@@ -57,7 +57,18 @@ pub mod col {
     pub const G2LIMB0: usize = 63;
     pub const G2LIMB1: usize = 64;
     pub const G2LIMB2: usize = 65;
-    pub const WIDTH: usize = 66;
+    /// ZKQ-3 (the 2026-09-27 zk scan): the *base* of a multi-cell access, in three limbs —
+    /// `A0 + B` for LOADE/STOREE, `A0` for POSEIDON2/SPONGE's state. The subject limbs above
+    /// check only the top cell, and an address is a field element: a base of `p − 1` put the top
+    /// at 0, in range, and the access reached a cell outside the `2^24` address space.
+    pub const G3LIMB0: usize = 66;
+    pub const G3LIMB1: usize = 67;
+    pub const G3LIMB2: usize = 68;
+    /// ZKQ-3: the base of SPONGE's source, `B0` (group 2 checks its top, `B0 + 3`).
+    pub const G4LIMB0: usize = 69;
+    pub const G4LIMB1: usize = 70;
+    pub const G4LIMB2: usize = 71;
+    pub const WIDTH: usize = 72;
 }
 use col::*;
 
@@ -256,6 +267,24 @@ where
         for l in [G2LIMB0, G2LIMB1, G2LIMB2] {
             bus::RANGE8.lookup_key(b, [v(l)], Count::bounded(sel(Op::Sponge), 1));
         }
+        // Groups 3 and 4 (ZKQ-3): the base of every multi-cell access, so both ends of the run of
+        // cells are below `2^24` and, the run being a few cells long, every cell between them is
+        // too. Group 3 is the `A0`-side base (LOADE/STOREE's `A0 + B`, POSEIDON2/SPONGE's state
+        // `A0`); group 4 is SPONGE's source base `B0`. Before these, only the top of each run was
+        // checked, and a base just below zero (`p − 1`, `p − 4`, ...) wrapped the top back into
+        // range. The emulator refuses every such address; now the AIR does too.
+        let is_multi = sel_sum(Sels::MEM2) + sel(Op::Poseidon2) + sel(Op::Sponge);
+        let base3 = sel_sum(Sels::MEM2) * (v(A0) + v(B)) + (sel(Op::Poseidon2) + sel(Op::Sponge)) * v(A0);
+        let limbs3 = v(G3LIMB0) + v(G3LIMB1) * AB::Expr::from_u32(1 << 8) + v(G3LIMB2) * AB::Expr::from_u32(1 << 16);
+        b.assert_zero(is_multi.clone() * (base3 - limbs3));
+        for l in [G3LIMB0, G3LIMB1, G3LIMB2] {
+            bus::RANGE8.lookup_key(b, [v(l)], Count::bounded(is_multi.clone(), 1));
+        }
+        let limbs4 = v(G4LIMB0) + v(G4LIMB1) * AB::Expr::from_u32(1 << 8) + v(G4LIMB2) * AB::Expr::from_u32(1 << 16);
+        b.assert_zero(sel(Op::Sponge) * (v(B0) - limbs4));
+        for l in [G4LIMB0, G4LIMB1, G4LIMB2] {
+            bus::RANGE8.lookup_key(b, [v(l)], Count::bounded(sel(Op::Sponge), 1));
+        }
 
         // ── register traffic (REG) and RAM traffic (RAM) ──
         let ts = |slot: u32| sixteen.clone() * v(CLK) + AB::Expr::from_u32(slot);
@@ -434,6 +463,23 @@ fn fill_row(r: &mut [F], e: &Event, pub_idx: &mut u32, counts: &mut RangeCounts)
             let limb = (s >> (8 * k)) as u32 & 0xff;
             r[*c] = F::from_u32(limb);
             counts.range8(limb);
+        }
+    }
+    // ZKQ-3's groups 3 and 4: the multi-cell accesses' bases, computed as the AIR recomputes them.
+    let base3: Option<u64> = match e.instr.op {
+        Op::Loade | Op::Storee => Some(e.mem[0].addr),
+        Op::Poseidon2 | Op::Sponge => Some(e.a[0].as_canonical_u64()),
+        _ => None,
+    };
+    let base4: Option<u64> = (e.instr.op == Op::Sponge).then(|| e.b_val[0].as_canonical_u64());
+    for (base, cols) in [(base3, [G3LIMB0, G3LIMB1, G3LIMB2]), (base4, [G4LIMB0, G4LIMB1, G4LIMB2])] {
+        if let Some(s) = base {
+            assert!(s < 1 << 24, "the emulator bounds every address below 2^24");
+            for (k, c) in cols.iter().enumerate() {
+                let limb = (s >> (8 * k)) as u32 & 0xff;
+                r[*c] = F::from_u32(limb);
+                counts.range8(limb);
+            }
         }
     }
     r[PUB_IDX] = F::from_u64(*pub_idx as u64);

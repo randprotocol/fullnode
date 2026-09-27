@@ -84,3 +84,43 @@ fn the_width_and_height_rules_are_pinned() {
     assert_eq!(poseidon2_log_height(51_606), 16);
     assert_eq!(poseidon2_log_height(65_536), 17, "one past the capacity climbs a rung");
 }
+
+/// ZKQ-6 (the 2026-09-27 zk scan, hardening): a known answer for the permutation, pinned as
+/// numbers. `research`'s `poseidon2_constants::permutation()` builds a *different type* per target
+/// — `p3_goldilocks`'s fused NEON implementation on aarch64, the generic `Poseidon2` elsewhere — so
+/// the host hash (`hash::permute_state`, every program digest and every emulated `POSEIDON2`) runs
+/// different code on an ARM laptop than on an x86 CI runner or validator. Both must compute the
+/// one permutation the chip's AIR constrains (`tables::poseidon2::permute_scalar`, the constants
+/// table walked round by round). The other tests here compare the two on the machine they run
+/// on; this pins the output itself, so an architecture whose fast path diverged would fail here
+/// rather than disagree silently with another machine. Recorded on aarch64 (NEON), where the
+/// scalar reference agreed.
+#[test]
+fn the_permutation_matches_its_known_answers() {
+    let inputs: [[u64; 8]; 3] = [
+        [0; 8],
+        [0, 1, 2, 3, 4, 5, 6, 7],
+        [F::ORDER_U64 - 1, 1 << 63, 0xC0FF_EE00_0000_0001, 42, 7, 1 << 32, (1 << 32) - 1, 0xDEAD_BEEF],
+    ];
+    let want: [[u64; 8]; 3] = [
+        [
+            2182887505462051504, 3439344203595588314, 11257167888106482493, 4107398993123293806,
+            14643323442960772459, 11192306518859915094, 364998372190244659, 17999480207850065192,
+        ],
+        [
+            7506498085745773920, 3890631433287662404, 17345641480708064142, 16023537662855063796,
+            14956148158829802274, 4100699954794509621, 17694435955024199899, 7588218540016218618,
+        ],
+        [
+            13177204086891333497, 5926417715648558762, 14857286310666800248, 15753195083841397473,
+            10135933228134719423, 4405257592837931310, 3073845396149882880, 12581549497245156936,
+        ],
+    ];
+    for (k, input) in inputs.iter().enumerate() {
+        let input: [F; 8] = input.map(F::from_u64);
+        let host: Vec<u64> = randprotocol_zkvm::hash::permute_state(input).iter().map(|x| x.as_canonical_u64()).collect();
+        let scalar: Vec<u64> = randprotocol_zkvm::tables::poseidon2::permute_scalar(input).iter().map(|x| x.as_canonical_u64()).collect();
+        assert_eq!(host, scalar, "input {k}: the host permutation and the AIR's scalar reference disagree on this machine");
+        assert_eq!(host, want[k].to_vec(), "input {k}: the permutation's known answer");
+    }
+}

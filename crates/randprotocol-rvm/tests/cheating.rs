@@ -541,11 +541,23 @@ fn memory_trace_unchecked(accesses: &[MemAccess], height: usize, counts: &mut ra
 
 /// Every table, built from the run's events the way `build_traces` builds them, except that the
 /// register and RAM access lists are given explicitly and both memory tables go through
-/// [`memory_trace_unchecked`] — the "honest trace builder bypassed" path. No REDUCE rows (the
-/// programs here have none).
+/// [`memory_trace_unchecked`] — the "honest trace builder bypassed" path. The reduce chip's trace
+/// is given explicitly too (with its declared log-height), or `None` for a program with no
+/// REDUCE rows.
 fn traces_bypassing_host_checks(p: &Program, exec: &Execution, tier: Tier, reg_acc: &[MemAccess], ram_acc: &[MemAccess]) -> Traces {
+    traces_from_parts(p, exec, tier, reg_acc, ram_acc, None)
+}
+
+fn traces_from_parts(
+    p: &Program,
+    exec: &Execution,
+    tier: Tier,
+    reg_acc: &[MemAccess],
+    ram_acc: &[MemAccess],
+    reduce: Option<(p3_matrix::dense::RowMajorMatrix<F>, u8)>,
+) -> Traces {
     use randprotocol_rvm::machine::{program_log_height, MIN_LOG_HEIGHT};
-    assert!(exec.events.iter().all(|e| e.reduce.is_none()));
+    assert!(reduce.is_some() || exec.events.iter().all(|e| e.reduce.is_none()));
     let mut counts = range::RangeCounts::default();
     let cpu_t = cpu::cpu_trace(&exec.events, tier.cpu_height(), &mut counts);
     let reg_lh = pad_height(reg_acc.len() + 1, 1 << MIN_LOG_HEIGHT).trailing_zeros() as u8;
@@ -554,6 +566,16 @@ fn traces_bypassing_host_checks(p: &Program, exec: &Execution, tier: Tier, reg_a
     let ram = memory_trace_unchecked(ram_acc, 1 << ram_lh, &mut counts);
     let perms = cpu::perm_events(&exec.events);
     let p2 = poseidon2::poseidon2_log_height(perms.len());
+    // The reduce chip's own range lookups (ZKQ-3: six three-byte address checks on each run's
+    // first row) go into the same counts, exactly as `build_traces` counts them.
+    if let Some((red, _)) = &reduce {
+        use reduce_table::col::{DESCR_LIMB0, IS_FIRST, WIDTH};
+        for row in red.values.chunks(WIDTH).filter(|r| r[IS_FIRST] == F::ONE) {
+            for &limb in &row[DESCR_LIMB0..DESCR_LIMB0 + 18] {
+                counts.range8(limb.as_canonical_u64() as u32);
+            }
+        }
+    }
     Traces {
         program: program_table::program_trace(p, &exec.events, 1 << program_log_height(p.instrs.len())),
         cpu: cpu_t,
@@ -562,12 +584,12 @@ fn traces_bypassing_host_checks(p: &Program, exec: &Execution, tier: Tier, reg_a
         poseidon2: poseidon2::poseidon2_trace(&perms, 1 << p2),
         public: public_table::public_trace(&exec.public, public_table::HEIGHT),
         range: range::range_trace(&counts),
-        reduce: None,
+        reduce_log_height: reduce.as_ref().map_or(0, |r| r.1),
+        reduce: reduce.map(|r| r.0),
         public_values: exec.public.clone(),
         reg_log_height: reg_lh,
         ram_log_height: ram_lh,
         poseidon2_log_height: p2,
-        reduce_log_height: 0,
     }
 }
 
@@ -710,4 +732,300 @@ fn a_forged_loade_high_lane_is_rejected() {
     forge_high_lane(&mut forged, None, 4, F::from_u64(FORGED));
     assert_eq!(forged.public, [FORGED, 11, 11, 22].map(F::from_u64).to_vec());
     assert_forged_run_is_refused(&m, &p, &forged, Tier(8), "(c), a forged LOADE high lane");
+}
+
+// ── The reduce chip's run rules (the 2026-09-27 zk scan: OPCODES-1/TABLES-1, V-OPCODES-1, ZKR-4) ──
+//
+// One program for the whole tranche: a three-column REDUCE run over hand-stored cells, its
+// accumulator loaded back and published. vals (extension, two cells each) at 100..105 =
+// (10, 0), (20, 0), (30, 0); row at 120..122 = 4, 5, 6; the descriptor at 200..210 =
+// [vals 100, row 120, len 3, inv (1, 0), acc (0, 0), apow (1, 0), alpha (3, 0)] — so the honest
+// accumulator is (10 − 4)·1 + (20 − 5)·3 + (30 − 6)·9 = 267. With `stale_first`, column 1's
+// cells (102, 103, 121) first hold (7, 0) and 7 — a difference of zero — and a filler row marks
+// the clock at which those stale values were live.
+fn reduce_run_program(stale_first: bool) -> Program {
+    let mut v = vec![];
+    let st = |v: &mut Vec<Instr>, addr: u64, val: u64| {
+        v.push(i(Op::Faddi, 1, 0, val));
+        v.push(i(Op::Store, 1, 0, addr));
+    };
+    if stale_first {
+        st(&mut v, 102, 7);
+        st(&mut v, 103, 0);
+        st(&mut v, 121, 7);
+        v.push(i(Op::Faddi, 9, 0, 0)); // the filler row: the stale-read clock
+    }
+    st(&mut v, 100, 10);
+    st(&mut v, 101, 0);
+    st(&mut v, 102, 20);
+    st(&mut v, 103, 0);
+    st(&mut v, 104, 30);
+    st(&mut v, 105, 0);
+    st(&mut v, 120, 4);
+    st(&mut v, 121, 5);
+    st(&mut v, 122, 6);
+    for (k, val) in [100u64, 120, 3, 1, 0, 0, 0, 1, 0, 3, 0].iter().enumerate() {
+        st(&mut v, 200 + k as u64, *val);
+    }
+    v.push(i(Op::Faddi, 2, 0, 200));
+    v.push(i(Op::Reduce, 0, 2, 0));
+    v.push(i(Op::Load, 3, 0, 205));
+    v.push(i(Op::Load, 4, 0, 206));
+    v.push(i(Op::Public, 0, 3, 0));
+    v.push(i(Op::Public, 0, 4, 0));
+    v.push(i(Op::Public, 0, 3, 0));
+    v.push(i(Op::Public, 0, 4, 0));
+    v.push(i(Op::Halt, 0, 0, 0));
+    Program { instrs: v, checkpoints: vec![] }
+}
+
+fn events_of(exec: &Execution, op: Op) -> Vec<usize> {
+    exec.events.iter().enumerate().filter(|(_, e)| e.instr.op == op).map(|(k, _)| k).collect()
+}
+
+/// Rewrite what the cpu reads back from the accumulator cell (205) — the first LOAD and every
+/// PUBLIC of `r3` — to `acc0`, as a forged reduction implies.
+fn forge_accumulator_readback(exec: &mut Execution, acc0: F) {
+    let l = events_of(exec, Op::Load)[0];
+    assert_eq!(exec.events[l].mem[0].addr, 205);
+    exec.events[l].mem[0].value = acc0;
+    exec.events[l].d[0] = acc0;
+    for k in events_of(exec, Op::Public) {
+        if exec.events[k].instr.ra == 3 {
+            exec.events[k].a[0] = acc0;
+        }
+    }
+    exec.public[0] = acc0;
+    exec.public[2] = acc0;
+}
+
+#[test]
+fn the_reduce_run_program_is_honest_and_publishes_267() {
+    let m = Machine::new(FriProfile::Test);
+    for stale in [false, true] {
+        let p = reduce_run_program(stale);
+        let exec = execute(&p, &[], 1000).unwrap();
+        assert_eq!(exec.public[0], F::from_u64(267));
+        let t = build_traces(&p, &exec, Tier(8)).unwrap();
+        prove_and_verify(&m, &p, &t).unwrap();
+        // And through the host-check-free path the forgeries below use, so a refusal there is
+        // the forgery's and not the path's.
+        let (reg, ram) = (cpu::register_accesses(&exec.events), cpu::ram_accesses(&exec.events));
+        let t = traces_from_parts(&p, &exec, Tier(8), &reg, &ram, Some((t.reduce.unwrap(), t.reduce_log_height)));
+        prove_and_verify(&m, &p, &t).unwrap();
+    }
+}
+
+/// OPCODES-1 / TABLES-1: a run's rows after the first read at `16·CLK + slot`, and nothing tied
+/// a later row's CLK to the first row's (the one the cpu's dispatch binds). So row 1 could read
+/// its column at a clock of the prover's choosing — here, before column 1's cells were
+/// overwritten — and the reduction used stale values: 222 published against an honest 267.
+#[test]
+fn a_reduce_row_reading_at_a_stale_clock_is_rejected() {
+    let p = reduce_run_program(true);
+    let m = Machine::new(FriProfile::Test);
+    let mut exec = execute(&p, &[], 1000).unwrap();
+    let filler = exec.events.iter().position(|e| e.instr.op == Op::Faddi && e.instr.rd == 9).unwrap() as u32;
+    let r = events_of(&exec, Op::Reduce)[0];
+    {
+        let e = &mut exec.events[r];
+        // The event's log: eleven descriptor reads, three reads per column, four write-backs.
+        let stale = [F::from_u64(7), F::ZERO, F::from_u64(7)];
+        for k in 0..3 {
+            let a = &mut e.mem[11 + 3 + k];
+            a.ts = filler * 16 + a.ts % 16;
+            a.value = stale[k];
+        }
+        // acc = (10 − 4)·1 + (7 − 7)·3 + (30 − 6)·9 = 222; the running power is unchanged.
+        e.mem[11 + 9].value = F::from_u64(222);
+    }
+    forge_accumulator_readback(&mut exec, F::from_u64(222));
+    let mut t = build_traces(&p, &exec, Tier(8)).unwrap();
+    let w = reduce_table::col::WIDTH;
+    t.reduce.as_mut().unwrap().values[w + reduce_table::col::CLK] = F::from_u64(filler as u64);
+    assert!(
+        rejects(|| prove_and_verify(&m, &p, &t)),
+        "OPCODES-1: a reduce row reading at a stale clock VERIFIED, publishing 222 against an honest 267"
+    );
+}
+
+/// V-OPCODES-1's forged padding row: `IS_LAST = 1` with `LEN = LEN1 = 1` (so the is-one gadget
+/// holds) on the first padding row after the run, `CLK = clk_r + 1/16` — CLK is a field element,
+/// so `16·CLK + 14` is `16·clk_r + 15`, any timestamp at all — and the accumulator column set to
+/// `value`. Its four write-back messages land in the descriptor's acc/apow cells between the real
+/// write-back and the cpu's LOAD; the RAM log carries them (on the HALT event, which is where
+/// `ram_accesses` picks them up). [`padding_writeback_traces`]'s `first` also sets `IS_FIRST`, the
+/// variant that claims a whole one-row run on padding.
+fn forge_padding_writeback(exec: &mut Execution, value: F) {
+    let r = events_of(exec, Op::Reduce)[0];
+    let clk_r = exec.events[r].clk;
+    let base = clk_r * 16;
+    // 205 ← value at 16·clk_r + 15, 206 ← 0 at + 16, 207 ← 0 at + 15, 208 ← 0 at + 16 (APOW = 0 on
+    // the forged row, so the step adds nothing and the power it writes back is zero).
+    let writes = [(205u64, base + 15, value), (206, base + 16, F::ZERO), (207, base + 15, F::ZERO), (208, base + 16, F::ZERO)];
+    let h = events_of(exec, Op::Halt)[0];
+    for (addr, ts, value) in writes {
+        exec.events[h].mem.push(MemAccess { addr, ts, value, is_write: true });
+    }
+}
+
+fn padding_writeback_traces(p: &Program, value: F, first: bool) -> (Execution, Traces) {
+    use reduce_table::col::*;
+    let mut exec = execute(p, &[], 1000).unwrap();
+    forge_padding_writeback(&mut exec, value);
+    forge_accumulator_readback(&mut exec, value);
+    let mut t = build_traces(p, &exec, Tier(8)).unwrap();
+    let clk_r = exec.events[events_of(&exec, Op::Reduce)[0]].clk;
+    let w = WIDTH;
+    let red = t.reduce.as_mut().unwrap();
+    let row = 3; // the first padding row after the three-row run
+    let rv = &mut red.values[row * w..(row + 1) * w];
+    assert_eq!(rv[IS_REAL], F::ZERO, "row 3 is padding");
+    rv[IS_LAST] = F::ONE;
+    rv[LEN] = F::ONE;
+    rv[LEN1] = F::ONE;
+    rv[LEN1_INV] = F::ZERO;
+    rv[CLK] = F::from_u64(clk_r as u64) + F::from_u64(16).inverse();
+    rv[DESCR_PTR] = F::from_u64(200);
+    rv[ACC0] = value;
+    if first {
+        rv[IS_FIRST] = F::ONE;
+    }
+    (exec, t)
+}
+
+/// V-OPCODES-1: `IS_LAST` was the `LEN == 1` gadget's output on every row, padding included, and
+/// `IS_FIRST` was a free boolean there — so a padding row could send the four write-backs (or,
+/// with `IS_FIRST`, a whole phantom run's messages). Here it writes 777 into the accumulator cell
+/// after the real write-back, and the cpu's LOAD reads 777 instead of 267.
+#[test]
+fn a_padding_reduce_row_writing_the_accumulator_is_rejected() {
+    let p = reduce_run_program(false);
+    let m = Machine::new(FriProfile::Test);
+    let (exec, t) = padding_writeback_traces(&p, F::from_u64(777), false);
+    assert_eq!(exec.public[0], F::from_u64(777));
+    assert!(
+        rejects(|| prove_and_verify(&m, &p, &t)),
+        "V-OPCODES-1: a padding reduce row's write-back VERIFIED, publishing 777 against an honest 267"
+    );
+}
+
+/// The `IS_FIRST` variant: the same forged row also claims to start a run. Before the fix this
+/// was already refused — not by any row constraint, but because its `REDUCE` dispatch entry has
+/// no cpu row consuming it (a bus imbalance) — so it is not a red of its own; after the fix the
+/// row itself is refused too (`IS_FIRST·(1 − IS_REAL) = 0`).
+#[test]
+fn a_padding_reduce_row_claiming_a_run_start_is_rejected() {
+    let p = reduce_run_program(false);
+    let m = Machine::new(FriProfile::Test);
+    let (_, t) = padding_writeback_traces(&p, F::from_u64(777), true);
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)), "a padding reduce row claiming a run start VERIFIED");
+}
+
+/// ZKR-4: nothing forced a run to *end* on its `IS_LAST` row. A run whose first row is followed
+/// by padding (rows 1–2 zeroed into ordinary padding, and the RAM log rebuilt without their reads
+/// and without the write-back) was accepted, so the write-back never happened and the cpu read
+/// the accumulator cell's pre-reduction value: 0 published against an honest 267.
+#[test]
+fn a_reduce_run_that_never_reaches_its_last_row_is_rejected() {
+    let p = reduce_run_program(false);
+    let m = Machine::new(FriProfile::Test);
+    let mut exec = execute(&p, &[], 1000).unwrap();
+    let honest = build_traces(&p, &exec, Tier(8)).unwrap();
+    let (mut red, lh) = (honest.reduce.clone().unwrap(), honest.reduce_log_height);
+    let w = reduce_table::col::WIDTH;
+    for row in 1..3 {
+        for c in 0..w {
+            red.values[row * w + c] = F::ZERO;
+        }
+        red.values[row * w + reduce_table::col::LEN1_INV] = F::NEG_ONE;
+    }
+    let r = events_of(&exec, Op::Reduce)[0];
+    // Keep the eleven descriptor reads and column 0's three; drop columns 1–2 and the write-backs.
+    exec.events[r].mem.truncate(14);
+    forge_accumulator_readback(&mut exec, F::ZERO);
+    let reg = cpu::register_accesses(&exec.events);
+    let ram = cpu::ram_accesses(&exec.events);
+    let t = traces_from_parts(&p, &exec, Tier(8), &reg, &ram, Some((red, lh)));
+    assert!(
+        rejects(|| prove_and_verify(&m, &p, &t)),
+        "ZKR-4: a reduce run that never reached its last row VERIFIED, publishing 0 against an honest 267"
+    );
+}
+
+// ── OPCODES-4: the public table's four rows are all real ──────────────────────────────────────
+
+/// OPCODES-4 (low): the public table let its trailing rows be padding, and a padding row pins
+/// nothing — so a program that published fewer than four words left the remaining public values
+/// free. Here a program publishes two; the proof claims four, the last two chosen at will.
+/// (Every shipped program publishes exactly the four-word interface digest, so this was not
+/// reachable through them; the table's own rule now says what R5 always meant.)
+#[test]
+fn public_values_a_program_never_published_are_rejected() {
+    let p = Program {
+        instrs: vec![
+            i(Op::Faddi, 1, 0, 5),
+            i(Op::Faddi, 2, 0, 6),
+            i(Op::Public, 0, 1, 0),
+            i(Op::Public, 0, 2, 0),
+            i(Op::Halt, 0, 0, 0),
+        ],
+        checkpoints: vec![],
+    };
+    let m = Machine::new(FriProfile::Test);
+    let mut exec = execute(&p, &[], 1000).unwrap();
+    assert_eq!(exec.public.len(), 2);
+    // The claimed four: the two published words, then two the program never produced.
+    exec.public.extend([F::from_u64(0xDEAD), F::from_u64(0xBEEF)]);
+    let reg = cpu::register_accesses(&exec.events);
+    let ram = cpu::ram_accesses(&exec.events);
+    let mut t = traces_from_parts(&p, &exec, Tier(8), &reg, &ram, None);
+    // Rows 2 and 3 of the public table become padding: nothing on the cpu side consumes them.
+    let w = public_table::col::WIDTH;
+    for row in 2..4 {
+        let r = &mut t.public.values[row * w..(row + 1) * w];
+        r[public_table::col::IS_REAL] = F::ZERO;
+        r[public_table::col::VALUE] = F::ZERO;
+        for k in 0..4 {
+            r[public_table::col::SEL0 + k] = F::ZERO;
+        }
+    }
+    assert!(
+        rejects(|| prove_and_verify(&m, &p, &t)),
+        "OPCODES-4: a proof claiming public values [5, 6, 0xDEAD, 0xBEEF] for a program that published two words VERIFIED"
+    );
+}
+
+// ── ZKQ-3: an extension pair never starts at r31 ──────────────────────────────────────────────
+
+/// An extension operand names `(r, r + 1)`, so `r31` as its first register reaches register
+/// cell `2^24 + 32` — a 33rd register the machine does not have. The emulator and
+/// `Machine::check_program` (the prover's entry) refuse such a program, but the AIR decodes
+/// every register index in five bits and never looks at `r + 1`, and `Machine::verify` did not
+/// run the program check: a hand-built trace of `LOADE r31` proved and verified. Here the honest
+/// run of `LOADE r30` is rewritten to `LOADE r31` in the program and the trace alike.
+#[test]
+fn an_extension_pair_starting_at_r31_is_rejected() {
+    let mut p = Program {
+        instrs: vec![
+            i(Op::Faddi, 6, 0, 1000),
+            i(Op::Loade, 30, 6, 0),
+            i(Op::Public, 0, 0, 0),
+            i(Op::Public, 0, 0, 0),
+            i(Op::Public, 0, 0, 0),
+            i(Op::Public, 0, 0, 0),
+            i(Op::Halt, 0, 0, 0),
+        ],
+        checkpoints: vec![],
+    };
+    let m = Machine::new(FriProfile::Test);
+    let mut exec = execute(&p, &[], 1000).unwrap();
+    p.instrs[1].rd = 31;
+    exec.events[1].instr.rd = 31;
+    assert!(Machine::check_program(&p).is_err(), "the prover's program check refuses it");
+    let reg = cpu::register_accesses(&exec.events);
+    assert!(reg.iter().any(|a| a.addr == memory::REGISTER_BASE + 32), "the trace writes register cell 2^24 + 32");
+    let ram = cpu::ram_accesses(&exec.events);
+    let t = traces_from_parts(&p, &exec, Tier(8), &reg, &ram, None);
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)), "ZKQ-3: a proof of LOADE r31 (a pair reaching register 32) VERIFIED");
 }

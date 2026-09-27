@@ -320,7 +320,10 @@ echo "reminder: --features cuda / mock-cuda need circuits checked out at ../../.
 # at `573ef2e` (audit v3 AGG-2, the aggregate binding), then at `224960c` (ZKV-2: the backends' seed
 # names research's `poseidon2_constants::PERM_SEED`; comments), then at `fbe29b8` (RVM-1: STOREE
 # reads the high lane of the stored pair from `rd + 1`; the aggregate program's digest does not
-# move, the rVM verifier does). Re-vendoring the rVM alone is this section alone: the research
+# move, the rVM verifier does), then at `642db8d` (the rest of the 2026-09-27 zk scan: the reduce
+# chip's clock chain, real-row-only row kinds, run-end rule and address range checks; the public
+# table's four real rows; both ends of every multi-cell access range-checked; `Machine::verify`
+# runs `check_program`; a Poseidon2 known-answer test — again no aggregate-digest move). Re-vendoring the rVM alone is this section alone: the research
 # section above rewrites `guests-compiled/PROVENANCE.md` and would carry research's older drift. Two vendored files carry hand fixes this
 # section does not reproduce — keep them when re-syncing: `Cargo.toml`'s `license.workspace`
 # line and `tests/backend.rs`'s doc comment (`randprotocol-zkvm`, not the old crate name). What the
@@ -394,4 +397,4 @@ open(p, 'w').write(s)
 PY
 grep -rl "recursion::" "$RVM_DST/tests" | xargs -I{} sed -i '' 's/recursion::/randprotocol_rvm::/g' {} 2>/dev/null || true
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin fbe29b8) into $RVM_DST"
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 642db8d) into $RVM_DST"

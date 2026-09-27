@@ -68,6 +68,16 @@ where
             sel_sum += s;
         }
         b.assert_eq(sel_sum, v(IS_REAL));
+        // OPCODES-4 (the 2026-09-27 zk scan): rows 0–3 are all real. The prefix rule and the
+        // selector tie alone let the real prefix stop early — a program publishing two words had
+        // two real rows, and `pv[2]`, `pv[3]` were pinned by nothing. The first row is real, and
+        // a row naming slot 0, 1 or 2 is followed by a real row; since `SEL_i` forces `IDX = i`,
+        // that walks rows 0, 1, 2, 3 real, and no later row can be (no slot names an `IDX ≥ 4`).
+        // Degree 2, like every other constraint here — `v(IS_REAL)·(1 − n(IS_REAL))·(1 − SEL3)`
+        // says the same at degree 3 and would have grown the table's quotient.
+        b.when_first_row().assert_one(v(IS_REAL));
+        let names_an_earlier_slot: AB::Expr = (0..NUM_PUBLIC_VALUES - 1).map(|i| v(SEL0 + i)).sum();
+        b.when_transition().assert_zero(names_an_earlier_slot * (one.clone() - n(IS_REAL)));
 
         bus::PUBLIC.table_entry(b, [v(IDX), v(VALUE)], v(IS_REAL));
     }

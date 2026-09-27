@@ -401,3 +401,181 @@ pub fn rejects(f: impl FnOnce() -> Result<(), randprotocol_rvm::machine::VerifyE
         }
     }
 }
+
+// ── Symbolic reads of an AIR (the binding tests: `tests/cpu.rs`, `tests/tables.rs`) ──────────
+// The tests that check a table's soundness *rules* — every written value bound, every run row
+// chained to the one before, no padding row sending anything — do not keep their own list of
+// what a table's `eval` does: they run `eval` through Plonky3's own symbolic interaction builder
+// and evaluate the constraints and messages it really emits at concrete rows. Deleting a
+// constraint or a send changes what they see.
+use p3_air::symbolic::{AirLayout, BaseEntry, BaseLeaf, SymbolicExpr, SymbolicExpression};
+
+/// Every global interaction and base constraint `air.eval` emits.
+#[allow(dead_code)]
+pub fn symbolic_air<A>(air: &A) -> (Vec<p3_lookup::SymbolicInteraction<randprotocol_rvm::isa::F>>, Vec<SymbolicExpression<randprotocol_rvm::isa::F>>)
+where
+    A: p3_air::BaseAir<randprotocol_rvm::isa::F>
+        + p3_air::Air<p3_lookup::InteractionSymbolicBuilder<randprotocol_rvm::isa::F, randprotocol_rvm::isa::EF>>,
+{
+    let mut sb = p3_lookup::InteractionSymbolicBuilder::<randprotocol_rvm::isa::F, randprotocol_rvm::isa::EF>::new(
+        AirLayout::from_air::<randprotocol_rvm::isa::F>(air),
+    );
+    air.eval(&mut sb);
+    (sb.global_interactions().to_vec(), sb.base_constraints())
+}
+
+/// A base-field symbolic expression at one row pair (`cur`, `next`), on a transition row that is
+/// neither the first nor the last — the rows every per-row rule lives on.
+#[allow(dead_code)]
+pub fn eval_at(e: &SymbolicExpression<randprotocol_rvm::isa::F>, cur: &[randprotocol_rvm::isa::F], next: &[randprotocol_rvm::isa::F]) -> randprotocol_rvm::isa::F {
+    use p3_field::PrimeCharacteristicRing;
+    use randprotocol_rvm::isa::F;
+    match e {
+        SymbolicExpr::Leaf(l) => match l {
+            BaseLeaf::Variable(v) => match v.entry {
+                BaseEntry::Main { offset: 0 } => cur[v.index],
+                BaseEntry::Main { offset: 1 } => next[v.index],
+                other => panic!("a main-trace-only AIR read {other:?}"),
+            },
+            BaseLeaf::IsFirstRow | BaseLeaf::IsLastRow => F::ZERO,
+            BaseLeaf::IsTransition => F::ONE,
+            BaseLeaf::Constant(c) => *c,
+        },
+        SymbolicExpr::Add { x, y, .. } => eval_at(x, cur, next) + eval_at(y, cur, next),
+        SymbolicExpr::Sub { x, y, .. } => eval_at(x, cur, next) - eval_at(y, cur, next),
+        SymbolicExpr::Neg { x, .. } => -eval_at(x, cur, next),
+        SymbolicExpr::Mul { x, y, .. } => eval_at(x, cur, next) * eval_at(y, cur, next),
+    }
+}
+
+/// The single current-row main column a message field is, or `None` for anything composite.
+#[allow(dead_code)]
+pub fn as_column(e: &SymbolicExpression<randprotocol_rvm::isa::F>) -> Option<usize> {
+    match e {
+        SymbolicExpr::Leaf(BaseLeaf::Variable(v)) if v.entry == (BaseEntry::Main { offset: 0 }) => Some(v.index),
+        _ => None,
+    }
+}
+
+/// Does `e` depend on column `col` of the current row (`next_row = false`) or of the next row
+/// (`true`) at this row pair? Two random perturbations, so a chance cancellation cannot hide a
+/// dependency.
+#[allow(dead_code)]
+pub fn depends(
+    e: &SymbolicExpression<randprotocol_rvm::isa::F>,
+    cur: &[randprotocol_rvm::isa::F],
+    next: &[randprotocol_rvm::isa::F],
+    col: usize,
+    next_row: bool,
+    rng: &mut impl rand::Rng,
+) -> bool {
+    use p3_field::PrimeCharacteristicRing;
+    let base = eval_at(e, cur, next);
+    (0..2).any(|_| {
+        let delta = random_felt(rng) + randprotocol_rvm::isa::F::ONE;
+        if next_row {
+            let mut moved = next.to_vec();
+            moved[col] += delta;
+            eval_at(e, cur, &moved) != base
+        } else {
+            let mut moved = cur.to_vec();
+            moved[col] += delta;
+            eval_at(e, &moved, next) != base
+        }
+    })
+}
+
+/// [`eval_at`] on a boundary row: the table's first row (`is_first`) or its last (`is_last`,
+/// where the transition selector is zero and `next` is the wrap-around row).
+#[allow(dead_code)]
+pub fn eval_at_boundary(
+    e: &SymbolicExpression<randprotocol_rvm::isa::F>,
+    cur: &[randprotocol_rvm::isa::F],
+    next: &[randprotocol_rvm::isa::F],
+    is_first: bool,
+    is_last: bool,
+) -> randprotocol_rvm::isa::F {
+    use p3_field::PrimeCharacteristicRing;
+    use randprotocol_rvm::isa::F;
+    let flag = |b: bool| if b { F::ONE } else { F::ZERO };
+    match e {
+        SymbolicExpr::Leaf(BaseLeaf::IsFirstRow) => flag(is_first),
+        SymbolicExpr::Leaf(BaseLeaf::IsLastRow) => flag(is_last),
+        SymbolicExpr::Leaf(BaseLeaf::IsTransition) => flag(!is_last),
+        SymbolicExpr::Leaf(_) => eval_at(e, cur, next),
+        SymbolicExpr::Add { x, y, .. } => eval_at_boundary(x, cur, next, is_first, is_last) + eval_at_boundary(y, cur, next, is_first, is_last),
+        SymbolicExpr::Sub { x, y, .. } => eval_at_boundary(x, cur, next, is_first, is_last) - eval_at_boundary(y, cur, next, is_first, is_last),
+        SymbolicExpr::Neg { x, .. } => -eval_at_boundary(x, cur, next, is_first, is_last),
+        SymbolicExpr::Mul { x, y, .. } => eval_at_boundary(x, cur, next, is_first, is_last) * eval_at_boundary(y, cur, next, is_first, is_last),
+    }
+}
+
+/// The main columns a table range-checks: the single-column fields of its `RANGE8` lookups.
+#[allow(dead_code)]
+pub fn range_checked_columns(interactions: &[p3_lookup::SymbolicInteraction<randprotocol_rvm::isa::F>]) -> Vec<usize> {
+    let mut cols: Vec<usize> = interactions
+        .iter()
+        .filter(|i| i.bus_name == randprotocol_rvm::tables::bus::RANGE8.name() && i.fields.len() == 1)
+        .filter_map(|i| as_column(&i.fields[0]))
+        .collect();
+    cols.sort();
+    cols.dedup();
+    cols
+}
+
+/// Can this row pair be completed into one every constraint accepts by choosing the
+/// range-checked columns (`limbs`) as *bytes*? Every other column is taken as given. The limb
+/// constraints are the decomposition kind — `gate·(subject − Σ 256^j·L_j)`, linear in one group of
+/// limbs — so each is solved directly: its three coefficients must be `a, 256·a, 65536·a`, and the
+/// subject it demands must be below `2^24`. `Err` names the first constraint no choice of bytes
+/// satisfies (or one that fails whatever the limbs are). The address range checks' soundness is
+/// exactly this: a wrapped address has no three-byte decomposition, whatever the prover writes.
+#[allow(dead_code)]
+pub fn admits_byte_limbs(
+    constraints: &[SymbolicExpression<randprotocol_rvm::isa::F>],
+    cur: &[randprotocol_rvm::isa::F],
+    next: &[randprotocol_rvm::isa::F],
+    limbs: &[usize],
+) -> Result<Vec<randprotocol_rvm::isa::F>, String> {
+    use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
+    use randprotocol_rvm::isa::F;
+    let mut row = cur.to_vec();
+    for &l in limbs {
+        row[l] = F::ZERO;
+    }
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x11b5);
+    for (k, c) in constraints.iter().enumerate() {
+        let group: Vec<usize> = limbs.iter().copied().filter(|&l| depends(c, &row, next, l, false, &mut rng)).collect();
+        let c0 = eval_at(c, &row, next);
+        if group.is_empty() {
+            if c0 != F::ZERO {
+                return Err(format!("constraint {k} fails whatever the limbs are"));
+            }
+            continue;
+        }
+        let coeff = |l: usize| {
+            let mut r = row.clone();
+            r[l] = F::ONE;
+            eval_at(c, &r, next) - c0
+        };
+        let mut terms: Vec<(usize, F)> = group.iter().map(|&l| (l, coeff(l))).collect();
+        // Order the group by its weights: the lowest limb's coefficient `a` divides the others.
+        let a = terms.iter().map(|t| t.1).find(|&x| terms.iter().all(|t| (t.1 * x.inverse()).as_canonical_u64() < 1 << 24)).expect("a limb group's weights");
+        terms.sort_by_key(|t| (t.1 * a.inverse()).as_canonical_u64());
+        for (j, t) in terms.iter().enumerate() {
+            assert_eq!(t.1, a * F::from_u64(1 << (8 * j)), "constraint {k}: a three-byte decomposition, weights 1, 256, 65536");
+        }
+        let want = (F::ZERO - c0) * a.inverse();
+        let w = want.as_canonical_u64();
+        if w >= 1 << (8 * terms.len()) {
+            return Err(format!("constraint {k} needs {w:#x} in {} bytes", terms.len()));
+        }
+        for (j, t) in terms.iter().enumerate() {
+            row[t.0] = F::from_u64((w >> (8 * j)) & 0xff);
+        }
+    }
+    match constraints.iter().position(|c| eval_at(c, &row, next) != F::ZERO) {
+        Some(k) => Err(format!("constraint {k} fails after the limbs are solved")),
+        None => Ok(row),
+    }
+}

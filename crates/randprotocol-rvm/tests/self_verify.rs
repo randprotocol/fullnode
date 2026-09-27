@@ -313,26 +313,33 @@ fn the_self_verifiers_measured_cost_at_two_fixture_shapes() {
     // (was (275215, 7440, 402909, 277058, 29375) and (367340, 9090, 478827, 369443, 35207); the
     // report's measured deltas, re-measured here). The *aggregate* program does not move: its
     // digest is pinned across the fix in `tests/verifier.rs`.
+    // Then the rest of the 2026-09-27 zk scan, re-pinned once for all of them (cumulative over
+    // RVM-1's numbers): OPCODES-4's public-table rule (+15 toy rows by itself) and ZKQ-3's six
+    // cpu address-limb columns and six RANGE8 lookups (the rest) — toy +1 151 rows and
+    // instructions, +56 permutations, +2 582 memory accesses, +160 witness words; busy +1 232,
+    // +40, +2 439, +1 232, +160. The reduce-chip fixes (OPCODES-1, V-OPCODES-1, ZKR-4, ZKQ-3's
+    // reduce half) move nothing here: neither fixture proof carries a reduce table.
     assert_eq!(
         (r.cpu_rows, r.permutations, r.mem_accesses, r.program_instrs, r.witness_words),
-        (275404, 7442, 403271, 277247, 29415),
+        (276555, 7498, 405853, 278398, 29575),
         "the tier-8 toy fixture's CycleReport, pinned"
     );
     assert_eq!(
         (rb.cpu_rows, rb.permutations, rb.mem_accesses, rb.program_instrs, rb.witness_words),
-        (367529, 9092, 479189, 369632, 35247),
+        (368761, 9132, 481628, 370864, 35407),
         "the busy fixture's CycleReport, pinned"
     );
 
     // Phase 5 is *not* height-independent: the constraint DAG is per-chip, but the emitted
     // selectors and quotient recomposition square `log(degree_bits)` times per instance
     // (`emit_selectors`' power loop), so the phase grows with the declared heights. Measured:
-    // 7 263 rows here, 7 543 there — the derivation in `docs/03` accounts for it explicitly.
+    // 7 365 rows here, 7 645 there — the derivation in `docs/03` accounts for it explicitly.
     // RVM-1 added 18 to both (was 7 245 / 7 525): the new STOREE message is one more lookup
     // term in the cpu chip's constraint DAG, which phase 5 evaluates. The 2026-09-27 report
     // measured only the CycleReport deltas above (its run stopped at the first failing pin);
-    // this one was measured here.
+    // this one was measured here. OPCODES-4 and ZKQ-3 added 102 more to both (7 263 / 7 543
+    // after RVM-1): the public table's two new constraints and the cpu's two limb groups.
     let p5a: usize = vp.phase5.iter().map(|c| c.instrs).sum();
     let p5b: usize = vp_b.phase5.iter().map(|c| c.instrs).sum();
-    assert_eq!((p5a, p5b), (7263, 7543), "phase 5 varies with the degree bits, measured");
+    assert_eq!((p5a, p5b), (7365, 7645), "phase 5 varies with the degree bits, measured");
 }

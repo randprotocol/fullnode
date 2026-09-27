@@ -240,6 +240,8 @@ pub enum VerifyError {
     RegHeight,
     RamHeight,
     Poseidon2Height,    ReduceHeight,
+    /// A program word the emulator could never execute (`Machine::check_program`): ZKQ-3.
+    Program(DecodeError),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -402,11 +404,13 @@ pub fn build_traces(program: &Program, exec: &Execution, tier: Tier) -> Result<T
     let poseidon2 = poseidon2_trace(&perms, 1 << p2_log);
     let program_t = program_trace(program, &exec.events, 1 << program_log_height(program.instrs.len()));
     let public = public_trace(&exec.public, crate::tables::public::HEIGHT);
-    let range = range_trace(&counts);
     let reduce_evs = reduce_events(&exec.events);
     let reduce_rows: usize = reduce_evs.iter().map(|e| e.reduce.unwrap().len as usize).sum();
     let reduce_lh = reduce_log_height(reduce_rows);
-    let reduce = if reduce_lh == 0 { None } else { Some(reduce_trace(&reduce_evs, 1 << reduce_lh)) };
+    // Before the range table: since ZKQ-3 the reduce chip range-checks its run's addresses, so
+    // its lookups are counted into the same `RangeCounts` as every other table's.
+    let reduce = if reduce_lh == 0 { None } else { Some(reduce_trace(&reduce_evs, 1 << reduce_lh, &mut counts)) };
+    let range = range_trace(&counts);
     Ok(Traces {
         program: program_t,
         cpu,
@@ -569,6 +573,14 @@ impl Machine {
         // `Val::from_u64` does not reduce: insist on the canonical representative so a proof has
         // exactly one encoding of its interface digest.
         if proof.public_values.iter().any(|x| *x >= <Val as PrimeField64>::ORDER_U64) { return Err(VerifyError::PublicValues); }
+        // ZKQ-3 (the 2026-09-27 zk scan): the program's words are legal — the check `prove` makes
+        // (and a node makes at registration), made here as well so the verifier never depends on
+        // it having been made. The AIR decodes each register index in five bits and never looks at
+        // `r + 1`, so an extension pair starting at `r31` (a LOADE/STOREE/HINTE/EADD… naming
+        // register cell `2^24 + 32`, a 33rd register) proved and verified from a hand-built
+        // trace. The program is public and fixed by the preprocessed commitment, so checking its
+        // words once here is complete: no row can execute an instruction the program lacks.
+        Self::check_program(program).map_err(VerifyError::Program)?;
         // Every range check on the proof's declared shape, before anything is sized from it.
         check_declared_heights(proof.tier, proof.reg_log_height, proof.ram_log_height, proof.poseidon2_log_height, proof.reduce_log_height)?;
         // A `Vec` comparison: simultaneously the batch's instance-count check and every declared

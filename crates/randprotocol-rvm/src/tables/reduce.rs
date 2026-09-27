@@ -9,7 +9,7 @@
 //! The arithmetic is extension-field: `pz` is an extension element (two cells), `px` is a base
 //! element (one cell), and `inv`/`acc`/`apow`/`alpha` are extension constants of the run. Every
 //! constraint is degree ≤ 3 (two extension multiplications and an add).
-use super::{bus, F};
+use super::{bus, range::RangeCounts, F};
 use crate::emulator::{Event, TS_RUN_PX, TS_RUN_PZ0, TS_RUN_PZ1, TS_WB_ACC0, TS_WB_ACC1, TS_WB_APOW0, TS_WB_APOW1};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
@@ -41,7 +41,18 @@ pub mod col {
     /// merely checked forward.
     pub const LEN1: usize = 19;
     pub const LEN1_INV: usize = 20;
-    pub const WIDTH: usize = 21;
+    /// ZKQ-3 (the 2026-09-27 zk scan): the run's address range checks, three byte limbs each, on
+    /// its first row — the descriptor's first and last cells (`DESCR_PTR`, `DESCR_PTR + 10`), the
+    /// vals array's (`ADDR_V`, `ADDR_V + 2·LEN − 1`) and the row array's (`ADDR_R`,
+    /// `ADDR_R + LEN − 1`). The cpu's REDUCE row range-checks nothing (REDUCE is not among its
+    /// subjects), so before these a descriptor or an array could sit anywhere in the field.
+    pub const DESCR_LIMB0: usize = 21; // 3
+    pub const DESCR_END_LIMB0: usize = 24; // 3
+    pub const VALS_LIMB0: usize = 27; // 3
+    pub const VALS_END_LIMB0: usize = 30; // 3
+    pub const ROW_LIMB0: usize = 33; // 3
+    pub const ROW_END_LIMB0: usize = 36; // 3
+    pub const WIDTH: usize = 39;
 }
 use col::*;
 
@@ -77,7 +88,17 @@ where
         {
             let mut t = b.when_transition();
             t.assert_zero(is_last.clone() * n(IS_REAL) * (one.clone() - n(IS_FIRST)));
+            // ZKR-4 (the 2026-09-27 zk scan): and the converse — a real row that is not its
+            // run's last is followed by the same run's next row: not by padding, not by a new
+            // run's first row. Before this a run could simply stop: its first row followed by
+            // padding was accepted, the write-back (sent only on `IS_LAST`) never happened, and
+            // the cpu read the accumulator cell's pre-reduction value back as the result.
+            t.assert_zero(is_real.clone() * (one.clone() - is_last.clone()) * (one.clone() - n(IS_REAL)));
+            t.assert_zero(is_real.clone() * (one.clone() - is_last.clone()) * n(IS_FIRST));
         }
+        // The transition rules above never see the table's final row, so no run may be open
+        // there: the final row is padding (`reduce_trace` always leaves at least one).
+        b.when_last_row().assert_zero(is_real.clone());
         // And `IS_LAST` is the gadget's output, not a witness: pinned below.
         // The is-one gadget on `LEN == 1` (the `alu.rs` pattern), and `IS_LAST` pinned to its
         // output: `IS_LAST ⟺ LEN == 1`, so the write-back happens on the run's final column and
@@ -85,7 +106,14 @@ where
         b.assert_bool(v(LEN1));
         b.assert_zero((v(LEN) - one.clone()) * v(LEN1_INV) - (one.clone() - v(LEN1)));
         b.assert_zero(v(LEN1) * (v(LEN) - one.clone()));
-        b.assert_zero(is_last.clone() - v(LEN1));
+        // V-OPCODES-1 (the 2026-09-27 zk scan): both row kinds exist only on real rows. `IS_LAST`
+        // was `LEN1` on *every* row, and `LEN = LEN1 = 1` satisfies the gadget on a padding row as
+        // well as on a real one — so a padding row could send the four write-backs, with values of
+        // its choosing, at `16·CLK + 14/15` for a CLK that is only a field element (`clk + 1/16`
+        // lands between any two real timestamps). `IS_FIRST` was a free boolean on padding. Now a
+        // padding row is neither, and every message the chip sends is gated on a real row.
+        b.assert_zero(is_last.clone() - is_real.clone() * v(LEN1));
+        b.assert_zero(is_first.clone() * (one.clone() - is_real.clone()));
 
         // ── the column step: diff = pz − px; t = apow·diff; t2 = t·inv; acc += t2; apow ·= alpha ──
         let (diff0, diff1) = (v(PZ0) - v(PX), v(PZ1));
@@ -110,10 +138,42 @@ where
         t.assert_zero(in_run_next.clone() * (n(ALPHA0) - v(ALPHA0)));
         t.assert_zero(in_run_next.clone() * (n(ALPHA1) - v(ALPHA1)));
         t.assert_zero(in_run_next.clone() * (n(DESCR_PTR) - v(DESCR_PTR)));
+        // OPCODES-1 / TABLES-1 (the 2026-09-27 zk scan): the run's clock is carried like its
+        // descriptor pointer. Every row's column reads — and the last row's write-back — sit at
+        // `16·CLK + slot`, and only the first row's CLK is bound, by the `REDUCE` dispatch entry
+        // the cpu row consumes. Without this line a later row's CLK was free: its reads could land
+        // at any earlier clock (stale cells, whatever they held then) or a later one, and the
+        // write-back at any time at all — the memory table only asks that each cell's history be
+        // consistent in timestamp order, not that the chip's timestamps be the dispatch's.
+        t.assert_zero(in_run_next.clone() * (n(CLK) - v(CLK)));
         t.assert_zero(in_run_next.clone() * (n(ADDR_V) - v(ADDR_V) - AB::Expr::from_u32(2)));
         t.assert_zero(in_run_next.clone() * (n(ADDR_R) - v(ADDR_R) - one.clone()));
         t.assert_zero(in_run_next.clone() * (n(LEN) - v(LEN) + one.clone()));
         drop(t);
+
+        // ── ZKQ-3: the run's addresses, range-checked on its first row ──
+        // Six subjects, both ends of each of the three runs of cells the chip touches. With both
+        // ends below `2^24` and the run short — `LEN` on the first row is the run's row count,
+        // which the chain and ZKR-4's end rule tie to the table's own height — every cell between
+        // them is in range too; the rows after the first reach only `ADDR_V + 2k`, `ADDR_R + k`
+        // and the descriptor cells, all inside the checked ranges.
+        {
+            let limbs = |c: usize| v(c) + v(c + 1) * AB::Expr::from_u32(1 << 8) + v(c + 2) * AB::Expr::from_u32(1 << 16);
+            let subjects: [(AB::Expr, usize); 6] = [
+                (v(DESCR_PTR), DESCR_LIMB0),
+                (v(DESCR_PTR) + AB::Expr::from_u32(10), DESCR_END_LIMB0),
+                (v(ADDR_V), VALS_LIMB0),
+                (v(ADDR_V) + AB::Expr::from_u32(2) * v(LEN) - one.clone(), VALS_END_LIMB0),
+                (v(ADDR_R), ROW_LIMB0),
+                (v(ADDR_R) + v(LEN) - one.clone(), ROW_END_LIMB0),
+            ];
+            for (subject, c) in subjects {
+                b.assert_zero(is_first.clone() * (subject - limbs(c)));
+                for l in c..c + 3 {
+                    bus::RANGE8.lookup_key(b, [v(l)], Count::bounded(is_first.clone(), 1));
+                }
+            }
+        }
 
         // ── buses ──
         // The dispatch handle: one entry per run, on its first row (the sha256 block pattern).
@@ -183,7 +243,7 @@ pub fn reduce_events(events: &[Event]) -> Vec<&Event> {
 /// `len` rows per event: the first carries the descriptor's state (and the `IS_FIRST` bus
 /// entry), each row one column's step, the last the write-back. Padding rows are all zero (the
 /// row-kind selectors are witness, so an all-zero row satisfies every gated constraint).
-pub fn reduce_trace(events: &[&Event], height: usize) -> RowMajorMatrix<F> {
+pub fn reduce_trace(events: &[&Event], height: usize, counts: &mut RangeCounts) -> RowMajorMatrix<F> {
     let n_rows: usize = events.iter().map(|e| e.reduce.unwrap().len as usize).sum();
     assert!(n_rows < height, "reduce table needs a padding row: {n_rows} rows, height {height}");
     let mut v = F::zero_vec(height * col::WIDTH);
@@ -233,6 +293,24 @@ pub fn reduce_trace(events: &[&Event], height: usize) -> RowMajorMatrix<F> {
             acc = [acc[0] + t2_0, acc[1] + t2_1];
             apow = ext_mul(apow, ev.alpha).into();
             if first {
+                // ZKQ-3's six range checks, computed as the AIR recomputes them.
+                let len = ev.len as u64;
+                let subjects = [
+                    (ev.descr_ptr, DESCR_LIMB0),
+                    (ev.descr_ptr + 10, DESCR_END_LIMB0),
+                    (ev.vals_base, VALS_LIMB0),
+                    (ev.vals_base + 2 * len - 1, VALS_END_LIMB0),
+                    (ev.row_base, ROW_LIMB0),
+                    (ev.row_base + len - 1, ROW_END_LIMB0),
+                ];
+                for (s, c) in subjects {
+                    assert!(s < 1 << 24, "the emulator bounds every REDUCE address below 2^24");
+                    for k in 0..3 {
+                        let limb = (s >> (8 * k)) as u32 & 0xff;
+                        r[c + k] = F::from_u32(limb);
+                        counts.range8(limb);
+                    }
+                }
                 for (j, rd) in descr_reads.iter().enumerate() {
                     let want = [
                         ev.vals_base, ev.row_base, ev.len as u64, ev.inv[0].as_canonical_u64(), ev.inv[1].as_canonical_u64(),

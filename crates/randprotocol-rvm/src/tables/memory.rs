@@ -35,7 +35,8 @@ pub const REGISTER_BASE: u64 = 1 << 24;
 
 /// One AIR, two instances: `register` picks the bus the instance receives on (`REG` or `RAM`).
 /// The table does not constrain its address range itself — the *senders* enforce it (the cpu's
-/// index decompositions and address limbs), and a row planted in the wrong table is an unclaimed
+/// index decompositions and address limbs, both ends of every multi-cell access since ZKQ-3, and
+/// the reduce chip's run-address limbs), and a row planted in the wrong table is an unclaimed
 /// supply on its bus, since each bus balances independently.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MemoryAir {
@@ -90,7 +91,8 @@ where
         }
         // The one sort key is the address itself — research's audit-ZM2 lesson (compute the key
         // exactly as the AIR does) applies unchanged; the delta fits four bytes
-        // (addresses < 2^24 + 32, timestamps < 16·2^22 at the top tier).
+        // (addresses < 2^24 + 32, timestamps < 16·2^23 = 2^27 at the top tier, 23 — ZKQ-6: this
+        // said 16·2^22 before the tier-23 rung; four bytes hold either).
         let msg = [l(ADDR), l(TS), l(VALUE), l(IS_WRITE)];
         let count = Count::bounded(l(IS_REAL), 1);
         if self.register {
