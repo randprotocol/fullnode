@@ -1542,7 +1542,7 @@ mod tests {
         // chain-13 node.
         assert_eq!(state.hc_bundle, ZkExecutor::hc_legacy_bundle(), "chain 13 pins the retired guest");
         assert_ne!(state.hc_bundle, ZkExecutor::hc_bundle());
-        let refused = node::check_build_runs_genesis(&state, &ZkExecutor::hc_bundle()).unwrap_err().to_string();
+        let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).unwrap_err().to_string();
         assert!(refused.contains("differs from the genesis hc_bundle"), "{refused}");
     }
 

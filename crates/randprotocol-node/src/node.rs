@@ -1492,12 +1492,18 @@ fn close_batch_coverage(storage: &Storage, batch: &mut Vec<CommittedBlock>, limi
 ///   hidden guest does not share. Aggregation is inactive on every live chain; it has to be
 ///   re-measured against the hidden guest before a genesis may carry it again. Refused with a
 ///   clear error rather than started into a chain whose aggregates could never cover a bundle.
-pub fn check_build_runs_genesis(gs: &GenesisState, built_hc_bundle: &randprotocol_core::notes::Word8) -> Result<()> {
-    if *built_hc_bundle != gs.hc_bundle {
+///
+/// `built_hc_bundles` is every bundle guest this build carries (`ZkExecutor::known_hc_bundles`):
+/// since the branch-free guest (INT-2 / GV-1) there are two, and the genesis picks one by its
+/// `hc_bundle` — chains 14 and 15 name v1, a later cut names v2. Verification needs nothing more
+/// (the program is digested in-circuit and both guests declare the same heights), so either is
+/// runnable; a genesis naming anything else is refused as before.
+pub fn check_build_runs_genesis(gs: &GenesisState, built_hc_bundles: &[randprotocol_core::notes::Word8]) -> Result<()> {
+    if !built_hc_bundles.contains(&gs.hc_bundle) {
         anyhow::bail!(
-            "this build's bundle guest ({}) differs from the genesis hc_bundle ({}); \
+            "every bundle guest this build carries ({}) differs from the genesis hc_bundle ({}); \
              rebuild from the chain's pinned commit",
-            randprotocol_core::notes::word8_to_hex(built_hc_bundle),
+            built_hc_bundles.iter().map(randprotocol_core::notes::word8_to_hex).collect::<Vec<_>>().join(", "),
             randprotocol_core::notes::word8_to_hex(&gs.hc_bundle)
         );
     }
@@ -1526,7 +1532,7 @@ pub fn check_build_runs_genesis(gs: &GenesisState, built_hc_bundle: &randprotoco
 pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     let key = Keypair::from_seed(cfg.seed).context("bad key seed")?;
     let (gs, executor) = load_genesis(&cfg.datadir)?;
-    check_build_runs_genesis(&gs, &ZkExecutor::hc_bundle())?;
+    check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles())?;
     // The disk guard (audit v4 OPS-3): a node that opens RocksDB on a full disk crash-loops
     // with the RPC never up; refusing here names the directory and the flag instead.
     let disk_free_bytes =
@@ -4200,9 +4206,20 @@ mod tests {
     fn startup_refuses_another_guest_and_an_aggregation_section() {
         let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
         let hc = gs.hc_bundle;
-        assert!(check_build_runs_genesis(&gs, &hc).is_ok());
-        let other = check_build_runs_genesis(&gs, &[0xdead; 8]).unwrap_err().to_string();
+        assert!(check_build_runs_genesis(&gs, &[hc]).is_ok());
+        let other = check_build_runs_genesis(&gs, &[[0xdead; 8]]).unwrap_err().to_string();
         assert!(other.contains("differs from the genesis hc_bundle"), "{other}");
+        // The build's two guests (INT-2 / GV-1): a genesis naming either starts; one naming
+        // neither — the retired 2-in-2-out guest, say — does not.
+        let [v1, v2] = ZkExecutor::known_hc_bundles();
+        for named in [v1, v2] {
+            gs.hc_bundle = named;
+            assert!(check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles()).is_ok());
+        }
+        gs.hc_bundle = ZkExecutor::hc_legacy_bundle();
+        let retired = check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles()).unwrap_err().to_string();
+        assert!(retired.contains("differs from the genesis hc_bundle"), "{retired}");
+        gs.hc_bundle = hc;
         gs.ledger.set_aggregation(Some(randprotocol_core::ledger::aggregation::AggregationConfig {
             bond: 100 * randprotocol_core::UNITS_PER_RAND,
             max_covers: 3,
@@ -4211,7 +4228,7 @@ mod tests {
             window: 256,
             admitted_shapes: vec![],
         }));
-        let gated = check_build_runs_genesis(&gs, &hc).unwrap_err().to_string();
+        let gated = check_build_runs_genesis(&gs, &[hc]).unwrap_err().to_string();
         assert!(gated.contains("block aggregation") && gated.contains("re-measured"), "{gated}");
         // And the second reason (the 2026-09-27 recursion-VM report, recommendation 5).
         assert!(gated.contains("RVM-1") && gated.contains("forged-aggregate exercise"), "{gated}");
@@ -4255,7 +4272,7 @@ mod tests {
         });
         let gs = file.build(&StubExecutor).expect("the section validates");
         assert!(gs.ledger.aggregation().is_some());
-        assert!(check_build_runs_genesis(&gs, &hc).is_err(), "a validating aggregation genesis still does not start");
+        assert!(check_build_runs_genesis(&gs, &[hc]).is_err(), "a validating aggregation genesis still does not start");
     }
 
     /// The aggregation gate survives a restart: it lives in the genesis file, so a reloaded

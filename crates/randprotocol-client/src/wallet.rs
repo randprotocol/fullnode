@@ -37,7 +37,7 @@ use randprotocol_zkvm::address::{address_of, envelope_from_core, seal_note_as};
 // every production sealing site goes through `seal_note_as` with the chain's format.
 #[cfg(test)]
 use randprotocol_zkvm::address::seal_note;
-use randprotocol_zkvm::executor::{prove_hidden_bundle, ZkExecutor};
+use randprotocol_zkvm::executor::{prove_bundle_for, ZkExecutor};
 use randprotocol_zkvm::hidden::{self, HiddenDigestInput, HiddenOutput, A_SLOTS, SLOTS};
 use randprotocol_zkvm::machine::{Backend, FriProfile};
 use randprotocol_zkvm::notes::{Note, SpendKey, ViewingKey};
@@ -1512,6 +1512,12 @@ struct Prepared {
     words: Vec<u32>,
     /// The digest this wallet computed from its own plaintext, which the proof must publish.
     expected: Word8,
+    /// The chain's bundle guest — its genesis `hc_bundle`, as `rand_status` names it — which is
+    /// the program this bundle is proved with ([`ZkExecutor::bundle_program_for`]). Chains 14 and
+    /// 15 run the v1 hidden guest; a later genesis may name the branch-free v2 (INT-2 / GV-1).
+    /// Both read this witness and publish this digest, so only the program differs — and a proof
+    /// of the other one would be refused by every validator.
+    guest: Word8,
 }
 
 /// One bundle's proof, made against its transaction's binding.
@@ -1543,7 +1549,7 @@ impl Prepared {
     fn prove(&self, binding: &[u32; TX_BINDING_WORDS], profile: FriProfile, backend: Backend) -> Result<Proved> {
         eprintln!("proving the bundle (tier 14; about a minute and a half on a laptop)…");
         let started = Instant::now();
-        let (proof, digest, tier) = prove_hidden_bundle(profile, &self.words, binding, backend)
+        let (proof, digest, tier) = prove_bundle_for(&self.guest, profile, &self.words, binding, backend)
             .map_err(|e| anyhow!("proving the bundle failed: {e}"))?;
         let proving = started.elapsed();
         eprintln!("proved in {proving:.1?}: tier {tier}, {} bytes", proof.len());
@@ -1672,7 +1678,23 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
         envelopes,
         proof: Vec::new(),
     };
-    Ok(Prepared { bundle, words, expected })
+    Ok(Prepared { bundle, words, expected, guest: ZkExecutor::hc_bundle() })
+}
+
+/// The chain's bundle guest: `rand_status`'s `hc_bundle` (the genesis pin), refused unless this
+/// build can prove it — asked before a bundle is built, so a wallet too old for its chain says so
+/// instead of spending a minute and a half on a proof every validator refuses.
+async fn chain_bundle_guest(rpc: &RpcClient) -> Result<Word8> {
+    let status = rpc.status().await?;
+    let named = status["hc_bundle"].as_str().ok_or_else(|| anyhow!("the node's rand_status names no hc_bundle"))?;
+    let hc = randprotocol_core::notes::word8_from_hex(named).ok_or_else(|| anyhow!("the node's hc_bundle {named} is not a 32-byte digest"))?;
+    if ZkExecutor::bundle_program_for(&hc).is_none() {
+        return Err(anyhow!(
+            "this chain's bundle guest is {named}, which this wallet cannot prove (it carries {}); update the wallet",
+            ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h)).join(" and ")
+        ));
+    }
+    Ok(hc)
 }
 
 /// Builds the bundle's witness from the wallet's own tree and picks its anchor, then builds the
@@ -1687,6 +1709,7 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
 /// Failing that, the newest checkpoint the node still serves — the local tree is frozen at its
 /// checkpoints, so where the old code looped on "tree moved; retry" this one rescans once.
 async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, plan: &Plan, format: EnvelopeFormat) -> Result<(Prepared, u32)> {
+    let guest = chain_bundle_guest(rpc).await?;
     let h = tree_hash();
     for attempt in 0..2 {
         let live = store.tree.root(&h);
@@ -1722,7 +1745,8 @@ async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, plan
                     .with_context(|| format!("no local witness for note {}; the store's tree is incomplete", n.index))?;
                 paths.push(path);
             }
-            return Ok((build_bundle(w, plan, root, &paths, time, format)?, time));
+            let prepared = Prepared { guest, ..build_bundle(w, plan, root, &paths, time, format)? };
+            return Ok((prepared, time));
         }
         if attempt == 1 {
             return Err(anyhow!(
@@ -3936,7 +3960,8 @@ mod tests {
     /// [`Proving::Emulated`]: the hidden guest run on `p.words` against `binding`, its digest
     /// checked as a real proof's is, and a stub proof carrying it.
     pub(super) fn emulated_proof(p: &Prepared, binding: &[u32; TX_BINDING_WORDS]) -> Result<Proved> {
-        let run = randprotocol_zkvm::emulator::execute(ZkExecutor::hidden_bundle_program(), &p.words, binding, 1 << 20)
+        let program = ZkExecutor::bundle_program_for(&p.guest).expect("prepare_bundle refuses a guest this build lacks");
+        let run = randprotocol_zkvm::emulator::execute(program, &p.words, binding, 1 << 20)
             .map_err(|e| anyhow!("the hidden guest did not run: {e:?}"))?;
         let digest: Word8 = run.outputs;
         check_published_digest(&digest, &p.expected)?;
@@ -3980,6 +4005,8 @@ mod tests {
         /// that predates the field, same as a genuinely absent one; `Some(MEMO_ENVELOPE_BYTES)`
         /// is the memo format.
         envelope_bytes: Option<u32>,
+        /// `rand_status`'s `hc_bundle`: the chain's bundle guest, v1 unless a test says otherwise.
+        hc_bundle: Word8,
     }
 
     fn kind(a: &Action) -> &'static str {
@@ -4018,6 +4045,7 @@ mod tests {
                 genesis: Hash([9; 32]),
                 witness_calls: 0,
                 envelope_bytes: None,
+                hc_bundle: ZkExecutor::hc_bundle(),
             }
         }
 
@@ -4124,6 +4152,7 @@ mod tests {
                     self.sent.push(tx);
                     json!(hash)
                 }
+                "rand_status" => json!({ "hc_bundle": word8_to_hex(&self.hc_bundle) }),
                 "rand_getBridgeState" => self.bridge.clone(),
                 "rand_getAssets" => self.assets.clone(),
                 "rand_getTokens" => self.tokens.clone(),
@@ -4732,6 +4761,36 @@ mod tests {
         assert_eq!(store.notes.len(), 3, "two funding notes and the change");
         assert_eq!(store.sent.len(), 1, "one payment in the history");
         assert_eq!(output_keys(&me, &tx).len(), 2, "the payment and the change, never a dummy");
+    }
+
+    /// The wallet proves the chain's bundle guest, not the one it was built around: on a chain
+    /// whose genesis names the branch-free guest (INT-2 / GV-1) the bundle is proved with v2 —
+    /// the emulated proof runs `bundle_program_for` of the `hc_bundle` `rand_status` names, and
+    /// its digest still matches what the wallet built — and on a chain naming a guest this build
+    /// does not carry the send is refused before anything is proved or sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_send_proves_the_bundle_guest_the_chain_names() {
+        let me = Wallet::from_spend_key(SpendKey([46; 8]));
+        let you = Wallet::from_spend_key(SpendKey([47; 8]));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        // Two notes: the first send leaves its note pending, the second spends the other.
+        chain.lock().unwrap().fund(&me, 7_000_000, 0);
+        chain.lock().unwrap().fund(&me, 7_000_000, 0);
+        chain.lock().unwrap().hc_bundle = ZkExecutor::hc_hidden_bundle_v2();
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000_000, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap();
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        chain.lock().unwrap().hc_bundle = [0xbad; 8];
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000_000, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("which this wallet cannot prove"), "{e}");
+        assert!(chain.lock().unwrap().sent.is_empty(), "nothing sent for a guest the wallet cannot prove");
     }
 
     /// Audit v3 PRIV-1: a wallet that asks the node for the witnesses of exactly the notes it
@@ -6334,6 +6393,7 @@ mod tests {
             },
             words: Vec::new(),
             expected: [0; 8],
+            guest: ZkExecutor::hc_bundle(),
         };
         let action = Action::BridgeBurn { asset: 3, amount: 400, relayer_fee: 100, to_chain: 2, token: [7; 32], to: [1; 32] };
         let mut tx = Transaction::shielded(13, prepared.bundle.clone(), action);
