@@ -548,6 +548,13 @@ field to the honest prover's value, for bundle and call proofs alike:
 
 - **The memory table's height** (INT-5 / HB-2): exactly `t + 2` for a proof without a keccak or
   sha256 table — 16 for every bundle. A bundle declaring 17 verified.
+- **The FRI folding schedule** (VERIFIER-2 / V-VERIFIER-1): the per-round `log_arity` the verifier
+  accepts at any value that folds onto every input height; pinned to the prover's greedy schedule,
+  re-derived from the declared shape (`executor::honest_fri_arities`, checked against calls at
+  tiers 10/12/14 and a bundle).
+- **The random-codeword openings** (V-VERIFIER-1): four random values at every opened point of a
+  randomised round, none in the preprocessed round — a count the hiding PCS's verifier does not
+  check.
 
 Under `hardening_v6` a transaction carrying such a proof is `NonCanonicalProof` at admission and at
 apply (`ConfidentialExecutor::non_canonical_proof`, before either proof is verified). Every node

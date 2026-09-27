@@ -177,6 +177,13 @@ pub fn call_private_table_under_floor(proof: &[u8]) -> Option<(&'static str, u8)
 ///   bundle declaring 17 verified (the review demonstrated it); it fingerprints the wallet that
 ///   made it and cannot be aggregated. A proof with a hash table has a data-dependent honest
 ///   height, which is left ranged.
+/// - **The FRI folding schedule** (VERIFIER-2 / V-VERIFIER-1): the per-round `log_arity` the
+///   verifier accepts at any value in `1..=max_log_arity` that folds onto every input height, so
+///   any finer schedule than the prover's greedy one verifies too; pinned to
+///   [`honest_fri_arities`], re-derived from the declared shape.
+/// - **The random-codeword openings** (V-VERIFIER-1): the hiding PCS's count of random values
+///   per opened point, which its verifier nests but does not count — four at every point of a
+///   randomised round, none in the preprocessed round.
 ///
 /// Which proofs this runs on, and when, is the caller's: every node's pool refuses a transaction
 /// carrying such a proof (`admission::non_canonical_proofs`), and the ledger refuses it under
@@ -194,7 +201,88 @@ pub fn non_canonical(proof: &Proof) -> Option<String> {
             proof.tier.0
         ));
     }
+    // VERIFIER-2 / V-VERIFIER-1: the folding schedule, re-derived from the declared shape.
+    let fri = &proof.batch.opening_proof.1;
+    let schedule: Vec<u8> = fri.commit_phase_openings.iter().map(|step| step.log_arity).collect();
+    if let Some(honest) = honest_fri_arities(proof) {
+        if schedule != honest {
+            return Some(format!("FRI folding schedule {schedule:?} where the honest prover folds {honest:?}"));
+        }
+    }
+    // And the hiding PCS's random openings: `NUM_RANDOM_CODEWORDS` values at every opened point
+    // of every randomised round, none in the one round that is not randomised (the preprocessed
+    // traces, one matrix per chip that has any). The verifier checks only the nesting — round,
+    // matrix, point — and appends whatever it finds; the count per point is the prover's to
+    // choose as far as that layer is concerned.
+    let preprocessed = crate::machine::chips(
+        if TIERS.contains(&proof.tier.0) { proof.tier } else { Tier(TIERS[0]) },
+        proof.keccak_log_height,
+        proof.sha256_log_height,
+    )
+    .iter()
+    .filter(|c| p3_air::BaseAir::<crate::machine::Val>::preprocessed_width(*c) > 0)
+    .count();
+    let mut unrandomised_rounds = 0;
+    for round in &proof.batch.opening_proof.0 {
+        let counts: Vec<usize> = round.iter().flatten().map(|point| point.len()).collect();
+        if !counts.is_empty() && counts.iter().all(|&c| c == 0) && round.len() == preprocessed {
+            unrandomised_rounds += 1;
+        } else if let Some(bad) = counts.iter().find(|&&c| c != NUM_RANDOM_CODEWORDS) {
+            return Some(format!("random-codeword opening of {bad} values where the honest prover opens {NUM_RANDOM_CODEWORDS}"));
+        }
+    }
+    if unrandomised_rounds > 1 {
+        return Some(format!("{unrandomised_rounds} unrandomised opening rounds where the honest prover has one"));
+    }
     None
+}
+
+/// The FRI parameters `machine::build_config` proves and verifies with — `log_blowup`,
+/// `log_final_poly_len`, `max_log_arity` — and the hiding PCS's random-codeword count
+/// (`HidingFriPcs::new(.., 4, ..)`). `machine.rs` keeps them as literals inside a private
+/// function; restated here for [`honest_fri_arities`], and pinned by
+/// `tests::verifier2_…`, which re-derives honest proofs' schedules from them (a re-vendor that
+/// moves one fails there).
+const FRI_LOG_BLOWUP: usize = 3;
+const FRI_LOG_FINAL_POLY_LEN: usize = 0;
+const FRI_MAX_LOG_ARITY: usize = 3;
+const NUM_RANDOM_CODEWORDS: usize = 4;
+
+/// VERIFIER-2: the FRI folding schedule the honest prover writes for a proof of this declared
+/// shape, or `None` for a shape that has no batch (a tier outside `TIERS`, an instance count the
+/// chip set does not have — refused elsewhere).
+///
+/// The schedule is proof-supplied (`CommitPhaseMultiStep::log_arity`, one per round) and the FRI
+/// verifier checks only that each arity is in `1..=max_log_arity`, that they sum to the global
+/// height, and that every input height is folded onto exactly — so every *finer* schedule than the
+/// prover's is accepted too, a second encoding of the same statement. The prover's own rule
+/// (`p3_fri::prover::commit_phase` → `compute_log_arity_for_round`) is greedy: from the tallest
+/// input, fold by `min(max_log_arity, to the next input height, to the final height)` each round.
+/// The input heights are the batch's committed LDE heights: every instance's extended trace domain
+/// (`degree_bits`, which already counts the zk doubling) plus `log_blowup` — main trace, quotient
+/// chunks, permutation and randomization polynomials, and a chip's preprocessed columns, all live
+/// at their instance's one height. (A first draft also placed the preprocessed traces one height
+/// lower, un-extended; every call proof agreed by coincidence — range and nibble's would-be 11 was
+/// the input table's own height at tier 10 — and the bundle, where it is not, showed it wrong.)
+pub fn honest_fri_arities(proof: &Proof) -> Option<Vec<u8>> {
+    if !TIERS.contains(&proof.tier.0) {
+        return None;
+    }
+    let chips = crate::machine::chips(proof.tier, proof.keccak_log_height, proof.sha256_log_height);
+    if chips.len() != proof.batch.degree_bits.len() {
+        return None;
+    }
+    let heights: std::collections::BTreeSet<usize> = proof.batch.degree_bits.iter().map(|db| db + FRI_LOG_BLOWUP).collect();
+    let final_height = FRI_LOG_BLOWUP + FRI_LOG_FINAL_POLY_LEN;
+    let mut current = *heights.iter().next_back()?;
+    let mut schedule = Vec::new();
+    while current > final_height {
+        let to_next = heights.range(..current).next_back().map_or(current - final_height, |next| current - next);
+        let arity = FRI_MAX_LOG_ARITY.min(to_next).min(current - final_height);
+        schedule.push(arity as u8);
+        current -= arity;
+    }
+    Some(schedule)
 }
 
 /// [`non_canonical`] over proof bytes: `None` for bytes that do not decode canonically — those
@@ -1230,6 +1318,49 @@ mod tests {
                 "the stub's restatement, public {n}"
             );
         }
+    }
+
+    /// VERIFIER-2 / V-VERIFIER-1: the FRI folding schedule and the hiding PCS's random-value
+    /// counts are pinned to the honest prover's. The schedule is re-derived from the declared
+    /// shape alone (`honest_fri_arities`) and matches every honest proof here — calls at tiers
+    /// 10, 12 and 14 and a (tainted, so any-witness) hidden-asset bundle — while a proof whose
+    /// schedule is permuted, or whose random-value count is padded, is named non-canonical. None
+    /// of these mutants need to verify: the rule reads the transcript's shape only.
+    #[test]
+    fn verifier2_the_fri_schedule_and_random_counts_are_the_honest_provers() {
+        use super::*;
+        use crate::machine::{Backend, FriProfile};
+        let payment = crate::guests::private_payment(1000);
+        let (base, _, _) = prove(FriProfile::Test, &payment, &[400, 250, 300, 75], &[], None, Backend::Cpu).unwrap();
+        // The mutants first (cheap: one tier-10 proof), the sweep of honest shapes after.
+        // The same arities in another order: the same total fold, a different transcript.
+        let mut swapped = decode_canonical(&base).unwrap();
+        let steps = &mut swapped.batch.opening_proof.1.commit_phase_openings;
+        let (i, j) = (0..steps.len()).flat_map(|i| (i + 1..steps.len()).map(move |j| (i, j))).find(|&(i, j)| steps[i].log_arity != steps[j].log_arity).unwrap();
+        let (a, b) = (steps[i].log_arity, steps[j].log_arity);
+        (steps[i].log_arity, steps[j].log_arity) = (b, a);
+        assert!(non_canonical(&swapped).is_some_and(|w| w.starts_with("FRI folding schedule")), "a permuted schedule");
+        // One random value too many on one opening point.
+        let mut padded = decode_canonical(&base).unwrap();
+        padded.batch.opening_proof.0[0][0][0].push(Default::default());
+        assert!(non_canonical(&padded).is_some_and(|w| w.starts_with("random-codeword")), "a padded random opening");
+        let mut honest: Vec<(String, Vec<u8>)> = vec![("call at tier 10".into(), base)];
+        for tier in [Some(12), Some(14)] {
+            let (bytes, _, t) = prove(FriProfile::Test, &payment, &[400, 250, 300, 75], &[], tier, Backend::Cpu).unwrap();
+            honest.push((format!("call at tier {t}"), bytes));
+        }
+        let (fib, _, _) = prove(FriProfile::Test, &crate::guests::fib(10), &[], &[], None, Backend::Cpu).unwrap();
+        honest.push(("fib".into(), fib));
+        let (bundle, _, _) =
+            prove_hidden_bundle(FriProfile::Test, &vec![0; crate::hidden::hidden_input::COUNT], &[7; TX_BINDING_WORDS], Backend::Cpu).unwrap();
+        honest.push(("bundle".into(), bundle));
+        for (what, bytes) in &honest {
+            let p = decode_canonical(bytes).unwrap();
+            let got: Vec<u8> = p.batch.opening_proof.1.commit_phase_openings.iter().map(|o| o.log_arity).collect();
+            assert_eq!(Some(got), honest_fri_arities(&p), "{what}: the derived schedule is the prover's");
+            assert_eq!(non_canonical(&p), None, "{what}: honest is canonical");
+        }
+        assert_eq!(non_canonical_proof(&padded.to_bytes()), non_canonical(&padded), "the byte form reads the same");
     }
 
     /// ZKG-1: an output word past 32 bits is refused, never narrowed. `x as u32` of
