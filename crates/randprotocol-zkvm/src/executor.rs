@@ -185,6 +185,12 @@ pub fn call_private_table_under_floor(proof: &[u8]) -> Option<(&'static str, u8)
 ///   per opened point, which its verifier nests but does not count — four at every point of a
 ///   randomised round, none in the preprocessed round.
 ///
+/// - **The commit-phase proof-of-work words** (VERIFIER-1): read and dropped at 0 grinding bits,
+///   outside the Fiat-Shamir transcript, so a relayer can rewrite one and the copy verifies with
+///   another transaction id — the sender's wallet then reports its own payment as not committed.
+///   Pinned to zero, what `grind(0)` writes. (The *query* proof-of-work word is ground at the
+///   profile's bits, observed, and has no single honest value; it is left alone.)
+///
 /// Which proofs this runs on, and when, is the caller's: every node's pool refuses a transaction
 /// carrying such a proof (`admission::non_canonical_proofs`), and the ledger refuses it under
 /// genesis `hardening_v6` (`ConfidentialExecutor::non_canonical_proof`).
@@ -201,8 +207,16 @@ pub fn non_canonical(proof: &Proof) -> Option<String> {
             proof.tier.0
         ));
     }
-    // VERIFIER-2 / V-VERIFIER-1: the folding schedule, re-derived from the declared shape.
+    // VERIFIER-1: the commit-phase proof-of-work words. The chain's FRI parameters grind 0 bits
+    // per commit round (`commit_proof_of_work_bits: 0`, `machine::build_config`), and at 0 bits
+    // `GrindingChallenger::check_witness` returns `true` without even observing the word — so it
+    // is outside the transcript, anyone relaying the proof can rewrite it, and the copy verifies
+    // under another transaction id. The honest prover's `grind(0)` writes zero.
     let fri = &proof.batch.opening_proof.1;
+    if let Some(round) = fri.commit_pow_witnesses.iter().position(|w| *w != <crate::machine::Val as p3_field::PrimeCharacteristicRing>::ZERO) {
+        return Some(format!("FRI commit-phase proof-of-work word {round} is not zero, the honest prover's (0 grinding bits)"));
+    }
+    // VERIFIER-2 / V-VERIFIER-1: the folding schedule, re-derived from the declared shape.
     let schedule: Vec<u8> = fri.commit_phase_openings.iter().map(|step| step.log_arity).collect();
     if let Some(honest) = honest_fri_arities(proof) {
         if schedule != honest {
@@ -1361,6 +1375,44 @@ mod tests {
             assert_eq!(non_canonical(&p), None, "{what}: honest is canonical");
         }
         assert_eq!(non_canonical_proof(&padded.to_bytes()), non_canonical(&padded), "the byte form reads the same");
+    }
+
+    /// VERIFIER-1: the FRI commit-phase proof-of-work words are read and dropped — the chain's
+    /// FRI parameters grind 0 bits there, and `check_witness(0, _)` is `true` for any word — so
+    /// anyone relaying a call or a bundle can rewrite one and hold a second valid encoding with
+    /// another transaction id. Shown on a real call: the rewritten proof still verifies against
+    /// the deployed program, and it is named non-canonical; the honest prover writes zero.
+    #[test]
+    fn verifier1_a_rewritten_commit_pow_word_verifies_and_is_non_canonical() {
+        use super::*;
+        use crate::machine::{Backend, FriProfile, Val};
+        use p3_field::PrimeCharacteristicRing;
+        let program = crate::guests::private_payment(1000);
+        let (bytes, _, _) = prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu).unwrap();
+        let honest = decode_canonical(&bytes).unwrap();
+        assert!(honest.batch.opening_proof.1.commit_pow_witnesses.iter().all(|w| *w == Val::ZERO), "the honest prover grinds 0 bits to zero");
+        let zk = ZkExecutor::new(FriProfile::Test);
+        let record = ProgramRecord {
+            id: randprotocol_core::program::program_id(program.base_pc, &program.words),
+            base_pc: program.base_pc,
+            words: program.words.clone(),
+            code_hash: zk.check_program(program.base_pc, &program.words).unwrap(),
+            deployed_at: 0,
+            public_digest: None,
+            public_len: 0,
+        };
+        let mut rewritten = decode_canonical(&bytes).unwrap();
+        rewritten.batch.opening_proof.1.commit_pow_witnesses[0] = Val::from_u64(0xdead_beef);
+        let rewritten = rewritten.to_bytes();
+        assert_ne!(rewritten, bytes, "another encoding, so another transaction id");
+        assert_eq!(zk.verify_call(&record, &rewritten), zk.verify_call(&record, &bytes), "the finding: it verifies all the same");
+        assert!(zk.verify_call(&record, &bytes).is_ok());
+        assert_eq!(non_canonical_proof(&bytes), None);
+        assert!(
+            non_canonical_proof(&rewritten).is_some_and(|w| w.starts_with("FRI commit-phase proof-of-work word")),
+            "{:?}",
+            non_canonical_proof(&rewritten)
+        );
     }
 
     /// ZKG-1: an output word past 32 bits is refused, never narrowed. `x as u32` of

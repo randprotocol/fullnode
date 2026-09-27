@@ -555,6 +555,9 @@ field to the honest prover's value, for bundle and call proofs alike:
 - **The random-codeword openings** (V-VERIFIER-1): four random values at every opened point of a
   randomised round, none in the preprocessed round — a count the hiding PCS's verifier does not
   check.
+- **The commit-phase proof-of-work words** (VERIFIER-1): zero. At 0 grinding bits the verifier
+  never reads them, so a relayer could rewrite one and commit a second encoding of someone's bundle
+  under another transaction id.
 
 Under `hardening_v6` a transaction carrying such a proof is `NonCanonicalProof` at admission and at
 apply (`ConfidentialExecutor::non_canonical_proof`, before either proof is verified). Every node
