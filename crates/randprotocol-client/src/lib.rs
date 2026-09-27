@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 pub mod contacts;
 pub mod governance;
+pub mod memo_display;
 pub mod qr;
 pub mod tree;
 pub mod wallet;
