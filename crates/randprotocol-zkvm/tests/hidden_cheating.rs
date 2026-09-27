@@ -45,7 +45,7 @@
 use std::sync::Mutex;
 
 use randprotocol_zkvm::emulator::execute;
-use randprotocol_zkvm::executor::{prove_hidden_bundle, ZkExecutor};
+use randprotocol_zkvm::executor::{prove_bundle_for, ZkExecutor};
 use randprotocol_zkvm::hidden::{self, hidden_input as hi, slot_asset, HiddenDigestInput, HiddenOutput, HIDDEN_BUNDLE_DOMAIN, SLOTS};
 use randprotocol_zkvm::ledger::CommitmentTree;
 use randprotocol_zkvm::machine::{Backend, FriProfile};
@@ -209,10 +209,36 @@ fn emulate(inputs: &[u32]) -> Word8 {
 }
 
 /// `emulate`, naming the run in the panic if the guest traps (a fuzz run: seed, base, mutation).
+///
+/// Runs **both** hidden guests — v1 (`guests::bundle_hidden`, chains 14 and 15) and the
+/// branch-free v2 (`guests::bundle_hidden_v2`, INT-2 / GV-1) — and insists they publish the same
+/// digest, so the whole suite (every hand-built cheat, the model cross-checks, and every fuzz
+/// mutation) holds v2 to v1's relation exactly: a branch-free guest that masks a check instead of
+/// jumping over it must not have lost one (a cheat v1 taints that v2 does not) or gained one (an
+/// honest or merely unusual witness — a dummy's path word, an unread one in v1 — that v2
+/// taints). The dummy rule, the membership and ownership taints and the asset checks are the
+/// ones v2 rewrote; they are exactly where the two runs would part.
 fn emulate_or(inputs: &[u32], ctx: impl FnOnce() -> String) -> Word8 {
-    match execute(ZkExecutor::hidden_bundle_program(), inputs, &BINDING_A, MAX_CYCLES) {
-        Ok(exec) => exec.outputs,
-        Err(e) => panic!("{}: the guest trapped instead of tainting: {e:?}", ctx()),
+    let run = |program| match execute(program, inputs, &BINDING_A, MAX_CYCLES) {
+        Ok(exec) => Ok(exec.outputs),
+        Err(e) => Err(format!("{e:?}")),
+    };
+    match (run(ZkExecutor::hidden_bundle_program()), run(ZkExecutor::hidden_bundle_v2_program())) {
+        (Ok(v1), Ok(v2)) if v1 == v2 => v1,
+        (Ok(v1), Ok(v2)) => panic!("{}: v1 and the branch-free v2 publish different digests: {v1:08x?} vs {v2:08x?}", ctx()),
+        (e1, e2) => panic!("{}: a guest trapped instead of tainting: v1 {e1:?}, v2 {e2:?}", ctx()),
+    }
+}
+
+/// The guest the real proofs below prove: v1 by default, the branch-free v2 with
+/// `HIDDEN_BUNDLE_GUEST=v2` — the nineteen real-proof cheats then run against v2 end to end
+/// (`cargo test --release -p randprotocol-zkvm --test hidden_cheating real_proof_` with the
+/// variable set, ~32 min).
+fn proved_guest() -> Word8 {
+    match std::env::var("HIDDEN_BUNDLE_GUEST").as_deref() {
+        Ok("v2") => ZkExecutor::hc_hidden_bundle_v2(),
+        Ok("v1") | Err(_) => ZkExecutor::hc_hidden_bundle(),
+        Ok(other) => panic!("HIDDEN_BUNDLE_GUEST={other}: expected v1 or v2"),
     }
 }
 
@@ -346,12 +372,13 @@ fn prove_and_verify(inputs: &[u32], what: &str) -> Word8 {
     let _in_binary = PROVING.lock().unwrap_or_else(|e| e.into_inner());
     let _slot = proving_slot();
     let started = std::time::Instant::now();
-    let (proof, digest, tier) = prove_hidden_bundle(FriProfile::Production, inputs, &BINDING_A, Backend::Cpu)
+    let hc = proved_guest();
+    let (proof, digest, tier) = prove_bundle_for(&hc, FriProfile::Production, inputs, &BINDING_A, Backend::Cpu)
         .unwrap_or_else(|e| panic!("{what}: the guest must taint, not trap — no proof: {e}"));
     let proved = started.elapsed();
     let ex = ZkExecutor::new(FriProfile::Production);
     let started = std::time::Instant::now();
-    ex.verify_hidden_bundle(&ZkExecutor::hc_hidden_bundle(), &proof, &BINDING_A)
+    ex.verify_hidden_bundle(&hc, &proof, &BINDING_A)
         .unwrap_or_else(|e| panic!("{what}: the proof must verify against its binding: {e:?}"));
     println!(
         "{what}: proved at tier {tier} in {proved:.1?}, {} proof bytes, verified in {:.1?} (Production FRI, CPU)",

@@ -462,6 +462,49 @@ impl ZkExecutor {
         Self::hidden_bundle_program().digest()
     }
 
+    /// The branch-free hidden-asset guest (`guests::bundle_hidden_v2`, INT-2 / GV-1): the same
+    /// relation, witness layout and published digest as [`Self::hidden_bundle_program`], with an
+    /// instruction trace that does not depend on the witness, so the program table's unblinded
+    /// LogUp terminal no longer tells which input slots are real or how many 1 bits a spent
+    /// note's leaf index has. **A genesis selects it** by naming [`Self::hc_hidden_bundle_v2`] as
+    /// its `hc_bundle`; chain 15 names v1's. Assembled once per process, like v1.
+    pub fn hidden_bundle_v2_program() -> &'static Program {
+        static HIDDEN_V2: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
+        HIDDEN_V2.get_or_init(crate::guests::bundle_hidden_v2)
+    }
+
+    /// Digest of the branch-free hidden guest — what a genesis names as `hc_bundle` to run it.
+    pub fn hc_hidden_bundle_v2() -> Word8 {
+        Self::hidden_bundle_v2_program().digest()
+    }
+
+    /// Every bundle guest this build can run a chain on, by the `hc_bundle` a genesis pins:
+    /// the hidden guest chains 14 and 15 pin, then the branch-free one. A node refuses a genesis
+    /// naming anything else (`node::check_build_runs_genesis`), and a wallet proves with
+    /// [`Self::bundle_program_for`] the chain's own.
+    pub fn known_hc_bundles() -> [Word8; 2] {
+        [Self::hc_hidden_bundle(), Self::hc_hidden_bundle_v2()]
+    }
+
+    /// The bundle guest whose digest is `hc`, if this build carries it — what a wallet proves
+    /// for a chain whose genesis pins `hc`. `None` for any other digest (the retired 2-in-2-out
+    /// guest included: no executor path verifies against it).
+    ///
+    /// Verification needs no such lookup: the program table is a witness table digested
+    /// in-circuit, so `verify_bundle` checks a proof against whatever `hc` the ledger hands it,
+    /// at the pinned heights — which the two guests share (their programs pad to the same table
+    /// height and read the same input vector; `tests/hidden_bundle.rs` pins it), so one verifier
+    /// key and one `bundle_heights` serve both.
+    pub fn bundle_program_for(hc: &Word8) -> Option<&'static Program> {
+        if *hc == Self::hc_hidden_bundle() {
+            Some(Self::hidden_bundle_program())
+        } else if *hc == Self::hc_hidden_bundle_v2() {
+            Some(Self::hidden_bundle_v2_program())
+        } else {
+            None
+        }
+    }
+
     /// `bundle_heights` for the hidden bundle guest: its program, its fixed
     /// `hidden::hidden_input::COUNT`-word input vector, and the transaction binding.
     pub fn hidden_bundle_heights() -> (u8, u8, u8) {
@@ -964,6 +1007,30 @@ pub fn prove_hidden_bundle(
         binding,
         backend,
     )
+}
+
+/// [`prove_bundle`] for the bundle guest a chain pins: `hc` is the chain's genesis `hc_bundle`
+/// (`rand_status`'s `hc_bundle`), and the guest proved is [`ZkExecutor::bundle_program_for`] of
+/// it — v1 on chains 14 and 15, the branch-free v2 on a genesis that names it. Both read the same
+/// witness (`hidden::hidden_bundle_inputs`) and publish the same digest, so only the program
+/// changes. An `hc` this build does not carry is refused before any proving: a proof of another
+/// guest would publish the right digest and still be refused by every validator, a minute and a
+/// half later.
+pub fn prove_bundle_for(
+    hc: &Word8,
+    profile: FriProfile,
+    inputs: &[u32],
+    binding: &[u32; TX_BINDING_WORDS],
+    backend: Backend,
+) -> Result<(Vec<u8>, Word8, u8), String> {
+    let program = ZkExecutor::bundle_program_for(hc).ok_or_else(|| {
+        format!(
+            "this build cannot prove for the chain's bundle guest {}: it carries {}; update the wallet",
+            randprotocol_core::notes::word8_to_hex(hc),
+            ZkExecutor::known_hc_bundles().map(|h| randprotocol_core::notes::word8_to_hex(&h)).join(" and ")
+        )
+    })?;
+    prove_pinned_bundle(profile, program, crate::hidden::hidden_input::COUNT, "hidden bundle", inputs, binding, backend)
 }
 
 fn prove_pinned_bundle(

@@ -109,14 +109,30 @@ fn the_chain_14_bundle_guest_is_the_genesis_pin() {
     assert_eq!(genesis["hc_bundle"].as_str().unwrap(), pin, "deploy/genesis-chain14.json's hc_bundle");
 }
 
+/// The branch-free hidden guest (`guests::bundle_hidden_v2()`, INT-2 / GV-1) assembles to one
+/// fixed digest, pinned here so that a source change moving it fails in this crate rather than
+/// at the first block of the chain whose genesis names it. No genesis in the repository names it
+/// yet: it takes effect at the cut whose `hc_bundle` is this value. v1's pin (above) is unmoved
+/// by its arrival — the two guests share one assembler function and v1's instruction stream is
+/// byte-for-byte what it was.
+#[test]
+fn the_branch_free_bundle_guest_is_pinned() {
+    let v2 = "651043e2ff2fef28df2d8edbdbbc387668577af72dcc584ee7d850e093a2839b";
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2()), v2, "guests::bundle_hidden_v2() no longer assembles to its pinned digest");
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle()), "83d3a3704a1fcdb9bae7136c0a947ffa34bd53f055388395ed705fe8cacd0ef8");
+    assert_eq!(ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h)), ["83d3a3704a1fcdb9bae7136c0a947ffa34bd53f055388395ed705fe8cacd0ef8", v2]);
+}
+
 /// ZKG-2: the pin above, for every genesis file the repository carries — chain 15 included, which
 /// the chain-14-only test never read. A chain from 14 on pins the hidden-asset guest
 /// (`guests::bundle_hidden()`); chains 6–13 pin the retired 2-in-2-out guest, which still
 /// assembles from this crate's source (`ZkExecutor::legacy_bundle_program`). A file whose
-/// `hc_bundle` is neither is a genesis this build could not have cut.
+/// `hc_bundle` is neither is a genesis this build could not have cut. Chains 14 and 15 pin v1
+/// exactly; a later file may name v1 or the branch-free v2 (`bundle_hidden_v2()`).
 #[test]
 fn every_genesis_files_bundle_guest_is_the_one_this_source_assembles() {
     let hidden = word8_to_hex(&ZkExecutor::hc_bundle());
+    let branch_free = word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2());
     let legacy = word8_to_hex(&ZkExecutor::hc_legacy_bundle());
     let deploy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy");
     let mut checked = BTreeSet::new();
@@ -130,6 +146,10 @@ fn every_genesis_files_bundle_guest_is_the_one_this_source_assembles() {
         let Some(pin) = genesis.get("hc_bundle").and_then(|v| v.as_str()) else {
             continue;
         };
+        if chain >= 16 && pin == branch_free {
+            checked.insert(chain);
+            continue;
+        }
         let (want, guest) = if chain >= 14 { (&hidden, "bundle_hidden") } else { (&legacy, "the retired bundle") };
         assert_eq!(pin, want.as_str(), "{name}'s hc_bundle is not {guest}()'s digest");
         checked.insert(chain);

@@ -978,6 +978,85 @@ fn emit_read_inputs(a: &mut Assembler, label: &str, base: u32, idx: u32, ptr: u3
 /// Written in `bundle()`'s unrolled style it lands at tier 16 (4× time and memory); the looped
 /// reads (`emit_read_inputs`) and the fused Merkle loop are what keep it at 14 — do not unroll.
 pub fn bundle_hidden() -> Program {
+    bundle_hidden_guest(Guest::V1)
+}
+
+/// The branch-free hidden-asset bundle (INT-2 / GV-1 of the 2026-09-27 zkVM and ISA review, its
+/// recommendation R3): [`bundle_hidden`]'s relation, check for check, over the same private-input
+/// layout (`hidden::hidden_input`), publishing the same digest of the same preimage
+/// (`hidden::hidden_bundle_preimage`, `bad` last) at the same output words — only the program,
+/// and so its digest `hc_bundle`, differs. A genesis selects it by naming that digest; chain 15
+/// pins [`bundle_hidden`]'s.
+///
+/// **Why a second guest.** Every batch-STARK proof publishes one LogUp terminal per table, unblinded,
+/// and the program table's is `Σ MULT/(γ − fingerprint(pc, instruction))`: the fingerprints are
+/// the public program's, so the terminal is a public linear function of how many times each
+/// instruction ran. [`bundle_hidden`] has exactly two data-dependent branches — the dummy skip
+/// (`amount == 0` jumps over the Merkle loop and the asset check) and the Merkle loop's
+/// direction bit (a right child costs one `jal` more per level) — so from any bundle anyone can
+/// recover which of the four input slots are real (and so whether it moved a token: a RAND
+/// payment keeps slots 0–1 dummy) and the number of 1 bits in each spent note's leaf index. The
+/// review's `audit_logup_leak` found the true pattern the unique match among 1.3 million
+/// candidates. Nothing in the proof system hides it; only a guest whose instruction sequence
+/// does not depend on the witness does.
+///
+/// **What changes, and nothing else does:**
+///
+/// - **Every slot runs the whole membership and asset check.** A dummy's path is read and hashed
+///   up 32 levels exactly as a real note's is; its root (which matches no anchor) and its asset
+///   compare as for a real note, and the failure bit is **multiplied out** rather than jumped
+///   over: `bad |= real & (root ≠ anchor | asset ≠ slot asset)`, with `real = (amount_lo |
+///   amount_hi) != 0` (`sltu`). The dummy rule keeps its structural form: `real` is computed
+///   from the *same registers* (`T1`, `T2`) that are stored as the conservation sums' addends,
+///   so a nonzero amount in either word makes `real = 1` — and then the masked check is the
+///   unmasked one. A note that carries value cannot also be exempt.
+/// - **The Merkle step is an address swap, not a branch.** Each level writes the running node
+///   and the sibling to `BUF + 4 + 32·b` and `BUF + 36 − 32·b` (`b` = the index bit, the two
+///   base registers computed with `slli`/`add`/`sub`): the instruction sequence is the same for a
+///   left and a right child; only which of the two fixed slots receives which word differs. The
+///   registers are constrained by the cpu AIR, so `b` is the index's bit and nothing else, and
+///   both slots are written on every level whatever `b` is — the same 16 addresses, so the
+///   memory table's shape is witness-independent too. The running node now lives in the hash
+///   buffer itself (`POSEIDON2` writes its digest over `BUF..BUF+32`), read word 7 down to word
+///   0 so that no write lands on a word not yet read; that drops `ROOT_TMP`'s copy per level and
+///   pays for most of the dummies' extra levels.
+/// - **Every other branch was already data-independent**: the private reads
+///   (`emit_read_inputs`) and the Merkle loop count constants down, and everything else in
+///   [`bundle_hidden`] — outputs, the pairwise distinctness checks, the range checks, the sums,
+///   `burn_asset` — is straight-line code. `tests/hidden_bundle.rs` checks it both ways: every
+///   branch in this program is a loop back-edge on a counter register, and honest witnesses that
+///   differ only in private data (real/dummy slots, RAND/token, leaf-index popcounts) produce
+///   identical per-instruction fetch counts (the program table's `MULT` column, from which that
+///   terminal is computed), syscall counts, per-index input reads (the input table's
+///   `MULT_READ`), and memory and ALU event counts.
+///
+/// What this does **not** hide: a table whose lookups are indexed by *values* — the range and
+/// nibble tables' multiplicities are a histogram of the bytes and nibbles the run checked — has a
+/// terminal that is a function of the private values, as it is for any two real transfers; and
+/// the input table's terminal is an unsalted function of the private words. Those need the
+/// generic fix (a blinding interaction per table, a constraint change and a chain cut), not a
+/// guest change; for a bundle the values are dominated by hash outputs and keys, where the
+/// review found nothing recoverable (its INT-1 table: 128 rows or more).
+///
+/// **Cost**: every witness now pays the four-real-input run, less the `ROOT_TMP` copies; still
+/// tier 14 (`tests/hidden_bundle.rs` measures it).
+pub fn bundle_hidden_v2() -> Program {
+    bundle_hidden_guest(Guest::V2BranchFree)
+}
+
+/// Which hidden-asset guest [`bundle_hidden_guest`] assembles. The two share every instruction
+/// outside the input slots' membership and asset checks, so the published statement cannot drift
+/// between them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Guest {
+    /// [`bundle_hidden`]: the chain-14/15 guest, byte for byte (`tests/guest_provenance.rs` pins
+    /// its digest).
+    V1,
+    /// [`bundle_hidden_v2`]: the branch-free guest.
+    V2BranchFree,
+}
+
+fn bundle_hidden_guest(guest: Guest) -> Program {
     use crate::asm::{copy_word8, emit_add64_carry, emit_derive_keys, emit_eq8, emit_note_commit, emit_nullify, emit_or_into, emit_range_check_u63, emit_stage_note};
     use crate::hidden::{hidden_input as hi, A_SLOTS, HIDDEN_BUNDLE_DOMAIN, SLOTS};
     use crate::notes::{domain, output, DEPTH};
@@ -989,6 +1068,11 @@ pub fn bundle_hidden() -> Program {
     const BAD: u32 = 9;         // s1: the taint accumulator, 0 until proven otherwise, never cleared
     const EQFOLD: u32 = 22;     // emit_eq8's fold scratch
     const T7: u32 = 21;         // emit_eq8's result
+    // The branch-free slot's (`Guest::V2BranchFree`) registers; `bundle_hidden` never writes them.
+    const REAL: u32 = T6;       // 1 iff the slot's amount is nonzero, held across the Merkle loop
+    const NA: u32 = T3;         // Merkle: BASE + 32·b, where the running node's words go
+    const SA: u32 = T4;         // Merkle: BASE − 32·b, where the sibling's words go
+    const OFS: u32 = T5;        // Merkle: 32·b
 
     // RAM, byte offsets from `BASE = HEAP`. The whole layout sits below 0x5c0, so every offset
     // is a valid 12-bit `lw`/`sw`/`addi` immediate without `bundle()`'s pivot (the private
@@ -1038,70 +1122,123 @@ pub fn bundle_hidden() -> Program {
 
     // 2. inputs.
     for k in 0..SLOTS {
-        // The slot's note words and its leaf index; the path is read by the Merkle loop, and
-        // only for a real input.
+        // The slot's note words and its leaf index; the path is read by the Merkle loop — in
+        // v1 only for a real input, in v2 for every slot.
         emit_read_inputs(&mut a, &format!("hid_in{k}"), BASE, IDX, PTR, CTR, hi::in_slot(k), hi::S_NOTE_WORDS, SLOT);
         emit_read_inputs(&mut a, &format!("hid_ix{k}"), BASE, IDX, PTR, CTR, hi::in_slot(k) + hi::S_INDEX, 1, slot_index);
         // Owner = pk_self, structurally.
         emit_stage_note(&mut a, BASE, T0, NOTE_STAGE, PK, slot(hi::S_FROM), slot(hi::S_AMOUNT_LO), slot(hi::S_AMOUNT_HI), slot(hi::S_ASSET), slot(hi::S_TIME), slot(hi::S_R));
         emit_note_commit(&mut a, BASE, T0, NOTE_STAGE, BUF, ptr_words(BUF), w8(CM_IN, k));
         // The dummy rule: T1/T2 are both the sum's addend (stored to IN_AMT) and the skip
-        // condition — nothing reloads the amount in between.
+        // condition (v1) or the `REAL` mask (v2) — nothing reloads the amount in between.
         a.push(lw(T1, BASE, slot(hi::S_AMOUNT_LO)));
         a.push(lw(T2, BASE, slot(hi::S_AMOUNT_HI)));
         a.push(sw(BASE, T1, in_amt(k).0));
         a.push(sw(BASE, T2, in_amt(k).1));
-        a.push(or(T1, T1, T2));
-        let skip = format!("hid_in{k}_skip");
-        a.branch(BranchCond::Eq, T1, REG_ZERO, &skip);
+        if guest == Guest::V1 {
+            a.push(or(T1, T1, T2));
+            let skip = format!("hid_in{k}_skip");
+            a.branch(BranchCond::Eq, T1, REG_ZERO, &skip);
 
-        // The fused MERKLE_VERIFY: the running node in ROOT_TMP, each level's sibling read from
-        // input indices PTR + 0..8 (PTR = the slot's path base, a program constant, + 8·level).
-        copy_word8(&mut a, BASE, T0, w8(CM_IN, k), ROOT_TMP);
-        a.push(lw(IDX, BASE, slot_index));
-        a.extend(li(PTR, (hi::in_slot(k) + hi::S_PATH) as i32));
-        a.extend(li(CTR, DEPTH as i32));
-        let (lp, bit0, done) = (format!("hid_m{k}_loop"), format!("hid_m{k}_bit0"), format!("hid_m{k}_done"));
-        let read_sibling = |a: &mut Assembler, dst: i32| {
-            for j in 0..8 {
+            // The fused MERKLE_VERIFY: the running node in ROOT_TMP, each level's sibling read from
+            // input indices PTR + 0..8 (PTR = the slot's path base, a program constant, + 8·level).
+            copy_word8(&mut a, BASE, T0, w8(CM_IN, k), ROOT_TMP);
+            a.push(lw(IDX, BASE, slot_index));
+            a.extend(li(PTR, (hi::in_slot(k) + hi::S_PATH) as i32));
+            a.extend(li(CTR, DEPTH as i32));
+            let (lp, bit0, done) = (format!("hid_m{k}_loop"), format!("hid_m{k}_bit0"), format!("hid_m{k}_done"));
+            let read_sibling = |a: &mut Assembler, dst: i32| {
+                for j in 0..8 {
+                    a.push(addi(REG_A0, PTR, j));
+                    a.push(ecall());
+                    a.push(sw(BASE, REG_A0, dst + 4 * j));
+                }
+            };
+            a.label(&lp);
+            a.push(andi(BIT, IDX, 1));
+            a.extend(li(REG_A7, SYS_READ_INPUT as i32)); // POSEIDON2 below clobbers a7
+            a.branch(BranchCond::Eq, BIT, REG_ZERO, &bit0);
+            // bit 1: the running node is the right child — [sibling, running].
+            read_sibling(&mut a, BUF + 4);
+            copy_word8(&mut a, BASE, T0, ROOT_TMP, BUF + 36);
+            a.jal(REG_ZERO, &done);
+            a.label(&bit0);
+            // bit 0: [running, sibling].
+            copy_word8(&mut a, BASE, T0, ROOT_TMP, BUF + 4);
+            read_sibling(&mut a, BUF + 36);
+            a.label(&done);
+            a.extend(li(T0, domain::NODE as i32));
+            a.push(sw(BASE, T0, BUF));
+            a.extend(call_poseidon2(ptr_words(BUF), 17));
+            copy_word8(&mut a, BASE, T0, BUF, ROOT_TMP);
+            a.push(srli(IDX, IDX, 1));
+            a.push(addi(PTR, PTR, 8));
+            a.push(addi(CTR, CTR, -1));
+            a.branch(BranchCond::Ne, CTR, REG_ZERO, &lp);
+
+            // root == anchor, else taint.
+            emit_eq8(&mut a, BASE, T0, EQFOLD, hdr(hi::ANCHOR), ROOT_TMP, T7);
+            a.push(xori(T7, T7, 1));
+            emit_or_into(&mut a, BAD, T7);
+            // the note's asset == the slot's asset, else taint.
+            a.push(lw(T0, BASE, slot(hi::S_ASSET)));
+            a.push(lw(T1, BASE, slot_asset(k)));
+            a.push(xor(T0, T0, T1));
+            a.push(sltu(T0, REG_ZERO, T0));
+            emit_or_into(&mut a, BAD, T0);
+            a.label(&skip);
+        } else {
+            // The branch-free slot (`bundle_hidden_v2`): the same work for a dummy and a real
+            // note, and for a left and a right child. `REAL` is the dummy rule's condition, from
+            // the very registers just stored as the sums' addends (nothing reloads the amount
+            // in between); it masks the two failure bits below instead of choosing a path.
+            a.push(or(T1, T1, T2));
+            a.push(sltu(REAL, REG_ZERO, T1)); // 1 iff amount != 0
+
+            // The fused MERKLE_VERIFY with the running node kept in BUF[0..8], where each
+            // level's POSEIDON2 leaves its digest. Level preimage: [NODE, left(8), right(8)] at
+            // BUF, left = running and right = sibling for b = 0, the reverse for b = 1 — by
+            // address: the running word j goes to NA + 4 + 4j, the sibling's to SA + 36 + 4j,
+            // with NA = BASE + 32b and SA = BASE − 32b.
+            copy_word8(&mut a, BASE, T0, w8(CM_IN, k), BUF);
+            a.push(lw(IDX, BASE, slot_index));
+            a.extend(li(PTR, (hi::in_slot(k) + hi::S_PATH) as i32));
+            a.extend(li(CTR, DEPTH as i32));
+            let lp = format!("hid2_m{k}_loop");
+            a.label(&lp);
+            a.push(andi(BIT, IDX, 1));
+            a.push(slli(OFS, BIT, 5));        // 32·b
+            a.push(add(NA, BASE, OFS));
+            a.push(sub(SA, BASE, OFS));
+            a.extend(li(REG_A7, SYS_READ_INPUT as i32)); // POSEIDON2 below clobbers a7
+            // Word 7 down to 0: the writes for word j land on BUF + 4 + 4j and BUF + 36 + 4j,
+            // never on a running word i < j still to be read (BUF + 4i).
+            for j in (0..8).rev() {
+                a.push(lw(T0, BASE, BUF + 4 * j));  // running word j
                 a.push(addi(REG_A0, PTR, j));
-                a.push(ecall());
-                a.push(sw(BASE, REG_A0, dst + 4 * j));
+                a.push(ecall());                     // sibling word j, from the private path
+                a.push(sw(SA, REG_A0, BUF + 36 + 4 * j));
+                a.push(sw(NA, T0, BUF + 4 + 4 * j));
             }
-        };
-        a.label(&lp);
-        a.push(andi(BIT, IDX, 1));
-        a.extend(li(REG_A7, SYS_READ_INPUT as i32)); // POSEIDON2 below clobbers a7
-        a.branch(BranchCond::Eq, BIT, REG_ZERO, &bit0);
-        // bit 1: the running node is the right child — [sibling, running].
-        read_sibling(&mut a, BUF + 4);
-        copy_word8(&mut a, BASE, T0, ROOT_TMP, BUF + 36);
-        a.jal(REG_ZERO, &done);
-        a.label(&bit0);
-        // bit 0: [running, sibling].
-        copy_word8(&mut a, BASE, T0, ROOT_TMP, BUF + 4);
-        read_sibling(&mut a, BUF + 36);
-        a.label(&done);
-        a.extend(li(T0, domain::NODE as i32));
-        a.push(sw(BASE, T0, BUF));
-        a.extend(call_poseidon2(ptr_words(BUF), 17));
-        copy_word8(&mut a, BASE, T0, BUF, ROOT_TMP);
-        a.push(srli(IDX, IDX, 1));
-        a.push(addi(PTR, PTR, 8));
-        a.push(addi(CTR, CTR, -1));
-        a.branch(BranchCond::Ne, CTR, REG_ZERO, &lp);
+            a.extend(li(T0, domain::NODE as i32));
+            a.push(sw(BASE, T0, BUF));
+            a.extend(call_poseidon2(ptr_words(BUF), 17));
+            a.push(srli(IDX, IDX, 1));
+            a.push(addi(PTR, PTR, 8));
+            a.push(addi(CTR, CTR, -1));
+            a.branch(BranchCond::Ne, CTR, REG_ZERO, &lp);
 
-        // root == anchor, else taint.
-        emit_eq8(&mut a, BASE, T0, EQFOLD, hdr(hi::ANCHOR), ROOT_TMP, T7);
-        a.push(xori(T7, T7, 1));
-        emit_or_into(&mut a, BAD, T7);
-        // the note's asset == the slot's asset, else taint.
-        a.push(lw(T0, BASE, slot(hi::S_ASSET)));
-        a.push(lw(T1, BASE, slot_asset(k)));
-        a.push(xor(T0, T0, T1));
-        a.push(sltu(T0, REG_ZERO, T0));
-        emit_or_into(&mut a, BAD, T0);
-        a.label(&skip);
+            // bad |= real & (root != anchor | asset != the slot's asset).
+            emit_eq8(&mut a, BASE, T0, EQFOLD, hdr(hi::ANCHOR), BUF, T7);
+            a.push(xori(T7, T7, 1));
+            a.push(lw(T0, BASE, slot(hi::S_ASSET)));
+            a.push(lw(T1, BASE, slot_asset(k)));
+            a.push(xor(T0, T0, T1));
+            a.push(sltu(T0, REG_ZERO, T0));
+            a.push(or(T7, T7, T0));
+            a.push(and(T7, T7, REAL));
+            emit_or_into(&mut a, BAD, T7);
+        }
         emit_nullify(&mut a, BASE, T0, NK, w8(CM_IN, k), BUF, ptr_words(BUF), w8(NF, k));
     }
 

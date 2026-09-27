@@ -21,7 +21,8 @@
 
 use randprotocol_core::confidential::ConfidentialError;
 use randprotocol_zkvm::emulator::{execute, HashRow};
-use randprotocol_zkvm::executor::{prove_hidden_bundle, ZkExecutor};
+use randprotocol_zkvm::executor::{prove_bundle_for, prove_hidden_bundle, ZkExecutor};
+use randprotocol_zkvm::isa::Program;
 use randprotocol_zkvm::hidden::{self, hidden_input as hi, HiddenDigestInput, HiddenOutput, HIDDEN_BUNDLE_DOMAIN};
 use randprotocol_zkvm::ledger::CommitmentTree;
 use randprotocol_zkvm::machine::{build_traces, Backend, FriProfile, Machine, Tier};
@@ -65,10 +66,16 @@ impl Case {
     /// what the guest commits to structurally. Five unrelated leaves precede the spent notes so
     /// every path is non-trivial.
     fn new(ins: [In; 4], outs: [u64; 4], fee: u64, burn_a: u64, burn_r: u64, asset_a: u32) -> Case {
+        Case::new_at(5, ins, outs, fee, burn_a, burn_r, asset_a)
+    }
+
+    /// [`Case::new`] with `filler` unrelated leaves ahead of the spent notes, so the real inputs'
+    /// leaf indices (and the number of 1 bits in each) are the caller's to choose.
+    fn new_at(filler: usize, ins: [In; 4], outs: [u64; 4], fee: u64, burn_a: u64, burn_r: u64, asset_a: u32) -> Case {
         let sk = SpendKey::random();
         let me = sk.viewing_key().pk();
         let mut tree = CommitmentTree::new();
-        for _ in 0..5 {
+        for _ in 0..filler {
             tree.append(Note::new([9; 8], [0; 8], 1, 0, 1).commitment());
         }
         let notes: Vec<Note> = ins
@@ -125,8 +132,22 @@ impl Case {
     }
 }
 
+/// Both hidden guests: v1 (`guests::bundle_hidden`, what chains 14 and 15 pin) and the
+/// branch-free v2 (`guests::bundle_hidden_v2`, INT-2 / GV-1). They must compute one relation.
+fn guests() -> [(&'static str, &'static Program); 2] {
+    [("v1", ZkExecutor::hidden_bundle_program()), ("v2", ZkExecutor::hidden_bundle_v2_program())]
+}
+
+/// Runs the witness through **both** guests and insists they publish the same digest — so every
+/// honest-shape and dishonest-witness test in this file checks the branch-free guest too: it
+/// may not lose a check (a cheat v1 taints and v2 does not) nor add one (an honest witness v2
+/// taints).
 fn emulate(inputs: &[u32]) -> Word8 {
-    execute(ZkExecutor::hidden_bundle_program(), inputs, &BINDING_A, MAX_CYCLES).unwrap().outputs
+    let [(_, v1), (_, v2)] = guests();
+    let one = execute(v1, inputs, &BINDING_A, MAX_CYCLES).unwrap().outputs;
+    let two = execute(v2, inputs, &BINDING_A, MAX_CYCLES).unwrap().outputs;
+    assert_eq!(one, two, "the branch-free guest publishes another digest than v1 for the same witness");
+    one
 }
 
 /// The claimed plaintext's digest with the guest's `bad` word set — what a tainted run publishes.
@@ -210,51 +231,273 @@ fn every_honest_shape_publishes_the_host_digest() {
 /// RAND payment from a token transfer. The tier does not depend on the FRI profile.
 #[test]
 fn every_shape_lands_at_tier_14_with_identical_table_heights() {
-    let program = ZkExecutor::hidden_bundle_program();
+    // One `heights` for both guests: v2 must declare v1's shape exactly (the executor verifies
+    // either at the one pinned `bundle_heights` and with one verifier key).
     let mut heights = None;
-    // The worst case for cycles over *any* witness, honest or not: the only data-dependent costs
-    // are the dummy skip and the Merkle bit branch (bit 1 costs one `jal` more per level), so
-    // four real inputs whose leaf indices are all ones. Tainted (no such leaves), but a cheating
-    // prover's witness must still fit the tier the verifier key is built for.
-    let mut worst = mixed().inputs();
-    for k in 0..4 {
-        worst[hi::in_slot(k) + hi::S_INDEX] = u32::MAX;
-    }
-    let mut runs: Vec<(&str, Vec<u32>)> = shapes().into_iter().map(|(w, c)| (w, c.inputs())).collect();
-    runs.push(("worst case: four real inputs, every index bit 1", worst));
-    for (what, inputs) in runs {
-        assert_eq!(inputs.len(), hi::COUNT);
-        let exec = execute(program, &inputs, &BINDING_A, MAX_CYCLES).unwrap();
-        let fixed = program.digest_rows()
-            + randprotocol_zkvm::hash::input_digest_row_count(inputs.len())
-            + randprotocol_zkvm::hash::public_digest_row_count(BINDING_A.len());
-        let absorb = exec.events.iter().filter(|e| matches!(e.hash_row, Some(HashRow::Absorb { .. }))).count();
-        let cycles = exec.cycles() + fixed;
-        let perms = fixed + absorb;
-        let tier = Tier::for_workload(cycles, perms).unwrap();
-        println!(
-            "{what}: program {} words, {} input words, {} executed + {fixed} digest rows = {cycles} cycles \
-             (tier-14 cap {}, headroom {}), {perms} permutations (cap {}, headroom {}), tier {}",
-            program.words.len(),
-            inputs.len(),
-            exec.cycles(),
-            Tier(14).max_cycles(),
-            Tier(14).max_cycles() as i64 - cycles as i64,
-            Tier(14).poseidon2_height() / 32,
-            (Tier(14).poseidon2_height() / 32) as i64 - perms as i64,
-            tier.0
-        );
-        assert_eq!(tier, Tier(14), "{what}");
-        let traces = build_traces(program, &inputs, &BINDING_A, &exec, tier).unwrap();
-        let h: Vec<usize> = traces.as_slice().iter().map(|m| p3_matrix::Matrix::height(*m)).collect();
-        match &heights {
-            None => {
-                println!("table heights: {h:?}");
-                heights = Some(h);
+    for (guest, program) in guests() {
+        // The worst case for cycles over *any* witness, honest or not: in v1 the only
+        // data-dependent costs are the dummy skip and the Merkle bit branch (bit 1 costs one `jal`
+        // more per level), so four real inputs whose leaf indices are all ones. Tainted (no such
+        // leaves), but a cheating prover's witness must still fit the tier the verifier key is
+        // built for. In v2 every witness costs the same (below).
+        let mut worst = mixed().inputs();
+        for k in 0..4 {
+            worst[hi::in_slot(k) + hi::S_INDEX] = u32::MAX;
+        }
+        let mut runs: Vec<(&str, Vec<u32>)> = shapes().into_iter().map(|(w, c)| (w, c.inputs())).collect();
+        runs.push(("worst case: four real inputs, every index bit 1", worst));
+        for (what, inputs) in runs {
+            assert_eq!(inputs.len(), hi::COUNT);
+            let exec = execute(program, &inputs, &BINDING_A, MAX_CYCLES).unwrap();
+            let fixed = program.digest_rows()
+                + randprotocol_zkvm::hash::input_digest_row_count(inputs.len())
+                + randprotocol_zkvm::hash::public_digest_row_count(BINDING_A.len());
+            let absorb = exec.events.iter().filter(|e| matches!(e.hash_row, Some(HashRow::Absorb { .. }))).count();
+            let cycles = exec.cycles() + fixed;
+            let perms = fixed + absorb;
+            let tier = Tier::for_workload(cycles, perms).unwrap();
+            println!(
+                "{guest} {what}: program {} words, {} input words, {} executed + {fixed} digest rows = {cycles} cycles \
+                 (tier-14 cap {}, headroom {}), {perms} permutations (cap {}, headroom {}), tier {}",
+                program.words.len(),
+                inputs.len(),
+                exec.cycles(),
+                Tier(14).max_cycles(),
+                Tier(14).max_cycles() as i64 - cycles as i64,
+                Tier(14).poseidon2_height() / 32,
+                (Tier(14).poseidon2_height() / 32) as i64 - perms as i64,
+                tier.0
+            );
+            assert_eq!(tier, Tier(14), "{guest} {what}");
+            let traces = build_traces(program, &inputs, &BINDING_A, &exec, tier).unwrap();
+            let h: Vec<usize> = traces.as_slice().iter().map(|m| p3_matrix::Matrix::height(*m)).collect();
+            match &heights {
+                None => {
+                    println!("table heights: {h:?}");
+                    heights = Some(h);
+                }
+                Some(first) => assert_eq!(first, &h, "{guest} {what}: table heights differ from the first shape's"),
             }
-            Some(first) => assert_eq!(first, &h, "{what}: table heights differ from the first shape's"),
         }
     }
+}
+
+// ─────────────── INT-2 / GV-1: what the LogUp terminals are computed from ───────────────
+
+/// Everything about a run that a proof's per-table LogUp terminals depend on *other than the
+/// private values themselves*. The program table's terminal is `Σ MULT/(γ − fp(pc, instr))`
+/// over the public program, so `fetches` — that table's `MULT` column, exactly as
+/// `tables::program::program_trace` builds it — determines it completely: equal `fetches` is an
+/// equal terminal. The rest are the counts the other tables' row sets and multiplicity columns are
+/// built from: which syscalls ran and how often (the poseidon2 table's permutations, the
+/// input table's `MULT_READ` per index — `input_reads`), how many times each RAM address was
+/// read and written (the memory table's rows), how many ALU events of each op ran (the alu
+/// table's rows), and every table's height.
+///
+/// What it deliberately leaves out: the *values* — a register word, a hashed state, the byte
+/// a range check looks up. Those differ between any two transfers, v1 or v2, real or dummy; the
+/// terminals of the tables they index (range, nibble, memory, input) are the generic INT-2
+/// problem, whose fix is blinding in the proof system, not in a guest.
+#[derive(Debug, PartialEq, Eq)]
+struct TraceShape {
+    cycles: usize,
+    fetches: Vec<u64>,
+    syscalls: std::collections::BTreeMap<String, usize>,
+    input_reads: Vec<u32>,
+    memory: std::collections::BTreeMap<(u32, u32, bool), usize>,
+    alu: std::collections::BTreeMap<String, usize>,
+    hash_rows: (usize, usize),
+    heights: Vec<usize>,
+}
+
+fn trace_shape(program: &Program, inputs: &[u32]) -> TraceShape {
+    use p3_field::PrimeField64;
+    use randprotocol_zkvm::emulator::Syscall;
+    use randprotocol_zkvm::tables::program::{col, program_log_height, program_trace};
+    let exec = execute(program, inputs, &BINDING_A, MAX_CYCLES).unwrap();
+    let height = 1usize << program_log_height(program.words.len());
+    let table = program_trace(program, &exec.events, height);
+    let fetches = (0..program.words.len()).map(|r| table.values[r * col::WIDTH + col::MULT].as_canonical_u64()).collect();
+    let mut syscalls = std::collections::BTreeMap::new();
+    let mut input_reads = vec![0u32; inputs.len()];
+    let mut memory = std::collections::BTreeMap::new();
+    let mut alu = std::collections::BTreeMap::new();
+    let mut hash_rows = (0, 0);
+    for e in &exec.events {
+        if let Some(sys) = &e.sys {
+            let key = match sys {
+                Syscall::ReadInput { idx, .. } => {
+                    input_reads[*idx as usize] += 1;
+                    "read_input".to_string()
+                }
+                Syscall::Poseidon2 { ptr, n } => format!("poseidon2 ptr {ptr} n {n}"),
+                Syscall::WriteOutput { slot, .. } => format!("write_output {slot}"),
+                other => format!("{:?}", std::mem::discriminant(other)),
+            };
+            *syscalls.entry(key).or_insert(0) += 1;
+        }
+        for m in e.accesses.iter().chain(&e.keccak_accesses).chain(&e.sha256_accesses) {
+            *memory.entry((m.space, m.addr, m.is_write)).or_insert(0) += 1;
+        }
+        for x in &e.alu {
+            *alu.entry(format!("{:?}", x.op)).or_insert(0) += 1;
+        }
+        match e.hash_row {
+            Some(HashRow::Absorb { .. }) => hash_rows.0 += 1,
+            Some(HashRow::WriteOut { .. }) => hash_rows.1 += 1,
+            _ => {}
+        }
+    }
+    let fixed = program.digest_rows()
+        + randprotocol_zkvm::hash::input_digest_row_count(inputs.len())
+        + randprotocol_zkvm::hash::public_digest_row_count(BINDING_A.len());
+    let tier = Tier::for_workload(exec.cycles() + fixed, fixed + hash_rows.0).unwrap();
+    let traces = build_traces(program, inputs, &BINDING_A, &exec, tier).unwrap();
+    let heights = traces.as_slice().iter().map(|m| p3_matrix::Matrix::height(*m)).collect();
+    TraceShape { cycles: exec.cycles(), fetches, syscalls, input_reads, memory, alu, hash_rows, heights }
+}
+
+/// Honest witnesses that differ only in private data: which slots are real (four, three, two,
+/// one), which asset moved (RAND, a token, `A = 0`), burns, and the spent notes' leaf indices —
+/// the same shape at indices 0..3 (popcounts 0, 1, 1, 2) and at 1019..1022 (popcounts 8 and 9).
+/// Every one publishes the host digest (so they are honest, not tainted runs that happen to
+/// look alike).
+fn private_variants() -> Vec<(String, Case)> {
+    let mut v: Vec<(String, Case)> = shapes().into_iter().map(|(w, c)| (w.to_string(), c)).collect();
+    let all_real = [In::Real(500, TOKEN), In::Real(300, TOKEN), In::Real(1_000, 0), In::Real(50, 0)];
+    v.push(("mixed, leaves 0..3 (popcounts 0, 1, 1, 2)".into(), Case::new_at(0, all_real, [600, 200, 900, 140], 10, 0, 0, TOKEN)));
+    v.push(("mixed, leaves 1019..1022 (popcounts 8, 9)".into(), Case::new_at(1019, all_real, [600, 200, 900, 140], 10, 0, 0, TOKEN)));
+    v.push((
+        "one real RAND input at leaf 1023 (popcount 10)".into(),
+        Case::new_at(1023, [In::Dummy, In::Dummy, In::Real(1_000, 0), In::Dummy], [0, 0, 600, 390], 10, 0, 0, 0),
+    ));
+    for (what, c) in &v {
+        assert_honest(c, what);
+    }
+    v
+}
+
+/// The first variant whose trace shape differs from the first variant's, with the fields that
+/// differ — `None` when every variant runs the same shape.
+fn first_divergence(program: &Program) -> Option<String> {
+    let variants = private_variants();
+    let (base_what, base) = (&variants[0].0, trace_shape(program, &variants[0].1.inputs()));
+    for (what, c) in &variants[1..] {
+        let t = trace_shape(program, &c.inputs());
+        if t != base {
+            let mut diff = Vec::new();
+            if t.cycles != base.cycles {
+                diff.push(format!("cycles {} vs {}", base.cycles, t.cycles));
+            }
+            if t.fetches != base.fetches {
+                let rows = base.fetches.iter().zip(&t.fetches).filter(|(a, b)| a != b).count();
+                let (sa, sb): (u64, u64) = (base.fetches.iter().sum(), t.fetches.iter().sum());
+                diff.push(format!("program MULT differs on {rows} rows (Σ {sa} vs {sb})"));
+            }
+            if t.syscalls != base.syscalls {
+                diff.push(format!("syscalls {:?} vs {:?}", base.syscalls.get("read_input"), t.syscalls.get("read_input")));
+            }
+            if t.input_reads != base.input_reads {
+                let idx = base.input_reads.iter().zip(&t.input_reads).filter(|(a, b)| a != b).count();
+                diff.push(format!("input MULT_READ differs at {idx} indices"));
+            }
+            if t.memory != base.memory {
+                diff.push("memory access counts".into());
+            }
+            if t.alu != base.alu {
+                diff.push("alu op counts".into());
+            }
+            if t.hash_rows != base.hash_rows {
+                diff.push(format!("hash rows {:?} vs {:?}", base.hash_rows, t.hash_rows));
+            }
+            if t.heights != base.heights {
+                diff.push(format!("heights {:?} vs {:?}", base.heights, t.heights));
+            }
+            return Some(format!("[{base_what}] vs [{what}]: {}", diff.join("; ")));
+        }
+    }
+    None
+}
+
+/// INT-2 / GV-1, fixed: the branch-free guest runs one instruction trace for every honest
+/// witness — the same per-instruction fetch counts (so the same program-table LogUp terminal),
+/// the same syscalls, the same input reads per index, the same memory and ALU event counts and
+/// the same table heights — whether its slots are real or dummy, whether it moves RAND or a
+/// token, and whatever its leaf indices. What the review recovered from v1 (the real-slot
+/// pattern, token-vs-RAND, each index's popcount) is not in these statistics any more.
+#[test]
+fn the_branch_free_guests_trace_does_not_depend_on_the_witness() {
+    if let Some(d) = first_divergence(ZkExecutor::hidden_bundle_v2_program()) {
+        panic!("the branch-free guest's trace depends on private data: {d}");
+    }
+}
+
+/// The leak itself, pinned on v1 (chains 14 and 15): the same witnesses run different
+/// instruction traces, which is what `audit_logup_leak` reads out of the program table's
+/// terminal. Kept as a check that `first_divergence` can see it — a statistics function that
+/// found nothing here would make the v2 test above vacuous.
+#[test]
+fn v1s_trace_shows_the_real_slots_and_the_index_popcounts() {
+    let d = first_divergence(ZkExecutor::hidden_bundle_program()).expect("v1's trace is witness-dependent");
+    println!("v1: {d}");
+    assert!(d.contains("program MULT"), "{d}");
+    // Popcount alone: two all-real witnesses at different leaves still differ in v1.
+    let v = private_variants();
+    let at = |name: &str| v.iter().find(|(w, _)| w.starts_with(name)).unwrap().1.inputs();
+    let (low, high) = (at("mixed, leaves 0..3"), at("mixed, leaves 1019..1022"));
+    let v1 = ZkExecutor::hidden_bundle_program();
+    let (a, b) = (trace_shape(v1, &low), trace_shape(v1, &high));
+    assert_ne!(a.fetches, b.fetches, "v1: the Merkle bit branch shows each index's popcount");
+    println!("v1 popcount leak: {} vs {} cycles for the same four real inputs at other leaves", a.cycles, b.cycles);
+    let v2 = ZkExecutor::hidden_bundle_v2_program();
+    assert_eq!(trace_shape(v2, &low), trace_shape(v2, &high), "v2: the leaf index is invisible");
+}
+
+/// The static half of the same property: every branch in v2 is a counted loop's back-edge — the
+/// private reads (`emit_read_inputs`) and the Merkle loop, both counting a program constant
+/// down in `CTR` (x23) — and there is no jump at all. So no instruction's execution count can
+/// depend on a witness word. v1 fails this on the dummy skip and the Merkle bit branch.
+#[test]
+fn every_branch_in_the_branch_free_guest_is_a_counted_loop() {
+    use randprotocol_zkvm::isa::{BranchCond, Instr};
+    let branches = |p: &Program| {
+        let mut data_dependent = Vec::new();
+        for (i, w) in p.words.iter().enumerate() {
+            match Instr::decode(*w).unwrap() {
+                Instr::Branch { cond, rs1, rs2, imm } => {
+                    if !(cond == BranchCond::Ne && rs1 == 23 && rs2 == 0 && (imm as i32) < 0) {
+                        data_dependent.push(format!("word {i}: {cond:?} x{rs1}, x{rs2}"));
+                    }
+                }
+                Instr::Jal { .. } | Instr::Jalr { .. } => data_dependent.push(format!("word {i}: a jump")),
+                _ => {}
+            }
+        }
+        data_dependent
+    };
+    assert_eq!(branches(ZkExecutor::hidden_bundle_v2_program()), Vec::<String>::new());
+    let v1 = branches(ZkExecutor::hidden_bundle_program());
+    println!("v1's data-dependent branches: {v1:?}");
+    assert_eq!(v1.len(), 12, "v1: four dummy skips, four bit branches, four jal");
+}
+
+/// The branch-free guest publishes what v1 does for the same witness (every test in this file
+/// runs both through `emulate`), and it is a different program: a genesis selects it by its own
+/// `hc_bundle`. Both pad to the same program-table height, so `bundle_heights` — and the one
+/// verifier key — serve either.
+#[test]
+fn the_branch_free_guest_is_a_distinct_program_with_v1s_declared_shape() {
+    let (v1, v2) = (ZkExecutor::hidden_bundle_program(), ZkExecutor::hidden_bundle_v2_program());
+    println!("v1 {} words, v2 {} words; hc v2 = {}", v1.words.len(), v2.words.len(), randprotocol_core::notes::word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2()));
+    assert_ne!(ZkExecutor::hc_hidden_bundle_v2(), ZkExecutor::hc_hidden_bundle());
+    use randprotocol_zkvm::tables::program::program_log_height;
+    assert_eq!(program_log_height(v1.words.len()), program_log_height(v2.words.len()));
+    assert_eq!(ZkExecutor::known_hc_bundles(), [ZkExecutor::hc_hidden_bundle(), ZkExecutor::hc_hidden_bundle_v2()]);
+    assert_eq!(ZkExecutor::bundle_program_for(&ZkExecutor::hc_hidden_bundle()).unwrap().digest(), v1.digest());
+    assert_eq!(ZkExecutor::bundle_program_for(&ZkExecutor::hc_hidden_bundle_v2()).unwrap().digest(), v2.digest());
+    assert!(ZkExecutor::bundle_program_for(&ZkExecutor::hc_legacy_bundle()).is_none(), "the retired guest is not a chain guest");
+    let refused = prove_bundle_for(&[7; 8], FriProfile::Test, &mixed().inputs(), &BINDING_A, Backend::Cpu).unwrap_err();
+    assert!(refused.contains("cannot prove for the chain's bundle guest"), "{refused}");
 }
 
 /// The digest excludes `A` (its preimage is 81 message words, 82 with the tag, and has no
@@ -733,3 +976,32 @@ fn a_hidden_bundle_proved_against_the_empty_segment_is_refused() {
     use randprotocol_core::confidential::ConfidentialExecutor;
     assert_eq!(ex.bundle_proof_digest(&bytes), Err(refused));
 }
+
+/// The branch-free guest proved once (Test profile — the tier and table heights do not depend
+/// on the profile): a mixed transfer lands on tier 14 at v1's pinned heights, publishes the host
+/// digest, and verifies through the chain's entry points under v2's `hc_bundle` and its own
+/// binding only — refused under v1's `hc` (the program digest is bound in-circuit, so a proof of
+/// one guest is never a proof of the other) and for another transaction.
+#[test]
+fn a_branch_free_bundle_proves_at_tier_14_at_the_pinned_shape() {
+    use randprotocol_core::confidential::ConfidentialExecutor;
+    let c = rand_only();
+    let inputs = c.inputs();
+    let di = c.claimed();
+    let hc2 = ZkExecutor::hc_hidden_bundle_v2();
+    let started = std::time::Instant::now();
+    let (proof, digest, tier) = prove_bundle_for(&hc2, FriProfile::Test, &inputs, &BINDING_A, Backend::Cpu).unwrap();
+    println!("branch-free bundle proved at tier {tier} in {:.1?} ({} proof bytes, Test FRI, CPU)", started.elapsed(), proof.len());
+    assert_eq!(tier, 14);
+    assert_eq!(digest, hidden::hidden_bundle_digest(&di));
+    let decoded = randprotocol_zkvm::executor::decode_canonical(&proof).unwrap();
+    assert_eq!((decoded.program_log_height, decoded.input_log_height, decoded.public_log_height), ZkExecutor::bundle_heights());
+    assert_eq!((decoded.tier, decoded.keccak_log_height, decoded.sha256_log_height), (Tier(14), 0, 0));
+    println!("declared: program {} input {} public {} mem {}", decoded.program_log_height, decoded.input_log_height, decoded.public_log_height, decoded.mem_log_height);
+    let ex = ZkExecutor::new(FriProfile::Test);
+    assert_eq!(ex.bundle_proof_digest(&proof).unwrap(), digest);
+    assert_eq!(ex.verify_bundle(&hc2, &proof, &BINDING_A), Ok(()));
+    assert_eq!(ex.verify_bundle(&hc2, &proof, &BINDING_B), Err(ConfidentialError::InvalidBundleProof("PublicValues".into())));
+    assert!(ex.verify_bundle(&ZkExecutor::hc_hidden_bundle(), &proof, &BINDING_A).is_err(), "v1's hc refuses a v2 proof");
+}
+
