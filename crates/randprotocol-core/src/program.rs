@@ -57,6 +57,41 @@ pub fn program_id_with_public(base_pc: u32, words: &[u32], public: &[u32]) -> Pr
     Hash::digest_domain(b"rand-program-2", &buf)
 }
 
+/// Rows in the zkVM's program table for a program of `len` words: `max(len + 1, 16)` rounded up to
+/// a power of two — `1 << tables::program::program_log_height(len)` in the zkVM (`pad_height(len +
+/// 1, MIN_HEIGHT)`, `MIN_HEIGHT` 16). Core cannot name a zkvm function (the dependency points the
+/// other way), so this is a mirror, like `types::pv`; `randprotocol-zkvm/src/executor.rs`'s tests
+/// pin it to the real function, so a re-vendor that moves the table's padding fails there.
+pub fn program_table_rows(len: usize) -> u64 {
+    (len as u64).saturating_add(1).max(16).next_power_of_two()
+}
+
+/// ZKV-11 (pc-wrap, 2026-09-28): does every row of this program's *padded* program table sit below
+/// the u32 pc wrap — `base_pc + 4 · program_table_rows(len) ≤ 2^32`?
+///
+/// The circuit does its PC arithmetic in the field — the program table's PC chain, the cpu's
+/// fall-through `PC + 4`, the JAL/JALR link — while the emulator wraps mod 2^32, so a program whose
+/// padded table crosses 2^32 has rows whose field PCs the emulator never produces, and no honest
+/// proof of it verifies (`OodEvaluationMismatch`). ZH4's `check_program` bounds only the program's
+/// own words, `base_pc + 4 · len`, not the `2^program_log_height` rows the table pads to: fib (15
+/// words) at `base_pc = 0xffffffc4` ends exactly at 2^32 and passes it, but pads to 16 rows, one
+/// past the wrap — deployable, paid for, and uncallable for ever. Nothing live is affected (every
+/// chain-15 program sits at `base_pc` 0). The verifier- and prover-side halves of the fix are the
+/// zkVM's (vendored, upstream); this predicate is what the node refuses such a deploy on — as its
+/// admission policy on every chain, and as a validity rule under genesis `program_pc_window`.
+pub fn pc_window_fits(base_pc: u32, len: usize) -> bool {
+    (base_pc as u64).saturating_add(program_table_rows(len).saturating_mul(4)) <= 1 << 32
+}
+
+/// The refusal for a deploy [`pc_window_fits`] refuses, one text for the admission policy and the
+/// validity rule, in ZH4's words.
+pub fn pc_window_error() -> crate::confidential::ConfidentialError {
+    crate::confidential::ConfidentialError::BadInstruction {
+        index: 0,
+        reason: "padded program table spans the u32 pc wrap".into(),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramRecord {
     pub id: ProgramId,

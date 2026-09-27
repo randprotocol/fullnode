@@ -479,6 +479,11 @@ pub struct Ledger {
     /// `None` keeps today's at-most-`MAX_ENVELOPE_BYTES` rule. A genesis parameter like the call
     /// limits: outside the state root and `Ledger`'s equality, restored by `reload_ledger`.
     envelope_bytes: Option<usize>,
+    /// Genesis `program_pc_window` (ZKV-11): a `Deploy` whose padded program table crosses the
+    /// u32 pc wrap is refused (`program::pc_window_fits`). A genesis parameter like
+    /// `max_program_words`: outside the state root and equality, restored by `reload_ledger`.
+    /// `false` — every chain cut before the flag, chain 15 included — is the old rule.
+    program_pc_window: bool,
     /// The aggregator register, hashed into the state root (spec §2.1) when `aggregation` is
     /// set; empty otherwise and at chain-9 block 0.
     aggregators: BTreeMap<Address, aggregation::AggregatorEntry>,
@@ -589,6 +594,7 @@ impl Ledger {
             max_call_envelope_bytes: crate::types::actions::MAX_CALL_ENVELOPE_BYTES,
             max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
             envelope_bytes: None,
+            program_pc_window: false,
             aggregators: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
@@ -641,6 +647,7 @@ impl Ledger {
             max_call_envelope_bytes: crate::types::actions::MAX_CALL_ENVELOPE_BYTES,
             max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
             envelope_bytes: None,
+            program_pc_window: false,
             aggregators: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
@@ -965,6 +972,17 @@ impl Ledger {
     /// enforce; this is only where the ledger keeps what it was told.
     pub fn set_max_program_words(&mut self, words: usize) {
         self.max_program_words = words;
+    }
+
+    /// Whether a `Deploy` must fit its padded program table below the u32 pc wrap (genesis
+    /// `program_pc_window`, ZKV-11); `false` on a chain whose file does not say `true`.
+    pub fn program_pc_window(&self) -> bool {
+        self.program_pc_window
+    }
+
+    /// Set by genesis from `program_pc_window`, and by `reload_ledger` on every restart.
+    pub fn set_program_pc_window(&mut self, on: bool) {
+        self.program_pc_window = on;
     }
 
     /// The largest proof a transaction may carry, in bytes, as genesis set it (default
@@ -1493,6 +1511,15 @@ impl Ledger {
             Action::Deploy { base_pc, words, .. } => {
                 if !self.confidential {
                     return Err(TxError::ConfidentialDisabled);
+                }
+                // ZKV-11, under genesis `program_pc_window`: the padded program table must end at
+                // or below the u32 pc wrap, or no honest proof of the program can verify
+                // (`program::pc_window_fits`). A comparison, so before the executor decodes a
+                // word. Without the flag this is admission policy only (the node's
+                // `admission::deploy_outside_pc_window`), and a block carrying such a deploy
+                // applies as before.
+                if self.program_pc_window && !crate::program::pc_window_fits(*base_pc, words.len()) {
+                    return Err(TxError::BadProgram(crate::program::pc_window_error()));
                 }
                 executor.check_program(*base_pc, words).map_err(TxError::BadProgram)?;
             }
@@ -3364,6 +3391,34 @@ mod tests {
         assert_eq!(r.h_pub, None);
         let with_input = StubExecutor::make_proof_with_public(&plain, 12, [2; 8], &public);
         assert_eq!(call(&mut l, plain, with_input, false), bad);
+    }
+
+    /// ZKV-11: under genesis `program_pc_window` a deploy whose *padded* program table crosses the
+    /// u32 pc wrap is refused, at admission and at apply alike. Fib's 15 words at `0xffffffc4` end
+    /// exactly at 2^32 (ZH4's bound admits them) but pad to 16 rows, one past it; at `0xffffffc0`
+    /// the 16 rows end at 2^32 and fit. Without the flag — chain 15 — the old rule stands.
+    #[test]
+    fn under_the_pc_window_flag_a_deploy_whose_padded_table_wraps_is_refused() {
+        let (a, _) = keys();
+        let deploy = |l: &Ledger, base_pc: u32, n: usize| {
+            let action = Action::Deploy { base_pc, words: vec![0x13; n], public: vec![] };
+            StubExecutor::bound(Transaction::shielded(7, bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&action)), action))
+        };
+        let plain = ledger();
+        assert!(!plain.program_pc_window(), "absent means the old rule");
+        assert_eq!(plain.validate(&deploy(&plain, 0xffff_ffc4, 15), &StubExecutor), Ok(()), "the finding: admitted today");
+
+        let mut gated = ledger();
+        gated.set_program_pc_window(true);
+        assert_eq!(gated, plain, "the flag is not part of equality");
+        assert_eq!(gated.state_root(), plain.state_root(), "nor of the state root");
+        let wraps = deploy(&gated, 0xffff_ffc4, 15);
+        assert_eq!(gated.validate(&wraps, &StubExecutor), Err(TxError::BadProgram(crate::program::pc_window_error())));
+        assert_eq!(gated.clone().apply_tx(&wraps, &a.address(), &StubExecutor), Err(TxError::BadProgram(crate::program::pc_window_error())));
+        assert_eq!(gated.validate(&deploy(&gated, 0xffff_ffc0, 15), &StubExecutor), Ok(()), "16 rows ending at 2^32 fit");
+        // 16 words pad to 32 rows, so the same start that fit 15 words no longer does.
+        assert_eq!(gated.validate(&deploy(&gated, 0xffff_ffc0, 16), &StubExecutor), Err(TxError::BadProgram(crate::program::pc_window_error())));
+        assert_eq!(gated.validate(&deploy(&gated, 0, 4), &StubExecutor), Ok(()), "every live program sits at base_pc 0");
     }
 
     /// The deploy cap is the ledger's, set from genesis, not the constant: a default ledger keeps

@@ -967,6 +967,26 @@ mod tests {
         assert_eq!(mirror::NUM, real::NUM);
     }
 
+    /// ZKV-11: core's `program::program_table_rows` mirrors this crate's program-table padding
+    /// (`1 << program_log_height(len)`), which core cannot call. Every length a deploy may carry
+    /// (up to the 16-bit limit) and the edges past it; a re-vendor that moves the padding fails
+    /// here, where both sides are visible, rather than letting the pc-window rule drift from the
+    /// table the circuit builds.
+    #[test]
+    fn the_ledgers_program_table_rows_mirror_the_real_padding() {
+        use crate::tables::program::program_log_height;
+        for len in (0..=70_000usize).chain([1 << 20, (1 << 20) + 1]) {
+            assert_eq!(
+                randprotocol_core::program::program_table_rows(len),
+                1u64 << program_log_height(len),
+                "len {len}"
+            );
+        }
+        // The finding's shape: fib (15 words) at 0xffffffc4 passes ZH4 and not the window.
+        assert!(!randprotocol_core::program::pc_window_fits(0xffff_ffc4, 15));
+        assert!(randprotocol_core::program::pc_window_fits(0xffff_ffc0, 15));
+    }
+
     /// ZKG-1: an output word past 32 bits is refused, never narrowed. `x as u32` of
     /// `2^32 + w` is `w`, so a truncating read would hand back exactly the digest a proof
     /// publishing `w` does — the pruned path (`Ledger::check_bundle_proof`) already refuses the

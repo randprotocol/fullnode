@@ -533,7 +533,8 @@ impl GossipOutcome {
     ///
     /// The order is the point. The refused cache first, because it is a hash lookup and because a
     /// peer flooding one known-bad transaction must not spend an allowance it could have used on a
-    /// good one; then [`oversized_note`], a byte verdict decided the same way. Then the bucket, so
+    /// good one; then [`oversized_note`] and [`deploy_outside_pc_window`], byte verdicts decided the
+    /// same way. Then the bucket, so
     /// a burst is shed before anything reads the ledger. Then the queue depth. Everything more expensive than this — `Mempool::precheck`, which hashes a
     /// bridge attestation, and the proof itself — happens only after a `Verify`.
     pub fn for_transaction(
@@ -551,6 +552,12 @@ impl GossipOutcome {
         // byte verdict like a cache hit — cached like one too, so the RPC answer names it and a
         // repeat is the lookup above; before the bucket, for the cache's reason.
         if let Some(e) = oversized_note(tx) {
+            refused.insert(tx.hash(), e);
+            return GossipOutcome::Report(Acceptance::Reject);
+        }
+        // And the pc-window screen (ZKV-11), a comparison on the deploy's own fields, for the
+        // same reasons and the same way.
+        if let Some(e) = deploy_outside_pc_window(tx) {
             refused.insert(tx.hash(), e);
             return GossipOutcome::Report(Acceptance::Reject);
         }
@@ -611,6 +618,29 @@ pub fn oversized_note(tx: &Transaction) -> Option<TxError> {
         }
         _ => None,
     }
+}
+
+/// A `Deploy` whose padded program table crosses the u32 pc wrap
+/// (`randprotocol_core::program::pc_window_fits`, ZKV-11): `TxError::BadProgram` with the ledger's
+/// own text. No honest proof of such a program verifies — the circuit does its PC arithmetic in the
+/// field, the emulator wraps mod 2^32 — yet ZH4's `check_program` bounds only `base_pc + 4·len`,
+/// so a deployer could pay `deploy_fee` for a program no call can ever use. `None` for everything
+/// else, and for every program at `base_pc` 0 (all 105 on chain 15).
+///
+/// **Unconditional**, on every chain, like [`oversized_note`]: node policy, not a validity rule —
+/// on a chain whose genesis does not set `program_pc_window` (chain 15) the ledger admits such a
+/// deploy and a block carrying one is valid; this node never pools or forwards it. Under the flag
+/// the ledger's verdict is the same one. Cached like `oversized_note`'s, and for its reason: a
+/// function of the transaction's bytes against a constant (`BadProgram` is already in
+/// [`is_permanent`]'s allowlist, as ZH4's and every other deploy-shape refusal is), so a repeat
+/// costs a lookup. The row count is `program::program_table_rows`, core's mirror of the zkVM's
+/// `program_log_height`, pinned to it in `randprotocol-zkvm`'s executor tests.
+pub fn deploy_outside_pc_window(tx: &Transaction) -> Option<TxError> {
+    let randprotocol_core::Action::Deploy { base_pc, words, .. } = &tx.action else {
+        return None;
+    };
+    (!randprotocol_core::program::pc_window_fits(*base_pc, words.len()))
+        .then(|| TxError::BadProgram(randprotocol_core::program::pc_window_error()))
 }
 
 /// The keys a faucet `Mint` may be signed by, as this node's admission policy: the genesis's
@@ -1092,6 +1122,47 @@ mod tests {
         );
         assert_eq!(bucket.tokens, None, "a refused deposit spends none of the peer's allowance");
         assert_eq!(GossipOutcome::for_transaction(&fits, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
+    }
+
+    /// ZKV-11 (pc-wrap): a deploy whose padded program table crosses the u32 pc wrap can never be
+    /// proven — the circuit does PC arithmetic in the field, the emulator wraps — yet ZH4's
+    /// `check_program` bounds only `base_pc + 4·len`, so fib's 15 words at `0xffffffc4` (ending
+    /// exactly at 2^32, padding to 16 rows) pass it on every chain. The door refuses it from its
+    /// bytes, before the bucket, as the ledger's own `BadProgram` verdict — a byte verdict, cached
+    /// like `oversized_note`'s. The same program one word lower fits and goes on to verify.
+    #[test]
+    fn a_deploy_whose_padded_program_table_wraps_the_pc_space_is_refused_at_the_door() {
+        use crate::storage::fixtures;
+        use randprotocol_core::confidential::{ConfidentialExecutor, StubExecutor};
+        use randprotocol_core::Transaction;
+
+        let (gs, _) = fixtures::bridged_genesis(1);
+        let l = gs.ledger.clone();
+        let fib = randprotocol_zkvm::guests::fib(10);
+        assert_eq!(fib.words.len(), 15, "the finding's program");
+        let zk = randprotocol_zkvm::executor::ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test);
+        assert!(zk.check_program(0xffff_ffc4, &fib.words).is_ok(), "ZH4's bound admits it: the gap");
+        let deploy = |base_pc: u32| {
+            let action = randprotocol_core::Action::Deploy { base_pc, words: fib.words.clone(), public: vec![] };
+            let b = fixtures::bundle(&l, [[40; 8], [41; 8]], [[42; 8], [43; 8]], randprotocol_core::gas::fee_floor(&action));
+            StubExecutor::bound(Transaction::shielded(l.chain_id(), b, action))
+        };
+        let wraps = deploy(0xffff_ffc4);
+        let fits = deploy(0xffff_ffc0);
+
+        let mut refused = RefusedCache::new(4);
+        let limiter = PeerLimiter::new(16, 4.0);
+        let now = Instant::now();
+        assert_eq!(
+            GossipOutcome::for_transaction(&wraps, None, &mut refused, &limiter, 0, now),
+            GossipOutcome::Report(Acceptance::Reject),
+            "a program no call can prove is refused at the door"
+        );
+        let verdict = TxError::BadProgram(randprotocol_core::program::pc_window_error());
+        assert_eq!(refused.get(&wraps.hash()), Some(&verdict), "cached as the byte verdict it is");
+        assert!(is_permanent(&verdict));
+        assert_eq!(GossipOutcome::for_transaction(&fits, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
+        assert_eq!(GossipOutcome::for_transaction(&deploy(0), None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
     }
 
     /// RESCAN-LEDGER-1: the ledger's `Mint` arm asks only for a row in the register, which a

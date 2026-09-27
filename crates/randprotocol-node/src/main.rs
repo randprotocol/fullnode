@@ -816,6 +816,8 @@ async fn main() -> Result<()> {
                     ),
                     None => None,
                 },
+                // ZKV-11's `program_pc_window` likewise: set by hand in the file for the next cut.
+                program_pc_window: None,
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
@@ -1492,7 +1494,8 @@ mod tests {
     }
 
     /// Chain 15, the running chain, byte for byte, after RESCAN-LEDGER-1's
-    /// `staking.faucet_minters` and C15-1's bridge replay floor: the file lists neither, so its
+    /// `staking.faucet_minters`, C15-1's bridge replay floor and ZKV-11's `program_pc_window`:
+    /// the file lists none of them, so its
     /// hash may not move by one bit, its bridge root carries no floor, the ledger's minter rule
     /// stays the register row, every node's pool admits the genesis validators' mints only, and
     /// rewriting the file adds no field. Every later genesis-gated field is pinned against this
@@ -1506,14 +1509,17 @@ mod tests {
         let bridge = gen.bridge.as_ref().expect("chain 15 is bridged");
         assert_eq!((bridge.guardian_set_index, bridge.burn_sequence), (Some(1), Some(7)));
         assert_eq!(bridge.min_inbound_sequence, None, "chain 15 carries no replay floor");
+        assert_eq!(gen.program_pc_window, None, "chain 15 predates the pc-window rule (ZKV-11)");
         let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
         let state = gen.build(executor.as_ref()).unwrap();
         assert_eq!(state.hash().to_hex(), "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8");
         let live = state.ledger.bridge().unwrap();
         assert!(live.min_inbound_sequence.is_empty() && live.replay_floor().is_none());
+        assert!(!state.ledger.program_pc_window(), "the ledger keeps the old deploy rule; the pool refuses as policy");
         let json = gen.to_json();
         assert!(!json.contains("faucet_minters"), "rewriting the file adds no list");
         assert!(!json.contains("min_inbound_sequence"), "rewriting the file adds no field");
+        assert!(!json.contains("program_pc_window"), "nor the pc-window flag");
         let minters = randprotocol_node::admission::faucet_minters(&state);
         assert_eq!(minters.len(), gen.validators.len(), "the pool admits the genesis validators");
         assert!(gen.validators.iter().all(|v| minters.contains(&v.public_key.address())));
@@ -1757,6 +1763,7 @@ mod tests {
             max_call_envelope_bytes: None,
             max_program_public_words: None,
             envelope_bytes: None,
+            program_pc_window: None,
             staking: None,
             vesting: None,
         }

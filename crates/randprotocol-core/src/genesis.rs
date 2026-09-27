@@ -397,6 +397,13 @@ pub struct Genesis {
     /// byte-for-byte as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vesting: Option<crate::ledger::vesting::VestingConfig>,
+    /// ZKV-11 (pc-wrap, 2026-09-28): `true` makes it a validity rule that a `Deploy`'s padded
+    /// program table ends at or below the u32 pc wrap (`program::pc_window_fits`) — a program
+    /// past it deploys and can never be proven. Absent or `false` is the old rule (the node still
+    /// refuses such a deploy at its pool, as policy). Part of the genesis hash, tagged, only when
+    /// `true`, so chain 15's file hashes byte-for-byte as before; never part of the state root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_pc_window: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -810,6 +817,7 @@ impl Genesis {
         );
         ledger.set_max_program_public_words(self.max_program_public_words.map_or(gas::MAX_PROGRAM_PUBLIC_WORDS, |n| n as usize));
         ledger.set_envelope_bytes(self.envelope_bytes.map(|n| n as usize));
+        ledger.set_program_pc_window(self.program_pc_window == Some(true));
         // The genesis ledger is positioned at the genesis block, so it carries that block's
         // time structurally rather than relying on every caller to patch it in. The timestamp
         // is transient state, not part of the state root or the genesis hash.
@@ -1084,6 +1092,13 @@ impl Genesis {
                     None => commit.push(0),
                 }
             }
+        }
+        // The pc-window rule (ZKV-11), last: tagged and appended only when the file says `true`,
+        // like `bound_note_value` — `false` is the old rule and commits nothing, so chain 15
+        // (`cc30e085…`) hashes byte-for-byte as before.
+        if self.program_pc_window == Some(true) {
+            commit.extend_from_slice(b"program_pc_window");
+            commit.push(1);
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -1470,6 +1485,7 @@ mod tests {
             max_program_public_words: None,
             envelope_bytes: None,
             vesting: None,
+            program_pc_window: None,
         }
     }
 
@@ -2716,6 +2732,33 @@ mod tests {
         assert_eq!(e.ledger.max_program_words(), crate::gas::MAX_PROGRAM_WORDS);
         assert_ne!(e.hash(), s.hash(), "the binding is presence: spelling out the default is a new chain");
         assert_ne!(e.hash(), r.hash(), "and two caps are two chains");
+    }
+
+    /// ZKV-11's `program_pc_window` is opt-in per chain and bound into the hash only when `true`,
+    /// like `tokens.bound_note_value`: absent or `false` is the old rule and the same chain, `true`
+    /// is a new chain whose ledger refuses a deploy past the pc window. Never state.
+    #[test]
+    fn program_pc_window_is_bound_into_the_hash_only_when_true() {
+        let plain = genesis(2);
+        assert_eq!(plain.program_pc_window, None);
+        assert!(!plain.to_json().contains("program_pc_window"), "an absent flag is absent from the file");
+        let s = build(&plain);
+        assert!(!s.ledger.program_pc_window(), "absent means the old rule");
+
+        let mut off = plain.clone();
+        off.program_pc_window = Some(false);
+        let o = build(&off);
+        assert_eq!(o.hash(), s.hash(), "`false` commits nothing");
+        assert!(!o.ledger.program_pc_window());
+
+        let mut on = plain.clone();
+        on.program_pc_window = Some(true);
+        let g = build(&on);
+        assert!(g.ledger.program_pc_window(), "the ledger runs the rule genesis names");
+        assert_ne!(g.hash(), s.hash(), "the rule is a different chain");
+        assert_eq!(g.ledger.state_root(), s.ledger.state_root(), "a parameter, not state");
+        assert!(on.to_json().contains("\"program_pc_window\": true"));
+        assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "and it round-trips");
     }
 
     /// The cap must be a program length the zkVM can prove: at least one word, and no more than

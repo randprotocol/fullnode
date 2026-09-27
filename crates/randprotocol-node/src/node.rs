@@ -172,6 +172,9 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // today's at-most rule, and a node that forgot it would admit short envelopes its peers
     // refuse — a fork at its first restart.
     ledger.set_envelope_bytes(gs.ledger.envelope_bytes());
+    // And the pc-window rule (ZKV-11): a node that came back without it would admit and apply a
+    // deploy its peers refuse — a fork at the first such deploy after its restart.
+    ledger.set_program_pc_window(gs.ledger.program_pc_window());
     // And the consensus signing domain (audit v4): `load_ledger` comes back at v0, and a node
     // that kept it on a v1 chain would refuse every peer's proposal at the ledger's own
     // signature check.
@@ -4251,6 +4254,20 @@ mod tests {
         let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
         assert_eq!(reloaded.max_program_words(), gas::MAX_PROGRAM_WORDS_LIMIT);
         assert_eq!(reloaded, gs.ledger);
+    }
+
+    /// The pc-window rule (ZKV-11) survives a restart the same way: `load_ledger` comes back with
+    /// it off, and a node that kept it off would apply a deploy its peers refuse.
+    #[test]
+    fn a_restart_restores_the_pc_window_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        gs.ledger.set_program_pc_window(true);
+        storage.init_genesis(&gs).unwrap();
+        assert!(!storage.load_ledger(&StubExecutor).unwrap().program_pc_window());
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert!(reloaded.program_pc_window(), "restored from the genesis state");
     }
 
     /// The four call-limits parameters survive a restart the same way: `load_ledger` comes back

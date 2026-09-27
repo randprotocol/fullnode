@@ -103,6 +103,7 @@ fn genesis_full(
         max_program_public_words,
         envelope_bytes: None,
         vesting: None,
+        program_pc_window: None,
     }
 }
 

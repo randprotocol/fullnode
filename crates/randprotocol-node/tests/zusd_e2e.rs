@@ -128,6 +128,7 @@ fn zusd_genesis(validators: &[randprotocol_core::Keypair]) -> Genesis {
         max_call_envelope_bytes: None,
         max_program_public_words: None,
         envelope_bytes: None,
+        program_pc_window: None,
         staking: None,
         vesting: None,
     }
