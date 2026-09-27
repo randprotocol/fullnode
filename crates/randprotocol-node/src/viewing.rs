@@ -104,6 +104,9 @@ impl Drop for Import {
         // Overwrite through a volatile write so the compiler cannot elide the store on a value
         // that is about to die (audit v3, VK-2).
         for w in self.vk.nk.iter_mut() {
+            // SAFETY: `w` is a `&mut u32` into `self.vk.nk`, so the pointer is non-null, aligned,
+            // valid for a `u32` write and exclusively borrowed; `u32` has no drop glue, so
+            // overwriting it without reading is sound.
             unsafe { std::ptr::write_volatile(w, 0) };
         }
     }

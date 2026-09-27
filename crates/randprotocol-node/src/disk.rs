@@ -13,8 +13,13 @@ pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `libc::statvfs` is a plain C struct of integer fields (no references, no niches),
+    // so the all-zero bit pattern is a valid value of it; it is only an out-parameter, fully
+    // written by the call below before any field is read.
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is a valid NUL-terminated path and `st` is a zeroed out-parameter.
+    // SAFETY: `c` is a valid NUL-terminated path that outlives the call, and `&mut st` is a
+    // valid, exclusive, properly aligned pointer to a `statvfs` for the call's duration; on a
+    // non-zero return nothing in `st` is read.
     if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
