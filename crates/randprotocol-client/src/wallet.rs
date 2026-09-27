@@ -1783,6 +1783,74 @@ fn prove_transaction(
     Ok(p)
 }
 
+/// Proves a call against its transaction's call binding: what [`submit_spend`]'s `call_prover`
+/// is (INT-4). Handed the eight binding words, returns the call proof.
+pub type CallProver<'a> = dyn Fn(&[u32; TX_BINDING_WORDS]) -> Result<Vec<u8>> + Send + Sync + 'a;
+
+/// INT-4 (genesis `hardening_v6`): prove `tx`'s call against `tx`'s own
+/// [`Transaction::call_binding`], in place — the call binding blanks the call proof and the bundle
+/// proof, so filling the call proof in cannot move it, and the bundle's binding, taken next, then
+/// covers the finished call. The chain refuses the proof under any other fee bundle.
+fn bind_call(tx: &mut Transaction, prove: &CallProver<'_>) -> Result<()> {
+    let binding = tx.call_binding();
+    let proof = prove(&binding)?;
+    match &mut tx.action {
+        Action::Call { proof: p, .. } => *p = proof,
+        _ => return Err(anyhow!("a call binding for an action that is not a call (wallet bug)")),
+    }
+    debug_assert_eq!(tx.call_binding(), binding, "filling the call proof in never moves the call binding");
+    Ok(())
+}
+
+/// A call on a chain whose genesis sets `hardening_v6` (INT-4): the RAND fee bundle is built
+/// first, the transaction assembled with both proofs empty, the call proved over its
+/// [`Transaction::call_binding`] by `prove_call`, and only then the bundle proved over the whole —
+/// [`submit_spend`]'s one path, with the hook. `action` is the `Call` with its proof empty and its
+/// input envelope already sealed (the envelope is inside the call binding). `fee` was fixed before
+/// the call proof existed, from its tier ([`randprotocol_zkvm::executor::call_tier`]); a proof that
+/// comes out larger than the fee pays for is refused here, before the bundle is proved.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_bound_call(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    action: Action,
+    fee: u64,
+    prove_call: &CallProver<'_>,
+    profile: FriProfile,
+    backend: Backend,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    let envelope = match &action {
+        Action::Call { input_envelope, .. } => input_envelope.clone(),
+        _ => return Err(anyhow!("submit_bound_call takes a call")),
+    };
+    let checked = |binding: &[u32; TX_BINDING_WORDS]| -> Result<Vec<u8>> {
+        let proof = prove_call(binding)?;
+        let tier = call_proof_tier(&proof)?;
+        let need = call_fee_default(tier, gas::call_bytes(&proof, envelope.as_ref()));
+        if need > fee {
+            return Err(anyhow!(
+                "the call proof came out at tier {tier}, {} bytes, whose fee is {} RAND — more than the {} RAND                  the fee bundle was built for; retry with --fee {}",
+                proof.len(),
+                format_amount(need),
+                format_amount(fee),
+                format_amount(need)
+            ));
+        }
+        Ok(proof)
+    };
+    let spend = Spend { asset: 0, to: None, memo: "", fee, burn_a: 0, burn_r: 0 };
+    submit_spend(rpc, w, store, spend, action, Burn::None, Proving::Real(profile, backend), Some(&checked), chain_id, wait).await
+}
+
+/// The tier a call proof declares, read off its header.
+fn call_proof_tier(proof: &[u8]) -> Result<u8> {
+    let p = randprotocol_zkvm::executor::decode_canonical(proof).map_err(|e| anyhow!("the call proof does not decode: {e}"))?;
+    Ok(p.tier.0 as u8)
+}
+
 /// Wait for the commit, or hold the spent notes back: the tail of every submission.
 async fn settle(
     rpc: &RpcClient,
@@ -1820,6 +1888,13 @@ async fn settle(
 /// so the fee, the anchor, the witnesses and the digest check cannot drift apart between a
 /// transfer, a bond, a deploy, a call, an attestation and a burn.
 #[allow(clippy::too_many_arguments)]
+///
+/// `call_prover` is the INT-4 hook (genesis `hardening_v6`): for a `Call` it is handed the
+/// transaction's [`Transaction::call_binding`] — taken with both proofs empty — and returns the
+/// call proof made over it, which is filled in before the bundle's own binding is taken
+/// ([`bind_call`]). `None` everywhere else, and for a call on a chain without the flag, whose proof
+/// the caller made beforehand.
+#[allow(clippy::too_many_arguments)]
 async fn submit_spend(
     rpc: &RpcClient,
     w: &Wallet,
@@ -1828,6 +1903,7 @@ async fn submit_spend(
     action: Action,
     burn: Burn,
     proving: Proving,
+    call_prover: Option<&CallProver<'_>>,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
@@ -1841,6 +1917,9 @@ async fn submit_spend(
     // The whole transaction first, its bundle's proof empty; then the proof, bound to it. Nothing
     // is set on the transaction after the proof but the proof itself.
     let mut tx = Transaction::shielded(chain_id, prepared.bundle.clone(), action);
+    if let Some(prove_call) = call_prover {
+        bind_call(&mut tx, prove_call)?;
+    }
     let proved = prove_transaction(&mut tx, &prepared, &|p, b| proving.prove(p, b))?;
     // `submit_refused` labels a JSON-RPC error reply *from this call* as `SubmitRefused`
     // (node I1): it is the only failure here that means nothing was admitted, and `rand token
@@ -1907,7 +1986,7 @@ async fn submit_with(
     // `to: None` (a deploy, a bond, a bridge action), and the one path that pays someone a memo
     // is `send`/`send_asset`, below.
     let spend = Spend { asset: 0, to, memo: "", fee, burn_a: 0, burn_r: burn.units() };
-    submit_spend(rpc, w, store, spend, action, burn, proving, chain_id, wait).await
+    submit_spend(rpc, w, store, spend, action, burn, proving, None, chain_id, wait).await
 }
 
 /// A bridge action on a fee bundle: `rand bridge-mint`'s and `rand bridge-rotate`'s
@@ -2115,7 +2194,7 @@ async fn submit_burn_with(
     burn_is_possible(&rpc.bridge_state().await?, asset, to_chain, &token, amount, relayer_fee)?;
     let action = Action::BridgeBurn { asset, amount, relayer_fee, to_chain, token, to };
     let spend = Spend { asset, to: None, memo: "", fee, burn_a: amount, burn_r: 0 };
-    submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, proving, chain_id, wait).await
+    submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, proving, None, chain_id, wait).await
 }
 
 /// Burn `amount` of token `asset` held in this wallet (`Action::TokenBurn`, RPL spec §4): the
@@ -2169,7 +2248,7 @@ async fn submit_token_burn_with(
     }
     let action = Action::TokenBurn { asset, amount };
     let spend = Spend { asset, to: None, memo: "", fee, burn_a: amount, burn_r: 0 };
-    submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, proving, chain_id, wait).await
+    submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, proving, None, chain_id, wait).await
 }
 
 /// The facts a deploy needs from the chain before any proving: whether `words` code words fit this
@@ -3256,7 +3335,7 @@ async fn send_asset_with(
         return Err(anyhow!("a transfer of zero moves nothing"));
     }
     let spend = Spend { asset, to: Some((to, amount)), memo, fee, burn_a: 0, burn_r: 0 };
-    submit_spend(rpc, w, store, spend, Action::None, Burn::None, proving, chain_id, wait).await
+    submit_spend(rpc, w, store, spend, Action::None, Burn::None, proving, None, chain_id, wait).await
 }
 
 #[cfg(test)]
@@ -6221,6 +6300,7 @@ mod tests {
             max_call_envelope_bytes,
             max_program_public_words: 64,
             envelope_bytes: None,
+            hardening_v6: false,
         }
     }
 
@@ -6413,6 +6493,54 @@ mod tests {
         *to = [2; 32];
         let refused = Err(ConfidentialError::InvalidBundleProof("PublicValues".into()));
         assert_eq!(StubExecutor.verify_bundle(&HC, &copy.bundle.as_ref().unwrap().proof, &copy.binding()), refused);
+    }
+
+    /// INT-4, the wallet's order under genesis `hardening_v6`: the call is proved over the
+    /// transaction's call binding (both proofs empty), filled in, and only then the bundle is
+    /// proved over the finished transaction — so the call proof verifies under the hardened rule
+    /// for this transaction and the bundle's binding covers the call proof. Lifted onto another
+    /// fee bundle, the call proof is refused.
+    #[test]
+    fn a_bound_call_is_proved_before_its_bundle_and_verifies_for_its_own_transaction() {
+        use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
+        use randprotocol_core::program::ProgramRecord;
+        const HC: Word8 = [11; 8];
+        let bundle = |nf: u32| Bundle {
+            anchor: [1; 8],
+            nullifiers: [[nf; 8], [nf + 1; 8], [nf + 2; 8], [nf + 3; 8]],
+            commitments: [[14; 8], [15; 8], [16; 8], [17; 8]],
+            fee: gas::BUNDLE_BASE + gas::call_fee(12, 0),
+            burn_a: 0,
+            burn_r: 0,
+            burn_asset: 0,
+            time: 9,
+            envelopes: [env(), env(), env(), env()],
+            proof: Vec::new(),
+        };
+        let prepared = Prepared { bundle: bundle(10), words: Vec::new(), expected: [0; 8] };
+        let id = Hash::digest(b"program");
+        let record = ProgramRecord { id, base_pc: 0, words: vec![0x13; 4], code_hash: vec![], deployed_at: 0, public_digest: None, public_len: 0 };
+        let call = Action::Call { program: id, proof: Vec::new(), input_envelope: None };
+        let mut tx = Transaction::shielded(13, prepared.bundle.clone(), call);
+        let prove_call = |b: &[u32; TX_BINDING_WORDS]| -> Result<Vec<u8>> { Ok(StubExecutor::make_proof_with_public(&id, 12, [5; 8], b)) };
+        bind_call(&mut tx, &prove_call).unwrap();
+        let stub = |p: &Prepared, binding: &[u32; TX_BINDING_WORDS]| -> Result<Proved> {
+            let d = StubExecutor.bundle_digest(&p.bundle.digest_input());
+            Ok(Proved { proof: StubExecutor::make_bundle_proof(&HC, &d, binding), tier: 14, proving: Duration::ZERO })
+        };
+        prove_transaction(&mut tx, &prepared, &stub).unwrap();
+        let Action::Call { proof, .. } = &tx.action else { panic!("a call") };
+        assert!(StubExecutor.verify_call_hardened(&record, proof, &tx.call_binding()).is_ok(), "bound to its own transaction");
+        assert_eq!(StubExecutor.verify_bundle(&HC, &tx.bundle.as_ref().unwrap().proof, &tx.binding()), Ok(()));
+        let mut lifted = Transaction::shielded(13, bundle(40), tx.action.clone());
+        StubExecutor::bind(&mut lifted);
+        let Action::Call { proof, .. } = &lifted.action else { panic!("a call") };
+        assert_eq!(
+            StubExecutor.verify_call_hardened(&record, proof, &lifted.call_binding()),
+            Err(ConfidentialError::InvalidProof("PublicValues".into())),
+            "the same call proof under another fee bundle"
+        );
+        assert!(bind_call(&mut Transaction::shielded(13, bundle(50), Action::None), &prove_call).is_err(), "only a call is bound");
     }
 
 }

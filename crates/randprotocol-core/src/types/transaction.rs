@@ -652,6 +652,9 @@ pub const TX_BINDING_WORDS: usize = 8;
 /// The binding's hash domain.
 pub const TX_BINDING_DOMAIN: &[u8] = b"rand-tx-bind-1";
 
+/// [`Transaction::call_binding`]'s hash domain (INT-4, genesis `hardening_v6`).
+pub const CALL_BINDING_DOMAIN: &[u8] = b"rand-call-bind-1";
+
 /// A transaction: a shielded bundle, an action, or (for a faucet mint) an action alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
@@ -782,18 +785,42 @@ impl Transaction {
     /// Not the transaction id: [`Transaction::hash`] is unchanged and still takes each bundle
     /// proof by its digest.
     pub fn binding(&self) -> [u32; TX_BINDING_WORDS] {
-        use bincode::Options;
-        let blanked = Transaction {
-            chain_id: self.chain_id,
-            bundle: self.bundle.as_ref().map(blank_bundle),
-            action: self.action.blanked(),
+        self.binding_of(TX_BINDING_DOMAIN, self.action.blanked())
+    }
+
+    /// What a call proof of this transaction is bound to under genesis `hardening_v6` (INT-4 of
+    /// the 2026-09-27 zkVM/ISA review): [`Transaction::binding`]'s construction under its own
+    /// domain, [`CALL_BINDING_DOMAIN`], with the `Call`'s proof blanked as well as the bundle's —
+    /// a proof cannot commit to itself. Everything else is inside it: the chain id, the program,
+    /// the call's input envelope, and every public field of the fee bundle (its four nullifiers
+    /// among them). The call proof carries these words as its public input segment when its
+    /// program was deployed without one (`ConfidentialExecutor::verify_call_hardened`), so a copy
+    /// of it attached to any other fee bundle no longer verifies, and since those nullifiers can
+    /// be spent once, one call proof yields one receipt.
+    ///
+    /// The two bindings nest: the bundle's [`Transaction::binding`] keeps the call proof inside,
+    /// so the wallet builds the transaction with both proofs empty, proves the call against this,
+    /// fills it in, and only then takes the bundle's binding and proves the bundle. For any other
+    /// action it is simply a second digest of the same transaction, which nothing checks.
+    pub fn call_binding(&self) -> [u32; TX_BINDING_WORDS] {
+        let action = match self.action.blanked() {
+            Action::Call { program, input_envelope, .. } => Action::Call { program, proof: Vec::new(), input_envelope },
+            other => other,
         };
+        self.binding_of(CALL_BINDING_DOMAIN, action)
+    }
+
+    /// `(chain_id, bundle', action)` under `domain`, as eight little-endian words: the bundle's
+    /// proof blanked, the action as the caller blanked it. The one construction both bindings use.
+    fn binding_of(&self, domain: &[u8], action: Action) -> [u32; TX_BINDING_WORDS] {
+        use bincode::Options;
+        let bundle = self.bundle.as_ref().map(blank_bundle);
         let bytes = bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .with_little_endian()
-            .serialize(&(blanked.chain_id, &blanked.bundle, &blanked.action))
+            .serialize(&(self.chain_id, &bundle, &action))
             .expect("Transaction serializes");
-        let digest = Hash::digest_domain(TX_BINDING_DOMAIN, &bytes);
+        let digest = Hash::digest_domain(domain, &bytes);
         std::array::from_fn(|i| u32::from_le_bytes(digest.0[4 * i..4 * i + 4].try_into().expect("four bytes")))
     }
 

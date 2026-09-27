@@ -1375,35 +1375,82 @@ async fn main() -> Result<()> {
                     public.len()
                 );
             }
-            let t = std::time::Instant::now();
-            // Two provers, one difference: `prove_call` returns the `H_IN` salt as well, which is
-            // what the transcript is sealed with. It is CPU-only — every other backend draws that
-            // salt inside the prover and drops it — so a GPU proof has to go without an envelope,
-            // and says so in its own words rather than being quietly downgraded here.
-            let (proof, outputs, tier, envelope, call_key) = if no_envelope {
-                let (proof, outputs, tier) =
-                    executor::prove(profile, &prog, &inputs, &public, tier, backend).map_err(|e| anyhow::anyhow!(e))?;
-                (proof, outputs, tier, None, None)
+            // INT-4: on a chain whose genesis sets `hardening_v6` a call proof is bound to its own
+            // transaction — its public segment is `Transaction::call_binding`, which covers the fee
+            // bundle — so it is proved *inside* the submission, after the bundle's notes are chosen
+            // and before the bundle is proved. Everything the binding covers is fixed first: the
+            // `H_IN` salt and the sealed input envelope, and the fee, from the tier the call lands
+            // on (`executor::call_tier`, no proving). On any other chain the old order stands.
+            let hardened = limits.as_ref().is_some_and(|l| l.hardening_v6);
+            let (s, call_key) = if hardened {
+                if !matches!(backend, Backend::Cpu) {
+                    anyhow::bail!("this chain binds each call proof to its transaction (hardening_v6); prove it on the CPU backend");
+                }
+                let segment_words = if public.is_empty() { randprotocol_core::types::TX_BINDING_WORDS } else { public.len() };
+                let tier = match tier {
+                    Some(t) => t,
+                    None => executor::call_tier(&prog, &inputs, segment_words).map_err(|e| anyhow::anyhow!(e))?,
+                };
+                let salt = executor::fresh_call_salt();
+                let (envelope, call_key) = if no_envelope {
+                    (None, None)
+                } else {
+                    let h_in = hash::input_digest(salt, &inputs);
+                    let (e, key) = call_envelope::seal_call_envelope(&w.vk, auditor.as_ref(), &h_in, salt, &inputs, caps)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    (Some(e), Some(key))
+                };
+                // The proof's own bytes cannot be priced before it exists; every call a chain
+                // admits today is inside the free allowance, and `submit_bound_call` refuses a
+                // proof that comes out dearer than this, naming the fee to retry with.
+                let fee = match fee {
+                    Some(f) => parse_amount(&f)?,
+                    None => wallet::call_fee_default(tier, gas::call_bytes(&[], envelope.as_ref())),
+                };
+                let cap = wallet::proof_cap(limits.as_ref());
+                let prove = |binding: &[u32; randprotocol_core::types::TX_BINDING_WORDS]| -> Result<Vec<u8>> {
+                    let t = std::time::Instant::now();
+                    let (proof, outputs, tier) =
+                        executor::prove_call_hardened(profile, &prog, &inputs, &public, binding, salt, Some(tier)).map_err(|e| anyhow::anyhow!(e))?;
+                    eprintln!("proved in {:.1?}: tier {tier}, {} bytes, outputs {outputs:?}", t.elapsed(), proof.len());
+                    wallet::check_proof_size(proof.len(), cap)?;
+                    Ok(proof)
+                };
+                let action = Action::Call { program: pid, proof: Vec::new(), input_envelope: envelope };
+                let s = wallet::submit_bound_call(&rpc, &w, &mut store, action, fee, &prove, profile, backend, chain_id, true).await;
+                (s, call_key)
             } else {
-                let (proof, outputs, tier, salt) =
-                    executor::prove_call(profile, &prog, &inputs, &public, tier, backend, caps.max_input_words).map_err(|e| anyhow::anyhow!(e))?;
-                let h_in = hash::input_digest(salt, &inputs);
-                let (e, key) = call_envelope::seal_call_envelope(&w.vk, auditor.as_ref(), &h_in, salt, &inputs, caps)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                (proof, outputs, tier, Some(e), Some(key))
+                let t = std::time::Instant::now();
+                // Two provers, one difference: `prove_call` returns the `H_IN` salt as well, which is
+                // what the transcript is sealed with. It is CPU-only — every other backend draws that
+                // salt inside the prover and drops it — so a GPU proof has to go without an envelope,
+                // and says so in its own words rather than being quietly downgraded here.
+                let (proof, outputs, tier, envelope, call_key) = if no_envelope {
+                    let (proof, outputs, tier) =
+                        executor::prove(profile, &prog, &inputs, &public, tier, backend).map_err(|e| anyhow::anyhow!(e))?;
+                    (proof, outputs, tier, None, None)
+                } else {
+                    let (proof, outputs, tier, salt) =
+                        executor::prove_call(profile, &prog, &inputs, &public, tier, backend, caps.max_input_words).map_err(|e| anyhow::anyhow!(e))?;
+                    let h_in = hash::input_digest(salt, &inputs);
+                    let (e, key) = call_envelope::seal_call_envelope(&w.vk, auditor.as_ref(), &h_in, salt, &inputs, caps)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    (proof, outputs, tier, Some(e), Some(key))
+                };
+                eprintln!("proved in {:.1?}: tier {tier}, {} bytes, outputs {outputs:?}", t.elapsed(), proof.len());
+                // Before the paying bundle is proved: a proof over the chain's cap would be refused.
+                wallet::check_proof_size(proof.len(), wallet::proof_cap(limits.as_ref()))?;
+                // The fee's byte term counts the proof and the envelope (spec §7); a call under the
+                // free allowance, every call a default chain admits, pays the tier's fee alone.
+                let bytes = gas::call_bytes(&proof, envelope.as_ref());
+                let action = Action::Call { program: pid, proof, input_envelope: envelope };
+                let fee = match fee {
+                    Some(f) => parse_amount(&f)?,
+                    None => wallet::call_fee_default(tier, bytes),
+                };
+                let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend, chain_id, true).await;
+                (s, call_key)
             };
-            eprintln!("proved in {:.1?}: tier {tier}, {} bytes, outputs {outputs:?}", t.elapsed(), proof.len());
-            // Before the paying bundle is proved: a proof over the chain's cap would be refused.
-            wallet::check_proof_size(proof.len(), wallet::proof_cap(limits.as_ref()))?;
-            // The fee's byte term counts the proof and the envelope (spec §7); a call under the
-            // free allowance, every call a default chain admits, pays the tier's fee alone.
-            let bytes = gas::call_bytes(&proof, envelope.as_ref());
-            let action = Action::Call { program: pid, proof, input_envelope: envelope };
-            let fee = match fee {
-                Some(f) => parse_amount(&f)?,
-                None => wallet::call_fee_default(tier, bytes),
-            };
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend, chain_id, true).await;
             store.save(&path)?;
             let s = s?;
             report(&s, "call");

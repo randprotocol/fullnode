@@ -711,6 +711,139 @@ impl ZkExecutor {
         self.verify_pinned_bundle(Self::hidden_bundle_heights(), hc, proof, binding)
     }
 
+    /// `verify_call`, and under genesis `hardening_v6` `verify_call_hardened` (`binding` set), and
+    /// its decode-only twin (`verify` false: everything but `Machine::verify`).
+    ///
+    /// INT-4: with `binding` set, a call against a program deployed without a public input must
+    /// carry the eight binding words (`Transaction::call_binding`) as its public segment — its
+    /// declared public height is theirs and `pv::PUB0..7` is their digest — where the old rule
+    /// wants the empty segment. A copy of the proof under another fee bundle then fails the digest
+    /// compare. A program deployed with a public input keeps its recorded digest either way: the
+    /// chain holds the digest, not the words, so it cannot recompute one over the words and the
+    /// binding (the residual `ConfidentialExecutor::verify_call_hardened` documents).
+    fn check_call(
+        &self,
+        record: &ProgramRecord,
+        proof: &[u8],
+        binding: Option<&[u32; TX_BINDING_WORDS]>,
+        verify: bool,
+    ) -> Result<CallOutcome, ConfidentialError> {
+        // INT-4: the segment this call proves over — the binding, for a program without a public
+        // input under the hardened rule; otherwise the deploy-time input, as ever.
+        let bound = binding.filter(|_| record.public_len == 0);
+        let segment_len = if bound.is_some() { TX_BINDING_WORDS } else { record.public_len as usize };
+        // `Machine::verify` runs `check_declared_heights` on the proof's tier and six declared
+        // table heights before using any of them to size anything — but the degree-bits pre-check
+        // inside `decode_and_check` shifts by them too, so it runs that same function in front of
+        // it, to avoid panicking on an attacker-chosen out-of-range value before ever reaching
+        // `verify`. `decode_and_check` only *ranges* a call's tier, program and input heights;
+        // the three checks below pin them against what the chain does know, and every one of
+        // them runs before `Machine::verify` builds a verifier key for the declared shape.
+        let proof = self.decode_and_check(proof, 0, 0, 0, false)?;
+        // The tier cap (deep scan 2026-09-24, zkvm). `check_declared_heights` admits every tier
+        // in `TIERS`, and `Machine::verify` builds the verifier key for the declared tier
+        // *before* it looks at a byte of STARK data — every pre-check in front of that build is
+        // satisfiable from public data alone (a consistent `degree_bits`, the tier's memory
+        // floor, the tier public value). The tier-20 key costs 216 s and 6.5 GB at the
+        // production profile, on validators that are 2–4 GB droplets, so one legal tier-20
+        // header — its transaction never mined, its fee bundle's note never spent, so it can be
+        // resubmitted forever — was an out-of-memory kill of the admitting node. Refused as its
+        // own verdict, with the remedy in the message, so an honest prover above the cap is
+        // told what to do rather than handed a `Batch(…)` failure.
+        let tier = proof.tier.0 as u8;
+        if tier > MAX_CALL_TIER {
+            return Err(ConfidentialError::CallTierTooHigh { tier, max: MAX_CALL_TIER });
+        }
+        // The two optional hash tables, whose preprocessed columns are the key's real cost
+        // (`MAX_CALL_KECCAK_LOG_HEIGHT`'s doc comment has the numbers): `check_declared_heights`
+        // bounds them by the tier's honest need, which at tier 14 is still a 2^19-row keccak
+        // table — 128 s and 8.7 GB of key. `0` declares no table and is always admitted.
+        if proof.keccak_log_height > MAX_CALL_KECCAK_LOG_HEIGHT {
+            return Err(ConfidentialError::InvalidProof(format!(
+                "keccak height {} past the {} a call may declare",
+                proof.keccak_log_height, MAX_CALL_KECCAK_LOG_HEIGHT
+            )));
+        }
+        if proof.sha256_log_height > MAX_CALL_SHA256_LOG_HEIGHT {
+            return Err(ConfidentialError::InvalidProof(format!(
+                "sha256 height {} past the {} a call may declare",
+                proof.sha256_log_height, MAX_CALL_SHA256_LOG_HEIGHT
+            )));
+        }
+        // The program height is not a guess: the record holds the deployed words, and
+        // `Machine::prove` declares exactly `program_log_height(program.len())` (`Program::len`
+        // is `words.len()`), so any other declared height is a proof over a different program
+        // table — one the `hc` compare inside `verify` would refuse, but only after a key was
+        // built and cached (evicting a warmed one) for the junk height.
+        if proof.program_log_height != program::program_log_height(record.words.len()) {
+            return Err(ConfidentialError::InvalidProof("program height not the deployed program's".into()));
+        }
+        // The input height is unknown but bounded by the tier, exactly as the keccak height is
+        // bounded by it inside `check_declared_heights` (`max_input_log_height`).
+        if proof.input_log_height > max_input_log_height(proof.tier) {
+            return Err(ConfidentialError::InvalidProof("input height past what the tier can read".into()));
+        }
+        // A deterministic early reject, before `hc_of` and `Machine::verify`: a call against a
+        // program deployed with a public input must declare exactly the public-table height the
+        // prover derives from that input's length (`Machine::prove` uses
+        // `public_log_height(public.len())`, and the record's `public_len` is that length). Any
+        // other height is a proof over a different public segment, which the `PUB0..7` compare
+        // below would refuse anyway — but only after `verify` had built (and cached, evicting an
+        // honest one) a verifier key for the junk height. Same error as that compare.
+        if proof.public_log_height != public::public_log_height(segment_len) {
+            return Err(ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues)));
+        }
+        let hc = Self::hc_of(record)?;
+        // The call limits (spec §5): `verify`, then `pv::PUB0..7` against the public input the
+        // program was deployed with — its record's digest, computed once at deploy, so no word is
+        // re-hashed here. A program deployed without one takes only `hash::public_digest(&[])`,
+        // exactly `verify_public(hc, &[], proof)`, today's rule. Plain `verify` alone would
+        // accept any `H_PUB`, bound in-circuit to a public segment the chain never saw (see the
+        // module doc comment). A mismatch reports as `verify_public`'s own `PublicValues`.
+        //
+        // `verify` false is B5's decode path: admission ran `Machine::verify` over these bytes.
+        if verify {
+            self.machine.verify(&hc, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+        }
+        let want = match bound {
+            Some(words) => crate::hash::public_digest(words),
+            None => record.public_digest.unwrap_or_else(|| crate::hash::public_digest(&[])),
+        };
+        if (0..8).any(|i| proof.public_values[pv::PUB0 + i] != want[i] as u64) {
+            return Err(ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues)));
+        }
+        let outputs = std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32);
+        // M4.1/S3: `H_IN` travels to the receipt so a call-input envelope sealed against it can
+        // be opened and checked later (spec §6.1). `decode_and_check` has already refused a
+        // proof whose `IN0..7` are not `u32`s, so the narrowing below cannot silently truncate.
+        let h_in = std::array::from_fn(|i| proof.public_values[pv::IN0 + i] as u32);
+        Ok(CallOutcome { tier: proof.tier.0 as u8, outputs, h_in })
+    }
+
+    /// The body of `warm`/`warm_hardened`: every admissible tier's key for one program height and
+    /// one public-segment length, at the input heights a call can still be pooled with.
+    fn warm_shape(&self, log_height: u8, public_len: usize) {
+        self.warming(|| {
+            // The smallest input table a call can still be pooled with (COV-2 / INT-6): below
+            // `MIN_PRIVATE_TABLE_LOG_HEIGHT` the pool refuses the call before any key is built
+            // (`admission::call_reveals_private_inputs`), so warming `input::MIN_LOG_HEIGHT`
+            // would spend a key build and a cache slot per tier on a shape no call can use. An
+            // upgraded wallet's prover floors the table there too, so the floor *is* the typical
+            // height of every small call.
+            let smallest = input::MIN_LOG_HEIGHT.max(MIN_PRIVATE_TABLE_LOG_HEIGHT);
+            let typical = input::input_log_height(4).max(MIN_PRIVATE_TABLE_LOG_HEIGHT);
+            let input_heights: &[u8] = if typical == smallest { &[smallest] } else { &[smallest, typical] };
+            let public_height = public::public_log_height(public_len);
+            // Every tier a call may declare (`MAX_CALL_TIER` and below) — the cap and this loop
+            // move together, so no admissible tier is ever an unwarmed key build at admission.
+            for t in TIERS.iter().filter(|t| **t as u8 <= MAX_CALL_TIER) {
+                for &in_h in input_heights {
+                    self.machine.verifier_key(Tier(*t), log_height, in_h, NO_KECCAK, NO_SHA256, public_height);
+                }
+            }
+        })
+    }
+
     /// The published digest of a proof of a pinned bundle guest whose heights are `heights`.
     fn pinned_proof_digest(&self, heights: (u8, u8, u8), proof: &[u8]) -> Result<Word8, ConfidentialError> {
         let (plh, ilh, pubh) = heights;
@@ -873,108 +1006,40 @@ impl ConfidentialExecutor for ZkExecutor {
     /// against it commits to exactly that input, so that one class is warmed in place of the
     /// empty one, and its first call pays no key build.
     fn warm(&self, record: &ProgramRecord) {
-        self.warming(|| {
-            let log_height = program::program_log_height(record.words.len());
-            // The smallest input table a call can still be pooled with (COV-2 / INT-6): below
-            // `MIN_PRIVATE_TABLE_LOG_HEIGHT` the pool refuses the call before any key is built
-            // (`admission::call_reveals_private_inputs`), so warming `input::MIN_LOG_HEIGHT`
-            // would spend a key build and a cache slot per tier on a shape no call can use. An
-            // upgraded wallet's prover floors the table there too, so the floor *is* the typical
-            // height of every small call.
-            let smallest = input::MIN_LOG_HEIGHT.max(MIN_PRIVATE_TABLE_LOG_HEIGHT);
-            let typical = input::input_log_height(4).max(MIN_PRIVATE_TABLE_LOG_HEIGHT);
-            let input_heights: &[u8] = if typical == smallest { &[smallest] } else { &[smallest, typical] };
-            let public_height = public::public_log_height(record.public_len as usize);
-            // Every tier a call may declare (`MAX_CALL_TIER` and below) — the cap and this loop
-            // move together, so no admissible tier is ever an unwarmed key build at admission.
-            for t in TIERS.iter().filter(|t| **t as u8 <= MAX_CALL_TIER) {
-                for &in_h in input_heights {
-                    self.machine.verifier_key(Tier(*t), log_height, in_h, NO_KECCAK, NO_SHA256, public_height);
-                }
-            }
-        })
+        self.warm_shape(program::program_log_height(record.words.len()), record.public_len as usize)
     }
 
+    /// `warm` under genesis `hardening_v6`: a program without a public input is called with the
+    /// eight call-binding words as its segment (INT-4, `check_call`), so that is the public height
+    /// its keys are built for.
+    fn warm_hardened(&self, record: &ProgramRecord) {
+        let segment = if record.public_len == 0 { TX_BINDING_WORDS } else { record.public_len as usize };
+        self.warm_shape(program::program_log_height(record.words.len()), segment)
+    }
+
+
     fn verify_call(&self, record: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
-        // `Machine::verify` runs `check_declared_heights` on the proof's tier and six declared
-        // table heights before using any of them to size anything — but the degree-bits pre-check
-        // inside `decode_and_check` shifts by them too, so it runs that same function in front of
-        // it, to avoid panicking on an attacker-chosen out-of-range value before ever reaching
-        // `verify`. `decode_and_check` only *ranges* a call's tier, program and input heights;
-        // the three checks below pin them against what the chain does know, and every one of
-        // them runs before `Machine::verify` builds a verifier key for the declared shape.
-        let proof = self.decode_and_check(proof, 0, 0, 0, false)?;
-        // The tier cap (deep scan 2026-09-24, zkvm). `check_declared_heights` admits every tier
-        // in `TIERS`, and `Machine::verify` builds the verifier key for the declared tier
-        // *before* it looks at a byte of STARK data — every pre-check in front of that build is
-        // satisfiable from public data alone (a consistent `degree_bits`, the tier's memory
-        // floor, the tier public value). The tier-20 key costs 216 s and 6.5 GB at the
-        // production profile, on validators that are 2–4 GB droplets, so one legal tier-20
-        // header — its transaction never mined, its fee bundle's note never spent, so it can be
-        // resubmitted forever — was an out-of-memory kill of the admitting node. Refused as its
-        // own verdict, with the remedy in the message, so an honest prover above the cap is
-        // told what to do rather than handed a `Batch(…)` failure.
-        let tier = proof.tier.0 as u8;
-        if tier > MAX_CALL_TIER {
-            return Err(ConfidentialError::CallTierTooHigh { tier, max: MAX_CALL_TIER });
-        }
-        // The two optional hash tables, whose preprocessed columns are the key's real cost
-        // (`MAX_CALL_KECCAK_LOG_HEIGHT`'s doc comment has the numbers): `check_declared_heights`
-        // bounds them by the tier's honest need, which at tier 14 is still a 2^19-row keccak
-        // table — 128 s and 8.7 GB of key. `0` declares no table and is always admitted.
-        if proof.keccak_log_height > MAX_CALL_KECCAK_LOG_HEIGHT {
-            return Err(ConfidentialError::InvalidProof(format!(
-                "keccak height {} past the {} a call may declare",
-                proof.keccak_log_height, MAX_CALL_KECCAK_LOG_HEIGHT
-            )));
-        }
-        if proof.sha256_log_height > MAX_CALL_SHA256_LOG_HEIGHT {
-            return Err(ConfidentialError::InvalidProof(format!(
-                "sha256 height {} past the {} a call may declare",
-                proof.sha256_log_height, MAX_CALL_SHA256_LOG_HEIGHT
-            )));
-        }
-        // The program height is not a guess: the record holds the deployed words, and
-        // `Machine::prove` declares exactly `program_log_height(program.len())` (`Program::len`
-        // is `words.len()`), so any other declared height is a proof over a different program
-        // table — one the `hc` compare inside `verify` would refuse, but only after a key was
-        // built and cached (evicting a warmed one) for the junk height.
-        if proof.program_log_height != program::program_log_height(record.words.len()) {
-            return Err(ConfidentialError::InvalidProof("program height not the deployed program's".into()));
-        }
-        // The input height is unknown but bounded by the tier, exactly as the keccak height is
-        // bounded by it inside `check_declared_heights` (`max_input_log_height`).
-        if proof.input_log_height > max_input_log_height(proof.tier) {
-            return Err(ConfidentialError::InvalidProof("input height past what the tier can read".into()));
-        }
-        // A deterministic early reject, before `hc_of` and `Machine::verify`: a call against a
-        // program deployed with a public input must declare exactly the public-table height the
-        // prover derives from that input's length (`Machine::prove` uses
-        // `public_log_height(public.len())`, and the record's `public_len` is that length). Any
-        // other height is a proof over a different public segment, which the `PUB0..7` compare
-        // below would refuse anyway — but only after `verify` had built (and cached, evicting an
-        // honest one) a verifier key for the junk height. Same error as that compare.
-        if proof.public_log_height != public::public_log_height(record.public_len as usize) {
-            return Err(ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues)));
-        }
-        let hc = Self::hc_of(record)?;
-        // The call limits (spec §5): `verify`, then `pv::PUB0..7` against the public input the
-        // program was deployed with — its record's digest, computed once at deploy, so no word is
-        // re-hashed here. A program deployed without one takes only `hash::public_digest(&[])`,
-        // exactly `verify_public(hc, &[], proof)`, today's rule. Plain `verify` alone would
-        // accept any `H_PUB`, bound in-circuit to a public segment the chain never saw (see the
-        // module doc comment). A mismatch reports as `verify_public`'s own `PublicValues`.
-        self.machine.verify(&hc, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
-        let want = record.public_digest.unwrap_or_else(|| crate::hash::public_digest(&[]));
-        if (0..8).any(|i| proof.public_values[pv::PUB0 + i] != want[i] as u64) {
-            return Err(ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues)));
-        }
-        let outputs = std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32);
-        // M4.1/S3: `H_IN` travels to the receipt so a call-input envelope sealed against it can
-        // be opened and checked later (spec §6.1). `decode_and_check` has already refused a
-        // proof whose `IN0..7` are not `u32`s, so the narrowing below cannot silently truncate.
-        let h_in = std::array::from_fn(|i| proof.public_values[pv::IN0 + i] as u32);
-        Ok(CallOutcome { tier: proof.tier.0 as u8, outputs, h_in })
+        self.check_call(record, proof, None, true)
+    }
+
+    fn verify_call_hardened(
+        &self,
+        record: &ProgramRecord,
+        proof: &[u8],
+        binding: &[u32; TX_BINDING_WORDS],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.check_call(record, proof, Some(binding), true)
+    }
+
+    /// Every check of [`Self::verify_call_hardened`] but `Machine::verify` itself (B5: the
+    /// verified set vouches for these bytes).
+    fn decode_call_hardened(
+        &self,
+        record: &ProgramRecord,
+        proof: &[u8],
+        binding: &[u32; TX_BINDING_WORDS],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.check_call(record, proof, Some(binding), false)
     }
 
     /// `H_PUB` exactly as the circuit publishes it in `pv::PUB0..7`.
@@ -1150,6 +1215,58 @@ pub fn prove_call(
              prove a call that publishes an input envelope on the CPU backend"
         )),
     }
+}
+
+/// The tier `Machine::prove` would pick for a call of `program` over `inputs` with a public
+/// segment of `public_segment_words` words — without proving. What a wallet needs *before* it
+/// proves a call under genesis `hardening_v6` (INT-4): the call proof commits to
+/// `Transaction::call_binding`, which covers the fee bundle, and the fee follows the tier, so the
+/// tier has to be known first. The run uses a zero segment of that length (the binding is not
+/// known yet); a guest that branches on its public words could land elsewhere with the real ones,
+/// and [`prove_call_hardened`] then fails at the pinned tier rather than proving a different one.
+pub fn call_tier(program: &Program, inputs: &[u32], public_segment_words: usize) -> Result<u8, String> {
+    let public = vec![0u32; public_segment_words];
+    let exec = crate::emulator::execute(program, inputs, &public, Tier(*TIERS.last().unwrap()).max_cycles()).map_err(|e| format!("{e:?}"))?;
+    let digests = program.digest_rows() + crate::hash::input_digest_row_count(inputs.len()) + crate::hash::public_digest_row_count(public.len());
+    let absorb_rows = exec.events.iter().filter(|e| matches!(e.hash_row, Some(crate::emulator::HashRow::Absorb { .. }))).count();
+    Tier::for_workload(exec.cycles() + digests, digests + absorb_rows)
+        .map(|t| t.0 as u8)
+        .ok_or_else(|| format!("no tier holds {} cycles", exec.cycles() + digests))
+}
+
+/// A fresh `H_IN` salt from OS entropy — the draw [`prove_call`] makes internally, for a caller
+/// that has to hold the salt before proving ([`prove_call_hardened`]: the envelope sealed against
+/// it is inside the call binding the proof commits to).
+pub fn fresh_call_salt() -> [u32; 4] {
+    use rand::RngExt;
+    rand::rng().random()
+}
+
+/// The call prover for a chain whose genesis sets `hardening_v6` (INT-4): [`prove_call`]'s proof,
+/// but for a program deployed without a public input the public segment is `binding` —
+/// `Transaction::call_binding` of the transaction the call will ride in, built with both proofs
+/// empty — so the chain can refuse a copy of the proof under any other fee bundle
+/// (`ZkExecutor::verify_call_hardened`). A program with a public input proves over it, as ever.
+///
+/// `salt` is the `H_IN` salt, drawn by the caller: the call-input envelope is sealed against
+/// `hash::input_digest(salt, inputs)` and sits inside the binding, so the wallet seals it before
+/// this proof exists (the salt's freshness is the caller's duty, exactly as `prove_call`'s doc
+/// comment states it). `tier` pins the tier the fee was computed for ([`call_tier`]). CPU only,
+/// for `prove_call`'s reason. Returns (proof bytes, outputs, tier).
+#[allow(clippy::too_many_arguments)]
+pub fn prove_call_hardened(
+    profile: FriProfile,
+    program: &Program,
+    inputs: &[u32],
+    public: &[u32],
+    binding: &[u32; TX_BINDING_WORDS],
+    salt: [u32; 4],
+    tier: Option<u8>,
+) -> Result<(Vec<u8>, [u32; 8], u8), String> {
+    let segment: &[u32] = if public.is_empty() { binding } else { public };
+    let m = Machine::new(profile);
+    let (proof, exec) = m.prove_salted(program, inputs, segment, salt, tier.map(|t| Tier(t as usize))).map_err(|e| format!("{e:?}"))?;
+    Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
 }
 
 /// Wallet-side prover for a shielded bundle: proves the chain's bundle guest (the hidden-asset
@@ -1413,6 +1530,44 @@ mod tests {
             "{:?}",
             non_canonical_proof(&rewritten)
         );
+    }
+
+    /// INT-4 on the real executor: a call proved with the call binding as its public segment
+    /// verifies under `verify_call_hardened` with that binding and no other; the old rule refuses
+    /// it, and the hardened rule refuses today's unbound proof. `call_tier` predicts the tier the
+    /// prover lands on.
+    #[test]
+    fn int4_a_bound_call_verifies_under_its_own_binding_only() {
+        use super::*;
+        use crate::machine::{Backend, FriProfile};
+        let program = crate::guests::private_payment(1000);
+        let inputs = [400, 250, 300, 75];
+        let zk = ZkExecutor::new(FriProfile::Test);
+        let record = ProgramRecord {
+            id: randprotocol_core::program::program_id(program.base_pc, &program.words),
+            base_pc: program.base_pc,
+            words: program.words.clone(),
+            code_hash: zk.check_program(program.base_pc, &program.words).unwrap(),
+            deployed_at: 0,
+            public_digest: None,
+            public_len: 0,
+        };
+        let binding = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let tier = call_tier(&program, &inputs, TX_BINDING_WORDS).unwrap();
+        let (bound, outputs, t) = prove_call_hardened(FriProfile::Test, &program, &inputs, &[], &binding, [1, 2, 3, 4], Some(tier)).unwrap();
+        assert_eq!(t, tier, "the wallet's tier is the prover's");
+        let outcome = zk.verify_call_hardened(&record, &bound, &binding).expect("its own binding");
+        assert_eq!(outcome.outputs, outputs);
+        assert_eq!(zk.decode_call_hardened(&record, &bound, &binding), Ok(outcome), "the decode path agrees");
+        let public_values = ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues));
+        let mut other = binding;
+        other[0] ^= 1;
+        assert_eq!(zk.verify_call_hardened(&record, &bound, &other), Err(public_values.clone()), "another transaction's binding");
+        assert_eq!(zk.decode_call_hardened(&record, &bound, &other), Err(public_values.clone()));
+        assert_eq!(zk.verify_call(&record, &bound), Err(public_values.clone()), "the old rule wants the empty segment");
+        let (unbound, _, _) = prove(FriProfile::Test, &program, &inputs, &[], None, Backend::Cpu).unwrap();
+        assert_eq!(zk.verify_call_hardened(&record, &unbound, &binding), Err(public_values), "today's proof under the flag");
+        assert!(zk.verify_call(&record, &unbound).is_ok());
     }
 
     /// ZKG-1: an output word past 32 bits is refused, never narrowed. `x as u32` of

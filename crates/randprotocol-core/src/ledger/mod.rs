@@ -548,6 +548,10 @@ pub struct Ledger {
     ///   (`program::pc_window_fits`).
     /// - CPU-1: a `Deploy` of more words than any call can hold is refused
     ///   (`ConfidentialExecutor::max_callable_program_words`, `TxError::ProgramUncallable`).
+    /// - INT-4: a call against a program deployed without a public input carries
+    ///   `Transaction::call_binding` as its public segment
+    ///   (`ConfidentialExecutor::verify_call_hardened`), so its proof cannot be copied under
+    ///   another fee bundle.
     /// - The canonical-proof rules (INT-5 first): a bundle or call proof with a header or
     ///   transcript field the honest prover would not write is refused
     ///   (`ConfidentialExecutor::non_canonical_proof`, `TxError::NonCanonicalProof`).
@@ -1637,8 +1641,13 @@ impl Ledger {
                 // bound, before it decodes a word. Without the flag this is the node's pool policy
                 // only (`admission::deploy_uncallable`), and a block carrying such a deploy
                 // applies as before.
+                //
+                // Under the flag a call against a program without a public input carries the
+                // call binding (INT-4) as its segment, `TX_BINDING_WORDS` words, so that is the
+                // segment the bound is taken against.
                 if self.hardening_v6 {
-                    if let Some(max_words) = executor.max_callable_program_words(public.len()) {
+                    let segment = if public.is_empty() { crate::types::TX_BINDING_WORDS } else { public.len() };
+                    if let Some(max_words) = executor.max_callable_program_words(segment) {
                         if words.len() > max_words {
                             return Err(TxError::ProgramUncallable { words: words.len(), public_words: public.len(), max_words });
                         }
@@ -1733,11 +1742,18 @@ impl Ledger {
             // B5: on a verified-set hit the proof is decoded, not verified — admission's
             // `verify_call` over these same bytes already ran, and the outcome the tier's fee
             // floor and the receipt are read from is the one it computed.
-            let outcome = if admitted {
-                executor.decode_call(record, proof).map_err(TxError::InvalidProof)?
-            } else {
-                executor.verify_call(record, proof).map_err(TxError::InvalidProof)?
-            };
+            //
+            // INT-4, under genesis `hardening_v6`: the proof must carry this transaction's
+            // `call_binding` as its public segment when the program has none of its own, so a copy
+            // under another fee bundle is refused (`verify_call_hardened`). Without the flag the
+            // old rule, the empty segment, stands.
+            let outcome = match (self.hardening_v6, admitted) {
+                (true, true) => executor.decode_call_hardened(record, proof, &tx.call_binding()),
+                (true, false) => executor.verify_call_hardened(record, proof, &tx.call_binding()),
+                (false, true) => executor.decode_call(record, proof),
+                (false, false) => executor.verify_call(record, proof),
+            }
+            .map_err(TxError::InvalidProof)?;
             let bytes = gas::call_bytes(proof, input_envelope.as_ref());
             let min = gas::BUNDLE_BASE + gas::call_fee(outcome.tier, bytes);
             let fee = tx.fee();
@@ -3632,16 +3648,20 @@ mod tests {
         let id = program_id(0, &words);
 
         let transfer = tx(&plain, [[10; 8], [11; 8]], [[12; 8], [13; 8]]);
-        let call_proof = StubExecutor::make_proof(&id, 12, [5; 8]);
-        let call = StubExecutor::bound(Transaction::shielded(
+        // Bound to its transaction (INT-4), so the only thing wrong with it under the flag is
+        // what the flagging executor says.
+        let mut call = Transaction::shielded(
             7,
             bundle(&plain, [[20; 8], [21; 8]], [[22; 8], [23; 8]], gas::BUNDLE_BASE + gas::call_fee(12, 0)),
-            Action::Call { program: id, proof: call_proof.clone(), input_envelope: None },
-        ));
+            Action::Call { program: id, proof: vec![], input_envelope: None },
+        );
+        let call_proof = StubExecutor::make_proof_with_public(&id, 12, [5; 8], &call.call_binding());
+        let Action::Call { proof, .. } = &mut call.action else { unreachable!() };
+        *proof = call_proof.clone();
+        let call = StubExecutor::bound(call);
         let bundle_proof = transfer.bundle.as_ref().unwrap().proof.clone();
         let ex = FlaggingExecutor { flagged: vec![bundle_proof, call_proof] };
         assert_eq!(plain.validate(&transfer, &ex), Ok(()), "the finding: valid today");
-        assert_eq!(plain.validate(&call, &ex), Ok(()));
 
         let mut gated = plain.clone();
         gated.set_hardening_v6(true);
@@ -3653,9 +3673,58 @@ mod tests {
         assert_eq!(gated.validate(&call, &StubExecutor), Ok(()));
     }
 
+    /// INT-4: a call proof is not bound to its transaction, so a copy of someone's call proof
+    /// attached under another fee bundle yields a second receipt — valid today on every chain.
+    /// Under genesis `hardening_v6` a call against a program deployed without a public input must
+    /// carry `Transaction::call_binding` as its public segment: the proof made for its own
+    /// transaction verifies there, the same proof under another bundle does not, and today's
+    /// unbound proof is refused. Without the flag nothing changes — a bound proof is refused there
+    /// as a proof over a public segment the program never had. Flag-only by necessity: every
+    /// wallet in the field proves the empty segment, so a pool policy would refuse every call.
+    #[test]
+    fn under_hardening_v6_a_call_proof_is_bound_to_its_transaction() {
+        let (a, _) = keys();
+        let mut plain = ledger();
+        let words = vec![0x13u32; 4];
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
+        let d = StubExecutor::bound(Transaction::shielded(7, bundle(&plain, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)), deploy));
+        plain.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
+        plain.record_anchor(plain.height());
+        let id = program_id(0, &words);
+        let fee = gas::BUNDLE_BASE + gas::call_fee(12, 0);
+        // A wallet's order: the transaction with both proofs empty, the call proved against its
+        // call binding, then the bundle bound to the whole.
+        let call_tx = |l: &Ledger, nfs: [Word8; 2], proof: Option<Vec<u8>>| {
+            let mut t = Transaction::shielded(7, bundle(l, nfs, [[nfs[0][0] + 2; 8], [nfs[0][0] + 3; 8]], fee), Action::Call { program: id, proof: vec![], input_envelope: None });
+            let proof = proof.unwrap_or_else(|| StubExecutor::make_proof_with_public(&id, 12, [5; 8], &t.call_binding()));
+            let Action::Call { proof: p, .. } = &mut t.action else { unreachable!() };
+            *p = proof;
+            StubExecutor::bound(t)
+        };
+        let unbound = StubExecutor::make_proof(&id, 12, [5; 8]);
+        let first = call_tx(&plain, [[10; 8], [11; 8]], Some(unbound.clone()));
+        let copy = call_tx(&plain, [[20; 8], [21; 8]], Some(unbound.clone()));
+        assert_eq!(plain.validate(&first, &StubExecutor), Ok(()));
+        assert_eq!(plain.validate(&copy, &StubExecutor), Ok(()), "the finding: the copy under another bundle is valid too");
+
+        let mut gated = plain.clone();
+        gated.set_hardening_v6(true);
+        let bound = call_tx(&gated, [[30; 8], [31; 8]], None);
+        let Action::Call { proof: bound_proof, .. } = &bound.action else { unreachable!() };
+        assert_eq!(gated.validate(&bound, &StubExecutor), Ok(()), "the proof made for its own transaction");
+        let refused = Err(TxError::InvalidProof(ConfidentialError::InvalidProof("PublicValues".into())));
+        let lifted = call_tx(&gated, [[40; 8], [41; 8]], Some(bound_proof.clone()));
+        assert_eq!(gated.validate(&lifted, &StubExecutor), refused, "the same proof under another fee bundle");
+        assert_eq!(gated.clone().apply_tx(&lifted, &a.address(), &StubExecutor).map(|_| ()), refused);
+        assert_eq!(gated.validate(&first, &StubExecutor), refused, "today's unbound proof");
+        assert_eq!(plain.validate(&bound, &StubExecutor), refused, "without the flag a bound proof is a stranger");
+    }
+
     /// CPU-1: under genesis `hardening_v6` a deploy of more words than any call can hold is
-    /// refused, at admission and at apply alike — 8 184 words at tier 14 with an empty public
-    /// segment (the stub restates the zkVM's bound), fewer beside a public input. Without the flag
+    /// refused, at admission and at apply alike — 8 180 words at tier 14 for a program without a
+    /// public input, whose calls carry the eight-word call binding under the flag (8 184 with the
+    /// empty segment, the pool's number), fewer beside a public input (the stub restates the
+    /// zkVM's bound). Without the flag
     /// — chain 15, whose genesis admits 65 535-word programs — the old rule stands and such a
     /// deploy is charged for a program no call can prove.
     #[test]
@@ -3672,11 +3741,14 @@ mod tests {
 
         let mut gated = plain.clone();
         gated.set_hardening_v6(true);
-        let over = deploy(&gated, 8185, 0);
-        let refused = Err(TxError::ProgramUncallable { words: 8185, public_words: 0, max_words: 8184 });
+        // Under the flag a call against a program without a public input carries the eight-word
+        // call binding (INT-4) as its segment — two digest slots, one more than the empty
+        // segment's — so the bound there is 8 180, four words under the pool's 8 184.
+        let over = deploy(&gated, 8181, 0);
+        let refused = Err(TxError::ProgramUncallable { words: 8181, public_words: 0, max_words: 8180 });
         assert_eq!(gated.validate(&over, &StubExecutor), refused);
         assert_eq!(gated.clone().apply_tx(&over, &a.address(), &StubExecutor).map(|_| ()), refused);
-        assert_eq!(gated.validate(&deploy(&gated, 8184, 0), &StubExecutor), Ok(()), "the bound itself fits");
+        assert_eq!(gated.validate(&deploy(&gated, 8180, 0), &StubExecutor), Ok(()), "the bound itself fits");
         // A 9-word public input takes three digest slots, two more than the empty segment's one.
         assert_eq!(
             gated.validate(&deploy(&gated, 8177, 9), &StubExecutor),

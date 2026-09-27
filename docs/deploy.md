@@ -538,6 +538,28 @@ larger one deploys, is charged `deploy_fee`, and can never be called — the shi
 - Every node already refuses it at its pool (`admission::deploy_uncallable`), as a non-permanent
   Ignore: the bound follows the build's call tier cap, which a later build may raise.
 
+### The call binding (INT-4)
+
+A call proof is not bound to its transaction today, so a copy of someone's call proof attached
+under another fee bundle yields a second receipt. Under `hardening_v6` a call against a program
+deployed *without* a public input must carry `Transaction::call_binding` — the transaction with its
+bundle proof and call proof blanked, under `rand-call-bind-1`, which covers the fee bundle's
+nullifiers — as its public segment (`ConfidentialExecutor::verify_call_hardened`). The same proof
+under another fee bundle is refused, and the nullifiers spend once, so one proof yields one receipt.
+
+- **Flag-only, no pool policy**: every wallet in the field proves the empty segment, so screening
+  for the binding at the pool would refuse every call on chain 15. A wallet learns the flag from
+  `rand_getLimits.hardening_v6` and then proves the call inside the submission
+  (`wallet::submit_bound_call`): notes chosen and the fee fixed from the call's tier first
+  (`executor::call_tier`), the input envelope sealed, the call proved over the call binding, the
+  bundle proved last.
+- **Residual**: a program deployed *with* a public input keeps its recorded digest — the ledger
+  holds the digest, not the words, so it cannot recompute one over the words and the binding.
+  Calls against such programs stay unbound until the ledger keeps the public words (or an
+  extendable digest) — a later cut.
+- Under the flag the CPU-1 bound for a program without a public input is taken with the binding's
+  eight-word segment: 8 180 words.
+
 ### Canonical proofs (INT-5, VERIFIER-2, VERIFIER-1)
 
 A proof header or transcript field the verifier accepts at more than one value lets whoever relays

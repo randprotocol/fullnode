@@ -281,6 +281,30 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.warm(program)
     }
 
+    /// The v0.6 call rules (INT-4), forwarded — the trait's default refuses every call, and this
+    /// wrapper is what every node runs.
+    fn verify_call_hardened(
+        &self,
+        program: &ProgramRecord,
+        proof: &[u8],
+        binding: &[u32; randprotocol_core::types::TX_BINDING_WORDS],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.inner.verify_call_hardened(program, proof, binding)
+    }
+
+    fn decode_call_hardened(
+        &self,
+        program: &ProgramRecord,
+        proof: &[u8],
+        binding: &[u32; randprotocol_core::types::TX_BINDING_WORDS],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.inner.decode_call_hardened(program, proof, binding)
+    }
+
+    fn warm_hardened(&self, program: &ProgramRecord) {
+        self.inner.warm_hardened(program)
+    }
+
     fn public_digest(&self, words: &[u32]) -> Word8 {
         self.inner.public_digest(words)
     }
@@ -632,6 +656,11 @@ mod tests {
         // The v0.6 rules' defaulted methods too (a default here would switch a rule off).
         assert_eq!(w.max_callable_program_words(0), zk.max_callable_program_words(0));
         assert_eq!(w.max_callable_program_words(0), Some(8184));
+        // INT-4's hardened call path: the trait default refuses every call by name, the zkVM's
+        // answers the bytes (these do not decode).
+        let record = ProgramRecord { id: randprotocol_core::Hash::digest(b"p"), base_pc: 0, words: vec![0x13; 4], code_hash: vec![0; 32], deployed_at: 0, public_digest: None, public_len: 0 };
+        assert_eq!(w.verify_call_hardened(&record, b"junk", &[0; 8]), zk.verify_call_hardened(&record, b"junk", &[0; 8]));
+        assert_eq!(w.decode_call_hardened(&record, b"junk", &[0; 8]), Err(ConfidentialError::MalformedProof));
     }
 
     /// The registered artifact (spec §2.3): the wrapper's digest is the rVM's own

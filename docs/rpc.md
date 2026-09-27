@@ -337,7 +337,8 @@ Params: `[]`. Result: the chain's five call limits and the envelope size, from i
 
 ```json
 { "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
-  "max_call_envelope_bytes": 18432, "max_program_public_words": 0, "envelope_bytes": null }
+  "max_call_envelope_bytes": 18432, "max_program_public_words": 0, "envelope_bytes": null,
+  "hardening_v6": false }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -351,6 +352,13 @@ to `1860` (spec 2026-09-26 §2.4), it means every note-creating envelope on this
 exactly that long — a wallet seals the memo-carrying format instead, and a memo becomes readable
 by the payee, the sender's own history, and anyone handed that output's per-transaction key.
 There is no other value yet: `validate` accepts only `1860` once the field is present.
+
+`hardening_v6` is `true` when the genesis sets the v0.6 switch (`docs/deploy.md`, "The next cut:
+`hardening_v6`"). A wallet then proves a call against a program deployed without a public input over
+the transaction's call binding (`Transaction::call_binding`, INT-4) instead of the empty segment —
+the fee bundle's notes chosen first, the call proved second, the bundle last; a chain with the flag
+refuses the old proof, a chain without it the new one. A node that predates the field answers
+without it, which a wallet reads as `false`.
 
 ### `rand_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
@@ -1337,6 +1345,17 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-28 — the v0.6 switch: `hardening_v6` in `rand_getLimits` (genesis-gated; on no chain yet)
+
+- **`rand_getLimits`** gains a seventh field, `hardening_v6`: `false` on every chain to date. `true`
+  means the genesis runs the v0.6 validity rules (`docs/deploy.md`), of which one changes what a
+  wallet proves: a call against a program without a public input carries the transaction's call
+  binding as its public segment (INT-4), and the old, unbound proof is refused as `PublicValues`.
+- **Pool refusals a submitter may now hear on every chain** (policy, never cached, never a ledger
+  rule without the flag): `ProgramUncallable` for a deploy no call can hold (CPU-1), and
+  `NonCanonicalProof` for a bundle or call proof whose header the honest prover would not write
+  (INT-5, VERIFIER-1/-2).
 
 ### 2026-09-28 — genesis vesting (genesis-gated; on no chain yet)
 

@@ -465,6 +465,10 @@ pub struct ChainLimits {
     /// Spec 2026-09-26 §2.4: the exact note-envelope size the genesis sets, `null` where it
     /// keeps today's at-most rule.
     pub envelope_bytes: Option<usize>,
+    /// Whether the genesis sets `hardening_v6` (the v0.6 switch). What a wallet reads to prove a
+    /// call over `Transaction::call_binding` (INT-4) instead of the empty segment: a chain with
+    /// the flag refuses the old proof, a chain without it the new one.
+    pub hardening_v6: bool,
 }
 
 impl ChainLimits {
@@ -476,6 +480,7 @@ impl ChainLimits {
             max_call_envelope_bytes: ledger.max_call_envelope_bytes(),
             max_program_public_words: ledger.max_program_public_words(),
             envelope_bytes: ledger.envelope_bytes(),
+            hardening_v6: ledger.hardening_v6(),
         }
     }
 
@@ -3371,6 +3376,7 @@ mod tests {
                 "max_call_envelope_bytes": 18_432,
                 "max_program_public_words": 0,
                 "envelope_bytes": null,
+                "hardening_v6": false,
             })
         );
         let gs = raised_genesis();
@@ -3384,6 +3390,7 @@ mod tests {
                 "max_call_envelope_bytes": 64 << 10,
                 "max_program_public_words": 64,
                 "envelope_bytes": null,
+                "hardening_v6": false,
             })
         );
         // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
@@ -3399,8 +3406,14 @@ mod tests {
                 "max_call_envelope_bytes": 64 << 10,
                 "max_program_public_words": 64,
                 "envelope_bytes": 1860,
+                "hardening_v6": false,
             })
         );
+        // The v0.6 switch: what a wallet reads to prove its calls over the call binding (INT-4).
+        let mut gs = raised_genesis();
+        gs.ledger.set_hardening_v6(true);
+        let (_d, st) = state_for(&gs);
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["hardening_v6"], json!(true));
     }
 
     /// The RPC's local limits follow a 20 MiB ledger (spec §8): the body limit is the same formula

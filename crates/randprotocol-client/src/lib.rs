@@ -145,6 +145,11 @@ pub struct ChainLimits {
     /// still decodes, at `None`.
     #[serde(default)]
     pub envelope_bytes: Option<usize>,
+    /// Whether the chain's genesis sets `hardening_v6`: then a call proves over
+    /// `Transaction::call_binding` (INT-4) and `rand call` takes that path. `false` from a node
+    /// that predates the field, which is right — such a node runs no chain with the flag.
+    #[serde(default)]
+    pub hardening_v6: bool,
 }
 
 /// Words from `rand_getProgramPublic`'s one hex string: each word as its four little-endian bytes,
@@ -1115,6 +1120,8 @@ mod tests {
                 // The scripted reply above carries no `envelope_bytes` key at all — exactly a
                 // node that predates the field — and it still decodes, at `None`.
                 envelope_bytes: None,
+                // Nor `hardening_v6`: at `false`, the old call rule.
+                hardening_v6: false,
             })
         );
         let older = RpcClient::new(scripted_rpc(vec![]).await);

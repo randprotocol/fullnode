@@ -1682,12 +1682,19 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             .aggregation()
             .map(|c| c.admitted_shapes.iter().map(|a| a.shape).collect())
             .unwrap_or_default();
+        // Under genesis `hardening_v6` a call proves over other shapes (the call binding, INT-4),
+        // so its keys are the hardened ones.
+        let hardened = hs.committed_ledger().hardening_v6();
         let ex = executor.clone();
         tokio::task::spawn_blocking(move || {
             ex.warm_bundle();
             tracing::info!("bundle verifier key warmed");
             for rec in programs {
-                ex.warm(&rec);
+                if hardened {
+                    ex.warm_hardened(&rec);
+                } else {
+                    ex.warm(&rec);
+                }
             }
             tracing::info!("verifier keys warmed");
             for shape in &agg_shapes {
@@ -2342,11 +2349,16 @@ impl Node {
         if records.is_empty() {
             return;
         }
+        let hardened = ledger.hardening_v6();
         let ex = self.executor.clone();
         tokio::task::spawn_blocking(move || {
             for rec in records {
                 let t = Instant::now();
-                ex.warm(&rec);
+                if hardened {
+                    ex.warm_hardened(&rec);
+                } else {
+                    ex.warm(&rec);
+                }
                 tracing::info!("verifier key ready for program {} ({:.1?})", rec.id, t.elapsed());
             }
         });

@@ -9,8 +9,8 @@ pub use actions::{
 };
 pub use block::{Block, BlockHeader, QuorumCertificate, Vote, SigningDomain};
 pub use transaction::{
-    format_amount, parse_amount, Action, AmountError, Transaction, FAUCET_MAX_UNITS, TOKEN_DECIMALS, TOKEN_SYMBOL,
-    TX_BINDING_DOMAIN, TX_BINDING_WORDS, UNITS_PER_RAND,
+    format_amount, parse_amount, Action, AmountError, Transaction, CALL_BINDING_DOMAIN, FAUCET_MAX_UNITS, TOKEN_DECIMALS,
+    TOKEN_SYMBOL, TX_BINDING_DOMAIN, TX_BINDING_WORDS, UNITS_PER_RAND,
 };
 pub use validator::{Validator, ValidatorSet};
 
