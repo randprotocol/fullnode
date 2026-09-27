@@ -491,7 +491,9 @@ impl Ledger {
     /// Add `amount` to `validator`'s stake, inserting the entry when `registration` is present.
     /// The bundle's `burn` is checked by admission (spec §7 step 3), not here — which is why
     /// this is crate-internal: a bond only ever arrives as an `Action::Bond` whose bundle burned
-    /// the amount, and calling it directly would mint stake out of nothing. (`unbond` and
+    /// the amount, or as a genesis-vesting `BondVested` (`vesting::apply`), which moves the same
+    /// amount out of the vesting register in the same step. Any other direct call would mint
+    /// stake out of nothing. (`unbond` and
     /// `withdraw` are public: they take nothing in, and the node's CLI signs them.)
     pub(crate) fn bond(
         &mut self,
