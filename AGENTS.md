@@ -4,7 +4,50 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-26)
+## Project memory (state as of 2026-09-27)
+
+### v0.5.9 — the 2026-09-27 rescan fixes (tagged 2026-09-27; roll status below)
+
+A four-reviewer rescan of `8e64781` (chain 15 live, the chain-15 genesis work never scanned) plus
+`cargo audit` (0 vulnerabilities; bincode, derivative, paste, atomic-polyfill unmaintained). Every
+fix red-first, each half reverted separately to confirm, the red quoted in its commit. **Node and
+wallet only for chain 15 — no wire break, no consensus-rule change on a genesis without the new
+fields — so it rolls one node at a time.** Address-sharing (fullnode-8b) is NOT in it: v0.5.10.
+
+- **LEDGER-1 (high, was live)**: a faucet `Mint` was accepted from any key in the validator
+  *register*, and a permissionless v2 `Bond` enters the register at once (active 2 epochs later) —
+  anyone holding an allowlisted wallet + 1000 RAND could drain `faucet_budget_per_epoch` every
+  epoch and bond it toward a third, then two thirds, of the stake. "In the active set" is NOT a
+  fix (reachable in ~46 min). Node policy: the pool admits a faucet Mint only from a genesis
+  validator (`admission::faucet_minters`, `TxError::MinterNotAllowed`, non-permanent → Ignore).
+  Validity rule for the next cut: genesis `staking.faucet_minters` (hashed only when present).
+  Validators bonded after genesis can validate but not mint — mint through C.
+- **CN-1 (high)**: a failed/abandoned sync batch never backed its peer off, so two silent peers
+  claiming the top height alternated for ever. Back-off on failure + the picker ranks misses
+  before claimed height (back-off alone loses: the 30 s wire timeout outlasts the 5 s back-off).
+- **CN-2**: per-peer meters and the CN-1 back-off survive a reconnect (`PEER_MEMORY_ENTRIES`
+  4096); a node-wide `Blocks` budget (burst 32, 8/s); `Blocks` serving runs on `spawn_blocking`
+  under `MAX_SYNC_SERVES_IN_FLIGHT` 4 (by-hash stays on the loop — NotHeld liveness).
+- **CN-4**: consensus gossip is prechecked (`HotStuff::precheck_gossip`: key/sig lengths, known
+  set, one signature verify, size caps, justify-certifies-parent) before it is forwarded, and
+  metered by bytes (`consensus_byte_limiter`). A signer we don't know is Ignore (handed to the
+  replica, not forwarded), never Reject — we may be behind an epoch.
+- **CN-3**: `NotHeld` signs the signer's view (`rand-not-held-2`) and counts only when newer than
+  the locked QC and within `NOT_HELD_VIEW_WINDOW` 256; no not-held for a block kept as an orphan.
+  The sync wire is CBOR with named fields, so a mixed fleet decodes both ways and neither side
+  counts the other's — lock release by NotHeld needs >2/3 on the new build (D15's corner).
+- **C15-1 (genesis-gated)**: `bridge.min_inbound_sequence` per source chain refuses an old
+  chain's already-minted locks (`BelowReplayFloor`); chain 15 has none — until a cut carries one,
+  a guardian brought up with an empty store must start its source cursors past chain 14's last
+  lock, never the config's start block (`docs/bridge.md` §23).
+- **RS-1 (high, ops + client)**: the public RPC ended at a pruning node; a fresh wallet's first
+  `rand_getBlocks(0, …)` got `-32010`. The wallet now resumes at the floor with one warning; the
+  public upstream moved to obs1 (archive) through `rpc-tunnel-obs1.service` (`deploy/caddy/README.md`).
+- **RS-2 refuted** (below). Still open: CN-5 (orphan leaders from retired epoch sets), RS-4
+  (`ssh -A` in the two old cutover scripts), B3, pruning-L1.
+- Suite on the laptop: core 476, client 96, node lib 314 (+13 recursion-fixture gap), cluster 26
+  (1241 s), wallet_flow 5 (1324 s), zusd_e2e 2 (1719 s), ws 9, genesis_cli 2; rvm/zkvm unchanged
+  since v0.5.8.
 
 ### 2026-09-27 — RS-2 refuted: the public RPC does not go through F
 
