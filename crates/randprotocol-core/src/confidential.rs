@@ -84,8 +84,10 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// segment. A copy of the proof under any other fee bundle is then refused (`PublicValues`).
     /// A program deployed with a public input keeps its recorded digest: the chain holds only that
     /// digest, not the words, so it cannot recompute a digest over the words and the binding —
-    /// such calls stay unbound (a documented residual). The default refuses every call: an
-    /// executor that has not implemented the rule must not pass it by default.
+    /// such calls stay unbound (a documented residual). And every call's program table is floored
+    /// at 2^7 rows (PROGRAM-TABLE-LEAK: a smaller one publishes the call's fetch counts), so the
+    /// declared height is `max(record height, 7)`, exactly. The default refuses every call: an
+    /// executor that has not implemented the rules must not pass them by default.
     fn verify_call_hardened(
         &self,
         _program: &ProgramRecord,

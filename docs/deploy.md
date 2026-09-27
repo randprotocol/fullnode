@@ -560,6 +560,22 @@ under another fee bundle is refused, and the nullifiers spend once, so one proof
 - Under the flag the CPU-1 bound for a program without a public input is taken with the binding's
   eight-word segment: 8 180 words.
 
+### The program-table floor (PROGRAM-TABLE-LEAK)
+
+The program table carries each instruction's fetch count — a call's control flow — and a committed
+table is hiding only while it has more random rows than the proof opens (80 FRI queries plus two
+out-of-domain points). The prover already floors the input, keccak and sha256 tables at 2^7 rows
+(COV-2 / INT-6), but the chain pins a call's program-table height to the deployed record's, so every
+program under 64 words proves at 16–64 rows and publishes its fetch counts: all 105 programs on
+chain 15 are 43 words.
+
+- Under `hardening_v6` a call declares `max(record height, 7)` (`executor::
+  hardened_program_log_height`): the wallet's hardened prover emits it (`prove_call_hardened`, a
+  taller table is padding the AIR allows, the same `hc`) and `verify_call_hardened` pins exactly
+  it; `warm_hardened` builds those keys. Without the flag nothing changes, and the old rule refuses
+  a floored proof. No pool policy: every wallet in the field declares the record's height.
+- Calls already committed on chain 15 stay exposed; only a cut stops new ones leaking.
+
 ### Canonical proofs (INT-5, VERIFIER-2, VERIFIER-1)
 
 A proof header or transcript field the verifier accepts at more than one value lets whoever relays

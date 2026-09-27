@@ -551,7 +551,8 @@ pub struct Ledger {
     /// - INT-4: a call against a program deployed without a public input carries
     ///   `Transaction::call_binding` as its public segment
     ///   (`ConfidentialExecutor::verify_call_hardened`), so its proof cannot be copied under
-    ///   another fee bundle.
+    ///   another fee bundle; and every call's program table is floored at 2^7 rows
+    ///   (PROGRAM-TABLE-LEAK), both in the executor's hardened verify.
     /// - The canonical-proof rules (INT-5 first): a bundle or call proof with a header or
     ///   transcript field the honest prover would not write is refused
     ///   (`ConfidentialExecutor::non_canonical_proof`, `TxError::NonCanonicalProof`).
