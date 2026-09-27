@@ -187,6 +187,15 @@ pub enum TxError {
          call may use — split the program"
     )]
     ProgramUncallable { words: usize, public_words: usize, max_words: usize },
+    /// The v0.6 canonical-proof rules (INT-5, VERIFIER-2, VERIFIER-1 of the 2026-09-27 reviews):
+    /// a bundle or call proof carrying a header or transcript field other than the one the honest
+    /// prover writes — a field the verifier accepts at any value, so a relayer could re-encode the
+    /// proof into a second transaction id, or a shape no aggregate can cover
+    /// (`ConfidentialExecutor::non_canonical_proof` names the field). The node's pool policy on
+    /// every chain, and a validity rule under genesis `hardening_v6`. Never a permanent verdict:
+    /// what the honest prover writes is the build's knowledge, which a re-vendor may move.
+    #[error("non-canonical proof: {0} — re-prove with an up-to-date wallet")]
+    NonCanonicalProof(String),
     #[error("bad mint signature")]
     BadMintSignature,
     #[error("the mint's commitment does not open to its published note and amount")]
@@ -427,6 +436,27 @@ pub fn mint_commitment(executor: &dyn ConfidentialExecutor, pk: &Word8, amount: 
 
 /// Whether two of `words` are equal — the pairwise distinctness a bundle's four nullifiers and
 /// four commitments each need (six pairs apiece).
+/// The v0.6 canonical-proof rules over a transaction: its raw bundle proof (a pruned marker
+/// carries no proof), then its call proof, each through `check`
+/// ([`ConfidentialExecutor::non_canonical_proof`], or the zkVM's function directly in the node's
+/// pool), as the one `TxError::NonCanonicalProof` naming which proof and which field. One function
+/// for the pool policy and the `hardening_v6` validity rule, so the two cannot drift.
+pub fn non_canonical_proofs(tx: &Transaction, check: &dyn Fn(&[u8]) -> Option<String>) -> Option<TxError> {
+    if let Some(b) = &tx.bundle {
+        if crate::notes::pruned_proof_hash(&b.proof).is_none() {
+            if let Some(why) = check(&b.proof) {
+                return Some(TxError::NonCanonicalProof(format!("bundle proof: {why}")));
+            }
+        }
+    }
+    if let Action::Call { proof, .. } = &tx.action {
+        if let Some(why) = check(proof) {
+            return Some(TxError::NonCanonicalProof(format!("call proof: {why}")));
+        }
+    }
+    None
+}
+
 fn has_duplicate(words: &[Word8]) -> bool {
     words.iter().enumerate().any(|(i, w)| words[i + 1..].contains(w))
 }
@@ -518,6 +548,9 @@ pub struct Ledger {
     ///   (`program::pc_window_fits`).
     /// - CPU-1: a `Deploy` of more words than any call can hold is refused
     ///   (`ConfidentialExecutor::max_callable_program_words`, `TxError::ProgramUncallable`).
+    /// - The canonical-proof rules (INT-5 first): a bundle or call proof with a header or
+    ///   transcript field the honest prover would not write is refused
+    ///   (`ConfidentialExecutor::non_canonical_proof`, `TxError::NonCanonicalProof`).
     ///
     /// A genesis parameter like `max_program_words`: outside the state root and equality,
     /// restored by `reload_ledger`. `false` — every chain cut before the flag, chain 15 included —
@@ -1672,6 +1705,17 @@ impl Ledger {
                 // trial apply takes this arm until Task 6 wires the covered pre-pass into
                 // `apply_block`.
                 return Err(TxError::AggregateNeedsCovered);
+            }
+        }
+        // 7b. under genesis `hardening_v6`, the canonical-proof rules (INT-5, VERIFIER-1/-2): a
+        // header or transcript field the honest prover would not write — one the verifier accepts
+        // at any value, so a relayer can re-encode the proof into a second transaction id — is
+        // refused before either proof is looked at. A decode and a few compares, so it runs on
+        // the verified-set path too. Without the flag it is the node's pool policy only
+        // (`admission::non_canonical_proofs`) and a block carrying such a proof applies.
+        if self.hardening_v6 {
+            if let Some(e) = non_canonical_proofs(tx, &|p| executor.non_canonical_proof(p)) {
+                return Err(e);
             }
         }
         // 8-9. the bundle's digest, then its proof, against this transaction's binding. Every
@@ -3521,6 +3565,92 @@ mod tests {
         // 16 words pad to 32 rows, so the same start that fit 15 words no longer does.
         assert_eq!(gated.validate(&deploy(&gated, 0xffff_ffc0, 16), &StubExecutor), Err(TxError::BadProgram(crate::program::pc_window_error())));
         assert_eq!(gated.validate(&deploy(&gated, 0, 4), &StubExecutor), Ok(()), "every live program sits at base_pc 0");
+    }
+
+    /// A `StubExecutor` that calls one set of proof bytes non-canonical — the stand-in for a zkVM
+    /// proof whose header the honest prover would not write (`non_canonical_proof`), since a stub
+    /// proof has no header. Everything else is the stub's.
+    struct FlaggingExecutor {
+        flagged: Vec<Vec<u8>>,
+    }
+
+    impl ConfidentialExecutor for FlaggingExecutor {
+        fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
+            StubExecutor.check_program(base_pc, words)
+        }
+        fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.verify_call(program, proof)
+        }
+        fn public_digest(&self, words: &[u32]) -> Word8 {
+            StubExecutor.public_digest(words)
+        }
+        fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
+            StubExecutor.node_hash(left, right)
+        }
+        fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
+            StubExecutor.note_commitment(pk, from, amount, asset, time, r)
+        }
+        fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+            StubExecutor.bundle_digest(input)
+        }
+        fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.bundle_proof_digest(proof)
+        }
+        fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
+            StubExecutor.verify_bundle(hc_bundle, proof, binding)
+        }
+        fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
+            self.flagged.iter().any(|f| f == proof).then(|| "memory height 17".to_string())
+        }
+        fn aggregate_program_digest(&self, shape: &crate::types::DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
+            StubExecutor.aggregate_program_digest(shape)
+        }
+        fn verify_aggregate(
+            &self,
+            shape: &crate::types::DeclaredShape,
+            covered: &[crate::types::CoveredBundle],
+            proof: &[u8],
+            binding: &[u32; 8],
+        ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+            StubExecutor.verify_aggregate(shape, covered, proof, binding)
+        }
+    }
+
+    /// The canonical-proof rules (INT-5 first): under genesis `hardening_v6` a transaction whose
+    /// bundle proof, or whose call proof, the executor calls non-canonical is refused, at
+    /// admission and at apply alike, before any proof is verified; without the flag — chain 15 —
+    /// the same bytes are valid (every node's pool refuses them as policy instead).
+    #[test]
+    fn under_hardening_v6_a_non_canonical_proof_is_refused() {
+        let (a, _) = keys();
+        let mut plain = ledger();
+        let words = vec![0x13u32; 4];
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
+        let d = StubExecutor::bound(Transaction::shielded(7, bundle(&plain, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)), deploy));
+        plain.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
+        plain.record_anchor(plain.height());
+        let id = program_id(0, &words);
+
+        let transfer = tx(&plain, [[10; 8], [11; 8]], [[12; 8], [13; 8]]);
+        let call_proof = StubExecutor::make_proof(&id, 12, [5; 8]);
+        let call = StubExecutor::bound(Transaction::shielded(
+            7,
+            bundle(&plain, [[20; 8], [21; 8]], [[22; 8], [23; 8]], gas::BUNDLE_BASE + gas::call_fee(12, 0)),
+            Action::Call { program: id, proof: call_proof.clone(), input_envelope: None },
+        ));
+        let bundle_proof = transfer.bundle.as_ref().unwrap().proof.clone();
+        let ex = FlaggingExecutor { flagged: vec![bundle_proof, call_proof] };
+        assert_eq!(plain.validate(&transfer, &ex), Ok(()), "the finding: valid today");
+        assert_eq!(plain.validate(&call, &ex), Ok(()));
+
+        let mut gated = plain.clone();
+        gated.set_hardening_v6(true);
+        let bundle_refused = Err(TxError::NonCanonicalProof("bundle proof: memory height 17".into()));
+        assert_eq!(gated.validate(&transfer, &ex), bundle_refused);
+        assert_eq!(gated.clone().apply_tx(&transfer, &a.address(), &ex).map(|_| ()), bundle_refused);
+        assert_eq!(gated.validate(&call, &ex), Err(TxError::NonCanonicalProof("call proof: memory height 17".into())));
+        assert_eq!(gated.validate(&transfer, &StubExecutor), Ok(()), "a canonical proof is valid under the flag");
+        assert_eq!(gated.validate(&call, &StubExecutor), Ok(()));
     }
 
     /// CPU-1: under genesis `hardening_v6` a deploy of more words than any call can hold is

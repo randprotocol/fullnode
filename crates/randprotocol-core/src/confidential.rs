@@ -115,6 +115,18 @@ pub trait ConfidentialExecutor: Send + Sync {
     ) -> Result<(), ConfidentialError>;
     /// Precompute the bundle verifier key. May be a no-op.
     fn warm_bundle(&self) {}
+    /// The v0.6 canonical-proof rules, for a bundle or a call proof alike: the first header or
+    /// transcript field of `proof` that is not the value the honest prover writes, named, or
+    /// `None`. A field the verifier does not bind to the statement lets anyone who relays a
+    /// transaction re-encode its proof into a different transaction id for the same statement,
+    /// and a shape the aggregate program was not built for can never be covered; the rules pin
+    /// each such field (`randprotocol_zkvm::executor::non_canonical`). Cheap: a decode and a few
+    /// compares, nothing verified. `None` for bytes that do not decode — those are refused
+    /// elsewhere — and from the default (the stub's). The ledger asks only under genesis
+    /// `hardening_v6`; every node's pool asks everywhere.
+    fn non_canonical_proof(&self, _proof: &[u8]) -> Option<String> {
+        None
+    }
 
     /// The registered aggregate program's digest for an admitted shape (block aggregation,
     /// spec §2.3): a startup constant, recomputed from the shape alone. Cheap relative to

@@ -667,6 +667,22 @@ pub fn deploy_uncallable(tx: &Transaction) -> Option<TxError> {
     (words.len() > max_words).then(|| TxError::ProgramUncallable { words: words.len(), public_words: public.len(), max_words })
 }
 
+/// A transaction whose bundle proof or call proof carries a field the honest prover would not
+/// write (`randprotocol_zkvm::executor::non_canonical`: the memory height first — INT-5, a bundle
+/// declaring 17 verifies today): `TxError::NonCanonicalProof`, the ledger's own verdict under
+/// `hardening_v6`. Such a field is accepted by the verifier at more than one value, so whoever
+/// relays the transaction can re-encode its proof into a second transaction id, and a bundle shape
+/// the aggregate program was not built for can never be covered. Decided on the headers alone,
+/// before any verification. `None` for everything else, including bytes that do not decode.
+///
+/// **Node policy on every chain, never permanent** ([`is_permanent`] leaves it out: what the honest
+/// prover writes is this build's knowledge, which a re-vendor may move, and a peer on an older
+/// build that forwards the transaction must not be penalised) — an Ignore, never cached. A block
+/// from an older proposer carrying one still applies until a genesis sets `hardening_v6`.
+pub fn non_canonical_proofs(tx: &Transaction) -> Option<TxError> {
+    randprotocol_core::ledger::non_canonical_proofs(tx, &randprotocol_zkvm::executor::non_canonical_proof)
+}
+
 /// A `Call` whose proof declares its input table — or a keccak or sha256 table it carries — under
 /// `MIN_PRIVATE_TABLE_LOG_HEIGHT` (2^7 rows): `TxError::CallRevealsPrivateInputs`, telling the
 /// wallet to upgrade (COV-2). A table that small has fewer random rows than the proof opens of it
@@ -1309,6 +1325,54 @@ mod tests {
         assert!(cache.is_empty());
         assert_eq!(refused(&deploy(8184)), None, "the bound itself pools");
         assert_eq!(deploy_uncallable(&deploy(18_009)).map(|e| e.to_string().contains("split the program")), Some(true));
+    }
+
+    /// INT-5 (the canonical-proof rules, first of three): a proof declaring a memory height other
+    /// than the honest prover's — `t + 2` for a proof without a hash table, 16 for every bundle —
+    /// is not pooled, on every chain, whether it is the call's proof or the bundle's: a
+    /// non-permanent policy verdict (Ignore, never cached). The honest proof pools.
+    #[test]
+    fn a_proof_with_a_non_canonical_header_is_not_pooled() {
+        use crate::mempool::{Mempool, MempoolError};
+        use crate::storage::fixtures;
+        use randprotocol_core::confidential::StubExecutor;
+        use randprotocol_zkvm::machine::{Backend, FriProfile, Proof};
+
+        let (gs, _) = fixtures::bridged_genesis(1);
+        let l = gs.ledger.clone();
+        let program = randprotocol_zkvm::guests::private_payment(1000);
+        let (bytes, _, _) =
+            randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu).unwrap();
+        let honest: Proof = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(honest.mem_log_height, honest.tier.min_mem_log_height(), "the honest prover declares t + 2");
+        let mut taller: Proof = postcard::from_bytes(&bytes).unwrap();
+        taller.mem_log_height += 1;
+        let taller = taller.to_bytes();
+        let call = |proof: Vec<u8>| {
+            let action = randprotocol_core::Action::Call { program: randprotocol_core::Hash::digest(b"program"), proof, input_envelope: None };
+            let b = fixtures::bundle(&l, [[70; 8], [71; 8]], [[72; 8], [73; 8]], randprotocol_core::gas::fee_floor(&action));
+            StubExecutor::bound(Transaction::shielded(l.chain_id(), b, action))
+        };
+        let pool = Mempool::new(100);
+        let refused = |tx: &Transaction| match pool.precheck(tx, &l, &StubExecutor) {
+            Err(MempoolError::Invalid(e)) => Some(e),
+            Err(other) => panic!("unexpected pool refusal {other}"),
+            Ok(_) => None,
+        };
+        assert_eq!(refused(&call(bytes.clone())), None, "the honest header pools");
+        let got = refused(&call(taller.clone())).expect("the finding: a taller memory table is pooled today");
+        let t = honest.tier.0;
+        let want = format!("call proof: memory height {} where the honest prover declares {} (tier {t}, no hash table)", t + 3, t + 2);
+        assert_eq!(got, TxError::NonCanonicalProof(want));
+        assert!(!is_permanent(&got), "policy, never cached");
+        let mut cache = RefusedCache::new(4);
+        assert_eq!(acceptance_for(&Err(got), Hash::digest(b"x"), &mut cache), Acceptance::Ignore);
+        assert!(cache.is_empty());
+        // The bundle's proof is screened the same way (the header rule is the same one; a bundle's
+        // honest memory height is its tier's, 16).
+        let mut with_bundle = call(bytes);
+        with_bundle.bundle.as_mut().unwrap().proof = taller;
+        assert!(matches!(non_canonical_proofs(&with_bundle), Some(TxError::NonCanonicalProof(w)) if w.starts_with("bundle proof: memory height")));
     }
 
     /// RESCAN-LEDGER-1: the ledger's `Mint` arm asks only for a row in the register, which a

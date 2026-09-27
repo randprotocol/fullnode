@@ -408,13 +408,20 @@ impl Mempool {
     /// a call whose proof would disclose its private inputs is not pooled, before any verification
     /// is scheduled for it. Policy like the minter rule — never permanent, never the ledger's.
     ///
-    /// CPU-1's (`admission::deploy_uncallable`) too: a deploy no call can hold is not pooled.
-    /// Policy on every chain, and the ledger's own rule only under genesis `hardening_v6`.
+    /// CPU-1's (`admission::deploy_uncallable`) too: a deploy no call can hold is not pooled; and
+    /// the canonical-proof rules' (`admission::non_canonical_proofs`). Policy on every chain, and
+    /// the ledger's own rules only under genesis `hardening_v6`.
     fn pool_policy(&self, tx: &Transaction, ledger: &Ledger) -> Result<(), TxError> {
         if let Some(e) = crate::admission::call_reveals_private_inputs(tx) {
             return Err(e);
         }
         if let Some(e) = crate::admission::deploy_uncallable(tx) {
+            return Err(e);
+        }
+        // And the canonical-proof rules (INT-5, VERIFIER-1/-2): a header the honest prover would
+        // not write, on the bundle's proof or the call's. The ledger's own rule under
+        // `hardening_v6`; policy here on every chain.
+        if let Some(e) = crate::admission::non_canonical_proofs(tx) {
             return Err(e);
         }
         match &self.faucet_minters {

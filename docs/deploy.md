@@ -538,6 +538,21 @@ larger one deploys, is charged `deploy_fee`, and can never be called — the shi
 - Every node already refuses it at its pool (`admission::deploy_uncallable`), as a non-permanent
   Ignore: the bound follows the build's call tier cap, which a later build may raise.
 
+### Canonical proofs (INT-5, VERIFIER-2, VERIFIER-1)
+
+A proof header or transcript field the verifier accepts at more than one value lets whoever relays
+a transaction re-encode its proof into a second transaction id (`Transaction::hash` takes a proof
+by digest) — the sender's wallet then reports its own payment as not committed — and lets a bundle
+take a shape no aggregate can cover. `randprotocol_zkvm::executor::non_canonical` pins each such
+field to the honest prover's value, for bundle and call proofs alike:
+
+- **The memory table's height** (INT-5 / HB-2): exactly `t + 2` for a proof without a keccak or
+  sha256 table — 16 for every bundle. A bundle declaring 17 verified.
+
+Under `hardening_v6` a transaction carrying such a proof is `NonCanonicalProof` at admission and at
+apply (`ConfidentialExecutor::non_canonical_proof`, before either proof is verified). Every node
+already refuses it at its pool (`admission::non_canonical_proofs`), as a non-permanent Ignore.
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and

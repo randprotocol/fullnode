@@ -156,6 +156,53 @@ pub fn call_private_table_under_floor(proof: &[u8]) -> Option<(&'static str, u8)
     None
 }
 
+/// The v0.6 canonical-proof rules: the first field of a decoded bundle or call proof that is not
+/// the value the honest prover writes, named — `None` for a proof the honest prover could have
+/// made. Header and transcript fields only; nothing here verifies anything, and every other
+/// check (`decode_and_check`, the verify) still runs.
+///
+/// Why it exists: a field `Machine::verify` accepts at more than one value, without the statement
+/// changing, makes the proof malleable — anyone who relays the transaction can re-encode it, the
+/// copy has another transaction id (`Transaction::hash` takes the proof by digest), and if it
+/// commits first the sender's wallet reports its own payment as not committed. It also lets a
+/// bundle take a shape the aggregate program was not built for, which no aggregate can then cover
+/// (VERIFIER-2 / V-VERIFIER-1). The rules, each the honest prover's own:
+///
+/// - **The memory table's height** (INT-5 / HB-2). The prover declares
+///   `max(t + 2, log2_ceil(accesses + 1))` (`build_traces_salted`) and the verifier only ranges it
+///   (`t + 2 ≤ mem ≤ MAX_MEM_LOG_HEIGHT`, one-sidedly sound: extra rows are padding). Without a
+///   keccak or sha256 table every access is one of a cpu row's four slots and a tier holds
+///   `2^t − 1` rows, so `accesses + 1 ≤ 4·2^t − 3 < 2^(t+2)` and the honest height is exactly
+///   `t + 2` — 16 for every bundle (tier 14, no hash tables, pinned by `decode_and_check`). A
+///   bundle declaring 17 verified (the review demonstrated it); it fingerprints the wallet that
+///   made it and cannot be aggregated. A proof with a hash table has a data-dependent honest
+///   height, which is left ranged.
+///
+/// Which proofs this runs on, and when, is the caller's: every node's pool refuses a transaction
+/// carrying such a proof (`admission::non_canonical_proofs`), and the ledger refuses it under
+/// genesis `hardening_v6` (`ConfidentialExecutor::non_canonical_proof`).
+pub fn non_canonical(proof: &Proof) -> Option<String> {
+    if proof.keccak_log_height == NO_KECCAK
+        && proof.sha256_log_height == NO_SHA256
+        && TIERS.contains(&proof.tier.0)
+        && proof.mem_log_height != proof.tier.min_mem_log_height()
+    {
+        return Some(format!(
+            "memory height {} where the honest prover declares {} (tier {}, no hash table)",
+            proof.mem_log_height,
+            proof.tier.min_mem_log_height(),
+            proof.tier.0
+        ));
+    }
+    None
+}
+
+/// [`non_canonical`] over proof bytes: `None` for bytes that do not decode canonically — those
+/// are refused as `MalformedProof` wherever they are verified.
+pub fn non_canonical_proof(bytes: &[u8]) -> Option<String> {
+    non_canonical(&decode_canonical(bytes).ok()?)
+}
+
 /// The largest `input_log_height` a call at `tier` can honestly declare — the input table's
 /// analogue of `Tier::max_keccak_log_height` (deep scan 2026-09-24, zkvm). Every private-input
 /// word is absorbed by an `IS_INDIGEST` cpu row, four words a row plus the salt row
@@ -332,8 +379,11 @@ impl ZkExecutor {
     /// rejected here rather than paying for a verifier key that could never match. Since zkvm I1
     /// the exact case also pins `tier` ([`BUNDLE_TIER`]) and both optional hash-table heights
     /// (`NO_KECCAK`/`NO_SHA256`), which are the *only* other prover-chosen words in a proof
-    /// header that feed `Machine::verifier_key`; `mem_log_height` stays merely ranged, since it
-    /// is the one header word `verifier_key` does not key on.
+    /// header that feed `Machine::verifier_key`; `mem_log_height` stays merely ranged here, since
+    /// it is the one header word `verifier_key` does not key on — and pinning it here would be a
+    /// validity change on every chain. Its pin (INT-5: exactly `t + 2`, 16 for a bundle) is one of
+    /// the canonical-proof rules instead ([`non_canonical`]): every node's pool policy, and a
+    /// validity rule under genesis `hardening_v6`.
     ///
     /// Size is no defence here and never was: chain 13 and 14 set `max_proof_bytes` to 8 MiB
     /// (`deploy/genesis-chain13.json`), and a junk header need not carry a large body at all —
@@ -870,6 +920,10 @@ impl ConfidentialExecutor for ZkExecutor {
     /// case), `NO_KECCAK` and `NO_SHA256` since the guest issues neither hash syscall, and the
     /// transaction binding's public height (`bundle_heights`), since every bundle proof commits
     /// to it.
+    fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
+        non_canonical_proof(proof)
+    }
+
     fn warm_bundle(&self) {
         self.warming(|| {
             let (plh, ilh, pubh) = Self::bundle_heights();

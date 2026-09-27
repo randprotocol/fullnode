@@ -314,6 +314,11 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.warm_bundle()
     }
 
+    /// Forwarded, like `max_callable_program_words` (a default would switch the rule off).
+    fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
+        self.inner.non_canonical_proof(proof)
+    }
+
     /// spec §2.3's registered artifact: the N-generic aggregate program's digest for the shape,
     /// rebuilt deterministically from `(shape, key)` — seconds of DSL emission, never a proof.
     fn aggregate_program_digest(&self, shape: &DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
