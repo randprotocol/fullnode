@@ -689,10 +689,16 @@ fn resolve_recipient(to: &str, contacts: &Contacts) -> Result<(ShieldedAddress, 
 /// A value that can come from a `--flag` or from a `randpay:` link's own field: agree if both are
 /// given, either alone if only one is, `None` if neither. A silent flag/link disagreement would
 /// mean the amount or asset a person confirmed on screen is not the one that gets sealed —
-/// refused instead.
+/// refused instead. `what` is `"memo"` for a link's memo field too, which is hostile text like any
+/// other memo, so both sides of the mismatch go through [`memo_display::truncate`] before they
+/// reach this error message — never the raw value (final review A, C2).
 fn merge_uri(flag: Option<String>, uri: Option<String>, what: &str) -> Result<Option<String>> {
     match (flag, uri) {
-        (Some(f), Some(u)) if f != u => Err(anyhow!("--{what} {f} does not match the link's {what} {u}")),
+        (Some(f), Some(u)) if f != u => Err(anyhow!(
+            "--{what} {} does not match the link's {what} {}",
+            memo_display::truncate(&f, 60),
+            memo_display::truncate(&u, 60)
+        )),
         (Some(f), _) => Ok(Some(f)),
         (None, u) => Ok(u),
     }
@@ -2286,6 +2292,25 @@ mod tests {
         assert_eq!(merge_uri(None, Some("1".into()), "amount").unwrap(), Some("1".into()));
         assert_eq!(merge_uri(Some("1".into()), Some("1".into()), "amount").unwrap(), Some("1".into()));
         assert!(merge_uri(Some("1".into()), Some("2".into()), "amount").is_err());
+    }
+
+    /// [`merge_uri`]'s mismatch error names both values, and a link's memo field is exactly as
+    /// hostile as a memo shown anywhere else: a link built with a terminal-clearing escape in its
+    /// `memo` field (reviewer's reproduction, `%0D%1B%5B2K` percent-decoded) must not put that
+    /// escape on the terminal when the error prints — both sides go through
+    /// [`memo_display::truncate`] first.
+    #[test]
+    fn a_memo_mismatch_error_shows_both_sides_sanitised() {
+        let link_memo = "\r\x1b[2Krm -rf ~ # not really, but it could say anything";
+        let err = merge_uri(Some("lunch".into()), Some(link_memo.into()), "memo").unwrap_err().to_string();
+        assert!(err.contains("--memo lunch"), "{err:?}");
+        assert!(err.contains("does not match the link's memo"), "{err:?}");
+        assert!(!err.contains('\r') && !err.contains('\x1b'), "{err:?}");
+        assert!(memo_display::is_displayable(&err), "{err:?}");
+        // A long memo on either side is cut too, so the error line itself cannot run away.
+        let long = "z".repeat(400);
+        let err = merge_uri(Some(long.clone()), Some("short".into()), "memo").unwrap_err().to_string();
+        assert!(err.chars().count() < long.chars().count(), "{err:?}");
     }
 
     /// Task review, fix round 1: every QR this wallet ever renders is a `randpay:` link, level M
