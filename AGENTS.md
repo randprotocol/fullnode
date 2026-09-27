@@ -6,6 +6,42 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-28)
 
+### v0.6 — the zkVM / rVM / aggregation fixes and the v0.6 hardening (2026-09-28; roll status below)
+
+The fixes from the 27–28 September zk reviews (the internal *Recursion VM security* report and its
+v2, the *zkVM and ISA security review*, the automated/unified scans, and this session's seven-part
+zk scan), each red-first with the red quoted in its commit and re-confirmed by reverting the fix
+alone. Report: `~/Downloads/Rand_zkVM_Bug_Fixes_Report_2026-09-28.pdf`; issues #16–#41, #47.
+circuits: main `c6cdef4` + `feat/v0.5.11-zk` + `feat/v06-hcs` → pin `4bb4d9a` (CI's `CIRCUITS_PIN`).
+
+- **rVM (dormant; aggregation off everywhere):** RVM-1 (STOREE high lane), OPCODES-1 (reduce clock),
+  V-OPCODES-1 (reduce flags on padding), ZKR-4 (reduce run end), OPCODES-4, ZKQ-3, ZKQ-6. The
+  registered aggregate program's digest does NOT change; the rVM verifier and self-verifier pins do.
+- **zkVM privacy (COV-2 / INT-6, live):** the prover floors the input/keccak/sha256 tables at 2^7
+  (80 queries + 2 OOD < 128 random rows); nodes refuse to pool a call proof below it. Bundles were
+  never exposed that way. **INT-2 / GV-1** (LogUp totals: which bundle slots are real, leaf
+  popcounts): the branch-free guest v2 (`hc_bundle 651043e2…`), selected by a genesis
+  (`rand-node genesis --bundle-guest v2`); chain 15 stays on v1 — its docs now say what leaks.
+- **One next-cut switch, `hardening_v6`** (`rand-node genesis --hardening-v6`; hashed only when true, so
+  chain 15's hash is unchanged): pc window (ZKV-11), uncallable deploys (CPU-1, 8 184 words at tier
+  14), canonical proof shapes (INT-5, VERIFIER-2) and commit-phase PoW words (VERIFIER-1), the call
+  binding (INT-4), the program-table floor. Each except INT-4 and the floor is ALSO a pool policy now.
+- **Node-only:** CPUV-1 (bundle key in its own Machine, one warm-up at a time), HB-1, HB-3, admission
+  `catch_unwind`, ZKG-1/2, open-files limit raised at startup (#41), the ssh -A scripts retired (#47).
+- **Aggregation interface (dormant):** INTERFACE-1 (slashing retired), -2, -3, -4, -5, -6, -7,
+  IFACE-6/7/8/9, V-INTERFACE-2 (signing domain `rand-aggregate-2`), ZKQ-1/2/4.
+- **circuits hardening:** HCS-1 interim (rand `=0.10.2`, rand_core `=0.10.1`, verifier-key pins in
+  `tests/verifier_key.rs`), HCS-2/3, VERIFIER-1 in `Machine::verify`, ISA-5, AIR invariant tests.
+- **Deferred to chain 16 (they change verifier keys):** generic LogUp blinding, ZKM-1/ZKH-2 range
+  checks, HCS-4 padding, HCS-1's key_derivation_v2, the rVM's in-circuit VERIFIER-1; INTERFACE-9;
+  the end-to-end forged-aggregate exercise (#45, ≥64 GB).
+- **ROLL: all-stop, all-start** (the v0.5.6 procedure), NOT one at a time: `Machine::verify` now
+  refuses a non-zero commit-phase PoW word unconditionally (circuits VERIFIER-1), so a v0.5.x node
+  and a v0.6 node would disagree on a rewritten proof. Honest proofs carry zeros. Wallets ship with
+  the node: a v0.6 node refuses call proofs whose private tables are under 2^7 rows.
+- **Trap:** every executor trait method with a default must be forwarded by `AggExecutor`, the
+  executor every node runs (`the_wrapper_delegates_the_zkvm_surface`).
+
 ### v0.5.10 — address sharing and the encrypted memo (2026-09-28)
 
 The launch address stays the ~1,667-char ML-KEM-768 `rand1…` (the user's decision, 2026-09-26: no
@@ -49,7 +85,7 @@ fullnode, randscan, randprotocol.org and clients; every task reviewed, then two 
   `RPC_BLOCKING` process-wide semaphore (v0.5.8) makes `rpc::tests::a_token_transfer_reveals…` flaky
   under parallel load (passes alone).
 
-### 2026-09-28 — v0.6 hardening (`feat/v06-hardening`, off `feat/v0.6`; not merged, not rolled)
+### 2026-09-28 — v0.6 hardening (`feat/v06-hardening`; merged into v0.6)
 
 The 2026-09-27 zkVM/ISA and recursion-VM reviews' remaining fullnode items. **One activation
 switch** (the ISA review's R4): top-level genesis `hardening_v6: true`, hashed (tag
@@ -84,7 +120,7 @@ there switches the rule off; `the_wrapper_delegates_the_zkvm_surface` pins them.
   lost worker slot), SAFETY comments. Docs (R1): shielded.md/confidential.md state what the proofs
   leak today. Deferred: INTERFACE-9 (pruning rewrites only the CF_TXS copy of a sealed bundle).
 
-### 2026-09-28 — zk node-side fixes (`feat/zk-node-fixes`, not merged, not rolled)
+### 2026-09-28 — zk node-side fixes (`feat/zk-node-fixes`; merged into v0.6)
 
 Node-local halves of the zk rescan; the vendored halves are other branches' (`feat/rvm-fixes`,
 `feat/zk-privacy-floor`). **Rolls one node at a time; nothing changes chain 15's rules** — its
