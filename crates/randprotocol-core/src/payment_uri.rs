@@ -38,7 +38,12 @@ fn decode(s: &str) -> Result<String, UriError> {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' {
+            // Exactly two hex digits: `u8::from_str_radix` alone also takes a sign, so `%+1`
+            // would have decoded as byte 1.
             let h = s.get(i + 1..i + 3).ok_or(UriError::BadEncoding)?;
+            if !h.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return Err(UriError::BadEncoding);
+            }
             out.push(u8::from_str_radix(h, 16).map_err(|_| UriError::BadEncoding)?);
             i += 3;
         } else {
