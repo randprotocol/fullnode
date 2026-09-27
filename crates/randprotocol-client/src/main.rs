@@ -2229,7 +2229,13 @@ mod tests {
         let cjk_full = format!("x{}{tail}", "中".repeat(36));
         let cjk_all = format!("{}{tail}", "中".repeat(60));
         let emoji_padded = format!("x{}{tail}", "🍜".repeat(36));
-        for m in [u2800_padded, dash_padded, at_the_chains_own_max, cjk_short, cjk_full, cjk_all, emoji_padded] {
+        // Re-review fix round 3, finding 1: an emoji modifier sequence (a base emoji plus a
+        // Fitzpatrick skin-tone modifier, two code points) priced by unicode_width's string-level
+        // `width_cjk` as one glyph, 2 columns — but a per-code-point terminal (xterm, the Linux
+        // console, conhost) draws both code points, 4 columns; `display_width` must measure and
+        // the cut must act on the per-code-point total (94), not the string-level one (58).
+        let thumbs_up_skin_tone = format!("x{}{short_tail}", "\u{1F44D}\u{1F3FB}".repeat(18));
+        for m in [u2800_padded, dash_padded, at_the_chains_own_max, cjk_short, cjk_full, cjk_all, emoji_padded, thumbs_up_skin_tone] {
             let shown = confirmation(Some("alice"), fp, "1.5 RAND", &m);
             let lines: Vec<&str> = shown.split('\n').collect();
             assert_eq!(lines.len(), 2, "{shown:?}");
@@ -2237,7 +2243,21 @@ mod tests {
             assert!(cols <= 80, "{} is {} columns: {shown:?}", lines[1], cols);
             assert!(!lines[1].contains("to alice"), "{shown:?}");
             assert!(!lines[1].contains("fingerprint AAAA-AAAA-AAAA-AAAA"), "{shown:?}");
+            assert!(lines[1].ends_with(" bytes)"), "expected a byte-count suffix (this case must be cut): {shown:?}");
         }
+        // A plain Hangul syllable, by contrast, is one code point with no modifier to merge:
+        // string-level and per-code-point measurement already agreed on it before this fix (18 ×
+        // width 2 = 36, + "x" + `short_tail`'s 21 columns = 58, under the 60-column memo budget)
+        // — the control case this fix must not regress: still shown whole, not cut, no byte
+        // suffix, exactly as before, and still nowhere near 80 columns.
+        let hangul = format!("x{}{short_tail}", "각".repeat(18));
+        let shown = confirmation(Some("alice"), fp, "1.5 RAND", &hangul);
+        let lines: Vec<&str> = shown.split('\n').collect();
+        assert_eq!(lines.len(), 2, "{shown:?}");
+        let cols = memo_display::display_width(lines[1]);
+        assert!(cols <= 80, "{} is {} columns: {shown:?}", lines[1], cols);
+        assert!(!lines[1].ends_with(" bytes)"), "under budget, so no byte suffix: {shown:?}");
+        assert!(lines[1].contains("to alice"), "under budget, so shown whole: {shown:?}");
     }
 
     /// Reviewer's report: `rand history` printed the memo column ahead of the `to` column, so a
