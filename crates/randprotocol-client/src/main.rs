@@ -711,7 +711,8 @@ fn merge_uri(flag: Option<String>, uri: Option<String>, what: &str) -> Result<Op
 /// collapses before the cut and a cut never splits an escape. Columns, not characters
 /// ([`memo_display::truncate_cols`], not `truncate`) — a CJK character or an emoji is one `char`
 /// but renders as two columns, so a character-counting cut can leave this column far wider than
-/// 24 (re-review fix round 2, finding 1). `None` (no memo, or a note from before the memo existed)
+/// 24 (re-review fix round 2, finding 1); measured by the same upper bound as the confirmation
+/// line, 2 columns per non-ASCII code point (fix round 4). `None` (no memo, or a note from before the memo existed)
 /// prints as `-`.
 fn memo_column(memo: &Option<String>, whole: bool) -> String {
     match memo {
@@ -743,7 +744,10 @@ fn history_row(index: u64, amount: &str, height: u64, to: &str, memo: &str) -> S
 /// always, short enough that, together with the fixed `memo: "…"` wrapping and a byte-count
 /// suffix of up to [`randprotocol_core::notes::MEMO_TEXT_MAX_BYTES`]'s three digits, the whole
 /// line never passes 80 columns (7 + 60 + 1 + 12 = 80 exactly, at the longest memo the chain
-/// accepts, measured throughout by [`memo_display::display_width`]).
+/// accepts, measured throughout by [`memo_display::display_width`] — a table-independent upper
+/// bound, 1 column per ASCII character and 2 per any other code point, since no terminal draws
+/// one code point wider than 2 (fix round 4: a width table under-charged the invisible U+3164
+/// HANGUL FILLER, and a memo of them wrapped into a forged row)).
 const MEMO_CONFIRM_COLS: usize = 60;
 
 /// `rand send`'s confirmation, before anything proves: `to <name?> · fingerprint … · <amount>
@@ -2235,7 +2239,12 @@ mod tests {
         // console, conhost) draws both code points, 4 columns; `display_width` must measure and
         // the cut must act on the per-code-point total (94), not the string-level one (58).
         let thumbs_up_skin_tone = format!("x{}{short_tail}", "\u{1F44D}\u{1F3FB}".repeat(18));
-        for m in [u2800_padded, dash_padded, at_the_chains_own_max, cjk_short, cjk_full, cjk_all, emoji_padded, thumbs_up_skin_tone] {
+        // Fix round 4: U+3164 HANGUL FILLER is invisible (Lo) and unicode-width prices it 0, so
+        // the old per-code-point measure charged it 1 column — but terminals draw it 2 wide. 36 of
+        // them measured 58 under the old rule (uncut) and wrapped at column 80 into a forged
+        // `to alice · 1000 RAND"` row. Every non-ASCII code point is now charged the upper bound, 2.
+        let hangul_filler = format!("x{}{short_tail}", "\u{3164}".repeat(36));
+        for m in [u2800_padded, dash_padded, at_the_chains_own_max, cjk_short, cjk_full, cjk_all, emoji_padded, thumbs_up_skin_tone, hangul_filler] {
             let shown = confirmation(Some("alice"), fp, "1.5 RAND", &m);
             let lines: Vec<&str> = shown.split('\n').collect();
             assert_eq!(lines.len(), 2, "{shown:?}");
@@ -2246,10 +2255,11 @@ mod tests {
             assert!(lines[1].ends_with(" bytes)"), "expected a byte-count suffix (this case must be cut): {shown:?}");
         }
         // A plain Hangul syllable, by contrast, is one code point with no modifier to merge:
-        // string-level and per-code-point measurement already agreed on it before this fix (18 ×
-        // width 2 = 36, + "x" + `short_tail`'s 21 columns = 58, under the 60-column memo budget)
-        // — the control case this fix must not regress: still shown whole, not cut, no byte
-        // suffix, exactly as before, and still nowhere near 80 columns.
+        // string-level and per-code-point measurement already agreed on it before round 3, and
+        // round 4's bound (2 per non-ASCII code point) charges it the same (18 × 2 = 36, + "x" +
+        // `short_tail`'s 21 columns = 58, under the 60-column memo budget) — the control case
+        // neither fix may regress: still shown whole, not cut, no byte suffix, exactly as before,
+        // and still nowhere near 80 columns.
         let hangul = format!("x{}{short_tail}", "각".repeat(18));
         let shown = confirmation(Some("alice"), fp, "1.5 RAND", &hangul);
         let lines: Vec<&str> = shown.split('\n').collect();

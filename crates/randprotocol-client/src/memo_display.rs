@@ -23,23 +23,27 @@
 //! characters can still be far wider than 57 columns and read as uncut (re-review fix round 2,
 //! finding 1 — a `"x" + 36×"中" + "to alice · 1000 RAND"` memo, at 57 characters, drew a forged
 //! second line in an 80-column terminal because nothing had cut it). [`truncate_cols`] and
-//! [`display_width`] measure and cut by **display column**, using [`UnicodeWidthChar::width_cjk`]
-//! per code point — the wide convention for the Unicode Ambiguous-width class, the one non-CJK
-//! terminals also render wide when the font covers CJK — since this exists to bound what a
-//! terminal draws, and undercounting a width is the unsafe direction here.
+//! [`display_width`] measure and cut by **display column**.
 //!
-//! **Per code point, not per string** (re-review fix round 3, finding 1): `unicode_width`'s
-//! string-level `UnicodeWidthStr::width_cjk` recognises emoji modifier and ZWJ sequences and
-//! prices the whole sequence as one glyph — right for a terminal that renders grapheme clusters,
-//! wrong for the many that render every code point as its own glyph-worth of columns (xterm, the
-//! Linux console, conhost among them). `"👍🏻"` is two code points (a thumbs-up plus a Fitzpatrick
-//! skin-tone modifier); string-level `width_cjk` prices the pair at 2 columns, but a per-code-point
-//! terminal draws 4. `"x" + 18×"👍🏻" + "to alice · 1000 RAND"` measured 58 columns at the string
-//! level — under a 60-column budget, so nothing cut it — while every code point in it sums to 94.
-//! [`display_width`] is therefore the same per-code-point sum [`truncate_cols`]'s cut loop already
-//! used, so the "is this over budget" check and the cut itself always agree.
+//! **The measure is a table-independent upper bound** (fix round 4): one column for an ASCII
+//! character — after [`sanitize`], the only ASCII left is printable (U+0020–U+007E), which every
+//! terminal draws one column wide — and **two for every other code point**, since no terminal
+//! draws a single code point wider than two columns. Any width *table* is a guess at one
+//! terminal's: rounds 2 and 3 used `unicode_width`'s `width_cjk` per code point, and it still
+//! under-charged U+3164 HANGUL FILLER (invisible, general category Lo, width 0 in the table,
+//! charged 1 — terminals draw it 2), so `"x" + 36×U+3164 + "to alice · 1000 RAND"` measured 58,
+//! was printed uncut, and wrapped at column 80 into a forged `to alice · 1000 RAND"` row. A sweep
+//! against macOS `wcwidth` found U+302E, U+302F, U+3164, U+16FF0 and U+16FF1 under-charged the
+//! same way, and tables differ between terminals, so no table can be trusted in the unsafe
+//! direction. Over-charging costs only an earlier cut of an honest non-ASCII memo.
+//!
+//! **Per code point, not per grapheme or per string** (re-review fix round 3, finding 1): a
+//! terminal that renders every code point as its own glyph (xterm, the Linux console, conhost)
+//! draws `"👍🏻"` — a thumbs-up plus a Fitzpatrick skin-tone modifier — as two glyphs, four columns,
+//! where a sequence-aware width function prices the pair at two. The bound charges each of its
+//! two code points two columns. [`display_width`] and [`truncate_cols`]'s cut loop share one
+//! function, [`char_cols`], so the "is this over budget" check and the cut itself always agree.
 
-use unicode_width::UnicodeWidthChar;
 
 /// The character every control, format character and line/paragraph separator becomes.
 pub const REPLACEMENT: char = '\u{FFFD}';
@@ -118,42 +122,45 @@ pub fn truncate(text: &str, max: usize) -> String {
     cut
 }
 
-/// `text`'s displayed width in terminal columns: the sum of each code point's
-/// [`UnicodeWidthChar::width_cjk`] (`None` or `0` charged one column, exactly as
-/// [`truncate_cols`]'s cut loop charges them — see the module comment on why this is a
-/// per-code-point sum and not `unicode_width`'s own string-level `UnicodeWidthStr::width_cjk`).
-/// A caller that needs to know whether a [`truncate_cols`] cut in fact happened compares this,
-/// not `chars().count()`, against its column budget — a wide character or a zero-width one would
-/// answer that wrong, and (re-review fix round 3) so would the string-level function, which can
-/// price an emoji modifier sequence at a fraction of what a per-code-point terminal draws.
-pub fn display_width(text: &str) -> usize {
-    text.chars().map(|c| c.width_cjk().filter(|&w| w > 0).unwrap_or(1)).sum()
+/// The columns one sanitised code point is charged: 1 for ASCII, 2 for anything else — an upper
+/// bound on what any terminal draws for it, independent of any width table (module comment,
+/// fix round 4). A zero-width or combining mark is charged 2 as well, so an unbounded run of them
+/// can never be free.
+pub fn char_cols(c: char) -> usize {
+    if c.is_ascii() {
+        1
+    } else {
+        2
+    }
 }
 
-/// The trailing `…` [`truncate_cols`] appends to a cut string: itself Ambiguous width, so under
-/// the wide convention this crate measures by ([`display_width`]'s doc) it costs **two** columns,
-/// not one — an easy first-draft mistake ("an ellipsis is basically one narrow character") this
-/// module's own tests once caught here at 61 columns against a 60-column budget.
+/// `text`'s displayed width in terminal columns, as an upper bound: the sum of [`char_cols`] over
+/// its code points (1 per ASCII character, 2 per any other). No terminal draws `text` wider than
+/// this, whatever its width table. A caller that needs to know whether a [`truncate_cols`] cut in
+/// fact happened compares this, not `chars().count()`, against its column budget.
+pub fn display_width(text: &str) -> usize {
+    text.chars().map(char_cols).sum()
+}
+
+/// The trailing `…` [`truncate_cols`] appends to a cut string. Non-ASCII, so it is charged
+/// [`char_cols`]'s **two** columns (some terminals do draw it two wide: it is East Asian
+/// Ambiguous) — counted inside the budget.
 const ELLIPSIS: char = '…';
 
-/// [`sanitize`]d `text`, cut so its **display width** ([`display_width`]) is at most `max_cols`
-/// columns, with a trailing [`ELLIPSIS`] — its own width counted within that budget — when it was
-/// cut. Sanitising comes first, exactly as in [`truncate`]. A sanitised character
-/// [`UnicodeWidthChar::width_cjk`] answers `None` for (a control character — sanitising already
-/// replaced every one with U+FFFD, so this should not occur) or `0` for (a genuine zero-width
-/// mark, which sanitising does not touch) is still charged one column: an unbounded run of them
-/// must not be free to repeat forever without ever counting against the cut.
+/// [`sanitize`]d `text`, cut so its [`display_width`] — the table-independent upper bound — is at
+/// most `max_cols` columns, with a trailing [`ELLIPSIS`], its own two columns counted within that
+/// budget, when it was cut. Sanitising comes first, exactly as in [`truncate`]. The over-budget
+/// check and the cut use the same measure, [`char_cols`].
 pub fn truncate_cols(text: &str, max_cols: usize) -> String {
     let clean = sanitize(text);
     if display_width(&clean) <= max_cols {
         return clean;
     }
-    let ellipsis_width = ELLIPSIS.width_cjk().filter(|&w| w > 0).unwrap_or(1);
-    let budget = max_cols.saturating_sub(ellipsis_width);
+    let budget = max_cols.saturating_sub(char_cols(ELLIPSIS));
     let mut cut = String::with_capacity(clean.len());
     let mut used = 0usize;
     for c in clean.chars() {
-        let w = c.width_cjk().filter(|&w| w > 0).unwrap_or(1);
+        let w = char_cols(c);
         if used + w > budget {
             break;
         }
@@ -226,6 +233,13 @@ pub(crate) mod tests {
         assert_eq!(display_width("中"), 2, "one char, two columns");
         assert_eq!(display_width("中中中"), 6);
         assert_eq!(display_width("🍜"), 2, "most emoji are width 2");
+        // Fix round 4: the table-independent bound — 2 for every non-ASCII code point, whatever
+        // a width table says (U+3164 is 0 in unicode-width; terminals draw it 2).
+        assert_eq!(display_width("\u{3164}"), 2, "HANGUL FILLER: invisible, drawn two wide");
+        assert_eq!(display_width("\u{0301}"), 2, "even a combining mark is charged the bound");
+        assert_eq!(display_width("\u{2800}"), 2);
+        assert_eq!(display_width("…"), 2);
+        assert_eq!(display_width("\u{1F44D}\u{1F3FB}"), 4, "per code point, not per sequence");
     }
 
     /// Re-review fix round 2, finding 1: `truncate` counts characters, but a terminal draws
@@ -278,14 +292,26 @@ pub(crate) mod tests {
         assert!(display_width(&cut) <= 60, "{cut:?} is {} columns", display_width(&cut));
         assert!(!cut.contains("to alice"), "{cut:?}");
         // A plain Hangul syllable is one code point with no modifier to merge, so string-level
-        // and per-code-point measurement already agreed on it before this fix (18 × width 2 = 36,
-        // + "x" + `short_tail`'s 21 columns = 58, under the 60-column budget) — included as the
-        // case this fix must not regress: still shown whole, not cut, exactly as before.
+        // and per-code-point measurement already agreed on it before round 3, and round 4's bound
+        // charges it the same 2 (18 × 2 = 36, + "x" + `short_tail`'s 21 columns — 19 ASCII plus
+        // a 2-column `·` — = 58, under the 60-column budget) — included as the case neither fix
+        // must regress: still shown whole, not cut, exactly as before.
         let hangul = format!("x{}{short_tail}", "각".repeat(18));
         assert_eq!(display_width(&hangul), 58, "the control case's premise: under budget already");
         let cut = truncate_cols(&hangul, 60);
         assert_eq!(cut, hangul, "under budget: shown whole, same as before this fix");
         assert!(display_width(&cut) <= 60, "{cut:?} is {} columns", display_width(&cut));
+
+        // Fix round 4: U+3164 HANGUL FILLER — invisible, general category Lo, unicode-width 0 —
+        // was charged 1 column by the old rule, while terminals draw it 2 wide: this memo measured
+        // 58 (uncut under a 60-column budget) yet drew 94 columns. Charged the upper bound, 2 per
+        // non-ASCII code point, it measures 94 and is cut before the forged tail.
+        let filler = format!("x{}{short_tail}", "\u{3164}".repeat(36));
+        assert_eq!(display_width(&filler), 1 + 72 + 21, "{filler:?}");
+        let cut = truncate_cols(&filler, 60);
+        assert!(display_width(&cut) <= 60, "{cut:?} is {} columns", display_width(&cut));
+        assert!(cut.ends_with('…'), "{cut:?}");
+        assert!(!cut.contains("to alice"), "{cut:?}");
 
         for m in hostile() {
             let t = truncate_cols(&m, 24);

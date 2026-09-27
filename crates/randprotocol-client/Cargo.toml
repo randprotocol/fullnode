@@ -21,7 +21,6 @@ hex = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true }
-unicode-width = { workspace = true }
 # `rand address --qr`/`--qr-png` and `rand contacts show --qr` (spec 2026-09-26 §2.2).
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
