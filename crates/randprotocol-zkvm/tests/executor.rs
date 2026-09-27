@@ -427,3 +427,68 @@ fn measure_a_call_verifier_key_build_at_the_production_profile() {
         println!("verifier key {shape}: {:.1?} ({} cached)", t.elapsed(), m.cached_keys());
     }
 }
+
+/// A record of `len` words at `base_pc` 0 with no public input — all `warm` reads of it is the
+/// word count (the program table's height) and `public_len`, so the words need not decode.
+fn synthetic_record(len: usize, public_len: u32) -> ProgramRecord {
+    let words = vec![0u32; len];
+    ProgramRecord {
+        id: program_id(0, &words),
+        base_pc: 0,
+        words,
+        code_hash: vec![0; 32],
+        deployed_at: 0,
+        public_digest: None,
+        public_len,
+    }
+}
+
+/// The smallest program with program-table log height `h` (`program_log_height(len)` is the log of
+/// `max(len + 1, 16)` rounded up to a power of two, so `h = 4` is every length up to 15 and each
+/// `h ≥ 5` starts at `2^(h−1)` words).
+fn words_for_log_height(h: u8) -> usize {
+    if h <= 4 {
+        1
+    } else {
+        1 << (h - 1)
+    }
+}
+
+/// CPUV-1 / ZKV-10: the bundle verifier key survives every program shape a deploy can warm after
+/// it. `Machine`'s key cache is a 64-entry FIFO (`get` does not refresh an entry), `warm` builds
+/// 3 tiers × 2 input heights = 6 keys per new (program height, public height) pair, and the
+/// bundle's key went in first at startup, so eleven deploys of new shapes pushed it out and the
+/// next bundle not already in the verified set paid a tier-14 key build inside consensus (~3.3 s
+/// at the production profile). The bundle guest now has a `Machine` of its own, which program
+/// shapes never touch.
+#[test]
+fn the_bundle_key_survives_eleven_program_shapes_warmed_after_it() {
+    let ex = ZkExecutor::new(FriProfile::Test);
+    ex.warm_bundle();
+    for h in 4u8..=14 {
+        let rec = synthetic_record(words_for_log_height(h), 0);
+        assert_eq!(randprotocol_zkvm::tables::program::program_log_height(rec.words.len()), h);
+        ex.warm(&rec);
+    }
+    let t = std::time::Instant::now();
+    ex.warm_bundle();
+    let took = t.elapsed();
+    assert!(took.as_millis() < 100, "the bundle key was rebuilt ({took:?}): evicted by the program shapes");
+}
+
+/// CPUV-1 (b): warm-ups are serialised node-wide. `warm_new_programs` spawns a blocking task per
+/// deploy-carrying commit and the startup warm runs beside them, so without a lock several key
+/// builds ran at once (six overlapping peaked at 1.58 GB on a 2 GB droplet). At most one `warm` or
+/// `warm_bundle` body runs at a time now, whichever thread calls it.
+#[test]
+fn concurrent_warms_never_build_in_parallel() {
+    let ex = ZkExecutor::new(FriProfile::Test);
+    std::thread::scope(|s| {
+        for h in 5u8..=8 {
+            let ex = &ex;
+            s.spawn(move || ex.warm(&synthetic_record(words_for_log_height(h), 0)));
+        }
+        s.spawn(|| ex.warm_bundle());
+    });
+    assert_eq!(ex.peak_concurrent_warms(), 1, "two warm-ups ran their key builds at once");
+}

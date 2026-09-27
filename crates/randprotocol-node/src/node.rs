@@ -2277,6 +2277,13 @@ impl Node {
     }
 
     /// Precompute verifier keys for programs deployed in `blocks`, off the node loop.
+    ///
+    /// One blocking task per deploy-carrying commit, but never more than one key build at a time:
+    /// `ZkExecutor::warm` holds the executor's warm lock across its whole body (CPUV-1), so a
+    /// burst of deploys queues here — each task parked on the lock holds a blocking-pool thread
+    /// and no key memory — instead of building side by side (six at once measured 1.58 GB on a
+    /// 2 GB droplet). The startup warm and `warm_bundle` take the same lock, and the bundle key
+    /// lives in a `Machine` of its own, so nothing warmed here can evict it.
     fn warm_new_programs(&self, blocks: &[CommittedBlock]) {
         let ledger = self.hs.committed_ledger();
         let records: Vec<_> = blocks

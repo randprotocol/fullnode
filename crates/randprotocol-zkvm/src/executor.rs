@@ -5,7 +5,8 @@
 //! verifier key it needs is `(tier, program_log_height)`-keyed and program-*content*-independent
 //! (`Machine::verifier_key`'s own doc comment), so `Machine` already caches it end to end; there
 //! is no second, program-keyed cache to maintain here any more (see `warm`'s doc comment for
-//! what "warm" means now).
+//! what "warm" means now). Since CPUV-1 (2026-09-28) the bundle guest's one key sits in a
+//! `Machine` of its own (`ZkExecutor::bundle_machine`), so no program shape can evict it.
 //!
 //! M4.1: the verifier key grew a third key component, `input_log_height` — the input table's
 //! declared height, exactly as `program_log_height` already was (`tables::input::input_log_height`'s
@@ -136,12 +137,63 @@ pub fn max_input_log_height(tier: Tier) -> u8 {
 }
 
 pub struct ZkExecutor {
+    /// Every call proof's verifier keys: `warm` fills it, `verify_call` reads it (and builds a
+    /// missing key into it).
     machine: Machine,
+    /// The bundle guest's own `Machine` (CPUV-1 / ZKV-10, 2026-09-28), used by the bundle verify
+    /// and `warm_bundle` and by nothing else. `Machine`'s key cache is a 64-entry FIFO whose
+    /// `get` does not refresh an entry, and `warm` builds six keys (tiers 10/12/14 × two input
+    /// heights) for every new (program height, public height) pair a deploy brings — so with one
+    /// shared cache, eleven deploys of new shapes evicted the bundle key `warm_bundle` put in
+    /// first at startup, and the next bundle not already in the verified set (B5) paid a tier-14
+    /// key build synchronously inside consensus (3.3 s measured at the production profile, on
+    /// every validator at once when a proposal carries it). `decode_and_check` pins every
+    /// component of a bundle proof's key (tier, all three heights the prover chooses, both hash
+    /// tables absent), so this cache only ever holds that one key and nothing a program can
+    /// deploy reaches it. The vendored cache itself (FIFO, no single-flight) is upstream's.
+    bundle_machine: Machine,
+    /// Held across the whole body of `warm` and `warm_bundle` (CPUV-1): at most one warm-up
+    /// builds keys at a time on this node, whoever calls it. `node::warm_new_programs` spawns a
+    /// blocking task per deploy-carrying commit and the startup warm runs beside them, so before
+    /// this the builds overlapped — six at once peaked at 1.58 GB against 2 GB droplets. A queued
+    /// warm-up waits here holding nothing but a blocking-pool thread. It does not serialise the
+    /// admission workers' own key builds on a cache miss (`Machine::verifier_key` has no
+    /// single-flight); those are bounded by the four verify workers instead.
+    warm_lock: std::sync::Mutex<()>,
+    /// How many `warm`/`warm_bundle` bodies are running right now, and the most that ever ran at
+    /// once — [`ZkExecutor::peak_concurrent_warms`], the observable CPUV-1's serialisation is
+    /// tested by.
+    warms_in_flight: std::sync::atomic::AtomicUsize,
+    peak_warms: std::sync::atomic::AtomicUsize,
 }
 
 impl ZkExecutor {
     pub fn new(profile: FriProfile) -> ZkExecutor {
-        ZkExecutor { machine: Machine::new(profile) }
+        ZkExecutor {
+            machine: Machine::new(profile),
+            bundle_machine: Machine::new(profile),
+            warm_lock: std::sync::Mutex::new(()),
+            warms_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            peak_warms: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The most `warm`/`warm_bundle` bodies this executor ever ran at the same time.
+    pub fn peak_concurrent_warms(&self) -> usize {
+        self.peak_warms.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Runs one warm-up body under `warm_lock`, counted in [`ZkExecutor::peak_concurrent_warms`].
+    /// A poisoned lock (a warm-up that panicked) still serialises: the guard is taken back
+    /// rather than the panic spread to every later deploy's warm-up.
+    fn warming<R>(&self, body: impl FnOnce() -> R) -> R {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _serial = self.warm_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = self.warms_in_flight.fetch_add(1, SeqCst) + 1;
+        self.peak_warms.fetch_max(now, SeqCst);
+        let out = body();
+        self.warms_in_flight.fetch_sub(1, SeqCst);
+        out
     }
 
     pub fn profile(&self) -> FriProfile {
@@ -172,11 +224,18 @@ impl ZkExecutor {
     }
 
     /// Number of `(tier, program_log_height, input_log_height, keccak_log_height,
-    /// sha256_log_height, public_log_height)` verifier keys this executor's `Machine` currently
-    /// has cached — `Machine`'s own cache, not a second one kept here (see the module doc
-    /// comment).
+    /// sha256_log_height, public_log_height)` call verifier keys this executor's `Machine`
+    /// currently has cached — `Machine`'s own cache, not a second one kept here (see the module
+    /// doc comment). The bundle key is not among them: it lives in `bundle_machine` (CPUV-1),
+    /// counted by [`ZkExecutor::cached_bundle_keys`].
     pub fn cached_keys(&self) -> usize {
         self.machine.cached_keys()
+    }
+
+    /// Number of verifier keys the bundle guest's own `Machine` holds: 0 before `warm_bundle` or
+    /// the first bundle verify, 1 after, and never more (`decode_and_check` pins the key).
+    pub fn cached_bundle_keys(&self) -> usize {
+        self.bundle_machine.cached_keys()
     }
 
     /// Decode a proof and run every check that must precede `Machine::verify_public` — the
@@ -411,7 +470,7 @@ impl ZkExecutor {
     ) -> Result<(), ConfidentialError> {
         let (plh, ilh, pubh) = heights;
         let p = self.decode_and_check(proof, plh, ilh, pubh, true)?;
-        self.machine
+        self.bundle_machine
             .verify_public(hc, binding, &p)
             .map_err(|e| ConfidentialError::InvalidBundleProof(format!("{e:?}")))
     }
@@ -529,18 +588,20 @@ impl ConfidentialExecutor for ZkExecutor {
     /// against it commits to exactly that input, so that one class is warmed in place of the
     /// empty one, and its first call pays no key build.
     fn warm(&self, record: &ProgramRecord) {
-        let log_height = program::program_log_height(record.words.len());
-        let smallest = input::MIN_LOG_HEIGHT;
-        let typical = input::input_log_height(4);
-        let input_heights: &[u8] = if typical == smallest { &[smallest] } else { &[smallest, typical] };
-        let public_height = public::public_log_height(record.public_len as usize);
-        // Every tier a call may declare (`MAX_CALL_TIER` and below) — the cap and this loop
-        // move together, so no admissible tier is ever an unwarmed key build at admission.
-        for t in TIERS.iter().filter(|t| **t as u8 <= MAX_CALL_TIER) {
-            for &in_h in input_heights {
-                self.machine.verifier_key(Tier(*t), log_height, in_h, NO_KECCAK, NO_SHA256, public_height);
+        self.warming(|| {
+            let log_height = program::program_log_height(record.words.len());
+            let smallest = input::MIN_LOG_HEIGHT;
+            let typical = input::input_log_height(4);
+            let input_heights: &[u8] = if typical == smallest { &[smallest] } else { &[smallest, typical] };
+            let public_height = public::public_log_height(record.public_len as usize);
+            // Every tier a call may declare (`MAX_CALL_TIER` and below) — the cap and this loop
+            // move together, so no admissible tier is ever an unwarmed key build at admission.
+            for t in TIERS.iter().filter(|t| **t as u8 <= MAX_CALL_TIER) {
+                for &in_h in input_heights {
+                    self.machine.verifier_key(Tier(*t), log_height, in_h, NO_KECCAK, NO_SHA256, public_height);
+                }
             }
-        }
+        })
     }
 
     fn verify_call(&self, record: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
@@ -671,8 +732,10 @@ impl ConfidentialExecutor for ZkExecutor {
     /// transaction binding's public height (`bundle_heights`), since every bundle proof commits
     /// to it.
     fn warm_bundle(&self) {
-        let (plh, ilh, pubh) = Self::bundle_heights();
-        let _ = self.machine.verifier_key(Tier(BUNDLE_TIER), plh, ilh, NO_KECCAK, NO_SHA256, pubh);
+        self.warming(|| {
+            let (plh, ilh, pubh) = Self::bundle_heights();
+            let _ = self.bundle_machine.verifier_key(Tier(BUNDLE_TIER), plh, ilh, NO_KECCAK, NO_SHA256, pubh);
+        })
     }
 
     /// The bare zkVM executor cannot build or verify aggregate proofs: the rVM lives in
