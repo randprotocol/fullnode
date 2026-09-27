@@ -383,6 +383,34 @@ fn validate_for_pool(
     })
 }
 
+/// Runs one admission verification (`f`, [`validate_for_pool`] in the worker) and turns a panic
+/// inside it into `TxError::VerifierPanicked` (the 2026-09-27 reviews' coverage gap: Plonky3 has
+/// never been fuzzed against malformed production proofs here, and nothing caught a panic).
+///
+/// Why here and not around each `Machine::verify`: the worker is where a panic does lasting
+/// harm. It is a `spawn_blocking` task that sends its verdict at the end, so a panicking verify
+/// killed it silently — no verdict, the in-flight slot (`MAX_VERIFY_IN_FLIGHT`) never returned,
+/// the gossip message never reported (gossipsub then stops forwarding it) — and four such proofs
+/// left the node admitting nothing. On the consensus path (block apply) a panic is left to crash
+/// the node, as before: every honest node panics on the same bytes, so swallowing it there would
+/// turn a verifier bug into a silent fork risk rather than a loud stop.
+///
+/// `AssertUnwindSafe`: the closure reads a ledger snapshot (an `Arc`, never mutated here), the
+/// store (RocksDB handles, read-only here) and the executor, whose one shared mutable state — the
+/// verifier-key cache — is behind a `Mutex` whose poisoning later `lock().unwrap()`s would surface
+/// as further panics this same guard catches, not as silent corruption.
+fn guard_verify(f: impl FnOnce() -> Result<(), randprotocol_core::TxError>) -> Result<(), randprotocol_core::TxError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let what = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a non-string panic".into());
+        tracing::warn!("the proof verifier panicked during admission: {what}");
+        Err(randprotocol_core::TxError::VerifierPanicked(what))
+    })
+}
+
 /// [`validate_for_pool`] over any covered-record source — the store in production, a counting
 /// stand-in in the test that pins the order: everything the transaction's own bytes and the
 /// register decide runs in `preflight_aggregate`, before `assemble` reads a single cover.
@@ -1975,7 +2003,7 @@ impl Node {
             let out = self.verdicts_tx.clone();
             self.verify_in_flight += 1;
             tokio::task::spawn_blocking(move || {
-                let result = validate_for_pool(&tx, &ledger, &storage, profile, executor.as_ref());
+                let result = guard_verify(|| validate_for_pool(&tx, &ledger, &storage, profile, executor.as_ref()));
                 if result.is_ok() {
                     // B5: remember that these exact bytes verified — the hash binds the proofs —
                     // so the consensus path decodes them instead of verifying again. The pool's
@@ -4477,6 +4505,23 @@ mod tests {
         }));
         let err = got.expect("the finding: sealing to a length-valid bad key panics").expect_err("refused");
         assert!(err.contains("not a valid ML-KEM-768 encapsulation key"), "{err}");
+    }
+
+    /// The 2026-09-27 reviews' coverage gap: nothing caught a panic inside proof verification,
+    /// and the admission worker is a `spawn_blocking` task that reports its verdict at the end —
+    /// so a proof that panicked Plonky3 killed the task, no verdict was ever sent, the worker slot
+    /// (`verify_in_flight`, four of them) was never given back and the gossip message was never
+    /// reported. Four such proofs and the node verified nothing more. The worker's body now runs
+    /// under `guard_verify`: a panic is a `VerifierPanicked` verdict (non-permanent: Ignore, never
+    /// cached), which `on_verdict` handles like any other.
+    #[test]
+    fn a_panic_inside_admission_verification_is_a_verdict_not_a_dead_worker() {
+        let got = std::panic::catch_unwind(|| guard_verify(|| panic!("index out of bounds: the len is 3 but the index is 7")));
+        let verdict = got.expect("the finding: the panic escapes the worker");
+        assert!(matches!(&verdict, Err(randprotocol_core::TxError::VerifierPanicked(m)) if m.contains("index out of bounds")), "{verdict:?}");
+        assert!(!admission::is_permanent(&verdict.unwrap_err()), "never cached");
+        assert_eq!(guard_verify(|| Ok(())), Ok(()), "a verdict passes through");
+        assert_eq!(guard_verify(|| Err(randprotocol_core::TxError::BadDigest)), Err(randprotocol_core::TxError::BadDigest));
     }
 
     /// The register and the bucket survive the same restart, hashed into and computed into the

@@ -230,6 +230,12 @@ pub enum TxError {
     /// unreachable in practice.
     #[error("the commitment tree is full")]
     CommitmentTreeFull,
+    /// The proof verifier panicked on this transaction (the 2026-09-27 reviews' coverage gap:
+    /// no `catch_unwind` around Plonky3). Raised by the node's admission workers only, which
+    /// catch the panic so a malformed proof costs a refusal rather than a worker slot. Never a
+    /// permanent verdict: a panic says the verifier broke, not which bytes are at fault.
+    #[error("the proof verifier failed on this transaction ({0}); refused")]
+    VerifierPanicked(String),
     /// INTERFACE-6: a sealed-form side-table record that does not belong to the transaction it
     /// vouches for — it names another transaction id, or its `H_PUB` words are not the digest of
     /// this transaction's binding. Only ever raised on the sealed-sync path.
