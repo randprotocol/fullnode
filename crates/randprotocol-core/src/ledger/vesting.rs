@@ -1106,4 +1106,49 @@ mod ledger_tests {
         assert_eq!(e(&l, 1).in_register(), 0);
         assert_eq!(a.vesting_in_register, 10 * U, "entry 2, untouched");
     }
+
+    /// The v0.6 rescan's lead "vesting actions don't bound the note `time`", refuted and pinned: a
+    /// claim or a revoke whose note `time` lies outside `[height - TIME_WINDOW, height]` — signed
+    /// by the rightful key, every other field valid — is refused `TimeOutOfWindow` at admission and
+    /// at apply, and the ledger is untouched; the window's two edges pass the time rule. The
+    /// bound is `check_time`'s match listing `ClaimVested` and `RevokeVesting`: drop either arm
+    /// and this goes red.
+    #[test]
+    fn a_vesting_note_time_outside_the_window_is_refused() {
+        use crate::ledger::TIME_WINDOW;
+        let mut l = ledger(vec![cfg(1, true)], 20_000);
+        l.set_height(TIME_WINDOW + 10);
+        let h = l.height() as u32;
+        let claim_at = |l: &Ledger, time: u32| {
+            let (to, r) = (addr(HOLDER), [1u32; 8]);
+            let m = claim_vested_message(&g(l), CHAIN, &[1; 32], U, 0, &to, time, &r, &env());
+            let signature = kp(HOLDER).sign(m.as_bytes());
+            tx(Action::ClaimVested { entry: [1; 32], amount: U, nonce: 0, to, time, r, envelope: env(), signature })
+        };
+        let revoke_at = |l: &Ledger, time: u32| {
+            let (to, r) = (addr(77), [9u32; 8]);
+            let m = revoke_vesting_message(&g(l), CHAIN, &[1; 32], U, 0, &to, time, &r, &env());
+            let signature = kp(REVOKER).sign(m.as_bytes());
+            tx(Action::RevokeVesting { entry: [1; 32], unvested: U, nonce: 0, to, time, r, envelope: env(), signature })
+        };
+        let out = [h + 1, h + 1000, u32::MAX, h - TIME_WINDOW as u32 - 1, 0];
+        for time in out {
+            for t in [claim_at(&l, time), revoke_at(&l, time)] {
+                let before = l.state_root();
+                assert!(matches!(l.validate(&t, &StubExecutor), Err(TxError::TimeOutOfWindow { .. })), "time {time}: admission");
+                assert!(matches!(apply(&mut l, &t), Err(TxError::TimeOutOfWindow { .. })), "time {time}: apply");
+                assert_eq!(l.state_root(), before, "time {time}: nothing written");
+            }
+        }
+        // The window's edges are inside it: whatever else a transaction fails, it is not the time.
+        for time in [h, h - TIME_WINDOW as u32] {
+            for t in [claim_at(&l, time), revoke_at(&l, time)] {
+                let r = l.validate(&t, &StubExecutor);
+                assert!(!matches!(r, Err(TxError::TimeOutOfWindow { .. })), "time {time}: {r:?}");
+            }
+        }
+        // A claim at the window's upper edge goes through end to end.
+        let ok = claim_at(&l, h);
+        apply(&mut l, &ok).expect("an in-window claim applies");
+    }
 }
