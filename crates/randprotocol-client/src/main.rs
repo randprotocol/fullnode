@@ -705,16 +705,19 @@ fn merge_uri(flag: Option<String>, uri: Option<String>, what: &str) -> Result<Op
 }
 
 /// A memo as `rand notes`, `rand history` and `rand tx-key` show it: [`memo_display::sanitize`]d
-/// first (a memo is anyone's text — final review A), then cut to 24 characters, `…` included, for
-/// a column that must not blow up a terminal's width; `--memo` on `rand notes`/`rand history`
-/// asks for the whole sanitised text instead. Sanitising first means padding collapses before the
-/// cut and a cut never splits an escape. `None` (no memo, or a note from before the memo existed)
+/// first (a memo is anyone's text — final review A), then cut to 24 **display columns**, `…`
+/// included, for a column that must not blow up a terminal's width; `--memo` on `rand notes`/
+/// `rand history` asks for the whole sanitised text instead. Sanitising first means padding
+/// collapses before the cut and a cut never splits an escape. Columns, not characters
+/// ([`memo_display::truncate_cols`], not `truncate`) — a CJK character or an emoji is one `char`
+/// but renders as two columns, so a character-counting cut can leave this column far wider than
+/// 24 (re-review fix round 2, finding 1). `None` (no memo, or a note from before the memo existed)
 /// prints as `-`.
 fn memo_column(memo: &Option<String>, whole: bool) -> String {
     match memo {
         None => "-".to_string(),
         Some(m) if whole => memo_display::sanitize(m),
-        Some(m) => memo_display::truncate(m, 24),
+        Some(m) => memo_display::truncate_cols(m, 24),
     }
 }
 
@@ -731,33 +734,40 @@ fn history_row(index: u64, amount: &str, height: u64, to: &str, memo: &str) -> S
     format!("{:>8}  {:>18}  {:>8}  {:<24}  {}", index, amount, height, to, memo)
 }
 
-/// The confirmation memo line's cut point: long enough to show a real memo whole almost always,
-/// short enough that, together with the fixed `memo: "…"` wrapping and a byte-count suffix of up
-/// to [`randprotocol_core::notes::MEMO_TEXT_MAX_BYTES`]'s three digits, the whole line never
-/// passes 80 columns (7 + 60 + 1 + 12 = 80 exactly, at the longest memo the chain accepts).
-const MEMO_CONFIRM_CHARS: usize = 60;
+/// The confirmation memo line's cut point, in **display columns** — not characters: a CJK
+/// character or an emoji is one `char` but renders as two terminal columns, so a character count
+/// can pass a memo through whole (57 characters, comfortably under a 60-character budget) while
+/// its actual display width forges a second line well past it (re-review fix round 2, finding 1:
+/// `"x" + 36×"中" + "to alice · 1000 RAND"`, 57 characters, was let through uncut and drew exactly
+/// that forged line in an 80-column terminal). Long enough to show a real memo whole almost
+/// always, short enough that, together with the fixed `memo: "…"` wrapping and a byte-count
+/// suffix of up to [`randprotocol_core::notes::MEMO_TEXT_MAX_BYTES`]'s three digits, the whole
+/// line never passes 80 columns (7 + 60 + 1 + 12 = 80 exactly, at the longest memo the chain
+/// accepts, measured throughout by [`memo_display::display_width`]).
+const MEMO_CONFIRM_COLS: usize = 60;
 
 /// `rand send`'s confirmation, before anything proves: `to <name?> · fingerprint … · <amount>
 /// <asset>`, then — only when there is one — the memo on its own `memo: "…"` line, itself cut to
-/// [`MEMO_CONFIRM_CHARS`] with [`memo_display::truncate`] so a memo of any length can never wrap
-/// the terminal, and — only when it was in fact cut — a `(N bytes)` suffix naming the raw memo's
-/// full length, since a cut memo can otherwise look complete. The memo is hostile text (anyone
-/// can send one, and a link carries any), so it never shares the recipient line, and it and the
-/// contact name (user-entered, and a link can suggest one) are shown through
-/// [`memo_display::sanitize`]: a memo padded with spaces or carrying a line break, a terminal
-/// escape or a bidi override cannot draw a second recipient line, and one long enough to wrap —
-/// or built of ordinary visible filler, like ASCII dashes or the invisible-looking Braille blank
-/// U+2800, that sanitizing does not touch — cannot draw a forged one past the cut either (final
-/// review A, C1).
+/// [`MEMO_CONFIRM_COLS`] **display columns** with [`memo_display::truncate_cols`] so a memo of
+/// any length, or any mix of narrow and wide characters, can never wrap the terminal, and — only
+/// when it was in fact cut, by width — a `(N bytes)` suffix naming the raw memo's full length,
+/// since a cut memo can otherwise look complete. The memo is hostile text (anyone can send one,
+/// and a link carries any), so it never shares the recipient line, and it and the contact name
+/// (user-entered, and a link can suggest one) are shown through [`memo_display::sanitize`]: a
+/// memo padded with spaces or carrying a line break, a terminal escape or a bidi override cannot
+/// draw a second recipient line, and one long enough to wrap — or built of ordinary visible
+/// filler, like ASCII dashes, the invisible-looking Braille blank U+2800, or a run of CJK
+/// characters or emoji, none of which sanitizing touches — cannot draw a forged one past the cut
+/// either (final review A, C1; re-review fix round 2, finding 1).
 fn confirmation(name: Option<&str>, fingerprint: &str, amount: &str, memo: &str) -> String {
     // The separator goes through the rule with the name, so a name ending in a space (names are
     // never trimmed) cannot leave a run of two.
     let name_part = name.map(|n| memo_display::sanitize(&format!("{n} · "))).unwrap_or_default();
     let mut shown = format!("to {name_part}fingerprint {fingerprint} · {}", memo_display::sanitize(amount));
     if !memo.is_empty() {
-        let full_len = memo_display::sanitize(memo).chars().count();
-        let cut = memo_display::truncate(memo, MEMO_CONFIRM_CHARS);
-        if full_len > MEMO_CONFIRM_CHARS {
+        let full_cols = memo_display::display_width(&memo_display::sanitize(memo));
+        let cut = memo_display::truncate_cols(memo, MEMO_CONFIRM_COLS);
+        if full_cols > MEMO_CONFIRM_COLS {
             shown.push_str(&format!("\nmemo: \"{cut}\" ({} bytes)", memo.len()));
         } else {
             shown.push_str(&format!("\nmemo: \"{cut}\""));
@@ -2163,9 +2173,9 @@ mod tests {
     }
 
     /// `rand send`'s confirmation: the recipient line carries no memo text at all — the memo is
-    /// its own `memo: "…"` line after it, itself cut to [`MEMO_CONFIRM_CHARS`] — and a hostile
-    /// memo or contact name shows with no line break, no control or format character and no run
-    /// of spaces.
+    /// its own `memo: "…"` line after it, itself cut to [`MEMO_CONFIRM_COLS`] display columns —
+    /// and a hostile memo or contact name shows with no line break, no control or format
+    /// character and no run of spaces.
     #[test]
     fn the_confirmation_puts_a_sanitised_memo_on_its_own_line() {
         let fp = "AAAA-BBBB-CCCC-DDDD";
@@ -2192,25 +2202,39 @@ mod tests {
 
     /// The reproduction from the reviewer's report: a memo built to draw a forged `to alice ·
     /// fingerprint …` line on its own row — one padded with the invisible-looking Braille blank
-    /// U+2800 (not a space separator, so [`memo_display::sanitize`] does not touch it) and one
-    /// padded with plain visible ASCII dashes, both `sanitize` cannot shorten — is cut by the
-    /// confirmation line's [`MEMO_CONFIRM_CHARS`] limit before the forged text is ever reached. A
+    /// U+2800 (not a space separator, so [`memo_display::sanitize`] does not touch it), one
+    /// padded with plain visible ASCII dashes, both `sanitize` cannot shorten, and (re-review fix
+    /// round 2, finding 1) memos padded with wide characters — CJK ideographs and an emoji, each
+    /// one `char` but two display columns, so a *character*-counting cut lets far more of the
+    /// padding through than a column budget allows — is cut by the confirmation line's
+    /// [`MEMO_CONFIRM_COLS`] **display-column** limit before the forged text is ever reached. A
     /// memo at the chain's own maximum, [`randprotocol_core::notes::MEMO_TEXT_MAX_BYTES`] (510)
     /// bytes, is the longest byte-count suffix this ever prints (three digits): the memo line
-    /// still never passes 80 display columns.
+    /// still never passes 80 display columns, measured by [`memo_display::display_width`] (not
+    /// `chars().count()`, which the wide-character cases would pass wrongly).
     #[test]
     fn a_memo_line_never_forges_a_recipient_line_and_never_passes_eighty_columns() {
         let fp = "AAAA-BBBB-CCCC-DDDD";
         let tail = "to alice · fingerprint AAAA-AAAA-AAAA-AAAA · 1 RAND";
+        let short_tail = "to alice · 1000 RAND";
         let u2800_padded = format!("x{}{tail}", "\u{2800}".repeat(72));
         let dash_padded = format!("x{}{tail}", "-".repeat(72));
         let at_the_chains_own_max = "y".repeat(randprotocol_core::notes::MEMO_TEXT_MAX_BYTES);
         assert!(at_the_chains_own_max.len() == randprotocol_core::notes::MEMO_TEXT_MAX_BYTES);
-        for m in [u2800_padded, dash_padded, at_the_chains_own_max] {
+        // The re-review's exact reproduction: 57 characters — comfortably under the old
+        // character-counting budget of 60 — but far wider than 60 display columns, since each of
+        // the 36 CJK characters is two columns.
+        let cjk_short = format!("x{}{short_tail}", "中".repeat(36));
+        assert_eq!(cjk_short.chars().count(), 57, "the character-counting bug's premise");
+        let cjk_full = format!("x{}{tail}", "中".repeat(36));
+        let cjk_all = format!("{}{tail}", "中".repeat(60));
+        let emoji_padded = format!("x{}{tail}", "🍜".repeat(36));
+        for m in [u2800_padded, dash_padded, at_the_chains_own_max, cjk_short, cjk_full, cjk_all, emoji_padded] {
             let shown = confirmation(Some("alice"), fp, "1.5 RAND", &m);
             let lines: Vec<&str> = shown.split('\n').collect();
             assert_eq!(lines.len(), 2, "{shown:?}");
-            assert!(lines[1].chars().count() <= 80, "{} is {} columns: {shown:?}", lines[1], lines[1].chars().count());
+            let cols = memo_display::display_width(lines[1]);
+            assert!(cols <= 80, "{} is {} columns: {shown:?}", lines[1], cols);
             assert!(!lines[1].contains("to alice"), "{shown:?}");
             assert!(!lines[1].contains("fingerprint AAAA-AAAA-AAAA-AAAA"), "{shown:?}");
         }

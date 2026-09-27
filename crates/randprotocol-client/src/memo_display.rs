@@ -17,6 +17,18 @@
 //! already-sanitised text — can never split an escape. The same rule, with the same U+FFFD, is in
 //! the web UI (`ui/lib/memo.js`), iOS (`Memo.display`), Android (`Memo.display`) and the
 //! website's `/account`.
+//!
+//! [`truncate`] bounds a *character* count, not what a terminal actually draws: a CJK character or
+//! an emoji is one `char` but renders as two columns, so a 57-character memo half of CJK
+//! characters can still be far wider than 57 columns and read as uncut (re-review fix round 2,
+//! finding 1 — a `"x" + 36×"中" + "to alice · 1000 RAND"` memo, at 57 characters, drew a forged
+//! second line in an 80-column terminal because nothing had cut it). [`truncate_cols`] and
+//! [`display_width`] measure and cut by **display column**, using [`UnicodeWidthChar::width_cjk`]/
+//! [`UnicodeWidthStr::width_cjk`] — the wide convention for the Unicode Ambiguous-width class, the
+//! one non-CJK terminals also render wide when the font covers CJK — since this exists to bound
+//! what a terminal draws, and undercounting a width is the unsafe direction here.
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The character every control, format character and line/paragraph separator becomes.
 pub const REPLACEMENT: char = '\u{FFFD}';
@@ -95,6 +107,48 @@ pub fn truncate(text: &str, max: usize) -> String {
     cut
 }
 
+/// `text`'s displayed width in terminal columns: [`UnicodeWidthStr::width_cjk`], the wide
+/// convention for Ambiguous-width code points (see the module comment). A caller that needs to
+/// know whether a [`truncate_cols`] cut in fact happened compares this, not `chars().count()`,
+/// against its column budget — a wide character or a zero-width one would answer that wrong.
+pub fn display_width(text: &str) -> usize {
+    UnicodeWidthStr::width_cjk(text)
+}
+
+/// The trailing `…` [`truncate_cols`] appends to a cut string: itself Ambiguous width, so under
+/// the wide convention this crate measures by ([`display_width`]'s doc) it costs **two** columns,
+/// not one — an easy first-draft mistake ("an ellipsis is basically one narrow character") this
+/// module's own tests once caught here at 61 columns against a 60-column budget.
+const ELLIPSIS: char = '…';
+
+/// [`sanitize`]d `text`, cut so its **display width** ([`display_width`]) is at most `max_cols`
+/// columns, with a trailing [`ELLIPSIS`] — its own width counted within that budget — when it was
+/// cut. Sanitising comes first, exactly as in [`truncate`]. A sanitised character
+/// [`UnicodeWidthChar::width_cjk`] answers `None` for (a control character — sanitising already
+/// replaced every one with U+FFFD, so this should not occur) or `0` for (a genuine zero-width
+/// mark, which sanitising does not touch) is still charged one column: an unbounded run of them
+/// must not be free to repeat forever without ever counting against the cut.
+pub fn truncate_cols(text: &str, max_cols: usize) -> String {
+    let clean = sanitize(text);
+    if display_width(&clean) <= max_cols {
+        return clean;
+    }
+    let ellipsis_width = ELLIPSIS.width_cjk().filter(|&w| w > 0).unwrap_or(1);
+    let budget = max_cols.saturating_sub(ellipsis_width);
+    let mut cut = String::with_capacity(clean.len());
+    let mut used = 0usize;
+    for c in clean.chars() {
+        let w = c.width_cjk().filter(|&w| w > 0).unwrap_or(1);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        cut.push(c);
+    }
+    cut.push(ELLIPSIS);
+    cut
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -148,5 +202,52 @@ pub(crate) mod tests {
         assert_eq!(truncate(&format!("x{}to alice", " ".repeat(400)), 24), "x to alice");
         assert_eq!(truncate("\x1b[2K\x1b[2K\x1b[2K\x1b[2K\x1b[2K\x1b[2K", 6), "\u{FFFD}[2K\u{FFFD}…");
         assert_eq!(truncate("short", 24), "short");
+    }
+
+    #[test]
+    fn display_width_counts_columns_not_characters() {
+        assert_eq!(display_width(""), 0);
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("中"), 2, "one char, two columns");
+        assert_eq!(display_width("中中中"), 6);
+        assert_eq!(display_width("🍜"), 2, "most emoji are width 2");
+    }
+
+    /// Re-review fix round 2, finding 1: `truncate` counts characters, but a terminal draws
+    /// columns — a CJK character or an emoji is one `char` and two columns. A memo half CJK can
+    /// sit at or under a character budget while its display width is far over it.
+    #[test]
+    fn truncate_cols_cuts_by_display_width_not_character_count() {
+        // The reviewer's exact reproduction: 57 characters, so `truncate(_, 60)` would return it
+        // whole — but its display width is nowhere near 60.
+        let m = format!("x{}to alice · 1000 RAND", "中".repeat(36));
+        assert_eq!(m.chars().count(), 57, "the character-counting bug's premise");
+        assert_eq!(truncate(&m, 60), m, "the character-counting cut lets the whole thing through");
+        assert!(display_width(&m) > 60, "but its actual display width is what must be bounded");
+        let cut = truncate_cols(&m, 60);
+        assert!(display_width(&cut) <= 60, "{cut:?} is {} columns", display_width(&cut));
+        assert!(!cut.contains("to alice"), "{cut:?}");
+
+        // The same, against the full hostile tail, and again fully CJK.
+        let tail = "to alice · fingerprint AAAA-AAAA-AAAA-AAAA · 1 RAND";
+        for m in [format!("x{}{tail}", "中".repeat(36)), format!("{}{tail}", "中".repeat(60))] {
+            let cut = truncate_cols(&m, 60);
+            assert!(display_width(&cut) <= 60, "{cut:?} is {} columns", display_width(&cut));
+            assert!(!cut.contains("to alice"), "{cut:?}");
+        }
+        // Emoji padding is exactly as wide as CJK padding to this cut.
+        let emoji = format!("x{}{tail}", "🍜".repeat(36));
+        let cut = truncate_cols(&emoji, 60);
+        assert!(display_width(&cut) <= 60, "{cut:?} is {} columns", display_width(&cut));
+        assert!(!cut.contains("to alice"), "{cut:?}");
+
+        for m in hostile() {
+            let t = truncate_cols(&m, 24);
+            assert_safe(&t, &m);
+            assert!(display_width(&t) <= 24, "{t:?} is {} columns", display_width(&t));
+        }
+        // Untouched when already inside the budget, exactly as `truncate` is.
+        assert_eq!(truncate_cols("short", 24), "short");
+        assert_eq!(truncate_cols(&format!("x{}to alice", " ".repeat(400)), 24), "x to alice");
     }
 }

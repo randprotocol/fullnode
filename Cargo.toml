@@ -58,6 +58,10 @@ rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
 
 # cli
 clap = { version = "4.4", features = ["derive", "env"] }
+# The confirmation memo line's column budget (`memo_display::truncate_cols`/`display_width`): a
+# CJK character or an emoji is one `char` but renders as two terminal columns, which
+# `chars().count()` cannot see (fix round 2, re-review finding 1).
+unicode-width = "0.2"
 
 # test
 tempfile = "3.10"
