@@ -1688,6 +1688,60 @@ impl Storage {
         Ok(())
     }
 
+    /// Every seal row a height above `height` owns, found from the rows themselves rather than
+    /// from the blocks (AGG-TRUNC-1: for a block that no longer decodes there is no transaction
+    /// list to walk). Each key shape records or indexes its height:
+    ///
+    /// - `t` + bundle → `(aggregate, sealed_at)`: dropped when the aggregate that sealed it
+    ///   committed above `height` (`sealed_at`), or when the bundle itself sits above it; with a
+    ///   mark whose aggregate is dropped goes the covered block's `sealed` flag, which the mark
+    ///   earned it (`stage_block_delete`'s rule for a decodable aggregate).
+    /// - `a` + aggregate, and `p` + proof → transaction: dropped when that transaction's record
+    ///   (`CF_TXS`, written in the block's own batch, so present for an undecodable block too)
+    ///   sits above `height`.
+    /// - `b` + block hash: dropped when the hash index puts the block above `height`. Read before
+    ///   the caller's batch drops those index rows — a batch is not visible until it is written.
+    fn stage_seal_rows_above(&self, batch: &mut WriteBatch, height: u64) -> Result<()> {
+        // A row whose own value, or whose transaction's record, no longer reads is dropped too:
+        // this runs only on a store being repaired, every seal row is derived state, and a missing
+        // one errs the safe way — a bundle with no mark is not sealed (never accepted in pruned
+        // form on its word), a missing proof-hash row only stops serving the sealed form, a
+        // missing payment row only blanks `rand_getAggregate`'s facts.
+        let tx_above = |tx: &Hash| match self.tx_location(tx) {
+            Ok(at) => at.is_some_and(|(at, _)| at > height),
+            Err(_) => true,
+        };
+        for item in self.db.iterator_cf(self.cf(CF_SEALS), IteratorMode::Start) {
+            let (k, v) = item?;
+            let Some((&shape, rest)) = k.split_first() else { continue };
+            let Ok(id) = <[u8; 32]>::try_from(rest).map(Hash) else { continue };
+            let drop = match shape {
+                b't' => match bincode::deserialize::<(Hash, u64)>(&v) {
+                    Ok(_) if tx_above(&id) => true,
+                    Ok((_, sealed_at)) if sealed_at > height => {
+                        // The kept, covered block loses the flag the mark earned it.
+                        if let Ok(Some((covered_height, _))) = self.tx_location(&id) {
+                            if let Ok(Some(covered_block)) = self.block_by_height(covered_height) {
+                                batch.delete_cf(self.cf(CF_SEALS), [b"b".as_slice(), covered_block.hash().as_bytes()].concat());
+                            }
+                        }
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(_) => true,
+                },
+                b'a' => tx_above(&id),
+                b'p' => bincode::deserialize::<Hash>(&v).map_or(true, |tx| tx_above(&tx)),
+                b'b' => self.height_by_hash(&id).map_or(true, |at| at.is_some_and(|at| at > height)),
+                _ => false,
+            };
+            if drop {
+                batch.delete_cf(self.cf(CF_SEALS), &k);
+            }
+        }
+        Ok(())
+    }
+
     /// Give the disk back: RocksDB only frees a deleted range at compaction. Compacts `blocks`
     /// over `[1, floor)` (`qcs` holds only genesis' and the head's rows since v0.5.5, OPS-4).
     /// A no-op on an archive.
@@ -2721,6 +2775,7 @@ impl Storage {
             _ => 0,
         };
         let mut batch = WriteBatch::default();
+        let mut undecodable = false;
         // The new head's certificate is the `justify` of the child about to be deleted (audit
         // v5, OPS-4); it becomes the head's `CF_QCS` row, or the next `head_qc()` is `Corrupt`.
         if height > 0 && height < head {
@@ -2735,11 +2790,22 @@ impl Storage {
             // aggregate's cover marks survived it, and `check_sealed_coverage` trusts exactly
             // those marks, so a pruned bundle whose cover this chain no longer carries would
             // have been accepted as sealed.
-            if let Ok(Some(block)) = self.block_by_height(h) {
-                self.stage_block_delete(&mut batch, &block)?;
+            match self.block_by_height(h) {
+                Ok(Some(block)) => self.stage_block_delete(&mut batch, &block)?,
+                _ => undecodable = true,
             }
             batch.delete_cf(self.cf(CF_BLOCKS), hk);
             batch.delete_cf(self.cf(CF_QCS), hk);
+        }
+        // AGG-TRUNC-1 (the v0.6 rescan, INTERFACE-2's residual): a block that does not decode
+        // cannot name the rows it owns — and a block row that no longer decodes is exactly when
+        // `check_and_repair_chain` truncates. Its aggregate's cover marks would then outlive it
+        // (and the covered block's `sealed` flag with them), which `check_sealed_coverage` trusts,
+        // so the seal family is swept by the heights its rows record instead. Only then: it is a
+        // scan of the whole family plus a point read per row, and a decodable block's rows are
+        // already staged above.
+        if undecodable {
+            self.stage_seal_rows_above(&mut batch, height)?;
         }
         // Also drop any index entries that point above `height` (blocks we could not decode).
         for item in self.db.iterator_cf(self.cf(CF_BLOCK_INDEX), IteratorMode::Start) {
@@ -6663,6 +6729,71 @@ mod seal_tests {
         assert!(!storage.block_sealed(&b3.block.hash()).unwrap(), "its block's flag");
         // The kept block is untouched and the store verifies at the new head.
         assert!(storage.tx_record(&covered.hash()).unwrap().is_some());
+        let check = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!((check.problem, check.last_good), (None, 1));
+    }
+
+    /// AGG-TRUNC-1 (the v0.6 rescan, a residual of INTERFACE-2): `truncate_to` staged a block's
+    /// seal rows only for a block it could decode — and a block row that no longer decodes is
+    /// exactly when `check_and_repair_chain` truncates. So a corrupt aggregate's cover marks, and
+    /// the covered block's `sealed` flag, outlived the truncation, and `check_sealed_coverage`
+    /// trusts exactly those marks. Block 1 carries a bundle, block 2 another, block 3 the
+    /// aggregate over block 1's, block 4 a sealed bundle pruned by hand (so it owns every row a
+    /// bundle can own); 3 and 4 are then garbage. `verify_chain` lands on 1 (block 2's
+    /// certificate lived in block 3's `justify`), and the repair's truncation leaves no mark of
+    /// either undecodable block, found from the seal rows' own recorded heights.
+    #[test]
+    fn truncation_over_undecodable_blocks_drops_their_seal_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1)], vec![], 100);
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let covered = bundle_tx(&ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee());
+        let b1 = make_block(&gs.block, &mut ledger, vec![covered.clone()], &key(1));
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let second = bundle_tx(&ledger, [[25; 8], [26; 8]], [[27; 8], [28; 8]], bundle_fee());
+        let b2 = make_block(&b1, &mut ledger, vec![second], &key(1));
+        storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
+        let b3 = make_block_unchecked(&b2, &ledger, vec![aggregate.clone()], &key(1));
+        storage.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
+        let later = bundle_tx(&ledger, [[31; 8], [32; 8]], [[33; 8], [34; 8]], bundle_fee());
+        let b4 = make_block(&b3, &mut ledger, vec![later.clone()], &key(1));
+        storage.commit(std::slice::from_ref(&b4), &ledger, &[], &StubExecutor).unwrap();
+        storage.mark_sealed(later.hash(), Hash::digest(b"a later aggregate"), 4).unwrap();
+        let later_proof = Hash::digest(&later.bundle.as_ref().unwrap().proof);
+        storage
+            .db
+            .put_cf(storage.cf(CF_SEALS), [b"p".as_slice(), later_proof.as_bytes()].concat(), bincode::serialize(&later.hash()).unwrap())
+            .unwrap();
+        assert!(storage.sealed_by(&covered.hash()).unwrap().is_some(), "the aggregate's commit sealed it");
+        assert!(storage.block_sealed(&b1.block.hash()).unwrap(), "and flagged its block");
+        // The payment facts `commit` writes off the ledger's own count (this aggregate is stored
+        // unchecked, so the ledger paid nothing), written by hand so their removal shows.
+        storage
+            .db
+            .put_cf(storage.cf(CF_SEALS), [b"a".as_slice(), aggregate.hash().as_bytes()].concat(), bincode::serialize(&(5u64, 0u64, 0u64)).unwrap())
+            .unwrap();
+        assert!(storage.aggregate_payment(&aggregate.hash()).unwrap().is_some());
+        assert!(storage.block_sealed(&b4.block.hash()).unwrap(), "the later block is flagged too");
+        // The corruption: neither the aggregate's block nor the later one decodes any more.
+        for h in [3u64, 4] {
+            storage.overwrite_block_bytes_for_testing(h, b"garbage").unwrap();
+            assert!(storage.block_by_height(h).is_err(), "block {h} no longer decodes");
+        }
+        let c = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(c.last_good, 1, "{:?}", c.problem);
+
+        storage.truncate_to(&gs, c.last_good, &c.ledger).unwrap();
+
+        assert_eq!(storage.sealed_by(&covered.hash()).unwrap(), None, "the undecodable aggregate's cover mark");
+        assert!(!storage.block_sealed(&b1.block.hash()).unwrap(), "and the kept block's flag it earned");
+        assert_eq!(storage.aggregate_payment(&aggregate.hash()).unwrap(), None, "its payment facts");
+        assert_eq!(storage.sealed_by(&later.hash()).unwrap(), None, "an undecodable block's bundle's own mark");
+        assert_eq!(storage.tx_hash_by_proof_hash(&later_proof).unwrap(), None, "its proof-hash row");
+        assert!(!storage.block_sealed(&b4.block.hash()).unwrap(), "its block's flag");
+        assert!(storage.tx_record(&covered.hash()).unwrap().is_some(), "the kept block's own record stays");
         let check = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
         assert_eq!((check.problem, check.last_good), (None, 1));
     }
