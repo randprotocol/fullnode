@@ -545,7 +545,8 @@ mod tests {
         assert_eq!(ex.program_builds(), 1, "two digests and a verify: one build");
     }
 
-    /// IFACE-9's node half: the core mirrors of the bundle header are the zkVM's own numbers, and
+    /// IFACE-9's node half: the core mirrors of the bundle header (and ZKQ-4's field order) are
+    /// the zkVM's own numbers, and
     /// `check_admitted_shape` is `InnerShape::try_of` — the pinned header builds, a declared
     /// height the zkVM refuses does not.
     #[test]
@@ -554,6 +555,11 @@ mod tests {
             randprotocol_core::types::BUNDLE_PUBLIC_LOG_HEIGHT,
             randprotocol_zkvm::tables::public::public_log_height(randprotocol_core::types::TX_BINDING_WORDS),
             "the transaction binding's public height"
+        );
+        assert_eq!(
+            randprotocol_core::types::pv::GOLDILOCKS_ORDER,
+            <randprotocol_zkvm::machine::Val as p3_field::PrimeField64>::ORDER_U64,
+            "the public values' field (ZKQ-4's canonical bound)"
         );
         let honest = DeclaredShape {
             tier: randprotocol_core::types::BUNDLE_PROOF_TIER,

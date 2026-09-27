@@ -72,4 +72,8 @@ pub mod pv {
     pub const IN0: usize = HC0 + 8;
     pub const PUB0: usize = IN0 + 8;
     pub const NUM: usize = PUB0 + 8;
+    /// The order of the field the public values live in (Goldilocks, `2^64 − 2^32 + 1`): a
+    /// canonical public value is below it. Mirrored like the layout above (core cannot name the
+    /// zkVM's `Val`); the node's `agg_executor` tests pin mirror == `Val::ORDER_U64`.
+    pub const GOLDILOCKS_ORDER: u64 = 0xFFFF_FFFF_0000_0001;
 }

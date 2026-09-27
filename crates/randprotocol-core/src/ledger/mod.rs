@@ -301,6 +301,12 @@ pub enum BlockError {
     /// transaction of the block is applied — a peer's wire input is never indexed on trust.
     #[error("pruned record for tx {tx} carries {words} public values, not {expected}")]
     MalformedPrunedRecord { tx: Hash, words: usize, expected: usize },
+    /// A side-table record carries a public value at or past the Goldilocks order (the rescan's
+    /// ZKQ-4): the rVM absorbs these words unreduced, so `x + p` would pass the covering
+    /// aggregate's digest in place of `x` and this node would store and re-serve the
+    /// non-canonical record. Refused beside the length check, before any transaction.
+    #[error("pruned record for tx {tx} carries a non-canonical public value at word {index}")]
+    NonCanonicalPrunedRecord { tx: Hash, index: usize },
     /// At most one `Aggregate` per block (spec §3.4) is a block-validity rule, not proposer
     /// selection alone (the pre-v0.1 review's H1): the second is refused by index.
     #[error("a block carries at most one aggregate; a second is at tx {index}")]
@@ -1902,6 +1908,12 @@ impl Ledger {
                     words: p.public_values.len(),
                     expected: crate::types::pv::NUM,
                 });
+            }
+            // And every word canonical (ZKQ-4): the rVM absorbs them unreduced, so `x + p` would
+            // match the covering aggregate's digest in place of `x`, and this node would store and
+            // re-serve a record no honest proof ever carried.
+            if let Some(index) = p.public_values.iter().position(|w| *w >= crate::types::pv::GOLDILOCKS_ORDER) {
+                return Err(BlockError::NonCanonicalPrunedRecord { tx: p.tx_hash, index });
             }
         }
         scratch.pruned_side =
@@ -4172,6 +4184,31 @@ mod tests {
             l.check_bundle_proof(marker.bundle.as_ref().unwrap(), &binding, &StubExecutor, false),
             Err(TxError::BadDigest)
         );
+    }
+
+    /// The rescan's ZKQ-4: the rVM absorbs a covered bundle's public values with
+    /// `F::from_u64`, which does not reduce — so a sync peer could serve a pruned record with
+    /// `x + p` in place of `x` in any of the 18 words neither the `HC` pin nor the `OUT` digest
+    /// check reads, the covering aggregate's interface digest still matched, and the node stored
+    /// and re-served a non-canonical record. Every word of a side-table record must be a
+    /// canonical Goldilocks element, refused with the length check before any transaction.
+    #[test]
+    fn a_pruned_record_with_a_non_canonical_word_is_refused() {
+        let mut l = ledger();
+        let proposer = l.validators.keys().next().copied().unwrap();
+        let mut public_values = vec![7u64; crate::types::pv::NUM];
+        // `pv::PC_ENTRY` is read by nothing the ledger checks: a word a peer could lift by p.
+        public_values[0] = 7 + crate::types::pv::GOLDILOCKS_ORDER;
+        let bad = crate::consensus::PrunedBundle {
+            tx_hash: Hash([1; 32]),
+            proof_hash: Hash([2; 32]),
+            public_values,
+            shape: crate::types::DeclaredShape { profile: crate::types::FriProfile::Test, tier: 14, program_log_height: 12, input_log_height: 10, keccak_log_height: 0, sha256_log_height: 0, public_log_height: 4, mem_log_height: 16 },
+        };
+        let err = l
+            .apply_transactions_for_sync(&[], &proposer, &BTreeMap::new(), &[bad], &StubExecutor, &NoVerified)
+            .expect_err("a record with a word at or past p is refused");
+        assert!(matches!(err, BlockError::NonCanonicalPrunedRecord { index: 0, .. }), "{err:?}");
     }
 
     /// Fix round 1, item 2: a marker-form copy of a raw transaction — `bundle.proof` replaced by
