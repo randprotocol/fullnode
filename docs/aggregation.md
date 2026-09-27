@@ -146,7 +146,7 @@ both have to clear before a genesis may switch it on.
    the reduce chip's free per-row clock (OPCODES-1/TABLES-1), its padding rows that could write
    (V-OPCODES-1), runs that could stop before their write-back (ZKR-4), the public table's
    optional rows (OPCODES-4) and the unchecked base addresses and `r31` pairs (ZKQ-3). All are
-   fixed in circuits `fbe29b8` and `334f414..642db8d`, vendored here at `642db8d`, each with a
+   fixed in circuits `b786aae` and `cd4b788..971b96b` (on circuits main after the memo commit `c6cdef4`), vendored here at `971b96b`, each with a
    red-first cheating vector. The aggregate program's digest does not change with any of them
    (a pinned test says so); the rVM *verifier* does, so a proof from an unfixed prover no longer
    verifies. What has **not** been done, and has to be before a genesis enables aggregation:

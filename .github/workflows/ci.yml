@@ -28,7 +28,7 @@ env:
   CARGO_TERM_COLOR: always
   # The circuits commit this tree's vendored crates were synced from (deploy/sync-zkvm.sh). Bump it
   # in the same commit as a re-vendor, or CI builds this workspace against a tree it did not vendor.
-  CIRCUITS_PIN: 642db8d0226d767f606f7d41d9c9b2c3824cf4f3
+  CIRCUITS_PIN: 971b96b8150bdc1113b09c3de5ffd82c0bfd91cd
 
 jobs:
   check-and-test:

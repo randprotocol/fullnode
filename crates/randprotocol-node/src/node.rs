@@ -1505,7 +1505,7 @@ pub fn check_build_runs_genesis(gs: &GenesisState, built_hc_bundle: &randprotoco
     // now holds aggregation off. RVM-1 let a prover choose the high lane of every extension value
     // the rVM stores to memory — thousands of free field elements in the aggregate verifier — and
     // the same day's zk scan found the reduce chip's clock, row-kind, run-end and address-range
-    // gaps. The fixed rVM (circuits 642db8d, vendored here) closes them, but no forged aggregate
+    // gaps. The fixed rVM (circuits 971b96b, vendored here) closes them, but no forged aggregate
     // has yet been built end to end against it; `docs/aggregation.md`, "Before enabling
     // aggregation", lists what has to happen first. Any genesis carrying an `aggregation` section
     // is refused until then, whichever reason is the last to clear.
