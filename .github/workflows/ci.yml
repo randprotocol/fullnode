@@ -88,6 +88,11 @@ jobs:
         run: |
           cargo test -p randprotocol-node --release --test submit --test ws
           cargo test -p randprotocol-zkvm --release --test guest_provenance
+          # HCS-1's tripwire: the verifier keys' known answers. Every key is salted from StdRng's
+          # stream, so a dependency bump that moves it (rand, rand_core, chacha20) refuses every
+          # proof on the fleet; nightly alone would catch it a day after the push that did it.
+          cargo test -p randprotocol-zkvm --release --test verifier_key
+          cargo test -p randprotocol-rvm --release --test verifier_key
           cargo test -p randprotocol-node --release --test cluster -- --exact \
             a_synced_certified_but_uncommitted_chain_is_not_committed \
             a_batch_whose_evidence_blocks_are_junk_commits_nothing \
