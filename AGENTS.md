@@ -49,6 +49,41 @@ fullnode, randscan, randprotocol.org and clients; every task reviewed, then two 
   `RPC_BLOCKING` process-wide semaphore (v0.5.8) makes `rpc::tests::a_token_transfer_reveals…` flaky
   under parallel load (passes alone).
 
+### 2026-09-28 — v0.6 hardening (`feat/v06-hardening`, off `feat/v0.6`; not merged, not rolled)
+
+The 2026-09-27 zkVM/ISA and recursion-VM reviews' remaining fullnode items. **One activation
+switch** (the ISA review's R4): top-level genesis `hardening_v6: true`, hashed (tag
+`hardening_v6`, appended last) only when true — chain 15 `cc30e085…` stays pinned by
+`chain_15s_genesis_file_still_builds_chain_15`. Each rule is every node's **pool policy now**
+(non-permanent Ignore) where old wallets allow it, and a **ledger/executor validity rule under the
+flag**; `Ledger::hardening_v6`'s doc comment lists them and `docs/deploy.md` "The next cut:
+`hardening_v6`" is the operator checklist. **Trap:** every defaulted `ConfidentialExecutor`
+method a rule adds must be forwarded by `AggExecutor` (the executor every node runs) — a default
+there switches the rule off; `the_wrapper_delegates_the_zkvm_surface` pins them.
+
+- **CPU-1** (medium): a deploy past `executor::max_callable_program_words` — tier 14's 2 048
+  Poseidon2 slots less the salt row and the public header, ×4 = 8 184 words (8 180 under the flag,
+  whose calls carry the 8-word binding) — is `ProgramUncallable`.
+- **INT-5, VERIFIER-2/V-VERIFIER-1, VERIFIER-1**: `executor::non_canonical` pins the memory height
+  (`t + 2` without hash tables, 16 for bundles), the FRI folding schedule (`honest_fri_arities`,
+  re-derived from `degree_bits`), the random-codeword counts and the commit-phase PoW words (zero)
+  — `NonCanonicalProof`. The query PoW word is ground and left alone.
+- **INT-4** (flag only — every field wallet proves the empty segment): a call against a program
+  without a public input carries `Transaction::call_binding` (`rand-call-bind-1`, both proofs
+  blanked) as its public segment; `rand_getLimits.hardening_v6` tells the wallet, which proves the
+  call inside `submit_bound_call` (notes, then call, then bundle). Residual: programs *with* a public
+  input stay unbound (the ledger holds only their digest).
+- **PROGRAM-TABLE-LEAK** (flag only): a call's program table is `max(record height, 7)`
+  (`hardened_program_log_height`), emitted by `prove_call_hardened` and pinned by
+  `verify_call_hardened`.
+- Node-only / dormant: HB-1 (`address::to_research` runs the ML-KEM key decode — a bad key no
+  longer panics the faucet), INTERFACE-6 (a pruned record must name its tx and carry its binding's
+  `H_PUB`), INTERFACE-7 (duplicate side-table proof hashes refused), V-INTERFACE-2 (the aggregator
+  signs the payout envelope's digest; domain `rand-aggregate-2`), HB-3 (`CommitmentTreeFull`, no
+  assert in apply), the admission worker's `guard_verify` (a verifier panic is a verdict, not a
+  lost worker slot), SAFETY comments. Docs (R1): shielded.md/confidential.md state what the proofs
+  leak today. Deferred: INTERFACE-9 (pruning rewrites only the CF_TXS copy of a sealed bundle).
+
 ### 2026-09-28 — zk node-side fixes (`feat/zk-node-fixes`, not merged, not rolled)
 
 Node-local halves of the zk rescan; the vendored halves are other branches' (`feat/rvm-fixes`,
@@ -61,8 +96,9 @@ genesis hash `cc30e085…` stays pinned by `chain_15s_genesis_file_still_builds_
 - **ZKG-1**: a bundle proof's published digest is read with `u32::try_from`. **ZKG-2**: the
   `hc_bundle` pin is checked for every `deploy/genesis-chain*.json`.
 - **ZKV-11 (pc-wrap)**: a `Deploy` whose padded program table crosses 2^32 is refused at the pool
-  on every chain (`admission::deploy_outside_pc_window`, permanent `BadProgram`) and, under a new
-  top-level genesis flag `program_pc_window: true` (next cut), by the ledger.
+  on every chain (`admission::deploy_outside_pc_window`, permanent `BadProgram`) and, under the
+  top-level genesis flag (next cut), by the ledger. The flag was `program_pc_window`; it is now
+  `hardening_v6` (below), renamed before any genesis carried it.
 - **COV-2 stopgap**: a call proof whose input/keccak/sha256 table is under 2^7 rows is not pooled
   (`CallRevealsPrivateInputs`, non-permanent, never a ledger rule). **Trap:** until the prover floor
   is vendored no wallet builds a compliant call, so a node on this build pools no call and the call
