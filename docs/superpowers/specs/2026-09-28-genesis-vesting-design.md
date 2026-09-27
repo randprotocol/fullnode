@@ -1,241 +1,122 @@
 # Genesis vesting: timelocked RAND for the team, investors and founding partners
 
-Status: design approved 2026-09-28 (brainstorm with the user); not implemented. Targets the next
-genesis cut that carries fundraising allocations (mainnet v1.0), rehearsed first on a testnet cut.
-User-facing guide: `docs/vesting.md`.
+Status: design approved 2026-09-28 and **revised the same day** after the SAFT check (§2);
+implemented on `feat/timelock-genesis` (plan `docs/superpowers/plans/2026-09-28-genesis-vesting.md`).
+Targets the genesis cut that carries fundraising allocations (mainnet v1.0), rehearsed first on a
+testnet cut. User-facing guide: `docs/vesting.md`.
 
 ## 1. Problem
 
 Fundraising allocations — internal team, investors (VCs), founding partners — are issued at genesis
-but must not be spendable until they unlock on a schedule (a cliff, then linear). RAND lives as
-shielded notes: a spend proof hides which note it consumes and what it is worth, so the ledger
-cannot enforce a lock on a note it cannot see. The lock therefore has to live where amounts are
-already public — a register, like the validator register (`ledger/staking.rs`) — and value enters
-the pool only as it unlocks.
+but must not be spendable until they unlock on a schedule. RAND lives as shielded notes: a spend
+proof hides which note it consumes and what it is worth, so the ledger cannot enforce a lock on a
+note it cannot see. The lock lives where amounts are already public — a register, like the
+validator register — and value enters the pool only as it unlocks.
 
-## 2. Decisions (user, 2026-09-28)
+## 2. Decisions
 
 | # | question | ruling |
 |---|---|---|
-| D1 | where the lock lives | **A public vesting register** seeded at genesis. Each entry's amount and schedule are public; the holder is a key, never a name. Rejected: a timelock inside the note (guest change, bundle re-measure, locked supply unauditable); off-chain/legal only (the chain enforces nothing). |
-| D2 | revocation | **Every entry carries a revoker key** (the field is per-entry and optional, so a deal whose terms forbid clawback is simply listed without one — no code change). A revoke takes only the *unvested* part. |
-| D3 | where revoked RAND goes | **A shielded note to the address the revoker names** (the treasury), spendable at once. Rejected: burning it. |
-| D4 | bonding locked RAND | **No.** Locked RAND is inert until claimed: no stake, no rewards, no consensus weight. No interaction with slashing, unbonding or the 3333-bps weight cap. |
-| D5 | time basis | The committing block's `timestamp_ms` — calendar-aligned with the legal agreements. B2 already bounds it (`MAX_TIMESTAMP_STEP_MS` 60 s per block; honest replicas refuse to vote for a block more than `MAX_CLOCK_DRIFT_MS` = 15 s ahead of their clock), so a proposer can shift an unlock by seconds, never by days. |
+| D1 | where the lock lives | **A public vesting register** seeded at genesis. Each entry's amount and schedule are public; the holder is a key, never a name. Rejected: a timelock inside the note (the SAFT draft's "Time-Locked Notes": a guest change, a tier-14 bundle re-measure, cheating tests, locked supply unauditable); off-chain/legal only. |
+| D2 | revocation | **Per entry**: an entry with a `revoker` key is revocable, one without is not. A revoke takes only the *unvested* part. The user first ruled "all revocable"; the SAFT check (below) moved investor and partner allocations to irrevocable, team grants revocable — a genesis-file choice, no code difference. |
+| D3 | where revoked RAND goes | A shielded note to the address the revoker names (the treasury), spendable at once. Rejected: burning it. |
+| D4 | bonding locked RAND | **Yes, irrevocable entries only** (`BondVested`/`UnbondVested`). The user first ruled "no"; SAFT Schedule 2 §4 promises it and §8 forbids an amendment that "reduce[s] the Investor's ability to Bond locked Tokens". Revocable entries cannot bond, so a revoke never reaches into a validator's stake. |
+| D5 | time basis | The applying block's `timestamp_ms`. B2 bounds it (`MAX_TIMESTAMP_STEP_MS` 60 s per block; honest replicas refuse to vote for a block more than 15 s ahead), so a proposer can move an unlock by seconds. The SAFT's height-based unlocks are, by its own text, an estimate of the calendar. |
+| D6 | schedule shape | **The SAFT's**: nothing until `start + cliff`, then `linear` *after* the cliff, continuous or in whole `step`s released at the end of each step (a 12-month cliff and 18 monthly steps = tranches at months 13 … 30). The first draft accrued from `start` and would have released 12/30 at the cliff. |
 
-Out of scope (YAGNI, each recorded): beneficiary key rotation (a lost key strands the vested part —
-custody, §9, is the mitigation); creating entries after genesis; bonding from the lock;
-per-entry step schedules other than cliff + linear.
+**The SAFT check (2026-09-28).** The SAFT draft (`../termsheets/RAND_SAFT_Institutional_US.md`
+§5.3, Schedule 2) and the tokenomics paper (`../tokenomics/rand_tokenomics.tex`, "Lockups as
+time-locked shielded notes") specify bondable, non-revocable, in-circuit time-locked notes with an
+aggregate, owner-free lockup table. The user chose to keep the register (D1) and meet the SAFT's
+substance: D2, D4, D6 and the lockup-table RPC. The one remaining difference — per-entry amounts
+public under a key — goes into the Schedule 2 §8 notice (`docs/vesting.md`, "The SAFT's
+Schedule 2").
+
+Out of scope (recorded): beneficiary key rotation (a lost key strands the entry); entries created
+after genesis; a multi-party revoker (the planned custody hardening); delegation of bonded RAND's
+rewards to the holder (rewards are the validator's, as on every bond on this chain).
 
 ## 3. Genesis section
 
-`Genesis::vesting: Option<VestingConfig>`, `#[serde(default, skip_serializing_if = "Option::is_none")]`.
-Absent — every chain to date — changes nothing: genesis file, hash and state roots byte-for-byte.
+`Genesis::vesting: Option<VestingConfig>`, omitted when absent — every chain to date keeps its file,
+hash and state roots. Format (amounts as decimal strings, like the staking section's):
 
 ```json
-"vesting": {
-  "entries": [
-    {
-      "id": "<64 hex>",
-      "class": "investor",
-      "beneficiary": "<Dilithium2 public key, hex>",
-      "revoker": "<Dilithium2 public key, hex>",
-      "amount": 50000000000000000,
-      "start_ms": 1790000000000,
-      "cliff_ms": 31536000000,
-      "duration_ms": 126144000000
-    }
-  ]
-}
+"vesting": { "entries": [ {
+  "id": "<64 hex>", "class": "team|investor|partner|other",
+  "beneficiary": "<Dilithium2 public key, hex>", "revoker": "<optional, hex>",
+  "amount": "<units>", "start_ms": 0, "cliff_ms": 0, "linear_ms": 0, "step_ms": 0 } ] }
 ```
 
-- `amount` in units (1 RAND = 10⁹). The cut script checks `Σ amount` against the allocation table
-  it was given, the same way the chain-15 cut checked `Σ notes == Σ locked` (the `alloc-note`
-  10⁹-scaling trap is the reason).
-- `class` ∈ `team | investor | partner | other`: reporting only (`rand_getVestingSummary`), no rule
-  reads it.
-- `id`: 32 bytes chosen by the cut tooling (random). Names and deal terms never go in the genesis
-  file; the operator keeps an off-chain manifest `id → name`.
-- `revoker` optional (D2). Both keys length-checked `== PUBLIC_KEY_LEN` (core review I-1's rule).
+`VestingConfig::check` (→ `GenesisError::BadVesting`): entries non-empty, ids distinct, amount > 0,
+`step_ms` (when present) non-zero and dividing a non-zero `linear_ms`, `start + cliff + linear`
+fits a u64, both keys `PUBLIC_KEY_LEN`, beneficiary ≠ revoker, Σ amount fits a u64. `build` also
+refuses (`SupplyOverflow`) when notes + stakes + the register overflow. The genesis commit appends
+tag `vesting`, the count, then every entry in **id order** with fixed-width fields and a presence
+byte before each optional one — after every other section.
 
-`Genesis::validate` refuses (`GenesisError::BadVesting(reason)`): an empty list; a duplicate `id`;
-`amount == 0`; `duration_ms == 0`; `cliff_ms > duration_ms`; `start_ms + duration_ms` overflowing;
-a wrong-length key; `Σ amount` (plus alloc, plus stakes) overflowing `u64`; and a `beneficiary`
-equal to its own `revoker`.
-
-## 4. The schedule
+## 4. The schedule (`ledger::vesting::vested`)
 
 ```
-vested(e, t) = 0                                         if t < e.start + e.cliff
-             = e.amount                                  if t ≥ e.start + e.duration
-             = ⌊ e.amount · (t − e.start) / e.duration ⌋ otherwise   (u128, then u64)
+vested(e, t) = 0                                    t < start + cliff
+             = amount                               t − (start + cliff) ≥ linear
+             = ⌊amount · k / linear⌋                otherwise, k = elapsed, or elapsed − elapsed mod step
+frozen after a revoke:  vested(e, ·) = amount − revoked_out
+claimable(e, t, epoch) = min(vested − claimed, free(epoch))
+free(epoch)            = amount − claimed − revoked_out − bonded − Σ unbonding rows not yet released
+unvested(e, t)         = amount − vested(e, t)   (0 once revoked)
 ```
 
-After a revoke, `vested(e, t) = e.amount − e.revoked_out` for every later `t` — the entry is frozen
-(§6.2). `vested` is monotonic in `t`, which makes admission sound: a claim valid against the
-tip's timestamp is valid in any later block, the one exception being a revoke landing in between —
-which apply re-checks.
-
-One pure function, `ledger::vesting::vested(&Entry, t_ms) -> u64`, used by validate, apply, RPC and
-CLI alike.
+u128 arithmetic; `vested` is monotonic in `t`.
 
 ## 5. Ledger state
 
-`ledger/vesting.rs`, alongside `staking.rs`:
+`ledger/vesting.rs`: `VestingRegister { entries: Vec<Entry> (id order), released: u64 }`, each
+`Entry` its genesis terms plus `claimed`, `revoked_out`, `revoked_at`, `bonded`, `bonded_to`,
+`unbonding: Vec<(release_epoch, amount)>`, `nonce`. `Ledger::vesting: Option<VestingRegister>`,
+inside `Ledger`'s equality. Root: leaves `rand-vesting-leaf-1` over every field, a Merkle root,
+then count and `released` under `rand-vesting-root-1`; appended last to the state root, re-domained
+**`rand-state-6`**, only under the section. Persisted as JSON under `META_VESTING` at the three
+state-write sites; `reload_ledger` refuses a genesis file and database that disagree about having
+one.
 
-```rust
-pub struct Entry {
-    pub class: Class,
-    pub beneficiary: PublicKey,
-    pub revoker: Option<PublicKey>,
-    pub amount: u64,
-    pub start_ms: u64,
-    pub cliff_ms: u64,
-    pub duration_ms: u64,
-    pub claimed: u64,            // released to the beneficiary so far (gross, before the base)
-    pub revoked_at: Option<u64>, // block timestamp of the revoke
-    pub revoked_out: u64,        // the unvested part paid to the treasury
-    pub nonce: u64,              // bumped by every accepted claim and revoke
-}
-pub struct VestingRegister(BTreeMap<[u8; 32], Entry>);
-```
+## 6. Actions (bundle-less, fee-less, `Action` 24–27, all signed over the genesis hash)
 
-Invariant per entry: `claimed + revoked_out ≤ amount`, and `claimed ≤ vested(e, now)`.
+| action | signer, domain | rule | effect |
+|---|---|---|---|
+| `ClaimVested { entry, amount, nonce, to, time, r, envelope, signature }` | beneficiary, `rand-vest-claim-1` | `BUNDLE_BASE < amount ≤ claimable`, `to` a valid address, `time` in the bundle window, the note new | `claimed += amount`; a note of `amount − base` to `to`; the base to the proposer |
+| `RevokeVesting { entry, unvested, nonce, to, time, r, envelope, signature }` | revoker, `rand-vest-revoke-1` | revocable, not revoked, `BUNDLE_BASE < unvested ≤ unvested(e, now)` | frozen: `revoked_at`, `revoked_out = unvested`; a note of `unvested − base` to `to`; the base to the proposer |
+| `BondVested { entry, validator, amount, registration, nonce, signature }` | beneficiary, `rand-vest-bond-1` | irrevocable, `0 < amount ≤ free`, one validator per entry, the register's own `check_bond` | `ledger.bond(…)` (registration, minimum stake, bond queue); `bonded += amount` |
+| `UnbondVested { entry, amount, nonce, signature }` | beneficiary, `rand-vest-unbond-1` | `amount ≤ bonded`, ≤ the validator's active stake | the validator's `stake −= amount`; a row `(epoch + UNBONDING_EPOCHS, amount)` back in the lock |
 
-Persisted as JSON through a storage-side mirror (the `RegistryExtDisk` pattern, so an appended
-field reads as its default) under `META_VESTING`, restored by `load_ledger`, audited in replay.
-Leaves `blake3("rand-vesting-leaf-1" ‖ id ‖ bincode(entry))`, a Merkle root over them in id order,
-appended to the state root and re-domained **`rand-state-6`** — only when the section is present,
-so a chain without it falls through to today's `rand-state-5` path unchanged. (The gate is restored
-on restart exactly like aggregation's: a restarted node that lost it would compute the old domain
-and fork at its first block.)
+The revoke names its exact amount because its envelope is sealed for one: the CLI signs the amount
+still unvested `--margin-secs` (600) past the head; what vests in the margin stays the holder's.
+The validator's own `Unbond` may not touch stake an entry bonded to it
+(`have = stake − queued − Σ bonded_to`). Every action bumps the entry's nonce; the mempool claims it
+(role 5, keyed on the entry id). Cacheable verdicts: `BadSignature`, `UnknownEntry`,
+`NotRevocable`, `BondNeedsIrrevocable`, `BadRecipient`, `BelowBundleBase`, `ZeroAmount`.
 
-## 6. Actions
+## 7. Supply
 
-Both are bundle-less, fee-less on the wire, and pay `gas::BUNDLE_BASE` out of what they release,
-to the proposer's `rewards` — exactly `Withdraw`'s shape (`ledger/staking.rs::apply`).
-
-### 6.1 `ClaimVested` = `Action` 24
-
-```rust
-ClaimVested { entry: [u8; 32], amount: u64, nonce: u64, to: ShieldedAddress,
-              time: u32, r: Word8, envelope: Envelope, signature: Signature }
-```
-
-Signed by `beneficiary` over
-`H("rand-vest-claim-1", genesis_hash ‖ chain_id ‖ entry ‖ amount ‖ nonce ‖ to ‖ time ‖ r ‖ envelope)`.
-Validate, cheap before expensive:
-1. the chain has a `vesting` section, else `NOT_VESTING`;
-2. `to`'s key lengths (`KEM_EK_BYTES`), permanent;
-3. entry exists (`UnknownVesting`), `nonce == entry.nonce` (`BadNonce`);
-4. `amount > BUNDLE_BASE` (`AmountTooSmall`) and `amount ≤ vested(e, block_ts) − claimed`
-   (`NotYetVested { available }`) — **not permanent**: time cures it;
-5. signature (`BadSignature`, permanent);
-6. the derived note `cm = note(to.pk, amount − BUNDLE_BASE, asset 0, time, r)` is new
-   (`CommitmentExists`); `time` held to the bundle window like a mint's.
-
-Apply: `claimed += amount`, `nonce += 1`, append the deposit, credit the base,
-`supply.vesting_released += amount − BUNDLE_BASE`. `derived_commitment` gains the arm (the note is
-computable from the action alone), so the mempool's conflict index holds it.
-
-`to` is in the signed message, so the beneficiary picks the receiving wallet per claim and nobody
-relaying the transaction can redirect it.
-
-### 6.2 `RevokeVesting` = `Action` 25
-
-```rust
-RevokeVesting { entry: [u8; 32], unvested: u64, nonce: u64, to: ShieldedAddress,
-                time: u32, r: Word8, envelope: Envelope, signature: Signature }
-```
-
-Signed by `revoker` under
-`H("rand-vest-revoke-1", genesis_hash ‖ chain_id ‖ entry ‖ unvested ‖ nonce ‖ to ‖ time ‖ r ‖ envelope)`.
-
-The note's envelope is sealed for one exact amount, so the revoke names that amount itself:
-`unvested` is what the treasury takes. The true unvested part `u(t) = amount − vested(e, t)` only
-shrinks as blocks pass, so the CLI signs `unvested = u(tip_ts + margin)` (default margin 10 min);
-whatever vests between that point and the committing block stays with the beneficiary.
-
-Validate: a `vesting` section (`NOT_VESTING`); the entry exists; it has a revoker (`NotRevocable`,
-permanent); not yet revoked (`AlreadyRevoked`, permanent); `nonce == entry.nonce`;
-`BUNDLE_BASE < unvested ≤ u(block_ts)` (`RevokeExceedsUnvested { unvested_now }` — permanent in
-effect, since `u` only falls: re-sign with a smaller amount); signature; the derived note
-`note(to.pk, unvested − BUNDLE_BASE, asset 0, time, r)` is new.
-
-Apply: `revoked_at = block_ts`, `revoked_out = unvested`, `nonce += 1`, the note to `to`, the base
-to the proposer, `supply.vesting_released += unvested − BUNDLE_BASE`. From then on the entry is
-**frozen**: the beneficiary may claim up to `amount − revoked_out` in total, at once (whatever had
-vested plus the margin's worth), and not a unit more. A fully vested grant cannot be clawed back
-(`u ≤ BUNDLE_BASE` refuses every revoke).
-
-Both actions are added to `Action::blanked`, the `VARIANTS` table (24 → 26) and `tx_json`.
-Governance-style mempool bypass: no — they are ordinary priority.
-
-## 7. Supply audit
-
-Two counters, both monotonic, both in `Supply` and served by `rand_getSupply`:
-
-| counter | sums | moves |
-|---|---|---|
-| `genesis_vested` | `Σ entries.amount` | never after block 0 — **issuance**, like `genesis_staked` |
-| `vesting_released` | every claim or revoke note (net of the base) | a claim/revoke commits — value **entering** the pool, like `withdraw_deposited` |
-
-```
-pool_value     = … + vesting_released
-register_total = … + Σ_vesting (amount − claimed − revoked_out)
-                 (a claim/revoke's base lands in a proposer's `rewards`, already in Σ rewards)
-issued         = … + genesis_vested
-invariant:       total_supply == issued − slashed − registration_fees_burned   (unchanged)
-```
-
-`rand_getSupply` additionally reports `vesting_locked = Σ (amount − revoked_out − vested(e, head_ts))`
-(0 for a revoked entry) and `vesting_unclaimed = Σ (vested − claimed)`,
-so **circulating = pool_value** and the locked figure are both first-class numbers. All amounts are
-decimal strings (the v0.5 RPC rule).
+Off the positional `Supply` blob: `Audit::with_vesting(issued, released, in_register)` —
+`vesting_issued` is issuance, `vesting_released` enters `pool_value`, `vesting_in_register`
+(held, not bonded) is added to `total_supply`. `invariant_holds` is unchanged in form.
 
 ## 8. RPC and CLI
 
-- `rand_getVesting(id)` → the entry, `vested_now`, `claimable_now`, next unlock, `nonce`.
-- `rand_getVestingSummary()` → per class: entries, total, vested, claimed, revoked, locked.
-- `rand-node genesis --vesting <entries.json>` (the section is spliced before `init` prints the
-  hash — the `bridge: None` trap: the hash that matters is `init`'s on the finished file).
-- `rand-node vesting keygen --out <file>` (beneficiary/revoker Dilithium2 key; prints the public key).
-- `rand-node vesting status <id>`, `rand-node vesting claim --entry <id> --key <file> --to <rand1…>
-  [--amount <RAND>|--all]`, `rand-node vesting revoke --entry <id> --key <file> --to <rand1…>`.
-  Both wait for the commit (like `submit_staking`), `--no-wait` to opt out. Amount parsing reuses
-  the WAL-2 rule: the unit follows what was typed.
+`rand_getVesting [id, at_ms?]`, `rand_getVestingSummary []` (per class, no owners),
+`rand_getVestingSchedule [from, to, step]` (≤ 1 000 points: the aggregate lockup table),
+`rand_getSupply`'s `vesting_*`. CLI: `rand-node genesis --vesting FILE`, `rand-node vesting
+status|claim|revoke|bond|unbond`; keys are `rand-node keygen` files.
 
-## 9. Custody (operational, part of the design)
+## 9. Custody
 
-- **Beneficiaries generate their own key** (`vesting keygen` on their machine) and send only the
-  public key. The operator never holds an investor's or partner's key.
-- **Revoker key**: one per class is enough; held offline / on a hardware-backed signer, never in a
-  shell profile or on a droplet (the BRG-14 lesson). Its loss only removes the ability to revoke;
-  its theft lets an attacker claw back unvested grants **to an address of its choosing** — so it is
-  the highest-value key this feature creates. A 2-of-3 revoker (Dilithium multisig) is the natural
-  hardening; deferred, recorded.
-- A lost beneficiary key strands the entry's vested part forever (no rotation, D-out). The revoker
-  can still recover the unvested part.
+Holders generate their own keys and send only the public key. The revoker key is held offline or
+hardware-backed, never in a shell profile or on a droplet (the BRG-14 lesson); a 2-of-3 revoker is
+the planned hardening.
 
-## 10. Tests (red-first; quote the red in each commit)
+## 10. Rollout
 
-- `vested`: before the cliff (0), at `start+cliff` exactly, one ms before, midway, at and past
-  `start+duration`, `amount` near `u64::MAX` (u128 path), frozen after revoke.
-- Claim: over-claim refused `NotYetVested`, claim of exactly available accepted, replayed nonce
-  refused, wrong key refused, `to` substituted after signing refused, amount ≤ base refused,
-  duplicate commitment refused, claim on a chain without the section refused.
-- Revoke: no revoker → `NotRevocable`; double revoke; fully vested → `NothingToRevoke`; beneficiary
-  still claims the frozen part after a revoke and not a unit more; `unvested` above `u(block_ts)` refused;
-  `unvested` below it leaves the difference to the beneficiary (frozen total = `amount − unvested`).
-- Supply: `invariant_holds` through genesis → claim → revoke → claim, in replay too.
-- Genesis: every `BadVesting` reason; **chain 15's genesis hash and state roots unchanged** without
-  the section; a vesting genesis restarts with the `rand-state-6` gate restored.
-- Cluster (one test): a vesting entry with a 0 cliff and a short duration claims through a live
-  4-node cluster and the payout wallet scans the note.
-
-## 11. Rollout
-
-Genesis-gated and wire-additive (two enum variants appended), but only a cut can carry it: a new
-chain whose genesis lists the entries. Rehearse on a testnet cut with test keys and minute-scale
-schedules, then the mainnet v1.0 genesis. The mainnet entry file is built from the signed
-allocation table; the cut script prints `Σ amount` per class for sign-off before `init`.
+Genesis-gated and wire-additive, but only a cut can carry it. Rehearse on a testnet cut with test
+keys and minute-scale schedules (claim, revoke, bond, unbond, the lockup table), then the mainnet
+v1.0 genesis built from the signed allocation table, with the Schedule 2 §8 notice sent first.

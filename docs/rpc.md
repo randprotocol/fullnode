@@ -826,8 +826,15 @@ Params: `[]`. Result:
   "withdraw_deposited": "…", "fees_paid": "…", "burned": "…",
   "subsidised": "…", "sealed_blocks": "…", "aggregator_bonds": "…", "slashed": "…",
   "registration_fees_burned": "…",
+  "vesting_issued": "…", "vesting_released": "…", "vesting_in_register": "…", "vesting_locked": "…",
   "pool_value": "…", "register_total": "…", "total_supply": "…", "invariant_holds": true }
 ```
+
+The four `vesting_*` fields (genesis vesting, `docs/vesting.md`; `"0"` without a `vesting`
+section): what genesis issued into the vesting register, the notes claims and revokes released into
+the pool (inside `pool_value`), what the register still holds (inside `total_supply`; RAND bonded
+from it is a validator's `stake`, so in `register_total`), and what of it has not unlocked yet at the
+head. `vesting_issued` is issuance, on the identity's right beside `genesis_staked`.
 
 `registration_fees_burned` (v0.5.5, audit v5 TOK-2) is Σ of the registration fees burned under
 the genesis `tokens.burn_registration_fee` (`docs/tokens.md` §15): inside `burned` on the pool
@@ -854,6 +861,35 @@ two together, and `invariant_holds` is whether it still equals everything the ch
 every one of them by replaying the chain, which is what makes them auditable. `docs/supply.md`
 works the identity through a bond and a withdraw and says where it rests on a claim (the genesis
 file's own amounts) rather than on a check.
+
+### `rand_getVesting`
+Params: `[id, at_ms?]` — the entry's 64-hex id, and optionally the time to evaluate the schedule at
+(default: the head block's timestamp). Result, genesis vesting (`docs/vesting.md`):
+
+```json
+{ "id": "3f9a…", "class": "investor", "beneficiary": "<address>", "revocable": false, "revoker": null,
+  "amount": "18000000000000000", "start_ms": 1790000000000, "cliff_ms": 31104000000,
+  "linear_ms": 46656000000, "step_ms": 2592000000,
+  "claimed": "0", "revoked_out": "0", "revoked_at": null,
+  "bonded": "0", "bonded_to": null, "unbonding": [], "nonce": 0,
+  "vested_now": "0", "claimable_now": "0", "unvested_now": "18000000000000000", "as_of_ms": 1790000000000 }
+```
+
+Keys are served as their addresses. `claimable_now` is what a `claim_vested` may take: vested,
+unclaimed, and neither bonded nor still unbonding. `null` for an id the register does not hold;
+`{"enabled": false}` on a chain without a `vesting` section.
+
+### `rand_getVestingSummary`
+Params: `[]`. Result: `{ "enabled": true, "height", "as_of_ms", "entries", "issued", "released",
+"locked", "classes": [{ "class", "entries", "amount", "vested", "claimed", "revoked_out", "bonded",
+"locked" }] }` — only the classes that have entries, in the order team, investor, partner, other.
+No key or owner appears. `{"enabled": false}` without the section.
+
+### `rand_getVestingSchedule`
+Params: `[from_ms, to_ms, step_ms]`, at most 1 000 points (`-32602` otherwise). Result:
+`{ "enabled": true, "issued": "…", "points": [{ "t_ms": …, "locked": "…" }] }` — the register's
+locked total at `from_ms`, `from_ms + step_ms`, … `≤ to_ms`: the aggregate lockup table (SAFT
+Schedule 2 §3). Revokes already applied are counted; future ones cannot be.
 
 ### `rand_getVersion`
 Params: `[]`. Result:
@@ -1300,6 +1336,17 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-28 — genesis vesting (genesis-gated; on no chain yet)
+
+- **Four bundle-less actions** — `claim_vested`, `revoke_vesting`, `bond_vested`, `unbond_vested`
+  (`Action` 24–27, `docs/vesting.md`). `rand_getTransaction` renders each with its entry id (hex),
+  amount as a decimal string, nonce and, for a claim or a revoke, the note's `time`; a bond adds
+  the validator and whether it registers one.
+- **`rand_getVesting`, `rand_getVestingSummary`, `rand_getVestingSchedule`**: an entry, the
+  per-class totals, and the aggregate lockup table. `{"enabled": false}` without the section.
+- **`rand_getSupply` gains `vesting_issued`, `vesting_released`, `vesting_in_register`,
+  `vesting_locked`** (all `"0"` without the section); `invariant_holds` covers the register.
 
 ### 2026-09-27 — the bridge replay floor (C15-1, genesis-gated; not on chain 15)
 

@@ -116,6 +116,34 @@ chain and the operator housekeeping (dead `set_real_ip_from 159.89.185.254` on t
 `.bak` files loaded from `sites-enabled/`). **Trap:** a committed config file is not a running
 service — check `systemctl is-active` and `ss -ltn` before reasoning from one.
 
+### Genesis vesting — timelocked RAND for team / investors / partners (2026-09-28, `feat/timelock-genesis`, on no chain)
+
+Spec `docs/superpowers/specs/2026-09-28-genesis-vesting-design.md`, guide `docs/vesting.md`, plan
+`docs/superpowers/plans/2026-09-28-genesis-vesting.md`. A shielded note cannot be held back, so a
+locked allocation lives in a **public vesting register** seeded by a genesis `vesting` section
+(absent = every chain to date, byte-for-byte) and enters the pool only when claimed.
+
+- **Schedule = the SAFT's:** nothing until `start + cliff`, then `linear_ms` *after* the cliff,
+  continuous or in whole `step_ms` tranches at each step's end (12-month cliff + 18 monthly = months
+  13…30). Block timestamp, not height.
+- **Actions 24–27**, bundle-less, signed over the genesis hash, nonce per entry (mempool role 5):
+  `ClaimVested` (beneficiary; a note to the signed `to`, base to the proposer, like `Withdraw`),
+  `RevokeVesting` (revoker; an exact `unvested` amount to the treasury, entry frozen),
+  `BondVested`/`UnbondVested` (irrevocable entries only; locked RAND as a validator's stake, back to
+  the lock after `UNBONDING_EPOCHS`; the validator's own `Unbond` cannot reach it).
+- **State:** `Ledger::vesting`, root appended under **`rand-state-6`**, JSON under `META_VESTING`;
+  `reload_ledger` refuses a genesis/database mismatch. Supply counters are kept **off `Supply`**
+  (positional blob) via `Audit::with_vesting`. RPC `rand_getVesting [id, at_ms?]`,
+  `rand_getVestingSummary`, `rand_getVestingSchedule` (the owner-free lockup table), `rand_getSupply`
+  `vesting_*`. CLI `rand-node genesis --vesting`, `rand-node vesting status|claim|revoke|bond|unbond`.
+- **Trap found while building it:** the SAFT draft (`../termsheets/`) and the tokenomics paper
+  promise *bondable, non-revocable, in-circuit* time-locked notes; the first design (not bondable, all
+  revocable, accrual from `start`) would have broken SAFT §5.3/Schedule 2 §4 and §8. The user kept
+  the register and took the SAFT fixes; Schedule 2 needs its §8 amendment notice (per-entry amounts
+  public under a key) before any investor signs. Read the termsheets before changing lockup rules.
+- **Custody:** holders generate their own `rand-node keygen` key; the revoker key offline, never in a
+  shell profile. Recommended genesis choice: team revocable, investors/partners irrevocable.
+
 ### Chain 15 — LIVE 2026-09-26 13:05 UTC (genesis `cc30e085…`, build `dd2ccbe` = v0.5.8 + the chain-15 genesis work)
 
 Cut on the user's go after the registry-v8 remediation (CS6-1 guest provenance, ZKV-2 Poseidon2

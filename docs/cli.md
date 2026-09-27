@@ -161,6 +161,22 @@ payout wallet finds by scanning.
 `docs/staking.md` is the whole picture these three sit in: the register, the epochs, what each action
 publishes, and a worked join-and-leave.
 
+### `rand-node vesting status` / `claim` / `revoke` / `bond` / `unbond`
+
+Genesis vesting (`docs/vesting.md`) — a timelocked allocation's holder and revoker side, on a chain
+whose genesis carries a `vesting` section. The key is a `rand-node keygen` file; `address --key`
+prints the public key that goes into the genesis entry.
+
+| command | arguments | meaning |
+|---|---|---|
+| `vesting status <id>` | `--rpc` | the entry as `rand_getVesting` serves it |
+| `vesting claim` | `--entry <id>`, `--to <rand1…>`, `--amount <RAND>` or `--all`, `--key`, `--rpc`, `--no-wait` | pay what has unlocked into a note at `--to`, less the 0.001 RAND base; the beneficiary key signs, `--to` included |
+| `vesting revoke` | `--entry`, `--to <treasury rand1…>`, `--margin-secs` (600), `--key`, … | revoker key: pay the part still unvested `--margin-secs` past the head to `--to` and freeze the entry |
+| `vesting bond <RAND>` | `--entry`, `--validator <address>`, `--registration <hex>`?, `--key`, … | irrevocable entries: bond locked RAND as that validator's stake (a new validator needs what `rand-node register` printed) |
+| `vesting unbond <RAND>` | `--entry`, `--key`, … | take bonded RAND back into the lock; claimable again after the unbonding epochs |
+
+`rand-node genesis … --vesting VESTING.JSON` writes the section (format in `docs/vesting.md`).
+
 ### `rand-node aggregator register` / `unbond` / `withdraw` (chain 9)
 
 The validator trio's twins, one register over — the three actions an aggregator operator runs on

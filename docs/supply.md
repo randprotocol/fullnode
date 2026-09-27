@@ -70,6 +70,24 @@ and staked 4000:
 `issued` is 6000 throughout: a bond, an unbond, a withdraw and a fee move value between the two
 halves and never create or destroy any. Only a faucet mint moves `issued` at all.
 
+## Genesis vesting: the third half
+
+A chain whose genesis has a `vesting` section (`docs/vesting.md`) holds timelocked allocations in a
+third public register beside the validator register. It adds one kind of issuance and one crossing,
+kept off the positional `Supply` blob (so chain 14's and 15's stored counters keep their layout)
+and served by `rand_getSupply` as `vesting_*`:
+
+| number | what it is | on the identity |
+|---|---|---|
+| `vesting_issued` | Σ of the entries' amounts at genesis | issuance, beside `genesis_staked` |
+| `vesting_released` | the notes claims and revokes created, net of their bases | value **entering** the pool, beside `withdraw_deposited` |
+| `vesting_in_register` | Σ over entries of `amount − claimed − revoked_out − bonded` | the register's half of `total_supply` |
+
+A claim of 100 takes 100 out of the vesting register, puts a 99.999 note into the pool and the
+0.001 base into a proposer's `rewards` — the `Withdraw` shape. A bond from the lock moves value from
+the vesting register into a validator's `stake` (so into `register_total`), and an unbond moves it
+back; neither crosses the pool's boundary. `issued` moves only at genesis.
+
 ## Reading it
 
 ```bash

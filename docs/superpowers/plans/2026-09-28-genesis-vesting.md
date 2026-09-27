@@ -10,6 +10,11 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-28-genesis-vesting-design.md` (user guide `docs/vesting.md`).
 
+> **Revised during execution (2026-09-28, the SAFT check — spec §2):** the schedule fields are
+> `cliff_ms`/`linear_ms`/`step_ms` (linear after the cliff), Task 3 also carries `BondVested` (26) and
+> `UnbondVested` (27) for irrevocable entries, Task 4 adds `rand_getVestingSchedule`, and Task 5 has
+> no `vesting keygen` (a `rand-node keygen` file is the key). The task list below is the original.
+
 ## Global Constraints
 
 - A genesis without `vesting` builds, hashes and roots byte-for-byte as today: `chain_15s_genesis_file_still_builds_chain_15` and `the_genesis_hash_is_pinned` stay green untouched.
