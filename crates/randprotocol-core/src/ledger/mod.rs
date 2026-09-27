@@ -333,6 +333,12 @@ pub enum BlockError {
     /// non-canonical record. Refused beside the length check, before any transaction.
     #[error("pruned record for tx {tx} carries a non-canonical public value at word {index}")]
     NonCanonicalPrunedRecord { tx: Hash, index: usize },
+    /// INTERFACE-7: two side-table records under one proof hash. The table is collected into a
+    /// map keyed by proof hash, so the second silently replaced the first, and which record a
+    /// node stored, served and checked depended on nothing but the order a peer sent them in.
+    /// Refused before any transaction is read.
+    #[error("the side table carries two records for proof {proof_hash}")]
+    DuplicatePrunedRecord { proof_hash: Hash },
     /// At most one `Aggregate` per block (spec §3.4) is a block-validity rule, not proposer
     /// selection alone (the pre-v0.1 review's H1): the second is refused by index.
     #[error("a block carries at most one aggregate; a second is at tx {index}")]
@@ -2032,8 +2038,16 @@ impl Ledger {
                 return Err(BlockError::NonCanonicalPrunedRecord { tx: p.tx_hash, index });
             }
         }
-        scratch.pruned_side =
-            pruned.iter().map(|p| (p.proof_hash, (p.tx_hash, p.public_values.clone()))).collect();
+        // INTERFACE-7: one record per proof hash. Collected into a map, a second record under
+        // the same hash replaced the first without a word, and which one this node checked,
+        // stored and re-served was the sending peer's ordering.
+        let mut side = BTreeMap::new();
+        for p in pruned {
+            if side.insert(p.proof_hash, (p.tx_hash, p.public_values.clone())).is_some() {
+                return Err(BlockError::DuplicatePrunedRecord { proof_hash: p.proof_hash });
+            }
+        }
+        scratch.pruned_side = side;
         let mut receipts = Vec::new();
         let mut aggregate_seen = false;
         for (index, tx) in txs.iter().enumerate() {
@@ -4522,6 +4536,27 @@ mod tests {
             l.check_bundle_proof(&marker, b, &binding, &StubExecutor, false),
             Err(TxError::PrunedRecordMismatch("the record names another transaction"))
         );
+    }
+
+    /// INTERFACE-7 (recursion-VM review, dormant): a side table carrying two records under one
+    /// proof hash was collected into a map, the later silently replacing the earlier — so which
+    /// record a node checked, stored and served was the peer's ordering. Refused before any
+    /// transaction is read; one record per proof hash applies as before.
+    #[test]
+    fn a_side_table_with_a_duplicate_proof_hash_is_refused() {
+        let mut l = ledger();
+        let proposer = l.validators.keys().next().copied().unwrap();
+        let record = |tx: u8| crate::consensus::PrunedBundle {
+            tx_hash: Hash([tx; 32]),
+            proof_hash: Hash([2; 32]),
+            public_values: vec![7; crate::types::pv::NUM],
+            shape: crate::types::DeclaredShape { profile: crate::types::FriProfile::Test, tier: 14, program_log_height: 12, input_log_height: 10, keccak_log_height: 0, sha256_log_height: 0, public_log_height: 2, mem_log_height: 16 },
+        };
+        let err = l
+            .apply_transactions_for_sync(&[], &proposer, &BTreeMap::new(), &[record(1), record(3)], &StubExecutor, &NoVerified)
+            .expect_err("two records under one proof hash");
+        assert_eq!(err, BlockError::DuplicatePrunedRecord { proof_hash: Hash([2; 32]) });
+        assert!(l.apply_transactions_for_sync(&[], &proposer, &BTreeMap::new(), &[record(1)], &StubExecutor, &NoVerified).is_ok());
     }
 
     /// The rescan's ZKQ-4: the rVM absorbs a covered bundle's public values with
