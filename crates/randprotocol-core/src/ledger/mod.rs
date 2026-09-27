@@ -148,6 +148,15 @@ pub enum TxError {
     AmountTooLarge { amount: u64 },
     #[error("minter {0} is not a validator")]
     MinterNotValidator(Address),
+    /// The faucet minter has a row in the validator register but is not one of the chain's faucet
+    /// minters — the genesis validators, as node admission policy, or `staking.faucet_minters`
+    /// where a genesis lists them (the pre-release rescan's RESCAN-LEDGER-1). The register is
+    /// permissionless, and a bonded key is in the active set two epochs later, so neither a row
+    /// nor set membership may make a key a minter. Never a permanent admission verdict: as node
+    /// policy it is this build's rule rather than the bytes', and a forwarder running an older
+    /// node must not be penalised for relaying what its own node still admits.
+    #[error("minter {0} is not a faucet minter on this chain")]
+    MinterNotAllowed(Address),
     #[error("bad mint signature")]
     BadMintSignature,
     #[error("the mint's commitment does not open to its published note and amount")]

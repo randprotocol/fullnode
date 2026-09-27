@@ -185,6 +185,15 @@ One more optional field lets a testnet keep a faucet beside a bridge (chain 15):
   is about the transaction's own bytes against a genesis constant, so the node caches it as
   permanent. A tester outside the list is sent coins by a listed wallet, like anyone else.
 
+**Who may sign a faucet `Mint` (RESCAN-LEDGER-1).** The ledger's rule is a row in the validator
+register. A permissionless `Bond` writes that row at once, and the bonded key is in the active set
+`bond_activation_epochs + 1` epochs later, so neither bounds who mints: anyone with `MIN_STAKE`
+and one allowlisted wallet could register a key, mint each epoch's whole faucet budget to that
+wallet ahead of the operator (`FaucetBudgetExhausted`) and bond the proceeds. Every node since
+this fix pools and forwards a `Mint` only from a **genesis validator** (`MinterNotAllowed`, node
+policy, never cached); a validator bonded after genesis — the operator's included — cannot mint
+through the pool, and the operator mints through a genesis key.
+
 Not in v0.5.4: slashing (audit decision D8 — "it means nothing while stake is free").
 
 A node runs with `--validator` when it holds a validator key at all; being in the current set is a

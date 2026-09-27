@@ -1255,6 +1255,9 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // At most `MAX_VERIFY_IN_FLIGHT` verdicts can be outstanding — a worker only exists because the
     // loop counted it in — so the channel never has to hold more than that.
     let (verdicts_tx, verdicts_rx) = mpsc::channel(MAX_VERIFY_IN_FLIGHT);
+    // RESCAN-LEDGER-1: this pool admits faucet mints from the genesis's minters only.
+    let mut mempool = Mempool::new(10_000);
+    mempool.set_faucet_minters(admission::faucet_minters(&gs));
     let node = Node {
         cfg,
         gs,
@@ -1262,7 +1265,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         executor: executor.clone(),
         storage: storage.clone(),
         hs,
-        mempool: Mempool::new(10_000),
+        mempool,
         net: net.clone(),
         status: status.clone(),
         viewing,

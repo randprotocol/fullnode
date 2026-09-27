@@ -23,7 +23,7 @@ use randprotocol_core::ledger::tokens::TokenError;
 use randprotocol_core::notes::{word8_from_bytes, word8_to_hex};
 use randprotocol_core::{Action, Address, Hash, Ledger, Transaction, TxError, Word8};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
@@ -206,6 +206,10 @@ pub struct Mempool {
     /// places `txs` changes — so `info` reads it rather than summing the pool on the node loop.
     bytes: usize,
     max_size: usize,
+    /// The keys whose faucet `Mint`s this pool admits (`admission::faucet_minters`,
+    /// RESCAN-LEDGER-1), set once by the node from its genesis. `None` — a pool nobody configured,
+    /// every unit test's — is no policy, the ledger's rule alone.
+    faucet_minters: Option<BTreeSet<Address>>,
 }
 
 /// Every commitment `tx` claims: the ones it carries, plus the deposit `ledger` would derive for
@@ -241,7 +245,14 @@ impl Mempool {
             digests: HashMap::new(),
             bytes: 0,
             max_size,
+            faucet_minters: None,
         }
+    }
+
+    /// Admit faucet `Mint`s only from `minters` (`admission::faucet_minters`). The node calls this
+    /// once, with what its genesis names; the set never changes while the process runs.
+    pub fn set_faucet_minters(&mut self, minters: BTreeSet<Address>) {
+        self.faucet_minters = Some(minters);
     }
 
     pub fn len(&self) -> usize {
@@ -289,6 +300,9 @@ impl Mempool {
     ) -> Result<Hash, MempoolError> {
         let c = self.pool_conflicts(&tx, ledger, executor)?;
         ledger.validate(&tx, executor).map_err(MempoolError::Invalid)?;
+        // The faucet minter policy after the ledger's own verdict: this path runs no `precheck`,
+        // and it is the one a local `rand_mint` takes.
+        self.faucet_policy(&tx, ledger).map_err(MempoolError::Invalid)?;
         Ok(self.admit(tx, c))
     }
 
@@ -374,7 +388,19 @@ impl Mempool {
     ) -> Result<Claims, MempoolError> {
         let c = self.pool_conflicts(tx, ledger, executor)?;
         Self::applies(tx, &c.commitments, c.claim, ledger).map_err(MempoolError::Invalid)?;
+        self.faucet_policy(tx, ledger).map_err(MempoolError::Invalid)?;
         Ok(c)
+    }
+
+    /// RESCAN-LEDGER-1's admission policy (`admission::minter_not_allowed`) against this pool's
+    /// minter set, when the node configured one. Asked here and in [`Mempool::insert`] only, not
+    /// at every tip like [`Mempool::applies`]: the set is fixed for the process, so a mint that
+    /// passed once passes for as long as it is pooled.
+    fn faucet_policy(&self, tx: &Transaction, ledger: &Ledger) -> Result<(), TxError> {
+        match &self.faucet_minters {
+            Some(minters) => crate::admission::minter_not_allowed(tx, ledger, minters).map_or(Ok(()), Err),
+            None => Ok(()),
+        }
     }
 
     /// Insert a transaction whose proof has already been verified. Re-runs [`Mempool::precheck`],

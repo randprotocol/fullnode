@@ -152,8 +152,8 @@ impl randprotocol_core::VerifiedProofs for VerifiedSet {
 /// Is this verdict a function of the transaction's bytes alone?
 ///
 /// `UnknownAnchor`, `TimeOutOfWindow`, `Spent`, `CommitmentExists`, `UnknownProgram`,
-/// `MinterNotValidator`, `Bridge`, `AttestAssetMismatch`, `Staking` and `UnknownProposer` are
-/// all statements about *this node's state at this moment*: a node one block behind would
+/// `MinterNotValidator`, `MinterNotAllowed`, `Bridge`, `AttestAssetMismatch`, `Staking` and
+/// `UnknownProposer` are all statements about *this node's state at this moment*: a node one block behind would
 /// otherwise poison itself against transactions that are about to be valid.
 ///
 /// Two arms are worth spelling out, because neither is literally a property of the bytes on their
@@ -579,6 +579,41 @@ pub fn oversized_note(tx: &Transaction) -> Option<TxError> {
         }
         _ => None,
     }
+}
+
+/// The keys a faucet `Mint` may be signed by, as this node's admission policy: the genesis
+/// validators — the register a chain starts with, every key of it the operator's (RESCAN-LEDGER-1).
+///
+/// The ledger's rule is a row in the register, which a permissionless `Bond` writes at once, and
+/// the bonded key is in the active set `bond_activation_epochs + 1` epochs later; so neither is a
+/// bound on who mints, and on chain 15 a bonder holding one allowlisted wallet could drain each
+/// epoch's faucet budget to it ahead of the operator and bond the proceeds. A validator bonded
+/// after genesis — the operator's own included — cannot mint through this node's pool; the
+/// operator mints through a genesis key.
+pub fn faucet_minters(gs: &randprotocol_core::genesis::GenesisState) -> std::collections::BTreeSet<randprotocol_core::Address> {
+    gs.validators.iter().map(|v| v.address()).collect()
+}
+
+/// A faucet `Mint` whose minter has a row in the validator register but is not in `minters`
+/// ([`faucet_minters`]): `TxError::MinterNotAllowed`. `None` for everything else — including a
+/// minter with no row at all, which is the ledger's own `MinterNotValidator`, left to `validate`
+/// to answer in its order.
+///
+/// Node policy, not a validity rule, so the verdict is an `Ignore` and never cached
+/// ([`is_permanent`] leaves it out): a peer on an older build still admits the same bytes, and
+/// the peer that forwarded them must not wear a penalty for it. A key that is not a minter
+/// proposes no block of this pool's, and a chain whose genesis validators are all the operator's
+/// keeps every such mint out of every block once its nodes run this.
+pub fn minter_not_allowed(
+    tx: &Transaction,
+    ledger: &randprotocol_core::Ledger,
+    minters: &std::collections::BTreeSet<randprotocol_core::Address>,
+) -> Option<TxError> {
+    let randprotocol_core::Action::Mint { minter, .. } = &tx.action else {
+        return None;
+    };
+    let addr = minter.address();
+    (ledger.validators().contains_key(&addr) && !minters.contains(&addr)).then_some(TxError::MinterNotAllowed(addr))
 }
 
 /// The acceptance a verdict earns, and the cache entry it leaves behind.
@@ -1007,6 +1042,80 @@ mod tests {
         );
         assert_eq!(bucket.tokens, None, "a refused deposit spends none of the peer's allowance");
         assert_eq!(GossipOutcome::for_transaction(&fits, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
+    }
+
+    /// RESCAN-LEDGER-1: the ledger's `Mint` arm asks only for a row in the register, which a
+    /// permissionless `Bond` writes at once — and two epochs later (chain 15's
+    /// `bond_activation_epochs`) the bonded key is in the active set too, so neither is a bound on
+    /// who mints. The pool admits a faucet mint only from a genesis validator: the bonder, active
+    /// or not, is refused at the pre-screen, at `insert_verified` and at a local insert, with an
+    /// `Ignore` and no cache entry; a genesis validator's mint pools, and a key with no row still
+    /// hears the ledger's own `MinterNotValidator`.
+    #[test]
+    fn admission_refuses_a_faucet_mint_by_a_bonded_key_even_once_it_is_in_the_active_set() {
+        use crate::mempool::Mempool;
+        use crate::storage::fixtures;
+        use randprotocol_core::confidential::StubExecutor;
+        use randprotocol_core::ledger::staking::MIN_STAKE;
+        use randprotocol_core::ledger::{StakingConfig, ValidatorEntry};
+        use randprotocol_core::{Keypair, Ledger, Transaction, UNITS_PER_RAND};
+
+        let (operator, bonder, stranger) = (fixtures::key(1), fixtures::key(9), fixtures::key(10));
+        let gs = fixtures::genesis_of(1, &[&operator], Vec::new(), 10);
+        assert_eq!(faucet_minters(&gs), [operator.address()].into_iter().collect(), "the genesis validators");
+        // The register two epochs after the bonder's v2 `Bond`: its row active from epoch 3, and
+        // the ledger at epoch 3.
+        let row = |k: &Keypair, activation_epoch: u64, i: u8| {
+            let e = ValidatorEntry {
+                public_key: k.public_key().clone(),
+                stake: MIN_STAKE,
+                pending: Vec::new(),
+                rewards: 0,
+                payout: fixtures::payout(i),
+                nonce: 0,
+                activation_epoch,
+            };
+            (k.address(), e)
+        };
+        let register = [row(&operator, 0, 1), row(&bonder, 3, 9)].into_iter().collect();
+        let mut l = Ledger::new(1, fixtures::HC, register, &StubExecutor);
+        l.set_faucet(true);
+        l.set_epoch_blocks(10);
+        l.set_height(30);
+        l.set_staking(Some(StakingConfig {
+            faucet_budget_per_epoch: 10_000 * UNITS_PER_RAND,
+            bond_activation_epochs: 2,
+            ..Default::default()
+        }));
+        assert!(l.derive_next_set(l.epoch()).contains(&bonder.address()), "the bonder is an active validator");
+        let mint = |k: &Keypair, seed: u32| {
+            Transaction::mint(1, [seed; 8], 30, [seed + 1; 8], fixtures::env(3), 100 * UNITS_PER_RAND, k, &StubExecutor)
+        };
+        let attack = mint(&bonder, 40);
+        // The ledger alone admits it on a chain without `staking.faucet_minters` — the finding.
+        assert_eq!(l.validate(&attack, &StubExecutor), Ok(()));
+
+        let mut pool = Mempool::new(16);
+        pool.set_faucet_minters(faucet_minters(&gs));
+        let refusal = TxError::MinterNotAllowed(bonder.address());
+        assert_eq!(pool.precheck(&attack, &l, &StubExecutor).err(), Some(MempoolError::Invalid(refusal.clone())));
+        assert_eq!(pool.insert_verified(attack.clone(), &l, &StubExecutor), Err(MempoolError::Invalid(refusal.clone())));
+        assert_eq!(pool.insert(attack.clone(), &l, &StubExecutor), Err(MempoolError::Invalid(refusal.clone())));
+        // Not forwarded, nobody penalised, nothing cached.
+        assert!(!is_permanent(&refusal), "{refusal} is this node's policy, not the bytes'");
+        let mut refused = RefusedCache::new(4);
+        assert_eq!(acceptance_for_pool(&MempoolError::Invalid(refusal), attack.hash(), &mut refused), Acceptance::Ignore);
+        assert!(refused.is_empty());
+        // A key with no row is the ledger's verdict, in the ledger's order.
+        let unknown = mint(&stranger, 50);
+        assert_eq!(
+            pool.insert(unknown, &l, &StubExecutor),
+            Err(MempoolError::Invalid(TxError::MinterNotValidator(stranger.address())))
+        );
+        // A genesis validator's mint still pools.
+        let honest = mint(&operator, 60);
+        assert!(pool.precheck(&honest, &l, &StubExecutor).is_ok());
+        assert!(pool.insert(honest, &l, &StubExecutor).is_ok());
     }
 
     /// The shipped policy, pinned: 8192 entries against a 10 000-transaction pool, and a burst of 16
