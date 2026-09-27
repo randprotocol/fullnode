@@ -142,20 +142,33 @@ impl AggExecutor {
     /// `InnerShape::try_of` (a genesis file's heights are numbers this node did not choose —
     /// exactly what `try_of` is for) and the startup-derived preprocessed cap.
     fn inner_key(shape: &DeclaredShape) -> Result<InnerVerifierKey, ConfidentialError> {
-        let profile = zkvm_profile(shape.profile);
-        let s = InnerShape::try_of(
-            profile,
-            randprotocol_zkvm::machine::Tier(shape.tier as usize),
-            shape.program_log_height,
-            shape.input_log_height,
-            shape.keccak_log_height,
-            shape.sha256_log_height,
-            shape.public_log_height,
-            shape.mem_log_height,
-        )
-        .map_err(|e| ConfidentialError::BadDeclaredShape(format!("{e:?}")))?;
-        Ok(InnerVerifierKey { key: InnerKey::of(profile, &s), shape: s })
+        let s = inner_shape(shape)?;
+        Ok(InnerVerifierKey { key: InnerKey::of(zkvm_profile(shape.profile), &s), shape: s })
     }
+}
+
+/// The rVM's `InnerShape` for a declared shape, through the fallible `try_of`.
+fn inner_shape(shape: &DeclaredShape) -> Result<InnerShape, ConfidentialError> {
+    InnerShape::try_of(
+        zkvm_profile(shape.profile),
+        randprotocol_zkvm::machine::Tier(shape.tier as usize),
+        shape.program_log_height,
+        shape.input_log_height,
+        shape.keccak_log_height,
+        shape.sha256_log_height,
+        shape.public_log_height,
+        shape.mem_log_height,
+    )
+    .map_err(|e| ConfidentialError::BadDeclaredShape(format!("{e:?}")))
+}
+
+/// Whether the rVM can build an inner verifier key for an admitted shape — the half of the
+/// genesis check core cannot run (the interface review's IFACE-9: core's `check_aggregation`
+/// pins the bundle header, but only the node can name `InnerShape::try_of`). `rand-node
+/// genesis` runs it on every `--admitted-shape` before a hash is printed; a shape that fails it
+/// could never be verified against, so no aggregate could ever be admitted on the chain.
+pub fn check_admitted_shape(shape: &DeclaredShape) -> Result<(), ConfidentialError> {
+    inner_shape(shape).map(|_| ())
 }
 
 /// `randprotocol-core`'s ledger-side mirror enum to the machine's own (R6: the ledger never names a
@@ -521,6 +534,28 @@ mod tests {
         let proof = crafted_proof(&shape, &covered, &binding, admitted_tiers(FriProfile::Test)[0] as usize, flipped);
         assert!(ex.verify_aggregate(&shape, &covered, &proof, &binding).is_err());
         assert_eq!(ex.program_builds(), 1, "two digests and a verify: one build");
+    }
+
+    /// IFACE-9's node half: the core mirrors of the bundle header are the zkVM's own numbers, and
+    /// `check_admitted_shape` is `InnerShape::try_of` — the pinned header builds, a declared
+    /// height the zkVM refuses does not.
+    #[test]
+    fn the_bundle_header_mirrors_are_the_zkvms_and_an_unbuildable_shape_is_refused() {
+        assert_eq!(
+            randprotocol_core::types::BUNDLE_PUBLIC_LOG_HEIGHT,
+            randprotocol_zkvm::tables::public::public_log_height(randprotocol_core::types::TX_BINDING_WORDS),
+            "the transaction binding's public height"
+        );
+        let honest = DeclaredShape {
+            tier: randprotocol_core::types::BUNDLE_PROOF_TIER,
+            public_log_height: randprotocol_core::types::BUNDLE_PUBLIC_LOG_HEIGHT,
+            ..fixture_free_shape()
+        };
+        check_admitted_shape(&honest).expect("the pinned bundle header is buildable");
+        match check_admitted_shape(&DeclaredShape { mem_log_height: 60, ..honest }) {
+            Err(ConfidentialError::BadDeclaredShape(_)) => {}
+            other => panic!("an absurd mem height must not build, got {other:?}"),
+        }
     }
 
     /// Why the wrapper exists: the bare zkVM executor names its own refusal, so a miswired node

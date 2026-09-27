@@ -1780,7 +1780,7 @@ fn aggregation_node_with(
         input_log_height: 12,
         keccak_log_height: 0,
         sha256_log_height: 0,
-        public_log_height: 2,
+        public_log_height: crate::types::BUNDLE_PUBLIC_LOG_HEIGHT,
         mem_log_height: 18,
     };
     let cfg = AggregationConfig {
@@ -1977,7 +1977,7 @@ fn a_proposal_carrying_an_aggregate_applies_identically_on_proposer_and_peer() {
                     input_log_height: 12,
                     keccak_log_height: 0,
                     sha256_log_height: 0,
-                    public_log_height: 2,
+                    public_log_height: crate::types::BUNDLE_PUBLIC_LOG_HEIGHT,
                     mem_log_height: 18,
                 };
                 Some(

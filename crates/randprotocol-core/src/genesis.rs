@@ -1297,6 +1297,27 @@ fn check_aggregation(
             s.shape.profile
         ));
     }
+    // And every admitted shape must be the bundle header a chain actually accepts (the interface
+    // review's IFACE-9): the one bundle tier, no keccak or sha256 table, and the transaction
+    // binding's public height — the header `decode_and_check` pins on every bundle proof. Any
+    // other shape registers one no committed bundle can ever match, so aggregation would be dead
+    // on a chain that believes it has it (chain 9's `public 2` was that, after the binding fork).
+    // Whether the rVM can build an inner verifier key for the shape (`InnerShape::try_of`) is the
+    // node's to check — core cannot name the rVM — and `rand-node genesis` does, at the cut.
+    for s in &cfg.admitted_shapes {
+        let d = &s.shape;
+        let pinned: [(&str, u8, u8); 4] = [
+            ("tier", d.tier, crate::types::BUNDLE_PROOF_TIER),
+            ("keccak_log_height", d.keccak_log_height, 0),
+            ("sha256_log_height", d.sha256_log_height, 0),
+            ("public_log_height", d.public_log_height, crate::types::BUNDLE_PUBLIC_LOG_HEIGHT),
+        ];
+        if let Some((field, got, want)) = pinned.into_iter().find(|(_, got, want)| got != want) {
+            return bad(format!(
+                "an admitted shape declares {field} {got}; every bundle proof declares {want}, so no bundle could match it"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1536,14 +1557,15 @@ mod tests {
         let with = |profile: FriProfile, chain: &str| {
             let mut g = base_genesis();
             g.fri_profile = chain.into();
+            // The pinned bundle header (IFACE-9), so only the profile differs.
             let shape = DeclaredShape {
                 profile,
-                tier: 21,
+                tier: crate::types::BUNDLE_PROOF_TIER,
                 program_log_height: 12,
                 input_log_height: 10,
                 keccak_log_height: 0,
                 sha256_log_height: 0,
-                public_log_height: 2,
+                public_log_height: crate::types::BUNDLE_PUBLIC_LOG_HEIGHT,
                 mem_log_height: 16,
             };
             g.aggregation = Some(AggregationConfig {
@@ -1569,6 +1591,61 @@ mod tests {
         );
         let e = with(FriProfile::Production, "test").unwrap_err();
         assert!(matches!(&e, GenesisError::BadAggregationConfig(m) if m.contains("profile")), "{e}");
+    }
+
+    /// The interface review's IFACE-9 (VERIFIER-2, node side): an admitted shape was checked for
+    /// its digest and its profile, never against the bundle header every coverable bundle
+    /// carries — tier [`BUNDLE_PROOF_TIER`], no keccak or sha256 table, the transaction binding's
+    /// public height ([`crate::types::BUNDLE_PUBLIC_LOG_HEIGHT`]). A genesis admitting any other
+    /// shape registers one no bundle can match: aggregation dead on a chain that believes it
+    /// has it (chain 9's `public 2` was exactly that after the binding fork). Refused here, by
+    /// name.
+    ///
+    /// [`BUNDLE_PROOF_TIER`]: crate::types::BUNDLE_PROOF_TIER
+    #[test]
+    fn an_admitted_shape_must_be_the_pinned_bundle_header() {
+        use crate::ledger::aggregation::{AdmittedShape, AggregationConfig};
+        use crate::types::{DeclaredShape, FriProfile};
+        let honest = DeclaredShape {
+            profile: FriProfile::Production,
+            tier: crate::types::BUNDLE_PROOF_TIER,
+            program_log_height: 12,
+            input_log_height: 10,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: crate::types::BUNDLE_PUBLIC_LOG_HEIGHT,
+            mem_log_height: 16,
+        };
+        let with = |shape: DeclaredShape| {
+            let mut g = base_genesis();
+            g.fri_profile = "production".into();
+            g.aggregation = Some(AggregationConfig {
+                bond: 1_000,
+                max_covers: 3,
+                subsidy_base: 100,
+                halving_blocks: 210_000,
+                window: 256,
+                admitted_shapes: vec![AdmittedShape {
+                    shape,
+                    hc: Hash::digest(b"the bundle guest"),
+                    aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap(),
+                }],
+            });
+            g.validate()
+        };
+        assert!(with(honest).is_ok(), "the pinned header is admissible");
+        for (field, bad) in [
+            ("keccak", DeclaredShape { keccak_log_height: 12, ..honest }),
+            ("sha256", DeclaredShape { sha256_log_height: 12, ..honest }),
+            ("tier", DeclaredShape { tier: 21, ..honest }),
+            ("public", DeclaredShape { public_log_height: 2, ..honest }),
+        ] {
+            let e = with(bad).unwrap_err();
+            assert!(
+                matches!(&e, GenesisError::BadAggregationConfig(m) if m.contains(field)),
+                "a shape with a non-bundle {field} was accepted: {e}"
+            );
+        }
     }
 
     /// Core I-2. On a chain with a `tokens` section an alloc commitment is no longer opaque:

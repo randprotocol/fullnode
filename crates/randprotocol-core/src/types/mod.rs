@@ -39,6 +39,18 @@ pub struct DeclaredShape {
     pub mem_log_height: u8,
 }
 
+/// The one tier a bundle proof may declare — `randprotocol_zkvm::executor`'s `BUNDLE_TIER`
+/// (zkvm I1: every witness of the hidden-asset guest lands at tier 14, at every FRI profile),
+/// mirrored because core cannot name the zkVM. An admitted aggregation shape must carry it
+/// (the interface review's IFACE-9): no bundle a chain accepts can have another.
+pub const BUNDLE_PROOF_TIER: u8 = 14;
+
+/// The one public-table height a bundle proof may declare: the transaction binding's
+/// ([`TX_BINDING_WORDS`] words) `public_log_height`, pinned by `decode_and_check` since the
+/// transaction binding (Task 5b). Mirrored like [`BUNDLE_PROOF_TIER`]; the node's
+/// `agg_executor` tests pin mirror == the zkVM's own function.
+pub const BUNDLE_PUBLIC_LOG_HEIGHT: u8 = 4;
+
 /// What admission needs of a covered bundle and nothing more (spec §4 steps 6–7): its 34
 /// public values in `pv` order and its declared shape.
 #[derive(Clone, PartialEq, Eq, Debug)]

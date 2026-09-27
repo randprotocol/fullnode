@@ -778,10 +778,16 @@ async fn main() -> Result<()> {
                                 // The literal `hc_bundle` means this build's pinned guest
                                 // digest — the only value a chain-9 genesis may take, so the
                                 // flag cannot quietly carry a stale one.
-                                parse_admitted_shape(&s.replace(
+                                let admitted = parse_admitted_shape(&s.replace(
                                     ",hc_bundle,",
                                     &format!(",{},", word8_to_hex(&ZkExecutor::hc_bundle())),
-                                ))
+                                ))?;
+                                // The half of the genesis check core cannot run (IFACE-9): the
+                                // rVM must be able to build an inner verifier key for the shape,
+                                // or no aggregate could ever be verified against it.
+                                randprotocol_node::agg_executor::check_admitted_shape(&admitted.shape)
+                                    .map_err(|e| anyhow::anyhow!("--admitted-shape {s}: {e}"))?;
+                                Ok(admitted)
                             })
                             .collect::<Result<Vec<_>>>()?;
                         Some(cfg)
@@ -1473,8 +1479,9 @@ mod tests {
             other => panic!("a Production shape on a test chain must be refused, got {other:?}"),
         }
         // And the real thing builds, with the register empty and the gated root — at the chain's
-        // own profile (tier 19 is the test profile's admitted tier).
-        let test_shape = parse_admitted_shape(&format!("test,19,12,10,0,0,2,16,{hc_hex},{digest_hex}")).unwrap();
+        // own profile and the pinned bundle header (IFACE-9: the inner tier 14, the binding's
+        // public height 4; 19 is an rVM *aggregate* tier, never a bundle's).
+        let test_shape = parse_admitted_shape(&format!("test,14,12,10,0,0,4,16,{hc_hex},{digest_hex}")).unwrap();
         cfg.admitted_shapes = vec![test_shape];
         let mut g2 = pinned_genesis();
         g2.aggregation = Some(cfg);

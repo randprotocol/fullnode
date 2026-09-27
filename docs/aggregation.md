@@ -234,5 +234,13 @@ that fork matches the chain-9 shape. Aggregation is inactive on every chain and 
 without it; re-measure the admitted shape (and the recursion fixtures) before any chain is cut
 with an `aggregation` section.
 
+**Enforced at genesis (2026-09-28, IFACE-9).** `Genesis::validate` now refuses an admitted shape
+that is not the bundle header every accepted bundle carries — tier 14, no keccak or sha256 table,
+public height 4 (`BUNDLE_PROOF_TIER`, `BUNDLE_PUBLIC_LOG_HEIGHT` in core, pinned to the zkVM's
+own numbers by an `agg_executor` test) — and `rand-node genesis` refuses one the rVM cannot build
+an inner verifier key for (`InnerShape::try_of`, via `agg_executor::check_admitted_shape`).
+`deploy/cut-chain9-genesis.sh`'s default public height is 4 accordingly; the program, input and
+mem heights are still the re-measurement above.
+
 Related: `docs/block-space.md` (the numbers and the three remedies), `docs/fees.md`,
 `docs/supply.md`, `docs/staking.md`, `docs/zkvm.md`.

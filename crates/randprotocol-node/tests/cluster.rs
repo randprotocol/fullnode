@@ -1731,7 +1731,9 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
         input_log_height: 10,
         keccak_log_height: 0,
         sha256_log_height: 0,
-        public_log_height: 2,
+        // The transaction binding's height (IFACE-9: `Genesis::validate` refuses any other);
+        // the rest of the shape is the re-measurement the ignore names.
+        public_log_height: randprotocol_core::types::BUNDLE_PUBLIC_LOG_HEIGHT,
         mem_log_height: 16,
     };
     let hc = Hash(randprotocol_core::notes::word8_to_bytes(&ZkExecutor::hc_bundle()));

@@ -53,7 +53,9 @@ SHAPE_PROGRAM=${SHAPE_PROGRAM:-12}
 SHAPE_INPUT=${SHAPE_INPUT:-10}
 SHAPE_KECCAK=${SHAPE_KECCAK:-0}
 SHAPE_SHA256=${SHAPE_SHA256:-0}
-SHAPE_PUBLIC=${SHAPE_PUBLIC:-2}
+# The transaction binding's public height (8 words → 4) since the binding fork: `Genesis::validate`
+# refuses any other (IFACE-9, 2026-09-28), as it refuses a tier other than 14 or a hash table.
+SHAPE_PUBLIC=${SHAPE_PUBLIC:-4}
 SHAPE_MEM=${SHAPE_MEM:-16}
 # The keyword `hc_bundle` means "this build's pinned bundle guest digest": the genesis command
 # substitutes it, so the cut cannot carry a stale hc from a stale note. It is the only value a
