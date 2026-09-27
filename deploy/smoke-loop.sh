@@ -48,7 +48,7 @@ while true; do
 
   # 2. transfer (proved bundle)
   to=$("$BIN/rand" --key "$W2" address)
-  t0=$(date +%s); out=$("$BIN/rand" send "$to" 1.5 --key "$W1" --rpc "$RPC" 2>&1); h=$(submitted "$out" transfer)
+  t0=$(date +%s); out=$("$BIN/rand" send "$to" 1.5 --yes --key "$W1" --rpc "$RPC" 2>&1); h=$(submitted "$out" transfer)
   if [ -n "$h" ] && body=$(explorer_tx "$h" transfer); then
     nf=$(grep -o '"nullifiers":\[[^]]*\]' <<<"$body" | head -1 | cut -c15-30)
     log "round $round transfer ok $h (proved+committed in $(( $(date +%s) - t0 )) s, bundle nullifiers ${nf}...)"

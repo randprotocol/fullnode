@@ -542,7 +542,7 @@ old build's `bin-<sha>/`.
 
 ```bash
 rand --key wallets/shielded-1.key.json balance      # scans the tree; 1000 RAND at genesis
-rand --key wallets/shielded-1.key.json send "$(rand --key wallets/shielded-2.key.json address)" 1.5
+rand --key wallets/shielded-1.key.json send "$(rand --key wallets/shielded-2.key.json address)" 1.5 --yes
 rand faucet "$(rand --key wallets/shielded-3.key.json address)"
 rand --key wallets/shielded-1.key.json program build --guest private_payment --arg 1000 --out pp.json
 rand --key wallets/shielded-1.key.json program deploy pp.json

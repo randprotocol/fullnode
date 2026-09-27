@@ -12,6 +12,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use randprotocol_client::governance;
+use randprotocol_client::memo_display;
 use randprotocol_client::wallet::{self, NoteStore, Wallet};
 use randprotocol_client::RpcClient;
 use randprotocol_client::wallet::{Burn, Submission};
@@ -723,6 +724,24 @@ fn contact_name_for(contacts: &Contacts, pk: &Word8) -> Option<String> {
     })
 }
 
+/// Ask `question [y/N]` and go on only on `y`. A stdin that is not a terminal (a script, a pipe,
+/// `</dev/null`) can answer nothing, so it is refused up front with the flag that skips the
+/// question — never read as a silent "no" (final review B1).
+fn confirm(question: &str, verb: &str, declined: &str) -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("stdin is not a terminal: pass --yes to {verb} without confirmation");
+    }
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    if !line.trim().eq_ignore_ascii_case("y") {
+        anyhow::bail!("{declined}");
+    }
+    Ok(())
+}
+
 /// The wallet, where its note store lives, and the store itself.
 fn open_wallet(key: &Path) -> Result<(Wallet, PathBuf, NoteStore)> {
     let w = Wallet::load(key)?;
@@ -869,8 +888,10 @@ async fn main() -> Result<()> {
         }
         Cmd::Address { uri, amount, asset, memo, qr, qr_png } => {
             let a = Wallet::load(&cli.key)?.address;
+            // stdout is exactly the address (and the link/QR asked for), so `$(rand address)`
+            // works in a script; the fingerprint is for the person reading, on stderr.
             println!("{a}");
-            println!("fingerprint {}", a.fingerprint());
+            eprintln!("fingerprint {}", a.fingerprint());
             let u = PaymentUri { address: a, amount, asset, memo };
             let text = u.format();
             // Round-trips through the same parser a payee's wallet uses, so a bad `--amount` or
@@ -884,7 +905,7 @@ async fn main() -> Result<()> {
             }
             if let Some(path) = qr_png {
                 randprotocol_client::qr::png(&text, &path)?;
-                println!("wrote {}", path.display());
+                eprintln!("wrote {}", path.display());
             }
         }
         Cmd::Contacts { op } => {
@@ -899,13 +920,7 @@ async fn main() -> Result<()> {
                     };
                     println!("fingerprint {}", addr.fingerprint());
                     if !yes {
-                        print!("add {name}? [y/N] ");
-                        std::io::stdout().flush()?;
-                        let mut line = String::new();
-                        std::io::stdin().read_line(&mut line)?;
-                        if !line.trim().eq_ignore_ascii_case("y") {
-                            anyhow::bail!("not added");
-                        }
+                        confirm(&format!("add {}?", memo_display::sanitize(&name)), "add", "not added")?;
                     }
                     c.add(&name, &addr)?;
                     c.save(&cli.key)?;
@@ -1096,13 +1111,7 @@ async fn main() -> Result<()> {
             let name_part = name.as_ref().map(|n| format!("{n} · ")).unwrap_or_default();
             println!("to {name_part}fingerprint {} · {amount_text} {asset_label} · memo \"{memo_text}\"", to.fingerprint());
             if !yes {
-                print!("send? [y/N] ");
-                std::io::stdout().flush()?;
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-                if !line.trim().eq_ignore_ascii_case("y") {
-                    anyhow::bail!("not sent");
-                }
+                confirm("send?", "send", "not sent")?;
             }
             let fee = match fee { Some(f) => parse_amount(&f)?, None => gas::BUNDLE_BASE };
             if is_rand {
