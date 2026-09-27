@@ -53,6 +53,13 @@ fn alloc_note_units(amount: &str, asset: u32) -> Result<u64> {
     Ok(rand_units / shift)
 }
 
+/// `rand-node alloc-note`: the amount in its display units, sealed in the envelope format the
+/// genesis's `envelope_bytes` names (`--envelope-bytes`), legacy when it names none.
+fn alloc_note_cmd(to: &str, amount: &str, asset: u32, envelope_bytes: Option<u32>) -> Result<GenesisNote> {
+    let amount = alloc_note_units(amount, asset)?;
+    alloc_note(to, amount, asset, EnvelopeFormat::for_chain(envelope_bytes))
+}
+
 fn alloc_note(addr: &str, amount: u64, asset: u32, format: EnvelopeFormat) -> Result<GenesisNote> {
     let to = ShieldedAddress::parse(addr).with_context(|| format!("{addr} is not a shielded address"))?;
     seal_deposit(&to, &Note::new(to.pk, [0; 8], amount, asset, 0), format)
@@ -724,9 +731,7 @@ async fn main() -> Result<()> {
             );
         }
         Cmd::AllocNote { to, amount, asset, envelope_bytes } => {
-            let amount = alloc_note_units(&amount, asset)?;
-            let format = EnvelopeFormat::for_chain(envelope_bytes);
-            println!("{}", serde_json::to_string_pretty(&alloc_note(&to, amount, asset, format)?)?);
+            println!("{}", serde_json::to_string_pretty(&alloc_note_cmd(&to, &amount, asset, envelope_bytes)?)?);
         }
         Cmd::Init { datadir, genesis } => {
             std::fs::create_dir_all(&datadir)?;
@@ -1393,6 +1398,45 @@ mod tests {
         assert_eq!(built.ledger.max_call_envelope_bytes(), 65_536);
         assert_eq!(built.ledger.max_program_public_words(), 32_768);
         assert_ne!(built.hash(), pinned_genesis().build(&ZkExecutor::new(FriProfile::Test)).unwrap().hash());
+    }
+
+    /// `rand-node alloc-note --envelope-bytes 1860` seals its note at exactly 1 860 bytes — the
+    /// size a genesis carrying `envelope_bytes` demands of every alloc note — and without the
+    /// flag at the legacy size (final review B4). The owner opens it either way.
+    #[test]
+    fn alloc_note_with_envelope_bytes_seals_at_1860() {
+        use randprotocol_core::notes::MEMO_ENVELOPE_BYTES;
+        let cli = Cli::try_parse_from(["rand-node", "alloc-note", "--to", "rand1x", "--amount", "5", "--envelope-bytes", "1860"]).unwrap();
+        let Cmd::AllocNote { envelope_bytes, .. } = cli.cmd else { unreachable!() };
+        assert_eq!(envelope_bytes, Some(1860));
+        let payee = SpendKey([0x16; 8]);
+        let to = randprotocol_zkvm::address::address_of(&payee.viewing_key());
+        for (flag, len) in [(Some(1860u32), MEMO_ENVELOPE_BYTES), (None, 1348)] {
+            let note = alloc_note_cmd(&to.to_string(), "5", 0, flag).unwrap();
+            let envelope = note.envelope.to_envelope().unwrap();
+            assert_eq!(envelope.len(), len, "--envelope-bytes {flag:?}");
+            let cm = randprotocol_core::notes::word8_from_hex(&note.cm).unwrap();
+            let (_, opened) = randprotocol_zkvm::address::envelope_from_core(&envelope)
+                .open_as_receiver(cm, &payee.viewing_key())
+                .expect("the owner opens it");
+            assert_eq!(opened.amount, 5 * UNITS_PER_RAND);
+        }
+    }
+
+    /// A node-sealed withdraw/payout note (`withdraw`, `aggregator withdraw`, `aggregate`) on a
+    /// chain whose genesis sets `envelope_bytes` is sealed at exactly 1 860 bytes — the ledger
+    /// refuses any other size there — carries no memo, and still opens for the payee.
+    #[test]
+    fn a_node_sealed_withdraw_note_in_the_memo_format_is_1860_bytes() {
+        use randprotocol_core::notes::MEMO_ENVELOPE_BYTES;
+        let payee = SpendKey([0x17; 8]);
+        let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
+        let (note, envelope) = sealed_withdraw_note(&payout, 3 * UNITS_PER_RAND, 2026, EnvelopeFormat::Memo).unwrap();
+        assert_eq!(envelope.len(), MEMO_ENVELOPE_BYTES);
+        let (_, opened) = randprotocol_zkvm::address::envelope_from_core(&envelope)
+            .open_as_receiver(note.commitment(), &payee.viewing_key())
+            .expect("the payout wallet opens it");
+        assert_eq!(opened, note);
     }
 
     /// `rand-node genesis --envelope-bytes 1860` writes the field, and reaches the `--alloc`
