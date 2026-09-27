@@ -353,7 +353,9 @@ fn a_call_with_a_keccak_height_past_the_call_cap_is_refused_before_verify() {
     let m = Machine::new(FriProfile::Test);
     // Tier 12, so the tier's own bound (`klh <= t + 5`) admits the height the cap refuses.
     let (mut proof, _) = m.prove(&p, &[], &[], Some(Tier(12))).unwrap();
-    assert_eq!(proof.keccak_log_height, 5, "one permutation fits the minimum block");
+    // One block, floored at 128 rows by the prover's private-data floor (circuits COV-2 / INT-6;
+    // was 5) — still far under the call cap, so the honest header verifies below.
+    assert_eq!(proof.keccak_log_height, 7, "one permutation, floored at 128 rows");
     let over = MAX_CALL_KECCAK_LOG_HEIGHT + 1;
     assert!(
         over <= Tier(12).max_keccak_log_height().min(randprotocol_zkvm::tables::keccak::MAX_LOG_HEIGHT),
@@ -386,7 +388,8 @@ fn a_call_with_a_sha256_height_past_the_call_cap_is_refused_before_verify() {
     let rec = record(&p);
     let m = Machine::new(FriProfile::Test);
     let (mut proof, _) = m.prove(&p, &[], &[], Some(Tier(12))).unwrap();
-    assert_eq!(proof.sha256_log_height, 6, "one compression fills the minimum block");
+    // One block plus one padding block since the private-data floor (COV-2 / INT-6; was 6).
+    assert_eq!(proof.sha256_log_height, 7, "one compression, floored at 128 rows");
     let over = MAX_CALL_SHA256_LOG_HEIGHT + 1;
     assert!(over <= Tier(12).max_sha256_log_height(), "the test needs a height only the call cap refuses");
     ex.verify_call(&rec, &proof.to_bytes()).expect("the honest header verifies");

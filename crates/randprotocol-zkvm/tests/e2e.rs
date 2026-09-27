@@ -93,7 +93,9 @@ fn keccak_demo_proves_and_verifies_at_tier_10() {
     let t0 = std::time::Instant::now();
     let (proof, _) = m.prove_salted(&p, &[], &[], [1, 2, 3, 4], Some(Tier(10))).unwrap();
     let prove_time = t0.elapsed();
-    assert_eq!(proof.keccak_log_height, 5, "one permutation fits the minimum block");
+    // One permutation is one 32-row block, floored at 128 rows by the private-data floor (audit
+    // COV-2 / INT-6; was 5).
+    assert_eq!(proof.keccak_log_height, 7, "one permutation, floored at 128 rows");
     // M4.2 (Task 6): a proof that *does* call `KECCAK` carries the keccak instance — the ninth
     // of the ten this batch has since constraint set 6 appended the mandatory `public` one.
     assert_eq!(proof.batch.degree_bits.len(), 10, "ten tables when the keccak table is present");
@@ -253,7 +255,8 @@ fn enough_keccak_permutations_raise_the_declared_memory_height_past_the_floor() 
 /// `SYS_SHA256` cpu row, the sha256 chip's 64 rounds and its own 32 `MEMORY` accesses, the
 /// proof-declared sha256 height — checked against the host `sha256::sha256` for the same
 /// message. One 55-byte message is one padded 512-bit block, i.e. exactly one compression, so
-/// `sha256_log_height` sits at its floor of 6 (one 64-row block).
+/// `sha256_log_height` would sit at its one-block floor of 6 — and declares 7 since audit COV-2 /
+/// INT-6's private-data floor (one real 64-row block, one padding block).
 #[test]
 fn sha256_demo_proves_and_verifies_with_one_sha256_block() {
     let m = Machine::new(FriProfile::Test);
@@ -279,7 +282,7 @@ fn sha256_demo_proves_and_verifies_with_one_sha256_block() {
     let (proof, _) = m.prove_salted(&p, &[], &[], [1, 2, 3, 4], None).unwrap();
     let prove_time = t0.elapsed();
     assert_eq!(proof.tier, Tier(10));
-    assert_eq!(proof.sha256_log_height, 6, "one compression fills the minimum block exactly");
+    assert_eq!(proof.sha256_log_height, 7, "one compression, floored at 128 rows (COV-2 / INT-6)");
     assert_eq!(proof.keccak_log_height, 0, "and it calls no KECCAK, so that table is absent");
     // Ten instances: the nine every proof carries (constraint set 6's mandatory `public` table
     // included) plus the sha256 chip. The keccak chip is the one that is absent here — sha256
@@ -490,7 +493,7 @@ fn measure_production_profile_at_tier_10_and_12() {
     let t0 = std::time::Instant::now();
     let (proof, _) = m.prove(&p, &[], &[], Some(Tier(10))).unwrap();
     let prove_time = t0.elapsed();
-    assert_eq!(proof.keccak_log_height, 5);
+    assert_eq!(proof.keccak_log_height, 7, "one block, floored at 128 rows (COV-2 / INT-6)");
     let t1 = std::time::Instant::now();
     m.verify(&p.digest(), &proof).unwrap();
     println!("tier 10 with a keccak table: proof size = {} bytes, prove = {:?}, verify = {:?}", proof.size(), prove_time, t1.elapsed());
@@ -541,7 +544,9 @@ fn compiled_keccak256_matches_the_host_in_one_permutation() {
     let t0 = std::time::Instant::now();
     let (proof, _) = m.prove_salted(&p, &inputs, &[], [5, 6, 7, 8], None).unwrap();
     let prove_time = t0.elapsed();
-    assert_eq!(proof.keccak_log_height, 5, "one permutation fits the minimum block");
+    // One permutation is one 32-row block, floored at 128 rows by the private-data floor (audit
+    // COV-2 / INT-6; was 5).
+    assert_eq!(proof.keccak_log_height, 7, "one permutation, floored at 128 rows");
     let t1 = std::time::Instant::now();
     m.verify(&p.digest(), &proof).unwrap();
     eprintln!(

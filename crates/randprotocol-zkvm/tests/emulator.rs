@@ -506,3 +506,21 @@ fn the_two_segments_are_independent_spaces() {
     // Same index, different spaces, different words.
     assert_eq!(execute(&p, &[900], &[400], 10_000).unwrap().outputs[0], 500);
 }
+
+/// Audit ZKH-3, pinned as documented behaviour rather than fixed: the `POSEIDON2` sponge is
+/// `PaddingFreeSponge` in overwrite mode from the zero state, so inside the first 4-word rate
+/// block a trailing zero and an absent word are the same message. Past the first block a short
+/// final chunk leaves the permuted lanes in place and the collision is gone — which is why the
+/// guidance (`docs/01-isa.md`, "`POSEIDON2` does not pad") is to length-prefix variable-length
+/// data, not to avoid the syscall.
+#[test]
+fn poseidon2_trailing_zeros_in_the_first_block_collide() {
+    use randprotocol_zkvm::hash::sponge_hash;
+    let a = 0xdead_beef;
+    assert_eq!(sponge_hash(&[a]), sponge_hash(&[a, 0]));
+    assert_eq!(sponge_hash(&[a]), sponge_hash(&[a, 0, 0, 0]));
+    // A second block breaks it: the fifth word is absorbed over permuted lanes, not zeros.
+    assert_ne!(sponge_hash(&[a, 1, 2, 3, 4]), sponge_hash(&[a, 1, 2, 3, 4, 0]));
+    // And the length prefix the docs recommend separates the first-block pair.
+    assert_ne!(sponge_hash(&[1, a]), sponge_hash(&[2, a, 0]));
+}

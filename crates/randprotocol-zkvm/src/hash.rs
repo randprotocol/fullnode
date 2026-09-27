@@ -72,6 +72,11 @@ pub fn split_digest(elems: [Val; 4]) -> [u32; 8] {
 /// `PaddingFreeSponge<_, 8, 4, 4>` semantics, matching `p3_symmetric::sponge::PaddingFreeSponge`
 /// exactly, empty input included: `sponge_hash(&[])` performs no permutation and returns the
 /// all-zero digest), returning the 8 lo/hi digest words.
+///
+/// No padding means no length binding (audit ZKH-3): the zero initial state plus overwrite-mode
+/// absorption make `[a]` and `[a, 0]` — any message of at most four words and its zero-extension
+/// within that first block — the same digest. Callers with variable-length data must encode the
+/// length themselves (`docs/01-isa.md`, "`POSEIDON2` does not pad").
 pub fn sponge_hash(msg: &[u32]) -> [u32; 8] {
     let sponge = PaddingFreeSponge::<_, 8, 4, 4>::new(perm().clone());
     let elems: Vec<Val> = msg.iter().copied().map(Val::from_u32).collect();

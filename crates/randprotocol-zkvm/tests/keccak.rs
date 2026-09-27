@@ -126,13 +126,17 @@ mod chip {
 
     /// M4.2 (Task 6): no permutations means *no table*, not one padding block — `0` is the
     /// "absent" marker `machine::chips` reads to build an eight-chip batch. From one
-    /// permutation on, the one-block floor is back.
+    /// permutation on, the one-block floor is back — and since audit COV-2 / INT-6 the private-
+    /// data floor above it: 1–4 permutations all declare 128 rows (`MIN_PRIVATE_TABLE_LOG_HEIGHT`,
+    /// was 5, 6, 7, 7), and only from the fifth does the block count itself set the height.
     #[test]
     fn keccak_log_height_is_zero_without_events_and_floors_at_one_block() {
         assert_eq!(keccak::keccak_log_height(0), 0);
-        assert_eq!(keccak::keccak_log_height(1), 5);
-        assert_eq!(keccak::keccak_log_height(2), 6);
+        assert_eq!(keccak::keccak_log_height(1), 7);
+        assert_eq!(keccak::keccak_log_height(2), 7);
         assert_eq!(keccak::keccak_log_height(3), 7);
+        assert_eq!(keccak::keccak_log_height(4), 7);
+        assert_eq!(keccak::keccak_log_height(5), 8);
     }
 }
 

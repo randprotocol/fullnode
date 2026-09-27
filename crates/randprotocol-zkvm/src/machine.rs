@@ -58,7 +58,7 @@ pub enum FriProfile {
 }
 
 impl FriProfile {
-    pub fn num_queries(self) -> usize {
+    pub const fn num_queries(self) -> usize {
         match self {
             Self::Test => 16,
             Self::Production => 80,
@@ -250,6 +250,18 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 pub const TIERS: [usize; 6] = [10, 12, 14, 16, 18, 20];
+
+// Audit COV-2 / INT-6: the private-data floor (`tables::MIN_PRIVATE_TABLE_LOG_HEIGHT`) must fit
+// every ceiling a floored table meets at the *smallest* tier, or an honest small call would be
+// refused for a height the prover chose, not one its workload needed. The verifier's own
+// tier-relative ceilings are `keccak ≤ t + 5` and `sha256 ≤ t + 6`; a chain's call rule adds
+// `input ≤ t + 2` (fullnode's `max_input_log_height`) — the tightest, hence `t ≥ 5`. `TIERS[0]`
+// is 10, so no tier ever needs raising and no `ProveError` exists for it; this assertion is what
+// would say so first if a smaller tier were ever added.
+const _: () = assert!(crate::tables::MIN_PRIVATE_TABLE_LOG_HEIGHT as usize <= TIERS[0] + 2);
+// And the floor's own derivation: 80 production queries plus the two out-of-domain points must
+// not outnumber the table's random rows (`tables::MIN_PRIVATE_TABLE_LOG_HEIGHT`'s doc comment).
+const _: () = assert!(1usize << crate::tables::MIN_PRIVATE_TABLE_LOG_HEIGHT >= FriProfile::Production.num_queries() + 2);
 
 /// M4.2 (controller ruling 1): the sanity ceiling on `Proof::mem_log_height`, the analogue of
 /// `tables::program::MAX_LOG_HEIGHT` for a table that has no module of its own to hold one.
@@ -634,6 +646,46 @@ pub enum VerifyError {
     /// MAX_MEM_LOG_HEIGHT]`. The lower bound is the load-bearing half — see
     /// `Proof::mem_log_height`.
     MemoryHeight,
+    /// Audit ZKA-1: public output slot `OUT0 + slot` holds a canonical field element above
+    /// `u32::MAX`. An output slot is a 32-bit word — `SYS_WRITE_OUTPUT` publishes a register — but
+    /// the circuit does not pin that on its own (`SYS_READ` hands a guest the input table's
+    /// `WORD`, which no lookup range-checks), so `check_public_values` does.
+    OutputNotU32 { slot: usize },
+}
+
+/// Every check `verify` runs on a proof's public values before any of its batch is touched:
+/// the count, canonical encoding, the program digest against `hc`, and the tier echo.
+/// Extracted from `verify` (like `check_declared_heights`) so the checks are testable on their
+/// own, without a proof that gets past the batch verifier.
+pub fn check_public_values(hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyError> {
+    use crate::tables::cpu::pv;
+    if proof.public_values.len() != pv::NUM { return Err(VerifyError::PublicValues); }
+    // `public_values` is deserialized from untrusted bytes as raw `u64`s, and
+    // `Val::from_u64` does not reduce: `out0` and `out0 + p` are the same field element
+    // and both verify, but they are different `to_bytes()` and different numbers to
+    // anyone reading the proof. Insist on the canonical representative so a proof has
+    // exactly one encoding of its outputs.
+    if proof.public_values.iter().any(|x| *x >= Val::ORDER_U64) { return Err(VerifyError::PublicValues); }
+    for i in 0..8 {
+        if proof.public_values[pv::HC0 + i] != hc[i] as u64 { return Err(VerifyError::PublicValues); }
+    }
+    if proof.public_values[pv::TIER] != proof.tier.0 as u64 { return Err(VerifyError::Tier); }
+    // Audit ZKA-1: an output slot is a 32-bit word, and every consumer reads it as one — but the
+    // canonical check above admits anything below `p ≈ 2^64`, and the circuit does not close the
+    // gap by itself: `SYS_READ` hands the guest the input table's `WORD` column, which no lookup
+    // range-checks, so the AIR alone does not guarantee that every value a register can carry to
+    // `SYS_WRITE_OUTPUT` is below `2^32` (the audit's ZKA-1). Rather than argue every path from
+    // that register to an output slot range-checks it, the verifier checks the one place the
+    // value becomes public. A chain's executor already refuses such outputs itself (fullnode's
+    // `verify_call`, and the ledger's call-output checks); this makes `verify`'s own answer agree,
+    // for every caller that is not a chain. An honest proof never trips it — the emulator's
+    // registers are `u32`.
+    for slot in 0..crate::isa::NUM_OUTPUTS {
+        if proof.public_values[pv::OUT0 + slot] > u32::MAX as u64 {
+            return Err(VerifyError::OutputNotU32 { slot });
+        }
+    }
+    Ok(())
 }
 
 /// Every range check `verify` runs on a proof's *declared shape* — the tier and the four
@@ -1394,18 +1446,7 @@ impl Machine {
     /// matching-but-different program producing the same `hc`, a genuine hash collision, not
     /// a free forgery.
     pub fn verify(&self, hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyError> {
-        use crate::tables::cpu::pv;
-        if proof.public_values.len() != pv::NUM { return Err(VerifyError::PublicValues); }
-        // `public_values` is deserialized from untrusted bytes as raw `u64`s, and
-        // `Val::from_u64` does not reduce: `out0` and `out0 + p` are the same field element
-        // and both verify, but they are different `to_bytes()` and different numbers to
-        // anyone reading the proof. Insist on the canonical representative so a proof has
-        // exactly one encoding of its outputs.
-        if proof.public_values.iter().any(|x| *x >= Val::ORDER_U64) { return Err(VerifyError::PublicValues); }
-        for i in 0..8 {
-            if proof.public_values[pv::HC0 + i] != hc[i] as u64 { return Err(VerifyError::PublicValues); }
-        }
-        if proof.public_values[pv::TIER] != proof.tier.0 as u64 { return Err(VerifyError::Tier); }
+        check_public_values(hc, proof)?;
         // M4.2 (Task 5 review): every range check on the proof's declared shape, in one place
         // and before anything is sized from it — `check_declared_heights`' doc comment has the
         // reasoning and the order. It runs *before* `log_ext_degrees`, `verifier_key` and

@@ -1664,7 +1664,10 @@ fn setup_keccak() -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
 
 /// A keccak table that actually has a padding block to forge on. M4.2 Task 6 made the table
 /// optional, so a keccak-free guest no longer carries one at all, and `setup_keccak`'s single
-/// permutation fills its one block exactly (`klh = 5`, 32 rows, all real). Three permutations
+/// permutation filled its one block exactly (`klh = 5`, 32 rows, all real) until audit COV-2 /
+/// INT-6 floored every existing private-data table at 128 rows — it now carries three padding
+/// blocks too, but this setup's shape (three real blocks, block 3 padding) is kept as the one the
+/// test was written against. Three permutations
 /// need three 32-row blocks rounded up to `2^7 = 128` rows, i.e. four blocks — blocks 0..=2
 /// real, **block 3 padding**.
 fn setup_keccak_with_a_padding_block() -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
@@ -1729,7 +1732,8 @@ fn bumping_keccak_mult_on_a_padding_block_is_rejected() {
 #[test]
 fn a_keccak_syscall_without_a_keccak_table_is_rejected() {
     let (m, p, mut t) = setup_keccak();
-    assert_eq!(t.keccak_log_height, 5, "the honest witness declares one block");
+    // One real block, floored to four (audit COV-2 / INT-6's private-data floor, was 5).
+    assert_eq!(t.keccak_log_height, 7, "the honest witness declares one block, floored to 128 rows");
     assert_eq!(t.cpu.height(), Tier(10).cpu_height());
     let w = cpu::col::WIDTH;
     let row = keccak_row(&t);
@@ -1830,7 +1834,7 @@ fn a_keccak_height_past_the_tiers_ceiling_is_rejected_before_any_verifier_key_is
     // ninth instance and the attacker's `degree_bits` edit below has a keccak entry to edit.
     let p = guests::keccak_demo(b"hi");
     let (mut proof, _) = prover.prove_salted(&p, &[], &[], [0; 4], Some(Tier(10))).unwrap();
-    assert_eq!(proof.keccak_log_height, 5);
+    assert_eq!(proof.keccak_log_height, 7, "one block, floored at 128 rows (COV-2 / INT-6)");
     assert_eq!(proof.batch.degree_bits.len(), 10, "eight mandatory tables, the keccak one, and the public one");
     assert_eq!(Tier(10).max_keccak_log_height(), 15);
     // `t + 6`, with `degree_bits` adjusted to match (the keccak instance is last in `chips()`
@@ -1856,7 +1860,7 @@ fn a_nonzero_keccak_height_below_one_block_is_rejected_before_any_verifier_key_i
     let prover = Machine::new(FriProfile::Test);
     let p = guests::keccak_demo(b"hi");
     let (mut proof, _) = prover.prove_salted(&p, &[], &[], [0; 4], Some(Tier(10))).unwrap();
-    assert_eq!(proof.keccak_log_height, 5);
+    assert_eq!(proof.keccak_log_height, 7, "one block, floored at 128 rows (COV-2 / INT-6)");
     proof.keccak_log_height = 3;
     // Constraint set 6: the optional hash instance is no longer the last entry — the
     // mandatory `public` one is appended after it (`machine::chips`), so it is second to
@@ -1937,7 +1941,7 @@ fn a_keccak_height_past_the_absolute_cap_is_rejected_before_any_verifier_key_is_
     let prover = Machine::new(FriProfile::Test);
     let p = guests::keccak_demo(b"hi");
     let (mut proof, _) = prover.prove_salted(&p, &[], &[], [0; 4], Some(Tier(10))).unwrap();
-    assert_eq!(proof.keccak_log_height, 5);
+    assert_eq!(proof.keccak_log_height, 7, "one block, floored at 128 rows (COV-2 / INT-6)");
     proof.keccak_log_height = 25;
     // Constraint set 6: the optional hash instance is no longer the last entry — the
     // mandatory `public` one is appended after it (`machine::chips`), so it is second to
@@ -2087,7 +2091,8 @@ fn setup_sha256() -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
     let p = guests::sha256_demo();
     let e = execute(&p, &[], &[], 10_000).unwrap();
     let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
-    assert_eq!(t.sha256_log_height, 6, "one compression fills the minimum block exactly");
+    // One real block plus one padding block since audit COV-2 / INT-6's private-data floor (was 6).
+    assert_eq!(t.sha256_log_height, 7, "one compression, floored at 128 rows");
     (m, p, t)
 }
 
@@ -2189,7 +2194,7 @@ fn sha256_height_above_the_tier_cap_is_rejected() {
     let prover = Machine::new(FriProfile::Test);
     let p = guests::sha256_demo();
     let (mut proof, _) = prover.prove_salted(&p, &[], &[], [0; 4], Some(Tier(10))).unwrap();
-    assert_eq!(proof.sha256_log_height, 6);
+    assert_eq!(proof.sha256_log_height, 7, "one block, floored at 128 rows (COV-2 / INT-6)");
     assert_eq!(Tier(10).max_sha256_log_height(), 16);
     // `t + 7`, with `degree_bits` adjusted to match (the sha256 instance is last in `chips()`
     // order; `+ 1` is the hiding config's `is_zk`).

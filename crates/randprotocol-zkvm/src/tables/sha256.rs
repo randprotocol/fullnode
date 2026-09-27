@@ -160,11 +160,18 @@ pub const MAX_LOG_HEIGHT: u8 = 20;
 /// Task 4). The table is ~466 columns and every FRI query opens a leaf of that width, so a
 /// guest that never hashes should not pay for it; the `SHA256` bus then has no provider at all,
 /// which is what makes a cpu row claiming `SYS_SHA256` unprovable.
+///
+/// Audit COV-2 / INT-6: a table that exists is floored at `super::MIN_PRIVATE_TABLE_LOG_HEIGHT`
+/// (128 rows, two blocks) — a block's rows hold the message schedule and the chaining state, and
+/// at 64 rows the hiding PCS's 64 random rows are outnumbered by the ~82 points a production
+/// proof opens the table at (the boolean and byte columns fall to lattice reduction). The second
+/// block is an idle padding block, as a 3-compression table's fourth already was.
+/// `MIN_LOG_HEIGHT` stays 6: it is the verifier's floor.
 pub fn sha256_log_height(n_compressions: usize) -> u8 {
     if n_compressions == 0 {
         return 0;
     }
-    super::pad_height(BLOCK * n_compressions, BLOCK).trailing_zeros() as u8
+    (super::pad_height(BLOCK * n_compressions, BLOCK).trailing_zeros() as u8).max(super::MIN_PRIVATE_TABLE_LOG_HEIGHT)
 }
 
 pub mod pre {

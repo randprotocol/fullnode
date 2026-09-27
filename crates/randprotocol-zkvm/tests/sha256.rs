@@ -142,11 +142,12 @@ mod chip {
     }
 
     /// The keccak table's rule, with 64-row blocks: `0` is the "this proof has no sha256
-    /// table" marker, and from one compression on the floor is a single block.
+    /// table" marker, and from one compression on the floor is a single block — raised by audit
+    /// COV-2 / INT-6's private-data floor to 128 rows, so one compression declares 7 (was 6).
     #[test]
     fn sha256_log_height_is_zero_without_events_and_floors_at_one_block() {
         assert_eq!(sha256::sha256_log_height(0), 0);
-        assert_eq!(sha256::sha256_log_height(1), 6);
+        assert_eq!(sha256::sha256_log_height(1), 7);
         assert_eq!(sha256::sha256_log_height(2), 7);
         assert_eq!(sha256::sha256_log_height(3), 8);
         assert_eq!(sha256::sha256_log_height(4), 8);

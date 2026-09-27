@@ -13,6 +13,45 @@ pub mod sha256;
 
 pub type F = p3_goldilocks::Goldilocks;
 
+/// The smallest log-height the prover gives a table that carries **private data** — `input` (the
+/// private tape), `keccak` (every permuted state, i.e. the preimage) and `sha256` (every message
+/// block and chaining state) — whenever that table exists at all. Audit COV-2 / INT-6 / ZKH-1.
+///
+/// The hiding PCS (`p3-fri` 0.7.0's `HidingFriPcs::commit`) blinds a height-`h` trace by
+/// interleaving exactly `h` uniform random rows into it: each committed column is a polynomial of
+/// degree `< 2h` whose coefficients hide `h` secret values behind `h` random ones. A proof
+/// evaluates it at every distinct FRI query point the table's LDE is opened at (at most
+/// `num_queries`) and at the two out-of-domain points `ζ` and `ζ·g` — `k ≤ num_queries + 2` linear
+/// equations. While `k ≤ h` the random rows absorb all of them and the column is perfectly hidden;
+/// past that the verifier learns `k − h` linear relations among the secret values themselves, and
+/// at the tables' old minimal heights that was the whole column: a 4-word input tape is an 8-row
+/// table (8 random unknowns against 82 equations — solved by Gaussian elimination), one keccak
+/// permutation a 32-row block (a reviewer recovered a full 128-byte preimage from a production
+/// proof), one sha256 compression a 64-row block (boolean and byte columns fall to lattice
+/// reduction at `h = 64`).
+///
+/// So `h ≥ num_queries + 2`. The `Production` profile runs `80` queries (`FriProfile::
+/// Production`, the whitepaper's FRI 80/8/20): `80 + 2 = 82 ≤ 128 = 2^7`, and `2^6 = 64 < 82`,
+/// hence 7 — the smallest power of two that clears it. The `Test` profile's 16 queries need only
+/// `2^5`; the floor is not profile-dependent because a declared height is part of the proof's
+/// public shape (and, for a pinned guest, of what a chain compares it against), so it must be one
+/// number whatever profile proves it. `tests/privacy_floor.rs` pins the arithmetic and counts the
+/// distinct opened rows off a real production proof. **Raise this with the query count**: any
+/// retune of `FriProfile::Production` past 126 queries needs 8.
+///
+/// It is prover-side only. The verifier's ranges already admit it (`keccak ∈ [5, t + 5]`,
+/// `sha256 ∈ [6, min(t + 6, 20)]`, `input ∈ [2, 20]`, and a chain's call caps — keccak ≤ 12,
+/// sha256 ≤ 13, input ≤ `t + 2` — are all ≥ 7 at the smallest tier, 10), so no constraint, key or
+/// verifier changes and every proof made before the floor still verifies. `machine::TIERS[0]`
+/// ≥ 5 is what keeps `input ≤ t + 2` true (`machine.rs` asserts it at compile time).
+///
+/// **Not the program table.** It carries the guest's control flow (`MULT`, how often each
+/// instruction ran) and leaks it the same way below 64 words, but its height is pinned — a chain
+/// compares a call's `program_log_height` against the deployed program record's — so flooring it
+/// is a consensus change for the next genesis cut, not a prover choice. `docs/03-privacy.md`,
+/// "What the trace heights leak", has the numbers.
+pub const MIN_PRIVATE_TABLE_LOG_HEIGHT: u8 = 7;
+
 /// Bus catalogue. A bus is a name; the batch verifier checks every bus balances.
 pub mod bus {
     use p3_lookup::{LookupBus, PermutationCheckBus};

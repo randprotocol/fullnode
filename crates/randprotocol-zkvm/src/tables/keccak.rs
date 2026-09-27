@@ -141,11 +141,18 @@ pub const MAX_LOG_HEIGHT: u8 = 20;
 /// no keccak instance at all, anything else the nine-chip one. The `KECCAK` bus then has no
 /// provider, which is exactly what makes a cpu row claiming `SYS_KECCAK` unprovable
 /// (`tests/cheating.rs::a_keccak_syscall_without_a_keccak_table_is_rejected`).
+///
+/// Audit COV-2 / INT-6: a table that exists is floored at `super::MIN_PRIVATE_TABLE_LOG_HEIGHT`
+/// (128 rows, four blocks) — every row of a real block is the permuted state, i.e. the preimage,
+/// and at 32 rows the hiding PCS's 32 random rows are outnumbered by the ~82 points a production
+/// proof opens the table at (a full 128-byte preimage was recovered that way). The extra blocks
+/// are idle padding blocks, exactly what a 3-permutation table's fourth block already was, and
+/// they cost no cycle and no memory access. `MIN_LOG_HEIGHT` stays 5: it is the verifier's floor.
 pub fn keccak_log_height(n_perms: usize) -> u8 {
     if n_perms == 0 {
         return 0;
     }
-    super::pad_height(BLOCK * n_perms, BLOCK).trailing_zeros() as u8
+    (super::pad_height(BLOCK * n_perms, BLOCK).trailing_zeros() as u8).max(super::MIN_PRIVATE_TABLE_LOG_HEIGHT)
 }
 
 pub mod pre {

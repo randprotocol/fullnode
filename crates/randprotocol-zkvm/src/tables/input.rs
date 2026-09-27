@@ -66,9 +66,18 @@ pub const MIN_LOG_HEIGHT: u8 = 2; // 1 << 2 == MIN_HEIGHT
 /// to 16 bits — so `n_in` is effectively capped at 65535 well before `MAX_LOG_HEIGHT` bites.
 pub const MAX_LOG_HEIGHT: u8 = 20;
 
-/// Same "+1 padding row, floor at MIN_HEIGHT" rule as `tables::program::program_log_height`.
+/// Same "+1 padding row, floor at MIN_HEIGHT" rule as `tables::program::program_log_height`,
+/// then floored again at `super::MIN_PRIVATE_TABLE_LOG_HEIGHT` (128 rows): the input table *is*
+/// the private tape, and below `num_queries + 2` rows the hiding PCS's interleaved random rows
+/// are outnumbered by the points a proof opens the table at, which hands the verifier the words
+/// themselves (audit COV-2 / INT-6 — every call with at most 30 private words was fully
+/// solvable, at most 62 by lattice reduction). `MIN_LOG_HEIGHT` stays 2: it is the *verifier's*
+/// floor, and a proof made before this floor declared 3 and must keep verifying.
+///
+/// Every chain-pinned input height is untouched: the hidden-asset bundle's 1 204 words already
+/// declare 11, far above the floor.
 pub fn input_log_height(n: usize) -> u8 {
-    super::pad_height(n + 1, MIN_HEIGHT).trailing_zeros() as u8
+    (super::pad_height(n + 1, MIN_HEIGHT).trailing_zeros() as u8).max(super::MIN_PRIVATE_TABLE_LOG_HEIGHT)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
