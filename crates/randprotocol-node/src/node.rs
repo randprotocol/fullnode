@@ -512,11 +512,23 @@ fn orphan_wants_batch_sync(best_peer_height: u64, committed_height: u64, pending
 /// the swarm already bounds how many there are, and a validator must never be refused — but the
 /// map never grows past `max` on the strength of entries that are *not* connected: at the bound
 /// those are dropped first.
-fn connect_peer(peers: &mut HashMap<PeerId, Peer>, id: PeerId, max: usize) -> &mut Peer {
+///
+/// A peer that was here before gets its meters back from `memory` (CN-2) — onto a new entry, or
+/// over one gossip or a request made for it while it was not recorded as connected, whose
+/// buckets are at most a moment old. Entries dropped at the bound are remembered the same way.
+fn connect_peer<'a>(peers: &'a mut HashMap<PeerId, Peer>, memory: &mut PeerMemory, id: PeerId, max: usize) -> &'a mut Peer {
     if !peers.contains_key(&id) && peers.len() >= max {
-        peers.retain(|_, p| p.connected);
+        peers.retain(|pid, p| {
+            if !p.connected {
+                memory.remember(*pid, p);
+            }
+            p.connected
+        });
     }
-    let p = peers.entry(id).or_default();
+    let p = peer_entry(peers, memory, id);
+    if let Some(m) = memory.recall(&id) {
+        m.restore(p);
+    }
     p.connected = true;
     p
 }
@@ -735,6 +747,13 @@ struct Node {
     sync_limiter: admission::PeerLimiter,
     /// This validator's signed not-held answers, re-served to repeated by-hash requests (SW-2).
     not_held_signed: NotHeldCache,
+    /// The meters of peers that have left, restored when they return (CN-2).
+    peer_memory: PeerMemory,
+    /// The node-wide budget on `Blocks` requests served, over every peer (CN-2).
+    sync_serve_budget: SyncServeBudget,
+    /// The blocking-worker slots `Blocks` answers are built in, off this loop
+    /// ([`MAX_SYNC_SERVES_IN_FLIGHT`], [`spawn_sync_serve`]).
+    sync_serving: Arc<tokio::sync::Semaphore>,
     /// The tip the pending verifications are running against, refreshed lazily: a full ledger clone
     /// per consensus message would cost one per vote, so it is taken only when a transaction is
     /// waiting and the tip's `(height, root)` has moved since the last one.
@@ -767,8 +786,9 @@ struct Peer {
     connected: bool,
     /// This peer's gossip-submission allowance. Metered only when the peer is the *forwarder* of a
     /// transaction (`GossipId.propagation_source`); a peer we know of only as the author of relayed
-    /// gossip never spends from it. Dropped with the entry on `PeerDisconnected`, which is why
-    /// `PeerLimiter` keeps no map.
+    /// gossip never spends from it. Leaves with the entry on `PeerDisconnected`, which is why
+    /// `PeerLimiter` keeps no map — into [`PeerMemory`], with every other meter here, and back
+    /// onto the entry if the peer returns (CN-2).
     tx_bucket: admission::TokenBucket,
     /// The same, for the `Status` messages this peer forwards (`on_status_gossip`): a status is
     /// three fields and costs nothing to check, so the bucket is generous ([`STATUS_GOSSIP_BURST`],
@@ -840,10 +860,28 @@ pub const SYNC_REQUEST_PER_SEC: f64 = 2.0;
 
 /// Whether to serve `peer`'s sync request now (SW-2): metered on its own `sync_bucket`. `peer` is
 /// the request's connection, never a claimed identity, and only a connected peer can send one,
-/// so an entry made here is bounded by the swarm's connection cap.
-fn admit_sync_request(peers: &mut HashMap<PeerId, Peer>, limiter: &admission::PeerLimiter, peer: PeerId, now: Instant) -> bool {
-    // Spent in place: `TokenBucket` is `Copy`.
-    limiter.allow(&mut peers.entry(peer).or_default().sync_bucket, now)
+/// so an entry made here is bounded by the swarm's connection cap. The bucket outlives the
+/// connection (CN-2, [`PeerMemory`]), and a `Blocks` request within it is charged to the node's
+/// own budget too ([`SyncServeBudget`]).
+fn admit_sync_request(
+    peers: &mut HashMap<PeerId, Peer>,
+    memory: &mut PeerMemory,
+    limiter: &admission::PeerLimiter,
+    global: &mut SyncServeBudget,
+    peer: PeerId,
+    req: &SyncRequest,
+    now: Instant,
+) -> bool {
+    // Spent in place: `TokenBucket` is `Copy`. The peer's own bucket first, restored if it has
+    // been here before (CN-2), so a request its own limit refuses spends nothing node-wide.
+    if !limiter.allow(&mut peer_entry(peers, memory, peer).sync_bucket, now) {
+        return false;
+    }
+    match req {
+        SyncRequest::Blocks { .. } => global.allow(now),
+        // One block, per-peer metered; see [`SYNC_SERVE_BURST`] for why it is not charged here.
+        SyncRequest::BlockByHash(_) => true,
+    }
 }
 
 /// The answer to a request over its peer's limit: the protocol's own "nothing" — an empty batch,
@@ -867,7 +905,8 @@ pub const SYNC_BACKOFF_MAX: Duration = Duration::from_secs(120);
 /// height is what made `pick_sync_peer` choose it, and nothing else would stop the same claim
 /// winning the next tick's `max_by_key` — an honest peer that pruned the height, or one briefly
 /// refusing (a metered sync request, SW-2), costs a few seconds of preference and nothing more.
-/// Held on the peer's entry, so a reconnect starts it over (a reconnect is what DS-2 meters).
+/// Held on the peer's entry and remembered past a disconnect ([`PeerMemory`], CN-2), so a
+/// reconnect restores it rather than starting it over.
 fn back_off_sync_peer(peer: &mut Peer, now: Instant) {
     peer.sync_backoff =
         if peer.sync_backoff.is_zero() { SYNC_BACKOFF_BASE } else { (peer.sync_backoff * 2).min(SYNC_BACKOFF_MAX) };
@@ -894,6 +933,214 @@ fn on_sync_batch_failed(peers: &mut HashMap<PeerId, Peer>, peer: PeerId, now: In
 fn clear_sync_backoff(peer: &mut Peer) {
     peer.sync_backoff = Duration::ZERO;
     peer.sync_backoff_until = None;
+}
+
+/// Departed peers whose meters are remembered (CN-2): a reconnecting id gets its buckets and its
+/// sync back-off back instead of a fresh set. Only peers that have *left* are held here — a
+/// connected one's meters are on its [`Peer`], and those are bounded by the swarm's inbound cap
+/// (DS-2, 256) — so this is the one place the bound is set. 4096 records of a few dozen bytes
+/// each, under half a megabyte.
+///
+/// What eviction buys an attacker, oldest first: to push one id's record out it has to bring
+/// 4096 other ids through a connection each (DS-2 meters those: 64 pending, 2 per peer) and
+/// back out again, and at the end of it the evicted id has one fresh burst — which each of the
+/// 4096 new ids had anyway. A fresh id always costs a connection and always starts full; what
+/// bounds the sum over every id is the node-wide budget ([`SyncServeBudget`]), not this map.
+pub const PEER_MEMORY_ENTRIES: usize = 4096;
+
+/// A peer's rate-limiter state — everything on [`Peer`] that metering or the sync picker
+/// accumulates about it — lifted off the entry when the peer leaves (CN-2). The status and
+/// connectedness are not carried: a returning peer has to say where it is again.
+#[derive(Clone, Copy, Debug)]
+struct PeerMeters {
+    tx_bucket: admission::TokenBucket,
+    status_bucket: admission::TokenBucket,
+    consensus_bucket: admission::TokenBucket,
+    sync_bucket: admission::TokenBucket,
+    sync_backoff_until: Option<Instant>,
+    sync_backoff: Duration,
+}
+
+impl PeerMeters {
+    fn of(p: &Peer) -> PeerMeters {
+        PeerMeters {
+            tx_bucket: p.tx_bucket,
+            status_bucket: p.status_bucket,
+            consensus_bucket: p.consensus_bucket,
+            sync_bucket: p.sync_bucket,
+            sync_backoff_until: p.sync_backoff_until,
+            sync_backoff: p.sync_backoff,
+        }
+    }
+
+    fn restore(self, p: &mut Peer) {
+        p.tx_bucket = self.tx_bucket;
+        p.status_bucket = self.status_bucket;
+        p.consensus_bucket = self.consensus_bucket;
+        p.sync_bucket = self.sync_bucket;
+        p.sync_backoff_until = self.sync_backoff_until;
+        p.sync_backoff = self.sync_backoff;
+    }
+}
+
+/// The departed peers' [`PeerMeters`], oldest evicted first ([`PEER_MEMORY_ENTRIES`]). A record
+/// is *taken* when its peer returns, so each id sits either here or on its entry, never both.
+/// Nothing here expires on time and nothing needs to: a remembered bucket refills from its
+/// last use when it is next spent (`PeerLimiter::allow`), and a back-off's instant simply passes.
+#[derive(Default)]
+struct PeerMemory {
+    by_id: HashMap<PeerId, PeerMeters>,
+    order: VecDeque<PeerId>,
+}
+
+impl PeerMemory {
+    fn remember(&mut self, id: PeerId, p: &Peer) {
+        if self.by_id.insert(id, PeerMeters::of(p)).is_some() {
+            // A record already held (a peer that came back without its entry being restored, and
+            // left again): refreshed, and moved to the young end. A linear scan of at most
+            // [`PEER_MEMORY_ENTRIES`] per departure.
+            self.order.retain(|x| *x != id);
+        } else if self.order.len() >= PEER_MEMORY_ENTRIES {
+            if let Some(old) = self.order.pop_front() {
+                self.by_id.remove(&old);
+            }
+        }
+        self.order.push_back(id);
+    }
+
+    fn recall(&mut self, id: &PeerId) -> Option<PeerMeters> {
+        let m = self.by_id.remove(id)?;
+        self.order.retain(|x| x != id);
+        Some(m)
+    }
+
+    fn len(&self) -> usize {
+        self.by_id.len()
+    }
+}
+
+/// `id`'s entry, restored from `memory` when this node holds none (CN-2): the entry a request or
+/// a connection creates for a peer that was here before carries its old meters, not a fresh set.
+fn peer_entry<'a>(peers: &'a mut HashMap<PeerId, Peer>, memory: &mut PeerMemory, id: PeerId) -> &'a mut Peer {
+    peers.entry(id).or_insert_with(|| {
+        let mut p = Peer::default();
+        if let Some(m) = memory.recall(&id) {
+            m.restore(&mut p);
+        }
+        p
+    })
+}
+
+/// `id`'s connection closed, or its entry is dropped for a batch we could not use: the entry goes,
+/// its meters are remembered (CN-2). `held_our_batch` — it left while our live batch request was
+/// on it — is a miss exactly as a silent peer's is (CN-1), so it is backed off first: before
+/// this, walking out on a request was the one way to decline one that cost a sybil nothing, the
+/// in-flight slot being cleared without a failure ever reaching [`on_sync_batch_failed`].
+fn disconnect_peer(peers: &mut HashMap<PeerId, Peer>, memory: &mut PeerMemory, id: PeerId, held_our_batch: bool, now: Instant) {
+    if let Some(mut p) = peers.remove(&id) {
+        if held_our_batch {
+            back_off_sync_peer(&mut p, now);
+        }
+        memory.remember(id, &p);
+    }
+}
+
+/// `Blocks` requests this node serves back to back across *every* peer, and the rate it recovers
+/// them at (CN-2). The per-peer bucket ([`SYNC_REQUEST_BURST`]) bounds one connection, and 256 of
+/// them (DS-2's inbound cap) at 2 a second was ~512 batch requests a second, each up to a
+/// [`serve_sync_budget`] read (~6 MiB). Eight a second is four honest syncers each keeping one
+/// full-rate batch in flight — an honest syncer asks for the next only after applying the last,
+/// which takes longer than half a second for a full batch — and caps what one node reads and
+/// sends for sync at eight budgets a second.
+///
+/// Over it the answer is the per-peer limit's own empty batch ([`refused_sync_response`]), and an
+/// honest syncer backs this node off for SYNC-2's 5 s and asks another, so no honest peer is
+/// penalised past that back-off, which a batch from here clears. The price of any node-wide
+/// budget is that it can be spent by someone else: four ids at their own full rate keep this
+/// node's sync service busy — the service, not the consensus loop, which is the point
+/// ([`spawn_sync_serve`]) — and a lagging node goes to another peer, every node having its own.
+/// A by-hash request is left out on purpose: it is one block, metered per peer, and a signed
+/// not-held is kept for re-serving (SW-2); a global cap on it would let a few ids deny every
+/// validator's not-held at once — the evidence a lock release (CON-4) waits for.
+pub const SYNC_SERVE_BURST: u32 = 32;
+pub const SYNC_SERVE_PER_SEC: f64 = 8.0;
+
+/// The node-wide `Blocks` budget ([`SYNC_SERVE_BURST`]): one bucket, like the faucet's, since it
+/// meters the node and not a peer.
+struct SyncServeBudget {
+    limiter: admission::PeerLimiter,
+    bucket: admission::TokenBucket,
+}
+
+impl SyncServeBudget {
+    fn new() -> SyncServeBudget {
+        SyncServeBudget {
+            limiter: admission::PeerLimiter::new(SYNC_SERVE_BURST, SYNC_SERVE_PER_SEC),
+            bucket: admission::TokenBucket::default(),
+        }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        // Spent in place: `TokenBucket` is `Copy`.
+        self.limiter.allow(&mut self.bucket, now)
+    }
+}
+
+/// `Blocks` answers being read and assembled at once, on blocking workers (CN-2). Four, the
+/// admission verifiers' number, against a pool the node shares with them, the RPC's blocking
+/// reads and the prune pass; each holds at most a reader limit's worth of blocks
+/// (`sync_response_wire_limit`) from the read until its answer is handed to the swarm, so the
+/// memory this can pin is bounded too. With every slot taken the request is answered empty, as
+/// an over-budget one is.
+pub const MAX_SYNC_SERVES_IN_FLIGHT: usize = 4;
+
+/// Run `work` — a `Blocks` answer's storage reads and batch assembly — on a blocking worker under
+/// one of `slots`, and hand its result to `reply` (the network task's `send_sync_response`, which
+/// is how a `ResponseChannel` is answered from off the swarm: a command to it, like every other).
+/// Hands `reply` back, having started nothing, when every slot is taken: the caller answers the
+/// request with it (CN-2) — dropped instead, it would drop the `ResponseChannel` inside it and
+/// the asker would wait for a failure rather than read an empty batch.
+///
+/// Before, the read ran inside `on_network_event` on the loop that handles votes and proposals —
+/// up to a hundred blocks from RocksDB and their sealed forms, and the coverage closure past
+/// that, per request — so an inbound sync load was a consensus-loop load. A panicking read
+/// answers an empty batch, which is what a refused request gets.
+fn spawn_sync_serve<R, Fut>(
+    slots: &Arc<tokio::sync::Semaphore>,
+    work: impl FnOnce() -> SyncResponse + Send + 'static,
+    reply: R,
+) -> Result<(), R>
+where
+    R: FnOnce(SyncResponse) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let Ok(permit) = slots.clone().try_acquire_owned() else {
+        return Err(reply);
+    };
+    tokio::spawn(async move {
+        let response = tokio::task::spawn_blocking(work).await.unwrap_or_else(|e| {
+            tracing::warn!("serving a sync batch failed: {e}");
+            SyncResponse::Blocks(vec![])
+        });
+        reply(response).await;
+        // Held until the answer is with the swarm, so the slots bound the batches held in memory
+        // as well as the reads.
+        drop(permit);
+    });
+    Ok(())
+}
+
+/// A `Blocks` request's answer, read from `storage` (SW-2's budget, spec §7's coverage closure):
+/// what `serve_sync` built on the loop, now a free function so it can run on a blocking worker
+/// ([`spawn_sync_serve`]).
+fn serve_blocks(storage: &Storage, wire: &network::WireLimits, from_height: u64, max: u32) -> SyncResponse {
+    let max = max.min(SYNC_BATCH);
+    // Lazy: a batch that fills up on bytes must not have read the rest from RocksDB.
+    let heights = from_height..from_height.saturating_add(max as u64);
+    let blocks = heights.map_while(|h| storage.committed_block(h).ok().flatten()).map(|cb| sealed_form_of(storage, &cb));
+    let mut batch = fill_sync_batch(blocks, serve_sync_budget(wire));
+    close_batch_coverage(storage, &mut batch, wire);
+    SyncResponse::Blocks(batch)
 }
 
 /// Drop the by-hash fetches sent more than `timeout` ago (audit v5): a request libp2p neither
@@ -1325,6 +1572,9 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         consensus_limiter: admission::PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC),
         sync_limiter: admission::PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC),
         not_held_signed: NotHeldCache::default(),
+        peer_memory: PeerMemory::default(),
+        sync_serve_budget: SyncServeBudget::new(),
+        sync_serving: Arc::new(tokio::sync::Semaphore::new(MAX_SYNC_SERVES_IN_FLIGHT)),
         faucet_limiter: admission::PeerLimiter::new(admission::FAUCET_MINT_BURST, admission::FAUCET_MINT_PER_SEC),
         faucet_bucket: admission::TokenBucket::default(),
         snapshot: None,
@@ -2041,12 +2291,13 @@ impl Node {
         match ev {
             NetworkEvent::Listening(a) => tracing::info!("listening on {a}"),
             NetworkEvent::PeerConnected(p) => {
-                connect_peer(&mut self.peers, p, self.wire.max_established_incoming as usize);
+                connect_peer(&mut self.peers, &mut self.peer_memory, p, self.wire.max_established_incoming as usize);
                 self.broadcast_status().await;
             }
             NetworkEvent::PeerDisconnected(p) => {
-                self.peers.remove(&p);
-                if self.sync_inflight.map(|s| s.0) == Some(p) {
+                let held_our_batch = self.sync_inflight.map(|s| s.0) == Some(p);
+                disconnect_peer(&mut self.peers, &mut self.peer_memory, p, held_our_batch, Instant::now());
+                if held_our_batch {
                     self.sync_inflight = None;
                     // The peer we were waiting on is gone: go to another one now rather than
                     // sitting out the rest of the give-up window.
@@ -2090,11 +2341,39 @@ impl Node {
                 }
             },
             NetworkEvent::SyncRequest { peer, request, channel } => {
-                let response = if admit_sync_request(&mut self.peers, &self.sync_limiter, peer, Instant::now()) {
+                let response = if admit_sync_request(
+                    &mut self.peers,
+                    &mut self.peer_memory,
+                    &self.sync_limiter,
+                    &mut self.sync_serve_budget,
+                    peer,
+                    &request,
+                    Instant::now(),
+                ) {
                     tracing::debug!("serving sync request from {peer}");
-                    self.serve_sync(request)
+                    match request {
+                        // Read and assembled off this loop (CN-2), answered from the worker
+                        // through the network task's command channel.
+                        SyncRequest::Blocks { from_height, max } => {
+                            let (storage, wire, net) = (self.storage.clone(), self.wire, self.net.clone());
+                            let (work, reply) = (
+                                move || serve_blocks(&storage, &wire, from_height, max),
+                                move |r| async move { net.send_sync_response(channel, r).await },
+                            );
+                            if let Err(reply) = spawn_sync_serve(&self.sync_serving, work, reply) {
+                                // Every slot taken: answered as an over-budget request is, through
+                                // the reply the refusal handed back (it owns the channel).
+                                tracing::debug!(%peer, "sync request past the serving slots; answered empty");
+                                reply(refused_sync_response(&request)).await;
+                            }
+                            return Ok(());
+                        }
+                        // One block and a kept signature: cheap enough to stay here, and it needs
+                        // the replica's tree.
+                        SyncRequest::BlockByHash(_) => self.serve_sync(request),
+                    }
                 } else {
-                    tracing::debug!(%peer, "sync request over the peer's limit; answered empty");
+                    tracing::debug!(%peer, "sync request over the peer's or the node's limit; answered empty");
                     refused_sync_response(&request)
                 };
                 self.net.send_sync_response(channel, response).await;
@@ -2179,17 +2458,9 @@ impl Node {
 
     fn serve_sync(&mut self, req: SyncRequest) -> SyncResponse {
         match req {
-            SyncRequest::Blocks { from_height, max } => {
-                let max = max.min(SYNC_BATCH);
-                // Lazy: a batch that fills up on bytes must not have read the rest from RocksDB.
-                let heights = from_height..from_height.saturating_add(max as u64);
-                let blocks = heights
-                    .map_while(|h| self.storage.committed_block(h).ok().flatten())
-                    .map(|cb| sealed_form_of(&self.storage, &cb));
-                let mut batch = fill_sync_batch(blocks, serve_sync_budget(&self.wire));
-                close_batch_coverage(&self.storage, &mut batch, &self.wire);
-                SyncResponse::Blocks(batch)
-            }
+            // The loop sends a `Blocks` request to a blocking worker (CN-2, `spawn_sync_serve`);
+            // this arm is the same answer, for any caller that is already off the loop's path.
+            SyncRequest::Blocks { from_height, max } => serve_blocks(&self.storage, &self.wire, from_height, max),
             SyncRequest::BlockByHash(h) => {
                 // A by-hash fetch is a single block with no aggregate context beside it: serve
                 // the stored block untouched, marker forms and all, and let the fetcher's
@@ -2462,7 +2733,9 @@ impl Node {
                     // damaged batch. It cost us a round trip either way.
                     self.sync_failures += 1;
                     tracing::warn!(%peer, failures = self.sync_failures, "sync batch rejected: {e}");
-                    self.peers.remove(&peer);
+                    // Its meters are remembered, not dropped with the entry (CN-2): a rejected
+                    // batch must not buy its sender a fresh set.
+                    disconnect_peer(&mut self.peers, &mut self.peer_memory, peer, false, Instant::now());
                     return Ok(());
                 }
                 // A batch got through, so the wire carries this size: ask for more next time, but
@@ -2912,21 +3185,21 @@ mod tests {
         let entry = |connected: bool| Peer { connected, ..Default::default() };
         const CAP: usize = 3;
         let mut peers: HashMap<PeerId, Peer> = [(pid(1), entry(false)), (pid(2), entry(false)), (pid(3), entry(false))].into_iter().collect();
-        connect_peer(&mut peers, pid(4), CAP);
+        connect_peer(&mut peers, &mut PeerMemory::default(), pid(4), CAP);
         assert!(peers.len() <= CAP, "{} entries, over the cap of {CAP}", peers.len());
         assert!(peers[&pid(4)].connected, "the new peer is recorded");
         // Connected entries are never evicted, and a connected peer is never refused: at the
         // bound with every entry connected the map grows, as the swarm's cap is what holds it.
         let mut peers: HashMap<PeerId, Peer> = [(pid(1), entry(true)), (pid(2), entry(true)), (pid(3), entry(true))].into_iter().collect();
-        connect_peer(&mut peers, pid(4), CAP);
+        connect_peer(&mut peers, &mut PeerMemory::default(), pid(4), CAP);
         assert_eq!(peers.len(), 4);
         assert!(peers.values().all(|p| p.connected));
         // Under the bound nothing is evicted, whatever its state.
         let mut peers: HashMap<PeerId, Peer> = [(pid(1), entry(false))].into_iter().collect();
-        connect_peer(&mut peers, pid(2), CAP);
+        connect_peer(&mut peers, &mut PeerMemory::default(), pid(2), CAP);
         assert_eq!(peers.len(), 2);
         // A known peer reconnecting is an update, not growth.
-        connect_peer(&mut peers, pid(1), CAP);
+        connect_peer(&mut peers, &mut PeerMemory::default(), pid(1), CAP);
         assert_eq!(peers.len(), 2);
         assert!(peers[&pid(1)].connected);
     }
@@ -3412,6 +3685,11 @@ mod tests {
         let limiter = PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC);
         let (p1, p2) = (pid(1), pid(2));
         let mut peers: HashMap<PeerId, Peer> = HashMap::new();
+        let (mut memory, mut global) = (PeerMemory::default(), SyncServeBudget::new());
+        let req = SyncRequest::Blocks { from_height: 1, max: 100 };
+        let mut admit_sync_request = |peers: &mut HashMap<PeerId, Peer>, limiter: &PeerLimiter, p: PeerId, t: Instant| {
+            admit_sync_request(peers, &mut memory, limiter, &mut global, p, &req, t)
+        };
         let now = Instant::now();
         for i in 0..SYNC_REQUEST_BURST {
             assert!(admit_sync_request(&mut peers, &limiter, p1, now), "request {i} of the burst");
@@ -3425,6 +3703,139 @@ mod tests {
         assert!(!admit_sync_request(&mut peers, &limiter, p1, later));
         assert!(matches!(refused_sync_response(&SyncRequest::Blocks { from_height: 1, max: 100 }), SyncResponse::Blocks(b) if b.is_empty()));
         assert!(matches!(refused_sync_response(&SyncRequest::BlockByHash(Hash::ZERO)), SyncResponse::Block(None)));
+    }
+
+    /// CN-2, the reconnect half: every per-peer meter lived on the `Peer` entry and
+    /// `PeerDisconnected` removed it, so a reconnect bought a fresh burst of each — one peer id,
+    /// ten reconnects, eighty sync requests served — and wiped the CN-1 back-off a sybil had
+    /// earned. A peer that leaves is remembered (bounded, [`PEER_MEMORY_ENTRIES`]) and a reconnect
+    /// restores its buckets and its back-off; one that leaves while holding our live batch
+    /// request has missed it, exactly as a silent one has (CN-1).
+    #[test]
+    fn a_reconnect_restores_the_peers_meters_and_back_off_instead_of_resetting_them() {
+        use crate::admission::PeerLimiter;
+        let pid = |seed: u16| {
+            let mut s = [7u8; 32];
+            s[..2].copy_from_slice(&seed.to_le_bytes());
+            PeerId::from(libp2p::identity::Keypair::ed25519_from_bytes(s).unwrap().public())
+        };
+        const CAP: usize = 256;
+        let limiter = PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC);
+        let consensus = PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC);
+        let req = SyncRequest::Blocks { from_height: 1, max: 100 };
+        let (mut peers, mut memory) = (HashMap::<PeerId, Peer>::new(), PeerMemory::default());
+        let now = Instant::now();
+        let p = pid(1);
+        // Ten reconnects in the same instant: only the first burst is served.
+        let mut served = 0;
+        for _ in 0..10 {
+            connect_peer(&mut peers, &mut memory, p, CAP);
+            for _ in 0..SYNC_REQUEST_BURST {
+                // A fresh global budget per request: this test is about the peer's own bucket.
+                served += admit_sync_request(&mut peers, &mut memory, &limiter, &mut SyncServeBudget::new(), p, &req, now) as u32;
+            }
+            for _ in 0..CONSENSUS_GOSSIP_BURST {
+                on_consensus_gossip(&mut peers, &consensus, p, now);
+            }
+            disconnect_peer(&mut peers, &mut memory, p, false, now);
+        }
+        assert_eq!(served, SYNC_REQUEST_BURST, "ten reconnects must not buy ten bursts");
+        connect_peer(&mut peers, &mut memory, p, CAP);
+        assert_eq!(
+            on_consensus_gossip(&mut peers, &consensus, p, now),
+            GossipOutcome::Report(admission::Acceptance::Ignore),
+            "the consensus bucket survives a reconnect"
+        );
+        // The CN-1 back-off survives one too, and leaving with our batch in hand is a miss.
+        on_sync_batch_failed(&mut peers, p, now);
+        disconnect_peer(&mut peers, &mut memory, p, true, now);
+        connect_peer(&mut peers, &mut memory, p, CAP);
+        assert_eq!(peers[&p].sync_backoff, SYNC_BACKOFF_BASE * 2, "two misses: the failed batch and the walk-out");
+        assert!(peers[&p].sync_backoff_until.is_some_and(|u| u > now));
+        // A peer rejected mid-connection (its entry dropped for a bad batch) is restored too.
+        disconnect_peer(&mut peers, &mut memory, p, false, now);
+        assert!(!admit_sync_request(&mut peers, &mut memory, &limiter, &mut SyncServeBudget::new(), p, &req, now));
+        // Bounded: the oldest record goes first, and a restored record leaves the memory.
+        let mut memory = PeerMemory::default();
+        let mut peers = HashMap::new();
+        for i in 0..=PEER_MEMORY_ENTRIES as u16 {
+            connect_peer(&mut peers, &mut memory, pid(1000 + i), CAP);
+            disconnect_peer(&mut peers, &mut memory, pid(1000 + i), false, now);
+        }
+        assert_eq!(memory.len(), PEER_MEMORY_ENTRIES);
+        assert!(!memory.by_id.contains_key(&pid(1000)), "the oldest record was evicted");
+        connect_peer(&mut peers, &mut memory, pid(1001), CAP);
+        assert_eq!(memory.len(), PEER_MEMORY_ENTRIES - 1, "a reconnected peer's record moves back to its entry");
+        assert_eq!(memory.order.len(), memory.by_id.len());
+    }
+
+    /// CN-2, the global half: the per-peer bucket bounds one connection, not the node — 256
+    /// inbound ids at 2 a second each was ~512 batch requests a second, each up to a ~6 MiB read.
+    /// Many ids each inside their own budget are held to the node-wide one; a by-hash request is
+    /// one block and stays outside it (see [`SyncServeBudget`]).
+    #[test]
+    fn many_peers_each_within_their_budget_are_held_to_the_global_sync_budget() {
+        use crate::admission::PeerLimiter;
+        let pid = |seed: u16| {
+            let mut s = [9u8; 32];
+            s[..2].copy_from_slice(&seed.to_le_bytes());
+            PeerId::from(libp2p::identity::Keypair::ed25519_from_bytes(s).unwrap().public())
+        };
+        let limiter = PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC);
+        let blocks = SyncRequest::Blocks { from_height: 1, max: 100 };
+        let (mut peers, mut memory, mut global) = (HashMap::new(), PeerMemory::default(), SyncServeBudget::new());
+        let now = Instant::now();
+        let ids: Vec<PeerId> = (0..64).map(pid).collect();
+        let mut admit = |t: Instant, req: &SyncRequest| {
+            ids.iter().map(|p| admit_sync_request(&mut peers, &mut memory, &limiter, &mut global, *p, req, t) as u32).sum::<u32>()
+        };
+        // Two requests from each of 64 ids — a quarter of each one's own burst.
+        let served = admit(now, &blocks) + admit(now, &blocks);
+        assert_eq!(served, SYNC_SERVE_BURST, "128 requests, each within its peer's budget, against a node-wide burst");
+        let later = now + Duration::from_secs(1);
+        assert_eq!(admit(later, &blocks), SYNC_SERVE_PER_SEC as u32, "and the node-wide rate after it");
+        // By-hash requests are not charged to it: each id still has its own tokens for them.
+        assert_eq!(admit(later, &SyncRequest::BlockByHash(Hash::ZERO)), 64);
+    }
+
+    /// CN-2, the off-loop half: a `Blocks` answer is read and assembled on a blocking worker, not
+    /// on the loop that handles votes and proposals, under [`MAX_SYNC_SERVES_IN_FLIGHT`] slots —
+    /// with every slot taken the request is refused (the caller answers it empty) and no read
+    /// starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_is_served_off_the_loop_under_a_bounded_number_of_slots() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_SYNC_SERVES_IN_FLIGHT));
+        let loop_thread = std::thread::current().id();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel();
+        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+        let spawned = spawn_sync_serve(
+            &slots,
+            move || {
+                ran_tx.send(std::thread::current().id()).unwrap();
+                // Holds its worker until the test lets go — inline, this would wait out the timeout.
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                SyncResponse::Blocks(vec![])
+            },
+            move |r| async move {
+                reply_tx.send(r).await.unwrap();
+            },
+        );
+        assert!(spawned.is_ok());
+        let ran_on = ran_rx.recv_timeout(Duration::from_secs(5)).expect("the serve ran");
+        assert_ne!(ran_on, loop_thread, "the read ran on the calling thread");
+        assert!(reply_rx.try_recv().is_err(), "the caller got control back before the answer was ready");
+        release_tx.send(()).unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(5), reply_rx.recv()).await.unwrap().unwrap();
+        assert!(matches!(r, SyncResponse::Blocks(b) if b.is_empty()));
+        // Saturated: every slot held, the next serve is refused and its read never starts.
+        let _held = slots.clone().acquire_many_owned(MAX_SYNC_SERVES_IN_FLIGHT as u32).await.unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let r2 = ran.clone();
+        let spawned = spawn_sync_serve(&slots, move || { r2.store(true, SeqCst); SyncResponse::Blocks(vec![]) }, |_| async {});
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(spawned.is_err(), "a serve past the slots is refused, its reply handed back");
+        assert!(!ran.load(SeqCst), "and reads nothing");
     }
 
     /// The startup check (H3): a genesis whose `hc_bundle` is not this build's guest is refused,
