@@ -232,6 +232,22 @@ impl ConfidentialExecutor for AggExecutor {
         // differently and is refused.
         let public = randprotocol_rvm::public_values::interface_words_bound(&vk.shape, &vk.key, binding, &pvs);
         let program = aggregate_program(&vk);
+        // The reduce flag, before `Machine::verify` builds a key (the interface review's
+        // INTERFACE-4). The rVM keys its verifier-key cache by `(tier, program, reduce)` and reads
+        // `reduce` off the proof's own `reduce_log_height`, so a proof declaring the reduce
+        // instance the registered program never emits — or omitting the one it does — bought a
+        // fresh key build (13 s test, 30–70 s production) and a slot in the 64-entry FIFO before
+        // its batch was ever looked at. The program decides the flag (`warm_aggregation`'s rule),
+        // so a mismatch is invalid by construction and refused here, in the node, without
+        // touching the vendored verifier.
+        let reduces = program.instrs.iter().any(|i| matches!(i.op, randprotocol_rvm::isa::Op::Reduce));
+        if (rvm_proof.reduce_log_height != 0) != reduces {
+            return Err(ConfidentialError::InvalidAggregateProof(format!(
+                "the proof declares reduce_log_height {} but the registered aggregate program {} the reduce instance",
+                rvm_proof.reduce_log_height,
+                if reduces { "uses" } else { "never uses" }
+            )));
+        }
         let out = randprotocol_rvm::aggregate::verify_aggregate(
             &self.rvm,
             &program,
@@ -322,6 +338,73 @@ mod tests {
         };
         let public_values: [u64; 34] = p.public_values.clone().try_into().expect("cs6 proofs carry 34 public values");
         (shape, CoveredBundle { public_values, shape })
+    }
+
+    /// A shape the rVM builds without any recursion fixture: the fixtures' own classes.
+    fn fixture_free_shape() -> DeclaredShape {
+        DeclaredShape {
+            profile: CoreProfile::Test,
+            tier: 14,
+            program_log_height: 13,
+            input_log_height: 12,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: 2,
+            mem_log_height: 18,
+        }
+    }
+
+    /// A decodable, canonical rVM proof that gets exactly as far as the checks under test: the
+    /// header fields as given, the interface digest `covered` and `binding` make (so the rVM's
+    /// digest compare passes), the degree bits `log_ext_degrees` wants for them (so
+    /// `Machine::verify`'s shape checks pass), and an all-zero batch — which could never verify,
+    /// but everything that would reject it runs after the verifier-key build. No prove, no
+    /// fixture: postcard decodes zero bytes as empty vectors and zero field elements.
+    fn crafted_proof(
+        shape: &DeclaredShape,
+        covered: &[CoveredBundle],
+        binding: &[u32; 8],
+        tier: usize,
+        reduce_log_height: u8,
+    ) -> Vec<u8> {
+        use p3_field::PrimeField64;
+        let vk = AggExecutor::inner_key(shape).unwrap();
+        let program = aggregate_program(&vk);
+        let pvs: Vec<Vec<u64>> = covered.iter().map(|c| c.public_values.to_vec()).collect();
+        let public = randprotocol_rvm::public_values::interface_words_bound(&vk.shape, &vk.key, binding, &pvs);
+        let digest: Vec<u64> = randprotocol_rvm::public_values::public_digest(&public).iter().map(|f| f.as_canonical_u64()).collect();
+        let h = randprotocol_rvm::machine::MIN_LOG_HEIGHT;
+        let mut bytes = postcard::to_allocvec(&(tier, h, h, h, reduce_log_height, digest)).unwrap();
+        bytes.extend_from_slice(&[0u8; 4096]);
+        let mut proof: randprotocol_rvm::machine::Proof = postcard::from_bytes(&bytes).expect("zeros decode as an empty batch");
+        proof.batch.degree_bits =
+            randprotocol_rvm::machine::log_ext_degrees(&program, randprotocol_rvm::machine::Tier(tier), h, h, h, reduce_log_height);
+        proof.to_bytes()
+    }
+
+    fn program_reduces(shape: &DeclaredShape) -> bool {
+        let program = aggregate_program(&AggExecutor::inner_key(shape).unwrap());
+        program.instrs.iter().any(|i| matches!(i.op, randprotocol_rvm::isa::Op::Reduce))
+    }
+
+    /// The interface review's INTERFACE-4: the rVM keys its verifier-key cache by `(tier,
+    /// program, reduce)` and takes `reduce` from the proof's own `reduce_log_height`. A proof
+    /// declaring the reduce instance the registered program does not use (or omitting the one it
+    /// does) is invalid by construction — but `Machine::verify` built and cached a verifier key
+    /// for it first: a 13 s (test) to 70 s (production) build, bought with garbage, evicting a
+    /// warm key from the 64-entry FIFO. The node refuses the flag mismatch before any key work.
+    #[test]
+    fn a_proof_whose_reduce_flag_is_not_the_programs_is_refused_before_any_key_build() {
+        let ex = AggExecutor::new(FriProfile::Test);
+        let shape = fixture_free_shape();
+        let covered = vec![CoveredBundle { public_values: [7; 34], shape }];
+        let binding = [3u32; 8];
+        let flipped = if program_reduces(&shape) { 0 } else { randprotocol_rvm::machine::MIN_LOG_HEIGHT };
+        let proof = crafted_proof(&shape, &covered, &binding, admitted_tiers(FriProfile::Test)[0] as usize, flipped);
+        let before = ex.rvm.cached_keys();
+        let err = ex.verify_aggregate(&shape, &covered, &proof, &binding).unwrap_err();
+        assert_eq!(ex.rvm.cached_keys(), before, "no verifier key was built for a flipped reduce flag: {err}");
+        assert!(format!("{err}").contains("reduce"), "refused by name: {err}");
     }
 
     /// Why the wrapper exists: the bare zkVM executor names its own refusal, so a miswired node
