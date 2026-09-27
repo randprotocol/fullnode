@@ -116,7 +116,14 @@ chain and the operator housekeeping (dead `set_real_ip_from 159.89.185.254` on t
 `.bak` files loaded from `sites-enabled/`). **Trap:** a committed config file is not a running
 service — check `systemctl is-active` and `ss -ltn` before reasoning from one.
 
-### Genesis vesting — timelocked RAND for team / investors / partners (2026-09-28, `feat/timelock-genesis`, on no chain)
+### v0.5.11 — genesis vesting: timelocked RAND for team / investors / partners (2026-09-28, PR #6, genesis-gated: active on no chain)
+
+**Tagged `v0.5.11`** on `main` (PR #6 fast-forwarded). Node-safe on chain 15: without a `vesting`
+genesis section the four new actions are refused `UnsupportedAction("vesting")` at admission, so a
+v0.5.11 node behaves as v0.5.10 for honest traffic; it only matters at the next cut. Release suite on
+the laptop: core 503, node lib 327 (+13 recursion-fixture gap), node bins 18, genesis_cli/submit/ws
+green, client lib 114; cluster and wallet_flow **not run**. The zkVM/rVM fixes planned as v0.5.11
+become **v0.6** (user, 2026-09-28).
 
 Spec `docs/superpowers/specs/2026-09-28-genesis-vesting-design.md`, guide `docs/vesting.md`, plan
 `docs/superpowers/plans/2026-09-28-genesis-vesting.md`. A shielded note cannot be held back, so a
