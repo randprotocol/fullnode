@@ -49,6 +49,28 @@ fullnode, randscan, randprotocol.org and clients; every task reviewed, then two 
   `RPC_BLOCKING` process-wide semaphore (v0.5.8) makes `rpc::tests::a_token_transfer_reveals…` flaky
   under parallel load (passes alone).
 
+### 2026-09-28 — zk node-side fixes (`feat/zk-node-fixes`, not merged, not rolled)
+
+Node-local halves of the zk rescan; the vendored halves are other branches' (`feat/rvm-fixes`,
+`feat/zk-privacy-floor`). **Rolls one node at a time; nothing changes chain 15's rules** — its
+genesis hash `cc30e085…` stays pinned by `chain_15s_genesis_file_still_builds_chain_15`.
+
+- **CPUV-1 / ZKV-10 (medium, live)**: the bundle key has its own `Machine`
+  (`ZkExecutor::bundle_machine`) — eleven deploys of new program shapes no longer evict it from
+  the 64-entry FIFO — and `warm`/`warm_bundle` run under one lock (at most one key build a time).
+- **ZKG-1**: a bundle proof's published digest is read with `u32::try_from`. **ZKG-2**: the
+  `hc_bundle` pin is checked for every `deploy/genesis-chain*.json`.
+- **ZKV-11 (pc-wrap)**: a `Deploy` whose padded program table crosses 2^32 is refused at the pool
+  on every chain (`admission::deploy_outside_pc_window`, permanent `BadProgram`) and, under a new
+  top-level genesis flag `program_pc_window: true` (next cut), by the ledger.
+- **COV-2 stopgap**: a call proof whose input/keccak/sha256 table is under 2^7 rows is not pooled
+  (`CallRevealsPrivateInputs`, non-permanent, never a ledger rule). **Trap:** until the prover floor
+  is vendored no wallet builds a compliant call, so a node on this build pools no call and the call
+  stages of `wallet_flow`/`cluster` are refused — merge with or after that re-vendor.
+- **The live proof cap is 8 MiB, not 2 MiB**: chains 13–15 set genesis `max_proof_bytes` to
+  8 388 608; `gas::MAX_PROOF_BYTES` (2 MiB) is only the default. Older entries below that say
+  "2 MiB" describe the default and carry a dated note.
+
 ### v0.5.9 — the 2026-09-27 rescan fixes (tagged 2026-09-27; roll status below)
 
 **ROLLED 2026-09-27 08:46–10:11 UTC, one node at a time, no pause.** GitHub release `v0.5.9`
@@ -1175,7 +1197,9 @@ set before it; fleets must run the same build (`docs/confidential.md`, "Constrai
 - `MAX_PROOF_BYTES` **stays 2 MiB**, re-measured on this tree (see the commit message and
   `docs/confidential.md`): the mandatory public table + 51 new cpu columns grow a keccak-free
   production proof by a few percent over set 5's 1 202 416 bytes (tier 10), still far under the
-  cap, and a keccak-carrying proof is still far over it.
+  cap, and a keccak-carrying proof is still far over it. *(Note 2026-09-28: that is the default
+  cap. Chains 13, 14 and 15 set genesis `max_proof_bytes` to 8 388 608 (8 MiB), so on the live
+  chain a keccak-carrying proof fits.)*
 - Vendoring mechanics worth knowing before the next resync (all in `deploy/sync-zkvm.sh`'s
   header): the `log_ext_degrees_pub` patch is re-anchored on the six-parameter `verifier_key`
   line and forwards all seven `log_ext_degrees` arguments; the domain-tag inlining gained a
@@ -1291,7 +1315,8 @@ through the constraint-set-5 re-vendor, not as a local patch — so read
   it met the ethSTARK conjectured 100-bit target but dropped the proven
   proximity-gaps floor to ~42 bits (vs ~86 at q=80). The paper's reconciliation
   keeps q=80 for exactly this reason. `MAX_PROOF_BYTES` is 2 MiB because of it —
-  at 80 queries the old 1 MiB cap rejected every production proof.
+  at 80 queries the old 1 MiB cap rejected every production proof. *(Note 2026-09-28: 2 MiB is
+  the default; chain 15's genesis, like 13's and 14's, sets `max_proof_bytes` to 8 MiB.)*
 - Completeness/robustness: memory-table sort key now matches the AIR's key
   arithmetic (honest ≥2^30 hash addresses were unprovable); the emulator rejects
   `ptr ≥ 2^30`; the poseidon2 permutation budget is a `ProveError`, not a panic

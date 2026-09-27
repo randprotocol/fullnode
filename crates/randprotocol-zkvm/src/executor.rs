@@ -623,7 +623,9 @@ impl ConfidentialExecutor for ZkExecutor {
     /// declares a keccak table if its guest actually calls `SYS_KECCAK`, no guest this chain
     /// deploys does, and at the production profile a keccak-bearing proof is ~1.91 MB larger
     /// than one without — 3 106 757 bytes at tier 10, which `randprotocol-core`'s 2 MiB
-    /// `MAX_PROOF_BYTES` refuses outright. Warming the keccak classes as well would multiply
+    /// `MAX_PROOF_BYTES` refuses outright (note 2026-09-28: that is the default cap; chains 13–15
+    /// set genesis `max_proof_bytes` to 8 MiB, where such a proof fits and is refused only past
+    /// `MAX_CALL_KECCAK_LOG_HEIGHT`). Warming the keccak classes as well would multiply
     /// this by the whole `[5, tier + 5]` range; a call that does declare one (at the `Test`
     /// profile, or once the block-space work makes such a proof admissible) pays the key-build
     /// cost once, like an unwarmed tier.

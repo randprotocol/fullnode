@@ -1324,7 +1324,8 @@ Encoded sizes (bincode's default configuration: fixed-width integers, 8-byte len
 | bundle proof | 327,203 measured for the hidden-asset guest at tier 14 under the `test` FRI profile |
 
 So a shielded transfer on the wire is about 1.43 MB at the 80-query production profile,
-essentially all proof. The ledger caps a proof at 2 MiB, an envelope
+essentially all proof. The ledger caps a proof at 2 MiB by default (chains 13–15 set
+`max_proof_bytes` to 8 MiB in their genesis; note 2026-09-28), an envelope
 at 2048 bytes, a program at 4096 words (or the genesis file's `max_program_words`, at most 65 535),
 and a block at 4 MiB of transaction bytes — two bundles
 per block at that default (`docs/block-space.md`; a genesis may raise the caps).

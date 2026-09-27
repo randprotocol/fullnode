@@ -123,6 +123,6 @@ accounting (M4.4).
 | `DEPLOY_PER_WORD` | 100,000 units | `gas.rs` |
 | `CALL_BASE`, `CALL_PER_TIER_STEP` | 1,000,000; 100,000 | `gas.rs` |
 | `MAX_PROGRAM_WORDS` | 4,096 — the default; a genesis file's `max_program_words` replaces it, up to `MAX_PROGRAM_WORDS_LIMIT` = 65,535 | `gas.rs` |
-| `MAX_PROOF_BYTES` | 2 MiB (constraint set 5's 80-query profile; re-measured and kept at constraint set 6) | `gas.rs` |
+| `MAX_PROOF_BYTES` | 2 MiB (constraint set 5's 80-query profile; re-measured and kept at constraint set 6) — the default; chains 13–15 set genesis `max_proof_bytes` to 8 MiB (note 2026-09-28) | `gas.rs` |
 | `MAX_BLOCK_BYTES`, `MAX_BLOCK_TXS` | 4 MiB, 2,000 | `gas.rs` |
 | tiers | 10, 12, 14, 16, 18, 20 cycles = `2ᵗ − 1` | `randprotocol-zkvm` `machine::TIERS` |

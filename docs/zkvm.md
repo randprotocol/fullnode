@@ -249,7 +249,7 @@ quarter as much (466 columns, +~400 KB at the production profile). Constraint se
 `public` table and wider cpu table grow every proof by a few percent over set 5 (measured in
 `docs/confidential.md`, "Constraint set 6"). `randprotocol-core`'s `MAX_PROOF_BYTES` is 2 MiB, so no
 keccak-bearing proof is admissible on this chain today; `docs/block-space.md` has the block-space
-consequences.
+consequences. *(Note 2026-09-28: 2 MiB is `gas::MAX_PROOF_BYTES`, the default for a genesis that does not set `max_proof_bytes`. The live chain does: chain 15's genesis — like chains 13 and 14 — sets `max_proof_bytes` to 8 388 608 (8 MiB), so a keccak-carrying proof fits there.)*
 
 Proving is a wallet-side cost paid once; verification is the consensus cost paid by every node.
 

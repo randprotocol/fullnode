@@ -268,7 +268,7 @@ headline changes:
 **`MAX_PROOF_BYTES` is 2 MiB** (`crates/randprotocol-core/src/gas.rs`), raised from 1 MiB in the same
 change: at 80 queries the 1 MiB cap rejected *every* production proof. 2 MiB is the smallest
 power-of-two cap above the measured sizes with room for the per-proof variation, and it sits
-deliberately below the ~3.11 MB a keccak-bearing proof costs. **`MAX_BLOCK_BYTES` stays 4 MiB** —
+deliberately below the ~3.11 MB a keccak-bearing proof costs. *(Note 2026-09-28: 2 MiB is `gas::MAX_PROOF_BYTES`, the default for a genesis that does not set `max_proof_bytes`. The live chain does: chain 15's genesis — like chains 13 and 14 — sets `max_proof_bytes` to 8 388 608 (8 MiB), so a keccak-carrying proof fits there.)* **`MAX_BLOCK_BYTES` stays 4 MiB** —
 `docs/block-space.md` §5 records that decision: at ~1.3 MB per shielded transfer that is three
 transfers per block, and block-level aggregation rather than a bigger block is the queued remedy.
 (Both are now genesis parameters with these values as defaults; chain 13 raises them to 8 MiB and
@@ -505,8 +505,8 @@ is no `effect` field.
   above 65 535, the word count the zkVM can prove), `base_pc % 4 == 0`, every word decodes,
   `public.len() <= max_program_public_words` (checked first, before any fee or code work),
   `fee >= BUNDLE_BASE + 100_000 * (words + public)`.
-- Call: program exists; `proof.len() <= max_proof_bytes` (genesis; 2 MiB, `gas::MAX_PROOF_BYTES`,
-  when the file does not set it: raised for constraint set 5's proof sizes, re-measured and kept at
+- Call: program exists; `proof.len() <= max_proof_bytes` (genesis — 8 388 608 on chains 13–15;
+  2 MiB, `gas::MAX_PROOF_BYTES`, when the file does not set it: raised for constraint set 5's proof sizes, re-measured and kept at
   constraint set 6's); the input envelope within `max_call_envelope_bytes` (18 432 by default); the
   proof's header is pinned before any verifier key is built (next paragraph); the
   proof verifies against the stored program's `hc` for the tier it declares, and its `H_PUB`
