@@ -1,0 +1,15 @@
+# rpc.randprotocol.org — NOT a passthrough to this validator. The approved design (website repo,
+# 2026-09-17 account-wallet-and-rpc-proxy) keeps rand_mint, rand_getPeers and the viewing-key
+# methods off the public RPC, and stock Caddy cannot filter JSON-RPC methods, so every request is
+# handed to the filtered, rate-limited proxy at https://randprotocol.org/api/rpc (method allowlist,
+# 12 MiB body, per-IP limits). This node's own RPC stays on 127.0.0.1:8545.
+rpc.randprotocol.org {
+	request_body {
+		max_size 12MB
+	}
+	rewrite * /api/rpc
+	reverse_proxy https://randprotocol.org {
+		header_up Host randprotocol.org
+		header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}
+	}
+}
