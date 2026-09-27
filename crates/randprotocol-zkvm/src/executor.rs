@@ -453,7 +453,7 @@ impl ZkExecutor {
     fn pinned_proof_digest(&self, heights: (u8, u8, u8), proof: &[u8]) -> Result<Word8, ConfidentialError> {
         let (plh, ilh, pubh) = heights;
         let p = self.decode_and_check(proof, plh, ilh, pubh, true)?;
-        Ok(std::array::from_fn(|k| p.public_values[pv::OUT0 + k] as u32))
+        published_digest(&p.public_values)
     }
 
     /// Verifies a proof of a pinned bundle guest (heights `heights`, digest `hc`) against the
@@ -474,6 +474,23 @@ impl ZkExecutor {
             .verify_public(hc, binding, &p)
             .map_err(|e| ConfidentialError::InvalidBundleProof(format!("{e:?}")))
     }
+}
+
+/// The eight output words a proof publishes (`pv::OUT0..8`) as the digest they encode — each a
+/// checked `u32::try_from`, never an `as` (ZKG-1, 2026-09-28). `decode_and_check` already refuses
+/// a proof with an output outside 32 bits, so on today's path the narrowing could not bite; but
+/// `x as u32` of `2^32 + w` is `w`, the very digest an honest proof publishing `w` carries, so a
+/// silent truncation here would turn any future gap in that check into a digest match. The pruned
+/// path (`Ledger::check_bundle_proof`) reads the same words with `u32::try_from` and refuses with
+/// `BadDigest`; this one refuses the proof as malformed, and a vector too short to hold the eight
+/// words likewise, rather than indexing past its end.
+fn published_digest(public_values: &[u64]) -> Result<Word8, ConfidentialError> {
+    let mut digest: Word8 = [0; 8];
+    for (k, slot) in digest.iter_mut().enumerate() {
+        let word = public_values.get(pv::OUT0 + k).ok_or(ConfidentialError::MalformedProof)?;
+        *slot = u32::try_from(*word).map_err(|_| ConfidentialError::MalformedProof)?;
+    }
+    Ok(digest)
 }
 
 /// The core crate's digest record as the hidden guest's (the two are field-for-field the same;
@@ -948,5 +965,28 @@ mod tests {
         assert_eq!(mirror::IN0, real::IN0);
         assert_eq!(mirror::PUB0, real::PUB0);
         assert_eq!(mirror::NUM, real::NUM);
+    }
+
+    /// ZKG-1: an output word past 32 bits is refused, never narrowed. `x as u32` of
+    /// `2^32 + w` is `w`, so a truncating read would hand back exactly the digest a proof
+    /// publishing `w` does — the pruned path (`Ledger::check_bundle_proof`) already refuses the
+    /// same record with `BadDigest`.
+    #[test]
+    fn a_published_output_word_past_32_bits_is_refused_not_truncated() {
+        use super::*;
+        let mut pvs = vec![0u64; pv::NUM];
+        for k in 0..8 {
+            pvs[pv::OUT0 + k] = 7 + k as u64;
+        }
+        let honest = published_digest(&pvs).expect("u32 words");
+        assert_eq!(honest, std::array::from_fn(|k| 7 + k as u32));
+        pvs[pv::OUT0 + 3] += 1 << 32;
+        let got = published_digest(&pvs);
+        assert!(
+            matches!(got, Err(ConfidentialError::MalformedProof)),
+            "a word past u32 read as {got:?}, the honest digest {honest:?}"
+        );
+        pvs.truncate(pv::OUT0 + 4);
+        assert!(matches!(published_digest(&pvs), Err(ConfidentialError::MalformedProof)), "a short vector is refused too");
     }
 }
