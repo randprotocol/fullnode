@@ -377,12 +377,26 @@ fn validate_for_pool(
     profile: randprotocol_core::types::FriProfile,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<(), randprotocol_core::TxError> {
+    validate_for_pool_with(tx, ledger, executor, |window, covers| {
+        assemble_covered(storage, ledger.height(), window, profile, covers)
+    })
+}
+
+/// [`validate_for_pool`] over any covered-record source — the store in production, a counting
+/// stand-in in the test that pins the order: everything the transaction's own bytes and the
+/// register decide runs in `preflight_aggregate`, before `assemble` reads a single cover.
+fn validate_for_pool_with(
+    tx: &Transaction,
+    ledger: &Ledger,
+    executor: &dyn ConfidentialExecutor,
+    assemble: impl FnOnce(u64, &[Hash]) -> Result<Vec<randprotocol_core::types::CoveredBundle>, randprotocol_core::TxError>,
+) -> Result<(), randprotocol_core::TxError> {
     let randprotocol_core::types::Action::Aggregate { covers, .. } = &tx.action else {
         return ledger.validate(tx, executor);
     };
     ledger.preflight_aggregate(tx)?;
     let window = ledger.aggregation().expect("preflight checked the gate").window;
-    let covered = assemble_covered(storage, ledger.height(), window, profile, covers)?;
+    let covered = assemble(window, covers)?;
     ledger.validate_aggregate(tx, &covered, executor).map(|_| ())
 }
 
@@ -5094,6 +5108,74 @@ mod tests {
         assert!(
             validate_for_pool(&mint, &gs.ledger, &storage, randprotocol_core::types::FriProfile::Test, &StubExecutor).is_ok()
         );
+    }
+
+    /// The rescan's ZKQ-1: `preflight_aggregate` checked only the gate, the sizes and the chain
+    /// id, so the cover count, the duplicates and the aggregator's signature were checked after
+    /// `assemble_covered` had read every cover from the store. One real bundle hash repeated to
+    /// the byte cap (~65 000 times, with a junk proof) cost that many RocksDB reads and decodes of
+    /// a ~1.2 MB record, and saturated the admission workers. Every one of those verdicts is the
+    /// transaction's own bytes or the register's, so each now refuses before a single read.
+    #[test]
+    fn a_cover_set_or_signature_admission_can_refuse_reads_nothing_from_the_store() {
+        let gs = genesis_of(7, &[&key(1)], vec![], 2);
+        let shape = DeclaredShape {
+            profile: randprotocol_core::types::FriProfile::Test,
+            tier: 14,
+            program_log_height: 12,
+            input_log_height: 10,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: 4,
+            mem_log_height: 16,
+        };
+        let mut ledger = gs.ledger.clone();
+        ledger.set_aggregation(Some(agg_cfg(shape, Hash::digest(b"the bundle guest"))));
+        ledger.set_height(1);
+        let kp = key(7);
+        register_aggregator(&mut ledger, &kp, 100 * randprotocol_core::UNITS_PER_RAND);
+        let reads = std::cell::Cell::new(0usize);
+        let run = |tx: &Transaction| {
+            validate_for_pool_with(tx, &ledger, &StubExecutor, |_, covers| {
+                reads.set(reads.get() + covers.len());
+                Err(randprotocol_core::TxError::Aggregation(AggregationError::UnknownCover(covers[0])))
+            })
+        };
+        let h = |i: u8| Hash::digest(&[i]);
+        let repeated = aggregate_tx(7, &kp, 0, 1, vec![h(1); 1000], b"junk".to_vec());
+        let too_many = aggregate_tx(7, &kp, 0, 1, (0..4).map(h).collect(), b"junk".to_vec());
+        let empty = aggregate_tx(7, &kp, 0, 1, vec![], b"junk".to_vec());
+        let unknown = aggregate_tx(7, &key(8), 0, 1, vec![h(1)], b"junk".to_vec());
+        let mut forged = aggregate_tx(7, &kp, 0, 1, vec![h(1)], b"junk".to_vec());
+        if let randprotocol_core::types::Action::Aggregate { signature, .. } = &mut forged.action {
+            *signature = key(8).sign(b"not the aggregate's signing hash");
+        }
+        let stale = aggregate_tx(7, &kp, 3, 1, vec![h(1)], b"junk".to_vec());
+        for (what, tx) in [
+            ("repeated", &repeated),
+            ("too many", &too_many),
+            ("empty", &empty),
+            ("unregistered", &unknown),
+            ("forged", &forged),
+            ("stale nonce", &stale),
+        ] {
+            match run(tx) {
+                Err(randprotocol_core::TxError::Aggregation(
+                    AggregationError::TooManyCovers { .. }
+                    | AggregationError::DuplicateCover(_)
+                    | AggregationError::EmptyCoverSet
+                    | AggregationError::UnknownAggregator(_)
+                    | AggregationError::BadSignature
+                    | AggregationError::BadNonce { .. },
+                )) => {}
+                other => panic!("{what}: refused by its bytes or the register, got {other:?}"),
+            }
+            assert_eq!(reads.get(), 0, "{what}: no cover was read from the store");
+        }
+        // A well-formed one does reach the store, once per cover.
+        let fine = aggregate_tx(7, &kp, 0, 1, vec![h(1), h(2)], b"junk".to_vec());
+        assert!(run(&fine).is_err());
+        assert_eq!(reads.get(), 2, "the honest set is assembled");
     }
 
     /// End to end through the worker arm: the stored fixture bundle assembled, the ledger's

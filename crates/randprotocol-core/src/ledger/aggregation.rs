@@ -582,15 +582,17 @@ fn shape_mismatch(a: &DeclaredShape, b: &DeclaredShape) -> Option<(&'static str,
 }
 
 impl Ledger {
-    /// The byte-level half of aggregate admission (spec §4 step 1): everything checkable
-    /// without the covered records or the register, run by the node before it assembles them,
-    /// so a garbage aggregate is refused before any storage read. `validate_aggregate` re-runs
-    /// these as its own first step — this is a pre-screen, like the mempool's.
+    /// The half of aggregate admission that needs no covered record (spec §4 steps 1, 2 and
+    /// 4's ledger rules), run by the node before it assembles them, so a garbage aggregate is
+    /// refused before any storage read: the byte-level caps and the chain id first — cacheable
+    /// verdicts, never pre-empted by state — then the cover count and duplicates, then the
+    /// register's entry, nonce, signature and unbonding bar (ZKQ-1). `validate_aggregate`
+    /// re-runs all of it — this is a pre-screen, like the mempool's.
     pub fn preflight_aggregate(&self, tx: &Transaction) -> Result<(), TxError> {
-        let Action::Aggregate { proof, envelope, .. } = &tx.action else { return Err(NOT_AGGREGATION) };
-        if self.aggregation().is_none() {
+        let Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope, signature } = &tx.action else {
             return Err(NOT_AGGREGATION);
-        }
+        };
+        let Some(cfg) = self.aggregation() else { return Err(NOT_AGGREGATION) };
         if proof.len() > self.max_proof_bytes() {
             return Err(TxError::ProofTooLarge);
         }
@@ -600,6 +602,30 @@ impl Ledger {
         }
         if tx.chain_id != self.chain_id {
             return Err(TxError::WrongChain { expected: self.chain_id, actual: tx.chain_id });
+        }
+        // Everything else the transaction's own bytes and the register decide, before the node
+        // reads a single cover from its store (the rescan's ZKQ-1). These ran only inside
+        // `validate_aggregate`, after `assemble_covered` — so one bundle hash repeated up to the
+        // byte cap (~65 000 times, a junk proof) bought as many RocksDB reads and decodes of a
+        // ~1.2 MB record and saturated the admission workers. Step 4's count and duplicate rules,
+        // then step 2's register, nonce, signature and unbonding bar: the same checks, in the
+        // same order, that `validate_aggregate` re-runs.
+        if covers.is_empty() {
+            return Err(AggregationError::EmptyCoverSet.into());
+        }
+        if covers.len() > cfg.max_covers as usize {
+            return Err(AggregationError::TooManyCovers { got: covers.len(), max: cfg.max_covers }.into());
+        }
+        for (i, cover) in covers.iter().enumerate() {
+            if covers[..i].contains(cover) {
+                return Err(AggregationError::DuplicateCover(*cover).into());
+            }
+        }
+        let entry = signed_by(self, aggregator, *nonce, signature, || {
+            aggregate_signing_hash(tx.chain_id, *nonce, *time, r, covers, &Hash::digest(proof))
+        })?;
+        if entry.unbonding.is_some() {
+            return Err(AggregationError::Unbonding(*aggregator).into());
         }
         Ok(())
     }
