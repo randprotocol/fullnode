@@ -110,7 +110,7 @@ transaction that looked different when there was no change would leak that there
 
 | | public on chain | hidden |
 |---|---|---|
-| **transfer** (`Action::None`) | anchor, all four nullifiers, all four commitments, fee, `burn_a = burn_r = burn_asset = 0`, `time`, four envelope ciphertexts, the bundle proof | who sent it, who is paid, the amount, which asset (RAND or any RPL token), the change, which leaves were spent, which slots were dummies |
+| **transfer** (`Action::None`) | anchor, all four nullifiers, all four commitments, fee, `burn_a = burn_r = burn_asset = 0`, `time`, four envelope ciphertexts, the bundle proof | who sent it, who is paid, the amount, the change, which leaves were spent — and, **only under the branch-free guest (v2)**, which asset (RAND or any RPL token) and which slots were dummies: under the v1 guest chains 14 and 15 run, the proof shows both (§6, "The bundle proof's instruction counts") |
 | **Deploy** | everything above, plus `base_pc` and the program's words (so the program id and its code) | who deployed it, and what the paying notes were worth |
 | **Call** | everything a transfer publishes, plus the program id, the call proof, and the receipt's tier and eight output words | the private inputs, registers, memory, branches taken, the real cycle count (only the padded tier shows), who called it |
 | **Mint** (faucet) | the new note's commitment, its envelope, the **amount in the clear**, the recipient's `pk` and the note's `time`/`r` (POOL-1: the commitment opening, checked by the ledger, not merely declared), and the minting validator's public key (shown as its address) and signature | which notes the recipient later spends and to whom — the address that received a mint is now public, but nothing about its later use is |
@@ -422,6 +422,47 @@ worth naming.
   amount and the destination.
 - **The program.** A deployed program is public code, and `hc` is binding, not hiding: anyone who
   can enumerate candidate programs can confirm which was deployed.
+- **The bundle proof's instruction counts (INT-2 / GV-1) — live on chains 14 and 15, closed by
+  the branch-free guest at the next cut.** Every proof carries one LogUp total per table,
+  unblinded, and the program table's is a public linear function of how many times each
+  instruction ran. The v1 hidden-asset guest (`guests::bundle_hidden`, `hc_bundle` `83d3a370…`)
+  skips the Merkle and asset checks for a dummy input and takes a different branch for a left
+  and a right Merkle child, so from any v1 bundle anyone can read **which of the four input slots
+  are real** — and so whether it moved a token (a RAND payment keeps slots 0–1 dummy) — and **the
+  number of 1 bits in each spent note's leaf index** (the 2026-09-27 zkVM review's
+  `audit_logup_leak` recovered the true pattern uniquely among 1.3 million candidates). Amounts,
+  owners, the asset id and the leaves themselves stay hidden.
+
+  The fix is a second guest, **`guests::bundle_hidden_v2`** (`hc_bundle`
+  `651043e2ff2fef28df2d8edbdbbc387668577af72dcc584ee7d850e093a2839b`): the same relation, the same
+  1 204-word witness and the same published digest (so the ledger, the wallet's plaintext and
+  every digest check are unchanged), with an instruction trace that does not depend on the
+  witness. Every slot, dummy or real, runs the full Merkle membership and asset check, and the
+  failure bit is masked by the slot's realness in arithmetic (`bad |= real & fail`, `real` taken
+  from the same registers that feed the conservation sums, so a note carrying value is never
+  exempt); the Merkle step writes the running node and the sibling to two fixed slots chosen by
+  address arithmetic on the index bit, the same instructions for a left and a right child. Its
+  only branches are counted loops over program constants. `tests/hidden_bundle.rs` checks that
+  honest witnesses differing in real/dummy slots, RAND/token and leaf-index popcounts run
+  identical per-instruction fetch counts (the program table's `MULT`, from which that total is
+  computed), syscalls, input reads per index, memory and ALU event counts and table heights —
+  and that v1's differ — and the whole cheating suite (`tests/hidden_cheating.rs`, the fuzz
+  included) runs both guests and requires the same digest from each. v2 proves at tier 14 at v1's
+  declared heights, so one verifier key serves both, and costs every witness about what v1's
+  four-real-input bundle did (12 272 cycles against v1's worst 14 242).
+
+  **v2 takes effect only on a genesis whose `hc_bundle` names it** — the next chain cut. A node
+  build carries both guests and runs a genesis naming either (`node::check_build_runs_genesis`
+  refuses any other digest); a wallet proves the guest `rand_status`'s `hc_bundle` names and
+  refuses a chain whose guest it does not carry. Chains 14 and 15 stay on v1, and every bundle
+  already on them keeps what it leaked.
+
+  What v2 does not hide is the part of INT-2 that is not about control flow: a table whose
+  lookups are indexed by *values* (the range and nibble tables, the memory and input tables) has a
+  total that is a function of the private values themselves. For a bundle those values are
+  dominated by keys and hash outputs, where the review found nothing recoverable, but the general
+  fix — blinding each table's total in the proof system — is a constraint change for every
+  program, not a guest change, and is not done (the review's R3, its second half; a chain cut).
 
 ### Disclosing on purpose
 
