@@ -2647,17 +2647,19 @@ async fn find_row(rpc: &RpcClient, text: &str, hint: &str, hit: impl Fn(&Value) 
     }
 }
 
-/// The pure core of [`parse_asset_amount`]: a decimal string (`"1.5"`, `"2"`) at `decimals`
-/// fractional digits, scaled to the smallest unit. No leading/trailing junk, no sign, no
-/// exponent — `int` and `frac` are each all-ASCII-digit or empty, and a literal `.` demands a
-/// non-empty fraction (`"2."` is refused, not read as `"2"`). More fraction digits than the asset
-/// carries is the one error message worth naming precisely, because it is the one a caller can
-/// fix by rounding; anything else just is not a decimal amount.
+/// The pure core of [`parse_asset_amount`]: a decimal string (`"1.5"`, `"2"`, and — as RAND's
+/// old `parse_amount` took them — `".5"` and `"2."`) at `decimals` fractional digits, scaled to
+/// the smallest unit. Surrounding whitespace is ignored; no sign, no exponent, no junk — `int`
+/// and `frac` are each all-ASCII-digit or empty, but not both empty (`""` and `"."` are
+/// refused). More fraction digits than the asset carries is the one error message worth naming
+/// precisely, because it is the one a caller can fix by rounding; anything else just is not a
+/// decimal amount.
 pub fn parse_decimal(text: &str, decimals: u8) -> Result<u64> {
-    let (int, frac) = text.split_once('.').unwrap_or((text, ""));
-    if int.is_empty() || !int.bytes().all(|c| c.is_ascii_digit()) || !frac.bytes().all(|c| c.is_ascii_digit()) || (text.contains('.') && frac.is_empty()) {
+    let (int, frac) = text.trim().split_once('.').unwrap_or((text.trim(), ""));
+    if (int.is_empty() && frac.is_empty()) || !int.bytes().all(|c| c.is_ascii_digit()) || !frac.bytes().all(|c| c.is_ascii_digit()) {
         return Err(anyhow!("{text} is not a decimal amount"));
     }
+    let int = if int.is_empty() { "0" } else { int };
     if frac.len() > decimals as usize {
         return Err(anyhow!("{text}: this asset has at most {decimals} decimals"));
     }
@@ -5699,6 +5701,15 @@ mod tests {
         assert!(e.contains("at most 9 decimals"), "{e}");
         assert_eq!(parse_decimal("2", 0).unwrap(), 2);
         assert!(parse_decimal("0.5", 0).is_err());
+        // The forms the old RAND `parse_amount` took (final review B4): a bare fraction and a
+        // trailing point; nothing at all, or a point alone, is still not an amount.
+        assert_eq!(parse_decimal(".5", 9).unwrap(), 500_000_000);
+        assert_eq!(parse_decimal("2.", 9).unwrap(), 2_000_000_000);
+        assert_eq!(parse_decimal("2.", 0).unwrap(), 2);
+        for bad in ["", ".", "1.2.3", "-1", "+1", "1e3", " ", "0x10"] {
+            assert!(parse_decimal(bad, 9).is_err(), "{bad:?}");
+        }
+        assert!(parse_decimal(".1234567891", 9).unwrap_err().to_string().contains("at most 9 decimals"));
     }
 
     /// [`format_decimal`] / [`display_amount`]: every digit at the asset's decimals, and the base
