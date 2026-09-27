@@ -5,6 +5,11 @@
 # The whole fleet runs one build (089bdd6, v0.5.7): a genesis-format change is a fork and a mixed
 # fleet stalls. NEVER run node B here too — B is the sgp1 droplet.
 set -euo pipefail
+# RETIRED 2026-09-27: validator A runs on the droplet rand-node-a (139.59.238.151, NODE_A in
+# deploy/nodes.env) with the same key. Starting this laptop copy too would sign every view twice
+# under one key — an equivocation — so it refuses unless the droplet has been stopped first and
+# RAND_NODE_A_ON_LAPTOP=1 says so deliberately.
+[ "${RAND_NODE_A_ON_LAPTOP:-}" = 1 ] || { echo "run-a.sh: node A runs on the droplet rand-node-a now; refusing to start a second copy of its key" >&2; exit 1; }
 HOME_A=${NODE_A_HOME:-$HOME/rand-node-a}
 KEYDIR=${KEYDIR:-$HOME/.rand-chain14}
 cd "$HOME_A"

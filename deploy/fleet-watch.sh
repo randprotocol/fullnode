@@ -38,14 +38,7 @@ for ip in $IPS; do
   [ "$health" = ok ] || alerts+=("$host: health $health")
 done
 rm -rf "$TMP"
-# Node A, local.
-a=$(rpc 127.0.0.1 rand_status); ah=$(echo "$a" | grep -oE '"height":[0-9]+' | cut -d: -f2)
-if [ -n "$ah" ]; then
-  rows+=("A|$ah|$(echo "$a" | grep -oE '"view":[0-9]+' | cut -d: -f2)|$(echo "$a" | grep -oE '"high_qc_view":[0-9]+' | cut -d: -f2)|$(rpc 127.0.0.1 rand_getVersion | grep -oE '"git_sha":"[0-9a-f]{7}' | cut -d'"' -f4)|$(rpc 127.0.0.1 rand_getHealth | grep -oE '"status":"[a-z_]+"' | cut -d'"' -f4)|$(df -h / | awk 'NR==2{print $4}')")
-  [ "$ah" -gt "$max_height" ] && max_height=$ah
-else
-  alerts+=("A: rpc closed")
-fi
+# Node A runs on its own droplet since 2026-09-27 (NODE_A in nodes.env), so the loop above covers it.
 # Behind, builds, stall.
 for r in "${rows[@]}"; do IFS='|' read -r host height _ _ build _ _ <<<"$r"; [ -n "$height" ] && [ "$height" != "?" ] && [ $((max_height - height)) -gt 60 ] && alerts+=("$host: behind by $((max_height - height))"); done
 distinct=$(printf '%s\n' "${builds[@]}" | sort -u | grep -c .)
