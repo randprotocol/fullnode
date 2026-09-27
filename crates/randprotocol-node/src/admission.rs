@@ -402,6 +402,14 @@ impl PeerLimiter {
     /// The refill is computed from the elapsed time on every call, so there is no timer and no
     /// background task: a bucket nobody touches for an hour is simply full when it is next asked.
     pub fn allow(&self, bucket: &mut TokenBucket, now: Instant) -> bool {
+        self.allow_n(bucket, 1.0, now)
+    }
+
+    /// Spend `cost` tokens at once — a byte budget spends a message's size (CN-4). All or
+    /// nothing: over the limit spends none, so a large message refused now is not charged for.
+    /// A cost above the burst can never pass; the caller sizes the burst above its largest
+    /// honest message.
+    pub fn allow_n(&self, bucket: &mut TokenBucket, cost: f64, now: Instant) -> bool {
         let available = match (bucket.tokens, bucket.last) {
             (Some(tokens), Some(last)) => {
                 let elapsed = now.saturating_duration_since(last).as_secs_f64();
@@ -411,11 +419,11 @@ impl PeerLimiter {
             _ => self.burst,
         };
         bucket.last = Some(now);
-        if available < 1.0 {
+        if available < cost {
             bucket.tokens = Some(available);
             return false;
         }
-        bucket.tokens = Some(available - 1.0);
+        bucket.tokens = Some(available - cost);
         true
     }
 }

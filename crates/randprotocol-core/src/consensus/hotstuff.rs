@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod precheck;
+pub use precheck::GossipPrecheck;
+
 /// How far ahead of our current view an inbound message's view may be before it is
 /// rejected. Deliberately generous (days of timed-out views): the bound exists to keep
 /// `view + 1` arithmetic away from u64 overflow and to bound speculative state, not to

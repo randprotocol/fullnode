@@ -743,6 +743,8 @@ struct Node {
     status_limiter: admission::PeerLimiter,
     /// The policy over every peer's `consensus_bucket` (see [`on_consensus_gossip`]).
     consensus_limiter: admission::PeerLimiter,
+    /// The byte policy over every peer's `consensus_byte_bucket` ([`consensus_byte_limiter`], CN-4).
+    consensus_byte_limiter: admission::PeerLimiter,
     /// The policy over every peer's `sync_bucket` (see [`admit_sync_request`]).
     sync_limiter: admission::PeerLimiter,
     /// This validator's signed not-held answers, re-served to repeated by-hash requests (SW-2).
@@ -797,6 +799,9 @@ struct Peer {
     status_bucket: admission::TokenBucket,
     /// The same, for the consensus messages this peer forwards ([`on_consensus_gossip`]).
     consensus_bucket: admission::TokenBucket,
+    /// Those messages' bytes (CN-4): the count alone let one forwarder push 64 messages a second
+    /// of up to gossip's 16 MiB transmit size each ([`classify_consensus_gossip`]).
+    consensus_byte_bucket: admission::TokenBucket,
     /// The same, for the sync requests this peer sends us ([`admit_sync_request`]).
     sync_bucket: admission::TokenBucket,
     /// Not asked for a batch before this instant (SYNC-2): set by [`back_off_sync_peer`] when the
@@ -846,6 +851,102 @@ fn on_consensus_gossip(
         return GossipOutcome::Report(admission::Acceptance::Ignore);
     }
     GossipOutcome::for_consensus()
+}
+
+/// The per-view allowance of consensus bytes one forwarder carries beyond a full block's
+/// transactions (CN-4): a proposal's header — its proposer key and signature, 3.7 KB, and its
+/// justify, one ~3.8 KB vote per validator of the set (68 KB at 18, 380 KB at 100) — plus the
+/// view's votes (18 × 3.8 KB) and, on a timeout, one NewView per validator each carrying a
+/// high QC (18 × ~72 KB ≈ 1.3 MB). 2 MiB covers all of it for an 18-validator set with room,
+/// and a set of about 25 before the NewView storm alone reaches it.
+pub const CONSENSUS_GOSSIP_VIEW_OVERHEAD_BYTES: usize = 2 << 20;
+/// The byte burst, in views' worth ([`consensus_view_bytes`]): eight, the count burst's "some
+/// seven whole views arriving at once" plus one — a leader's catch-up, or a view-change storm,
+/// delivering full blocks back to back through this node's one forwarder.
+pub const CONSENSUS_GOSSIP_BURST_VIEWS: u32 = 8;
+/// The byte refill, in views' worth a second: two. An honest view carries at most one proposal
+/// and the fleet runs ≥ 1 s a block (~1.4 s measured), so a forwarder's honest share is at most
+/// one view a second even when every block is full and every view also times out — which two
+/// cannot both be at once. Twice that is the headroom.
+pub const CONSENSUS_GOSSIP_VIEWS_PER_SEC: f64 = 2.0;
+
+/// One view's worth of honest consensus bytes on a chain whose blocks carry up to
+/// `max_block_bytes` of transactions: a full block plus [`CONSENSUS_GOSSIP_VIEW_OVERHEAD_BYTES`].
+pub fn consensus_view_bytes(max_block_bytes: usize) -> usize {
+    max_block_bytes.saturating_add(CONSENSUS_GOSSIP_VIEW_OVERHEAD_BYTES)
+}
+
+/// The byte policy over every forwarder's `consensus_byte_bucket` (CN-4). On a default 4 MiB
+/// chain that is 48 MiB of burst and 12 MiB a second; before, the count bucket alone admitted
+/// 256 × 16 MiB = 4 GiB of burst and 64 × 16 MiB = 1 GiB a second per connection. The burst is
+/// eight views, so it always exceeds the largest honest message (one proposal, under one view)
+/// and gossip's transmit size (`max(16 MiB, max_block_bytes + 1 MiB)`): nothing an honest peer
+/// can send is unpassable.
+pub fn consensus_byte_limiter(max_block_bytes: usize) -> admission::PeerLimiter {
+    let view = consensus_view_bytes(max_block_bytes);
+    let burst = (view as u64).saturating_mul(CONSENSUS_GOSSIP_BURST_VIEWS as u64).min(u32::MAX as u64) as u32;
+    admission::PeerLimiter::new(burst, view as f64 * CONSENSUS_GOSSIP_VIEWS_PER_SEC)
+}
+
+/// What the consensus gossip arm does with one delivered message (CN-4): the one report
+/// gossipsub gets for it, and whether the replica is handed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsensusGossipVerdict {
+    pub report: admission::Acceptance,
+    pub handle: bool,
+}
+
+/// The consensus gossip arm's whole decision, in order (CN-4):
+///
+/// 1. The forwarder's message count ([`on_consensus_gossip`], SW-1(d)/SW-3) and then its bytes
+///    ([`consensus_byte_limiter`]): over either, `Ignore`d — not forwarded, not handled, never
+///    `Reject`ed, since an honest relay in a burst looks the same. The size is the message's
+///    encoded size, a walk of the decoded value with no allocation.
+/// 2. [`HotStuff::precheck_gossip`]: lengths, counts, a known signer and one signature verify.
+///    `Accept` forwards and hands it to the replica, as every metered message was before.
+///    `Reject` — malformed or forged whatever this node's state — is neither forwarded nor
+///    handled. `Ignore` — stale, too far ahead, a signer in no set this replica knows — is not
+///    forwarded but is still handed to the replica, which is the authority: a node that has not
+///    derived the next epoch's set yet must still take the first proposal of that epoch; it
+///    just does not vouch for it to the mesh.
+///
+/// The precheck costs one Dilithium2 verify (~0.1 ms) before the report, which is what the
+/// report used to be free of; that is what it takes to stop relaying forged messages, and a
+/// proposal's execution — the reason the report goes out before handling — is still after it.
+#[allow(clippy::too_many_arguments)]
+fn classify_consensus_gossip(
+    peers: &mut HashMap<PeerId, Peer>,
+    limiter: &admission::PeerLimiter,
+    byte_limiter: &admission::PeerLimiter,
+    hs: &HotStuff,
+    forwarder: PeerId,
+    msg: &ConsensusMessage,
+    now: Instant,
+) -> ConsensusGossipVerdict {
+    use admission::Acceptance;
+    use randprotocol_core::consensus::GossipPrecheck;
+    let ignored = ConsensusGossipVerdict { report: Acceptance::Ignore, handle: false };
+    if on_consensus_gossip(peers, limiter, forwarder, now) != GossipOutcome::for_consensus() {
+        return ignored;
+    }
+    let bytes = bincode::serialized_size(msg).unwrap_or(u64::MAX) as f64;
+    // Spent in place: `TokenBucket` is `Copy`. The entry exists: `on_consensus_gossip` made it.
+    let bucket = &mut peers.entry(forwarder).or_default().consensus_byte_bucket;
+    if !byte_limiter.allow_n(bucket, bytes, now) {
+        tracing::debug!(%forwarder, bytes, "consensus gossip over the forwarder's byte budget; ignored");
+        return ignored;
+    }
+    match hs.precheck_gossip(msg) {
+        GossipPrecheck::Accept => ConsensusGossipVerdict { report: Acceptance::Accept, handle: true },
+        GossipPrecheck::Ignore(why) => {
+            tracing::debug!(%forwarder, "consensus gossip not forwarded: {why}");
+            ConsensusGossipVerdict { report: Acceptance::Ignore, handle: true }
+        }
+        GossipPrecheck::Reject(why) => {
+            tracing::debug!(%forwarder, "consensus gossip rejected: {why}");
+            ConsensusGossipVerdict { report: Acceptance::Reject, handle: false }
+        }
+    }
 }
 
 /// Inbound sync requests one peer may send back to back, and the rate it recovers them at (SW-2).
@@ -1416,6 +1517,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // spec §8), computed once here and handed to the swarm and the serve path.
     let identity = key.derive_subkey(b"rand-p2p-identity");
     let wire = network::WireLimits::for_ledger(&gs.ledger);
+    // The consensus byte budget is sized off the same genesis cap (CN-4).
+    let max_block_bytes = gs.ledger.max_block_bytes();
     let (net, mut events) = network::start(
         NetworkConfig {
             chain_id: gs.chain_id,
@@ -1570,6 +1673,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
         status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
         consensus_limiter: admission::PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC),
+        consensus_byte_limiter: consensus_byte_limiter(max_block_bytes),
         sync_limiter: admission::PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC),
         not_held_signed: NotHeldCache::default(),
         peer_memory: PeerMemory::default(),
@@ -2309,16 +2413,23 @@ impl Node {
             // undecodable message never gets this far — the network task reports that one itself.
             NetworkEvent::Gossip { from, msg, id } => match msg {
                 GossipMessage::Consensus(m) => {
-                    // Metered per forwarder (SW-1(d)/SW-3): over its budget a message is ignored —
-                    // not forwarded and not handled. Within it, reported before handling as it
-                    // always was, because a proposal's verification stays on this loop and the
-                    // report must not queue behind it (moving the accept after handling would
-                    // change when votes and proposals reach the rest of the fleet).
-                    let outcome =
-                        on_consensus_gossip(&mut self.peers, &self.consensus_limiter, id.propagation_source, Instant::now());
-                    let handle = outcome == GossipOutcome::for_consensus();
-                    self.report(id, outcome).await;
-                    if handle {
+                    // Metered per forwarder by count and bytes (SW-1(d)/SW-3, CN-4), then prechecked
+                    // (CN-4): only a message this node would vouch for is accepted, so forwarded
+                    // (`classify_consensus_gossip`). Still reported before handling, because a
+                    // proposal's execution stays on this loop and the report must not queue behind
+                    // it (moving the accept after handling would change when votes and proposals
+                    // reach the rest of the fleet); the precheck is one signature verify.
+                    let verdict = classify_consensus_gossip(
+                        &mut self.peers,
+                        &self.consensus_limiter,
+                        &self.consensus_byte_limiter,
+                        &self.hs,
+                        id.propagation_source,
+                        &m,
+                        Instant::now(),
+                    );
+                    self.report(id, GossipOutcome::Report(verdict.report)).await;
+                    if verdict.handle {
                         self.on_consensus(m).await?
                     }
                 }
@@ -3318,6 +3429,134 @@ mod tests {
         // a rejected sync batch) is metered on a fresh one, as a transaction's is — never refused
         // outright: a validator's votes must not be lost to bookkeeping.
         assert_eq!(on_consensus_gossip(&mut peers, &limiter, pid(3), now), GossipOutcome::for_consensus());
+    }
+
+    /// A four-validator replica (keys 1..=4) at genesis, as the node's gossip arm sees it.
+    fn gossip_replica() -> HotStuff {
+        let (k1, k2, k3, k4) = (key(1), key(2), key(3), key(4));
+        let gs = genesis_of(7, &[&k1, &k2, &k3, &k4], vec![], 1000);
+        let mut ccfg = ConsensusConfig::new(7, gs.validators.clone(), gs.hash());
+        ccfg.domain = gs.signing_domain();
+        HotStuff::new(ccfg, Some(key(1)), gs.block.clone(), gs.ledger.clone(), Arc::new(StubExecutor))
+    }
+
+    /// An honest proposal for the replica's view by that view's leader, extending genesis and
+    /// carrying `txs` (their root filled in).
+    fn gossip_proposal(hs: &HotStuff, txs: Vec<Transaction>) -> ConsensusMessage {
+        let genesis = hs.committed_hash();
+        let leader = (1..=4u8).map(key).find(|k| k.address() == hs.leader(hs.view())).unwrap();
+        let header = BlockHeader {
+            height: 1,
+            view: hs.view(),
+            parent: genesis,
+            proposer: leader.public_key().clone(),
+            timestamp_ms: 0,
+            tx_root: Block::tx_root(&txs),
+            state_root: Hash::ZERO,
+            justify: QuorumCertificate::genesis(genesis),
+        };
+        ConsensusMessage::Proposal(Block::sign(hs.domain(), header, txs, &leader))
+    }
+
+    /// CN-4 (scan 2026-09-27, medium): the consensus arm accepted — so gossipsub forwarded
+    /// fleet-wide — every decodable proposal, vote and new view before anything looked at it. A
+    /// vote from a key no set holds is not forwarded now, one forged under a validator's key is
+    /// rejected and never handed to the replica, and honest messages are accepted exactly as
+    /// before. A message this replica merely cannot place (too far ahead) is not forwarded but
+    /// still handled: the replica decides, and nobody is penalised.
+    #[test]
+    fn consensus_gossip_is_prechecked_before_it_is_forwarded() {
+        use crate::admission::{Acceptance, PeerLimiter};
+        let hs = gossip_replica();
+        let pid = PeerId::from(libp2p::identity::Keypair::ed25519_from_bytes([1; 32]).unwrap().public());
+        let mut peers: HashMap<PeerId, Peer> = HashMap::new();
+        let limiter = PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC);
+        let bytes = consensus_byte_limiter(gas::MAX_BLOCK_BYTES);
+        let now = Instant::now();
+        let mut judge = |m: &ConsensusMessage| classify_consensus_gossip(&mut peers, &limiter, &bytes, &hs, pid, m, now);
+        let accepted = ConsensusGossipVerdict { report: Acceptance::Accept, handle: true };
+        let rejected = ConsensusGossipVerdict { report: Acceptance::Reject, handle: false };
+        let not_forwarded = ConsensusGossipVerdict { report: Acceptance::Ignore, handle: true };
+
+        let view = hs.view();
+        let vote = |k: u8, v: u64| ConsensusMessage::Vote(Vote::sign(hs.domain(), v, Hash([7; 32]), &key(k)));
+        assert_eq!(judge(&vote(2, view)), accepted, "an honest vote");
+        let nv = randprotocol_core::consensus::NewView::sign(hs.domain(), view, hs.high_qc().clone(), &key(3));
+        assert_eq!(judge(&ConsensusMessage::NewView(nv)), accepted, "an honest new view");
+        assert_eq!(judge(&gossip_proposal(&hs, vec![])), accepted, "an honest proposal");
+
+        assert_eq!(judge(&vote(9, view)), not_forwarded, "a non-validator's vote");
+        let ConsensusMessage::Vote(mut forged) = vote(2, view) else { unreachable!() };
+        forged.block_hash = Hash([8; 32]);
+        assert_eq!(judge(&ConsensusMessage::Vote(forged)), rejected, "a validator key's vote over another block");
+        let ConsensusMessage::Proposal(mut forged) = gossip_proposal(&hs, vec![]) else { unreachable!() };
+        forged.header.timestamp_ms = 1;
+        assert_eq!(judge(&ConsensusMessage::Proposal(forged)), rejected, "a leader's proposal re-headed");
+        let far = view + randprotocol_core::consensus::PROPOSAL_VIEW_WINDOW + 1;
+        assert_eq!(judge(&vote(2, far)), not_forwarded, "an honest vote past the proposal window");
+    }
+
+    /// CN-4: the count bucket let a forwarder deliver 64 messages a second of up to gossip's
+    /// 16 MiB transmit size each — ~1 GiB a second per connection. The byte bucket stops a flood
+    /// of maximum-size messages after its burst (ignored, not handled), while a minute of honest
+    /// traffic — a burst of seven full blocks, then a full block, four votes and four new views
+    /// every second — never trips it.
+    #[test]
+    fn consensus_gossip_is_metered_by_bytes() {
+        use crate::admission::{Acceptance, PeerLimiter};
+        let hs = gossip_replica();
+        let pid = |seed: u8| PeerId::from(libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap().public());
+        let (honest, flooder) = (pid(1), pid(2));
+        let mut peers: HashMap<PeerId, Peer> = HashMap::new();
+        let limiter = PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC);
+        let bytes = consensus_byte_limiter(gas::MAX_BLOCK_BYTES);
+        let t0 = Instant::now();
+        let metered_out = ConsensusGossipVerdict { report: Acceptance::Ignore, handle: false };
+
+        // A 16 MiB "signature" on a vote: the size gossip lets through.
+        let ConsensusMessage::Vote(mut junk) = ConsensusMessage::Vote(Vote::sign(hs.domain(), hs.view(), Hash([7; 32]), &key(2)))
+        else {
+            unreachable!()
+        };
+        junk.signature = bincode::deserialize(&bincode::serialize(&vec![0u8; 16 << 20]).unwrap()).unwrap();
+        let junk = ConsensusMessage::Vote(junk);
+        let through = (0..CONSENSUS_GOSSIP_BURST)
+            .filter(|_| classify_consensus_gossip(&mut peers, &limiter, &bytes, &hs, flooder, &junk, t0) != metered_out)
+            .count();
+        let most = (consensus_view_bytes(gas::MAX_BLOCK_BYTES) * CONSENSUS_GOSSIP_BURST_VIEWS as usize) / (16 << 20);
+        assert!(through <= most, "{through} maximum-size messages got past the byte budget, at most {most} may");
+
+        // Honest traffic, all accepted: a full block's worth of transactions under the cap.
+        let full: Vec<Transaction> = (0..3u32)
+            .map(|i| {
+                let envelope = randprotocol_core::notes::Envelope {
+                    kem_ct: vec![0; 1_300_000],
+                    to_receiver: vec![],
+                    to_sender: vec![],
+                    body: vec![],
+                };
+                Transaction::mint(7, [1; 8], 0, [i; 8], envelope, 1, &key(1), &StubExecutor)
+            })
+            .collect();
+        let proposal = gossip_proposal(&hs, full);
+        let view = hs.view();
+        let votes: Vec<ConsensusMessage> =
+            (1..=4u8).map(|k| ConsensusMessage::Vote(Vote::sign(hs.domain(), view, Hash([7; 32]), &key(k)))).collect();
+        let nvs: Vec<ConsensusMessage> = (1..=4u8)
+            .map(|k| {
+                ConsensusMessage::NewView(randprotocol_core::consensus::NewView::sign(hs.domain(), view, hs.high_qc().clone(), &key(k)))
+            })
+            .collect();
+        let accepted = ConsensusGossipVerdict { report: Acceptance::Accept, handle: true };
+        for i in 0..7 {
+            assert_eq!(classify_consensus_gossip(&mut peers, &limiter, &bytes, &hs, honest, &proposal, t0), accepted, "burst block {i}");
+        }
+        for s in 1..=60u64 {
+            let now = t0 + Duration::from_secs(s);
+            for m in std::iter::once(&proposal).chain(&votes).chain(&nvs) {
+                assert_eq!(classify_consensus_gossip(&mut peers, &limiter, &bytes, &hs, honest, m, now), accepted, "second {s}");
+            }
+        }
     }
 
     /// SYNC-1 (fullnode network scan 2026-09-26, high): gossipsub runs `Permissive`, so an

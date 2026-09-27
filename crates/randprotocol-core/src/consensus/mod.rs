@@ -11,7 +11,7 @@ mod hotstuff;
 mod tests;
 
 pub use crate::types::SigningDomain;
-pub use hotstuff::{CoveredSource, HotStuff};
+pub use hotstuff::{CoveredSource, GossipPrecheck, HotStuff};
 
 /// B2 (bridge hardening spec §3): on a chain with a bridge, a validator does not vote for a block
 /// whose timestamp runs more than this many milliseconds ahead of its own clock. A vote rule
