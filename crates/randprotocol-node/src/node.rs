@@ -4460,6 +4460,25 @@ mod tests {
         assert_eq!(envelope.len(), randprotocol_core::notes::MEMO_ENVELOPE_BYTES);
     }
 
+    /// HB-1 (zkVM/ISA review, low): a `kem_ek` of the right length (1 184 bytes) that is not an
+    /// ML-KEM-768 encapsulation key — a coefficient past q — panicked the vendored
+    /// `Envelope::seal` (`.expect("valid encapsulation key")`), and the faucet seals on the node's
+    /// own loop (`Node::mint`), so one `rand_mint` call with such an address took the node down.
+    /// Now it is the faucet's error, like a wrong-length key already was; every node path that
+    /// seals to an address it was handed goes through the same `address::to_research` check.
+    #[test]
+    fn a_faucet_mint_to_an_invalid_ml_kem_key_is_an_error_not_a_panic() {
+        let ex = ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test);
+        let gs = crate::storage::fixtures::genesis(1);
+        let mut to = crate::storage::fixtures::payout(9);
+        to.kem_ek = vec![0xff; randprotocol_core::notes::KEM_EK_BYTES];
+        let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            faucet_mint_tx(gs.ledger.chain_id(), gs.ledger.envelope_bytes(), &to, 1_000, gs.ledger.height(), &key(1), &ex)
+        }));
+        let err = got.expect("the finding: sealing to a length-valid bad key panics").expect_err("refused");
+        assert!(err.contains("not a valid ML-KEM-768 encapsulation key"), "{err}");
+    }
+
     /// The register and the bucket survive the same restart, hashed into and computed into the
     /// state root as they are: a node that came back without them would fork at the next block
     /// (the register's root) or mis-pay the next aggregate (the bucket's excesses).

@@ -23,6 +23,15 @@ pub fn address_of(vk: &ViewingKey) -> ShieldedAddress {
 /// so its `kem_ek` can be any length by the time it reaches here — an RPC parameter, a genesis
 /// file, a gossiped envelope. ML-KEM-768 encapsulation panics on a wrong-length key, so the
 /// length is checked here, once, and reported rather than aborting the node.
+///
+/// HB-1 (2026-09-27 zkVM/ISA review): so does a key of the right length that is not an
+/// encapsulation key — ML-KEM's modulus check refuses a 12-bit coefficient at or past q = 3329,
+/// and the vendored `viewing::Envelope::seal` reads it with `.expect("valid encapsulation key")`.
+/// Through the faucet (`rand_mint`, sealed on the node's own loop) that was a crash of the node for
+/// one request. The same decode `seal` runs is tried here first and refused as an error, so every
+/// caller of [`seal_note`]/[`seal_note_as`] — the faucet, the operator commands, the wallet — gets
+/// a message, not a panic. The upstream fix is for `Envelope::seal` to return a `Result`
+/// (circuits); this file is node-local, `viewing.rs` is vendored and stays byte-identical.
 pub fn to_research(a: &ShieldedAddress) -> Result<viewing::Address, String> {
     if a.kem_ek.len() != randprotocol_core::notes::KEM_EK_BYTES {
         return Err(format!(
@@ -31,6 +40,9 @@ pub fn to_research(a: &ShieldedAddress) -> Result<viewing::Address, String> {
             randprotocol_core::notes::KEM_EK_BYTES
         ));
     }
+    type Ek = ml_kem::ml_kem_768::EncapsulationKey;
+    let key = ml_kem::kem::Key::<Ek>::try_from(&a.kem_ek[..]).map_err(|_| "shielded address kem_ek has the wrong length".to_string())?;
+    Ek::new(&key).map_err(|_| "shielded address kem_ek is not a valid ML-KEM-768 encapsulation key".to_string())?;
     Ok(viewing::Address { pk: a.pk, kem_ek: a.kem_ek.clone() })
 }
 
