@@ -108,3 +108,31 @@ fn the_chain_14_bundle_guest_is_the_genesis_pin() {
     assert_eq!(word8_to_hex(&ZkExecutor::hc_bundle()), pin, "guests::bundle_hidden() no longer assembles to chain 14's hc_bundle");
     assert_eq!(genesis["hc_bundle"].as_str().unwrap(), pin, "deploy/genesis-chain14.json's hc_bundle");
 }
+
+/// ZKG-2: the pin above, for every genesis file the repository carries — chain 15 included, which
+/// the chain-14-only test never read. A chain from 14 on pins the hidden-asset guest
+/// (`guests::bundle_hidden()`); chains 6–13 pin the retired 2-in-2-out guest, which still
+/// assembles from this crate's source (`ZkExecutor::legacy_bundle_program`). A file whose
+/// `hc_bundle` is neither is a genesis this build could not have cut.
+#[test]
+fn every_genesis_files_bundle_guest_is_the_one_this_source_assembles() {
+    let hidden = word8_to_hex(&ZkExecutor::hc_bundle());
+    let legacy = word8_to_hex(&ZkExecutor::hc_legacy_bundle());
+    let deploy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy");
+    let mut checked = BTreeSet::new();
+    for entry in std::fs::read_dir(&deploy).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        let Some(chain) = name.strip_prefix("genesis-chain").and_then(|r| r.strip_suffix(".json")) else {
+            continue;
+        };
+        let chain: u32 = chain.parse().unwrap_or_else(|_| panic!("{name}: not genesis-chain<N>.json"));
+        let genesis: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(deploy.join(&name)).unwrap()).unwrap();
+        let Some(pin) = genesis.get("hc_bundle").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let (want, guest) = if chain >= 14 { (&hidden, "bundle_hidden") } else { (&legacy, "the retired bundle") };
+        assert_eq!(pin, want.as_str(), "{name}'s hc_bundle is not {guest}()'s digest");
+        checked.insert(chain);
+    }
+    assert!(checked.contains(&14) && checked.contains(&15), "chains 14 and 15 must be among the files checked: {checked:?}");
+}
