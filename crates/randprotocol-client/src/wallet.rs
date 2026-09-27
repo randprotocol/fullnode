@@ -4432,7 +4432,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_scan_against_a_pruned_node_resumes_at_its_floor() {
         let me = Wallet::from_spend_key(SpendKey([57; 8]));
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         let (txs, notes) = public_notes_for(&me);
         let mut txs = txs.into_iter();
         {
@@ -4583,7 +4583,7 @@ mod tests {
             scanned_height: 240_000,
             scanned_attest_height: 240_000,
             notes: vec![owned(0, 5, true), pending],
-            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2 }],
+            sent: vec![SentRow { index: 7, to_pk: [4; 8], amount: 11, height: 2, memo: None }],
             ..NoteStore::default()
         };
         store.reset();
@@ -5094,7 +5094,7 @@ mod tests {
     async fn a_node_reported_registration_fee_above_the_ceiling_needs_an_explicit_fee() {
         let me = Wallet::from_spend_key(SpendKey([67; 8]));
         let absurd: u64 = 5_000_000_000_000_000;
-        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
         {
             let mut c = chain.lock().unwrap();
             c.tokens = serde_json::json!({ "enabled": true, "registration_fee": absurd.to_string(), "next_index": 1, "tokens": [] });

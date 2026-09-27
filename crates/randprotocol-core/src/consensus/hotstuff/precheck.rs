@@ -256,6 +256,7 @@ mod tests {
             aggregation: None,
             consensus_domain: Some(1),
             staking: None,
+            envelope_bytes: None,
         };
         let gs = genesis.build(&StubExecutor).unwrap();
         let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
