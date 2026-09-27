@@ -100,6 +100,16 @@ pub struct ValidatorEntry {
 ///   the register for anyone else. It is what lets `faucet: true` sit beside a `bridge` section
 ///   (`GenesisError::FaucetWithBridge` otherwise); an empty list is refused. The budget above
 ///   still applies on top.
+///
+/// And its twin on the signing side, which closes the rescan's RESCAN-LEDGER-1 as a validity rule
+/// (the next cut):
+///
+/// - `faucet_minters`: a `Mint` may be signed only by one of these validator keys
+///   (`TxError::MinterNotAllowed`). The ledger's own rule is a row in the register, which a
+///   permissionless `Bond` writes at once, and the bonded key is in the active set
+///   `bond_activation_epochs + 1` epochs later — so neither bounds who drains the budget. An empty
+///   or duplicated list is refused; absent, the register row is the rule and every node's
+///   admission policy admits the genesis validators only.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StakingConfig {
@@ -114,6 +124,8 @@ pub struct StakingConfig {
     pub registration_v2: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub faucet_recipients: Option<Vec<FaucetRecipient>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faucet_minters: Option<Vec<FaucetMinter>>,
 }
 
 /// One entry of `staking.faucet_recipients`: the spend public key `pk` a faucet `Mint` may pay.
@@ -144,6 +156,40 @@ impl<'de> Deserialize<'de> for FaucetRecipient {
         }
         crate::notes::word8_from_hex(&t).map(FaucetRecipient).ok_or_else(|| {
             serde::de::Error::custom(format!("faucet recipient {t:?} is neither 64 hex characters nor a rand1 address"))
+        })
+    }
+}
+
+/// One entry of `staking.faucet_minters`: the address of a validator key that may sign a faucet
+/// `Mint`. The genesis file may name one three ways — the address as `rand-node` prints it
+/// (base58), those 32 bytes as 64 hex characters, or the validator's whole Dilithium2 public key
+/// in hex, as `validators[].public_key` carries it — and it is always written back as the base58
+/// address. Only the 32 address bytes are committed to the genesis hash, so every spelling of one
+/// key is one chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FaucetMinter(pub Address);
+
+impl Serialize for FaucetMinter {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for FaucetMinter {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let t = String::deserialize(d)?;
+        if t.len() == 64 {
+            if let Ok(bytes) = hex::decode(&t) {
+                return Ok(FaucetMinter(Address(bytes.try_into().expect("64 hex characters are 32 bytes"))));
+            }
+        }
+        if let Ok(pk) = PublicKey::from_hex(&t) {
+            return Ok(FaucetMinter(pk.address()));
+        }
+        Address::from_base58(&t).map(FaucetMinter).map_err(|_| {
+            serde::de::Error::custom(format!(
+                "faucet minter {t:?} is neither an address (base58 or 64 hex characters) nor a validator public key in hex"
+            ))
         })
     }
 }
@@ -1585,6 +1631,63 @@ mod tests {
         assert!(!derive_set(&reg, 4).contains(&key(2).address()));
         assert!(derive_set(&reg, 5).contains(&key(2).address()));
         assert_eq!(derive_set(&reg, 4).len(), 1);
+    }
+
+    /// RESCAN-LEDGER-1: a permissionless `Bond` writes the register row at once, and two epochs
+    /// later the key is in the active set — the `Mint` arm asked only for the row, so the bonder
+    /// was a faucet minter, and set membership would not have stopped it either. Under
+    /// `staking.faucet_minters` only a listed key mints, at admission and at apply, however long
+    /// it has been bonded; the register check still comes first. Without the list (chain 15) the
+    /// rule is unchanged, and the node's admission policy is what keeps such a mint out.
+    #[test]
+    fn under_faucet_minters_only_a_listed_key_mints_even_once_a_bonder_is_in_the_active_set() {
+        use crate::ledger::FAUCET_MAX_UNITS;
+        let genesis = key(1);
+        let bonder = key(9);
+        let cfg = |minters: Option<Vec<FaucetMinter>>| StakingConfig {
+            faucet_budget_per_epoch: 10_000 * UNITS_PER_RAND,
+            bond_activation_epochs: 2,
+            faucet_minters: minters,
+            ..Default::default()
+        };
+        let mint = |l: &Ledger, k: &Keypair, seed: u32| {
+            Transaction::mint(CHAIN, [seed; 8], l.height() as u32, [seed + 1; 8], env(), FAUCET_MAX_UNITS, k, &StubExecutor)
+        };
+        // Bonded in epoch 0 of ten-block epochs, and in the active set from epoch 3.
+        let bonded = |minters: Option<Vec<FaucetMinter>>| {
+            let mut l = sectioned(vec![entry(&genesis, MIN_STAKE, payout(1))], cfg(minters));
+            l.set_faucet(true);
+            let t = bond_tx(&l, 40, &bonder, MIN_STAKE, Some(registration(&bonder, payout(9))));
+            l.apply_tx(&t, &genesis.address(), &StubExecutor).unwrap();
+            l.set_height(30);
+            assert!(l.derive_next_set(l.epoch()).contains(&bonder.address()), "the bonder is an active validator");
+            l
+        };
+
+        // Chain 15's rule, unchanged: the row is enough.
+        let mut off = bonded(None);
+        let attack = mint(&off, &bonder, 70);
+        assert_eq!(off.validate(&attack, &StubExecutor), Ok(()));
+        off.apply_tx(&attack, &genesis.address(), &StubExecutor).unwrap();
+
+        // Under the list: refused at admission and at apply, the ledger untouched.
+        let mut on = bonded(Some(vec![FaucetMinter(genesis.address())]));
+        let refusal = TxError::MinterNotAllowed(bonder.address());
+        assert_eq!(on.validate(&attack, &StubExecutor), Err(refusal.clone()));
+        let before = on.clone();
+        assert_eq!(on.apply_tx(&attack, &genesis.address(), &StubExecutor), Err(refusal));
+        assert_eq!(on, before, "a refused mint leaves the ledger untouched");
+        // A listed key mints; a key with no row is `MinterNotValidator` first, listed or not.
+        on.apply_tx(&mint(&on, &genesis, 80), &genesis.address(), &StubExecutor).unwrap();
+        let stranger = key(10);
+        let mut listed_stranger = bonded(Some(vec![FaucetMinter(stranger.address())]));
+        assert_eq!(
+            listed_stranger.validate(&mint(&listed_stranger, &stranger, 90), &StubExecutor),
+            Err(TxError::MinterNotValidator(stranger.address()))
+        );
+        // And a bonder the list names mints like any other listed key.
+        listed_stranger.set_staking(Some(cfg(Some(vec![FaucetMinter(genesis.address()), FaucetMinter(bonder.address())]))));
+        assert_eq!(listed_stranger.validate(&attack, &StubExecutor), Ok(()));
     }
 
     /// A ledger at height 1 of ten-block epochs under a `staking` section, holding `entries`.

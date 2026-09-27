@@ -581,8 +581,10 @@ pub fn oversized_note(tx: &Transaction) -> Option<TxError> {
     }
 }
 
-/// The keys a faucet `Mint` may be signed by, as this node's admission policy: the genesis
-/// validators — the register a chain starts with, every key of it the operator's (RESCAN-LEDGER-1).
+/// The keys a faucet `Mint` may be signed by, as this node's admission policy: the genesis's
+/// `staking.faucet_minters` where it lists them — the validity rule, which this then only
+/// anticipates — and otherwise the genesis validators, the register a chain starts with, every key
+/// of it the operator's (RESCAN-LEDGER-1).
 ///
 /// The ledger's rule is a row in the register, which a permissionless `Bond` writes at once, and
 /// the bonded key is in the active set `bond_activation_epochs + 1` epochs later; so neither is a
@@ -591,7 +593,10 @@ pub fn oversized_note(tx: &Transaction) -> Option<TxError> {
 /// after genesis — the operator's own included — cannot mint through this node's pool; the
 /// operator mints through a genesis key.
 pub fn faucet_minters(gs: &randprotocol_core::genesis::GenesisState) -> std::collections::BTreeSet<randprotocol_core::Address> {
-    gs.validators.iter().map(|v| v.address()).collect()
+    match gs.staking.as_ref().and_then(|s| s.faucet_minters.as_ref()) {
+        Some(list) => list.iter().map(|m| m.0).collect(),
+        None => gs.validators.iter().map(|v| v.address()).collect(),
+    }
 }
 
 /// A faucet `Mint` whose minter has a row in the validator register but is not in `minters`
@@ -1116,6 +1121,23 @@ mod tests {
         let honest = mint(&operator, 60);
         assert!(pool.precheck(&honest, &l, &StubExecutor).is_ok());
         assert!(pool.insert(honest, &l, &StubExecutor).is_ok());
+    }
+
+    /// Where a genesis lists `staking.faucet_minters` the pool's minters are that list, not the
+    /// genesis validators: a listed non-genesis key is admitted, an unlisted genesis key is not.
+    #[test]
+    fn the_pools_faucet_minters_are_the_genesis_list_when_it_names_one() {
+        use crate::storage::fixtures;
+        use randprotocol_core::genesis::{FaucetMinter, StakingConfig};
+        use randprotocol_core::UNITS_PER_RAND;
+        let (a, b, later) = (fixtures::key(1), fixtures::key(2), fixtures::key(9));
+        let mut g = fixtures::genesis_file_of(1, &[&a, &b], Vec::new(), 10);
+        g.staking = Some(StakingConfig { faucet_budget_per_epoch: 100 * UNITS_PER_RAND, bond_activation_epochs: 2, ..Default::default() });
+        let gs = g.build(&randprotocol_core::confidential::StubExecutor).unwrap();
+        assert_eq!(faucet_minters(&gs), [a.address(), b.address()].into_iter().collect());
+        g.staking.as_mut().unwrap().faucet_minters = Some(vec![FaucetMinter(b.address()), FaucetMinter(later.address())]);
+        let gs = g.build(&randprotocol_core::confidential::StubExecutor).unwrap();
+        assert_eq!(faucet_minters(&gs), [b.address(), later.address()].into_iter().collect());
     }
 
     /// The shipped policy, pinned: 8192 entries against a 10 000-transaction pool, and a burst of 16

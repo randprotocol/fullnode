@@ -1209,6 +1209,25 @@ mod tests {
         assert!(!gen.to_json().contains("staking"), "rewriting the file adds no section");
     }
 
+    /// Chain 15, the running chain, byte for byte, after RESCAN-LEDGER-1's
+    /// `staking.faucet_minters`: the file does not list it, so its hash may not move by one bit,
+    /// the ledger's rule stays the register row, and every node's pool admits the genesis
+    /// validators' mints only.
+    #[test]
+    fn chain_15s_genesis_file_still_builds_chain_15() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain15.json");
+        let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let staking = gen.staking.as_ref().expect("chain 15 carries a staking section");
+        assert_eq!(staking.faucet_minters, None, "chain 15 predates the list");
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        assert_eq!(state.hash().to_hex(), "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8");
+        assert!(!gen.to_json().contains("faucet_minters"), "rewriting the file adds no list");
+        let minters = randprotocol_node::admission::faucet_minters(&state);
+        assert_eq!(minters.len(), gen.validators.len(), "the pool admits the genesis validators");
+        assert!(gen.validators.iter().all(|v| minters.contains(&v.public_key.address())));
+    }
+
     /// Chain 15's genesis custody, end to end on the real chain-14 file: chain 14's zUSD listed
     /// at genesis (same name, symbol and salt, so the same asset id), 9 USDT locked on Tron and 1
     /// on Solana, and one ten-zUSD note written by `rand-node alloc-note --asset 1` — which the

@@ -23,7 +23,7 @@ use crate::gas;
 use crate::notes::{word8_to_bytes, Bundle, CommitmentTree, Envelope, Word8, MAX_ENVELOPE_BYTES};
 use crate::program::{program_id_with_public, CallOutcome, CallReceipt, ProgramId, ProgramRecord};
 use crate::types::{Action, Block, Transaction, ValidatorSet, FAUCET_MAX_UNITS};
-pub use staking::{FaucetRecipient, StakingConfig};
+pub use staking::{FaucetMinter, FaucetRecipient, StakingConfig};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// How many block-end roots a bundle may anchor to (spec §7 item 4).
@@ -1406,6 +1406,15 @@ impl Ledger {
                 let addr = minter.address();
                 if !self.validators.contains_key(&addr) {
                     return Err(TxError::MinterNotValidator(addr));
+                }
+                // RESCAN-LEDGER-1, under `staking.faucet_minters` only: a register row is not
+                // enough — a permissionless `Bond` writes one, and the key is active two epochs
+                // later — so the minter must be on the genesis list. Before the signature, like
+                // the row check. Chain 15 has no list and runs on the node's admission policy.
+                if let Some(list) = self.staking.as_ref().and_then(|s| s.faucet_minters.as_ref()) {
+                    if !list.iter().any(|m| m.0 == addr) {
+                        return Err(TxError::MinterNotAllowed(addr));
+                    }
                 }
                 let signing_hash = Transaction::mint_signing_hash(tx.chain_id, cm, pk, *time, r, envelope, *amount);
                 if !minter.verify(signing_hash.as_bytes(), signature) {

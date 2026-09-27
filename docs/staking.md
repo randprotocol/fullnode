@@ -194,6 +194,15 @@ this fix pools and forwards a `Mint` only from a **genesis validator** (`MinterN
 policy, never cached); a validator bonded after genesis — the operator's included — cannot mint
 through the pool, and the operator mints through a genesis key.
 
+The validity rule is the genesis list `staking.faucet_minters` (next cut): a `Mint` signed by a
+key not on it is refused (`MinterNotAllowed`) at admission and at apply, after the register check
+and before any signature work, however long the key has been bonded. An entry is a validator
+address as `rand-node` prints it (base58), those 32 bytes in hex, or the validator's whole public
+key in hex as `validators[].public_key` carries it; the file is written back as the base58
+address, only the 32 address bytes are committed, key by key in file order, and an empty or
+duplicated list is refused at `init` (`BadStaking`). Where a genesis lists it, every node's pool
+admits exactly that list. Absent, it commits nothing — chain 15 runs without it.
+
 Not in v0.5.4: slashing (audit decision D8 — "it means nothing while stake is free").
 
 A node runs with `--validator` when it holds a validator key at all; being in the current set is a

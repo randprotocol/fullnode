@@ -274,6 +274,9 @@ same section, and sets `"faucet": true` at the top level:
   "faucet_recipients": [
     "rand1…the output of `rand --key ~/.rand-chain15/wallets/dendi.key.json address`…",
     "rand1…anish's address, as he sends it…"
+  ],
+  "faucet_minters": [
+    "…the address `rand-node` prints for each operator validator key that may run the faucet…"
   ]
 }
 ```
@@ -284,11 +287,19 @@ same section, and sets `"faucet": true` at the top level:
   `rand address` prints — or its `pk` as 64 hex characters; only the `pk` is committed, so an
   address can be pasted as it is. `rand_mint` to any other
   address is refused at admission. **Mainnet never carries a faucet**, allowlisted or not.
+- **`faucet_minters`** (RESCAN-LEDGER-1; the next cut that keeps a faucet sets it, to the operator's
+  own validator keys): a `Mint` may be signed only by these keys (`MinterNotAllowed` otherwise).
+  Without it the ledger accepts any key with a register row — which a permissionless `Bond` writes,
+  and which is in the active set two epochs later — and only every node's admission policy (the
+  genesis validators) keeps a bonder from draining the budget. Each entry is a validator's base58
+  address, its 64 hex characters, or its `public_key` hex; non-empty, no key twice, committed only
+  when present.
 
 Like the rest of the section: `rand-node genesis` never writes them, the cut script splices them
 in, and `rand-node init` on the finished file prints the hash that matters. Chain 14 has no
 section, and `rand-node`'s `chain_14s_genesis_file_still_builds_chain_14` pins its hash
-(`1cff3b7d…`) against all of it.
+(`1cff3b7d…`) against all of it; `chain_15s_genesis_file_still_builds_chain_15` pins chain 15's
+(`cc30e085…`) against `faucet_minters`.
 
 ## The `staking` genesis section (v0.5.4)
 

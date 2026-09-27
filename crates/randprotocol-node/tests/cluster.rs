@@ -2454,6 +2454,8 @@ async fn a_chain_15_shaped_genesis_commits_mints_only_to_the_allowlist_and_syncs
         max_stake_entry_per_epoch: Some(10_000 * UNITS_PER_RAND),
         registration_v2: Some(true),
         faucet_recipients: Some(vec![FaucetRecipient(wallet(1).address.pk)]),
+        // Chain 15 predates RESCAN-LEDGER-1's list; every node's admission policy stands in.
+        faucet_minters: None,
     });
 
     let n0 = start_node(&ks[0], &gen, vec![], true).await;

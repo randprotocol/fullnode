@@ -286,7 +286,7 @@ impl From<&TokensConfig> for TokensCommit {
 }
 
 /// The `staking` genesis section (audit v4, STAKE-2), defined beside the rules it switches on.
-pub use crate::ledger::staking::{FaucetRecipient, StakingConfig};
+pub use crate::ledger::staking::{FaucetMinter, FaucetRecipient, StakingConfig};
 /// Shortest `bridge.rules_v2.cap_window_secs` (one hour) and longest (seven days) a genesis may set.
 pub const MIN_CAP_WINDOW_SECS: u32 = 3_600;
 pub const MAX_CAP_WINDOW_SECS: u32 = 7 * 86_400;
@@ -636,6 +636,16 @@ impl Genesis {
                     return Err(GenesisError::BadStaking("faucet_recipients names a key twice".into()));
                 }
             }
+            // The minter list, the same two rules: empty mints for no one, a key twice is a typo.
+            if let Some(list) = &s.faucet_minters {
+                if list.is_empty() {
+                    return Err(GenesisError::BadStaking("faucet_minters is empty: no key could mint".into()));
+                }
+                let distinct: std::collections::BTreeSet<_> = list.iter().collect();
+                if distinct.len() != list.len() {
+                    return Err(GenesisError::BadStaking("faucet_minters names a key twice".into()));
+                }
+            }
             if let Some(bps) = s.max_weight_bps {
                 if bps == 0 || bps > crate::ledger::staking::MAX_WEIGHT_BPS {
                     return Err(GenesisError::BadStaking(format!("max_weight_bps {bps} is outside 1..=10000")));
@@ -965,6 +975,16 @@ impl Genesis {
                 commit.extend_from_slice(&(list.len() as u32).to_be_bytes());
                 for r in list {
                     commit.extend_from_slice(&crate::notes::word8_to_bytes(&r.0));
+                }
+            }
+            // The minter list (RESCAN-LEDGER-1), the same way and after it: its length, then each
+            // address's 32 bytes in file order. Absent, nothing — chain 15 (`cc30e085…`) hashes
+            // byte-for-byte as before.
+            if let Some(list) = &s.faucet_minters {
+                commit.extend_from_slice(b"faucet_minters");
+                commit.extend_from_slice(&(list.len() as u32).to_be_bytes());
+                for m in list {
+                    commit.extend_from_slice(&m.0 .0);
                 }
             }
         }
@@ -2881,6 +2901,47 @@ mod tests {
         assert_eq!(build(&by_address).hash(), s.hash());
         assert!(Genesis::from_json(&json.replace(&me_hex, "rand1notanaddress")).is_err());
         assert!(Genesis::from_json(&json.replace(&me_hex, "abcd")).is_err());
+    }
+
+    /// RESCAN-LEDGER-1's `staking.faucet_minters`, parsed, validated and committed exactly like
+    /// `faucet_recipients`: absent from the file and the hash unless set, an empty or duplicated
+    /// list refused, committed address by address, and the three spellings of a key — base58
+    /// address, its 64 hex characters, the validator's public key in hex — one chain. The ledger
+    /// runs with the list.
+    #[test]
+    fn a_faucet_minter_list_is_committed_only_when_present_and_refused_empty_or_duplicated() {
+        let mut base = genesis(2);
+        base.faucet = true;
+        base.staking = Some(StakingConfig { faucet_budget_per_epoch: 100 * UNITS_PER_RAND, bond_activation_epochs: 2, ..Default::default() });
+        let plain = build(&base);
+        assert!(!base.to_json().contains("faucet_minters"), "absent from a file that does not set it");
+        let (a, b) = (base.validators[0].public_key.clone(), base.validators[1].public_key.clone());
+        let with = |list: Vec<FaucetMinter>| {
+            let mut g = base.clone();
+            g.staking.as_mut().unwrap().faucet_minters = Some(list);
+            g
+        };
+        let (ma, mb) = (FaucetMinter(a.address()), FaucetMinter(b.address()));
+        let listed = with(vec![ma]);
+        let s = build(&listed);
+        assert_eq!(s.ledger.staking().unwrap().faucet_minters, Some(vec![ma]), "the ledger runs with the list");
+        assert_ne!(s.hash(), plain.hash());
+        assert_ne!(build(&with(vec![mb])).hash(), s.hash());
+        assert_ne!(build(&with(vec![ma, mb])).hash(), s.hash());
+        assert!(matches!(with(vec![]).validate(), Err(GenesisError::BadStaking(_))), "an empty list mints for no one");
+        assert!(matches!(with(vec![ma, ma]).validate(), Err(GenesisError::BadStaking(_))));
+        // The file writes the base58 address and reads every spelling back to the same chain.
+        let json = listed.to_json();
+        let text = a.address().to_string();
+        assert!(json.contains(&format!("\"faucet_minters\": [\n      \"{text}\"")), "{json}");
+        assert_eq!(Genesis::from_json(&json).unwrap(), listed);
+        for spelling in [hex::encode(a.address().0), a.to_hex()] {
+            let other = Genesis::from_json(&json.replace(&text, &spelling)).unwrap();
+            assert_eq!(other, listed, "{spelling}");
+            assert_eq!(build(&other).hash(), s.hash());
+        }
+        assert!(Genesis::from_json(&json.replace(&text, "abcd")).is_err());
+        assert!(Genesis::from_json(&json.replace(&text, "0OIl")).is_err(), "not base58");
     }
 
     /// The v4 re-review's three `staking` fields ride the section's own gate one level down:
