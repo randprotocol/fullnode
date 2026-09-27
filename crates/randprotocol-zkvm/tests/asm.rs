@@ -112,3 +112,45 @@ fn ops_read_public_assembles_to_a7_six_and_a0_idx() {
     let e = randprotocol_zkvm::emulator::execute(&p, &[], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 77], 100).unwrap();
     assert!(e.events.iter().any(|ev| matches!(ev.sys, Some(randprotocol_zkvm::emulator::Syscall::ReadPublic { idx: 9, word: 77 }))));
 }
+
+/// ISA-5 (the 2026-09-27 zkVM review): the `ops` helpers masked their operands *before* `encode`
+/// could see them — `slli(rd, rs1, 33)` became a shift by 1, `lui(rd, 0xdead_beef)` became
+/// `lui(rd, 0xdead_b000)` — so ZM3's range checks at `encode` never fired for code written
+/// through them. The helpers now pass the operand through and `encode` refuses it.
+#[test]
+#[should_panic(expected = "does not fit 5 bits")]
+fn an_out_of_range_shift_amount_panics_through_the_helper() {
+    let _ = slli(1, 2, 33).encode();
+}
+
+#[test]
+#[should_panic(expected = "does not fit 5 bits")]
+fn an_out_of_range_srai_amount_panics_through_the_helper() {
+    let _ = srai(1, 2, 32).encode();
+}
+
+#[test]
+#[should_panic(expected = "low 12 bits set")]
+fn a_lui_with_low_bits_set_panics_through_the_helper() {
+    let _ = lui(1, 0xdead_beef).encode();
+}
+
+#[test]
+#[should_panic(expected = "low 12 bits set")]
+fn an_auipc_with_low_bits_set_panics_through_the_helper() {
+    let _ = auipc(1, 0x0000_1001).encode();
+}
+
+/// A register index is a 5-bit field; `rd = 32` used to be shifted into `funct3`'s bits — a
+/// different instruction, silently. `encode` refuses every register field above 31.
+#[test]
+#[should_panic(expected = "register")]
+fn a_register_index_past_31_panics_at_encode() {
+    let _ = addi(32, 0, 0).encode();
+}
+
+#[test]
+#[should_panic(expected = "register")]
+fn a_source_register_index_past_31_panics_at_encode() {
+    let _ = add(1, 2, 40).encode();
+}

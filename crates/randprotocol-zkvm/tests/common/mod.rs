@@ -65,3 +65,119 @@ pub fn rejects(f: impl FnOnce() -> Result<(), randprotocol_zkvm::machine::Verify
         }
     }
 }
+
+// ── Symbolic reads of an AIR (`tests/air_invariants.rs`, `tests/next_constraint_set.rs`) ─────
+// The recursion crate's `tests/common/mod.rs` helpers, ported: the tests that check a table's
+// soundness *rules* — every value the cpu row sends bound, no padding row sending anything — do
+// not keep their own list of what a table's `eval` does; they run `eval` through Plonky3's own
+// symbolic interaction builder and evaluate the constraints and messages it really emits at
+// concrete rows. Deleting a constraint or a send changes what they see. Unlike the rVM's tables,
+// five of this machine's read preprocessed columns, so a row here is a main row *and* a
+// preprocessed row.
+use p3_air::symbolic::{AirLayout, BaseEntry, BaseLeaf, SymbolicExpr, SymbolicExpression};
+use randprotocol_zkvm::machine::{Challenge, Val};
+
+pub type Interaction = p3_lookup::SymbolicInteraction<Val>;
+pub type Expr = SymbolicExpression<Val>;
+
+/// Every global interaction and base constraint `air.eval` emits.
+pub fn symbolic_air<A>(air: &A) -> (Vec<Interaction>, Vec<Expr>)
+where
+    A: p3_air::BaseAir<Val> + p3_air::Air<p3_lookup::InteractionSymbolicBuilder<Val, Challenge>>,
+{
+    let mut sb = p3_lookup::InteractionSymbolicBuilder::<Val, Challenge>::new(AirLayout::from_air::<Val>(air));
+    air.eval(&mut sb);
+    (sb.global_interactions().to_vec(), sb.base_constraints())
+}
+
+/// A row pair: the main trace's current and next rows, and the preprocessed trace's.
+#[derive(Clone, Debug)]
+pub struct Rows {
+    pub cur: Vec<Val>,
+    pub next: Vec<Val>,
+    pub pre_cur: Vec<Val>,
+    pub pre_next: Vec<Val>,
+    /// The instance's public values (the cpu's `pv` vector; empty for every other table).
+    pub public: Vec<Val>,
+}
+
+pub fn random_felt(rng: &mut impl rand::Rng) -> Val {
+    use p3_field::PrimeCharacteristicRing;
+    Val::from_u64(rng.next_u64() % 0xFFFF_FFFF_0000_0001)
+}
+
+impl Rows {
+    pub fn random(width: usize, pre_width: usize, rng: &mut impl rand::Rng) -> Rows {
+        let mut v = |n: usize| (0..n).map(|_| random_felt(rng)).collect::<Vec<_>>();
+        Rows { cur: v(width), next: v(width), pre_cur: v(pre_width), pre_next: v(pre_width), public: vec![] }
+    }
+}
+
+/// A base-field symbolic expression at one row pair, on a transition row that is neither the first
+/// nor the last (the rows every per-row rule lives on) unless `boundary` says otherwise.
+pub fn eval_rows(e: &Expr, r: &Rows) -> Val { eval_boundary(e, r, false, false) }
+
+/// [`eval_rows`] on a boundary row: the table's first row (`is_first`) or its last (`is_last`,
+/// where the transition selector is zero).
+pub fn eval_boundary(e: &Expr, r: &Rows, is_first: bool, is_last: bool) -> Val {
+    use p3_field::PrimeCharacteristicRing;
+    let flag = |b: bool| if b { Val::ONE } else { Val::ZERO };
+    match e {
+        SymbolicExpr::Leaf(l) => match l {
+            BaseLeaf::Variable(v) => match v.entry {
+                BaseEntry::Main { offset: 0 } => r.cur[v.index],
+                BaseEntry::Main { offset: 1 } => r.next[v.index],
+                BaseEntry::Preprocessed { offset: 0 } => r.pre_cur[v.index],
+                BaseEntry::Preprocessed { offset: 1 } => r.pre_next[v.index],
+                BaseEntry::Public => r.public[v.index],
+                other => panic!("an AIR here read {other:?}"),
+            },
+            BaseLeaf::IsFirstRow => flag(is_first),
+            BaseLeaf::IsLastRow => flag(is_last),
+            BaseLeaf::IsTransition => flag(!is_last),
+            BaseLeaf::Constant(c) => *c,
+        },
+        SymbolicExpr::Add { x, y, .. } => eval_boundary(x, r, is_first, is_last) + eval_boundary(y, r, is_first, is_last),
+        SymbolicExpr::Sub { x, y, .. } => eval_boundary(x, r, is_first, is_last) - eval_boundary(y, r, is_first, is_last),
+        SymbolicExpr::Neg { x, .. } => -eval_boundary(x, r, is_first, is_last),
+        SymbolicExpr::Mul { x, y, .. } => eval_boundary(x, r, is_first, is_last) * eval_boundary(y, r, is_first, is_last),
+    }
+}
+
+/// Which slot of a row pair a column lives in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Slot {
+    Cur,
+    Next,
+    PreCur,
+    PreNext,
+}
+
+fn slot_mut(r: &mut Rows, s: Slot) -> &mut Vec<Val> {
+    match s {
+        Slot::Cur => &mut r.cur,
+        Slot::Next => &mut r.next,
+        Slot::PreCur => &mut r.pre_cur,
+        Slot::PreNext => &mut r.pre_next,
+    }
+}
+
+/// Does `e` depend on column `col` of `slot` at this row pair? Two random perturbations, so a
+/// chance cancellation cannot hide a dependency.
+pub fn depends(e: &Expr, r: &Rows, slot: Slot, col: usize, rng: &mut impl rand::Rng) -> bool {
+    use p3_field::PrimeCharacteristicRing;
+    let base = eval_rows(e, r);
+    (0..2).any(|_| {
+        let mut moved = r.clone();
+        slot_mut(&mut moved, slot)[col] += random_felt(rng) + Val::ONE;
+        eval_rows(e, &moved) != base
+    })
+}
+
+/// The single current-row main column a message field is, or `None` for anything composite.
+pub fn as_column(e: &Expr) -> Option<usize> {
+    match e {
+        SymbolicExpr::Leaf(BaseLeaf::Variable(v)) if v.entry == (BaseEntry::Main { offset: 0 }) => Some(v.index),
+        _ => None,
+    }
+}

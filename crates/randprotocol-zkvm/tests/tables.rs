@@ -169,8 +169,9 @@ fn every_legal_encoding(rng: &mut StdRng) -> Vec<u32> {
     }
     for f in [lb, lbu, lh, lhu, lw] as [fn(u32, u32, i32) -> Instr; 5] { out.push(f(rd, rs1, imm(rng)).encode()); }
     for f in [sb, sh, sw] as [fn(u32, u32, i32) -> Instr; 3] { out.push(f(rs1, rs2, imm(rng)).encode()); }
-    out.push(lui(rd, rand_u32(rng)).encode());
-    out.push(auipc(rd, rand_u32(rng)).encode());
+    // The helpers no longer mask (ISA-5): a U-type immediate is its upper twenty bits.
+    out.push(lui(rd, rand_u32(rng) & 0xffff_f000).encode());
+    out.push(auipc(rd, rand_u32(rng) & 0xffff_f000).encode());
     out.push(jalr(rd, rs1, imm(rng)).encode());
     out.push(ecall().encode());
     for cond in [BranchCond::Eq, BranchCond::Ne, BranchCond::Lt, BranchCond::Ge, BranchCond::Ltu, BranchCond::Geu] {

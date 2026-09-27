@@ -263,3 +263,52 @@ fn witness_words_are_272_and_round_trip() {
 }
 
 fn into_guest(w: Witness) -> gs::Witness { gs::Witness { slot: w.slot, value: w.value, siblings: w.siblings, verified: false } }
+
+/// The evm-core storage-index lead from the 2026-09-27 zkVM review, measured rather than argued.
+/// A leaf position is only 32 bits of `keccak256(slot)`, so a *pair* of colliding slots is a
+/// birthday search (~2^16 slots — found here) and a slot colliding with one *chosen* victim slot is
+/// a second-preimage search on 32 bits (~2^32 Keccaks: seconds on a GPU). The per-call refusal of
+/// a colliding pair is `two_witnesses_at_one_leaf_position_are_refused_at_push`; this is the
+/// consequence *across* calls the docs had not stated: while one slot of the pair holds a non-zero
+/// value, the other cannot be touched at all — not read, not written — by any call, because the
+/// position's leaf binds the holder's slot and no witness for the other slot can hash to it. It
+/// stops the moment the holder is back at zero. No forgery (every successful call's roots are
+/// consistent) and no loss (a call that touches the frozen slot halts before any state changes);
+/// a targeted, persistent denial of one slot — `docs/04-guests.md`, "Known limitation (storage
+/// index)", has the verdict.
+#[test]
+fn a_ground_colliding_slot_freezes_its_partner_while_it_holds_a_value() {
+    // The birthday search: slots 0, 1, 2, … until two share a leaf position.
+    let mut seen = std::collections::HashMap::new();
+    let (a, b) = (0u32..1 << 20)
+        .find_map(|i| seen.insert(slot_index(&s(i)), i).map(|j| (s(j), s(i))))
+        .expect("a 32-bit collision among 2^20 slots (~2^16 expected)");
+    assert_ne!(a, b);
+    assert_eq!(slot_index(&a), slot_index(&b));
+    let mut h = HostRef;
+
+    // `a` holds a value. A witness for `b` must fold to the root from `b`'s position — `a`'s — and
+    // whatever value it claims, its leaf `H(STORAGE_LEAF, b, v)` (or the zero leaf) is not `a`'s.
+    let mut t = SparseTree::new();
+    t.insert(a, s(7));
+    let siblings = t.witness(&a).siblings;
+    for claimed in [U256::ZERO, s(7), s(1)] {
+        let mut g = StorageTree::new(t.root());
+        g.push(&mut h, gs::Witness { slot: b, value: claimed, siblings, verified: false }).unwrap();
+        assert!(matches!(g.load(&mut h, &b), Err(gs::StorageError::BadWitness)), "b is readable claiming {claimed:?}");
+        let mut g = StorageTree::new(t.root());
+        g.push(&mut h, gs::Witness { slot: b, value: claimed, siblings, verified: false }).unwrap();
+        assert!(matches!(g.store(&mut h, &b, s(1)), Err(gs::StorageError::BadWitness)), "b is writable claiming {claimed:?}");
+    }
+    // `a` itself is untouched by the collision.
+    let mut g = StorageTree::new(t.root());
+    g.push(&mut h, into_guest(t.witness(&a))).unwrap();
+    assert_eq!(g.load(&mut h, &a).unwrap(), s(7));
+
+    // Once `a` is back at zero the position's leaf is the canonical zero leaf, and `b` is usable.
+    t.insert(a, U256::ZERO);
+    let mut g = StorageTree::new(t.root());
+    g.push(&mut h, into_guest(t.witness(&b))).unwrap();
+    assert_eq!(g.load(&mut h, &b).unwrap(), U256::ZERO);
+    g.store(&mut h, &b, s(9)).unwrap();
+}

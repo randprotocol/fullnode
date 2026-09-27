@@ -383,3 +383,138 @@ fn a_reduce_run_touching_a_cell_outside_the_address_space_is_refused() {
     }
     assert!(admitted.is_empty(), "ZKQ-3: the reduce chip admits runs outside the address space: {admitted:?}");
 }
+
+// ── R6 / RVMv2 R5: no admissible padding row of any chip sends a message ─────────────────────
+//
+// `no_admissible_padding_reduce_row_sends_a_message` (above) is this rule for one chip, with the
+// row kinds enumerated by hand. This is the rule for every chip, table-driven the way
+// `research/tests/air_invariants.rs` runs it for the RV32 machine: from an honest padding row
+// between two honest padding rows, every column the constraints leave free there (one at a time,
+// kept only if both row pairs still satisfy every constraint) is set at random, and then no
+// message the chip sends or provides may have a non-zero count. The range table is skipped: every
+// row of it is a table entry whose count is a provided multiplicity, balanced by the global sum.
+
+/// A program that reaches every chip: registers and RAM (`STORE`, `LOAD`), a `POSEIDON2`
+/// dispatch, a three-row `REDUCE` run over a hand-written descriptor, the four `PUBLIC`s, `HALT`.
+fn every_chip_program() -> Program {
+    let mut v = vec![];
+    let st = |v: &mut Vec<Instr>, addr: u64, val: u64| {
+        v.push(Instr { op: Op::Faddi, rd: 1, ra: 0, b: F::from_u64(val) });
+        v.push(Instr { op: Op::Store, rd: 1, ra: 0, b: F::from_u64(addr) });
+    };
+    for (k, val) in [100u64, 120, 3, 1, 0, 0, 0, 1, 0, 3, 0].iter().enumerate() {
+        st(&mut v, 200 + k as u64, *val);
+    }
+    v.push(Instr { op: Op::Load, rd: 3, ra: 0, b: F::from_u64(201) });
+    v.push(Instr { op: Op::Faddi, rd: 2, ra: 0, b: F::from_u64(200) });
+    v.push(Instr { op: Op::Reduce, rd: 0, ra: 2, b: F::ZERO });
+    v.push(Instr { op: Op::Faddi, rd: 7, ra: 0, b: F::from_u64(64) });
+    v.push(Instr { op: Op::Poseidon2, rd: 0, ra: 7, b: F::ZERO });
+    for _ in 0..4 {
+        v.push(Instr { op: Op::Public, rd: 0, ra: 0, b: F::ZERO });
+    }
+    v.push(Instr { op: Op::Halt, rd: 0, ra: 0, b: F::ZERO });
+    Program { instrs: v, checkpoints: vec![] }
+}
+
+#[test]
+fn no_admissible_padding_row_of_any_chip_sends_a_message() {
+    use p3_air::BaseAir;
+    use randprotocol_rvm::machine::Chip;
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x0bc0_de03);
+    let p = every_chip_program();
+    let exec = randprotocol_rvm::emulator::execute(&p, &[], 1000).unwrap();
+    let t = randprotocol_rvm::machine::build_traces(&p, &exec, Tier(8)).unwrap();
+    assert!(t.reduce.is_some(), "the program dispatches REDUCE, so the batch declares the chip");
+    let chips = randprotocol_rvm::machine::chips(&std::sync::Arc::new(p.clone()), Tier(8), t.reduce_log_height);
+    let row_of = |m: &p3_matrix::dense::RowMajorMatrix<F>, r: usize| -> Vec<F> {
+        let w = m.width();
+        m.values[r * w..(r + 1) * w].to_vec()
+    };
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for (k, (chip, trace)) in chips.iter().zip(t.as_slice()).enumerate() {
+        if matches!(chip, Chip::Range(_)) {
+            continue;
+        }
+        let h = trace.height();
+        let r = h - 2;
+        let pre = BaseAir::<F>::preprocessed_trace(chip);
+        let pre_row = |i: usize| pre.as_ref().map(|m| row_of(m, i)).unwrap_or_default();
+        let public: Vec<F> = if k == randprotocol_rvm::machine::PUBLIC_VALUES_INDEX { t.public_values.clone() } else { vec![] };
+        let (interactions, constraints) = common::symbolic_air(chip);
+        let (prev, next) = (row_of(trace, r - 1), row_of(trace, r + 1));
+        let holds = |cur: &Vec<F>| {
+            constraints.iter().all(|c| {
+                common::eval_full(c, &prev, cur, (&pre_row(r - 1), &pre_row(r)), &public) == F::ZERO
+                    && common::eval_full(c, cur, &next, (&pre_row(r), &pre_row(r + 1)), &public) == F::ZERO
+            })
+        };
+        let sends = |cur: &Vec<F>| -> Vec<String> {
+            interactions
+                .iter()
+                .filter(|i| common::eval_full(&i.count, cur, &next, (&pre_row(r), &pre_row(r + 1)), &public) != F::ZERO)
+                .map(|i| i.bus_name.clone())
+                .collect()
+        };
+        let mut cur = row_of(trace, r);
+        assert!(holds(&cur), "chip {k}: the honest row {r} fails a constraint");
+        assert!(sends(&cur).is_empty(), "chip {k}: honest row {r} of {h} is not padding (it sends {:?})", sends(&cur));
+        // And its predecessor is padding, so `r` is not the real/padding boundary — where a
+        // table's own rules may admit one more real row and a cross-table balance refuses it (the
+        // RV32 harness's comment in `research/tests/air_invariants.rs` has the case it met).
+        assert!(
+            interactions.iter().all(|i| common::eval_full(&i.count, &prev, &cur, (&pre_row(r - 1), &pre_row(r)), &public) == F::ZERO),
+            "chip {k}: row {} before the checked row is not padding",
+            r - 1
+        );
+        let mut free = Vec::new();
+        // A random value first, then `1`: a flag column is only ever free as a boolean, and a
+        // random field element would fail its `assert_bool` and hide exactly that freedom.
+        for col in 0..cur.len() {
+            let keep = cur[col];
+            for candidate in [common::random_felt(&mut rng), F::ONE] {
+                cur[col] = candidate;
+                if holds(&cur) {
+                    free.push(col);
+                    break;
+                }
+                cur[col] = keep;
+            }
+        }
+        checked += 1;
+        let s = sends(&cur);
+        eprintln!("chip {k}: padding row {r} of {h}, {} of {} columns free, sends {s:?}", free.len(), cur.len());
+        if !s.is_empty() {
+            failures.push(format!("chip {k}: a padding row with free columns {free:?} sends on {s:?}"));
+        }
+    }
+    assert_eq!(checked, 7, "every chip but range: program, cpu, reg, ram, poseidon2, public, reduce");
+    assert!(failures.is_empty(), "admissible padding rows send messages:\n  {}", failures.join("\n  "));
+}
+/// R4 (the 2026-09-27 rVM review): the pin above builds a program with no `REDUCE`, so its batch
+/// has seven instances and the reduce chip's width and degree were pinned by nothing — the chip
+/// every dormant high finding of that review (RVM-2, TABLES-1, V-TABLES-1) lives in. Here the same
+/// pin over a program that dispatches `REDUCE`, with the chip declared: eight instances, reduce
+/// last, and the other seven unchanged by its presence.
+#[test]
+fn the_reduce_chip_width_and_constraint_degree_are_pinned() {
+    assert_eq!(reduce_table::col::WIDTH, 39, "the reduce chip's designed width (Task 8's run row, ZKQ-3's range limbs)");
+    let p = Program {
+        instrs: vec![
+            Instr { op: Op::Faddi, rd: 2, ra: 0, b: F::from_u64(200) },
+            Instr { op: Op::Reduce, rd: 0, ra: 2, b: F::ZERO },
+            Instr { op: Op::Halt, rd: 0, ra: 0, b: F::ZERO },
+        ],
+        checkpoints: vec![],
+    };
+    let degs = randprotocol_rvm::machine::max_constraint_degrees_declaring(&p, Tier(8), true);
+    assert_eq!(degs.len(), 8, "program, cpu, reg, ram, poseidon2, public, range, reduce");
+    assert_eq!(&degs[..7], &[2, 8, 4, 4, 4, 2, 2], "declaring the reduce chip moves no other table's degree");
+    // Measured: 8 — like the cpu's, this config's budget ceiling (`log2_ceil(degree − 1) ≤
+    // log_blowup = 3`), so the reduce chip has no degree headroom left: one more degree-2 factor on
+    // any of its lookups or constraints and the batch needs a larger blowup. That is what a pin is
+    // for.
+    assert_eq!(degs[7], 8);
+}
+

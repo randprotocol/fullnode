@@ -579,3 +579,37 @@ pub fn admits_byte_limbs(
         None => Ok(row),
     }
 }
+
+/// [`eval_at`] for an AIR that also reads preprocessed columns and public values (the program and
+/// range tables, the public table): `pre` is the preprocessed row pair, `public` the instance's
+/// public values. A transition row, like `eval_at`'s.
+#[allow(dead_code)]
+pub fn eval_full(
+    e: &SymbolicExpression<randprotocol_rvm::isa::F>,
+    cur: &[randprotocol_rvm::isa::F],
+    next: &[randprotocol_rvm::isa::F],
+    pre: (&[randprotocol_rvm::isa::F], &[randprotocol_rvm::isa::F]),
+    public: &[randprotocol_rvm::isa::F],
+) -> randprotocol_rvm::isa::F {
+    use p3_field::PrimeCharacteristicRing;
+    use randprotocol_rvm::isa::F;
+    match e {
+        SymbolicExpr::Leaf(l) => match l {
+            BaseLeaf::Variable(v) => match v.entry {
+                BaseEntry::Main { offset: 0 } => cur[v.index],
+                BaseEntry::Main { offset: 1 } => next[v.index],
+                BaseEntry::Preprocessed { offset: 0 } => pre.0[v.index],
+                BaseEntry::Preprocessed { offset: 1 } => pre.1[v.index],
+                BaseEntry::Public => public[v.index],
+                other => panic!("an AIR here read {other:?}"),
+            },
+            BaseLeaf::IsFirstRow | BaseLeaf::IsLastRow => F::ZERO,
+            BaseLeaf::IsTransition => F::ONE,
+            BaseLeaf::Constant(c) => *c,
+        },
+        SymbolicExpr::Add { x, y, .. } => eval_full(x, cur, next, pre, public) + eval_full(y, cur, next, pre, public),
+        SymbolicExpr::Sub { x, y, .. } => eval_full(x, cur, next, pre, public) - eval_full(y, cur, next, pre, public),
+        SymbolicExpr::Neg { x, .. } => -eval_full(x, cur, next, pre, public),
+        SymbolicExpr::Mul { x, y, .. } => eval_full(x, cur, next, pre, public) * eval_full(y, cur, next, pre, public),
+    }
+}

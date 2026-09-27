@@ -26,7 +26,10 @@ p3-merkle-tree = "=0.7.0"
 p3-commit = "=0.7.0"
 p3-matrix = "=0.7.0"
 p3-util = "=0.7.0"
-rand = { version = "0.10", features = ["std_rng"] }
+# HCS-1 (2026-09-27 zkVM review): verifier keys are derived from StdRng's output stream (KEY_SEED);
+# exact pins so no dependency bump can silently move every key. tests/verifier_key.rs pins them.
+rand = { version = "=0.10.2", features = ["std_rng"] }
+rand_core = "=0.10.1"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 # The reference verifier this crate's first program mirrors, the reference permutation it hashes

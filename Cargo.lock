@@ -5396,6 +5396,7 @@ dependencies = [
  "postcard",
  "rand 0.10.2",
  "rand-zkvm-cuda",
+ "rand_core 0.10.1",
  "randprotocol-zkvm",
  "serde",
 ]
@@ -5427,6 +5428,7 @@ dependencies = [
  "postcard",
  "rand 0.10.2",
  "rand-zkvm-cuda",
+ "rand_core 0.10.1",
  "randprotocol-core",
  "revm",
  "sbpf-core",

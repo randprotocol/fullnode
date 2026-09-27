@@ -205,6 +205,19 @@ impl Instr {
         // Assert the ranges here, the one choke point where the value is still known —
         // host-side only, matching `Assembler::label`'s own panic on a duplicate label;
         // `decode` never calls this.
+        // ISA-5 (the 2026-09-27 review): the register fields are five bits, and `rd << 7` with
+        // `rd = 32` lands in `funct3` — a different instruction, silently. Same choke point, same
+        // host-only panic.
+        let regs: Vec<u32> = match *self {
+            Instr::Lui { rd, .. } | Instr::Auipc { rd, .. } | Instr::Jal { rd, .. } => vec![rd],
+            Instr::Jalr { rd, rs1, .. } | Instr::Load { rd, rs1, .. } | Instr::AluImm { rd, rs1, .. } => vec![rd, rs1],
+            Instr::Branch { rs1, rs2, .. } | Instr::Store { rs1, rs2, .. } => vec![rs1, rs2],
+            Instr::AluReg { rd, rs1, rs2, .. } => vec![rd, rs1, rs2],
+            Instr::Ecall => vec![],
+        };
+        for r in regs {
+            assert!(r < 32, "register x{r} does not fit 5 bits");
+        }
         let i_type = |imm: u32, rs1: u32, f3: u32, rd: u32, op: u32| {
             assert!((-2048..=2047).contains(&(imm as i32)), "I-type immediate {} does not fit 12 bits", imm as i32);
             (imm & 0xfff) << 20 | rs1 << 15 | f3 << 12 | rd << 7 | op

@@ -38,7 +38,10 @@ p3-symmetric = "=0.7.0"
 # `tests/keccak.rs` cross-checks `src/keccak.rs`'s host permutation against `p3_keccak`'s own.
 # Pinned to the exact version upstream uses — see `deploy/sync-zkvm.sh`'s header.
 p3-keccak = "=0.7.0"
-rand = { version = "0.10", features = ["std_rng"] }
+# HCS-1 (2026-09-27 zkVM review): verifier keys are derived from StdRng's output stream (KEY_SEED);
+# exact pins so no dependency bump can silently move every key. tests/verifier_key.rs pins them.
+rand = { version = "=0.10.2", features = ["std_rng"] }
+rand_core = "=0.10.1"
 # Shielded pool S1: the vendored note layer's envelope format (`src/viewing.rs`). Pinned to the
 # exact versions the research crate uses — an envelope sealed by a wallet must open on a node,
 # and both sides are this one implementation.

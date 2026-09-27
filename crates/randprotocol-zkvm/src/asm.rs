@@ -28,6 +28,13 @@ impl Assembler {
 }
 
 /// Mnemonic helpers. Immediates are `i32` for readability and stored sign-extended.
+///
+/// ISA-5 (the 2026-09-27 zkVM review): no helper masks or truncates an operand. A value that does
+/// not fit its field reaches `Instr::encode` unchanged, and `encode` refuses it (audit ZM3's range
+/// checks; ISA-5's register check) — the helpers used to mask shift amounts to five bits and
+/// `lui`/`auipc` immediates to their upper twenty *before* `encode` could see them, so a typo
+/// assembled to a different, valid instruction. Every in-range operand encodes to exactly the word
+/// it always did, so no program, digest or guest changes.
 pub mod ops {
     use crate::isa::*;
     fn imm(i: i32) -> u32 { i as u32 }
@@ -37,9 +44,9 @@ pub mod ops {
     pub fn xori(rd: u32, rs1: u32, i: i32) -> Instr { Instr::AluImm { op: AluOp::Xor, rd, rs1, imm: imm(i) } }
     pub fn slti(rd: u32, rs1: u32, i: i32) -> Instr { Instr::AluImm { op: AluOp::Slt, rd, rs1, imm: imm(i) } }
     pub fn sltiu(rd: u32, rs1: u32, i: i32) -> Instr { Instr::AluImm { op: AluOp::Sltu, rd, rs1, imm: imm(i) } }
-    pub fn slli(rd: u32, rs1: u32, sh: u32) -> Instr { Instr::AluImm { op: AluOp::Sll, rd, rs1, imm: sh & 31 } }
-    pub fn srli(rd: u32, rs1: u32, sh: u32) -> Instr { Instr::AluImm { op: AluOp::Srl, rd, rs1, imm: sh & 31 } }
-    pub fn srai(rd: u32, rs1: u32, sh: u32) -> Instr { Instr::AluImm { op: AluOp::Sra, rd, rs1, imm: sh & 31 } }
+    pub fn slli(rd: u32, rs1: u32, sh: u32) -> Instr { Instr::AluImm { op: AluOp::Sll, rd, rs1, imm: sh } }
+    pub fn srli(rd: u32, rs1: u32, sh: u32) -> Instr { Instr::AluImm { op: AluOp::Srl, rd, rs1, imm: sh } }
+    pub fn srai(rd: u32, rs1: u32, sh: u32) -> Instr { Instr::AluImm { op: AluOp::Sra, rd, rs1, imm: sh } }
     macro_rules! rrr { ($($name:ident => $op:ident),*) => { $( pub fn $name(rd: u32, rs1: u32, rs2: u32) -> Instr { Instr::AluReg { op: AluOp::$op, rd, rs1, rs2 } } )* } }
     rrr!(add => Add, sub => Sub, and => And, or => Or, xor => Xor, sll => Sll, srl => Srl, sra => Sra, slt => Slt, sltu => Sltu,
          mul => Mul, mulh => Mulh, mulhu => Mulhu, mulhsu => Mulhsu, div => Div, divu => Divu, rem => Rem, remu => Remu);
@@ -51,8 +58,8 @@ pub mod ops {
     pub fn sb(rs1: u32, rs2: u32, off: i32) -> Instr { Instr::Store { rs1, rs2, imm: imm(off), width: Width::Byte } }
     pub fn sh(rs1: u32, rs2: u32, off: i32) -> Instr { Instr::Store { rs1, rs2, imm: imm(off), width: Width::Half } }
     pub fn sw(rs1: u32, rs2: u32, off: i32) -> Instr { Instr::Store { rs1, rs2, imm: imm(off), width: Width::Word } }
-    pub fn lui(rd: u32, upper: u32) -> Instr { Instr::Lui { rd, imm: upper & 0xffff_f000 } }
-    pub fn auipc(rd: u32, upper: u32) -> Instr { Instr::Auipc { rd, imm: upper & 0xffff_f000 } }
+    pub fn lui(rd: u32, upper: u32) -> Instr { Instr::Lui { rd, imm: upper } }
+    pub fn auipc(rd: u32, upper: u32) -> Instr { Instr::Auipc { rd, imm: upper } }
     pub fn jalr(rd: u32, rs1: u32, off: i32) -> Instr { Instr::Jalr { rd, rs1, imm: imm(off) } }
     pub fn ecall() -> Instr { Instr::Ecall }
     pub fn mv(rd: u32, rs: u32) -> Instr { addi(rd, rs, 0) }

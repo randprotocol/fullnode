@@ -600,12 +600,22 @@ impl Machine {
 /// real, same-bus-packed lookup contexts. Exists to back the per-table degree regression tests
 /// (`research`'s `max_constraint_degrees`'s role, over a program-carrying chip set).
 pub fn max_constraint_degrees(program: &Program, tier: Tier) -> Vec<usize> {
+    max_constraint_degrees_declaring(program, tier, false)
+}
+
+/// [`max_constraint_degrees`] with the reduce chip declared (`reduce = true`: the eight-instance
+/// batch, reduce last) or not. R4's width/degree pin (the 2026-09-27 rVM review) found the pinned
+/// test never built the reduce chip — `max_constraint_degrees` always passed a reduce height of
+/// `0` — so the chip's degree, and with it its quotient-chunk count, was pinned by nothing. The
+/// declared height is the floor, as everywhere else here: the symbolic degree is height-invariant.
+pub fn max_constraint_degrees_declaring(program: &Program, tier: Tier, reduce: bool) -> Vec<usize> {
     let machine = Machine::new(FriProfile::Test);
     let key_cfg = key_config(machine.profile);
     let arc = Arc::new(program.clone());
-    let airs = chips(&arc, tier, 0);
+    let reduce_log_height = if reduce { MIN_LOG_HEIGHT } else { 0 };
+    let airs = chips(&arc, tier, reduce_log_height);
     let is_zk = machine.config.is_zk();
-    let ext_degrees = log_ext_degrees(program, tier, MIN_LOG_HEIGHT, MIN_LOG_HEIGHT, MIN_LOG_HEIGHT, 0); // max_constraint_degrees is reduce-free
+    let ext_degrees = log_ext_degrees(program, tier, MIN_LOG_HEIGHT, MIN_LOG_HEIGHT, MIN_LOG_HEIGHT, reduce_log_height);
     let prover_data = ProverData::from_airs_and_degrees(&key_cfg, &airs, &ext_degrees);
     let lookup_gadget = p3_lookup::LogUpGadget::new();
     airs.iter()

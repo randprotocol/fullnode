@@ -161,3 +161,54 @@ fn the_floor_never_adds_an_absent_hash_table() {
     assert_eq!(proof.input_log_height, MIN_PRIVATE_TABLE_LOG_HEIGHT);
     m.verify(&p.digest(), &proof).unwrap();
 }
+
+/// HCS-3 (the 2026-09-27 zkVM review): with `ProveOptions::pad_absent_hash_tables` a call that
+/// never hashes declares the keccak and sha256 tables anyway, all padding, at the floor — and the
+/// unchanged verifier accepts it. Its header's hash-table heights are then exactly those of
+/// `private_call`, which really runs one permutation and one compression: from the header alone the
+/// two are the same kind of call. Off by default (the test above pins that the default prover
+/// never adds a table), because it costs proving time and hides nothing unless others do it too.
+///
+/// Measured on this laptop (tier 10, `balance_check`, `--release`, one run each; this test prints
+/// the Test-profile pair as `default` / `padded`): Test 300 708 → 850 026 bytes, ~6.9 → ~7.1 s;
+/// Production 1 305 415 → 3 622 604 bytes, 6.3 → 7.2 s (`ProveOptions`' doc comment weighs it).
+#[test]
+fn padded_hash_tables_verify_and_hide_presence() {
+    use randprotocol_zkvm::machine::ProveOptions;
+    let m = Machine::new(FriProfile::Test);
+    let p = randprotocol_zkvm::guests::balance_check(1000);
+    let inputs = [400, 250, 300, 75];
+    let t0 = std::time::Instant::now();
+    let (plain, _) = m.prove(&p, &inputs, &[], Some(Tier(10))).unwrap();
+    let t_plain = t0.elapsed();
+    let t0 = std::time::Instant::now();
+    let opts = ProveOptions { pad_absent_hash_tables: true };
+    let (padded, exec) = m.prove_with_options(&p, &inputs, &[], Some(Tier(10)), opts).unwrap();
+    let t_padded = t0.elapsed();
+    eprintln!("default: {} bytes, {t_plain:?}; padded: {} bytes, {t_padded:?}", plain.size(), padded.size());
+    assert_eq!(exec.events.iter().filter(|e| e.keccak_row.is_some() || e.sha256_row.is_some()).count(), 0, "the call never hashes");
+    assert_eq!((plain.keccak_log_height, plain.sha256_log_height), (0, 0));
+    assert_eq!((padded.keccak_log_height, padded.sha256_log_height), (MIN_PRIVATE_TABLE_LOG_HEIGHT, MIN_PRIVATE_TABLE_LOG_HEIGHT));
+    // Nothing else in the header moves: the idle tables add no cycle and no memory access.
+    assert_eq!(
+        (padded.tier, padded.program_log_height, padded.input_log_height, padded.public_log_height, padded.mem_log_height),
+        (plain.tier, plain.program_log_height, plain.input_log_height, plain.public_log_height, plain.mem_log_height)
+    );
+    assert_eq!(padded.batch.degree_bits.len(), plain.batch.degree_bits.len() + 2);
+    m.verify(&p.digest(), &padded).expect("the unchanged verifier accepts all-padding hash tables");
+    assert_eq!(padded.public_values, {
+        // Same statement: every public value but the salted H_IN (a fresh salt per proof) agrees.
+        let mut v = plain.public_values.clone();
+        for i in 0..8 {
+            v[randprotocol_zkvm::tables::cpu::pv::IN0 + i] = padded.public_values[randprotocol_zkvm::tables::cpu::pv::IN0 + i];
+        }
+        v
+    });
+    // The header a real one-permutation, one-compression call declares — the same two heights.
+    let (real, _) = m.prove(&private_call(), &[1, 2, 3, 4], &[], Some(Tier(10))).unwrap();
+    assert_eq!((real.keccak_log_height, real.sha256_log_height), (padded.keccak_log_height, padded.sha256_log_height));
+    // And the option never changes a table a call already has.
+    let (real_padded, _) = m.prove_with_options(&private_call(), &[1, 2, 3, 4], &[], Some(Tier(10)), opts).unwrap();
+    assert_eq!((real_padded.keccak_log_height, real_padded.sha256_log_height), (real.keccak_log_height, real.sha256_log_height));
+    m.verify(&private_call().digest(), &real_padded).unwrap();
+}

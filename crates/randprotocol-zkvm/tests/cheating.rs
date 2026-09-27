@@ -3034,3 +3034,167 @@ fn an_inflated_mult_read_on_a_real_public_row_is_rejected() {
     t.public.values[col::MULT_READ] = F::from_u32(2);
     assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
 }
+
+/// VERIFIER-1 (the 2026-09-27 zkVM and rVM reviews): FRI's commit-phase proof-of-work words.
+///
+/// This machine grinds zero bits in the commit phase (`generic_config`'s
+/// `commit_proof_of_work_bits: 0`), and at zero bits p3's `check_witness` returns `true` without
+/// even observing the witness (`grinding_challenger.rs:42-48`) — so the words ride in the proof, one
+/// per folding round, bound to nothing. The honest prover's `grind(0)` always writes `F::ZERO`
+/// (`grinding_challenger.rs:117-120`), but any other value verified identically. The proof is then
+/// malleable: a relayer rewrites a word and the bytes — and on a chain the transaction id that hashes
+/// them — change while the proof stays valid, so a wallet watching for its own id reports a committed
+/// payment as never committed. `Machine::verify` now requires every such word to be the honest zero.
+/// (The query-phase word is not malleable: it is observed before the query indices are drawn, so any
+/// other passing witness moves every query and the openings no longer match.)
+#[test]
+fn a_rewritten_commit_phase_pow_word_is_refused() {
+    let m = Machine::new(FriProfile::Test);
+    let p = guests::fib(10);
+    let (proof, _) = m.prove(&p, &[], &[], None).unwrap();
+    let words = &proof.batch.opening_proof.1.commit_pow_witnesses;
+    assert!(!words.is_empty(), "a tier-10 proof folds at least once");
+    assert!(words.iter().all(|w| *w == Val::ZERO), "the honest prover writes zero at zero bits");
+    m.verify(&p.digest(), &proof).unwrap();
+    for round in [0, words.len() - 1] {
+        let mut forged: randprotocol_zkvm::machine::Proof = postcard::from_bytes(&proof.to_bytes()).unwrap();
+        forged.batch.opening_proof.1.commit_pow_witnesses[round] = Val::from_u64(0x1234_5678);
+        assert_ne!(forged.to_bytes(), proof.to_bytes(), "a different encoding of the proof");
+        assert!(
+            matches!(m.verify(&p.digest(), &forged), Err(randprotocol_zkvm::machine::VerifyError::CommitPowWitness { round: r }) if r == round),
+            "round {round}: {:?}",
+            m.verify(&p.digest(), &forged)
+        );
+    }
+}
+
+// ── ARITH-2 (the 2026-09-27 zkVM review): negative tests for the ALU's untested guards ─────────
+//
+// The review listed load-bearing ALU constraints no test refuses a cheat through, the SLL wrap
+// guard first. Each test below takes an honest run whose one ALU result flows straight to output
+// slot 0, forges that result *and every consequence of it* — the cpu row, the register write and
+// every later read, the public output, the ALU row's limbs, the range and nibble tables'
+// multiplicities — so that exactly one rule is left to refuse it: the guard under test. Each was
+// checked the other way round when written (the guard deleted from `alu.rs`, the forged trace
+// then *verifies*), which is what makes it a test of that guard and not of the bookkeeping; the
+// commit message quotes those runs.
+
+/// `li x5, a; <op> a1, x5, imm; WRITE_OUTPUT(0, a1); HALT` — the result reaches the output with
+/// no other instruction touching it.
+fn one_op_to_output(a: i32, op: Instr) -> Program {
+    let mut asm = Assembler::new(0);
+    asm.extend(li(5, a));
+    asm.push(op);
+    asm.extend(li(REG_A7, randprotocol_zkvm::isa::SYS_WRITE_OUTPUT as i32));
+    asm.extend(li(REG_A0, 0));
+    asm.push(ecall());
+    asm.extend(halt());
+    asm.assemble()
+}
+
+/// Moves one `RANGE8` demand from `from` to `to` in the range table's multiplicities.
+fn range8_moved(t: &mut Traces, from: u32, to: u32) {
+    let w = range::col::WIDTH;
+    t.range.values[from as usize * w + range::col::M_RANGE] -= F::ONE;
+    t.range.values[to as usize * w + range::col::M_RANGE] += F::ONE;
+}
+
+/// Moves one `AND4` demand from nibble pair `from` to `to` (`None`: a tuple the table has no row
+/// for — the demand simply disappears from the provider side, as a forged tuple's does).
+fn and4_moved(t: &mut Traces, from: (u32, u32), to: Option<(u32, u32)>) {
+    let w = nibble::col::WIDTH;
+    t.nibble.values[nibble::row_of(from.0, from.1) * w + nibble::col::M_AND] -= F::ONE;
+    if let Some(to) = to {
+        t.nibble.values[nibble::row_of(to.0, to.1) * w + nibble::col::M_AND] += F::ONE;
+    }
+}
+
+/// The cpu, memory and public-value half of a forged result: the `op` row writing `a1` now
+/// yields `forged`, and so does every later read of `a1` and output slot 0.
+fn forge_a1_result(t: &mut Traces, forged: u32) {
+    let (wc, wm) = (cpu::col::WIDTH, memory::col::WIDTH);
+    let new = F::from_u32(forged);
+    let row = (0..t.cpu.height())
+        .find(|r| t.cpu.values[r * wc + cpu::col::IS_ALU] == F::ONE && t.cpu.values[r * wc + cpu::col::RD] == F::from_u32(REG_A1))
+        .expect("the op writes a1");
+    let write_ts = 4 * t.cpu.values[row * wc + cpu::col::CLK].as_canonical_u64() + SLOT_W as u64;
+    t.cpu.values[row * wc + cpu::col::ALU_OUT] = new;
+    t.cpu.values[row * wc + cpu::col::C] = new;
+    for r in row + 1..t.cpu.height() {
+        if t.cpu.values[r * wc + cpu::col::IS_ECALL] == F::ONE {
+            t.cpu.values[r * wc + cpu::col::MEM_VAL] = new;
+        }
+    }
+    for r in 0..t.memory.height() {
+        let m = &mut t.memory.values[r * wm..(r + 1) * wm];
+        if m[memory::col::IS_REAL] == F::ONE && m[memory::col::SPACE] == F::ZERO && m[memory::col::ADDR] == F::from_u32(REG_A1) && m[memory::col::TS].as_canonical_u64() >= write_ts {
+            m[memory::col::VALUE] = new;
+        }
+    }
+    t.public_values[cpu::pv::OUT0] = new;
+}
+
+/// The SLL wrap guard. `A·PW = Q·2^32 + C` is checked in the field, where `2^64 ≡ 2^32 − 1`: with
+/// `Q = 2^32 − 1` the right side is `p − 1 + C + 1`, so `(Q, C) = (2^32 − 1, c + 1)` satisfies the
+/// identity exactly when `(0, c)` does — `slli a1, x5, 1` with `x5 = 5` can claim `11`. `Q`'s four
+/// limbs are all bytes (`0xff`), so their range checks pass; what refuses it is the guard that `Q`'s
+/// top bit is clear (`QH3 & 8 = 0`, the `AND4` lookup `alu.rs` calls "sll's overflow check"), since
+/// an honest `Q` is below `2^31` for any shift of a 32-bit value.
+#[test]
+fn an_sll_that_wraps_the_field_is_refused_by_the_overflow_guard() {
+    let p = one_op_to_output(5, slli(REG_A1, 5, 1));
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 10);
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = alu::col::WIDTH;
+    let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Sll);
+    let al = |t: &Traces, c: usize| t.alu.values[row * w + c];
+    assert_eq!((al(&t, alu::col::A), al(&t, alu::col::C), al(&t, alu::col::Q0 + 3), al(&t, alu::col::QH3)), (F::from_u32(5), F::from_u32(10), F::ZERO, F::ZERO));
+    // The identity holds in the field for the forged pair.
+    let (q, c) = (F::from_u64(0xffff_ffff), F::from_u32(11));
+    assert_eq!(F::from_u32(5) * F::from_u32(2), q * F::from_u64(1 << 32) + c);
+    forge_a1_result(&mut t, 11);
+    t.alu.values[row * w + alu::col::C] = c;
+    t.alu.values[row * w + alu::col::C0] = c;
+    range8_moved(&mut t, 10, 11);
+    for k in 0..4 {
+        t.alu.values[row * w + alu::col::Q0 + k] = F::from_u32(0xff);
+        range8_moved(&mut t, 0, 0xff);
+    }
+    // Q's top limb's nibbles: the dummy low-nibble range check moves (0,0) → (15,0); the guard's
+    // own tuple (QH3, 8, 0) becomes (15, 8, 0), which the nibble table does not provide.
+    t.alu.values[row * w + alu::col::QH3] = F::from_u32(0xf);
+    and4_moved(&mut t, (0, 0), Some((0xf, 0)));
+    and4_moved(&mut t, (0, 8), None);
+    assert_eq!(t.public_values[cpu::pv::OUT0], F::from_u32(11));
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+/// The right-shift remainder bound. `srli a1, x5, 2` with `x5 = 17`: honest `(Q, R) = (4, 1)`,
+/// `PW = 4`. `(3, 5)` also satisfies `A' = Q·PW + R` (`17 = 12 + 5`), with every limb a byte; what
+/// refuses it is `PW − 1 − R − T = 0` with `T`'s limbs range-checked — `R < PW` — since `T` would
+/// have to be `−2`. The result the forge claims is `3`, one short of the truth.
+#[test]
+fn a_right_shift_remainder_not_below_the_shift_is_refused() {
+    let p = one_op_to_output(17, srli(REG_A1, 5, 2));
+    let m = Machine::new(FriProfile::Test);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    assert_eq!(e.outputs[0], 4);
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let w = alu::col::WIDTH;
+    let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Srl);
+    let al = |t: &Traces, c: usize| t.alu.values[row * w + c];
+    assert_eq!((al(&t, alu::col::Q0), al(&t, alu::col::S0), al(&t, alu::col::T0), al(&t, alu::col::PW)), (F::from_u32(4), F::ONE, F::TWO, F::from_u32(4)));
+    forge_a1_result(&mut t, 3);
+    // The quotient is the result on a logical right shift (`C_k = Q_k` when `SA = 0`).
+    t.alu.values[row * w + alu::col::C] = F::from_u32(3);
+    t.alu.values[row * w + alu::col::C0] = F::from_u32(3);
+    t.alu.values[row * w + alu::col::Q0] = F::from_u32(3);
+    t.alu.values[row * w + alu::col::S0] = F::from_u32(5);
+    range8_moved(&mut t, 4, 3); // C0 (a shift row range-checks C's limbs too)
+    range8_moved(&mut t, 4, 3); // Q0
+    range8_moved(&mut t, 1, 5); // S0
+    // `T` left at its honest 2: no byte value of it satisfies `PW − 1 − R − T = 0` with `R = 5`.
+    assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
