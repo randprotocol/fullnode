@@ -41,16 +41,19 @@ fn verifies_a_real_proof_and_reports_outputs() {
     ex.warm(&rec);
     // `warm` precomputes the keys for tiers 10, 12 and 14 (the tiers real guests land on;
     // warming every tier would build the Poseidon2 chip's 2^22-row preprocessed table on a
-    // 2-vCPU validator at deploy time) crossed with two input-height classes (M4.1 ruling,
-    // `executor.rs`'s `warm` doc comment): `input::MIN_LOG_HEIGHT` (a 0..3-word call) and
-    // `input_log_height(4)` (a 4-word call — what `private_payment` itself reads, matching the
-    // proof already verified above at tier 10). 3 tiers * 2 input-height classes = 6 combinations;
-    // the (tier 10, input height of a 4-word call) key is already cached from the verify above
-    // and is reused, not double-counted, so six cached keys in total.
+    // 2-vCPU validator at deploy time) crossed with the input-height classes a call can still be
+    // pooled with. Since COV-2 / INT-6 that is one class: the prover floors every private table at
+    // `MIN_PRIVATE_TABLE_LOG_HEIGHT` (2^7 rows, so the hiding PCS's 80 queries + 2 OOD points
+    // never outnumber its random rows), the pool refuses a call below it, and a 4-word call —
+    // `private_payment`, verified above at tier 10 — lands exactly on the floor. Warming the old
+    // `input::MIN_LOG_HEIGHT` class too would spend three key builds and three cache slots per
+    // program on a shape no call can use. 3 tiers * 1 class = 3 combinations; the (tier 10,
+    // floored input) key is already cached from the verify above and is reused, not
+    // double-counted, so three cached keys in total.
     assert_eq!(
         ex.cached_keys(),
-        6,
-        "warm precomputes keys for tiers 10, 12, 14 x 2 input-height classes, reusing the cached one"
+        3,
+        "warm precomputes keys for tiers 10, 12, 14 at the floored input height, reusing the cached one"
     );
     let t = std::time::Instant::now();
     ex.verify_call(&rec, proof).unwrap();

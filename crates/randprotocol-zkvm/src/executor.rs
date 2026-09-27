@@ -641,8 +641,14 @@ impl ConfidentialExecutor for ZkExecutor {
     fn warm(&self, record: &ProgramRecord) {
         self.warming(|| {
             let log_height = program::program_log_height(record.words.len());
-            let smallest = input::MIN_LOG_HEIGHT;
-            let typical = input::input_log_height(4);
+            // The smallest input table a call can still be pooled with (COV-2 / INT-6): below
+            // `MIN_PRIVATE_TABLE_LOG_HEIGHT` the pool refuses the call before any key is built
+            // (`admission::call_reveals_private_inputs`), so warming `input::MIN_LOG_HEIGHT`
+            // would spend a key build and a cache slot per tier on a shape no call can use. An
+            // upgraded wallet's prover floors the table there too, so the floor *is* the typical
+            // height of every small call.
+            let smallest = input::MIN_LOG_HEIGHT.max(MIN_PRIVATE_TABLE_LOG_HEIGHT);
+            let typical = input::input_log_height(4).max(MIN_PRIVATE_TABLE_LOG_HEIGHT);
             let input_heights: &[u8] = if typical == smallest { &[smallest] } else { &[smallest, typical] };
             let public_height = public::public_log_height(record.public_len as usize);
             // Every tier a call may declare (`MAX_CALL_TIER` and below) — the cap and this loop
