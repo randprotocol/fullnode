@@ -33,7 +33,21 @@ for rollback — retire them with `deploy/retire-chain-dirs.sh` once chain 15 ha
   5 BSC 9, 6 SOL 8; released by the relayer, audited custody == locked). The 10 zUSD left — all
   Anish's — are listed at genesis: same asset id `32e5ab28…`, backings locked Tron USDT 9 /
   Solana USDT 1, one genesis note to his address. `total_supply == Σ locked == custody` at block 0.
-- Relayer funded by 3 × 100 RAND faucet mints (blocks 32/36/40). The bridge session owns the
+- Relayer funded by 3 × 100 RAND faucet mints (blocks 32/36/40).
+- **2026-09-27, off the laptop and 26 validators.** Validator A moved to droplet `rand-node-a`
+  (139.59.238.151, sgp1; same key, `--prune-history 24h`); the laptop's launchd job is retired and
+  `deploy/run-a.sh` refuses to start (two signers on one key = equivocation); the laptop keeps
+  only an SSH tunnel on 127.0.0.1:8545 → A's RPC for the bridge daemons still there. New second
+  archive `rand-archive-2` (206.81.29.236, fra1, 250 GiB volume `/mnt/rand_archive_2`, full
+  history). Both droplets and the six guardian hosts live in DigitalOcean team "My Team"
+  (dendi@systematictrading.group); the 17 original validator droplets are in another team whose
+  token is not on this machine. Eight nodes were bonded as new validators (1 000 RAND each,
+  registration v2, payout wallets `~/.rand-chain15/payout/`, registrations
+  `~/.rand-chain15/registrations/`): obs1, rand-archive-2, and guardian hosts 1–6 (their node key
+  `/var/lib/randnode/node.key.json`; `--validator --prune-history 24h` in the `chain15.conf`
+  drop-in) — the user chose the guardian hosts against the BRG-14 custody advice. Register = 26;
+  the eight activate at epoch 43. Funding: genesis alloc wallets shielded-1..5 + a 100-RAND
+  top-up each, and 9 merges each in demo-01/05/08 (a bundle spends at most two notes). The bridge session owns the
   relayer, guardians and the six guardian observer droplets.
 - **Trap from the cut:** `rand-node alloc-note --amount` scaled zUSD by RAND's 10^9 (100 zUSD for
   "10"); fixed in `d6f6425`, caught by the cut script's Σ notes == Σ locked check. Also:
