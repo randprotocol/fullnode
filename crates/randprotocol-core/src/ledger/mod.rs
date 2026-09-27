@@ -175,6 +175,18 @@ pub enum TxError {
          whose prover pads it, and prove the call again"
     )]
     CallRevealsPrivateInputs { table: &'static str, log_height: u8, min: u8 },
+    /// CPU-1 (2026-09-27 zkVM/ISA review): a `Deploy` of more program words than any call can
+    /// hold — the call tier cap's Poseidon2 budget less the digests every proof pays first
+    /// (`ConfidentialExecutor::max_callable_program_words`). It would deploy, be charged
+    /// `deploy_fee`, and never be callable. The node's pool policy on every chain, and a validity
+    /// rule under genesis `hardening_v6`. Never a permanent verdict: the bound follows the build's
+    /// call tier cap, which a later build may raise.
+    #[error(
+        "a program of {words} words (public input {public_words} words) can never be called: a call \
+         proves at most {max_words} program words beside that public input at the highest tier a \
+         call may use — split the program"
+    )]
+    ProgramUncallable { words: usize, public_words: usize, max_words: usize },
     #[error("bad mint signature")]
     BadMintSignature,
     #[error("the mint's commitment does not open to its published note and amount")]
@@ -504,6 +516,8 @@ pub struct Ledger {
     ///
     /// - ZKV-11: a `Deploy` whose padded program table crosses the u32 pc wrap is refused
     ///   (`program::pc_window_fits`).
+    /// - CPU-1: a `Deploy` of more words than any call can hold is refused
+    ///   (`ConfidentialExecutor::max_callable_program_words`, `TxError::ProgramUncallable`).
     ///
     /// A genesis parameter like `max_program_words`: outside the state root and equality,
     /// restored by `reload_ledger`. `false` — every chain cut before the flag, chain 15 included —
@@ -1580,9 +1594,22 @@ impl Ledger {
                     return Err(TxError::CommitmentExists(*cm));
                 }
             }
-            Action::Deploy { base_pc, words, .. } => {
+            Action::Deploy { base_pc, words, public } => {
                 if !self.confidential {
                     return Err(TxError::ConfidentialDisabled);
+                }
+                // CPU-1, under genesis `hardening_v6`: a program no call can hold — past the call
+                // tier cap's Poseidon2 budget, less the digests every proof pays first — would be
+                // charged `deploy_fee` and never be callable. A comparison against the executor's
+                // bound, before it decodes a word. Without the flag this is the node's pool policy
+                // only (`admission::deploy_uncallable`), and a block carrying such a deploy
+                // applies as before.
+                if self.hardening_v6 {
+                    if let Some(max_words) = executor.max_callable_program_words(public.len()) {
+                        if words.len() > max_words {
+                            return Err(TxError::ProgramUncallable { words: words.len(), public_words: public.len(), max_words });
+                        }
+                    }
                 }
                 // ZKV-11, under genesis `hardening_v6`: the padded program table must end at
                 // or below the u32 pc wrap, or no honest proof of the program can verify
@@ -3494,6 +3521,40 @@ mod tests {
         // 16 words pad to 32 rows, so the same start that fit 15 words no longer does.
         assert_eq!(gated.validate(&deploy(&gated, 0xffff_ffc0, 16), &StubExecutor), Err(TxError::BadProgram(crate::program::pc_window_error())));
         assert_eq!(gated.validate(&deploy(&gated, 0, 4), &StubExecutor), Ok(()), "every live program sits at base_pc 0");
+    }
+
+    /// CPU-1: under genesis `hardening_v6` a deploy of more words than any call can hold is
+    /// refused, at admission and at apply alike — 8 184 words at tier 14 with an empty public
+    /// segment (the stub restates the zkVM's bound), fewer beside a public input. Without the flag
+    /// — chain 15, whose genesis admits 65 535-word programs — the old rule stands and such a
+    /// deploy is charged for a program no call can prove.
+    #[test]
+    fn under_hardening_v6_a_deploy_no_call_can_hold_is_refused() {
+        let (a, _) = keys();
+        let deploy = |l: &Ledger, n: usize, public: usize| {
+            let action = Action::Deploy { base_pc: 0, words: vec![0x13; n], public: vec![7; public] };
+            StubExecutor::bound(Transaction::shielded(7, bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&action)), action))
+        };
+        let mut plain = ledger();
+        plain.set_max_program_words(65_535);
+        plain.set_max_program_public_words(32_768);
+        assert_eq!(plain.validate(&deploy(&plain, 8185, 0), &StubExecutor), Ok(()), "the finding: admitted today");
+
+        let mut gated = plain.clone();
+        gated.set_hardening_v6(true);
+        let over = deploy(&gated, 8185, 0);
+        let refused = Err(TxError::ProgramUncallable { words: 8185, public_words: 0, max_words: 8184 });
+        assert_eq!(gated.validate(&over, &StubExecutor), refused);
+        assert_eq!(gated.clone().apply_tx(&over, &a.address(), &StubExecutor).map(|_| ()), refused);
+        assert_eq!(gated.validate(&deploy(&gated, 8184, 0), &StubExecutor), Ok(()), "the bound itself fits");
+        // A 9-word public input takes three digest slots, two more than the empty segment's one.
+        assert_eq!(
+            gated.validate(&deploy(&gated, 8177, 9), &StubExecutor),
+            Err(TxError::ProgramUncallable { words: 8177, public_words: 9, max_words: 8176 })
+        );
+        assert_eq!(gated.validate(&deploy(&gated, 8176, 9), &StubExecutor), Ok(()));
+        // The EVM interpreter guest, 18 009 words, is what the report found deployable and dead.
+        assert!(matches!(gated.validate(&deploy(&gated, 18_009, 0), &StubExecutor), Err(TxError::ProgramUncallable { .. })));
     }
 
     /// The deploy cap is the ledger's, set from genesis, not the constant: a default ledger keeps

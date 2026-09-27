@@ -224,6 +224,14 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.check_program(base_pc, words)
     }
 
+    /// Forwarded, never left at the trait's `None` default: this wrapper is the executor every
+    /// node runs (`node::executor_for_profile`), so a default here would switch CPU-1's rule off
+    /// under `hardening_v6` on the very nodes that are meant to enforce it. The same holds for
+    /// every defaulted method the v0.6 rules add.
+    fn max_callable_program_words(&self, public_segment_words: usize) -> Option<usize> {
+        self.inner.max_callable_program_words(public_segment_words)
+    }
+
     fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
         self.inner.verify_call(program, proof)
     }
@@ -616,6 +624,9 @@ mod tests {
         let (a, b) = ([1u32; 8], [2u32; 8]);
         assert_eq!(w.node_hash(&a, &b), zk.node_hash(&a, &b));
         assert_eq!(w.note_commitment(&a, &b, 5, 0, 9, &a), zk.note_commitment(&a, &b, 5, 0, 9, &a));
+        // The v0.6 rules' defaulted methods too (a default here would switch a rule off).
+        assert_eq!(w.max_callable_program_words(0), zk.max_callable_program_words(0));
+        assert_eq!(w.max_callable_program_words(0), Some(8184));
     }
 
     /// The registered artifact (spec §2.3): the wrapper's digest is the rVM's own

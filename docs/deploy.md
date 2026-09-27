@@ -521,6 +521,23 @@ its own `program_pc_window` flag; no genesis ever carried that, and it is folded
 - The verifier- and prover-side fixes (bound the table in the circuit, refuse to prove) are the
   zkVM's, upstream.
 
+### The callable program size (CPU-1)
+
+Every proof pays one Poseidon2 permutation per four program words before it executes anything,
+plus one for the empty input's salt row and one for the (empty) public segment's header. A call is
+capped at tier 14 (`MAX_CALL_TIER`), whose Poseidon2 table holds `2^(14-3)` = 2 048 permutations,
+so a program has at most 2 046 digest rows: **8 184 words**, fewer beside a public input
+(`max(1, ⌈n/4⌉)` slots for `n` public words). Chain 15's genesis admits 65 535-word programs, so a
+larger one deploys, is charged `deploy_fee`, and can never be called — the shipped EVM interpreter
+(18 009 words) and sBPF interpreter (8 317) among them.
+
+- Under `hardening_v6` such a deploy is `ProgramUncallable` at admission and at apply
+  (`ConfidentialExecutor::max_callable_program_words`, the prover's own terms —
+  `randprotocol_zkvm::executor::max_callable_program_words`, pinned one word either side against
+  `build_traces_salted`).
+- Every node already refuses it at its pool (`admission::deploy_uncallable`), as a non-permanent
+  Ignore: the bound follows the build's call tier cap, which a later build may raise.
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and

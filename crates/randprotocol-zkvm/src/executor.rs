@@ -168,6 +168,41 @@ pub fn max_input_log_height(tier: Tier) -> u8 {
     ((tier.0 + 2) as u8).min(input::input_log_height(u16::MAX as usize))
 }
 
+/// CPU-1 (the 2026-09-27 zkVM/ISA review, medium, live): the most program words a call at
+/// [`MAX_CALL_TIER`] can hold, when its public segment is `public_segment_words` long.
+///
+/// Every proof pays for its three digests before the guest executes a single instruction: one
+/// Poseidon2 permutation per four program words (`Program::digest_rows`, at least one), one per
+/// four private-input words plus the salt row (`hash::input_digest_row_count`, at least one — the
+/// salt — for a call that reads nothing), and one per four public words (`hash::
+/// public_digest_row_count`, at least one — the header — for an empty segment). The Poseidon2
+/// table of tier `t` holds `poseidon2_height / BLOCK = 2^(t+2) / 32 = 2^(t-3)` permutations, which
+/// `Machine::prove` refuses to exceed (`TooManyPoseidon2Permutations`) and `verify_call` caps `t` at
+/// `MAX_CALL_TIER`. So at tier 14 there are 2 048 slots; the empty input and the empty public
+/// segment take one each, and a program has at most `2 046` digest rows — **8 184 words**, the
+/// report's number: `4 · (2^(14-3) − 1 − 1)`. A public segment of `n` words takes
+/// `max(1, ⌈n/4⌉)` slots instead of one, and every input word a call reads lowers it further,
+/// which is the caller's own affair — this is the bound for the lightest call there can be.
+///
+/// The cycle budget (`2^t − 1`, every digest row one cycle, plus at least the halting `ecall`) is
+/// checked too, for completeness; at every tier it is the looser of the two by a factor of eight.
+///
+/// Nothing here is a guess at the machine: the terms are the vendored functions the prover itself
+/// counts with (`build_traces_salted`), and `tests::cpu1_…` checks the bound against the prover's
+/// own refusal one word either side of it. A program past it deploys and is charged `deploy_fee`
+/// but no call can ever prove it — the shipped EVM interpreter (18 009 words) and sBPF interpreter
+/// (8 317) among them — so a deploy past it is refused: the node's pool policy on every chain
+/// (`admission::deploy_uncallable`), and a validity rule under genesis `hardening_v6`.
+pub fn max_callable_program_words(public_segment_words: usize) -> usize {
+    let tier = Tier(MAX_CALL_TIER as usize);
+    let slots = tier.poseidon2_height() / crate::tables::poseidon2::BLOCK;
+    let mandatory = crate::hash::input_digest_row_count(0) + crate::hash::public_digest_row_count(public_segment_words);
+    let by_permutations = slots.saturating_sub(mandatory);
+    // One executed instruction at least (the halt), on top of every digest row.
+    let by_cycles = tier.max_cycles().saturating_sub(mandatory + 1);
+    4 * by_permutations.min(by_cycles)
+}
+
 pub struct ZkExecutor {
     /// Every call proof's verifier keys: `warm` fills it, `verify_call` reads it (and builds a
     /// missing key into it).
@@ -637,6 +672,10 @@ impl ConfidentialExecutor for ZkExecutor {
         Ok(out)
     }
 
+    fn max_callable_program_words(&self, public_segment_words: usize) -> Option<usize> {
+        Some(max_callable_program_words(public_segment_words))
+    }
+
     /// Precompute the verifier keys a call against `record` is likely to need, off the node
     /// loop (deploy commit / startup). Since M3.4 the key is `(tier, program_log_height)` and
     /// program-content-independent, so this warms one shared key per tier for this program's
@@ -1092,6 +1131,51 @@ mod tests {
         // The finding's shape: fib (15 words) at 0xffffffc4 passes ZH4 and not the window.
         assert!(!randprotocol_core::program::pc_window_fits(0xffff_ffc4, 15));
         assert!(randprotocol_core::program::pc_window_fits(0xffff_ffc0, 15));
+    }
+
+    /// CPU-1: `max_callable_program_words` is the prover's own limit, not a restatement of it.
+    /// One word either side of the bound, at `MAX_CALL_TIER`, against `build_traces_salted` —
+    /// the function `Machine::prove` runs, which counts the same three digests and refuses with
+    /// `TooManyPoseidon2Permutations`: 8 184 words (8 182 nops and the two-instruction halt)
+    /// build, 8 185 do not; with a 9-word public segment the bound drops by eight words (three
+    /// header-and-word slots for one). The shipped EVM and sBPF interpreter guests are past it —
+    /// the report's finding — and the core stub restates the same numbers.
+    #[test]
+    fn cpu1_the_callable_program_bound_is_the_provers_own_limit() {
+        use super::*;
+        use crate::machine::{build_traces_salted, ProveError};
+        let halting = |n: usize| {
+            let halt: Vec<u32> = crate::asm::ops::halt().iter().map(|i| i.encode()).collect();
+            let mut words = vec![crate::asm::ops::addi(0, 0, 0).encode(); n - halt.len()];
+            words.extend(halt);
+            Program::new(0, words)
+        };
+        let tier = Tier(MAX_CALL_TIER as usize);
+        let fits = |n: usize, public: &[u32]| {
+            let p = halting(n);
+            let exec = crate::emulator::execute(&p, &[], public, tier.max_cycles()).expect("halts");
+            match build_traces_salted(&p, &[], public, [0; 4], &exec, tier) {
+                Ok(_) => true,
+                Err(ProveError::TooManyPoseidon2Permutations { .. }) => false,
+                Err(e) => panic!("{n} words: {e:?}"),
+            }
+        };
+        assert_eq!(max_callable_program_words(0), 8184, "4 · (2^(14-3) − 1 − 1)");
+        assert!(fits(8184, &[]), "the bound itself proves");
+        assert!(!fits(8185, &[]), "one word more does not");
+        let public = [5u32; 9];
+        assert_eq!(max_callable_program_words(public.len()), 8176);
+        assert!(fits(8176, &public));
+        assert!(!fits(8177, &public));
+        assert!(crate::guests::compiled::evm().words.len() > max_callable_program_words(0), "the EVM interpreter");
+        assert!(crate::guests::compiled::sbpf().words.len() > max_callable_program_words(0), "the sBPF interpreter");
+        for n in [0, 1, 4, 5, 8, 9, 100, 32_768] {
+            assert_eq!(
+                randprotocol_core::confidential::StubExecutor.max_callable_program_words(n),
+                Some(max_callable_program_words(n)),
+                "the stub's restatement, public {n}"
+            );
+        }
     }
 
     /// ZKG-1: an output word past 32 bits is refused, never narrowed. `x as u32` of

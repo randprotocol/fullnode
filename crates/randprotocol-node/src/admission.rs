@@ -645,6 +645,28 @@ pub fn deploy_outside_pc_window(tx: &Transaction) -> Option<TxError> {
         .then(|| TxError::BadProgram(randprotocol_core::program::pc_window_error()))
 }
 
+/// A `Deploy` of more program words than any call can hold (CPU-1, the 2026-09-27 zkVM/ISA
+/// review): `TxError::ProgramUncallable`, the ledger's own verdict under `hardening_v6`. Every
+/// proof pays one Poseidon2 permutation per four program words, plus the empty input's salt row
+/// and the public segment's header, before it executes anything, and a call is capped at tier 14's
+/// 2 048 — so a program past 8 184 words (fewer beside a public input) deploys, is charged
+/// `deploy_fee` and can never be called. The shipped EVM (18 009 words) and sBPF (8 317)
+/// interpreters are both past it. The bound is `randprotocol_zkvm::executor::
+/// max_callable_program_words`, the prover's own terms. `None` for everything else.
+///
+/// **Node policy on every chain, never permanent** ([`is_permanent`] leaves it out: the bound is
+/// the build's call tier cap, which a later build may raise, and a peer on an older build that
+/// forwards the deploy must not be penalised) — an Ignore, never cached. On a chain whose genesis
+/// sets `hardening_v6` the ledger refuses the same deploy itself; on chain 15 a block from an older
+/// proposer that carries one still applies.
+pub fn deploy_uncallable(tx: &Transaction) -> Option<TxError> {
+    let randprotocol_core::Action::Deploy { words, public, .. } = &tx.action else {
+        return None;
+    };
+    let max_words = randprotocol_zkvm::executor::max_callable_program_words(public.len());
+    (words.len() > max_words).then(|| TxError::ProgramUncallable { words: words.len(), public_words: public.len(), max_words })
+}
+
 /// A `Call` whose proof declares its input table — or a keccak or sha256 table it carries — under
 /// `MIN_PRIVATE_TABLE_LOG_HEIGHT` (2^7 rows): `TxError::CallRevealsPrivateInputs`, telling the
 /// wallet to upgrade (COV-2). A table that small has fewer random rows than the proof opens of it
@@ -1253,6 +1275,40 @@ mod tests {
         assert!(is_permanent(&verdict));
         assert_eq!(GossipOutcome::for_transaction(&fits, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
         assert_eq!(GossipOutcome::for_transaction(&deploy(0), None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
+    }
+
+    /// CPU-1: a deploy past the most program words a tier-14 call can hold (8 184 with an empty
+    /// public segment) is not pooled, on every chain — a non-permanent policy verdict (Ignore,
+    /// never cached), the ledger's own `ProgramUncallable` under `hardening_v6`. 8 184 words pool;
+    /// so does anything that is not a deploy.
+    #[test]
+    fn a_deploy_no_call_can_hold_is_not_pooled() {
+        use crate::mempool::{Mempool, MempoolError};
+        use crate::storage::fixtures;
+        use randprotocol_core::confidential::StubExecutor;
+
+        let (gs, _) = fixtures::bridged_genesis(1);
+        let mut l = gs.ledger.clone();
+        l.set_max_program_words(65_535);
+        let deploy = |n: usize| {
+            let action = randprotocol_core::Action::Deploy { base_pc: 0, words: vec![0x13; n], public: vec![] };
+            let b = fixtures::bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], randprotocol_core::gas::fee_floor(&action));
+            StubExecutor::bound(Transaction::shielded(l.chain_id(), b, action))
+        };
+        let pool = Mempool::new(100);
+        let refused = |tx: &Transaction| match pool.precheck(tx, &l, &StubExecutor) {
+            Err(MempoolError::Invalid(e)) => Some(e),
+            Err(other) => panic!("unexpected pool refusal {other}"),
+            Ok(_) => None,
+        };
+        let got = refused(&deploy(8185)).expect("the finding: a deploy no call can hold is pooled today");
+        assert_eq!(got, TxError::ProgramUncallable { words: 8185, public_words: 0, max_words: 8184 });
+        assert!(!is_permanent(&got), "policy, never cached");
+        let mut cache = RefusedCache::new(4);
+        assert_eq!(acceptance_for(&Err(got), Hash::digest(b"x"), &mut cache), Acceptance::Ignore);
+        assert!(cache.is_empty());
+        assert_eq!(refused(&deploy(8184)), None, "the bound itself pools");
+        assert_eq!(deploy_uncallable(&deploy(18_009)).map(|e| e.to_string().contains("split the program")), Some(true));
     }
 
     /// RESCAN-LEDGER-1: the ledger's `Mint` arm asks only for a row in the register, which a

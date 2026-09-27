@@ -49,6 +49,14 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// Validate program code at deploy time (must be cheap: it runs inside block application)
     /// and return the code commitment recorded on chain.
     fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError>;
+    /// CPU-1: the most program words any call can hold when its public segment is
+    /// `public_segment_words` long — the call tier cap's Poseidon2 budget, less the digests every
+    /// proof pays before it executes (`randprotocol_zkvm::executor::max_callable_program_words`).
+    /// A program past it deploys and can never be proved. `None` (the default, and the stub's)
+    /// is "no bound this executor knows of". The ledger asks only under genesis `hardening_v6`.
+    fn max_callable_program_words(&self, _public_segment_words: usize) -> Option<usize> {
+        None
+    }
     /// Verify `proof` against `program`; on success return the tier and the eight outputs.
     ///
     /// The proof's public-input digest (`pv::PUB0..7`) must equal `program.public_digest`, or
@@ -245,6 +253,14 @@ impl StubExecutor {
 impl ConfidentialExecutor for StubExecutor {
     fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
         Ok(crate::program::program_id(base_pc, words).0.to_vec())
+    }
+
+    /// The zkVM's own bound at its call tier cap (tier 14: 2 048 Poseidon2 slots, one for the
+    /// empty input's salt row, `max(1, ⌈n/4⌉)` for an `n`-word public segment, four program words
+    /// a slot), restated so the ledger's CPU-1 rule can be exercised without the zkVM.
+    /// `randprotocol-zkvm`'s executor tests pin it to the real function.
+    fn max_callable_program_words(&self, public_segment_words: usize) -> Option<usize> {
+        Some(4 * 2048usize.saturating_sub(1 + public_segment_words.div_ceil(4).max(1)))
     }
 
     fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
