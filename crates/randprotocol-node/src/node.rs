@@ -176,6 +176,16 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // that kept it on a v1 chain would refuse every peer's proposal at the ledger's own
     // signature check.
     ledger.set_signing_domain(gs.signing_domain());
+    // The vesting register is state, not a switch: storage holds it (claims move it), so it is
+    // never re-seeded from the file — but the two must agree that the chain has one, or this
+    // node would compute a different state-root domain from its peers at its first block.
+    if gs.ledger.vesting().is_some() != ledger.vesting().is_some() {
+        anyhow::bail!(
+            "the genesis file {} a vesting section but the database {} a vesting register",
+            if gs.ledger.vesting().is_some() { "has" } else { "has no" },
+            if ledger.vesting().is_some() { "holds" } else { "holds no" },
+        );
+    }
     Ok(ledger)
 }
 

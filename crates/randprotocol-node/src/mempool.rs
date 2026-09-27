@@ -141,6 +141,12 @@ fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
         Action::RegisterBridgedToken { nonce, .. } | Action::ListBacking { nonce, .. } => Some((Address([0; 32]), *nonce)),
         // Bridge rules v2: the bridge's `rotation_nonce`, shared by the two rotations.
         Action::RotatePqGuardians { nonce, .. } | Action::RotatePauseKey { nonce, .. } => Some((Address([0; 32]), *nonce)),
+        // Genesis vesting: the entry's nonce, which all four of its actions share — keyed on the
+        // entry's 32-byte id, kept apart from every address by `claim_key`'s role.
+        Action::ClaimVested { entry, nonce, .. }
+        | Action::RevokeVesting { entry, nonce, .. }
+        | Action::BondVested { entry, nonce, .. }
+        | Action::UnbondVested { entry, nonce, .. } => Some((Address(*entry), *nonce)),
         _ => None,
     }
 }
@@ -179,6 +185,7 @@ fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
         Action::PauseMints { .. } | Action::UnpauseMints { .. } => 2,
         Action::RegisterBridgedToken { .. } | Action::ListBacking { .. } => 3,
         Action::RotatePqGuardians { .. } | Action::RotatePauseKey { .. } => 4,
+        Action::ClaimVested { .. } | Action::RevokeVesting { .. } | Action::BondVested { .. } | Action::UnbondVested { .. } => 5,
         _ => 0,
     };
     (role, claim.0, claim.1)
@@ -575,8 +582,11 @@ impl Mempool {
         // so it goes stale here the same way a bundle does (`Ledger::time_in_window`). An
         // `Aggregate`'s payout note's `time` (spec §4 step 3) is the same promise, one action
         // over, and a `WithdrawAggregator`'s note time is its `Withdraw` twin's, one register over.
-        if let Action::Withdraw { time, .. } | Action::Aggregate { time, .. } | Action::WithdrawAggregator { time, .. } =
-            &tx.action
+        if let Action::Withdraw { time, .. }
+        | Action::Aggregate { time, .. }
+        | Action::WithdrawAggregator { time, .. }
+        | Action::ClaimVested { time, .. }
+        | Action::RevokeVesting { time, .. } = &tx.action
         {
             if !ledger.time_in_window(*time) {
                 return Err(TxError::TimeOutOfWindow { time: *time, height: ledger.height() });
@@ -661,6 +671,21 @@ impl Mempool {
                 let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
                 if bridge.list_nonce != nonce {
                     return Err(TxError::Bridge(BridgeError::BadListNonce { expected: bridge.list_nonce, got: nonce }));
+                }
+            } else if matches!(
+                tx.action,
+                Action::ClaimVested { .. } | Action::RevokeVesting { .. } | Action::BondVested { .. } | Action::UnbondVested { .. }
+            ) {
+                // Genesis vesting: the entry's nonce, which only moves forward. Never the
+                // validator lookup below — an entry id is not a validator address.
+                use randprotocol_core::ledger::vesting::VestingError;
+                let reg = ledger.vesting().ok_or(TxError::UnsupportedAction("vesting"))?;
+                match reg.get(&addr.0).map(|e| e.nonce) {
+                    Some(current) if current == nonce => {}
+                    Some(current) => {
+                        return Err(TxError::Vesting(VestingError::BadNonce { expected: current, actual: nonce }))
+                    }
+                    None => return Err(TxError::Vesting(VestingError::UnknownEntry(hex::encode(addr.0)))),
                 }
             } else if matches!(
                 tx.action,
@@ -1253,6 +1278,67 @@ mod tests {
 
         m.prune(&after);
         assert!(m.is_empty(), "an unbond whose nonce the register has moved past survived prune");
+    }
+
+    /// Genesis vesting: a claim holds its entry's nonce in the pool — one pooled action per
+    /// entry nonce, whichever of the four — and once the entry's nonce moves past it, it leaves
+    /// at prune with the vesting verdict, never falling through to the validator lookup (an
+    /// entry id is not an address).
+    #[test]
+    fn a_vesting_claim_holds_its_entry_nonce_and_dies_with_it() {
+        use randprotocol_core::ledger::vesting::{Class, VestingConfig, VestingEntryConfig, VestingError, VestingRegister};
+        use randprotocol_core::types::actions::{claim_vested_message, unbond_vested_message};
+        let holder = fixtures::key(40);
+        let mut l = ledger();
+        let entry = |id: u8| VestingEntryConfig {
+            id: [id; 32],
+            class: Class::Investor,
+            beneficiary: holder.public_key().clone(),
+            revoker: None,
+            amount: 10 * randprotocol_core::UNITS_PER_RAND,
+            start_ms: 0,
+            cliff_ms: 0,
+            linear_ms: 1,
+            step_ms: None,
+        };
+        l.set_vesting(Some(VestingRegister::from_config(&VestingConfig { entries: vec![entry(1), entry(2)] })));
+        l.set_timestamp_ms(10);
+        let genesis = l.signing_domain().genesis;
+        let claim = |id: u8, nonce: u64, r: u32| {
+            let to = ShieldedAddress { pk: [r; 8], kem_ek: vec![3; randprotocol_core::notes::KEM_EK_BYTES] };
+            let (time, r, envelope) = (l.height() as u32, [r; 8], fixtures::env(1));
+            let amount = randprotocol_core::UNITS_PER_RAND;
+            let m = claim_vested_message(&genesis, l.chain_id(), &[id; 32], amount, nonce, &to, time, &r, &envelope);
+            Transaction {
+                chain_id: l.chain_id(),
+                bundle: None,
+                action: Action::ClaimVested { entry: [id; 32], amount, nonce, to, time, r, envelope, signature: holder.sign(m.as_bytes()) },
+            }
+        };
+        let mut m = Mempool::new(100);
+        m.insert(claim(1, 0, 1), &l, &StubExecutor).unwrap();
+        // Another entry's nonce 0 is its own slot.
+        m.insert(claim(2, 0, 2), &l, &StubExecutor).unwrap();
+        // The same entry's nonce 0 is taken, whichever action wants it.
+        let unbond_sig = holder.sign(unbond_vested_message(&genesis, l.chain_id(), &[1; 32], 5, 0).as_bytes());
+        let unbond = Transaction {
+            chain_id: l.chain_id(),
+            bundle: None,
+            action: Action::UnbondVested { entry: [1; 32], amount: 5, nonce: 0, signature: unbond_sig },
+        };
+        assert!(matches!(m.insert(unbond, &l, &StubExecutor), Err(MempoolError::Conflict(_))));
+        assert_eq!(m.len(), 2);
+
+        // Entry 1's nonce moves on (a claim committed elsewhere): its pooled claim is stale.
+        let mut after = l.clone();
+        after.apply_tx(&claim(1, 0, 9), &fixtures::key(1).address(), &StubExecutor).unwrap();
+        let stale = claim(1, 0, 1);
+        assert_eq!(
+            Mempool::applies(&stale, &[], claimed_nonce(&stale.action), &after).unwrap_err(),
+            TxError::Vesting(VestingError::BadNonce { expected: 1, actual: 0 })
+        );
+        m.prune(&after);
+        assert_eq!(m.len(), 1, "entry 1's claim left, entry 2's stayed");
     }
 
     /// The same `(validator, nonce)` claimed by an unbond and a withdraw is still one claim: the

@@ -195,6 +195,13 @@ const META_BOND_QUEUE: &str = "bond_queue";
 /// audit subtracts it on the right of its identity: the fee left the pool into no register
 /// entry.
 const META_REGISTRATION_FEES_BURNED: &str = "registration_fees_burned";
+/// JSON of the vesting register (genesis vesting, `ledger::vesting::VestingRegister`) as of the
+/// head: every entry's claimed, revoked, bonded and nonce state and the released counter.
+/// Consensus state — hashed into the state root under `rand-state-6`, inside `Ledger`'s equality
+/// — written at the same three sites as the bond queue, replay-audited, and JSON (every field
+/// `#[serde(default)]`) so a field appended later reads as its default rather than breaking a
+/// positional blob. Absent on every chain without a `vesting` section.
+const META_VESTING: &str = "vesting";
 /// `bincode(BTreeMap<Address, AggregatorEntry>)`: the aggregator register as of the head.
 /// `META_SUPPLY`'s twin in kind — derived, replay-audited — but unlike the bucket this one is
 /// hashed into the state root, so a restarted node that lost it would fork at the next block.
@@ -458,6 +465,9 @@ fn created_notes(
 pub fn derived_note_count(tx: &randprotocol_core::Transaction) -> usize {
     match &tx.action {
         Action::Withdraw { .. } => 1,
+        // Genesis vesting: a claim's and a revoke's note arrive through `cb.deposits`, exactly
+        // as a `Withdraw`'s — one each. A bond or an unbond from the lock creates none.
+        Action::ClaimVested { .. } | Action::RevokeVesting { .. } => 1,
         // The size cap before the decode, exactly as `Ledger::derived_commitment` applies it;
         // `created_notes` needs no cap because it only ever sees a committed block.
         Action::BridgeAttest { attestation, .. } if attestation.len() > randprotocol_core::gas::MAX_ATTESTATION_BYTES => 0,
@@ -694,6 +704,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&gs.ledger.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(gs.ledger.bond_queue())?);
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&gs.ledger.registration_fees_burned())?);
+        self.put_vesting(&mut batch, gs.ledger.vesting())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
@@ -1061,6 +1072,32 @@ impl Storage {
     /// a database written before the key existed: empty.
     pub fn bond_queue(&self) -> Result<Vec<randprotocol_core::ledger::QueuedStake>> {
         Ok(self.get_meta_raw(META_BOND_QUEUE)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
+    /// The vesting register as of the head (genesis vesting), `None` on a chain without the
+    /// section.
+    pub fn vesting(&self) -> Result<Option<randprotocol_core::ledger::vesting::VestingRegister>> {
+        self.get_meta_raw(META_VESTING)?
+            .map(|b| serde_json::from_slice(&b).map_err(|e| StorageError::Corrupt(format!("vesting: {e}"))))
+            .transpose()
+    }
+
+    /// Write the register beside the rest of the head's state — present when the chain has one,
+    /// deleted otherwise (the `put_tokens_ext` rule).
+    fn put_vesting(
+        &self,
+        batch: &mut WriteBatch,
+        v: Option<&randprotocol_core::ledger::vesting::VestingRegister>,
+    ) -> Result<()> {
+        match v {
+            Some(v) => batch.put_cf(
+                self.cf(CF_META),
+                META_VESTING,
+                serde_json::to_vec(v).map_err(|e| StorageError::Corrupt(format!("vesting: {e}")))?,
+            ),
+            None => batch.delete_cf(self.cf(CF_META), META_VESTING),
+        }
+        Ok(())
     }
 
     /// Σ of the registration fees burned under `tokens.burn_registration_fee` as of the head
@@ -1798,6 +1835,7 @@ impl Storage {
         ledger.set_faucet_epoch_counters(faucet_epoch, faucet_minted);
         ledger.set_bond_queue(self.bond_queue()?);
         ledger.set_registration_fees_burned(self.registration_fees_burned()?);
+        ledger.set_vesting(self.vesting()?);
         ledger.set_unsealed_fees(self.unsealed_fees()?);
         ledger.set_aggregators(self.aggregators()?);
         ledger.set_aggregation(self.aggregation_config()?);
@@ -2013,7 +2051,8 @@ impl Storage {
                 match &tx.action {
                     Action::Bond { validator, .. }
                     | Action::Unbond { validator, .. }
-                    | Action::Withdraw { validator, .. } => {
+                    | Action::Withdraw { validator, .. }
+                    | Action::BondVested { validator, .. } => {
                         touched.insert(*validator);
                     }
                     _ => {}
@@ -2118,6 +2157,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger_after.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger_after.bond_queue())?);
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger_after.registration_fees_burned())?);
+        self.put_vesting(&mut batch, ledger_after.vesting())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger_after.tokens().cloned())?);
@@ -2473,6 +2513,11 @@ impl Storage {
                     ledger.bond_queue()
                 ))
             }
+            // The vesting register likewise (genesis vesting): inside the equality, hashed under
+            // its section, named so the repair knows the key.
+            Ok(stored) if stored.vesting() != ledger.vesting() => {
+                check.problem = Some("stored vesting register does not match the replayed chain's".into())
+            }
             // The supply counters are outside `Ledger`'s equality (nothing hashes them), so they
             // are audited here explicitly: this is the replay the RPC's numbers are worth.
             Ok(stored) if stored == ledger && stored.supply() != ledger.supply() => {
@@ -2711,6 +2756,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger.bond_queue())?);
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger.registration_fees_burned())?);
+        self.put_vesting(&mut batch, ledger.vesting())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger.tokens().cloned())?);
@@ -6027,6 +6073,91 @@ mod tests {
         // A database written before the key existed reads as `(0, 0)`, like the supply.
         s.db.delete_cf(s.cf(CF_META), META_FAUCET_EPOCH).unwrap();
         assert_eq!(s.faucet_epoch_counters().unwrap(), (0, 0));
+    }
+
+    /// A genesis with one vesting entry for `holder`: 10 RAND from t = 0, no cliff, 2 ms linear
+    /// — half vested at block 1 (`make_block` stamps each block with its height in ms).
+    fn vesting_genesis(holder: &randprotocol_core::crypto::Keypair) -> GenesisState {
+        use randprotocol_core::ledger::vesting::{Class, VestingConfig, VestingEntryConfig};
+        let mut g = genesis_file_of(7, &[&key(1)], vec![], 2);
+        g.vesting = Some(VestingConfig {
+            entries: vec![VestingEntryConfig {
+                id: [7; 32],
+                class: Class::Investor,
+                beneficiary: holder.public_key().clone(),
+                revoker: None,
+                amount: 10 * randprotocol_core::UNITS_PER_RAND,
+                start_ms: 0,
+                cliff_ms: 0,
+                linear_ms: 2,
+                step_ms: None,
+            }],
+        });
+        g.build(&StubExecutor).unwrap()
+    }
+
+    /// A `ClaimVested` of `amount` from entry `[7; 32]`, signed by `holder`.
+    fn claim_vested_tx(ledger: &Ledger, holder: &randprotocol_core::crypto::Keypair, amount: u64, nonce: u64) -> Transaction {
+        let to = randprotocol_core::notes::ShieldedAddress { pk: [5; 8], kem_ek: vec![5; randprotocol_core::notes::KEM_EK_BYTES] };
+        let (time, r, envelope) = (ledger.height() as u32, [3; 8], env(4));
+        let m = randprotocol_core::types::actions::claim_vested_message(
+            &ledger.signing_domain().genesis,
+            7,
+            &[7; 32],
+            amount,
+            nonce,
+            &to,
+            time,
+            &r,
+            &envelope,
+        );
+        let signature = holder.sign(m.as_bytes());
+        Transaction { chain_id: 7, bundle: None, action: Action::ClaimVested { entry: [7; 32], amount, nonce, to, time, r, envelope, signature } }
+    }
+
+    /// Genesis vesting: the register is consensus state, so it is committed beside the rest of
+    /// the head's state, restored by `load_ledger` (and the reloaded ledger hashes the same
+    /// `rand-state-6` root), named by `verify_chain` when stale and rewritten by the repair —
+    /// and a node whose database and genesis file disagree about having one refuses to start.
+    #[test]
+    fn the_vesting_register_is_persisted_restored_and_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let holder = key(40);
+        let gs = vesting_genesis(&holder);
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.vesting().unwrap().as_ref(), gs.ledger.vesting());
+
+        let mut ledger = gs.ledger.clone();
+        let amount = 5 * randprotocol_core::UNITS_PER_RAND;
+        let claim = claim_vested_tx(&ledger, &holder, amount, 0);
+        let b1 = make_block(&gs.block, &mut ledger, vec![claim], &key(1));
+        assert_eq!(b1.deposits.len(), 1, "the claim note is a ledger deposit, like a withdraw's");
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let stored = s.vesting().unwrap().expect("committed with the state");
+        assert_eq!((stored.entries[0].claimed, stored.entries[0].nonce), (amount, 1));
+        assert!(ledger.audit().invariant_holds(), "{:?}", ledger.audit());
+
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.vesting(), ledger.vesting());
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(reloaded, ledger);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A stale register (the genesis one: the claim lost) is named, and repaired from replay.
+        s.db.put_cf(s.cf(CF_META), META_VESTING, serde_json::to_vec(gs.ledger.vesting().unwrap()).unwrap()).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.expect("a stale register is a problem");
+        assert!(problem.contains("vesting register"), "{problem}");
+        assert_eq!(check.last_good, 1, "the block itself is fine");
+        s.truncate_to(&gs, 1, &check.ledger).unwrap();
+        assert_eq!(s.vesting().unwrap().as_ref(), ledger.vesting());
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A database without the register under a genesis with the section: refuse to start.
+        s.db.delete_cf(s.cf(CF_META), META_VESTING).unwrap();
+        let err = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap_err().to_string();
+        assert!(err.contains("vesting"), "{err}");
     }
 
     /// The v4 re-review's bond queue is consensus state under a `staking` section, so — like

@@ -1312,6 +1312,51 @@ fn bundle_json(b: &randprotocol_core::Bundle) -> Value {
 /// `tokens` is the asset registry, which a `BridgeAttest` needs and nothing else does: the
 /// deposit's asset index is state, not a field of the transaction. `executor` is what computes
 /// that deposit's commitment, the one note commitment the wire does not carry.
+/// One vesting entry as `rand_getVesting` serves it (genesis vesting): its genesis terms, what
+/// happened to it, and what the schedule says at `t_ms` in `epoch` — amounts as decimal strings.
+/// The keys are served as their addresses (a Dilithium2 key is 1 312 bytes); nothing names the
+/// holder.
+fn vesting_entry_json(e: &randprotocol_core::ledger::vesting::Entry, t_ms: u64, epoch: u64) -> Value {
+    use randprotocol_core::ledger::vesting::{claimable, unvested, vested};
+    json!({
+        "id": hex::encode(e.id),
+        "class": e.class.as_str(),
+        "beneficiary": e.beneficiary.address().to_base58(),
+        "revocable": e.revoker.is_some(),
+        "revoker": e.revoker.as_ref().map(|k| k.address().to_base58()),
+        "amount": e.amount.to_string(),
+        "start_ms": e.start_ms,
+        "cliff_ms": e.cliff_ms,
+        "linear_ms": e.linear_ms,
+        "step_ms": e.step_ms,
+        "claimed": e.claimed.to_string(),
+        "revoked_out": e.revoked_out.to_string(),
+        "revoked_at": e.revoked_at,
+        "bonded": e.bonded.to_string(),
+        "bonded_to": e.bonded_to.map(|v| v.to_base58()),
+        "unbonding": e.unbonding
+            .iter()
+            .map(|(release_epoch, amount)| json!({ "release_epoch": release_epoch, "amount": amount.to_string() }))
+            .collect::<Vec<_>>(),
+        "nonce": e.nonce,
+        "vested_now": vested(e, t_ms).to_string(),
+        "claimable_now": claimable(e, t_ms, epoch).to_string(),
+        "unvested_now": unvested(e, t_ms).to_string(),
+    })
+}
+
+/// What of `reg` is still locked at `t_ms`: every entry's amount less what it lost to a revoke
+/// and less what has vested. The public lockup figure (SAFT Schedule 2 §3) — owners never enter.
+fn vesting_locked(reg: &randprotocol_core::ledger::vesting::VestingRegister, t_ms: u64) -> u64 {
+    use randprotocol_core::ledger::vesting::vested;
+    reg.entries
+        .iter()
+        .fold(0u64, |a, e| a.saturating_add(e.amount.saturating_sub(e.revoked_out).saturating_sub(vested(e, t_ms))))
+}
+
+/// The most points `rand_getVestingSchedule` answers in one call.
+pub const MAX_VESTING_SCHEDULE_POINTS: u64 = 1_000;
+
 fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn ConfidentialExecutor) -> Value {
     let bundle = t.bundle.as_ref().map(bundle_json);
     let action = match &t.action {
@@ -2466,6 +2511,88 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // The supply audit (`ledger::supply`). Note values are hidden, but every crossing of the
         // pool's boundary is public, so this is exact rather than an estimate — and
         // `--verify-chain` recomputes every counter in it by replaying the chain.
+        // Genesis vesting (`docs/vesting.md`): one entry by its 64-hex id, `null` for an id the
+        // register does not hold, `{"enabled": false}` on a chain without the section. "Now" is
+        // the head block's timestamp — what the next block's rules would start from.
+        "rand_getVesting" => {
+            let id: String = param(p, 0, "id")?;
+            let id: [u8; 32] = hex::decode(id.strip_prefix("0x").unwrap_or(&id))
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| RpcError::invalid_params("id: 64 hex characters"))?;
+            let Some(reg) = st.storage.vesting().map_err(RpcError::internal)? else {
+                return Ok(json!({ "enabled": false }));
+            };
+            let t = st.storage.head_block().map_err(RpcError::internal)?.header.timestamp_ms;
+            let epoch = epoch_info(st).await?.epoch;
+            Ok(reg.get(&id).map_or(Value::Null, |e| vesting_entry_json(e, t, epoch)))
+        }
+        // Per-class totals — how much team / investor / partner RAND is still locked — and the
+        // whole register's. No entry, key or owner in the answer.
+        "rand_getVestingSummary" => {
+            use randprotocol_core::ledger::vesting::{vested, Class};
+            let Some(reg) = st.storage.vesting().map_err(RpcError::internal)? else {
+                return Ok(json!({ "enabled": false }));
+            };
+            let head = st.storage.head_block().map_err(RpcError::internal)?;
+            let t = head.header.timestamp_ms;
+            let classes: Vec<Value> = [Class::Team, Class::Investor, Class::Partner, Class::Other]
+                .iter()
+                .filter_map(|c| {
+                    let rows: Vec<_> = reg.entries.iter().filter(|e| e.class == *c).collect();
+                    if rows.is_empty() {
+                        return None;
+                    }
+                    let sum = |f: &dyn Fn(&randprotocol_core::ledger::vesting::Entry) -> u64| {
+                        rows.iter().fold(0u64, |a, e| a.saturating_add(f(e))).to_string()
+                    };
+                    Some(json!({
+                        "class": c.as_str(),
+                        "entries": rows.len(),
+                        "amount": sum(&|e| e.amount),
+                        "vested": sum(&|e| vested(e, t)),
+                        "claimed": sum(&|e| e.claimed),
+                        "revoked_out": sum(&|e| e.revoked_out),
+                        "bonded": sum(&|e| e.bonded),
+                        "locked": sum(&|e| e.amount.saturating_sub(e.revoked_out).saturating_sub(vested(e, t))),
+                    }))
+                })
+                .collect();
+            Ok(json!({
+                "enabled": true,
+                "height": head.height(),
+                "as_of_ms": t,
+                "entries": reg.entries.len(),
+                "issued": reg.issued().to_string(),
+                "released": reg.released.to_string(),
+                "locked": vesting_locked(&reg, t).to_string(),
+                "classes": classes,
+            }))
+        }
+        // The aggregate lockup table (SAFT Schedule 2 §3): the register's locked total at each of
+        // `from_ms, from_ms + step_ms, …, ≤ to_ms`, at most `MAX_VESTING_SCHEDULE_POINTS` points —
+        // computable by anyone from the genesis file, served so nobody has to. Revokes already
+        // applied are counted; future ones cannot be.
+        "rand_getVestingSchedule" => {
+            let from: u64 = param(p, 0, "from_ms")?;
+            let to: u64 = param(p, 1, "to_ms")?;
+            let step: u64 = param(p, 2, "step_ms")?;
+            if step == 0 || to < from || (to - from) / step >= MAX_VESTING_SCHEDULE_POINTS {
+                return Err(RpcError::invalid_params(format!(
+                    "need step_ms > 0, to_ms >= from_ms and at most {MAX_VESTING_SCHEDULE_POINTS} points"
+                )));
+            }
+            let Some(reg) = st.storage.vesting().map_err(RpcError::internal)? else {
+                return Ok(json!({ "enabled": false }));
+            };
+            let points: Vec<Value> = (0..=(to - from) / step)
+                .map(|i| {
+                    let t = from + i * step;
+                    json!({ "t_ms": t, "locked": vesting_locked(&reg, t).to_string() })
+                })
+                .collect();
+            Ok(json!({ "enabled": true, "issued": reg.issued().to_string(), "points": points }))
+        }
         "rand_getSupply" => {
             let height = st.storage.head().map_err(RpcError::internal)?.height;
             let supply = st.storage.supply().map_err(RpcError::internal)?;
@@ -2479,8 +2606,26 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let register_total = randprotocol_core::ledger::register_total(&register)
                 .saturating_add(randprotocol_core::ledger::supply::aggregators_total(&aggregators));
             let audit = randprotocol_core::ledger::Audit::new(supply, register_total, registration_fees_burned);
+            // Genesis vesting: the register is the identity's third half (`Ledger::audit`).
+            let vesting = st.storage.vesting().map_err(RpcError::internal)?;
+            let audit = match &vesting {
+                Some(v) => audit.with_vesting(v.issued(), v.released, v.in_register()),
+                None => audit,
+            };
+            let vesting_locked = match &vesting {
+                Some(v) => vesting_locked(v, st.storage.head_block().map_err(RpcError::internal)?.header.timestamp_ms),
+                None => 0,
+            };
             Ok(json!({
                 "height": height,
+                // Genesis vesting: what genesis issued into the register, what claims and revokes
+                // released into the pool, what the register still holds (bonded RAND is in
+                // `register_total`), and what of it has not unlocked yet. All "0" without the
+                // section.
+                "vesting_issued": audit.vesting_issued.to_string(),
+                "vesting_released": audit.vesting_released.to_string(),
+                "vesting_in_register": audit.vesting_in_register.to_string(),
+                "vesting_locked": vesting_locked.to_string(),
                 "genesis_deposited": supply.genesis_deposited.to_string(),
                 "genesis_staked": supply.genesis_staked.to_string(),
                 "faucet_minted": supply.faucet_minted.to_string(),
@@ -3830,6 +3975,88 @@ mod tests {
         assert_eq!(v["register_total"], Value::String((stake + bundle_fee()).to_string()));
         assert_eq!(v["total_supply"], Value::String((alloc + stake).to_string()));
         assert_eq!(v["invariant_holds"], true);
+    }
+
+    /// Genesis vesting: `rand_getVesting` serves an entry's terms and what the schedule says at
+    /// the head; `rand_getVestingSummary` the per-class totals; `rand_getVestingSchedule` the
+    /// owner-free lockup table; `rand_getSupply` the register as the identity's third half. A
+    /// chain without the section answers `enabled: false`.
+    #[tokio::test]
+    async fn the_vesting_register_is_served_and_audited() {
+        use randprotocol_core::ledger::vesting::{Class, VestingConfig, VestingEntryConfig};
+        let rand = randprotocol_core::UNITS_PER_RAND;
+        let holder = key(40);
+        let (_p, plain) = state_for(&fixtures::genesis_with(1, vec![]));
+        assert_eq!(ok(&plain, "rand_getVestingSummary", json!([])).await, json!({ "enabled": false }));
+        assert_eq!(ok(&plain, "rand_getVesting", json!(["07".repeat(32)])).await, json!({ "enabled": false }));
+        assert_eq!(ok(&plain, "rand_getSupply", json!([])).await["vesting_issued"], "0");
+
+        let mut g = fixtures::genesis_file_of(7, &[&key(1)], vec![], 2);
+        let entry = |id: u8, class: Class, amount: u64, linear_ms: u64| VestingEntryConfig {
+            id: [id; 32],
+            class,
+            beneficiary: holder.public_key().clone(),
+            revoker: None,
+            amount,
+            start_ms: 0,
+            cliff_ms: 0,
+            linear_ms,
+            step_ms: None,
+        };
+        g.vesting = Some(VestingConfig {
+            entries: vec![entry(7, Class::Investor, 10 * rand, 2), entry(8, Class::Team, 4 * rand, 1_000)],
+        });
+        let gs = g.build(&StubExecutor).unwrap();
+        let (_d, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        // Block 1 (t = 1): half of entry 7 has vested; claim 5 RAND of it.
+        let to = ShieldedAddress { pk: [5; 8], kem_ek: vec![5; randprotocol_core::notes::KEM_EK_BYTES] };
+        let (time, r, envelope) = (0u32, [3; 8], fixtures::env(4));
+        let m = randprotocol_core::types::actions::claim_vested_message(
+            &ledger.signing_domain().genesis, 7, &[7; 32], 5 * rand, 0, &to, time, &r, &envelope,
+        );
+        let claim = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::ClaimVested { entry: [7; 32], amount: 5 * rand, nonce: 0, to, time, r, envelope, signature: holder.sign(m.as_bytes()) },
+        };
+        let b1 = make_block(&gs.block, &mut ledger, vec![claim], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+
+        let v = ok(&st, "rand_getVesting", json!(["07".repeat(32)])).await;
+        assert_eq!(v["class"], "investor");
+        assert_eq!(v["beneficiary"], holder.address().to_base58());
+        assert_eq!(v["revocable"], false);
+        assert_eq!(v["amount"], (10 * rand).to_string());
+        assert_eq!(v["claimed"], (5 * rand).to_string());
+        assert_eq!(v["vested_now"], (5 * rand).to_string(), "t = 1 of 2");
+        assert_eq!(v["claimable_now"], "0");
+        assert_eq!(v["nonce"], 1);
+        assert_eq!(ok(&st, "rand_getVesting", json!(["09".repeat(32)])).await, Value::Null);
+        assert_eq!(call(&st, "rand_getVesting", json!(["07"])).await.err().unwrap().code, -32602);
+
+        let sum = ok(&st, "rand_getVestingSummary", json!([])).await;
+        assert_eq!(sum["issued"], (14 * rand).to_string());
+        assert_eq!(sum["released"], (5 * rand - randprotocol_core::gas::BUNDLE_BASE).to_string());
+        let classes = sum["classes"].as_array().unwrap();
+        assert_eq!(classes.len(), 2, "only the classes that have entries");
+        assert_eq!(classes[0]["class"], "team");
+        assert_eq!(classes[1]["locked"], (5 * rand).to_string());
+        let team_locked = 4 * rand - 4 * rand / 1_000;
+        assert_eq!(sum["locked"], (5 * rand + team_locked).to_string());
+
+        let table = ok(&st, "rand_getVestingSchedule", json!([0, 1_000, 500])).await;
+        let points = table["points"].as_array().unwrap();
+        assert_eq!(points.len(), 3);
+        assert_eq!(points[0], json!({ "t_ms": 0, "locked": (14 * rand).to_string() }));
+        assert_eq!(points[2], json!({ "t_ms": 1_000, "locked": "0" }));
+        assert_eq!(call(&st, "rand_getVestingSchedule", json!([0, 1_000_000, 1])).await.err().unwrap().code, -32602);
+
+        let supply = ok(&st, "rand_getSupply", json!([])).await;
+        assert_eq!(supply["vesting_issued"], (14 * rand).to_string());
+        assert_eq!(supply["vesting_in_register"], (9 * rand).to_string());
+        assert_eq!(supply["vesting_locked"], (5 * rand + team_locked).to_string());
+        assert_eq!(supply["invariant_holds"], true);
     }
 
     /// Audit v5 (TOK-2): under `tokens.burn_registration_fee` a registration's fee is destroyed —

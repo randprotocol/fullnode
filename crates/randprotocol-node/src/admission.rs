@@ -193,6 +193,25 @@ impl randprotocol_core::VerifiedProofs for VerifiedSet {
 /// token 0 is refused on every state forever. Every *other* index is state — a registration can
 /// create it one block later — and stays out.
 pub fn is_permanent(e: &TxError) -> bool {
+    // Genesis vesting: the register's entries, their keys and whether each is revocable are all
+    // fixed at genesis — no action rotates a key or adds an entry — so a bad signature, an
+    // unknown entry, a revoke of an irrevocable entry and a bond from a revocable one are
+    // verdicts on the bytes against constants, as are the byte rules (a recipient's key length,
+    // an amount under the base, a zero amount). Everything else — the nonce, what has vested,
+    // what is free or bonded, whether the entry was revoked — moves with the chain and time.
+    if let TxError::Vesting(v) = e {
+        use randprotocol_core::ledger::vesting::VestingError as V;
+        return matches!(
+            v,
+            V::BadSignature
+                | V::UnknownEntry(_)
+                | V::NotRevocable
+                | V::BondNeedsIrrevocable
+                | V::BadRecipient
+                | V::BelowBundleBase { .. }
+                | V::ZeroAmount
+        );
+    }
     // The aggregation register's verdicts, split like `Staking`'s: the byte-verdicts (and the
     // ones against genesis-pinned constants) are cacheable, the register's state is not. A
     // signature is over the transaction's own fields against the entry's key — and an address
