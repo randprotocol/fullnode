@@ -712,6 +712,19 @@ fn memo_column(memo: &Option<String>, whole: bool) -> String {
     }
 }
 
+/// `rand history`'s header, `to` before `memo` (reviewer's report: the memo — anyone's hostile
+/// text — was printed ahead of the recipient column, where it could read as if it were the
+/// recipient). Shared with [`history_row`] and this module's own test, so the column order in
+/// the header and in every row can never drift apart.
+fn history_header() -> String {
+    format!("{:>8}  {:>18}  {:>8}  {:<24}  {}", "index", "amount", "height", "to", "memo")
+}
+
+/// One `rand history` row, in the same column order as [`history_header`].
+fn history_row(index: u64, amount: &str, height: u64, to: &str, memo: &str) -> String {
+    format!("{:>8}  {:>18}  {:>8}  {:<24}  {}", index, amount, height, to, memo)
+}
+
 /// The confirmation memo line's cut point: long enough to show a real memo whole almost always,
 /// short enough that, together with the fixed `memo: "…"` wrapping and a byte-count suffix of up
 /// to [`randprotocol_core::notes::MEMO_TEXT_MAX_BYTES`]'s three digits, the whole line never
@@ -1116,15 +1129,12 @@ async fn main() -> Result<()> {
             if store.sent.is_empty() {
                 println!("no notes sent from this wallet");
             } else {
-                println!("{:>8}  {:>18}  {:>8}  {:<9}  {}", "index", "amount", "height", "memo", "to");
+                println!("{}", history_header());
                 for s in &store.sent {
                     let to = contact_name_for(&contacts, &s.to_pk)
                         .map(|n| memo_display::sanitize(&n))
                         .unwrap_or_else(|| randprotocol_core::notes::word8_to_hex(&s.to_pk));
-                    println!(
-                        "{:>8}  {:>18}  {:>8}  {:<9}  {}",
-                        s.index, format_amount(s.amount), s.height, memo_column(&s.memo, memo), to
-                    );
+                    println!("{}", history_row(s.index, &format_amount(s.amount), s.height, &to, &memo_column(&s.memo, memo)));
                 }
             }
         }
@@ -2198,6 +2208,22 @@ mod tests {
             assert!(!lines[1].contains("to alice"), "{shown:?}");
             assert!(!lines[1].contains("fingerprint AAAA-AAAA-AAAA-AAAA"), "{shown:?}");
         }
+    }
+
+    /// Reviewer's report: `rand history` printed the memo column ahead of the `to` column, so a
+    /// hostile memo sat where a reader would expect the recipient. The header and every row must
+    /// name `to` before `memo`.
+    #[test]
+    fn history_names_the_to_column_before_the_memo_column() {
+        let header = history_header();
+        let to_pos = header.find("to").expect("header names a to column");
+        let memo_pos = header.find("memo").expect("header names a memo column");
+        assert!(to_pos < memo_pos, "{header:?}");
+
+        let row = history_row(3, "1.00000000", 42, "alice", "lunch");
+        let alice_pos = row.find("alice").expect("row shows the recipient");
+        let lunch_pos = row.find("lunch").expect("row shows the memo");
+        assert!(alice_pos < lunch_pos, "{row:?}");
     }
 
     /// `rand notes`/`rand history`/`rand tx-key`'s memo column: sanitised first, then cut to 24
