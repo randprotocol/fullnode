@@ -1209,7 +1209,10 @@ mod tests {
         let (bytes, _, _) =
             randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu).unwrap();
         let honest: Proof = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(honest.input_log_height, 3, "a four-word call's input table today");
+        // The vendored prover floors the table itself since the COV-2 / INT-6 re-vendor, so a v0.6
+        // wallet's four-word call declares 2^7; a wallet from before it declared 2^3 — the header
+        // this screen reads, reproduced below by rewriting the height alone.
+        assert_eq!(honest.input_log_height, 7, "a four-word call's input table, floored by the prover");
         assert_eq!((honest.keccak_log_height, honest.sha256_log_height), (0, 0));
         let call = |proof: Vec<u8>| {
             let action = randprotocol_core::Action::Call { program: randprotocol_core::Hash::digest(b"program"), proof, input_envelope: None };
@@ -1228,7 +1231,8 @@ mod tests {
             Ok(_) => None,
         };
 
-        let got = refused(&call(bytes.clone())).expect("the finding: a 2^3-row input table is pooled today");
+        assert_eq!(refused(&call(bytes.clone())), None, "an upgraded wallet's floored call pools");
+        let got = refused(&with(&|p| p.input_log_height = 3)).expect("the finding: a 2^3-row input table (an old wallet's) is pooled");
         assert_eq!(got, TxError::CallRevealsPrivateInputs { table: "input", log_height: 3, min: 7 });
         assert!(!is_permanent(&got), "policy, never cached");
         let mut cache = RefusedCache::new(4);
@@ -1245,7 +1249,13 @@ mod tests {
             refused(&with(&|p| (p.input_log_height, p.sha256_log_height) = (7, 6))),
             Some(TxError::CallRevealsPrivateInputs { table: "sha256", log_height: 6, min: 7 })
         );
-        assert_eq!(refused(&with(&|p| (p.input_log_height, p.keccak_log_height, p.sha256_log_height) = (8, 7, 9))), None);
+        // Heights at or above the floor pass this screen. (This header is a rewrite of a real
+        // proof, so VERIFIER-2's canonical-shape screen now refuses it as a non-canonical proof —
+        // a different verdict; the point here is that the privacy screen does not.)
+        assert!(!matches!(
+            refused(&with(&|p| (p.input_log_height, p.keccak_log_height, p.sha256_log_height) = (8, 7, 9))),
+            Some(TxError::CallRevealsPrivateInputs { .. })
+        ));
         assert_eq!(refused(&call(vec![4u8; 64])), None, "undecodable bytes are the ledger's to refuse");
         // The ledger itself never raises it: a block carrying such a call applies (StubExecutor
         // verifies stub proofs only, so the rule's absence is shown on the variant: nothing in

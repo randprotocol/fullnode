@@ -6517,7 +6517,7 @@ mod tests {
             envelopes: [env(), env(), env(), env()],
             proof: Vec::new(),
         };
-        let prepared = Prepared { bundle: bundle(10), words: Vec::new(), expected: [0; 8] };
+        let prepared = Prepared { bundle: bundle(10), words: Vec::new(), expected: [0; 8], guest: ZkExecutor::hc_bundle() };
         let id = Hash::digest(b"program");
         let record = ProgramRecord { id, base_pc: 0, words: vec![0x13; 4], code_hash: vec![], deployed_at: 0, public_digest: None, public_len: 0 };
         let call = Action::Call { program: id, proof: Vec::new(), input_envelope: None };
