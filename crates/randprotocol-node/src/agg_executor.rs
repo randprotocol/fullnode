@@ -21,16 +21,113 @@ use randprotocol_zkvm::machine::FriProfile;
 /// The counter behind [`AggExecutor::verification_count`] — see its doc comment.
 static AGGREGATE_VERIFICATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// One admitted shape's aggregate program, built once (the interface review's INTERFACE-5): the
+/// inner verifier key, the program, its digest (step 7b's genesis-pin compare), and whether it
+/// uses the reduce instance (INTERFACE-4's flag check).
+struct BuiltProgram {
+    vk: InnerVerifierKey,
+    program: randprotocol_rvm::isa::Program,
+    digest: [u64; 4],
+    reduces: bool,
+}
+
+/// A declared shape as a map key — `DeclaredShape` itself is not `Hash`, and is core's type.
+type ShapeKey = (u8, u8, u8, u8, u8, u8, u8, u8);
+
+fn shape_key(s: &DeclaredShape) -> ShapeKey {
+    let profile = match s.profile {
+        randprotocol_core::types::FriProfile::Test => 0,
+        randprotocol_core::types::FriProfile::Production => 1,
+    };
+    (
+        profile,
+        s.tier,
+        s.program_log_height,
+        s.input_log_height,
+        s.keccak_log_height,
+        s.sha256_log_height,
+        s.public_log_height,
+        s.mem_log_height,
+    )
+}
+
+/// How many shapes' programs the memo keeps. A chain admits one shape at activation (spec
+/// §2.3), and admission reaches the executor only with a shape step 6 matched against the
+/// genesis list, so this bound is never met in practice; it exists so no caller can grow the
+/// map without limit — past it a shape is built and used, not kept.
+const MAX_BUILT_PROGRAMS: usize = 8;
+
 /// The executor the node runs: `ZkExecutor` inside, one rVM `Machine` beside it (its 64-entry
-/// verifier-key FIFO is what `warm_aggregation` fills and every `verify_aggregate` then reuses).
+/// verifier-key FIFO is what `warm_aggregation` fills and every `verify_aggregate` then reuses),
+/// and the admitted shapes' aggregate programs, built once each.
 pub struct AggExecutor {
     inner: ZkExecutor,
     rvm: randprotocol_rvm::machine::Machine,
+    programs: std::sync::Mutex<std::collections::HashMap<ShapeKey, std::sync::Arc<BuiltProgram>>>,
+    /// Program builds this executor has run — the memo's instrument for its test.
+    program_builds: std::sync::atomic::AtomicUsize,
 }
 
 impl AggExecutor {
     pub fn new(profile: FriProfile) -> AggExecutor {
-        AggExecutor { inner: ZkExecutor::new(profile), rvm: randprotocol_rvm::machine::Machine::new(profile) }
+        AggExecutor {
+            inner: ZkExecutor::new(profile),
+            rvm: randprotocol_rvm::machine::Machine::new(profile),
+            programs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            program_builds: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The shape's aggregate program, memoised (INTERFACE-5). Step 7b's digest compare and step
+    /// 8's verify each rebuilt the inner key and the program — seconds of DSL emission, twice
+    /// per aggregate, on the admission worker and again at every block apply — for a value that
+    /// is a pure function of a genesis constant. Built outside the lock: two first callers may
+    /// both build, and the second's insert is a no-op; nobody waits on a build under a lock.
+    fn built_program(&self, shape: &DeclaredShape) -> Result<std::sync::Arc<BuiltProgram>, ConfidentialError> {
+        use p3_field::PrimeField64;
+        let key = shape_key(shape);
+        if let Some(hit) = self.programs.lock().expect("the program memo").get(&key) {
+            return Ok(hit.clone());
+        }
+        let vk = Self::inner_key(shape)?;
+        let program = aggregate_program(&vk);
+        self.program_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let digest = program.digest().map(|f| f.as_canonical_u64());
+        // The reduce flag tracks the program, not a guess: `Precompiles::On` emits a REDUCE
+        // instruction per query opening, so the batch carries the reduce instance exactly when
+        // the program has such an instruction (`machine::verifier_key`'s third key component).
+        let reduces = program.instrs.iter().any(|i| matches!(i.op, randprotocol_rvm::isa::Op::Reduce));
+        let built = std::sync::Arc::new(BuiltProgram { vk, program, digest, reduces });
+        let mut memo = self.programs.lock().expect("the program memo");
+        if memo.len() < MAX_BUILT_PROGRAMS {
+            memo.entry(key).or_insert_with(|| built.clone());
+        }
+        Ok(built)
+    }
+
+    /// How many aggregate programs this executor has built (INTERFACE-5's instrument).
+    pub fn program_builds(&self) -> usize {
+        self.program_builds.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The header half of the aggregate checks (INTERFACE-5): the decode, the canonical
+    /// encoding and the admitted tier — everything that needs no program — shared by
+    /// `check_aggregate_header` (admission, before step 7b) and `verify_aggregate` itself.
+    fn aggregate_header(&self, proof: &[u8]) -> Result<randprotocol_rvm::machine::Proof, ConfidentialError> {
+        let rvm_proof: randprotocol_rvm::machine::Proof =
+            postcard::from_bytes(proof).map_err(|_| ConfidentialError::MalformedProof)?;
+        // Canonical encoding only, as `randprotocol_zkvm::executor::decode_canonical` insists for
+        // every bundle and call proof: postcard ignores trailing bytes and accepts overlong
+        // varints, so a padded or re-encoded aggregate would otherwise verify under another txid.
+        if rvm_proof.to_bytes() != proof {
+            return Err(ConfidentialError::MalformedProof);
+        }
+        // The tier, before any key work (audit v3, AGG-3). Everything after it — the program
+        // build, `verify_aggregate`'s `verifier_key` — is seconds to a minute of work that an
+        // *invalid* proof could otherwise buy at an unwarmed tier, on the consensus loop at block
+        // apply. The admitted set is the spec's, per profile.
+        check_tier(self.rvm.profile, rvm_proof.tier.0 as u8)?;
+        Ok(rvm_proof)
     }
 
     /// Process-wide count of real rVM aggregate verifications this process has run — the
@@ -190,9 +287,13 @@ impl ConfidentialExecutor for AggExecutor {
     /// spec §2.3's registered artifact: the N-generic aggregate program's digest for the shape,
     /// rebuilt deterministically from `(shape, key)` — seconds of DSL emission, never a proof.
     fn aggregate_program_digest(&self, shape: &DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
-        use p3_field::PrimeField64;
-        let vk = Self::inner_key(shape)?;
-        Ok(randprotocol_rvm::programs::aggregate_program_digest(&vk.shape, &vk.key).map(|f| f.as_canonical_u64()))
+        // `aggregate_program(vk).digest()` is `programs::aggregate_program_digest(shape, key)` —
+        // one function the other calls — so the memoised program's digest is the pinned one.
+        Ok(self.built_program(shape)?.digest)
+    }
+
+    fn check_aggregate_header(&self, proof: &[u8]) -> Result<(), ConfidentialError> {
+        self.aggregate_header(proof).map(|_| ())
     }
 
 /// spec §4 steps 7–8: the §4.4 interface list is recomputed from the covered bundles' public
@@ -212,26 +313,13 @@ impl ConfidentialExecutor for AggExecutor {
                 "an aggregate covers at least one bundle".into(),
             ));
         }
-        let rvm_proof: randprotocol_rvm::machine::Proof =
-            postcard::from_bytes(proof).map_err(|_| ConfidentialError::MalformedProof)?;
-        // Canonical encoding only, as `randprotocol_zkvm::executor::decode_canonical` insists for
-        // every bundle and call proof: postcard ignores trailing bytes and accepts overlong
-        // varints, so a padded or re-encoded aggregate would otherwise verify under another txid.
-        if rvm_proof.to_bytes() != proof {
-            return Err(ConfidentialError::MalformedProof);
-        }
-        // The tier, before any key work (audit v3, AGG-3). Everything below — `inner_key`, the
-        // program build, `verify_aggregate`'s `verifier_key` — is seconds to a minute of work that
-        // an *invalid* proof could otherwise buy at an unwarmed tier, on the consensus loop at
-        // block apply. The admitted set is the spec's, per profile.
-        check_tier(self.rvm.profile, rvm_proof.tier.0 as u8)?;
-        let vk = Self::inner_key(shape)?;
+        let rvm_proof = self.aggregate_header(proof)?;
+        let built = self.built_program(shape)?;
         let pvs: Vec<Vec<u64>> = covered.iter().map(|c| c.public_values.to_vec()).collect();
         // The list carries the transaction's own binding (audit v3, AGG-2), recomputed by the
         // ledger from `(chain, aggregator, nonce)`: a proof made under another triple digests
         // differently and is refused.
-        let public = randprotocol_rvm::public_values::interface_words_bound(&vk.shape, &vk.key, binding, &pvs);
-        let program = aggregate_program(&vk);
+        let public = randprotocol_rvm::public_values::interface_words_bound(&built.vk.shape, &built.vk.key, binding, &pvs);
         // The reduce flag, before `Machine::verify` builds a key (the interface review's
         // INTERFACE-4). The rVM keys its verifier-key cache by `(tier, program, reduce)` and reads
         // `reduce` off the proof's own `reduce_log_height`, so a proof declaring the reduce
@@ -240,17 +328,16 @@ impl ConfidentialExecutor for AggExecutor {
         // its batch was ever looked at. The program decides the flag (`warm_aggregation`'s rule),
         // so a mismatch is invalid by construction and refused here, in the node, without
         // touching the vendored verifier.
-        let reduces = program.instrs.iter().any(|i| matches!(i.op, randprotocol_rvm::isa::Op::Reduce));
-        if (rvm_proof.reduce_log_height != 0) != reduces {
+        if (rvm_proof.reduce_log_height != 0) != built.reduces {
             return Err(ConfidentialError::InvalidAggregateProof(format!(
                 "the proof declares reduce_log_height {} but the registered aggregate program {} the reduce instance",
                 rvm_proof.reduce_log_height,
-                if reduces { "uses" } else { "never uses" }
+                if built.reduces { "uses" } else { "never uses" }
             )));
         }
         let out = randprotocol_rvm::aggregate::verify_aggregate(
             &self.rvm,
-            &program,
+            &built.program,
             &AggregateProof { proof: rvm_proof, public },
             binding,
         )
@@ -268,24 +355,22 @@ impl ConfidentialExecutor for AggExecutor {
     /// skipped, not panicked on: genesis validation is where that refusal belongs.
     fn warm_aggregation(&self, shape: &DeclaredShape) {
         let t0 = std::time::Instant::now();
-        let vk = match Self::inner_key(shape) {
-            Ok(vk) => vk,
+        // The memoised program (INTERFACE-5): the warm builds it once, and admission's step 7b
+        // and step 8 reuse it.
+        let built = match self.built_program(shape) {
+            Ok(built) => built,
             Err(e) => {
                 tracing::warn!("aggregation: admitted shape cannot build an inner key ({e}); skipping the warm");
                 return;
             }
         };
-        let program = aggregate_program(&vk);
-        // The reduce flag tracks the program, not a guess: `Precompiles::On` emits a REDUCE
-        // instruction per query opening, so the batch carries the reduce instance exactly when
-        // the program has such an instruction (`machine::verifier_key`'s third key component).
-        let reduce = program.instrs.iter().any(|i| matches!(i.op, randprotocol_rvm::isa::Op::Reduce));
+        let (program, reduce) = (&built.program, built.reduces);
         // *Every* admitted tier, not just the N=1 landing tier (audit v3, AGG-3): an aggregate
         // covering two or three bundles lands higher, and paying its key build inside admission —
         // on the consensus loop — is what this warm exists to avoid. The tiers above N=1 are rarer,
         // not cheaper.
         for tier in admitted_tiers(self.rvm.profile) {
-            let _ = self.rvm.verifier_key(&program, randprotocol_rvm::machine::Tier(*tier as usize), reduce);
+            let _ = self.rvm.verifier_key(program, randprotocol_rvm::machine::Tier(*tier as usize), reduce);
         }
         tracing::info!(
             "aggregation: aggregate program built and the verifier keys for tiers {:?} warmed ({:.1?})",
@@ -405,6 +490,37 @@ mod tests {
         let err = ex.verify_aggregate(&shape, &covered, &proof, &binding).unwrap_err();
         assert_eq!(ex.rvm.cached_keys(), before, "no verifier key was built for a flipped reduce flag: {err}");
         assert!(format!("{err}").contains("reduce"), "refused by name: {err}");
+    }
+
+    /// The interface review's INTERFACE-5: step 7b's digest and step 8's verify each rebuilt the
+    /// inner key and the aggregate program (seconds of DSL emission) per aggregate, at admission
+    /// and again at every block apply. The program is a pure function of a genesis constant, so
+    /// it is built once per shape: a second digest, a second verify and the warm reuse it. And
+    /// the header gate admission runs before step 7b refuses an unadmitted tier with no build.
+    #[test]
+    fn the_aggregate_program_is_built_once_per_shape_and_never_for_a_refused_header() {
+        let ex = AggExecutor::new(FriProfile::Test);
+        let shape = fixture_free_shape();
+        let covered = vec![CoveredBundle { public_values: [7; 34], shape }];
+        let binding = [3u32; 8];
+        // A header at a tier the chain never admits: refused before anything is built.
+        let unadmitted = crafted_proof(&shape, &covered, &binding, 22, 0);
+        assert!(matches!(ex.check_aggregate_header(&unadmitted), Err(ConfidentialError::InvalidAggregateProof(m)) if m.contains("tier 22")));
+        assert_eq!(ex.program_builds(), 0, "a refused header builds nothing");
+
+        let first = ex.aggregate_program_digest(&shape).unwrap();
+        assert_eq!(ex.aggregate_program_digest(&shape).unwrap(), first, "one program, one digest");
+        let vk = AggExecutor::inner_key(&shape).unwrap();
+        assert_eq!(
+            first,
+            randprotocol_rvm::programs::aggregate_program_digest(&vk.shape, &vk.key).map(|f| p3_field::PrimeField64::as_canonical_u64(&f)),
+            "the memoised digest is the rVM's own"
+        );
+        // A verify at the same shape (refused at the reduce check, after the program is in hand).
+        let flipped = if program_reduces(&shape) { 0 } else { randprotocol_rvm::machine::MIN_LOG_HEIGHT };
+        let proof = crafted_proof(&shape, &covered, &binding, admitted_tiers(FriProfile::Test)[0] as usize, flipped);
+        assert!(ex.verify_aggregate(&shape, &covered, &proof, &binding).is_err());
+        assert_eq!(ex.program_builds(), 1, "two digests and a verify: one build");
     }
 
     /// Why the wrapper exists: the bare zkVM executor names its own refusal, so a miswired node

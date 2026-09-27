@@ -524,6 +524,11 @@ pub(super) fn validate_aggregate(
             return Err(AggregationError::CoveredGuestMismatch(*cover).into());
         }
     }
+    // 7a. The proof's header — its decode, canonical encoding and admitted rVM tier (AGG-3) —
+    //     before 7b's program build (the interface review's INTERFACE-5): the tier gate used to
+    //     live only inside step 8, so a proof at a tier this chain never admits first bought the
+    //     program emission below. The executor re-checks it all in step 8.
+    executor.check_aggregate_header(proof).map_err(TxError::InvalidAggregateProof)?;
     // 7b. The genesis pin, enforced (audit v3, AGG-6). `admitted_shapes[i].aggregate_program_digest`
     //     is measured at activation and bound into the genesis hash, but nothing ever compared it
     //     with the program this build emits: `verify_aggregate` verifies against whatever
@@ -1811,6 +1816,68 @@ mod admission_tests {
             Err(TxError::InvalidAggregateProof(_)) => {}
             other => panic!("A's proof re-signed by B must be refused, got {other:?}"),
         }
+    }
+
+    /// The interface review's INTERFACE-5 (and the rescan's ZKQ-2): step 7b rebuilds the
+    /// aggregate program to compare its digest with the genesis pin — seconds of DSL emission —
+    /// and it ran before the AGG-3 tier gate, which lived inside step 8's `verify_aggregate`. So
+    /// an aggregate at a tier the chain never admits bought the program build first. The header
+    /// gate (`check_aggregate_header`: decode, canonical, tier) now runs before step 7b.
+    #[test]
+    fn a_proof_the_header_gate_refuses_never_reaches_the_program_digest() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        /// The stub, with a header gate that refuses and a count of step 7b's calls.
+        struct HeaderRefusing(AtomicUsize);
+        impl ConfidentialExecutor for HeaderRefusing {
+            fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
+                StubExecutor.check_program(base_pc, words)
+            }
+            fn verify_call(&self, program: &crate::program::ProgramRecord, proof: &[u8]) -> Result<crate::program::CallOutcome, ConfidentialError> {
+                StubExecutor.verify_call(program, proof)
+            }
+            fn public_digest(&self, words: &[u32]) -> Word8 {
+                StubExecutor.public_digest(words)
+            }
+            fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
+                StubExecutor.node_hash(left, right)
+            }
+            fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
+                StubExecutor.note_commitment(pk, from, amount, asset, time, r)
+            }
+            fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+                StubExecutor.bundle_digest(input)
+            }
+            fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+                StubExecutor.bundle_proof_digest(proof)
+            }
+            fn verify_bundle(&self, hc: &Word8, proof: &[u8], binding: &[u32; crate::types::TX_BINDING_WORDS]) -> Result<(), ConfidentialError> {
+                StubExecutor.verify_bundle(hc, proof, binding)
+            }
+            fn aggregate_program_digest(&self, shape: &DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                StubExecutor.aggregate_program_digest(shape)
+            }
+            fn check_aggregate_header(&self, _proof: &[u8]) -> Result<(), ConfidentialError> {
+                Err(ConfidentialError::InvalidAggregateProof("aggregate proof at tier 25".into()))
+            }
+            fn verify_aggregate(
+                &self,
+                shape: &DeclaredShape,
+                covered: &[CoveredBundle],
+                proof: &[u8],
+                binding: &[u32; 8],
+            ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+                StubExecutor.verify_aggregate(shape, covered, proof, binding)
+            }
+        }
+        let (l, kp) = setup();
+        let ex = HeaderRefusing(AtomicUsize::new(0));
+        let tx = aggregate_tx(&kp, 0, 100, covers(2), b"ok".to_vec());
+        match l.validate_aggregate(&tx, &covered_records(&shape(), &[1, 2]), &ex) {
+            Err(TxError::InvalidAggregateProof(ConfidentialError::InvalidAggregateProof(m))) => assert!(m.contains("tier"), "{m}"),
+            other => panic!("the header gate must refuse, got {other:?}"),
+        }
+        assert_eq!(ex.0.load(Ordering::SeqCst), 0, "step 7b's program build never ran");
     }
 
     /// The interface review's INTERFACE-1: a retry is not equivocation. The register nonce moves

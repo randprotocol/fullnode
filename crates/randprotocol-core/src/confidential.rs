@@ -112,6 +112,14 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// spec §2.3): a startup constant, recomputed from the shape alone. Cheap relative to
     /// verification (the DSL program build, not the proving key).
     fn aggregate_program_digest(&self, shape: &crate::types::DeclaredShape) -> Result<[u64; 4], ConfidentialError>;
+    /// The aggregate proof's header, alone and cheap (the interface review's INTERFACE-5): the
+    /// decode, the canonical encoding and the admitted rVM tier — every refusal that needs no
+    /// program. Admission runs it before step 7b's program build, so a proof at a tier the chain
+    /// never admits buys nothing; `verify_aggregate` still checks all of it itself. The default
+    /// (the stub, and any executor without the rVM) admits every header.
+    fn check_aggregate_header(&self, _proof: &[u8]) -> Result<(), ConfidentialError> {
+        Ok(())
+    }
     /// spec §4 steps 7–8: the interface-list recompute and digest compare against the proof's
     /// batch public values, then the rVM `Machine::verify` of the aggregate proof against the
     /// registered aggregate program. Returns each covered bundle's `OUT0..7` in cover order.
