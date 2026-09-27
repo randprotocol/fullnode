@@ -21,13 +21,22 @@ impl Contacts {
     pub fn save(&self, key: &Path) -> Result<()> {
         let p = path_for(key);
         let tmp = p.with_extension("json.tmp");
+        // A stale temp file keeps its own mode through `open(create)`: remove it first and create
+        // afresh (`create_new`), then pin 0600 anyway, so the contacts file is always private.
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         {
             use std::io::Write;
             let mut o = std::fs::OpenOptions::new();
-            o.write(true).create(true).truncate(true);
+            o.write(true).create_new(true);
             #[cfg(unix)]
             { use std::os::unix::fs::OpenOptionsExt; o.mode(0o600); }
             let mut f = o.open(&tmp)?;
+            #[cfg(unix)]
+            { use std::os::unix::fs::PermissionsExt; f.set_permissions(std::fs::Permissions::from_mode(0o600))?; }
             f.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
             f.sync_all()?;
         }
@@ -89,5 +98,22 @@ mod tests {
         #[cfg(unix)]
         { use std::os::unix::fs::PermissionsExt; assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600); }
         assert_eq!(Contacts::load(&key).unwrap().get("alice"), Some(a));
+    }
+    /// A stale `.json.tmp` left world-readable (a crash between write and rename, or a file
+    /// someone else made) must not carry its mode into the contacts file.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_world_readable_temp_file_does_not_leak_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("w.key.json");
+        let tmp = dir.path().join("w.key.json.contacts.json.tmp");
+        std::fs::write(&tmp, "stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut c = Contacts::default();
+        c.add("alice", &addr()).unwrap();
+        c.save(&key).unwrap();
+        let p = dir.path().join("w.key.json.contacts.json");
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
     }
 }
