@@ -81,6 +81,35 @@ pub fn aggregators_root(register: &BTreeMap<Address, AggregatorEntry>) -> Hash {
     merkle_root(&leaves)
 }
 
+/// The register's whole state-root component: [`aggregators_root`] alone while no address has
+/// ever withdrawn — so every root computed before the interface review's IFACE-6 is unchanged —
+/// and, once one has, `blake3("rand-aggregators-retired-1", aggregators_root ‖ retired_root)`
+/// where `retired_root` is the merkle root of `blake3("rand-aggregator-retired-leaf-1", addr ‖
+/// floor)` per withdrawn address. The floors are consensus state: they decide which nonce a
+/// re-registration starts at, so two replicas disagreeing about one must not share a root.
+pub fn aggregators_component(
+    register: &BTreeMap<Address, AggregatorEntry>,
+    retired: &BTreeMap<Address, u64>,
+) -> Hash {
+    let root = aggregators_root(register);
+    if retired.is_empty() {
+        return root;
+    }
+    let leaves: Vec<Hash> = retired
+        .iter()
+        .map(|(addr, floor)| {
+            let mut buf = Vec::with_capacity(40);
+            buf.extend_from_slice(addr.as_bytes());
+            buf.extend_from_slice(&floor.to_be_bytes());
+            Hash::digest_domain(b"rand-aggregator-retired-leaf-1", &buf)
+        })
+        .collect();
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(root.as_bytes());
+    buf.extend_from_slice(merkle_root(&leaves).as_bytes());
+    Hash::digest_domain(b"rand-aggregators-retired-1", &buf)
+}
+
 // ── the register's four actions (spec §2.2) ─────────────────────────────────────────────────
 
 use crate::crypto::Signature;
@@ -626,7 +655,10 @@ impl Ledger {
 }
 
 impl Ledger {
-    /// Register the address as an aggregator (spec §2.2), inserting the entry at nonce 0. The
+    /// Register the address as an aggregator (spec §2.2), inserting the entry at the address's
+    /// nonce floor — 0 for an address that never withdrew, else where its last entry's nonce
+    /// stopped (IFACE-6: the signed actions carry only `(chain, address, nonce)`, so restarting
+    /// at 0 made every old unbond and withdraw of the address valid again). The
     /// bundle's burn is checked by admission, not here — a register only ever arrives as an
     /// `Action::RegisterAggregator` whose bundle burned the genesis bond (crate-internal, like
     /// the validator register's `bond`).
@@ -644,7 +676,7 @@ impl Ledger {
                 public_key: registration.public_key.clone(),
                 bond,
                 payout: registration.payout.clone(),
-                nonce: 0,
+                nonce: self.retired_aggregator_nonces.get(&aggregator).copied().unwrap_or(0),
                 unbonding: None,
             },
         );
@@ -686,7 +718,12 @@ impl Ledger {
         chain_id: u64,
     ) -> Result<(), AggregationError> {
         check_withdraw(self, aggregator, nonce, time, r, envelope, signature, chain_id)?;
+        // The withdraw consumes `nonce` like every signed action, so the floor is one past it:
+        // every message this address ever signed stays spent (IFACE-6). Worked out before the
+        // entry goes, so an overflow changes nothing.
+        let floor = nonce.checked_add(1).ok_or(AggregationError::Overflow)?;
         self.aggregators.remove(aggregator).expect("checked above");
+        self.retired_aggregator_nonces.insert(*aggregator, floor);
         Ok(())
     }
 }
@@ -1449,6 +1486,54 @@ mod register_tests {
             "the base goes to the proposer"
         );
         assert!(l.aggregators().get(&kp.public_key().address()).is_none(), "the entry is deleted");
+    }
+
+    /// The interface review's IFACE-6: a withdraw deletes the entry, and a re-registration used
+    /// to start the nonce at 0 again — while the unbond message is only `(chain, address,
+    /// nonce)`. The first registration's unbond at nonce 0, public on chain, then replayed
+    /// against the second registration and started its unbonding without its key. The nonce
+    /// floor now survives the withdraw: the re-registration starts where the old entry stopped.
+    #[test]
+    fn an_old_unbond_does_not_replay_against_a_re_registration() {
+        let mut l = gated();
+        let (kp, _) = keys();
+        let addr = kp.public_key().address();
+        l.apply_tx(&register_tx(&l, &kp, &payout_addr(), cfg().bond), &proposer(&l), &StubExecutor).unwrap();
+        let old_unbond = unbond_tx(&kp, 0);
+        l.apply_tx(&old_unbond, &proposer(&l), &StubExecutor).unwrap();
+        let release = l.height + cfg().window;
+        l.set_height(release);
+        l.apply_tx(&withdraw_tx(&kp, 1, release as u32, [9; 8]), &proposer(&l), &StubExecutor).unwrap();
+        assert!(l.aggregators().get(&addr).is_none(), "withdrawn");
+        assert_eq!(l.retired_aggregator_nonces().get(&addr), Some(&2), "the floor survives the entry");
+        // The floor is in the register's root component once there is one, and a register with
+        // no floors hashes exactly as before.
+        assert_ne!(
+            aggregators_component(l.aggregators(), l.retired_aggregator_nonces()),
+            aggregators_root(l.aggregators())
+        );
+        assert_eq!(aggregators_component(l.aggregators(), &BTreeMap::new()), aggregators_root(l.aggregators()));
+
+        // Register again, from a fresh bundle anchored at the current root.
+        l.record_anchor(release);
+        let mut again = register_tx(&l, &kp, &payout_addr(), cfg().bond);
+        let b = again.bundle.as_mut().unwrap();
+        b.nullifiers = crate::notes::pad4([[5; 8], [6; 8]]);
+        b.commitments = crate::notes::pad4([[7; 8], [8; 8]]);
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
+        let again = StubExecutor::bound(again);
+        l.apply_tx(&again, &proposer(&l), &StubExecutor).unwrap();
+        assert_eq!(l.aggregators()[&addr].nonce, 2, "the re-registration starts at the floor the withdraw left");
+
+        // The first registration's unbond, replayed: refused, and nothing moves.
+        match l.apply_tx(&old_unbond, &proposer(&l), &StubExecutor) {
+            Err(crate::ledger::TxError::Aggregation(AggregationError::BadNonce { expected: 2, actual: 0 })) => {}
+            other => panic!("a replayed unbond must be refused, got {other:?}"),
+        }
+        assert_eq!(l.aggregators()[&addr].unbonding, None, "the new registration is not unbonding");
+        // The owner's own next unbond, at the floor, still works.
+        l.apply_tx(&unbond_tx(&kp, 2), &proposer(&l), &StubExecutor).unwrap();
     }
 
     /// Slashing is retired (INTERFACE-1): two headers by one aggregator at one nonce with

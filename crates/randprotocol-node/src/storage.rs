@@ -206,6 +206,12 @@ const META_VESTING: &str = "vesting";
 /// `META_SUPPLY`'s twin in kind — derived, replay-audited — but unlike the bucket this one is
 /// hashed into the state root, so a restarted node that lost it would fork at the next block.
 const META_AGGREGATORS: &str = "aggregators";
+/// `bincode(BTreeMap<Address, u64>)`: the withdrawn aggregators' nonce floors (the interface
+/// review's IFACE-6), `META_AGGREGATORS`'s companion — in the state root once non-empty, so
+/// restored by `load_ledger` like the register. A key of its own rather than a wider register
+/// blob, so every store written before it (all of them hold an empty register) decodes as it
+/// did; absent means empty, and it is written only on a chain with an `aggregation` section.
+const META_RETIRED_AGGREGATOR_NONCES: &str = "retired_aggregator_nonces";
 /// `bincode(Option<AggregationConfig>)`: the genesis section itself. The register and the
 /// bucket are persisted derived state, but the config is genesis truth — `load_ledger` restores
 /// it from here so every reader of the store (RPC included, which has no genesis file to hand)
@@ -1119,6 +1125,31 @@ impl Storage {
         Ok(self.get_meta_raw(META_AGGREGATORS)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
     }
 
+    /// The withdrawn aggregators' nonce floors as of the head (IFACE-6); empty when absent.
+    pub fn retired_aggregator_nonces(&self) -> Result<std::collections::BTreeMap<randprotocol_core::Address, u64>> {
+        Ok(self
+            .get_meta_raw(META_RETIRED_AGGREGATOR_NONCES)?
+            .map(|b| bincode::deserialize(&b))
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    /// Stage the nonce floors beside the register, on an aggregating chain only (every other
+    /// chain's map is empty by construction, and its store never grows the key): written when
+    /// non-empty, deleted when empty — a truncation can take the last withdraw away.
+    fn stage_retired_aggregator_nonces(&self, batch: &mut WriteBatch, ledger: &Ledger) -> Result<()> {
+        if ledger.aggregation().is_none() {
+            return Ok(());
+        }
+        let floors = ledger.retired_aggregator_nonces();
+        if floors.is_empty() {
+            batch.delete_cf(self.cf(CF_META), META_RETIRED_AGGREGATOR_NONCES);
+        } else {
+            batch.put_cf(self.cf(CF_META), META_RETIRED_AGGREGATOR_NONCES, bincode::serialize(floors)?);
+        }
+        Ok(())
+    }
+
     /// The chain's genesis aggregation section, `None` without one — and equally for a database
     /// written before the key existed, which is what `Ledger::from_parts` would have left it.
     /// Genesis truth, never changed after `init_genesis`, so a reader that needs only the config
@@ -1847,6 +1878,7 @@ impl Storage {
         ledger.set_vesting(self.vesting()?);
         ledger.set_unsealed_fees(self.unsealed_fees()?);
         ledger.set_aggregators(self.aggregators()?);
+        ledger.set_retired_aggregator_nonces(self.retired_aggregator_nonces()?);
         ledger.set_aggregation(self.aggregation_config()?);
         ledger.set_bridge(self.load_bridge()?);
         ledger.set_tokens(self.tokens()?);
@@ -2169,6 +2201,7 @@ impl Storage {
         self.put_vesting(&mut batch, ledger_after.vesting())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
+        self.stage_retired_aggregator_nonces(&mut batch, ledger_after)?;
         batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger_after.tokens().cloned())?);
         self.put_tokens_ext(&mut batch, ledger_after.tokens())?;
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(last_height));
@@ -2803,6 +2836,7 @@ impl Storage {
         self.put_vesting(&mut batch, ledger.vesting())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
+        self.stage_retired_aggregator_nonces(&mut batch, ledger)?;
         batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger.tokens().cloned())?);
         self.put_tokens_ext(&mut batch, ledger.tokens())?;
         if height == 0 {
@@ -6627,6 +6661,39 @@ mod seal_tests {
         assert!(storage.tx_record(&covered.hash()).unwrap().is_some());
         let check = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
         assert_eq!((check.problem, check.last_good), (None, 1));
+    }
+
+    /// IFACE-6's floors are state-root state, so they persist beside the register and
+    /// `load_ledger` restores them — a restarted node that lost one would start a
+    /// re-registration at another nonce than its peers and fork at the root. Written only on an
+    /// aggregating chain, and dropped when a truncation empties the map.
+    #[test]
+    fn the_retired_aggregator_nonces_persist_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let shape = DeclaredShape {
+            profile: FriProfile::Test,
+            tier: 14,
+            program_log_height: 13,
+            input_log_height: 12,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: 2,
+            mem_log_height: 18,
+        };
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 100);
+        gs.ledger.set_aggregation(Some(gated_cfg(shape, Hash::digest(b"the bundle guest"), 256)));
+        storage.init_genesis(&gs).unwrap();
+        assert!(storage.retired_aggregator_nonces().unwrap().is_empty());
+        let mut l = gs.ledger.clone();
+        let floors: BTreeMap<randprotocol_core::Address, u64> = [(key(7).address(), 3)].into_iter().collect();
+        l.set_retired_aggregator_nonces(floors.clone());
+        storage.truncate_to(&gs, 0, &l).unwrap();
+        let loaded = storage.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(loaded.retired_aggregator_nonces(), &floors);
+        assert_eq!(loaded.state_root(), l.state_root(), "the reloaded root carries the floor");
+        storage.truncate_to(&gs, 0, &gs.ledger).unwrap();
+        assert!(storage.get_meta_raw(META_RETIRED_AGGREGATOR_NONCES).unwrap().is_none(), "an empty map leaves no key");
     }
 
     /// A gated genesis's section round-trips through the accessor `rand_getEmission` reads, and

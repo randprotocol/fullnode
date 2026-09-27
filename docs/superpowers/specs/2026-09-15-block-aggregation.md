@@ -167,6 +167,14 @@ kem_ek)`, and the root joins the state root as `… || aggregators_root` under t
 One monotonic `nonce` per entry is shared by all three signed actions and by every `Aggregate`
 submission; each accepted action consumes `nonce + 1`.
 
+**The nonce outlives the entry (2026-09-28, the interface review's IFACE-6).** A withdraw deletes
+the entry, and a re-registration used to start again at `nonce = 0` — while the unbond message is
+only `(chain_id, address, nonce)`, so the old registration's public unbond replayed against the
+new one. The withdraw now leaves a per-address floor (`nonce + 1`) in the ledger's
+`retired_aggregator_nonces`, a re-registration starts at it, and the register's state-root
+component becomes `blake3("rand-aggregators-retired-1", aggregators_root ‖ retired_root)` once any
+floor exists — `aggregators_root` alone while none does, so no root computed before is changed.
+
 ### 2.3 The registered artifacts and the startup key-build obligation
 
 `genesis.aggregation: Option<AggregationConfig>` carries:

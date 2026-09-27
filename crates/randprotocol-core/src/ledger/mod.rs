@@ -500,6 +500,13 @@ pub struct Ledger {
     /// The aggregator register, hashed into the state root (spec §2.1) when `aggregation` is
     /// set; empty otherwise and at chain-9 block 0.
     aggregators: BTreeMap<Address, aggregation::AggregatorEntry>,
+    /// Per address that has withdrawn from the aggregator register, the nonce its next
+    /// registration starts at (the interface review's IFACE-6): the entry is deleted at the
+    /// withdraw, and without this floor a re-registration restarted at 0 and replayed its old
+    /// signed actions. Consensus state, in the aggregators' state-root component only when
+    /// non-empty ([`aggregation::aggregators_component`]); empty on every chain without the
+    /// section.
+    retired_aggregator_nonces: BTreeMap<Address, u64>,
     /// Height of the block being applied (the `time` window and `ProgramRecord::deployed_at`).
     height: u64,
     /// Timestamp of the block being applied, in unix milliseconds.
@@ -550,6 +557,7 @@ impl PartialEq for Ledger {
             && self.bridge == o.bridge
             && self.tokens == o.tokens
             && self.aggregators == o.aggregators
+            && self.retired_aggregator_nonces == o.retired_aggregator_nonces
             // The proving-share bucket is consensus state on an aggregating chain: what it holds
             // decides who is paid and which bundles an aggregate may cover (audit v3, AGG-4). On a
             // chain without aggregation it is empty on both sides and this compares nothing.
@@ -609,6 +617,7 @@ impl Ledger {
             envelope_bytes: None,
             program_pc_window: false,
             aggregators: BTreeMap::new(),
+            retired_aggregator_nonces: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
             deposits: Vec::new(),
@@ -662,6 +671,7 @@ impl Ledger {
             envelope_bytes: None,
             program_pc_window: false,
             aggregators: BTreeMap::new(),
+            retired_aggregator_nonces: BTreeMap::new(),
             height: 0,
             timestamp_ms: 0,
             deposits: Vec::new(),
@@ -798,6 +808,18 @@ impl Ledger {
     /// its peers from the very next block. `from_parts` leaves it empty; the loader sets it.
     pub fn set_aggregators(&mut self, m: BTreeMap<Address, aggregation::AggregatorEntry>) {
         self.aggregators = m;
+    }
+
+    /// Restore the withdrawn aggregators' nonce floors (IFACE-6) a node persisted beside the
+    /// register: in the state root once non-empty, so the loader must set them too.
+    pub fn set_retired_aggregator_nonces(&mut self, m: BTreeMap<Address, u64>) {
+        self.retired_aggregator_nonces = m;
+    }
+
+    /// The withdrawn aggregators' nonce floors (IFACE-6): what each address's next registration
+    /// starts its nonce at.
+    pub fn retired_aggregator_nonces(&self) -> &BTreeMap<Address, u64> {
+        &self.retired_aggregator_nonces
     }
 
     /// What genesis itself created, set once by [`crate::genesis::Genesis::build`]: the deposit
@@ -2132,7 +2154,7 @@ impl Ledger {
             None => "none".into(),
         };
         let agg = if self.aggregation.is_some() {
-            format!("{:?}", aggregation::aggregators_root(&self.aggregators))
+            format!("{:?}", aggregation::aggregators_component(&self.aggregators, &self.retired_aggregator_nonces))
         } else {
             "none".into()
         };
@@ -2207,7 +2229,9 @@ impl Ledger {
             buf.extend_from_slice(tokens.root().as_bytes());
         }
         if self.aggregation.is_some() {
-            buf.extend_from_slice(aggregation::aggregators_root(&self.aggregators).as_bytes());
+            buf.extend_from_slice(
+                aggregation::aggregators_component(&self.aggregators, &self.retired_aggregator_nonces).as_bytes(),
+            );
             buf.extend_from_slice(self.unsealed_root().as_bytes());
         }
         if self.staking.is_some() {
