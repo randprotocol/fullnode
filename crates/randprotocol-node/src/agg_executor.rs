@@ -126,7 +126,16 @@ impl AggExecutor {
         // build, `verify_aggregate`'s `verifier_key` — is seconds to a minute of work that an
         // *invalid* proof could otherwise buy at an unwarmed tier, on the consensus loop at block
         // apply. The admitted set is the spec's, per profile.
-        check_tier(self.rvm.profile, rvm_proof.tier.0 as u8)?;
+        // Read as what it is (the rescan's ZKQ-2): the tier is a `usize` off the wire, and `as u8`
+        // wrapped 277 into 21 — an admitted test tier. A tier no `u8` holds is no admitted tier.
+        let tier = u8::try_from(rvm_proof.tier.0).map_err(|_| {
+            ConfidentialError::InvalidAggregateProof(format!(
+                "aggregate proof at tier {}; this chain admits {:?}",
+                rvm_proof.tier.0,
+                admitted_tiers(self.rvm.profile)
+            ))
+        })?;
+        check_tier(self.rvm.profile, tier)?;
         Ok(rvm_proof)
     }
 
@@ -556,6 +565,25 @@ mod tests {
             Err(ConfidentialError::BadDeclaredShape(_)) => {}
             other => panic!("an absurd mem height must not build, got {other:?}"),
         }
+    }
+
+    /// The rescan's ZKQ-2: the tier gate read the proof's `usize` tier `as u8`, which wraps — a
+    /// header declaring tier 277 was gated as 21, an admitted test tier (and 533 as 21, …). The
+    /// rVM's own `check_declared_heights` refuses such a tier later, but the gate is the one
+    /// admission runs first and it must say what the proof says.
+    #[test]
+    fn a_tier_past_u8_is_refused_not_wrapped_into_an_admitted_one() {
+        let ex = AggExecutor::new(FriProfile::Test);
+        let shape = fixture_free_shape();
+        let covered = vec![CoveredBundle { public_values: [7; 34], shape }];
+        let binding = [3u32; 8];
+        assert!(admitted_tiers(FriProfile::Test).contains(&((277usize) as u8)), "277 wraps to an admitted tier");
+        let proof = crafted_proof(&shape, &covered, &binding, 277, 0);
+        match ex.check_aggregate_header(&proof) {
+            Err(ConfidentialError::InvalidAggregateProof(m)) => assert!(m.contains("277"), "{m}"),
+            other => panic!("tier 277 must be refused as itself, got {other:?}"),
+        }
+        assert_eq!(ex.program_builds(), 0);
     }
 
     /// Why the wrapper exists: the bare zkVM executor names its own refusal, so a miswired node
