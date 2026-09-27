@@ -4,7 +4,50 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-27)
+## Project memory (state as of 2026-09-28)
+
+### v0.5.10 — address sharing and the encrypted memo (2026-09-28)
+
+The launch address stays the ~1,667-char ML-KEM-768 `rand1…` (the user's decision, 2026-09-26: no
+standardized PQ KEM has a key under ~700 bytes; a registry, an auto-published key, an X25519 hybrid
+and a CTIDH address were each rejected — spec §1). It is made shareable instead. Spec
+`docs/superpowers/specs/2026-09-26-address-sharing-and-memo-design.md`, plan
+`docs/superpowers/plans/2026-09-26-address-sharing-and-memo.md` (17 tasks across circuits,
+fullnode, randscan, randprotocol.org and clients; every task reviewed, then two whole-branch reviews).
+**What it is:**
+
+- **Fingerprint** (`randprotocol_core::fingerprint`): 80 bits of `blake3("rand-address-fingerprint-1"
+  ‖ pk ‖ kem_ek)`, 16 Crockford chars; seed vector `crates/randprotocol-core/tests/vectors/
+  address-sharing.json` → `1WCV-YC8F-47BY-5RZY`. Display only.
+- **`randpay:` links** (`randprotocol_core::payment_uri`): address + optional amount (display units),
+  asset, memo (≤ 510 B). Every QR encodes one, at level M.
+- **The memo**: body plaintext `note (112) ‖ memo field (512)` = `len u16 LE ‖ UTF-8 ‖ zero pad`, sealed
+  in the research note layer (`viewing::seal_with_memo`/`memo`, vendored); a malformed field opens as
+  no memo, never costing the note. **Genesis `envelope_bytes: 1860`** (only 1860; bound into the hash
+  LAST, only when present — chain 14 `1cff3b7d…` and chain 15 `cc30e085…` unchanged) makes every note
+  envelope exactly 1,860 B, genesis allocs included (`TxError::EnvelopeSize`, permanent). It turns on
+  at the v1.0 genesis (~chain 20, `rand-node genesis --envelope-bytes 1860`); wallets seal the memo
+  form only where `rand_getLimits.envelope_bytes == 1860`, legacy 1,348 B elsewhere.
+- **Trap — a memo is hostile text on every chain today.** A 1,860-B envelope is ≤ 2,048 so chains 14/15
+  accept it, and the opener reads a 624-B body anywhere: anyone can pay a dust note carrying any memo,
+  and a link can carry one. Every surface (CLI `memo_display`, UI `ui/lib/memo.js`, iOS/Android
+  `Memo.display`, the website) sanitises it and shows it as one non-wrapping line; the CLI bounds the
+  line at 1 column per ASCII / 2 per other code point, table-free, after four review rounds found
+  wrap forgeries through U+3000, U+2800, skin-tone modifiers and U+3164. Never print a memo raw.
+- `WithdrawAggregator`'s envelope now gets the cap every note envelope has (a ruling; refused anyway
+  on chains without aggregation).
+- **CLI changes:** token amounts (`send --asset`, `token mint`, `token burn`) are display units;
+  `rand address` prints only the address on stdout (fingerprint → stderr); `rand send` confirms first
+  and refuses a non-terminal stdin without `--yes` (deploy scripts pass `--yes`).
+- **Companions:** circuits `research` (the memo seal), randscan `randscan-viewing` (opens the memo body;
+  rebuild `frontend/public/viewing/*` before any memo genesis), randprotocol.org (`/address`
+  fingerprint + QR + link builder + contacts, `/account` memo column), clients (core re-vendored;
+  shared UI, desktop deep link + single-instance, web wallet `web+randpay`, iOS, Android). Apps and
+  website ship before any genesis sets `envelope_bytes`; the bridge relayer needs only a `rand` rebuilt
+  from this release (it shells out to `rand bridge-mint`).
+- **Open (v0.5.11):** a node-supplied token symbol is not length-bounded in the wallet; the
+  `RPC_BLOCKING` process-wide semaphore (v0.5.8) makes `rpc::tests::a_token_transfer_reveals…` flaky
+  under parallel load (passes alone).
 
 ### v0.5.9 — the 2026-09-27 rescan fixes (tagged 2026-09-27; roll status below)
 
