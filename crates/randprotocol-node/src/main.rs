@@ -357,6 +357,11 @@ enum Cmd {
         /// come out the declared length too.
         #[arg(long)]
         envelope_bytes: Option<u32>,
+        /// Genesis vesting (`docs/vesting.md`): the timelocked allocations, as a `VestingConfig`
+        /// JSON file (`{"entries": [{"id", "class", "beneficiary", "revoker"?, "amount",
+        /// "start_ms", "cliff_ms", "linear_ms", "step_ms"?}]}`). Omitted entirely when absent.
+        #[arg(long, value_name = "VESTING.JSON")]
+        vesting: Option<PathBuf>,
     },
     /// Print one genesis alloc note as JSON — the object that goes into a genesis file's `alloc`
     /// list — sealed to `--to` exactly as `genesis --alloc` seals one, so the owner's wallet finds
@@ -498,6 +503,13 @@ enum Cmd {
         #[command(flatten)]
         staking: StakingArgs,
     },
+    /// Genesis vesting (`docs/vesting.md`): a timelocked allocation's holder and revoker side —
+    /// status, claim, revoke, and bonding locked RAND. The key is made with `keygen` and its
+    /// public key read with `address`; `--key` below is the entry's beneficiary (or revoker) key.
+    Vesting {
+        #[command(subcommand)]
+        cmd: VestingCmd,
+    },
     /// The aggregator role on a chain with an `aggregation` section (block aggregation,
     /// spec §2.2): register, unbond, withdraw. The register's twins, one register over.
     Aggregator {
@@ -576,6 +588,102 @@ enum AggregatorCmd {
 /// free; a withdraw pays the bundle base out of the amount it withdraws, to the proposer of the
 /// block that applies it. So neither command takes a wallet, and both return in a block's time
 /// rather than a proof's.
+/// `rand-node vesting …` (genesis vesting).
+#[derive(Subcommand)]
+enum VestingCmd {
+    /// Show an entry: its terms, what has vested, what is claimable now.
+    Status {
+        /// The entry id, 64 hex characters.
+        entry: String,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+    /// Claim unlocked RAND into a note at `--to`, less the 0.001 RAND base the block's proposer
+    /// is paid. Signed by the beneficiary key.
+    Claim {
+        /// The entry id, 64 hex characters.
+        #[arg(long)]
+        entry: String,
+        /// The `rand1…` address the note is paid to — inside what the key signs.
+        #[arg(long)]
+        to: String,
+        /// Amount in RAND; or `--all` for everything claimable now.
+        #[arg(long, conflicts_with = "all", required_unless_present = "all")]
+        amount: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[command(flatten)]
+        staking: StakingArgs,
+    },
+    /// Revoke a revocable entry: its unvested part is paid to `--to` (the treasury) and the
+    /// entry is frozen. Signed by the revoker key. The amount is what will still be unvested
+    /// `--margin-secs` after the head, so a revoke that lands a little later still fits; what
+    /// vests in the margin stays the holder's.
+    Revoke {
+        #[arg(long)]
+        entry: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value_t = 600)]
+        margin_secs: u64,
+        #[command(flatten)]
+        staking: StakingArgs,
+    },
+    /// Bond an irrevocable entry's locked RAND as `--validator`'s stake (SAFT Schedule 2 §4).
+    /// A validator not yet in the register needs `--registration` (what `rand-node register`
+    /// prints for it).
+    Bond {
+        #[arg(long)]
+        entry: String,
+        /// The validator's address (base58).
+        #[arg(long)]
+        validator: String,
+        /// Amount in RAND.
+        amount: String,
+        #[arg(long)]
+        registration: Option<String>,
+        #[command(flatten)]
+        staking: StakingArgs,
+    },
+    /// Take bonded RAND back into the lock (claimable again after the unbonding epochs).
+    Unbond {
+        #[arg(long)]
+        entry: String,
+        /// Amount in RAND.
+        amount: String,
+        #[command(flatten)]
+        staking: StakingArgs,
+    },
+}
+
+/// A 64-hex vesting entry id.
+fn parse_entry_id(s: &str) -> Result<[u8; 32]> {
+    hex::decode(s.strip_prefix("0x").unwrap_or(s))
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .with_context(|| format!("{s} is not a vesting entry id (64 hex characters)"))
+}
+
+/// The entry as the node serves it (`rand_getVesting`), refusing a chain without the section
+/// and an id the register does not hold. `at_ms` asks for the schedule at another time.
+async fn vesting_entry(rpc: &RpcClient, id: &[u8; 32], at_ms: Option<u64>) -> Result<serde_json::Value> {
+    let v = rpc.call("rand_getVesting", serde_json::json!([hex::encode(id), at_ms])).await?;
+    anyhow::ensure!(v["enabled"] != serde_json::json!(false), "this chain has no vesting section");
+    anyhow::ensure!(!v.is_null(), "no vesting entry {} on this chain", hex::encode(id));
+    Ok(v)
+}
+
+fn amount_field(v: &serde_json::Value, name: &str) -> Result<u64> {
+    v[name].as_str().and_then(|s| s.parse().ok()).with_context(|| format!("the node's vesting reply has no {name}"))
+}
+
+/// The note a claim or a revoke pays and the envelope that opens it: `to`, no sender, the
+/// amount less the base, the native asset, `time` — what `ledger::vesting` derives, which
+/// `the_cli_vesting_note_is_the_note_the_ledger_derives` pins.
+fn sealed_vesting_note(to: &ShieldedAddress, net: u64, time: u32, format: EnvelopeFormat) -> Result<(Note, Envelope)> {
+    sealed_withdraw_note(to, net, time, format)
+}
+
 #[derive(clap::Args)]
 struct StakingArgs {
     /// The validator key file: the key the register knows, and the key that signs the action.
@@ -622,6 +730,7 @@ async fn main() -> Result<()> {
             admitted_shapes,
             tokens,
             envelope_bytes,
+            vesting,
         } => {
             let mut gen = Genesis {
                 chain_id,
@@ -696,7 +805,17 @@ async fn main() -> Result<()> {
                 // The audit-v4 `staking` section (STAKE-2) is spliced in by hand like the
                 // `bridge` section: a chain without it hashes byte-for-byte as before.
                 staking: None,
-                vesting: None,
+                // Genesis vesting: read from a `VestingConfig` JSON file when `--vesting` is given
+                // (`Genesis::build` validates it); omitted entirely otherwise.
+                vesting: match &vesting {
+                    Some(path) => Some(
+                        serde_json::from_str::<randprotocol_core::ledger::vesting::VestingConfig>(
+                            &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
+                        )
+                        .with_context(|| format!("{} is not a valid vesting config", path.display()))?,
+                    ),
+                    None => None,
+                },
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
@@ -885,6 +1004,123 @@ async fn main() -> Result<()> {
             );
             submit_staking(&staking, chain_id, action, &format!("withdraw of {} RAND", format_amount(amount))).await?;
         }
+        Cmd::Vesting { cmd } => match cmd {
+            VestingCmd::Status { entry, rpc } => {
+                let v = vesting_entry(&RpcClient::new(rpc), &parse_entry_id(&entry)?, None).await?;
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            }
+            VestingCmd::Claim { entry, to, amount, all, staking } => {
+                use randprotocol_core::types::actions::claim_vested_message;
+                let kp = load_keypair(&staking.key)?;
+                let id = parse_entry_id(&entry)?;
+                let to = ShieldedAddress::parse(&to).map_err(|e| anyhow::anyhow!("{to} is not a shielded address: {e}"))?;
+                let rpc = RpcClient::new(staking.rpc.clone());
+                let v = vesting_entry(&rpc, &id, None).await?;
+                let claimable = amount_field(&v, "claimable_now")?;
+                let amount = match (amount, all) {
+                    (Some(a), _) => parse_amount(&a)?,
+                    (None, _) => claimable,
+                };
+                let base = randprotocol_core::gas::BUNDLE_BASE;
+                anyhow::ensure!(
+                    amount > base,
+                    "a claim pays the {} RAND bundle base out of its amount, so {} RAND buys no note",
+                    format_amount(base),
+                    format_amount(amount)
+                );
+                anyhow::ensure!(
+                    amount <= claimable,
+                    "only {} RAND is claimable now, not {} RAND",
+                    format_amount(claimable),
+                    format_amount(amount)
+                );
+                let nonce = v["nonce"].as_u64().context("the node's vesting reply has no nonce")?;
+                let chain_id = rpc.chain_id().await?;
+                let genesis = rpc.genesis_hash().await?;
+                let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
+                let (note, envelope) = sealed_vesting_note(&to, amount - base, time, envelope_format(&rpc).await?)?;
+                let signature = kp.sign(
+                    claim_vested_message(&genesis, chain_id, &id, amount, nonce, &to, time, &note.r, &envelope).as_bytes(),
+                );
+                println!(
+                    "claiming {} RAND from entry {entry}: a note worth {} RAND to {to}, the {} RAND base to the block's proposer",
+                    format_amount(amount),
+                    format_amount(amount - base),
+                    format_amount(base)
+                );
+                let action = randprotocol_core::Action::ClaimVested { entry: id, amount, nonce, to, time, r: note.r, envelope, signature };
+                submit_staking(&staking, chain_id, action, &format!("claim of {} RAND", format_amount(amount))).await?;
+            }
+            VestingCmd::Revoke { entry, to, margin_secs, staking } => {
+                use randprotocol_core::types::actions::revoke_vesting_message;
+                let kp = load_keypair(&staking.key)?;
+                let id = parse_entry_id(&entry)?;
+                let to = ShieldedAddress::parse(&to).map_err(|e| anyhow::anyhow!("{to} is not a shielded address: {e}"))?;
+                let rpc = RpcClient::new(staking.rpc.clone());
+                let now = vesting_entry(&rpc, &id, None).await?;
+                anyhow::ensure!(now["revocable"] == serde_json::json!(true), "entry {entry} has no revoker: it is irrevocable");
+                anyhow::ensure!(now["revoked_at"].is_null(), "entry {entry} is already revoked");
+                let head_ms = now["as_of_ms"].as_u64().context("the node's vesting reply has no as_of_ms")?;
+                let at = head_ms.saturating_add(margin_secs.saturating_mul(1_000));
+                let unvested = amount_field(&vesting_entry(&rpc, &id, Some(at)).await?, "unvested_now")?;
+                let base = randprotocol_core::gas::BUNDLE_BASE;
+                anyhow::ensure!(unvested > base, "nothing left to revoke: {} RAND unvested {margin_secs} s from now", format_amount(unvested));
+                let nonce = now["nonce"].as_u64().context("the node's vesting reply has no nonce")?;
+                let chain_id = rpc.chain_id().await?;
+                let genesis = rpc.genesis_hash().await?;
+                let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
+                let (note, envelope) = sealed_vesting_note(&to, unvested - base, time, envelope_format(&rpc).await?)?;
+                let signature = kp.sign(
+                    revoke_vesting_message(&genesis, chain_id, &id, unvested, nonce, &to, time, &note.r, &envelope).as_bytes(),
+                );
+                println!(
+                    "revoking entry {entry}: {} RAND unvested ({margin_secs} s margin) to {to}; the holder keeps everything vested by then",
+                    format_amount(unvested)
+                );
+                let action =
+                    randprotocol_core::Action::RevokeVesting { entry: id, unvested, nonce, to, time, r: note.r, envelope, signature };
+                submit_staking(&staking, chain_id, action, &format!("revoke of {} RAND", format_amount(unvested))).await?;
+            }
+            VestingCmd::Bond { entry, validator, amount, registration, staking } => {
+                use randprotocol_core::types::actions::{bond_vested_message, Registration};
+                let kp = load_keypair(&staking.key)?;
+                let id = parse_entry_id(&entry)?;
+                let validator = randprotocol_core::Address::from_base58(&validator)
+                    .map_err(|e| anyhow::anyhow!("{validator} is not a validator address: {e}"))?;
+                let amount = parse_amount(&amount)?;
+                let registration = match registration {
+                    Some(h) => Some(
+                        Registration::decode(&hex::decode(&h).context("--registration is hex")?)
+                            .map_err(|e| anyhow::anyhow!("--registration: {e}"))?,
+                    ),
+                    None => None,
+                };
+                let rpc = RpcClient::new(staking.rpc.clone());
+                let v = vesting_entry(&rpc, &id, None).await?;
+                anyhow::ensure!(v["revocable"] == serde_json::json!(false), "a revocable entry cannot bond");
+                let nonce = v["nonce"].as_u64().context("the node's vesting reply has no nonce")?;
+                let chain_id = rpc.chain_id().await?;
+                let genesis = rpc.genesis_hash().await?;
+                let signature =
+                    kp.sign(bond_vested_message(&genesis, chain_id, &id, &validator, amount, nonce, registration.as_ref()).as_bytes());
+                let action = randprotocol_core::Action::BondVested { entry: id, validator, amount, registration, nonce, signature };
+                submit_staking(&staking, chain_id, action, &format!("bond of {} locked RAND to {validator}", format_amount(amount))).await?;
+            }
+            VestingCmd::Unbond { entry, amount, staking } => {
+                use randprotocol_core::types::actions::unbond_vested_message;
+                let kp = load_keypair(&staking.key)?;
+                let id = parse_entry_id(&entry)?;
+                let amount = parse_amount(&amount)?;
+                let rpc = RpcClient::new(staking.rpc.clone());
+                let v = vesting_entry(&rpc, &id, None).await?;
+                let nonce = v["nonce"].as_u64().context("the node's vesting reply has no nonce")?;
+                let chain_id = rpc.chain_id().await?;
+                let genesis = rpc.genesis_hash().await?;
+                let signature = kp.sign(unbond_vested_message(&genesis, chain_id, &id, amount, nonce).as_bytes());
+                let action = randprotocol_core::Action::UnbondVested { entry: id, amount, nonce, signature };
+                submit_staking(&staking, chain_id, action, &format!("unbond of {} locked RAND", format_amount(amount))).await?;
+            }
+        },
         Cmd::Aggregator { cmd } => match cmd {
             AggregatorCmd::Register { key, bond, payout, rpc } => {
                 let kp = load_keypair(&key)?;
@@ -1591,6 +1827,76 @@ mod tests {
             .expect("the payout wallet opens its own note");
         assert_eq!(opened, note);
         assert_eq!(opened.amount, amount - base);
+    }
+
+    /// Genesis vesting: the note `rand-node vesting claim` seals is the note the ledger derives
+    /// for the action it signs (`ledger::vesting`, through `Ledger::derived_commitment`), with
+    /// the real executor — and the holder's wallet opens it.
+    #[test]
+    fn the_cli_vesting_note_is_the_note_the_ledger_derives() {
+        use randprotocol_core::ledger::vesting::{Class, VestingConfig, VestingEntryConfig, VestingRegister};
+        let holder = SpendKey([9; 8]);
+        let to = randprotocol_zkvm::address::address_of(&holder.viewing_key());
+        let base = randprotocol_core::gas::BUNDLE_BASE;
+        let (amount, time) = (3 * UNITS_PER_RAND, 77);
+        let (note, envelope) = sealed_vesting_note(&to, amount - base, time, EnvelopeFormat::Legacy).unwrap();
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let action = randprotocol_core::Action::ClaimVested {
+            entry: [1; 32],
+            amount,
+            nonce: 0,
+            to: to.clone(),
+            time,
+            r: note.r,
+            envelope: envelope.clone(),
+            signature: randprotocol_core::crypto::Signature::empty(),
+        };
+        let mut ledger = pinned_genesis().build(&ex).unwrap().ledger;
+        let key = Keypair::from_seed([4; 32]).unwrap();
+        ledger.set_vesting(Some(VestingRegister::from_config(&VestingConfig {
+            entries: vec![VestingEntryConfig {
+                id: [1; 32],
+                class: Class::Partner,
+                beneficiary: key.public_key().clone(),
+                revoker: None,
+                amount: 10 * UNITS_PER_RAND,
+                start_ms: 0,
+                cliff_ms: 0,
+                linear_ms: 1,
+                step_ms: None,
+            }],
+        })));
+        assert_eq!(ledger.derived_commitment(&action, &ex), Some(note.commitment()), "the CLI's note is the chain's");
+        let (_, opened) = randprotocol_zkvm::address::envelope_from_core(&envelope)
+            .open_as_receiver(note.commitment(), &holder.viewing_key())
+            .expect("the holder's wallet opens its claim");
+        assert_eq!(opened.amount, amount - base);
+    }
+
+    /// The `--vesting` file format is `docs/vesting.md`'s example, verbatim: a doc that drifts
+    /// from what `rand-node genesis --vesting` reads fails here.
+    #[test]
+    fn the_documented_vesting_file_parses_and_validates() {
+        let doc = include_str!("../../../docs/vesting.md");
+        let start = doc.find("```json\n{\n  \"entries\"").expect("docs/vesting.md carries the example file");
+        let body = &doc[start + "```json\n".len()..];
+        let mut json = body[..body.find("```").unwrap()].to_string();
+        // The keys are `"<…>"` placeholders in the doc: stand a real one in for each.
+        let key = Keypair::from_seed([6; 32]).unwrap().public_key().to_hex();
+        let revoker = Keypair::from_seed([7; 32]).unwrap().public_key().to_hex();
+        while let Some(a) = json.find("\"<") {
+            let b = a + json[a..].find(">\"").unwrap() + 2;
+            let k = if json[a..b].contains("revoker") { &revoker } else { &key };
+            json.replace_range(a..b, &format!("\"{k}\""));
+        }
+        let cfg: randprotocol_core::ledger::vesting::VestingConfig = serde_json::from_str(&json).expect("the example parses");
+        assert_eq!(cfg.entries.len(), 2);
+        let total = cfg.check().expect("the example is a valid section");
+        assert_eq!(total, 23_000_000 * UNITS_PER_RAND, "18 M (the Founding Sale shape) + 5 M (a team grant)");
+        let founding = &cfg.entries[0];
+        const MONTH: u64 = 30 * 86_400_000;
+        assert_eq!((founding.cliff_ms, founding.linear_ms, founding.step_ms), (12 * MONTH, 18 * MONTH, Some(MONTH)));
+        assert!(founding.revoker.is_none() && cfg.entries[1].revoker.is_some(), "investor irrevocable, team revocable");
     }
 
     /// Two allocations of the same amount to the same address are two different notes. A

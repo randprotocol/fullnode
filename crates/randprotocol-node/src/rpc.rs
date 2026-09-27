@@ -2513,7 +2513,9 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // `--verify-chain` recomputes every counter in it by replaying the chain.
         // Genesis vesting (`docs/vesting.md`): one entry by its 64-hex id, `null` for an id the
         // register does not hold, `{"enabled": false}` on a chain without the section. "Now" is
-        // the head block's timestamp — what the next block's rules would start from.
+        // the head block's timestamp — what the next block's rules would start from — unless an
+        // optional `at_ms` asks for the schedule at another time (a revoker signing ahead of the
+        // block that will apply it).
         "rand_getVesting" => {
             let id: String = param(p, 0, "id")?;
             let id: [u8; 32] = hex::decode(id.strip_prefix("0x").unwrap_or(&id))
@@ -2523,9 +2525,20 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let Some(reg) = st.storage.vesting().map_err(RpcError::internal)? else {
                 return Ok(json!({ "enabled": false }));
             };
-            let t = st.storage.head_block().map_err(RpcError::internal)?.header.timestamp_ms;
+            let at: Option<u64> = match p.get(1) {
+                Some(v) if !v.is_null() => Some(param(p, 1, "at_ms")?),
+                _ => None,
+            };
+            let t = match at {
+                Some(t) => t,
+                None => st.storage.head_block().map_err(RpcError::internal)?.header.timestamp_ms,
+            };
             let epoch = epoch_info(st).await?.epoch;
-            Ok(reg.get(&id).map_or(Value::Null, |e| vesting_entry_json(e, t, epoch)))
+            Ok(reg.get(&id).map_or(Value::Null, |e| {
+                let mut v = vesting_entry_json(e, t, epoch);
+                v["as_of_ms"] = json!(t);
+                v
+            }))
         }
         // Per-class totals — how much team / investor / partner RAND is still locked — and the
         // whole register's. No entry, key or owner in the answer.
@@ -4032,6 +4045,9 @@ mod tests {
         assert_eq!(v["vested_now"], (5 * rand).to_string(), "t = 1 of 2");
         assert_eq!(v["claimable_now"], "0");
         assert_eq!(v["nonce"], 1);
+        assert_eq!(v["as_of_ms"], 1, "the head block's timestamp");
+        let later = ok(&st, "rand_getVesting", json!(["07".repeat(32), 2])).await;
+        assert_eq!((later["as_of_ms"].clone(), later["vested_now"].clone()), (json!(2), json!((10 * rand).to_string())));
         assert_eq!(ok(&st, "rand_getVesting", json!(["09".repeat(32)])).await, Value::Null);
         assert_eq!(call(&st, "rand_getVesting", json!(["07"])).await.err().unwrap().code, -32602);
 
