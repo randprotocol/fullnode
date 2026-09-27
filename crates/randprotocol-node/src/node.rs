@@ -1533,6 +1533,12 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     let key = Keypair::from_seed(cfg.seed).context("bad key seed")?;
     let (gs, executor) = load_genesis(&cfg.datadir)?;
     check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles())?;
+    // Before RocksDB opens its ~1000 table files (issue #41): a node started under the default
+    // soft limit of 1024 ran out of descriptors and its RPC refused every connection.
+    match crate::rlimit::raise_nofile_limit() {
+        Ok((soft, hard)) => tracing::info!(soft, hard, "open-files limit"),
+        Err(e) => tracing::warn!("could not raise the open-files limit: {e}"),
+    }
     // The disk guard (audit v4 OPS-3): a node that opens RocksDB on a full disk crash-loops
     // with the RPC never up; refusing here names the directory and the flag instead.
     let disk_free_bytes =
