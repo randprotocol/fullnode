@@ -30,6 +30,10 @@ p3-util = "=0.7.0"
 # exact pins so no dependency bump can silently move every key. tests/verifier_key.rs pins them.
 rand = { version = "=0.10.2", features = ["std_rng"] }
 rand_core = "=0.10.1"
+# StdRng's stream is ChaCha12 from `chacha20` (HCS-1's third pin, upstream's `=0.10.2` since
+# circuits `7a75ae2`): a `chacha20` release that moved the stream would move every key as surely
+# as a `rand` one. Named here only for the pin — nothing in this crate calls it directly.
+chacha20 = { version = "=0.10.2", default-features = false }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 # The reference verifier this crate's first program mirrors, the reference permutation it hashes
