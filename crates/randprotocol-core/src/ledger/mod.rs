@@ -3621,8 +3621,10 @@ mod tests {
 
     /// ZKV-11: under genesis `hardening_v6` a deploy whose *padded* program table crosses the
     /// u32 pc wrap is refused, at admission and at apply alike. Fib's 15 words at `0xffffffc4` end
-    /// exactly at 2^32 (ZH4's bound admits them) but pad to 16 rows, one past it; at `0xffffffc0`
-    /// the 16 rows end at 2^32 and fit. Without the flag — chain 15 — the old rule stands.
+    /// exactly at 2^32 (ZH4's bound admits them) but pad to 16 rows, one past it. The window is the
+    /// floored table's (PCW-FLOOR): a hardened call declares 128 rows, so `0xffffffc0` — where the
+    /// 16 unfloored rows end at 2^32 — is refused too, and `2^32 − 512` is the highest start that
+    /// fits. Without the flag — chain 15 — the old rule stands.
     #[test]
     fn under_the_pc_window_flag_a_deploy_whose_padded_table_wraps_is_refused() {
         let (a, _) = keys();
@@ -3641,9 +3643,14 @@ mod tests {
         let wraps = deploy(&gated, 0xffff_ffc4, 15);
         assert_eq!(gated.validate(&wraps, &StubExecutor), Err(TxError::BadProgram(crate::program::pc_window_error())));
         assert_eq!(gated.clone().apply_tx(&wraps, &a.address(), &StubExecutor), Err(TxError::BadProgram(crate::program::pc_window_error())));
-        assert_eq!(gated.validate(&deploy(&gated, 0xffff_ffc0, 15), &StubExecutor), Ok(()), "16 rows ending at 2^32 fit");
-        // 16 words pad to 32 rows, so the same start that fit 15 words no longer does.
-        assert_eq!(gated.validate(&deploy(&gated, 0xffff_ffc0, 16), &StubExecutor), Err(TxError::BadProgram(crate::program::pc_window_error())));
+        assert_eq!(
+            gated.validate(&deploy(&gated, 0xffff_ffc0, 15), &StubExecutor),
+            Err(TxError::BadProgram(crate::program::pc_window_error())),
+            "PCW-FLOOR: 16 rows would end at 2^32, the floored 128 do not"
+        );
+        assert_eq!(gated.validate(&deploy(&gated, 0xffff_fe00, 15), &StubExecutor), Ok(()), "128 rows ending at 2^32 fit");
+        // 128 words pad to 256 rows, so the same start that fit 15 words no longer does.
+        assert_eq!(gated.validate(&deploy(&gated, 0xffff_fe00, 128), &StubExecutor), Err(TxError::BadProgram(crate::program::pc_window_error())));
         assert_eq!(gated.validate(&deploy(&gated, 0, 4), &StubExecutor), Ok(()), "every live program sits at base_pc 0");
     }
 

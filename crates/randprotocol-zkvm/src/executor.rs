@@ -1445,9 +1445,62 @@ mod tests {
                 "len {len}"
             );
         }
-        // The finding's shape: fib (15 words) at 0xffffffc4 passes ZH4 and not the window.
+        // PCW-FLOOR: the window is taken over the floored table a hardened call declares, so the
+        // floor core mirrors must be this crate's (`hardened_program_log_height`'s).
+        assert_eq!(randprotocol_core::program::MIN_PRIVATE_TABLE_LOG_HEIGHT, super::MIN_PRIVATE_TABLE_LOG_HEIGHT);
+        assert_eq!(super::MIN_PRIVATE_TABLE_LOG_HEIGHT, crate::tables::MIN_PRIVATE_TABLE_LOG_HEIGHT);
+        for len in [0usize, 15, 43, 127, 128, 129, 8_184] {
+            assert_eq!(
+                randprotocol_core::program::program_table_rows(len).max(1 << randprotocol_core::program::MIN_PRIVATE_TABLE_LOG_HEIGHT),
+                1u64 << super::hardened_program_log_height(len),
+                "len {len}"
+            );
+        }
+        // The finding's shape: fib (15 words) at 0xffffffc4 passes ZH4 and not the window; at
+        // 0xffffffc0 its 16 unfloored rows fit but the 128 floored ones do not (PCW-FLOOR).
         assert!(!randprotocol_core::program::pc_window_fits(0xffff_ffc4, 15));
-        assert!(randprotocol_core::program::pc_window_fits(0xffff_ffc0, 15));
+        assert!(!randprotocol_core::program::pc_window_fits(0xffff_ffc0, 15));
+        assert!(randprotocol_core::program::pc_window_fits(0xffff_fe00, 15));
+    }
+
+    /// PCW-FLOOR (the v0.6 rescan), on real proofs: the window and the hardened prover agree at the
+    /// window's edge. Fib at `0xffffffc0` — admitted by the old, unfloored window — declares a
+    /// 128-row program table under `hardening_v6` whose padding PCs cross 2^32, and its proof is
+    /// refused (the rescan's reproduction: `OodEvaluationMismatch`); the window now refuses the
+    /// deploy. At `2^32 − 512`, the highest start the window admits, the hardened call proves and
+    /// verifies. Tier 10, the test profile.
+    #[test]
+    fn pcw_floor_the_window_and_the_hardened_prover_agree_at_the_edge() {
+        use super::*;
+        use crate::machine::FriProfile;
+        let fib = crate::guests::fib(10);
+        let zk = ZkExecutor::new(FriProfile::Test);
+        let binding = [9u32; TX_BINDING_WORDS];
+        let hardened = |base_pc: u32| {
+            let program = crate::isa::Program::new(base_pc, fib.words.clone());
+            let record = ProgramRecord {
+                id: randprotocol_core::program::program_id(base_pc, &program.words),
+                base_pc,
+                words: program.words.clone(),
+                code_hash: zk.check_program(base_pc, &program.words).unwrap(),
+                deployed_at: 0,
+                public_digest: None,
+                public_len: 0,
+            };
+            let proved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                prove_call_hardened(FriProfile::Test, &program, &[], &[], &binding, [0; 4], Some(10))
+            }));
+            match proved {
+                Ok(Ok((bytes, _, _))) => zk.verify_call_hardened(&record, &bytes, &binding).map(|_| ()).map_err(|e| format!("{e:?}")),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err("prove panicked".into()),
+            }
+        };
+        let edge = 0xffff_fe00u32;
+        assert!(randprotocol_core::program::pc_window_fits(edge, fib.words.len()));
+        assert_eq!(hardened(edge), Ok(()), "the highest start the window admits proves and verifies");
+        assert!(!randprotocol_core::program::pc_window_fits(0xffff_ffc0, fib.words.len()));
+        assert!(hardened(0xffff_ffc0).is_err(), "past it the floored table crosses the wrap");
     }
 
     /// CPU-1: `max_callable_program_words` is the prover's own limit, not a restatement of it.

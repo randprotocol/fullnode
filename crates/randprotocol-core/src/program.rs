@@ -66,8 +66,17 @@ pub fn program_table_rows(len: usize) -> u64 {
     (len as u64).saturating_add(1).max(16).next_power_of_two()
 }
 
+/// The zkVM's private-table floor, `executor::MIN_PRIVATE_TABLE_LOG_HEIGHT` (2^7 rows): under genesis
+/// `hardening_v6` a call's program table is declared at `max(program_log_height(len), 7)`
+/// (`executor::hardened_program_log_height`, PROGRAM-TABLE-LEAK), so the rows the pc window has to
+/// hold are at least this many. Core cannot name the zkVM's constant (the dependency points the other
+/// way), so this is a mirror, like [`program_table_rows`]; `randprotocol-zkvm/src/executor.rs`'s
+/// tests pin it equal to the real one, so a re-vendor that moves the floor fails there rather than
+/// letting the window drift from the table a hardened proof builds.
+pub const MIN_PRIVATE_TABLE_LOG_HEIGHT: u8 = 7;
+
 /// ZKV-11 (pc-wrap, 2026-09-28): does every row of this program's *padded* program table sit below
-/// the u32 pc wrap — `base_pc + 4 · program_table_rows(len) ≤ 2^32`?
+/// the u32 pc wrap — `base_pc + 4 · max(program_table_rows(len), 2^MIN_PRIVATE_TABLE_LOG_HEIGHT) ≤ 2^32`?
 ///
 /// The circuit does its PC arithmetic in the field — the program table's PC chain, the cpu's
 /// fall-through `PC + 4`, the JAL/JALR link — while the emulator wraps mod 2^32, so a program whose
@@ -79,8 +88,19 @@ pub fn program_table_rows(len: usize) -> u64 {
 /// chain-15 program sits at `base_pc` 0). The verifier- and prover-side halves of the fix are the
 /// zkVM's (vendored, upstream); this predicate is what the node refuses such a deploy on — as its
 /// admission policy on every chain, and as a validity rule under genesis `hardening_v6` (the v0.6 switch).
+///
+/// **The rows measured are the floored table's** (PCW-FLOOR, the v0.6 rescan). Under `hardening_v6`
+/// every call declares its program table at no fewer than 2^7 rows, and the padding rows carry
+/// field PCs `last_pc + 4k` exactly as the unfloored ones do — so fib at `0xffffffc0`, whose 16-row
+/// table ends at 2^32, has a 128-row table that crosses it, and the rescan's reproduction showed
+/// its floored proof refused (`OodEvaluationMismatch`) while the window had admitted the deploy:
+/// the very condition the window exists to prevent. One window for both uses, the floored one:
+/// stricter than chain 15's unfloored calls strictly need, which costs the pool policy nothing
+/// (every chain-15 program sits at `base_pc` 0, and a start within 512 bytes of the wrap is no
+/// honest deployer's choice).
 pub fn pc_window_fits(base_pc: u32, len: usize) -> bool {
-    (base_pc as u64).saturating_add(program_table_rows(len).saturating_mul(4)) <= 1 << 32
+    let rows = program_table_rows(len).max(1 << MIN_PRIVATE_TABLE_LOG_HEIGHT);
+    (base_pc as u64).saturating_add(rows.saturating_mul(4)) <= 1 << 32
 }
 
 /// The refusal for a deploy [`pc_window_fits`] refuses, one text for the admission policy and the
@@ -242,5 +262,22 @@ mod tests {
         let ids: std::collections::BTreeSet<ProgramId> =
             (1..all.len()).map(|k| program_id_with_public(0, &all[..k], &all[k..])).collect();
         assert_eq!(ids.len(), all.len() - 1);
+    }
+
+    /// PCW-FLOOR (the v0.6 rescan): the window is taken over the program table a hardened call
+    /// declares — at least `2^MIN_PRIVATE_TABLE_LOG_HEIGHT` = 128 rows — not the 16 fib's 15 words
+    /// would pad to unfloored. At `0xffffffc0` the 16-row table ends exactly at 2^32 but the
+    /// 128-row one does not, and the rescan's reproduction showed its floored proof failing
+    /// (`OodEvaluationMismatch`); the highest start that fits is `2^32 − 4·128`. A program past
+    /// 127 words is unaffected: its own table is the taller one.
+    #[test]
+    fn the_window_measures_the_floored_program_table() {
+        assert!(!pc_window_fits(0xffff_ffc0, 15), "the rescan's reproduction: 128 rows cross the wrap");
+        assert!(pc_window_fits(0xffff_fe00, 15), "2^32 − 512: the 128 rows end exactly at 2^32");
+        assert!(!pc_window_fits(0xffff_fe04, 15), "one word higher does not fit");
+        assert!(pc_window_fits(0xffff_fe00, 127), "127 words still pad to 128 rows");
+        assert!(!pc_window_fits(0xffff_fe00, 128), "128 words pad to 256: the program's own table rules");
+        assert!(pc_window_fits(0xffff_fc00, 128));
+        assert!(pc_window_fits(0, 15), "every chain-15 program sits at base_pc 0");
     }
 }

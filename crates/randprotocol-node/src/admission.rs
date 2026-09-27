@@ -636,7 +636,8 @@ pub fn oversized_note(tx: &Transaction) -> Option<TxError> {
 /// function of the transaction's bytes against a constant (`BadProgram` is already in
 /// [`is_permanent`]'s allowlist, as ZH4's and every other deploy-shape refusal is), so a repeat
 /// costs a lookup. The row count is `program::program_table_rows`, core's mirror of the zkVM's
-/// `program_log_height`, pinned to it in `randprotocol-zkvm`'s executor tests.
+/// `program_log_height`, floored at `program::MIN_PRIVATE_TABLE_LOG_HEIGHT` (PCW-FLOOR: the
+/// table a hardened call declares), both pinned to the zkVM's own in its executor tests.
 pub fn deploy_outside_pc_window(tx: &Transaction) -> Option<TxError> {
     let randprotocol_core::Action::Deploy { base_pc, words, .. } = &tx.action else {
         return None;
@@ -1267,7 +1268,9 @@ mod tests {
     /// `check_program` bounds only `base_pc + 4·len`, so fib's 15 words at `0xffffffc4` (ending
     /// exactly at 2^32, padding to 16 rows) pass it on every chain. The door refuses it from its
     /// bytes, before the bucket, as the ledger's own `BadProgram` verdict — a byte verdict, cached
-    /// like `oversized_note`'s. The same program one word lower fits and goes on to verify.
+    /// like `oversized_note`'s. The window is the floored table's (PCW-FLOOR: a hardened call
+    /// declares 128 rows), so one word lower, `0xffffffc0`, is refused as well; `2^32 − 512` fits
+    /// and goes on to verify.
     #[test]
     fn a_deploy_whose_padded_program_table_wraps_the_pc_space_is_refused_at_the_door() {
         use crate::storage::fixtures;
@@ -1286,7 +1289,8 @@ mod tests {
             StubExecutor::bound(Transaction::shielded(l.chain_id(), b, action))
         };
         let wraps = deploy(0xffff_ffc4);
-        let fits = deploy(0xffff_ffc0);
+        let floored_wraps = deploy(0xffff_ffc0);
+        let fits = deploy(0xffff_fe00);
 
         let mut refused = RefusedCache::new(4);
         let limiter = PeerLimiter::new(16, 4.0);
@@ -1299,6 +1303,11 @@ mod tests {
         let verdict = TxError::BadProgram(randprotocol_core::program::pc_window_error());
         assert_eq!(refused.get(&wraps.hash()), Some(&verdict), "cached as the byte verdict it is");
         assert!(is_permanent(&verdict));
+        assert_eq!(
+            GossipOutcome::for_transaction(&floored_wraps, None, &mut refused, &limiter, 0, now),
+            GossipOutcome::Report(Acceptance::Reject),
+            "PCW-FLOOR: its 16 rows end at 2^32, the 128 a hardened call declares do not"
+        );
         assert_eq!(GossipOutcome::for_transaction(&fits, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
         assert_eq!(GossipOutcome::for_transaction(&deploy(0), None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
     }

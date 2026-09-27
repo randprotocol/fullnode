@@ -507,7 +507,9 @@ pins `cc30e085…` against the field. The rules, one subsection each:
 ### The program pc window (ZKV-11)
 
 A `Deploy` whose *padded* program table — `max(len + 1, 16)` rounded up to a power of two rows,
-four bytes a row — runs past the u32 pc wrap can never be proven (the circuit does PC arithmetic
+and never fewer than 128 (the table a hardened call declares, `2^MIN_PRIVATE_TABLE_LOG_HEIGHT`;
+PCW-FLOOR, the v0.6 rescan: measured unfloored, the window admitted fib at `0xffffffc0`, whose
+floored proof is refused), four bytes a row — runs past the u32 pc wrap can never be proven (the circuit does PC arithmetic
 in the field, the emulator wraps), yet ZH4's `check_program` bounds only `base_pc + 4·len`: fib's
 15 words at `0xffffffc4` deploy and are uncallable for ever. (It first shipped on `feat/v0.6` as
 its own `program_pc_window` flag; no genesis ever carried that, and it is folded in here.)
