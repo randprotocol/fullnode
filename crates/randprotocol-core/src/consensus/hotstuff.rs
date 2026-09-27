@@ -1,6 +1,6 @@
 use super::{
     Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, EpochSets, NewView, NotHeld, SafetyState,
-    SigningDomain, PROPOSAL_VIEW_WINDOW,
+    SigningDomain, NOT_HELD_VIEW_WINDOW, PROPOSAL_VIEW_WINDOW,
 };
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, Keypair};
@@ -107,10 +107,13 @@ pub struct HotStuff {
     /// views first.
     proposed: BTreeMap<(u64, Address), Hash>,
     /// Validators of the current set that have signed that they do not hold the locked block
-    /// (audit v4, CON-4), keyed by that block's hash. Kept for the locked block alone — the one
+    /// (audit v4, CON-4), keyed by that block's hash, each with the highest view it signed at
+    /// (scan 2026-09-27, CN-3: one entry per signer, so a signer counts once however many of its
+    /// words arrive; the stake counted is only that of entries still within
+    /// `NOT_HELD_VIEW_WINDOW` of this replica's view). Kept for the locked block alone — the one
     /// hash the evidence can act on — so it holds at most one entry; cleared when the block
     /// arrives, when the lock is released, and on commit.
-    not_held: HashMap<Hash, std::collections::BTreeSet<Address>>,
+    not_held: HashMap<Hash, BTreeMap<Address, u64>>,
     /// Blocks every fetch failed for — the hash `fallback_high_qc` moved away from. A QC on one
     /// of them is not raised again until the block itself arrives (`execute_and_insert` removes
     /// it; a commit clears the set): after a whole-fleet restart every replica's persisted high
@@ -636,18 +639,43 @@ impl HotStuff {
         }
     }
 
-    /// This replica's signed word that it does not hold `hash` (audit v4, CON-4), for the
-    /// node's answer to a by-hash fetch it cannot serve. `None` without a signer: an observer's
-    /// word carries no stake.
+    /// This replica's signed word, at its current view, that it does not hold `hash` (audit v4,
+    /// CON-4; the view since CN-3), for the node's answer to a by-hash fetch it cannot serve.
+    /// `None` without a signer — an observer's word carries no stake — and `None` while the block
+    /// sits in the tree or in the orphan pool: a replica holding it, parent or not, does not
+    /// attest otherwise (scan 2026-09-27, CN-3 — a lagging validator used to sign for a block it
+    /// kept as an orphan).
     pub fn not_held(&self, hash: &Hash) -> Option<NotHeld> {
-        self.signer.as_ref().map(|k| NotHeld::sign(k, &self.cfg.genesis_hash, hash))
+        if self.tree.contains_key(hash) || self.holds_orphan(hash) {
+            return None;
+        }
+        self.signer.as_ref().map(|k| NotHeld::sign(k, &self.cfg.genesis_hash, hash, self.view))
     }
 
-    /// The stake of the current set's validators that have attested not holding `hash`.
+    /// Whether `hash` is a block waiting in the orphan pool for its parent.
+    pub fn holds_orphan(&self, hash: &Hash) -> bool {
+        self.orphans.values().flatten().any(|(b, _)| b.hash() == *hash)
+    }
+
+    /// Whether a not-held signed at `view` is recent enough to count at this replica's view
+    /// (scan 2026-09-27, CN-3).
+    fn not_held_is_recent(&self, view: u64) -> bool {
+        view.saturating_add(NOT_HELD_VIEW_WINDOW) >= self.view
+    }
+
+    /// The stake of the current set's validators that have attested not holding `hash`, each
+    /// counted once and only while its word is recent ([`NOT_HELD_VIEW_WINDOW`]).
     pub fn not_held_stake(&self, hash: &Hash) -> u128 {
         self.not_held
             .get(hash)
-            .map(|signers| signers.iter().filter_map(|a| self.current.get(a)).map(|v| v.stake).sum())
+            .map(|signers| {
+                signers
+                    .iter()
+                    .filter(|(_, view)| self.not_held_is_recent(**view))
+                    .filter_map(|(a, _)| self.current.get(a))
+                    .map(|v| v.stake)
+                    .sum()
+            })
             .unwrap_or(0)
     }
 
@@ -661,6 +689,11 @@ impl HotStuff {
     /// lowered to the committed head's QC, which is safe for the same reason the old unsigned
     /// fallback was: nothing above the head is committed. Returns whether the lock was released
     /// by this attestation.
+    ///
+    /// Scan 2026-09-27, CN-3: an attestation counts only when its signer's view is above the
+    /// locked QC's — signed after the signer left the view the block was certified in, so not a
+    /// word harvested before the block had propagated — and within [`NOT_HELD_VIEW_WINDOW`] of
+    /// this replica's view. Anything else is refused before the signature is checked.
     pub fn record_not_held(&mut self, n: &NotHeld) -> bool {
         let locked = self.locked_qc.block_hash;
         // Evidence for any other hash is stale — the lock moved on — or never mattered.
@@ -668,11 +701,15 @@ impl HotStuff {
         if n.hash != locked || self.locked_qc.view <= self.head_qc.view || self.tree.contains_key(&locked) {
             return false;
         }
+        if n.view <= self.locked_qc.view || !self.not_held_is_recent(n.view) {
+            return false;
+        }
         let signer = n.signer.address();
         if !self.current.contains(&signer) || !n.verify(&self.cfg.genesis_hash) {
             return false;
         }
-        self.not_held.entry(locked).or_default().insert(signer);
+        let seen = self.not_held.entry(locked).or_default().entry(signer).or_insert(n.view);
+        *seen = (*seen).max(n.view);
         let stake = self.not_held_stake(&locked);
         if !self.current.has_quorum(stake) {
             return false;

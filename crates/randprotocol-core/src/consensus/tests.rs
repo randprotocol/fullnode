@@ -1279,7 +1279,7 @@ fn leader_falls_back_when_high_qc_block_is_unobtainable() {
             continue;
         }
         for j in (0..4).filter(|&j| j != i) {
-            let n = NotHeld::sign(&sim.keys[j], &sim.gs.hash(), &locked.block_hash);
+            let n = NotHeld::sign(&sim.keys[j], &sim.gs.hash(), &locked.block_hash, sim.nodes[i].view());
             sim.nodes[i].record_not_held(&n);
         }
         assert_eq!(sim.nodes[i].locked_qc().view, sim.nodes[i].committed_qc_view(), "released on more than a third");
@@ -2255,7 +2255,9 @@ fn not_held_releases_the_lock_only_on_a_quorum() {
     let h = sim.nodes[victim].locked_qc().block_hash;
     let g = sim.gs.hash();
     let others: Vec<usize> = (0..6).filter(|&i| i != victim).collect();
-    let sign = |i: usize| NotHeld::sign(&sim.keys[i], &g, &h);
+    let now = sim.nodes[victim].view();
+    assert!(now > sim.nodes[victim].locked_qc().view);
+    let sign = |i: usize| NotHeld::sign(&sim.keys[i], &g, &h, now);
     assert!(!sim.nodes[victim].record_not_held(&sign(others[0])));
     assert!(!sim.nodes[victim].record_not_held(&sign(others[1])));
     assert!(!sim.nodes[victim].record_not_held(&sign(others[2])), "three of six is not a quorum");
@@ -2269,20 +2271,101 @@ fn not_held_releases_the_lock_only_on_a_quorum() {
     assert_eq!(sim.nodes[victim].not_held_stake(&h), 0, "the evidence is cleared with the release");
 }
 
+/// CN-3 (medium): a not-held carried no freshness, so one signed before the lock formed — asked
+/// for a hash before its block had propagated anywhere — stayed good evidence for ever. A
+/// harvester asks every validator for `H` early, keeps the answers, and feeds them back once some
+/// replica is locked on `H` without holding it: a quorum of stale "I do not hold it" releases a
+/// lock no quorum attests *now*. The same deterministic run is replayed twice: once to learn the
+/// hash the victim ends up locked on, once to harvest every validator's word on it before the
+/// block exists.
+#[test]
+fn a_not_held_signed_before_the_lock_formed_does_not_release_it() {
+    let mut scout = setup(6, 6);
+    let victim = lock_on_unobtainable(&mut scout);
+    let h = scout.nodes[victim].locked_qc().block_hash;
+    let v = scout.nodes[victim].locked_qc().view;
+    drop(scout);
+    let mut sim = setup(6, 6);
+    // The harvest: every validator asked about `h` before anyone has it, each at its own view.
+    let harvested: Vec<NotHeld> = (0..6).filter(|&i| i != victim).map(|i| sim.nodes[i].not_held(&h).unwrap()).collect();
+    assert_eq!(lock_on_unobtainable(&mut sim), victim, "the replay is deterministic");
+    assert_eq!((sim.nodes[victim].locked_qc().block_hash, sim.nodes[victim].locked_qc().view), (h, v));
+    for n in &harvested {
+        assert!(!sim.nodes[victim].record_not_held(n), "an attestation older than the lock is no evidence about it");
+    }
+    assert_eq!(sim.nodes[victim].locked_qc().block_hash, h, "the harvested quorum did not release the lock");
+    assert_eq!(sim.nodes[victim].not_held_stake(&h), 0);
+    // At the lock's own view is not after it either: the signer may not yet have seen the block.
+    let g = sim.gs.hash();
+    let others: Vec<usize> = (0..6).filter(|&i| i != victim).collect();
+    for &i in &others {
+        assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&sim.keys[i], &g, &h, v)));
+    }
+    // Too old for this replica's view: a word from more than `NOT_HELD_VIEW_WINDOW` views ago is
+    // not kept as evidence, even one that postdates the lock.
+    let now = sim.nodes[victim].view();
+    if now > v + 1 + super::NOT_HELD_VIEW_WINDOW {
+        assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&sim.keys[others[0]], &g, &h, v + 1)));
+    }
+    // Fresh words — signed after the lock formed — still release it on a quorum (CON-4 intact),
+    // and a signer's second word counts once.
+    let fresh = |i: usize| NotHeld::sign(&sim.keys[i], &g, &h, now);
+    for &i in &others[..4] {
+        assert!(!sim.nodes[victim].record_not_held(&fresh(i)));
+    }
+    assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&sim.keys[others[0]], &g, &h, now + 1)), "a repeat signer counts once");
+    assert_eq!(sim.nodes[victim].not_held_stake(&h), 4 * MIN_STAKE as u128);
+    assert!(sim.nodes[victim].record_not_held(&fresh(others[4])), "five fresh of six release the lock");
+    assert_eq!(sim.nodes[victim].locked_qc().view, sim.nodes[victim].committed_qc_view());
+}
+
+/// CN-3: the window half. Evidence recorded while recent stops counting once this replica's
+/// view has moved more than `NOT_HELD_VIEW_WINDOW` past it, so words gathered long ago cannot be
+/// topped up into a quorum by later ones.
+#[test]
+fn a_not_held_ages_out_of_the_count() {
+    let mut sim = setup(6, 6);
+    let victim = lock_on_unobtainable(&mut sim);
+    let h = sim.nodes[victim].locked_qc().block_hash;
+    let v = sim.nodes[victim].locked_qc().view;
+    let g = sim.gs.hash();
+    let others: Vec<usize> = (0..6).filter(|&i| i != victim).collect();
+    let now = sim.nodes[victim].view();
+    for &i in &others[..4] {
+        assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&sim.keys[i], &g, &h, now)));
+    }
+    assert_eq!(sim.nodes[victim].not_held_stake(&h), 4 * MIN_STAKE as u128);
+    // Let the replica's view run past the window on timeouts, the lock held throughout.
+    while sim.nodes[victim].view() <= now + super::NOT_HELD_VIEW_WINDOW {
+        let view = sim.nodes[victim].view();
+        sim.nodes[victim].on_timeout(view);
+    }
+    assert_eq!(sim.nodes[victim].locked_qc().view, v);
+    assert_eq!(sim.nodes[victim].not_held_stake(&h), 0, "the old words aged out");
+    let later = sim.nodes[victim].view();
+    assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&sim.keys[others[4]], &g, &h, later)), "one fresh word is not a quorum");
+    assert_eq!(sim.nodes[victim].locked_qc().block_hash, h);
+}
+
 #[test]
 fn a_not_held_from_outside_the_current_set_or_for_another_chain_counts_nothing() {
     let mut sim = setup(4, 4);
     let victim = lock_on_unobtainable(&mut sim);
     let h = sim.nodes[victim].locked_qc().block_hash;
     let g = sim.gs.hash();
+    let now = sim.nodes[victim].view();
     let stranger = Keypair::from_seed([9; 32]).unwrap(); // a key in no set
-    assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&stranger, &g, &h)));
+    assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&stranger, &g, &h, now)));
     let other = (0..4).find(|&i| i != victim).unwrap();
-    assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&sim.keys[other], &Hash([7; 32]), &h)));
+    assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&sim.keys[other], &Hash([7; 32]), &h, now)));
     // A tampered attestation: a real signer's signature moved onto another hash.
-    let mut moved = NotHeld::sign(&sim.keys[other], &g, &Hash([8; 32]));
+    let mut moved = NotHeld::sign(&sim.keys[other], &g, &Hash([8; 32]), now);
     moved.hash = h;
     assert!(!sim.nodes[victim].record_not_held(&moved));
+    // And one moved onto a later view: the view is under the signature (CN-3).
+    let mut bumped = NotHeld::sign(&sim.keys[other], &g, &h, sim.nodes[victim].locked_qc().view);
+    bumped.view = now;
+    assert!(!sim.nodes[victim].record_not_held(&bumped));
     assert_eq!(sim.nodes[victim].not_held_stake(&h), 0);
     assert_eq!(sim.nodes[victim].locked_qc().block_hash, h);
 }
@@ -2729,6 +2812,23 @@ fn a_full_orphan_pool_gives_way_to_a_lower_height() {
     assert_eq!(z.orphans_held().0, cfg.max_orphans);
     assert!(sw1_honest_orphan_survives(&mut z, &b1, &b2), "a full orphan pool refused the honest out-of-order block");
     assert!(z.orphans_held().0 <= cfg.max_orphans);
+}
+
+/// CN-3: a validator holding a block only as an orphan — it has not seen the parent yet — used
+/// to sign that it did not hold it, handing a harvester a word it would later count. It now
+/// signs nothing for a block in its tree or its orphan pool, and still signs for one it lacks.
+#[test]
+fn a_validator_does_not_attest_not_holding_a_block_it_keeps_as_an_orphan() {
+    let (cfg, gs, key, b1, b2) = sw1_parts();
+    let mut z = HotStuff::new(cfg.clone(), Some(key), gs.block.clone(), gs.ledger.clone(), std::sync::Arc::new(StubExecutor));
+    z.start();
+    assert!(z.not_held(&b2.hash()).is_some(), "baseline: a block it lacks is attested");
+    assert!(matches!(z.on_proposal(b2.clone(), 0), Err(ConsensusError::UnknownParent(_))));
+    assert!(z.holds_orphan(&b2.hash()));
+    assert_eq!(z.not_held(&b2.hash()), None, "an orphan is held");
+    let _ = z.on_proposal(b1.clone(), 0);
+    assert!(z.has_block(&b1.hash()));
+    assert_eq!(z.not_held(&b1.hash()), None, "a block in the tree is held");
 }
 
 /// The orphan pool is bounded by bytes, not only by count: sixteen 1 MiB orphans against a

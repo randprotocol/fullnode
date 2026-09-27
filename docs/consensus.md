@@ -66,16 +66,25 @@ changes close that, and v0.5.5 (audit v5) tightens both:
   block that never arrived). The v0.5.4 key is read once more by the first v0.5.5 startup on
   such a database, folded into the pending set, and retired (`Storage::clear_locked_block`).
 - **Release only on a signed not-held quorum.** A validator asked `BlockByHash(h)` for a block it
-  holds neither in its tree nor in its committed chain answers `SyncResponse::NotHeld` — a
-  Dilithium2 signature over `rand-not-held-1 ‖ genesis_hash ‖ h`, bound to one chain and one
-  block; an observer answers `Block(None)` as before, its word carrying no stake. The asker
+  holds neither in its tree, nor in its orphan pool, nor in its committed chain answers
+  `SyncResponse::NotHeld` — a Dilithium2 signature over `rand-not-held-2 ‖ genesis_hash ‖ h ‖
+  view` (its own current view, big-endian), bound to one chain, one block and one moment; an
+  observer answers `Block(None)` as before, its word carrying no stake. The asker
   verifies the signer against its *current* validator set (a member of an earlier epoch's set
   counts nothing), records the signer's stake against the hash, and lowers the lock only once the
   signers hold **a quorum — strictly more than two thirds of the set's stake**
   (`ValidatorSet::has_quorum`, since v0.5.5; v0.5.4 released on more than a third, which is not
   sound: a third is exactly what the Byzantine validators may hold, so nobody honest need be
-  among them). Timeouts and `Block(None)` still count as fetch attempts, bounding the fetch
-  loop, but never as evidence. `high_qc` keeps the old fallback: it is liveness state, not a
+  among them). **An attestation counts only when it is fresh** (scan 2026-09-27, CN-3): its view
+  must be above the locked QC's — signed after the signer had left the view the block was
+  certified in, so not a word harvested before the block propagated, when nobody honest held it
+  yet — and within `NOT_HELD_VIEW_WINDOW` (256) views of the asker's own; a recorded word that
+  ages out of that window stops counting. `rand-not-held-1` signed the genesis and the hash
+  alone, so a word asked for early stayed valid for ever and a harvester holding a quorum of
+  them could release a later lock on that block. Each signer counts once (its highest view is
+  kept); a validator re-serves its signed answer to repeated requests only within the view it
+  signed at (`NotHeldCache`), and signs afresh once its view moves. Timeouts and `Block(None)`
+  still count as fetch attempts, bounding the fetch loop, but never as evidence. `high_qc` keeps the old fallback: it is liveness state, not a
   promise. Evidence is kept for the locked block alone and cleared when the block arrives, when
   the lock is released, and on commit.
 
@@ -114,6 +123,11 @@ Regression tests: `eight_unsigned_not_found_replies_no_longer_release_the_lock` 
 v0.5.3: the first fallback lowered the lock), `not_held_releases_the_lock_only_on_a_quorum`
 (fails on v0.5.4: three of six released),
 `a_not_held_from_outside_the_current_set_or_for_another_chain_counts_nothing`,
+`a_not_held_signed_before_the_lock_formed_does_not_release_it` (fails on v0.5.8: five harvested
+words released the lock), `a_not_held_ages_out_of_the_count`,
+`a_validator_does_not_attest_not_holding_a_block_it_keeps_as_an_orphan`, the node's
+`a_kept_not_held_is_re_signed_once_the_view_moves` and the wire's
+`a_not_held_decodes_across_the_roll_and_counts_on_neither_side`,
 `a_restart_keeps_the_blocks_a_qc_certified` (fails on v0.5.4: the restart drops the block the
 persisted high QC names), `a_stale_pending_set_is_dropped`,
 `a_resumed_validator_finds_its_locked_block_without_a_fetch`; `leader_falls_back_when_high_qc_block_is_unobtainable`

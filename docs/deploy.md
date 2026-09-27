@@ -93,6 +93,23 @@ v0.5.5 every certified block above the head is persisted too (`META_PENDING_BLOC
 CF_META key an old build never reads) and restored at startup, so a whole-fleet restart no longer
 leaves every validator's high QC naming a block nobody holds — the 2026-09-24 stall.
 
+**Roll note for the not-held freshness fix (scan 2026-09-27, CN-3): one at a time, not
+all-stop.** A `NotHeld` now signs `rand-not-held-2 ‖ genesis ‖ hash ‖ view` and carries the
+signer's view as a field appended last; the asker counts it only when its view is above the
+locked QC's and within 256 views of its own (`docs/consensus.md`, "The lock"). The sync wire is
+CBOR with named fields, so nothing fails to decode in a mixed fleet (pinned by
+`network::wire`'s `a_not_held_decodes_across_the_roll_and_counts_on_neither_side`): an old node
+skips the unknown `view` field and its `rand-not-held-1` check refuses the signature — counted
+nothing, next peer asked, exactly as for `Block(None)`, no penalty; a new node reads an old
+answer with `view` 0, which the new tag refuses and every lock is above — counted nothing too.
+Votes, proposals, NewViews, blocks and every validity rule are unchanged, so the chain keeps
+committing through any mix and there is no fork window — which is why the roll is the usual
+one node at a time waited to `rand_getHealth: ok` rather than v0.5.6's all-stop. The cost is
+the v0.5.4 D15 corner only: while the fleet is mixed, a lock on a block nobody holds can be
+released only by the new build's words from more than two thirds of the stake (13 of the 18
+equal stakes), so keep the roll short and do not leave the fleet mixed. Rollback is the re-pin of
+the previous binary (no storage change).
+
 **Roll note for v0.5.5's storage layout (audit v5 OPS-4).** A committed block's certificate is
 stored once: it lives in its child's `justify`, and `CF_QCS` keeps only genesis' row and the
 head's. The first open on v0.5.5 deletes the row v0.5.4 wrote for every other height (~250 000

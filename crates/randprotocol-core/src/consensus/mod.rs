@@ -57,36 +57,60 @@ impl NewView {
     }
 }
 
+/// A not-held counts toward releasing a lock only while its view is within this many views of
+/// the asking replica's own (scan 2026-09-27, CN-3): old truthful words about a block are not
+/// kept as evidence for ever. Generous against the stall it serves — a release round in the
+/// 2026-09-24 ghost-lock state spans a few leader turns while views advance on timeouts — and
+/// a bound on replay all the same.
+pub const NOT_HELD_VIEW_WINDOW: u64 = 256;
+
 /// A validator's signed word that it holds no block of a hash it was asked for (audit v4,
-/// CON-4): the evidence a lock is released on. Over `rand-not-held-1 ‖ genesis ‖ hash`, so an
-/// attestation is bound to one chain and one block; the asker verifies it against its current
-/// validator set and counts the signer's stake, and lowers its lock only once the signers hold
-/// a quorum — strictly more than two thirds of the set's stake (audit v5; v0.5.4 released on a
-/// third, which a Byzantine minority can supply alone) — so honest validators holding a third
-/// of the stake are among them. Timeouts and unsigned `Block(None)` answers are fetch attempts,
-/// never evidence.
+/// CON-4): the evidence a lock is released on. Over `rand-not-held-2 ‖ genesis ‖ hash ‖ view`
+/// (big-endian, as a vote's), where `view` is the signer's own view when it answered, so an
+/// attestation is bound to one chain, one block and one moment; the asker verifies it against
+/// its current validator set, counts the signer's stake only when the word postdates its lock
+/// (`view` above the locked QC's) and is recent (within [`NOT_HELD_VIEW_WINDOW`] of its own
+/// view), and lowers its lock only once the signers hold a quorum — strictly more than two
+/// thirds of the set's stake (audit v5; v0.5.4 released on a third, which a Byzantine minority
+/// can supply alone) — so honest validators holding a third of the stake are among them.
+/// Timeouts and unsigned `Block(None)` answers are fetch attempts, never evidence.
+///
+/// Scan 2026-09-27, CN-3: `rand-not-held-1` signed the genesis and the hash alone, so a word
+/// asked for before the block had propagated — when nobody honest held it yet — stayed valid
+/// for ever, and a harvester could replay a quorum of them against a later lock on that block.
+/// A signer's view above the locked QC's means it had left the view the block was certified
+/// in, after the certificate could form, and still did not hold it.
+///
+/// `view` is appended last and defaults on decode: the sync wire is CBOR (a map of named
+/// fields), so a v0.5.8 peer's `rand-not-held-1` answer decodes here with `view` 0 — at or
+/// under every lock, and under the old tag, so it counts nothing — and a v0.5.8 node ignores
+/// the unknown field in ours and fails the old tag's signature check. See
+/// `network::wire`'s decode test and `docs/deploy.md`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotHeld {
     pub hash: Hash,
     pub signer: PublicKey,
     pub signature: Signature,
+    #[serde(default)]
+    pub view: u64,
 }
 
 impl NotHeld {
-    fn message(genesis: &Hash, hash: &Hash) -> Vec<u8> {
-        let mut m = Vec::with_capacity(64);
+    fn message(genesis: &Hash, hash: &Hash, view: u64) -> Vec<u8> {
+        let mut m = Vec::with_capacity(72);
         m.extend_from_slice(genesis.as_bytes());
         m.extend_from_slice(hash.as_bytes());
-        Hash::digest_domain(b"rand-not-held-1", &m).0.to_vec()
+        m.extend_from_slice(&view.to_be_bytes());
+        Hash::digest_domain(b"rand-not-held-2", &m).0.to_vec()
     }
 
-    pub fn sign(key: &Keypair, genesis: &Hash, hash: &Hash) -> NotHeld {
-        let signature = key.sign(&Self::message(genesis, hash));
-        NotHeld { hash: *hash, signer: key.public_key().clone(), signature }
+    pub fn sign(key: &Keypair, genesis: &Hash, hash: &Hash, view: u64) -> NotHeld {
+        let signature = key.sign(&Self::message(genesis, hash, view));
+        NotHeld { hash: *hash, signer: key.public_key().clone(), signature, view }
     }
 
     pub fn verify(&self, genesis: &Hash) -> bool {
-        self.signer.verify(&Self::message(genesis, &self.hash), &self.signature)
+        self.signer.verify(&Self::message(genesis, &self.hash, self.view), &self.signature)
     }
 }
 

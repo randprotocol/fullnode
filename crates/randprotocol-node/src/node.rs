@@ -218,15 +218,18 @@ pub fn resume_consensus(
 
 /// The answer to a by-hash fetch: the block from the tree or the committed chain; failing that,
 /// a validator's signed not-held (audit v4, CON-4) so the asker can count its stake toward
-/// releasing a lock, and an observer's `Block(None)` — its word carries no stake. The signed
-/// answer comes from `signed` when this hash was answered before (SW-2): a not-held is over the
-/// genesis and the hash alone, so a kept one is as good as a fresh one, and a repeated request
-/// no longer buys a Dilithium2 signature. The block lookup runs first on every request, so a
-/// block that arrives after its not-held was kept is served, never denied.
+/// releasing a lock, and an observer's `Block(None)` — its word carries no stake. A block kept
+/// only as an orphan is held, not attested unheld (scan 2026-09-27, CN-3): `Block(None)`. The
+/// signed answer comes from `signed` when this hash was answered before in the current view
+/// (SW-2): a not-held is over the genesis, the hash and the signer's view (CN-3), so a kept one
+/// is as good as a fresh one until the view moves, and a repeated request no longer buys a
+/// Dilithium2 signature — at most one per hash and view. The block lookup runs first on every
+/// request, so a block that arrives after its not-held was kept is served, never denied.
 fn block_by_hash_response(hs: &HotStuff, storage: &Storage, h: &Hash, signed: &mut NotHeldCache) -> SyncResponse {
     match hs.block(h).cloned().or_else(|| storage.block_by_hash(h).ok().flatten()) {
         Some(b) => SyncResponse::Block(Some(b)),
-        None => match signed.get_or_sign(h, || hs.not_held(h)) {
+        None if hs.holds_orphan(h) => SyncResponse::Block(None),
+        None => match signed.get_or_sign(h, hs.view(), || hs.not_held(h)) {
             Some(n) => SyncResponse::NotHeld(n),
             None => SyncResponse::Block(None),
         },
@@ -239,6 +242,7 @@ fn block_by_hash_response(hs: &HotStuff, storage: &Storage, h: &Hash, signed: &m
 pub const NOT_HELD_CACHE: usize = 256;
 
 /// This validator's signed not-held answers by hash, oldest evicted first ([`NOT_HELD_CACHE`]).
+/// Each carries the view it was signed at (CN-3) and is re-served only in that view.
 #[derive(Default)]
 struct NotHeldCache {
     by_hash: HashMap<Hash, NotHeld>,
@@ -246,13 +250,20 @@ struct NotHeldCache {
 }
 
 impl NotHeldCache {
-    /// The kept answer for `h`, or `sign()`'s, kept when there is one (an observer's `None` is
-    /// not).
-    fn get_or_sign(&mut self, h: &Hash, sign: impl FnOnce() -> Option<NotHeld>) -> Option<NotHeld> {
+    /// The kept answer for `h` when it was signed at `view`, else `sign()`'s — replacing a kept
+    /// one from an earlier view, so an asker is never handed a stale word as the current one —
+    /// kept when there is one (an observer's `None` is not).
+    fn get_or_sign(&mut self, h: &Hash, view: u64, sign: impl FnOnce() -> Option<NotHeld>) -> Option<NotHeld> {
         if let Some(n) = self.by_hash.get(h) {
-            return Some(n.clone());
+            if n.view == view {
+                return Some(n.clone());
+            }
         }
         let n = sign()?;
+        if let Some(kept) = self.by_hash.get_mut(h) {
+            *kept = n.clone();
+            return Some(n);
+        }
         if self.order.len() >= NOT_HELD_CACHE {
             if let Some(old) = self.order.pop_front() {
                 self.by_hash.remove(&old);
@@ -3872,11 +3883,12 @@ mod tests {
         let unknown = Hash::digest(b"nobody has this");
         let mut cache = NotHeldCache::default();
         let mut signs = 0;
-        let first = cache.get_or_sign(&unknown, || {
+        let view = validator.view();
+        let first = cache.get_or_sign(&unknown, view, || {
             signs += 1;
             validator.not_held(&unknown)
         });
-        let again = cache.get_or_sign(&unknown, || {
+        let again = cache.get_or_sign(&unknown, view, || {
             signs += 1;
             validator.not_held(&unknown)
         });
@@ -3893,22 +3905,53 @@ mod tests {
         }
         // An observer's `None` is not kept.
         let mut none = NotHeldCache::default();
-        assert_eq!(none.get_or_sign(&unknown, || None), None);
+        assert_eq!(none.get_or_sign(&unknown, view, || None), None);
         assert_eq!(none.len(), 0);
         // Bounded, oldest first.
         let mut bounded = NotHeldCache::default();
         for i in 0..NOT_HELD_CACHE as u64 + 10 {
             let h = Hash::digest(&i.to_le_bytes());
-            bounded.get_or_sign(&h, || validator.not_held(&h));
+            bounded.get_or_sign(&h, view, || validator.not_held(&h));
         }
         assert_eq!(bounded.len(), NOT_HELD_CACHE);
         let oldest = Hash::digest(&0u64.to_le_bytes());
         let mut resigned = false;
-        bounded.get_or_sign(&oldest, || {
+        bounded.get_or_sign(&oldest, view, || {
             resigned = true;
             validator.not_held(&oldest)
         });
         assert!(resigned, "the oldest entry was evicted");
+    }
+
+    /// CN-3 (scan 2026-09-27, medium), the serving half: a not-held now carries the signer's
+    /// view, and an asker counts only a recent one that postdates its lock. A kept answer from an
+    /// earlier view is therefore not re-served as the current word: once the view moves the next
+    /// request is signed afresh at the new view, replacing the kept one (the cache does not grow),
+    /// and repeats within that view are served from the cache again.
+    #[test]
+    fn a_kept_not_held_is_re_signed_once_the_view_moves() {
+        let (_d, storage, gs, _ledger) = chain_past_a_boundary();
+        let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
+        let mut validator =
+            resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), executor).unwrap();
+        let unknown = Hash::digest(b"nobody has this");
+        let mut signed = NotHeldCache::default();
+        let at = |r: SyncResponse| match r {
+            SyncResponse::NotHeld(n) => n,
+            other => panic!("a validator answers a signed not-held: {other:?}"),
+        };
+        let v0 = validator.view();
+        let first = at(block_by_hash_response(&validator, &storage, &unknown, &mut signed));
+        assert_eq!(first.view, v0, "signed at the validator's own view");
+        assert!(first.verify(&gs.hash()));
+        validator.on_timeout(v0);
+        assert!(validator.view() > v0);
+        let moved = at(block_by_hash_response(&validator, &storage, &unknown, &mut signed));
+        assert_eq!(moved.view, validator.view(), "the stale word is not served once the view moved");
+        assert!(moved.verify(&gs.hash()));
+        assert_eq!(signed.len(), 1, "replaced in place");
+        let again = at(block_by_hash_response(&validator, &storage, &unknown, &mut signed));
+        assert_eq!(again, moved, "within one view the kept answer is served");
     }
 
     /// SW-2, the metering half: a ~30-byte `Blocks` request makes this node read and assemble up
