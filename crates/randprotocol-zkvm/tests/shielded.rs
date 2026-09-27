@@ -249,3 +249,37 @@ fn seal_note_as_follows_the_format_and_keeps_the_memo() {
     assert!(seal_note_as(EnvelopeFormat::Legacy, &a, &to, &note, &key, "x").unwrap_err().contains("no memo"));
     assert!(seal_note_as(EnvelopeFormat::Memo, &a, &to, &note, &key, &"x".repeat(511)).unwrap_err().contains("at most 510"));
 }
+
+/// Task 9 (spec 2026-09-26 §2.3): the `memos` vectors in `address-sharing.json`, run through
+/// `randprotocol_zkvm::viewing`'s own `memo_field`/`memo_text` — the pure bit-packing the note
+/// layer's sealing rides on, with no encryption involved. The vectors this crate cannot host
+/// itself (core cannot depend on zkvm) live in `randprotocol-core`'s vectors file and are read
+/// here through the same `include_str!` every other consumer of that file uses.
+///
+/// An entry carrying `"text"` round-trips both ways: `memo_field(text)` reproduces the vector's
+/// `field` bytes, and `memo_text` on those bytes reproduces `opens_as` (`null` for the empty
+/// memo — `len == 0` is "no memo", spec §2.3). An entry with no `"text"` is one of the three
+/// malformed fields (a length past `MEMO_TEXT_MAX_BYTES`, invalid UTF-8 inside the declared
+/// length, and non-zero padding after it): only its `field` is checked against `opens_as`, which
+/// is `null` in every case — a malformed memo opens as no memo, never as an error.
+#[test]
+fn memos_match_the_vectors() {
+    use randprotocol_zkvm::viewing::{memo_field, memo_text, MEMO_FIELD_BYTES};
+
+    let vectors: serde_json::Value = serde_json::from_str(include_str!("../../randprotocol-core/tests/vectors/address-sharing.json")).unwrap();
+    let memos = vectors["memos"].as_array().unwrap();
+    assert_eq!(memos.len(), 6, "empty, \"Invoice #42\", the 510-byte é×255, and three malformed fields");
+
+    for v in memos {
+        let field_bytes = hex::decode(v["field"].as_str().unwrap()).unwrap();
+        assert_eq!(field_bytes.len(), MEMO_FIELD_BYTES);
+        let mut field = [0u8; MEMO_FIELD_BYTES];
+        field.copy_from_slice(&field_bytes);
+
+        if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+            assert_eq!(memo_field(text), Some(field), "memo_field({text:?}) matches the vector's field");
+        }
+
+        assert_eq!(memo_text(&field).as_deref(), v["opens_as"].as_str(), "field {}", v["field"]);
+    }
+}

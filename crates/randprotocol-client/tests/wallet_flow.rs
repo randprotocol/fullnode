@@ -297,6 +297,81 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     handle.shutdown().await;
 }
 
+/// Task 9 (spec 2026-09-26 §2.3, §2.4): the memo round trip against a real node. Genesis carries
+/// `envelope_bytes: Some(1860)`, so every note-creating envelope in the committed bundle is
+/// exactly that long; a real bundle proof still passes because the memo lives outside the proof
+/// (`viewing.rs`'s sealed body, not the note or the commitment). The memo is readable by exactly
+/// the parties spec §2.3 names: the payee's own scan, the sender's own history row, and anyone
+/// handed that output's per-transaction key (`rand_checkTransaction`, `rand tx-key`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_memo_is_read_by_the_payee_the_sender_and_a_disclosed_tx_key() {
+    init_tracing();
+    let dir = tempfile::tempdir().unwrap();
+    let key = Keypair::from_seed([103; 32]).unwrap();
+    let mut g = genesis(&key);
+    g.envelope_bytes = Some(1860);
+    let handle = start_with(&dir, &key, g).await;
+    let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
+
+    let a = Wallet::from_spend_key(SpendKey([7; 8]));
+    let b = Wallet::from_spend_key(SpendKey([8; 8]));
+    let mut a_store = NoteStore::default();
+    let mut b_store = NoteStore::default();
+
+    // ---- mint: A gets 10 RAND to send from ----
+    let mint = 10 * UNITS_PER_RAND;
+    let hash = rpc.mint_shielded(&a.address.to_string(), Some(mint)).await.expect("mint accepted");
+    rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
+    wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
+
+    // ---- send: A pays B 1 RAND with a memo, proving a real bundle under the proving slot ----
+    let fee = gas::BUNDLE_BASE;
+    let pay = UNITS_PER_RAND;
+    let memo = "round trip";
+    let slot = proving_slot().await;
+    let sent = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, memo, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        .await
+        .expect("the memo bundle is accepted and commits");
+    drop(slot);
+    eprintln!("memo bundle: tier {}, proved in {:.1?}, {} proof bytes", sent.tier, sent.proving, sent.proof_bytes);
+
+    // ---- the payee's scan shows the memo ----
+    wallet::scan(&rpc, &b, &mut b_store).await.unwrap();
+    assert_eq!(b_store.spendable().len(), 1);
+    assert_eq!(b_store.notes[0].memo.as_deref(), Some(memo), "the payee's note carries the memo");
+
+    // ---- the sender's own history row shows it too ----
+    wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
+    let row = a_store.sent.iter().find(|s| s.amount == pay).expect("the payment is in A's own history");
+    assert_eq!(row.memo.as_deref(), Some(memo), "A's history names the memo it sent");
+
+    // ---- a disclosed tx key, from the chain alone, shows it a third time ----
+    let tx = rpc.raw_transaction(&sent.hash).await.unwrap().expect("the transaction is committed");
+    let rows = wallet::output_keys(&a, &tx);
+    let payment = rows
+        .iter()
+        .find(|r| r.role == wallet::KeyRole::Sent && r.note.amount == pay)
+        .expect("A's own output key for the payment slot");
+    assert_eq!(payment.memo.as_deref(), Some(memo));
+    let disclosed = rpc
+        .check_transaction(&sent.hash, &hex::encode(payment.key.0))
+        .await
+        .unwrap()
+        .expect("rand_checkTransaction knows this committed transaction");
+    let d = disclosed["disclosed"].as_array().expect("a disclosed array");
+    let cm_hex = word8_to_hex(&payment.cm);
+    let out = d.iter().find(|o| o["cm"] == serde_json::json!(cm_hex)).expect("the payment output is among the disclosed ones");
+    assert_eq!(out["note"]["memo"], serde_json::json!(memo), "rand_checkTransaction discloses the same memo");
+
+    // ---- every envelope in the committed bundle is exactly 1860 bytes (spec §2.4) ----
+    let bundle = tx.bundle.as_ref().expect("a plain transfer has a bundle");
+    for e in &bundle.envelopes {
+        assert_eq!(e.len(), 1860, "envelope_bytes: Some(1860) is enforced on every slot, memo or not");
+    }
+
+    handle.shutdown().await;
+}
+
 /// A program deployed with a public input (spec §5, §6), end to end on a test-profile chain whose
 /// genesis admits 64 public words: `--public` on deploy, a call proved over the public input the
 /// wallet fetched back, a receipt carrying `h_pub`, and a call proved against any other public

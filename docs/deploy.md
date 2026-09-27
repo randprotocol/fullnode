@@ -350,6 +350,26 @@ guardian brought up with an empty store sets its source cursors past chain 14's 
 (`start_block` for EVM/Tron sources, `start_sequence` for Solana) before it starts, never the
 configuration's deployment block.
 
+## The next cut: genesis fields address sharing and the encrypted memo introduces
+
+Spec `docs/superpowers/specs/2026-09-26-address-sharing-and-memo-design.md` §2.3–§2.4.
+
+- **`"envelope_bytes": 1860`** — every note-creating envelope (`Bundle.envelopes[..]`, `Mint`,
+  `Withdraw`, `BridgeAttest`, `Aggregate`, `TokenMint`, `RegisterToken`'s initial mint, and a
+  genesis alloc note) must be exactly 1860 bytes, which is what lets every one of them carry the
+  fixed 512-byte encrypted memo field. Absent (chain 14 and every earlier chain) is today's rule
+  byte-for-byte: an envelope at most `MAX_ENVELOPE_BYTES` (2048), no uniform size, and a memo
+  refused before proving rather than silently dropped. `1860` is the only value `validate` accepts
+  today — a future layout is a new value. Set with `rand-node genesis --envelope-bytes 1860`; the
+  field is hash-bound last, and a genesis alloc note whose own envelope is not exactly 1860 bytes
+  fails `Genesis::build` (`GenesisError::AllocEnvelopeSize`) rather than silently mismatching it.
+- **Ship the apps and the website first, the genesis after.** A wallet built before this change
+  cannot open a 652-byte sealed body (its `Note::from_bytes` sees 624 bytes and fails); a wallet
+  built after opens both the legacy 112-byte body and the memo-carrying 624-byte one. So the cut
+  order (spec §5) is: `randprotocol.org` and the wallet apps release the new core first, and only
+  then does a genesis with `envelope_bytes: 1860` go live — never the other way, or a deployed
+  wallet meets a form it cannot open at all.
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and

@@ -286,10 +286,10 @@ Result:
 { "scanned_index": 10041, "next_index": 10041, "complete": true,
   "notes": [
     { "index": 40, "cm": "2a9f…07", "height": 37, "role": "received",
-      "note": { "pk": "…", "from": "…", "amount": "1500000000", "asset": 0, "time": 5 },
+      "note": { "pk": "…", "from": "…", "amount": "1500000000", "asset": 0, "time": 5, "memo": "coffee" },
       "nullifier": "8c04…d1", "spent": false },
     { "index": 43, "cm": "b310…88", "height": 39, "role": "sent",
-      "note": { "pk": "…", "from": "…", "amount": "25000000", "asset": 0, "time": 9 },
+      "note": { "pk": "…", "from": "…", "amount": "25000000", "asset": 0, "time": 9, "memo": null },
       "nullifier": null, "spent": null }
   ] }
 ```
@@ -306,7 +306,10 @@ a public address is not proof of ownership) and `"sent"` for a note the key crea
 else, opened through the outgoing viewing key. A `received` row carries the note's `nullifier`
 (a function of the viewing key) and whether the chain has published it — refreshed on every call;
 a `sent` row has neither, because the note is not the key's to nullify. Amounts are strings, as
-everywhere chain state is served.
+everywhere chain state is served. The note's `memo` is the sender's encrypted memo (spec
+2026-09-26 §2.3) if it opened one — `null` for no memo, a chain whose genesis carries no
+`envelope_bytes`, or an envelope this key opened but whose memo field was malformed (a malformed
+memo never costs the payee the note itself, just the text).
 
 Errors: `-32602` for a malformed key or page bound, `-32001` for a key this node has not
 imported.
@@ -330,17 +333,24 @@ input, `null` for an id no program has. A wallet proving a call passes these wor
 the proof commits to them and the ledger checks that commitment against `public_digest`.
 
 ### `rand_getLimits`
-Params: `[]`. Result: the chain's five call limits, from its genesis:
+Params: `[]`. Result: the chain's six call limits, from its genesis:
 
 ```json
 { "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
-  "max_call_envelope_bytes": 18432, "max_program_public_words": 0 }
+  "max_call_envelope_bytes": 18432, "max_program_public_words": 0, "envelope_bytes": null }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
 from these instead of hard-coding them: the most words a program may have, the largest proof, the
 largest transaction (a block's worth), the largest call-input envelope, and the most public words a
 deploy may carry.
+
+`envelope_bytes` is `null` on every genesis without the field (every existing chain), meaning no
+uniform size is enforced and a wallet seals the legacy 1 348-byte note envelope with no memo. Set
+to `1860` (spec 2026-09-26 §2.4), it means every note-creating envelope on this chain must be
+exactly that long — a wallet seals the memo-carrying format instead, and a memo becomes readable
+by the payee, the sender's own history, and anyone handed that output's per-transaction key.
+There is no other value yet: `validate` accepts only `1860` once the field is present.
 
 ### `rand_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
@@ -536,7 +546,7 @@ it:
 { "tx": "4f2c…e7", "height": 192,
   "disclosed": [
     { "output": "bundle:0", "cm": "2a9f…07", "index": 40,
-      "note": { "pk": "…", "from": "…", "amount": "1500000000", "asset": 0, "time": 5 } }
+      "note": { "pk": "…", "from": "…", "amount": "1500000000", "asset": 0, "time": 5, "memo": "invoice 7" } }
   ] }
 ```
 
@@ -557,6 +567,11 @@ keys dropped at once, so no `TxKey` for them can exist. A mint's is sealed the s
 recipient recovers the key through the envelope's KEM half (`rand tx-key`), so a mint is tried. A
 token mint's and an initial mint's envelopes are sealed by the minter, and open against the
 commitment the chain computed for that note.
+
+The disclosed `note`'s `memo` is the sender's memo (spec 2026-09-26 §2.3) if this envelope
+carried one — `null` for no memo, a chain whose genesis carries no `envelope_bytes`, or a memo
+field that opened malformed. It is readable here for exactly the same reason the note itself is:
+the key that opens one opens the other, from the same AEAD body.
 
 The call is **stateless**: the key is used for this one request and dropped — it is not imported,
 stored, or learnable from anything the node keeps (unlike `rand_importViewingKey`, which
@@ -1295,6 +1310,26 @@ What changed for clients, in one place. Newest first.
   `BelowReplayFloor` — a permanent verdict (`rand_getTransactionStatus` reads `rejected`). Nothing
   changes on a chain whose genesis has no floor (`docs/bridge.md` §23).
 
+### 2026-09-26 — address sharing and the encrypted memo: `envelope_bytes`, `memo` in disclosed notes
+
+Spec `docs/superpowers/specs/2026-09-26-address-sharing-and-memo-design.md` §2.3–§2.4. Genesis-gated,
+node-only otherwise; a chain without the field is unaffected.
+
+- **`rand_getLimits`** gains a sixth field, `envelope_bytes`: `null` on every genesis without it
+  (every chain up to and including 14 — today's legacy 1 348-byte envelope, no memo), or `1860`
+  when the genesis sets it, meaning every note-creating envelope (`Bundle.envelopes`, `Mint`,
+  `Withdraw`, `BridgeAttest`, `Aggregate`, `TokenMint`, `RegisterToken`'s initial mint) must be
+  exactly that long, memo field included whether or not it carries text.
+- **`rand_checkTransaction`** and **`rand_getViewingNotes`**'s disclosed `note` objects gain
+  `memo`: `null` for no memo, a chain without `envelope_bytes`, or a memo field that opened
+  malformed; otherwise the sender's UTF-8 text (at most 510 bytes), readable by whoever can
+  already open that note — the payee, the sender's own history, or anyone handed the output's
+  per-transaction key.
+- A malformed envelope's memo field never costs the payee the note itself: only the memo is
+  lost, not the payment.
+- A non-conforming envelope size (present `envelope_bytes`, wrong length) is refused
+  `TxError::EnvelopeSize { expected, got }`, a permanent verdict.
+
 ### 2026-09-25 — history pruning: `--prune-history`, `rand_status.prune_floor`, error `-32010`
 
 A node started with `--prune-history 24h` keeps the ledger and only the last day of blocks.
@@ -1563,7 +1598,8 @@ For the chain cut that sets the call-limit genesis fields (`max_proof_bytes`, `m
 `max_call_envelope_bytes`, `max_program_public_words`). A default chain's answers are unchanged,
 apart from the new fields. Changes:
 
-- **`rand_getLimits`**, new: the chain's five limits, so wallets stop hard-coding them.
+- **`rand_getLimits`**, new: the chain's five limits at the time, so wallets stop hard-coding them
+  (a sixth, `envelope_bytes`, follows in the 2026-09-26 entry below).
 - **`rand_getProgramPublic(program_id)`**, new: a program's deploy-time public words, as hex of
   their little-endian bytes. It returns `""` for a program without a public input.
 - **`rand_getProgram`** adds `public_words_len` and `public_digest`, which is `null` without a public

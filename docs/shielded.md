@@ -58,6 +58,17 @@ chain. What appears is:
   tree, and
 - its **envelope**, the note's plaintext sealed to the owner's address (ML-KEM-768 +
   ChaCha20-Poly1305, 1348 bytes) so only the owner — or the sender, through `ovk` — can read it.
+  A genesis that sets `envelope_bytes: 1860` (spec 2026-09-26 §2.3–§2.4) grows the sealed body
+  by a fixed 512-byte memo field — `len (u16 LE) ‖ UTF-8 text ‖ zero padding`, at most 510 bytes
+  of text — so every note-creating envelope on that chain is exactly 1860 bytes whether or not it
+  carries a memo: a dummy or change output is padded the same way, and nothing on chain
+  distinguishes a memo, its length, or its absence. The memo is not in the note, the commitment,
+  or any proof, and is readable by exactly whoever can already read the note: the owner (ML-KEM),
+  the sender (`ovk`), or anyone handed that output's per-transaction key
+  (`rand_checkTransaction`, `rand tx-key`). A malformed memo field (bad length, invalid UTF-8, or
+  non-zero padding) opens as no memo — it never costs the owner the note itself. A chain without
+  `envelope_bytes` keeps today's 1348-byte envelope and refuses a non-empty memo before proving,
+  rather than silently dropping it.
 
 Spending a note publishes its **nullifier** `H_NF(nk, cm)`, which is unlinkable to the
 commitment without `nk`. The nullifier set is what prevents a double spend.

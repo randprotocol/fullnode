@@ -277,14 +277,15 @@ Global options, accepted before or after the subcommand:
 | command | arguments | behaviour |
 |---|---|---|
 | `keygen` | | write a new spend-key file at `--key`, mode 0600; refuses to overwrite |
-| `address` | | print this wallet's `rand1…` shielded address |
+| `address` | `--uri [--amount A] [--asset X] [--memo M]`, `--qr`, `--qr-png <FILE>` | print this wallet's `rand1…` shielded address and its `fingerprint XXXX-XXXX-XXXX-XXXX` (spec 2026-09-26 §2.1 — 16 Crockford base32 characters, a human check of the address, never sent on the wire). `--uri` also prints a `randpay:` link (§2.2: address plus optional `amount`/`asset`/`memo`), round-tripped through the same parser a payee's wallet uses before it is shown. `--qr` renders that link as a QR code in the terminal (Unicode half blocks); `--qr-png <FILE>` writes it as a PNG. A bare address's QR is the link with no parameters — a scanner always lands on `randpay:`, never a raw address |
+| `contacts add <NAME> <TO>` / `list` / `show <NAME> [--qr]` / `remove <NAME>` | `--yes` (`add`) | named addresses this wallet can send to by name (§3.1). `TO` is a `rand1…` address or a `randpay:` link (only its address is kept); `add` prints the fingerprint and asks `add? [y/N]` unless `--yes`. `show` prints the address, its fingerprint, and — with `--qr` — a QR of its `randpay:` link. Stored at `<key>.contacts.json`, mode 0600, written atomically (temp file, then rename); a name is 1–64 characters, never starting with `rand1` or `randpay:` (case-insensitive), and unique — an address may be saved under one name only |
 | `viewing-key` | | print this wallet's viewing key `nk`, 64 hex — the parameter `rand_importViewingKey` takes. It reads every note the wallet has sent or received and spends none; derived from the spend key on each run, never stored |
 | `balance` | | scan the tree, save the store, print spendable value and the unspent note count |
 | `sync` | `--rescan` | scan without printing a balance; prints how far it got. A first sync reads every block header (1024 a call) before the leaves. `--rescan` starts the note store over first — every note, spent mark, pending hold, sent row, the local tree and every cursor forgotten, the chain binding kept — and rescans from leaf 0: the way back when a node reported this wallet's notes as spent wrongly (a scan never un-spends a note), best run against a node you trust. "insufficient balance" and "matches none of the node's anchors" name it |
-| `notes` | | every note this wallet has opened: index, `asset`, amount, height, `spent`, `pending` |
+| `notes` | `--memo` | every note this wallet has opened: index, `asset`, amount, height, `spent`, `pending`, and a memo column — the first 24 characters truncated, or the whole text with `--memo` |
 | `asset-balance [INDEX]` | | scan, then print what this wallet holds in one bridged asset, or a row per asset held; amounts are in the asset's own smallest unit |
-| `history` | | every note this wallet created for someone else, opened through its own outgoing viewing key |
-| `send <TO> <AMOUNT>` | `--asset <INDEX\|rand\|rpl1…\|hex>` (default `0`, RAND), `--fee <RAND>` (default `0.001`), `--no-wait`, `--cuda` | scan, select at most two notes of the asset and at most two RAND notes for the fee, prove one four-slot hidden-asset bundle locally, submit; waits for the commit unless `--no-wait`. `AMOUNT` is decimal RAND for RAND and whole units for a token. A token id (`rpl1…` or 64 hex) is resolved to its index from the node's **whole** registry listing (`rand_getTokens`, every page from index 0) — never by a per-token lookup, which would tell the node which token is about to move; a numeric index never reaches the node at all. The id is decoded before the node is asked (a malformed one is refused), and the matched row must name it in every id field it carries and sit at index 1 or above — a listing that answers a token id with RAND's index 0, or whose `id` and `id_text` disagree, is refused. The unit of `AMOUNT` follows what was typed, never the index the node answered: only `0`/`rand` reads RAND. The asset index, amount and fee are printed before proving. On chain a token transfer is a plain bundle, indistinguishable from a RAND payment; its fee is RAND, and a wallet without spendable RAND is refused before proving |
+| `history` | `--memo` | every note this wallet created for someone else, opened through its own outgoing viewing key, with the same memo column as `notes` |
+| `send <TO> <AMOUNT>` | `--asset <INDEX\|rand\|rpl1…\|hex>` (default `0`, RAND), `--memo <M>`, `--fee <RAND>` (default `0.001`), `--no-wait`, `--yes`, `--cuda` | `TO` is a `rand1…` address, a `randpay:` link, or a saved contact's name, tried in that order (§3.1). A link's own `amount`/`asset`/`memo` fill in what the command line leaves out; `AMOUNT` becomes optional only when the link carries one, and a value given both ways that disagrees is refused, never guessed. Prints the confirmation line — `to <contact, if any> · fingerprint XXXX-XXXX-XXXX-XXXX · <amount> <asset> · memo "<text>"` — and asks before proving unless `--yes`. Then: scan, select at most two notes of the asset and at most two RAND notes for the fee, seal the memo into every real output (spec §2.3 — a chain whose genesis carries `envelope_bytes` only; a non-empty memo on a chain without it is refused before anything proves), prove one four-slot hidden-asset bundle locally, submit; waits for the commit unless `--no-wait`. `AMOUNT` (and a link's `amount`) is in the asset's display units: decimal RAND at nine decimals for RAND, and a token at its registry row's own `decimals`, read off the same whole listing. A token id (`rpl1…` or 64 hex) is resolved to its index from the node's **whole** registry listing (`rand_getTokens`, every page from index 0) — never by a per-token lookup, which would tell the node which token is about to move; a numeric index never reaches the node at all. The id is decoded before the node is asked (a malformed one is refused), and the matched row must name it in every id field it carries and sit at index 1 or above — a listing that answers a token id with RAND's index 0, or whose `id` and `id_text` disagree, is refused. Only `0`/`rand` names RAND, whatever index the node answered. The asset index, amount in base units and fee are printed before proving. On chain a token transfer is a plain bundle, indistinguishable from a RAND payment; its fee is RAND, and a wallet without spendable RAND is refused before proving |
 | `bond <VALIDATOR> <AMOUNT>` | `--registration <hex>`, `--fee <RAND>` (default `0.001`), `--no-wait`, `--cuda` | stake onto a validator: the bundle burns the amount out of this wallet's notes. `--registration` (from `rand-node register`) exactly when the validator is not in the register yet, and then at least 1000 RAND; prints the new stake and the epoch it counts from (`docs/staking.md`) |
 | `faucet [ADDRESS]` | `--amount <RAND>` (default `100`, max `100`) | testnet only: ask a validator node to mint into a note for `ADDRESS` (default: this wallet), wait for the commit |
 | `program build` | `--guest <fib\|memcpy\|bubble_sort\|balance_check\|private_payment\|public_echo>`, `--arg N` (repeatable), `--out <file>` (default `program.json`) | assemble a built-in guest to `{base_pc, words}` JSON; prints the program id |
@@ -310,7 +311,7 @@ Global options, accepted before or after the subcommand:
 | `bridge-message <SEQUENCE>` | | one outbound burn message, verbatim, for a guardian to sign |
 | `fee bundle` / `fee deploy <words>` / `fee call <tier>` | `--public-words M` (`deploy`), `--bytes B` (`call`) | minimum fee from the node's schedule. `--public-words` prices a public input like code words; `--bytes` is the call's proof plus input-envelope bytes, and only bytes past the free 2 MiB + 18 432 add to the fee (1 000 units per KiB) |
 | `tx <HASH>` | | committed transaction with its block height and index, or "not found" |
-| `tx-key <HASH>` | | one row per output of that transaction this wallet sent, received or kept as change: `output` (`bundle:0` … `bundle:3`, the one bundle's four slots, or `mint:0`), role, amount (in RAND, or `N (asset I)` for a token), and the per-transaction key it was sealed under. Recovered from the chain through the envelope's sender or receiver half, so it works for any past transaction; hand a `sent` row's key to a payee or auditor and `rand_checkTransaction <HASH> <KEY>` discloses that one output. A dummy slot (zero value, sealed to a throwaway key) opens to nobody and has no row. Errors if the wallet opens no output of the transaction |
+| `tx-key <HASH>` | | one row per output of that transaction this wallet sent, received or kept as change: `output` (`bundle:0` … `bundle:3`, the one bundle's four slots, or `mint:0`), role, amount (in RAND, or `N (asset I)` for a token), the memo it carried (`-` for none — the holder of this row's own key can already open the memo, so showing it discloses nothing a `rand_checkTransaction` call with that key would not), and the per-transaction key it was sealed under. Recovered from the chain through the envelope's sender or receiver half, so it works for any past transaction; hand a `sent` row's key to a payee or auditor and `rand_checkTransaction <HASH> <KEY>` discloses that one output, memo included. A dummy slot (zero value, sealed to a throwaway key) opens to nobody and has no row. Errors if the wallet opens no output of the transaction |
 | `block <ID>` | | block by height (integer) or by hash (hex) |
 | `head` | | `{height, hash, view}` |
 | `status` | | node status object (see docs/rpc.md `rand_status`) |
@@ -389,12 +390,29 @@ units), where `bytes` is the proof plus the sealed transcript.
 
 ```bash
 rand keygen                                   # wallet.key.json
-rand address                                  # rand1… — give this to whoever pays you
+rand address                                  # rand1… and its fingerprint XXXX-XXXX-XXXX-XXXX
 rand faucet                                   # testnet: 100 RAND into a note only you can open
 rand balance                                  # balance: 100 RAND
 rand send rand1q9f… 1.5                     # ~100 s of local proving, then the commit
 rand notes                                    # the spent note, and the change note
 ```
+
+### Sharing an address, and a memo (spec 2026-09-26)
+
+```bash
+rand address --uri --amount 1.5 --memo "invoice #42" --qr   # a randpay: link, as a terminal QR
+rand contacts add alice rand1q9f…                            # shows the fingerprint, asks add? [y/N]
+rand send alice 1.5 --memo "coffee"                          # a memo, on a chain whose genesis sets envelope_bytes
+rand history --memo                                           # alice's row shows the whole memo
+rand tx-key <hash>                                             # hand the sent row's key to alice or an auditor
+```
+
+A payee reads the same memo two ways: their own `scan`/`notes`, and anyone with that output's
+per-transaction key through `rand_checkTransaction <hash> <key>` — the memo is inside the same
+sealed body as the note, so whoever can open one can open the other. On a chain whose genesis
+carries no `envelope_bytes` (chain 14 and earlier), `--memo` is refused before anything proves:
+there is no room in the legacy 1 348-byte envelope for a memo field, and an old wallet's
+`Note::from_bytes` would not open a memo-carrying one.
 
 ### A confidential call you can open again later
 
