@@ -185,6 +185,9 @@ pub fn fee_floor(action: &Action) -> u64 {
         // Bridge rules v2: bundle-less like the pause, and unspammable for the same reason — each
         // needs a PQ guardian quorum over the current `rotation_nonce`, and each spends it.
         Action::RotatePqGuardians { .. } | Action::RotatePauseKey { .. } => 0,
+        // Genesis vesting: a claim and a revoke pay the base out of what they release, like a
+        // `Withdraw`; a bond and an unbond from the lock move no value into or out of the pool.
+        Action::ClaimVested { .. } | Action::RevokeVesting { .. } | Action::BondVested { .. } | Action::UnbondVested { .. } => 0,
     }
 }
 

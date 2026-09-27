@@ -1488,6 +1488,21 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
             "kind": "rotate_pause_key", "new_pause_key": new_pause_key.to_hex(), "nonce": nonce,
             "pq_signers": pq_signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
         }),
+        // Genesis vesting: the entry and the amounts are public register facts, like a
+        // `Withdraw`'s; the note a claim or a revoke pays is rendered no further.
+        Action::ClaimVested { entry, amount, nonce, time, .. } => json!({
+            "kind": "claim_vested", "entry": hex::encode(entry), "amount": amount.to_string(), "nonce": nonce, "time": time
+        }),
+        Action::RevokeVesting { entry, unvested, nonce, time, .. } => json!({
+            "kind": "revoke_vesting", "entry": hex::encode(entry), "unvested": unvested.to_string(), "nonce": nonce, "time": time
+        }),
+        Action::BondVested { entry, validator, amount, registration, nonce, .. } => json!({
+            "kind": "bond_vested", "entry": hex::encode(entry), "validator": validator.to_base58(),
+            "amount": amount.to_string(), "registers": registration.is_some(), "nonce": nonce
+        }),
+        Action::UnbondVested { entry, amount, nonce, .. } => json!({
+            "kind": "unbond_vested", "entry": hex::encode(entry), "amount": amount.to_string(), "nonce": nonce
+        }),
     };
     json!({
         "hash": t.hash().to_hex(),
@@ -4003,6 +4018,54 @@ mod tests {
         );
         let pause_key = bundle_less(Action::RotatePauseKey { new_pause_key: keys[1].clone(), nonce: 8, pq_signatures: vec![pq(0)] });
         assert_eq!(pause_key, json!({ "kind": "rotate_pause_key", "new_pause_key": keys[1].to_hex(), "nonce": 8, "pq_signers": [0] }));
+    }
+
+    /// Genesis vesting: the four actions render their public register facts.
+    #[test]
+    fn tx_json_renders_the_vesting_actions() {
+        use randprotocol_core::crypto::{Address, Signature};
+        let bundle_less = |action: Action| {
+            let tx = Transaction { chain_id: 7, bundle: None, action };
+            tx_json(&tx, None, &StubExecutor)["action"].clone()
+        };
+        let to = ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] };
+        let env = Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] };
+        let claim = bundle_less(Action::ClaimVested {
+            entry: [0xab; 32],
+            amount: 5_000_000_000,
+            nonce: 2,
+            to: to.clone(),
+            time: 9,
+            r: [0; 8],
+            envelope: env.clone(),
+            signature: Signature::empty(),
+        });
+        assert_eq!(claim, json!({ "kind": "claim_vested", "entry": "ab".repeat(32), "amount": "5000000000", "nonce": 2, "time": 9 }));
+        let revoke = bundle_less(Action::RevokeVesting {
+            entry: [0xab; 32],
+            unvested: 7,
+            nonce: 3,
+            to,
+            time: 9,
+            r: [0; 8],
+            envelope: env,
+            signature: Signature::empty(),
+        });
+        assert_eq!(revoke["kind"], "revoke_vesting");
+        assert_eq!(revoke["unvested"], "7");
+        let bond = bundle_less(Action::BondVested {
+            entry: [1; 32],
+            validator: Address([2; 32]),
+            amount: 3,
+            registration: None,
+            nonce: 0,
+            signature: Signature::empty(),
+        });
+        assert_eq!(bond["kind"], "bond_vested");
+        assert_eq!(bond["validator"], Address([2; 32]).to_base58());
+        assert_eq!(bond["registers"], false);
+        let unbond = bundle_less(Action::UnbondVested { entry: [1; 32], amount: 3, nonce: 1, signature: Signature::empty() });
+        assert_eq!(unbond, json!({ "kind": "unbond_vested", "entry": "01".repeat(32), "amount": "3", "nonce": 1 }));
     }
 
     #[test]

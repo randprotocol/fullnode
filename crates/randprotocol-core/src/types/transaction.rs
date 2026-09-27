@@ -342,6 +342,44 @@ pub enum Action {
     /// [`crate::bridge::gov::rotate_pause_message`]`(chain_id, nonce, key)`, `nonce` the bridge's
     /// `rotation_nonce`. Bundle-less and fee-less; gated like `RotatePqGuardians`.
     RotatePauseKey { new_pause_key: PublicKey, nonce: u64, pq_signatures: Vec<crate::bridge::PqSignature> },
+    /// Genesis vesting (spec §6.1): release `amount` (gross) of a vesting entry's unlocked RAND
+    /// as a note of `amount − BUNDLE_BASE` to `to` (no sender, the native asset, `time` and `r`
+    /// the note's, `envelope` sealed against it); the base goes to the proposer. Signed by the
+    /// entry's beneficiary over [`crate::types::actions::claim_vested_message`]; `nonce` the
+    /// entry's. Bundle-less and fee-less, like a `Withdraw`.
+    ClaimVested {
+        entry: [u8; 32],
+        amount: u64,
+        nonce: u64,
+        to: ShieldedAddress,
+        time: u32,
+        r: Word8,
+        envelope: Envelope,
+        signature: Signature,
+    },
+    /// Genesis vesting (spec §6.2): pay exactly `unvested` of a revocable entry's not-yet-vested
+    /// RAND to `to` (the treasury) as a note of `unvested − BUNDLE_BASE`, and freeze the entry
+    /// at `amount − unvested`. Signed by the entry's revoker over
+    /// [`crate::types::actions::revoke_vesting_message`].
+    RevokeVesting {
+        entry: [u8; 32],
+        unvested: u64,
+        nonce: u64,
+        to: ShieldedAddress,
+        time: u32,
+        r: Word8,
+        envelope: Envelope,
+        signature: Signature,
+    },
+    /// Genesis vesting, bond-from-lock (SAFT Schedule 2 §4): bond `amount` of an irrevocable
+    /// entry's locked RAND as `validator`'s stake — a `Bond` whose value comes from the vesting
+    /// register instead of a bundle's burn, `registration` present exactly when the validator
+    /// is new. Signed by the beneficiary over [`crate::types::actions::bond_vested_message`].
+    BondVested { entry: [u8; 32], validator: Address, amount: u64, registration: Option<Registration>, nonce: u64, signature: Signature },
+    /// Genesis vesting: take `amount` of the entry's bonded stake back; it returns to the lock
+    /// after `UNBONDING_EPOCHS`, never to a note. Signed by the beneficiary over
+    /// [`crate::types::actions::unbond_vested_message`].
+    UnbondVested { entry: [u8; 32], amount: u64, nonce: u64, signature: Signature },
 }
 
 impl Action {
@@ -366,6 +404,10 @@ impl Action {
             Action::UnpauseMints { .. } => Some("unpause_mints"),
             Action::RotatePqGuardians { .. } => Some("rotate_pq_guardians"),
             Action::RotatePauseKey { .. } => Some("rotate_pause_key"),
+            Action::ClaimVested { .. } => Some("claim_vested"),
+            Action::RevokeVesting { .. } => Some("revoke_vesting"),
+            Action::BondVested { .. } => Some("bond_vested"),
+            Action::UnbondVested { .. } => Some("unbond_vested"),
             _ => None,
         }
     }
@@ -548,6 +590,38 @@ impl Action {
                 nonce: *nonce,
                 pq_signatures: pq_signatures.clone(),
             },
+            // Genesis vesting: no proofs, every field kept.
+            Action::ClaimVested { entry, amount, nonce, to, time, r, envelope, signature } => Action::ClaimVested {
+                entry: *entry,
+                amount: *amount,
+                nonce: *nonce,
+                to: to.clone(),
+                time: *time,
+                r: *r,
+                envelope: envelope.clone(),
+                signature: signature.clone(),
+            },
+            Action::RevokeVesting { entry, unvested, nonce, to, time, r, envelope, signature } => Action::RevokeVesting {
+                entry: *entry,
+                unvested: *unvested,
+                nonce: *nonce,
+                to: to.clone(),
+                time: *time,
+                r: *r,
+                envelope: envelope.clone(),
+                signature: signature.clone(),
+            },
+            Action::BondVested { entry, validator, amount, registration, nonce, signature } => Action::BondVested {
+                entry: *entry,
+                validator: *validator,
+                amount: *amount,
+                registration: registration.clone(),
+                nonce: *nonce,
+                signature: signature.clone(),
+            },
+            Action::UnbondVested { entry, amount, nonce, signature } => {
+                Action::UnbondVested { entry: *entry, amount: *amount, nonce: *nonce, signature: signature.clone() }
+            }
         }
     }
 }
@@ -964,6 +1038,37 @@ mod tests {
             (Action::UnpauseMints { nonce: 0, pq_signatures: Vec::new() }, "unpause_mints"),
             (Action::RotatePqGuardians { new_pq_guardians: Vec::new(), nonce: 0, pq_signatures: Vec::new() }, "rotate_pq_guardians"),
             (Action::RotatePauseKey { new_pause_key: minter.clone(), nonce: 0, pq_signatures: Vec::new() }, "rotate_pause_key"),
+            (Action::UnbondVested { entry: [0; 32], amount: 1, nonce: 0, signature: Signature::empty() }, "unbond_vested"),
+            (
+                Action::BondVested { entry: [0; 32], validator: v, amount: 1, registration: None, nonce: 0, signature: Signature::empty() },
+                "bond_vested",
+            ),
+            (
+                Action::ClaimVested {
+                    entry: [0; 32],
+                    amount: 1,
+                    nonce: 0,
+                    to: ShieldedAddress { pk: [0; 8], kem_ek: vec![] },
+                    time: 0,
+                    r: [0; 8],
+                    envelope: env(),
+                    signature: Signature::empty(),
+                },
+                "claim_vested",
+            ),
+            (
+                Action::RevokeVesting {
+                    entry: [0; 32],
+                    unvested: 1,
+                    nonce: 0,
+                    to: ShieldedAddress { pk: [0; 8], kem_ek: vec![] },
+                    time: 0,
+                    r: [0; 8],
+                    envelope: env(),
+                    signature: Signature::empty(),
+                },
+                "revoke_vesting",
+            ),
         ];
         for (a, name) in &bundle_less {
             assert_eq!(a.bundle_less(), Some(*name), "{a:?}");
@@ -1181,7 +1286,7 @@ mod tests {
     /// The number of `Action` variants, and each one's position — an exhaustive match with no
     /// wildcard, so a new variant fails to compile here until [`sample`] has a row for it (and
     /// [`Action::blanked`] has an arm).
-    const VARIANTS: usize = 24;
+    const VARIANTS: usize = 28;
     fn variant_index(a: &Action) -> usize {
         match a {
             Action::None => 0,
@@ -1208,6 +1313,10 @@ mod tests {
             Action::ListBacking { .. } => 21,
             Action::RotatePqGuardians { .. } => 22,
             Action::RotatePauseKey { .. } => 23,
+            Action::ClaimVested { .. } => 24,
+            Action::RevokeVesting { .. } => 25,
+            Action::BondVested { .. } => 26,
+            Action::UnbondVested { .. } => 27,
         }
     }
 
@@ -1371,6 +1480,35 @@ mod tests {
                     crate::bridge::PqSignature { index: 5, signature: vec![0xad; 8] },
                 ],
             },
+            24 => Action::ClaimVested {
+                entry: [0x51; 32],
+                amount: 9,
+                nonce: 1,
+                to: ShieldedAddress { pk: [5; 8], kem_ek: vec![6; 32] },
+                time: 4,
+                r: [7; 8],
+                envelope: env(),
+                signature: sig(),
+            },
+            25 => Action::RevokeVesting {
+                entry: [0x52; 32],
+                unvested: 9,
+                nonce: 1,
+                to: ShieldedAddress { pk: [5; 8], kem_ek: vec![6; 32] },
+                time: 4,
+                r: [7; 8],
+                envelope: env(),
+                signature: sig(),
+            },
+            26 => Action::BondVested {
+                entry: [0x53; 32],
+                validator: Address([0x54; 32]),
+                amount: 9,
+                registration: Some(reg.clone()),
+                nonce: 1,
+                signature: sig(),
+            },
+            27 => Action::UnbondVested { entry: [0x55; 32], amount: 9, nonce: 1, signature: sig() },
             _ => panic!("no variant {i}"),
         }
     }
@@ -1662,6 +1800,59 @@ mod tests {
             (23, "rotate pause pq signature index", |t| {
                 let Action::RotatePauseKey { pq_signatures, .. } = &mut t.action else { panic!() };
                 pq_signatures[1].index = 4;
+            }),
+            // Genesis vesting: every field of the four, the signatures included.
+            (24, "claim entry", |t| {
+                let Action::ClaimVested { entry, .. } = &mut t.action else { panic!() };
+                entry[0] ^= 1;
+            }),
+            (24, "claim amount", |t| {
+                let Action::ClaimVested { amount, .. } = &mut t.action else { panic!() };
+                *amount += 1;
+            }),
+            (24, "claim nonce", |t| {
+                let Action::ClaimVested { nonce, .. } = &mut t.action else { panic!() };
+                *nonce += 1;
+            }),
+            (24, "claim to", |t| {
+                let Action::ClaimVested { to, .. } = &mut t.action else { panic!() };
+                to.pk[0] ^= 1;
+            }),
+            (24, "claim time", |t| {
+                let Action::ClaimVested { time, .. } = &mut t.action else { panic!() };
+                *time += 1;
+            }),
+            (24, "claim r", |t| {
+                let Action::ClaimVested { r, .. } = &mut t.action else { panic!() };
+                r[0] ^= 1;
+            }),
+            (24, "claim envelope", |t| {
+                let Action::ClaimVested { envelope, .. } = &mut t.action else { panic!() };
+                envelope.body[0] ^= 1;
+            }),
+            (24, "claim signature", |t| {
+                let Action::ClaimVested { signature, .. } = &mut t.action else { panic!() };
+                *signature = Signature::empty();
+            }),
+            (25, "revoke unvested", |t| {
+                let Action::RevokeVesting { unvested, .. } = &mut t.action else { panic!() };
+                *unvested += 1;
+            }),
+            (25, "revoke to", |t| {
+                let Action::RevokeVesting { to, .. } = &mut t.action else { panic!() };
+                to.kem_ek[0] ^= 1;
+            }),
+            (26, "bond validator", |t| {
+                let Action::BondVested { validator, .. } = &mut t.action else { panic!() };
+                validator.0[0] ^= 1;
+            }),
+            (26, "bond registration", |t| {
+                let Action::BondVested { registration, .. } = &mut t.action else { panic!() };
+                *registration = None;
+            }),
+            (27, "unbond amount", |t| {
+                let Action::UnbondVested { amount, .. } = &mut t.action else { panic!() };
+                *amount += 1;
             }),
         ];
         for (i, what, change) in action_cases {

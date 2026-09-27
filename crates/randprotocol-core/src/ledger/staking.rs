@@ -442,6 +442,8 @@ impl Ledger {
             Action::Withdraw { validator, amount, time, r, .. } => {
                 withdraw_note(self, validator, *amount, *time, r, executor).ok()
             }
+            // Genesis vesting: a claim's or a revoke's note, derived from the action alone.
+            a @ (Action::ClaimVested { .. } | Action::RevokeVesting { .. }) => super::vesting::derived_note(a, executor),
             Action::WithdrawAggregator { aggregator, time, r, .. } => {
                 // The aggregator's withdraw note derives the same way, one register over: the
                 // bond less the base, at the entry's payout (spec §2.2).
@@ -675,7 +677,7 @@ impl Ledger {
 /// Bond's rules, in spec order: registration present exactly when the validator is unknown, the
 /// registration is for this validator and signed by it, and a registration bonds at least
 /// [`MIN_STAKE`].
-fn check_bond(
+pub(crate) fn check_bond(
     ledger: &Ledger,
     validator: &Address,
     amount: u64,
@@ -754,7 +756,12 @@ fn check_unbond(
     // Only active stake unbonds: what is still in the bond queue is not weight yet, and letting
     // it leave would let a bond skip the queue's order on its way back out. Without a section
     // the queue is empty and this is the whole stake.
-    let have = e.stake.saturating_sub(ledger.queued_stake(validator));
+    //
+    // Genesis vesting: nor does stake a vesting entry bonded here (`BondVested`) — only its
+    // beneficiary may take that back, and only into the lock. Conservative while such a bond is
+    // itself still queued (it is then subtracted twice), never generous. 0 without the section.
+    let vested = ledger.vesting().map_or(0, |v| v.bonded_to(validator));
+    let have = e.stake.saturating_sub(ledger.queued_stake(validator)).saturating_sub(vested);
     if amount > have {
         return Err(StakingError::InsufficientStake { have, want: amount });
     }

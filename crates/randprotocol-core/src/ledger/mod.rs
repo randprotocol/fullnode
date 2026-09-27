@@ -242,6 +242,8 @@ pub enum TxError {
     #[error("proposer {0} is not in the validator register")]
     UnknownProposer(Address),
     /// Phase S2: a `Bond`, `Unbond` or `Withdraw` the register refused (see [`StakingError`]).
+    #[error("vesting: {0}")]
+    Vesting(#[from] vesting::VestingError),
     #[error("staking: {0}")]
     Staking(#[from] StakingError),
     /// Block aggregation: a register action or aggregate the aggregation module refused (see
@@ -1369,7 +1371,10 @@ impl Ledger {
             | Action::WithdrawAggregator { envelope, .. }
             | Action::BridgeAttest { envelope, .. }
             | Action::Aggregate { envelope, .. }
-            | Action::TokenMint { envelope, .. } => self.check_note_envelope(envelope)?,
+            | Action::TokenMint { envelope, .. }
+            // Genesis vesting: a claim's and a revoke's note envelopes, like a withdraw's.
+            | Action::ClaimVested { envelope, .. }
+            | Action::RevokeVesting { envelope, .. } => self.check_note_envelope(envelope)?,
             Action::RegisterToken { initial: Some(m), .. } => self.check_note_envelope(&m.envelope)?,
             _ => {}
         }
@@ -1422,8 +1427,11 @@ impl Ledger {
         // node chose — and it is held to the same window by the same rule; a `WithdrawAggregator`'s
         // note time is its twin, one register over. Checked here, at the step a bundle's time is
         // checked, so a stale one is refused before any signature work.
-        if let Action::Withdraw { time, .. } | Action::WithdrawAggregator { time, .. } | Action::Mint { time, .. } =
-            &tx.action
+        if let Action::Withdraw { time, .. }
+        | Action::WithdrawAggregator { time, .. }
+        | Action::Mint { time, .. }
+        | Action::ClaimVested { time, .. }
+        | Action::RevokeVesting { time, .. } = &tx.action
         {
             self.check_time(*time)?;
         }
@@ -1497,6 +1505,12 @@ impl Ledger {
             }
             a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. }) => {
                 staking::validate(self, tx, a, executor)?;
+            }
+            a @ (Action::ClaimVested { .. }
+            | Action::RevokeVesting { .. }
+            | Action::BondVested { .. }
+            | Action::UnbondVested { .. }) => {
+                vesting::validate(self, tx, a, executor)?;
             }
             a @ (Action::BridgeAttest { .. } | Action::BridgeBurn { .. }) => {
                 verified.attestation = bridge_notes::validate(self, tx, a, executor)?;
@@ -1713,6 +1727,13 @@ impl Ledger {
                 // The proposer is passed in because a `Withdraw` pays it the bundle base out of
                 // the amount it withdraws — the one fee that does not come from a bundle.
                 staking::apply(self, tx, a, proposer, executor)?;
+            }
+            a @ (Action::ClaimVested { .. }
+            | Action::RevokeVesting { .. }
+            | Action::BondVested { .. }
+            | Action::UnbondVested { .. }) => {
+                // A claim and a revoke pay the proposer the base, as a `Withdraw` does.
+                vesting::apply(self, tx, a, proposer, executor)?;
             }
             a @ (Action::BridgeAttest { .. } | Action::BridgeBurn { .. }) => {
                 bridge_notes::apply(self, tx, a, executor, verified.attestation)?;

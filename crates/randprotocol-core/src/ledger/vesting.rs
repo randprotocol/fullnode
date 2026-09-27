@@ -11,7 +11,15 @@
 //! Genesis-gated: a chain without the section has no register (`Ledger::vesting` is `None`)
 //! and every one of the two actions is refused `UnsupportedAction("vesting")`.
 
-use crate::crypto::{merkle_root, Hash, PublicKey, PUBLIC_KEY_LEN};
+use super::{staking, Ledger, TxError};
+use crate::confidential::ConfidentialExecutor;
+use crate::crypto::{merkle_root, Address, Hash, PublicKey, Signature, PUBLIC_KEY_LEN};
+use crate::gas;
+use crate::notes::{Envelope, ShieldedAddress, Word8, KEM_EK_BYTES};
+use crate::types::actions::{
+    bond_vested_message, claim_vested_message, revoke_vesting_message, unbond_vested_message, Registration,
+};
+use crate::types::transaction::{Action, Transaction};
 use serde::{Deserialize, Serialize};
 
 /// What an allocation is for. Reporting only (`rand_getVestingSummary`): no rule reads it.
@@ -370,6 +378,291 @@ pub enum VestingError {
     Overflow,
 }
 
+// ------------------------------------------------------------------ the four actions
+
+/// What an action reaching this module that it does not own gets — and what every vesting
+/// action gets on a chain without the section: the gate is absolute.
+const NOT_VESTING: TxError = TxError::UnsupportedAction("vesting");
+
+fn entry<'a>(ledger: &'a Ledger, id: &[u8; 32]) -> Result<&'a Entry, TxError> {
+    let reg = ledger.vesting().ok_or(NOT_VESTING)?;
+    reg.get(id).ok_or_else(|| VestingError::UnknownEntry(hex::encode(id)).into())
+}
+
+fn check_nonce(e: &Entry, nonce: u64) -> Result<(), VestingError> {
+    if nonce != e.nonce {
+        return Err(VestingError::BadNonce { expected: e.nonce, actual: nonce });
+    }
+    Ok(())
+}
+
+/// A recipient nobody can seal a note to is not an address (the register's payout rule).
+fn check_to(to: &ShieldedAddress) -> Result<(), VestingError> {
+    if to.kem_ek.len() != KEM_EK_BYTES {
+        return Err(VestingError::BadRecipient);
+    }
+    Ok(())
+}
+
+fn net(amount: u64) -> Result<u64, VestingError> {
+    amount.checked_sub(gas::BUNDLE_BASE).filter(|n| *n > 0).ok_or(VestingError::BelowBundleBase { amount, base: gas::BUNDLE_BASE })
+}
+
+/// The note a claim or a revoke creates: `to`, no sender, the amount less the base, the native
+/// asset, the action's own `time` and blinding — the envelope was sealed against exactly this.
+fn release_note(
+    to: &ShieldedAddress,
+    gross: u64,
+    time: u32,
+    r: &Word8,
+    executor: &dyn ConfidentialExecutor,
+) -> Result<Word8, VestingError> {
+    Ok(super::mint_commitment(executor, &to.pk, net(gross)?, time, r))
+}
+
+/// The note `action` would create, for `Ledger::derived_commitment` (the mempool's conflict
+/// index). `None` for a bond or an unbond, which create none, and for an amount that does not
+/// cover the base — which `validate` refuses on its own.
+pub(super) fn derived_note(action: &Action, executor: &dyn ConfidentialExecutor) -> Option<Word8> {
+    match action {
+        Action::ClaimVested { amount, to, time, r, .. } => release_note(to, *amount, *time, r, executor).ok(),
+        Action::RevokeVesting { unvested, to, time, r, .. } => release_note(to, *unvested, *time, r, executor).ok(),
+        _ => None,
+    }
+}
+
+/// A claim's rules, cheap before expensive, the signature last.
+#[allow(clippy::too_many_arguments)]
+fn check_claim(
+    ledger: &Ledger,
+    id: &[u8; 32],
+    amount: u64,
+    nonce: u64,
+    to: &ShieldedAddress,
+    time: u32,
+    r: &Word8,
+    envelope: &Envelope,
+    signature: &Signature,
+    chain_id: u64,
+) -> Result<(), TxError> {
+    let e = entry(ledger, id)?;
+    check_nonce(e, nonce)?;
+    net(amount)?;
+    check_to(to)?;
+    let available = claimable(e, ledger.timestamp_ms(), ledger.epoch());
+    if amount > available {
+        return Err(VestingError::NotYetVested { available, want: amount }.into());
+    }
+    let msg = claim_vested_message(&ledger.signing_domain().genesis, chain_id, id, amount, nonce, to, time, r, envelope);
+    if !e.beneficiary.verify(msg.as_bytes(), signature) {
+        return Err(VestingError::BadSignature.into());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_revoke(
+    ledger: &Ledger,
+    id: &[u8; 32],
+    amount: u64,
+    nonce: u64,
+    to: &ShieldedAddress,
+    time: u32,
+    r: &Word8,
+    envelope: &Envelope,
+    signature: &Signature,
+    chain_id: u64,
+) -> Result<(), TxError> {
+    let e = entry(ledger, id)?;
+    let revoker = e.revoker.as_ref().ok_or(VestingError::NotRevocable)?;
+    if e.revoked_at.is_some() {
+        return Err(VestingError::AlreadyRevoked.into());
+    }
+    check_nonce(e, nonce)?;
+    net(amount)?;
+    check_to(to)?;
+    // The true unvested part only shrinks with time, so the revoker signs a little less than
+    // it saw; what vests in between stays the beneficiary's.
+    let unvested_now = unvested(e, ledger.timestamp_ms()).min(e.free(ledger.epoch()));
+    if amount > unvested_now {
+        return Err(VestingError::RevokeExceedsUnvested { unvested_now, want: amount }.into());
+    }
+    let msg = revoke_vesting_message(&ledger.signing_domain().genesis, chain_id, id, amount, nonce, to, time, r, envelope);
+    if !revoker.verify(msg.as_bytes(), signature) {
+        return Err(VestingError::BadSignature.into());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_bond(
+    ledger: &Ledger,
+    id: &[u8; 32],
+    validator: &Address,
+    amount: u64,
+    registration: Option<&Registration>,
+    nonce: u64,
+    signature: &Signature,
+    chain_id: u64,
+) -> Result<(), TxError> {
+    let e = entry(ledger, id)?;
+    // A revocable grant never bonds, so a revoke never has to reach into a validator's stake.
+    if e.revoker.is_some() {
+        return Err(VestingError::BondNeedsIrrevocable.into());
+    }
+    check_nonce(e, nonce)?;
+    if amount == 0 {
+        return Err(VestingError::ZeroAmount.into());
+    }
+    if e.bonded_to.is_some_and(|v| v != *validator) {
+        return Err(VestingError::BondedElsewhere.into());
+    }
+    let available = e.free(ledger.epoch());
+    if amount > available {
+        return Err(VestingError::NotFreeToBond { available, want: amount }.into());
+    }
+    // The register's own bond rules: registration exactly when new, signed by the validator,
+    // the minimum stake.
+    staking::check_bond(ledger, validator, amount, registration, chain_id)?;
+    let msg = bond_vested_message(&ledger.signing_domain().genesis, chain_id, id, validator, amount, nonce, registration);
+    if !e.beneficiary.verify(msg.as_bytes(), signature) {
+        return Err(VestingError::BadSignature.into());
+    }
+    Ok(())
+}
+
+fn check_unbond(
+    ledger: &Ledger,
+    id: &[u8; 32],
+    amount: u64,
+    nonce: u64,
+    signature: &Signature,
+    chain_id: u64,
+) -> Result<Address, TxError> {
+    let e = entry(ledger, id)?;
+    check_nonce(e, nonce)?;
+    if amount == 0 {
+        return Err(VestingError::ZeroAmount.into());
+    }
+    let validator = match e.bonded_to {
+        Some(v) if amount <= e.bonded => v,
+        _ => return Err(VestingError::NotBonded { bonded: e.bonded, want: amount }.into()),
+    };
+    // Only active stake unbonds, as a plain `Unbond`: what is still queued is not weight yet.
+    let v = ledger.validators().get(&validator).ok_or(staking::StakingError::UnknownValidator(validator))?;
+    let have = v.stake.saturating_sub(ledger.queued_stake(&validator));
+    if amount > have {
+        return Err(staking::StakingError::InsufficientStake { have, want: amount }.into());
+    }
+    let msg = unbond_vested_message(&ledger.signing_domain().genesis, chain_id, id, amount, nonce);
+    if !e.beneficiary.verify(msg.as_bytes(), signature) {
+        return Err(VestingError::BadSignature.into());
+    }
+    Ok(validator)
+}
+
+/// Admission's half: every rule, and for a claim or a revoke the note must be new.
+pub(super) fn validate(
+    ledger: &Ledger,
+    tx: &Transaction,
+    action: &Action,
+    executor: &dyn ConfidentialExecutor,
+) -> Result<(), TxError> {
+    ledger.vesting().ok_or(NOT_VESTING)?;
+    let chain_id = tx.chain_id;
+    match action {
+        Action::ClaimVested { entry, amount, nonce, to, time, r, envelope, signature } => {
+            check_claim(ledger, entry, *amount, *nonce, to, *time, r, envelope, signature, chain_id)?;
+        }
+        Action::RevokeVesting { entry, unvested, nonce, to, time, r, envelope, signature } => {
+            check_revoke(ledger, entry, *unvested, *nonce, to, *time, r, envelope, signature, chain_id)?;
+        }
+        Action::BondVested { entry, validator, amount, registration, nonce, signature } => {
+            return check_bond(ledger, entry, validator, *amount, registration.as_ref(), *nonce, signature, chain_id);
+        }
+        Action::UnbondVested { entry, amount, nonce, signature } => {
+            return check_unbond(ledger, entry, *amount, *nonce, signature, chain_id).map(|_| ());
+        }
+        _ => return Err(NOT_VESTING),
+    }
+    let cm = derived_note(action, executor).ok_or(NOT_VESTING)?;
+    if ledger.has_commitment(&cm) {
+        return Err(TxError::CommitmentExists(cm));
+    }
+    Ok(())
+}
+
+/// Drop the unbonding rows that have come back by `epoch`: they are plain register value now.
+fn settle(e: &mut Entry, epoch: u64) {
+    e.unbonding.retain(|(release, _)| *release > epoch);
+}
+
+/// The apply step, in lockstep with [`validate`]: every check re-run, everything that can fail
+/// worked out before the first mutation.
+pub(super) fn apply(
+    ledger: &mut Ledger,
+    tx: &Transaction,
+    action: &Action,
+    proposer: &Address,
+    executor: &dyn ConfidentialExecutor,
+) -> Result<(), TxError> {
+    validate(ledger, tx, action, executor)?;
+    let now = ledger.timestamp_ms();
+    let epoch = ledger.epoch();
+    match action {
+        Action::ClaimVested { entry, amount, envelope, .. } | Action::RevokeVesting { entry, unvested: amount, envelope, .. } => {
+            let cm = derived_note(action, executor).ok_or(NOT_VESTING)?;
+            let paid = net(*amount)?;
+            let rewards = ledger.validators().get(proposer).ok_or(TxError::UnknownProposer(*proposer))?.rewards;
+            rewards.checked_add(gas::BUNDLE_BASE).ok_or(TxError::Overflow)?;
+            let reg = ledger.vesting_mut().ok_or(NOT_VESTING)?;
+            let released = reg.released.checked_add(paid).ok_or(VestingError::Overflow)?;
+            let e = reg.get_mut(entry).expect("validated above");
+            if matches!(action, Action::ClaimVested { .. }) {
+                e.claimed = e.claimed.checked_add(*amount).ok_or(VestingError::Overflow)?;
+            } else {
+                e.revoked_at = Some(now);
+                e.revoked_out = *amount;
+            }
+            e.nonce += 1;
+            settle(e, epoch);
+            reg.released = released;
+            ledger.append_deposit(cm, envelope.clone(), executor)?;
+            let p = ledger.validators.get_mut(proposer).expect("looked up above");
+            p.rewards = p.rewards.checked_add(gas::BUNDLE_BASE).ok_or(TxError::Overflow)?;
+        }
+        Action::BondVested { entry, validator, amount, registration, .. } => {
+            ledger.bond(*validator, *amount, registration.as_ref(), tx.chain_id)?;
+            let reg = ledger.vesting_mut().ok_or(NOT_VESTING)?;
+            let e = reg.get_mut(entry).expect("validated above");
+            e.bonded = e.bonded.checked_add(*amount).ok_or(VestingError::Overflow)?;
+            e.bonded_to = Some(*validator);
+            e.nonce += 1;
+            settle(e, epoch);
+        }
+        Action::UnbondVested { entry, amount, nonce, signature } => {
+            let validator = check_unbond(ledger, entry, *amount, *nonce, signature, tx.chain_id)?;
+            let release = epoch.checked_add(staking::UNBONDING_EPOCHS).ok_or(VestingError::Overflow)?;
+            let v = ledger.validators.get_mut(&validator).expect("checked above");
+            v.stake -= amount;
+            let reg = ledger.vesting_mut().ok_or(NOT_VESTING)?;
+            let e = reg.get_mut(entry).expect("validated above");
+            e.bonded -= amount;
+            if e.bonded == 0 {
+                e.bonded_to = None;
+            }
+            settle(e, epoch);
+            match e.unbonding.last_mut().filter(|(last, _)| *last == release) {
+                Some((_, pending)) => *pending = pending.checked_add(*amount).ok_or(VestingError::Overflow)?,
+                None => e.unbonding.push((release, *amount)),
+            }
+            e.nonce += 1;
+        }
+        _ => return Err(NOT_VESTING),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +834,276 @@ mod tests {
         assert_eq!(serde_json::from_str::<VestingConfig>(&json).unwrap(), c);
         let r = VestingRegister::from_config(&c);
         assert_eq!(serde_json::from_str::<VestingRegister>(&serde_json::to_string(&r).unwrap()).unwrap(), r);
+    }
+}
+
+/// The four actions against a real ledger (spec §10).
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+    use crate::confidential::StubExecutor;
+    use crate::crypto::Keypair;
+    use crate::ledger::staking::{StakingError, MIN_STAKE};
+    use crate::ledger::ValidatorEntry;
+    use crate::types::actions::registration_message;
+    use std::collections::BTreeMap;
+
+    const CHAIN: u64 = 7;
+    const BASE: u64 = gas::BUNDLE_BASE;
+    const U: u64 = crate::ledger::staking::MIN_STAKE; // 1 000 RAND: one unit of vesting, one minimum stake
+
+    fn kp(i: u8) -> Keypair {
+        Keypair::from_seed([i; 32]).unwrap()
+    }
+    fn addr(i: u8) -> ShieldedAddress {
+        ShieldedAddress { pk: [i as u32; 8], kem_ek: vec![i; KEM_EK_BYTES] }
+    }
+    fn env() -> Envelope {
+        Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] }
+    }
+    const HOLDER: u8 = 1;
+    const REVOKER: u8 = 2;
+    const PROPOSER: u8 = 90;
+
+    /// An entry of `10 U` from t = 1 000: cliff 1 000 ms, then 10 000 ms linear, so `U` a
+    /// thousand ms from t = 2 000 on.
+    fn cfg(id: u8, revocable: bool) -> VestingEntryConfig {
+        VestingEntryConfig {
+            id: [id; 32],
+            class: if revocable { Class::Team } else { Class::Investor },
+            beneficiary: kp(HOLDER).public_key().clone(),
+            revoker: revocable.then(|| kp(REVOKER).public_key().clone()),
+            amount: 10 * U,
+            start_ms: 1_000,
+            cliff_ms: 1_000,
+            linear_ms: 10_000,
+            step_ms: None,
+        }
+    }
+
+    fn ledger(entries: Vec<VestingEntryConfig>, t: u64) -> Ledger {
+        let p = kp(PROPOSER);
+        let mut reg = BTreeMap::new();
+        reg.insert(
+            p.address(),
+            ValidatorEntry {
+                public_key: p.public_key().clone(),
+                stake: MIN_STAKE,
+                pending: Vec::new(),
+                rewards: 0,
+                payout: addr(PROPOSER),
+                nonce: 0,
+                activation_epoch: 0,
+            },
+        );
+        let mut l = Ledger::new(CHAIN, [11; 8], reg, &StubExecutor);
+        l.set_epoch_blocks(4);
+        l.set_height(5);
+        l.set_timestamp_ms(t);
+        l.set_genesis_supply(0, MIN_STAKE);
+        l.set_vesting(Some(VestingRegister::from_config(&VestingConfig { entries })));
+        l
+    }
+
+    fn g(l: &Ledger) -> Hash {
+        l.signing_domain().genesis
+    }
+
+    fn tx(action: Action) -> Transaction {
+        Transaction { chain_id: CHAIN, bundle: None, action }
+    }
+
+    fn claim(l: &Ledger, id: u8, amount: u64, nonce: u64, signer: u8, r: u8) -> Transaction {
+        let (to, time, r) = (addr(HOLDER), l.height() as u32, [r as u32; 8]);
+        let m = claim_vested_message(&g(l), CHAIN, &[id; 32], amount, nonce, &to, time, &r, &env());
+        let signature = kp(signer).sign(m.as_bytes());
+        tx(Action::ClaimVested { entry: [id; 32], amount, nonce, to, time, r, envelope: env(), signature })
+    }
+
+    fn revoke(l: &Ledger, id: u8, unvested: u64, nonce: u64, signer: u8) -> Transaction {
+        let (to, time, r) = (addr(77), l.height() as u32, [9u32; 8]);
+        let m = revoke_vesting_message(&g(l), CHAIN, &[id; 32], unvested, nonce, &to, time, &r, &env());
+        let signature = kp(signer).sign(m.as_bytes());
+        tx(Action::RevokeVesting { entry: [id; 32], unvested, nonce, to, time, r, envelope: env(), signature })
+    }
+
+    fn bond(l: &Ledger, id: u8, validator: &Keypair, amount: u64, nonce: u64, new: bool) -> Transaction {
+        let registration = new.then(|| {
+            let payout = addr(55);
+            let signature = validator.sign(registration_message(CHAIN, &payout).as_bytes());
+            Registration { public_key: validator.public_key().clone(), payout, signature }
+        });
+        let m = bond_vested_message(&g(l), CHAIN, &[id; 32], &validator.address(), amount, nonce, registration.as_ref());
+        let signature = kp(HOLDER).sign(m.as_bytes());
+        tx(Action::BondVested { entry: [id; 32], validator: validator.address(), amount, registration, nonce, signature })
+    }
+
+    fn unbond(l: &Ledger, id: u8, amount: u64, nonce: u64) -> Transaction {
+        let signature = kp(HOLDER).sign(unbond_vested_message(&g(l), CHAIN, &[id; 32], amount, nonce).as_bytes());
+        tx(Action::UnbondVested { entry: [id; 32], amount, nonce, signature })
+    }
+
+    fn apply(l: &mut Ledger, t: &Transaction) -> Result<(), TxError> {
+        l.apply_tx(t, &kp(PROPOSER).address(), &StubExecutor).map(|_| ())
+    }
+
+    /// Build the transaction against the ledger first, then apply it.
+    macro_rules! ap {
+        ($l:ident, $t:expr) => {{
+            let t = $t;
+            apply(&mut $l, &t)
+        }};
+    }
+
+    fn verr(e: TxError) -> VestingError {
+        match e {
+            TxError::Vesting(v) => v,
+            other => panic!("expected a vesting error, got {other:?}"),
+        }
+    }
+
+    fn e(l: &Ledger, id: u8) -> &Entry {
+        l.vesting().unwrap().get(&[id; 32]).unwrap()
+    }
+
+    #[test]
+    fn a_claim_releases_exactly_what_has_vested_into_a_note_and_pays_the_proposer_the_base() {
+        let mut l = ledger(vec![cfg(1, false)], 1_999);
+        assert_eq!(verr(ap!(l, claim(&l, 1, 2 * BASE, 0, HOLDER, 1)).unwrap_err()), VestingError::NotYetVested { available: 0, want: 2 * BASE });
+        l.set_timestamp_ms(4_000); // 2 000 ms into the linear period: 2 U
+        assert_eq!(
+            verr(ap!(l, claim(&l, 1, 2 * U + 1, 0, HOLDER, 1)).unwrap_err()),
+            VestingError::NotYetVested { available: 2 * U, want: 2 * U + 1 }
+        );
+        let t = claim(&l, 1, 2 * U, 0, HOLDER, 1);
+        let cm = l.derived_commitment(&t.action, &StubExecutor).unwrap();
+        apply(&mut l, &t).unwrap();
+        assert!(l.has_commitment(&cm), "the claim note is in the tree");
+        assert_eq!(l.deposits().len(), 1);
+        assert_eq!((e(&l, 1).claimed, e(&l, 1).nonce), (2 * U, 1));
+        assert_eq!(l.validators().get(&kp(PROPOSER).address()).unwrap().rewards, BASE);
+        assert_eq!(l.vesting().unwrap().released, 2 * U - BASE);
+        let a = l.audit();
+        assert!(a.invariant_holds(), "{a:?}");
+        // The same claim again: its nonce is spent.
+        assert_eq!(verr(apply(&mut l, &t).unwrap_err()), VestingError::BadNonce { expected: 1, actual: 0 });
+        // Nothing more has vested since.
+        assert!(matches!(verr(ap!(l, claim(&l, 1, 2 * BASE, 1, HOLDER, 2)).unwrap_err()), VestingError::NotYetVested { .. }));
+    }
+
+    #[test]
+    fn a_claim_is_refused_for_every_bad_field() {
+        let l = ledger(vec![cfg(1, false)], 20_000);
+        let check = |t: Transaction| l.validate(&t, &StubExecutor).unwrap_err();
+        assert_eq!(verr(check(claim(&l, 1, U, 0, REVOKER, 1))), VestingError::BadSignature, "not the beneficiary's key");
+        assert_eq!(verr(check(claim(&l, 2, U, 0, HOLDER, 1))), VestingError::UnknownEntry(hex::encode([2u8; 32])));
+        assert_eq!(verr(check(claim(&l, 1, BASE, 0, HOLDER, 1))), VestingError::BelowBundleBase { amount: BASE, base: BASE });
+        // The recipient is inside the signature: redirected after signing, it is refused.
+        let mut redirected = claim(&l, 1, U, 0, HOLDER, 1);
+        if let Action::ClaimVested { to, .. } = &mut redirected.action {
+            to.pk[0] ^= 1;
+        }
+        assert_eq!(verr(check(redirected)), VestingError::BadSignature);
+        let mut short = claim(&l, 1, U, 0, HOLDER, 1);
+        if let Action::ClaimVested { to, .. } = &mut short.action {
+            to.kem_ek.pop();
+        }
+        assert_eq!(verr(check(short)), VestingError::BadRecipient);
+        // A note that already exists.
+        let mut l2 = l.clone();
+        let t = claim(&l2, 1, U, 0, HOLDER, 1);
+        let cm = l2.derived_commitment(&t.action, &StubExecutor).unwrap();
+        l2.deposit(cm, &StubExecutor).unwrap();
+        assert_eq!(l2.validate(&t, &StubExecutor).unwrap_err(), TxError::CommitmentExists(cm));
+        // No section, no vesting action at all.
+        let mut plain = l.clone();
+        plain.set_vesting(None);
+        assert_eq!(plain.validate(&claim(&l, 1, U, 0, HOLDER, 1), &StubExecutor).unwrap_err(), TxError::UnsupportedAction("vesting"));
+    }
+
+    #[test]
+    fn a_revoke_takes_only_the_unvested_part_and_freezes_the_entry() {
+        let mut l = ledger(vec![cfg(1, true), cfg(2, false)], 5_000); // 3 U vested, 7 U not
+        assert_eq!(verr(ap!(l, revoke(&l, 2, U, 0, REVOKER)).unwrap_err()), VestingError::NotRevocable);
+        assert_eq!(verr(ap!(l, revoke(&l, 1, U, 0, HOLDER)).unwrap_err()), VestingError::BadSignature);
+        assert_eq!(
+            verr(ap!(l, revoke(&l, 1, 7 * U + 1, 0, REVOKER)).unwrap_err()),
+            VestingError::RevokeExceedsUnvested { unvested_now: 7 * U, want: 7 * U + 1 }
+        );
+        // The revoker signs a little less than it saw (the margin): the rest is the holder's.
+        ap!(l, revoke(&l, 1, 6 * U, 0, REVOKER)).unwrap();
+        assert_eq!((e(&l, 1).revoked_out, e(&l, 1).revoked_at), (6 * U, Some(5_000)));
+        assert!(l.audit().invariant_holds());
+        assert_eq!(verr(ap!(l, revoke(&l, 1, 2 * BASE, 1, REVOKER)).unwrap_err()), VestingError::AlreadyRevoked);
+        // Frozen at 10 U − 6 U, whatever the time: 4 U, claimable at once, and not a unit more.
+        l.set_timestamp_ms(1_000_000);
+        assert!(matches!(verr(ap!(l, claim(&l, 1, 4 * U + 1, 1, HOLDER, 1)).unwrap_err()), VestingError::NotYetVested { .. }));
+        ap!(l, claim(&l, 1, 4 * U, 1, HOLDER, 1)).unwrap();
+        assert_eq!(e(&l, 1).held(), 0);
+        let a = l.audit();
+        assert!(a.invariant_holds(), "{a:?}");
+        assert_eq!(a.vesting_released, 10 * U - 2 * BASE);
+    }
+
+    /// Review focus 1: a claim admitted against the head, a revoke landing first — the claim can
+    /// only ever have asked for what had vested, which the frozen total always covers.
+    #[test]
+    fn a_claim_admitted_before_a_revoke_still_applies_after_it() {
+        let mut l = ledger(vec![cfg(1, true)], 5_000); // 3 U vested
+        let c = claim(&l, 1, 3 * U, 0, HOLDER, 1);
+        l.validate(&c, &StubExecutor).unwrap();
+        ap!(l, revoke(&l, 1, 7 * U, 0, REVOKER)).unwrap();
+        // The claim was signed at nonce 0 and the revoke spent it: re-signed at 1, it applies.
+        assert!(matches!(verr(apply(&mut l, &c).unwrap_err()), VestingError::BadNonce { .. }));
+        ap!(l, claim(&l, 1, 3 * U, 1, HOLDER, 1)).unwrap();
+        assert!(l.audit().invariant_holds());
+    }
+
+    #[test]
+    fn locked_ram_bonds_to_a_validator_and_comes_back_only_to_the_lock() {
+        let v = kp(60);
+        let mut l = ledger(vec![cfg(1, false), cfg(2, true)], 1_500); // nothing vested yet
+        assert_eq!(verr(ap!(l, bond(&l, 2, &v, MIN_STAKE, 0, true)).unwrap_err()), VestingError::BondNeedsIrrevocable);
+        assert!(matches!(
+            ap!(l, bond(&l, 1, &v, MIN_STAKE - 1, 0, true)).unwrap_err(),
+            TxError::Staking(StakingError::BelowMinStake { .. })
+        ));
+        assert_eq!(
+            verr(ap!(l, bond(&l, 1, &v, 10 * U + 1, 0, true)).unwrap_err()),
+            VestingError::NotFreeToBond { available: 10 * U, want: 10 * U + 1 }
+        );
+        // Locked, unvested RAND bonds: that is the point (SAFT Schedule 2 §4).
+        let staked = 6 * U;
+        assert!(staked >= MIN_STAKE);
+        ap!(l, bond(&l, 1, &v, staked, 0, true)).unwrap();
+        assert_eq!(l.validators().get(&v.address()).unwrap().stake, staked);
+        assert_eq!((e(&l, 1).bonded, e(&l, 1).bonded_to), (staked, Some(v.address())));
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+        // Only one validator per entry at a time.
+        assert_eq!(verr(ap!(l, bond(&l, 1, &kp(61), MIN_STAKE, 1, true)).unwrap_err()), VestingError::BondedElsewhere);
+        // Fully vested now, but the bonded part is stake: only the rest is claimable.
+        l.set_timestamp_ms(1_000_000);
+        assert_eq!(
+            verr(ap!(l, claim(&l, 1, 4 * U + 1, 1, HOLDER, 1)).unwrap_err()),
+            VestingError::NotYetVested { available: 4 * U, want: 4 * U + 1 }
+        );
+        // The validator's own key cannot unbond stake the entry bonded.
+        let own = crate::types::actions::unbond_message(CHAIN, &v.address(), BASE, 0);
+        let t = tx(Action::Unbond { validator: v.address(), amount: BASE, nonce: 0, signature: v.sign(own.as_bytes()) });
+        assert!(matches!(apply(&mut l, &t).unwrap_err(), TxError::Staking(StakingError::InsufficientStake { have: 0, .. })));
+        // The beneficiary takes it back: out of the stake at once, claimable two epochs on.
+        assert_eq!(verr(ap!(l, unbond(&l, 1, staked + 1, 1)).unwrap_err()), VestingError::NotBonded { bonded: staked, want: staked + 1 });
+        ap!(l, unbond(&l, 1, staked, 1)).unwrap();
+        assert_eq!(l.validators().get(&v.address()).unwrap().stake, 0);
+        assert_eq!((e(&l, 1).bonded, e(&l, 1).bonded_to), (0, None));
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+        assert!(matches!(verr(ap!(l, claim(&l, 1, 4 * U + 1, 2, HOLDER, 1)).unwrap_err()), VestingError::NotYetVested { .. }));
+        l.set_height(l.height() + 2 * 4 * staking::UNBONDING_EPOCHS);
+        ap!(l, claim(&l, 1, 10 * U, 2, HOLDER, 1)).unwrap();
+        assert!(e(&l, 1).unbonding.is_empty(), "the released row is settled");
+        let a = l.audit();
+        assert!(a.invariant_holds(), "{a:?}");
+        assert_eq!(e(&l, 1).in_register(), 0);
+        assert_eq!(a.vesting_in_register, 10 * U, "entry 2, untouched");
     }
 }
