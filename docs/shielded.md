@@ -145,6 +145,34 @@ disclose more, and until the next chain cut they do:
   are 43 words — publishes its per-instruction fetch counts, i.e. the call's control flow. The
   declared hash-table heights (`keccak_log_height`, `sha256_log_height`) say whether a call hashed
   and roughly how often.
+- **A call's LogUp totals are a public function of its private inputs, so low-entropy inputs can
+  be brute-forced from them** (INT-2 on calls; the v0.6 rescan). The same unblinded terminals as
+  the bundle item above: the input table's is the sum over its rows of one term per committed
+  `(index, word)` pair — every word on the tape, read or not — and the challenges come from public
+  transcript data, so anyone holding the proof and the program can compute the total a *candidate*
+  input list would produce and compare. It is unsalted: `H_IN`'s salt enters the digest, not this
+  sum. The 2^7 table floor does not help — it hides the table's rows from the openings, not the
+  total, which is computed over the raw trace before any hiding. So a call whose private inputs are
+  a few small words — an amount under a million, a PIN, a handful of flags — is a search of millions
+  to billions of candidates, the size the review ran for the bundle leak (there the true witness was
+  the unique match among 1.3 million). High-entropy inputs (keys, 256-bit secrets, random
+  blindings) are out of reach.
+  **Until the fix, a program that takes low-entropy private inputs should also take at least two
+  uniformly random private words (four for 128 bits) and read them into the computation** — padding
+  the tape alone masks the input table's own total, but the cpu and memory tables' totals depend on
+  the words the program reads and what it does with them, so the salt must pass through the same
+  tables the secret does. The generic fix is LogUp blinding (a random masking term in every
+  table's total), which changes every verifier key and so is chain 16's.
+- **The branch-free bundle guest (v2) still has two witness-dependent traces, both on the Merkle
+  path bit** (the v0.6 rescan). v2's address swap writes each path cell from `sw SA` or `sw NA`,
+  one clock apart depending on the bit, so (1) the memory table's access timestamps and (2) the
+  range-check histogram of timestamp differences both depend on every spent input's leaf-index bits
+  — in principle more than v1's popcount, a function of the bits themselves. Both enter LogUp
+  totals that also sum over secret hash words (the note secrets and sibling hashes the same tables
+  carry), which is why the rescan judged them unrecoverable by the candidate search above; that is
+  a judgement, not a measurement — the rescan did not quantify them, and v2's
+  witness-independence test compares access counts per address, not timestamps. LogUp blinding
+  closes both.
 
 What is already fixed, and what needs the cut:
 
@@ -156,7 +184,12 @@ What is already fixed, and what needs the cut:
   require, a floor of 2^7 rows (`docs/deploy.md`, "The program-table floor").
 - The bundle's real-slot and popcount leak needs a circuit change — LogUp blinding, or a
   branch-free bundle guest whose trace does not depend on which slots are dummies — and so a chain
-  cut with a new `hc_bundle`. It is not fixed on chain 15.
+  cut with a new `hc_bundle`. It is not fixed on chain 15. v0.6 carries the branch-free guest (v2,
+  `rand-node genesis --bundle-guest v2`), which removes the real-slot and popcount leak and leaves
+  the two Merkle-bit residuals above.
+- A call's input totals, and v2's residuals, need LogUp blinding — a verifier-key change, due
+  with chain 16's other key changes. Until then the only mitigation is the program's own random
+  salt words, above.
 
 A `Call`'s `input_envelope` is the one optional publication in that table: the call's private inputs,
 sealed so that the caller, a per-call key, or a named auditor can open them later

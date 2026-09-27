@@ -615,6 +615,13 @@ above):**
   a token or only RAND) and the popcount of each spent leaf index. The fix is a circuit change —
   blinded LogUp totals or a branch-free bundle guest — and needs a chain cut with a new
   `hc_bundle`; it is not fixed on chain 15.
+- **A call's LogUp totals let low-entropy private inputs be brute-forced** (INT-2 on calls; the
+  v0.6 rescan). The input table's total is an unsalted function of every committed input word
+  (`H_IN`'s salt is not in it), and the 2^7 floor hides rows, not totals — so a call whose inputs
+  are a few small words can be matched by enumeration. A program handling such inputs should read
+  at least two uniformly random private words into its computation; the generic fix, LogUp
+  blinding, is chain 16's. `docs/shielded.md`, "What the proofs leak today", has the detail and
+  the branch-free bundle guest's two remaining Merkle-bit residuals.
 - **Proofs do fingerprint their shape** where a header field is free (INT-5's memory height,
   VERIFIER-2's FRI schedule): every v0.6 pool refuses a non-canonical header, and the ledger does
   under `hardening_v6` (`docs/deploy.md`, "Canonical proofs").
