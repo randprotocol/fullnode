@@ -5670,10 +5670,13 @@ mod tests {
     async fn parse_asset_amount_reads_decimals_off_the_whole_token_listing() {
         let asked = Arc::new(Mutex::new(Vec::<String>::new()));
         let log = asked.clone();
+        // A self-consistent row: `id` and `id_text` name the same token, as WAL-1's row check
+        // requires of every row `find_token_row` returns.
+        let id = Hash::digest_domain(b"test", b"fifth token");
         let rows = serde_json::json!({
             "enabled": true,
             "tokens": [
-                { "index": 5, "id": "bb".repeat(32), "id_text": "rpl1fifth", "authority": { "kind": "none" }, "mint_nonce": 0, "decimals": 6 },
+                { "index": 5, "id": id.to_hex(), "id_text": randprotocol_core::token_id::encode(&id), "authority": { "kind": "none" }, "mint_nonce": 0, "decimals": 6 },
             ],
         });
         let rpc = RpcClient::new(
