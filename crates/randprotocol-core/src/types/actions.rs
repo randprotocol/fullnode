@@ -226,6 +226,65 @@ pub fn withdraw_message(
     Hash::digest_domain(b"rand-withdraw", &bytes)
 }
 
+/// What a vesting entry's beneficiary signs to claim (`ClaimVested`, genesis vesting spec §6.1):
+/// the genesis and chain, the entry, the gross amount, the entry's nonce, and the note it asks
+/// for — the recipient, `time`, blinding and envelope — so nobody relaying it can redirect it.
+#[allow(clippy::too_many_arguments)]
+pub fn claim_vested_message(
+    genesis: &Hash,
+    chain_id: u64,
+    entry: &[u8; 32],
+    amount: u64,
+    nonce: u64,
+    to: &ShieldedAddress,
+    time: u32,
+    r: &Word8,
+    envelope: &Envelope,
+) -> Hash {
+    let bytes = bincode::serialize(&(genesis, chain_id, entry, amount, nonce, to, time, r, envelope)).expect("serializes");
+    Hash::digest_domain(b"rand-vest-claim-1", &bytes)
+}
+
+/// What a vesting entry's revoker signs (`RevokeVesting`, spec §6.2): as a claim, with the exact
+/// unvested amount the treasury note carries in place of the claimed amount.
+#[allow(clippy::too_many_arguments)]
+pub fn revoke_vesting_message(
+    genesis: &Hash,
+    chain_id: u64,
+    entry: &[u8; 32],
+    unvested: u64,
+    nonce: u64,
+    to: &ShieldedAddress,
+    time: u32,
+    r: &Word8,
+    envelope: &Envelope,
+) -> Hash {
+    let bytes = bincode::serialize(&(genesis, chain_id, entry, unvested, nonce, to, time, r, envelope)).expect("serializes");
+    Hash::digest_domain(b"rand-vest-revoke-1", &bytes)
+}
+
+/// What a beneficiary signs to bond locked RAND to a validator (`BondVested`): the entry, the
+/// validator, the amount, the entry's nonce, and the registration it carries when the validator
+/// is new (its own signature covers the rest of it).
+pub fn bond_vested_message(
+    genesis: &Hash,
+    chain_id: u64,
+    entry: &[u8; 32],
+    validator: &Address,
+    amount: u64,
+    nonce: u64,
+    registration: Option<&Registration>,
+) -> Hash {
+    let bytes = bincode::serialize(&(genesis, chain_id, entry, validator, amount, nonce, registration)).expect("serializes");
+    Hash::digest_domain(b"rand-vest-bond-1", &bytes)
+}
+
+/// What a beneficiary signs to take bonded RAND back into the lock (`UnbondVested`).
+pub fn unbond_vested_message(genesis: &Hash, chain_id: u64, entry: &[u8; 32], amount: u64, nonce: u64) -> Hash {
+    let bytes = bincode::serialize(&(genesis, chain_id, entry, amount, nonce)).expect("serializes");
+    Hash::digest_domain(b"rand-vest-unbond-1", &bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +393,58 @@ mod tests {
             assert_ne!(x, s);
         }
         assert_ne!(m, s, "distinct domains");
+    }
+    /// The four vesting messages (genesis vesting spec §6): each binds every field, and no two
+    /// domains collide.
+    #[test]
+    fn vesting_messages_bind_every_field_under_distinct_domains() {
+        let g = Hash::digest(b"g");
+        let h = Hash::digest(b"h");
+        let to = addr();
+        let mut to2 = addr();
+        to2.pk = [9; 8];
+        let base = claim_vested_message(&g, 7, &[1; 32], 5, 0, &to, 3, &[2; 8], &env());
+        for other in [
+            claim_vested_message(&h, 7, &[1; 32], 5, 0, &to, 3, &[2; 8], &env()),
+            claim_vested_message(&g, 8, &[1; 32], 5, 0, &to, 3, &[2; 8], &env()),
+            claim_vested_message(&g, 7, &[2; 32], 5, 0, &to, 3, &[2; 8], &env()),
+            claim_vested_message(&g, 7, &[1; 32], 6, 0, &to, 3, &[2; 8], &env()),
+            claim_vested_message(&g, 7, &[1; 32], 5, 1, &to, 3, &[2; 8], &env()),
+            claim_vested_message(&g, 7, &[1; 32], 5, 0, &to2, 3, &[2; 8], &env()),
+            claim_vested_message(&g, 7, &[1; 32], 5, 0, &to, 4, &[2; 8], &env()),
+            claim_vested_message(&g, 7, &[1; 32], 5, 0, &to, 3, &[3; 8], &env()),
+            claim_vested_message(&g, 7, &[1; 32], 5, 0, &to, 3, &[2; 8], &Envelope { body: vec![9], ..env() }),
+        ] {
+            assert_ne!(other, base);
+        }
+        let revoke = revoke_vesting_message(&g, 7, &[1; 32], 5, 0, &to, 3, &[2; 8], &env());
+        assert_ne!(revoke, base, "same fields, different domain");
+        assert_ne!(revoke_vesting_message(&g, 7, &[1; 32], 6, 0, &to, 3, &[2; 8], &env()), revoke);
+        let v = Address([1; 32]);
+        let bond = bond_vested_message(&g, 7, &[1; 32], &v, 5, 0, None);
+        for other in [
+            bond_vested_message(&h, 7, &[1; 32], &v, 5, 0, None),
+            bond_vested_message(&g, 8, &[1; 32], &v, 5, 0, None),
+            bond_vested_message(&g, 7, &[2; 32], &v, 5, 0, None),
+            bond_vested_message(&g, 7, &[1; 32], &Address([2; 32]), 5, 0, None),
+            bond_vested_message(&g, 7, &[1; 32], &v, 6, 0, None),
+            bond_vested_message(&g, 7, &[1; 32], &v, 5, 1, None),
+        ] {
+            assert_ne!(other, bond);
+        }
+        let k = Keypair::from_seed([9; 32]).unwrap();
+        let reg = Registration { public_key: k.public_key().clone(), payout: addr(), signature: k.sign(b"x") };
+        assert_ne!(bond_vested_message(&g, 7, &[1; 32], &v, 5, 0, Some(&reg)), bond);
+        let unbond = unbond_vested_message(&g, 7, &[1; 32], 5, 0);
+        for other in [
+            unbond_vested_message(&h, 7, &[1; 32], 5, 0),
+            unbond_vested_message(&g, 8, &[1; 32], 5, 0),
+            unbond_vested_message(&g, 7, &[2; 32], 5, 0),
+            unbond_vested_message(&g, 7, &[1; 32], 6, 0),
+            unbond_vested_message(&g, 7, &[1; 32], 5, 1),
+        ] {
+            assert_ne!(other, unbond);
+        }
     }
 }
 

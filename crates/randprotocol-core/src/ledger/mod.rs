@@ -15,6 +15,7 @@ pub mod call_envelope;
 pub mod staking;
 pub mod supply;
 pub mod tokens;
+pub mod vesting;
 
 use crate::bridge::{BridgeError, BridgeState, CheckedAttestation};
 use crate::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
