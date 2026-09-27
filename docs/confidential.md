@@ -589,9 +589,35 @@ published, never leaves the prover) it cannot be opened, so on its own it only p
 the same input index to agree and makes an out-of-range read unsatisfiable — see "Disclosure
 implication" above for what happens if a caller later reveals the salt. Private: inputs, registers,
 memory, branches taken, cycle count (padded to the tier), the `H_IN` salt itself — and, since S1,
-*who called it and what they paid with*: the bundle publishes two nullifiers and two commitments
-and names nobody. Two proofs of the same run are different bytes (hiding commitments), so proofs do
-not fingerprint inputs.
+*who called it and what they paid with*: the bundle publishes its nullifiers and commitments and
+names nobody. Two proofs of the same run are different bytes (hiding commitments).
+
+**Corrections (the 2026-09-27 zkVM/ISA review — read these before relying on the paragraph
+above):**
+
+- **Small tables are not hidden** (INT-1 family: INT-1, COV-2, INT-6, HCS-3; High, live on
+  chain 15). A proof opens each committed table at 80 FRI queries plus two out-of-domain points,
+  and a table is hiding only while it has more random rows than that. Before v0.6's prover floor,
+  a call with 31 or fewer private words proved an input table of 2^3–2^5 rows, and the review
+  recovered every private word from production proofs — so *inputs* of such calls are public in
+  the proofs already on chain 15. The same holds for a small keccak or sha256 table (a 128-byte
+  secret was recovered from a one-permutation keccak call), 64-row tables leak Boolean and
+  small-count columns by lattice reduction, and the **program table** of any program under 64
+  words (every chain-15 program is 43) publishes its fetch counts — the *branches taken*. The
+  declared `keccak_log_height`/`sha256_log_height` say whether and roughly how often a call hashed.
+  Fixed without a cut for input/keccak/sha256 (the v0.6 prover floors them at 2^7 rows and every
+  v0.6 pool refuses a call proof that does not, `CallRevealsPrivateInputs`); the program table only
+  under genesis `hardening_v6` (`docs/deploy.md`, "The program-table floor"). Calls already
+  committed stay exposed.
+- **Bundle proofs reveal their real-slot pattern** (INT-2 / GV-1; High, live). The per-table LogUp
+  totals are published unblinded, and the hidden-asset guest branches on dummy slots and on each
+  Merkle path bit, so every bundle proof tells which input slots are real (hence whether it moves
+  a token or only RAND) and the popcount of each spent leaf index. The fix is a circuit change —
+  blinded LogUp totals or a branch-free bundle guest — and needs a chain cut with a new
+  `hc_bundle`; it is not fixed on chain 15.
+- **Proofs do fingerprint their shape** where a header field is free (INT-5's memory height,
+  VERIFIER-2's FRI schedule): every v0.6 pool refuses a non-canonical header, and the ledger does
+  under `hardening_v6` (`docs/deploy.md`, "Canonical proofs").
 
 ## Call input envelopes
 

@@ -104,18 +104,59 @@ three staking variants are on the wire but every one of them is still refused
 
 The shape is fixed, so one input and one output are often dummies: a dummy input is a zero-value
 note owned by the spender, and the change output is published even when the change is zero. A
-transaction that looked different when there was no change would leak that there was none.
+transaction that looked different when there was no change would leak that there was none. (The
+*transaction* looks the same; the bundle *proof* does not yet — it reveals which input slots are
+real, see "What the proofs leak today" below.)
 
 ### What is public and what is hidden
 
 | | public on chain | hidden |
 |---|---|---|
-| **transfer** (`Action::None`) | anchor, all four nullifiers, all four commitments, fee, `burn_a = burn_r = burn_asset = 0`, `time`, four envelope ciphertexts, the bundle proof | who sent it, who is paid, the amount, the change, which leaves were spent — and, **only under the branch-free guest (v2)**, which asset (RAND or any RPL token) and which slots were dummies: under the v1 guest chains 14 and 15 run, the proof shows both (§6, "The bundle proof's instruction counts") |
+| **transfer** (`Action::None`) | anchor, all four nullifiers, all four commitments, fee, `burn_a = burn_r = burn_asset = 0`, `time`, four envelope ciphertexts, the bundle proof — **and, under the v1 guest chains 14 and 15 run, read off that proof: which input slots are real and the popcount of each spent leaf index** (see "What the proofs leak today", below, and §6, "The bundle proof's instruction counts") | who sent it, who is paid, the amount, the change, which leaves were spent (beyond their popcounts under v1); which asset only partly under v1 — the real-slot pattern tells a RAND bundle from a token one. Under the branch-free guest (v2), selected by a later genesis's `hc_bundle`, which asset moved and which slots were dummies are hidden too |
 | **Deploy** | everything above, plus `base_pc` and the program's words (so the program id and its code) | who deployed it, and what the paying notes were worth |
-| **Call** | everything a transfer publishes, plus the program id, the call proof, and the receipt's tier and eight output words | the private inputs, registers, memory, branches taken, the real cycle count (only the padded tier shows), who called it |
+| **Call** | everything a transfer publishes, plus the program id, the call proof, and the receipt's tier and eight output words — **and, read off the call proof, what its small committed tables hold** (see below) | registers, memory, the real cycle count (only the padded tier shows), who called it; the private inputs and the branches taken only as far as "What the proofs leak today" allows |
 | **Mint** (faucet) | the new note's commitment, its envelope, the **amount in the clear**, the recipient's `pk` and the note's `time`/`r` (POOL-1: the commitment opening, checked by the ledger, not merely declared), and the minting validator's public key (shown as its address) and signature | which notes the recipient later spends and to whom — the address that received a mint is now public, but nothing about its later use is |
 | **BridgeAttest** | the attestation (so the source chain, the token, the **amount**, the recipient's address hash and the guardian signatures), the recipient's shielded address, the deposit note's `asset` index, `r` and `time`, and the fee bundle | which notes paid the fee, and everything about the deposit note's later spend |
 | **BridgeBurn** / **TokenBurn** | the asset index, the **amount**, the relayer fee and the destination chain and address (`BridgeBurn` only), and the one bundle's public fields (`burn_a`, `burn_asset` equal the amount and asset) | which notes were burned, and who burned them |
+
+### What the proofs leak today (the 2026-09-27 zkVM/ISA review)
+
+The table above is what the protocol publishes on purpose. Two findings of the 2026-09-27 review
+(`INT-1` family and `INT-2`/`GV-1`, both High, both live on chain 15) show the proofs themselves
+disclose more, and until the next chain cut they do:
+
+- **Every bundle proof reveals which of its four input slots are real, and the popcount of each
+  spent note's leaf index** (INT-2 / GV-1). The batch STARK publishes each table's LogUp running
+  total unblinded, and the hidden-asset guest takes a different branch for a dummy input than for a
+  real one and walks each Merkle path bit by bit — so the per-table totals separate the real slots
+  from the dummies (in particular, whether slots 0–1 spend anything, i.e. whether the bundle moves
+  a token or only RAND) and count the one bits of every spent index. The review recovered both
+  uniquely, at the Test and the Production profile. So a transfer's *asset class* (RAND or a token,
+  not which token) and a coarse fingerprint of *which leaves* it spends are public today; who, how
+  much, and which token stay hidden. The dummy slots are **not** indistinguishable from real ones,
+  whatever an earlier version of this page said.
+- **A small committed table of a call proof is readable from its openings** (INT-1, COV-2, INT-6,
+  HCS-3). The proof opens every table at 80 FRI query points plus two out-of-domain points, and a
+  table is hiding only while it has more random rows than that; below 2^7 rows the openings
+  determine it. So a call proved by a wallet older than v0.6 with 31 or fewer private words carries
+  its private inputs in the proof (its input table is 2^3–2^5 rows), a one-permutation keccak call
+  carries its hashed secret, and 64-row tables leak Boolean and small-count columns by lattice
+  reduction. The **program table** of every program under 64 words — all 105 programs on chain 15
+  are 43 words — publishes its per-instruction fetch counts, i.e. the call's control flow. The
+  declared hash-table heights (`keccak_log_height`, `sha256_log_height`) say whether a call hashed
+  and roughly how often.
+
+What is already fixed, and what needs the cut:
+
+- v0.6's prover floors the input, keccak and sha256 tables at 2^7 rows, and every v0.6 node's pool
+  refuses a call proof that does not (`CallRevealsPrivateInputs`) — no cut needed, but calls already
+  committed on chain 15 stay exposed for ever.
+- The program table can only be floored when the chain stops pinning its height to the deployed
+  record's: that is genesis `hardening_v6` (the next cut), under which wallets prove, and nodes
+  require, a floor of 2^7 rows (`docs/deploy.md`, "The program-table floor").
+- The bundle's real-slot and popcount leak needs a circuit change — LogUp blinding, or a
+  branch-free bundle guest whose trace does not depend on which slots are dummies — and so a chain
+  cut with a new `hc_bundle`. It is not fixed on chain 15.
 
 A `Call`'s `input_envelope` is the one optional publication in that table: the call's private inputs,
 sealed so that the caller, a per-call key, or a named auditor can open them later
