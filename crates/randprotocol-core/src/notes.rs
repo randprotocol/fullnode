@@ -301,9 +301,26 @@ impl CommitmentTree {
         self.next_index
     }
 
-    /// Append `cm` as the next leaf and return its index. Panics if the tree is full (2^32 leaves).
+    /// Append `cm` as the next leaf and return its index. Panics if the tree is full (2^32
+    /// leaves) — for genesis and tests; the ledger's block paths use [`Self::try_append`].
     pub fn append(&mut self, cm: Word8, h: &dyn ConfidentialExecutor) -> u64 {
-        assert!(self.next_index < (1u64 << DEPTH), "commitment tree is full");
+        self.try_append(cm, h).expect("commitment tree is full")
+    }
+
+    /// How many more leaves the tree holds: `2^DEPTH − next_index`.
+    pub fn remaining(&self) -> u64 {
+        (1u64 << DEPTH) - self.next_index
+    }
+
+    /// HB-3 (2026-09-27 zkVM/ISA review, info): [`Self::append`], but `None` — and no change —
+    /// when the tree already holds its 2^32 leaves, where `append`'s `assert!` used to be the
+    /// only guard inside block application. The ledger refuses a transaction that could overflow
+    /// the tree before it applies anything (`TxError::CommitmentTreeFull`), so on its paths this
+    /// is the belt to that check's braces. Unreachable in practice: four billion leaves.
+    pub fn try_append(&mut self, cm: Word8, h: &dyn ConfidentialExecutor) -> Option<u64> {
+        if self.next_index >= (1u64 << DEPTH) {
+            return None;
+        }
         let index = self.next_index;
         let mut node = cm;
         let mut pos = index;
@@ -321,7 +338,15 @@ impl CommitmentTree {
         }
         self.root = node;
         self.next_index = index + 1;
-        index
+        Some(index)
+    }
+
+    /// A tree `remaining` leaves short of full, every frontier slot filled — for the ledger's
+    /// HB-3 tests, which cannot append four billion leaves to get there.
+    #[cfg(test)]
+    pub(crate) fn nearly_full_for_tests(remaining: u64, h: &dyn ConfidentialExecutor) -> CommitmentTree {
+        let empty = empty_digests(h);
+        CommitmentTree { next_index: (1u64 << DEPTH) - remaining, frontier: empty[..DEPTH].iter().map(|e| Some(*e)).collect(), root: empty[DEPTH], empty }
     }
 }
 

@@ -224,6 +224,12 @@ pub enum TxError {
     InvalidProof(ConfidentialError),
     #[error("the bundle's digest is not what its proof published")]
     BadDigest,
+    /// HB-3: the commitment tree could not hold every leaf this transaction may append (its
+    /// bundle's four, and a note the ledger derives). Refused before anything is applied; the
+    /// tree's `append` used to `assert!` inside block application. Four billion leaves in, so
+    /// unreachable in practice.
+    #[error("the commitment tree is full")]
+    CommitmentTreeFull,
     /// INTERFACE-6: a sealed-form side-table record that does not belong to the transaction it
     /// vouches for — it names another transaction id, or its `H_PUB` words are not the digest of
     /// this transaction's binding. Only ever raised on the sealed-sync path.
@@ -467,6 +473,12 @@ pub fn non_canonical_proofs(tx: &Transaction, check: &dyn Fn(&[u8]) -> Option<St
     }
     None
 }
+
+/// HB-3: the most commitment-tree leaves one transaction can append — a bundle's four slots and
+/// at most one note the ledger derives itself (a `Withdraw` or `BridgeAttest` deposit, a faucet
+/// `Mint`, a `TokenMint` or `RegisterToken` initial mint, a vesting claim or revoke, an aggregate
+/// payout). `validate_inner` refuses a transaction when the tree has fewer left.
+pub const MAX_LEAVES_PER_TX: u64 = crate::notes::BUNDLE_SLOTS as u64 + 1;
 
 fn has_duplicate(words: &[Word8]) -> bool {
     words.iter().enumerate().any(|(i, w)| words[i + 1..].contains(w))
@@ -990,7 +1002,7 @@ impl Ledger {
         if !self.commitments.insert(cm) {
             return Err(TxError::CommitmentExists(cm));
         }
-        let index = self.tree.append(cm, executor);
+        let index = self.tree.try_append(cm, executor).ok_or(TxError::CommitmentTreeFull)?;
         self.deposits.push(Deposit { index, cm, envelope });
         Ok(index)
     }
@@ -1299,23 +1311,24 @@ impl Ledger {
         if !self.commitments.insert(cm) {
             return Err(TxError::CommitmentExists(cm));
         }
-        Ok(self.tree.append(cm, executor))
+        self.tree.try_append(cm, executor).ok_or(TxError::CommitmentTreeFull)
     }
 
     /// Write one admitted bundle's notes: its four nullifiers into the spent set, its four
     /// commitments — dummies included — into the set and the tree, in slot order. The write half
     /// of [`Ledger::check_bundle`].
     ///
-    /// Infallible by the time it runs: `check_bundle` established that none of these eight
-    /// words is already present.
-    fn apply_bundle_notes(&mut self, b: &Bundle, executor: &dyn ConfidentialExecutor) {
+    /// `check_bundle` established that none of these eight words is already present, and
+    /// `validate_inner` that the tree has room (HB-3); the tree-full error is the belt to that.
+    fn apply_bundle_notes(&mut self, b: &Bundle, executor: &dyn ConfidentialExecutor) -> Result<(), TxError> {
         for nf in &b.nullifiers {
             self.nullifiers.insert(*nf);
         }
         for cm in &b.commitments {
             self.commitments.insert(*cm);
-            self.tree.append(*cm, executor);
+            self.tree.try_append(*cm, executor).ok_or(TxError::CommitmentTreeFull)?;
         }
+        Ok(())
     }
 
     /// Spec §7 items 4-6 for the bundle: its anchor is live, its `time` is in the window, its
@@ -1510,6 +1523,14 @@ impl Ledger {
         let encoded_len = tx.encoded_len();
         if encoded_len > self.max_block_bytes {
             return Err(TxError::TransactionTooLarge { size: encoded_len, max: self.max_block_bytes });
+        }
+        // HB-3: room in the commitment tree for every leaf this transaction may append — a
+        // bundle's four, plus the one note the ledger derives for a withdraw, an attestation, a
+        // mint, a claim or an aggregate payout ([`MAX_LEAVES_PER_TX`]) — before anything is
+        // applied. The tree's `append` `assert!`ed inside block application before this. A
+        // comparison; unreachable in practice (four billion leaves).
+        if self.tree.remaining() < MAX_LEAVES_PER_TX {
+            return Err(TxError::CommitmentTreeFull);
         }
         if let Some(b) = &tx.bundle {
             for e in &b.envelopes {
@@ -1863,7 +1884,7 @@ impl Ledger {
                 .ok_or(TxError::Overflow)?;
             self.registration_fees_burned =
                 self.registration_fees_burned.checked_add(registration_burn).ok_or(TxError::Overflow)?;
-            self.apply_bundle_notes(b, executor);
+            self.apply_bundle_notes(b, executor)?;
             self.validators.get_mut(proposer).expect("looked up above").rewards = rewards;
             if self.aggregation.is_some() {
                 let until = self.height.checked_add(self.aggregation().expect("just checked").window).ok_or(TxError::Overflow)?;
@@ -1898,7 +1919,7 @@ impl Ledger {
                         self.faucet_minted_in_epoch.checked_add(*amount).ok_or(TxError::Overflow)?;
                 }
                 self.commitments.insert(*cm);
-                self.tree.append(*cm, executor);
+                self.tree.try_append(*cm, executor).ok_or(TxError::CommitmentTreeFull)?;
             }
             Action::Deploy { base_pc, words, public } => {
                 let id = program_id_with_public(*base_pc, words, public);
@@ -4557,6 +4578,32 @@ mod tests {
             .expect_err("two records under one proof hash");
         assert_eq!(err, BlockError::DuplicatePrunedRecord { proof_hash: Hash([2; 32]) });
         assert!(l.apply_transactions_for_sync(&[], &proposer, &BTreeMap::new(), &[record(1)], &StubExecutor, &NoVerified).is_ok());
+    }
+
+    /// HB-3 (zkVM/ISA review, info): the commitment tree's 2^32-leaf capacity was enforced by an
+    /// `assert!` inside `CommitmentTree::append`, reached from block application — a transaction
+    /// admitted into the last few leaves panicked the applying node. Now a transaction that could
+    /// overflow the tree is refused at validation (`CommitmentTreeFull`), and the apply path
+    /// returns the same error rather than panicking.
+    #[test]
+    fn a_transaction_that_would_overflow_the_commitment_tree_is_refused_not_a_panic() {
+        let (a, _) = keys();
+        let mut l = ledger();
+        let t = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        l.tree = crate::notes::CommitmentTree::nearly_full_for_tests(2, &StubExecutor);
+        let root = l.tree.root();
+        l.anchors.push_back((l.height, root));
+        let t = {
+            let mut t = t;
+            t.bundle.as_mut().unwrap().anchor = root;
+            restub(t.bundle.as_mut().unwrap());
+            StubExecutor::bound(t)
+        };
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::CommitmentTreeFull), "four leaves into a tree with room for two");
+        let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| l.clone().apply_tx(&t, &a.address(), &StubExecutor).map(|_| ())));
+        assert_eq!(applied.expect("no panic in block application"), Err(TxError::CommitmentTreeFull));
+        l.tree = crate::notes::CommitmentTree::nearly_full_for_tests(8, &StubExecutor);
+        assert_ne!(l.validate(&t, &StubExecutor), Err(TxError::CommitmentTreeFull), "room enough");
     }
 
     /// The rescan's ZKQ-4: the rVM absorbs a covered bundle's public values with
