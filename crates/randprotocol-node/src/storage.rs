@@ -1642,6 +1642,15 @@ impl Storage {
             if let randprotocol_core::types::Action::Aggregate { covers, .. } = &tx.action {
                 for cover in covers {
                     batch.delete_cf(self.cf(CF_SEALS), [b"t".as_slice(), cover.as_bytes()].concat());
+                    // With the mark goes the covered block's `sealed` flag, which the mark
+                    // earned it. The retention pass drops a cover's block before its aggregate's
+                    // (the cover is always older), so this only bites under truncation, where the
+                    // covered block can survive the aggregate that sealed it.
+                    if let Some((height, _)) = self.tx_location(cover)? {
+                        if let Some(covered_block) = self.block_by_height(height)? {
+                            batch.delete_cf(self.cf(CF_SEALS), [b"b".as_slice(), covered_block.hash().as_bytes()].concat());
+                        }
+                    }
                 }
             }
         }
@@ -2687,11 +2696,13 @@ impl Storage {
         }
         for h in (height + 1)..=head.max(height + 1) {
             let hk = height_key(h);
+            // Every row the block owns, through the one function the retention pass uses — the
+            // seal rows included (the interface review's INTERFACE-2): before, a truncated
+            // aggregate's cover marks survived it, and `check_sealed_coverage` trusts exactly
+            // those marks, so a pruned bundle whose cover this chain no longer carries would
+            // have been accepted as sealed.
             if let Ok(Some(block)) = self.block_by_height(h) {
-                batch.delete_cf(self.cf(CF_BLOCK_INDEX), block.hash().as_bytes());
-                for tx in &block.transactions {
-                    batch.delete_cf(self.cf(CF_TXS), tx.hash().as_bytes());
-                }
+                self.stage_block_delete(&mut batch, &block)?;
             }
             batch.delete_cf(self.cf(CF_BLOCKS), hk);
             batch.delete_cf(self.cf(CF_QCS), hk);
@@ -6567,6 +6578,55 @@ mod seal_tests {
         let check = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
         assert_eq!(check.last_good, 0);
         assert!(check.problem.as_deref().is_some_and(|p| p.starts_with("block 1 does not apply")), "{:?}", check.problem);
+    }
+
+    /// The interface review's INTERFACE-2: `truncate_to` deleted the dropped blocks' records and
+    /// rows but not their seal rows. An aggregate's block truncated away left its covers'
+    /// `sealed_by` marks (and the covered block's `sealed` flag) behind, and
+    /// `check_sealed_coverage` trusts exactly those marks — a pruned bundle whose cover this
+    /// chain no longer carries would be accepted as sealed. A truncated bundle's own rows (the
+    /// proof-hash index, its mark) likewise outlived it.
+    #[test]
+    fn truncation_drops_the_seal_rows_of_the_blocks_it_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1)], vec![], 100);
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let covered = bundle_tx(&ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee());
+        let b1 = make_block(&gs.block, &mut ledger, vec![covered.clone()], &key(1));
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let at_1 = ledger.clone();
+        // Block 2 carries the aggregate over it (stored unchecked: the seal rows are storage's,
+        // written by `commit` off the transaction, whatever the ledger made of it); block 3 a
+        // second bundle, sealed and pruned by hand so it owns every row a bundle can own.
+        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
+        let b2 = make_block_unchecked(&b1, &ledger, vec![aggregate.clone()], &key(1));
+        storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+        let later = bundle_tx(&ledger, [[31; 8], [32; 8]], [[33; 8], [34; 8]], bundle_fee());
+        let b3 = make_block(&b2, &mut ledger, vec![later.clone()], &key(1));
+        storage.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
+        storage.mark_sealed(later.hash(), Hash::digest(b"a later aggregate"), 3).unwrap();
+        let later_proof = Hash::digest(&later.bundle.as_ref().unwrap().proof);
+        storage
+            .db
+            .put_cf(storage.cf(CF_SEALS), [b"p".as_slice(), later_proof.as_bytes()].concat(), bincode::serialize(&later.hash()).unwrap())
+            .unwrap();
+        assert!(storage.sealed_by(&covered.hash()).unwrap().is_some(), "the aggregate's commit sealed it");
+        assert!(storage.block_sealed(&b1.block.hash()).unwrap(), "and flagged its block");
+
+        storage.truncate_to(&gs, 1, &at_1).unwrap();
+
+        assert_eq!(storage.sealed_by(&covered.hash()).unwrap(), None, "the aggregate is gone, so is its mark");
+        assert!(!storage.block_sealed(&b1.block.hash()).unwrap(), "and the kept block's flag");
+        assert_eq!(storage.aggregate_payment(&aggregate.hash()).unwrap(), None);
+        assert_eq!(storage.sealed_by(&later.hash()).unwrap(), None, "a dropped bundle's own mark");
+        assert_eq!(storage.tx_hash_by_proof_hash(&later_proof).unwrap(), None, "its proof-hash row");
+        assert!(!storage.block_sealed(&b3.block.hash()).unwrap(), "its block's flag");
+        // The kept block is untouched and the store verifies at the new head.
+        assert!(storage.tx_record(&covered.hash()).unwrap().is_some());
+        let check = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!((check.problem, check.last_good), (None, 1));
     }
 
     /// A gated genesis's section round-trips through the accessor `rand_getEmission` reads, and
