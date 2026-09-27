@@ -8,6 +8,20 @@ invariants, and known traps.
 
 ### v0.6 — the zkVM / rVM / aggregation fixes and the v0.6 hardening (2026-09-28; roll status below)
 
+**TAGGED v0.6 = 12a56d1 and ROLLED 2026-09-28 23:36–23:46 UTC, all-stop / all-start** (`rand-node` sha256
+`2be892da…e793`, `rand` `d7d9f8b9…3071`, GitHub release v0.6, built on E in `/root/build06`): all 26 hosts staged the
+release binaries (sha-checked) with nodes running, stopped together at head 105 435, started together; committing again
+~23:39, all 26 healthy on 12a56d1 by 23:46 (block 105 818); public RPC 0.6.0; guardian daemons active. Before it, chain
+15's full history (104 850 blocks) was re-verified with the v0.6 binary (`rand-node verify --mode quick` on a copy of
+rand-archive-2) — no proof carries a non-zero commit-phase PoW word. Rollback: `/root/rand-node.pre-v06` and
+`/root/rand.pre-v06` on every host (= v0.5.10 0c0f4db), all-stop/all-start again. circuits main = 27732e9.
+Final checks on 12a56d1: the full suite on 06e688d (only the recursion-fixture tests, the OOM-bound rVM aggregate
+binary and the since-fixed TEST-1 failed), then core 518, zkvm lib 21, executor 19, verifier_key 2+1, node lib 351
+(21 fixture), genesis_cli 3, client 116, and guest v2's 21 real-proof cheats (HIDDEN_BUNDLE_GUEST=v2) — all green.
+Issues #16–#42, #47 closed with commits; open: #43–#46, #48–#52. Reports: ~/Downloads/Rand_zkVM_Bug_Fixes_Report_2026-09-28.pdf
+and the four updated scans (Rand_Recursion_VM_Security_2026-09-28_v3, Rand_zkVM_ISA_Security_Review_2026-09-28_v2,
+RandProtocol_Automated_Security_Scan_v3_2026-09-28, RandProtocol_Unified_Security_Scan_2026-09-28_v2).
+
 The fixes from the 27–28 September zk reviews (the internal *Recursion VM security* report and its
 v2, the *zkVM and ISA security review*, the automated/unified scans, and this session's seven-part
 zk scan), each red-first with the red quoted in its commit and re-confirmed by reverting the fix
