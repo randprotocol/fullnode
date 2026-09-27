@@ -664,15 +664,19 @@ fn parse_address(s: &str) -> Result<ShieldedAddress> {
 /// `randpay:` link, then a saved contact's name — in that order, so a name that happens to
 /// collide with neither shape is still refused with one clear error rather than three swallowed
 /// ones. Returns the address, the link if TO was one (so its `amount`/`asset`/`memo` can be
-/// merged with any flags), and the contact name if TO was one (so a print or a history row can
-/// show it instead of a bare `rand1…`).
+/// merged with any flags), and the name the address is saved under, if it is — whether TO was
+/// that name, the bare address or a link to it (so the confirmation can show it).
 fn resolve_recipient(to: &str, contacts: &Contacts) -> Result<(ShieldedAddress, Option<PaymentUri>, Option<String>)> {
+    // A pasted address or link names its saved contact too (final review B2): the confirmation
+    // then says who it is, and a stranger's address shows no name at all.
     if let Ok(a) = ShieldedAddress::parse(to) {
-        return Ok((a, None, None));
+        let name = contacts.name_of(&a).map(str::to_string);
+        return Ok((a, None, name));
     }
     if let Ok(u) = PaymentUri::parse(to) {
         let a = u.address.clone();
-        return Ok((a, Some(u), None));
+        let name = contacts.name_of(&a).map(str::to_string);
+        return Ok((a, Some(u), name));
     }
     if let Some(a) = contacts.get(to) {
         return Ok((a, None, Some(to.to_string())));
@@ -2162,8 +2166,21 @@ mod tests {
         let (x, uri, _) = resolve_recipient(&format!("randpay:{a}?amount=2"), &c).unwrap();
         assert_eq!((x, uri.unwrap().amount.as_deref()), (a.clone(), Some("2")));
         let (x, _, name) = resolve_recipient("bob", &c).unwrap();
-        assert_eq!((x, name.as_deref()), (a, Some("bob")));
+        assert_eq!((x, name.as_deref()), (a.clone(), Some("bob")));
         assert!(resolve_recipient("carol", &c).is_err());
+    }
+
+    /// Final review B2: the confirmation names a saved contact whichever way its address arrived —
+    /// typed by name, pasted bare, or inside a `randpay:` link — and names nobody for an address
+    /// that is not saved.
+    #[test]
+    fn a_pasted_address_or_link_of_a_saved_contact_is_named() {
+        let (a, stranger) = (fresh_address(), fresh_address());
+        let mut c = contacts::Contacts::default();
+        c.add("bob", &a).unwrap();
+        assert_eq!(resolve_recipient(&a.to_string(), &c).unwrap().2.as_deref(), Some("bob"));
+        assert_eq!(resolve_recipient(&format!("randpay:{a}?amount=2"), &c).unwrap().2.as_deref(), Some("bob"));
+        assert_eq!(resolve_recipient(&stranger.to_string(), &c).unwrap().2, None);
     }
 
     /// [`merge_uri`]: a `--flag` and a link's own field agree if both are given, either alone if
