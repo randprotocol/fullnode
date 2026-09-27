@@ -4189,6 +4189,47 @@ mod tests {
         assert!(gated.contains("block aggregation") && gated.contains("re-measured"), "{gated}");
     }
 
+    /// The startup guard is independent of genesis validation (the 2026-09-28 interface fixes):
+    /// a section `Genesis::validate` now accepts — its one admitted shape the pinned bundle header
+    /// (IFACE-9), buildable by the rVM — still does not start. Every aggregation fix since rides
+    /// node-only because of this refusal; it lifts only with the re-measurement it names. The
+    /// message is not asserted here (it is the startup test's).
+    #[test]
+    fn startup_still_refuses_an_aggregation_section_that_validates() {
+        use randprotocol_core::confidential::ConfidentialExecutor as _;
+        use randprotocol_core::genesis::Genesis;
+        let hc = ZkExecutor::hc_bundle();
+        let shape = randprotocol_core::types::DeclaredShape {
+            profile: randprotocol_core::types::FriProfile::Test,
+            tier: randprotocol_core::types::BUNDLE_PROOF_TIER,
+            program_log_height: 12,
+            input_log_height: 10,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: randprotocol_core::types::BUNDLE_PUBLIC_LOG_HEIGHT,
+            mem_log_height: 16,
+        };
+        crate::agg_executor::check_admitted_shape(&shape).expect("the rVM builds the pinned header");
+        let mut file: Genesis = crate::storage::fixtures::genesis_file_of(7, &[&key(1)], vec![], 2);
+        file.fri_profile = "test".into();
+        file.hc_bundle = randprotocol_core::notes::word8_to_hex(&hc);
+        file.aggregation = Some(randprotocol_core::ledger::aggregation::AggregationConfig {
+            bond: 100 * randprotocol_core::UNITS_PER_RAND,
+            max_covers: 3,
+            subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![randprotocol_core::ledger::aggregation::AdmittedShape {
+                shape,
+                hc: Hash(randprotocol_core::notes::word8_to_bytes(&hc)),
+                aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap(),
+            }],
+        });
+        let gs = file.build(&StubExecutor).expect("the section validates");
+        assert!(gs.ledger.aggregation().is_some());
+        assert!(check_build_runs_genesis(&gs, &hc).is_err(), "a validating aggregation genesis still does not start");
+    }
+
     /// The aggregation gate survives a restart: it lives in the genesis file, so a reloaded
     /// ledger must carry it — a node that resumed without it would compute state-2 roots and
     /// refuse every aggregation action by name, forking off a chain-9 fleet at its first restart.
