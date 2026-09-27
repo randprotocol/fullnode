@@ -26,11 +26,14 @@ pub mod wallet;
 
 /// A node's JSON-RPC error reply. It prints as it always has, `"<message> (rpc <code>)"`, and
 /// keeps its code, so a caller can tell an older node (no such method, [`METHOD_NOT_FOUND`]) from
-/// every other failure: `err.downcast_ref::<RpcError>()`, or [`is_method_not_found`].
+/// every other failure: `err.downcast_ref::<RpcError>()`, or [`is_method_not_found`]. `data` is
+/// the reply's `data` member when it had one — a pruned node's `-32010` names its floor there
+/// ([`pruned_floor`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    pub data: Option<Value>,
 }
 
 impl std::fmt::Display for RpcError {
@@ -112,6 +115,16 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 /// True when `e` is a node saying it has no such method — the one error a wallet falls back on.
 pub fn is_method_not_found(e: &anyhow::Error) -> bool {
     e.downcast_ref::<RpcError>().is_some_and(|r| r.code == METHOD_NOT_FOUND)
+}
+
+/// A node started with `--prune-history` answers a height below its retention floor with this
+/// code, naming the floor in `data.floor` (`docs/rpc.md`).
+pub const PRUNED: i64 = -32010;
+
+/// The retention floor `e` names, when `e` is a pruned node's `-32010` that carries one.
+pub fn pruned_floor(e: &anyhow::Error) -> Option<u64> {
+    let r = e.downcast_ref::<RpcError>().filter(|r| r.code == PRUNED)?;
+    r.data.as_ref()?.get("floor")?.as_u64()
 }
 
 /// `rand_getLimits`: the chain's five genesis limits, which a wallet derives its caps from
@@ -306,7 +319,8 @@ impl RpcClient {
         if let Some(err) = resp.get("error") {
             let message = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown").to_string();
             let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-            return Err(RpcError { code, message }.into());
+            let data = err.get("data").filter(|d| !d.is_null()).cloned();
+            return Err(RpcError { code, message, data }.into());
         }
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -731,6 +745,8 @@ pub(crate) mod test_rpc {
     pub enum Reply {
         Ok(Value),
         Err(i64, &'static str),
+        /// An error reply that carries `data`, as the node's `-32010` does (`{"floor": f}`).
+        ErrData(i64, String, Value),
     }
 
     pub async fn scripted_rpc(script: Vec<(&'static str, Reply)>) -> String {
@@ -738,6 +754,7 @@ pub(crate) mod test_rpc {
         rpc_fn(move |method, _| match script.iter().find(|(m, _)| *m == method) {
             Some((_, Reply::Ok(v))) => Reply::Ok(v.clone()),
             Some((_, Reply::Err(code, msg))) => Reply::Err(*code, msg),
+            Some((_, Reply::ErrData(code, msg, data))) => Reply::ErrData(*code, msg.clone(), data.clone()),
             None => Reply::Err(-32601, "unknown method"),
         })
         .await
@@ -790,6 +807,9 @@ pub(crate) mod test_rpc {
                         Reply::Ok(v) => json!({ "jsonrpc": "2.0", "id": 1, "result": v }),
                         Reply::Err(code, msg) => {
                             json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": code, "message": msg } })
+                        }
+                        Reply::ErrData(code, msg, data) => {
+                            json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": code, "message": msg, "data": data } })
                         }
                     }
                     .to_string();

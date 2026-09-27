@@ -727,12 +727,26 @@ pub fn rebuilt_notes(w: &Wallet, tx: &Transaction) -> Vec<Note> {
 /// pass reads headers [`BLOCK_PAGE`] at a time (`rand_getBlocks`), a block only when it carries
 /// a transaction, and a raw transaction only for the three kinds that append a public note — so
 /// an idle chain costs a header page per `BLOCK_PAGE` blocks.
+///
+/// A node started with `--prune-history` (every validator: one day) answers a page reaching below
+/// its retention floor `-32010`, naming the floor — a fresh or rescanned store starts at 0, so
+/// that is the first page it asks for. The walk resumes at the floor, and the scan warns once
+/// ([`warn_pruned`]): what lies below it cannot be read from this node, and the cursor still
+/// passes it, because asking again would only be refused again.
 async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &NoteStore) -> Result<(BTreeMap<Word8, Note>, u64)> {
     let head = rpc.head().await?["height"].as_u64().context("getHead did not return a height")?;
     let mut out = BTreeMap::new();
     let mut from = store.scanned_attest_height;
-    while from <= head {
-        let headers = rpc.blocks(from, head.min(from.saturating_add(BLOCK_PAGE - 1))).await?;
+    // The highest floor a refusal named, if any page was refused.
+    let mut pruned: Option<u64> = None;
+    'pages: while from <= head {
+        let headers = match rpc.blocks(from, head.min(from.saturating_add(BLOCK_PAGE - 1))).await {
+            Ok(headers) => headers,
+            Err(e) => {
+                from = past_the_floor(e, from, &mut pruned)?;
+                continue;
+            }
+        };
         let Some(last) = headers.iter().filter_map(|h| h["height"].as_u64()).max() else {
             return Err(anyhow!("getBlocks returned no header from height {from} though the head is {head}"));
         };
@@ -744,7 +758,14 @@ async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &NoteStore) -> Re
                 continue;
             }
             let height = header["height"].as_u64().context("a block header without a height")?;
-            let block = rpc.block_by_height(height).await?;
+            // A pruning pass can raise the floor between the header page and this read.
+            let block = match rpc.block_by_height(height).await {
+                Ok(block) => block,
+                Err(e) => {
+                    from = past_the_floor(e, height, &mut pruned)?;
+                    continue 'pages;
+                }
+            };
             let Some(txs) = block["transactions"].as_array() else { continue };
             for tx in txs {
                 let kind = tx["action"]["kind"].as_str().unwrap_or_default();
@@ -764,7 +785,39 @@ async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &NoteStore) -> Re
         }
         from = last + 1;
     }
+    if let Some(floor) = pruned {
+        warn_pruned(floor);
+    }
     Ok((out, store.scanned_attest_height.max(head + 1)))
+}
+
+/// Where the block walk resumes after `e`, an error answered for a read at height `at`: the floor
+/// a pruned node's `-32010` names, when it lies above `at` (recorded in `pruned`). Any other error
+/// is the scan's — as is a floor at or below `at`, which would not move the walk.
+fn past_the_floor(e: anyhow::Error, at: u64, pruned: &mut Option<u64>) -> Result<u64> {
+    match crate::pruned_floor(&e) {
+        Some(floor) if floor > at => {
+            *pruned = Some(pruned.map_or(floor, |p| p.max(floor)));
+            Ok(floor)
+        }
+        _ => Err(e),
+    }
+}
+
+/// The one warning a scan against a pruned node prints. Only the public-rebuild pass is short:
+/// the commitment and nullifier pages come from the node's ledger, which pruning never touches,
+/// so every note whose envelope opens is found and every spend is seen. What the pass exists for
+/// — a deposit or mint published with an envelope that does not open — is lost below the floor
+/// for this scan, and since the cursor has passed it, only a rescan against an archive reads it.
+fn warn_pruned(floor: u64) {
+    eprintln!(
+        "warning: this node has pruned its blocks below height {floor}, so they were not read. A bridge deposit \
+         (bridge_attest), token mint (token_mint) or registration's initial mint (register_token) to this wallet \
+         committed below that height is still found if its envelope opens, as an honestly sealed one does, but one \
+         whose envelope does not open cannot be recovered from this node. Shielded notes and spends are unaffected \
+         (the node never prunes its commitments or nullifiers). For a complete scan, run \
+         `rand --rpc <archive node> sync --rescan`."
+    );
 }
 
 /// Headers per `rand_getBlocks` page: the node's own cap (`rpc::MAX_BLOCK_HEADERS`). An older
@@ -3794,6 +3847,9 @@ mod tests {
         /// replies are), overridden to exercise `-32603` (node N-2: not a verdict, so not
         /// `SubmitRefused`).
         fail_code: i64,
+        /// The node's retention floor (`--prune-history`): a block below it, genesis excepted, is
+        /// answered `-32010` by height, as the real node's `refuse_pruned` does. 0 is an archive.
+        floor: u64,
         /// What `rand_getGenesisHash` answers: the chain this fake is.
         genesis: Hash,
         /// How many `rand_getWitness` calls this node has answered. A wallet that keeps its own
@@ -3833,6 +3889,7 @@ mod tests {
                 tokens: serde_json::json!({ "enabled": false, "tokens": [] }),
                 fail: None,
                 fail_code: -32000,
+                floor: 0,
                 genesis: Hash([9; 32]),
                 witness_calls: 0,
             }
@@ -3867,6 +3924,21 @@ mod tests {
             }
             let n = |i: usize| p[i].as_u64().unwrap_or(0);
             let head = self.head();
+            // The real node's check: `rand_getBlocks` refuses the whole range when its first
+            // non-genesis height is pruned; `rand_getBlockByHeight` refuses a pruned height.
+            let first = match method {
+                "rand_getBlocks" if n(1) >= n(0).max(1) => Some(n(0).max(1)),
+                "rand_getBlockByHeight" if n(0) != 0 => Some(n(0)),
+                _ => None,
+            };
+            if let Some(h) = first.filter(|h| *h < self.floor) {
+                let floor = self.floor;
+                return Reply::ErrData(
+                    -32010,
+                    format!("pruned: height {h} is below this node's retention floor {floor}"),
+                    json!({ "floor": floor }),
+                );
+            }
             Reply::Ok(match method {
                 "rand_getHead" => json!({ "height": head }),
                 "rand_getGenesisHash" => json!(self.genesis.to_hex()),
@@ -4133,6 +4205,46 @@ mod tests {
         // `--no-wait`: the two spent notes are held back until the chain answers.
         assert_eq!(store.balance_of(3), 0);
         assert_eq!(store.balance(), 0);
+    }
+
+    /// RS-1: a fresh wallet pointed at a pruned node (every validator keeps one day) walks the
+    /// blocks from height 0, and the node answers `-32010` with its floor for the whole range. The
+    /// scan resumes the walk at the floor instead of failing: a note sealed honestly below it is
+    /// still found through the commitment pages (never pruned), a deposit above it is rebuilt, and
+    /// the block cursor passes the head so the next scan does not walk into the floor again. The
+    /// one thing lost is a garbage-envelope public note below the floor — which `sync --rescan`
+    /// against an archive recovers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_against_a_pruned_node_resumes_at_its_floor() {
+        let me = Wallet::from_spend_key(SpendKey([57; 8]));
+        let chain = Arc::new(Mutex::new(FakeChain::new()));
+        let (txs, notes) = public_notes_for(&me);
+        let mut txs = txs.into_iter();
+        {
+            let mut c = chain.lock().unwrap();
+            c.fund(&me, 5, 0); // block 1: a shielded note, sealed to me
+            c.commit(vec![txs.next().unwrap()], vec![(notes[0].commitment(), garbage())]); // block 2: a deposit
+            for _ in 0..4 {
+                c.commit(Vec::new(), Vec::new());
+            }
+            c.commit(vec![txs.next().unwrap()], vec![(notes[1].commitment(), garbage())]); // block 7: a mint
+            c.floor = 5;
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        scan(&rpc, &me, &mut store).await.expect("a pruned node's floor is not a failed scan");
+        assert_eq!(store.asset_balances(), vec![(0, 5), (5, 250)], "the shielded note and the mint above the floor");
+        let head = chain.lock().unwrap().head();
+        assert_eq!(store.scanned_attest_height, head + 1);
+        // The next scan starts past the floor and neither fails nor walks into it.
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.notes.len(), 2);
+
+        // `rand sync --rescan` against an archive recovers the deposit below the floor.
+        chain.lock().unwrap().floor = 0;
+        store.reset();
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.asset_balances(), vec![(0, 5), (3, 1_000), (5, 250)]);
     }
 
     /// A save round trip, as `rand` does after every command whether or not it failed.
