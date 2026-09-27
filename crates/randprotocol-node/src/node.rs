@@ -582,24 +582,33 @@ fn pick_sync_peer(
     now: Instant,
 ) -> Option<PeerId> {
     let serves = |s: &Status| s.floor <= my_height.saturating_add(1);
-    // A peer backed off after answering a live request with nothing (SYNC-2) is no candidate on
-    // either branch until its back-off expires.
+    // A peer backed off after a miss — an empty answer to a live request (SYNC-2), a failed or
+    // abandoned one (CN-1) — is no candidate on either branch until its back-off expires.
     let askable = |p: &PeerId, peer: &Peer| {
         peer.connected && !skipped.contains(p) && peer.sync_backoff_until.map_or(true, |until| now >= until)
     };
+    // And once it has expired, a peer's record ranks before its claim (CN-1): fewest consecutive
+    // misses first (`sync_backoff` is zero until one, doubles per miss, clears on a batch that
+    // applied), the claimed height only among equals. A claimed height costs nothing to make, so
+    // ranking on it alone let two silent peers claiming the top take every turn between them, their
+    // back-offs expiring while the other held the request. An honest peer that missed once — a
+    // metered answer (SW-2) — is outranked only until a clean peer is asked, and a sybil has to
+    // serve the chain to climb back, at which point it is no longer in the way.
+    let rank = |peer: &Peer, h: u64| (std::cmp::Reverse(peer.sync_backoff), h);
     let best = peers
         .iter()
         .filter(|(p, peer)| askable(p, peer))
-        .filter_map(|(p, peer)| peer.status.as_ref().filter(|s| serves(s)).map(|s| (*p, s.height)))
-        .filter(|(_, h)| *h > my_height)
-        .max_by_key(|(_, h)| *h)
-        .map(|(p, _)| p);
+        .filter_map(|(p, peer)| peer.status.as_ref().filter(|s| serves(s)).map(|s| (*p, rank(peer, s.height), s.height)))
+        .filter(|(_, _, h)| *h > my_height)
+        .max_by_key(|(_, r, _)| *r)
+        .map(|(p, _, _)| p);
     best.or_else(|| {
         if best_peer_height > my_height + 1 {
             peers
                 .iter()
                 .filter(|(p, peer)| askable(p, peer))
-                .find(|(_, peer)| peer.status.as_ref().map_or(true, serves))
+                .filter(|(_, peer)| peer.status.as_ref().map_or(true, serves))
+                .min_by_key(|(_, peer)| peer.sync_backoff)
                 .map(|(p, _)| *p)
         } else {
             None
@@ -771,10 +780,12 @@ struct Peer {
     /// The same, for the sync requests this peer sends us ([`admit_sync_request`]).
     sync_bucket: admission::TokenBucket,
     /// Not asked for a batch before this instant (SYNC-2): set by [`back_off_sync_peer`] when the
-    /// peer answered our live batch request with nothing we could use.
+    /// peer answered our live batch request with nothing we could use, or when that request failed
+    /// or was abandoned (CN-1, [`on_sync_batch_failed`]).
     sync_backoff_until: Option<Instant>,
     /// The length of the last back-off, doubled per consecutive miss up to [`SYNC_BACKOFF_MAX`];
-    /// zero after a batch from this peer applied.
+    /// zero after a batch from this peer applied. Outlives the back-off itself: `pick_sync_peer`
+    /// ranks on it before the claimed height (CN-1).
     sync_backoff: Duration,
 }
 
@@ -850,7 +861,8 @@ fn refused_sync_response(req: &SyncRequest) -> SyncResponse {
 pub const SYNC_BACKOFF_BASE: Duration = Duration::from_secs(5);
 pub const SYNC_BACKOFF_MAX: Duration = Duration::from_secs(120);
 
-/// A peer answered our live batch request with nothing we could apply (SYNC-2): not asked again
+/// A peer answered our live batch request with nothing we could apply (SYNC-2), or never answered
+/// it at all (CN-1, [`on_sync_batch_failed`]): not asked again
 /// for [`SYNC_BACKOFF_BASE`], doubling per consecutive miss to [`SYNC_BACKOFF_MAX`]. Its claimed
 /// height is what made `pick_sync_peer` choose it, and nothing else would stop the same claim
 /// winning the next tick's `max_by_key` — an honest peer that pruned the height, or one briefly
@@ -860,6 +872,22 @@ fn back_off_sync_peer(peer: &mut Peer, now: Instant) {
     peer.sync_backoff =
         if peer.sync_backoff.is_zero() { SYNC_BACKOFF_BASE } else { (peer.sync_backoff * 2).min(SYNC_BACKOFF_MAX) };
     peer.sync_backoff_until = Some(now + peer.sync_backoff);
+}
+
+/// Our live batch request to `peer` failed — a wire or codec error, libp2p's own timeout — or was
+/// abandoned past the wire timeout by [`Node::sync_from`] (CN-1, 2026-09-27): a miss exactly as
+/// SYNC-2's empty answer is, so the same back-off. Before, only an *answered* miss backed a peer
+/// off, and a peer that simply never answers is cheaper to run than one that answers empty: two
+/// of them claiming the top height alternated for ever, the failure path skipping only the one
+/// that had just failed, and the honest peer was never asked. The back-off alone would not have
+/// been enough — a silent peer holds each request for the wire's whole timeout (30 s), far past
+/// the first 5 s back-off, so the other sybil's had always expired again by its turn — which is
+/// why `pick_sync_peer` also ranks a peer's unbroken misses ahead of its claim. A peer with no
+/// entry (disconnected meanwhile, or dropped for a rejected batch) has nothing to back off.
+fn on_sync_batch_failed(peers: &mut HashMap<PeerId, Peer>, peer: PeerId, now: Instant) {
+    if let Some(p) = peers.get_mut(&peer) {
+        back_off_sync_peer(p, now);
+    }
 }
 
 /// A batch from this peer applied: it is asked again at once, and a later miss starts at the base.
@@ -2080,6 +2108,15 @@ impl Node {
                     let elapsed = self.sync_inflight.map(|(_, _, at, _)| at.elapsed().as_millis() as u64).unwrap_or(0);
                     self.sync_failures += 1;
                     self.sync_inflight = None;
+                    // The peer missed (CN-1): backed off, and — below — skipped for the retry.
+                    on_sync_batch_failed(&mut self.peers, peer, Instant::now());
+                    // The halving stays on every failure, a silent peer's included (CN-1 looked at
+                    // halving only on a size-shaped error): a batch too big for a slow link also
+                    // ends in a timeout, and a peer choosing its failure can make any error it
+                    // likes, so the error's shape proves nothing. What bounds the cost is the
+                    // doubling back on each batch that applies, below in `on_sync_response`: with
+                    // the silent peers backed off and outranked, two misses cost an honest peer
+                    // two doublings, not a batch stuck at one block.
                     // Halve the batch, down to a single block. A batch too big for the wire fails
                     // identically every time it is retried at the same size — which is how a node
                     // that fell behind chain 8's first 1.3 MB transfer proof stopped dead at that
@@ -2266,6 +2303,9 @@ impl Node {
             );
             self.sync_failures += 1;
             self.sync_inflight = None;
+            // A peer that held our request for the whole timeout is a miss (CN-1): backed off,
+            // which also keeps it out of the pick just below.
+            on_sync_batch_failed(&mut self.peers, peer, Instant::now());
         }
         // Ask above what we *hold*, not above what we have committed (review C2). A batch whose
         // blocks the three-chain rule cannot commit — three blocks over the byte budget is enough,
@@ -2299,7 +2339,7 @@ impl Node {
                             height = my_height,
                             target = self.best_peer_height(),
                             peers = ?no_peer_summary(&self.peers),
-                            "no peer holds height {}: every candidate has pruned it — a node behind every peer's retention must sync from the archive",
+                            "no peer holds height {}: every candidate has pruned it, or is backed off after a miss and asked again when that expires — a node behind every peer's retention must sync from the archive",
                             my_height + 1
                         );
                     }
@@ -4627,12 +4667,16 @@ mod tests {
         back_off_sync_peer(peers.get_mut(&liar).unwrap(), t0);
         assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t0), Some(honest), "the next candidate is asked");
         assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t0 + SYNC_BACKOFF_BASE - Duration::from_millis(1)), Some(honest));
-        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t0 + SYNC_BACKOFF_BASE), Some(liar), "back once the back-off expires");
+        // Back once the back-off expires — a candidate again, though no longer ahead of a peer
+        // with no miss (CN-1: the record ranks before the claim), so shown with that peer skipped.
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[honest], t0 + SYNC_BACKOFF_BASE - Duration::from_millis(1)), None);
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[honest], t0 + SYNC_BACKOFF_BASE), Some(liar), "back once the back-off expires");
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t0 + SYNC_BACKOFF_BASE), Some(honest), "but outranked by a peer with no miss");
         // A second miss in a row doubles it.
         let t1 = t0 + SYNC_BACKOFF_BASE;
         back_off_sync_peer(peers.get_mut(&liar).unwrap(), t1);
-        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t1 + SYNC_BACKOFF_BASE), Some(honest));
-        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t1 + 2 * SYNC_BACKOFF_BASE), Some(liar));
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[honest], t1 + SYNC_BACKOFF_BASE), None);
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[honest], t1 + 2 * SYNC_BACKOFF_BASE), Some(liar));
         // The fallback branch (no fresh candidate) honours it too: alone and backed off, no pick.
         let mut alone: HashMap<PeerId, Peer> = [(liar, at(1_000_000))].into_iter().collect();
         back_off_sync_peer(alone.get_mut(&liar).unwrap(), t0);
@@ -4648,6 +4692,60 @@ mod tests {
         assert_eq!(pick_sync_peer(&peers, 43, 1_000_000, &[], t0), Some(liar));
         back_off_sync_peer(peers.get_mut(&liar).unwrap(), t0);
         assert_eq!(peers[&liar].sync_backoff, SYNC_BACKOFF_BASE);
+    }
+
+    /// CN-1 (2026-09-27, high): two peers that each claim a height near `u64::MAX` and never answer
+    /// held a lagging node's batch sync for ever. A failed or timed-out batch request halved the
+    /// batch and re-picked with only that one peer skipped, so the two alternated — each holding
+    /// the request for the wire's whole timeout — and the honest peer slightly ahead was asked
+    /// zero times. A failure now backs the peer off as SYNC-2's empty answer does, and the picker
+    /// ranks the fewest consecutive misses before the claimed height: the back-off alone expires
+    /// (5 s) well inside the 30 s a silent peer holds each request, so it cannot be the whole fix.
+    #[test]
+    fn two_silent_sybils_claiming_the_top_height_cannot_starve_the_honest_peer() {
+        let pid = |seed: u8| PeerId::from(libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap().public());
+        let at = |h: u64| Peer { status: Some(Status { height: h, head_hash: Hash::ZERO, view: h, floor: 0 }), connected: true, ..Default::default() };
+        let (s1, s2, honest) = (pid(1), pid(2), pid(3));
+        let top = u64::MAX - 1;
+        let mut peers: HashMap<PeerId, Peer> = [(s1, at(top)), (s2, at(top)), (honest, at(50))].into_iter().collect();
+        let my = 43;
+        let mut now = Instant::now();
+        // The node's own loop, reduced to its decisions: pick; a sybil holds the request for the
+        // wire's whole timeout and it fails (`SyncFailed`, or `sync_from`'s abandon on the tick);
+        // the failure handling runs and the next candidate is picked with that peer skipped.
+        let mut skip: Option<PeerId> = None;
+        let mut asked = Vec::new();
+        for _ in 0..8 {
+            let Some(p) = pick_sync_peer(&peers, my, top, skip.as_slice(), now) else {
+                now += Duration::from_secs(2); // the sync tick
+                skip = None;
+                continue;
+            };
+            asked.push(p);
+            if p == honest {
+                break;
+            }
+            now += network::SYNC_REQUEST_TIMEOUT;
+            on_sync_batch_failed(&mut peers, p, now);
+            skip = Some(p);
+        }
+        assert_eq!(asked.last(), Some(&honest), "the honest peer must be asked; asked: {asked:?}");
+        assert!(asked.len() <= 3, "each sybil costs at most one request; asked: {asked:?}");
+        // The honest batch applies. Its next request goes to it again — even once the sybils'
+        // back-offs have expired, their unbroken misses rank them below it.
+        clear_sync_backoff(peers.get_mut(&honest).unwrap());
+        let later = now + SYNC_BACKOFF_MAX;
+        assert_eq!(pick_sync_peer(&peers, my, top, &[], later), Some(honest));
+        // Liveness: with the honest peer gone, an expired back-off is a candidate again (on the
+        // fresh branch and the fallback alike), never a stall ...
+        peers.remove(&honest);
+        assert!(pick_sync_peer(&peers, my, top, &[], later).is_some());
+        // ... and while every ahead peer is still backed off there is no pick until one expires.
+        for p in [s1, s2] {
+            on_sync_batch_failed(&mut peers, p, later);
+        }
+        assert_eq!(pick_sync_peer(&peers, my, top, &[], later), None);
+        assert!(pick_sync_peer(&peers, my, top, &[], later + SYNC_BACKOFF_MAX).is_some());
     }
 
     /// Answering the request the slot holds frees it, and is not late.
