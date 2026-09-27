@@ -70,6 +70,17 @@ const TS_RA1: u32 = 1;
 const TS_RB: u32 = 2;
 const TS_RB1: u32 = 3;
 const TS_RD_READ: u32 = 4;
+/// RVM-1 (the 2026-09-27 recursion-VM report): STOREE's read of `rd + 1`, the high lane of the
+/// stored pair. Slot 5 cannot collide with any other access at the same `(address, timestamp)`:
+/// a timestamp is `16·clk + slot`, so two accesses can only share one if they are on the same
+/// row, and on a STOREE row the only other `REG` accesses are the `ra` read (slot 0) and the
+/// `rd` read (slot 4) — no row reads or writes a register at slot 5 but this one, the slots in use
+/// being 0–4, 8 and 9. The row's two `RAM` writes use slots 0 and 1 too, but a `RAM` address is
+/// below `2^24` and a register's is `2^24 + idx` (`memory::REGISTER_BASE`), and the two classes
+/// sit in different memory tables on different buses, so they never meet in one sort. Even
+/// `rd + 1 = ra` (a STOREE whose pair ends in its own base register) is two accesses to one
+/// address at slots 0 and 5, strictly increasing as the memory table requires.
+const TS_RD1_READ: u32 = 5;
 const TS_RD_WRITE: u32 = 8;
 const TS_RD1_WRITE: u32 = 9;
 
@@ -93,6 +104,13 @@ impl Sels {
     const B_REG: &'static [Op] = &[Op::Fadd, Op::Fsub, Op::Fmul, Op::Eadd, Op::Esub, Op::Emul, Op::Emulf, Op::Sponge];
     /// Read `rd` (the compared or stored value).
     const READ_RD: &'static [Op] = &[Op::Jeq, Op::Jne, Op::Store, Op::Storee];
+    /// Read `rd + 1`, the high lane of the `rd` pair a STOREE writes to memory (RVM-1). LOADE,
+    /// the mirror image, is in `EXT_WRITE_RD`: it *writes* the pair, from its two RAM reads, so
+    /// both of its lanes were always bound. STOREE's second RAM write carries `D1`, and before
+    /// this set existed no message read `rd + 1` into it — `D1` was a free witness column, so
+    /// the high lane of every extension value written to memory (every REDUCE descriptor, every
+    /// register-allocator spill of an extension value) was the prover's choice.
+    const EXT_READ_RD: &'static [Op] = &[Op::Storee];
     /// Write `rd`.
     const WRITE_RD: &'static [Op] = &[
         Op::Fadd, Op::Fsub, Op::Fmul, Op::Faddi, Op::Fmuli, Op::Eadd, Op::Esub, Op::Emul,
@@ -258,6 +276,10 @@ where
         bus::REG.send(b, [reg_base.clone() + from_bits(RB_BIT0), ts(TS_RB), v(B0), AB::Expr::ZERO], count(is_b_reg.clone()));
         bus::REG.send(b, [reg_base.clone() + from_bits(RB_BIT0) + one.clone(), ts(TS_RB1), v(B1), AB::Expr::ZERO], count(ext_read_rb));
         bus::REG.send(b, [reg_base.clone() + v(RD), ts(TS_RD_READ), v(D0), AB::Expr::ZERO], count(reads_rd));
+        // RVM-1: STOREE's high lane `D1` is `rd + 1`'s value, read here exactly as `D0` is read
+        // from `rd` on the line above — without it the `RAM` write of `D1` below carried a value
+        // nothing constrained (`tests/cpu.rs`'s binding test checks every opcode for this).
+        bus::REG.send(b, [reg_base.clone() + v(RD) + one.clone(), ts(TS_RD1_READ), v(D1), AB::Expr::ZERO], count(sel_sum(Sels::EXT_READ_RD)));
         bus::REG.send(b, [reg_base.clone() + v(RD), ts(TS_RD_WRITE), v(D0), one.clone()], count(writes_rd));
         bus::REG.send(b, [reg_base.clone() + v(RD) + one.clone(), ts(TS_RD1_WRITE), v(D1), one.clone()], count(ext_writes_rd));
 
@@ -305,6 +327,13 @@ pub fn register_accesses(events: &[Event]) -> Vec<MemAccess> {
         }
         if Sels::READ_RD.contains(&op) {
             push(clk, TS_RD_READ, rd, e.d[0], false);
+        }
+        // RVM-1: the mirror of the AIR's `EXT_READ_RD` send. The emulator's STOREE arm sets
+        // `d[1] = regs[rd + 1]`, so an honest run's read matches the last write of `rd + 1`; a
+        // run whose stored high lane was rewritten now fails the memory table's read-after-write
+        // check here in the builder and, built by hand past that, in the constraints.
+        if Sels::EXT_READ_RD.contains(&op) {
+            push(clk, TS_RD1_READ, rd + 1, e.d[1], false);
         }
         if Sels::WRITE_RD.contains(&op) && rd != 0 {
             push(clk, TS_RD_WRITE, rd, e.d[0], true);

@@ -318,7 +318,10 @@ echo "reminder: --features cuda / mock-cuda need circuits checked out at ../../.
 # ── the recursion VM (rVM) → crates/randprotocol-rvm ────────────────────────────────────────────────
 # M5.3/M5.4's recursion VM, vendored at circuits main `271679d` ("Merge zkvm-m5-4") and re-vendored
 # at `573ef2e` (audit v3 AGG-2, the aggregate binding), then at `224960c` (ZKV-2: the backends' seed
-# names research's `poseidon2_constants::PERM_SEED`; comments). Two vendored files carry hand fixes this
+# names research's `poseidon2_constants::PERM_SEED`; comments), then at `fbe29b8` (RVM-1: STOREE
+# reads the high lane of the stored pair from `rd + 1`; the aggregate program's digest does not
+# move, the rVM verifier does). Re-vendoring the rVM alone is this section alone: the research
+# section above rewrites `guests-compiled/PROVENANCE.md` and would carry research's older drift. Two vendored files carry hand fixes this
 # section does not reproduce — keep them when re-syncing: `Cargo.toml`'s `license.workspace`
 # line and `tests/backend.rs`'s doc comment (`randprotocol-zkvm`, not the old crate name). What the
 # rename has to achieve (the block-aggregation plan's R1): recursion's own
@@ -391,4 +394,4 @@ open(p, 'w').write(s)
 PY
 grep -rl "recursion::" "$RVM_DST/tests" | xargs -I{} sed -i '' 's/recursion::/randprotocol_rvm::/g' {} 2>/dev/null || true
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 224960c) into $RVM_DST"
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin fbe29b8) into $RVM_DST"

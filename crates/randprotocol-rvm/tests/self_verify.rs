@@ -305,23 +305,34 @@ fn the_self_verifiers_measured_cost_at_two_fixture_shapes() {
     assert_eq!(exec_b.hints_read, tape_b.len(), "the program consumes the whole tape");
 
     // The two fixtures, pinned exactly (the program is straight-line and its structure is
-    // deterministic — a code change that moves any number is a deliberate re-measurement):
+    // deterministic — a code change that moves any number is a deliberate re-measurement).
+    // RVM-1 (2026-09-27) moved both by the same amount: the cpu table's new `REG` read of
+    // `rd + 1` on STOREE rows is one more global interaction, which the self-verifier compiles
+    // into its constraint evaluation and its lookup-challenge and opening phases — +189 rows and
+    // instructions, +2 permutations, +362 memory accesses, +40 witness words at both shapes
+    // (was (275215, 7440, 402909, 277058, 29375) and (367340, 9090, 478827, 369443, 35207); the
+    // report's measured deltas, re-measured here). The *aggregate* program does not move: its
+    // digest is pinned across the fix in `tests/verifier.rs`.
     assert_eq!(
         (r.cpu_rows, r.permutations, r.mem_accesses, r.program_instrs, r.witness_words),
-        (275215, 7440, 402909, 277058, 29375),
+        (275404, 7442, 403271, 277247, 29415),
         "the tier-8 toy fixture's CycleReport, pinned"
     );
     assert_eq!(
         (rb.cpu_rows, rb.permutations, rb.mem_accesses, rb.program_instrs, rb.witness_words),
-        (367340, 9090, 478827, 369443, 35207),
+        (367529, 9092, 479189, 369632, 35247),
         "the busy fixture's CycleReport, pinned"
     );
 
     // Phase 5 is *not* height-independent: the constraint DAG is per-chip, but the emitted
     // selectors and quotient recomposition square `log(degree_bits)` times per instance
     // (`emit_selectors`' power loop), so the phase grows with the declared heights. Measured:
-    // 7 245 rows here, 7 525 there — the derivation in `docs/03` accounts for it explicitly.
+    // 7 263 rows here, 7 543 there — the derivation in `docs/03` accounts for it explicitly.
+    // RVM-1 added 18 to both (was 7 245 / 7 525): the new STOREE message is one more lookup
+    // term in the cpu chip's constraint DAG, which phase 5 evaluates. The 2026-09-27 report
+    // measured only the CycleReport deltas above (its run stopped at the first failing pin);
+    // this one was measured here.
     let p5a: usize = vp.phase5.iter().map(|c| c.instrs).sum();
     let p5b: usize = vp_b.phase5.iter().map(|c| c.instrs).sum();
-    assert_eq!((p5a, p5b), (7245, 7525), "phase 5 varies with the degree bits, measured");
+    assert_eq!((p5a, p5b), (7263, 7543), "phase 5 varies with the degree bits, measured");
 }

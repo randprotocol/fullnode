@@ -778,3 +778,24 @@ fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
     assert_eq!(got_off, got_on);
     assert_eq!(got_on.len(), 4, "the interface digest, from both builds");
 }
+
+/// The registered aggregate program does not move with an rVM *constraint* change (RVM-1, the
+/// 2026-09-27 recursion-VM report). A program digest hashes instructions, and `verify_rv32n`'s
+/// instructions are a function of the *inner* (RV32-machine) shape and key alone — the rVM's own
+/// tables are the machine that runs the program, not part of it. So STOREE's new register read
+/// of `rd + 1` (and any other change to `tables/*.rs` that emits no instruction) leaves this digest
+/// where it was, and a node's pinned `aggregate_program_digest` stays valid across the fix — what
+/// changes is the rVM *verifier*: a proof made by an unfixed prover no longer verifies. Pinned at
+/// the Test fixture's shape, recorded on circuits `224960c` (before the fix) and asserted after
+/// it; the self-verifier (`verify_rv32r`), which compiles the rVM's own tables into its program,
+/// is the one whose digest and costs do move (`tests/self_verify.rs`).
+#[test]
+fn the_aggregate_program_digest_is_unchanged_by_rvm_constraint_fixes() {
+    let (_p, shape, key) = one_test_proof();
+    let vp = randprotocol_rvm::programs::verify_rv32n(&shape, &key, Checkpoints::Off);
+    assert_eq!(
+        randprotocol_rvm::programs::digest_hex(&vp.program),
+        "1ec0c545003179b1ca4215b439d2d69fa33149a5257a04dc8473030fc2deeeeb",
+        "the aggregate program's digest at the Test fixture shape, as registered before RVM-1"
+    );
+}
