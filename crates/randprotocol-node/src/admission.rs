@@ -643,6 +643,31 @@ pub fn deploy_outside_pc_window(tx: &Transaction) -> Option<TxError> {
         .then(|| TxError::BadProgram(randprotocol_core::program::pc_window_error()))
 }
 
+/// A `Call` whose proof declares its input table — or a keccak or sha256 table it carries — under
+/// `MIN_PRIVATE_TABLE_LOG_HEIGHT` (2^7 rows): `TxError::CallRevealsPrivateInputs`, telling the
+/// wallet to upgrade (COV-2). A table that small has fewer random rows than the proof opens of it
+/// (80 FRI queries + 2 out-of-domain points), so the proof discloses the call's private inputs;
+/// the prover is being fixed upstream to floor the tables at 128 rows. Decided on the header
+/// alone (`ZkExecutor::call_private_table_under_floor`), before any verification. Bundles are
+/// exempt: their shape is pinned and safe (a 2048-row input table, no hash tables).
+///
+/// **Node policy, never a ledger validity rule**: a block from a proposer that pooled such a call
+/// still applies — refusing it would split the chain on a privacy rule no genesis carries — and
+/// the verdict is not permanent ([`is_permanent`] leaves it out: the floor is this build's policy,
+/// which can move, and a peer on an older build that forwards the call must not be penalised), so
+/// it is an Ignore and is never cached.
+pub fn call_reveals_private_inputs(tx: &Transaction) -> Option<TxError> {
+    let randprotocol_core::Action::Call { proof, .. } = &tx.action else {
+        return None;
+    };
+    let (table, log_height) = randprotocol_zkvm::executor::call_private_table_under_floor(proof)?;
+    Some(TxError::CallRevealsPrivateInputs {
+        table,
+        log_height,
+        min: randprotocol_zkvm::executor::MIN_PRIVATE_TABLE_LOG_HEIGHT,
+    })
+}
+
 /// The keys a faucet `Mint` may be signed by, as this node's admission policy: the genesis's
 /// `staking.faucet_minters` where it lists them — the validity rule, which this then only
 /// anticipates — and otherwise the genesis validators, the register a chain starts with, every key
@@ -1122,6 +1147,68 @@ mod tests {
         );
         assert_eq!(bucket.tokens, None, "a refused deposit spends none of the peer's allowance");
         assert_eq!(GossipOutcome::for_transaction(&fits, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
+    }
+
+    /// COV-2: a call proof whose input table is 2^3 rows (a four-word call, what every wallet's
+    /// prover declares today) reveals its private inputs through the proof's openings; so does a
+    /// keccak or sha256 table under 2^7. The pool refuses such a call before any verification, as
+    /// a non-permanent policy verdict (Ignore, never cached). A header at the 2^7 floor — what the
+    /// upstream prover now declares — pools; a proof that does not decode is the ledger's to
+    /// refuse, not this screen's.
+    #[test]
+    fn a_call_whose_private_tables_are_under_the_floor_is_not_pooled() {
+        use crate::mempool::{Mempool, MempoolError};
+        use crate::storage::fixtures;
+        use randprotocol_core::confidential::StubExecutor;
+        use randprotocol_zkvm::machine::{Backend, FriProfile, Proof};
+
+        let (gs, _) = fixtures::bridged_genesis(1);
+        let l = gs.ledger.clone();
+        let program = randprotocol_zkvm::guests::private_payment(1000);
+        let (bytes, _, _) =
+            randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu).unwrap();
+        let honest: Proof = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(honest.input_log_height, 3, "a four-word call's input table today");
+        assert_eq!((honest.keccak_log_height, honest.sha256_log_height), (0, 0));
+        let call = |proof: Vec<u8>| {
+            let action = randprotocol_core::Action::Call { program: randprotocol_core::Hash::digest(b"program"), proof, input_envelope: None };
+            let b = fixtures::bundle(&l, [[50; 8], [51; 8]], [[52; 8], [53; 8]], randprotocol_core::gas::fee_floor(&action));
+            StubExecutor::bound(Transaction::shielded(l.chain_id(), b, action))
+        };
+        let with = |f: &dyn Fn(&mut Proof)| {
+            let mut p: Proof = postcard::from_bytes(&bytes).unwrap();
+            f(&mut p);
+            call(p.to_bytes())
+        };
+        let pool = Mempool::new(100);
+        let refused = |tx: &Transaction| match pool.precheck(tx, &l, &StubExecutor) {
+            Err(MempoolError::Invalid(e)) => Some(e),
+            Err(other) => panic!("unexpected pool refusal {other}"),
+            Ok(_) => None,
+        };
+
+        let got = refused(&call(bytes.clone())).expect("the finding: a 2^3-row input table is pooled today");
+        assert_eq!(got, TxError::CallRevealsPrivateInputs { table: "input", log_height: 3, min: 7 });
+        assert!(!is_permanent(&got), "policy, never cached");
+        let mut cache = RefusedCache::new(4);
+        assert_eq!(acceptance_for(&Err(got.clone()), Hash::digest(b"x"), &mut cache), Acceptance::Ignore);
+        assert!(cache.is_empty());
+        assert!(got.to_string().contains("upgrade the wallet"), "{got}");
+
+        assert_eq!(refused(&with(&|p| p.input_log_height = 7)), None, "the floored header pools");
+        assert_eq!(
+            refused(&with(&|p| (p.input_log_height, p.keccak_log_height) = (7, 5))),
+            Some(TxError::CallRevealsPrivateInputs { table: "keccak", log_height: 5, min: 7 })
+        );
+        assert_eq!(
+            refused(&with(&|p| (p.input_log_height, p.sha256_log_height) = (7, 6))),
+            Some(TxError::CallRevealsPrivateInputs { table: "sha256", log_height: 6, min: 7 })
+        );
+        assert_eq!(refused(&with(&|p| (p.input_log_height, p.keccak_log_height, p.sha256_log_height) = (8, 7, 9))), None);
+        assert_eq!(refused(&call(vec![4u8; 64])), None, "undecodable bytes are the ledger's to refuse");
+        // The ledger itself never raises it: a block carrying such a call applies (StubExecutor
+        // verifies stub proofs only, so the rule's absence is shown on the variant: nothing in
+        // `randprotocol-core` constructs it).
     }
 
     /// ZKV-11 (pc-wrap): a deploy whose padded program table crosses the u32 pc wrap can never be

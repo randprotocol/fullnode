@@ -124,6 +124,38 @@ pub const MAX_CALL_KECCAK_LOG_HEIGHT: u8 = 12;
 /// the intended user.
 pub const MAX_CALL_SHA256_LOG_HEIGHT: u8 = 13;
 
+/// COV-2 (2026-09-28): the smallest log height a call proof's input, keccak or sha256 table may
+/// declare and keep its contents private — 128 rows. The PCS is hiding, but a table of `h` rows is
+/// opened at 80 FRI queries plus two out-of-domain points, and once that is more evaluations than
+/// the `h` random rows mask, the openings determine the table: at 2^3 rows (every four-word call
+/// today) the proof carries its private inputs. The prover is being fixed upstream to floor all
+/// three tables here. **Not a validity rule**: `verify_call` does not check it, so a block carrying
+/// such a call still applies; it is the node's pool policy (`call_private_table_under_floor`,
+/// `admission::call_reveals_private_inputs`), non-permanent. Bundles are exempt — their shape is
+/// pinned (`decode_and_check`): a 2048-row input table and no hash tables.
+pub const MIN_PRIVATE_TABLE_LOG_HEIGHT: u8 = 7;
+
+/// The first private table a *call* proof declares under [`MIN_PRIVATE_TABLE_LOG_HEIGHT`], as
+/// `(table, declared log height)` — `"input"`, then `"keccak"` and `"sha256"` when present (a `0`
+/// declares no such table and nothing to leak). `None` for a header at or above the floor, and for
+/// bytes that do not decode canonically — those are the ledger's to refuse (`decode_and_check`).
+/// Reads the header only; nothing is verified. Next to the call caps `verify_call` enforces, but
+/// policy, not one of them (see the constant's doc comment).
+pub fn call_private_table_under_floor(proof: &[u8]) -> Option<(&'static str, u8)> {
+    let proof = decode_canonical(proof).ok()?;
+    let min = MIN_PRIVATE_TABLE_LOG_HEIGHT;
+    if proof.input_log_height < min {
+        return Some(("input", proof.input_log_height));
+    }
+    if proof.keccak_log_height != NO_KECCAK && proof.keccak_log_height < min {
+        return Some(("keccak", proof.keccak_log_height));
+    }
+    if proof.sha256_log_height != NO_SHA256 && proof.sha256_log_height < min {
+        return Some(("sha256", proof.sha256_log_height));
+    }
+    None
+}
+
 /// The largest `input_log_height` a call at `tier` can honestly declare — the input table's
 /// analogue of `Tier::max_keccak_log_height` (deep scan 2026-09-24, zkvm). Every private-input
 /// word is absorbed by an `IS_INDIGEST` cpu row, four words a row plus the salt row

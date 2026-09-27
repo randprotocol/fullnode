@@ -307,9 +307,9 @@ impl Mempool {
     ) -> Result<Hash, MempoolError> {
         let c = self.pool_conflicts(&tx, ledger, executor)?;
         ledger.validate(&tx, executor).map_err(MempoolError::Invalid)?;
-        // The faucet minter policy after the ledger's own verdict: this path runs no `precheck`,
-        // and it is the one a local `rand_mint` takes.
-        self.faucet_policy(&tx, ledger).map_err(MempoolError::Invalid)?;
+        // The pool's policies (the faucet minter rule, COV-2's call screen) after the ledger's own
+        // verdict: this path runs no `precheck`, and it is the one a local `rand_mint` takes.
+        self.pool_policy(&tx, ledger).map_err(MempoolError::Invalid)?;
         Ok(self.admit(tx, c))
     }
 
@@ -395,7 +395,7 @@ impl Mempool {
     ) -> Result<Claims, MempoolError> {
         let c = self.pool_conflicts(tx, ledger, executor)?;
         Self::applies(tx, &c.commitments, c.claim, ledger).map_err(MempoolError::Invalid)?;
-        self.faucet_policy(tx, ledger).map_err(MempoolError::Invalid)?;
+        self.pool_policy(tx, ledger).map_err(MempoolError::Invalid)?;
         Ok(c)
     }
 
@@ -403,7 +403,14 @@ impl Mempool {
     /// minter set, when the node configured one. Asked here and in [`Mempool::insert`] only, not
     /// at every tip like [`Mempool::applies`]: the set is fixed for the process, so a mint that
     /// passed once passes for as long as it is pooled.
-    fn faucet_policy(&self, tx: &Transaction, ledger: &Ledger) -> Result<(), TxError> {
+    ///
+    /// COV-2's screen rides here too (`admission::call_reveals_private_inputs`), unconditionally:
+    /// a call whose proof would disclose its private inputs is not pooled, before any verification
+    /// is scheduled for it. Policy like the minter rule — never permanent, never the ledger's.
+    fn pool_policy(&self, tx: &Transaction, ledger: &Ledger) -> Result<(), TxError> {
+        if let Some(e) = crate::admission::call_reveals_private_inputs(tx) {
+            return Err(e);
+        }
         match &self.faucet_minters {
             Some(minters) => crate::admission::minter_not_allowed(tx, ledger, minters).map_or(Ok(()), Err),
             None => Ok(()),

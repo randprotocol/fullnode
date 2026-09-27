@@ -162,6 +162,19 @@ pub enum TxError {
     /// node must not be penalised for relaying what its own node still admits.
     #[error("minter {0} is not a faucet minter on this chain")]
     MinterNotAllowed(Address),
+    /// COV-2 (2026-09-28): a call proof declaring its input, keccak or sha256 table below
+    /// 2^`min` rows. Such a table is smaller than what the proof opens of it — 80 FRI queries plus
+    /// two out-of-domain points against `h` random rows of the hiding commitment — so the proof
+    /// reveals the table's private contents. The prover is being fixed upstream to floor the
+    /// three tables at 128 rows; until every wallet runs it, a node refuses to pool such a call.
+    /// **Node policy only — the ledger never raises it**: a block carrying one still applies, and
+    /// the verdict is never permanent (a policy can move; the wallet that upgrades resubmits).
+    #[error(
+        "call proof declares a {table} table of 2^{log_height} rows, under the 2^{min} floor: a \
+         table that small leaks its private contents through the proof — upgrade the wallet, \
+         whose prover pads it, and prove the call again"
+    )]
+    CallRevealsPrivateInputs { table: &'static str, log_height: u8, min: u8 },
     #[error("bad mint signature")]
     BadMintSignature,
     #[error("the mint's commitment does not open to its published note and amount")]
