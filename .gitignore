@@ -13,3 +13,11 @@ bin-b00bc72/
 bin-03c9fb9/
 bin-*/
 .worktrees/
+# A wallet's note store holds every note plaintext, nullifier and leaf index it knows, and a
+# wallets/ directory holds spend keys: neither belongs in a public repository. Nor do node A's
+# log or a crate-local build directory.
+/wallets/
+*.notes.json
+*.notes.json.*
+/run-a.log
+**/target/
