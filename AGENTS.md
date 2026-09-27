@@ -8,6 +8,17 @@ invariants, and known traps.
 
 ### v0.5.9 — the 2026-09-27 rescan fixes (tagged 2026-09-27; roll status below)
 
+**ROLLED 2026-09-27 08:46–10:11 UTC, one node at a time, no pause.** GitHub release `v0.5.9`
+(`rand-node` sha256 `28a0130c…fcce5`, `rand` `14b41094…c6d6`, built on E in `/root/build059`).
+Each host downloaded both binaries from the release itself and checked the pinned sha256s before
+anything stopped: relaying 47 MB from the laptop stalled at ~170 KB/s upload, so
+`update-droplet.sh`'s laptop relay is not the path for a whole-fleet roll. Canary MEM1, then B, F,
+the eleven regional, D, C, A, rand-archive-2, E (with `--prune-history 24h` back — the public RPC
+now ends at obs1), obs1 last (~3 min public-RPC gap); each back at the head in 25–190 s; then the
+six guardian hosts (their own key, `~/.ssh/rand_guardian_ed25519`; guardian daemons stayed
+active). Rollback: `/root/rand-node.pre-v059` and `/root/rand.pre-v059` on every host
+(= `dd2ccbe`), stop → install → start.
+
 A four-reviewer rescan of `8e64781` (chain 15 live, the chain-15 genesis work never scanned) plus
 `cargo audit` (0 vulnerabilities; bincode, derivative, paste, atomic-polyfill unmaintained). Every
 fix red-first, each half reverted separately to confirm, the red quoted in its commit. **Node and
