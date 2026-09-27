@@ -1327,6 +1327,13 @@ node-only otherwise; a chain without the field is unaffected.
   per-transaction key.
 - A malformed envelope's memo field never costs the payee the note itself: only the memo is
   lost, not the payment.
+- **The `rand` CLI (not an RPC change): one amount convention.** `rand send --asset <token>`,
+  `rand token mint --amount` and `rand token burn <ASSET> <AMOUNT>` all read the amount in the
+  asset's display units, at its `rand_getTokens` row's own `decimals` (RAND at nine) — the same
+  units a `randpay:` link's `amount` carries. All three took whole smallest units before; a
+  script passing `1000000` for one unit of a 6-decimal token now moves a million of them, so
+  scale such amounts down. `send`'s confirmation prints both forms
+  (`10.00000000 zUSD (1000000000 units)`).
 - A non-conforming envelope size (present `envelope_bytes`, wrong length) is refused
   `TxError::EnvelopeSize { expected, got }`, a permanent verdict.
 

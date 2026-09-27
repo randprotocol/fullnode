@@ -2665,6 +2665,49 @@ pub fn parse_decimal(text: &str, decimals: u8) -> Result<u64> {
     scaled.parse::<u64>().map_err(|_| anyhow!("{text} is too large"))
 }
 
+/// `units` at `decimals` fractional digits, every digit shown (`1000000000` at 8 is
+/// `"10.00000000"`, at 0 `"1000000000"`): [`parse_decimal`]'s inverse.
+pub fn format_decimal(units: u64, decimals: u8) -> String {
+    if decimals == 0 {
+        return units.to_string();
+    }
+    let digits = format!("{units:0>width$}", width = decimals as usize + 1);
+    let (int, frac) = digits.split_at(digits.len() - decimals as usize);
+    format!("{int}.{frac}")
+}
+
+/// An amount as `rand send`'s confirmation shows it: display units with the asset's decimals,
+/// its symbol, and the base units the proof will actually carry — `10.00000000 zUSD (1000000000
+/// units)` — so a node that lies about a token's `decimals` shows up before anything is sent
+/// (the display figure and the typed one disagree).
+pub fn display_amount(units: u64, decimals: u8, symbol: &str) -> String {
+    format!("{} {symbol} ({units} units)", format_decimal(units, decimals))
+}
+
+/// A token row's `decimals`, held to a `u8`.
+fn row_decimals(row: &Value, asset: u32) -> Result<u8> {
+    let decimals = row["decimals"].as_u64().context("a rand_getTokens row without decimals")?;
+    u8::try_from(decimals).map_err(|_| anyhow!("token {asset} reports {decimals} decimals, which is not plausible"))
+}
+
+/// An asset's display decimals and symbol: RAND's nine and `RAND` without asking the node, or a
+/// token's registry row — found in the same whole `rand_getTokens` listing [`resolve_asset`]
+/// pages, never a per-token lookup. The symbol is the node's text: show it sanitised.
+pub async fn asset_units(rpc: &RpcClient, asset: u32) -> Result<(u8, String)> {
+    if asset == 0 {
+        return Ok((9, "RAND".to_string()));
+    }
+    let row = find_token_row(rpc, &asset.to_string()).await?;
+    let symbol = row["symbol"].as_str().map(str::to_string).unwrap_or_else(|| format!("asset {asset}"));
+    Ok((row_decimals(&row, asset)?, symbol))
+}
+
+/// [`parse_decimal`] at a token row's own `decimals` — `rand token mint`'s reader, which already
+/// holds the row.
+pub fn parse_row_amount(row: &Value, asset: u32, text: &str) -> Result<u64> {
+    parse_decimal(text, row_decimals(row, asset)?)
+}
+
 /// `--amount`/a `randpay:` link's `amount`, in the asset's own display units: RAND (asset 0) at
 /// this chain's nine decimals via [`parse_amount`](randprotocol_core::parse_amount)'s scale, and
 /// any other asset at its registry row's own `decimals` — the same whole-listing
@@ -2676,12 +2719,7 @@ pub fn parse_decimal(text: &str, decimals: u8) -> Result<u64> {
 /// the asset's smallest unit; it is now the same display-unit form a `randpay:` link's `amount`
 /// takes, matching every other amount this wallet prints or parses.
 pub async fn parse_asset_amount(rpc: &RpcClient, asset: u32, text: &str) -> Result<u64> {
-    if asset == 0 {
-        return parse_decimal(text, 9);
-    }
-    let row = find_token_row(rpc, &asset.to_string()).await?;
-    let decimals = row["decimals"].as_u64().context("a rand_getTokens row without decimals")?;
-    let decimals = u8::try_from(decimals).map_err(|_| anyhow!("token {asset} reports {decimals} decimals, which is not plausible"))?;
+    let (decimals, _) = asset_units(rpc, asset).await?;
     parse_decimal(text, decimals)
 }
 
@@ -5661,6 +5699,22 @@ mod tests {
         assert!(e.contains("at most 9 decimals"), "{e}");
         assert_eq!(parse_decimal("2", 0).unwrap(), 2);
         assert!(parse_decimal("0.5", 0).is_err());
+    }
+
+    /// [`format_decimal`] / [`display_amount`]: every digit at the asset's decimals, and the base
+    /// units beside them (final review B3: a node lying about `decimals` shows before sending).
+    #[test]
+    fn the_confirmation_amount_shows_display_and_base_units() {
+        assert_eq!(format_decimal(1_000_000_000, 8), "10.00000000");
+        assert_eq!(format_decimal(1_500_000_000, 9), "1.500000000");
+        assert_eq!(format_decimal(5, 9), "0.000000005");
+        assert_eq!(format_decimal(42, 0), "42");
+        assert_eq!(format_decimal(u64::MAX, 19), "1.8446744073709551615");
+        assert_eq!(display_amount(1_000_000_000, 8, "zUSD"), "10.00000000 zUSD (1000000000 units)");
+        assert_eq!(display_amount(1_500_000_000, 9, "RAND"), "1.500000000 RAND (1500000000 units)");
+        for (units, decimals) in [(0u64, 9u8), (1, 9), (123_456_789_012, 6), (7, 0)] {
+            assert_eq!(parse_decimal(&format_decimal(units, decimals), decimals).unwrap(), units, "round trip");
+        }
     }
 
     /// [`parse_asset_amount`]: RAND (asset 0) never touches the node; any other asset reads its

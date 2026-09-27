@@ -404,8 +404,9 @@ enum TokenCmd {
     Burn {
         /// The token: its registry index, or its id (`rpl1…` or 64 hex).
         asset: String,
-        /// Amount in the token's own smallest unit.
-        amount: u64,
+        /// Amount in the token's display units, at its registry row's own `decimals` (as
+        /// `send --asset` reads it).
+        amount: String,
         /// Fee in RAND; the floor is 0.001.
         #[arg(long)]
         fee: Option<String>,
@@ -528,9 +529,10 @@ enum TokenCmd {
         /// The recipient's shielded address.
         #[arg(long)]
         to: String,
-        /// Amount in the token's own smallest unit.
+        /// Amount in the token's display units, at its registry row's own `decimals` (as
+        /// `send --asset` reads it).
         #[arg(long)]
-        amount: u64,
+        amount: String,
         /// The token's mint authority: a Dilithium2 key file (`rand-node keygen`'s shape, or
         /// `rand token create --authority-key-out`'s).
         #[arg(long)]
@@ -1126,9 +1128,12 @@ async fn main() -> Result<()> {
             );
             // Display units, whichever asset moves: RAND's nine decimals, or the token registry's
             // own `decimals` for its own — the same units a `randpay:` link's `amount` carries.
-            let amount = wallet::parse_asset_amount(&rpc, asset, &amount_text).await?;
-            let asset_label = if asset == 0 { "RAND".to_string() } else { format!("asset {asset}") };
-            println!("{}", confirmation(name.as_deref(), &to.fingerprint().to_string(), &format!("{amount_text} {asset_label}"), &memo_text));
+            // The confirmation shows the display figure *and* the base units the proof will carry
+            // (final review B3), so a node that lies about a token's decimals is visible here.
+            let (decimals, symbol) = wallet::asset_units(&rpc, asset).await?;
+            let amount = wallet::parse_decimal(&amount_text, decimals)?;
+            let shown = wallet::display_amount(amount, decimals, &symbol);
+            println!("{}", confirmation(name.as_deref(), &to.fingerprint().to_string(), &shown, &memo_text));
             if !yes {
                 confirm("send?", "send", "not sent")?;
             }
@@ -1634,6 +1639,9 @@ async fn main() -> Result<()> {
         Cmd::Token(TokenCmd::Burn { asset, amount, fee, no_wait, cuda }) => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let asset = wallet::resolve_asset(&rpc, &asset).await?;
+            let (decimals, symbol) = wallet::asset_units(&rpc, asset).await?;
+            let amount = wallet::parse_decimal(&amount, decimals)?;
+            eprintln!("burning {}", memo_display::sanitize(&wallet::display_amount(amount, decimals, &symbol)));
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
                 None => gas::fee_floor(&Action::TokenBurn { asset, amount }),
@@ -1798,6 +1806,8 @@ async fn main() -> Result<()> {
             let asset = u32::try_from(row["index"].as_u64().context("a token row without its index")?)
                 .context("a token row whose index is not a u32")?;
             let recipient = parse_address(&to)?;
+            let amount_text = amount;
+            let amount = wallet::parse_row_amount(&row, asset, &amount_text)?;
             let authority = wallet::load_authority_key(&authority_key)?;
             let chain_id = rpc.chain_id().await?;
             let (w, path, mut store) = open_wallet(&cli.key)?;
@@ -1812,7 +1822,7 @@ async fn main() -> Result<()> {
             let s = wallet::submit_token_mint(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait).await;
             store.save(&path)?;
             report(&s?, "token mint");
-            println!("minted {amount} of asset {asset} to {to}");
+            println!("minted {amount_text} ({amount} units) of asset {asset} to {to}");
         }
         Cmd::Token(TokenCmd::SetAuthority { asset, authority_key, new_key, renounce, fee, no_wait, cuda }) => {
             if renounce == new_key.is_some() {
@@ -2003,12 +2013,18 @@ mod tests {
         };
         assert_eq!((authority_key_out.as_deref(), initial), (Some(Path::new("authority.key.json")), Some(500)));
 
+        // Final review B3: `token mint` and `token burn` read AMOUNT in the token's display
+        // units, like `send --asset` — one convention across the CLI.
         let Ok(Cmd::Token(TokenCmd::Mint { asset, to: to_arg, amount, authority_key, .. })) =
-            parse(&["token", "mint", "--asset", "rpl1keyed", "--to", to, "--amount", "500", "--authority-key", "authority.key.json"])
+            parse(&["token", "mint", "--asset", "rpl1keyed", "--to", to, "--amount", "1.5", "--authority-key", "authority.key.json"])
         else {
             panic!("mint parses")
         };
-        assert_eq!((asset.as_str(), to_arg.as_str(), amount, authority_key.as_path()), ("rpl1keyed", to, 500, Path::new("authority.key.json")));
+        assert_eq!((asset.as_str(), to_arg.as_str(), amount.as_str(), authority_key.as_path()), ("rpl1keyed", to, "1.5", Path::new("authority.key.json")));
+        let Ok(Cmd::Token(TokenCmd::Burn { asset, amount, .. })) = parse(&["token", "burn", "2", "0.25"]) else {
+            panic!("burn parses a display-unit amount")
+        };
+        assert_eq!((asset.as_str(), amount.as_str()), ("2", "0.25"));
 
         let Ok(Cmd::Token(TokenCmd::SetAuthority { asset, new_key, renounce, .. })) =
             parse(&["token", "set-authority", "--asset", "2", "--authority-key", "authority.key.json", "--new-key", "successor.key.json"])

@@ -238,19 +238,25 @@ Full flag detail is `docs/cli.md`'s `rand` (wallet) table; this is the token-spe
 | command | what it does |
 |---|---|
 | `rand token create --name … --symbol … --decimals <0..=9> --salt <hex32>` then either `--fixed-supply <N> --to <ADDR>` or `--authority-key-out <FILE> [--initial <N> --to <ADDR>]` | register a token at the registry's next index: fixed supply (mints once, authority `none`) or `Key`-authorised (writes a fresh Dilithium2 key file), with or without an initial mint. Reads `next_index` and `registration_fee` off `rand_getTokens` before proving; prints the index and the id, hex and `rpl1…`, on success, or "another token took index N first — re-run to register at N+1" on `IndexMismatch` |
-| `rand token mint --asset <A> --to <ADDR> --amount <N> --authority-key <FILE>` | mint more of a `Key`-authorised token, signed by its authority; refused up front if `--asset` is not `Key`-authorised or `--authority-key` is the wrong key |
+| `rand token mint --asset <A> --to <ADDR> --amount <N> --authority-key <FILE>` | mint more of a `Key`-authorised token, signed by its authority; `N` is in the token's display units (`1.5` of a 6-decimal token is 1 500 000 units); refused up front if `--asset` is not `Key`-authorised or `--authority-key` is the wrong key |
 | `rand token set-authority --asset <A> --authority-key <FILE> (--new-key <FILE> \| --renounce)` | hand a `Key`-authorised token to another key, or renounce minting for good |
 | `rand token info <A>` | one token's full row: name, symbol, decimals, authority, `mint_nonce`, total supply, `registered_at`, id (hex and `rpl1…`), and — if bridged — every backing |
 | `rand token list [--from <index>] [--limit <N>]` | one page of the whole registry |
-| `rand token burn <ASSET> <AMOUNT>` | destroy `AMOUNT` of a token this wallet holds; refused before proving for a `Bridge`-authority token |
-| `rand send <TO> <AMOUNT> --asset <INDEX\|rpl1…\|hex>` | send RAND (default, `--asset 0`) or any RPL token in one proof; `AMOUNT` is whole units of the token, not a decimal amount |
+| `rand token burn <ASSET> <AMOUNT>` | destroy `AMOUNT` (display units) of a token this wallet holds; refused before proving for a `Bridge`-authority token |
+| `rand send <TO> <AMOUNT> --asset <INDEX\|rpl1…\|hex>` | send RAND (default, `--asset 0`) or any RPL token in one proof; `AMOUNT` is in the asset's display units — a decimal at RAND's nine decimals, or at the token's own `decimals` — and the confirmation shows it both ways (`10.00000000 zUSD (1000000000 units)`) before anything proves |
 | `rand asset-balance [INDEX]` | what this wallet holds of one asset, or a row per asset |
 
 `--asset` (on `send`, `token mint`, `token set-authority`, `token burn`, `token info`) accepts an
 index, the `rpl1…` text form or 64 hex, and is always resolved from the node's **whole**
 `rand_getTokens` listing, never a per-token lookup — a wallet about to move a token should not tell
-the node which one it cares about (§11). Amounts are in the token's own smallest unit: a token with
-6 decimals moves in millionths, exactly as its source chain would show it.
+the node which one it cares about (§11). Amounts (`send`, `token mint`, `token burn`, and a
+`randpay:` link's `amount`) are in the token's **display units**, read at its registry row's own
+`decimals`: `1.5` of a token with 6 decimals is 1 500 000 of its smallest unit, and more
+fractional digits than the token has is refused. On chain the amount is always the smallest-unit
+integer; `send`'s confirmation prints both (`1.500000 USDX (1500000 units)`), so a node that lied
+about `decimals` shows before anything is sent. (Before the address-sharing release `send
+--asset`, `token mint` and `token burn` took whole smallest units; `token create`'s
+`--fixed-supply`/`--initial` still do.)
 
 ## 11. The RPC
 
