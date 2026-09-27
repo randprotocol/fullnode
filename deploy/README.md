@@ -241,11 +241,11 @@ commands.
 
 ## Public RPC
 
-**`https://rpc.randprotocol.org`** — Cloudflare in front, proxied to Caddy on droplet **F**
-(`nyc3`), which forwards to that node's `127.0.0.1:8545`. Deliberately **not** put on E: E's node
-holds randscan's 64 `rand_importViewingKey` slots (in-memory, cleared at restart), and a public RPC
-there would let anyone else's import calls evict them. Every other droplet's RPC stays bound to
-`127.0.0.1` and unreachable from outside, per the topology rule in `docs/deploy.md`.
+**`https://rpc.randprotocol.org`** — served since 2026-09-20 03:04 UTC (within the hour F's Caddy
+hop was written) by the web droplet's own vhost: Cloudflare → web droplet nginx → the sale service's
+filtered proxy → randscan's `/rpc` route on E → E's `127.0.0.1:8545`. F's Caddy is not in the path
+and does not run; `deploy/caddy/README.md` has the chain and the evidence. Every droplet's node RPC
+stays bound to `127.0.0.1`, per the topology rule in `docs/deploy.md`.
 
 ## Cut-over checklist, per node
 

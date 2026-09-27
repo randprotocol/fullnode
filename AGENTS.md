@@ -6,6 +6,19 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-26)
 
+### 2026-09-27 — RS-2 refuted: the public RPC does not go through F
+
+Suspected: F's Caddy re-enters Cloudflare, so every `rpc.randprotocol.org` caller shares F's
+rate-limit bucket. **F's Caddy is `disabled`/dead (never started since boot), F listens on neither
+80 nor 443**; DNS goes to the web droplet's own `rpc.randprotocol.org` vhost (installed 2026-09-20
+03:04 UTC, website `66a6be9`), which resolves each caller from `CF-Connecting-IP` over Cloudflare's
+ranges — the access log shows separate clients metered separately (one curl 429'd while another
+client in the same hour was not), none from F. Every note below that says "Caddy on droplet F"
+describes a hop that never carried traffic past 2026-09-20; `deploy/caddy/README.md` has the real
+chain and the operator housekeeping (dead `set_real_ip_from 159.89.185.254` on the main vhost,
+`.bak` files loaded from `sites-enabled/`). **Trap:** a committed config file is not a running
+service — check `systemctl is-active` and `ss -ltn` before reasoning from one.
+
 ### Chain 15 — LIVE 2026-09-26 13:05 UTC (genesis `cc30e085…`, build `dd2ccbe` = v0.5.8 + the chain-15 genesis work)
 
 Cut on the user's go after the registry-v8 remediation (CS6-1 guest provenance, ZKV-2 Poseidon2

@@ -1,15 +1,21 @@
 # The public RPC: `rpc.randprotocol.org`
 
-`Caddyfile.rpc-randprotocol-org` is droplet F's `/etc/caddy/Caddyfile`, copied verbatim as it runs
-(2026-09-27, unchanged since 2026-09-20). Keep it that way: a change on F that is not also a commit
-here is drift.
+**F's Caddy is not in the path.** `Caddyfile.rpc-randprotocol-org` is droplet F's
+`/etc/caddy/Caddyfile`, copied verbatim from F's disk (unchanged since 2026-09-20 03:02 UTC) — but
+on F `caddy.service` is `disabled` and `inactive (dead)` with no start since the host booted,
+nothing listens on 80 or 443, and F's ufw admits only 22 and 30303 (read 2026-09-27). The file is
+kept as a record of a hop that was written and never carried traffic after 2026-09-20; it must not
+be started (see "RS-2" below for why that would be a regression).
 
 ## What actually serves a public request
 
-The public RPC is **not** a passthrough to F's node. The chain is:
-
 ```
-client → Cloudflare → Caddy on F (this file) → https://randprotocol.org/api/rpc
+client → Cloudflare (proxied DNS) → web droplet 159.65.138.161, nginx vhost rpc.randprotocol.org
+         (randprotocol.org repo, server/nginx-rpc.conf = /etc/nginx/sites-enabled/rpc-randprotocol;
+          its own Let's Encrypt certificate, DNS-01 via Cloudflare, valid to 2026-12-19;
+          set_real_ip_from <Cloudflare ranges> + real_ip_header CF-Connecting-IP;
+          limit_req zone=rpc 180 r/min burst 60 per client address)
+       → proxy_pass http://127.0.0.1:8788/api/rpc, X-Real-IP $remote_addr, CF-Connecting-IP stripped
        → the sale service's RPC proxy (randprotocol.org repo, server/sale/src/rpc.rs)
        → SALE_RPC_UPSTREAM = https://randscan.org/rpc
        → randscan's Caddy route on E (randscan repo, deploy/Caddyfile; admits only the web
@@ -17,8 +23,32 @@ client → Cloudflare → Caddy on F (this file) → https://randprotocol.org/ap
        → E's node on 127.0.0.1:8545
 ```
 
-F's own node binds `127.0.0.1:8545` and nothing forwards to it. The previous passthrough is on F
-as `/etc/caddy/Caddyfile.bak-20260920-passthrough` (not copied here — it must not come back).
+The web droplet's vhost was installed at 2026-09-20 03:04 UTC, two minutes after F's Caddyfile was
+written (website commit `66a6be9`); the DNS record went to the web droplet and F's hop was never
+brought back. F's own node binds `127.0.0.1:8545` and nothing forwards to it. The older passthrough
+is on F as `/etc/caddy/Caddyfile.bak-20260920-passthrough` (not copied here — it must not come
+back).
+
+## RS-2 — "every caller shares F's rate-limit bucket" — refuted (2026-09-27)
+
+The suspicion (also the 2026-09-24 deep scan's, which added `set_real_ip_from 159.89.185.254` and
+`real_ip_recursive on` to the main randprotocol.org vhost for it): F's Caddy re-enters Cloudflare,
+so Cloudflare would set `CF-Connecting-IP` to F and every public caller would share one bucket.
+It would be true if F were in the path — Caddy's `X-Forwarded-For` is not the header nginx reads,
+and with `real_ip_recursive` a single trusted value in `CF-Connecting-IP` resolves to F itself, so
+the 09-24 trust line never helped. But F is not in the path (above), and the web droplet's access
+log shows the rpc vhost (`POST /`) metering real clients separately — 2026-09-26, addresses cut to
+two octets:
+
+```
+ 85 180.248.x.x 07h 200 | 125 180.248.x.x 07h 429   (curl, one client hitting its own limit)
+ 19 2400:9800:x 07h 200                              (same hour, a different client, never 429'd)
+277 5.31.x.x    08h 200 |  13 5.31.x.x    08h 429
+ 37 83.110.x.x  10–11h 200                           (a browser)
+```
+
+No request in the two uncompressed logs comes from `159.89.185.254`. The limits are per client, as
+designed. What remains for the operator is housekeeping, listed at the end.
 
 ## Why the proxy is security-critical
 
@@ -39,7 +69,9 @@ proxy stands where they would. It does, verified 2026-09-26 against the live end
    later stays closed until someone opens it there.
 2. **No batches** — a top-level array is refused, so a refused method cannot ride inside one.
 3. **Per-IP limits** — 120 reads and 6 `rand_sendTransaction` a minute, keyed on the real client IP
-   (`client_ip` reads `X-Real-IP`, set by nginx on the web droplet), and a 12 MiB body cap.
+   (`client_ip` reads `X-Real-IP`, set by the web droplet's nginx from `CF-Connecting-IP` for
+   Cloudflare's ranges only — a direct connection to the origin is metered as its own TCP peer and
+   cannot name an address), and a 12 MiB body cap.
 
 Change the allowlist in the randprotocol.org repo, never by pointing Caddy at a node directly.
 
@@ -52,7 +84,7 @@ path:
   genesis names, within `faucet_budget_per_epoch`. It cannot pay anyone else.
 - F's node answers `rand_mint` only on its own loopback, which nothing forwards to; E's is reached
   publicly only through the proxy, which refuses it.
-- So nothing changes on F. Mint to an allowlisted key from the host itself (`rand faucet <address>` against
+- So nothing changes on F (whose Caddy does not run). Mint to an allowlisted key from the host itself (`rand faucet <address>` against
   `127.0.0.1:8545`), never by opening the method on the proxy.
 
 ## Checks after any change here or to the proxy
@@ -62,3 +94,20 @@ path:
 - `rand_status`, `rand_getBlockByHeight` and the methods wallets and randscan use still answer.
 - A burst from one IP is throttled; two IPs are metered separately.
 - F's and E's nodes still bind `127.0.0.1:8545` only (the topology rule in `docs/deploy.md`).
+
+## Housekeeping left for the operator (not done; read-only investigation 2026-09-27)
+
+- **Do not start `caddy` on F.** If it ran and DNS moved back to F, the double Cloudflare hop would
+  make RS-2 real: every caller would share F's bucket. Either leave it disabled or remove the
+  package and this file together.
+- The main randprotocol.org vhost's `set_real_ip_from 159.89.185.254;` and `real_ip_recursive on;`
+  (added 2026-09-24 for the non-existent F hop) are dead config; drop them with the next edit of
+  that file (`nginx -t && systemctl reload nginx`).
+- `/etc/nginx/sites-enabled/` on the web droplet holds `randprotocol.bak-20260924` and
+  `rpc-randprotocol.bak-20260924` as regular files, so nginx loads them and prints "conflicting
+  server name … ignored" for every name on `nginx -t`. The live files win only because they sort
+  first; move the backups out of `sites-enabled/`.
+- The public RPC ends at E, a validator that prunes to one day: heights older than a day answer
+  `-32010` through `rpc.randprotocol.org`.
+- IPv6 callers are bucketed per /128 at both nginx and the sale service; one host with a /64 can
+  rotate addresses. Keying IPv6 on its /64 is a sale-service change, if it ever matters.
