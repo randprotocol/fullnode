@@ -2466,9 +2466,42 @@ impl Storage {
                         sidecar.insert(index, records);
                     }
                 }
+                // A block that arrived in sealed form (spec §7) is stored as served: its pruned
+                // bundles carry the marker, and their `Pruned` records are the side table sync
+                // applied it with. The replay rebuilds that table from those records and applies
+                // through the same sync path, so the pruned branch binds each bundle's public
+                // fields to the record's `OUT` words exactly as it did then (the interface
+                // review's INTERFACE-3: an empty table here refused every marker as a malformed
+                // proof, and the repair truncated the store below the first sealed-synced block
+                // at every restart). A block whose store raw proofs survive — a locally pruned
+                // one keeps its raw block row — carries no marker and needs no entry.
+                let mut pruned = Vec::new();
+                for tx in &block.transactions {
+                    let Some(proof_hash) =
+                        tx.bundle.as_ref().and_then(|b| randprotocol_core::notes::pruned_proof_hash(&b.proof))
+                    else {
+                        continue;
+                    };
+                    match self.tx_record(&tx.hash()) {
+                        Ok(Some(TxRecord::Pruned { tx_hash, proof_hash: ph, public_values, shape, .. }))
+                            if ph == proof_hash =>
+                        {
+                            pruned.push(randprotocol_core::consensus::PrunedBundle {
+                                tx_hash,
+                                proof_hash,
+                                public_values,
+                                shape,
+                            });
+                        }
+                        // No record, or one that does not vouch for this marker: the apply below
+                        // refuses the marker by name at its index.
+                        Ok(_) => {}
+                        Err(e) => return Err(format!("tx {} record unreadable at block {h}: {e}", tx.hash())),
+                    }
+                }
                 let mut next = ledger.clone();
                 let receipts = next
-                    .apply_block_with_covered(&block, &sidecar, executor)
+                    .apply_block_for_sync(&block, &sidecar, &pruned, executor, &randprotocol_core::NoVerified)
                     .map_err(|e| format!("block {h} does not apply: {e}"))?;
                 for r in &receipts {
                     match self.receipt(&r.tx) {
@@ -6452,6 +6485,88 @@ mod seal_tests {
         let block1 = storage.block_by_height(1).unwrap().unwrap();
         let register_tx = &block1.transactions[1];
         assert!(matches!(storage.tx_record(&register_tx.hash()).unwrap().unwrap(), TxRecord::Raw { .. }), "an unsealed bundle is never pruned");
+    }
+
+    /// The interface review's INTERFACE-3: a block that arrived in sealed (marker) form is
+    /// committed as served — its pruned bundles become `Pruned` records, the block row keeps the
+    /// marker — and the startup replay must apply it the way sync did, with the side table
+    /// rebuilt from those records. Before the fix `verify_chain` replayed it with an empty side
+    /// table, `check_bundle_proof` refused the marker as a malformed proof, and
+    /// `check_and_repair_chain` truncated the store to just before the first sealed-synced block
+    /// at every restart. Stub-consistent end to end (no recursion fixture): the side table's
+    /// `OUT` words are the bundle's stub digest, exactly what the pruned branch binds.
+    #[test]
+    fn verify_chain_replays_a_block_that_was_synced_in_sealed_form() {
+        use randprotocol_core::confidential::ConfidentialExecutor as _;
+        use randprotocol_core::types::pv;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1)], vec![], 100);
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let raw = bundle_tx(&ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee());
+        let raw_cb = make_block(&gs.block, &mut ledger, vec![raw.clone()], &key(1));
+
+        // The block as a sealed-form peer serves it: the marker in place of the proof, and the
+        // side-table entry attesting the raw hash, the proof hash, 34 public values whose `OUT`
+        // words are the bundle's digest, and a declared shape.
+        let bundle = raw.bundle.as_ref().unwrap();
+        let digest = StubExecutor.bundle_digest(&bundle.digest_input());
+        let mut public_values = vec![0u64; pv::NUM];
+        public_values[pv::TIER] = 14;
+        for k in 0..8 {
+            public_values[pv::OUT0 + k] = digest[k] as u64;
+        }
+        let shape = DeclaredShape {
+            profile: FriProfile::Test,
+            tier: 14,
+            program_log_height: 13,
+            input_log_height: 12,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: 2,
+            mem_log_height: 18,
+        };
+        let proof_hash = Hash::digest(&bundle.proof);
+        let mut served = raw_cb.clone();
+        served.block.transactions[0].bundle.as_mut().unwrap().proof =
+            [PRUNED_PROOF_MARKER, proof_hash.as_bytes().as_slice()].concat();
+        served.pruned = vec![randprotocol_core::consensus::PrunedBundle {
+            tx_hash: raw.hash(),
+            proof_hash,
+            public_values: public_values.clone(),
+            shape,
+        }];
+        // Sync's own acceptance: the ledger applies the sealed form to the raw block's root.
+        let mut synced = gs.ledger.clone();
+        synced
+            .apply_block_for_sync(&served.block, &BTreeMap::new(), &served.pruned, &StubExecutor, &randprotocol_core::ledger::NoVerified)
+            .unwrap();
+        assert_eq!(synced.state_root(), ledger.state_root());
+        storage.commit(std::slice::from_ref(&served), &synced, &[], &StubExecutor).unwrap();
+        assert!(matches!(storage.tx_record(&raw.hash()).unwrap(), Some(TxRecord::Pruned { .. })), "committed as served");
+
+        // The restart's replay (`Quick`: the fixture's QCs carry no votes): the sealed block
+        // verifies, nothing is truncated.
+        let check = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(check.problem, None);
+        assert_eq!(check.last_good, 1);
+        assert_eq!(check.ledger.state_root(), ledger.state_root());
+
+        // And the rebuilt side table binds what the sync one bound: a stored record whose `OUT`
+        // words vouch for another digest fails the replay at that block.
+        let Some(TxRecord::Pruned { height, index, tx_hash, tx, proof_hash, mut public_values, shape }) =
+            storage.tx_record(&raw.hash()).unwrap()
+        else {
+            unreachable!()
+        };
+        public_values[pv::OUT0] ^= 1;
+        storage
+            .put_pruned(&TxRecord::Pruned { height, index, tx_hash, tx, proof_hash, public_values, shape })
+            .unwrap();
+        let check = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(check.last_good, 0);
+        assert!(check.problem.as_deref().is_some_and(|p| p.starts_with("block 1 does not apply")), "{:?}", check.problem);
     }
 
     /// A gated genesis's section round-trips through the accessor `rand_getEmission` reads, and
