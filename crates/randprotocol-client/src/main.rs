@@ -719,7 +719,9 @@ fn memo_column(memo: &Option<String>, whole: bool) -> String {
 /// [`memo_display::sanitize`]: a memo padded with spaces or carrying a line break, a terminal
 /// escape or a bidi override cannot draw a second recipient line (final review A).
 fn confirmation(name: Option<&str>, fingerprint: &str, amount: &str, memo: &str) -> String {
-    let name_part = name.map(|n| format!("{} · ", memo_display::sanitize(n))).unwrap_or_default();
+    // The separator goes through the rule with the name, so a name ending in a space (names are
+    // never trimmed) cannot leave a run of two.
+    let name_part = name.map(|n| memo_display::sanitize(&format!("{n} · "))).unwrap_or_default();
     let mut shown = format!("to {name_part}fingerprint {fingerprint} · {}", memo_display::sanitize(amount));
     if !memo.is_empty() {
         shown.push_str(&format!("\nmemo: \"{}\"", memo_display::sanitize(memo)));
@@ -2134,6 +2136,8 @@ mod tests {
         let fp = "AAAA-BBBB-CCCC-DDDD";
         assert_eq!(confirmation(Some("alice"), fp, "1.5 RAND", ""), "to alice · fingerprint AAAA-BBBB-CCCC-DDDD · 1.5 RAND");
         assert_eq!(confirmation(None, fp, "1.5 RAND", "hi"), "to fingerprint AAAA-BBBB-CCCC-DDDD · 1.5 RAND\nmemo: \"hi\"");
+        // A saved name may end in a space (names are never trimmed): it and the separator collapse.
+        assert_eq!(confirmation(Some("alice "), fp, "1.5 RAND", ""), "to alice · fingerprint AAAA-BBBB-CCCC-DDDD · 1.5 RAND");
         for m in hostile() {
             let shown = confirmation(Some("alice"), fp, "1.5 RAND", &m);
             let lines: Vec<&str> = shown.split('\n').collect();
