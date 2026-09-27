@@ -2849,8 +2849,11 @@ mod payment_tests {
         let tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, 0), Action::None));
         let digest = StubExecutor.bundle_digest(&tx.bundle.as_ref().unwrap().digest_input());
         let mut pv = [0u64; 34];
+        // The covered proof's H_PUB is its transaction's binding (INTERFACE-6 checks it).
+        let hpub = StubExecutor.public_digest(&tx.binding());
         for k in 0..8 {
             pv[pv::OUT0 + k] = digest[k] as u64;
+            pv[pv::PUB0 + k] = hpub[k] as u64;
         }
         let proof_hash = Hash::digest(&tx.bundle.as_ref().unwrap().proof);
         let mut marker = crate::notes::PRUNED_PROOF_MARKER.to_vec();
@@ -2897,8 +2900,11 @@ mod payment_tests {
         let tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, 0), Action::None));
         let digest = StubExecutor.bundle_digest(&tx.bundle.as_ref().unwrap().digest_input());
         let mut pv = [0u64; 34];
+        // The covered proof's H_PUB is its transaction's binding (INTERFACE-6 checks it).
+        let hpub = StubExecutor.public_digest(&tx.binding());
         for k in 0..8 {
             pv[pv::OUT0 + k] = digest[k] as u64;
+            pv[pv::PUB0 + k] = hpub[k] as u64;
         }
         // The marker carries the raw proof's digest — what the raw hash commits the proof by.
         let proof_hash = Hash::digest(&tx.bundle.as_ref().unwrap().proof);
@@ -2955,8 +2961,10 @@ mod payment_tests {
         let mut rich_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::BUNDLE_BASE + 60, 0), Action::None));
         let rich_digest = StubExecutor.bundle_digest(&rich_tx.bundle.as_ref().unwrap().digest_input());
         let mut rich_pv = [0u64; 34];
+        let rich_hpub = StubExecutor.public_digest(&rich_tx.binding());
         for k in 0..8 {
             rich_pv[pv::OUT0 + k] = rich_digest[k] as u64;
+            rich_pv[pv::PUB0 + k] = rich_hpub[k] as u64;
         }
         let rich_marker = {
             let mut m2 = crate::notes::PRUNED_PROOF_MARKER.to_vec();

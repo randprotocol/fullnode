@@ -6560,8 +6560,11 @@ mod seal_tests {
         let digest = StubExecutor.bundle_digest(&bundle.digest_input());
         let mut public_values = vec![0u64; pv::NUM];
         public_values[pv::TIER] = 14;
+        // The covered proof's H_PUB is its transaction's binding (INTERFACE-6 checks it).
+        let hpub = StubExecutor.public_digest(&raw.binding());
         for k in 0..8 {
             public_values[pv::OUT0 + k] = digest[k] as u64;
+            public_values[pv::PUB0 + k] = hpub[k] as u64;
         }
         let shape = DeclaredShape {
             profile: FriProfile::Test,

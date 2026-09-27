@@ -224,6 +224,11 @@ pub enum TxError {
     InvalidProof(ConfidentialError),
     #[error("the bundle's digest is not what its proof published")]
     BadDigest,
+    /// INTERFACE-6: a sealed-form side-table record that does not belong to the transaction it
+    /// vouches for — it names another transaction id, or its `H_PUB` words are not the digest of
+    /// this transaction's binding. Only ever raised on the sealed-sync path.
+    #[error("pruned bundle record: {0}")]
+    PrunedRecordMismatch(&'static str),
     #[error("invalid bundle proof: {0}")]
     InvalidBundleProof(ConfidentialError),
     /// A bundle proof in the sealed (pruned) marker form outside sealed-form sync: the marker is
@@ -1409,6 +1414,7 @@ impl Ledger {
     /// function is the cheap, deterministic half of it.
     fn check_bundle_proof(
         &self,
+        tx: &Transaction,
         b: &Bundle,
         binding: &[u32; crate::types::TX_BINDING_WORDS],
         executor: &dyn ConfidentialExecutor,
@@ -1419,15 +1425,23 @@ impl Ledger {
         // rests on. Two checks stand in for it (spec §7's acceptance, the ledger's half): the
         // proof hash must be one the sync side vouched for, and the bundle's own public fields
         // must hash to the digest the covering aggregate's verified public values commit to —
-        // the binding that keeps a peer from substituting the bundle's content. The transaction
-        // binding (`binding`) is not checked on this path: there is no proof here to carry it.
-        // What authenticates a pruned transaction's action and envelopes is its id — the
-        // certified tx root covers `Transaction::hash`, which covers both (`docs/confidential.md`,
-        // "Transaction binding").
+        // the binding that keeps a peer from substituting the bundle's content.
+        //
+        // INTERFACE-6: and the record must belong to *this* transaction. There is no proof here,
+        // but the record's public values are the covered proof's, verified by the covering
+        // aggregate — and their `PUB0..7` is `H_PUB` of the transaction binding that proof was
+        // made over. So the binding is checked after all: the record's `PUB` words must be the
+        // digest of this transaction's `binding`, and its `tx_hash` this transaction's id. Before,
+        // only the certified tx root stood behind the action and envelopes of a pruned transaction
+        // (`Transaction::hash` covers both), and a record bound to another transaction's action
+        // passed here on a sync peer's word. Two compares and one `H_PUB`, on the sync path only.
         if let Some(proof_hash) = crate::notes::pruned_proof_hash(&b.proof) {
-            let Some((_, pv)) = self.pruned_side.get(&proof_hash) else {
+            let Some((record_tx, pv)) = self.pruned_side.get(&proof_hash) else {
                 return Err(TxError::InvalidBundleProof(crate::confidential::ConfidentialError::MalformedProof));
             };
+            if *record_tx != tx.hash() {
+                return Err(TxError::PrunedRecordMismatch("the record names another transaction"));
+            }
             let want = executor.bundle_digest(&b.digest_input());
             // A short or non-u32 record is a mismatch, never an index past the end: the
             // sync path refuses such a table before it gets here (`MalformedPrunedRecord`),
@@ -1439,7 +1453,15 @@ impl Ledger {
                     None => return Err(TxError::BadDigest),
                 }
             }
-            return if want == got { Ok(()) } else { Err(TxError::BadDigest) };
+            if want != got {
+                return Err(TxError::BadDigest);
+            }
+            // After the digest, so a short record is still the `BadDigest` it always was.
+            let want_pub = executor.public_digest(binding);
+            if (0..8).any(|k| pv.get(crate::types::pv::PUB0 + k).copied() != Some(want_pub[k] as u64)) {
+                return Err(TxError::PrunedRecordMismatch("the record's H_PUB is not this transaction's binding"));
+            }
+            return Ok(());
         }
         let published = executor.bundle_proof_digest(&b.proof).map_err(TxError::InvalidBundleProof)?;
         if published != executor.bundle_digest(&b.digest_input()) {
@@ -1735,7 +1757,7 @@ impl Ledger {
         let admitted = !verified_proofs.is_empty() && verified_proofs.contains(&tx.hash());
         if let Some(b) = bundle {
             let binding = tx.binding();
-            self.check_bundle_proof(b, &binding, executor, admitted)?;
+            self.check_bundle_proof(tx, b, &binding, executor, admitted)?;
         }
         // 10. the call's own proof, then its fee: the tier's, and the byte term for proof and
         // envelope bytes past the free allowance (spec §7)
@@ -4451,8 +4473,54 @@ mod tests {
         l.pruned_side.insert(ph, (raw.hash(), Vec::new()));
         let binding = [0u32; crate::types::TX_BINDING_WORDS];
         assert_eq!(
-            l.check_bundle_proof(marker.bundle.as_ref().unwrap(), &binding, &StubExecutor, false),
+            l.check_bundle_proof(&marker, marker.bundle.as_ref().unwrap(), &binding, &StubExecutor, false),
             Err(TxError::BadDigest)
+        );
+    }
+
+    /// INTERFACE-6 (recursion-VM review, dormant): the pruned path checked the record's `OUT`
+    /// digest against the bundle's public fields and nothing tying the record to the rest of the
+    /// transaction. The record's `PUB0..7` is `H_PUB` of the binding the covered proof was made
+    /// over (the covering aggregate verified it), and its `tx_hash` names the raw transaction; a
+    /// marker-form transaction whose action or envelopes differ from what the proof was bound to
+    /// was accepted on a sync peer's word. Both are now checked: the record's `tx_hash` must be
+    /// this transaction's id and its `PUB` words the digest of this transaction's binding.
+    #[test]
+    fn a_pruned_record_must_carry_this_transactions_binding() {
+        let mut l = ledger();
+        let raw = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let mut marker = raw.clone();
+        let b = marker.bundle.as_mut().unwrap();
+        let ph = Hash::digest(&b.proof);
+        let mut m = crate::notes::PRUNED_PROOF_MARKER.to_vec();
+        m.extend_from_slice(ph.as_bytes());
+        b.proof = m;
+        let b = marker.bundle.as_ref().unwrap();
+        let binding = marker.binding();
+        let record = |hpub: Word8| {
+            let mut pv = vec![0u64; crate::types::pv::NUM];
+            let digest = StubExecutor.bundle_digest(&b.digest_input());
+            for k in 0..8 {
+                pv[crate::types::pv::OUT0 + k] = digest[k] as u64;
+                pv[crate::types::pv::PUB0 + k] = hpub[k] as u64;
+            }
+            pv
+        };
+        let honest = record(StubExecutor.public_digest(&binding));
+        l.pruned_side.insert(ph, (raw.hash(), honest.clone()));
+        assert_eq!(l.check_bundle_proof(&marker, b, &binding, &StubExecutor, false), Ok(()), "the record of this transaction");
+        // The same bundle, the same OUT digest — but the covered proof was bound to another
+        // transaction (another action, another envelope): refused.
+        l.pruned_side.insert(ph, (raw.hash(), record(StubExecutor.public_digest(&[9; 8]))));
+        assert_eq!(
+            l.check_bundle_proof(&marker, b, &binding, &StubExecutor, false),
+            Err(TxError::PrunedRecordMismatch("the record's H_PUB is not this transaction's binding"))
+        );
+        // And a record naming another transaction id.
+        l.pruned_side.insert(ph, (Hash([5; 32]), honest));
+        assert_eq!(
+            l.check_bundle_proof(&marker, b, &binding, &StubExecutor, false),
+            Err(TxError::PrunedRecordMismatch("the record names another transaction"))
         );
     }
 
