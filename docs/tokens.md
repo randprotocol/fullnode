@@ -243,7 +243,7 @@ Full flag detail is `docs/cli.md`'s `rand` (wallet) table; this is the token-spe
 | `rand token info <A>` | one token's full row: name, symbol, decimals, authority, `mint_nonce`, total supply, `registered_at`, id (hex and `rpl1…`), and — if bridged — every backing |
 | `rand token list [--from <index>] [--limit <N>]` | one page of the whole registry |
 | `rand token burn <ASSET> <AMOUNT>` | destroy `AMOUNT` (display units) of a token this wallet holds; refused before proving for a `Bridge`-authority token |
-| `rand send <TO> <AMOUNT> --asset <INDEX\|rpl1…\|hex>` | send RAND (default, `--asset 0`) or any RPL token in one proof; `AMOUNT` is in the asset's display units — a decimal at RAND's nine decimals, or at the token's own `decimals` — and the confirmation shows it both ways (`10.00000000 zUSD (1000000000 units)`) before anything proves |
+| `rand send <TO> [AMOUNT] --asset <INDEX\|rpl1…\|hex>` | send RAND (default, `--asset 0`) or any RPL token in one proof; `AMOUNT` is in the asset's display units — a decimal at RAND's nine decimals, or at the token's own `decimals` — and the confirmation shows it both ways (`10.00000000 zUSD (1000000000 units)`) before anything proves |
 | `rand asset-balance [INDEX]` | what this wallet holds of one asset, or a row per asset |
 
 `--asset` (on `send`, `token mint`, `token set-authority`, `token burn`, `token info`) accepts an

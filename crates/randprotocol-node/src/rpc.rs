@@ -351,7 +351,8 @@ pub struct RpcState {
     pub status: Arc<RwLock<NodeStatus>>,
     pub node: mpsc::Sender<NodeCommand>,
     pub chain_id: u64,
-    /// The chain's five call limits, from its genesis ledger ([`ChainLimits::of`]): what
+    /// The chain's five call limits and its envelope size, from its genesis ledger
+    /// ([`ChainLimits::of`]): what
     /// `rand_getLimits` reports, what `rand_estimateFee` refuses a deploy estimate past (so it
     /// agrees with admission), and the block cap `rand_sendTransaction` pre-checks against.
     pub limits: ChainLimits,

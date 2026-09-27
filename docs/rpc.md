@@ -307,9 +307,9 @@ else, opened through the outgoing viewing key. A `received` row carries the note
 (a function of the viewing key) and whether the chain has published it — refreshed on every call;
 a `sent` row has neither, because the note is not the key's to nullify. Amounts are strings, as
 everywhere chain state is served. The note's `memo` is the sender's encrypted memo (spec
-2026-09-26 §2.3) if it opened one — `null` for no memo, a chain whose genesis carries no
-`envelope_bytes`, or an envelope this key opened but whose memo field was malformed (a malformed
-memo never costs the payee the note itself, just the text).
+2026-09-26 §2.3) if it opened one — `null` for no memo, or an envelope this key opened but whose
+memo field was malformed (a malformed memo never costs the payee the note itself, just the text).
+A memo can be present on any chain: where the genesis sets no `envelope_bytes` (chains 14 and 15) the ledger still accepts any note envelope up to 2 048 bytes, so a memo-carrying 1 860-byte envelope from another sender is valid and opens with its memo — wallets only *seal* one where the chain sets `envelope_bytes`. A memo is anyone's text: show it as untrusted (see `docs/cli.md`, "How a memo is shown").
 
 Errors: `-32602` for a malformed key or page bound, `-32001` for a key this node has not
 imported.
@@ -333,7 +333,7 @@ input, `null` for an id no program has. A wallet proving a call passes these wor
 the proof commits to them and the ledger checks that commitment against `public_digest`.
 
 ### `rand_getLimits`
-Params: `[]`. Result: the chain's six call limits, from its genesis:
+Params: `[]`. Result: the chain's five call limits and the envelope size, from its genesis:
 
 ```json
 { "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
@@ -569,8 +569,7 @@ token mint's and an initial mint's envelopes are sealed by the minter, and open 
 commitment the chain computed for that note.
 
 The disclosed `note`'s `memo` is the sender's memo (spec 2026-09-26 §2.3) if this envelope
-carried one — `null` for no memo, a chain whose genesis carries no `envelope_bytes`, or a memo
-field that opened malformed. It is readable here for exactly the same reason the note itself is:
+carried one — `null` for no memo or a memo field that opened malformed. A memo can be present on any chain: where the genesis sets no `envelope_bytes` (chains 14 and 15) the ledger still accepts any note envelope up to 2 048 bytes, so a memo-carrying 1 860-byte envelope from another sender is valid and opens with its memo — wallets only *seal* one where the chain sets `envelope_bytes`. A memo is anyone's text: show it as untrusted (see `docs/cli.md`, "How a memo is shown"). It is readable here for exactly the same reason the note itself is:
 the key that opens one opens the other, from the same AEAD body.
 
 The call is **stateless**: the key is used for this one request and dropped — it is not imported,
@@ -1316,13 +1315,15 @@ Spec `docs/superpowers/specs/2026-09-26-address-sharing-and-memo-design.md` §2.
 node-only otherwise; a chain without the field is unaffected.
 
 - **`rand_getLimits`** gains a sixth field, `envelope_bytes`: `null` on every genesis without it
-  (every chain up to and including 14 — today's legacy 1 348-byte envelope, no memo), or `1860`
+  (chains 14 and 15 and every earlier chain — wallets seal today's legacy 1 348-byte envelope and no memo), or `1860`
   when the genesis sets it, meaning every note-creating envelope (`Bundle.envelopes`, `Mint`,
   `Withdraw`, `BridgeAttest`, `Aggregate`, `TokenMint`, `RegisterToken`'s initial mint) must be
   exactly that long, memo field included whether or not it carries text.
 - **`rand_checkTransaction`** and **`rand_getViewingNotes`**'s disclosed `note` objects gain
-  `memo`: `null` for no memo, a chain without `envelope_bytes`, or a memo field that opened
-  malformed; otherwise the sender's UTF-8 text (at most 510 bytes), readable by whoever can
+  `memo`: `null` for no memo or a memo field that opened malformed — a memo can be present on
+  any chain, a chain without `envelope_bytes` included (its ledger accepts a 1 860-byte envelope
+  up to the 2 048-byte cap; wallets only seal one where the chain sets the field), so treat it as
+  untrusted text; otherwise the sender's UTF-8 text (at most 510 bytes), readable by whoever can
   already open that note — the payee, the sender's own history, or anyone handed the output's
   per-transaction key.
 - A malformed envelope's memo field never costs the payee the note itself: only the memo is

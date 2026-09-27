@@ -66,9 +66,13 @@ chain. What appears is:
   or any proof, and is readable by exactly whoever can already read the note: the owner (ML-KEM),
   the sender (`ovk`), or anyone handed that output's per-transaction key
   (`rand_checkTransaction`, `rand tx-key`). A malformed memo field (bad length, invalid UTF-8, or
-  non-zero padding) opens as no memo — it never costs the owner the note itself. A chain without
-  `envelope_bytes` keeps today's 1348-byte envelope and refuses a non-empty memo before proving,
-  rather than silently dropping it.
+  non-zero padding) opens as no memo — it never costs the owner the note itself. On a chain
+  without `envelope_bytes` (chains 14 and 15) wallets keep sealing today's 1348-byte envelope and
+  refuse a non-empty memo before proving, rather than silently dropping it — but that chain's
+  ledger still accepts any envelope up to 2048 bytes, so a memo-carrying 1860-byte envelope from
+  another sender is valid there and opens with its memo. A memo can be present on any chain, and
+  is anyone's text: every wallet shows it through one display rule (`docs/cli.md`, "How a memo is
+  shown").
 
 Spending a note publishes its **nullifier** `H_NF(nk, cm)`, which is unlinkable to the
 commitment without `nk`. The nullifier set is what prevents a double spend.
@@ -152,7 +156,7 @@ the pool back together.
 | `rand sync` | scan without printing a balance |
 | `rand notes` | every note this wallet has opened, with `spent` and `pending` |
 | `rand history` | every note this wallet created for someone else |
-| `rand send <TO> <AMOUNT>` | select, prove a bundle, submit, wait for the commit |
+| `rand send <TO> [AMOUNT]` | select, prove a bundle, submit, wait for the commit (`AMOUNT` may come from a `randpay:` link) |
 | `rand bond <VALIDATOR> <AMOUNT>` | stake onto a validator: the bundle burns the amount (`docs/staking.md`) |
 | `rand faucet [ADDRESS]` | ask a validator to mint (testnet chains only) |
 | `rand program build/deploy/show` | assemble, deploy (paid by a bundle), inspect a program |

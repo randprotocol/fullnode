@@ -357,9 +357,13 @@ Spec `docs/superpowers/specs/2026-09-26-address-sharing-and-memo-design.md` §2.
 - **`"envelope_bytes": 1860`** — every note-creating envelope (`Bundle.envelopes[..]`, `Mint`,
   `Withdraw`, `BridgeAttest`, `Aggregate`, `TokenMint`, `RegisterToken`'s initial mint, and a
   genesis alloc note) must be exactly 1860 bytes, which is what lets every one of them carry the
-  fixed 512-byte encrypted memo field. Absent (chain 14 and every earlier chain) is today's rule
-  byte-for-byte: an envelope at most `MAX_ENVELOPE_BYTES` (2048), no uniform size, and a memo
-  refused before proving rather than silently dropped. `1860` is the only value `validate` accepts
+  fixed 512-byte encrypted memo field. Absent (chains 14 and 15 and every earlier chain) is today's
+  rule byte-for-byte: an envelope at most `MAX_ENVELOPE_BYTES` (2048), no uniform size, and a memo
+  refused by the wallet before proving rather than silently dropped. The ledger there still admits
+  a memo-carrying 1860-byte envelope (it is under the 2048 cap) and a new wallet opens its memo, so
+  **memos are live on chains 14 and 15 as soon as the new wallets ship**: anyone can pay a dust
+  note with any memo to a public address. Every surface shows a memo through one display rule
+  (`docs/cli.md`, "How a memo is shown"). `1860` is the only value `validate` accepts
   today — a future layout is a new value. Set with `rand-node genesis --envelope-bytes 1860`; the
   field is hash-bound last, and a genesis alloc note whose own envelope is not exactly 1860 bytes
   fails `Genesis::build` (`GenesisError::AllocEnvelopeSize`) rather than silently mismatching it.
@@ -374,18 +378,20 @@ Spec `docs/superpowers/specs/2026-09-26-address-sharing-and-memo-design.md` §2.
 
 Task 17 (plan `2026-09-26-address-sharing-and-memo`) closed out the branch with a cross-repo
 verification pass and this checklist. Per the user: **address sharing itself ships as v0.5.10**
-(same-chain — nothing here changes chain 14's rules), right after this task and its review. The
+(same-chain — nothing here changes the rules of chains 14 and 15, neither of which sets
+`envelope_bytes`), right after this task and its review. The
 `envelope_bytes: 1860` memo *rule* above is a separate, later event: it is not part of v0.5.10 and
 does not go live until the v1.0 genesis (~chain 20, `rand-node genesis --envelope-bytes 1860`).
 Everything that ships as v0.5.10 works against a chain without `envelope_bytes` exactly as it does
-today (address sharing, the fingerprint, `randpay:` links, contacts) — only the memo field is
-gated on a future chain that carries the section.
+today (address sharing, the fingerprint, `randpay:` links, contacts) — only *sealing* a memo is
+gated on a chain that carries the section. Opening one is not: a third-party sender can already
+put a memo in a 1860-byte envelope on chains 14 and 15 (see above), and the new wallets show it.
 
 ### Step 1: final verification, one run per repo at the branch's final commits
 
 | repo | commit | command | result |
 |---|---|---|---|
-| fullnode | `2e769b7` | (not re-run — see below) | 61/63 binaries clean, 1478 passed / 13 failed / 15 ignored; the 13 failures are the documented `RECURSION_FIXTURES` gap (`node::tests`/`rpc::tests`, all panicking at `agg_executor.rs:295`) and the `randprotocol-rvm --test aggregate` binary is the documented laptop OOM (SIGKILL) — both pre-existing laptop limits, not this branch |
+| fullnode | the release commit (recorded at the release step) | (not re-run — see below) | 61/63 binaries clean, 1478 passed / 13 failed / 15 ignored; the 13 failures are the documented `RECURSION_FIXTURES` gap (`node::tests`/`rpc::tests`, all panicking at `agg_executor.rs:295`) and the `randprotocol-rvm --test aggregate` binary is the documented laptop OOM (SIGKILL) — both pre-existing laptop limits, not this branch |
 | circuits (`research`) | `95c9072` | `cargo test --release --test viewing` | 19 passed, 0 failed |
 | randscan-viewing | `b889519` | `cargo test` | 8 passed, 0 failed (lib 0 + `memo.rs` 3 + `rpl_disclosure.rs` 1 + `vectors.rs` 4) |
 | website | `4b8e276` | `node --test tests/` | 28 total, 27 passed, 1 skipped (`LIVE_KEY`, needs a live node — expected), 0 failed |
@@ -395,9 +401,9 @@ gated on a future chain that carries the section.
 | clients `android/` | `96b9999` | `./gradlew testDebugUnitTest --rerun` | 28 tests (Amounts 2, Contacts 7, NoteStore 6, SendLink 13), 0 failed, 0 skipped |
 | clients `ios/` | `96b9999` | `xcodebuild test` on iPhone 18 Pro simulator | 31 tests, 0 failures |
 
-fullnode's suite was not re-run per the controller's ruling: it ran in full at `2e769b7` (Task 9),
-`git -C /tmp/fullnode-memo log --oneline -1` still reads `2e769b7`, and the full log is at
-`.superpowers/sdd/2026-09-26-address-sharing-and-memo/memo-suite.log`. Every other repo's commit
+fullnode's full suite was not re-run here per the controller's ruling: it ran in full at the end
+of Task 9 (log: `.superpowers/sdd/2026-09-26-address-sharing-and-memo/memo-suite.log`), and the
+release step records the commit it ships and the suite run against it. Every other repo's commit
 matched the plan's final list exactly; every suite is green (the one `LIVE_KEY` skip is a
 pre-existing, expected skip — it needs a reachable live node).
 
@@ -415,8 +421,8 @@ a scratch file and runs `rand bridge-mint @<file> --to <address>` as a child pro
 
 **Verdict: nothing to change in the bridge repo, and no blocker.** The relayer never builds a
 `BridgeAttest` envelope itself; sealing is entirely the `rand` binary's job, and Task 7 already
-made every one of the wallet's sealing sites (including the `bridge-mint` deposit path,
-`randprotocol-client/src/main.rs:1193`) fetch `rpc.envelope_format()` and seal through
+made every one of the wallet's sealing sites (including the `bridge-mint` deposit path in
+`randprotocol-client/src/main.rs`, which seals through `wallet::deposit_note_for`) fetch `rpc.envelope_format()` and seal through
 `seal_note_as`. The only operational requirement is that the `rand` binary the relayer's host
 invokes be rebuilt from a fullnode commit at or after Task 7 before the launch genesis is cut —
 an ordinary binary update, not a bridge-repo code change.
