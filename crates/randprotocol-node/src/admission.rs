@@ -236,6 +236,8 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | A::CoveredGuestMismatch(_)
                 | A::CoverNotABundle(_)
                 | A::CoverSealed(_)
+                // A slash is refused whatever its bytes and whatever the state (INTERFACE-1).
+                | A::SlashingRetired
         );
     }
     // The RPL registry's verdicts, split the same way: only the ones a transaction's *own bytes*
@@ -955,6 +957,7 @@ mod tests {
             agg(A::CoveredGuestMismatch(h(4))),
             agg(A::CoverNotABundle(h(5))),
             agg(A::CoverSealed(h(5))),
+            agg(A::SlashingRetired),
             TxError::AggregateTooLarge { size: 9_000_000, max: 2 << 20 },
             TxError::InvalidAggregateProof(ConfidentialError::MalformedProof),
         ] {

@@ -120,6 +120,16 @@ Because the program digest changed, a chain's `admitted_shapes[].aggregate_progr
 must be measured on a build that carries it, **and the production proof batch must use this
 program**.
 
+### 3.6 No slashing: a retry is not equivocation (INTERFACE-1)
+
+`SlashAggregator` is refused on every aggregating chain (`AggregationError::SlashingRetired`,
+permanent). The register nonce advances only when an aggregate commits, so every retry after a
+lost race, a refusal or censorship re-signs the same nonce over new content — the `--watch`
+daemon draws a fresh `r` and `time` each pass — and the spec's equivocation proof was exactly
+two such headers, available to anyone. Exactly one aggregate can consume a nonce, so
+equivocation harmed nothing; the bond is what prices spam. The action's wire variant stays (its
+bincode index is part of every txid); `slashed` stays in the supply identity at 0.
+
 ## 4. Fallback
 
 A block whose bundles no aggregate ever covers stays valid: its raw bundle proofs are kept and

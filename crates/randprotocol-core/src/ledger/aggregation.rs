@@ -90,7 +90,7 @@ use crate::types::actions::{
     aggregate_signing_hash, aggregator_register_message, aggregator_unbond_message,
     aggregator_withdraw_message, AggregatorRegistration,
 };
-use crate::types::{Action, SignedAggregateHeader, Transaction};
+use crate::types::{Action, Transaction};
 
 /// Why an aggregation action was refused. Carried inside [`TxError::Aggregation`] so admission
 /// reports the module's own name for it — [`super::staking::StakingError`]'s role, one role over.
@@ -114,8 +114,14 @@ pub enum AggregationError {
     NothingReleased { release: u64, height: u64 },
     #[error("withdraw of {amount} does not cover the bundle base {base}")]
     BelowBundleBase { amount: u64, base: u64 },
-    #[error("a slash's headers must share one aggregator at one nonce with different content")]
-    NotEquivocation,
+    /// `SlashAggregator` is refused outright (the interface review's INTERFACE-1). Two headers
+    /// at one `(aggregator, nonce)` with different content are what every honest retry looks
+    /// like — the nonce moves only when an aggregate commits — so "equivocation" punished the
+    /// aggregator who lost a race; and it harms nothing, because exactly one aggregate can
+    /// consume a nonce. The variant stays on the wire (bincode indices and txids depend on it);
+    /// no state can make it valid again, so the verdict is permanent.
+    #[error("slashing aggregators is retired: a same-nonce retry is not equivocation")]
+    SlashingRetired,
     #[error("an aggregate covers at least one bundle")]
     EmptyCoverSet,
     #[error("an aggregate covers {got} bundles, over the cap {max}")]
@@ -206,8 +212,19 @@ pub(super) fn validate(
                 return Err(TxError::CommitmentExists(cm));
             }
         }
-        Action::SlashAggregator { a, b } => {
-            check_slash(ledger, a, b, tx.chain_id)?;
+        // Retired (the interface review's INTERFACE-1), a validity rule on every aggregating
+        // chain. The register nonce moves only when an aggregate commits, so a retry after a
+        // lost selection race, a refusal or censorship must re-sign the same nonce over new
+        // content — two such headers were the whole "equivocation" proof, public the moment they
+        // were gossiped, and anyone could burn an honest aggregator's bond with them. Nothing is
+        // lost by retiring it: exactly one aggregate can consume a nonce (and one aggregate
+        // commits per block, `BlockError::SecondAggregate`), so two headers at one nonce can
+        // never both be paid; the bond already prices spam. The variant stays in `Action` — its
+        // bincode index is the wire format and every txid — and is refused here before any
+        // state is read. Node-only to ship: aggregation is genesis-gated and off on every live
+        // chain (the gate above refuses the action first there).
+        Action::SlashAggregator { .. } => {
+            return Err(AggregationError::SlashingRetired.into());
         }
         _ => return Err(NOT_AGGREGATION),
     }
@@ -260,8 +277,10 @@ pub(super) fn apply(
             ledger.supply.aggregator_bonds =
                 ledger.supply.aggregator_bonds.checked_sub(bond).ok_or(TxError::Overflow)?;
         }
-        Action::SlashAggregator { a, b } => {
-            ledger.slash_aggregator(a, b, tx.chain_id)?;
+        // Refused in `validate` (INTERFACE-1); `apply_tx` validates first, so this arm is the
+        // lockstep twin of that refusal, never a mutation.
+        Action::SlashAggregator { .. } => {
+            return Err(AggregationError::SlashingRetired.into());
         }
         _ => return Err(NOT_AGGREGATION),
     }
@@ -670,26 +689,6 @@ impl Ledger {
         self.aggregators.remove(aggregator).expect("checked above");
         Ok(())
     }
-
-    /// Burn the bond and delete the entry on an equivocation proof (spec §2.2). The checks are
-    /// in [`check_slash`]; this is the mutation it gates.
-    pub(crate) fn slash_aggregator(
-        &mut self,
-        a: &SignedAggregateHeader,
-        b: &SignedAggregateHeader,
-        chain_id: u64,
-    ) -> Result<(), AggregationError> {
-        check_slash(self, a, b, chain_id)?;
-        let bond = self
-            .aggregators
-            .remove(&a.aggregator)
-            .expect("checked above")
-            .bond;
-        self.supply.aggregator_bonds =
-            self.supply.aggregator_bonds.checked_sub(bond).ok_or(AggregationError::Overflow)?;
-        self.supply.slashed = self.supply.slashed.checked_add(bond).ok_or(AggregationError::Overflow)?;
-        Ok(())
-    }
 }
 
 /// Registration's rules (spec §2.2): the address is unknown, the registration's key claims
@@ -775,30 +774,6 @@ fn check_withdraw(
             height: ledger.height,
         }),
     }
-}
-
-/// The equivocation check (spec §2.2): both headers are signed by the same aggregator at the
-/// same nonce with different content — the only fault provable on chain.
-fn check_slash(
-    ledger: &Ledger,
-    a: &SignedAggregateHeader,
-    b: &SignedAggregateHeader,
-    chain_id: u64,
-) -> Result<(), AggregationError> {
-    if a.aggregator != b.aggregator || a.nonce != b.nonce || a == b {
-        return Err(AggregationError::NotEquivocation);
-    }
-    let e = ledger
-        .aggregators()
-        .get(&a.aggregator)
-        .ok_or(AggregationError::UnknownAggregator(a.aggregator))?;
-    for h in [a, b] {
-        let msg = aggregate_signing_hash(chain_id, h.nonce, h.time, &h.r, &h.covers, &h.proof_hash);
-        if !e.public_key.verify(msg.as_bytes(), &h.signature) {
-            return Err(AggregationError::BadSignature);
-        }
-    }
-    Ok(())
 }
 
 /// The deposit note an aggregator withdraw creates: the register's payout address, no sender,
@@ -1476,54 +1451,32 @@ mod register_tests {
         assert!(l.aggregators().get(&kp.public_key().address()).is_none(), "the entry is deleted");
     }
 
-    /// Slashing: two headers by the same aggregator at the same nonce with different content
-    /// burn the bond and delete the entry — and anyone may submit the proof.
+    /// Slashing is retired (INTERFACE-1): two headers by one aggregator at one nonce with
+    /// different content — what "equivocation" meant, and what every honest retry looks like —
+    /// are refused by name, and so is the pair that never was equivocation (identical headers,
+    /// different nonces). The entry and its bond survive every one.
     #[test]
-    fn a_slash_burns_the_bond_and_deletes_the_entry() {
-        let mut l = gated();
-        let (kp, other) = keys();
-        l.apply_tx(&register_tx(&l, &kp, &payout_addr(), cfg().bond), &proposer(&l), &StubExecutor).unwrap();
-        let h1 = Hash::digest(b"covers one");
-        let h2 = Hash::digest(b"covers two");
-        let slash = Transaction {
-            chain_id: 7,
-            bundle: None,
-            action: Action::SlashAggregator {
-                a: signed_header(&kp, 1, vec![h1], Hash::digest(b"proof one")),
-                b: signed_header(&kp, 1, vec![h2], Hash::digest(b"proof two")),
-            },
-        };
-        l.apply_tx(&slash, &proposer(&l), &StubExecutor).unwrap();
-        assert!(l.aggregators().get(&kp.public_key().address()).is_none(), "the entry is slashed away");
-        let _ = other;
-    }
-
-    /// Not equivocation: identical content, or the same aggregator at different nonces.
-    #[test]
-    fn a_slash_without_equivocation_is_refused() {
+    fn a_slash_is_refused_whatever_its_headers() {
         let mut l = gated();
         let (kp, _) = keys();
         l.apply_tx(&register_tx(&l, &kp, &payout_addr(), cfg().bond), &proposer(&l), &StubExecutor).unwrap();
         let h = Hash::digest(b"covers");
         let p = Hash::digest(b"proof");
-        // Identical headers.
-        let same = Transaction {
-            chain_id: 7,
-            bundle: None,
-            action: Action::SlashAggregator { a: signed_header(&kp, 1, vec![h], p), b: signed_header(&kp, 1, vec![h], p) },
-        };
-        assert!(l.apply_tx(&same, &proposer(&l), &StubExecutor).is_err());
-        // Different nonces.
-        let different = Transaction {
-            chain_id: 7,
-            bundle: None,
-            action: Action::SlashAggregator {
-                a: signed_header(&kp, 1, vec![h], p),
-                b: signed_header(&kp, 2, vec![Hash::digest(b"other")], Hash::digest(b"other proof")),
-            },
-        };
-        assert!(l.apply_tx(&different, &proposer(&l), &StubExecutor).is_err());
-        assert_eq!(l.aggregators().len(), 1, "the entry survives both refusals");
+        let pairs = [
+            (signed_header(&kp, 1, vec![Hash::digest(b"covers one")], Hash::digest(b"proof one")),
+             signed_header(&kp, 1, vec![Hash::digest(b"covers two")], Hash::digest(b"proof two"))),
+            (signed_header(&kp, 1, vec![h], p), signed_header(&kp, 1, vec![h], p)),
+            (signed_header(&kp, 1, vec![h], p), signed_header(&kp, 2, vec![Hash::digest(b"other")], Hash::digest(b"other proof"))),
+        ];
+        for (a, b) in pairs {
+            let slash = Transaction { chain_id: 7, bundle: None, action: Action::SlashAggregator { a, b } };
+            match l.apply_tx(&slash, &proposer(&l), &StubExecutor) {
+                Err(crate::ledger::TxError::Aggregation(AggregationError::SlashingRetired)) => {}
+                other => panic!("every slash is refused by name, got {other:?}"),
+            }
+        }
+        assert_eq!(l.aggregators()[&kp.public_key().address()].bond, cfg().bond, "the bond survives");
+        assert_eq!(l.supply().slashed, 0);
     }
 }
 
@@ -1773,6 +1726,82 @@ mod admission_tests {
             Err(TxError::InvalidAggregateProof(_)) => {}
             other => panic!("A's proof re-signed by B must be refused, got {other:?}"),
         }
+    }
+
+    /// The interface review's INTERFACE-1: a retry is not equivocation. The register nonce moves
+    /// only when an aggregate *commits* (`apply_aggregate`), so an aggregator that loses the
+    /// selection race to a rival — or is refused, or censored — must re-sign the very same nonce
+    /// over new content the next time round (the `--watch` daemon draws a fresh `r` and `time`
+    /// every pass). Both headers are public the moment they are gossiped, and before the fix any
+    /// keyless third party could pair them into a `SlashAggregator` and burn the honest
+    /// aggregator's whole bond. The slash is refused outright now, as a validity rule.
+    #[test]
+    fn a_retry_at_the_same_nonce_is_not_slashable() {
+        let mut l = gated();
+        let genesis_root = l.root();
+        let (v, rival) = keys();
+        register(&mut l, &v);
+        // The rival's registration, anchored at the genesis root (`a_resigned_aggregate_is_refused`'s
+        // construction: the root after V's registration is not yet a known anchor).
+        let payout = payout_addr();
+        let registration = AggregatorRegistration {
+            public_key: rival.public_key().clone(),
+            payout: payout.clone(),
+            signature: rival.sign(aggregator_register_message(7, &payout).as_bytes()),
+        };
+        let mut rb = bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::BUNDLE_BASE, cfg().bond);
+        rb.anchor = genesis_root;
+        let d = StubExecutor.bundle_digest(&rb.digest_input());
+        rb.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
+        let reg = StubExecutor::bound(Transaction::shielded(7, rb, Action::RegisterAggregator { registration }));
+        l.apply_tx(&reg, &proposer(&l), &StubExecutor).unwrap();
+        let p = proposer(&l);
+        for c in covers(4) {
+            l.bucket_excess(c, 0, p, u64::MAX);
+        }
+        let v_addr = v.public_key().address();
+        let bonds_before = l.supply().aggregator_bonds;
+
+        // V signs nonce 0 over cover c0 — and loses: the rival's aggregate over c0 commits first.
+        let v_proof = StubExecutor::make_aggregate_proof(&aggregate_binding(7, &v_addr, 0));
+        let first = aggregate_tx(&v, 0, 100, vec![covers(1)[0]], v_proof.clone());
+        let rival_proof = StubExecutor::make_aggregate_proof(&aggregate_binding(7, &rival.public_key().address(), 0));
+        let rivals = aggregate_tx(&rival, 0, 100, vec![covers(1)[0]], rival_proof);
+        l.apply_aggregate(&rivals, &covered_records(&shape(), &[1]), &StubExecutor).unwrap();
+        assert_eq!(l.aggregators()[&v_addr].nonce, 0, "V's nonce did not move: nothing of V's committed");
+
+        // V's retry: the same nonce, new content — and it is a valid aggregate.
+        let retry = aggregate_tx(&v, 0, 99, vec![covers(2)[1]], v_proof);
+        l.validate_aggregate(&retry, &covered_records(&shape(), &[2]), &StubExecutor)
+            .expect("the retry at the uncommitted nonce is valid");
+
+        // A keyless third party pairs the two public headers.
+        let header = |tx: &Transaction| {
+            let Action::Aggregate { covers, proof, aggregator, nonce, time, r, signature, .. } = &tx.action else {
+                unreachable!()
+            };
+            Box::new(crate::types::SignedAggregateHeader {
+                aggregator: *aggregator,
+                nonce: *nonce,
+                time: *time,
+                r: *r,
+                covers: covers.clone(),
+                proof_hash: Hash::digest(proof),
+                signature: signature.clone(),
+            })
+        };
+        let slash = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::SlashAggregator { a: header(&first), b: header(&retry) },
+        };
+        match l.apply_tx(&slash, &p, &StubExecutor) {
+            Err(TxError::Aggregation(AggregationError::SlashingRetired)) => {}
+            other => panic!("a retry must never be slashable, got {other:?}"),
+        }
+        assert_eq!(l.aggregators()[&v_addr].bond, cfg().bond, "V's bond is untouched");
+        assert_eq!(l.supply().aggregator_bonds, bonds_before, "no bond left the register");
+        assert_eq!(l.supply().slashed, 0, "nothing was slashed");
     }
 
     /// The happy path, end to end through the covered-carrying entry: steps 1–8 pass, the
@@ -2380,8 +2409,9 @@ mod payment_tests {
     }
 
     /// The audit across the whole lifecycle (spec §5.3): a register, a fee-paying bundle, an
-    /// aggregate covering it, an aggregator withdraw, and a slash — after each, the pool plus
-    /// the register adds up to exactly what the chain issued less what was slashed.
+    /// aggregate covering it, an aggregator withdraw, and a slash (refused since INTERFACE-1) —
+    /// after each, the pool plus the register adds up to exactly what the chain issued less what
+    /// was slashed.
     #[test]
     fn the_supply_invariant_holds_across_register_aggregate_withdraw_and_slash() {
         let (a, b) = keys();
@@ -2460,7 +2490,8 @@ mod payment_tests {
         l.apply_tx(&withdraw, &p, &StubExecutor).unwrap();
         check(&l, "withdraw");
 
-        // Slash `b` for equivocation: the bond is destroyed, and `issued − slashed` tracks it.
+        // A slash of `b` is refused (INTERFACE-1): nothing is destroyed, `slashed` stays 0, and
+        // `b`'s bond is still in the register — the audit holds either way.
         let slash = Transaction {
             chain_id: 7,
             bundle: None,
@@ -2469,10 +2500,13 @@ mod payment_tests {
                 b: Box::new(signed_header(&b, 0, vec![Hash::digest(b"y")])),
             },
         };
-        l.apply_tx(&slash, &p, &StubExecutor).unwrap();
-        check(&l, "slash");
-        assert_eq!(l.supply().slashed, cfg_with_window(2).bond);
-        assert_eq!(l.supply().aggregator_bonds, 0, "both bonds resolved");
+        assert!(matches!(
+            l.apply_tx(&slash, &p, &StubExecutor),
+            Err(crate::ledger::TxError::Aggregation(AggregationError::SlashingRetired))
+        ));
+        check(&l, "a refused slash");
+        assert_eq!(l.supply().slashed, 0);
+        assert_eq!(l.supply().aggregator_bonds, cfg_with_window(2).bond, "b's bond is still registered");
     }
 
     /// The T4 interim closes (spec §4's admission, run at apply): a block carrying an

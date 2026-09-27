@@ -154,6 +154,16 @@ kem_ek)`, and the root joins the state root as `… || aggregators_root` under t
   content — the only equivocation provable on chain. Burns the bond (supply term `slashed`,
   §5.3) and deletes the entry. Everything else invalid is simply refused.
 
+  **Retired (2026-09-28, the interface review's INTERFACE-1): every `SlashAggregator` is refused,
+  `AggregationError::SlashingRetired`, a permanent validity rule.** The nonce moves only when an
+  aggregate *commits*, so an aggregator that loses the §3.4 selection, is refused or is censored
+  must re-sign the same nonce over new content on its next attempt — two such headers are what
+  "equivocation" meant above, both public once gossiped, and anyone could burn an honest bond
+  with them. Retiring it costs nothing: exactly one aggregate can consume a nonce and one
+  aggregate commits per block, so two headers at one nonce are never both paid, and the bond
+  already prices submission spam. The variant keeps its place in `Action` (its bincode index is
+  the wire format and every txid); `slashed` stays in the supply identity and stays 0.
+
 One monotonic `nonce` per entry is shared by all three signed actions and by every `Aggregate`
 submission; each accepted action consumes `nonce + 1`.
 
