@@ -712,19 +712,37 @@ fn memo_column(memo: &Option<String>, whole: bool) -> String {
     }
 }
 
+/// The confirmation memo line's cut point: long enough to show a real memo whole almost always,
+/// short enough that, together with the fixed `memo: "…"` wrapping and a byte-count suffix of up
+/// to [`randprotocol_core::notes::MEMO_TEXT_MAX_BYTES`]'s three digits, the whole line never
+/// passes 80 columns (7 + 60 + 1 + 12 = 80 exactly, at the longest memo the chain accepts).
+const MEMO_CONFIRM_CHARS: usize = 60;
+
 /// `rand send`'s confirmation, before anything proves: `to <name?> · fingerprint … · <amount>
-/// <asset>`, then — only when there is one — the memo on its own `memo: "…"` line. The memo is
-/// hostile text (anyone can send one, and a link carries any), so it never shares the recipient
-/// line, and it and the contact name (user-entered, and a link can suggest one) are shown through
+/// <asset>`, then — only when there is one — the memo on its own `memo: "…"` line, itself cut to
+/// [`MEMO_CONFIRM_CHARS`] with [`memo_display::truncate`] so a memo of any length can never wrap
+/// the terminal, and — only when it was in fact cut — a `(N bytes)` suffix naming the raw memo's
+/// full length, since a cut memo can otherwise look complete. The memo is hostile text (anyone
+/// can send one, and a link carries any), so it never shares the recipient line, and it and the
+/// contact name (user-entered, and a link can suggest one) are shown through
 /// [`memo_display::sanitize`]: a memo padded with spaces or carrying a line break, a terminal
-/// escape or a bidi override cannot draw a second recipient line (final review A).
+/// escape or a bidi override cannot draw a second recipient line, and one long enough to wrap —
+/// or built of ordinary visible filler, like ASCII dashes or the invisible-looking Braille blank
+/// U+2800, that sanitizing does not touch — cannot draw a forged one past the cut either (final
+/// review A, C1).
 fn confirmation(name: Option<&str>, fingerprint: &str, amount: &str, memo: &str) -> String {
     // The separator goes through the rule with the name, so a name ending in a space (names are
     // never trimmed) cannot leave a run of two.
     let name_part = name.map(|n| memo_display::sanitize(&format!("{n} · "))).unwrap_or_default();
     let mut shown = format!("to {name_part}fingerprint {fingerprint} · {}", memo_display::sanitize(amount));
     if !memo.is_empty() {
-        shown.push_str(&format!("\nmemo: \"{}\"", memo_display::sanitize(memo)));
+        let full_len = memo_display::sanitize(memo).chars().count();
+        let cut = memo_display::truncate(memo, MEMO_CONFIRM_CHARS);
+        if full_len > MEMO_CONFIRM_CHARS {
+            shown.push_str(&format!("\nmemo: \"{cut}\" ({} bytes)", memo.len()));
+        } else {
+            shown.push_str(&format!("\nmemo: \"{cut}\""));
+        }
     }
     shown
 }
@@ -2129,8 +2147,9 @@ mod tests {
     }
 
     /// `rand send`'s confirmation: the recipient line carries no memo text at all — the memo is
-    /// its own `memo: "…"` line after it — and a hostile memo or contact name shows with no line
-    /// break, no control or format character and no run of spaces.
+    /// its own `memo: "…"` line after it, itself cut to [`MEMO_CONFIRM_CHARS`] — and a hostile
+    /// memo or contact name shows with no line break, no control or format character and no run
+    /// of spaces.
     #[test]
     fn the_confirmation_puts_a_sanitised_memo_on_its_own_line() {
         let fp = "AAAA-BBBB-CCCC-DDDD";
@@ -2143,11 +2162,41 @@ mod tests {
             let lines: Vec<&str> = shown.split('\n').collect();
             assert_eq!(lines.len(), 2, "{shown:?}");
             assert_eq!(lines[0], "to alice · fingerprint AAAA-BBBB-CCCC-DDDD · 1.5 RAND");
-            assert!(lines[1].starts_with("memo: \"") && lines[1].ends_with('"'), "{shown:?}");
+            assert!(lines[1].starts_with("memo: \""), "{shown:?}");
+            // A cut memo's line ends in the closing quote alone; a memo long enough to be cut
+            // (some of the hostile cases are, once their format characters are counted) ends in
+            // the `(N bytes)` suffix instead.
+            assert!(lines[1].ends_with('"') || lines[1].ends_with(" bytes)"), "{shown:?}");
             assert!(memo_display::is_displayable(lines[1]), "{shown:?}");
             // A contact name is user-entered too, and reaches the same line.
             let shown = confirmation(Some(&m), fp, "1.5 RAND", "");
             assert!(!shown.contains('\n') && memo_display::is_displayable(&shown), "{shown:?}");
+        }
+    }
+
+    /// The reproduction from the reviewer's report: a memo built to draw a forged `to alice ·
+    /// fingerprint …` line on its own row — one padded with the invisible-looking Braille blank
+    /// U+2800 (not a space separator, so [`memo_display::sanitize`] does not touch it) and one
+    /// padded with plain visible ASCII dashes, both `sanitize` cannot shorten — is cut by the
+    /// confirmation line's [`MEMO_CONFIRM_CHARS`] limit before the forged text is ever reached. A
+    /// memo at the chain's own maximum, [`randprotocol_core::notes::MEMO_TEXT_MAX_BYTES`] (510)
+    /// bytes, is the longest byte-count suffix this ever prints (three digits): the memo line
+    /// still never passes 80 display columns.
+    #[test]
+    fn a_memo_line_never_forges_a_recipient_line_and_never_passes_eighty_columns() {
+        let fp = "AAAA-BBBB-CCCC-DDDD";
+        let tail = "to alice · fingerprint AAAA-AAAA-AAAA-AAAA · 1 RAND";
+        let u2800_padded = format!("x{}{tail}", "\u{2800}".repeat(72));
+        let dash_padded = format!("x{}{tail}", "-".repeat(72));
+        let at_the_chains_own_max = "y".repeat(randprotocol_core::notes::MEMO_TEXT_MAX_BYTES);
+        assert!(at_the_chains_own_max.len() == randprotocol_core::notes::MEMO_TEXT_MAX_BYTES);
+        for m in [u2800_padded, dash_padded, at_the_chains_own_max] {
+            let shown = confirmation(Some("alice"), fp, "1.5 RAND", &m);
+            let lines: Vec<&str> = shown.split('\n').collect();
+            assert_eq!(lines.len(), 2, "{shown:?}");
+            assert!(lines[1].chars().count() <= 80, "{} is {} columns: {shown:?}", lines[1], lines[1].chars().count());
+            assert!(!lines[1].contains("to alice"), "{shown:?}");
+            assert!(!lines[1].contains("fingerprint AAAA-AAAA-AAAA-AAAA"), "{shown:?}");
         }
     }
 
