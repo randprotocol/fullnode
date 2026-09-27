@@ -1591,13 +1591,19 @@ mod tests {
         assert_eq!(non_canonical_proof(&padded.to_bytes()), non_canonical(&padded), "the byte form reads the same");
     }
 
-    /// VERIFIER-1: the FRI commit-phase proof-of-work words are read and dropped — the chain's
+    /// VERIFIER-1: the FRI commit-phase proof-of-work words were read and dropped — the chain's
     /// FRI parameters grind 0 bits there, and `check_witness(0, _)` is `true` for any word — so
-    /// anyone relaying a call or a bundle can rewrite one and hold a second valid encoding with
-    /// another transaction id. Shown on a real call: the rewritten proof still verifies against
-    /// the deployed program, and it is named non-canonical; the honest prover writes zero.
+    /// anyone relaying a call or a bundle could rewrite one and hold a second valid encoding with
+    /// another transaction id. This test first pinned the finding (the rewritten proof verified,
+    /// and only the node's canonical check named it); since the circuits `36f07bb` re-vendor,
+    /// `Machine::verify` refuses a non-zero word itself, unconditionally
+    /// (`VerifyError::CommitPowWitness`), so it now pins the fix on a real call: the rewritten
+    /// proof is refused by the verifier against the deployed program, and the node's canonical
+    /// check refuses it too — two independent refusals, the pool's before any key is built. The
+    /// honest prover writes zero and passes both. (TEST-1, the v0.6 rescan: the stale assertion
+    /// was red at 06e688d.)
     #[test]
-    fn verifier1_a_rewritten_commit_pow_word_verifies_and_is_non_canonical() {
+    fn verifier1_a_rewritten_commit_pow_word_is_refused_by_verify_and_is_non_canonical() {
         use super::*;
         use crate::machine::{Backend, FriProfile, Val};
         use p3_field::PrimeCharacteristicRing;
@@ -1619,8 +1625,12 @@ mod tests {
         rewritten.batch.opening_proof.1.commit_pow_witnesses[0] = Val::from_u64(0xdead_beef);
         let rewritten = rewritten.to_bytes();
         assert_ne!(rewritten, bytes, "another encoding, so another transaction id");
-        assert_eq!(zk.verify_call(&record, &rewritten), zk.verify_call(&record, &bytes), "the finding: it verifies all the same");
-        assert!(zk.verify_call(&record, &bytes).is_ok());
+        assert_eq!(
+            zk.verify_call(&record, &rewritten),
+            Err(ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::CommitPowWitness { round: 0 }))),
+            "the fix: Machine::verify refuses the rewritten word"
+        );
+        assert!(zk.verify_call(&record, &bytes).is_ok(), "the honest encoding verifies");
         assert_eq!(non_canonical_proof(&bytes), None);
         assert!(
             non_canonical_proof(&rewritten).is_some_and(|w| w.starts_with("FRI commit-phase proof-of-work word")),
