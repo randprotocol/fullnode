@@ -48,8 +48,8 @@ Change the allowlist in the randprotocol.org repo, never by pointing Caddy at a 
 `rand_mint` stays as the genesis sets it — there is no per-node switch — and stays off the public
 path:
 
-- Chain 15's faucet is `staking.faucet_recipients`-limited: it pays only the 18 allowlisted spend
-  keys (all the operator's), within `faucet_budget_per_epoch`. It cannot pay anyone else.
+- Chain 15's faucet is `staking.faucet_recipients`-limited: it pays only the 16 spend keys the
+  genesis names, within `faucet_budget_per_epoch`. It cannot pay anyone else.
 - F's node answers `rand_mint` only on its own loopback, which nothing forwards to; E's is reached
   publicly only through the proxy, which refuses it.
 - So nothing changes on F. Mint to an allowlisted key from the host itself (`rand faucet <address>` against
