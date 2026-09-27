@@ -362,6 +362,17 @@ enum Cmd {
         /// "start_ms", "cliff_ms", "linear_ms", "step_ms"?}]}`). Omitted entirely when absent.
         #[arg(long, value_name = "VESTING.JSON")]
         vesting: Option<PathBuf>,
+        /// The bundle guest the chain pins as `hc_bundle`: `v1` (the hidden-asset guest chains 14
+        /// and 15 run) or `v2`, the branch-free guest whose instruction and lookup counts do not
+        /// depend on which input slots are real or on the spent leaves' indices (INT-2 / GV-1).
+        /// Both are the same statement and proof shape; this build verifies either.
+        #[arg(long, value_name = "v1|v2", default_value = "v1", value_parser = ["v1", "v2"])]
+        bundle_guest: String,
+        /// Turn on the v0.6 rules as validity rules (`hardening_v6`): the pc window, uncallable
+        /// deploys, canonical proof shapes and proof-of-work words, the call binding and the
+        /// program-table floor. Absent, a node still refuses those at its pool, as policy.
+        #[arg(long)]
+        hardening_v6: bool,
     },
     /// Print one genesis alloc note as JSON — the object that goes into a genesis file's `alloc`
     /// list — sealed to `--to` exactly as `genesis --alloc` seals one, so the owner's wallet finds
@@ -731,7 +742,13 @@ async fn main() -> Result<()> {
             tokens,
             envelope_bytes,
             vesting,
+            bundle_guest,
+            hardening_v6,
         } => {
+            let hc_bundle = match bundle_guest.as_str() {
+                "v2" => ZkExecutor::hc_hidden_bundle_v2(),
+                _ => ZkExecutor::hc_bundle(),
+            };
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -742,7 +759,7 @@ async fn main() -> Result<()> {
                 faucet,
                 confidential: !no_confidential,
                 fri_profile,
-                hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
+                hc_bundle: word8_to_hex(&hc_bundle),
                 // A bridged chain is cut by adding a `bridge` section to this file by hand:
                 // `Genesis::build` accepts and validates one (`check_bridge`) and the node
                 // persists and reloads it, but a guardian set plus a per-chain emitter table is
@@ -775,12 +792,12 @@ async fn main() -> Result<()> {
                         cfg.admitted_shapes = shapes
                             .iter()
                             .map(|s| {
-                                // The literal `hc_bundle` means this build's pinned guest
-                                // digest — the only value a chain-9 genesis may take, so the
-                                // flag cannot quietly carry a stale one.
+                                // The literal `hc_bundle` means the guest this genesis pins
+                                // (`--bundle-guest`) — the only value its aggregates may cover,
+                                // so the flag cannot quietly carry a stale one.
                                 let admitted = parse_admitted_shape(&s.replace(
                                     ",hc_bundle,",
-                                    &format!(",{},", word8_to_hex(&ZkExecutor::hc_bundle())),
+                                    &format!(",{},", word8_to_hex(&hc_bundle)),
                                 ))?;
                                 // The half of the genesis check core cannot run (IFACE-9): the
                                 // rVM must be able to build an inner verifier key for the shape,
@@ -822,8 +839,9 @@ async fn main() -> Result<()> {
                     ),
                     None => None,
                 },
-                // The v0.6 `hardening_v6` switch likewise: set by hand in the file for the next cut.
-                hardening_v6: None,
+                // The v0.6 `hardening_v6` switch: absent unless asked for, so a genesis cut without
+                // it hashes byte-for-byte as before.
+                hardening_v6: hardening_v6.then_some(true),
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);

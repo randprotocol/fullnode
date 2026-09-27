@@ -89,3 +89,29 @@ fn the_genesis_command_round_trips_a_tokens_section() {
     assert!(!stderr.contains("is not a valid tokens config"), "refused by the build, not the parse: {stderr}");
     assert!(!bad_out.exists(), "and nothing is written");
 }
+
+/// v0.6's next-cut switches from the command line: `--bundle-guest v2` pins the branch-free guest
+/// (INT-2 / GV-1) and `--hardening-v6` turns the v0.6 rules on as validity rules. The file carries
+/// both, it builds, a node built from this tree accepts it, and it is a different chain from the
+/// default (v1, no switch) — while the default still writes exactly what it always did.
+#[test]
+fn the_genesis_command_pins_guest_v2_and_the_v06_switch_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("plain.json");
+    let next = dir.path().join("next.json");
+    assert!(genesis(&plain, &[]).status.success());
+    let run = genesis(&next, &["--bundle-guest", "v2", "--hardening-v6"]);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let (p, n) = (read(&plain), read(&next));
+    assert_eq!(p.hc_bundle, word8_to_hex(&ZkExecutor::hc_hidden_bundle()), "the default stays v1");
+    assert_eq!(p.hardening_v6, None, "and writes no switch");
+    assert_eq!(n.hc_bundle, word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2()));
+    assert_eq!(n.hardening_v6, Some(true));
+    let executor = randprotocol_node::node::executor_for_profile(&n.fri_profile).unwrap();
+    let state = n.build(executor.as_ref()).unwrap();
+    assert!(state.ledger.hardening_v6());
+    randprotocol_node::node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).unwrap();
+    let plain_state = p.build(executor.as_ref()).unwrap();
+    assert_ne!(state.hash(), plain_state.hash(), "a different chain");
+    assert!(genesis(&dir.path().join("bad.json"), &["--bundle-guest", "v3"]).status.code() != Some(0), "an unknown guest is refused");
+}
