@@ -676,6 +676,9 @@ Params: `[]`. Result on a chain without a `bridge` section: `{ "enabled": false 
                                          // must carry (always 0 on a chain without rules_v2 — chain 14)
   "rules_v2": null,                      // v0.5.4: { "global_mint_cap_per_window": "<decimal string>",
                                          // "cap_window_secs": 86400 } on a chain whose genesis has the group
+  "min_inbound_sequence": null,          // C15-1: { "2": 7, "4": 3 } — per source chain the lowest
+                                         // sequence a transfer may carry, from the genesis replay floor;
+                                         // null on a chain without one (chain 15 and earlier)
   "assets": [ …the rows of `rand_getAssets`… ]
 }
 ```
@@ -1283,6 +1286,14 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-27 — the bridge replay floor (C15-1, genesis-gated; not on chain 15)
+
+- **`rand_getBridgeState` gains `min_inbound_sequence`**: the genesis `bridge.min_inbound_sequence`,
+  an object of decimal chain ids to plain-number sequences, or `null` without one. A
+  `bridge_attest` whose transfer carries a lower sequence from that chain is refused
+  `BelowReplayFloor` — a permanent verdict (`rand_getTransactionStatus` reads `rejected`). Nothing
+  changes on a chain whose genesis has no floor (`docs/bridge.md` §23).
 
 ### 2026-09-25 — history pruning: `--prune-history`, `rand_status.prune_floor`, error `-32010`
 

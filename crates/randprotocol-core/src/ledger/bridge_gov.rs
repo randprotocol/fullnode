@@ -365,6 +365,7 @@ mod tests {
             rules_v2: None,
             guardian_set_index: None,
             burn_sequence: None,
+            min_inbound_sequence: None,
         })));
         l.set_tokens(Some(TokenRegistry::new(FEE).with_mint_cap(100_000 * 100_000_000)));
         l.set_height(1);

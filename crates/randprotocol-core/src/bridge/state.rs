@@ -93,6 +93,25 @@ pub struct BridgeConfig {
     /// `burn_sequence` either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub burn_sequence: Option<u64>,
+    /// The inbound replay floor (C15-1): per source chain, the lowest message `sequence` a
+    /// transfer attestation from that chain's emitter may carry. A chain cut from another one's
+    /// bridge keeps the source endpoints — and their sequence counters, and (at a carried-over
+    /// guardian set) their ECDSA signatures — so every lock the old chain already minted is an
+    /// attestation the new chain's ECDSA quorum accepts; only the PQ co-signature, bound to the
+    /// chain id, and the guardians' own stores stand between it and a second mint. The floor is
+    /// one past the last lock the old chain observed on each source, so no guardian store, fresh
+    /// or not, can make an old lock mint twice: below it a transfer is
+    /// [`BridgeError::BelowReplayFloor`]. Rotations (Rand's own governance messages) are not
+    /// judged by it.
+    ///
+    /// Written `{"<chain>": <sequence>}` (keys the decimal chain id, as `emitters`; a key twice
+    /// is refused at parse). Genesis holds it non-empty, every key a registered `emitters` chain
+    /// and every floor above zero. Absent on chain 15 and every earlier chain; then committed
+    /// nowhere. Present, it is committed to the genesis hash under its own tag
+    /// (`b"bridge_min_inbound_sequence"` ‖ u32 BE count ‖ (u16 BE chain ‖ u64 BE floor)…, after
+    /// `bridge_burn_sequence`) and folded into the bridge root (see [`BridgeState::root`]).
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "floor_map")]
+    pub min_inbound_sequence: Option<BTreeMap<u16, u64>>,
 }
 
 /// Bridge rules v2 (audit v4 BRG-14 / BR-4): the parameters the second rule set adds. Genesis
@@ -150,6 +169,8 @@ impl From<&BridgeConfig> for BridgeCommit {
             rules_v2: _,
             guardian_set_index: _,
             burn_sequence: _,
+            // The replay floor (C15-1) likewise: tagged in `Genesis::build`, only when present.
+            min_inbound_sequence: _,
         } = cfg;
         BridgeCommit {
             emitter: *emitter,
@@ -216,6 +237,10 @@ pub struct BridgeState {
     /// Bridge rules v2: the genesis `bridge.rules_v2`, `None` on chain 14. The gate every v2
     /// rule reads first (`BridgeError::RulesV2Disabled`).
     pub rules_v2: Option<BridgeRulesV2>,
+    /// C15-1: the genesis `bridge.min_inbound_sequence`, empty when the genesis has none (chain
+    /// 15 and every earlier chain). Fixed for the chain's life; stored under its own key and
+    /// folded into the root only when non-empty.
+    pub min_inbound_sequence: BTreeMap<u16, u64>,
 }
 
 /// The small, whole-state half of a [`BridgeState`]: everything except the
@@ -390,6 +415,12 @@ pub enum BridgeError {
     /// Bridge rules v2: the new pause key is one of the PQ guardians'.
     #[error("the new pause key is a PQ guardian's key")]
     PauseKeyIsGuardian,
+    /// C15-1: a transfer whose `(emitter_chain, sequence)` is below the genesis replay floor
+    /// (`bridge.min_inbound_sequence`) — a lock the chain this one was cut from already observed,
+    /// whatever quorum signs it. The body's own bytes against a genesis constant, so a permanent
+    /// verdict.
+    #[error("chain {chain} sequence {sequence} is below this chain's replay floor {floor}")]
+    BelowReplayFloor { chain: u16, sequence: u64, floor: u64 },
 }
 
 /// A transfer attestation as the pool needs it: which asset, under which note
@@ -516,6 +547,7 @@ impl BridgeState {
             pq_guardians: cfg.pq_guardians.clone(),
             pause_key: cfg.pause_key.clone(),
             rules_v2: cfg.rules_v2.clone(),
+            min_inbound_sequence: cfg.min_inbound_sequence.clone().unwrap_or_default(),
             ..Default::default()
         }
     }
@@ -541,6 +573,8 @@ impl BridgeState {
             // The v2 half: `meta_v2`'s, never this blob's (its layout is chain 14's).
             rotation_nonce: _,
             rules_v2: _,
+            // The replay floor: `replay_floor`'s, under its own key, never this blob's.
+            min_inbound_sequence: _,
         } = self;
         BridgeMeta {
             emitter: *emitter,
@@ -562,12 +596,21 @@ impl BridgeState {
         self.rules_v2.clone().map(|rules| BridgeMetaV2 { rotation_nonce: self.rotation_nonce, rules })
     }
 
+    /// The replay floor for storage (C15-1): `Some` exactly when the genesis carries one, `None`
+    /// on chain 15 and every earlier chain — where there is nothing to store and no key to write,
+    /// so their databases keep the key set they have.
+    pub fn replay_floor(&self) -> Option<&BTreeMap<u16, u64>> {
+        Some(&self.min_inbound_sequence).filter(|f| !f.is_empty())
+    }
+
     /// Rebuilds a bridge from the halves storage keeps apart: the v1 blob, the v2 blob when the
-    /// chain has one, and the two row-wise collections. The inverse of [`BridgeState::meta`] and
-    /// [`BridgeState::meta_v2`].
+    /// chain has one, the replay floor (empty when the chain has none), and the two row-wise
+    /// collections. The inverse of [`BridgeState::meta`], [`BridgeState::meta_v2`] and
+    /// [`BridgeState::replay_floor`].
     pub fn from_parts(
         meta: BridgeMeta,
         v2: Option<BridgeMetaV2>,
+        min_inbound_sequence: BTreeMap<u16, u64>,
         spent: BTreeSet<Hash>,
         burns: BTreeMap<u64, BridgeBurnRecord>,
     ) -> BridgeState {
@@ -602,6 +645,7 @@ impl BridgeState {
             list_nonce,
             rotation_nonce,
             rules_v2,
+            min_inbound_sequence,
         }
     }
 
@@ -676,6 +720,19 @@ impl BridgeState {
                 }
                 if self.emitters.get(&att.body.emitter_chain) != Some(&att.body.emitter_address) {
                     return Err(BridgeError::WrongEmitter);
+                }
+                // C15-1: a lock the chain this one was cut from already observed. The source
+                // endpoints (and, at a carried-over guardian set, their signers) outlive a cut, so
+                // the quorums below would accept it; the genesis floor is what refuses it, as a
+                // comparison, before any signature.
+                if let Some(&floor) = self.min_inbound_sequence.get(&att.body.emitter_chain) {
+                    if att.body.sequence < floor {
+                        return Err(BridgeError::BelowReplayFloor {
+                            chain: att.body.emitter_chain,
+                            sequence: att.body.sequence,
+                            floor,
+                        });
+                    }
                 }
                 if t.token_chain != att.body.emitter_chain {
                     return Err(BridgeError::WrongTokenChain);
@@ -973,6 +1030,13 @@ impl BridgeState {
     /// chain without the section — chain 14 — hashes byte-for-byte as above, whatever
     /// `rotation_nonce` reads (nothing can move it there).
     ///
+    /// A genesis replay floor (C15-1, `min_inbound_sequence`), when present and only then, wraps
+    /// that root: `blake3("rand-bridge-replay-floor-1" || root || bincode(floor))`. The floor never
+    /// moves and the genesis hash already commits to it, but it decides which mints are admissible
+    /// exactly as the emitter table does, so a node that lost it (a store written without the
+    /// key) must disagree at its very next state root rather than at the first old lock it
+    /// admits. A chain without one — chain 15 and every earlier chain — hashes as above.
+    ///
     /// B1/B4 appended the pause key, the pause flag and the two governance
     /// nonces and bumped the domain to `rand-bridge-state-4`: each decides
     /// what the next governance message or attestation may do, so two nodes
@@ -1016,13 +1080,25 @@ impl BridgeState {
             &bincode::serialize(&(&self.pause_key, self.mint_paused, self.pause_nonce, self.list_nonce))
                 .expect("the pause and listing state serializes"),
         );
-        if let Some(rules) = &self.rules_v2 {
-            buf.extend_from_slice(
-                &bincode::serialize(&(self.rotation_nonce, rules)).expect("the rotation nonce and the rules serialize"),
-            );
-            return Hash::digest_domain(b"rand-bridge-state-5", &buf);
+        let root = match &self.rules_v2 {
+            Some(rules) => {
+                buf.extend_from_slice(
+                    &bincode::serialize(&(self.rotation_nonce, rules)).expect("the rotation nonce and the rules serialize"),
+                );
+                Hash::digest_domain(b"rand-bridge-state-5", &buf)
+            }
+            None => Hash::digest_domain(b"rand-bridge-state-4", &buf),
+        };
+        // C15-1: the replay floor wraps whichever root the chain has, and only when the genesis
+        // carries one — a fixed 32-byte root then the floor, under a domain of its own.
+        match self.replay_floor() {
+            Some(floor) => {
+                let mut wrapped = root.as_bytes().to_vec();
+                wrapped.extend_from_slice(&bincode::serialize(floor).expect("the replay floor serializes"));
+                Hash::digest_domain(b"rand-bridge-replay-floor-1", &wrapped)
+            }
+            None => root,
         }
-        Hash::digest_domain(b"rand-bridge-state-4", &buf)
     }
 }
 
@@ -1074,6 +1150,43 @@ mod hex_guardians {
             .iter()
             .map(|s| from_hex::<20, D::Error>(s))
             .collect()
+    }
+}
+
+/// `min_inbound_sequence`'s JSON: an object keyed by the decimal chain id (as `emitters`), each
+/// value a plain number. Unlike `hex_emitters` a key twice is refused here, including two
+/// spellings of one chain (`"2"` and `"02"`): a map would silently keep the last one, and a floor
+/// typed twice with two values is exactly the edit that should not pass unnoticed.
+mod floor_map {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(v: &Option<BTreeMap<u16, u64>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(m) => s.collect_map(m.iter().map(|(k, f)| (k.to_string(), *f))),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<BTreeMap<u16, u64>>, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = BTreeMap<u16, u64>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object of decimal chain ids to sequences")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+                use serde::de::Error as _;
+                let mut out = BTreeMap::new();
+                while let Some((k, v)) = a.next_entry::<String, u64>()? {
+                    let chain: u16 = k.parse().map_err(|_| A::Error::custom(format!("invalid chain id {k:?}")))?;
+                    if out.insert(chain, v).is_some() {
+                        return Err(A::Error::custom(format!("chain {chain} is listed twice")));
+                    }
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_map(Visit).map(Some)
     }
 }
 
@@ -1187,6 +1300,7 @@ mod tests {
             rules_v2: None,
             guardian_set_index: None,
             burn_sequence: None,
+            min_inbound_sequence: None,
         };
         (config, secrets)
     }
@@ -1528,6 +1642,99 @@ mod tests {
         assert_eq!(BridgeState::from_config(&plain).burn_sequence, 0);
     }
 
+    /// C15-1: chain 15 starts at guardian set 1, where the source endpoints were before the cut,
+    /// and `mu` does not name the Rand chain — so a chain-14 lock signed by set 1 is an ECDSA-valid
+    /// attestation on its successor, and a PQ quorum with fresh stores would co-sign it for the
+    /// new chain id. The genesis replay floor refuses it whatever signs it: below the floor a
+    /// set-1-signed transfer with an honest PQ co-signature for this chain is `BelowReplayFloor`;
+    /// at and above it, and on a chain the floor does not name, it is accepted; and a bridge
+    /// with no floor (chain 15's) accepts what it always did.
+    #[test]
+    fn a_transfer_below_the_replay_floor_is_refused_whatever_signs_it() {
+        let (mut c, s) = cfg();
+        c.guardian_set_index = Some(1);
+        let at = |chain: u16, token: [u8; 32], sequence: u64| {
+            let mut body = token_body(chain, token, 1_000, 10, 1);
+            body.sequence = sequence;
+            attest(&s, 1, body)
+        };
+        const OTHER: [u8; 32] = [0xbb; 32];
+        let mut tk = tokens_with_the_test_token();
+        list(&mut tk, 3, OTHER);
+
+        // No floor — chain 15's genesis: every sequence is what it was.
+        let plain = BridgeState::from_config(&c);
+        assert!(plain.min_inbound_sequence.is_empty());
+        for sequence in [0, 9, 10] {
+            assert!(check(&plain, &tk, &at(2, TOKEN, sequence), 100).is_ok(), "no floor, sequence {sequence}");
+        }
+
+        c.min_inbound_sequence = Some([(2u16, 10u64)].into_iter().collect());
+        let st = BridgeState::from_config(&c);
+        for sequence in [0, 9] {
+            let bytes = at(2, TOKEN, sequence);
+            assert_eq!(
+                check(&st, &tk, &bytes, 100).unwrap_err(),
+                BridgeError::BelowReplayFloor { chain: 2, sequence, floor: 10 },
+                "sequence {sequence} under the floor"
+            );
+        }
+        for sequence in [10, 11, u64::MAX] {
+            assert!(check(&st, &tk, &at(2, TOKEN, sequence), 100).is_ok(), "sequence {sequence} at or above the floor");
+        }
+        // A source chain the floor does not name keeps no floor.
+        assert!(check(&st, &tk, &at(3, OTHER, 0), 100).is_ok());
+    }
+
+    /// The replay floor rides its own storage half and wraps the root only when present: a
+    /// bridge without one has no floor half and the root it always had; with one, the root moves
+    /// with every entry and the floor round-trips through `from_parts`.
+    #[test]
+    fn the_replay_floor_is_in_the_root_and_its_own_storage_half_only_when_present() {
+        let (mut c, _) = cfg();
+        let plain = BridgeState::from_config(&c);
+        assert_eq!(plain.replay_floor(), None);
+        c.min_inbound_sequence = Some([(2u16, 10u64), (4, 3)].into_iter().collect());
+        let st = BridgeState::from_config(&c);
+        assert_eq!(st.replay_floor(), c.min_inbound_sequence.as_ref());
+        assert_eq!(st.meta(), plain.meta(), "the v1 blob is chain 15's layout");
+        assert_ne!(st.root(), plain.root());
+        let mut higher = c.clone();
+        higher.min_inbound_sequence = Some([(2u16, 11u64), (4, 3)].into_iter().collect());
+        assert_ne!(BridgeState::from_config(&higher).root(), st.root());
+        let rebuilt = BridgeState::from_parts(
+            st.meta(),
+            None,
+            st.replay_floor().cloned().unwrap_or_default(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+        );
+        assert_eq!(rebuilt, st);
+        // An empty map is no floor: the root and the storage half are the plain bridge's.
+        c.min_inbound_sequence = Some(BTreeMap::new());
+        let empty = BridgeState::from_config(&c);
+        assert_eq!((empty.replay_floor(), empty.root()), (None, plain.root()));
+    }
+
+    /// The floor's JSON: decimal chain keys, plain-number sequences, absent when unset, and a
+    /// chain written twice — under any spelling — refused rather than silently collapsed.
+    #[test]
+    fn the_replay_floor_parses_from_json_and_refuses_a_chain_twice() {
+        let (mut c, _) = cfg();
+        assert!(!serde_json::to_string(&c).unwrap().contains("min_inbound_sequence"));
+        c.min_inbound_sequence = Some([(2u16, 10u64), (5, 7)].into_iter().collect());
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains(r#""min_inbound_sequence":{"2":10,"5":7}"#), "{json}");
+        assert_eq!(serde_json::from_str::<BridgeConfig>(&json).unwrap(), c);
+        for twice in [r#"{"2":10,"2":11}"#, r#"{"2":10,"02":11}"#] {
+            let bad = json.replace(r#"{"2":10,"5":7}"#, twice);
+            let err = serde_json::from_str::<BridgeConfig>(&bad).unwrap_err().to_string();
+            assert!(err.contains("chain 2 is listed twice"), "{err}");
+        }
+        let bad = json.replace(r#"{"2":10,"5":7}"#, r#"{"eth":10}"#);
+        assert!(serde_json::from_str::<BridgeConfig>(&bad).unwrap_err().to_string().contains("invalid chain id"));
+    }
+
     #[test]
     fn burn_records_the_message_against_an_index() {
         let (c, s) = cfg();
@@ -1593,7 +1800,7 @@ mod tests {
         let meta: BridgeMeta = bincode::deserialize(&blob).unwrap();
         assert_eq!(meta, st.meta());
         assert_eq!(meta.current_set, 1, "the rotation is part of the blob, not derived");
-        let rebuilt = BridgeState::from_parts(meta, None, st.spent.clone(), st.burns.clone());
+        let rebuilt = BridgeState::from_parts(meta, None, BTreeMap::new(), st.spent.clone(), st.burns.clone());
         assert_eq!(rebuilt, st);
         assert_eq!(rebuilt.root(), st.root());
     }
@@ -1996,6 +2203,7 @@ mod tests {
             rules_v2: None,
             guardian_set_index: None,
             burn_sequence: None,
+            min_inbound_sequence: None,
         });
         st.spent.insert(Hash([0x44; 32]));
         st.burn_sequence = 7;
@@ -2240,7 +2448,7 @@ mod tests {
         other.pq_guardians.swap(0, 1);
         assert_ne!(other.root(), st.root());
         let meta: BridgeMeta = bincode::deserialize(&bincode::serialize(&st.meta()).unwrap()).unwrap();
-        assert_eq!(BridgeState::from_parts(meta, None, BTreeSet::new(), BTreeMap::new()), st);
+        assert_eq!(BridgeState::from_parts(meta, None, BTreeMap::new(), BTreeSet::new(), BTreeMap::new()), st);
     }
 
     /// Every case of the bridge repo's `pq-cosignatures.json`, end to end through `check_attest`:
@@ -2274,6 +2482,7 @@ mod tests {
             rules_v2: None,
             guardian_set_index: None,
             burn_sequence: None,
+            min_inbound_sequence: None,
         });
         let now = att["now"].as_u64().unwrap();
         let by_name = |name: &str| {
@@ -2410,7 +2619,7 @@ mod tests {
         st.rotation_nonce = 7;
         assert_eq!(st.root().to_hex(), "5df59d6ada206d29301125c469d8e61beee05d4ee6568a09f0bf63083eb18014");
         let meta = st.meta();
-        assert_eq!(BridgeState::from_parts(meta, None, BTreeSet::new(), BTreeMap::new()).rotation_nonce, 0);
+        assert_eq!(BridgeState::from_parts(meta, None, BTreeMap::new(), BTreeSet::new(), BTreeMap::new()).rotation_nonce, 0);
     }
 
     /// Bridge rules v2: a `rules_v2` section moves the bridge root to `rand-bridge-state-5`
@@ -2430,7 +2639,7 @@ mod tests {
         assert_ne!(st.root(), r0, "and so is the rotation nonce");
         let v2: BridgeMetaV2 = bincode::deserialize(&bincode::serialize(&st.meta_v2().unwrap()).unwrap()).unwrap();
         assert_eq!(v2, BridgeMetaV2 { rotation_nonce: 1, rules: c.rules_v2.clone().unwrap() });
-        assert_eq!(BridgeState::from_parts(st.meta(), Some(v2), BTreeSet::new(), BTreeMap::new()), st);
+        assert_eq!(BridgeState::from_parts(st.meta(), Some(v2), BTreeMap::new(), BTreeSet::new(), BTreeMap::new()), st);
     }
 
     /// The pause state, both nonces and the pause key ride the storage blob.
@@ -2442,6 +2651,6 @@ mod tests {
         assert!(!st.mint_paused);
         (st.mint_paused, st.pause_nonce, st.list_nonce) = (true, 3, 9);
         let meta: BridgeMeta = bincode::deserialize(&bincode::serialize(&st.meta()).unwrap()).unwrap();
-        assert_eq!(BridgeState::from_parts(meta, None, BTreeSet::new(), BTreeMap::new()), st);
+        assert_eq!(BridgeState::from_parts(meta, None, BTreeMap::new(), BTreeSet::new(), BTreeMap::new()), st);
     }
 }

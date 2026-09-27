@@ -421,6 +421,7 @@ mod tests {
             rules_v2: None,
             guardian_set_index: None,
             burn_sequence: None,
+            min_inbound_sequence: None,
         };
         (config, secrets)
     }

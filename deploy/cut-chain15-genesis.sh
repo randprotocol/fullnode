@@ -165,6 +165,9 @@ g["bridge"] = {
     "guardian_set_index": int(E["GUARDIAN_SET_INDEX"]),
     "burn_sequence": int(E["BURN_SEQUENCE"]),
 }
+# Chain 15 carries no replay floor (C15-1, docs/bridge.md §23): its build predates the field. The
+# next bridged cut's copy of this block adds "min_inbound_sequence": {chain: last minted lock + 1}
+# for each source chain, read off chain 15 like BURN_SEQUENCE, and refuses to run with one unset.
 
 # ── tokens: zUSD at genesis, chain 14's registration fields (asset id 32e5ab28…) ──────────────────
 USDT_TRON = "000000000000000000000000a614f803b6fd780986a42c78ec9c7f77e6ded13c"

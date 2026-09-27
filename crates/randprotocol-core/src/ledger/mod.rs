@@ -3521,6 +3521,7 @@ mod tests {
                 rules_v2: None,
                 guardian_set_index: None,
                 burn_sequence: None,
+                min_inbound_sequence: None,
             };
         let mut bridged = plain.clone();
         bridged.set_bridge(Some(BridgeState::from_config(&config)));
@@ -3576,6 +3577,7 @@ mod tests {
                 rules_v2: None,
                 guardian_set_index: None,
                 burn_sequence: None,
+                min_inbound_sequence: None,
             };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));
@@ -3637,6 +3639,7 @@ mod tests {
                 rules_v2: None,
                 guardian_set_index: None,
                 burn_sequence: None,
+                min_inbound_sequence: None,
             };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));

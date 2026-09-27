@@ -318,6 +318,37 @@ section, and `rand-node`'s `chain_14s_genesis_file_still_builds_chain_14` pins i
 (`1cff3b7d…`) against all of it; `chain_15s_genesis_file_still_builds_chain_15` pins chain 15's
 (`cc30e085…`) against `faucet_minters`.
 
+## The next cut: the bridge replay floor (C15-1)
+
+A chain cut from another one's bridge keeps the source endpoints, their sequence counters and —
+at a carried-over guardian set — their signers, so an old chain's already-minted lock is an
+ECDSA-valid attestation on its successor (`docs/bridge.md` §23). The next bridged cut sets, inside
+the `bridge` section the cut script splices in, beside `guardian_set_index` and `burn_sequence`:
+
+```json
+"bridge": { …, "min_inbound_sequence": { "2": <n2>, "3": <n3>, "4": <n4>, "5": <n5> } }
+```
+
+- **Each source chain's floor is one past the last lock the previous chain observed from it**:
+  the highest `sequence` of any committed `BridgeAttest` transfer from that emitter chain, plus
+  one — read off the old chain (or the guardians' signed-message stores) after its last mint and
+  before it stops, the way the burn sequence and the residue custody are read. Drain in-flight
+  locks first: a lock the old chain never minted but that sits below a minted one would be
+  stranded under the floor (carry its custody at genesis instead).
+- A source chain that never locked anything toward the old chain is left out (every lock on it is
+  new). Keys must be chains in `emitters`, values above 0, and a present map non-empty
+  (`rand-node init` refuses otherwise). The script should refuse to run with any floor unset, the
+  way `cut-chain15-genesis.sh` refuses to guess the residue custody.
+- Absent is chain 15's behaviour and commits nothing; present, it is committed to the genesis
+  hash under its own tag and wraps the bridge root, so it ships with a cut, never as a same-chain
+  update. `rand-node`'s `chain_15s_genesis_file_still_builds_chain_15` pins chain 15's hash
+  (`cc30e085…`) against it.
+
+**Until then — chain 15 runs without a floor — the rule is the guardians' (bridge.md §23):** a
+guardian brought up with an empty store sets its source cursors past chain 14's last observed lock
+(`start_block` for EVM/Tron sources, `start_sequence` for Solana) before it starts, never the
+configuration's deployment block.
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and

@@ -1135,3 +1135,72 @@ root either way:
 `rand_getBridgeState` serves both as it always has (`guardian_set_index`, `burn_sequence`);
 `rand_getTokens`/`rand_getAssets` serve the genesis `locked` and `total_supply`, and
 `rand_getSupply`'s `genesis_deposited` stays RAND-only.
+
+## 23. The inbound replay floor — a cut chain refuses the old chain's locks (C15-1)
+
+A chain cut from a running bridged chain keeps the source endpoints — their emitter addresses,
+their per-endpoint `sequence` counters and, when the genesis starts at the guardian set the
+endpoints already hold (chain 15 at set 1, §22), the ECDSA signers too. And `mu` does not name the
+Rand chain. So every lock the old chain already minted is, on its successor, an attestation whose
+ECDSA quorum verifies; `spent` starts empty, and the one check left between it and a second mint
+is the PQ co-signature, which binds the chain id — and which a guardian only withholds while its
+local store remembers having signed that `(chain, sequence)`. A quorum of guardians brought up
+with fresh stores (a rotation, a rebuilt droplet) rescans each source from its configured start
+and co-signs every historical lock for the new chain id: zUSD minted with no custody behind it,
+bounded only by the rules-v2 global cap (4 000 zUSD a day on chain 15).
+
+**The floor** is an optional, genesis-fixed field of the `bridge` section: per source chain, the
+lowest `sequence` a transfer attestation from that chain's emitter may carry.
+
+```json
+"bridge": { …, "guardian_set_index": 1, "burn_sequence": 7,
+            "min_inbound_sequence": { "2": 2, "3": 2, "4": 2, "5": 2 } }
+```
+
+- **The rule** (`BridgeState::check_attest`): a transfer whose `(emitter_chain, sequence)` is below
+  the chain's floor is refused `BelowReplayFloor { chain, sequence, floor }`, whatever quorum and
+  co-signature it carries — decided after the emitter check and before any signature. A chain the
+  floor does not name has no floor; guardian-set rotations (Rand's own governance messages) are
+  not judged by it. The verdict is the body's own bytes against a genesis constant, so admission
+  caches it as permanent (`admission::is_permanent`).
+- **Validation** (`Genesis::validate`): present means non-empty; every key a chain with a
+  registered `emitters` entry (a floor on any other chain is dead — `WrongEmitter` comes first —
+  and almost certainly a mistyped id that leaves the chain meant unguarded); every floor above 0
+  (0 refuses nothing, and is what an unset cut variable writes). A chain written twice in the
+  file, under any spelling (`"2"` and `"02"`), is a parse error rather than a silently kept last
+  value.
+- **Commitments.** Absent — chain 15 and every earlier chain — it is committed nowhere: the file,
+  the genesis hash, the bridge root and the database are byte-for-byte what they were
+  (`chain_15s_genesis_file_still_builds_chain_15` pins `cc30e085…`). Present, it is committed to
+  the genesis hash under its own tag after `bridge_burn_sequence`
+  (`b"bridge_min_inbound_sequence"` ‖ u32 BE count ‖ (u16 BE chain ‖ u64 BE floor)… in ascending
+  chain order), and it wraps the bridge root:
+  `blake3("rand-bridge-replay-floor-1" ‖ root ‖ bincode(floor))`. The floor never moves, so the
+  genesis hash alone would bind it; the root carries it too, like the emitter table, so a node
+  whose store lost it disagrees at its next block rather than at the first old lock it admits.
+- **Storage and RPC.** Stored under its own `meta` key (`bridge_replay_floor`), written only when
+  present, and restored by `load_bridge`; `rand_getBridgeState` serves it as
+  `min_inbound_sequence` (`null` without one).
+
+**Setting it at a cut.** Each source chain's floor is **one past the last lock the old chain
+observed from that source** — the highest `sequence` any `BridgeAttest` on the old chain carried
+for that emitter chain, plus one (read off the old chain's committed attestations, or the
+guardians' signed-message stores, before the old chain stops). Every lock at or above it is one the
+new chain must mint; every lock below it the old chain already minted. Two consequences for the
+cut: a lock made on a source *after* the old chain's last attest but before the cut is above the
+floor and mints on the new chain (as it should — it was never minted); a lock the old chain never
+minted but that sits *below* a later minted one (an out-of-order relay) would be stranded under
+the floor, so drain every in-flight lock on the old chain before reading the floors, or carry its
+custody at genesis (§22) the way chain 15 carried the residue. The cut script sets the field with
+the rest of the `bridge` section it splices in (`docs/deploy.md` "The next cut", and
+`deploy/cut-chain15-genesis.sh`'s bridge block is where the next script's copy takes it).
+
+**Until a chain carries the floor — chain 15 today — the rule is operational.** A guardian brought
+up with an empty store (a new operator, a rotation, a rebuilt droplet, a store restored from an
+old backup) must have **its source cursors set past the previous chain's last observed lock before
+it starts**, never left to the configuration's start: `start_block` for an EVM/Tron source (the
+first block after the last lock chain 14 minted), `start_sequence` for Solana (that lock's sequence
+plus one). A guardian left to rescan from the deployment block re-observes every chain-14 lock as
+new and, with an empty store, co-signs it for chain 15; a quorum of such guardians re-mints them.
+Bringing more than one guardian up fresh at once, or any fresh guardian before its cursors are
+set, is the failure this section exists for.

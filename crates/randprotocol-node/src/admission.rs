@@ -312,6 +312,9 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | B::BadPqGuardianKey { .. }
                 | B::BadPauseKeyLength { .. }
                 | B::DuplicatePqGuardian
+                // C15-1: the body's own `(emitter_chain, sequence)` against the genesis replay
+                // floor, which no action moves — like `WrongChain`'s chain id.
+                | B::BelowReplayFloor { .. }
         );
     }
     matches!(
@@ -835,6 +838,17 @@ mod tests {
             let e = TxError::Bridge(b);
             assert!(!is_permanent(&e), "{e} is state, not bytes");
         }
+    }
+
+    /// C15-1: the replay floor compares the attestation body's own `(emitter_chain, sequence)`
+    /// with a genesis constant no action moves, so the same bytes are refused at every tip and the
+    /// refusal is cached — a relayer replaying an old lock buys one decode, not a quorum's worth
+    /// of recoveries per delivery.
+    #[test]
+    fn a_transfer_below_the_replay_floor_is_a_byte_verdict_and_is_cached() {
+        use randprotocol_core::bridge::BridgeError as B;
+        let e = TxError::Bridge(B::BelowReplayFloor { chain: 4, sequence: 1, floor: 2 });
+        assert!(is_permanent(&e), "{e} is the body's bytes against a genesis constant");
     }
 
     #[test]

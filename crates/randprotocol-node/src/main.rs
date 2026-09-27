@@ -1210,19 +1210,28 @@ mod tests {
     }
 
     /// Chain 15, the running chain, byte for byte, after RESCAN-LEDGER-1's
-    /// `staking.faucet_minters`: the file does not list it, so its hash may not move by one bit,
-    /// the ledger's rule stays the register row, and every node's pool admits the genesis
-    /// validators' mints only.
+    /// `staking.faucet_minters` and C15-1's bridge replay floor: the file lists neither, so its
+    /// hash may not move by one bit, its bridge root carries no floor, the ledger's minter rule
+    /// stays the register row, every node's pool admits the genesis validators' mints only, and
+    /// rewriting the file adds no field. Every later genesis-gated field is pinned against this
+    /// file the way chain 14's are against its own.
     #[test]
     fn chain_15s_genesis_file_still_builds_chain_15() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain15.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
         let staking = gen.staking.as_ref().expect("chain 15 carries a staking section");
         assert_eq!(staking.faucet_minters, None, "chain 15 predates the list");
+        let bridge = gen.bridge.as_ref().expect("chain 15 is bridged");
+        assert_eq!((bridge.guardian_set_index, bridge.burn_sequence), (Some(1), Some(7)));
+        assert_eq!(bridge.min_inbound_sequence, None, "chain 15 carries no replay floor");
         let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
         let state = gen.build(executor.as_ref()).unwrap();
         assert_eq!(state.hash().to_hex(), "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8");
-        assert!(!gen.to_json().contains("faucet_minters"), "rewriting the file adds no list");
+        let live = state.ledger.bridge().unwrap();
+        assert!(live.min_inbound_sequence.is_empty() && live.replay_floor().is_none());
+        let json = gen.to_json();
+        assert!(!json.contains("faucet_minters"), "rewriting the file adds no list");
+        assert!(!json.contains("min_inbound_sequence"), "rewriting the file adds no field");
         let minters = randprotocol_node::admission::faucet_minters(&state);
         assert_eq!(minters.len(), gen.validators.len(), "the pool admits the genesis validators");
         assert!(gen.validators.iter().all(|v| minters.contains(&v.public_key.address())));

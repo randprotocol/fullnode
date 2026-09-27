@@ -887,6 +887,17 @@ impl Genesis {
             commit.extend_from_slice(b"bridge_burn_sequence");
             commit.extend_from_slice(&sequence.to_be_bytes());
         }
+        // The inbound replay floor (C15-1), tagged and appended only when present, after the
+        // burn sequence: the entry count, then each (chain, floor) in ascending chain order — so
+        // chain 15's file, which has none, hashes byte-for-byte as before.
+        if let Some(floor) = self.bridge.as_ref().and_then(|b| b.min_inbound_sequence.as_ref()) {
+            commit.extend_from_slice(b"bridge_min_inbound_sequence");
+            commit.extend_from_slice(&(floor.len() as u32).to_be_bytes());
+            for (chain, sequence) in floor {
+                commit.extend_from_slice(&chain.to_be_bytes());
+                commit.extend_from_slice(&sequence.to_be_bytes());
+            }
+        }
         // RPL tokens, after the bridge bytes: appended only when the section is configured, so a
         // chain without one hashes byte-for-byte as before. `TokensCommit` is the plain-bytes
         // twin of `TokensConfig`, whose own serde renders a token address as hex text — bincode
@@ -1127,6 +1138,22 @@ fn check_bridge(cfg: &BridgeConfig) -> Result<(), GenesisError> {
     // binding of spec 3.8.
     if let Some((chain, _)) = cfg.emitters.iter().find(|(_, addr)| **addr == [0u8; 32]) {
         return bad(format!("zero emitter address for chain {chain}"));
+    }
+    // C15-1: the replay floor. Present means it says something: an empty map would move the
+    // genesis hash and refuse nothing. A chain the emitter table does not register can never
+    // be attested (`WrongEmitter` comes first), so a floor on it is dead — almost certainly a
+    // mistyped chain id, which would leave the chain meant unguarded. A floor of 0 refuses
+    // nothing either, and is the value an unset cut variable would write.
+    if let Some(floor) = &cfg.min_inbound_sequence {
+        if floor.is_empty() {
+            return bad("min_inbound_sequence is empty: omit it, or name each source chain's floor".into());
+        }
+        if let Some(chain) = floor.keys().find(|c| !cfg.emitters.contains_key(c)) {
+            return bad(format!("min_inbound_sequence names chain {chain}, which has no registered emitter"));
+        }
+        if let Some((chain, _)) = floor.iter().find(|(_, s)| **s == 0) {
+            return bad(format!("min_inbound_sequence for chain {chain} is 0, which refuses nothing"));
+        }
     }
     Ok(())
 }
@@ -1628,6 +1655,7 @@ mod tests {
             rules_v2: None,
             guardian_set_index: None,
             burn_sequence: None,
+            min_inbound_sequence: None,
         }
     }
 
@@ -2206,6 +2234,42 @@ mod tests {
         let mut last = g.clone();
         last.bridge.as_mut().unwrap().guardian_set_index = Some(u32::MAX);
         assert!(matches!(last.validate(), Err(GenesisError::BadBridgeConfig(m)) if m.contains("guardian_set_index")));
+    }
+
+    /// C15-1: the replay floor reaches the genesis ledger's bridge, is committed only when
+    /// present (chain 15's shape, without it, keeps its hash; each floor is its own chain), is
+    /// absent from a file that does not set it, and is refused empty, on an unregistered chain or
+    /// at zero.
+    #[test]
+    fn a_bridge_replay_floor_is_committed_only_when_present_and_validated() {
+        let mut g = chain15_shape();
+        let b = g.bridge.as_mut().unwrap();
+        (b.guardian_set_index, b.burn_sequence) = (Some(1), Some(7));
+        let plain = build(&g);
+        assert!(plain.ledger.bridge().unwrap().min_inbound_sequence.is_empty());
+        let with = |floor: &[(u16, u64)]| {
+            let mut f = g.clone();
+            f.bridge.as_mut().unwrap().min_inbound_sequence = Some(floor.iter().copied().collect());
+            f
+        };
+        let floored = with(&[(2, 3), (4, 2)]);
+        let s = build(&floored);
+        assert_eq!(
+            s.ledger.bridge().unwrap().min_inbound_sequence,
+            [(2u16, 3u64), (4, 2)].into_iter().collect::<BTreeMap<_, _>>()
+        );
+        let hashes = [plain.hash(), s.hash(), build(&with(&[(2, 4), (4, 2)])).hash(), build(&with(&[(2, 3)])).hash()];
+        assert_eq!(hashes.iter().collect::<BTreeSet<_>>().len(), 4, "{hashes:?}");
+        let json = floored.to_json();
+        assert!(json.contains("\"min_inbound_sequence\": {"), "{json}");
+        assert_eq!(Genesis::from_json(&json).unwrap(), floored);
+        assert!(!g.to_json().contains("min_inbound_sequence"));
+        for (floor, why) in [(&[][..], "empty"), (&[(6, 1)][..], "chain 6"), (&[(2, 0)][..], "is 0")] {
+            match with(floor).validate() {
+                Err(GenesisError::BadBridgeConfig(m)) => assert!(m.contains(why), "{m}"),
+                other => panic!("{floor:?}: expected BadBridgeConfig, got {other:?}"),
+            }
+        }
     }
 
     /// Listed at genesis with chain 14's registration fields, zUSD keeps chain 14's asset id —

@@ -2126,6 +2126,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             // store that somehow lacks it serves an empty registry rather than failing the call.
             let tokens = st.storage.tokens().map_err(RpcError::internal)?;
             let v2 = st.storage.bridge_meta_v2().map_err(RpcError::internal)?;
+            let floor = st.storage.bridge_replay_floor().map_err(RpcError::internal)?;
             let day = head_mint_day(&st.storage)?;
             let guardians = bridge
                 .guardian_sets
@@ -2165,6 +2166,13 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     "global_mint_cap_per_window": m.rules.global_mint_cap_per_window.to_string(),
                     "cap_window_secs": m.rules.cap_window_secs,
                 })),
+                // C15-1: the genesis replay floor, per source chain the lowest sequence a transfer
+                // may carry (`null` on a chain without one — chain 15 and every earlier chain). A
+                // relayer reads it to drop a lock the chain this one was cut from already minted.
+                "min_inbound_sequence": (!floor.is_empty()).then(|| floor
+                    .iter()
+                    .map(|(c, f)| (c.to_string(), json!(f)))
+                    .collect::<serde_json::Map<String, Value>>()),
                 // `next_index` is gone with the bridge's own registry: there is no index to
                 // predict any more, because a bridged token is listed before it can be deposited
                 // and its index is a fact a wallet reads off `assets` (`rand_getAssets`).

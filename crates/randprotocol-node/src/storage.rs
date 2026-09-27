@@ -213,6 +213,11 @@ const META_BRIDGE_STATE: &str = "bridge_state";
 /// nonce and the rules — written only on a chain whose genesis carries `bridge.rules_v2`, so a
 /// chain-14 database never gains a key and its v1 blob keeps its strict decode.
 const META_BRIDGE_STATE_V2: &str = "bridge_state_v2";
+/// C15-1: `bincode(BTreeMap<u16, u64>)`, the genesis `bridge.min_inbound_sequence` — written only
+/// on a chain whose genesis carries one, so chain 15's (and every earlier chain's) database never
+/// gains a key. Genesis truth like `META_AGGREGATION`, restored by `load_bridge` so a restarted
+/// node refuses what it refused before.
+const META_BRIDGE_REPLAY_FLOOR: &str = "bridge_replay_floor";
 /// `bincode(Option<TokenRegistry>)`: the RPL token registry as of the head, whole — `by_index`,
 /// `index_of`, `next_index` and `registration_fee` all together, the same shape `Ledger::tokens`
 /// holds and `TokenRegistry::root` hashes into the state root. `META_AGGREGATORS`'s twin, not
@@ -735,6 +740,10 @@ impl Storage {
             Some(v2) => batch.put_cf(self.cf(CF_META), META_BRIDGE_STATE_V2, bincode::serialize(&v2)?),
             None => batch.delete_cf(self.cf(CF_META), META_BRIDGE_STATE_V2),
         }
+        match bridge.replay_floor() {
+            Some(floor) => batch.put_cf(self.cf(CF_META), META_BRIDGE_REPLAY_FLOOR, bincode::serialize(floor)?),
+            None => batch.delete_cf(self.cf(CF_META), META_BRIDGE_REPLAY_FLOOR),
+        }
         Ok(())
     }
 
@@ -766,6 +775,7 @@ impl Storage {
         }
         batch.delete_cf(self.cf(CF_META), META_BRIDGE_STATE);
         batch.delete_cf(self.cf(CF_META), META_BRIDGE_STATE_V2);
+        batch.delete_cf(self.cf(CF_META), META_BRIDGE_REPLAY_FLOOR);
         Ok(())
     }
 
@@ -804,6 +814,17 @@ impl Storage {
         }
     }
 
+    /// The inbound replay floor (C15-1): empty on a chain whose genesis has none — chain 15 and
+    /// every earlier chain — where the key is never written. Decoded strictly like
+    /// [`Self::bridge_meta`].
+    pub fn bridge_replay_floor(&self) -> Result<BTreeMap<u16, u64>> {
+        use bincode::Options as _;
+        match self.get_meta_raw(META_BRIDGE_REPLAY_FLOOR)? {
+            Some(bytes) => Ok(bincode::DefaultOptions::new().with_fixint_encoding().deserialize(&bytes)?),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
     /// The outbound burn message with this sequence, for guardians to sign.
     pub fn bridge_burn(&self, sequence: u64) -> Result<Option<BridgeBurnRecord>> {
         self.get(CF_BRIDGE_BURNS, &height_key(sequence))
@@ -829,7 +850,7 @@ impl Storage {
             let rec: BridgeBurnRecord = bincode::deserialize(&v)?;
             burns.insert(rec.sequence, rec);
         }
-        Ok(Some(BridgeState::from_parts(meta, self.bridge_meta_v2()?, spent, burns)))
+        Ok(Some(BridgeState::from_parts(meta, self.bridge_meta_v2()?, self.bridge_replay_floor()?, spent, burns)))
     }
 
     // ---- the shielded pool ----------------------------------------------
@@ -2860,6 +2881,7 @@ pub(crate) mod fixtures {
             rules_v2: None,
             guardian_set_index: None,
             burn_sequence: None,
+            min_inbound_sequence: None,
         };
         (config, secrets)
     }
@@ -2881,7 +2903,7 @@ pub(crate) mod fixtures {
     /// [`genesis`] with a `bridge` section, and the guardian secrets that can attest to it.
     /// Its state root has the fifth component, which is what makes it useful for the reload test.
     pub(crate) fn bridged_genesis(chain_id: u64) -> (GenesisState, Vec<[u8; 32]>) {
-        bridged_genesis_with(chain_id, None)
+        bridged_genesis_with(chain_id, None, None)
     }
 
     /// [`bridged_genesis`] with bridge rules v2 on (audit v4): the section on the bridge, a cap
@@ -2890,12 +2912,18 @@ pub(crate) mod fixtures {
         bridged_genesis_with(
             chain_id,
             Some(randprotocol_core::bridge::BridgeRulesV2 { global_mint_cap_per_window: 1_000_000, cap_window_secs: 86_400 }),
+            None,
         )
     }
 
-    fn bridged_genesis_with(chain_id: u64, rules_v2: Option<randprotocol_core::bridge::BridgeRulesV2>) -> (GenesisState, Vec<[u8; 32]>) {
+    pub(crate) fn bridged_genesis_with(
+        chain_id: u64,
+        rules_v2: Option<randprotocol_core::bridge::BridgeRulesV2>,
+        min_inbound_sequence: Option<BTreeMap<u16, u64>>,
+    ) -> (GenesisState, Vec<[u8; 32]>) {
         let (mut config, secrets) = bridge_config();
         config.rules_v2 = rules_v2;
+        config.min_inbound_sequence = min_inbound_sequence;
         let k = key(1);
         let gs = Genesis {
             chain_id,
@@ -4037,6 +4065,45 @@ mod tests {
         assert_eq!(check.problem, None);
         assert_eq!(check.ledger.bridge(), ledger.bridge());
         assert_eq!(check.ledger.tokens(), ledger.tokens());
+    }
+
+    /// C15-1 on disk: a genesis replay floor rides `META_BRIDGE_REPLAY_FLOOR` (strictly decoded)
+    /// beside — never inside — the v1 blob, survives a commit and a restart at the same state
+    /// root, and the reloaded ledger still refuses a lock below it; a chain without one writes no
+    /// key and reloads to no floor.
+    #[test]
+    fn a_replay_floor_survives_a_restart_and_a_chain_without_one_writes_no_key() {
+        let (_d, s, gs, ledger) = governance_chain(1);
+        assert_restart_round_trips(&s, &gs, &ledger, "no floor");
+        assert_eq!(s.get_meta_raw(META_BRIDGE_REPLAY_FLOOR).unwrap(), None, "no floor key");
+        assert!(s.bridge_replay_floor().unwrap().is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let floor = BTreeMap::from([(2u16, 5u64)]);
+        let (gs, secrets) = bridged_genesis_with(9, None, Some(floor.clone()));
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.get_meta_raw(META_BRIDGE_REPLAY_FLOOR).unwrap(), Some(bincode::serialize(&floor).unwrap()));
+        let mut ledger = gs.ledger.clone();
+        let at_floor = attest_tx(&ledger, attestation(&secrets, &recipient(), 1_000, 5), 20);
+        let b1 = make_block(&gs.block, &mut ledger, vec![at_floor], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_restart_round_trips(&s, &gs, &ledger, "a deposit at the floor");
+        assert_eq!(s.bridge_replay_floor().unwrap(), floor);
+        let loaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(loaded.bridge().unwrap().min_inbound_sequence, floor);
+        let below = attest_tx(&loaded, attestation(&secrets, &recipient(), 1_000, 4), 30);
+        assert_eq!(
+            loaded.validate(&below, &StubExecutor),
+            Err(randprotocol_core::ledger::TxError::Bridge(randprotocol_core::bridge::BridgeError::BelowReplayFloor {
+                chain: 2,
+                sequence: 4,
+                floor: 5
+            }))
+        );
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(check.problem, None);
+        assert_eq!(check.ledger.bridge(), ledger.bridge());
     }
 
     #[test]
