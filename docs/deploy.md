@@ -370,6 +370,118 @@ Spec `docs/superpowers/specs/2026-09-26-address-sharing-and-memo-design.md` §2.
   then does a genesis with `envelope_bytes: 1860` go live — never the other way, or a deployed
   wallet meets a form it cannot open at all.
 
+## Address sharing release checklist
+
+Task 17 (plan `2026-09-26-address-sharing-and-memo`) closed out the branch with a cross-repo
+verification pass and this checklist. Per the user: **address sharing itself ships as v0.5.10**
+(same-chain — nothing here changes chain 14's rules), right after this task and its review. The
+`envelope_bytes: 1860` memo *rule* above is a separate, later event: it is not part of v0.5.10 and
+does not go live until the v1.0 genesis (~chain 20, `rand-node genesis --envelope-bytes 1860`).
+Everything that ships as v0.5.10 works against a chain without `envelope_bytes` exactly as it does
+today (address sharing, the fingerprint, `randpay:` links, contacts) — only the memo field is
+gated on a future chain that carries the section.
+
+### Step 1: final verification, one run per repo at the branch's final commits
+
+| repo | commit | command | result |
+|---|---|---|---|
+| fullnode | `2e769b7` | (not re-run — see below) | 61/63 binaries clean, 1478 passed / 13 failed / 15 ignored; the 13 failures are the documented `RECURSION_FIXTURES` gap (`node::tests`/`rpc::tests`, all panicking at `agg_executor.rs:295`) and the `randprotocol-rvm --test aggregate` binary is the documented laptop OOM (SIGKILL) — both pre-existing laptop limits, not this branch |
+| circuits (`research`) | `95c9072` | `cargo test --release --test viewing` | 19 passed, 0 failed |
+| randscan-viewing | `b889519` | `cargo test` | 8 passed, 0 failed (lib 0 + `memo.rs` 3 + `rpl_disclosure.rs` 1 + `vectors.rs` 4) |
+| website | `4b8e276` | `node --test tests/` | 28 total, 27 passed, 1 skipped (`LIVE_KEY`, needs a live node — expected), 0 failed |
+| website `server/address-wasm` | `4b8e276` | `cargo test --release` | 9 passed, 0 failed |
+| clients (`ui`/`web`/`extension`) | `96b9999` | `node --test ui/test web/wallet/test extension/test` | 772 passed, 0 failed, 0 skipped — includes `web/wallet/test/core.integration.test.mjs` run for real (not skipped): the wasm core was already built (`core/target/wasm32-unknown-unknown/wasm/wallet_wasm.wasm`, from Task 13) |
+| clients `core/` | `96b9999` | `cargo test --release` | 78 passed, 0 failed |
+| clients `android/` | `96b9999` | `./gradlew testDebugUnitTest --rerun` | 28 tests (Amounts 2, Contacts 7, NoteStore 6, SendLink 13), 0 failed, 0 skipped |
+| clients `ios/` | `96b9999` | `xcodebuild test` on iPhone 18 Pro simulator | 31 tests, 0 failures |
+
+fullnode's suite was not re-run per the controller's ruling: it ran in full at `2e769b7` (Task 9),
+`git -C /tmp/fullnode-memo log --oneline -1` still reads `2e769b7`, and the full log is at
+`.superpowers/sdd/2026-09-26-address-sharing-and-memo/memo-suite.log`. Every other repo's commit
+matched the plan's final list exactly; every suite is green (the one `LIVE_KEY` skip is a
+pre-existing, expected skip — it needs a reachable live node).
+
+### Step 2: the bridge relayer
+
+`grep -rn "seal_note\|Envelope::seal\|envelope\|BridgeAttest" ../bridge --include='*.rs'` finds no
+envelope-sealing code in the bridge repo (`/Users/dendisuhubdy/Github/randprotocol/bridge`) at all,
+and no Cargo dependency on `randprotocol-client` or `randprotocol-core` from the `daemons` crate
+(only `tools/vectors`, an unrelated test-vector helper, depends on `randprotocol-core`).
+`daemons/src/submit/process.rs`'s `RandSubmitter::mint` reaches Rand by shelling out to the `rand`
+CLI's `bridge-mint` subcommand (`daemons/src/submit/process.rs:5-6`: *"Rand, through the wallet's
+`rand bridge-mint`, because minting a deposit means sealing a note and proving a fee bundle, which
+is the wallet's job"*) — it writes the attestation (and, for a PQ quorum, the co-signature list) to
+a scratch file and runs `rand bridge-mint @<file> --to <address>` as a child process.
+
+**Verdict: nothing to change in the bridge repo, and no blocker.** The relayer never builds a
+`BridgeAttest` envelope itself; sealing is entirely the `rand` binary's job, and Task 7 already
+made every one of the wallet's sealing sites (including the `bridge-mint` deposit path,
+`randprotocol-client/src/main.rs:1193`) fetch `rpc.envelope_format()` and seal through
+`seal_note_as`. The only operational requirement is that the `rand` binary the relayer's host
+invokes be rebuilt from a fullnode commit at or after Task 7 before the launch genesis is cut —
+an ordinary binary update, not a bridge-repo code change.
+
+### Step 3: the release order
+
+1. **Apps and website released with the new core.** `randprotocol.org` (worktree `/tmp/site-memo`,
+   `4b8e276`) and every wallet app (`clients`, `/tmp/clients-memo`, `96b9999`: web wallet, desktop,
+   browser extensions, iOS, Android) ship the code that reads both the legacy 112-byte note body
+   and the 624-byte memo-carrying one, and that speaks `randpay:` links, fingerprints and contacts
+   — all of which work unchanged against today's chains (no `envelope_bytes`). This is what makes
+   the later genesis cut safe: every deployed client can already open the longer form before any
+   chain produces one.
+2. **randscan deployed with Task 10.** `randscan-viewing` (`/tmp/randscan-memo`, `b889519`) opens
+   both note-body layouts and reports `"memo": string | null` from `open_note`; deploy it to the
+   explorer (E) alongside or before the genesis cut, so `/account`'s viewing-key disclosure and the
+   sale service's balance reads keep working once a memo chain exists.
+3. **The launch genesis cut with `rand-node genesis --envelope-bytes 1860`.** Per the spec and the
+   "next cut" section above, this is a *future* chain (~chain 20, v1.0) — not part of v0.5.10. When
+   it happens: cut with the flag, confirm `Genesis::build` accepts every alloc note at exactly 1860
+   bytes (`GenesisError::AllocEnvelopeSize` on a mismatch), and roll the fleet as any other chain
+   cut (`docs/deploy.md`'s topology rules; validators first via the bootstraps, then the rest, node
+   A last).
+4. **After the cut, verify:**
+   - `rand_getLimits.envelope_bytes == 1860` on every node (validators and observers alike — a
+     stale or misbuilt node would still answer `null` or an older value).
+   - A faucet mint's envelope is exactly 1860 bytes (`rand_mint`, then read the committed
+     transaction's envelope length back — the same check `under_envelope_bytes_every_alloc_envelope
+     _is_exactly_that_long` and `on_a_memo_chain_every_output_is_1860_bytes_and_the_payee_reads_the
+     _memo` make in the test suite, now against the live chain).
+   - A payment with a memo round-trips end to end on the live chain: the payee's scan and the
+     sender's `history` both show it, and `rand_checkTransaction` with the output's tx key discloses
+     it — the same shape as the wallet-flow test (Task 9), now manual and against mainnet.
+
+### Known untested items (carried forward, not blockers for v0.5.10)
+
+- **iOS: pre-filled Send not observed on the simulator.** Task 15's simulator smoke got the OS
+  "Open in Rand Wallet?" prompt (confirming the `randpay` scheme is registered) but nothing on that
+  machine could tap through the unlock prompt to see Send actually pre-filled — Simulator.app was
+  not at the expected Xcode path and neither `cliclick` nor `idb` was available. Logic is covered by
+  `SendLinkTests`/`LinkHandoffTests` (unit tests), not by an observed run.
+- **Android: camera scan of a real QR, and the review/prove screens, not exercised on device.**
+  Task 16's emulator has a synthetic virtual camera (no way to show it an actual QR — scan and
+  paste share the same resolution code path, which *was* exercised), and the emulator wallet held
+  0 RAND with the public faucet returning HTTP 429, so the Review screen, its confirmation line and
+  a real proof were never driven end to end on device — only by unit tests.
+- **macOS: OS-level `randpay:` routing needs a built `.app`.** Task 14's desktop deep-link wiring
+  (`tauri-plugin-deep-link`) is verified against the plugin's own vendored source and by unit tests
+  only; the scheme is read from the Info.plist a real `cargo tauri build` generates, so a manual
+  pass (`cargo tauri build`, then `open "randpay:rand1...?amount=1"` against the installed app) is
+  still owed at release time.
+- **Website: the saved-account share block awaits the account save flow.** Task 11's `[data-acct-
+  share]`/`[data-acct-address]` wiring on `/address` activates automatically (via a
+  `MutationObserver`) once a sign-in/save flow exists, but `randprotocol.org` has no such flow yet
+  in this worktree (no `src/scripts/account.js` or equivalent) — this predates address sharing and
+  is out of this branch's scope, so it is untested against a real save, not broken.
+
+### Every push waits for the user's go
+
+Nothing in this checklist authorizes acting on it. Every `git push` of every branch above, the
+website deploy, every app-store upload, and the genesis cut itself each wait for the user's
+explicit go, typed in the session that will do it — per the standing rule that a relayed go is not
+authorization for a fleet-wide or public-facing action (see "Repo workflow traps" and the memory
+note on fleet gos).
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and
