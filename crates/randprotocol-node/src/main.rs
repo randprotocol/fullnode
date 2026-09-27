@@ -1181,8 +1181,26 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// What the aggregate daemon asks of its node: one JSON-RPC call. A trait so a test can stand in
+/// for the node — and move the chain on while the prover runs, which is the whole of IFACE-8.
+trait AggregateNode {
+    async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value>;
+    /// The chain's note-envelope format (`rand_getLimits.envelope_bytes`, v0.5.10): the payout
+    /// note is sealed in it, or a memo-format chain refuses the aggregate's envelope.
+    async fn envelope_format(&self) -> Result<EnvelopeFormat>;
+}
+
+impl AggregateNode for RpcClient {
+    async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        RpcClient::call(self, method, params).await
+    }
+    async fn envelope_format(&self) -> Result<EnvelopeFormat> {
+        envelope_format(self).await
+    }
+}
+
 /// The aggregator register row for `me`: nonce, payout and bond, from `rand_getAggregators`.
-async fn aggregator_row(rpc: &RpcClient, me: &randprotocol_core::Address) -> Result<(u64, ShieldedAddress, u64)> {
+async fn aggregator_row(rpc: &impl AggregateNode, me: &randprotocol_core::Address) -> Result<(u64, ShieldedAddress, u64)> {
     let rows = rpc.call("rand_getAggregators", serde_json::json!([])).await?;
     let want = me.to_base58();
     let row = rows
@@ -1196,124 +1214,168 @@ async fn aggregator_row(rpc: &RpcClient, me: &randprotocol_core::Address) -> Res
     Ok((nonce, payout, bond))
 }
 
-/// The aggregate daemon's one pass (spec §8's shape): the unsealed work list, up to
-/// `max_covers` of it, the raw bundles fetched back, one rVM proof over them, and the signed
-/// aggregate submitted. `--watch` loops it on the interval; every pass is one proving job.
+/// The one rVM aggregate proof over the raw bundle proofs, bound to `binding` — the daemon's
+/// only expensive step (~26 min at the test profile), a function of its own so the pass around
+/// it can be driven without the rVM.
+fn prove_aggregate(profile: FriProfile, raw_proofs: &[Vec<u8>], binding: &[u32; 8]) -> Result<Vec<u8>> {
+    let proofs = raw_proofs
+        .iter()
+        .map(|b| postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(b).map_err(|_| anyhow::anyhow!("a work row's proof does not decode")))
+        .collect::<Result<Vec<_>>>()?;
+    // The shape is the first proof's; every proof in the set must share it (the chain's
+    // admission checks it again).
+    let first = proofs.first().context("nothing to aggregate")?;
+    let shape = randprotocol_rvm::shape::InnerShape::of(
+        profile,
+        first.tier,
+        first.program_log_height,
+        first.input_log_height,
+        first.keccak_log_height,
+        first.sha256_log_height,
+        first.public_log_height,
+        first.mem_log_height,
+    );
+    let key_inner = randprotocol_rvm::shape::InnerKey::of(profile, &shape);
+    let vk = randprotocol_rvm::aggregate::InnerVerifierKey { shape, key: key_inner };
+    let m = randprotocol_rvm::machine::Machine::new(profile);
+    let t0 = std::time::Instant::now();
+    let a = randprotocol_rvm::aggregate::aggregate(&m, &vk, &proofs, binding, None)
+        .map_err(|e| anyhow::anyhow!("aggregating {} bundles: {e:?}", proofs.len()))?;
+    let proof_bytes = a.proof.to_bytes();
+    tracing::info!("aggregated {} bundles in {:.1?} ({} proof bytes)", proofs.len(), t0.elapsed(), proof_bytes.len());
+    Ok(proof_bytes)
+}
+
+/// One pass of the aggregate daemon up to the signed transaction (spec §8's shape): the
+/// unsealed work list, up to `max_covers` of it, the raw bundles fetched back, one proof over
+/// them (`prove`), and the signed aggregate — or `None` when there is nothing to cover.
+///
+/// What is read before the prove and what after is the point (the interface review's IFACE-8).
+/// The prove takes tens of minutes; the payout note's `time` must sit inside the ledger's
+/// `TIME_WINDOW` (256 blocks, ~6 min) of the head *at submission*, and its subsidy is the
+/// schedule at the `sealed_blocks` of that moment — so both are read after the prove,
+/// immediately before the transaction is built; read before it (as they were), every aggregate
+/// arrived with a `time` long out of window. The nonce is the one thing the proof binds (audit
+/// v3, AGG-2), so it is read before; it is read again after, and a pass whose nonce moved
+/// meanwhile (another of this key's aggregates, or its unbond, committed) is abandoned rather
+/// than submitted to certain refusal. The shares are each cover's bucketed excess, fixed at the
+/// bundle's inclusion (IFACE-7) — a cover that left the bucket in the meantime makes the
+/// aggregate invalid whatever it pays, and admission names it.
+async fn aggregate_pass(
+    rpc: &impl AggregateNode,
+    kp: &Keypair,
+    chain_id: u64,
+    prove: impl FnOnce(FriProfile, &[Vec<u8>], &[u32; 8]) -> Result<Vec<u8>>,
+) -> Result<Option<randprotocol_core::Transaction>> {
+    let status = rpc.call("rand_status", serde_json::json!([])).await?;
+    let profile = match status["fri_profile"].as_str().unwrap_or("production") {
+        "test" => FriProfile::Test,
+        _ => FriProfile::Production,
+    };
+    let max_covers = status["aggregation"]["max_covers"].as_u64().unwrap_or(0) as usize;
+    let work = rpc.call("rand_getUnsealed", serde_json::json!([0, max_covers.max(1)])).await?;
+    let bundles = work["bundles"].as_array().cloned().unwrap_or_default();
+    if bundles.is_empty() || max_covers == 0 {
+        return Ok(None);
+    }
+    let chosen = &bundles[..bundles.len().min(max_covers)];
+    // The raw bundles, back from the node: each one's stored proof is the tape input.
+    let mut raw_proofs = Vec::with_capacity(chosen.len());
+    let mut covers = Vec::with_capacity(chosen.len());
+    let mut shares = 0u64;
+    for b in chosen {
+        let hash = randprotocol_core::Hash::from_hex(b["hash"].as_str().context("work row has no hash")?)
+            .map_err(|e| anyhow::anyhow!("work row hash: {e}"))?;
+        let raw = rpc.call("rand_getRawTransaction", serde_json::json!([b["hash"].clone()])).await?;
+        let bytes = hex::decode(raw.as_str().context("getRawTransaction answer is not hex")?)?;
+        let tx: randprotocol_core::Transaction = bincode::deserialize(&bytes)?;
+        let bundle = tx.bundle.as_ref().context("a work row with no bundle")?;
+        covers.push(hash);
+        // The node's own bucketed excess (IFACE-7), never `fee − BUNDLE_BASE` recomputed
+        // here: a token registration under `tokens.burn_registration_fee` is bucketed net
+        // of the burned fee, and a note over any other amount is refused at step 5.
+        let excess = randprotocol_client::amount_field(&b["excess"]).context("work row has no excess")?;
+        shares = shares.saturating_add(excess);
+        raw_proofs.push(bundle.proof.clone());
+    }
+    // The proof binds this aggregator's own `(chain, address, nonce)` (audit v3, AGG-2): the
+    // register nonce is read before proving, and the submission below signs the same nonce — a
+    // proof made for one nonce verifies at no other.
+    let nonce = aggregator_row(rpc, &kp.address()).await?.0;
+    let binding = randprotocol_core::types::actions::aggregate_binding(chain_id, &kp.address(), nonce);
+    let proof_bytes = prove(profile, &raw_proofs, &binding)?;
+
+    // After the prove, immediately before the transaction: the head, the schedule, the payout
+    // and the nonce as they are *now* (IFACE-8).
+    let (nonce_now, payout, _) = aggregator_row(rpc, &kp.address()).await?;
+    if nonce_now != nonce {
+        anyhow::bail!(
+            "the register nonce moved from {nonce} to {nonce_now} while proving; the proof is bound to {nonce} and \
+             can never verify — abandoning this pass"
+        );
+    }
+    let status = rpc.call("rand_status", serde_json::json!([])).await?;
+    let agg = &status["aggregation"];
+    // `subsidy_base` is a decimal string since node N-3 (2026-09-20); `amount_field` reads
+    // either encoding, so this daemon works against an older node too.
+    let subsidy_base = randprotocol_client::amount_field(&agg["subsidy_base"]).unwrap_or(0);
+    let halving = agg["halving_blocks"].as_u64().unwrap_or(1).max(1);
+    let n = agg["sealed_blocks"].as_u64().unwrap_or(0);
+    let height = status["height"].as_u64().context("the node's status has no height")?;
+    // The payment note: the subsidy at the schedule's current index plus the proving shares,
+    // sealed to the register's payout address (spec §5.4).
+    let subsidy = subsidy_base.checked_shr((n / halving) as u32).unwrap_or(0);
+    let time = height as u32 + 1;
+    let (note, envelope) = sealed_withdraw_note(&payout, subsidy.saturating_add(shares), time, rpc.envelope_format().await?)?;
+    let signature = kp.sign(
+        aggregate_signing_hash(chain_id, nonce, time, &note.r, &covers, &randprotocol_core::Hash::digest(&proof_bytes))
+            .as_bytes(),
+    );
+    Ok(Some(randprotocol_core::Transaction {
+        chain_id,
+        bundle: None,
+        action: randprotocol_core::Action::Aggregate {
+            covers,
+            proof: proof_bytes,
+            aggregator: kp.address(),
+            nonce,
+            time,
+            r: note.r,
+            envelope,
+            signature,
+        },
+    }))
+}
+
+/// The aggregate daemon: [`aggregate_pass`], submitted, and `--watch` loops it on the interval;
+/// every pass is one proving job.
 async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, watch: bool, interval_secs: u64, no_wait: bool) -> Result<()> {
     let kp = load_keypair(key)?;
     let rpc = RpcClient::new(rpc_url.to_string());
     let chain_id = rpc.chain_id().await?;
     loop {
-        let status = rpc.status().await?;
-        let agg = &status["aggregation"];
-        let profile = match status["fri_profile"].as_str().unwrap_or("production") {
-            "test" => FriProfile::Test,
-            _ => FriProfile::Production,
-        };
-        let max_covers = agg["max_covers"].as_u64().unwrap_or(0) as usize;
-        // `subsidy_base` is a decimal string since node N-3 (2026-09-20); `amount_field` reads
-        // either encoding, so this daemon works against an older node too.
-        let subsidy_base = randprotocol_client::amount_field(&agg["subsidy_base"]).unwrap_or(0);
-        let halving = agg["halving_blocks"].as_u64().unwrap_or(1).max(1);
-        let n = agg["sealed_blocks"].as_u64().unwrap_or(0);
-        let height = status["height"].as_u64().unwrap_or(0);
-        let work = rpc.call("rand_getUnsealed", serde_json::json!([0, max_covers.max(1)])).await?;
-        let bundles = work["bundles"].as_array().cloned().unwrap_or_default();
-        if !bundles.is_empty() && max_covers > 0 {
-            let chosen = &bundles[..bundles.len().min(max_covers)];
-            // The raw bundles, back from the node: each one's stored proof is the tape input.
-            let mut proofs = Vec::with_capacity(chosen.len());
-            let mut covers = Vec::with_capacity(chosen.len());
-            let mut shares = 0u64;
-            for b in chosen {
-                let hash = randprotocol_core::Hash::from_hex(b["hash"].as_str().context("work row has no hash")?)
-                    .map_err(|e| anyhow::anyhow!("work row hash: {e}"))?;
-                let raw = rpc.call("rand_getRawTransaction", serde_json::json!([b["hash"].clone()])).await?;
-                let bytes = hex::decode(raw.as_str().context("getRawTransaction answer is not hex")?)?;
-                let tx: randprotocol_core::Transaction = bincode::deserialize(&bytes)?;
-                let bundle = tx.bundle.as_ref().context("a work row with no bundle")?;
-                let proof: randprotocol_zkvm::machine::Proof = postcard::from_bytes(&bundle.proof)
-                    .map_err(|_| anyhow::anyhow!("a work row's proof does not decode"))?;
-                covers.push(hash);
-                // The node's own bucketed excess (IFACE-7), never `fee − BUNDLE_BASE` recomputed
-                // here: a token registration under `tokens.burn_registration_fee` is bucketed net
-                // of the burned fee, and a note over any other amount is refused at step 5.
-                let excess = randprotocol_client::amount_field(&b["excess"]).context("work row has no excess")?;
-                shares = shares.saturating_add(excess);
-                proofs.push(proof);
+        match aggregate_pass(&rpc, &kp, chain_id, prove_aggregate).await? {
+            Some(tx) => {
+                let covered = match &tx.action {
+                    randprotocol_core::Action::Aggregate { covers, .. } => covers.len(),
+                    _ => 0,
+                };
+                let hash = rpc.send_transaction(&tx).await?;
+                if no_wait {
+                    println!("submitted aggregate {hash} ({covered} covered)");
+                } else {
+                    let receipt = rpc.wait_for_transaction(&hash, wallet::COMMIT_TIMEOUT).await?;
+                    println!("submitted aggregate {hash} ({covered} covered)\n  committed in block {}", receipt.height);
+                }
+                if !watch {
+                    return Ok(());
+                }
             }
-            // The shape is the first proof's; every proof in the set must share it (the
-            // chain's admission checks it again).
-            let first = &proofs[0];
-            let shape = randprotocol_rvm::shape::InnerShape::of(
-                profile,
-                first.tier,
-                first.program_log_height,
-                first.input_log_height,
-                first.keccak_log_height,
-                first.sha256_log_height,
-                first.public_log_height,
-                first.mem_log_height,
-            );
-            let key_inner = randprotocol_rvm::shape::InnerKey::of(profile, &shape);
-            let vk = randprotocol_rvm::aggregate::InnerVerifierKey { shape, key: key_inner };
-            let m = randprotocol_rvm::machine::Machine::new(profile);
-            // The proof binds this aggregator's own `(chain, address, nonce)` (audit v3, AGG-2):
-            // the register nonce is read before proving, and the submission below signs the same
-            // nonce — a proof made for one nonce verifies at no other.
-            let nonce = aggregator_row(&rpc, &kp.address()).await?.0;
-            let binding = randprotocol_core::types::actions::aggregate_binding(chain_id, &kp.address(), nonce);
-            let t0 = std::time::Instant::now();
-            let a = randprotocol_rvm::aggregate::aggregate(&m, &vk, &proofs, &binding, None)
-                .map_err(|e| anyhow::anyhow!("aggregating {} bundles: {e:?}", proofs.len()))?;
-            let proof_bytes = a.proof.to_bytes();
-            tracing::info!(
-                "aggregated {} bundles in {:.1?} ({} proof bytes)",
-                proofs.len(),
-                t0.elapsed(),
-                proof_bytes.len()
-            );
-            // The payment note: the subsidy at the schedule's current index plus the proving
-            // shares, sealed to the register's payout address (spec §5.4).
-            let subsidy = subsidy_base.checked_shr((n / halving) as u32).unwrap_or(0);
-            let (_, payout, _) = aggregator_row(&rpc, &kp.address()).await?;
-            let time = height as u32 + 1;
-            let (note, envelope) = sealed_withdraw_note(&payout, subsidy + shares, time, envelope_format(&rpc).await?)?;
-            let signature = kp.sign(
-                aggregate_signing_hash(chain_id, nonce, time, &note.r, &covers, &randprotocol_core::Hash::digest(&proof_bytes))
-                    .as_bytes(),
-            );
-            let tx = randprotocol_core::Transaction {
-                chain_id,
-                bundle: None,
-                action: randprotocol_core::Action::Aggregate {
-                    covers,
-                    proof: proof_bytes,
-                    aggregator: kp.address(),
-                    nonce,
-                    time,
-                    r: note.r,
-                    envelope,
-                    signature,
-                },
-            };
-            let hash = rpc.send_transaction(&tx).await?;
-            if no_wait {
-                println!("submitted aggregate {hash} ({} covered)", proofs.len());
-            } else {
-                let receipt = rpc.wait_for_transaction(&hash, wallet::COMMIT_TIMEOUT).await?;
-                println!("submitted aggregate {hash} ({} covered)
-  committed in block {}", proofs.len(), receipt.height);
-            }
-            if !watch {
+            None if !watch => {
+                println!("nothing to cover right now");
                 return Ok(());
             }
-        }
-        if !watch {
-            if bundles.is_empty() {
-                println!("nothing to cover right now");
-            }
-            return Ok(());
+            None => {}
         }
         tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
     }
@@ -1811,6 +1873,139 @@ mod tests {
     /// beside it opens to a different commitment. So this pins the CLI's note to
     /// `ConfidentialExecutor::note_commitment` field for field, and checks that the payout wallet
     /// really opens it.
+    /// A stand-in node for the aggregate pass: one covered bundle 25 over its floor, one
+    /// registered aggregator, and a head, a schedule index and a nonce the test moves while the
+    /// "prover" runs — the tens of minutes a real rVM prove takes, in which the chain goes on.
+    struct MovingNode {
+        height: std::cell::Cell<u64>,
+        sealed_blocks: std::cell::Cell<u64>,
+        nonce: std::cell::Cell<u64>,
+        me: randprotocol_core::Address,
+        payout: ShieldedAddress,
+        raw: randprotocol_core::Transaction,
+    }
+
+    impl AggregateNode for MovingNode {
+        async fn call(&self, method: &str, _params: serde_json::Value) -> Result<serde_json::Value> {
+            use serde_json::json;
+            Ok(match method {
+                "rand_status" => json!({
+                    "fri_profile": "test",
+                    "height": self.height.get(),
+                    "aggregation": {
+                        "max_covers": 3,
+                        "subsidy_base": "1000",
+                        "halving_blocks": 1,
+                        "sealed_blocks": self.sealed_blocks.get(),
+                    },
+                }),
+                "rand_getUnsealed" => json!({
+                    "bundles": [{ "hash": self.raw.hash().to_hex(), "height": 1, "excess": "25" }],
+                    "next_from": null,
+                }),
+                "rand_getRawTransaction" => json!(hex::encode(bincode::serialize(&self.raw).unwrap())),
+                "rand_getAggregators" => json!([{
+                    "address": self.me.to_base58(),
+                    "nonce": self.nonce.get(),
+                    "payout": self.payout.to_string(),
+                    "bond": "100",
+                    "unbonding": null,
+                }]),
+                other => anyhow::bail!("unexpected call {other}"),
+            })
+        }
+        async fn envelope_format(&self) -> Result<EnvelopeFormat> {
+            // A chain without `envelope_bytes`, as chains 14 and 15.
+            Ok(EnvelopeFormat::for_chain(None))
+        }
+    }
+
+    fn moving_node(me: randprotocol_core::Address, payout: ShieldedAddress) -> MovingNode {
+        let env = || Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] };
+        let bundle = randprotocol_core::Bundle {
+            anchor: [0; 8],
+            nullifiers: [[1; 8], [2; 8], [3; 8], [4; 8]],
+            commitments: [[5; 8], [6; 8], [7; 8], [8; 8]],
+            fee: randprotocol_core::gas::BUNDLE_BASE + 25,
+            burn_a: 0,
+            burn_r: 0,
+            burn_asset: 0,
+            time: 1,
+            envelopes: [env(), env(), env(), env()],
+            proof: b"the bundle proof".to_vec(),
+        };
+        MovingNode {
+            height: std::cell::Cell::new(100),
+            sealed_blocks: std::cell::Cell::new(0),
+            nonce: std::cell::Cell::new(0),
+            me,
+            payout,
+            raw: randprotocol_core::Transaction::shielded(7, bundle, randprotocol_core::Action::None),
+        }
+    }
+
+    /// The interface review's IFACE-8: the prove takes ~26 minutes and the payout note's `time`
+    /// must sit inside the ledger's 256-block window of the head at submission, so the pass
+    /// reads the head — and the schedule index the subsidy is paid at — after the prove,
+    /// immediately before building the transaction. Read before it (as the daemon did), the
+    /// aggregate was built at `time = 101` against a head that had moved to 2000: out of window,
+    /// refused. The nonce stays read before (the proof binds it, AGG-2).
+    #[tokio::test]
+    async fn the_aggregate_pass_reads_time_and_schedule_after_proving() {
+        use randprotocol_core::confidential::ConfidentialExecutor;
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payee = SpendKey([7; 8]);
+        let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
+        let node = moving_node(kp.address(), payout.clone());
+        let tx = aggregate_pass(&node, &kp, 7, |profile, raw, binding| {
+            assert_eq!(profile, FriProfile::Test);
+            assert_eq!(raw, &[b"the bundle proof".to_vec()][..], "the tape is the stored bundle proof");
+            assert_eq!(
+                binding,
+                &randprotocol_core::types::actions::aggregate_binding(7, &kp.address(), 0),
+                "the proof binds the nonce read before proving"
+            );
+            // The chain moves on while the prover works: 1900 blocks, one sealed block.
+            node.height.set(2000);
+            node.sealed_blocks.set(1);
+            Ok(b"the aggregate proof".to_vec())
+        })
+        .await
+        .unwrap()
+        .expect("one bundle to cover");
+        let randprotocol_core::Action::Aggregate { covers, nonce, time, r, envelope, proof, .. } = &tx.action else {
+            panic!("not an aggregate: {tx:?}")
+        };
+        assert_eq!(*time, 2001, "time is read from the head at submission, not before the prove");
+        assert_eq!(*nonce, 0);
+        assert_eq!(covers, &vec![node.raw.hash()]);
+        assert_eq!(proof, &b"the aggregate proof".to_vec());
+        // The subsidy at the schedule index after the prove (halving every sealed block: 1000 >> 1),
+        // plus the node's bucketed excess — and the envelope opens to exactly that note.
+        let amount = 500 + 25;
+        let cm = ZkExecutor::new(FriProfile::Test).note_commitment(&payout.pk, &[0; 8], amount, 0, *time, r);
+        let (_, opened) = randprotocol_zkvm::address::envelope_from_core(envelope)
+            .open_as_receiver(cm, &payee.viewing_key())
+            .expect("the payout note opens at the post-prove amount and time");
+        assert_eq!(opened.amount, amount);
+    }
+
+    /// And a pass whose nonce moved while proving is abandoned: the proof is bound to the old
+    /// nonce (AGG-2) and can never verify, so it is not submitted to certain refusal.
+    #[tokio::test]
+    async fn the_aggregate_pass_abandons_a_proof_whose_nonce_moved() {
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payout = randprotocol_zkvm::address::address_of(&SpendKey([7; 8]).viewing_key());
+        let node = moving_node(kp.address(), payout);
+        let err = aggregate_pass(&node, &kp, 7, |_, _, _| {
+            node.nonce.set(1);
+            Ok(b"the aggregate proof".to_vec())
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("nonce moved from 0 to 1"), "{err}");
+    }
+
     #[test]
     fn the_cli_withdraw_note_is_the_note_the_ledger_derives() {
         use randprotocol_core::confidential::ConfidentialExecutor;
