@@ -130,6 +130,50 @@ two such headers, available to anyone. Exactly one aggregate can consume a nonce
 equivocation harmed nothing; the bond is what prices spam. The action's wire variant stays (its
 bincode index is part of every txid); `slashed` stays in the supply identity at 0.
 
+## Before enabling aggregation
+
+Aggregation is off on every live chain, and `rand-node` refuses to start on any genesis that
+carries an `aggregation` section (`node::check_build_runs_genesis`). Two reasons hold it there;
+both have to clear before a genesis may switch it on.
+
+1. **The hidden-asset bundle's shape.** The admitted shapes and the recursion fixtures were
+   measured for the retired 2-in-2-out guest; they are re-measured for the current bundle guest,
+   and `admitted_shapes[].aggregate_program_digest` is taken on the build that will run.
+2. **The rVM's own soundness (2026-09-27).** The recursion-VM security report's RVM-1 let a
+   prover choose the high lane (column `D1`) of every extension value a STOREE writes to memory
+   — no register read bound it — and the aggregate verifier stores 14 370 of them per inner
+   proof (the REDUCE descriptors, the register allocator's spills). The same day's zk scan added
+   the reduce chip's free per-row clock (OPCODES-1/TABLES-1), its padding rows that could write
+   (V-OPCODES-1), runs that could stop before their write-back (ZKR-4), the public table's
+   optional rows (OPCODES-4) and the unchecked base addresses and `r31` pairs (ZKQ-3). All are
+   fixed in circuits `fbe29b8` and `334f414..642db8d`, vendored here at `642db8d`, each with a
+   red-first cheating vector. The aggregate program's digest does not change with any of them
+   (a pinned test says so); the rVM *verifier* does, so a proof from an unfixed prover no longer
+   verifies. What has **not** been done, and has to be before a genesis enables aggregation:
+
+   - **An end-to-end forged-aggregate exercise against the fixed verifier**: a malicious inner
+     proof and a search for the lane values that would satisfy the verifier's final checks, run
+     against the fixed rVM and shown refused. The report traced that path statically (its §6)
+     and its proof of concept showed the missing constraint, not a full forgery. It needs the
+     ≥ 64 GB class of machine the production aggregate proofs need; **not run.**
+   - The report's §11, what its review did not cover — rechecked on 2026-09-28 by the zk scan's
+     "not covered" pass, which found no soundness break in any of them:
+     - the generated constraint evaluation (`programs/constraints.rs`) against Plonky3 0.7.0's
+       verifier folder, term by term (fold order, selectors, quotient recomposition, LogUp
+       terminals, `X² = 7`): no mismatch. Still missing: a Production-profile differential and a
+       test that breaks a single AIR constraint on a non-first instance;
+     - the `rv32n` absorb schedule (`[vk ‖ N ‖ B ‖ 34·N]`, the length in capacity, the final
+       permutation) and hostile cover sets (N = 0, a wrong N, duplicates, mixed shapes): no
+       desynchronisation — read, not fuzzed. The `rv32r` self-verifier's binding is not tied to
+       the inner aggregate's (ZKQ-5): decide before trees of aggregates ship;
+     - the CUDA and reference backends: no verifier path differs under their features;
+     - the witness tape and host-side replay: admission read every cover before checking the
+       count and signature (ZKQ-1, fixed in this release);
+     - timestamps: proven collision-free at every tier (`16·CLK + slot ≤ 2^27`, integral `CLK` on
+       every real row once the reduce clock is carried).
+   - Deferred from the zk scan (ZKQ-6): a DSL-side check that a loop body never reads a
+     register before writing it.
+
 ## 4. Fallback
 
 A block whose bundles no aggregate ever covers stays valid: its raw bundle proofs are kept and

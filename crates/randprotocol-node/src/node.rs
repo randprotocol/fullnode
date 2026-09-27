@@ -1501,11 +1501,23 @@ pub fn check_build_runs_genesis(gs: &GenesisState, built_hc_bundle: &randprotoco
             randprotocol_core::notes::word8_to_hex(&gs.hc_bundle)
         );
     }
+    // Kept, and widened (the 2026-09-27 recursion-VM report's recommendation 5): a second reason
+    // now holds aggregation off. RVM-1 let a prover choose the high lane of every extension value
+    // the rVM stores to memory — thousands of free field elements in the aggregate verifier — and
+    // the same day's zk scan found the reduce chip's clock, row-kind, run-end and address-range
+    // gaps. The fixed rVM (circuits 642db8d, vendored here) closes them, but no forged aggregate
+    // has yet been built end to end against it; `docs/aggregation.md`, "Before enabling
+    // aggregation", lists what has to happen first. Any genesis carrying an `aggregation` section
+    // is refused until then, whichever reason is the last to clear.
     if gs.ledger.aggregation().is_some() {
         anyhow::bail!(
             "this genesis enables block aggregation, which is not supported on the hidden-asset \
              bundle yet: its admitted shapes and the recursion fixtures were measured for the \
-             retired 2-in-2-out guest and must be re-measured before aggregation is activated"
+             retired 2-in-2-out guest and must be re-measured before aggregation is activated; \
+             and aggregation also stays blocked until the fixed recursion VM (RVM-1, the STOREE \
+             high lane, and the other rVM findings of the 2026-09-27 release) has shipped and an \
+             end-to-end forged-aggregate exercise has been run against it (docs/aggregation.md, \
+             \"Before enabling aggregation\")"
         );
     }
     Ok(())
@@ -4201,6 +4213,8 @@ mod tests {
         }));
         let gated = check_build_runs_genesis(&gs, &hc).unwrap_err().to_string();
         assert!(gated.contains("block aggregation") && gated.contains("re-measured"), "{gated}");
+        // And the second reason (the 2026-09-27 recursion-VM report, recommendation 5).
+        assert!(gated.contains("RVM-1") && gated.contains("forged-aggregate exercise"), "{gated}");
     }
 
     /// The startup guard is independent of genesis validation (the 2026-09-28 interface fixes):
