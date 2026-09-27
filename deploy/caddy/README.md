@@ -17,11 +17,30 @@ client → Cloudflare (proxied DNS) → web droplet 159.65.138.161, nginx vhost 
           limit_req zone=rpc 180 r/min burst 60 per client address)
        → proxy_pass http://127.0.0.1:8788/api/rpc, X-Real-IP $remote_addr, CF-Connecting-IP stripped
        → the sale service's RPC proxy (randprotocol.org repo, server/sale/src/rpc.rs)
-       → SALE_RPC_UPSTREAM = https://randscan.org/rpc
-       → randscan's Caddy route on E (randscan repo, deploy/Caddyfile; admits only the web
-         droplet 159.65.138.161, 403s everyone else)
-       → E's node on 127.0.0.1:8545
+       → SALE_RPC_UPSTREAM = http://127.0.0.1:18545 (since 2026-09-27; was https://randscan.org/rpc)
+       → rpc-tunnel-obs1.service on the web droplet: ssh -N -L 127.0.0.1:18545:127.0.0.1:8545
+         rpctunnel@168.144.46.203 (key /root/.ssh/obs1_rpc_tunnel, host key pinned in
+         /root/.ssh/obs1_rpc_known_hosts)
+       → obs1's node on 127.0.0.1:8545 — the archive, no --prune-history, datadir on the
+         250 GiB volume
 ```
+
+**Why obs1, not E.** Until 2026-09-27 the upstream was randscan's Caddy route on E
+(`https://randscan.org/rpc`, `remote_ip` the web droplet only) to E's node. E prunes like every
+validator, and a pruned node answers a fresh wallet's first `rand_getBlocks(0, …)` with `-32010`
+(the rescan's RS-1), so the public RPC must end at a node that keeps every block. E was unpruned
+as a stopgap (it grows ~4.3 GB/day on a 77 GB disk); obs1 keeps full history on a volume.
+obs1's own nginx serves randbridge.org behind Cloudflare and trusts `CF-Connecting-IP` from
+anywhere, so an IP allowlist there would be spoofable — hence an SSH tunnel: `rpctunnel` on obs1
+has no shell (`/usr/sbin/nologin`) and its `authorized_keys` entry is
+`restrict,port-forwarding,permitopen="127.0.0.1:8545",command="/usr/sbin/nologin"`, so the key
+can forward to the node's RPC port and nothing else (checked: a shell and a forward to port 22
+are both refused). The node sees the proxy as loopback, as E's did through Caddy — the proxy's
+`RPC_ALLOWED` stays the only method gate. randscan's `/rpc` route on E is now unused.
+
+**Rollback:** `SALE_RPC_UPSTREAM=https://randscan.org/rpc` in `/etc/randprotocol/sale.env`
+(backup `/root/sale.env.bak-20260927`), `systemctl restart sale` — and turn E's pruning off again
+first if it was turned back on.
 
 The web droplet's vhost was installed at 2026-09-20 03:04 UTC, two minutes after F's Caddyfile was
 written (website commit `66a6be9`); the DNS record went to the web droplet and F's hop was never

@@ -610,7 +610,7 @@ evict them).
   all 17 droplets + A, guarded per host by `ExecStart` datadir = `*1cff3b7d` + `rand_getHealth:
   ok`; every droplet ended at 28–59 % used. The chain-13 rollback path (runbook §8) no longer
   exists anywhere — chain 14 is the only chain on any disk.**
-- **The sale service's RPC upstream is a Caddy route on E, and it lives in randscan's repo.**
+- **(Until 2026-09-27; since then the upstream is obs1, the archive, through an SSH tunnel — `deploy/caddy/README.md`.) The sale service's RPC upstream is a Caddy route on E, and it lives in randscan's repo.**
   `SALE_RPC_UPSTREAM = https://randscan.org/rpc` (web droplet `/etc/randprotocol/sale.env`) is a
   route in randscan's `deploy/Caddyfile` (since randscan `412a55d`) that `remote_ip`-allowlists the
   web droplet `159.65.138.161` to E's `127.0.0.1:8545` and 403s the rest. It was first hand-added
