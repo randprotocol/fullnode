@@ -692,18 +692,33 @@ fn merge_uri(flag: Option<String>, uri: Option<String>, what: &str) -> Result<Op
     }
 }
 
-/// The first 24 characters of a memo, `…`-suffixed if longer, for a column that must not blow up
-/// a terminal's width; `--memo` on `rand notes`/`rand history` asks for the whole thing instead.
-/// `None` (no memo, or a note from before the memo existed) prints as `-`.
+/// A memo as `rand notes`, `rand history` and `rand tx-key` show it: [`memo_display::sanitize`]d
+/// first (a memo is anyone's text — final review A), then cut to 24 characters, `…` included, for
+/// a column that must not blow up a terminal's width; `--memo` on `rand notes`/`rand history`
+/// asks for the whole sanitised text instead. Sanitising first means padding collapses before the
+/// cut and a cut never splits an escape. `None` (no memo, or a note from before the memo existed)
+/// prints as `-`.
 fn memo_column(memo: &Option<String>, whole: bool) -> String {
     match memo {
         None => "-".to_string(),
-        Some(m) if whole => m.clone(),
-        Some(m) => {
-            let truncated: String = m.chars().take(24).collect();
-            if m.chars().count() > 24 { format!("{truncated}…") } else { truncated }
-        }
+        Some(m) if whole => memo_display::sanitize(m),
+        Some(m) => memo_display::truncate(m, 24),
     }
+}
+
+/// `rand send`'s confirmation, before anything proves: `to <name?> · fingerprint … · <amount>
+/// <asset>`, then — only when there is one — the memo on its own `memo: "…"` line. The memo is
+/// hostile text (anyone can send one, and a link carries any), so it never shares the recipient
+/// line, and it and the contact name (user-entered, and a link can suggest one) are shown through
+/// [`memo_display::sanitize`]: a memo padded with spaces or carrying a line break, a terminal
+/// escape or a bidi override cannot draw a second recipient line (final review A).
+fn confirmation(name: Option<&str>, fingerprint: &str, amount: &str, memo: &str) -> String {
+    let name_part = name.map(|n| format!("{} · ", memo_display::sanitize(n))).unwrap_or_default();
+    let mut shown = format!("to {name_part}fingerprint {fingerprint} · {}", memo_display::sanitize(amount));
+    if !memo.is_empty() {
+        shown.push_str(&format!("\nmemo: \"{}\"", memo_display::sanitize(memo)));
+    }
+    shown
 }
 
 /// The bare `randpay:` link naming just an address — no amount, asset or memo. Every QR this
@@ -924,14 +939,14 @@ async fn main() -> Result<()> {
                     }
                     c.add(&name, &addr)?;
                     c.save(&cli.key)?;
-                    println!("saved {name}");
+                    println!("saved {}", memo_display::sanitize(&name));
                 }
                 ContactsOp::List => {
                     if c.entries.is_empty() {
                         println!("no contacts");
                     } else {
                         for (name, addr) in &c.entries {
-                            println!("{name}  {addr}");
+                            println!("{}  {addr}", memo_display::sanitize(name));
                         }
                     }
                 }
@@ -946,7 +961,7 @@ async fn main() -> Result<()> {
                 ContactsOp::Remove { name } => {
                     c.remove(&name)?;
                     c.save(&cli.key)?;
-                    println!("removed {name}");
+                    println!("removed {}", memo_display::sanitize(&name));
                 }
             }
         }
@@ -972,7 +987,7 @@ async fn main() -> Result<()> {
                 } else {
                     format!("{} (asset {})", r.note.amount, r.note.asset)
                 };
-                let memo = r.memo.as_deref().unwrap_or("-");
+                let memo = memo_column(&r.memo, false);
                 println!(
                     "{:<15} {:<9} {:>22}  {:<24}  {}",
                     format!("{}:{}", r.output, r.slot), r.role.as_str(), amount, memo, hex::encode(r.key.0)
@@ -1078,6 +1093,7 @@ async fn main() -> Result<()> {
                 println!("{:>8}  {:>18}  {:>8}  {:<9}  {}", "index", "amount", "height", "memo", "to");
                 for s in &store.sent {
                     let to = contact_name_for(&contacts, &s.to_pk)
+                        .map(|n| memo_display::sanitize(&n))
                         .unwrap_or_else(|| randprotocol_core::notes::word8_to_hex(&s.to_pk));
                     println!(
                         "{:>8}  {:>18}  {:>8}  {:<9}  {}",
@@ -1108,8 +1124,7 @@ async fn main() -> Result<()> {
             // own `decimals` for its own — the same units a `randpay:` link's `amount` carries.
             let amount = wallet::parse_asset_amount(&rpc, asset, &amount_text).await?;
             let asset_label = if asset == 0 { "RAND".to_string() } else { format!("asset {asset}") };
-            let name_part = name.as_ref().map(|n| format!("{n} · ")).unwrap_or_default();
-            println!("to {name_part}fingerprint {} · {amount_text} {asset_label} · memo \"{memo_text}\"", to.fingerprint());
+            println!("{}", confirmation(name.as_deref(), &to.fingerprint().to_string(), &format!("{amount_text} {asset_label}"), &memo_text));
             if !yes {
                 confirm("send?", "send", "not sent")?;
             }
@@ -2074,6 +2089,60 @@ mod tests {
         // And it must differ from `Program::code_hash()`'s big-endian spelling of the same eight
         // words — that mismatch is exactly the bug this fixes.
         assert_ne!(rpc_hc_hex(&p), p.code_hash());
+    }
+
+    /// The hostile memos (and contact names) every display surface is tested with (final
+    /// review A): padding to push a fake line into view, terminal escapes, line breaks, bidi and
+    /// zero-width characters.
+    fn hostile() -> Vec<String> {
+        let tail = "to alice · fingerprint AAAA-AAAA-AAAA-AAAA · 1 RAND";
+        vec![
+            format!("x{}{tail}", "\u{3000}".repeat(120)),
+            format!("x{}{tail}", " ".repeat(400)),
+            format!("\r\x1b[2K{tail}"),
+            format!("\n\nto alice\u{2028}{tail}\u{2029}"),
+            format!("\u{202E}DNAR 1\u{202C} \u{2066}{tail}\u{2069}\u{200E}\u{200F}\u{061C}"),
+            format!("a\u{200B}\u{200C}\u{200D}b\u{2060}\u{2064}c\u{FEFF}d\u{00AD}e"),
+        ]
+    }
+
+    /// `rand send`'s confirmation: the recipient line carries no memo text at all — the memo is
+    /// its own `memo: "…"` line after it — and a hostile memo or contact name shows with no line
+    /// break, no control or format character and no run of spaces.
+    #[test]
+    fn the_confirmation_puts_a_sanitised_memo_on_its_own_line() {
+        let fp = "AAAA-BBBB-CCCC-DDDD";
+        assert_eq!(confirmation(Some("alice"), fp, "1.5 RAND", ""), "to alice · fingerprint AAAA-BBBB-CCCC-DDDD · 1.5 RAND");
+        assert_eq!(confirmation(None, fp, "1.5 RAND", "hi"), "to fingerprint AAAA-BBBB-CCCC-DDDD · 1.5 RAND\nmemo: \"hi\"");
+        for m in hostile() {
+            let shown = confirmation(Some("alice"), fp, "1.5 RAND", &m);
+            let lines: Vec<&str> = shown.split('\n').collect();
+            assert_eq!(lines.len(), 2, "{shown:?}");
+            assert_eq!(lines[0], "to alice · fingerprint AAAA-BBBB-CCCC-DDDD · 1.5 RAND");
+            assert!(lines[1].starts_with("memo: \"") && lines[1].ends_with('"'), "{shown:?}");
+            assert!(memo_display::is_displayable(lines[1]), "{shown:?}");
+            // A contact name is user-entered too, and reaches the same line.
+            let shown = confirmation(Some(&m), fp, "1.5 RAND", "");
+            assert!(!shown.contains('\n') && memo_display::is_displayable(&shown), "{shown:?}");
+        }
+    }
+
+    /// `rand notes`/`rand history`/`rand tx-key`'s memo column: sanitised first, then cut to 24
+    /// characters, so 400 spaces or 120 ideographic spaces cannot push the real text out and an
+    /// escape cannot be split or survive. `--memo` prints the whole memo, sanitised the same way.
+    #[test]
+    fn the_memo_column_is_sanitised_before_it_is_truncated() {
+        assert_eq!(memo_column(&None, false), "-");
+        assert_eq!(memo_column(&Some(format!("x{}to alice", " ".repeat(400))), false), "x to alice");
+        for m in hostile() {
+            for whole in [false, true] {
+                let shown = memo_column(&Some(m.clone()), whole);
+                assert!(!shown.contains('\n') && memo_display::is_displayable(&shown), "{shown:?}");
+                if !whole {
+                    assert!(shown.chars().count() <= 24, "{shown:?}");
+                }
+            }
+        }
     }
 
     fn fresh_address() -> ShieldedAddress {

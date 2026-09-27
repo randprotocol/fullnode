@@ -75,6 +75,13 @@ pub fn sanitize(text: &str) -> String {
     out
 }
 
+/// Whether `shown` obeys the rule [`sanitize`] establishes: no control, format or line/paragraph
+/// separator character, no space separator but U+0020, and no run of two spaces. What every
+/// surface's tests hold a displayed memo (or contact name) to.
+pub fn is_displayable(shown: &str) -> bool {
+    !shown.contains("  ") && shown.chars().all(|c| !is_neutralised(c) && (c == ' ' || !is_space_separator(c)))
+}
+
 /// [`sanitize`]d `text`, cut to at most `max` characters with a trailing `…` when it was longer
 /// (the `…` counts toward `max`). Sanitising comes first, so a cut can never split an escape or
 /// leave half of a control sequence.
@@ -115,6 +122,7 @@ pub(crate) mod tests {
             assert!(c == ' ' || !is_space_separator(c), "non-ASCII space {:?} in {shown:?} (from {from:?})", c);
         }
         assert!(!shown.contains("  "), "a run of spaces in {shown:?} (from {from:?})");
+        assert!(is_displayable(shown));
     }
 
     #[test]
