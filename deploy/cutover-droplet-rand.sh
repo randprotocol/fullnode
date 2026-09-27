@@ -13,6 +13,12 @@
 # that on every droplet first, build nodes.env and BOOTSTRAPS from the answers, then the real
 # pass. Binaries fan out from BUILD_HOST (E) over the forwarded agent, as before.
 set -euo pipefail
+# RETIRED (issue #47, ops review OPS-3): this script fans binaries out over a forwarded agent
+# (`ssh -A`), which hands the laptop's agent to every droplet it touches. Its chain cutovers are
+# history; for a new cut use deploy/cutover-fleet-chain15.sh's pattern (sha-checked relay or the
+# release download, no agent forwarding). Kept for the record only.
+echo "$(basename "$0") is retired: it forwards the ssh agent to every droplet (issue #47); see its header" >&2
+exit 1
 IP=$1; NAME=$2; NEW=$3; GENESIS=$4; BUILD_HOST=${5:-188.166.235.187}
 OLD_SERVICE=${OLD_SERVICE:-shrugg-node}
 BUILD_DIR=${BUILD_DIR:-/root/fullnode/target/release}

@@ -15,6 +15,12 @@
 # SERVICE and BIN_NODE/BIN_WALLET default to the pre-rename names; the chain-10 cut-over passes
 # the RAND ones. Run from the repo root with an agent that can reach both hosts.
 set -euo pipefail
+# RETIRED (issue #47, ops review OPS-3): this script fans binaries out over a forwarded agent
+# (`ssh -A`), which hands the laptop's agent to every droplet it touches. Its chain cutovers are
+# history; for a new cut use deploy/cutover-fleet-chain15.sh's pattern (sha-checked relay or the
+# release download, no agent forwarding). Kept for the record only.
+echo "$(basename "$0") is retired: it forwards the ssh agent to every droplet (issue #47); see its header" >&2
+exit 1
 IP=$1; OLD=$2; NEW=$3; GENESIS=$4; BUILD_HOST=${5:-188.166.235.187}
 SERVICE=${SERVICE:-rand-node}
 BIN_NODE=${BIN_NODE:-rand-node}
