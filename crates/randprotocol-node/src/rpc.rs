@@ -2999,7 +2999,7 @@ mod tests {
         let r = [9u32; 8];
         let covers = vec![covered_tx.hash()];
         let proof_bytes = b"ok".to_vec();
-        let signature = kp.sign(aggregate_signing_hash(7, 0, 2, &r, &covers, &Hash::digest(&proof_bytes)).as_bytes());
+        let signature = kp.sign(aggregate_signing_hash(7, 0, 2, &r, &covers, &Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&fixtures::env(9))).as_bytes());
         let aggregate = Transaction {
             chain_id: 7,
             bundle: None,

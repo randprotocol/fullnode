@@ -1334,7 +1334,7 @@ async fn aggregate_pass(
     let time = height as u32 + 1;
     let (note, envelope) = sealed_withdraw_note(&payout, subsidy.saturating_add(shares), time, rpc.envelope_format().await?)?;
     let signature = kp.sign(
-        aggregate_signing_hash(chain_id, nonce, time, &note.r, &covers, &randprotocol_core::Hash::digest(&proof_bytes))
+        aggregate_signing_hash(chain_id, nonce, time, &note.r, &covers, &randprotocol_core::Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&envelope))
             .as_bytes(),
     );
     Ok(Some(randprotocol_core::Transaction {

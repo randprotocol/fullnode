@@ -2172,7 +2172,7 @@ mod tests {
                     r,
                     envelope: fixtures::env(3),
                     signature: kp.sign(
-                        aggregate_signing_hash(1, nonce, 0, &r, &covers, &Hash::digest(&proof)).as_bytes(),
+                        aggregate_signing_hash(1, nonce, 0, &r, &covers, &Hash::digest(&proof), &randprotocol_core::types::actions::envelope_digest(&fixtures::env(3))).as_bytes(),
                     ),
                 },
             }

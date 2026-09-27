@@ -1867,8 +1867,9 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
         let covers = vec![register.hash];
         let proof_bytes = aggregate_proof.proof.to_bytes();
         let time = head as u32 + 1;
+        let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] };
         let signature = aggregator.sign(
-            randprotocol_core::types::actions::aggregate_signing_hash(CHAIN_ID, 0, time, &r, &covers, &Hash::digest(&proof_bytes))
+            randprotocol_core::types::actions::aggregate_signing_hash(CHAIN_ID, 0, time, &r, &covers, &Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&envelope))
                 .as_bytes(),
         );
         Transaction {
@@ -1881,7 +1882,7 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
                 nonce: 0,
                 time,
                 r,
-                envelope: Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] },
+                envelope,
                 signature,
             },
         }

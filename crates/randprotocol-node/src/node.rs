@@ -4589,7 +4589,7 @@ mod tests {
         let aggregator = kp.public_key().address();
         let r = [9; 8];
         let signature =
-            kp.sign(aggregate_signing_hash(chain_id, nonce, time, &r, &covers, &Hash::digest(&proof)).as_bytes());
+            kp.sign(aggregate_signing_hash(chain_id, nonce, time, &r, &covers, &Hash::digest(&proof), &randprotocol_core::types::actions::envelope_digest(&env(9))).as_bytes());
         Transaction {
             chain_id,
             bundle: None,

@@ -117,7 +117,7 @@ use crate::gas;
 use crate::ledger::{Ledger, TxError};
 use crate::types::actions::{
     aggregate_signing_hash, aggregator_register_message, aggregator_unbond_message,
-    aggregator_withdraw_message, AggregatorRegistration,
+    aggregator_withdraw_message, envelope_digest, AggregatorRegistration,
 };
 use crate::types::{Action, Transaction};
 
@@ -458,7 +458,7 @@ pub(super) fn validate_aggregate(
     // 2. The aggregator: registered, not unbonding, the nonce the register expects, and the
     //    signature over the action's signing hash — `signed_by`'s three, plus the bar.
     let entry = signed_by(ledger, aggregator, nonce, signature, || {
-        aggregate_signing_hash(tx.chain_id, nonce, time, r, covers, &Hash::digest(proof))
+        aggregate_signing_hash(tx.chain_id, nonce, time, r, covers, &Hash::digest(proof), &envelope_digest(envelope))
     })?;
     if entry.unbonding.is_some() {
         return Err(AggregationError::Unbonding(*aggregator).into());
@@ -622,7 +622,7 @@ impl Ledger {
             }
         }
         let entry = signed_by(self, aggregator, *nonce, signature, || {
-            aggregate_signing_hash(tx.chain_id, *nonce, *time, r, covers, &Hash::digest(proof))
+            aggregate_signing_hash(tx.chain_id, *nonce, *time, r, covers, &Hash::digest(proof), &envelope_digest(envelope))
         })?;
         if entry.unbonding.is_some() {
             return Err(AggregationError::Unbonding(*aggregator).into());
@@ -1372,7 +1372,7 @@ mod register_tests {
 
     fn signed_header(kp: &Keypair, nonce: u64, covers: Vec<Hash>, proof_hash: Hash) -> Box<SignedAggregateHeader> {
         let aggregator = kp.public_key().address();
-        let signature = kp.sign(aggregate_signing_hash(7, nonce, 9, &[1; 8], &covers, &proof_hash).as_bytes());
+        let signature = kp.sign(aggregate_signing_hash(7, nonce, 9, &[1; 8], &covers, &proof_hash, &Hash::ZERO).as_bytes());
         Box::new(SignedAggregateHeader { aggregator, nonce, time: 9, r: [1; 8], covers, proof_hash, signature })
     }
 
@@ -1722,7 +1722,7 @@ mod admission_tests {
     fn aggregate_tx(kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
         let aggregator = kp.public_key().address();
         let r = [9; 8];
-        let signature = kp.sign(aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof)).as_bytes());
+        let signature = kp.sign(aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof), &envelope_digest(&env())).as_bytes());
         Transaction {
             chain_id: 7,
             bundle: None,
@@ -1841,6 +1841,27 @@ mod admission_tests {
         match l.validate_aggregate(&resigned, &covered, &StubExecutor) {
             Err(TxError::InvalidAggregateProof(_)) => {}
             other => panic!("A's proof re-signed by B must be refused, got {other:?}"),
+        }
+    }
+
+    /// V-INTERFACE-2 (recursion-VM review, dormant): the aggregator's signature covered the
+    /// chain, nonce, time, `r`, covers and proof hash — not the payout note's envelope. A relayer
+    /// holding the aggregate could swap the envelope for one that opens to nobody, and the
+    /// aggregator's payout note would land in the tree unfindable by its own wallet. The signing
+    /// hash (domain `rand-aggregate-2`) now carries the envelope's digest, so the swap is a bad
+    /// signature.
+    #[test]
+    fn a_swapped_payout_envelope_breaks_the_aggregators_signature() {
+        let (l, kp) = setup();
+        let covered = covered_records(&shape(), &[1, 2]);
+        let honest = aggregate_tx(&kp, 0, 100, covers(2), b"ok".to_vec());
+        assert!(l.validate_aggregate(&honest, &covered, &StubExecutor).is_ok());
+        let mut swapped = honest.clone();
+        let Action::Aggregate { envelope, .. } = &mut swapped.action else { unreachable!() };
+        envelope.body = vec![5; 16];
+        match l.validate_aggregate(&swapped, &covered, &StubExecutor) {
+            Err(TxError::Aggregation(AggregationError::BadSignature)) => {}
+            other => panic!("a swapped payout envelope must break the signature, got {other:?}"),
         }
     }
 
@@ -2417,7 +2438,7 @@ mod payment_tests {
     fn aggregate_tx(kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
         let aggregator = kp.public_key().address();
         let r = [9; 8];
-        let signature = kp.sign(aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof)).as_bytes());
+        let signature = kp.sign(aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof), &envelope_digest(&env())).as_bytes());
         Transaction {
             chain_id: 7,
             bundle: None,
@@ -3062,7 +3083,7 @@ mod payment_tests {
     fn signed_header(kp: &Keypair, nonce: u64, covers: Vec<Hash>) -> crate::types::SignedAggregateHeader {
         let aggregator = kp.public_key().address();
         let proof_hash = Hash::digest(b"p");
-        let signature = kp.sign(aggregate_signing_hash(7, nonce, 9, &[1; 8], &covers, &proof_hash).as_bytes());
+        let signature = kp.sign(aggregate_signing_hash(7, nonce, 9, &[1; 8], &covers, &proof_hash, &Hash::ZERO).as_bytes());
         crate::types::SignedAggregateHeader { aggregator, nonce, time: 9, r: [1; 8], covers, proof_hash, signature }
     }
 }

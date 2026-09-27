@@ -1885,8 +1885,10 @@ fn aggregation_node_with(
 fn aggregate_tx(key: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
     let aggregator = key.public_key().address();
     let r = [9; 8];
+    let envelope = crate::notes::Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] };
     let signature = key.sign(
-        crate::types::actions::aggregate_signing_hash(1, nonce, time, &r, &covers, &Hash::digest(&proof)).as_bytes(),
+        crate::types::actions::aggregate_signing_hash(1, nonce, time, &r, &covers, &Hash::digest(&proof), &crate::types::actions::envelope_digest(&envelope))
+            .as_bytes(),
     );
     Transaction {
         chain_id: 1,
@@ -1898,7 +1900,7 @@ fn aggregate_tx(key: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: 
             nonce,
             time,
             r,
-            envelope: crate::notes::Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] },
+            envelope,
             signature,
         },
     }

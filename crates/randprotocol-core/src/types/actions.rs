@@ -520,8 +520,17 @@ pub fn aggregate_binding(chain_id: u64, aggregator: &crate::crypto::Address, non
 }
 
 /// What an aggregator signs over an `Aggregate` submission (spec §3.1): the chain, the register
-/// nonce, the payout note's `time` and blinding `r`, the cover set, and the proof's hash — the
-/// full content an equivocating pair of `SignedAggregateHeader`s is evidence of.
+/// nonce, the payout note's `time` and blinding `r`, the cover set, the proof's hash, and — since
+/// V-INTERFACE-2 — the payout note's envelope, by [`envelope_digest`].
+///
+/// V-INTERFACE-2 (recursion-VM review, 2026-09-27; dormant — aggregation is on no chain): the
+/// envelope was outside the signature, so whoever relayed an aggregate could swap it for one that
+/// opens to nobody and the aggregator's payout note landed in the tree unfindable by its own
+/// wallet (`token_mint_message` binds its envelope the same way). The domain moved with the
+/// preimage, `rand-aggregate` → `rand-aggregate-2`, so no signature over the old preimage can be
+/// read as one over the new; no chain has ever carried an aggregate, so nothing signed under the
+/// old domain exists. `SignedAggregateHeader` (the retired slashing evidence) carries no envelope
+/// and is never verified any more; its signers pass the digest of whatever envelope they paid to.
 pub fn aggregate_signing_hash(
     chain_id: u64,
     nonce: u64,
@@ -529,7 +538,8 @@ pub fn aggregate_signing_hash(
     r: &Word8,
     covers: &[crate::crypto::Hash],
     proof_hash: &crate::crypto::Hash,
+    envelope_digest: &crate::crypto::Hash,
 ) -> crate::crypto::Hash {
-    let bytes = bincode::serialize(&(chain_id, nonce, time, r, covers, proof_hash)).expect("serializes");
-    crate::crypto::Hash::digest_domain(b"rand-aggregate", &bytes)
+    let bytes = bincode::serialize(&(chain_id, nonce, time, r, covers, proof_hash, envelope_digest)).expect("serializes");
+    crate::crypto::Hash::digest_domain(b"rand-aggregate-2", &bytes)
 }

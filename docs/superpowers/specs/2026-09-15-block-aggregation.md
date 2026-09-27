@@ -222,10 +222,15 @@ Action::Aggregate {
     time:       u32,             // window-checked; the payout note's time
     r:          Word8,           // the payout note's blinding factor
     envelope:   Envelope,        // the payout note sealed to the entry's payout address
-    signature:  Signature,       // over blake3("rand-aggregate",
-                                 //   chain_id || nonce || time || r || covers || proof hash)
+    signature:  Signature,       // over blake3("rand-aggregate-2",
+                                 //   chain_id || nonce || time || r || covers || proof hash
+                                 //   || envelope digest)
 }
 ```
+
+(2026-09-28, V-INTERFACE-2: the envelope's digest joined the signed preimage and the domain moved
+from `rand-aggregate` to `rand-aggregate-2` — without it a relayer could swap the payout note's
+envelope for one that opens to nobody. No chain has carried an aggregate.)
 
 Bundle-less. Size cap `MAX_AGGREGATE_BYTES = MAX_PROOF_BYTES + MAX_COVERS · 32 + (4 + 1 +
 34 · MAX_COVERS) · 8 + MAX_ENVELOPE_BYTES + 3 000` — the rVM proof (328 121 bytes measured at

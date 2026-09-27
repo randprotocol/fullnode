@@ -191,7 +191,7 @@ async fn a_gossiped_aggregate_is_verified_off_the_loop_and_its_refusal_cached() 
                 r,
                 envelope: env(4),
                 signature: kp.sign(
-                    randprotocol_core::types::actions::aggregate_signing_hash(99, 0, 0, &r, &covers, &randprotocol_core::Hash::digest(&proof))
+                    randprotocol_core::types::actions::aggregate_signing_hash(99, 0, 0, &r, &covers, &randprotocol_core::Hash::digest(&proof), &randprotocol_core::types::actions::envelope_digest(&env(4)))
                         .as_bytes(),
                 ),
             },
