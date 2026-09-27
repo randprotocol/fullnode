@@ -630,7 +630,7 @@ pub fn oversized_note(tx: &Transaction) -> Option<TxError> {
 /// else, and for every program at `base_pc` 0 (all 105 on chain 15).
 ///
 /// **Unconditional**, on every chain, like [`oversized_note`]: node policy, not a validity rule —
-/// on a chain whose genesis does not set `program_pc_window` (chain 15) the ledger admits such a
+/// on a chain whose genesis does not set `hardening_v6` (chain 15) the ledger admits such a
 /// deploy and a block carrying one is valid; this node never pools or forwards it. Under the flag
 /// the ledger's verdict is the same one. Cached like `oversized_note`'s, and for its reason: a
 /// function of the transaction's bytes against a constant (`BadProgram` is already in

@@ -251,7 +251,7 @@ mod tests {
             max_block_bytes: None,
             max_call_envelope_bytes: None,
             max_program_public_words: None,
-            program_pc_window: None,
+            hardening_v6: None,
             bridge: None,
             tokens: None,
             aggregation: None,

@@ -1178,7 +1178,7 @@ mod tests {
             max_program_public_words: None,
             envelope_bytes: None,
             vesting: None,
-            program_pc_window: None,
+            hardening_v6: None,
         }
     }
 

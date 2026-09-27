@@ -78,7 +78,7 @@ pub fn program_table_rows(len: usize) -> u64 {
 /// past the wrap — deployable, paid for, and uncallable for ever. Nothing live is affected (every
 /// chain-15 program sits at `base_pc` 0). The verifier- and prover-side halves of the fix are the
 /// zkVM's (vendored, upstream); this predicate is what the node refuses such a deploy on — as its
-/// admission policy on every chain, and as a validity rule under genesis `program_pc_window`.
+/// admission policy on every chain, and as a validity rule under genesis `hardening_v6` (the v0.6 switch).
 pub fn pc_window_fits(base_pc: u32, len: usize) -> bool {
     (base_pc as u64).saturating_add(program_table_rows(len).saturating_mul(4)) <= 1 << 32
 }

@@ -488,24 +488,36 @@ explicit go, typed in the session that will do it — per the standing rule that
 authorization for a fleet-wide or public-facing action (see "Repo workflow traps" and the memory
 note on fleet gos).
 
-## The next cut: the program pc window (ZKV-11)
+## The next cut: `hardening_v6` (the v0.6 switch)
+
+The 2026-09-27 zkVM/ISA review's R4: every stricter validity rule on a live path (its class H)
+ships behind **one** top-level genesis field, so one cut turns them all on together. The next cut
+sets:
+
+```json
+"hardening_v6": true
+```
+
+Absent or `false` commits nothing and is chain 15's rules; `true` is committed to the genesis hash
+under its own tag. Until a genesis carries it, each rule below is every node's **pool policy** (a
+node on this build never pools or forwards what the rule refuses), and a block from an older
+proposer that carries such a transaction still applies. `chain_15s_genesis_file_still_builds_chain_15`
+pins `cc30e085…` against the field. The rules, one subsection each:
+
+### The program pc window (ZKV-11)
 
 A `Deploy` whose *padded* program table — `max(len + 1, 16)` rounded up to a power of two rows,
 four bytes a row — runs past the u32 pc wrap can never be proven (the circuit does PC arithmetic
 in the field, the emulator wraps), yet ZH4's `check_program` bounds only `base_pc + 4·len`: fib's
-15 words at `0xffffffc4` deploy and are uncallable for ever. The next cut sets, at the top level:
+15 words at `0xffffffc4` deploy and are uncallable for ever. (It first shipped on `feat/v0.6` as
+its own `program_pc_window` flag; no genesis ever carried that, and it is folded in here.)
 
-```json
-"program_pc_window": true
-```
-
-- With it, `base_pc + 4 · rows > 2^32` is `BadProgram` at admission and at apply
-  (`program::pc_window_fits`). Absent or `false` commits nothing and is chain 15's rule; `true` is
-  committed to the genesis hash under its own tag, so it ships with a cut.
+- Under `hardening_v6`, `base_pc + 4 · rows > 2^32` is `BadProgram` at admission and at apply
+  (`program::pc_window_fits`).
 - **Every node already refuses such a deploy at its pool, on every chain** (node policy, cached as
   a byte verdict like the note-value screen); a block from an older proposer that carries one still
   applies until the flag is set. Nothing live is affected: every chain-15 program sits at
-  `base_pc` 0. `chain_15s_genesis_file_still_builds_chain_15` pins `cc30e085…` against the field.
+  `base_pc` 0.
 - The verifier- and prover-side fixes (bound the table in the circuit, refuse to prove) are the
   zkVM's, upstream.
 

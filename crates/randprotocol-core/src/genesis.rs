@@ -397,13 +397,18 @@ pub struct Genesis {
     /// byte-for-byte as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vesting: Option<crate::ledger::vesting::VestingConfig>,
-    /// ZKV-11 (pc-wrap, 2026-09-28): `true` makes it a validity rule that a `Deploy`'s padded
-    /// program table ends at or below the u32 pc wrap (`program::pc_window_fits`) — a program
-    /// past it deploys and can never be proven. Absent or `false` is the old rule (the node still
-    /// refuses such a deploy at its pool, as policy). Part of the genesis hash, tagged, only when
-    /// `true`, so chain 15's file hashes byte-for-byte as before; never part of the state root.
+    /// The v0.6 hardening switch (the 2026-09-27 zkVM/ISA review's R4: *one* activation for every
+    /// stricter validity rule on a live path — its class H). `true` turns each of them from the
+    /// node's pool policy into a validity rule, at admission and at apply alike; `Ledger::
+    /// hardening_v6`'s doc comment lists them, and `docs/deploy.md` ("The next cut: hardening_v6")
+    /// is the operator's list. The first was ZKV-11's pc window, which shipped on `feat/v0.6` as
+    /// its own `program_pc_window` flag and was folded in here before any genesis carried it.
+    /// Absent or `false` is the old rules, byte for byte (every node still refuses the same
+    /// transactions at its pool, as policy, where old wallets allow). Part of the genesis hash,
+    /// tagged, only when `true`, so chain 15's file hashes byte-for-byte as before; never part of
+    /// the state root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub program_pc_window: Option<bool>,
+    pub hardening_v6: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -817,7 +822,7 @@ impl Genesis {
         );
         ledger.set_max_program_public_words(self.max_program_public_words.map_or(gas::MAX_PROGRAM_PUBLIC_WORDS, |n| n as usize));
         ledger.set_envelope_bytes(self.envelope_bytes.map(|n| n as usize));
-        ledger.set_program_pc_window(self.program_pc_window == Some(true));
+        ledger.set_hardening_v6(self.hardening_v6 == Some(true));
         // The genesis ledger is positioned at the genesis block, so it carries that block's
         // time structurally rather than relying on every caller to patch it in. The timestamp
         // is transient state, not part of the state root or the genesis hash.
@@ -1093,11 +1098,11 @@ impl Genesis {
                 }
             }
         }
-        // The pc-window rule (ZKV-11), last: tagged and appended only when the file says `true`,
-        // like `bound_note_value` — `false` is the old rule and commits nothing, so chain 15
+        // The v0.6 hardening switch, last: tagged and appended only when the file says `true`,
+        // like `bound_note_value` — `false` is the old rules and commits nothing, so chain 15
         // (`cc30e085…`) hashes byte-for-byte as before.
-        if self.program_pc_window == Some(true) {
-            commit.extend_from_slice(b"program_pc_window");
+        if self.hardening_v6 == Some(true) {
+            commit.extend_from_slice(b"hardening_v6");
             commit.push(1);
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
@@ -1506,7 +1511,7 @@ mod tests {
             max_program_public_words: None,
             envelope_bytes: None,
             vesting: None,
-            program_pc_window: None,
+            hardening_v6: None,
         }
     }
 
@@ -2811,30 +2816,30 @@ mod tests {
         assert_ne!(e.hash(), r.hash(), "and two caps are two chains");
     }
 
-    /// ZKV-11's `program_pc_window` is opt-in per chain and bound into the hash only when `true`,
-    /// like `tokens.bound_note_value`: absent or `false` is the old rule and the same chain, `true`
-    /// is a new chain whose ledger refuses a deploy past the pc window. Never state.
+    /// `hardening_v6` is opt-in per chain and bound into the hash only when `true`, like
+    /// `tokens.bound_note_value`: absent or `false` is the old rules and the same chain, `true` is a
+    /// new chain whose ledger runs the v0.6 rules (the pc window first). Never state.
     #[test]
-    fn program_pc_window_is_bound_into_the_hash_only_when_true() {
+    fn hardening_v6_is_bound_into_the_hash_only_when_true() {
         let plain = genesis(2);
-        assert_eq!(plain.program_pc_window, None);
-        assert!(!plain.to_json().contains("program_pc_window"), "an absent flag is absent from the file");
+        assert_eq!(plain.hardening_v6, None);
+        assert!(!plain.to_json().contains("hardening_v6"), "an absent flag is absent from the file");
         let s = build(&plain);
-        assert!(!s.ledger.program_pc_window(), "absent means the old rule");
+        assert!(!s.ledger.hardening_v6(), "absent means the old rule");
 
         let mut off = plain.clone();
-        off.program_pc_window = Some(false);
+        off.hardening_v6 = Some(false);
         let o = build(&off);
         assert_eq!(o.hash(), s.hash(), "`false` commits nothing");
-        assert!(!o.ledger.program_pc_window());
+        assert!(!o.ledger.hardening_v6());
 
         let mut on = plain.clone();
-        on.program_pc_window = Some(true);
+        on.hardening_v6 = Some(true);
         let g = build(&on);
-        assert!(g.ledger.program_pc_window(), "the ledger runs the rule genesis names");
+        assert!(g.ledger.hardening_v6(), "the ledger runs the rule genesis names");
         assert_ne!(g.hash(), s.hash(), "the rule is a different chain");
         assert_eq!(g.ledger.state_root(), s.ledger.state_root(), "a parameter, not state");
-        assert!(on.to_json().contains("\"program_pc_window\": true"));
+        assert!(on.to_json().contains("\"hardening_v6\": true"));
         assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "and it round-trips");
     }
 

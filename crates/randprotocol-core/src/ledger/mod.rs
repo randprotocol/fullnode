@@ -498,11 +498,17 @@ pub struct Ledger {
     /// `None` keeps today's at-most-`MAX_ENVELOPE_BYTES` rule. A genesis parameter like the call
     /// limits: outside the state root and `Ledger`'s equality, restored by `reload_ledger`.
     envelope_bytes: Option<usize>,
-    /// Genesis `program_pc_window` (ZKV-11): a `Deploy` whose padded program table crosses the
-    /// u32 pc wrap is refused (`program::pc_window_fits`). A genesis parameter like
-    /// `max_program_words`: outside the state root and equality, restored by `reload_ledger`.
-    /// `false` — every chain cut before the flag, chain 15 included — is the old rule.
-    program_pc_window: bool,
+    /// Genesis `hardening_v6`, the v0.6 switch: each stricter rule below is the node's pool policy
+    /// on every chain and a validity rule here only when this is set (the zkVM/ISA review's R4,
+    /// one activation for all of them):
+    ///
+    /// - ZKV-11: a `Deploy` whose padded program table crosses the u32 pc wrap is refused
+    ///   (`program::pc_window_fits`).
+    ///
+    /// A genesis parameter like `max_program_words`: outside the state root and equality,
+    /// restored by `reload_ledger`. `false` — every chain cut before the flag, chain 15 included —
+    /// is the old rules.
+    hardening_v6: bool,
     /// The aggregator register, hashed into the state root (spec §2.1) when `aggregation` is
     /// set; empty otherwise and at chain-9 block 0.
     aggregators: BTreeMap<Address, aggregation::AggregatorEntry>,
@@ -621,7 +627,7 @@ impl Ledger {
             max_call_envelope_bytes: crate::types::actions::MAX_CALL_ENVELOPE_BYTES,
             max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
             envelope_bytes: None,
-            program_pc_window: false,
+            hardening_v6: false,
             aggregators: BTreeMap::new(),
             retired_aggregator_nonces: BTreeMap::new(),
             height: 0,
@@ -675,7 +681,7 @@ impl Ledger {
             max_call_envelope_bytes: crate::types::actions::MAX_CALL_ENVELOPE_BYTES,
             max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
             envelope_bytes: None,
-            program_pc_window: false,
+            hardening_v6: false,
             aggregators: BTreeMap::new(),
             retired_aggregator_nonces: BTreeMap::new(),
             height: 0,
@@ -1040,15 +1046,15 @@ impl Ledger {
         self.max_program_words = words;
     }
 
-    /// Whether a `Deploy` must fit its padded program table below the u32 pc wrap (genesis
-    /// `program_pc_window`, ZKV-11); `false` on a chain whose file does not say `true`.
-    pub fn program_pc_window(&self) -> bool {
-        self.program_pc_window
+    /// Whether the v0.6 rules are validity rules on this chain (genesis `hardening_v6`; the list is
+    /// on the field); `false` on a chain whose file does not say `true`.
+    pub fn hardening_v6(&self) -> bool {
+        self.hardening_v6
     }
 
-    /// Set by genesis from `program_pc_window`, and by `reload_ledger` on every restart.
-    pub fn set_program_pc_window(&mut self, on: bool) {
-        self.program_pc_window = on;
+    /// Set by genesis from `hardening_v6`, and by `reload_ledger` on every restart.
+    pub fn set_hardening_v6(&mut self, on: bool) {
+        self.hardening_v6 = on;
     }
 
     /// The largest proof a transaction may carry, in bytes, as genesis set it (default
@@ -1578,13 +1584,13 @@ impl Ledger {
                 if !self.confidential {
                     return Err(TxError::ConfidentialDisabled);
                 }
-                // ZKV-11, under genesis `program_pc_window`: the padded program table must end at
+                // ZKV-11, under genesis `hardening_v6`: the padded program table must end at
                 // or below the u32 pc wrap, or no honest proof of the program can verify
                 // (`program::pc_window_fits`). A comparison, so before the executor decodes a
                 // word. Without the flag this is admission policy only (the node's
                 // `admission::deploy_outside_pc_window`), and a block carrying such a deploy
                 // applies as before.
-                if self.program_pc_window && !crate::program::pc_window_fits(*base_pc, words.len()) {
+                if self.hardening_v6 && !crate::program::pc_window_fits(*base_pc, words.len()) {
                     return Err(TxError::BadProgram(crate::program::pc_window_error()));
                 }
                 executor.check_program(*base_pc, words).map_err(TxError::BadProgram)?;
@@ -3462,7 +3468,7 @@ mod tests {
         assert_eq!(call(&mut l, plain, with_input, false), bad);
     }
 
-    /// ZKV-11: under genesis `program_pc_window` a deploy whose *padded* program table crosses the
+    /// ZKV-11: under genesis `hardening_v6` a deploy whose *padded* program table crosses the
     /// u32 pc wrap is refused, at admission and at apply alike. Fib's 15 words at `0xffffffc4` end
     /// exactly at 2^32 (ZH4's bound admits them) but pad to 16 rows, one past it; at `0xffffffc0`
     /// the 16 rows end at 2^32 and fit. Without the flag — chain 15 — the old rule stands.
@@ -3474,11 +3480,11 @@ mod tests {
             StubExecutor::bound(Transaction::shielded(7, bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&action)), action))
         };
         let plain = ledger();
-        assert!(!plain.program_pc_window(), "absent means the old rule");
+        assert!(!plain.hardening_v6(), "absent means the old rule");
         assert_eq!(plain.validate(&deploy(&plain, 0xffff_ffc4, 15), &StubExecutor), Ok(()), "the finding: admitted today");
 
         let mut gated = ledger();
-        gated.set_program_pc_window(true);
+        gated.set_hardening_v6(true);
         assert_eq!(gated, plain, "the flag is not part of equality");
         assert_eq!(gated.state_root(), plain.state_root(), "nor of the state root");
         let wraps = deploy(&gated, 0xffff_ffc4, 15);
