@@ -92,6 +92,7 @@ fn genesis_with_aggregation(key: &Keypair, aggregation: Option<randprotocol_core
         max_program_public_words: None,
         envelope_bytes: None,
         staking: None,
+        vesting: None,
     }
 }
 

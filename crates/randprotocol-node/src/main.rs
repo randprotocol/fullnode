@@ -696,6 +696,7 @@ async fn main() -> Result<()> {
                 // The audit-v4 `staking` section (STAKE-2) is spliced in by hand like the
                 // `bridge` section: a chain without it hashes byte-for-byte as before.
                 staking: None,
+                vesting: None,
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
@@ -1521,6 +1522,7 @@ mod tests {
             max_program_public_words: None,
             envelope_bytes: None,
             staking: None,
+            vesting: None,
         }
     }
 

@@ -447,6 +447,9 @@ pub struct Ledger {
     /// the order it was bonded. Consensus state on a chain with a `staking` section — folded
     /// into the state root and persisted beside `META_SUPPLY` — and always empty without one.
     bond_queue: Vec<staking::QueuedStake>,
+    /// Genesis vesting (`vesting.rs`): the register a genesis `vesting` section seeds, `None`
+    /// without one. Consensus state, in the state root (`rand-state-6`), persisted whole.
+    vesting: Option<vesting::VestingRegister>,
     /// Σ of every registration fee burned under `tokens.burn_registration_fee` (audit v5,
     /// TOK-2). A supply counter in kind — derived, outside the state root and this ledger's
     /// equality, persisted beside `META_SUPPLY` and replay-audited — kept off [`Supply`] so
@@ -537,6 +540,9 @@ impl PartialEq for Ledger {
             && self.faucet_minted_in_epoch == o.faucet_minted_in_epoch
             // The bond queue likewise: consensus state under the section, empty without one.
             && self.bond_queue == o.bond_queue
+            // The vesting register: consensus state under its section, `None` on both sides
+            // without one.
+            && self.vesting == o.vesting
     }
 }
 impl Eq for Ledger {}
@@ -573,6 +579,7 @@ impl Ledger {
             faucet_epoch: 0,
             faucet_minted_in_epoch: 0,
             bond_queue: Vec::new(),
+            vesting: None,
             registration_fees_burned: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
@@ -624,6 +631,7 @@ impl Ledger {
             faucet_epoch: 0,
             faucet_minted_in_epoch: 0,
             bond_queue: Vec::new(),
+            vesting: None,
             registration_fees_burned: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
@@ -792,11 +800,29 @@ impl Ledger {
 
     /// The supply audit against this ledger's own register.
     pub fn audit(&self) -> Audit {
-        Audit::new(
+        let audit = Audit::new(
             self.supply,
             register_total(&self.validators).saturating_add(supply::aggregators_total(&self.aggregators)),
             self.registration_fees_burned,
-        )
+        );
+        match &self.vesting {
+            Some(v) => audit.with_vesting(v.issued(), v.released, v.in_register()),
+            None => audit,
+        }
+    }
+
+    /// The vesting register (genesis vesting), `None` on a chain without the section.
+    pub fn vesting(&self) -> Option<&vesting::VestingRegister> {
+        self.vesting.as_ref()
+    }
+
+    /// Install the register: genesis from its section, a reloading node from what it persisted.
+    pub fn set_vesting(&mut self, v: Option<vesting::VestingRegister>) {
+        self.vesting = v;
+    }
+
+    pub(crate) fn vesting_mut(&mut self) -> Option<&mut vesting::VestingRegister> {
+        self.vesting.as_mut()
     }
 
     /// Deposit notes this ledger created while applying the current block (see [`Deposit`]).
@@ -2049,8 +2075,12 @@ impl Ledger {
         } else {
             "none".into()
         };
+        let vest = match &self.vesting {
+            Some(v) => format!("{:?}", v.root()),
+            None => "none".into(),
+        };
         format!(
-            "tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} tokens {tok} aggregators {agg}",
+            "tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} tokens {tok} aggregators {agg} vesting {vest}",
             self.tree.root()
         )
     }
@@ -2124,6 +2154,14 @@ impl Ledger {
             buf.extend_from_slice(&self.faucet_minted_in_epoch.to_be_bytes());
             // And the bond queue, whole and in order: its order is the admission order.
             buf.extend_from_slice(self.bond_queue_root().as_bytes());
+        }
+        // Genesis vesting: the register's root last, re-domained `rand-state-6`. Only under
+        // the section, so every chain without one keeps its domain and bytes.
+        if let Some(v) = &self.vesting {
+            buf.extend_from_slice(v.root().as_bytes());
+            return Hash::digest_domain(b"rand-state-6", &buf);
+        }
+        if self.staking.is_some() {
             return Hash::digest_domain(b"rand-state-5", &buf);
         }
         if self.tokens.is_some() {

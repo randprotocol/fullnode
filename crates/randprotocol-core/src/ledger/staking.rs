@@ -219,7 +219,7 @@ pub struct QueuedStake {
 
 /// A `u64` amount as a decimal string in the genesis file (the RPC's amount convention). A
 /// plain JSON number is accepted on the way in, so a hand-edited file is not refused for it.
-mod amount_string {
+pub(crate) mod amount_string {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {

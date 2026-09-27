@@ -2861,6 +2861,7 @@ pub(crate) mod fixtures {
             max_call_envelope_bytes: None,
             max_program_public_words: None,
             envelope_bytes: None,
+            vesting: None,
         }
     }
 
@@ -2970,6 +2971,7 @@ pub(crate) mod fixtures {
             max_call_envelope_bytes: None,
             max_program_public_words: None,
             envelope_bytes: None,
+            vesting: None,
         }
         .build(&StubExecutor)
         .unwrap();

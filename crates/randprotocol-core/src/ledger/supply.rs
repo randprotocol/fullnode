@@ -154,22 +154,56 @@ pub struct Audit {
     /// register entry: destroyed issuance, on the right of the identity beside `slashed`. Kept
     /// off [`Supply`] so chain 14's stored blob keeps its layout; 0 without the gate.
     pub registration_fees_burned: u64,
+    /// Genesis vesting (spec §7), all 0 without a `vesting` section and kept off [`Supply`] for
+    /// the same layout reason: what genesis issued into the vesting register (issuance, like
+    /// `genesis_staked`) …
+    pub vesting_issued: u64,
+    /// … what claims and revokes have put into the pool as notes, net of their bases (value
+    /// entering the pool, like `withdraw_deposited`) …
+    pub vesting_released: u64,
+    /// … and what the vesting register itself still holds (RAND bonded from it is in the
+    /// validator register's `stake`, so inside `register_total`).
+    pub vesting_in_register: u64,
 }
 
 impl Audit {
     pub fn new(supply: Supply, register_total: u64, registration_fees_burned: u64) -> Audit {
-        Audit { supply, pool_value: supply.pool_value(), register_total, registration_fees_burned }
+        Audit {
+            supply,
+            pool_value: supply.pool_value(),
+            register_total,
+            registration_fees_burned,
+            vesting_issued: 0,
+            vesting_released: 0,
+            vesting_in_register: 0,
+        }
+    }
+
+    /// The same audit with the vesting register's three numbers in it.
+    pub fn with_vesting(self, issued: u64, released: u64, in_register: u64) -> Audit {
+        Audit {
+            pool_value: self.supply.pool_value().saturating_add(released),
+            vesting_issued: issued,
+            vesting_released: released,
+            vesting_in_register: in_register,
+            ..self
+        }
+    }
+
+    /// What was issued: [`Supply::issued`] plus the vesting register's genesis issuance.
+    pub fn issued(&self) -> u64 {
+        self.supply.issued().saturating_add(self.vesting_issued)
     }
 
     pub fn total_supply(&self) -> u64 {
-        self.pool_value.saturating_add(self.register_total)
+        self.pool_value.saturating_add(self.register_total).saturating_add(self.vesting_in_register)
     }
 
     /// Everything the chain issued is either in the pool or in the register, less what was
     /// destroyed: a slashed bond, or a registration fee burned under the gate. A false here is a
     /// consensus bug or a damaged counter, never a legitimate chain state.
     pub fn invariant_holds(&self) -> bool {
-        self.total_supply() == self.supply.issued().saturating_sub(self.supply.slashed).saturating_sub(self.registration_fees_burned)
+        self.total_supply() == self.issued().saturating_sub(self.supply.slashed).saturating_sub(self.registration_fees_burned)
     }
 }
 
@@ -233,5 +267,27 @@ mod tests {
         let s = Supply { fees_paid: 5, ..Default::default() };
         assert_eq!(s.pool_value(), 0);
         assert_eq!(Audit::new(s, 0, 0).total_supply(), 0);
+    }
+
+    /// Genesis vesting (spec §7): a claim moves value from the vesting register into the pool
+    /// (and its base into a proposer's rewards), a bond from the lock moves it into a validator's
+    /// stake — neither creates nor destroys any, and the identity holds through both.
+    #[test]
+    fn the_vesting_register_is_the_third_half_of_the_identity() {
+        let s = Supply { genesis_deposited: 1_000, genesis_staked: 4_000, ..Supply::default() };
+        // Genesis: 600 vesting, nothing released.
+        let a = Audit::new(s, 4_000, 0).with_vesting(600, 0, 600);
+        assert_eq!((a.issued(), a.total_supply()), (5_600, 5_600));
+        assert!(a.invariant_holds());
+        // A claim of 100 gross: a 99 note, 1 base to a proposer's rewards.
+        let a = Audit::new(s, 4_001, 0).with_vesting(600, 99, 500);
+        assert!(a.invariant_holds());
+        assert_eq!(a.pool_value, 1_099);
+        // 200 bonded from the lock: out of the vesting register, into a validator's stake.
+        let a = Audit::new(s, 4_201, 0).with_vesting(600, 99, 300);
+        assert!(a.invariant_holds());
+        // Counting the claim twice — or not at all — breaks it.
+        assert!(!Audit::new(s, 4_001, 0).with_vesting(600, 99, 600).invariant_holds());
+        assert!(!Audit::new(s, 4_001, 0).with_vesting(600, 0, 500).invariant_holds());
     }
 }

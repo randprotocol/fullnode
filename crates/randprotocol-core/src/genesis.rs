@@ -390,6 +390,13 @@ pub struct Genesis {
     /// a genesis hash unchanged byte for byte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub envelope_bytes: Option<u32>,
+    /// Genesis vesting (`docs/superpowers/specs/2026-09-28-genesis-vesting-design.md`): the
+    /// timelocked allocations — team, investors, founding partners — the vesting register
+    /// starts with. Part of the genesis hash and of the state root (`rand-state-6`) when
+    /// present; omitted entirely when absent, so every chain without one hashes and commits
+    /// byte-for-byte as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vesting: Option<crate::ledger::vesting::VestingConfig>,
 }
 
 fn default_true() -> bool {
@@ -454,6 +461,9 @@ pub enum GenesisError {
     /// faucet allowlist.
     #[error("bad staking config: {0}")]
     BadStaking(String),
+    /// The `vesting` section breaks one of `VestingConfig::check`'s rules.
+    #[error("bad vesting config: {0}")]
+    BadVesting(String),
     #[error("bad hc_bundle {0} (64 hex characters)")]
     BadHcBundle(String),
     #[error("bad alloc note {0}")]
@@ -669,6 +679,9 @@ impl Genesis {
                 return Err(GenesisError::BadStaking("max_stake_entry_per_epoch 0 would admit no stake ever".into()));
             }
         }
+        if let Some(v) = &self.vesting {
+            v.check().map_err(GenesisError::BadVesting)?;
+        }
         Ok(())
     }
 
@@ -860,6 +873,13 @@ impl Genesis {
             staked = staked.checked_add(e.stake).ok_or(GenesisError::SupplyOverflow)?;
         }
         ledger.set_genesis_supply(deposited, staked);
+        // The vesting register is issuance too, beside the notes and the stakes: all three
+        // together must fit a u64, or the supply audit could not state the total.
+        if let Some(v) = &self.vesting {
+            let vested = v.check().map_err(GenesisError::BadVesting)?;
+            deposited.checked_add(staked).and_then(|t| t.checked_add(vested)).ok_or(GenesisError::SupplyOverflow)?;
+            ledger.set_vesting(Some(crate::ledger::vesting::VestingRegister::from_config(v)));
+        }
         // Replaces the empty-tree root `Ledger::new` recorded, so the only anchor a chain
         // starts with is the root the deposit notes leave behind.
         ledger.record_anchor(0);
@@ -1030,6 +1050,40 @@ impl Genesis {
         if let Some(n) = self.envelope_bytes {
             commit.extend_from_slice(b"envelope_bytes");
             commit.extend_from_slice(&n.to_be_bytes());
+        }
+        // Genesis vesting, after the envelope size — last: its count, then every entry in id
+        // order (the register's order, so two files listing the same entries differently are one
+        // chain), every field
+        // fixed-width — the keys are held to their length by `validate` — with a presence byte
+        // before each optional one. Absent, nothing.
+        if let Some(v) = &self.vesting {
+            let mut entries: Vec<_> = v.entries.iter().collect();
+            entries.sort_by(|a, b| a.id.cmp(&b.id));
+            commit.extend_from_slice(b"vesting");
+            commit.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for e in entries {
+                commit.extend_from_slice(&e.id);
+                commit.extend_from_slice(e.class.as_str().as_bytes());
+                commit.push(0);
+                commit.extend_from_slice(e.beneficiary.as_bytes());
+                match &e.revoker {
+                    Some(r) => {
+                        commit.push(1);
+                        commit.extend_from_slice(r.as_bytes());
+                    }
+                    None => commit.push(0),
+                }
+                for w in [e.amount, e.start_ms, e.cliff_ms, e.linear_ms] {
+                    commit.extend_from_slice(&w.to_be_bytes());
+                }
+                match e.step_ms {
+                    Some(step) => {
+                        commit.push(1);
+                        commit.extend_from_slice(&step.to_be_bytes());
+                    }
+                    None => commit.push(0),
+                }
+            }
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -1415,6 +1469,7 @@ mod tests {
             max_call_envelope_bytes: None,
             max_program_public_words: None,
             envelope_bytes: None,
+            vesting: None,
         }
     }
 
@@ -3167,4 +3222,88 @@ mod tests {
         assert!(with(|s| s.max_weight_bps = Some(10_000)).validate().is_ok());
         assert!(matches!(with(|s| s.max_stake_entry_per_epoch = Some(0)).validate(), Err(GenesisError::BadStaking(_))));
     }
+
+    // ------------------------------------------------------------------ genesis vesting
+
+    fn vesting_entry(id: u8, amount: u64) -> crate::ledger::vesting::VestingEntryConfig {
+        crate::ledger::vesting::VestingEntryConfig {
+            id: [id; 32],
+            class: crate::ledger::vesting::Class::Investor,
+            beneficiary: Keypair::from_seed([50 + id; 32]).unwrap().public_key().clone(),
+            revoker: None,
+            amount,
+            start_ms: 1_700_000_000_000,
+            cliff_ms: 1_000,
+            linear_ms: 2_000,
+            step_ms: None,
+        }
+    }
+
+    fn vested_genesis(entries: Vec<crate::ledger::vesting::VestingEntryConfig>) -> Genesis {
+        let mut g = genesis(1);
+        g.vesting = Some(crate::ledger::vesting::VestingConfig { entries });
+        g
+    }
+
+    /// Genesis vesting (spec §3, §5, §7): the section seeds the register, is committed to the
+    /// genesis hash and to the state root under `rand-state-6`, and the supply identity holds
+    /// at block 0 with the register as issuance; a genesis without it is unchanged.
+    #[test]
+    fn a_vesting_section_seeds_the_register_and_is_committed_only_when_present() {
+        let plain = build(&genesis(1));
+        assert!(plain.ledger.vesting().is_none());
+        assert!(!genesis(1).to_json().contains("vesting"), "absent from a file that does not set it");
+        let g = vested_genesis(vec![vesting_entry(2, 700 * UNITS_PER_RAND), vesting_entry(1, 300 * UNITS_PER_RAND)]);
+        let gs = build(&g);
+        let v = gs.ledger.vesting().expect("the register is seeded");
+        assert_eq!(v.entries.len(), 2);
+        assert_eq!(v.entries[0].id, [1; 32], "in id order");
+        assert_eq!(v.issued(), 1_000 * UNITS_PER_RAND);
+        let audit = gs.ledger.audit();
+        assert!(audit.invariant_holds(), "{audit:?}");
+        assert_eq!(audit.vesting_in_register, 1_000 * UNITS_PER_RAND);
+        assert_ne!(gs.hash(), plain.hash());
+        assert_ne!(gs.ledger.state_root(), plain.ledger.state_root());
+        assert!(!gs.ledger.debug_state_root_components().contains("vesting none"));
+        assert!(plain.ledger.debug_state_root_components().contains("vesting none"));
+        // The file round-trips, amounts as decimal strings.
+        let json = g.to_json();
+        assert!(json.contains("\"amount\": \"300000000000\""), "{json}");
+        assert_eq!(Genesis::from_json(&json).unwrap(), g);
+        // The same entries listed in another order are the same chain.
+        let reordered = vested_genesis(vec![vesting_entry(1, 300 * UNITS_PER_RAND), vesting_entry(2, 700 * UNITS_PER_RAND)]);
+        assert_eq!(build(&reordered).hash(), gs.hash());
+        // Every committed field moves the hash.
+        let with = |f: fn(&mut crate::ledger::vesting::VestingEntryConfig)| {
+            let mut x = g.clone();
+            f(&mut x.vesting.as_mut().unwrap().entries[0]);
+            build(&x).hash()
+        };
+        let moved = [
+            with(|e| e.id = [9; 32]),
+            with(|e| e.class = crate::ledger::vesting::Class::Team),
+            with(|e| e.beneficiary = Keypair::from_seed([99; 32]).unwrap().public_key().clone()),
+            with(|e| e.revoker = Some(Keypair::from_seed([98; 32]).unwrap().public_key().clone())),
+            with(|e| e.amount += 1),
+            with(|e| e.start_ms += 1),
+            with(|e| e.cliff_ms += 1),
+            with(|e| e.linear_ms += 1000),
+            with(|e| e.step_ms = Some(1000)),
+        ];
+        for (i, h) in moved.iter().enumerate() {
+            assert_ne!(*h, gs.hash(), "field {i} must be in the genesis binding");
+        }
+    }
+
+    #[test]
+    fn a_bad_vesting_section_is_refused_at_the_file() {
+        let bad = |g: Genesis| assert!(matches!(g.validate(), Err(GenesisError::BadVesting(_))), "{:?}", g.validate());
+        bad(vested_genesis(vec![]));
+        bad(vested_genesis(vec![vesting_entry(1, 5), vesting_entry(1, 6)]));
+        bad(vested_genesis(vec![vesting_entry(1, 0)]));
+        // The register, the notes and the stakes together must fit a u64.
+        let huge = vested_genesis(vec![vesting_entry(1, u64::MAX - 1)]);
+        assert!(matches!(huge.build(&StubExecutor), Err(GenesisError::SupplyOverflow)));
+    }
+
 }

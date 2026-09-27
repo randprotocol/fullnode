@@ -127,6 +127,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         aggregation: None,
         consensus_domain: fixture_domain(),
         staking: None,
+        vesting: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -1341,6 +1342,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         aggregation: None,
         consensus_domain: fixture_domain(),
         staking: None,
+        vesting: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -1814,6 +1816,7 @@ fn aggregation_node_with(
         aggregation: Some(cfg.clone()),
         consensus_domain: None,
         staking: None,
+        vesting: None,
     };
     let mut gs = genesis.build(&StubExecutor).unwrap();
     // Register the aggregator directly on the genesis ledger the node builds on (the register

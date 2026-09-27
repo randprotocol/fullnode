@@ -57,7 +57,9 @@ pub struct VestingEntryConfig {
     /// The Dilithium2 key that may revoke the unvested part. Absent: irrevocable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoker: Option<PublicKey>,
-    /// Total, in units (1 RAND = 10⁹).
+    /// Total, in units (1 RAND = 10⁹), a decimal string in the file like every genesis amount
+    /// (a plain number is accepted on the way in).
+    #[serde(with = "crate::ledger::staking::amount_string")]
     pub amount: u64,
     /// When the lockup starts (network launch, for a sale round).
     pub start_ms: u64,
