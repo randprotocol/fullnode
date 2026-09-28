@@ -696,6 +696,57 @@ so it rolls only onto a new genesis, all-stop/all-start; wallets, the prover and
 relayer's `rand` move with it. The cut procedure is "The chain-17 cut" (it arrives with the
 chain-17 scripts).
 
+## The next cut: the gas section (chain 18)
+
+Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md` §3.2–§4.3, §7.1. **Built on
+`feat/gas-chain18`, not yet cut** — see the AGENTS.md `chain 18` entry for the review traps and
+gate counts. Genesis `gas` (optional, absent from every chain up to and including 16 and hashed
+in only when present):
+
+```json
+"gas": { "gas_price": "100", "byte_price": "800", "bundle_gas_limit": 20479, "metering": "circuit",
+         "dynamic": { "target_block_bytes": 2097152, "target_block_gas": 262144,
+                      "adjust_bps": 1250, "min_gas_price": "100", "min_byte_price": "800" } }
+```
+
+- **`gas_price`, `byte_price`** (decimal strings, `> 0`): the starting units of RAND per gas and
+  per KiB of call proof plus input envelope. A call's floor is `BUNDLE_BASE + gas_price·GAS_LIMIT
+  + byte_price·⌈bytes/1024⌉`, priced at the proof's own declared `GAS_LIMIT`, not the header's
+  ceiling (`docs/fees.md` §1.1).
+- **`bundle_gas_limit`** (`> 0`): every bundle proof's declared `GAS_LIMIT` must equal this
+  exactly, or the proof is refused (`TxError::BundleGasLimit`, permanent). Must be `gas_max(14, 0,
+  0) = 20479` for today's tier-14 hidden-asset (v2) guest — any other value means no real bundle
+  can ever be admitted.
+- **`metering`**: only `"circuit"` parses; the field exists so a later metering scheme has a name.
+- **`dynamic`** (optional, Phase 2 — absent means the two starting prices never move):
+  `target_block_bytes` (`1..=max_block_bytes`, the ledger's effective cap) and `target_block_gas`
+  (`> 0`) are what the controller measures fullness against; `adjust_bps` (`1..=5000`) is the
+  largest one-block price move, in basis points; `min_gas_price`/`min_byte_price` (decimal
+  strings, each `<=` the section's own starting price) are the floors the controller never crosses,
+  and each must satisfy `min_price · adjust_bps >= 10000` — a floor under that bound could never
+  rise again once reached (`docs/fees.md` §1.2).
+- **Refused beside an `aggregation` section** (`GenesisError::DynamicGasWithAggregation`) whenever
+  `dynamic` is set: a pruned bundle's marker form encodes shorter than its raw form, so a node
+  syncing sealed history would compute a different `bytes_used` than a live-synced one and diverge
+  on the byte price. A fixed-price `gas` section (no `dynamic`) is not affected — its prices never
+  move, so nothing about sealed-form sync depends on them.
+
+**Constraint set 8 changes every verifier key** (the cpu AIR itself changes, `docs/confidential.md`
+"Constraint set 8"), so — like every prior constraint-set cut — this is **all-stop, all-start**, no
+mixed-fleet path: a v0.6.1 node cannot verify a cs8 proof and vice versa. **Clients and randscan
+rebuild against cs8 first**, same rule as constraint sets 5–7: a wallet or explorer built before
+the cut cannot prove or verify anything the new chain admits.
+
+`rand-node genesis --gas-price <UNITS> --byte-price <UNITS> --bundle-gas-limit <N> [--gas-dynamic
+<target_bytes>,<target_gas>,<adjust_bps>]` writes the section (`--gas-price` is what turns it on
+at all; the other three flags are meaningless without it, and default to `800`, `gas_max(14, 0,
+0)` and "off"). `rand-node genesis`/`init` print `gas: price P/gas, B/KiB, bundle limit N,
+dynamic: …` (or `gas: none`) on the finished file — the hash that matters, as with every gated
+section. `deploy/cut-chain18-genesis.sh` writes chain 18's testnet defaults (the JSON above) and
+asserts the section is present, `dynamic` is set with the right target/adjust/floor values, and no
+`aggregation` section rides beside it; `deploy/cutover-fleet-chain18.sh` is the all-stop/all-start
+roll; `deploy/chain18-bridge-steps.md` has the bridge relayer's own rebuild step.
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and
