@@ -155,11 +155,36 @@ pub struct ChainLimits {
     /// from a node that runs no policy or predates the field — paired with `byte_price` below to
     /// decide [`ChainLimits::gas_policy`]. `gas_metering` (`"header"` or `null`) is deliberately
     /// not decoded here: the wallet needs only the two prices.
-    #[serde(default)]
+    ///
+    /// A price is a RAND amount, so the node sends a decimal string (docs/rpc.md); a number is
+    /// accepted too, for a node built before that rule reached these two fields.
+    #[serde(default, deserialize_with = "opt_u64_string_or_number")]
     pub gas_price: Option<u64>,
     /// Byte-units per RAND-unit, under the node's gas policy. See `gas_price` above.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_u64_string_or_number")]
     pub byte_price: Option<u64>,
+}
+
+/// An optional u64 sent as a decimal string or as a JSON number; `None` for `null` (and, with
+/// `#[serde(default)]`, for an absent key). Anything else — a negative, a fraction, a string
+/// that is not a decimal u64 — is a decode error, never a guess.
+fn opt_u64_string_or_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Amount {
+        Number(u64),
+        Text(String),
+    }
+    match <Option<Amount> as serde::Deserialize>::deserialize(d)? {
+        None => Ok(None),
+        Some(Amount::Number(n)) => Ok(Some(n)),
+        Some(Amount::Text(t)) => {
+            if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(serde::de::Error::custom(format!("not a decimal amount: {t:?}")));
+            }
+            t.parse().map(Some).map_err(serde::de::Error::custom)
+        }
+    }
 }
 
 impl ChainLimits {
@@ -1183,6 +1208,31 @@ mod tests {
         let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(priced))]).await);
         let limits = rpc.limits().await.unwrap().unwrap();
         assert_eq!(limits.gas_policy(), Some(randprotocol_core::gas::GasPolicy::DEFAULT));
+
+        // The node serves the prices as decimal strings (they are RAND amounts, docs/rpc.md);
+        // the number form above decodes too, and an explicit `null` is no policy.
+        let strings = json!({
+            "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+            "max_call_envelope_bytes": 18432, "max_program_public_words": 64,
+            "gas_price": "100", "byte_price": "800", "gas_metering": "header"
+        });
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(strings))]).await);
+        let limits = rpc.limits().await.unwrap().unwrap();
+        assert_eq!(limits.gas_policy(), Some(randprotocol_core::gas::GasPolicy::DEFAULT));
+        let nulls = json!({
+            "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+            "max_call_envelope_bytes": 18432, "max_program_public_words": 64,
+            "gas_price": null, "byte_price": null, "gas_metering": null
+        });
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(nulls))]).await);
+        assert_eq!(rpc.limits().await.unwrap().unwrap().gas_policy(), None);
+        let junk = json!({
+            "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+            "max_call_envelope_bytes": 18432, "max_program_public_words": 64,
+            "gas_price": "1e2", "byte_price": "800"
+        });
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(junk))]).await);
+        assert!(rpc.limits().await.is_err(), "a price that is not a decimal u64 is an error, not a guess");
     }
 
     /// [`RpcClient::envelope_format`] reads `rand_getLimits` at most once, however many times it
