@@ -374,3 +374,38 @@ fn die_immediately_handles_cost_nothing_and_live_max_is_measured() {
         "the 40-constant fold, measured: {stats:?}"
     );
 }
+
+/// The runtime-length sponge (`hash::absorb_staged`, the aggregate program's interface digest)
+/// against the host's padding-free `public_values::public_digest`, at every length through six
+/// blocks — every residue mod the rate, block boundaries included. Constraint set 8 found the
+/// gap this pins: the absorb used to permute on the word that filled the rate, and the program's
+/// unconditional final permutation then permuted a list ending on a block boundary twice — never
+/// reached while an inner proof carried 34 public values, reached at `N = 1` with cs8's 35.
+#[test]
+fn the_staged_absorb_is_the_host_sponge_at_every_length() {
+    use randprotocol_rvm::dsl::hash::absorb_staged;
+    use randprotocol_rvm::public_values::{public_digest, RVM_PUB_DOMAIN};
+    for len in 1..=24usize {
+        let mut b = Builder::new(Checkpoints::Off);
+        let st = b.alloc_absolute(8);
+        b.zero_cells(st, 0, 8);
+        let dom = b.constant(F::from_u64(RVM_PUB_DOMAIN));
+        b.store(st, 4, dom);
+        let n = b.constant(F::from_u64(len as u64));
+        b.store(st, 5, n);
+        let cursor = b.alloc_absolute(1);
+        let first = b.constant(F::from_u64(b.addr_of(st)));
+        b.store(cursor, 0, first);
+        for _ in 0..len {
+            let v = b.hint();
+            absorb_staged(&mut b, st, cursor, v);
+        }
+        b.poseidon2(st);
+        for lane in 0..4 {
+            let v = b.load(st, lane);
+            b.public(v);
+        }
+        let words: Vec<F> = (0..len as u64).map(|k| F::from_u64(1000 + 7 * k)).collect();
+        assert_eq!(run(b, &words), public_digest(&words).to_vec(), "length {len}");
+    }
+}

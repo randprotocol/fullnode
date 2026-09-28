@@ -45,10 +45,10 @@ pub enum Segment {
     /// round's `log_arity`. Read off the *proof* and pinned against the program's own shape word
     /// by word, so a proof of another shape is refused here rather than misparsed later.
     Header,
-    /// The 34 inner public values (constraint set 6: `PC_ENTRY`, `TIER`, `OUT0..7`, `HC0..7`,
-    /// `IN0..7`, then `PUB0..7` — the unsalted `H_PUB`, which for the empty public segment these
-    /// fixtures prove is a prover-computed constant of the shape, carried as ordinary public
-    /// values; no public-segment words enter the tape).
+    /// The 35 inner public values (constraint set 8: `PC_ENTRY`, `TIER`, `OUT0..7`, `HC0..7`,
+    /// `IN0..7`, `PUB0..7`, then `GAS`, the declared gas limit — `PUB0..7` the unsalted `H_PUB`,
+    /// which for the empty public segment these fixtures prove is a prover-computed constant of
+    /// the shape, carried as ordinary public values; no public-segment words enter the tape).
     PublicValues,
     /// The `main`, `permutation`, `quotient_chunks` and `random` caps: four times sixteen elements.
     Commitments,

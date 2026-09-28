@@ -1,6 +1,6 @@
 //! The N-generic aggregate program (M5.3): one counted loop over the tape's N, each iteration
 //! the per-proof pipeline with a fresh challenger, then the interface digest over
-//! `[inner_vk_digest ‖ N ‖ 34·N]`. The differentials: N=1 is the single-proof program plus a
+//! `[inner_vk_digest ‖ N ‖ B(8) ‖ 35·N]`. The differentials: N=1 is the single-proof program plus a
 //! pinned loop overhead, and the thirteen segment tampers are refused at the M5.1 table's named
 //! steps, verbatim, at `(proof, segment)`.
 
@@ -25,23 +25,27 @@ const MAX_CYCLES: usize = 1 << 24;
 
 /// The rows the counted loop and the runtime-length interface sponge cost over the single-proof
 /// program at N=1, measured on this tree: the count word and its guard, the sponge state and
-/// cursor, the per-proof 34-word staged absorb (with its eight rate-fill permutations), the
-/// final partial-block permutation, and the loop scaffolding — against the single-proof phase
-/// 8's list build and one-shot `sponge_seeded` it replaces — plus AGG-2's eight binding words
-/// (their hints, stores, and two rate-fill absorbs: 80 rows, the same at every N). Constraint
-/// set 7 moved it by one row (219 → 220) — measured, not traced to an instruction; the looped
-/// body is compiled over the wider inner shape (the LogUp blind's columns, the floored public
-/// table).
-const LOOP_OVERHEAD: usize = 220;
+/// cursor, the per-proof 35-word staged absorb (with its rate-fill permutations), the final
+/// permutation, and the loop scaffolding — against the single-proof phase 8's list build and
+/// one-shot `sponge_seeded` it replaces — plus AGG-2's eight binding words (their hints, stores,
+/// and two rate-fill absorbs, the same at every N). Constraint set 7 moved it by one row
+/// (219 → 220). Constraint set 8 moved it 220 → 274: the 35th public value and the wider inner
+/// shape measure 235 on the eager absorb, and the deferred absorb (`hash::absorb_staged`, which
+/// fixed the double final permutation on a list ending at a block boundary — `N = 1` at 35
+/// words a proof) costs one cursor reload per staged word (+43 at N=1) and drops the doubled
+/// permutation's four rows: 235 + 43 − 4 = 274.
+const LOOP_OVERHEAD: usize = 274;
 
 /// The N=3 total, measured on this tree. The per-N total is *not* a clean multiple of the
-/// per-proof rows: the staged absorb permutes when the rate fills, and the fill phase advances
-/// by two lanes per proof (34 mod 4), so an odd-numbered iteration permutes nine times where an
-/// even one permutes eight — the per-N rows are `pre + Σ body_j + post` with the parity term,
-/// pinned per N rather than modelled. Constraint set 7 with VERIFIER-1 (one `commit pow witness`
-/// assertion per FRI round per proof; `LOOP_OVERHEAD` does not move, the single-proof program paying
-/// the same): 1 324 774 → 1 383 100 (`tests/pins.json`'s `aggregate_test_n3_cpu_rows`, re-measured).
-const N3_ROWS: usize = 1_383_100;
+/// per-proof rows: the staged absorb permutes when a block fills, and the fill phase advances
+/// by three lanes per proof (35 mod 4), so iterations differ by one permutation depending on
+/// where their run of 35 words starts — the per-N rows are `pre + Σ body_j + post` with the
+/// phase term, pinned per N rather than modelled. Constraint set 7 with VERIFIER-1: 1 383 100.
+/// Constraint set 8 (the 35th public value, the wider inner shape, the deferred absorb):
+/// 1 383 100 → 1 385 968 (`tests/pins.json`'s `aggregate_test_n3_cpu_rows`, re-measured; the
+/// eager absorb measured 1 385 855 on the same tree — the 113 rows are one cursor reload per
+/// staged word, 8 + 3·35).
+const N3_ROWS: usize = 1_385_968;
 
 fn shape_and_key(p: &Proof) -> (InnerShape, InnerKey) {
     let shape = InnerShape::of(
@@ -59,7 +63,7 @@ fn shape_and_key(p: &Proof) -> (InnerShape, InnerKey) {
 }
 
 /// The N=1 differential: the looped program over one fixture proof accepts, publishes exactly
-/// the host's `[vk ‖ 1 ‖ B(8) ‖ 34]` bound-interface digest, and costs the single-proof rows
+/// the host's `[vk ‖ 1 ‖ B(8) ‖ 35]` bound-interface digest, and costs the single-proof rows
 /// plus the pinned loop overhead. (The aggregate's interface carries the eight binding words, so
 /// it is *not* the single-proof program's digest — that equality held before AGG-2.)
 #[test]
@@ -101,7 +105,8 @@ fn n1_aggregate_publishes_the_bound_interface_digest_at_a_pinned_overhead() {
 }
 
 /// Three real proofs, one looped run: accepted, and the published digest is the host's
-/// `[vk ‖ 3 ‖ B(8) ‖ 34·3]` list — the staged absorb's two rate-fill parities both exercised.
+/// `[vk ‖ 3 ‖ B(8) ‖ 35·3]` list — the staged absorb over three proofs whose runs start at
+/// three different lanes. (N=1 is the block-boundary case: 13 + 35 = 48 words.)
 #[test]
 fn n3_aggregate_publishes_the_host_interface_digest() {
     let proofs: Vec<Proof> =
@@ -413,7 +418,7 @@ fn a_wrong_shape_proof_in_the_set_is_named_by_index_before_any_tape_work() {
 // ── Task 4: the refusal suite, the in-suite aggregate, and the N=3 twin ──────────────────────
 
 /// (a) an inner proof tampered inside the set makes `aggregate` fail — never an aggregate. The
-/// tamper is one of the 34 public values of proof 1: `matches` still passes (length and
+/// tamper is one of the 35 public values of proof 1: `matches` still passes (length and
 /// canonicality are all it checks), so the refusal lands in the tape builder's transcript
 /// replay, where the native verifier's own checks run.
 #[test]
@@ -424,7 +429,7 @@ fn a_tampered_inner_proof_never_yields_an_aggregate() {
     let vk = inner_vk(&shape, &key);
     let m = RvmMachine::new(FriProfile::Test);
     let mut set = proofs;
-    set[1].public_values[pv::OUT0] += 1; // still 34 canonical words; no longer its transcript
+    set[1].public_values[pv::OUT0] += 1; // still 35 canonical words; no longer its transcript
     match aggregate(&m, &vk, &set, &common::TEST_BINDING, None) {
         Err(AggregateError::Tape(_)) => {}
         Err(e) => panic!("a tampered inner proof must fail at the tape replay, got {e:?}"),
@@ -545,12 +550,12 @@ fn the_admission_stub_vectors() {
     let vk_digest = randprotocol_rvm::shape::inner_vk_digest(&shape, &key);
     assert_eq!(
         hex_words(&vk_digest),
-        "ee072b7a8eb766c7de6fb4fffa1f9f1b6098c8971b1b49eec2f4e0091edadfbe",
+        "346ee1841980e46a3501f5b04cdf40dd3208e5b1c67360285353cf7a0b735fb9",
         "the inner vk digest is a deterministic constant of the fixture shape"
     );
     let pvs: Vec<Vec<u64>> = proofs.iter().map(|p| p.public_values.clone()).collect();
     let list = randprotocol_rvm::public_values::interface_words_bound(&shape, &key, &common::TEST_BINDING, &pvs);
-    assert_eq!(list.len(), 4 + 1 + 8 + 34 * 3);
+    assert_eq!(list.len(), 4 + 1 + 8 + 35 * 3);
     let digest = randprotocol_rvm::public_values::public_digest(&list);
     eprintln!("binding (8 words), hex: {}", hex_words(&common::TEST_BINDING.map(|x| F::from_u64(x as u64))));
     eprintln!("inner_vk_digest: {}", hex_words(&vk_digest));

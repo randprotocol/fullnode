@@ -709,9 +709,11 @@ fn phase_5_costs_the_measured_number_of_rows_per_inner_proof() {
     // measured Test-profile number (constraint set 7's shape; 11 205 in constraint set 6 — the
     // LogUp blind's five columns per instance and ZKM-1's 32-bit input/public/salt lanes widen
     // every opened leaf the query phase hashes, and the public table is floored at `2^7` rows;
-    // VERIFIER-1's per-round assertion hashes nothing); the production one lives in
-    // `docs/00-recursion-vm.md` and `pins.json`.
-    assert_eq!(exec.permutations(), 11_852, "51 transcript duplexes in phases 0–4, the rest is the query phase and phase 8's digest");
+    // VERIFIER-1's per-round assertion hashes nothing; constraint set 8 moved it 11 852 → 11 875:
+    // the cpu table's `GAS` column widens every opened main-trace leaf, and the 35th public value
+    // is observed and sponged — phase 8's list is 40 words, still ten permutations); the
+    // production one lives in `docs/00-recursion-vm.md` and `pins.json`.
+    assert_eq!(exec.permutations(), 11_875, "51 transcript duplexes in phases 0–4, the rest is the query phase and phase 8's digest");
 }
 
 /// Every assertion phase 5 makes is a *named* checkpoint, and the names are the interface Task 6's
@@ -754,7 +756,9 @@ fn phase_5s_assertions_are_all_named() {
 /// carries the On build's own, different, digest). Constraint set 7 re-recorded it (the Off
 /// replay compiles the inner AIR, which gained the LogUp blind's columns and bus on every
 /// instance and a public table floored at `2^7`, and embeds the inner key, whose salts HCS-1
-/// moved): `c1c04ac3…d731` → `989752d6…6e98`.
+/// moved): `c1c04ac3…d731` → `989752d6…6e98`. Constraint set 8 re-recorded it (the `GAS` column
+/// and the 35th public value; the key the program embeds moved with the AIR): `aafb1584…38ea` →
+/// `af772819…8425`.
 #[test]
 fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
     use randprotocol_rvm::dsl::Liveness;
@@ -770,9 +774,9 @@ fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
     let off = verify_rv32_with(&shape, &key, Checkpoints::Off, Liveness::Off, randprotocol_rvm::programs::Precompiles::Off);
     assert_eq!(
         randprotocol_rvm::programs::digest_hex(&off.program),
-        "aafb158456ff7e7ed742b48197b6fc3eb4925a0b2ae1a7ed3717bfb676cd38ea",
+        "af7728191e4ec0c1b8f6cc3d60aff36b04dc0d1b48b494aa9fbf107ebc708425",
         "the Off replay must reproduce the pre-Task-7 stream byte for byte (plus VERIFIER-1's \
-         per-round assertions, and constraint set 7's inner changes)"
+         per-round assertions, and constraint set 7's and 8's inner changes)"
     );
 
     let on = verify_rv32_with(&shape, &key, Checkpoints::Off, Liveness::On, randprotocol_rvm::programs::Precompiles::On);
@@ -804,15 +808,17 @@ fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
 /// VERIFIER-1 (2026-09-28, in the same constraint set) *is* a program change — one
 /// `commit pow witness[r]` assertion per FRI round in the shared pipeline. The claim above still
 /// holds for constraint-only fixes of the rVM's own AIR. Re-registered for constraint set 7 with
-/// VERIFIER-1: `1ec0c545…eeeb` → `5e04fba0…2993`.
+/// VERIFIER-1: `1ec0c545…eeeb` → `5e04fba0…2993`. Re-registered for constraint set 8 (the `GAS`
+/// column and the 35th public value move the inner shape and key; the deferred staged absorb,
+/// `dsl::hash::absorb_staged`, is itself a program change): `5e04fba0…2993` → `9eba7380…193d`.
 #[test]
 fn the_aggregate_program_digest_is_unchanged_by_rvm_constraint_fixes() {
     let (_p, shape, key) = one_test_proof();
     let vp = randprotocol_rvm::programs::verify_rv32n(&shape, &key, Checkpoints::Off);
     assert_eq!(
         randprotocol_rvm::programs::digest_hex(&vp.program),
-        "5e04fba0c0b900dcafbf37aa0acae87afb9ba2269f4d1970706ce2320b962993",
-        "the aggregate program's digest at the Test fixture shape, as re-registered for constraint set 7"
+        "9eba73805fa23361708d9ca1c58d904ac830aeb6810470ec7788c4f36880193d",
+        "the aggregate program's digest at the Test fixture shape, as re-registered for constraint set 8"
     );
 }
 

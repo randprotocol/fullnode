@@ -1,6 +1,6 @@
 //! The chain-facing aggregate API (spec §6, amended by M5.2's R5/R6 and M5.3's R6): `aggregate`
 //! turns N same-shape RV32-machine proofs into one rVM proof whose four batch public values are
-//! the interface digest of `[inner_vk_digest ‖ N ‖ B(8) ‖ 34·N]` — B the chain's
+//! the interface digest of `[inner_vk_digest ‖ N ‖ B(8) ‖ 35·N]` — B the chain's
 //! `H("rand-aggregate-bind-1", chain_id ‖ aggregator ‖ nonce)` (audit v3, AGG-2) — and
 //! `verify_aggregate` checks the digest the node recomputes from the covered bundles before the
 //! ordinary rVM `Machine::verify` — the cs6 `verify_public` pattern: the §4.4 list travels with
@@ -17,7 +17,7 @@ use crate::witness::{TapeError, WitnessTape};
 use p3_field::PrimeField64;
 use randprotocol_zkvm::tables::cpu::pv;
 
-/// The RV32 machine's `Proof` (its 34 public values ride inside it; the empty public segment's
+/// The RV32 machine's `Proof` (its 35 public values ride inside it; the empty public segment's
 /// `H_PUB` is a prover-computed constant of the shape, as in M5.1's fixtures).
 pub type InnerProof = randprotocol_zkvm::machine::Proof;
 

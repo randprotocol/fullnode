@@ -1,6 +1,6 @@
 //! The N-generic aggregate program (M5.3, ruling R1): one counted loop over the tape's `N`,
 //! each iteration the per-proof pipeline of `rv32.rs` over that proof's region with a fresh
-//! challenger (R2), then the interface digest over `[inner_vk_digest ‖ N ‖ B(8) ‖ 34·N]` (R5;
+//! challenger (R2), then the interface digest over `[inner_vk_digest ‖ N ‖ B(8) ‖ 35·N]` (R5;
 //! B = the chain's aggregate binding, audit v3's AGG-2).
 //!
 //! Shape-specialised per `InnerShape`, exactly as the single-proof program is: one program —
@@ -9,19 +9,20 @@
 //! interface digest's length runtime too, and the runtime length is what the one genuinely new
 //! piece here answers: the interface list is never materialised. Its words are absorbed into a
 //! running padding-free sponge as they exist — the vk digest as block zero, `N` as the next
-//! word, the eight binding words after it, and each proof's thirty-four public values as its
+//! word, the eight binding words after it, and each proof's thirty-five public values as its
 //! iteration accepts them — through a cursor cell tracking the next rate lane's absolute
 //! address (`dsl::hash::absorb_staged`). The state lives in eight *dedicated* cells: the
 //! pipeline hashes through the shared `Builder::hash_scratch` tens of thousands of times per
 //! iteration, and the interface sponge must survive that untouched.
 //!
-//! The absorb schedule is the host's (`public_values::public_digest`), word for word: a full
-//! block permutes when its fourth word lands, and the trailing partial block overwrites only its
-//! own lanes and permutes once. With the stream `[vk(4) ‖ N ‖ B(8) ‖ 34·N]`, the position after
-//! the last word is `(9 + 34N) mod 4 = (1 + 34N) mod 4 ∈ {1, 3}` for `N ≥ 1` — the eight
-//! binding words are exactly two rate fills, so they leave the schedule where the count word
-//! alone left it — never a block boundary, so the final permutation is unconditional, one row,
-//! no branch.
+//! The absorb schedule is the host's (`public_values::public_digest`), word for word: every
+//! block, the trailing partial one included, overwrites its own lanes and permutes exactly once.
+//! `absorb_staged` defers each block's permutation to the word that opens the next block, so
+//! after the last word a block is always pending and the final permutation is unconditional,
+//! one row, no branch — for every list length. (Before constraint set 8 the absorb permuted
+//! eagerly and this relied on `(9 + 34N) mod 4 ∈ {1, 3}` never landing on a block boundary; with
+//! cs8's 35 public values `(9 + 35N) mod 4 = (1 + 3N) mod 4` is `0` for every `N ≡ 1 (mod 4)`,
+//! where the eager schedule permuted twice and published a digest the host never computes.)
 
 use crate::dsl::hash;
 use crate::dsl::{Builder, Checkpoints, DIGEST_ELEMS};
@@ -57,7 +58,7 @@ pub fn verify_rv32n(shape: &InnerShape, key: &InnerKey, cp: Checkpoints) -> Veri
     }
 
     // ── the interface sponge's preamble. The state: zero lanes, the domain tag and the word
-    // count `4 + 1 + 8 + 34·N` in the capacity lanes — the count computed from the tape's `N`, so
+    // count `4 + 1 + 8 + 35·N` in the capacity lanes — the count computed from the tape's `N`, so
     // two different lengths are different digests by construction. Then the vk digest as block
     // zero, and `N` opening block one. The state and the cursor are addressed absolutely: they
     // live across the loop, and an absolute pointer claims no register the replay's loop
@@ -80,14 +81,13 @@ pub fn verify_rv32n(shape: &InnerShape, key: &InnerKey, cp: Checkpoints) -> Veri
     b.poseidon2(st);
     b.store(st, 0, n);
     // The cursor: the absolute address of the next rate lane to write, advanced by every
-    // absorbed word and rewound by every rate-fill permutation.
+    // absorbed word and rewound by every rate-fill permutation (taken when the next word arrives).
     let cursor = b.alloc_absolute(1);
     let first = b.constant(F::from_u64(b.addr_of(st) + 1));
     b.store(cursor, 0, first);
     // The binding words absorb next, from lane 1: eight words are exactly two rate fills, so
     // the cursor re-enters the loop's absorb schedule at the same lane the count word alone
-    // used to leave it in — the trailing partial-block analysis is the pre-binding one,
-    // unchanged.
+    // used to leave it in.
     for k in 0..8i64 {
         let v = b.load(bind, k);
         hash::absorb_staged(&mut b, st, cursor, v);
@@ -112,8 +112,8 @@ pub fn verify_rv32n(shape: &InnerShape, key: &InnerKey, cp: Checkpoints) -> Veri
     });
     b.note_phase("the N-proof loop");
 
-    // ── the trailing partial block always exists ((1 + 34N) mod 4 ∈ {1, 3}), so exactly one
-    // final permutation — then the digest's four lanes are the program's only public values,
+    // ── a block — full or partial — is always pending (`absorb_staged` defers each block's
+    // permutation to the next word), so exactly one final permutation — then the digest's four lanes are the program's only public values,
     // exactly as the single-proof program publishes them.
     b.poseidon2(st);
     for lane in 0..DIGEST_ELEMS as i64 {
