@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-codec"
-version = "0.6.2"
+version = "0.6.3"
 
 [[package]]
 name = "bs58"
@@ -5309,7 +5309,7 @@ dependencies = [
 
 [[package]]
 name = "randprotocol-client"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -5333,7 +5333,7 @@ dependencies = [
 
 [[package]]
 name = "randprotocol-core"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "bincode",
  "blake3",
@@ -5353,7 +5353,7 @@ dependencies = [
 
 [[package]]
 name = "randprotocol-node"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5389,7 +5389,7 @@ dependencies = [
 
 [[package]]
 name = "randprotocol-prover"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -5448,7 +5448,7 @@ dependencies = [
 
 [[package]]
 name = "randprotocol-zkvm"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "chacha20 0.10.2",
  "chacha20poly1305 0.11.0",

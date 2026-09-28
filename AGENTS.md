@@ -6,7 +6,67 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-28)
 
-### v0.6.2 — delegated proving, Phase 1 (2026-09-28; tagged `98d1ff6`, released — NOT rolled)
+### v0.6.3 — delegated proving, Phase 2: split authorisation (2026-09-29; chain 17 only)
+
+The bundle proof no longer takes the spend key. Spec `docs/superpowers/specs/2026-09-28-delegated-proving-design.md`
+§4–§5, plan `docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md` (10 tasks, every task
+reviewed, a whole-branch review, then one fix wave), user guide `docs/prover.md`; branch
+`feat/delegated-proving-2` + the chain-17 scripts of `feat/chain17-cut`. **A hard fork: `Bundle` gains
+`auth_commit` and `auth_proof` on the wire and the transaction id domain is `rand-txid-3`, so this
+build decodes none of chain 16's bundles and refuses chains 14, 15 and 16 at startup
+(`node::CHAINS_THIS_BUILD_CANNOT_RUN`, each hash with its reason). It runs chain 17 only — never roll
+it onto the chain-16 fleet; it lands with the chain-17 cut.** Phase 1's v0.6.2 stays the chain-16 build.
+**What it is:**
+
+- **Two guests, both fullnode-local** (`crates/randprotocol-zkvm/src/{auth.rs,guests.rs,hidden.rs}`,
+  excluded from `deploy/sync-zkvm.sh` — no circuits change): the **auth guest** (`hc_auth
+  1e4e347f…39c1`, domain `AUTH = 65`, inputs `sk ‖ salt`, publishes `c = H(AUTH, nk, salt)`; tier 10,
+  production proof 1.36 MB in ~7 s) and **bundle guest v3** (`hc_bundle 60af094a…3fce`, the v2 guest
+  reading `nk` at word 0 and the salt at 1204 — 1 212 words — deriving `pk`/nullifiers from `nk` and
+  folding `c` into its digest, preimage 89 words; tier 14 with 4 024 cycles / 273 permutations of
+  headroom; v1/v2 byte-identical). Pinned in `tests/guest_provenance.rs`; the §4.4 cheating suite
+  (`tests/hidden_cheating.rs`, six cases with real proofs) and `tests/auth_cheating.rs`.
+- **Consensus rule** (`Ledger::check_bundle_proof`, gated on genesis `hc_auth` — `Genesis.hc_auth`,
+  hashed after `hardening_v6`, paired with `hc_bundle` v3 both-or-neither at `genesis` and at
+  startup): on a v3 chain `auth_commit` must equal what the auth proof publishes (cheap, before any
+  STARK), the bundle digest is `hidden_bundle_digest_v3` with `c` in the preimage, and both proofs
+  verify against the transaction binding (`verify_bundle`, `verify_auth`); a pre-v3 chain requires
+  zero `auth_commit` and an empty `auth_proof`. `TxError::{AuthUnexpected, AuthMissing,
+  AuthMismatch, InvalidAuthProof}` are permanent. `warm_auth` beside `warm_bundle`.
+- **Node**: `rand-node genesis --bundle-guest v3 --auth-guest`; `rand_status` and `rand_getLimits`
+  serve `hc_auth`; `tx_json` shows `auth_commit` and `auth_proof_bytes` (randscan reads them there);
+  `--prover-fee`/`--prover-fee-address` on the hosted prover. `tests/split_auth.rs`: a real v3
+  transaction commits on a v3 genesis; a foreign-binding and a re-salted auth proof are refused.
+- **Prover**: `viewing_key` jobs for the v3 guest (exactly 1 212 words) from ANY pairing, own or not
+  (`prover_info.witness_kinds`); the **fee**: `run --fee <RAND> --fee-address <rand1…>` (both or
+  neither), quoted in `prover_info.fee {amount (base units, decimal string), address}`, checked in
+  the opened witness as one RAND output to the prover's `pk` of at least the quote (`-32006`;
+  ≥ 2^63 refused cheaply). The prover checks the fee OUTPUT, not its envelope — a wallet can seal
+  junk to it (griefing only; the RAND is lost to both).
+- **Wallet**: on a v3 chain `rand send` (and every bundle-paying command) makes a fresh 32-byte
+  salt, the auth proof locally (always — `sk` never leaves the wallet), and the bundle proof locally
+  or through `--prover` as a viewing-key job to whichever prover is paired; a non-own pairing prints
+  "this prover can read this wallet's whole history; it cannot spend" before y/N. The fee is one slot
+  (spec §5: token transfer/burn → slot 2 fee, slot 3 change; RAND transfer → slot 0 fee, slot 1 its
+  change, payment 2, change 3; a bundle paying nobody → slot 2; a single RAND note must be split
+  first), bounded by the global **`--max-prover-fee` (default 1 RAND; `0` refuses any)** at the one
+  read point of the quote — a hostile prover can otherwise quote anything and `--yes` pays it.
+  Prover-supplied strings are sanitised like memos. Refused before proving: a v3 `hc_bundle` whose
+  `hc_auth` is null or foreign, and the reverse. Pre-v3 chains send exactly as v0.6.2.
+- **Measured** (laptop, test profile): v3 bundle 102 s local / 108–111 s via a paired prover, auth
+  6.4–7.4 s; the 2026-09-29 end-to-end run (`docs/prover.md`): a non-own viewing-key-only
+  `rand-prover` proved a 5 RAND send, committed, payee credited. A transfer is ~2.85 MB of proofs
+  (1.49 + 1.36 MB) — one per 4 MiB block, ~7 per 20 MiB block; aggregation is the remedy.
+- **Trap — the wallet's remote path on a pre-v3 chain is unchanged** (a spend-key job to an own
+  prover); the same binary speaks both, decided by `rand_status.hc_bundle`.
+- **Open (v0.6.4+)**: the wallet does not remember the fee seen at pairing (a prover can raise its
+  price up to the cap); the spec §5 "prover assembles and broadcasts" paragraph is deferred (the
+  client submits); the prover keeping the fee note's opening; `docs/cli.md`'s genesis table lacks
+  the newer flags; `docs/architecture.md` still shows the 2-slot `Bundle`; the node-lib
+  `rpc::tests::a_pruned_height_answers_32010…` is a second load flake beside the recorded one
+  (passes alone). Clients Phase 2 re-vendors at this tag.
+
+### v0.6.2 — delegated proving, Phase 1 (2026-09-28; tagged `98d1ff6`, released; rolled to all 26 nodes 2026-09-29 by fullnode-cb)
 
 A wallet's bundle proof made on a machine its owner runs (a desktop proving for a phone, a home
 server for a laptop). Spec `docs/superpowers/specs/2026-09-28-delegated-proving-design.md`, plan
