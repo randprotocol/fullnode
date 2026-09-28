@@ -61,6 +61,27 @@ fn alloc_note_cmd(to: &str, amount: &str, asset: u32, envelope_bytes: Option<u32
     alloc_note(to, amount, asset, EnvelopeFormat::for_chain(envelope_bytes))
 }
 
+/// The gas section's one-line summary, printed by `genesis` and `init` alike (design
+/// 2026-09-28 §4.2, §4.3, §7.1): `gas: none` on a chain without one.
+fn gas_summary(g: Option<&randprotocol_core::gas::GasConfig>) -> String {
+    match g {
+        None => "gas: none".to_string(),
+        Some(g) => {
+            let dynamic = match &g.dynamic {
+                None => "off".to_string(),
+                Some(d) => format!(
+                    "target {} B / {} gas, adjust {} bps, floor {}/{}",
+                    d.target_block_bytes, d.target_block_gas, d.adjust_bps, d.min_gas_price, d.min_byte_price
+                ),
+            };
+            format!(
+                "gas: price {}/gas, {}/KiB, bundle limit {}, dynamic: {dynamic}",
+                g.gas_price, g.byte_price, g.bundle_gas_limit
+            )
+        }
+    }
+}
+
 fn alloc_note(addr: &str, amount: u64, asset: u32, format: EnvelopeFormat) -> Result<GenesisNote> {
     let to = ShieldedAddress::parse(addr).with_context(|| format!("{addr} is not a shielded address"))?;
     seal_deposit(&to, &Note::new(to.pk, [0; 8], amount, asset, 0), format)
@@ -384,6 +405,28 @@ enum Cmd {
         /// program-table floor. Absent, a node still refuses those at its pool, as policy.
         #[arg(long)]
         hardening_v6: bool,
+        /// The gas section (design 2026-09-28 §4.2, §4.3, §7.1): units of RAND per gas. Given,
+        /// the file gets a `gas` section (`metering: "circuit"`) and the price is part of the
+        /// genesis hash; omitted, the file has none, byte-for-byte today's shape. The section is
+        /// written only when this flag is given.
+        #[arg(long)]
+        gas_price: Option<u64>,
+        /// The gas section's price per KiB (or part of one) of call proof and input envelope,
+        /// from byte 0. Only meaningful with `--gas-price`; defaults to
+        /// [`randprotocol_core::gas::BYTE_PRICE_DEFAULT`] when that is given and this is not.
+        #[arg(long)]
+        byte_price: Option<u64>,
+        /// The gas section's flat bundle gas limit (spec §4.3): every bundle proof's declared
+        /// `GAS_LIMIT` must equal this exactly. Only meaningful with `--gas-price`; defaults to
+        /// `16 383` (today's tier-14 bundle guest) when that is given and this is not.
+        #[arg(long)]
+        bundle_gas_limit: Option<u64>,
+        /// Phase 2 (spec §7.1): the dynamic price controller, as
+        /// `<target_block_bytes>,<target_block_gas>,<adjust_bps>`. The floors (`min_gas_price`,
+        /// `min_byte_price`) are set to the section's own starting prices. Only meaningful with
+        /// `--gas-price`; omitted, the prices this command writes never move.
+        #[arg(long, value_name = "TARGET_BYTES,TARGET_GAS,ADJUST_BPS")]
+        gas_dynamic: Option<String>,
     },
     /// Print one genesis alloc note as JSON — the object that goes into a genesis file's `alloc`
     /// list — sealed to `--to` exactly as `genesis --alloc` seals one, so the owner's wallet finds
@@ -820,6 +863,10 @@ async fn main() -> Result<()> {
             bundle_guest,
             auth_guest,
             hardening_v6,
+            gas_price,
+            byte_price,
+            bundle_gas_limit,
+            gas_dynamic,
         } => {
             let hc_bundle = match bundle_guest.as_str() {
                 "v3" => ZkExecutor::hc_hidden_bundle_v3(),
@@ -840,6 +887,42 @@ async fn main() -> Result<()> {
                 ),
                 _ => {}
             }
+            // The gas section (spec §4.2, §4.3, §7.1): written only when `--gas-price` is given,
+            // so a chain cut without it hashes byte-for-byte as before.
+            let gas = match gas_price {
+                Some(gas_price) => Some(randprotocol_core::gas::GasConfig {
+                    gas_price,
+                    byte_price: byte_price.unwrap_or(randprotocol_core::gas::BYTE_PRICE_DEFAULT),
+                    bundle_gas_limit: bundle_gas_limit.unwrap_or(16_383),
+                    metering: randprotocol_core::gas::GasMetering::Circuit,
+                    dynamic: match &gas_dynamic {
+                        Some(spec) => {
+                            let parts: Vec<&str> = spec.split(',').collect();
+                            let [target_block_bytes, target_block_gas, adjust_bps] = parts.as_slice() else {
+                                anyhow::bail!(
+                                    "--gas-dynamic {spec} must be <target_block_bytes>,<target_block_gas>,<adjust_bps>"
+                                );
+                            };
+                            let byte_price = byte_price.unwrap_or(randprotocol_core::gas::BYTE_PRICE_DEFAULT);
+                            Some(randprotocol_core::gas::DynamicGas {
+                                target_block_bytes: target_block_bytes
+                                    .parse()
+                                    .with_context(|| format!("--gas-dynamic {spec}: bad target_block_bytes"))?,
+                                target_block_gas: target_block_gas
+                                    .parse()
+                                    .with_context(|| format!("--gas-dynamic {spec}: bad target_block_gas"))?,
+                                adjust_bps: adjust_bps
+                                    .parse()
+                                    .with_context(|| format!("--gas-dynamic {spec}: bad adjust_bps"))?,
+                                min_gas_price: gas_price,
+                                min_byte_price: byte_price,
+                            })
+                        }
+                        None => None,
+                    },
+                }),
+                None => None,
+            };
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -936,6 +1019,9 @@ async fn main() -> Result<()> {
                 // Split authorisation's auth guest (`--auth-guest`, only with `--bundle-guest v3`):
                 // absent otherwise, so a genesis cut without it hashes byte-for-byte as before.
                 hc_auth: auth_guest.then(|| word8_to_hex(&ZkExecutor::hc_auth())),
+                // The gas section: absent unless `--gas-price` is given, so a genesis cut
+                // without it hashes byte-for-byte as before.
+                gas,
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
@@ -970,6 +1056,7 @@ async fn main() -> Result<()> {
                 gen.hc_bundle,
                 gen.hc_auth.as_deref().unwrap_or("none"),
             );
+            println!("{}", gas_summary(state.ledger.gas()));
         }
         Cmd::AllocNote { to, amount, asset, envelope_bytes } => {
             println!("{}", serde_json::to_string_pretty(&alloc_note_cmd(&to, &amount, asset, envelope_bytes)?)?);
@@ -984,6 +1071,7 @@ async fn main() -> Result<()> {
             let storage = Storage::open(&datadir)?;
             storage.init_genesis(&gs)?;
             println!("initialised {} at genesis {} (chain id {})", datadir.display(), gs.hash(), gs.chain_id);
+            println!("{}", gas_summary(gs.ledger.gas()));
         }
         Cmd::Verify { datadir, mode, repair } => {
             let mode: VerifyMode = mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
@@ -2043,6 +2131,62 @@ mod tests {
         assert_ne!(built.hash(), pinned_genesis().build(&ZkExecutor::new(FriProfile::Test)).unwrap().hash());
     }
 
+    /// `rand-node genesis` takes the four gas flags (design 2026-09-28 §4.2, §4.3, §7.1); the
+    /// section is written only when `--gas-price` is given, and `--gas-dynamic` sets the
+    /// controller's floors to the section's own starting prices.
+    #[test]
+    fn the_genesis_command_takes_the_gas_flags() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["rand-node", "genesis", "--validator", "k,1000,p"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().cmd {
+                Cmd::Genesis { gas_price, byte_price, bundle_gas_limit, gas_dynamic, .. } => {
+                    (gas_price, byte_price, bundle_gas_limit, gas_dynamic)
+                }
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(parse(&[]), (None, None, None, None));
+        assert_eq!(
+            parse(&["--gas-price", "100", "--byte-price", "800", "--bundle-gas-limit", "16383"]),
+            (Some(100), Some(800), Some(16_383), None)
+        );
+        assert_eq!(
+            parse(&["--gas-price", "100", "--gas-dynamic", "2097152,262144,1250"]).3,
+            Some("2097152,262144,1250".to_string())
+        );
+
+        // Without `--gas-price` the other three flags parse but write no section: chain 15's
+        // shape, byte-for-byte.
+        let g = pinned_genesis();
+        assert!(g.gas.is_none());
+        assert!(!g.to_json().contains("\"gas\""));
+
+        // With `--gas-price`, byte_price and bundle_gas_limit take their CLI values (or the
+        // documented defaults), metering is "circuit", and gas_dynamic's three numbers plus the
+        // starting prices as floors build the `dynamic` sub-section.
+        let mut with_gas = pinned_genesis();
+        with_gas.gas = Some(randprotocol_core::gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: 16_383,
+            metering: randprotocol_core::gas::GasMetering::Circuit,
+            dynamic: Some(randprotocol_core::gas::DynamicGas {
+                target_block_bytes: 2_097_152,
+                target_block_gas: 262_144,
+                adjust_bps: 1250,
+                min_gas_price: 100,
+                min_byte_price: 800,
+            }),
+        });
+        let json = with_gas.to_json();
+        assert!(json.contains("\"gas_price\": \"100\""));
+        assert!(json.contains("\"metering\": \"circuit\""));
+        let built = with_gas.build(&ZkExecutor::new(FriProfile::Test)).unwrap();
+        assert_eq!(built.ledger.gas().unwrap().bundle_gas_limit, 16_383);
+        assert_ne!(built.hash(), pinned_genesis().build(&ZkExecutor::new(FriProfile::Test)).unwrap().hash());
+    }
+
     /// `rand-node alloc-note --envelope-bytes 1860` seals its note at exactly 1 860 bytes — the
     /// size a genesis carrying `envelope_bytes` demands of every alloc note — and without the
     /// flag at the legacy size (final review B4). The owner opens it either way.
@@ -2167,6 +2311,7 @@ mod tests {
             hc_auth: None,
             staking: None,
             vesting: None,
+            gas: None,
         }
     }
 

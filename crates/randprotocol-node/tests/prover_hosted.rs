@@ -47,6 +47,7 @@ fn genesis(validator: &Keypair) -> Genesis {
         vesting: None,
         hardening_v6: None,
         hc_auth: None,
+        gas: None,
     }
 }
 

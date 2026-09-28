@@ -3062,6 +3062,7 @@ pub(crate) mod fixtures {
             max_program_public_words: None,
             envelope_bytes: None,
             vesting: None,
+            gas: None,
             hardening_v6: None,
             hc_auth: None,
         }
@@ -3174,6 +3175,7 @@ pub(crate) mod fixtures {
             max_program_public_words: None,
             envelope_bytes: None,
             vesting: None,
+            gas: None,
             hardening_v6: None,
             hc_auth: None,
         }

@@ -600,6 +600,12 @@ pub struct Ledger {
     /// `None` keeps today's at-most-`MAX_ENVELOPE_BYTES` rule. A genesis parameter like the call
     /// limits: outside the state root and `Ledger`'s equality, restored by `reload_ledger`.
     envelope_bytes: Option<usize>,
+    /// Genesis `gas` (design 2026-09-28 §4.2, §4.3, §7.1): the chain's declared prices, the
+    /// bundle guest's flat gas limit, the metering scheme and (Phase 2) the dynamic price
+    /// controller's parameters, `None` on a chain whose file does not set one. A genesis
+    /// parameter like `max_program_words` and `envelope_bytes`: outside the state root and this
+    /// ledger's equality, restored by `reload_ledger` on every restart.
+    gas: Option<gas::GasConfig>,
     /// Genesis `hardening_v6`, the v0.6 switch: each stricter rule below is the node's pool policy
     /// on every chain and a validity rule here only when this is set (the zkVM/ISA review's R4,
     /// one activation for all of them):
@@ -750,6 +756,7 @@ impl Ledger {
             max_call_envelope_bytes: crate::types::actions::MAX_CALL_ENVELOPE_BYTES,
             max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
             envelope_bytes: None,
+            gas: None,
             hardening_v6: false,
             hc_auth: None,
             aggregators: BTreeMap::new(),
@@ -806,6 +813,7 @@ impl Ledger {
             max_call_envelope_bytes: crate::types::actions::MAX_CALL_ENVELOPE_BYTES,
             max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
             envelope_bytes: None,
+            gas: None,
             hardening_v6: false,
             hc_auth: None,
             aggregators: BTreeMap::new(),
@@ -1256,6 +1264,20 @@ impl Ledger {
     /// Set by genesis from `envelope_bytes`, and by `reload_ledger` on every restart.
     pub fn set_envelope_bytes(&mut self, bytes: Option<usize>) {
         self.envelope_bytes = bytes;
+    }
+
+    /// The gas section genesis set (`gas`, design 2026-09-28 §4.2, §4.3, §7.1), or `None` on a
+    /// chain whose file does not set one.
+    pub fn gas(&self) -> Option<&gas::GasConfig> {
+        self.gas.as_ref()
+    }
+
+    /// Set by genesis from `gas`. Not yet consumed by anything else in the tree — the fee floor
+    /// and price rules are a later task, spec §4.2 — and not yet restored by `reload_ledger` on
+    /// restart, like `max_program_words` and `envelope_bytes` are; that wiring is part of the
+    /// task that first reads this field.
+    pub fn set_gas(&mut self, g: Option<gas::GasConfig>) {
+        self.gas = g;
     }
 
     /// The note-envelope rule: exactly `envelope_bytes` when the genesis sets it, else at most

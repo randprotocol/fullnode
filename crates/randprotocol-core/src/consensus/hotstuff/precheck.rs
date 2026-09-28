@@ -260,6 +260,7 @@ mod tests {
             staking: None,
             envelope_bytes: None,
             vesting: None,
+            gas: None,
         };
         let gs = genesis.build(&StubExecutor).unwrap();
         let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
