@@ -28,7 +28,7 @@
 use axum::extract::State;
 use axum::routing::post;
 use randprotocol_client::governance::{self, GovState};
-use randprotocol_client::wallet::{self, NoteStore, Submission, Wallet};
+use randprotocol_client::wallet::{self, NoteStore, Submission, Wallet, Proving};
 use randprotocol_client::RpcClient;
 use randprotocol_core::bridge::gov::{list_message, register_message, unpause_message};
 use randprotocol_core::bridge::{Body, BridgeError, Payload, PqSignature, CHAIN_RAND};
@@ -291,7 +291,7 @@ async fn bridge_mint(
     wallet::check_pq_cosignatures(&state, CHAIN_ID, &attestation, &pq_signatures).expect("the quorum is well formed");
     let action = Action::BridgeAttest { attestation, recipient: to.clone(), r: note.r, time, asset: index, envelope, pq_signatures };
     let fee = gas::fee_floor(&action);
-    let s = wallet::submit_bridge_action(&n.rpc, relayer, store, action, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let s = wallet::submit_bridge_action(&n.rpc, relayer, store, action, fee, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the attestation's fee bundle commits");
     drop(slot);
@@ -312,7 +312,7 @@ async fn send_asset(n: &TestNode, from: &Wallet, store: &mut NoteStore, to: &Wal
         "",
         gas::fee_floor(&Action::None),
         FriProfile::Test,
-        Backend::Cpu,
+        &Proving::local(Backend::Cpu),
         CHAIN_ID,
         true,
     )
@@ -326,7 +326,7 @@ async fn send_asset(n: &TestNode, from: &Wallet, store: &mut NoteStore, to: &Wal
 /// A bridge-governance action on the deployer's fee bundle. Takes the proving slot.
 async fn submit_gov(n: &TestNode, w: &Wallet, store: &mut NoteStore, action: Action, fee: u64) -> Submission {
     let slot = proving_slot().await;
-    let s = wallet::submit_bridge_action(&n.rpc, w, store, action, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let s = wallet::submit_bridge_action(&n.rpc, w, store, action, fee, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the governance action commits");
     drop(slot);
@@ -573,7 +573,7 @@ async fn zusd_bridge_in_transfer_bridge_back_and_every_refusal() {
         evm_to(0x22),
         gas::BRIDGE_BURN_FEE,
         FriProfile::Test,
-        Backend::Cpu,
+        &Proving::local(Backend::Cpu),
         CHAIN_ID,
         false,
     )
@@ -618,7 +618,7 @@ async fn zusd_bridge_in_transfer_bridge_back_and_every_refusal() {
     // (a) more than the backing holds, though the token's supply and C's balance would cover it.
     let too_much = usdc_locked + 100 * ZUSD;
     assert!(too_much <= total_of(&supply) && too_much <= asset_balance(&n0, &c, zusd).await);
-    let e = wallet::submit_burn(&n0.rpc, &c, &mut c_store, zusd, too_much, 0, 2, usdc2(), evm_to(0x22), gas::BRIDGE_BURN_FEE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let e = wallet::submit_burn(&n0.rpc, &c, &mut c_store, zusd, too_much, 0, 2, usdc2(), evm_to(0x22), gas::BRIDGE_BURN_FEE, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect_err("the wallet refuses before proving");
     assert!(e.to_string().contains("only"), "{e}");
@@ -653,7 +653,7 @@ async fn zusd_bridge_in_transfer_bridge_back_and_every_refusal() {
     let burn2 = 100 * ZUSD;
     let usdt_before = locked_of(&token_supply(&n0, zusd).await, 2, &usdt2());
     let slot = proving_slot().await;
-    let burned2 = wallet::submit_burn(&n0.rpc, &c, &mut c_store, zusd, burn2, 0, 2, usdt2(), evm_to(0x22), gas::BRIDGE_BURN_FEE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let burned2 = wallet::submit_burn(&n0.rpc, &c, &mut c_store, zusd, burn2, 0, 2, usdt2(), evm_to(0x22), gas::BRIDGE_BURN_FEE, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("a burn still goes through while mints are paused");
     drop(slot);

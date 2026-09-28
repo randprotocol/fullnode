@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 randprotocol-core = { workspace = true }
 randprotocol-zkvm = { workspace = true }
+# The delegated-proving wire (sealed job, sealed reply, pairing link) — never the service half.
+randprotocol-prover = { workspace = true, default-features = false }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -20,6 +22,8 @@ serde_json = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+# The prover job's token and reply key are wiped after use (`prover.rs`).
+zeroize = { workspace = true }
 clap = { workspace = true }
 # `rand address --qr`/`--qr-png` and `rand contacts show --qr` (spec 2026-09-26 §2.2).
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
