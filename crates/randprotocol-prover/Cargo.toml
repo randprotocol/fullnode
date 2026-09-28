@@ -48,3 +48,12 @@ tempfile = { workspace = true }
 [[test]]
 name = "service"
 required-features = ["service"]
+
+[[test]]
+name = "http"
+required-features = ["service"]
+
+[[bin]]
+name = "rand-prover"
+path = "src/main.rs"
+required-features = ["service"]
