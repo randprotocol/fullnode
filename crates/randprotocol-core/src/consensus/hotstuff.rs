@@ -1150,13 +1150,17 @@ impl HotStuff {
             };
             cb.len().cmp(&ca.len()).then_with(|| Hash::digest(pa).cmp(&Hash::digest(pb)))
         });
+        // Phase 2 (spec §7.1): the calls' gas, for the controller at the block's end — summed
+        // exactly as `apply_block_for_sync` sums its receipts.
+        let mut call_gas = 0u64;
         for tx in ordinary {
             // Apply on a trial clone: a transaction that fails part-way through
             // must not leave the cumulative ledger dirty for the next candidate
             // or for the state root committed to the header. B5: with the admission
             // cache along, a candidate's proofs are not verified a second time here.
             let mut trial = ledger.clone();
-            if trial.apply_tx_with(&tx, &me, self.executor.as_ref(), self.verified.as_ref()).is_ok() {
+            if let Ok(receipt) = trial.apply_tx_with(&tx, &me, self.executor.as_ref(), self.verified.as_ref()) {
+                call_gas = call_gas.saturating_add(receipt.map_or(0, |r| r.gas_used));
                 ledger = trial;
                 txs.push(tx);
             }
@@ -1175,7 +1179,8 @@ impl HotStuff {
             }
         }
         // The same block-end steps `apply_block_for_sync` runs before it recomputes the root.
-        ledger.close_block(height, &me);
+        let (bytes_used, gas_used) = ledger.block_usage(&txs, call_gas);
+        ledger.close_block(height, &me, bytes_used, gas_used);
         let header = BlockHeader {
             height: parent.block.height() + 1,
             view,

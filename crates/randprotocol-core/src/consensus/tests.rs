@@ -951,7 +951,7 @@ fn a_resumed_validator_keeps_its_lock() {
     after.set_height(height);
     after.set_timestamp_ms(sim.now);
     after.apply_transactions(&[], &proposer_addr, &StubExecutor).expect("an empty block applies");
-    after.close_block(height, &proposer_addr);
+    after.close_block(height, &proposer_addr, 0, 0);
     let header = crate::types::BlockHeader {
         height,
         view,
@@ -2089,7 +2089,7 @@ fn block_on_head(sim: &Sim, node: usize, view: u64, timestamp_ms: u64) -> Block 
     after.set_height(height);
     after.set_timestamp_ms(timestamp_ms);
     after.apply_transactions(&[], &proposer_addr, &StubExecutor).expect("an empty block applies");
-    after.close_block(height, &proposer_addr);
+    after.close_block(height, &proposer_addr, 0, 0);
     let justify = match sim.committed[node].last() {
         Some(cb) => cb.qc.clone(),
         None => QuorumCertificate::genesis(parent_hash),
@@ -2430,7 +2430,7 @@ fn a_resumed_validator_finds_its_locked_block_without_a_fetch() {
     after.set_height(header.height);
     after.set_timestamp_ms(header.timestamp_ms);
     after.apply_transactions(&[], &header.proposer.address(), &StubExecutor).unwrap();
-    after.close_block(header.height, &header.proposer.address());
+    after.close_block(header.height, &header.proposer.address(), 0, 0);
     header.state_root = after.state_root();
     header.tx_root = Block::tx_root(&[]);
     header.justify = qc.clone();
