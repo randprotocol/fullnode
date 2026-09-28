@@ -6,6 +6,70 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-28)
 
+### v0.6.2 — delegated proving, Phase 1 (2026-09-28; tag pending v0.6.1 / chain 16)
+
+A wallet's bundle proof made on a machine its owner runs (a desktop proving for a phone, a home
+server for a laptop). Spec `docs/superpowers/specs/2026-09-28-delegated-proving-design.md`, plan
+`docs/superpowers/plans/2026-09-28-delegated-proving-phase1.md`, user guide `docs/prover.md`;
+branch `feat/delegated-proving`, to be rebased onto the `v0.6.1` tag and bumped to 0.6.2 before the
+tag. **Trust model, in the spec's words: "delegating a proof is handing over custody"** — today's
+guest takes `sk` as a private input, so a Phase 1 prover can spend for every wallet it proves for.
+**What it is:**
+
+- **Crate `randprotocol-prover`**: the sealed wire (`wire.rs`, ML-KEM-768 + ChaCha20-Poly1305, the reply under a one-time key, the
+  pairing token inside the seal), the prover key and pairing store (`key.rs`, `pairing.rs`,
+  `randprover:` links, `own=1` only with `pair --own`), the queue (`service.rs`: per-pairing cap 2,
+  `max_queue` 8, `max_parallel` 1, witnesses zeroized; `Service::shutdown` drops the queue, lets a
+  proof in flight finish and discards its reply), the `prover_*` JSON-RPC listener (`http.rs`,
+  CORS preflight 204 / `Allow-Origin: *`, `serve_on` a pre-bound listener), a free-memory gate.
+  `prover_info` is unauthenticated; a Phase 1 prover's `fee` is `null`.
+- **Binary `rand-prover`** (`keygen`, `pair`, `unpair`, `pairings`, `run`; plain HTTP on `127.0.0.1:8600`, TLS by a
+  fronting proxy). `run` refuses every `SpendKey` job without `--accept-spend-key`, which prints its
+  sentence on stderr, not only in the log.
+- **`rand-node run --prover <ADDR>`** (`--prover-home`, `-accept-spend-key`, `-max-parallel`,
+  `-max-queue`, `-cuda`, `-skip-memory-check`): hosted by `hosted_prover` on **its own listener,
+  never a method of the RPC** (an address equal to `--rpc`, or a wildcard on its port, is refused);
+  every check and the bind happen **before the node key is read or the database opened**; a
+  prover listener that exits stops the node. On the way out: `Service::shutdown`, then the node,
+  then the listener aborted (the order is load-bearing — the other way admits jobs while stopping).
+- **Wallet**: `Proving::Remote`, `rand prover pair|show|forget` (`<key>.prover.json`, 0600, one
+  pairing; `pair` checks the prover answers with the link's fingerprint), the global `--prover`
+  on every bundle-proving command (`call`: only the paying bundle moves; `--prover --cuda` refused
+  except `call`'s call proof). Checks: fingerprint, guest in `hc_bundles`, profile, `spend_key` in
+  `witness_kinds`, **`own=1` for a spend-key witness**; on the reply the size cap
+  (`max_proof_bytes`), **the digest read FROM THE PROOF's public values** (never the reply's field
+  — a tainted witness still proves), the field agrees, then a local `verify_bundle` by default
+  (`RAND_PROVER_NO_VERIFY=1` skips only that). URL rule: `https://` anywhere, `http://` only to
+  `localhost`/`127.0.0.1`/`[::1]`, userinfo refused, the parsed host is the one checked. Polls
+  retry through outages, give up (and cancel) after 20 min.
+- **NOT in it:** Phase 2 (split authorisation, `ViewingKey` jobs — the prover gets `nk`, can read but
+  not spend; needs a guest change and a genesis), fees (`fee: null`), any market or discovery.
+- **Roll: node-only and optional** — no consensus, wire or genesis change; `--prover` is off by
+  default. **One behaviour change every `rand-node` gets: SIGTERM is handled like ctrl-c** (graceful
+  `systemctl stop`, where it used to be killed outright); a unit with `--prover` wants
+  `TimeoutStopSec=180` (a proof in flight finishes, ~100 s).
+- **Traps found while building:** the chacha20poly1305 `zeroize` feature must be on or copies of
+  the cipher key survive; a hygiene test must not scan sealed ciphertext with short needles (random
+  hex matches — false positives); `Vec::zeroize` truncates, so assert `is_empty`, not all-zero; a
+  wallet must never trust the prover's claimed digest — read it off the proof; URL userinfo
+  (`http://localhost:80@evil.com/`) bypasses a host check unless the URL is parsed; tracing-only
+  warnings are silenceable by `RUST_LOG` — misconfiguration and the spend-key sentence go through
+  `eprintln!` too; the zkvm/mock-cuda tests do not build on the laptop because the sibling
+  `circuits` symlink points at `main` while the vendored code is constraint set 7
+  (`/private/tmp/circuits-cs7` is the matching checkout); a wrong Co-Authored-By trailer is fixed
+  with `git filter-branch` / `--amend`, not a new commit.
+- **Suite on the laptop (pre-rebase):** core 521+3, prover 1+4+2+6+9+11 (hygiene 108 s), client lib
+  130→135, node lib 374 with 26 fixture-gap failures (RECURSION_FIXTURES), wallet_flow 7 (1625 s;
+  one send proved through a paired prover on a v2-guest chain), cluster 26 (1319 s), zusd_e2e 2
+  (1767 s), ws 9, genesis_cli 3, prover_flag 2, prover_hosted 3, submit 2, node bins 21,
+  bridge-codec 4.
+- **Companions:** clients repo `feat/delegated-proving` — core `prepare_*`/`finish_proof`, the
+  engine's prover group with resume, Settings pairing, desktop "Prove for my other devices",
+  extension boot resume, a Node e2e wasm → `rand-prover` → node in 126 s; the clients also found
+  and fixed a hard-coded `production` FRI profile and a local path that always proved the v1 guest.
+- **Open (v0.6.3 / Phase 2):** `docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md`.
+
+### v0.6.1 — constraint set 7 (2026-09-28, branch `feat/v061`; NOT tagged, NOT rolled)
 ### Chain 16 — LIVE 2026-09-28 16:39 UTC (genesis `20925ae6…3005`, build v0.6.1 `2c75e08`)
 
 Genesis `20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005`, chain id **16**, file
