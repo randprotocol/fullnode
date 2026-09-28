@@ -85,7 +85,6 @@ guest takes `sk` as a private input, so a Phase 1 prover can spend for every wal
   and fixed a hard-coded `production` FRI profile and a local path that always proved the v1 guest.
 - **Open (v0.6.3 / Phase 2):** `docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md`.
 
-### v0.6.1 — constraint set 7 (2026-09-28, branch `feat/v061`; NOT tagged, NOT rolled)
 ### Chain 16 — LIVE 2026-09-28 16:39 UTC (genesis `20925ae6…3005`, build v0.6.1 `2c75e08`)
 
 Genesis `20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005`, chain id **16**, file
