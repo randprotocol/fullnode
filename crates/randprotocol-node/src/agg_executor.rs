@@ -274,7 +274,13 @@ impl ConfidentialExecutor for AggExecutor {
         }
         let outputs = std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32);
         let h_in = std::array::from_fn(|i| proof.public_values[pv::IN0 + i] as u32);
-        Ok(CallOutcome { tier: proof.tier.0 as u8, outputs, h_in })
+        Ok(CallOutcome {
+            tier: proof.tier.0 as u8,
+            outputs,
+            h_in,
+            keccak_log_height: proof.keccak_log_height,
+            sha256_log_height: proof.sha256_log_height,
+        })
     }
 
     fn warm(&self, program: &ProgramRecord) {

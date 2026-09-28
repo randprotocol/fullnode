@@ -162,6 +162,18 @@ pub struct CallOutcome {
     /// per-call key or an auditor key could open the transcript, and nobody could check an
     /// opened one against `hash::input_digest(salt, inputs)`.
     pub h_in: Word8,
+    /// The proof's declared keccak-table height (`0` = no table): with `tier` and
+    /// `sha256_log_height`, what `gas::gas_max` prices a call by (spec 2026-09-28 §4.1).
+    pub keccak_log_height: u8,
+    /// The declared sha256-table height, `0` = none.
+    pub sha256_log_height: u8,
+}
+
+impl CallOutcome {
+    /// The gas ceiling this proof's header implies (`gas::gas_max`).
+    pub fn gas_max(&self) -> u64 {
+        crate::gas::gas_max(self.tier, self.keccak_log_height, self.sha256_log_height)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

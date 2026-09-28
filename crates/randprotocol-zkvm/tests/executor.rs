@@ -32,6 +32,8 @@ fn verifies_a_real_proof_and_reports_outputs() {
     let ex = ZkExecutor::new(FriProfile::Test);
     let rec = record(&p);
     let out = ex.verify_call(&rec, proof).unwrap();
+    assert_eq!((out.keccak_log_height, out.sha256_log_height), (0, 0), "fib calls no hash syscall");
+    assert_eq!(out.gas_max(), randprotocol_core::gas::gas_max(out.tier, 0, 0));
     assert_eq!(out.tier, *tier);
     assert_eq!(out.outputs, *outputs);
     assert_eq!(out.outputs[0], 1, "sum 1025 >= 1000 -> transfer");
