@@ -60,6 +60,8 @@ pub struct Claims {
     /// See [`claimed_token_slot`]: a token's `mint_nonce` for a `TokenMint` or `SetAuthority`,
     /// the registry index for a `RegisterToken`, `None` otherwise.
     pub token: Option<TokenClaim>,
+    /// The floor this transaction was admitted against (spec 2026-09-28 §7's ordering key).
+    pub floor: u64,
 }
 
 /// A token-registry slot at most one pooled transaction may hold (H4 review minor): the ledger
@@ -117,6 +119,8 @@ struct Pooled {
     /// `tx.encoded_len()`, taken once at admission: that is a full re-encode (a ~1.2 MB proof
     /// included), and `info` and `candidates_within` would otherwise pay it per entry per call.
     len: usize,
+    /// The floor this transaction was admitted against — see [`Claims::floor`].
+    floor: u64,
 }
 
 /// The register nonce a bundle-less `Unbond` or `Withdraw` claims — and the aggregator
@@ -217,6 +221,10 @@ pub struct Mempool {
     /// RESCAN-LEDGER-1), set once by the node from its genesis. `None` — a pool nobody configured,
     /// every unit test's — is no policy, the ledger's rule alone.
     faucet_minters: Option<BTreeSet<Address>>,
+    /// This node's gas policy (spec 2026-09-28 §4.1, Phase 0), set once from its
+    /// `--gas-price`/`--byte-price`. `None` — a pool nobody configured, every unit test's — is no
+    /// policy, the ledger's own `fee_floor` alone.
+    gas_policy: Option<randprotocol_core::gas::GasPolicy>,
 }
 
 /// Every commitment `tx` claims: the ones it carries, plus the deposit `ledger` would derive for
@@ -253,6 +261,7 @@ impl Mempool {
             bytes: 0,
             max_size,
             faucet_minters: None,
+            gas_policy: None,
         }
     }
 
@@ -260,6 +269,25 @@ impl Mempool {
     /// once, with what its genesis names; the set never changes while the process runs.
     pub fn set_faucet_minters(&mut self, minters: BTreeSet<Address>) {
         self.faucet_minters = Some(minters);
+    }
+
+    /// Price calls by their proof header (spec 2026-09-28 §4.1, Phase 0). The node calls this
+    /// once from its `--gas-price`/`--byte-price`; the policy never changes while it runs.
+    pub fn set_gas_policy(&mut self, policy: randprotocol_core::gas::GasPolicy) {
+        self.gas_policy = Some(policy);
+    }
+
+    /// The floor `tx` must pay here: the gas policy's for a call under one, the schedule's
+    /// otherwise — refusing below it.
+    fn gas_policy_floor(&self, tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> Result<u64, TxError> {
+        let floor = match &self.gas_policy {
+            Some(p) => crate::admission::call_floor(tx, ledger, executor, p)?,
+            None => randprotocol_core::gas::fee_floor(&tx.action),
+        };
+        match crate::admission::fee_below_floor(tx, floor) {
+            Some(e) => Err(e),
+            None => Ok(floor),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -310,6 +338,8 @@ impl Mempool {
         // The pool's policies (the faucet minter rule, COV-2's call screen) after the ledger's own
         // verdict: this path runs no `precheck`, and it is the one a local `rand_mint` takes.
         self.pool_policy(&tx, ledger).map_err(MempoolError::Invalid)?;
+        let mut c = c;
+        c.floor = self.gas_policy_floor(&tx, ledger, executor).map_err(MempoolError::Invalid)?;
         Ok(self.admit(tx, c))
     }
 
@@ -370,7 +400,7 @@ impl Mempool {
         if !is_governance(&tx.action) && self.txs.len() >= self.max_size {
             return Err(MempoolError::Full);
         }
-        Ok(Claims { commitments, claim, token })
+        Ok(Claims { commitments, claim, token, floor: randprotocol_core::gas::fee_floor(&tx.action) })
     }
 
     /// Everything the pool can decide about a transaction without verifying a proof: the pool
@@ -396,6 +426,8 @@ impl Mempool {
         let c = self.pool_conflicts(tx, ledger, executor)?;
         Self::applies(tx, &c.commitments, c.claim, ledger).map_err(MempoolError::Invalid)?;
         self.pool_policy(tx, ledger).map_err(MempoolError::Invalid)?;
+        let mut c = c;
+        c.floor = self.gas_policy_floor(tx, ledger, executor).map_err(MempoolError::Invalid)?;
         Ok(c)
     }
 
@@ -457,7 +489,7 @@ impl Mempool {
     /// [`Mempool::pool_conflicts`] for this transaction, so no index entry written here can collide
     /// with one that exists.
     fn admit(&mut self, tx: Transaction, c: Claims) -> Hash {
-        let Claims { commitments, claim, token } = c;
+        let Claims { commitments, claim, token, floor } = c;
         let hash = tx.hash();
         for nf in tx.nullifiers() {
             self.nullifiers.insert(nf, hash);
@@ -478,14 +510,15 @@ impl Mempool {
         self.bytes += len;
         // `pool_conflicts` refuses a hash already pooled, so nothing is replaced here; if that
         // ever changes, the replaced entry's bytes must leave the total with it.
-        if let Some(old) = self.txs.insert(hash, Pooled { tx, commitments, claim, token, since: Instant::now(), len }) {
+        if let Some(old) = self.txs.insert(hash, Pooled { tx, commitments, claim, token, since: Instant::now(), len, floor }) {
             self.bytes -= old.len;
         }
         hash
     }
 
-    /// Transactions ready for inclusion on top of `ledger`, highest fee first and ties broken by
-    /// hash so every honest proposer building on the same pool picks the same block.
+    /// Transactions ready for inclusion on top of `ledger`, highest surplus per KiB first, then
+    /// fee, and ties broken by hash so every honest proposer building on the same pool picks the
+    /// same block.
     pub fn candidates(&self, ledger: &Ledger, max: usize) -> Vec<Transaction> {
         self.candidates_within(ledger, max, usize::MAX)
     }
@@ -519,13 +552,17 @@ impl Mempool {
     pub fn candidates_within(&self, ledger: &Ledger, max: usize, max_bytes: usize) -> Vec<Transaction> {
         let mut ready: Vec<(&Hash, &Pooled)> =
             self.txs.iter().filter(|(_, p)| Self::still_applies(p, ledger)).collect();
-        // Governance first, then fee-descending, then by hash (node I4). A `PauseMints` pays
+        // Spec 2026-09-28 §7: governance first, then the fee above the admitted floor per KiB of
+        // transaction (bytes are what a block is short of), then total fee, then hash so every
+        // honest proposer on the same pool picks the same block. A `PauseMints` pays
         // `fee() == 0` by design — it must work from a wallet holding no RAND at all — so fee
         // order sorted the emergency brake behind every transaction that pays, which is the
         // wrong end of a block while a compromised guardian set is minting.
+        let surplus_per_kib = |p: &Pooled| (p.tx.fee().saturating_sub(p.floor) as u128 * 1024) / p.len.max(1) as u128;
         ready.sort_by(|a, b| {
             is_governance(&b.1.tx.action)
                 .cmp(&is_governance(&a.1.tx.action))
+                .then_with(|| surplus_per_kib(b.1).cmp(&surplus_per_kib(a.1)))
                 .then_with(|| b.1.tx.fee().cmp(&a.1.tx.fee()))
                 .then_with(|| a.0.cmp(b.0))
         });
@@ -2300,4 +2337,114 @@ mod tests {
         }
     }
 
+    /// A ledger with a four-word program deployed, its id, and a call to it at `tier` paying
+    /// `fee`, on fresh nullifiers `n..n+4`.
+    fn program_and_call(tier: u8, fee: u64, n: u8) -> (Ledger, randprotocol_core::program::ProgramId, Transaction) {
+        use randprotocol_core::confidential::StubExecutor;
+        let gs = fixtures::genesis(1);
+        let mut ledger = gs.ledger.clone();
+        let words = vec![0x13u32; 4];
+        let pid = randprotocol_core::program::program_id(0, &words);
+        let with_bundle = |l: &Ledger, a: u8, fee: u64, action| {
+            let a = a as u32;
+            let b = fixtures::bundle_tx(l, [[a; 8], [a + 1; 8]], [[a + 2; 8], [a + 3; 8]], fee).bundle.expect("bundle");
+            StubExecutor::bound(Transaction::shielded(gs.chain_id, b, action))
+        };
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
+        let deploy = with_bundle(&ledger, 40, randprotocol_core::gas::fee_floor(&deploy), deploy);
+        ledger.apply_tx(&deploy, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        ledger.record_anchor(ledger.height());
+        let call = with_bundle(
+            &ledger,
+            n,
+            fee,
+            Action::Call { program: pid, proof: StubExecutor::make_proof_with_public(&pid, tier, [7; 8], &[]), input_envelope: None },
+        );
+        (ledger, pid, call)
+    }
+
+    /// Spec 2026-09-28 §4.1: under a policy a call must pay `GasPolicy::call_floor` of its
+    /// header; at the ledger's old floor it is refused, naming the policy's minimum, and the
+    /// verdict is not permanent.
+    #[test]
+    fn a_call_under_the_policy_floor_is_refused_at_precheck() {
+        use randprotocol_core::gas::{self, GasPolicy};
+        // Tier 14, not the brief's 12: at tier 12 (cycles 4 095, GAS_PRICE_DEFAULT 100) the
+        // gas-priced floor is 1 410 300 against the old schedule's 2 100 000 — the ledger's own
+        // floor dominates the `max` in `GasPolicy::call_floor` and `want == old`, so the refusal
+        // this test exists to demonstrate cannot happen there. Tier 14 (cycles 16 383) is the
+        // first step where the gas price's `100 × cycles` term overtakes the flat per-tier-step
+        // schedule; verified against the built `GasPolicy::DEFAULT` before writing this in.
+        let stub_len = StubExecutor::make_proof_with_public(&Hash::ZERO, 14, [0; 8], &[]).len();
+        let old = gas::BUNDLE_BASE + gas::call_fee(14, stub_len);
+        let want = GasPolicy::DEFAULT.call_floor(14, 0, 0, stub_len);
+        assert!(want > old);
+        let (ledger, _, call) = program_and_call(14, old, 50);
+        let mut m = Mempool::new(64);
+        m.set_gas_policy(GasPolicy::DEFAULT);
+        assert_eq!(
+            m.precheck(&call, &ledger, &StubExecutor).unwrap_err(),
+            MempoolError::Invalid(TxError::FeeTooLow { min: want, fee: old })
+        );
+        assert!(!crate::admission::is_permanent(&TxError::FeeTooLow { min: want, fee: old }));
+        // `insert` (the local `rand_sendTransaction` path) applies it too.
+        assert_eq!(m.insert(call, &ledger, &StubExecutor).unwrap_err(), MempoolError::Invalid(TxError::FeeTooLow { min: want, fee: old }));
+        // At the policy floor it pools, and its claims carry that floor.
+        let (ledger, _, paid) = program_and_call(14, want, 60);
+        let c = m.precheck(&paid, &ledger, &StubExecutor).unwrap();
+        assert_eq!(c.floor, want);
+        m.insert(paid, &ledger, &StubExecutor).unwrap();
+        // Without a policy the old floor pools, and the claims carry the ledger's floor.
+        let (ledger, _, call) = program_and_call(14, old, 70);
+        let n = Mempool::new(64);
+        assert_eq!(n.precheck(&call, &ledger, &StubExecutor).unwrap().floor, gas::fee_floor(&call.action));
+    }
+
+    /// Review focus 1 and 2: the policy check never decodes a proof it should not.
+    #[test]
+    fn an_unknown_programs_call_is_refused_before_its_proof_is_decoded() {
+        let (ledger, _, call) = program_and_call(12, u64::MAX / 2, 50);
+        let unknown = Hash::digest(b"no such program");
+        let Action::Call { proof, .. } = &call.action else { unreachable!() };
+        let tx = StubExecutor::bound(Transaction::shielded(
+            ledger.chain_id(),
+            call.bundle.clone().unwrap(),
+            Action::Call { program: unknown, proof: proof.clone(), input_envelope: None },
+        ));
+        let r = crate::admission::call_floor(&tx, &ledger, &StubExecutor, &randprotocol_core::gas::GasPolicy::DEFAULT);
+        assert_eq!(r.unwrap_err(), TxError::UnknownProgram(unknown));
+    }
+
+    #[test]
+    fn an_oversized_proof_is_refused_before_the_policy_decodes_it() {
+        let (ledger, pid, call) = program_and_call(12, u64::MAX / 2, 50);
+        let over = vec![0u8; ledger.max_proof_bytes() + 1];
+        let tx = StubExecutor::bound(Transaction::shielded(
+            ledger.chain_id(),
+            call.bundle.clone().unwrap(),
+            Action::Call { program: pid, proof: over, input_envelope: None },
+        ));
+        let r = crate::admission::call_floor(&tx, &ledger, &StubExecutor, &randprotocol_core::gas::GasPolicy::DEFAULT);
+        assert_eq!(r.unwrap_err(), TxError::ProofTooLarge);
+    }
+
+    /// Spec §7: candidates order by fee above the floor per KiB, governance first. A big call
+    /// paying a little more in total sorts behind a small transfer paying more per KiB.
+    #[test]
+    fn candidates_order_by_surplus_per_kib() {
+        use randprotocol_core::gas;
+        // The stub call proof is ~110 B, so the call is only slightly bigger than the transfer;
+        // give it the smaller surplus (3 000 over its floor against the transfer's 5 000) so the
+        // per-KiB key, not the total, decides.
+        let (ledger, _, call) = program_and_call(12, gas::GasPolicy::DEFAULT.call_floor(12, 0, 0, 200) + 3_000, 50);
+        let mut m = Mempool::new(64);
+        m.set_gas_policy(gas::GasPolicy::DEFAULT);
+        let transfer = fixtures::bundle_tx(&ledger, [[80; 8], [81; 8]], [[82; 8], [83; 8]], gas::BUNDLE_BASE + 5_000);
+        let call_hash = m.insert(call.clone(), &ledger, &StubExecutor).unwrap();
+        let transfer_hash = m.insert(transfer.clone(), &ledger, &StubExecutor).unwrap();
+        assert!(call.encoded_len() > transfer.encoded_len(), "the call is the bigger transaction");
+        assert!(call.fee() > transfer.fee(), "and pays more in total");
+        let picked: Vec<Hash> = m.candidates(&ledger, 10).iter().map(|t| t.hash()).collect();
+        assert_eq!(picked, vec![transfer_hash, call_hash], "more surplus per KiB first");
+    }
 }
