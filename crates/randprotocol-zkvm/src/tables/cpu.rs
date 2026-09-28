@@ -263,7 +263,18 @@ pub mod col {
     /// RV32I's `(rs1 + imm) & !1` drops — so `NEXT_PC = ALU_OUT - JALR_B0`. Boolean, and zero on
     /// every row that is not a `JALR`. Appended at the end of the column list.
     pub const JALR_B0: usize = SYS_HASH_LEN + 1;
-    pub const WIDTH: usize = JALR_B0 + 1;
+    /// Constraint set 8 (fullnode spec 2026-09-28 §4.2): the gas accumulated *through* this row —
+    /// `1` on row 0 (always a digest row, weight 1), then on every real row the previous row's
+    /// `GAS` plus this row's weight `1 + 2·IS_HASH + 191·SYS_KECCAK + 63·SYS_SHA256`
+    /// (`gas::row_gas`'s constants). Read once, on the `HALT` row, against `pv::GAS`; unconstrained
+    /// on padding rows (the fill copies the halt row's value forward). Appended at the end of the
+    /// column list.
+    pub const GAS: usize = JALR_B0 + 1;
+    /// Constraint set 8: the four byte limbs (`RANGE8`-checked on the `HALT` row, zero on every
+    /// other row) of `pv::GAS − GAS` on the `HALT` row — they prove `GAS ≤ GAS_LIMIT` without
+    /// publishing the run's gas. `GD0 + k` is limb `k`, little-endian.
+    pub const GD0: usize = GAS + 1;
+    pub const WIDTH: usize = GD0 + 4;
     /// Columns that must be zero on padding rows.
     pub const SELECTORS: [usize; 31] = [
         IS_ALU, IS_IMM, IS_BRANCH, IS_LB, IS_LH, IS_LW, IS_SB, IS_SH, IS_SW, SIGNED,
@@ -302,7 +313,12 @@ pub mod pv {
     /// *is* checkable by a verifier: `Machine::verify_public` recomputes
     /// `hash::public_digest(words)` from the words the chain publishes and compares.
     pub const PUB0: usize = IN0 + 8;
-    pub const NUM: usize = PUB0 + 8; // 34
+    /// Constraint set 8: the gas limit this proof declares (`gas.rs`'s module doc), the last
+    /// public value. `Machine::verify`'s `check_public_values` refuses a proof whose declared
+    /// limit exceeds what its own header (`tier`, `keccak_log_height`, `sha256_log_height`)
+    /// could possibly need (`gas::gas_max`).
+    pub const GAS: usize = PUB0 + 8;
+    pub const NUM: usize = GAS + 1; // 35
 }
 use col::*;
 
@@ -342,6 +358,8 @@ where
             // as it flowed directly before M3.4.
             f.assert_one(v(IS_DIGEST));
             f.assert_eq(v(PC), pvs[pv::PC_ENTRY].clone());
+            // Constraint set 8: row 0 is a digest row, and a digest row weighs 1 (`gas::gas_of`).
+            f.assert_one(v(GAS));
         }
         b.when_last_row().assert_zero(v(IS_REAL));
         {
@@ -355,6 +373,14 @@ where
             // M3.4: `IS_DIGEST` is a contiguous prefix — once it drops to 0 (the first
             // instruction row) it never returns to 1.
             t.assert_zero((one.clone() - v(IS_DIGEST)) * n(IS_DIGEST));
+            // Constraint set 8: the gas chain. The next row's weight is a constant per row kind
+            // (`gas::row_gas`'s, the same constants), so this is degree 2: `n(IS_REAL)` times a
+            // form linear in next-row selectors. No transition into a padding row is charged.
+            let w_next = one.clone()
+                + AB::Expr::from_u64(crate::gas::POSEIDON2_ABSORB_GAS - 1) * n(IS_HASH)
+                + AB::Expr::from_u64(crate::gas::KECCAK_GAS - 1) * n(SYS_KECCAK)
+                + AB::Expr::from_u64(crate::gas::SHA256_GAS - 1) * n(SYS_SHA256);
+            t.assert_zero(n(IS_REAL) * (n(GAS) - v(GAS) - w_next));
         }
 
         // M3.2 hash rows: absorb (`IS_HASH`) and write-back (`IS_HASH_OUT`) rows are
@@ -729,6 +755,20 @@ where
         b.assert_zero(v(IS_ECALL) * (sys_sum.clone() - one.clone()));
         b.assert_zero((one.clone() - v(IS_ECALL)) * sys_sum);
         b.assert_zero(v(SYS_HALT) * (v(A) - AB::Expr::from_u32(SYS_NUM_HALT)));
+        // Constraint set 8: on the `HALT` row, `pv::GAS − GAS` is the four `RANGE8` limbs
+        // `GD0..3` — a value in `[0, 2^32)`, so the declared limit is at or above the run's gas
+        // (both far below the field's `p`: `GAS` is an exact sum of at most `2^20` rows of weight
+        // ≤ 192, and `check_public_values` holds `pv::GAS ≤ gas::gas_max(header)` < `2^32`), and
+        // the run's gas itself stays private. Off the `HALT` row the limbs are zero — no lookup
+        // and no freedom — which also pins them on padding rows. There is exactly one `HALT` row
+        // (the last real row, `t.assert_zero(v(SYS_HALT) · n(IS_REAL))` above), so this reads the
+        // chain's final value.
+        let gd = v(GD0) + c8(1) * v(GD0 + 1) + c8(2) * v(GD0 + 2) + c8(3) * v(GD0 + 3);
+        b.assert_zero(v(SYS_HALT) * (pvs[pv::GAS].clone() - v(GAS) - gd));
+        for k in 0..4 {
+            b.assert_zero((one.clone() - v(SYS_HALT)) * v(GD0 + k));
+            bus::RANGE8.lookup_key(b, [v(GD0 + k)], Count::bounded(v(SYS_HALT), 1));
+        }
         b.assert_zero(v(SYS_WRITE) * (v(A) - AB::Expr::from_u32(SYS_WRITE_OUTPUT)));
         b.assert_zero(v(SYS_READ) * (v(A) - AB::Expr::from_u32(SYS_READ_INPUT)));
         // M4.1: the only constraint that pins a SYS_READ row's returned value (`C`, already
@@ -1482,12 +1522,13 @@ where
     }
 }
 
-pub fn public_values(pc_entry: u32, tier_log2: usize, outputs: &[u32; NUM_OUTPUTS], hc: &[u32; 8], hin: &[u32; 8], hpub: &[u32; 8]) -> Vec<F> {
+pub fn public_values(pc_entry: u32, tier_log2: usize, outputs: &[u32; NUM_OUTPUTS], hc: &[u32; 8], hin: &[u32; 8], hpub: &[u32; 8], gas_limit: u64) -> Vec<F> {
     let mut v = vec![F::from_u32(pc_entry), F::from_u64(tier_log2 as u64)];
     v.extend(outputs.iter().map(|o| F::from_u32(*o)));
     v.extend(hc.iter().map(|o| F::from_u32(*o)));
     v.extend(hin.iter().map(|o| F::from_u32(*o)));
     v.extend(hpub.iter().map(|o| F::from_u32(*o)));
+    v.push(F::from_u64(gas_limit));
     v
 }
 
@@ -1692,7 +1733,15 @@ fn fill_public_digest_rows(v: &mut [F], offset: usize, base_pc: u32, public: &[u
 /// digest-row prefix (`Program::digest_rows()` rows, `hash::program_digest_rows`) — the
 /// witness's own traversal of the whole program for `hc`, distinct from `events`'ordinary
 /// per-cycle rows, which now start `digest_rows` rows later (`CLK` shifted the same amount).
-pub fn cpu_trace(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 4], events: &[CycleEvent], height: usize, range: &mut RangeCounts, nibble: &mut NibbleCounts) -> RowMajorMatrix<F> {
+///
+/// Constraint set 8: `gas_limit` is the proof's declared `pv::GAS`. The fill keeps the running
+/// gas (`+1` per digest row, `gas::row_gas` per event row) in `GAS` on every real row, and on the
+/// `HALT` row writes the byte limbs of `gas_limit − gas` into `GD0..3` (each `RANGE8`-counted).
+/// Padding rows carry the halt row's `GAS` forward (deterministic; the AIR leaves it free there)
+/// and zero limbs. Panics if `gas_limit` is below the run's gas or `2^32` or more above it —
+/// `machine::build_traces_salted` refuses the first, and the second by refusing a limit above
+/// `gas::gas_max`, which is under `2^32` at every admissible header.
+pub fn cpu_trace(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 4], events: &[CycleEvent], height: usize, gas_limit: u64, range: &mut RangeCounts, nibble: &mut NibbleCounts) -> RowMajorMatrix<F> {
     let digest_rows = program.digest_rows();
     let input_digest_rows = crate::hash::input_digest_row_count(inputs.len());
     let public_digest_rows = crate::hash::public_digest_row_count(public.len());
@@ -1706,11 +1755,28 @@ pub fn cpu_trace(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 
     fill_digest_rows(&mut v, program, range);
     fill_input_digest_rows(&mut v, digest_rows, program.base_pc, salt, inputs, range);
     fill_public_digest_rows(&mut v, digest_rows + input_digest_rows, program.base_pc, public, range);
+    // Constraint set 8: the digest prefix rows weigh 1 each (`gas::gas_of`).
+    let mut gas: u64 = 0;
+    for i in 0..offset {
+        gas += 1;
+        v[i * WIDTH + GAS] = F::from_u64(gas);
+    }
     let mut written = [0u32; NUM_OUTPUTS];
     let mut hash_ptr_n: Option<(u32, u32)> = None;
     for (i, e) in events.iter().enumerate() {
         let r = &mut v[(offset + i) * WIDTH..(offset + i + 1) * WIDTH];
         r[CLK] = F::from_u32(offset as u32 + e.clk); r[PC] = F::from_u32(e.pc); r[NEXT_PC] = F::from_u32(e.next_pc); r[IS_REAL] = F::ONE;
+        gas += crate::gas::row_gas(e);
+        r[GAS] = F::from_u64(gas);
+        if matches!(e.sys, Some(Syscall::Halt)) {
+            let slack = gas_limit.checked_sub(gas).expect("gas_limit below the run's gas (build_traces_salted refuses this)");
+            assert!(slack < 1 << 32, "gas_limit − gas does not fit the four GD limbs (build_traces_salted refuses this)");
+            for k in 0..4 {
+                let limb = ((slack >> (8 * k)) & 0xff) as u32;
+                r[GD0 + k] = F::from_u32(limb);
+                range.range8(limb);
+            }
+        }
         for (k, f) in e.dec.to_fields().iter().enumerate() { r[DEC0 + k] = F::from_u32(*f); }
         r[A] = F::from_u32(e.a); r[B] = F::from_u32(e.b); r[C] = F::from_u32(e.c);
         r[ALU_OUT] = F::from_u32(e.alu_out); r[TGT] = F::from_u32(e.tgt);
@@ -1889,6 +1955,8 @@ pub fn cpu_trace(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 
     for i in (offset + events.len())..height {
         let r = &mut v[i * WIDTH..(i + 1) * WIDTH];
         for (k, w) in written.iter().enumerate() { r[WRITTEN0 + k] = F::from_u32(*w); }
+        // Constraint set 8: `GAS` is free on padding rows; carry the halt row's value forward.
+        r[GAS] = F::from_u64(gas);
     }
     RowMajorMatrix::new(v, WIDTH)
 }

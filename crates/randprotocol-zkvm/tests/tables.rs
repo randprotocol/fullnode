@@ -433,7 +433,7 @@ fn cpu_trace_mirrors_events_and_pads() {
     let e = execute(&p, &[], &[], 10_000).unwrap();
     let mut range = RangeCounts::default();
     let mut nibble = NibbleCounts::default();
-    let t = cpu_trace(&p, &[], &[], [0u32; 4], &e.events, 64, &mut range, &mut nibble);
+    let t = cpu_trace(&p, &[], &[], [0u32; 4], &e.events, 64, randprotocol_zkvm::gas::gas_of(&p, &[], &[], &e.events), &mut range, &mut nibble);
     let w = cpu::col::WIDTH;
     // M4.1: ordinary events now start after both the program-digest prefix (`dr`) and the
     // (always >= 1) input-digest prefix (`randprotocol_zkvm::hash::input_digest_row_count(0) == 1`
@@ -460,17 +460,27 @@ fn cpu_trace_mirrors_events_and_pads() {
     assert_eq!(t.values[last_real * w + cpu::col::SYS_HALT], F::ONE);
     let write_row = dr + e.events.iter().position(|ev| matches!(ev.sys, Some(randprotocol_zkvm::emulator::Syscall::WriteOutput { .. }))).unwrap();
     assert_eq!(t.values[write_row * w + cpu::col::OUT_SEL0], F::ONE);
+    // Constraint set 8: `GAS` accumulates through every real row and ends, on the `HALT` row, at
+    // exactly `gas::gas_of` — the limit passed above, so the halt row's `GD0..3` slack is zero.
+    let gas = randprotocol_zkvm::gas::gas_of(&p, &[], &[], &e.events);
+    assert_eq!(t.values[cpu::col::GAS], F::ONE, "row 0 is a digest row, weight 1");
+    assert_eq!(t.values[last_real * w + cpu::col::GAS], F::from_u64(gas));
+    for k in 0..4 { assert_eq!(t.values[last_real * w + cpu::col::GD0 + k], F::ZERO); }
     // Padding rows are all-zero except the `written` accumulators, which must carry the
-    // final per-slot write counts through to the last row for the unwritten-slot constraint.
+    // final per-slot write counts through to the last row for the unwritten-slot constraint,
+    // and `GAS`, which the fill carries forward from the `HALT` row (the AIR leaves it free).
     let pad = &t.values[(last_real + 1) * w..(last_real + 2) * w];
     for (i, x) in pad.iter().enumerate() {
-        let expected = if i == cpu::col::WRITTEN0 { F::ONE } else { F::ZERO };
+        let expected = if i == cpu::col::WRITTEN0 { F::ONE } else if i == cpu::col::GAS { F::from_u64(gas) } else { F::ZERO };
         assert_eq!(*x, expected, "padding column {i}");
     }
     let last = &t.values[(t.height() - 1) * w..t.height() * w];
     assert_eq!(last[cpu::col::WRITTEN0], F::ONE, "slot 0 was written");
     for k in 1..8 { assert_eq!(last[cpu::col::WRITTEN0 + k], F::ZERO, "slot {k} was not"); }
-    let pv = public_values(0, 10, &e.outputs, &p.digest(), &randprotocol_zkvm::hash::input_digest([0u32; 4], &[]), &randprotocol_zkvm::hash::public_digest(&[]));
+    // Constraint set 8: a real gas limit for tier 10, no hash tables (the tier this hand-built
+    // trace call names).
+    let gas_limit = randprotocol_zkvm::gas::gas_max(randprotocol_zkvm::machine::Tier(10), 0, 0);
+    let pv = public_values(0, 10, &e.outputs, &p.digest(), &randprotocol_zkvm::hash::input_digest([0u32; 4], &[]), &randprotocol_zkvm::hash::public_digest(&[]), gas_limit);
     assert_eq!(pv.len(), cpu::pv::NUM);
     assert_eq!(pv[cpu::pv::OUT0], F::from_u32(2));
 }
@@ -481,7 +491,7 @@ fn cpu_trace_limbs_and_counts_every_load_store_address() {
     let e = execute(&p, &[], &[], 10_000).unwrap();
     let mut range = RangeCounts::default();
     let mut nibble = NibbleCounts::default();
-    let t = cpu_trace(&p, &[], &[], [0u32; 4], &e.events, 1 << 10, &mut range, &mut nibble);
+    let t = cpu_trace(&p, &[], &[], [0u32; 4], &e.events, 1 << 10, randprotocol_zkvm::gas::gas_of(&p, &[], &[], &e.events), &mut range, &mut nibble);
     let w = cpu::col::WIDTH;
     // M4.1: as in `cpu_trace_mirrors_events_and_pads`, ordinary events start after both the
     // program-digest prefix and the (always >= 1) input-digest prefix — and, since constraint
@@ -518,8 +528,9 @@ fn cpu_trace_limbs_and_counts_every_load_store_address() {
     // Constraint set 6: the public-digest prefix (`pdr` rows, also folded into `dr`) pays the
     // same 4-per-row rate plus its own 32-word `PHVL0..31` encoding — a third +32. The next
     // constraint set (ZKM-1/ZKH-2): the salt row's four lanes are byte-limbed too — +16.
+    // Constraint set 8: the `HALT` row's four `GD0..3` gas-slack limbs — +4.
     let digest_range8 = 4 * dr + 32 + 32 + 32 + 16;
-    assert_eq!(range.range.iter().sum::<u64>() as usize, 8 * mem_rows.len() + 4 * n_stores + digest_range8);
+    assert_eq!(range.range.iter().sum::<u64>() as usize, 8 * mem_rows.len() + 4 * n_stores + digest_range8 + 4);
     let nibble_total: u64 = nibble.and.iter().sum();
     assert_eq!(nibble_total as usize, 2 * mem_rows.len());
 }

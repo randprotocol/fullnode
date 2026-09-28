@@ -44,7 +44,7 @@ fn a_non_u32_input_word_is_refused_by_the_air() {
     a.extend(halt());
     let p = a.assemble();
     let e = execute(&p, &[5], &[], 10_000).unwrap();
-    let t = build_traces_salted(&p, &[5], &[], [0; 4], &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[5], &[], [0; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
 
     // The input table's row 0, and its successor.
     let row = |m: &p3_matrix::dense::RowMajorMatrix<Val>, r: usize| m.values[(r % m.height()) * m.width()..(r % m.height()) * m.width() + m.width()].to_vec();
@@ -98,7 +98,7 @@ fn a_non_u32_public_word_is_refused_by_the_air() {
     a.extend(halt());
     let p = a.assemble();
     let e = execute(&p, &[], &[5], 10_000).unwrap();
-    let t = build_traces_salted(&p, &[], &[5], [0; 4], &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], &[5], [0; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
 
     let row = |m: &p3_matrix::dense::RowMajorMatrix<Val>, r: usize| m.values[(r % m.height()) * m.width()..(r % m.height()) * m.width() + m.width()].to_vec();
     let (pub_int, pub_con) = symbolic_air(&public::PublicAir);
@@ -124,7 +124,7 @@ fn a_non_u32_salt_lane_is_refused_by_the_air() {
     a.extend(halt());
     let p = a.assemble();
     let e = execute(&p, &[5], &[], 10_000).unwrap();
-    let t = build_traces_salted(&p, &[5], &[], [7, 8, 9, 10], &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[5], &[], [7, 8, 9, 10], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
 
     let row = |m: &p3_matrix::dense::RowMajorMatrix<Val>, r: usize| m.values[(r % m.height()) * m.width()..(r % m.height()) * m.width() + m.width()].to_vec();
     let (wc, hc) = (cpu::col::WIDTH, t.cpu.height());
@@ -195,7 +195,7 @@ fn poseidon2_binds_the_message_length() {
 fn hash_group(msg: &[u32], len_bound: bool) -> (p3_matrix::dense::RowMajorMatrix<Val>, Vec<Val>, usize) {
     let p = if len_bound { randprotocol_zkvm::guests::poseidon2_len_demo(msg) } else { randprotocol_zkvm::guests::poseidon2_demo(msg) };
     let e = execute(&p, &[], &[], 10_000).unwrap();
-    let t = build_traces_salted(&p, &[], &[], [0; 4], &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let sel = if len_bound { cpu::col::SYS_HASH_LEN } else { cpu::col::SYS_HASH };
     let w = cpu::col::WIDTH;
     let r = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + sel] == Val::ONE).expect("the hash call's ecall row");

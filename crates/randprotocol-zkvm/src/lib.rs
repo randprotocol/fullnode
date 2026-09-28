@@ -4,6 +4,8 @@ pub mod guests;
 pub mod emulator;
 pub mod tables;
 pub mod machine;
+/// Vendored: constraint set 8's gas meter (`gas_of`, `row_gas`, `gas_max`, the weights).
+pub mod gas;
 /// Vendored: HCS-1's stable key derivation, written for the next constraint set, not wired in.
 pub mod key_derivation_v2;
 /// Vendored: the committed Poseidon2 round-constant table (audit finding ZKV-2).
