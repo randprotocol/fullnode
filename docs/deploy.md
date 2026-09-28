@@ -587,7 +587,12 @@ take a shape no aggregate can cover. `randprotocol_zkvm::executor::non_canonical
 field to the honest prover's value, for bundle and call proofs alike:
 
 - **The memory table's height** (INT-5 / HB-2): exactly `t + 2` for a proof without a keccak or
-  sha256 table — 16 for every bundle. A bundle declaring 17 verified.
+  sha256 table — 16 for every bundle. A bundle declaring 17 verified. With a hash table the honest
+  height depends on the run's access count, not on the header, so it is capped rather than pinned
+  (issue #56): at most `executor::hash_bearing_mem_log_height_ceiling` of the declared tier and
+  hash-table heights, which leaves one or two encodings where the verifier's range left up to a
+  dozen. A pin needs the prover to declare the ceiling itself — a circuits change, next
+  constraint set (#52).
 - **The FRI folding schedule** (VERIFIER-2 / V-VERIFIER-1): the per-round `log_arity` the verifier
   accepts at any value that folds onto every input height; pinned to the prover's greedy schedule,
   re-derived from the declared shape (`executor::honest_fri_arities`, checked against calls at

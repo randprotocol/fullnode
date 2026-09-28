@@ -176,7 +176,8 @@ pub fn call_private_table_under_floor(proof: &[u8]) -> Option<(&'static str, u8)
 ///   `t + 2` — 16 for every bundle (tier 14, no hash tables, pinned by `decode_and_check`). A
 ///   bundle declaring 17 verified (the review demonstrated it); it fingerprints the wallet that
 ///   made it and cannot be aggregated. A proof with a hash table has a data-dependent honest
-///   height, which is left ranged.
+///   height, so it is capped instead, at [`hash_bearing_mem_log_height_ceiling`] of its declared
+///   shape (issue #56): the verifier's range above that is no honest prover's.
 /// - **The FRI folding schedule** (VERIFIER-2 / V-VERIFIER-1): the per-round `log_arity` the
 ///   verifier accepts at any value in `1..=max_log_arity` that folds onto every input height, so
 ///   any finer schedule than the prover's greedy one verifies too; pinned to
@@ -206,6 +207,18 @@ pub fn non_canonical(proof: &Proof) -> Option<String> {
             proof.tier.min_mem_log_height(),
             proof.tier.0
         ));
+    }
+    // INT-5 residual (issue #56): with a hash table the honest height depends on how many
+    // accesses the run made, which the header does not carry, so it is capped rather than pinned
+    // — at the most the declared shape can honestly need.
+    if (proof.keccak_log_height != NO_KECCAK || proof.sha256_log_height != NO_SHA256) && TIERS.contains(&proof.tier.0) {
+        let ceiling = hash_bearing_mem_log_height_ceiling(proof.tier, proof.keccak_log_height, proof.sha256_log_height);
+        if proof.mem_log_height > ceiling {
+            return Some(format!(
+                "memory height {} above the {ceiling} the honest prover can need (tier {}, keccak {}, sha256 {})",
+                proof.mem_log_height, proof.tier.0, proof.keccak_log_height, proof.sha256_log_height
+            ));
+        }
     }
     // VERIFIER-1: the commit-phase proof-of-work words. The chain's FRI parameters grind 0 bits
     // per commit round (`commit_proof_of_work_bits: 0`, `machine::build_config`), and at 0 bits
@@ -249,6 +262,36 @@ pub fn non_canonical(proof: &Proof) -> Option<String> {
         return Some(format!("{unrandomised_rounds} unrandomised opening rounds where the honest prover has one"));
     }
     None
+}
+
+/// INT-5 residual (issue #56): the tallest memory table an honest prover declares for a proof of
+/// tier `t` with keccak and sha256 tables of the declared log heights (`0` = no such table).
+///
+/// The prover declares `max(t + 2, log2_ceil(accesses + 1))` (`build_traces_salted`), counting
+/// every row `memory_trace` pushes: at most four a cpu event (its four slots), and a tier runs at
+/// most `2^t − 1` events; 100 more for each keccak permutation (`2 · keccak::WORDS`, the 50-word
+/// state read and written back by the keccak chip) and 32 for each sha256 compression
+/// (`sha256::WORDS` reads, `sha256::STATE_WORDS` write-backs). A keccak table of `2^klh` rows
+/// holds at most `2^klh / keccak BLOCK` permutations and a sha256 table at most
+/// `2^slh / sha256 BLOCK` compressions, so the sum below bounds every honest run of that shape.
+///
+/// **Why a ceiling, not a pin.** The declared hash heights are powers of two over the call count
+/// (and floored at 2^7 for privacy, COV-2), so one shape covers runs whose access counts differ
+/// by more than a factor of two, and the honest height is not a function of the header. Pinning
+/// it would need the prover to declare this ceiling itself — padding the memory table to the
+/// shape's worst case, one extra bit at most (tier 14 with the call keccak cap: 2^16 → 2^17) —
+/// which is a prover change in the vendored machine (circuits), for the next constraint set
+/// (#52). Until then the ceiling leaves at most `ceiling − (t + 2) + 1` encodings (two or three)
+/// in place of the verifier's `MAX_MEM_LOG_HEIGHT − (t + 2) + 1` (up to a dozen), and the height
+/// still says, to within that bit, whether the run's accesses spilled past `2^(t+2)`.
+pub fn hash_bearing_mem_log_height_ceiling(tier: Tier, keccak_log_height: u8, sha256_log_height: u8) -> u8 {
+    let rows = |log_height: u8| if log_height == 0 { 0u128 } else { 1u128 << log_height.min(63) };
+    let cpu = 4 * (tier.cpu_height() as u128 - 1);
+    let keccak = rows(keccak_log_height) / crate::tables::keccak::BLOCK as u128 * (2 * crate::keccak::WORDS) as u128;
+    let sha256 = rows(sha256_log_height) / crate::tables::sha256::BLOCK as u128
+        * (crate::sha256::WORDS + crate::sha256::STATE_WORDS) as u128;
+    let needed = (cpu + keccak + sha256 + 1).next_power_of_two().trailing_zeros() as u8;
+    tier.min_mem_log_height().max(needed).min(crate::machine::MAX_MEM_LOG_HEIGHT)
 }
 
 /// The FRI parameters `machine::build_config` proves and verifies with — `log_blowup`,
@@ -1545,6 +1588,73 @@ mod tests {
                 Some(max_callable_program_words(n)),
                 "the stub's restatement, public {n}"
             );
+        }
+    }
+
+    /// INT-5 residual (issue #56): a call proof carrying a keccak or sha256 table was only ranged
+    /// (`t + 2 ≤ mem ≤ MAX_MEM_LOG_HEIGHT`, 24), so its prover could declare any of up to a dozen
+    /// memory heights for one statement. The honest height is data-dependent — the access count,
+    /// not the declared shape, decides it — so it cannot be pinned from the header; but the shape
+    /// bounds it: [`hash_bearing_mem_log_height_ceiling`]. Above that ceiling no honest prover
+    /// declares, and the proof is non-canonical; every honest hash-bearing proof here is at or
+    /// under it, including traces built for workloads that pack a tier with hash calls.
+    #[test]
+    fn int5_a_hash_bearing_calls_memory_height_is_capped_by_its_declared_shape() {
+        use super::*;
+        use crate::machine::{Backend, FriProfile, MAX_MEM_LOG_HEIGHT};
+        for (what, program) in [("keccak", crate::guests::keccak_demo(b"abc")), ("sha256", crate::guests::sha256_demo())] {
+            let (bytes, _, _) = prove(FriProfile::Test, &program, &[], &[], None, Backend::Cpu).unwrap();
+            let honest = decode_canonical(&bytes).unwrap();
+            assert!(honest.keccak_log_height != NO_KECCAK || honest.sha256_log_height != NO_SHA256, "{what} declares a hash table");
+            assert_eq!(non_canonical(&honest), None, "{what}: the honest proof is canonical");
+            let mut tall = decode_canonical(&bytes).unwrap();
+            tall.mem_log_height = MAX_MEM_LOG_HEIGHT;
+            assert!(
+                non_canonical(&tall).is_some_and(|w| w.starts_with("memory height")),
+                "{what}: a memory height of {MAX_MEM_LOG_HEIGHT} (honest {}) is canonical: {:?}",
+                honest.mem_log_height,
+                non_canonical(&tall)
+            );
+            let ceiling = hash_bearing_mem_log_height_ceiling(honest.tier, honest.keccak_log_height, honest.sha256_log_height);
+            let mut top = decode_canonical(&bytes).unwrap();
+            top.mem_log_height = ceiling;
+            assert!(
+                non_canonical(&top).is_none_or(|w| !w.starts_with("memory height")),
+                "{what}: the ceiling itself ({ceiling}) is admitted"
+            );
+        }
+        // The ceiling is an upper bound on what the prover declares, at the far end too: a tier
+        // packed with hash calls (a three-cycle loop around the ecall, up to every cycle the tier
+        // has) builds traces at or under it.
+        use crate::asm::ops::{addi, ecall, halt, li};
+        use crate::isa::{BranchCond, REG_A0, REG_A7, SYS_KECCAK, SYS_SHA256};
+        use crate::machine::{build_traces_salted, Tier};
+        const COUNTER: u32 = 5;
+        for tier in [Tier(10), Tier(12)] {
+            for (what, sys) in [("keccak", SYS_KECCAK), ("sha256", SYS_SHA256)] {
+                for fill in [1usize, 2, 3, 4] {
+                    let calls = (tier.max_cycles() - 16) * fill / 4 / 3;
+                    let mut a = crate::asm::Assembler::new(0);
+                    a.extend(li(REG_A7, sys as i32));
+                    a.extend(li(REG_A0, 0x10_0000 / 4));
+                    a.extend(li(COUNTER, calls as i32));
+                    a.label("again");
+                    a.push(ecall());
+                    a.push(addi(COUNTER, COUNTER, -1));
+                    a.branch(BranchCond::Ne, COUNTER, 0, "again");
+                    a.extend(halt());
+                    let p = a.assemble();
+                    let exec = crate::emulator::execute(&p, &[], &[], tier.max_cycles()).expect("halts");
+                    let traces = build_traces_salted(&p, &[], &[], [0; 4], &exec, tier).expect("fits the tier");
+                    let ceiling = hash_bearing_mem_log_height_ceiling(tier, traces.keccak_log_height, traces.sha256_log_height);
+                    assert!(
+                        traces.mem_log_height <= ceiling,
+                        "tier {}, {calls} {what} calls: the prover declares {} above the ceiling {ceiling}",
+                        tier.0,
+                        traces.mem_log_height
+                    );
+                }
+            }
         }
     }
 
