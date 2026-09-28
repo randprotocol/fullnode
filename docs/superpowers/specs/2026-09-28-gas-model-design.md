@@ -360,7 +360,10 @@ Genesis `gas.dynamic` (optional inside the `gas` section; absent = the fixed pri
   `gas_used`/`target_block_gas`. An empty block lowers each price by `adjust_bps/10 000` (12.5 %
   at the default) down to its floor; a block at twice the target raises it by the same; a block
   at the target leaves it. `target_block_bytes` must be ≤ `max_block_bytes`; `adjust_bps` is
-  `1..=5000`.
+  `1..=5000`; and `min_gas_price · adjust_bps ≥ 10 000` and `min_byte_price · adjust_bps ≥
+  10 000`, since a price with `price · adjust_bps < 10 000` floors every step up to 0 and could
+  never rise. `dynamic` is refused beside an `aggregation` section: a pruned bundle's marker
+  form encodes shorter than its raw form, so sealed-form sync would diverge on the byte price.
 - **The wallet** reads `rand_getLimits` (which serves the tip's current prices under `dynamic`,
   the genesis prices otherwise) and pays the floor at the current prices times
   `(1 + adjust_bps/10 000)`, one step of headroom, so a block that raises the price before the

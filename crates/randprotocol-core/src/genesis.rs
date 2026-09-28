@@ -488,6 +488,11 @@ pub enum GenesisError {
     /// The `gas` section breaks one of `GasConfig::check`'s rules.
     #[error("bad gas config: {0}")]
     Gas(String),
+    /// Controller ruling (task B6): the byte price is driven by Σ `encoded_len` over a block as
+    /// served, and a pruned bundle's marker form encodes shorter than its raw form, so a sealed-form
+    /// sync would compute another price and fail the state root.
+    #[error("gas.dynamic cannot be combined with aggregation: a pruned bundle's encoded size differs from its raw size, so sealed-form sync would diverge on the byte price")]
+    DynamicGasWithAggregation,
     #[error("bad hc_bundle {0} (64 hex characters)")]
     BadHcBundle(String),
     #[error("bad alloc note {0}")]
@@ -709,6 +714,9 @@ impl Genesis {
         if let Some(g) = &self.gas {
             let max_block_bytes = self.max_block_bytes.map_or(gas::MAX_BLOCK_BYTES, |n| n as usize);
             g.check(max_block_bytes).map_err(GenesisError::Gas)?;
+            if g.dynamic.is_some() && self.aggregation.is_some() {
+                return Err(GenesisError::DynamicGasWithAggregation);
+            }
         }
         Ok(())
     }
@@ -2949,6 +2957,68 @@ mod tests {
             bad_dyn(gas::DynamicGas { min_gas_price: 101, ..d.clone() }).contains("min_gas_price"),
             "the floor cannot exceed the starting price"
         );
+    }
+
+    /// Controller ruling (task B6): `gas.dynamic` prices bytes by Σ `encoded_len` over the block
+    /// as served, and a pruned (marker-form) bundle encodes shorter than its raw form, so a node
+    /// syncing sealed history would compute another byte price and fail the root. Refused by name
+    /// until the side table carries raw lengths; a fixed-price section beside aggregation is fine.
+    #[test]
+    fn dynamic_gas_is_refused_beside_aggregation() {
+        use crate::ledger::aggregation::{AdmittedShape, AggregationConfig};
+        use crate::types::{DeclaredShape, FriProfile};
+        let shape = DeclaredShape {
+            profile: FriProfile::Production,
+            tier: crate::types::BUNDLE_PROOF_TIER,
+            program_log_height: 12,
+            input_log_height: 10,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: crate::types::BUNDLE_PUBLIC_LOG_HEIGHT,
+            mem_log_height: 16,
+        };
+        let fixed = gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: 16_383,
+            metering: gas::GasMetering::Circuit,
+            dynamic: None,
+        };
+        let dynamic = gas::GasConfig {
+            dynamic: Some(gas::DynamicGas {
+                target_block_bytes: 2 << 20,
+                target_block_gas: 1 << 18,
+                adjust_bps: 1250,
+                min_gas_price: 100,
+                min_byte_price: 800,
+            }),
+            ..fixed.clone()
+        };
+        let with = |g_cfg: gas::GasConfig| {
+            let mut g = base_genesis();
+            g.fri_profile = "production".into();
+            g.aggregation = Some(AggregationConfig {
+                bond: 1_000,
+                max_covers: 3,
+                subsidy_base: 100,
+                halving_blocks: 210_000,
+                window: 256,
+                admitted_shapes: vec![AdmittedShape {
+                    shape,
+                    hc: Hash::digest(b"the bundle guest"),
+                    aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap(),
+                }],
+            });
+            g.gas = Some(g_cfg);
+            g.validate()
+        };
+        assert!(with(fixed).is_ok(), "fixed prices never move, so sealed sync cannot diverge on them");
+        let e = with(dynamic.clone()).unwrap_err();
+        assert!(matches!(e, GenesisError::DynamicGasWithAggregation), "{e}");
+        assert!(e.to_string().contains("gas.dynamic cannot be combined with aggregation"), "{e}");
+        let mut alone = base_genesis();
+        alone.gas = Some(dynamic);
+        assert!(alone.validate().is_ok(), "dynamic without aggregation is fine");
     }
 
     /// The cap must be a program length the zkVM can prove: at least one word, and no more than

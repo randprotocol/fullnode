@@ -211,15 +211,24 @@ pub struct GasPrices {
     pub byte_price: u64,
 }
 
-/// Spec §7.1's controller: `max(min, price + price·adjust_bps·(used − target)/(10 000·target))`,
-/// in i128 (saturating) with Rust's truncating division (toward zero), saturating at `u64::MAX`, never below
-/// `min`. A zero `target` is read as 1 (genesis refuses one; this only keeps the division
-/// defined). Deterministic by construction: integers only, no rounding mode to disagree on.
+/// Spec §7.1's controller: `max(min, price + ⌊price·adjust_bps·(used − target)/(10 000·target)⌋)`
+/// — **floor** division (`div_euclid` by a positive divisor, so a fall rounds away from zero:
+/// −125.125 is −126), clamped to `0..=u64::MAX`, never below `min`. A zero `target` is read as
+/// 1 (genesis refuses one; this only keeps the division defined). Integers only, so every
+/// validator computes the same price.
+///
+/// The product is computed in i128 with saturating multiplies. It is exact whenever
+/// `price·adjust_bps·|used − target| < 2^127`; with `adjust_bps ≤ 5 000` (genesis) that needs
+/// `price·|used − target|` above ~2^114 — a price past ~2^60 units (≈10⁹ RAND per gas or per
+/// KiB) with a 2^54 gap from target — before it departs from the exact formula, and past that
+/// point it only caps the step. Beyond reach on any chain this code runs, and still
+/// deterministic if reached.
 pub fn next_price(price: u64, min: u64, used: u64, target: u64, adjust_bps: u32) -> u64 {
     let target = target.max(1) as i128;
-    // `price·adjust_bps` is under 2^77 (genesis caps `adjust_bps` at 5 000); the product with a
-    // `used` near `u64::MAX` could still pass i128, so it saturates rather than wraps.
-    let delta = (price as i128).saturating_mul(adjust_bps as i128).saturating_mul(used as i128 - target) / (10_000 * target);
+    let delta = (price as i128)
+        .saturating_mul(adjust_bps as i128)
+        .saturating_mul(used as i128 - target)
+        .div_euclid(10_000 * target);
     let next = (price as i128).saturating_add(delta).clamp(0, u64::MAX as i128) as u64;
     next.max(min)
 }
@@ -646,6 +655,21 @@ impl GasConfig {
             if d.min_byte_price > self.byte_price {
                 return Err(format!("min_byte_price {} cannot exceed the starting byte_price {}", d.min_byte_price, self.byte_price));
             }
+            // A price with `price·adjust_bps < 10 000` can never rise: a full step up floors to 0
+            // (`next_price`). Every price stays at or above its floor, so a floor that meets this
+            // keeps the controller able to lift every price it can reach.
+            if (d.min_gas_price as u128) * (d.adjust_bps as u128) < 10_000 {
+                return Err(format!(
+                    "min_gas_price {} · adjust_bps {} is under 10 000: a price there could never rise",
+                    d.min_gas_price, d.adjust_bps
+                ));
+            }
+            if (d.min_byte_price as u128) * (d.adjust_bps as u128) < 10_000 {
+                return Err(format!(
+                    "min_byte_price {} · adjust_bps {} is under 10 000: a price there could never rise",
+                    d.min_byte_price, d.adjust_bps
+                ));
+            }
         }
         Ok(())
     }
@@ -691,6 +715,17 @@ mod gas_config_tests {
         };
         assert!(bad(DynamicGas { adjust_bps: 0, ..base.clone() }).contains("adjust_bps"));
         assert!(bad(DynamicGas { adjust_bps: 5001, ..base.clone() }).contains("adjust_bps"));
+        // A price with price·adjust_bps < 10 000 can never rise (the step floors to 0), so a floor
+        // that low would let a price sink to where the controller can no longer lift it.
+        assert!(bad(DynamicGas { adjust_bps: 99, ..base.clone() }).contains("min_gas_price"), "100 · 99 < 10 000");
+        assert!(bad(DynamicGas { adjust_bps: 12, ..base.clone() }).contains("min_gas_price"));
+        let mut low_byte = ok();
+        low_byte.byte_price = 7;
+        low_byte.dynamic = Some(DynamicGas { min_byte_price: 7, adjust_bps: 1250, ..base.clone() });
+        assert!(low_byte.check(MAX_BLOCK_BYTES).unwrap_err().contains("min_byte_price"), "7 · 1250 < 10 000");
+        let mut edge = ok();
+        edge.dynamic = Some(DynamicGas { adjust_bps: 100, min_byte_price: 800, ..base.clone() });
+        assert!(edge.check(MAX_BLOCK_BYTES).is_ok(), "100 · 100 = 10 000 exactly can rise");
         assert!(bad(DynamicGas { target_block_bytes: 0, ..base.clone() }).contains("target_block_bytes"));
         assert!(bad(DynamicGas { target_block_bytes: (MAX_BLOCK_BYTES as u64) + 1, ..base.clone() }).contains("target_block_bytes"));
         assert!(bad(DynamicGas { target_block_gas: 0, ..base.clone() }).contains("target_block_gas"));
@@ -705,6 +740,7 @@ mod gas_config_tests {
         assert_eq!(next_price(800, 800, t, t, 1250), 800, "at target: unchanged");
         assert_eq!(next_price(800, 800, 0, t, 1250), 800, "empty block at the floor stays at the floor");
         assert_eq!(next_price(1_000, 800, 0, t, 1250), 875, "empty block: −12.5 %");
+        assert_eq!(next_price(1_001, 800, 0, t, 1250), 875, "floor division: −125.125 floors to −126, not −125");
         assert_eq!(next_price(1_000, 800, 2 * t, t, 1250), 1_125, "twice the target: +12.5 %");
         assert_eq!(next_price(1_000, 800, 3 * t, t, 1250), 1_250, "three times the target: +25 % (bytes cannot exceed 2× a half-cap target; gas can)");
         assert_eq!(next_price(u64::MAX, 800, 2 * t, t, 5000), u64::MAX, "saturates");
