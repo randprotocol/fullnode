@@ -2284,6 +2284,32 @@ pub async fn deploy_precheck(rpc: &RpcClient, words: usize, public_words: usize)
     rpc.estimate_fee(serde_json::json!({ "kind": "deploy", "words": words, "public_words": public_words })).await
 }
 
+/// CPU-1's residual (issue #57): the deploy bound (`TxError::ProgramUncallable`, the pool's
+/// `admission::deploy_uncallable`) is the prover's limit for a call with **no** private inputs, so
+/// a program under it can still be uncallable at every tier once a call's inputs are digested too
+/// (one Poseidon2 slot a few input words, before a single instruction runs) — or once it runs
+/// longer than the call tier cap allows. `rand program deploy --input …` runs the call the deployer
+/// has in mind through the emulator first (`executor::call_tier`, no proving) and refuses, before
+/// the deploy is paid for, unless it lands at or under `MAX_CALL_TIER`. The public segment is
+/// taken at the length the chain will prove over — the program's public input, followed by the
+/// eight-word call binding under genesis `hardening_v6` (`program::hardened_call_segment`) — with
+/// zero words, as `call_tier` does; a guest that branches on its public words may land elsewhere.
+/// Returns the tier the call would prove at.
+pub fn deploy_dry_run(program: &randprotocol_zkvm::isa::Program, public: &[u32], inputs: &[u32], hardened: bool) -> Result<u8> {
+    let segment = if hardened { public.len() + TX_BINDING_WORDS } else { public.len() };
+    let max = randprotocol_zkvm::executor::MAX_CALL_TIER;
+    let tier = randprotocol_zkvm::executor::call_tier(program, inputs, segment).map_err(|e| {
+        anyhow!("a call over these {} input words cannot be proved at any tier ({e}); not deploying", inputs.len())
+    })?;
+    if tier > max {
+        return Err(anyhow!(
+            "a call over these {} input words needs tier {tier}, past the call tier cap {max}: no validator would admit it; not deploying",
+            inputs.len()
+        ));
+    }
+    Ok(tier)
+}
+
 /// `--public <file>` for `rand program deploy`, as the words the program's public input will be.
 ///
 /// Two forms. An ELF (`\x7fELF` magic, or a `.so` name, which must then be an ELF) is
@@ -3354,6 +3380,22 @@ mod tests {
     fn owned_asset(index: u64, amount: u64, spent: bool, asset: u32) -> OwnedNote {
         let note = Note::new([1; 8], [2; 8], amount, asset, 3);
         OwnedNote { index, cm: note.commitment(), nf: [index as u32; 8], note, spent, pending: None, height: index, memo: None }
+    }
+
+    /// CPU-1's residual (issue #57): a program inside the deploy bound — which is the prover's
+    /// limit for a call with no inputs — is still uncallable once a call's private inputs are
+    /// digested as well. The dry run refuses it before the deploy is paid for, and passes the same
+    /// call a few words shorter.
+    #[test]
+    fn a_deploy_dry_run_refuses_a_program_its_inputs_push_past_the_call_tier_cap() {
+        let mut program = randprotocol_zkvm::guests::private_payment(1000);
+        let bound = randprotocol_zkvm::executor::max_callable_program_words(TX_BINDING_WORDS);
+        program.words.resize(bound, 0x13);
+        let inputs = [400, 250, 300, 75];
+        let refused = deploy_dry_run(&program, &[], &inputs, true).unwrap_err().to_string();
+        assert!(refused.contains("not deploying"), "{refused}");
+        program.words.truncate(bound - 16);
+        assert_eq!(deploy_dry_run(&program, &[], &inputs, true).unwrap(), randprotocol_zkvm::executor::MAX_CALL_TIER);
     }
 
     /// The test token these attestations are about: chain 2's `0xaa…`.

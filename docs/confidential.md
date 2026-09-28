@@ -774,6 +774,18 @@ the same words big-endian and reads different for the same program). Then it cal
 the cost of one RPC round trip — rather than after the minutes it takes to prove a bundle the
 ledger would then throw away.
 
+**A deployable program is not always a callable one** (CPU-1 and its residual, issue #57). Every
+call proof spends one Poseidon2 permutation per four program words, plus its private inputs' and
+public segment's digests, before it executes an instruction, and a call is capped at tier 14
+(`MAX_CALL_TIER`, 2 048 permutations). A deploy past the bound for a call with *no* private
+inputs — 8 184 words, 8 180 under `hardening_v6`, fewer beside a public input — is refused
+(`ProgramUncallable`: the pool's policy everywhere, a validity rule under the flag). That bound is
+necessary, not sufficient: a program inside it can still be uncallable at every tier once a call's
+inputs are digested too, or once it runs longer than tier 14 holds, and its deploy fee is then
+paid for nothing. `rand program deploy --input <u32> …` (or `--check-call` for a call with no
+inputs) runs the call you have in mind through the emulator first — no proving, the public segment
+at the length the chain proves over, zero-filled — and refuses unless it lands at or under tier 14.
+
 Writing, building and deploying a guest step by step (Rust, C, or a hand-built image) is in
 [`guests.md`](guests.md). Deploying translated Solana and Ethereum programs is in
 [`translators.md`](translators.md).

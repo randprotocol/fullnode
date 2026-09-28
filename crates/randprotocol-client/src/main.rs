@@ -609,6 +609,15 @@ enum ProgramCmd {
         /// program, and every call proves over it.
         #[arg(long)]
         public: Option<PathBuf>,
+        /// Before paying for the deploy, run a call over these private inputs (u32, in order)
+        /// through the emulator and refuse unless it fits the call tier cap. The deploy bound is
+        /// the prover's limit for a call with no inputs, so a program inside it can still be
+        /// uncallable once a call's inputs are digested too (issue #57). Nothing is proved.
+        #[arg(long = "input")]
+        inputs: Vec<u32>,
+        /// Run that check with no private inputs (implied by `--input`).
+        #[arg(long)]
+        check_call: bool,
         /// Prove the paying bundle on an attached NVIDIA GPU.
         #[arg(long)]
         cuda: bool,
@@ -1294,7 +1303,7 @@ async fn main() -> Result<()> {
                 randprotocol_core::program::program_id_with_public(p.base_pc, &p.words, &[])
             );
         }
-        Cmd::Program(ProgramCmd::Deploy { file, public, cuda }) => {
+        Cmd::Program(ProgramCmd::Deploy { file, public, inputs, check_call, cuda }) => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let p = load_program(&file)?;
             let public = public.as_deref().map(wallet::public_file_words).transpose()?.unwrap_or_default();
@@ -1321,6 +1330,13 @@ async fn main() -> Result<()> {
             // `max_program_words` and `max_program_public_words` admission, so a program over
             // either cap is refused here rather than after a proof the ledger would throw away.
             wallet::deploy_precheck(&rpc, p.words.len(), public.len()).await?;
+            // Issue #57: the callable-size bound above holds only for an input-free call; a call
+            // over the deployer's own inputs is dry-run against the tier cap before any fee moves.
+            if check_call || !inputs.is_empty() {
+                let hardened = rpc.limits().await?.is_some_and(|l| l.hardening_v6);
+                let tier = wallet::deploy_dry_run(&p, &public, &inputs, hardened)?;
+                eprintln!("a call over {} input words proves at tier {tier}", inputs.len());
+            }
             let action = Action::Deploy { base_pc: p.base_pc, words: p.words.clone(), public };
             let fee = wallet::deploy_fee_default(&action);
             let chain_id = rpc.chain_id().await?;
