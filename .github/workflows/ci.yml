@@ -10,7 +10,8 @@
 #                   and every library suite. The proving suites and the fixture-backed aggregation
 #                   tests are skipped by name — see below.
 #   nightly         the long ones: the wallet flow and the cluster suite really prove bundles
-#                   (~90 minutes together on this project's own machines).
+#                   (~90 minutes together on this project's own machines), then the hidden
+#                   bundle's real-proof cheats again against guest v2 (~35 minutes).
 #
 # `randprotocol-zkvm` has *path* dependencies on `../../../circuits/guests-compiled/{evm-core,
 # sbpf-core}`, so the circuits repository must be checked out as a sibling directory named
@@ -192,3 +193,18 @@ jobs:
         run: |
           cargo test --workspace --release \
             -- --skip agg_executor:: --skip round_trips --skip two_test_profile
+      # Issue #61: `tests/hidden_cheating.rs`'s nineteen real-proof cheats prove the guest
+      # `HIDDEN_BUNDLE_GUEST` names, v1 by default — so the step above covers v1 end to end and the
+      # branch-free v2 (`hc_bundle 651043e2…`) only in the emulator and one tier-14 proof. The
+      # chain-16 cut (`rand-node genesis --bundle-guest v2`) makes v2 the live guest, so its cheats
+      # have to be real proofs every night too, not a manual run someone remembers before a cut.
+      # Only `real_proof_` here: the fuzz and the emulator companions are guest-agnostic (they
+      # compare v1 and v2 on every run) and already ran above. ~35 min; Production FRI, one proof
+      # at a time through the workspace proving slot.
+      - name: Guest v2's real-proof cheating suite
+        working-directory: fullnode
+        env:
+          HIDDEN_BUNDLE_GUEST: v2
+        run: |
+          cargo test -p randprotocol-zkvm --release --test hidden_cheating real_proof_ \
+            -- --test-threads=1
