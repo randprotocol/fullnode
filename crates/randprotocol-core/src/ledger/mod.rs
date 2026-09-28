@@ -1226,10 +1226,8 @@ impl Ledger {
         self.gas.as_ref()
     }
 
-    /// Set by genesis from `gas`. Not yet consumed by anything else in the tree — the fee floor
-    /// and price rules are a later task, spec §4.2 — and not yet restored by `reload_ledger` on
-    /// restart, like `max_program_words` and `envelope_bytes` are; that wiring is part of the
-    /// task that first reads this field.
+    /// Set by genesis from `gas`, and by `reload_ledger` on every restart. Not yet consumed by
+    /// anything else in the tree — the fee floor and price rules are a later task, spec §4.2.
     pub fn set_gas(&mut self, g: Option<gas::GasConfig>) {
         self.gas = g;
     }

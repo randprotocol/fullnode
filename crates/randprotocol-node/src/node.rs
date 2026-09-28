@@ -178,6 +178,10 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // would admit and apply what its peers refuse — a fork at the first such transaction after its
     // restart.
     ledger.set_hardening_v6(gs.ledger.hardening_v6());
+    // And the gas section (design 2026-09-28 §4.2, §4.3, §7.1): `load_ledger` comes back at
+    // `None`, and a node that kept it would run without the prices and the bundle gas limit its
+    // peers enforce.
+    ledger.set_gas(gs.ledger.gas().cloned());
     // And the consensus signing domain (audit v4): `load_ledger` comes back at v0, and a node
     // that kept it on a v1 chain would refuse every peer's proposal at the ledger's own
     // signature check.
@@ -4470,6 +4474,30 @@ mod tests {
         assert!(!storage.load_ledger(&StubExecutor).unwrap().hardening_v6());
         let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
         assert!(reloaded.hardening_v6(), "restored from the genesis state");
+    }
+
+    /// The gas section (design 2026-09-28 §4.2, §4.3, §7.1) survives a restart the same way:
+    /// `load_ledger` comes back at `None`, and a node that kept it would run without the prices
+    /// and the bundle gas limit its peers enforce.
+    #[test]
+    fn a_restart_restores_the_gas_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        gs.ledger.set_gas(Some(gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: 16_383,
+            metering: gas::GasMetering::Circuit,
+            dynamic: None,
+        }));
+        storage.init_genesis(&gs).unwrap();
+        assert!(storage.load_ledger(&StubExecutor).unwrap().gas().is_none());
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        let g = reloaded.gas().expect("restored from the genesis state");
+        assert_eq!(g.gas_price, 100);
+        assert_eq!(g.byte_price, 800);
+        assert_eq!(g.bundle_gas_limit, 16_383);
     }
 
     /// The four call-limits parameters survive a restart the same way: `load_ledger` comes back

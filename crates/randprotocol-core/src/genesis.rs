@@ -412,9 +412,10 @@ pub struct Genesis {
     /// The gas section (design 2026-09-28 §4.2, §4.3, §7.1): the chain's declared prices, the
     /// bundle guest's flat gas limit, the metering scheme, and (Phase 2) the dynamic price
     /// controller's parameters. A genesis parameter like `max_program_words`: outside the state
-    /// root and `Ledger`'s equality. Absent from a chain cut before it — chain 15's file
-    /// included — hashes byte-for-byte as before; present, it is bound into the genesis hash
-    /// after `hardening_v6`. Nothing outside `Genesis`/`Ledger` reads it yet (a later task).
+    /// root and `Ledger`'s equality, restored by `reload_ledger` on every restart. Absent from a
+    /// chain cut before it — chain 15's file included — hashes byte-for-byte as before; present,
+    /// it is bound into the genesis hash after `hardening_v6`. No fee floor or price rule reads
+    /// it yet (a later task).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gas: Option<gas::GasConfig>,
 }
@@ -1125,14 +1126,14 @@ impl Genesis {
         // genesis cut before it hashes byte-for-byte as before.
         if let Some(g) = &self.gas {
             commit.extend_from_slice(b"gas");
-            commit.extend_from_slice(&g.gas_price.to_le_bytes());
-            commit.extend_from_slice(&g.byte_price.to_le_bytes());
-            commit.extend_from_slice(&g.bundle_gas_limit.to_le_bytes());
+            commit.extend_from_slice(&g.gas_price.to_be_bytes());
+            commit.extend_from_slice(&g.byte_price.to_be_bytes());
+            commit.extend_from_slice(&g.bundle_gas_limit.to_be_bytes());
             commit.extend_from_slice(b"circuit");
             if let Some(d) = &g.dynamic {
                 commit.extend_from_slice(b"gas_dynamic");
                 for x in [d.target_block_bytes, d.target_block_gas, d.adjust_bps as u64, d.min_gas_price, d.min_byte_price] {
-                    commit.extend_from_slice(&x.to_le_bytes());
+                    commit.extend_from_slice(&x.to_be_bytes());
                 }
             }
         }
