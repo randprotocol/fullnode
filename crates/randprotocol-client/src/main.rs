@@ -1510,16 +1510,21 @@ async fn main() -> Result<()> {
                         .map_err(|e| anyhow::anyhow!(e))?;
                     (Some(e), Some(key))
                 };
-                // The proof's own bytes, and its hash-table heights, cannot be priced before it
-                // exists — the header the fee is priced on (spec 2026-09-28 §4.1) is what the
-                // hardened path proves for, not what it starts from — so this is priced at 0, 0
-                // (no hash tables) same as an unhardened call under today's caps; `submit_bound_call`
-                // refuses a proof that comes out dearer than this, naming the fee to retry with.
+                // The proof's own bytes cannot be known before it exists — the hardened path fixes
+                // the fee before proving (the binding covers the fee bundle, so the bundle is built
+                // first). Under a policy every byte prices in, so the proof's bytes cannot be left
+                // out of the quote the way the old free-allowance floor could afford to: this
+                // prices the chain's proof cap in the proof's own place (and heights 0, 0 — the
+                // real header is just as unknown), which can only overpay, by at most
+                // `(cap − actual) · byte_price` (≈ 0.0007 RAND at the 2 MiB cap); `--fee` pays
+                // exact. `submit_bound_call` re-prices the real proof's header once it exists and
+                // refuses to submit under its floor, naming the fee to retry with.
+                let cap = wallet::proof_cap(limits.as_ref());
+                let bytes = cap + envelope.as_ref().map_or(0, |e| e.len());
                 let fee = match fee {
                     Some(f) => parse_amount(&f)?,
-                    None => wallet::call_fee_default(limits.as_ref(), tier, 0, 0, gas::call_bytes(&[], envelope.as_ref())),
+                    None => wallet::call_fee_default(limits.as_ref(), tier, 0, 0, bytes),
                 };
-                let cap = wallet::proof_cap(limits.as_ref());
                 let prove = |binding: &[u32; randprotocol_core::types::TX_BINDING_WORDS]| -> Result<Vec<u8>> {
                     let t = std::time::Instant::now();
                     let (proof, outputs, tier) =
@@ -1529,7 +1534,8 @@ async fn main() -> Result<()> {
                     Ok(proof)
                 };
                 let action = Action::Call { program: pid, proof: Vec::new(), input_envelope: envelope };
-                let s = wallet::submit_bound_call(&rpc, &w, &mut store, action, fee, &prove, profile, &proving, chain_id, true).await;
+                let s =
+                    wallet::submit_bound_call(&rpc, &w, &mut store, action, fee, &prove, limits.as_ref(), profile, &proving, chain_id, true).await;
                 (s, call_key)
             } else {
                 let t = std::time::Instant::now();

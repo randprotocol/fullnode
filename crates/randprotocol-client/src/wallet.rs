@@ -2136,6 +2136,7 @@ pub async fn submit_bound_call(
     action: Action,
     fee: u64,
     prove_call: &CallProver<'_>,
+    limits: Option<&ChainLimits>,
     profile: FriProfile,
     proving: &Proving,
     chain_id: u64,
@@ -2147,32 +2148,41 @@ pub async fn submit_bound_call(
     };
     let checked = |binding: &[u32; TX_BINDING_WORDS]| -> Result<Vec<u8>> {
         let proof = prove_call(binding)?;
-        let tier = call_proof_tier(&proof)?;
-        // No `limits` here: this checked-closure only guards the fee the bundle was already
-        // built for (the ledger's own floor) against a proof that came out dearer than declared;
-        // the caller prices the real policy floor, with the header's own heights, before it ever
-        // calls in.
+        // One decode for the tier and both hash-table heights, off the REAL proof.
         let header = randprotocol_zkvm::executor::decode_canonical(&proof).map_err(|e| anyhow!("the call proof does not decode: {e}"))?;
-        let need = call_fee_default(None, tier, header.keccak_log_height, header.sha256_log_height, gas::call_bytes(&proof, envelope.as_ref()));
-        if need > fee {
-            return Err(anyhow!(
-                "the call proof came out at tier {tier}, {} bytes, whose fee is {} RAND — more than the {} RAND                  the fee bundle was built for; retry with --fee {}",
-                proof.len(),
-                format_amount(need),
-                format_amount(fee),
-                format_amount(need)
-            ));
-        }
+        let tier = header.tier.0 as u8;
+        refuse_if_under_the_floor(limits, tier, header.keccak_log_height, header.sha256_log_height, &proof, envelope.as_ref(), fee)?;
         Ok(proof)
     };
     let spend = Spend { asset: 0, to: None, memo: "", fee, burn_a: 0, burn_r: 0, prover_fee: None };
     submit_spend(rpc, w, store, spend, action, Burn::None, profile, proving, Some(&checked), chain_id, wait).await
 }
 
-/// The tier a call proof declares, read off its header.
-fn call_proof_tier(proof: &[u8]) -> Result<u8> {
-    let p = randprotocol_zkvm::executor::decode_canonical(proof).map_err(|e| anyhow!("the call proof does not decode: {e}"))?;
-    Ok(p.tier.0 as u8)
+/// The guard `submit_bound_call`'s `checked` closure applies to the REAL proof once it exists
+/// (INT-4): priced under the caller's gas policy exactly as `rand call`'s unhardened path prices
+/// one (spec 2026-09-28 §4.1), so an under-quote — a keccak-bearing proof, a raised cap, anything
+/// the pre-price at `main.rs` could not know before the proof existed — is refused here, naming
+/// the floor to retry with.
+fn refuse_if_under_the_floor(
+    limits: Option<&ChainLimits>,
+    tier: u8,
+    keccak_log_height: u8,
+    sha256_log_height: u8,
+    proof: &[u8],
+    envelope: Option<&randprotocol_core::types::CallEnvelope>,
+    fee: u64,
+) -> Result<()> {
+    let need = call_fee_default(limits, tier, keccak_log_height, sha256_log_height, gas::call_bytes(proof, envelope));
+    if need > fee {
+        return Err(anyhow!(
+            "the call proof came out at tier {tier}, {} bytes, whose fee is {} RAND — more than the {} RAND                  the fee bundle was built for; retry with --fee {}",
+            proof.len(),
+            format_amount(need),
+            format_amount(fee),
+            format_amount(need)
+        ));
+    }
+    Ok(())
 }
 
 /// Wait for the commit, or hold the spent notes back: the tail of every submission.
@@ -7388,6 +7398,36 @@ mod tests {
             "the same call proof under another fee bundle"
         );
         assert!(bind_call(&mut Transaction::shielded(13, bundle(50), Action::None), &prove_call).is_err(), "only a call is bound");
+    }
+
+    /// Review finding (fix round 1 of 5): under a node's gas policy, `submit_bound_call`'s guard
+    /// must price the REAL proof's bytes, not the pre-price `main.rs` made before the proof
+    /// existed — a fee that covers only the ledger floor of the same proof is refused, naming the
+    /// policy floor to retry with; the same fee, no policy, still passes (the old rule).
+    #[test]
+    fn the_bound_call_guard_refuses_a_policy_under_quote() {
+        use randprotocol_core::gas::GasPolicy;
+        let proof = vec![0u8; 1_300_000];
+        let tier = 12u8;
+        let bytes = gas::call_bytes(&proof, None);
+        let ledger_floor = gas::BUNDLE_BASE + gas::call_fee(tier, bytes);
+        let policy = ChainLimits {
+            max_program_words: 4096,
+            max_proof_bytes: 2 << 20,
+            max_block_bytes: 4 << 20,
+            max_call_envelope_bytes: 18_432,
+            max_program_public_words: 0,
+            envelope_bytes: None,
+            hardening_v6: true,
+            gas_price: Some(100),
+            byte_price: Some(800),
+        };
+        let want = GasPolicy::DEFAULT.call_floor(tier, 0, 0, bytes);
+        assert!(want > ledger_floor, "the policy floor must exceed the ledger floor for this test to say anything");
+        let e = refuse_if_under_the_floor(Some(&policy), tier, 0, 0, &proof, None, ledger_floor).unwrap_err().to_string();
+        assert!(e.contains(&format_amount(want)), "{e}");
+        // The same fee, no policy at all: the old rule, unchanged.
+        assert!(refuse_if_under_the_floor(None, tier, 0, 0, &proof, None, ledger_floor).is_ok());
     }
 
 }
