@@ -6,7 +6,7 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-28)
 
-### v0.6.2 — delegated proving, Phase 1 (2026-09-28; tag after chain 16 is live)
+### v0.6.2 — delegated proving, Phase 1 (2026-09-28; tagged `98d1ff6`, released — NOT rolled)
 
 A wallet's bundle proof made on a machine its owner runs (a desktop proving for a phone, a home
 server for a laptop). Spec `docs/superpowers/specs/2026-09-28-delegated-proving-design.md`, plan
@@ -15,6 +15,8 @@ branch `feat/delegated-proving`, rebased onto main at `e1572cd` (v0.6.1 + two te
 bumped to workspace version 0.6.2; the tag itself waits on chain 16 going live. **Trust model, in
 the spec's words: "delegating a proof is handing over custody"** — today's
 guest takes `sk` as a private input, so a Phase 1 prover can spend for every wallet it proves for.
+**Released 2026-09-28 ~17:20 UTC** (chain 16 live since 16:39 UTC): tag `v0.6.2` = `98d1ff6` on `main`, GitHub release with `rand-node` sha256 `fcd2ff69…1620b`, `rand` `3008cc0f…8520f`, `rand-prover` `85037c5d…492e2b` + `SHA256SUMS`, built on E in `/root/build062` (fullnode = git archive of the tag, circuits = archive of `b9ffc39` beside it, shipped from the laptop by scp — E's `/root/fullnode` is a stale rsync tree; E's clang 18 is fine, clang 23 is only for rand-guest). Smoke on E from the published binary: `keygen`, `pair --own`, `run`, `prover_info` lists v1 + v2 `hc_bundles`, a hostile-origin preflight gets 403. **No fleet roll** — node-only, opt-in; the roll is the user's separate go. Companion: clients `v0.6.5` (pin `e6d1327`) + the re-pin to this tag.
+
 **What it is:**
 
 - **Crate `randprotocol-prover`**: the sealed wire (`wire.rs`, ML-KEM-768 + ChaCha20-Poly1305, the reply under a one-time key, the
