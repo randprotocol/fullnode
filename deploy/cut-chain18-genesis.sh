@@ -87,6 +87,16 @@ NODE=${NODE:-target/release/rand-node}
 WALLET=${WALLET:-target/release/rand}
 CHAIN_ID=${CHAIN_ID:-18}
 OUT=${OUT:-deploy/genesis-chain18.json}
+# DRY_RUN=1 must be unmistakable: force a distinct output path (and, below, a distinct snapshot
+# filename) so a real cut can never find a dry-run artifact sitting at its own path, and a dry
+# run can never be confused for — or silently overwrite — a real one. Unconditional, not
+# `${OUT:-…}`: OUT already has a real default just above.
+SNAPSHOT_BASENAME=chain16-state.json
+if [ "$DRY_RUN" = 1 ]; then
+  OUT=deploy/genesis-chain18.DRY-RUN.json
+  SNAPSHOT_BASENAME=chain16-state.DRY-RUN.json
+fi
+export SNAPSHOT_BASENAME
 CHAIN16_GENESIS=${CHAIN16_GENESIS:-deploy/genesis-chain16.json}
 # Chain 16 was not yet live when this script was written (v0.6.1, "cut in flight") — unlike
 # chain 16's script, which pinned chain 15's already-known hash, there is no baked default here.
@@ -110,7 +120,7 @@ FAUCET_RECIPIENTS=${FAUCET_RECIPIENTS:-$HOME/.rand-chain16/faucet-recipients.txt
 ALLOC_ADDRESSES=${ALLOC_ADDRESSES:-$HOME/.rand-chain18/alloc-rand.txt}          # "<label> rand1… <RAND>" per line
 ZUSD_CARRY=${ZUSD_CARRY:-$HOME/.rand-chain18/zusd-carry.txt}                    # "<label> rand1… <zUSD>" per line
 PQ_GUARDIANS=${PQ_GUARDIANS:-$HOME/.rand-bridge/mainnet-set1/pq-guardians-chain16.json}
-PQ_GUARDIANS_SHA256=${PQ_GUARDIANS_SHA256:-b1f6e8781784fa6e88e295ff27626a9a42d1c1d4348826e49ef751ab06dd7fb1}  # inherited: the guardian-set-1 PQ file has not changed (rotation on hold) as of this writing — reconfirm against the bridge session at chain-16 cut time
+PQ_GUARDIANS_SHA256=${PQ_GUARDIANS_SHA256:-b1f6e8781784fa6e88e295ff27626a9a42d1c1d4348826e49ef751ab06dd7fb1}  # inherited: the guardian-set-1 PQ file has not changed (rotation on hold) as of this writing — reconfirm against the bridge session at chain-18 cut time
 PAUSE_KEY=${PAUSE_KEY:-$HOME/.rand-bridge/mainnet-set1/pause-key-chain16.pub}
 EXPECT_HC_BUNDLE=${EXPECT_HC_BUNDLE:-}         # optional pin: the v2 hc the release binary reports
 
@@ -154,9 +164,12 @@ EMITTER_2=${EMITTER_2:-$C16_EMITTER_2}
 EMITTER_3=${EMITTER_3:-$C16_EMITTER_3}
 EMITTER_4=${EMITTER_4:-$C16_EMITTER_4}
 EMITTER_5=${EMITTER_5:-$C16_EMITTER_5}
-# C15-1: one past the last lock chain 14 or 15 minted from each source. On 2026-09-28 every source
-# endpoint's next sequence is 2 and chain 14 minted sequences 0 and 1 from each (the relayer's
-# done/<chain>/{0,1} records, the round-1/round-2 mints); chain 16 minted nothing. `none` = no floor.
+# C15-1: one past the last lock chain 14 or 16 minted from each source (chain 16 is chain 18's
+# predecessor here — see the header). On 2026-09-28 every source endpoint's next sequence was 2 and
+# chain 14 minted sequences 0 and 1 from each (the relayer's done/<chain>/{0,1} records, the
+# round-1/round-2 mints); whether chain 16 minted anything by chain 18's own snapshot time is TBD —
+# read from the snapshot's own next_sequence, not assumed unchanged from chain 16's cut day.
+# `none` = no floor.
 for c in 2 3 4 5; do
   v=MIN_INBOUND_$c; e=EMITTER_$c; o=C16_EMITTER_$c
   if [ -z "${!v:-}" ]; then
@@ -207,7 +220,7 @@ export BACKINGS_PY
 # ══ snapshot: read-only reads of chain 16 and of the source endpoints ═════════════════════════
 if [ "${1:-}" = snapshot ]; then
   SNAP=${2:?snapshot <dir>}
-  [ ! -e "$SNAP/chain16-state.json" ] || { echo "cut-chain18: $SNAP/chain16-state.json exists — a snapshot is taken once; move it aside" >&2; exit 1; }
+  [ ! -e "$SNAP/$SNAPSHOT_BASENAME" ] || { echo "cut-chain18: $SNAP/$SNAPSHOT_BASENAME exists — a snapshot is taken once; move it aside" >&2; exit 1; }
   mkdir -p "$SNAP"; export SNAP
 
   # ── DRY_RUN=1: no live RPC, no source-chain reads. Everything the real snapshot step would read
@@ -366,11 +379,11 @@ snap = {
     "supply": None,
     "source": {"emitters": emitters, "next_sequence": {"2": 2, "3": 2, "4": 2, "5": 2}, "custody": custody},
 }
-json.dump(snap, open(os.path.join(SNAP, "chain16-state.json"), "w"), indent=1)
-print(f"cut-chain18: DRY_RUN snapshot — synthetic chain 16 at height {snap['status_height']} → {SNAP}/chain16-state.json")
-print(f"cut-chain18: DRY_RUN inputs written under {D} (validators.tsv, registrations/, pq-guardians.json, "
+json.dump(snap, open(os.path.join(SNAP, E["SNAPSHOT_BASENAME"]), "w"), indent=1)
+print(f"cut-chain18: DRY RUN — synthetic chain 16 at height {snap['status_height']} → {SNAP}/{E['SNAPSHOT_BASENAME']}")
+print(f"cut-chain18: DRY RUN — inputs written under {D} (validators.tsv, registrations/, pq-guardians.json, "
       f"pause-key.pub, faucet-recipients.txt, alloc-rand.txt, zusd-carry.txt, chain16-genesis-stub.json)")
-print(f"cut-chain18: DRY_RUN hc_bundle {hc_bundle} (probe genesis, guest v2)")
+print(f"cut-chain18: DRY RUN — hc_bundle {hc_bundle} (probe genesis, guest v2)")
 PY
     exit 0
   fi
@@ -498,10 +511,10 @@ if [ "$DRY_RUN" = 1 ]; then
   FAUCET_RECIPIENTS_CHANGED=1
   export VALIDATORS_TSV REGISTRATIONS PQ_GUARDIANS PQ_GUARDIANS_SHA256 PAUSE_KEY FAUCET_RECIPIENTS \
     ALLOC_ADDRESSES ZUSD_CARRY CHAIN16_GENESIS CHAIN16_HASH FAUCET_RECIPIENTS_CHANGED
-  echo "cut-chain18: DRY_RUN=1 — reading synthetic inputs from $DR (chain16_hash ${CHAIN16_HASH:0:16}…)"
+  echo "cut-chain18: DRY RUN — reading synthetic inputs from $DR (chain16_hash ${CHAIN16_HASH:0:16}…)"
 fi
 [ -n "$CHAIN16_HASH" ] || { echo "cut-chain18: CHAIN16_HASH is unset — chain 16 was not live when this script was written (see the header); set it once chain 16's genesis hash is known, or run with DRY_RUN=1" >&2; exit 1; }
-SNAPSHOT_FILE=$CHAIN16_SNAPSHOT/chain16-state.json; export SNAPSHOT_FILE
+SNAPSHOT_FILE=$CHAIN16_SNAPSHOT/$SNAPSHOT_BASENAME; export SNAPSHOT_FILE
 for bin in "$NODE" "$WALLET"; do
   [ -x "$bin" ] || { echo "cut-chain18: $bin is not executable — the cs8/gas release binaries (v0.6.5+)" >&2; exit 1; }
 done
@@ -633,7 +646,7 @@ for i, k in enumerate(pq_guardians + [pause_key]):
     need(re.fullmatch(r"[0-9a-f]{2624}", k), f"PQ key {i} is not 2624 lowercase hex characters")
 need(pause_key not in pq_guardians, "pause_key is one of the pq_guardians")
 need(len(set(pq_guardians)) == 8 and len(set(guardians)) == 8, "duplicate guardian key")
-# Chain 15's live bridge must still be what chain 18 starts from: no rotation, no PQ or pause-key
+# Chain 16's live bridge must still be what chain 18 starts from: no rotation, no PQ or pause-key
 # rotation, no burn since the snapshot values these defaults encode.
 need(sb["guardians"] == guardians, "chain 16's live guardian set differs from GUARDIANS")
 need(sb["guardian_set_index"] == int(E["GUARDIAN_SET_INDEX"]), f"chain 16 is at guardian set {sb['guardian_set_index']}")
@@ -656,7 +669,7 @@ for c in "2345":
     v = E[f"MIN_INBOUND_{c}"]
     next_seq = snap["source"]["next_sequence"][c]
     if v == "none":
-        need(c in redeployed, f"MIN_INBOUND_{c}=none on an endpoint chain 14/15 minted from — its old locks would replay")
+        need(c in redeployed, f"MIN_INBOUND_{c}=none on an endpoint chain 14/16 minted from — its old locks would replay")
         continue
     need(v.isdigit() and int(v) > 0, f"MIN_INBOUND_{c} is {v!r}: a positive sequence or `none`")
     # Above the endpoint's next sequence the floor would refuse locks nobody has minted yet.
@@ -831,15 +844,20 @@ cp "$OUT" "$FINAL_OUT"; OUT=$FINAL_OUT
 TS=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['timestamp_ms'])" "$OUT")
 AGE=$(( ( $(date +%s) * 1000 - TS ) / 1000 ))
 
+# DRY_RUN=1 must be unmistakable in the one place an operator is most likely to skim: every line
+# of this banner is prefixed, on top of $OUT and the snapshot filename already being distinct.
+BANNER_TAG=""
+[ "$DRY_RUN" != 1 ] || BANNER_TAG="DRY RUN — "
+
 cat <<EOF
 
-cut-chain18: wrote $OUT (sha256 $(shasum -a 256 "$OUT" | cut -c1-64))
-cut-chain18: genesis hash $HASH
-cut-chain18: chain id $CHAIN_ID, hc_bundle $HC_REPORTED (guest v2, == chain 16's), hardening_v6, consensus_domain 1, no aggregation
-cut-chain18: gas price $GAS_PRICE/gas, $BYTE_PRICE/KiB, bundle limit $BUNDLE_GAS_LIMIT, dynamic $GAS_DYNAMIC
-cut-chain18: 26 validators × $STAKE_RAND RAND (quorum 18); faucet minters: $FAUCET_MINTERS
-cut-chain18: bridge set $GUARDIAN_SET_INDEX, burn sequence $BURN_SEQUENCE, floors 2:$MIN_INBOUND_2 3:$MIN_INBOUND_3 4:$MIN_INBOUND_4 5:$MIN_INBOUND_5
-cut-chain18: zUSD at genesis — locked Tron-USDT $LOCKED_TRON_USDT, Sol-USDT $LOCKED_SOL_USDT
+${BANNER_TAG}cut-chain18: wrote $OUT (sha256 $(shasum -a 256 "$OUT" | cut -c1-64))
+${BANNER_TAG}cut-chain18: genesis hash $HASH
+${BANNER_TAG}cut-chain18: chain id $CHAIN_ID, hc_bundle $HC_REPORTED (guest v2, == chain 16's), hardening_v6, consensus_domain 1, no aggregation
+${BANNER_TAG}cut-chain18: gas price $GAS_PRICE/gas, $BYTE_PRICE/KiB, bundle limit $BUNDLE_GAS_LIMIT, dynamic $GAS_DYNAMIC
+${BANNER_TAG}cut-chain18: 26 validators × $STAKE_RAND RAND (quorum 18); faucet minters: $FAUCET_MINTERS
+${BANNER_TAG}cut-chain18: bridge set $GUARDIAN_SET_INDEX, burn sequence $BURN_SEQUENCE, floors 2:$MIN_INBOUND_2 3:$MIN_INBOUND_3 4:$MIN_INBOUND_4 5:$MIN_INBOUND_5
+${BANNER_TAG}cut-chain18: zUSD at genesis — locked Tron-USDT $LOCKED_TRON_USDT, Sol-USDT $LOCKED_SOL_USDT
 
-⚠  Stamped $AGE s ago; the chain's clock starts there. Launch within MINUTES, or delete $OUT and re-cut.
+${BANNER_TAG}⚠  Stamped $AGE s ago; the chain's clock starts there. Launch within MINUTES, or delete $OUT and re-cut.
 EOF
