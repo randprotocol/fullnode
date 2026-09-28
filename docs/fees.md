@@ -31,6 +31,23 @@ Value also leaves the pool through `burn`: a `Bond` burns exactly its amount int
 validator's public stake, and a `BridgeBurn` burns the amount plus a relayer fee in the bridged
 asset. Burns are not fees; `docs/supply.md` accounts for both.
 
+### 1.1 The gas floor (v0.6.4, spec `2026-09-28-gas-model-design.md` §4.1)
+
+A node prices a call by the work its proof header bounds, as admission policy on any chain:
+
+    gas_max = (2ᵗ − 1) + 191·(2ᵏˡʰ / 32) + 63·(2ˢˡʰ / 64)          -- 0 for an absent table
+    floor   = max( BUNDLE_BASE + call_fee(t, bytes),
+                   BUNDLE_BASE + gas_price·gas_max + byte_price·⌈bytes / 1024⌉ )
+
+`gas_price` and `byte_price` are the node's `--gas-price` / `--byte-price` (defaults 100 and
+800 units: 10⁻⁷ RAND per gas, 8·10⁻⁷ RAND per KiB from byte 0); `rand_getLimits` announces
+them and `rand_estimateFee` prices them; a wallet pays the floor by default. It is a policy above
+the ledger's schedule, never a block rule: the pool refuses `FeeTooLow` (not permanent), a block
+that carries a cheaper call is still valid. One gas is one cpu row; a `KECCAK` row is 192, a
+`SHA256` row 64 (§3.1 of the spec). What this changes: a tier-20 call pays ~0.107 RAND, not
+0.0025; a tier-10 call pays what it paid (~0.0021). The declared limit and the in-circuit meter
+that make this per-instruction rather than per-header come with the chain 18 cut.
+
 ## 2. What the sender pays with its own machine: proving
 
 The one cost that varies is producing the STARK proof, and only the sender's machine pays it.
@@ -65,7 +82,7 @@ and block ten million.
 The practical rule for a program author: keep the cycle count under the next tier boundary.
 The fee floor barely notices a tier step; the wallet's proving time notices a 4× jump.
 
-## 3. Why Ethereum needs gas and this chain does not
+## 3. Why Ethereum needs gas as a bound, and this chain uses it only as a price
 
 Ethereum's gas exists because **every node executes every transaction**, and execution is
 open-ended: a contract can loop forever, allocate storage without bound, or recurse, and every
@@ -88,10 +105,10 @@ So the three jobs of gas fall apart:
 
 - **Termination** is enforced by the tier. A run that does not halt within the budget cannot be
   proved at all; the prover, not the network, absorbs the failure.
-- **Pricing the work of others** is trivial because the work of others is nearly constant:
-  about 16 ms of verification with a warm verifier key, plus bytes. A flat floor per bundle and a
-  small tier step for calls cover it. The variable cost, proving, is borne by the sender's own
-  machine and never by anyone else, so there is nothing to meter.
+- **Pricing the work** is what the gas floor above does: the network's marginal cost per
+  instruction is near zero, but the sender's proving work is real, delegated provers and
+  aggregators sell exactly it, and a flat floor priced a million-cycle call like a thousand-cycle
+  one.
 - **Block sizing** is a byte budget (`MAX_BLOCK_BYTES`) and a transaction count, because
   verification cost per transaction is flat.
 
@@ -126,3 +143,5 @@ accounting (M4.4).
 | `MAX_PROOF_BYTES` | 2 MiB (constraint set 5's 80-query profile; re-measured and kept at constraint set 6) — the default; chains 13–15 set genesis `max_proof_bytes` to 8 MiB (note 2026-09-28) | `gas.rs` |
 | `MAX_BLOCK_BYTES`, `MAX_BLOCK_TXS` | 4 MiB, 2,000 | `gas.rs` |
 | tiers | 10, 12, 14, 16, 18, 20 cycles = `2ᵗ − 1` | `randprotocol-zkvm` `machine::TIERS` |
+| `KECCAK_GAS`, `SHA256_GAS` | 192, 64 units of gas per row | `gas.rs` |
+| `GAS_PRICE_DEFAULT`, `BYTE_PRICE_DEFAULT` | 100, 800 units — a node's `--gas-price`/`--byte-price` default | `gas.rs` |

@@ -333,12 +333,13 @@ input, `null` for an id no program has. A wallet proving a call passes these wor
 the proof commits to them and the ledger checks that commitment against `public_digest`.
 
 ### `rand_getLimits`
-Params: `[]`. Result: the chain's five call limits and the envelope size, from its genesis:
+Params: `[]`. Result: the chain's five call limits and the envelope size, from its genesis, plus
+this node's own gas policy:
 
 ```json
 { "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
   "max_call_envelope_bytes": 18432, "max_program_public_words": 0, "envelope_bytes": null,
-  "hardening_v6": false }
+  "hardening_v6": false, "gas_price": 100, "byte_price": 800, "gas_metering": "header" }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -360,6 +361,14 @@ program with a public input) instead of the public input alone —
 the fee bundle's notes chosen first, the call proved second, the bundle last; a chain with the flag
 refuses the old proof, a chain without it the new one. A node that predates the field answers
 without it, which a wallet reads as `false`.
+
+`gas_price`, `byte_price` and `gas_metering` are this **node's** own gas policy (spec
+`2026-09-28-gas-model-design.md` §4.1, Phase 0), not a chain limit — two nodes on one chain may
+answer differently. `gas_price`/`byte_price` are the node's `--gas-price`/`--byte-price` in units
+of 10⁻⁹ RAND (defaults 100, 800); `gas_metering` is `"header"` while the policy prices a call's
+`gas_max` off its proof's declared header, `null` with no policy (`--gas-price 0 --byte-price 0`).
+A node that predates these fields answers without them, which a wallet reads as no policy. Phase 1
+(chain 18) answers `"circuit"` — an in-circuit meter, not the header alone.
 
 ### `rand_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
@@ -408,11 +417,11 @@ receipt for that hash.
 
 ### `rand_estimateFee`
 Params: `[spec]`, one of `{"kind":"bundle"}`, `{"kind":"deploy","words":n,"public_words":m}` or
-`{"kind":"call","tier":t,"bytes":b}` (`t` one of 10, 12, 14, 16, 18, 20). Result: the minimum fee
-in units, as a string. `{"kind":"bundle"}` is the floor for a plain transfer: `1000000`. A deploy of
-more words than the chain's program cap (4096, or the genesis file's `max_program_words`) is an
-invalid-params error (`-32602`) naming the cap — the same program admission would refuse, so a
-wallet can ask before it proves.
+`{"kind":"call","tier":t,"bytes":b,"keccak_log_height":k,"sha256_log_height":s}` (`t` one of 10,
+12, 14, 16, 18, 20). Result: the minimum fee in units, as a string. `{"kind":"bundle"}` is the floor
+for a plain transfer: `1000000`. A deploy of more words than the chain's program cap (4096, or the
+genesis file's `max_program_words`) is an invalid-params error (`-32602`) naming the cap — the same
+program admission would refuse, so a wallet can ask before it proves.
 
 `public_words` (optional, default 0) is the deploy's public input length. Public words are paid for
 per word like code, so the fee is the deploy fee of `n + m` words. More than the chain's
@@ -423,6 +432,14 @@ Anything but a non-negative integer (or `null`) is `-32602` as well.
 at or under the free allowance (2 097 152 + 18 432 bytes) costs what it did before this field
 existed; each KiB over it, a partial KiB counting as whole, adds 1000 units. Without `bytes` the
 answer is the old one. Anything but a non-negative integer is `-32602`.
+
+`keccak_log_height` and `sha256_log_height` (both optional, default 0, spec 2026-09-28 §8) are the
+proof header's declared hash-table heights — `0` means the table is absent. Either out of `0..=40`
+is `-32602`. On a node that announces a gas policy (`rand_getLimits.gas_metering == "header"`) the
+answer is `GasPolicy::call_floor(tier, keccak_log_height, sha256_log_height, bytes)`: the greater of
+the ledger's own tier floor and `BUNDLE_BASE + gas_price·gas_max + byte_price·⌈bytes/1024⌉`
+(`docs/fees.md` §1.1). On a node with no policy the heights are accepted but change nothing — the
+answer is the ledger floor alone, as before.
 
 ### `rand_getTransaction`
 Params: `[hash]`. Result: `null` until committed, then:
@@ -1346,6 +1363,26 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-28 — gas (Phase 0): the header-priced call floor
+
+Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md` §4.1. Node policy, not a chain rule —
+`rand-node run` carries the policy by default (`--gas-price 100 --byte-price 800`); only
+`--gas-price 0 --byte-price 0` turns it off and answers as before.
+
+- **`rand_getLimits`** gains three fields: `gas_price`, `byte_price` (this node's `--gas-price` /
+  `--byte-price`, units of 10⁻⁹ RAND, defaults 100 and 800; `null` with no policy) and
+  `gas_metering` (`"header"` under a policy, `null` without one; Phase 1's chain 18 answers
+  `"circuit"`).
+- **`rand_estimateFee`**'s call spec gains `keccak_log_height`, `sha256_log_height` (optional,
+  `0..=40`, default 0, `-32602` outside the range): under a policy the answer is the gas floor of
+  that header, `max(BUNDLE_BASE + call_fee(tier, bytes), BUNDLE_BASE + gas_price·gas_max +
+  byte_price·⌈bytes/1024⌉)`; with no policy the heights are accepted but the answer is the ledger
+  floor alone.
+- **A pool refusal a submitter may now hear on a node running a policy**: `FeeTooLow` for a call
+  under its gas floor — not a permanent verdict (`rand_getTransactionStatus` still reads
+  `unknown` once it ages out of the pool), and never a block rule: a block carrying a cheaper call
+  is still valid on every node.
 
 ### 2026-09-28 — the v0.6 switch: `hardening_v6` in `rand_getLimits` (genesis-gated; on no chain yet)
 

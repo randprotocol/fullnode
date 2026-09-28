@@ -7,7 +7,11 @@ be chain 18 cut")**. Read against `origin/main` at `aedf458` (v0.6).
 Scope: fullnode (`randprotocol-core::gas`, the ledger's call rule, the wallet), one public value
 and one column in the zkVM (circuits).
 Ships in: **Phase 0 = v0.6.4** on any chain (node policy, no consensus change; plan
-`docs/superpowers/plans/2026-09-28-gas-phase0-v0.6.4.md`). **Phase 1 = the chain 18 cut**: a
+`docs/superpowers/plans/2026-09-28-gas-phase0-v0.6.4.md`). **Phase 0 built** (Tasks 1–6 on
+`feat/gas`: `gas_max`/`GasPolicy` in `randprotocol-core::gas`, `--gas-price`/`--byte-price` on
+`rand-node run`, `rand_getLimits`/`rand_estimateFee`, the mempool's `FeeTooLow` and surplus-per-KiB
+order, and the wallet's `gas bound …` line and `rand fee call`'s hash-height flags) — not yet
+tagged or rolled. **Phase 1 = the chain 18 cut**: a
 hard fork that changes every verifier key, so it rides the constraint set chain 18 carries.
 Constraint set 7 (#52) is chain 16's (v0.6.1, cut in flight) and chain 17 is delegated
 proving's (v0.6.3); neither takes the meter.
