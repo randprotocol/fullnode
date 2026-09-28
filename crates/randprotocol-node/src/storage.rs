@@ -32,8 +32,20 @@ const CF_TXS: &str = "txs";
 /// transaction's hash is not its raw hash, so the record cannot be found without it); and
 /// `b'a' + aggregate_hash` -> `bincode((subsidy, proving_shares, n))`, the payment facts of a
 /// committed aggregate (spec §5.4), written with its block so `rand_getAggregate` can report
-/// them without a historical ledger. All derived state, never consensus.
+/// them without a historical ledger; and `b'h' + sealed_at (8 BE) + bundle_hash` -> empty, the
+/// pruning pass's height index (INTERFACE-9): one row per `t` mark whose bundle the pass has not
+/// yet pruned, in the order the marks come due, deleted as the pass handles it. All derived
+/// state, never consensus.
 const CF_SEALS: &str = "seals";
+/// Set once `CF_SEALS`'s `h` rows have been built from its `t` rows (INTERFACE-9): a store sealed
+/// by an older build carries marks without the index, and `Storage::open` indexes them once.
+const META_SEAL_HEIGHTS_BUILT: &str = "seal_heights_built";
+/// Sealed bundles one `prune_sealed` pass rewrites at most (INTERFACE-9). A pass runs every 16
+/// blocks and at most one aggregate commits a block, so the steady state is 16 × `max_covers`
+/// bundles a pass; the cap only bites on a backlog — pruning turned on late, or the first pass
+/// over a store whose index was just backfilled — which then drains over a few passes instead
+/// of one long one. Each rewrite reads one raw record (~1.3 MB) and its block row (≤ 4 MiB).
+pub const PRUNE_SEALED_PASS_MAX: u64 = 64;
 const CF_META: &str = "meta";
 const CF_PROGRAMS: &str = "programs";
 const CF_RECEIPTS: &str = "receipts";
@@ -367,6 +379,16 @@ fn height_key(h: u64) -> [u8; 8] {
     h.to_be_bytes()
 }
 
+/// `CF_SEALS`'s height-index key (INTERFACE-9): `h ‖ sealed_at (BE) ‖ bundle`, so the family
+/// iterates the index in the order the marks come due.
+fn seal_height_key(sealed_at: u64, bundle: &Hash) -> [u8; 41] {
+    let mut k = [0u8; 41];
+    k[0] = b'h';
+    k[1..9].copy_from_slice(&sealed_at.to_be_bytes());
+    k[9..].copy_from_slice(bundle.as_bytes());
+    k
+}
+
 /// What a sealed bundle's record keeps of its raw proof (spec §6.2): the 34 public values and
 /// the declared shape, read off the stored zkVM proof. One reader for the `Raw` arm of
 /// [`Storage::covered_record`] and for the pruning pass, so the two forms read one way.
@@ -625,7 +647,33 @@ impl Storage {
         };
         storage.backfill_receipts_index()?;
         storage.prune_committed_qcs()?;
+        storage.backfill_seal_heights()?;
         Ok(storage)
+    }
+
+    /// Build the pruning pass's height index from the seal marks, once (INTERFACE-9): a store
+    /// sealed by a build without the index has `t` marks and no `h` rows, and the pass reads
+    /// only the index. Every mark gets a row — one whose record is already pruned too, which the
+    /// pass then only drops (and, since the block-row rewrite, uses to shrink that block's row).
+    /// Marked done under `META_SEAL_HEIGHTS_BUILT` in the same batch; a fresh store pays one
+    /// empty iteration.
+    fn backfill_seal_heights(&self) -> Result<()> {
+        if self.get_meta_raw(META_SEAL_HEIGHTS_BUILT)?.is_some() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::default();
+        for item in self.db.iterator_cf(self.cf(CF_SEALS), IteratorMode::From(b"t", rocksdb::Direction::Forward)) {
+            let (k, v) = item?;
+            if k.first() != Some(&b't') {
+                break;
+            }
+            let Ok(bundle) = <[u8; 32]>::try_from(&k[1..]).map(Hash) else { continue };
+            let Ok((_, sealed_at)) = bincode::deserialize::<(Hash, u64)>(&v) else { continue };
+            batch.put_cf(self.cf(CF_SEALS), seal_height_key(sealed_at, &bundle), []);
+        }
+        batch.put_cf(self.cf(CF_META), META_SEAL_HEIGHTS_BUILT, [1u8]);
+        self.db.write_opt(batch, &sync_opts())?;
+        Ok(())
     }
 
     /// Delete the `CF_QCS` rows strictly between genesis and the head, once (audit v5, OPS-4).
@@ -1473,6 +1521,7 @@ impl Storage {
         key.push(b't');
         key.extend_from_slice(bundle_hash.as_bytes());
         batch.put_cf(self.cf(CF_SEALS), &key, bincode::serialize(&(aggregate_tx, sealed_at))?);
+        batch.put_cf(self.cf(CF_SEALS), seal_height_key(sealed_at, &bundle_hash), []);
         self.db.write_opt(batch, &sync_opts())?;
         self.refresh_block_sealed_flag(&bundle_hash)
     }
@@ -1558,9 +1607,11 @@ impl Storage {
     /// least `window` blocks whose record is still `Raw` becomes its `Pruned` form, the 34
     /// public values and the declared shape filled from the stored proof. Aggregate
     /// transactions and unsealed bundles are never touched — the first are bundle-less, the
-    /// second have no mark. Returns how many records it rewrote.
+    /// second have no mark. The due marks come from the height index, at most
+    /// [`PRUNE_SEALED_PASS_MAX`] a pass (INTERFACE-9), so a pass's work is what came due, not
+    /// the store's whole sealed history. Returns how many records it rewrote.
     pub fn prune_sealed(&self, head_height: u64, window: u64, profile: randprotocol_core::types::FriProfile) -> Result<u64> {
-        self.prune_sealed_with(head_height, window, u64::MAX, &|tx_hash, proof| raw_proof_facts(tx_hash, proof, profile))
+        self.prune_sealed_with(head_height, window, PRUNE_SEALED_PASS_MAX, &|tx_hash, proof| raw_proof_facts(tx_hash, proof, profile))
     }
 
     /// [`Storage::prune_sealed`] with the raw proof's reader passed in: the production reader
@@ -1574,43 +1625,61 @@ impl Storage {
         max: u64,
         read: &dyn Fn(&Hash, &[u8]) -> Result<randprotocol_core::types::CoveredBundle>,
     ) -> Result<u64> {
-        let mut pruned = 0u64;
-        let seals: Vec<(Box<[u8]>, Box<[u8]>)> = self
-            .db
-            .iterator_cf(self.cf(CF_SEALS), IteratorMode::Start)
-            .collect::<std::result::Result<_, _>>()?;
-        for (k, _) in seals {
-            if pruned >= max {
+        // The due marks, from the height index (INTERFACE-9): its rows sort by `sealed_at`, so
+        // the walk stops at the first mark still inside its window, and a handled row is deleted
+        // — a pass visits what came due since the last one, never the whole sealed history.
+        let mut due: Vec<(Box<[u8]>, u64, Hash)> = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_SEALS), IteratorMode::From(b"h", rocksdb::Direction::Forward)) {
+            if due.len() as u64 >= max {
                 break;
             }
-            if k.first() != Some(&b't') {
-                continue;
+            let (k, _) = item?;
+            if k.first() != Some(&b'h') {
+                break;
             }
-            self.seal_rows_examined.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let bundle_hash = Hash(k[1..].try_into().map_err(|_| StorageError::Corrupt("seal key has wrong length".into()))?);
-            let Some((_, sealed_at)) = self.sealed_by(&bundle_hash)? else { continue };
+            if k.len() != 41 {
+                return Err(StorageError::Corrupt("seal height key has wrong length".into()));
+            }
+            let sealed_at = u64::from_be_bytes(k[1..9].try_into().expect("8 bytes"));
             if sealed_at.saturating_add(window) > head_height {
-                continue;
+                break;
             }
-            let Some(TxRecord::Raw { height, index, tx }) = self.tx_record(&bundle_hash)? else { continue };
-            let Some(bundle) = &tx.bundle else { continue };
-            let randprotocol_core::types::CoveredBundle { public_values, shape } = read(&bundle_hash, &bundle.proof)?;
-            let proof_hash = Hash::digest(&bundle.proof);
-            let mut pruned_tx = tx.clone();
-            let mut marker = PRUNED_PROOF_MARKER.to_vec();
-            marker.extend_from_slice(proof_hash.as_bytes());
-            pruned_tx.bundle.as_mut().expect("checked above").proof = marker;
-            let record = TxRecord::Pruned {
-                height,
-                index,
-                tx_hash: bundle_hash,
-                tx: pruned_tx,
-                proof_hash,
-                public_values: public_values.to_vec(),
-                shape,
-            };
-            self.put_pruned(&record)?;
-            pruned += 1;
+            let bundle_hash = Hash(k[9..].try_into().expect("32 bytes"));
+            due.push((k, sealed_at, bundle_hash));
+        }
+        let mut pruned = 0u64;
+        for (k, sealed_at, bundle_hash) in due {
+            self.seal_rows_examined.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut batch = WriteBatch::default();
+            batch.delete_cf(self.cf(CF_SEALS), &k);
+            // A row whose mark no longer says what it did (dropped with a truncated aggregate,
+            // or re-sealed at another height, which wrote its own row) is only dropped; so is
+            // one whose record is gone, not a bundle, or already pruned.
+            let current = self.sealed_by(&bundle_hash)?.is_some_and(|(_, at)| at == sealed_at);
+            if current {
+                if let Some(TxRecord::Raw { height, index, tx }) = self.tx_record(&bundle_hash)? {
+                    if let Some(bundle) = &tx.bundle {
+                        let randprotocol_core::types::CoveredBundle { public_values, shape } = read(&bundle_hash, &bundle.proof)?;
+                        let proof_hash = Hash::digest(&bundle.proof);
+                        let mut pruned_tx = tx.clone();
+                        let mut marker = PRUNED_PROOF_MARKER.to_vec();
+                        marker.extend_from_slice(proof_hash.as_bytes());
+                        pruned_tx.bundle.as_mut().expect("checked above").proof = marker;
+                        let record = TxRecord::Pruned {
+                            height,
+                            index,
+                            tx_hash: bundle_hash,
+                            tx: pruned_tx,
+                            proof_hash,
+                            public_values: public_values.to_vec(),
+                            shape,
+                        };
+                        self.stage_pruned(&mut batch, &record)?;
+                        pruned += 1;
+                    }
+                }
+            }
+            self.db.write_opt(batch, &sync_opts())?;
         }
         Ok(pruned)
     }
@@ -1620,13 +1689,20 @@ impl Storage {
     /// the store. `pub(crate)` so a test can store the pruned form of a stub-proved bundle, whose
     /// proof the pass (which decodes a real one) cannot read.
     pub(crate) fn put_pruned(&self, record: &TxRecord) -> Result<()> {
+        let mut batch = rocksdb::WriteBatch::default();
+        self.stage_pruned(&mut batch, record)?;
+        self.db.write_opt(batch, &sync_opts())?;
+        Ok(())
+    }
+
+    /// [`Storage::put_pruned`]'s rows, staged into the caller's batch (the pruning pass writes
+    /// them with the index row it drops).
+    fn stage_pruned(&self, batch: &mut WriteBatch, record: &TxRecord) -> Result<()> {
         let TxRecord::Pruned { tx_hash, proof_hash, .. } = record else {
             return Err(StorageError::Corrupt("put_pruned takes a pruned record".into()));
         };
-        let mut batch = rocksdb::WriteBatch::default();
         batch.put_cf(self.cf(CF_TXS), tx_hash.as_bytes(), bincode::serialize(record)?);
         batch.put_cf(self.cf(CF_SEALS), [b"p".as_slice(), proof_hash.as_bytes()].concat(), bincode::serialize(tx_hash)?);
-        self.db.write_opt(batch, &sync_opts())?;
         Ok(())
     }
 
@@ -1711,10 +1787,18 @@ impl Storage {
                     .unwrap_or_else(|| Hash::digest(&bundle.proof));
                 batch.delete_cf(self.cf(CF_SEALS), [b"p".as_slice(), ph.as_bytes()].concat());
             }
+            // Each mark takes its height-index row with it (INTERFACE-9); the row's key carries
+            // the mark's height, so the mark is read before it goes.
+            if let Some((_, sealed_at)) = self.sealed_by(&key)? {
+                batch.delete_cf(self.cf(CF_SEALS), seal_height_key(sealed_at, &key));
+            }
             batch.delete_cf(self.cf(CF_SEALS), [b"t".as_slice(), key.as_bytes()].concat());
             batch.delete_cf(self.cf(CF_SEALS), [b"a".as_slice(), key.as_bytes()].concat());
             if let randprotocol_core::types::Action::Aggregate { covers, .. } = &tx.action {
                 for cover in covers {
+                    if let Some((_, sealed_at)) = self.sealed_by(cover)? {
+                        batch.delete_cf(self.cf(CF_SEALS), seal_height_key(sealed_at, cover));
+                    }
                     batch.delete_cf(self.cf(CF_SEALS), [b"t".as_slice(), cover.as_bytes()].concat());
                     // With the mark goes the covered block's `sealed` flag, which the mark
                     // earned it. The retention pass drops a cover's block before its aggregate's
@@ -1757,6 +1841,18 @@ impl Storage {
         for item in self.db.iterator_cf(self.cf(CF_SEALS), IteratorMode::Start) {
             let (k, v) = item?;
             let Some((&shape, rest)) = k.split_first() else { continue };
+            // The height index (INTERFACE-9): `sealed_at ‖ bundle`, dropped with its mark's rule —
+            // a mark from an aggregate above `height`, or a bundle above it.
+            if shape == b'h' {
+                let drop = match (<[u8; 8]>::try_from(&rest[..rest.len().min(8)]), rest.get(8..).map(<[u8; 32]>::try_from)) {
+                    (Ok(at), Some(Ok(bundle))) => u64::from_be_bytes(at) > height || tx_above(&Hash(bundle)),
+                    _ => true,
+                };
+                if drop {
+                    batch.delete_cf(self.cf(CF_SEALS), &k);
+                }
+                continue;
+            }
             let Ok(id) = <[u8; 32]>::try_from(rest).map(Hash) else { continue };
             let drop = match shape {
                 b't' => match bincode::deserialize::<(Hash, u64)>(&v) {
@@ -2130,6 +2226,7 @@ impl Storage {
                             [b"t".as_slice(), cover.as_bytes()].concat(),
                             bincode::serialize(&(tx.hash(), block.height()))?,
                         );
+                        batch.put_cf(self.cf(CF_SEALS), seal_height_key(block.height(), cover), []);
                     }
                     if let Some(cfg) = ledger_after.aggregation() {
                         let n = ledger_after.supply().sealed_blocks.saturating_sub(1);
@@ -3616,6 +3713,50 @@ pub(crate) mod fixtures {
 
     pub(crate) fn bundle_fee() -> u64 {
         gas::BUNDLE_BASE
+    }
+
+    /// The 34 public values and the declared shape a stub-proved bundle's pruned record carries:
+    /// `OUT` its stub digest, `HC` the fixtures' guest, `PUB` its transaction binding, tier 14 —
+    /// exactly what the ledger's pruned branch binds (INTERFACE-3's and INTERFACE-6's
+    /// construction), so a store pruned with it replays and serves like a real one.
+    pub(crate) fn stub_pruned_facts(tx: &Transaction) -> randprotocol_core::types::CoveredBundle {
+        use randprotocol_core::confidential::ConfidentialExecutor as _;
+        use randprotocol_core::types::pv;
+        let bundle = tx.bundle.as_ref().expect("a bundle-carrying transaction");
+        let digest = StubExecutor.bundle_digest(&bundle.digest_input());
+        let hpub = StubExecutor.public_digest(&tx.binding());
+        let mut public_values = [0u64; 34];
+        public_values[pv::TIER] = 14;
+        for k in 0..8 {
+            public_values[pv::OUT0 + k] = digest[k] as u64;
+            public_values[pv::HC0 + k] = HC[k] as u64;
+            public_values[pv::PUB0 + k] = hpub[k] as u64;
+        }
+        randprotocol_core::types::CoveredBundle {
+            public_values,
+            shape: randprotocol_core::types::DeclaredShape {
+                profile: randprotocol_core::types::FriProfile::Test,
+                tier: 14,
+                program_log_height: 13,
+                input_log_height: 12,
+                keccak_log_height: 0,
+                sha256_log_height: 0,
+                public_log_height: 4,
+                mem_log_height: 18,
+            },
+        }
+    }
+
+    /// A pruning-pass proof reader ([`Storage::prune_sealed_with`]) for stub-proved bundles: the
+    /// [`stub_pruned_facts`] of whichever of `txs` the pass asks for, by raw hash.
+    pub(crate) fn stub_proof_reader(
+        txs: &[Transaction],
+    ) -> impl Fn(&Hash, &[u8]) -> Result<randprotocol_core::types::CoveredBundle> {
+        let facts: BTreeMap<Hash, randprotocol_core::types::CoveredBundle> =
+            txs.iter().map(|tx| (tx.hash(), stub_pruned_facts(tx))).collect();
+        move |tx_hash: &Hash, _proof: &[u8]| {
+            facts.get(tx_hash).cloned().ok_or_else(|| StorageError::Corrupt(format!("no stub facts for {tx_hash}")))
+        }
     }
 
     /// Apply `txs` to `ledger` as block `parent.height() + 1` and build the committed block that
@@ -7121,5 +7262,134 @@ mod seal_tests {
         assert_eq!(replayed.ledger.state_root(), l2.state_root(), "the same root");
         assert_eq!(replayed.ledger.supply(), l2.supply(), "the same counters");
         assert_eq!(replayed.ledger.unsealed_fees(), l2.unsealed_fees(), "the same bucket");
+    }
+
+    /// A committed block 1 carrying `n` stub-proved bundles, each with its own nullifiers and
+    /// commitments, and the ledger after it.
+    fn block_of_stub_bundles(n: u8) -> (tempfile::TempDir, Storage, GenesisState, Vec<Transaction>, Ledger) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1)], vec![], 100);
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let txs: Vec<Transaction> = (0..n)
+            .map(|i| bundle_tx(&ledger, [[21 + i as u32; 8], [41 + i as u32; 8]], [[61 + i as u32; 8], [81 + i as u32; 8]], bundle_fee()))
+            .collect();
+        let b1 = make_block(&gs.block, &mut ledger, txs.clone(), &key(1));
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        (dir, storage, gs, txs, ledger)
+    }
+
+    /// INTERFACE-9 (issue #51), the rescan half: the pruning pass walked every seal mark the
+    /// store ever held on every pass — reading each one's mark again, and each eligible one's
+    /// record — so its work grew with the chain's whole sealed history, every 16 blocks, for
+    /// ever. A pass must visit only the marks whose window has passed and that it has not
+    /// already pruned: a height index, drained as it prunes.
+    #[test]
+    fn the_sealed_pruning_pass_visits_only_the_marks_whose_window_passed_once() {
+        let (_d, storage, _gs, txs, _ledger) = block_of_stub_bundles(3);
+        let read = stub_proof_reader(&txs);
+        let aggregate = Hash::digest(b"the covering aggregate");
+        storage.mark_sealed(txs[0].hash(), aggregate, 2).unwrap();
+        storage.mark_sealed(txs[1].hash(), aggregate, 2).unwrap();
+        storage.mark_sealed(txs[2].hash(), Hash::digest(b"a later aggregate"), 10).unwrap();
+
+        let examined = |f: &dyn Fn() -> u64| {
+            let before = storage.seal_rows_examined();
+            let pruned = f();
+            (pruned, storage.seal_rows_examined() - before)
+        };
+        let pass = |head: u64, max: u64| storage.prune_sealed_with(head, 4, max, &read).unwrap();
+
+        assert_eq!(examined(&|| pass(6, u64::MAX)), (2, 2), "the two sealed at 2 are due at 6; the third is not visited");
+        assert_eq!(examined(&|| pass(6, u64::MAX)), (0, 0), "a second pass has nothing left to visit");
+        assert_eq!(examined(&|| pass(13, u64::MAX)), (0, 0), "sealed at 10, due at 14");
+        assert_eq!(examined(&|| pass(14, u64::MAX)), (1, 1), "the third, once");
+        assert_eq!(examined(&|| pass(100, u64::MAX)), (0, 0), "and nothing after");
+        for tx in &txs {
+            assert!(matches!(storage.tx_record(&tx.hash()).unwrap(), Some(TxRecord::Pruned { .. })));
+        }
+    }
+
+    /// The per-pass bound: a backlog (a node that turned pruning on late, or the first pass after
+    /// the index is backfilled) drains `max` bundles a pass, visiting no more than it prunes.
+    #[test]
+    fn the_sealed_pruning_pass_drains_a_backlog_a_bounded_step_at_a_time() {
+        let (_d, storage, _gs, txs, _ledger) = block_of_stub_bundles(3);
+        let read = stub_proof_reader(&txs);
+        for tx in &txs {
+            storage.mark_sealed(tx.hash(), Hash::digest(b"the covering aggregate"), 2).unwrap();
+        }
+        for expect in [2, 1, 0] {
+            let before = storage.seal_rows_examined();
+            assert_eq!(storage.prune_sealed_with(100, 4, 2, &read).unwrap(), expect);
+            assert_eq!(storage.seal_rows_examined() - before, expect, "visited no more than it pruned");
+        }
+    }
+
+    /// A store sealed by a build without the height index (its marks carry none) gets the index
+    /// at open, once, so the pass still reaches every mark.
+    #[test]
+    fn a_store_sealed_before_the_height_index_gets_it_at_open() {
+        let (dir, storage, _gs, txs, _ledger) = block_of_stub_bundles(2);
+        // The marks as the older build wrote them: the `t` rows alone, no index, no marker.
+        for tx in &txs {
+            storage
+                .db
+                .put_cf(storage.cf(CF_SEALS), [b"t".as_slice(), tx.hash().as_bytes()].concat(), bincode::serialize(&(Hash::digest(b"agg"), 2u64)).unwrap())
+                .unwrap();
+        }
+        storage.db.delete_cf(storage.cf(CF_META), META_SEAL_HEIGHTS_BUILT.as_bytes()).unwrap();
+        drop(storage);
+        let storage = Storage::open(dir.path()).unwrap();
+        assert_eq!(storage.prune_sealed_with(6, 4, u64::MAX, &stub_proof_reader(&txs)).unwrap(), 2, "both marks reached");
+        assert!(storage.get_meta_raw(META_SEAL_HEIGHTS_BUILT).unwrap().is_some(), "and the index marked built");
+    }
+
+    /// The index's rows are the block's to delete like every other seal row: history pruning and
+    /// truncation — over a decodable block or an undecodable one — leave none behind for a
+    /// bundle or an aggregate they drop.
+    #[test]
+    fn history_pruning_and_truncation_drop_the_height_index_rows() {
+        let seal_heights = |s: &Storage| {
+            s.db.iterator_cf(s.cf(CF_SEALS), IteratorMode::Start)
+                .filter(|kv| kv.as_ref().unwrap().0.first() == Some(&b'h'))
+                .count()
+        };
+        // Truncation below the covering aggregate's height drops the index row with the mark.
+        let (_d, storage, gs, covered_tx, at_1) = chain_with_a_stub_aggregate();
+        assert_eq!(seal_heights(&storage), 1, "the aggregate's commit indexed its cover");
+        storage.truncate_to(&gs, 1, &at_1).unwrap();
+        assert_eq!(seal_heights(&storage), 0, "truncated with the aggregate");
+        assert!(storage.sealed_by(&covered_tx.hash()).unwrap().is_none());
+        // Likewise when the aggregate's block no longer decodes (found from the rows themselves).
+        let (_d, storage, gs, _covered_tx, at_1) = chain_with_a_stub_aggregate();
+        storage.overwrite_block_bytes_for_testing(3, b"garbage").unwrap();
+        storage.truncate_to(&gs, 1, &at_1).unwrap();
+        assert_eq!(seal_heights(&storage), 0, "truncated over an undecodable aggregate");
+        // History pruning of the covered block drops it too.
+        let (_d, storage, _gs, _covered_tx, _at_1) = chain_with_a_stub_aggregate();
+        assert_eq!(storage.prune_history(u64::MAX, 2, 16).unwrap(), 1);
+        assert_eq!(seal_heights(&storage), 0, "history pruning took the index row with the bundle's block");
+    }
+
+    /// Block 1 a stub-proved bundle, block 2 empty, block 3 an aggregate covering it — stored
+    /// unchecked, the seal rows being storage's, written by `commit` off the transaction (the
+    /// truncation tests' construction). Returns the ledger at block 1, what a truncation to it installs.
+    fn chain_with_a_stub_aggregate() -> (tempfile::TempDir, Storage, GenesisState, Transaction, Ledger) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1)], vec![], 100);
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let covered = bundle_tx(&ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee());
+        let b1 = make_block(&gs.block, &mut ledger, vec![covered.clone()], &key(1));
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
+        let b2 = make_block_unchecked(&b1, &ledger, vec![], &key(1));
+        storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+        let b3 = make_block_unchecked(&b2, &ledger, vec![aggregate], &key(1));
+        storage.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
+        (dir, storage, gs, covered, ledger)
     }
 }
