@@ -150,13 +150,14 @@ pub struct SafetyState {
 /// One pruned bundle's attestation on the wire (block aggregation, spec §7's sealed form):
 /// everything a joining node needs to accept the marker form in place of the raw proof — the
 /// raw transaction's hash (unrecomputable once the proof bytes are gone, and what the tx_root
-/// checks against), the proof's hash (what the sync-side skip vouches for), the 34 public
-/// values and the declared shape (what the covering aggregate's admission reads).
+/// checks against), the proof's hash (what the sync-side skip vouches for), the `pv::NUM` (35)
+/// public values and the declared shape (what the covering aggregate's admission reads).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrunedBundle {
     pub tx_hash: crate::crypto::Hash,
     pub proof_hash: crate::crypto::Hash,
-    /// The 34 public values, in `pv` order — a `Vec` for serde's array limit, always 34.
+    /// The `pv::NUM` public values (35 since constraint set 8), in `pv` order — a `Vec` for
+    /// serde's array limit, always `pv::NUM` long.
     pub public_values: Vec<u64>,
     pub shape: crate::types::DeclaredShape,
 }

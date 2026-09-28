@@ -279,7 +279,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
         header.sha256_log_height,
         header.public_values[randprotocol_zkvm::tables::cpu::pv::GAS],
         randprotocol_core::gas::call_bytes(&proof, Some(&envelope)),
-    );
+    ).unwrap();
     let action = Action::Call { program: pid, proof, input_envelope: Some(envelope) };
     let call = wallet::submit(
         &rpc,
@@ -472,7 +472,7 @@ async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
         header.sha256_log_height,
         header.public_values[randprotocol_zkvm::tables::cpu::pv::GAS],
         gas::call_bytes(&proof, Some(&envelope)),
-    );
+    ).unwrap();
     let action = Action::Call { program: pid, proof, input_envelope: Some(envelope) };
     let call = wallet::submit(&rpc, &a, &mut store, None, action, fee, Burn::None, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
@@ -493,7 +493,7 @@ async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
         executor::prove_call(FriProfile::Test, &onchain, &inputs, &other, None, Backend::Cpu, caps.max_input_words, None)
             .expect("a proof over another public input still proves");
     let header = randprotocol_zkvm::executor::decode_canonical(&proof).expect("the call proof decodes");
-    let fee = wallet::call_fee_default(Some(&limits), tier, header.keccak_log_height, header.sha256_log_height, header.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], gas::call_bytes(&proof, None));
+    let fee = wallet::call_fee_default(Some(&limits), tier, header.keccak_log_height, header.sha256_log_height, header.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], gas::call_bytes(&proof, None)).unwrap();
     let action = Action::Call { program: pid, proof, input_envelope: None };
     let refused = wallet::submit(&rpc, &a, &mut store, None, action, fee, Burn::None, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true).await;
     drop(slot);

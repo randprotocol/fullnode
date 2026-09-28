@@ -63,7 +63,7 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | `--faucet` | off | **testnet only**: enable `Mint` transactions (`rand_mint`, up to 100 RAND per call). Part of the genesis hash |
 | `--no-confidential` | off | disable Deploy/Call transactions on this chain. Part of the genesis hash |
 | `--fri-profile <production\|test>` | `production` | zkVM FRI profile every node must use; `test` is insecure and for the test suite. Part of the genesis hash |
-| `--gas-price <UNITS>` | none — no `gas` section | units of RAND per gas the chain itself charges a call (constraint set 8, `docs/fees.md` §1.1). Writing this flag is what turns the section on at all; the other three below are meaningless without it. Part of the genesis hash |
+| `--gas-price <UNITS>` | none — no `gas` section | units of RAND per gas the chain itself charges a call (constraint set 8, `docs/fees.md` §1.1). Writing this flag is what turns the section on at all; the other three below are refused without it (`rand-node genesis` errors, naming the flag). Part of the genesis hash |
 | `--byte-price <UNITS>` | `800` (`BYTE_PRICE_DEFAULT`), only with `--gas-price` | units of RAND per KiB of call proof plus input envelope, from byte 0 |
 | `--bundle-gas-limit <N>` | `gas_max(14, 0, 0)` = `20479`, only with `--gas-price` | the exact `GAS_LIMIT` every bundle proof (transfer, bond, burn, …) must declare on this chain; a bundle proof declaring any other value is refused (`TxError::BundleGasLimit`, permanent), and the genesis itself refuses any value but `20479` (`GasConfig::check`, `gas::bundle_gas_limit_pin`) |
 | `--gas-dynamic <target_bytes>,<target_gas>,<adjust_bps>` | none — fixed prices | Phase 2 (`docs/fees.md` §1.2): turns on the per-block price controller, floored at the section's own starting `gas_price`/`byte_price`. Refused beside `--aggregation` (`GenesisError::DynamicGasWithAggregation`) |
@@ -220,7 +220,7 @@ bundles' proving shares) to the register's payout address, signs and submits. `r
 `aggregation` section carries the chain parameters the payment is computed from.
 
 `rand-node run` gains **`--keep-raw-proofs`**: an archive node keeps sealed bundles' raw
-proofs; by default the pruning pass rewrites their records (34 public values + the 7 declared
+proofs; by default the pruning pass rewrites their records (`pv::NUM` = 35 public values + the 7 declared
 shape bytes) once the sealing window passes.
 
 ### `rand-node init`

@@ -340,8 +340,9 @@ pub enum BlockError {
     #[error("too many transactions in block")]
     TooManyTransactions,
     /// A sealed-form batch's side table carries a pruned record whose public-value list is not
-    /// the 34 words a covering aggregate reads (deep scan 2026-09-24): refused before any
-    /// transaction of the block is applied — a peer's wire input is never indexed on trust.
+    /// the `pv::NUM` (35 since constraint set 8) words a covering aggregate reads (deep scan
+    /// 2026-09-24): refused before any transaction of the block is applied — a peer's wire input
+    /// is never indexed on trust.
     #[error("pruned record for tx {tx} carries {words} public values, not {expected}")]
     MalformedPrunedRecord { tx: Hash, words: usize, expected: usize },
     /// A side-table record carries a public value at or past the Goldilocks order (the rescan's
@@ -397,7 +398,7 @@ pub struct CallReceiptData {
     /// [`call_envelope`] for the one rule the chain applies to it.
     pub input_envelope: Option<crate::types::CallEnvelope>,
     /// What this call adds to its block's `gas_used` for the Phase 2 controller
-    /// ([`Ledger::call_gas_used`]; 0 until B3). Not on the stored receipt.
+    /// ([`Ledger::call_gas_used`]: the proof's declared `GAS_LIMIT`). Not on the stored receipt.
     pub gas_used: u64,
 }
 
@@ -636,7 +637,7 @@ pub struct Ledger {
     /// Deposit notes this block's transactions made the ledger create (see [`Deposit`]).
     deposits: Vec<Deposit>,
     /// The sealed form's side table for the block being applied (spec §7), keyed by proof
-    /// hash: the raw transaction hash and the 34 public values per pruned bundle. Scratch,
+    /// hash: the raw transaction hash and the `pv::NUM` (35) public values per pruned bundle. Scratch,
     /// like `deposits` — set by `apply_transactions_for_sync`, cleared with the deposits,
     /// never hashed into anything, and empty on every path but sealed-form sync.
     pruned_side: BTreeMap<Hash, (Hash, Vec<u64>)>,
@@ -1248,7 +1249,8 @@ impl Ledger {
 
     /// Set by genesis from `gas`, and by `reload_ledger` on every restart (after `load_ledger`
     /// restored the live prices, which this leaves alone — see `gas_prices`). Read by the Phase 2
-    /// controller (`close_block`) and the state root; the fee floor rules are a later task.
+    /// controller (`close_block`), the state root, the call floor ([`Self::gas_call_floor`]) and
+    /// the bundle's pinned gas limit.
     pub fn set_gas(&mut self, g: Option<gas::GasConfig>) {
         self.gas = g;
     }
@@ -2215,7 +2217,7 @@ impl Ledger {
         let mut scratch = self.clone();
         // The deposits reported after a block are exactly that block's (see `Deposit`).
         scratch.deposits.clear();
-        // A side table is a peer's wire input: every record must be the 34-word list the
+        // A side table is a peer's wire input: every record must be the `pv::NUM`-word list the
         // covering aggregate's admission and the digest check below index into, checked here
         // once, before any transaction is read.
         for p in pruned {

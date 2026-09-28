@@ -402,18 +402,19 @@ enum Cmd {
         #[arg(long)]
         gas_price: Option<u64>,
         /// The gas section's price per KiB (or part of one) of call proof and input envelope,
-        /// from byte 0. Only meaningful with `--gas-price`; defaults to
+        /// from byte 0. Refused without `--gas-price`; defaults to
         /// [`randprotocol_core::gas::BYTE_PRICE_DEFAULT`] when that is given and this is not.
         #[arg(long)]
         byte_price: Option<u64>,
         /// The gas section's flat bundle gas limit (spec §4.3): every bundle proof's declared
-        /// `GAS_LIMIT` must equal this exactly. Only meaningful with `--gas-price`; defaults to
-        /// `gas_max(14, 0, 0)` = `20 479` (today's tier-14 bundle guest) when that is given and this is not.
+        /// `GAS_LIMIT` must equal this exactly, and genesis accepts only `gas_max(14, 0, 0)` =
+        /// `20 479` (today's tier-14 bundle guest), the default when `--gas-price` is given and
+        /// this is not. Refused without `--gas-price`.
         #[arg(long)]
         bundle_gas_limit: Option<u64>,
         /// Phase 2 (spec §7.1): the dynamic price controller, as
         /// `<target_block_bytes>,<target_block_gas>,<adjust_bps>`. The floors (`min_gas_price`,
-        /// `min_byte_price`) are set to the section's own starting prices. Only meaningful with
+        /// `min_byte_price`) are set to the section's own starting prices. Refused without
         /// `--gas-price`; omitted, the prices this command writes never move.
         #[arg(long, value_name = "TARGET_BYTES,TARGET_GAS,ADJUST_BPS")]
         gas_dynamic: Option<String>,
@@ -480,7 +481,7 @@ enum Cmd {
         verify_chain: String,
         /// Keep the raw proofs of sealed bundles (block aggregation, spec §6.2): an archive
         /// node. By default the pruning pass rewrites a sealed bundle's record to its pruned
-        /// form (34 public values + the declared shape) once the window passes.
+        /// form (`pv::NUM` = 35 public values + the declared shape) once the window passes.
         #[arg(long)]
         keep_raw_proofs: bool,
         /// Let the viewing-key methods answer callers that are not on loopback.
@@ -856,40 +857,7 @@ async fn main() -> Result<()> {
             };
             // The gas section (spec §4.2, §4.3, §7.1): written only when `--gas-price` is given,
             // so a chain cut without it hashes byte-for-byte as before.
-            let gas = match gas_price {
-                Some(gas_price) => Some(randprotocol_core::gas::GasConfig {
-                    gas_price,
-                    byte_price: byte_price.unwrap_or(randprotocol_core::gas::BYTE_PRICE_DEFAULT),
-                    bundle_gas_limit: bundle_gas_limit_or_default(bundle_gas_limit),
-                    metering: randprotocol_core::gas::GasMetering::Circuit,
-                    dynamic: match &gas_dynamic {
-                        Some(spec) => {
-                            let parts: Vec<&str> = spec.split(',').collect();
-                            let [target_block_bytes, target_block_gas, adjust_bps] = parts.as_slice() else {
-                                anyhow::bail!(
-                                    "--gas-dynamic {spec} must be <target_block_bytes>,<target_block_gas>,<adjust_bps>"
-                                );
-                            };
-                            let byte_price = byte_price.unwrap_or(randprotocol_core::gas::BYTE_PRICE_DEFAULT);
-                            Some(randprotocol_core::gas::DynamicGas {
-                                target_block_bytes: target_block_bytes
-                                    .parse()
-                                    .with_context(|| format!("--gas-dynamic {spec}: bad target_block_bytes"))?,
-                                target_block_gas: target_block_gas
-                                    .parse()
-                                    .with_context(|| format!("--gas-dynamic {spec}: bad target_block_gas"))?,
-                                adjust_bps: adjust_bps
-                                    .parse()
-                                    .with_context(|| format!("--gas-dynamic {spec}: bad adjust_bps"))?,
-                                min_gas_price: gas_price,
-                                min_byte_price: byte_price,
-                            })
-                        }
-                        None => None,
-                    },
-                }),
-                None => None,
-            };
+            let gas = gas_section(gas_price, byte_price, bundle_gas_limit, gas_dynamic.as_deref())?;
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -1628,6 +1596,68 @@ pub fn parse_prune_history(s: &str) -> Result<Duration, String> {
     Ok(d)
 }
 
+/// `rand-node genesis`'s gas flags as the genesis `gas` section (spec §4.2, §4.3, §7.1):
+/// `None` without `--gas-price`, so a chain cut without it hashes byte-for-byte as before — and
+/// then any of the other three gas flags is an error, never a silently section-less genesis.
+fn gas_section(
+    gas_price: Option<u64>,
+    byte_price: Option<u64>,
+    bundle_gas_limit: Option<u64>,
+    gas_dynamic: Option<&str>,
+) -> Result<Option<randprotocol_core::gas::GasConfig>> {
+    if gas_price.is_none() {
+        let given: Vec<&str> = [
+            byte_price.map(|_| "--byte-price"),
+            bundle_gas_limit.map(|_| "--bundle-gas-limit"),
+            gas_dynamic.map(|_| "--gas-dynamic"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !given.is_empty() {
+            anyhow::bail!(
+                "{} given without --gas-price: the gas section is written only with --gas-price, so this genesis would \
+                 have none",
+                given.join(", ")
+            );
+        }
+    }
+    Ok(match gas_price {
+        Some(gas_price) => Some(randprotocol_core::gas::GasConfig {
+            gas_price,
+            byte_price: byte_price.unwrap_or(randprotocol_core::gas::BYTE_PRICE_DEFAULT),
+            bundle_gas_limit: bundle_gas_limit_or_default(bundle_gas_limit),
+            metering: randprotocol_core::gas::GasMetering::Circuit,
+            dynamic: match gas_dynamic {
+                Some(spec) => {
+                    let parts: Vec<&str> = spec.split(',').collect();
+                    let [target_block_bytes, target_block_gas, adjust_bps] = parts.as_slice() else {
+                        anyhow::bail!(
+                            "--gas-dynamic {spec} must be <target_block_bytes>,<target_block_gas>,<adjust_bps>"
+                        );
+                    };
+                    let byte_price = byte_price.unwrap_or(randprotocol_core::gas::BYTE_PRICE_DEFAULT);
+                    Some(randprotocol_core::gas::DynamicGas {
+                        target_block_bytes: target_block_bytes
+                            .parse()
+                            .with_context(|| format!("--gas-dynamic {spec}: bad target_block_bytes"))?,
+                        target_block_gas: target_block_gas
+                            .parse()
+                            .with_context(|| format!("--gas-dynamic {spec}: bad target_block_gas"))?,
+                        adjust_bps: adjust_bps
+                            .parse()
+                            .with_context(|| format!("--gas-dynamic {spec}: bad adjust_bps"))?,
+                        min_gas_price: gas_price,
+                        min_byte_price: byte_price,
+                    })
+                }
+                None => None,
+            },
+        }),
+        None => None,
+    })
+}
+
 /// `rand-node genesis --bundle-gas-limit`'s value, or its default: what every real hidden-asset
 /// bundle proof declares, the tier-14 hash-free ceiling `gas_max(BUNDLE_PROOF_TIER, 0, 0)` (spec
 /// §4.3) — also the only value `Genesis::build` accepts (`GasConfig::check`), so a flag naming
@@ -2099,12 +2129,12 @@ mod tests {
             (Some(100), Some(800), Some(20_479), None)
         );
         assert_eq!(
-            parse(&["--gas-price", "100", "--gas-dynamic", "2097152,262144,1250"]).3,
-            Some("2097152,262144,1250".to_string())
+            parse(&["--gas-price", "100", "--gas-dynamic", "10485760,262144,1250"]).3,
+            Some("10485760,262144,1250".to_string())
         );
 
-        // Without `--gas-price` the other three flags parse but write no section: chain 15's
-        // shape, byte-for-byte.
+        // Without any gas flag no section is written: chain 15's shape, byte-for-byte (and any of
+        // the other three without `--gas-price` is refused: `a_gas_flag_without_gas_price_is_refused`).
         let g = pinned_genesis();
         assert!(g.gas.is_none());
         assert!(!g.to_json().contains("\"gas\""));
@@ -2132,6 +2162,24 @@ mod tests {
         let built = with_gas.build(&ZkExecutor::new(FriProfile::Test)).unwrap();
         assert_eq!(built.ledger.gas().unwrap().bundle_gas_limit, 20_479);
         assert_ne!(built.hash(), pinned_genesis().build(&ZkExecutor::new(FriProfile::Test)).unwrap().hash());
+    }
+
+    /// Final-review minor 4: `--byte-price`, `--bundle-gas-limit` or `--gas-dynamic` without
+    /// `--gas-price` is an error naming the flag, not a genesis silently cut with no gas section.
+    #[test]
+    fn a_gas_flag_without_gas_price_is_refused() {
+        assert_eq!(gas_section(None, None, None, None).unwrap(), None, "no flags: no section");
+        for (byte_price, bundle, dynamic, flag) in [
+            (Some(800), None, None, "--byte-price"),
+            (None, Some(20_479), None, "--bundle-gas-limit"),
+            (None, None, Some("10485760,262144,1250"), "--gas-dynamic"),
+        ] {
+            let e = gas_section(None, byte_price, bundle, dynamic).expect_err(&format!("{flag} alone must be refused")).to_string();
+            assert!(e.contains(flag) && e.contains("--gas-price"), "{e}");
+        }
+        let with = gas_section(Some(100), Some(800), None, Some("10485760,262144,1250")).unwrap().unwrap();
+        assert_eq!(with.bundle_gas_limit, 20_479);
+        assert_eq!(with.dynamic.unwrap().target_block_bytes, 10_485_760);
     }
 
     /// `rand-node alloc-note --envelope-bytes 1860` seals its note at exactly 1 860 bytes — the

@@ -989,7 +989,7 @@ async fn confidential_call_rides_on_a_bundle() {
         header.sha256_log_height,
         header.public_values[randprotocol_zkvm::tables::cpu::pv::GAS],
         randprotocol_core::gas::call_bytes(&proof, None),
-    );
+    ).unwrap();
     let called = wallet::submit(
         &n0.rpc,
         &a,
@@ -1637,7 +1637,7 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
         header.sha256_log_height,
         header.public_values[randprotocol_zkvm::tables::cpu::pv::GAS],
         randprotocol_core::gas::call_bytes(&proof, Some(&sealed)),
-    );
+    ).unwrap();
     let called = wallet::submit(
         &n0.rpc,
         &caller,
@@ -2735,7 +2735,7 @@ async fn a_chain18_genesis_prices_calls_by_their_declared_limit() {
     assert!(run.gas <= tight && tight < ceiling, "the default bucket sits between the exact gas and the ceiling");
     let limits = n0.rpc.limits().await.unwrap().unwrap();
     let quote = wallet::hardened_call_quote_bytes(Some(&limits), 0);
-    let tight_fee = wallet::call_fee_default(Some(&limits), tier, 0, 0, tight, quote);
+    let tight_fee = wallet::call_fee_default(Some(&limits), tier, 0, 0, tight, quote).unwrap();
     let called = chain18_call(&n0, &a, &mut store, &program, id, &inputs, tier, Some(tight), tight_fee, &limits).await;
     let call_tx = committed_tx(&n0, &called.hash);
     let Action::Call { proof: call_proof, .. } = &call_tx.action else { panic!("not a call") };
@@ -2775,14 +2775,14 @@ async fn a_chain18_genesis_prices_calls_by_their_declared_limit() {
     if (tgp, tbp) == (gp, bp) {
         assert_eq!(est_tight, floor, "rand_estimateFee reproduces the floor the node demanded");
     }
-    assert_eq!(est_tight, wallet::call_floor(Some(&n0.rpc.limits().await.unwrap().unwrap()), tier, 0, 0, tight, call_bytes));
+    assert_eq!(est_tight, wallet::call_floor(Some(&n0.rpc.limits().await.unwrap().unwrap()), tier, 0, 0, tight, call_bytes).unwrap());
     let est_max = estimate(ceiling).await;
     assert!(est_tight < est_max, "a tight limit pays less than the ceiling: {est_tight} vs {est_max}");
     eprintln!("2. floor {floor}, estimate(tight) {est_tight}, estimate(ceiling) {est_max}");
 
     // ---- 3. the same call at `max` (`None` → the header's ceiling) ----
     let limits = n0.rpc.limits().await.unwrap().unwrap();
-    let max_fee = wallet::call_fee_default(Some(&limits), tier, 0, 0, ceiling, quote);
+    let max_fee = wallet::call_fee_default(Some(&limits), tier, 0, 0, ceiling, quote).unwrap();
     let called_max = chain18_call(&n0, &a, &mut store, &program, id, &inputs, tier, None, max_fee, &limits).await;
     let max_tx = committed_tx(&n0, &called_max.hash);
     let Action::Call { proof: max_proof, .. } = &max_tx.action else { panic!("not a call") };

@@ -197,7 +197,7 @@ fullnode, C1 deploy); live ledger
 `.superpowers/sdd/2026-09-28-gas-phase1-phase2-chain18/progress.md` (every `Ruling:` line).
 Circuits worktree `/private/tmp/circuits-cs8` (branch `feat/cs8-gas`, **final `18c2627`, unpushed
 to origin**); fullnode worktree `/private/tmp/fullnode-gas18` (branch `feat/gas-chain18`, off
-`feat/gas`, head at this task's two commits). Both Phase 0 (v0.6.4, node policy, see the entry
+`feat/gas`). Both Phase 0 (v0.6.4, node policy, see the entry
 below) and Phase 1+2 are unreleased — nothing here is live, nothing is tagged, nothing is rolled.
 
 **What it is.** One column, one public value in the cpu AIR (`pv::GAS = 34`, `pv::NUM 34 → 35`):
@@ -210,15 +210,18 @@ shipped). Native `check_public_values` refuses `GAS_LIMIT > gas_max(header)` and
 191·⌊2^klh/32⌋ + 63·⌊2^slh/64⌋` — the `2^(t−2)` Poseidon2-absorb-surcharge term a first draft of
 this design omitted (below). Genesis `gas` section: `gas_price`/`byte_price` (decimal strings),
 `bundle_gas_limit` (`20 479` = `gas_max(14, 0, 0)`, every real bundle proof must declare exactly
-this — `TxError::BundleGasLimit`, permanent), `metering: "circuit"`, optional `dynamic {
+this — `TxError::BundleGasLimit`, permanent — and genesis refuses any other value), `metering: "circuit"`, optional `dynamic {
 target_block_bytes, target_block_gas, adjust_bps, min_gas_price, min_byte_price }` (Phase 2);
-bound into the genesis hash big-endian, only when present, refused beside `aggregation`. Ledger:
+bound into the genesis hash big-endian, only when present (`genesis::gas_commit`, pinned byte for
+byte); unknown keys refused (`deny_unknown_fields`); `dynamic` is refused beside `aggregation`. Ledger:
 `Ledger::gas_call_floor`/`circuit_call_floor` price a call at `outcome.gas_limit`; Phase 2's
-`GasPrices` moves once a block in `close_block` (`next_price`, floor `div_euclid`, saturating),
+`GasPrices` moves once a block in `close_block` (`next_price`: `used` capped at `2·target`, floor
+`div_euclid`, saturating),
 folded into the state root under `rand-state-7` only with `dynamic`, persisted at
 `META_GAS_PRICES`, restored by `reload_ledger`. RPC: `rand_getLimits` gains `bundle_gas_limit`,
 `adjust_bps`, `gas_metering: "circuit"`, the tip's dynamic prices; `rand_estimateFee`'s call spec
-requires `gas` under a section; `rand_status`/`rand_getLimits` serve `gas_prices`. Wallet: `rand
+requires `gas` under a section; `rand_getLimits` serves the tip's `gas_price`/`byte_price` and
+`rand_status` its `gas_prices`. Wallet: `rand
 call --gas-limit <N|max>` (CPU-backend default under a section: the dry run's exact gas rounded up
 to a multiple of `2^(t−2)`, five values a tier under the ceiling — non-CPU backends and no-section
 chains default to `max`, the only thing they can declare), `rand fee call <tier> [--gas N]`
@@ -270,6 +273,21 @@ old value now).
   genesis combines the two today; the fix is a genesis-validation refusal
   (`GenesisError::DynamicGasWithAggregation`), not a storage redesign — the raw-length side-table
   field that would let them coexist is future work.
+- **A chain-18 build would have started on chain 16.** Constraint set 8 moves every verifier key
+  again, but chain 16 pins guest v2, which this build still carries, so the `hc_bundle` check alone
+  let it start there — its replay (or a `verify --repair`) would then refuse, and truncate, chain
+  16's history, on an archive the only full copy. `node::OLDER_CONSTRAINT_SET_CHAINS` now lists
+  chain 16 (set 7) beside 14 and 15 (set 6), refused at `run` and `verify`
+  (`a_constraint_set_8_build_refuses_chain_16`). No chain-17 genesis file is in this tree; add it
+  there when one is.
+- **The cut's block cap is 20 MiB, so the byte target is 10 MiB — half the cap.** The first cut
+  script said "half the 4 MiB soft cap" and set `target_block_bytes` 2 097 152, a tenth of the real
+  `MAX_BLOCK_BYTES=20971520`: a full block would have been 10× the target. It is now
+  `$((MAX_BLOCK_BYTES / 2))` = 10 485 760, checked by the cut. And `next_price` caps `used` at
+  `2·target`, so `adjust_bps` is the largest one-block move in either direction (a block's gas
+  can pass twice its target even when its bytes cannot); the wallet pays two steps of headroom,
+  `⌊floor·(10 000 + a)²/10 000²⌋`, because it prices at the committed head and lands 2–3 certified
+  blocks later.
 - **`reload_ledger` did not restore the `gas` section.** Genesis parameters outside the state root
   (`envelope_bytes`, `hardening_v6`, …) are re-applied by `node.rs`'s `reload_ledger` after
   `load_ledger`; `gas` was added to the ledger struct but not to that restore list, so a restarted

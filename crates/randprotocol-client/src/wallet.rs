@@ -1931,10 +1931,10 @@ fn refuse_if_under_the_floor(
     envelope: Option<&randprotocol_core::types::CallEnvelope>,
     fee: u64,
 ) -> Result<()> {
-    let need = call_floor(limits, tier, keccak_log_height, sha256_log_height, gas_limit, gas::call_bytes(proof, envelope));
+    let need = call_floor(limits, tier, keccak_log_height, sha256_log_height, gas_limit, gas::call_bytes(proof, envelope))?;
     if need > fee {
         return Err(anyhow!(
-            "the call proof came out at tier {tier}, {} bytes, whose fee is {} RAND — more than the {} RAND                  the fee bundle was built for; retry with --fee {}",
+            "the call proof came out at tier {tier}, {} bytes, whose fee is {} RAND — more than the {} RAND the fee bundle was built for; retry with --fee {}",
             proof.len(),
             format_amount(need),
             format_amount(fee),
@@ -2565,14 +2565,17 @@ pub fn call_fee_default(
     sha256_log_height: u8,
     gas_limit: u64,
     bytes: usize,
-) -> u64 {
-    with_headroom(limits, call_floor(limits, tier, keccak_log_height, sha256_log_height, gas_limit, bytes))
+) -> Result<u64> {
+    Ok(with_headroom(limits, call_floor(limits, tier, keccak_log_height, sha256_log_height, gas_limit, bytes)?))
 }
 
 /// The floor itself, no headroom: what the chain (or the node's policy) refuses a call under.
 /// [`call_fee_default`] is this plus the dynamic headroom; the post-proof guard
 /// ([`refuse_if_under_the_floor`]) compares a fee with this, so a `--fee` that pays the floor
 /// exactly is not refused for lacking headroom the caller chose not to buy.
+///
+/// Fail-closed under a `gas` section: a node that reports the section but leaves out
+/// `gas_price` or `byte_price` is an error naming the field, never a price of zero.
 pub fn call_floor(
     limits: Option<&ChainLimits>,
     tier: u8,
@@ -2580,14 +2583,17 @@ pub fn call_floor(
     sha256_log_height: u8,
     gas_limit: u64,
     bytes: usize,
-) -> u64 {
+) -> Result<u64> {
     if let Some(l) = limits.filter(|l| l.gas_circuit) {
-        return gas::circuit_call_floor(l.gas_price.unwrap_or(0), l.byte_price.unwrap_or(0), gas_limit, bytes);
+        let missing = |field: &str| anyhow!("the node reports a gas section (gas_metering \"circuit\") but no {field}: refusing to price the call at zero");
+        let gas_price = l.gas_price.ok_or_else(|| missing("gas_price"))?;
+        let byte_price = l.byte_price.ok_or_else(|| missing("byte_price"))?;
+        return Ok(gas::circuit_call_floor(gas_price, byte_price, gas_limit, bytes));
     }
-    match limits.and_then(|l| l.gas_policy()) {
+    Ok(match limits.and_then(|l| l.gas_policy()) {
         Some(p) => p.call_floor(tier, keccak_log_height, sha256_log_height, bytes),
         None => gas::BUNDLE_BASE + gas::call_fee(tier, bytes),
-    }
+    })
 }
 
 /// Spec §7.1: `⌊floor·(10 000 + adjust_bps)²/10 000²⌋` under the dynamic controller — two of the
@@ -6224,7 +6230,7 @@ mod tests {
         assert_eq!(hardened_call_quote_bytes(None, 0), 0);
         assert_eq!(hardened_call_quote_bytes(Some(&priced), 1_000), (20 << 20) + 1_000, "a policy: the cap in the proof's place");
         // The overcharge the no-policy rule avoids is real: the cap alone is past the free allowance.
-        assert!(call_fee_default(Some(&raised), 14, 0, 0, 0, (20 << 20) + 1_000) > call_fee_default(Some(&raised), 14, 0, 0, 0, 1_000));
+        assert!(call_fee_default(Some(&raised), 14, 0, 0, 0, (20 << 20) + 1_000).unwrap() > call_fee_default(Some(&raised), 14, 0, 0, 0, 1_000).unwrap());
     }
 
     #[test]
@@ -6241,11 +6247,11 @@ mod tests {
         let old = ChainLimits { gas_price: None, byte_price: None, ..policy };
         for tier in [10u8, 12, 14, 20] {
             // Review focus 4: no node, or an old node, prices the ledger's floor, nothing over it.
-            assert_eq!(call_fee_default(None, tier, 0, 0, 0, 0), gas::BUNDLE_BASE + gas::call_fee(tier, 0));
-            assert_eq!(call_fee_default(Some(&old), tier, 0, 0, 0, 1_300_000), gas::BUNDLE_BASE + gas::call_fee(tier, 1_300_000));
+            assert_eq!(call_fee_default(None, tier, 0, 0, 0, 0).unwrap(), gas::BUNDLE_BASE + gas::call_fee(tier, 0));
+            assert_eq!(call_fee_default(Some(&old), tier, 0, 0, 0, 1_300_000).unwrap(), gas::BUNDLE_BASE + gas::call_fee(tier, 1_300_000));
             // Under a policy: its floor of the header, exactly.
-            assert_eq!(call_fee_default(Some(&policy), tier, 0, 0, 0, 1_300_000), GasPolicy::DEFAULT.call_floor(tier, 0, 0, 1_300_000));
-            assert_eq!(call_fee_default(Some(&policy), tier, 12, 13, 0, 3_200_000), GasPolicy::DEFAULT.call_floor(tier, 12, 13, 3_200_000));
+            assert_eq!(call_fee_default(Some(&policy), tier, 0, 0, 0, 1_300_000).unwrap(), GasPolicy::DEFAULT.call_floor(tier, 0, 0, 1_300_000));
+            assert_eq!(call_fee_default(Some(&policy), tier, 12, 13, 0, 3_200_000).unwrap(), GasPolicy::DEFAULT.call_floor(tier, 12, 13, 3_200_000));
         }
         // A burn pays the bridge fee, the schedule's floor for it.
         let burn = Action::BridgeBurn {
@@ -6920,18 +6926,36 @@ mod tests {
     fn the_circuit_fee_is_the_declared_limits_floor() {
         let l = circuit_limits(None);
         for (tier, klh, slh) in [(10u8, 0u8, 0u8), (12, 0, 0), (14, 12, 13)] {
-            assert_eq!(call_fee_default(Some(&l), tier, klh, slh, 3_000, 1_300_000), gas::circuit_call_floor(100, 800, 3_000, 1_300_000));
+            assert_eq!(call_fee_default(Some(&l), tier, klh, slh, 3_000, 1_300_000).unwrap(), gas::circuit_call_floor(100, 800, 3_000, 1_300_000));
         }
-        assert!(call_fee_default(Some(&l), 12, 0, 0, 3_000, 0) < call_fee_default(Some(&l), 12, 0, 0, 4_000, 0), "the limit prices it");
+        assert!(call_fee_default(Some(&l), 12, 0, 0, 3_000, 0).unwrap() < call_fee_default(Some(&l), 12, 0, 0, 4_000, 0).unwrap(), "the limit prices it");
         // Without the section, the gas limit is ignored (Phase 0's header rule).
         let header = ChainLimits { gas_circuit: false, bundle_gas_limit: None, ..l };
-        assert_eq!(call_fee_default(Some(&header), 12, 0, 0, 3_000, 1_300_000), call_fee_default(Some(&header), 12, 0, 0, 9, 1_300_000));
+        assert_eq!(call_fee_default(Some(&header), 12, 0, 0, 3_000, 1_300_000).unwrap(), call_fee_default(Some(&header), 12, 0, 0, 9, 1_300_000).unwrap());
         // The post-proof guard prices the proof's own declared limit.
         let proof = vec![0u8; 1_300_000];
         let floor = gas::circuit_call_floor(100, 800, 3_000, gas::call_bytes(&proof, None));
         assert!(refuse_if_under_the_floor(Some(&l), 12, 0, 0, 3_000, &proof, None, floor).is_ok());
         let e = refuse_if_under_the_floor(Some(&l), 12, 0, 0, 3_001, &proof, None, floor).unwrap_err().to_string();
         assert!(e.contains(&format_amount(floor + 100)), "{e}");
+    }
+
+    /// Final-review minor 3: under a `gas` section a price the node left out is not zero — the
+    /// floor fails closed, naming the missing field, rather than pricing the call at nothing.
+    #[test]
+    fn a_missing_price_under_a_gas_section_fails_closed() {
+        let no_gas_price = ChainLimits { gas_price: None, ..circuit_limits(None) };
+        let no_byte_price = ChainLimits { byte_price: None, ..circuit_limits(None) };
+        let e = call_floor(Some(&no_gas_price), 12, 0, 0, 3_000, 0).unwrap_err().to_string();
+        assert!(e.contains("gas_price"), "{e}");
+        let e = call_fee_default(Some(&no_byte_price), 12, 0, 0, 3_000, 1_300_000).unwrap_err().to_string();
+        assert!(e.contains("byte_price"), "{e}");
+        let proof = vec![0u8; 1_000];
+        let e = refuse_if_under_the_floor(Some(&no_gas_price), 12, 0, 0, 3_000, &proof, None, u64::MAX).unwrap_err().to_string();
+        assert!(e.contains("gas_price"), "the post-proof guard fails closed too: {e}");
+        // Without a section the prices are the node's optional policy, as before.
+        let header = ChainLimits { gas_circuit: false, gas_price: None, byte_price: None, ..circuit_limits(None) };
+        assert!(call_floor(Some(&header), 12, 0, 0, 3_000, 0).is_ok());
     }
 
     /// Spec §7.1 (task B7, final-review I2c): two price steps of headroom under `dynamic`, none
@@ -6942,15 +6966,15 @@ mod tests {
         let fixed = circuit_limits(None);
         let dynamic = circuit_limits(Some(1_250));
         let floor = gas::circuit_call_floor(100, 800, 3_000, 1_300_000);
-        assert_eq!(call_fee_default(Some(&fixed), 12, 0, 0, 3_000, 1_300_000), floor);
+        assert_eq!(call_fee_default(Some(&fixed), 12, 0, 0, 3_000, 1_300_000).unwrap(), floor);
         let two_steps = (floor as u128 * 11_250 * 11_250 / 100_000_000) as u64;
-        assert_eq!(call_fee_default(Some(&dynamic), 12, 0, 0, 3_000, 1_300_000), two_steps, "floor · 1.125²");
+        assert_eq!(call_fee_default(Some(&dynamic), 12, 0, 0, 3_000, 1_300_000).unwrap(), two_steps, "floor · 1.125²");
         assert!(two_steps > floor + floor * 1_250 / 10_000, "more than one step");
-        assert_eq!(call_floor(Some(&dynamic), 12, 0, 0, 3_000, 1_300_000), floor, "the floor itself carries no headroom");
+        assert_eq!(call_floor(Some(&dynamic), 12, 0, 0, 3_000, 1_300_000).unwrap(), floor, "the floor itself carries no headroom");
         let proof = vec![0u8; 1_300_000];
         let exact = gas::circuit_call_floor(100, 800, 3_000, gas::call_bytes(&proof, None));
         assert!(refuse_if_under_the_floor(Some(&dynamic), 12, 0, 0, 3_000, &proof, None, exact).is_ok());
-        assert_eq!(call_fee_default(Some(&ChainLimits { adjust_bps: Some(5_000), ..dynamic }), 12, 0, 0, u64::MAX, 0), u64::MAX, "saturating");
+        assert_eq!(call_fee_default(Some(&ChainLimits { adjust_bps: Some(5_000), ..dynamic }), 12, 0, 0, u64::MAX, 0).unwrap(), u64::MAX, "saturating");
     }
 
     #[test]
