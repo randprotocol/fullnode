@@ -2724,6 +2724,18 @@ pub fn proof_cap(limits: Option<&ChainLimits>) -> usize {
     limits.map_or(gas::MAX_PROOF_BYTES, |l| l.max_proof_bytes)
 }
 
+/// The bytes a hardened `rand call` (INT-4) prices its fee on before its proof exists. Under the
+/// node's gas policy every byte prices in, so the chain's proof cap stands in for the unproved
+/// proof (it can only overpay). Without a policy the ledger charges only bytes past the free
+/// allowance, so the quote is `call_bytes(&[], envelope)` — the envelope alone, as before the gas
+/// work — and a raised-cap chain is not charged for proof bytes no real proof carries.
+pub fn hardened_call_quote_bytes(limits: Option<&ChainLimits>, envelope_bytes: usize) -> usize {
+    match limits.and_then(|l| l.gas_policy()) {
+        Some(_) => proof_cap(limits) + envelope_bytes,
+        None => envelope_bytes,
+    }
+}
+
 /// The proof-size pre-check `rand call` makes after proving and before the paying bundle is
 /// proved: a proof the chain refuses by size would cost that second proof for nothing.
 pub fn check_proof_size(proof_bytes: usize, cap: usize) -> Result<()> {
@@ -6782,6 +6794,26 @@ mod tests {
         let greedy = serde_json::json!({ "amount": "14000000000", "address": prover.address.to_string() });
         let e = prover_confirmation(&rpc, &info_only_prover(greedy, false).await).await.unwrap_err().to_string();
         assert!(e.contains("the prover quotes 14 RAND; the cap is 1 RAND (--max-prover-fee)"), "{e}");
+    }
+
+    /// Final review minor 1: the hardened pre-price stands the proof cap in for the unproved
+    /// proof only under a gas policy, where every byte prices in. Without one the ledger's byte
+    /// term charges only past the free allowance, and on a chain whose cap is raised past it the
+    /// cap would buy a byte charge no real proof pays: there the quote is the envelope alone, as
+    /// before the gas work.
+    #[test]
+    fn the_hardened_quote_prices_the_proof_cap_only_under_a_policy() {
+        let raised = ChainLimits {
+            max_program_words: 4096, max_proof_bytes: 20 << 20, max_block_bytes: 24 << 20, max_call_envelope_bytes: 18_432,
+            max_program_public_words: 0, envelope_bytes: None, hardening_v6: true,
+            gas_price: None, byte_price: None,
+        };
+        let priced = ChainLimits { gas_price: Some(100), byte_price: Some(800), ..raised };
+        assert_eq!(hardened_call_quote_bytes(Some(&raised), 1_000), 1_000, "no policy: the envelope, as before");
+        assert_eq!(hardened_call_quote_bytes(None, 0), 0);
+        assert_eq!(hardened_call_quote_bytes(Some(&priced), 1_000), (20 << 20) + 1_000, "a policy: the cap in the proof's place");
+        // The overcharge the no-policy rule avoids is real: the cap alone is past the free allowance.
+        assert!(call_fee_default(Some(&raised), 14, 0, 0, (20 << 20) + 1_000) > call_fee_default(Some(&raised), 14, 0, 0, 1_000));
     }
 
     #[test]

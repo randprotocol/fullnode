@@ -1512,15 +1512,17 @@ async fn main() -> Result<()> {
                 };
                 // The proof's own bytes cannot be known before it exists — the hardened path fixes
                 // the fee before proving (the binding covers the fee bundle, so the bundle is built
-                // first). Under a policy every byte prices in, so the proof's bytes cannot be left
-                // out of the quote the way the old free-allowance floor could afford to: this
-                // prices the chain's proof cap in the proof's own place (and heights 0, 0 — the
-                // real header is just as unknown), which can only overpay, by at most
-                // `(cap − actual) · byte_price` (≈ 0.0007 RAND at the 2 MiB cap); `--fee` pays
-                // exact. `submit_bound_call` re-prices the real proof's header once it exists and
-                // refuses to submit under its floor, naming the fee to retry with.
+                // first). Under the node's gas policy every byte prices in, so the proof's bytes
+                // cannot be left out of the quote: `hardened_call_quote_bytes` prices the chain's
+                // proof cap in the proof's own place (and heights 0, 0 — the real header is just as
+                // unknown), which can only overpay, by at most `(cap − actual) · byte_price`
+                // (≈ 0.0007 RAND at the 2 MiB cap); `--fee` pays exact. Without a policy the
+                // ledger's byte term charges only past the free allowance, so the quote is the
+                // envelope alone, as before — the cap would over-charge a raised-cap chain.
+                // `submit_bound_call` re-prices the real proof's header once it exists and refuses
+                // to submit under its floor, naming the fee to retry with.
                 let cap = wallet::proof_cap(limits.as_ref());
-                let bytes = cap + envelope.as_ref().map_or(0, |e| e.len());
+                let bytes = wallet::hardened_call_quote_bytes(limits.as_ref(), envelope.as_ref().map_or(0, |e| e.len()));
                 let fee = match fee {
                     Some(f) => parse_amount(&f)?,
                     None => wallet::call_fee_default(limits.as_ref(), tier, 0, 0, bytes),
