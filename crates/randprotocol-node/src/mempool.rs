@@ -2496,9 +2496,9 @@ mod tests {
     #[test]
     fn under_the_gas_section_the_pools_call_floor_is_the_ledger_rule() {
         use randprotocol_core::gas::{self, GasConfig, GasMetering, GasPolicy, GasPrices};
-        let section = GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 16_383, metering: GasMetering::Circuit, dynamic: None };
+        let section = GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 20_479, metering: GasMetering::Circuit, dynamic: None };
         let stub_len = StubExecutor::make_proof_with_public(&Hash::ZERO, 12, [0; 8], &[]).len();
-        // A stub tier-12 proof declares gas_max(12, 0, 0) = 4 095.
+        // A stub tier-12 proof declares gas_max(12, 0, 0) = 5 119 (4 095 cycles + the 2^10 absorb term).
         let want = gas::circuit_call_floor(100, 800, gas::gas_max(12, 0, 0), stub_len);
         assert!(want < gas::fee_floor(&Action::Call { program: Hash::ZERO, proof: vec![], input_envelope: None }), "cheaper than the schedule's pre-verify floor");
         for policy in [None, Some(GasPolicy::DEFAULT), GasPolicy::from_prices(1_000, 8_000)] {
@@ -2648,7 +2648,7 @@ mod tests {
     #[test]
     fn under_the_gas_section_candidates_order_by_surplus_per_kib_without_a_policy() {
         use randprotocol_core::gas::{self, GasConfig, GasMetering};
-        let section = GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 16_383, metering: GasMetering::Circuit, dynamic: None };
+        let section = GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 20_479, metering: GasMetering::Circuit, dynamic: None };
         let with_section = |(mut l, pid, tx): (Ledger, randprotocol_core::program::ProgramId, Transaction)| {
             l.set_gas(Some(section.clone()));
             (l, pid, tx)
@@ -2695,7 +2695,7 @@ mod tests {
         ledger.apply_tx(&deploy, &fixtures::key(1).address(), &StubExecutor).unwrap();
         ledger.record_anchor(ledger.height());
         ledger.set_hardening_v6(true);
-        ledger.set_gas(Some(GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 16_383, metering: GasMetering::Circuit, dynamic: None }));
+        ledger.set_gas(Some(GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 20_479, metering: GasMetering::Circuit, dynamic: None }));
         let stub_len = StubExecutor::make_proof_with_public(&pid, 12, [7; 8], &public).len();
         let floor = gas::circuit_call_floor(100, 800, gas::gas_max(12, 0, 0), stub_len);
         let b = fixtures::bundle_tx(&ledger, [[60; 8], [61; 8]], [[62; 8], [63; 8]], floor).bundle.expect("bundle");

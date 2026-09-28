@@ -1272,12 +1272,12 @@ mod tests {
         });
         let mut circuit = base();
         circuit["gas_metering"] = json!("circuit");
-        circuit["bundle_gas_limit"] = json!(16383);
+        circuit["bundle_gas_limit"] = json!(20479);
         circuit["adjust_bps"] = json!(1250);
         let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(circuit))]).await);
         let l = rpc.limits().await.unwrap().unwrap();
         assert!(l.gas_circuit);
-        assert_eq!((l.bundle_gas_limit, l.adjust_bps), (Some(16_383), Some(1_250)));
+        assert_eq!((l.bundle_gas_limit, l.adjust_bps), (Some(20_479), Some(1_250)));
         for metering in [json!("header"), json!(null), json!("quantum")] {
             let mut other = base();
             other["gas_metering"] = metering.clone();

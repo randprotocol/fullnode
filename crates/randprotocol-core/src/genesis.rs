@@ -2896,7 +2896,7 @@ mod tests {
         g.gas = Some(gas::GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 16_383,
+            bundle_gas_limit: 20_479,
             metering: gas::GasMetering::Circuit,
             dynamic: None,
         });
@@ -2925,7 +2925,7 @@ mod tests {
         let ok = gas::GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 16_383,
+            bundle_gas_limit: 20_479,
             metering: gas::GasMetering::Circuit,
             dynamic: None,
         };
@@ -2980,7 +2980,7 @@ mod tests {
         let fixed = gas::GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 16_383,
+            bundle_gas_limit: 20_479,
             metering: gas::GasMetering::Circuit,
             dynamic: None,
         };

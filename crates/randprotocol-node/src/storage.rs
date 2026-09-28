@@ -6206,7 +6206,7 @@ mod tests {
         g.gas = Some(GasConfig {
             gas_price: 200,
             byte_price: 1_600,
-            bundle_gas_limit: 16_383,
+            bundle_gas_limit: 20_479,
             metering: GasMetering::Circuit,
             dynamic: Some(DynamicGas {
                 target_block_bytes: 4096,

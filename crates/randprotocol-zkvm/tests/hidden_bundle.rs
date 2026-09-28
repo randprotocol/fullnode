@@ -954,8 +954,10 @@ fn a_mixed_hidden_bundle_proves_at_tier_14_and_verifies_only_against_its_binding
     assert_eq!(ex.verify_hidden_bundle(&hc, &decoded.to_bytes(), &BINDING_A), Ok(()));
     assert_eq!((decoded.tier, decoded.keccak_log_height, decoded.sha256_log_height), (Tier(14), 0, 0));
     // Constraint set 8: a bundle declares its header's ceiling, gas_max(14, 0, 0).
-    assert_eq!(decoded.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], 16_383);
-    assert_eq!(ZkExecutor::new(FriProfile::Test).bundle_gas_limit(&proof).unwrap(), Some(16_383));
+    // `randprotocol_core::gas::gas_max(14, 0, 0)` = 20 479: the chain's `bundle_gas_limit`.
+    assert_eq!(decoded.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], randprotocol_core::gas::gas_max(14, 0, 0));
+    assert_eq!(decoded.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], 20_479);
+    assert_eq!(ZkExecutor::new(FriProfile::Test).bundle_gas_limit(&proof).unwrap(), Some(randprotocol_core::gas::gas_max(14, 0, 0)));
 }
 
 /// Proved the pre-binding way — against the empty public segment — the proof is refused whatever
@@ -1005,7 +1007,7 @@ fn a_branch_free_bundle_proves_at_tier_14_at_the_pinned_shape() {
     let decoded = randprotocol_zkvm::executor::decode_canonical(&proof).unwrap();
     assert_eq!((decoded.program_log_height, decoded.input_log_height, decoded.public_log_height), ZkExecutor::bundle_heights());
     assert_eq!((decoded.tier, decoded.keccak_log_height, decoded.sha256_log_height), (Tier(14), 0, 0));
-    assert_eq!(decoded.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], 16_383, "cs8: prove_bundle_for declares gas_max(14, 0, 0)");
+    assert_eq!(decoded.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], randprotocol_core::gas::gas_max(14, 0, 0), "cs8: prove_bundle_for declares gas_max(14, 0, 0)");
     println!("declared: program {} input {} public {} mem {}", decoded.program_log_height, decoded.input_log_height, decoded.public_log_height, decoded.mem_log_height);
     let ex = ZkExecutor::new(FriProfile::Test);
     assert_eq!(ex.bundle_proof_digest(&proof).unwrap(), digest);

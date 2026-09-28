@@ -6830,26 +6830,31 @@ mod tests {
         assert_eq!(default_gas_limit(1, 10), 256);
         assert_eq!(default_gas_limit(256, 10), 256);
         assert_eq!(default_gas_limit(257, 10), 512);
-        assert_eq!(default_gas_limit(1_000, 10), 1_023, "capped at the tier's own ceiling");
+        // Tier 10's ceiling is gas_max(10, 0, 0) = 1 279 (1 023 cycles + the 2^8 absorb term), so
+        // 1 024 is a bucket under it and the next bucket, 1 280, is capped to it.
+        assert_eq!(default_gas_limit(1_000, 10), 1_024);
+        assert_eq!(default_gas_limit(1_200, 10), 1_279, "capped at the tier's own ceiling");
         // 2^14 steps at tier 16 (the brief's 40 960 is not a multiple of 2^14; see the report).
         assert_eq!(default_gas_limit(38_412, 16), 49_152);
-        assert_eq!(default_gas_limit(60_000, 16), 65_535, "capped at gas_max(16, 0, 0)");
+        assert_eq!(default_gas_limit(60_000, 16), 65_536);
+        assert_eq!(default_gas_limit(70_000, 16), 81_919, "capped at gas_max(16, 0, 0)");
         // A hashing call's ceiling is its header's, not the hash-free one.
         let ceiling = gas::gas_max(10, 7, 0);
         assert_eq!(gas_bucket(1_500, 10, ceiling), 1_536);
-        for exact in [1u64, 255, 256, 257, 700, 1_023] {
+        for exact in [1u64, 255, 256, 257, 700, 1_023, 1_279] {
             assert!(default_gas_limit(exact, 10) >= exact, "never under the exact gas");
         }
     }
 
     #[test]
     fn a_declared_limit_outside_the_run_and_the_ceiling_is_refused_naming_the_bound() {
-        assert!(check_gas_limit(500, 500, 1_023).is_ok());
-        assert!(check_gas_limit(1_023, 500, 1_023).is_ok());
-        let e = check_gas_limit(499, 500, 1_023).unwrap_err().to_string();
+        let ceiling = gas::gas_max(10, 0, 0);
+        assert!(check_gas_limit(500, 500, ceiling).is_ok());
+        assert!(check_gas_limit(1_279, 500, ceiling).is_ok());
+        let e = check_gas_limit(499, 500, ceiling).unwrap_err().to_string();
         assert!(e.contains("exact gas 500"), "{e}");
-        let e = check_gas_limit(1_024, 500, 1_023).unwrap_err().to_string();
-        assert!(e.contains("ceiling 1023"), "{e}");
+        let e = check_gas_limit(1_280, 500, ceiling).unwrap_err().to_string();
+        assert!(e.contains("ceiling 1279"), "{e}");
     }
 
     /// Under a `gas` section the default is the declared limit's floor, whatever the header.
@@ -6902,9 +6907,11 @@ mod tests {
     #[test]
     fn a_bundle_gas_limit_other_than_the_guests_ceiling_is_refused() {
         assert!(check_bundle_gas_limit(None).is_ok());
-        assert!(check_bundle_gas_limit(Some(16_383)).is_ok());
-        let e = check_bundle_gas_limit(Some(16_384)).unwrap_err().to_string();
-        assert!(e.contains("16384") && e.contains("16383"), "{e}");
+        assert!(check_bundle_gas_limit(Some(gas::gas_max(14, 0, 0))).is_ok());
+        assert!(check_bundle_gas_limit(Some(20_479)).is_ok());
+        // The pre-absorb-term value is another guest's now.
+        let e = check_bundle_gas_limit(Some(16_383)).unwrap_err().to_string();
+        assert!(e.contains("16383") && e.contains("20479"), "{e}");
     }
 
 }

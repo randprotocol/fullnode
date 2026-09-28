@@ -228,9 +228,6 @@ const STUB_AGGREGATE_TAG: &[u8] = b"rand-stub-aggregate-bound";
 const STUB_BUNDLE_BINDING: usize = 4 + 32 + 8;
 /// Where the gas limit starts inside a stub bundle proof: its last eight bytes.
 const STUB_BUNDLE_GAS: usize = STUB_BUNDLE_BINDING + 32;
-/// The gas limit a stub bundle proof declares unless a test chooses one: `gas_max(14, 0, 0)`,
-/// what every real hidden-asset bundle proof declares (tier 14, no hash table).
-pub const STUB_BUNDLE_GAS_LIMIT: u64 = 16_383;
 
 impl StubExecutor {
     /// A stub call proof publishing an all-zero `H_IN` — what a test that is not about the
@@ -289,7 +286,10 @@ impl StubExecutor {
         v.extend_from_slice(&word8_to_bytes(digest));
         v.extend_from_slice(&Hash::digest_domain(b"rand-stub-bundle", &word8_to_bytes(hc_bundle)).0[..8]);
         v.extend_from_slice(&word8_to_bytes(binding));
-        v.extend_from_slice(&STUB_BUNDLE_GAS_LIMIT.to_le_bytes());
+        // The gas limit a stub bundle proof declares unless a test chooses one (`with_bundle_gas`):
+        // `gas_max(14, 0, 0)`, what every real hidden-asset bundle proof declares (tier 14, no hash
+        // table).
+        v.extend_from_slice(&crate::gas::gas_max(14, 0, 0).to_le_bytes());
         v
     }
 
@@ -583,7 +583,7 @@ mod tests {
         assert_eq!(StubExecutor.verify_call(&record(Hash::digest(b"q")), &p), Err(ConfidentialError::WrongProgram));
     }
 
-    /// A stub bundle proof declares 16 383 (`gas_max(14, 0, 0)`, what a real hidden-asset bundle
+    /// A stub bundle proof declares `gas_max(14, 0, 0)` = 20 479 (what a real hidden-asset bundle
     /// proof declares); `with_bundle_gas` rewrites it, and binding the transaction keeps it.
     #[test]
     fn the_stub_bundle_proof_carries_its_gas_limit() {
@@ -591,9 +591,10 @@ mod tests {
         let digest = [5u32; 8];
         let binding = [6u32; 8];
         let mut b = StubExecutor::make_bundle_proof(&hc, &digest, &binding);
-        assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(16_383));
-        StubExecutor::with_bundle_gas(&mut b, 16_384);
-        assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(16_384));
+        assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(crate::gas::gas_max(14, 0, 0)));
+        assert_eq!(crate::gas::gas_max(14, 0, 0), 20_479, "(2^14 − 1) + 2^12, the absorb term included");
+        StubExecutor::with_bundle_gas(&mut b, 20_480);
+        assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(20_480));
         assert_eq!(StubExecutor.bundle_proof_digest(&b).unwrap(), digest);
         assert_eq!(StubExecutor.verify_bundle(&hc, &b, &binding), Ok(()));
         assert_eq!(StubExecutor.bundle_gas_limit(b"junk"), Err(ConfidentialError::MalformedProof));

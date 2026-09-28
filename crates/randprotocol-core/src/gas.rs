@@ -598,8 +598,8 @@ pub struct GasConfig {
     #[serde(with = "crate::ledger::staking::amount_string")]
     pub byte_price: u64,
     /// The bundle guest's flat gas (spec §4.3): every bundle proof's declared `GAS_LIMIT` must
-    /// equal this constant exactly, or the proof is refused. `16 383` (`2¹⁴ − 1`) for today's
-    /// tier-14 guest.
+    /// equal this constant exactly, or the proof is refused. `20 479` (`gas_max(14, 0, 0)` =
+    /// `(2¹⁴ − 1) + 2¹²`) for today's tier-14 guest.
     pub bundle_gas_limit: u64,
     /// How gas is metered on this chain. `Circuit` (spec §4.2) is the only value the chain
     /// accepts today; the field exists so a later metering scheme has somewhere to be named.
@@ -700,7 +700,7 @@ mod gas_config_tests {
     use super::*;
 
     fn ok() -> GasConfig {
-        GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 16_383, metering: GasMetering::Circuit, dynamic: None }
+        GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 20_479, metering: GasMetering::Circuit, dynamic: None }
     }
 
     #[test]

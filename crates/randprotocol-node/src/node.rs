@@ -4497,7 +4497,7 @@ mod tests {
         gs.ledger.set_gas(Some(gas::GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 16_383,
+            bundle_gas_limit: 20_479,
             metering: gas::GasMetering::Circuit,
             dynamic: None,
         }));
@@ -4507,7 +4507,7 @@ mod tests {
         let g = reloaded.gas().expect("restored from the genesis state");
         assert_eq!(g.gas_price, 100);
         assert_eq!(g.byte_price, 800);
-        assert_eq!(g.bundle_gas_limit, 16_383);
+        assert_eq!(g.bundle_gas_limit, 20_479);
     }
 
     /// The four call-limits parameters survive a restart the same way: `load_ledger` comes back
