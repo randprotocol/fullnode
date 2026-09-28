@@ -3219,7 +3219,7 @@ impl Node {
                     None => {
                         if let Some(bd) = &tx.bundle {
                             if let Ok(proof) = postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(&bd.proof) {
-                                let pv: [u64; 34] = proof.public_values.clone().try_into().expect("cs6 proofs carry 34 public values");
+                                let pv: [u64; randprotocol_core::types::pv::NUM] = proof.public_values.clone().try_into().expect("cs8 proofs carry pv::NUM public values");
                                 recent.insert(
                                     tx.hash(),
                                     randprotocol_core::types::CoveredBundle {
@@ -4823,7 +4823,7 @@ mod tests {
         let covered =
             assemble_covered(&storage, 1, 256, randprotocol_core::types::FriProfile::Test, &[covered_tx.hash()]).unwrap();
         assert_eq!(covered.len(), 1);
-        let expected: [u64; 34] = proof.public_values.clone().try_into().unwrap();
+        let expected: [u64; randprotocol_core::types::pv::NUM] = proof.public_values.clone().try_into().unwrap();
         assert_eq!(covered[0], CoveredBundle { public_values: expected, shape: fixture_shape(&proof) });
     }
 
@@ -4952,7 +4952,7 @@ mod tests {
         let expect = fixture_shape(&proof);
         assert_eq!(covered.len(), 1);
         assert_eq!(covered[0].shape, expect);
-        let pv: [u64; 34] = proof.public_values.clone().try_into().unwrap();
+        let pv: [u64; randprotocol_core::types::pv::NUM] = proof.public_values.clone().try_into().unwrap();
         assert_eq!(covered[0].public_values, pv);
         // And the admission policy is where it belongs: `assemble_covered` still refuses the
         // same bundle once the window passes.

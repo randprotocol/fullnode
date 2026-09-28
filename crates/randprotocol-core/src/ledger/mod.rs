@@ -5167,6 +5167,7 @@ mod tests {
             h_in: [0; 8],
             keccak_log_height: 12,
             sha256_log_height: 13,
+            gas_limit: crate::gas::gas_max(20, 12, 13),
         };
         assert_eq!(Ledger::call_gas_used(&o), 0);
     }

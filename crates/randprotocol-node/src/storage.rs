@@ -1413,11 +1413,11 @@ impl Storage {
                 let Some(bundle) = &tx.bundle else { return Ok(None) };
                 let proof: randprotocol_zkvm::machine::Proof = postcard::from_bytes(&bundle.proof)
                     .map_err(|_| StorageError::Corrupt(format!("covered bundle {cover}'s proof does not decode")))?;
-                let public_values: [u64; 34] = proof
+                let public_values: [u64; randprotocol_core::types::pv::NUM] = proof
                     .public_values
                     .clone()
                     .try_into()
-                    .map_err(|_| StorageError::Corrupt(format!("covered bundle {cover}'s public values are not 34 words")))?;
+                    .map_err(|_| StorageError::Corrupt(format!("covered bundle {cover}'s public values are not pv::NUM words")))?;
                 Ok(Some(CoveredBundle {
                     public_values,
                     shape: DeclaredShape {
@@ -1436,8 +1436,8 @@ impl Storage {
                 if tx.bundle.is_none() {
                     return Ok(None);
                 }
-                let public_values: [u64; 34] = public_values.try_into().map_err(|_| {
-                    StorageError::Corrupt(format!("pruned record for {cover} does not carry 34 public values"))
+                let public_values: [u64; randprotocol_core::types::pv::NUM] = public_values.try_into().map_err(|_| {
+                    StorageError::Corrupt(format!("pruned record for {cover} does not carry pv::NUM public values"))
                 })?;
                 Ok(Some(CoveredBundle { public_values, shape }))
             }
@@ -1558,11 +1558,11 @@ impl Storage {
             let Some(bundle) = &tx.bundle else { continue };
             let proof: randprotocol_zkvm::machine::Proof = postcard::from_bytes(&bundle.proof)
                 .map_err(|_| StorageError::Corrupt(format!("sealed bundle {}'s proof does not decode", bundle_hash)))?;
-            let public_values: [u64; 34] = proof
+            let public_values: [u64; randprotocol_core::types::pv::NUM] = proof
                 .public_values
                 .clone()
                 .try_into()
-                .map_err(|_| StorageError::Corrupt(format!("sealed bundle {}'s public values are not 34 words", bundle_hash)))?;
+                .map_err(|_| StorageError::Corrupt(format!("sealed bundle {}'s public values are not pv::NUM words", bundle_hash)))?;
             let shape = randprotocol_core::types::DeclaredShape {
                 profile,
                 tier: proof.tier.0 as u8,
@@ -5963,7 +5963,7 @@ mod tests {
             tx_hash: Hash([5; 32]),
             tx,
             proof_hash: Hash([6; 32]),
-            public_values: vec![11; 34],
+            public_values: vec![11; randprotocol_core::types::pv::NUM],
             shape: randprotocol_core::types::DeclaredShape {
                 profile: randprotocol_core::types::FriProfile::Test,
                 tier: 14,
@@ -6726,7 +6726,7 @@ mod seal_tests {
         assert_eq!(tx_hash, covered_tx.hash(), "the raw hash rides the record");
         let fixture = crate::agg_executor::fixture_proof(0);
         let expect: Vec<u64> = fixture.public_values.clone();
-        assert_eq!(public_values, expect, "the 34 public values ride the record");
+        assert_eq!(public_values, expect, "the pv::NUM public values ride the record");
         assert_eq!(shape, fixture_shape(&fixture), "and the declared shape, 7 bytes' worth");
         let stored_proof = crate::agg_executor::fixture_proof(0).to_bytes();
         assert_eq!(proof_hash, Hash::digest(&stored_proof));
@@ -7043,7 +7043,7 @@ mod seal_tests {
         // The covered record as the pruned form carries it: the 34 public values (with the
         // guest's hc at HC0..7) and the registered shape.
         let hc_words: [u32; 8] = randprotocol_core::notes::word8_from_bytes(hc.as_bytes()).unwrap();
-        let mut pv = [0u64; 34];
+        let mut pv = [0u64; randprotocol_core::types::pv::NUM];
         pv[randprotocol_core::types::pv::TIER] = shape.tier as u64;
         for k in 0..8 {
             pv[randprotocol_core::types::pv::OUT0 + k] = 100 + k as u64;

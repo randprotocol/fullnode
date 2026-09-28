@@ -137,6 +137,13 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// Cheap: decode `proof`, check its declared tier/heights/public-value canonicity, and return
     /// the digest it publishes in `OUT0..OUT7`. Verifies nothing cryptographic.
     fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError>;
+    /// Constraint set 8: the gas limit a bundle proof declares (`pv::GAS`) — a decode, not a
+    /// verification: the value is trusted only once [`Self::verify_bundle`] has accepted the
+    /// same bytes (the circuit binds it, spec 2026-09-28 §4.2). `None` (the default) is "this
+    /// executor's proofs carry no limit".
+    fn bundle_gas_limit(&self, _proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+        Ok(None)
+    }
     /// Expensive: the STARK verification of a bundle proof against the pinned bundle guest (the
     /// hidden-asset guest since chain 14, `hc_bundle` in genesis), and
     /// against `binding` — the [`crate::types::Transaction::binding`] of the transaction the
@@ -199,23 +206,31 @@ pub trait ConfidentialExecutor: Send + Sync {
 }
 
 /// Test executor. A "proof" is `STUB` || tier (1 byte) || 8 outputs (LE u32) || `H_IN`
-/// (8 LE u32) || `H_PUB` (8 LE u32) || blake3(program id)[..8]. Any code is accepted. Never use
-/// on a real chain.
+/// (8 LE u32) || `H_PUB` (8 LE u32) || blake3(program id)[..8] || the declared gas limit (LE
+/// u64, constraint set 8's `pv::GAS`). Any code is accepted. Never use on a real chain.
 #[derive(Debug, Default, Clone)]
 pub struct StubExecutor;
 
 pub const STUB_MARKER: &[u8; 4] = b"STUB";
-const STUB_LEN: usize = 4 + 1 + 32 + 32 + 32 + 8;
+const STUB_LEN: usize = 4 + 1 + 32 + 32 + 32 + 8 + 8;
+/// Where the program binding starts inside a stub call proof (the gas limit follows it).
+const STUB_PROGRAM_BINDING: usize = STUB_LEN - 16;
 /// Stub bundle proof: `STUB` || 32-byte digest || blake3("rand-stub-bundle", hc_bundle bytes)[..8]
 /// || the 8 binding words (32 bytes, little-endian) — the stand-in for a real proof's public
-/// input segment, compared word for word by `verify_bundle` exactly as the zkVM compares `H_PUB`.
-const STUB_BUNDLE_LEN: usize = 4 + 32 + 8 + 32;
+/// input segment, compared word for word by `verify_bundle` exactly as the zkVM compares `H_PUB`
+/// — || the declared gas limit (LE u64, constraint set 8's `pv::GAS`).
+const STUB_BUNDLE_LEN: usize = 4 + 32 + 8 + 32 + 8;
 /// The tag of a stub aggregate proof that carries its binding (AGG-2), followed by the eight
 /// binding words (32 bytes, little-endian).
 const STUB_AGGREGATE_TAG: &[u8] = b"rand-stub-aggregate-bound";
 
 /// Where the binding words start inside a stub bundle proof.
 const STUB_BUNDLE_BINDING: usize = 4 + 32 + 8;
+/// Where the gas limit starts inside a stub bundle proof: its last eight bytes.
+const STUB_BUNDLE_GAS: usize = STUB_BUNDLE_BINDING + 32;
+/// The gas limit a stub bundle proof declares unless a test chooses one: `gas_max(14, 0, 0)`,
+/// what every real hidden-asset bundle proof declares (tier 14, no hash table).
+pub const STUB_BUNDLE_GAS_LIMIT: u64 = 16_383;
 
 impl StubExecutor {
     /// A stub call proof publishing an all-zero `H_IN` — what a test that is not about the
@@ -236,6 +251,14 @@ impl StubExecutor {
         Self::make_proof_full(program, tier, outputs, [0; 8], public)
     }
 
+    /// A stub call proof declaring `gas_limit` (`pv::GAS` on a real proof) instead of the
+    /// header's ceiling `gas_max(tier, 0, 0)`, which every other `make_proof*` declares.
+    pub fn make_proof_with_gas(program: &Hash, tier: u8, outputs: [u32; 8], gas_limit: u64) -> Vec<u8> {
+        let mut v = Self::make_proof_full(program, tier, outputs, [0; 8], &[]);
+        v[STUB_LEN - 8..].copy_from_slice(&gas_limit.to_le_bytes());
+        v
+    }
+
     fn make_proof_full(program: &Hash, tier: u8, outputs: [u32; 8], h_in: Word8, public: &[u32]) -> Vec<u8> {
         let mut v = STUB_MARKER.to_vec();
         v.push(tier);
@@ -245,6 +268,7 @@ impl StubExecutor {
         v.extend_from_slice(&word8_to_bytes(&h_in));
         v.extend_from_slice(&word8_to_bytes(&StubExecutor.public_digest(public)));
         v.extend_from_slice(&Hash::digest_domain(b"rand-stub-binding", program.as_bytes()).0[..8]);
+        v.extend_from_slice(&crate::gas::gas_max(tier, 0, 0).to_le_bytes());
         v
     }
 
@@ -265,7 +289,17 @@ impl StubExecutor {
         v.extend_from_slice(&word8_to_bytes(digest));
         v.extend_from_slice(&Hash::digest_domain(b"rand-stub-bundle", &word8_to_bytes(hc_bundle)).0[..8]);
         v.extend_from_slice(&word8_to_bytes(binding));
+        v.extend_from_slice(&STUB_BUNDLE_GAS_LIMIT.to_le_bytes());
         v
+    }
+
+    /// Rewrite the gas limit a stub bundle proof declares. Anything that is not a well-formed
+    /// stub bundle proof is left untouched, as [`Self::bind`] leaves it. The limit is not part of
+    /// the transaction binding (the binding blanks the proof), so no re-bind is needed after.
+    pub fn with_bundle_gas(proof: &mut Vec<u8>, gas_limit: u64) {
+        if proof.len() == STUB_BUNDLE_LEN && &proof[..4] == STUB_MARKER {
+            proof[STUB_BUNDLE_GAS..].copy_from_slice(&gas_limit.to_le_bytes());
+        }
     }
 
     /// Re-bind the stub bundle proof `tx` carries to `tx.binding()`, leaving the proof's digest
@@ -279,7 +313,7 @@ impl StubExecutor {
         let binding = word8_to_bytes(&tx.binding());
         if let Some(b) = tx.bundle.as_mut() {
             if b.proof.len() == STUB_BUNDLE_LEN && &b.proof[..4] == STUB_MARKER {
-                b.proof[STUB_BUNDLE_BINDING..].copy_from_slice(&binding);
+                b.proof[STUB_BUNDLE_BINDING..STUB_BUNDLE_GAS].copy_from_slice(&binding);
             }
         }
     }
@@ -304,7 +338,7 @@ impl StubExecutor {
             return Err(ConfidentialError::MalformedProof);
         }
         let expected = &Hash::digest_domain(b"rand-stub-binding", program.id.as_bytes()).0[..8];
-        if &proof[STUB_LEN - 8..] != expected {
+        if &proof[STUB_PROGRAM_BINDING..STUB_LEN - 8] != expected {
             return Err(ConfidentialError::WrongProgram);
         }
         let tier = proof[4];
@@ -325,7 +359,8 @@ impl StubExecutor {
         if h_pub != want {
             return Err(ConfidentialError::InvalidProof("PublicValues".into()));
         }
-        Ok(CallOutcome { tier, outputs, h_in, keccak_log_height: 0, sha256_log_height: 0 })
+        let gas_limit = u64::from_le_bytes(proof[STUB_LEN - 8..].try_into().expect("8 bytes"));
+        Ok(CallOutcome { tier, outputs, h_in, keccak_log_height: 0, sha256_log_height: 0, gas_limit })
     }
 
     fn hash_words(domain: &[u8], parts: &[&[u8]]) -> Word8 {
@@ -420,6 +455,11 @@ impl ConfidentialExecutor for StubExecutor {
         Ok(word8_from_bytes(&proof[4..36]).unwrap())
     }
 
+    fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+        self.bundle_proof_digest(proof)?;
+        Ok(Some(u64::from_le_bytes(proof[STUB_BUNDLE_GAS..].try_into().expect("8 bytes"))))
+    }
+
     fn verify_bundle(
         &self,
         hc_bundle: &Word8,
@@ -433,7 +473,7 @@ impl ConfidentialExecutor for StubExecutor {
         }
         // The binding, as the zkVM checks `H_PUB`: a proof made for another transaction is
         // refused with the same words `Machine::verify_public` reports (`PublicValues`).
-        if proof[STUB_BUNDLE_BINDING..] != word8_to_bytes(binding) {
+        if proof[STUB_BUNDLE_BINDING..STUB_BUNDLE_GAS] != word8_to_bytes(binding) {
             return Err(ConfidentialError::InvalidBundleProof("PublicValues".into()));
         }
         Ok(())
@@ -512,7 +552,14 @@ mod tests {
         let out = StubExecutor.verify_call(&record(id), &proof).unwrap();
         assert_eq!(
             out,
-            CallOutcome { tier: 12, outputs: [1, 0, 5, 0, 0, 0, 0, 9], h_in: [0; 8], keccak_log_height: 0, sha256_log_height: 0 }
+            CallOutcome {
+                tier: 12,
+                outputs: [1, 0, 5, 0, 0, 0, 0, 9],
+                h_in: [0; 8],
+                keccak_log_height: 0,
+                sha256_log_height: 0,
+                gas_limit: crate::gas::gas_max(12, 0, 0),
+            }
         );
         assert_eq!(out.gas_max(), crate::gas::gas_max(12, 0, 0), "a stub proof declares no hash table");
         // …and the H_IN a call-input envelope is sealed against travels in the proof, not beside it.
@@ -520,6 +567,36 @@ mod tests {
         assert_eq!(StubExecutor.verify_call(&record(id), &sealed).unwrap().h_in, [7; 8]);
         assert_eq!(StubExecutor.verify_call(&record(Hash::digest(b"q")), &proof), Err(ConfidentialError::WrongProgram));
         assert_eq!(StubExecutor.verify_call(&record(id), b"junk"), Err(ConfidentialError::MalformedProof));
+    }
+
+    /// Constraint set 8 (spec 2026-09-28 §4.2–4.3): a stub call proof carries its declared gas
+    /// limit, `gas_max(tier, 0, 0)` unless chosen, and the outcome reports it.
+    #[test]
+    fn the_stub_call_proof_carries_its_gas_limit() {
+        let id = Hash::digest(b"p");
+        let p = StubExecutor::make_proof_with_gas(&id, 12, [1; 8], 777);
+        assert_eq!(StubExecutor.verify_call(&record(id), &p).unwrap().gas_limit, 777);
+        assert_eq!(StubExecutor.decode_call(&record(id), &p).unwrap().gas_limit, 777);
+        let d = StubExecutor::make_proof(&id, 12, [1; 8]);
+        assert_eq!(StubExecutor.verify_call(&record(id), &d).unwrap().gas_limit, crate::gas::gas_max(12, 0, 0));
+        // The program binding still refuses another program's proof with the limit appended.
+        assert_eq!(StubExecutor.verify_call(&record(Hash::digest(b"q")), &p), Err(ConfidentialError::WrongProgram));
+    }
+
+    /// A stub bundle proof declares 16 383 (`gas_max(14, 0, 0)`, what a real hidden-asset bundle
+    /// proof declares); `with_bundle_gas` rewrites it, and binding the transaction keeps it.
+    #[test]
+    fn the_stub_bundle_proof_carries_its_gas_limit() {
+        let hc = [3u32; 8];
+        let digest = [5u32; 8];
+        let binding = [6u32; 8];
+        let mut b = StubExecutor::make_bundle_proof(&hc, &digest, &binding);
+        assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(16_383));
+        StubExecutor::with_bundle_gas(&mut b, 16_384);
+        assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(16_384));
+        assert_eq!(StubExecutor.bundle_proof_digest(&b).unwrap(), digest);
+        assert_eq!(StubExecutor.verify_bundle(&hc, &b, &binding), Ok(()));
+        assert_eq!(StubExecutor.bundle_gas_limit(b"junk"), Err(ConfidentialError::MalformedProof));
     }
 
     #[test]

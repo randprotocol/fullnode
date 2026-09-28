@@ -884,6 +884,9 @@ impl ZkExecutor {
             h_in,
             keccak_log_height: proof.keccak_log_height,
             sha256_log_height: proof.sha256_log_height,
+            // Constraint set 8: the declared limit, `pv::GAS`. `Machine::verify` holds the run's
+            // gas to it and it to `gas_max` of the header (`VerifyError::GasLimit`).
+            gas_limit: proof.public_values[pv::GAS],
         })
     }
 
@@ -1137,6 +1140,16 @@ impl ConfidentialExecutor for ZkExecutor {
 
     fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
         self.hidden_bundle_proof_digest(proof)
+    }
+
+    /// Constraint set 8: `pv::GAS` of the canonically decoded proof — a decode, no verification
+    /// (the trait's contract: trusted only once `verify_bundle` accepted the same bytes).
+    fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+        let proof = decode_canonical(proof)?;
+        if proof.public_values.len() != pv::NUM {
+            return Err(ConfidentialError::MalformedProof);
+        }
+        Ok(Some(proof.public_values[pv::GAS]))
     }
 
     fn verify_bundle(
@@ -1489,6 +1502,7 @@ mod tests {
         assert_eq!(mirror::HC0, real::HC0);
         assert_eq!(mirror::IN0, real::IN0);
         assert_eq!(mirror::PUB0, real::PUB0);
+        assert_eq!(mirror::GAS, real::GAS);
         assert_eq!(mirror::NUM, real::NUM);
     }
 

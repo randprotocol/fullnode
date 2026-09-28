@@ -280,6 +280,9 @@ impl ConfidentialExecutor for AggExecutor {
             h_in,
             keccak_log_height: proof.keccak_log_height,
             sha256_log_height: proof.sha256_log_height,
+            // Constraint set 8: the declared limit, `pv::GAS`. `Machine::verify` holds the run's
+            // gas to it and it to `gas_max` of the header (`VerifyError::GasLimit`).
+            gas_limit: proof.public_values[pv::GAS],
         })
     }
 
@@ -329,6 +332,10 @@ impl ConfidentialExecutor for AggExecutor {
 
     fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
         self.inner.bundle_proof_digest(proof)
+    }
+
+    fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+        self.inner.bundle_gas_limit(proof)
     }
 
     fn verify_bundle(
@@ -473,7 +480,7 @@ mod tests {
     use randprotocol_core::types::FriProfile as CoreProfile;
 
     /// The covered-bundle record admission would assemble for fixture `k`: its declared shape
-    /// read off the proof's stored header, and its 34 public values.
+    /// read off the proof's stored header, and its `pv::NUM` public values.
     fn covered(k: usize) -> (DeclaredShape, CoveredBundle) {
         let p = fixture_proof(k);
         let shape = DeclaredShape {
@@ -486,7 +493,7 @@ mod tests {
             public_log_height: p.public_log_height,
             mem_log_height: p.mem_log_height,
         };
-        let public_values: [u64; 34] = p.public_values.clone().try_into().expect("cs6 proofs carry 34 public values");
+        let public_values: [u64; randprotocol_core::types::pv::NUM] = p.public_values.clone().try_into().expect("cs8 proofs carry pv::NUM public values");
         (shape, CoveredBundle { public_values, shape })
     }
 
@@ -548,7 +555,7 @@ mod tests {
     fn a_proof_whose_reduce_flag_is_not_the_programs_is_refused_before_any_key_build() {
         let ex = AggExecutor::new(FriProfile::Test);
         let shape = fixture_free_shape();
-        let covered = vec![CoveredBundle { public_values: [7; 34], shape }];
+        let covered = vec![CoveredBundle { public_values: [7; randprotocol_core::types::pv::NUM], shape }];
         let binding = [3u32; 8];
         let flipped = if program_reduces(&shape) { 0 } else { randprotocol_rvm::machine::MIN_LOG_HEIGHT };
         let proof = crafted_proof(&shape, &covered, &binding, admitted_tiers(FriProfile::Test)[0] as usize, flipped);
@@ -567,7 +574,7 @@ mod tests {
     fn the_aggregate_program_is_built_once_per_shape_and_never_for_a_refused_header() {
         let ex = AggExecutor::new(FriProfile::Test);
         let shape = fixture_free_shape();
-        let covered = vec![CoveredBundle { public_values: [7; 34], shape }];
+        let covered = vec![CoveredBundle { public_values: [7; randprotocol_core::types::pv::NUM], shape }];
         let binding = [3u32; 8];
         // A header at a tier the chain never admits: refused before anything is built.
         let unadmitted = crafted_proof(&shape, &covered, &binding, 22, 0);
@@ -625,7 +632,7 @@ mod tests {
     fn a_tier_past_u8_is_refused_not_wrapped_into_an_admitted_one() {
         let ex = AggExecutor::new(FriProfile::Test);
         let shape = fixture_free_shape();
-        let covered = vec![CoveredBundle { public_values: [7; 34], shape }];
+        let covered = vec![CoveredBundle { public_values: [7; randprotocol_core::types::pv::NUM], shape }];
         let binding = [3u32; 8];
         assert!(admitted_tiers(FriProfile::Test).contains(&((277usize) as u8)), "277 wraps to an admitted tier");
         let proof = crafted_proof(&shape, &covered, &binding, 277, 0);
@@ -758,10 +765,10 @@ mod tests {
             "the pinned inner_vk_digest"
         );
         // The 115-word interface list, built the way admission builds it: from the covered
-        // bundles' 34 public values, in cover order, with the binding after the count.
+        // bundles' `pv::NUM` public values, in cover order, with the binding after the count.
         let pvs: Vec<Vec<u64>> = (0..3).map(|k| covered(k).1.public_values.to_vec()).collect();
         let list = randprotocol_rvm::public_values::interface_words_bound(&vk.shape, &vk.key, &DOC_BINDING, &pvs);
-        assert_eq!(list.len(), 4 + 1 + 8 + 34 * 3);
+        assert_eq!(list.len(), 4 + 1 + 8 + randprotocol_core::types::pv::NUM * 3);
         assert_eq!(hex_words(&list), INTERFACE_LIST_HEX, "the pinned 115-word interface list");
         assert_eq!(
             hex_words(&randprotocol_rvm::public_values::public_digest(&list)),
