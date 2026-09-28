@@ -1400,7 +1400,7 @@ pub fn prove(
     } else if gas_limit.is_none() {
         m.prove_with(backend, program, inputs, public, tier)
     } else {
-        return Err(format!("{backend:?} proves under the header's gas ceiling only; declare a gas limit on the CPU backend"));
+        return Err(format!("{backend:?} proves under the header's gas ceiling only (`--gas-limit max`); declare a gas limit on the CPU backend"));
     };
     let (proof, exec) = proved.map_err(|e| format!("{e:?}"))?;
     Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))

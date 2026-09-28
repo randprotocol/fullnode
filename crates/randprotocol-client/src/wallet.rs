@@ -2152,12 +2152,22 @@ pub async fn submit_bound_call(
         // One decode for the tier and both hash-table heights, off the REAL proof.
         let header = randprotocol_zkvm::executor::decode_canonical(&proof).map_err(|e| anyhow!("the call proof does not decode: {e}"))?;
         let tier = header.tier.0 as u8;
-        let gas_limit = header.public_values.get(randprotocol_zkvm::tables::cpu::pv::GAS).copied().unwrap_or(0);
+        let gas_limit = declared_gas(&header.public_values)?;
         refuse_if_under_the_floor(limits, tier, header.keccak_log_height, header.sha256_log_height, gas_limit, &proof, envelope.as_ref(), fee)?;
         Ok(proof)
     };
     let spend = Spend { asset: 0, to: None, memo: "", fee, burn_a: 0, burn_r: 0, prover_fee: None };
     submit_spend(rpc, w, store, spend, action, Burn::None, profile, proving, Some(&checked), chain_id, wait).await
+}
+
+/// A decoded call proof's declared `GAS_LIMIT` (`pv::GAS`). Fail-closed: a proof whose public
+/// values stop short of it is an error, never priced as zero gas.
+fn declared_gas(public_values: &[u64]) -> Result<u64> {
+    let at = randprotocol_zkvm::tables::cpu::pv::GAS;
+    public_values
+        .get(at)
+        .copied()
+        .ok_or_else(|| anyhow!("the call proof carries {} public values, none at GAS (index {at}); refusing to price it", public_values.len()))
 }
 
 /// The guard `submit_bound_call`'s `checked` closure applies to the REAL proof once it exists
@@ -7655,6 +7665,19 @@ mod tests {
         // The segment length is part of the digest prefix, so it is part of the gas.
         let (padded, _) = exact_call_gas(&p, &[], &[0; 8]).unwrap();
         assert!(padded > g);
+    }
+
+    /// B5 review ruling: the hardened guard reads `pv[GAS]` fail-closed — a public-value list
+    /// short of it is refused, not priced at zero gas.
+    #[test]
+    fn the_declared_gas_is_read_fail_closed() {
+        let gas_ix = randprotocol_zkvm::tables::cpu::pv::GAS;
+        let mut pv = vec![0u64; randprotocol_zkvm::tables::cpu::pv::NUM];
+        pv[gas_ix] = 3_000;
+        assert_eq!(declared_gas(&pv).unwrap(), 3_000);
+        let e = declared_gas(&pv[..gas_ix]).unwrap_err().to_string();
+        assert!(e.contains("GAS"), "{e}");
+        assert!(declared_gas(&[]).is_err());
     }
 
     #[test]
