@@ -1540,8 +1540,8 @@ mod tests {
         }
         // And the real thing builds, with the register empty and the gated root — at the chain's
         // own profile and the pinned bundle header (IFACE-9: the inner tier 14, the binding's
-        // public height 4; 19 is an rVM *aggregate* tier, never a bundle's).
-        let test_shape = parse_admitted_shape(&format!("test,14,12,10,0,0,4,16,{hc_hex},{digest_hex}")).unwrap();
+        // public height 7 under constraint set 7's 2^7 floor; 19 is an rVM *aggregate* tier, never a bundle's).
+        let test_shape = parse_admitted_shape(&format!("test,14,12,10,0,0,7,16,{hc_hex},{digest_hex}")).unwrap();
         cfg.admitted_shapes = vec![test_shape];
         let mut g2 = pinned_genesis();
         g2.aggregation = Some(cfg);
