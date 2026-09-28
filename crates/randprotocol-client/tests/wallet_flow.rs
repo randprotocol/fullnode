@@ -107,6 +107,12 @@ fn genesis_full(
     }
 }
 
+/// The same chain on the branch-free hidden guest (`hc_hidden_bundle_v2`), the one chain 16 pins.
+/// The wallet learns the guest from `rand_status.hc_bundle`, so nothing else changes.
+fn genesis_v2(validator: &Keypair) -> Genesis {
+    Genesis { hc_bundle: word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2()), ..genesis(validator) }
+}
+
 async fn start(dir: &tempfile::TempDir, key: &Keypair) -> NodeHandle {
     start_with(dir, key, genesis(key)).await
 }
@@ -612,6 +618,63 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
 
 /// One validator's bonded stake, as `rand_getValidators` reports it: amounts go out as decimal
 /// strings, since a stake in units does not fit a JSON number safely.
+/// Delegated proving, Phase 1 end to end: a prover service (its own ML-KEM key, one `own` pairing,
+/// spend-key witnesses accepted, the real prove function) proves a wallet's send on a chain that
+/// pins the v2 hidden guest; the wallet opens the sealed reply, checks the digest and size,
+/// verifies locally and submits; the node admits it and the payee's scan finds the note.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_proved_by_a_paired_prover_is_admitted() {
+    init_tracing();
+    let started = Instant::now();
+    let dir = tempfile::tempdir().unwrap();
+    let key = Keypair::from_seed([107; 32]).unwrap();
+    let handle = start_with(&dir, &key, genesis_v2(&key)).await;
+    let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
+
+    // ---- the prover: its own key, one own pairing, spend-key jobs accepted ----
+    let pkey = randprotocol_prover::key::ProverKey::generate();
+    let ek = pkey.kem_ek().to_vec();
+    let mut pairings = randprotocol_prover::pairing::Pairings::default();
+    let token = pairings.pair("laptop", true).unwrap();
+    let mut cfg = randprotocol_prover::service::Config::new(pkey, pairings);
+    cfg.accept_spend_key = true;
+    let (paddr, _svc, _ptask) = randprotocol_prover::http::serve("127.0.0.1:0".parse().unwrap(), cfg).await.expect("the prover listens");
+    let link = randprotocol_prover::pairing::PairingLink { kem_ek: ek, url: format!("http://{paddr}"), token, own: true };
+    let paired = randprotocol_client::prover::PairedProver::from_link(&link, Some("laptop".into()));
+    let proving = Proving::Remote(std::sync::Arc::new(randprotocol_client::prover::RemoteProver::new(paired)));
+
+    // ---- fund A, send to B through the prover ----
+    let a = Wallet::from_spend_key(SpendKey([21; 8]));
+    let b = Wallet::from_spend_key(SpendKey([22; 8]));
+    let mut a_store = NoteStore::default();
+    let mut b_store = NoteStore::default();
+    let mint = 100 * UNITS_PER_RAND;
+    let hash = rpc.mint_shielded(&a.address.to_string(), Some(mint)).await.expect("mint accepted");
+    rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
+    wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
+    assert_eq!(a_store.balance(), mint);
+
+    let fee = gas::BUNDLE_BASE;
+    let pay = UNITS_PER_RAND;
+    let slot = proving_slot().await;
+    let sub = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, "", fee, FriProfile::Test, &proving, CHAIN_ID, true)
+        .await
+        .expect("the remotely proved bundle is accepted and commits");
+    drop(slot);
+    eprintln!("remote bundle: tier {}, proved in {:.1?}, {} proof bytes", sub.tier, sub.proving, sub.proof_bytes);
+    assert_eq!(sub.tier, 14);
+    assert_eq!(sub.amount, pay);
+    assert_eq!(sub.change, mint - pay - fee);
+
+    // ---- B finds the note the prover's proof carried; A keeps its change ----
+    wallet::scan(&rpc, &b, &mut b_store).await.unwrap();
+    assert_eq!(b_store.balance(), pay, "B received the note the prover's proof carried");
+    wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
+    assert_eq!(a_store.balance(), mint - pay - fee, "A keeps its change");
+    eprintln!("delegated send end to end in {:.1?}", started.elapsed());
+    handle.shutdown().await;
+}
+
 async fn stake_of(rpc: &RpcClient, address: &str) -> u64 {
     let rows = rpc.validators().await.expect("getValidators answers");
     let row = rows

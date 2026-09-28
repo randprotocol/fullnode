@@ -45,3 +45,5 @@ tempfile = { workspace = true }
 randprotocol-node = { path = "../randprotocol-node" }
 libp2p = { workspace = true }
 tracing-subscriber = { workspace = true }
+# `tests/wallet_flow.rs` runs a real prover service beside the node (the delegated-proving end to end).
+randprotocol-prover = { workspace = true, features = ["service"] }
