@@ -3,7 +3,10 @@
 Status: draft 2026-09-28, written on the user's request ("analyze the gas in terms of RAND to
 execute ISA in the zkVM; build a model where the user pays for the ISA in RAND and not a fixed
 cost"); **approved by the user 2026-09-28 ("ok amazing … implement it for v0.6.4"; "this should
-be chain 18 cut")**. Read against `origin/main` at `aedf458` (v0.6).
+be chain 18 cut")**. Read against `origin/main` at `aedf458` (v0.6). **Status 2026-09-29: Phase 1
++ Phase 2 built on `feat/gas-chain18` (worktree `/private/tmp/fullnode-gas18`, off circuits
+`feat/cs8-gas` `18c2627`), not yet cut — see the AGENTS.md `chain 18` entry for the built state,
+the traps found in review, and the cut order.**
 Scope: fullnode (`randprotocol-core::gas`, the ledger's call rule, the wallet), one public value
 and one column in the zkVM (circuits).
 Ships in: **Phase 0 = v0.6.4** on any chain (node policy, no consensus change; plan
@@ -14,7 +17,11 @@ order, and the wallet's `gas bound …` line and `rand fee call`'s hash-height f
 tagged or rolled. **Phase 1 = the chain 18 cut**: a
 hard fork that changes every verifier key, so it rides the constraint set chain 18 carries.
 Constraint set 7 (#52) is chain 16's (v0.6.1, cut in flight) and chain 17 is delegated
-proving's (v0.6.3); neither takes the meter.
+proving's (v0.6.3); neither takes the meter. **Phase 2** (§7.1, the dynamic prices) is cut beside
+Phase 1 on chain 18, not a later chain (the user's ruling, 2026-09-28). **Phase 1 + Phase 2 built**
+on `feat/gas-chain18` (Tasks A1–A6, B1–B8, C1 of
+`docs/superpowers/plans/2026-09-28-gas-phase1-phase2-chain18.md`), reviewed clean, **not yet
+tagged, rolled or cut** — see the AGENTS.md `chain 18` entry.
 
 Companion documents: `docs/fees.md` (the schedule this replaces and its "why there is no gas"
 argument, which §2 revisits), `docs/zkvm.md` §§3–4, 8 (the ISA, the syscalls, the measured
@@ -251,26 +258,54 @@ cannot move without a cut), and the pool and the proposer demand the higher floo
 disagrees on it disagrees only about what to admit, never about what a block may contain.
 Wallets read it from `rand_getLimits` (§9).
 
-### 4.2 Phase 1 — the in-circuit meter, chain 18's constraint set
+### 4.2 Phase 1 — the in-circuit meter, chain 18's constraint set (built)
 
-One column, one public value, two constraints in the cpu table:
+One column, one public value, three constraints in the cpu table (`crates/randprotocol-zkvm/src/tables/cpu.rs`):
 
-- `GAS`: the accumulator. On every real row `GAS' = GAS + w(row)` with
-  `w = 1 + 2·IS_HASH_BLOCK + 191·SYS_KECCAK + 63·SYS_SHA256`, where `IS_HASH_BLOCK` marks the
-  first cpu row of each Poseidon2 permutation (the existing hash-row flags give it), and every
-  weight is a constant, so the transition stays degree 1. `GAS = 0` on the entry row.
-- On the `HALT` row, `GAS_LIMIT − GAS` is range-checked into `[0, 2ᵗ⁺⁸)` through the existing
-  range table (the +8 bits admit the keccak weight: no run at tier `t` spends `192 · 2ᵗ` or
-  more), which proves `GAS ≤ GAS_LIMIT`; the `GAS_LIMIT ≤ gas_max(header)` check outside the
-  circuit keeps the difference inside that range.
-- `GAS_LIMIT` is `pv::GAS`, the 35th public value.
+- `GAS`: the accumulator, `col::GAS`. Row 0 is always a digest row (`Program::digest_rows`'s
+  `max(1, …)`), and a digest row weighs 1, so `GAS = 1` there (`f.assert_one(v(GAS))`), not `0` —
+  the entry row already carries the first row's own weight. On every real-to-real transition,
+  `n(IS_REAL)·(n(GAS) − v(GAS) − w_next) = 0` with
+  `w_next = 1 + 2·n(IS_HASH) + 191·n(SYS_KECCAK) + 63·n(SYS_SHA256)` — `IS_HASH` (a Poseidon2
+  absorb row's own selector, not a separate "block" flag) and the two syscall selectors of the
+  row the chain is moving *into*. Every weight is a constant, but `w_next` is itself a sum of two
+  selector products, so the transition is **degree 2**, not degree 1. No transition into a
+  padding row is charged.
+- On the `HALT` row, `pv::GAS − GAS` is not a plain range check on the accumulator: it is decomposed
+  into four **witness** limbs `GD0..3`, each `RANGE8`-looked-up (so each is `[0, 256)`), assembled
+  little-endian (`GD0 + 2⁸·GD1 + 2¹⁶·GD2 + 2²⁴·GD3`) into a value in `[0, 2³²)`. The constraint is
+  `SYS_HALT·(pv[GAS] − GAS − gd) = 0`; off the `HALT` row the four limbs are forced to `0`
+  (`(1 − SYS_HALT)·GD_k = 0`), which also pins them on padding rows (there is exactly one `HALT`
+  row, the last real one). `GAS` itself is an exact sum of at most `2²⁰` rows of weight ≤ 192 and
+  `check_public_values` already holds `pv::GAS ≤ gas_max(header) < 2³²` outside the circuit, so
+  `[0, 2³²)` is sound with no extra slack term — the four-limb `[0, 2^(t+8))` range this section
+  first specified is not what shipped. **The limbs are never opened or published**: they are
+  ordinary witness columns under the hiding STARK, so the run's own gas stays private — only
+  `GAS_LIMIT` is a new public value, never `GAS_LIMIT − gas`.
+- `GAS_LIMIT` is `pv::GAS = 34` (0-indexed), the 35th public value (`pv::NUM = 35`).
+- **Native, outside the circuit** (`machine::check_public_values`, run before any key is built):
+  a proof's `TIER` public value must lie in `TIERS` (`VerifyError::Tier`), and
+  `pv::GAS > gas::gas_max(tier, keccak_log_height, sha256_log_height)` is refused
+  (`VerifyError::GasLimit`) — a larger declared limit could only be a mispriced header.
 
 The meter is exact per instruction — a `KECCAK` row adds 192 because that is what the circuit
-sees on that row — and no new witness enters: everything it reads is already a column. Every
-verifier key changes (the cpu AIR changes), which is why it rides chain 18's constraint set and
-not a same-chain update. The rVM's aggregate interface grows
-with it: `[vk ‖ N ‖ B(8) ‖ 35·N]` (was `34·N`), and the recursion verifier program takes the new
-width — the aggregate program digest changes, as it did for AGG-2.
+sees on that row — and no new witness enters beyond the four slack limbs, which the fill derives
+from columns the trace already has. Every verifier key changes (the cpu AIR changes), which is
+why it rides chain 18's constraint set and not a same-chain update. The rVM's aggregate interface
+grows with it: `[vk ‖ N ‖ B(8) ‖ 35·N]` (was `34·N`), and the recursion verifier program takes the
+new width — the aggregate program digest changes, as it did for AGG-2 (built:
+`1831f036a2d3524249df17a66a220457878f8aeed669c77db08d58026461ddd7`, for two reasons: the wider
+interface and a real bug the 35th word exposed — see the AGENTS.md chain-18 entry's sponge trap).
+
+**`gas_max` itself carries a term this section's earlier drafts omitted** (found in the constraint-set-8
+final review, Important 1): an honest run that fills a tier with Poseidon2 absorbs can exceed the
+plain cycle budget `2ᵗ − 1`, because each absorb row costs `POSEIDON2_ABSORB_GAS − 1 = 2` beyond
+its own row, and the Poseidon2 *table's* own capacity (`Tier::poseidon2_height(t) = 2^(t+2)` rows
+at `BLOCK = 32` rows per permutation) bounds the absorb-row count at `2^(t−3)`, not the cpu table's
+tier bound — so the ceiling needs its own `2·2^(t−3) = 2^(t−2)` term, folded into §3.2's formula
+above. The built `gas_max` clamps its tier argument to `[TIERS[0], TIERS[last]] = [10, 20]` before
+computing, and each declared hash-table height to `40` before shifting, since the arguments come
+from an untrusted proof header read before `check_declared_heights` refuses an out-of-range one.
 
 The ledger rule (`Ledger::validate_inner`'s call arm, where `call_fee` is charged today): after
 `verify_call` returns the outcome, `fee ≥ BUNDLE_BASE + GAS_PRICE · outcome.gas_limit +
@@ -393,11 +428,22 @@ Genesis `gas.dynamic` (optional inside the `gas` section; absent = the fixed pri
 
 - The wallet already runs `emulator::run` before proving (it has to pick the tier); the run's
   `CycleEvent`s give the exact gas by §3.1's table. `rand call` prints
-  `gas: 38 412 (declaring 40 960, tier 16)` and the fee it implies before proving, and refuses
-  to prove a call whose declared limit the emulator's run exceeds.
-- `rand fee call --gas <n> --bytes <b>` replaces `rand fee call <tier>`; `rand fee call --tier
-  <t>` keeps working as "gas = `gas_max` of a hash-free tier-`t` header".
-- `rand call --gas-limit <n|max>`; `--fee` above the floor is the bid (§7).
+  `gas: 38 412 (declaring 49 152, tier 16)` and the fee it implies before proving, and refuses
+  to prove a call whose declared limit the emulator's run exceeds. (Built: 38 412 rounds up to
+  the next multiple of `2^(16−2) = 16 384`, which is `3 · 16 384 = 49 152`, not `40 960` — an
+  earlier draft of this example did the rounding wrong; `40 960` is not a multiple of `16 384`.)
+- `rand fee call <tier> [--gas N]` (built name; the `--gas <n> --bytes <b>` form without a tier
+  was not built) prices `--gas`'s declared limit at the tip's current prices under a `gas`
+  section, no headroom — the floor itself. Without `--gas`, under a section, it defaults to the
+  header's own ceiling, `gas_max(tier, keccak_log_height, sha256_log_height)` (0/0 with no height
+  flags) — what `rand call --gas-limit max` would declare; without a section it prices the header
+  the flags describe the same way Phase 0 always has.
+- `rand call --gas-limit <n|max>`; `--fee` above the floor is the bid (§7). Built default on the
+  CPU backend under a section: the quarter-tier bucket over the dry run's exact gas (§3.2, §5),
+  capped at the ceiling. **On a non-CPU backend (`--cuda`)**, which cannot declare anything but the
+  ceiling (its prover takes no gas option), the default is `max` and an explicit `--gas-limit N`
+  is refused, naming `--gas-limit max`. Without a section, the default is `max` everywhere (a
+  finer default would only leak, and buys nothing).
 - `rand_estimateGas` is deliberately absent: the node has no program input and no emulator
   role; estimation is the wallet's, with the witness.
 
