@@ -10,7 +10,7 @@
 //!   claim — the ledger recomputes that digest with `bad = 0` and refuses the bundle. Where the
 //!   check is a taint, the published digest is asserted to be exactly the claimed plaintext's
 //!   `bad = 1` digest (the taint and nothing else moved it). One honest proof is the control.
-//! - **A mutation fuzz** (`mutation_fuzz_*`, emulator only, ~60 s): random honest witnesses of
+//! - **A mutation fuzz** (`mutation_fuzz_*`, emulator only, ~185 s): random honest witnesses of
 //!   every shape, each mutated — one word anywhere in the 1 204-word private input, two words, an
 //!   amount moved between fields, a whole slot copied over another, two input slots swapped (a real
 //!   note moved into the other asset group, membership intact), two output-side terms of one
@@ -35,7 +35,7 @@
 //! Node-local, not vendored (`deploy/sync-zkvm.sh` excludes it, like `tests/hidden_bundle.rs`).
 //!
 //! Running: the real proofs are told apart by name. Fast only (the fuzz and the emulator
-//! companions, ~60 s in `--release`):
+//! companions, ~185 s in `--release`):
 //!
 //! ```text
 //! cargo test --release -p randprotocol-zkvm --test hidden_cheating -- --skip real_proof_
