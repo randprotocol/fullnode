@@ -1043,6 +1043,13 @@ async fn main() -> Result<()> {
                 RemoteProver::new(paired.clone()).info().await?;
                 paired.save(&cli.key)?;
                 println!("paired {} at {} (own: {})", paired.fingerprint, paired.url, if paired.own { "yes" } else { "no" });
+                if !paired.own {
+                    // Saved anyway (a later build's viewing-key witness may use it), but today every
+                    // `--prover` use of it is refused, so say so now rather than at the first send.
+                    eprintln!(
+                        "warning: this link has no own=1, so this pairing cannot receive a spend-key witness in this build — every --prover use will refuse it (re-pair with a link from `rand-prover pair --own`)"
+                    );
+                }
             }
             ProverOp::Show => match PairedProver::load(&cli.key)? {
                 Some(p) => println!("{}", p.show()),

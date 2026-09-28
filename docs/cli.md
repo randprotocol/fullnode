@@ -1,9 +1,10 @@
 # Command-line reference
 
-Two binaries are built by `cargo build --release`: `rand-node` (node and operator commands) and
-`rand` (the shielded wallet client). Every command accepts `-h/--help`.
+Three binaries are built by `cargo build --release`: `rand-node` (node and operator commands),
+`rand` (the shielded wallet client) and `rand-prover` (the delegated prover, documented in
+[`docs/prover.md`](prover.md), not here). Every command accepts `-h/--help`.
 
-The two hold different kinds of key and must not be confused. A **node key** is a 32-byte seed and
+The first two hold different kinds of key and must not be confused. A **node key** is a 32-byte seed and
 a Dilithium2 key pair whose base58 address is public and signs blocks. A **wallet key** is a
 256-bit shielded spend key whose `rand1…` address receives notes and which never signs anything
 on chain (`docs/shielded.md` §1).
@@ -247,7 +248,7 @@ one the cut announced; a mismatch on one node is almost always an old binary.
 | `--view-timeout-ms <MS>` | `3000` | base view timeout; doubles per consecutive timeout up to 8x |
 | `--verify-chain <MODE>` | `quick` | startup integrity check: `off`, `quick` (structure + ledger replay), `full` (also proposer signatures and every QC's votes) |
 | `--min-free-disk-mb <MB>` | `1024` | refuse to start with less free on the data directory's filesystem; `rand_getHealth` says `disk_low` under four times it (audit v4 OPS-3). `0` disables the guard |
-| `--prover <ADDR>` | off | host the delegated prover (`prover_*` JSON-RPC) on this address: a listener of its own, never the RPC — an address equal to `--rpc`, or a wildcard on `--rpc`'s port, is refused. Refuses to start without `<prover-home>/prover.key.json` (made by `rand-prover keygen`); every prover check runs before the node key is read or the database opened |
+| `--prover <ADDR>` | off | host the delegated prover (`prover_*` JSON-RPC) on this address: a listener of its own, never the RPC — an address equal to `--rpc`, or a wildcard on `--rpc`'s port, is refused. Refuses to start without `<prover-home>/prover.key.json` (made by `rand-prover keygen`); every prover check runs, and the address is bound, before the node key is read or the database opened |
 | `--prover-home <DIR>` | `<datadir>/prover` | the prover's `prover.key.json` and `pairings.json` |
 | `--prover-accept-spend-key` | off | accept spend-key witnesses (only for wallets you own); prints the spend-key sentence at start |
 | `--prover-max-parallel <N>` | `1` | proofs the hosted prover runs at once; the start is refused unless 5.74 GB × N + 1 GiB of memory is available |
@@ -296,7 +297,7 @@ Global options, accepted before or after the subcommand:
 |---|---|---|---|
 | `--rpc <RPC>` | `RAND_RPC` | `http://127.0.0.1:8545` | node JSON-RPC endpoint, `http` or `https` (the public one is `https://rpc.randprotocol.org`) |
 | `--key <KEY>` | `RAND_KEY` | `wallet.key.json` | spend-key file; the note store lives beside it at `<key>.notes.json`. The store is bound to the chain it was scanned against (its `genesis` field, the node's `rand_getGenesisHash`): pointed at a node on another chain — a wallet file kept across a chain cut — it is emptied and rescanned from leaf 0 with a warning, never scanned from a cursor past the new chain's tree. A store written before the binding existed is rescanned once, the same way |
-| `--prover` | | off | prove the bundle on the prover paired with this wallet (`rand prover pair`) instead of on this machine; the proof is checked here — its digest read off the proof, its size and a local verify — before it goes into a transaction. Applies to every command that proves a bundle: `send`, `bond`, `program deploy`, `call` (the paying bundle only; the call proof stays local), `bridge-mint`, `bridge-rotate`, `bridge-burn`, and `token create`/`mint`/`burn`/`set-authority`/`register-bridged`/`list-backing`. Refused together with `--cuda`, and without a pairing. The trust model — a Phase 1 prover receives the spend key — is in [`docs/prover.md`](prover.md) |
+| `--prover` | | off | prove the bundle on the prover paired with this wallet (`rand prover pair`) instead of on this machine; the proof is checked here — its digest read off the proof, its size and a local verify — before it goes into a transaction. Applies to every command that proves a bundle: `send`, `bond`, `program deploy`, `call` (the paying bundle only; the call proof stays local), `bridge-mint`, `bridge-rotate`, `bridge-burn`, and `token create`/`mint`/`burn`/`set-authority`/`register-bridged`/`list-backing`. Refused together with `--cuda` — except `call`, whose call proof takes `--cuda`; the paying bundle still goes to the prover — and without a pairing. The trust model — a Phase 1 prover receives the spend key — is in [`docs/prover.md`](prover.md) |
 
 | command | arguments | behaviour |
 |---|---|---|

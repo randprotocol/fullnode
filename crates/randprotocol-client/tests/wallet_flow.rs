@@ -12,7 +12,7 @@
 //! register's stake is where it turns up instead); and a call's private inputs come back off the
 //! chain under A's viewing key alone, checked against the `H_IN` its proof published (spec §6.1).
 //!
-//! Eleven bundle proofs and three call proofs across the three tests, so this is the slowest test
+//! Twelve bundle proofs and three call proofs across the five tests, so this is the slowest test
 //! binary in the workspace by a wide margin — minutes, not seconds. The bridge commands are not here: they need a chain with a
 //! guardian set, which the node's cluster tests configure.
 //!

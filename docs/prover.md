@@ -89,7 +89,7 @@ directory that holds `prover.key.json` and `pairings.json`. It is created at mod
 - **`unpair --name <LABEL>`** removes a pairing. A running prover reads `pairings.json` at start,
   so the revocation takes effect when it restarts.
 - **`pairings`** lists one line per pairing: label, `own` or `-`, and the creation date (UTC).
-- **`run`** serves the `prover_*` JSON-RPC (§6) until ctrl-c.
+- **`run`** serves the `prover_*` JSON-RPC (§6) until ctrl-c or SIGTERM.
 
 The token is printed once, inside the link, and never stored anywhere the prover can read it back.
 A lost link cannot be recovered: `unpair --name <LABEL>` and `pair` again. The link is about
@@ -129,16 +129,14 @@ it can give (a large page cache, say); a prover that swaps or is killed mid-proo
 
 ### 3.4 Stopping
 
-`run` shuts down on SIGINT (ctrl-c). A proof already running on the blocking pool is not
-interrupted, so shutdown can wait up to one proof, about 100 s, while it finishes. The service
-installs no SIGTERM handler: systemd's default stop signal ends the process at once, and the
-job in flight is lost (the wallet sees an error and can try again). In a systemd unit, stop it the
-graceful way:
+`run` shuts down on SIGINT (ctrl-c) or SIGTERM (systemd's default stop signal), the same way. A
+proof already running on the blocking pool is not interrupted, so shutdown can wait up to one
+proof, about 100 s, while it finishes. In a systemd unit, give the stop that long before systemd
+escalates to SIGKILL:
 
 ```ini
 [Service]
 ExecStart=/usr/local/bin/rand-prover --home /root/prover run --accept-spend-key
-KillSignal=SIGINT
 TimeoutStopSec=180
 ```
 
@@ -171,14 +169,15 @@ must be a listener of its own: an address equal to `--rpc`, or a wildcard addres
 as `--rpc` (either side), is refused with `--prover <ADDR> is the --rpc address: the prover is
 never a method of the public RPC; give it its own listener`.
 
-**Every prover check runs before the node key is read or the database opened**, so a
-misconfigured prover exits at once instead of after a startup verify. The node never mints a
+**Every prover check runs, and the prover's address is bound, before the node key is read or the
+database opened**, so a misconfigured prover — or a `--prover` port already in use — exits at once
+instead of after a startup verify. The node never mints a
 prover key: without one it refuses to start with
 ``no prover key at <home>/prover.key.json: run `rand-prover --home <home> keygen` and `pair` first``. The memory gate, the CUDA check and the
 no-pairings warning are the same as `rand-prover run`'s, with the node's flag names. The prover
-binds after the node's RPC is up and stops with the node; if the prover's listener exits, the node
-stops too. Stopping a node with `--prover` can wait for a proof in flight in the same way
-(§3.4).
+is served once the node's RPC is up (the bound port accepts no request before then) and stops
+with the node; if the prover's listener exits, the node stops too. The node stops on ctrl-c or
+SIGTERM, and stopping one with `--prover` can wait for a proof in flight in the same way (§3.4).
 
 Never host the prover on a machine in the public RPC path (`docs/deploy.md`). Spec §8 Q3 also
 records that a validator which holds witnesses while it proves is a larger target; an observer
@@ -198,7 +197,8 @@ rand prover forget
 refuses unless the prover answers with the key fingerprint the link names — so the prover must be
 running when the wallet pairs. Only then does it write `<key>.prover.json` beside the spend-key
 file, at mode 0600 (the token is a bearer credential), replacing any earlier pairing, and print
-`paired <fingerprint> at <url> (own: yes|no)`. `--name` is a label the wallet prints instead of
+`paired <fingerprint> at <url> (own: yes|no)`. A link without `own=1` is still saved, with a
+warning on stderr that this build's `--prover` will refuse every use of it (§2). `--name` is a label the wallet prints instead of
 the URL. A wallet keeps one pairing.
 
 `show` prints the pairing's name, URL, fingerprint, `own` and the prover's key, never the token.
@@ -216,11 +216,15 @@ It applies to every command that proves a bundle: `send`, `bond`, `program deplo
 `bridge-mint`, `bridge-rotate`, `bridge-burn`, and `token create`, `mint`, `burn`,
 `set-authority`, `register-bridged` and `list-backing`. For `call`, only the paying bundle moves;
 the call proof is always made on the wallet's machine. `--prover` with `--cuda` is refused: the
-bundle is proved on the paired prover or on this machine's GPU, not both. Without a pairing,
+bundle is proved on the paired prover or on this machine's GPU, not both — except `call`, whose
+call proof takes `--cuda`; the paying bundle still goes to the prover. Without a pairing,
 `--prover` refuses with `no prover paired for this wallet: rand prover pair <link>`.
 
 While the job runs the wallet prints `queued on <name> at position <n>…` and `proving on <name>…`,
-polling `prover_status` once a second. It gives up after 20 minutes, queue included, and cancels
+polling `prover_status` once a second. A poll that does not reach the prover (a reset, a timeout,
+a proxy's error page) is retried, with one `prover <name> unreachable …, retrying…` line per
+outage; the prover's own JSON-RPC error (`unknown job` after it restarted, say) or a `failed` or
+`expired` job ends the wait. It gives up after 20 minutes, queue included, and cancels
 the job. Any refusal of a proof also cancels the job, so it stops holding the prover's queue.
 
 ### 5.3 What the wallet checks
@@ -321,6 +325,9 @@ ProveReply { proof: Vec<u8>, digest: Word8, tier: u8 }
   ML-KEM's implicit rejection never errors on its own.
 - `inputs` must be exactly the bundle guest's witness length; `binding` is the transaction's
   binding words, over which the proof is made.
+- Nothing binds a sealed job to one submission: anyone who captures one can replay it verbatim.
+  That costs the pairing's per-token slots and one proof of the prover's time, and the reply is
+  useless to the replayer — it is sealed to the wallet's `reply_key`.
 
 ### 6.4 The pairing link
 
@@ -352,6 +359,11 @@ prover.example.net {
     reverse_proxy 127.0.0.1:8600
 }
 ```
+
+A `--listen` (or `--prover`) address off loopback needs that fronting proxy to terminate TLS and
+to meter requests: the prover itself caps only jobs per pairing and its queue, not requests, and `prover_info` is
+unauthenticated — anyone who reaches it learns the prover's key, backend, queue depth and
+`witness_kinds` (whether it takes spend keys).
 
 A certificate a browser or phone accepts on a LAN is the operator's to arrange; whether a desktop
 app should carry a relay instead is spec §8 open question 4, unresolved.
