@@ -31,7 +31,19 @@ fn run_with_prover_refuses_without_a_key_and_refuses_the_rpc_address() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
     assert!(err.contains("never a method of the public RPC"), "{err}");
-    // Neither refusal opened the database.
+    // A wildcard RPC bind overlaps a specific prover bind on the same port.
+    let out = Command::new(env!("CARGO_BIN_EXE_rand-node"))
+        .args(["run", "--datadir"])
+        .arg(dir.path())
+        .arg("--key")
+        .arg(&node_key)
+        .args(["--rpc", "0.0.0.0:8599", "--prover", "127.0.0.1:8599"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(err.contains("never a method of the public RPC"), "{err}");
+    // No refusal opened the database.
     assert!(!dir.path().join("db").exists());
 }
 
@@ -39,7 +51,7 @@ fn run_with_prover_refuses_without_a_key_and_refuses_the_rpc_address() {
 fn run_help_lists_the_prover_flags() {
     let out = Command::new(env!("CARGO_BIN_EXE_rand-node")).args(["run", "--help"]).output().unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
-    for f in ["--prover ", "--prover-home", "--prover-accept-spend-key", "--prover-max-parallel", "--prover-max-queue"] {
+    for f in ["--prover ", "--prover-home", "--prover-accept-spend-key", "--prover-max-parallel", "--prover-max-queue", "--prover-skip-memory-check", "--prover-cuda"] {
         assert!(s.contains(f), "{f} missing:\n{s}");
     }
 }

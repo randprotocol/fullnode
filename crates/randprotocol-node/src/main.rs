@@ -749,6 +749,9 @@ fn opens_storage(cmd: &Cmd) -> bool {
 
 /// What `run --prover` loaded before the node started: everything that can refuse does so here,
 /// before the node key is read or the database opened.
+/// Shown whenever `--prover-accept-spend-key` is on (the same sentence `rand-prover run` prints).
+const SPEND_KEY_SENTENCE: &str = "every SpendKey job holds the sending wallet's spend key: run this only for wallets you own";
+
 struct HostedProver {
     key: ProverKey,
     pairings: Pairings,
@@ -760,7 +763,10 @@ struct HostedProver {
 /// key that already exists (a node never mints one), the pairings (none = a warning), the
 /// backend (no CUDA fallback) and the free-memory gate.
 fn prepare_prover(addr: SocketAddr, rpc: SocketAddr, home: &Path, max_parallel: usize, cuda: bool, skip_memory_check: bool) -> Result<HostedProver> {
-    if addr.ip() == rpc.ip() && addr.port() == rpc.port() {
+    // A wildcard bind on either side overlaps the other on the same port (and macOS's
+    // SO_REUSEADDR lets a specific bind sit beside a wildcard one), so that is the same listener too.
+    let overlaps = addr.ip() == rpc.ip() || addr.ip().is_unspecified() || rpc.ip().is_unspecified();
+    if overlaps && addr.port() == rpc.port() {
         anyhow::bail!("--prover {addr} is the --rpc address: the prover is never a method of the public RPC; give it its own listener");
     }
     if max_parallel == 0 {
@@ -788,10 +794,16 @@ fn prepare_prover(addr: SocketAddr, rpc: SocketAddr, home: &Path, max_parallel: 
     if skip_memory_check {
         tracing::warn!("prover memory check skipped");
     } else {
-        randprotocol_prover::memory::check(max_parallel).map_err(anyhow::Error::msg)?;
+        // `memory::check` names `rand-prover`'s flags; this node's are prefixed.
+        randprotocol_prover::memory::check(max_parallel).map_err(|e| {
+            anyhow::anyhow!(e.replace("--max-parallel", "--prover-max-parallel").replace("--skip-memory-check", "--prover-skip-memory-check"))
+        })?;
     }
     if pairings.pairings.is_empty() {
-        tracing::warn!("no prover pairings: every job will be refused — run `rand-prover --home {} pair`", home.display());
+        // Printed, not only logged: a log filter must never hide a misconfiguration.
+        let line = format!("no prover pairings: every job will be refused — run `rand-prover --home {} pair`", home.display());
+        eprintln!("{line}");
+        tracing::warn!("{line}");
     }
     let fingerprint = key.fingerprint().to_string();
     Ok(HostedProver { key, pairings, backend, fingerprint })
@@ -1077,7 +1089,9 @@ async fn main() -> Result<()> {
                     cfg.max_queue = prover_max_queue;
                     cfg.accept_spend_key = prover_accept_spend_key;
                     if prover_accept_spend_key {
-                        tracing::warn!("every SpendKey job holds the sending wallet's spend key: run this only for wallets you own");
+                        // The spec's disclosure sentence: printed, so no log filter can hide it.
+                        eprintln!("{SPEND_KEY_SENTENCE}");
+                        tracing::warn!("{SPEND_KEY_SENTENCE}");
                     }
                     let addr = prover.expect("hosted implies --prover");
                     let (bound, _svc, task) = match randprotocol_prover::http::serve(addr, cfg).await {

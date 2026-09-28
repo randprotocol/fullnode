@@ -190,9 +190,13 @@ async fn main() -> Result<()> {
                 memory::check(max_parallel).map_err(anyhow::Error::msg)?;
             }
             if pairings.pairings.is_empty() {
+                // Printed, not only logged: a log filter must never hide a misconfiguration.
+                eprintln!("no pairings: every job will be refused — run `rand-prover pair`");
                 tracing::warn!("no pairings: every job will be refused — run `rand-prover pair`");
             }
             if accept_spend_key {
+                // The spec's disclosure sentence: printed, so no log filter can hide it.
+                eprintln!("every SpendKey job holds the sending wallet's spend key: run this only for wallets you own");
                 tracing::warn!("every SpendKey job holds the sending wallet's spend key: run this only for wallets you own");
             }
             let fingerprint = key.fingerprint();
