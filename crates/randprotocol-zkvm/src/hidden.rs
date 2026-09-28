@@ -14,7 +14,7 @@
 //! (asset 0). `A` may be 0, in which case every slot is RAND. What the chain sees is the digest
 //! below, and nothing in it names `A`.
 
-use crate::notes::{hash, Note, SpendKey, Word8, DEPTH};
+use crate::notes::{hash, Note, SpendKey, ViewingKey, Word8, DEPTH};
 
 /// The hidden bundle digest's domain tag. `notes::domain` is vendored, and upstream allocates
 /// its tags sequentially from 1 (1–15 here; upstream's research crate is already at 16, a
@@ -177,10 +177,29 @@ pub fn hidden_bundle_inputs(
     asset_a: u32,
     time: u32,
 ) -> Vec<u32> {
+    let mut v = witness_body(&sk.viewing_key().pk(), inputs, outputs, anchor, fee, burn_a, burn_r, asset_a, time);
+    v[hidden_input::SK..hidden_input::SK + 8].copy_from_slice(&sk.0);
+    v
+}
+
+/// The [`hidden_input::COUNT`] words every hidden guest's witness shares — everything but words
+/// `0..8` (the spend key in v1/v2, `nk` in v3), left zero for the caller. Refuses (panics) an
+/// input not owned by `pk_self`.
+#[allow(clippy::too_many_arguments)]
+fn witness_body(
+    pk_self: &Word8,
+    inputs: &[(Note, [Word8; DEPTH], u32); SLOTS],
+    outputs: &[HiddenOutput; SLOTS],
+    anchor: Word8,
+    fee: u64,
+    burn_a: u64,
+    burn_r: u64,
+    asset_a: u32,
+    time: u32,
+) -> Vec<u32> {
     use hidden_input::*;
+    let pk_self = *pk_self;
     let mut v = vec![0u32; COUNT];
-    v[SK..SK + 8].copy_from_slice(&sk.0);
-    let pk_self = sk.viewing_key().pk();
     for (k, (note, path, index)) in inputs.iter().enumerate() {
         assert_eq!(note.pk, pk_self, "input {k} is not owned by this spend key");
         let b = in_slot(k);
@@ -211,5 +230,93 @@ pub fn hidden_bundle_inputs(
     v[BURN_R_HI] = (burn_r >> 32) as u32;
     v[ASSET_A] = asset_a;
     v[TIME] = time;
+    v
+}
+
+/// Delegated proving, Phase 2 (`docs/superpowers/specs/2026-09-28-delegated-proving-design.md`
+/// §4.1): private-input layout of **bundle guest v3** (`guests::bundle_hidden_v3()`) — 1 212
+/// words. It is [`hidden_input`] with two changes and nothing else moved: `nk` takes `sk`'s eight
+/// words at 0 (the guest never sees the spend key; `pk_self = H(PK, nk)` is derived from `nk`
+/// directly), and the 8-word per-transaction `salt` is appended after `time`, at 1 204. Every
+/// other offset is [`hidden_input`]'s own, re-exported rather than copied.
+pub mod hidden_input_v3 {
+    pub use super::hidden_input::{
+        in_slot, out, ANCHOR, ASSET_A, BURN_A_HI, BURN_A_LO, BURN_R_HI, BURN_R_LO, FEE_HI, FEE_LO, IN_SLOTS, IN_SLOT_WORDS,
+        OUTS, OUT_WORDS, O_AMOUNT_HI, O_AMOUNT_LO, O_PK, O_R, S_AMOUNT_HI, S_AMOUNT_LO, S_ASSET, S_FROM, S_INDEX,
+        S_NOTE_WORDS, S_PATH, S_R, S_TIME, TIME,
+    };
+    /// The 8-word nullifier key `nk = H(NK, sk)` — where v1/v2 hold `sk`.
+    pub const NK: usize = 0;
+    /// The 8-word per-transaction salt the auth proof commits to (`auth::auth_commit`).
+    pub const SALT: usize = super::hidden_input::COUNT; // 1204
+    pub const COUNT: usize = SALT + 8; // 1212
+}
+
+/// What the chain holds for a v3 hidden bundle: v1's plaintext plus the public auth commitment
+/// `c = auth::auth_commit(nk, salt)` (the `Bundle`'s `auth_commit`), which the auth proof
+/// publishes and the bundle digest folds in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HiddenDigestInputV3 {
+    pub base: HiddenDigestInput,
+    pub auth_commit: Word8,
+}
+
+/// Words of the v3 digest's message, after the domain tag: [`PREIMAGE_WORDS`] plus the eight of
+/// `auth_commit` — 89, 90 hashed with the tag.
+pub const PREIMAGE_WORDS_V3: usize = PREIMAGE_WORDS + 8; // 89
+
+/// The v3 digest's message (without the tag), `bad = 0`: v1's preimage with `auth_commit`
+/// inserted immediately before `bad` — `m[0..72]` as v1, `m[72..80]` the tail `fee .. time`,
+/// `m[80..88] = auth_commit`, `m[88] = bad`. The exact word order `guests::bundle_hidden_v3()`
+/// stages.
+pub fn hidden_bundle_preimage_v3(i: &HiddenDigestInputV3) -> [u32; PREIMAGE_WORDS_V3] {
+    let v1 = hidden_bundle_preimage(&i.base);
+    let mut m = [0u32; PREIMAGE_WORDS_V3];
+    m[..PREIMAGE_WORDS - 1].copy_from_slice(&v1[..PREIMAGE_WORDS - 1]);
+    m[PREIMAGE_WORDS - 1..PREIMAGE_WORDS_V3 - 1].copy_from_slice(&i.auth_commit);
+    m[PREIMAGE_WORDS_V3 - 1] = v1[PREIMAGE_WORDS - 1]; // bad = 0
+    m
+}
+
+/// `H(HIDDEN_BUNDLE_DOMAIN, anchor, nf0..3, cm0..3, fee, burn_a, burn_r, burn_asset, time,
+/// auth_commit, bad = 0)` — what an honest run of `guests::bundle_hidden_v3()` publishes.
+///
+/// **The same tag, 64, as v1/v2**, deliberately. `notes::hash` is the padding-free sponge
+/// (`hash::sponge_hash`: rate 4, overwrite mode, zero initial state) over `[tag, msg…]`, with the
+/// tag at word 0. Its only structural ambiguity is a zero-extension *within the first,
+/// zero-initialised block* (ZKH-3); past that block every absorbed chunk overwrites lanes a
+/// permutation already mixed. A v1/v2 message is 82 words with the tag (21 permutations), a v3
+/// one 90 (23): both run far past the first block and absorb a different number of blocks, so a
+/// v3 digest equal to a v1/v2 digest would be a Poseidon2 collision between inputs of different
+/// lengths, not a property of the encoding. (And no chain accepts both: a genesis pins one
+/// `hc_bundle`, and the ledger recomputes that guest's digest only.)
+pub fn hidden_bundle_digest_v3(i: &HiddenDigestInputV3) -> Word8 {
+    hash(HIDDEN_BUNDLE_DOMAIN, &hidden_bundle_preimage_v3(i))
+}
+
+/// Builds `guests::bundle_hidden_v3()`'s private-input vector ([`hidden_input_v3::COUNT`] words):
+/// [`hidden_bundle_inputs`]' witness with `vk.nk` in place of the spend key and `salt` appended.
+/// What a light client hands a prover — no word of it can move a note without the auth proof,
+/// which only the spend key's holder can make. Every input must be owned by `vk.pk()` (panics
+/// otherwise, as [`hidden_bundle_inputs`] does); the same fresh-`r` rule for dummies holds.
+#[allow(clippy::too_many_arguments)]
+pub fn hidden_bundle_inputs_v3(
+    vk: &ViewingKey,
+    salt: &Word8,
+    inputs: &[(Note, [Word8; DEPTH], u32); SLOTS],
+    outputs: &[HiddenOutput; SLOTS],
+    anchor: Word8,
+    fee: u64,
+    burn_a: u64,
+    burn_r: u64,
+    asset_a: u32,
+    time: u32,
+) -> Vec<u32> {
+    use hidden_input_v3::{COUNT, NK, SALT};
+    let mut v = witness_body(&vk.pk(), inputs, outputs, anchor, fee, burn_a, burn_r, asset_a, time);
+    v[NK..NK + 8].copy_from_slice(&vk.nk);
+    debug_assert_eq!(v.len(), SALT);
+    v.extend_from_slice(salt);
+    debug_assert_eq!(v.len(), COUNT);
     v
 }

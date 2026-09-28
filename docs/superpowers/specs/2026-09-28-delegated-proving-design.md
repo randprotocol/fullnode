@@ -149,6 +149,10 @@ bundle guest v3   private: nk, salt, the rest as today
 - One shape for every transaction: a wallet that proves for itself makes both proofs. A
   self-proved and a delegated transaction are indistinguishable on chain.
 
+The guest computes `c` with the plain `POSEIDON2` syscall (not constraint set 7's `POSEIDON2_LEN`) over
+a fixed 17-word preimage `[AUTH, nk, salt]`, like every note-layer hash, so it is `auth::auth_commit`
+bit for bit and costs one fixed-length hash.
+
 Genesis selects it the way `hc_bundle` selects v1 or v2 today: a new `hc_bundle` for v3 and a new
 `hc_auth` pinning the auth guest.
 
@@ -156,7 +160,7 @@ Genesis selects it the way `hc_bundle` selects v1 or v2 today: a new `hc_bundle`
 
 | | estimate or measurement | source |
 |---|---|---|
-| bundle guest v3 cycles | net zero (one hash dropped, one added) | to be measured against the 13 % headroom |
+| bundle guest v3 cycles | **measured 2026-09-29:** 2 854 program words, 1 212 input words; every shape (and the adversarial worst case) runs 11 339 executed + 1 020 digest rows = 12 359 cycles (tier-14 cap 16 383: **4 024 spare**) and 1 775 permutations (cap 2 048: **273 spare**, 13.3 %) → **tier 14**, the same nine table heights as v1/v2. Against v2 (12 272 cycles, 1 756 permutations, 292 spare): +87 cycles, +19 permutations — the dropped `H(NK, sk)` is outweighed by `c`'s 17-word hash, the salt reads and the eight wider digest words | `tests/hidden_bundle.rs` (`every_shape_lands_at_tier_14_with_identical_table_heights`) |
 | auth guest workload | **measured 2026-09-28:** 159 program words, 16 input words; 203 executed + 47 digest rows = 250 cycles (tier-10 cap 1 023), 55 permutations (8 absorb; cap 128) → **tier 10** | `tests/auth_spike.rs` |
 | auth proof, proving | **measured 2026-09-28:** tier 10, 6.5–7.6 s proving and 0.30–0.33 s verifying on one core (Apple M4 Max, CPU backend, both profiles), 0.40 GB peak RSS for the Test + Production run | `tests/auth_spike.rs`; wasm and phones unmeasured |
 | auth proof, size | **measured 2026-09-28:** 1 364 714–1 369 066 B (≈ 1.37 MB) at Production FRI; 312 488–314 152 B at Test FRI (three runs; the spread is the proof's salted randomness) | `tests/auth_spike.rs` |

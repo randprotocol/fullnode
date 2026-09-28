@@ -1059,6 +1059,29 @@ pub fn bundle_hidden_v2() -> Program {
     bundle_hidden_guest(Guest::V2BranchFree)
 }
 
+/// Delegated proving, Phase 2 (`docs/superpowers/specs/2026-09-28-delegated-proving-design.md`
+/// §4.1): **bundle guest v3**, split authorisation. [`bundle_hidden_v2`]'s branch-free relation,
+/// check for check, with two changes:
+///
+/// - The witness (`hidden::hidden_input_v3`, built by `hidden::hidden_bundle_inputs_v3`) carries
+///   `nk` where v1/v2 carry the spend key, and `pk_self = H(PK, nk)` is derived from it
+///   (`asm::emit_derive_pk`, the second half of `emit_derive_keys`). Ownership is exactly as
+///   structural as before: every input is staged under `pk_self`, so a note is spendable in the
+///   bundle only by a witness holding its owner's `nk`. What `nk` alone can no longer do is
+///   *authorise*: that is the auth proof's job.
+/// - A per-transaction `salt` (8 words at `hidden_input_v3::SALT`, 1 204) is read and
+///   `c = H(AUTH, nk, salt)` (`auth::auth_commit`, tag `AUTH_DOMAIN` = 65) is computed over a
+///   fixed 17-word preimage with the plain `POSEIDON2` syscall, like every note-layer hash, and
+///   folded into the digest immediately before `bad`: `hidden::hidden_bundle_digest_v3`, 90
+///   words under `HIDDEN_BUNDLE_DOMAIN`. The ledger requires `c` to equal the auth proof's
+///   output, and only the spend key's holder can make that proof (`guests::auth`).
+///
+/// Addresses, keys and notes are unchanged. The digest staging grows by eight words, so the RAM
+/// layout is [`HIDDEN_LAYOUT_V3`]; v1 and v2 keep theirs byte for byte.
+pub fn bundle_hidden_v3() -> Program {
+    bundle_hidden_guest(Guest::V3Split)
+}
+
 /// Which hidden-asset guest [`bundle_hidden_guest`] assembles. The two share every instruction
 /// outside the input slots' membership and asset checks, so the published statement cannot drift
 /// between them.
@@ -1069,11 +1092,130 @@ enum Guest {
     V1,
     /// [`bundle_hidden_v2`]: the branch-free guest.
     V2BranchFree,
+    /// [`bundle_hidden_v3`]: the branch-free guest with split authorisation — `nk` and `salt`
+    /// in, `c = H(AUTH, nk, salt)` in the digest.
+    V3Split,
 }
 
+impl Guest {
+    fn layout(self) -> HiddenLayout {
+        match self {
+            Guest::V1 | Guest::V2BranchFree => HIDDEN_LAYOUT_V1,
+            Guest::V3Split => HIDDEN_LAYOUT_V3,
+        }
+    }
+}
+
+/// The hidden guests' RAM layout: byte offsets from `BASE = HEAP`, one per region. The whole
+/// layout sits below 0x600, so every offset is a valid 12-bit `lw`/`sw`/`addi` immediate without
+/// `bundle()`'s pivot (the private inputs are read one slot at a time into a 21-word window
+/// rather than kept in RAM whole; `Instr::encode` asserts the range, so a layout change that
+/// broke it would panic at assembly). Regions are disjoint ([`HiddenLayout::is_sound`], asserted
+/// at compile time for both layouts).
+///
+/// v1 and v2 share [`HIDDEN_LAYOUT_V1`] — exactly the constants the guest used before v3, so
+/// their instruction streams, and the digests `tests/guest_provenance.rs` pins, do not move. v3
+/// ([`HIDDEN_LAYOUT_V3`]) stages a 90-word digest preimage (v1's 82 plus `auth_commit`), so its
+/// `buf` is 0x20 bytes longer and every later region sits 0x20 higher; `skr` holds the salt
+/// there (the guest never sees `sk`), and `authc` holds `c`.
+#[derive(Clone, Copy)]
+struct HiddenLayout {
+    /// Words of hash scratch at `buf`: the digest preimage, tag included.
+    buf_words: i32,
+    buf: i32,
+    note_stage: i32, // Note::WORDS = 28
+    slot: i32,       // one input slot's 20 note words, then its index
+    hdr: i32,        // hidden_input ANCHOR..COUNT, 88 words
+    skr: i32,        // v1/v2: sk; v3: the salt (`SALTR`)
+    nk: i32,
+    pk: i32,
+    cm_in: i32,      // 4 × Word8
+    nf: i32,         // 4 × Word8
+    cm_out: i32,     // 4 × Word8
+    root_tmp: i32,   // the running Merkle node (v1 only)
+    zero: i32,       // asset 0 (RAND), written by the guest
+    burn_asset: i32,
+    in_amt: i32,     // 4 × (lo, hi): the sums' input addends
+    sum_in: i32,     // (lo, hi)
+    sum_out: i32,    // (lo, hi)
+    /// v3 only: `c = H(AUTH, nk, salt)`, 8 words (unused, and past the layout's end, in v1/v2).
+    authc: i32,
+}
+
+impl HiddenLayout {
+    /// Every region disjoint and in order, and the last byte a valid 12-bit immediate.
+    const fn is_sound(&self) -> bool {
+        use crate::hidden::hidden_input as hi;
+        self.buf + 4 * self.buf_words <= self.note_stage
+            && self.note_stage + 4 * 28 <= self.slot
+            && self.slot + 4 * (hi::S_NOTE_WORDS as i32 + 1) <= self.hdr
+            && self.hdr + 4 * (hi::COUNT - hi::ANCHOR) as i32 <= self.skr
+            && self.skr + 32 <= self.nk
+            && self.nk + 32 <= self.pk
+            && self.pk + 32 <= self.cm_in
+            && self.cm_in + 128 <= self.nf
+            && self.nf + 128 <= self.cm_out
+            && self.cm_out + 128 <= self.root_tmp
+            && self.root_tmp + 32 <= self.zero
+            && self.zero + 4 <= self.burn_asset
+            && self.burn_asset + 4 <= self.in_amt
+            && self.in_amt + 32 <= self.sum_in
+            && self.sum_in + 8 <= self.sum_out
+            && self.sum_out + 8 <= self.authc
+            && self.authc + 32 <= 0x800
+    }
+}
+
+/// v1 and v2 (82-word digest preimage): the pre-v3 constants, unchanged.
+const HIDDEN_LAYOUT_V1: HiddenLayout = HiddenLayout {
+    buf_words: 1 + crate::hidden::PREIMAGE_WORDS as i32, // 82 (..0x148)
+    buf: 0x000,
+    note_stage: 0x150, // (..0x1c0)
+    slot: 0x1c0,       // (..0x214)
+    hdr: 0x220,        // (..0x380)
+    skr: 0x380,        // (..0x3a0)
+    nk: 0x3a0,
+    pk: 0x3c0,
+    cm_in: 0x3e0,      // (..0x460)
+    nf: 0x460,         // (..0x4e0)
+    cm_out: 0x4e0,     // (..0x560)
+    root_tmp: 0x560,   // (..0x580)
+    zero: 0x580,
+    burn_asset: 0x584,
+    in_amt: 0x588,     // (..0x5a8)
+    sum_in: 0x5a8,
+    sum_out: 0x5b0,    // (..0x5b8)
+    authc: 0x5b8,      // never written by v1/v2
+};
+
+/// v3 (90-word digest preimage): v1's regions from `note_stage` on, each 0x20 higher, and `authc`.
+const HIDDEN_LAYOUT_V3: HiddenLayout = HiddenLayout {
+    buf_words: 1 + crate::hidden::PREIMAGE_WORDS_V3 as i32, // 90 (..0x168)
+    buf: 0x000,
+    note_stage: 0x170, // (..0x1e0)
+    slot: 0x1e0,       // (..0x234)
+    hdr: 0x240,        // (..0x3a0)
+    skr: 0x3a0,        // SALTR: the salt (..0x3c0)
+    nk: 0x3c0,
+    pk: 0x3e0,
+    cm_in: 0x400,      // (..0x480)
+    nf: 0x480,         // (..0x500)
+    cm_out: 0x500,     // (..0x580)
+    root_tmp: 0x580,   // (..0x5a0), unused by the branch-free slot
+    zero: 0x5a0,
+    burn_asset: 0x5a4,
+    in_amt: 0x5a8,     // (..0x5c8)
+    sum_in: 0x5c8,
+    sum_out: 0x5d0,    // (..0x5d8)
+    authc: 0x5d8,      // c (..0x5f8)
+};
+
+const _: () = assert!(HIDDEN_LAYOUT_V1.is_sound() && HIDDEN_LAYOUT_V3.is_sound());
+
 fn bundle_hidden_guest(guest: Guest) -> Program {
-    use crate::asm::{copy_word8, emit_add64_carry, emit_derive_keys, emit_eq8, emit_note_commit, emit_nullify, emit_or_into, emit_range_check_u63, emit_stage_note};
-    use crate::hidden::{hidden_input as hi, A_SLOTS, HIDDEN_BUNDLE_DOMAIN, SLOTS};
+    use crate::asm::{copy_word8, emit_add64_carry, emit_derive_keys, emit_derive_pk, emit_eq8, emit_note_commit, emit_nullify, emit_or_into, emit_range_check_u63, emit_stage_note};
+    use crate::auth::AUTH_DOMAIN;
+    use crate::hidden::{hidden_input as hi, hidden_input_v3 as hi3, A_SLOTS, HIDDEN_BUNDLE_DOMAIN, PREIMAGE_WORDS, PREIMAGE_WORDS_V3, SLOTS};
     use crate::notes::{domain, output, DEPTH};
     const BASE: u32 = 25;       // RAM base (holds HEAP)
     const BIT: u32 = 26;        // Merkle: the current index bit
@@ -1089,61 +1231,58 @@ fn bundle_hidden_guest(guest: Guest) -> Program {
     const SA: u32 = T4;         // Merkle: BASE − 32·b, where the sibling's words go
     const OFS: u32 = T5;        // Merkle: 32·b
 
-    // RAM, byte offsets from `BASE = HEAP`. The whole layout sits below 0x5c0, so every offset
-    // is a valid 12-bit `lw`/`sw`/`addi` immediate without `bundle()`'s pivot (the private
-    // inputs are read one slot at a time into a 21-word window rather than kept in RAM whole;
-    // `Instr::encode` asserts the range, so a layout change that broke it would panic at
-    // assembly). Regions are disjoint:
-    const BUF: i32 = 0x000;        // hash scratch: 82 words for the digest (..0x148)
-    const NOTE_STAGE: i32 = 0x150; // Note::WORDS = 28 (..0x1c0)
-    const SLOT: i32 = 0x1c0;       // one input slot's 20 note words, then its index (..0x214)
-    const HDR: i32 = 0x220;        // hidden_input ANCHOR..COUNT, 88 words (..0x380)
-    const SKR: i32 = 0x380;        // sk (..0x3a0)
-    const NK: i32 = 0x3a0;
-    const PK: i32 = 0x3c0;
-    const CM_IN: i32 = 0x3e0;      // 4 × Word8 (..0x460)
-    const NF: i32 = 0x460;         // 4 × Word8 (..0x4e0)
-    const CM_OUT: i32 = 0x4e0;     // 4 × Word8 (..0x560)
-    const ROOT_TMP: i32 = 0x560;   // the running Merkle node (..0x580)
-    const ZERO: i32 = 0x580;       // asset 0 (RAND), written by the guest
-    const BURN_ASSET: i32 = 0x584;
-    const IN_AMT: i32 = 0x588;     // 4 × (lo, hi): the sums' input addends (..0x5a8)
-    const SUM_IN: i32 = 0x5a8;     // (lo, hi)
-    const SUM_OUT: i32 = 0x5b0;    // (lo, hi) (..0x5b8)
-    const _: () = assert!(BUF + 4 * 82 <= NOTE_STAGE && NOTE_STAGE + 4 * 28 <= SLOT);
-    const _: () = assert!(SLOT + 4 * (hi::S_NOTE_WORDS as i32 + 1) <= HDR);
-    const _: () = assert!(HDR + 4 * (hi::COUNT - hi::ANCHOR) as i32 <= SKR && SUM_OUT + 8 <= 0x800);
+    // RAM: the per-guest region offsets (`HiddenLayout`, above; v1/v2 share
+    // `HIDDEN_LAYOUT_V1`, byte for byte what the constants here were before v3).
+    let l = guest.layout();
 
     let ptr_words = |buf: i32| (HEAP + buf) / 4;
-    let hdr = |i: usize| HDR + 4 * (i - hi::ANCHOR) as i32;
-    let slot = |off: usize| SLOT + 4 * off as i32;
-    let slot_index = SLOT + 4 * hi::S_NOTE_WORDS as i32;
+    let hdr = |i: usize| l.hdr + 4 * (i - hi::ANCHOR) as i32;
+    let slot = |off: usize| l.slot + 4 * off as i32;
+    let slot_index = l.slot + 4 * hi::S_NOTE_WORDS as i32;
     let w8 = |region: i32, k: usize| region + 32 * k as i32;
-    let slot_asset = |k: usize| if k < A_SLOTS { hdr(hi::ASSET_A) } else { ZERO };
-    let in_amt = |k: usize| (IN_AMT + 8 * k as i32, IN_AMT + 8 * k as i32 + 4);
+    let slot_asset = |k: usize| if k < A_SLOTS { hdr(hi::ASSET_A) } else { l.zero };
+    let in_amt = |k: usize| (l.in_amt + 8 * k as i32, l.in_amt + 8 * k as i32 + 4);
     let out_amt = |k: usize| (hdr(hi::out(k) + hi::O_AMOUNT_LO), hdr(hi::out(k) + hi::O_AMOUNT_HI));
 
     let mut a = Assembler::new(0);
     a.extend(li(BASE, HEAP));
     a.extend(li(BAD, 0));
-    a.push(sw(BASE, REG_ZERO, ZERO));
+    a.push(sw(BASE, REG_ZERO, l.zero));
 
-    // sk and the header (anchor, outputs, fee, burns, A, time), each word read once.
-    emit_read_inputs(&mut a, "hid_sk", BASE, IDX, PTR, CTR, hi::SK, 8, SKR);
-    emit_read_inputs(&mut a, "hid_hdr", BASE, IDX, PTR, CTR, hi::ANCHOR, hi::COUNT - hi::ANCHOR, HDR);
+    if guest == Guest::V3Split {
+        // nk (read straight into NK — v3 never sees the spend key) and the header (anchor,
+        // outputs, fee, burns, A, time: v1's words at v1's indices), each word read once.
+        emit_read_inputs(&mut a, "hid_nk", BASE, IDX, PTR, CTR, hi3::NK, 8, l.nk);
+        emit_read_inputs(&mut a, "hid_hdr", BASE, IDX, PTR, CTR, hi3::ANCHOR, hi3::SALT - hi3::ANCHOR, l.hdr);
+        // 1. pk_self = H(PK, nk) — the same instructions `emit_derive_keys`' second half emits.
+        emit_derive_pk(&mut a, BASE, T0, l.nk, l.buf, ptr_words(l.buf), l.pk);
+        // 1a. c = H(AUTH, nk, salt): [AUTH_DOMAIN, nk(8), salt(8)], 17 words through the plain
+        // POSEIDON2 syscall — `auth::auth_commit`, the value the auth proof publishes.
+        emit_read_inputs(&mut a, "hid_salt", BASE, IDX, PTR, CTR, hi3::SALT, 8, l.skr);
+        a.extend(li(T0, AUTH_DOMAIN as i32));
+        a.push(sw(BASE, T0, l.buf));
+        copy_word8(&mut a, BASE, T0, l.nk, l.buf + 4);
+        copy_word8(&mut a, BASE, T0, l.skr, l.buf + 36);
+        a.extend(call_poseidon2(ptr_words(l.buf), 17));
+        copy_word8(&mut a, BASE, T0, l.buf, l.authc);
+    } else {
+        // sk and the header (anchor, outputs, fee, burns, A, time), each word read once.
+        emit_read_inputs(&mut a, "hid_sk", BASE, IDX, PTR, CTR, hi::SK, 8, l.skr);
+        emit_read_inputs(&mut a, "hid_hdr", BASE, IDX, PTR, CTR, hi::ANCHOR, hi::COUNT - hi::ANCHOR, l.hdr);
 
-    // 1. nk, pk_self.
-    emit_derive_keys(&mut a, BASE, T0, SKR, BUF, ptr_words(BUF), NK, PK);
+        // 1. nk, pk_self.
+        emit_derive_keys(&mut a, BASE, T0, l.skr, l.buf, ptr_words(l.buf), l.nk, l.pk);
+    }
 
     // 2. inputs.
     for k in 0..SLOTS {
         // The slot's note words and its leaf index; the path is read by the Merkle loop — in
         // v1 only for a real input, in v2 for every slot.
-        emit_read_inputs(&mut a, &format!("hid_in{k}"), BASE, IDX, PTR, CTR, hi::in_slot(k), hi::S_NOTE_WORDS, SLOT);
+        emit_read_inputs(&mut a, &format!("hid_in{k}"), BASE, IDX, PTR, CTR, hi::in_slot(k), hi::S_NOTE_WORDS, l.slot);
         emit_read_inputs(&mut a, &format!("hid_ix{k}"), BASE, IDX, PTR, CTR, hi::in_slot(k) + hi::S_INDEX, 1, slot_index);
         // Owner = pk_self, structurally.
-        emit_stage_note(&mut a, BASE, T0, NOTE_STAGE, PK, slot(hi::S_FROM), slot(hi::S_AMOUNT_LO), slot(hi::S_AMOUNT_HI), slot(hi::S_ASSET), slot(hi::S_TIME), slot(hi::S_R));
-        emit_note_commit(&mut a, BASE, T0, NOTE_STAGE, BUF, ptr_words(BUF), w8(CM_IN, k));
+        emit_stage_note(&mut a, BASE, T0, l.note_stage, l.pk, slot(hi::S_FROM), slot(hi::S_AMOUNT_LO), slot(hi::S_AMOUNT_HI), slot(hi::S_ASSET), slot(hi::S_TIME), slot(hi::S_R));
+        emit_note_commit(&mut a, BASE, T0, l.note_stage, l.buf, ptr_words(l.buf), w8(l.cm_in, k));
         // The dummy rule: T1/T2 are both the sum's addend (stored to IN_AMT) and the skip
         // condition (v1) or the `REAL` mask (v2) — nothing reloads the amount in between.
         a.push(lw(T1, BASE, slot(hi::S_AMOUNT_LO)));
@@ -1157,7 +1296,7 @@ fn bundle_hidden_guest(guest: Guest) -> Program {
 
             // The fused MERKLE_VERIFY: the running node in ROOT_TMP, each level's sibling read from
             // input indices PTR + 0..8 (PTR = the slot's path base, a program constant, + 8·level).
-            copy_word8(&mut a, BASE, T0, w8(CM_IN, k), ROOT_TMP);
+            copy_word8(&mut a, BASE, T0, w8(l.cm_in, k), l.root_tmp);
             a.push(lw(IDX, BASE, slot_index));
             a.extend(li(PTR, (hi::in_slot(k) + hi::S_PATH) as i32));
             a.extend(li(CTR, DEPTH as i32));
@@ -1174,25 +1313,25 @@ fn bundle_hidden_guest(guest: Guest) -> Program {
             a.extend(li(REG_A7, SYS_READ_INPUT as i32)); // POSEIDON2 below clobbers a7
             a.branch(BranchCond::Eq, BIT, REG_ZERO, &bit0);
             // bit 1: the running node is the right child — [sibling, running].
-            read_sibling(&mut a, BUF + 4);
-            copy_word8(&mut a, BASE, T0, ROOT_TMP, BUF + 36);
+            read_sibling(&mut a, l.buf + 4);
+            copy_word8(&mut a, BASE, T0, l.root_tmp, l.buf + 36);
             a.jal(REG_ZERO, &done);
             a.label(&bit0);
             // bit 0: [running, sibling].
-            copy_word8(&mut a, BASE, T0, ROOT_TMP, BUF + 4);
-            read_sibling(&mut a, BUF + 36);
+            copy_word8(&mut a, BASE, T0, l.root_tmp, l.buf + 4);
+            read_sibling(&mut a, l.buf + 36);
             a.label(&done);
             a.extend(li(T0, domain::NODE as i32));
-            a.push(sw(BASE, T0, BUF));
-            a.extend(call_poseidon2(ptr_words(BUF), 17));
-            copy_word8(&mut a, BASE, T0, BUF, ROOT_TMP);
+            a.push(sw(BASE, T0, l.buf));
+            a.extend(call_poseidon2(ptr_words(l.buf), 17));
+            copy_word8(&mut a, BASE, T0, l.buf, l.root_tmp);
             a.push(srli(IDX, IDX, 1));
             a.push(addi(PTR, PTR, 8));
             a.push(addi(CTR, CTR, -1));
             a.branch(BranchCond::Ne, CTR, REG_ZERO, &lp);
 
             // root == anchor, else taint.
-            emit_eq8(&mut a, BASE, T0, EQFOLD, hdr(hi::ANCHOR), ROOT_TMP, T7);
+            emit_eq8(&mut a, BASE, T0, EQFOLD, hdr(hi::ANCHOR), l.root_tmp, T7);
             a.push(xori(T7, T7, 1));
             emit_or_into(&mut a, BAD, T7);
             // the note's asset == the slot's asset, else taint.
@@ -1215,7 +1354,7 @@ fn bundle_hidden_guest(guest: Guest) -> Program {
             // BUF, left = running and right = sibling for b = 0, the reverse for b = 1 — by
             // address: the running word j goes to NA + 4 + 4j, the sibling's to SA + 36 + 4j,
             // with NA = BASE + 32b and SA = BASE − 32b.
-            copy_word8(&mut a, BASE, T0, w8(CM_IN, k), BUF);
+            copy_word8(&mut a, BASE, T0, w8(l.cm_in, k), l.buf);
             a.push(lw(IDX, BASE, slot_index));
             a.extend(li(PTR, (hi::in_slot(k) + hi::S_PATH) as i32));
             a.extend(li(CTR, DEPTH as i32));
@@ -1229,22 +1368,22 @@ fn bundle_hidden_guest(guest: Guest) -> Program {
             // Word 7 down to 0: the writes for word j land on BUF + 4 + 4j and BUF + 36 + 4j,
             // never on a running word i < j still to be read (BUF + 4i).
             for j in (0..8).rev() {
-                a.push(lw(T0, BASE, BUF + 4 * j));  // running word j
+                a.push(lw(T0, BASE, l.buf + 4 * j));  // running word j
                 a.push(addi(REG_A0, PTR, j));
                 a.push(ecall());                     // sibling word j, from the private path
-                a.push(sw(SA, REG_A0, BUF + 36 + 4 * j));
-                a.push(sw(NA, T0, BUF + 4 + 4 * j));
+                a.push(sw(SA, REG_A0, l.buf + 36 + 4 * j));
+                a.push(sw(NA, T0, l.buf + 4 + 4 * j));
             }
             a.extend(li(T0, domain::NODE as i32));
-            a.push(sw(BASE, T0, BUF));
-            a.extend(call_poseidon2(ptr_words(BUF), 17));
+            a.push(sw(BASE, T0, l.buf));
+            a.extend(call_poseidon2(ptr_words(l.buf), 17));
             a.push(srli(IDX, IDX, 1));
             a.push(addi(PTR, PTR, 8));
             a.push(addi(CTR, CTR, -1));
             a.branch(BranchCond::Ne, CTR, REG_ZERO, &lp);
 
             // bad |= real & (root != anchor | asset != the slot's asset).
-            emit_eq8(&mut a, BASE, T0, EQFOLD, hdr(hi::ANCHOR), BUF, T7);
+            emit_eq8(&mut a, BASE, T0, EQFOLD, hdr(hi::ANCHOR), l.buf, T7);
             a.push(xori(T7, T7, 1));
             a.push(lw(T0, BASE, slot(hi::S_ASSET)));
             a.push(lw(T1, BASE, slot_asset(k)));
@@ -1254,18 +1393,18 @@ fn bundle_hidden_guest(guest: Guest) -> Program {
             a.push(and(T7, T7, REAL));
             emit_or_into(&mut a, BAD, T7);
         }
-        emit_nullify(&mut a, BASE, T0, NK, w8(CM_IN, k), BUF, ptr_words(BUF), w8(NF, k));
+        emit_nullify(&mut a, BASE, T0, l.nk, w8(l.cm_in, k), l.buf, ptr_words(l.buf), w8(l.nf, k));
     }
 
     // 3. outputs: from = pk_self, asset = the slot's, time = the bundle's.
     for k in 0..SLOTS {
         let o = hi::out(k);
-        emit_stage_note(&mut a, BASE, T0, NOTE_STAGE, hdr(o + hi::O_PK), PK, hdr(o + hi::O_AMOUNT_LO), hdr(o + hi::O_AMOUNT_HI), slot_asset(k), hdr(hi::TIME), hdr(o + hi::O_R));
-        emit_note_commit(&mut a, BASE, T0, NOTE_STAGE, BUF, ptr_words(BUF), w8(CM_OUT, k));
+        emit_stage_note(&mut a, BASE, T0, l.note_stage, hdr(o + hi::O_PK), l.pk, hdr(o + hi::O_AMOUNT_LO), hdr(o + hi::O_AMOUNT_HI), slot_asset(k), hdr(hi::TIME), hdr(o + hi::O_R));
+        emit_note_commit(&mut a, BASE, T0, l.note_stage, l.buf, ptr_words(l.buf), w8(l.cm_out, k));
     }
 
     // 4. every pair of nullifiers and every pair of output commitments differs.
-    for region in [NF, CM_OUT] {
+    for region in [l.nf, l.cm_out] {
         for i in 0..SLOTS {
             for j in (i + 1)..SLOTS {
                 emit_eq8(&mut a, BASE, T0, EQFOLD, w8(region, i), w8(region, j), T7);
@@ -1298,23 +1437,23 @@ fn bundle_hidden_guest(guest: Guest) -> Program {
         a.push(sw(BASE, T4, dst + 4));
     };
     let compare = |a: &mut Assembler| {
-        a.push(lw(T0, BASE, SUM_IN));
-        a.push(lw(T1, BASE, SUM_OUT));
+        a.push(lw(T0, BASE, l.sum_in));
+        a.push(lw(T1, BASE, l.sum_out));
         a.push(sub(T2, T0, T1));
-        a.push(lw(T0, BASE, SUM_IN + 4));
-        a.push(lw(T1, BASE, SUM_OUT + 4));
+        a.push(lw(T0, BASE, l.sum_in + 4));
+        a.push(lw(T1, BASE, l.sum_out + 4));
         a.push(sub(T3, T0, T1));
         a.push(or(T2, T2, T3));
         a.push(sltu(T2, REG_ZERO, T2)); // 1 iff the totals differ
         emit_or_into(a, BAD, T2);
     };
     // Asset A: in0 + in1 == out0 + out1 + burn_a.
-    sum(&mut a, &[in_amt(0), in_amt(1)], SUM_IN);
-    sum(&mut a, &[out_amt(0), out_amt(1), (hdr(hi::BURN_A_LO), hdr(hi::BURN_A_HI))], SUM_OUT);
+    sum(&mut a, &[in_amt(0), in_amt(1)], l.sum_in);
+    sum(&mut a, &[out_amt(0), out_amt(1), (hdr(hi::BURN_A_LO), hdr(hi::BURN_A_HI))], l.sum_out);
     compare(&mut a);
     // RAND: in2 + in3 == out2 + out3 + fee + burn_r.
-    sum(&mut a, &[in_amt(2), in_amt(3)], SUM_IN);
-    sum(&mut a, &[out_amt(2), out_amt(3), (hdr(hi::FEE_LO), hdr(hi::FEE_HI)), (hdr(hi::BURN_R_LO), hdr(hi::BURN_R_HI))], SUM_OUT);
+    sum(&mut a, &[in_amt(2), in_amt(3)], l.sum_in);
+    sum(&mut a, &[out_amt(2), out_amt(3), (hdr(hi::FEE_LO), hdr(hi::FEE_HI)), (hdr(hi::BURN_R_LO), hdr(hi::BURN_R_HI))], l.sum_out);
     compare(&mut a);
 
     // 7. burn_asset = A & -(burn_a != 0).
@@ -1325,32 +1464,39 @@ fn bundle_hidden_guest(guest: Guest) -> Program {
     a.push(sub(T0, REG_ZERO, T0));  // all ones iff burn_a != 0
     a.push(lw(T1, BASE, hdr(hi::ASSET_A)));
     a.push(and(T1, T1, T0));
-    a.push(sw(BASE, T1, BURN_ASSET));
+    a.push(sw(BASE, T1, l.burn_asset));
 
     // 8. digest = H(HIDDEN_BUNDLE_DOMAIN, anchor, nf0..3, cm0..3, fee, burn_a, burn_r,
     // burn_asset, time, bad) — `hidden::hidden_bundle_preimage`'s order, bad last.
     a.extend(li(T0, HIDDEN_BUNDLE_DOMAIN as i32));
-    a.push(sw(BASE, T0, BUF));
-    copy_word8(&mut a, BASE, T0, hdr(hi::ANCHOR), BUF + 4);
-    let mut off = BUF + 36;
-    for region in [NF, CM_OUT] {
+    a.push(sw(BASE, T0, l.buf));
+    copy_word8(&mut a, BASE, T0, hdr(hi::ANCHOR), l.buf + 4);
+    let mut off = l.buf + 36;
+    for region in [l.nf, l.cm_out] {
         for k in 0..SLOTS {
             copy_word8(&mut a, BASE, T0, w8(region, k), off);
             off += 32;
         }
     }
-    let tail = [hdr(hi::FEE_LO), hdr(hi::FEE_HI), hdr(hi::BURN_A_LO), hdr(hi::BURN_A_HI), hdr(hi::BURN_R_LO), hdr(hi::BURN_R_HI), BURN_ASSET, hdr(hi::TIME)];
+    let tail = [hdr(hi::FEE_LO), hdr(hi::FEE_HI), hdr(hi::BURN_A_LO), hdr(hi::BURN_A_HI), hdr(hi::BURN_R_LO), hdr(hi::BURN_R_HI), l.burn_asset, hdr(hi::TIME)];
     for src in tail {
         a.push(lw(T0, BASE, src));
         a.push(sw(BASE, T0, off));
         off += 4;
     }
+    // v3: auth_commit, immediately before bad (`hidden::hidden_bundle_preimage_v3`).
+    if guest == Guest::V3Split {
+        copy_word8(&mut a, BASE, T0, l.authc, off);
+        off += 32;
+    }
     a.push(sw(BASE, BAD, off));
     off += 4;
-    assert_eq!((off - BUF) / 4, 1 + crate::hidden::PREIMAGE_WORDS as i32, "the staged digest preimage is not hidden_bundle_preimage's");
-    a.extend(call_poseidon2(ptr_words(BUF), 1 + crate::hidden::PREIMAGE_WORDS));
+    let preimage_words = if guest == Guest::V3Split { PREIMAGE_WORDS_V3 } else { PREIMAGE_WORDS };
+    assert_eq!((off - l.buf) / 4, 1 + preimage_words as i32, "the staged digest preimage is not hidden_bundle_preimage's");
+    assert_eq!(1 + preimage_words as i32, l.buf_words, "the digest preimage overruns its scratch");
+    a.extend(call_poseidon2(ptr_words(l.buf), 1 + preimage_words));
     for i in 0..8 {
-        a.push(lw(T1, BASE, BUF + 4 * i));
+        a.push(lw(T1, BASE, l.buf + 4 * i));
         a.extend(write_output((output::DIGEST + i as usize) as u32, T1));
     }
     a.extend(halt());

@@ -120,7 +120,26 @@ fn the_branch_free_bundle_guest_is_pinned() {
     let v2 = "651043e2ff2fef28df2d8edbdbbc387668577af72dcc584ee7d850e093a2839b";
     assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2()), v2, "guests::bundle_hidden_v2() no longer assembles to its pinned digest");
     assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle()), "83d3a3704a1fcdb9bae7136c0a947ffa34bd53f055388395ed705fe8cacd0ef8");
-    assert_eq!(ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h)), ["83d3a3704a1fcdb9bae7136c0a947ffa34bd53f055388395ed705fe8cacd0ef8", v2]);
+    assert_eq!(ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h))[..2], ["83d3a3704a1fcdb9bae7136c0a947ffa34bd53f055388395ed705fe8cacd0ef8", v2]);
+}
+
+/// Bundle guest v3 (`guests::bundle_hidden_v3()`, delegated proving Phase 2: `nk` and `salt` in,
+/// `c = H(AUTH, nk, salt)` in the digest) assembles to one fixed digest, pinned like v2's. No
+/// genesis names it yet. v1's and v2's pins (above) are unmoved by its arrival: the three share
+/// one assembler function, and v1/v2 keep their RAM layout (`HIDDEN_LAYOUT_V1`) and instruction
+/// stream byte for byte.
+#[test]
+fn the_split_authorisation_bundle_guest_is_pinned() {
+    let v3 = "60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce";
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), v3, "guests::bundle_hidden_v3() no longer assembles to its pinned digest");
+    assert_eq!(
+        ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h)),
+        [
+            "83d3a3704a1fcdb9bae7136c0a947ffa34bd53f055388395ed705fe8cacd0ef8".to_string(),
+            "651043e2ff2fef28df2d8edbdbbc387668577af72dcc584ee7d850e093a2839b".to_string(),
+            v3.to_string(),
+        ]
+    );
 }
 
 /// ZKG-2: the pin above, for every genesis file the repository carries — chain 15 included, which

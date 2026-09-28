@@ -4319,10 +4319,10 @@ mod tests {
         assert!(check_build_runs_genesis(&gs, &[hc]).is_ok());
         let other = check_build_runs_genesis(&gs, &[[0xdead; 8]]).unwrap_err().to_string();
         assert!(other.contains("differs from the genesis hc_bundle"), "{other}");
-        // The build's two guests (INT-2 / GV-1): a genesis naming either starts; one naming
-        // neither — the retired 2-in-2-out guest, say — does not.
-        let [v1, v2] = ZkExecutor::known_hc_bundles();
-        for named in [v1, v2] {
+        // The build's guests (v1, the branch-free v2 of INT-2 / GV-1, and v3's split
+        // authorisation): a genesis naming any of them starts; one naming none — the retired
+        // 2-in-2-out guest, say — does not.
+        for named in ZkExecutor::known_hc_bundles() {
             gs.hc_bundle = named;
             assert!(check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles()).is_ok());
         }

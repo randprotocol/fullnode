@@ -23,7 +23,8 @@ use randprotocol_core::confidential::ConfidentialError;
 use randprotocol_zkvm::emulator::{execute, HashRow};
 use randprotocol_zkvm::executor::{prove_bundle_for, prove_hidden_bundle, ZkExecutor};
 use randprotocol_zkvm::isa::Program;
-use randprotocol_zkvm::hidden::{self, hidden_input as hi, HiddenDigestInput, HiddenOutput, HIDDEN_BUNDLE_DOMAIN};
+use randprotocol_zkvm::auth;
+use randprotocol_zkvm::hidden::{self, hidden_input as hi, hidden_input_v3 as hi3, HiddenDigestInput, HiddenDigestInputV3, HiddenOutput, HIDDEN_BUNDLE_DOMAIN};
 use randprotocol_zkvm::ledger::CommitmentTree;
 use randprotocol_zkvm::machine::{build_traces, Backend, FriProfile, Machine, Tier};
 use randprotocol_zkvm::notes::{self, Note, SpendKey, Word8, DEPTH};
@@ -58,6 +59,8 @@ struct Case {
     burn_r: u64,
     asset_a: u32,
     time: u32,
+    /// The v3 witness's per-transaction salt (fresh per case, as a wallet draws it).
+    salt: Word8,
 }
 
 impl Case {
@@ -103,7 +106,7 @@ impl Case {
             let asset = if k < 2 { asset_a } else { 0 };
             Note::new([k as u32 + 20; 8], me, outs[k], asset, TIME)
         });
-        Case { sk, ins, outs, anchor, fee, burn_a, burn_r, asset_a, time: TIME }
+        Case { sk, ins, outs, anchor, fee, burn_a, burn_r, asset_a, time: TIME, salt: SpendKey::random().0 }
     }
 
     /// The witness. The outputs go in as the sender's choices only (`pk`, `amount`, `r`); the
@@ -113,6 +116,19 @@ impl Case {
         hidden::hidden_bundle_inputs(
             &self.sk, &self.ins, &outs, self.anchor, self.fee, self.burn_a, self.burn_r, self.asset_a, self.time,
         )
+    }
+
+    /// The v3 witness (`hidden::hidden_bundle_inputs_v3`): `nk` in place of `sk`, the salt appended.
+    fn inputs_v3(&self) -> Vec<u32> {
+        let outs = self.outs.map(|o| HiddenOutput { pk: o.pk, amount: o.amount, r: o.r });
+        hidden::hidden_bundle_inputs_v3(
+            &self.sk.viewing_key(), &self.salt, &self.ins, &outs, self.anchor, self.fee, self.burn_a, self.burn_r, self.asset_a, self.time,
+        )
+    }
+
+    /// What a v3 chain sees: [`Case::claimed`] and the auth commitment of this case's `nk` and salt.
+    fn claimed_v3(&self) -> HiddenDigestInputV3 {
+        HiddenDigestInputV3 { base: self.claimed(), auth_commit: auth::auth_commit(&self.sk.viewing_key().nk, &self.salt) }
     }
 
     /// What the chain sees, computed here independently of the guest: nullifiers of the spent
@@ -157,15 +173,58 @@ fn tainted(di: &HiddenDigestInput) -> Word8 {
     notes::hash(HIDDEN_BUNDLE_DOMAIN, &msg)
 }
 
-fn assert_honest(c: &Case, what: &str) {
-    assert_eq!(emulate(&c.inputs()), hidden::hidden_bundle_digest(&c.claimed()), "{what}: an honest witness tainted, or the digest preimage disagrees");
+/// [`tainted`] for v3: `bad = 1` after `auth_commit`.
+fn tainted_v3(di: &HiddenDigestInputV3) -> Word8 {
+    let mut msg = hidden::hidden_bundle_preimage_v3(di);
+    *msg.last_mut().unwrap() = 1;
+    notes::hash(HIDDEN_BUNDLE_DOMAIN, &msg)
 }
 
-/// The witness taints `bad` and changes nothing else about the digest.
+/// Bundle guest v3 on a v3 witness.
+fn emulate_v3(inputs_v3: &[u32]) -> Word8 {
+    assert_eq!(inputs_v3.len(), hi3::COUNT);
+    execute(ZkExecutor::hidden_bundle_v3_program(), inputs_v3, &BINDING_A, MAX_CYCLES).unwrap().outputs
+}
+
+/// The v3 witness of a v1/v2 witness — dishonest ones included: the same words at the same
+/// indices, `nk = H(NK, sk)` in place of `sk`, and `salt` appended. So every witness the tests
+/// below build for v1 and v2, cheats included, runs on v3 too.
+fn to_v3(inputs: &[u32], salt: &Word8) -> Vec<u32> {
+    assert_eq!(inputs.len(), hi::COUNT);
+    let sk = SpendKey(inputs[hi::SK..hi::SK + 8].try_into().unwrap());
+    let mut v = inputs.to_vec();
+    v[hi3::NK..hi3::NK + 8].copy_from_slice(&sk.viewing_key().nk);
+    v.extend_from_slice(salt);
+    v
+}
+
+/// The salt [`assert_taints`] runs its v3 witnesses under.
+const TAINT_SALT: Word8 = [0x5a17, 1, 2, 3, 4, 5, 6, 0x7fff_ffff];
+
+/// `claimed` as a v3 chain sees it, for the spend key in `inputs` and `salt`.
+fn claimed_v3_of(inputs: &[u32], claimed: &HiddenDigestInput, salt: &Word8) -> HiddenDigestInputV3 {
+    let sk = SpendKey(inputs[hi::SK..hi::SK + 8].try_into().unwrap());
+    HiddenDigestInputV3 { base: *claimed, auth_commit: auth::auth_commit(&sk.viewing_key().nk, salt) }
+}
+
+/// Honest on v1, v2 **and v3**: v1/v2 publish `hidden_bundle_digest`, v3 on the v3 witness
+/// `hidden_bundle_digest_v3` with `auth_commit = auth::auth_commit(nk, salt)` — and the v3
+/// builder's witness is exactly `to_v3` of the v1 one.
+fn assert_honest(c: &Case, what: &str) {
+    assert_eq!(emulate(&c.inputs()), hidden::hidden_bundle_digest(&c.claimed()), "{what}: an honest witness tainted, or the digest preimage disagrees");
+    assert_eq!(c.inputs_v3(), to_v3(&c.inputs(), &c.salt), "{what}: the v3 builder moved a shared word");
+    assert_eq!(emulate_v3(&c.inputs_v3()), hidden::hidden_bundle_digest_v3(&c.claimed_v3()), "{what}: v3 tainted an honest witness, or its preimage disagrees");
+}
+
+/// The witness taints `bad` and changes nothing else about the digest — on v1, v2 and v3.
 fn assert_taints(inputs: &[u32], claimed: &HiddenDigestInput, what: &str) {
     let out = emulate(inputs);
     assert_ne!(out, hidden::hidden_bundle_digest(claimed), "{what}: a cheating witness published the honest digest");
     assert_eq!(out, tainted(claimed), "{what}: expected exactly the bad = 1 digest");
+    let claimed_v3 = claimed_v3_of(inputs, claimed, &TAINT_SALT);
+    let out = emulate_v3(&to_v3(inputs, &TAINT_SALT));
+    assert_ne!(out, hidden::hidden_bundle_digest_v3(&claimed_v3), "{what}: v3 published the honest digest");
+    assert_eq!(out, tainted_v3(&claimed_v3), "{what}: v3 did not publish exactly the bad = 1 digest");
 }
 
 // ───────────────────────────── shapes ─────────────────────────────
@@ -231,10 +290,15 @@ fn every_honest_shape_publishes_the_host_digest() {
 /// RAND payment from a token transfer. The tier does not depend on the FRI profile.
 #[test]
 fn every_shape_lands_at_tier_14_with_identical_table_heights() {
-    // One `heights` for both guests: v2 must declare v1's shape exactly (the executor verifies
-    // either at the one pinned `bundle_heights` and with one verifier key).
+    // One `heights` for every guest: v2 must declare v1's shape exactly (the executor verifies
+    // either at the one pinned `bundle_heights` and with one verifier key), and v3 — a wider
+    // witness and a longer program — measures here into the same table heights, so
+    // `bundle_heights_for` is one triple for all three today.
     let mut heights = None;
-    for (guest, program) in guests() {
+    let mut worst_v3 = (i64::MAX, i64::MAX);
+    let all: [(&str, &Program); 3] = [guests()[0], guests()[1], ("v3", ZkExecutor::hidden_bundle_v3_program())];
+    for (guest, program) in all {
+        let v3 = guest == "v3";
         // The worst case for cycles over *any* witness, honest or not: in v1 the only
         // data-dependent costs are the dummy skip and the Merkle bit branch (bit 1 costs one `jal`
         // more per level), so four real inputs whose leaf indices are all ones. Tainted (no such
@@ -244,10 +308,10 @@ fn every_shape_lands_at_tier_14_with_identical_table_heights() {
         for k in 0..4 {
             worst[hi::in_slot(k) + hi::S_INDEX] = u32::MAX;
         }
-        let mut runs: Vec<(&str, Vec<u32>)> = shapes().into_iter().map(|(w, c)| (w, c.inputs())).collect();
-        runs.push(("worst case: four real inputs, every index bit 1", worst));
+        let mut runs: Vec<(&str, Vec<u32>)> = shapes().into_iter().map(|(w, c)| (w, if v3 { c.inputs_v3() } else { c.inputs() })).collect();
+        runs.push(("worst case: four real inputs, every index bit 1", if v3 { to_v3(&worst, &TAINT_SALT) } else { worst }));
         for (what, inputs) in runs {
-            assert_eq!(inputs.len(), hi::COUNT);
+            assert_eq!(inputs.len(), if v3 { hi3::COUNT } else { hi::COUNT });
             let exec = execute(program, &inputs, &BINDING_A, MAX_CYCLES).unwrap();
             let fixed = program.digest_rows()
                 + randprotocol_zkvm::hash::input_digest_row_count(inputs.len())
@@ -269,6 +333,10 @@ fn every_shape_lands_at_tier_14_with_identical_table_heights() {
                 tier.0
             );
             assert_eq!(tier, Tier(14), "{guest} {what}");
+            if v3 {
+                let head = (Tier(14).max_cycles() as i64 - cycles as i64, (Tier(14).poseidon2_height() / 32) as i64 - perms as i64);
+                worst_v3 = (worst_v3.0.min(head.0), worst_v3.1.min(head.1));
+            }
             let traces = build_traces(program, &inputs, &BINDING_A, &exec, tier).unwrap();
             let h: Vec<usize> = traces.as_slice().iter().map(|m| p3_matrix::Matrix::height(*m)).collect();
             match &heights {
@@ -280,6 +348,14 @@ fn every_shape_lands_at_tier_14_with_identical_table_heights() {
             }
         }
     }
+    println!("v3 worst-shape headroom at tier 14: {} cycles, {} permutations", worst_v3.0, worst_v3.1);
+    // And the executor's pinned triples agree with what was measured: one for every guest.
+    let v1 = ZkExecutor::bundle_heights_for(&ZkExecutor::hc_hidden_bundle());
+    assert_eq!(v1, ZkExecutor::hidden_bundle_heights());
+    assert_eq!(ZkExecutor::bundle_heights_for(&ZkExecutor::hc_hidden_bundle_v2()), v1);
+    assert_eq!(ZkExecutor::bundle_heights_for(&ZkExecutor::hc_hidden_bundle_v3()), v1, "v3 declares v1's heights");
+    assert_eq!(ZkExecutor::bundle_input_words(&ZkExecutor::hc_hidden_bundle_v3()), hi3::COUNT);
+    assert_eq!(ZkExecutor::bundle_input_words(&ZkExecutor::hc_hidden_bundle_v2()), hi::COUNT);
 }
 
 // ─────────────── INT-2 / GV-1: what the LogUp terminals are computed from ───────────────
@@ -380,10 +456,15 @@ fn private_variants() -> Vec<(String, Case)> {
 /// The first variant whose trace shape differs from the first variant's, with the fields that
 /// differ — `None` when every variant runs the same shape.
 fn first_divergence(program: &Program) -> Option<String> {
+    first_divergence_of(program, Case::inputs)
+}
+
+/// [`first_divergence`] with the witness built by `witness` (`Case::inputs_v3` for v3).
+fn first_divergence_of(program: &Program, witness: fn(&Case) -> Vec<u32>) -> Option<String> {
     let variants = private_variants();
-    let (base_what, base) = (&variants[0].0, trace_shape(program, &variants[0].1.inputs()));
+    let (base_what, base) = (&variants[0].0, trace_shape(program, &witness(&variants[0].1)));
     for (what, c) in &variants[1..] {
-        let t = trace_shape(program, &c.inputs());
+        let t = trace_shape(program, &witness(c));
         if t != base {
             let mut diff = Vec::new();
             if t.cycles != base.cycles {
@@ -432,6 +513,15 @@ fn the_branch_free_guests_trace_does_not_depend_on_the_witness() {
     }
 }
 
+/// v3 keeps v2's property: one instruction trace for every honest v3 witness (each variant with
+/// its own fresh salt and key, so `nk` and `salt` vary too).
+#[test]
+fn the_v3_guests_trace_does_not_depend_on_the_witness() {
+    if let Some(d) = first_divergence_of(ZkExecutor::hidden_bundle_v3_program(), Case::inputs_v3) {
+        panic!("bundle guest v3's trace depends on private data: {d}");
+    }
+}
+
 /// The leak itself, pinned on v1 (chains 14 and 15): the same witnesses run different
 /// instruction traces, which is what `audit_logup_leak` reads out of the program table's
 /// terminal. Kept as a check that `first_divergence` can see it — a statistics function that
@@ -476,6 +566,7 @@ fn every_branch_in_the_branch_free_guest_is_a_counted_loop() {
         data_dependent
     };
     assert_eq!(branches(ZkExecutor::hidden_bundle_v2_program()), Vec::<String>::new());
+    assert_eq!(branches(ZkExecutor::hidden_bundle_v3_program()), Vec::<String>::new(), "v3 is branch-free too");
     let v1 = branches(ZkExecutor::hidden_bundle_program());
     println!("v1's data-dependent branches: {v1:?}");
     assert_eq!(v1.len(), 12, "v1: four dummy skips, four bit branches, four jal");
@@ -492,9 +583,19 @@ fn the_branch_free_guest_is_a_distinct_program_with_v1s_declared_shape() {
     assert_ne!(ZkExecutor::hc_hidden_bundle_v2(), ZkExecutor::hc_hidden_bundle());
     use randprotocol_zkvm::tables::program::program_log_height;
     assert_eq!(program_log_height(v1.words.len()), program_log_height(v2.words.len()));
-    assert_eq!(ZkExecutor::known_hc_bundles(), [ZkExecutor::hc_hidden_bundle(), ZkExecutor::hc_hidden_bundle_v2()]);
+    assert_eq!(ZkExecutor::known_hc_bundles(), [ZkExecutor::hc_hidden_bundle(), ZkExecutor::hc_hidden_bundle_v2(), ZkExecutor::hc_hidden_bundle_v3()]);
     assert_eq!(ZkExecutor::bundle_program_for(&ZkExecutor::hc_hidden_bundle()).unwrap().digest(), v1.digest());
     assert_eq!(ZkExecutor::bundle_program_for(&ZkExecutor::hc_hidden_bundle_v2()).unwrap().digest(), v2.digest());
+    let v3 = ZkExecutor::hidden_bundle_v3_program();
+    assert_eq!(ZkExecutor::bundle_program_for(&ZkExecutor::hc_hidden_bundle_v3()).unwrap().digest(), v3.digest());
+    assert_ne!(ZkExecutor::hc_hidden_bundle_v3(), ZkExecutor::hc_hidden_bundle_v2());
+    assert_eq!(program_log_height(v1.words.len()), program_log_height(v3.words.len()), "v3 pads to v1's program height");
+    println!("v3 {} words; hc v3 = {}", v3.words.len(), randprotocol_core::notes::word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()));
+    // A v1-width witness is refused for v3 before proving, and the reverse.
+    let refused = prove_bundle_for(&ZkExecutor::hc_hidden_bundle_v3(), FriProfile::Test, &mixed().inputs(), &BINDING_A, Backend::Cpu).unwrap_err();
+    assert!(refused.contains("exactly 1212 words"), "{refused}");
+    let refused = prove_bundle_for(&ZkExecutor::hc_hidden_bundle_v2(), FriProfile::Test, &mixed().inputs_v3(), &BINDING_A, Backend::Cpu).unwrap_err();
+    assert!(refused.contains("exactly 1204 words"), "{refused}");
     assert!(ZkExecutor::bundle_program_for(&ZkExecutor::hc_legacy_bundle()).is_none(), "the retired guest is not a chain guest");
     let refused = prove_bundle_for(&[7; 8], FriProfile::Test, &mixed().inputs(), &BINDING_A, Backend::Cpu).unwrap_err();
     assert!(refused.contains("cannot prove for the chain's bundle guest"), "{refused}");
@@ -579,6 +680,81 @@ fn the_witness_builder_follows_the_layout() {
     assert_eq!(v[hi::ASSET_A], TOKEN);
     assert_eq!(v[hi::TIME], TIME);
     assert_eq!(hi::TIME + 1, hi::COUNT);
+    // v3: nk at 0 (never sk), the salt at 1204, every other word v1's.
+    assert_eq!((hi3::NK, hi3::SALT, hi3::COUNT), (0, 1_204, 1_212));
+    let w = c.inputs_v3();
+    assert_eq!(w.len(), hi3::COUNT);
+    assert_eq!(&w[hi3::NK..hi3::NK + 8], &c.sk.viewing_key().nk);
+    assert!(!w.windows(8).any(|x| x == c.sk.0), "the spend key appears nowhere in a v3 witness");
+    assert_eq!(&w[hi3::SALT..hi3::COUNT], &c.salt);
+    assert_eq!(&w[8..hi3::SALT], &v[8..hi::COUNT]);
+}
+
+/// The v3 digest: v1's preimage with `auth_commit` inserted immediately before `bad`, under the
+/// same tag (64), and every published field — `auth_commit` included — moves it.
+#[test]
+fn the_v3_digest_is_v1s_preimage_with_the_auth_commit_before_bad() {
+    let c = mixed();
+    let d3 = c.claimed_v3();
+    let (m1, m3) = (hidden::hidden_bundle_preimage(&d3.base), hidden::hidden_bundle_preimage_v3(&d3));
+    assert_eq!((m1.len(), m3.len(), hidden::PREIMAGE_WORDS_V3), (81, 89, 89));
+    assert_eq!(&m3[..80], &m1[..80]);
+    assert_eq!(&m3[80..88], &d3.auth_commit);
+    assert_eq!((m3[88], m1[80]), (0, 0), "bad last, 0 in the honest preimage");
+    assert_eq!(hidden::hidden_bundle_digest_v3(&d3), notes::hash(HIDDEN_BUNDLE_DOMAIN, &m3));
+    assert_ne!(hidden::hidden_bundle_digest_v3(&d3), hidden::hidden_bundle_digest(&d3.base));
+    assert_ne!(hidden::hidden_bundle_digest_v3(&HiddenDigestInputV3 { auth_commit: [1; 8], ..d3 }), hidden::hidden_bundle_digest_v3(&d3));
+    assert_ne!(hidden::hidden_bundle_digest_v3(&HiddenDigestInputV3 { base: HiddenDigestInput { fee: 11, ..d3.base }, ..d3 }), hidden::hidden_bundle_digest_v3(&d3));
+}
+
+/// The salt is in the digest: the same bundle under another salt publishes another `c`, so
+/// another digest — and each is exactly the host's for its own salt.
+#[test]
+fn a_v3_witness_with_a_different_salt_publishes_a_different_digest() {
+    let c = mixed();
+    let mut d = c.clone();
+    d.salt = SpendKey::random().0;
+    assert_ne!(c.salt, d.salt);
+    let (one, two) = (emulate_v3(&c.inputs_v3()), emulate_v3(&d.inputs_v3()));
+    assert_ne!(one, two);
+    assert_eq!(one, hidden::hidden_bundle_digest_v3(&c.claimed_v3()));
+    assert_eq!(two, hidden::hidden_bundle_digest_v3(&d.claimed_v3()));
+    assert_eq!(c.claimed(), d.claimed(), "nothing but the auth commitment differs");
+}
+
+/// v3's owner check is by `nk`: a witness carrying another key's `nk` derives that key's
+/// `pk_self`, stages the spender's notes under it (commitments not in the tree) and commits the
+/// outputs `from` it — exactly what v1 does with another key's `sk`. So it taints, and what it
+/// publishes is the relabelled plaintext's digest with `bad = 1` and the other `nk`'s `c`: a
+/// prover holding the wrong `nk` can neither spend these notes nor pass for their owner.
+#[test]
+fn a_v3_witness_with_another_keys_nk_taints() {
+    let c = rand_only();
+    let other = SpendKey::random();
+    let (ovk, opk) = (other.viewing_key(), other.viewing_key().pk());
+    let mut v = c.inputs_v3();
+    v[hi3::NK..hi3::NK + 8].copy_from_slice(&ovk.nk);
+    // What the guest actually proves about: every input and output relabelled to the other key.
+    let mut relabelled = c.clone();
+    relabelled.sk = other;
+    for k in 0..4 {
+        relabelled.ins[k].0.pk = opk;
+        relabelled.outs[k].from = opk;
+    }
+    let claimed = HiddenDigestInputV3 { base: relabelled.claimed(), auth_commit: auth::auth_commit(&ovk.nk, &c.salt) };
+    let out = emulate_v3(&v);
+    assert_ne!(out, hidden::hidden_bundle_digest_v3(&c.claimed_v3()), "another nk published the owner's digest");
+    assert_ne!(out, hidden::hidden_bundle_digest_v3(&claimed), "the real input is not in the tree under the other key");
+    assert_eq!(out, tainted_v3(&claimed), "expected exactly the relabelled bad = 1 digest");
+}
+
+/// The v3 builder refuses an input not owned by `vk.pk()`, as v1's does for `sk`.
+#[test]
+#[should_panic(expected = "input 2 is not owned by this spend key")]
+fn the_v3_builder_refuses_an_input_owned_by_another_key() {
+    let mut c = rand_only();
+    c.ins[2].0.pk = [1; 8];
+    let _ = c.inputs_v3();
 }
 
 // ───────────────────────────── dishonest witnesses ─────────────────────────────

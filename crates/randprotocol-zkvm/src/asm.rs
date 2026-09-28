@@ -210,9 +210,19 @@ pub fn emit_derive_nk(a: &mut Assembler, base: u32, tmp: u32, sk_at: i32, buf: i
 /// committed to your own key" structural — so it is emitted from one place.
 pub fn emit_derive_keys(a: &mut Assembler, base: u32, tmp: u32, sk_at: i32, buf: i32, ptr_words: i32, nk_out: i32, pk_out: i32) {
     emit_derive_nk(a, base, tmp, sk_at, buf, ptr_words, nk_out);
+    emit_derive_pk(a, base, tmp, nk_out, buf, ptr_words, pk_out);
+}
+
+/// The second half of [`emit_derive_keys`]: `pk = H(PK, nk)` from an 8-word `nk` at
+/// `base + nk_at` to `base + pk_out`, the 9-word preimage staged at `base + buf`. Factored out
+/// for `guests::bundle_hidden_v3` (delegated proving, Phase 2), whose witness carries `nk` and
+/// never the spend key; `emit_derive_keys` emits exactly the instructions it did before
+/// (`tests/guest_provenance.rs` pins the guests built from it). Node-local, like
+/// [`emit_derive_nk`].
+pub fn emit_derive_pk(a: &mut Assembler, base: u32, tmp: u32, nk_at: i32, buf: i32, ptr_words: i32, pk_out: i32) {
     a.extend(ops::li(tmp, domain::PK as i32));
     a.push(ops::sw(base, tmp, buf));
-    copy_word8(a, base, tmp, nk_out, buf + 4);
+    copy_word8(a, base, tmp, nk_at, buf + 4);
     a.extend(ops::call_poseidon2(ptr_words, 9));
     copy_word8(a, base, tmp, buf, pk_out);
 }

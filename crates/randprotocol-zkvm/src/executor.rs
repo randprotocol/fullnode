@@ -713,12 +713,49 @@ impl ZkExecutor {
         Self::hidden_bundle_v2_program().digest()
     }
 
-    /// Every bundle guest this build can run a chain on, by the `hc_bundle` a genesis pins:
-    /// the hidden guest chains 14 and 15 pin, then the branch-free one. A node refuses a genesis
-    /// naming anything else (`node::check_build_runs_genesis`), and a wallet proves with
-    /// [`Self::bundle_program_for`] the chain's own.
-    pub fn known_hc_bundles() -> [Word8; 2] {
-        [Self::hc_hidden_bundle(), Self::hc_hidden_bundle_v2()]
+    /// Bundle guest v3 (`guests::bundle_hidden_v3`, delegated proving Phase 2, spec
+    /// `docs/superpowers/specs/2026-09-28-delegated-proving-design.md` §4.1): the branch-free
+    /// relation over the v3 witness (`hidden::hidden_input_v3`: `nk` in place of the spend key,
+    /// `salt` appended), publishing `hidden::hidden_bundle_digest_v3` — v2's digest with the auth
+    /// commitment `c = H(AUTH, nk, salt)` before `bad`. Assembled once per process.
+    pub fn hidden_bundle_v3_program() -> &'static Program {
+        static HIDDEN_V3: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
+        HIDDEN_V3.get_or_init(crate::guests::bundle_hidden_v3)
+    }
+
+    /// Digest of bundle guest v3 — what a genesis names as `hc_bundle` to run split
+    /// authorisation.
+    pub fn hc_hidden_bundle_v3() -> Word8 {
+        Self::hidden_bundle_v3_program().digest()
+    }
+
+    /// Every bundle guest this build carries, by the `hc_bundle` a genesis pins: the hidden guest
+    /// chains 14 and 15 pin, the branch-free one, then v3 (split authorisation). A node refuses
+    /// a genesis naming anything else (`node::check_build_runs_genesis`), and a wallet proves
+    /// with [`Self::bundle_program_for`] the chain's own.
+    pub fn known_hc_bundles() -> [Word8; 3] {
+        [Self::hc_hidden_bundle(), Self::hc_hidden_bundle_v2(), Self::hc_hidden_bundle_v3()]
+    }
+
+    /// The width of the private-input vector the bundle guest `hc` reads:
+    /// `hidden::hidden_input::COUNT` (1 204) for v1 and v2, `hidden::hidden_input_v3::COUNT`
+    /// (1 212) for v3. Any other `hc` gets v1's width (no program of this build is proved or
+    /// verified at it; the heights only have to be deterministic).
+    pub fn bundle_input_words(hc: &Word8) -> usize {
+        if *hc == Self::hc_hidden_bundle_v3() {
+            crate::hidden::hidden_input_v3::COUNT
+        } else {
+            crate::hidden::hidden_input::COUNT
+        }
+    }
+
+    /// The `(program_log_height, input_log_height, public_log_height)` a proof of the bundle
+    /// guest `hc` must declare — its program's, its [`Self::bundle_input_words`]-wide witness',
+    /// and the transaction binding's. For v1 and v2 this is [`Self::hidden_bundle_heights`];
+    /// `tests/hidden_bundle.rs` measures v3's (at this build, the same three heights).
+    pub fn bundle_heights_for(hc: &Word8) -> (u8, u8, u8) {
+        let program = Self::bundle_program_for(hc).unwrap_or_else(Self::hidden_bundle_program);
+        pinned_heights(program, Self::bundle_input_words(hc))
     }
 
     /// The bundle guest whose digest is `hc`, if this build carries it — what a wallet proves
@@ -735,6 +772,8 @@ impl ZkExecutor {
             Some(Self::hidden_bundle_program())
         } else if *hc == Self::hc_hidden_bundle_v2() {
             Some(Self::hidden_bundle_v2_program())
+        } else if *hc == Self::hc_hidden_bundle_v3() {
+            Some(Self::hidden_bundle_v3_program())
         } else {
             None
         }
@@ -752,11 +791,19 @@ impl ZkExecutor {
         self.pinned_proof_digest(Self::hidden_bundle_heights(), proof)
     }
 
+    /// [`Self::hidden_bundle_proof_digest`] at the heights of the bundle guest `hc`
+    /// ([`Self::bundle_heights_for`]) — what a v3 chain's reader uses (Task 4 wires it; the
+    /// `ConfidentialExecutor::bundle_proof_digest` entry point, which is not handed `hc`, stays
+    /// on v1/v2's heights).
+    pub fn hidden_bundle_proof_digest_for(&self, hc: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+        self.pinned_proof_digest(Self::bundle_heights_for(hc), proof)
+    }
+
     /// `ConfidentialExecutor::verify_bundle` for a hidden bundle proof: verified against `hc`
     /// with the transaction binding as its public segment (Task 5b), exactly as a `bundle` proof
     /// is — the empty segment and any other transaction's words are refused.
     pub fn verify_hidden_bundle(&self, hc: &Word8, proof: &[u8], binding: &[u32; TX_BINDING_WORDS]) -> Result<(), ConfidentialError> {
-        self.verify_pinned_bundle(Self::hidden_bundle_heights(), hc, proof, binding)
+        self.verify_pinned_bundle(Self::bundle_heights_for(hc), hc, proof, binding)
     }
 
     /// `verify_call`, and under genesis `hardening_v6` `verify_call_hardened` (`segment` set — it
@@ -1425,7 +1472,8 @@ pub fn prove_hidden_bundle(
 /// (`rand_status`'s `hc_bundle`), and the guest proved is [`ZkExecutor::bundle_program_for`] of
 /// it — v1 on chains 14 and 15, the branch-free v2 on a genesis that names it. Both read the same
 /// witness (`hidden::hidden_bundle_inputs`) and publish the same digest, so only the program
-/// changes. An `hc` this build does not carry is refused before any proving: a proof of another
+/// changes. v3 (split authorisation) reads its own, wider witness (`hidden::hidden_bundle_inputs_v3`,
+/// [`ZkExecutor::bundle_input_words`]) and publishes `hidden::hidden_bundle_digest_v3`. An `hc` this build does not carry is refused before any proving: a proof of another
 /// guest would publish the right digest and still be refused by every validator, a minute and a
 /// half later.
 pub fn prove_bundle_for(
@@ -1439,10 +1487,10 @@ pub fn prove_bundle_for(
         format!(
             "this build cannot prove for the chain's bundle guest {}: it carries {}; update the wallet",
             randprotocol_core::notes::word8_to_hex(hc),
-            ZkExecutor::known_hc_bundles().map(|h| randprotocol_core::notes::word8_to_hex(&h)).join(" and ")
+            ZkExecutor::known_hc_bundles().map(|h| randprotocol_core::notes::word8_to_hex(&h)).join(", ")
         )
     })?;
-    prove_pinned_bundle(profile, program, crate::hidden::hidden_input::COUNT, "hidden bundle", inputs, binding, backend)
+    prove_pinned_bundle(profile, program, ZkExecutor::bundle_input_words(hc), "hidden bundle", inputs, binding, backend)
 }
 
 fn prove_pinned_bundle(
