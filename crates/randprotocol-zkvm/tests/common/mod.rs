@@ -184,7 +184,7 @@ pub fn as_column(e: &Expr) -> Option<usize> {
 
 /// Constraint set 8 (Task A1): a real tier-10 proof for `gas.rs`'s native-ceiling test — the
 /// smallest guest already used across the suite (`guests::fib`), proved at a fixed tier so
-/// `gas_max(Tier(10), 0, 0)` (1 023 cycles) is the exact ceiling the test checks against. `fib(20)`
+/// `gas_max(Tier(10), 0, 0)` (1 279: 1 023 cycles + 256 for the absorb rows) is the exact ceiling the test checks against. `fib(20)`
 /// is far under that budget (`tests/emulator.rs` runs the same call), and the test profile is
 /// what every other proving test in this crate uses (`tests/zk.rs`).
 pub fn fib_proof_tier_10() -> (randprotocol_zkvm::isa::Program, randprotocol_zkvm::machine::Proof) {

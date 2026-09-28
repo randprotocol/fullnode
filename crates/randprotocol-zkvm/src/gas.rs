@@ -30,11 +30,25 @@ pub fn row_gas(ev: &CycleEvent) -> u64 {
     } + if ev.hash_row.as_ref().is_some_and(|h| h.is_absorb()) { POSEIDON2_ABSORB_GAS - 1 } else { 0 }
 }
 
-/// The gas no run under this header can exceed: the tier's cycle budget plus the weight of
-/// every permutation (`2^klh / 32`) and compression (`2^slh / 64`) the declared tables could
-/// hold. `0` = no such table. The verifier refuses a `GAS_LIMIT` above it.
+/// The gas no run under this header can exceed — the header's ceiling, and the verifier refuses
+/// a `GAS_LIMIT` above it. Four terms, each the most its row kind can contribute at this header:
+///
+/// - `2^t − 1`: the tier's cycle budget, one gas per cpu row;
+/// - `2^(t−2)`: every `POSEIDON2`/`POSEIDON2_LEN` absorb row adds `POSEIDON2_ABSORB_GAS − 1 = 2`
+///   beyond its own cycle, and each absorb row pulls one permutation into the poseidon2 table,
+///   whose height `2^(t+2)` holds `2^(t+2) / 32 = 2^(t−3)` permutation slots — so at most
+///   `2^(t−3)` absorb rows, `2 · 2^(t−3) = 2^(t−2)` gas (the final review's probe, 30 absorbs in
+///   a 1 016-row tier-10 run, spent 1 078 against the old `2^t − 1` ceiling);
+/// - `191 · 2^klh / 32`: every `KECCAK` row adds 191 and occupies one 32-row keccak block;
+/// - `63 · 2^slh / 64`: every `SHA256` row adds 63 and occupies one 64-row sha256 block.
+///
+/// Height `0` = no such table. The tier is clamped to `[10, 20]` (`machine::TIERS`) and each height
+/// to 40 before any shift: the arguments come from an untrusted proof header, and
+/// `check_public_values` reaches this before `check_declared_heights` refuses them.
 pub fn gas_max(tier: Tier, keccak_log_height: u8, sha256_log_height: u8) -> u64 {
-    let cycles = (1u64 << tier.0) - 1;
+    let t = tier.0.clamp(crate::machine::TIERS[0], crate::machine::TIERS[crate::machine::TIERS.len() - 1]);
+    let cycles = (1u64 << t) - 1;
+    let absorbs = 1u64 << (t - 2);
     let blocks = |h: u8, block: u64| if h == 0 { 0 } else { (1u64 << h.min(40)) / block };
-    cycles + blocks(keccak_log_height, 32) * (KECCAK_GAS - 1) + blocks(sha256_log_height, 64) * (SHA256_GAS - 1)
+    cycles + absorbs + blocks(keccak_log_height, 32) * (KECCAK_GAS - 1) + blocks(sha256_log_height, 64) * (SHA256_GAS - 1)
 }
