@@ -233,6 +233,15 @@ pub fn next_price(price: u64, min: u64, used: u64, target: u64, adjust_bps: u32)
     next.max(min)
 }
 
+/// A call's floor on a chain with a `gas` section (spec §3.3, §7.1, §8): `BUNDLE_BASE +
+/// gas_price·gas_limit + byte_price·⌈bytes/1024⌉`, saturating. The declared limit prices the
+/// call, not the header's `gas_max` ceiling — [`GasPolicy::call_floor`] is Phase 0's node-policy
+/// twin, over a decoded proof header rather than a declared bound.
+pub fn circuit_call_floor(gas_price: u64, byte_price: u64, gas_limit: u64, bytes: usize) -> u64 {
+    let kib = bytes.div_ceil(1024) as u64;
+    BUNDLE_BASE.saturating_add(gas_price.saturating_mul(gas_limit)).saturating_add(byte_price.saturating_mul(kib))
+}
+
 /// The floor a bundle must pay before the action's proof is verified. A call's tier-dependent
 /// part is only known once its proof has been decoded, so it is charged afterwards
 /// (`Ledger::validate`); this floor is what keeps that work from being bought for nothing.
@@ -521,6 +530,17 @@ mod tests {
                 assert!(p.call_floor(tier, 0, 0, bytes) >= BUNDLE_BASE + call_fee(tier, bytes), "tier {tier} {bytes} B");
             }
         }
+    }
+
+    /// Spec §3.3's table row at 100/800: `BUNDLE_BASE + 100·3 000 + 800·⌈1 300 000/1024⌉`
+    /// (1 300 000 B is 1 270 KiB, rounding up).
+    #[test]
+    fn circuit_call_floor_prices_the_declared_limit() {
+        assert_eq!(circuit_call_floor(100, 800, 3_000, 1_300_000), BUNDLE_BASE + 300_000 + 1_016_000);
+        // Zero bytes still pays the base and the gas term alone.
+        assert_eq!(circuit_call_floor(100, 800, 0, 0), BUNDLE_BASE);
+        // Saturates rather than overflows at absurd inputs.
+        assert_eq!(circuit_call_floor(u64::MAX, u64::MAX, u64::MAX, usize::MAX), u64::MAX);
     }
 
     #[test]

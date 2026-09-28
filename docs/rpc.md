@@ -339,7 +339,8 @@ this node's own gas policy:
 ```json
 { "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
   "max_call_envelope_bytes": 18432, "max_program_public_words": 0, "envelope_bytes": null,
-  "hardening_v6": false, "gas_price": "100", "byte_price": "800", "gas_metering": "header" }
+  "hardening_v6": false, "gas_price": "100", "byte_price": "800", "gas_metering": "header",
+  "bundle_gas_limit": null, "adjust_bps": null }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -363,13 +364,26 @@ refuses the old proof, a chain without it the new one. A node that predates the 
 without it, which a wallet reads as `false`.
 
 `gas_price`, `byte_price` and `gas_metering` are this **node's** own gas policy (spec
-`2026-09-28-gas-model-design.md` §4.1, Phase 0), not a chain limit — two nodes on one chain may
-answer differently. `gas_price`/`byte_price` are the node's `--gas-price`/`--byte-price` in units
-of 10⁻⁹ RAND (defaults 100, 800), decimal strings like every other amount on this API (`null` with
-no policy); `gas_metering` is `"header"` while the policy prices a call's
-`gas_max` off its proof's declared header, `null` with no policy (`--gas-price 0 --byte-price 0`).
-A node that predates these fields answers without them, which a wallet reads as no policy. Phase 1
-(chain 18) answers `"circuit"` — an in-circuit meter, not the header alone.
+`2026-09-28-gas-model-design.md` §4.1, Phase 0) *or* the chain's own `gas` section (§4.2, §7.1,
+Phase 1) when its genesis carries one — a chain's section always wins, and a node's
+`--gas-price`/`--byte-price` flags are silently ignored on such a chain (one `warn!` at startup).
+Node policy is not a chain limit (two nodes on one chain may answer differently); a chain's own
+section is consensus state and every node on the chain answers the same.
+
+Without a `gas` section, `gas_price`/`byte_price` are the node's `--gas-price`/`--byte-price` in
+units of 10⁻⁹ RAND (defaults 100, 800), decimal strings like every other amount on this API
+(`null` with no policy); `gas_metering` is `"header"` while the policy prices a call's `gas_max`
+off its proof's declared header, `null` with no policy (`--gas-price 0 --byte-price 0`). A node
+that predates these fields answers without them, which a wallet reads as no policy.
+
+With a `gas` section, `gas_metering` is `"circuit"` (the in-circuit meter, §4.2) and `gas_price`/
+`byte_price` are the chain's current prices — under `gas.dynamic` (§7.1) these are the **tip's**
+live prices, which move per block by fullness, not the genesis snapshot this node took at
+startup; without `dynamic` they are the section's own fixed prices, which never move.
+`bundle_gas_limit` is the bundle guest's flat declared gas (genesis `gas.bundle_gas_limit`),
+`null` without a section. `adjust_bps` is the dynamic controller's per-block step size in basis
+points (genesis `gas.dynamic.adjust_bps`), `null` on a chain without `dynamic` — including one
+with a `gas` section whose prices never move.
 
 ### `rand_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
@@ -441,6 +455,16 @@ answer is `GasPolicy::call_floor(tier, keccak_log_height, sha256_log_height, byt
 the ledger's own tier floor and `BUNDLE_BASE + gas_price·gas_max + byte_price·⌈bytes/1024⌉`
 (`docs/fees.md` §1.1). On a node with no policy the heights are accepted but change nothing — the
 answer is the ledger floor alone, as before.
+
+On a chain with its own `gas` section (`rand_getLimits.gas_metering == "circuit"`, spec §3.3,
+§4.2), the call spec takes a fourth field, `gas` — the transaction's own declared limit, not the
+proof header's `gas_max` ceiling — and it is **required**: without it the call arm answers
+`-32602`, "under the gas section a call estimate needs its gas". With it, the answer is
+`circuit_call_floor(gas_price, byte_price, gas, bytes)` = `BUNDLE_BASE + gas_price·gas +
+byte_price·⌈bytes/1024⌉`, at `rand_getLimits`'s current prices — the tip's, under `gas.dynamic`
+(§7.1). `keccak_log_height`/`sha256_log_height` are accepted but unused under a section: the
+declared limit already bounds the header, hash tables included. On a chain with no `gas` section
+this field does not exist and the estimate behaves exactly as above.
 
 ### `rand_getTransaction`
 Params: `[hash]`. Result: `null` until committed, then:
@@ -646,7 +670,8 @@ Params: `[]`. Result:
   "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
   "fri_profile": "production", "programs": 2, "viewing_keys": 0,
   "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19",
-  "address": "2nRdFC…", "peer_id": "12D3KooW..."
+  "address": "2nRdFC…", "peer_id": "12D3KooW...",
+  "gas_prices": null
 }
 ```
 `syncing` is true while a batch request to a peer is in flight; `sync_target` is the highest height
@@ -690,6 +715,11 @@ says that key is in the set running the current epoch (spec §8) — a validator
 but whose epoch has not arrived is the first without the second. `notes` is every note the chain has ever created, `nullifiers` every note
 it has ever spent, and `hc_bundle` the bundle guest this chain's proofs are against — a node whose
 build disagrees with the genesis value refuses to start at all.
+
+`gas_prices` (spec 2026-09-28 §7.1, §8) is `{ "gas_price": "…", "byte_price": "…" }`, the tip
+ledger's current gas prices, `null` on a chain without a `gas` section. Refreshed every commit,
+the same as every other field here — it is what `rand_getLimits` reads to serve a `dynamic`
+chain's current prices rather than the genesis snapshot it took at startup.
 
 ### `rand_getPeers`
 Params: `[]`. Result: array of `{ "peer_id": "12D3KooW...", "addrs": ["/ip4/…/tcp/30303"], "connected_secs": 1241 }`.
@@ -1364,6 +1394,33 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-28 — gas (Phase 1 + Phase 2): the chain's own `gas` section, and the tip's moving prices
+
+Task B4 + the RPC half of B7. Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md` §3.3,
+§7.1, §8. Genesis-gated (chain 18) — a chain without a `gas` section is unaffected, and its
+`rand_getLimits`/`rand_estimateFee` behave exactly as Phase 0 above.
+
+- **`rand_getLimits`** reports the chain's own `gas` section, not just a node's policy, when its
+  genesis carries one: `gas_price`/`byte_price` are the chain's current prices (the tip's, under
+  `gas.dynamic` — moving per block by fullness — else the section's fixed ones), `gas_metering`
+  is `"circuit"`, and two new fields appear — `bundle_gas_limit` (the bundle guest's flat declared
+  gas, `null` without a section) and `adjust_bps` (the dynamic controller's step size in basis
+  points, `null` without `dynamic`). A chain's own section always wins over a node's
+  `--gas-price`/`--byte-price` flags, which are silently ignored on such a chain (one `warn!` at
+  node startup).
+- **`rand_estimateFee`**'s call spec gains a fourth field, `gas` — the transaction's declared gas
+  limit — **required** on a chain with a `gas` section (`-32602`, "under the gas section a call
+  estimate needs its gas", without it); the answer is `circuit_call_floor(gas_price, byte_price,
+  gas, bytes)` = `BUNDLE_BASE + gas_price·gas + byte_price·⌈bytes/1024⌉` at the current prices
+  (`randprotocol_core::gas::circuit_call_floor`). `keccak_log_height`/`sha256_log_height` are
+  accepted but unused under a section. A chain with no section is unaffected: `gas` does not
+  exist and the answer is Phase 0's header-priced floor, as before.
+- **`rand_status`** gains `gas_prices: { "gas_price": "…", "byte_price": "…" }`, the tip ledger's
+  current prices (decimal strings), `null` on a chain without a `gas` section. Refreshed every
+  commit by the node loop's `publish_status`, the same as every other status field — this is what
+  `rand_getLimits` reads to serve a `dynamic` chain's *current* prices rather than the genesis
+  snapshot taken at node startup.
 
 ### 2026-09-28 — gas (Phase 0): the header-priced call floor
 

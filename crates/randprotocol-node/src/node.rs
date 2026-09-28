@@ -1734,7 +1734,13 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // node loop purely so `rand_status` can say how many keys this process is holding.
     let viewing = Arc::new(RwLock::new(crate::viewing::Registry::default()));
     let viewing_count = viewing.read().unwrap_or_else(|e| e.into_inner()).count();
-    // The RPC's limits, computed once from the genesis ledger.
+    // The RPC's limits, computed once from the genesis ledger. A chain's own `gas` section
+    // (Phase 1) is consensus state, and `with_gas_policy` refuses to let a node's
+    // `--gas-price`/`--byte-price` flags override it — warn once here, since the flags are
+    // otherwise silently ignored (spec 2026-09-28 §8).
+    if cfg.gas_policy.is_some() && gs.ledger.gas().is_some() {
+        tracing::warn!("this chain's genesis carries its own gas section; --gas-price/--byte-price are ignored");
+    }
     let rpc_limits = rpc::ChainLimits::of(&gs.ledger).with_gas_policy(cfg.gas_policy);
     let (rpc_addr, rpc_task) = rpc::serve(
         cfg.rpc_addr,
@@ -2017,6 +2023,10 @@ impl Node {
             s.aggregation.halving_blocks = cfg.halving_blocks;
             s.aggregation.sealed_blocks = ledger.supply().sealed_blocks;
         }
+        // Spec 2026-09-28 §7.1, §8: the tip's live gas prices, `null` without a `gas` section —
+        // what `rand_status` reports and what `rand_getLimits` reads for a `dynamic` chain's
+        // current prices, since `ChainLimits::of`'s snapshot is only ever taken at startup.
+        s.gas_prices = ledger.gas().is_some().then(|| ledger.gas_prices().into());
         // The pool's public size, straight from the committed ledger rather than a second read
         // of storage: this runs on the node loop after every commit.
         s.notes = ledger.next_index();
