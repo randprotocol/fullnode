@@ -237,7 +237,7 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// Read `resp`'s body, refusing it once it passes `limit` bytes — up front on a declared
 /// `Content-Length`, otherwise chunk by chunk as it arrives.
 pub(crate) async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
-    let too_big = || anyhow!("the node's reply is larger than {} MiB; refusing it", limit / (1024 * 1024));
+    let too_big = || anyhow!("the reply is larger than {} MiB; refusing it", limit / (1024 * 1024));
     if resp.content_length().is_some_and(|n| n > limit as u64) {
         return Err(too_big());
     }
@@ -788,6 +788,10 @@ pub(crate) mod test_rpc {
         Err(i64, &'static str),
         /// An error reply that carries `data`, as the node's `-32010` does (`{"floor": f}`).
         ErrData(i64, String, Value),
+        /// Close the connection without answering (a reset, as a network blip or a restart shows it).
+        Drop,
+        /// Answer `200 OK` with this body, which is not JSON-RPC (a proxy's error page).
+        Malformed(&'static str),
     }
 
     pub async fn scripted_rpc(script: Vec<(&'static str, Reply)>) -> String {
@@ -796,6 +800,8 @@ pub(crate) mod test_rpc {
             Some((_, Reply::Ok(v))) => Reply::Ok(v.clone()),
             Some((_, Reply::Err(code, msg))) => Reply::Err(*code, msg),
             Some((_, Reply::ErrData(code, msg, data))) => Reply::ErrData(*code, msg.clone(), data.clone()),
+            Some((_, Reply::Drop)) => Reply::Drop,
+            Some((_, Reply::Malformed(body))) => Reply::Malformed(body),
             None => Reply::Err(-32601, "unknown method"),
         })
         .await
@@ -845,15 +851,16 @@ pub(crate) mod test_rpc {
                     let req: Value = serde_json::from_slice(&buf[header_end..]).unwrap_or(Value::Null);
                     let method = req["method"].as_str().unwrap_or_default().to_string();
                     let body = match answer(&method, &req["params"]) {
-                        Reply::Ok(v) => json!({ "jsonrpc": "2.0", "id": 1, "result": v }),
+                        Reply::Drop => return,
+                        Reply::Malformed(body) => body.to_string(),
+                        Reply::Ok(v) => json!({ "jsonrpc": "2.0", "id": 1, "result": v }).to_string(),
                         Reply::Err(code, msg) => {
-                            json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": code, "message": msg } })
+                            json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": code, "message": msg } }).to_string()
                         }
                         Reply::ErrData(code, msg, data) => {
-                            json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": code, "message": msg, "data": data } })
+                            json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": code, "message": msg, "data": data } }).to_string()
                         }
-                    }
-                    .to_string();
+                    };
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
                         body.len(),
