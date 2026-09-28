@@ -2162,7 +2162,7 @@ pub async fn submit_bound_call(
 
 /// A decoded call proof's declared `GAS_LIMIT` (`pv::GAS`). Fail-closed: a proof whose public
 /// values stop short of it is an error, never priced as zero gas.
-fn declared_gas(public_values: &[u64]) -> Result<u64> {
+pub fn declared_gas(public_values: &[u64]) -> Result<u64> {
     let at = randprotocol_zkvm::tables::cpu::pv::GAS;
     public_values
         .get(at)
@@ -2870,8 +2870,9 @@ fn with_headroom(limits: Option<&ChainLimits>, floor: u64) -> u64 {
 }
 
 /// Spec 2026-09-28 §5, §9: the `GAS_LIMIT` a call declares by default — the dry run's `exact`
-/// gas rounded up to the next multiple of `2^(tier−2)` (four buckets per tier: two bits beyond
-/// what the tier already leaks), capped at the tier's hash-free ceiling `gas_max(tier, 0, 0)`.
+/// gas rounded up to the next multiple of `2^(tier−2)` (five values a tier under the ceiling —
+/// two bits beyond what the tier already leaks — the top one being the ceiling itself), capped at
+/// the tier's hash-free ceiling `gas_max(tier, 0, 0)`.
 /// A call that hashes has a higher ceiling; [`gas_bucket`] takes it explicitly.
 pub fn default_gas_limit(exact: u64, tier: u8) -> u64 {
     gas_bucket(exact, tier, gas::gas_max(tier, 0, 0))
@@ -7586,7 +7587,8 @@ mod tests {
         }
     }
 
-    /// Spec §5: the exact gas rounded up to a multiple of `2^(t−2)`, four buckets a tier, capped
+    /// Spec §5: the exact gas rounded up to a multiple of `2^(t−2)` (five values a tier under the
+    /// ceiling, the top one being the ceiling itself, since the ceiling is `5·2^(t−2) − 1`), capped
     /// at the tier's own ceiling.
     #[test]
     fn the_wallet_declares_a_quarter_tier_bucket() {

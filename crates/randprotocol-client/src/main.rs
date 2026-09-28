@@ -1670,7 +1670,9 @@ async fn main() -> Result<()> {
                 let gas_bound = gas::gas_max(tier, klh, slh);
                 // Constraint set 8: the limit the proof declares (`pv::GAS`), what a gas section
                 // charges — read off the proof itself, so `max` prices the real header's ceiling.
-                let declared = header.public_values.get(randprotocol_zkvm::tables::cpu::pv::GAS).copied().unwrap_or(gas_bound);
+                // Fail-closed (`wallet::declared_gas`): a proof whose public values stop short of
+                // GAS is an error here, never silently priced at the header's ceiling.
+                let declared = wallet::declared_gas(&header.public_values)?;
                 let floor = wallet::call_fee_default(limits.as_ref(), tier, klh, slh, declared, bytes);
                 let fee = match fee {
                     Some(f) => parse_amount(&f)?,
