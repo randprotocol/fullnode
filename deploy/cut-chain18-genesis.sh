@@ -24,12 +24,12 @@
 #     other amount and no pending unbond) and what chain 16's genesis gave its eighteen. Quorum is
 #     now 18 of 26 — the guardian hosts count for liveness.
 #   * `rand-node genesis --hardening-v6 --bundle-guest v2 --gas-price 100 --byte-price 800
-#     --bundle-gas-limit 20479 --gas-dynamic 2097152,262144,1250`: the v0.6 validity rules, the
+#     --bundle-gas-limit 20479 --gas-dynamic 10485760,262144,1250`: the v0.6 validity rules, the
 #     branch-free hidden-asset guest (hc_bundle is whatever THIS rand-node reports for v2; the cut
 #     is made with the release binary the fleet will run — never a local build) AND the gas
 #     section on, testnet with the Phase 2 controller running: mins equal the fixed prices, target
-#     bytes half the 4 MiB soft cap, target gas 2^18, 12.5%/step. Constraint set 8 does not touch
-#     the hidden-asset guest's own words (only the STARK verifier key), so **hc_bundle is asserted
+#     bytes half the 20 MiB block cap (MAX_BLOCK_BYTES, below), target gas 2^18, 12.5%/step.
+#     Constraint set 8 does not touch the hidden-asset guest's own words (only the STARK verifier key), so **hc_bundle is asserted
 #     EQUAL to chain 16's**, not different — unlike chain 16's own script, which asserted its
 #     hc_bundle differed from chain 15's v1 guest.
 #   * The genesis MUST NOT carry an `aggregation` section beside `gas.dynamic`
@@ -184,9 +184,12 @@ BYTE_PRICE=${BYTE_PRICE:-800}
 # gas_max(14, 0, 0) = (2^14 − 1) + 2^12 = 20 479 — the absorb term included (circuits 18c2627); the
 # bare cycle budget 16 383 would refuse every bundle the fleet's prover makes.
 BUNDLE_GAS_LIMIT=${BUNDLE_GAS_LIMIT:-20479}
-# target_block_bytes,target_block_gas,adjust_bps — half the 4 MiB soft target in bytes, 2^18 gas,
-# 12.5% per step; mins default to gas_price/byte_price above (rand-node genesis's own rule).
-GAS_DYNAMIC=${GAS_DYNAMIC:-2097152,262144,1250}
+# target_block_bytes,target_block_gas,adjust_bps — half the 20 MiB cap in bytes (10 485 760 =
+# MAX_BLOCK_BYTES / 2: a block can then be at most twice the target, so an over-full block and an
+# empty one move byte_price by the same 12.5%; next_price also caps `used` at 2·target, which
+# bounds the gas meter the same way), 2^18 gas, 12.5% per step; mins default to
+# gas_price/byte_price above (rand-node genesis's own rule).
+GAS_DYNAMIC=${GAS_DYNAMIC:-$((MAX_BLOCK_BYTES / 2)),262144,1250}
 
 ETH_RPC=${ETH_RPC:-https://ethereum-rpc.publicnode.com}
 BSC_RPC=${BSC_RPC:-https://bsc-rpc.publicnode.com}
@@ -813,6 +816,8 @@ dyn = gas["dynamic"]
 want_bytes, want_gas, want_bps = (int(x) for x in E["GAS_DYNAMIC"].split(","))
 need(dyn["target_block_bytes"] == want_bytes and dyn["target_block_gas"] == want_gas and dyn["adjust_bps"] == want_bps,
      f"gas.dynamic targets are {dyn}, expected {E['GAS_DYNAMIC']}")
+need(dyn["target_block_bytes"] * 2 == int(E["MAX_BLOCK_BYTES"]),
+     f"target_block_bytes {dyn['target_block_bytes']} is not half max_block_bytes {E['MAX_BLOCK_BYTES']}")
 need(int(dyn["min_gas_price"]) == int(E["GAS_PRICE"]) and int(dyn["min_byte_price"]) == int(E["BYTE_PRICE"]),
      "gas.dynamic's floors are not the section's own starting prices")
 need(g["epoch_blocks"] == 1000, "epoch_blocks is not 1000")

@@ -175,8 +175,9 @@ pub struct ChainLimits {
     #[serde(default)]
     pub bundle_gas_limit: Option<u64>,
     /// The dynamic price controller's step, in basis points (genesis `gas.dynamic.adjust_bps`),
-    /// `None` on a chain whose prices never move. The wallet pays one step of headroom over the
-    /// tip's floor (spec §7.1).
+    /// `None` on a chain whose prices never move. The wallet pays two steps of headroom over the
+    /// tip's floor (spec §7.1: the served prices are the committed head's, and a transaction lands
+    /// two or three certified blocks later).
     #[serde(default)]
     pub adjust_bps: Option<u32>,
 }

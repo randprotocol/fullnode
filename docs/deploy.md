@@ -628,7 +628,7 @@ in only when present):
 
 ```json
 "gas": { "gas_price": "100", "byte_price": "800", "bundle_gas_limit": 20479, "metering": "circuit",
-         "dynamic": { "target_block_bytes": 2097152, "target_block_gas": 262144,
+         "dynamic": { "target_block_bytes": 10485760, "target_block_gas": 262144,
                       "adjust_bps": 1250, "min_gas_price": "100", "min_byte_price": "800" } }
 ```
 
@@ -642,9 +642,11 @@ in only when present):
   can ever be admitted.
 - **`metering`**: only `"circuit"` parses; the field exists so a later metering scheme has a name.
 - **`dynamic`** (optional, Phase 2 — absent means the two starting prices never move):
-  `target_block_bytes` (`1..=max_block_bytes`, the ledger's effective cap) and `target_block_gas`
-  (`> 0`) are what the controller measures fullness against; `adjust_bps` (`1..=5000`) is the
-  largest one-block price move, in basis points; `min_gas_price`/`min_byte_price` (decimal
+  `target_block_bytes` (`1..=max_block_bytes`, the ledger's effective cap; half `max_block_bytes`
+  by convention — 10 485 760 for chain 18, whose cap is 20 MiB) and `target_block_gas` (`> 0`)
+  are what the controller measures fullness against; `adjust_bps` (`1..=5000`) is the largest
+  one-block price move, in basis points, in either direction (`gas::next_price` caps `used` at
+  `2·target` before the formula); `min_gas_price`/`min_byte_price` (decimal
   strings, each `<=` the section's own starting price) are the floors the controller never crosses,
   and each must satisfy `min_price · adjust_bps >= 10000` — a floor under that bound could never
   rise again once reached (`docs/fees.md` §1.2).

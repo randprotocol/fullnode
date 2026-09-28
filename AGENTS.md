@@ -222,7 +222,7 @@ requires `gas` under a section; `rand_status`/`rand_getLimits` serve `gas_prices
 call --gas-limit <N|max>` (CPU-backend default under a section: the dry run's exact gas rounded up
 to a multiple of `2^(t−2)`, five values a tier under the ceiling — non-CPU backends and no-section
 chains default to `max`, the only thing they can declare), `rand fee call <tier> [--gas N]`
-(defaults to `gas_max(tier, klh, slh)` under a section), one price step of headroom under
+(defaults to `gas_max(tier, klh, slh)` under a section), two price steps of headroom under
 `dynamic`; `rand-node genesis --gas-price/--byte-price/--bundle-gas-limit/--gas-dynamic`. Cut:
 `deploy/cut-chain18-genesis.sh`, `deploy/cutover-fleet-chain18.sh` (all-stop/all-start — cs8
 changes every verifier key, no mixed-fleet path), `deploy/chain18-bridge-steps.md` (relayer needs

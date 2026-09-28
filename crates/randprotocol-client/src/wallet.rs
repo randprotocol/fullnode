@@ -2554,8 +2554,9 @@ pub fn deploy_fee_default(action: &Action) -> u64 {
 /// On a chain whose genesis carries a `gas` section (`limits.gas_circuit`, spec §3.3) the floor
 /// is `gas::circuit_call_floor` of the call's declared `gas_limit` at the served prices — the
 /// header and its heights no longer price it. Under the dynamic controller (`limits.adjust_bps`,
-/// spec §7.1) the default pays one price step of headroom over that floor, so a block that raises
-/// the price before this transaction lands still admits it; `--fee` overrides. `gas_limit` is
+/// spec §7.1) the default pays two price steps of headroom over that floor — `rand_getLimits`
+/// serves the committed head's prices and a transaction lands two or three certified blocks
+/// later, so two raises before it lands still admit it; `--fee` overrides. `gas_limit` is
 /// ignored everywhere else.
 pub fn call_fee_default(
     limits: Option<&ChainLimits>,
@@ -2589,11 +2590,17 @@ pub fn call_floor(
     }
 }
 
-/// Spec §7.1: `floor + ⌊floor·adjust_bps/10 000⌋` under the dynamic controller — the largest move
-/// one block can make — else `floor`. Saturating.
+/// Spec §7.1: `⌊floor·(10 000 + adjust_bps)²/10 000²⌋` under the dynamic controller — two of the
+/// largest moves one block can make (`gas::next_price` caps a block's move at `adjust_bps`) —
+/// else `floor`. Two, not one: `rand_getLimits` serves the committed head's prices, and a
+/// transaction submitted now is priced at the parent of the block that includes it, two or three
+/// certified blocks past that head. u128, then saturating to `u64::MAX`.
 fn with_headroom(limits: Option<&ChainLimits>, floor: u64) -> u64 {
     match limits.and_then(|l| l.adjust_bps) {
-        Some(a) => floor.saturating_add(u64::try_from(floor as u128 * a as u128 / 10_000).unwrap_or(u64::MAX)),
+        Some(a) => {
+            let step = 10_000u128 + a as u128;
+            u64::try_from(floor as u128 * step * step / 100_000_000).unwrap_or(u64::MAX)
+        }
         None => floor,
     }
 }
@@ -6926,15 +6933,18 @@ mod tests {
         assert!(e.contains(&format_amount(floor + 100)), "{e}");
     }
 
-    /// Spec §7.1 (task B7): one price step of headroom under `dynamic`, none otherwise; the guard
-    /// still accepts a `--fee` of the bare floor.
+    /// Spec §7.1 (task B7, final-review I2c): two price steps of headroom under `dynamic`, none
+    /// otherwise — `rand_getLimits` serves the committed head's prices and a transaction lands two
+    /// or three certified blocks later; the guard still accepts a `--fee` of the bare floor.
     #[test]
-    fn the_wallet_pays_one_price_step_of_headroom_under_dynamic_prices() {
+    fn the_wallet_pays_two_price_steps_of_headroom_under_dynamic_prices() {
         let fixed = circuit_limits(None);
         let dynamic = circuit_limits(Some(1_250));
         let floor = gas::circuit_call_floor(100, 800, 3_000, 1_300_000);
         assert_eq!(call_fee_default(Some(&fixed), 12, 0, 0, 3_000, 1_300_000), floor);
-        assert_eq!(call_fee_default(Some(&dynamic), 12, 0, 0, 3_000, 1_300_000), floor + floor * 1_250 / 10_000);
+        let two_steps = (floor as u128 * 11_250 * 11_250 / 100_000_000) as u64;
+        assert_eq!(call_fee_default(Some(&dynamic), 12, 0, 0, 3_000, 1_300_000), two_steps, "floor · 1.125²");
+        assert!(two_steps > floor + floor * 1_250 / 10_000, "more than one step");
         assert_eq!(call_floor(Some(&dynamic), 12, 0, 0, 3_000, 1_300_000), floor, "the floor itself carries no headroom");
         let proof = vec![0u8; 1_300_000];
         let exact = gas::circuit_call_floor(100, 800, 3_000, gas::call_bytes(&proof, None));

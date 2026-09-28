@@ -2532,8 +2532,12 @@ async fn a_chain_15_shaped_genesis_commits_mints_only_to_the_allowlist_and_syncs
 // the branch-free bundle guest, and the `gas` section with the dynamic controller at the cut's
 // numbers — carrying real proofs end to end.
 
+/// The cut script's block cap, `MAX_BLOCK_BYTES=20971520` (20 MiB).
+const CHAIN18_MAX_BLOCK_BYTES: u32 = 20 << 20;
+
 /// The cut script's `gas` section: `--gas-price 100 --byte-price 800 --bundle-gas-limit 20479
-/// --gas-dynamic 2097152,262144,1250`, the floors at the starting prices.
+/// --gas-dynamic 10485760,262144,1250` (the byte target half the 20 MiB cap), the floors at the
+/// starting prices.
 fn chain18_gas() -> gas::GasConfig {
     gas::GasConfig {
         gas_price: 100,
@@ -2541,7 +2545,7 @@ fn chain18_gas() -> gas::GasConfig {
         bundle_gas_limit: gas::gas_max(14, 0, 0),
         metering: gas::GasMetering::Circuit,
         dynamic: Some(gas::DynamicGas {
-            target_block_bytes: 2 << 20,
+            target_block_bytes: (CHAIN18_MAX_BLOCK_BYTES / 2) as u64,
             target_block_gas: 1 << 18,
             adjust_bps: 1250,
             min_gas_price: 100,
@@ -2550,12 +2554,13 @@ fn chain18_gas() -> gas::GasConfig {
     }
 }
 
-/// [`genesis_funding`] reshaped as chain 18: `hardening_v6`, bundle guest v2, and `gas`. No
-/// `aggregation` section.
+/// [`genesis_funding`] reshaped as chain 18: `hardening_v6`, bundle guest v2, the cut's 20 MiB
+/// block cap, and `gas`. No `aggregation` section.
 fn genesis_chain18(validators: &[Keypair], funded: &[&Wallet], gas: Option<gas::GasConfig>) -> Genesis {
     let mut gen = genesis_funding(validators, funded);
     gen.hardening_v6 = Some(true);
     gen.hc_bundle = word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2());
+    gen.max_block_bytes = Some(CHAIN18_MAX_BLOCK_BYTES);
     gen.gas = gas;
     gen
 }
@@ -2851,7 +2856,7 @@ async fn a_dynamic_chain_decays_its_prices_to_the_floors_on_empty_blocks() {
     let mut cfg = chain18_gas();
     let d = cfg.dynamic.as_mut().unwrap();
     (d.min_gas_price, d.min_byte_price) = (50, 400);
-    cfg.check(gas::MAX_BLOCK_BYTES).expect("floors under the starting prices are a valid section");
+    cfg.check(CHAIN18_MAX_BLOCK_BYTES as usize).expect("floors under the starting prices are a valid section");
     let gen = genesis_chain18(&ks, &[], Some(cfg.clone()));
     // One-second blocks, so a height whose prices are between the start and the floors is there
     // to be read (gas: 100, 87, 76, 66, 57, 50; bytes: 800, 700, 612, 535, 468, 409, 400).
