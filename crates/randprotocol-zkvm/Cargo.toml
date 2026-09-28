@@ -68,6 +68,10 @@ evm-core = { path = "../../../circuits/guests-compiled/evm-core" }
 sbpf-core = { path = "../../../circuits/guests-compiled/sbpf-core" }
 
 [dev-dependencies]
+# The same `evm-core` with its `ffi` feature, for tests only (upstream's dev-dependency, taken with
+# constraint set 7's re-vendor): `tests/evm_abi.rs` drives the C ABI (`evm_sload`/`evm_sstore`/
+# `evm_keccak256`) `evm2rv`'s translated contracts call.
+evm-core = { path = "../../../circuits/guests-compiled/evm-core", features = ["ffi"] }
 # M4.2: the vendored `tests/keccak.rs` states its known-answer vectors as hex strings. Same
 # version upstream's `[dev-dependencies]` pins.
 hex = "0.4"

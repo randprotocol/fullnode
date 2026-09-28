@@ -77,6 +77,24 @@ fn every_guest_proves_and_verifies() {
     }
 }
 
+/// HCS-4: `POSEIDON2_LEN` end to end — the length-seeded group start, the `n = 0` empty block, a
+/// partial block and a two-block message — each proved, verified, and publishing
+/// `hash::sponge_hash_len`'s digest.
+#[test]
+fn poseidon2_len_demo_proves_and_verifies() {
+    let m = Machine::new(FriProfile::Test);
+    for n in [0usize, 1, 4, 5] {
+        let msg: Vec<u32> = (0..n as u32).map(|k| 0x0dea_0000 + k).collect();
+        let p = guests::poseidon2_len_demo(&msg);
+        let (proof, exec) = m.prove_salted(&p, &[], &[], [1, 2, 3, 4], Some(Tier(10))).unwrap_or_else(|e| panic!("n={n}: {e:?}"));
+        m.verify(&p.digest(), &proof).unwrap_or_else(|e| panic!("n={n}: {e:?}"));
+        let want = randprotocol_zkvm::hash::sponge_hash_len(&msg);
+        assert_eq!(&exec.outputs[..], &want[..], "n={n}");
+        use randprotocol_zkvm::tables::cpu::pv;
+        for k in 0..8 { assert_eq!(proof.public_values[pv::OUT0 + k], want[k] as u64, "n={n}: output {k}"); }
+    }
+}
+
 /// M4.2: the end-to-end anchor for the whole `KECCAK` path — guest sponge, `SYS_KECCAK` cpu
 /// row, the keccak chip's 24 rounds and its own `MEMORY` traffic, the proof-declared keccak
 /// height — checked against the host `keccak::keccak256` for the same message.
@@ -109,7 +127,7 @@ fn keccak_demo_proves_and_verifies_at_tier_10() {
 
 /// A keccak-free `guests::fib(10)` proof at `Tier(10)` and `FriProfile::Test`, measured.
 ///
-/// **The current figure is constraint set 6's**, which is why the constant is no longer named for
+/// **The current figure is constraint set 7's**, which is why the constant is no longer named for
 /// M4.2 — it was `PRE_M4_2_TIER_10_TEST_PROFILE_BYTES` while it held the **pre**-M4.2 baseline, the
 /// size of this proof on the last commit *before* the keccak table existed, and it kept that name
 /// for one commit too long after it stopped holding that.
@@ -123,14 +141,19 @@ fn keccak_demo_proves_and_verifies_at_tier_10() {
 /// `SYS_READ_PUB`/`IS_PUBDIGEST`/`PUBDIGEST_LAST` selectors, `IPOUT0..7`, and the
 /// `PHVL0..31`/`PHIMAX0..3`/`PINV0..3` final-encoding block) and the batch gained a mandatory
 /// ninth instance, the 4-column `public` table; every FRI query opens a leaf of the batch's
-/// full width. `SIZE_BAND_PCT` is the tolerance around the current figure.
-const TIER_10_TEST_PROFILE_BYTES: usize = 298_791;
+/// full width. Constraint set 7 grew it again, by ~5.7% to **315 847**, the middle of five on the
+/// integrated `feat/cs7` tree (314 919 / 315 239 / 315 847 / 316 167 / 317 191): the LogUp blind's
+/// five columns and bus pair on every instance, the `2^7` floor on the program, input and public
+/// tables, and ZKM-1's four byte limbs on the input and public tables all widen or lengthen what
+/// every FRI query opens. `SIZE_BAND_PCT` is the tolerance around the current figure.
+const TIER_10_TEST_PROFILE_BYTES: usize = 315_847;
 
 /// Tolerance, in percent, on the size assertion in `a_keccak_free_proof_carries_no_keccak_table`.
 ///
-/// Derived, not picked: the four measured proofs above span 297 223..299 783, i.e. ±0.6% around
-/// the constant, so 5% is ~8x the per-proof entropy noise — room for the odd extra
-/// declared-height byte or an upstream postcard tweak. The thing the assertion exists to detect
+/// Derived, not picked: the constraint-set-6 proofs above spanned 297 223..299 783 and the
+/// constraint-set-7 ones span 314 919..317 191, i.e. ±0.6% around the constant either time, so
+/// 5% is ~8x the per-proof entropy noise — room for the odd extra declared-height byte or an
+/// upstream postcard tweak. The thing the assertion exists to detect
 /// is an order of magnitude beyond it: a 2 612-column keccak table adds roughly +450 KB at this
 /// profile (+1.91 MB at the production one), i.e. +160%, so the band would have to be ~32x wider
 /// before the regression could hide inside it. The load-bearing check is the
@@ -336,8 +359,9 @@ fn a_declared_sha256_table_costs_about_a_hundred_kilobytes_at_the_test_profile()
     let free = m.prove_traces(&p, &t, Tier(10));
     m.verify(&p.digest(), &free).unwrap();
 
-    t.sha256 = Some(sha256::sha256_trace(&[], sha256::MIN_LOG_HEIGHT));
-    t.sha256_log_height = sha256::MIN_LOG_HEIGHT;
+    // Constraint set 7: a declared table is at least the private-data floor, two 64-row blocks.
+    t.sha256 = Some(sha256::sha256_trace(&[], randprotocol_zkvm::tables::MIN_PRIVATE_TABLE_LOG_HEIGHT));
+    t.sha256_log_height = randprotocol_zkvm::tables::MIN_PRIVATE_TABLE_LOG_HEIGHT;
     let carried = m.prove_traces(&p, &t, Tier(10));
     m.verify(&p.digest(), &carried).unwrap();
 
@@ -367,8 +391,9 @@ fn measure_the_sha256_table_cost_at_the_production_profile() {
     let free = m.prove_traces(&p, &t, Tier(10));
     let free_prove = t0.elapsed();
     m.verify(&p.digest(), &free).unwrap();
-    t.sha256 = Some(sha256::sha256_trace(&[], sha256::MIN_LOG_HEIGHT));
-    t.sha256_log_height = sha256::MIN_LOG_HEIGHT;
+    // Constraint set 7: a declared table is at least the private-data floor, two 64-row blocks.
+    t.sha256 = Some(sha256::sha256_trace(&[], randprotocol_zkvm::tables::MIN_PRIVATE_TABLE_LOG_HEIGHT));
+    t.sha256_log_height = randprotocol_zkvm::tables::MIN_PRIVATE_TABLE_LOG_HEIGHT;
     let t1 = std::time::Instant::now();
     let carried = m.prove_traces(&p, &t, Tier(10));
     let carried_prove = t1.elapsed();

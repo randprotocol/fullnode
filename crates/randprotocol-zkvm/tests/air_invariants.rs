@@ -209,9 +209,17 @@ fn no_admissible_padding_row_sends_a_message() {
         let (interactions, constraints) = symbolic_air(chip);
         let public = if matches!(chip, Chip::Cpu(_)) { t.public_values.clone() } else { vec![] };
         let rows_at = |prev: &Vec<Val>, cur: &Vec<Val>, i: usize| Rows { cur: prev.clone(), next: cur.clone(), pre_cur: pre_row(i), pre_next: pre_row(i + 1), public: public.clone() };
-        let prev = row_of(trace, r - 1);
-        let next = row_of(trace, r + 1);
-        let mut cur = row_of(trace, r);
+        // Constraint set 7: a chip is its table plus the LogUp blind's columns, which `Traces` does
+        // not carry (`Machine::prove_traces` appends them). On a row past the first they are zero,
+        // honestly and by constraint — and they are among the columns the loop below tries to free.
+        let row_at = |i: usize| -> Vec<Val> {
+            let mut v = row_of(trace, i);
+            v.resize(w, Val::ZERO);
+            v
+        };
+        let prev = row_at(r - 1);
+        let next = row_at(r + 1);
+        let mut cur = row_at(r);
         // The honest padding row itself sends nothing and satisfies everything (sanity, and the
         // check that `r` is padding at all).
         let holds = |cur: &Vec<Val>| {
@@ -230,7 +238,7 @@ fn no_admissible_padding_row_sends_a_message() {
         // balance against the cpu's digest rows, not by the table — and that is a cross-table
         // argument this row-local harness cannot make. (It found exactly that when the public
         // table had two padding rows: row 2, after two real rows, could be flipped real.)
-        let prev_rows = rows_at(&prev, &row_of(trace, r), r - 1);
+        let prev_rows = rows_at(&prev, &row_at(r), r - 1);
         assert!(
             interactions.iter().all(|i| eval_rows(&i.count, &prev_rows) == Val::ZERO),
             "chip {k}: row {} before the checked row is not padding",

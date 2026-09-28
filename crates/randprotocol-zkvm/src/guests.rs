@@ -382,6 +382,21 @@ pub fn poseidon2_demo(msg: &[u32]) -> Program {
     a.assemble()
 }
 
+/// HCS-4: `poseidon2_demo` over the length-bound `POSEIDON2_LEN` syscall, mirrored host-side by
+/// `hash::sponge_hash_len`.
+///
+/// Mirrors upstream `research/src/guests.rs` verbatim (constraint set 7, circuits `3d6f082`); the
+/// vendored `tests/{e2e,emulator,next_constraint_set}.rs` call it by name.
+pub fn poseidon2_len_demo(msg: &[u32]) -> Program {
+    let mut a = Assembler::new(0);
+    a.extend(li(S0, HEAP));
+    for (i, w) in msg.iter().enumerate() { a.extend(li(T0, *w as i32)); a.push(sw(S0, T0, 4 * i as i32)); }
+    a.extend(call_poseidon2_len(HEAP / 4, msg.len()));
+    for i in 0..8 { a.push(lw(T1, S0, 4 * i as i32)); a.extend(write_output(i as u32, T1)); }
+    a.extend(halt());
+    a.assemble()
+}
+
 /// M4.2 demo: `keccak256(msg)` for a message that fits one rate block (≤ 135 bytes, so a
 /// single permutation), with the sponge itself in guest code — exactly what `guest-sdk`'s own
 /// `keccak256` does, transcribed against `asm.rs`: XOR the padded 136-byte block into the first

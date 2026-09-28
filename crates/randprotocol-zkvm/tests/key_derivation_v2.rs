@@ -1,5 +1,5 @@
-//! HCS-1: the stable verifier-key salt derivation the next chain cut switches to
-//! (`key_derivation_v2`'s module comment has the why and the switch). These tests show the three
+//! HCS-1: the stable verifier-key salt derivation, live since constraint set 7
+//! (`key_derivation_v2`'s module comment has the why and the wiring). These tests show the three
 //! things that make it a fix rather than a second guard: it is deterministic, it is a known answer
 //! computed from this repository's own constants (no `rand` generator anywhere in it), and it drops
 //! into the hiding MMCS a verifier key is committed through, unchanged.
@@ -12,11 +12,11 @@ use randprotocol_zkvm::machine::{permutation, Compress, Hash, Val};
 
 fn draw(mut r: KeyRngV2, n: usize) -> Vec<u64> { (0..n).map(|_| r.next_u64()).collect() }
 
-/// Not the live derivation: flipping `ACTIVE` is a chain cut, and whoever does it re-pins
-/// `tests/verifier_key.rs` in the same change — this test going red is the reminder.
+/// The live derivation since constraint set 7 (chain 16): every verifier key is salted from it
+/// (`machine::key_config`), and `tests/verifier_key.rs` pins the keys it gives.
 #[test]
-fn v2_is_not_the_live_derivation() {
-    assert!(!v2::ACTIVE);
+fn v2_is_the_live_derivation() {
+    assert!(v2::ACTIVE);
 }
 
 #[test]
@@ -93,3 +93,20 @@ fn it_salts_the_hiding_mmcs_reproducibly() {
     let (c, _) = p3_commit::Mmcs::commit(&other, vec![mat()]);
     assert_ne!(a, c);
 }
+
+/// Constraint set 7's wiring: one salt type, two sources (`SaltRng`). p3's hiding MMCS and PCS
+/// clone themselves through `R::from_rng`, which for `SaltRng` is always the `key_derivation_v2`
+/// stream — so whatever p3 clones, a verifier key's salts never pass through `StdRng`, and a
+/// proving config's clones are the Poseidon2 sponge keyed by 32 bytes of OS entropy.
+#[test]
+fn a_salt_rng_reseeds_into_the_v2_stream_whatever_its_source() {
+    use rand::SeedableRng;
+    let mut fresh = v2::SaltRng::fresh();
+    assert!(matches!(v2::SaltRng::from_rng(&mut fresh), v2::SaltRng::Key(_)));
+    let mut key = v2::SaltRng::key(v2::MMCS_LABEL);
+    assert!(matches!(v2::SaltRng::from_rng(&mut key), v2::SaltRng::Key(_)));
+    // And a key-sourced `SaltRng` is exactly the label's `KeyRngV2` stream.
+    assert_eq!(draw_salt(v2::SaltRng::key(v2::MMCS_LABEL), 8), draw(KeyRngV2::from_label(v2::MMCS_LABEL), 8));
+}
+
+fn draw_salt(mut r: v2::SaltRng, n: usize) -> Vec<u64> { (0..n).map(|_| r.next_u64()).collect() }

@@ -108,6 +108,19 @@ pub mod ops {
         v.push(ecall());
         v
     }
+    /// HCS-4: `call_poseidon2` with the message length bound — `SYS_POSEIDON2_LEN`, the same
+    /// arguments and the same in-place digest, over the length-seeded sponge
+    /// (`hash::sponge_hash_len`).
+    ///
+    /// Mirrors upstream `research/src/asm.rs` verbatim (constraint set 7, circuits `3d6f082`);
+    /// the vendored `tests/{emulator,next_constraint_set}.rs` call it by name.
+    pub fn call_poseidon2_len(ptr_words: i32, n: usize) -> Vec<Instr> {
+        let mut v = li(REG_A7, SYS_POSEIDON2_LEN as i32);
+        v.extend(li(REG_A0, ptr_words));
+        v.extend(li(REG_A1, n as i32));
+        v.push(ecall());
+        v
+    }
     /// M4.2: one Keccak-f[1600] permutation of the `KECCAK_WORDS` words at word address
     /// `ptr_words` (`a0`, the same `MEM_ADDR` word-address convention `call_poseidon2` uses),
     /// in place. No second argument — the state's width is fixed.

@@ -1,19 +1,19 @@
-//! HCS-1 (the 2026-09-27 zkVM review): the verifier-key salt stream the **next chain cut** switches
-//! to. Written, tested, and **not wired in** — nothing in this crate reads it while [`ACTIVE`] is
-//! `false`, and no live verifier key depends on it.
+//! HCS-1 (the 2026-09-27 zkVM review): the verifier-key salt stream. **Live since constraint set 7**
+//! ([`ACTIVE`]): every verifier key's preprocessed commitment — here and in `recursion` — is salted
+//! from [`KeyRngV2`], and no consensus-facing value reads `rand`'s `StdRng` any more.
 //!
 //! **Why it exists.** Every verifier key's preprocessed commitment goes through the *hiding* MMCS,
 //! which salts every committed row with elements drawn from its RNG (`hiding_mmcs.rs`'s
 //! `RowMajorMatrix::rand(rng, height, SALT_ELEMS)`), so the salts are inside the Merkle cap the
-//! Fiat–Shamir transcript absorbs first. Today that RNG is `StdRng::seed_from_u64(KEY_SEED)`
-//! (`machine::key_config`), and `rand` documents `StdRng` as *not* reproducible across releases —
-//! both its algorithm (ChaCha12 today) and `rand_core`'s `seed_from_u64` expansion (PCG32 today)
-//! may change. The live chain is protected by an exact pin of `rand`, `rand_core` and `chacha20`
-//! (`Cargo.toml`) and by `tests/verifier_key.rs`, which fails on any changed key. That is a guard,
+//! Fiat–Shamir transcript absorbs first. Through constraint set 6 that RNG was
+//! `StdRng::seed_from_u64(KEY_SEED)` (`machine::key_config`), and `rand` documents `StdRng` as *not*
+//! reproducible across releases — both its algorithm (ChaCha12 today) and `rand_core`'s
+//! `seed_from_u64` expansion (PCG32 today) may change. Chain 15 is protected by an exact pin of
+//! `rand`, `rand_core` and `chacha20` (`Cargo.toml`) and by `tests/verifier_key.rs`. That is a guard,
 //! not a fix: the chain's keys should be a function of things this repository specifies. This
 //! module is that function. (Measured while writing it: the *PCS* RNG, the second of `key_rngs`'
 //! pair, does not enter the key at all — perturbing its seed leaves every pinned digest unchanged —
-//! so only the MMCS stream needs replacing. The pair is kept below anyway so the switch is
+//! so only the MMCS stream needed replacing. The pair is derived anyway so the switch is
 //! type-for-type.)
 //!
 //! **What it is.** A sponge over the committed Poseidon2 permutation (`poseidon2_constants` — the
@@ -33,29 +33,32 @@
 //!    `2^64 − 2^32 + 1`); `next_u64` is two such words, low first.
 //!
 //! Nothing here touches `rand`'s generators: the traits it implements are `rand_core`'s (so
-//! `MerkleTreeHidingMmcs<…, KeyRngV2, …>` and `HidingFriPcs<…, KeyRngV2>` type-check unchanged),
-//! but the stream is this file's arithmetic over this repository's constants.
+//! `MerkleTreeHidingMmcs<…, SaltRng, …>` and `HidingFriPcs<…, SaltRng>` type-check), but the stream
+//! is this file's arithmetic over this repository's constants.
 //!
-//! **Switching (a chain cut, never a same-chain release — every verifier key changes).** Replace
-//! `StdRng` with [`KeyRngV2`] in `machine.rs`'s `ValMmcs`/`Pcs` aliases, the backends' configs and
-//! `recursion/src/machine.rs`'s; seed the *proving* configs from OS entropy through
-//! `KeyRngV2::from_rng(&mut rand::rng())` (a fresh 32-byte seed through [`KeyRngV2::from_seed`] —
-//! fresh entropy is what proving needs, the construction does not care); replace `key_rngs()`'s
-//! body with [`key_rngs`] below; flip [`ACTIVE`]; re-pin `tests/verifier_key.rs` (research and
-//! recursion) and every chain-side key pin (fullnode's vendored crates, the aggregate program's
-//! inner-vk digest); cut the genesis. `KEY_SEED` and the three exact `rand` pins can then be relaxed
-//! back to carets — nothing consensus-facing would read `StdRng` any more.
+//! **How it is wired (constraint set 7).** One configuration type serves the verifier key and the
+//! proof — `prove_batch` takes the proving config and the key's `ProverData`, and both must be the
+//! same `StarkGenericConfig` — so the salt generator is one type, [`SaltRng`], with two sources: a
+//! key config's is [`SaltRng::Key`] (this stream, from [`key_rngs`]'s labels — `recursion` derives
+//! its own from its own labels), a proving config's is [`SaltRng::Fresh`] (`StdRng` from OS
+//! entropy — proving blinding, which *should* be random, and is where `rand` stays). The one place
+//! the two could meet is a clone: `MerkleTreeHidingMmcs` and `HidingFriPcs` clone themselves by
+//! re-seeding `R::from_rng(&mut self.rng)`, and `SeedableRng::from_seed` for `SaltRng` always
+//! builds a [`KeyRngV2`] — so a clone of a key config is still `StdRng`-free whatever p3 clones,
+//! and a clone of a proving config is a Poseidon2 sponge keyed by 32 bytes of OS entropy (which the
+//! `TryCryptoRng` note below covers; it salts only the FRI commit-phase trees, a few hundred
+//! thousand elements a proof, so the slower generator costs milliseconds). `KEY_SEED` is gone; the
+//! three exact `rand` pins stay (they cost nothing, and `rand` still decides proving's salts).
 use crate::machine::Val;
 use core::convert::Infallible;
 use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use rand_core::{SeedableRng, TryCryptoRng, TryRng};
 
-/// `false` on every chain so far, chain 15 included: the live verifier keys are salted from
-/// `StdRng::seed_from_u64(KEY_SEED)`, and `tests/verifier_key.rs` pins them. Flipping this is part
-/// of the switch the module comment describes — on its own it changes nothing, since nothing reads
+/// `true` from constraint set 7 (chain 16): every verifier key is salted from this module's stream.
+/// `false` on chains up to 15, whose keys were `StdRng::seed_from_u64(KEY_SEED)`'s. Nothing reads
 /// it; it exists so the state of the switch is a named fact, tested
-/// (`tests/key_derivation_v2.rs::v2_is_not_the_live_derivation`), rather than folklore.
-pub const ACTIVE: bool = false;
+/// (`tests/key_derivation_v2.rs::v2_is_the_live_derivation`), rather than folklore.
+pub const ACTIVE: bool = true;
 
 /// The derivation's domain tag, absorbed before anything else.
 pub const DOMAIN: &[u8] = b"rand-vk-salt-v2";
@@ -154,7 +157,50 @@ impl SeedableRng for KeyRngV2 {
     fn from_seed(seed: [u8; 32]) -> Self { Self::from_parts(b"seed", &seed) }
 }
 
-/// The `(mmcs_rng, pcs_rng)` pair `machine::key_rngs` returns today, derived instead from
-/// [`MMCS_LABEL`] and [`PCS_LABEL`]. Not called by anything consensus-facing while [`ACTIVE`] is
-/// `false`.
+/// The `(mmcs_rng, pcs_rng)` pair behind `machine::key_config`, from [`MMCS_LABEL`] and
+/// [`PCS_LABEL`].
 pub fn key_rngs() -> (KeyRngV2, KeyRngV2) { (KeyRngV2::from_label(MMCS_LABEL), KeyRngV2::from_label(PCS_LABEL)) }
+
+/// The salt generator every `Config` in this crate (and `recursion`'s) is built over — the module
+/// comment's "How it is wired" has why one type has two sources. Not `Clone` (`StdRng` is not,
+/// deliberately: a cloned generator repeats its stream); p3 copies a generator by re-seeding one from
+/// it, `SeedableRng::from_rng`, below.
+#[derive(Debug)]
+pub enum SaltRng {
+    /// A verifier key's: this module's Poseidon2 stream, a pure function of a label.
+    Key(KeyRngV2),
+    /// A proof's: `rand`'s `StdRng`, seeded from OS entropy ([`SaltRng::fresh`]).
+    Fresh(rand::rngs::StdRng),
+}
+
+impl SaltRng {
+    /// A proving config's generator: fresh OS entropy.
+    pub fn fresh() -> Self { SaltRng::Fresh(rand::rngs::StdRng::from_rng(&mut rand::rng())) }
+    /// A key config's generator for `label` — [`KeyRngV2::from_label`].
+    pub fn key(label: &[u8]) -> Self { SaltRng::Key(KeyRngV2::from_label(label)) }
+}
+
+impl TryRng for SaltRng {
+    type Error = Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+        match self { SaltRng::Key(r) => r.try_next_u32(), SaltRng::Fresh(r) => r.try_next_u32() }
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        match self { SaltRng::Key(r) => r.try_next_u64(), SaltRng::Fresh(r) => r.try_next_u64() }
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
+        match self { SaltRng::Key(r) => r.try_fill_bytes(dst), SaltRng::Fresh(r) => r.try_fill_bytes(dst) }
+    }
+}
+
+/// Both sources are cryptographic generators: `StdRng` is, and [`KeyRngV2`] keyed by a secret seed
+/// is (its own `TryCryptoRng` note).
+impl TryCryptoRng for SaltRng {}
+
+impl SeedableRng for SaltRng {
+    type Seed = [u8; 32];
+    /// Always a [`KeyRngV2`] — never `StdRng`. This is what p3's `Clone` for the hiding MMCS and
+    /// PCS calls (`R::from_rng(&mut self.rng)`), and it keeps every clone of a key config on this
+    /// module's stream (the module comment, "How it is wired").
+    fn from_seed(seed: [u8; 32]) -> Self { SaltRng::Key(KeyRngV2::from_seed(seed)) }
+}

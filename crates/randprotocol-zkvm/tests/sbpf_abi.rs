@@ -973,6 +973,47 @@ fn the_spl_token_transfer_fixture_runs_natively() {
     );
 }
 
+/// `run_call_with_executor` (M4's `sbpf2rv` hook) must give exactly what `run_call_with` gives when
+/// the executor it is handed just delegates to the interpreter — same vector (the SPL Token
+/// `Transfer` fixture), same eight public words, same `Result<u64, Halt>`. This is the harness
+/// contract a translated program's entry point stands in for.
+#[test]
+fn an_executor_that_delegates_to_the_vm_gives_the_interpreter_output() {
+    use randprotocol_zkvm::sbpf::spl_transfer;
+
+    let call = spl_transfer(250);
+    let public = call.public_words();
+    let private = call.input_words();
+
+    let mut ws_want = Box::new(abi::Workspace::ZERO);
+    let mut h_want = HostRef;
+    let want = abi::run_call_with(
+        &mut h_want,
+        &mut ws_want,
+        |i| public[i as usize],
+        public.len() as u32,
+        |i| private[i as usize],
+        private.len() as u32,
+    );
+
+    let mut ws_got = Box::new(abi::Workspace::ZERO);
+    let mut h_got = HostRef;
+    let mut run_vm = |h: &mut HostRef, p: &sbpf_core::elf::Program<'_>, mem: sbpf_core::memory::Memory<'_>| {
+        sbpf_core::interp::Vm::new(h, p, mem).run()
+    };
+    let got = abi::run_call_with_executor(
+        &mut h_got,
+        &mut ws_got,
+        |i| public[i as usize],
+        public.len() as u32,
+        |i| private[i as usize],
+        private.len() as u32,
+        &mut run_vm,
+    );
+
+    assert_eq!(got, want);
+}
+
 /// The same fixture with an amount above the source's balance: `TokenError::InsufficientFunds`, a
 /// non-zero `r0`, status 0, and the **pre**-state bound as the post-state — nothing moved.
 #[test]

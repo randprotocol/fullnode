@@ -195,6 +195,32 @@ fn the_table_widths_and_constraint_degrees_are_pinned() {
     assert_eq!(degs, vec![2, 8, 4, 4, 4, 2, 2]);
 }
 
+/// R4 (the 2026-09-27 rVM review): the pin above builds a program with no `REDUCE`, so its batch
+/// has seven instances and the reduce chip's width and degree were pinned by nothing — the chip
+/// every dormant high finding of that review (RVM-2, TABLES-1, V-TABLES-1) lives in. Here the same
+/// pin over a program that dispatches `REDUCE`, with the chip declared: eight instances, reduce
+/// last, and the other seven unchanged by its presence.
+#[test]
+fn the_reduce_chip_width_and_constraint_degree_are_pinned() {
+    assert_eq!(reduce_table::col::WIDTH, 39, "the reduce chip's designed width (Task 8's run row, ZKQ-3's range limbs)");
+    let p = Program {
+        instrs: vec![
+            Instr { op: Op::Faddi, rd: 2, ra: 0, b: F::from_u64(200) },
+            Instr { op: Op::Reduce, rd: 0, ra: 2, b: F::ZERO },
+            Instr { op: Op::Halt, rd: 0, ra: 0, b: F::ZERO },
+        ],
+        checkpoints: vec![],
+    };
+    let degs = randprotocol_rvm::machine::max_constraint_degrees_declaring(&p, Tier(8), true);
+    assert_eq!(degs.len(), 8, "program, cpu, reg, ram, poseidon2, public, range, reduce");
+    assert_eq!(&degs[..7], &[2, 8, 4, 4, 4, 2, 2], "declaring the reduce chip moves no other table's degree");
+    // Measured: 8 — like the cpu's, this config's budget ceiling (`log2_ceil(degree − 1) ≤
+    // log_blowup = 3`), so the reduce chip has no degree headroom left: one more degree-2 factor on
+    // any of its lookups or constraints and the batch needs a larger blowup. That is what a pin is
+    // for.
+    assert_eq!(degs[7], 8);
+}
+
 // ── The reduce chip's run rules, read off `ReduceAir::eval` (the 2026-09-27 zk scan) ──────────
 use randprotocol_rvm::tables::{bus, reduce as reduce_table};
 
@@ -394,35 +420,12 @@ fn a_reduce_run_touching_a_cell_outside_the_address_space_is_refused() {
 // message the chip sends or provides may have a non-zero count. The range table is skipped: every
 // row of it is a table entry whose count is a provided multiplicity, balanced by the global sum.
 
-/// A program that reaches every chip: registers and RAM (`STORE`, `LOAD`), a `POSEIDON2`
-/// dispatch, a three-row `REDUCE` run over a hand-written descriptor, the four `PUBLIC`s, `HALT`.
-fn every_chip_program() -> Program {
-    let mut v = vec![];
-    let st = |v: &mut Vec<Instr>, addr: u64, val: u64| {
-        v.push(Instr { op: Op::Faddi, rd: 1, ra: 0, b: F::from_u64(val) });
-        v.push(Instr { op: Op::Store, rd: 1, ra: 0, b: F::from_u64(addr) });
-    };
-    for (k, val) in [100u64, 120, 3, 1, 0, 0, 0, 1, 0, 3, 0].iter().enumerate() {
-        st(&mut v, 200 + k as u64, *val);
-    }
-    v.push(Instr { op: Op::Load, rd: 3, ra: 0, b: F::from_u64(201) });
-    v.push(Instr { op: Op::Faddi, rd: 2, ra: 0, b: F::from_u64(200) });
-    v.push(Instr { op: Op::Reduce, rd: 0, ra: 2, b: F::ZERO });
-    v.push(Instr { op: Op::Faddi, rd: 7, ra: 0, b: F::from_u64(64) });
-    v.push(Instr { op: Op::Poseidon2, rd: 0, ra: 7, b: F::ZERO });
-    for _ in 0..4 {
-        v.push(Instr { op: Op::Public, rd: 0, ra: 0, b: F::ZERO });
-    }
-    v.push(Instr { op: Op::Halt, rd: 0, ra: 0, b: F::ZERO });
-    Program { instrs: v, checkpoints: vec![] }
-}
-
 #[test]
 fn no_admissible_padding_row_of_any_chip_sends_a_message() {
     use p3_air::BaseAir;
     use randprotocol_rvm::machine::Chip;
     let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x0bc0_de03);
-    let p = every_chip_program();
+    let p = common::every_chip_program();
     let exec = randprotocol_rvm::emulator::execute(&p, &[], 1000).unwrap();
     let t = randprotocol_rvm::machine::build_traces(&p, &exec, Tier(8)).unwrap();
     assert!(t.reduce.is_some(), "the program dispatches REDUCE, so the batch declares the chip");
@@ -492,29 +495,3 @@ fn no_admissible_padding_row_of_any_chip_sends_a_message() {
     assert_eq!(checked, 7, "every chip but range: program, cpu, reg, ram, poseidon2, public, reduce");
     assert!(failures.is_empty(), "admissible padding rows send messages:\n  {}", failures.join("\n  "));
 }
-/// R4 (the 2026-09-27 rVM review): the pin above builds a program with no `REDUCE`, so its batch
-/// has seven instances and the reduce chip's width and degree were pinned by nothing — the chip
-/// every dormant high finding of that review (RVM-2, TABLES-1, V-TABLES-1) lives in. Here the same
-/// pin over a program that dispatches `REDUCE`, with the chip declared: eight instances, reduce
-/// last, and the other seven unchanged by its presence.
-#[test]
-fn the_reduce_chip_width_and_constraint_degree_are_pinned() {
-    assert_eq!(reduce_table::col::WIDTH, 39, "the reduce chip's designed width (Task 8's run row, ZKQ-3's range limbs)");
-    let p = Program {
-        instrs: vec![
-            Instr { op: Op::Faddi, rd: 2, ra: 0, b: F::from_u64(200) },
-            Instr { op: Op::Reduce, rd: 0, ra: 2, b: F::ZERO },
-            Instr { op: Op::Halt, rd: 0, ra: 0, b: F::ZERO },
-        ],
-        checkpoints: vec![],
-    };
-    let degs = randprotocol_rvm::machine::max_constraint_degrees_declaring(&p, Tier(8), true);
-    assert_eq!(degs.len(), 8, "program, cpu, reg, ram, poseidon2, public, range, reduce");
-    assert_eq!(&degs[..7], &[2, 8, 4, 4, 4, 2, 2], "declaring the reduce chip moves no other table's degree");
-    // Measured: 8 — like the cpu's, this config's budget ceiling (`log2_ceil(degree − 1) ≤
-    // log_blowup = 3`), so the reduce chip has no degree headroom left: one more degree-2 factor on
-    // any of its lookups or constraints and the batch needs a larger blowup. That is what a pin is
-    // for.
-    assert_eq!(degs[7], 8);
-}
-

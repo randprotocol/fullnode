@@ -18,7 +18,10 @@ impl MemAccess { pub fn ts(&self, clk: u32) -> u32 { 4 * clk + self.slot } }
 pub struct AluEvent { pub op: AluOp, pub a: u32, pub b: u32, pub c: u32 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Syscall { Halt, WriteOutput { slot: u32, word: u32 }, ReadInput { idx: u32, word: u32 }, ReadPublic { idx: u32, word: u32 }, Poseidon2 { ptr: u32, n: u32 }, Keccak { ptr: u32 }, Sha256 { ptr: u32 } }
+pub enum Syscall { Halt, WriteOutput { slot: u32, word: u32 }, ReadInput { idx: u32, word: u32 }, ReadPublic { idx: u32, word: u32 }, Poseidon2 { ptr: u32, n: u32 }, Keccak { ptr: u32 }, Sha256 { ptr: u32 },
+    /// HCS-4 (the next constraint set): `POSEIDON2_LEN` — `Poseidon2`'s row group over the
+    /// length-seeded sponge (`hash::sponge_hash_len`).
+    Poseidon2Len { ptr: u32, n: u32 } }
 
 /// M4.2: the whole of one `KECCAK` syscall, on the single cpu row that issues it. `ptr` is the
 /// state's word address; `input`/`output` are the 50 words before and after the permutation, in
@@ -50,7 +53,7 @@ pub struct Sha256Row { pub clk: u32, pub ptr: u32, pub block: [u32; 16], pub h_i
 /// `hash::sponge_hash` on any call absorbing more than one block.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HashRow {
-    /// The ecall row itself (`sys == Some(Syscall::Poseidon2 { ptr, n })`); carried again here
+    /// The ecall row itself (`sys == Some(Syscall::Poseidon2 { ptr, n })`, or `Poseidon2Len`); carried again here
     /// so `cpu_trace` doesn't have to match on `sys` to find it.
     Ecall { ptr: u32, n: u32 },
     /// One absorbed block. `idx`: 0-based block index (this row's `HASH_IDX`). `left_before`:
@@ -188,7 +191,9 @@ pub fn execute(program: &Program, inputs: &[u32], public: &[u32], max_cycles: us
             Instr::Lui { imm, .. } => c = imm,
             Instr::Auipc { .. } => c = tgt,
             Instr::Jal { .. } => { c = pc.wrapping_add(4); next_pc = tgt; }
-            Instr::Jalr { .. } => { c = pc.wrapping_add(4); next_pc = alu_out; }
+            // ISA-4 (the next constraint set): RV32I's `(rs1 + imm) & !1` — bit 0 of the target is
+            // cleared, not left to make the fetch fail (`tables::cpu`'s `JALR_B0`).
+            Instr::Jalr { .. } => { c = pc.wrapping_add(4); next_pc = alu_out & !1; }
             Instr::Branch { .. } => { let taken = (alu_out == 1) != (dec.br_neg == 1); if taken { next_pc = tgt; } }
             Instr::Load { width, signed, .. } => {
                 let off = alu_out & 3;
@@ -223,7 +228,12 @@ pub fn execute(program: &Program, inputs: &[u32], public: &[u32], max_cycles: us
                 mem_addr = ECALL_MEM_REG; mem_val = regs[ECALL_MEM_REG as usize];
                 acc.push(MemAccess { space: SPACE_REG, addr: ECALL_MEM_REG, slot: SLOT_MEM, value: mem_val, is_write: false });
                 let (num, arg0, arg1) = (a, b, mem_val);
-                if num == SYS_POSEIDON2 {
+                if num == SYS_POSEIDON2 || num == SYS_POSEIDON2_LEN {
+                    // HCS-4: `POSEIDON2_LEN` is this same row group over the length-seeded sponge —
+                    // the first absorb row enters `[0, 0, 0, 0, n, 0, 0, 0]` instead of the zero
+                    // state, and `n = 0` absorbs one empty block (every lane inactive) rather than
+                    // none, so the digest is always a permutation output.
+                    let len_bound = num == SYS_POSEIDON2_LEN;
                     let (ptr, n) = (arg0, arg1);
                     if n > POSEIDON2_MAX_WORDS { return Err(ExecError::Poseidon2WordCount(n)); }
                     // Audit ZM4 (2026-09-12): the AIR's `HASH_PTR < 2^30` bound, enforced here
@@ -236,16 +246,18 @@ pub fn execute(program: &Program, inputs: &[u32], public: &[u32], max_cycles: us
                     // directly from HASH_N/the zero sentinel, so `cpu_trace` only needs `ptr`/`n`.
                     events.push(CycleEvent {
                         clk, pc, next_pc: pc, instr, dec, a, b, c: 0, alu_out, tgt, mem_addr, mem_val,
-                        sys: Some(Syscall::Poseidon2 { ptr, n }), accesses: acc.clone(), alu: alu.clone(),
+                        sys: Some(if len_bound { Syscall::Poseidon2Len { ptr, n } } else { Syscall::Poseidon2 { ptr, n } }),
+                        accesses: acc.clone(), alu: alu.clone(),
                         hash_row: Some(HashRow::Ecall { ptr, n }), keccak_row: None, keccak_accesses: Vec::new(),
                         sha256_row: None, sha256_accesses: Vec::new(),
                     });
                     clk += 1;
 
                     let mut state = [Val::ZERO; 8];
+                    if len_bound { state[4] = Val::from_u32(n); }
                     let mut left = n;
                     let mut idx = 0u32;
-                    while left > 0 {
+                    while left > 0 || (len_bound && idx == 0) {
                         if events.len() >= max_cycles { return Err(ExecError::OutOfCycles(max_cycles)); }
                         let cnt = left.min(4);
                         let mut words = [0u32; 4];

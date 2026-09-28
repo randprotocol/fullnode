@@ -20,11 +20,11 @@ pub const PERM_SEED: u64 = randprotocol_zkvm::poseidon2_constants::PERM_SEED;
 #[cfg(feature = "reference-backend")]
 mod reference_cfg {
     use super::*;
-    pub type Mmcs = rand_zkvm_cuda::merkle::mmcs::HidingMmcs<rand_zkvm_cuda::merkle::cpu::CpuHashEngine>;
+    pub type Mmcs = rand_zkvm_cuda::merkle::mmcs::HidingMmcs<rand_zkvm_cuda::merkle::cpu::CpuHashEngine, SaltRng>;
     pub type Dft = rand_zkvm_cuda::dft::Dft<rand_zkvm_cuda::ntt::cpu::CpuNttEngine>;
-    pub type Pcs = HidingFriPcs<Val, Dft, Mmcs, ExtensionMmcs<Val, Challenge, Mmcs>, StdRng>;
+    pub type Pcs = HidingFriPcs<Val, Dft, Mmcs, ExtensionMmcs<Val, Challenge, Mmcs>, SaltRng>;
     pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
-    pub fn config(profile: FriProfile, mmcs_rng: StdRng, pcs_rng: StdRng) -> Config {
+    pub fn config(profile: FriProfile, mmcs_rng: SaltRng, pcs_rng: SaltRng) -> Config {
         let engine = std::sync::Arc::new(rand_zkvm_cuda::merkle::cpu::CpuHashEngine::new(PERM_SEED));
         let mmcs = Mmcs::new(engine, PERM_SEED, 2, mmcs_rng);
         super::generic_config(profile, Dft::default(), mmcs, pcs_rng)
@@ -36,15 +36,15 @@ mod reference_cfg {
 #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
 mod cuda_cfg {
     use super::*;
-    pub type Mmcs = rand_zkvm_cuda::merkle::mmcs::HidingMmcs<rand_zkvm_cuda::gpu::hash::CudaHashEngine>;
+    pub type Mmcs = rand_zkvm_cuda::merkle::mmcs::HidingMmcs<rand_zkvm_cuda::gpu::hash::CudaHashEngine, SaltRng>;
     pub type Dft = rand_zkvm_cuda::dft::Dft<rand_zkvm_cuda::gpu::ntt::CudaNttEngine>;
-    pub type Pcs = HidingFriPcs<Val, Dft, Mmcs, ExtensionMmcs<Val, Challenge, Mmcs>, StdRng>;
+    pub type Pcs = HidingFriPcs<Val, Dft, Mmcs, ExtensionMmcs<Val, Challenge, Mmcs>, SaltRng>;
     pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
     pub fn config(
         profile: FriProfile,
         gpu: std::sync::Arc<rand_zkvm_cuda::gpu::GpuProver>,
-        mmcs_rng: StdRng,
-        pcs_rng: StdRng,
+        mmcs_rng: SaltRng,
+        pcs_rng: SaltRng,
     ) -> Config {
         let engine = std::sync::Arc::new(rand_zkvm_cuda::gpu::hash::CudaHashEngine { gpu: gpu.clone() });
         let mmcs = Mmcs::new(engine, PERM_SEED, 2, mmcs_rng);

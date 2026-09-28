@@ -317,47 +317,50 @@ pub fn random_ext(rng: &mut impl rand::Rng) -> randprotocol_rvm::isa::EF {
 /// `n` distinct honest bundle proofs at `profile`, cached on disk by `(profile, k)`.
 pub fn bundle_proofs(profile: FriProfile, n: usize) -> Vec<BundleProof> {
     let m = Machine::new(profile);
-    (0..n)
-        .map(|k| {
-            if let Some(p) = load_cached(&m, profile, k) {
-                return p;
-            }
-            let (alice, bob, bridge) = (Party::new(), Party::new(), Party::new());
-            let (asset, mint_time) = (0u32, 1_700_000_000u32);
-            let mut ledger = Ledger::new(mint_time);
-            // A different witness per k, and one that still conserves value below.
-            let amounts = [1_000u64 + k as u64, 2_000 + 2 * k as u64];
-            let in_notes: [Note; 2] = amounts.map(|amount| {
-                let n = Note::new(alice.vk.pk(), bridge.vk.pk(), amount, asset, mint_time);
-                let env = Envelope::seal(&bridge.vk, &alice.vk.address(), &n, &TxKey::random());
-                ledger.mint(&n, env).unwrap();
-                n
-            });
-            ledger.advance(60);
-            let (time, anchor) = (ledger.now, ledger.root());
-            let inputs: [(Note, [Word8; DEPTH], u32); 2] = std::array::from_fn(|i| {
-                let (path, index) = ledger.path_for(&in_notes[i].commitment()).unwrap();
-                (in_notes[i], path, index)
-            });
-            let total = amounts[0] + amounts[1];
-            let (fee, burn) = (100u64, 0u64);
-            let outputs = [
-                Note::new(bob.vk.pk(), alice.vk.pk(), total - fee - 500, asset, time),
-                Note::new(alice.vk.pk(), alice.vk.pk(), 500, asset, time),
-            ];
-            let inputs_vec =
-                notes::bundle_inputs(&alice.sk, &inputs, &outputs, anchor, fee, burn, asset, time);
-            // The public segment is empty for bundle proofs: the chain admits only
-        // `verify_public(hc, &[], _)`, so the fixtures prove with `&[]` — and `H_PUB` is then
-        // the prover-computed digest of the empty segment, carried as ordinary public values.
-        let (proof, _) = m.prove(&ledger.bundle_program, &inputs_vec, &[], None).unwrap();
-            let hc = ledger.bundle_program.digest();
-            m.verify(&hc, &proof).expect("a fixture proof must verify natively");
-            let p = BundleProof { proof, hc };
-            store_cached(profile, k, &p);
-            p
-        })
-        .collect()
+    (0..n).map(|k| bundle_proof_at(&m, profile, k)).collect()
+}
+
+/// Fixture `k` alone — the cached one, or a fresh proof stored to the cache. Separate from
+/// [`bundle_proofs`] so a cache can be generated `k` by `k` in parallel processes
+/// (`tests/fixtures.rs`); the proof is the same one either way, fixture `k`'s witness.
+pub fn bundle_proof_at(m: &Machine, profile: FriProfile, k: usize) -> BundleProof {
+    if let Some(p) = load_cached(m, profile, k) {
+        return p;
+    }
+    let (alice, bob, bridge) = (Party::new(), Party::new(), Party::new());
+    let (asset, mint_time) = (0u32, 1_700_000_000u32);
+    let mut ledger = Ledger::new(mint_time);
+    // A different witness per k, and one that still conserves value below.
+    let amounts = [1_000u64 + k as u64, 2_000 + 2 * k as u64];
+    let in_notes: [Note; 2] = amounts.map(|amount| {
+        let n = Note::new(alice.vk.pk(), bridge.vk.pk(), amount, asset, mint_time);
+        let env = Envelope::seal(&bridge.vk, &alice.vk.address(), &n, &TxKey::random());
+        ledger.mint(&n, env).unwrap();
+        n
+    });
+    ledger.advance(60);
+    let (time, anchor) = (ledger.now, ledger.root());
+    let inputs: [(Note, [Word8; DEPTH], u32); 2] = std::array::from_fn(|i| {
+        let (path, index) = ledger.path_for(&in_notes[i].commitment()).unwrap();
+        (in_notes[i], path, index)
+    });
+    let total = amounts[0] + amounts[1];
+    let (fee, burn) = (100u64, 0u64);
+    let outputs = [
+        Note::new(bob.vk.pk(), alice.vk.pk(), total - fee - 500, asset, time),
+        Note::new(alice.vk.pk(), alice.vk.pk(), 500, asset, time),
+    ];
+    let inputs_vec =
+        notes::bundle_inputs(&alice.sk, &inputs, &outputs, anchor, fee, burn, asset, time);
+    // The public segment is empty for bundle proofs: the chain admits only
+    // `verify_public(hc, &[], _)`, so the fixtures prove with `&[]` — and `H_PUB` is then
+    // the prover-computed digest of the empty segment, carried as ordinary public values.
+    let (proof, _) = m.prove(&ledger.bundle_program, &inputs_vec, &[], None).unwrap();
+    let hc = ledger.bundle_program.digest();
+    m.verify(&hc, &proof).expect("a fixture proof must verify natively");
+    let p = BundleProof { proof, hc };
+    store_cached(profile, k, &p);
+    p
 }
 
 // ── `rejects()`, the cheating-test discipline ────────────────────────────────────────────────
@@ -508,6 +511,62 @@ pub fn eval_at_boundary(
         SymbolicExpr::Neg { x, .. } => -eval_at_boundary(x, cur, next, is_first, is_last),
         SymbolicExpr::Mul { x, y, .. } => eval_at_boundary(x, cur, next, is_first, is_last) * eval_at_boundary(y, cur, next, is_first, is_last),
     }
+}
+
+/// [`eval_full`] on any row pair of a table, boundaries included: `is_first` for the pair that
+/// starts at row 0, `is_last` for the one that starts at the last row (whose `next` is the
+/// wrap-around row 0, and where the transition selector is zero).
+#[allow(dead_code)]
+pub fn eval_row(
+    e: &SymbolicExpression<randprotocol_rvm::isa::F>,
+    cur: &[randprotocol_rvm::isa::F],
+    next: &[randprotocol_rvm::isa::F],
+    pre: (&[randprotocol_rvm::isa::F], &[randprotocol_rvm::isa::F]),
+    public: &[randprotocol_rvm::isa::F],
+    is_first: bool,
+    is_last: bool,
+) -> randprotocol_rvm::isa::F {
+    use p3_field::PrimeCharacteristicRing;
+    use randprotocol_rvm::isa::F;
+    let flag = |b: bool| if b { F::ONE } else { F::ZERO };
+    let go = |x: &SymbolicExpression<F>| eval_row(x, cur, next, pre, public, is_first, is_last);
+    match e {
+        SymbolicExpr::Leaf(BaseLeaf::IsFirstRow) => flag(is_first),
+        SymbolicExpr::Leaf(BaseLeaf::IsLastRow) => flag(is_last),
+        SymbolicExpr::Leaf(BaseLeaf::IsTransition) => flag(!is_last),
+        SymbolicExpr::Leaf(_) => eval_full(e, cur, next, pre, public),
+        SymbolicExpr::Add { x, y, .. } => go(x) + go(y),
+        SymbolicExpr::Sub { x, y, .. } => go(x) - go(y),
+        SymbolicExpr::Neg { x, .. } => -go(x),
+        SymbolicExpr::Mul { x, y, .. } => go(x) * go(y),
+    }
+}
+
+/// A program that reaches every chip: registers and RAM (`STORE`, `LOAD`), a `POSEIDON2`
+/// dispatch, a three-row `REDUCE` run over a hand-written descriptor, the four `PUBLIC`s, `HALT`.
+/// (`tests/tables.rs`' padding-row rule and `tests/binding.rs`' binding rule both run over it.)
+#[allow(dead_code)]
+pub fn every_chip_program() -> randprotocol_rvm::isa::Program {
+    use p3_field::PrimeCharacteristicRing;
+    use randprotocol_rvm::isa::{Instr, Op, Program, F};
+    let mut v = vec![];
+    let st = |v: &mut Vec<Instr>, addr: u64, val: u64| {
+        v.push(Instr { op: Op::Faddi, rd: 1, ra: 0, b: F::from_u64(val) });
+        v.push(Instr { op: Op::Store, rd: 1, ra: 0, b: F::from_u64(addr) });
+    };
+    for (k, val) in [100u64, 120, 3, 1, 0, 0, 0, 1, 0, 3, 0].iter().enumerate() {
+        st(&mut v, 200 + k as u64, *val);
+    }
+    v.push(Instr { op: Op::Load, rd: 3, ra: 0, b: F::from_u64(201) });
+    v.push(Instr { op: Op::Faddi, rd: 2, ra: 0, b: F::from_u64(200) });
+    v.push(Instr { op: Op::Reduce, rd: 0, ra: 2, b: F::ZERO });
+    v.push(Instr { op: Op::Faddi, rd: 7, ra: 0, b: F::from_u64(64) });
+    v.push(Instr { op: Op::Poseidon2, rd: 0, ra: 7, b: F::ZERO });
+    for _ in 0..4 {
+        v.push(Instr { op: Op::Public, rd: 0, ra: 0, b: F::ZERO });
+    }
+    v.push(Instr { op: Op::Halt, rd: 0, ra: 0, b: F::ZERO });
+    Program { instrs: v, checkpoints: vec![] }
 }
 
 /// The main columns a table range-checks: the single-column fields of its `RANGE8` lookups.

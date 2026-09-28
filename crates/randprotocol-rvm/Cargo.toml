@@ -26,13 +26,14 @@ p3-merkle-tree = "=0.7.0"
 p3-commit = "=0.7.0"
 p3-matrix = "=0.7.0"
 p3-util = "=0.7.0"
-# HCS-1 (2026-09-27 zkVM review): verifier keys are derived from StdRng's output stream (KEY_SEED);
-# exact pins so no dependency bump can silently move every key. tests/verifier_key.rs pins them.
+# HCS-1 (2026-09-27 zkVM review): exact pins, not carets. Through constraint set 6 every verifier
+# key's preprocessed commitment was salted from `StdRng::seed_from_u64(KEY_SEED)` (here and in
+# `research/`), a stream `rand` does not promise to keep. Constraint set 7 salts every key from
+# `research`'s `key_derivation_v2` (this crate from its own labels, `machine::KEY_MMCS_LABEL`), so no
+# key depends on `rand`; it only seeds proving's salts from OS entropy. The pins stay — they cost
+# nothing. `tests/verifier_key.rs` (here and in `research/`) pins the keys themselves.
 rand = { version = "=0.10.2", features = ["std_rng"] }
 rand_core = "=0.10.1"
-# StdRng's stream is ChaCha12 from `chacha20` (HCS-1's third pin, upstream's `=0.10.2` since
-# circuits `7a75ae2`): a `chacha20` release that moved the stream would move every key as surely
-# as a `rand` one. Named here only for the pin — nothing in this crate calls it directly.
 chacha20 = { version = "=0.10.2", default-features = false }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }

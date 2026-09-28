@@ -139,7 +139,7 @@ pub mod flags {
     pub const LUI: usize = 0;
     pub const AUIPC: usize = 1;
     pub const JAL: usize = 2;
-    pub const JALR: usize = 3;
+    pub const JALR: usize = 3; // f3 == 0 (ISA-4, the next constraint set)
     // BranchCond order: Eq, Ne, Lt, Ge, Ltu, Geu (funct3 0,1,4,5,6,7) — `isa::BranchCond::from_funct3`.
     pub const BR_EQ: usize = 4;
     pub const BR_NE: usize = 5;
@@ -201,7 +201,11 @@ pub const MESSAGE_LEN: usize = 1 + Decoded::NUM_FIELDS;
 /// The smallest program-table height ever built, regardless of how short the program is —
 /// matches the pre-M3.4 preprocessed builder's own floor.
 pub const MIN_HEIGHT: usize = 16;
-pub const MIN_LOG_HEIGHT: u8 = 4; // 1 << 4 == MIN_HEIGHT
+/// The smallest program-table log-height a proof may declare — constraint set 7 (audit INT-1 /
+/// INT-2): `super::MIN_PRIVATE_TABLE_LOG_HEIGHT`, 128 rows, above `MIN_HEIGHT`'s 16 (which stays the
+/// padding rule's own floor, `program_log_height` flooring again at this). Was `4` through
+/// constraint set 6.
+pub const MIN_LOG_HEIGHT: u8 = super::MIN_PRIVATE_TABLE_LOG_HEIGHT;
 /// Ceiling on the *declared* (proof-carried) program-table log-height (`Proof::
 /// program_log_height`) — `2^22` rows is a program of up to ~4M words, comfortably past
 /// anything this crate's guests or any conceivable RV32 program compiled for it need; a
@@ -236,8 +240,35 @@ pub const MAX_LOG_HEIGHT: u8 = 22;
 /// verifier's degree-bits check — the declared height *sizes* the table, it never lets a
 /// prover shrink, pad, or silently extend past the program the digest itself is bound to. See
 /// `docs/03-privacy.md`.
+///
+/// Constraint set 7 (audit INT-1 / INT-2): floored at `super::MIN_PRIVATE_TABLE_LOG_HEIGHT` (128
+/// rows), which `machine::check_declared_heights` now requires of every declared table. The
+/// program table's `MULT` column is how often each instruction ran — the guest's control flow — and
+/// at 16 to 64 rows the proof's openings recover it; the extra rows are ordinary padding. A chain
+/// that pins a call's program height derives it from this function, so it follows.
 pub fn program_log_height(len: usize) -> u8 {
-    super::pad_height(len + 1, MIN_HEIGHT).trailing_zeros() as u8
+    (super::pad_height(len + 1, MIN_HEIGHT).trailing_zeros() as u8).max(super::MIN_PRIVATE_TABLE_LOG_HEIGHT)
+}
+
+/// ISA-1 residual (randprotocol/fullnode#53): does a program table of `2^log_height` rows starting
+/// at `base_pc` end at or below the u32 pc wrap — `base_pc + 4 · 2^log_height ≤ 2^32`?
+///
+/// The circuit does its PC arithmetic in the field (this table's PC chain, the cpu's fall-through
+/// `PC + 4`, the JAL/JALR link) while the emulator wraps mod 2^32, so a table whose padding rows
+/// run past 2^32 carries field PCs no execution produces: no honest proof of such a program
+/// verifies, and nothing a verifier does with one is worth the key it would build. The rows
+/// measured are the *declared* table's — `program_log_height(len)`, floored at 2^7 — not the
+/// program's own words, which is the gap ZH4's word-only bound left (fib's 15 words at
+/// `0xffffffc0` end at 2^32 and pad to 128 rows that do not). `Machine::prove*` refuses such a
+/// program (`ProveError::PcWindow`) and `Machine::verify` such a proof, from its `pv::PC_ENTRY`
+/// and declared `program_log_height` (`VerifyError::PcWindow`). fullnode's
+/// `randprotocol_core::program::pc_window_fits` is the deploy-side mirror of this predicate over
+/// `program_log_height(len)`. `base_pc` is a `u64` because the verifier reads it from a public
+/// value, which is any canonical field element.
+pub fn pc_window_fits(base_pc: u64, log_height: u8) -> bool {
+    // `4 · 2^30` alone is 2^32, so nothing taller fits; the guard also keeps the shift in range.
+    if log_height > 30 { return false; }
+    base_pc.checked_add(4u64 << log_height).is_some_and(|end| end <= 1 << 32)
 }
 
 use col::*;
@@ -318,7 +349,10 @@ where
         pin_op(b, flags::LUI, OP_LUI);
         pin_op(b, flags::AUIPC, OP_AUIPC);
         pin_op(b, flags::JAL, OP_JAL);
-        pin_op(b, flags::JALR, OP_JALR); // no funct3 requirement, matches `Instr::decode`'s literal `OP_JALR => ..` arm
+        // ISA-4 (the next constraint set): `funct3 = 0`, as `Instr::decode`'s `OP_JALR` arm now
+        // requires — RV32I reserves the other seven, which used to decode to the same `JALR`.
+        pin_op(b, flags::JALR, OP_JALR);
+        pin_f3(b, flags::JALR, 0);
 
         for (i, code) in [(flags::BR_EQ, 0u32), (flags::BR_NE, 1), (flags::BR_LT, 4), (flags::BR_GE, 5), (flags::BR_LTU, 6), (flags::BR_GEU, 7)] {
             pin_op(b, i, OP_BRANCH);

@@ -1916,8 +1916,16 @@ fn a_keccak_height_past_the_absolute_cap_is_rejected_where_the_tier_bound_would_
     }
     // The cap itself, and everything under it, still passes the declared-shape checks at a tier
     // whose own bound is looser — this is a ceiling, not a narrowing of what tier 20 may declare.
-    for klh in [0, keccak::MIN_LOG_HEIGHT, 19, keccak::MAX_LOG_HEIGHT] {
+    // Constraint set 7: the smallest legal non-zero height is the private-data floor (7), not the
+    // one-block `keccak::MIN_LOG_HEIGHT` (5) — a shorter table is refused like a taller one.
+    for klh in [0, randprotocol_zkvm::tables::MIN_PRIVATE_TABLE_LOG_HEIGHT, 19, keccak::MAX_LOG_HEIGHT] {
         assert!(check_declared_heights(Tier(20), plh, ilh, klh, 0, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, mlh).is_ok(), "klh = {klh} is legal at tier 20");
+    }
+    for klh in [keccak::MIN_LOG_HEIGHT, randprotocol_zkvm::tables::MIN_PRIVATE_TABLE_LOG_HEIGHT - 1] {
+        assert!(
+            matches!(check_declared_heights(Tier(20), plh, ilh, klh, 0, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, mlh), Err(VerifyError::KeccakHeight)),
+            "klh = {klh} is under the constraint-set-7 floor",
+        );
     }
     // And where the tier is the tighter of the two, the tier variant is still what a forgery
     // earns: at tier 10 anything in `16..=20` is flat-legal but past `t + 5`.
@@ -2257,9 +2265,15 @@ fn declared_sha256_heights_outside_the_range_or_past_the_tier_are_refused() {
             "slh = {slh} is a table too short to hold one block",
         );
     }
-    for slh in [0, sha256::MIN_LOG_HEIGHT, 19, sha256::MAX_LOG_HEIGHT] {
+    // Constraint set 7: the smallest legal non-zero height is the private-data floor (7), not the
+    // one-block `sha256::MIN_LOG_HEIGHT` (6).
+    for slh in [0, randprotocol_zkvm::tables::MIN_PRIVATE_TABLE_LOG_HEIGHT, 19, sha256::MAX_LOG_HEIGHT] {
         assert!(check_declared_heights(Tier(20), plh, ilh, 0, slh, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, mlh20).is_ok(), "slh = {slh} is legal at tier 20");
     }
+    assert!(
+        matches!(check_declared_heights(Tier(20), plh, ilh, 0, sha256::MIN_LOG_HEIGHT, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT, mlh20), Err(VerifyError::Sha256Height)),
+        "one block (slh = 6) is under the constraint-set-7 floor",
+    );
     // And where the tier is the tighter of the two, the tier variant is what a forgery earns.
     let mlh10 = Tier(10).min_mem_log_height();
     assert_eq!(Tier(10).max_sha256_log_height(), 16);
@@ -3197,4 +3211,42 @@ fn a_right_shift_remainder_not_below_the_shift_is_refused() {
     range8_moved(&mut t, 1, 5); // S0
     // `T` left at its honest 2: no byte value of it satisfies `PW − 1 − R − T = 0` with `R = 5`.
     assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ───────────────────── Constraint set 7: the LogUp blind (audit INT-2) ─────────────────────
+
+/// The blind is one more balanced bus, and unbalancing it is refused like unbalancing any other:
+/// an instance whose `OUT` nobody receives (its successor's `IN` is left at the old value), and an
+/// instance that receives a value nobody sent. In a debug build `prove_batch`'s own balance check
+/// panics with `LOOKUP_BALANCE_PANIC`; in release the terminals no longer sum to zero and
+/// `verify_batch` refuses. `tables::blind`'s module comment has why the honest cycle balances and
+/// why a dishonest one cannot be made to by choosing the values after the challenges.
+#[test]
+fn mismatched_blinds_are_refused() {
+    let (m, p, t) = setup();
+    let honest = randprotocol_zkvm::tables::blind::fresh(t.as_slice().len());
+    let proof = m.prove_traces_with_blinds(&p, &t, Tier(10), &honest);
+    m.verify(&p.digest(), &proof).expect("the honest cycle verifies");
+    // Instance 3 sends something else; instance 4 still receives the value it was drawn for.
+    let mut sent = honest.clone();
+    sent[3][randprotocol_zkvm::tables::blind::col::OUT1] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces_with_blinds(&p, &t, Tier(10), &sent); m.verify(&p.digest(), &pr) }));
+    // Instance 5 receives a value nobody sent.
+    let mut received = honest.clone();
+    received[5][randprotocol_zkvm::tables::blind::col::IN0] += F::ONE;
+    assert!(rejects(|| { let pr = m.prove_traces_with_blinds(&p, &t, Tier(10), &received); m.verify(&p.digest(), &pr) }));
+}
+
+/// The cycle is the honest prover's arrangement, not a rule: any blinds that balance as a multiset
+/// verify — here every instance sends and receives one value of its own, which blinds nothing. That
+/// is a prover declining its own privacy, not a way to cheat, and it is why the constraint system
+/// needs no notion of an instance's neighbour.
+#[test]
+fn any_balanced_blinds_verify() {
+    let (m, p, t) = setup();
+    let own: Vec<randprotocol_zkvm::tables::blind::Blind> = (0..t.as_slice().len())
+        .map(|i| { let x = F::from_u32(1000 + i as u32); [x, F::ONE, x, F::ONE] })
+        .collect();
+    let proof = m.prove_traces_with_blinds(&p, &t, Tier(10), &own);
+    m.verify(&p.digest(), &proof).expect("balanced blinds verify");
 }

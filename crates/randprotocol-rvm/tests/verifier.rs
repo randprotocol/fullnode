@@ -706,9 +706,12 @@ fn phase_5_costs_the_measured_number_of_rows_per_inner_proof() {
     // is the query phase — the FRI transcript's duplexes, the five input rounds' leaf sponges,
     // walks and injections, and the commit-phase rows and walks — plus phase 8's interface
     // digest (R5): a 39-word seeded sponge, `ceil(39/4)` = 10 permutations. Pinned at the
-    // measured Test-profile number (constraint set 6's shape); the production one lives in
+    // measured Test-profile number (constraint set 7's shape; 11 205 in constraint set 6 — the
+    // LogUp blind's five columns per instance and ZKM-1's 32-bit input/public/salt lanes widen
+    // every opened leaf the query phase hashes, and the public table is floored at `2^7` rows;
+    // VERIFIER-1's per-round assertion hashes nothing); the production one lives in
     // `docs/00-recursion-vm.md` and `pins.json`.
-    assert_eq!(exec.permutations(), 11_205, "51 transcript duplexes in phases 0–4, the rest is the query phase and phase 8's digest");
+    assert_eq!(exec.permutations(), 11_852, "51 transcript duplexes in phases 0–4, the rest is the query phase and phase 8's digest");
 }
 
 /// Every assertion phase 5 makes is a *named* checkpoint, and the names are the interface Task 6's
@@ -748,7 +751,10 @@ fn phase_5s_assertions_are_all_named() {
 /// for byte, and the two builds accept the same proofs with the same public values. The
 /// hardcoded digest is the production shape's pre-Task-7 program digest (the value committed
 /// before the liveness rework — after this task re-records, `src/programs/verify_rv32.digest`
-/// carries the On build's own, different, digest).
+/// carries the On build's own, different, digest). Constraint set 7 re-recorded it (the Off
+/// replay compiles the inner AIR, which gained the LogUp blind's columns and bus on every
+/// instance and a public table floored at `2^7`, and embeds the inner key, whose salts HCS-1
+/// moved): `c1c04ac3…d731` → `989752d6…6e98`.
 #[test]
 fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
     use randprotocol_rvm::dsl::Liveness;
@@ -764,8 +770,9 @@ fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
     let off = verify_rv32_with(&shape, &key, Checkpoints::Off, Liveness::Off, randprotocol_rvm::programs::Precompiles::Off);
     assert_eq!(
         randprotocol_rvm::programs::digest_hex(&off.program),
-        "c1c04ac3a9faf266eb8980260dae6c7f12fe9ee4cf3dfa40de8440182258d731",
-        "the Off replay must reproduce the pre-Task-7 stream byte for byte"
+        "aafb158456ff7e7ed742b48197b6fc3eb4925a0b2ae1a7ed3717bfb676cd38ea",
+        "the Off replay must reproduce the pre-Task-7 stream byte for byte (plus VERIFIER-1's \
+         per-round assertions, and constraint set 7's inner changes)"
     );
 
     let on = verify_rv32_with(&shape, &key, Checkpoints::Off, Liveness::On, randprotocol_rvm::programs::Precompiles::On);
@@ -789,13 +796,78 @@ fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
 /// the Test fixture's shape, recorded on circuits `224960c` (before the fix) and asserted after
 /// it; the self-verifier (`verify_rv32r`), which compiles the rVM's own tables into its program,
 /// is the one whose digest and costs do move (`tests/self_verify.rs`).
+///
+/// An *inner* constraint change does move it, by the same reasoning: constraint set 7 (the LogUp
+/// blind on every RV32 instance, the `2^7` floor on the public table's declared height — the
+/// fixture's `public_log_height` goes 2 → 7) changes the instructions phase 5 and the opening phase
+/// emit — and the constraint-set-7 key derivation (HCS-1) moves the inner key the program embeds.
+/// VERIFIER-1 (2026-09-28, in the same constraint set) *is* a program change — one
+/// `commit pow witness[r]` assertion per FRI round in the shared pipeline. The claim above still
+/// holds for constraint-only fixes of the rVM's own AIR. Re-registered for constraint set 7 with
+/// VERIFIER-1: `1ec0c545…eeeb` → `5e04fba0…2993`.
 #[test]
 fn the_aggregate_program_digest_is_unchanged_by_rvm_constraint_fixes() {
     let (_p, shape, key) = one_test_proof();
     let vp = randprotocol_rvm::programs::verify_rv32n(&shape, &key, Checkpoints::Off);
     assert_eq!(
         randprotocol_rvm::programs::digest_hex(&vp.program),
-        "1ec0c545003179b1ca4215b439d2d69fa33149a5257a04dc8473030fc2deeeeb",
-        "the aggregate program's digest at the Test fixture shape, as registered before RVM-1"
+        "5e04fba0c0b900dcafbf37aa0acae87afb9ba2269f4d1970706ce2320b962993",
+        "the aggregate program's digest at the Test fixture shape, as re-registered for constraint set 7"
     );
+}
+
+/// VERIFIER-1 (the 2026-09-27 reviews), the rVM half: a commit-phase proof-of-work word other
+/// than the honest `0` is refused by the verifier program, at that round's named step — exactly
+/// where `Machine::verify` (`check_commit_pow_witnesses`) refuses the same rewritten proof. At
+/// zero commit-phase grinding bits p3 neither checks nor observes the word, so before this the
+/// program read it and dropped it and a re-encoded inner proof verified inside an aggregate.
+///
+/// The rewritten proof is built for real (the word changed in `commit_pow_witnesses`, the proof
+/// re-decoded), refused natively and by the host replay; its tape — which a prover hands the
+/// program as untrusted hints — is the honest tape with that one word rewritten, since the word
+/// is observed by nothing and moves no other tape word.
+#[test]
+fn a_rewritten_commit_phase_pow_word_is_refused_at_its_round() {
+    let (p, shape, key) = one_test_proof();
+    let vp = verify_rv32(&shape, &key, Checkpoints::Off);
+    let honest = WitnessTape::build(FriProfile::Test, &shape, &key, &p.proof).unwrap();
+    let (_, start, len) = *honest
+        .segments
+        .iter()
+        .find(|(s, _, _)| *s == randprotocol_rvm::witness::Segment::FriCommits)
+        .unwrap();
+    let rounds = shape.log_arities.len();
+    assert_eq!(len, rounds * 17, "per round: a 16-word cap, then its PoW word");
+    let m = Machine::new(FriProfile::Test);
+    for r in 0..rounds {
+        let at = start + 17 * r + 16;
+        assert_eq!(honest.words[at], F::ZERO, "an honest prover's grind(0) writes zero");
+        for w in [F::ONE, F::from_u64(0xdead_beef), F::NEG_ONE] {
+            // The rewritten proof, for real: refused natively and by the replay.
+            let mut bad: randprotocol_zkvm::machine::Proof = postcard::from_bytes(&p.proof.to_bytes()).unwrap();
+            bad.batch.opening_proof.1.commit_pow_witnesses[r] = w;
+            assert!(
+                matches!(m.verify(&p.hc, &bad), Err(randprotocol_zkvm::machine::VerifyError::CommitPowWitness { round }) if round == r),
+                "round {r}: Machine::verify refuses the rewritten word"
+            );
+            assert_eq!(
+                replay(FriProfile::Test, &shape, &key, &bad).err(),
+                Some(randprotocol_rvm::reference::ReplayError::PowWitness("commit phase")),
+                "round {r}: the host replay refuses it too"
+            );
+            // Its tape, and the program's verdict on it.
+            let mut t = honest.clone();
+            t.words[at] = w;
+            match execute(&vp.program, &t.words, 100_000_000) {
+                Err(ExecError::InverseOfZero { pc }) => assert_eq!(
+                    vp.program.checkpoint_at(pc),
+                    Some(format!("commit pow witness[{r}]").as_str()),
+                    "round {r}: refused at the wrong step"
+                ),
+                other => panic!("round {r}, word {w:?}: expected a refusal, got {:?}", other.map(|e| format!("acceptance, {} cpu rows", e.cpu_rows()))),
+            }
+        }
+    }
+    // And the honest tape still runs to acceptance.
+    execute(&vp.program, &honest.words, 100_000_000).expect("the honest tape is accepted");
 }

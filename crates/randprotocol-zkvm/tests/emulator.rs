@@ -25,6 +25,38 @@ fn poseidon2_syscall_matches_native_reference_for_various_lengths() {
     }
 }
 
+/// HCS-4: `POSEIDON2_LEN` agrees with `hash::sponge_hash_len` at every block boundary, and its row
+/// group always has at least one absorb row — `n = 0` absorbs one empty block, so the digest is a
+/// permutation output: 1 ecall row, `max(1, n.div_ceil(4))` absorb rows, 2 write-back rows.
+#[test]
+fn poseidon2_len_syscall_matches_native_reference_for_various_lengths() {
+    for n in [0usize, 1, 3, 4, 5, 8, 100] {
+        let msg: Vec<u32> = (1..=n as u32).collect();
+        let e = run(&guests::poseidon2_len_demo(&msg), &[]);
+        assert_eq!(&e.outputs[..8], &randprotocol_zkvm::hash::sponge_hash_len(&msg)[..], "n={n}: digest");
+        let hash_rows = e.events.iter().filter(|ev| ev.hash_row.is_some()).count();
+        assert_eq!(hash_rows, 1 + n.div_ceil(4).max(1) + 2, "n={n}: hash row count");
+        assert!(e.events.iter().any(|ev| ev.sys == Some(Syscall::Poseidon2Len { ptr: 0x1000 / 4, n: n as u32 })), "n={n}");
+    }
+    assert_ne!(randprotocol_zkvm::hash::sponge_hash_len(&[]), [0u32; 8]);
+    assert_ne!(randprotocol_zkvm::hash::sponge_hash_len(&[7]), randprotocol_zkvm::hash::sponge_hash_len(&[7, 0]));
+    // The two syscalls are different hashes of the same words, not one with a flag.
+    assert_ne!(randprotocol_zkvm::hash::sponge_hash_len(&[1, 2, 3, 4, 5]), randprotocol_zkvm::hash::sponge_hash(&[1, 2, 3, 4, 5]));
+}
+
+/// `POSEIDON2_LEN` shares `POSEIDON2`'s word cap and pointer bound.
+#[test]
+fn poseidon2_len_refuses_what_poseidon2_refuses() {
+    let mut a = Assembler::new(0);
+    a.extend(call_poseidon2_len(0x1000 / 4, (POSEIDON2_MAX_WORDS + 1) as usize));
+    a.extend(halt());
+    assert_eq!(execute(&a.assemble(), &[], &[], 1 << 16).unwrap_err(), ExecError::Poseidon2WordCount(POSEIDON2_MAX_WORDS + 1));
+    let mut a = Assembler::new(0);
+    a.extend(call_poseidon2_len(1 << 30, 4));
+    a.extend(halt());
+    assert_eq!(execute(&a.assemble(), &[], &[], 1 << 16).unwrap_err(), ExecError::Poseidon2Ptr(1 << 30));
+}
+
 /// `n = 0` is the sponge's empty-input case: no permutation runs at all, and the digest is the
 /// all-zero state's own first 4 lanes.
 #[test]

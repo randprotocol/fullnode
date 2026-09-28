@@ -39,7 +39,7 @@ fn keccak_f_matches_p3_keccak_and_words_roundtrip() {
 /// `keccak256` at every block-boundary case: empty, short, one byte shy of the rate, exactly the
 /// rate (which needs a whole extra all-padding block), one byte past it, and two full blocks.
 fn sdk_keccak256(msg: &[u8]) -> [u8; 32] {
-    // stand-in for `keccak(state.as_mut_ptr())`
+    // stand-in for `keccak(&mut state)`
     let keccak = |state: &mut [u32; 50]| {
         let mut st = words_to_state(state);
         keccak_f(&mut st);
