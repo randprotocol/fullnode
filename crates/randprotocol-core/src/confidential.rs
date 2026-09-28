@@ -599,6 +599,37 @@ mod tests {
         assert_eq!(StubExecutor.bundle_gas_limit(b"junk"), Err(ConfidentialError::MalformedProof));
     }
 
+    /// Binding a transaction rewrites the stub bundle proof's binding words only: the gas tail
+    /// `with_bundle_gas` set survives `bound`, and binding a bound transaction again moves nothing.
+    #[test]
+    fn binding_keeps_the_bundle_proofs_gas_limit() {
+        use crate::notes::Bundle;
+        use crate::types::Action;
+        let hc = [3u32; 8];
+        let mut proof = StubExecutor::make_bundle_proof(&hc, &[5u32; 8], &[0; 8]);
+        StubExecutor::with_bundle_gas(&mut proof, 777);
+        let bundle = Bundle {
+            anchor: [1; 8],
+            nullifiers: [[2; 8], [3; 8], [4; 8], [5; 8]],
+            commitments: [[6; 8], [7; 8], [8; 8], [9; 8]],
+            fee: 1,
+            burn_a: 0,
+            burn_r: 0,
+            burn_asset: 0,
+            time: 1,
+            envelopes: std::array::from_fn(|_| crate::notes::Envelope { kem_ct: vec![1], to_receiver: vec![2], to_sender: vec![3], body: vec![4] }),
+            proof,
+        };
+        let tx = StubExecutor::bound(Transaction::shielded(7, bundle, Action::None));
+        let p = &tx.bundle.as_ref().unwrap().proof;
+        assert_eq!(StubExecutor.bundle_gas_limit(p).unwrap(), Some(777), "bound keeps the gas tail");
+        let binding = word8_to_bytes(&tx.binding());
+        assert_eq!(&p[STUB_BUNDLE_BINDING..STUB_BUNDLE_GAS], &binding[..], "and the binding is this transaction's");
+        assert_eq!(StubExecutor.verify_bundle(&hc, p, &tx.binding()), Ok(()));
+        let again = StubExecutor::bound(tx.clone());
+        assert_eq!(again, tx, "binding is idempotent");
+    }
+
     #[test]
     fn stub_bundle_proof_carries_its_digest_and_binds_hc() {
         let hc = [3u32; 8];
