@@ -1877,7 +1877,7 @@ fn aggregation_node_with(
         std::sync::Arc::new(StubExecutor),
     );
     let hc_words: [u32; 8] = crate::notes::word8_from_bytes(Hash::digest(b"the bundle guest").as_bytes()).unwrap();
-    let mut pv = [0u64; 34];
+    let mut pv = [0u64; crate::types::pv::NUM];
     pv[crate::types::pv::TIER] = shape.tier as u64;
     for k in 0..8 {
         pv[crate::types::pv::OUT0 + k] = 100 + k as u64;
@@ -1998,7 +1998,7 @@ fn a_proposal_carrying_an_aggregate_applies_identically_on_proposer_and_peer() {
                     covers
                         .iter()
                         .map(|_| {
-                            let mut pv = [0u64; 34];
+                            let mut pv = [0u64; crate::types::pv::NUM];
                             pv[crate::types::pv::TIER] = 14;
                             for k in 0..8 {
                                 pv[crate::types::pv::OUT0 + k] = 100 + k as u64;

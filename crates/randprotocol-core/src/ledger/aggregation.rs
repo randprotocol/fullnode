@@ -1139,7 +1139,7 @@ mod tests {
     fn max_aggregate_bytes_is_the_proof_cap_plus_the_cover_and_list_bounds() {
         assert_eq!(
             gas::MAX_AGGREGATE_BYTES,
-            gas::MAX_PROOF_BYTES + 3 * 32 + (4 + 1 + 34 * 3) * 8 + 4_400
+            gas::MAX_PROOF_BYTES + 3 * 32 + (4 + 1 + 35 * 3) * 8 + 4_400
         );
         // And it admits a 2 MiB proof with the three covers and the envelope.
         assert!(gas::MAX_AGGREGATE_BYTES > gas::MAX_PROOF_BYTES + 3 * 32 + 2_000);
@@ -1752,7 +1752,7 @@ mod admission_tests {
         let hc_words = word8_from_bytes(guest_hc().as_bytes()).unwrap();
         tags.iter()
             .map(|&t| {
-                let mut public_values = [0u64; 34];
+                let mut public_values = [0u64; crate::types::pv::NUM];
                 public_values[pv::TIER] = shape.tier as u64;
                 for k in 0..8 {
                     public_values[pv::OUT0 + k] = t as u64 * 100 + k as u64;
@@ -2467,7 +2467,7 @@ mod payment_tests {
         let hc_words = word8_from_bytes(Hash::digest(b"the bundle guest").as_bytes()).unwrap();
         tags.iter()
             .map(|&t| {
-                let mut public_values = [0u64; 34];
+                let mut public_values = [0u64; crate::types::pv::NUM];
                 public_values[pv::TIER] = shape().tier as u64;
                 for k in 0..8 {
                     public_values[pv::OUT0 + k] = t as u64 * 100 + k as u64;
@@ -2886,7 +2886,7 @@ mod payment_tests {
         let l = gated(256);
         let tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, 0), Action::None));
         let digest = StubExecutor.bundle_digest(&tx.bundle.as_ref().unwrap().digest_input());
-        let mut pv = [0u64; 34];
+        let mut pv = [0u64; crate::types::pv::NUM];
         // The covered proof's H_PUB is its transaction's binding (INTERFACE-6 checks it).
         let hpub = StubExecutor.public_digest(&tx.binding());
         for k in 0..8 {
@@ -2937,7 +2937,7 @@ mod payment_tests {
         // its own public fields hash to.
         let tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE, 0), Action::None));
         let digest = StubExecutor.bundle_digest(&tx.bundle.as_ref().unwrap().digest_input());
-        let mut pv = [0u64; 34];
+        let mut pv = [0u64; crate::types::pv::NUM];
         // The covered proof's H_PUB is its transaction's binding (INTERFACE-6 checks it).
         let hpub = StubExecutor.public_digest(&tx.binding());
         for k in 0..8 {
@@ -2998,7 +2998,7 @@ mod payment_tests {
         // covers name — not the marker form's (spec §6.2's byte-identical replay).
         let mut rich_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::BUNDLE_BASE + 60, 0), Action::None));
         let rich_digest = StubExecutor.bundle_digest(&rich_tx.bundle.as_ref().unwrap().digest_input());
-        let mut rich_pv = [0u64; 34];
+        let mut rich_pv = [0u64; crate::types::pv::NUM];
         let rich_hpub = StubExecutor.public_digest(&rich_tx.binding());
         for k in 0..8 {
             rich_pv[pv::OUT0 + k] = rich_digest[k] as u64;

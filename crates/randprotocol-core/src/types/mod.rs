@@ -52,17 +52,18 @@ pub const BUNDLE_PROOF_TIER: u8 = 14;
 /// which floors every declared table at 2^7 rows; 4 through constraint set 6.
 pub const BUNDLE_PUBLIC_LOG_HEIGHT: u8 = 7;
 
-/// What admission needs of a covered bundle and nothing more (spec §4 steps 6–7): its 34
-/// public values in `pv` order and its declared shape.
+/// What admission needs of a covered bundle and nothing more (spec §4 steps 6–7): its
+/// `pv::NUM` public values (35 since constraint set 8) in `pv` order and its declared shape.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CoveredBundle {
-    pub public_values: [u64; 34],
+    pub public_values: [u64; pv::NUM],
     pub shape: DeclaredShape,
 }
 
 /// The zkVM's public-value layout (`randprotocol_zkvm::tables::cpu::pv`), mirrored so the ledger
-/// never names a zkvm type — [`FriProfile`]'s discipline, one level down. The constraint-set-6
-/// values: `PC_ENTRY, TIER, OUT0..7, HC0..7, IN0..7, PUB0..7`, 34 in all. A test on the zkvm
+/// never names a zkvm type — [`FriProfile`]'s discipline, one level down. The constraint-set-8
+/// values: `PC_ENTRY, TIER, OUT0..7, HC0..7, IN0..7, PUB0..7, GAS`, 35 in all (34 through
+/// constraint set 7). A test on the zkvm
 /// side pins these to the real constants, so a constraint-set change that moves the layout
 /// fails there, not silently here.
 pub mod pv {
@@ -72,7 +73,11 @@ pub mod pv {
     pub const HC0: usize = OUT0 + 8;
     pub const IN0: usize = HC0 + 8;
     pub const PUB0: usize = IN0 + 8;
-    pub const NUM: usize = PUB0 + 8;
+    /// Constraint set 8: the proof's declared gas limit (`GAS_LIMIT`), the one word after
+    /// `PUB0..7`. The verifier holds the run's metered gas to it and it to `gas::gas_max` of the
+    /// header (spec 2026-09-28 §4.2).
+    pub const GAS: usize = PUB0 + 8;
+    pub const NUM: usize = GAS + 1;
     /// The order of the field the public values live in (Goldilocks, `2^64 − 2^32 + 1`): a
     /// canonical public value is below it. Mirrored like the layout above (core cannot name the
     /// zkVM's `Val`); the node's `agg_executor` tests pin mirror == `Val::ORDER_U64`.

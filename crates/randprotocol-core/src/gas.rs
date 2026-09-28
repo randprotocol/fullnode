@@ -582,7 +582,7 @@ pub const MAX_COVERS_DEFAULT: u32 = 3;
 /// recomputed interface list's length bound, an envelope and fixed overhead. The rVM proof at
 /// production is estimated well under the 2 MiB proof cap already (`circuits`' M5.2 record).
 pub const MAX_AGGREGATE_BYTES: usize =
-    MAX_PROOF_BYTES + MAX_COVERS_DEFAULT as usize * 32 + (4 + 1 + 34 * MAX_COVERS_DEFAULT as usize) * 8 + 4_400;
+    MAX_PROOF_BYTES + MAX_COVERS_DEFAULT as usize * 32 + (4 + 1 + crate::types::pv::NUM * MAX_COVERS_DEFAULT as usize) * 8 + 4_400;
 
 /// The sealing block's minted subsidy (spec §5.1): `subsidy_base` per sealed block, halving
 /// every `halving_blocks`, zero from the 64th halving. `n` is the ledger's `sealed_blocks`

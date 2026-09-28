@@ -167,6 +167,12 @@ pub struct CallOutcome {
     pub keccak_log_height: u8,
     /// The declared sha256-table height, `0` = none.
     pub sha256_log_height: u8,
+    /// Constraint set 8: the proof's declared gas limit (`pv::GAS`), taken straight from the
+    /// proof the verifier just accepted. The circuit holds the run's metered gas to it
+    /// (`gas ≤ gas_limit`) and the verifier holds it to the header's ceiling
+    /// ([`Self::gas_max`]), so `gas_limit ≤ gas_max()` for every accepted proof. What a gas-priced
+    /// chain charges a call for (spec 2026-09-28 §4.3): a caller who declares less pays less.
+    pub gas_limit: u64,
 }
 
 impl CallOutcome {
