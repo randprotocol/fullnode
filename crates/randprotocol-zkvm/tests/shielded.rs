@@ -178,7 +178,7 @@ fn a_bundle_proves_against_its_binding_and_verifies_only_against_it() {
     println!("bundle proved at tier {tier} in {:.1?} ({} proof bytes)", started.elapsed(), proof.len());
     assert_eq!(tier, 14, "the eight binding words do not move the bundle off its tier");
     assert_eq!(ex.bundle_digest(&di), digest);
-    assert_eq!(ex.bundle_proof_digest(&proof).unwrap(), digest);
+    assert_eq!(ex.bundle_proof_digest(&ZkExecutor::hc_bundle(), &proof).unwrap(), digest);
     let hc = ZkExecutor::hc_bundle();
     ex.verify_bundle(&hc, &proof, &BINDING_A).unwrap();
     // The attack: the same proof, verified for another transaction. One bit of one word differs.
@@ -204,14 +204,14 @@ fn a_bundle_proves_against_its_binding_and_verifies_only_against_it() {
         let mut other = randprotocol_zkvm::executor::decode_canonical(&proof).unwrap();
         other.public_log_height = height;
         let bytes = other.to_bytes();
-        assert_eq!(ex.bundle_proof_digest(&bytes), Err(why.clone()), "height {height}");
+        assert_eq!(ex.bundle_proof_digest(&hc, &bytes), Err(why.clone()), "height {height}");
         assert_eq!(ex.verify_bundle(&hc, &bytes, &BINDING_A), Err(why.clone()), "height {height}");
     }
     // Canonical decoding (final review): the same proof with one trailing byte decodes to the same
     // `Proof` under plain postcard, and is refused by both bundle entry points.
     let mut trailing = proof.clone();
     trailing.push(0);
-    assert_eq!(ex.bundle_proof_digest(&trailing), Err(ConfidentialError::MalformedProof));
+    assert_eq!(ex.bundle_proof_digest(&hc, &trailing), Err(ConfidentialError::MalformedProof));
     assert_eq!(ex.verify_bundle(&hc, &trailing, &BINDING_A), Err(ConfidentialError::MalformedProof));
 }
 
@@ -235,7 +235,7 @@ fn a_bundle_proved_against_the_empty_segment_is_refused() {
     assert_eq!(proof.public_log_height, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT);
     assert_eq!(proof.public_log_height, ZkExecutor::bundle_heights().2, "cs7: the same declared height as the binding's");
     let bytes = proof.to_bytes();
-    assert_eq!(ex.bundle_proof_digest(&bytes), Ok(exec.outputs), "the cheap reader verifies nothing");
+    assert_eq!(ex.bundle_proof_digest(&ZkExecutor::hc_bundle(), &bytes), Ok(exec.outputs), "the cheap reader verifies nothing");
     let refused = ConfidentialError::InvalidBundleProof("PublicValues".into());
     for binding in [BINDING_A, [0; 8]] {
         assert_eq!(ex.verify_bundle(&ZkExecutor::hc_bundle(), &bytes, &binding), Err(refused.clone()));
