@@ -707,12 +707,33 @@ struct StakingArgs {
     no_wait: bool,
 }
 
+/// Whether `cmd` opens a data directory's RocksDB, and so needs the open-files limit raised
+/// before it does (issue #60).
+///
+/// #41 raised the limit only inside `node::start`, so `run` was covered and nothing else was:
+/// `verify` (and `verify --repair`), `db drop-receipts-index` and `init` open the same database —
+/// ~1000 table files on chain 15's archives — under whatever soft limit the operator's shell has
+/// (1024 on a droplet's login shell, 256 on macOS). The fleet's systemd drop-in covers the unit,
+/// not a hand-run command, and a hand-run command is exactly what an operator repairing a node
+/// reaches for. Every arm that calls `Storage::open` (or `Storage::drop_receipts_index`, which
+/// opens the families itself) belongs here; the RPC-client and key-file commands do not.
+fn opens_storage(cmd: &Cmd) -> bool {
+    matches!(cmd, Cmd::Run { .. } | Cmd::Verify { .. } | Cmd::Db { .. } | Cmd::Init { .. })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,libp2p=warn,libp2p_mdns=off".into()))
         .init();
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    if opens_storage(&cli.cmd) {
+        match randprotocol_node::rlimit::raise_nofile_limit() {
+            Ok((soft, hard)) => tracing::debug!(soft, hard, "open-files limit"),
+            Err(e) => tracing::warn!("could not raise the open-files limit: {e}"),
+        }
+    }
+    match cli.cmd {
         Cmd::Keygen { out } => {
             let kp = Keypair::generate();
             KeyFile::from_keypair(&kp).write(&out)?;
@@ -1435,6 +1456,26 @@ pub fn parse_prune_history(s: &str) -> Result<Duration, String> {
 mod tests {
     use super::*;
     use randprotocol_core::ledger::staking::MIN_STAKE;
+
+    /// Issue #60: every subcommand that opens RocksDB raises the open-files limit first — not
+    /// only `run`, whose `node::start` did it since #41. `verify --repair` is the one that
+    /// matters most: it runs by hand, under a login shell's limit, on a node already in trouble.
+    #[test]
+    fn every_subcommand_that_opens_the_database_raises_the_open_files_limit() {
+        let cmd = |args: &[&str]| Cli::try_parse_from(std::iter::once("rand-node").chain(args.iter().copied())).unwrap().cmd;
+        for args in [
+            &["verify", "--datadir", "d"][..],
+            &["verify", "--datadir", "d", "--repair"],
+            &["db", "drop-receipts-index", "--datadir", "d"],
+            &["init", "--datadir", "d", "--genesis", "g.json"],
+            &["run", "--datadir", "d", "--key", "k.json"],
+        ] {
+            assert!(opens_storage(&cmd(args)), "`rand-node {}` opens RocksDB under the shell's open-files limit", args.join(" "));
+        }
+        for args in [&["status"][..], &["keygen", "--out", "k.json"], &["address", "--key", "k.json"]] {
+            assert!(!opens_storage(&cmd(args)), "`rand-node {}` opens no database", args.join(" "));
+        }
+    }
     use randprotocol_zkvm::machine::FriProfile;
 
     /// The chain-9 genesis arms (spec §2.3): the section parses from the flag spellings, the
