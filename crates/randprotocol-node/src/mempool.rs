@@ -2380,11 +2380,11 @@ mod tests {
     #[test]
     fn a_call_under_the_policy_floor_is_refused_at_precheck() {
         use randprotocol_core::gas::{self, GasPolicy};
-        // Tier 14, not the brief's 12: at tier 12 (cycles 4 095, GAS_PRICE_DEFAULT 100) the
-        // gas-priced floor is 1 410 300 against the old schedule's 2 100 000 — the ledger's own
+        // Tier 14, not the brief's 12: at tier 12 (gas_max 5 119, GAS_PRICE_DEFAULT 100) the
+        // gas-priced floor is 1 512 700 against the old schedule's 2 100 000 — the ledger's own
         // floor dominates the `max` in `GasPolicy::call_floor` and `want == old`, so the refusal
-        // this test exists to demonstrate cannot happen there. Tier 14 (cycles 16 383) is the
-        // first step where the gas price's `100 × cycles` term overtakes the flat per-tier-step
+        // this test exists to demonstrate cannot happen there. Tier 14 (gas_max 20 479) is the
+        // first step where the gas price's `100 × gas_max` term overtakes the flat per-tier-step
         // schedule; verified against the built `GasPolicy::DEFAULT` before writing this in.
         let stub_len = StubExecutor::make_proof_with_public(&Hash::ZERO, 14, [0; 8], &[]).len();
         let old = gas::BUNDLE_BASE + gas::call_fee(14, stub_len);
