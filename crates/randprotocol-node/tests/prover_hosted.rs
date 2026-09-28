@@ -125,7 +125,7 @@ async fn the_hosted_prover_answers_beside_the_node_and_its_exit_stops_the_node()
         .unwrap();
     let info = &info["result"];
     assert_eq!(info["kem_fingerprint"], json!(prover_key.fingerprint().to_string()), "{info}");
-    assert_eq!(info["witness_kinds"], json!([]), "--prover-accept-spend-key is off: {info}");
+    assert_eq!(info["witness_kinds"], json!(["viewing_key"]), "--prover-accept-spend-key is off: viewing-key (v3) jobs only: {info}");
     assert_eq!(info["allowed_origins"][0], json!("chrome-extension://*"), "no --prover-allow-origin: the default list: {info}");
     // The node's own RPC is up beside it, and knows nothing of `prover_*`.
     let on_node: Value = http

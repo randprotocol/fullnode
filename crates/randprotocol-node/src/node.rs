@@ -1547,6 +1547,42 @@ fn close_batch_coverage(storage: &Storage, batch: &mut Vec<CommittedBlock>, limi
     }
 }
 
+/// The chains this build refuses to run, by genesis hash, each with the reason it gives. Every
+/// chain up to 13 pins the retired 2-in-2-out guest, which this build does not carry, so the
+/// `hc_bundle` check already refuses it; the chains below pin a guest this build still carries (a
+/// new genesis may name v1 or v2), so they are named here:
+///
+/// - **Chains 14 and 15** committed proofs under constraint set 6. Every verifier key moved with
+///   constraint set 7 (v0.6.1): a node on either chain would refuse the chain's own history at its
+///   startup replay.
+/// - **Chain 16** (v0.6.1/v0.6.2) runs on the bundle wire and transaction ids before split
+///   authorisation. This build appends `auth_commit`/`auth_proof` to every `Bundle` (bincode is
+///   positional, so none of chain 16's bundles decode) and hashes every transaction under
+///   `rand-txid-3`, so it would fail at chain 16's first bundle.
+pub const CHAINS_THIS_BUILD_CANNOT_RUN: [(u64, &str, &str); 3] = [
+    (14, "1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff", CONSTRAINT_SET_6_REASON),
+    (15, "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8", CONSTRAINT_SET_6_REASON),
+    (16, "20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005", SPLIT_AUTH_REASON),
+];
+
+const CONSTRAINT_SET_6_REASON: &str = "its proofs were made under constraint set 6; this build is constraint \
+     set 7 (v0.6.1 and later) and verifies none of them. Run the chain's own release (v0.6 or earlier), never this one";
+
+const SPLIT_AUTH_REASON: &str = "this build changes the bundle wire and every transaction id (rand-txid-3, split \
+     authorisation): it runs chain 17+ only; use the v0.6.1/v0.6.2 release for chain 16";
+
+/// Refuse a genesis in [`CHAINS_THIS_BUILD_CANNOT_RUN`]: `run` (through
+/// [`check_build_runs_genesis`]) and `verify` both call it before touching the datadir's blocks,
+/// so this binary installed on a chain-14, -15 or -16 host neither starts nor `verify --repair`s
+/// that chain's history away.
+pub fn refuse_chains_this_build_cannot_run(gs: &GenesisState) -> Result<()> {
+    let hash = gs.hash().to_hex();
+    if let Some((chain, _, why)) = CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(_, h, _)| *h == hash) {
+        anyhow::bail!("genesis {hash} is chain {chain}: {why}");
+    }
+    Ok(())
+}
+
 /// What this build can run, checked against the genesis before anything is opened.
 ///
 /// - Every shielded-pool proof on the chain is against one guest, pinned by the genesis. A node
@@ -1565,35 +1601,8 @@ fn close_batch_coverage(storage: &Storage, batch: &mut Vec<CommittedBlock>, limi
 /// `hc_bundle` — chains 14 and 15 name v1, a later cut names v2. Verification needs nothing more
 /// (the program is digested in-circuit and both guests declare the same heights), so either is
 /// runnable; a genesis naming anything else is refused as before.
-/// The chains whose committed proofs were made under an older constraint set than this build's
-/// (constraint set 7, v0.6.1), by genesis hash. Every earlier chain pins the retired 2-in-2-out
-/// guest, which this build does not carry, so the `hc_bundle` check already refuses it; chains 14
-/// and 15 pin guest v1, which it still does (a new genesis may name it), so they are named here.
-/// Every verifier key moved with constraint set 7: a v0.6.1 node on either chain would refuse the
-/// chain's own history at its startup replay.
-pub const PRE_CONSTRAINT_SET_7_CHAINS: [(u64, &str); 2] = [
-    (14, "1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff"),
-    (15, "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8"),
-];
-
-/// Refuse a genesis in [`PRE_CONSTRAINT_SET_7_CHAINS`]: `run` (through
-/// [`check_build_runs_genesis`]) and `verify` both call it before touching the datadir's blocks,
-/// so a v0.6.1 binary installed on a chain-14 or chain-15 host neither starts nor `verify
-/// --repair`s that chain's history away.
-pub fn refuse_pre_constraint_set_7(gs: &GenesisState) -> Result<()> {
-    let hash = gs.hash().to_hex();
-    if let Some((chain, _)) = PRE_CONSTRAINT_SET_7_CHAINS.iter().find(|(_, h)| *h == hash) {
-        anyhow::bail!(
-            "genesis {hash} is chain {chain}, whose proofs were made under constraint set 6; this build \
-             is constraint set 7 (v0.6.1) and verifies none of them. Run the chain's own release \
-             (v0.6 or earlier), never this one"
-        );
-    }
-    Ok(())
-}
-
 pub fn check_build_runs_genesis(gs: &GenesisState, built_hc_bundles: &[randprotocol_core::notes::Word8]) -> Result<()> {
-    refuse_pre_constraint_set_7(gs)?;
+    refuse_chains_this_build_cannot_run(gs)?;
     if !built_hc_bundles.contains(&gs.hc_bundle) {
         anyhow::bail!(
             "every bundle guest this build carries ({}) differs from the genesis hc_bundle ({}); \
@@ -1769,7 +1778,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             node: cmd_tx,
             chain_id: gs.chain_id,
             // The RPC's limits follow the genesis (call limits spec §8), like the wire's above.
-            limits: rpc_limits,
+            limits: rpc_limits.clone(),
             max_body_bytes: rpc_limits.rpc_max_body_bytes(),
             executor: executor.clone(),
             heads: heads.clone(),
@@ -1804,10 +1813,17 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         // Under genesis `hardening_v6` a call proves over other shapes (the call binding, INT-4),
         // so its keys are the hardened ones.
         let hardened = hs.committed_ledger().hardening_v6();
+        // Split authorisation (genesis `hc_auth`): every bundle on such a chain carries an auth
+        // proof too, so its key is warmed beside the bundle's; a chain without it never needs one.
+        let split_auth = hs.committed_ledger().hc_auth().is_some();
         let ex = executor.clone();
         tokio::task::spawn_blocking(move || {
             ex.warm_bundle();
             tracing::info!("bundle verifier key warmed");
+            if split_auth {
+                ex.warm_auth();
+                tracing::info!("auth verifier key warmed");
+            }
             for rec in programs {
                 if hardened {
                     ex.warm_hardened(&rec);
@@ -2043,6 +2059,7 @@ impl Node {
         s.nullifiers = ledger.nullifiers().len() as u64;
         s.tree_root = randprotocol_core::notes::word8_to_hex(&ledger.root());
         s.hc_bundle = randprotocol_core::notes::word8_to_hex(&ledger.hc_bundle());
+        s.hc_auth = ledger.hc_auth().map(|h| randprotocol_core::notes::word8_to_hex(&h));
         let target = self.peers.values().filter_map(|p| p.status.as_ref()).map(|p| p.height).max().unwrap_or(0);
         s.sync_target = target.max(s.height);
         s.syncing = self.sync_inflight.is_some();

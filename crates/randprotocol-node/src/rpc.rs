@@ -177,6 +177,9 @@ pub struct NodeStatus {
     pub tree_root: String,
     /// The bundle guest this chain's proofs are against.
     pub hc_bundle: String,
+    /// The auth guest (split authorisation) the genesis pins as `hc_auth`, `null` on a chain
+    /// without it. Set, every bundle carries an auth proof against it and `hc_bundle` is v3.
+    pub hc_auth: Option<String>,
     pub address: Option<String>,
     pub peer_id: String,
     /// The aggregation section (spec §8): the register's size, the coverable bundles the
@@ -455,7 +458,7 @@ impl RpcError {
 
 /// A chain's call limits (spec §3), read once off its genesis ledger. What `rand_getLimits`
 /// returns, field for field, so wallets derive their caps instead of hard-coding them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ChainLimits {
     pub max_program_words: usize,
     pub max_proof_bytes: usize,
@@ -470,6 +473,10 @@ pub struct ChainLimits {
     /// #55) instead of the public input alone: a chain with
     /// the flag refuses the old proof, a chain without it the new one.
     pub hardening_v6: bool,
+    /// The genesis `hc_auth` (split authorisation), hex, `null` where the chain has none. What a
+    /// wallet reads to build a v3 transaction — `nk` and a salt to the bundle guest, the spend
+    /// key to its own auth proof — instead of a v1/v2 one.
+    pub hc_auth: Option<String>,
 }
 
 impl ChainLimits {
@@ -482,6 +489,7 @@ impl ChainLimits {
             max_program_public_words: ledger.max_program_public_words(),
             envelope_bytes: ledger.envelope_bytes(),
             hardening_v6: ledger.hardening_v6(),
+            hc_auth: ledger.hc_auth().map(|h| word8_to_hex(&h)),
         }
     }
 
@@ -1321,6 +1329,10 @@ fn bundle_json(b: &randprotocol_core::Bundle) -> Value {
         "time": b.time,
         "proof_len": b.proof.len(),
         "envelope_len": b.envelopes.iter().map(|e| e.len()).collect::<Vec<_>>(),
+        // Split authorisation (genesis `hc_auth`): the public `c = H(AUTH, nk, salt)` both proofs
+        // publish, and the auth proof's length. A pre-v3 bundle carries neither: zeros and 0.
+        "auth_commit": word8_to_hex(&b.auth_commit),
+        "auth_proof_bytes": b.auth_proof.len(),
     })
 }
 
@@ -1588,7 +1600,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let s = st.status.read().unwrap_or_else(|e| e.into_inner());
             Ok(json!({
                 "version": env!("CARGO_PKG_VERSION"), "git_sha": GIT_SHA, "chain_id": st.chain_id,
-                "hc_bundle": s.hc_bundle, "fri_profile": s.fri_profile,
+                "hc_bundle": s.hc_bundle, "hc_auth": s.hc_auth, "fri_profile": s.fri_profile,
             }))
         }
         "rand_getGenesisHash" => Ok(json!(st.storage.genesis_hash().map_err(RpcError::internal)?.to_hex())),
@@ -2803,8 +2815,8 @@ mod tests {
             status: Arc::new(RwLock::new(NodeStatus::default())),
             node: tx,
             chain_id: gs.chain_id,
-            limits,
             max_body_bytes: limits.rpc_max_body_bytes(),
+            limits,
             executor: Arc::new(StubExecutor),
             heads: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
             commits: tokio::sync::broadcast::channel(HEAD_CHANNEL).0,
@@ -3380,6 +3392,7 @@ mod tests {
                 "max_program_public_words": 0,
                 "envelope_bytes": null,
                 "hardening_v6": false,
+                "hc_auth": null,
             })
         );
         let gs = raised_genesis();
@@ -3394,6 +3407,7 @@ mod tests {
                 "max_program_public_words": 64,
                 "envelope_bytes": null,
                 "hardening_v6": false,
+                "hc_auth": null,
             })
         );
         // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
@@ -3410,6 +3424,7 @@ mod tests {
                 "max_program_public_words": 64,
                 "envelope_bytes": 1860,
                 "hardening_v6": false,
+                "hc_auth": null,
             })
         );
         // The v0.6 switch: what a wallet reads to prove its calls over the call binding (INT-4).
@@ -3417,6 +3432,11 @@ mod tests {
         gs.ledger.set_hardening_v6(true);
         let (_d, st) = state_for(&gs);
         assert_eq!(ok(&st, "rand_getLimits", json!([])).await["hardening_v6"], json!(true));
+        // Split authorisation: a wallet reads `hc_auth` to build a v3 transaction.
+        let mut gs = raised_genesis();
+        gs.ledger.set_hc_auth(Some([7; 8]));
+        let (_d, st) = state_for(&gs);
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["hc_auth"], json!(word8_to_hex(&[7; 8])));
     }
 
     /// The RPC's local limits follow a 20 MiB ledger (spec §8): the body limit is the same formula
@@ -3617,6 +3637,7 @@ mod tests {
         assert_eq!(v["nullifiers"], 4);
         assert_eq!(v["tree_root"], word8_to_hex(&st.storage.tree().unwrap().root()));
         assert_eq!(v["hc_bundle"], word8_to_hex(&fixtures::HC));
+        assert!(v["hc_auth"].is_null(), "present, null without split authorisation");
         // Written by the node loop's publish_status, which these tests don't run: zero here, and
         // present — an operator must be able to see the node is holding keys at all.
         assert_eq!(v["viewing_keys"], 0);
@@ -4522,7 +4543,7 @@ mod tests {
             keys,
             [
                 "anchor", "nullifiers", "commitments", "fee", "burn_a", "burn_r", "burn_asset", "time", "proof_len",
-                "envelope_len"
+                "envelope_len", "auth_commit", "auth_proof_bytes"
             ]
             .into_iter()
             .collect(),
@@ -4535,6 +4556,13 @@ mod tests {
         assert_eq!(transfer["commitments"].as_array().unwrap().len(), 4);
         assert_eq!(transfer["envelope_len"], json!(b.envelopes.iter().map(|e| e.len()).collect::<Vec<_>>()));
         assert_eq!(transfer["envelope_len"].as_array().unwrap().len(), 4);
+        // A pre-v3 bundle: no auth commitment, no auth proof.
+        assert_eq!((&transfer["auth_commit"], &transfer["auth_proof_bytes"]), (&json!(word8_to_hex(&[0; 8])), &json!(0)));
+        let mut split = tx.clone();
+        let sb = split.bundle.as_mut().unwrap();
+        (sb.auth_commit, sb.auth_proof) = ([5; 8], vec![1; 77]);
+        let split = tx_json(&split, None, &StubExecutor)["bundle"].clone();
+        assert_eq!((&split["auth_commit"], &split["auth_proof_bytes"]), (&json!(word8_to_hex(&[5; 8])), &json!(77)));
         assert_eq!((&transfer["fee"], &transfer["time"]), (&json!(bundle_fee().to_string()), &json!(b.time)));
         assert_eq!(
             (&transfer["burn_a"], &transfer["burn_r"], &transfer["burn_asset"]),
@@ -6039,6 +6067,12 @@ mod tests {
         );
         assert_eq!(v["chain_id"], 7);
         assert!(v["hc_bundle"].is_string());
+        assert!(v["hc_auth"].is_null(), "no split authorisation on this chain");
+        {
+            st.status.write().unwrap().hc_auth = Some(word8_to_hex(&[9; 8]));
+        }
+        let v = ok(&st, "rand_getVersion", json!([])).await;
+        assert_eq!(v["hc_auth"], json!(word8_to_hex(&[9; 8])));
         assert!(v["fri_profile"].is_string());
     }
 

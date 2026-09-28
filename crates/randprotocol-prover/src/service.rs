@@ -20,7 +20,7 @@ use rand::Rng;
 use randprotocol_core::notes::{word8_to_hex, Word8};
 use randprotocol_core::types::TX_BINDING_WORDS;
 use randprotocol_zkvm::executor::{prove_bundle_for, ZkExecutor};
-use randprotocol_zkvm::hidden::hidden_input;
+use randprotocol_zkvm::hidden::{hidden_input, hidden_input_v3};
 use randprotocol_zkvm::machine::{Backend, FriProfile};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -192,7 +192,14 @@ impl Service {
             hc_bundles: ZkExecutor::known_hc_bundles().iter().map(word8_to_hex).collect(),
             profiles: vec!["test", "production"],
             backend: self.backend_name(),
-            witness_kinds: if self.cfg.accept_spend_key { vec![WitnessKind::SpendKey.as_str()] } else { vec![] },
+            // A viewing-key job (bundle guest v3, split authorisation) is always accepted: its
+            // witness holds `nk`, which can prove but never authorise a spend. A spend-key job
+            // (v1/v2) only behind `--accept-spend-key`.
+            witness_kinds: if self.cfg.accept_spend_key {
+                vec![WitnessKind::ViewingKey.as_str(), WitnessKind::SpendKey.as_str()]
+            } else {
+                vec![WitnessKind::ViewingKey.as_str()]
+            },
             queue: QueueInfo { depth, max: self.cfg.max_queue, proving },
             fee: None,
             allowed_origins: self.cfg.allowed_origins.to_list(),
@@ -214,24 +221,34 @@ impl Service {
             let pairings = self.cfg.pairings.read().unwrap();
             pairings.lookup(&job.token).ok_or(Refusal::Unpaired)?.label.clone()
         };
-        match job.witness_kind {
-            WitnessKind::SpendKey if !self.cfg.accept_spend_key => {
-                return Err(Refusal::WitnessKind("this prover does not accept spend-key witnesses".into()));
-            }
-            WitnessKind::SpendKey => {}
-            WitnessKind::ViewingKey => {
-                return Err(Refusal::WitnessKind("viewing-key witnesses are not supported: this build's bundle guests take a spend key".into()));
-            }
+        if job.witness_kind == WitnessKind::SpendKey && !self.cfg.accept_spend_key {
+            return Err(Refusal::WitnessKind("this prover does not accept spend-key witnesses".into()));
         }
         if !ZkExecutor::known_hc_bundles().contains(&job.hc_bundle) {
             return Err(Refusal::Bad(format!("unknown bundle guest {}", word8_to_hex(&job.hc_bundle))));
         }
+        // The witness kind follows the guest: bundle guest v3 (split authorisation) takes `nk` and
+        // a salt, v1/v2 take the spend key. A job whose kind does not match its guest is refused
+        // before its words are even counted, so a v3 job never runs with a spend key in it.
+        let v3 = job.hc_bundle == ZkExecutor::hc_hidden_bundle_v3();
+        let expected_words = match (job.witness_kind, v3) {
+            (WitnessKind::ViewingKey, true) => hidden_input_v3::COUNT,
+            (WitnessKind::SpendKey, false) => hidden_input::COUNT,
+            (WitnessKind::SpendKey, true) => {
+                return Err(Refusal::WitnessKind("a v3 guest takes nk — send a viewing-key witness".into()));
+            }
+            (WitnessKind::ViewingKey, false) => {
+                return Err(Refusal::WitnessKind(
+                    "viewing-key witnesses need bundle guest v3: this build's v1/v2 guests take a spend key".into(),
+                ));
+            }
+        };
         if ZkExecutor::profile_from_str(&job.profile).is_none() {
             // Not echoed: the profile string is the submitter's, and refusals reach logs and callers.
             return Err(Refusal::Bad("unknown fri profile".into()));
         }
-        if job.inputs.len() != hidden_input::COUNT {
-            return Err(Refusal::Bad(format!("witness of {} words, expected {}", job.inputs.len(), hidden_input::COUNT)));
+        if job.inputs.len() != expected_words {
+            return Err(Refusal::Bad(format!("witness of {} words, expected {expected_words}", job.inputs.len())));
         }
         let th = token_hash(&job.token);
         let kind = job.witness_kind;

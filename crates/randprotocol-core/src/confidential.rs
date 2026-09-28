@@ -176,6 +176,9 @@ pub trait ConfidentialExecutor: Send + Sync {
     ) -> Result<(), ConfidentialError>;
     /// Precompute the bundle verifier key. May be a no-op.
     fn warm_bundle(&self) {}
+    /// Precompute the auth guest's verifier key (split authorisation). May be a no-op. A node
+    /// calls it only on a chain whose genesis names `hc_auth`; no earlier chain needs the key.
+    fn warm_auth(&self) {}
     /// The v0.6 canonical-proof rules, for a bundle or a call proof alike: the first header or
     /// transcript field of `proof` that is not the value the honest prover writes, named, or
     /// `None`. A field the verifier does not bind to the statement lets anyone who relays a

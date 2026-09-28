@@ -42,7 +42,7 @@ fn job(token: [u8; 32]) -> ProveJob {
 async fn info_submit_status_cancel_over_json_rpc() {
     let (addr, ek, token, http) = start().await;
     let info = rpc(&http, addr, "prover_info", json!([])).await;
-    assert_eq!(info["result"]["witness_kinds"], json!(["spend_key"]));
+    assert_eq!(info["result"]["witness_kinds"], json!(["viewing_key", "spend_key"]));
     assert_eq!(info["result"]["queue"]["max"], 8);
     assert!(info["result"]["fee"].is_null());
     let j = job(token);

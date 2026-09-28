@@ -338,7 +338,7 @@ Params: `[]`. Result: the chain's five call limits and the envelope size, from i
 ```json
 { "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
   "max_call_envelope_bytes": 18432, "max_program_public_words": 0, "envelope_bytes": null,
-  "hardening_v6": false }
+  "hardening_v6": false, "hc_auth": null }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -360,6 +360,12 @@ program with a public input) instead of the public input alone —
 the fee bundle's notes chosen first, the call proved second, the bundle last; a chain with the flag
 refuses the old proof, a chain without it the new one. A node that predates the field answers
 without it, which a wallet reads as `false`.
+
+`hc_auth` is the auth guest the genesis pins (split authorisation, `docs/prover.md` §8), hex, or
+`null`. Set, the chain's `hc_bundle` is bundle guest v3 and every bundle carries `auth_commit` and
+an auth proof: a wallet gives the bundle guest `nk` and a fresh salt and proves the auth guest over
+the spend key and the same binding itself. A node that predates the field answers without it — a
+chain it runs has none.
 
 ### `rand_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
@@ -437,7 +443,8 @@ Params: `[hash]`. Result: `null` until committed, then:
       "nullifiers": ["8c04…d1", "5e77…20", "03aa…6f", "e19b…42"],
       "commitments": ["2a9f…07", "b310…88", "77c1…0e", "5d20…b3"],
       "fee": "1000000", "burn_a": "0", "burn_r": "0", "burn_asset": 0, "time": 5,
-      "proof_len": 1431562, "envelope_len": [1380, 1380, 1380, 1380]
+      "proof_len": 1431562, "envelope_len": [1380, 1380, 1380, 1380],
+      "auth_commit": "0000…00", "auth_proof_bytes": 0
     },
     "action": { "kind": "none" }
   }
@@ -627,7 +634,7 @@ Params: `[]`. Result:
   "verify_queue": 0, "mempool_size": 0,
   "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
   "fri_profile": "production", "programs": 2, "viewing_keys": 0,
-  "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19",
+  "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19", "hc_auth": null,
   "address": "2nRdFC…", "peer_id": "12D3KooW..."
 }
 ```
@@ -671,7 +678,8 @@ otherwise looks identical to a node that is behind and working:
 says that key is in the set running the current epoch (spec §8) — a validator that has bonded in
 but whose epoch has not arrived is the first without the second. `notes` is every note the chain has ever created, `nullifiers` every note
 it has ever spent, and `hc_bundle` the bundle guest this chain's proofs are against — a node whose
-build disagrees with the genesis value refuses to start at all.
+build disagrees with the genesis value refuses to start at all. `hc_auth` is the genesis auth guest
+(split authorisation) or `null`, checked against the build the same way.
 
 ### `rand_getPeers`
 Params: `[]`. Result: array of `{ "peer_id": "12D3KooW...", "addrs": ["/ip4/…/tcp/30303"], "connected_secs": 1241 }`.
@@ -904,7 +912,7 @@ Schedule 2 §3). Revokes already applied are counted; future ones cannot be.
 Params: `[]`. Result:
 ```json
 { "version": "0.1.0", "git_sha": "c66e6b8…", "chain_id": 12, "hc_bundle": "f07a…19",
-  "fri_profile": "production" }
+  "hc_auth": null, "fri_profile": "production" }
 ```
 `version` is the workspace crate version. `git_sha` is the full commit hash captured at build time
 by `randprotocol-node`'s `build.rs` — `git rev-parse HEAD` in a checkout, else the `.git-rev` file
@@ -1346,6 +1354,21 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### v0.6.3 — split authorisation: `hc_auth`, the bundle's auth fields, `rand-txid-3` (genesis-gated; chain 17+)
+
+- **`rand_status`, `rand_getVersion` and `rand_getLimits` gain `hc_auth`**: the genesis auth guest,
+  hex, or `null` on a chain without split authorisation. Set, `hc_bundle` is bundle guest v3 and a
+  wallet builds v3 transactions (`nk` + salt to the bundle guest, its own auth proof over the spend
+  key).
+- **`rand_getTransaction`'s `bundle` gains `auth_commit`** (hex, the public `c = H(AUTH, nk, salt)`;
+  zeros on a pre-v3 bundle) **and `auth_proof_bytes`** (the auth proof's length; `0` on a pre-v3
+  bundle).
+- **Every transaction id changes** (domain `rand-txid-3`, which binds `auth_commit` and the auth
+  proof's digest), on every chain this build runs; the bundle wire gains the two fields too. This
+  build therefore refuses chains 14–16 at startup and runs chain 17 on; a client that recomputes
+  ids locally must move with it. New permanent refusals: `AuthUnexpected`, `AuthMissing`,
+  `AuthMismatch`, `InvalidAuthProof`.
 
 ### 2026-09-28 — the v0.6 switch: `hardening_v6` in `rand_getLimits` (genesis-gated; on no chain yet)
 

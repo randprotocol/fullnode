@@ -3,7 +3,7 @@ use randprotocol_prover::pairing::Pairings;
 use randprotocol_prover::service::*;
 use randprotocol_prover::wire::*;
 use randprotocol_zkvm::executor::ZkExecutor;
-use randprotocol_zkvm::hidden::hidden_input;
+use randprotocol_zkvm::hidden::{hidden_input, hidden_input_v3};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -88,19 +88,59 @@ async fn an_unknown_token_is_refused_before_queueing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_spend_key_job_needs_the_flag_and_info_says_so() {
     let r = rig(false, 8, 1, Behaviour::Ok);
-    assert!(r.svc.info().witness_kinds.is_empty());
+    assert_eq!(r.svc.info().witness_kinds, vec!["viewing_key"], "viewing-key jobs (v3) are always accepted");
     let j = job(r.own_token, WitnessKind::SpendKey);
     assert!(matches!(r.svc.submit(&seal_job(&r.ek, &j).unwrap()), Err(Refusal::WitnessKind(_))));
     let r = rig(true, 8, 1, Behaviour::Ok);
-    assert_eq!(r.svc.info().witness_kinds, vec!["spend_key"]);
+    assert_eq!(r.svc.info().witness_kinds, vec!["viewing_key", "spend_key"]);
 }
 
+/// A job for bundle guest v3 (split authorisation): `nk` and a salt, 1 212 words.
+fn v3_job(token: [u8; 32], kind: WitnessKind) -> ProveJob {
+    let mut j = job(token, kind);
+    j.hc_bundle = ZkExecutor::hc_hidden_bundle_v3();
+    j.inputs = vec![77; hidden_input_v3::COUNT];
+    j
+}
+
+/// The witness kind follows the guest, whatever the flag: a viewing-key job for v3 is accepted
+/// (with or without `--accept-spend-key`), a spend-key job for v3 is refused (v3 takes `nk`), and
+/// a viewing-key job for v1/v2 is refused (those take a spend key).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_viewing_key_job_is_refused_in_this_build() {
+async fn the_witness_kind_follows_the_guest() {
+    for accept_spend_key in [false, true] {
+        let r = rig(accept_spend_key, 8, 1, Behaviour::Ok);
+        // v3 + viewing key: accepted, proved, replied.
+        let j = v3_job(r.token, WitnessKind::ViewingKey);
+        let reply_key = j.reply_key;
+        let id = r.svc.submit(&seal_job(&r.ek, &j).unwrap()).unwrap_or_else(|e| panic!("accept_spend_key {accept_spend_key}: {e:?}"));
+        let s = wait_terminal(&r.svc, &id).await;
+        assert_eq!(s.state, State::Done);
+        assert_eq!(open_reply(&reply_key, s.reply.as_ref().unwrap()).unwrap().digest, [77; 8]);
+        // v3 witness of the v1/v2 width: bad.
+        let mut short = v3_job(r.token, WitnessKind::ViewingKey);
+        short.inputs = vec![77; hidden_input::COUNT];
+        let Err(Refusal::Bad(e)) = r.svc.submit(&seal_job(&r.ek, &short).unwrap()) else { panic!() };
+        assert!(e.contains(&hidden_input_v3::COUNT.to_string()), "{e}");
+        // v1 and v2 + viewing key: refused.
+        for hc in [ZkExecutor::hc_hidden_bundle(), ZkExecutor::hc_hidden_bundle_v2()] {
+            let mut j = job(r.own_token, WitnessKind::ViewingKey);
+            j.hc_bundle = hc;
+            let Err(Refusal::WitnessKind(e)) = r.svc.submit(&seal_job(&r.ek, &j).unwrap()) else { panic!() };
+            assert!(e.contains("v1/v2 guests take a spend key"), "{e}");
+        }
+    }
+    // v3 + spend key: refused even where spend keys are accepted…
     let r = rig(true, 8, 1, Behaviour::Ok);
-    let j = job(r.own_token, WitnessKind::ViewingKey);
-    let Err(Refusal::WitnessKind(e)) = r.svc.submit(&seal_job(&r.ek, &j).unwrap()) else { panic!() };
-    assert!(e.contains("spend key"), "{e}");
+    let Err(Refusal::WitnessKind(e)) = r.svc.submit(&seal_job(&r.ek, &v3_job(r.own_token, WitnessKind::SpendKey)).unwrap()) else { panic!() };
+    assert!(e.contains("a v3 guest takes nk"), "{e}");
+    // …and, without the flag, refused as a spend-key job before the guest is looked at.
+    let r = rig(false, 8, 1, Behaviour::Ok);
+    let Err(Refusal::WitnessKind(e)) = r.svc.submit(&seal_job(&r.ek, &v3_job(r.own_token, WitnessKind::SpendKey)).unwrap()) else { panic!() };
+    assert!(e.contains("does not accept spend-key"), "{e}");
+    // v1 + spend key without the flag: refused (the flag is the gate).
+    let Err(Refusal::WitnessKind(_)) = r.svc.submit(&seal_job(&r.ek, &job(r.own_token, WitnessKind::SpendKey)).unwrap()) else { panic!() };
+    assert_eq!(r.svc.info().queue.depth, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

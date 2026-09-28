@@ -113,5 +113,67 @@ fn the_genesis_command_pins_guest_v2_and_the_v06_switch_when_asked() {
     randprotocol_node::node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).unwrap();
     let plain_state = p.build(executor.as_ref()).unwrap();
     assert_ne!(state.hash(), plain_state.hash(), "a different chain");
-    assert!(genesis(&dir.path().join("bad.json"), &["--bundle-guest", "v3"]).status.code() != Some(0), "an unknown guest is refused");
+    assert!(genesis(&dir.path().join("bad.json"), &["--bundle-guest", "v4"]).status.code() != Some(0), "an unknown guest is refused");
+}
+
+/// The genesis hash a `rand-node` run printed (`genesis hash <hex>` or `at genesis <hex>`).
+fn printed_hash(out: &Output, after: &str) -> String {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let at = stdout.find(after).unwrap_or_else(|| panic!("no {after:?} in {stdout}")) + after.len();
+    stdout[at..at + 64].to_string()
+}
+
+/// Split authorisation from the command line: `--bundle-guest v3 --auth-guest` pins bundle guest
+/// v3 and this build's auth guest as `hc_auth`; the two are a pair both ways — v3 alone and
+/// `--auth-guest` with v1/v2 are refused, writing nothing. The file it writes is one `rand-node
+/// init` accepts, re-deriving the hash the genesis command printed, and a node built from this
+/// tree runs it.
+#[test]
+fn the_genesis_command_pins_guest_v3_with_the_auth_guest() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let bare = dir.path().join("bare.json");
+    let run = genesis(&bare, &["--bundle-guest", "v3"]);
+    assert!(!run.status.success(), "v3 without --auth-guest must be refused");
+    assert!(String::from_utf8_lossy(&run.stderr).contains("--bundle-guest v3 needs --auth-guest"), "{}", String::from_utf8_lossy(&run.stderr));
+    assert!(!bare.exists(), "and nothing is written");
+    for guest in ["v1", "v2"] {
+        let wrong = dir.path().join(format!("{guest}.json"));
+        let run = genesis(&wrong, &["--bundle-guest", guest, "--auth-guest"]);
+        assert!(!run.status.success(), "{guest} --auth-guest must be refused");
+        assert!(String::from_utf8_lossy(&run.stderr).contains("--auth-guest needs --bundle-guest v3"), "{}", String::from_utf8_lossy(&run.stderr));
+        assert!(!wrong.exists());
+    }
+    let run = genesis(&dir.path().join("default.json"), &["--auth-guest"]);
+    assert!(!run.status.success(), "--auth-guest with the default guest (v1) is refused too");
+
+    let out = dir.path().join("split.json");
+    let run = genesis(&out, &["--bundle-guest", "v3", "--auth-guest", "--hardening-v6"]);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let gen = read(&out);
+    assert_eq!(gen.hc_bundle, word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()));
+    assert_eq!(gen.hc_auth, Some(word8_to_hex(&ZkExecutor::hc_auth())));
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains(&format!("hc_auth {}", word8_to_hex(&ZkExecutor::hc_auth()))), "the operator is told: {stdout}");
+    let executor = randprotocol_node::node::executor_for_profile(&gen.fri_profile).unwrap();
+    let state = gen.build(executor.as_ref()).unwrap();
+    assert_eq!(state.ledger.hc_auth(), Some(ZkExecutor::hc_auth()));
+    randprotocol_node::node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).unwrap();
+    let printed = printed_hash(&run, "genesis hash ");
+    assert_eq!(printed, state.hash().to_hex());
+
+    let datadir = dir.path().join("data");
+    let init = Command::new(env!("CARGO_BIN_EXE_rand-node"))
+        .args(["init", "--datadir"])
+        .arg(&datadir)
+        .arg("--genesis")
+        .arg(&out)
+        .output()
+        .expect("rand-node runs");
+    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+    assert_eq!(printed_hash(&init, "at genesis "), printed, "init re-derives the hash the genesis command printed");
+
+    let help = Command::new(env!("CARGO_BIN_EXE_rand-node")).args(["genesis", "--help"]).output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--auth-guest") && help.contains("v1|v2|v3"), "{help}");
 }

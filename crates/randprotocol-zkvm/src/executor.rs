@@ -1299,6 +1299,15 @@ impl ConfidentialExecutor for ZkExecutor {
         })
     }
 
+    /// The auth guest's one key ([`AUTH_TIER`], its pinned heights, no hash table) — the only key
+    /// `verify_auth_proof` ever asks `auth_machine` for.
+    fn warm_auth(&self) {
+        self.warming(|| {
+            let (plh, ilh, pubh) = Self::auth_heights();
+            let _ = self.auth_machine.verifier_key(Tier(AUTH_TIER), plh, ilh, NO_KECCAK, NO_SHA256, pubh);
+        })
+    }
+
     /// The bare zkVM executor cannot build or verify aggregate proofs: the rVM lives in
     /// `randprotocol-rvm`, which depends on this crate, so linking it here would be a crate cycle.
     /// `rand-node` wraps this executor with the rVM-backed aggregating one.

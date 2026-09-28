@@ -62,6 +62,18 @@ Both ends enforce the Phase 1 rule:
   receive it`. Every witness this build makes carries the spend key, so a prover paired without
   `--own` cannot be used at all in Phase 1.
 
+On a split-authorisation chain (genesis `hc_auth`, bundle guest v3 — §8) the job is a
+`ViewingKey` job instead: the wallet sends `nk` and a fresh 256-bit salt, never the spend key, and
+makes the tiny auth proof over `sk` itself. Every prover accepts viewing-key jobs, with or without
+`--accept-spend-key`, and the wallet may send one to **any** paired prover, `own=1` or not — the
+prover gates only by its flag and the job's kind; whether a pairing may receive a witness is the
+wallet's rule, not the prover's. The history warning above is the whole cost: whoever proves one
+v3 transaction for a wallet can read that wallet's entire history, past and future, so pair with a
+prover you would show your history to.
+
+The kind follows the guest, whichever flags are set: a `ViewingKey` job is refused for guests v1
+and v2 (they take a spend key), and a `SpendKey` job is refused for guest v3 (it takes `nk`).
+
 The prover is not trusted for correctness either: the wallet checks every proof it gets back (§5).
 
 ## 3. Run your own
@@ -104,7 +116,7 @@ wallet can take pasted text, paste the link instead.
 | option | default | meaning |
 |---|---|---|
 | `--listen <ADDR>` | `127.0.0.1:8600` | the listener, `ip:port` |
-| `--accept-spend-key` | off | accept `SpendKey` witnesses; only for wallets you own (§2) |
+| `--accept-spend-key` | off | accept `SpendKey` witnesses (guests v1/v2); only for wallets you own (§2). `ViewingKey` witnesses (guest v3) are accepted either way |
 | `--max-parallel <N>` | `1` | proofs run at once, one worker each; at least 1 |
 | `--max-queue <N>` | `8` | jobs waiting beyond those proving |
 | `--per-token <N>` | `2` | jobs one pairing may have queued or proving at once |
@@ -318,8 +330,9 @@ browser send.
 
 `prover_info`: `kem_ek` is the ML-KEM-768 encapsulation key in hex; `hc_bundles` are the bundle
 guests this build proves, in the hex form `rand_status.hc_bundle` serves; `profiles` is
-`["test", "production"]`; `backend` is `cpu` or `cuda`; `witness_kinds` is `["spend_key"]` with
-`--accept-spend-key` and `[]` without; `fee` is `null`; `allowed_origins` is the origin allow-list
+`["test", "production"]`; `backend` is `cpu` or `cuda`; `witness_kinds` is `["viewing_key",
+"spend_key"]` with `--accept-spend-key` and `["viewing_key"]` without (a viewing-key job proves
+bundle guest v3 only, §2); `fee` is `null`; `allowed_origins` is the origin allow-list
 above, or `["*"]`.
 
 `prover_status`: `position` (1-based) is present while `queued`; `reply` (hex of the sealed reply)
@@ -342,12 +355,12 @@ proving, `false` if it had already finished.
 | `-32000` | `bad job` | `data.reason`: too long, does not open under this key, malformed, wrong wire version, unknown bundle guest, unknown FRI profile, or a witness of the wrong length |
 | `-32001` | `unknown job` | `prover_status`/`prover_cancel` on an id the prover does not hold |
 | `-32003` | `the job's token is not paired with this prover` | |
-| `-32004` | `witness kind not accepted` | `data.reason`: spend-key witnesses refused (no `--accept-spend-key`), or a viewing-key witness (no guest in this build takes one) |
+| `-32004` | `witness kind not accepted` | `data.reason`: spend-key witnesses refused (no `--accept-spend-key`); a spend-key witness for guest v3 (`a v3 guest takes nk — send a viewing-key witness`); or a viewing-key witness for guest v1/v2 (`this build's v1/v2 guests take a spend key`) |
 | `-32005` | `busy` | `data: {depth, max}` — the pairing's cap or the queue is full |
 | `-32007` | `origin not allowed` | any method, from a request whose `Origin` header is not on the allow-list (§6.1); answered before the body is read as a request, without CORS headers |
 
-Admission runs cheap before expensive — size, open, pairing, witness kind, guest, profile,
-witness length, the pairing's cap, the queue's cap — and a refused job is zeroized before the
+Admission runs cheap before expensive — size, open, pairing, the spend-key flag, guest, the
+witness kind against the guest, profile, witness length, the pairing's cap, the queue's cap — and a refused job is zeroized before the
 answer goes out.
 
 ### 6.3 The sealed job and reply
@@ -370,13 +383,15 @@ ProveReply { proof: Vec<u8>, digest: Word8, tier: u8 }
 - The KEM is ML-KEM-768 to the prover's `kem_ek`; the primitives are the note envelope's
   (`randprotocol_zkvm::viewing`), at the same pinned versions.
 - A sealed job is at most `MAX_SEALED_JOB_BYTES`, 64 KiB; an honest one is about 5 KB
-  (1 100 bytes of KEM ciphertext and nonce plus 1 204 witness words).
+  (1 100 bytes of KEM ciphertext and nonce plus 1 204 witness words for guests v1/v2, 1 212 for
+  v3 — `nk` in the spend key's place, plus the eight salt words).
 - `reply_key` is 32 fresh random bytes per job, so only the wallet that sent the job opens the
   proof. The prover's job ids are its own 128 random bits.
 - A job sealed to another prover's key fails authentication (`does not open under this key`);
   ML-KEM's implicit rejection never errors on its own.
-- `inputs` must be exactly the bundle guest's witness length; `binding` is the transaction's
-  binding words, over which the proof is made.
+- `inputs` must be exactly the bundle guest's witness length (`hidden_input::COUNT` = 1 204 for
+  v1/v2, `hidden_input_v3::COUNT` = 1 212 for v3); `binding` is the transaction's binding words,
+  over which the proof is made.
 - Nothing binds a sealed job to one submission: anyone who captures one can replay it verbatim.
   That costs the pairing's per-token slots and one proof of the prover's time, and the reply is
   useless to the replayer — it is sealed to the wallet's `reply_key`.
@@ -441,8 +456,9 @@ Phase 2 (spec §4) moves the spend key out of the bundle guest into a second, ti
 wallet makes itself: an auth guest publishes `c = H(AUTH, nk, salt)` against the transaction's
 binding, and bundle guest v3 takes `nk` instead of `sk` and binds the same `c` into its digest. A
 prover then holds `nk` — enough to prove the bundle and to read the wallet's whole history, not
-enough to spend — so anyone may run one, and `witness_kind: ViewingKey`, refused by every prover
-today, becomes the normal job. It is a hard fork, selected at genesis by a new `hc_bundle` and an
-`hc_auth`, and it waits for the measurements in spec §4.2 (the auth proof roughly doubles a
-transaction's size). The implementation plan is
+enough to spend — so anyone may run one, and `witness_kind: ViewingKey` becomes the normal job:
+every prover from v0.6.3 accepts it for guest v3 (§2, §6.1). It is a hard fork, selected at genesis
+by `rand-node genesis --bundle-guest v3 --auth-guest` (the v3 `hc_bundle` and this build's
+`hc_auth`; `rand_status`/`rand_getLimits` serve `hc_auth`), and the auth proof roughly doubles a
+transaction's size (spec §4.2). The implementation plan is
 `docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md`.

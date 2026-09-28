@@ -355,6 +355,10 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.warm_bundle()
     }
 
+    fn warm_auth(&self) {
+        self.inner.warm_auth()
+    }
+
     /// Forwarded, like `max_callable_program_words` (a default would switch the rule off).
     fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
         self.inner.non_canonical_proof(proof)

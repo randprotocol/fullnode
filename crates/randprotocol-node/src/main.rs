@@ -366,9 +366,18 @@ enum Cmd {
         /// The bundle guest the chain pins as `hc_bundle`: `v1` (the hidden-asset guest chains 14
         /// and 15 run) or `v2`, the branch-free guest whose instruction and lookup counts do not
         /// depend on which input slots are real or on the spent leaves' indices (INT-2 / GV-1).
-        /// Both are the same statement and proof shape; this build verifies either.
-        #[arg(long, value_name = "v1|v2", default_value = "v1", value_parser = ["v1", "v2"])]
+        /// Both are the same statement and proof shape; this build verifies either. `v3` is the
+        /// split-authorisation guest (delegated proving Phase 2): it takes the viewing key's `nk`
+        /// and a salt instead of the spend key and publishes `c = H(AUTH, nk, salt)`, which a
+        /// second, tiny auth proof over the spend key must match — so it needs `--auth-guest`.
+        #[arg(long, value_name = "v1|v2|v3", default_value = "v1", value_parser = ["v1", "v2", "v3"])]
         bundle_guest: String,
+        /// Pin this build's auth guest as the genesis `hc_auth` (split authorisation): every
+        /// bundle then carries an auth proof over the spend key, bound to its transaction, whose
+        /// output equals the bundle's `auth_commit`. Required with `--bundle-guest v3` and refused
+        /// with `v1`/`v2` — the two come as a pair (only v3 publishes the commitment).
+        #[arg(long)]
+        auth_guest: bool,
         /// Turn on the v0.6 rules as validity rules (`hardening_v6`): the pc window, uncallable
         /// deploys, canonical proof shapes and proof-of-work words, the call binding and the
         /// program-table floor. Absent, a node still refuses those at its pool, as policy.
@@ -793,12 +802,28 @@ async fn main() -> Result<()> {
             envelope_bytes,
             vesting,
             bundle_guest,
+            auth_guest,
             hardening_v6,
         } => {
             let hc_bundle = match bundle_guest.as_str() {
+                "v3" => ZkExecutor::hc_hidden_bundle_v3(),
                 "v2" => ZkExecutor::hc_hidden_bundle_v2(),
                 _ => ZkExecutor::hc_bundle(),
             };
+            // Split authorisation pairs bundle guest v3 with the auth guest both ways (the node's
+            // `check_build_runs_genesis` would refuse either half alone at startup; say so here,
+            // before a file is written).
+            match (bundle_guest.as_str(), auth_guest) {
+                ("v3", false) => anyhow::bail!(
+                    "--bundle-guest v3 needs --auth-guest: v3 takes nk, not the spend key, and only an auth proof \
+                     pinned by the genesis hc_auth authorises its spends"
+                ),
+                (g, true) if g != "v3" => anyhow::bail!(
+                    "--auth-guest needs --bundle-guest v3: the {g} guest does not publish the auth commitment, \
+                     so no bundle on the chain could be admitted"
+                ),
+                _ => {}
+            }
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -892,10 +917,9 @@ async fn main() -> Result<()> {
                 // The v0.6 `hardening_v6` switch: absent unless asked for, so a genesis cut without
                 // it hashes byte-for-byte as before.
                 hardening_v6: hardening_v6.then_some(true),
-                // Split authorisation's auth guest: none from this command yet (`--auth-guest`
-                // with `--bundle-guest v3` is the next task's), so a genesis cut here hashes
-                // byte-for-byte as before.
-                hc_auth: None,
+                // Split authorisation's auth guest (`--auth-guest`, only with `--bundle-guest v3`):
+                // absent otherwise, so a genesis cut without it hashes byte-for-byte as before.
+                hc_auth: auth_guest.then(|| word8_to_hex(&ZkExecutor::hc_auth())),
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
@@ -913,7 +937,7 @@ async fn main() -> Result<()> {
             let state = gen.build(executor.as_ref())?;
             std::fs::write(&out, gen.to_json())?;
             println!(
-                "wrote {} (genesis hash {}, {} validators, {} notes, {} blocks/epoch, programs up to {} words, proofs up to {} bytes, blocks up to {} bytes, call envelopes up to {} bytes, program public input up to {} words, faucet {}, confidential {}, fri {}, hc_bundle {})",
+                "wrote {} (genesis hash {}, {} validators, {} notes, {} blocks/epoch, programs up to {} words, proofs up to {} bytes, blocks up to {} bytes, call envelopes up to {} bytes, program public input up to {} words, faucet {}, confidential {}, fri {}, hc_bundle {}, hc_auth {})",
                 out.display(),
                 state.hash(),
                 state.validators.len(),
@@ -928,6 +952,7 @@ async fn main() -> Result<()> {
                 if no_confidential { "off" } else { "on" },
                 state.fri_profile,
                 gen.hc_bundle,
+                gen.hc_auth.as_deref().unwrap_or("none"),
             );
         }
         Cmd::AllocNote { to, amount, asset, envelope_bytes } => {
@@ -947,7 +972,7 @@ async fn main() -> Result<()> {
         Cmd::Verify { datadir, mode, repair } => {
             let mode: VerifyMode = mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let (gs, executor) = node::load_genesis(&datadir)?;
-            node::refuse_pre_constraint_set_7(&gs)?;
+            node::refuse_chains_this_build_cannot_run(&gs)?;
             let storage = Storage::open(&datadir)?;
             let check = storage.verify_chain(&gs, mode, executor.as_ref())?;
             match &check.problem {
@@ -1766,19 +1791,31 @@ mod tests {
     /// and 15 committed verifies on this build. Both genesis files pin guest v1, which this build
     /// still carries (a new chain may pin it), so the `hc_bundle` check alone let a v0.6.1 binary
     /// start on either chain — and its startup replay would then refuse the chain's own history.
-    /// The startup guard names both chains and refuses them before any datadir is opened.
+    /// Chain 16 pins guest v2, also still carried, but this build (split authorisation) changes the
+    /// bundle wire and every transaction id, so it would fail at chain 16's first bundle. The
+    /// startup guard names all three and refuses them before any datadir is opened — at `run`
+    /// (`check_build_runs_genesis`) and `verify` (`refuse_chains_this_build_cannot_run`).
     #[test]
-    fn a_constraint_set_7_build_refuses_chain_14_and_chain_15() {
-        for (chain, file) in [(14, "genesis-chain14.json"), (15, "genesis-chain15.json")] {
+    fn this_build_refuses_chains_14_15_and_16() {
+        for (chain, file, why) in [
+            (14, "genesis-chain14.json", "constraint set 7"),
+            (15, "genesis-chain15.json", "constraint set 7"),
+            (16, "genesis-chain16.json", "rand-txid-3, split authorisation"),
+        ] {
             let path = format!("{}/../../deploy/{file}", env!("CARGO_MANIFEST_DIR"));
             let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
             let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
             let state = gen.build(executor.as_ref()).unwrap();
+            assert_eq!(state.chain_id, chain);
             assert!(ZkExecutor::known_hc_bundles().contains(&state.hc_bundle), "chain {chain} pins a guest this build carries");
             let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles())
-                .expect_err(&format!("a constraint-set-7 build must refuse chain {chain}"))
+                .expect_err(&format!("this build must refuse chain {chain} at run"))
                 .to_string();
-            assert!(refused.contains("constraint set 7") && refused.contains(&format!("chain {chain}")), "{refused}");
+            assert!(refused.contains(why) && refused.contains(&format!("chain {chain}")), "{refused}");
+            let at_verify = node::refuse_chains_this_build_cannot_run(&state)
+                .expect_err(&format!("this build must refuse chain {chain} at verify"))
+                .to_string();
+            assert_eq!(at_verify, refused, "run and verify give the same reason");
         }
     }
 
