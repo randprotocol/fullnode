@@ -106,6 +106,7 @@ async fn the_hosted_prover_answers_beside_the_node_and_its_exit_stops_the_node()
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
         prune_history: None,
+        gas_policy: None,
     })
     .await
     .expect("node starts");
@@ -177,6 +178,7 @@ async fn the_node_stops_cleanly_on_shutdown_with_its_prover() {
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
         prune_history: None,
+        gas_policy: None,
     })
     .await
     .unwrap();
