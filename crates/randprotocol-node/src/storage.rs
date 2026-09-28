@@ -95,7 +95,7 @@ const BRIDGE_CFS: [&str; 2] = [CF_BRIDGE_SPENT, CF_BRIDGE_BURNS];
 /// the transaction itself, in one of two forms. `Raw` is every record at commit. `Pruned` is
 /// the form a sealed bundle takes once the pruning pass (spec §6.2) has dropped its raw proof
 /// bytes — the transaction with `bundle.proof` replaced by [`PRUNED_PROOF_MARKER`] plus the
-/// proof's hash, the proof's hash again on its own, the 34 public values, and the declared
+/// proof's hash, the proof's hash again on its own, the `pv::NUM` (35) public values, and the declared
 /// shape, which is everything admission (§4 step 6) and the replay ever read of it afterwards.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TxRecord {
@@ -113,7 +113,7 @@ pub enum TxRecord {
         tx_hash: Hash,
         tx: Transaction,
         proof_hash: Hash,
-        /// The proof's 34 public values, in `pv` order — a `Vec` because serde's built-in array
+        /// The proof's `pv::NUM` (35) public values, in `pv` order — a `Vec` because serde's built-in array
         /// impls stop at 32; always exactly 34 (the pruning pass writes it, the readers assert it).
         public_values: Vec<u64>,
         shape: randprotocol_core::types::DeclaredShape,
@@ -1395,7 +1395,7 @@ impl Storage {
         self.get(CF_TXS, h.as_bytes())
     }
 
-    /// One covered bundle's admission record (spec §3.2's data half): its 34 public values and
+    /// One covered bundle's admission record (spec §3.2's data half): its `pv::NUM` (35) public values and
     /// declared shape — the `Raw` form's read off the stored proof, the `Pruned` form's off the
     /// record, so admission and the replay read one way regardless of pruning (spec §6.2's
     /// promise). No policy attached: finality, the window and sealing are the caller's checks
@@ -2585,7 +2585,7 @@ impl Storage {
                 // block carrying an `Aggregate` replays through the covered-carrying path, its
                 // records read from the store with no admission policy attached: the covered
                 // bundles may be sealed or pruned *now*, which says nothing about the block
-                // then — and the pruned record carries exactly the 34 public values and the
+                // then — and the pruned record carries exactly the `pv::NUM` (35) public values and the
                 // shape the apply reads (spec §6.2's proof, as code).
                 let mut sidecar = BTreeMap::new();
                 for (index, tx) in block.transactions.iter().enumerate() {
@@ -6766,7 +6766,7 @@ mod seal_tests {
         let raw_cb = make_block(&gs.block, &mut ledger, vec![raw.clone()], &key(1));
 
         // The block as a sealed-form peer serves it: the marker in place of the proof, and the
-        // side-table entry attesting the raw hash, the proof hash, 34 public values whose `OUT`
+        // side-table entry attesting the raw hash, the proof hash, `pv::NUM` (35) public values whose `OUT`
         // words are the bundle's digest, and a declared shape.
         let bundle = raw.bundle.as_ref().unwrap();
         let digest = StubExecutor.bundle_digest(&bundle.digest_input());
@@ -7040,7 +7040,7 @@ mod seal_tests {
         let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), register], &key(1));
         storage.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
 
-        // The covered record as the pruned form carries it: the 34 public values (with the
+        // The covered record as the pruned form carries it: the `pv::NUM` (35) public values (with the
         // guest's hc at HC0..7) and the registered shape.
         let hc_words: [u32; 8] = randprotocol_core::notes::word8_from_bytes(hc.as_bytes()).unwrap();
         let mut pv = [0u64; randprotocol_core::types::pv::NUM];

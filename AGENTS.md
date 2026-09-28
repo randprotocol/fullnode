@@ -4,192 +4,13 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-28)
+## Project memory (state as of 2026-09-29)
 
-### v0.6.2 — delegated proving, Phase 1 (2026-09-28; tag after chain 16 is live)
+### v0.6.5 — gas: Phase 1 + Phase 2 (constraint set 8), the chain-18 cut scripts (tagged 2026-09-29, NOT cut)
 
-A wallet's bundle proof made on a machine its owner runs (a desktop proving for a phone, a home
-server for a laptop). Spec `docs/superpowers/specs/2026-09-28-delegated-proving-design.md`, plan
-`docs/superpowers/plans/2026-09-28-delegated-proving-phase1.md`, user guide `docs/prover.md`;
-branch `feat/delegated-proving`, rebased onto main at `e1572cd` (v0.6.1 + two test fixes) and
-bumped to workspace version 0.6.2; the tag itself waits on chain 16 going live. **Trust model, in
-the spec's words: "delegating a proof is handing over custody"** — today's
-guest takes `sk` as a private input, so a Phase 1 prover can spend for every wallet it proves for.
-**What it is:**
-
-- **Crate `randprotocol-prover`**: the sealed wire (`wire.rs`, ML-KEM-768 + ChaCha20-Poly1305, the reply under a one-time key, the
-  pairing token inside the seal), the prover key and pairing store (`key.rs`, `pairing.rs`,
-  `randprover:` links, `own=1` only with `pair --own`), the queue (`service.rs`: per-pairing cap 2,
-  `max_queue` 8, `max_parallel` 1, witnesses zeroized; `Service::shutdown` drops the queue, lets a
-  proof in flight finish and discards its reply), the `prover_*` JSON-RPC listener (`http.rs`,
-  CORS by origin allow-list — default extensions + loopback pages, echoed with `Vary: Origin`; any
-  other `Origin` = 403 preflight and `-32007` to every method, so no website can read `kem_ek` as a
-  cross-site identifier of a desktop wallet; `--allow-origin`/`--prover-allow-origin`, `*` opt-in —
-  `serve_on` a pre-bound listener), a free-memory gate.
-  `prover_info` is unauthenticated; a Phase 1 prover's `fee` is `null`.
-- **Binary `rand-prover`** (`keygen`, `pair`, `unpair`, `pairings`, `run`; plain HTTP on `127.0.0.1:8600`, TLS by a
-  fronting proxy). `run` refuses every `SpendKey` job without `--accept-spend-key`, which prints its
-  sentence on stderr, not only in the log.
-- **`rand-node run --prover <ADDR>`** (`--prover-home`, `--prover-accept-spend-key`,
-  `--prover-max-parallel`, `--prover-max-queue`, `--prover-cuda`, `--prover-skip-memory-check`):
-  hosted by `hosted_prover` on **its own listener, never a method of the RPC** (an address equal
-  to `--rpc`, or a wildcard on its port, is refused); every check and the bind happen **before the
-  node key is read or the database opened**; a prover listener that exits stops the node. On the
-  way out: `Service::shutdown`, then the node, then the listener aborted (the order is
-  load-bearing — the other way admits jobs while stopping).
-- The listener's CORS is an origin allow-list (default: `chrome-extension://*`,
-  `moz-extension://*`, `safari-web-extension://*`, `http://localhost:*`, `http://127.0.0.1:*`,
-  `http://[::1]:*`; `--allow-origin` / `--prover-allow-origin` replace it; `*` only explicitly) so
-  no website can read the desktop wallet's prover key as a cross-site identifier — found by the
-  clients repo's final review.
-- **Wallet**: `Proving::Remote`, `rand prover pair|show|forget` (`<key>.prover.json`, 0600, one
-  pairing; `pair` checks the prover answers with the link's fingerprint), the global `--prover`
-  on every bundle-proving command (`call`: only the paying bundle moves; `--prover --cuda` refused
-  except `call`'s call proof). Checks: fingerprint, guest in `hc_bundles`, profile, `spend_key` in
-  `witness_kinds`, **`own=1` for a spend-key witness**; on the reply the size cap
-  (`max_proof_bytes`), **the digest read FROM THE PROOF's public values** (never the reply's field
-  — a tainted witness still proves), the field agrees, then a local `verify_bundle` by default
-  (`RAND_PROVER_NO_VERIFY=1` skips only that). URL rule: `https://` anywhere, `http://` only to
-  `localhost`/`127.0.0.1`/`[::1]`, userinfo refused, the parsed host is the one checked. Polls
-  retry through outages, give up (and cancel) after 20 min.
-- **NOT in it:** Phase 2 (split authorisation, `ViewingKey` jobs — the prover gets `nk`, can read but
-  not spend; needs a guest change and a genesis), fees (`fee: null`), any market or discovery.
-- **Roll: node-only and optional** — no consensus, wire or genesis change; `--prover` is off by
-  default. **One behaviour change every `rand-node` gets: SIGTERM is handled like ctrl-c** (graceful
-  `systemctl stop`, where it used to be killed outright); a unit with `--prover` wants
-  `TimeoutStopSec=180` (a proof in flight finishes, ~100 s).
-- **Traps found while building:** the chacha20poly1305 `zeroize` feature must be on or copies of
-  the cipher key survive; a hygiene test must not scan sealed ciphertext with short needles (random
-  hex matches — false positives); `Vec::zeroize` truncates, so assert `is_empty`, not all-zero; a
-  wallet must never trust the prover's claimed digest — read it off the proof; URL userinfo
-  (`http://localhost:80@evil.com/`) bypasses a host check unless the URL is parsed; tracing-only
-  warnings are silenceable by `RUST_LOG` — misconfiguration and the spend-key sentence go through
-  `eprintln!` too; the zkvm/mock-cuda tests do not build on the laptop because the sibling
-  `circuits` symlink points at `main` while the vendored code is constraint set 7
-  (`/private/tmp/circuits-cs7` is the matching checkout); a wrong Co-Authored-By trailer is fixed
-  with `git filter-branch` / `--amend`, not a new commit; the v0.6.1 tag's own test suite had two
-  stale assertions (the 0.6.0 version pin; the aggregation shape's public height 4 vs the 2^7
-  floor's 7) — fixed on main at `e1572cd`, test-only; a branch rebased onto a tag inherits the
-  tag's red tests until main is taken instead.
-- **Suite on the laptop**, measured on `feat/delegated-proving` rebased onto main `e1572cd`
-  (v0.6.1 + two test fixes): core 521+3; prover unit 6, bin 1, http 11, hygiene 2 (108–119 s, one
-  real proof), pairing 6, service 10, wire 11; client lib 135; node lib 374 with the 26
-  RECURSION_FIXTURES failures only; wallet_flow 7 (1733 s; one send proved through a paired prover
-  on a v2-guest chain); cluster 26 (1361 s); zusd_e2e 2 (1839 s); ws 9; genesis_cli 4; prover_flag
-  3; prover_hosted 4; submit 2; node bins 22; bridge-codec 4. The zkvm/rvm tests still do not build
-  on the laptop (the sibling `circuits` symlink points at `main` while the vendored code is
-  constraint set 7).
-- **Companions:** clients repo `feat/delegated-proving` — core `prepare_*`/`finish_proof`, the
-  engine's prover group with resume, Settings pairing, desktop "Prove for my other devices",
-  extension boot resume, a Node e2e wasm → `rand-prover` → node in 126 s; the clients also found
-  and fixed a hard-coded `production` FRI profile and a local path that always proved the v1 guest.
-- **Open (v0.6.3 / Phase 2):** `docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md`.
-
-### Chain 16 — LIVE 2026-09-28 16:39 UTC (genesis `20925ae6…3005`, build v0.6.1 `2c75e08`)
-
-Genesis `20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005`, chain id **16**, file
-`deploy/genesis-chain16.json` (sha256 `98036c41…d624`), cut by `deploy/cut-chain16-genesis.sh` with the
-macOS build of the tag (its v2 `hc_bundle` `651043e2…839b` checked equal to the Linux release
-binary's), rolled all-stop/all-start by `deploy/cutover-fleet-chain16.sh` over all 26 hosts. Chain 15
-stopped at ~157 370; its data dirs stay on every host for rollback (retire with
-`deploy/retire-chain-dirs.sh` after a day). `--hardening-v6 --bundle-guest v2`, `consensus_domain 1`,
-26 validators × 1000 RAND (quorum 18), `faucet_minters` = the 18 operator keys, the chain-15 faucet
-allowlist, no aggregation. Bridge: guardian set 1, burn sequence 7, `min_inbound_sequence`
-`{2:2,3:2,4:2,5:2}`, the CURRENT endpoints (the 2026-09-29 contract redeploy needs a later genesis to
-be usable); zUSD carried: 10 zUSD to Anish, locked Tron USDT 9 + Solana USDT 1, audited
-custody == locked == supply after launch. Relayer `rand_cli` → `~/rand-node-a/bin-v061/rand`
-(macOS v0.6.1), funded by 3 × 100 RAND faucet mints (blocks 593/600/608); all 8 guardians
-co-signing for chain 16. GitHub release v0.6.1: `rand-node` sha256 `aed1a3be…58ad6`, `rand`
-`1a6a0419…67ec5` (built on the testbox, Ubuntu 24.04). **Trap from the cut:** chaining
-`push … | tail && switch … | tail && start` let `start` run after `push` failed (`LOCAL_NODE`
-unset — `push` needs a local rand-node to re-derive the hash) — the pipe's exit status is `tail`'s;
-the fleet came back up on chain 15/v0.6 for a minute and was stopped again. Run each phase alone
-and read its rc.
-
-### v0.6.1 — constraint set 7 (2026-09-28; tagged `2c75e08`, released, chain 16's build)
-
-circuits `feat/cs7` at **`b9ffc39`** re-vendored by `deploy/sync-zkvm.sh` (CI `CIRCUITS_PIN` =
-PROVENANCE.md = `b9ffc39`). **A hard fork: v0.6.1 runs ONLY on a new genesis — chain 16.** Every
-verifier key, the AIR and the rVM's programs changed, so no chain-14/15 proof verifies on it; the
-node refuses both genesis hashes at `run` and `verify` (`node::PRE_CONSTRAINT_SET_7_CHAINS`), chains
-≤ 13 by their retired `hc_bundle`. **Keep chain 15 on v0.6** until the chain-16 cut
-(`deploy/cut-chain16-genesis.sh`, `--bundle-guest v2 --hardening-v6`).
-
-- **What cs7 is:** every LogUp terminal blinded (`BLIND` bus, five appended columns, `F_{p²}` blinds)
-  and **every declared table floored at 2^7** (program/input/public `MIN_LOG_HEIGHT` 7, keccak/sha256
-  ≥ 7) — INT-2 / GV-1; verifier keys salted from `key_derivation_v2` (HCS-1); 32-bit range checks on
-  input/public words and salt lanes (ZKM-1/ZKH-2); `POSEIDON2_LEN` syscall 7 (HCS-4); JALR bit 0
-  cleared + funct3 = 0 (ISA-4); guest-sdk arrays / unsafe poseidon2 (R4-b); the pc window on the
-  prover and in `Machine::verify` (#53); LRU single-flight key cache (#54); rVM in-circuit VERIFIER-1
-  and every chip's writes bound (#58).
-- **Pins (all measured on the testbox, 2026-09-28):** `hc_bundle` **unchanged** — v1 `83d3a370…0ef8`,
-  v2 `651043e2…839b` (`POSEIDON2` and the program digest did not move). `BUNDLE_PUBLIC_LOG_HEIGHT`
-  4 → **7** (the binding and the empty segment now declare the same height; a pre-binding bundle proof
-  is refused at `verify_bundle`, `PublicValues`, not on its header). `program_table_rows` floors at 128.
-  Admission stub vectors: inner vk digest `ee072b7a…fbe`, interface digest `6059c52a…a6ee` (on the cs7
-  fixture cache `/root/recursion-fixtures-cs7`). Production proofs: bundle v1 **1 498 821 B**, v2
-  **1 497 156 B** (tier 14); fib tier 10 1 367 688 / tier 12 1 424 299; keccak tier 10 3 283 898 —
-  **`MAX_PROOF_BYTES` stays 2 MiB**. `MAX_CALL_TIER` 14 and the DS-3 hash-table caps (12/13) unchanged:
-  the worst admissible call header's key (tier 14, 16/16/12/13/15) builds in 11.6 s / 295 MB peak against a
-  base tier-14 shape's 8.6 s / 220 MB on the loaded testbox — cs6's ratio (4.7 s vs 3.9 s, laptop), memory flat.
-- **Trap — proving got slower:** a Test-profile bundle proof took ~230 s on the testbox (shared with the
-  circuits suite). Three tests read the head height *before* waiting for the proving slot and outran
-  the bundle window (`wallet_flow`'s token mint, both `bridge_mint` helpers); take the slot first.
-- **Vendoring:** `tests/{evm,sbpf}_rt.rs` are now excluded by the script (they test circuits' sibling
-  `evm-rt`/`sbpf-rt` crates by `research/`-relative paths); `evm-core` is a dev-dependency again with
-  its `ffi` feature for `tests/evm_abi.rs`. `ledger.rs`'s RAND comments are restored after each rsync.
-
-### v0.6 — the zkVM / rVM / aggregation fixes and the v0.6 hardening (2026-09-28; roll status below)
-
-**TAGGED v0.6 = 12a56d1 and ROLLED 2026-09-28 23:36–23:46 UTC, all-stop / all-start** (`rand-node` sha256
-`2be892da…e793`, `rand` `d7d9f8b9…3071`, GitHub release v0.6, built on E in `/root/build06`): all 26 hosts staged the
-release binaries (sha-checked) with nodes running, stopped together at head 105 435, started together; committing again
-~23:39, all 26 healthy on 12a56d1 by 23:46 (block 105 818); public RPC 0.6.0; guardian daemons active. Before it, chain
-15's full history (104 850 blocks) was re-verified with the v0.6 binary (`rand-node verify --mode quick` on a copy of
-rand-archive-2) — no proof carries a non-zero commit-phase PoW word. Rollback: `/root/rand-node.pre-v06` and
-`/root/rand.pre-v06` on every host (= v0.5.10 0c0f4db), all-stop/all-start again. circuits main = 27732e9.
-Final checks on 12a56d1: the full suite on 06e688d (only the recursion-fixture tests, the OOM-bound rVM aggregate
-binary and the since-fixed TEST-1 failed), then core 518, zkvm lib 21, executor 19, verifier_key 2+1, node lib 351
-(21 fixture), genesis_cli 3, client 116, and guest v2's 21 real-proof cheats (HIDDEN_BUNDLE_GUEST=v2) — all green.
-Issues #16–#42, #47 closed with commits; open: #43–#46, #48–#52. Reports: ~/Downloads/Rand_zkVM_Bug_Fixes_Report_2026-09-28.pdf
-and the four updated scans (Rand_Recursion_VM_Security_2026-09-28_v3, Rand_zkVM_ISA_Security_Review_2026-09-28_v2,
-RandProtocol_Automated_Security_Scan_v3_2026-09-28, RandProtocol_Unified_Security_Scan_2026-09-28_v2).
-
-The fixes from the 27–28 September zk reviews (the internal *Recursion VM security* report and its
-v2, the *zkVM and ISA security review*, the automated/unified scans, and this session's seven-part
-zk scan), each red-first with the red quoted in its commit and re-confirmed by reverting the fix
-alone. Report: `~/Downloads/Rand_zkVM_Bug_Fixes_Report_2026-09-28.pdf`; issues #16–#41, #47.
-circuits: main `c6cdef4` + `feat/v0.5.11-zk` + `feat/v06-hcs` → pin `4bb4d9a` (CI's `CIRCUITS_PIN`).
-
-- **rVM (dormant; aggregation off everywhere):** RVM-1 (STOREE high lane), OPCODES-1 (reduce clock),
-  V-OPCODES-1 (reduce flags on padding), ZKR-4 (reduce run end), OPCODES-4, ZKQ-3, ZKQ-6. The
-  registered aggregate program's digest does NOT change; the rVM verifier and self-verifier pins do.
-- **zkVM privacy (COV-2 / INT-6, live):** the prover floors the input/keccak/sha256 tables at 2^7
-  (80 queries + 2 OOD < 128 random rows); nodes refuse to pool a call proof below it. Bundles were
-  never exposed that way. **INT-2 / GV-1** (LogUp totals: which bundle slots are real, leaf
-  popcounts): the branch-free guest v2 (`hc_bundle 651043e2…`), selected by a genesis
-  (`rand-node genesis --bundle-guest v2`); chain 15 stays on v1 — its docs now say what leaks.
-- **One next-cut switch, `hardening_v6`** (`rand-node genesis --hardening-v6`; hashed only when true, so
-  chain 15's hash is unchanged): pc window (ZKV-11), uncallable deploys (CPU-1, 8 184 words at tier
-  14), canonical proof shapes (INT-5, VERIFIER-2) and commit-phase PoW words (VERIFIER-1), the call
-  binding (INT-4), the program-table floor. Each except INT-4 and the floor is ALSO a pool policy now.
-- **Node-only:** CPUV-1 (bundle key in its own Machine, one warm-up at a time), HB-1, HB-3, admission
-  `catch_unwind`, ZKG-1/2, open-files limit raised at startup (#41), the ssh -A scripts retired (#47).
-- **Aggregation interface (dormant):** INTERFACE-1 (slashing retired), -2, -3, -4, -5, -6, -7,
-  IFACE-6/7/8/9, V-INTERFACE-2 (signing domain `rand-aggregate-2`), ZKQ-1/2/4.
-- **circuits hardening:** HCS-1 interim (rand `=0.10.2`, rand_core `=0.10.1`, verifier-key pins in
-  `tests/verifier_key.rs`), HCS-2/3, VERIFIER-1 in `Machine::verify`, ISA-5, AIR invariant tests.
-- **Deferred to chain 16 (they change verifier keys):** generic LogUp blinding, ZKM-1/ZKH-2 range
-  checks, HCS-4 padding, HCS-1's key_derivation_v2, the rVM's in-circuit VERIFIER-1; INTERFACE-9;
-  the end-to-end forged-aggregate exercise (#45, ≥64 GB).
-- **ROLL: all-stop, all-start** (the v0.5.6 procedure), NOT one at a time: `Machine::verify` now
-  refuses a non-zero commit-phase PoW word unconditionally (circuits VERIFIER-1), so a v0.5.x node
-  and a v0.6 node would disagree on a rewritten proof. Honest proofs carry zeros. Wallets ship with
-  the node: a v0.6 node refuses call proofs whose private tables are under 2^7 rows.
-- **Trap:** every executor trait method with a default must be forwarded by `AggExecutor`, the
-  executor every node runs (`the_wrapper_delegates_the_zkvm_surface`).
-
-### chain 18 — gas Phase 1 + Phase 2 (built 2026-09-29 on `feat/gas-chain18`, NOT cut)
+**v0.6.5 = v0.6.2 (the delegated prover) + gas Phase 0 (the v0.6.4 line, folded in: its own entry below) + this.**
+`feat/gas` was rebased onto the `v0.6.2` tag, then this branch's 26 chain-18 commits onto it; the
+workspace version is `0.6.5`.
 
 Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md` §4.2–4.3, §7.1; plan
 `docs/superpowers/plans/2026-09-28-gas-phase1-phase2-chain18.md` (A1–A6 circuits, B1–B8
@@ -198,7 +19,7 @@ fullnode, C1 deploy); live ledger
 Circuits worktree `/private/tmp/circuits-cs8` (branch `feat/cs8-gas`, **final `18c2627`, unpushed
 to origin**); fullnode worktree `/private/tmp/fullnode-gas18` (branch `feat/gas-chain18`, off
 `feat/gas`). Both Phase 0 (v0.6.4, node policy, see the entry
-below) and Phase 1+2 are unreleased — nothing here is live, nothing is tagged, nothing is rolled.
+below) and Phase 1+2 ship in v0.6.5 — nothing here is live, nothing is cut, nothing is rolled.
 
 **What it is.** One column, one public value in the cpu AIR (`pv::GAS = 34`, `pv::NUM 34 → 35`):
 `GAS` accumulates `1` per row plus `2` per Poseidon2 absorb row (`IS_HASH`), `191` per `KECCAK`
@@ -305,6 +126,15 @@ hidden_bundle` 25/25 (119 s); `cargo check --workspace --tests --release` clean.
 `--release`: gas 15, cheating 120, zk 3, tables 25, verifier_key 2, e2e 25 (3 ignored), 0 failed;
 recursion 179/0.
 
+**Release gate (v0.6.5, the rebased head, release profile, `RECURSION_FIXTURES` = the cs8 cache
+`fx2`):** core lib 549/549; node lib 392/392 (+1 ignored); `rand-node` bin 27/27 (+1 ignored);
+client lib 147/147; `rand` bin 17/17; zkvm `--test executor --skip measure` 17 passed / the 3
+known-stale failures above; node `submit` 2 (+1 ignored), `ws` 9/9, `prover_hosted` 4/4,
+`cluster a_dynamic_chain_decays…` 1/1 (18 s); `cargo check --workspace --tests --release` clean.
+Run together, each taking the proving slot in turn: the chain-18 capstone
+`a_chain18_genesis_prices_calls_by_their_declared_limit` 1/1 in **2 634 s** (595 s alone — it
+waited on the slot), `wallet_flow` 7/7 in **2 517 s** (the delegated-prover send included).
+
 **Cut order** (not yet run): push circuits `feat/cs8-gas` to origin → final whole-branch review →
 tag (`v0.6.5` unless the line has moved — named in `deploy/cut-chain18-genesis.sh`'s header and
 `deploy/cutover-fleet-chain18.sh`'s `TAG` default, not the spec, which names no version) →
@@ -316,7 +146,7 @@ cs8 changes only the STARK verifier key, not the hidden-asset guest's words) →
 website) needs a cs8 rebuild before or with the cut, same rule as every prior verifier-key fork —
 none of the built work here changes that rule.
 
-### v0.6.4 — gas, Phase 0: the header-priced call floor (2026-09-28, branch `feat/gas`, not tagged, not rolled)
+### v0.6.4 — gas, Phase 0: the header-priced call floor (2026-09-28; never tagged on its own — ships inside v0.6.5)
 
 Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md`, plan
 `…/plans/2026-09-28-gas-phase0-v0.6.4.md`. **Node policy only, any chain, rolls one node at a
@@ -362,10 +192,192 @@ this laptop); node bin 21/21; client lib 119/119; zkvm `tests/executor.rs` 19/19
 `cluster.rs` and `zusd_e2e` were not run and still start their nodes with `gas_policy: None`.
 
 Roll: wallets first (an old wallet against a policy node is refused with the floor named in the
-error), nodes a week later. Branch state: `feat/gas` off `origin/main` `aedf458` (v0.6); not
-tagged, not rolled. **Rebase `feat/gas` onto the `v0.6.1` tag before tagging** — the branch
-diverged before v0.6.1 and carries a one-line `CallOutcome` seam in `zkvm/src/executor.rs` (a
-fullnode-local file, not vendored) that the rebase must keep.
+error), nodes a week later. Branch state: `feat/gas` rebased onto the `v0.6.2` tag (it keeps the
+one-line `CallOutcome` seam in `zkvm/src/executor.rs`, a fullnode-local file); never tagged on its
+own — **it ships inside v0.6.5** (entry above), not rolled.
+
+### v0.6.2 — delegated proving, Phase 1 (2026-09-28; tag after chain 16 is live)
+
+A wallet's bundle proof made on a machine its owner runs (a desktop proving for a phone, a home
+server for a laptop). Spec `docs/superpowers/specs/2026-09-28-delegated-proving-design.md`, plan
+`docs/superpowers/plans/2026-09-28-delegated-proving-phase1.md`, user guide `docs/prover.md`;
+branch `feat/delegated-proving`, rebased onto main at `e1572cd` (v0.6.1 + two test fixes) and
+bumped to workspace version 0.6.2; the tag itself waits on chain 16 going live. **Trust model, in
+the spec's words: "delegating a proof is handing over custody"** — today's
+guest takes `sk` as a private input, so a Phase 1 prover can spend for every wallet it proves for.
+**What it is:**
+
+- **Crate `randprotocol-prover`**: the sealed wire (`wire.rs`, ML-KEM-768 + ChaCha20-Poly1305, the reply under a one-time key, the
+  pairing token inside the seal), the prover key and pairing store (`key.rs`, `pairing.rs`,
+  `randprover:` links, `own=1` only with `pair --own`), the queue (`service.rs`: per-pairing cap 2,
+  `max_queue` 8, `max_parallel` 1, witnesses zeroized; `Service::shutdown` drops the queue, lets a
+  proof in flight finish and discards its reply), the `prover_*` JSON-RPC listener (`http.rs`,
+  CORS by origin allow-list — default extensions + loopback pages, echoed with `Vary: Origin`; any
+  other `Origin` = 403 preflight and `-32007` to every method, so no website can read `kem_ek` as a
+  cross-site identifier of a desktop wallet; `--allow-origin`/`--prover-allow-origin`, `*` opt-in —
+  `serve_on` a pre-bound listener), a free-memory gate.
+  `prover_info` is unauthenticated; a Phase 1 prover's `fee` is `null`.
+- **Binary `rand-prover`** (`keygen`, `pair`, `unpair`, `pairings`, `run`; plain HTTP on `127.0.0.1:8600`, TLS by a
+  fronting proxy). `run` refuses every `SpendKey` job without `--accept-spend-key`, which prints its
+  sentence on stderr, not only in the log.
+- **`rand-node run --prover <ADDR>`** (`--prover-home`, `--prover-accept-spend-key`,
+  `--prover-max-parallel`, `--prover-max-queue`, `--prover-cuda`, `--prover-skip-memory-check`):
+  hosted by `hosted_prover` on **its own listener, never a method of the RPC** (an address equal
+  to `--rpc`, or a wildcard on its port, is refused); every check and the bind happen **before the
+  node key is read or the database opened**; a prover listener that exits stops the node. On the
+  way out: `Service::shutdown`, then the node, then the listener aborted (the order is
+  load-bearing — the other way admits jobs while stopping).
+- The listener's CORS is an origin allow-list (default: `chrome-extension://*`,
+  `moz-extension://*`, `safari-web-extension://*`, `http://localhost:*`, `http://127.0.0.1:*`,
+  `http://[::1]:*`; `--allow-origin` / `--prover-allow-origin` replace it; `*` only explicitly) so
+  no website can read the desktop wallet's prover key as a cross-site identifier — found by the
+  clients repo's final review.
+- **Wallet**: `Proving::Remote`, `rand prover pair|show|forget` (`<key>.prover.json`, 0600, one
+  pairing; `pair` checks the prover answers with the link's fingerprint), the global `--prover`
+  on every bundle-proving command (`call`: only the paying bundle moves; `--prover --cuda` refused
+  except `call`'s call proof). Checks: fingerprint, guest in `hc_bundles`, profile, `spend_key` in
+  `witness_kinds`, **`own=1` for a spend-key witness**; on the reply the size cap
+  (`max_proof_bytes`), **the digest read FROM THE PROOF's public values** (never the reply's field
+  — a tainted witness still proves), the field agrees, then a local `verify_bundle` by default
+  (`RAND_PROVER_NO_VERIFY=1` skips only that). URL rule: `https://` anywhere, `http://` only to
+  `localhost`/`127.0.0.1`/`[::1]`, userinfo refused, the parsed host is the one checked. Polls
+  retry through outages, give up (and cancel) after 20 min.
+- **NOT in it:** Phase 2 (split authorisation, `ViewingKey` jobs — the prover gets `nk`, can read but
+  not spend; needs a guest change and a genesis), fees (`fee: null`), any market or discovery.
+- **Roll: node-only and optional** — no consensus, wire or genesis change; `--prover` is off by
+  default. **One behaviour change every `rand-node` gets: SIGTERM is handled like ctrl-c** (graceful
+  `systemctl stop`, where it used to be killed outright); a unit with `--prover` wants
+  `TimeoutStopSec=180` (a proof in flight finishes, ~100 s).
+- **Traps found while building:** the chacha20poly1305 `zeroize` feature must be on or copies of
+  the cipher key survive; a hygiene test must not scan sealed ciphertext with short needles (random
+  hex matches — false positives); `Vec::zeroize` truncates, so assert `is_empty`, not all-zero; a
+  wallet must never trust the prover's claimed digest — read it off the proof; URL userinfo
+  (`http://localhost:80@evil.com/`) bypasses a host check unless the URL is parsed; tracing-only
+  warnings are silenceable by `RUST_LOG` — misconfiguration and the spend-key sentence go through
+  `eprintln!` too; the zkvm/mock-cuda tests do not build on the laptop because the sibling
+  `circuits` symlink points at `main` while the vendored code is constraint set 7
+  (`/private/tmp/circuits-cs7` is the matching checkout); a wrong Co-Authored-By trailer is fixed
+  with `git filter-branch` / `--amend`, not a new commit; the v0.6.1 tag's own test suite had two
+  stale assertions (the 0.6.0 version pin; the aggregation shape's public height 4 vs the 2^7
+  floor's 7) — fixed on main at `e1572cd`, test-only; a branch rebased onto a tag inherits the
+  tag's red tests until main is taken instead.
+- **Suite on the laptop**, measured on `feat/delegated-proving` rebased onto main `e1572cd`
+  (v0.6.1 + two test fixes): core 521+3; prover unit 6, bin 1, http 11, hygiene 2 (108–119 s, one
+  real proof), pairing 6, service 10, wire 11; client lib 135; node lib 374 with the 26
+  RECURSION_FIXTURES failures only; wallet_flow 7 (1733 s; one send proved through a paired prover
+  on a v2-guest chain); cluster 26 (1361 s); zusd_e2e 2 (1839 s); ws 9; genesis_cli 4; prover_flag
+  3; prover_hosted 4; submit 2; node bins 22; bridge-codec 4. The zkvm/rvm tests still do not build
+  on the laptop (the sibling `circuits` symlink points at `main` while the vendored code is
+  constraint set 7).
+- **Companions:** clients repo `feat/delegated-proving` — core `prepare_*`/`finish_proof`, the
+  engine's prover group with resume, Settings pairing, desktop "Prove for my other devices",
+  extension boot resume, a Node e2e wasm → `rand-prover` → node in 126 s; the clients also found
+  and fixed a hard-coded `production` FRI profile and a local path that always proved the v1 guest.
+- **Open (v0.6.3 / Phase 2):** `docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md`.
+
+### Chain 16 — LIVE 2026-09-28 16:39 UTC (genesis `20925ae6…3005`, build v0.6.1 `2c75e08`)
+
+Genesis `20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005`, chain id **16**, file
+`deploy/genesis-chain16.json` (sha256 `98036c41…d624`), cut by `deploy/cut-chain16-genesis.sh` with the
+macOS build of the tag (its v2 `hc_bundle` `651043e2…839b` checked equal to the Linux release
+binary's), rolled all-stop/all-start by `deploy/cutover-fleet-chain16.sh` over all 26 hosts. Chain 15
+stopped at ~157 370; its data dirs stay on every host for rollback (retire with
+`deploy/retire-chain-dirs.sh` after a day). `--hardening-v6 --bundle-guest v2`, `consensus_domain 1`,
+26 validators × 1000 RAND (quorum 18), `faucet_minters` = the 18 operator keys, the chain-15 faucet
+allowlist, no aggregation. Bridge: guardian set 1, burn sequence 7, `min_inbound_sequence`
+`{2:2,3:2,4:2,5:2}`, the CURRENT endpoints (the 2026-09-29 contract redeploy needs a later genesis to
+be usable); zUSD carried: 10 zUSD to Anish, locked Tron USDT 9 + Solana USDT 1, audited
+custody == locked == supply after launch. Relayer `rand_cli` → `~/rand-node-a/bin-v061/rand`
+(macOS v0.6.1), funded by 3 × 100 RAND faucet mints (blocks 593/600/608); all 8 guardians
+co-signing for chain 16. GitHub release v0.6.1: `rand-node` sha256 `aed1a3be…58ad6`, `rand`
+`1a6a0419…67ec5` (built on the testbox, Ubuntu 24.04). **Trap from the cut:** chaining
+`push … | tail && switch … | tail && start` let `start` run after `push` failed (`LOCAL_NODE`
+unset — `push` needs a local rand-node to re-derive the hash) — the pipe's exit status is `tail`'s;
+the fleet came back up on chain 15/v0.6 for a minute and was stopped again. Run each phase alone
+and read its rc.
+
+### v0.6.1 — constraint set 7 (2026-09-28; tagged `2c75e08`, released, chain 16's build)
+
+circuits `feat/cs7` at **`b9ffc39`** re-vendored by `deploy/sync-zkvm.sh` (CI `CIRCUITS_PIN` =
+PROVENANCE.md = `b9ffc39`). **A hard fork: v0.6.1 runs ONLY on a new genesis — chain 16.** Every
+verifier key, the AIR and the rVM's programs changed, so no chain-14/15 proof verifies on it; the
+node refuses both genesis hashes at `run` and `verify` (`node::OLDER_CONSTRAINT_SET_CHAINS`, named `PRE_CONSTRAINT_SET_7_CHAINS` until v0.6.5 added chain 16), chains
+≤ 13 by their retired `hc_bundle`. **Keep chain 15 on v0.6** until the chain-16 cut
+(`deploy/cut-chain16-genesis.sh`, `--bundle-guest v2 --hardening-v6`).
+
+- **What cs7 is:** every LogUp terminal blinded (`BLIND` bus, five appended columns, `F_{p²}` blinds)
+  and **every declared table floored at 2^7** (program/input/public `MIN_LOG_HEIGHT` 7, keccak/sha256
+  ≥ 7) — INT-2 / GV-1; verifier keys salted from `key_derivation_v2` (HCS-1); 32-bit range checks on
+  input/public words and salt lanes (ZKM-1/ZKH-2); `POSEIDON2_LEN` syscall 7 (HCS-4); JALR bit 0
+  cleared + funct3 = 0 (ISA-4); guest-sdk arrays / unsafe poseidon2 (R4-b); the pc window on the
+  prover and in `Machine::verify` (#53); LRU single-flight key cache (#54); rVM in-circuit VERIFIER-1
+  and every chip's writes bound (#58).
+- **Pins (all measured on the testbox, 2026-09-28):** `hc_bundle` **unchanged** — v1 `83d3a370…0ef8`,
+  v2 `651043e2…839b` (`POSEIDON2` and the program digest did not move). `BUNDLE_PUBLIC_LOG_HEIGHT`
+  4 → **7** (the binding and the empty segment now declare the same height; a pre-binding bundle proof
+  is refused at `verify_bundle`, `PublicValues`, not on its header). `program_table_rows` floors at 128.
+  Admission stub vectors: inner vk digest `ee072b7a…fbe`, interface digest `6059c52a…a6ee` (on the cs7
+  fixture cache `/root/recursion-fixtures-cs7`). Production proofs: bundle v1 **1 498 821 B**, v2
+  **1 497 156 B** (tier 14); fib tier 10 1 367 688 / tier 12 1 424 299; keccak tier 10 3 283 898 —
+  **`MAX_PROOF_BYTES` stays 2 MiB**. `MAX_CALL_TIER` 14 and the DS-3 hash-table caps (12/13) unchanged:
+  the worst admissible call header's key (tier 14, 16/16/12/13/15) builds in 11.6 s / 295 MB peak against a
+  base tier-14 shape's 8.6 s / 220 MB on the loaded testbox — cs6's ratio (4.7 s vs 3.9 s, laptop), memory flat.
+- **Trap — proving got slower:** a Test-profile bundle proof took ~230 s on the testbox (shared with the
+  circuits suite). Three tests read the head height *before* waiting for the proving slot and outran
+  the bundle window (`wallet_flow`'s token mint, both `bridge_mint` helpers); take the slot first.
+- **Vendoring:** `tests/{evm,sbpf}_rt.rs` are now excluded by the script (they test circuits' sibling
+  `evm-rt`/`sbpf-rt` crates by `research/`-relative paths); `evm-core` is a dev-dependency again with
+  its `ffi` feature for `tests/evm_abi.rs`. `ledger.rs`'s RAND comments are restored after each rsync.
+
+### v0.6 — the zkVM / rVM / aggregation fixes and the v0.6 hardening (2026-09-28; roll status below)
+
+**TAGGED v0.6 = 12a56d1 and ROLLED 2026-09-28 23:36–23:46 UTC, all-stop / all-start** (`rand-node` sha256
+`2be892da…e793`, `rand` `d7d9f8b9…3071`, GitHub release v0.6, built on E in `/root/build06`): all 26 hosts staged the
+release binaries (sha-checked) with nodes running, stopped together at head 105 435, started together; committing again
+~23:39, all 26 healthy on 12a56d1 by 23:46 (block 105 818); public RPC 0.6.0; guardian daemons active. Before it, chain
+15's full history (104 850 blocks) was re-verified with the v0.6 binary (`rand-node verify --mode quick` on a copy of
+rand-archive-2) — no proof carries a non-zero commit-phase PoW word. Rollback: `/root/rand-node.pre-v06` and
+`/root/rand.pre-v06` on every host (= v0.5.10 0c0f4db), all-stop/all-start again. circuits main = 27732e9.
+Final checks on 12a56d1: the full suite on 06e688d (only the recursion-fixture tests, the OOM-bound rVM aggregate
+binary and the since-fixed TEST-1 failed), then core 518, zkvm lib 21, executor 19, verifier_key 2+1, node lib 351
+(21 fixture), genesis_cli 3, client 116, and guest v2's 21 real-proof cheats (HIDDEN_BUNDLE_GUEST=v2) — all green.
+Issues #16–#42, #47 closed with commits; open: #43–#46, #48–#52. Reports: ~/Downloads/Rand_zkVM_Bug_Fixes_Report_2026-09-28.pdf
+and the four updated scans (Rand_Recursion_VM_Security_2026-09-28_v3, Rand_zkVM_ISA_Security_Review_2026-09-28_v2,
+RandProtocol_Automated_Security_Scan_v3_2026-09-28, RandProtocol_Unified_Security_Scan_2026-09-28_v2).
+
+The fixes from the 27–28 September zk reviews (the internal *Recursion VM security* report and its
+v2, the *zkVM and ISA security review*, the automated/unified scans, and this session's seven-part
+zk scan), each red-first with the red quoted in its commit and re-confirmed by reverting the fix
+alone. Report: `~/Downloads/Rand_zkVM_Bug_Fixes_Report_2026-09-28.pdf`; issues #16–#41, #47.
+circuits: main `c6cdef4` + `feat/v0.5.11-zk` + `feat/v06-hcs` → pin `4bb4d9a` (CI's `CIRCUITS_PIN`).
+
+- **rVM (dormant; aggregation off everywhere):** RVM-1 (STOREE high lane), OPCODES-1 (reduce clock),
+  V-OPCODES-1 (reduce flags on padding), ZKR-4 (reduce run end), OPCODES-4, ZKQ-3, ZKQ-6. The
+  registered aggregate program's digest does NOT change; the rVM verifier and self-verifier pins do.
+- **zkVM privacy (COV-2 / INT-6, live):** the prover floors the input/keccak/sha256 tables at 2^7
+  (80 queries + 2 OOD < 128 random rows); nodes refuse to pool a call proof below it. Bundles were
+  never exposed that way. **INT-2 / GV-1** (LogUp totals: which bundle slots are real, leaf
+  popcounts): the branch-free guest v2 (`hc_bundle 651043e2…`), selected by a genesis
+  (`rand-node genesis --bundle-guest v2`); chain 15 stays on v1 — its docs now say what leaks.
+- **One next-cut switch, `hardening_v6`** (`rand-node genesis --hardening-v6`; hashed only when true, so
+  chain 15's hash is unchanged): pc window (ZKV-11), uncallable deploys (CPU-1, 8 184 words at tier
+  14), canonical proof shapes (INT-5, VERIFIER-2) and commit-phase PoW words (VERIFIER-1), the call
+  binding (INT-4), the program-table floor. Each except INT-4 and the floor is ALSO a pool policy now.
+- **Node-only:** CPUV-1 (bundle key in its own Machine, one warm-up at a time), HB-1, HB-3, admission
+  `catch_unwind`, ZKG-1/2, open-files limit raised at startup (#41), the ssh -A scripts retired (#47).
+- **Aggregation interface (dormant):** INTERFACE-1 (slashing retired), -2, -3, -4, -5, -6, -7,
+  IFACE-6/7/8/9, V-INTERFACE-2 (signing domain `rand-aggregate-2`), ZKQ-1/2/4.
+- **circuits hardening:** HCS-1 interim (rand `=0.10.2`, rand_core `=0.10.1`, verifier-key pins in
+  `tests/verifier_key.rs`), HCS-2/3, VERIFIER-1 in `Machine::verify`, ISA-5, AIR invariant tests.
+- **Deferred to chain 16 (they change verifier keys):** generic LogUp blinding, ZKM-1/ZKH-2 range
+  checks, HCS-4 padding, HCS-1's key_derivation_v2, the rVM's in-circuit VERIFIER-1; INTERFACE-9;
+  the end-to-end forged-aggregate exercise (#45, ≥64 GB).
+- **ROLL: all-stop, all-start** (the v0.5.6 procedure), NOT one at a time: `Machine::verify` now
+  refuses a non-zero commit-phase PoW word unconditionally (circuits VERIFIER-1), so a v0.5.x node
+  and a v0.6 node would disagree on a rewritten proof. Honest proofs carry zeros. Wallets ship with
+  the node: a v0.6 node refuses call proofs whose private tables are under 2^7 rows.
+- **Trap:** every executor trait method with a default must be forwarded by `AggExecutor`, the
+  executor every node runs (`the_wrapper_delegates_the_zkvm_surface`).
 
 ### v0.5.10 — address sharing and the encrypted memo (2026-09-28)
 
