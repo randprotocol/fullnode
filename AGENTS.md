@@ -6,13 +6,14 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-28)
 
-### v0.6.2 — delegated proving, Phase 1 (2026-09-28; tag pending v0.6.1 / chain 16)
+### v0.6.2 — delegated proving, Phase 1 (2026-09-28; tag after chain 16 is live)
 
 A wallet's bundle proof made on a machine its owner runs (a desktop proving for a phone, a home
 server for a laptop). Spec `docs/superpowers/specs/2026-09-28-delegated-proving-design.md`, plan
 `docs/superpowers/plans/2026-09-28-delegated-proving-phase1.md`, user guide `docs/prover.md`;
-branch `feat/delegated-proving`, to be rebased onto the `v0.6.1` tag and bumped to 0.6.2 before the
-tag. **Trust model, in the spec's words: "delegating a proof is handing over custody"** — today's
+branch `feat/delegated-proving`, rebased onto main at `e1572cd` (v0.6.1 + two test fixes) and
+bumped to workspace version 0.6.2; the tag itself waits on chain 16 going live. **Trust model, in
+the spec's words: "delegating a proof is handing over custody"** — today's
 guest takes `sk` as a private input, so a Phase 1 prover can spend for every wallet it proves for.
 **What it is:**
 
@@ -29,12 +30,18 @@ guest takes `sk` as a private input, so a Phase 1 prover can spend for every wal
 - **Binary `rand-prover`** (`keygen`, `pair`, `unpair`, `pairings`, `run`; plain HTTP on `127.0.0.1:8600`, TLS by a
   fronting proxy). `run` refuses every `SpendKey` job without `--accept-spend-key`, which prints its
   sentence on stderr, not only in the log.
-- **`rand-node run --prover <ADDR>`** (`--prover-home`, `-accept-spend-key`, `-max-parallel`,
-  `-max-queue`, `-cuda`, `-skip-memory-check`): hosted by `hosted_prover` on **its own listener,
-  never a method of the RPC** (an address equal to `--rpc`, or a wildcard on its port, is refused);
-  every check and the bind happen **before the node key is read or the database opened**; a
-  prover listener that exits stops the node. On the way out: `Service::shutdown`, then the node,
-  then the listener aborted (the order is load-bearing — the other way admits jobs while stopping).
+- **`rand-node run --prover <ADDR>`** (`--prover-home`, `--prover-accept-spend-key`,
+  `--prover-max-parallel`, `--prover-max-queue`, `--prover-cuda`, `--prover-skip-memory-check`):
+  hosted by `hosted_prover` on **its own listener, never a method of the RPC** (an address equal
+  to `--rpc`, or a wildcard on its port, is refused); every check and the bind happen **before the
+  node key is read or the database opened**; a prover listener that exits stops the node. On the
+  way out: `Service::shutdown`, then the node, then the listener aborted (the order is
+  load-bearing — the other way admits jobs while stopping).
+- The listener's CORS is an origin allow-list (default: `chrome-extension://*`,
+  `moz-extension://*`, `safari-web-extension://*`, `http://localhost:*`, `http://127.0.0.1:*`,
+  `http://[::1]:*`; `--allow-origin` / `--prover-allow-origin` replace it; `*` only explicitly) so
+  no website can read the desktop wallet's prover key as a cross-site identifier — found by the
+  clients repo's final review.
 - **Wallet**: `Proving::Remote`, `rand prover pair|show|forget` (`<key>.prover.json`, 0600, one
   pairing; `pair` checks the prover answers with the link's fingerprint), the global `--prover`
   on every bundle-proving command (`call`: only the paying bundle moves; `--prover --cuda` refused
@@ -60,12 +67,18 @@ guest takes `sk` as a private input, so a Phase 1 prover can spend for every wal
   `eprintln!` too; the zkvm/mock-cuda tests do not build on the laptop because the sibling
   `circuits` symlink points at `main` while the vendored code is constraint set 7
   (`/private/tmp/circuits-cs7` is the matching checkout); a wrong Co-Authored-By trailer is fixed
-  with `git filter-branch` / `--amend`, not a new commit.
-- **Suite on the laptop (pre-rebase):** core 521+3, prover 1+4+2+6+9+11 (hygiene 108 s), client lib
-  130→135, node lib 374 with 26 fixture-gap failures (RECURSION_FIXTURES), wallet_flow 7 (1625 s;
-  one send proved through a paired prover on a v2-guest chain), cluster 26 (1319 s), zusd_e2e 2
-  (1767 s), ws 9, genesis_cli 3, prover_flag 2, prover_hosted 3, submit 2, node bins 21,
-  bridge-codec 4.
+  with `git filter-branch` / `--amend`, not a new commit; the v0.6.1 tag's own test suite had two
+  stale assertions (the 0.6.0 version pin; the aggregation shape's public height 4 vs the 2^7
+  floor's 7) — fixed on main at `e1572cd`, test-only; a branch rebased onto a tag inherits the
+  tag's red tests until main is taken instead.
+- **Suite on the laptop**, measured on `feat/delegated-proving` rebased onto main `e1572cd`
+  (v0.6.1 + two test fixes): core 521+3; prover unit 6, bin 1, http 11, hygiene 2 (108–119 s, one
+  real proof), pairing 6, service 10, wire 11; client lib 135; node lib 374 with the 26
+  RECURSION_FIXTURES failures only; wallet_flow 7 (1733 s; one send proved through a paired prover
+  on a v2-guest chain); cluster 26 (1361 s); zusd_e2e 2 (1839 s); ws 9; genesis_cli 4; prover_flag
+  3; prover_hosted 4; submit 2; node bins 22; bridge-codec 4. The zkvm/rvm tests still do not build
+  on the laptop (the sibling `circuits` symlink points at `main` while the vendored code is
+  constraint set 7).
 - **Companions:** clients repo `feat/delegated-proving` — core `prepare_*`/`finish_proof`, the
   engine's prover group with resume, Settings pairing, desktop "Prove for my other devices",
   extension boot resume, a Node e2e wasm → `rand-prover` → node in 126 s; the clients also found
