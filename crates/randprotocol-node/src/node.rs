@@ -515,8 +515,9 @@ fn sealed_form_of(storage: &Storage, cb: &CommittedBlock) -> CommittedBlock {
     let mut pruned = Vec::new();
     for tx in &mut block.transactions {
         // The record is keyed by the raw hash, which is `tx.hash()` for a raw-stored tx;
-        // for a marker-form one (this block itself arrived sealed), the record is found by
-        // the proof hash the marker carries.
+        // for a marker-form one (this block arrived sealed, or this node pruned it — the pass
+        // shrinks the block row with the record, INTERFACE-9), the record is found by the proof
+        // hash the marker carries.
         let key = match tx.bundle.as_ref().and_then(|b| randprotocol_core::notes::pruned_proof_hash(&b.proof)) {
             Some(ph) => match storage.tx_hash_by_proof_hash(&ph) {
                 Ok(Some(k)) => k,
@@ -5464,6 +5465,71 @@ mod tests {
         // Unclosed, so the fresh syncer's answer is the fallback — the archive case, pinned
         // in `the_sealed_coverage_rule_accepts_marks_and_batch_and_falls_back_otherwise`.
         assert!(accepted_by_a_fresh_store(&batch).unwrap_err().downcast_ref::<RawFallback>().is_some());
+    }
+
+    /// INTERFACE-9 (issue #51): the pruning pass now shrinks the block row with the record, so
+    /// a node serves its own pruned history from a marker-form row, exactly as a node that
+    /// synced it in sealed form always has. The serve path must not notice: the same marker
+    /// form and side entry as the record, a batch cut short of the cover still extends until
+    /// the coverage closes, and a fresh syncer accepts it. Stub-proved end to end (the pass's
+    /// reader is `stub_proof_reader`), so it runs without a recursion fixture — the stub twin
+    /// of `a_batch_cut_short_of_its_cover_extends_until_the_coverage_closes`.
+    #[test]
+    fn a_block_row_this_node_pruned_serves_coverage_closed_like_a_sealed_synced_one() {
+        use crate::storage::TxRecord;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = genesis_of(7, &[&key(1)], vec![], 2);
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger_after = gs.ledger.clone();
+        let mut covered: Option<Transaction> = None;
+        let mut parent = gs.block.clone();
+        let mut blocks = Vec::new();
+        for h in 1..=5u64 {
+            ledger_after.set_height(h);
+            ledger_after.set_timestamp_ms(h);
+            let stored: Vec<Transaction> = match h {
+                2 => {
+                    let tx = bundle_tx(&ledger_after, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee());
+                    ledger_after.apply_transactions(std::slice::from_ref(&tx), &key(1).address(), &StubExecutor).unwrap();
+                    covered = Some(tx.clone());
+                    vec![tx]
+                }
+                5 => vec![aggregate_tx(7, &key(7), 0, 1, vec![covered.as_ref().unwrap().hash()], b"ok".to_vec())],
+                _ => vec![],
+            };
+            ledger_after.record_anchor(h);
+            let cb = make_block_unchecked(&parent, &ledger_after, stored, &key(1));
+            parent = cb.block.clone();
+            blocks.push(cb);
+        }
+        storage.commit(&blocks, &ledger_after, &[], &StubExecutor).unwrap();
+        let covered = covered.unwrap();
+        assert_eq!(storage.sealed_by(&covered.hash()).unwrap().map(|(_, at)| at), Some(5), "the aggregate's commit sealed it");
+        let reader = crate::storage::fixtures::stub_proof_reader(std::slice::from_ref(&covered));
+        assert_eq!(storage.prune_sealed_with(5 + 256, 256, u64::MAX, &reader).unwrap(), 1);
+
+        // The block row is the marker form now, under the certified root.
+        let row = storage.block_by_height(2).unwrap().unwrap();
+        let Some(TxRecord::Pruned { tx: marker_tx, proof_hash, public_values, shape, .. }) = storage.tx_record(&covered.hash()).unwrap()
+        else {
+            panic!("the record is pruned")
+        };
+        assert_eq!(row.transactions, vec![marker_tx.clone()], "the block row shrank with the record");
+        assert_eq!(row.hash(), blocks[1].block.hash());
+
+        // Served from that row: the record's form and its side entry.
+        let served = sealed_form_of(&storage, &storage.committed_block(2).unwrap().unwrap());
+        assert_eq!(served.block.transactions, vec![marker_tx]);
+        assert_eq!(served.pruned.len(), 1);
+        let side = &served.pruned[0];
+        assert_eq!((side.tx_hash, side.proof_hash, &side.public_values, side.shape), (covered.hash(), proof_hash, &public_values, shape));
+
+        // Coverage-closed: a count cut at 3 extends to the aggregate at 5, and a fresh store takes it.
+        let batch = serve_blocks(&storage, 3);
+        assert_eq!(batch.last().unwrap().block.height(), 5, "the extension closed the coverage");
+        assert_eq!(batch[1].pruned[0].tx_hash, covered.hash());
+        accepted_by_a_fresh_store(&batch).expect("a coverage-closed batch is accepted");
     }
 
     /// The worker arm's ordering (cheap before expensive, and bytes before storage): the wire
