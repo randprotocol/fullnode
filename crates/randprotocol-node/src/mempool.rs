@@ -562,10 +562,11 @@ impl Mempool {
         // order sorted the emergency brake behind every transaction that pays, which is the
         // wrong end of a block while a compromised guardian set is minting.
         //
-        // The surplus-per-KiB key applies only under a gas policy: a node without one orders
-        // exactly as before the gas work (governance, total fee, hash), so switching the policy
-        // off is a true no-op.
-        let priced = self.gas_policy.is_some();
+        // The surplus-per-KiB key applies under a gas policy or on a chain whose genesis carries
+        // the `gas` section (calls are priced there by the ledger's own rule, and each pooled
+        // floor is that rule's): a node without either orders exactly as before the gas work
+        // (governance, total fee, hash), so switching the policy off is a true no-op there.
+        let priced = self.gas_policy.is_some() || ledger.gas().is_some();
         let surplus_per_kib = |p: &Pooled| {
             if priced {
                 (p.tx.fee().saturating_sub(p.floor) as u128 * 1024) / p.len.max(1) as u128
@@ -2637,5 +2638,73 @@ mod tests {
         let transfer_hash = m.insert(transfer, &ledger, &StubExecutor).unwrap();
         let picked: Vec<Hash> = m.candidates(&ledger, 10).iter().map(|t| t.hash()).collect();
         assert_eq!(picked, vec![transfer_hash, call_hash], "more surplus per KiB first, not more surplus");
+    }
+
+    /// Controller ruling (B3 review): under the genesis `gas` section calls are priced, so the
+    /// pool orders by surplus per KiB even on a node without a gas policy. The same shape as
+    /// `candidates_order_by_surplus_per_kib_not_by_absolute_surplus`, no policy, a fixed section.
+    #[test]
+    fn under_the_gas_section_candidates_order_by_surplus_per_kib_without_a_policy() {
+        use randprotocol_core::gas::{self, GasConfig, GasMetering};
+        let section = GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 16_383, metering: GasMetering::Circuit, dynamic: None };
+        let with_section = |(mut l, pid, tx): (Ledger, randprotocol_core::program::ProgramId, Transaction)| {
+            l.set_gas(Some(section.clone()));
+            (l, pid, tx)
+        };
+        let (ledger, _, probe) = with_section(program_and_call(12, 0, 50));
+        let floor_c = ledger.gas_call_floor(gas::gas_max(12, 0, 0), {
+            let Action::Call { proof, .. } = &probe.action else { unreachable!() };
+            proof.len()
+        })
+        .unwrap();
+        let floor_t = gas::fee_floor(&Action::None);
+        let len_t = fixtures::bundle_tx(&ledger, [[80; 8], [81; 8]], [[82; 8], [83; 8]], 0).encoded_len();
+        let len_c = probe.encoded_len();
+        assert!(len_c > len_t, "the call is the bigger transaction ({len_c} vs {len_t} B)");
+        let s_t: u64 = 10_000_000;
+        let s_c = s_t + (s_t as u128 * (len_c - len_t) as u128 / len_t as u128 / 2) as u64;
+        let (ledger, _, call) = with_section(program_and_call(12, floor_c + s_c, 50));
+        let transfer = fixtures::bundle_tx(&ledger, [[80; 8], [81; 8]], [[82; 8], [83; 8]], floor_t + s_t);
+        assert!(call.fee() > transfer.fee(), "total-fee order would put the call first");
+        let per_kib = |s: u64, len: usize| s as u128 * 1024 / len as u128;
+        assert!(per_kib(s_c, len_c) < per_kib(s_t, len_t), "but it has less surplus per KiB");
+        let mut m = Mempool::new(64);
+        let call_hash = m.insert(call, &ledger, &StubExecutor).unwrap();
+        let transfer_hash = m.insert(transfer, &ledger, &StubExecutor).unwrap();
+        let picked: Vec<Hash> = m.candidates(&ledger, 10).iter().map(|t| t.hash()).collect();
+        assert_eq!(picked, vec![transfer_hash, call_hash], "more surplus per KiB first, with no node policy");
+    }
+
+    /// B3 review: `call_floor` decodes a hardened call over the ledger's own segment — a
+    /// program's deploy-time public words, then the call binding (issue #55) — so a call to a
+    /// program WITH a public input is priced at the rule's floor, not refused `InvalidProof`.
+    #[test]
+    fn a_hardened_call_to_a_public_input_program_is_priced_not_refused() {
+        use randprotocol_core::gas::{self, GasConfig, GasMetering, GasPolicy};
+        let gs = fixtures::genesis(1);
+        let mut ledger = gs.ledger.clone();
+        ledger.set_max_program_public_words(64);
+        let words = vec![0x13u32; 4];
+        let public = vec![0xdead_beefu32; 3];
+        let pid = randprotocol_core::program::program_id_with_public(0, &words, &public);
+        let deploy = Action::Deploy { base_pc: 0, words, public: public.clone() };
+        let b = fixtures::bundle_tx(&ledger, [[40; 8], [41; 8]], [[42; 8], [43; 8]], gas::fee_floor(&deploy)).bundle.expect("bundle");
+        let deploy = StubExecutor::bound(Transaction::shielded(gs.chain_id, b, deploy));
+        ledger.apply_tx(&deploy, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        ledger.record_anchor(ledger.height());
+        ledger.set_hardening_v6(true);
+        ledger.set_gas(Some(GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 16_383, metering: GasMetering::Circuit, dynamic: None }));
+        let stub_len = StubExecutor::make_proof_with_public(&pid, 12, [7; 8], &public).len();
+        let floor = gas::circuit_call_floor(100, 800, gas::gas_max(12, 0, 0), stub_len);
+        let b = fixtures::bundle_tx(&ledger, [[60; 8], [61; 8]], [[62; 8], [63; 8]], floor).bundle.expect("bundle");
+        let mut call = Transaction::shielded(ledger.chain_id(), b, Action::Call { program: pid, proof: vec![], input_envelope: None });
+        let segment = [public.as_slice(), call.call_binding().as_slice()].concat();
+        let proof = StubExecutor::make_proof_with_public(&pid, 12, [7; 8], &segment);
+        let Action::Call { proof: p, .. } = &mut call.action else { unreachable!() };
+        *p = proof;
+        let call = StubExecutor::bound(call);
+        assert_eq!(ledger.validate(&call, &StubExecutor), Ok(()), "the ledger accepts the call at the floor");
+        assert_eq!(crate::admission::call_floor(&call, &ledger, &StubExecutor, &GasPolicy::DEFAULT), Ok(floor));
+        assert_eq!(Mempool::new(64).precheck(&call, &ledger, &StubExecutor).unwrap().floor, floor);
     }
 }
