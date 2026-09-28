@@ -302,6 +302,56 @@ circuits: main `c6cdef4` + `feat/v0.5.11-zk` + `feat/v06-hcs` → pin `4bb4d9a` 
 - **Trap:** every executor trait method with a default must be forwarded by `AggExecutor`, the
   executor every node runs (`the_wrapper_delegates_the_zkvm_surface`).
 
+### v0.6.4 — gas, Phase 0: the header-priced call floor (2026-09-28, branch `feat/gas`, not tagged, not rolled)
+
+Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md`, plan
+`…/plans/2026-09-28-gas-phase0-v0.6.4.md`. **Node policy only, any chain, rolls one node at a
+time; no ledger rule, no genesis field, no wire change.** A call pays
+`max(BUNDLE_BASE + call_fee, BUNDLE_BASE + gas_price·gas_max(header) + byte_price·KiB)`
+(`gas::GasPolicy`, `gas::gas_max`), demanded by the pool at `precheck`/`insert`
+(`admission::call_floor`, `FeeTooLow` non-permanent) and announced by `rand_getLimits`
+(`gas_price`, `byte_price`, `gas_metering: "header"`); `rand_estimateFee` takes the two hash
+heights; the wallet pays the floor of the proof it just made. Candidates order by fee above the
+admitted floor per KiB, but **only when a policy is set** — `--gas-price 0 --byte-price 0` (no
+policy, `GasPolicy::from_prices` → `None`) orders exactly as before: governance, total fee
+descending, hash (`mempool.rs`'s `candidates_within`, pinned by `zero_prices_mean_no_policy`).
+
+**Trap (final review C1, fixed cf8effe):** `admission::call_floor` must decode a hardened call's
+header with `executor.decode_call_hardened(record, proof, &tx.call_binding())` under genesis
+`hardening_v6`, exactly as the ledger's own step 10 does — with the plain `decode_call` every
+call to a program without a public input on a hardening_v6 chain (chain 16) was refused
+`InvalidProof(PublicValues)`, permanent, cached, and gossip-Rejected. Get this wrong again and a
+policy node silently blacklists every hardened call.
+
+Other rulings from the final review wave (cf8effe..0eff34c): `rand_getLimits` serves
+`gas_price`/`byte_price` as decimal strings (the every-amount-is-a-string rule), `gas_metering`
+stays a bare string (`"header"` or `null`); the client's `ChainLimits` decodes either a string or
+a number so an old node's JSON numbers still parse. The CLI's hardened call quote
+(`wallet::hardened_call_quote_bytes`) prices the proof cap in the not-yet-proved header's place
+only when a policy is set — with none it quotes the envelope alone, as before. The refusal test
+that pins the crossover runs at tier 14, not 12: with a ~110-byte stub proof the byte term is
+~0, so the policy floor equals the ledger's own floor until `gas_price·gas_max` first exceeds
+`CALL_BASE + step` — at tier 14 that's 1,638,300 > 1,200,000. `docs/fees.md` §1.1 headlines this
+same tier-14 crossover (~0.0022 → ~0.0037 RAND), not tier 20 — no chain admits a tier-20 call
+(`MAX_CALL_TIER` is 14).
+
+**Phase 1** (the in-circuit meter, `pv::GAS`, the genesis `gas` section, the bundle's pinned
+limit, the rVM's 35-word interface) is **the chain 18 cut** (the user's ruling) — its plan is
+written against the constraint set chain 18 carries, not a new constraint set of its own.
+
+**Gate, release profile, on `0eff34c`:** core lib 522/522; node lib 360 passed + 21 failed, all
+the pre-existing recursion-fixture gap (`agg_executor.rs:461`, no `RECURSION_FIXTURES` cache on
+this laptop); node bin 21/21; client lib 119/119; zkvm `tests/executor.rs` 19/19; node `submit` 2
+(+1 ignored), `ws` 9/9; `cargo check --workspace --tests` clean; `wallet_flow` 6/6 in 1439 s
+**with the node running `GasPolicy::DEFAULT`** — the first real-proof run under a policy.
+`cluster.rs` and `zusd_e2e` were not run and still start their nodes with `gas_policy: None`.
+
+Roll: wallets first (an old wallet against a policy node is refused with the floor named in the
+error), nodes a week later. Branch state: `feat/gas` off `origin/main` `aedf458` (v0.6); not
+tagged, not rolled. **Rebase `feat/gas` onto the `v0.6.1` tag before tagging** — the branch
+diverged before v0.6.1 and carries a one-line `CallOutcome` seam in `zkvm/src/executor.rs` (a
+fullnode-local file, not vendored) that the rebase must keep.
+
 ### v0.5.10 — address sharing and the encrypted memo (2026-09-28)
 
 The launch address stays the ~1,667-char ML-KEM-768 `rand1…` (the user's decision, 2026-09-26: no
