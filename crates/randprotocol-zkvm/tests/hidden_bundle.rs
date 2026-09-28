@@ -873,6 +873,7 @@ fn a_mixed_hidden_bundle_proves_at_tier_14_and_verifies_only_against_its_binding
         proof.len()
     );
     assert_eq!(tier, 14);
+    assert!(proof.len() <= randprotocol_core::gas::MAX_PROOF_BYTES, "{} bytes is over MAX_PROOF_BYTES", proof.len());
     assert_eq!(digest, hidden::hidden_bundle_digest(&di));
     let ex = ZkExecutor::new(FriProfile::Production);
     assert_eq!(ex.hidden_bundle_proof_digest(&proof).unwrap(), digest);
@@ -1009,3 +1010,30 @@ fn a_branch_free_bundle_proves_at_tier_14_at_the_pinned_shape() {
     assert!(ex.verify_bundle(&ZkExecutor::hc_hidden_bundle(), &proof, &BINDING_A).is_err(), "v1's hc refuses a v2 proof");
 }
 
+
+/// The proof size a chain-16 genesis (`--bundle-guest v2`) has to admit, measured rather than
+/// assumed: a mixed transfer under the branch-free guest at the **Production** FRI profile the
+/// chain pins, against `MAX_PROOF_BYTES` (the default `max_proof_bytes` when a genesis omits it;
+/// the cut scripts set 8 MiB). Constraint set 7 added the blinding columns and floored every table
+/// at 2^7, so the cs6 number (~1.2 MB at tier 10) is not the one to keep trusting. The v1 twin is
+/// measured by `a_mixed_hidden_bundle_proves_at_tier_14_and_verifies_only_against_its_binding`.
+#[test]
+fn a_branch_free_bundle_at_the_production_profile_fits_the_proof_cap() {
+    use randprotocol_core::confidential::ConfidentialExecutor;
+    let c = mixed();
+    let inputs = c.inputs();
+    let hc2 = ZkExecutor::hc_hidden_bundle_v2();
+    let started = std::time::Instant::now();
+    let (proof, digest, tier) = prove_bundle_for(&hc2, FriProfile::Production, &inputs, &BINDING_A, Backend::Cpu).unwrap();
+    println!("branch-free bundle proved at tier {tier} in {:.1?} ({} proof bytes, Production FRI, CPU)", started.elapsed(), proof.len());
+    assert_eq!(tier, 14);
+    assert!(
+        proof.len() <= randprotocol_core::gas::MAX_PROOF_BYTES,
+        "a v2 bundle proof of {} bytes is over MAX_PROOF_BYTES {}",
+        proof.len(),
+        randprotocol_core::gas::MAX_PROOF_BYTES
+    );
+    let ex = ZkExecutor::new(FriProfile::Production);
+    assert_eq!(ex.bundle_proof_digest(&proof).unwrap(), digest);
+    assert_eq!(ex.verify_bundle(&hc2, &proof, &BINDING_A), Ok(()));
+}
