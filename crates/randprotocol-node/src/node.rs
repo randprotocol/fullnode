@@ -545,6 +545,40 @@ fn check_sealed_coverage(storage: &Storage, batch_covers: &BTreeSet<Hash>, cb: &
     Ok(())
 }
 
+/// INTERFACE-6's residual (issue #59): a sealed-form side-table entry's `shape` is not covered by
+/// anything the ledger checks — `apply_block_for_sync` binds the record's transaction, digest and
+/// `H_PUB`, never its seven shape bytes — yet this node stores it with the record and hands it to
+/// every later reader of that cover (`Storage::covered_record`: a later aggregate's sidecar, the
+/// startup replay of the covering aggregate's block, re-serving). An aggregate carried in the same
+/// batch binds it (its admission wants every covered shape equal and admitted, and the rVM verify
+/// is for that shape); nothing else did. So every entry must name a shape this chain's genesis
+/// admits for the guest its public values say it proves (`pv::HC0..7 == admitted.hc`) — the only
+/// shapes a covering aggregate can have verified. A chain without an `aggregation` section has no
+/// admissible pruned record at all. Refused as a damaged batch, not the raw-form fallback: an
+/// honest peer's record carries the shape its own pruning pass read off the verified proof.
+fn check_pruned_shapes(
+    aggregation: Option<&randprotocol_core::ledger::aggregation::AggregationConfig>,
+    height: u64,
+    pruned: &[randprotocol_core::consensus::PrunedBundle],
+) -> Result<()> {
+    for p in pruned {
+        let admitted = aggregation.is_some_and(|cfg| {
+            cfg.admitted_shapes.iter().any(|a| {
+                let hc = randprotocol_core::notes::word8_from_bytes(a.hc.as_bytes()).expect("a Hash is 32 bytes");
+                a.shape == p.shape
+                    && (0..8).all(|k| p.public_values.get(randprotocol_core::types::pv::HC0 + k) == Some(&(hc[k] as u64)))
+            })
+        });
+        if !admitted {
+            anyhow::bail!(
+                "block {height} carries a pruned record for {} whose shape is not one this chain admits for its guest",
+                p.tx_hash
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The raw-form fallback (spec §7): a pruned bundle arrived whose covering aggregate is
 /// neither applied nor in this batch. Serving closes a batch's coverage before it goes out
 /// ([`close_batch_coverage`]), so what remains here is the genuine archive case — the cover
@@ -3097,6 +3131,7 @@ impl Node {
             // block fails today). Anything else is the raw-form fallback: another peer may
             // hold the raw proofs, and serving pruned history is policy, not malice.
             check_sealed_coverage(&self.storage, &batch_covers, &cb)?;
+            check_pruned_shapes(ledger.aggregation(), b.height(), &cb.pruned)?;
             // The covered-carrying sidecar for any aggregate in the block: the records the
             // batch has produced so far, then the store's (spec §3.2's data — the pruned form
             // reads exactly as the raw one).
@@ -4990,6 +5025,57 @@ mod tests {
             gs.ledger.clone().apply_block_for_sync(&lying.block, &BTreeMap::new(), &lying.pruned, &StubExecutor, &NoVerified),
             Err(BlockError::InvalidTx { index: 0, error: randprotocol_core::TxError::BadDigest })
         ));
+    }
+
+    /// INTERFACE-6's residual (issue #59): a side-table entry's shape was taken on the serving
+    /// peer's word. It must be a shape the genesis admits for the guest its `HC0..7` names; any
+    /// other shape, another guest's words, or a chain without aggregation is a damaged batch.
+    #[test]
+    fn a_pruned_records_shape_must_be_an_admitted_shape_of_its_guest() {
+        use randprotocol_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
+        use randprotocol_core::types::pv;
+        let shape = DeclaredShape {
+            profile: randprotocol_core::types::FriProfile::Test,
+            tier: 14,
+            program_log_height: 13,
+            input_log_height: 12,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: 2,
+            mem_log_height: 18,
+        };
+        let cfg = AggregationConfig {
+            bond: 100 * randprotocol_core::UNITS_PER_RAND,
+            max_covers: 3,
+            subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![AdmittedShape {
+                shape,
+                hc: Hash(randprotocol_core::notes::word8_to_bytes(&HC)),
+                aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap(),
+            }],
+        };
+        let mut public_values = vec![0u64; pv::NUM];
+        for k in 0..8 {
+            public_values[pv::HC0 + k] = HC[k] as u64;
+        }
+        let entry = randprotocol_core::consensus::PrunedBundle {
+            tx_hash: Hash::digest(b"a sealed bundle"),
+            proof_hash: Hash::digest(b"its proof"),
+            public_values,
+            shape,
+        };
+        check_pruned_shapes(Some(&cfg), 5, std::slice::from_ref(&entry)).unwrap();
+        let mut taller = entry.clone();
+        taller.shape.mem_log_height += 1;
+        let err = check_pruned_shapes(Some(&cfg), 5, &[entry.clone(), taller]).unwrap_err().to_string();
+        assert!(err.contains("block 5") && err.contains("shape"), "{err}");
+        let mut other_guest = entry.clone();
+        other_guest.public_values[pv::HC0] ^= 1;
+        assert!(check_pruned_shapes(Some(&cfg), 5, &[other_guest]).is_err(), "the shape, but for another guest");
+        assert!(check_pruned_shapes(None, 5, std::slice::from_ref(&entry)).is_err(), "no aggregation, no pruned record");
+        check_pruned_shapes(None, 5, &[]).unwrap();
     }
 
     /// The coverage rule (spec §7): a pruned bundle is accepted when its raw hash is sealed
