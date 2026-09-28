@@ -341,7 +341,7 @@ gas policy:
 ```json
 { "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
   "max_call_envelope_bytes": 18432, "max_program_public_words": 0, "envelope_bytes": null,
-  "hardening_v6": false, "hc_auth": null, "gas_price": 100, "byte_price": 800,
+  "hardening_v6": false, "hc_auth": null, "gas_price": "100", "byte_price": "800",
   "gas_metering": "header" }
 ```
 
@@ -374,7 +374,8 @@ chain it runs has none.
 `gas_price`, `byte_price` and `gas_metering` are this **node's** own gas policy (spec
 `2026-09-28-gas-model-design.md` §4.1, Phase 0), not a chain limit — two nodes on one chain may
 answer differently. `gas_price`/`byte_price` are the node's `--gas-price`/`--byte-price` in units
-of 10⁻⁹ RAND (defaults 100, 800); `gas_metering` is `"header"` while the policy prices a call's
+of 10⁻⁹ RAND (defaults 100, 800), decimal strings like every other amount on this API (`null` with
+no policy); `gas_metering` is `"header"` while the policy prices a call's
 `gas_max` off its proof's declared header, `null` with no policy (`--gas-price 0 --byte-price 0`).
 A node that predates these fields answers without them, which a wallet reads as no policy. Phase 1
 (chain 18) answers `"circuit"` — an in-circuit meter, not the header alone.
@@ -1383,7 +1384,8 @@ Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md` §4.1. Node policy,
 `--gas-price 0 --byte-price 0` turns it off and answers as before.
 
 - **`rand_getLimits`** gains three fields: `gas_price`, `byte_price` (this node's `--gas-price` /
-  `--byte-price`, units of 10⁻⁹ RAND, defaults 100 and 800; `null` with no policy) and
+  `--byte-price`, units of 10⁻⁹ RAND, defaults 100 and 800, as decimal strings — `"100"`,
+  `"800"` — like every amount; `null` with no policy) and
   `gas_metering` (`"header"` under a policy, `null` without one; Phase 1's chain 18 answers
   `"circuit"`).
 - **`rand_estimateFee`**'s call spec gains `keccak_log_height`, `sha256_log_height` (optional,

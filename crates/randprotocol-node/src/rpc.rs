@@ -196,6 +196,14 @@ fn u64_as_decimal_string<S: serde::Serializer>(v: &u64, s: S) -> Result<S::Ok, S
     s.serialize_str(&v.to_string())
 }
 
+/// [`u64_as_decimal_string`] for an optional amount: `null` when absent.
+fn opt_u64_as_decimal_string<S: serde::Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(v) => s.serialize_str(&v.to_string()),
+        None => s.serialize_none(),
+    }
+}
+
 /// `rand_status`'s `aggregation` object (spec §8).
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct AggregationStatus {
@@ -479,7 +487,12 @@ pub struct ChainLimits {
     pub hc_auth: Option<String>,
     /// Spec 2026-09-28 §8: this node's gas policy (Phase 0), `null` when it runs none. Node
     /// policy, not a chain limit — two nodes on one chain may answer differently.
+    ///
+    /// The two prices are RAND amounts, so decimal strings like every other u64 amount on the
+    /// wire (docs/rpc.md's conventions).
+    #[serde(serialize_with = "opt_u64_as_decimal_string")]
     pub gas_price: Option<u64>,
+    #[serde(serialize_with = "opt_u64_as_decimal_string")]
     pub byte_price: Option<u64>,
     /// `"header"` while the policy prices `gas_max` of the proof header (Phase 0); `null` with
     /// no policy. Phase 1 (chain 18) answers `"circuit"`.
@@ -3524,13 +3537,15 @@ mod tests {
         let (_d, mut st) = state_for(&gs);
         st.limits = st.limits.with_gas_policy(Some(randprotocol_core::gas::GasPolicy::DEFAULT));
         let v = ok(&st, "rand_getLimits", json!([])).await;
-        assert_eq!(v["gas_price"], 100);
-        assert_eq!(v["byte_price"], 800);
+        // Prices are RAND amounts, so decimal strings like every other u64 amount (docs/rpc.md).
+        assert_eq!(v["gas_price"], "100");
+        assert_eq!(v["byte_price"], "800");
         assert_eq!(v["gas_metering"], "header");
         assert_eq!(v["max_proof_bytes"], 2_097_152, "the chain's limits are unchanged");
         st.limits = st.limits.with_gas_policy(randprotocol_core::gas::GasPolicy::from_prices(0, 0));
         let v = ok(&st, "rand_getLimits", json!([])).await;
         assert_eq!(v["gas_price"], serde_json::Value::Null);
+        assert_eq!(v["byte_price"], serde_json::Value::Null);
         assert_eq!(v["gas_metering"], serde_json::Value::Null);
     }
 
