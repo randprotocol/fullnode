@@ -1039,7 +1039,7 @@ async fn main() -> Result<()> {
         Cmd::Verify { datadir, mode, repair } => {
             let mode: VerifyMode = mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let (gs, executor) = node::load_genesis(&datadir)?;
-            node::refuse_pre_constraint_set_7(&gs)?;
+            node::refuse_older_constraint_set(&gs)?;
             let storage = Storage::open(&datadir)?;
             let check = storage.verify_chain(&gs, mode, executor.as_ref())?;
             match &check.problem {
@@ -1839,13 +1839,13 @@ mod tests {
         assert!(gen.validators.iter().all(|v| minters.contains(&v.public_key.address())));
     }
 
-    /// v0.6.1 is constraint set 7: every verifier key moved, so no bundle or call proof chains 14
-    /// and 15 committed verifies on this build. Both genesis files pin guest v1, which this build
+    /// v0.6.1 was constraint set 7 and this build is 8: every verifier key moved, so no bundle or
+    /// call proof chains 14 and 15 (constraint set 6) committed verifies on this build. Both genesis files pin guest v1, which this build
     /// still carries (a new chain may pin it), so the `hc_bundle` check alone let a v0.6.1 binary
     /// start on either chain — and its startup replay would then refuse the chain's own history.
     /// The startup guard names both chains and refuses them before any datadir is opened.
     #[test]
-    fn a_constraint_set_7_build_refuses_chain_14_and_chain_15() {
+    fn a_constraint_set_8_build_refuses_chain_14_and_chain_15() {
         for (chain, file) in [(14, "genesis-chain14.json"), (15, "genesis-chain15.json")] {
             let path = format!("{}/../../deploy/{file}", env!("CARGO_MANIFEST_DIR"));
             let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
@@ -1853,10 +1853,38 @@ mod tests {
             let state = gen.build(executor.as_ref()).unwrap();
             assert!(ZkExecutor::known_hc_bundles().contains(&state.hc_bundle), "chain {chain} pins a guest this build carries");
             let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles())
-                .expect_err(&format!("a constraint-set-7 build must refuse chain {chain}"))
+                .expect_err(&format!("a constraint-set-8 build must refuse chain {chain}"))
                 .to_string();
-            assert!(refused.contains("constraint set 7") && refused.contains(&format!("chain {chain}")), "{refused}");
+            assert!(
+                refused.contains("constraint set 6") && refused.contains("constraint set 8") && refused.contains(&format!("chain {chain}")),
+                "{refused}"
+            );
         }
+    }
+
+    /// This build is constraint set 8 (the gas meter, chain 18): every verifier key moved again, so
+    /// no proof chain 16 (constraint set 7, v0.6.1) committed verifies here. Chain 16 pins the v2
+    /// guest, which this build still carries, so the `hc_bundle` check alone would let this binary
+    /// start on chain 16 — and its startup replay (or a `verify --repair`) would then refuse, and
+    /// truncate, the chain's own history. The guard names the chain, its set and the archive risk.
+    #[test]
+    fn a_constraint_set_8_build_refuses_chain_16() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain16.json");
+        let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        assert_eq!(state.hash().to_hex(), "20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005");
+        let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles())
+            .expect_err("a constraint-set-8 build must refuse chain 16")
+            .to_string();
+        assert!(
+            refused.contains("chain 16") && refused.contains("constraint set 7") && refused.contains("constraint set 8"),
+            "{refused}"
+        );
+        assert!(refused.contains("archive"), "the message names the archive risk: {refused}");
+        // `verify` calls the same guard before it opens the datadir.
+        let verify = node::refuse_older_constraint_set(&state).expect_err("verify refuses chain 16 too").to_string();
+        assert_eq!(verify, refused);
     }
 
     /// Chain 16, cut by `deploy/cut-chain16-genesis.sh` with the v0.6.1 release binary: every
