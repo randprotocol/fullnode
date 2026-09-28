@@ -4,3 +4,5 @@
 pub mod wire;
 pub mod key;
 pub mod pairing;
+#[cfg(feature = "service")]
+pub mod service;
