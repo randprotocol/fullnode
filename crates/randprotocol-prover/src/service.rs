@@ -513,6 +513,11 @@ pub fn check_fee(inputs: &[u32], fee: &Fee) -> Result<(), Refusal> {
         }
         in_rand = true;
         let amount = u64::from(inputs[o + w::O_AMOUNT_LO]) | (u64::from(inputs[o + w::O_AMOUNT_HI]) << 32);
+        // The guest range-checks every output below 2^63 and taints the proof otherwise: refused
+        // here for free rather than after a proof no chain accepts.
+        if amount >= randprotocol_core::notes::MAX_NOTE_VALUE {
+            return Err(Refusal::Fee("the fee output's amount is not below 2^63, which no note can hold".into()));
+        }
         if amount >= fee.amount {
             return Ok(());
         }

@@ -37,6 +37,29 @@ pub const NOT_OWN_PAIRING_NOTE: &str = "this link has no own=1: on a chain with 
      and on a pre-v3 chain, whose witness carries the spend key, every --prover use is refused; re-pair with a link from \
      `rand-prover pair --own` only for a machine you run";
 
+/// `--max-prover-fee`'s default: 1 RAND. A prover quoting more is refused before any bundle is
+/// built, whatever the command (review I-1: the quote is the prover's to set, at any time).
+pub const DEFAULT_MAX_PROVER_FEE: u64 = randprotocol_core::UNITS_PER_RAND;
+
+/// The one rule for a quoted fee against the wallet's cap: at most `cap`, and `cap` 0 refuses any.
+pub fn check_fee_cap(quoted: u64, cap: u64) -> Result<()> {
+    if quoted > cap {
+        return Err(anyhow!(
+            "the prover quotes {} RAND; the cap is {} RAND (--max-prover-fee) — not building the bundle",
+            randprotocol_core::format_amount(quoted),
+            randprotocol_core::format_amount(cap)
+        ));
+    }
+    Ok(())
+}
+
+/// Prover-supplied text as the wallet prints it: through the memo sanitiser (no control, format
+/// or bidi characters, no terminal escapes), cut to 200 characters. A paired prover is not
+/// trusted to write to this terminal (review M-6).
+pub fn shown(text: &str) -> String {
+    crate::memo_display::truncate(text, 200)
+}
+
 /// A sealed reply carries a ~1.2 MB proof as hex; 64 MiB is the wallet's own RPC reply cap.
 const MAX_REPLY_BYTES: usize = 64 * 1024 * 1024;
 
@@ -216,6 +239,10 @@ pub struct RemoteProver {
     /// Set once [`VIEWING_KEY_WARNING`] has been printed, so it is said once per prover, not once
     /// per job.
     warned_history: std::sync::atomic::AtomicBool,
+    /// The largest fee this wallet pays a prover, in RAND base units (`--max-prover-fee`).
+    max_fee: u64,
+    /// Set once the "prover fee" line has been shown, so `rand send` says it once (review M-1).
+    fee_announced: std::sync::atomic::AtomicBool,
 }
 
 /// Reads the digest a bundle proof of the guest `hc` publishes, at a FRI profile.
@@ -244,7 +271,20 @@ impl RemoteProver {
             info: tokio::sync::OnceCell::new(),
             published_digest: std::sync::Arc::new(executor_digest),
             warned_history: std::sync::atomic::AtomicBool::new(false),
+            max_fee: DEFAULT_MAX_PROVER_FEE,
+            fee_announced: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// The cap on a quoted fee (`--max-prover-fee`, base units); 0 refuses any fee.
+    pub fn with_max_fee(mut self, cap: u64) -> RemoteProver {
+        self.max_fee = cap;
+        self
+    }
+
+    /// `true` the first time only: whether the "prover fee" line is still to be shown.
+    pub fn announce_fee(&self) -> bool {
+        !self.fee_announced.swap(true, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether [`VIEWING_KEY_WARNING`] has been shown for this prover.
@@ -265,10 +305,16 @@ impl RemoteProver {
 
     /// The fee this prover quotes in `prover_info` (spec §5): its shielded address and the amount
     /// in RAND base units, or `None` when it charges nothing. A quote that does not parse is an
-    /// error, never read as "free": the prover would refuse every job that did not pay it.
+    /// error, never read as "free": the prover would refuse every job that did not pay it. A quote
+    /// above this wallet's cap ([`with_max_fee`](Self::with_max_fee)) is refused here — the one
+    /// place every `--prover` command learns the fee, before any bundle is built.
     pub async fn fee(&self) -> Result<Option<(ShieldedAddress, u64)>> {
         let info = self.info().await?;
-        parse_fee(&info["fee"]).map_err(|e| anyhow!("the prover {} quotes a fee this wallet cannot read: {e}", self.paired.label()))
+        let fee = parse_fee(&info["fee"]).map_err(|e| anyhow!("the prover {} quotes a fee this wallet cannot read: {e}", self.paired.label()))?;
+        if let Some((_, amount)) = &fee {
+            check_fee_cap(*amount, self.max_fee)?;
+        }
+        Ok(fee)
     }
 
     pub fn paired(&self) -> &PairedProver {
@@ -288,7 +334,7 @@ impl RemoteProver {
         let bytes = crate::read_capped(resp, MAX_REPLY_BYTES).await?;
         let resp: Value = serde_json::from_slice(&bytes).with_context(|| format!("{method}: the prover's reply is not JSON"))?;
         if let Some(err) = resp.get("error") {
-            let message = err.get("message").and_then(Value::as_str).unwrap_or("unknown").to_string();
+            let message = shown(err.get("message").and_then(Value::as_str).unwrap_or("unknown"));
             let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
             let data = err.get("data").filter(|d| !d.is_null()).cloned();
             return Err(RpcError { code, message, data }.into());
@@ -306,8 +352,9 @@ impl RemoteProver {
                 let got = info["kem_fingerprint"].as_str().unwrap_or("");
                 if got != self.paired.fingerprint {
                     return Err(anyhow!(
-                        "the prover at {} answers with key fingerprint {got:?}, but this wallet paired with {} — not sending it anything",
+                        "the prover at {} answers with key fingerprint {:?}, but this wallet paired with {} — not sending it anything",
                         self.paired.url,
+                        shown(got),
                         self.paired.fingerprint
                     ));
                 }
@@ -437,7 +484,7 @@ impl RemoteProver {
                     break hex::decode(hex_reply).map_err(|_| anyhow!("the prover's reply is not hex"))?;
                 }
                 "failed" => {
-                    return Err(anyhow!("the prover failed the job: {}", s["error"].as_str().unwrap_or("no reason given")));
+                    return Err(anyhow!("the prover failed the job: {}", self::shown(s["error"].as_str().unwrap_or("no reason given"))));
                 }
                 "expired" => {
                     return Err(anyhow!("the prover did not finish within its own reply window (the job expired)"));
@@ -522,9 +569,9 @@ fn submit_error(e: anyhow::Error, label: &str) -> anyhow::Error {
             data["max"].as_u64().map_or("?".into(), |d| d.to_string())
         ),
         -32003 => anyhow!("the prover {label} does not know this wallet's pairing token: pair again (rand prover pair <link>)"),
-        -32004 => anyhow!("the prover {label} refused the witness kind: {}", data["reason"].as_str().unwrap_or(&r.message)),
-        -32000 => anyhow!("the prover {label} refused the job: {}", data["reason"].as_str().unwrap_or(&r.message)),
-        -32006 => anyhow!("the prover {label} refused the job's fee: {}", data["reason"].as_str().unwrap_or(&r.message)),
+        -32004 => anyhow!("the prover {label} refused the witness kind: {}", shown(data["reason"].as_str().unwrap_or(&r.message))),
+        -32000 => anyhow!("the prover {label} refused the job: {}", shown(data["reason"].as_str().unwrap_or(&r.message))),
+        -32006 => anyhow!("the prover {label} refused the job's fee: {}", shown(data["reason"].as_str().unwrap_or(&r.message))),
         _ => e,
     }
 }
@@ -725,8 +772,8 @@ mod tests {
         let (paired, _) = fake(Finish::Never, false, |_| {}).await;
         assert_eq!(quick(paired).fee().await.unwrap(), None);
         let addr = to.to_string();
-        let (paired, _) = fake(Finish::Never, false, |i| i["fee"] = json!({ "amount": "2500000000", "address": addr })).await;
-        assert_eq!(quick(paired).fee().await.unwrap(), Some((to.clone(), 2_500_000_000)));
+        let (paired, _) = fake(Finish::Never, false, |i| i["fee"] = json!({ "amount": "250000000", "address": addr })).await;
+        assert_eq!(quick(paired).fee().await.unwrap(), Some((to.clone(), 250_000_000)));
         let addr = to.to_string();
         let (paired, _) = fake(Finish::Never, false, |i| i["fee"] = json!({ "amount": "0", "address": addr })).await;
         assert_eq!(quick(paired).fee().await.unwrap(), None, "a zero quote is no fee");
@@ -753,6 +800,31 @@ mod tests {
         let link = PairingLink { kem_ek: key.kem_ek().to_vec(), url, token: [9; 32], own: true };
         let e = prove(&quick(PairedProver::from_link(&link, None)), 1000).await.unwrap_err().to_string();
         assert!(e.contains("refused the job's fee: the fee paid is below the quoted 5"), "{e}");
+    }
+
+    /// Review M-6: prover-supplied text is sanitised before the wallet prints it — a refusal
+    /// reason carrying a terminal escape arrives neutralised, and the fee cap is applied at `fee()`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prover_text_is_sanitised_and_a_quote_over_the_cap_is_refused() {
+        let key = ProverKey::generate();
+        let info = info_for(&key);
+        let url = rpc_fn(move |method, _| match method {
+            "prover_info" => Reply::Ok(info.clone()),
+            "prover_submit" => Reply::ErrData(-32006, "fee\u{1b}[2J".into(), json!({ "reason": "paid\u{1b}]0;owned\u{7}\n\u{202e}evil" })),
+            _ => Reply::Err(-32601, "method not found"),
+        })
+        .await;
+        let link = PairingLink { kem_ek: key.kem_ek().to_vec(), url, token: [9; 32], own: true };
+        let e = prove(&quick(PairedProver::from_link(&link, None)), 1000).await.unwrap_err().to_string();
+        assert!(e.contains("refused the job's fee: paid"), "{e}");
+        assert!(!e.chars().any(|c| c.is_control() || c == '\u{202e}'), "no escape, bell, newline or bidi override: {e:?}");
+        assert_eq!(shown(&"x".repeat(500)).chars().count(), 200, "bounded");
+        let to = ShieldedAddress { pk: [4; 8], kem_ek: vec![5; randprotocol_core::notes::KEM_EK_BYTES] }.to_string();
+        let (paired, _) = fake(Finish::Never, false, move |i| i["fee"] = json!({ "amount": "1000000001", "address": to })).await;
+        let e = quick(paired.clone()).fee().await.unwrap_err().to_string();
+        assert!(e.contains("the prover quotes 1.000000001 RAND; the cap is 1 RAND (--max-prover-fee)"), "{e}");
+        assert!(quick(paired.clone()).with_max_fee(2 * randprotocol_core::UNITS_PER_RAND).fee().await.unwrap().is_some());
+        assert!(quick(paired).with_max_fee(0).fee().await.is_err(), "0 refuses any fee");
     }
 
     /// `rand prover pair`'s note for a link without own=1 (Phase 2): such a pairing proves on a

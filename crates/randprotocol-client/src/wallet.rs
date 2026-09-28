@@ -1566,12 +1566,17 @@ impl Plan {
 /// aside for it first and the rest tried again. One spendable note can never make two groups:
 /// [`SPLIT_FIRST`].
 fn select_rand_pair(rand: &[&OwnedNote], need_r: u64, prover_fee: u64) -> Result<(Vec<OwnedNote>, Vec<OwnedNote>)> {
-    if rand.len() == 1 {
-        return Err(anyhow!(SPLIT_FIRST));
-    }
     let total: u64 = rand.iter().map(|n| n.note.amount).sum();
     if total < need_r.saturating_add(prover_fee) {
-        return Err(SelectError::Insufficient { have: total }.into());
+        return Err(anyhow!(
+            "insufficient balance: the payment and chain fee need {} RAND and the prover's fee {} RAND more, and this wallet holds {} RAND",
+            format_amount(need_r),
+            format_amount(prover_fee),
+            format_amount(total)
+        ));
+    }
+    if rand.len() == 1 {
+        return Err(anyhow!(SPLIT_FIRST));
     }
     let without = |taken: &[OwnedNote]| -> Vec<&OwnedNote> { rand.iter().copied().filter(|n| !taken.iter().any(|t| t.index == n.index)).collect() };
     if let Ok(r) = select_inputs(rand, need_r) {
@@ -1589,7 +1594,8 @@ fn select_rand_pair(rand: &[&OwnedNote], need_r: u64, prover_fee: u64) -> Result
     }
     Err(anyhow!(
         "a RAND transfer through a prover that charges a fee pays it from a second group of at most two RAND notes, \
-         and this wallet's notes do not split into two such groups — consolidate first"
+         and this wallet's notes do not divide into two such groups: send yourself one note that covers the payment \
+         and the chain fee (a self-transfer proved without --prover), then retry"
     ))
 }
 
@@ -1718,8 +1724,9 @@ pub enum Proving {
     Emulated,
     /// [`Proving::Emulated`] by a prover that quotes this fee (spec §5), whose admission check
     /// (`randprotocol_prover::service::check_fee`) is run on the witness before the emulation.
+    /// The third field is the wallet's cap (`--max-prover-fee`), applied as for a real prover.
     #[cfg(test)]
-    EmulatedFee(ShieldedAddress, u64),
+    EmulatedFee(ShieldedAddress, u64, u64),
 }
 
 impl Proving {
@@ -1736,7 +1743,19 @@ impl Proving {
             #[cfg(test)]
             Proving::Emulated => Ok(None),
             #[cfg(test)]
-            Proving::EmulatedFee(to, amount) => Ok(Some((to.clone(), *amount))),
+            Proving::EmulatedFee(to, amount, cap) => {
+                crate::prover::check_fee_cap(*amount, *cap)?;
+                Ok(Some((to.clone(), *amount)))
+            }
+        }
+    }
+
+    /// Whether the "prover fee" line is still to be shown: once per prover, so `rand send`, which
+    /// shows it in its confirmation, does not print it again when the bundle is built.
+    fn announce_fee(&self) -> bool {
+        match self {
+            Proving::Remote(remote) => remote.announce_fee(),
+            _ => true,
         }
     }
 
@@ -1767,7 +1786,7 @@ impl Proving {
             #[cfg(test)]
             Proving::Emulated => tests::emulated_proof(prepared, sk, binding),
             #[cfg(test)]
-            Proving::EmulatedFee(to, amount) => {
+            Proving::EmulatedFee(to, amount, _) => {
                 let fee = randprotocol_prover::service::Fee { amount: *amount, address: to.clone() };
                 randprotocol_prover::service::check_fee(&prepared.words, &fee).map_err(|e| anyhow!("the prover would refuse this witness: {e:?}"))?;
                 tests::emulated_proof(prepared, sk, binding)
@@ -1969,6 +1988,7 @@ pub async fn prover_confirmation(rpc: &RpcClient, proving: &Proving) -> Result<V
             ));
         }
         lines.push(format!("prover fee: {} RAND to {}", format_amount(amount), to.fingerprint()));
+        remote.announce_fee();
     }
     if v3 {
         lines.extend(remote.history_warning());
@@ -2206,7 +2226,9 @@ async fn submit_spend(
                 format_amount(*amount)
             ));
         }
-        eprintln!("prover fee: {} RAND to {}", format_amount(*amount), to.fingerprint());
+        if proving.announce_fee() {
+            eprintln!("prover fee: {} RAND to {}", format_amount(*amount), to.fingerprint());
+        }
     }
     let spend = Spend { prover_fee: quoted.as_ref().map(|(d, f)| (d, *f)), ..spend };
     let plan = Plan::select(store, spend)?;
@@ -6535,7 +6557,7 @@ mod tests {
         let you = Wallet::from_spend_key(SpendKey([66; 8]));
         let prover = Wallet::from_spend_key(SpendKey([67; 8]));
         let pf = 2_000_000;
-        let charging = Proving::EmulatedFee(prover.address.clone(), pf);
+        let charging = Proving::EmulatedFee(prover.address.clone(), pf, crate::prover::DEFAULT_MAX_PROVER_FEE);
         let chain = Arc::new(Mutex::new(ChainState::new()));
         {
             let mut c = chain.lock().unwrap();
@@ -6583,6 +6605,68 @@ mod tests {
             .to_string();
         assert!(e.contains("split-authorisation") && e.contains("drop --prover"), "{e}");
         assert!(chain.lock().unwrap().sent.is_empty());
+    }
+
+    /// Review I-1: a quote above `--max-prover-fee` is refused before any bundle is built — on
+    /// `send` and on a command that asks nothing (a deploy here; bond, burn and the bridge
+    /// actions share the same `submit_spend`). A quote at the cap passes; a cap of 0 refuses any.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_quote_above_the_cap_is_refused_before_any_bundle_on_every_command() {
+        let me = Wallet::from_spend_key(SpendKey([71; 8]));
+        let you = Wallet::from_spend_key(SpendKey([72; 8]));
+        let prover = Wallet::from_spend_key(SpendKey([73; 8]));
+        let unit = randprotocol_core::UNITS_PER_RAND;
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        {
+            let mut c = chain.lock().unwrap();
+            c.hc_bundle = ZkExecutor::hc_hidden_bundle_v3();
+            c.hc_auth = Some(ZkExecutor::hc_auth());
+            for _ in 0..3 {
+                c.fund(&me, 20 * unit, 0);
+            }
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let greedy = Proving::EmulatedFee(prover.address.clone(), 14 * unit, unit);
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 0, unit, "", gas::BUNDLE_BASE, FriProfile::Test, &greedy, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("the prover quotes 14 RAND; the cap is 1 RAND (--max-prover-fee)"), "{e}");
+        let deploy = Action::Deploy { base_pc: 0, words: vec![0x13; 4], public: vec![] };
+        let e = submit_with(&rpc, &me, &mut store, None, deploy.clone(), gas::fee_floor(&deploy), Burn::None, FriProfile::Test, &greedy, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("the cap is 1 RAND (--max-prover-fee)"), "{e}");
+        assert!(chain.lock().unwrap().sent.is_empty(), "nothing proved, nothing sent");
+        assert!(store.notes.iter().all(|n| n.pending.is_none() && !n.spent), "no note held back");
+        // A cap of 0 refuses even one base unit.
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 0, unit, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::EmulatedFee(prover.address.clone(), 1, 0), 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("the cap is 0 RAND"), "{e}");
+        // Exactly the cap: paid.
+        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, unit, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::EmulatedFee(prover.address.clone(), unit, unit), 7, false)
+            .await
+            .unwrap();
+        assert_eq!(s.prover_fee, unit);
+        assert_eq!(chain.lock().unwrap().sent.len(), 1);
+    }
+
+    /// Review M-4: one RAND note too small for both fees is "insufficient", with the amounts — not
+    /// told to split a note that could not pay anyway.
+    #[test]
+    fn one_note_short_of_both_fees_is_insufficient_not_split() {
+        let you = Wallet::from_spend_key(SpendKey([74; 8]));
+        let prover = Wallet::from_spend_key(SpendKey([75; 8]));
+        let one = NoteStore { notes: vec![owned_asset(1, 12, false, 0)], ..NoteStore::default() };
+        let e = Plan::select(&one, Spend { asset: 0, to: Some((&you.address, 10)), memo: "", fee: 2, burn_a: 0, burn_r: 0, prover_fee: Some((&prover.address, 3)) })
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("insufficient balance") && e.contains("0.000000012 RAND") && e.contains("0.000000003 RAND"), "{e}");
+        assert_ne!(e, SPLIT_FIRST);
     }
 
     /// Carried from the Task 6 review: a v1/v2 bundle guest beside a named `hc_auth` is refused.
@@ -6640,14 +6724,15 @@ mod tests {
         chain.lock().unwrap().hc_auth = Some(ZkExecutor::hc_auth());
         let rpc = serve(&chain).await;
         assert!(prover_confirmation(&rpc, &Proving::local(Backend::Cpu)).await.unwrap().is_empty());
-        let fee = serde_json::json!({ "amount": "1500000000", "address": prover.address.to_string() });
+        let fee = serde_json::json!({ "amount": "500000000", "address": prover.address.to_string() });
         let remote = info_only_prover(fee.clone(), false).await;
         let lines = prover_confirmation(&rpc, &remote).await.unwrap();
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert_eq!(lines[0], format!("prover fee: 1.5 RAND to {}", prover.address.fingerprint()));
+        assert_eq!(lines[0], format!("prover fee: 0.5 RAND to {}", prover.address.fingerprint()));
         assert!(lines[1].contains(crate::prover::VIEWING_KEY_WARNING) && lines[1].contains("box"), "{lines:?}");
         let Proving::Remote(r) = &remote else { unreachable!() };
         assert!(r.warned_history(), "shown once: the proof prints no second warning");
+        assert!(!remote.announce_fee(), "the fee line was shown here: building the bundle does not print it again (M-1)");
         assert_eq!(prover_confirmation(&rpc, &remote).await.unwrap(), vec![lines[0].clone()]);
         // The owner's own prover, charging nothing: nothing to show.
         assert!(prover_confirmation(&rpc, &info_only_prover(serde_json::Value::Null, true).await).await.unwrap().is_empty());
@@ -6657,6 +6742,12 @@ mod tests {
         assert!(prover_confirmation(&rpc, &info_only_prover(serde_json::Value::Null, false).await).await.unwrap().is_empty());
         let e = prover_confirmation(&rpc, &info_only_prover(fee, false).await).await.unwrap_err().to_string();
         assert!(e.contains("only a split-authorisation chain"), "{e}");
+        // Above the default cap (1 RAND): refused before the y/N (I-1).
+        chain.lock().unwrap().hc_bundle = ZkExecutor::hc_hidden_bundle_v3();
+        chain.lock().unwrap().hc_auth = Some(ZkExecutor::hc_auth());
+        let greedy = serde_json::json!({ "amount": "14000000000", "address": prover.address.to_string() });
+        let e = prover_confirmation(&rpc, &info_only_prover(greedy, false).await).await.unwrap_err().to_string();
+        assert!(e.contains("the prover quotes 14 RAND; the cap is 1 RAND (--max-prover-fee)"), "{e}");
     }
 
     #[test]

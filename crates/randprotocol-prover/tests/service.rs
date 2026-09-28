@@ -401,3 +401,19 @@ fn a_fee_needs_both_flags_parsed_in_display_units() {
     assert!(Fee::from_flags("1.0000000001", &addr).is_err(), "RAND has 9 decimals");
     assert!(Fee::from_flags("1", "rand1nope").is_err());
 }
+
+/// Review M-3: a fee output at or above 2^63 — which the guest's range check would taint — is
+/// refused at admission, before any proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fee_output_of_two_to_the_63_is_refused_before_proving() {
+    let r = fee_rig(charging());
+    for amount in [1u64 << 63, u64::MAX] {
+        let mut j = v3_witness(r.token, 1);
+        pay(&mut j, 2, PROVER_PK, amount);
+        let Err(Refusal::Fee(why)) = submit(&r, &j) else { panic!("{amount} must be refused") };
+        assert!(why.contains("2^63"), "{why}");
+    }
+    let mut j = v3_witness(r.token, 1);
+    pay(&mut j, 2, PROVER_PK, (1 << 63) - 1);
+    submit(&r, &j).expect("just below 2^63 pays the quote");
+}
