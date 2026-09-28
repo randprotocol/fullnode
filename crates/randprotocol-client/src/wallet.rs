@@ -1534,7 +1534,7 @@ struct Proved {
 /// proof that does not publish the digest this wallet computed from its own plaintext is a bug in
 /// this wallet — not something the node would explain, since the node only ever sees a digest
 /// that matches no plaintext.
-pub(crate) fn check_published_digest(digest: &Word8, expected: &Word8) -> Result<()> {
+fn check_published_digest(digest: &Word8, expected: &Word8) -> Result<()> {
     if digest != expected {
         return Err(anyhow!(
             "the bundle proof published digest {} but this wallet built {} — refusing to submit (wallet bug)",
@@ -4119,7 +4119,7 @@ mod tests {
     /// is the one the proof names.
     const EMULATED_HC: Word8 = [0xe0; 8];
 
-    /// [`FriProfile::Test, &Proving::Emulated`]: the hidden guest run on `p.words` against `binding`, its digest
+    /// [`Proving::Emulated`]: the hidden guest run on `p.words` against `binding`, its digest
     /// checked as a real proof's is, and a stub proof carrying it.
     pub(super) fn emulated_proof(p: &Prepared, binding: &[u32; TX_BINDING_WORDS]) -> Result<Proved> {
         let program = ZkExecutor::bundle_program_for(&p.guest).expect("prepare_bundle refuses a guest this build lacks");

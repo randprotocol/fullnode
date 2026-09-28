@@ -163,22 +163,19 @@ impl PairedProver {
 /// (`localhost`, `127.0.0.1`, `[::1]`). A job is sealed either way, but the pairing token travels
 /// in it and the reply's timing and size are visible to anyone on the path.
 pub fn check_prover_url(url: &str) -> Result<()> {
-    if url.strip_prefix("https://").is_some_and(|rest| !rest.is_empty()) {
-        return Ok(());
+    let u = reqwest::Url::parse(url).map_err(|e| anyhow!("{url}: not a URL ({e}); a prover URL is https:// (or http:// to 127.0.0.1/localhost)"))?;
+    // `http://localhost:80@evil.com/` names host evil.com: credentials in a prover URL are refused
+    // outright, and the host checked is the one the URL resolves to, never a prefix of its text.
+    if !u.username().is_empty() || u.password().is_some() {
+        return Err(anyhow!("{url}: a prover URL carries no user name or password"));
     }
-    if let Some(rest) = url.strip_prefix("http://") {
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-        let host = if let Some(v6) = authority.strip_prefix('[') {
-            v6.split(']').next().map(|h| format!("[{h}]")).unwrap_or_default()
-        } else {
-            authority.split(':').next().unwrap_or("").to_string()
-        };
-        if matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]") {
-            return Ok(());
-        }
-        return Err(anyhow!("{url}: a prover is reached over https anywhere but 127.0.0.1/localhost"));
+    let host = u.host_str().unwrap_or("");
+    match u.scheme() {
+        "https" if !host.is_empty() => Ok(()),
+        "http" if matches!(host, "localhost" | "127.0.0.1" | "[::1]") => Ok(()),
+        "http" => Err(anyhow!("{url}: a prover is reached over https anywhere but 127.0.0.1/localhost")),
+        _ => Err(anyhow!("{url}: a prover URL is https:// (or http:// to 127.0.0.1/localhost)")),
     }
-    Err(anyhow!("{url}: a prover URL is https:// (or http:// to 127.0.0.1/localhost)"))
 }
 
 /// The name a FRI profile goes by on the wire (`ZkExecutor::profile_from_str`'s inverse).
@@ -200,6 +197,16 @@ pub struct RemoteProver {
     /// Verify the returned proof on this machine before using it (on unless `RAND_PROVER_NO_VERIFY=1`).
     pub(crate) verify_locally: bool,
     info: tokio::sync::OnceCell<Value>,
+    /// The digest a proof's own public values publish (`bundle_proof_digest`, structural and
+    /// cheap). A seam so the unit tests' fake proofs need not decode; the real executor otherwise.
+    pub(crate) published_digest: PublishedDigest,
+}
+
+/// Reads the digest a bundle proof publishes, at a FRI profile.
+pub(crate) type PublishedDigest = std::sync::Arc<dyn Fn(FriProfile, &[u8]) -> Result<Word8> + Send + Sync>;
+
+fn executor_digest(profile: FriProfile, proof: &[u8]) -> Result<Word8> {
+    ZkExecutor::new(profile).bundle_proof_digest(proof).map_err(|e| anyhow!("{e}"))
 }
 
 impl RemoteProver {
@@ -217,6 +224,7 @@ impl RemoteProver {
             max_wait: Duration::from_secs(20 * 60),
             verify_locally: !no_verify,
             info: tokio::sync::OnceCell::new(),
+            published_digest: std::sync::Arc::new(executor_digest),
         }
     }
 
@@ -372,12 +380,30 @@ impl RemoteProver {
             tokio::time::sleep(self.poll).await;
         };
         let reply = open_reply(reply_key, &sealed_reply).map_err(|e| anyhow!("opening the prover's reply: {e}"))?;
-        crate::wallet::check_published_digest(&reply.digest, expected)?;
         // `wallet::check_proof_size`'s rule, in a bundle's words (its message names a call proof).
         if reply.proof.len() > proof_cap {
             return Err(anyhow!(
                 "the prover's bundle proof is {} bytes, over this chain's {proof_cap}-byte cap (max_proof_bytes); not using it",
                 reply.proof.len()
+            ));
+        }
+        // The digest is read off the proof itself — `verify_bundle` never looks at it, and the
+        // reply's `digest` field is only the prover's word — and checked whatever `verify_locally`.
+        let label = self.paired.label();
+        let published = (self.published_digest)(profile, &reply.proof)
+            .map_err(|e| anyhow!("the prover {label}'s proof does not decode as a bundle proof: {e}; not using it"))?;
+        if published != *expected {
+            return Err(anyhow!(
+                "the prover {label}'s proof publishes digest {} but this wallet built {} — not using it",
+                word8_to_hex(&published),
+                word8_to_hex(expected)
+            ));
+        }
+        if reply.digest != published {
+            return Err(anyhow!(
+                "the prover {label} claimed digest {} but its proof publishes {} — not using it",
+                word8_to_hex(&reply.digest),
+                word8_to_hex(&published)
             ));
         }
         if self.verify_locally {
@@ -424,8 +450,9 @@ mod tests {
     /// What the fake answers `prover_status` with once a job is in.
     #[derive(Clone, Copy)]
     enum Finish {
-        /// `done`, with a reply whose digest is `EXPECTED` xor `flip` and whose proof is `proof_len` zero bytes.
-        Done { flip: u32, proof_len: usize },
+        /// `done`: the reply claims digest `EXPECTED` xor `flip`; its proof is `proof_len` bytes whose
+        /// first 32 carry the digest it "publishes" (`EXPECTED` xor `publish_flip`, read by [`stub_digest`]).
+        Done { flip: u32, publish_flip: u32, proof_len: usize },
         /// `proving`, for ever.
         Never,
     }
@@ -471,15 +498,26 @@ mod tests {
                     let job = open_job(f.key.dk(), &sealed).expect("the wallet sealed the job to this prover");
                     assert_eq!(job.binding, BINDING);
                     assert_eq!(job.profile, "test");
+                    assert_eq!(job.inputs, vec![1, 2, 3]);
+                    assert!(job.witness_kind == WitnessKind::SpendKey);
+                    assert_eq!(job.hc_bundle, ZkExecutor::hc_bundle());
+                    assert_eq!(job.token, [9; 32]);
+                    assert_eq!(job.version, WIRE_VERSION);
                     f.reply_key = Some(job.reply_key);
                     Reply::Ok(json!({ "job": "j1" }))
                 }
                 "prover_status" => match f.finish {
                     Finish::Never => Reply::Ok(json!({ "state": "proving" })),
-                    Finish::Done { flip, proof_len } => {
+                    Finish::Done { flip, publish_flip, proof_len } => {
                         let mut digest = EXPECTED;
                         digest[0] ^= flip;
-                        let reply = ProveReply { proof: vec![0; proof_len], digest, tier: 14 };
+                        let mut published = EXPECTED;
+                        published[0] ^= publish_flip;
+                        let mut proof = vec![0; proof_len];
+                        for (i, w) in published.iter().enumerate() {
+                            proof[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+                        }
+                        let reply = ProveReply { proof, digest, tier: 14 };
                         let sealed = seal_reply(&f.reply_key.unwrap(), &reply);
                         Reply::Ok(json!({ "state": "done", "reply": hex::encode(sealed) }))
                     }
@@ -499,7 +537,17 @@ mod tests {
         // A guard that stops checking should fail its test, not hang it.
         r.max_wait = Duration::from_secs(5);
         r.verify_locally = false;
+        r.published_digest = Arc::new(stub_digest);
         r
+    }
+
+    /// The fake's proofs publish their first 32 bytes as the digest.
+    fn stub_digest(_: FriProfile, proof: &[u8]) -> Result<Word8> {
+        let mut d = [0u32; 8];
+        for (i, w) in d.iter_mut().enumerate() {
+            *w = u32::from_le_bytes(proof.get(4 * i..4 * i + 4).context("short")?.try_into().unwrap());
+        }
+        Ok(d)
     }
 
     async fn prove(r: &RemoteProver, cap: usize) -> Result<(Vec<u8>, u8)> {
@@ -508,15 +556,39 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_honest_reply_is_accepted() {
-        let (paired, state) = fake(Finish::Done { flip: 0, proof_len: 100 }, true, |_| {}).await;
+        let (paired, state) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, true, |_| {}).await;
         let (proof, tier) = prove(&quick(paired), 1000).await.unwrap();
         assert_eq!((proof.len(), tier), (100, 14));
-        assert!(!state.lock().unwrap().seen.contains(&"prover_cancel".to_string()));
+        assert_eq!(state.lock().unwrap().seen, ["prover_info", "prover_submit", "prover_status"], "one info, no cancel");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claimed_digest_the_proof_does_not_publish_is_refused() {
+        // The reply claims the right digest; the proof itself publishes another.
+        let (paired, state) = fake(Finish::Done { flip: 0, publish_flip: 1, proof_len: 100 }, true, |_| {}).await;
+        let e = prove(&quick(paired), 1000).await.unwrap_err().to_string();
+        assert!(e.contains("publishes digest") && e.contains("box") && !e.contains("wallet bug"), "{e}");
+        assert_eq!(state.lock().unwrap().seen.last().map(String::as_str), Some("prover_cancel"));
+        // The proof publishes the right digest; the reply claims another.
+        let (paired, _) = fake(Finish::Done { flip: 1, publish_flip: 0, proof_len: 100 }, true, |_| {}).await;
+        let e = prove(&quick(paired), 1000).await.unwrap_err().to_string();
+        assert!(e.contains("claimed digest"), "{e}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proof_the_real_executor_cannot_read_is_refused_without_the_local_verify() {
+        let (paired, state) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, true, |_| {}).await;
+        let mut r = quick(paired);
+        r.published_digest = Arc::new(executor_digest);
+        assert!(!r.verify_locally);
+        let e = prove(&r, 1000).await.unwrap_err().to_string();
+        assert!(e.contains("does not decode"), "{e}");
+        assert_eq!(state.lock().unwrap().seen.last().map(String::as_str), Some("prover_cancel"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reply_with_the_wrong_digest_is_refused() {
-        let (paired, state) = fake(Finish::Done { flip: 1, proof_len: 100 }, true, |_| {}).await;
+        let (paired, state) = fake(Finish::Done { flip: 1, publish_flip: 1, proof_len: 100 }, true, |_| {}).await;
         let e = prove(&quick(paired), 1000).await.unwrap_err().to_string();
         assert!(e.contains("digest"), "{e}");
         assert_eq!(state.lock().unwrap().seen.last().map(String::as_str), Some("prover_cancel"));
@@ -524,7 +596,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_oversized_proof_is_refused() {
-        let (paired, state) = fake(Finish::Done { flip: 0, proof_len: 1001 }, true, |_| {}).await;
+        let (paired, state) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 1001 }, true, |_| {}).await;
         let e = prove(&quick(paired), 1000).await.unwrap_err().to_string();
         assert!(e.contains("bytes"), "{e}");
         assert!(state.lock().unwrap().seen.contains(&"prover_cancel".to_string()));
@@ -532,7 +604,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_proof_that_does_not_verify_locally_is_refused() {
-        let (paired, _) = fake(Finish::Done { flip: 0, proof_len: 100 }, true, |_| {}).await;
+        let (paired, _) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, true, |_| {}).await;
         let mut r = quick(paired);
         r.verify_locally = true;
         let e = prove(&r, 1000).await.unwrap_err().to_string();
@@ -541,7 +613,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_spend_key_witness_goes_only_to_an_own_prover() {
-        let (paired, state) = fake(Finish::Done { flip: 0, proof_len: 100 }, false, |_| {}).await;
+        let (paired, state) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, false, |_| {}).await;
         let e = prove(&quick(paired), 1000).await.unwrap_err().to_string();
         assert!(e.contains("only a prover paired as your own (own=1) may receive it"), "{e}");
         assert!(state.lock().unwrap().seen.is_empty(), "no request before the refusal");
@@ -549,7 +621,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fingerprint_mismatch_is_refused_at_info() {
-        let (paired, state) = fake(Finish::Done { flip: 0, proof_len: 100 }, true, |i| {
+        let (paired, state) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, true, |i| {
             i["kem_fingerprint"] = json!(ProverKey::generate().fingerprint().to_string());
         })
         .await;
@@ -631,7 +703,7 @@ mod tests {
         for ok in ["https://prover.example", "https://1.2.3.4:9000/", "http://127.0.0.1:9000", "http://localhost:9000/", "http://[::1]:9000", "http://localhost"] {
             check_prover_url(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
-        for bad in ["http://prover.example", "http://10.0.0.2:9000", "http://localhost.evil.com", "http://127.0.0.1.evil.com:80", "ftp://127.0.0.1", "prover.example"] {
+        for bad in ["http://prover.example", "http://10.0.0.2:9000", "http://localhost.evil.com", "http://127.0.0.1.evil.com:80", "ftp://127.0.0.1", "prover.example", "http://localhost:80@evil.com/", "http://[::1]@evil.com/", "http://127.0.0.1@evil.com", "https://user:pw@prover.example"] {
             assert!(check_prover_url(bad).is_err(), "{bad}");
         }
         let key = ProverKey::generate();
