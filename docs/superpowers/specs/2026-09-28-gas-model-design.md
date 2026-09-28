@@ -322,12 +322,46 @@ the one the transaction was admitted against, recorded in the pool entry. Changi
 `candidates_within`'s sort key is node policy (Phase 0).
 
 Fixed prices first. When blocks fill, the standard second step is a per-block base price that
-tracks fullness: `byte_price' = byte_price · (1 + ⅛ · (bytes_used − target) / target)`, target
-half the block cap, floored at the genesis value; `gas_price` follows the same rule on gas
-used. That is EIP-1559's controller without the burn and is genesis-gated (`gas.dynamic`),
-a ledger state value under the state root like `faucet_budget_per_epoch`. Not in this spec's
-tasks; recorded so the constants above are read as the starting point of a controller, not a
-ruling.
+tracks fullness. That is **Phase 2**, cut with chain 18 beside Phase 1 (the user's ruling,
+2026-09-28), and §7.1 is its rule.
+
+### 7.1 Phase 2 — the dynamic prices (chain 18)
+
+Genesis `gas.dynamic` (optional inside the `gas` section; absent = the fixed prices of §3.3):
+
+```json
+"gas": { "gas_price": "100", "byte_price": "800", "bundle_gas_limit": 16383, "metering": "circuit",
+         "dynamic": { "target_block_bytes": 2097152, "target_block_gas": 262144,
+                      "adjust_bps": 1250, "min_gas_price": "100", "min_byte_price": "800" } }
+```
+
+- **State.** The ledger holds `GasPrices { gas_price, byte_price }`, starting at the section's
+  two prices, persisted beside `META_SUPPLY` (`META_GAS_PRICES`), replay-audited, and folded
+  into the state root last under `rand-state-7` only when `dynamic` is present (the vesting
+  pattern: absent = the root is unchanged).
+- **The rule that prices a block** uses the prices in force at the block's start, i.e. the
+  parent's closing state: a call's floor is `BUNDLE_BASE + gas_price·GAS_LIMIT + byte_price·KiB`
+  at those prices; a bundle's floor stays `BUNDLE_BASE` (§4.3).
+- **The update**, in `close_block`, after the block's transactions and before the root, from
+  the block's `bytes_used` (Σ `tx.encoded_len()`) and `gas_used` (Σ `GAS_LIMIT` of every call
+  proof plus `bundle_gas_limit` per bundle proof), in integer arithmetic (u128, floor division):
+
+  ```
+  price' = max(min_price, price + price · adjust_bps · (used − target) / (10 000 · target))
+  ```
+
+  applied to `byte_price` with `bytes_used`/`target_block_bytes` and to `gas_price` with
+  `gas_used`/`target_block_gas`. An empty block lowers each price by `adjust_bps/10 000` (12.5 %
+  at the default) down to its floor; a block at twice the target raises it by the same; a block
+  at the target leaves it. `target_block_bytes` must be ≤ `max_block_bytes`; `adjust_bps` is
+  `1..=5000`.
+- **The wallet** reads `rand_getLimits` (which serves the tip's current prices under `dynamic`,
+  the genesis prices otherwise) and pays the floor at the current prices times
+  `(1 + adjust_bps/10 000)`, one step of headroom, so a block that raises the price before the
+  transaction lands still admits it; `--fee` overrides. `rand_status` reports `gas_prices`.
+- **What it is not:** no burn (the fee still goes to the proposer, §3.4), no per-transaction
+  priority fee field (the bid is the fee above the floor, §7), no change to the bundle's flat
+  base.
 
 ## 8. Interactions
 
