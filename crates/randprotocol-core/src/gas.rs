@@ -148,11 +148,14 @@ pub const BYTE_PRICE_DEFAULT: u64 = 800;
 /// charges a declared limit at or under it.
 ///
 /// The absorb surcharge: the cpu table's gas accumulator (§4.2's `w = 1 + 2·IS_HASH_BLOCK + …`)
-/// charges `+2` on every `POSEIDON2` absorb row beyond the `+1` every row already costs — every
-/// permutation is `3 + 3·⌈n/4⌉` cpu rows (§3.1), of which one is the absorb row this surcharge
-/// falls on. A tier of `2^t` padded cpu rows holds at most `2^(t−3)` permutations (the smallest
-/// permutation, `n = 0`, is 3 rows), so the most the accumulator can run over the plain cycle
-/// count `2^t − 1` is `2 · 2^(t−3) = 2^(t−2)` — the term this ceiling was previously missing.
+/// charges `+2` on every `POSEIDON2` absorb row beyond the `+1` every row already costs. The
+/// bound on how many absorb rows a tier can hold is the Poseidon2 *table's* own capacity, not a
+/// count of cpu rows: `Tier::poseidon2_height(t) = 2^(t+2)` rows
+/// (`crates/randprotocol-zkvm/src/machine.rs`'s `Tier::for_workload`, the ZH1 note) at
+/// `poseidon2::BLOCK = 32` rows per permutation block, so a tier holds at most
+/// `2^(t+2) / 32 = 2^(t−3)` permutations — each contributing one absorb row. So the most the
+/// accumulator can run over the plain cycle count `2^t − 1` is `2 · 2^(t−3) = 2^(t−2)` — the
+/// term this ceiling was previously missing.
 pub fn gas_max(tier: u8, keccak_log_height: u8, sha256_log_height: u8) -> u64 {
     let tier = tier.clamp(MIN_TIER, MAX_TIER);
     let cycles = (1u64 << tier) - 1;
@@ -442,9 +445,10 @@ mod tests {
 
     /// Spec 2026-09-28 §3.2 (controller ruling, constraint-set-8 final review): the ceiling a
     /// proof header implies — the tier's cycle budget, plus the Poseidon2 absorb surcharge
-    /// (`2^(t−2)`: every absorb row beyond its cycle costs `+2`, and a tier holds up to
-    /// `2^(t−3)` permutation slots), plus the weight of every permutation and compression the
-    /// declared hash tables could hold.
+    /// (`2^(t−2)`: every absorb row beyond its cycle costs `+2`, bounded by the Poseidon2
+    /// table's own capacity of `2^(t−3)` permutation slots — `gas_max`'s doc comment — not a
+    /// cpu-row count), plus the weight of every permutation and compression the declared hash
+    /// tables could hold.
     #[test]
     fn gas_max_is_the_headers_ceiling() {
         assert_eq!(gas_max(10, 0, 0), 1_279);

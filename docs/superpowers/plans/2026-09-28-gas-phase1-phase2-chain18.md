@@ -15,8 +15,9 @@
 - Circuit base: the `circuits` commit chain 16's build vendors (`b9ffc39` on `origin/feat/cs7`; `origin/main` once cs7 merges). Part A is **constraint set 8**: every verifier key changes, so it ships only with the chain 18 cut, never as a same-chain release. Branch `feat/cs8-gas` in `circuits`, `feat/gas-chain18` in fullnode (off the v0.6.4 tag).
 - Weights, verbatim from the spec: every cpu row 1 gas; a `POSEIDON2` absorb row (`IS_HASH`) +2; a `KECCAK` row (`SYS_KECCAK`) +191; a `SHA256` row (`SYS_SHA256`) +63 (so `KECCAK_GAS = 192`, `SHA256_GAS = 64`, an absorb row 3). Digest rows (program, input, public) are real rows and count 1 each.
 - `pv::GAS = 34`, `pv::NUM = 35`. `GAS_LIMIT` is canonical (`< Val::ORDER`), `≤ gas_max(tier, keccak_log_height, sha256_log_height)` (native, `check_public_values`), and `≥` the run's gas (in-circuit, halt row, four RANGE8 limbs: `GAS_LIMIT − GAS < 2^32`; the largest possible gas is `192·2^20 < 2^28`).
+- `gas_max(t, klh, slh) = (2^t − 1) + 2^(t−2) + 191·(2^klh/32) + 63·(2^slh/64)` (corrected by a controller ruling from the constraint-set-8 final review, `randprotocol-core::gas::gas_max`): the `2^(t−2)` term is the Poseidon2 absorb surcharge — every absorb row beyond its cycle costs `+2` (this file's weight line above), bounded by the Poseidon2 *table's* own capacity of `2^(t−3)` permutation slots (`Tier::poseidon2_height(t) = 2^(t+2)` rows at `BLOCK = 32` rows per permutation, `research/src/machine.rs`'s `Tier::for_workload`, ZH1), not a cpu-row count. Hash-free ceilings this plan's literals use: tier 10 → 1 279, 14 → 20 479, 20 → 1 310 719.
 - The library default `gas_limit` is `gas_max(header)` (leaks nothing new); the wallet's default is the exact gas rounded up to the next multiple of `2^(t−2)` (spec §5); `--gas-limit max` = `gas_max(header)`. **No refund, ever.**
-- The bundle guest's `GAS_LIMIT` must equal genesis `gas.bundle_gas_limit` exactly (`16 383` = `gas_max(14, 0, 0)` for the v2 guest, which declares no hash table). The v2 guest's prover passes no limit, so the library default already yields exactly that.
+- The bundle guest's `GAS_LIMIT` must equal genesis `gas.bundle_gas_limit` exactly (`20 479` = `gas_max(14, 0, 0)` for the v2 guest, which declares no hash table). The v2 guest's prover passes no limit, so the library default already yields exactly that.
 - Under the genesis `gas` section a call's floor is `BUNDLE_BASE + gas_price·GAS_LIMIT + byte_price·⌈bytes/1024⌉` — a validity rule replacing `call_fee`'s tier floor on that chain; every other action keeps `fee_floor`. `FeeTooLow` stays non-permanent; `BundleGasLimit` is permanent.
 - Phase 2 (`gas.dynamic`) uses the parent block's closing prices to price a block and updates them in `close_block` by `price' = max(min_price, price + price·adjust_bps·(used − target)/(10 000·target))` in u128 floor division; `adjust_bps ∈ 1..=5000`; `target_block_bytes ≤ max_block_bytes`. Prices are ledger state, persisted beside `META_SUPPLY`, replay-audited, and folded into the state root under `rand-state-7` **only when `dynamic` is present**.
 - Amounts on the wire are decimal strings (`gas_price`, `byte_price`, `min_*`); heights and limits are numbers.
@@ -62,11 +63,11 @@ fn the_public_value_layout_gains_gas_limit_last() {
 
 #[test]
 fn gas_max_is_the_headers_ceiling() {
-    assert_eq!(gas_max(Tier(10), 0, 0), 1_023);
-    assert_eq!(gas_max(Tier(10), 5, 0), 1_023 + 191);
-    assert_eq!(gas_max(Tier(10), 0, 6), 1_023 + 63);
-    assert_eq!(gas_max(Tier(14), 12, 13), 16_383 + 128 * 191 + 128 * 63);
-    assert_eq!(gas_max(Tier(20), 20, 20), 1_048_575 + 32_768 * 191 + 16_384 * 63);
+    assert_eq!(gas_max(Tier(10), 0, 0), 1_279);
+    assert_eq!(gas_max(Tier(10), 5, 0), 1_279 + 191);
+    assert_eq!(gas_max(Tier(10), 0, 6), 1_279 + 63);
+    assert_eq!(gas_max(Tier(14), 12, 13), 20_479 + 128 * 191 + 128 * 63);
+    assert_eq!(gas_max(Tier(20), 20, 20), 1_310_719 + 32_768 * 191 + 16_384 * 63);
 }
 
 /// Review focus 3: a limit past the header's ceiling is refused natively, before any key.
@@ -408,8 +409,8 @@ Part A ends with `circuits` tagged for the fullnode to vendor (`cs8-<sha>`); not
 
 **Files:**
 - Run: `deploy/sync-zkvm.sh` (both sections at the cs8 pin; `RVM_SRC` too), then `cargo check --workspace --tests`
-- Modify: `crates/randprotocol-core/src/types/mod.rs` (`pv::GAS`, `NUM = 35`), `crates/randprotocol-core/src/gas.rs` (`MAX_AGGREGATE_BYTES` in terms of `pv::NUM`), `crates/randprotocol-core/src/program.rs` (`CallOutcome.gas_limit: u64`), `crates/randprotocol-core/src/confidential.rs` (trait: `fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> { Ok(None) }`; the stub proof formats gain an 8-byte little-endian `gas_limit` at the end — `STUB_LEN += 8`, `STUB_BUNDLE_LEN += 8`; `make_proof*` default it to `gas::gas_max(tier, 0, 0)`, `make_bundle_proof` to `16_383`; new `make_proof_with_gas(program, tier, outputs, gas_limit)` and `with_bundle_gas(proof: &mut Vec<u8>, gas_limit: u64)`), `crates/randprotocol-zkvm/src/executor.rs` (`ZkExecutor::verify_call`/`decode_call*` fill `gas_limit` from `pv::GAS`; `bundle_gas_limit` decodes and returns `Some(pv[GAS])`), `crates/randprotocol-node/src/agg_executor.rs` (same two)
-- Test: `crates/randprotocol-zkvm/src/executor.rs`'s mirror-pin test (`pv` mirror == real: extend to `GAS`/`NUM`), `crates/randprotocol-zkvm/tests/executor.rs` (a real proof's `gas_limit == gas_max`), `confidential.rs` tests (the stub's limit round-trips; `bundle_gas_limit` of a stub bundle is `Some(16_383)`)
+- Modify: `crates/randprotocol-core/src/types/mod.rs` (`pv::GAS`, `NUM = 35`), `crates/randprotocol-core/src/gas.rs` (`MAX_AGGREGATE_BYTES` in terms of `pv::NUM`), `crates/randprotocol-core/src/program.rs` (`CallOutcome.gas_limit: u64`), `crates/randprotocol-core/src/confidential.rs` (trait: `fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> { Ok(None) }`; the stub proof formats gain an 8-byte little-endian `gas_limit` at the end — `STUB_LEN += 8`, `STUB_BUNDLE_LEN += 8`; `make_proof*` default it to `gas::gas_max(tier, 0, 0)`, `make_bundle_proof` to `20_479`; new `make_proof_with_gas(program, tier, outputs, gas_limit)` and `with_bundle_gas(proof: &mut Vec<u8>, gas_limit: u64)`), `crates/randprotocol-zkvm/src/executor.rs` (`ZkExecutor::verify_call`/`decode_call*` fill `gas_limit` from `pv::GAS`; `bundle_gas_limit` decodes and returns `Some(pv[GAS])`), `crates/randprotocol-node/src/agg_executor.rs` (same two)
+- Test: `crates/randprotocol-zkvm/src/executor.rs`'s mirror-pin test (`pv` mirror == real: extend to `GAS`/`NUM`), `crates/randprotocol-zkvm/tests/executor.rs` (a real proof's `gas_limit == gas_max`), `confidential.rs` tests (the stub's limit round-trips; `bundle_gas_limit` of a stub bundle is `Some(20_479)`)
 
 - [ ] **Step 1: Failing tests**
 
@@ -423,7 +424,7 @@ assert_eq!(out.gas_limit, randprotocol_core::gas::gas_max(out.tier, out.keccak_l
 let p = StubExecutor::make_proof_with_gas(&id, 12, [1; 8], 777);
 assert_eq!(StubExecutor.verify_call(&rec, &p).unwrap().gas_limit, 777);
 let mut b = StubExecutor::make_bundle_proof(&hc, &digest, &binding);
-assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(16_383));
+assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(20_479));
 StubExecutor::with_bundle_gas(&mut b, 16_384);
 assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(16_384));
 ```
@@ -474,7 +475,7 @@ fn the_gas_section_is_bound_into_the_hash_only_when_present() {
     assert!(plain.gas.is_none() && !plain.to_json().contains("\"gas\""));
     let h0 = plain.hash();
     let mut g = plain.clone();
-    g.gas = Some(GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 16_383, metering: GasMetering::Circuit, dynamic: None });
+    g.gas = Some(GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 20_479, metering: GasMetering::Circuit, dynamic: None });
     assert_ne!(g.hash(), h0);
     let s = g.clone().into_state().unwrap();
     assert_eq!(s.ledger.gas().unwrap().gas_price, 100);
@@ -488,7 +489,7 @@ fn the_gas_section_is_bound_into_the_hash_only_when_present() {
 #[test]
 fn the_gas_section_is_validated() {
     let mut g = fixtures::genesis_file();
-    let ok = GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 16_383, metering: GasMetering::Circuit, dynamic: None };
+    let ok = GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 20_479, metering: GasMetering::Circuit, dynamic: None };
     g.gas = Some(GasConfig { gas_price: 0, ..ok.clone() });
     assert!(g.validate().unwrap_err().contains("gas_price"));
     g.gas = Some(GasConfig { bundle_gas_limit: 0, ..ok.clone() });
@@ -522,7 +523,7 @@ fn the_gas_section_is_validated() {
         }
 ```
 
-`validate`: prices `> 0`, `bundle_gas_limit ≥ 1`, `dynamic`: `1 ≤ adjust_bps ≤ 5000`, `target_block_bytes ≤ self.max_block_bytes.unwrap_or(gas::MAX_BLOCK_BYTES)` and `> 0`, `target_block_gas > 0`, `min_* ≤ the starting price`. The ledger gets `set_gas(Some(g.clone()))` at construction. `rand-node genesis`: the four flags, written only when `--gas-price` is given (the default file has no section — chain 16/17 shape). `init` prints `gas: price 100/gas, 800/KiB, bundle limit 16383, dynamic: …`.
+`validate`: prices `> 0`, `bundle_gas_limit ≥ 1`, `dynamic`: `1 ≤ adjust_bps ≤ 5000`, `target_block_bytes ≤ self.max_block_bytes.unwrap_or(gas::MAX_BLOCK_BYTES)` and `> 0`, `target_block_gas > 0`, `min_* ≤ the starting price`. The ledger gets `set_gas(Some(g.clone()))` at construction. `rand-node genesis`: the four flags, written only when `--gas-price` is given (the default file has no section — chain 16/17 shape). `init` prints `gas: price 100/gas, 800/KiB, bundle limit 20479, dynamic: …`.
 - [ ] **Step 4:** `cargo test -p randprotocol-core --lib genesis && cargo test -p randprotocol-node --bin rand-node` — Expected: pass.
 - [ ] **Step 5: Commit** — `git commit -m "genesis: the gas section — prices, the bundle's limit, circuit metering, the dynamic controller's parameters (spec §4.2, §7.1)"`
 
@@ -538,7 +539,7 @@ fn the_gas_section_is_validated() {
 
 ```rust
     fn gas_ledger() -> (Ledger, ProgramId) {
-        ledger_with_program(|l| l.set_gas(Some(gas::GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 16_383, metering: gas::GasMetering::Circuit, dynamic: None })))
+        ledger_with_program(|l| l.set_gas(Some(gas::GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 20_479, metering: gas::GasMetering::Circuit, dynamic: None })))
     }
 
     /// Spec §4.2: under the section a call pays gas_price·GAS_LIMIT + byte_price·KiB over the
@@ -554,10 +555,10 @@ fn the_gas_section_is_validated() {
         assert_eq!(l.validate(&short, &StubExecutor), Err(TxError::FeeTooLow { min: floor, fee: floor - 1 }));
         let paid = call_tx(&l, 30, id, proof, floor);
         assert!(l.validate(&paid, &StubExecutor).is_ok());
-        // A limit of gas_max at tier 20 with the same bytes costs 0.1 RAND more.
-        let big = StubExecutor::make_proof_with_gas(&id, 14, [7; 8], 1_048_575);
+        // A limit of gas_max at tier 20 with the same bytes costs ~0.13 RAND more.
+        let big = StubExecutor::make_proof_with_gas(&id, 14, [7; 8], 1_310_719);
         let kib = big.len().div_ceil(1024) as u64;
-        let floor = gas::BUNDLE_BASE + 100 * 1_048_575 + 800 * kib;
+        let floor = gas::BUNDLE_BASE + 100 * 1_310_719 + 800 * kib;
         assert_eq!(l.validate(&call_tx(&l, 40, id, big, floor - 1), &StubExecutor), Err(TxError::FeeTooLow { min: floor, fee: floor - 1 }));
     }
 
@@ -567,11 +568,11 @@ fn the_gas_section_is_validated() {
         let (l, _) = gas_ledger();
         let ok = bundle_tx_fixture(&l, 50);                          // whatever helper builds a plain transfer here
         assert!(l.validate(&ok, &StubExecutor).is_ok());
-        for other in [16_382u64, 16_384, 1] {
+        for other in [20_478u64, 20_480, 1] {
             let mut tx = ok.clone();
             StubExecutor::with_bundle_gas(&mut tx.bundle.as_mut().unwrap().proof, other);
             let tx = StubExecutor::bound(tx);
-            assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::BundleGasLimit { want: 16_383, got: Some(other) }), "{other}");
+            assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::BundleGasLimit { want: 20_479, got: Some(other) }), "{other}");
         }
         // Without the section any limit is accepted (chains 16/17).
         let (plain, _) = ledger_with_program(|_| {});
@@ -612,11 +613,11 @@ fn the_gas_section_is_validated() {
 ```rust
     #[tokio::test]
     async fn get_limits_serves_the_chains_gas_section() {
-        let gs = fixtures::genesis_with(|g| g.gas = Some(gas::GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 16_383, metering: gas::GasMetering::Circuit, dynamic: None }));
+        let gs = fixtures::genesis_with(|g| g.gas = Some(gas::GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 20_479, metering: gas::GasMetering::Circuit, dynamic: None }));
         let (_d, st) = state_for(&gs);
         let v = ok(&st, "rand_getLimits", json!([])).await;
         assert_eq!(v["gas_price"], "100"); assert_eq!(v["byte_price"], "800");
-        assert_eq!(v["bundle_gas_limit"], 16_383); assert_eq!(v["gas_metering"], "circuit");
+        assert_eq!(v["bundle_gas_limit"], 20_479); assert_eq!(v["gas_metering"], "circuit");
         let fee = ok(&st, "rand_estimateFee", json!([{"kind": "call", "tier": 12, "bytes": 1_300_000, "gas": 3_000}])).await;
         assert_eq!(fee, gas::circuit_call_floor(100, 800, 3_000, 1_300_000).to_string());
         let e = call(&st, "rand_estimateFee", json!([{"kind": "call", "tier": 12}])).await.unwrap_err();
@@ -631,8 +632,8 @@ fn the_gas_section_is_validated() {
 ### Task B5: The wallet declares its limit
 
 **Files:**
-- Modify: `crates/randprotocol-zkvm/src/executor.rs` (`prove`, `prove_call`, `prove_call_hardened` take `gas_limit: Option<u64>` and pass `ProveOptions { gas_limit, .. }`; `prove_bundle_for` passes `None` — the ceiling, `16_383` for the v2 guest — and asserts the resulting `pv[GAS] == 16_383` in its test), `crates/randprotocol-client/src/wallet.rs` (`pub fn default_gas_limit(exact: u64, tier: u8) -> u64` = round up to a multiple of `2^(t−2)`, capped at `gas_max`; `call_fee_default` under a section: `circuit_call_floor`), `crates/randprotocol-client/src/main.rs` (`rand call --gas-limit <N|max>`; before proving, run the emulator (`executor::dry_run` — the wallet already runs it for the tier), print `gas: <exact> (declaring <limit>, tier t)`; `rand fee call --gas <N>`)
-- Test: `wallet.rs` tests, `zkvm/tests/hidden_bundle.rs` (the v2 guest's `GAS_LIMIT` is `16_383`)
+- Modify: `crates/randprotocol-zkvm/src/executor.rs` (`prove`, `prove_call`, `prove_call_hardened` take `gas_limit: Option<u64>` and pass `ProveOptions { gas_limit, .. }`; `prove_bundle_for` passes `None` — the ceiling, `20_479` for the v2 guest — and asserts the resulting `pv[GAS] == 20_479` in its test), `crates/randprotocol-client/src/wallet.rs` (`pub fn default_gas_limit(exact: u64, tier: u8) -> u64` = round up to a multiple of `2^(t−2)`, capped at `gas_max`; `call_fee_default` under a section: `circuit_call_floor`), `crates/randprotocol-client/src/main.rs` (`rand call --gas-limit <N|max>`; before proving, run the emulator (`executor::dry_run` — the wallet already runs it for the tier), print `gas: <exact> (declaring <limit>, tier t)`; `rand fee call --gas <N>`)
+- Test: `wallet.rs` tests, `zkvm/tests/hidden_bundle.rs` (the v2 guest's `GAS_LIMIT` is `20_479`)
 
 - [ ] **Step 1: Failing tests**
 
@@ -642,11 +643,11 @@ fn the_gas_section_is_validated() {
         assert_eq!(default_gas_limit(1, 10), 256);
         assert_eq!(default_gas_limit(256, 10), 256);
         assert_eq!(default_gas_limit(257, 10), 512);
-        assert_eq!(default_gas_limit(1_000, 10), 1_023, "capped at the tier's own ceiling");
+        assert_eq!(default_gas_limit(1_025, 10), 1_279, "capped at the tier's own ceiling: rounding 1 025 up to the next 2^(t−2)=256 block gives 1 280, above gas_max(10,0,0)=1 279");
         assert_eq!(default_gas_limit(38_412, 16), 40_960);
     }
     // hidden_bundle.rs: after `prove_bundle_for(...)`:
-    assert_eq!(proof.public_values[pv::GAS], 16_383, "the v2 guest declares exactly the pinned limit");
+    assert_eq!(proof.public_values[pv::GAS], 20_479, "the v2 guest declares exactly the pinned limit");
 ```
 
 - [ ] **Step 2:** run, expect compile errors. **Step 3:** implement; `rand call` refuses `--gas-limit` below the emulator's exact gas with the exact number in the message, and above `gas_max` with the ceiling. **Step 4:** `cargo test -p randprotocol-client --release --lib && cargo test --release -p randprotocol-zkvm --test hidden_bundle` (proves a bundle: ~100 s). **Step 5: Commit** — `git commit -m "cli: rand call --gas-limit — the quarter-tier default, the exact count printed, the bundle's pinned limit (spec §9)"`
@@ -683,7 +684,7 @@ fn the_gas_section_is_validated() {
     #[test]
     fn the_controller_is_deterministic_and_floored() {
         let dynamic = gas::DynamicGas { target_block_bytes: 4096, target_block_gas: 20_000, adjust_bps: 1250, min_gas_price: 100, min_byte_price: 800 };
-        let (l, id) = ledger_with_program(|l| l.set_gas(Some(gas::GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 16_383, metering: gas::GasMetering::Circuit, dynamic: Some(dynamic) })));
+        let (l, id) = ledger_with_program(|l| l.set_gas(Some(gas::GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 20_479, metering: gas::GasMetering::Circuit, dynamic: Some(dynamic) })));
         assert_eq!(l.gas_prices(), gas::GasPrices { gas_price: 100, byte_price: 800 });
         let r0 = l.state_root();
         let (mut a, mut b) = (l.clone(), l.clone());
@@ -692,7 +693,7 @@ fn the_gas_section_is_validated() {
         let tx = call_tx(&l, 20, id, proof, gas::BUNDLE_BASE + 100 * 40_000 + 800 * kib);
         for l in [&mut a, &mut b] {
             l.apply_tx(&tx, &proposer(), &StubExecutor).unwrap();
-            l.close_block(1, &proposer(), tx.encoded_len() as u64, 40_000 + 16_383);
+            l.close_block(1, &proposer(), tx.encoded_len() as u64, 40_000 + 20_479);
         }
         assert_eq!(a.gas_prices(), b.gas_prices());
         assert_eq!(a.state_root(), b.state_root());
@@ -755,7 +756,7 @@ pub fn next_price(price: u64, min: u64, used: u64, target: u64, adjust_bps: u32)
 ### Task C1: `deploy/cut-chain18-genesis.sh` and the cutover
 
 **Files:**
-- Create: `deploy/cut-chain18-genesis.sh` from `deploy/cut-chain17-genesis.sh` (delegated proving's; if chain 17 is not cut yet, from `cut-chain16-genesis.sh`): the same snapshot → carry-over of notes, validators, zUSD, bridge state; `rand-node genesis --hardening-v6 --bundle-guest v2 --gas-price 100 --byte-price 800 --bundle-gas-limit 16383 --gas-dynamic 2097152,262144,1250` (the testnet runs the controller; mins = the fixed prices) with the release binary; the `hc_bundle` the binary reports (unchanged by cs8 — the guest's words did not change — but assert it); `Σ notes == Σ locked` and the register checks as before.
+- Create: `deploy/cut-chain18-genesis.sh` from `deploy/cut-chain17-genesis.sh` (delegated proving's; if chain 17 is not cut yet, from `cut-chain16-genesis.sh`): the same snapshot → carry-over of notes, validators, zUSD, bridge state; `rand-node genesis --hardening-v6 --bundle-guest v2 --gas-price 100 --byte-price 800 --bundle-gas-limit 20479 --gas-dynamic 2097152,262144,1250` (the testnet runs the controller; mins = the fixed prices) with the release binary; the `hc_bundle` the binary reports (unchanged by cs8 — the guest's words did not change — but assert it); `Σ notes == Σ locked` and the register checks as before.
 - Modify: `deploy/cutover-fleet-chain18.sh` from chain 16's all-stop/all-start script (every proof format changes: no mixed fleet).
 - Rollout order (spec §11, and the release-gating rule): tag the fullnode release that carries cs8 (`v0.6.5` unless the line has moved) only after the full suite on the testbox and a final review; **ship the clients (core re-vendored at cs8, `--gas-limit` in the apps) and randscan's `randscan-viewing`/pv decoding before the cut** — a wallet on cs7 can prove nothing chain 18 accepts; then the cut; obs1 first, then the validators, A/D/C bootstraps as in chain 16's runbook.
 
@@ -768,5 +769,5 @@ Tagging, the roll and the cut itself are the operator's, per `feedback-release-g
 ## Open questions carried from the spec (decide before C1)
 
 1. Proposer credit or burn for the gas term (spec §3.4) — this plan keeps credit (no new counter).
-2. `bundle_gas_limit` = the tier ceiling (16 383) — chosen here: it never needs re-measuring and the v2 guest's default limit already equals it.
+2. `bundle_gas_limit` = the tier ceiling (20 479) — chosen here: it never needs re-measuring and the v2 guest's default limit already equals it.
 3. Whether chain 18 cuts with `dynamic` on (this plan: yes, on the testnet, with `min_* = the fixed prices`) or fixed first.

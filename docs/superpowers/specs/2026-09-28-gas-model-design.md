@@ -168,9 +168,12 @@ gas_max(header) = (2ᵗ − 1) + 2^(t−2) + 191 · (2ᵏˡʰ / 32) + 63 · (2ˢ
 ```
 
 (the cycle budget, plus the Poseidon2 absorb surcharge — the accumulator charges `+2` on every
-absorb row beyond its cycle, and a tier holds up to `2^(t−3)` permutation slots, so a run can
-exceed the plain cycle budget by up to `2·2^(t−3) = 2^(t−2)` — plus the weight of every keccak
-permutation and sha256 compression the declared tables could hold). Declaring `GAS_LIMIT = gas_max`
+absorb row beyond its cycle, and a tier holds up to `2^(t−3)` permutation slots (the Poseidon2
+*table's* own capacity, `Tier::poseidon2_height(t) = 2^(t+2)` rows at `BLOCK = 32` rows per
+permutation — `crates/randprotocol-zkvm/src/machine.rs`'s `Tier::for_workload`, ZH1 — not a
+cpu-row count), so a run can exceed the plain cycle budget by up to `2·2^(t−3) = 2^(t−2)` — plus
+the weight of every keccak permutation and sha256 compression the declared tables could hold).
+Declaring `GAS_LIMIT = gas_max`
 leaks exactly what the header leaks today and costs the most; declaring the count to the cycle
 leaks the count and costs the least. The wallet's default (§9) rounds up to a quarter-tier, two
 bits more than today. A
