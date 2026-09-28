@@ -2564,6 +2564,8 @@ mod action_tests {
             time: l.height() as u32,
             envelopes: [env(), env(), env(), env()],
             proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);

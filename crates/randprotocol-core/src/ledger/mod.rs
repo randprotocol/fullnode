@@ -224,6 +224,23 @@ pub enum TxError {
     InvalidProof(ConfidentialError),
     #[error("the bundle's digest is not what its proof published")]
     BadDigest,
+    /// Split authorisation (delegated proving Phase 2): a bundle carrying a non-zero
+    /// `auth_commit` or a non-empty `auth_proof` on a chain whose genesis names no `hc_auth`.
+    /// About the bundle's own bytes against a genesis constant.
+    #[error("this chain has no split authorisation (genesis hc_auth): a bundle's auth_commit must be zero and its auth_proof empty")]
+    AuthUnexpected,
+    /// Split authorisation: a bundle without an auth proof on a chain whose genesis names
+    /// `hc_auth` — every bundle there carries one, self-proved or delegated alike.
+    #[error("this chain requires an auth proof on every bundle (genesis hc_auth)")]
+    AuthMissing,
+    /// Split authorisation: the auth proof publishes a commitment other than the bundle's
+    /// `auth_commit` — the spend key holder did not authorise this bundle.
+    #[error("the auth proof publishes a different commitment than the bundle's auth_commit")]
+    AuthMismatch,
+    /// Split authorisation: the auth proof does not decode at the auth guest's pinned shape, or
+    /// does not verify against the pinned auth guest and this transaction's binding.
+    #[error("auth proof: {0}")]
+    InvalidAuthProof(ConfidentialError),
     /// HB-3: the commitment tree could not hold every leaf this transaction may append (its
     /// bundle's four, and a note the ledger derives). Refused before anything is applied; the
     /// tree's `append` used to `assert!` inside block application. Four billion leaves in, so
@@ -404,13 +421,13 @@ struct Verified {
 
 /// The set of transactions whose proofs this node has already verified (audit v3, B5).
 ///
-/// The key is the transaction hash, which binds the proof: `rand-txid-2` hashes the bundle
-/// proof by digest, and the transaction binding the proof itself is verified against covers the
-/// rest of the transaction. So "this hash verified" is a stateless fact — a hit vouches for
+/// The key is the transaction hash, which binds the proof: `rand-txid-3` hashes the bundle
+/// proof (and the split-authorisation auth proof) by digest, and the transaction binding the
+/// proof itself is verified against covers the rest of the transaction. So "this hash verified" is a stateless fact — a hit vouches for
 /// these exact bytes, never for some other transaction, however the entry came to be held. The
 /// ledger consults the set at block application ([`Ledger::apply_block_with`]) and skips exactly
-/// one thing on a hit: the STARK verification (`verify_bundle` / `verify_call`). Everything else
-/// `validate_inner` does still runs — the digest compares, the bundle's structural checks, and
+/// one thing on a hit: the STARK verification (`verify_bundle`, `verify_auth`, `verify_call`).
+/// Everything else `validate_inner` does still runs — the digest compares, the bundle's structural checks, and
 /// the whole state-dependent half (anchors, nullifiers, nonces, fee floors) — so two validators
 /// holding different sets still reach byte-identical verdicts, and an entry whose transaction
 /// was evicted from the pool (or never pooled: a proof verified, then lost to a conflict) costs
@@ -460,7 +477,7 @@ pub fn mint_commitment(executor: &dyn ConfidentialExecutor, pk: &Word8, amount: 
 /// Whether two of `words` are equal — the pairwise distinctness a bundle's four nullifiers and
 /// four commitments each need (six pairs apiece).
 /// The v0.6 canonical-proof rules over a transaction: its raw bundle proof (a pruned marker
-/// carries no proof), then its call proof, each through `check`
+/// carries no proof), its auth proof when it has one, then its call proof, each through `check`
 /// ([`ConfidentialExecutor::non_canonical_proof`], or the zkVM's function directly in the node's
 /// pool), as the one `TxError::NonCanonicalProof` naming which proof and which field. One function
 /// for the pool policy and the `hardening_v6` validity rule, so the two cannot drift.
@@ -469,6 +486,12 @@ pub fn non_canonical_proofs(tx: &Transaction, check: &dyn Fn(&[u8]) -> Option<St
         if crate::notes::pruned_proof_hash(&b.proof).is_none() {
             if let Some(why) = check(&b.proof) {
                 return Some(TxError::NonCanonicalProof(format!("bundle proof: {why}")));
+            }
+        }
+        // Split authorisation's auth proof (never pruned), when the bundle carries one.
+        if !b.auth_proof.is_empty() {
+            if let Some(why) = check(&b.auth_proof) {
+                return Some(TxError::NonCanonicalProof(format!("auth proof: {why}")));
             }
         }
     }
@@ -598,6 +621,16 @@ pub struct Ledger {
     /// restored by `reload_ledger`. `false` — every chain cut before the flag, chain 15 included —
     /// is the old rules.
     hardening_v6: bool,
+    /// Genesis `hc_auth` (split authorisation, delegated proving Phase 2, spec
+    /// `docs/superpowers/specs/2026-09-28-delegated-proving-design.md` §4.1): the auth guest every
+    /// bundle's `auth_proof` must be a proof of. `Some` makes every bundle carry an auth proof
+    /// whose published `c` is its `auth_commit`, and recomputes the bundle digest with the v3
+    /// preimage (`auth_commit` inside); `None` — every chain cut before it — refuses any auth
+    /// field (`TxError::AuthUnexpected`) and keeps the v1 digest, byte for byte. That `hc_bundle`
+    /// is a v3 guest exactly when this is set is the node's startup gate
+    /// (`node::check_build_runs_genesis`): core cannot name guests. A genesis parameter like
+    /// `hardening_v6`: outside the state root and equality, restored by `reload_ledger`.
+    hc_auth: Option<Word8>,
     /// The aggregator register, hashed into the state root (spec §2.1) when `aggregation` is
     /// set; empty otherwise and at chain-9 block 0.
     aggregators: BTreeMap<Address, aggregation::AggregatorEntry>,
@@ -718,6 +751,7 @@ impl Ledger {
             max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
             envelope_bytes: None,
             hardening_v6: false,
+            hc_auth: None,
             aggregators: BTreeMap::new(),
             retired_aggregator_nonces: BTreeMap::new(),
             height: 0,
@@ -773,6 +807,7 @@ impl Ledger {
             max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
             envelope_bytes: None,
             hardening_v6: false,
+            hc_auth: None,
             aggregators: BTreeMap::new(),
             retired_aggregator_nonces: BTreeMap::new(),
             height: 0,
@@ -1148,6 +1183,17 @@ impl Ledger {
         self.hardening_v6 = on;
     }
 
+    /// The pinned auth guest (genesis `hc_auth`), or `None` on a chain without split
+    /// authorisation — see the field.
+    pub fn hc_auth(&self) -> Option<Word8> {
+        self.hc_auth
+    }
+
+    /// Set by genesis from `hc_auth`, and by `reload_ledger` on every restart.
+    pub fn set_hc_auth(&mut self, hc_auth: Option<Word8>) {
+        self.hc_auth = hc_auth;
+    }
+
     /// The largest proof a transaction may carry, in bytes, as genesis set it (default
     /// [`gas::MAX_PROOF_BYTES`]).
     pub fn max_proof_bytes(&self) -> usize {
@@ -1485,6 +1531,17 @@ impl Ledger {
     /// (audit v3, B5): on a hit the STARK verification is skipped — admission already ran it over
     /// these exact bytes — and the digest compare above still stands, so what is left of this
     /// function is the cheap, deterministic half of it.
+    ///
+    /// Split authorisation (genesis `hc_auth`, delegated proving Phase 2, spec
+    /// `docs/superpowers/specs/2026-09-28-delegated-proving-design.md` §4.1) adds four checks, each
+    /// necessary (`randprotocol-zkvm/tests/hidden_cheating.rs`'s `ledger_rule` shows a cheat that
+    /// only it refuses), cheap before expensive: the auth proof is present and the `c` it
+    /// publishes (read without verifying) is the bundle's `auth_commit`; the bundle digest
+    /// recomputed is the v3 one, over `auth_commit`; then, unless `admitted`, the bundle proof
+    /// verifies against the binding and the auth proof verifies against the *same* binding, its
+    /// verified `c` again `auth_commit`. On a chain without `hc_auth` both auth fields must be
+    /// empty and the digest is the v1 one — today's rule, byte for byte. A pruned bundle keeps its
+    /// auth fields (the marker replaces only `proof`), so the sync path runs the same auth checks.
     fn check_bundle_proof(
         &self,
         tx: &Transaction,
@@ -1493,6 +1550,7 @@ impl Ledger {
         executor: &dyn ConfidentialExecutor,
         admitted: bool,
     ) -> Result<(), TxError> {
+        self.check_auth_fields(b, executor)?;
         // A pruned bundle (spec §6.2's marker form) carries no proof to check: the covering
         // aggregate — verified when its own block applied — is what this bundle's validity
         // rests on. Two checks stand in for it (spec §7's acceptance, the ledger's half): the
@@ -1515,7 +1573,7 @@ impl Ledger {
             if *record_tx != tx.hash() {
                 return Err(TxError::PrunedRecordMismatch("the record names another transaction"));
             }
-            let want = executor.bundle_digest(&b.digest_input());
+            let want = self.expected_bundle_digest(b, executor);
             // A short or non-u32 record is a mismatch, never an index past the end: the
             // sync path refuses such a table before it gets here (`MalformedPrunedRecord`),
             // and a store written by an older build gets the same verdict.
@@ -1534,17 +1592,68 @@ impl Ledger {
             if (0..8).any(|k| pv.get(crate::types::pv::PUB0 + k).copied() != Some(want_pub[k] as u64)) {
                 return Err(TxError::PrunedRecordMismatch("the record's H_PUB is not this transaction's binding"));
             }
+            // The auth proof is not covered by the aggregate: verified here, as admission does.
+            if !admitted {
+                self.verify_auth_proof(b, binding, executor)?;
+            }
             return Ok(());
         }
-        let published = executor.bundle_proof_digest(&b.proof).map_err(TxError::InvalidBundleProof)?;
-        if published != executor.bundle_digest(&b.digest_input()) {
+        let published = executor.bundle_proof_digest(&self.hc_bundle, &b.proof).map_err(TxError::InvalidBundleProof)?;
+        if published != self.expected_bundle_digest(b, executor) {
             return Err(TxError::BadDigest);
         }
         // B5: the one step a hit on the verified set skips. Everything else about this bundle —
         // the digest just compared, and every structural and stateful check `validate_inner` ran
-        // before this function — is checked at apply exactly as at admission.
+        // before this function — is checked at apply exactly as at admission. The transaction id
+        // binds the auth proof by digest (`rand-txid-3`), so a hit vouches for it too.
         if !admitted {
             executor.verify_bundle(&self.hc_bundle, &b.proof, binding).map_err(TxError::InvalidBundleProof)?;
+            self.verify_auth_proof(b, binding, executor)?;
+        }
+        Ok(())
+    }
+
+    /// The digest a bundle's proof must publish: the v3 preimage (`auth_commit` inside) on a
+    /// chain whose genesis names `hc_auth`, the v1 one otherwise.
+    fn expected_bundle_digest(&self, b: &Bundle, executor: &dyn ConfidentialExecutor) -> Word8 {
+        match self.hc_auth {
+            Some(_) => executor.bundle_digest_v3(&b.digest_input()),
+            None => executor.bundle_digest(&b.digest_input()),
+        }
+    }
+
+    /// Split authorisation's cheap half: without genesis `hc_auth`, no auth field at all
+    /// (`AuthUnexpected`); with it, an auth proof whose published `c` — read, not verified — is
+    /// the bundle's `auth_commit` (`AuthMissing`, `InvalidAuthProof`, `AuthMismatch`).
+    fn check_auth_fields(&self, b: &Bundle, executor: &dyn ConfidentialExecutor) -> Result<(), TxError> {
+        match self.hc_auth {
+            None if b.auth_commit != [0; 8] || !b.auth_proof.is_empty() => Err(TxError::AuthUnexpected),
+            None => Ok(()),
+            Some(_) if b.auth_proof.is_empty() => Err(TxError::AuthMissing),
+            Some(_) => {
+                let c = executor.auth_proof_digest(&b.auth_proof).map_err(TxError::InvalidAuthProof)?;
+                if c != b.auth_commit {
+                    return Err(TxError::AuthMismatch);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Split authorisation's expensive half: the auth proof verifies against the pinned auth
+    /// guest and this transaction's `binding` — the same binding the bundle proof was verified
+    /// against — and the `c` it publishes is the bundle's `auth_commit`. Nothing on a chain
+    /// without `hc_auth` (`check_auth_fields` has refused any auth field there).
+    fn verify_auth_proof(
+        &self,
+        b: &Bundle,
+        binding: &[u32; crate::types::TX_BINDING_WORDS],
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<(), TxError> {
+        let Some(hc_auth) = self.hc_auth else { return Ok(()) };
+        let c = executor.verify_auth(&hc_auth, &b.auth_proof, binding).map_err(TxError::InvalidAuthProof)?;
+        if c != b.auth_commit {
+            return Err(TxError::AuthMismatch);
         }
         Ok(())
     }
@@ -1590,7 +1699,8 @@ impl Ledger {
             for e in &b.envelopes {
                 self.check_note_envelope(e)?;
             }
-            if b.proof.len() > self.max_proof_bytes {
+            // The split-authorisation auth proof is a proof like any other.
+            if b.proof.len() > self.max_proof_bytes || b.auth_proof.len() > self.max_proof_bytes {
                 return Err(TxError::ProofTooLarge);
             }
         }
@@ -2575,6 +2685,8 @@ mod tests {
             time: l.height as u32,
             envelopes: [env(), env(), env(), env()],
             proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         restub(&mut b);
         b
@@ -2937,8 +3049,17 @@ mod tests {
         fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
             StubExecutor.bundle_digest(input)
         }
-        fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
-            StubExecutor.bundle_proof_digest(proof)
+        fn bundle_digest_v3(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+            StubExecutor.bundle_digest_v3(input)
+        }
+        fn bundle_proof_digest(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.bundle_proof_digest(hc_bundle, proof)
+        }
+        fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.auth_proof_digest(proof)
+        }
+        fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.verify_auth(hc_auth, proof, binding)
         }
         fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
             self.bundles.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3737,8 +3858,17 @@ mod tests {
         fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
             StubExecutor.bundle_digest(input)
         }
-        fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
-            StubExecutor.bundle_proof_digest(proof)
+        fn bundle_digest_v3(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+            StubExecutor.bundle_digest_v3(input)
+        }
+        fn bundle_proof_digest(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.bundle_proof_digest(hc_bundle, proof)
+        }
+        fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.auth_proof_digest(proof)
+        }
+        fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.verify_auth(hc_auth, proof, binding)
         }
         fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
             StubExecutor.verify_bundle(hc_bundle, proof, binding)
@@ -4035,8 +4165,17 @@ mod tests {
         fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
             StubExecutor.bundle_digest(input)
         }
-        fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
-            StubExecutor.bundle_proof_digest(proof)
+        fn bundle_digest_v3(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+            StubExecutor.bundle_digest_v3(input)
+        }
+        fn bundle_proof_digest(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.bundle_proof_digest(hc_bundle, proof)
+        }
+        fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.auth_proof_digest(proof)
+        }
+        fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.verify_auth(hc_auth, proof, binding)
         }
         fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
             StubExecutor.verify_bundle(hc_bundle, proof, binding)
@@ -4923,5 +5062,229 @@ mod tests {
             with_queue(vec![row(&b, 5), row(&a, 5)], s),
             "the order is the admission order, so the root binds it"
         );
+    }
+
+    // ---- Split authorisation (delegated proving Phase 2, spec 2026-09-28 §4.1) --------------
+
+    /// The auth guest a v3 test chain pins (genesis `hc_auth`).
+    const HCA: Word8 = [21; 8];
+    /// The auth commitment `c` an honest wallet's auth proof and bundle both carry.
+    const C: Word8 = [0xc0; 8];
+
+    /// [`ledger`] with split authorisation on.
+    fn v3_ledger() -> Ledger {
+        let mut l = ledger();
+        l.set_hc_auth(Some(HCA));
+        l
+    }
+
+    /// A v3 transaction as an honest wallet makes it: the bundle carries `auth_commit` `c`, its
+    /// stub proof publishes the v3 digest over it, and the auth proof (made by `hc_auth`)
+    /// publishes `proof_c` — `c` itself when honest. Both proofs are bound to the transaction.
+    fn v3_tx_with(l: &Ledger, c: Word8, proof_c: Word8, hc_auth: Word8) -> Transaction {
+        let mut b = bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE);
+        b.auth_commit = c;
+        b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest_v3(&b.digest_input()), &[0; 8]);
+        b.auth_proof = StubExecutor::make_auth_proof(&hc_auth, &proof_c, &[0; 8]);
+        StubExecutor::bound(Transaction::shielded(7, b, Action::None))
+    }
+
+    fn v3_tx(l: &Ledger) -> Transaction {
+        v3_tx_with(l, C, C, HCA)
+    }
+
+    #[test]
+    fn a_v3_bundle_with_a_valid_auth_proof_is_accepted() {
+        let mut l = v3_ledger();
+        let (a, _) = keys();
+        let t = v3_tx(&l);
+        assert_eq!(l.validate(&t, &StubExecutor), Ok(()));
+        l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
+        assert!(l.nullifiers.contains(&[1; 8]), "the bundle spent");
+    }
+
+    #[test]
+    fn a_v3_chain_refuses_a_bundle_without_an_auth_proof() {
+        let l = v3_ledger();
+        let mut t = v3_tx(&l);
+        t.bundle.as_mut().unwrap().auth_proof = Vec::new();
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::AuthMissing));
+        // Nor does a v1 bundle — zero `auth_commit`, no auth proof, the v1 digest — pass there.
+        let v1 = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        assert_eq!(l.validate(&v1, &StubExecutor), Err(TxError::AuthMissing));
+    }
+
+    /// A v3 chain recomputes the v3 digest — `auth_commit` inside — and nothing else: a bundle
+    /// proof publishing the v1 digest over the same fields is refused, and so is a bundle whose
+    /// `auth_commit` field is changed after its proof was made (the auth proof following it).
+    #[test]
+    fn a_v3_chain_recomputes_the_v3_digest() {
+        let l = v3_ledger();
+        let mut t = v3_tx(&l);
+        let b = t.bundle.as_mut().unwrap();
+        b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
+        StubExecutor::bind(&mut t);
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::BadDigest));
+        let mut t = v3_tx(&l);
+        let b = t.bundle.as_mut().unwrap();
+        b.auth_commit = [0xc1; 8];
+        b.auth_proof = StubExecutor::make_auth_proof(&HCA, &[0xc1; 8], &[0; 8]);
+        StubExecutor::bind(&mut t);
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::BadDigest));
+    }
+
+    /// The auth proof's `c` must be the bundle's `auth_commit`: a prover holding `nk` makes a
+    /// bundle over its own `c` (salt), and an auth proof the key holder made publishes another.
+    /// Refused on the cheap read (before any verify), and also when only the verify reads it.
+    #[test]
+    fn an_auth_commit_that_differs_from_the_proofs_c_is_refused() {
+        let l = v3_ledger();
+        let t = v3_tx_with(&l, C, [0xc1; 8], HCA);
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::AuthMismatch));
+        let b = t.bundle.as_ref().unwrap();
+        assert_eq!(l.check_bundle_proof(&t, b, &t.binding(), &StubExecutor, true), Err(TxError::AuthMismatch), "the cheap half runs on a verified-set hit too");
+
+        /// An executor whose cheap read reports the bundle's own `c` while the verified proof
+        /// publishes another — the verify's answer is compared as well.
+        struct LyingDigest;
+        impl ConfidentialExecutor for LyingDigest {
+            fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
+                StubExecutor.check_program(base_pc, words)
+            }
+            fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.verify_call(program, proof)
+            }
+            fn public_digest(&self, words: &[u32]) -> Word8 {
+                StubExecutor.public_digest(words)
+            }
+            fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
+                StubExecutor.node_hash(left, right)
+            }
+            fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
+                StubExecutor.note_commitment(pk, from, amount, asset, time, r)
+            }
+            fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+                StubExecutor.bundle_digest(input)
+            }
+            fn bundle_digest_v3(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+                StubExecutor.bundle_digest_v3(input)
+            }
+            fn bundle_proof_digest(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+                StubExecutor.bundle_proof_digest(hc_bundle, proof)
+            }
+            fn auth_proof_digest(&self, _proof: &[u8]) -> Result<Word8, ConfidentialError> {
+                Ok(C)
+            }
+            fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
+                StubExecutor.verify_auth(hc_auth, proof, binding)
+            }
+            fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
+                StubExecutor.verify_bundle(hc_bundle, proof, binding)
+            }
+            fn aggregate_program_digest(&self, shape: &crate::types::DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
+                StubExecutor.aggregate_program_digest(shape)
+            }
+            fn verify_aggregate(
+                &self,
+                shape: &crate::types::DeclaredShape,
+                covered: &[crate::types::CoveredBundle],
+                proof: &[u8],
+                binding: &[u32; 8],
+            ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+                StubExecutor.verify_aggregate(shape, covered, proof, binding)
+            }
+        }
+        assert_eq!(l.validate(&t, &LyingDigest), Err(TxError::AuthMismatch));
+    }
+
+    /// An auth proof is bound to one transaction: one made for another binding (a replay onto a
+    /// transaction the key holder never saw) is refused, and so is one by another guest.
+    #[test]
+    fn an_auth_proof_for_another_binding_is_refused() {
+        let l = v3_ledger();
+        let mut t = v3_tx(&l);
+        let b = t.bundle.as_mut().unwrap();
+        b.auth_proof = StubExecutor::make_auth_proof(&HCA, &C, &[9; 8]);
+        let b = t.bundle.as_ref().unwrap();
+        assert_eq!(
+            l.validate(&t, &StubExecutor),
+            Err(TxError::InvalidAuthProof(ConfidentialError::InvalidProof("PublicValues".into())))
+        );
+        // B5: admission verified it, so a verified-set hit skips the verify, as for the bundle.
+        assert_eq!(l.check_bundle_proof(&t, b, &t.binding(), &StubExecutor, true), Ok(()));
+        let other_guest = v3_tx_with(&l, C, C, [22; 8]);
+        assert_eq!(l.validate(&other_guest, &StubExecutor), Err(TxError::InvalidAuthProof(ConfidentialError::WrongProgram)));
+        let mut junk = v3_tx(&l);
+        junk.bundle.as_mut().unwrap().auth_proof = b"junk".to_vec();
+        assert_eq!(l.validate(&junk, &StubExecutor), Err(TxError::InvalidAuthProof(ConfidentialError::MalformedProof)));
+    }
+
+    /// A chain whose genesis names no `hc_auth` keeps today's rules byte for byte: a bundle
+    /// carrying either auth field is refused, before any proof is looked at.
+    #[test]
+    fn a_pre_v3_chain_refuses_a_bundle_carrying_auth_fields() {
+        let l = ledger();
+        assert_eq!(l.hc_auth(), None);
+        let honest = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        assert_eq!(l.validate(&honest, &StubExecutor), Ok(()));
+        let mut t = honest.clone();
+        t.bundle.as_mut().unwrap().auth_commit = C;
+        StubExecutor::bind(&mut t);
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::AuthUnexpected));
+        let mut t = honest.clone();
+        t.bundle.as_mut().unwrap().auth_proof = StubExecutor::make_auth_proof(&HCA, &[0; 8], &[0; 8]);
+        StubExecutor::bind(&mut t);
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::AuthUnexpected));
+        // A whole v3 transaction, likewise.
+        assert_eq!(l.validate(&v3_tx(&v3_ledger()), &StubExecutor), Err(TxError::AuthUnexpected));
+    }
+
+    /// An auth proof is a proof: held to the chain's proof size cap like the bundle's.
+    #[test]
+    fn an_oversized_auth_proof_is_refused() {
+        let l = v3_ledger();
+        let mut t = v3_tx(&l);
+        t.bundle.as_mut().unwrap().auth_proof = vec![0; l.max_proof_bytes() + 1];
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::ProofTooLarge));
+    }
+
+    /// A pruned v3 bundle keeps its `auth_commit` and `auth_proof` (the marker replaces only
+    /// `proof`): the record's `OUT` digest is the v3 one, and the auth proof is verified on the
+    /// sync path as at admission.
+    #[test]
+    fn a_pruned_v3_bundle_checks_the_v3_digest_and_its_auth_proof() {
+        let mut l = v3_ledger();
+        let raw = v3_tx(&l);
+        let mut marker = raw.clone();
+        let b = marker.bundle.as_mut().unwrap();
+        let ph = Hash::digest(&b.proof);
+        let mut m = crate::notes::PRUNED_PROOF_MARKER.to_vec();
+        m.extend_from_slice(ph.as_bytes());
+        b.proof = m;
+        assert_eq!(marker.hash(), raw.hash(), "the marker form keeps the raw id");
+        let binding = marker.binding();
+        let record = |digest: Word8| {
+            let mut pv = vec![0u64; crate::types::pv::NUM];
+            let hpub = StubExecutor.public_digest(&binding);
+            for k in 0..8 {
+                pv[crate::types::pv::OUT0 + k] = digest[k] as u64;
+                pv[crate::types::pv::PUB0 + k] = hpub[k] as u64;
+            }
+            pv
+        };
+        let b = marker.bundle.clone().unwrap();
+        l.pruned_side.insert(ph, (raw.hash(), record(StubExecutor.bundle_digest_v3(&b.digest_input()))));
+        assert_eq!(l.check_bundle_proof(&marker, &b, &binding, &StubExecutor, false), Ok(()));
+        let mut replayed = b.clone();
+        replayed.auth_proof = StubExecutor::make_auth_proof(&HCA, &C, &[9; 8]);
+        assert_eq!(
+            l.check_bundle_proof(&marker, &replayed, &binding, &StubExecutor, false),
+            Err(TxError::InvalidAuthProof(ConfidentialError::InvalidProof("PublicValues".into())))
+        );
+        let mut missing = b.clone();
+        missing.auth_proof = Vec::new();
+        assert_eq!(l.check_bundle_proof(&marker, &missing, &binding, &StubExecutor, false), Err(TxError::AuthMissing));
+        l.pruned_side.insert(ph, (raw.hash(), record(StubExecutor.bundle_digest(&b.digest_input()))));
+        assert_eq!(l.check_bundle_proof(&marker, &b, &binding, &StubExecutor, false), Err(TxError::BadDigest), "a v1 record");
     }
 }

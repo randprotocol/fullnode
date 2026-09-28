@@ -252,6 +252,7 @@ mod tests {
             max_call_envelope_bytes: None,
             max_program_public_words: None,
             hardening_v6: None,
+            hc_auth: None,
             bridge: None,
             tokens: None,
             aggregation: None,

@@ -321,8 +321,25 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.bundle_digest(input)
     }
 
-    fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
-        self.inner.bundle_proof_digest(proof)
+    fn bundle_digest_v3(&self, input: &BundleDigestInput) -> Word8 {
+        self.inner.bundle_digest_v3(input)
+    }
+
+    fn bundle_proof_digest(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+        self.inner.bundle_proof_digest(hc_bundle, proof)
+    }
+
+    fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+        self.inner.auth_proof_digest(proof)
+    }
+
+    fn verify_auth(
+        &self,
+        hc_auth: &Word8,
+        proof: &[u8],
+        binding: &[u32; randprotocol_core::types::TX_BINDING_WORDS],
+    ) -> Result<Word8, ConfidentialError> {
+        self.inner.verify_auth(hc_auth, proof, binding)
     }
 
     fn verify_bundle(

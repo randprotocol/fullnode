@@ -200,6 +200,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         max_program_public_words: None,
         envelope_bytes: None,
         hardening_v6: None,
+        hc_auth: None,
         staking: None,
         vesting: None,
     }
@@ -1416,6 +1417,8 @@ async fn replayed_attest(node: &TestNode, to: &ShieldedAddress, attestation: Vec
         time,
         envelopes: [empty.clone(), empty.clone(), empty.clone(), empty.clone()],
         proof: vec![0xff; 32],
+        auth_commit: [0; 8],
+        auth_proof: Vec::new(),
     };
     // A full PQ quorum, so the refusal that comes back is the replay, not the co-signature's shape
     // (which `check_attest` checks first).

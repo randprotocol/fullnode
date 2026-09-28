@@ -3063,6 +3063,7 @@ pub(crate) mod fixtures {
             envelope_bytes: None,
             vesting: None,
             hardening_v6: None,
+            hc_auth: None,
         }
     }
 
@@ -3174,6 +3175,7 @@ pub(crate) mod fixtures {
             envelope_bytes: None,
             vesting: None,
             hardening_v6: None,
+            hc_auth: None,
         }
         .build(&StubExecutor)
         .unwrap();
@@ -3504,6 +3506,8 @@ pub(crate) mod fixtures {
             time: ledger.height() as u32,
             envelopes: [env(cms[0][0] as u8), env(cms[1][0] as u8), env(cms[0][0] as u8), env(cms[1][0] as u8)],
             proof: Vec::new(),
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
@@ -6495,6 +6499,8 @@ mod seal_tests {
             time: 1,
             envelopes: [env(1), env(2), env(1), env(2)],
             proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);

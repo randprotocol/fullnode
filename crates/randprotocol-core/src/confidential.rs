@@ -133,10 +133,34 @@ pub trait ConfidentialExecutor: Send + Sync {
     fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8;
     /// The hidden-asset bundle digest (`randprotocol_zkvm::hidden::hidden_bundle_digest`, spec
     /// §3.4) over the public bundle fields with the taint word fixed to 0. No asset is among them.
+    /// `input.auth_commit` is not read: this is the digest of bundle guests v1 and v2, which
+    /// every chain without genesis `hc_auth` runs.
     fn bundle_digest(&self, input: &BundleDigestInput) -> Word8;
-    /// Cheap: decode `proof`, check its declared tier/heights/public-value canonicity, and return
-    /// the digest it publishes in `OUT0..OUT7`. Verifies nothing cryptographic.
-    fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError>;
+    /// The digest bundle guest v3 publishes (split authorisation, delegated proving Phase 2;
+    /// `randprotocol_zkvm::hidden::hidden_bundle_digest_v3`): [`Self::bundle_digest`]'s preimage
+    /// with `input.auth_commit` before the taint word. The ledger recomputes this one, and only
+    /// this one, on a chain whose genesis names `hc_auth`.
+    fn bundle_digest_v3(&self, input: &BundleDigestInput) -> Word8;
+    /// Cheap: decode `proof`, check its declared tier/heights/public-value canonicity against the
+    /// bundle guest `hc_bundle` (the chain's genesis pin — each guest has its own pinned heights),
+    /// and return the digest it publishes in `OUT0..OUT7`. Verifies nothing cryptographic.
+    fn bundle_proof_digest(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError>;
+    /// Cheap: decode an auth proof (split authorisation), check its header against the auth
+    /// guest's pinned shape, and return the commitment `c` it publishes in `OUT0..OUT7`. Verifies
+    /// nothing cryptographic — the ledger compares the answer with the bundle's `auth_commit`
+    /// before paying for [`Self::verify_auth`].
+    fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError>;
+    /// Expensive: the STARK verification of an auth proof against the pinned auth guest
+    /// `hc_auth` (genesis) and against `binding` — the [`crate::types::Transaction::binding`] of
+    /// the transaction it rides in, as its public input segment — returning the `c` it publishes.
+    /// A proof made for another transaction, or by another guest, is refused; so an auth proof
+    /// cannot be replayed onto a transaction its key holder never signed off.
+    fn verify_auth(
+        &self,
+        hc_auth: &Word8,
+        proof: &[u8],
+        binding: &[u32; crate::types::TX_BINDING_WORDS],
+    ) -> Result<Word8, ConfidentialError>;
     /// Expensive: the STARK verification of a bundle proof against the pinned bundle guest (the
     /// hidden-asset guest since chain 14, `hc_bundle` in genesis), and
     /// against `binding` — the [`crate::types::Transaction::binding`] of the transaction the
@@ -216,6 +240,12 @@ const STUB_AGGREGATE_TAG: &[u8] = b"rand-stub-aggregate-bound";
 
 /// Where the binding words start inside a stub bundle proof.
 const STUB_BUNDLE_BINDING: usize = 4 + 32 + 8;
+/// Stub auth proof: `auth:` || the 32-byte `c` || blake3("rand-stub-auth", hc_auth bytes)[..8] ||
+/// the 8 binding words (32 bytes, little-endian) — [`STUB_BUNDLE_LEN`]'s layout under its own tag.
+const STUB_AUTH_MARKER: &[u8; 5] = b"auth:";
+const STUB_AUTH_LEN: usize = 5 + 32 + 8 + 32;
+/// Where the binding words start inside a stub auth proof.
+const STUB_AUTH_BINDING: usize = 5 + 32 + 8;
 
 impl StubExecutor {
     /// A stub call proof publishing an all-zero `H_IN` — what a test that is not about the
@@ -268,18 +298,32 @@ impl StubExecutor {
         v
     }
 
+    /// Build a stub auth proof publishing the commitment `c`, made by the auth guest `hc_auth`
+    /// and bound to `binding` — the [`Transaction::binding`] of the transaction it will ride in.
+    pub fn make_auth_proof(hc_auth: &Word8, c: &Word8, binding: &[u32; TX_BINDING_WORDS]) -> Vec<u8> {
+        let mut v = STUB_AUTH_MARKER.to_vec();
+        v.extend_from_slice(&word8_to_bytes(c));
+        v.extend_from_slice(&Hash::digest_domain(b"rand-stub-auth", &word8_to_bytes(hc_auth)).0[..8]);
+        v.extend_from_slice(&word8_to_bytes(binding));
+        v
+    }
+
     /// Re-bind the stub bundle proof `tx` carries to `tx.binding()`, leaving the proof's digest
     /// and guest commitment as they were, and leaving anything that is not a well-formed stub
     /// bundle proof (a pruned marker, deliberately broken bytes) untouched. What a test calls once
     /// it has finished assembling a transaction: the stub's analogue of a wallet proving after it
     /// has built everything but the proof.
     ///
-    /// The binding blanks the bundle proof, so rewriting it does not move the binding.
+    /// The binding blanks the bundle proof, so rewriting it does not move the binding. A stub
+    /// auth proof (split authorisation) is re-bound the same way; the binding blanks it too.
     pub fn bind(tx: &mut Transaction) {
         let binding = word8_to_bytes(&tx.binding());
         if let Some(b) = tx.bundle.as_mut() {
             if b.proof.len() == STUB_BUNDLE_LEN && &b.proof[..4] == STUB_MARKER {
                 b.proof[STUB_BUNDLE_BINDING..].copy_from_slice(&binding);
+            }
+            if b.auth_proof.len() == STUB_AUTH_LEN && &b.auth_proof[..5] == STUB_AUTH_MARKER {
+                b.auth_proof[STUB_AUTH_BINDING..].copy_from_slice(&binding);
             }
         }
     }
@@ -413,11 +457,44 @@ impl ConfidentialExecutor for StubExecutor {
         Self::hash_words(b"rand-stub-hidden-bundle-digest", &refs)
     }
 
-    fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+    /// The v1 stand-in's fields, then `auth_commit`, under its own domain — so a v3 digest never
+    /// equals a v1 one, and it binds `auth_commit` as the real v3 preimage does.
+    fn bundle_digest_v3(&self, i: &BundleDigestInput) -> Word8 {
+        let v1 = self.bundle_digest(i);
+        Self::hash_words(b"rand-stub-hidden-bundle-digest-v3", &[&word8_to_bytes(&v1), &word8_to_bytes(&i.auth_commit)])
+    }
+
+    /// The stub reads the digest whatever `hc_bundle` is: a stub proof's guest tag is checked by
+    /// `verify_bundle`, as the zkVM's `hc` is.
+    fn bundle_proof_digest(&self, _hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
         if proof.len() != STUB_BUNDLE_LEN || &proof[..4] != STUB_MARKER {
             return Err(ConfidentialError::MalformedProof);
         }
         Ok(word8_from_bytes(&proof[4..36]).unwrap())
+    }
+
+    fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+        if proof.len() != STUB_AUTH_LEN || &proof[..5] != STUB_AUTH_MARKER {
+            return Err(ConfidentialError::MalformedProof);
+        }
+        Ok(word8_from_bytes(&proof[5..37]).unwrap())
+    }
+
+    fn verify_auth(
+        &self,
+        hc_auth: &Word8,
+        proof: &[u8],
+        binding: &[u32; TX_BINDING_WORDS],
+    ) -> Result<Word8, ConfidentialError> {
+        let c = self.auth_proof_digest(proof)?;
+        let expected = &Hash::digest_domain(b"rand-stub-auth", &word8_to_bytes(hc_auth)).0[..8];
+        if &proof[37..STUB_AUTH_BINDING] != expected {
+            return Err(ConfidentialError::WrongProgram);
+        }
+        if proof[STUB_AUTH_BINDING..] != word8_to_bytes(binding) {
+            return Err(ConfidentialError::InvalidProof("PublicValues".into()));
+        }
+        Ok(c)
     }
 
     fn verify_bundle(
@@ -426,7 +503,7 @@ impl ConfidentialExecutor for StubExecutor {
         proof: &[u8],
         binding: &[u32; TX_BINDING_WORDS],
     ) -> Result<(), ConfidentialError> {
-        self.bundle_proof_digest(proof)?;
+        self.bundle_proof_digest(hc_bundle, proof)?;
         let expected = &Hash::digest_domain(b"rand-stub-bundle", &word8_to_bytes(hc_bundle)).0[..8];
         if &proof[36..STUB_BUNDLE_BINDING] != expected {
             return Err(ConfidentialError::WrongProgram);
@@ -524,7 +601,7 @@ mod tests {
         let d = [5u32; 8];
         let binding = [6u32; 8];
         let p = StubExecutor::make_bundle_proof(&hc, &d, &binding);
-        assert_eq!(StubExecutor.bundle_proof_digest(&p).unwrap(), d);
+        assert_eq!(StubExecutor.bundle_proof_digest(&hc, &p).unwrap(), d);
         assert_eq!(StubExecutor.verify_bundle(&hc, &p, &binding), Ok(()));
         assert_eq!(StubExecutor.verify_bundle(&[4u32; 8], &p, &binding), Err(ConfidentialError::WrongProgram));
         // Task 5b: the stub enforces the binding as the zkVM does — another transaction's words
@@ -533,7 +610,7 @@ mod tests {
         assert_eq!(StubExecutor.verify_bundle(&hc, &p, &[7u32; 8]), public_values);
         let unbound = StubExecutor::make_bundle_proof(&hc, &d, &[0; 8]);
         assert_eq!(StubExecutor.verify_bundle(&hc, &unbound, &binding), public_values);
-        assert_eq!(StubExecutor.bundle_proof_digest(b"junk"), Err(ConfidentialError::MalformedProof));
+        assert_eq!(StubExecutor.bundle_proof_digest(&hc, b"junk"), Err(ConfidentialError::MalformedProof));
         assert_ne!(StubExecutor.node_hash(&[1; 8], &[2; 8]), StubExecutor.node_hash(&[2; 8], &[1; 8]));
     }
 
@@ -551,6 +628,7 @@ mod tests {
             burn_r: 12,
             burn_asset: 13,
             time: 14,
+            auth_commit: [15; 8],
         };
         let d = StubExecutor.bundle_digest(&base);
         let mut changes: Vec<BundleDigestInput> = Vec::new();
@@ -577,6 +655,49 @@ mod tests {
         for c in changes {
             assert_ne!(StubExecutor.bundle_digest(&c), d, "{c:?}");
         }
+    }
+
+    /// The v3 stand-in binds `auth_commit` and every v1 field, under a domain of its own; the v1
+    /// one ignores `auth_commit` (a chain without `hc_auth` hashes as before).
+    #[test]
+    fn the_stub_v3_digest_binds_the_auth_commit_and_v1_ignores_it() {
+        let base = BundleDigestInput {
+            anchor: [1; 8],
+            nullifiers: [[2; 8], [3; 8], [4; 8], [5; 8]],
+            commitments: [[6; 8], [7; 8], [8; 8], [9; 8]],
+            fee: 10,
+            burn_a: 11,
+            burn_r: 12,
+            burn_asset: 13,
+            time: 14,
+            auth_commit: [15; 8],
+        };
+        let mut other = base;
+        other.auth_commit[3] ^= 1;
+        assert_eq!(StubExecutor.bundle_digest(&other), StubExecutor.bundle_digest(&base));
+        assert_ne!(StubExecutor.bundle_digest_v3(&other), StubExecutor.bundle_digest_v3(&base));
+        assert_ne!(StubExecutor.bundle_digest_v3(&base), StubExecutor.bundle_digest(&base));
+        let mut fee = base;
+        fee.fee += 1;
+        assert_ne!(StubExecutor.bundle_digest_v3(&fee), StubExecutor.bundle_digest_v3(&base));
+    }
+
+    #[test]
+    fn stub_auth_proof_publishes_c_and_binds_hc_and_the_binding() {
+        let (hca, c, binding) = ([21u32; 8], [0xc0u32; 8], [6u32; 8]);
+        let p = StubExecutor::make_auth_proof(&hca, &c, &binding);
+        assert_eq!(StubExecutor.auth_proof_digest(&p), Ok(c));
+        assert_eq!(StubExecutor.verify_auth(&hca, &p, &binding), Ok(c));
+        assert_eq!(StubExecutor.verify_auth(&[22; 8], &p, &binding), Err(ConfidentialError::WrongProgram));
+        assert_eq!(
+            StubExecutor.verify_auth(&hca, &p, &[7; 8]),
+            Err(ConfidentialError::InvalidProof("PublicValues".into()))
+        );
+        assert_eq!(StubExecutor.auth_proof_digest(b"junk"), Err(ConfidentialError::MalformedProof));
+        // A bundle proof is not an auth proof, nor the other way round.
+        let bundle = StubExecutor::make_bundle_proof(&hca, &c, &binding);
+        assert_eq!(StubExecutor.auth_proof_digest(&bundle), Err(ConfidentialError::MalformedProof));
+        assert_eq!(StubExecutor.bundle_proof_digest(&hca, &p), Err(ConfidentialError::MalformedProof));
     }
 
     /// Every field the real commitment binds, the stand-in binds too — otherwise a ledger test

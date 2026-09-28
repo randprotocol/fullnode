@@ -176,6 +176,10 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // would admit and apply what its peers refuse — a fork at the first such transaction after its
     // restart.
     ledger.set_hardening_v6(gs.ledger.hardening_v6());
+    // And split authorisation's auth guest (genesis `hc_auth`): a node that came back without it
+    // would recompute the v1 digest and refuse every v3 bundle its peers apply — a fork at the
+    // first transaction after its restart.
+    ledger.set_hc_auth(gs.ledger.hc_auth());
     // And the consensus signing domain (audit v4): `load_ledger` comes back at v0, and a node
     // that kept it on a v1 chain would refuse every peer's proposal at the ledger's own
     // signature check.
@@ -1606,6 +1610,31 @@ pub fn check_build_runs_genesis(gs: &GenesisState, built_hc_bundles: &[randproto
     // has yet been built end to end against it; `docs/aggregation.md`, "Before enabling
     // aggregation", lists what has to happen first. Any genesis carrying an `aggregation` section
     // is refused until then, whichever reason is the last to clear.
+    // Split authorisation (genesis `hc_auth`, delegated proving Phase 2): the auth guest and
+    // bundle guest v3 come as a pair. The ledger recomputes the v3 digest exactly when `hc_auth`
+    // is set, and only v3 publishes it, so a v3 `hc_bundle` without `hc_auth` (or `hc_auth` with a
+    // v1/v2 guest) is a chain on which no bundle can ever be admitted; and an `hc_auth` this
+    // build does not carry is a guest no wallet built from it can prove. Core cannot name guests,
+    // so this is where the pairing is enforced.
+    let v3 = ZkExecutor::hc_hidden_bundle_v3();
+    match gs.ledger.hc_auth() {
+        Some(h) if h != ZkExecutor::hc_auth() => anyhow::bail!(
+            "the genesis hc_auth ({}) is not this build's auth guest ({}); rebuild from the chain's pinned commit",
+            randprotocol_core::notes::word8_to_hex(&h),
+            randprotocol_core::notes::word8_to_hex(&ZkExecutor::hc_auth())
+        ),
+        Some(_) if gs.hc_bundle != v3 => anyhow::bail!(
+            "the genesis names hc_auth (split authorisation) but its hc_bundle ({}) is not bundle guest v3 ({}): \
+             the auth guest needs v3, the only bundle guest that publishes the auth commitment",
+            randprotocol_core::notes::word8_to_hex(&gs.hc_bundle),
+            randprotocol_core::notes::word8_to_hex(&v3)
+        ),
+        None if gs.hc_bundle == v3 => anyhow::bail!(
+            "the genesis pins bundle guest v3 but names no hc_auth: v3 needs hc_auth (split \
+             authorisation) — without it the ledger recomputes the v1 digest and admits no bundle"
+        ),
+        _ => {}
+    }
     if gs.ledger.aggregation().is_some() {
         anyhow::bail!(
             "this genesis enables block aggregation, which is not supported on the hidden-asset \
@@ -4324,8 +4353,11 @@ mod tests {
         // 2-in-2-out guest, say — does not.
         for named in ZkExecutor::known_hc_bundles() {
             gs.hc_bundle = named;
+            // v3 comes with its auth guest (`startup_pairs_bundle_guest_v3_with_hc_auth`).
+            gs.ledger.set_hc_auth((named == ZkExecutor::hc_hidden_bundle_v3()).then(ZkExecutor::hc_auth));
             assert!(check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles()).is_ok());
         }
+        gs.ledger.set_hc_auth(None);
         gs.hc_bundle = ZkExecutor::hc_legacy_bundle();
         let retired = check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles()).unwrap_err().to_string();
         assert!(retired.contains("differs from the genesis hc_bundle"), "{retired}");
@@ -4342,6 +4374,33 @@ mod tests {
         assert!(gated.contains("block aggregation") && gated.contains("re-measured"), "{gated}");
         // And the second reason (the 2026-09-27 recursion-VM report, recommendation 5).
         assert!(gated.contains("RVM-1") && gated.contains("forged-aggregate exercise"), "{gated}");
+    }
+
+    /// Split authorisation: genesis `hc_auth` and bundle guest v3 come as a pair, and `hc_auth`
+    /// must be this build's auth guest. v3 without `hc_auth` would recompute the v1 digest and
+    /// admit nothing; `hc_auth` with a v1/v2 guest likewise (neither publishes the v3 digest); an
+    /// unknown `hc_auth` is a guest no wallet of this build can prove.
+    #[test]
+    fn startup_pairs_bundle_guest_v3_with_hc_auth() {
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        let known = ZkExecutor::known_hc_bundles();
+        gs.hc_bundle = ZkExecutor::hc_hidden_bundle_v3();
+        gs.ledger.set_hc_auth(Some(ZkExecutor::hc_auth()));
+        assert!(check_build_runs_genesis(&gs, &known).is_ok(), "v3 with this build's auth guest starts");
+        gs.ledger.set_hc_auth(None);
+        let bare = check_build_runs_genesis(&gs, &known).unwrap_err().to_string();
+        assert!(bare.contains("v3 needs hc_auth"), "{bare}");
+        gs.ledger.set_hc_auth(Some([0xdead; 8]));
+        let unknown = check_build_runs_genesis(&gs, &known).unwrap_err().to_string();
+        assert!(unknown.contains("not this build's auth guest"), "{unknown}");
+        for old in [ZkExecutor::hc_hidden_bundle(), ZkExecutor::hc_hidden_bundle_v2()] {
+            gs.hc_bundle = old;
+            gs.ledger.set_hc_auth(Some(ZkExecutor::hc_auth()));
+            let paired = check_build_runs_genesis(&gs, &known).unwrap_err().to_string();
+            assert!(paired.contains("is not bundle guest v3"), "{paired}");
+            gs.ledger.set_hc_auth(None);
+            assert!(check_build_runs_genesis(&gs, &known).is_ok(), "v1/v2 without hc_auth: today's chains");
+        }
     }
 
     /// The startup guard is independent of genesis validation (the 2026-09-28 interface fixes):
@@ -4632,6 +4691,8 @@ mod tests {
                 time: 1,
                 envelopes: [env(1), env(2), env(1), env(2)],
                 proof: vec![],
+                auth_commit: [0; 8],
+                auth_proof: Vec::new(),
             };
             let d = StubExecutor.bundle_digest(&b.digest_input());
             b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
@@ -4728,6 +4789,8 @@ mod tests {
             time: l.height() as u32,
             envelopes: [env(1), env(2), env(1), env(2)],
             proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
@@ -5500,6 +5563,8 @@ mod tests {
             time: 1,
             envelopes: [crate::storage::fixtures::env(1), crate::storage::fixtures::env(2), crate::storage::fixtures::env(1), crate::storage::fixtures::env(2)],
             proof,
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, bundle, randprotocol_core::Action::None))
     }
@@ -6008,6 +6073,8 @@ mod tests {
             time: 1,
             envelopes: [crate::storage::fixtures::env(tag), crate::storage::fixtures::env(tag.wrapping_add(1)), crate::storage::fixtures::env(tag), crate::storage::fixtures::env(tag.wrapping_add(1))],
             proof: vec![tag; 32],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, bundle, randprotocol_core::Action::None))
     }

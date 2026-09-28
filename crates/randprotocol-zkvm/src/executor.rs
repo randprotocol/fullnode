@@ -79,6 +79,12 @@ const NO_SHA256: u8 = 0;
 /// other, which is what keeps a junk header from making a node build one.
 const BUNDLE_TIER: usize = 14;
 
+/// The one tier an auth proof (split authorisation, `guests::auth`) may declare: the guest is
+/// straight-line — 250 cycles and 55 permutations for every witness (`tests/auth_spike.rs`,
+/// `the_auth_guest_publishes_c_and_lands_at_tier_10`) — so, like [`BUNDLE_TIER`], it is pinned,
+/// and a junk header cannot make a node build another key.
+pub const AUTH_TIER: usize = 10;
+
 /// The highest tier a *call* proof may declare (deep scan 2026-09-24, zkvm), enforced by
 /// `verify_call` before any verifier key is built, so it is a validity rule (admission and block
 /// apply both run `verify_call`). It is the highest tier `warm` pre-builds, and that is the
@@ -411,6 +417,11 @@ pub struct ZkExecutor {
     /// tables absent), so this cache only ever holds that one key and nothing a program can
     /// deploy reaches it. The vendored cache itself (FIFO, no single-flight) is upstream's.
     bundle_machine: Machine,
+    /// The auth guest's own `Machine` (split authorisation), for the same reason as
+    /// `bundle_machine`: `decode_and_check` pins every component of an auth proof's key
+    /// ([`AUTH_TIER`], the guest's heights, no hash table), so this cache holds that one key and
+    /// neither a deploy nor a bundle can evict it.
+    auth_machine: Machine,
     /// Held across the whole body of `warm` and `warm_bundle` (CPUV-1): at most one warm-up
     /// builds keys at a time on this node, whoever calls it. `node::warm_new_programs` spawns a
     /// blocking task per deploy-carrying commit and the startup warm runs beside them, so before
@@ -431,6 +442,7 @@ impl ZkExecutor {
         ZkExecutor {
             machine: Machine::new(profile),
             bundle_machine: Machine::new(profile),
+            auth_machine: Machine::new(profile),
             warm_lock: std::sync::Mutex::new(()),
             warms_in_flight: std::sync::atomic::AtomicUsize::new(0),
             peak_warms: std::sync::atomic::AtomicUsize::new(0),
@@ -551,6 +563,7 @@ impl ZkExecutor {
         input_log_height: u8,
         public_log_height: u8,
         exact: bool,
+        pinned_tier: usize,
     ) -> Result<Proof, ConfidentialError> {
         let proof = decode_canonical(proof)?;
         check_declared_heights(
@@ -590,8 +603,12 @@ impl ZkExecutor {
         // and 238 permutations to spare) — and it issues neither hash syscall, so both optional
         // tables are absent. `Tier::for_workload` reads cycles and permutations only, so this
         // holds at every FRI profile: the test profile's proofs are the same tier 14.
+        //
+        // `pinned_tier` is that one tier: [`BUNDLE_TIER`] for a bundle proof, [`AUTH_TIER`] for
+        // an auth proof (split authorisation, whose guest is straight-line). Unread when `exact`
+        // is false.
         if exact
-            && (proof.tier != Tier(BUNDLE_TIER)
+            && (proof.tier != Tier(pinned_tier)
                 || proof.keccak_log_height != NO_KECCAK
                 || proof.sha256_log_height != NO_SHA256)
         {
@@ -785,18 +802,66 @@ impl ZkExecutor {
         pinned_heights(Self::hidden_bundle_program(), crate::hidden::hidden_input::COUNT)
     }
 
-    /// `ConfidentialExecutor::bundle_proof_digest` for a hidden bundle proof: the digest it
-    /// publishes, after the same structural checks (exact heights, canonical encoding).
+    /// The digest a hidden bundle proof publishes, after the same structural checks (exact
+    /// heights, canonical encoding), at v1's heights — for a caller that does not know the
+    /// chain's `hc_bundle` (the wallet's remote-prover reply check). Every guest of this build
+    /// shares those heights today (`tests/hidden_bundle.rs` asserts it); the ledger's path,
+    /// `ConfidentialExecutor::bundle_proof_digest`, is keyed by the chain's `hc_bundle`
+    /// ([`Self::hidden_bundle_proof_digest_for`]).
     pub fn hidden_bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
         self.pinned_proof_digest(Self::hidden_bundle_heights(), proof)
     }
 
     /// [`Self::hidden_bundle_proof_digest`] at the heights of the bundle guest `hc`
-    /// ([`Self::bundle_heights_for`]) — what a v3 chain's reader uses (Task 4 wires it; the
-    /// `ConfidentialExecutor::bundle_proof_digest` entry point, which is not handed `hc`, stays
-    /// on v1/v2's heights).
+    /// ([`Self::bundle_heights_for`]) — `ConfidentialExecutor::bundle_proof_digest`, which the
+    /// ledger hands its genesis `hc_bundle`.
     pub fn hidden_bundle_proof_digest_for(&self, hc: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
         self.pinned_proof_digest(Self::bundle_heights_for(hc), proof)
+    }
+
+    /// The auth guest (split authorisation, `guests::auth`, spec
+    /// `docs/superpowers/specs/2026-09-28-delegated-proving-design.md` §4.1): `sk`, `salt` in,
+    /// `c = H(AUTH, nk, salt)` out. Assembled once per process, like the bundle guests.
+    pub fn auth_program() -> &'static Program {
+        static AUTH: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
+        AUTH.get_or_init(crate::guests::auth)
+    }
+
+    /// Digest of the auth guest — what a genesis names as `hc_auth` to run split authorisation.
+    pub fn hc_auth() -> Word8 {
+        Self::auth_program().digest()
+    }
+
+    /// The `(program_log_height, input_log_height, public_log_height)` an auth proof must
+    /// declare: the auth guest's program, its fixed `auth::auth_input::COUNT`-word witness and the
+    /// transaction binding.
+    pub fn auth_heights() -> (u8, u8, u8) {
+        pinned_heights(Self::auth_program(), crate::auth::auth_input::COUNT)
+    }
+
+    /// `ConfidentialExecutor::auth_proof_digest`: the `c` an auth proof publishes, after the
+    /// structural checks at the auth guest's pinned shape. Nothing verified.
+    pub fn auth_proof_commit(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+        let (plh, ilh, pubh) = Self::auth_heights();
+        let p = self.decode_and_check(proof, plh, ilh, pubh, true, AUTH_TIER)?;
+        published_digest(&p.public_values)
+    }
+
+    /// `ConfidentialExecutor::verify_auth`: the auth proof decoded at the pinned shape, verified
+    /// against `hc_auth` with `binding` as its public segment (`verify_public`), and the `c` it
+    /// publishes returned.
+    pub fn verify_auth_proof(
+        &self,
+        hc_auth: &Word8,
+        proof: &[u8],
+        binding: &[u32; TX_BINDING_WORDS],
+    ) -> Result<Word8, ConfidentialError> {
+        let (plh, ilh, pubh) = Self::auth_heights();
+        let p = self.decode_and_check(proof, plh, ilh, pubh, true, AUTH_TIER)?;
+        self.auth_machine
+            .verify_public(hc_auth, binding, &p)
+            .map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+        published_digest(&p.public_values)
     }
 
     /// `ConfidentialExecutor::verify_bundle` for a hidden bundle proof: verified against `hc`
@@ -839,7 +904,7 @@ impl ZkExecutor {
         // `verify`. `decode_and_check` only *ranges* a call's tier, program and input heights;
         // the three checks below pin them against what the chain does know, and every one of
         // them runs before `Machine::verify` builds a verifier key for the declared shape.
-        let proof = self.decode_and_check(proof, 0, 0, 0, false)?;
+        let proof = self.decode_and_check(proof, 0, 0, 0, false, 0)?;
         // The tier cap (deep scan 2026-09-24, zkvm). `check_declared_heights` admits every tier
         // in `TIERS`, and `Machine::verify` builds the verifier key for the declared tier
         // *before* it looks at a byte of STARK data — every pre-check in front of that build is
@@ -955,7 +1020,7 @@ impl ZkExecutor {
     /// The published digest of a proof of a pinned bundle guest whose heights are `heights`.
     fn pinned_proof_digest(&self, heights: (u8, u8, u8), proof: &[u8]) -> Result<Word8, ConfidentialError> {
         let (plh, ilh, pubh) = heights;
-        let p = self.decode_and_check(proof, plh, ilh, pubh, true)?;
+        let p = self.decode_and_check(proof, plh, ilh, pubh, true, BUNDLE_TIER)?;
         published_digest(&p.public_values)
     }
 
@@ -972,7 +1037,7 @@ impl ZkExecutor {
         binding: &[u32; TX_BINDING_WORDS],
     ) -> Result<(), ConfidentialError> {
         let (plh, ilh, pubh) = heights;
-        let p = self.decode_and_check(proof, plh, ilh, pubh, true)?;
+        let p = self.decode_and_check(proof, plh, ilh, pubh, true, BUNDLE_TIER)?;
         self.bundle_machine
             .verify_public(hc, binding, &p)
             .map_err(|e| ConfidentialError::InvalidBundleProof(format!("{e:?}")))
@@ -998,9 +1063,17 @@ fn published_digest(public_values: &[u64]) -> Result<Word8, ConfidentialError> {
 
 /// The core crate's digest record as the hidden guest's (the two are field-for-field the same;
 /// core cannot name a zkvm type, so the copy happens on this side).
+///
+/// `auth_commit` is not a v1 field and is dropped here; [`hidden_digest_input_v3`] carries it.
 pub fn hidden_digest_input(i: &BundleDigestInput) -> crate::hidden::HiddenDigestInput {
-    let BundleDigestInput { anchor, nullifiers, commitments, fee, burn_a, burn_r, burn_asset, time } = *i;
+    let BundleDigestInput { anchor, nullifiers, commitments, fee, burn_a, burn_r, burn_asset, time, auth_commit: _ } = *i;
     crate::hidden::HiddenDigestInput { anchor, nullifiers, commitments, fee, burn_a, burn_r, burn_asset, time }
+}
+
+/// The core crate's digest record as bundle guest v3's (split authorisation): the v1 fields and
+/// the bundle's `auth_commit`.
+pub fn hidden_digest_input_v3(i: &BundleDigestInput) -> crate::hidden::HiddenDigestInputV3 {
+    crate::hidden::HiddenDigestInputV3 { base: hidden_digest_input(i), auth_commit: i.auth_commit }
 }
 
 /// The `(program_log_height, input_log_height, public_log_height)` every proof of a pinned bundle
@@ -1176,8 +1249,27 @@ impl ConfidentialExecutor for ZkExecutor {
         crate::hidden::hidden_bundle_digest(&hidden_digest_input(i))
     }
 
-    fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
-        self.hidden_bundle_proof_digest(proof)
+    /// Bundle guest v3's digest (`hidden::hidden_bundle_digest_v3`): v1's preimage with the
+    /// bundle's `auth_commit` before the taint word.
+    fn bundle_digest_v3(&self, i: &BundleDigestInput) -> Word8 {
+        crate::hidden::hidden_bundle_digest_v3(&hidden_digest_input_v3(i))
+    }
+
+    fn bundle_proof_digest(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+        self.hidden_bundle_proof_digest_for(hc_bundle, proof)
+    }
+
+    fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+        self.auth_proof_commit(proof)
+    }
+
+    fn verify_auth(
+        &self,
+        hc_auth: &Word8,
+        proof: &[u8],
+        binding: &[u32; TX_BINDING_WORDS],
+    ) -> Result<Word8, ConfidentialError> {
+        self.verify_auth_proof(hc_auth, proof, binding)
     }
 
     fn verify_bundle(
@@ -1491,6 +1583,26 @@ pub fn prove_bundle_for(
         )
     })?;
     prove_pinned_bundle(profile, program, ZkExecutor::bundle_input_words(hc), "hidden bundle", inputs, binding, backend)
+}
+
+/// The auth proof a wallet makes itself (split authorisation, spec
+/// `docs/superpowers/specs/2026-09-28-delegated-proving-design.md` §4.1): the auth guest over
+/// `sk` and the per-transaction `salt` (256 fresh random bits — a repeated salt repeats `c` and
+/// links two transactions; the wallet, not the guest, enforces freshness), proved against the
+/// transaction's `binding`. Returns (proof bytes, the published `c`, tier) — `c` is
+/// `auth::auth_commit(nk, salt)`, the bundle's `auth_commit`.
+pub fn prove_auth(
+    profile: FriProfile,
+    sk: &crate::notes::SpendKey,
+    salt: &Word8,
+    binding: &[u32; TX_BINDING_WORDS],
+    backend: Backend,
+) -> Result<(Vec<u8>, Word8, u8), String> {
+    let inputs = crate::auth::auth_inputs(sk, salt);
+    let m = Machine::new(profile);
+    let (proof, exec) =
+        m.prove_with(backend, ZkExecutor::auth_program(), &inputs, binding, None).map_err(|e| format!("{e:?}"))?;
+    Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
 }
 
 fn prove_pinned_bundle(
@@ -1953,5 +2065,41 @@ mod tests {
         );
         pvs.truncate(pv::OUT0 + 4);
         assert!(matches!(published_digest(&pvs), Err(ConfidentialError::MalformedProof)), "a short vector is refused too");
+    }
+
+    /// Split authorisation: the trait's v3 digest is bundle guest v3's own
+    /// (`hidden::hidden_bundle_digest_v3` over the core record, `auth_commit` included), the v1
+    /// digest ignores `auth_commit`, and `hc_auth` is the auth guest's digest.
+    #[test]
+    fn the_v3_digest_and_hc_auth_are_the_guests() {
+        use super::*;
+        let input = BundleDigestInput {
+            anchor: [1; 8],
+            nullifiers: [[2; 8], [3; 8], [4; 8], [5; 8]],
+            commitments: [[6; 8], [7; 8], [8; 8], [9; 8]],
+            fee: 10,
+            burn_a: 11,
+            burn_r: 12,
+            burn_asset: 13,
+            time: 14,
+            auth_commit: [15; 8],
+        };
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let want = crate::hidden::hidden_bundle_digest_v3(&crate::hidden::HiddenDigestInputV3 {
+            base: hidden_digest_input(&input),
+            auth_commit: [15; 8],
+        });
+        assert_eq!(ex.bundle_digest_v3(&input), want);
+        let mut other = input;
+        other.auth_commit[0] ^= 1;
+        assert_ne!(ex.bundle_digest_v3(&other), want);
+        assert_eq!(ex.bundle_digest(&other), ex.bundle_digest(&input), "v1 does not read auth_commit");
+        assert_ne!(ex.bundle_digest(&input), want);
+        assert_eq!(ZkExecutor::hc_auth(), crate::guests::auth().digest());
+        assert!(!ZkExecutor::known_hc_bundles().contains(&ZkExecutor::hc_auth()), "not a bundle guest");
+        assert_eq!(ZkExecutor::auth_heights().2, public::public_log_height(TX_BINDING_WORDS));
+        // Junk is refused by the cheap reader, never read as a `c`.
+        assert_eq!(ex.auth_proof_digest(b"junk"), Err(ConfidentialError::MalformedProof));
+        assert_eq!(ex.verify_auth(&ZkExecutor::hc_auth(), b"junk", &[0; 8]), Err(ConfidentialError::MalformedProof));
     }
 }

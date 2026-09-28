@@ -206,7 +206,7 @@ pub struct RemoteProver {
 pub(crate) type PublishedDigest = std::sync::Arc<dyn Fn(FriProfile, &[u8]) -> Result<Word8> + Send + Sync>;
 
 fn executor_digest(profile: FriProfile, proof: &[u8]) -> Result<Word8> {
-    ZkExecutor::new(profile).bundle_proof_digest(proof).map_err(|e| anyhow!("{e}"))
+    ZkExecutor::new(profile).hidden_bundle_proof_digest(proof).map_err(|e| anyhow!("{e}"))
 }
 
 impl RemoteProver {

@@ -409,6 +409,16 @@ pub struct Genesis {
     /// the state root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardening_v6: Option<bool>,
+    /// Split authorisation (delegated proving Phase 2, spec
+    /// `docs/superpowers/specs/2026-09-28-delegated-proving-design.md` §4.1): the auth guest's
+    /// program commitment, 64 hex characters. Present, every bundle must carry an auth proof of
+    /// this guest publishing its `auth_commit`, and the bundle digest is the v3 one; `hc_bundle`
+    /// must then be bundle guest v3, which the node checks at startup (core cannot name guests).
+    /// Absent is today's rules, byte for byte. Part of the genesis hash, tagged and appended
+    /// after `hardening_v6`, only when present — so chains 14, 15 and 16 hash as before; never
+    /// part of the state root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hc_auth: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -478,6 +488,8 @@ pub enum GenesisError {
     BadVesting(String),
     #[error("bad hc_bundle {0} (64 hex characters)")]
     BadHcBundle(String),
+    #[error("bad hc_auth {0} (64 hex characters)")]
+    BadHcAuth(String),
     #[error("bad alloc note {0}")]
     BadNote(String),
     #[error("duplicate alloc note {0}")]
@@ -823,6 +835,11 @@ impl Genesis {
         ledger.set_max_program_public_words(self.max_program_public_words.map_or(gas::MAX_PROGRAM_PUBLIC_WORDS, |n| n as usize));
         ledger.set_envelope_bytes(self.envelope_bytes.map(|n| n as usize));
         ledger.set_hardening_v6(self.hardening_v6 == Some(true));
+        let hc_auth = match &self.hc_auth {
+            Some(h) => Some(word8_from_hex(h).ok_or_else(|| GenesisError::BadHcAuth(h.clone()))?),
+            None => None,
+        };
+        ledger.set_hc_auth(hc_auth);
         // The genesis ledger is positioned at the genesis block, so it carries that block's
         // time structurally rather than relying on every caller to patch it in. The timestamp
         // is transient state, not part of the state root or the genesis hash.
@@ -1104,6 +1121,12 @@ impl Genesis {
         if self.hardening_v6 == Some(true) {
             commit.extend_from_slice(b"hardening_v6");
             commit.push(1);
+        }
+        // Split authorisation's auth guest, after the v0.6 switch: tagged and appended only when
+        // the file names one, so chains 14, 15 (`cc30e085…`) and 16 (`20925ae6…`) hash as before.
+        if let Some(hc_auth) = ledger.hc_auth() {
+            commit.extend_from_slice(b"hc_auth");
+            commit.extend_from_slice(&word8_to_bytes(&hc_auth));
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -1512,6 +1535,7 @@ mod tests {
             envelope_bytes: None,
             vesting: None,
             hardening_v6: None,
+            hc_auth: None,
         }
     }
 
@@ -2841,6 +2865,41 @@ mod tests {
         assert_eq!(g.ledger.state_root(), s.ledger.state_root(), "a parameter, not state");
         assert!(on.to_json().contains("\"hardening_v6\": true"));
         assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "and it round-trips");
+    }
+
+    /// Split authorisation's `hc_auth` is opt-in per chain: absent, the file, the hash and the
+    /// ledger are as before (chains 14–16 hash unchanged — the node pins their files); present, it
+    /// is bound into the hash (after `hardening_v6`), set on the ledger, never state, and a
+    /// malformed one is refused.
+    #[test]
+    fn hc_auth_is_bound_into_the_hash_only_when_present() {
+        let plain = genesis(2);
+        assert_eq!(plain.hc_auth, None);
+        assert!(!plain.to_json().contains("hc_auth"), "an absent pin is absent from the file");
+        let s = build(&plain);
+        assert_eq!(s.ledger.hc_auth(), None);
+
+        let mut on = plain.clone();
+        on.hc_auth = Some(word8_to_hex(&[21; 8]));
+        let g = build(&on);
+        assert_eq!(g.ledger.hc_auth(), Some([21; 8]), "the ledger runs the guest genesis names");
+        assert_ne!(g.hash(), s.hash(), "the rule is a different chain");
+        assert_eq!(g.ledger.state_root(), s.ledger.state_root(), "a parameter, not state");
+        let mut other = plain.clone();
+        other.hc_auth = Some(word8_to_hex(&[22; 8]));
+        assert_ne!(build(&other).hash(), g.hash(), "and the pin itself is bound");
+        assert!(on.to_json().contains("\"hc_auth\""));
+        assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "and it round-trips");
+        // After `hardening_v6`, and independent of it.
+        let mut both = on.clone();
+        both.hardening_v6 = Some(true);
+        let mut v6 = plain.clone();
+        v6.hardening_v6 = Some(true);
+        assert!([s.hash(), g.hash(), build(&v6).hash()].iter().all(|h| *h != build(&both).hash()));
+
+        let mut bad = plain.clone();
+        bad.hc_auth = Some("not hex".into());
+        assert!(matches!(bad.build(&StubExecutor), Err(GenesisError::BadHcAuth(_))));
     }
 
     /// The cap must be a program length the zkVM can prove: at least one word, and no more than

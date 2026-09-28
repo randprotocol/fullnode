@@ -1024,6 +1024,8 @@ mod tests {
             envelopes: [env(), env(), env(), env()],
             // A constraint-set-5 bundle proof, to the byte measured on chain 8.
             proof: vec![7u8; 1_321_773],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         let tx = Transaction::shielded(7, bundle, Action::None);
         let posted = serde_json::to_vec(&json!({

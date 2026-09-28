@@ -129,6 +129,7 @@ fn zusd_genesis(validators: &[randprotocol_core::Keypair]) -> Genesis {
         max_program_public_words: None,
         envelope_bytes: None,
         hardening_v6: None,
+        hc_auth: None,
         staking: None,
         vesting: None,
     }
@@ -225,6 +226,8 @@ async fn junk_bundle(n: &TestNode, fee: u64, burn_asset: u32, burn_a: u64, seed:
         time,
         envelopes: [e.clone(), e.clone(), e.clone(), e],
         proof: vec![0xff; 32],
+        auth_commit: [0; 8],
+        auth_proof: Vec::new(),
     };
     (bundle, time)
 }

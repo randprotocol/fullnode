@@ -99,7 +99,8 @@ pub fn open_memo(e: &Envelope, cm: Word8, key: &TxKey) -> Option<String> {
 }
 
 /// The public preimage of a hidden-asset bundle digest, in spec §3.4 field order, packaged as the
-/// record `randprotocol-core` passes around.
+/// record `randprotocol-core` passes around. `auth_commit` (split authorisation) is zero: the v1
+/// digest does not read it; a v3 caller sets the field on the record it gets back.
 #[allow(clippy::too_many_arguments)]
 pub fn digest_input_of(
     anchor: Word8,
@@ -111,7 +112,7 @@ pub fn digest_input_of(
     burn_asset: u32,
     time: u32,
 ) -> BundleDigestInput {
-    BundleDigestInput { anchor, nullifiers, commitments, fee, burn_a, burn_r, burn_asset, time }
+    BundleDigestInput { anchor, nullifiers, commitments, fee, burn_a, burn_r, burn_asset, time, auth_commit: [0; 8] }
 }
 
 #[cfg(test)]

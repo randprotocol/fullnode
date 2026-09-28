@@ -1071,7 +1071,7 @@ fn a_mixed_hidden_bundle_proves_at_tier_14_and_verifies_only_against_its_binding
         di.anchor, di.nullifiers, di.commitments, di.fee, di.burn_a, di.burn_r, di.burn_asset, di.time,
     );
     assert_eq!(ex.bundle_digest(&core), digest, "the ledger recomputes the published digest");
-    assert_eq!(ex.bundle_proof_digest(&proof).unwrap(), digest);
+    assert_eq!(ex.bundle_proof_digest(&hc, &proof).unwrap(), digest);
     assert_eq!(ex.verify_bundle(&ZkExecutor::hc_bundle(), &proof, &BINDING_A), Ok(()));
     assert_eq!(
         ex.verify_bundle(&ZkExecutor::hc_bundle(), &proof, &BINDING_B),
@@ -1122,7 +1122,7 @@ fn a_mixed_hidden_bundle_proves_at_tier_14_and_verifies_only_against_its_binding
         let bytes = junk.to_bytes();
         assert_eq!(ex.verify_hidden_bundle(&hc, &bytes, &BINDING_A), Err(pinned.clone()), "tier {tier} klh {klh} shh {shh}");
         assert_eq!(ex.hidden_bundle_proof_digest(&bytes), Err(pinned.clone()), "and the digest path");
-        assert_eq!(ex.bundle_proof_digest(&bytes), Err(pinned.clone()), "and the trait the ledger calls");
+        assert_eq!(ex.bundle_proof_digest(&hc, &bytes), Err(pinned.clone()), "and the trait the ledger calls");
     }
     // The honest header — tier 14, neither hash table — is what the pin accepts, which the
     // successful verify above already showed; re-encoding it unchanged must still pass, so the
@@ -1155,7 +1155,7 @@ fn a_hidden_bundle_proved_against_the_empty_segment_is_refused() {
         assert_eq!(ex.verify_bundle(&ZkExecutor::hc_bundle(), &bytes, &binding), Err(refused.clone()));
     }
     use randprotocol_core::confidential::ConfidentialExecutor;
-    assert_eq!(ex.bundle_proof_digest(&bytes), Ok(exec.outputs));
+    assert_eq!(ex.bundle_proof_digest(&ZkExecutor::hc_bundle(), &bytes), Ok(exec.outputs));
 }
 
 /// The branch-free guest proved once (Test profile — the tier and table heights do not depend
@@ -1180,7 +1180,7 @@ fn a_branch_free_bundle_proves_at_tier_14_at_the_pinned_shape() {
     assert_eq!((decoded.tier, decoded.keccak_log_height, decoded.sha256_log_height), (Tier(14), 0, 0));
     println!("declared: program {} input {} public {} mem {}", decoded.program_log_height, decoded.input_log_height, decoded.public_log_height, decoded.mem_log_height);
     let ex = ZkExecutor::new(FriProfile::Test);
-    assert_eq!(ex.bundle_proof_digest(&proof).unwrap(), digest);
+    assert_eq!(ex.bundle_proof_digest(&hc2, &proof).unwrap(), digest);
     assert_eq!(ex.verify_bundle(&hc2, &proof, &BINDING_A), Ok(()));
     assert_eq!(ex.verify_bundle(&hc2, &proof, &BINDING_B), Err(ConfidentialError::InvalidBundleProof("PublicValues".into())));
     assert!(ex.verify_bundle(&ZkExecutor::hc_hidden_bundle(), &proof, &BINDING_A).is_err(), "v1's hc refuses a v2 proof");
@@ -1210,6 +1210,6 @@ fn a_branch_free_bundle_at_the_production_profile_fits_the_proof_cap() {
         randprotocol_core::gas::MAX_PROOF_BYTES
     );
     let ex = ZkExecutor::new(FriProfile::Production);
-    assert_eq!(ex.bundle_proof_digest(&proof).unwrap(), digest);
+    assert_eq!(ex.bundle_proof_digest(&hc2, &proof).unwrap(), digest);
     assert_eq!(ex.verify_bundle(&hc2, &proof, &BINDING_A), Ok(()));
 }

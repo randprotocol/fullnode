@@ -626,11 +626,26 @@ impl Action {
     }
 }
 
-/// `b` with its `proof` replaced by the empty vector and every other field kept — the bundle
-/// half of [`Action::blanked`]. Every field is named, for the same reason: a new `Bundle` field
-/// does not compile until it is classified.
+/// `b` with both its proofs — `proof` and the split-authorisation `auth_proof` — replaced by the
+/// empty vector and every other field kept, `auth_commit` among them — the bundle half of
+/// [`Action::blanked`]. Every field is named, for the same reason: a new `Bundle` field does not
+/// compile until it is classified. The auth proof is blanked because it is proved against this
+/// binding (it cannot commit to itself); `auth_commit` is public and stays inside.
 fn blank_bundle(b: &Bundle) -> Bundle {
-    let Bundle { anchor, nullifiers, commitments, fee, burn_a, burn_r, burn_asset, time, envelopes, proof: _ } = b;
+    let Bundle {
+        anchor,
+        nullifiers,
+        commitments,
+        fee,
+        burn_a,
+        burn_r,
+        burn_asset,
+        time,
+        envelopes,
+        proof: _,
+        auth_commit,
+        auth_proof: _,
+    } = b;
     Bundle {
         anchor: *anchor,
         nullifiers: *nullifiers,
@@ -642,6 +657,8 @@ fn blank_bundle(b: &Bundle) -> Bundle {
         time: *time,
         envelopes: envelopes.clone(),
         proof: Vec::new(),
+        auth_commit: *auth_commit,
+        auth_proof: Vec::new(),
     }
 }
 
@@ -724,6 +741,13 @@ impl Transaction {
     /// block's pruned transactions whole: envelopes, action, everything but the proof bytes the
     /// covering aggregate stands in for (the pre-v0.1 review's M1). A bundle-less transaction
     /// hashes its bytes as is.
+    ///
+    /// Split authorisation (delegated proving Phase 2, domain `rand-txid-3`): the bundle's
+    /// `auth_commit` enters as is and its `auth_proof` by its digest, like the bundle proof. The
+    /// pruned form replaces only `proof`, never `auth_proof`, so it still hashes to the raw id.
+    /// **Every transaction id changes** with this domain and view, on every chain the build runs
+    /// — together with the wire change of the two `Bundle` fields, the reason the build carrying
+    /// them (v0.6.3) runs chain 17 only.
     pub fn hash(&self) -> Hash {
         #[derive(Serialize)]
         struct BundleView<'a> {
@@ -737,6 +761,8 @@ impl Transaction {
             time: u32,
             envelopes: &'a [Envelope; BUNDLE_SLOTS],
             proof_hash: Hash,
+            auth_commit: &'a Word8,
+            auth_proof_hash: Hash,
         }
         #[derive(Serialize)]
         struct TxView<'a> {
@@ -755,9 +781,11 @@ impl Transaction {
             time: b.time,
             envelopes: &b.envelopes,
             proof_hash: crate::notes::pruned_proof_hash(&b.proof).unwrap_or_else(|| Hash::digest(&b.proof)),
+            auth_commit: &b.auth_commit,
+            auth_proof_hash: Hash::digest(&b.auth_proof),
         });
         let view = TxView { chain_id: self.chain_id, bundle, action: &self.action };
-        Hash::digest_domain(b"rand-txid-2", &bincode::serialize(&view).expect("Transaction serializes"))
+        Hash::digest_domain(b"rand-txid-3", &bincode::serialize(&view).expect("Transaction serializes"))
     }
 
     /// What every bundle proof of this transaction is bound to: blake3 under
@@ -907,7 +935,76 @@ mod tests {
             time: 9,
             envelopes: [env(), env(), env(), env()],
             proof: vec![9; 40],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         }
+    }
+
+    /// Split authorisation: the transaction id takes the auth proof by its digest, like the
+    /// bundle proof (`rand-txid-3`), so two transactions differing only in their auth proof —
+    /// or only in `auth_commit` — have different ids, while the pruned marker form (which
+    /// replaces only `proof`) keeps the raw id. The binding blanks the auth proof and keeps
+    /// `auth_commit`.
+    #[test]
+    fn txid_covers_the_auth_proof_by_digest() {
+        let mut b = bundle();
+        b.auth_commit = [0xc0; 8];
+        b.auth_proof = vec![0xa0; 50];
+        let t = Transaction::shielded(13, b, Action::None);
+        let mut other_proof = t.clone();
+        other_proof.bundle.as_mut().unwrap().auth_proof = vec![0xa1; 50];
+        assert_ne!(other_proof.hash(), t.hash(), "the auth proof is inside the id");
+        assert_eq!(other_proof.binding(), t.binding(), "and outside the binding it is proved against");
+        let mut other_commit = t.clone();
+        other_commit.bundle.as_mut().unwrap().auth_commit = [0xc1; 8];
+        assert_ne!(other_commit.hash(), t.hash(), "auth_commit is inside the id");
+        assert_ne!(other_commit.binding(), t.binding(), "and inside the binding");
+        // By digest, not by bytes: the id is the digest of a view carrying `Hash::digest(auth_proof)`.
+        let mut marker = t.clone();
+        let bm = marker.bundle.as_mut().unwrap();
+        let ph = Hash::digest(&bm.proof);
+        bm.proof = [crate::notes::PRUNED_PROOF_MARKER, ph.as_bytes()].concat();
+        assert_eq!(marker.hash(), t.hash(), "the pruned form keeps the raw id, auth proof and all");
+        // And the domain moved: an id with empty auth fields is not the rand-txid-2 id of the
+        // same bytes (every transaction id changes with this build — chain 17 only).
+        let plain = Transaction::shielded(13, bundle(), Action::None);
+        #[derive(serde::Serialize)]
+        struct V2<'a> {
+            chain_id: u64,
+            bundle: Option<V2Bundle<'a>>,
+            action: &'a Action,
+        }
+        #[derive(serde::Serialize)]
+        struct V2Bundle<'a> {
+            anchor: &'a Word8,
+            nullifiers: &'a [Word8; BUNDLE_SLOTS],
+            commitments: &'a [Word8; BUNDLE_SLOTS],
+            fee: u64,
+            burn_a: u64,
+            burn_r: u64,
+            burn_asset: u32,
+            time: u32,
+            envelopes: &'a [Envelope; BUNDLE_SLOTS],
+            proof_hash: Hash,
+        }
+        let pb = plain.bundle.as_ref().unwrap();
+        let v2 = V2 {
+            chain_id: 13,
+            bundle: Some(V2Bundle {
+                anchor: &pb.anchor,
+                nullifiers: &pb.nullifiers,
+                commitments: &pb.commitments,
+                fee: pb.fee,
+                burn_a: pb.burn_a,
+                burn_r: pb.burn_r,
+                burn_asset: pb.burn_asset,
+                time: pb.time,
+                envelopes: &pb.envelopes,
+                proof_hash: Hash::digest(&pb.proof),
+            }),
+            action: &plain.action,
+        };
+        assert_ne!(plain.hash(), Hash::digest_domain(b"rand-txid-2", &bincode::serialize(&v2).unwrap()));
     }
 
     /// The golden encodings (final review, item 3): the byte-vector fields that ride the CBOR
@@ -921,6 +1018,15 @@ mod tests {
     /// `burn`/`asset`), so the call and attest fixtures — which carry a bundle — encode and hash
     /// differently. The bundle-less aggregate fixture did not move, and neither did any
     /// variant tag before `TokenBurn` (`TokenTransfer` was the one after `SetAuthority`).
+    ///
+    /// Re-pinned again, deliberately, for split authorisation (delegated proving Phase 2, the
+    /// chain-17 hard fork): a bundle's encoding grows by `auth_commit` and an empty `auth_proof` —
+    /// 40 zero bytes after the proof, exactly — so the call and attest encodings move, and every id
+    /// moves with the `rand-txid-3` domain, the bundle-less aggregate's included (its encoding did
+    /// not move). Before: call id `07801ac23f33f0d8b00d6e369f947ddee6afcab406f0d7905cd41bd3775bf1d5`,
+    /// attest encoding `a6ec2084406fa08c02c05bd50142daf06a723fdbdda856d68cd41a34e02772c6` and id
+    /// `a6fe97af73dda142415401c7e755f8532f081bd3fcacfae3fc833e057be1ea23`, aggregate id
+    /// `a25cb696d9d92cecb09c0b4d4c818ae30c6e29ecda1d73944395843e3f350e0f`.
     #[test]
     fn the_consensus_encoding_and_txid_are_pinned() {
         let call = Transaction::shielded(
@@ -991,16 +1097,17 @@ mod tests {
         "000202020204000000000000000303030310000000000000000404040404040404040404040404040408000000000000",
         "000101010101010101040000000000000002020202040000000000000003030303100000000000000004040404040404",
         "040404040404040404280000000000000009090909090909090909090909090909090909090909090909090909090909",
-        "090909090909090909030000000707070707070707070707070707070707070707070707070707070707070707000100",
-        "0000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a",
-        "2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a",
-        "5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a",
-        "8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9ba",
-        "bbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9ea",
-        "ebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff010500000000000000a1a1a1a1a10300000000000000b2b2b20200",
-        "000000000000c3c30700000000000000d4d4d4d4d4d4d4",
+        "090909090909090909000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000300000007070707070707070707070707070707070707070707070707070707070707070001000000000000000102",
+        "030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132",
+        "333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162",
+        "636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192",
+        "939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2",
+        "c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2",
+        "f3f4f5f6f7f8f9fafbfcfdfeff010500000000000000a1a1a1a1a10300000000000000b2b2b20200000000000000c3c3",
+        "0700000000000000d4d4d4d4d4d4d4",
     );
-    const CALL_ID: &str = "07801ac23f33f0d8b00d6e369f947ddee6afcab406f0d7905cd41bd3775bf1d5";
+    const CALL_ID: &str = "fa79972d2125643097ccf253c9b4c326e33abc4c250cb64630787a4c90735282";
     /// Moved by the bridge hardening's B3, deliberately: `BridgeAttest` gained its last field,
     /// `pq_signatures`, so an attest's encoding grows by that list (here empty — an 8-byte zero
     /// length) and its id moves with it. A hard fork for a bridged chain only — no running chain
@@ -1010,10 +1117,10 @@ mod tests {
     /// `04aa8e8f2dadcd9f93cdeeb79850f0f535f4ca901e7ea162d5e560f2d8f3d690` (id); the new encoding is
     /// exactly that one followed by the eight zero bytes. The call and the aggregate pins did not
     /// move.
-    const ATTEST_ENCODING_BLAKE3: &str = "a6ec2084406fa08c02c05bd50142daf06a723fdbdda856d68cd41a34e02772c6";
-    const ATTEST_ID: &str = "a6fe97af73dda142415401c7e755f8532f081bd3fcacfae3fc833e057be1ea23";
+    const ATTEST_ENCODING_BLAKE3: &str = "1de4200cee6184eec917fcf13ec968f926157cecaf1fe7c4b249fe00ee561836";
+    const ATTEST_ID: &str = "2234de2343de1cb0ae0b758bc3765fce6b3d49e74ec7b8fd7abc6f0da87c2ef6";
     const AGGREGATE_ENCODING_BLAKE3: &str = "c5f06333b3d6f2e744f6edeb66b612723c1bc4fcf7f98fd8249b40226af64d64";
-    const AGGREGATE_ID: &str = "a25cb696d9d92cecb09c0b4d4c818ae30c6e29ecda1d73944395843e3f350e0f";
+    const AGGREGATE_ID: &str = "da7be1091cabf0cc0489eb619aab0ad5801970c965ecef6e2912a3168845afb2";
 
     #[test]
     fn transactions_roundtrip_and_hash_their_full_encoding() {
@@ -1899,6 +2006,10 @@ mod tests {
     /// consensus encoding (`Transaction::encode`) — and a golden value pins the binding itself, so
     /// a wallet written against this function and a ledger built from it can never disagree
     /// silently, and a change to the blanking or the encoding shows up here as a hard fork.
+    ///
+    /// Re-pinned for split authorisation (the chain-17 hard fork): the blanked bundle carries
+    /// `auth_commit` and an empty `auth_proof`. Before:
+    /// `154da8ece535cc3502bbb5bc7280ae0cdbd768ac6f71a43a2fb515653ea248dd`.
     #[test]
     fn the_binding_encoding_is_pinned() {
         use bincode::Options;
@@ -1906,6 +2017,7 @@ mod tests {
         // The blanked transaction, written out by hand.
         let mut blank = tx.clone();
         blank.bundle.as_mut().unwrap().proof.clear();
+        blank.bundle.as_mut().unwrap().auth_proof.clear();
         let pinned = bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .with_little_endian()
@@ -1919,5 +2031,5 @@ mod tests {
         assert_eq!(hex::encode(digest.0), BURN_BINDING);
     }
 
-    const BURN_BINDING: &str = "154da8ece535cc3502bbb5bc7280ae0cdbd768ac6f71a43a2fb515653ea248dd";
+    const BURN_BINDING: &str = "612f84f4a11155f511d1343bf06fb61e6c90ec8c3c266372db7441340e2bb457";
 }

@@ -133,6 +133,22 @@ pub struct Bundle {
     /// `postcard(rand_zkvm::Proof)` of the hidden-asset bundle guest.
     #[serde(with = "crate::crypto::wire_bytes")]
     pub proof: Vec<u8>,
+    /// Split authorisation (delegated proving Phase 2, spec
+    /// `docs/superpowers/specs/2026-09-28-delegated-proving-design.md` §4.1): the auth
+    /// commitment `c = H(AUTH, nk, salt)` the bundle guest v3 folds into its digest and the auth
+    /// proof publishes. Public, inside [`crate::types::Transaction::binding`]. `[0; 8]` on every
+    /// chain whose genesis names no `hc_auth` (the ledger refuses anything else there).
+    pub auth_commit: Word8,
+    /// `postcard(rand_zkvm::Proof)` of the auth guest (genesis `hc_auth`), proved against the
+    /// transaction's binding and publishing `auth_commit`. Empty on a chain without `hc_auth`.
+    /// Never pruned: a sealed (pruned) bundle replaces only `proof` with the marker form, and
+    /// keeps this proof, which the sync path verifies as admission does.
+    ///
+    /// Both fields sit at the end of the struct and are positional on the wire (bincode), so a
+    /// build carrying them cannot decode a bundle written without them — a hard fork, which is
+    /// why the build that introduces them (v0.6.3) runs chain 17 only.
+    #[serde(with = "crate::crypto::wire_bytes")]
+    pub auth_proof: Vec<u8>,
 }
 
 /// The public preimage of a bundle digest, minus the taint word the verifier fixes to zero —
@@ -147,6 +163,10 @@ pub struct BundleDigestInput {
     pub burn_r: u64,
     pub burn_asset: u32,
     pub time: u32,
+    /// The bundle's [`Bundle::auth_commit`]. Only the v3 digest
+    /// ([`crate::confidential::ConfidentialExecutor::bundle_digest_v3`]) reads it; the v1 digest
+    /// (`bundle_digest`) ignores it, so a chain without genesis `hc_auth` hashes as before.
+    pub auth_commit: Word8,
 }
 
 /// Test helper: widen a two-word note set to a bundle's four slots, deriving the two extra words
@@ -188,6 +208,7 @@ impl Bundle {
             burn_r: self.burn_r,
             burn_asset: self.burn_asset,
             time: self.time,
+            auth_commit: self.auth_commit,
         }
     }
 }

@@ -97,8 +97,8 @@ pub const VERIFIED_SET_ENTRIES: usize = 8192;
 /// the proofs instead of re-verifying them.
 ///
 /// Bounded and FIFO like the refused cache, and keyed on the transaction hash for the same
-/// reason the whole scheme is sound: the hash binds the proof (`rand-txid-2` takes it by
-/// digest, and the transaction binding covers the rest), so a stale entry can only ever say
+/// reason the whole scheme is sound: the hash binds the proof (`rand-txid-3` takes it, and the
+/// split-authorisation auth proof, by digest, and the transaction binding covers the rest), so a stale entry can only ever say
 /// "these exact bytes verified" — never vouch for a different transaction. An entry whose
 /// transaction was then refused by the pool for a *state* reason (a lost conflict, a stale
 /// anchor) is kept deliberately: the proof did verify, and the stateful half is re-checked at
@@ -344,6 +344,12 @@ pub fn is_permanent(e: &TxError) -> bool {
         TxError::InvalidProof(_)
             | TxError::InvalidBundleProof(_)
             | TxError::BadDigest
+            // Split authorisation: the auth fields against the genesis gate, and the auth proof
+            // against the pinned auth guest and the transaction's own binding — all the bytes'.
+            | TxError::AuthUnexpected
+            | TxError::AuthMissing
+            | TxError::AuthMismatch
+            | TxError::InvalidAuthProof(_)
             | TxError::BadMintSignature
             // A mint's commitment is a function of its own bytes (`ledger::mint_commitment`).
             | TxError::MintCommitmentMismatch

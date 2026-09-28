@@ -1699,6 +1699,10 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
         time,
         envelopes,
         proof: Vec::new(),
+        // Split authorisation (a v3 chain) is the wallet's next task; a v1/v2 bundle carries no
+        // auth fields, which is what every chain without genesis `hc_auth` requires.
+        auth_commit: [0; 8],
+        auth_proof: Vec::new(),
     };
     Ok(Prepared { bundle, words, expected, guest: ZkExecutor::hc_bundle() })
 }
@@ -4471,7 +4475,7 @@ mod tests {
             }
         }
         let recomputed = ZkExecutor::new(FriProfile::Test).bundle_digest(&b.digest_input());
-        assert_eq!(StubExecutor.bundle_proof_digest(&b.proof).unwrap(), recomputed, "the ledger's digest is the guest's");
+        assert_eq!(StubExecutor.bundle_proof_digest(&[0; 8], &b.proof).unwrap(), recomputed, "the ledger's digest is the guest's");
         assert_eq!(StubExecutor.verify_bundle(&EMULATED_HC, &b.proof, &tx.binding()), Ok(()), "bound to this transaction");
     }
 
@@ -4499,6 +4503,8 @@ mod tests {
             time: 1,
             envelopes: [env(), env(), env(), env()],
             proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         }
     }
 
@@ -6295,6 +6301,8 @@ mod tests {
                 env(),
             ],
             proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         (Transaction::shielded(7, bundle, Action::None), k_pay, k_change, pay, change)
     }
@@ -6365,6 +6373,8 @@ mod tests {
                 env(),
             ],
             proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         let tx = Transaction::shielded(7, bundle, Action::None);
         let rows = output_keys(&me, &tx);
@@ -6553,6 +6563,8 @@ mod tests {
                 time: 9,
                 envelopes: [env(), env(), env(), env()],
                 proof: Vec::new(),
+                auth_commit: [0; 8],
+                auth_proof: Vec::new(),
             },
             words: Vec::new(),
             expected: [0; 8],
@@ -6567,7 +6579,7 @@ mod tests {
         prove_transaction_by(&mut tx, |b| std::future::ready(stub(&prepared, &b))).await.unwrap();
         let binding = tx.binding();
         let b = tx.bundle.as_ref().unwrap();
-        assert_eq!(StubExecutor.bundle_proof_digest(&b.proof).unwrap(), StubExecutor.bundle_digest(&b.digest_input()));
+        assert_eq!(StubExecutor.bundle_proof_digest(&[0; 8], &b.proof).unwrap(), StubExecutor.bundle_digest(&b.digest_input()));
         assert_eq!(StubExecutor.verify_bundle(&HC, &b.proof, &binding), Ok(()));
         // The copied-proof attack against what the wallet built: the destination changed, the
         // proof kept. It does not verify for the copy.
@@ -6599,6 +6611,8 @@ mod tests {
             time: 9,
             envelopes: [env(), env(), env(), env()],
             proof: Vec::new(),
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         let prepared = Prepared { bundle: bundle(10), words: Vec::new(), expected: [0; 8], guest: ZkExecutor::hc_bundle() };
         let id = Hash::digest(b"program");

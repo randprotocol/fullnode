@@ -2146,6 +2146,8 @@ mod tests {
             time: l.height() as u32,
             envelopes: [fixtures::env(1), fixtures::env(2), fixtures::env(1), fixtures::env(2)],
             proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &d, &[0; 8]);

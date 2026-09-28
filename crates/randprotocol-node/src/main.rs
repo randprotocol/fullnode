@@ -892,6 +892,10 @@ async fn main() -> Result<()> {
                 // The v0.6 `hardening_v6` switch: absent unless asked for, so a genesis cut without
                 // it hashes byte-for-byte as before.
                 hardening_v6: hardening_v6.then_some(true),
+                // Split authorisation's auth guest: none from this command yet (`--auth-guest`
+                // with `--bundle-guest v3` is the next task's), so a genesis cut here hashes
+                // byte-for-byte as before.
+                hc_auth: None,
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
@@ -1734,6 +1738,30 @@ mod tests {
         assert!(gen.validators.iter().all(|v| minters.contains(&v.public_key.address())));
     }
 
+    /// Split authorisation's genesis `hc_auth` is hashed only when present (after
+    /// `hardening_v6`), so the committed chain-15 and chain-16 files — neither names one — still
+    /// hash to their live genesis, build ledgers without the rule, and rewrite without the field.
+    #[test]
+    fn the_genesis_hash_is_unchanged_without_hc_auth() {
+        for (file, hash) in [
+            ("genesis-chain15.json", "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8"),
+            ("genesis-chain16.json", "20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005"),
+        ] {
+            let path = format!("{}/../../deploy/{file}", env!("CARGO_MANIFEST_DIR"));
+            let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(gen.hc_auth, None, "{file} predates split authorisation");
+            let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+            let state = gen.build(executor.as_ref()).unwrap();
+            assert_eq!(state.hash().to_hex(), hash, "{file}");
+            assert_eq!(state.ledger.hc_auth(), None, "{file}: the ledger keeps the v1 digest");
+            assert!(!gen.to_json().contains("hc_auth"), "{file}: rewriting the file adds no field");
+            // And the same file naming the auth guest is another chain.
+            let mut split = gen.clone();
+            split.hc_auth = Some(word8_to_hex(&ZkExecutor::hc_auth()));
+            assert_ne!(split.build(executor.as_ref()).unwrap().hash().to_hex(), hash, "{file}");
+        }
+    }
+
     /// v0.6.1 is constraint set 7: every verifier key moved, so no bundle or call proof chains 14
     /// and 15 committed verifies on this build. Both genesis files pin guest v1, which this build
     /// still carries (a new chain may pin it), so the `hc_bundle` check alone let a v0.6.1 binary
@@ -2040,6 +2068,7 @@ mod tests {
             max_program_public_words: None,
             envelope_bytes: None,
             hardening_v6: None,
+            hc_auth: None,
             staking: None,
             vesting: None,
         }
@@ -2143,6 +2172,8 @@ mod tests {
             time: 1,
             envelopes: [env(), env(), env(), env()],
             proof: b"the bundle proof".to_vec(),
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         MovingNode {
             height: std::cell::Cell::new(100),

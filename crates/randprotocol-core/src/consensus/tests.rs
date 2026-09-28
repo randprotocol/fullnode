@@ -109,6 +109,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         max_program_public_words: None,
         envelope_bytes: None,
         hardening_v6: None,
+        hc_auth: None,
         bridge: bridged.then(|| crate::bridge::BridgeConfig {
             emitter: [1; 32],
             guardians: vec![[2; 20]],
@@ -726,6 +727,8 @@ fn a_ledger_resumed_at_height_h_accepts_a_bundle_timed_at_h() {
         time: h as u32,
         envelopes: [env(), env(), env(), env()],
         proof: vec![],
+        auth_commit: [0; 8],
+        auth_proof: Vec::new(),
     };
     let d = StubExecutor.bundle_digest(&b.digest_input());
     b.proof = StubExecutor::make_bundle_proof(&tip.hc_bundle(), &d, &[0; 8]);
@@ -1339,6 +1342,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         max_program_public_words: None,
         envelope_bytes: None,
         hardening_v6: None,
+        hc_auth: None,
         bridge: None,
         tokens: None,
         aggregation: None,
@@ -1483,6 +1487,8 @@ fn staking_tx(l: &Ledger, n: u32, burn: u64, action: crate::types::Action) -> Tr
         time: l.height() as u32,
         envelopes: [env(), env(), env(), env()],
         proof: vec![],
+        auth_commit: [0; 8],
+        auth_proof: Vec::new(),
     };
     let d = StubExecutor.bundle_digest(&b.digest_input());
     b.proof = StubExecutor::make_bundle_proof(&l.hc_bundle(), &d, &[0; 8]);
@@ -1814,6 +1820,7 @@ fn aggregation_node_with(
         max_program_public_words: None,
         envelope_bytes: None,
         hardening_v6: None,
+        hc_auth: None,
         bridge: None,
         tokens: None,
         aggregation: Some(cfg.clone()),
@@ -1846,6 +1853,8 @@ fn aggregation_node_with(
             crate::notes::Envelope { kem_ct: vec![4; 8], to_receiver: vec![5; 4], to_sender: vec![6; 4], body: vec![7; 16] },
         ],
         proof: vec![],
+        auth_commit: [0; 8],
+        auth_proof: Vec::new(),
     };
     let d = StubExecutor.bundle_digest(&b.digest_input());
     b.proof = StubExecutor::make_bundle_proof(&[3; 8], &d, &[0; 8]);

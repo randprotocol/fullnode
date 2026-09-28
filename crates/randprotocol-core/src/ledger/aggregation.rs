@@ -1179,6 +1179,7 @@ mod tests {
             envelope_bytes: None,
             vesting: None,
             hardening_v6: None,
+            hc_auth: None,
         }
     }
 
@@ -1318,6 +1319,8 @@ mod register_tests {
             time: l.height as u32,
             envelopes: [env(), env(), env(), env()],
             proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
@@ -1687,6 +1690,8 @@ mod admission_tests {
             time: l.height() as u32,
             envelopes: [env(), env(), env(), env()],
             proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
@@ -1894,8 +1899,17 @@ mod admission_tests {
             fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
                 StubExecutor.bundle_digest(input)
             }
-            fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
-                StubExecutor.bundle_proof_digest(proof)
+            fn bundle_digest_v3(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+                StubExecutor.bundle_digest_v3(input)
+            }
+            fn bundle_proof_digest(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+                StubExecutor.bundle_proof_digest(hc_bundle, proof)
+            }
+            fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+                StubExecutor.auth_proof_digest(proof)
+            }
+            fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
+                StubExecutor.verify_auth(hc_auth, proof, binding)
             }
             fn verify_bundle(&self, hc: &Word8, proof: &[u8], binding: &[u32; crate::types::TX_BINDING_WORDS]) -> Result<(), ConfidentialError> {
                 StubExecutor.verify_bundle(hc, proof, binding)
@@ -2413,6 +2427,8 @@ mod payment_tests {
             time: l.height() as u32,
             envelopes: [env(), env(), env(), env()],
             proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
