@@ -159,6 +159,7 @@ start)
 wait)
   GENESIS=${2:?wait <genesis file>}
   NEW=$(genesis_hash "$GENESIS")
+  [ -n "$NEW" ] || { echo "wait: could not derive the genesis hash locally (set LOCAL_NODE to a rand-node of this release)" >&2; exit 1; }
   for i in $(seq 1 90); do
     sleep 20; ok=0
     for ip in $ALL; do
