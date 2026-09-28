@@ -350,11 +350,32 @@ impl RemoteProver {
     ) -> Result<(Vec<u8>, u8)> {
         let started = Instant::now();
         let mut shown = String::new();
+        // Set while `prover_status` cannot be reached, so an outage is announced once, not per poll.
+        let mut unreachable = false;
         let sealed_reply = loop {
             if started.elapsed() > self.max_wait {
                 return Err(anyhow!("the prover did not finish within {:.0?}; the job was cancelled", self.max_wait));
             }
-            let s = self.call("prover_status", json!([job])).await?;
+            // A transport failure (a reset, the client's timeout, a proxy's 502 page) says nothing
+            // about the job, which may be seconds from done: keep polling until `max_wait`. Only
+            // the prover's own JSON-RPC error (an unknown job after a restart, say) ends the wait.
+            let s = match self.call("prover_status", json!([job])).await {
+                Ok(s) => {
+                    unreachable = false;
+                    s
+                }
+                Err(e) if is_transport_error(&e) => {
+                    if !unreachable {
+                        eprintln!("prover {} unreachable ({e:#}), retrying…", self.paired.label());
+                        unreachable = true;
+                        // The next state line is printed again once it answers.
+                        shown.clear();
+                    }
+                    tokio::time::sleep(self.poll).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let line = match s["state"].as_str().unwrap_or("") {
                 "queued" => match s["position"].as_u64() {
                     Some(p) => format!("queued on {} at position {p}…", self.paired.label()),
@@ -416,6 +437,13 @@ impl RemoteProver {
     }
 }
 
+/// Whether a failed [`RemoteProver::call`] never got a JSON-RPC answer from the prover — the
+/// request did not go through, or what came back was not the prover's (not JSON, no result, over
+/// the cap) — as opposed to the prover's own [`RpcError`].
+fn is_transport_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RpcError>().is_none()
+}
+
 /// A `prover_submit` refusal in words: `busy` names the queue, the others what the prover said.
 fn submit_error(e: anyhow::Error, label: &str) -> anyhow::Error {
     let Some(r) = e.downcast_ref::<RpcError>() else { return e };
@@ -455,6 +483,10 @@ mod tests {
         Done { flip: u32, publish_flip: u32, proof_len: usize },
         /// `proving`, for ever.
         Never,
+        /// `failed`, with this error.
+        Failed(&'static str),
+        /// `expired`.
+        Expired,
     }
 
     struct Fake {
@@ -464,6 +496,8 @@ mod tests {
         /// Every method asked, in order.
         seen: Vec<String>,
         reply_key: Option<[u8; 32]>,
+        /// Answers to the first `prover_status` calls, one each, before `finish` takes over.
+        status_first: std::collections::VecDeque<Reply>,
     }
 
     fn info_for(key: &ProverKey) -> Value {
@@ -486,7 +520,7 @@ mod tests {
         let mut info = info_for(&key);
         edit_info(&mut info);
         let kem_ek = key.kem_ek().to_vec();
-        let state = Arc::new(Mutex::new(Fake { key, info, finish, seen: Vec::new(), reply_key: None }));
+        let state = Arc::new(Mutex::new(Fake { key, info, finish, seen: Vec::new(), reply_key: None, status_first: Default::default() }));
         let s = state.clone();
         let url = rpc_fn(move |method, params| {
             let mut f = s.lock().unwrap();
@@ -506,8 +540,11 @@ mod tests {
                     f.reply_key = Some(job.reply_key);
                     Reply::Ok(json!({ "job": "j1" }))
                 }
+                "prover_status" if !f.status_first.is_empty() => f.status_first.pop_front().unwrap(),
                 "prover_status" => match f.finish {
                     Finish::Never => Reply::Ok(json!({ "state": "proving" })),
+                    Finish::Failed(error) => Reply::Ok(json!({ "state": "failed", "error": error })),
+                    Finish::Expired => Reply::Ok(json!({ "state": "expired" })),
                     Finish::Done { flip, publish_flip, proof_len } => {
                         let mut digest = EXPECTED;
                         digest[0] ^= flip;
@@ -639,6 +676,63 @@ mod tests {
         let e = prove(&r, 1000).await.unwrap_err().to_string();
         assert!(e.contains("did not finish"), "{e}");
         assert_eq!(state.lock().unwrap().seen.last().map(String::as_str), Some("prover_cancel"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transient_poll_failure_is_retried_not_cancelled() {
+        // A reset, then a proxy's error page, then `proving`, then done: the wallet waits it out.
+        let (paired, state) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, true, |_| {}).await;
+        state.lock().unwrap().status_first.extend([
+            Reply::Drop,
+            Reply::Malformed("<html>502 Bad Gateway</html>"),
+            Reply::Ok(json!({ "state": "proving" })),
+        ]);
+        let (proof, tier) = prove(&quick(paired), 1000).await.unwrap();
+        assert_eq!((proof.len(), tier), (100, 14));
+        let seen = state.lock().unwrap().seen.clone();
+        assert!(!seen.contains(&"prover_cancel".to_string()), "no cancel: {seen:?}");
+        assert_eq!(seen.iter().filter(|m| *m == "prover_status").count(), 4, "{seen:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_poll_answered_with_the_provers_own_error_ends_the_wait() {
+        // A prover that restarted no longer knows the job: its JSON-RPC error is definite.
+        let (paired, state) = fake(Finish::Never, true, |_| {}).await;
+        state.lock().unwrap().status_first.push_back(Reply::Err(-32001, "unknown job"));
+        let e = prove(&quick(paired), 1000).await.unwrap_err().to_string();
+        assert!(e.contains("unknown job"), "{e}");
+        let seen = state.lock().unwrap().seen.clone();
+        assert_eq!(seen.iter().filter(|m| *m == "prover_status").count(), 1, "no retry: {seen:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prover_that_stays_unreachable_times_out() {
+        let (paired, state) = fake(Finish::Never, true, |_| {}).await;
+        state.lock().unwrap().status_first.extend((0..1000).map(|_| Reply::Drop));
+        let mut r = quick(paired);
+        r.poll = Duration::from_millis(20);
+        r.max_wait = Duration::from_millis(300);
+        let e = prove(&r, 1000).await.unwrap_err().to_string();
+        assert!(e.contains("did not finish"), "{e}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_job_surfaces_the_provers_error() {
+        let (paired, state) = fake(Finish::Failed("out of memory at tier 14"), true, |_| {}).await;
+        let e = prove(&quick(paired), 1000).await.unwrap_err().to_string();
+        assert!(e.contains("the prover failed the job: out of memory at tier 14"), "{e}");
+        let seen = state.lock().unwrap().seen.clone();
+        // One status answer ends it; the best-effort cancel follows, as for every refused job.
+        assert_eq!(seen, ["prover_info", "prover_submit", "prover_status", "prover_cancel"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_expired_job_is_a_definite_error() {
+        let (paired, state) = fake(Finish::Expired, true, |_| {}).await;
+        let e = prove(&quick(paired), 1000).await.unwrap_err().to_string();
+        assert!(e.contains("expired"), "{e}");
+        let seen = state.lock().unwrap().seen.clone();
+        assert_eq!(seen, ["prover_info", "prover_submit", "prover_status", "prover_cancel"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
