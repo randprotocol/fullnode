@@ -211,6 +211,31 @@ impl GasPolicy {
     }
 }
 
+/// Phase 2 (spec §7.1): the two live prices a chain with `gas.dynamic` moves once per block.
+/// Consensus state (`Ledger::gas_prices`): folded into the state root under `rand-state-7` when
+/// the controller is on, persisted beside `META_SUPPLY`, replay-audited. Without `dynamic` the
+/// section's own prices, which never move; without a section, zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GasPrices {
+    /// Units per gas.
+    pub gas_price: u64,
+    /// Units per KiB (or part) of call proof plus input envelope.
+    pub byte_price: u64,
+}
+
+/// Spec §7.1's controller: `max(min, price + price·adjust_bps·(used − target)/(10 000·target))`,
+/// in i128 (saturating) with Rust's truncating division (toward zero), saturating at `u64::MAX`, never below
+/// `min`. A zero `target` is read as 1 (genesis refuses one; this only keeps the division
+/// defined). Deterministic by construction: integers only, no rounding mode to disagree on.
+pub fn next_price(price: u64, min: u64, used: u64, target: u64, adjust_bps: u32) -> u64 {
+    let target = target.max(1) as i128;
+    // `price·adjust_bps` is under 2^77 (genesis caps `adjust_bps` at 5 000); the product with a
+    // `used` near `u64::MAX` could still pass i128, so it saturates rather than wraps.
+    let delta = (price as i128).saturating_mul(adjust_bps as i128).saturating_mul(used as i128 - target) / (10_000 * target);
+    let next = (price as i128).saturating_add(delta).clamp(0, u64::MAX as i128) as u64;
+    next.max(min)
+}
+
 /// The floor a bundle must pay before the action's proof is verified. A call's tier-dependent
 /// part is only known once its proof has been decoded, so it is charged afterwards
 /// (`Ledger::validate`); this floor is what keeps that work from being bought for nothing.
@@ -683,5 +708,18 @@ mod gas_config_tests {
         assert!(bad(DynamicGas { target_block_gas: 0, ..base.clone() }).contains("target_block_gas"));
         assert!(bad(DynamicGas { min_gas_price: 101, ..base.clone() }).contains("min_gas_price"), "the floor cannot exceed the starting price");
         assert!(bad(DynamicGas { min_byte_price: 801, ..base.clone() }).contains("min_byte_price"));
+    }
+
+    /// Spec §7.1: price' = max(min, price + price·adjust·(used − target)/(10 000·target)).
+    #[test]
+    fn the_controller_moves_prices_by_fullness() {
+        let t = 2u64 << 20;
+        assert_eq!(next_price(800, 800, t, t, 1250), 800, "at target: unchanged");
+        assert_eq!(next_price(800, 800, 0, t, 1250), 800, "empty block at the floor stays at the floor");
+        assert_eq!(next_price(1_000, 800, 0, t, 1250), 875, "empty block: −12.5 %");
+        assert_eq!(next_price(1_000, 800, 2 * t, t, 1250), 1_125, "twice the target: +12.5 %");
+        assert_eq!(next_price(1_000, 800, 3 * t, t, 1250), 1_250, "three times the target: +25 % (bytes cannot exceed 2× a half-cap target; gas can)");
+        assert_eq!(next_price(u64::MAX, 800, 2 * t, t, 5000), u64::MAX, "saturates");
+        assert_eq!(next_price(100, 100, 0, 1 << 18, 1250), 100, "gas: floor holds");
     }
 }

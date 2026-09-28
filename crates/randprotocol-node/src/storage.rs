@@ -195,6 +195,14 @@ const META_BOND_QUEUE: &str = "bond_queue";
 /// audit subtracts it on the right of its identity: the fee left the pool into no register
 /// entry.
 const META_REGISTRATION_FEES_BURNED: &str = "registration_fees_burned";
+/// `bincode(GasPrices)`: the live gas prices as of the head (Phase 2, spec §7.1,
+/// `Ledger::gas_prices`). Consensus state under `gas.dynamic` — in the state root under
+/// `rand-state-7` and `Ledger`'s equality — written at the same sites as
+/// `META_REGISTRATION_FEES_BURNED` (genesis init, every commit, the repair), restored by
+/// `load_ledger` and replayed by `verify_chain`. Absent on a database written before the key
+/// existed: `load_ledger` then leaves the ledger's prices unset, which reads as the genesis
+/// section's own prices once `reload_ledger` sets the section — so a chain-16/17 datadir opens.
+const META_GAS_PRICES: &str = "gas_prices";
 /// JSON of the vesting register (genesis vesting, `ledger::vesting::VestingRegister`) as of the
 /// head: every entry's claimed, revoked, bonded and nonce state and the released counter.
 /// Consensus state — hashed into the state root under `rand-state-6`, inside `Ledger`'s equality
@@ -710,6 +718,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&gs.ledger.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(gs.ledger.bond_queue())?);
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&gs.ledger.registration_fees_burned())?);
+        batch.put_cf(self.cf(CF_META), META_GAS_PRICES, bincode::serialize(&gs.ledger.gas_prices())?);
         self.put_vesting(&mut batch, gs.ledger.vesting())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
@@ -1111,6 +1120,13 @@ impl Storage {
     /// the key existed: 0, which on a chain without the gate is also the only value it holds.
     pub fn registration_fees_burned(&self) -> Result<u64> {
         Ok(self.get_meta_raw(META_REGISTRATION_FEES_BURNED)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
+    /// The live gas prices as of the head (Phase 2, `META_GAS_PRICES`), or `None` on a database
+    /// written before the key existed — "the genesis section's prices", which is what the
+    /// ledger reads once its section is set.
+    pub fn gas_prices(&self) -> Result<Option<randprotocol_core::gas::GasPrices>> {
+        Ok(self.get_meta_raw(META_GAS_PRICES)?.map(|b| bincode::deserialize(&b)).transpose()?)
     }
 
     /// The proving-share bucket as of the head — `supply()`'s twin, with the same rule for a
@@ -1938,6 +1954,9 @@ impl Storage {
         ledger.set_faucet_epoch_counters(faucet_epoch, faucet_minted);
         ledger.set_bond_queue(self.bond_queue()?);
         ledger.set_registration_fees_burned(self.registration_fees_burned()?);
+        if let Some(p) = self.gas_prices()? {
+            ledger.set_gas_prices(p);
+        }
         ledger.set_vesting(self.vesting()?);
         ledger.set_unsealed_fees(self.unsealed_fees()?);
         ledger.set_aggregators(self.aggregators()?);
@@ -2262,6 +2281,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger_after.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger_after.bond_queue())?);
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger_after.registration_fees_burned())?);
+        batch.put_cf(self.cf(CF_META), META_GAS_PRICES, bincode::serialize(&ledger_after.gas_prices())?);
         self.put_vesting(&mut batch, ledger_after.vesting())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
@@ -2631,7 +2651,21 @@ impl Storage {
         // The snapshot families must match the replayed chain. `Ledger`'s equality covers the
         // tree, the commitment and nullifier sets, the anchors, the validators and the programs
         // — everything these families hold.
-        match self.load_ledger(executor) {
+        // The stored ledger carries no genesis parameters; the gas section is the one the
+        // comparison needs, so an unset (pre-key) price reads as the section's, like a restart.
+        match self.load_ledger(executor).map(|mut stored| {
+            stored.set_gas(gs.ledger.gas().cloned());
+            stored
+        }) {
+            // The live gas prices (Phase 2): inside the equality, hashed under `gas.dynamic`,
+            // named first so the repair knows the key.
+            Ok(stored) if stored.gas_prices() != ledger.gas_prices() => {
+                check.problem = Some(format!(
+                    "stored gas prices {:?} do not match the replayed chain's {:?}",
+                    stored.gas_prices(),
+                    ledger.gas_prices()
+                ))
+            }
             // The faucet's epoch counters (audit v4, STAKE-2) are inside `Ledger`'s equality —
             // hashed into the root on a chain with a `staking` section — so a stale pair would
             // otherwise surface as the generic snapshot mismatch below. Named first, so the
@@ -2909,6 +2943,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger.bond_queue())?);
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger.registration_fees_burned())?);
+        batch.put_cf(self.cf(CF_META), META_GAS_PRICES, bincode::serialize(&ledger.gas_prices())?);
         self.put_vesting(&mut batch, ledger.vesting())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
@@ -4407,7 +4442,7 @@ mod tests {
         ledger.set_height(1);
         ledger.set_timestamp_ms(1);
         ledger.apply_transactions(std::slice::from_ref(&tx), &key(1).address(), &StubExecutor).unwrap();
-        ledger.close_block(1, &key(1).address());
+        ledger.close_block(1, &key(1).address(), 0, 0);
         let b1 = make_block_unchecked(&gs.block, &ledger, vec![tx], &key(1));
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         let before = ledger.validators()[&key(1).address()].rewards;
@@ -4417,7 +4452,7 @@ mod tests {
         ledger.set_height(2);
         ledger.set_timestamp_ms(2);
         ledger.apply_transactions(&[], &key(2).address(), &StubExecutor).unwrap();
-        ledger.close_block(2, &key(2).address());
+        ledger.close_block(2, &key(2).address(), 0, 0);
         assert_eq!(ledger.validators()[&key(1).address()].rewards, before + 60, "the sweep credited key 1");
         let b2 = make_block_unchecked(&b1, &ledger, vec![], &key(2));
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
@@ -6147,6 +6182,69 @@ mod tests {
         let mut g = genesis_file_of(7, &[&key(1)], vec![], 2);
         g.staking = Some(randprotocol_core::genesis::StakingConfig { faucet_budget_per_epoch: budget, bond_activation_epochs: 1, ..Default::default() });
         g.build(&StubExecutor).unwrap()
+    }
+
+    /// Phase 2 (spec §7.1): the live gas prices are consensus state beside `META_SUPPLY` —
+    /// written at genesis init, committed with the state, restored by `load_ledger` (and not
+    /// clobbered by `reload_ledger`'s `set_gas`), audited by `verify_chain`'s replay, rewritten by
+    /// the repair — and a database written before the key reads as the section's prices.
+    #[test]
+    fn the_gas_prices_are_persisted_restored_and_audited() {
+        use randprotocol_core::gas::{DynamicGas, GasConfig, GasMetering, GasPrices};
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let mut g = genesis_file_of(7, &[&key(1)], vec![], 2);
+        g.gas = Some(GasConfig {
+            gas_price: 200,
+            byte_price: 1_600,
+            bundle_gas_limit: 16_383,
+            metering: GasMetering::Circuit,
+            dynamic: Some(DynamicGas {
+                target_block_bytes: 4096,
+                target_block_gas: 20_000,
+                adjust_bps: 1250,
+                min_gas_price: 100,
+                min_byte_price: 800,
+            }),
+        });
+        let gs = g.build(&StubExecutor).unwrap();
+        let start = GasPrices { gas_price: 200, byte_price: 1_600 };
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.gas_prices().unwrap(), Some(start), "written at genesis init");
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap().gas_prices(), start);
+
+        // An empty block: both prices fall toward their floors, and the header commits to them.
+        let mut ledger = gs.ledger.clone();
+        ledger.set_height(1);
+        ledger.set_timestamp_ms(1);
+        ledger.apply_transactions(&[], &key(1).address(), &StubExecutor).unwrap();
+        ledger.close_block(1, &key(1).address(), 0, 0);
+        let moved = ledger.gas_prices();
+        assert_eq!(moved, GasPrices { gas_price: 175, byte_price: 1_400 });
+        let b1 = make_block_unchecked(&gs.block, &ledger, vec![], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.gas_prices().unwrap(), Some(moved), "committed with the state");
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap().gas_prices(), moved, "restored");
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.gas_prices(), moved, "set_gas after load_ledger keeps the restored prices");
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // Stale prices are named by the audit, not folded into a generic snapshot mismatch.
+        s.db.put_cf(s.cf(CF_META), META_GAS_PRICES, bincode::serialize(&start).unwrap()).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.expect("stale prices are a problem");
+        assert!(problem.contains("gas prices"), "{problem}");
+        assert_eq!(check.last_good, 1, "the block itself is fine");
+        // The repair rewrites them from the replay (`truncate_to` at the head).
+        s.truncate_to(&gs, 1, &check.ledger).unwrap();
+        assert_eq!(s.gas_prices().unwrap(), Some(moved));
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A database written before the key existed: the section's prices, once it is set.
+        s.db.delete_cf(s.cf(CF_META), META_GAS_PRICES).unwrap();
+        assert_eq!(s.gas_prices().unwrap(), None);
+        assert_eq!(crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap().gas_prices(), start);
     }
 
     /// Audit v5, TOK-2: the burned registration fees are a supply counter beside `META_SUPPLY`

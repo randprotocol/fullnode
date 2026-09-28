@@ -408,6 +408,9 @@ pub struct CallReceiptData {
     /// The call's input envelope, carried through to the receipt unread (spec §6.1); see
     /// [`call_envelope`] for the one rule the chain applies to it.
     pub input_envelope: Option<crate::types::CallEnvelope>,
+    /// What this call adds to its block's `gas_used` for the Phase 2 controller
+    /// ([`Ledger::call_gas_used`]; 0 until B3). Not on the stored receipt.
+    pub gas_used: u64,
 }
 
 /// What `validate_inner` verified that `apply_tx` would otherwise verify again: a call's
@@ -606,6 +609,13 @@ pub struct Ledger {
     /// parameter like `max_program_words` and `envelope_bytes`: outside the state root and this
     /// ledger's equality, restored by `reload_ledger` on every restart.
     gas: Option<gas::GasConfig>,
+    /// Phase 2 (spec §7.1): the live prices, once the controller has moved them or storage has
+    /// restored them. `None` means "the section's own prices" — what a fresh genesis ledger, and
+    /// a database written before `META_GAS_PRICES` existed, start from — so `set_gas` (which
+    /// `reload_ledger` runs *after* `load_ledger` restores this) can never clobber moved prices.
+    /// Read through [`Ledger::gas_prices`] only. Consensus state under `gas.dynamic`: in the
+    /// state root (`rand-state-7`) and in this ledger's equality (by effective value).
+    gas_prices: Option<gas::GasPrices>,
     /// Genesis `hardening_v6`, the v0.6 switch: each stricter rule below is the node's pool policy
     /// on every chain and a validity rule here only when this is set (the zkVM/ISA review's R4,
     /// one activation for all of them):
@@ -711,6 +721,9 @@ impl PartialEq for Ledger {
             // The vesting register: consensus state under its section, `None` on both sides
             // without one.
             && self.vesting == o.vesting
+            // The live gas prices (Phase 2): consensus state under `gas.dynamic`, compared by
+            // effective value so a restored `Some(section prices)` equals an unmoved `None`.
+            && self.gas_prices() == o.gas_prices()
     }
 }
 impl Eq for Ledger {}
@@ -757,6 +770,7 @@ impl Ledger {
             max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
             envelope_bytes: None,
             gas: None,
+            gas_prices: None,
             hardening_v6: false,
             hc_auth: None,
             aggregators: BTreeMap::new(),
@@ -814,6 +828,7 @@ impl Ledger {
             max_program_public_words: gas::MAX_PROGRAM_PUBLIC_WORDS,
             envelope_bytes: None,
             gas: None,
+            gas_prices: None,
             hardening_v6: false,
             hc_auth: None,
             aggregators: BTreeMap::new(),
@@ -1272,10 +1287,48 @@ impl Ledger {
         self.gas.as_ref()
     }
 
-    /// Set by genesis from `gas`, and by `reload_ledger` on every restart. Not yet consumed by
-    /// anything else in the tree — the fee floor and price rules are a later task, spec §4.2.
+    /// Set by genesis from `gas`, and by `reload_ledger` on every restart (after `load_ledger`
+    /// restored the live prices, which this leaves alone — see `gas_prices`). Read by the Phase 2
+    /// controller (`close_block`) and the state root; the fee floor rules are a later task.
     pub fn set_gas(&mut self, g: Option<gas::GasConfig>) {
         self.gas = g;
+    }
+
+    /// The live gas prices (spec §7.1): what the controller last moved them to or storage
+    /// restored, else the section's own `gas_price`/`byte_price` (the prices a genesis starts
+    /// from — the "initialised from the section" case, read lazily so `set_gas`'s place in
+    /// `reload_ledger` does not matter), else zero on a chain without a `gas` section.
+    pub fn gas_prices(&self) -> gas::GasPrices {
+        self.gas_prices.unwrap_or_else(|| {
+            self.gas.as_ref().map_or(gas::GasPrices::default(), |g| gas::GasPrices { gas_price: g.gas_price, byte_price: g.byte_price })
+        })
+    }
+
+    /// Restore the prices a node persisted beside the state (`META_GAS_PRICES`) — `set_supply`'s
+    /// twin.
+    pub fn set_gas_prices(&mut self, p: gas::GasPrices) {
+        self.gas_prices = Some(p);
+    }
+
+    /// The gas a verified call adds to its block's `gas_used` (spec §7.1). **0 today, on
+    /// purpose**: the call's declared `GAS_LIMIT` reaches `CallOutcome` only with the
+    /// constraint-set-8 vendor (B1); B3 reads `outcome.gas_limit` here once the cs8 vendor lands,
+    /// red-first against `a_calls_gas_used_is_zero_until_b3`. Until then a block's gas is its
+    /// bundles' flat `bundle_gas_limit` alone.
+    pub fn call_gas_used(outcome: &crate::program::CallOutcome) -> u64 {
+        let _ = outcome;
+        0
+    }
+
+    /// What a block of `txs` feeds the controller, given the Σ of its calls' gas
+    /// (`CallReceiptData::gas_used`): `(bytes_used, gas_used)` = (Σ `encoded_len`, calls' gas +
+    /// `bundle_gas_limit` per transaction carrying a bundle proof). One function for the
+    /// proposer (`HotStuff::propose`) and the replica (`apply_block_for_sync`), which must agree.
+    pub fn block_usage(&self, txs: &[Transaction], call_gas: u64) -> (u64, u64) {
+        let bundle_gas = self.gas.as_ref().map_or(0, |g| g.bundle_gas_limit);
+        let bytes = txs.iter().fold(0u64, |a, tx| a.saturating_add(tx.encoded_len() as u64));
+        let bundles = txs.iter().filter(|tx| tx.bundle.is_some()).count() as u64;
+        (bytes, call_gas.saturating_add(bundles.saturating_mul(bundle_gas)))
     }
 
     /// The note-envelope rule: exactly `envelope_bytes` when the genesis sets it, else at most
@@ -2145,6 +2198,7 @@ impl Ledger {
                     // The digest the proof was just checked against (`verify_call`).
                     h_pub: self.programs.get(program).and_then(|r| r.public_digest),
                     input_envelope: input_envelope.clone(),
+                    gas_used: Ledger::call_gas_used(&o),
                 });
             }
             a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. }) => {
@@ -2402,7 +2456,9 @@ impl Ledger {
         scratch.set_height(block.height());
         scratch.set_timestamp_ms(block.header.timestamp_ms);
         let data = scratch.apply_transactions_for_sync(&block.transactions, &proposer, covered, pruned, executor, verified_proofs)?;
-        scratch.close_block(block.height(), &proposer);
+        let call_gas = data.iter().fold(0u64, |a, (_, r)| a.saturating_add(r.gas_used));
+        let (bytes_used, gas_used) = scratch.block_usage(&block.transactions, call_gas);
+        scratch.close_block(block.height(), &proposer, bytes_used, gas_used);
         let computed = scratch.state_root();
         if computed != block.header.state_root {
             // Components, not just the composite: the divergence names the ledger half it
@@ -2439,8 +2495,20 @@ impl Ledger {
     /// paths on purpose: the proposer's header root and the replica's recomputed root must come
     /// from the same steps, or the first expired bucket makes every leader reject its own block
     /// (the pre-v0.1 review's L1).
-    pub fn close_block(&mut self, height: u64, proposer: &Address) {
+    ///
+    /// Phase 2 (spec §7.1): on a chain with `gas.dynamic`, the controller then moves each live
+    /// price by this block's fullness — `gas_price` by `gas_used` against `target_block_gas`,
+    /// `byte_price` by `bytes_used` against `target_block_bytes` ([`gas::next_price`]) — before
+    /// the root, so the header commits to the prices the next block pays. A no-op without it.
+    pub fn close_block(&mut self, height: u64, proposer: &Address, bytes_used: u64, gas_used: u64) {
         self.sweep_expired_excesses(height, proposer);
+        if let Some(d) = self.gas.as_ref().and_then(|g| g.dynamic.as_ref()) {
+            let p = self.gas_prices();
+            self.gas_prices = Some(gas::GasPrices {
+                gas_price: gas::next_price(p.gas_price, d.min_gas_price, gas_used, d.target_block_gas, d.adjust_bps),
+                byte_price: gas::next_price(p.byte_price, d.min_byte_price, bytes_used, d.target_block_bytes, d.adjust_bps),
+            });
+        }
         // The last block of an epoch admits the bond queue's due stake for the next one, before
         // the root: the next epoch's set is derived from exactly this ledger
         // (`HotStuff::shared_set_for_height`, the sync paths), so the admission and the
@@ -2539,8 +2607,9 @@ impl Ledger {
             None => "none".into(),
         };
         format!(
-            "tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} tokens {tok} aggregators {agg} vesting {vest}",
-            self.tree.root()
+            "tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} tokens {tok} aggregators {agg} vesting {vest} gas prices {:?}",
+            self.tree.root(),
+            self.gas_prices()
         )
     }
 
@@ -2591,6 +2660,11 @@ impl Ledger {
     /// epoch counters and the bond queue's root are appended last and the whole thing is re-domained `rand-state-5`,
     /// whatever else is on — the section is gated exactly like the three before it, so a chain
     /// without one falls through to the domains above unchanged.
+    ///
+    /// Genesis vesting appends the register's root after that (`rand-state-6`), and Phase 2 of
+    /// the gas model (spec §7.1), under `gas.dynamic` only, appends the live `gas_price ‖
+    /// byte_price` (big-endian u64) after everything, vesting included, re-domained
+    /// `rand-state-7`. A fixed-price `gas` section is not in the root: its prices never move.
     pub fn state_root(&self) -> Hash {
         let (nf_root, val_root, prog_root) = self.state_root_leaves();
         let mut buf = Vec::with_capacity(128);
@@ -2620,6 +2694,17 @@ impl Ledger {
         // the section, so every chain without one keeps its domain and bytes.
         if let Some(v) = &self.vesting {
             buf.extend_from_slice(v.root().as_bytes());
+        }
+        // Phase 2 (spec §7.1): the live gas prices after everything else, big-endian, re-domained
+        // `rand-state-7`. Only under `gas.dynamic`: a fixed-price section (or none) keeps its
+        // domain and bytes, since those prices never move.
+        if self.gas.as_ref().is_some_and(|g| g.dynamic.is_some()) {
+            let p = self.gas_prices();
+            buf.extend_from_slice(&p.gas_price.to_be_bytes());
+            buf.extend_from_slice(&p.byte_price.to_be_bytes());
+            return Hash::digest_domain(b"rand-state-7", &buf);
+        }
+        if self.vesting.is_some() {
             return Hash::digest_domain(b"rand-state-6", &buf);
         }
         if self.staking.is_some() {
@@ -5306,5 +5391,123 @@ mod tests {
         assert_eq!(l.check_bundle_proof(&marker, &missing, &binding, &StubExecutor, false), Err(TxError::AuthMissing));
         l.pruned_side.insert(ph, (raw.hash(), record(StubExecutor.bundle_digest(&b.digest_input()))));
         assert_eq!(l.check_bundle_proof(&marker, &b, &binding, &StubExecutor, false), Err(TxError::BadDigest), "a v1 record");
+    }
+
+    /// Phase 2's controller parameters for the tests below: prices 100 / 800 at their floors.
+    fn dynamic_gas() -> gas::GasConfig {
+        gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: 16_383,
+            metering: gas::GasMetering::Circuit,
+            dynamic: Some(gas::DynamicGas {
+                target_block_bytes: 4096,
+                target_block_gas: 20_000,
+                adjust_bps: 1250,
+                min_gas_price: 100,
+                min_byte_price: 800,
+            }),
+        }
+    }
+
+    /// Review focus 5: the same block from the same parent gives the same prices and root; an
+    /// empty block walks each price back to its floor and never below; a chain without `dynamic`
+    /// never moves and keeps its pre-gas root.
+    #[test]
+    fn the_controller_is_deterministic_and_floored() {
+        let (a0, _) = keys();
+        let proposer = a0.address();
+        let (l, id) = ledger_with_program(|l| l.set_gas(Some(dynamic_gas())));
+        assert_eq!(l.gas_prices(), gas::GasPrices { gas_price: 100, byte_price: 800 }, "starts at the section's prices");
+        let r0 = l.state_root();
+        let (mut a, mut b) = (l.clone(), l.clone());
+        let proof = StubExecutor::make_proof(&id, 12, [7; 8]);
+        let fee = fee_for(proof.len());
+        let tx = call_tx(&l, 20, id, proof, fee);
+        for l in [&mut a, &mut b] {
+            l.apply_tx(&tx, &proposer, &StubExecutor).unwrap();
+            // B1/B3 have not landed: the call's own gas is driven directly here.
+            l.close_block(1, &proposer, tx.encoded_len() as u64, 40_000 + 16_383);
+        }
+        assert_eq!(a.gas_prices(), b.gas_prices());
+        assert_eq!(a.state_root(), b.state_root());
+        assert_ne!(a.state_root(), r0, "the prices are in the root");
+        assert!(a.gas_prices().gas_price > 100, "gas above target raised the gas price");
+        // An empty block lowers each price toward its floor and never below.
+        for h in 2..40 {
+            a.close_block(h, &proposer, 0, 0);
+        }
+        assert_eq!(a.gas_prices(), gas::GasPrices { gas_price: 100, byte_price: 800 });
+        // A chain without `dynamic` never moves and keeps rand-state-6's root shape.
+        let (fixed, _) = ledger_with_program(|l| l.set_gas(Some(gas::GasConfig { dynamic: None, ..dynamic_gas() })));
+        let r = fixed.state_root();
+        let mut f = fixed.clone();
+        f.close_block(1, &proposer, 1 << 30, 1 << 30);
+        assert_eq!(f.gas_prices(), gas::GasPrices { gas_price: 100, byte_price: 800 });
+        assert_eq!(f.state_root(), r, "without `dynamic` the prices are not in the root and never move");
+    }
+
+    /// The root folds the prices only under `dynamic`: a fixed-price section leaves every byte of
+    /// the root as it was without a section, and a dynamic one changes it only once the prices
+    /// move.
+    #[test]
+    fn the_prices_are_in_the_root_only_under_dynamic() {
+        let (a0, _) = keys();
+        let proposer = a0.address();
+        let bare = ledger();
+        let mut fixed = ledger();
+        fixed.set_gas(Some(gas::GasConfig { dynamic: None, ..dynamic_gas() }));
+        assert_eq!(fixed.state_root(), bare.state_root(), "a fixed-price section is not in the root");
+        let mut dynamic = ledger();
+        dynamic.set_gas(Some(dynamic_gas()));
+        assert_ne!(dynamic.state_root(), bare.state_root(), "under `dynamic` the root is re-domained");
+        // At the target on both meters: the prices hold, and so does the root (the anchor aside).
+        let mut held = dynamic.clone();
+        let mut moved = dynamic.clone();
+        held.close_block(1, &proposer, 4096, 20_000);
+        moved.close_block(1, &proposer, 4096, 40_000);
+        assert_eq!(held.gas_prices(), dynamic.gas_prices());
+        assert_ne!(moved.gas_prices(), dynamic.gas_prices());
+        assert_ne!(moved.state_root(), held.state_root(), "moved prices move the root");
+        // With the prices set back by hand, the two roots agree again: the prices are the only
+        // difference.
+        moved.set_gas_prices(held.gas_prices());
+        assert_eq!(moved.state_root(), held.state_root());
+    }
+
+    /// The deliberate seam for B3: until the constraint-set-8 vendor gives `CallOutcome` its
+    /// `gas_limit`, a call adds nothing to a block's gas. B3's change must turn this red first.
+    #[test]
+    fn a_calls_gas_used_is_zero_until_b3() {
+        let o = crate::program::CallOutcome {
+            tier: 20,
+            outputs: [0; 8],
+            h_in: [0; 8],
+            keccak_log_height: 12,
+            sha256_log_height: 13,
+        };
+        assert_eq!(Ledger::call_gas_used(&o), 0);
+    }
+
+    /// `apply_block` charges the controller Σ `encoded_len` in bytes and `bundle_gas_limit` per
+    /// bundle proof in gas: the replica's prices after a one-call block are exactly what a
+    /// direct `close_block` with those two sums gives.
+    #[test]
+    fn apply_block_feeds_the_controller_the_blocks_bytes_and_gas() {
+        let (a0, _) = keys();
+        // Above both floors, so a block under target moves both prices.
+        let (l, id) = ledger_with_program(|l| l.set_gas(Some(gas::GasConfig { gas_price: 200, byte_price: 1_600, ..dynamic_gas() })));
+        let proof = StubExecutor::make_proof(&id, 12, [7; 8]);
+        let fee = fee_for(proof.len());
+        let tx = call_tx(&l, 20, id, proof, fee);
+        let mut expect = l.clone();
+        expect.set_height(2);
+        expect.apply_tx(&tx, &a0.address(), &StubExecutor).unwrap();
+        expect.close_block(2, &a0.address(), tx.encoded_len() as u64, 16_383);
+        let block = signed_block(vec![tx], &a0, 2, expect.state_root());
+        let mut replica = l.clone();
+        replica.apply_block(&block, &StubExecutor).unwrap();
+        assert_eq!(replica.gas_prices(), expect.gas_prices());
+        assert_ne!(replica.gas_prices(), l.gas_prices(), "the block moved the prices");
     }
 }
