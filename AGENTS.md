@@ -189,6 +189,113 @@ circuits: main `c6cdef4` + `feat/v0.5.11-zk` + `feat/v06-hcs` → pin `4bb4d9a` 
 - **Trap:** every executor trait method with a default must be forwarded by `AggExecutor`, the
   executor every node runs (`the_wrapper_delegates_the_zkvm_surface`).
 
+### chain 18 — gas Phase 1 + Phase 2 (built 2026-09-29 on `feat/gas-chain18`, NOT cut)
+
+Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md` §4.2–4.3, §7.1; plan
+`docs/superpowers/plans/2026-09-28-gas-phase1-phase2-chain18.md` (A1–A6 circuits, B1–B8
+fullnode, C1 deploy); live ledger
+`.superpowers/sdd/2026-09-28-gas-phase1-phase2-chain18/progress.md` (every `Ruling:` line).
+Circuits worktree `/private/tmp/circuits-cs8` (branch `feat/cs8-gas`, **final `18c2627`, unpushed
+to origin**); fullnode worktree `/private/tmp/fullnode-gas18` (branch `feat/gas-chain18`, off
+`feat/gas`, head at this task's two commits). Both Phase 0 (v0.6.4, node policy, see the entry
+below) and Phase 1+2 are unreleased — nothing here is live, nothing is tagged, nothing is rolled.
+
+**What it is.** One column, one public value in the cpu AIR (`pv::GAS = 34`, `pv::NUM 34 → 35`):
+`GAS` accumulates `1` per row plus `2` per Poseidon2 absorb row (`IS_HASH`), `191` per `KECCAK`
+row, `63` per `SHA256` row, degree 2 (`w_next` sums two next-row selector products); the halt row
+proves `pv[GAS] − GAS` is a 4-limb `RANGE8`-checked, never-published, `[0, 2³²)` witness value
+(the run's own gas stays private — the `[0, 2^(t+8))` slack this spec once specified is not what
+shipped). Native `check_public_values` refuses `GAS_LIMIT > gas_max(header)` and a `TIER` outside
+`TIERS`, before any verifier key is built. `gas_max(t, klh, slh) = (2ᵗ−1) + 2^(t−2) +
+191·⌊2^klh/32⌋ + 63·⌊2^slh/64⌋` — the `2^(t−2)` Poseidon2-absorb-surcharge term a first draft of
+this design omitted (below). Genesis `gas` section: `gas_price`/`byte_price` (decimal strings),
+`bundle_gas_limit` (`20 479` = `gas_max(14, 0, 0)`, every real bundle proof must declare exactly
+this — `TxError::BundleGasLimit`, permanent), `metering: "circuit"`, optional `dynamic {
+target_block_bytes, target_block_gas, adjust_bps, min_gas_price, min_byte_price }` (Phase 2);
+bound into the genesis hash big-endian, only when present, refused beside `aggregation`. Ledger:
+`Ledger::gas_call_floor`/`circuit_call_floor` price a call at `outcome.gas_limit`; Phase 2's
+`GasPrices` moves once a block in `close_block` (`next_price`, floor `div_euclid`, saturating),
+folded into the state root under `rand-state-7` only with `dynamic`, persisted at
+`META_GAS_PRICES`, restored by `reload_ledger`. RPC: `rand_getLimits` gains `bundle_gas_limit`,
+`adjust_bps`, `gas_metering: "circuit"`, the tip's dynamic prices; `rand_estimateFee`'s call spec
+requires `gas` under a section; `rand_status`/`rand_getLimits` serve `gas_prices`. Wallet: `rand
+call --gas-limit <N|max>` (CPU-backend default under a section: the dry run's exact gas rounded up
+to a multiple of `2^(t−2)`, five values a tier under the ceiling — non-CPU backends and no-section
+chains default to `max`, the only thing they can declare), `rand fee call <tier> [--gas N]`
+(defaults to `gas_max(tier, klh, slh)` under a section), one price step of headroom under
+`dynamic`; `rand-node genesis --gas-price/--byte-price/--bundle-gas-limit/--gas-dynamic`. Cut:
+`deploy/cut-chain18-genesis.sh`, `deploy/cutover-fleet-chain18.sh` (all-stop/all-start — cs8
+changes every verifier key, no mixed-fleet path), `deploy/chain18-bridge-steps.md` (relayer needs
+a v0.6.5 `rand`); randscan and the client apps must rebuild against cs8 before or with the cut,
+same as every prior constraint-set fork. **Parked, operator task:** the ≥ 64 GB rVM round trips
+(tier-19/20/21 real proofs; commands and cache instructions in `task-A6-report.md`) — killed at
+54.8 GB peak on this 48 GB laptop; needs a provisioned box before the cut's suite can claim the
+real proofs, not just the structural tests, pass.
+
+**Pins:** circuits `feat/cs8-gas` `18c2627` (push before CI/the cut can use it — `ci.yml`'s
+`CIRCUITS_PIN` already names it); `aggregate_program_digest`
+`1831f036a2d3524249df17a66a220457878f8aeed669c77db08d58026461ddd7`; rVM interface digest
+`5e3d7fb2bd1f5342e49577650a281996b656d1fa4e8f3eff7ee82adefe9d1ed6`; `inner_vk_digest`
+`346ee1841980e46a3501f5b04cdf40dd3208e5b1c67360285353cf7a0b735fb9`; `bundle_gas_limit` `20 479`
+(moved once from `16 383` mid-task — the absorb-term ruling below — every site greps clean for the
+old value now).
+
+**Traps found in review, all fixed before Part A/B final:**
+- **The header ceiling missed the Poseidon2 absorb term.** `gas_max`'s first draft was
+  `(2ᵗ−1) + 191·⌊…⌋ + 63·⌊…⌋` alone; a probe (10 `POSEIDON2` calls over 12 words, tier 10) spent
+  1 078 gas against the old ceiling's 1 023 and was wrongly refused `GasLimitBelowRun`. Fixed by
+  adding `2^(t−2)`, bounded by the Poseidon2 *table's* own capacity
+  (`Tier::poseidon2_height(t) = 2^(t+2)` rows at 32 rows/permutation → `2^(t−3)` absorb rows at
+  `+2` gas each), not a cpu-row count. Rippled `16 383 → 20 479` and `1 023 → 1 279` through every
+  default-limit site in five crates plus the deploy scripts (`14ad9d9`, `a2951dd`, the Part A fix
+  wave `09b032f`).
+- **The aggregate sponge over-permuted at block boundaries.** `rv32n`'s runtime-length interface
+  sponge permuted eagerly on the word that filled the rate, then once more unconditionally after
+  the last word — correct only when the public-value list never ends exactly on a block boundary.
+  At 34 words it never did; at 35 (the gas word) it does for every `N ≡ 1 (mod 4)`, **N = 1
+  included** — every single-inner aggregate would have published an unrecomputable digest. Failed
+  closed (`DigestMismatch`) before the fix, never wrongly accepted; fixed by deferring the permute
+  to the word that opens the *next* block (A6, `6d4f124`).
+- **Phase 0's hardened call floor used the bare call binding, not the hardened decode.** Under
+  `hardening_v6`, a call to a program *with* a public input needs
+  `ledger.hardened_call_segment(record, &tx.call_binding())`, not `&tx.call_binding()` alone
+  (issue #55's shape); with the bare binding, `admission::call_floor` refused every such call
+  `InvalidProof(PublicValues)` — permanent, cached, gossip-Reject — censoring it fleet-wide on a
+  default v0.6.4 node. Same root cause as the Phase-0 entry's own C1 trap below, hit twice more:
+  once as `feat/gas`'s HOTFIX (`2646d06`) and once inside B3's own `admission::call_floor` (fix
+  round 1, `1735da3`).
+- **`gas.dynamic` beside `aggregation` was left uncaught until B6's own review.** A pruned
+  (marker-form) bundle encodes shorter than its raw form, so a node syncing sealed history would
+  compute a different `bytes_used` than a live-synced one and diverge on the byte price. No
+  genesis combines the two today; the fix is a genesis-validation refusal
+  (`GenesisError::DynamicGasWithAggregation`), not a storage redesign — the raw-length side-table
+  field that would let them coexist is future work.
+- **`reload_ledger` did not restore the `gas` section.** Genesis parameters outside the state root
+  (`envelope_bytes`, `hardening_v6`, …) are re-applied by `node.rs`'s `reload_ledger` after
+  `load_ledger`; `gas` was added to the ledger struct but not to that restore list, so a restarted
+  chain-18 node would silently come back with `ledger.gas() == None`. Red-first
+  (`a_restart_restores_the_gas_section`), fixed with one `set_gas` call (B2 fix round 1).
+
+**Gate** (after every task, `RECURSION_FIXTURES` pointed at a regenerated cs8 fixture cache): core
+lib 546/546; node lib 392/392 (+1 ignored, the tier-19 aggregate round trip; `agg_executor` 12/12,
+no fixture-cache gap); client lib 128/128 (this task's `f28acfc` re-run, unchanged), `rand` bin
+17/17; zkvm `--test executor --skip measure` 17 passed / **3 known-stale failures**
+(`a_call_with_the_wrong_public_height…`, `the_bundle_key_survives_eleven_program_shapes…`,
+`a_program_with_a_public_input_is_warmed` — pre-existing since cs7's `MIN_PRIVATE_TABLE_LOG_HEIGHT`
+floor made their premise false, not caused by gas); zkvm lib 24/24, `--test gas` 15/15, `--test
+hidden_bundle` 25/25 (119 s); `cargo check --workspace --tests --release` clean. circuits (research)
+`--release`: gas 15, cheating 120, zk 3, tables 25, verifier_key 2, e2e 25 (3 ignored), 0 failed;
+recursion 179/0.
+
+**Cut order** (not yet run): push circuits `feat/cs8-gas` to origin → final whole-branch review →
+tag (spec §11: v0.6.5 unless the line has moved) → `deploy/cut-chain18-genesis.sh` (26 validators,
+carries chain 16's bridge/tokens/supply snapshot forward, `hc_bundle` unchanged from chain 16's —
+cs8 changes only the STARK verifier key, not the hidden-asset guest's words) →
+`deploy/cutover-fleet-chain18.sh` all-stop/all-start (C, D first) → `deploy/chain18-bridge-steps.md`
+(relayer rebuilds `rand` first, its RPC tunnel repoints). Every client (wallet, randscan, the
+website) needs a cs8 rebuild before or with the cut, same rule as every prior verifier-key fork —
+none of the built work here changes that rule.
+
 ### v0.6.4 — gas, Phase 0: the header-priced call floor (2026-09-28, branch `feat/gas`, not tagged, not rolled)
 
 Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md`, plan

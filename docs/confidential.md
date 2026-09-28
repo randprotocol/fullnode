@@ -416,6 +416,50 @@ runs only on a new genesis — chain 16.** A v0.6.1 node refuses chains 14 and 1
 `run` and `verify` (`node::PRE_CONSTRAINT_SET_7_CHAINS`), and chains up to 13 by their retired
 `hc_bundle`; keep chain 15 on v0.6.
 
+**Constraint set 8 (2026-09-29, circuits `feat/cs8-gas` `18c2627`: the gas meter, built on
+`feat/gas-chain18`, chain 18, not yet cut).** One new column and one new public value in the cpu
+table (`docs/superpowers/specs/2026-09-28-gas-model-design.md` §4.2, `docs/fees.md` §1.1,
+`docs/zkvm.md` §1, §4):
+
+- **The column, `GAS`** (`col::GAS`, right after `JALR_B0`): the running gas accumulator. Row 0 —
+  always a digest row — starts it at `1`; every real-to-real transition adds
+  `w_next = 1 + 2·n(IS_HASH) + 191·n(SYS_KECCAK) + 63·n(SYS_SHA256)` for the row it is moving
+  into, degree 2 (not degree 1: `w_next` is itself a sum of selector products).
+- **The public value, `GAS_LIMIT`** (`pv::GAS = 34`, `pv::NUM 34 → 35`): the prover's declared
+  ceiling. On the `HALT` row, `pv[GAS] − GAS` is decomposed into four `RANGE8`-looked-up witness
+  limbs `GD0..3` (`[0, 2³²)`, little-endian), never opened or published — the run's exact gas
+  stays private, and only `GAS_LIMIT` is new public information. Off the `HALT` row the limbs are
+  forced to zero.
+- **The native checks** (`machine::check_public_values`, before any verifier key is built): a
+  proof's `TIER` must be in `TIERS` (`VerifyError::Tier`, native — an untrusted tier that survives
+  `gas_max`'s clamp to `[10, 20]` is caught here first), and `pv::GAS > gas::gas_max(tier,
+  keccak_log_height, sha256_log_height)` is refused (`VerifyError::GasLimit`).
+- **`gas_max` carries a term the design's first draft missed** (the final review's Important 1,
+  found by a probe that spent 1 078 gas against a tier-10 run's old 1 023 ceiling): the Poseidon2
+  absorb surcharge can run a tier over its plain cycle budget by up to `2^(t−2)`, bounded by the
+  Poseidon2 table's own capacity (`2^(t+2)` rows at 32 rows/permutation, so at most `2^(t−3)`
+  absorb rows at `+2` gas each). Built: `gas_max(t, klh, slh) = (2ᵗ−1) + 2^(t−2) + 191·⌊2^klh/32⌋ +
+  63·⌊2^slh/64⌋`, tier and height-clamped. The tier-14 hash-free ceiling moved `16 383 → 20 479`;
+  chain 18's `bundle_gas_limit` moves with it (below).
+- **Measured deltas** (constraint-set-6 baseline → cs8, re-run and reconciled against the noise
+  band `±6 KB`, `research/docs/05-roadmap.md`): tier 10 (no hash) **+0.15%**; tier 12 (no hash)
+  **+0.56%**; tier 10 + one keccak block **+0.29%** — four new `RANGE8` lookups on the packed
+  lookups, no new preprocessed table (every pinned `commitment` half is unchanged, only `common`
+  moved). `MAX_PROOF_BYTES` is unaffected at this scale.
+- **The rVM interface grows to `35·N`** (was `34·N`): `[vk ‖ N ‖ B(8) ‖ 35·N]`. Re-vendoring for
+  the 35th word exposed a real completeness bug in `rv32n`'s runtime-length interface sponge (it
+  permuted eagerly, on the word that filled the rate, then once more unconditionally after the
+  last word — correct only when the list never ends exactly on a block boundary; at 35 words per
+  proof it does, for every `N ≡ 1 (mod 4)`, N = 1 included). Fixed by deferring the permute until
+  the word that opens the *next* block arrives, so one block is always left pending for the final
+  permutation. It failed closed before the fix (`DigestMismatch`), never wrongly accepted. The
+  production `aggregate_program_digest` moved for both reasons (the wider interface and the sponge
+  fix): `1831f036a2d3524249df17a66a220457878f8aeed669c77db08d58026461ddd7`.
+
+Every verifier key changes (the cpu AIR changes), so constraint set 8 rides only a chain cut —
+chain 18, which also carries `hardening_v6` and the genesis `gas` section (`docs/fees.md` §1.1,
+§1.2). See the AGENTS.md `chain 18` entry for the full built state, review traps and the cut order.
+
 ### Transaction binding (2026-09-19, Task 5b — a hard fork, chain 14)
 
 **The hole it closes.** A transaction is `{chain_id, bundle, action}` and carries no signature;

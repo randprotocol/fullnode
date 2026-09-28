@@ -22,14 +22,18 @@ authoritative reference and are cited by name below.
 One relation, for every program:
 
 > *This RV32IM program, started at `base_pc`, run on a private input vector committed to by
-> `H_IN`, halted within `2ᵗ − 1` cycles and published these eight output words.*
+> `H_IN`, halted within `2ᵗ − 1` cycles, spent at most `GAS_LIMIT` gas, and published these
+> eight output words.*
 
 The program is identified by its in-circuit digest `hc` (public values `HC0..7`), the inputs by
 the salted digest `H_IN` (`IN0..7`), the public segment by the unsalted digest `H_PUB` (`PUB0..7`,
-constraint set 6 — empty on this chain), the outputs by `OUT0..7`, and the gas tier by `TIER`.
-That is the whole public interface: 34 field elements (`pv::NUM = 34`). Everything else —
-registers, memory, branches taken, the exact cycle count, the inputs — is witness and stays
-private.
+constraint set 6 — empty on this chain), the outputs by `OUT0..7`, the gas tier by `TIER`, and
+(constraint set 8, built on `feat/gas-chain18`, not yet cut — `docs/confidential.md`'s
+"Constraint set 8") a declared gas ceiling by `GAS_LIMIT` (`pv::GAS`), the prover's own chosen
+bound on the run's weighted row count (`docs/fees.md` §1.1). That is the whole public interface:
+35 field elements once constraint set 8 ships (`pv::NUM = 35`; 34 before it). Everything else —
+registers, memory, branches taken, the exact cycle count, the exact gas, the inputs — is witness
+and stays private: the halt-row check that proves `GAS ≤ GAS_LIMIT` never opens the difference.
 
 A contract is therefore a program: the node stores its words at deploy time, computes `hc`, and
 verifies every call with `Machine::verify_public(hc, &[], proof)` — `verify` plus a check that
@@ -100,17 +104,22 @@ verifier holds only `hc` and never sees a program word.
 `ECALL` reads the syscall number from `a7` and the first argument from `a0`; a second argument
 comes from `a1` through the row's memory slot; a value-returning syscall writes `a0`.
 
-| # | name | effect | cpu rows |
-|---|---|---|---|
-| 0 | `HALT` | ends the run; every later row is padding | 1 |
-| 1 | `WRITE_OUTPUT slot word` | pins public output `slot < 8`; each slot at most once; unwritten slots are pinned to zero | 1 |
-| 2 | `READ_INPUT idx` | returns private input word `idx`, looked up in the committed input table; two reads of one index agree; `idx ≥ n_in` is unsatisfiable | 1 |
-| 3 | `POSEIDON2 ptr n` | hashes `n ≤ 4096` words at word address `ptr` with the Poseidon2 sponge (width 8, rate 4, overwrite mode) and writes the 8-word digest in place | 1 + ⌈n/4⌉ + 2 |
-| 4 | `KECCAK ptr` **(M4.2)** | one Keccak-f[1600] permutation of the 50-word state at word address `ptr`, in place; the keccak table reads and writes the words itself | 1 |
-| 5 | `SHA256 ptr` **(M4.4)** | one SHA-256 compression of the 24 words at word address `ptr` (16-word block, 8-word chaining state), the new state written back in place; the sha256 table reads and writes the words itself | 1 |
-| 6 | `READ_PUBLIC idx` **(constraint set 6)** | returns public-segment word `idx`, looked up in the public table; two reads of one index agree; `idx ≥ n_pub` is unsatisfiable | 1 |
+| # | name | effect | cpu rows | gas (constraint set 8) |
+|---|---|---|---|---|
+| 0 | `HALT` | ends the run; every later row is padding | 1 | 1 |
+| 1 | `WRITE_OUTPUT slot word` | pins public output `slot < 8`; each slot at most once; unwritten slots are pinned to zero | 1 | 1 |
+| 2 | `READ_INPUT idx` | returns private input word `idx`, looked up in the committed input table; two reads of one index agree; `idx ≥ n_in` is unsatisfiable | 1 | 1 |
+| 3 | `POSEIDON2 ptr n` | hashes `n ≤ 4096` words at word address `ptr` with the Poseidon2 sponge (width 8, rate 4, overwrite mode) and writes the 8-word digest in place | 1 + ⌈n/4⌉ + 2 | `3 + 3·⌈n/4⌉` |
+| 4 | `KECCAK ptr` **(M4.2)** | one Keccak-f[1600] permutation of the 50-word state at word address `ptr`, in place; the keccak table reads and writes the words itself | 1 | **192** |
+| 5 | `SHA256 ptr` **(M4.4)** | one SHA-256 compression of the 24 words at word address `ptr` (16-word block, 8-word chaining state), the new state written back in place; the sha256 table reads and writes the words itself | 1 | **64** |
+| 6 | `READ_PUBLIC idx` **(constraint set 6)** | returns public-segment word `idx`, looked up in the public table; two reads of one index agree; `idx ≥ n_pub` is unsatisfiable | 1 | 1 |
+| 7 | `POSEIDON2_LEN ptr n` **(constraint set 7)** | `POSEIDON2` with the length seeded into capacity lane 4, at least one permutation | 1 + max(⌈n/4⌉, 1) + 2 | `3 + 3·max(⌈n/4⌉, 1)` (the bare formula is exact for every `n ≥ 1`; at `n = 0` it still absorbs one length-seeded empty block, so its true minimum is 6, not 3) |
 
-Rows 0–6 are the whole syscall surface. A guest that issues `ECALL` with `a7 = 4` or `a7 = 5`
+Every ordinary RV32I/RV32M cpu row (no syscall) costs 1 gas the same way `WRITE_OUTPUT`/etc. do;
+the syscalls above are the only non-uniform costs (`docs/fees.md` §5's constants,
+`randprotocol-zkvm/src/gas.rs`, constraint set 8, not yet cut).
+
+Rows 0–7 are the whole syscall surface. A guest that issues `ECALL` with `a7 = 4` or `a7 = 5`
 makes its proof declare the matching hash table (`keccak_log_height` / `sha256_log_height !=
 0`); a `SYS_KECCAK` or `SYS_SHA256` row in a proof that declares none cannot balance that bus
 and is rejected. `READ_PUBLIC` needs no such declaration: the public table is in every batch.
@@ -241,6 +250,14 @@ leaves prove time unchanged within noise:
 | `private_payment` (call) | small | < 1 000 | 10 | ~435 KB | ~1.20 MB (`fib`, measured upstream) | 7.4 s |
 | `bundle`, 2-in-2-out | 3 811 | ≈ 9 160 incl. digest rows | 14 | ~300 KB | ~1.3 MB (estimated, not yet re-measured) | ≈ 100 s |
 | `bundle`, 1-in-1-out with dummies | 3 811 | ≈ 6 920 | 14 | ~300 KB | ~1.3 MB (estimated) | ≈ 100 s |
+
+**Gas** (constraint set 8, built on `feat/gas-chain18`, not yet cut — `docs/fees.md` §1.1): for a
+program with no `KECCAK`/`SHA256` rows, gas tracks cycles closely (every ordinary row is 1 gas, a
+`POSEIDON2` absorb row 3), so the cycle counts above are close to what each guest spends: the
+`bundle` guest is 6 920–9 160 gas depending on how many of its four slots are real. Chain 18's
+`bundle_gas_limit` genesis constant pins every real hidden-asset bundle's *declared* limit at
+`gas_max(14, 0, 0) = 20 479` regardless — the flat price a fixed program gets (spec §4.3) — so the
+guest's own cycle count only bounds what it could exceed, never what it pays.
 
 A proof that carries the keccak table costs ~1.91 MB more than one that does not — the table is
 2 612 columns wide, and every FRI query opens a full-width main-trace leaf, so its *width*, not

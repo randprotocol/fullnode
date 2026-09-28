@@ -107,7 +107,16 @@ aggregate from the pool, re-sign it under its own identity and nonce, and be pai
 The rVM's aggregate program absorbs eight binding words into its interface digest:
 
 ```
-interface = [inner_vk_digest(4) ‖ N ‖ B(8) ‖ 34·N public values]
+interface = [inner_vk_digest(4) ‖ N ‖ B(8) ‖ 34·N public values]     -- pre-constraint-set-8
+```
+
+As of constraint set 8 (chain 18's `pv::NUM = 35`, `docs/confidential.md`'s "Constraint set 8",
+built on `feat/gas-chain18`, not yet cut) the width is `35·N` — a chain built after chain 18
+carries `[vk ‖ N ‖ B(8) ‖ 35·N]`, not the `34·N` this section was written against. No live chain
+runs aggregation, and chain 18's genesis rejects `gas.dynamic` beside an `aggregation` section
+(`docs/fees.md` §1.2), so the two have never yet had to coexist.
+
+```
 B = aggregate_binding(chain_id, aggregator, nonce)   // H("rand-aggregate-bind-1", …), 8 LE u32
 ```
 
@@ -162,7 +171,10 @@ both have to clear before a genesis may switch it on.
        verifier folder, term by term (fold order, selectors, quotient recomposition, LogUp
        terminals, `X² = 7`): no mismatch. Still missing: a Production-profile differential and a
        test that breaks a single AIR constraint on a non-first instance;
-     - the `rv32n` absorb schedule (`[vk ‖ N ‖ B ‖ 34·N]`, the length in capacity, the final
+     - the `rv32n` absorb schedule (`[vk ‖ N ‖ B ‖ 34·N]` at the time of this review, `35·N` since
+       constraint set 8 — the same schedule, re-checked at the new width by circuits `18c2627`'s
+       fix for the sponge's block-boundary bug, `docs/confidential.md`'s "Constraint set 8"), the
+       length in capacity, the final
        permutation) and hostile cover sets (N = 0, a wrong N, duplicates, mixed shapes): no
        desynchronisation — read, not fuzzed. The `rv32r` self-verifier's binding is not tied to
        the inner aggregate's (ZKQ-5): decide before trees of aggregates ship;

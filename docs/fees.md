@@ -31,9 +31,12 @@ Value also leaves the pool through `burn`: a `Bond` burns exactly its amount int
 validator's public stake, and a `BridgeBurn` burns the amount plus a relayer fee in the bridged
 asset. Burns are not fees; `docs/supply.md` accounts for both.
 
-### 1.1 The gas floor (v0.6.4, spec `2026-09-28-gas-model-design.md` §4.1)
+### 1.1 The gas rule (spec `2026-09-28-gas-model-design.md` §3.2, §4.1, §4.2)
 
-A node prices a call by the work its proof header bounds, as admission policy on any chain:
+Two rules apply, one live today on any chain, one riding chain 18's constraint set.
+
+**Phase 0 (v0.6.4, node policy, live today).** A node prices a call by the work its proof header
+*bounds*, without decoding anything the chain doesn't already read:
 
     gas_max = (2ᵗ − 1) + 2^(t−2) + 191·(2ᵏˡʰ / 32) + 63·(2ˢˡʰ / 64)     -- 0 for an absent table
     floor   = max( BUNDLE_BASE + call_fee(t, bytes),
@@ -50,9 +53,49 @@ permutation slots, so a run can exceed the plain cycle budget by up to `2·2^(t�
 changes, for a ~1.2–1.3 MB production proof: a tier-14 call — the highest tier a chain admits a
 call at (`MAX_CALL_TIER`) — goes from ~0.0022 to ~0.0041 RAND (`20 479·100 +
 800·⌈1 350 000/1024⌉ + 1 000 000`), and a tier-10 call pays ~0.0021 (was 0.0020). The schedule
-would charge a tier-20 header ~0.133 RAND, but no such call is admitted today. The declared limit
-and the in-circuit meter that make this per-instruction rather than per-header come with the
-chain 18 cut.
+would charge a tier-20 header ~0.133 RAND, but no such call is admitted today.
+
+**Phase 1 (chain 18's constraint set, built on `feat/gas-chain18`, not yet cut).** The chain
+learns the exact declared limit instead of the header's ceiling: a call proof carries one new
+public value, `GAS_LIMIT` (`pv::GAS`), and the cpu AIR proves `GAS ≤ GAS_LIMIT` in-circuit
+(`docs/confidential.md`'s "Constraint set 8", `docs/zkvm.md` §1, §4). The ledger rule replaces
+`gas_max` in the floor above with the proof's own declared `outcome.gas_limit`:
+
+    fee ≥ BUNDLE_BASE + gas_price·outcome.gas_limit + byte_price·⌈bytes / 1024⌉
+
+and the pre-verify floor (before the proof is decoded) prices `outcome.gas_limit = 1`, so a verify
+still isn't bought for nothing. A bundle proof's `GAS_LIMIT` must equal the genesis constant
+`bundle_gas_limit` exactly — `20 479` (`gas_max(14, 0, 0)`) for today's tier-14 hidden-asset
+guest — or the proof is refused (`TxError::BundleGasLimit`, permanent): every bundle then
+publishes the same value, so a fixed price is still the right price for a fixed program. On a
+chain without a `gas` section (`rand_getLimits.gas_metering` absent) both rules are absent and
+the ledger's flat tier schedule above applies unchanged.
+
+### 1.2 Dynamic prices (Phase 2, chain 18's genesis `gas.dynamic`, built, not yet cut)
+
+Optional inside the same `gas` section (spec §7.1): `gas_price`/`byte_price` become live ledger
+state (`Ledger::gas_prices`, `GasPrices { gas_price, byte_price }`), moved once per block in
+`close_block`, after the block's transactions and before the root, by fullness against a target:
+
+    price' = max(min_price, price + ⌊price · adjust_bps · (used − target) / (10 000 · target)⌋)
+
+applied to `byte_price` against `bytes_used`/`target_block_bytes` (Σ every transaction's
+`encoded_len`) and to `gas_price` against `gas_used`/`target_block_gas` (Σ each call's declared
+`GAS_LIMIT` plus `bundle_gas_limit` per bundle proof, built as `Ledger::block_usage`). The division
+floors toward zero fall (`div_euclid`, not truncating division — `next_price(1001, 800, 0, t,
+1250) == 875`, not `876`); every price is clamped at its own `min_gas_price`/`min_byte_price`
+floor, which genesis must set so `min_price · adjust_bps ≥ 10 000` (a price under that bound could
+never rise again once floored). The live prices are folded into the state root, last, under
+`rand-state-7`, **only** when `dynamic` is present (absent or a fixed-price-only section leaves
+the root exactly as before — the vesting pattern), and persisted beside `META_SUPPLY`
+(`META_GAS_PRICES`, restored by `reload_ledger` on every restart, written only when the chain has
+a `gas` section at all). A `gas` section with `dynamic` set is refused beside an `aggregation`
+section at genesis (`GenesisError::DynamicGasWithAggregation`): a pruned bundle's marker form
+encodes shorter than its raw form, so sealed-sync's byte price would diverge from a live-synced
+node's. The wallet reads `rand_getLimits` (which serves the tip's current prices under `dynamic`)
+and pays one step of headroom, `floor + ⌊floor · adjust_bps / 10 000⌋`, so a block that raises the
+price before the transaction lands still admits it; `--fee` overrides. `rand_status` reports
+`gas_prices`.
 
 ## 2. What the sender pays with its own machine: proving
 
@@ -150,4 +193,9 @@ accounting (M4.4).
 | `MAX_BLOCK_BYTES`, `MAX_BLOCK_TXS` | 4 MiB, 2,000 | `gas.rs` |
 | tiers | 10, 12, 14, 16, 18, 20 cycles = `2ᵗ − 1` | `randprotocol-zkvm` `machine::TIERS` |
 | `KECCAK_GAS`, `SHA256_GAS` | 192, 64 units of gas per row | `gas.rs` |
-| `GAS_PRICE_DEFAULT`, `BYTE_PRICE_DEFAULT` | 100, 800 units — a node's `--gas-price`/`--byte-price` default | `gas.rs` |
+| `POSEIDON2_ABSORB_GAS` | 3 units of gas per absorb row (1 base + 2 surcharge) | `randprotocol-zkvm/src/gas.rs` |
+| `GAS_PRICE_DEFAULT`, `BYTE_PRICE_DEFAULT` | 100, 800 units — a node's `--gas-price`/`--byte-price` default, and chain 18's testnet genesis starting prices | `gas.rs` |
+| `bundle_gas_limit` | `20 479` = `gas_max(14, 0, 0)` — chain 18's genesis constant, the tier-14 hidden-asset guest's flat declared gas | `GasConfig` (genesis), `gas.rs` |
+| `next_price`'s `adjust_bps` bound | `1..=5000` (genesis `gas.dynamic.adjust_bps`, chain 18's testnet default `1250` = 12.5% a block) | `GasConfig::check` |
+| `min_gas_price · adjust_bps`, `min_byte_price · adjust_bps` | `≥ 10 000`, or that floor could never rise | `GasConfig::check` |
+| `pv::GAS`, `pv::NUM` | 34, 35 (constraint set 8) — was 34 total before the gas meter | `randprotocol-zkvm/src/tables/cpu.rs` |
