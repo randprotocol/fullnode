@@ -224,7 +224,10 @@ pub struct GasPrices {
 }
 
 /// Spec §7.1's controller: `max(min, price + ⌊price·adjust_bps·(used − target)/(10 000·target)⌋)`
-/// — **floor** division (`div_euclid` by a positive divisor, so a fall rounds away from zero:
+/// with `used` first capped at `2·target`, so `adjust_bps` is the largest one-block move in
+/// either direction (an empty block moves the price down by exactly `adjust_bps`, a block at or
+/// past twice the target up by exactly as much — a block's gas can exceed twice its target, its
+/// bytes cannot when the target is half the cap). **Floor** division (`div_euclid` by a positive divisor, so a fall rounds away from zero:
 /// −125.125 is −126), clamped to `0..=u64::MAX`, never below `min`. A zero `target` is read as
 /// 1 (genesis refuses one; this only keeps the division defined). Integers only, so every
 /// validator computes the same price.
@@ -236,7 +239,9 @@ pub struct GasPrices {
 /// point it only caps the step. Beyond reach on any chain this code runs, and still
 /// deterministic if reached.
 pub fn next_price(price: u64, min: u64, used: u64, target: u64, adjust_bps: u32) -> u64 {
-    let target = target.max(1) as i128;
+    let target = target.max(1);
+    let used = used.min(target.saturating_mul(2));
+    let target = target as i128;
     let delta = (price as i128)
         .saturating_mul(adjust_bps as i128)
         .saturating_mul(used as i128 - target)
@@ -637,12 +642,14 @@ pub enum GasMetering {
 pub struct DynamicGas {
     /// The block-bytes figure the controller targets: `byte_price` falls when a block is under
     /// this and rises when it is over. Must be `1..=max_block_bytes` (today's default when the
-    /// genesis does not set one, [`MAX_BLOCK_BYTES`]).
+    /// genesis does not set one, [`MAX_BLOCK_BYTES`]); by convention half the chain's cap
+    /// (chain 18: 10 485 760 of 20 MiB), so a full block is exactly twice the target.
     pub target_block_bytes: u64,
     /// The block-gas figure the controller targets, the same way for `gas_price`. Must be `> 0`.
     pub target_block_gas: u64,
-    /// The largest one-block move, in basis points of the current price (spec §7.1's formula).
-    /// `1..=5000` (0.01 %..=50 % a block).
+    /// The largest one-block move, in basis points of the current price, in either direction
+    /// (spec §7.1's formula; [`next_price`] caps `used` at `2·target`, so no block moves a price
+    /// further). `1..=5000` (0.01 %..=50 % a block).
     pub adjust_bps: u32,
     /// The floor `gas_price` never falls under. Must be `<= gas_price` — a genesis file cannot
     /// declare a starting price its own floor already exceeds.
@@ -774,7 +781,12 @@ mod gas_config_tests {
         assert_eq!(next_price(1_000, 800, 0, t, 1250), 875, "empty block: −12.5 %");
         assert_eq!(next_price(1_001, 800, 0, t, 1250), 875, "floor division: −125.125 floors to −126, not −125");
         assert_eq!(next_price(1_000, 800, 2 * t, t, 1250), 1_125, "twice the target: +12.5 %");
-        assert_eq!(next_price(1_000, 800, 3 * t, t, 1250), 1_250, "three times the target: +25 % (bytes cannot exceed 2× a half-cap target; gas can)");
+        // `used` is capped at twice the target, so `adjust_bps` is the largest one-block move in
+        // either direction: a block of gas three times the target (bytes cannot pass 2× a
+        // half-cap target; gas can) moves the price exactly as far as one at twice the target.
+        assert_eq!(next_price(1_000, 800, 3 * t, t, 1250), 1_125, "three times the target: capped at +12.5 %");
+        assert_eq!(next_price(1_000, 800, u64::MAX, t, 1250), 1_125, "any overshoot: capped at +12.5 %");
+        assert_eq!(next_price(1_000, 800, 2 * t + 1, t, 5000), 1_500, "just over twice the target at 50 %: +50 %, no more");
         assert_eq!(next_price(u64::MAX, 800, 2 * t, t, 5000), u64::MAX, "saturates");
         assert_eq!(next_price(100, 100, 0, 1 << 18, 1250), 100, "gas: floor holds");
     }

@@ -372,7 +372,7 @@ Genesis `gas.dynamic` (optional inside the `gas` section; absent = the fixed pri
 
 ```json
 "gas": { "gas_price": "100", "byte_price": "800", "bundle_gas_limit": 20479, "metering": "circuit",
-         "dynamic": { "target_block_bytes": 2097152, "target_block_gas": 262144,
+         "dynamic": { "target_block_bytes": 10485760, "target_block_gas": 262144,
                       "adjust_bps": 1250, "min_gas_price": "100", "min_byte_price": "800" } }
 ```
 
@@ -392,17 +392,22 @@ Genesis `gas.dynamic` (optional inside the `gas` section; absent = the fixed pri
   ```
 
   applied to `byte_price` with `bytes_used`/`target_block_bytes` and to `gas_price` with
-  `gas_used`/`target_block_gas`. An empty block lowers each price by `adjust_bps/10 000` (12.5 %
-  at the default) down to its floor; a block at twice the target raises it by the same; a block
-  at the target leaves it. `target_block_bytes` must be ≤ `max_block_bytes`; `adjust_bps` is
+  `gas_used`/`target_block_gas`. `used` is capped at twice the target before the formula, so
+  `adjust_bps` is the largest one-block move in either direction: an empty block lowers each
+  price by `adjust_bps/10 000` (12.5 % at the default) down to its floor; a block at or past
+  twice the target raises it by the same; a block at the target leaves it. `target_block_bytes`
+  is half `max_block_bytes` — chain 18's cap is 20 MiB, so 10 485 760 — so a block's bytes never
+  pass twice the target anyway; its gas can, which the cap bounds. `target_block_bytes` must be ≤ `max_block_bytes`; `adjust_bps` is
   `1..=5000`; and `min_gas_price · adjust_bps ≥ 10 000` and `min_byte_price · adjust_bps ≥
   10 000`, since a price with `price · adjust_bps < 10 000` floors every step up to 0 and could
   never rise. `dynamic` is refused beside an `aggregation` section: a pruned bundle's marker
   form encodes shorter than its raw form, so sealed-form sync would diverge on the byte price.
-- **The wallet** reads `rand_getLimits` (which serves the tip's current prices under `dynamic`,
-  the genesis prices otherwise) and pays the floor at the current prices times
-  `(1 + adjust_bps/10 000)`, one step of headroom, so a block that raises the price before the
-  transaction lands still admits it; `--fee` overrides. `rand_status` reports `gas_prices`.
+- **The wallet** reads `rand_getLimits` (which serves the committed head's prices under
+  `dynamic`, the genesis prices otherwise) and pays the floor at those prices times
+  `(1 + adjust_bps/10 000)²` (integer: `⌊floor·(10 000 + adjust_bps)²/10 000²⌋`, u128), two
+  steps of headroom: the transaction is priced at the parent of the block that includes it, two
+  or three certified blocks past the served head, so two raises before it lands still admit it;
+  `--fee` overrides. `rand_status` reports `gas_prices`.
 - **What it is not:** no burn (the fee still goes to the proposer, §3.4), no per-transaction
   priority fee field (the bid is the fee above the floor, §7), no change to the bundle's flat
   base.

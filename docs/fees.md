@@ -81,7 +81,10 @@ state (`Ledger::gas_prices`, `GasPrices { gas_price, byte_price }`), moved once 
 
 applied to `byte_price` against `bytes_used`/`target_block_bytes` (Σ every transaction's
 `encoded_len`) and to `gas_price` against `gas_used`/`target_block_gas` (Σ each call's declared
-`GAS_LIMIT` plus `bundle_gas_limit` per bundle proof, built as `Ledger::block_usage`). The division
+`GAS_LIMIT` plus `bundle_gas_limit` per bundle proof, built as `Ledger::block_usage`), with `used`
+first capped at `2 · target` — so `adjust_bps` is the largest one-block move in either direction
+(a block's gas can exceed twice its target; its bytes cannot, chain 18's `target_block_bytes` being
+10 485 760, half the 20 MiB `max_block_bytes`). The division
 floors toward zero fall (`div_euclid`, not truncating division — `next_price(1001, 800, 0, t,
 1250) == 875`, not `876`); every price is clamped at its own `min_gas_price`/`min_byte_price`
 floor, which genesis must set so `min_price · adjust_bps ≥ 10 000` (a price under that bound could
@@ -93,8 +96,9 @@ a `gas` section at all). A `gas` section with `dynamic` set is refused beside an
 section at genesis (`GenesisError::DynamicGasWithAggregation`): a pruned bundle's marker form
 encodes shorter than its raw form, so sealed-sync's byte price would diverge from a live-synced
 node's. The wallet reads `rand_getLimits` (which serves the tip's current prices under `dynamic`)
-and pays one step of headroom, `floor + ⌊floor · adjust_bps / 10 000⌋`, so a block that raises the
-price before the transaction lands still admits it; `--fee` overrides. `rand_status` reports
+and pays two steps of headroom, `⌊floor · (10 000 + adjust_bps)² / 10 000²⌋` in u128: the served
+prices are the committed head's, and a transaction lands two or three certified blocks later, so
+two raises before it lands still admit it; `--fee` overrides. `rand_status` reports
 `gas_prices`.
 
 ## 2. What the sender pays with its own machine: proving

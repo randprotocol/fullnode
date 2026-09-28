@@ -234,7 +234,7 @@ enum Cmd {
         #[arg(long)]
         gas_limit: Option<String>,
         /// Fee in RAND; default: the floor for the declared gas (or, without a gas section, the
-        /// tier), plus one price step of headroom where prices move.
+        /// tier), plus two price steps of headroom where prices move.
         #[arg(long)]
         fee: Option<String>,
         /// Also seal the transcript to this `rand1…` address, which can then open this one call.
@@ -995,11 +995,11 @@ fn fee_call_default_gas(section: bool, tier: u64, keccak_log_height: Option<u8>,
     })
 }
 
-/// The fee line's suffix under the dynamic controller: the default pays one price step over the
+/// The fee line's suffix under the dynamic controller: the default pays two price steps over the
 /// tip's floor (spec §7.1).
 fn headroom_note(limits: Option<&randprotocol_client::ChainLimits>) -> &'static str {
     if limits.and_then(|l| l.adjust_bps).is_some() {
-        " (incl. one price step of headroom)"
+        " (incl. two price steps of headroom)"
     } else {
         ""
     }
