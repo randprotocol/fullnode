@@ -2027,7 +2027,23 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                             .and_then(|b| usize::try_from(b).ok())
                             .ok_or_else(|| RpcError::invalid_params("bytes must be a non-negative integer"))?,
                     };
-                    randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(tier, bytes)
+                    // Spec 2026-09-28 §8: the two hash-table heights of the header, optional,
+                    // `0` = no table; a `u8` in range, else -32602.
+                    let height = |name: &str| -> Result<u8, RpcError> {
+                        match spec.get(name) {
+                            None | Some(Value::Null) => Ok(0),
+                            Some(v) => v
+                                .as_u64()
+                                .and_then(|h| u8::try_from(h).ok())
+                                .filter(|h| *h <= 40)
+                                .ok_or_else(|| RpcError::invalid_params(format!("{name} must be an integer in 0..=40"))),
+                        }
+                    };
+                    let (klh, slh) = (height("keccak_log_height")?, height("sha256_log_height")?);
+                    match (st.limits.gas_price, st.limits.byte_price) {
+                        (Some(g), Some(b)) => randprotocol_core::gas::GasPolicy { gas_price: g, byte_price: b }.call_floor(tier, klh, slh, bytes),
+                        _ => randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(tier, bytes),
+                    }
                 }
                 _ => return Err(RpcError::invalid_params("kind must be bundle, deploy or call")),
             };
@@ -3341,6 +3357,36 @@ mod tests {
             assert_eq!(e.code, -32602, "tier {bad}");
         }
         assert_eq!(call(&st, "rand_estimateFee", json!([{"kind": "transfer"}])).await.unwrap_err().code, -32602);
+    }
+
+    /// Spec 2026-09-28 §8: under a policy the estimate is the policy floor of the header; the
+    /// two heights are optional and default to "no table"; without a policy the old answer.
+    #[tokio::test]
+    async fn estimate_fee_prices_the_header_under_a_policy() {
+        use randprotocol_core::gas::{self, GasPolicy};
+        let gs = fixtures::genesis(1);
+        let (_d, mut st) = state_for(&gs);
+        // A plain closure can't express the HRTB `Fn(&'a RpcState, Value) -> (impl Future + 'a)`
+        // that borrowing `st` per call and returning `ok`'s future would need; a nested async fn
+        // states the same borrow explicitly.
+        async fn fee(st: &RpcState, spec: Value) -> Value {
+            ok(st, "rand_estimateFee", json!([spec])).await
+        }
+        let old = (gas::BUNDLE_BASE + gas::call_fee(14, 1_300_000)).to_string();
+        assert_eq!(fee(&st, json!({"kind": "call", "tier": 14, "bytes": 1_300_000})).await, old);
+        st.limits = st.limits.with_gas_policy(Some(GasPolicy::DEFAULT));
+        assert_eq!(
+            fee(&st, json!({"kind": "call", "tier": 14, "bytes": 1_300_000})).await,
+            GasPolicy::DEFAULT.call_floor(14, 0, 0, 1_300_000).to_string()
+        );
+        assert_eq!(
+            fee(&st, json!({"kind": "call", "tier": 14, "bytes": 3_200_000, "keccak_log_height": 12, "sha256_log_height": 13})).await,
+            GasPolicy::DEFAULT.call_floor(14, 12, 13, 3_200_000).to_string()
+        );
+        for bad in [json!(-1), json!("5"), json!(300)] {
+            let e = call(&st, "rand_estimateFee", json!([{"kind": "call", "tier": 14, "keccak_log_height": bad}])).await.unwrap_err();
+            assert_eq!(e.code, -32602, "{bad}");
+        }
     }
 
     /// The deploy estimate refuses what the chain's own cap refuses — the genesis cap, not the
