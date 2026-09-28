@@ -1561,7 +1561,35 @@ fn close_batch_coverage(storage: &Storage, batch: &mut Vec<CommittedBlock>, limi
 /// `hc_bundle` — chains 14 and 15 name v1, a later cut names v2. Verification needs nothing more
 /// (the program is digested in-circuit and both guests declare the same heights), so either is
 /// runnable; a genesis naming anything else is refused as before.
+/// The chains whose committed proofs were made under an older constraint set than this build's
+/// (constraint set 7, v0.6.1), by genesis hash. Every earlier chain pins the retired 2-in-2-out
+/// guest, which this build does not carry, so the `hc_bundle` check already refuses it; chains 14
+/// and 15 pin guest v1, which it still does (a new genesis may name it), so they are named here.
+/// Every verifier key moved with constraint set 7: a v0.6.1 node on either chain would refuse the
+/// chain's own history at its startup replay.
+pub const PRE_CONSTRAINT_SET_7_CHAINS: [(u64, &str); 2] = [
+    (14, "1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff"),
+    (15, "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8"),
+];
+
+/// Refuse a genesis in [`PRE_CONSTRAINT_SET_7_CHAINS`]: `run` (through
+/// [`check_build_runs_genesis`]) and `verify` both call it before touching the datadir's blocks,
+/// so a v0.6.1 binary installed on a chain-14 or chain-15 host neither starts nor `verify
+/// --repair`s that chain's history away.
+pub fn refuse_pre_constraint_set_7(gs: &GenesisState) -> Result<()> {
+    let hash = gs.hash().to_hex();
+    if let Some((chain, _)) = PRE_CONSTRAINT_SET_7_CHAINS.iter().find(|(_, h)| *h == hash) {
+        anyhow::bail!(
+            "genesis {hash} is chain {chain}, whose proofs were made under constraint set 6; this build \
+             is constraint set 7 (v0.6.1) and verifies none of them. Run the chain's own release \
+             (v0.6 or earlier), never this one"
+        );
+    }
+    Ok(())
+}
+
 pub fn check_build_runs_genesis(gs: &GenesisState, built_hc_bundles: &[randprotocol_core::notes::Word8]) -> Result<()> {
+    refuse_pre_constraint_set_7(gs)?;
     if !built_hc_bundles.contains(&gs.hc_bundle) {
         anyhow::bail!(
             "every bundle guest this build carries ({}) differs from the genesis hc_bundle ({}); \

@@ -914,6 +914,7 @@ async fn main() -> Result<()> {
         Cmd::Verify { datadir, mode, repair } => {
             let mode: VerifyMode = mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let (gs, executor) = node::load_genesis(&datadir)?;
+            node::refuse_pre_constraint_set_7(&gs)?;
             let storage = Storage::open(&datadir)?;
             let check = storage.verify_chain(&gs, mode, executor.as_ref())?;
             match &check.problem {
@@ -1655,6 +1656,26 @@ mod tests {
         let minters = randprotocol_node::admission::faucet_minters(&state);
         assert_eq!(minters.len(), gen.validators.len(), "the pool admits the genesis validators");
         assert!(gen.validators.iter().all(|v| minters.contains(&v.public_key.address())));
+    }
+
+    /// v0.6.1 is constraint set 7: every verifier key moved, so no bundle or call proof chains 14
+    /// and 15 committed verifies on this build. Both genesis files pin guest v1, which this build
+    /// still carries (a new chain may pin it), so the `hc_bundle` check alone let a v0.6.1 binary
+    /// start on either chain — and its startup replay would then refuse the chain's own history.
+    /// The startup guard names both chains and refuses them before any datadir is opened.
+    #[test]
+    fn a_constraint_set_7_build_refuses_chain_14_and_chain_15() {
+        for (chain, file) in [(14, "genesis-chain14.json"), (15, "genesis-chain15.json")] {
+            let path = format!("{}/../../deploy/{file}", env!("CARGO_MANIFEST_DIR"));
+            let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+            let state = gen.build(executor.as_ref()).unwrap();
+            assert!(ZkExecutor::known_hc_bundles().contains(&state.hc_bundle), "chain {chain} pins a guest this build carries");
+            let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles())
+                .expect_err(&format!("a constraint-set-7 build must refuse chain {chain}"))
+                .to_string();
+            assert!(refused.contains("constraint set 7") && refused.contains(&format!("chain {chain}")), "{refused}");
+        }
     }
 
     /// Chain 16, cut by `deploy/cut-chain16-genesis.sh` with the v0.6.1 release binary: every
