@@ -155,6 +155,10 @@ async fn assert_refused(http: &reqwest::Client, addr: SocketAddr, origin: &str) 
         assert_eq!(v["error"]["message"], "origin not allowed");
         assert!(v.get("result").is_none(), "{v}");
     }
+    // An oversized body too: refused before its size is, and still no CORS headers.
+    let big = post_from(http, addr, Some(origin), json!({"jsonrpc":"2.0","id":1,"method":"prover_submit","params":["a".repeat(MAX_BODY_BYTES + 1)]})).await;
+    assert!(big.headers().get("access-control-allow-origin").is_none(), "{origin}: the oversized body");
+    assert_eq!(big.json::<Value>().await.unwrap()["error"]["code"], -32007, "{origin}: the oversized body");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

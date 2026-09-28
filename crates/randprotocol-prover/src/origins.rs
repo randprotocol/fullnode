@@ -23,7 +23,7 @@ pub enum AllowedOrigins {
     /// Every origin (`Access-Control-Allow-Origin: *`); opt-in, `--allow-origin '*'`.
     Any,
     /// Patterns, each one of: an exact origin (`https://wallet.example`, `http://host:8080`);
-    /// `scheme://*`, any extension id under that scheme (one host label of letters, digits, `-`,
+    /// `scheme://*` for a `-extension` scheme only, any extension id under it (letters, digits, `-`,
     /// `_` or `.`, no port); `scheme://host:*`, that exact scheme and host on any port (or none).
     /// No other wildcard exists.
     List(Vec<String>),
@@ -77,7 +77,10 @@ pub fn check_pattern(p: &str) -> Result<(), String> {
         return bad("the scheme must be lowercase letters, digits, +, - or .");
     }
     if rest == "*" {
-        return Ok(());
+        if is_extension_scheme(scheme) {
+            return Ok(());
+        }
+        return bad("`scheme://*` matches an extension id and is only for a `-extension` scheme; to allow every origin, pass `--allow-origin '*'`");
     }
     let authority = rest.strip_suffix(":*").unwrap_or(rest);
     if authority.is_empty() {
@@ -92,11 +95,22 @@ pub fn check_pattern(p: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `chrome-extension`, `moz-extension`, `safari-web-extension`: the only schemes whose `://*`
+/// names an extension id rather than every host.
+fn is_extension_scheme(scheme: &str) -> bool {
+    scheme.ends_with("-extension")
+}
+
 /// One pattern against one origin, as [`AllowedOrigins::List`] describes: exact, `scheme://*`
 /// or `scheme://host:*`. Prefix-then-shape, never a substring test, so `http://localhost.evil`
 /// is not `http://localhost:*`.
 fn matches(pattern: &str, origin: &str) -> bool {
+    // A `List` built in code bypasses `check_pattern`, so the extension-only rule is kept here too:
+    // `https://*` matches nothing rather than every website.
     if let Some(prefix) = pattern.strip_suffix('*').filter(|p| p.ends_with("://")) {
+        if !is_extension_scheme(&prefix[..prefix.len() - 3]) {
+            return false;
+        }
         return match origin.strip_prefix(prefix) {
             Some(id) => !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)),
             None => false,
@@ -167,6 +181,13 @@ mod tests {
     }
 
     #[test]
+    fn a_scheme_wildcard_outside_an_extension_scheme_matches_nothing() {
+        let l = AllowedOrigins::List(vec!["https://*".into(), "http://*".into()]);
+        assert!(!l.allows("https://evil.example"));
+        assert!(!l.allows("http://evil.example"));
+    }
+
+    #[test]
     fn an_exact_pattern_is_exact() {
         let l = AllowedOrigins::List(vec!["https://wallet.example".into()]);
         assert!(l.allows("https://wallet.example"));
@@ -190,6 +211,12 @@ mod tests {
         assert!(!l.allows("chrome-extension://abc"), "the given list is the whole list");
         for bad in ["localhost:5173", "https://a.example/", "https://*.example", "https://a.example:*:*", "https://a*", "http://localhost:8*", "*://a.example", "https://a.example/path", "https://"] {
             assert!(AllowedOrigins::from_flags(&[bad.into()]).is_err(), "{bad}");
+        }
+        // `scheme://*` is an extension id only: under http(s) the id charset (`.` included) would
+        // match every website, a near-`*` without its warning.
+        for bad in ["https://*", "http://*", "ws://*"] {
+            let e = AllowedOrigins::from_flags(&[bad.into()]).unwrap_err();
+            assert!(e.contains("'*'"), "{bad}: {e}");
         }
         for ok in DEFAULT_ORIGINS {
             assert!(check_pattern(ok).is_ok(), "{ok}");

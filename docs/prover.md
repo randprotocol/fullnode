@@ -281,11 +281,14 @@ chrome-extension://*   moz-extension://*   safari-web-extension://*
 http://localhost:*     http://127.0.0.1:*  http://[::1]:*
 ```
 
-A pattern is an exact origin (`https://wallet.example`, `http://host:8080`), `scheme://*` (any
-extension id under that scheme: letters, digits, `-`, `_`, `.`, no port or path), or
+A pattern is an exact origin (`https://wallet.example`, `http://host:8080`), `scheme://*` for a
+`-extension` scheme only (any extension id under it: letters, digits, `-`, `_`, `.`, no port or
+path; `https://*` or `http://*` is refused at start — to allow every origin, say `*`), or
 `scheme://host:*` (that exact scheme and host on any port, or none). There is no other wildcard and
 no substring match: `http://localhost.evil.example` is not `http://localhost:*`. A browser sends
-origins in lowercase and so must the list. Per request, by its `Origin` header:
+origins in lowercase and so must the list. `Origin: null` — a `file://` page, a sandboxed iframe,
+some redirects — matches no pattern and can never be allowed (only `*` answers it); serve a wallet
+page from `http://localhost:<port>` instead. Per request, by its `Origin` header:
 
 - **No `Origin`** (curl, the `rand` CLI, a same-origin page): served, with no CORS headers.
 - **An allowed origin**: `OPTIONS /` answers 204 with `Access-Control-Allow-Origin: <that origin>`,
@@ -421,6 +424,13 @@ that sends no `Origin`, or a forged one, over the network. A proxy in front of t
 the browser's `Origin` through unchanged (Caddy's `reverse_proxy` does), so the list keeps
 working behind it; a web wallet served from its own `https://` origin needs that origin added with
 `--allow-origin`, and `*` is never needed for it.
+
+Known limitation: Chrome's Private Network Access sends a preflight with
+`Access-Control-Request-Private-Network: true` when a public `https://` page calls a loopback
+address, and blocks the call unless the reply carries `Access-Control-Allow-Private-Network: true`.
+This build never sends that header, so a public web wallet cannot reach a prover on the user's own
+`127.0.0.1` from Chrome even with its origin on the list; extension and `localhost` wallets are
+unaffected, and a web wallet can reach a prover behind an `https://` proxy (above).
 
 A certificate a browser or phone accepts on a LAN is the operator's to arrange; whether a desktop
 app should carry a relay instead is spec §8 open question 4, unresolved.
