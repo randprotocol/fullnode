@@ -5370,6 +5370,7 @@ dependencies = [
  "rand 0.8.8",
  "randprotocol-client",
  "randprotocol-core",
+ "randprotocol-prover",
  "randprotocol-rvm",
  "randprotocol-zkvm",
  "reqwest",

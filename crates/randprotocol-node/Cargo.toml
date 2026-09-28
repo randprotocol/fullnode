@@ -10,11 +10,17 @@ description = "RAND full node: storage, p2p networking, sync, JSON-RPC, CLI"
 name = "rand-node"
 path = "src/main.rs"
 
+[features]
+# Forwarded to the hosted prover (`run --prover --prover-cuda`), which forwards them to the zkVM.
+cuda = ["randprotocol-prover/cuda"]
+mock-cuda = ["randprotocol-prover/mock-cuda"]
+
 [dependencies]
 randprotocol-core = { workspace = true }
 randprotocol-client = { workspace = true }
 randprotocol-zkvm = { workspace = true }
 randprotocol-rvm = { workspace = true }
+randprotocol-prover = { workspace = true }
 p3-field = "=0.7.0"
 postcard = { version = "1", features = ["alloc"] }
 blake3 = { workspace = true }
