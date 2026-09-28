@@ -239,6 +239,42 @@ key custody all at once — worth re-reading before chain 15.
    genesis starts at the guardian set already in use and takes the rotation attestation later, so
    there is no reason to gate the cut on it.
 
+## The chain-17 cut (v0.6.3, split authorisation)
+
+Scripts: `deploy/cut-chain17-genesis.sh` (the genesis), `deploy/cutover-fleet-chain17.sh` (the
+fleet), `deploy/chain17-bridge-steps.md` (the bridge session's half). **What changes:** the genesis
+is cut with `rand-node genesis --hardening-v6 --bundle-guest v3 --auth-guest` — `hc_bundle` is the
+v3 hidden-asset guest (`60af094a…`, `EXPECT_HC_BUNDLE`) and the new `hc_auth` (the auth guest's
+digest, hashed after `hardening_v6`) is pinned by the operator from the v0.6.3 release binary
+(`EXPECT_HC_AUTH`, no default; the script prints what the binary reports and refuses unset). Every
+bundle then carries an auth proof, **every txid changes** (`rand-txid-3`), and **the wire changes**:
+a v0.6.3 node refuses chains 14/15/16 at startup and a v0.6.1/v0.6.2 node cannot decode a chain-17
+bundle, so the roll is all-stop/all-start onto a new genesis, chain 16's shape (26 validators, the
+same keys, `faucet_minters` the 18 operator keys, the bridge's live set and a re-derived replay
+floor). Wallets, the relayer's `rand`, randscan and the website move to v0.6.3 with it.
+
+**The carry-over rule.** Chain 17 starts from chain 16's value, but only value whose opening the
+operator can re-issue: zUSD as chain 16's per-backing `locked` with fresh genesis notes to the
+holders in `ZUSD_CARRY` (Σ notes == Σ locked == source custody); RAND as one genesis alloc note per
+wallet the operator holds, at its chain-16 balance; the vesting register re-emitted with each
+entry's claimed amount subtracted; validator stakes as chain 16's register holds them (asserted,
+not assumed). **Shielded notes of wallets the operator does not hold cannot be carried** — a
+genesis note needs an opening — and the launch notes must say so. **The `balances` step**
+(`cut-chain17-genesis.sh balances <snapshot dir>`, read-only toward the chain, after `snapshot`,
+while chain 16 is up) runs `rand sync` + `balance` for every `*.key.json` under `WALLETS_DIRS`
+against chain 16 and writes `ALLOC_ADDRESSES` from the non-zero balances plus `balances.json`
+beside the snapshot; the cut asserts the alloc list is those wallets one-for-one and Σ alloc ==
+Σ scanned (`NO_BALANCES=1` is the explicit opt-out). `SELFTEST=1` runs the assembly and thirteen
+refusal cases on fixtures derived from `deploy/genesis-chain16.json`, with no network and no binary.
+
+**Order and the gate.** `stage` → bridge stop → `snapshot` → `balances` → **the user's go, typed in
+the executing session** → `stop` → cut → `push` → `switch` → `start` → `wait` → bridge restart →
+`retire-chain-dirs.sh` for chain 16 after a day. `stage`, `snapshot`, `balances` and the cut are
+reversible and need no go; `stop` does. Run every phase alone and read its `$?` (chain 16's trap: a
+piped `push … | tail && … start` started the fleet after a failed push). `push`, `switch` and `wait`
+refuse without `LOCAL_NODE` (a v0.6.3 `rand-node`); `start` refuses unless a successful `switch`
+left `/tmp/chain17-switched-<genesis prefix>`.
+
 ## The next cut: genesis fields v0.5.4 introduces
 
 The audit-v4 release (v0.5.4) added consensus rules that are switched on by genesis fields chain
