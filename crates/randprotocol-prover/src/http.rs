@@ -29,7 +29,12 @@ pub const BUSY: i64 = -32005;
 /// Binds `addr`, starts the [`Service`] on the current runtime and serves it. Returns the bound
 /// address (for `:0`), the service and the server task.
 pub async fn serve(addr: SocketAddr, cfg: Config) -> anyhow::Result<(SocketAddr, Shared, tokio::task::JoinHandle<()>)> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_on(tokio::net::TcpListener::bind(addr).await?, cfg).await
+}
+
+/// [`serve`] on a listener the caller already bound — `rand-node run --prover` binds its prover
+/// address before the node's startup verify, so a port in use fails at once, and serves it after.
+pub async fn serve_on(listener: tokio::net::TcpListener, cfg: Config) -> anyhow::Result<(SocketAddr, Shared, tokio::task::JoinHandle<()>)> {
     let bound = listener.local_addr()?;
     let svc = Service::start(cfg);
     let app = Router::new()

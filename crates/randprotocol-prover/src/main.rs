@@ -209,12 +209,30 @@ async fn main() -> Result<()> {
             let (bound, _svc, task) = http::serve(listen, cfg).await?;
             eprintln!("rand-prover {fingerprint} listening on http://{bound}");
             tokio::select! {
-                r = tokio::signal::ctrl_c() => { r?; eprintln!("shutting down"); }
+                r = shutdown_signal() => { r?; eprintln!("shutting down"); }
                 _ = task => bail!("the listener exited"),
             }
         }
     }
     Ok(())
+}
+
+/// Ctrl-C or SIGTERM (systemd's default stop signal), whichever comes first: both stop the same
+/// graceful way, waiting for a proof in flight.
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r,
+            _ = term.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }
 
 #[cfg(test)]

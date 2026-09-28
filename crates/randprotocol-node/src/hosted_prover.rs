@@ -1,0 +1,181 @@
+//! `rand-node run --prover`: the delegated prover hosted beside a node (`docs/prover.md` §4), on
+//! its own listener, never a method of the public RPC. [`prepare`] makes every check that can
+//! refuse — the key, the pairings, the backend, the free-memory gate and the bind itself — before
+//! the node key is read or the database opened; [`start`] serves the bound listener once the node
+//! is up; [`run`] ties the two together, so either one exiting stops the other.
+
+use crate::node::NodeHandle;
+use anyhow::{Context, Result};
+use randprotocol_prover::key::ProverKey;
+use randprotocol_prover::pairing::Pairings;
+use randprotocol_prover::service::Config;
+use randprotocol_zkvm::machine::Backend;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use tokio::task::JoinHandle;
+
+/// Shown whenever `--prover-accept-spend-key` is on (the same sentence `rand-prover run` prints).
+pub const SPEND_KEY_SENTENCE: &str = "every SpendKey job holds the sending wallet's spend key: run this only for wallets you own";
+
+/// `run`'s `--prover*` flags.
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// `--prover`.
+    pub addr: SocketAddr,
+    /// `--rpc`, which the prover's address must not overlap.
+    pub rpc: SocketAddr,
+    /// `--prover-home` (default `<datadir>/prover`).
+    pub home: PathBuf,
+    pub accept_spend_key: bool,
+    pub max_parallel: usize,
+    pub max_queue: usize,
+    pub cuda: bool,
+    pub skip_memory_check: bool,
+}
+
+/// What `run --prover` loaded before the node started: everything that can refuse has done so,
+/// and the prover's address is already bound (not yet served).
+pub struct HostedProver {
+    cfg: Config,
+    listener: std::net::TcpListener,
+    fingerprint: String,
+}
+
+impl HostedProver {
+    /// The address the prover's listener is bound to (the port, for `:0`).
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.listener.local_addr()?)
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+/// `run --prover`'s checks, as `rand-prover run` makes them: a listener distinct from the RPC, a
+/// key that already exists (a node never mints one), the pairings (none = a warning), the
+/// backend (no CUDA fallback), the free-memory gate — and the bind, so a port already in use
+/// fails here rather than after the node's startup verify.
+pub fn prepare(o: &Options) -> Result<HostedProver> {
+    let (addr, rpc, home) = (o.addr, o.rpc, &o.home);
+    // A wildcard bind on either side overlaps the other on the same port (and macOS's
+    // SO_REUSEADDR lets a specific bind sit beside a wildcard one), so that is the same listener too.
+    let overlaps = addr.ip() == rpc.ip() || addr.ip().is_unspecified() || rpc.ip().is_unspecified();
+    // Port 0 on both sides is two ephemeral ports, never one listener.
+    if overlaps && addr.port() != 0 && addr.port() == rpc.port() {
+        anyhow::bail!("--prover {addr} is the --rpc address: the prover is never a method of the public RPC; give it its own listener");
+    }
+    if o.max_parallel == 0 {
+        anyhow::bail!("--prover-max-parallel must be at least 1");
+    }
+    let key_path = home.join("prover.key.json");
+    let key = match ProverKey::load(&key_path) {
+        Ok(k) => k,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
+            "no prover key at {}: run `rand-prover --home {} keygen` and `pair` first",
+            key_path.display(),
+            home.display()
+        ),
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("loading {}", key_path.display()))),
+    };
+    let backend = match o.cuda {
+        false => Backend::Cpu,
+        #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
+        true => Backend::Cuda,
+        #[cfg(not(any(feature = "cuda", feature = "mock-cuda")))]
+        true => anyhow::bail!("built without CUDA support; rebuild rand-node with --features cuda"),
+    };
+    let pairings_path = home.join("pairings.json");
+    let pairings = Pairings::load(&pairings_path).with_context(|| format!("loading {}", pairings_path.display()))?;
+    if o.skip_memory_check {
+        tracing::warn!("prover memory check skipped");
+    } else {
+        // `memory::check` names `rand-prover`'s flags; this node's are prefixed.
+        randprotocol_prover::memory::check(o.max_parallel).map_err(|e| {
+            anyhow::anyhow!(e.replace("--max-parallel", "--prover-max-parallel").replace("--skip-memory-check", "--prover-skip-memory-check"))
+        })?;
+    }
+    let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding the prover on {addr}"))?;
+    listener.set_nonblocking(true)?;
+    if pairings.pairings.is_empty() {
+        // Printed, not only logged: a log filter must never hide a misconfiguration.
+        let line = format!("no prover pairings: every job will be refused — run `rand-prover --home {} pair`", home.display());
+        eprintln!("{line}");
+        tracing::warn!("{line}");
+    }
+    let fingerprint = key.fingerprint().to_string();
+    let mut cfg = Config::new(key, pairings);
+    cfg.backend = backend;
+    cfg.max_parallel = o.max_parallel;
+    cfg.max_queue = o.max_queue;
+    cfg.accept_spend_key = o.accept_spend_key;
+    Ok(HostedProver { cfg, listener, fingerprint })
+}
+
+/// Serves the listener [`prepare`] bound: the prover's address and its server task.
+pub async fn start(hp: HostedProver) -> Result<(SocketAddr, JoinHandle<()>)> {
+    if hp.cfg.accept_spend_key {
+        // The spec's disclosure sentence: printed, so no log filter can hide it.
+        eprintln!("{SPEND_KEY_SENTENCE}");
+        tracing::warn!("{SPEND_KEY_SENTENCE}");
+    }
+    let listener = tokio::net::TcpListener::from_std(hp.listener)?;
+    let (bound, _svc, task) = randprotocol_prover::http::serve_on(listener, hp.cfg).await?;
+    tracing::info!("prover listening on {bound}, fingerprint {}", hp.fingerprint);
+    Ok((bound, task))
+}
+
+/// Runs the node until it ends, `shutdown` fires, or the hosted prover's task (when there is one)
+/// exits — which stops the node and is an error. The prover's task is aborted on the way out.
+pub async fn run(mut handle: NodeHandle, mut prover: Option<JoinHandle<()>>, shutdown: impl Future<Output = ()>) -> Result<()> {
+    let prover_exit = async {
+        match prover.as_mut() {
+            Some(t) => {
+                let _ = t.await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let out = tokio::select! {
+        r = &mut handle.task => r.map_err(anyhow::Error::from).and_then(|r| r),
+        _ = prover_exit => {
+            tracing::error!("the prover listener exited; stopping the node");
+            handle.shutdown().await;
+            Err(anyhow::anyhow!("the prover listener exited"))
+        }
+        _ = shutdown => {
+            tracing::info!("shutting down");
+            handle.shutdown().await;
+            Ok(())
+        }
+    };
+    if let Some(t) = prover {
+        t.abort();
+    }
+    out
+}
+
+/// Ctrl-C or SIGTERM (systemd's default stop signal), whichever comes first.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!("cannot listen for SIGTERM ({e}); stopping on ctrl-c only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}

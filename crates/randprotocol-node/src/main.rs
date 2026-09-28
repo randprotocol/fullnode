@@ -10,20 +10,18 @@ use randprotocol_core::types::actions::{
     registration_message, registration_message_v2, unbond_message, withdraw_message, AggregatorRegistration,
     Registration,
 };
-use randprotocol_zkvm::machine::{Backend, FriProfile};
+use randprotocol_zkvm::machine::FriProfile;
 use randprotocol_core::{format_amount, parse_amount};
 use randprotocol_core::{Keypair, PublicKey, UNITS_PER_RAND};
 use randprotocol_node::keyfile::{load_keypair, KeyFile};
 use randprotocol_node::node::{self, NodeConfig};
 use randprotocol_node::storage::{Storage, VerifyMode};
-use randprotocol_prover::key::ProverKey;
-use randprotocol_prover::pairing::Pairings;
-use randprotocol_prover::service::Config;
+use randprotocol_node::hosted_prover::{self, HostedProver};
 use randprotocol_zkvm::executor::ZkExecutor;
 use randprotocol_zkvm::notes::{Note, SpendKey};
 use randprotocol_zkvm::viewing::TxKey;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// One genesis deposit note: `amount` units owned by the shielded address `addr`.
@@ -747,68 +745,6 @@ fn opens_storage(cmd: &Cmd) -> bool {
     matches!(cmd, Cmd::Run { .. } | Cmd::Verify { .. } | Cmd::Db { .. } | Cmd::Init { .. })
 }
 
-/// What `run --prover` loaded before the node started: everything that can refuse does so here,
-/// before the node key is read or the database opened.
-/// Shown whenever `--prover-accept-spend-key` is on (the same sentence `rand-prover run` prints).
-const SPEND_KEY_SENTENCE: &str = "every SpendKey job holds the sending wallet's spend key: run this only for wallets you own";
-
-struct HostedProver {
-    key: ProverKey,
-    pairings: Pairings,
-    backend: Backend,
-    fingerprint: String,
-}
-
-/// `run --prover`'s checks, as `rand-prover run` makes them: a listener distinct from the RPC, a
-/// key that already exists (a node never mints one), the pairings (none = a warning), the
-/// backend (no CUDA fallback) and the free-memory gate.
-fn prepare_prover(addr: SocketAddr, rpc: SocketAddr, home: &Path, max_parallel: usize, cuda: bool, skip_memory_check: bool) -> Result<HostedProver> {
-    // A wildcard bind on either side overlaps the other on the same port (and macOS's
-    // SO_REUSEADDR lets a specific bind sit beside a wildcard one), so that is the same listener too.
-    let overlaps = addr.ip() == rpc.ip() || addr.ip().is_unspecified() || rpc.ip().is_unspecified();
-    if overlaps && addr.port() == rpc.port() {
-        anyhow::bail!("--prover {addr} is the --rpc address: the prover is never a method of the public RPC; give it its own listener");
-    }
-    if max_parallel == 0 {
-        anyhow::bail!("--prover-max-parallel must be at least 1");
-    }
-    let key_path = home.join("prover.key.json");
-    let key = match ProverKey::load(&key_path) {
-        Ok(k) => k,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
-            "no prover key at {}: run `rand-prover --home {} keygen` and `pair` first",
-            key_path.display(),
-            home.display()
-        ),
-        Err(e) => return Err(anyhow::Error::new(e).context(format!("loading {}", key_path.display()))),
-    };
-    let backend = match cuda {
-        false => Backend::Cpu,
-        #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
-        true => Backend::Cuda,
-        #[cfg(not(any(feature = "cuda", feature = "mock-cuda")))]
-        true => anyhow::bail!("built without CUDA support; rebuild rand-node with --features cuda"),
-    };
-    let pairings_path = home.join("pairings.json");
-    let pairings = Pairings::load(&pairings_path).with_context(|| format!("loading {}", pairings_path.display()))?;
-    if skip_memory_check {
-        tracing::warn!("prover memory check skipped");
-    } else {
-        // `memory::check` names `rand-prover`'s flags; this node's are prefixed.
-        randprotocol_prover::memory::check(max_parallel).map_err(|e| {
-            anyhow::anyhow!(e.replace("--max-parallel", "--prover-max-parallel").replace("--skip-memory-check", "--prover-skip-memory-check"))
-        })?;
-    }
-    if pairings.pairings.is_empty() {
-        // Printed, not only logged: a log filter must never hide a misconfiguration.
-        let line = format!("no prover pairings: every job will be refused — run `rand-prover --home {} pair`", home.display());
-        eprintln!("{line}");
-        tracing::warn!("{line}");
-    }
-    let fingerprint = key.fingerprint().to_string();
-    Ok(HostedProver { key, pairings, backend, fingerprint })
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -1050,14 +986,20 @@ async fn main() -> Result<()> {
             prover_cuda,
             prover_skip_memory_check,
         } => {
-            // Every prover check runs before the node key is read or the database opened, so a
-            // misconfigured prover exits at once.
-            let hosted = match prover {
+            // Every prover check runs, and its address is bound, before the node key is read or
+            // the database opened, so a misconfigured prover (or a port in use) exits at once.
+            let hosted: Option<HostedProver> = match prover {
                 None => None,
-                Some(addr) => {
-                    let home = prover_home.unwrap_or_else(|| datadir.join("prover"));
-                    Some(prepare_prover(addr, rpc, &home, prover_max_parallel, prover_cuda, prover_skip_memory_check)?)
-                }
+                Some(addr) => Some(hosted_prover::prepare(&hosted_prover::Options {
+                    addr,
+                    rpc,
+                    home: prover_home.unwrap_or_else(|| datadir.join("prover")),
+                    accept_spend_key: prover_accept_spend_key,
+                    max_parallel: prover_max_parallel,
+                    max_queue: prover_max_queue,
+                    cuda: prover_cuda,
+                    skip_memory_check: prover_skip_memory_check,
+                })?),
             };
             let kp = load_keypair(&key)?;
             let handle = node::start(NodeConfig {
@@ -1078,54 +1020,19 @@ async fn main() -> Result<()> {
                 prune_history,
             })
             .await?;
-            let mut handle = handle;
-            // The prover binds after the node's RPC is up and stops with the node; a prover
+            // The prover is served once the node's RPC is up and stops with the node; a prover
             // that exits stops the node too.
-            let mut prover_task = match hosted {
+            let prover_task = match hosted {
                 None => None,
-                Some(hp) => {
-                    let mut cfg = Config::new(hp.key, hp.pairings);
-                    cfg.backend = hp.backend;
-                    cfg.max_parallel = prover_max_parallel;
-                    cfg.max_queue = prover_max_queue;
-                    cfg.accept_spend_key = prover_accept_spend_key;
-                    if prover_accept_spend_key {
-                        // The spec's disclosure sentence: printed, so no log filter can hide it.
-                        eprintln!("{SPEND_KEY_SENTENCE}");
-                        tracing::warn!("{SPEND_KEY_SENTENCE}");
+                Some(hp) => match hosted_prover::start(hp).await {
+                    Ok((_bound, task)) => Some(task),
+                    Err(e) => {
+                        handle.shutdown().await;
+                        return Err(e.context("serving the prover"));
                     }
-                    let addr = prover.expect("hosted implies --prover");
-                    let (bound, _svc, task) = match randprotocol_prover::http::serve(addr, cfg).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            handle.shutdown().await;
-                            return Err(e.context(format!("binding the prover on {addr}")));
-                        }
-                    };
-                    tracing::info!("prover listening on {bound}, fingerprint {}", hp.fingerprint);
-                    Some(task)
-                }
+                },
             };
-            let prover_exit = async {
-                match prover_task.as_mut() {
-                    Some(t) => {
-                        let _ = t.await;
-                    }
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            tokio::select! {
-                r = &mut handle.task => { r??; }
-                _ = prover_exit => {
-                    tracing::error!("the prover listener exited; stopping the node");
-                    handle.shutdown().await;
-                    anyhow::bail!("the prover listener exited");
-                }
-                _ = tokio::signal::ctrl_c() => { tracing::info!("shutting down"); handle.shutdown().await; }
-            }
-            if let Some(t) = prover_task {
-                t.abort();
-            }
+            hosted_prover::run(handle, prover_task, hosted_prover::shutdown_signal()).await?;
         }
         Cmd::Db { cmd: DbCmd::DropReceiptsIndex { datadir } } => {
             let dropped = Storage::drop_receipts_index(&datadir)?;
