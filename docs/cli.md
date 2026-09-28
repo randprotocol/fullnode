@@ -256,7 +256,7 @@ one the cut announced; a mismatch on one node is almost always an old binary.
 | `--prover-cuda` | off | prove on the CUDA backend (a build with `--features cuda`); no CPU fallback |
 | `--prover-skip-memory-check` | off | skip the free-memory gate |
 
-Environment: `RUST_LOG` (default `info,libp2p=warn,libp2p_mdns=off`). Ctrl-C shuts down cleanly.
+Environment: `RUST_LOG` (default `info,libp2p=warn,libp2p_mdns=off`). Ctrl-C or SIGTERM (systemd's default stop signal) shuts down cleanly.
 
 Startup sequence: open storage, check that this build's bundle guest matches the genesis
 `hc_bundle`, run the integrity check (truncating a damaged tail if any), resume consensus from the

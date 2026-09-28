@@ -4,7 +4,7 @@
 //! the node key is read or the database opened; [`start`] serves the bound listener once the node
 //! is up; [`run`] ties the two together, so either one exiting stops the other. On the way out
 //! `run` calls [`Service::shutdown`](randprotocol_prover::service::Service::shutdown) (queue
-//! dropped, workers stopped) before it aborts the listener task.
+//! dropped, workers stopped) first, then stops the node, then aborts the listener task.
 
 use crate::node::NodeHandle;
 use anyhow::{Context, Result};
@@ -138,7 +138,16 @@ pub async fn start(hp: HostedProver) -> Result<(SocketAddr, Served)> {
 /// exits — which stops the node and is an error. On the way out the prover's service is shut down
 /// (queued jobs dropped; a proof in flight, up to ~100 s, finishes with its reply discarded, and
 /// the runtime waits for it before the process exits) and its listener task aborted.
+///
+/// The order is load-bearing: `Service::shutdown` first, then the node, then the listener. Stopping
+/// the node first (it can take seconds) would leave the prover admitting jobs — and starting a
+/// ~100 s proof — while the process is already on its way out.
 pub async fn run(mut handle: NodeHandle, mut prover: Option<Served>, shutdown: impl Future<Output = ()>) -> Result<()> {
+    enum Why {
+        NodeEnded(Result<()>),
+        ProverExited,
+        Requested,
+    }
     let prover_exit = async {
         match prover.as_mut() {
             Some(p) => {
@@ -147,23 +156,33 @@ pub async fn run(mut handle: NodeHandle, mut prover: Option<Served>, shutdown: i
             None => std::future::pending::<()>().await,
         }
     };
-    let out = tokio::select! {
-        r = &mut handle.task => r.map_err(anyhow::Error::from).and_then(|r| r),
-        _ = prover_exit => {
+    let why = tokio::select! {
+        r = &mut handle.task => Why::NodeEnded(r.map_err(anyhow::Error::from).and_then(|r| r)),
+        _ = prover_exit => Why::ProverExited,
+        _ = shutdown => Why::Requested,
+    };
+    // 1. The prover's queue closes before anything else: no job is admitted from here on.
+    if let Some(p) = prover.as_ref() {
+        tracing::info!("stopping the prover: queued jobs dropped; a proof in flight (up to ~100 s) finishes first and its reply is discarded");
+        p.svc.shutdown();
+    }
+    // 2. The node.
+    let out = match why {
+        Why::NodeEnded(r) => r,
+        Why::ProverExited => {
             tracing::error!("the prover listener exited; stopping the node");
             handle.shutdown().await;
             Err(anyhow::anyhow!("the prover listener exited"))
         }
-        _ = shutdown => {
+        Why::Requested => {
             tracing::info!("shutting down");
             handle.shutdown().await;
             Ok(())
         }
     };
+    // 3. The listener. Not awaited when `prover_exit` already consumed it: a JoinHandle is polled
+    // once to completion.
     if let Some(p) = prover {
-        tracing::info!("stopping the prover: queued jobs dropped; a proof in flight (up to ~100 s) finishes first and its reply is discarded");
-        p.svc.shutdown();
-        // Not awaited when `prover_exit` already consumed it: a JoinHandle is polled once to completion.
         if !p.task.is_finished() {
             p.task.abort();
             let _ = p.task.await;
