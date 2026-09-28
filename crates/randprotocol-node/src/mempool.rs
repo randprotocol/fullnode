@@ -2436,6 +2436,57 @@ mod tests {
         assert_eq!(m.precheck(&call, &ledger, &StubExecutor).unwrap().floor, want);
     }
 
+    /// Chain 16 hotfix: `admission::call_floor` used to read a hardened call's header over just
+    /// `tx.call_binding()`, but the ledger's own hardened-call rule (`hardened_call_segment`,
+    /// issue #55) proves over the program's deploy-time public words *then* the binding — for a
+    /// program deployed with a public input that segment is longer than the binding alone, so
+    /// the policy's decode failed `InvalidProof("PublicValues")` (permanent) for every valid call
+    /// to it, even though the ledger itself would have accepted the same proof. The fix reads the
+    /// segment the same way the ledger does.
+    #[test]
+    fn a_hardened_call_to_a_public_input_program_is_priced_not_refused() {
+        use randprotocol_core::gas::GasPolicy;
+        use randprotocol_core::program::{hardened_call_segment, program_id_with_public};
+
+        let gs = fixtures::genesis(1);
+        let mut ledger = gs.ledger.clone();
+        ledger.set_hardening_v6(true);
+        ledger.set_max_program_public_words(8);
+        let words = vec![0x13u32; 4];
+        let public = vec![1u32, 2, 3];
+        let pid = program_id_with_public(0, &words, &public);
+        let with_bundle = |l: &Ledger, a: u8, fee: u64, action| {
+            let a = a as u32;
+            let b = fixtures::bundle_tx(l, [[a; 8], [a + 1; 8]], [[a + 2; 8], [a + 3; 8]], fee).bundle.expect("bundle");
+            StubExecutor::bound(Transaction::shielded(gs.chain_id, b, action))
+        };
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: public.clone() };
+        let deploy = with_bundle(&ledger, 40, randprotocol_core::gas::fee_floor(&deploy), deploy);
+        ledger.apply_tx(&deploy, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        ledger.record_anchor(ledger.height());
+
+        let stub_len = StubExecutor::make_proof_with_public(&Hash::ZERO, 12, [0; 8], &[]).len();
+        let want = GasPolicy::DEFAULT.call_floor(12, 0, 0, stub_len);
+        let call = with_bundle(&ledger, 60, want, Action::Call { program: pid, proof: vec![], input_envelope: None });
+        let binding = call.call_binding();
+        let segment = hardened_call_segment(&public, &binding);
+        let proof = StubExecutor::make_proof_with_public(&pid, 12, [7; 8], &segment);
+        let mut call = call;
+        let Action::Call { proof: p, .. } = &mut call.action else { unreachable!() };
+        *p = proof;
+        let call = StubExecutor::bound(call);
+
+        assert_eq!(ledger.validate(&call, &StubExecutor), Ok(()), "the ledger accepts the bound call");
+        assert_eq!(
+            crate::admission::call_floor(&call, &ledger, &StubExecutor, &GasPolicy::DEFAULT),
+            Ok(want),
+            "the pool prices the call over the ledger's own segment instead of refusing it"
+        );
+        let mut m = Mempool::new(64);
+        m.set_gas_policy(GasPolicy::DEFAULT);
+        assert_eq!(m.precheck(&call, &ledger, &StubExecutor).unwrap().floor, want);
+    }
+
     /// Review focus 1 and 2: the policy check never decodes a proof it should not.
     #[test]
     fn an_unknown_programs_call_is_refused_before_its_proof_is_decoded() {

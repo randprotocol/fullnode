@@ -779,9 +779,11 @@ pub fn call_floor(
     let record = ledger.program(program).ok_or(TxError::UnknownProgram(*program))?;
     // Read the header as the ledger's step 10 does: under genesis `hardening_v6` a program
     // without a public input is proved over the call binding (INT-4), which the plain decoder
-    // would refuse as `PublicValues`.
+    // would refuse as `PublicValues`. The segment is the ledger's own (`hardened_call_segment`:
+    // a program's deploy-time public words, then the binding — issue #55), so a program with a
+    // public input decodes here too.
     let outcome = if ledger.hardening_v6() {
-        executor.decode_call_hardened(record, proof, &tx.call_binding())
+        executor.decode_call_hardened(record, proof, &ledger.hardened_call_segment(record, &tx.call_binding()))
     } else {
         executor.decode_call(record, proof)
     }
