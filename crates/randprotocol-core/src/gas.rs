@@ -528,3 +528,148 @@ pub fn subsidy(n: u64, cfg: &crate::ledger::aggregation::AggregationConfig) -> u
         cfg.subsidy_base >> (n / cfg.halving_blocks)
     }
 }
+
+/// Genesis `gas` (design 2026-09-28 §4.2, §4.3, §7.1): a chain's declared prices, the bundle's
+/// flat gas limit, and how gas is metered. A genesis parameter like `max_program_words` — outside
+/// the state root and `Ledger`'s equality, restored by `reload_ledger` on every restart — bound
+/// into the genesis hash only when the section is present, so a chain without one hashes
+/// byte-for-byte as before.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GasConfig {
+    /// Units of RAND per gas (spec §3.1's unit; §3.3's default is [`GAS_PRICE_DEFAULT`]). A
+    /// decimal string in the file, like every other genesis amount.
+    #[serde(with = "crate::ledger::staking::amount_string")]
+    pub gas_price: u64,
+    /// Units of RAND per KiB (or part of one) of call proof and input envelope, from byte 0.
+    #[serde(with = "crate::ledger::staking::amount_string")]
+    pub byte_price: u64,
+    /// The bundle guest's flat gas (spec §4.3): every bundle proof's declared `GAS_LIMIT` must
+    /// equal this constant exactly, or the proof is refused. `16 383` (`2¹⁴ − 1`) for today's
+    /// tier-14 guest.
+    pub bundle_gas_limit: u64,
+    /// How gas is metered on this chain. `Circuit` (spec §4.2) is the only value the chain
+    /// accepts today; the field exists so a later metering scheme has somewhere to be named.
+    pub metering: GasMetering,
+    /// Phase 2 (spec §7.1): the dynamic price controller. Absent means the fixed prices above
+    /// never move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic: Option<DynamicGas>,
+}
+
+/// How a chain meters gas (`GasConfig::metering`). Only `Circuit` — the in-circuit meter, spec
+/// §4.2 — is accepted; the enum exists so a later scheme has a name to add beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GasMetering {
+    Circuit,
+}
+
+/// Phase 2 (spec §7.1): the parameters of the per-block price controller. State derived from
+/// this section (the live `gas_price`/`byte_price`) lives on the ledger, not here — this is only
+/// the genesis file's declaration of how that state starts and moves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DynamicGas {
+    /// The block-bytes figure the controller targets: `byte_price` falls when a block is under
+    /// this and rises when it is over. Must be `1..=max_block_bytes` (today's default when the
+    /// genesis does not set one, [`MAX_BLOCK_BYTES`]).
+    pub target_block_bytes: u64,
+    /// The block-gas figure the controller targets, the same way for `gas_price`. Must be `> 0`.
+    pub target_block_gas: u64,
+    /// The largest one-block move, in basis points of the current price (spec §7.1's formula).
+    /// `1..=5000` (0.01 %..=50 % a block).
+    pub adjust_bps: u32,
+    /// The floor `gas_price` never falls under. Must be `<= gas_price` — a genesis file cannot
+    /// declare a starting price its own floor already exceeds.
+    #[serde(with = "crate::ledger::staking::amount_string")]
+    pub min_gas_price: u64,
+    /// The floor `byte_price` never falls under, the same way. Must be `<= byte_price`.
+    #[serde(with = "crate::ledger::staking::amount_string")]
+    pub min_byte_price: u64,
+}
+
+impl GasConfig {
+    /// Every rule a `gas` section has to meet before it can seed a chain (spec §4.2, §4.3, §7.1).
+    /// `max_block_bytes` is the ledger's effective cap — the genesis file's own
+    /// `max_block_bytes`, or [`MAX_BLOCK_BYTES`] when it does not set one — which is what bounds
+    /// `dynamic.target_block_bytes`.
+    pub fn check(&self, max_block_bytes: usize) -> Result<(), String> {
+        if self.gas_price == 0 {
+            return Err("gas_price must be greater than 0".into());
+        }
+        if self.byte_price == 0 {
+            return Err("byte_price must be greater than 0".into());
+        }
+        if self.bundle_gas_limit == 0 {
+            return Err("bundle_gas_limit must be at least 1".into());
+        }
+        if let Some(d) = &self.dynamic {
+            if d.adjust_bps == 0 || d.adjust_bps > 5000 {
+                return Err(format!("adjust_bps {} is outside 1..=5000", d.adjust_bps));
+            }
+            if d.target_block_bytes == 0 || d.target_block_bytes as usize > max_block_bytes {
+                return Err(format!(
+                    "target_block_bytes {} must be 1..={max_block_bytes} (the chain's max_block_bytes)",
+                    d.target_block_bytes
+                ));
+            }
+            if d.target_block_gas == 0 {
+                return Err("target_block_gas must be greater than 0".into());
+            }
+            if d.min_gas_price > self.gas_price {
+                return Err(format!("min_gas_price {} cannot exceed the starting gas_price {}", d.min_gas_price, self.gas_price));
+            }
+            if d.min_byte_price > self.byte_price {
+                return Err(format!("min_byte_price {} cannot exceed the starting byte_price {}", d.min_byte_price, self.byte_price));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gas_config_tests {
+    use super::*;
+
+    fn ok() -> GasConfig {
+        GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 16_383, metering: GasMetering::Circuit, dynamic: None }
+    }
+
+    #[test]
+    fn a_well_formed_config_checks_clean() {
+        assert!(ok().check(MAX_BLOCK_BYTES).is_ok());
+        let d = DynamicGas {
+            target_block_bytes: 2 << 20,
+            target_block_gas: 1 << 18,
+            adjust_bps: 1250,
+            min_gas_price: 100,
+            min_byte_price: 800,
+        };
+        let mut g = ok();
+        g.dynamic = Some(d);
+        assert!(g.check(MAX_BLOCK_BYTES).is_ok());
+    }
+
+    #[test]
+    fn zero_prices_and_a_zero_limit_are_refused() {
+        assert!(GasConfig { gas_price: 0, ..ok() }.check(MAX_BLOCK_BYTES).unwrap_err().contains("gas_price"));
+        assert!(GasConfig { byte_price: 0, ..ok() }.check(MAX_BLOCK_BYTES).unwrap_err().contains("byte_price"));
+        assert!(GasConfig { bundle_gas_limit: 0, ..ok() }.check(MAX_BLOCK_BYTES).unwrap_err().contains("bundle_gas_limit"));
+    }
+
+    #[test]
+    fn the_dynamic_controller_is_bounded() {
+        let base = DynamicGas { target_block_bytes: 2 << 20, target_block_gas: 1 << 18, adjust_bps: 1250, min_gas_price: 100, min_byte_price: 800 };
+        let bad = |d: DynamicGas| -> String {
+            let mut g = ok();
+            g.dynamic = Some(d);
+            g.check(MAX_BLOCK_BYTES).unwrap_err()
+        };
+        assert!(bad(DynamicGas { adjust_bps: 0, ..base.clone() }).contains("adjust_bps"));
+        assert!(bad(DynamicGas { adjust_bps: 5001, ..base.clone() }).contains("adjust_bps"));
+        assert!(bad(DynamicGas { target_block_bytes: 0, ..base.clone() }).contains("target_block_bytes"));
+        assert!(bad(DynamicGas { target_block_bytes: (MAX_BLOCK_BYTES as u64) + 1, ..base.clone() }).contains("target_block_bytes"));
+        assert!(bad(DynamicGas { target_block_gas: 0, ..base.clone() }).contains("target_block_gas"));
+        assert!(bad(DynamicGas { min_gas_price: 101, ..base.clone() }).contains("min_gas_price"), "the floor cannot exceed the starting price");
+        assert!(bad(DynamicGas { min_byte_price: 801, ..base.clone() }).contains("min_byte_price"));
+    }
+}

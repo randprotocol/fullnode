@@ -202,6 +202,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         hardening_v6: None,
         staking: None,
         vesting: None,
+        gas: None,
     }
 }
 

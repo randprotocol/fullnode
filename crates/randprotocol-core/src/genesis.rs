@@ -409,6 +409,14 @@ pub struct Genesis {
     /// the state root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardening_v6: Option<bool>,
+    /// The gas section (design 2026-09-28 §4.2, §4.3, §7.1): the chain's declared prices, the
+    /// bundle guest's flat gas limit, the metering scheme, and (Phase 2) the dynamic price
+    /// controller's parameters. A genesis parameter like `max_program_words`: outside the state
+    /// root and `Ledger`'s equality. Absent from a chain cut before it — chain 15's file
+    /// included — hashes byte-for-byte as before; present, it is bound into the genesis hash
+    /// after `hardening_v6`. Nothing outside `Genesis`/`Ledger` reads it yet (a later task).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas: Option<gas::GasConfig>,
 }
 
 fn default_true() -> bool {
@@ -476,6 +484,9 @@ pub enum GenesisError {
     /// The `vesting` section breaks one of `VestingConfig::check`'s rules.
     #[error("bad vesting config: {0}")]
     BadVesting(String),
+    /// The `gas` section breaks one of `GasConfig::check`'s rules.
+    #[error("bad gas config: {0}")]
+    Gas(String),
     #[error("bad hc_bundle {0} (64 hex characters)")]
     BadHcBundle(String),
     #[error("bad alloc note {0}")]
@@ -694,6 +705,10 @@ impl Genesis {
         if let Some(v) = &self.vesting {
             v.check().map_err(GenesisError::BadVesting)?;
         }
+        if let Some(g) = &self.gas {
+            let max_block_bytes = self.max_block_bytes.map_or(gas::MAX_BLOCK_BYTES, |n| n as usize);
+            g.check(max_block_bytes).map_err(GenesisError::Gas)?;
+        }
         Ok(())
     }
 
@@ -823,6 +838,7 @@ impl Genesis {
         ledger.set_max_program_public_words(self.max_program_public_words.map_or(gas::MAX_PROGRAM_PUBLIC_WORDS, |n| n as usize));
         ledger.set_envelope_bytes(self.envelope_bytes.map(|n| n as usize));
         ledger.set_hardening_v6(self.hardening_v6 == Some(true));
+        ledger.set_gas(self.gas.clone());
         // The genesis ledger is positioned at the genesis block, so it carries that block's
         // time structurally rather than relying on every caller to patch it in. The timestamp
         // is transient state, not part of the state root or the genesis hash.
@@ -1104,6 +1120,21 @@ impl Genesis {
         if self.hardening_v6 == Some(true) {
             commit.extend_from_slice(b"hardening_v6");
             commit.push(1);
+        }
+        // Gas (design 2026-09-28 §4.2, §4.3, §7.1), last: only when the file sets it, so every
+        // genesis cut before it hashes byte-for-byte as before.
+        if let Some(g) = &self.gas {
+            commit.extend_from_slice(b"gas");
+            commit.extend_from_slice(&g.gas_price.to_le_bytes());
+            commit.extend_from_slice(&g.byte_price.to_le_bytes());
+            commit.extend_from_slice(&g.bundle_gas_limit.to_le_bytes());
+            commit.extend_from_slice(b"circuit");
+            if let Some(d) = &g.dynamic {
+                commit.extend_from_slice(b"gas_dynamic");
+                for x in [d.target_block_bytes, d.target_block_gas, d.adjust_bps as u64, d.min_gas_price, d.min_byte_price] {
+                    commit.extend_from_slice(&x.to_le_bytes());
+                }
+            }
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -1512,6 +1543,7 @@ mod tests {
             envelope_bytes: None,
             vesting: None,
             hardening_v6: None,
+            gas: None,
         }
     }
 
@@ -2841,6 +2873,81 @@ mod tests {
         assert_eq!(g.ledger.state_root(), s.ledger.state_root(), "a parameter, not state");
         assert!(on.to_json().contains("\"hardening_v6\": true"));
         assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "and it round-trips");
+    }
+
+    /// The `gas` section (design 2026-09-28 §4.2, §4.3, §7.1) is bound into the genesis hash
+    /// only when present, prices are decimal strings, and `dynamic` is bound under its own tag.
+    #[test]
+    fn the_gas_section_is_bound_into_the_hash_only_when_present() {
+        let plain = genesis(1);
+        assert!(plain.gas.is_none() && !plain.to_json().contains("\"gas\""));
+        let h0 = build(&plain).hash();
+
+        let mut g = plain.clone();
+        g.gas = Some(gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: 16_383,
+            metering: gas::GasMetering::Circuit,
+            dynamic: None,
+        });
+        let s = build(&g);
+        assert_ne!(s.hash(), h0);
+        assert_eq!(s.ledger.gas().unwrap().gas_price, 100);
+        assert!(g.to_json().contains("\"gas_price\": \"100\""), "amounts are decimal strings");
+        assert_eq!(s.ledger.state_root(), build(&plain).ledger.state_root(), "a parameter, not state");
+
+        let mut d = g.clone();
+        d.gas.as_mut().unwrap().dynamic = Some(gas::DynamicGas {
+            target_block_bytes: 2 << 20,
+            target_block_gas: 1 << 18,
+            adjust_bps: 1250,
+            min_gas_price: 100,
+            min_byte_price: 800,
+        });
+        assert_ne!(build(&d).hash(), build(&g).hash(), "dynamic is bound under its own tag");
+        assert_eq!(Genesis::from_json(&d.to_json()).unwrap(), d, "round-trips");
+    }
+
+    /// `GasConfig::check`'s rules, reached through `Genesis::validate`.
+    #[test]
+    fn the_gas_section_is_validated() {
+        let base = genesis(1);
+        let ok = gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: 16_383,
+            metering: gas::GasMetering::Circuit,
+            dynamic: None,
+        };
+        let mut g = base.clone();
+        g.gas = Some(gas::GasConfig { gas_price: 0, ..ok.clone() });
+        assert!(g.validate().unwrap_err().to_string().contains("gas_price"));
+
+        let mut g = base.clone();
+        g.gas = Some(gas::GasConfig { bundle_gas_limit: 0, ..ok.clone() });
+        assert!(g.validate().unwrap_err().to_string().contains("bundle_gas_limit"));
+
+        let bad_dyn = |d: gas::DynamicGas| -> String {
+            let mut g = base.clone();
+            g.gas = Some(gas::GasConfig { dynamic: Some(d), ..ok.clone() });
+            g.validate().unwrap_err().to_string()
+        };
+        let d = gas::DynamicGas {
+            target_block_bytes: 2 << 20,
+            target_block_gas: 1 << 18,
+            adjust_bps: 1250,
+            min_gas_price: 100,
+            min_byte_price: 800,
+        };
+        assert!(bad_dyn(gas::DynamicGas { adjust_bps: 0, ..d.clone() }).contains("adjust_bps"));
+        assert!(bad_dyn(gas::DynamicGas { adjust_bps: 5001, ..d.clone() }).contains("adjust_bps"));
+        assert!(bad_dyn(gas::DynamicGas { target_block_bytes: (64 << 20) + 1, ..d.clone() }).contains("target_block_bytes"));
+        assert!(bad_dyn(gas::DynamicGas { target_block_gas: 0, ..d.clone() }).contains("target_block_gas"));
+        assert!(
+            bad_dyn(gas::DynamicGas { min_gas_price: 101, ..d.clone() }).contains("min_gas_price"),
+            "the floor cannot exceed the starting price"
+        );
     }
 
     /// The cap must be a program length the zkVM can prove: at least one word, and no more than
