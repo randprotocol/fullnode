@@ -78,6 +78,8 @@ pub struct NodeConfig {
     pub min_free_disk_bytes: u64,
     /// Keep only this much block history (history pruning spec §1); `None` keeps everything.
     pub prune_history: Option<Duration>,
+    /// Spec 2026-09-28 §4.1: price calls by their proof header; None = no policy.
+    pub gas_policy: Option<randprotocol_core::gas::GasPolicy>,
 }
 
 /// Handles returned by `Node::start` so tests and the CLI can observe the node.
@@ -1767,7 +1769,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     let viewing = Arc::new(RwLock::new(crate::viewing::Registry::default()));
     let viewing_count = viewing.read().unwrap_or_else(|e| e.into_inner()).count();
     // The RPC's limits, computed once from the genesis ledger.
-    let rpc_limits = rpc::ChainLimits::of(&gs.ledger);
+    let rpc_limits = rpc::ChainLimits::of(&gs.ledger).with_gas_policy(cfg.gas_policy);
     let (rpc_addr, rpc_task) = rpc::serve(
         cfg.rpc_addr,
         RpcState {
@@ -1845,6 +1847,9 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     // RESCAN-LEDGER-1: this pool admits faucet mints from the genesis's minters only.
     let mut mempool = Mempool::new(10_000);
     mempool.set_faucet_minters(admission::faucet_minters(&gs));
+    if let Some(p) = cfg.gas_policy {
+        mempool.set_gas_policy(p);
+    }
     let node = Node {
         cfg,
         gs,

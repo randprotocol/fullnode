@@ -504,6 +504,14 @@ enum Cmd {
         /// The shielded address (`rand1…`) the hosted prover's fee is paid to.
         #[arg(long, value_name = "ADDRESS", requires = "prover_fee")]
         prover_fee_address: Option<String>,
+        /// Units (10⁻⁹ RAND) per gas the pool demands of a call, over `gas_max` of its proof
+        /// header (spec 2026-09-28 §4.1). Admission policy, not a chain rule. `0` with
+        /// `--byte-price 0` runs no policy: the ledger's tier schedule alone.
+        #[arg(long, default_value_t = randprotocol_core::gas::GAS_PRICE_DEFAULT)]
+        gas_price: u64,
+        /// Units per KiB (or part) of a call's proof and input envelope, from byte 0.
+        #[arg(long, default_value_t = randprotocol_core::gas::BYTE_PRICE_DEFAULT)]
+        byte_price: u64,
     },
     /// Verify the chain in a data directory without running the node.
     Verify {
@@ -1030,6 +1038,8 @@ async fn main() -> Result<()> {
             prover_allow_origin,
             prover_fee,
             prover_fee_address,
+            gas_price,
+            byte_price,
         } => {
             // Every prover check runs, and its address is bound, before the node key is read or
             // the database opened, so a misconfigured prover (or a port in use) exits at once.
@@ -1066,6 +1076,7 @@ async fn main() -> Result<()> {
                 keep_raw_proofs,
                 min_free_disk_bytes: min_free_disk_mb << 20,
                 prune_history,
+                gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
             })
             .await?;
             // The prover is served once the node's RPC is up and stops with the node; a prover
@@ -2466,5 +2477,17 @@ mod prune_flag_tests {
         assert!(parse_prune_history("h").unwrap_err().contains("<n>m, <n>h or <n>d"));
         assert!(parse_prune_history("0h").unwrap_err().contains("at least 1h"));
         assert!(parse_prune_history("24ｈ").unwrap_err().contains("<n>m, <n>h or <n>d"));
+    }
+
+    #[test]
+    fn run_defaults_to_the_spec_prices_and_zero_means_no_policy() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["rand-node", "run", "--datadir", "/tmp/x", "--key", "/tmp/k"]).unwrap();
+        let Cmd::Run { gas_price, byte_price, .. } = cli.cmd else { panic!("run") };
+        assert_eq!((gas_price, byte_price), (100, 800));
+        assert_eq!(randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price), Some(randprotocol_core::gas::GasPolicy::DEFAULT));
+        let cli = Cli::try_parse_from(["rand-node", "run", "--datadir", "/tmp/x", "--key", "/tmp/k", "--gas-price", "0", "--byte-price", "0"]).unwrap();
+        let Cmd::Run { gas_price, byte_price, .. } = cli.cmd else { panic!("run") };
+        assert_eq!(randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price), None);
     }
 }

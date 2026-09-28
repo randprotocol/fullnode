@@ -477,6 +477,13 @@ pub struct ChainLimits {
     /// wallet reads to build a v3 transaction — `nk` and a salt to the bundle guest, the spend
     /// key to its own auth proof — instead of a v1/v2 one.
     pub hc_auth: Option<String>,
+    /// Spec 2026-09-28 §8: this node's gas policy (Phase 0), `null` when it runs none. Node
+    /// policy, not a chain limit — two nodes on one chain may answer differently.
+    pub gas_price: Option<u64>,
+    pub byte_price: Option<u64>,
+    /// `"header"` while the policy prices `gas_max` of the proof header (Phase 0); `null` with
+    /// no policy. Phase 1 (chain 18) answers `"circuit"`.
+    pub gas_metering: Option<&'static str>,
 }
 
 impl ChainLimits {
@@ -490,7 +497,18 @@ impl ChainLimits {
             envelope_bytes: ledger.envelope_bytes(),
             hardening_v6: ledger.hardening_v6(),
             hc_auth: ledger.hc_auth().map(|h| word8_to_hex(&h)),
+            gas_price: None,
+            byte_price: None,
+            gas_metering: None,
         }
+    }
+
+    /// The same limits announcing `policy` (`None` clears them).
+    pub fn with_gas_policy(mut self, policy: Option<randprotocol_core::gas::GasPolicy>) -> ChainLimits {
+        self.gas_price = policy.map(|p| p.gas_price);
+        self.byte_price = policy.map(|p| p.byte_price);
+        self.gas_metering = policy.map(|_| "header");
+        self
     }
 
     /// The request-body limit for this chain: [`RPC_MAX_BODY_BYTES`]'s formula over the chain's
@@ -3397,6 +3415,9 @@ mod tests {
                 "envelope_bytes": null,
                 "hardening_v6": false,
                 "hc_auth": null,
+                "gas_price": null,
+                "byte_price": null,
+                "gas_metering": null,
             })
         );
         let gs = raised_genesis();
@@ -3412,6 +3433,9 @@ mod tests {
                 "envelope_bytes": null,
                 "hardening_v6": false,
                 "hc_auth": null,
+                "gas_price": null,
+                "byte_price": null,
+                "gas_metering": null,
             })
         );
         // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
@@ -3429,6 +3453,9 @@ mod tests {
                 "envelope_bytes": 1860,
                 "hardening_v6": false,
                 "hc_auth": null,
+                "gas_price": null,
+                "byte_price": null,
+                "gas_metering": null,
             })
         );
         // The v0.6 switch: what a wallet reads to prove its calls over the call binding (INT-4).
@@ -3441,6 +3468,24 @@ mod tests {
         gs.ledger.set_hc_auth(Some([7; 8]));
         let (_d, st) = state_for(&gs);
         assert_eq!(ok(&st, "rand_getLimits", json!([])).await["hc_auth"], json!(word8_to_hex(&[7; 8])));
+    }
+
+    /// Spec 2026-09-28 §8: a node with a gas policy announces it; review focus 3: zero prices
+    /// mean no policy and the reply reads as before.
+    #[tokio::test]
+    async fn get_limits_announces_the_gas_policy() {
+        let gs = fixtures::genesis(1);
+        let (_d, mut st) = state_for(&gs);
+        st.limits = st.limits.with_gas_policy(Some(randprotocol_core::gas::GasPolicy::DEFAULT));
+        let v = ok(&st, "rand_getLimits", json!([])).await;
+        assert_eq!(v["gas_price"], 100);
+        assert_eq!(v["byte_price"], 800);
+        assert_eq!(v["gas_metering"], "header");
+        assert_eq!(v["max_proof_bytes"], 2_097_152, "the chain's limits are unchanged");
+        st.limits = st.limits.with_gas_policy(randprotocol_core::gas::GasPolicy::from_prices(0, 0));
+        let v = ok(&st, "rand_getLimits", json!([])).await;
+        assert_eq!(v["gas_price"], serde_json::Value::Null);
+        assert_eq!(v["gas_metering"], serde_json::Value::Null);
     }
 
     /// The RPC's local limits follow a 20 MiB ledger (spec §8): the body limit is the same formula
