@@ -15,6 +15,8 @@ pub mod sbpf;
 pub mod notes;
 /// Node-local (not vendored): the hidden-asset bundle's layout, digest and witness builder.
 pub mod hidden;
+/// Node-local (not vendored): delegated proving's auth guest — its input layout and commitment.
+pub mod auth;
 pub mod evm;
 pub mod viewing;
 pub mod ledger;

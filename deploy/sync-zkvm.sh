@@ -134,6 +134,11 @@
 # ledger refuses, and a seeded mutation fuzz over every private-input word against a host model of
 # spec §3.3. Upstream has no such file; without the exclusion `--delete` would remove it.
 #
+# Delegated proving, Phase 2 (spec `docs/superpowers/specs/2026-09-28-delegated-proving-design.md`
+# §4) adds `src/auth.rs` (the auth guest's input layout and `c = H(AUTH, nk, salt)`, node-local tag
+# 65) and `tests/auth*.rs` (the P2-0 spike and what follows it), both excluded below for the same
+# reason; the guest itself is `guests::auth()` in the already-excluded `guests.rs`.
+#
 # Audit finding ZKV-2 (circuits 224960c): the Poseidon2 round constants are a committed literal
 # table, `src/poseidon2_constants.rs`, instead of a seeded `StdRng` draw (`rand` does not promise
 # `StdRng` is stable across releases, so a dependency bump could have moved every hash). The file
@@ -167,11 +172,11 @@ DST=crates/randprotocol-zkvm
 mkdir -p "$DST/src" "$DST/tests"
 rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude rust-toolchain.toml \
       --exclude executor.rs --exclude codec.rs --exclude guests.rs --exclude asm.rs \
-      --exclude address.rs --exclude arx.rs --exclude call_envelope.rs --exclude hidden.rs \
+      --exclude address.rs --exclude arx.rs --exclude call_envelope.rs --exclude hidden.rs --exclude auth.rs \
       --exclude lib.rs --exclude main.rs "$SRC/src/" "$DST/src/"
 rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_envelope.rs \
       --exclude viewing.rs --exclude bundle.rs --exclude hidden_bundle.rs \
-      --exclude hidden_cheating.rs --exclude guest_provenance.rs --exclude evm_rt.rs --exclude sbpf_rt.rs \
+      --exclude hidden_cheating.rs --exclude guest_provenance.rs --exclude 'auth*.rs' --exclude evm_rt.rs --exclude sbpf_rt.rs \
       "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
 # M4.1/M4.2: vendor the compiled guest binaries the vendored `tests/e2e.rs` and the local

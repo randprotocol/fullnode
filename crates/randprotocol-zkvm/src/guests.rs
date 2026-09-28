@@ -1384,3 +1384,51 @@ pub fn merkle_probe(leaf: crate::notes::Word8, path: &[crate::notes::Word8; crat
     a.extend(halt());
     a.assemble()
 }
+
+/// Delegated proving, Phase 2: the **auth guest** (`docs/superpowers/specs/
+/// 2026-09-28-delegated-proving-design.md` §4.1). Private inputs `auth::auth_input` (16 words:
+/// `sk` 8, `salt` 8, built by `auth::auth_inputs`); derives `nk = H(NK, sk)` with the same
+/// instructions every spend uses (`asm::emit_derive_nk`, `emit_derive_keys`' first half) and
+/// publishes `c = auth::auth_commit(nk, salt) = H(AUTH, nk ‖ salt)` at outputs `0..8`.
+///
+/// No taint and no branch: the relation is two hashes, each fixed-length, each over words the
+/// program itself stages. The guest never reads the public segment — like the bundle guest, it is
+/// proved against the transaction's binding, which `H_PUB` binds through the verifier
+/// (`Machine::verify_public`), so an auth proof cannot be replayed onto another transaction.
+///
+/// Node-local (this file is excluded from `deploy/sync-zkvm.sh`'s rsync). Its cost is measured by
+/// `tests/auth_spike.rs`.
+pub fn auth() -> Program {
+    use crate::asm::{copy_word8, emit_derive_nk};
+    use crate::auth::{auth_input as ai, AUTH_DOMAIN};
+    const BASE: u32 = 25; // RAM base (holds HEAP)
+    const PTR: u32 = 27;
+    const IDX: u32 = 24;
+    const CTR: u32 = 23;
+    // RAM, byte offsets from `BASE = HEAP`; disjoint regions.
+    const BUF: i32 = 0x000; // hash scratch: 17 words (..0x44)
+    const SKR: i32 = 0x060; // sk (..0x80)
+    const SALTR: i32 = 0x080; // salt (..0xa0)
+    const NK: i32 = 0x0a0; // nk (..0xc0)
+    const _: () = assert!(BUF + 4 * 17 <= SKR);
+    let ptr_words = |buf: i32| (HEAP + buf) / 4;
+
+    let mut a = Assembler::new(0);
+    a.extend(li(BASE, HEAP));
+    emit_read_inputs(&mut a, "auth_sk", BASE, IDX, PTR, CTR, ai::SK, 8, SKR);
+    emit_read_inputs(&mut a, "auth_salt", BASE, IDX, PTR, CTR, ai::SALT, 8, SALTR);
+    // nk = H(NK, sk).
+    emit_derive_nk(&mut a, BASE, T0, SKR, BUF, ptr_words(BUF), NK);
+    // c = H(AUTH, nk ‖ salt): [AUTH_DOMAIN, nk(8), salt(8)].
+    a.extend(li(T0, AUTH_DOMAIN as i32));
+    a.push(sw(BASE, T0, BUF));
+    copy_word8(&mut a, BASE, T0, NK, BUF + 4);
+    copy_word8(&mut a, BASE, T0, SALTR, BUF + 36);
+    a.extend(call_poseidon2(ptr_words(BUF), 17));
+    for i in 0..8 {
+        a.push(lw(T1, BASE, BUF + 4 * i));
+        a.extend(write_output(i as u32, T1));
+    }
+    a.extend(halt());
+    a.assemble()
+}

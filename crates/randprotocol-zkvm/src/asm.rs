@@ -185,6 +185,21 @@ pub fn copy_word8_from_reg(a: &mut Assembler, base: u32, tmp: u32, src_reg: u32,
     }
 }
 
+/// The first half of [`emit_derive_keys`]: `nk = H(NK, sk)` from an 8-word spend key at
+/// `base + sk_at` to `base + nk_out`, the 9-word preimage staged at `base + buf`. Factored out
+/// for `guests::auth` (delegated proving, Phase 2), which needs `nk` but not `pk`;
+/// `emit_derive_keys` emits exactly the instructions it did before (`tests/guest_provenance.rs`
+/// pins the guests built from it).
+///
+/// Node-local (not upstream): `asm.rs` is excluded from `deploy/sync-zkvm.sh`'s rsync.
+pub fn emit_derive_nk(a: &mut Assembler, base: u32, tmp: u32, sk_at: i32, buf: i32, ptr_words: i32, nk_out: i32) {
+    a.extend(ops::li(tmp, domain::NK as i32));
+    a.push(ops::sw(base, tmp, buf));
+    copy_word8(a, base, tmp, sk_at, buf + 4);
+    a.extend(ops::call_poseidon2(ptr_words, 9));
+    copy_word8(a, base, tmp, buf, nk_out);
+}
+
 /// The note layer's key derivation, `nk = H(NK, sk)` then `pk = H(PK, nk)`, from an 8-word
 /// spend key at `base + sk_at` to an 8-word `nk` at `base + nk_out` and an 8-word `pk` at
 /// `base + pk_out`. Both hashes stage their own preimage at `base + buf` (9 words each) and
@@ -194,11 +209,7 @@ pub fn copy_word8_from_reg(a: &mut Assembler, base: u32, tmp: u32, src_reg: u32,
 /// rather than taking an owner from the witness, which is what makes "you can only spend notes
 /// committed to your own key" structural — so it is emitted from one place.
 pub fn emit_derive_keys(a: &mut Assembler, base: u32, tmp: u32, sk_at: i32, buf: i32, ptr_words: i32, nk_out: i32, pk_out: i32) {
-    a.extend(ops::li(tmp, domain::NK as i32));
-    a.push(ops::sw(base, tmp, buf));
-    copy_word8(a, base, tmp, sk_at, buf + 4);
-    a.extend(ops::call_poseidon2(ptr_words, 9));
-    copy_word8(a, base, tmp, buf, nk_out);
+    emit_derive_nk(a, base, tmp, sk_at, buf, ptr_words, nk_out);
     a.extend(ops::li(tmp, domain::PK as i32));
     a.push(ops::sw(base, tmp, buf));
     copy_word8(a, base, tmp, nk_out, buf + 4);

@@ -154,11 +154,12 @@ Genesis selects it the way `hc_bundle` selects v1 or v2 today: a new `hc_bundle`
 
 ### 4.2 Costs, and the measurement gate
 
-| | estimate | source |
+| | estimate or measurement | source |
 |---|---|---|
 | bundle guest v3 cycles | net zero (one hash dropped, one added) | to be measured against the 13 % headroom |
-| auth proof, proving | tier 10: seconds natively, about 0.4 GB | `docs/fees.md` §2; wasm and phones unmeasured |
-| auth proof, size | about 1.2 MB at production FRI | `docs/block-space.md`, tier-10 row |
+| auth guest workload | **measured 2026-09-28:** 159 program words, 16 input words; 203 executed + 47 digest rows = 250 cycles (tier-10 cap 1 023), 55 permutations (8 absorb; cap 128) → **tier 10** | `tests/auth_spike.rs` |
+| auth proof, proving | **measured 2026-09-28:** tier 10, 6.5–7.6 s proving and 0.30–0.33 s verifying on one core (Apple M4 Max, CPU backend, both profiles), 0.40 GB peak RSS for the Test + Production run | `tests/auth_spike.rs`; wasm and phones unmeasured |
+| auth proof, size | **measured 2026-09-28:** 1 364 714–1 369 066 B (≈ 1.37 MB) at Production FRI; 312 488–314 152 B at Test FRI (three runs; the spread is the proof's salted randomness) | `tests/auth_spike.rs` |
 | transaction size | about 1.4 MB → about 2.6 MB | |
 | transfers per unaggregated block | three → one at a 4 MiB cap | |
 
