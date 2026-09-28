@@ -170,7 +170,9 @@ fn a_program_without_a_public_input_keeps_its_id_and_its_empty_input_proofs() {
 fn a_program_with_a_public_input_is_warmed() {
     use randprotocol_zkvm::machine::Machine;
     let p = guests::public_echo();
-    let public = [11u32, 22, 33, 44, 55, 66, 77, 88, 99];
+    // Past 128 words: constraint set 7 floors the public table at 2^7 rows, so any shorter segment
+    // shares the empty segment's height class (nine words did through constraint set 6).
+    let public: Vec<u32> = (1..=200u32).map(|i| i * 11).collect();
     let ex = ZkExecutor::new(FriProfile::Test);
     let rec = ProgramRecord {
         public_digest: Some(ex.public_digest(&public)),
@@ -220,7 +222,9 @@ fn a_call_proof_must_be_canonically_encoded() {
 fn a_call_with_the_wrong_public_height_is_refused_before_verify() {
     use randprotocol_zkvm::machine::Machine;
     use randprotocol_zkvm::tables::public::public_log_height;
-    let public = [11u32, 22, 33, 44];
+    // Past 128 words, for the same reason as `a_program_with_a_public_input_is_warmed`: four words
+    // declare the empty segment's height since constraint set 7's 2^7 floor.
+    let public: Vec<u32> = (1..=200u32).collect();
     let f = guests::fib(10);
     let ex = ZkExecutor::new(FriProfile::Test);
     let with = ProgramRecord { public_digest: Some(ex.public_digest(&public)), public_len: public.len() as u32, ..record(&f) };
@@ -450,10 +454,10 @@ fn synthetic_record(len: usize, public_len: u32) -> ProgramRecord {
 }
 
 /// The smallest program with program-table log height `h` (`program_log_height(len)` is the log of
-/// `max(len + 1, 16)` rounded up to a power of two, so `h = 4` is every length up to 15 and each
-/// `h ≥ 5` starts at `2^(h−1)` words).
+/// `max(len + 1, 128)` rounded up to a power of two since constraint set 7's floor — `max(len + 1,
+/// 16)` before it — so `h = 7` is every length up to 127 and each `h ≥ 8` starts at `2^(h−1)` words).
 fn words_for_log_height(h: u8) -> usize {
-    if h <= 4 {
+    if h <= 7 {
         1
     } else {
         1 << (h - 1)
@@ -471,10 +475,14 @@ fn words_for_log_height(h: u8) -> usize {
 fn the_bundle_key_survives_eleven_program_shapes_warmed_after_it() {
     let ex = ZkExecutor::new(FriProfile::Test);
     ex.warm_bundle();
-    for h in 4u8..=14 {
-        let rec = synthetic_record(words_for_log_height(h), 0);
-        assert_eq!(randprotocol_zkvm::tables::program::program_log_height(rec.words.len()), h);
-        ex.warm(&rec);
+    // Twelve distinct (program height, public height) pairs. Constraint set 7 floors both tables
+    // at 2^7, so program heights 4–6 no longer exist; the public height supplies the second axis.
+    for h in 7u8..=12 {
+        for public_len in [0u32, 200] {
+            let rec = synthetic_record(words_for_log_height(h), public_len);
+            assert_eq!(randprotocol_zkvm::tables::program::program_log_height(rec.words.len()), h);
+            ex.warm(&rec);
+        }
     }
     let t = std::time::Instant::now();
     ex.warm_bundle();
