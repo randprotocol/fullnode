@@ -8,7 +8,7 @@
 use crate::RpcError;
 use anyhow::{anyhow, Context, Result};
 use randprotocol_core::confidential::ConfidentialExecutor;
-use randprotocol_core::notes::{word8_to_hex, Word8};
+use randprotocol_core::notes::{word8_to_hex, ShieldedAddress, Word8};
 use randprotocol_core::types::TX_BINDING_WORDS;
 use randprotocol_prover::key::fingerprint_of;
 use randprotocol_prover::pairing::PairingLink;
@@ -28,6 +28,14 @@ pub const NOT_OWN: &str = "this build's witness carries the spend key; only a pr
 /// v3 witness carries `nk`, which opens every note this wallet ever received or spent, and moves
 /// none of them (the auth proof, made on this machine over the spend key, is what spends).
 pub const VIEWING_KEY_WARNING: &str = "this prover can read this wallet's whole history; it cannot spend";
+
+/// What `rand prover pair` says of a link without `own=1`: such a pairing proves on a
+/// split-authorisation chain (its witness carries the viewing key) and is refused on an older one
+/// (whose witness carries the spend key).
+pub const NOT_OWN_PAIRING_NOTE: &str = "this link has no own=1: on a chain with split authorisation (bundle guest v3) this \
+     prover can prove your bundles from a viewing-key witness — it learns this wallet's whole history, never its spend key — \
+     and on a pre-v3 chain, whose witness carries the spend key, every --prover use is refused; re-pair with a link from \
+     `rand-prover pair --own` only for a machine you run";
 
 /// A sealed reply carries a ~1.2 MB proof as hex; 64 MiB is the wallet's own RPC reply cap.
 const MAX_REPLY_BYTES: usize = 64 * 1024 * 1024;
@@ -239,9 +247,28 @@ impl RemoteProver {
         }
     }
 
-    /// Whether [`VIEWING_KEY_WARNING`] has been printed for this prover.
+    /// Whether [`VIEWING_KEY_WARNING`] has been shown for this prover.
     pub fn warned_history(&self) -> bool {
         self.warned_history.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The history warning, once: `Some(line)` the first time a viewing-key witness is headed
+    /// for this prover and it is not the owner's own, `None` afterwards (and for an own prover).
+    /// `rand send` shows it in the confirmation before its y/N, so the user can decline; a command
+    /// that asks nothing gets it from [`prove`](Self::prove), before the job is sent.
+    pub fn history_warning(&self) -> Option<String> {
+        if self.paired.own || self.warned_history.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        Some(format!("warning: {} — {VIEWING_KEY_WARNING}", self.paired.label()))
+    }
+
+    /// The fee this prover quotes in `prover_info` (spec §5): its shielded address and the amount
+    /// in RAND base units, or `None` when it charges nothing. A quote that does not parse is an
+    /// error, never read as "free": the prover would refuse every job that did not pay it.
+    pub async fn fee(&self) -> Result<Option<(ShieldedAddress, u64)>> {
+        let info = self.info().await?;
+        parse_fee(&info["fee"]).map_err(|e| anyhow!("the prover {} quotes a fee this wallet cannot read: {e}", self.paired.label()))
     }
 
     pub fn paired(&self) -> &PairedProver {
@@ -308,8 +335,10 @@ impl RemoteProver {
         }
         // A viewing-key witness (bundle guest v3) may go to any paired prover; one that is not the
         // owner's own is told what it can then see, once, before anything is sent.
-        if witness_kind == WitnessKind::ViewingKey && !self.paired.own && !self.warned_history.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("warning: {} — {VIEWING_KEY_WARNING}", self.paired.label());
+        if witness_kind == WitnessKind::ViewingKey {
+            if let Some(line) = self.history_warning() {
+                eprintln!("{line}");
+            }
         }
         let info = self.info().await?;
         let has = |field: &str, want: &str| info[field].as_array().is_some_and(|a| a.iter().any(|v| v.as_str() == Some(want)));
@@ -458,6 +487,23 @@ impl RemoteProver {
     }
 }
 
+/// `prover_info.fee`: `null` (or absent) is no fee; otherwise `{amount, address}`, the amount in base
+/// units as a decimal string (the RPC convention), the address a `rand1…` shielded address. A
+/// zero amount is no fee.
+fn parse_fee(v: &Value) -> Result<Option<(ShieldedAddress, u64)>> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    let amount = v["amount"].as_str().ok_or_else(|| anyhow!("no amount string"))?;
+    if amount.is_empty() || !amount.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(anyhow!("the amount is not a decimal string of base units"));
+    }
+    let amount: u64 = amount.parse().map_err(|_| anyhow!("the amount does not fit 64 bits"))?;
+    let address = v["address"].as_str().ok_or_else(|| anyhow!("no address"))?;
+    let address = ShieldedAddress::parse(address).map_err(|e| anyhow!("the address: {e}"))?;
+    Ok((amount > 0).then_some((address, amount)))
+}
+
 /// Whether a failed [`RemoteProver::call`] never got a JSON-RPC answer from the prover — the
 /// request did not go through, or what came back was not the prover's (not JSON, no result, over
 /// the cap) — as opposed to the prover's own [`RpcError`].
@@ -478,6 +524,7 @@ fn submit_error(e: anyhow::Error, label: &str) -> anyhow::Error {
         -32003 => anyhow!("the prover {label} does not know this wallet's pairing token: pair again (rand prover pair <link>)"),
         -32004 => anyhow!("the prover {label} refused the witness kind: {}", data["reason"].as_str().unwrap_or(&r.message)),
         -32000 => anyhow!("the prover {label} refused the job: {}", data["reason"].as_str().unwrap_or(&r.message)),
+        -32006 => anyhow!("the prover {label} refused the job's fee: {}", data["reason"].as_str().unwrap_or(&r.message)),
         _ => e,
     }
 }
@@ -640,6 +687,7 @@ mod tests {
         assert!(!r.warned_history());
         vk(&r).await.expect("a viewing-key job needs no own pairing");
         assert!(r.warned_history(), "a prover not the owner's own is told what it can read");
+        assert_eq!(r.history_warning(), None, "already said: `rand send`'s confirmation shows it only once too");
         assert_eq!(state.lock().unwrap().kind, Some(WitnessKind::ViewingKey));
         vk(&r).await.expect("and again");
         // The same prover, own: no warning.
@@ -650,6 +698,73 @@ mod tests {
         let r = quick(paired);
         vk(&r).await.unwrap();
         assert!(!r.warned_history(), "the owner's own prover already holds the spend key");
+        assert_eq!(r.history_warning(), None);
+    }
+
+    /// The warning moved before `rand send`'s y/N: taken there (`history_warning`), the proof that
+    /// follows prints nothing more — one warning per send, shown where it can be declined.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_history_warning_taken_by_the_confirmation_is_not_repeated() {
+        let (paired, _) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, false, |i| {
+            i["witness_kinds"] = json!(["viewing_key"]);
+        })
+        .await;
+        let r = quick(paired);
+        let line = r.history_warning().expect("the first time");
+        assert!(line.contains(VIEWING_KEY_WARNING) && line.contains("box"), "{line}");
+        assert_eq!(r.history_warning(), None, "once");
+        vk(&r).await.unwrap();
+        assert!(r.warned_history());
+    }
+
+    /// `prover_info.fee`: null is no fee; `{amount, address}` in base units and `rand1…`; anything
+    /// malformed is an error, never "free".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_quoted_fee_is_read_from_prover_info() {
+        let to = ShieldedAddress { pk: [4; 8], kem_ek: vec![5; randprotocol_core::notes::KEM_EK_BYTES] };
+        let (paired, _) = fake(Finish::Never, false, |_| {}).await;
+        assert_eq!(quick(paired).fee().await.unwrap(), None);
+        let addr = to.to_string();
+        let (paired, _) = fake(Finish::Never, false, |i| i["fee"] = json!({ "amount": "2500000000", "address": addr })).await;
+        assert_eq!(quick(paired).fee().await.unwrap(), Some((to.clone(), 2_500_000_000)));
+        let addr = to.to_string();
+        let (paired, _) = fake(Finish::Never, false, |i| i["fee"] = json!({ "amount": "0", "address": addr })).await;
+        assert_eq!(quick(paired).fee().await.unwrap(), None, "a zero quote is no fee");
+        for bad in [json!({ "amount": 5, "address": to.to_string() }), json!({ "amount": "-5", "address": to.to_string() }),
+                    json!({ "amount": "1e9", "address": to.to_string() }), json!({ "amount": "99999999999999999999", "address": to.to_string() }),
+                    json!({ "amount": "5", "address": "rand1nope" }), json!({ "amount": "5" }), json!("5")] {
+            let b = bad.clone();
+            let (paired, _) = fake(Finish::Never, false, move |i| i["fee"] = b).await;
+            let e = quick(paired).fee().await.unwrap_err().to_string();
+            assert!(e.contains("quotes a fee this wallet cannot read"), "{bad}: {e}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fee_refusal_says_so() {
+        let key = ProverKey::generate();
+        let info = info_for(&key);
+        let url = rpc_fn(move |method, _| match method {
+            "prover_info" => Reply::Ok(info.clone()),
+            "prover_submit" => Reply::ErrData(-32006, "the prover fee is not paid".into(), json!({ "reason": "the fee paid is below the quoted 5 base units" })),
+            _ => Reply::Err(-32601, "method not found"),
+        })
+        .await;
+        let link = PairingLink { kem_ek: key.kem_ek().to_vec(), url, token: [9; 32], own: true };
+        let e = prove(&quick(PairedProver::from_link(&link, None)), 1000).await.unwrap_err().to_string();
+        assert!(e.contains("refused the job's fee: the fee paid is below the quoted 5"), "{e}");
+    }
+
+    /// `rand prover pair`'s note for a link without own=1 (Phase 2): such a pairing proves on a
+    /// split-authorisation chain and is refused only on a pre-v3 one.
+    #[test]
+    fn the_not_own_pairing_note_names_both_chains() {
+        let n = NOT_OWN_PAIRING_NOTE;
+        assert!(n.contains("split authorisation") && n.contains("viewing-key witness"), "{n}");
+        assert!(n.contains("whole history") && n.contains("never its spend key"), "{n}");
+        assert!(n.contains("pre-v3 chain") && n.contains("refused"), "{n}");
+        assert!(n.contains("--own") && n.contains("a machine you run"), "{n}");
+        assert!(!n.contains("in this build"), "the Phase 1 wording is gone");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -7,7 +7,7 @@ use randprotocol_prover::key::ProverKey;
 use randprotocol_prover::memory;
 use randprotocol_prover::origins::AllowedOrigins;
 use randprotocol_prover::pairing::{PairingLink, Pairings};
-use randprotocol_prover::service::Config;
+use randprotocol_prover::service::{Config, Fee};
 use randprotocol_zkvm::machine::Backend;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -73,6 +73,13 @@ enum Cmd {
         /// website, which can then read this prover's key as a cross-site identifier.
         #[arg(long = "allow-origin", value_name = "ORIGIN")]
         allow_origin: Vec<String>,
+        /// The fee every job must pay, in RAND (display units, up to 9 decimals): one RAND output
+        /// to --fee-address inside the bundle being proved (spec §5). Needs --fee-address.
+        #[arg(long, value_name = "RAND", requires = "fee_address")]
+        fee: Option<String>,
+        /// The shielded address (`rand1…`) the fee is paid to. Needs --fee.
+        #[arg(long, value_name = "ADDRESS", requires = "fee")]
+        fee_address: Option<String>,
     },
 }
 
@@ -195,10 +202,15 @@ async fn main() -> Result<()> {
                 println!("{}  {}  {}", p.label, if p.own { "own" } else { "-" }, date_of(p.created_unix));
             }
         }
-        Cmd::Run { listen, accept_spend_key, max_parallel, max_queue, per_token, cuda, skip_memory_check, allow_origin } => {
+        Cmd::Run { listen, accept_spend_key, max_parallel, max_queue, per_token, cuda, skip_memory_check, allow_origin, fee, fee_address } => {
             if max_parallel == 0 {
                 bail!("--max-parallel must be at least 1");
             }
+            // clap's `requires` makes it both or neither.
+            let fee = match (fee, fee_address) {
+                (Some(a), Some(to)) => Some(Fee::from_flags(&a, &to).map_err(anyhow::Error::msg)?),
+                _ => None,
+            };
             let allowed = allowed_origins(&allow_origin, "--allow-origin")?;
             let backend = backend_for(cuda)?;
             let key = load_key(&key_path)?;
@@ -226,6 +238,10 @@ async fn main() -> Result<()> {
             cfg.per_token = per_token;
             cfg.accept_spend_key = accept_spend_key;
             cfg.allowed_origins = allowed;
+            if let Some(f) = &fee {
+                eprintln!("charging {} RAND per job to {}", randprotocol_core::format_amount(f.amount), f.address.fingerprint());
+            }
+            cfg.fee = fee;
             let (bound, svc, mut task) = http::serve(listen, cfg).await?;
             eprintln!("rand-prover {fingerprint} listening on http://{bound}");
             tokio::select! {
@@ -268,6 +284,17 @@ async fn shutdown_signal() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
+    #[test]
+    fn run_takes_the_fee_flags_both_or_neither() {
+        let run = |extra: &[&str]| super::Cli::try_parse_from([&["rand-prover", "run"][..], extra].concat());
+        assert!(run(&[]).is_ok());
+        assert!(run(&["--fee", "1.5", "--fee-address", "rand1x"]).is_ok());
+        assert!(run(&["--fee", "1.5"]).is_err(), "--fee needs --fee-address");
+        assert!(run(&["--fee-address", "rand1x"]).is_err(), "--fee-address needs --fee");
+    }
+
     #[test]
     fn date_of_known_days() {
         assert_eq!(super::date_of(0), "1970-01-01");

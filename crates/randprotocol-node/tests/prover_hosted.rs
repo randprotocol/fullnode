@@ -73,6 +73,8 @@ fn options(addr: &str, home: &Path) -> Options {
         // The gate is `rand-prover`'s own, tested there; a test machine need not hold a prover.
         skip_memory_check: true,
         allow_origins: vec![],
+        fee: None,
+        fee_address: None,
     }
 }
 
@@ -247,6 +249,38 @@ async fn the_hosted_prover_serves_its_origin_list() {
     assert!(refused.headers().get("access-control-allow-origin").is_none());
     let v: Value = refused.json().await.unwrap();
     assert_eq!(v["error"]["code"], -32007, "{v}");
+    served.svc.shutdown();
+    served.task.abort();
+}
+
+/// `--prover-fee`/`--prover-fee-address` reach the listener: `prover_info` quotes the fee in base
+/// units; one flag without the other, or a malformed one, fails at `prepare`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hosted_prover_quotes_its_fee() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("prover");
+    prover_home(&home);
+    let to = randprotocol_core::notes::ShieldedAddress { pk: [3; 8], kem_ek: vec![7; randprotocol_core::notes::KEM_EK_BYTES] }.to_string();
+    let mut o = options("127.0.0.1:0", &home);
+    o.fee = Some("0.25".into());
+    let e = hosted_prover::prepare(&o).err().expect("a fee without an address").to_string();
+    assert!(e.contains("give both or neither"), "{e}");
+    o.fee_address = Some("rand1nope".into());
+    let e = hosted_prover::prepare(&o).err().expect("a bad address").to_string();
+    assert!(e.contains("--prover-fee-address"), "{e}");
+    o.fee_address = Some(to.clone());
+    let hosted = hosted_prover::prepare(&o).expect("prepare");
+    let (bound, served) = hosted_prover::start(hosted).await.expect("serve");
+    let v: Value = reqwest::Client::new()
+        .post(format!("http://{bound}"))
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "prover_info", "params": [] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["result"]["fee"], json!({ "amount": "250000000", "address": to }), "{v}");
     served.svc.shutdown();
     served.task.abort();
 }

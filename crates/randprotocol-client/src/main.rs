@@ -1044,11 +1044,9 @@ async fn main() -> Result<()> {
                 paired.save(&cli.key)?;
                 println!("paired {} at {} (own: {})", paired.fingerprint, paired.url, if paired.own { "yes" } else { "no" });
                 if !paired.own {
-                    // Saved anyway (a later build's viewing-key witness may use it), but today every
-                    // `--prover` use of it is refused, so say so now rather than at the first send.
-                    eprintln!(
-                        "warning: this link has no own=1, so this pairing cannot receive a spend-key witness in this build — every --prover use will refuse it (re-pair with a link from `rand-prover pair --own`)"
-                    );
+                    // What a pairing that is not the owner's own can and cannot do, said now
+                    // rather than at the first send.
+                    eprintln!("warning: {}", prover::NOT_OWN_PAIRING_NOTE);
                 }
             }
             ProverOp::Show => match PairedProver::load(&cli.key)? {
@@ -1265,6 +1263,12 @@ async fn main() -> Result<()> {
             let amount = wallet::parse_decimal(&amount_text, decimals)?;
             let shown = wallet::display_amount(amount, decimals, &symbol);
             println!("{}", confirmation(name.as_deref(), &to.fingerprint().to_string(), &shown, &memo_text));
+            // A paired prover's fee and, for one not the owner's own, what it can read: shown
+            // before the y/N, so both can be declined (spec §5).
+            let proving = proving_for(cli.prover, cuda, &cli.key)?;
+            for line in wallet::prover_confirmation(&rpc, &proving).await? {
+                println!("{line}");
+            }
             if !yes {
                 confirm("send?", "send", "not sent")?;
             }
@@ -1276,7 +1280,7 @@ async fn main() -> Result<()> {
             }
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::send_asset(&rpc, &w, &mut store, &to, asset, amount, &memo_text, fee, profile, &proving_for(cli.prover, cuda, &cli.key)?, chain_id, !no_wait)
+            let s = wallet::send_asset(&rpc, &w, &mut store, &to, asset, amount, &memo_text, fee, profile, &proving, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             report(&s?, "transfer");

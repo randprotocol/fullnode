@@ -275,3 +275,129 @@ async fn shutdown_drops_queued_jobs_refuses_new_ones_and_stops_the_workers() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1, "no second proof ever starts");
 }
+
+// ---- The prover fee (spec §5): one RAND output to the prover's address, checked in the witness.
+
+const FEE: u64 = 5_000_000_000; // 5 RAND
+const PROVER_PK: [u32; 8] = [0xF00D; 8];
+
+fn prover_address() -> randprotocol_core::notes::ShieldedAddress {
+    randprotocol_core::notes::ShieldedAddress { pk: PROVER_PK, kem_ek: vec![9; 1184] }
+}
+
+/// A rig whose prover charges `fee` (or nothing), spend keys accepted so a v1 job reaches the fee check.
+fn fee_rig(fee: Option<Fee>) -> Rig {
+    let key = ProverKey::from_seed([4; 64]);
+    let ek = key.kem_ek().to_vec();
+    let mut pairings = Pairings::default();
+    let own_token = pairings.pair("laptop", true).unwrap();
+    let token = pairings.pair("phone", false).unwrap();
+    let mut cfg = Config::new(key, pairings);
+    cfg.accept_spend_key = true;
+    cfg.fee = fee;
+    cfg.prove = stub(Arc::new(Mutex::new(Behaviour::Ok)));
+    Rig { svc: Service::start(cfg), ek, token, own_token }
+}
+
+fn charging() -> Option<Fee> {
+    Some(Fee { amount: FEE, address: prover_address() })
+}
+
+/// A v3 witness whose four outputs pay nobody in particular (pk 1, amount 0), asset `A` = `asset_a`.
+fn v3_witness(token: [u8; 32], asset_a: u32) -> ProveJob {
+    let mut j = v3_job(token, WitnessKind::ViewingKey);
+    for k in 0..4 {
+        let o = hidden_input_v3::out(k);
+        j.inputs[o + hidden_input_v3::O_PK..o + hidden_input_v3::O_PK + 8].copy_from_slice(&[1; 8]);
+        j.inputs[o + hidden_input_v3::O_AMOUNT_LO] = 0;
+        j.inputs[o + hidden_input_v3::O_AMOUNT_HI] = 0;
+    }
+    j.inputs[hidden_input_v3::ASSET_A] = asset_a;
+    j
+}
+
+fn pay(j: &mut ProveJob, slot: usize, pk: [u32; 8], amount: u64) {
+    let o = hidden_input_v3::out(slot);
+    j.inputs[o + hidden_input_v3::O_PK..o + hidden_input_v3::O_PK + 8].copy_from_slice(&pk);
+    j.inputs[o + hidden_input_v3::O_AMOUNT_LO] = amount as u32;
+    j.inputs[o + hidden_input_v3::O_AMOUNT_HI] = (amount >> 32) as u32;
+}
+
+fn submit(r: &Rig, j: &ProveJob) -> Result<String, Refusal> {
+    r.svc.submit(&seal_job(&r.ek, j).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fee_paid_in_the_wrong_asset_is_refused() {
+    let r = fee_rig(charging());
+    // Slots 0–1 carry asset A: a token (A = 1) fee there is not RAND.
+    for slot in [0, 1] {
+        let mut j = v3_witness(r.token, 1);
+        pay(&mut j, slot, PROVER_PK, FEE);
+        let Err(Refusal::Fee(why)) = submit(&r, &j) else { panic!("slot {slot} in asset 1 must be refused") };
+        assert!(why.contains("RAND"), "{why}");
+    }
+    // The same slot in a RAND transfer (A = 0) is RAND: accepted.
+    let mut j = v3_witness(r.token, 0);
+    pay(&mut j, 0, PROVER_PK, FEE);
+    submit(&r, &j).expect("slot 0 of a RAND transfer is a RAND slot");
+    // Slots 2–3 are RAND whatever A is.
+    let mut j = v3_witness(r.own_token, 1);
+    pay(&mut j, 2, PROVER_PK, FEE);
+    submit(&r, &j).expect("slot 2 is always RAND");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fee_below_the_quote_is_refused() {
+    let r = fee_rig(charging());
+    let mut j = v3_witness(r.token, 1);
+    pay(&mut j, 2, PROVER_PK, FEE - 1);
+    let Err(Refusal::Fee(why)) = submit(&r, &j) else { panic!("one unit short must be refused") };
+    assert!(why.contains("below"), "{why}");
+    // The amount is lo | hi << 32: a fee above 2^32 units is read whole.
+    let r = fee_rig(Some(Fee { amount: (1 << 32) + 7, address: prover_address() }));
+    let mut j = v3_witness(r.token, 1);
+    pay(&mut j, 3, PROVER_PK, 7);
+    assert!(matches!(submit(&r, &j), Err(Refusal::Fee(_))), "the low word alone is not the amount");
+    let mut j = v3_witness(r.token, 1);
+    pay(&mut j, 3, PROVER_PK, (1 << 32) + 7);
+    submit(&r, &j).expect("exactly the quote");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fee_output_to_another_pk_is_refused() {
+    let r = fee_rig(charging());
+    let mut j = v3_witness(r.token, 0);
+    pay(&mut j, 2, [0xBEEF; 8], FEE * 10);
+    let Err(Refusal::Fee(why)) = submit(&r, &j) else { panic!("paying someone else is no fee") };
+    assert!(why.contains("no output pays this prover"), "{why}");
+    // A v1/v2 (spend-key) witness cannot carry the fee this prover charges.
+    let Err(Refusal::Fee(why)) = submit(&r, &job(r.own_token, WitnessKind::SpendKey)) else { panic!() };
+    assert!(why.contains("only a v3 witness can carry"), "{why}");
+    assert_eq!(r.svc.info().queue.depth, 0);
+    // prover_info quotes it: base units as a decimal string, and the address.
+    let fee = r.svc.info().fee.expect("quoted");
+    assert_eq!(fee.amount, FEE.to_string());
+    assert_eq!(fee.address, prover_address().to_string());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_fee_configured_accepts_any_witness() {
+    let r = fee_rig(None);
+    assert!(r.svc.info().fee.is_none());
+    // The outputs are never read: all-77 words, a token transfer paying nobody, and a v1 job.
+    submit(&r, &v3_job(r.token, WitnessKind::ViewingKey)).expect("any v3 witness");
+    submit(&r, &v3_witness(r.token, 1)).expect("no output pays anyone we know");
+    submit(&r, &job(r.own_token, WitnessKind::SpendKey)).expect("a spend-key job, spend keys accepted");
+}
+
+#[test]
+fn a_fee_needs_both_flags_parsed_in_display_units() {
+    let addr = prover_address().to_string();
+    let f = Fee::from_flags("1.5", &addr).unwrap();
+    assert_eq!(f.amount, 1_500_000_000);
+    assert_eq!(f.address, prover_address());
+    assert!(Fee::from_flags("0", &addr).is_err(), "a zero fee is no fee: omit both flags");
+    assert!(Fee::from_flags("1.0000000001", &addr).is_err(), "RAND has 9 decimals");
+    assert!(Fee::from_flags("1", "rand1nope").is_err());
+}

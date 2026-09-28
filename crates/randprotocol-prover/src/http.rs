@@ -43,6 +43,8 @@ pub const UNKNOWN_JOB: i64 = -32001;
 pub const UNPAIRED: i64 = -32003;
 pub const WITNESS_KIND: i64 = -32004;
 pub const BUSY: i64 = -32005;
+/// `prover_submit`, for a job whose witness does not pay this prover's quoted fee (spec §5).
+pub const FEE: i64 = -32006;
 /// Any method, from a page whose `Origin` is not in [`Config::allowed_origins`].
 pub const ORIGIN_NOT_ALLOWED: i64 = -32007;
 
@@ -206,6 +208,9 @@ fn dispatch(svc: &Service, method: &str, params: &[Value]) -> Result<Value, RpcE
                 }
                 Err(Refusal::Busy { depth, max }) => {
                     Err(RpcError::new(BUSY, "busy").with_data(json!({ "depth": depth, "max": max })))
+                }
+                Err(Refusal::Fee(reason)) => {
+                    Err(RpcError::new(FEE, "the prover fee is not paid").with_data(json!({ "reason": reason })))
                 }
             }
         }

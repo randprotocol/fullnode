@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use randprotocol_prover::key::ProverKey;
 use randprotocol_prover::origins::AllowedOrigins;
 use randprotocol_prover::pairing::Pairings;
-use randprotocol_prover::service::{Config, Shared};
+use randprotocol_prover::service::{Config, Fee, Shared};
 use randprotocol_zkvm::machine::Backend;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -38,6 +38,11 @@ pub struct Options {
     /// `--prover-allow-origin` values: empty = the default list (extensions and loopback pages),
     /// otherwise the whole list; `*` = every origin.
     pub allow_origins: Vec<String>,
+    /// `--prover-fee`: the fee every job must pay, in RAND display units; both it and
+    /// `fee_address` or neither (spec §5).
+    pub fee: Option<String>,
+    /// `--prover-fee-address`: the `rand1…` address the fee is paid to.
+    pub fee_address: Option<String>,
 }
 
 /// What `run --prover` loaded before the node started: everything that can refuse has done so,
@@ -75,6 +80,11 @@ pub fn prepare(o: &Options) -> Result<HostedProver> {
     if o.max_parallel == 0 {
         anyhow::bail!("--prover-max-parallel must be at least 1");
     }
+    let fee = match (&o.fee, &o.fee_address) {
+        (Some(amount), Some(to)) => Some(Fee::from_flags(amount, to).map_err(|e| anyhow::anyhow!(e.replace("--fee", "--prover-fee")))?),
+        (None, None) => None,
+        _ => anyhow::bail!("--prover-fee and --prover-fee-address go together: give both or neither"),
+    };
     let allowed_origins = AllowedOrigins::from_flags(&o.allow_origins).map_err(|e| anyhow::anyhow!(e.replace("--allow-origin", "--prover-allow-origin")))?;
     let key_path = home.join("prover.key.json");
     let key = match ProverKey::load(&key_path) {
@@ -123,6 +133,12 @@ pub fn prepare(o: &Options) -> Result<HostedProver> {
         tracing::warn!("{line}");
     }
     cfg.allowed_origins = allowed_origins;
+    if let Some(f) = &fee {
+        let line = format!("the prover charges {} RAND per job to {}", randprotocol_core::format_amount(f.amount), f.address.fingerprint());
+        eprintln!("{line}");
+        tracing::info!("{line}");
+    }
+    cfg.fee = fee;
     Ok(HostedProver { cfg, listener, fingerprint })
 }
 

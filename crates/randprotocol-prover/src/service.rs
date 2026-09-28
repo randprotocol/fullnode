@@ -17,7 +17,8 @@ use crate::origins::AllowedOrigins;
 use crate::pairing::{token_hash, Pairings};
 use crate::wire::{open_job, seal_reply, ProveJob, ProveReply, WitnessKind, MAX_SEALED_JOB_BYTES};
 use rand::Rng;
-use randprotocol_core::notes::{word8_to_hex, Word8};
+use randprotocol_core::notes::{word8_to_hex, ShieldedAddress, Word8};
+use randprotocol_core::parse_amount;
 use randprotocol_core::types::TX_BINDING_WORDS;
 use randprotocol_zkvm::executor::{prove_bundle_for, ZkExecutor};
 use randprotocol_zkvm::machine::{Backend, FriProfile};
@@ -49,6 +50,38 @@ pub struct Config {
     /// The web origins whose pages may read replies (`crate::origins`); default: extensions and
     /// loopback pages only, never an arbitrary website.
     pub allowed_origins: AllowedOrigins,
+    /// The fee this prover charges per job (spec §5), or none. When set, only a v3 job whose
+    /// witness pays it — one RAND output to `address.pk` of at least `amount` — is admitted.
+    pub fee: Option<Fee>,
+}
+
+/// A prover's fee: a flat amount in RAND base units, paid to its shielded address by one output
+/// inside the bundle it proves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fee {
+    pub amount: u64,
+    pub address: ShieldedAddress,
+}
+
+impl Fee {
+    /// `--fee <RAND, display units> --fee-address <rand1…>`, both given. A zero fee is refused:
+    /// a prover that charges nothing omits both flags.
+    pub fn from_flags(amount: &str, address: &str) -> Result<Fee, String> {
+        let amount = parse_amount(amount).map_err(|e| format!("--fee: {e} (RAND, up to 9 decimals)"))?;
+        if amount == 0 {
+            return Err("--fee 0 charges nothing: omit --fee and --fee-address instead".into());
+        }
+        let address = ShieldedAddress::parse(address.trim()).map_err(|e| format!("--fee-address: {e}"))?;
+        Ok(Fee { amount, address })
+    }
+}
+
+/// `prover_info.fee`: the amount in base units as a decimal string (the RPC convention), and the
+/// address in its `rand1…` form.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct FeeInfo {
+    pub amount: String,
+    pub address: String,
 }
 
 impl Config {
@@ -66,6 +99,7 @@ impl Config {
             result_ttl: Duration::from_secs(600),
             prove: Arc::new(prove_bundle_for),
             allowed_origins: AllowedOrigins::default(),
+            fee: None,
         }
     }
 }
@@ -102,8 +136,8 @@ pub struct Info {
     pub backend: &'static str,
     pub witness_kinds: Vec<&'static str>,
     pub queue: QueueInfo,
-    /// No fees in this build.
-    pub fee: Option<()>,
+    /// The fee a job must pay (spec §5), or `null` for a prover that charges nothing.
+    pub fee: Option<FeeInfo>,
     /// The origin patterns whose pages may read replies, or `["*"]`, so a refused wallet can
     /// tell why.
     pub allowed_origins: Vec<String>,
@@ -122,6 +156,8 @@ pub enum Refusal {
     WitnessKind(String),
     /// The token's cap or the queue is full; `depth` is the queued count, `max` the queue's size.
     Busy { depth: usize, max: usize },
+    /// The witness does not pay the fee this prover charges (JSON-RPC `-32006`).
+    Fee(String),
 }
 
 struct Entry {
@@ -200,7 +236,7 @@ impl Service {
                 vec![WitnessKind::ViewingKey.as_str()]
             },
             queue: QueueInfo { depth, max: self.cfg.max_queue, proving },
-            fee: None,
+            fee: self.cfg.fee.as_ref().map(|f| FeeInfo { amount: f.amount.to_string(), address: f.address.to_string() }),
             allowed_origins: self.cfg.allowed_origins.to_list(),
         }
     }
@@ -250,6 +286,14 @@ impl Service {
         }
         if job.inputs.len() != expected_words {
             return Err(Refusal::Bad(format!("witness of {} words, expected {expected_words}", job.inputs.len())));
+        }
+        // The fee (spec §5), read from the opened witness — never logged, never echoed back.
+        // After the length check, so every output offset is in range.
+        if let Some(fee) = &self.cfg.fee {
+            if !v3 {
+                return Err(Refusal::Fee("this prover charges a fee, which only a v3 witness can carry".into()));
+            }
+            check_fee(&job.inputs, fee)?;
         }
         let th = token_hash(&job.token);
         let kind = job.witness_kind;
@@ -448,4 +492,34 @@ impl Service {
             }
         }
     }
+}
+
+/// One of the witness's four outputs pays `fee`: its `pk` is the prover's, its amount (`lo | hi <<
+/// 32`) is at least the quote, and it sits in a RAND slot — slots 2–3 always, slots 0–1 only when
+/// the bundle's asset `A` is RAND (0), i.e. a RAND transfer (`hidden::slot_asset`). `inputs` is a
+/// v3 witness already checked to be `hidden_input_v3::COUNT` words long.
+pub fn check_fee(inputs: &[u32], fee: &Fee) -> Result<(), Refusal> {
+    use randprotocol_zkvm::hidden::{hidden_input_v3 as w, slot_asset, SLOTS};
+    let asset_a = inputs[w::ASSET_A];
+    let (mut to_us, mut in_rand) = (false, false);
+    for k in 0..SLOTS {
+        let o = w::out(k);
+        if inputs[o + w::O_PK..o + w::O_PK + 8] != fee.address.pk {
+            continue;
+        }
+        to_us = true;
+        if slot_asset(k, asset_a) != 0 {
+            continue;
+        }
+        in_rand = true;
+        let amount = u64::from(inputs[o + w::O_AMOUNT_LO]) | (u64::from(inputs[o + w::O_AMOUNT_HI]) << 32);
+        if amount >= fee.amount {
+            return Ok(());
+        }
+    }
+    Err(Refusal::Fee(match (to_us, in_rand) {
+        (false, _) => "no output pays this prover's fee address".into(),
+        (true, false) => "the output to this prover is not in RAND: the fee is paid in a RAND slot".into(),
+        (true, true) => format!("the fee paid is below the quoted {} base units", fee.amount),
+    }))
 }

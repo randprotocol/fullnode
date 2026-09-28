@@ -1297,6 +1297,9 @@ pub struct Submission {
     /// How long the auth proof took, on this machine — `None` on a chain without split
     /// authorisation, whose transactions carry none.
     pub auth_proving: Option<Duration>,
+    /// The RAND paid to the paired prover by one output of this bundle (spec §5), zero when the
+    /// bundle was proved here or by a prover that charges nothing.
+    pub prover_fee: u64,
 }
 
 impl Submission {
@@ -1330,8 +1333,12 @@ impl Submission {
             Some(auth) => format!(", proved in {:.1?} (bundle) + {auth:.1?} (auth)", self.proving),
             None => String::new(),
         };
+        let prover_fee = match self.prover_fee {
+            0 => String::new(),
+            p => format!(", prover fee {} RAND", format_amount(p)),
+        };
         format!(
-            "submitted {what} {}\n  {out} out, {burned}{change} change, fee {} RAND{fee_change}, anchored at height {}{proved}",
+            "submitted {what} {}\n  {out} out, {burned}{change} change, fee {} RAND{prover_fee}{fee_change}, anchored at height {}{proved}",
             self.hash,
             format_amount(self.fee),
             self.time,
@@ -1346,6 +1353,8 @@ enum Payee {
     To(ShieldedAddress),
     /// This wallet: change.
     Me,
+    /// The paired prover's fee (spec §5): a RAND output to its address, sealed with no memo.
+    Prover(ShieldedAddress),
     /// Nobody: a zero-value dummy whose envelope is sealed to a throwaway key, so it opens to no
     /// one, the sender included.
     Nobody,
@@ -1359,6 +1368,12 @@ enum Payee {
 /// call) keeps today's shape — the value and the fee both in slots 2–3, slots 0–1 dummies (spec
 /// §3.1) — so it can spend two RAND notes, as before. A token bundle spends up to two notes of
 /// the token in slots 0–1 and up to two RAND notes for the fee in slots 2–3.
+///
+/// A paired prover's fee (spec §5, [`Plan::prover_fee`]) is one more RAND output: slot 2 of a
+/// token transfer, a burn or a RAND bundle that pays nobody (the RAND change moves to slot 3);
+/// slot 0 of a RAND transfer, whose slots 2–3 already hold the payment and its change — so that
+/// transfer spends a RAND note in slots 0–1 for the fee (its change in slot 1) and another in
+/// slots 2–3, and a wallet holding one RAND note must split it first.
 #[derive(Clone, Debug)]
 pub(crate) struct Plan {
     asset: u32,
@@ -1376,6 +1391,8 @@ pub(crate) struct Plan {
     burn_a: u64,
     /// RAND burned from slots 2–3.
     burn_r: u64,
+    /// The paired prover's address and fee, in RAND, when it charges one.
+    prover_fee: Option<(ShieldedAddress, u64)>,
 }
 
 /// What [`Plan::select`] is asked for.
@@ -1391,7 +1408,15 @@ pub(crate) struct Spend<'a> {
     pub fee: u64,
     pub burn_a: u64,
     pub burn_r: u64,
+    /// The paired prover's fee (spec §5): its address and the RAND it quotes. [`submit_spend`]
+    /// fills it from the prover's `prover_info`; every caller passes `None`.
+    pub prover_fee: Option<(&'a ShieldedAddress, u64)>,
 }
+
+/// The refusal for a RAND transfer through a fee-charging prover from a wallet with one RAND note.
+pub const SPLIT_FIRST: &str = "a RAND transfer through a prover that charges a fee spends two RAND notes — one for the \
+     prover's fee (slots 0–1), one for the payment (slots 2–3) — and this wallet holds one spendable RAND note: split it \
+     first with a self-transfer proved without --prover (`rand send <your address> <part of it>`), then retry";
 
 impl Plan {
     /// Select both groups' notes in one plan, largest-first and at most two per group
@@ -1400,22 +1425,30 @@ impl Plan {
     /// The fee is RAND, always (spec §3.9): a token bundle whose wallet holds no spendable RAND is
     /// refused here, with the reason, before anything is proved.
     pub(crate) fn select(store: &NoteStore, spend: Spend<'_>) -> Result<Plan> {
-        let Spend { asset, to, memo, fee, burn_a, burn_r } = spend;
+        let Spend { asset, to, memo, fee, burn_a, burn_r, prover_fee } = spend;
         let amount = to.map_or(0, |(_, a)| a);
+        let pf = prover_fee.map_or(0, |(_, f)| f);
         let (a_notes, r_notes) = if asset == 0 {
             // RAND is burned through `burn_r` only; the ledger refuses a RAND `burn_a`
             // (`NonCanonicalRandBurn`), so a plan that asked for one is this wallet's bug.
             if burn_a != 0 {
                 return Err(anyhow!("a RAND burn goes through burn_r, never burn_a"));
             }
-            let need = bundle_need(amount, fee, burn_r)?;
-            (Vec::new(), select_inputs(&store.spendable_of(0), need)?)
+            if pf > 0 && to.is_some() {
+                // A RAND transfer: the payment and its change fill slots 2–3, so the prover's fee
+                // is paid from slots 0–1 — a second RAND note, disjoint from the first group.
+                select_rand_pair(&store.spendable_of(0), bundle_need(amount, fee, burn_r)?, pf)?
+            } else {
+                // Anything else in RAND pays the prover from slots 2–3, beside the change.
+                let need = bundle_need(amount, fee, burn_r)?.checked_add(pf).ok_or_else(|| anyhow!("amount + fees overflow"))?;
+                (Vec::new(), select_inputs(&store.spendable_of(0), need)?)
+            }
         } else {
             let need_a = bundle_need(amount, 0, burn_a)?;
             if need_a == 0 {
                 return Err(anyhow!("a bundle of asset {asset} that neither pays nor burns any of it"));
             }
-            let need_r = bundle_need(0, fee, burn_r)?;
+            let need_r = bundle_need(0, fee, burn_r)?.checked_add(pf).ok_or_else(|| anyhow!("fee + prover fee overflows"))?;
             let rand = store.spendable_of(0);
             if rand.is_empty() && need_r > 0 {
                 // RAND held back by a `--no-wait` submission is not spendable yet, but it is not
@@ -1438,7 +1471,18 @@ impl Plan {
             let r_notes = select_inputs(&rand, need_r).map_err(|e| anyhow!("the RAND fee: {e}"))?;
             (a_notes, r_notes)
         };
-        Ok(Plan { asset, a_notes, r_notes, to: to.map(|(d, a)| (d.clone(), a)), memo: memo.to_string(), fee, burn_a, burn_r })
+        let prover_fee = prover_fee.filter(|(_, f)| *f > 0).map(|(d, f)| (d.clone(), f));
+        Ok(Plan { asset, a_notes, r_notes, to: to.map(|(d, a)| (d.clone(), a)), memo: memo.to_string(), fee, burn_a, burn_r, prover_fee })
+    }
+
+    fn prover_fee_amount(&self) -> u64 {
+        self.prover_fee.as_ref().map_or(0, |(_, f)| *f)
+    }
+
+    /// The prover's fee is paid from slots 0–1: a RAND transfer, whose slots 2–3 hold the payment
+    /// and its change (spec §5's table).
+    fn prover_fee_in_a(&self) -> bool {
+        self.asset == 0 && self.to.is_some() && self.prover_fee.is_some()
     }
 
     fn amount(&self) -> u64 {
@@ -1452,10 +1496,11 @@ impl Plan {
 
     /// The asset change (slots 0–1). Zero for a RAND bundle, whose change is all [`Plan::change_r`].
     fn change_a(&self) -> u64 {
-        if self.asset == 0 {
-            return 0;
-        }
         let have: u64 = self.a_notes.iter().map(|n| n.note.amount).sum();
+        if self.asset == 0 {
+            // RAND in slots 0–1 only to pay a prover's fee (a RAND transfer's).
+            return if self.prover_fee_in_a() { have - self.prover_fee_amount() } else { 0 };
+        }
         have - self.amount() - self.burn_a
     }
 
@@ -1463,7 +1508,8 @@ impl Plan {
     fn change_r(&self) -> u64 {
         let have: u64 = self.r_notes.iter().map(|n| n.note.amount).sum();
         let paid_here = if self.asset == 0 { self.amount() } else { 0 };
-        have - paid_here - self.fee - self.burn_r
+        let prover_here = if self.prover_fee_in_a() { 0 } else { self.prover_fee_amount() };
+        have - paid_here - self.fee - self.burn_r - prover_here
     }
 
     /// What each output slot pays, and how much. A zero amount is a dummy sealed to nobody —
@@ -1474,10 +1520,16 @@ impl Plan {
             _ => (Payee::Nobody, 0),
         };
         let mine = |amount: u64| if amount > 0 { (Payee::Me, amount) } else { (Payee::Nobody, 0) };
-        if self.asset == 0 {
-            [(Payee::Nobody, 0), (Payee::Nobody, 0), pay(self.amount()), mine(self.change_r())]
-        } else {
-            [pay(self.amount()), mine(self.change_a()), mine(self.change_r()), (Payee::Nobody, 0)]
+        let prover = self.prover_fee.as_ref().map(|(d, f)| (Payee::Prover(d.clone()), *f));
+        match (self.asset == 0, prover) {
+            (true, None) => [(Payee::Nobody, 0), (Payee::Nobody, 0), pay(self.amount()), mine(self.change_r())],
+            // A RAND transfer: the prover in slot 0, the fee note's change in slot 1.
+            (true, Some(p)) if self.to.is_some() => [p, mine(self.change_a()), pay(self.amount()), mine(self.change_r())],
+            // A RAND bundle that pays nobody (a bond, a deploy, a call, a bridge action).
+            (true, Some(p)) => [(Payee::Nobody, 0), (Payee::Nobody, 0), p, mine(self.change_r())],
+            (false, None) => [pay(self.amount()), mine(self.change_a()), mine(self.change_r()), (Payee::Nobody, 0)],
+            // A token transfer or a burn: the prover in slot 2, the RAND change in slot 3.
+            (false, Some(p)) => [pay(self.amount()), mine(self.change_a()), p, mine(self.change_r())],
         }
     }
 
@@ -1486,7 +1538,8 @@ impl Plan {
         let (amount, change, rand_change) = match burn {
             // A token burn's figures are the token's: what left the pool, and what came back.
             Burn::Asset { amount, .. } => (amount, self.change_a(), self.change_r()),
-            _ if self.asset == 0 => (self.amount(), self.change_r(), 0),
+            // Every RAND that came back: slots 2–3's, and slot 1's when a prover's fee note sat there.
+            _ if self.asset == 0 => (self.amount(), self.change_r() + self.change_a(), 0),
             _ => (self.amount(), self.change_a(), self.change_r()),
         };
         Submission {
@@ -1502,8 +1555,42 @@ impl Plan {
             proof_bytes: proved.proof.len(),
             proving: proved.proving,
             auth_proving: proved.auth_proving,
+            prover_fee: self.prover_fee_amount(),
         }
     }
+}
+
+/// Two disjoint groups of RAND notes, at most two each: one covering `need_r` (slots 2–3: the
+/// payment, the chain fee, any burn) and one covering `prover_fee` (slots 0–1). The larger group is
+/// served largest-first; if what is left cannot pay the prover, the smallest note that does is set
+/// aside for it first and the rest tried again. One spendable note can never make two groups:
+/// [`SPLIT_FIRST`].
+fn select_rand_pair(rand: &[&OwnedNote], need_r: u64, prover_fee: u64) -> Result<(Vec<OwnedNote>, Vec<OwnedNote>)> {
+    if rand.len() == 1 {
+        return Err(anyhow!(SPLIT_FIRST));
+    }
+    let total: u64 = rand.iter().map(|n| n.note.amount).sum();
+    if total < need_r.saturating_add(prover_fee) {
+        return Err(SelectError::Insufficient { have: total }.into());
+    }
+    let without = |taken: &[OwnedNote]| -> Vec<&OwnedNote> { rand.iter().copied().filter(|n| !taken.iter().any(|t| t.index == n.index)).collect() };
+    if let Ok(r) = select_inputs(rand, need_r) {
+        if let Ok(a) = select_inputs(&without(&r), prover_fee) {
+            return Ok((a, r));
+        }
+    }
+    let mut by_size: Vec<&OwnedNote> = rand.to_vec();
+    by_size.sort_by_key(|n| n.note.amount);
+    if let Some(fee_note) = by_size.iter().find(|n| n.note.amount >= prover_fee) {
+        let a = vec![(*fee_note).clone()];
+        if let Ok(r) = select_inputs(&without(&a), need_r) {
+            return Ok((a, r));
+        }
+    }
+    Err(anyhow!(
+        "a RAND transfer through a prover that charges a fee pays it from a second group of at most two RAND notes, \
+         and this wallet's notes do not split into two such groups — consolidate first"
+    ))
 }
 
 /// A fresh random word: a blinding `r`.
@@ -1629,11 +1716,28 @@ pub enum Proving {
     Remote(Arc<RemoteProver>),
     #[cfg(test)]
     Emulated,
+    /// [`Proving::Emulated`] by a prover that quotes this fee (spec §5), whose admission check
+    /// (`randprotocol_prover::service::check_fee`) is run on the witness before the emulation.
+    #[cfg(test)]
+    EmulatedFee(ShieldedAddress, u64),
 }
 
 impl Proving {
     pub fn local(b: Backend) -> Proving {
         Proving::Local(b)
+    }
+
+    /// The fee the prover proving this bundle charges — its address and the RAND it quotes in
+    /// `prover_info` — or `None` for a local proof and a prover that charges nothing.
+    pub async fn fee(&self) -> Result<Option<(ShieldedAddress, u64)>> {
+        match self {
+            Proving::Local(_) => Ok(None),
+            Proving::Remote(remote) => remote.fee().await,
+            #[cfg(test)]
+            Proving::Emulated => Ok(None),
+            #[cfg(test)]
+            Proving::EmulatedFee(to, amount) => Ok(Some((to.clone(), *amount))),
+        }
     }
 
     /// Proves `prepared` against `binding`: the bundle, and on a v3 chain the auth proof over
@@ -1662,6 +1766,12 @@ impl Proving {
             }
             #[cfg(test)]
             Proving::Emulated => tests::emulated_proof(prepared, sk, binding),
+            #[cfg(test)]
+            Proving::EmulatedFee(to, amount) => {
+                let fee = randprotocol_prover::service::Fee { amount: *amount, address: to.clone() };
+                randprotocol_prover::service::check_fee(&prepared.words, &fee).map_err(|e| anyhow!("the prover would refuse this witness: {e:?}"))?;
+                tests::emulated_proof(prepared, sk, binding)
+            }
         }
     }
 }
@@ -1728,7 +1838,7 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
         // The throwaway key a dummy is sealed to — and owned by — exists only for this call.
         let nobody = matches!(payee, Payee::Nobody).then(Wallet::generate);
         let pk = match (&payee, &nobody) {
-            (Payee::To(dest), _) => dest.pk,
+            (Payee::To(dest), _) | (Payee::Prover(dest), _) => dest.pk,
             (Payee::Me, _) => pk_self,
             (Payee::Nobody, Some(t)) => t.vk.pk(),
             (Payee::Nobody, None) => unreachable!("a throwaway key for every dummy"),
@@ -1739,6 +1849,8 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
         let key = TxKey::random();
         let sealed = match (&payee, &nobody) {
             (Payee::To(dest), _) => seal_note_as(format, &w.vk, dest, &note, &key, &plan.memo),
+            // The prover's fee is a plain note to its address; the payment's memo is never its.
+            (Payee::Prover(dest), _) => seal_note_as(format, &w.vk, dest, &note, &key, ""),
             (Payee::Me, _) => seal_note_as(format, &w.vk, &w.address, &note, &key, ""),
             (Payee::Nobody, Some(t)) => seal_note_as(format, &t.vk, &t.address, &note, &key, ""),
             (Payee::Nobody, None) => unreachable!("a throwaway key for every dummy"),
@@ -1817,6 +1929,13 @@ async fn chain_bundle_guest(rpc: &RpcClient) -> Result<Word8> {
     // Bundle guest v3 needs its auth proof, made by the auth guest the genesis pins as `hc_auth`:
     // an auth proof of any other guest is refused by every validator, so a chain naming another
     // one (or, inconsistently, none) is refused here — before a proof is paid for.
+    // A v1/v2 guest beside a named auth guest is no genesis this build knows how to cut: every
+    // `hc_auth` chain runs bundle guest v3.
+    if hc != ZkExecutor::hc_hidden_bundle_v3() && !status["hc_auth"].is_null() {
+        return Err(anyhow!(
+            "this chain names an auth guest but a v1/v2 bundle guest ({named}); the node is misconfigured or lying — refusing to prove"
+        ));
+    }
     if hc == ZkExecutor::hc_hidden_bundle_v3() {
         let ours = ZkExecutor::hc_auth();
         let theirs = status["hc_auth"].as_str().and_then(randprotocol_core::notes::word8_from_hex);
@@ -1831,6 +1950,32 @@ async fn chain_bundle_guest(rpc: &RpcClient) -> Result<Word8> {
     Ok(hc)
 }
 
+/// The lines `rand send` shows beside its recipient before the y/N, when a paired prover makes
+/// the bundle proof: the prover's fee ("prover fee: X RAND to <fingerprint>", spec §5) and — on a
+/// split-authorisation chain, for a prover that is not the owner's own — the history warning,
+/// once ([`RemoteProver::history_warning`]; the proof itself then says nothing more). Empty for a
+/// local proof. A fee on a chain whose witness cannot carry it is refused here, before anything
+/// is asked of the user.
+pub async fn prover_confirmation(rpc: &RpcClient, proving: &Proving) -> Result<Vec<String>> {
+    let Proving::Remote(remote) = proving else { return Ok(Vec::new()) };
+    let v3 = chain_bundle_guest(rpc).await? == ZkExecutor::hc_hidden_bundle_v3();
+    let mut lines = Vec::new();
+    if let Some((to, amount)) = remote.fee().await? {
+        if !v3 {
+            return Err(anyhow!(
+                "the paired prover charges {} RAND, which only a split-authorisation chain's (bundle guest v3) witness can carry; \
+                 this chain's is v1/v2 — prove on this machine (drop --prover) or use a prover that charges nothing",
+                format_amount(amount)
+            ));
+        }
+        lines.push(format!("prover fee: {} RAND to {}", format_amount(amount), to.fingerprint()));
+    }
+    if v3 {
+        lines.extend(remote.history_warning());
+    }
+    Ok(lines)
+}
+
 /// Builds the bundle's witness from the wallet's own tree and picks its anchor, then builds the
 /// bundle ([`build_bundle`]), returning it with the `time` it carries.
 ///
@@ -1842,8 +1987,8 @@ async fn chain_bundle_guest(rpc: &RpcClient) -> Result<Word8> {
 /// however long ago the last leaf landed, which is the case a checkpoint alone cannot cover).
 /// Failing that, the newest checkpoint the node still serves — the local tree is frozen at its
 /// checkpoints, so where the old code looped on "tree moved; retry" this one rescans once.
-async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, plan: &Plan, format: EnvelopeFormat) -> Result<(Prepared, u32)> {
-    let guest = chain_bundle_guest(rpc).await?;
+async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, plan: &Plan, format: EnvelopeFormat, guest: &Word8) -> Result<(Prepared, u32)> {
+    let guest = *guest;
     let h = tree_hash();
     for attempt in 0..2 {
         let live = store.tree.root(&h);
@@ -1982,7 +2127,7 @@ pub async fn submit_bound_call(
         }
         Ok(proof)
     };
-    let spend = Spend { asset: 0, to: None, memo: "", fee, burn_a: 0, burn_r: 0 };
+    let spend = Spend { asset: 0, to: None, memo: "", fee, burn_a: 0, burn_r: 0, prover_fee: None };
     submit_spend(rpc, w, store, spend, action, Burn::None, profile, proving, Some(&checked), chain_id, wait).await
 }
 
@@ -2050,12 +2195,26 @@ async fn submit_spend(
     wait: bool,
 ) -> Result<Submission> {
     scan(rpc, w, store).await?;
+    // The chain's guest first: it decides whether a prover's fee can ride in this bundle at all.
+    let guest = chain_bundle_guest(rpc).await?;
+    let quoted = proving.fee().await?;
+    if let Some((to, amount)) = &quoted {
+        if guest != ZkExecutor::hc_hidden_bundle_v3() {
+            return Err(anyhow!(
+                "the paired prover charges {} RAND, which only a split-authorisation chain's (bundle guest v3) witness can carry; \
+                 this chain's is v1/v2 — prove on this machine (drop --prover) or use a prover that charges nothing",
+                format_amount(*amount)
+            ));
+        }
+        eprintln!("prover fee: {} RAND to {}", format_amount(*amount), to.fingerprint());
+    }
+    let spend = Spend { prover_fee: quoted.as_ref().map(|(d, f)| (d, *f)), ..spend };
     let plan = Plan::select(store, spend)?;
     // One `rand_getLimits` read (cached after the first) decides the envelope every slot of this
     // bundle is sealed in — before any proof is paid for, a memo this chain cannot carry is
     // refused inside `build_bundle`.
     let format = rpc.envelope_format().await?;
-    let (prepared, time) = prepare_bundle(rpc, w, store, &plan, format).await?;
+    let (prepared, time) = prepare_bundle(rpc, w, store, &plan, format, &guest).await?;
     // The whole transaction first, its bundle's proof empty; then the proof, bound to it. Nothing
     // is set on the transaction after the proof but the proof itself.
     let mut tx = Transaction::shielded(chain_id, prepared.bundle.clone(), action);
@@ -2133,7 +2292,7 @@ async fn submit_with(
     // `submit`/`submit_with` carries no memo of its own: every caller in this workspace passes
     // `to: None` (a deploy, a bond, a bridge action), and the one path that pays someone a memo
     // is `send`/`send_asset`, below.
-    let spend = Spend { asset: 0, to, memo: "", fee, burn_a: 0, burn_r: burn.units() };
+    let spend = Spend { asset: 0, to, memo: "", fee, burn_a: 0, burn_r: burn.units(), prover_fee: None };
     submit_spend(rpc, w, store, spend, action, burn, profile, proving, None, chain_id, wait).await
 }
 
@@ -2343,7 +2502,7 @@ async fn submit_burn_with(
     // release unit and its locked amount among them, since one token's backings are held apart.
     burn_is_possible(&rpc.bridge_state().await?, asset, to_chain, &token, amount, relayer_fee)?;
     let action = Action::BridgeBurn { asset, amount, relayer_fee, to_chain, token, to };
-    let spend = Spend { asset, to: None, memo: "", fee, burn_a: amount, burn_r: 0 };
+    let spend = Spend { asset, to: None, memo: "", fee, burn_a: amount, burn_r: 0, prover_fee: None };
     submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, profile, proving, None, chain_id, wait).await
 }
 
@@ -2398,7 +2557,7 @@ async fn submit_token_burn_with(
         ));
     }
     let action = Action::TokenBurn { asset, amount };
-    let spend = Spend { asset, to: None, memo: "", fee, burn_a: amount, burn_r: 0 };
+    let spend = Spend { asset, to: None, memo: "", fee, burn_a: amount, burn_r: 0, prover_fee: None };
     submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, profile, proving, None, chain_id, wait).await
 }
 
@@ -3516,7 +3675,7 @@ async fn send_asset_with(
     if amount == 0 {
         return Err(anyhow!("a transfer of zero moves nothing"));
     }
-    let spend = Spend { asset, to: Some((to, amount)), memo, fee, burn_a: 0, burn_r: 0 };
+    let spend = Spend { asset, to: Some((to, amount)), memo, fee, burn_a: 0, burn_r: 0, prover_fee: None };
     submit_spend(rpc, w, store, spend, Action::None, Burn::None, profile, proving, None, chain_id, wait).await
 }
 
@@ -3949,6 +4108,7 @@ mod tests {
             proof_bytes: 1 << 20,
             proving: Duration::from_secs(98),
             auth_proving: None,
+            prover_fee: 0,
         };
 
         // A transfer: nothing burned, nothing said about burning.
@@ -5011,7 +5171,7 @@ mod tests {
         let you = Wallet::from_spend_key(SpendKey([57; 8]));
         let mut store = NoteStore { notes: vec![owned_asset(0, 500, false, 4), owned_asset(1, 3_000_000, false, 0)], ..NoteStore::default() };
         store.notes[1].pending = Some(9);
-        let spend = Spend { asset: 4, to: Some((&you.address, 100)), memo: "", fee: gas::BUNDLE_BASE, burn_a: 0, burn_r: 0 };
+        let spend = Spend { asset: 4, to: Some((&you.address, 100)), memo: "", fee: gas::BUNDLE_BASE, burn_a: 0, burn_r: 0, prover_fee: None };
         let e = Plan::select(&store, spend).unwrap_err().to_string();
         assert!(e.contains("0.003 RAND is held by a pending submission") && e.contains("rand sync"), "{e}");
         store.notes[1].spent = true;
@@ -5199,9 +5359,9 @@ mod tests {
         chain.lock().unwrap().fund(&stranger, 5, 0);
 
         // Preparing against the stale store anchors at the freshest checkpoint the node confirms.
-        let spend = Spend { asset: 0, to: Some((&you.address, 8_000_000)), memo: "", fee: gas::BUNDLE_BASE, burn_a: 0, burn_r: 0 };
+        let spend = Spend { asset: 0, to: Some((&you.address, 8_000_000)), memo: "", fee: gas::BUNDLE_BASE, burn_a: 0, burn_r: 0, prover_fee: None };
         let plan = Plan::select(&store, spend).unwrap();
-        let (prepared, time) = prepare_bundle(&rpc, &me, &mut store, &plan, EnvelopeFormat::Legacy).await.unwrap();
+        let (prepared, time) = prepare_bundle(&rpc, &me, &mut store, &plan, EnvelopeFormat::Legacy, &ZkExecutor::hc_bundle()).await.unwrap();
         assert_eq!(time, 2, "the checkpoint's height, not the moved head's");
         assert_eq!(prepared.bundle.anchor, scanned_root, "frozen at the checkpoint");
         assert_eq!(chain.lock().unwrap().witness_calls, 0);
@@ -5902,7 +6062,7 @@ mod tests {
             ],
             ..NoteStore::default()
         };
-        let spend = |asset, amount, fee| Spend { asset, to: Some((&you.address, amount)), memo: "", fee, burn_a: 0, burn_r: 0 };
+        let spend = |asset, amount, fee| Spend { asset, to: Some((&you.address, amount)), memo: "", fee, burn_a: 0, burn_r: 0, prover_fee: None };
         let plan = Plan::select(&store, spend(7, 60, 5)).unwrap();
         assert_eq!(plan.a_notes.iter().map(|n| n.index).collect::<Vec<_>>(), vec![0, 1]);
         assert_eq!(plan.r_notes.iter().map(|n| n.index).collect::<Vec<_>>(), vec![4]);
@@ -5921,7 +6081,7 @@ mod tests {
         // Three notes of the token would be needed: a group spends two at most.
         assert!(Plan::select(&store, spend(7, 85, 5)).unwrap_err().to_string().contains("consolidate"));
         // A RAND burn through `burn_a` is never planned.
-        let bad = Spend { asset: 0, to: None, memo: "", fee: 1, burn_a: 1, burn_r: 0 };
+        let bad = Spend { asset: 0, to: None, memo: "", fee: 1, burn_a: 1, burn_r: 0, prover_fee: None };
         assert!(Plan::select(&store, bad).is_err());
         let _ = me;
     }
@@ -6133,7 +6293,7 @@ mod tests {
             notes: vec![OwnedNote { index: 0, cm: note.commitment(), nf: me.vk.nullifier(&note.commitment()), note, spent: false, pending: None, height: 1, memo: None }],
             ..NoteStore::default()
         };
-        let plan = Plan::select(&store, Spend { asset: 0, to: None, memo: "", fee: 50, burn_a: 0, burn_r: 0 }).unwrap();
+        let plan = Plan::select(&store, Spend { asset: 0, to: None, memo: "", fee: 50, burn_a: 0, burn_r: 0, prover_fee: None }).unwrap();
         let build = || build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &ZkExecutor::hc_bundle()).unwrap();
         let (one, two) = (build(), build());
         for k in 0..SLOTS {
@@ -6168,7 +6328,7 @@ mod tests {
             notes: vec![OwnedNote { index: 0, cm: note.commitment(), nf: me.vk.nullifier(&note.commitment()), note, spent: false, pending: None, height: 1, memo: None }],
             ..NoteStore::default()
         };
-        let plan = Plan::select(&store, Spend { asset: 0, to: None, memo: "", fee: 50, burn_a: 0, burn_r: 0 }).unwrap();
+        let plan = Plan::select(&store, Spend { asset: 0, to: None, memo: "", fee: 50, burn_a: 0, burn_r: 0, prover_fee: None }).unwrap();
         (tree, plan)
     }
 
@@ -6294,6 +6454,209 @@ mod tests {
         let b = tx.bundle.as_ref().unwrap();
         assert_eq!(b.auth_commit, [0; 8]);
         assert!(b.auth_proof.is_empty());
+    }
+
+    // ---- The prover fee (spec §5): one RAND output to the paired prover, in a RAND slot.
+
+    /// The slot table, per transaction kind: a token transfer and a burn pay the prover in slot 2
+    /// with the RAND change in slot 3; a RAND transfer pays it in slot 0 from a RAND note of its
+    /// own (change in slot 1), the payment and its change in slots 2–3; a RAND bundle that pays
+    /// nobody (a bond, say) pays it in slot 2. No output other than the prover's carries its pk.
+    #[test]
+    fn the_prover_fee_takes_a_rand_slot_in_each_transaction_kind() {
+        let you = Wallet::from_spend_key(SpendKey([61; 8]));
+        let prover = Wallet::from_spend_key(SpendKey([62; 8]));
+        let pf = Some((&prover.address, 3));
+        let store = NoteStore {
+            notes: vec![owned_asset(0, 100, false, 7), owned_asset(1, 20, false, 0), owned_asset(2, 5, false, 0)],
+            ..NoteStore::default()
+        };
+        let to_prover = (Payee::Prover(prover.address.clone()), 3);
+        // A token transfer: RAND covers the chain fee and the prover's.
+        let plan = Plan::select(&store, Spend { asset: 7, to: Some((&you.address, 60)), memo: "hi", fee: 4, burn_a: 0, burn_r: 0, prover_fee: pf }).unwrap();
+        assert_eq!(plan.r_notes.iter().map(|n| n.index).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(plan.outputs(), [(Payee::To(you.address.clone()), 60), (Payee::Me, 40), to_prover.clone(), (Payee::Me, 20 - 4 - 3)]);
+        // The prover's fee is part of what the RAND group must cover: 5 alone pays the chain fee
+        // of 4, not the prover's 3 as well.
+        let small = NoteStore {
+            notes: vec![owned_asset(0, 100, false, 7), owned_asset(1, 5, false, 0), owned_asset(2, 3, false, 0)],
+            ..NoteStore::default()
+        };
+        let plan = Plan::select(&small, Spend { asset: 7, to: Some((&you.address, 60)), memo: "", fee: 4, burn_a: 0, burn_r: 0, prover_fee: pf }).unwrap();
+        assert_eq!(plan.r_notes.iter().map(|n| n.index).collect::<Vec<_>>(), vec![1, 2], "both RAND notes: 4 + 3 > 5");
+        assert_eq!(plan.outputs()[2..], [to_prover.clone(), (Payee::Me, 1)]);
+        // A burn: the same RAND slots.
+        let plan = Plan::select(&store, Spend { asset: 7, to: None, memo: "", fee: 4, burn_a: 30, burn_r: 0, prover_fee: pf }).unwrap();
+        assert_eq!(plan.outputs(), [(Payee::Nobody, 0), (Payee::Me, 70), to_prover.clone(), (Payee::Me, 13)]);
+        // A RAND transfer: the payment group (slots 2–3) takes the 20, the prover's (0–1) the 5.
+        let plan = Plan::select(&store, Spend { asset: 0, to: Some((&you.address, 10)), memo: "", fee: 4, burn_a: 0, burn_r: 0, prover_fee: pf }).unwrap();
+        assert_eq!(plan.a_notes.iter().map(|n| n.index).collect::<Vec<_>>(), vec![2], "the fee note, slots 0–1");
+        assert_eq!(plan.r_notes.iter().map(|n| n.index).collect::<Vec<_>>(), vec![1], "the payment note, slots 2–3");
+        assert_eq!(plan.outputs(), [to_prover.clone(), (Payee::Me, 2), (Payee::To(you.address.clone()), 10), (Payee::Me, 6)]);
+        let s = plan.report(Hash::ZERO, Burn::None, 1, &Proved { proof: vec![], tier: 14, proving: Duration::ZERO, auth_proof: vec![], auth_proving: None });
+        assert_eq!((s.change, s.prover_fee), (8, 3), "every RAND that came back, slot 1's included");
+        assert!(s.summary("transfer").contains("prover fee 0.000000003 RAND"), "{}", s.summary("transfer"));
+        // When the largest note would leave nothing for the prover, a small note is set aside first.
+        let tight = NoteStore { notes: vec![owned_asset(1, 14, false, 0), owned_asset(2, 3, false, 0)], ..NoteStore::default() };
+        let plan = Plan::select(&tight, Spend { asset: 0, to: Some((&you.address, 10)), memo: "", fee: 4, burn_a: 0, burn_r: 0, prover_fee: pf }).unwrap();
+        assert_eq!((plan.a_notes[0].index, plan.r_notes[0].index), (2, 1));
+        assert_eq!(plan.outputs(), [to_prover.clone(), (Payee::Nobody, 0), (Payee::To(you.address.clone()), 10), (Payee::Nobody, 0)]);
+        // A RAND bundle that pays nobody: slot 2, beside the change; one note is enough.
+        let one = NoteStore { notes: vec![owned_asset(1, 20, false, 0)], ..NoteStore::default() };
+        let plan = Plan::select(&one, Spend { asset: 0, to: None, memo: "", fee: 4, burn_a: 0, burn_r: 5, prover_fee: pf }).unwrap();
+        assert_eq!(plan.outputs(), [(Payee::Nobody, 0), (Payee::Nobody, 0), to_prover, (Payee::Me, 8)]);
+        // Not enough RAND for both fees: refused with the balance.
+        let e = Plan::select(&tight, Spend { asset: 0, to: Some((&you.address, 15)), memo: "", fee: 4, burn_a: 0, burn_r: 0, prover_fee: pf }).unwrap_err();
+        assert!(e.to_string().contains("insufficient"), "{e}");
+    }
+
+    /// A RAND transfer through a fee-charging prover from one RAND note: told to split it first.
+    #[test]
+    fn a_rand_transfer_through_a_charging_prover_from_one_note_is_told_to_split() {
+        let you = Wallet::from_spend_key(SpendKey([63; 8]));
+        let prover = Wallet::from_spend_key(SpendKey([64; 8]));
+        let one = NoteStore { notes: vec![owned_asset(1, 1_000, false, 0)], ..NoteStore::default() };
+        let e = Plan::select(&one, Spend { asset: 0, to: Some((&you.address, 10)), memo: "", fee: 4, burn_a: 0, burn_r: 0, prover_fee: Some((&prover.address, 3)) })
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, SPLIT_FIRST);
+        assert!(e.contains("split it first") && e.contains("without --prover"), "{e}");
+        // Without a fee the same note pays as it always did.
+        Plan::select(&one, Spend { asset: 0, to: Some((&you.address, 10)), memo: "", fee: 4, burn_a: 0, burn_r: 0, prover_fee: None }).unwrap();
+    }
+
+    /// The whole path, on a v3 chain, for each kind: the witness the wallet builds passes the
+    /// prover's own admission check (`check_fee`, run by [`Proving::EmulatedFee`]) and the guest;
+    /// the prover opens exactly one output — its fee, in RAND — and nothing else. A pre-v3 chain
+    /// refuses a charging prover before anything is proved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prover_fee_bundle_passes_the_provers_check_and_the_guest() {
+        let me = Wallet::from_spend_key(SpendKey([65; 8]));
+        let you = Wallet::from_spend_key(SpendKey([66; 8]));
+        let prover = Wallet::from_spend_key(SpendKey([67; 8]));
+        let pf = 2_000_000;
+        let charging = Proving::EmulatedFee(prover.address.clone(), pf);
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        {
+            let mut c = chain.lock().unwrap();
+            c.hc_bundle = ZkExecutor::hc_hidden_bundle_v3();
+            c.hc_auth = Some(ZkExecutor::hc_auth());
+            for _ in 0..4 {
+                c.fund(&me, 7_000_000, 0);
+            }
+            c.fund(&me, 500, 3);
+            c.fund(&me, 300, 5);
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let paid_once = |tx: &Transaction, slot: usize| {
+            let theirs = slots_for(&prover, tx);
+            let Found::Received(n, memo) = &theirs[slot] else { panic!("slot {slot} pays the prover: {theirs:?}") };
+            assert_eq!((n.amount, n.asset, memo.as_deref()), (pf, 0, None), "RAND, the quote, no memo");
+            assert_eq!(theirs.iter().filter(|f| !opens_to_nobody(f)).count(), 1, "only its fee: {theirs:?}");
+        };
+        // A RAND transfer: slot 0.
+        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000_000, "", gas::BUNDLE_BASE, FriProfile::Test, &charging, 7, false)
+            .await
+            .unwrap();
+        assert_eq!(s.prover_fee, pf);
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        paid_once(&tx, 0);
+        let Found::Received(paid, memo) = &slots_for(&you, &tx)[2] else { panic!() };
+        assert_eq!((paid.amount, memo.as_deref()), (1_000_000, None), "the payment is slot 2");
+        // A token transfer: slot 2.
+        send_asset_with(&rpc, &me, &mut store, &you.address, 3, 400, "", gas::BUNDLE_BASE, FriProfile::Test, &charging, 7, false).await.unwrap();
+        paid_once(&chain.lock().unwrap().sent.pop().unwrap(), 2);
+        // A token burn: slot 2.
+        submit_token_burn_with(&rpc, &me, &mut store, 5, 300, gas::BUNDLE_BASE, FriProfile::Test, &charging, 7, false).await.unwrap();
+        paid_once(&chain.lock().unwrap().sent.pop().unwrap(), 2);
+
+        // A v1 chain: its witness carries the spend key, which no charging prover takes.
+        {
+            let mut c = chain.lock().unwrap();
+            c.hc_bundle = ZkExecutor::hc_bundle();
+            c.hc_auth = None;
+        }
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000, "", gas::BUNDLE_BASE, FriProfile::Test, &charging, 7, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("split-authorisation") && e.contains("drop --prover"), "{e}");
+        assert!(chain.lock().unwrap().sent.is_empty());
+    }
+
+    /// Carried from the Task 6 review: a v1/v2 bundle guest beside a named `hc_auth` is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_v1_or_v2_guest_beside_an_hc_auth_is_refused() {
+        let me = Wallet::from_spend_key(SpendKey([68; 8]));
+        let you = Wallet::from_spend_key(SpendKey([69; 8]));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        chain.lock().unwrap().fund(&me, 7_000_000, 0);
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        for hc in [ZkExecutor::hc_hidden_bundle(), ZkExecutor::hc_hidden_bundle_v2()] {
+            {
+                let mut c = chain.lock().unwrap();
+                c.hc_bundle = hc;
+                c.hc_auth = Some(ZkExecutor::hc_auth());
+            }
+            let e = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("names an auth guest but a v1/v2 bundle guest") && e.contains("misconfigured or lying"), "{e}");
+        }
+        assert!(chain.lock().unwrap().sent.is_empty());
+        // The same guest with no hc_auth: the chain it always was.
+        chain.lock().unwrap().hc_auth = None;
+        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false).await.unwrap();
+    }
+
+    /// A prover answering `prover_info` only, quoting `fee`.
+    async fn info_only_prover(fee: serde_json::Value, own: bool) -> Proving {
+        let key = randprotocol_prover::key::ProverKey::generate();
+        let info = serde_json::json!({
+            "kem_fingerprint": key.fingerprint().to_string(),
+            "hc_bundles": [], "profiles": [], "witness_kinds": ["viewing_key"], "fee": fee,
+        });
+        let url = rpc_fn(move |method, _| match method {
+            "prover_info" => Reply::Ok(info.clone()),
+            _ => Reply::Err(-32601, "method not found"),
+        })
+        .await;
+        let link = randprotocol_prover::pairing::PairingLink { kem_ek: key.kem_ek().to_vec(), url, token: [9; 32], own };
+        Proving::Remote(Arc::new(RemoteProver::new(crate::prover::PairedProver::from_link(&link, Some("box".into())))))
+    }
+
+    /// Carried from the Task 6 review: what `rand send` shows before its y/N — the prover's fee
+    /// and, for a prover not the owner's own on a v3 chain, the history warning, once (the proof
+    /// then prints no second one). A local proof shows nothing; a charging prover on a pre-v3
+    /// chain is refused here, before the question.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_send_confirmation_names_the_prover_fee_and_the_history_warning_once() {
+        let prover = Wallet::from_spend_key(SpendKey([70; 8]));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        chain.lock().unwrap().hc_bundle = ZkExecutor::hc_hidden_bundle_v3();
+        chain.lock().unwrap().hc_auth = Some(ZkExecutor::hc_auth());
+        let rpc = serve(&chain).await;
+        assert!(prover_confirmation(&rpc, &Proving::local(Backend::Cpu)).await.unwrap().is_empty());
+        let fee = serde_json::json!({ "amount": "1500000000", "address": prover.address.to_string() });
+        let remote = info_only_prover(fee.clone(), false).await;
+        let lines = prover_confirmation(&rpc, &remote).await.unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], format!("prover fee: 1.5 RAND to {}", prover.address.fingerprint()));
+        assert!(lines[1].contains(crate::prover::VIEWING_KEY_WARNING) && lines[1].contains("box"), "{lines:?}");
+        let Proving::Remote(r) = &remote else { unreachable!() };
+        assert!(r.warned_history(), "shown once: the proof prints no second warning");
+        assert_eq!(prover_confirmation(&rpc, &remote).await.unwrap(), vec![lines[0].clone()]);
+        // The owner's own prover, charging nothing: nothing to show.
+        assert!(prover_confirmation(&rpc, &info_only_prover(serde_json::Value::Null, true).await).await.unwrap().is_empty());
+        // A pre-v3 chain: no history (the witness carries the spend key), and a fee is refused.
+        chain.lock().unwrap().hc_bundle = ZkExecutor::hc_bundle();
+        chain.lock().unwrap().hc_auth = None;
+        assert!(prover_confirmation(&rpc, &info_only_prover(serde_json::Value::Null, false).await).await.unwrap().is_empty());
+        let e = prover_confirmation(&rpc, &info_only_prover(fee, false).await).await.unwrap_err().to_string();
+        assert!(e.contains("only a split-authorisation chain"), "{e}");
     }
 
     #[test]

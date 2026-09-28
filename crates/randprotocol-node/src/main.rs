@@ -496,6 +496,13 @@ enum Cmd {
         /// pages only (`docs/prover.md` §6.1). `*` allows every website.
         #[arg(long = "prover-allow-origin", value_name = "ORIGIN")]
         prover_allow_origin: Vec<String>,
+        /// The fee every job sent to the hosted prover must pay, in RAND (display units, up to
+        /// 9 decimals): one RAND output to --prover-fee-address inside the bundle proved.
+        #[arg(long, value_name = "RAND", requires = "prover_fee_address")]
+        prover_fee: Option<String>,
+        /// The shielded address (`rand1…`) the hosted prover's fee is paid to.
+        #[arg(long, value_name = "ADDRESS", requires = "prover_fee")]
+        prover_fee_address: Option<String>,
     },
     /// Verify the chain in a data directory without running the node.
     Verify {
@@ -1020,6 +1027,8 @@ async fn main() -> Result<()> {
             prover_cuda,
             prover_skip_memory_check,
             prover_allow_origin,
+            prover_fee,
+            prover_fee_address,
         } => {
             // Every prover check runs, and its address is bound, before the node key is read or
             // the database opened, so a misconfigured prover (or a port in use) exits at once.
@@ -1035,6 +1044,8 @@ async fn main() -> Result<()> {
                     cuda: prover_cuda,
                     skip_memory_check: prover_skip_memory_check,
                     allow_origins: prover_allow_origin,
+                    fee: prover_fee,
+                    fee_address: prover_fee_address,
                 })?),
             };
             let kp = load_keypair(&key)?;
