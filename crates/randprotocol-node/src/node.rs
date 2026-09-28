@@ -1559,28 +1559,49 @@ fn close_batch_coverage(storage: &Storage, batch: &mut Vec<CommittedBlock>, limi
 /// new genesis may name v1 or v2), so they are named here:
 ///
 /// - **Chains 14 and 15** committed proofs under constraint set 6. Every verifier key moved with
-///   constraint set 7 (v0.6.1): a node on either chain would refuse the chain's own history at its
-///   startup replay.
-/// - **Chain 16** (v0.6.1/v0.6.2) runs on the bundle wire and transaction ids before split
-///   authorisation. This build appends `auth_commit`/`auth_proof` to every `Bundle` (bincode is
-///   positional, so none of chain 16's bundles decode) and hashes every transaction under
-///   `rand-txid-3`, so it would fail at chain 16's first bundle.
+///   constraint set 7 (v0.6.1) and again with constraint set 8 ([`BUILD_CONSTRAINT_SET`], the gas
+///   meter): a node on either chain would refuse the chain's own history at its startup replay.
+/// - **Chain 16** (v0.6.1/v0.6.2) committed proofs under constraint set 7, and runs on the bundle
+///   wire and transaction ids before split authorisation. This build appends
+///   `auth_commit`/`auth_proof` to every `Bundle` (bincode is positional, so none of chain 16's
+///   bundles decode) and hashes every transaction under `rand-txid-3`, so it would fail at chain
+///   16's first bundle.
+/// - **Chain 17** (v0.6.3) commits proofs under constraint set 7 and pins bundle guest v3 and
+///   `hc_auth`, both of which this build still carries — so only its hash can refuse it here. No
+///   chain-17 genesis file is in this tree (the chain is not yet cut); add its hash beside
+///   [`CONSTRAINT_SET_7_REASON`] as soon as `deploy/genesis-chain17.json` is committed, or this
+///   binary installed on a chain-17 host would start, refuse the chain's own history at its
+///   startup replay, and a `verify --repair` would truncate it.
 pub const CHAINS_THIS_BUILD_CANNOT_RUN: [(u64, &str, &str); 3] = [
     (14, "1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff", CONSTRAINT_SET_6_REASON),
     (15, "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8", CONSTRAINT_SET_6_REASON),
     (16, "20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005", SPLIT_AUTH_REASON),
 ];
 
-const CONSTRAINT_SET_6_REASON: &str = "its proofs were made under constraint set 6; this build is constraint \
-     set 7 (v0.6.1 and later) and verifies none of them. Run the chain's own release (v0.6 or earlier), never this one";
+/// The constraint set this build proves and verifies under: 8, the gas meter (`pv::GAS`, chain 18).
+pub const BUILD_CONSTRAINT_SET: u8 = 8;
 
-const SPLIT_AUTH_REASON: &str = "this build changes the bundle wire and every transaction id (rand-txid-3, split \
-     authorisation): it runs chain 17+ only; use the v0.6.1/v0.6.2 release for chain 16";
+const CONSTRAINT_SET_6_REASON: &str = "its proofs were made under constraint set 6; this build is constraint \
+     set 8 (v0.6.5 and later) and verifies none of them, so its startup replay would refuse the chain's own \
+     history and a `verify --repair` would truncate it — on an archive node, the only full copy. Run the \
+     chain's own release (v0.6 or earlier), never this one";
+
+const SPLIT_AUTH_REASON: &str = "its proofs were made under constraint set 7 and this build is constraint set 8, \
+     and this build changes the bundle wire and every transaction id (rand-txid-3, split authorisation): a \
+     `verify --repair` would truncate the chain's history — on an archive node, the only full copy. Use the \
+     v0.6.1/v0.6.2 release for chain 16";
+
+/// Chain 17's reason, for when its genesis file lands (see [`CHAINS_THIS_BUILD_CANNOT_RUN`]).
+#[allow(dead_code)]
+const CONSTRAINT_SET_7_REASON: &str = "its proofs were made under constraint set 7; this build is constraint \
+     set 8 (v0.6.5 and later) and verifies none of them, so its startup replay would refuse the chain's own \
+     history and a `verify --repair` would truncate it. Use the v0.6.3 release for chain 17";
 
 /// Refuse a genesis in [`CHAINS_THIS_BUILD_CANNOT_RUN`]: `run` (through
 /// [`check_build_runs_genesis`]) and `verify` both call it before touching the datadir's blocks,
 /// so this binary installed on a chain-14, -15 or -16 host neither starts nor `verify --repair`s
-/// that chain's history away.
+/// that chain's history away — on an archive (obs1, rand-archive-2) that history is the only full
+/// copy there is.
 pub fn refuse_chains_this_build_cannot_run(gs: &GenesisState) -> Result<()> {
     let hash = gs.hash().to_hex();
     if let Some((chain, _, why)) = CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(_, h, _)| *h == hash) {

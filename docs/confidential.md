@@ -459,7 +459,13 @@ table (`docs/superpowers/specs/2026-09-28-gas-model-design.md` §4.2, `docs/fees
 
 Every verifier key changes (the cpu AIR changes), so constraint set 8 rides only a chain cut —
 chain 18, which also carries `hardening_v6` and the genesis `gas` section (`docs/fees.md` §1.1,
-§1.2). See the AGENTS.md `chain 18` entry for the full built state, review traps and the cut order.
+§1.2). A constraint-set-8 build refuses chain 16 (constraint set 7) by genesis hash at `run` and
+`verify` beside chains 14 and 15 (`node::CHAINS_THIS_BUILD_CANNOT_RUN`, whose chain-16 reason
+v0.6.3 already carried for the wire change): chain 16 pins guest v2, which this build still
+carries, so the `hc_bundle` check alone would let it start there and its replay (or a `verify
+--repair`) refuse and truncate the chain's history. **Chain 17 (constraint set 7, v0.6.3) must be
+added to that list the moment its genesis file is committed** — it pins bundle guest v3 and
+`hc_auth`, both still carried, so nothing but its hash can refuse it. See the AGENTS.md `chain 18` entry for the full built state, review traps and the cut order.
 
 ### Transaction binding (2026-09-19, Task 5b — a hard fork, chain 14)
 

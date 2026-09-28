@@ -1908,8 +1908,8 @@ mod tests {
         }
     }
 
-    /// v0.6.1 is constraint set 7: every verifier key moved, so no bundle or call proof chains 14
-    /// and 15 committed verifies on this build. Both genesis files pin guest v1, which this build
+    /// v0.6.1 was constraint set 7 and this build is 8: every verifier key moved, so no bundle or
+    /// call proof chains 14 and 15 (constraint set 6) committed verifies on this build. Both genesis files pin guest v1, which this build
     /// still carries (a new chain may pin it), so the `hc_bundle` check alone let a v0.6.1 binary
     /// start on either chain — and its startup replay would then refuse the chain's own history.
     /// Chain 16 pins guest v2, also still carried, but this build (split authorisation) changes the
@@ -1919,8 +1919,8 @@ mod tests {
     #[test]
     fn this_build_refuses_chains_14_15_and_16() {
         for (chain, file, why) in [
-            (14, "genesis-chain14.json", "constraint set 7"),
-            (15, "genesis-chain15.json", "constraint set 7"),
+            (14, "genesis-chain14.json", "constraint set 6"),
+            (15, "genesis-chain15.json", "constraint set 6"),
             (16, "genesis-chain16.json", "rand-txid-3, split authorisation"),
         ] {
             let path = format!("{}/../../deploy/{file}", env!("CARGO_MANIFEST_DIR"));
@@ -1933,6 +1933,7 @@ mod tests {
                 .expect_err(&format!("this build must refuse chain {chain} at run"))
                 .to_string();
             assert!(refused.contains(why) && refused.contains(&format!("chain {chain}")), "{refused}");
+            assert!(refused.contains("constraint set 8"), "names this build's set: {refused}");
             let at_verify = node::refuse_chains_this_build_cannot_run(&state)
                 .expect_err(&format!("this build must refuse chain {chain} at verify"))
                 .to_string();
@@ -1966,6 +1967,31 @@ mod tests {
         assert_eq!(state.hash().to_hex(), "d1afefc3dd68f73e3799aa0803b692d0e6a5c7c27d228bdeb3d06cdf4027e7ff", "chain 17's live genesis");
         assert_eq!(state.ledger.hc_auth(), Some(ZkExecutor::hc_auth()), "the ledger enforces split authorisation");
         node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 17");
+    }
+
+    /// This build is constraint set 8 (the gas meter, chain 18): every verifier key moved again, so
+    /// no proof chain 16 (constraint set 7, v0.6.1) committed verifies here. Chain 16 pins the v2
+    /// guest, which this build still carries, so the `hc_bundle` check alone would let this binary
+    /// start on chain 16 — and its startup replay (or a `verify --repair`) would then refuse, and
+    /// truncate, the chain's own history. The guard names the chain, its set and the archive risk.
+    #[test]
+    fn a_constraint_set_8_build_refuses_chain_16() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain16.json");
+        let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        assert_eq!(state.hash().to_hex(), "20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005");
+        let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles())
+            .expect_err("a constraint-set-8 build must refuse chain 16")
+            .to_string();
+        assert!(
+            refused.contains("chain 16") && refused.contains("constraint set 7") && refused.contains("constraint set 8"),
+            "{refused}"
+        );
+        assert!(refused.contains("archive"), "the message names the archive risk: {refused}");
+        // `verify` calls the same guard before it opens the datadir.
+        let verify = node::refuse_chains_this_build_cannot_run(&state).expect_err("verify refuses chain 16 too").to_string();
+        assert_eq!(verify, refused);
     }
 
     /// Chain 16, cut by `deploy/cut-chain16-genesis.sh` with the v0.6.1 release binary: every
