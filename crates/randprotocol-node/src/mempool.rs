@@ -2400,6 +2400,29 @@ mod tests {
         assert_eq!(n.precheck(&call, &ledger, &StubExecutor).unwrap().floor, gas::fee_floor(&call.action));
     }
 
+    /// C1 of the final review: under genesis `hardening_v6` a call to a program without a public
+    /// input proves over its `call_binding` (INT-4), so the policy's header read must decode it the
+    /// hardened way, as the ledger does — the plain decoder compares `H_PUB` against the empty
+    /// segment and refused every such call `InvalidProof("PublicValues")`, permanently.
+    #[test]
+    fn a_hardened_call_paying_the_policy_floor_passes_precheck() {
+        use randprotocol_core::gas::GasPolicy;
+        let (mut ledger, pid, _) = program_and_call(14, 0, 50);
+        ledger.set_hardening_v6(true);
+        let stub_len = StubExecutor::make_proof_with_public(&Hash::ZERO, 14, [0; 8], &[]).len();
+        let want = GasPolicy::DEFAULT.call_floor(14, 0, 0, stub_len);
+        let b = fixtures::bundle_tx(&ledger, [[60; 8], [61; 8]], [[62; 8], [63; 8]], want).bundle.expect("bundle");
+        let mut call = Transaction::shielded(ledger.chain_id(), b, Action::Call { program: pid, proof: vec![], input_envelope: None });
+        let proof = StubExecutor::make_proof_with_public(&pid, 14, [7; 8], &call.call_binding());
+        let Action::Call { proof: p, .. } = &mut call.action else { unreachable!() };
+        *p = proof;
+        let call = StubExecutor::bound(call);
+        assert_eq!(ledger.validate(&call, &StubExecutor), Ok(()), "the ledger accepts the bound call");
+        let mut m = Mempool::new(64);
+        m.set_gas_policy(GasPolicy::DEFAULT);
+        assert_eq!(m.precheck(&call, &ledger, &StubExecutor).unwrap().floor, want);
+    }
+
     /// Review focus 1 and 2: the policy check never decodes a proof it should not.
     #[test]
     fn an_unknown_programs_call_is_refused_before_its_proof_is_decoded() {
