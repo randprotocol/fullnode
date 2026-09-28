@@ -152,16 +152,26 @@ pub const GAS_PRICE_DEFAULT: u64 = 100;
 /// 1.25 MB proof is ≈ 1 000 000 units, today's `CALL_BASE` under another name.
 pub const BYTE_PRICE_DEFAULT: u64 = 800;
 
-/// The gas no run under this proof header can exceed (spec §3.2): the tier's cycle budget, plus
-/// `KECCAK_GAS − 1` for every permutation the declared keccak table could hold (one 32-row block
-/// each, `0` = no table) and `SHA256_GAS − 1` for every compression of the sha256 table (64-row
-/// blocks). Phase 0 charges exactly this; Phase 1's in-circuit meter charges a declared limit at
-/// or under it.
+/// The gas no run under this proof header can exceed (spec §3.2, controller ruling from the
+/// constraint-set-8 final review): the tier's cycle budget, plus the Poseidon2 absorb
+/// surcharge, plus `KECCAK_GAS − 1` for every permutation the declared keccak table could hold
+/// (one 32-row block each, `0` = no table) and `SHA256_GAS − 1` for every compression of the
+/// sha256 table (64-row blocks). Phase 0 charges exactly this; Phase 1's in-circuit meter
+/// charges a declared limit at or under it.
+///
+/// The absorb surcharge: the cpu table's gas accumulator (§4.2's `w = 1 + 2·IS_HASH_BLOCK + …`)
+/// charges `+2` on every `POSEIDON2` absorb row beyond the `+1` every row already costs — every
+/// permutation is `3 + 3·⌈n/4⌉` cpu rows (§3.1), of which one is the absorb row this surcharge
+/// falls on. A tier of `2^t` padded cpu rows holds at most `2^(t−3)` permutations (the smallest
+/// permutation, `n = 0`, is 3 rows), so the most the accumulator can run over the plain cycle
+/// count `2^t − 1` is `2 · 2^(t−3) = 2^(t−2)` — the term this ceiling was previously missing.
 pub fn gas_max(tier: u8, keccak_log_height: u8, sha256_log_height: u8) -> u64 {
     let tier = tier.clamp(MIN_TIER, MAX_TIER);
     let cycles = (1u64 << tier) - 1;
+    let absorb_surcharge = 1u64 << (tier - 2);
     let blocks = |log_height: u8, block: u64| if log_height == 0 { 0 } else { (1u64 << log_height.min(40)) / block };
     cycles
+        .saturating_add(absorb_surcharge)
         .saturating_add(blocks(keccak_log_height, 32).saturating_mul(KECCAK_GAS - 1))
         .saturating_add(blocks(sha256_log_height, 64).saturating_mul(SHA256_GAS - 1))
 }
@@ -442,18 +452,21 @@ mod tests {
         assert_eq!(call_bytes(&[], Some(&e)), 1248);
     }
 
-    /// Spec 2026-09-28 §3.2: the ceiling a proof header implies — the tier's cycle budget plus
-    /// the weight of every permutation and compression the declared hash tables could hold.
+    /// Spec 2026-09-28 §3.2 (controller ruling, constraint-set-8 final review): the ceiling a
+    /// proof header implies — the tier's cycle budget, plus the Poseidon2 absorb surcharge
+    /// (`2^(t−2)`: every absorb row beyond its cycle costs `+2`, and a tier holds up to
+    /// `2^(t−3)` permutation slots), plus the weight of every permutation and compression the
+    /// declared hash tables could hold.
     #[test]
     fn gas_max_is_the_headers_ceiling() {
-        assert_eq!(gas_max(10, 0, 0), 1_023);
-        assert_eq!(gas_max(20, 0, 0), 1_048_575);
+        assert_eq!(gas_max(10, 0, 0), 1_279);
+        assert_eq!(gas_max(20, 0, 0), 1_310_719);
         // One keccak block (2^5 rows = 1 permutation) adds KECCAK_GAS − 1 beyond its cycle.
-        assert_eq!(gas_max(10, 5, 0), 1_023 + 191);
+        assert_eq!(gas_max(10, 5, 0), 1_279 + 191);
         // One sha256 block (2^6 rows = 1 compression) adds SHA256_GAS − 1.
-        assert_eq!(gas_max(10, 0, 6), 1_023 + 63);
+        assert_eq!(gas_max(10, 0, 6), 1_279 + 63);
         // The call caps: tier 14, keccak 2^12 (128 perms), sha256 2^13 (128 comps).
-        assert_eq!(gas_max(14, 12, 13), 16_383 + 128 * 191 + 128 * 63);
+        assert_eq!(gas_max(14, 12, 13), 20_479 + 128 * 191 + 128 * 63);
         // Below MIN_TIER clamps up; above MAX_TIER clamps down.
         assert_eq!(gas_max(0, 0, 0), gas_max(10, 0, 0));
         assert_eq!(gas_max(99, 0, 0), gas_max(20, 0, 0));
@@ -464,11 +477,11 @@ mod tests {
     #[test]
     fn the_policy_floor_is_the_larger_of_the_two_floors() {
         let p = GasPolicy::DEFAULT;
-        // tier-10 fib-sized, 1.30 MB: bytes 1 270 KiB · 800 = 1 016 000, gas 1 023 · 100.
-        assert_eq!(p.call_floor(10, 0, 0, 1_300_000), BUNDLE_BASE + 102_300 + 1_016_000);
-        // tier 20, 1.45 MB: 1 048 575 · 100 + 1 417 KiB · 800 (1 450 000 B is 16 B into its
+        // tier-10 fib-sized, 1.30 MB: bytes 1 270 KiB · 800 = 1 016 000, gas 1 279 · 100.
+        assert_eq!(p.call_floor(10, 0, 0, 1_300_000), BUNDLE_BASE + 127_900 + 1_016_000);
+        // tier 20, 1.45 MB: 1 310 719 · 100 + 1 417 KiB · 800 (1 450 000 B is 16 B into its
         // 1 417th KiB, so the "or part of one" rule rounds up from 1 450 000 / 1024 = 1416.015625).
-        assert_eq!(p.call_floor(20, 0, 0, 1_450_000), BUNDLE_BASE + 104_857_500 + 1_133_600);
+        assert_eq!(p.call_floor(20, 0, 0, 1_450_000), BUNDLE_BASE + 131_071_900 + 1_133_600);
         // A 32 MiB proof at tier 10: the old schedule's byte term is the higher floor.
         let big = 32 << 20;
         let old = BUNDLE_BASE + call_fee(10, big);

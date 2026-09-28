@@ -35,7 +35,7 @@ asset. Burns are not fees; `docs/supply.md` accounts for both.
 
 A node prices a call by the work its proof header bounds, as admission policy on any chain:
 
-    gas_max = (2ᵗ − 1) + 191·(2ᵏˡʰ / 32) + 63·(2ˢˡʰ / 64)          -- 0 for an absent table
+    gas_max = (2ᵗ − 1) + 2^(t−2) + 191·(2ᵏˡʰ / 32) + 63·(2ˢˡʰ / 64)     -- 0 for an absent table
     floor   = max( BUNDLE_BASE + call_fee(t, bytes),
                    BUNDLE_BASE + gas_price·gas_max + byte_price·⌈bytes / 1024⌉ )
 
@@ -44,11 +44,15 @@ A node prices a call by the work its proof header bounds, as admission policy on
 them and `rand_estimateFee` prices them; a wallet pays the floor by default. It is a policy above
 the ledger's schedule, never a block rule: the pool refuses `FeeTooLow` (not permanent), a block
 that carries a cheaper call is still valid. One gas is one cpu row; a `KECCAK` row is 192, a
-`SHA256` row 64 (§3.1 of the spec). What this changes, for a ~1.2–1.3 MB production proof: a
-tier-14 call — the highest tier a chain admits a call at (`MAX_CALL_TIER`) — goes from ~0.0022 to
-~0.0037 RAND, and a tier-10 call pays ~0.0021 (was 0.0020). The schedule would charge a tier-20
-header ~0.107 RAND, but no such call is admitted today. The declared limit and the in-circuit meter
-that make this per-instruction rather than per-header come with the chain 18 cut.
+`SHA256` row 64 (§3.1 of the spec). The `2^(t−2)` term is the Poseidon2 absorb surcharge: the
+zkVM charges `+2` gas on every absorb row beyond its cycle, and a tier holds up to `2^(t−3)`
+permutation slots, so a run can exceed the plain cycle budget by up to `2·2^(t−3)`. What this
+changes, for a ~1.2–1.3 MB production proof: a tier-14 call — the highest tier a chain admits a
+call at (`MAX_CALL_TIER`) — goes from ~0.0022 to ~0.0041 RAND (`20 479·100 +
+800·⌈1 350 000/1024⌉ + 1 000 000`), and a tier-10 call pays ~0.0021 (was 0.0020). The schedule
+would charge a tier-20 header ~0.133 RAND, but no such call is admitted today. The declared limit
+and the in-circuit meter that make this per-instruction rather than per-header come with the
+chain 18 cut.
 
 ## 2. What the sender pays with its own machine: proving
 

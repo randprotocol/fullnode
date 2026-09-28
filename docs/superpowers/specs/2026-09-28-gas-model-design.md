@@ -164,13 +164,16 @@ the sender chooses the granularity of its own leak. Every proof header already i
 ceiling no run under it can exceed,
 
 ```
-gas_max(header) = (2ᵗ − 1) + 191 · (2ᵏˡʰ / 32) + 63 · (2ˢˡʰ / 64)      -- 0 for an absent table
+gas_max(header) = (2ᵗ − 1) + 2^(t−2) + 191 · (2ᵏˡʰ / 32) + 63 · (2ˢˡʰ / 64)      -- 0 for an absent table
 ```
 
-(the cycle budget, plus the weight of every keccak permutation and sha256 compression the
-declared tables could hold). Declaring `GAS_LIMIT = gas_max` leaks exactly what the header
-leaks today and costs the most; declaring the count to the cycle leaks the count and costs the
-least. The wallet's default (§9) rounds up to a quarter-tier, two bits more than today. A
+(the cycle budget, plus the Poseidon2 absorb surcharge — the accumulator charges `+2` on every
+absorb row beyond its cycle, and a tier holds up to `2^(t−3)` permutation slots, so a run can
+exceed the plain cycle budget by up to `2·2^(t−3) = 2^(t−2)` — plus the weight of every keccak
+permutation and sha256 compression the declared tables could hold). Declaring `GAS_LIMIT = gas_max`
+leaks exactly what the header leaks today and costs the most; declaring the count to the cycle
+leaks the count and costs the least. The wallet's default (§9) rounds up to a quarter-tier, two
+bits more than today. A
 `GAS_LIMIT > gas_max` is refused before any verification work: it could only be a mispriced
 header.
 
@@ -200,9 +203,9 @@ Calibration, all with the 0.001 RAND bundle base included:
 | call | gas | bytes | today | this model: base + bytes + gas |
 |---|---|---|---|---|
 | tier-10 `fib`-sized, 1 000 gas, no hash table | 1 000 | 1.30 MB (1 270 KiB) | 0.0020 RAND | 0.0010 + 0.0010 + 0.0001 = **0.0021 RAND** |
-| tier-14 program, 16 000 gas, no hash table | 16 000 | 1.35 MB | 0.0022 | 0.0010 + 0.0011 + 0.0016 = **0.0037** |
+| tier-14 program, 20 479 gas (`gas_max(14,0,0)`), no hash table | 20 479 | 1.35 MB | 0.0022 | 0.0010 + 0.0011 + 0.0020 = **0.0041** |
 | tier-14 EVM ERC-20 transfer, 40 000 cycles + 40 keccak | 47 680 | 3.2 MB (needs `max_proof_bytes` raised) | 0.0022 + 0.0011 bytes = 0.0033 | 0.0010 + 0.0025 + 0.0048 = **0.0083** |
-| tier-20, a full trace | 1 048 575 | 1.45 MB | 0.0025 | 0.0010 + 0.0011 + 0.1049 = **0.107** |
+| tier-20, a full trace | 1 310 719 | 1.45 MB | 0.0025 | 0.0010 + 0.0011 + 0.1311 = **0.133** |
 | tier-10, 200 gas, tightly declared | 200 | 1.30 MB | 0.0020 | 0.0010 + 0.0010 + 0.00002 = **0.0020** |
 
 The small call pays what it pays today (the byte term is the old base under another name); the
@@ -237,7 +240,7 @@ fee ≥ max( BUNDLE_BASE + call_fee(t, bytes),                            -- the
 for a proof of many MiB, and a policy may never demand less than the validity rule). The prices
 are the node's `--gas-price` / `--byte-price` (defaults §3.3; both `0` = no policy), announced by
 `rand_getLimits`. It is a smoother tier fee, not per-instruction — the bound is still a power of two — but it
-already removes the regression of §1 (tier 20 pays 0.107 RAND, not 0.0025) and prices a keccak
+already removes the regression of §1 (tier 20 pays 0.133 RAND, not 0.0025) and prices a keccak
 table by its declared size. It is **admission policy above the ledger's rule**, the LEDGER-1
 pattern: the ledger keeps today's `call_fee` floor as the validity rule (it is replayed, so it
 cannot move without a cut), and the pool and the proposer demand the higher floor
@@ -277,7 +280,7 @@ term replaces `CALL_BASE` in that role too).
 
 The bundle guest's `hc` is pinned in genesis and its shape is fixed; its gas is whatever that
 guest spends, and the ledger must never let it vary on chain. Rule: **a bundle proof's
-`GAS_LIMIT` must equal the genesis constant `bundle_gas_limit`** (`2¹⁴ − 1 = 16 383` for
+`GAS_LIMIT` must equal the genesis constant `bundle_gas_limit`** (`gas_max(14, 0, 0) = 20 479` for
 today's tier-14 guest), exactly, or the proof is refused. Every bundle then publishes the same
 value and the per-instruction schedule collapses to the flat `BUNDLE_BASE` it has today: a fixed
 price is the right price for a fixed program. The same holds for the aggregate (rVM) proof and
@@ -441,11 +444,11 @@ Rollback for Phase 0 is a node re-pin; for Phase 1 it is the chain's, like every
 
 1. Proposer credit or burn for the gas term (§3.4)? Burn needs a `gas_burned` supply counter
    and an audit line; credit needs nothing.
-2. The constants: `GAS_PRICE` at 10⁻⁷ RAND makes a full tier-20 call 0.1 RAND. Is that the
+2. The constants: `GAS_PRICE` at 10⁻⁷ RAND makes a full tier-20 call ~0.13 RAND. Is that the
    intended ceiling for an interpreted SPL call, or should the price be tiered by 10× above
    `2¹⁶` gas?
 3. Should `bundle_gas_limit` be the guest's measured maximum (9 160 → 9 216) rather than the
-   tier's `16 383`, to make a future smaller bundle guest cheaper? Either is a constant; the
+   tier's `20 479`, to make a future smaller bundle guest cheaper? Either is a constant; the
    tier's is the one that never needs re-measuring.
 4. Resolved by the user: Phase 1 is the chain 18 cut. Constraint set 7's LogUp blinding ships on
    chain 16 ahead of it.

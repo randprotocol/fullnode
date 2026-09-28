@@ -331,9 +331,10 @@ a number so an old node's JSON numbers still parse. The CLI's hardened call quot
 only when a policy is set — with none it quotes the envelope alone, as before. The refusal test
 that pins the crossover runs at tier 14, not 12: with a ~110-byte stub proof the byte term is
 ~0, so the policy floor equals the ledger's own floor until `gas_price·gas_max` first exceeds
-`CALL_BASE + step` — at tier 14 that's 1,638,300 > 1,200,000. `docs/fees.md` §1.1 headlines this
-same tier-14 crossover (~0.0022 → ~0.0037 RAND), not tier 20 — no chain admits a tier-20 call
-(`MAX_CALL_TIER` is 14).
+`CALL_BASE + step` — at tier 14 that's 2,047,900 > 1,200,000 (`gas_max(14, 0, 0) = 20 479`, the
+constraint-set-8 final review's Poseidon2-absorb-surcharge correction to the formula, not the
+`16 383` this note originally quoted). `docs/fees.md` §1.1 headlines this same tier-14 crossover
+(~0.0022 → ~0.0041 RAND), not tier 20 — no chain admits a tier-20 call (`MAX_CALL_TIER` is 14).
 
 **Phase 1** (the in-circuit meter, `pv::GAS`, the genesis `gas` section, the bundle's pinned
 limit, the rVM's 35-word interface) is **the chain 18 cut** (the user's ruling) — its plan is
