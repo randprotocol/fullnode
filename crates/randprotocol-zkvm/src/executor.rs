@@ -1523,6 +1523,29 @@ pub fn prove_bundle_for(
     prove_pinned_bundle(profile, program, crate::hidden::hidden_input::COUNT, "hidden bundle", inputs, binding, backend)
 }
 
+/// Test-only (the chain-18 capstone, `tests/cluster.rs`): [`prove_bundle_for`] declaring
+/// `gas_limit` as the bundle proof's `GAS_LIMIT` (`pv::GAS`) instead of the header's ceiling
+/// every honest wallet declares. A real proof that verifies — the circuit holds any limit in
+/// `[the run's gas, gas_max]` — so the chain's `bundle_gas_limit` pin (spec 2026-09-28 §4.3) is
+/// the only rule left to refuse it. CPU only. Never a wallet path.
+#[doc(hidden)]
+pub fn prove_bundle_for_with_limit(
+    hc: &Word8,
+    profile: FriProfile,
+    inputs: &[u32],
+    binding: &[u32; TX_BINDING_WORDS],
+    gas_limit: u64,
+) -> Result<(Vec<u8>, Word8, u8), String> {
+    let program = ZkExecutor::bundle_program_for(hc)
+        .ok_or_else(|| format!("this build cannot prove for the bundle guest {}", randprotocol_core::notes::word8_to_hex(hc)))?;
+    if inputs.len() != crate::hidden::hidden_input::COUNT {
+        return Err(format!("hidden bundle inputs must be exactly {} words, got {}", crate::hidden::hidden_input::COUNT, inputs.len()));
+    }
+    let opts = crate::machine::ProveOptions { gas_limit: Some(gas_limit), ..Default::default() };
+    let (proof, exec) = Machine::new(profile).prove_with_options(program, inputs, binding, None, opts).map_err(|e| format!("{e:?}"))?;
+    Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
+}
+
 fn prove_pinned_bundle(
     profile: FriProfile,
     program: &Program,

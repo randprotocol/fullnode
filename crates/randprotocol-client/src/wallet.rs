@@ -1561,6 +1561,43 @@ impl Prepared {
     }
 }
 
+/// Test-only (the chain-18 capstone, `randprotocol-node`'s `tests/cluster.rs`): a plain RAND
+/// transfer built and proved exactly as [`send`] builds and proves one — the same scan, plan,
+/// anchor, envelopes and binding — except that its bundle proof declares `bundle_gas_limit` as
+/// its `GAS_LIMIT` rather than the guest's ceiling. Returned unsubmitted, so the caller submits
+/// it and reads the refusal by hash. Never a wallet path: every honest bundle declares the
+/// ceiling ([`check_bundle_gas_limit`]).
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn build_transfer_declaring_bundle_gas(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    to: &ShieldedAddress,
+    amount: u64,
+    fee: u64,
+    profile: FriProfile,
+    chain_id: u64,
+    bundle_gas_limit: u64,
+) -> Result<Transaction> {
+    scan(rpc, w, store).await?;
+    let plan = Plan::select(store, Spend { asset: 0, to: Some((to, amount)), memo: "", fee, burn_a: 0, burn_r: 0 })?;
+    let format = rpc.envelope_format().await?;
+    let (prepared, _) = prepare_bundle(rpc, w, store, &plan, format).await?;
+    let mut tx = Transaction::shielded(chain_id, prepared.bundle.clone(), Action::None);
+    let p = &prepared;
+    prove_transaction_by(&mut tx, |binding| async move {
+        let started = Instant::now();
+        let (proof, digest, tier) =
+            randprotocol_zkvm::executor::prove_bundle_for_with_limit(&p.guest, profile, &p.words, &binding, bundle_gas_limit)
+                .map_err(|e| anyhow!("proving the bundle failed: {e}"))?;
+        check_published_digest(&digest, &p.expected)?;
+        Ok(Proved { proof, tier, proving: started.elapsed() })
+    })
+    .await?;
+    Ok(tx)
+}
+
 /// How a submission proves its bundle: on this machine ([`Proving::Local`]), on a paired prover
 /// ([`Proving::Remote`], `rand --prover`), or — in unit tests — the guest run in the emulator,
 /// whose digest is checked exactly as a proof's is. The FRI profile is the chain's and travels
