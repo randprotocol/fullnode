@@ -224,7 +224,8 @@ enum Cmd {
         /// The gas limit the proof declares, `N` or `max` (spec 2026-09-28 §5): what a chain with
         /// a gas section charges, and an upper bound on the run anyone can read. Default there:
         /// the exact gas rounded up to a quarter of the tier; `max` declares the header's ceiling
-        /// and leaks nothing the tier does not. Elsewhere the default is `max` (it buys nothing).
+        /// and leaks nothing the tier does not. Elsewhere the default is `max` (it buys nothing),
+        /// and on `--cuda`, which can declare nothing else.
         #[arg(long)]
         gas_limit: Option<String>,
         /// Fee in RAND; default: the floor for the declared gas (or, without a gas section, the
@@ -382,8 +383,9 @@ enum Cmd {
         /// `call`: the proof's declared hash-table heights, 0 = none.
         #[arg(long)]
         sha256_log_height: Option<u8>,
-        /// `call`: the gas limit the proof declares — required on a chain with a gas section,
-        /// which prices it (`rand call` prints it before proving).
+        /// `call`: the gas limit the proof declares, which a chain with a gas section prices
+        /// (`rand call` prints it before proving); absent there, the header's ceiling
+        /// `gas_max(tier, K, S)` is priced.
         #[arg(long)]
         gas: Option<u64>,
     },
@@ -941,7 +943,8 @@ fn parse_gas_limit(arg: Option<&str>) -> Result<GasArg> {
 /// What a call declares, from its dry run (spec 2026-09-28 §5, §9): `(the prover's gas_limit,
 /// the gas the fee is priced at before proving)`. `None` proves under the header's own ceiling
 /// (`max`, and the default on a chain without a gas section, where the limit buys nothing and
-/// would only leak); the default under a section is the quarter-tier bucket over the exact gas.
+/// would only leak, or on a non-CPU backend, which cannot declare anything else); the default
+/// under a section on the CPU backend is the quarter-tier bucket over the exact gas.
 /// Prints `gas: <exact> (declaring <limit>, tier <t>)` before any proving, and refuses a limit
 /// under the exact gas or over the ceiling, naming the bound.
 fn resolve_gas_limit(
@@ -949,6 +952,7 @@ fn resolve_gas_limit(
     run: &executor::CallDryRun,
     tier: u8,
     limits: Option<&randprotocol_client::ChainLimits>,
+    cpu: bool,
 ) -> Result<(Option<u64>, u64)> {
     let ceiling = gas::gas_max(tier, run.keccak_log_height, run.sha256_log_height);
     if run.gas > ceiling {
@@ -957,8 +961,13 @@ fn resolve_gas_limit(
     let section = limits.is_some_and(|l| l.gas_circuit);
     let declare = match arg {
         GasArg::Max => None,
-        GasArg::Default if !section => None,
+        // A non-CPU backend (`--cuda`) proves under the header's ceiling only (its prover takes no
+        // options), so the default there is the ceiling, not the bucket.
+        GasArg::Default if !section || !cpu => None,
         GasArg::Default => Some(wallet::gas_bucket(run.gas, tier, ceiling)),
+        GasArg::Exactly(n) if !cpu => {
+            anyhow::bail!("--gas-limit {n}: this backend proves under the header's gas ceiling only; pass --gas-limit max, or prove on the CPU backend")
+        }
         GasArg::Exactly(n) => {
             wallet::check_gas_limit(n, run.gas, ceiling)?;
             Some(n)
@@ -967,6 +976,17 @@ fn resolve_gas_limit(
     let priced = declare.unwrap_or(ceiling);
     eprintln!("gas: {} (declaring {priced}, tier {tier})", run.gas);
     Ok((declare, priced))
+}
+
+/// `rand fee call <tier>` without `--gas` (spec §9): on a chain with a gas section, the ceiling of
+/// the header the flags describe — `gas_max(tier, 0, 0)` for a hash-free call, what
+/// `rand call --gas-limit max` declares — so the answer is the most such a call can cost; `None`
+/// (no `gas` sent) on a chain without one, which prices the header instead.
+fn fee_call_default_gas(section: bool, tier: u64, keccak_log_height: Option<u8>, sha256_log_height: Option<u8>) -> Option<u64> {
+    section.then(|| {
+        let tier = u8::try_from(tier).unwrap_or(u8::MAX);
+        gas::gas_max(tier, keccak_log_height.unwrap_or(0), sha256_log_height.unwrap_or(0))
+    })
 }
 
 /// The fee line's suffix under the dynamic controller: the default pays one price step over the
@@ -1563,7 +1583,7 @@ async fn main() -> Result<()> {
                 // The limit is fixed here, before proving, because the fee is (the binding covers
                 // the fee bundle). `max` proves with `None` — the real header's ceiling — and is
                 // priced at the dry run's; the guard after proving re-prices the real one.
-                let (declare, priced_gas) = resolve_gas_limit(gas_arg, &run, tier, limits.as_ref())?;
+                let (declare, priced_gas) = resolve_gas_limit(gas_arg, &run, tier, limits.as_ref(), true)?;
                 let salt = executor::fresh_call_salt();
                 let (envelope, call_key) = if no_envelope {
                     (None, None)
@@ -1608,7 +1628,7 @@ async fn main() -> Result<()> {
                 (s, call_key)
             } else {
                 let run = executor::dry_run_call(&prog, &inputs, &public).map_err(|e| anyhow::anyhow!("the call does not run: {e}"))?;
-                let (declare, _) = resolve_gas_limit(gas_arg, &run, tier.unwrap_or(run.tier), limits.as_ref())?;
+                let (declare, _) = resolve_gas_limit(gas_arg, &run, tier.unwrap_or(run.tier), limits.as_ref(), matches!(backend, Backend::Cpu))?;
                 let t = std::time::Instant::now();
                 // Two provers, one difference: `prove_call` returns the `H_IN` salt as well, which is
                 // what the transcript is sealed with. It is CPU-only — every other backend draws that
@@ -2244,15 +2264,19 @@ async fn main() -> Result<()> {
                         obj.insert("sha256_log_height".to_string(), serde_json::json!(s));
                     }
                     // Spec §3.3, §9: a chain with a gas section prices the declared limit and its
-                    // node refuses an estimate without one (-32602); say so here instead.
-                    match gas {
-                        Some(g) => {
-                            obj.insert("gas".to_string(), serde_json::json!(g));
-                        }
-                        None if rpc.limits().await?.is_some_and(|l| l.gas_circuit) => anyhow::bail!(
-                            "this chain prices a call by the gas its proof declares: pass --gas <N> (`rand call` prints it before proving)"
+                    // node refuses an estimate without one (-32602); without `--gas` the wallet
+                    // sends the header's ceiling — what `rand call --gas-limit max` declares.
+                    let gas = match gas {
+                        Some(g) => Some(g),
+                        None => fee_call_default_gas(
+                            rpc.limits().await?.is_some_and(|l| l.gas_circuit),
+                            tier,
+                            keccak_log_height,
+                            sha256_log_height,
                         ),
-                        None => {}
+                    };
+                    if let Some(g) = gas {
+                        obj.insert("gas".to_string(), serde_json::json!(g));
                     }
                     spec
                 }
@@ -2290,6 +2314,52 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn section_limits() -> randprotocol_client::ChainLimits {
+        randprotocol_client::ChainLimits {
+            max_program_words: 4096,
+            max_proof_bytes: 2 << 20,
+            max_block_bytes: 4 << 20,
+            max_call_envelope_bytes: 18_432,
+            max_program_public_words: 64,
+            envelope_bytes: None,
+            hardening_v6: false,
+            gas_price: Some(100),
+            byte_price: Some(800),
+            gas_circuit: true,
+            bundle_gas_limit: Some(gas::gas_max(14, 0, 0)),
+            adjust_bps: None,
+        }
+    }
+
+    /// B5 review ruling (spec §9): `rand fee call <tier>` on a section chain without `--gas`
+    /// prices the header's ceiling instead of refusing; off a section nothing is sent.
+    #[test]
+    fn fee_call_without_gas_defaults_to_the_headers_ceiling_under_a_section() {
+        assert_eq!(fee_call_default_gas(true, 12, None, None), Some(gas::gas_max(12, 0, 0)));
+        assert_eq!(fee_call_default_gas(true, 14, None, None), Some(20_479));
+        // Heights given describe a hashing header: its ceiling, not the hash-free one.
+        assert_eq!(fee_call_default_gas(true, 14, Some(12), Some(13)), Some(gas::gas_max(14, 12, 13)));
+        // A tier past u8 clamps like the header rule does (gas_max clamps to 20).
+        assert_eq!(fee_call_default_gas(true, 1_000, None, None), Some(gas::gas_max(20, 0, 0)));
+        assert_eq!(fee_call_default_gas(false, 12, None, None), None, "no section: the node prices the header");
+    }
+
+    /// B5 review ruling: on a non-CPU backend (`--cuda`) the prover declares only the header's
+    /// ceiling, so the default under a section is `None` (the ceiling), not the bucket, and an
+    /// explicit limit is refused naming `--gas-limit max`.
+    #[test]
+    fn a_non_cpu_backend_declares_the_ceiling_and_refuses_an_explicit_limit() {
+        let run = executor::CallDryRun { gas: 700, tier: 10, keccak_log_height: 0, sha256_log_height: 0 };
+        let l = section_limits();
+        let ceiling = gas::gas_max(10, 0, 0);
+        assert_eq!(resolve_gas_limit(GasArg::Default, &run, 10, Some(&l), true).unwrap(), (Some(768), 768), "CPU: the bucket");
+        assert_eq!(resolve_gas_limit(GasArg::Default, &run, 10, Some(&l), false).unwrap(), (None, ceiling), "GPU: the ceiling");
+        assert_eq!(resolve_gas_limit(GasArg::Max, &run, 10, Some(&l), false).unwrap(), (None, ceiling));
+        let e = resolve_gas_limit(GasArg::Exactly(800), &run, 10, Some(&l), false).unwrap_err().to_string();
+        assert!(e.contains("--gas-limit max"), "{e}");
+        assert_eq!(resolve_gas_limit(GasArg::Exactly(800), &run, 10, Some(&l), true).unwrap(), (Some(800), 800));
+    }
 
     /// The four bridge-governance command lines parse under the names agreed with the bridge
     /// session (`docs/mainnet-launch.md` §5 in the bridge repo).
