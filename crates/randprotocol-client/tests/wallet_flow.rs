@@ -532,12 +532,15 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
 
     // ---- `token mint`: A mints its own supply against the authority key ----
     let supply = 1_000_000u64;
+    // The slot before the build, not after: `build_token_mint` stamps the note's `time` with the
+    // head height, and a wait for the slot behind other tests' proofs (~230 s each at constraint
+    // set 7 on a shared box) outran its window — "time 82 is outside [160, 416]" (v0.6.1 suite).
+    let slot = proving_slot().await;
     let row = wallet::find_token_row(&rpc, "1").await.unwrap();
     let mint_action = wallet::build_token_mint(&rpc, &a, CHAIN_ID, 1, &row, &a.address, supply, &authority)
         .await
         .expect("the authority mints against its own token");
     assert!(matches!(&mint_action, Action::TokenMint { asset: 1, amount: 1_000_000, nonce: 0, .. }));
-    let slot = proving_slot().await;
     let minted = wallet::submit_token_mint(&rpc, &a, &mut a_store, mint_action, gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the mint's bundle commits");
