@@ -137,7 +137,11 @@ async fn start_with(dir: &tempfile::TempDir, key: &Keypair, genesis: Genesis) ->
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
         prune_history: None,
-        gas_policy: None,
+        // Final review I2: the node runs the default gas policy (what `rand-node run` carries
+        // unless told `--gas-price 0 --byte-price 0`), so every real call proof in these flows is
+        // priced by the pool's `admission::call_floor` over its decoded header, and the wallet
+        // pays the policy floor it reads from `rand_getLimits`.
+        gas_policy: Some(randprotocol_core::gas::GasPolicy::DEFAULT),
     })
     .await
     .expect("node starts")
@@ -264,8 +268,11 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     let (envelope, key) = call_envelope::seal_call_envelope(&a.vk, None, &h_in, salt, &inputs, call_envelope::CallCaps::FALLBACK)
         .expect("the transcript seals");
     let header = randprotocol_zkvm::executor::decode_canonical(&proof).expect("the call proof decodes");
+    // The node's gas policy, as the wallet reads it: the call pays the policy floor of its header.
+    let limits = rpc.limits().await.unwrap().expect("this node reports its limits");
+    assert_eq!(limits.gas_policy(), Some(randprotocol_core::gas::GasPolicy::DEFAULT), "the node announces its policy");
     let fee = wallet::call_fee_default(
-        None,
+        Some(&limits),
         tier,
         header.keccak_log_height,
         header.sha256_log_height,
