@@ -1636,26 +1636,31 @@ impl Storage {
             // one whose record is gone, not a bundle, or already pruned.
             let current = self.sealed_by(&bundle_hash)?.is_some_and(|(_, at)| at == sealed_at);
             if current {
-                if let Some(TxRecord::Raw { height, index, tx }) = self.tx_record(&bundle_hash)? {
-                    if let Some(bundle) = &tx.bundle {
-                        let randprotocol_core::types::CoveredBundle { public_values, shape } = read(&bundle_hash, &bundle.proof)?;
-                        let proof_hash = Hash::digest(&bundle.proof);
-                        let mut pruned_tx = tx.clone();
-                        let mut marker = PRUNED_PROOF_MARKER.to_vec();
-                        marker.extend_from_slice(proof_hash.as_bytes());
-                        pruned_tx.bundle.as_mut().expect("checked above").proof = marker;
-                        let record = TxRecord::Pruned {
-                            height,
-                            index,
-                            tx_hash: bundle_hash,
-                            tx: pruned_tx,
-                            proof_hash,
-                            public_values: public_values.to_vec(),
-                            shape,
-                        };
-                        self.stage_pruned(&mut batch, &record)?;
-                        pruned += 1;
+                match self.tx_record(&bundle_hash)? {
+                    // Pruned by a build that left the block row raw: the row shrinks now.
+                    Some(record @ TxRecord::Pruned { .. }) => self.stage_pruned(&mut batch, &record)?,
+                    Some(TxRecord::Raw { height, index, tx }) => {
+                        if let Some(bundle) = &tx.bundle {
+                            let randprotocol_core::types::CoveredBundle { public_values, shape } = read(&bundle_hash, &bundle.proof)?;
+                            let proof_hash = Hash::digest(&bundle.proof);
+                            let mut pruned_tx = tx.clone();
+                            let mut marker = PRUNED_PROOF_MARKER.to_vec();
+                            marker.extend_from_slice(proof_hash.as_bytes());
+                            pruned_tx.bundle.as_mut().expect("checked above").proof = marker;
+                            let record = TxRecord::Pruned {
+                                height,
+                                index,
+                                tx_hash: bundle_hash,
+                                tx: pruned_tx,
+                                proof_hash,
+                                public_values: public_values.to_vec(),
+                                shape,
+                            };
+                            self.stage_pruned(&mut batch, &record)?;
+                            pruned += 1;
+                        }
                     }
+                    None => {}
                 }
             }
             self.db.write_opt(batch, &sync_opts())?;
@@ -1663,9 +1668,10 @@ impl Storage {
         Ok(pruned)
     }
 
-    /// Write one `Pruned` record over its raw one, with the proof-hash index entry beside it, in
-    /// one synced batch — the pruning pass's write, and the only way a `Pruned` record reaches
-    /// the store. `pub(crate)` so a test can store the pruned form of a stub-proved bundle, whose
+    /// Write one `Pruned` record over its raw one, with the proof-hash index entry beside it and
+    /// the block row shrunk to match ([`Storage::stage_pruned`]), in one synced batch — the
+    /// pruning pass's write, and the only way a `Pruned` record reaches the store besides a
+    /// sealed-form sync's commit. `pub(crate)` so a test can store the pruned form of a stub-proved bundle, whose
     /// proof the pass (which decodes a real one) cannot read.
     pub(crate) fn put_pruned(&self, record: &TxRecord) -> Result<()> {
         let mut batch = rocksdb::WriteBatch::default();
@@ -1675,13 +1681,40 @@ impl Storage {
     }
 
     /// [`Storage::put_pruned`]'s rows, staged into the caller's batch (the pruning pass writes
-    /// them with the index row it drops).
+    /// them with the index row it drops): the record, its proof-hash row, and — INTERFACE-9 —
+    /// the block row, whose transaction at the record's index becomes the record's marker form.
+    ///
+    /// The block row is the second stored copy of the transaction, and the one that carried the
+    /// ~1.3 MB proof after the record had dropped it. Rewritten, it is byte for byte the row a
+    /// block synced in sealed form is stored as (`commit`: "stored as served"), which every
+    /// reader already takes: `sealed_form_of` serves the record's form whichever row it finds;
+    /// `verify_chain` replays a marker through the record (INTERFACE-3); the deletes resolve it
+    /// through the proof-hash row. The block hash cannot move — the marker form hashes to the
+    /// raw hash, the proof entering the id by digest — and both halves are checked before the
+    /// row is written. A block row already gone (history pruning) leaves only the record.
     fn stage_pruned(&self, batch: &mut WriteBatch, record: &TxRecord) -> Result<()> {
-        let TxRecord::Pruned { tx_hash, proof_hash, .. } = record else {
+        let TxRecord::Pruned { height, index, tx_hash, tx, proof_hash, .. } = record else {
             return Err(StorageError::Corrupt("put_pruned takes a pruned record".into()));
         };
         batch.put_cf(self.cf(CF_TXS), tx_hash.as_bytes(), bincode::serialize(record)?);
         batch.put_cf(self.cf(CF_SEALS), [b"p".as_slice(), proof_hash.as_bytes()].concat(), bincode::serialize(tx_hash)?);
+        if let Some(mut block) = self.block_by_height(*height)? {
+            let slot = block.transactions.get_mut(*index as usize).ok_or_else(|| {
+                StorageError::Corrupt(format!("pruned record for {tx_hash} names index {index} past block {height}'s end"))
+            })?;
+            if slot.hash() != *tx_hash || tx.hash() != *tx_hash {
+                return Err(StorageError::Corrupt(format!(
+                    "pruned record for {tx_hash} does not match block {height}'s transaction {index}"
+                )));
+            }
+            if slot != tx {
+                *slot = tx.clone();
+                if !block.verify_tx_root() {
+                    return Err(StorageError::Corrupt(format!("block {height} does not keep its root in pruned form")));
+                }
+                batch.put_cf(self.cf(CF_BLOCKS), height_key(*height), block.encode());
+            }
+        }
         Ok(())
     }
 
@@ -1740,8 +1773,9 @@ impl Storage {
         batch.delete_cf(self.cf(CF_BLOCK_INDEX), hash.as_bytes());
         batch.delete_cf(self.cf(CF_SEALS), [b"b".as_slice(), hash.as_bytes()].concat());
         for tx in &block.transactions {
-            // A block served in sealed form carries a marker-form bundle whose record is keyed by
-            // the raw hash the 'p' row names; everything else is keyed by its own hash.
+            // A block stored in sealed form (synced so, or pruned here since INTERFACE-9) carries
+            // a marker-form bundle whose record is keyed by the raw hash the 'p' row names;
+            // everything else is keyed by its own hash.
             let key = match tx.bundle.as_ref().and_then(|b| randprotocol_core::notes::pruned_proof_hash(&b.proof)) {
                 Some(ph) => {
                     let pkey = [b"p".as_slice(), ph.as_bytes()].concat();
@@ -2698,8 +2732,10 @@ impl Storage {
                 // fields to the record's `OUT` words exactly as it did then (the interface
                 // review's INTERFACE-3: an empty table here refused every marker as a malformed
                 // proof, and the repair truncated the store below the first sealed-synced block
-                // at every restart). A block whose store raw proofs survive — a locally pruned
-                // one keeps its raw block row — carries no marker and needs no entry.
+                // at every restart). A block this node pruned itself is stored the same way since
+                // INTERFACE-9 (the pass shrinks the block row with the record), and replays here
+                // the same way; a block whose raw proofs survive carries no marker and needs no
+                // entry.
                 let mut pruned = Vec::new();
                 for tx in &block.transactions {
                     let Some(proof_hash) =
@@ -7254,5 +7290,85 @@ mod seal_tests {
         let b3 = make_block_unchecked(&b2, &ledger, vec![aggregate], &key(1));
         storage.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
         (dir, storage, gs, covered, ledger)
+    }
+
+    /// INTERFACE-9 (issue #51), the second copy: the pruning pass rewrote a sealed bundle's
+    /// `CF_TXS` record to the pruned form and left the same transaction, raw ~1.3 MB proof and
+    /// all, in its block's `CF_BLOCKS` row — so the disk the pass exists to give back stayed
+    /// spent. The block row must shrink with the record, to exactly the form a block synced in
+    /// sealed form is stored in (the marker where the proof was, every other transaction as it
+    /// was), under the same block hash; and the startup replay, which then meets the marker,
+    /// must still verify the block — through the pruned branch, bound to the record.
+    #[test]
+    fn a_pruned_bundle_shrinks_its_block_row_too_and_the_startup_replay_still_verifies() {
+        let (_d, storage, gs, txs, ledger) = block_of_stub_bundles(2);
+        let before = storage.block_by_height(1).unwrap().unwrap();
+        storage.mark_sealed(txs[0].hash(), Hash::digest(b"the covering aggregate"), 2).unwrap();
+        assert_eq!(storage.prune_sealed_with(6, 4, u64::MAX, &stub_proof_reader(&txs)).unwrap(), 1);
+
+        let after = storage.block_by_height(1).unwrap().unwrap();
+        let Some(TxRecord::Pruned { tx: pruned_tx, .. }) = storage.tx_record(&txs[0].hash()).unwrap() else {
+            panic!("the record is pruned")
+        };
+        let proof = &after.transactions[0].bundle.as_ref().unwrap().proof;
+        assert!(proof.starts_with(PRUNED_PROOF_MARKER), "the block row carries the marker, not the raw proof");
+        assert_eq!(proof.len(), PRUNED_PROOF_MARKER.len() + 32);
+        assert_eq!(after.transactions[0], pruned_tx, "the block row and the record hold one form");
+        assert_eq!(after.transactions[1], txs[1], "the unsealed bundle keeps its raw proof");
+        assert_eq!(after.hash(), before.hash(), "the same block");
+        assert!(after.verify_tx_root(), "under the same certified root");
+        assert_eq!(storage.block_by_hash(&before.hash()).unwrap(), Some(after.clone()));
+
+        // The replay meets the marker and verifies it through the record, to the same state.
+        let check = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!((check.problem, check.last_good), (None, 1));
+        assert_eq!(check.ledger.state_root(), ledger.state_root());
+        // It really is the pruned branch: a record vouching for another digest fails the block.
+        let Some(TxRecord::Pruned { height, index, tx_hash, tx, proof_hash, mut public_values, shape }) =
+            storage.tx_record(&txs[0].hash()).unwrap()
+        else {
+            unreachable!()
+        };
+        public_values[randprotocol_core::types::pv::OUT0] ^= 1;
+        storage.put_pruned(&TxRecord::Pruned { height, index, tx_hash, tx, proof_hash, public_values, shape }).unwrap();
+        let check = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(check.last_good, 0);
+        assert!(check.problem.as_deref().is_some_and(|p| p.starts_with("block 1 does not apply")), "{:?}", check.problem);
+    }
+
+    /// A store whose records an older build pruned kept their raw block rows; the next pass that
+    /// reaches their marks (the height index is backfilled at open) shrinks those rows too,
+    /// rewriting nothing else.
+    #[test]
+    fn a_block_row_left_raw_behind_a_pruned_record_shrinks_on_the_next_pass() {
+        let (_d, storage, gs, txs, ledger) = block_of_stub_bundles(1);
+        let facts = stub_pruned_facts(&txs[0]);
+        let proof_hash = Hash::digest(&txs[0].bundle.as_ref().unwrap().proof);
+        let mut marker_tx = txs[0].clone();
+        marker_tx.bundle.as_mut().unwrap().proof = [PRUNED_PROOF_MARKER, proof_hash.as_bytes().as_slice()].concat();
+        // The older pass's write: the record and the proof-hash row, the block row untouched.
+        let record = TxRecord::Pruned {
+            height: 1,
+            index: 0,
+            tx_hash: txs[0].hash(),
+            tx: marker_tx.clone(),
+            proof_hash,
+            public_values: facts.public_values.to_vec(),
+            shape: facts.shape,
+        };
+        storage.db.put_cf(storage.cf(CF_TXS), txs[0].hash().as_bytes(), bincode::serialize(&record).unwrap()).unwrap();
+        storage
+            .db
+            .put_cf(storage.cf(CF_SEALS), [b"p".as_slice(), proof_hash.as_bytes()].concat(), bincode::serialize(&txs[0].hash()).unwrap())
+            .unwrap();
+        storage.mark_sealed(txs[0].hash(), Hash::digest(b"the covering aggregate"), 2).unwrap();
+        assert_eq!(storage.block_by_height(1).unwrap().unwrap().transactions[0], txs[0], "raw behind the pruned record");
+
+        assert_eq!(storage.prune_sealed_with(6, 4, u64::MAX, &stub_proof_reader(&txs)).unwrap(), 0, "no record to rewrite");
+        assert_eq!(storage.block_by_height(1).unwrap().unwrap().transactions[0], marker_tx, "the block row shrank");
+        assert_eq!(storage.tx_record(&txs[0].hash()).unwrap(), Some(record));
+        let check = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!((check.problem, check.last_good), (None, 1));
+        assert_eq!(check.ledger.state_root(), ledger.state_root());
     }
 }

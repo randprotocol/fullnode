@@ -260,6 +260,58 @@ The fixes, each with its node-lib regression test:
   stall costs the chain. A send that cannot go out warns, counts, and tries the next
   candidate. Pinned by `pick_sync_peer_prefers_fresh_and_falls_back_to_any_connected`.
 
+### What pruning shrinks, and how much work a pass does (INTERFACE-9, issue #51)
+
+A committed transaction is stored twice: inside its block's `CF_BLOCKS` row, and as its own
+`CF_TXS` record. Until issue #51 the pruning pass rewrote only the record, so the block row kept
+the raw ~1.3 MB proof and the disk §6.2 promises back never came back; and the pass found its
+work by walking every seal mark the store had ever written, every 16 blocks, for ever. Both are
+fixed node-side (no consensus, wire or genesis change; dormant while no chain carries an
+`aggregation` section):
+
+- **The block row shrinks with the record, in the same synced batch** (`Storage::stage_pruned`):
+  the transaction at the record's index becomes the record's marker form. That is exactly the
+  row a block synced in sealed form has always been stored as (`commit` stores a block "as
+  served"), so no reader meets anything new, and both copies now hold one form:
+  - *Serving* never used the raw row for a pruned bundle — `sealed_form_of` serves the record's
+    marker form and side entry whichever row it finds — so a `Blocks` response is byte for byte
+    what it was, and coverage-closed serving (`close_batch_coverage`, above) reads only the
+    seal marks. What the raw row could have offered, a raw proof to a syncer whose fallback
+    wants one, this node never served; that fallback was and is an archive's job
+    (`--keep-raw-proofs`, which never runs the pass).
+  - *The startup replay* meets the marker and applies the block through the pruned branch
+    with the side table rebuilt from the records (INTERFACE-3, the sealed-synced path): each
+    bundle's public fields are bound to its record's `OUT` and `H_PUB` words, and the covering
+    aggregate's block, replayed after it, verifies the rVM proof over those same records. That
+    is the soundness a sealed-synced node already rests on, and the one §6.2 prunes for: once a
+    window has passed its seal, the aggregate — not the bundle's own STARK — is the proof.
+  - *The block hash cannot move*: the marker form hashes to the raw hash (the proof enters the
+    id by digest, `rand-txid-2`), and the write refuses unless the slot's hash, the record's
+    hash and the block's tx root all still agree.
+  - Visible changes: `rand_getBlockByHeight`/`ByHash` report a pruned bundle's `proof_len` as the
+    marker's 44 bytes, as `rand_getTransaction` already did off the record; a by-hash block fetch
+    of such a block returns the marker form, as a sealed-synced node's always has — by-hash
+    fetches serve pending and recently committed blocks, never history a window past its seal.
+- **A height index for the pass**: `CF_SEALS` rows `h ‖ sealed_at (BE) ‖ bundle`, written with
+  every seal mark. The pass walks them from the lowest `sealed_at`, stops at the first still in
+  its window, deletes each row it handles, and handles at most `PRUNE_SEALED_PASS_MAX` (64) a
+  pass — steady state is 16 × `max_covers`, so the cap only paces a backlog. Its work is what came
+  due since the last pass, never the sealed history. History pruning and truncation drop a
+  mark's index row with the mark.
+- **Upgrade**: a store sealed by an older build is indexed once at open (`seal_heights_built`);
+  the next passes then also shrink the block rows an older pass left raw behind already-pruned
+  records. An older build ignores `h` rows and replays marker rows (INTERFACE-3), so a rollback
+  needs nothing.
+
+Pinned by `the_sealed_pruning_pass_visits_only_the_marks_whose_window_passed_once`,
+`the_sealed_pruning_pass_drains_a_backlog_a_bounded_step_at_a_time`,
+`a_store_sealed_before_the_height_index_gets_it_at_open`,
+`history_pruning_and_truncation_drop_the_height_index_rows`,
+`a_pruned_bundle_shrinks_its_block_row_too_and_the_startup_replay_still_verifies`,
+`a_block_row_left_raw_behind_a_pruned_record_shrinks_on_the_next_pass` (`storage.rs`) and
+`a_block_row_this_node_pruned_serves_coverage_closed_like_a_sealed_synced_one` (`node.rs`) — all
+stub-proved, so they run without a recursion fixture.
+
 ### The fleet bundle's declared shape
 
 The admitted shape chain 9 registers is the fleet's own measured classes for a 2-in/2-out
