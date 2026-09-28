@@ -100,8 +100,8 @@ stage)
   echo "== stage $TAG on $(echo $ALL | wc -w) hosts from $RELEASE_URL $(date -u +%T)"
   # Each host fetches the release itself and checks both pins; a mismatch deletes what it fetched.
   each "set -e; cd /root
-    curl -fsSL --retry 3 -o rand-node.c17 '$RELEASE_URL/rand-node'
-    curl -fsSL --retry 3 -o rand.c17 '$RELEASE_URL/rand'
+    curl -fsSL --retry 10 --retry-all-errors --retry-delay 5 -o rand-node.c17 '$RELEASE_URL/rand-node'
+    curl -fsSL --retry 10 --retry-all-errors --retry-delay 5 -o rand.c17 '$RELEASE_URL/rand'
     if ! echo '$WANT_SHA  rand-node.c17' | sha256sum -c --quiet || ! echo '$WANT_SHA_WALLET  rand.c17' | sha256sum -c --quiet; then
       rm -f rand-node.c17 rand.c17; echo 'SHA MISMATCH — removed'; exit 1; fi
     chmod 755 rand-node.c17 rand.c17
