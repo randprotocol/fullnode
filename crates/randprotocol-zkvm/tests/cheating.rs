@@ -1861,7 +1861,7 @@ fn a_nonzero_keccak_height_below_one_block_is_rejected_before_any_verifier_key_i
     let p = guests::keccak_demo(b"hi");
     // Constraint set 8: lowering `keccak_log_height` also lowers this header's own gas ceiling
     // (`gas::gas_max`), so the proof declares, honestly — the `HALT` row's limbs match it — a limit
-    // the tampered header still admits: `gas_max(Tier(10), 3, 0)` (= the hash-free ceiling, 1 023;
+    // the tampered header still admits: `gas_max(Tier(10), 3, 0)` (= the hash-free ceiling, 1 279;
     // a 3 is below one block and buys no keccak weight). The height is then the only lie, and the
     // `KeccakHeight` refusal below is what names it.
     let limit = randprotocol_zkvm::gas::gas_max(Tier(10), 3, 0);
@@ -3276,12 +3276,23 @@ fn any_balanced_blinds_verify() {
 /// the real proof must then be refused.
 #[test]
 fn a_keccak_row_that_pays_one_gas_is_refused() {
-    use common::{eval_boundary, symbolic_air, Rows};
     let (m, p, mut t) = setup_keccak();
+    let k = keccak_row(&t);
+    assert_eq!(underpay_gas_from(&mut t, k, 191), vec![(k - 1, 1)], "only the GAS transition into the KECCAK row breaks");
+    assert!(rejects(|| m.verify(&p.digest(), &m.prove_traces(&p, &t, Tier(10)))));
+}
+
+/// The trace-forgery shape the cs8 cheating tests share: lower `GAS` by `by` on every row from
+/// `from` on (so the chain is consistent everywhere but on the transition into `from`, or on
+/// row 0's boundary when `from == 0`), re-derive the `HALT` row's four limbs for the lowered total
+/// and move their `RANGE8` multiplicities to match — so the halt-row equation and the range bus
+/// hold too. Returns the `(row, count)` of every cpu constraint the forged trace breaks,
+/// evaluated symbolically, so each test can pin that it breaks exactly the one it targets.
+fn underpay_gas_from(t: &mut Traces, from: usize, by: u64) -> Vec<(usize, usize)> {
+    use common::{eval_boundary, symbolic_air, Rows};
     let w = cpu::col::WIDTH;
     let rows = t.cpu.height();
-    let k = keccak_row(&t);
-    for r in k..rows { t.cpu.values[r * w + cpu::col::GAS] -= F::from_u64(191); }
+    for r in from..rows { t.cpu.values[r * w + cpu::col::GAS] -= F::from_u64(by); }
     let halt = (0..rows).find(|&r| t.cpu.values[r * w + cpu::col::SYS_HALT] == F::ONE).unwrap();
     let diff = (t.public_values[cpu::pv::GAS] - t.cpu.values[halt * w + cpu::col::GAS]).as_canonical_u64();
     assert!(diff < 1 << 32);
@@ -3292,9 +3303,8 @@ fn a_keccak_row_that_pays_one_gas_is_refused() {
         t.cpu.values[halt * w + cpu::col::GD0 + j] = F::from_u32(new);
         edits.push((old, new));
     }
-    shift_range8(&mut t, &edits);
+    shift_range8(t, &edits);
 
-    // Symbolically: exactly one cpu constraint fails, on exactly the transition into row `k`.
     let (_, cons) = symbolic_air(&cpu::CpuAir);
     let row = |r: usize| t.cpu.values[(r % rows) * w..(r % rows) * w + w].to_vec();
     let mut failing = Vec::new();
@@ -3303,7 +3313,35 @@ fn a_keccak_row_that_pays_one_gas_is_refused() {
         let n = cons.iter().filter(|c| eval_boundary(c, &pair, r == 0, r == rows - 1) != F::ZERO).count();
         if n > 0 { failing.push((r, n)); }
     }
-    assert_eq!(failing, vec![(k - 1, 1)], "only the GAS transition into the KECCAK row breaks");
+    failing
+}
 
+/// Final review (cs8), the `SHA256` twin: a `SYS_SHA256` row that pays one gas instead of 64.
+#[test]
+fn a_sha256_row_that_pays_one_gas_is_refused() {
+    let (m, p, mut t) = setup_sha256();
+    let w = cpu::col::WIDTH;
+    let k = (0..t.cpu.height()).find(|&r| t.cpu.values[r * w + cpu::col::SYS_SHA256] == F::ONE).expect("a SYS_SHA256 row");
+    assert_eq!(underpay_gas_from(&mut t, k, 63), vec![(k - 1, 1)], "only the GAS transition into the SHA256 row breaks");
+    assert!(rejects(|| m.verify(&p.digest(), &m.prove_traces(&p, &t, Tier(10)))));
+}
+
+/// Final review (cs8), the `POSEIDON2` twin: an `IS_HASH` absorb row that pays one gas instead
+/// of three (its permutation's +2 dropped).
+#[test]
+fn a_poseidon2_absorb_row_that_pays_one_gas_is_refused() {
+    let (m, p, mut t) = setup_poseidon2(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let (_, absorbs, _) = hash_rows(&t);
+    let k = absorbs[0];
+    assert_eq!(underpay_gas_from(&mut t, k, 2), vec![(k - 1, 1)], "only the GAS transition into the absorb row breaks");
+    assert!(rejects(|| m.verify(&p.digest(), &m.prove_traces(&p, &t, Tier(10)))));
+}
+
+/// Final review (cs8): row 0 starts the chain at `GAS = 0` instead of 1 — every row one short, so
+/// every transition holds and only the first-row boundary `GAS = 1` stands in the way.
+#[test]
+fn a_first_row_gas_of_zero_is_refused() {
+    let (m, p, mut t) = setup();
+    assert_eq!(underpay_gas_from(&mut t, 0, 1), vec![(0, 1)], "only the first-row GAS boundary breaks");
     assert!(rejects(|| m.verify(&p.digest(), &m.prove_traces(&p, &t, Tier(10)))));
 }

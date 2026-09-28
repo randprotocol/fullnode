@@ -12,11 +12,74 @@ fn the_public_value_layout_gains_gas_limit_last() {
 
 #[test]
 fn gas_max_is_the_headers_ceiling() {
-    assert_eq!(gas_max(Tier(10), 0, 0), 1_023);
-    assert_eq!(gas_max(Tier(10), 5, 0), 1_023 + 191);
-    assert_eq!(gas_max(Tier(10), 0, 6), 1_023 + 63);
-    assert_eq!(gas_max(Tier(14), 12, 13), 16_383 + 128 * 191 + 128 * 63);
-    assert_eq!(gas_max(Tier(20), 20, 20), 1_048_575 + 32_768 * 191 + 16_384 * 63);
+    // Cycles `2^t − 1`, plus `2^(t−2)` for the absorb rows' permutations (at most `2^(t−3)`
+    // poseidon2 slots, +2 each), plus the declared hash tables' blocks.
+    assert_eq!(gas_max(Tier(10), 0, 0), 1_279);
+    assert_eq!(gas_max(Tier(10), 5, 0), 1_279 + 191);
+    assert_eq!(gas_max(Tier(10), 0, 6), 1_279 + 63);
+    assert_eq!(gas_max(Tier(14), 0, 0), 20_479);
+    assert_eq!(gas_max(Tier(14), 12, 13), 20_479 + 128 * 191 + 128 * 63);
+    assert_eq!(gas_max(Tier(20), 20, 20), 1_048_575 + 262_144 + 32_768 * 191 + 16_384 * 63);
+}
+
+/// Final review, item 1: the probe — ten `POSEIDON2` calls over 12 words (30 absorb rows) and a
+/// filler loop. Its run fits tier 10's cycle and permutation budgets, so the auto-tier picks
+/// tier 10, yet its gas passes the old ceiling `2^10 − 1 = 1 023` (the absorb rows' +2 was not
+/// in it): the default proof was refused `GasLimitBelowRun` with no limit that made it provable.
+fn poseidon2_probe(loops: i32) -> randprotocol_zkvm::isa::Program {
+    use randprotocol_zkvm::asm::{ops::*, Assembler};
+    use randprotocol_zkvm::isa::BranchCond;
+    const S0: u32 = 8; const T0: u32 = 5; const T2: u32 = 7;
+    let mut a = Assembler::new(0);
+    a.extend(li(S0, 0x1000));
+    for i in 0..12 { a.extend(li(T0, i + 1)); a.push(sw(S0, T0, 4 * i)); }
+    for _ in 0..10 { a.extend(call_poseidon2(0x1000 / 4, 12)); }
+    a.extend(li(T2, loops));
+    a.label("fill");
+    a.push(addi(T2, T2, -1));
+    a.branch(BranchCond::Ne, T2, 0, "fill");
+    a.extend(halt());
+    a.assemble()
+}
+
+#[test]
+fn a_run_past_the_cycle_budget_in_gas_proves_at_its_tier() {
+    use randprotocol_zkvm::emulator::{execute, HashRow};
+    use randprotocol_zkvm::gas::gas_of;
+    use randprotocol_zkvm::machine::{FriProfile, Machine};
+    let p = poseidon2_probe(PROBE_LOOPS);
+    let e = execute(&p, &[], &[], 100_000).unwrap();
+    let absorbs = e.events.iter().filter(|ev| matches!(ev.hash_row, Some(HashRow::Absorb { .. }))).count();
+    assert_eq!(absorbs, 30, "ten 12-word messages at rate 4");
+    let gas = gas_of(&p, &[], &[], &e.events);
+    assert!(gas > 1_023, "the probe's gas {gas} must pass the old ceiling");
+    let m = Machine::new(FriProfile::Test);
+    let (proof, _) = m.prove(&p, &[], &[], None).expect("the probe proves at its auto tier");
+    assert_eq!(proof.tier, Tier(10));
+    assert_eq!(proof.public_values[pv::GAS], gas_max(Tier(10), proof.keccak_log_height, proof.sha256_log_height));
+    assert!(proof.public_values[pv::GAS] >= gas);
+    assert!(m.verify(&p.digest(), &proof).is_ok());
+}
+/// 998 cycles + 18 program-digest rows (≤ tier 10's 1 023), gas 1 078.
+const PROBE_LOOPS: i32 = 440;
+
+/// Final review, item 2: `gas_max` clamps the tier to `[10, 20]` before shifting, so an untrusted
+/// header's absurd tier neither panics (debug) nor wraps the shift (release).
+#[test]
+fn gas_max_clamps_an_absurd_tier() {
+    assert_eq!(gas_max(Tier(200), 0, 0), gas_max(Tier(20), 0, 0));
+    assert_eq!(gas_max(Tier(usize::MAX), 0, 0), gas_max(Tier(20), 0, 0));
+    assert_eq!(gas_max(Tier(0), 0, 0), gas_max(Tier(10), 0, 0));
+}
+
+/// Final review, item 2: a real proof whose `tier` and `pv::TIER` both say 200 (the review's probe
+/// shape) is refused by `check_public_values` as a tier, not a panic in the gas check's shift.
+#[test]
+fn check_public_values_refuses_an_absurd_tier() {
+    let (p, mut proof) = common::fib_proof_tier_10();
+    proof.tier = Tier(200);
+    proof.public_values[pv::TIER] = 200;
+    assert_eq!(check_public_values(&p.digest(), &proof), Err(VerifyError::Tier));
 }
 
 /// Review focus 3: a limit past the header's ceiling is refused natively, before any key.

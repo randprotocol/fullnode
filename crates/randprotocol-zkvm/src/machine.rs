@@ -620,11 +620,11 @@ pub enum ProveError {
     PcWindow { base_pc: u32, log_height: u8 },
     /// Constraint set 8: the requested gas limit is below what this run spends (`gas::gas_of`) —
     /// the `HALT` row's `GD0..3` limbs cannot represent a negative slack, so no trace built with
-    /// it could verify. Refused before any trace is built.
+    /// it could verify. Refused before the cpu trace is built.
     GasLimitBelowRun { gas: u64, limit: u64 },
     /// Constraint set 8: the requested gas limit is above this proof's own header ceiling
     /// (`gas::gas_max(tier, keccak_log_height, sha256_log_height)`), which `check_public_values`
-    /// refuses. Refused before any trace is built.
+    /// refuses. Refused before the cpu trace is built.
     GasLimitAboveHeader { limit: u64, max: u64 },
 }
 #[derive(Debug, PartialEq)]
@@ -712,6 +712,9 @@ pub fn check_public_values(hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyErr
         if proof.public_values[pv::HC0 + i] != hc[i] as u64 { return Err(VerifyError::PublicValues); }
     }
     if proof.public_values[pv::TIER] != proof.tier.0 as u64 { return Err(VerifyError::Tier); }
+    // An untrusted tier outside `TIERS` is refused here too, before the gas check reads it (the
+    // same guard `check_declared_heights` runs; `gas_max` clamps regardless).
+    if !TIERS.contains(&proof.tier.0) { return Err(VerifyError::Tier); }
     // Constraint set 8: the declared gas limit is canonical (checked above) and never past what
     // the header itself allows — a larger value could only be a mispriced header.
     if proof.public_values[pv::GAS] > crate::gas::gas_max(proof.tier, proof.keccak_log_height, proof.sha256_log_height) {
@@ -936,7 +939,7 @@ pub struct ProveOptions {
     /// cs8: the `GAS_LIMIT` to declare; `None` = `gas::gas_max(header)` (spec §5: leaks nothing
     /// new — every verifier already learns the tier and both hash-table heights from the header,
     /// and the default limit is a pure function of those). Must lie in `[gas::gas_of(run),
-    /// gas::gas_max(header)]` or `build_traces_inner` refuses before any trace is built
+    /// gas::gas_max(header)]` or `build_traces_inner` refuses before the cpu trace is built
     /// (`ProveError::GasLimitBelowRun`/`GasLimitAboveHeader`).
     ///
     /// HCS-3's `pad_absent_hash_tables` above changes what the *default* limit is, not just what
@@ -953,7 +956,7 @@ pub struct ProveOptions {
 
 /// Constraint set 8: `gas_limit` is the proof's declared `pv::GAS`, and must lie in
 /// `[gas::gas_of(run), gas::gas_max(header)]` — `ProveError::GasLimitBelowRun` /
-/// `GasLimitAboveHeader` otherwise, before any trace is built. A caller with no better value
+/// `GasLimitAboveHeader` otherwise, before the cpu trace is built. A caller with no better value
 /// passes the header's ceiling; [`build_traces_salted_with`] does exactly that.
 pub fn build_traces_salted(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 4], exec: &Execution, tier: Tier, gas_limit: u64) -> Result<Traces, ProveError> {
     build_traces_inner(program, inputs, public, salt, exec, tier, ProveOptions::default(), Some(gas_limit))

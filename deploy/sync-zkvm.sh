@@ -170,6 +170,10 @@
 # The recursion section at `f95a1ce` is byte-identical to `b9ffc39`'s; the rVM's own cs8 re-pin
 # landed at `6d4f124` (the 35-word-per-proof aggregate interface and the staged-absorb sponge fix;
 # the research section is unchanged since `f95a1ce`) and is vendored by the recursion section below.
+# Then at `18c2627` (the cs8 final review): `gas::gas_max` gains the Poseidon2 absorb term
+# `2^(t−2)` (tier-14 hash-free ceiling 16 383 → 20 479, tier 10 1 023 → 1 279), the tier is clamped
+# and `check_public_values` refuses a tier outside `TIERS`; sister GAS cheating tests. The rVM is
+# unchanged; only its fixture cache's GAS values (so the stub interface list and digest) moved.
 #
 # The CUDA backend is *not* vendored either: crates/randprotocol-zkvm depends on it by path, as
 # ../../../circuits/rand-zkvm-cuda, so `circuits` must be checked out beside `fullnode` when building
@@ -354,7 +358,8 @@ echo "reminder: --features cuda / mock-cuda need circuits checked out at ../../.
 # new inner vk / interface digests — the aggregate program digest DOES move here), then at
 # `6d4f124` (constraint set 8: the interface carries 35 public values a proof, `pv::GAS` the 35th;
 # `dsl::hash::absorb_staged` defers each permutation so a list ending on a block boundary digests
-# right; aggregate program digest `66a8094f…` → `1831f036…`). Re-vendoring the rVM alone is this section alone: the research
+# right; aggregate program digest `66a8094f…` → `1831f036…`), then at `18c2627` (byte-identical;
+# the regenerated cache moves the interface digest `36b414c0…` → `5e3d7fb2…`). Re-vendoring the rVM alone is this section alone: the research
 # section above rewrites `guests-compiled/PROVENANCE.md` and would carry research's older drift. Two vendored files carry hand fixes this
 # section does not reproduce — keep them when re-syncing: `Cargo.toml`'s `license.workspace`
 # line and `tests/backend.rs`'s doc comment (`randprotocol-zkvm`, not the old crate name). What the
@@ -428,4 +433,4 @@ open(p, 'w').write(s)
 PY
 grep -rl "recursion::" "$RVM_DST/tests" | xargs -I{} sed -i '' 's/recursion::/randprotocol_rvm::/g' {} 2>/dev/null || true
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 6d4f124) into $RVM_DST"
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 18c2627) into $RVM_DST"
