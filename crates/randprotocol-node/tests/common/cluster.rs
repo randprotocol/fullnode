@@ -131,6 +131,7 @@ pub async fn start_in_pruned(
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
         prune_history,
+        gas_policy: None,
     })
     .await
     .expect("node starts");

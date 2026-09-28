@@ -138,6 +138,7 @@ async fn start_one_validator_with(
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
         prune_history: None,
+        gas_policy: None,
     })
     .await
     .expect("node starts");

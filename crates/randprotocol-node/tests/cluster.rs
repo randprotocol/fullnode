@@ -643,6 +643,7 @@ async fn a_build_whose_bundle_guest_differs_from_genesis_refuses_to_start() {
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
         prune_history: None,
+        gas_policy: None,
     })
     .await;
     // `NodeHandle` is not `Debug`, so unwrap the error by hand rather than via `expect_err`.
