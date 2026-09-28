@@ -6,6 +6,39 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-28)
 
+### v0.6.1 — constraint set 7 (2026-09-28, branch `feat/v061`; NOT tagged, NOT rolled)
+
+circuits `feat/cs7` at **`b9ffc39`** re-vendored by `deploy/sync-zkvm.sh` (CI `CIRCUITS_PIN` =
+PROVENANCE.md = `b9ffc39`). **A hard fork: v0.6.1 runs ONLY on a new genesis — chain 16.** Every
+verifier key, the AIR and the rVM's programs changed, so no chain-14/15 proof verifies on it; the
+node refuses both genesis hashes at `run` and `verify` (`node::PRE_CONSTRAINT_SET_7_CHAINS`), chains
+≤ 13 by their retired `hc_bundle`. **Keep chain 15 on v0.6** until the chain-16 cut
+(`deploy/cut-chain16-genesis.sh`, `--bundle-guest v2 --hardening-v6`).
+
+- **What cs7 is:** every LogUp terminal blinded (`BLIND` bus, five appended columns, `F_{p²}` blinds)
+  and **every declared table floored at 2^7** (program/input/public `MIN_LOG_HEIGHT` 7, keccak/sha256
+  ≥ 7) — INT-2 / GV-1; verifier keys salted from `key_derivation_v2` (HCS-1); 32-bit range checks on
+  input/public words and salt lanes (ZKM-1/ZKH-2); `POSEIDON2_LEN` syscall 7 (HCS-4); JALR bit 0
+  cleared + funct3 = 0 (ISA-4); guest-sdk arrays / unsafe poseidon2 (R4-b); the pc window on the
+  prover and in `Machine::verify` (#53); LRU single-flight key cache (#54); rVM in-circuit VERIFIER-1
+  and every chip's writes bound (#58).
+- **Pins (all measured on the testbox, 2026-09-28):** `hc_bundle` **unchanged** — v1 `83d3a370…0ef8`,
+  v2 `651043e2…839b` (`POSEIDON2` and the program digest did not move). `BUNDLE_PUBLIC_LOG_HEIGHT`
+  4 → **7** (the binding and the empty segment now declare the same height; a pre-binding bundle proof
+  is refused at `verify_bundle`, `PublicValues`, not on its header). `program_table_rows` floors at 128.
+  Admission stub vectors: inner vk digest `ee072b7a…fbe`, interface digest `6059c52a…a6ee` (on the cs7
+  fixture cache `/root/recursion-fixtures-cs7`). Production proofs: bundle v1 **1 498 821 B**, v2
+  **1 497 156 B** (tier 14); fib tier 10 1 367 688 / tier 12 1 424 299; keccak tier 10 3 283 898 —
+  **`MAX_PROOF_BYTES` stays 2 MiB**. `MAX_CALL_TIER` 14 and the DS-3 hash-table caps (12/13) unchanged:
+  the worst admissible call header's key (tier 14, 16/16/12/13/15) builds in 11.6 s / 295 MB peak against a
+  base tier-14 shape's 8.6 s / 220 MB on the loaded testbox — cs6's ratio (4.7 s vs 3.9 s, laptop), memory flat.
+- **Trap — proving got slower:** a Test-profile bundle proof took ~230 s on the testbox (shared with the
+  circuits suite). Three tests read the head height *before* waiting for the proving slot and outran
+  the bundle window (`wallet_flow`'s token mint, both `bridge_mint` helpers); take the slot first.
+- **Vendoring:** `tests/{evm,sbpf}_rt.rs` are now excluded by the script (they test circuits' sibling
+  `evm-rt`/`sbpf-rt` crates by `research/`-relative paths); `evm-core` is a dev-dependency again with
+  its `ffi` feature for `tests/evm_abi.rs`. `ledger.rs`'s RAND comments are restored after each rsync.
+
 ### v0.6 — the zkVM / rVM / aggregation fixes and the v0.6 hardening (2026-09-28; roll status below)
 
 **TAGGED v0.6 = 12a56d1 and ROLLED 2026-09-28 23:36–23:46 UTC, all-stop / all-start** (`rand-node` sha256

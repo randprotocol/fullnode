@@ -21,12 +21,14 @@ Plonky3 batch STARK over Goldilocks with Poseidon2 hashing and ZK-hiding FRI. Ni
 tables (program, cpu, memory, alu, range, nibble, poseidon2, input, public — `input` added in
 constraint set 4, `public` in constraint set 6, below), plus a `keccak` and a `sha256` table a
 proof carries only when its guest called the matching syscall (sets 5 and 6), connected by
-LogUp/permutation buses. Seven syscalls: `read_input(i)` (private input word, bound since
+LogUp/permutation buses, every LogUp terminal blinded and every table at least 2^7 rows since
+constraint set 7. Eight syscalls: `read_input(i)` (private input word, bound since
 constraint set 4 to a salted commitment `H_IN`), `write_output(slot, word)` (one of eight
 public outputs), `poseidon2(ptr, n)` (in-place hash of `n` words), `keccak(ptr)` (one in-place
 Keccak-f[1600] permutation, constraint set 5), `sha256(ptr)` (one in-place SHA-256 compression,
 arrived with constraint set 6's re-vendor), `read_public(i)` (public input word, bound to the
-unsalted `H_PUB`, constraint set 6), `halt`.
+unsalted `H_PUB`, constraint set 6), `poseidon2_len(ptr, n)` (the length-bound sponge,
+constraint set 7), `halt`.
 
 Gas tiers pad the execution trace: tier `t` (10, 12, ..., 20) proves up to `2^t - 1` cycles and the
 proof reveals only the tier, never the real cycle count. Production FRI profile: blowup 8, **80
@@ -39,6 +41,8 @@ first (uncached) verify 16 ms. At constraint set 5 the proof is ~1 202 416 bytes
 verify ~233 ms, with prove time unchanged within noise — the query count moves bytes, not work.
 Constraint set 6's mandatory public table and wider cpu table add a few percent to those bytes
 (see "Constraint set 6" below for the measured deltas); prove and verify are unchanged in kind.
+Constraint set 7's blinding columns and 2^7 floors take tier 10 to 1 367 688 bytes (see
+"Constraint set 7").
 The verifier key itself is what a cached verify amortizes away; see "Constraint set 3" and
 "Constraint set 5" below for the full before/after.
 
@@ -361,6 +365,56 @@ constraint sets 2–5 already documented: a node built from this commit will fai
 replay of any chain with a confidential call proved under an older constraint set and truncate
 its chain. Start a new chain id, or run `--verify-chain off` on nodes that must keep serving an
 old chain. A fleet must run one build.
+
+**Constraint set 7 (2026-09-28, circuits `b9ffc39`: fullnode v0.6.1, chain 16 only).** The
+vendored zkVM and rVM were re-synced to circuits `feat/cs7`, which carries every verifier-key-moving
+fix the v0.6 review deferred to the next cut. The headline changes:
+
+- **Every LogUp terminal is blinded, and every declared table is floored at 2^7 rows** (INT-2 /
+  GV-1). Each table's published running-sum terminal was a checkable function of its trace (a
+  call's private words, which bundle slots are real). Every instance now carries five appended
+  columns on a new `BLIND` bus (`tables/blind.rs`): the honest prover moves each terminal by a
+  uniform `F_{p²}` element while their sum stays zero. Because a table's running-sum columns are
+  opened like its main columns, `check_declared_heights` floors **program, input and public** at
+  `MIN_LOG_HEIGHT = 7` and **keccak/sha256** at 7 when present (80 queries plus 2 out-of-domain
+  points are fewer than 128 random rows). So an 8-word transaction binding declares public height
+  7 (it was 4), and so does the empty segment (it was 2): a pre-binding bundle proof is no longer
+  refused on its header, but at `verify_bundle` (`PublicValues`, its `H_PUB` is the empty
+  segment's). `randprotocol_core::types::BUNDLE_PUBLIC_LOG_HEIGHT` is 7.
+- **Verifier keys are salted from `key_derivation_v2`** (HCS-1), a Poseidon2 stream over the
+  crate's own constants, not `rand`'s `StdRng`. `rand` now seeds only proving's salts.
+- **32-bit range checks on the input and public words and the salt lanes** (ZKM-1 / ZKH-2).
+- **`POSEIDON2_LEN`, syscall 7** (HCS-4): `POSEIDON2` with the length in capacity lane 4 and at
+  least one permutation. `POSEIDON2` itself is unchanged, so no note commitment, nullifier, root or
+  program digest moves: **`hc_bundle` is unchanged** — v1 `83d3a370…0ef8`, v2 `651043e2…839b`.
+- **`JALR` clears bit 0 of its target and requires `funct3 = 0`** (ISA-4). No in-tree program's
+  words or digest change.
+- **The pc window** (#53): `Machine::prove*` refuses and `Machine::verify` rejects a program whose
+  declared (floored) table `base_pc + 4·2^program_log_height` passes 2^32. The deploy-side mirror,
+  `randprotocol_core::program::pc_window_fits`, already measured the floored table (PCW-FLOOR).
+- **The verifier-key cache is LRU and builds each key once** (#54).
+- **rVM:** the verifier program refuses a non-zero commit-phase PoW word in-circuit (VERIFIER-1),
+  every chip's writes are bound on its row (#58), and the admission-stub vectors moved: inner vk
+  digest `ee072b7a…fbe`, interface digest `6059c52a…a6ee` (the aggregate program digest moves).
+
+Measured on this tree (testbox, 2026-09-28; `measure_production_profile_at_tier_10_and_12` and
+the two Production bundle tests in `tests/hidden_bundle.rs`): `fib` at the production profile is
+**1 367 688 bytes at tier 10** and **1 424 299 at tier 12** (constraint set 6: 1 298 729 /
+1 359 978), a keccak-carrying tier-10 proof **3 283 898** (3 198 430); a mixed hidden-asset bundle
+at tier 14 is **1 498 821 bytes (guest v1)** and **1 497 156 (guest v2)**. **`MAX_PROOF_BYTES`
+stays 2 MiB**: every hash-table-free proof fits with room, and a keccak-bearing one is still
+refused outright. A Test-profile bundle proof is ~347 KB and took 226–237 s on the shared 16-vCPU
+testbox (~100 s alone on the laptop under constraint set 6). The call caps stand (`MAX_CALL_TIER` 14,
+keccak ≤ 2^12, sha256 ≤ 2^13): the worst admissible call header's verifier key builds in 11.6 s at
+295 MB peak against a base tier-14 shape's 8.6 s / 220 MB on the same loaded box — the ratio
+constraint set 6 measured (4.7 s against 3.9 s on the laptop), with memory flat
+(`measure_a_call_verifier_key_build_at_the_production_profile`).
+
+Proofs made under constraint set 6 do not verify under constraint set 7: every verifier key, the
+AIR (the blind columns and bus, the range checks, `JALR`) and the rVM's programs changed. **v0.6.1
+runs only on a new genesis — chain 16.** A v0.6.1 node refuses chains 14 and 15 by genesis hash at
+`run` and `verify` (`node::PRE_CONSTRAINT_SET_7_CHAINS`), and chains up to 13 by their retired
+`hc_bundle`; keep chain 15 on v0.6.
 
 ### Transaction binding (2026-09-19, Task 5b — a hard fork, chain 14)
 
