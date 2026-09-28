@@ -20,7 +20,6 @@ use rand::Rng;
 use randprotocol_core::notes::{word8_to_hex, Word8};
 use randprotocol_core::types::TX_BINDING_WORDS;
 use randprotocol_zkvm::executor::{prove_bundle_for, ZkExecutor};
-use randprotocol_zkvm::hidden::{hidden_input, hidden_input_v3};
 use randprotocol_zkvm::machine::{Backend, FriProfile};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -229,11 +228,12 @@ impl Service {
         }
         // The witness kind follows the guest: bundle guest v3 (split authorisation) takes `nk` and
         // a salt, v1/v2 take the spend key. A job whose kind does not match its guest is refused
-        // before its words are even counted, so a v3 job never runs with a spend key in it.
+        // before its words are even counted, so a v3 job never runs with a spend key in it. The
+        // width itself comes from `ZkExecutor::bundle_input_words`, the one place that maps a
+        // guest digest to its witness length — not duplicated here.
         let v3 = job.hc_bundle == ZkExecutor::hc_hidden_bundle_v3();
-        let expected_words = match (job.witness_kind, v3) {
-            (WitnessKind::ViewingKey, true) => hidden_input_v3::COUNT,
-            (WitnessKind::SpendKey, false) => hidden_input::COUNT,
+        match (job.witness_kind, v3) {
+            (WitnessKind::ViewingKey, true) | (WitnessKind::SpendKey, false) => {}
             (WitnessKind::SpendKey, true) => {
                 return Err(Refusal::WitnessKind("a v3 guest takes nk — send a viewing-key witness".into()));
             }
@@ -242,7 +242,8 @@ impl Service {
                     "viewing-key witnesses need bundle guest v3: this build's v1/v2 guests take a spend key".into(),
                 ));
             }
-        };
+        }
+        let expected_words = ZkExecutor::bundle_input_words(&job.hc_bundle);
         if ZkExecutor::profile_from_str(&job.profile).is_none() {
             // Not echoed: the profile string is the submitter's, and refusals reach logs and callers.
             return Err(Refusal::Bad("unknown fri profile".into()));

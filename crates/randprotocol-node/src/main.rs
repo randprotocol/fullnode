@@ -1822,14 +1822,18 @@ mod tests {
     /// Chain 16, cut by `deploy/cut-chain16-genesis.sh` with the v0.6.1 release binary: every
     /// genesis-gated field chain 15 lacks is present and builds — `staking.faucet_minters`, C15-1's
     /// `bridge.min_inbound_sequence`, `hardening_v6` and the v2 bundle guest — beside chain 15's
-    /// custody, carried at genesis. **Ignored until the real file is committed**: at the cut, commit
-    /// `deploy/genesis-chain16.json`, set `CHAIN_16_HASH` to what `rand-node init` printed on it,
-    /// and drop the `#[ignore]`. Until then `CHAIN16_GENESIS=<a dry-run cut> cargo test … --ignored`
-    /// checks the structure of any cut (the hash assertion is then skipped).
+    /// custody, carried at genesis. `deploy/genesis-chain16.json` is committed and its hash is
+    /// pinned in `node::CHAINS_THIS_BUILD_CANNOT_RUN` (this build refuses to run chain 16, but
+    /// still names its exact genesis hash there), so the hash assertion below reads it from that
+    /// one place rather than duplicating the literal. `CHAIN16_GENESIS=<a dry-run cut> cargo test
+    /// … --ignored` still checks the structure of any other cut (the hash assertion is skipped).
     #[test]
-    #[ignore = "deploy/genesis-chain16.json is cut at launch — pin CHAIN_16_HASH then"]
     fn chain_16s_genesis_file_builds_chain_16() {
-        const CHAIN_16_HASH: &str = "";
+        let chain_16_hash = node::CHAINS_THIS_BUILD_CANNOT_RUN
+            .iter()
+            .find(|(chain, _, _)| *chain == 16)
+            .map(|(_, hash, _)| *hash)
+            .expect("chain 16 is pinned in CHAINS_THIS_BUILD_CANNOT_RUN");
         let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain16.json");
         let path = std::env::var("CHAIN16_GENESIS").unwrap_or_else(|_| committed.to_string());
         let gen = Genesis::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -1853,7 +1857,7 @@ mod tests {
         let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
         let state = gen.build(executor.as_ref()).unwrap();
         if std::env::var("CHAIN16_GENESIS").is_err() {
-            assert_eq!(state.hash().to_hex(), CHAIN_16_HASH);
+            assert_eq!(state.hash().to_hex(), chain_16_hash);
         }
         assert!(state.ledger.hardening_v6());
         assert_eq!(state.ledger.bridge().unwrap().replay_floor(), Some(floor));

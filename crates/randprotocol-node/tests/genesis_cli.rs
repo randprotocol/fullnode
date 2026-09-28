@@ -144,8 +144,10 @@ fn the_genesis_command_pins_guest_v3_with_the_auth_guest() {
         assert!(String::from_utf8_lossy(&run.stderr).contains("--auth-guest needs --bundle-guest v3"), "{}", String::from_utf8_lossy(&run.stderr));
         assert!(!wrong.exists());
     }
-    let run = genesis(&dir.path().join("default.json"), &["--auth-guest"]);
+    let default_json = dir.path().join("default.json");
+    let run = genesis(&default_json, &["--auth-guest"]);
     assert!(!run.status.success(), "--auth-guest with the default guest (v1) is refused too");
+    assert!(!default_json.exists(), "and nothing is written");
 
     let out = dir.path().join("split.json");
     let run = genesis(&out, &["--bundle-guest", "v3", "--auth-guest", "--hardening-v6"]);
