@@ -9,8 +9,7 @@ use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks};
 use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use p3_uni_stark::StarkConfig;
-use rand::rngs::StdRng;
-use rand::SeedableRng;
+pub use crate::key_derivation_v2::SaltRng;
 
 pub type Val = Goldilocks;
 pub type Challenge = BinomialExtensionField<Val, 2>;
@@ -26,18 +25,22 @@ pub type Hash = PaddingFreeSponge<Perm, 8, 4, 4>;
 #[doc(hidden)]
 pub type Compress = TruncatedPermutation<Perm, 2, 4, 8>;
 type Packing = <Val as Field>::Packing;
-pub type ValMmcs = MerkleTreeHidingMmcs<Packing, Packing, Hash, Compress, StdRng, 2, 4, 4>;
+/// HCS-1 (constraint set 7): salted through [`SaltRng`] — `key_derivation_v2`'s stream for a verifier
+/// key, OS entropy for a proof.
+pub type ValMmcs = MerkleTreeHidingMmcs<Packing, Packing, Hash, Compress, SaltRng, 2, 4, 4>;
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 pub type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
 type Dft = Radix2DitParallel<Val>;
-pub type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, StdRng>;
+pub type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, SaltRng>;
 pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
 
 /// The seed the Poseidon2 round constants were once drawn from. The constants themselves are a
 /// committed table now (`poseidon2_constants`, audit finding ZKV-2 — a seeded `StdRng` is not
 /// stable across `rand` releases); this name remains the key `rand-zkvm-cuda`'s engines take
-/// (`constants::permutation(PERM_SEED)` reads the same table) and the salt seed of
-/// `val_mmcs_for_tests`.
+/// (`constants::permutation(PERM_SEED)` reads the same table). (It was also `val_mmcs_for_tests`'
+/// salt seed until HCS-1 took `StdRng` out of every deterministic salt stream; that accessor reads
+/// a `key_derivation_v2` label now.)
+#[cfg_attr(not(any(feature = "reference-backend", feature = "cuda", feature = "mock-cuda")), allow(dead_code))]
 pub(crate) const PERM_SEED: u64 = crate::poseidon2_constants::PERM_SEED; // "RandZK"
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,7 +92,7 @@ pub fn permutation() -> Perm {
 #[doc(hidden)]
 pub fn val_mmcs_for_tests() -> ValMmcs {
     let perm = permutation();
-    ValMmcs::new(Hash::new(perm.clone()), Compress::new(perm), 2, StdRng::seed_from_u64(PERM_SEED))
+    ValMmcs::new(Hash::new(perm.clone()), Compress::new(perm), 2, SaltRng::key(b"tests/val-mmcs"))
 }
 
 /// One full Merkle authentication path per query, restored from a pruned multiproof — a test
@@ -144,7 +147,7 @@ pub fn restore_paths_for_tests(
 /// random codewords/quotient blinding. Kept private: callers pick a seeding strategy through
 /// `make_config` (fresh OS entropy, for proving) or `key_config` (deterministic, for a
 /// preprocessed commitment any verifier can recompute).
-fn build_config(profile: FriProfile, mmcs_rng: StdRng, pcs_rng: StdRng) -> Config {
+fn build_config(profile: FriProfile, mmcs_rng: SaltRng, pcs_rng: SaltRng) -> Config {
     let perm = permutation();
     let hash = Hash::new(perm.clone());
     let compress = Compress::new(perm);
@@ -160,8 +163,8 @@ fn generic_config<D, M>(
     profile: FriProfile,
     dft: D,
     val_mmcs: M,
-    pcs_rng: StdRng,
-) -> StarkConfig<HidingFriPcs<Val, D, M, ExtensionMmcs<Val, Challenge, M>, StdRng>, Challenge, Challenger>
+    pcs_rng: SaltRng,
+) -> StarkConfig<HidingFriPcs<Val, D, M, ExtensionMmcs<Val, Challenge, M>, SaltRng>, Challenge, Challenger>
 where
     D: p3_dft::TwoAdicSubgroupDft<Val>,
     M: p3_commit::Mmcs<Val, MultiProof: Sync, Error: Sync> + Clone,
@@ -186,11 +189,11 @@ where
 #[cfg(feature = "reference-backend")]
 mod reference_cfg {
     use super::*;
-    pub type Mmcs = rand_zkvm_cuda::merkle::mmcs::HidingMmcs<rand_zkvm_cuda::merkle::cpu::CpuHashEngine>;
+    pub type Mmcs = rand_zkvm_cuda::merkle::mmcs::HidingMmcs<rand_zkvm_cuda::merkle::cpu::CpuHashEngine, SaltRng>;
     pub type Dft = rand_zkvm_cuda::dft::Dft<rand_zkvm_cuda::ntt::cpu::CpuNttEngine>;
-    pub type Pcs = HidingFriPcs<Val, Dft, Mmcs, ExtensionMmcs<Val, Challenge, Mmcs>, StdRng>;
+    pub type Pcs = HidingFriPcs<Val, Dft, Mmcs, ExtensionMmcs<Val, Challenge, Mmcs>, SaltRng>;
     pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
-    pub fn config(profile: FriProfile, mmcs_rng: StdRng, pcs_rng: StdRng) -> Config {
+    pub fn config(profile: FriProfile, mmcs_rng: SaltRng, pcs_rng: SaltRng) -> Config {
         let engine = std::sync::Arc::new(rand_zkvm_cuda::merkle::cpu::CpuHashEngine::new(PERM_SEED));
         let mmcs = Mmcs::new(engine, PERM_SEED, 2, mmcs_rng);
         super::generic_config(profile, Dft::default(), mmcs, pcs_rng)
@@ -202,15 +205,15 @@ mod reference_cfg {
 #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
 mod cuda_cfg {
     use super::*;
-    pub type Mmcs = rand_zkvm_cuda::merkle::mmcs::HidingMmcs<rand_zkvm_cuda::gpu::hash::CudaHashEngine>;
+    pub type Mmcs = rand_zkvm_cuda::merkle::mmcs::HidingMmcs<rand_zkvm_cuda::gpu::hash::CudaHashEngine, SaltRng>;
     pub type Dft = rand_zkvm_cuda::dft::Dft<rand_zkvm_cuda::gpu::ntt::CudaNttEngine>;
-    pub type Pcs = HidingFriPcs<Val, Dft, Mmcs, ExtensionMmcs<Val, Challenge, Mmcs>, StdRng>;
+    pub type Pcs = HidingFriPcs<Val, Dft, Mmcs, ExtensionMmcs<Val, Challenge, Mmcs>, SaltRng>;
     pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
     pub fn config(
         profile: FriProfile,
         gpu: std::sync::Arc<rand_zkvm_cuda::gpu::GpuProver>,
-        mmcs_rng: StdRng,
-        pcs_rng: StdRng,
+        mmcs_rng: SaltRng,
+        pcs_rng: SaltRng,
     ) -> Config {
         let engine = std::sync::Arc::new(rand_zkvm_cuda::gpu::hash::CudaHashEngine { gpu: gpu.clone() });
         let mmcs = Mmcs::new(engine, PERM_SEED, 2, mmcs_rng);
@@ -224,7 +227,7 @@ mod cuda_cfg {
 pub fn make_config(profile: FriProfile) -> Config {
     // Fresh entropy per proof, taken from the OS: this is the config actually used to prove,
     // so main-trace and quotient commitments stay hiding.
-    build_config(profile, StdRng::from_rng(&mut rand::rng()), StdRng::from_rng(&mut rand::rng()))
+    build_config(profile, SaltRng::fresh(), SaltRng::fresh())
 }
 
 use crate::emulator::{execute, ExecError, Execution};
@@ -246,7 +249,7 @@ use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::Matrix;
 use p3_uni_stark::StarkGenericConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub const TIERS: [usize; 6] = [10, 12, 14, 16, 18, 20];
@@ -384,10 +387,20 @@ impl Tier {
 #[derive(Clone)]
 pub enum Chip { Program(ProgramAir), Cpu(CpuAir), Memory(MemoryAir), Alu(AluAir), Range(RangeAir), Nibble(NibbleAir), Poseidon2(Poseidon2Air, usize), Input(crate::tables::input::InputAir), Keccak(KeccakAir, usize), Sha256(Sha256Air, usize), Public(crate::tables::public::PublicAir) }
 
-impl BaseAir<Val> for Chip {
-    fn width(&self) -> usize {
+impl Chip {
+    /// The table's own width — its `col::WIDTH` — without constraint set 7's blind columns. What a
+    /// `Traces` matrix is; `BaseAir::width` (and so the committed trace) is this plus
+    /// `tables::blind::col::WIDTH`.
+    pub fn table_width(&self) -> usize {
         match self { Chip::Program(a) => BaseAir::<Val>::width(a), Chip::Cpu(a) => BaseAir::<Val>::width(a), Chip::Memory(a) => BaseAir::<Val>::width(a), Chip::Alu(a) => BaseAir::<Val>::width(a), Chip::Range(a) => BaseAir::<Val>::width(a), Chip::Nibble(a) => BaseAir::<Val>::width(a), Chip::Poseidon2(a, _) => BaseAir::<Val>::width(a), Chip::Input(a) => BaseAir::<Val>::width(a), Chip::Keccak(a, _) => BaseAir::<Val>::width(a), Chip::Sha256(a, _) => BaseAir::<Val>::width(a), Chip::Public(a) => BaseAir::<Val>::width(a) }
     }
+}
+
+impl BaseAir<Val> for Chip {
+    /// Constraint set 7: every table carries the LogUp blind's five columns after its own
+    /// (`tables::blind`). They are added here, once, rather than in each table's `col` list, so no
+    /// table's layout moves and the blind is one piece of code for all eleven.
+    fn width(&self) -> usize { self.table_width() + crate::tables::blind::col::WIDTH }
     fn preprocessed_width(&self) -> usize {
         match self { Chip::Program(a) => BaseAir::<Val>::preprocessed_width(a), Chip::Range(a) => BaseAir::<Val>::preprocessed_width(a), Chip::Nibble(a) => BaseAir::<Val>::preprocessed_width(a), Chip::Poseidon2(a, _) => BaseAir::<Val>::preprocessed_width(a), Chip::Keccak(a, _) => BaseAir::<Val>::preprocessed_width(a), Chip::Sha256(a, _) => BaseAir::<Val>::preprocessed_width(a), _ => 0 }
     }
@@ -418,6 +431,8 @@ where
 {
     fn eval(&self, b: &mut AB) {
         match self { Chip::Program(a) => a.eval(b), Chip::Cpu(a) => a.eval(b), Chip::Memory(a) => a.eval(b), Chip::Alu(a) => a.eval(b), Chip::Range(a) => a.eval(b), Chip::Nibble(a) => a.eval(b), Chip::Poseidon2(a, _) => a.eval(b), Chip::Input(a) => a.eval(b), Chip::Keccak(a, _) => a.eval(b), Chip::Sha256(a, _) => a.eval(b), Chip::Public(a) => a.eval(b) }
+        // Constraint set 7: the blind, on the columns after the table's own.
+        crate::tables::blind::eval(b, self.table_width());
     }
 }
 
@@ -598,6 +613,11 @@ pub enum ProveError {
     /// builds, a masked shift plus an abort-scale allocation in release). The prove-side mirror
     /// of `check_declared_heights`' own `TIERS.contains` guard on the untrusted-proof side.
     BadTier(usize),
+    /// ISA-1 residual (randprotocol/fullnode#53): the program's declared table — `2^log_height`
+    /// rows from `base_pc`, floored at `2^7` — crosses the u32 pc wrap
+    /// (`tables::program::pc_window_fits`). The circuit's PCs are field sums and the emulator's
+    /// wrap, so no honest proof of such a program verifies; refused before any trace is built.
+    PcWindow { base_pc: u32, log_height: u8 },
 }
 #[derive(Debug)]
 pub enum VerifyError {
@@ -656,6 +676,11 @@ pub enum VerifyError {
     /// even observes the word — it was free, and rewriting it re-encoded a valid proof (a second
     /// transaction id for one bundle). `check_commit_pow_witnesses` has the reasoning.
     CommitPowWitness { round: usize },
+    /// ISA-1 residual (randprotocol/fullnode#53): the proof's claimed entry pc (`pv::PC_ENTRY`,
+    /// the program's `base_pc`) plus its declared program table (`4 · 2^program_log_height`
+    /// bytes) runs past 2^32 (`tables::program::pc_window_fits`). No honest proof has such a
+    /// header; refused with the other cheap checks, before any key is built.
+    PcWindow { entry_pc: u64, program_log_height: u8 },
 }
 
 /// Every check `verify` runs on a proof's public values before any of its batch is touched:
@@ -716,12 +741,14 @@ pub fn check_public_values(hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyErr
 /// what is there. The query-phase word needs nothing of the kind: it is observed before the query
 /// indices are drawn, so another passing witness moves every query and the openings stop matching.
 ///
-/// The rVM's in-circuit verifier (`recursion/src/programs/rv32.rs`, the `FriCommits` tape segment
-/// `witness.rs` writes) reads these words and drops them the same way. It is deliberately *not*
-/// tightened here: an in-program check changes the aggregate program and therefore its digest. A
-/// covered bundle is admitted by the chain through this `verify` first, so a rewritten word never
-/// reaches an aggregate from the chain's own queue; the rVM-side check belongs with the next
-/// aggregate program version (`recursion/docs/`, VERIFIER-1).
+/// The rVM's in-circuit verifier makes the same check (constraint set 7, the chain-16 cut):
+/// `recursion/src/programs/rv32.rs`'s FRI-commits loop asserts each hinted word of the `FriCommits`
+/// tape segment zero, the trap named `commit pow witness[r]`, and the host replay
+/// (`recursion::reference::replay`) refuses it as `PowWitness("commit phase")` — so an aggregate
+/// accepts exactly the inner proofs this `verify` accepts on these words. The rVM's own native
+/// verifier carries a copy of this function for its own proofs (`recursion::machine::
+/// check_commit_pow_witnesses`). The in-program assertion moved every aggregate program digest
+/// (`recursion/docs/02-aggregate.md`, VERIFIER-1).
 pub fn check_commit_pow_witnesses(proof: &Proof) -> Result<(), VerifyError> {
     let fri = &proof.batch.opening_proof.1;
     match fri.commit_pow_witnesses.iter().position(|w| *w != Val::ZERO) {
@@ -759,14 +786,22 @@ pub fn check_declared_heights(
     // `log_ext_degrees` after them — calls `Tier::cpu_height`/`alu_height`/`min_mem_log_height`,
     // which shift by `self.0` and panic in debug builds for a large enough tier (`1usize << 99`).
     if !TIERS.contains(&tier.0) { return Err(VerifyError::Tier); }
+    // Constraint set 7 (audit INT-2): every declared table is at least `2^7` rows —
+    // `tables::MIN_PRIVATE_TABLE_LOG_HEIGHT`, raised from a prover-side floor on three tables to
+    // the verifier's floor on all five. Below it a table's committed columns — its permutation
+    // (running-sum) columns included, which carry the terminal the LogUp blind hides — are opened at
+    // more points than the hiding PCS has random rows (`tables::blind`'s module comment). Each
+    // range check below starts at `max(table floor, floor)`, so a short table earns its own
+    // table's variant, exactly as a too-tall one does.
+    let floor = crate::tables::MIN_PRIVATE_TABLE_LOG_HEIGHT;
     // M3.4 (fix): `program_log_height` is untrusted the same way — reject anything outside the
     // sane range before it sizes a table (`1usize << log_height` inside
     // `log_ext_degrees`/`verifier_key`) and panics on an absurd shift.
-    if !(program::MIN_LOG_HEIGHT..=program::MAX_LOG_HEIGHT).contains(&program_log_height) {
+    if !(program::MIN_LOG_HEIGHT.max(floor)..=program::MAX_LOG_HEIGHT).contains(&program_log_height) {
         return Err(VerifyError::ProgramHeight);
     }
     // M4.1: the input table's height, same treatment.
-    if !(crate::tables::input::MIN_LOG_HEIGHT..=crate::tables::input::MAX_LOG_HEIGHT).contains(&input_log_height) {
+    if !(crate::tables::input::MIN_LOG_HEIGHT.max(floor)..=crate::tables::input::MAX_LOG_HEIGHT).contains(&input_log_height) {
         return Err(VerifyError::InputHeight);
     }
     // M4.2 (Task 6): `keccak_log_height == 0` declares *no* keccak table — the batch has eight
@@ -782,7 +817,7 @@ pub fn check_declared_heights(
         // is the cap that keeps a declared `u8` from sizing a preprocessed trace the verifier
         // would spend minutes building, which the tier bound below does *not* do on its own (at
         // tier 20 it admits `klh = 25`, a 2^25-row, 99-column preprocessed keccak trace).
-        if !(crate::tables::keccak::MIN_LOG_HEIGHT..=crate::tables::keccak::MAX_LOG_HEIGHT).contains(&keccak_log_height) {
+        if !(crate::tables::keccak::MIN_LOG_HEIGHT.max(floor)..=crate::tables::keccak::MAX_LOG_HEIGHT).contains(&keccak_log_height) {
             return Err(VerifyError::KeccakHeight);
         }
         // M4.2 (controller ruling 2): and then the tier, which is already known good —
@@ -799,7 +834,7 @@ pub fn check_declared_heights(
     // sha256_row_without_a_sha256_table_is_rejected`), any other value gets both ceilings in the
     // same order.
     if sha256_log_height != 0 {
-        if !(crate::tables::sha256::MIN_LOG_HEIGHT..=crate::tables::sha256::MAX_LOG_HEIGHT).contains(&sha256_log_height) {
+        if !(crate::tables::sha256::MIN_LOG_HEIGHT.max(floor)..=crate::tables::sha256::MAX_LOG_HEIGHT).contains(&sha256_log_height) {
             return Err(VerifyError::Sha256Height);
         }
         // `Tier::max_sha256_log_height` is `min(t + 6, MAX_LOG_HEIGHT)` — it folds the flat cap in,
@@ -811,7 +846,7 @@ pub fn check_declared_heights(
     }
     // The public table is mandatory — unlike the two hash chips there is no "0 means absent"
     // value — so this is a plain range check, `tables::input`'s exactly.
-    if !(crate::tables::public::MIN_LOG_HEIGHT..=crate::tables::public::MAX_LOG_HEIGHT).contains(&public_log_height) {
+    if !(crate::tables::public::MIN_LOG_HEIGHT.max(floor)..=crate::tables::public::MAX_LOG_HEIGHT).contains(&public_log_height) {
         return Err(VerifyError::PublicHeight);
     }
     // M4.2 (controller ruling 1): `mem_log_height` is untrusted the same way. The floor is the
@@ -916,6 +951,12 @@ pub fn build_traces_salted_with(program: &Program, inputs: &[u32], public: &[u32
     if program_log_height > program::MAX_LOG_HEIGHT {
         return Err(ProveError::ProgramTooLarge { len: program.len(), log_height: program_log_height });
     }
+    // ISA-1 residual (randprotocol/fullnode#53): the declared, floored table must sit below the
+    // u32 pc wrap, or its padding rows carry field PCs no execution produces and the proof built
+    // here could never verify (`tables::program::pc_window_fits`).
+    if !program::pc_window_fits(program.base_pc as u64, program_log_height) {
+        return Err(ProveError::PcWindow { base_pc: program.base_pc, log_height: program_log_height });
+    }
     // M4.1: the input table's height is proof-declared the same way.
     let input_log_height = crate::tables::input::input_log_height(inputs.len());
     if input_log_height > crate::tables::input::MAX_LOG_HEIGHT {
@@ -999,15 +1040,17 @@ pub fn build_traces_salted_with(program: &Program, inputs: &[u32], public: &[u32
     }
     let memory = memory_trace(&exec.events, clk_offset, 1usize << mem_log_height, &mut range);
     let alu = alu_trace(&exec.events, tier.alu_height(), &mut range, &mut nibble);
-    let range_t = range_trace(&range);
-    let nibble_t = nibble_trace(&nibble);
-    let program_t = program_trace(program, &exec.events, 1usize << program_log_height);
     let read_counts = crate::tables::input::read_counts(inputs.len(), &exec.events);
-    let input_t = crate::tables::input::input_trace(inputs, &read_counts, 1usize << input_log_height);
+    // ZKM-1/ZKH-2 (next constraint set): the input and public tables' word limbs are `RANGE8`
+    // lookups too, so both are built before the range table is.
+    let input_t = crate::tables::input::input_trace(inputs, &read_counts, 1usize << input_log_height, &mut range);
     // Constraint set 6: the public table, `input`'s twin — `MULT_READ` counted off the
     // `SYS_READ_PUBLIC` events the same way.
     let public_read_counts = crate::tables::public::read_counts(public.len(), &exec.events);
-    let public_t = crate::tables::public::public_trace(public, &public_read_counts, 1usize << public_log_height);
+    let public_t = crate::tables::public::public_trace(public, &public_read_counts, 1usize << public_log_height, &mut range);
+    let range_t = range_trace(&range);
+    let nibble_t = nibble_trace(&nibble);
+    let program_t = program_trace(program, &exec.events, 1usize << program_log_height);
     // M3.4: the digest prefix's own permutations, in the same row order `tables::cpu`'s
     // `IS_DIGEST` rows issue them (`fill_digest_rows`) — these come *first*, since the digest
     // rows precede every ordinary cycle in the cpu table.
@@ -1140,27 +1183,17 @@ impl Proof {
     pub fn size(&self) -> usize { self.to_bytes().len() }
 }
 
-/// M3.4: the fixed seed behind `key_config`'s RNGs. Before M3.4 this was derived from the
-/// program (`program_digest`, an FNV-1a-style fold over `base_pc` and every word) — but the
-/// preprocessed columns are now the range/nibble tables and the Poseidon2 round-constant
-/// table alone (`Machine::verifier_key`'s doc comment), none of which depend on any specific
-/// program, so seeding from the program would only make the same `(tier)` verifier key
-/// non-reproducible from one build to the next for no benefit. A single fixed constant
-/// (arbitrary, like `machine::PERM_SEED`) is all a program-independent preprocessed
-/// commitment needs.
-///
-/// HCS-1 (2026-09-27 zkVM review): the *seed* is fixed, but the salts are `rand`'s `StdRng` stream
-/// from it, which `rand` does not promise to keep across releases — so the stream is consensus.
-/// Interim guard: `rand`, `rand_core` and `chacha20` are pinned exactly (`Cargo.toml`) and
-/// `tests/verifier_key.rs` pins the resulting keys. The fix, for the next chain cut, is
-/// `key_derivation_v2` (written, tested, not wired in).
-const KEY_SEED: u64 = 0x4b45_595f_4d33_5f34; // "KEY_M3_4"
-
 /// A `Config` whose value-MMCS salts and PCS random codewords are both seeded deterministically
-/// from `KEY_SEED` (M3.4: no longer the program — see that constant's doc comment) instead of
-/// OS entropy, so that the resulting preprocessed commitment (`Machine::verifier_key`) is a
-/// pure function of the tier: any verifier can recompute it standalone, without having
-/// witnessed the proving session or holding the program.
+/// instead of from OS entropy, so that the resulting preprocessed commitment
+/// (`Machine::verifier_key`) is a pure function of the declared shape: any verifier can recompute
+/// it standalone, without having witnessed the proving session or holding the program.
+///
+/// M3.4 seeded it from a fixed `KEY_SEED` rather than the program (the preprocessed columns — the
+/// range/nibble tables, the Poseidon2 round constants, the hash chips' periodic columns — depend on
+/// no program). HCS-1, constraint set 7: the seed was fixed, but the salts were `rand`'s `StdRng`
+/// stream from it, which `rand` does not promise to keep across releases — the stream was
+/// consensus. They are `key_derivation_v2`'s now, a Poseidon2 sponge over this repository's own
+/// constants and two labels (`key_rngs` below), so no dependency update can move a key.
 ///
 /// Never used for the actual `prove_batch` call, whose main-trace/quotient/permutation
 /// commitments must keep fresh entropy (see `make_config`) or two proofs of the same run
@@ -1173,9 +1206,10 @@ fn key_config(profile: FriProfile) -> Config {
 /// The deterministic `(mmcs_rng, pcs_rng)` pair behind `key_config`, factored out so every
 /// backend seeds its own key config identically and therefore produces a preprocessed
 /// commitment byte-identical to the one `verifier_key` recomputes on the CPU.
-fn key_rngs() -> (StdRng, StdRng) {
-    // XOR with an arbitrary odd constant so the two RNG streams don't start identically.
-    (StdRng::seed_from_u64(KEY_SEED), StdRng::seed_from_u64(KEY_SEED ^ 0x9E37_79B9_7F4A_7C15))
+fn key_rngs() -> (SaltRng, SaltRng) {
+    // Two labels, so the two streams do not start identically (`key_derivation_v2::key_rngs`).
+    let (mmcs, pcs) = crate::key_derivation_v2::key_rngs();
+    (SaltRng::Key(mmcs), SaltRng::Key(pcs))
 }
 
 /// Which prover implementation `Machine::prove_with` runs the batch STARK on. Every variant
@@ -1202,13 +1236,17 @@ fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
     "backend panicked".to_string()
 }
 
-/// Bound on the number of `(program digest, tier)` verifier keys `Machine::verifier_key`
-/// keeps in memory at once. Past this, the oldest entry is evicted (FIFO) to make room for the
-/// new one — a preprocessed commitment is cheap enough to recompute that a fancier (e.g. LRU)
-/// policy is not worth the complexity here.
+/// Bound on the number of verifier keys `Machine::verifier_key` keeps in memory at once. Past
+/// this, the least recently used key is evicted to make room for the new one (CPUV-1 residual,
+/// randprotocol/fullnode#54: it was FIFO, so a burst of distinct shapes evicted a key in constant
+/// use — a node's bundle key — however hot it was, and a rebuild costs seconds and hundreds of MB
+/// at a node's call-shape cap). The bound is on entries, not bytes: an entry is a verifier's
+/// `CommonData` (a Merkle cap and the packed lookups), whose size is a function of the shape.
 const KEY_CACHE_CAPACITY: usize = 64;
 
-/// A bounded, FIFO-evicted cache of `Machine::verifier_key` results, keyed by `(tier.0,
+/// A bounded, least-recently-used cache of `Machine::verifier_key` results with single-flight
+/// builds (#54: each entry is a `OnceLock` slot, so concurrent first callers of one shape wait for
+/// one build instead of each running the preprocessing pass), keyed by `(tier.0,
 /// program_log_height, input_log_height, keccak_log_height)` (M3.4 fix: the program table's height is
 /// proof-declared, not tier-derived — `tables::program::program_log_height`'s doc comment —
 /// so `CommonData`'s per-instance degree-bit bookkeeping depends on it too, even though the
@@ -1226,35 +1264,77 @@ const KEY_CACHE_CAPACITY: usize = 64;
 /// tier 20, the `+ 2` counting M4.2 Task 6's `klh = 0`, "no keccak table", as its own value)` distinct
 /// keys in the worst case —
 /// comfortably able to exceed `KEY_CACHE_CAPACITY` if a caller proves at many different
-/// program/input sizes, unlike the tier-only cache this replaces, so the FIFO eviction here is
+/// program/input sizes, unlike the tier-only cache this replaces, so the eviction here is
 /// a real policy again, not just defense in depth.
-#[derive(Default)]
+type KeyShape = (usize, u8, u8, u8, u8, u8);
+type KeySlot = Arc<std::sync::OnceLock<Arc<CommonData<Config>>>>;
+
 struct KeyCache {
-    map: HashMap<(usize, u8, u8, u8, u8, u8), Arc<CommonData<Config>>>,
-    order: VecDeque<(usize, u8, u8, u8, u8, u8)>,
+    /// Each shape's slot and the tick of its last use.
+    map: HashMap<KeyShape, (KeySlot, u64)>,
+    tick: u64,
+    capacity: usize,
+}
+impl Default for KeyCache {
+    fn default() -> Self { Self { map: HashMap::new(), tick: 0, capacity: KEY_CACHE_CAPACITY } }
 }
 impl KeyCache {
-    fn get(&self, key: &(usize, u8, u8, u8, u8, u8)) -> Option<Arc<CommonData<Config>>> {
-        self.map.get(key).cloned()
-    }
-    fn insert(&mut self, key: (usize, u8, u8, u8, u8, u8), value: Arc<CommonData<Config>>) {
-        if self.map.contains_key(&key) {
-            return;
+    /// The slot for `key`, marked used now — an existing one (built, or being built by another
+    /// caller) or a fresh, empty one, making room first by evicting the least recently used
+    /// entries. An evicted slot that is still being built is only dropped from the map: its
+    /// builder holds its own handle and returns the key it builds.
+    fn slot(&mut self, key: KeyShape) -> KeySlot {
+        self.tick += 1;
+        let now = self.tick;
+        if let Some((slot, used)) = self.map.get_mut(&key) {
+            *used = now;
+            return slot.clone();
         }
-        if self.map.len() >= KEY_CACHE_CAPACITY {
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-            }
+        while self.map.len() >= self.capacity {
+            let lru = *self.map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k).expect("capacity > 0");
+            self.map.remove(&lru);
         }
-        self.order.push_back(key);
-        self.map.insert(key, value);
+        let slot = KeySlot::default();
+        self.map.insert(key, (slot.clone(), now));
+        slot
     }
+    /// Whether `key`'s slot is present and built (a lookup, not a use).
+    fn is_built(&self, key: &KeyShape) -> bool {
+        self.map.get(key).is_some_and(|(slot, _)| slot.get().is_some())
+    }
+    /// The number of built keys held.
+    fn built(&self) -> usize { self.map.values().filter(|(slot, _)| slot.get().is_some()).count() }
 }
 
-pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache> }
+pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize }
 
 impl Machine {
-    pub fn new(profile: FriProfile) -> Self { Self { config: make_config(profile), profile, keys: Mutex::new(KeyCache::default()) } }
+    pub fn new(profile: FriProfile) -> Self { Self::with_key_cache_capacity(profile, KEY_CACHE_CAPACITY) }
+
+    /// A test instrument (`tests/key_cache.rs`): a machine whose verifier-key cache holds
+    /// `capacity` keys instead of `KEY_CACHE_CAPACITY`, so eviction is observable in a few builds.
+    #[doc(hidden)]
+    pub fn with_key_cache_capacity(profile: FriProfile, capacity: usize) -> Self {
+        assert!(capacity > 0, "a key cache holds at least one key");
+        Self {
+            config: make_config(profile),
+            profile,
+            keys: Mutex::new(KeyCache { capacity, ..KeyCache::default() }),
+            key_builds: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// A test instrument: how many verifier keys this machine has built (cache misses that ran
+    /// the preprocessing pass), since construction.
+    #[doc(hidden)]
+    pub fn key_builds(&self) -> usize { self.key_builds.load(std::sync::atomic::Ordering::SeqCst) }
+
+    /// A test instrument: whether the key for this shape is cached right now (a lookup that does
+    /// not count as a use).
+    #[doc(hidden)]
+    pub fn has_cached_key(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, public_log_height: u8) -> bool {
+        self.keys.lock().unwrap().is_built(&(tier.0, program_log_height, input_log_height, keccak_log_height, sha256_log_height, public_log_height))
+    }
 
     /// Each instance's extended trace degree bits, in `chips()` order — a pure function of the
     /// tier and the declared heights, which is why it can be `pub`: the free function
@@ -1343,22 +1423,25 @@ impl Machine {
 
     pub fn verifier_key(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, public_log_height: u8) -> Arc<CommonData<Config>> {
         let key = (tier.0, program_log_height, input_log_height, keccak_log_height, sha256_log_height, public_log_height);
-        if let Some(hit) = self.keys.lock().unwrap().get(&key) {
-            return hit;
-        }
-        // Any valid `mem_log_height` gives the same `CommonData` (see above); the tier's floor is
-        // the canonical one, and using it makes this function's result independent of which
-        // proof happened to miss the cache first.
-        let mem_log_height = tier.min_mem_log_height();
-        let common = Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips(tier, keccak_log_height, sha256_log_height), &self.log_ext_degrees(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, public_log_height, mem_log_height)).common);
-        self.keys.lock().unwrap().insert(key, common.clone());
-        common
+        // The cache lock is held only to find or make the slot; the build runs outside it, and
+        // `OnceLock::get_or_init` makes every concurrent caller of this shape wait for the one
+        // build (#54's single flight) — a caller of another shape is never held up by it.
+        let slot = self.keys.lock().unwrap().slot(key);
+        slot.get_or_init(|| {
+            // Any valid `mem_log_height` gives the same `CommonData` (see above); the tier's
+            // floor is the canonical one, and using it makes this function's result independent
+            // of which proof happened to miss the cache first.
+            let mem_log_height = tier.min_mem_log_height();
+            self.key_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips(tier, keccak_log_height, sha256_log_height), &self.log_ext_degrees(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, public_log_height, mem_log_height)).common)
+        })
+        .clone()
     }
 
     /// Number of `(tier, program_log_height, input_log_height, keccak_log_height,
     /// sha256_log_height, public_log_height)` verifier keys
     /// currently cached.
-    pub fn cached_keys(&self) -> usize { self.keys.lock().unwrap().map.len() }
+    pub fn cached_keys(&self) -> usize { self.keys.lock().unwrap().built() }
 
     /// Draws a fresh per-proof salt from OS entropy and delegates to [`Self::prove_salted`] —
     /// see that method's doc comment (controller ruling: H_IN, `pv::IN0..7`, must be salted or
@@ -1422,13 +1505,30 @@ impl Machine {
     /// and `traces` already carries everything the witness needs, `hc` included via
     /// `public_values`) — kept in the signature for symmetry with `prove`/`prove_on`, which
     /// still need the program to execute it and build `traces` in the first place.
-    pub fn prove_traces(&self, _program: &Program, traces: &Traces, tier: Tier) -> Proof {
+    ///
+    /// Constraint set 7: draws fresh LogUp blinds (`tables::blind::fresh`) and appends them to the
+    /// traces — `Traces` holds each table at its own width, the committed trace is five columns
+    /// wider (`Chip`'s `BaseAir::width`). The widening copies each trace once; that is a sixteenth
+    /// of the low-degree extension `prove_batch` then builds from it, so it is not worth an owning
+    /// variant.
+    pub fn prove_traces(&self, program: &Program, traces: &Traces, tier: Tier) -> Proof {
+        let blinds = crate::tables::blind::fresh(traces.as_slice().len());
+        self.prove_traces_with_blinds(program, traces, tier, &blinds)
+    }
+
+    /// [`Self::prove_traces`] with the blinds given instead of drawn — one per instance, in
+    /// `chips()` order. A test hook: an honest caller wants [`Self::prove_traces`]' fresh ones, and
+    /// blinds that do not balance (`tests/cheating.rs`) are refused like any other unbalanced bus.
+    #[doc(hidden)]
+    pub fn prove_traces_with_blinds(&self, _program: &Program, traces: &Traces, tier: Tier, blinds: &[crate::tables::blind::Blind]) -> Proof {
         let airs = chips(tier, traces.keccak_log_height, traces.sha256_log_height);
-        let mats = traces.as_slice();
         // M4.2 (Task 6): `keccak_log_height` picks the chip set and `keccak` supplies the
         // traces, so the two must agree — a mismatch would `zip` short and silently prove a
         // different batch than the degree bits describe.
-        assert_eq!(airs.len(), mats.len(), "one trace per chip: the declared keccak/sha256 heights and Traces::keccak/sha256 disagree");
+        assert_eq!(airs.len(), traces.as_slice().len(), "one trace per chip: the declared keccak/sha256 heights and Traces::keccak/sha256 disagree");
+        assert_eq!(airs.len(), blinds.len(), "one blind per instance");
+        let wide: Vec<RowMajorMatrix<Val>> = traces.as_slice().iter().zip(blinds).map(|(m, b)| crate::tables::blind::widen(m, b)).collect();
+        let mats: Vec<&RowMajorMatrix<Val>> = wide.iter().collect();
         let instances: Vec<StarkInstance<'_, Config, Chip>> = airs.iter().zip(mats.iter()).enumerate().map(|(i, (air, trace))| StarkInstance {
             air, trace, public_values: if i == 1 { traces.public_values.clone() } else { vec![] },
         }).collect();
@@ -1465,7 +1565,7 @@ impl Machine {
             Backend::Reference => {
                 // Fresh entropy for the proving config (hiding), deterministic for the key
                 // config — the same split `make_config`/`key_config` make on the CPU.
-                let cfg = reference_cfg::config(self.profile, StdRng::from_rng(&mut rand::rng()), StdRng::from_rng(&mut rand::rng()));
+                let cfg = reference_cfg::config(self.profile, SaltRng::fresh(), SaltRng::fresh());
                 let (mmcs_rng, pcs_rng) = key_rngs();
                 let key = reference_cfg::config(self.profile, mmcs_rng, pcs_rng);
                 self.prove_on(&cfg, &key, program, inputs, public, tier)
@@ -1473,7 +1573,7 @@ impl Machine {
             #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
             Backend::Cuda => {
                 let gpu = rand_zkvm_cuda::gpu::GpuProver::probe(PERM_SEED).map_err(|e| ProveError::Backend(e.to_string()))?;
-                let cfg = cuda_cfg::config(self.profile, gpu.clone(), StdRng::from_rng(&mut rand::rng()), StdRng::from_rng(&mut rand::rng()));
+                let cfg = cuda_cfg::config(self.profile, gpu.clone(), SaltRng::fresh(), SaltRng::fresh());
                 let (mmcs_rng, pcs_rng) = key_rngs();
                 let key = cuda_cfg::config(self.profile, gpu, mmcs_rng, pcs_rng);
                 self.prove_on(&cfg, &key, program, inputs, public, tier)
@@ -1533,11 +1633,14 @@ impl Machine {
         };
         let traces = build_traces_salted(program, inputs, public, salt, &exec, tier)?;
         let airs = chips(tier, traces.keccak_log_height, traces.sha256_log_height);
-        let mats = traces.as_slice();
         // M4.2 (Task 6): `keccak_log_height` picks the chip set and `keccak` supplies the
         // traces, so the two must agree — a mismatch would `zip` short and silently prove a
         // different batch than the degree bits describe.
-        assert_eq!(airs.len(), mats.len(), "one trace per chip: the declared keccak/sha256 heights and Traces::keccak/sha256 disagree");
+        assert_eq!(airs.len(), traces.as_slice().len(), "one trace per chip: the declared keccak/sha256 heights and Traces::keccak/sha256 disagree");
+        // Constraint set 7: fresh blinds, appended — `prove_traces`' step, duplicated with it.
+        let blinds = crate::tables::blind::fresh(airs.len());
+        let wide: Vec<RowMajorMatrix<Val>> = traces.as_slice().iter().zip(&blinds).map(|(m, b)| crate::tables::blind::widen(m, b)).collect();
+        let mats: Vec<&RowMajorMatrix<Val>> = wide.iter().collect();
         let instances: Vec<StarkInstance<'_, SC, Chip>> = airs.iter().zip(mats.iter()).enumerate().map(|(i, (air, trace))| StarkInstance {
             air, trace, public_values: if i == 1 { traces.public_values.clone() } else { vec![] },
         }).collect();
@@ -1583,6 +1686,15 @@ impl Machine {
             proof.public_log_height,
             proof.mem_log_height,
         )?;
+        // ISA-1 residual (randprotocol/fullnode#53): the claimed entry pc plus the declared (and,
+        // above, range-checked) program table must end at or below 2^32 — the prover's own
+        // `PcWindow` refusal, made again on the untrusted header. `PC_ENTRY` is bound in-circuit to
+        // the first cpu row's `PC`, and `hc` absorbs `base_pc`, so this reads the program's own
+        // `base_pc`; no honest proof trips it.
+        let entry_pc = proof.public_values[crate::tables::cpu::pv::PC_ENTRY];
+        if !crate::tables::program::pc_window_fits(entry_pc, proof.program_log_height) {
+            return Err(VerifyError::PcWindow { entry_pc, program_log_height: proof.program_log_height });
+        }
         // Audit VERIFIER-1: the commit-phase proof-of-work words, unobserved at zero bits, must be
         // the honest zero — one encoding per proof (`check_commit_pow_witnesses`). A comparison per
         // round, so it goes with the other cheap checks, before the key is built.

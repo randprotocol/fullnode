@@ -219,17 +219,22 @@ where
     let fri_alpha = ch.sample_ext(b);
     b.checkpoint("fri_alpha", fri_alpha);
 
-    // 2. The commit phase — per round: the cap, the discarded PoW witness, one `beta` draw.
+    // 2. The commit phase — per round: the cap, the PoW witness (asserted zero), one `beta` draw.
     let mut fri_caps = Vec::with_capacity(shape.log_arities().len());
     let mut betas = Vec::with_capacity(shape.log_arities().len());
     for r in 0..shape.log_arities().len() {
         let cap = read_cap(b);
         ch.observe_cap(b, &cap);
-        // `commit_proof_of_work_bits == 0` on this machine, and `check_witness(0, w)` observes
+        // `commit_proof_of_work_bits == 0` on both machines, and `check_witness(0, w)` observes
         // nothing — it returns `true` without touching the transcript
-        // (`grinding_challenger.rs:44-49`). The witness element is therefore read off the tape
-        // and discarded, exactly as the native verifier discards it.
-        let _discarded = b.hint();
+        // (`grinding_challenger.rs:44-49`) — so p3 accepts any word here. `Machine::verify`
+        // (research's `check_commit_pow_witnesses`, and the rVM's own) refuses all but the
+        // honest `0` (VERIFIER-1, the 2026-09-27 reviews): one encoding per proof. The word is
+        // asserted zero here to match — observed by nothing still, so the transcript is
+        // unchanged — at one `JEQ` row per round. Before this the word was read and discarded,
+        // and an inner proof with a rewritten word verified inside an aggregate.
+        let pow = b.hint();
+        b.assert_zero(pow, &format!("commit pow witness[{r}]"));
         let beta = ch.sample_ext(b);
         b.checkpoint(&format!("beta[{r}]"), beta);
         fri_caps.push(cap);

@@ -6,12 +6,18 @@
 //! primitives (`keccak::keccak256`, `notes::hash`), never from `evm_core`'s copies, so an
 //! agreement is evidence rather than a tautology.
 
+use std::ffi::c_void;
+
 use evm_core::abi::{
-    decode_input, hash_words, logs_hash, public_output, run_call, run_call_with, InputCursor,
-    ParseError, Workspace,
+    decode_input, hash_words, logs_hash, public_output, run_call, run_call_with,
+    run_call_with_executor, InputCursor, ParseError, Workspace,
 };
-use evm_core::interp::{Halt, Interpreter, Log, Outcome, MAX_CALLDATA_BYTES, MAX_CODE_BYTES, MAX_LOGS, MAX_RETURN_BYTES};
-use evm_core::storage::MAX_WITNESSES;
+use evm_core::ffi::{evm_keccak256, evm_sload, evm_sstore, halt_code, halt_from_code, HostBox};
+use evm_core::interp::{
+    Buffers, Env, Halt, Interpreter, Log, Outcome, MAX_CALLDATA_BYTES, MAX_CODE_BYTES, MAX_LOGS,
+    MAX_RETURN_BYTES,
+};
+use evm_core::storage::{StorageError, StorageTree, MAX_WITNESSES};
 use evm_core::u256::U256;
 use randprotocol_zkvm::evm::{EvmCall, HostRef, SparseTree, WITNESS_WORDS};
 use randprotocol_zkvm::keccak::keccak256;
@@ -421,4 +427,161 @@ fn one_workspace_runs_two_calls_without_leaking_state() {
     assert_eq!(run_call(&mut HostRef, &mut ws, |i| wj[i as usize], wj.len() as u32)[0], 1);
     assert_eq!(run_call(&mut HostRef, &mut ws, |i| wn[i as usize], wn.len() as u32)[0], 2);
     assert_eq!(no_jd.expected().1.halt, Halt::BadJump);
+}
+
+// ---- evm2rv Task 1: the executor hook and the storage FFI ----
+
+/// The interpreter as an `Executor`.
+fn interp_exec(h: &mut HostRef, code: &[u8], cd: &[u8], env: Env, st: &mut StorageTree, b: &mut Buffers) -> Outcome {
+    Interpreter::new(h, code, cd, env, st, b).run()
+}
+
+/// (a) The executor hook with the interpreter as the executor is `run_call_with`, on the ERC-20
+/// `transfer` vector — the same eight words, the same outcome, the same post-state tree, and the
+/// executor sees exactly the decoded call — and on a revert and an exceptional halt, whose outputs
+/// the shared `public_output` rules collapse. A malformed vector never reaches the executor.
+#[test]
+fn the_executor_hook_with_the_interpreter_is_run_call_with() {
+    use randprotocol_zkvm::evm::{erc20_transfer, ALICE, BOB};
+    let call = erc20_transfer(ALICE, BOB, U256::from_u32(250), &[(ALICE, U256::from_u32(1000))]);
+    let w = call.input_words();
+
+    let mut ws_ref = Box::new(Workspace::ZERO);
+    let (out_ref, o_ref) = run_call_with(&mut HostRef, &mut ws_ref, |i| w[i as usize], w.len() as u32);
+    assert_eq!(out_ref[0], 1, "the transfer succeeds");
+
+    let mut calls = 0;
+    let mut exec = |h: &mut HostRef, code: &[u8], cd: &[u8], env: Env, st: &mut StorageTree, b: &mut Buffers| {
+        calls += 1;
+        assert_eq!(code, &call.code[..]);
+        assert_eq!(cd, &call.calldata[..]);
+        assert_eq!(env.address, call.address);
+        assert_eq!(env.caller, call.caller);
+        assert_eq!(env.callvalue, call.callvalue);
+        assert_eq!(env.gas_limit, call.gas_limit);
+        assert_eq!(st.root(), call.tree.root());
+        interp_exec(h, code, cd, env, st, b)
+    };
+    let mut ws = Box::new(Workspace::ZERO);
+    let (out, o) = run_call_with_executor(&mut HostRef, &mut ws, |i| w[i as usize], w.len() as u32, &mut exec);
+    assert_eq!(calls, 1);
+    assert_eq!(out, out_ref);
+    assert_eq!(out, call.expected().0);
+    assert_eq!((o.halt, o.gas_used, &o.ret[..o.ret_len], o.n_logs), (o_ref.halt, o_ref.gas_used, &o_ref.ret[..o_ref.ret_len], o_ref.n_logs));
+    assert_eq!(o.logs, o_ref.logs);
+    assert_eq!(ws.input.storage.root(), ws_ref.input.storage.root());
+    assert_ne!(ws.input.storage.root(), call.tree.root(), "the transfer moved the root");
+
+    // a revert and an exceptional halt after a store and a log: the same collapsed outputs
+    for tail in [vec![0x60, 0x2a, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xfd], vec![0xfe]] {
+        let mut c = sample();
+        c.code = store_and_log();
+        c.code.extend_from_slice(&tail);
+        let w = c.input_words();
+        let mut ws = Box::new(Workspace::ZERO);
+        let (out, o) = run_call_with_executor(&mut HostRef, &mut ws, |i| w[i as usize], w.len() as u32, &mut interp_exec);
+        let (want, o_want, _) = c.expected();
+        assert_eq!(out, want);
+        assert_ne!(out[0], 1);
+        assert_eq!((o.halt, o.gas_used, o.n_logs), (o_want.halt, o_want.gas_used, o_want.n_logs));
+    }
+
+    // a malformed vector never reaches the executor and is the canonical malformed output
+    let mut bad = w.clone();
+    bad.truncate(w.len() - 1);
+    let mut never = |_: &mut HostRef, _: &[u8], _: &[u8], _: Env, _: &mut StorageTree, _: &mut Buffers| -> Outcome {
+        panic!("the executor ran on a vector that does not parse")
+    };
+    let mut ws = Box::new(Workspace::ZERO);
+    let (out, o) = run_call_with_executor(&mut HostRef, &mut ws, |i| bad[i as usize], bad.len() as u32, &mut never);
+    assert_eq!(out, out_words(2, digest(&[], [0; 8], [0; 8], &[], &no_logs())));
+    assert_eq!((o.halt, o.gas_used), (Halt::OutOfBounds, 0));
+}
+
+/// (b) `evm_sload`/`evm_sstore` through the C ABI on a two-slot tree match `StorageTree::load`/
+/// `store` step for step — values, roots and refusals — and `evm_keccak256` is `keccak256`.
+#[test]
+fn the_storage_and_keccak_ffi_match_the_storage_tree() {
+    let mut c = sample();
+    c.tree.insert(U256::from_u32(2), U256::from_u32(7));
+    c.touched = vec![U256::from_u32(1), U256::from_u32(2)];
+    let w = c.input_words();
+    let mut direct = decoded(&w);
+    let mut via = decoded(&w);
+    assert_eq!(via.input.storage.len(), 2);
+
+    let mut host = HostRef;
+    let mut hb = HostBox(&mut host);
+    let hp = &mut hb as *mut HostBox as *mut c_void;
+    let tp = &mut via.input.storage as *mut StorageTree;
+
+    let sload = |slot: U256| -> (u32, U256) {
+        let mut out = [0u32; 8];
+        let code = unsafe { evm_sload(tp, hp, slot.0.as_ptr(), out.as_mut_ptr()) };
+        (code, U256(out))
+    };
+    let sstore = |slot: U256, value: U256| -> u32 { unsafe { evm_sstore(tp, hp, slot.0.as_ptr(), value.0.as_ptr()) } };
+
+    let (one, two, three) = (U256::from_u32(1), U256::from_u32(2), U256::from_u32(3));
+    assert_eq!(sload(one), (0, direct.input.storage.load(&mut HostRef, &one).unwrap()));
+    assert_eq!(sload(one).1, U256::from_u32(41));
+    assert_eq!(sload(two), (0, direct.input.storage.load(&mut HostRef, &two).unwrap()));
+    assert_eq!(sstore(two, U256::from_u32(99)), 0);
+    direct.input.storage.store(&mut HostRef, &two, U256::from_u32(99)).unwrap();
+    assert_eq!(unsafe { (*tp).root() }, direct.input.storage.root());
+    assert_ne!(direct.input.storage.root(), c.tree.root(), "the store moved the root");
+    // the other witness's sibling was refreshed, so slot 1 still loads against the new root
+    assert_eq!(sload(one), (0, direct.input.storage.load(&mut HostRef, &one).unwrap()));
+    assert_eq!(sstore(one, U256::ZERO), 0);
+    direct.input.storage.store(&mut HostRef, &one, U256::ZERO).unwrap();
+    assert_eq!(sload(two), (0, U256::from_u32(99)));
+    assert_eq!(sload(one), (0, U256::ZERO));
+    assert_eq!(unsafe { (*tp).root() }, direct.input.storage.root());
+    let mut post = c.tree.clone();
+    post.insert(one, U256::ZERO);
+    post.insert(two, U256::from_u32(99));
+    assert_eq!(direct.input.storage.root(), post.root());
+
+    // a slot with no witness is NoWitness, as a halt code; nothing moves
+    let before = unsafe { (*tp).root() };
+    assert_eq!(direct.input.storage.load(&mut HostRef, &three), Err(StorageError::NoWitness));
+    assert_eq!(sload(three).0, halt_code(Halt::NoWitness));
+    assert_eq!(sstore(three, one), halt_code(Halt::NoWitness));
+    assert_eq!(unsafe { (*tp).root() }, before);
+
+    // a witness that does not hash to the root is BadWitness
+    let mut forged = w.clone();
+    let n_at = forged.len() - 1 - 2 * WITNESS_WORDS;
+    forged[n_at - 8] ^= 1; // pre_root's first word
+    let mut bad = decoded(&forged);
+    assert_eq!(bad.input.storage.load(&mut HostRef, &one), Err(StorageError::BadWitness));
+    let mut bad2 = decoded(&forged);
+    let bp = &mut bad2.input.storage as *mut StorageTree;
+    let mut out = [0u32; 8];
+    assert_eq!(unsafe { evm_sload(bp, hp, one.0.as_ptr(), out.as_mut_ptr()) }, halt_code(Halt::BadWitness));
+    assert_eq!(unsafe { evm_sstore(bp, hp, one.0.as_ptr(), two.0.as_ptr()) }, halt_code(Halt::BadWitness));
+
+    // the halt codes are a bijection on the halts, and 0 is none of them
+    let all = [
+        Halt::Stop, Halt::Return, Halt::Revert, Halt::OutOfGas, Halt::StackUnderflow, Halt::StackOverflow,
+        Halt::BadJump, Halt::Invalid, Halt::Trap(0x0c), Halt::NoWitness, Halt::BadWitness, Halt::OutOfBounds,
+    ];
+    for h in all {
+        let arg = if let Halt::Trap(op) = h { op as u32 } else { 0 };
+        assert_ne!(halt_code(h), 0);
+        assert_eq!(halt_from_code(halt_code(h), arg), Some(h));
+    }
+    assert_eq!(halt_from_code(0, 0), None);
+    assert_eq!(halt_from_code(99, 0), None);
+
+    // keccak256 through the FFI, at the empty message, a sub-rate one and a multi-block one
+    for n in [0usize, 5, 135, 136, 137, 1296] {
+        let msg: Vec<u8> = (0..n).map(|i| (i * 7 + 3) as u8).collect();
+        let mut out = [0u8; 32];
+        unsafe { evm_keccak256(hp, msg.as_ptr(), n as u32, out.as_mut_ptr()) };
+        assert_eq!(out, keccak256(&msg), "{n} bytes");
+    }
+    let mut out = [0u8; 32];
+    unsafe { evm_keccak256(hp, std::ptr::null(), 0, out.as_mut_ptr()) };
+    assert_eq!(out, keccak256(&[]));
 }

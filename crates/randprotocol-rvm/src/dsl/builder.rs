@@ -685,6 +685,18 @@ impl Builder {
         self.trap(what);
     }
 
+    /// `a == 0`, or the program traps at a `pc` that names `what` — one `JEQ` against the zero
+    /// register over the trap, so an accepting run pays one row (VERIFIER-1's commit-phase PoW
+    /// words; [`Builder::assert_eq`] against a zero constant would pay an `FSUB` more).
+    pub fn assert_zero(&mut self, a: Felt, what: &str) {
+        self.begin();
+        let ra = self.materialise(a.0);
+        let over = self.ops.len() as u32 + 2;
+        self.emit(Op::Jeq, ra, RRef::Raw(0), BRef::Imm(F::ZERO));
+        self.set_target(over);
+        self.trap(what);
+    }
+
     /// Two [`Builder::assert_eq`]s, one per coefficient, named `"<what> (c0)"` and `"<what> (c1)"`.
     pub fn assert_eq_ext(&mut self, a: Ext, b: Ext, what: &str) {
         let (a0, a1) = self.ext_parts(a);

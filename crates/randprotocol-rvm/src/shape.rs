@@ -835,8 +835,9 @@ impl PartialEq for RvmShape {
 impl Eq for RvmShape {}
 
 /// The rVM preprocessed commitment for `(program, tier, reduce)`: sixteen field elements,
-/// recomputable by anyone through `machine::Machine::verifier_key` (seeded from the fixed
-/// `KEY_SEED` precisely so that it is).
+/// recomputable by anyone through `machine::Machine::verifier_key` (salted from fixed
+/// `key_derivation_v2` labels precisely so that it is — constraint set 7; a `StdRng` `KEY_SEED`
+/// before).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RvmKey {
     pub cap: [[F; 4]; 4],

@@ -403,14 +403,20 @@ fn input_digest_rows_len(inputs: &[u32]) -> usize { randprotocol_zkvm::hash::inp
 #[test]
 fn input_table_shape_and_padding() {
     use randprotocol_zkvm::tables::input::{col, input_trace};
-    let t = input_trace(&[10, 20, 30], &[0, 2, 1], 8);
+    let mut range = RangeCounts::default();
+    let t = input_trace(&[10, 20, 30], &[0, 2, 1], 8, &mut range);
     assert_eq!(t.height(), 8);
+    // ZKM-1/ZKH-2: one `RANGE8` receipt per byte limb of every real word, none for padding.
+    assert_eq!(range.range.iter().sum::<u64>(), 12);
+    assert_eq!((range.range[10], range.range[20], range.range[30], range.range[0]), (1, 1, 1, 9));
     for (i, (word, mult)) in [(10u32, 0u32), (20, 2), (30, 1)].iter().enumerate() {
         let r = i * col::WIDTH;
         assert_eq!(t.values[r + col::IDX], randprotocol_zkvm::tables::F::from_u32(i as u32));
         assert_eq!(t.values[r + col::WORD], randprotocol_zkvm::tables::F::from_u32(*word));
         assert_eq!(t.values[r + col::IS_REAL], randprotocol_zkvm::tables::F::ONE);
         assert_eq!(t.values[r + col::MULT_READ], randprotocol_zkvm::tables::F::from_u32(*mult));
+        assert_eq!(t.values[r + col::WL0], randprotocol_zkvm::tables::F::from_u32(*word));
+        for k in 1..4 { assert_eq!(t.values[r + col::WL0 + k], randprotocol_zkvm::tables::F::ZERO); }
     }
     for i in 3..8 {
         let r = i * col::WIDTH;
@@ -510,8 +516,9 @@ fn cpu_trace_limbs_and_counts_every_load_store_address() {
     // into `dr = program digest rows + idr`) plus its own 32-word `IHVL0..31` canonical
     // encoding on its own last row — a second +32, on top of the program digest's own.
     // Constraint set 6: the public-digest prefix (`pdr` rows, also folded into `dr`) pays the
-    // same 4-per-row rate plus its own 32-word `PHVL0..31` encoding — a third +32.
-    let digest_range8 = 4 * dr + 32 + 32 + 32;
+    // same 4-per-row rate plus its own 32-word `PHVL0..31` encoding — a third +32. The next
+    // constraint set (ZKM-1/ZKH-2): the salt row's four lanes are byte-limbed too — +16.
+    let digest_range8 = 4 * dr + 32 + 32 + 32 + 16;
     assert_eq!(range.range.iter().sum::<u64>() as usize, 8 * mem_rows.len() + 4 * n_stores + digest_range8);
     let nibble_total: u64 = nibble.and.iter().sum();
     assert_eq!(nibble_total as usize, 2 * mem_rows.len());
@@ -756,7 +763,11 @@ fn alu_max_constraint_degree_is_pinned() {
             randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT,
         );
         assert_eq!(common.lookups.len(), 11);
-        assert_eq!(common.lookups[9].len(), 7, "sha256 packed lookup groups");
+        // Constraint set 7: the LogUp blind's `BLIND` send/receive pair is one more group (a bus
+        // of its own, so it folds with nothing else) — 20 interactions, 8 groups (was 18, 7). The
+        // degrees above did not move: the blind's count is a degree-1 column and its messages are
+        // degree 1, so its fraction pin is degree 2, under every table's own maximum.
+        assert_eq!(common.lookups[9].len(), 8, "sha256 packed lookup groups");
     }
 }
 
@@ -1099,7 +1110,9 @@ mod keccak_tests {
 fn public_table_rows_are_committed_words_with_their_read_counts() {
     use randprotocol_zkvm::tables::public;
     let w = public::col::WIDTH;
-    let t = public::public_trace(&[5, 6, 7], &[2, 0, 1], 8);
+    let mut range = RangeCounts::default();
+    let t = public::public_trace(&[5, 6, 7], &[2, 0, 1], 8, &mut range);
+    assert_eq!(range.range.iter().sum::<u64>(), 12);
     assert_eq!(t.height(), 8);
     for i in 0..3 {
         assert_eq!(t.values[i * w + public::col::IDX], F::from_u32(i as u32));
@@ -1112,9 +1125,13 @@ fn public_table_rows_are_committed_words_with_their_read_counts() {
     assert_eq!(t.values[3 * w + public::col::IS_REAL], F::ZERO);
     assert_eq!(t.values[3 * w + public::col::WORD], F::ZERO);
     assert_eq!(t.values[3 * w + public::col::MULT_READ], F::ZERO);
-    // Height rule: declare n+1, floor at MIN_HEIGHT — tables::input's rule exactly.
+    // Height rule: declare n+1, floor at MIN_HEIGHT — tables::input's rule exactly — and then,
+    // constraint set 7, at the private-data floor (128 rows): every segment up to 127 words
+    // declares 7 (was 2 for 0..=3, 3 for 4..=7, …).
     assert_eq!(public::public_log_height(0), public::MIN_LOG_HEIGHT);
-    assert_eq!(public::public_log_height(3), 2);
-    assert_eq!(public::public_log_height(4), 3);
+    assert_eq!(public::MIN_LOG_HEIGHT, randprotocol_zkvm::tables::MIN_PRIVATE_TABLE_LOG_HEIGHT);
+    assert_eq!(public::public_log_height(3), 7);
+    assert_eq!(public::public_log_height(127), 7);
+    assert_eq!(public::public_log_height(128), 8);
     assert_eq!(public::public_log_height(1000), 10);
 }

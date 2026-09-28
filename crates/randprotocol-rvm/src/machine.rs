@@ -16,8 +16,7 @@ use p3_lookup::InteractionBuilder;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::Matrix;
 use p3_uni_stark::{StarkConfig, StarkGenericConfig};
-use rand::rngs::StdRng;
-use rand::SeedableRng;
+pub use randprotocol_zkvm::machine::SaltRng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -29,7 +28,7 @@ pub use randprotocol_zkvm::machine::{
 /// The rVM's field and proof-system types are the RV32 machine's own aliases.
 pub type Val = randprotocol_zkvm::machine::Val;
 type Dft = Radix2DitParallel<Val>;
-pub type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, StdRng>;
+pub type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, SaltRng>;
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
 
@@ -44,10 +43,13 @@ use crate::tables::public::{public_trace, PublicAir, NUM_PUBLIC_VALUES};
 use crate::tables::range::{range_trace, RangeAir, RangeCounts};
 use crate::tables::reduce::{reduce_events, reduce_log_height, reduce_trace, ReduceAir};
 
-/// Fixed seed for the rVM's `key_config` RNGs — the role of `research`'s `machine::KEY_SEED`
-/// (a deterministic preprocessed commitment any verifier can recompute standalone), over a
-/// different artifact family, so a different arbitrary constant: "RVM_M5_2".
-const KEY_SEED: u64 = 0x5256_4d5f_4d35_5f32;
+/// The labels of the rVM's `key_config` salt streams (HCS-1, constraint set 7) — `research`'s
+/// `key_derivation_v2::MMCS_LABEL`/`PCS_LABEL` role over a different artifact family, so different
+/// labels. Until constraint set 7 this was a `StdRng` seed, `KEY_SEED = 0x5256_4d5f_4d35_5f32`
+/// ("RVM_M5_2"), whose stream `rand` does not promise to keep; `key_derivation_v2`'s module comment
+/// has the switch.
+const KEY_MMCS_LABEL: &[u8] = b"rvm/key/mmcs";
+const KEY_PCS_LABEL: &[u8] = b"rvm/key/pcs";
 
 /// The alternative proving backends' Plonky3 configurations (M5.4 Task 1):
 /// `research/src/machine.rs`'s `reference_cfg`/`cuda_cfg`, mirrored on the rVM's own
@@ -60,7 +62,7 @@ pub mod backend;
 /// seeds the PCS's own random codewords/quotient blinding. Kept private: callers pick a seeding
 /// strategy through `make_config` (fresh OS entropy, for proving) or `key_config`
 /// (deterministic, for a preprocessed commitment any verifier can recompute).
-fn build_config(profile: FriProfile, mmcs_rng: StdRng, pcs_rng: StdRng) -> Config {
+fn build_config(profile: FriProfile, mmcs_rng: SaltRng, pcs_rng: SaltRng) -> Config {
     let perm = permutation();
     let hash = Hash::new(perm.clone());
     let compress = Compress::new(perm);
@@ -77,8 +79,8 @@ fn generic_config<D, M>(
     profile: FriProfile,
     dft: D,
     val_mmcs: M,
-    pcs_rng: StdRng,
-) -> StarkConfig<HidingFriPcs<Val, D, M, ExtensionMmcs<Val, Challenge, M>, StdRng>, Challenge, Challenger>
+    pcs_rng: SaltRng,
+) -> StarkConfig<HidingFriPcs<Val, D, M, ExtensionMmcs<Val, Challenge, M>, SaltRng>, Challenge, Challenger>
 where
     D: p3_dft::TwoAdicSubgroupDft<Val>,
     M: p3_commit::Mmcs<Val, MultiProof: Sync, Error: Sync> + Clone,
@@ -104,12 +106,12 @@ fn key_config(profile: FriProfile) -> Config {
     build_config(profile, mmcs_rng, pcs_rng)
 }
 
-fn key_rngs() -> (StdRng, StdRng) {
-    (StdRng::seed_from_u64(KEY_SEED), StdRng::seed_from_u64(KEY_SEED ^ 0x9E37_79B9_7F4A_7C15))
+fn key_rngs() -> (SaltRng, SaltRng) {
+    (SaltRng::key(KEY_MMCS_LABEL), SaltRng::key(KEY_PCS_LABEL))
 }
 
 pub fn make_config(profile: FriProfile) -> Config {
-    build_config(profile, StdRng::from_rng(&mut rand::rng()), StdRng::from_rng(&mut rand::rng()))
+    build_config(profile, SaltRng::fresh(), SaltRng::fresh())
 }
 
 /// The rVM tier ladder (plan R2): stride 2 through the cheap-test sizes, then every rung near the
@@ -242,6 +244,25 @@ pub enum VerifyError {
     Poseidon2Height,    ReduceHeight,
     /// A program word the emulator could never execute (`Machine::check_program`): ZKQ-3.
     Program(DecodeError),
+    /// VERIFIER-1: FRI's commit-phase proof-of-work word for folding round `round` is not the
+    /// honest `0` (`check_commit_pow_witnesses`).
+    CommitPowWitness { round: usize },
+}
+
+/// VERIFIER-1 (the 2026-09-27 reviews), the rVM's copy of research's
+/// `machine::check_commit_pow_witnesses`: every FRI commit-phase proof-of-work word must be the
+/// honest `0`. This machine grinds `commit_proof_of_work_bits: 0` too, and at zero bits p3's
+/// `check_witness` returns `true` before observing the word, so it was bound to nothing — any
+/// value verified, and one proof had as many byte encodings as there are field elements per round.
+/// The honest prover's `grind(0)` writes `F::ZERO`, so no honestly produced proof is refused. The
+/// self-verifier (`programs::verify_rv32r`, through the shared pipeline) asserts the same words
+/// in-program, which is what keeps it differential with this `verify`.
+pub fn check_commit_pow_witnesses(proof: &Proof) -> Result<(), VerifyError> {
+    let fri = &proof.batch.opening_proof.1;
+    match fri.commit_pow_witnesses.iter().position(|w| *w != Val::ZERO) {
+        Some(round) => Err(VerifyError::CommitPowWitness { round }),
+        None => Ok(()),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -488,7 +509,7 @@ impl Machine {
             Backend::Reference => {
                 // Fresh entropy for the proving config (hiding), deterministic for the key
                 // config — the same split `make_config`/`key_config` make on the CPU.
-                let cfg = backend::reference_config(self.profile, StdRng::from_rng(&mut rand::rng()), StdRng::from_rng(&mut rand::rng()));
+                let cfg = backend::reference_config(self.profile, SaltRng::fresh(), SaltRng::fresh());
                 let (mmcs_rng, pcs_rng) = key_rngs();
                 let key = backend::reference_config(self.profile, mmcs_rng, pcs_rng);
                 self.prove_on(&cfg, &key, program, witness, tier)
@@ -496,7 +517,7 @@ impl Machine {
             #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
             Backend::Cuda => {
                 let gpu = rand_zkvm_cuda::gpu::GpuProver::probe(backend::PERM_SEED).map_err(|e| ProveError::Backend(e.to_string()))?;
-                let cfg = backend::cuda_config(self.profile, gpu.clone(), StdRng::from_rng(&mut rand::rng()), StdRng::from_rng(&mut rand::rng()));
+                let cfg = backend::cuda_config(self.profile, gpu.clone(), SaltRng::fresh(), SaltRng::fresh());
                 let (mmcs_rng, pcs_rng) = key_rngs();
                 let key = backend::cuda_config(self.profile, gpu, mmcs_rng, pcs_rng);
                 self.prove_on(&cfg, &key, program, witness, tier)
@@ -583,6 +604,9 @@ impl Machine {
         Self::check_program(program).map_err(VerifyError::Program)?;
         // Every range check on the proof's declared shape, before anything is sized from it.
         check_declared_heights(proof.tier, proof.reg_log_height, proof.ram_log_height, proof.poseidon2_log_height, proof.reduce_log_height)?;
+        // VERIFIER-1: the commit-phase PoW words, unobserved at zero bits, must be the honest
+        // zero — a comparison per round, with the other cheap checks, before any key is built.
+        check_commit_pow_witnesses(proof)?;
         // A `Vec` comparison: simultaneously the batch's instance-count check and every declared
         // height's.
         if proof.batch.degree_bits != log_ext_degrees(program, proof.tier, proof.reg_log_height, proof.ram_log_height, proof.poseidon2_log_height, proof.reduce_log_height) { return Err(VerifyError::Tier); }

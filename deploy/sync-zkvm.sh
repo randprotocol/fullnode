@@ -147,6 +147,13 @@
 # and the new `tests/{evm,sbpf}_rt.rs`) and recursion's two hand-fixed files were restored after
 # it, as before.
 #
+# Constraint set 7 (circuits `b9ffc39`, fullnode v0.6.1) needs nothing new from this script beyond
+# the two hand mirrors every cs has needed: `asm::ops::call_poseidon2_len` and
+# `guests::poseidon2_len_demo` (HCS-4's `SYS_POSEIDON2_LEN = 7`). The new `tables/blind.rs` rides
+# the rsync as a submodule of `tables/`; `key_derivation_v2.rs` was already named in `lib.rs`. The
+# research drift earlier syncs restored (`tests/{evm,sbpf}_abi.rs`, `tests/{evm,sbpf}_rt.rs`) is
+# taken whole this time; `ledger.rs`'s RAND comments and recursion's two hand fixes are kept.
+#
 # The CUDA backend is *not* vendored either: crates/randprotocol-zkvm depends on it by path, as
 # ../../../circuits/rand-zkvm-cuda, so `circuits` must be checked out beside `fullnode` when building
 # with --features cuda or --features mock-cuda.
@@ -323,7 +330,10 @@ echo "reminder: --features cuda / mock-cuda need circuits checked out at ../../.
 # move, the rVM verifier does), then at `971b96b` (the rest of the 2026-09-27 zk scan: the reduce
 # chip's clock chain, real-row-only row kinds, run-end rule and address range checks; the public
 # table's four real rows; both ends of every multi-cell access range-checked; `Machine::verify`
-# runs `check_program`; a Poseidon2 known-answer test — again no aggregate-digest move). Re-vendoring the rVM alone is this section alone: the research
+# runs `check_program`; a Poseidon2 known-answer test — again no aggregate-digest move), then at
+# `b9ffc39` (constraint set 7: the verifier program refuses a non-zero commit-phase PoW word
+# (VERIFIER-1), every chip's writes bound on its row (#58), keys salted from `key_derivation_v2`,
+# new inner vk / interface digests — the aggregate program digest DOES move here). Re-vendoring the rVM alone is this section alone: the research
 # section above rewrites `guests-compiled/PROVENANCE.md` and would carry research's older drift. Two vendored files carry hand fixes this
 # section does not reproduce — keep them when re-syncing: `Cargo.toml`'s `license.workspace`
 # line and `tests/backend.rs`'s doc comment (`randprotocol-zkvm`, not the old crate name). What the
@@ -397,4 +407,4 @@ open(p, 'w').write(s)
 PY
 grep -rl "recursion::" "$RVM_DST/tests" | xargs -I{} sed -i '' 's/recursion::/randprotocol_rvm::/g' {} 2>/dev/null || true
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 971b96b) into $RVM_DST"
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin b9ffc39) into $RVM_DST"

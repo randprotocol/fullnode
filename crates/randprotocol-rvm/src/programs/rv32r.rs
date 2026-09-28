@@ -32,6 +32,10 @@ pub fn verify_rv32r(shape: &RvmShape, key: &RvmKey, cp: Checkpoints) -> Verifier
     // and absorbed into the interface between the count and the public values, exactly as the
     // N-generic program absorbs it after `N`. A tree of aggregates is this program over a tape
     // of rVM proofs, whose root aggregate's `(chain, aggregator, nonce)` these words bind.
+    // ZKQ-5 (decided 2026-09-28, `docs/02-aggregate.md`): nothing here asserts these words equal
+    // the inner aggregate's binding — the program sees that binding only inside the inner
+    // interface digest. The tie is the verifier's: it recomputes every level's digest from the
+    // covered bundles under the chain's one binding, which forces the two equal.
     let bind = b.alloc(8);
     for k in 0..8i64 {
         let w = b.hint();

@@ -436,6 +436,13 @@ where
         if !ch.check_witness(params.commit_proof_of_work_bits, *witness) {
             return Err(ReplayError::PowWitness("commit phase"));
         }
+        // VERIFIER-1: p3 accepts any word at zero bits, but `Machine::verify` (research's
+        // `check_commit_pow_witnesses`, and the rVM's own) refuses all but the honest `0` — one
+        // encoding per proof — and the program asserts it. The replay is `Machine::verify`'s
+        // acceptance, so it refuses the same words.
+        if *witness != crate::isa::F::ZERO {
+            return Err(ReplayError::PowWitness("commit phase"));
+        }
         betas.push(ch.sample_algebra_element());
     }
     if fri.final_poly.len() != params.final_poly_len() {

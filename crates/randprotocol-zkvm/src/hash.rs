@@ -84,6 +84,26 @@ pub fn sponge_hash(msg: &[u32]) -> [u32; 8] {
     split_digest(digest)
 }
 
+/// HCS-4 (the next constraint set): the sponge the `POSEIDON2_LEN` syscall computes — `sponge_hash`
+/// with the message length bound. The state starts as `[0, 0, 0, 0, n, 0, 0, 0]` (the length in
+/// capacity lane 4, which absorption never overwrites) rather than all zero, the message is absorbed
+/// exactly as `sponge_hash` absorbs it (rate 4, overwrite mode), and an empty message still takes one
+/// permutation of that seeded state — so no two messages of different lengths share a starting
+/// state, and `sponge_hash_len(&[])` is a permutation output rather than the zero digest.
+pub fn sponge_hash_len(msg: &[u32]) -> [u32; 8] {
+    let mut state = [Val::ZERO; 8];
+    state[4] = Val::from_u32(msg.len() as u32);
+    let mut chunks = msg.chunks(4).peekable();
+    if chunks.peek().is_none() {
+        state = permute_state(state);
+    }
+    for chunk in chunks {
+        for (k, w) in chunk.iter().enumerate() { state[k] = Val::from_u32(*w); }
+        state = permute_state(state);
+    }
+    split_digest([state[0], state[1], state[2], state[3]])
+}
+
 /// hc (M3.4): the in-circuit program digest, exactly what `tables::cpu`'s digest rows
 /// compute and `pv::HC0..HC7` publish. `Program::digest` (`isa.rs`) is a thin wrapper over
 /// this.

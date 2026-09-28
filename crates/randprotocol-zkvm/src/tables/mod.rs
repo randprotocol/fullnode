@@ -10,6 +10,7 @@ pub mod input;
 pub mod public;
 pub mod keccak;
 pub mod sha256;
+pub mod blind;
 
 pub type F = p3_goldilocks::Goldilocks;
 
@@ -38,6 +39,15 @@ pub type F = p3_goldilocks::Goldilocks;
 /// number whatever profile proves it. `tests/privacy_floor.rs` pins the arithmetic and counts the
 /// distinct opened rows off a real production proof. **Raise this with the query count**: any
 /// retune of `FriProfile::Production` past 126 queries needs 8.
+///
+/// **Constraint set 7 makes it every declared table's floor, on both sides** (audit INT-2): the
+/// LogUp blind (`blind`) hides a table's published terminal, but the same table's permutation
+/// (running-sum) columns are opened like its main columns, and hidden only above this height. So
+/// `machine::check_declared_heights` refuses a program, input, public, keccak or sha256 height below
+/// it, and the prover floors the program and public tables here too (`program::program_log_height`,
+/// `public::public_log_height`). The paragraphs below describe the rule as it stood in constraint
+/// set 6, when it was prover-side only and the program table was left out; they are kept because
+/// the arithmetic is the same.
 ///
 /// It is prover-side only. The verifier's ranges already admit it (`keccak ∈ [5, t + 5]`,
 /// `sha256 ∈ [6, min(t + 6, 20)]`, `input ∈ [2, 20]`, and a chain's call caps — keccak ≤ 12,
@@ -112,6 +122,11 @@ pub mod bus {
     /// `(clk, ptr)` is only the handle that makes the cpu's syscall row and the chip's block the
     /// same event.
     pub const SHA256: LookupBus<'static> = LookupBus::new("SHA256");
+    /// Constraint set 7 (audit INT-2): every instance → the next, in a fixed cycle: one two-element
+    /// blinding value per instance, sent and received on each instance's first row
+    /// (`tables::blind`). Balanced by construction; it exists to shift every published LogUp
+    /// terminal by a fresh uniform element.
+    pub const BLIND: PermutationCheckBus<'static> = PermutationCheckBus::new("BLIND");
 }
 
 /// Split a u32 into four little-endian bytes as field elements.

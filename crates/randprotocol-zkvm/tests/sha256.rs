@@ -37,7 +37,7 @@ fn compress_matches_sha2_compress256_on_a_thousand_blocks() {
 /// whose padding needs a whole extra block), either side of a full 64-byte block, and the same
 /// three cases one block further along.
 fn sdk_sha256(msg: &[u8]) -> [u8; 32] {
-    // stand-in for `sha256_compress(buf.as_mut_ptr())`
+    // stand-in for `sha256_compress(buf)`
     let compress_syscall = |buf: &mut [u32; 24]| {
         let block: [u32; 16] = buf[..16].try_into().unwrap();
         let mut h: [u32; 8] = buf[16..].try_into().unwrap();

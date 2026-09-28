@@ -379,7 +379,7 @@ where
 
         // 7 ── per FRI round, the commit cap and its PoW witness. `commit_proof_of_work_bits == 0`,
         // so the witness is *never observed* (`grinding_challenger.rs:44-49`); the program reads it
-        // and discards it, which is why it is on the tape at all.
+        // and asserts it is the honest `0` (VERIFIER-1), which is why it is on the tape at all.
         w.begin(Segment::FriCommits);
         for (comm, witness) in fri.commit_phase_commits.iter().zip(&fri.commit_pow_witnesses) {
             w.cap(comm.roots());
