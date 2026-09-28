@@ -990,7 +990,13 @@ impl ZkExecutor {
         // be opened and checked later (spec §6.1). `decode_and_check` has already refused a
         // proof whose `IN0..7` are not `u32`s, so the narrowing below cannot silently truncate.
         let h_in = std::array::from_fn(|i| proof.public_values[pv::IN0 + i] as u32);
-        Ok(CallOutcome { tier: proof.tier.0 as u8, outputs, h_in })
+        Ok(CallOutcome {
+            tier: proof.tier.0 as u8,
+            outputs,
+            h_in,
+            keccak_log_height: proof.keccak_log_height,
+            sha256_log_height: proof.sha256_log_height,
+        })
     }
 
     /// The body of `warm`/`warm_hardened`: every admissible tier's key for one program height and

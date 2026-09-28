@@ -372,7 +372,7 @@ impl StubExecutor {
         if h_pub != want {
             return Err(ConfidentialError::InvalidProof("PublicValues".into()));
         }
-        Ok(CallOutcome { tier, outputs, h_in })
+        Ok(CallOutcome { tier, outputs, h_in, keccak_log_height: 0, sha256_log_height: 0 })
     }
 
     fn hash_words(domain: &[u8], parts: &[&[u8]]) -> Word8 {
@@ -590,7 +590,11 @@ mod tests {
         let id = Hash::digest(b"p");
         let proof = StubExecutor::make_proof(&id, 12, [1, 0, 5, 0, 0, 0, 0, 9]);
         let out = StubExecutor.verify_call(&record(id), &proof).unwrap();
-        assert_eq!(out, CallOutcome { tier: 12, outputs: [1, 0, 5, 0, 0, 0, 0, 9], h_in: [0; 8] });
+        assert_eq!(
+            out,
+            CallOutcome { tier: 12, outputs: [1, 0, 5, 0, 0, 0, 0, 9], h_in: [0; 8], keccak_log_height: 0, sha256_log_height: 0 }
+        );
+        assert_eq!(out.gas_max(), crate::gas::gas_max(12, 0, 0), "a stub proof declares no hash table");
         // …and the H_IN a call-input envelope is sealed against travels in the proof, not beside it.
         let sealed = StubExecutor::make_proof_with_h_in(&id, 12, [1, 0, 5, 0, 0, 0, 0, 9], [7; 8]);
         assert_eq!(StubExecutor.verify_call(&record(id), &sealed).unwrap().h_in, [7; 8]);
