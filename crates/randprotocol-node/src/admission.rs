@@ -755,6 +755,36 @@ pub fn minter_not_allowed(
     (ledger.validators().contains_key(&addr) && !minters.contains(&addr)).then_some(TxError::MinterNotAllowed(addr))
 }
 
+/// Spec 2026-09-28 §4.1 (gas, Phase 0): what `tx` must pay under `policy`. A `Call` pays
+/// `GasPolicy::call_floor` of its proof header — `gas_max(tier, keccak, sha256)` and its bytes —
+/// read by `decode_call` (no verification; the size cap first, so an oversized blob buys no
+/// decode). Every other action's floor is the schedule's `fee_floor`. Admission policy above
+/// the ledger's `call_fee` validity rule, the LEDGER-1 pattern: the pool and the proposer
+/// demand it, a block never does.
+pub fn call_floor(
+    tx: &Transaction,
+    ledger: &randprotocol_core::Ledger,
+    executor: &dyn randprotocol_core::confidential::ConfidentialExecutor,
+    policy: &randprotocol_core::gas::GasPolicy,
+) -> Result<u64, TxError> {
+    use randprotocol_core::gas;
+    use randprotocol_core::Action;
+    let Action::Call { program, proof, input_envelope } = &tx.action else {
+        return Ok(gas::fee_floor(&tx.action));
+    };
+    if proof.len() > ledger.max_proof_bytes() {
+        return Err(TxError::ProofTooLarge);
+    }
+    let record = ledger.program(program).ok_or(TxError::UnknownProgram(*program))?;
+    let outcome = executor.decode_call(record, proof).map_err(TxError::InvalidProof)?;
+    Ok(policy.call_floor(outcome.tier, outcome.keccak_log_height, outcome.sha256_log_height, gas::call_bytes(proof, input_envelope.as_ref())))
+}
+
+/// `FeeTooLow` naming `floor` when `tx` pays less; non-permanent (a floor a fee market moves).
+pub fn fee_below_floor(tx: &Transaction, floor: u64) -> Option<TxError> {
+    (tx.fee() < floor).then(|| TxError::FeeTooLow { min: floor, fee: tx.fee() })
+}
+
 /// The acceptance a verdict earns, and the cache entry it leaves behind.
 ///
 /// `Accept` even when the pool then refuses the transaction as a conflict: it verified, so
