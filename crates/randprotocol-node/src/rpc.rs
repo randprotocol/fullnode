@@ -187,6 +187,30 @@ pub struct NodeStatus {
     /// (zeroed) on a chain without the section.
     #[serde(default)]
     pub aggregation: AggregationStatus,
+    /// Spec 2026-09-28 §7.1, §8: the tip ledger's live gas prices (`Ledger::gas_prices`),
+    /// `null` on a chain without a `gas` section. Refreshed every commit by `publish_status`, the
+    /// same way as every other field here — this is what `rand_getLimits` reads to serve a
+    /// `dynamic` chain's *current* prices rather than its genesis snapshot (`ChainLimits::of` is
+    /// computed once, at startup).
+    #[serde(default)]
+    pub gas_prices: Option<GasPricesStatus>,
+}
+
+/// [`NodeStatus::gas_prices`]'s two amounts, decimal strings like every other RAND amount on the
+/// wire — unlike `randprotocol_core::gas::GasPrices`, which is ledger-internal state and not
+/// itself RPC-facing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct GasPricesStatus {
+    #[serde(serialize_with = "u64_as_decimal_string")]
+    pub gas_price: u64,
+    #[serde(serialize_with = "u64_as_decimal_string")]
+    pub byte_price: u64,
+}
+
+impl From<randprotocol_core::gas::GasPrices> for GasPricesStatus {
+    fn from(p: randprotocol_core::gas::GasPrices) -> GasPricesStatus {
+        GasPricesStatus { gas_price: p.gas_price, byte_price: p.byte_price }
+    }
 }
 
 /// Serialize a `u64` amount as a decimal string, the one rule this RPC follows for every amount
@@ -485,8 +509,16 @@ pub struct ChainLimits {
     /// wallet reads to build a v3 transaction — `nk` and a salt to the bundle guest, the spend
     /// key to its own auth proof — instead of a v1/v2 one.
     pub hc_auth: Option<String>,
-    /// Spec 2026-09-28 §8: this node's gas policy (Phase 0), `null` when it runs none. Node
-    /// policy, not a chain limit — two nodes on one chain may answer differently.
+    /// Spec 2026-09-28 §8: this node's gas policy (Phase 0), or the chain's own `gas` section
+    /// (Phase 1, §7.1) when its genesis carries one — a chain's section always wins, and
+    /// [`ChainLimits::with_gas_policy`] never overrides it. `null` when neither applies. Node
+    /// policy is not a chain limit (two nodes on one chain may answer differently), but a
+    /// chain's own section is consensus state, the same on every node.
+    ///
+    /// Under a `gas` section these are the tip's *current* prices (§7.1), not necessarily this
+    /// snapshot's genesis ones — `dispatch`'s `rand_getLimits` arm overrides them from the
+    /// published [`NodeStatus::gas_prices`] when [`ChainLimits::adjust_bps`] says the chain runs
+    /// the dynamic controller.
     ///
     /// The two prices are RAND amounts, so decimal strings like every other u64 amount on the
     /// wire (docs/rpc.md's conventions).
@@ -494,14 +526,21 @@ pub struct ChainLimits {
     pub gas_price: Option<u64>,
     #[serde(serialize_with = "opt_u64_as_decimal_string")]
     pub byte_price: Option<u64>,
-    /// `"header"` while the policy prices `gas_max` of the proof header (Phase 0); `null` with
-    /// no policy. Phase 1 (chain 18) answers `"circuit"`.
+    /// `"header"` while a node policy prices `gas_max` of the proof header (Phase 0); `"circuit"`
+    /// on a chain whose genesis carries a `gas` section (Phase 1); `null` with neither.
     pub gas_metering: Option<&'static str>,
+    /// The bundle guest's flat declared gas (genesis `gas.bundle_gas_limit`), `null` without a
+    /// section.
+    pub bundle_gas_limit: Option<u64>,
+    /// The dynamic controller's step size in basis points (genesis `gas.dynamic.adjust_bps`),
+    /// `null` on a chain without `dynamic` — including one with a `gas` section whose prices
+    /// never move.
+    pub adjust_bps: Option<u32>,
 }
 
 impl ChainLimits {
     pub fn of(ledger: &randprotocol_core::Ledger) -> ChainLimits {
-        ChainLimits {
+        let mut limits = ChainLimits {
             max_program_words: ledger.max_program_words(),
             max_proof_bytes: ledger.max_proof_bytes(),
             max_block_bytes: ledger.max_block_bytes(),
@@ -513,11 +552,28 @@ impl ChainLimits {
             gas_price: None,
             byte_price: None,
             gas_metering: None,
+            bundle_gas_limit: None,
+            adjust_bps: None,
+        };
+        if let Some(g) = ledger.gas() {
+            let prices = ledger.gas_prices();
+            limits.gas_price = Some(prices.gas_price);
+            limits.byte_price = Some(prices.byte_price);
+            limits.gas_metering = Some("circuit");
+            limits.bundle_gas_limit = Some(g.bundle_gas_limit);
+            limits.adjust_bps = g.dynamic.as_ref().map(|d| d.adjust_bps);
         }
+        limits
     }
 
-    /// The same limits announcing `policy` (`None` clears them).
+    /// The same limits announcing a node's `policy` (`None` clears them) — a no-op when the
+    /// chain's own genesis already carries a `gas` section (`gas_metering == Some("circuit")`):
+    /// that is consensus state, not a node's to override, and the caller (`node.rs`) is the one
+    /// that warns about it.
     pub fn with_gas_policy(mut self, policy: Option<randprotocol_core::gas::GasPolicy>) -> ChainLimits {
+        if self.gas_metering == Some("circuit") {
+            return self;
+        }
         self.gas_price = policy.map(|p| p.gas_price);
         self.byte_price = policy.map(|p| p.byte_price);
         self.gas_metering = policy.map(|_| "header");
@@ -529,6 +585,24 @@ impl ChainLimits {
     pub const fn rpc_max_body_bytes(&self) -> usize {
         rpc_max_body_bytes(self.max_proof_bytes, self.max_call_envelope_bytes)
     }
+}
+
+/// The chain's current gas prices under a `gas` section (spec §7.1, §8): the tip's live prices
+/// when `dynamic` is set (`NodeStatus::gas_prices`, published every commit by `publish_status`),
+/// else the section's own fixed prices in `st.limits` — a non-`dynamic` section's prices never
+/// move, so the startup snapshot is always current. Falls back to the snapshot too if `dynamic`
+/// is set but the status has not published a price yet (a database this test harness builds by
+/// hand, never a running node past its first loop pass).
+///
+/// Only meaningful on a chain with a `gas` section (`st.limits.gas_metering == Some("circuit")`);
+/// every caller checks that first.
+fn tip_gas_prices(st: &RpcState) -> (u64, u64) {
+    if st.limits.adjust_bps.is_some() {
+        if let Some(p) = st.status.read().unwrap_or_else(|e| e.into_inner()).gas_prices {
+            return (p.gas_price, p.byte_price);
+        }
+    }
+    (st.limits.gas_price.unwrap_or(0), st.limits.byte_price.unwrap_or(0))
 }
 
 /// The largest request body the RPC accepts on a chain whose proofs are capped at
@@ -1931,7 +2005,19 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let words = st.storage.program_public(&id).map_err(RpcError::internal)?.unwrap_or_default();
             Ok(json!(hex::encode(words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())))
         }
-        "rand_getLimits" => Ok(json!(st.limits)),
+        "rand_getLimits" => {
+            let mut limits = st.limits;
+            // Spec §7.1, §8: under a `gas` section the prices reported are the tip's current
+            // ones, not this process's genesis snapshot — `tip_gas_prices` tracks `dynamic`'s
+            // moves through the published status; a non-`dynamic` section's own fixed prices are
+            // already correct in `limits` and this is then a no-op.
+            if limits.gas_metering == Some("circuit") {
+                let (gas_price, byte_price) = tip_gas_prices(st);
+                limits.gas_price = Some(gas_price);
+                limits.byte_price = Some(byte_price);
+            }
+            Ok(json!(limits))
+        }
         "rand_getProgramCode" => {
             let id = parse_hash(p, 0)?;
             Ok(st
@@ -2069,9 +2155,26 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                         }
                     };
                     let (klh, slh) = (height("keccak_log_height")?, height("sha256_log_height")?);
-                    match (st.limits.gas_price, st.limits.byte_price) {
-                        (Some(g), Some(b)) => randprotocol_core::gas::GasPolicy { gas_price: g, byte_price: b }.call_floor(tier, klh, slh, bytes),
-                        _ => randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(tier, bytes),
+                    // Spec §3.3, §7.1, §8: under a chain's own `gas` section the floor is the
+                    // *declared* limit's, not the decoded header's `gas_max` ceiling (Phase 0's
+                    // node-policy rule below) — so the request must carry `gas`, and the answer is
+                    // priced at the tip's current prices (`tip_gas_prices`, dynamic-aware).
+                    if st.limits.gas_metering == Some("circuit") {
+                        let gas_limit = match spec.get("gas") {
+                            None | Some(Value::Null) => {
+                                return Err(RpcError::invalid_params("under the gas section a call estimate needs its gas"));
+                            }
+                            Some(g) => g
+                                .as_u64()
+                                .ok_or_else(|| RpcError::invalid_params("gas must be a non-negative integer"))?,
+                        };
+                        let (gas_price, byte_price) = tip_gas_prices(st);
+                        randprotocol_core::gas::circuit_call_floor(gas_price, byte_price, gas_limit, bytes)
+                    } else {
+                        match (st.limits.gas_price, st.limits.byte_price) {
+                            (Some(g), Some(b)) => randprotocol_core::gas::GasPolicy { gas_price: g, byte_price: b }.call_floor(tier, klh, slh, bytes),
+                            _ => randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(tier, bytes),
+                        }
                     }
                 }
                 _ => return Err(RpcError::invalid_params("kind must be bundle, deploy or call")),
@@ -3477,6 +3580,8 @@ mod tests {
                 "gas_price": null,
                 "byte_price": null,
                 "gas_metering": null,
+                "bundle_gas_limit": null,
+                "adjust_bps": null,
             })
         );
         let gs = raised_genesis();
@@ -3495,6 +3600,8 @@ mod tests {
                 "gas_price": null,
                 "byte_price": null,
                 "gas_metering": null,
+                "bundle_gas_limit": null,
+                "adjust_bps": null,
             })
         );
         // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
@@ -3515,6 +3622,8 @@ mod tests {
                 "gas_price": null,
                 "byte_price": null,
                 "gas_metering": null,
+                "bundle_gas_limit": null,
+                "adjust_bps": null,
             })
         );
         // The v0.6 switch: what a wallet reads to prove its calls over the call binding (INT-4).
@@ -3547,6 +3656,115 @@ mod tests {
         assert_eq!(v["gas_price"], serde_json::Value::Null);
         assert_eq!(v["byte_price"], serde_json::Value::Null);
         assert_eq!(v["gas_metering"], serde_json::Value::Null);
+    }
+
+    /// Task B4 (spec §3.3, §7.1, §8): a chain's own `gas` section, reported by `rand_getLimits`
+    /// and priced by `rand_estimateFee`'s call arm — the declared limit, not the header's
+    /// `gas_max` ceiling.
+    #[tokio::test]
+    async fn get_limits_serves_the_chains_gas_section() {
+        use randprotocol_core::gas::{self, GasConfig, GasMetering};
+        let mut gs = fixtures::genesis(1);
+        gs.ledger.set_gas(Some(GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: 16_383,
+            metering: GasMetering::Circuit,
+            dynamic: None,
+        }));
+        let (_d, st) = state_for(&gs);
+        let v = ok(&st, "rand_getLimits", json!([])).await;
+        assert_eq!(v["gas_price"], "100");
+        assert_eq!(v["byte_price"], "800");
+        assert_eq!(v["bundle_gas_limit"], 16_383);
+        assert_eq!(v["gas_metering"], "circuit");
+        assert_eq!(v["adjust_bps"], serde_json::Value::Null, "no dynamic section");
+
+        let fee = ok(&st, "rand_estimateFee", json!([{"kind": "call", "tier": 12, "bytes": 1_300_000, "gas": 3_000}])).await;
+        assert_eq!(fee, gas::circuit_call_floor(100, 800, 3_000, 1_300_000).to_string());
+        let e = call(&st, "rand_estimateFee", json!([{"kind": "call", "tier": 12}])).await.unwrap_err();
+        assert_eq!(e.code, -32602, "under the section a call estimate needs its gas");
+
+        // `with_gas_policy` never overrides a chain's own section: the node's flags are ignored.
+        let overridden = st.limits.with_gas_policy(Some(randprotocol_core::gas::GasPolicy::DEFAULT));
+        assert_eq!(overridden, st.limits, "a node policy cannot override the chain's own gas section");
+    }
+
+    /// Task B7 (spec §7.1, §8): under `dynamic`, `rand_getLimits` and `rand_status` serve the
+    /// TIP's live prices, not the genesis snapshot `ChainLimits::of` took at startup. The
+    /// production path is `publish_status`, which this harness's stand-in node loop never runs
+    /// (it only answers a handful of `NodeCommand`s) — so the test sets `NodeStatus::gas_prices`
+    /// by hand after the commit, exactly as `publish_status` would on the real node loop.
+    #[tokio::test]
+    async fn rand_get_limits_and_status_follow_the_tips_moved_prices() {
+        use randprotocol_core::gas::{DynamicGas, GasConfig, GasMetering};
+        let mut gs = fixtures::genesis(1);
+        gs.ledger.set_gas(Some(GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: 16_383,
+            metering: GasMetering::Circuit,
+            dynamic: Some(DynamicGas {
+                target_block_bytes: 4_096,
+                target_block_gas: 20_000,
+                adjust_bps: 1_250,
+                min_gas_price: 100,
+                min_byte_price: 800,
+            }),
+        }));
+        let (_d, st) = state_for(&gs);
+
+        // Before any commit: the genesis snapshot (the section's own starting prices), and the
+        // status method reports no published prices yet (this harness's stand-in loop only).
+        let v = ok(&st, "rand_getLimits", json!([])).await;
+        assert_eq!(v["gas_price"], "100");
+        assert_eq!(v["byte_price"], "800");
+        assert_eq!(ok(&st, "rand_status", json!([])).await["gas_prices"], serde_json::Value::Null);
+
+        // An over-target block (double `target_block_bytes`, at-target gas): `close_block`
+        // raises `byte_price` and leaves `gas_price` where it is.
+        let mut ledger = gs.ledger.clone();
+        ledger.set_height(1);
+        ledger.set_timestamp_ms(1);
+        ledger.apply_transactions(&[], &key(1).address(), &StubExecutor).unwrap();
+        ledger.close_block(1, &key(1).address(), 8_192, 20_000);
+        let moved = ledger.gas_prices();
+        assert!(moved.byte_price > 800, "an over-target block raises byte_price: {moved:?}");
+        assert_eq!(moved.gas_price, 100, "an at-target block leaves gas_price alone");
+        let b1 = make_block_unchecked(&gs.block, &ledger, vec![], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+
+        // What `publish_status` publishes after this commit on the real node loop.
+        st.status.write().unwrap().gas_prices = Some(moved.into());
+
+        let v = ok(&st, "rand_getLimits", json!([])).await;
+        assert_eq!(v["gas_price"], moved.gas_price.to_string());
+        assert_eq!(v["byte_price"], moved.byte_price.to_string());
+        let s = ok(&st, "rand_status", json!([])).await;
+        assert_eq!(s["gas_prices"]["gas_price"], moved.gas_price.to_string());
+        assert_eq!(s["gas_prices"]["byte_price"], moved.byte_price.to_string());
+
+        // `rand_estimateFee`'s call arm prices at the moved byte price too.
+        let fee = ok(&st, "rand_estimateFee", json!([{"kind": "call", "tier": 12, "bytes": 1_300_000, "gas": 3_000}])).await;
+        assert_eq!(fee, randprotocol_core::gas::circuit_call_floor(moved.gas_price, moved.byte_price, 3_000, 1_300_000).to_string());
+    }
+
+    /// A chain with no `gas` section reports the node policy exactly as before — `dynamic`
+    /// tracking is only wired for a chain that has a section (`gas_metering == Some("circuit")`);
+    /// `tip_gas_prices` is never consulted here even if `NodeStatus::gas_prices` were somehow set.
+    #[tokio::test]
+    async fn without_a_gas_section_the_node_policy_is_unaffected_by_dynamic_tracking() {
+        let gs = fixtures::genesis(1);
+        let (_d, mut st) = state_for(&gs);
+        st.limits = st.limits.with_gas_policy(Some(randprotocol_core::gas::GasPolicy::DEFAULT));
+        // A stray published price (never happens in practice without a `gas` section) must not
+        // leak into a chain running the plain node policy.
+        st.status.write().unwrap().gas_prices =
+            Some(GasPricesStatus { gas_price: 999, byte_price: 999 });
+        let v = ok(&st, "rand_getLimits", json!([])).await;
+        assert_eq!(v["gas_price"], "100");
+        assert_eq!(v["byte_price"], "800");
+        assert_eq!(v["gas_metering"], "header");
     }
 
     /// The RPC's local limits follow a 20 MiB ledger (spec §8): the body limit is the same formula
