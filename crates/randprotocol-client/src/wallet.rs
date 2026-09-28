@@ -2148,7 +2148,12 @@ pub async fn submit_bound_call(
     let checked = |binding: &[u32; TX_BINDING_WORDS]| -> Result<Vec<u8>> {
         let proof = prove_call(binding)?;
         let tier = call_proof_tier(&proof)?;
-        let need = call_fee_default(tier, gas::call_bytes(&proof, envelope.as_ref()));
+        // No `limits` here: this checked-closure only guards the fee the bundle was already
+        // built for (the ledger's own floor) against a proof that came out dearer than declared;
+        // the caller prices the real policy floor, with the header's own heights, before it ever
+        // calls in.
+        let header = randprotocol_zkvm::executor::decode_canonical(&proof).map_err(|e| anyhow!("the call proof does not decode: {e}"))?;
+        let need = call_fee_default(None, tier, header.keccak_log_height, header.sha256_log_height, gas::call_bytes(&proof, envelope.as_ref()));
         if need > fee {
             return Err(anyhow!(
                 "the call proof came out at tier {tier}, {} bytes, whose fee is {} RAND — more than the {} RAND                  the fee bundle was built for; retry with --fee {}",
@@ -2770,15 +2775,21 @@ pub fn deploy_fee_default(action: &Action) -> u64 {
     gas::fee_floor(action)
 }
 
-/// What a `call` pays by default — and deliberately NOT `fee_floor(Call) + call_fee(..)`.
+/// What a `call` pays by default: the node's gas policy over the proof's header (spec 2026-09-28
+/// §4.1) when it announces one, else deliberately NOT `fee_floor(Call) + call_fee(..)`.
 /// `fee_floor(Call)` is `BUNDLE_BASE + CALL_BASE`, and `CALL_BASE` is already `call_fee`'s own
 /// constant term, so adding the two overpays by `CALL_BASE`. The node's floor, once it has
-/// decoded the proof and knows the tier, is precisely this (`Ledger::validate_inner`).
+/// decoded the proof and knows the tier, is precisely this (`Ledger::validate_inner`) — never
+/// under either.
 ///
-/// `bytes` is the call's proof plus its input envelope (`gas::call_bytes`); only what is past
-/// `gas::CALL_FREE_BYTES` costs anything, so a call under today's caps pays today's fee.
-pub fn call_fee_default(tier: u8, bytes: usize) -> u64 {
-    gas::BUNDLE_BASE + gas::call_fee(tier, bytes)
+/// `bytes` is the call's proof plus its input envelope (`gas::call_bytes`); under `limits`'
+/// gas policy every byte prices in (the free allowance is gone), and without one only what is
+/// past `gas::CALL_FREE_BYTES` costs anything, so a call under today's caps pays today's fee.
+pub fn call_fee_default(limits: Option<&ChainLimits>, tier: u8, keccak_log_height: u8, sha256_log_height: u8, bytes: usize) -> u64 {
+    match limits.and_then(|l| l.gas_policy()) {
+        Some(p) => p.call_floor(tier, keccak_log_height, sha256_log_height, bytes),
+        None => gas::BUNDLE_BASE + gas::call_fee(tier, bytes),
+    }
 }
 
 /// What a `bridge-burn` pays by default: the bridge fee (0.01 RAND, covering its bundle's base
@@ -6768,22 +6779,20 @@ mod tests {
         let deploy = Action::Deploy { base_pc: 0, words: vec![0x13; 40], public: vec![] };
         assert_eq!(deploy_fee_default(&deploy), gas::fee_floor(&deploy));
         assert_eq!(deploy_fee_default(&deploy), gas::BUNDLE_BASE + gas::deploy_fee(40));
+        use randprotocol_core::gas::GasPolicy;
+        let policy = ChainLimits {
+            max_program_words: 4096, max_proof_bytes: 2 << 20, max_block_bytes: 4 << 20, max_call_envelope_bytes: 18_432,
+            max_program_public_words: 0, envelope_bytes: None, hardening_v6: false,
+            gas_price: Some(100), byte_price: Some(800),
+        };
+        let old = ChainLimits { gas_price: None, byte_price: None, ..policy };
         for tier in [10u8, 12, 14, 20] {
-            assert_eq!(call_fee_default(tier, 0), gas::BUNDLE_BASE + gas::call_fee(tier, 0));
-            // The floor `Ledger::validate_inner` applies, not a cent over it: adding
-            // `fee_floor(Call)` to `call_fee` would double-count `CALL_BASE`.
-            let floor = gas::fee_floor(&Action::Call { program: randprotocol_core::Hash::ZERO, proof: vec![], input_envelope: None });
-            let doubled = floor + gas::call_fee(tier, 0);
-            assert_eq!(doubled - call_fee_default(tier, 0), gas::CALL_BASE, "tier {tier}");
-            // The byte term (spec §7): nothing at or under the free allowance, so every call a
-            // chain-12 node admits pays what it paid before, and `CALL_PER_KIB` per KiB past it.
-            assert_eq!(call_fee_default(tier, gas::CALL_FREE_BYTES), call_fee_default(tier, 0));
-            assert_eq!(call_fee_default(tier, gas::CALL_FREE_BYTES + 1024), call_fee_default(tier, 0) + gas::CALL_PER_KIB);
-            assert_eq!(
-                call_fee_default(tier, 5 << 20),
-                gas::BUNDLE_BASE + gas::call_fee(tier, 5 << 20),
-                "the wallet pays the ledger's step-10 floor exactly"
-            );
+            // Review focus 4: no node, or an old node, prices the ledger's floor, nothing over it.
+            assert_eq!(call_fee_default(None, tier, 0, 0, 0), gas::BUNDLE_BASE + gas::call_fee(tier, 0));
+            assert_eq!(call_fee_default(Some(&old), tier, 0, 0, 1_300_000), gas::BUNDLE_BASE + gas::call_fee(tier, 1_300_000));
+            // Under a policy: its floor of the header, exactly.
+            assert_eq!(call_fee_default(Some(&policy), tier, 0, 0, 1_300_000), GasPolicy::DEFAULT.call_floor(tier, 0, 0, 1_300_000));
+            assert_eq!(call_fee_default(Some(&policy), tier, 12, 13, 3_200_000), GasPolicy::DEFAULT.call_floor(tier, 12, 13, 3_200_000));
         }
         // A burn pays the bridge fee, the schedule's floor for it.
         let burn = Action::BridgeBurn {
@@ -7129,6 +7138,8 @@ mod tests {
             max_program_public_words: 64,
             envelope_bytes: None,
             hardening_v6: false,
+            gas_price: None,
+            byte_price: None,
         }
     }
 
