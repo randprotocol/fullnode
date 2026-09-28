@@ -34,7 +34,7 @@ use p3_uni_stark::StarkGenericConfig;
 use randprotocol_zkvm::emulator::execute;
 use randprotocol_zkvm::guests;
 use randprotocol_zkvm::isa::Program;
-use randprotocol_zkvm::machine::{build_traces_salted, chips, Challenge, Config, FriProfile, Machine, Proof, Tier, Traces, Val};
+use randprotocol_zkvm::machine::{build_traces_salted, build_traces_salted_with, chips, Challenge, Config, FriProfile, Machine, Proof, Tier, Traces, Val};
 
 /// A trace widened with zero columns to its chip's width. The blinding columns are the chip's last
 /// ones and `Traces` does not carry them (`Machine::prove_traces` appends them), so this is exactly
@@ -109,14 +109,14 @@ const SALT: [u32; 4] = [0x51, 0x52, 0x53, 0x54];
 fn prove(m: &Machine, p: &Program, inputs: &[u32]) -> (Proof, Traces) {
     let (proof, exec) = m.prove_salted(p, inputs, &[], SALT, None).expect("proves");
     m.verify(&p.digest(), &proof).expect("an honest proof verifies");
-    let t = build_traces_salted(p, inputs, &[], SALT, &exec, proof.tier).expect("builds");
+    let t = build_traces_salted(p, inputs, &[], SALT, &exec, proof.tier, randprotocol_zkvm::gas::gas_max(proof.tier, proof.keccak_log_height, proof.sha256_log_height)).expect("builds");
     (proof, t)
 }
 
 /// A candidate witness's traces at `tier`: what the observer builds for a guess.
 fn candidate(p: &Program, inputs: &[u32], tier: Tier) -> Traces {
     let exec = execute(p, inputs, &[], 1 << 22).expect("runs");
-    build_traces_salted(p, inputs, &[], SALT, &exec, tier).expect("builds")
+    build_traces_salted_with(p, inputs, &[], SALT, &exec, tier, randprotocol_zkvm::machine::ProveOptions::default()).expect("builds")
 }
 
 /// `published − predicted`, per instance with a terminal.

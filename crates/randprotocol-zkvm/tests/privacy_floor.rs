@@ -182,7 +182,7 @@ fn padded_hash_tables_verify_and_hide_presence() {
     let (plain, _) = m.prove(&p, &inputs, &[], Some(Tier(10))).unwrap();
     let t_plain = t0.elapsed();
     let t0 = std::time::Instant::now();
-    let opts = ProveOptions { pad_absent_hash_tables: true };
+    let opts = ProveOptions { pad_absent_hash_tables: true, ..Default::default() };
     let (padded, exec) = m.prove_with_options(&p, &inputs, &[], Some(Tier(10)), opts).unwrap();
     let t_padded = t0.elapsed();
     eprintln!("default: {} bytes, {t_plain:?}; padded: {} bytes, {t_padded:?}", plain.size(), padded.size());
@@ -202,6 +202,10 @@ fn padded_hash_tables_verify_and_hide_presence() {
         for i in 0..8 {
             v[randprotocol_zkvm::tables::cpu::pv::IN0 + i] = padded.public_values[randprotocol_zkvm::tables::cpu::pv::IN0 + i];
         }
+        // Constraint set 8: and the declared gas limit, which by default is the header's own
+        // ceiling (`gas::gas_max`) — the padded header declares both hash tables, so its ceiling
+        // is higher. It says nothing the header's heights do not already say.
+        v[randprotocol_zkvm::tables::cpu::pv::GAS] = randprotocol_zkvm::gas::gas_max(Tier(10), MIN_PRIVATE_TABLE_LOG_HEIGHT, MIN_PRIVATE_TABLE_LOG_HEIGHT);
         v
     });
     // The header a real one-permutation, one-compression call declares — the same two heights.

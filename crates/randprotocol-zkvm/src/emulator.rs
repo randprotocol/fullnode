@@ -72,6 +72,14 @@ pub enum HashRow {
     WriteOut { fin: bool, words: [u32; 4], state: [Val; 8] },
 }
 
+impl HashRow {
+    /// True on an absorbed-block row (`IS_HASH` in the cpu AIR) — the row the gas meter
+    /// (`gas::row_gas`, constraint set 8) charges the extra `POSEIDON2_ABSORB_GAS - 1` for its
+    /// permutation. False on the ecall row and on a digest write-back row (`IS_HASH_OUT`),
+    /// neither of which pulls a fresh permutation.
+    pub fn is_absorb(&self) -> bool { matches!(self, HashRow::Absorb { .. }) }
+}
+
 #[derive(Clone, Debug)]
 pub struct CycleEvent {
     pub clk: u32, pub pc: u32, pub next_pc: u32, pub instr: Instr, pub dec: Decoded,

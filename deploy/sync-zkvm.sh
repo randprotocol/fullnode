@@ -158,6 +158,18 @@
 # (`../evm-rt`, `../guests-compiled/...`) that do not exist from this crate's root. `ledger.rs`'s
 # RAND comments and recursion's two hand fixes are restored after the rsync, as before.
 #
+# Constraint set 8 (circuits `f95a1ce`, branch `feat/cs8-gas`, the gas model — fullnode spec
+# 2026-09-28 §4.2): the gas meter `src/gas.rs` (`gas_of`, `row_gas`, `gas_max`, the weights) and
+# its `tests/gas.rs` ride the rsyncs; `src/lib.rs` is hand-maintained, so `pub mod gas;` went in
+# by hand. The rest is in vendored files: the cpu `GAS` column, `pv::GAS = 34`/`pv::NUM = 35`,
+# `ProveOptions.gas_limit`, `VerifyError::GasLimit`, `ProveError::GasLimitBelowRun`/
+# `GasLimitAboveHeader`. One signature moved under the local (excluded) `executor.rs`:
+# `machine::build_traces_salted` takes an explicit `gas_limit` now, so the executor calls
+# `build_traces_salted_with(.., ProveOptions::default())` — the header's own ceiling
+# (`gas::gas_max`), what every `Machine::prove*` declares by default. No patch below changed.
+# The recursion section at `f95a1ce` is byte-identical to `b9ffc39`'s; the rVM's own cs8 re-pin
+# is a separate recursion change and needs a second run of this script once it lands.
+#
 # The CUDA backend is *not* vendored either: crates/randprotocol-zkvm depends on it by path, as
 # ../../../circuits/rand-zkvm-cuda, so `circuits` must be checked out beside `fullnode` when building
 # with --features cuda or --features mock-cuda.

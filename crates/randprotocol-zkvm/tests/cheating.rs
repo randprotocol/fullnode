@@ -35,7 +35,7 @@ fn setup() -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
     let m = Machine::new(FriProfile::Test);
     let p = guests::fib(10);
     let e = execute(&p, &[], &[], 10_000).unwrap();
-    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     (m, p, t)
 }
 
@@ -330,7 +330,7 @@ fn storing_a_value_that_was_never_in_a_register_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 5);
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     forge_a_store(&mut t, 0x0500_0000);
     assert_eq!(t.public_values[cpu::pv::OUT0], F::from_u32(0x0500_0000));
     assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
@@ -352,7 +352,7 @@ fn bumping_range8_on_a_bitwise_rows_now_unconstrained_a_limb_is_rejected() {
     let p = a.assemble();
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     t.range.values[0x12 * range::col::WIDTH + range::col::M_RANGE] += F::ONE;
     assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
 }
@@ -370,7 +370,7 @@ fn bumping_range8_on_an_slt_rows_now_unconstrained_c_limb_is_rejected() {
     let p = a.assemble();
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     t.range.values[range::col::WIDTH + range::col::M_RANGE] += F::ONE;
     assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
 }
@@ -389,7 +389,7 @@ fn a_store_that_replaces_the_wrong_byte_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 0x112233ff);
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let w = cpu::col::WIDTH;
     // Find the SB row and corrupt MERGED to replace byte 1 instead of byte 0.
     let sb_row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::IS_SB] == F::ONE).unwrap();
@@ -412,7 +412,7 @@ fn a_load_byte_with_flipped_sign_extension_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 0xffff_ffff);
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let w = cpu::col::WIDTH;
     let lb_row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::IS_LB] == F::ONE).unwrap();
     t.cpu.values[lb_row * w + cpu::col::SGN] = F::ZERO; // flip: claim unsigned-looking zero-extend
@@ -433,7 +433,7 @@ fn a_misaligned_lh_is_rejected_by_the_air() {
     let p = a.assemble();
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let w = cpu::col::WIDTH;
     let lw_row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::IS_LW] == F::ONE).unwrap();
     // Retag this LW row as an LH with OFF0=1 (byte offset 1 — misaligned for a half).
@@ -456,7 +456,7 @@ fn a_sb_that_changes_a_byte_outside_its_offset_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 0x1122ff44);
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let w = cpu::col::WIDTH;
     let sb_row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::IS_SB] == F::ONE).unwrap();
     // Also corrupt byte 2 (outside off=1), leaving byte 1 correct.
@@ -489,7 +489,7 @@ fn mulhu_cannot_claim_hi_equals_2_32_minus_1_for_a_small_product() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 0);
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let w = alu::col::WIDTH;
     let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Mulhu);
     let forged_carry = 0xffff_ffffu32; // would make HI = T2 + CARRY = 0xffff_ffff
@@ -522,7 +522,7 @@ fn a_small_in_range_forged_carry_on_a_mulhu_row_is_still_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 0);
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let w = alu::col::WIDTH;
     let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Mulhu);
     let forged_carry = 100u32; // < 2^24, so the CARRY-limb check alone does not catch this
@@ -553,7 +553,7 @@ fn a_remainder_not_smaller_than_the_divisor_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 2);
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let w = alu::col::WIDTH;
     let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Remu);
     t.alu.values[row * w + alu::col::Q0] = F::from_u32(2); // quotient core: 3 -> 2
@@ -578,7 +578,7 @@ fn a_wrong_divz_on_a_nonzero_divisor_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 3);
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let w = alu::col::WIDTH;
     let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Divu);
     t.alu.values[row * w + alu::col::DIVZ] = F::ONE; // B = 3 != 0, but claim DIVZ
@@ -617,7 +617,7 @@ fn a_mul_flag_set_on_an_otherwise_all_zero_padding_row_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let p = guests::muldiv();
     let e = execute(&p, &[], &[], 10_000).unwrap();
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let wa = alu::col::WIDTH;
     let pad = t.alu.height() - 1;
     assert_eq!(t.alu.values[pad * wa + alu::col::IS_REAL], F::ZERO, "last alu row is padding");
@@ -641,7 +641,7 @@ fn a_sign_flipped_mulh_is_rejected() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 0);
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let w = alu::col::WIDTH;
     let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Mulh);
     assert_eq!(t.alu.values[row * w + alu::col::SA], F::ONE, "A = -2 is negative");
@@ -700,7 +700,7 @@ fn setup_poseidon2(msg: &[u32]) -> (Machine, randprotocol_zkvm::isa::Program, Tr
     let m = Machine::new(FriProfile::Test);
     let p = guests::poseidon2_demo(msg);
     let e = execute(&p, &[], &[], 10_000).unwrap();
-    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     (m, p, t)
 }
 
@@ -938,7 +938,7 @@ fn rogue_write_out(fin: bool, pc: u32, next_pc: u32, ptr: u32, words: [u32; 4], 
 fn rogue_traces(p: &randprotocol_zkvm::isa::Program, mut events: Vec<CycleEvent>, outputs: [u32; 8]) -> Traces {
     for (i, e) in events.iter_mut().enumerate() { e.clk = i as u32; }
     let exec = randprotocol_zkvm::emulator::Execution { events, outputs, halted: true };
-    build_traces_salted(p, &[], &[], [0u32; 4], &exec, Tier(10)).unwrap()
+    build_traces_salted(p, &[], &[], [0u32; 4], &exec, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap()
 }
 
 /// ZC1, the entry gate `(1 − SYS_HASH − is_hash − is_hash_out)·n(IS_HASH_OUT) = 0`: a
@@ -1262,7 +1262,7 @@ fn setup_with_inputs(inputs: &[u32]) -> (Machine, randprotocol_zkvm::isa::Progra
     let m = Machine::new(FriProfile::Test);
     let p = guests::balance_check(1000); // reads inputs 0..3 once each
     let e = execute(&p, inputs, &[], 10_000).unwrap();
-    let t = build_traces_salted(&p, inputs, &[], TEST_SALT, &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, inputs, &[], TEST_SALT, &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     (m, p, t)
 }
 
@@ -1377,7 +1377,7 @@ fn two_reads_of_the_same_index_returning_different_words_is_rejected() {
     let e = execute(&p, &inputs, &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 0, "two honest reads of the same index must agree");
     let m = Machine::new(FriProfile::Test);
-    let mut t = build_traces_salted(&p, &inputs, &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &inputs, &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let w = cpu::col::WIDTH;
     // Locate the second SYS_READ row (there are exactly two) and forge its returned word.
     let read_rows: Vec<usize> = (0..t.cpu.height()).filter(|&i| t.cpu.values[i * w + cpu::col::SYS_READ] == F::ONE).collect();
@@ -1658,7 +1658,7 @@ fn setup_keccak() -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
     let m = Machine::new(FriProfile::Test);
     let p = guests::keccak_demo(b"hi");
     let e = execute(&p, &[], &[], 10_000).unwrap();
-    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     (m, p, t)
 }
 
@@ -1681,7 +1681,7 @@ fn setup_keccak_with_a_padding_block() -> (Machine, randprotocol_zkvm::isa::Prog
     a.extend(halt());
     let p = a.assemble();
     let e = execute(&p, &[], &[], 10_000).unwrap();
-    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     assert_eq!(t.keccak_log_height, 7, "three blocks rounded up to four");
     (m, p, t)
 }
@@ -1859,7 +1859,16 @@ fn a_nonzero_keccak_height_below_one_block_is_rejected_before_any_verifier_key_i
     use randprotocol_zkvm::machine::VerifyError;
     let prover = Machine::new(FriProfile::Test);
     let p = guests::keccak_demo(b"hi");
-    let (mut proof, _) = prover.prove_salted(&p, &[], &[], [0; 4], Some(Tier(10))).unwrap();
+    // Constraint set 8: lowering `keccak_log_height` also lowers this header's own gas ceiling
+    // (`gas::gas_max`), so the proof declares, honestly — the `HALT` row's limbs match it — a limit
+    // the tampered header still admits: `gas_max(Tier(10), 3, 0)` (= the hash-free ceiling, 1 023;
+    // a 3 is below one block and buys no keccak weight). The height is then the only lie, and the
+    // `KeccakHeight` refusal below is what names it.
+    let limit = randprotocol_zkvm::gas::gas_max(Tier(10), 3, 0);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0; 4], &e, Tier(10), limit).unwrap();
+    let mut proof = prover.prove_traces(&p, &t, Tier(10));
+    assert!(prover.verify(&p.digest(), &proof).is_ok(), "the untampered proof is honest at this limit");
     assert_eq!(proof.keccak_log_height, 7, "one block, floored at 128 rows (COV-2 / INT-6)");
     proof.keccak_log_height = 3;
     // Constraint set 6: the optional hash instance is no longer the last entry — the
@@ -2055,7 +2064,7 @@ fn keccak_ptr_traces(p1: u32) -> (Machine, randprotocol_zkvm::isa::Program, Trac
     let p = keccak_ptr_from_input();
     let mut e = execute(&p, &[P0], &[], 10_000).unwrap();
     relocate_keccak_ptr(&mut e, P0, p1);
-    let t = build_traces_salted(&p, &[p1], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[p1], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let w = cpu::col::WIDTH;
     let row = keccak_row(&t);
     // `HASH_PTR = B` (the `a0` the row read) and the four limbs recompose to it: the two
@@ -2098,7 +2107,7 @@ fn setup_sha256() -> (Machine, randprotocol_zkvm::isa::Program, Traces) {
     let m = Machine::new(FriProfile::Test);
     let p = guests::sha256_demo();
     let e = execute(&p, &[], &[], 10_000).unwrap();
-    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     // One real block plus one padding block since audit COV-2 / INT-6's private-data floor (was 6).
     assert_eq!(t.sha256_log_height, 7, "one compression, floored at 128 rows");
     (m, p, t)
@@ -2119,7 +2128,7 @@ fn setup_sha256_with_a_padding_block() -> (Machine, randprotocol_zkvm::isa::Prog
     a.extend(halt());
     let p = a.assemble();
     let e = execute(&p, &[], &[], 10_000).unwrap();
-    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     assert_eq!(t.sha256_log_height, 8, "three blocks rounded up to four");
     (m, p, t)
 }
@@ -2226,7 +2235,13 @@ fn a_nonzero_sha256_height_below_one_block_is_rejected() {
     use randprotocol_zkvm::machine::VerifyError;
     let prover = Machine::new(FriProfile::Test);
     let p = guests::sha256_demo();
-    let (mut proof, _) = prover.prove_salted(&p, &[], &[], [0; 4], Some(Tier(10))).unwrap();
+    // Constraint set 8: as the keccak twin above — prove at a limit the tampered header
+    // (`sha256_log_height = 5`, below one block) still admits, so the height is the only lie.
+    let limit = randprotocol_zkvm::gas::gas_max(Tier(10), 0, 5);
+    let e = execute(&p, &[], &[], 10_000).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0; 4], &e, Tier(10), limit).unwrap();
+    let mut proof = prover.prove_traces(&p, &t, Tier(10));
+    assert!(prover.verify(&p.digest(), &proof).is_ok(), "the untampered proof is honest at this limit");
     proof.sha256_log_height = 5;
     // Constraint set 6: the optional hash instance is no longer the last entry — the
     // mandatory `public` one is appended after it (`machine::chips`), so it is second to
@@ -2384,7 +2399,7 @@ fn a_workload_exceeding_the_poseidon2_budget_is_a_clean_error() {
     let exec = execute(&p, &[], &[], 10_000).unwrap();
     assert!(exec.cycles() < 20, "only the leading few instructions ever execute");
     assert!(
-        matches!(build_traces_salted(&p, &[], &[], [0u32; 4], &exec, Tier(10)), Err(ProveError::TooManyPoseidon2Permutations { .. })),
+        matches!(build_traces_salted(&p, &[], &[], [0u32; 4], &exec, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)), Err(ProveError::TooManyPoseidon2Permutations { .. })),
         "151 permutations cannot fit tier 10's 128 poseidon2 blocks"
     );
     let (proof, _) = m.prove(&p, &[], &[], None).expect("auto-tier must climb past the permutation wall, not panic");
@@ -2421,7 +2436,7 @@ fn a_program_input_or_public_vector_longer_than_the_16_bit_hash_left_cap_is_a_cl
     // this the way it would at tier 10.
     let exec = execute(&small, &[], &public, 10_000).unwrap();
     assert!(matches!(
-        build_traces_salted(&small, &[], &public, [0u32; 4], &exec, Tier(20)),
+        build_traces_salted(&small, &[], &public, [0u32; 4], &exec, Tier(20), randprotocol_zkvm::gas::gas_max(Tier(20), 0, 0)),
         Err(ProveError::PublicTooLong { len: 65536 })
     ));
 }
@@ -2481,7 +2496,7 @@ fn setup_with_public(public: &[u32]) -> (Machine, randprotocol_zkvm::isa::Progra
     let m = Machine::new(FriProfile::Test);
     let p = guests::public_echo(); // reads public[0..4], and public[1] twice
     let e = execute(&p, &[], public, 10_000).unwrap();
-    let t = build_traces_salted(&p, &[], public, TEST_SALT, &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], public, TEST_SALT, &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     (m, p, t)
 }
 
@@ -2818,7 +2833,7 @@ fn setup_with_inputs_and_public(inputs: &[u32], public: &[u32]) -> (Machine, ran
     a.extend(halt());
     let p = a.assemble();
     let e = execute(&p, inputs, public, 10_000).unwrap();
-    let t = build_traces_salted(&p, inputs, public, TEST_SALT, &e, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, inputs, public, TEST_SALT, &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     (m, p, t)
 }
 
@@ -3160,7 +3175,7 @@ fn an_sll_that_wraps_the_field_is_refused_by_the_overflow_guard() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 10);
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let w = alu::col::WIDTH;
     let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Sll);
     let al = |t: &Traces, c: usize| t.alu.values[row * w + c];
@@ -3195,7 +3210,7 @@ fn a_right_shift_remainder_not_below_the_shift_is_refused() {
     let m = Machine::new(FriProfile::Test);
     let e = execute(&p, &[], &[], 10_000).unwrap();
     assert_eq!(e.outputs[0], 4);
-    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [0u32; 4], &e, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let w = alu::col::WIDTH;
     let row = find_alu_row(&t, randprotocol_zkvm::isa::AluOp::Srl);
     let al = |t: &Traces, c: usize| t.alu.values[row * w + c];
@@ -3249,4 +3264,46 @@ fn any_balanced_blinds_verify() {
         .collect();
     let proof = m.prove_traces_with_blinds(&p, &t, Tier(10), &own);
     m.verify(&p.digest(), &proof).expect("balanced blinds verify");
+}
+
+// ───────────────────────────── Constraint set 8: the GAS column ─────────────────────────────
+
+/// Review focus 2 (cs8): a `KECCAK` row that pays one gas instead of 192. Every `GAS` from that
+/// row on is lowered by 191, so the chain is consistent everywhere but on the transition into
+/// the `KECCAK` row, and the `HALT` row's limbs are re-derived for the lowered total (with the
+/// `RANGE8` multiplicities moved to match), so the halt-row equation and the range bus hold too.
+/// The symbolic pass below confirms that transition is the one constraint the forgery breaks;
+/// the real proof must then be refused.
+#[test]
+fn a_keccak_row_that_pays_one_gas_is_refused() {
+    use common::{eval_boundary, symbolic_air, Rows};
+    let (m, p, mut t) = setup_keccak();
+    let w = cpu::col::WIDTH;
+    let rows = t.cpu.height();
+    let k = keccak_row(&t);
+    for r in k..rows { t.cpu.values[r * w + cpu::col::GAS] -= F::from_u64(191); }
+    let halt = (0..rows).find(|&r| t.cpu.values[r * w + cpu::col::SYS_HALT] == F::ONE).unwrap();
+    let diff = (t.public_values[cpu::pv::GAS] - t.cpu.values[halt * w + cpu::col::GAS]).as_canonical_u64();
+    assert!(diff < 1 << 32);
+    let mut edits = Vec::new();
+    for j in 0..4 {
+        let old = t.cpu.values[halt * w + cpu::col::GD0 + j].as_canonical_u64() as u32;
+        let new = ((diff >> (8 * j)) & 0xff) as u32;
+        t.cpu.values[halt * w + cpu::col::GD0 + j] = F::from_u32(new);
+        edits.push((old, new));
+    }
+    shift_range8(&mut t, &edits);
+
+    // Symbolically: exactly one cpu constraint fails, on exactly the transition into row `k`.
+    let (_, cons) = symbolic_air(&cpu::CpuAir);
+    let row = |r: usize| t.cpu.values[(r % rows) * w..(r % rows) * w + w].to_vec();
+    let mut failing = Vec::new();
+    for r in 0..rows {
+        let pair = Rows { cur: row(r), next: row(r + 1), pre_cur: vec![], pre_next: vec![], public: t.public_values.clone() };
+        let n = cons.iter().filter(|c| eval_boundary(c, &pair, r == 0, r == rows - 1) != F::ZERO).count();
+        if n > 0 { failing.push((r, n)); }
+    }
+    assert_eq!(failing, vec![(k - 1, 1)], "only the GAS transition into the KECCAK row breaks");
+
+    assert!(rejects(|| m.verify(&p.digest(), &m.prove_traces(&p, &t, Tier(10)))));
 }

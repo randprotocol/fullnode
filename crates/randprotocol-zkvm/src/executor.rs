@@ -1346,7 +1346,7 @@ pub fn prove_call_hardened(
         Some(t) => return Err(format!("tier {t} is not one of {TIERS:?}")),
         None => Tier(call_tier(program, inputs, segment.len())? as usize),
     };
-    let mut traces = crate::machine::build_traces_salted(program, inputs, segment, salt, &exec, tier).map_err(|e| format!("{e:?}"))?;
+    let mut traces = crate::machine::build_traces_salted_with(program, inputs, segment, salt, &exec, tier, crate::machine::ProveOptions::default()).map_err(|e| format!("{e:?}"))?;
     let floored = hardened_program_log_height(program.words.len());
     if traces.program_log_height < floored {
         traces.program = crate::tables::program::program_trace(program, &exec.events, 1usize << floored);
@@ -1575,7 +1575,7 @@ mod tests {
     #[test]
     fn cpu1_the_callable_program_bound_is_the_provers_own_limit() {
         use super::*;
-        use crate::machine::{build_traces_salted, ProveError};
+        use crate::machine::{build_traces_salted_with, ProveError};
         let halting = |n: usize| {
             let halt: Vec<u32> = crate::asm::ops::halt().iter().map(|i| i.encode()).collect();
             let mut words = vec![crate::asm::ops::addi(0, 0, 0).encode(); n - halt.len()];
@@ -1586,7 +1586,7 @@ mod tests {
         let fits = |n: usize, public: &[u32]| {
             let p = halting(n);
             let exec = crate::emulator::execute(&p, &[], public, tier.max_cycles()).expect("halts");
-            match build_traces_salted(&p, &[], public, [0; 4], &exec, tier) {
+            match build_traces_salted_with(&p, &[], public, [0; 4], &exec, tier, crate::machine::ProveOptions::default()) {
                 Ok(_) => true,
                 Err(ProveError::TooManyPoseidon2Permutations { .. }) => false,
                 Err(e) => panic!("{n} words: {e:?}"),
@@ -1647,7 +1647,7 @@ mod tests {
         // has) builds traces at or under it.
         use crate::asm::ops::{addi, ecall, halt, li};
         use crate::isa::{BranchCond, REG_A0, REG_A7, SYS_KECCAK, SYS_SHA256};
-        use crate::machine::{build_traces_salted, Tier};
+        use crate::machine::{build_traces_salted_with, Tier};
         const COUNTER: u32 = 5;
         for tier in [Tier(10), Tier(12)] {
             for (what, sys) in [("keccak", SYS_KECCAK), ("sha256", SYS_SHA256)] {
@@ -1664,7 +1664,7 @@ mod tests {
                     a.extend(halt());
                     let p = a.assemble();
                     let exec = crate::emulator::execute(&p, &[], &[], tier.max_cycles()).expect("halts");
-                    let traces = build_traces_salted(&p, &[], &[], [0; 4], &exec, tier).expect("fits the tier");
+                    let traces = build_traces_salted_with(&p, &[], &[], [0; 4], &exec, tier, crate::machine::ProveOptions::default()).expect("fits the tier");
                     let ceiling = hash_bearing_mem_log_height_ceiling(tier, traces.keccak_log_height, traces.sha256_log_height);
                     assert!(
                         traces.mem_log_height <= ceiling,

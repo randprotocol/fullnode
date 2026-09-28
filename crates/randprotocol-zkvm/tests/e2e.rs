@@ -42,7 +42,7 @@ fn a_program_much_longer_than_a_small_tiers_cpu_height_but_briefly_executed_prov
 
     let exec = randprotocol_zkvm::emulator::execute(&p, &[], &[], 1 << 20).unwrap();
     assert!(exec.cycles() < 20, "only the leading few instructions ever execute");
-    let traces = build_traces_salted(&p, &[], &[], [0u32; 4], &exec, Tier(14)).unwrap();
+    let traces = build_traces_salted(&p, &[], &[], [0u32; 4], &exec, Tier(14), randprotocol_zkvm::gas::gas_max(Tier(14), 0, 0)).unwrap();
     // The program table's own height is driven by the program's length (`program_log_height`),
     // not by `Tier(14).cpu_height()` (16 384) — it is far smaller, and in particular still
     // bigger than `Tier(10).cpu_height()` would have offered, confirming the fix actually sized
@@ -201,7 +201,7 @@ fn a_keccak_free_proof_declares_the_tier_floor_memory_height() {
     let exec = randprotocol_zkvm::emulator::execute(&p, &[], &[], Tier(10).max_cycles()).unwrap();
     let accesses: usize = exec.events.iter().map(|e| e.accesses.len() + e.keccak_accesses.len()).sum();
     assert!(accesses < 1 << 12, "fib(10) is nowhere near the tier-10 floor: {accesses} accesses");
-    let t = build_traces_salted(&p, &[], &[], [0; 4], &exec, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0; 4], &exec, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     assert_eq!(t.mem_log_height, 12, "exactly `t + 2`");
     assert_eq!(t.memory.height(), 1 << 12);
     let proof = m.prove_traces(&p, &t, Tier(10));
@@ -231,7 +231,7 @@ fn a_few_keccak_permutations_still_fit_under_the_tier_floor() {
     let p = a.assemble();
     let exec = randprotocol_zkvm::emulator::execute(&p, &[], &[], Tier(10).max_cycles()).unwrap();
     assert_eq!(exec.events.iter().filter(|e| e.keccak_row.is_some()).count(), 3);
-    let t = build_traces_salted(&p, &[], &[], [0; 4], &exec, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0; 4], &exec, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     // Three permutations need three 32-row blocks -> 128 rows -> 2^7.
     assert_eq!(t.keccak_log_height, 7);
     let accesses: usize = exec.events.iter().map(|e| e.accesses.len() + e.keccak_accesses.len()).sum();
@@ -261,7 +261,7 @@ fn enough_keccak_permutations_raise_the_declared_memory_height_past_the_floor() 
     let p = a.assemble();
     let exec = randprotocol_zkvm::emulator::execute(&p, &[], &[], Tier(10).max_cycles()).unwrap();
     assert_eq!(exec.events.iter().filter(|e| e.keccak_row.is_some()).count(), 40);
-    let t = build_traces_salted(&p, &[], &[], [0; 4], &exec, Tier(10)).unwrap();
+    let t = build_traces_salted(&p, &[], &[], [0; 4], &exec, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 11, 0)).unwrap(); // cs8: the 40 permutations weigh 7 640 gas, past the hash-free ceiling; 11 = the height asserted below
     let accesses: usize = exec.events.iter().map(|e| e.accesses.len() + e.keccak_accesses.len()).sum();
     assert!(((1 << 12)..1 << 13).contains(&accesses), "{accesses} accesses: past the floor, inside one more bit");
     assert_eq!(t.mem_log_height, 13, "the access count now drives the height");
@@ -354,7 +354,7 @@ fn a_declared_sha256_table_costs_about_a_hundred_kilobytes_at_the_test_profile()
     let m = Machine::new(FriProfile::Test);
     let p = guests::fib(10);
     let exec = randprotocol_zkvm::emulator::execute(&p, &[], &[], Tier(10).max_cycles()).unwrap();
-    let mut t = build_traces_salted(&p, &[], &[], [1, 2, 3, 4], &exec, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [1, 2, 3, 4], &exec, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     assert_eq!(t.sha256_log_height, 0, "fib makes no SHA256 call");
     let free = m.prove_traces(&p, &t, Tier(10));
     m.verify(&p.digest(), &free).unwrap();
@@ -386,7 +386,7 @@ fn measure_the_sha256_table_cost_at_the_production_profile() {
     let m = Machine::new(FriProfile::Production);
     let p = guests::fib(10);
     let exec = randprotocol_zkvm::emulator::execute(&p, &[], &[], Tier(10).max_cycles()).unwrap();
-    let mut t = build_traces_salted(&p, &[], &[], [1, 2, 3, 4], &exec, Tier(10)).unwrap();
+    let mut t = build_traces_salted(&p, &[], &[], [1, 2, 3, 4], &exec, Tier(10), randprotocol_zkvm::gas::gas_max(Tier(10), 0, 0)).unwrap();
     let t0 = std::time::Instant::now();
     let free = m.prove_traces(&p, &t, Tier(10));
     let free_prove = t0.elapsed();
