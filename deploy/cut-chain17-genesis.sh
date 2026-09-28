@@ -12,14 +12,12 @@
 #     `hc_bundle` is the v3 hidden-asset guest (nk and salt in, c = H(AUTH, nk, salt) in the digest;
 #     60af094a… on the v0.6.3 build — EXPECT_HC_BUNDLE), and the new `hc_auth` is the auth guest's
 #     program commitment, hashed after `hardening_v6`. `crates/randprotocol-zkvm/tests/guest_provenance.rs`
-#     pins the bundle guest v1/v2/v3 digests but, as of this build, NO auth-guest digest — so
-#     EXPECT_HC_AUTH has NO compiled-in default and the operator pins the value the v0.6.3 RELEASE
-#     binary reports (the script prints it and refuses unset). Read it from a Linux host after
-#     `stage`: `/root/rand-node.c17 genesis --bundle-guest v3 --auth-guest --hardening-v6 <the
-#     same validator/limits flags this script passes> --out /tmp/x.json`, then read the printed
-#     `hc_auth <hex>` line (or `hc_auth` in /tmp/x.json). Once a `guest_provenance` test pins the
-#     auth guest's digest the way v1/v2/v3 are pinned, default EXPECT_HC_AUTH to it like
-#     EXPECT_HC_BUNDLE — this script still cross-checks it against the built binary's own output.
+#     pins the bundle guest v1/v2/v3 digests AND, since v0.6.3, the auth guest's
+#     (`1e4e347f…39c1`), so EXPECT_HC_AUTH defaults to that pin like EXPECT_HC_BUNDLE; this script
+#     still cross-checks it against the built binary's own output (a mismatch = the wrong binary).
+#     To read it off a Linux host after `stage`: `/root/rand-node.c17 genesis --bundle-guest v3
+#     --auth-guest --hardening-v6 <the same validator/limits flags> --out /tmp/x.json`, then the
+#     printed `hc_auth <hex>` line.
 #     Every bundle carries an auth proof, every txid is `rand-txid-3`, and the wire changes: a
 #     v0.6.3 node refuses chains 14/15/16 at startup and a v0.6.1/v0.6.2 node cannot decode a
 #     chain-17 bundle — so the roll is all-stop/all-start (deploy/cutover-fleet-chain17.sh).
@@ -97,11 +95,11 @@ ZUSD_CARRY=${ZUSD_CARRY:-$HOME/.rand-chain17/zusd-carry.txt}             # "<lab
 WALLETS_DIRS=${WALLETS_DIRS:-$HOME/.rand-chain14/wallets $HOME/.rand-chain15/wallets $HOME/.rand-chain16/wallets $HOME/.rand-chain14/payout $HOME/.rand-chain15/payout $FULLNODE_DIR/wallets}   # `balances`: dirs of *.key.json (a missing dir is skipped, printed, never an error); $FULLNODE_DIR/wallets is the repo's gitignored wallets/ (shielded-1..5, the chain-15 cut's ALLOC_WALLETS default)
 RELAYER_DONE_DIR=${RELAYER_DONE_DIR:-}             # optional: the relayer's done/ (done/<chain>/<seq>), a floor cross-check
 EXPECT_HC_BUNDLE=${EXPECT_HC_BUNDLE:-60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce}   # v3
-EXPECT_HC_AUTH=${EXPECT_HC_AUTH:-}                 # REQUIRED for the cut: the auth guest's hc the v0.6.3 release reports
+EXPECT_HC_AUTH=${EXPECT_HC_AUTH:-1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1}   # guest_provenance.rs's auth pin; cross-checked against the binary
 
 # ── chain 16's limits (asserted equal to its genesis unless LIMITS_CHANGED=1) ───────────────────
 MAX_PROGRAM_WORDS=${MAX_PROGRAM_WORDS:-65535}
-MAX_PROOF_BYTES=${MAX_PROOF_BYTES:-8388608}
+MAX_PROOF_BYTES=${MAX_PROOF_BYTES:-4194304}   # 4 MiB, down from chain 16's 8: a v3 transaction carries up to THREE proofs (bundle 1.49 MB + auth 1.36 MB + call) and Genesis::validate requires max_block_bytes >= 3*max_proof_bytes + 1 MiB with hc_auth (3*4+1 = 13 <= 20); every admissible proof is <= 2 MiB by the zkvm cap
 MAX_BLOCK_BYTES=${MAX_BLOCK_BYTES:-20971520}
 MAX_CALL_ENVELOPE_BYTES=${MAX_CALL_ENVELOPE_BYTES:-65536}
 MAX_PROGRAM_PUBLIC_WORDS=${MAX_PROGRAM_PUBLIC_WORDS:-32768}
@@ -763,7 +761,11 @@ for k, want in (("max_program_words", "MAX_PROGRAM_WORDS"), ("max_proof_bytes", 
                 ("max_block_bytes", "MAX_BLOCK_BYTES"), ("max_call_envelope_bytes", "MAX_CALL_ENVELOPE_BYTES"),
                 ("max_program_public_words", "MAX_PROGRAM_PUBLIC_WORDS")):
     need(g[k] == int(E[want]), f"{k} is {g[k]}")
+    if k == "max_proof_bytes" and g[k] == 4194304 and g16[k] == 8388608:
+        continue  # the split-authorisation cut halves the proof cap on purpose (three proofs per transaction)
     need(g[k] == g16[k] or E.get("LIMITS_CHANGED"), f"{k} {g[k]} differs from chain 16's {g16[k]} (LIMITS_CHANGED=1 if intended)")
+need(g["max_block_bytes"] >= 3 * g["max_proof_bytes"] + 1048576,
+     f"max_block_bytes {g['max_block_bytes']} < 3*max_proof_bytes + 1 MiB ({3 * g['max_proof_bytes'] + 1048576}): a v3 Call carries three proofs")
 now_ms = int(time.time() * 1000)
 need(g["timestamp_ms"] <= now_ms + 15_000, "timestamp_ms is in the future beyond the 15 s vote drift bound")
 
@@ -841,6 +843,7 @@ base = {k: g16[k] for k in ("chain_id", "timestamp_ms", "validators", "faucet", 
                            "epoch_blocks", "max_program_words", "max_proof_bytes", "max_block_bytes", "max_call_envelope_bytes",
                            "max_program_public_words", "hardening_v6")}
 base.update(chain_id=17, timestamp_ms=int(time.time() * 1000), alloc=rand_notes, hc_bundle=E["EXPECT_HC_BUNDLE"], hc_auth="ab" * 32,
+            max_proof_bytes=int(E["MAX_PROOF_BYTES"]),  # the flag the real cut passes (4 MiB; chain 16 had 8)
             tokens={"registration_fee": g16["tokens"]["registration_fee"], "mint_cap_per_day": g16["tokens"]["mint_cap_per_day"], "tokens": []})
 json.dump(base, open(f"{st}/base.json", "w"))
 PY

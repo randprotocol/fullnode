@@ -246,7 +246,11 @@ fleet), `deploy/chain17-bridge-steps.md` (the bridge session's half). **What cha
 is cut with `rand-node genesis --hardening-v6 --bundle-guest v3 --auth-guest` — `hc_bundle` is the
 v3 hidden-asset guest (`60af094a…`, `EXPECT_HC_BUNDLE`) and the new `hc_auth` (the auth guest's
 digest, hashed after `hardening_v6`) is pinned by the operator from the v0.6.3 release binary
-(`EXPECT_HC_AUTH`, no default; the script prints what the binary reports and refuses unset). Every
+(`EXPECT_HC_AUTH`, defaulting to `guest_provenance.rs`'s pin `1e4e347f…39c1` and cross-checked
+against what the built binary reports). A v3 transaction carries up to three proofs (bundle,
+auth, call), so `Genesis::validate` requires `max_block_bytes ≥ 3·max_proof_bytes + 1 MiB` with
+`hc_auth`: the cut halves the proof cap to 4 MiB (`MAX_PROOF_BYTES`, every admissible proof is
+≤ 2 MiB by the zkVM cap; chain 16's 8 MiB would need 25 MiB blocks) and keeps 20 MiB blocks. Every
 bundle then carries an auth proof, **every txid changes** (`rand-txid-3`), and **the wire changes**:
 a v0.6.3 node refuses chains 14/15/16 at startup and a v0.6.1/v0.6.2 node cannot decode a chain-17
 bundle, so the roll is all-stop/all-start onto a new genesis, chain 16's shape (26 validators, the
