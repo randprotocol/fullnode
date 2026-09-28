@@ -1,13 +1,23 @@
 //! The `prover_*` JSON-RPC listener: JSON-RPC 2.0 on `POST /`, one request object per body (no
 //! batches, no notifications), four methods over a [`Service`]. Nothing here logs a request body:
 //! a sealed job is opaque bytes to this layer and is handed straight to [`Service::submit`].
+//!
+//! CORS: a browser wallet on another origin posts here, so `OPTIONS /` answers the preflight (204)
+//! and every reply carries `Access-Control-Allow-Origin: *`. Any origin is safe: a request is
+//! authorised only by the pairing token sealed inside the job, never by a cookie or other ambient
+//! credential a page could borrow.
+//!
+//! Stopping: [`serve`]/[`serve_on`] return the service and the listener task. An embedder stops
+//! both in two calls — [`Service::shutdown`] on the service (queue dropped, workers exit, a proof in
+//! flight finishes with its reply discarded), then `abort()` on the task.
 
 use crate::service::{Config, Refusal, Service, Shared};
 use crate::wire::MAX_SEALED_JOB_BYTES;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
@@ -38,7 +48,8 @@ pub async fn serve_on(listener: tokio::net::TcpListener, cfg: Config) -> anyhow:
     let bound = listener.local_addr()?;
     let svc = Service::start(cfg);
     let app = Router::new()
-        .route("/", post(handle))
+        .route("/", post(handle).options(preflight))
+        .layer(axum::middleware::map_response(allow_any_origin))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(svc.clone());
     let task = tokio::spawn(async move {
@@ -48,6 +59,24 @@ pub async fn serve_on(listener: tokio::net::TcpListener, cfg: Config) -> anyhow:
         }
     });
     Ok((bound, svc, task))
+}
+
+/// A browser's CORS preflight for `POST /` with a JSON body.
+async fn preflight() -> impl IntoResponse {
+    (
+        StatusCode::NO_CONTENT,
+        [
+            (header::ACCESS_CONTROL_ALLOW_METHODS, "POST, OPTIONS"),
+            (header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type"),
+            (header::ACCESS_CONTROL_MAX_AGE, "86400"),
+        ],
+    )
+}
+
+/// Every reply, the 413 and JSON-RPC errors included, may be read by a page on any origin.
+async fn allow_any_origin(mut res: Response) -> Response {
+    res.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    res
 }
 
 struct RpcError { code: i64, message: String, data: Option<Value> }

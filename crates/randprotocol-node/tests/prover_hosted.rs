@@ -106,10 +106,10 @@ async fn the_hosted_prover_answers_beside_the_node_and_its_exit_stops_the_node()
     .await
     .expect("node starts");
     let node_rpc = handle.rpc_addr;
-    let (served, task) = hosted_prover::start(hosted).await.expect("serve");
+    let (served, prover) = hosted_prover::start(hosted).await.expect("serve");
     assert_eq!(served, bound, "served on the listener prepare bound");
-    let abort = task.abort_handle();
-    let run = tokio::spawn(hosted_prover::run(handle, Some(task), std::future::pending::<()>()));
+    let abort = prover.task.abort_handle();
+    let run = tokio::spawn(hosted_prover::run(handle, Some(prover), std::future::pending::<()>()));
 
     let http = reqwest::Client::new();
     let info: Value = http
@@ -175,9 +175,10 @@ async fn the_node_stops_cleanly_on_shutdown_with_its_prover() {
     })
     .await
     .unwrap();
-    let (_, task) = hosted_prover::start(hosted).await.unwrap();
+    let (_, prover) = hosted_prover::start(hosted).await.unwrap();
+    let svc = prover.svc.clone();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let run = tokio::spawn(hosted_prover::run(handle, Some(task), async move {
+    let run = tokio::spawn(hosted_prover::run(handle, Some(prover), async move {
         let _ = stopped.await;
     }));
     stop.send(()).unwrap();
@@ -185,6 +186,8 @@ async fn the_node_stops_cleanly_on_shutdown_with_its_prover() {
     // The prover's task was aborted on the way out: its port is free again.
     tokio::time::sleep(Duration::from_millis(200)).await;
     std::net::TcpListener::bind(bound).expect("the prover's listener is closed");
+    // ... and its queue is shut: a submit is refused before the job is even opened.
+    assert!(matches!(svc.submit(&[0u8; 8]), Err(randprotocol_prover::service::Refusal::Bad(why)) if why == "shutting down"));
 }
 
 #[test]

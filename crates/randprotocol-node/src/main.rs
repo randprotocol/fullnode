@@ -1025,7 +1025,7 @@ async fn main() -> Result<()> {
             let prover_task = match hosted {
                 None => None,
                 Some(hp) => match hosted_prover::start(hp).await {
-                    Ok((_bound, task)) => Some(task),
+                    Ok((_bound, served)) => Some(served),
                     Err(e) => {
                         handle.shutdown().await;
                         return Err(e.context("serving the prover"));

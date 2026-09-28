@@ -6,6 +6,11 @@
 //! (zeroized) on the spot; if admitted it waits in the queue and is moved into the blocking
 //! proving task, which drops it the moment the prover returns. Logs carry the job id, the
 //! pairing label, the witness kind, the tier and seconds, nothing else.
+//!
+//! [`Service::shutdown`] stops it: every later submit is refused, every queued job is dropped
+//! (zeroized), a proof in flight runs to the end with its reply discarded, and the workers exit.
+//! It does not close the listener: an embedder serving through [`crate::http::serve`] calls
+//! `shutdown` on the returned [`Shared`], then aborts the returned listener task.
 
 use crate::key::ProverKey;
 use crate::pairing::{token_hash, Pairings};
@@ -131,6 +136,9 @@ struct Inner {
     /// zeroizes: the deque's buffer holds only the pointer, never a copy of the secrets.
     queue: VecDeque<(String, Box<ProveJob>)>,
     proving: usize,
+    /// Set once by [`Service::shutdown`], under this lock, so admission and the workers see it
+    /// in the same order as the queue.
+    shutting_down: bool,
 }
 
 pub struct Service {
@@ -146,7 +154,7 @@ impl Service {
     pub fn start(cfg: Config) -> Shared {
         let svc = Arc::new(Service {
             cfg,
-            inner: Mutex::new(Inner { entries: HashMap::new(), queue: VecDeque::new(), proving: 0 }),
+            inner: Mutex::new(Inner { entries: HashMap::new(), queue: VecDeque::new(), proving: 0, shutting_down: false }),
             wake: tokio::sync::Notify::new(),
         });
         for _ in 0..svc.cfg.max_parallel.max(1) {
@@ -182,6 +190,9 @@ impl Service {
     /// witness length, the token's cap, the queue's cap. A refused job is dropped (zeroized)
     /// before this returns. Returns the job id: 128 random bits, hex.
     pub fn submit(&self, sealed: &[u8]) -> Result<String, Refusal> {
+        if self.inner.lock().unwrap().shutting_down {
+            return Err(Refusal::Bad("shutting down".into()));
+        }
         if sealed.len() > MAX_SEALED_JOB_BYTES {
             return Err(Refusal::Bad(format!("sealed job of {} bytes exceeds {MAX_SEALED_JOB_BYTES}", sealed.len())));
         }
@@ -212,6 +223,9 @@ impl Service {
         let th = token_hash(&job.token);
         let kind = job.witness_kind;
         let mut g = self.inner.lock().unwrap();
+        if g.shutting_down {
+            return Err(Refusal::Bad("shutting down".into()));
+        }
         self.sweep(&mut g);
         let busy = Refusal::Busy { depth: g.queue.len(), max: self.cfg.max_queue };
         let mine = g.entries.values().filter(|e| e.token_hash == th && matches!(e.state, State::Queued | State::Proving)).count();
@@ -294,10 +308,44 @@ impl Service {
         }
     }
 
+    /// Stops the service: every later [`submit`](Self::submit) is refused `Bad("shutting
+    /// down")`, every queued job is dropped now (its witness, token and reply key zeroized) and
+    /// forgotten, and a proof in flight is left to finish — the blocking pool cannot interrupt it,
+    /// so a process that exits after this may still wait up to one proof (~100 s) — and ends
+    /// `failed` with `shutting down`, its reply discarded. The workers exit once idle. Idempotent.
+    pub fn shutdown(&self) {
+        let dropped = {
+            let mut g = self.inner.lock().unwrap();
+            g.shutting_down = true;
+            let queued: Vec<(String, Box<ProveJob>)> = g.queue.drain(..).collect();
+            for (id, _) in &queued {
+                g.entries.remove(id);
+            }
+            queued
+        };
+        let n = dropped.len();
+        // Each job zeroizes as it drops, outside the lock.
+        drop(dropped);
+        // Every worker waits on an enabled `Notified` (see `worker`), so this reaches each one.
+        self.wake.notify_waiters();
+        for _ in 0..self.cfg.max_parallel.max(1) {
+            self.wake.notify_one();
+        }
+        tracing::info!(dropped = n, "prover shutting down");
+    }
+
     async fn worker(self: Arc<Self>) {
         loop {
+            // Enabled before the queue is read, so a submit's `notify_one` or a shutdown's
+            // `notify_waiters` that lands between the read and the await is never missed.
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let next = {
                 let mut g = self.inner.lock().unwrap();
+                if g.shutting_down {
+                    return;
+                }
                 match g.queue.pop_front() {
                     Some((id, job)) => match g.entries.get_mut(&id) {
                         Some(e) => {
@@ -313,7 +361,7 @@ impl Service {
                 }
             };
             let Some((id, job, label, kind)) = next else {
-                self.wake.notified().await;
+                notified.await;
                 continue;
             };
             tracing::info!(job = %id, label = %label, kind = kind.as_str(), "proving");
@@ -338,13 +386,15 @@ impl Service {
             reply_key.zeroize();
             let mut g = self.inner.lock().unwrap();
             g.proving -= 1;
-            let mut cancelled = false;
+            let mut cancelled = None;
+            let shutting_down = g.shutting_down;
             if let Some(e) = g.entries.get_mut(&id) {
                 e.finished = Some(Instant::now());
-                if e.cancelled {
-                    cancelled = true;
+                if e.cancelled || shutting_down {
+                    let why = if shutting_down { "shutting down" } else { "cancelled" };
+                    cancelled = Some(why);
                     e.state = State::Failed;
-                    e.error = Some("cancelled".into());
+                    e.error = Some(why.into());
                 } else {
                     match &out {
                         Ok(_) => {
@@ -361,7 +411,7 @@ impl Service {
             // Nothing logs under the store's lock.
             drop(g);
             match &out {
-                _ if cancelled => tracing::info!(job = %id, label = %label, kind = kind.as_str(), error = "cancelled", secs, "failed"),
+                _ if cancelled.is_some() => tracing::info!(job = %id, label = %label, kind = kind.as_str(), error = cancelled.unwrap_or_default(), secs, "failed"),
                 Ok((_, _, tier)) => tracing::info!(job = %id, label = %label, kind = kind.as_str(), tier, secs, "done"),
                 Err(err) => tracing::info!(job = %id, label = %label, kind = kind.as_str(), error = %err, secs, "failed"),
             }

@@ -190,3 +190,48 @@ async fn info_names_the_guests_the_profiles_the_backend_and_the_fingerprint() {
     assert_eq!(i.queue.max, 8);
     assert!(i.fee.is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_drops_queued_jobs_refuses_new_ones_and_stops_the_workers() {
+    let key = ProverKey::from_seed([3; 64]);
+    let ek = key.kem_ek().to_vec();
+    let mut pairings = Pairings::default();
+    let own = pairings.pair("laptop", true).unwrap();
+    let other = pairings.pair("phone", false).unwrap();
+    let mut cfg = Config::new(key, pairings);
+    cfg.accept_spend_key = true;
+    let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let inner = stub(Arc::new(Mutex::new(Behaviour::Block(300))));
+    let count = started.clone();
+    cfg.prove = Arc::new(move |hc, p, inputs, binding, backend| {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        inner(hc, p, inputs, binding, backend)
+    });
+    let svc = Service::start(cfg);
+    let proving = svc.submit(&seal_job(&ek, &job(own, WitnessKind::SpendKey)).unwrap()).unwrap();
+    wait_proving(&svc, &proving).await;
+    let q1 = svc.submit(&seal_job(&ek, &job(own, WitnessKind::SpendKey)).unwrap()).unwrap();
+    let q2 = svc.submit(&seal_job(&ek, &job(other, WitnessKind::SpendKey)).unwrap()).unwrap();
+    assert_eq!(svc.info().queue.depth, 2);
+
+    svc.shutdown();
+    assert!(svc.status(&q1).is_none(), "a queued job is dropped");
+    assert!(svc.status(&q2).is_none(), "a queued job is dropped");
+    assert_eq!(svc.info().queue.depth, 0);
+    match svc.submit(&seal_job(&ek, &job(other, WitnessKind::SpendKey)).unwrap()) {
+        Err(Refusal::Bad(why)) => assert_eq!(why, "shutting down"),
+        other => panic!("{other:?}"),
+    }
+    let s = wait_terminal(&svc, &proving).await;
+    assert_eq!(s.state, State::Failed);
+    assert!(s.reply.is_none(), "the in-flight proof's reply is discarded");
+    assert_eq!(s.error.as_deref(), Some("shutting down"));
+    // The worker exits: it drops its clone of the service.
+    for _ in 0..200 {
+        if Arc::strong_count(&svc) == 1 { break; }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(Arc::strong_count(&svc), 1, "the worker task still holds the service");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1, "no second proof ever starts");
+}

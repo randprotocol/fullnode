@@ -206,11 +206,22 @@ async fn main() -> Result<()> {
             cfg.max_queue = max_queue;
             cfg.per_token = per_token;
             cfg.accept_spend_key = accept_spend_key;
-            let (bound, _svc, task) = http::serve(listen, cfg).await?;
+            let (bound, svc, mut task) = http::serve(listen, cfg).await?;
             eprintln!("rand-prover {fingerprint} listening on http://{bound}");
             tokio::select! {
-                r = shutdown_signal() => { r?; eprintln!("shutting down"); }
-                _ = task => bail!("the listener exited"),
+                r = shutdown_signal() => {
+                    r?;
+                    // Queued jobs are dropped now; the runtime still waits for a proof already on
+                    // the blocking pool, whose reply is discarded.
+                    eprintln!("shutting down: queued jobs dropped; a proof in flight (up to ~100 s) finishes first and its reply is discarded");
+                    svc.shutdown();
+                    task.abort();
+                    let _ = task.await;
+                }
+                _ = &mut task => {
+                    svc.shutdown();
+                    bail!("the listener exited");
+                }
             }
         }
     }

@@ -140,6 +140,11 @@ ExecStart=/usr/local/bin/rand-prover --home /root/prover run --accept-spend-key
 TimeoutStopSec=180
 ```
 
+On the stop the service stops admitting (a submit in the meantime is refused `bad job` with
+`shutting down`), drops every queued job with its witness zeroized, lets the proof in flight finish
+but discards its reply (the job ends `failed`, `shutting down`), and stops its workers; `rand-node
+run --prover` stops its hosted prover the same way when the node stops.
+
 ## 4. In a node
 
 A node can host the same service on its own listener:
@@ -258,6 +263,15 @@ JSON-RPC 2.0 over HTTP `POST /`, one request object per body. Batches and notifi
 served (`-32600`); `params` must be an array. The request body is capped at 135 168 bytes
 (twice `MAX_SEALED_JOB_BYTES` for the hex, plus 4 KiB); a larger body gets HTTP 413 with a
 JSON-RPC error.
+
+The listener is reachable from a browser page on another origin (the web wallet): `OPTIONS /`
+answers a CORS preflight with 204, `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods:
+POST, OPTIONS`, `Access-Control-Allow-Headers: content-type` and `Access-Control-Max-Age: 86400`,
+and every reply to a `POST` — results, JSON-RPC errors and the 413 alike — carries
+`Access-Control-Allow-Origin: *`. Any origin is safe here because nothing about a request is
+authorised by the browser: the only credential is the pairing token inside the sealed job, which a
+page can present only if it already holds it, never a cookie or other ambient credential another
+site could make the browser send.
 
 | method | params | result |
 |---|---|---|

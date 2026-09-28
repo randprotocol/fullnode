@@ -88,3 +88,37 @@ fn required_bytes_is_peak_times_parallel_plus_a_gib() {
     let e = check(1_000_000).unwrap_err();
     assert!(e.contains("GB"), "{e}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_preflight_is_answered_for_a_browser_page() {
+    let (addr, _ek, _token, http) = start().await;
+    let r = http
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/"))
+        .header("origin", "https://wallet.example")
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "content-type")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let h = r.headers();
+    assert_eq!(h["access-control-allow-origin"], "*");
+    assert_eq!(h["access-control-allow-methods"], "POST, OPTIONS");
+    assert_eq!(h["access-control-allow-headers"], "content-type");
+    assert_eq!(h["access-control-max-age"], "86400");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_post_reply_carries_allow_origin() {
+    let (addr, _ek, _token, http) = start().await;
+    let post = |body: Value| http.post(format!("http://{addr}/")).header("origin", "https://wallet.example").json(&body).send();
+    let ok = post(json!({"jsonrpc":"2.0","id":1,"method":"prover_info","params":[]})).await.unwrap();
+    assert_eq!(ok.status(), 200);
+    assert_eq!(ok.headers()["access-control-allow-origin"], "*", "a success");
+    let err = post(json!({"jsonrpc":"2.0","id":1,"method":"prover_nope","params":[]})).await.unwrap();
+    assert_eq!(err.headers()["access-control-allow-origin"], "*", "a JSON-RPC error");
+    assert_eq!(err.json::<Value>().await.unwrap()["error"]["code"], -32601);
+    let big = post(json!({"jsonrpc":"2.0","id":1,"method":"prover_submit","params":["a".repeat(MAX_BODY_BYTES + 1)]})).await.unwrap();
+    assert_eq!(big.status(), 413);
+    assert_eq!(big.headers()["access-control-allow-origin"], "*", "the 413");
+}
