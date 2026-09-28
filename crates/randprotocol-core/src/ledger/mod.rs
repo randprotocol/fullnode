@@ -5475,6 +5475,51 @@ mod tests {
         assert_eq!(moved.state_root(), held.state_root());
     }
 
+    /// The `rand-state-7` byte layout, pinned: the pre-gas buffer (here the four base leaves,
+    /// then the vesting root when a register is present), then `be(gas_price) ‖ be(byte_price)`.
+    #[test]
+    fn the_rand_state_7_layout_is_pinned() {
+        for vesting in [false, true] {
+            let mut l = ledger();
+            if vesting {
+                l.set_vesting(Some(vesting::VestingRegister::default()));
+            }
+            l.set_gas(Some(dynamic_gas()));
+            l.set_gas_prices(gas::GasPrices { gas_price: 0x0102_0304_0506_0708, byte_price: 0x1112_1314_1516_1718 });
+            let (nf, val, prog) = l.state_root_leaves();
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&word8_to_bytes(&l.tree.root()));
+            buf.extend_from_slice(nf.as_bytes());
+            buf.extend_from_slice(val.as_bytes());
+            buf.extend_from_slice(prog.as_bytes());
+            if let Some(v) = l.vesting() {
+                buf.extend_from_slice(v.root().as_bytes());
+            }
+            buf.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            buf.extend_from_slice(&[0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]);
+            assert_eq!(l.state_root(), Hash::digest_domain(b"rand-state-7", &buf), "vesting {vesting}");
+        }
+    }
+
+    /// A chain with `vesting` and a FIXED gas section keeps exactly the `rand-state-6` root it
+    /// had without the gas section.
+    #[test]
+    fn a_fixed_gas_section_keeps_the_vesting_root() {
+        let mut bare = ledger();
+        bare.set_vesting(Some(vesting::VestingRegister::default()));
+        let mut fixed = bare.clone();
+        fixed.set_gas(Some(gas::GasConfig { dynamic: None, ..dynamic_gas() }));
+        assert_eq!(fixed.state_root(), bare.state_root());
+        let (nf, val, prog) = bare.state_root_leaves();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&word8_to_bytes(&bare.tree.root()));
+        buf.extend_from_slice(nf.as_bytes());
+        buf.extend_from_slice(val.as_bytes());
+        buf.extend_from_slice(prog.as_bytes());
+        buf.extend_from_slice(bare.vesting().unwrap().root().as_bytes());
+        assert_eq!(fixed.state_root(), Hash::digest_domain(b"rand-state-6", &buf));
+    }
+
     /// The deliberate seam for B3: until the constraint-set-8 vendor gives `CallOutcome` its
     /// `gas_limit`, a call adds nothing to a block's gas. B3's change must turn this red first.
     #[test]

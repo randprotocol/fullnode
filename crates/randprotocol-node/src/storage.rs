@@ -198,7 +198,8 @@ const META_REGISTRATION_FEES_BURNED: &str = "registration_fees_burned";
 /// `bincode(GasPrices)`: the live gas prices as of the head (Phase 2, spec §7.1,
 /// `Ledger::gas_prices`). Consensus state under `gas.dynamic` — in the state root under
 /// `rand-state-7` and `Ledger`'s equality — written at the same sites as
-/// `META_REGISTRATION_FEES_BURNED` (genesis init, every commit, the repair), restored by
+/// `META_REGISTRATION_FEES_BURNED` (genesis init, every commit, the repair) but only when the
+/// ledger has a `gas` section, restored by
 /// `load_ledger` and replayed by `verify_chain`. Absent on a database written before the key
 /// existed: `load_ledger` then leaves the ledger's prices unset, which reads as the genesis
 /// section's own prices once `reload_ledger` sets the section — so a chain-16/17 datadir opens.
@@ -718,7 +719,11 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&gs.ledger.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(gs.ledger.bond_queue())?);
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&gs.ledger.registration_fees_burned())?);
-        batch.put_cf(self.cf(CF_META), META_GAS_PRICES, bincode::serialize(&gs.ledger.gas_prices())?);
+        // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
+        // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
+        if gs.ledger.gas().is_some() {
+            batch.put_cf(self.cf(CF_META), META_GAS_PRICES, bincode::serialize(&gs.ledger.gas_prices())?);
+        }
         self.put_vesting(&mut batch, gs.ledger.vesting())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
@@ -2281,7 +2286,11 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger_after.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger_after.bond_queue())?);
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger_after.registration_fees_burned())?);
-        batch.put_cf(self.cf(CF_META), META_GAS_PRICES, bincode::serialize(&ledger_after.gas_prices())?);
+        // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
+        // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
+        if ledger_after.gas().is_some() {
+            batch.put_cf(self.cf(CF_META), META_GAS_PRICES, bincode::serialize(&ledger_after.gas_prices())?);
+        }
         self.put_vesting(&mut batch, ledger_after.vesting())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
@@ -2943,7 +2952,11 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger.bond_queue())?);
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger.registration_fees_burned())?);
-        batch.put_cf(self.cf(CF_META), META_GAS_PRICES, bincode::serialize(&ledger.gas_prices())?);
+        // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
+        // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
+        if ledger.gas().is_some() {
+            batch.put_cf(self.cf(CF_META), META_GAS_PRICES, bincode::serialize(&ledger.gas_prices())?);
+        }
         self.put_vesting(&mut batch, ledger.vesting())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
@@ -6245,6 +6258,24 @@ mod tests {
         s.db.delete_cf(s.cf(CF_META), META_GAS_PRICES).unwrap();
         assert_eq!(s.gas_prices().unwrap(), None);
         assert_eq!(crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap().gas_prices(), start);
+    }
+
+    /// Review item 3: a ledger without a `gas` section (every chain before chain 18, and any
+    /// ledger `load_ledger` built before `set_gas`) never stores `(0, 0)` as its prices.
+    #[test]
+    fn a_chain_without_a_gas_section_stores_no_gas_prices() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = genesis_file_of(7, &[&key(1)], vec![], 2).build(&StubExecutor).unwrap();
+        assert!(gs.ledger.gas().is_none());
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.gas_prices().unwrap(), None, "not at genesis init");
+        let mut ledger = gs.ledger.clone();
+        let b1 = make_block(&gs.block, &mut ledger, vec![], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.gas_prices().unwrap(), None, "not at a commit");
+        s.truncate_to(&gs, 1, &ledger).unwrap();
+        assert_eq!(s.gas_prices().unwrap(), None, "not at the repair");
     }
 
     /// Audit v5, TOK-2: the burned registration fees are a supply counter beside `META_SUPPLY`
