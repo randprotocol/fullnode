@@ -13,7 +13,7 @@ randprotocol-core = { path = "crates/randprotocol-core" }
 randprotocol-client = { path = "crates/randprotocol-client" }
 randprotocol-zkvm = { path = "crates/randprotocol-zkvm" }
 randprotocol-rvm = { path = "crates/randprotocol-rvm" }
-randprotocol-prover = { path = "crates/randprotocol-prover" }
+randprotocol-prover = { path = "crates/randprotocol-prover", default-features = false }
 bridge-codec = { path = "crates/bridge-codec" }
 
 # crypto

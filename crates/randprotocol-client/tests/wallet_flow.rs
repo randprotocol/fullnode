@@ -29,7 +29,7 @@
 //! `cargo test` against the same target directory — is ever in flight beside it. The slow blocks
 //! are what covers a slow machine; the slot is what covers a busy one.
 
-use randprotocol_client::wallet::{self, Burn, NoteStore, Wallet};
+use randprotocol_client::wallet::{self, Burn, NoteStore, Wallet, Proving};
 use randprotocol_client::RpcClient;
 use randprotocol_core::genesis::{Genesis, GenesisValidator};
 use randprotocol_core::notes::word8_to_hex;
@@ -171,7 +171,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     // read and released after the commit, so no other test's proof shares these cores (see
     // `proving_slot`).
     let slot = proving_slot().await;
-    let first = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, "", fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let first = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, "", fee, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the bundle is accepted and commits");
     drop(slot);
@@ -197,7 +197,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
 
     // ---- the change note is spendable ----
     let slot = proving_slot().await;
-    let second = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, "", fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let second = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, "", fee, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the change note pays a second bundle");
     drop(slot);
@@ -218,7 +218,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     let action = randprotocol_core::Action::Bond { validator, amount: bond, registration: None };
     let slot = proving_slot().await;
     let bonded =
-        wallet::submit(&rpc, &a, &mut a_store, None, action, fee, Burn::Rand(bond), FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::submit(&rpc, &a, &mut a_store, None, action, fee, Burn::Rand(bond), FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
             .await
             .expect("the bond's bundle is accepted and commits");
     drop(slot);
@@ -240,7 +240,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     let deploy = Action::Deploy { base_pc: prog.base_pc, words: prog.words.clone(), public: vec![] };
     let fee = wallet::deploy_fee_default(&deploy);
     let slot = proving_slot().await;
-    wallet::submit(&rpc, &a, &mut a_store, None, deploy, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    wallet::submit(&rpc, &a, &mut a_store, None, deploy, fee, Burn::None, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the program deploys");
     drop(slot);
@@ -267,7 +267,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
         fee,
         Burn::None,
         FriProfile::Test,
-        Backend::Cpu,
+        &Proving::local(Backend::Cpu),
         CHAIN_ID,
         true,
     )
@@ -331,7 +331,7 @@ async fn a_memo_is_read_by_the_payee_the_sender_and_a_disclosed_tx_key() {
     let pay = UNITS_PER_RAND;
     let memo = "round trip";
     let slot = proving_slot().await;
-    let sent = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, memo, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let sent = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, memo, fee, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the memo bundle is accepted and commits");
     drop(slot);
@@ -419,7 +419,7 @@ async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
     assert_eq!(fee, gas::BUNDLE_BASE + gas::deploy_fee(prog.words.len() + public.len()));
     let pid = program_id_with_public(prog.base_pc, &prog.words, &public);
     let slot = proving_slot().await;
-    wallet::submit(&rpc, &a, &mut store, None, deploy, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    wallet::submit(&rpc, &a, &mut store, None, deploy, fee, Burn::None, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the program deploys with its public input");
     drop(slot);
@@ -443,7 +443,7 @@ async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
     let (envelope, _) = call_envelope::seal_call_envelope(&a.vk, None, &h_in, salt, &inputs, caps).expect("seals");
     let fee = wallet::call_fee_default(tier, gas::call_bytes(&proof, Some(&envelope)));
     let action = Action::Call { program: pid, proof, input_envelope: Some(envelope) };
-    let call = wallet::submit(&rpc, &a, &mut store, None, action, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let call = wallet::submit(&rpc, &a, &mut store, None, action, fee, Burn::None, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the call is accepted and commits");
     drop(slot);
@@ -463,7 +463,7 @@ async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
             .expect("a proof over another public input still proves");
     let fee = wallet::call_fee_default(tier, gas::call_bytes(&proof, None));
     let action = Action::Call { program: pid, proof, input_envelope: None };
-    let refused = wallet::submit(&rpc, &a, &mut store, None, action, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true).await;
+    let refused = wallet::submit(&rpc, &a, &mut store, None, action, fee, Burn::None, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true).await;
     drop(slot);
     let e = refused.expect_err("the chain refuses a call proved over another public input").to_string();
     assert!(e.contains("PublicValues"), "{e}");
@@ -502,6 +502,7 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
     // refuse the registration, and is promoted to `authority_out` only once it is accepted.
     let authority = Keypair::generate();
     let authority_out = dir.path().join("authority.key.json");
+    let cpu = Proving::local(Backend::Cpu);
     let created = wallet::create_token(
         &rpc,
         &a,
@@ -514,7 +515,7 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
         [7; 32],
         None,
         FriProfile::Test,
-        Backend::Cpu,
+        &cpu,
         CHAIN_ID,
         true,
     );
@@ -538,7 +539,7 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
         .expect("the authority mints against its own token");
     assert!(matches!(&mint_action, Action::TokenMint { asset: 1, amount: 1_000_000, nonce: 0, .. }));
     let slot = proving_slot().await;
-    let minted = wallet::submit_token_mint(&rpc, &a, &mut a_store, mint_action, gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let minted = wallet::submit_token_mint(&rpc, &a, &mut a_store, mint_action, gas::BUNDLE_BASE, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect("the mint's bundle commits");
     drop(slot);
@@ -556,7 +557,7 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
     let pay = 400_000u64;
     let slot = proving_slot().await;
     let sent =
-        wallet::send_asset(&rpc, &a, &mut a_store, &b.address, resolved, pay, "", gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::send_asset(&rpc, &a, &mut a_store, &b.address, resolved, pay, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
             .await
             .expect("the token transfer commits");
     drop(slot);
@@ -574,7 +575,7 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
     assert_eq!(a_store.balance(), after_register_and_mint - gas::BUNDLE_BASE);
 
     // ---- B cannot pay it on without RAND for the fee: refused before any proof ----
-    let e = wallet::send_asset(&rpc, &b, &mut b_store, &a.address, 1, 1, "", gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+    let e = wallet::send_asset(&rpc, &b, &mut b_store, &a.address, 1, 1, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
         .expect_err("no RAND, no transfer")
         .to_string();
@@ -584,7 +585,7 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
     let burn = 100_000u64;
     let slot = proving_slot().await;
     let burned =
-        wallet::submit_token_burn(&rpc, &a, &mut a_store, 1, burn, gas::BUNDLE_BASE, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
+        wallet::submit_token_burn(&rpc, &a, &mut a_store, 1, burn, gas::BUNDLE_BASE, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
             .await
             .expect("the token burn commits");
     drop(slot);

@@ -19,6 +19,7 @@
 //! the fee, the burn fields, and four envelopes nobody but their recipients can open — the
 //! dummies' envelopes open to nobody at all.
 
+use crate::prover::RemoteProver;
 use crate::tree::LocalTree;
 use crate::{AssetRow, ChainLimits, CommitmentRow, RpcClient};
 use anyhow::{anyhow, Context, Result};
@@ -42,8 +43,10 @@ use randprotocol_zkvm::hidden::{self, HiddenDigestInput, HiddenOutput, A_SLOTS, 
 use randprotocol_zkvm::machine::{Backend, FriProfile};
 use randprotocol_zkvm::notes::{Note, SpendKey, ViewingKey};
 use randprotocol_zkvm::viewing::TxKey;
+use randprotocol_prover::wire::WitnessKind;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Rows per `getCommitments`/`getNullifiers` page. The node caps a page at 1000 however large
@@ -1531,7 +1534,7 @@ struct Proved {
 /// proof that does not publish the digest this wallet computed from its own plaintext is a bug in
 /// this wallet — not something the node would explain, since the node only ever sees a digest
 /// that matches no plaintext.
-fn check_published_digest(digest: &Word8, expected: &Word8) -> Result<()> {
+pub(crate) fn check_published_digest(digest: &Word8, expected: &Word8) -> Result<()> {
     if digest != expected {
         return Err(anyhow!(
             "the bundle proof published digest {} but this wallet built {} — refusing to submit (wallet bug)",
@@ -1558,19 +1561,38 @@ impl Prepared {
     }
 }
 
-/// How a submission proves its bundle: the real prover at the chain's profile, or — in unit
-/// tests — the guest run in the emulator, whose digest is checked exactly as a proof's is.
-#[derive(Clone, Copy)]
-enum Proving {
-    Real(FriProfile, Backend),
+/// How a submission proves its bundle: on this machine ([`Proving::Local`]), on a paired prover
+/// ([`Proving::Remote`], `rand --prover`), or — in unit tests — the guest run in the emulator,
+/// whose digest is checked exactly as a proof's is. The FRI profile is the chain's and travels
+/// beside it, not inside it.
+#[derive(Clone)]
+pub enum Proving {
+    Local(Backend),
+    Remote(Arc<RemoteProver>),
     #[cfg(test)]
     Emulated,
 }
 
 impl Proving {
-    fn prove(self, prepared: &Prepared, binding: &[u32; TX_BINDING_WORDS]) -> Result<Proved> {
+    pub fn local(b: Backend) -> Proving {
+        Proving::Local(b)
+    }
+
+    /// Proves `prepared` against `binding`. `proof_cap` is the chain's `max_proof_bytes`, which a
+    /// remote prover's reply is held to before it is used (a local proof is this build's own).
+    async fn prove(&self, prepared: &Prepared, binding: &[u32; TX_BINDING_WORDS], profile: FriProfile, proof_cap: usize) -> Result<Proved> {
         match self {
-            Proving::Real(profile, backend) => prepared.prove(binding, profile, backend),
+            Proving::Local(backend) => prepared.prove(binding, profile, *backend),
+            Proving::Remote(remote) => {
+                eprintln!("proving the bundle on {} (paired prover {})…", remote.paired().label(), remote.paired().fingerprint);
+                let started = Instant::now();
+                let (proof, tier) = remote
+                    .prove(&prepared.guest, profile, WitnessKind::SpendKey, &prepared.words, binding, &prepared.expected, proof_cap)
+                    .await?;
+                let proving = started.elapsed();
+                eprintln!("proved remotely in {proving:.1?}: tier {tier}, {} bytes", proof.len());
+                Ok(Proved { proof, tier, proving })
+            }
             #[cfg(test)]
             Proving::Emulated => tests::emulated_proof(prepared, binding),
         }
@@ -1766,18 +1788,22 @@ fn is_anchor_miss(e: &anyhow::Error) -> bool {
     e.downcast_ref::<crate::RpcError>().is_some_and(|r| r.code == -32001)
 }
 
-/// Prove `tx`'s one bundle against `tx`'s own binding, in place. The binding is taken with the
-/// proof still empty; filling the proof in cannot move it, because the binding blanks it.
-///
-/// `prove` is [`Prepared::prove`] at the caller's profile and backend; a unit test hands in a stub
+/// Prove `tx`'s one bundle against `tx`'s own binding, in place, with `proving` at `profile`.
+async fn prove_transaction(tx: &mut Transaction, prepared: &Prepared, proving: &Proving, profile: FriProfile, proof_cap: usize) -> Result<Proved> {
+    prove_transaction_by(tx, |binding| async move { proving.prove(prepared, &binding, profile, proof_cap).await }).await
+}
+
+/// The order [`prove_transaction`] keeps: the binding is taken with the proof still empty, the
+/// bundle proved against it, the proof filled in; filling the proof in cannot move the binding,
+/// because the binding blanks it. `prove` is handed the binding — a unit test hands in a stub
 /// prover, which is what lets the ordering be tested without a minute of proving.
-fn prove_transaction(
-    tx: &mut Transaction,
-    prepared: &Prepared,
-    prove: &dyn Fn(&Prepared, &[u32; TX_BINDING_WORDS]) -> Result<Proved>,
-) -> Result<Proved> {
+async fn prove_transaction_by<F, Fut>(tx: &mut Transaction, prove: F) -> Result<Proved>
+where
+    F: FnOnce([u32; TX_BINDING_WORDS]) -> Fut,
+    Fut: std::future::Future<Output = Result<Proved>>,
+{
     let binding = tx.binding();
-    let p = prove(prepared, &binding)?;
+    let p = prove(binding).await?;
     tx.bundle.as_mut().context("a shielded transaction has a bundle")?.proof = p.proof.clone();
     debug_assert_eq!(tx.binding(), binding, "filling the proof in never moves the binding");
     Ok(p)
@@ -1818,7 +1844,7 @@ pub async fn submit_bound_call(
     fee: u64,
     prove_call: &CallProver<'_>,
     profile: FriProfile,
-    backend: Backend,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
@@ -1842,7 +1868,7 @@ pub async fn submit_bound_call(
         Ok(proof)
     };
     let spend = Spend { asset: 0, to: None, memo: "", fee, burn_a: 0, burn_r: 0 };
-    submit_spend(rpc, w, store, spend, action, Burn::None, Proving::Real(profile, backend), Some(&checked), chain_id, wait).await
+    submit_spend(rpc, w, store, spend, action, Burn::None, profile, proving, Some(&checked), chain_id, wait).await
 }
 
 /// The tier a call proof declares, read off its header.
@@ -1902,7 +1928,8 @@ async fn submit_spend(
     spend: Spend<'_>,
     action: Action,
     burn: Burn,
-    proving: Proving,
+    profile: FriProfile,
+    proving: &Proving,
     call_prover: Option<&CallProver<'_>>,
     chain_id: u64,
     wait: bool,
@@ -1920,7 +1947,12 @@ async fn submit_spend(
     if let Some(prove_call) = call_prover {
         bind_call(&mut tx, prove_call)?;
     }
-    let proved = prove_transaction(&mut tx, &prepared, &|p, b| proving.prove(p, b))?;
+    // A remote prover's reply is held to the chain's proof cap; a local proof needs no read.
+    let cap = match proving {
+        Proving::Remote(_) => proof_cap(rpc.limits().await?.as_ref()),
+        _ => gas::MAX_PROOF_BYTES,
+    };
+    let proved = prove_transaction(&mut tx, &prepared, proving, profile, cap).await?;
     // `submit_refused` labels a JSON-RPC error reply *from this call* as `SubmitRefused`
     // (node I1): it is the only failure here that means nothing was admitted, and `rand token
     // create` deletes a freshly generated authority key on it and on nothing else. Everything
@@ -1950,11 +1982,11 @@ pub async fn submit(
     fee: u64,
     burn: Burn,
     profile: FriProfile,
-    backend: Backend,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    submit_with(rpc, w, store, to, action, fee, burn, Proving::Real(profile, backend), chain_id, wait).await
+    submit_with(rpc, w, store, to, action, fee, burn, profile, proving, chain_id, wait).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1966,7 +1998,8 @@ async fn submit_with(
     action: Action,
     fee: u64,
     burn: Burn,
-    proving: Proving,
+    profile: FriProfile,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
@@ -1986,7 +2019,7 @@ async fn submit_with(
     // `to: None` (a deploy, a bond, a bridge action), and the one path that pays someone a memo
     // is `send`/`send_asset`, below.
     let spend = Spend { asset: 0, to, memo: "", fee, burn_a: 0, burn_r: burn.units() };
-    submit_spend(rpc, w, store, spend, action, burn, proving, None, chain_id, wait).await
+    submit_spend(rpc, w, store, spend, action, burn, profile, proving, None, chain_id, wait).await
 }
 
 /// A bridge action on a fee bundle: `rand bridge-mint`'s and `rand bridge-rotate`'s
@@ -2007,11 +2040,11 @@ pub async fn submit_bridge_action(
     action: Action,
     fee: u64,
     profile: FriProfile,
-    backend: Backend,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    submit_bridge_action_with(rpc, w, store, action, fee, Proving::Real(profile, backend), chain_id, wait).await
+    submit_bridge_action_with(rpc, w, store, action, fee, profile, proving, chain_id, wait).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2021,7 +2054,8 @@ async fn submit_bridge_action_with(
     store: &mut NoteStore,
     action: Action,
     fee: u64,
-    proving: Proving,
+    profile: FriProfile,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
@@ -2031,7 +2065,7 @@ async fn submit_bridge_action_with(
     ) {
         return Err(anyhow!("submit_bridge_action carries a bridge attestation or a bridged-token listing, nothing else"));
     }
-    submit_with(rpc, w, store, None, action, fee, Burn::None, proving, chain_id, wait).await
+    submit_with(rpc, w, store, None, action, fee, Burn::None, profile, proving, chain_id, wait).await
 }
 
 /// The four facts about the chain a burn needs before any proving: the chain has a bridge at
@@ -2144,12 +2178,12 @@ pub async fn submit_burn(
     to: [u8; 32],
     fee: u64,
     profile: FriProfile,
-    backend: Backend,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
     let burn = BurnRequest { asset, amount, relayer_fee, to_chain, token, to };
-    submit_burn_with(rpc, w, store, burn, fee, Proving::Real(profile, backend), chain_id, wait).await
+    submit_burn_with(rpc, w, store, burn, fee, profile, proving, chain_id, wait).await
 }
 
 /// [`submit_burn`]'s arguments that become the action.
@@ -2170,7 +2204,8 @@ async fn submit_burn_with(
     store: &mut NoteStore,
     burn: BurnRequest,
     fee: u64,
-    proving: Proving,
+    profile: FriProfile,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
@@ -2194,7 +2229,7 @@ async fn submit_burn_with(
     burn_is_possible(&rpc.bridge_state().await?, asset, to_chain, &token, amount, relayer_fee)?;
     let action = Action::BridgeBurn { asset, amount, relayer_fee, to_chain, token, to };
     let spend = Spend { asset, to: None, memo: "", fee, burn_a: amount, burn_r: 0 };
-    submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, proving, None, chain_id, wait).await
+    submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, profile, proving, None, chain_id, wait).await
 }
 
 /// Burn `amount` of token `asset` held in this wallet (`Action::TokenBurn`, RPL spec §4): the
@@ -2216,11 +2251,11 @@ pub async fn submit_token_burn(
     amount: u64,
     fee: u64,
     profile: FriProfile,
-    backend: Backend,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    submit_token_burn_with(rpc, w, store, asset, amount, fee, Proving::Real(profile, backend), chain_id, wait).await
+    submit_token_burn_with(rpc, w, store, asset, amount, fee, profile, proving, chain_id, wait).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2231,7 +2266,8 @@ async fn submit_token_burn_with(
     asset: u32,
     amount: u64,
     fee: u64,
-    proving: Proving,
+    profile: FriProfile,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
@@ -2248,7 +2284,7 @@ async fn submit_token_burn_with(
     }
     let action = Action::TokenBurn { asset, amount };
     let spend = Spend { asset, to: None, memo: "", fee, burn_a: amount, burn_r: 0 };
-    submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, proving, None, chain_id, wait).await
+    submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, profile, proving, None, chain_id, wait).await
 }
 
 /// The facts a deploy needs from the chain before any proving: whether `words` code words fit this
@@ -3024,11 +3060,11 @@ pub async fn submit_register_token(
     action: Action,
     fee: u64,
     profile: FriProfile,
-    backend: Backend,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    submit_register_token_with(rpc, w, store, action, fee, Proving::Real(profile, backend), chain_id, wait).await
+    submit_register_token_with(rpc, w, store, action, fee, profile, proving, chain_id, wait).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3038,14 +3074,15 @@ async fn submit_register_token_with(
     store: &mut NoteStore,
     action: Action,
     fee: u64,
-    proving: Proving,
+    profile: FriProfile,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
     if !matches!(action, Action::RegisterToken { .. }) {
         return Err(anyhow!("submit_register_token carries a RegisterToken action, nothing else"));
     }
-    submit_with(rpc, w, store, None, action, fee, Burn::None, proving, chain_id, wait).await
+    submit_with(rpc, w, store, None, action, fee, Burn::None, profile, proving, chain_id, wait).await
 }
 
 /// What `rand token create` reports: the submission, the index it registered at, the asset id it
@@ -3080,11 +3117,11 @@ pub async fn create_token(
     salt: [u8; 32],
     fee: Option<u64>,
     profile: FriProfile,
-    backend: Backend,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<CreateTokenResult> {
-    create_token_with(rpc, w, store, name, symbol, decimals, authority, initial, salt, fee, Proving::Real(profile, backend), chain_id, wait)
+    create_token_with(rpc, w, store, name, symbol, decimals, authority, initial, salt, fee, profile, proving, chain_id, wait)
         .await
 }
 
@@ -3100,7 +3137,8 @@ async fn create_token_with(
     initial: Option<(u64, ShieldedAddress)>,
     salt: [u8; 32],
     fee: Option<u64>,
-    proving: Proving,
+    profile: FriProfile,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<CreateTokenResult> {
@@ -3136,7 +3174,7 @@ async fn create_token_with(
         }
         None => None,
     };
-    let result = submit_register_token_with(rpc, w, store, plan.action, fee, proving, chain_id, wait).await;
+    let result = submit_register_token_with(rpc, w, store, plan.action, fee, profile, proving, chain_id, wait).await;
     match (&result, &pending) {
         (Ok(_), Some((pending_path, path))) => {
             if let Err(e) = promote_pending_authority_key(pending_path, path) {
@@ -3181,11 +3219,11 @@ pub async fn submit_token_mint(
     action: Action,
     fee: u64,
     profile: FriProfile,
-    backend: Backend,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    submit_token_mint_with(rpc, w, store, action, fee, Proving::Real(profile, backend), chain_id, wait).await
+    submit_token_mint_with(rpc, w, store, action, fee, profile, proving, chain_id, wait).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3195,14 +3233,15 @@ async fn submit_token_mint_with(
     store: &mut NoteStore,
     action: Action,
     fee: u64,
-    proving: Proving,
+    profile: FriProfile,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
     if !matches!(action, Action::TokenMint { .. }) {
         return Err(anyhow!("submit_token_mint carries a TokenMint action, nothing else"));
     }
-    submit_with(rpc, w, store, None, action, fee, Burn::None, proving, chain_id, wait).await
+    submit_with(rpc, w, store, None, action, fee, Burn::None, profile, proving, chain_id, wait).await
 }
 
 /// `rand token set-authority`'s submission: one RAND fee bundle, `to = None`.
@@ -3214,11 +3253,11 @@ pub async fn submit_token_set_authority(
     action: Action,
     fee: u64,
     profile: FriProfile,
-    backend: Backend,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    submit_token_set_authority_with(rpc, w, store, action, fee, Proving::Real(profile, backend), chain_id, wait).await
+    submit_token_set_authority_with(rpc, w, store, action, fee, profile, proving, chain_id, wait).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3228,14 +3267,15 @@ async fn submit_token_set_authority_with(
     store: &mut NoteStore,
     action: Action,
     fee: u64,
-    proving: Proving,
+    profile: FriProfile,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
     if !matches!(action, Action::SetAuthority { .. }) {
         return Err(anyhow!("submit_token_set_authority carries a SetAuthority action, nothing else"));
     }
-    submit_with(rpc, w, store, None, action, fee, Burn::None, proving, chain_id, wait).await
+    submit_with(rpc, w, store, None, action, fee, Burn::None, profile, proving, chain_id, wait).await
 }
 
 /// The PQ co-signature file `rand bridge-mint --pq` and `rand bridge-rotate --pq` read (bridge
@@ -3314,11 +3354,11 @@ pub async fn send(
     memo: &str,
     fee: u64,
     profile: FriProfile,
-    backend: Backend,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    send_asset(rpc, w, store, to, 0, amount, memo, fee, profile, backend, chain_id, wait).await
+    send_asset(rpc, w, store, to, 0, amount, memo, fee, profile, proving, chain_id, wait).await
 }
 
 /// A shielded transfer of any asset — RAND (`asset` 0) or a token by its registry index — as a
@@ -3336,11 +3376,11 @@ pub async fn send_asset(
     memo: &str,
     fee: u64,
     profile: FriProfile,
-    backend: Backend,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
-    send_asset_with(rpc, w, store, to, asset, amount, memo, fee, Proving::Real(profile, backend), chain_id, wait).await
+    send_asset_with(rpc, w, store, to, asset, amount, memo, fee, profile, proving, chain_id, wait).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3353,7 +3393,8 @@ async fn send_asset_with(
     amount: u64,
     memo: &str,
     fee: u64,
-    proving: Proving,
+    profile: FriProfile,
+    proving: &Proving,
     chain_id: u64,
     wait: bool,
 ) -> Result<Submission> {
@@ -3361,7 +3402,7 @@ async fn send_asset_with(
         return Err(anyhow!("a transfer of zero moves nothing"));
     }
     let spend = Spend { asset, to: Some((to, amount)), memo, fee, burn_a: 0, burn_r: 0 };
-    submit_spend(rpc, w, store, spend, Action::None, Burn::None, proving, None, chain_id, wait).await
+    submit_spend(rpc, w, store, spend, Action::None, Burn::None, profile, proving, None, chain_id, wait).await
 }
 
 #[cfg(test)]
@@ -4078,7 +4119,7 @@ mod tests {
     /// is the one the proof names.
     const EMULATED_HC: Word8 = [0xe0; 8];
 
-    /// [`Proving::Emulated`]: the hidden guest run on `p.words` against `binding`, its digest
+    /// [`FriProfile::Test, &Proving::Emulated`]: the hidden guest run on `p.words` against `binding`, its digest
     /// checked as a real proof's is, and a stub proof carrying it.
     pub(super) fn emulated_proof(p: &Prepared, binding: &[u32; TX_BINDING_WORDS]) -> Result<Proved> {
         let program = ZkExecutor::bundle_program_for(&p.guest).expect("prepare_bundle refuses a guest this build lacks");
@@ -4335,7 +4376,7 @@ mod tests {
         async fn send(&self, from: &Wallet, to: &ShieldedAddress, amount: u64, memo: &str) -> Result<Submission> {
             let rpc = serve(&self.inner).await;
             let mut store = NoteStore::default();
-            let submission = send_asset_with(&rpc, from, &mut store, to, 0, amount, memo, 1, Proving::Emulated, 7, false).await?;
+            let submission = send_asset_with(&rpc, from, &mut store, to, 0, amount, memo, 1, FriProfile::Test, &Proving::Emulated, 7, false).await?;
             let tx = self.last_tx();
             let b = tx.bundle.as_ref().expect("a plain transfer has a bundle");
             let leaves: Vec<(Word8, Envelope)> = b.commitments.iter().zip(&b.envelopes).map(|(cm, e)| (*cm, e.clone())).collect();
@@ -4586,7 +4627,7 @@ mod tests {
         scan(&rpc, &me, &mut store).await.unwrap();
         assert_eq!(store.notes.len(), 4);
 
-        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 3, 400, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 3, 400, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .expect("the deposit is spendable");
         assert_eq!((s.amount, s.change, s.asset, s.rand_change), (400, 600, 3, gas::BUNDLE_BASE));
@@ -4854,7 +4895,7 @@ mod tests {
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();
         // Needs both notes: neither alone covers 8 000 000 + the fee.
-        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap();
         assert_eq!((s.amount, s.change, s.asset, s.burn), (8_000_000, 2_000_000 - gas::BUNDLE_BASE, 0, Burn::None));
@@ -4900,13 +4941,13 @@ mod tests {
         chain.lock().unwrap().hc_bundle = ZkExecutor::hc_hidden_bundle_v2();
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();
-        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000_000, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000_000, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap();
         let tx = chain.lock().unwrap().sent.pop().unwrap();
         assert_admissible_shape(&tx);
         chain.lock().unwrap().hc_bundle = [0xbad; 8];
-        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000_000, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000_000, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
@@ -4929,7 +4970,7 @@ mod tests {
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();
         // Two inputs, the shape that asked for two witnesses before this change.
-        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap();
         assert_eq!(chain.lock().unwrap().witness_calls, 0, "the wallet computes its own witnesses (PRIV-1)");
@@ -4994,7 +5035,7 @@ mod tests {
         assert_eq!(store.notes.len(), 2, "no note was duplicated");
         assert!(store.tree.path(0).is_some() && store.tree.path(1).is_some());
         // And a send takes its witnesses from the rebuilt tree, never from the node.
-        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap();
         assert_eq!(chain.lock().unwrap().witness_calls, 0);
@@ -5031,7 +5072,7 @@ mod tests {
 
         // A full send rescans first and anchors at the moved head: the (emulated) guest still
         // accepts every witness, because the appends advanced them.
-        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 8_000_000, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap();
         assert_eq!(s.time, 3);
@@ -5075,7 +5116,7 @@ mod tests {
         assert_eq!(store.asset_balances(), vec![(0, 10_000_000), (3, 1_000)], "the deposit recovered");
         assert!(store.tree.path(0).is_some(), "and it has a witness after the rebuild");
         // Spendable, and its witness comes from the rebuilt tree — never from the node.
-        send_asset_with(&rpc, &me, &mut store, &you.address, 3, 400, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        send_asset_with(&rpc, &me, &mut store, &you.address, 3, 400, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .expect("the recovered deposit is spendable");
         assert_eq!(chain.lock().unwrap().witness_calls, 0);
@@ -5122,18 +5163,18 @@ mod tests {
         chain.lock().unwrap().fund(&me, 500, 4);
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();
-        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 100, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 100, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("a transfer pays its fee in RAND"), "{e}");
         chain.lock().unwrap().fund(&me, gas::BUNDLE_BASE, 0);
-        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 501, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 501, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("asset 4") && e.contains("insufficient"), "{e}");
-        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 0, "", gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let e = send_asset_with(&rpc, &me, &mut store, &you.address, 4, 0, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
@@ -5159,14 +5200,14 @@ mod tests {
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();
         let burn = |amount| BurnRequest { asset: 3, amount, relayer_fee: 0, to_chain: 2, token, to: [1; 32] };
-        let e = submit_burn_with(&rpc, &me, &mut store, burn(800), gas::BRIDGE_BURN_FEE, Proving::Emulated, 7, false)
+        let e = submit_burn_with(&rpc, &me, &mut store, burn(800), gas::BRIDGE_BURN_FEE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("only 700 is locked"), "{e}");
         assert!(chain.lock().unwrap().sent.is_empty());
 
-        let s = submit_burn_with(&rpc, &me, &mut store, burn(400), gas::BRIDGE_BURN_FEE, Proving::Emulated, 7, false).await.unwrap();
+        let s = submit_burn_with(&rpc, &me, &mut store, burn(400), gas::BRIDGE_BURN_FEE, FriProfile::Test, &Proving::Emulated, 7, false).await.unwrap();
         assert_eq!((s.amount, s.change, s.asset, s.burn, s.rand_change), (400, 600, 3, Burn::Asset { index: 3, amount: 400 }, 5));
         let tx = chain.lock().unwrap().sent.pop().unwrap();
         assert_admissible_shape(&tx);
@@ -5190,19 +5231,19 @@ mod tests {
         }
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();
-        let e = submit_token_burn_with(&rpc, &me, &mut store, 2, 100, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let e = submit_token_burn_with(&rpc, &me, &mut store, 2, 100, gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("bridged token") && e.contains("bridge-burn"), "{e}");
-        let e = submit_token_burn_with(&rpc, &me, &mut store, 0, 100, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let e = submit_token_burn_with(&rpc, &me, &mut store, 0, 100, gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("RAND"), "{e}");
         assert!(chain.lock().unwrap().sent.is_empty());
 
-        let s = submit_token_burn_with(&rpc, &me, &mut store, 5, 300, gas::BUNDLE_BASE, Proving::Emulated, 7, false).await.unwrap();
+        let s = submit_token_burn_with(&rpc, &me, &mut store, 5, 300, gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false).await.unwrap();
         assert_eq!((s.amount, s.change, s.rand_change), (300, 0, 0));
         let tx = chain.lock().unwrap().sent.pop().unwrap();
         assert_admissible_shape(&tx);
@@ -5264,7 +5305,7 @@ mod tests {
             None,
             [3; 32],
             None,
-            Proving::Emulated,
+            FriProfile::Test, &Proving::Emulated,
             7,
             false,
         )
@@ -5293,7 +5334,7 @@ mod tests {
             None,
             [3; 32],
             None,
-            Proving::Emulated,
+            FriProfile::Test, &Proving::Emulated,
             7,
             false,
         )
@@ -5323,14 +5364,14 @@ mod tests {
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();
         let initial = Some((1_000, me.address.clone()));
-        let e = create_token_with(&rpc, &me, &mut store, "Fixed", "FIX", 6, None, initial.clone(), [4; 32], None, Proving::Emulated, 7, false)
+        let e = create_token_with(&rpc, &me, &mut store, "Fixed", "FIX", 6, None, initial.clone(), [4; 32], None, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .expect_err("an absurd node-reported registration fee is refused")
             .to_string();
         assert!(e.contains("--fee"), "{e}");
         assert!(chain.lock().unwrap().sent.is_empty(), "nothing was sent");
         let fee = 2 * gas::BUNDLE_BASE + absurd;
-        create_token_with(&rpc, &me, &mut store, "Fixed", "FIX", 6, None, initial, [4; 32], Some(fee), Proving::Emulated, 7, false)
+        create_token_with(&rpc, &me, &mut store, "Fixed", "FIX", 6, None, initial, [4; 32], Some(fee), FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .expect("an explicit --fee is the caller's own decision");
         assert_eq!(chain.lock().unwrap().sent.pop().unwrap().bundle.unwrap().fee, fee);
@@ -5374,7 +5415,7 @@ mod tests {
             None,
             [3; 32],
             None,
-            Proving::Emulated,
+            FriProfile::Test, &Proving::Emulated,
             7,
             true,
         )
@@ -5401,7 +5442,7 @@ mod tests {
         }
         let e = create_token_with(
             &rpc, &me, &mut store, "Fixed", "FIX", 6, Some((&kp, out2.as_path())), None, [3; 32], None,
-            Proving::Emulated, 7, true,
+            FriProfile::Test, &Proving::Emulated, 7, true,
         )
         .await
         .unwrap_err();
@@ -5443,7 +5484,7 @@ mod tests {
             None,
             [3; 32],
             None,
-            Proving::Emulated,
+            FriProfile::Test, &Proving::Emulated,
             7,
             true,
         )
@@ -5491,7 +5532,7 @@ mod tests {
             }
             _ => unreachable!(),
         };
-        submit_register_token_with(&rpc, &me, &mut store, plan.action, fee, Proving::Emulated, 7, false).await.unwrap();
+        submit_register_token_with(&rpc, &me, &mut store, plan.action, fee, FriProfile::Test, &Proving::Emulated, 7, false).await.unwrap();
         let tx = chain.lock().unwrap().sent.pop().unwrap();
         assert_admissible_shape(&tx);
         let b = tx.bundle.as_ref().unwrap();
@@ -5518,13 +5559,13 @@ mod tests {
             _ => unreachable!(),
         };
         assert_ne!(id1, id2, "two different registrations are two different assets");
-        submit_register_token_with(&rpc, &me, &mut store, plan.action, fee, Proving::Emulated, 7, false).await.unwrap();
+        submit_register_token_with(&rpc, &me, &mut store, plan.action, fee, FriProfile::Test, &Proving::Emulated, 7, false).await.unwrap();
         let tx = chain.lock().unwrap().sent.pop().unwrap();
         assert_admissible_shape(&tx);
         assert!(matches!(tx.action, Action::RegisterToken { authority: MintAuthority::Key(_), index: 2, initial: None, .. }));
 
         // A submission of anything but a `RegisterToken` is refused outright.
-        let e = submit_register_token_with(&rpc, &me, &mut store, Action::None, fee, Proving::Emulated, 7, false)
+        let e = submit_register_token_with(&rpc, &me, &mut store, Action::None, fee, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
@@ -5583,7 +5624,7 @@ mod tests {
         // The right key mints: `TokenMint` at `mint_nonce` 0, signed, riding a fee bundle.
         let action = build_token_mint(&rpc, &me, 7, 2, &row(2), &me.address, 500, &authority_kp).await.unwrap();
         assert!(matches!(&action, Action::TokenMint { asset: 2, amount: 500, nonce: 0, .. }));
-        submit_token_mint_with(&rpc, &me, &mut store, action, gas::BUNDLE_BASE, Proving::Emulated, 7, false).await.unwrap();
+        submit_token_mint_with(&rpc, &me, &mut store, action, gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false).await.unwrap();
         let tx = chain.lock().unwrap().sent.pop().unwrap();
         assert_admissible_shape(&tx);
         assert!(matches!(tx.action, Action::TokenMint { asset: 2, amount: 500, nonce: 0, .. }));
@@ -5593,18 +5634,18 @@ mod tests {
         let successor = Keypair::generate();
         let action = build_token_set_authority(7, 2, &row(2), &authority_kp, Some(successor.public_key().clone())).unwrap();
         assert!(matches!(&action, Action::SetAuthority { asset: 2, new: Some(pk), nonce: 0, .. } if *pk == *successor.public_key()));
-        submit_token_set_authority_with(&rpc, &me, &mut store, action, gas::BUNDLE_BASE, Proving::Emulated, 7, false).await.unwrap();
+        submit_token_set_authority_with(&rpc, &me, &mut store, action, gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false).await.unwrap();
         let tx = chain.lock().unwrap().sent.pop().unwrap();
         assert_admissible_shape(&tx);
         assert!(matches!(tx.action, Action::SetAuthority { asset: 2, new: Some(_), .. }));
 
         // A submission of anything but the right variant is refused outright.
-        let e = submit_token_mint_with(&rpc, &me, &mut store, Action::None, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let e = submit_token_mint_with(&rpc, &me, &mut store, Action::None, gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("TokenMint"), "{e}");
-        let e = submit_token_set_authority_with(&rpc, &me, &mut store, Action::None, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let e = submit_token_set_authority_with(&rpc, &me, &mut store, Action::None, gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
@@ -5660,7 +5701,7 @@ mod tests {
             Action::ListBacking { token_index: 3, chain: 5, token: [9; 32], decimals: 6, nonce: 1, pq_signatures: pq() },
         ];
         for (what, action) in ["deposit", "rotation", "register_bridged", "list_backing"].into_iter().zip(actions) {
-            let s = submit_bridge_action_with(&rpc, &me, &mut store, action.clone(), gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+            let s = submit_bridge_action_with(&rpc, &me, &mut store, action.clone(), gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
                 .await
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
             assert_eq!((s.amount, s.asset, s.burn), (0, 0, Burn::None), "{what}");
@@ -5682,7 +5723,7 @@ mod tests {
             }
             assert!(StubExecutor.verify_bundle(&EMULATED_HC, &b.proof, &swapped.binding()).is_err(), "{what}: a swapped quorum unbinds the proof");
         }
-        let e = submit_bridge_action_with(&rpc, &me, &mut store, Action::None, gas::BUNDLE_BASE, Proving::Emulated, 7, false)
+        let e = submit_bridge_action_with(&rpc, &me, &mut store, Action::None, gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap_err()
             .to_string();
@@ -5699,7 +5740,7 @@ mod tests {
         let rpc = serve(&chain).await;
         let mut store = NoteStore::default();
         let action = Action::Bond { validator: randprotocol_core::Keypair::generate().address(), amount: 4_000_000, registration: None };
-        let s = submit_with(&rpc, &me, &mut store, None, action, gas::BUNDLE_BASE, Burn::Rand(4_000_000), Proving::Emulated, 7, false)
+        let s = submit_with(&rpc, &me, &mut store, None, action, gas::BUNDLE_BASE, Burn::Rand(4_000_000), FriProfile::Test, &Proving::Emulated, 7, false)
             .await
             .unwrap();
         assert_eq!((s.amount, s.change, s.burn), (0, 6_000_000 - gas::BUNDLE_BASE, Burn::Rand(4_000_000)));
@@ -6040,7 +6081,7 @@ mod tests {
                 [1; 32],
                 burn_fee_default(),
                 FriProfile::Test,
-                Backend::Cpu,
+                &Proving::local(Backend::Cpu),
                 7,
                 false,
             )
@@ -6496,8 +6537,8 @@ mod tests {
     /// submits verifies against the binding the ledger will recompute from it, and a copy with its
     /// destination changed does not. (A stub prover stands in for the minute of proving; the real
     /// one's binding is `tests/shielded.rs`'s in the zkVM crate.)
-    #[test]
-    fn a_submitted_transactions_proof_verifies_against_its_own_binding() {
+    #[tokio::test]
+    async fn a_submitted_transactions_proof_verifies_against_its_own_binding() {
         use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
         const HC: Word8 = [11; 8];
         let prepared = Prepared {
@@ -6523,7 +6564,7 @@ mod tests {
             let d = StubExecutor.bundle_digest(&p.bundle.digest_input());
             Ok(Proved { proof: StubExecutor::make_bundle_proof(&HC, &d, binding), tier: 14, proving: Duration::ZERO })
         };
-        prove_transaction(&mut tx, &prepared, &stub).unwrap();
+        prove_transaction_by(&mut tx, |b| std::future::ready(stub(&prepared, &b))).await.unwrap();
         let binding = tx.binding();
         let b = tx.bundle.as_ref().unwrap();
         assert_eq!(StubExecutor.bundle_proof_digest(&b.proof).unwrap(), StubExecutor.bundle_digest(&b.digest_input()));
@@ -6542,8 +6583,8 @@ mod tests {
     /// proved over the finished transaction — so the call proof verifies under the hardened rule
     /// for this transaction and the bundle's binding covers the call proof. Lifted onto another
     /// fee bundle, the call proof is refused.
-    #[test]
-    fn a_bound_call_is_proved_before_its_bundle_and_verifies_for_its_own_transaction() {
+    #[tokio::test]
+    async fn a_bound_call_is_proved_before_its_bundle_and_verifies_for_its_own_transaction() {
         use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
         use randprotocol_core::program::ProgramRecord;
         const HC: Word8 = [11; 8];
@@ -6570,7 +6611,7 @@ mod tests {
             let d = StubExecutor.bundle_digest(&p.bundle.digest_input());
             Ok(Proved { proof: StubExecutor::make_bundle_proof(&HC, &d, binding), tier: 14, proving: Duration::ZERO })
         };
-        prove_transaction(&mut tx, &prepared, &stub).unwrap();
+        prove_transaction_by(&mut tx, |b| std::future::ready(stub(&prepared, &b))).await.unwrap();
         let Action::Call { proof, .. } = &tx.action else { panic!("a call") };
         assert!(StubExecutor.verify_call_hardened(&record, proof, &tx.call_binding()).is_ok(), "bound to its own transaction");
         assert_eq!(StubExecutor.verify_bundle(&HC, &tx.bundle.as_ref().unwrap().proof, &tx.binding()), Ok(()));

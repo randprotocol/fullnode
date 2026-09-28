@@ -15,7 +15,9 @@ use randprotocol_client::governance;
 use randprotocol_client::memo_display;
 use randprotocol_client::wallet::{self, NoteStore, Wallet};
 use randprotocol_client::RpcClient;
-use randprotocol_client::wallet::{Burn, Submission};
+use randprotocol_client::wallet::{Burn, Proving, Submission};
+use randprotocol_client::prover::{self, PairedProver, RemoteProver};
+use randprotocol_prover::pairing::PairingLink;
 #[cfg(test)]
 use randprotocol_client::contacts;
 use randprotocol_client::contacts::Contacts;
@@ -39,6 +41,11 @@ struct Cli {
     /// Spend-key file. The note store lives next to it, at `<key>.notes.json`.
     #[arg(long, global = true, env = "RAND_KEY", default_value = "wallet.key.json")]
     key: PathBuf,
+    /// Prove bundles on the prover paired with this wallet (`rand prover pair`) instead of on
+    /// this machine. The proof is checked here — its digest, its size and a local verify —
+    /// before it goes into a transaction.
+    #[arg(long, global = true)]
+    prover: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -67,6 +74,12 @@ enum Cmd {
         /// Write the link as a QR code PNG to this path.
         #[arg(long = "qr-png")]
         qr_png: Option<PathBuf>,
+    },
+    /// Delegated proving: pair this wallet with a prover (a `randprover:` link from
+    /// `rand-prover pair`), show the pairing, or forget it. `--prover` then proves there.
+    Prover {
+        #[command(subcommand)]
+        op: ProverOp,
     },
     /// Named addresses this wallet can send to by name instead of a `rand1…` address.
     Contacts {
@@ -368,6 +381,22 @@ enum Cmd {
     Peers,
     /// Validator set.
     Validators,
+}
+
+#[derive(Subcommand)]
+enum ProverOp {
+    /// Pair with the prover a `randprover:` link names: its key's fingerprint is checked against
+    /// what the prover itself answers before anything is saved (`<key>.prover.json`, mode 0600).
+    Pair {
+        link: String,
+        /// A name to print for this prover instead of its URL.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Print the pairing (never its token).
+    Show,
+    /// Delete the pairing.
+    Forget,
 }
 
 #[derive(Subcommand)]
@@ -861,6 +890,20 @@ fn backend_for(cuda: bool) -> Result<Backend> {
     }
 }
 
+/// How this invocation proves its bundle: on the paired prover under `--prover`, else here on
+/// `--cuda`'s backend. Both at once is refused — a proof is made in one place, the one asked for.
+fn proving_for(prover: bool, cuda: bool, key: &Path) -> Result<Proving> {
+    if !prover {
+        return Ok(Proving::local(backend_for(cuda)?));
+    }
+    if cuda {
+        anyhow::bail!("--prover and --cuda: the bundle is proved on the paired prover or on this machine's GPU, not both");
+    }
+    let paired = PairedProver::load(key)?.ok_or_else(|| anyhow!("no prover paired for this wallet: rand prover pair <link>"))?;
+    prover::check_prover_url(&paired.url)?;
+    Ok(Proving::Remote(std::sync::Arc::new(RemoteProver::new(paired))))
+}
+
 /// The summary line, printed. The wording lives in [`Submission::summary`], where a test can read
 /// it back.
 fn report(s: &Submission, what: &str) {
@@ -991,6 +1034,28 @@ async fn main() -> Result<()> {
                 eprintln!("wrote {}", path.display());
             }
         }
+        Cmd::Prover { op } => match op {
+            ProverOp::Pair { link, name } => {
+                let link = PairingLink::parse(link.trim()).map_err(|e| anyhow!("{e}"))?;
+                prover::check_prover_url(&link.url)?;
+                let paired = PairedProver::from_link(&link, name);
+                // `info` refuses a prover whose key is not the one the link names.
+                RemoteProver::new(paired.clone()).info().await?;
+                paired.save(&cli.key)?;
+                println!("paired {} at {} (own: {})", paired.fingerprint, paired.url, if paired.own { "yes" } else { "no" });
+            }
+            ProverOp::Show => match PairedProver::load(&cli.key)? {
+                Some(p) => println!("{}", p.show()),
+                None => println!("no prover paired for this wallet"),
+            },
+            ProverOp::Forget => {
+                if PairedProver::forget(&cli.key)? {
+                    println!("forgot the pairing ({})", PairedProver::path_for(&cli.key).display());
+                } else {
+                    println!("no prover was paired for this wallet");
+                }
+            }
+        },
         Cmd::Contacts { op } => {
             let mut c = Contacts::load(&cli.key)?;
             match op {
@@ -1204,7 +1269,7 @@ async fn main() -> Result<()> {
             }
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::send_asset(&rpc, &w, &mut store, &to, asset, amount, &memo_text, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
+            let s = wallet::send_asset(&rpc, &w, &mut store, &to, asset, amount, &memo_text, fee, profile, &proving_for(cli.prover, cuda, &cli.key)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             report(&s?, "transfer");
@@ -1260,7 +1325,7 @@ async fn main() -> Result<()> {
             // note, and the ledger admits a bond only when the bundle burns exactly what is
             // bonded. The unit is RAND, which is now in the type rather than in this comment.
             let s =
-                wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::rand(amount), profile, backend_for(cuda)?, chain_id, !no_wait)
+                wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::rand(amount), profile, &proving_for(cli.prover, cuda, &cli.key)?, chain_id, !no_wait)
                     .await;
             store.save(&path)?;
             report(&s?, "bond");
@@ -1341,7 +1406,7 @@ async fn main() -> Result<()> {
             let fee = wallet::deploy_fee_default(&action);
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend_for(cuda)?, chain_id, true).await;
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, &proving_for(cli.prover, cuda, &cli.key)?, chain_id, true).await;
             store.save(&path)?;
             // No repeat of the program id/hc line after submission: both are pure functions of
             // the file the wallet loaded (checked above, before the proof), never of the chain's
@@ -1382,6 +1447,9 @@ async fn main() -> Result<()> {
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
             let backend = backend_for(cuda)?;
+            // The call proof is always made here, on `--cuda`'s backend; `--prover` moves only the
+            // paying bundle.
+            let proving = if cli.prover { proving_for(true, false, &cli.key)? } else { Proving::local(backend) };
             if public.is_empty() {
                 eprintln!("proving the call locally ({} inputs stay private)…", inputs.len());
             } else {
@@ -1435,7 +1503,7 @@ async fn main() -> Result<()> {
                     Ok(proof)
                 };
                 let action = Action::Call { program: pid, proof: Vec::new(), input_envelope: envelope };
-                let s = wallet::submit_bound_call(&rpc, &w, &mut store, action, fee, &prove, profile, backend, chain_id, true).await;
+                let s = wallet::submit_bound_call(&rpc, &w, &mut store, action, fee, &prove, profile, &proving, chain_id, true).await;
                 (s, call_key)
             } else {
                 let t = std::time::Instant::now();
@@ -1466,7 +1534,7 @@ async fn main() -> Result<()> {
                     Some(f) => parse_amount(&f)?,
                     None => wallet::call_fee_default(tier, bytes),
                 };
-                let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, backend, chain_id, true).await;
+                let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, &proving, chain_id, true).await;
                 (s, call_key)
             };
             store.save(&path)?;
@@ -1610,7 +1678,7 @@ async fn main() -> Result<()> {
             };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
+            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;
@@ -1699,7 +1767,7 @@ async fn main() -> Result<()> {
                 None => gas::fee_floor(&action),
             };
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
+            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;
@@ -1734,7 +1802,7 @@ async fn main() -> Result<()> {
                 to,
                 fee,
                 profile,
-                backend_for(cuda)?,
+                &proving_for(cli.prover, cuda, &cli.key)?,
                 chain_id,
                 !no_wait,
             )
@@ -1763,7 +1831,7 @@ async fn main() -> Result<()> {
             };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit_token_burn(&rpc, &w, &mut store, asset, amount, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
+            let s = wallet::submit_token_burn(&rpc, &w, &mut store, asset, amount, fee, profile, &proving_for(cli.prover, cuda, &cli.key)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             report(&s?, "token burn");
@@ -1790,7 +1858,7 @@ async fn main() -> Result<()> {
             eprintln!("registering {symbol} ({name}): fee {} RAND", format_amount(fee));
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
+            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;
@@ -1810,7 +1878,7 @@ async fn main() -> Result<()> {
             };
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
+            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;
@@ -1883,7 +1951,7 @@ async fn main() -> Result<()> {
                 salt,
                 fee,
                 profile,
-                backend_for(cuda)?,
+                &proving_for(cli.prover, cuda, &cli.key)?,
                 chain_id,
                 !no_wait,
             )
@@ -1934,7 +2002,7 @@ async fn main() -> Result<()> {
                 None => gas::fee_floor(&action),
             };
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit_token_mint(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait).await;
+            let s = wallet::submit_token_mint(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key)?, chain_id, !no_wait).await;
             store.save(&path)?;
             report(&s?, "token mint");
             println!("minted {amount_text} ({amount} units) of asset {asset} to {to}");
@@ -1963,7 +2031,7 @@ async fn main() -> Result<()> {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let profile = profile_of(&rpc).await?;
             let s =
-                wallet::submit_token_set_authority(&rpc, &w, &mut store, action, fee, profile, backend_for(cuda)?, chain_id, !no_wait)
+                wallet::submit_token_set_authority(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key)?, chain_id, !no_wait)
                     .await;
             store.save(&path)?;
             report(&s?, "set token authority");

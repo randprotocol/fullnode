@@ -20,7 +20,7 @@ randprotocol-core = { workspace = true }
 randprotocol-client = { workspace = true }
 randprotocol-zkvm = { workspace = true }
 randprotocol-rvm = { workspace = true }
-randprotocol-prover = { workspace = true }
+randprotocol-prover = { workspace = true, features = ["service"] }
 p3-field = "=0.7.0"
 postcard = { version = "1", features = ["alloc"] }
 blake3 = { workspace = true }

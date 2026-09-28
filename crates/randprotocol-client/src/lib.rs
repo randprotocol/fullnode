@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 pub mod contacts;
 pub mod governance;
 pub mod memo_display;
+pub mod prover;
 pub mod qr;
 pub mod tree;
 pub mod wallet;
@@ -235,7 +236,7 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Read `resp`'s body, refusing it once it passes `limit` bytes — up front on a declared
 /// `Content-Length`, otherwise chunk by chunk as it arrives.
-async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+pub(crate) async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     let too_big = || anyhow!("the node's reply is larger than {} MiB; refusing it", limit / (1024 * 1024));
     if resp.content_length().is_some_and(|n| n > limit as u64) {
         return Err(too_big());
