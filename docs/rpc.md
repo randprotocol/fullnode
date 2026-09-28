@@ -333,7 +333,9 @@ input, `null` for an id no program has. A wallet proving a call passes these wor
 the proof commits to them and the ledger checks that commitment against `public_digest`.
 
 ### `rand_getLimits`
-Params: `[]`. Result: the chain's five call limits and the envelope size, from its genesis:
+Params: `[]`. Result: what a wallet needs from the chain's genesis to build a transaction — the
+call limits (`max_program_words` through `max_program_public_words`), the envelope size, the v0.6
+switch (`hardening_v6`) and the split-authorisation auth guest (`hc_auth`):
 
 ```json
 { "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
@@ -1245,7 +1247,8 @@ Bundle {                                        // the hidden-asset bundle (chai
   anchor: Word8, nullifiers: [Word8; 4], commitments: [Word8; 4],
   fee: u64, burn_a: u64, burn_r: u64, burn_asset: u32, time: u32,
   envelopes: [Envelope; 4], proof: Vec<u8>,     // postcard(rand_zkvm::Proof) of the hidden-asset guest
-}
+  auth_commit: Word8, auth_proof: Vec<u8>,      // v0.6.3, chain 17+: split authorisation's c and
+}                                               //   auth proof; zeros and empty without hc_auth
 Envelope { kem_ct: Vec<u8>, to_receiver: Vec<u8>, to_sender: Vec<u8>, body: Vec<u8> }
 
 Action::None                                            // a plain shielded transfer
@@ -1369,6 +1372,21 @@ What changed for clients, in one place. Newest first.
   build therefore refuses chains 14–16 at startup and runs chain 17 on; a client that recomputes
   ids locally must move with it. New permanent refusals: `AuthUnexpected`, `AuthMissing`,
   `AuthMismatch`, `InvalidAuthProof`.
+- **The `Bundle` wire changes** (a breaking change for every encoder): two fields appended after
+  `proof`, `auth_commit: Word8` and `auth_proof: Vec<u8>` ("The transaction on the wire"). bincode
+  is positional, so no chain-16 bundle decodes under v0.6.3, nor does a v0.6.2 node read a v0.6.3
+  transaction as the one that was sent — the reason chains 14–16 are refused (`node::CHAINS_THIS_BUILD_CANNOT_RUN`).
+  Without genesis `hc_auth` both fields must be zero and empty (`AuthUnexpected`); with it, every
+  bundle carries an auth proof, self-proved or delegated alike (`docs/shielded.md` §2).
+- **`tx_json`** — `rand_getTransaction`'s `tx` and each entry of a block's `transactions`
+  (`rand_getBlockByHeight`, `rand_getBlockByHash`) — carries the bundle's `auth_commit` and `auth_proof_bytes`,
+  so an explorer needs no core types to show them: randscan's `/transactions` reads bundles
+  through `tx_json` (it does not vendor core) and gains `auth_commit` / `auth_proof_bytes` with no
+  decoder change.
+- **The delegated prover** (`docs/prover.md`, its own listener, never this RPC) gains
+  `prover_info.fee` (`null`, or `{amount, address}` with the amount in RAND base units as a decimal
+  string) and the error `-32006 the prover fee is not paid` on `prover_submit`; its `witness_kinds`
+  always includes `viewing_key` (bundle guest v3).
 
 ### 2026-09-28 — the v0.6 switch: `hardening_v6` in `rand_getLimits` (genesis-gated; on no chain yet)
 

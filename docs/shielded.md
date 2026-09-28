@@ -45,6 +45,13 @@ and overwriting one destroys every note it could still open. Next to it lives
 of which is recoverable by rescanning from leaf 0. It holds note plaintexts, so it is written
 mode 0600 like the key itself.
 
+The spend key is the only authority to spend. Under bundle guests v1 and v2 the bundle proof
+itself takes `sk` as a private input. On a chain whose genesis names `hc_auth` (split
+authorisation, v0.6.3, §2) the bundle proof takes only `nk`, and `sk` enters a second, tiny auth
+proof the wallet always makes on its own machine — which is what lets a delegated prover
+(`docs/prover.md`) prove a bundle without being able to spend. Addresses, keys and existing notes
+are the same either way: `pk = H(PK, nk)` does not change.
+
 A validator key is a different thing entirely: a 32-byte seed and a Dilithium2 key pair, whose
 base58 address is public and appears in blocks as a proposer. Validators have addresses; wallets
 have shielded addresses; the two never mix.
@@ -85,7 +92,7 @@ nullifiers and four commitments whatever it moves.
 
 ```
 Bundle { anchor, nullifiers[4], commitments[4], fee, burn_a, burn_r, burn_asset, time,
-         envelopes[4], proof }
+         envelopes[4], proof, auth_commit, auth_proof }     // the last two since v0.6.3
 Transaction { chain_id, bundle: Option<Bundle>, action }
 Action = None | Mint { .. } | Deploy { base_pc, words } | Call { program, proof, input_envelope }
        | Bond { validator, amount, registration } | Unbond { .. } | Withdraw { .. } // phase S2
@@ -108,11 +115,70 @@ transaction that looked different when there was no change would leak that there
 *transaction* looks the same; the bundle *proof* does not yet — it reveals which input slots are
 real, see "What the proofs leak today" below.)
 
+### Split authorisation: bundle guest v3 and the auth proof (v0.6.3, genesis `hc_auth`)
+
+Spec `docs/superpowers/specs/2026-09-28-delegated-proving-design.md` §4. A genesis cut with
+`rand-node genesis --bundle-guest v3 --auth-guest` pins bundle guest v3 as `hc_bundle`
+(`60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce`) and the auth guest as
+`hc_auth` (`1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1`); the two come as a
+pair, both ways. Every bundle on such a chain carries two proofs:
+
+```
+auth guest        private: sk, salt          nk = H(NK, sk);  c = H(AUTH, nk ‖ salt)
+                  publishes c                proved against the transaction's binding
+                  16 input words (auth::auth_input), tier 10
+
+bundle guest v3   private: nk, salt, and v1's witness otherwise (hidden_input_v3: nk at 0,
+                  salt at 1 204, 1 212 words)
+                  pk_self = H(PK, nk);  every input owned by pk_self;  c = H(AUTH, nk ‖ salt)
+                  digest = H(64, anchor, nf0..3, cm0..3, fee, burn_a, burn_r, burn_asset, time,
+                             c, bad)
+```
+
+`AUTH` is the node-local domain tag 65 (`auth::AUTH_DOMAIN`). The v3 digest is v1's preimage with
+the eight words of `c` inserted immediately before `bad` (`hidden_bundle_preimage_v3`); it keeps
+tag 64, which is safe because the v1/v2 and v3 messages absorb a different number of sponge
+blocks (21 against 23 permutations). The bundle publishes `c` as `auth_commit` and carries the auth
+proof as `auth_proof`. The ledger (`Ledger::check_bundle_proof`):
+
+- on a chain without `hc_auth` refuses any bundle whose `auth_commit` is not zero or whose
+  `auth_proof` is not empty (`AuthUnexpected`), and recomputes the v1 digest, byte for byte as
+  before;
+- on a chain with it, before the bundle digest: refuses a bundle without an auth proof
+  (`AuthMissing`), decodes the auth proof at the auth guest's pinned shape (`InvalidAuthProof`)
+  and requires the `c` it publishes to equal `auth_commit` (`AuthMismatch`); then recomputes the
+  v3 digest (with `auth_commit`) against the bundle proof, verifies the bundle proof, and finally
+  verifies the auth proof against `hc_auth` and the **same** transaction binding, its `c` again
+  equal to `auth_commit`.
+
+All four refusals are permanent. A pruned bundle keeps its auth proof — the covering aggregate
+does not stand in for it — and the sync path verifies it there too.
+
+What this buys: a prover holding `nk` and the salt can make the bundle proof but not an auth proof
+for it, and an auth proof is bound to one transaction's binding, so it cannot be moved onto
+another. A witness with another key's `nk` taints the bundle proof, whose digest then matches no
+plaintext. The salt is 256 fresh random bits per bundle, drawn by the wallet: a repeated salt
+would repeat `c` and link two transactions to one wallet, and the guest cannot tell — so
+`auth_commit` is public but, with a fresh salt, links nothing. A wallet that proves for itself
+makes both proofs too: one shape for every transaction, so a self-proved and a delegated one look
+the same on chain.
+
+The transaction id moved with it: `rand-txid-3` hashes `auth_commit` as is and the auth proof by
+its digest, like the bundle proof, so the pruned marker form still hashes to the raw id; the
+transaction binding blanks both proofs and keeps `auth_commit`. Every transaction id changes, and
+the bundle wire gained the two fields — so the build that carries them (v0.6.3) runs chain 17 on
+and refuses chains 14–16 at startup (`node::CHAINS_THIS_BUILD_CANNOT_RUN`).
+
+The cost is size: the auth proof is about 1.37 MB at Production FRI, so a transfer carries about
+2.85 MB of proof (1.49 MB of it the bundle proof, in one measured run) — one per block at the 4 MiB
+default (spec §4.2). The soundness evidence is in
+`docs/confidential.md` ("The hidden-asset bundle guest: soundness").
+
 ### What is public and what is hidden
 
 | | public on chain | hidden |
 |---|---|---|
-| **transfer** (`Action::None`) | anchor, all four nullifiers, all four commitments, fee, `burn_a = burn_r = burn_asset = 0`, `time`, four envelope ciphertexts, the bundle proof — **and, under the v1 guest chains 14 and 15 run, read off that proof: which input slots are real and the popcount of each spent leaf index** (see "What the proofs leak today", below, and §6, "The bundle proof's instruction counts") | who sent it, who is paid, the amount, the change, which leaves were spent (beyond their popcounts under v1); which asset only partly under v1 — the real-slot pattern tells a RAND bundle from a token one. Under the branch-free guest (v2), selected by a later genesis's `hc_bundle`, which asset moved and which slots were dummies are hidden too |
+| **transfer** (`Action::None`) | anchor, all four nullifiers, all four commitments, fee, `burn_a = burn_r = burn_asset = 0`, `time`, four envelope ciphertexts, the bundle proof (and on a split-authorisation chain `auth_commit` and the auth proof, both unlinkable under a fresh salt) — **and, under the v1 guest chains 14 and 15 run, read off that proof: which input slots are real and the popcount of each spent leaf index** (see "What the proofs leak today", below, and §6, "The bundle proof's instruction counts") | who sent it, who is paid, the amount, the change, which leaves were spent (beyond their popcounts under v1); which asset only partly under v1 — the real-slot pattern tells a RAND bundle from a token one. Under the branch-free guest (v2), selected by a later genesis's `hc_bundle`, which asset moved and which slots were dummies are hidden too |
 | **Deploy** | everything above, plus `base_pc` and the program's words (so the program id and its code) | who deployed it, and what the paying notes were worth |
 | **Call** | everything a transfer publishes, plus the program id, the call proof, and the receipt's tier and eight output words — **and, read off the call proof, what its small committed tables hold** (see below) | registers, memory, the real cycle count (only the padded tier shows), who called it; the private inputs and the branches taken only as far as "What the proofs leak today" allows |
 | **Mint** (faucet) | the new note's commitment, its envelope, the **amount in the clear**, the recipient's `pk` and the note's `time`/`r` (POOL-1: the commitment opening, checked by the ledger, not merely declared), and the minting validator's public key (shown as its address) and signature | which notes the recipient later spends and to whom — the address that received a mint is now public, but nothing about its later use is |
@@ -445,12 +511,16 @@ the same check before gossiping, so a bad transaction is refused once, at the ed
    bundle's proof, so a transaction that cannot apply costs no STARK verification.
 8. **Bundle digest** — the ledger recomputes the digest from the bundle's published plaintext and
    it must equal what the proof published. A proof whose witness broke the relation publishes a
-   tainted digest, which matches no plaintext.
+   tainted digest, which matches no plaintext. On a split-authorisation chain (§2) the auth fields
+   are checked first — present exactly when the genesis names `hc_auth`, and the `c` the auth proof
+   publishes (read, not yet verified) equal to `auth_commit` — and the digest is the v3 one, with
+   `auth_commit` inside.
 9. **Bundle proof** — `Machine::verify_public` against the genesis-pinned `hc_bundle` and the
    transaction's binding (`Transaction::binding`: a hash of the whole transaction with every proof
    blanked, eight words the proof carries as its public input). This is what keeps a proof from
    being copied onto a changed transaction — another action, another envelope, another chain id
-   (`docs/confidential.md`, "Transaction binding").
+   (`docs/confidential.md`, "Transaction binding"). On a split-authorisation chain the auth proof
+   is verified next, against `hc_auth` and the same binding.
 10. **Call proof and its tier fee** — the call's own STARK against the program's `code_hash`, then
     `fee ≥ BUNDLE_BASE + call_fee(tier)`, which is only knowable once the tier is.
 

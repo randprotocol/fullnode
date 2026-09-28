@@ -413,7 +413,8 @@ constraint set 6 measured (4.7 s against 3.9 s on the laptop), with memory flat
 Proofs made under constraint set 6 do not verify under constraint set 7: every verifier key, the
 AIR (the blind columns and bus, the range checks, `JALR`) and the rVM's programs changed. **v0.6.1
 runs only on a new genesis — chain 16.** A v0.6.1 node refuses chains 14 and 15 by genesis hash at
-`run` and `verify` (`node::CHAINS_THIS_BUILD_CANNOT_RUN`), and chains up to 13 by their retired
+`run` and `verify` (`PRE_CONSTRAINT_SET_7_CHAINS` in v0.6.1; `CHAINS_THIS_BUILD_CANNOT_RUN` since
+v0.6.3, which adds chain 16), and chains up to 13 by their retired
 `hc_bundle`; keep chain 15 on v0.6.
 
 ### Transaction binding (2026-09-19, Task 5b — a hard fork, chain 14)
@@ -909,11 +910,50 @@ The fuzz caught all twelve, each in about 12 s including the rebuild.
 | Digest: tag 64, `bad` last, no `A` | structural: the staging at step 8, checked against `hidden_bundle_preimage` by `assert_eq!` at assembly | `the_digest_is_domain_separated_and_has_no_asset_field` | every `real_proof_*` (the verifier's `hidden_bundle_proof_digest` equals the emulator's) | every run |
 
 Commands: the fast suite is `cargo test --release -p randprotocol-zkvm --test hidden_cheating --
---skip real_proof_` (about a minute). The real proofs are `… --test hidden_cheating real_proof_`
-(thirteen proofs, about 100 s and 5.7 GB each). They run one at a time behind the workspace
+--skip real_proof_` (185 s measured on the laptop with the split-authorisation fuzz and emulator
+companions below). The real proofs are `… --test hidden_cheating real_proof_` (twenty-six: the
+nineteen v1/v2 cheats, about 100 s and 5.7 GB each, ~32 min; and the seven split-authorisation
+cases, ~6 min, which share three v3 bundle proofs and four auth proofs made once per run). They run one at a time behind the workspace
 proving slot, `<target-dir>/tmp/rand-proving-slot.lock`, the lock the node and client proof tests
 also take. To replay a fuzz failure, set `HIDDEN_FUZZ_SEED` and `HIDDEN_FUZZ_ITERS`. The teeth
 check is `deploy/weaken-hidden-guest.sh [variant …]`, about 2½ min for all twelve variants.
+
+### Bundle guest v3 and the auth guest (split authorisation, v0.6.3)
+
+Delegated proving Phase 2 (spec `docs/superpowers/specs/2026-09-28-delegated-proving-design.md`
+§4; `docs/shielded.md` §2) splits the spend authority out of the bundle guest. Bundle guest v3
+(`guests::bundle_hidden_v3()`, `hc` `60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce`)
+is v1's statement with `nk` in the spend key's place and a salt appended (1 212 input words), and
+publishes `c = H(AUTH, nk ‖ salt)` inside its digest; the auth guest (`guests::auth()`, `hc`
+`1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1`) reads `sk` and the salt and
+publishes the same `c`, proved against the transaction's binding. Both digests are pinned in
+`tests/guest_provenance.rs`. v3 shares v1/v2's assembler: every §3.3 row of the table above holds
+for it unchanged (the mutation fuzz runs every v1/v2 witness's v3 twin under the same model), and
+it lands at tier 14 with v1/v2's nine table heights, v2 + 87 cycles and + 19 permutations (4 024
+cycles and 273 permutations of headroom). The auth guest is 250 cycles and 55 permutations, tier
+10. What the split adds, and what each rule rests on — the ledger's rule is that the bundle
+digest (recomputed with `auth_commit`) is what the bundle proof publishes, the auth proof
+verifies against `hc_auth` and the **same** binding, and its `c` equals `auth_commit`:
+
+| check | enforced by | emulator test | real proof | fuzz |
+|---|---|---|---|---|
+| `pk_self = H(PK, nk)` from the witness's `nk`; every input owned by it | structural in v3 (the derivation reads `nk` where v1 derives it from `sk`); a foreign `nk` stages the notes under another `pk_self`, so every input fails membership — taint | `a_v3_witness_with_another_keys_nk_taints`, `the_v3_builder_refuses_an_input_owned_by_another_key` (`hidden_bundle.rs`) | `real_proof_an_auth_proof_for_a_different_nk` (the cheater's re-proved bundle) | `mutation_fuzz_v3_nk_and_salt_words_publish_the_honest_digest_only_when_valid` |
+| `c = H(AUTH, nk ‖ salt)` in the v3 digest, immediately before `bad` | structural: staged by the guest from its own `nk` and salt words; `hidden_bundle_preimage_v3` checked at assembly | `the_v3_digest_is_v1s_preimage_with_the_auth_commit_before_bad`, `a_v3_witness_with_a_different_salt_publishes_a_different_digest` | every v3 `real_proof_*` (the published digest is the host's) | the v3 fuzz above |
+| The auth proof's `c` is `H(AUTH, H(NK, sk) ‖ salt)` | structural: `guests::auth()` derives `nk` from `sk` exactly as every spend does | `a_different_sk_or_salt_changes_c` (`auth_spike.rs`), `a_witness_with_a_wrong_sk_publishes_another_c` (`auth_cheating.rs`) | `real_proof_a_tampered_output_word_fails_verify` (`auth_cheating.rs`) | `mutation_fuzz_every_mutation_of_the_16_words_changes_c` |
+| An auth proof for another `nk` does not authorise the bundle | the ledger: its `c` misses `auth_commit` (`AuthMismatch`), or, with the field moved, the bundle digest misses (`BadDigest`) | `an_auth_proof_for_a_different_nk` | `real_proof_an_auth_proof_for_a_different_nk` | — |
+| Bundle and auth proof under different salts | the ledger: no field value satisfies both proofs | `a_bundle_whose_c_uses_a_different_salt_than_the_auth_proof` | `real_proof_a_bundle_whose_c_uses_a_different_salt_than_the_auth_proof` | — |
+| `auth_commit` differing from both proofs | the ledger: the recomputed v3 digest misses (`BadDigest`) whatever the auth proof says | `auth_commit_in_the_bundle_differing_from_either_proof` | `real_proof_auth_commit_in_the_bundle_differing_from_either_proof` | — |
+| An auth proof for another binding, or replayed from another transaction | the binding alone: the auth guest never reads its public segment, so only `H_PUB` ties the proof to its transaction, and `verify_public` against this transaction's binding refuses another's | `an_auth_proof_for_a_different_binding`, `an_auth_proof_replayed_from_another_transaction` | `real_proof_an_auth_proof_for_a_different_binding`, `real_proof_an_auth_proof_replayed_from_another_transaction` | — |
+| Neither guest accepts the empty public segment (Task 5b) | `verify_public` against the transaction's binding | `both_guests_publish_the_same_under_the_empty_segment` | `real_proof_both_guests_refuse_the_empty_segment` | — |
+| The honest pair passes | — | — | `real_proof_split_honest_control_passes_the_rule` | — |
+
+The salt's freshness is the wallet's, not a guest's: a repeated salt repeats `c` and links two
+transactions, so the wallet draws 256 fresh random bits per bundle (`crates/randprotocol-client`,
+a unit test asserts two bundles never share one). The ledger side is in `docs/shielded.md` §2 and
+§5; the node's end-to-end test is `crates/randprotocol-node/tests/split_auth.rs` (a v3 transaction
+with a real bundle and auth proof commits on a v3 genesis; a swapped-binding and a different-salt
+auth proof are refused). The auth-guest suites: `cargo test --release -p randprotocol-zkvm --test
+auth_spike --test auth_cheating` (the real proofs are about 7 s each).
 
 ## GPU proving (--cuda)
 

@@ -1,4 +1,4 @@
-# The delegated prover (Phase 1)
+# The delegated prover
 
 A bundle proof is tier 14: about 100 s and 5.74 GB of memory on a laptop CPU
 (`docs/node-hardware.md` §3). A browser gives WebAssembly 4 GiB and most phones have less than
@@ -12,7 +12,9 @@ wallet pairs with it, and the wire protocol for other client authors. The design
 `docs/superpowers/specs/2026-09-28-delegated-proving-design.md`; the code is
 `crates/randprotocol-prover` (the service and `rand-prover`), `crates/randprotocol-node/src/main.rs`
 (`run --prover`) and `crates/randprotocol-client/src/prover.rs` (the wallet's side). Phase 1
-changes no consensus rule and runs against any chain.
+(v0.6.2) changes no consensus rule and runs against any chain; its witness carries the spend key.
+Phase 2 (v0.6.3, split authorisation — §8) is a hard fork selected at genesis: the witness carries
+the viewing key `nk` instead, and the spend key stays on the wallet's machine.
 
 ## 1. What it is
 
@@ -25,7 +27,8 @@ The chain has three roles that prove or verify, and the delegated prover is the 
 | aggregator | one recursive proof over many bundles | GPU | the fee's proving share + the block subsidy | `docs/aggregation.md` |
 | **delegated prover** | one bundle proof for one sender | 8 GB+ CPU, or GPU | that sender, privately (spec §5) | this page |
 
-A Phase 1 prover charges nothing: `prover_info` reports `"fee": null`. It holds no chain state,
+A prover charges nothing unless its operator sets a fee (`--fee`, §3.5); then `prover_info.fee`
+quotes it, and only a v3 job whose witness pays it is admitted. A prover holds no chain state,
 reads no blocks and never sees a transaction — only the witness words and the eight binding words
 of one bundle. The wallet builds the transaction, and the proof is bound to it through those
 binding words.
@@ -39,19 +42,20 @@ proof is handing over custody.**
 
 | | prover receives | prover can read | prover can spend | who may run it |
 |---|---|---|---|---|
-| Phase 1 (today's guest) | `sk` | the wallet's whole history | **yes** | the wallet's owner only |
-| Phase 2 (split authorisation) | `nk` | the wallet's whole history | no | anyone |
+| Phase 1 (bundle guests v1/v2) | `sk` | the wallet's whole history | **yes** | the wallet's owner only |
+| Phase 2 (bundle guest v3, genesis `hc_auth`) | `nk` and a fresh salt | the wallet's whole history | no | anyone |
 
 A Phase 1 prover receives the spend key. It is for a machine the wallet's owner runs — a desktop
 proving for the same person's phone, a home server proving for a laptop. The rule the design
 starts from is that **someone who wants full privacy runs their own.**
 
-A Phase 2 prover will receive the viewing key `nk` instead. It cannot spend, but it can read the
+A Phase 2 prover receives the viewing key `nk` instead. It cannot spend — a v3 bundle is admitted
+only beside an auth proof over `sk`, which the wallet makes itself (§8) — but it can read the
 wallet's whole history: `nk` derives the ML-KEM decapsulation key and `ovk`, so a prover that
 proved one transaction can read everything that wallet ever received or sent, before and after.
 Phase 2 does not make delegation private; it makes it non-custodial (§8).
 
-Both ends enforce the Phase 1 rule:
+Both ends enforce the Phase 1 rule for spend-key witnesses:
 
 - `rand-prover run` refuses every `SpendKey` job unless it was started with `--accept-spend-key`
   (off by default). With the flag it prints, on stderr and in the log:
@@ -59,8 +63,8 @@ Both ends enforce the Phase 1 rule:
 - A pairing link carries `own=1` only when the operator passed `--own` to `rand-prover pair`. The
   wallet sends a spend-key witness only to a prover paired with `own=1`; otherwise it refuses with
   `this build's witness carries the spend key; only a prover paired as your own (own=1) may
-  receive it`. Every witness this build makes carries the spend key, so a prover paired without
-  `--own` cannot be used at all in Phase 1.
+  receive it`. On a chain whose bundle guest is v1 or v2 every witness carries the spend key, so a
+  prover paired without `--own` cannot be used there.
 
 On a split-authorisation chain (genesis `hc_auth`, bundle guest v3 — §8) the job is a
 `ViewingKey` job instead: the wallet sends `nk` and a fresh 256-bit salt, never the spend key, and
@@ -69,7 +73,9 @@ makes the tiny auth proof over `sk` itself. Every prover accepts viewing-key job
 prover gates only by its flag and the job's kind; whether a pairing may receive a witness is the
 wallet's rule, not the prover's. The history warning above is the whole cost: whoever proves one
 v3 transaction for a wallet can read that wallet's entire history, past and future, so pair with a
-prover you would show your history to.
+prover you would show your history to. The wallet says so in two places: `rand prover pair` on a
+link without `own=1`, and once per prover before the first viewing-key witness goes to one that is
+not paired as your own (§5.2).
 
 The kind follows the guest, whichever flags are set: a `ViewingKey` job is refused for guests v1
 and v2 (they take a spend key), and a `SpendKey` job is refused for guest v3 (it takes `nk`).
@@ -123,6 +129,8 @@ wallet can take pasted text, paste the link instead.
 | `--cuda` | off | prove on the CUDA backend; needs a build with `--features cuda`, and there is no CPU fallback |
 | `--skip-memory-check` | off | start even when the memory gate below would refuse |
 | `--allow-origin <ORIGIN>` | extensions and loopback pages | a browser origin whose pages may read replies, repeatable; given once or more, the values are the whole list; `*` = every origin (opt-in, warned) — §6.1 |
+| `--fee <RAND>` | none | the fee every job must pay, in RAND (display units, up to 9 decimals); needs `--fee-address` — §3.5 |
+| `--fee-address <ADDRESS>` | none | the `rand1…` address the fee is paid to; needs `--fee` |
 
 A job over the pairing's `--per-token` cap, or one that would push queued plus proving jobs past
 `--max-queue` plus `--max-parallel`, is refused `busy` (§6.2).
@@ -160,6 +168,35 @@ zeroized, lets the proof in flight finish but discards its reply (the job ends `
 down`), and stops its workers; `rand-node run --prover` stops its hosted prover the same way when
 the node stops, closing the prover's queue before it stops the node.
 
+### 3.5 Charging a fee
+
+```sh
+rand-prover run --fee 0.05 --fee-address rand1…
+```
+
+Spec §5: the sender pays the prover inside the same bundle, as one more shielded RAND output — no
+consensus change, no public field, and the prover is paid only if the transaction it proved
+commits. `--fee` and `--fee-address` come together (each `requires` the other); `--fee 0` is
+refused (`omit --fee and --fee-address instead`). At start `run` prints `charging <amount> RAND
+per job to <fingerprint>`, the address's fingerprint. `prover_info.fee` then quotes
+`{"amount": "<base units, decimal string>", "address": "rand1…"}` (§6.1).
+
+Admission checks the fee after the witness length, on the opened witness (`service::check_fee`):
+one of the four outputs must name the fee address's `pk`, sit in a RAND slot — slots 2–3 always,
+slots 0–1 only when the bundle's asset is RAND — and carry at least the quoted amount, below 2^63
+(the guest's range check would taint anything larger). A job that does not pay is refused `-32006
+the prover fee is not paid`, with `data.reason` one of `no output pays this prover's fee address`,
+`the output to this prover is not in RAND: the fee is paid in a RAND slot`, `the fee paid is below
+the quoted <n> base units`, or the 2^63 refusal. Only a v3 witness can carry the fee: on a prover
+that charges one, a spend-key job that passes the earlier checks (so `--accept-spend-key` is set)
+is refused `-32006` too (`this prover charges a fee, which only a v3 witness can carry`).
+
+The prover checks the fee **output** in the witness, not the **envelope** the wallet seals to it:
+the envelope is not in the witness, so a wallet can pay the note and seal junk to it. That is
+griefing only — the note is committed but neither side can open it, so the RAND is lost to both
+and the wallet gains nothing. A follow-up is for the prover to keep the fee note's opening from
+the witness, so it can spend the note without the envelope; this build does not.
+
 ## 4. In a node
 
 A node can host the same service on its own listener:
@@ -181,6 +218,8 @@ rand-node run --datadir /root/data --key /root/keys/node.key.json \
 | `--prover-cuda` | off | as `--cuda` (a `rand-node` built with `--features cuda`) |
 | `--prover-skip-memory-check` | off | as `--skip-memory-check` |
 | `--prover-allow-origin <ORIGIN>` | extensions and loopback pages | as `--allow-origin` (§6.1) |
+| `--prover-fee <RAND>` | none | as `--fee` (§3.5); needs `--prover-fee-address` |
+| `--prover-fee-address <ADDRESS>` | none | as `--fee-address`; needs `--prover-fee` |
 
 The per-pairing cap is the default, 2 jobs; there is no node flag for it.
 
@@ -218,9 +257,17 @@ rand prover forget
 refuses unless the prover answers with the key fingerprint the link names — so the prover must be
 running when the wallet pairs. Only then does it write `<key>.prover.json` beside the spend-key
 file, at mode 0600 (the token is a bearer credential), replacing any earlier pairing, and print
-`paired <fingerprint> at <url> (own: yes|no)`. A link without `own=1` is still saved, with a
-warning on stderr that this build's `--prover` will refuse every use of it (§2). `--name` is a label the wallet prints instead of
-the URL. A wallet keeps one pairing.
+`paired <fingerprint> at <url> (own: yes|no)`. A link without `own=1` is still saved, with this
+warning on stderr (§2), printed as one line:
+
+```text
+warning: this link has no own=1: on a chain with split authorisation (bundle guest v3) this
+prover can prove your bundles from a viewing-key witness — it learns this wallet's whole history,
+never its spend key — and on a pre-v3 chain, whose witness carries the spend key, every --prover
+use is refused; re-pair with a link from `rand-prover pair --own` only for a machine you run
+```
+
+`--name` is a label the wallet prints instead of the URL. A wallet keeps one pairing.
 
 `show` prints the pairing's name, URL, fingerprint, `own` and the prover's key, never the token.
 `forget` deletes `<key>.prover.json`.
@@ -241,6 +288,28 @@ bundle is proved on the paired prover or on this machine's GPU, not both — exc
 call proof takes `--cuda`; the paying bundle still goes to the prover. Without a pairing,
 `--prover` refuses with `no prover paired for this wallet: rand prover pair <link>`.
 
+On a split-authorisation chain (`rand_status` names bundle guest v3 and `hc_auth`) the wallet
+draws a fresh 256-bit salt for each bundle, sends the prover the v3 witness — `nk` and the salt,
+never the spend key — as a `ViewingKey` job, and makes the auth proof over the spend key and the
+same binding on this machine (tier 10, about 7 s). The summary line reports both proving times.
+To a prover not paired as your own, the first such job is preceded, once, by `warning: <name> —
+this prover can read this wallet's whole history; it cannot spend`; `rand send` shows it in its
+confirmation, before the y/N, so it can be declined.
+
+**The prover's fee.** When `prover_info.fee` quotes one, the wallet adds the output that pays it
+(spec §5): slot 2 of a token transfer, a burn, or a RAND bundle that pays nobody (a bond, a
+deploy, a call, a bridge action), the RAND change moving to slot 3; slot 0 of a RAND transfer,
+whose slots 2–3 already hold the payment and its change. That transfer spends one RAND note in
+slots 0–1 for the fee (its change in slot 1) and another in slots 2–3, so a wallet holding one
+spendable RAND note is told to split it first with a self-transfer proved without `--prover`.
+`rand send` shows `prover fee: <amount> RAND to <fingerprint>` beside the recipient before its y/N;
+the other commands print the same line on stderr. The global `--max-prover-fee <RAND>` (default
+`1`) caps what the wallet pays: a quote above it is refused before any bundle is built, on every
+command (`the prover quotes <q> RAND; the cap is <c> RAND (--max-prover-fee) — not building the
+bundle`); `--max-prover-fee 0` refuses any fee. A fee on a chain whose bundle guest is v1 or v2 is
+refused too — only a v3 witness can carry it. The wallet does not remember the fee it saw at
+pairing: a prover may raise its price at any time, up to the cap.
+
 While the job runs the wallet prints `queued on <name> at position <n>…` and `proving on <name>…`,
 polling `prover_status` once a second. A poll that does not reach the prover (a reset, a timeout,
 a proxy's error page) is retried, with one `prover <name> unreachable …, retrying…` line per
@@ -253,9 +322,14 @@ the job. Any refusal of a proof also cancels the job, so it stops holding the pr
 Before sealing anything:
 
 - the prover's `prover_info.kem_fingerprint` equals the fingerprint the wallet paired with;
+- the chain's own `rand_status`: a v3 `hc_bundle` must come with an `hc_auth` equal to this
+  build's auth guest, and a v1/v2 `hc_bundle` with none — otherwise the wallet refuses before
+  proving anything;
 - the prover lists this chain's bundle guest in `hc_bundles`, the chain's FRI profile in
-  `profiles`, and `spend_key` in `witness_kinds`;
-- the pairing has `own=1`, since the witness carries the spend key (§2).
+  `profiles`, and the job's kind in `witness_kinds` (`viewing_key` for guest v3, `spend_key` for
+  v1/v2);
+- for a spend-key witness only, the pairing has `own=1` (§2);
+- a quoted fee is readable, at most `--max-prover-fee`, and on a v3 chain.
 
 On the reply, in this order:
 
@@ -266,6 +340,9 @@ On the reply, in this order:
 3. the reply's `digest` field agrees with the proof;
 4. the proof verifies on the wallet's machine against the bundle guest and the transaction's
    binding (`verify_bundle`), unless `RAND_PROVER_NO_VERIFY=1` is set.
+
+On a v3 chain the digest in step 2 is the v3 digest, with the bundle's `auth_commit =
+H(AUTH, nk, salt)` inside, and the wallet's own auth proof must publish the same `c`.
 
 Step 2 is the check that matters and it runs whatever `RAND_PROVER_NO_VERIFY` says: a tainted
 witness still proves (the guest sets its `bad` flag), so a valid proof of the wrong statement is
@@ -332,8 +409,9 @@ browser send.
 guests this build proves, in the hex form `rand_status.hc_bundle` serves; `profiles` is
 `["test", "production"]`; `backend` is `cpu` or `cuda`; `witness_kinds` is `["viewing_key",
 "spend_key"]` with `--accept-spend-key` and `["viewing_key"]` without (a viewing-key job proves
-bundle guest v3 only, §2); `fee` is `null`; `allowed_origins` is the origin allow-list
-above, or `["*"]`.
+bundle guest v3 only, §2); `fee` is `null`, or `{"amount": "<RAND base units, decimal string>",
+"address": "rand1…"}` for a prover started with `--fee` (§3.5); `allowed_origins` is the origin
+allow-list above, or `["*"]`.
 
 `prover_status`: `position` (1-based) is present while `queued`; `reply` (hex of the sealed reply)
 while `done`, on every poll; `error` while `failed` (a cancelled proving job ends `failed` with
@@ -357,11 +435,12 @@ proving, `false` if it had already finished.
 | `-32003` | `the job's token is not paired with this prover` | |
 | `-32004` | `witness kind not accepted` | `data.reason`: spend-key witnesses refused (no `--accept-spend-key`); a spend-key witness for guest v3 (`a v3 guest takes nk — send a viewing-key witness`); or a viewing-key witness for guest v1/v2 (`this build's v1/v2 guests take a spend key`) |
 | `-32005` | `busy` | `data: {depth, max}` — the pairing's cap or the queue is full |
+| `-32006` | `the prover fee is not paid` | `data.reason`: the witness does not pay this prover's quoted fee, or a spend-key job to a prover that charges one (§3.5) |
 | `-32007` | `origin not allowed` | any method, from a request whose `Origin` header is not on the allow-list (§6.1); answered before the body is read as a request, without CORS headers |
 
 Admission runs cheap before expensive — size, open, pairing, the spend-key flag, guest, the
-witness kind against the guest, profile, witness length, the pairing's cap, the queue's cap — and a refused job is zeroized before the
-answer goes out.
+witness kind against the guest, profile, witness length, the fee, the pairing's cap, the queue's
+cap — and a refused job is zeroized before the answer goes out.
 
 ### 6.3 The sealed job and reply
 
@@ -452,13 +531,26 @@ app should carry a relay instead is spec §8 open question 4, unresolved.
 
 ## 8. What Phase 2 changes
 
-Phase 2 (spec §4) moves the spend key out of the bundle guest into a second, tiny proof the light
-wallet makes itself: an auth guest publishes `c = H(AUTH, nk, salt)` against the transaction's
-binding, and bundle guest v3 takes `nk` instead of `sk` and binds the same `c` into its digest. A
-prover then holds `nk` — enough to prove the bundle and to read the wallet's whole history, not
-enough to spend — so anyone may run one, and `witness_kind: ViewingKey` becomes the normal job:
-every prover from v0.6.3 accepts it for guest v3 (§2, §6.1). It is a hard fork, selected at genesis
-by `rand-node genesis --bundle-guest v3 --auth-guest` (the v3 `hc_bundle` and this build's
-`hc_auth`; `rand_status`/`rand_getLimits` serve `hc_auth`), and the auth proof roughly doubles a
-transaction's size (spec §4.2). The implementation plan is
-`docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md`.
+Phase 2 (spec §4, v0.6.3) moves the spend key out of the bundle guest into a second, tiny proof the
+light wallet makes itself: the auth guest reads `sk` and a fresh salt and publishes
+`c = H(AUTH, nk, salt)`, proved against the transaction's binding; bundle guest v3 takes `nk` and
+the same salt instead of `sk`, derives `pk_self` from `nk`, and folds the same `c` into its digest.
+The bundle carries `c` as `auth_commit` and the auth proof as `auth_proof`, and the ledger admits
+it only when the auth proof verifies against the pinned auth guest and the same binding and
+publishes `auth_commit` (`docs/shielded.md` §2). A prover then holds `nk` — enough to prove the
+bundle and to read the wallet's whole history, not enough to spend — so anyone may run one, and
+`witness_kind: ViewingKey` is the normal job: every prover from v0.6.3 accepts it for guest v3 (§2,
+§6.1). A wallet that proves for itself makes both proofs too, so a self-proved and a delegated
+transaction look the same on chain.
+
+It is a hard fork, selected at genesis by `rand-node genesis --bundle-guest v3 --auth-guest`:
+`hc_bundle` `60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce` (v3) and `hc_auth`
+`1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1` (both pinned in
+`crates/randprotocol-zkvm/tests/guest_provenance.rs`); `rand_status` and `rand_getLimits` serve
+`hc_auth`. The v0.6.3 build runs chain 17 on and refuses chains 14–16 (`docs/rpc.md`, changelog).
+
+Measured (spec §4.2): the auth proof is tier 10, about 1.37 MB at Production FRI (313 KB at Test)
+and about 7 s to prove on one laptop core; in the wallet-flow test (Test FRI profile) a v3 bundle
+proof took 102 s on the wallet's machine and 108 s through a paired prover. A v3 transfer carries both proofs, about
+2.85 MB at Production FRI (1.36 MB auth + 1.49 MB bundle in one measured run): one per block at the 4 MiB default, about seven at the 20 MiB `max_block_bytes` chains 15
+and 16 set. The implementation plan is `docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md`.

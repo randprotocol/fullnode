@@ -619,6 +619,18 @@ Under `hardening_v6` a transaction carrying such a proof is `NonCanonicalProof` 
 apply (`ConfidentialExecutor::non_canonical_proof`, before either proof is verified). Every node
 already refuses it at its pool (`admission::non_canonical_proofs`), as a non-permanent Ignore.
 
+## The next cut: split authorisation (`--bundle-guest v3 --auth-guest`, v0.6.3)
+
+Delegated proving Phase 2 (`docs/prover.md` §8, `docs/shielded.md` §2) is genesis-gated and a hard
+fork: `rand-node genesis --bundle-guest v3 --auth-guest` pins `hc_bundle`
+`60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce` and `hc_auth`
+`1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1` (the pins in
+`crates/randprotocol-zkvm/tests/guest_provenance.rs`; the build that cuts must print the same). The
+two flags come as a pair, both ways. The v0.6.3 build refuses chains 14–16 at `run` and `verify`,
+so it rolls only onto a new genesis, all-stop/all-start; wallets, the prover and the bridge
+relayer's `rand` move with it. The cut procedure is "The chain-17 cut" (it arrives with the
+chain-17 scripts).
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and

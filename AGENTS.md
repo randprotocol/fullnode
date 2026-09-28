@@ -113,7 +113,8 @@ and read its rc.
 circuits `feat/cs7` at **`b9ffc39`** re-vendored by `deploy/sync-zkvm.sh` (CI `CIRCUITS_PIN` =
 PROVENANCE.md = `b9ffc39`). **A hard fork: v0.6.1 runs ONLY on a new genesis — chain 16.** Every
 verifier key, the AIR and the rVM's programs changed, so no chain-14/15 proof verifies on it; the
-node refuses both genesis hashes at `run` and `verify` (`node::CHAINS_THIS_BUILD_CANNOT_RUN`), chains
+node refuses both genesis hashes at `run` and `verify` (`PRE_CONSTRAINT_SET_7_CHAINS` in v0.6.1;
+`CHAINS_THIS_BUILD_CANNOT_RUN` since v0.6.3), chains
 ≤ 13 by their retired `hc_bundle`. **Keep chain 15 on v0.6** until the chain-16 cut
 (`deploy/cut-chain16-genesis.sh`, `--bundle-guest v2 --hardening-v6`).
 

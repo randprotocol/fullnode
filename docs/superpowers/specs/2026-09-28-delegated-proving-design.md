@@ -6,6 +6,12 @@ Scope: fullnode (this repo). Companion: `../clients/docs/superpowers/specs/2026-
 Ships in: Phase 1 on any chain (no consensus change). Phase 2 is a hard fork, genesis-gated, and
 waits for the measurements in §3.6.
 
+Update 2026-09-29: Phase 1 shipped as v0.6.2; Phase 2 is built on `feat/delegated-proving-2` for
+v0.6.3 (plan `docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md`). The text below is
+the design as drafted; where the build differs it is marked here (§4.2's measurements, §5's table
+and its last paragraph). The user-facing description of the code is `docs/prover.md`,
+`docs/shielded.md` §2 and `docs/confidential.md`.
+
 ## 1. Problem
 
 A bundle proof is tier 14: about 100 s and 5.7 GB on a laptop CPU. A browser gives WebAssembly
@@ -164,12 +170,16 @@ Genesis selects it the way `hc_bundle` selects v1 or v2 today: a new `hc_bundle`
 | auth guest workload | **measured 2026-09-28:** 159 program words, 16 input words; 203 executed + 47 digest rows = 250 cycles (tier-10 cap 1 023), 55 permutations (8 absorb; cap 128) → **tier 10** | `tests/auth_spike.rs` |
 | auth proof, proving | **measured 2026-09-28:** tier 10, 6.5–7.6 s proving and 0.30–0.33 s verifying on one core (Apple M4 Max, CPU backend, both profiles), 0.40 GB peak RSS for the Test + Production run | `tests/auth_spike.rs`; wasm and phones unmeasured |
 | auth proof, size | **measured 2026-09-28:** 1 364 714–1 369 066 B (≈ 1.37 MB) at Production FRI; 312 488–314 152 B at Test FRI (three runs; the spread is the proof's salted randomness) | `tests/auth_spike.rs` |
-| transaction size | about 1.4 MB → about 2.6 MB | |
-| transfers per unaggregated block | three → one at a 4 MiB cap | |
+| bundle proof v3, proving | **measured 2026-09-29:** 102 s on the wallet's machine and 108 s through a paired prover (the wallet-flow test, Test FRI profile, laptop CPU); at Production FRI, in a manual end-to-end run on a local v3 chain through a paired prover that was not the owner's: bundle 110.8 s remote, 1 490 435 B; auth 7.4 s local, 1 361 161 B | `crates/randprotocol-client/tests/wallet_flow.rs`; the manual run (2026-09-29, binaries at `6f005bf`) |
+| digests | **pinned:** `hc_bundle` v3 `60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce`, `hc_auth` `1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1` | `tests/guest_provenance.rs` |
+| transaction size | about 1.4 MB → about 2.6 MB (estimate); **measured:** 1 361 161 B of auth proof + 1 490 435 B of bundle proof ≈ 2.85 MB of proof per transfer at Production FRI | the manual run above |
+| transfers per unaggregated block | three → one at a 4 MiB cap; about seven at the 20 MiB `max_block_bytes` chains 15 and 16 set | |
 
 The size is the real cost. Phase 2 therefore ships only when **one** of these holds, decided from
 a spike (task P2-0): aggregation is active on the target chain; the auth proof measures small
-enough to keep two transfers per block; or the owners accept the throughput.
+enough to keep two transfers per block; or the owners accept the throughput. **Decided
+2026-09-28:** the owners accept the throughput — the user ordered Phase 2 executed and the chain
+cut; the cost, until aggregation is active, is one transfer per 4 MiB of block.
 
 ### 4.3 Rejected
 
@@ -204,11 +214,24 @@ Where the output fits in the 4-in/4-out shape:
 | transaction | asset slots 0–1 (outputs) | RAND slots 2–3 (outputs) |
 |---|---|---|
 | token transfer | payment, change | **prover fee**, RAND change |
-| BridgeBurn / TokenBurn | change, dummy | **prover fee**, RAND change |
+| BridgeBurn / TokenBurn | dummy, change | **prover fee**, RAND change |
 | RAND transfer (`A = 0`) | **prover fee**, change | payment, change |
+| RAND bundle paying nobody (`A = 0`: a bond, a deploy, a call, a bridge action) | dummy, dummy | **prover fee**, RAND change |
+
+As built (`Plan::outputs`, `crates/randprotocol-client/src/wallet.rs`): the burn row's asset slots
+are (dummy, change) — slot 0 is the payment slot, empty for a burn — where this table first read
+(change, dummy); the RAND bundle that pays nobody was not in the draft and puts the fee in slot 2.
+The prover accepts the fee in any RAND slot (slots 2–3 always, 0–1 when `A = 0`), so neither
+choice is a wire rule.
 
 A RAND transfer funds the fee from a RAND input in slots 0–1, so a wallet holding a single RAND
 note must split it first (one self-transfer).
+
+As built, the prover checks the fee **output** in the witness but not the envelope sealed to it,
+which the witness does not carry: a wallet can pay the note and seal junk, so neither side can
+open it. That is griefing only — the RAND is lost to both. Follow-up: the prover keeps the fee
+note's opening from the witness. The wallet caps what it pays with `--max-prover-fee` (default
+1 RAND) and does not remember the quote it saw at pairing.
 
 Why not the alternatives:
 
@@ -221,6 +244,12 @@ The remaining risk is a client that takes the proof and never submits, or spends
 elsewhere first. In Phase 2 the client sends the whole unproven transaction and its auth proof, so
 the prover assembles and broadcasts it itself; a race still costs the prover one proof, which the
 pairing token's rate limit bounds. Phase 1 provers are the owner's own and charge nothing.
+
+**Deferred — not built in v0.6.3.** The paragraph above is not what the build does: the prover
+receives only the witness and the binding words (`ProveJob`), never the transaction, and the
+client assembles and submits the transaction itself, as in Phase 1. So the risk stands as stated —
+a client can take the proof and not submit, and the prover has done one unpaid proof, bounded by
+the pairing's per-token cap (`--per-token`, default 2 jobs at once).
 
 ## 6. Relation to aggregators
 

@@ -142,6 +142,22 @@ fn the_split_authorisation_bundle_guest_is_pinned() {
     );
 }
 
+/// The auth guest (`guests::auth()`, delegated proving Phase 2: `sk` and `salt` in,
+/// `c = H(AUTH, nk, salt)` out, the transaction binding as its public segment, proved locally at
+/// `AUTH_TIER`) assembles to one fixed digest — the
+/// value a genesis carries as `hc_auth` beside a v3 `hc_bundle`. Pinned like the bundle guests, so
+/// a source change that moves it fails here rather than at the first block of the chain whose
+/// genesis names it. No genesis in the repository names it yet.
+#[test]
+fn the_auth_guest_is_pinned() {
+    let auth = "1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1";
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_auth()), auth, "the auth guest no longer assembles to its pinned digest");
+    assert!(
+        !ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h)).contains(&auth.to_string()),
+        "the auth guest's digest must not be a bundle guest's"
+    );
+}
+
 /// ZKG-2: the pin above, for every genesis file the repository carries — chain 15 included, which
 /// the chain-14-only test never read. A chain from 14 on pins the hidden-asset guest
 /// (`guests::bundle_hidden()`); chains 6–13 pin the retired 2-in-2-out guest, which still
