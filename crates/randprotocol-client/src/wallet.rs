@@ -38,8 +38,8 @@ use randprotocol_zkvm::address::{address_of, envelope_from_core, seal_note_as};
 // every production sealing site goes through `seal_note_as` with the chain's format.
 #[cfg(test)]
 use randprotocol_zkvm::address::seal_note;
-use randprotocol_zkvm::executor::{prove_bundle_for, ZkExecutor};
-use randprotocol_zkvm::hidden::{self, HiddenDigestInput, HiddenOutput, A_SLOTS, SLOTS};
+use randprotocol_zkvm::executor::{prove_auth, prove_bundle_for, ZkExecutor};
+use randprotocol_zkvm::hidden::{self, HiddenDigestInput, HiddenDigestInputV3, HiddenOutput, A_SLOTS, SLOTS};
 use randprotocol_zkvm::machine::{Backend, FriProfile};
 use randprotocol_zkvm::notes::{Note, SpendKey, ViewingKey};
 use randprotocol_zkvm::viewing::TxKey;
@@ -1292,7 +1292,11 @@ pub struct Submission {
     pub rand_change: u64,
     pub tier: u8,
     pub proof_bytes: usize,
+    /// How long the bundle proof took (here or on the paired prover).
     pub proving: Duration,
+    /// How long the auth proof took, on this machine — `None` on a chain without split
+    /// authorisation, whose transactions carry none.
+    pub auth_proving: Option<Duration>,
 }
 
 impl Submission {
@@ -1320,8 +1324,14 @@ impl Submission {
             Burn::None | Burn::Asset { .. } => String::new(),
             Burn::Rand(amount) => format!("{} RAND burned, ", format_amount(amount)),
         };
+        // A v3 transaction carries two proofs; both times are reported. Every other chain's
+        // line is unchanged.
+        let proved = match self.auth_proving {
+            Some(auth) => format!(", proved in {:.1?} (bundle) + {auth:.1?} (auth)", self.proving),
+            None => String::new(),
+        };
         format!(
-            "submitted {what} {}\n  {out} out, {burned}{change} change, fee {} RAND{fee_change}, anchored at height {}",
+            "submitted {what} {}\n  {out} out, {burned}{change} change, fee {} RAND{fee_change}, anchored at height {}{proved}",
             self.hash,
             format_amount(self.fee),
             self.time,
@@ -1491,6 +1501,7 @@ impl Plan {
             tier: proved.tier,
             proof_bytes: proved.proof.len(),
             proving: proved.proving,
+            auth_proving: proved.auth_proving,
         }
     }
 }
@@ -1519,15 +1530,57 @@ struct Prepared {
     /// the program this bundle is proved with ([`ZkExecutor::bundle_program_for`]). Chains 14 and
     /// 15 run the v1 hidden guest; a later genesis may name the branch-free v2 (INT-2 / GV-1).
     /// Both read this witness and publish this digest, so only the program differs — and a proof
-    /// of the other one would be refused by every validator.
+    /// of the other one would be refused by every validator. v3 (split authorisation) reads its
+    /// own witness and publishes its own digest: see `v3`.
     guest: Word8,
+    /// The chain runs split authorisation (spec 2026-09-28 §4.1): `guest` is bundle guest v3, the
+    /// witness carries `nk` and `salt` instead of the spend key, `expected` is the v3 digest, and
+    /// the transaction needs a second proof — the auth proof, made by this wallet over its spend
+    /// key and `salt`, publishing `auth_commit`. False on every chain without genesis `hc_auth`.
+    v3: bool,
+    /// 256 fresh random bits, drawn for this bundle alone: a repeated salt repeats `auth_commit`
+    /// and links two transactions to one wallet, and no guest can tell. Zero when not `v3`.
+    salt: Word8,
+    /// `auth::auth_commit(nk, salt)` — the bundle's `auth_commit`, which the auth proof must
+    /// publish and the v3 digest folds in. Zero when not `v3`.
+    auth_commit: Word8,
 }
 
-/// One bundle's proof, made against its transaction's binding.
+/// One transaction's proofs, made against its binding: the bundle's, and on a v3 chain the auth
+/// proof (empty elsewhere).
 struct Proved {
     proof: Vec<u8>,
     tier: u8,
     proving: Duration,
+    auth_proof: Vec<u8>,
+    /// How long the auth proof took; `None` when the chain has no split authorisation.
+    auth_proving: Option<Duration>,
+}
+
+/// The auth proof's half of [`check_published_digest`]: the `c` it publishes must be the bundle's
+/// `auth_commit`, or the ledger refuses the pair — and since this wallet computed both from its
+/// own `nk` and `salt`, a mismatch is a bug here.
+fn check_published_auth(c: &Word8, auth_commit: &Word8) -> Result<()> {
+    if c != auth_commit {
+        return Err(anyhow!(
+            "the auth proof published {} but this bundle's auth_commit is {} — refusing to submit (wallet bug)",
+            word8_to_hex(c),
+            word8_to_hex(auth_commit),
+        ));
+    }
+    Ok(())
+}
+
+/// Makes the auth proof on this machine — always here, never on a prover, because its witness is
+/// the spend key. Tier 10, seconds.
+fn prove_auth_locally(prepared: &Prepared, sk: &SpendKey, binding: &[u32; TX_BINDING_WORDS], profile: FriProfile, backend: Backend) -> Result<(Vec<u8>, Duration)> {
+    eprintln!("proving the spend authorisation on this machine (tier 10; seconds)…");
+    let started = Instant::now();
+    let (proof, c, tier) = prove_auth(profile, sk, &prepared.salt, binding, backend).map_err(|e| anyhow!("proving the spend authorisation failed: {e}"))?;
+    let took = started.elapsed();
+    eprintln!("authorisation proved in {took:.1?}: tier {tier}, {} bytes", proof.len());
+    check_published_auth(&c, &prepared.auth_commit)?;
+    Ok((proof, took))
 }
 
 /// The guest taints its digest instead of failing when a witness violates the relation, so a
@@ -1548,7 +1601,8 @@ fn check_published_digest(digest: &Word8, expected: &Word8) -> Result<()> {
 impl Prepared {
     /// Prove this bundle with `binding` — the [`Transaction::binding`] of the transaction it has
     /// already been placed in — as the public input segment. The chain recomputes the binding from
-    /// the transaction it receives and refuses a proof made for any other.
+    /// the transaction it receives and refuses a proof made for any other. The auth proof, on a
+    /// v3 chain, is [`prove_auth_locally`]'s and not made here.
     fn prove(&self, binding: &[u32; TX_BINDING_WORDS], profile: FriProfile, backend: Backend) -> Result<Proved> {
         eprintln!("proving the bundle (tier 14; about a minute and a half on a laptop)…");
         let started = Instant::now();
@@ -1557,7 +1611,7 @@ impl Prepared {
         let proving = started.elapsed();
         eprintln!("proved in {proving:.1?}: tier {tier}, {} bytes", proof.len());
         check_published_digest(&digest, &self.expected)?;
-        Ok(Proved { proof, tier, proving })
+        Ok(Proved { proof, tier, proving, auth_proof: Vec::new(), auth_proving: None })
     }
 }
 
@@ -1565,6 +1619,10 @@ impl Prepared {
 /// ([`Proving::Remote`], `rand --prover`), or — in unit tests — the guest run in the emulator,
 /// whose digest is checked exactly as a proof's is. The FRI profile is the chain's and travels
 /// beside it, not inside it.
+///
+/// On a v3 chain (split authorisation) the transaction's second proof, the auth proof, is made on
+/// this machine whichever is chosen — its witness is the spend key, which never leaves the wallet
+/// — and a remote prover is sent the v3 witness, which carries the viewing key's `nk` instead.
 #[derive(Clone)]
 pub enum Proving {
     Local(Backend),
@@ -1578,24 +1636,41 @@ impl Proving {
         Proving::Local(b)
     }
 
-    /// Proves `prepared` against `binding`. `proof_cap` is the chain's `max_proof_bytes`, which a
-    /// remote prover's reply is held to before it is used (a local proof is this build's own).
-    async fn prove(&self, prepared: &Prepared, binding: &[u32; TX_BINDING_WORDS], profile: FriProfile, proof_cap: usize) -> Result<Proved> {
+    /// Proves `prepared` against `binding`: the bundle, and on a v3 chain the auth proof over
+    /// `sk` (first — seconds, so a failure there costs no bundle proof). `proof_cap` is the
+    /// chain's `max_proof_bytes`, which a remote prover's reply is held to before it is used (a
+    /// local proof is this build's own).
+    async fn prove(&self, prepared: &Prepared, sk: &SpendKey, binding: &[u32; TX_BINDING_WORDS], profile: FriProfile, proof_cap: usize) -> Result<Proved> {
         match self {
-            Proving::Local(backend) => prepared.prove(binding, profile, *backend),
+            Proving::Local(backend) => {
+                let auth = prepared.v3.then(|| prove_auth_locally(prepared, sk, binding, profile, *backend)).transpose()?;
+                let proved = prepared.prove(binding, profile, *backend)?;
+                Ok(with_auth(proved, auth))
+            }
             Proving::Remote(remote) => {
+                // The prover never sees the spend key: on a v3 chain it gets the viewing-key
+                // witness and the auth proof is made here, on the CPU (tier 10, seconds).
+                let auth = prepared.v3.then(|| prove_auth_locally(prepared, sk, binding, profile, Backend::Cpu)).transpose()?;
+                let kind = if prepared.v3 { WitnessKind::ViewingKey } else { WitnessKind::SpendKey };
                 eprintln!("proving the bundle on {} (paired prover {})…", remote.paired().label(), remote.paired().fingerprint);
                 let started = Instant::now();
-                let (proof, tier) = remote
-                    .prove(&prepared.guest, profile, WitnessKind::SpendKey, &prepared.words, binding, &prepared.expected, proof_cap)
-                    .await?;
+                let (proof, tier) =
+                    remote.prove(&prepared.guest, profile, kind, &prepared.words, binding, &prepared.expected, proof_cap).await?;
                 let proving = started.elapsed();
                 eprintln!("proved remotely in {proving:.1?}: tier {tier}, {} bytes", proof.len());
-                Ok(Proved { proof, tier, proving })
+                Ok(with_auth(Proved { proof, tier, proving, auth_proof: Vec::new(), auth_proving: None }, auth))
             }
             #[cfg(test)]
-            Proving::Emulated => tests::emulated_proof(prepared, binding),
+            Proving::Emulated => tests::emulated_proof(prepared, sk, binding),
         }
+    }
+}
+
+/// `proved` with the auth proof, when there is one, beside it.
+fn with_auth(proved: Proved, auth: Option<(Vec<u8>, Duration)>) -> Proved {
+    match auth {
+        Some((auth_proof, took)) => Proved { auth_proof, auth_proving: Some(took), ..proved },
+        None => proved,
     }
 }
 
@@ -1611,7 +1686,13 @@ impl Proving {
 /// (`Payee::To`) ever carries `plan.memo` — change (`Payee::Me`) and every dummy (`Payee::Nobody`)
 /// are sealed with `""`, so every slot is the same size whether or not this transaction pays
 /// anyone a memo (spec 2026-09-26 §2.4).
-fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]], time: u32, format: EnvelopeFormat) -> Result<Prepared> {
+///
+/// `guest` is the chain's bundle guest ([`chain_bundle_guest`]). On bundle guest v3 (split
+/// authorisation) the bundle draws a fresh salt, carries `auth_commit = H(AUTH, nk, salt)`, and its
+/// witness is the v3 one — `nk` and the salt, never the spend key — with the v3 digest expected;
+/// on every other guest the bundle is exactly what it always was, `auth_commit` zero.
+#[allow(clippy::too_many_arguments)]
+fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]], time: u32, format: EnvelopeFormat, guest: &Word8) -> Result<Prepared> {
     let pk_self = w.vk.pk();
     let asset = plan.asset;
     if paths.len() != plan.inputs().count() {
@@ -1676,7 +1757,7 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
         }
     }
     let burn_asset = if plan.burn_a != 0 { asset } else { 0 };
-    let expected = hidden::hidden_bundle_digest(&HiddenDigestInput {
+    let digest_input = HiddenDigestInput {
         anchor,
         nullifiers,
         commitments,
@@ -1685,8 +1766,21 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
         burn_r: plan.burn_r,
         burn_asset,
         time,
-    });
-    let words = hidden::hidden_bundle_inputs(&w.sk, &inputs, &outs, anchor, plan.fee, plan.burn_a, plan.burn_r, asset, time);
+    };
+    let v3 = *guest == ZkExecutor::hc_hidden_bundle_v3();
+    let (salt, auth_commit, expected, words) = if v3 {
+        // Fresh for every bundle, never derived from anything: a repeated salt repeats
+        // `auth_commit` and links the two transactions to one wallet (spec §4.1).
+        let salt = fresh_word();
+        let auth_commit = randprotocol_zkvm::auth::auth_commit(&w.vk.nk, &salt);
+        let expected = hidden::hidden_bundle_digest_v3(&HiddenDigestInputV3 { base: digest_input, auth_commit });
+        let words = hidden::hidden_bundle_inputs_v3(&w.vk, &salt, &inputs, &outs, anchor, plan.fee, plan.burn_a, plan.burn_r, asset, time);
+        (salt, auth_commit, expected, words)
+    } else {
+        let expected = hidden::hidden_bundle_digest(&digest_input);
+        let words = hidden::hidden_bundle_inputs(&w.sk, &inputs, &outs, anchor, plan.fee, plan.burn_a, plan.burn_r, asset, time);
+        ([0; 8], [0; 8], expected, words)
+    };
     let envelopes: [Envelope; SLOTS] = envelopes.try_into().map_err(|_| anyhow!("four envelopes"))?;
     let bundle = Bundle {
         anchor,
@@ -1699,16 +1793,16 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
         time,
         envelopes,
         proof: Vec::new(),
-        // Split authorisation (a v3 chain) is the wallet's next task; a v1/v2 bundle carries no
-        // auth fields, which is what every chain without genesis `hc_auth` requires.
-        auth_commit: [0; 8],
+        // Set before the transaction around it exists, so the binding both proofs are made over
+        // covers it. Zero on a chain without genesis `hc_auth`, which that chain requires.
+        auth_commit,
         auth_proof: Vec::new(),
     };
-    Ok(Prepared { bundle, words, expected, guest: ZkExecutor::hc_bundle() })
+    Ok(Prepared { bundle, words, expected, guest: *guest, v3, salt, auth_commit })
 }
 
-/// The chain's bundle guest: `rand_status`'s `hc_bundle` (the genesis pin), refused unless this
-/// build can prove it — asked before a bundle is built, so a wallet too old for its chain says so
+/// The chain's bundle guest: `rand_status`'s `hc_bundle` (the genesis pin) — and for v3, its
+/// `hc_auth` too — refused unless this build can prove it — asked before a bundle is built, so a wallet too old for its chain says so
 /// instead of spending a minute and a half on a proof every validator refuses.
 async fn chain_bundle_guest(rpc: &RpcClient) -> Result<Word8> {
     let status = rpc.status().await?;
@@ -1719,6 +1813,20 @@ async fn chain_bundle_guest(rpc: &RpcClient) -> Result<Word8> {
             "this chain's bundle guest is {named}, which this wallet cannot prove (it carries {}); update the wallet",
             ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h)).join(" and ")
         ));
+    }
+    // Bundle guest v3 needs its auth proof, made by the auth guest the genesis pins as `hc_auth`:
+    // an auth proof of any other guest is refused by every validator, so a chain naming another
+    // one (or, inconsistently, none) is refused here — before a proof is paid for.
+    if hc == ZkExecutor::hc_hidden_bundle_v3() {
+        let ours = ZkExecutor::hc_auth();
+        let theirs = status["hc_auth"].as_str().and_then(randprotocol_core::notes::word8_from_hex);
+        if theirs != Some(ours) {
+            let named = status["hc_auth"].as_str().map_or_else(|| "not named (rand_status has no hc_auth)".to_string(), str::to_string);
+            return Err(anyhow!(
+                "this chain's auth guest is {named}; this wallet carries {} — refusing to prove a v3 bundle it cannot authorise; update the wallet",
+                word8_to_hex(&ours)
+            ));
+        }
     }
     Ok(hc)
 }
@@ -1771,7 +1879,7 @@ async fn prepare_bundle(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, plan
                     .with_context(|| format!("no local witness for note {}; the store's tree is incomplete", n.index))?;
                 paths.push(path);
             }
-            let prepared = Prepared { guest, ..build_bundle(w, plan, root, &paths, time, format)? };
+            let prepared = build_bundle(w, plan, root, &paths, time, format, &guest)?;
             return Ok((prepared, time));
         }
         if attempt == 1 {
@@ -1792,14 +1900,15 @@ fn is_anchor_miss(e: &anyhow::Error) -> bool {
     e.downcast_ref::<crate::RpcError>().is_some_and(|r| r.code == -32001)
 }
 
-/// Prove `tx`'s one bundle against `tx`'s own binding, in place, with `proving` at `profile`.
-async fn prove_transaction(tx: &mut Transaction, prepared: &Prepared, proving: &Proving, profile: FriProfile, proof_cap: usize) -> Result<Proved> {
-    prove_transaction_by(tx, |binding| async move { proving.prove(prepared, &binding, profile, proof_cap).await }).await
+/// Prove `tx`'s one bundle — and on a v3 chain its auth proof, over `sk` — against `tx`'s own
+/// binding, in place, with `proving` at `profile`.
+async fn prove_transaction(tx: &mut Transaction, prepared: &Prepared, sk: &SpendKey, proving: &Proving, profile: FriProfile, proof_cap: usize) -> Result<Proved> {
+    prove_transaction_by(tx, |binding| async move { proving.prove(prepared, sk, &binding, profile, proof_cap).await }).await
 }
 
-/// The order [`prove_transaction`] keeps: the binding is taken with the proof still empty, the
-/// bundle proved against it, the proof filled in; filling the proof in cannot move the binding,
-/// because the binding blanks it. `prove` is handed the binding — a unit test hands in a stub
+/// The order [`prove_transaction`] keeps: the binding is taken with both proofs still empty, the
+/// bundle (and the auth proof, on a v3 chain) proved against it, the proofs filled in; filling
+/// them in cannot move the binding, because the binding blanks both. `prove` is handed the binding — a unit test hands in a stub
 /// prover, which is what lets the ordering be tested without a minute of proving.
 async fn prove_transaction_by<F, Fut>(tx: &mut Transaction, prove: F) -> Result<Proved>
 where
@@ -1808,8 +1917,10 @@ where
 {
     let binding = tx.binding();
     let p = prove(binding).await?;
-    tx.bundle.as_mut().context("a shielded transaction has a bundle")?.proof = p.proof.clone();
-    debug_assert_eq!(tx.binding(), binding, "filling the proof in never moves the binding");
+    let bundle = tx.bundle.as_mut().context("a shielded transaction has a bundle")?;
+    bundle.proof = p.proof.clone();
+    bundle.auth_proof = p.auth_proof.clone();
+    debug_assert_eq!(tx.binding(), binding, "filling the proofs in never moves the binding");
     Ok(p)
 }
 
@@ -1956,7 +2067,7 @@ async fn submit_spend(
         Proving::Remote(_) => proof_cap(rpc.limits().await?.as_ref()),
         _ => gas::MAX_PROOF_BYTES,
     };
-    let proved = prove_transaction(&mut tx, &prepared, proving, profile, cap).await?;
+    let proved = prove_transaction(&mut tx, &prepared, &w.sk, proving, profile, cap).await?;
     // `submit_refused` labels a JSON-RPC error reply *from this call* as `SubmitRefused`
     // (node I1): it is the only failure here that means nothing was admitted, and `rand token
     // create` deletes a freshly generated authority key on it and on nothing else. Everything
@@ -3837,6 +3948,7 @@ mod tests {
             tier: 14,
             proof_bytes: 1 << 20,
             proving: Duration::from_secs(98),
+            auth_proving: None,
         };
 
         // A transfer: nothing burned, nothing said about burning.
@@ -4123,15 +4235,29 @@ mod tests {
     /// is the one the proof names.
     const EMULATED_HC: Word8 = [0xe0; 8];
 
+    /// The `hc_auth` the emulated auth "proof" is made under — any word, as [`EMULATED_HC`].
+    const EMULATED_AUTH_HC: Word8 = [0xa0; 8];
+
     /// [`Proving::Emulated`]: the hidden guest run on `p.words` against `binding`, its digest
-    /// checked as a real proof's is, and a stub proof carrying it.
-    pub(super) fn emulated_proof(p: &Prepared, binding: &[u32; TX_BINDING_WORDS]) -> Result<Proved> {
+    /// checked as a real proof's is, and a stub proof carrying it. On a v3 chain the auth guest
+    /// is run too, on `auth_inputs(sk, salt)`, its `c` checked against `auth_commit` as a real
+    /// auth proof's is, and a stub auth proof carrying it.
+    pub(super) fn emulated_proof(p: &Prepared, sk: &SpendKey, binding: &[u32; TX_BINDING_WORDS]) -> Result<Proved> {
         let program = ZkExecutor::bundle_program_for(&p.guest).expect("prepare_bundle refuses a guest this build lacks");
         let run = randprotocol_zkvm::emulator::execute(program, &p.words, binding, 1 << 20)
             .map_err(|e| anyhow!("the hidden guest did not run: {e:?}"))?;
         let digest: Word8 = run.outputs;
         check_published_digest(&digest, &p.expected)?;
-        Ok(Proved { proof: StubExecutor::make_bundle_proof(&EMULATED_HC, &digest, binding), tier: 14, proving: Duration::ZERO })
+        let (auth_proof, auth_proving) = if p.v3 {
+            let words = randprotocol_zkvm::auth::auth_inputs(sk, &p.salt);
+            let run = randprotocol_zkvm::emulator::execute(ZkExecutor::auth_program(), &words, binding, 1 << 16)
+                .map_err(|e| anyhow!("the auth guest did not run: {e:?}"))?;
+            check_published_auth(&run.outputs, &p.auth_commit)?;
+            (StubExecutor::make_auth_proof(&EMULATED_AUTH_HC, &run.outputs, binding), Some(Duration::ZERO))
+        } else {
+            (Vec::new(), None)
+        };
+        Ok(Proved { proof: StubExecutor::make_bundle_proof(&EMULATED_HC, &digest, binding), tier: 14, proving: Duration::ZERO, auth_proof, auth_proving })
     }
 
     /// A node in memory: the commitment tree and its envelopes, the blocks, the nullifiers, what
@@ -4173,6 +4299,9 @@ mod tests {
         envelope_bytes: Option<u32>,
         /// `rand_status`'s `hc_bundle`: the chain's bundle guest, v1 unless a test says otherwise.
         hc_bundle: Word8,
+        /// `rand_status`'s `hc_auth`: `None` (served as null) unless a test runs split
+        /// authorisation.
+        hc_auth: Option<Word8>,
     }
 
     fn kind(a: &Action) -> &'static str {
@@ -4212,6 +4341,7 @@ mod tests {
                 witness_calls: 0,
                 envelope_bytes: None,
                 hc_bundle: ZkExecutor::hc_bundle(),
+                hc_auth: None,
             }
         }
 
@@ -4318,7 +4448,7 @@ mod tests {
                     self.sent.push(tx);
                     json!(hash)
                 }
-                "rand_status" => json!({ "hc_bundle": word8_to_hex(&self.hc_bundle) }),
+                "rand_status" => json!({ "hc_bundle": word8_to_hex(&self.hc_bundle), "hc_auth": self.hc_auth.as_ref().map(word8_to_hex) }),
                 "rand_getBridgeState" => self.bridge.clone(),
                 "rand_getAssets" => self.assets.clone(),
                 "rand_getTokens" => self.tokens.clone(),
@@ -6004,7 +6134,7 @@ mod tests {
             ..NoteStore::default()
         };
         let plan = Plan::select(&store, Spend { asset: 0, to: None, memo: "", fee: 50, burn_a: 0, burn_r: 0 }).unwrap();
-        let build = || build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy).unwrap();
+        let build = || build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &ZkExecutor::hc_bundle()).unwrap();
         let (one, two) = (build(), build());
         for k in 0..SLOTS {
             if k != 2 {
@@ -6026,6 +6156,144 @@ mod tests {
         // And the witness is one the guest accepts: every output a dummy, the one input real.
         let run = randprotocol_zkvm::emulator::execute(ZkExecutor::hidden_bundle_program(), &one.words, &[0; TX_BINDING_WORDS], 1 << 20).unwrap();
         assert_eq!(run.outputs, one.expected);
+    }
+
+    /// A one-note store and the self-transfer plan over it, for the split-authorisation tests
+    /// that build a bundle without a chain.
+    fn one_note_plan(me: &Wallet) -> (randprotocol_zkvm::ledger::CommitmentTree, Plan) {
+        let mut tree = randprotocol_zkvm::ledger::CommitmentTree::new();
+        let note = Note::new(me.vk.pk(), [1; 8], 50, 0, 1);
+        tree.append(note.commitment());
+        let store = NoteStore {
+            notes: vec![OwnedNote { index: 0, cm: note.commitment(), nf: me.vk.nullifier(&note.commitment()), note, spent: false, pending: None, height: 1, memo: None }],
+            ..NoteStore::default()
+        };
+        let plan = Plan::select(&store, Spend { asset: 0, to: None, memo: "", fee: 50, burn_a: 0, burn_r: 0 }).unwrap();
+        (tree, plan)
+    }
+
+    /// Split authorisation (spec 2026-09-28 §4.1): a repeated salt repeats `c = H(AUTH, nk, salt)`
+    /// and links two transactions to one wallet, and the guest cannot tell — so the wallet draws a
+    /// fresh salt for every bundle it builds. Two bundles from the same plan carry distinct salts
+    /// and distinct `auth_commit`s, each the commitment of its own salt, and the salt the v3
+    /// witness hands the prover is that salt.
+    #[test]
+    fn two_sends_never_share_a_salt() {
+        let me = Wallet::from_spend_key(SpendKey([56; 8]));
+        let (tree, plan) = one_note_plan(&me);
+        let v3 = ZkExecutor::hc_hidden_bundle_v3();
+        let build = || build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &v3).unwrap();
+        let (one, two) = (build(), build());
+        assert!(one.v3 && two.v3);
+        assert_ne!(one.salt, [0; 8], "a v3 bundle draws a salt");
+        assert_ne!(one.salt, two.salt, "two bundles, two salts");
+        assert_ne!(one.auth_commit, two.auth_commit, "two salts, two commitments");
+        for p in [&one, &two] {
+            assert_eq!(p.auth_commit, randprotocol_zkvm::auth::auth_commit(&me.vk.nk, &p.salt));
+            assert_eq!(p.bundle.auth_commit, p.auth_commit, "the bundle carries the commitment");
+            use randprotocol_zkvm::hidden::hidden_input_v3::{COUNT, NK, SALT};
+            assert_eq!(p.words.len(), COUNT);
+            assert_eq!(p.words[SALT..SALT + 8], p.salt, "the witness carries this bundle's salt");
+            assert_eq!(p.words[NK..NK + 8], me.vk.nk, "the witness carries nk");
+            assert!(p.words.windows(8).all(|w| w != me.sk.0), "and never the spend key");
+        }
+        // The v3 witness is one the v3 guest accepts, publishing the v3 digest the wallet built.
+        let program = ZkExecutor::bundle_program_for(&v3).unwrap();
+        let run = randprotocol_zkvm::emulator::execute(program, &one.words, &[0; TX_BINDING_WORDS], 1 << 20).unwrap();
+        assert_eq!(run.outputs, one.expected);
+    }
+
+    /// A v3 chain (`rand_status` names `hc_hidden_bundle_v3` and this build's `hc_auth`): the
+    /// bundle carries its `auth_commit` before the binding is taken — so the binding, which both
+    /// proofs are made over, covers it — and the submitted transaction carries both proofs: the
+    /// bundle's publishing the v3 digest, the auth proof publishing `auth_commit`, both bound to
+    /// the transaction. A v3 chain whose `hc_auth` is not this build's (or is missing) is refused
+    /// before anything is proved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_v3_bundle_carries_auth_commit_before_binding() {
+        let me = Wallet::from_spend_key(SpendKey([57; 8]));
+        let (tree, plan) = one_note_plan(&me);
+        let v3 = ZkExecutor::hc_hidden_bundle_v3();
+        let p = build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &v3).unwrap();
+        let tx = Transaction::shielded(7, p.bundle.clone(), Action::None);
+        let mut moved = tx.clone();
+        moved.bundle.as_mut().unwrap().auth_commit[0] ^= 1;
+        assert_ne!(tx.binding(), moved.binding(), "the binding covers auth_commit");
+
+        // The whole path against a v3 chain.
+        let you = Wallet::from_spend_key(SpendKey([58; 8]));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        chain.lock().unwrap().fund(&me, 7_000_000, 0);
+        chain.lock().unwrap().fund(&me, 7_000_000, 0);
+        chain.lock().unwrap().hc_bundle = v3;
+        chain.lock().unwrap().hc_auth = Some(ZkExecutor::hc_auth());
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000_000, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
+            .await
+            .unwrap();
+        assert!(s.auth_proving.is_some(), "a v3 send reports the auth proof's time");
+        assert!(s.summary("transfer").contains("auth"), "{}", s.summary("transfer"));
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        let b = tx.bundle.as_ref().unwrap();
+        assert_ne!(b.auth_commit, [0; 8]);
+        assert!(!b.auth_proof.is_empty(), "the auth proof rides in the bundle");
+        let recomputed = ZkExecutor::new(FriProfile::Test).bundle_digest_v3(&b.digest_input());
+        assert_eq!(StubExecutor.bundle_proof_digest(&[0; 8], &b.proof).unwrap(), recomputed, "the v3 digest, auth_commit inside");
+        assert_eq!(StubExecutor.verify_bundle(&EMULATED_HC, &b.proof, &tx.binding()), Ok(()));
+        assert_eq!(StubExecutor.verify_auth(&EMULATED_AUTH_HC, &b.auth_proof, &tx.binding()), Ok(b.auth_commit), "auth bound to this transaction");
+
+        // Another auth guest, or none, on a v3 chain: refused before any proof.
+        for hc_auth in [Some([0xbad; 8]), None] {
+            chain.lock().unwrap().hc_auth = hc_auth;
+            let e = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000_000, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("this chain's auth guest is") && e.contains("this wallet carries"), "{e}");
+        }
+        assert!(chain.lock().unwrap().sent.is_empty(), "nothing sent under a foreign auth guest");
+    }
+
+    /// Chains 14–16 (no `hc_auth`, a v1 or v2 bundle guest) are unchanged: no salt, a zero
+    /// `auth_commit`, an empty `auth_proof`, the 1 204-word witness with the spend key in it and
+    /// the v1 digest — what every such chain's ledger requires (`TxError::AuthUnexpected`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pre_v3_chain_builds_the_old_shape() {
+        let me = Wallet::from_spend_key(SpendKey([59; 8]));
+        let (tree, plan) = one_note_plan(&me);
+        for hc in [ZkExecutor::hc_hidden_bundle(), ZkExecutor::hc_hidden_bundle_v2()] {
+            let p = build_bundle(&me, &plan, tree.root(), &[tree.path(0)], 2, EnvelopeFormat::Legacy, &hc).unwrap();
+            assert!(!p.v3);
+            assert_eq!((p.salt, p.auth_commit, p.bundle.auth_commit), ([0; 8], [0; 8], [0; 8]));
+            assert!(p.bundle.auth_proof.is_empty());
+            assert_eq!(p.words.len(), randprotocol_zkvm::hidden::hidden_input::COUNT);
+            assert_eq!(p.expected, hidden::hidden_bundle_digest(&HiddenDigestInput {
+                anchor: p.bundle.anchor,
+                nullifiers: p.bundle.nullifiers,
+                commitments: p.bundle.commitments,
+                fee: p.bundle.fee,
+                burn_a: p.bundle.burn_a,
+                burn_r: p.bundle.burn_r,
+                burn_asset: p.bundle.burn_asset,
+                time: p.bundle.time,
+            }));
+        }
+        let you = Wallet::from_spend_key(SpendKey([60; 8]));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        chain.lock().unwrap().fund(&me, 7_000_000, 0);
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let s = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000_000, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
+            .await
+            .unwrap();
+        assert_eq!(s.auth_proving, None);
+        assert!(!s.summary("transfer").contains("auth"), "the summary line is the old one");
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        let b = tx.bundle.as_ref().unwrap();
+        assert_eq!(b.auth_commit, [0; 8]);
+        assert!(b.auth_proof.is_empty());
     }
 
     #[test]
@@ -6569,12 +6837,15 @@ mod tests {
             words: Vec::new(),
             expected: [0; 8],
             guest: ZkExecutor::hc_bundle(),
+            v3: false,
+            salt: [0; 8],
+            auth_commit: [0; 8],
         };
         let action = Action::BridgeBurn { asset: 3, amount: 400, relayer_fee: 100, to_chain: 2, token: [7; 32], to: [1; 32] };
         let mut tx = Transaction::shielded(13, prepared.bundle.clone(), action);
         let stub = |p: &Prepared, binding: &[u32; TX_BINDING_WORDS]| -> Result<Proved> {
             let d = StubExecutor.bundle_digest(&p.bundle.digest_input());
-            Ok(Proved { proof: StubExecutor::make_bundle_proof(&HC, &d, binding), tier: 14, proving: Duration::ZERO })
+            Ok(Proved { proof: StubExecutor::make_bundle_proof(&HC, &d, binding), tier: 14, proving: Duration::ZERO, auth_proof: Vec::new(), auth_proving: None })
         };
         prove_transaction_by(&mut tx, |b| std::future::ready(stub(&prepared, &b))).await.unwrap();
         let binding = tx.binding();
@@ -6614,7 +6885,8 @@ mod tests {
             auth_commit: [0; 8],
             auth_proof: Vec::new(),
         };
-        let prepared = Prepared { bundle: bundle(10), words: Vec::new(), expected: [0; 8], guest: ZkExecutor::hc_bundle() };
+        let prepared =
+            Prepared { bundle: bundle(10), words: Vec::new(), expected: [0; 8], guest: ZkExecutor::hc_bundle(), v3: false, salt: [0; 8], auth_commit: [0; 8] };
         let id = Hash::digest(b"program");
         let record = ProgramRecord { id, base_pc: 0, words: vec![0x13; 4], code_hash: vec![], deployed_at: 0, public_digest: None, public_len: 0 };
         let call = Action::Call { program: id, proof: Vec::new(), input_envelope: None };
@@ -6623,7 +6895,7 @@ mod tests {
         bind_call(&mut tx, &prove_call).unwrap();
         let stub = |p: &Prepared, binding: &[u32; TX_BINDING_WORDS]| -> Result<Proved> {
             let d = StubExecutor.bundle_digest(&p.bundle.digest_input());
-            Ok(Proved { proof: StubExecutor::make_bundle_proof(&HC, &d, binding), tier: 14, proving: Duration::ZERO })
+            Ok(Proved { proof: StubExecutor::make_bundle_proof(&HC, &d, binding), tier: 14, proving: Duration::ZERO, auth_proof: Vec::new(), auth_proving: None })
         };
         prove_transaction_by(&mut tx, |b| std::future::ready(stub(&prepared, &b))).await.unwrap();
         let Action::Call { proof, .. } = &tx.action else { panic!("a call") };

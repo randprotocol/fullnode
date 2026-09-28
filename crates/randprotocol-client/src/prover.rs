@@ -24,6 +24,11 @@ use zeroize::Zeroizing;
 /// The refusal for a spend-key witness bound for a prover that is not the owner's own.
 pub const NOT_OWN: &str = "this build's witness carries the spend key; only a prover paired as your own (own=1) may receive it";
 
+/// Printed once, before a viewing-key witness goes to a prover that is not the owner's own: the
+/// v3 witness carries `nk`, which opens every note this wallet ever received or spent, and moves
+/// none of them (the auth proof, made on this machine over the spend key, is what spends).
+pub const VIEWING_KEY_WARNING: &str = "this prover can read this wallet's whole history; it cannot spend";
+
 /// A sealed reply carries a ~1.2 MB proof as hex; 64 MiB is the wallet's own RPC reply cap.
 const MAX_REPLY_BYTES: usize = 64 * 1024 * 1024;
 
@@ -200,13 +205,18 @@ pub struct RemoteProver {
     /// The digest a proof's own public values publish (`bundle_proof_digest`, structural and
     /// cheap). A seam so the unit tests' fake proofs need not decode; the real executor otherwise.
     pub(crate) published_digest: PublishedDigest,
+    /// Set once [`VIEWING_KEY_WARNING`] has been printed, so it is said once per prover, not once
+    /// per job.
+    warned_history: std::sync::atomic::AtomicBool,
 }
 
-/// Reads the digest a bundle proof publishes, at a FRI profile.
-pub(crate) type PublishedDigest = std::sync::Arc<dyn Fn(FriProfile, &[u8]) -> Result<Word8> + Send + Sync>;
+/// Reads the digest a bundle proof of the guest `hc` publishes, at a FRI profile.
+pub(crate) type PublishedDigest = std::sync::Arc<dyn Fn(FriProfile, &Word8, &[u8]) -> Result<Word8> + Send + Sync>;
 
-fn executor_digest(profile: FriProfile, proof: &[u8]) -> Result<Word8> {
-    ZkExecutor::new(profile).hidden_bundle_proof_digest(proof).map_err(|e| anyhow!("{e}"))
+/// Keyed by the chain's `hc_bundle` — the heights a proof must declare are that guest's
+/// ([`ZkExecutor::bundle_heights_for`]), exactly as the ledger reads them.
+fn executor_digest(profile: FriProfile, hc: &Word8, proof: &[u8]) -> Result<Word8> {
+    ZkExecutor::new(profile).hidden_bundle_proof_digest_for(hc, proof).map_err(|e| anyhow!("{e}"))
 }
 
 impl RemoteProver {
@@ -225,7 +235,13 @@ impl RemoteProver {
             verify_locally: !no_verify,
             info: tokio::sync::OnceCell::new(),
             published_digest: std::sync::Arc::new(executor_digest),
+            warned_history: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether [`VIEWING_KEY_WARNING`] has been printed for this prover.
+    pub fn warned_history(&self) -> bool {
+        self.warned_history.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn paired(&self) -> &PairedProver {
@@ -289,6 +305,11 @@ impl RemoteProver {
     ) -> Result<(Vec<u8>, u8)> {
         if witness_kind == WitnessKind::SpendKey && !self.paired.own {
             return Err(anyhow!(NOT_OWN));
+        }
+        // A viewing-key witness (bundle guest v3) may go to any paired prover; one that is not the
+        // owner's own is told what it can then see, once, before anything is sent.
+        if witness_kind == WitnessKind::ViewingKey && !self.paired.own && !self.warned_history.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("warning: {} — {VIEWING_KEY_WARNING}", self.paired.label());
         }
         let info = self.info().await?;
         let has = |field: &str, want: &str| info[field].as_array().is_some_and(|a| a.iter().any(|v| v.as_str() == Some(want)));
@@ -411,7 +432,7 @@ impl RemoteProver {
         // The digest is read off the proof itself — `verify_bundle` never looks at it, and the
         // reply's `digest` field is only the prover's word — and checked whatever `verify_locally`.
         let label = self.paired.label();
-        let published = (self.published_digest)(profile, &reply.proof)
+        let published = (self.published_digest)(profile, hc, &reply.proof)
             .map_err(|e| anyhow!("the prover {label}'s proof does not decode as a bundle proof: {e}; not using it"))?;
         if published != *expected {
             return Err(anyhow!(
@@ -498,6 +519,8 @@ mod tests {
         reply_key: Option<[u8; 32]>,
         /// Answers to the first `prover_status` calls, one each, before `finish` takes over.
         status_first: std::collections::VecDeque<Reply>,
+        /// The witness kind of the last job submitted.
+        kind: Option<WitnessKind>,
     }
 
     fn info_for(key: &ProverKey) -> Value {
@@ -520,7 +543,7 @@ mod tests {
         let mut info = info_for(&key);
         edit_info(&mut info);
         let kem_ek = key.kem_ek().to_vec();
-        let state = Arc::new(Mutex::new(Fake { key, info, finish, seen: Vec::new(), reply_key: None, status_first: Default::default() }));
+        let state = Arc::new(Mutex::new(Fake { key, info, finish, seen: Vec::new(), reply_key: None, status_first: Default::default(), kind: None }));
         let s = state.clone();
         let url = rpc_fn(move |method, params| {
             let mut f = s.lock().unwrap();
@@ -533,7 +556,7 @@ mod tests {
                     assert_eq!(job.binding, BINDING);
                     assert_eq!(job.profile, "test");
                     assert_eq!(job.inputs, vec![1, 2, 3]);
-                    assert!(job.witness_kind == WitnessKind::SpendKey);
+                    f.kind = Some(job.witness_kind);
                     assert_eq!(job.hc_bundle, ZkExecutor::hc_bundle());
                     assert_eq!(job.token, [9; 32]);
                     assert_eq!(job.version, WIRE_VERSION);
@@ -579,7 +602,7 @@ mod tests {
     }
 
     /// The fake's proofs publish their first 32 bytes as the digest.
-    fn stub_digest(_: FriProfile, proof: &[u8]) -> Result<Word8> {
+    fn stub_digest(_: FriProfile, _: &Word8, proof: &[u8]) -> Result<Word8> {
         let mut d = [0u32; 8];
         for (i, w) in d.iter_mut().enumerate() {
             *w = u32::from_le_bytes(proof.get(4 * i..4 * i + 4).context("short")?.try_into().unwrap());
@@ -597,6 +620,36 @@ mod tests {
         let (proof, tier) = prove(&quick(paired), 1000).await.unwrap();
         assert_eq!((proof.len(), tier), (100, 14));
         assert_eq!(state.lock().unwrap().seen, ["prover_info", "prover_submit", "prover_status"], "one info, no cancel");
+        assert_eq!(state.lock().unwrap().kind, Some(WitnessKind::SpendKey));
+    }
+
+    async fn vk(r: &RemoteProver) -> Result<(Vec<u8>, u8)> {
+        r.prove(&ZkExecutor::hc_bundle(), FriProfile::Test, WitnessKind::ViewingKey, &[1, 2, 3], &BINDING, &EXPECTED, 1000).await
+    }
+
+    /// Split authorisation: a viewing-key witness (bundle guest v3) goes to any paired prover —
+    /// `own` or not — and a prover that is not the owner's own is warned about once, before the
+    /// first job, never again for the same prover.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_viewing_key_witness_goes_to_any_paired_prover_with_one_warning() {
+        let (paired, state) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, false, |i| {
+            i["witness_kinds"] = json!(["viewing_key"]);
+        })
+        .await;
+        let r = quick(paired);
+        assert!(!r.warned_history());
+        vk(&r).await.expect("a viewing-key job needs no own pairing");
+        assert!(r.warned_history(), "a prover not the owner's own is told what it can read");
+        assert_eq!(state.lock().unwrap().kind, Some(WitnessKind::ViewingKey));
+        vk(&r).await.expect("and again");
+        // The same prover, own: no warning.
+        let (paired, _) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, true, |i| {
+            i["witness_kinds"] = json!(["spend_key", "viewing_key"]);
+        })
+        .await;
+        let r = quick(paired);
+        vk(&r).await.unwrap();
+        assert!(!r.warned_history(), "the owner's own prover already holds the spend key");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

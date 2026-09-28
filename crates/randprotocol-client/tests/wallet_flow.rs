@@ -13,7 +13,9 @@
 //! chain under A's viewing key alone, checked against the `H_IN` its proof published (spec §6.1).
 //!
 //! Twelve bundle proofs and three call proofs across the five tests, so this is the slowest test
-//! binary in the workspace by a wide margin — minutes, not seconds. The bridge commands are not here: they need a chain with a
+//! binary in the workspace by a wide margin — minutes, not seconds. The two split-authorisation
+//! tests (a v3 chain) add two bundle proofs and two auth proofs, one pair proved by a paired
+//! prover. The bridge commands are not here: they need a chain with a
 //! guardian set, which the node's cluster tests configure.
 //!
 //! Two things about the chain this test configures deliberately. The FRI profile is `test` (16
@@ -112,6 +114,18 @@ fn genesis_full(
 /// The wallet learns the guest from `rand_status.hc_bundle`, so nothing else changes.
 fn genesis_v2(validator: &Keypair) -> Genesis {
     Genesis { hc_bundle: word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2()), ..genesis(validator) }
+}
+
+/// The same chain under split authorisation (delegated proving Phase 2): bundle guest v3 and the
+/// auth guest pinned as `hc_auth` — both or neither, or the node refuses to start. Every
+/// transaction then carries two proofs, the bundle's (over `nk`) and the auth proof (over the
+/// spend key, always made by the wallet).
+fn genesis_v3(validator: &Keypair) -> Genesis {
+    Genesis {
+        hc_bundle: word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()),
+        hc_auth: Some(word8_to_hex(&ZkExecutor::hc_auth())),
+        ..genesis(validator)
+    }
 }
 
 async fn start(dir: &tempfile::TempDir, key: &Keypair) -> NodeHandle {
@@ -673,6 +687,115 @@ async fn a_send_proved_by_a_paired_prover_is_admitted() {
     wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
     assert_eq!(a_store.balance(), mint - pay - fee, "A keeps its change");
     eprintln!("delegated send end to end in {:.1?}", started.elapsed());
+    handle.shutdown().await;
+}
+
+/// Split authorisation, the wallet's end to end: on a v3 chain `send` draws a fresh salt, builds
+/// the v3 witness, proves the bundle and the auth proof against the same binding, and the node
+/// admits the pair; the payee finds the note and the payer's change comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_v3_send_proves_both_and_is_admitted() {
+    init_tracing();
+    let started = Instant::now();
+    let dir = tempfile::tempdir().unwrap();
+    let key = Keypair::from_seed([108; 32]).unwrap();
+    let handle = start_with(&dir, &key, genesis_v3(&key)).await;
+    let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
+
+    let a = Wallet::from_spend_key(SpendKey([23; 8]));
+    let b = Wallet::from_spend_key(SpendKey([24; 8]));
+    let mut a_store = NoteStore::default();
+    let mut b_store = NoteStore::default();
+    let mint = 100 * UNITS_PER_RAND;
+    let hash = rpc.mint_shielded(&a.address.to_string(), Some(mint)).await.expect("mint accepted");
+    rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
+    wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
+    assert_eq!(a_store.balance(), mint);
+
+    let fee = gas::BUNDLE_BASE;
+    let pay = UNITS_PER_RAND;
+    let slot = proving_slot().await;
+    let sub = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, "", fee, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
+        .await
+        .expect("the v3 transaction is accepted and commits");
+    drop(slot);
+    let auth = sub.auth_proving.expect("a v3 send makes the auth proof");
+    eprintln!("v3 local: bundle tier {} in {:.1?} ({} bytes), auth in {auth:.1?}", sub.tier, sub.proving, sub.proof_bytes);
+    eprintln!("{}", sub.summary("transfer"));
+    assert!(sub.summary("transfer").contains("(auth)"), "the summary reports both proving times");
+    assert_eq!((sub.tier, sub.amount, sub.change), (14, pay, mint - pay - fee));
+
+    let shown = rpc.raw_transaction(&sub.hash).await.unwrap().expect("committed");
+    let bundle = shown.bundle.as_ref().expect("a bundle");
+    assert_ne!(bundle.auth_commit, [0; 8], "a v3 bundle commits to its salt");
+    assert!(!bundle.auth_proof.is_empty(), "and carries its auth proof");
+
+    wallet::scan(&rpc, &b, &mut b_store).await.unwrap();
+    assert_eq!(b_store.balance(), pay, "B received the payment");
+    wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
+    assert_eq!(a_store.balance(), mint - pay - fee, "A keeps its change");
+    eprintln!("v3 send end to end in {:.1?}", started.elapsed());
+    handle.shutdown().await;
+}
+
+/// Split authorisation through a delegated prover: the prover runs WITHOUT spend-key witnesses and
+/// is paired as not the owner's own (`own=0`), so on a v3 chain the wallet sends it the viewing-key
+/// witness (`nk`, never the spend key), warns once that it can read this wallet's history, makes
+/// the auth proof itself, and the node admits the pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_v3_send_through_a_viewing_key_prover_is_admitted() {
+    init_tracing();
+    let started = Instant::now();
+    let dir = tempfile::tempdir().unwrap();
+    let key = Keypair::from_seed([109; 32]).unwrap();
+    let handle = start_with(&dir, &key, genesis_v3(&key)).await;
+    let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
+
+    // ---- the prover: its own key, one pairing that is NOT the owner's, no spend-key jobs ----
+    let pkey = randprotocol_prover::key::ProverKey::generate();
+    let ek = pkey.kem_ek().to_vec();
+    let mut pairings = randprotocol_prover::pairing::Pairings::default();
+    let token = pairings.pair("friend", false).unwrap();
+    let cfg = randprotocol_prover::service::Config::new(pkey, pairings);
+    assert!(!cfg.accept_spend_key, "started without --accept-spend-key");
+    let (paddr, _svc, _ptask) = randprotocol_prover::http::serve("127.0.0.1:0".parse().unwrap(), cfg).await.expect("the prover listens");
+    let link = randprotocol_prover::pairing::PairingLink { kem_ek: ek, url: format!("http://{paddr}"), token, own: false };
+    let paired = randprotocol_client::prover::PairedProver::from_link(&link, Some("friend".into()));
+    let remote = std::sync::Arc::new(randprotocol_client::prover::RemoteProver::new(paired));
+    let proving = Proving::Remote(remote.clone());
+
+    let a = Wallet::from_spend_key(SpendKey([25; 8]));
+    let b = Wallet::from_spend_key(SpendKey([26; 8]));
+    let mut a_store = NoteStore::default();
+    let mut b_store = NoteStore::default();
+    let mint = 100 * UNITS_PER_RAND;
+    let hash = rpc.mint_shielded(&a.address.to_string(), Some(mint)).await.expect("mint accepted");
+    rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
+    wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
+    assert_eq!(a_store.balance(), mint);
+
+    let fee = gas::BUNDLE_BASE;
+    let pay = UNITS_PER_RAND;
+    let slot = proving_slot().await;
+    let sub = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, "", fee, FriProfile::Test, &proving, CHAIN_ID, true)
+        .await
+        .expect("the delegated v3 transaction is accepted and commits");
+    drop(slot);
+    let auth = sub.auth_proving.expect("the wallet made the auth proof itself");
+    eprintln!("v3 remote: bundle tier {} in {:.1?} ({} bytes, remote), auth in {auth:.1?} (local)", sub.tier, sub.proving, sub.proof_bytes);
+    assert!(remote.warned_history(), "the wallet warned: {}", randprotocol_client::prover::VIEWING_KEY_WARNING);
+    assert_eq!((sub.tier, sub.amount, sub.change), (14, pay, mint - pay - fee));
+
+    let shown = rpc.raw_transaction(&sub.hash).await.unwrap().expect("committed");
+    let bundle = shown.bundle.as_ref().expect("a bundle");
+    assert_ne!(bundle.auth_commit, [0; 8]);
+    assert!(!bundle.auth_proof.is_empty());
+
+    wallet::scan(&rpc, &b, &mut b_store).await.unwrap();
+    assert_eq!(b_store.balance(), pay, "B received the note the prover's proof carried");
+    wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
+    assert_eq!(a_store.balance(), mint - pay - fee, "A keeps its change");
+    eprintln!("delegated v3 send end to end in {:.1?}", started.elapsed());
     handle.shutdown().await;
 }
 
