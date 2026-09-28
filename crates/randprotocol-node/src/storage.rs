@@ -305,6 +305,9 @@ pub struct Storage {
     /// re-tries it, so without this the warning would fire once per pass forever instead of
     /// once per floor value (final-review fix #1).
     torn_floor_warned: std::sync::atomic::AtomicU64,
+    /// How many seal rows the sealed-proof pruning pass has visited, for the tests that bound
+    /// its work per pass (INTERFACE-9).
+    seal_rows_examined: std::sync::atomic::AtomicU64,
 }
 
 /// What [`Storage::drop_receipts_index`] found and removed: whether the `receipts_by_program`
@@ -353,6 +356,36 @@ fn decode_validator(bytes: &[u8]) -> Result<ValidatorEntry> {
 
 fn height_key(h: u64) -> [u8; 8] {
     h.to_be_bytes()
+}
+
+/// What a sealed bundle's record keeps of its raw proof (spec §6.2): the 34 public values and
+/// the declared shape, read off the stored zkVM proof. One reader for the `Raw` arm of
+/// [`Storage::covered_record`] and for the pruning pass, so the two forms read one way.
+fn raw_proof_facts(
+    tx_hash: &Hash,
+    proof: &[u8],
+    profile: randprotocol_core::types::FriProfile,
+) -> Result<randprotocol_core::types::CoveredBundle> {
+    let proof: randprotocol_zkvm::machine::Proof = postcard::from_bytes(proof)
+        .map_err(|_| StorageError::Corrupt(format!("covered bundle {tx_hash}'s proof does not decode")))?;
+    let public_values: [u64; 34] = proof
+        .public_values
+        .clone()
+        .try_into()
+        .map_err(|_| StorageError::Corrupt(format!("covered bundle {tx_hash}'s public values are not 34 words")))?;
+    Ok(randprotocol_core::types::CoveredBundle {
+        public_values,
+        shape: randprotocol_core::types::DeclaredShape {
+            profile,
+            tier: proof.tier.0 as u8,
+            program_log_height: proof.program_log_height,
+            input_log_height: proof.input_log_height,
+            keccak_log_height: proof.keccak_log_height,
+            sha256_log_height: proof.sha256_log_height,
+            public_log_height: proof.public_log_height,
+            mem_log_height: proof.mem_log_height,
+        },
+    })
 }
 
 /// `CF_RECEIPTS_BY_PROGRAM`'s key: `program || height (BE) || index (BE)`. Big-endian height
@@ -579,6 +612,7 @@ impl Storage {
             tree_cache: std::sync::Mutex::new(None),
             tree_builds: std::sync::atomic::AtomicUsize::new(0),
             torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX),
+            seal_rows_examined: std::sync::atomic::AtomicU64::new(0),
         };
         storage.backfill_receipts_index()?;
         storage.prune_committed_qcs()?;
@@ -1229,6 +1263,11 @@ impl Storage {
         self.tree_builds.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// How many seal rows [`Storage::prune_sealed`] has visited since this store was opened.
+    pub fn seal_rows_examined(&self) -> u64 {
+        self.seal_rows_examined.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Paths for many leaves from one tree build (`rand_getWitnesses`); `None` for an index past
     /// the tree. The root is the same for every path, so it is returned once.
     pub fn witnesses(&self, indices: &[u64], executor: &dyn ConfidentialExecutor) -> Result<(Word8, Vec<Option<[Word8; DEPTH]>>)> {
@@ -1385,31 +1424,12 @@ impl Storage {
         cover: &Hash,
         profile: randprotocol_core::types::FriProfile,
     ) -> Result<Option<randprotocol_core::types::CoveredBundle>> {
-        use randprotocol_core::types::{CoveredBundle, DeclaredShape};
+        use randprotocol_core::types::CoveredBundle;
         let Some(record) = self.tx_record(cover)? else { return Ok(None) };
         match record {
             TxRecord::Raw { tx, .. } => {
                 let Some(bundle) = &tx.bundle else { return Ok(None) };
-                let proof: randprotocol_zkvm::machine::Proof = postcard::from_bytes(&bundle.proof)
-                    .map_err(|_| StorageError::Corrupt(format!("covered bundle {cover}'s proof does not decode")))?;
-                let public_values: [u64; 34] = proof
-                    .public_values
-                    .clone()
-                    .try_into()
-                    .map_err(|_| StorageError::Corrupt(format!("covered bundle {cover}'s public values are not 34 words")))?;
-                Ok(Some(CoveredBundle {
-                    public_values,
-                    shape: DeclaredShape {
-                        profile,
-                        tier: proof.tier.0 as u8,
-                        program_log_height: proof.program_log_height,
-                        input_log_height: proof.input_log_height,
-                        keccak_log_height: proof.keccak_log_height,
-                        sha256_log_height: proof.sha256_log_height,
-                        public_log_height: proof.public_log_height,
-                        mem_log_height: proof.mem_log_height,
-                    },
-                }))
+                raw_proof_facts(cover, &bundle.proof, profile).map(Some)
             }
             TxRecord::Pruned { tx, public_values, shape, .. } => {
                 if tx.bundle.is_none() {
@@ -1519,15 +1539,33 @@ impl Storage {
     /// transactions and unsealed bundles are never touched — the first are bundle-less, the
     /// second have no mark. Returns how many records it rewrote.
     pub fn prune_sealed(&self, head_height: u64, window: u64, profile: randprotocol_core::types::FriProfile) -> Result<u64> {
+        self.prune_sealed_with(head_height, window, u64::MAX, &|tx_hash, proof| raw_proof_facts(tx_hash, proof, profile))
+    }
+
+    /// [`Storage::prune_sealed`] with the raw proof's reader passed in: the production reader
+    /// decodes a real zkVM proof ([`raw_proof_facts`]); a test passes one for a stub-proved
+    /// bundle, whose bytes the real one cannot read, so the pass itself runs without a
+    /// recursion fixture. Rewrites at most `max` records.
+    pub(crate) fn prune_sealed_with(
+        &self,
+        head_height: u64,
+        window: u64,
+        max: u64,
+        read: &dyn Fn(&Hash, &[u8]) -> Result<randprotocol_core::types::CoveredBundle>,
+    ) -> Result<u64> {
         let mut pruned = 0u64;
         let seals: Vec<(Box<[u8]>, Box<[u8]>)> = self
             .db
             .iterator_cf(self.cf(CF_SEALS), IteratorMode::Start)
             .collect::<std::result::Result<_, _>>()?;
         for (k, _) in seals {
+            if pruned >= max {
+                break;
+            }
             if k.first() != Some(&b't') {
                 continue;
             }
+            self.seal_rows_examined.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let bundle_hash = Hash(k[1..].try_into().map_err(|_| StorageError::Corrupt("seal key has wrong length".into()))?);
             let Some((_, sealed_at)) = self.sealed_by(&bundle_hash)? else { continue };
             if sealed_at.saturating_add(window) > head_height {
@@ -1535,23 +1573,7 @@ impl Storage {
             }
             let Some(TxRecord::Raw { height, index, tx }) = self.tx_record(&bundle_hash)? else { continue };
             let Some(bundle) = &tx.bundle else { continue };
-            let proof: randprotocol_zkvm::machine::Proof = postcard::from_bytes(&bundle.proof)
-                .map_err(|_| StorageError::Corrupt(format!("sealed bundle {}'s proof does not decode", bundle_hash)))?;
-            let public_values: [u64; 34] = proof
-                .public_values
-                .clone()
-                .try_into()
-                .map_err(|_| StorageError::Corrupt(format!("sealed bundle {}'s public values are not 34 words", bundle_hash)))?;
-            let shape = randprotocol_core::types::DeclaredShape {
-                profile,
-                tier: proof.tier.0 as u8,
-                program_log_height: proof.program_log_height,
-                input_log_height: proof.input_log_height,
-                keccak_log_height: proof.keccak_log_height,
-                sha256_log_height: proof.sha256_log_height,
-                public_log_height: proof.public_log_height,
-                mem_log_height: proof.mem_log_height,
-            };
+            let randprotocol_core::types::CoveredBundle { public_values, shape } = read(&bundle_hash, &bundle.proof)?;
             let proof_hash = Hash::digest(&bundle.proof);
             let mut pruned_tx = tx.clone();
             let mut marker = PRUNED_PROOF_MARKER.to_vec();
@@ -5974,7 +5996,7 @@ mod tests {
         {
             // `init_genesis` touches no family the old build lacks, so it runs over the raw
             // fifteen-family handle exactly as the old build's own did.
-            let old = Storage { db: open_as_pre_v03(dir.path(), true).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX) };
+            let old = Storage { db: open_as_pre_v03(dir.path(), true).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX), seal_rows_examined: Default::default() };
             old.init_genesis(&gs).unwrap();
             let r = a_receipt(pid);
             old.db.put_cf(old.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(&r).unwrap()).unwrap();
@@ -6010,7 +6032,7 @@ mod tests {
                 .iter()
                 .filter(|c| **c != CF_PROGRAM_PUBLIC)
                 .map(|n| ColumnFamilyDescriptor::new(*n, Options::default()));
-            let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX) };
+            let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX), seal_rows_examined: Default::default() };
             st.backfill_receipts_index().unwrap();
             st.init_genesis(&gs).unwrap();
             let r = a_receipt(pid);
