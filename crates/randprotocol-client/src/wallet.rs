@@ -2644,10 +2644,11 @@ pub fn check_gas_limit(declared: u64, exact: u64, ceiling: u64) -> Result<()> {
 }
 
 /// Under a `gas` section every bundle declares the chain's `bundle_gas_limit` (spec §4.3), which
-/// is the bundle guest's own ceiling `gas_max(14, 0, 0)` — the prover's default. A chain naming
-/// any other value runs a bundle guest this wallet does not have: refused before proving.
+/// is the bundle guest's own ceiling `gas_max(BUNDLE_PROOF_TIER, 0, 0)` — the prover's default,
+/// and the only value genesis accepts (`gas::bundle_gas_limit_pin`). A chain naming any other
+/// value runs a bundle guest this wallet does not have: refused before proving.
 pub fn check_bundle_gas_limit(bundle_gas_limit: Option<u64>) -> Result<()> {
-    let ours = gas::gas_max(14, 0, 0);
+    let ours = gas::bundle_gas_limit_pin();
     match bundle_gas_limit {
         Some(b) if b != ours => Err(anyhow!(
             "this chain pins every bundle at {b} gas, but this wallet's bundle guest declares {ours}; update the wallet"

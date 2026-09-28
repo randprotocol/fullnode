@@ -65,7 +65,7 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | `--fri-profile <production\|test>` | `production` | zkVM FRI profile every node must use; `test` is insecure and for the test suite. Part of the genesis hash |
 | `--gas-price <UNITS>` | none — no `gas` section | units of RAND per gas the chain itself charges a call (constraint set 8, `docs/fees.md` §1.1). Writing this flag is what turns the section on at all; the other three below are meaningless without it. Part of the genesis hash |
 | `--byte-price <UNITS>` | `800` (`BYTE_PRICE_DEFAULT`), only with `--gas-price` | units of RAND per KiB of call proof plus input envelope, from byte 0 |
-| `--bundle-gas-limit <N>` | `gas_max(14, 0, 0)` = `20479`, only with `--gas-price` | the exact `GAS_LIMIT` every bundle proof (transfer, bond, burn, …) must declare on this chain; any other value is refused (`TxError::BundleGasLimit`, permanent) |
+| `--bundle-gas-limit <N>` | `gas_max(14, 0, 0)` = `20479`, only with `--gas-price` | the exact `GAS_LIMIT` every bundle proof (transfer, bond, burn, …) must declare on this chain; a bundle proof declaring any other value is refused (`TxError::BundleGasLimit`, permanent), and the genesis itself refuses any value but `20479` (`GasConfig::check`, `gas::bundle_gas_limit_pin`) |
 | `--gas-dynamic <target_bytes>,<target_gas>,<adjust_bps>` | none — fixed prices | Phase 2 (`docs/fees.md` §1.2): turns on the per-block price controller, floored at the section's own starting `gas_price`/`byte_price`. Refused beside `--aggregation` (`GenesisError::DynamicGasWithAggregation`) |
 
 `rand-node genesis`/`init` print `gas: price P/gas, B/KiB, bundle limit N, dynamic: target … / …

@@ -167,6 +167,13 @@ pub fn gas_max(tier: u8, keccak_log_height: u8, sha256_log_height: u8) -> u64 {
         .saturating_add(blocks(sha256_log_height, 64).saturating_mul(SHA256_GAS - 1))
 }
 
+/// The one `bundle_gas_limit` a genesis `gas` section may name (final-review I3): the bundle
+/// guest's header ceiling `gas_max(BUNDLE_PROOF_TIER, 0, 0)` = 20 479 — what every hidden-asset
+/// bundle proof declares, since a bundle is pinned to tier 14 with no hash tables.
+pub fn bundle_gas_limit_pin() -> u64 {
+    gas_max(crate::types::BUNDLE_PROOF_TIER, 0, 0)
+}
+
 /// A node's gas prices (spec §4.1, Phase 0): admission policy, not a ledger rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GasPolicy {
@@ -603,8 +610,9 @@ pub struct GasConfig {
     #[serde(with = "crate::ledger::staking::amount_string")]
     pub byte_price: u64,
     /// The bundle guest's flat gas (spec §4.3): every bundle proof's declared `GAS_LIMIT` must
-    /// equal this constant exactly, or the proof is refused. `20 479` (`gas_max(14, 0, 0)` =
-    /// `(2¹⁴ − 1) + 2¹²`) for today's tier-14 guest.
+    /// equal this constant exactly, or the proof is refused. Must be [`bundle_gas_limit_pin`],
+    /// `20 479` (`gas_max(14, 0, 0)` = `(2¹⁴ − 1) + 2¹²`) for today's tier-14 guest — `check`
+    /// refuses anything else.
     pub bundle_gas_limit: u64,
     /// How gas is metered on this chain. `Circuit` (spec §4.2) is the only value the chain
     /// accepts today; the field exists so a later metering scheme has somewhere to be named.
@@ -660,8 +668,17 @@ impl GasConfig {
         if self.byte_price == 0 {
             return Err("byte_price must be greater than 0".into());
         }
-        if self.bundle_gas_limit == 0 {
-            return Err("bundle_gas_limit must be at least 1".into());
+        // Every bundle proof declares its header's ceiling (spec §4.3), and a bundle is pinned to
+        // one tier, so any other value names a chain on which no bundle is ever admitted.
+        let pin = bundle_gas_limit_pin();
+        if self.bundle_gas_limit != pin {
+            return Err(format!(
+                "bundle_gas_limit {} must be {pin}, the tier-{} bundle guest's ceiling gas_max({}, 0, 0): \
+                 every bundle proof declares exactly that",
+                self.bundle_gas_limit,
+                crate::types::BUNDLE_PROOF_TIER,
+                crate::types::BUNDLE_PROOF_TIER
+            ));
         }
         if let Some(d) = &self.dynamic {
             if d.adjust_bps == 0 || d.adjust_bps > 5000 {
@@ -730,6 +747,8 @@ mod gas_config_tests {
         assert!(GasConfig { gas_price: 0, ..ok() }.check(MAX_BLOCK_BYTES).unwrap_err().contains("gas_price"));
         assert!(GasConfig { byte_price: 0, ..ok() }.check(MAX_BLOCK_BYTES).unwrap_err().contains("byte_price"));
         assert!(GasConfig { bundle_gas_limit: 0, ..ok() }.check(MAX_BLOCK_BYTES).unwrap_err().contains("bundle_gas_limit"));
+        assert!(GasConfig { bundle_gas_limit: 20_478, ..ok() }.check(MAX_BLOCK_BYTES).unwrap_err().contains("20479"), "only the pin");
+        assert_eq!(bundle_gas_limit_pin(), 20_479);
     }
 
     #[test]
