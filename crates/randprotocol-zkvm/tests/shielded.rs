@@ -190,18 +190,22 @@ fn a_bundle_proves_against_its_binding_and_verifies_only_against_it() {
     assert!(ex.verify_bundle(&[1u32; 8], &proof, &BINDING_A).is_err());
     // …and under the retired guest's `hc`: a chain-13 genesis cannot verify a chain-14 bundle.
     assert!(ex.verify_bundle(&ZkExecutor::hc_legacy_bundle(), &proof, &BINDING_A).is_err());
-    // The declared public height is pinned to the binding's (4, for eight words) and anything
-    // else is refused before any verifier key is built — here the empty segment's height, 2.
+    // The declared public height is pinned to the binding's and anything else is refused before
+    // any verifier key is built. Constraint set 7 floors every declared table at 2^7, so eight
+    // words declare 7 (it was 4 through cs6) — the same height the empty segment declares now.
     let decoded = randprotocol_zkvm::executor::decode_canonical(&proof).unwrap();
     assert_eq!(decoded.public_log_height, ZkExecutor::bundle_heights().2);
-    assert_eq!(ZkExecutor::bundle_heights().2, 4);
+    assert_eq!(ZkExecutor::bundle_heights().2, 7);
+    assert_eq!(ZkExecutor::bundle_heights().2, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT);
+    // Under the floor the declared-shape check refuses it first; above, the binding pin does.
+    let under = ConfidentialError::InvalidProof("declared shape: PublicHeight".into());
     let refused = ConfidentialError::InvalidProof("public height not the transaction binding's".into());
-    for height in [2u8, 3, 5] {
+    for (height, why) in [(2u8, &under), (4, &under), (6, &under), (8, &refused), (9, &refused)] {
         let mut other = randprotocol_zkvm::executor::decode_canonical(&proof).unwrap();
         other.public_log_height = height;
         let bytes = other.to_bytes();
-        assert_eq!(ex.bundle_proof_digest(&bytes), Err(refused.clone()), "height {height}");
-        assert_eq!(ex.verify_bundle(&hc, &bytes, &BINDING_A), Err(refused.clone()), "height {height}");
+        assert_eq!(ex.bundle_proof_digest(&bytes), Err(why.clone()), "height {height}");
+        assert_eq!(ex.verify_bundle(&hc, &bytes, &BINDING_A), Err(why.clone()), "height {height}");
     }
     // Canonical decoding (final review): the same proof with one trailing byte decodes to the same
     // `Proof` under plain postcard, and is refused by both bundle entry points.
@@ -214,6 +218,12 @@ fn a_bundle_proves_against_its_binding_and_verifies_only_against_it() {
 /// A bundle proved the pre-fork way — against the *empty* public segment, which is every bundle
 /// proof made before Task 5b and what an old wallet still makes — is refused, whatever binding it
 /// is checked against: it is bound to no transaction at all.
+///
+/// Through constraint set 6 the refusal came on the header alone: the empty segment declared
+/// public height 2, the binding 4. Constraint set 7 floors every declared table at 2^7, so both
+/// declare 7 and the cheap reader (`bundle_proof_digest`, which verifies nothing cryptographic)
+/// now passes it; the refusal is `verify_bundle`'s, where `pv::PUB0..7 = H_PUB([])` is not the
+/// binding's `H_PUB` — the same `PublicValues` refusal a proof for another transaction gets.
 #[test]
 fn a_bundle_proved_against_the_empty_segment_is_refused() {
     let ex = ZkExecutor::new(FriProfile::Test);
@@ -223,9 +233,10 @@ fn a_bundle_proved_against_the_empty_segment_is_refused() {
         .unwrap();
     assert_eq!(exec.outputs, ex.bundle_digest(&di), "an honest witness: only the segment is wrong");
     assert_eq!(proof.public_log_height, randprotocol_zkvm::tables::public::MIN_LOG_HEIGHT);
+    assert_eq!(proof.public_log_height, ZkExecutor::bundle_heights().2, "cs7: the same declared height as the binding's");
     let bytes = proof.to_bytes();
-    let refused = ConfidentialError::InvalidProof("public height not the transaction binding's".into());
-    assert_eq!(ex.bundle_proof_digest(&bytes), Err(refused.clone()));
+    assert_eq!(ex.bundle_proof_digest(&bytes), Ok(exec.outputs), "the cheap reader verifies nothing");
+    let refused = ConfidentialError::InvalidBundleProof("PublicValues".into());
     for binding in [BINDING_A, [0; 8]] {
         assert_eq!(ex.verify_bundle(&ZkExecutor::hc_bundle(), &bytes, &binding), Err(refused.clone()));
     }

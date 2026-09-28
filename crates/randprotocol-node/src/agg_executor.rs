@@ -484,7 +484,8 @@ mod tests {
         (shape, CoveredBundle { public_values, shape })
     }
 
-    /// A shape the rVM builds without any recursion fixture: the fixtures' own classes.
+    /// A shape the rVM builds without any recursion fixture: the fixtures' own classes (public
+    /// height 7, constraint set 7's floor on every table — the empty segment's 2 before it).
     fn fixture_free_shape() -> DeclaredShape {
         DeclaredShape {
             profile: CoreProfile::Test,
@@ -493,7 +494,7 @@ mod tests {
             input_log_height: 12,
             keccak_log_height: 0,
             sha256_log_height: 0,
-            public_log_height: 2,
+            public_log_height: 7,
             mem_log_height: 18,
         }
     }

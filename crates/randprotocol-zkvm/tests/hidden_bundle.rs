@@ -921,9 +921,10 @@ fn a_mixed_hidden_bundle_proves_at_tier_14_and_verifies_only_against_its_binding
     // is built.
     let machine = Machine::new(FriProfile::Production);
     let pinned = ConfidentialError::InvalidProof("tier or hash-table height not the pinned guest's".into());
-    // Each triple is one `check_declared_heights` admits (keccak's floor is 5, sha256's 6, both
-    // capped by `tier + 5`), so every one of them reached `verifier_key` before this pin.
-    for (tier, klh, shh) in [(20u8, 20u8, 20u8), (14, 5, 0), (14, 0, 6), (12, 0, 0), (16, 0, 0), (10, 5, 6)] {
+    // Each triple is one `check_declared_heights` admits (keccak's and sha256's floor is 7 since
+    // constraint set 7 — 5 and 6 before it — both capped by `tier + 5`), so every one of them
+    // reached `verifier_key` before this pin.
+    for (tier, klh, shh) in [(20u8, 20u8, 20u8), (14, 7, 0), (14, 0, 7), (12, 0, 0), (16, 0, 0), (10, 7, 7)] {
         let mut junk = randprotocol_zkvm::executor::decode_canonical(&proof).unwrap();
         junk.tier = Tier(tier as usize);
         junk.keccak_log_height = klh;
@@ -954,7 +955,9 @@ fn a_mixed_hidden_bundle_proves_at_tier_14_and_verifies_only_against_its_binding
 }
 
 /// Proved the pre-binding way — against the empty public segment — the proof is refused whatever
-/// binding it is checked against (Test profile: the refusal is on the declared height).
+/// binding it is checked against (Test profile). Through constraint set 6 the refusal was on the
+/// declared height (2 against the binding's 4); constraint set 7 floors both at 2^7, so the cheap
+/// digest reader passes it and `verify_*` refuses it on `H_PUB` (`PublicValues`).
 #[test]
 fn a_hidden_bundle_proved_against_the_empty_segment_is_refused() {
     let c = token_only();
@@ -963,10 +966,11 @@ fn a_hidden_bundle_proved_against_the_empty_segment_is_refused() {
         .prove_with(Backend::Cpu, ZkExecutor::hidden_bundle_program(), &inputs, &[], None)
         .unwrap();
     assert_eq!(exec.outputs, hidden::hidden_bundle_digest(&c.claimed()), "an honest witness: only the segment is wrong");
+    assert_eq!(proof.public_log_height, ZkExecutor::hidden_bundle_heights().2, "cs7: the binding's declared height too");
     let bytes = proof.to_bytes();
     let ex = ZkExecutor::new(FriProfile::Test);
-    let refused = ConfidentialError::InvalidProof("public height not the transaction binding's".into());
-    assert_eq!(ex.hidden_bundle_proof_digest(&bytes), Err(refused.clone()));
+    assert_eq!(ex.hidden_bundle_proof_digest(&bytes), Ok(exec.outputs), "the cheap reader verifies nothing");
+    let refused = ConfidentialError::InvalidBundleProof("PublicValues".into());
     for binding in [BINDING_A, [0; 8]] {
         assert_eq!(ex.verify_hidden_bundle(&ZkExecutor::hc_hidden_bundle(), &bytes, &binding), Err(refused.clone()));
         // …and through the trait the ledger calls (H3: the chain's bundle is this guest).
@@ -974,7 +978,7 @@ fn a_hidden_bundle_proved_against_the_empty_segment_is_refused() {
         assert_eq!(ex.verify_bundle(&ZkExecutor::hc_bundle(), &bytes, &binding), Err(refused.clone()));
     }
     use randprotocol_core::confidential::ConfidentialExecutor;
-    assert_eq!(ex.bundle_proof_digest(&bytes), Err(refused));
+    assert_eq!(ex.bundle_proof_digest(&bytes), Ok(exec.outputs));
 }
 
 /// The branch-free guest proved once (Test profile — the tier and table heights do not depend

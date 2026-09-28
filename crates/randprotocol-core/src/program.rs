@@ -66,13 +66,15 @@ pub fn hardened_call_segment(public: &[u32], binding: &[u32; crate::types::TX_BI
     [public, binding.as_slice()].concat()
 }
 
-/// Rows in the zkVM's program table for a program of `len` words: `max(len + 1, 16)` rounded up to
-/// a power of two — `1 << tables::program::program_log_height(len)` in the zkVM (`pad_height(len +
-/// 1, MIN_HEIGHT)`, `MIN_HEIGHT` 16). Core cannot name a zkvm function (the dependency points the
-/// other way), so this is a mirror, like `types::pv`; `randprotocol-zkvm/src/executor.rs`'s tests
-/// pin it to the real function, so a re-vendor that moves the table's padding fails there.
+/// Rows in the zkVM's program table for a program of `len` words: `max(len + 1, 128)` rounded up
+/// to a power of two — `1 << tables::program::program_log_height(len)` in the zkVM (`pad_height(len +
+/// 1, MIN_HEIGHT)`, floored at `2^MIN_PRIVATE_TABLE_LOG_HEIGHT` since constraint set 7; through
+/// constraint set 6 the floor was `MIN_HEIGHT`'s 16). Core cannot name a zkvm function (the
+/// dependency points the other way), so this is a mirror, like `types::pv`;
+/// `randprotocol-zkvm/src/executor.rs`'s tests pin it to the real function, so a re-vendor that
+/// moves the table's padding fails there.
 pub fn program_table_rows(len: usize) -> u64 {
-    (len as u64).saturating_add(1).max(16).next_power_of_two()
+    (len as u64).saturating_add(1).max(1 << MIN_PRIVATE_TABLE_LOG_HEIGHT).next_power_of_two()
 }
 
 /// The zkVM's private-table floor, `executor::MIN_PRIVATE_TABLE_LOG_HEIGHT` (2^7 rows): under genesis

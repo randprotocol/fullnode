@@ -537,10 +537,13 @@ impl ZkExecutor {
     /// The public height *is* pinned in the exact case since Task 5b: a bundle proof carries the
     /// transaction binding — always [`TX_BINDING_WORDS`] words — so its public table has exactly
     /// one honest height, `public_log_height(TX_BINDING_WORDS)` (`public_log_height`, passed in
-    /// here). Any other declared height is a proof over a segment of some other length — the empty
-    /// segment of a pre-fork bundle proof among them — which `verify_public` would refuse anyway,
-    /// but only after building (and caching, evicting an honest one) a verifier key for the junk
-    /// height; refusing it here is deterministic and costs a comparison.
+    /// here). Any other declared height is a proof over a segment of some other length, which
+    /// `verify_public` would refuse anyway, but only after building (and caching, evicting an
+    /// honest one) a verifier key for the junk height; refusing it here is deterministic and costs
+    /// a comparison. Since constraint set 7 floors every table at 2^7, a segment of up to 128
+    /// words — the empty one of a pre-fork bundle proof among them — declares the binding's height
+    /// too, and is refused by `verify_public`'s `H_PUB` comparison instead (the key it needs is the
+    /// honest one, so nothing is evicted).
     fn decode_and_check(
         &self,
         proof: &[u8],
@@ -651,9 +654,11 @@ impl ZkExecutor {
     /// guest is one pinned program, its private-input vector is always
     /// `hidden::hidden_input::COUNT` words wide (a dummy slot is a zero-amount note, not a shorter
     /// witness — that is the whole point of the fixed 4-in-4-out shape), and its public segment
-    /// is always the transaction binding, [`TX_BINDING_WORDS`] words (Task 5b) — whose height,
-    /// `public_log_height(8) == 4`, is not the empty segment's `MIN_LOG_HEIGHT == 2`, so a
-    /// pre-fork bundle proof is refused on the declared height alone.
+    /// is always the transaction binding, [`TX_BINDING_WORDS`] words (Task 5b). Through constraint
+    /// set 6 that height, `public_log_height(8) == 4`, was not the empty segment's 2, so a
+    /// pre-fork bundle proof was refused on the declared height alone; constraint set 7 floors
+    /// both at `MIN_LOG_HEIGHT == 7`, and such a proof is refused at `verify_bundle`
+    /// (`PublicValues`, its `H_PUB` is the empty segment's).
     pub fn bundle_heights() -> (u8, u8, u8) {
         Self::hidden_bundle_heights()
     }
@@ -1357,7 +1362,9 @@ pub fn prove_call_hardened(
 /// (all 105 on chain 15 are 43) proves at 16 to 64 rows and publishes its fetch counts. Flooring it
 /// changes what the chain pins, so it waits for the cut: the hardened prover
 /// ([`prove_call_hardened`]) declares this height and `verify_call_hardened` pins exactly it;
-/// without the flag both keep the record's own height.
+/// without the flag both keep the record's own height. Since constraint set 7 (v0.6.1)
+/// `program_log_height` is itself floored at 2^7 upstream, so this equals it for every length;
+/// kept as the name the hardened rule reads.
 pub fn hardened_program_log_height(len: usize) -> u8 {
     program::program_log_height(len).max(MIN_PRIVATE_TABLE_LOG_HEIGHT)
 }
@@ -1834,19 +1841,23 @@ mod tests {
         assert_eq!(zk.verify_call_hardened(&record, &bound, &binding), public_values, "the binding alone");
     }
 
-    /// PROGRAM-TABLE-LEAK (the INT-1 family's open member): a call's program table is as tall as
-    /// its program needs — 16 rows for fib's 15 words, 64 for every 43-word program on chain 15 —
+    /// PROGRAM-TABLE-LEAK (the INT-1 family's open member): a call's program table was as tall as
+    /// its program needed — 16 rows for fib's 15 words, 64 for every 43-word program on chain 15 —
     /// and a table under 2^7 rows is opened at more points than it has random rows, so its fetch
-    /// counts (the control flow) read off the proof. Under `hardening_v6` the prover declares
-    /// `max(record height, MIN_PRIVATE_TABLE_LOG_HEIGHT)` and the executor pins exactly that; the
-    /// old rule pins the record's own height and refuses the floored proof, and the hardened rule
-    /// refuses an unfloored one.
+    /// counts (the control flow) read off the proof. v0.6 floored it on this side under
+    /// `hardening_v6` (the hardened prover declared `max(record height, 7)` and the executor pinned
+    /// exactly that). Constraint set 7 floors every declared table upstream, so
+    /// `program_log_height` itself is the floor for such a program: the vendored prover and the
+    /// hardened one declare the same height, both rules pin it, and what separates them is only
+    /// the public segment (the binding, INT-4).
     #[test]
     fn program_table_leak_the_hardened_call_floors_the_program_table() {
         use super::*;
         use crate::machine::FriProfile;
         let program = crate::guests::fib(10);
-        assert!(program::program_log_height(program.words.len()) < MIN_PRIVATE_TABLE_LOG_HEIGHT, "a program the leak reaches");
+        assert!(program.words.len() + 1 < 1 << MIN_PRIVATE_TABLE_LOG_HEIGHT, "a program the leak reaches");
+        assert_eq!(program::program_log_height(program.words.len()), MIN_PRIVATE_TABLE_LOG_HEIGHT, "cs7: the floor is upstream's");
+        assert_eq!(hardened_program_log_height(program.words.len()), MIN_PRIVATE_TABLE_LOG_HEIGHT);
         let zk = ZkExecutor::new(FriProfile::Test);
         let record = ProgramRecord {
             id: randprotocol_core::program::program_id(program.base_pc, &program.words),
@@ -1863,12 +1874,14 @@ mod tests {
         assert_eq!(proof.program_log_height, MIN_PRIVATE_TABLE_LOG_HEIGHT, "the hardened prover floors the program table");
         assert!(zk.verify_call_hardened(&record, &bytes, &binding).is_ok(), "and the hardened rule accepts it");
         assert_eq!(non_canonical_proof(&bytes), None, "a floored proof is canonical");
-        let height = ConfidentialError::InvalidProof("program height not the deployed program's".into());
-        assert_eq!(zk.verify_call(&record, &bytes), Err(height.clone()), "the old rule pins the record's own height");
-        // An unfloored proof over the binding (the vendored prover, which declares the record's
-        // height) is refused under the hardened rule on its height alone.
-        let (unfloored, _) = Machine::new(FriProfile::Test).prove_salted(&program, &[], &binding, [0; 4], None).unwrap();
-        assert_eq!(zk.verify_call_hardened(&record, &unfloored.to_bytes(), &binding), Err(height));
+        // The old rule pins the same height now; it refuses the proof on its segment, not its height.
+        let public_values = Err(ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues)));
+        assert_eq!(zk.verify_call(&record, &bytes), public_values, "the old rule checks the empty segment");
+        // The vendored prover over the same segment declares the floored height as well, and the
+        // hardened rule accepts its proof.
+        let (vendored, _) = Machine::new(FriProfile::Test).prove_salted(&program, &[], &binding, [0; 4], None).unwrap();
+        assert_eq!(vendored.program_log_height, MIN_PRIVATE_TABLE_LOG_HEIGHT);
+        assert!(zk.verify_call_hardened(&record, &vendored.to_bytes(), &binding).is_ok());
     }
 
     /// ZKG-1: an output word past 32 bits is refused, never narrowed. `x as u32` of
