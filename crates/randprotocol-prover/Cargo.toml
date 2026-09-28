@@ -44,6 +44,8 @@ qrcode = { version = "0.14", default-features = false, optional = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [[test]]
 name = "service"
@@ -51,6 +53,10 @@ required-features = ["service"]
 
 [[test]]
 name = "http"
+required-features = ["service"]
+
+[[test]]
+name = "hygiene"
 required-features = ["service"]
 
 [[bin]]
