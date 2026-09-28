@@ -110,8 +110,11 @@ async fn an_unknown_guest_profile_or_witness_length_is_bad() {
     j.hc_bundle = [1; 8];
     assert!(matches!(r.svc.submit(&seal_job(&r.ek, &j).unwrap()), Err(Refusal::Bad(_))));
     let mut j = job(r.own_token, WitnessKind::SpendKey);
-    j.profile = "fast".into();
-    assert!(matches!(r.svc.submit(&seal_job(&r.ek, &j).unwrap()), Err(Refusal::Bad(_))));
+    j.profile = "fast\u{1b}[2J".into();
+    match r.svc.submit(&seal_job(&r.ek, &j).unwrap()) {
+        Err(Refusal::Bad(why)) => assert_eq!(why, "unknown fri profile", "the submitter's profile string is never echoed"),
+        other => panic!("{other:?}"),
+    }
     let mut j = job(r.own_token, WitnessKind::SpendKey);
     j.inputs.truncate(10);
     assert!(matches!(r.svc.submit(&seal_job(&r.ek, &j).unwrap()), Err(Refusal::Bad(_))));
@@ -167,6 +170,8 @@ async fn a_done_reply_expires_after_the_ttl_and_cancel_drops_a_queued_job() {
     assert!(r.svc.cancel(&a), "a proving job is cancelled: its reply is dropped when it finishes");
     let s = wait_terminal(&r.svc, &a).await;
     assert!(s.reply.is_none());
+    assert_eq!(s.state, State::Failed);
+    assert_eq!(s.error.as_deref(), Some("cancelled"));
     assert!(r.svc.status("nope").is_none());
 }
 
