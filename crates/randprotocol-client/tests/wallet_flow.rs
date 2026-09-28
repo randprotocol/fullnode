@@ -263,7 +263,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     // slot — a program proof is prover work like any other, and the bundle follows it immediately.
     let slot = proving_slot().await;
     let (proof, outputs, tier, salt) =
-        executor::prove_call(FriProfile::Test, &prog, &inputs, &[], None, Backend::Cpu, call_envelope::FALLBACK_MAX_CALL_INPUT_WORDS)
+        executor::prove_call(FriProfile::Test, &prog, &inputs, &[], None, Backend::Cpu, call_envelope::FALLBACK_MAX_CALL_INPUT_WORDS, None)
             .expect("the call proves");
     let h_in = hash::input_digest(salt, &inputs);
     let (envelope, key) = call_envelope::seal_call_envelope(&a.vk, None, &h_in, salt, &inputs, call_envelope::CallCaps::FALLBACK)
@@ -277,6 +277,7 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
         tier,
         header.keccak_log_height,
         header.sha256_log_height,
+        header.public_values[randprotocol_zkvm::tables::cpu::pv::GAS],
         randprotocol_core::gas::call_bytes(&proof, Some(&envelope)),
     );
     let action = Action::Call { program: pid, proof, input_envelope: Some(envelope) };
@@ -457,7 +458,7 @@ async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
     let inputs = [9u32];
     let slot = proving_slot().await;
     let (proof, outputs, tier, salt) =
-        executor::prove_call(FriProfile::Test, &onchain, &inputs, &fetched, None, Backend::Cpu, caps.max_input_words)
+        executor::prove_call(FriProfile::Test, &onchain, &inputs, &fetched, None, Backend::Cpu, caps.max_input_words, None)
             .expect("the call proves");
     assert_eq!(outputs[0], 1 + 2 + 3 + 4 + 2, "the guest read the deploy-time words");
     wallet::check_proof_size(proof.len(), wallet::proof_cap(Some(&limits))).expect("inside the proof cap");
@@ -469,6 +470,7 @@ async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
         tier,
         header.keccak_log_height,
         header.sha256_log_height,
+        header.public_values[randprotocol_zkvm::tables::cpu::pv::GAS],
         gas::call_bytes(&proof, Some(&envelope)),
     );
     let action = Action::Call { program: pid, proof, input_envelope: Some(envelope) };
@@ -488,10 +490,10 @@ async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
     // And by the chain, when a proof over it is made anyway: its H_PUB is not the program's.
     let slot = proving_slot().await;
     let (proof, _, _, _) =
-        executor::prove_call(FriProfile::Test, &onchain, &inputs, &other, None, Backend::Cpu, caps.max_input_words)
+        executor::prove_call(FriProfile::Test, &onchain, &inputs, &other, None, Backend::Cpu, caps.max_input_words, None)
             .expect("a proof over another public input still proves");
     let header = randprotocol_zkvm::executor::decode_canonical(&proof).expect("the call proof decodes");
-    let fee = wallet::call_fee_default(Some(&limits), tier, header.keccak_log_height, header.sha256_log_height, gas::call_bytes(&proof, None));
+    let fee = wallet::call_fee_default(Some(&limits), tier, header.keccak_log_height, header.sha256_log_height, header.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], gas::call_bytes(&proof, None));
     let action = Action::Call { program: pid, proof, input_envelope: None };
     let refused = wallet::submit(&rpc, &a, &mut store, None, action, fee, Burn::None, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true).await;
     drop(slot);

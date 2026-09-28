@@ -217,7 +217,7 @@ fn prove_call_returns_the_salt_behind_the_proofs_h_in() {
     let program = randprotocol_zkvm::guests::fib(10);
     let inputs = inputs();
     let (bytes, outputs, tier, salt) =
-        prove_call(FriProfile::Test, &program, &inputs, &[], Some(10), Backend::Cpu, FALLBACK_MAX_CALL_INPUT_WORDS).expect("fib proves at tier 10");
+        prove_call(FriProfile::Test, &program, &inputs, &[], Some(10), Backend::Cpu, FALLBACK_MAX_CALL_INPUT_WORDS, None).expect("fib proves at tier 10");
     assert_eq!(tier, 10);
     assert_eq!(outputs[0], 55, "fib(10)");
 
@@ -232,7 +232,7 @@ fn prove_call_returns_the_salt_behind_the_proofs_h_in() {
     assert!(call_envelope_is_faithful(&published, opened_salt, &opened_inputs));
 
     // Two calls never share a salt: the freshness `H_IN`'s hiding rests on.
-    let (_, _, _, salt2) = prove_call(FriProfile::Test, &program, &inputs, &[], Some(10), Backend::Cpu, FALLBACK_MAX_CALL_INPUT_WORDS).unwrap();
+    let (_, _, _, salt2) = prove_call(FriProfile::Test, &program, &inputs, &[], Some(10), Backend::Cpu, FALLBACK_MAX_CALL_INPUT_WORDS, None).unwrap();
     assert_ne!(salt, salt2);
 
     // And the chain-side verifier publishes that same `H_IN` on the call's outcome, which is
@@ -266,6 +266,7 @@ fn prove_call_refuses_an_input_vector_past_the_cap_before_proving() {
         Some(10),
         Backend::Cpu,
         100,
+        None,
     )
     .unwrap_err();
     assert!(err.contains("at most 100 input words"), "{err}");
@@ -285,12 +286,12 @@ fn both_provers_prove_over_the_public_input_they_are_given() {
     };
 
     let (bytes, outputs, _, _) =
-        prove_call(FriProfile::Test, &program, &[], &public, None, Backend::Cpu, FALLBACK_MAX_CALL_INPUT_WORDS)
+        prove_call(FriProfile::Test, &program, &[], &public, None, Backend::Cpu, FALLBACK_MAX_CALL_INPUT_WORDS, None)
             .expect("public_echo proves");
     assert_eq!(outputs[0], 1 + 2 + 3 + 4 + 2);
     assert_eq!(h_pub(&bytes), digest);
 
-    let (bytes, outputs, _) = prove(FriProfile::Test, &program, &[], &public, None, Backend::Cpu).expect("proves");
+    let (bytes, outputs, _) = prove(FriProfile::Test, &program, &[], &public, None, Backend::Cpu, None).expect("proves");
     assert_eq!(outputs[0], 12);
     assert_eq!(h_pub(&bytes), digest);
 }

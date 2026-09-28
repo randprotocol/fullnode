@@ -978,7 +978,7 @@ async fn confidential_call_rides_on_a_bundle() {
     // proof is prover work like any other, and the bundle follows it immediately.
     let slot = proving_slot().await;
     let (proof, outputs, tier) =
-        randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu)
+        randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu, None)
             .expect("the call proves");
     eprintln!("call: tier {tier}, {} proof bytes, outputs {outputs:?}", proof.len());
     let header = randprotocol_zkvm::executor::decode_canonical(&proof).expect("the call proof decodes");
@@ -987,6 +987,7 @@ async fn confidential_call_rides_on_a_bundle() {
         tier,
         header.keccak_log_height,
         header.sha256_log_height,
+        header.public_values[randprotocol_zkvm::tables::cpu::pv::GAS],
         randprotocol_core::gas::call_bytes(&proof, None),
     );
     let called = wallet::submit(
@@ -1622,6 +1623,7 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
             None,
             Backend::Cpu,
             call_envelope::FALLBACK_MAX_CALL_INPUT_WORDS,
+            None,
         )
         .expect("the call proves");
     let h_in = hash::input_digest(salt, &inputs);
@@ -1633,6 +1635,7 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
         tier,
         header.keccak_log_height,
         header.sha256_log_height,
+        header.public_values[randprotocol_zkvm::tables::cpu::pv::GAS],
         randprotocol_core::gas::call_bytes(&proof, Some(&sealed)),
     );
     let called = wallet::submit(

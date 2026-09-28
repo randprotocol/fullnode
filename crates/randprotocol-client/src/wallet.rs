@@ -1716,6 +1716,7 @@ async fn chain_bundle_guest(rpc: &RpcClient) -> Result<Word8> {
             ZkExecutor::known_hc_bundles().map(|h| word8_to_hex(&h)).join(" and ")
         ));
     }
+    check_bundle_gas_limit(rpc.limits().await?.and_then(|l| l.bundle_gas_limit))?;
     Ok(hc)
 }
 
@@ -1858,7 +1859,8 @@ pub async fn submit_bound_call(
         // One decode for the tier and both hash-table heights, off the REAL proof.
         let header = randprotocol_zkvm::executor::decode_canonical(&proof).map_err(|e| anyhow!("the call proof does not decode: {e}"))?;
         let tier = header.tier.0 as u8;
-        refuse_if_under_the_floor(limits, tier, header.keccak_log_height, header.sha256_log_height, &proof, envelope.as_ref(), fee)?;
+        let gas_limit = header.public_values.get(randprotocol_zkvm::tables::cpu::pv::GAS).copied().unwrap_or(0);
+        refuse_if_under_the_floor(limits, tier, header.keccak_log_height, header.sha256_log_height, gas_limit, &proof, envelope.as_ref(), fee)?;
         Ok(proof)
     };
     let spend = Spend { asset: 0, to: None, memo: "", fee, burn_a: 0, burn_r: 0 };
@@ -1870,16 +1872,18 @@ pub async fn submit_bound_call(
 /// one (spec 2026-09-28 §4.1), so an under-quote — a keccak-bearing proof, a raised cap, anything
 /// the pre-price at `main.rs` could not know before the proof existed — is refused here, naming
 /// the floor to retry with.
+#[allow(clippy::too_many_arguments)]
 fn refuse_if_under_the_floor(
     limits: Option<&ChainLimits>,
     tier: u8,
     keccak_log_height: u8,
     sha256_log_height: u8,
+    gas_limit: u64,
     proof: &[u8],
     envelope: Option<&randprotocol_core::types::CallEnvelope>,
     fee: u64,
 ) -> Result<()> {
-    let need = call_fee_default(limits, tier, keccak_log_height, sha256_log_height, gas::call_bytes(proof, envelope));
+    let need = call_floor(limits, tier, keccak_log_height, sha256_log_height, gas_limit, gas::call_bytes(proof, envelope));
     if need > fee {
         return Err(anyhow!(
             "the call proof came out at tier {tier}, {} bytes, whose fee is {} RAND — more than the {} RAND                  the fee bundle was built for; retry with --fee {}",
@@ -2498,10 +2502,101 @@ pub fn deploy_fee_default(action: &Action) -> u64 {
 /// `bytes` is the call's proof plus its input envelope (`gas::call_bytes`); under `limits`'
 /// gas policy every byte prices in (the free allowance is gone), and without one only what is
 /// past `gas::CALL_FREE_BYTES` costs anything, so a call under today's caps pays today's fee.
-pub fn call_fee_default(limits: Option<&ChainLimits>, tier: u8, keccak_log_height: u8, sha256_log_height: u8, bytes: usize) -> u64 {
+///
+/// On a chain whose genesis carries a `gas` section (`limits.gas_circuit`, spec §3.3) the floor
+/// is `gas::circuit_call_floor` of the call's declared `gas_limit` at the served prices — the
+/// header and its heights no longer price it. Under the dynamic controller (`limits.adjust_bps`,
+/// spec §7.1) the default pays one price step of headroom over that floor, so a block that raises
+/// the price before this transaction lands still admits it; `--fee` overrides. `gas_limit` is
+/// ignored everywhere else.
+pub fn call_fee_default(
+    limits: Option<&ChainLimits>,
+    tier: u8,
+    keccak_log_height: u8,
+    sha256_log_height: u8,
+    gas_limit: u64,
+    bytes: usize,
+) -> u64 {
+    with_headroom(limits, call_floor(limits, tier, keccak_log_height, sha256_log_height, gas_limit, bytes))
+}
+
+/// The floor itself, no headroom: what the chain (or the node's policy) refuses a call under.
+/// [`call_fee_default`] is this plus the dynamic headroom; the post-proof guard
+/// ([`refuse_if_under_the_floor`]) compares a fee with this, so a `--fee` that pays the floor
+/// exactly is not refused for lacking headroom the caller chose not to buy.
+pub fn call_floor(
+    limits: Option<&ChainLimits>,
+    tier: u8,
+    keccak_log_height: u8,
+    sha256_log_height: u8,
+    gas_limit: u64,
+    bytes: usize,
+) -> u64 {
+    if let Some(l) = limits.filter(|l| l.gas_circuit) {
+        return gas::circuit_call_floor(l.gas_price.unwrap_or(0), l.byte_price.unwrap_or(0), gas_limit, bytes);
+    }
     match limits.and_then(|l| l.gas_policy()) {
         Some(p) => p.call_floor(tier, keccak_log_height, sha256_log_height, bytes),
         None => gas::BUNDLE_BASE + gas::call_fee(tier, bytes),
+    }
+}
+
+/// Spec §7.1: `floor + ⌊floor·adjust_bps/10 000⌋` under the dynamic controller — the largest move
+/// one block can make — else `floor`. Saturating.
+fn with_headroom(limits: Option<&ChainLimits>, floor: u64) -> u64 {
+    match limits.and_then(|l| l.adjust_bps) {
+        Some(a) => floor.saturating_add(u64::try_from(floor as u128 * a as u128 / 10_000).unwrap_or(u64::MAX)),
+        None => floor,
+    }
+}
+
+/// Spec 2026-09-28 §5, §9: the `GAS_LIMIT` a call declares by default — the dry run's `exact`
+/// gas rounded up to the next multiple of `2^(tier−2)` (four buckets per tier: two bits beyond
+/// what the tier already leaks), capped at the tier's hash-free ceiling `gas_max(tier, 0, 0)`.
+/// A call that hashes has a higher ceiling; [`gas_bucket`] takes it explicitly.
+pub fn default_gas_limit(exact: u64, tier: u8) -> u64 {
+    gas_bucket(exact, tier, gas::gas_max(tier, 0, 0))
+}
+
+/// [`default_gas_limit`] under an explicit `ceiling` (the header's `gas_max`, which a keccak or
+/// sha256 table raises). Never under `exact` while `exact ≤ ceiling`.
+pub fn gas_bucket(exact: u64, tier: u8, ceiling: u64) -> u64 {
+    let step = 1u64 << tier.saturating_sub(2).min(62);
+    exact.div_ceil(step).saturating_mul(step).min(ceiling)
+}
+
+/// The exact gas a call spends and the tier it proves at, from a dry run in the emulator
+/// (`executor::dry_run_call` — `gas::gas_of` over the run's events). `public` is the segment the
+/// proof commits to: the program's public input, followed under `hardening_v6` by
+/// `TX_BINDING_WORDS` zeros. Witness only — the wallet prints it, the chain never sees it.
+pub fn exact_call_gas(program: &randprotocol_zkvm::isa::Program, inputs: &[u32], public: &[u32]) -> Result<(u64, u8)> {
+    let run = randprotocol_zkvm::executor::dry_run_call(program, inputs, public).map_err(|e| anyhow!("the call does not run: {e}"))?;
+    Ok((run.gas, run.tier))
+}
+
+/// `rand call --gas-limit N`: a declared limit under the run's exact gas cannot be proved (the
+/// circuit refuses `gas_at_halt > GAS_LIMIT`), and one over the header's ceiling is refused by
+/// every verifier — both said before minutes of proving, naming the bound.
+pub fn check_gas_limit(declared: u64, exact: u64, ceiling: u64) -> Result<()> {
+    if declared < exact {
+        return Err(anyhow!("--gas-limit {declared} is under this call's exact gas {exact}; declare at least {exact}"));
+    }
+    if declared > ceiling {
+        return Err(anyhow!("--gas-limit {declared} is over this call's ceiling {ceiling} (gas_max of its header); declare at most {ceiling}, or `max`"));
+    }
+    Ok(())
+}
+
+/// Under a `gas` section every bundle declares the chain's `bundle_gas_limit` (spec §4.3), which
+/// is the bundle guest's own ceiling `gas_max(14, 0, 0)` — the prover's default. A chain naming
+/// any other value runs a bundle guest this wallet does not have: refused before proving.
+pub fn check_bundle_gas_limit(bundle_gas_limit: Option<u64>) -> Result<()> {
+    let ours = gas::gas_max(14, 0, 0);
+    match bundle_gas_limit {
+        Some(b) if b != ours => Err(anyhow!(
+            "this chain pins every bundle at {b} gas, but this wallet's bundle guest declares {ours}; update the wallet"
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -6065,14 +6160,14 @@ mod tests {
         let raised = ChainLimits {
             max_program_words: 4096, max_proof_bytes: 20 << 20, max_block_bytes: 24 << 20, max_call_envelope_bytes: 18_432,
             max_program_public_words: 0, envelope_bytes: None, hardening_v6: true,
-            gas_price: None, byte_price: None,
+            gas_price: None, byte_price: None, gas_circuit: false, bundle_gas_limit: None, adjust_bps: None,
         };
         let priced = ChainLimits { gas_price: Some(100), byte_price: Some(800), ..raised };
         assert_eq!(hardened_call_quote_bytes(Some(&raised), 1_000), 1_000, "no policy: the envelope, as before");
         assert_eq!(hardened_call_quote_bytes(None, 0), 0);
         assert_eq!(hardened_call_quote_bytes(Some(&priced), 1_000), (20 << 20) + 1_000, "a policy: the cap in the proof's place");
         // The overcharge the no-policy rule avoids is real: the cap alone is past the free allowance.
-        assert!(call_fee_default(Some(&raised), 14, 0, 0, (20 << 20) + 1_000) > call_fee_default(Some(&raised), 14, 0, 0, 1_000));
+        assert!(call_fee_default(Some(&raised), 14, 0, 0, 0, (20 << 20) + 1_000) > call_fee_default(Some(&raised), 14, 0, 0, 0, 1_000));
     }
 
     #[test]
@@ -6084,16 +6179,16 @@ mod tests {
         let policy = ChainLimits {
             max_program_words: 4096, max_proof_bytes: 2 << 20, max_block_bytes: 4 << 20, max_call_envelope_bytes: 18_432,
             max_program_public_words: 0, envelope_bytes: None, hardening_v6: false,
-            gas_price: Some(100), byte_price: Some(800),
+            gas_price: Some(100), byte_price: Some(800), gas_circuit: false, bundle_gas_limit: None, adjust_bps: None,
         };
         let old = ChainLimits { gas_price: None, byte_price: None, ..policy };
         for tier in [10u8, 12, 14, 20] {
             // Review focus 4: no node, or an old node, prices the ledger's floor, nothing over it.
-            assert_eq!(call_fee_default(None, tier, 0, 0, 0), gas::BUNDLE_BASE + gas::call_fee(tier, 0));
-            assert_eq!(call_fee_default(Some(&old), tier, 0, 0, 1_300_000), gas::BUNDLE_BASE + gas::call_fee(tier, 1_300_000));
+            assert_eq!(call_fee_default(None, tier, 0, 0, 0, 0), gas::BUNDLE_BASE + gas::call_fee(tier, 0));
+            assert_eq!(call_fee_default(Some(&old), tier, 0, 0, 0, 1_300_000), gas::BUNDLE_BASE + gas::call_fee(tier, 1_300_000));
             // Under a policy: its floor of the header, exactly.
-            assert_eq!(call_fee_default(Some(&policy), tier, 0, 0, 1_300_000), GasPolicy::DEFAULT.call_floor(tier, 0, 0, 1_300_000));
-            assert_eq!(call_fee_default(Some(&policy), tier, 12, 13, 3_200_000), GasPolicy::DEFAULT.call_floor(tier, 12, 13, 3_200_000));
+            assert_eq!(call_fee_default(Some(&policy), tier, 0, 0, 0, 1_300_000), GasPolicy::DEFAULT.call_floor(tier, 0, 0, 1_300_000));
+            assert_eq!(call_fee_default(Some(&policy), tier, 12, 13, 0, 3_200_000), GasPolicy::DEFAULT.call_floor(tier, 12, 13, 3_200_000));
         }
         // A burn pays the bridge fee, the schedule's floor for it.
         let burn = Action::BridgeBurn {
@@ -6437,6 +6532,9 @@ mod tests {
             hardening_v6: false,
             gas_price: None,
             byte_price: None,
+            gas_circuit: false,
+            bundle_gas_limit: None,
+            adjust_bps: None,
         }
     }
 
@@ -6700,13 +6798,113 @@ mod tests {
             hardening_v6: true,
             gas_price: Some(100),
             byte_price: Some(800),
+            gas_circuit: false,
+            bundle_gas_limit: None,
+            adjust_bps: None,
         };
         let want = GasPolicy::DEFAULT.call_floor(tier, 0, 0, bytes);
         assert!(want > ledger_floor, "the policy floor must exceed the ledger floor for this test to say anything");
-        let e = refuse_if_under_the_floor(Some(&policy), tier, 0, 0, &proof, None, ledger_floor).unwrap_err().to_string();
+        let e = refuse_if_under_the_floor(Some(&policy), tier, 0, 0, 0, &proof, None, ledger_floor).unwrap_err().to_string();
         assert!(e.contains(&format_amount(want)), "{e}");
         // The same fee, no policy at all: the old rule, unchanged.
-        assert!(refuse_if_under_the_floor(None, tier, 0, 0, &proof, None, ledger_floor).is_ok());
+        assert!(refuse_if_under_the_floor(None, tier, 0, 0, 0, &proof, None, ledger_floor).is_ok());
+    }
+
+    // ---------------------------------------------------- the declared gas limit (B5, B7)
+
+    fn circuit_limits(adjust_bps: Option<u32>) -> ChainLimits {
+        ChainLimits {
+            gas_price: Some(100),
+            byte_price: Some(800),
+            gas_circuit: true,
+            bundle_gas_limit: Some(gas::gas_max(14, 0, 0)),
+            adjust_bps,
+            ..limits(18_432, 2 << 20)
+        }
+    }
+
+    /// Spec §5: the exact gas rounded up to a multiple of `2^(t−2)`, four buckets a tier, capped
+    /// at the tier's own ceiling.
+    #[test]
+    fn the_wallet_declares_a_quarter_tier_bucket() {
+        assert_eq!(default_gas_limit(1, 10), 256);
+        assert_eq!(default_gas_limit(256, 10), 256);
+        assert_eq!(default_gas_limit(257, 10), 512);
+        assert_eq!(default_gas_limit(1_000, 10), 1_023, "capped at the tier's own ceiling");
+        // 2^14 steps at tier 16 (the brief's 40 960 is not a multiple of 2^14; see the report).
+        assert_eq!(default_gas_limit(38_412, 16), 49_152);
+        assert_eq!(default_gas_limit(60_000, 16), 65_535, "capped at gas_max(16, 0, 0)");
+        // A hashing call's ceiling is its header's, not the hash-free one.
+        let ceiling = gas::gas_max(10, 7, 0);
+        assert_eq!(gas_bucket(1_500, 10, ceiling), 1_536);
+        for exact in [1u64, 255, 256, 257, 700, 1_023] {
+            assert!(default_gas_limit(exact, 10) >= exact, "never under the exact gas");
+        }
+    }
+
+    #[test]
+    fn a_declared_limit_outside_the_run_and_the_ceiling_is_refused_naming_the_bound() {
+        assert!(check_gas_limit(500, 500, 1_023).is_ok());
+        assert!(check_gas_limit(1_023, 500, 1_023).is_ok());
+        let e = check_gas_limit(499, 500, 1_023).unwrap_err().to_string();
+        assert!(e.contains("exact gas 500"), "{e}");
+        let e = check_gas_limit(1_024, 500, 1_023).unwrap_err().to_string();
+        assert!(e.contains("ceiling 1023"), "{e}");
+    }
+
+    /// Under a `gas` section the default is the declared limit's floor, whatever the header.
+    #[test]
+    fn the_circuit_fee_is_the_declared_limits_floor() {
+        let l = circuit_limits(None);
+        for (tier, klh, slh) in [(10u8, 0u8, 0u8), (12, 0, 0), (14, 12, 13)] {
+            assert_eq!(call_fee_default(Some(&l), tier, klh, slh, 3_000, 1_300_000), gas::circuit_call_floor(100, 800, 3_000, 1_300_000));
+        }
+        assert!(call_fee_default(Some(&l), 12, 0, 0, 3_000, 0) < call_fee_default(Some(&l), 12, 0, 0, 4_000, 0), "the limit prices it");
+        // Without the section, the gas limit is ignored (Phase 0's header rule).
+        let header = ChainLimits { gas_circuit: false, bundle_gas_limit: None, ..l };
+        assert_eq!(call_fee_default(Some(&header), 12, 0, 0, 3_000, 1_300_000), call_fee_default(Some(&header), 12, 0, 0, 9, 1_300_000));
+        // The post-proof guard prices the proof's own declared limit.
+        let proof = vec![0u8; 1_300_000];
+        let floor = gas::circuit_call_floor(100, 800, 3_000, gas::call_bytes(&proof, None));
+        assert!(refuse_if_under_the_floor(Some(&l), 12, 0, 0, 3_000, &proof, None, floor).is_ok());
+        let e = refuse_if_under_the_floor(Some(&l), 12, 0, 0, 3_001, &proof, None, floor).unwrap_err().to_string();
+        assert!(e.contains(&format_amount(floor + 100)), "{e}");
+    }
+
+    /// Spec §7.1 (task B7): one price step of headroom under `dynamic`, none otherwise; the guard
+    /// still accepts a `--fee` of the bare floor.
+    #[test]
+    fn the_wallet_pays_one_price_step_of_headroom_under_dynamic_prices() {
+        let fixed = circuit_limits(None);
+        let dynamic = circuit_limits(Some(1_250));
+        let floor = gas::circuit_call_floor(100, 800, 3_000, 1_300_000);
+        assert_eq!(call_fee_default(Some(&fixed), 12, 0, 0, 3_000, 1_300_000), floor);
+        assert_eq!(call_fee_default(Some(&dynamic), 12, 0, 0, 3_000, 1_300_000), floor + floor * 1_250 / 10_000);
+        assert_eq!(call_floor(Some(&dynamic), 12, 0, 0, 3_000, 1_300_000), floor, "the floor itself carries no headroom");
+        let proof = vec![0u8; 1_300_000];
+        let exact = gas::circuit_call_floor(100, 800, 3_000, gas::call_bytes(&proof, None));
+        assert!(refuse_if_under_the_floor(Some(&dynamic), 12, 0, 0, 3_000, &proof, None, exact).is_ok());
+        assert_eq!(call_fee_default(Some(&ChainLimits { adjust_bps: Some(5_000), ..dynamic }), 12, 0, 0, u64::MAX, 0), u64::MAX, "saturating");
+    }
+
+    #[test]
+    fn exact_call_gas_is_the_emulators_gas_of() {
+        let p = randprotocol_zkvm::guests::fib(10);
+        let (g, tier) = exact_call_gas(&p, &[], &[]).unwrap();
+        let exec = randprotocol_zkvm::emulator::execute(&p, &[], &[], 1 << 22).unwrap();
+        assert_eq!(g, randprotocol_zkvm::gas::gas_of(&p, &[], &[], &exec.events));
+        assert_eq!(tier, randprotocol_zkvm::executor::call_tier(&p, &[], 0).unwrap());
+        // The segment length is part of the digest prefix, so it is part of the gas.
+        let (padded, _) = exact_call_gas(&p, &[], &[0; 8]).unwrap();
+        assert!(padded > g);
+    }
+
+    #[test]
+    fn a_bundle_gas_limit_other_than_the_guests_ceiling_is_refused() {
+        assert!(check_bundle_gas_limit(None).is_ok());
+        assert!(check_bundle_gas_limit(Some(16_383)).is_ok());
+        let e = check_bundle_gas_limit(Some(16_384)).unwrap_err().to_string();
+        assert!(e.contains("16384") && e.contains("16383"), "{e}");
     }
 
 }

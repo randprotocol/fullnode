@@ -22,7 +22,7 @@ fn record(p: &randprotocol_zkvm::isa::Program) -> ProgramRecord {
 /// One proof shared by every test (proving takes ~20 s).
 fn shared() -> &'static (Vec<u8>, [u32; 8], u8) {
     static P: OnceLock<(Vec<u8>, [u32; 8], u8)> = OnceLock::new();
-    P.get_or_init(|| prove(FriProfile::Test, &guests::private_payment(1000), &[400, 250, 300, 75], &[], None, Backend::Cpu).unwrap())
+    P.get_or_init(|| prove(FriProfile::Test, &guests::private_payment(1000), &[400, 250, 300, 75], &[], None, Backend::Cpu, None).unwrap())
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn zh4_rejects_a_program_that_wraps_the_u32_pc_space() {
 
 #[test]
 fn private_payment_emits_no_transfer_below_threshold() {
-    let (_, outputs, _) = prove(FriProfile::Test, &guests::private_payment(2000), &[400, 250, 300, 75], &[], None, Backend::Cpu).unwrap();
+    let (_, outputs, _) = prove(FriProfile::Test, &guests::private_payment(2000), &[400, 250, 300, 75], &[], None, Backend::Cpu, None).unwrap();
     assert_eq!(outputs, [0; 8]);
 }
 
@@ -113,7 +113,7 @@ fn private_payment_emits_no_transfer_below_threshold() {
 fn prove_takes_a_backend_and_cpu_is_unchanged() {
     let p = guests::private_payment(1000);
     let (proof, outputs, tier) =
-        prove(FriProfile::Test, &p, &[400, 250, 300, 75], &[], None, randprotocol_zkvm::machine::Backend::Cpu).unwrap();
+        prove(FriProfile::Test, &p, &[400, 250, 300, 75], &[], None, randprotocol_zkvm::machine::Backend::Cpu, None).unwrap();
     let ex = ZkExecutor::new(FriProfile::Test);
     let out = ex.verify_call(&record(&p), &proof).unwrap();
     assert_eq!((out.outputs, out.tier), (outputs, tier));
@@ -503,4 +503,35 @@ fn concurrent_warms_never_build_in_parallel() {
         s.spawn(|| ex.warm_bundle());
     });
     assert_eq!(ex.peak_concurrent_warms(), 1, "two warm-ups ran their key builds at once");
+}
+
+/// Constraint set 8 (spec 2026-09-28 §3.2, §9, task B5): the wallet declares its own limit. A
+/// call proved with `gas_limit: Some(exact + 5)` publishes exactly that in `pv::GAS`, and the
+/// chain's verifier reads it back as `CallOutcome::gas_limit` — the value the ledger charges.
+/// `exact` is the dry run's (`dry_run_call`), which is `gas::gas_of` over the emulator's run.
+#[test]
+fn a_call_proved_with_a_declared_limit_publishes_exactly_it() {
+    use randprotocol_zkvm::executor::{dry_run_call, prove_call};
+    use randprotocol_zkvm::tables::cpu::pv;
+    let p = guests::private_payment(1000);
+    let inputs = [400, 250, 300, 75];
+    let run = dry_run_call(&p, &inputs, &[]).unwrap();
+    let exec = randprotocol_zkvm::emulator::execute(&p, &inputs, &[], 1 << 22).unwrap();
+    assert_eq!(run.gas, randprotocol_zkvm::gas::gas_of(&p, &inputs, &[], &exec.events), "the dry run's gas is gas_of");
+    let (bytes, _, tier, _) = prove_call(
+        FriProfile::Test,
+        &p,
+        &inputs,
+        &[],
+        None,
+        Backend::Cpu,
+        randprotocol_zkvm::call_envelope::FALLBACK_MAX_CALL_INPUT_WORDS,
+        Some(run.gas + 5),
+    )
+    .unwrap();
+    assert_eq!(tier, run.tier, "the dry run picks the prover's tier");
+    let proof = randprotocol_zkvm::executor::decode_canonical(&bytes).unwrap();
+    assert_eq!(proof.public_values[pv::GAS], run.gas + 5);
+    let out = ZkExecutor::new(FriProfile::Test).verify_call(&record(&p), &bytes).unwrap();
+    assert_eq!(out.gas_limit, run.gas + 5, "the chain charges the declared limit");
 }

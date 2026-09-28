@@ -221,7 +221,14 @@ enum Cmd {
         /// Force a gas tier (10, 12, ..., 20); default: smallest that fits.
         #[arg(long)]
         tier: Option<u8>,
-        /// Fee in RAND; default: the schedule minimum for the tier.
+        /// The gas limit the proof declares, `N` or `max` (spec 2026-09-28 §5): what a chain with
+        /// a gas section charges, and an upper bound on the run anyone can read. Default there:
+        /// the exact gas rounded up to a quarter of the tier; `max` declares the header's ceiling
+        /// and leaks nothing the tier does not. Elsewhere the default is `max` (it buys nothing).
+        #[arg(long)]
+        gas_limit: Option<String>,
+        /// Fee in RAND; default: the floor for the declared gas (or, without a gas section, the
+        /// tier), plus one price step of headroom where prices move.
         #[arg(long)]
         fee: Option<String>,
         /// Also seal the transcript to this `rand1…` address, which can then open this one call.
@@ -375,6 +382,10 @@ enum Cmd {
         /// `call`: the proof's declared hash-table heights, 0 = none.
         #[arg(long)]
         sha256_log_height: Option<u8>,
+        /// `call`: the gas limit the proof declares — required on a chain with a gas section,
+        /// which prices it (`rand call` prints it before proving).
+        #[arg(long)]
+        gas: Option<u64>,
     },
     /// Look up a transaction by hash.
     Tx { hash: String },
@@ -911,6 +922,63 @@ fn proving_for(prover: bool, cuda: bool, key: &Path) -> Result<Proving> {
     Ok(Proving::Remote(std::sync::Arc::new(RemoteProver::new(paired))))
 }
 
+/// `rand call --gas-limit`, parsed: absent, `max`, or a number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GasArg {
+    Default,
+    Max,
+    Exactly(u64),
+}
+
+fn parse_gas_limit(arg: Option<&str>) -> Result<GasArg> {
+    match arg {
+        None => Ok(GasArg::Default),
+        Some("max") => Ok(GasArg::Max),
+        Some(n) => n.parse().map(GasArg::Exactly).map_err(|_| anyhow!("--gas-limit takes a whole number of gas or `max`, not {n:?}")),
+    }
+}
+
+/// What a call declares, from its dry run (spec 2026-09-28 §5, §9): `(the prover's gas_limit,
+/// the gas the fee is priced at before proving)`. `None` proves under the header's own ceiling
+/// (`max`, and the default on a chain without a gas section, where the limit buys nothing and
+/// would only leak); the default under a section is the quarter-tier bucket over the exact gas.
+/// Prints `gas: <exact> (declaring <limit>, tier <t>)` before any proving, and refuses a limit
+/// under the exact gas or over the ceiling, naming the bound.
+fn resolve_gas_limit(
+    arg: GasArg,
+    run: &executor::CallDryRun,
+    tier: u8,
+    limits: Option<&randprotocol_client::ChainLimits>,
+) -> Result<(Option<u64>, u64)> {
+    let ceiling = gas::gas_max(tier, run.keccak_log_height, run.sha256_log_height);
+    if run.gas > ceiling {
+        anyhow::bail!("this call spends {} gas, over tier {tier}'s ceiling {ceiling}; drop --tier or raise it", run.gas);
+    }
+    let section = limits.is_some_and(|l| l.gas_circuit);
+    let declare = match arg {
+        GasArg::Max => None,
+        GasArg::Default if !section => None,
+        GasArg::Default => Some(wallet::gas_bucket(run.gas, tier, ceiling)),
+        GasArg::Exactly(n) => {
+            wallet::check_gas_limit(n, run.gas, ceiling)?;
+            Some(n)
+        }
+    };
+    let priced = declare.unwrap_or(ceiling);
+    eprintln!("gas: {} (declaring {priced}, tier {tier})", run.gas);
+    Ok((declare, priced))
+}
+
+/// The fee line's suffix under the dynamic controller: the default pays one price step over the
+/// tip's floor (spec §7.1).
+fn headroom_note(limits: Option<&randprotocol_client::ChainLimits>) -> &'static str {
+    if limits.and_then(|l| l.adjust_bps).is_some() {
+        " (incl. one price step of headroom)"
+    } else {
+        ""
+    }
+}
+
 /// The summary line, printed. The wording lives in [`Submission::summary`], where a test can read
 /// it back.
 fn report(s: &Submission, what: &str) {
@@ -1435,7 +1503,8 @@ async fn main() -> Result<()> {
                 None => println!("unknown program"),
             }
         }
-        Cmd::Call { program, inputs, expect_public, tier, fee, auditor, no_envelope, print_call_key, cuda } => {
+        Cmd::Call { program, inputs, expect_public, tier, gas_limit, fee, auditor, no_envelope, print_call_key, cuda } => {
+            let gas_arg = parse_gas_limit(gas_limit.as_deref())?;
             if no_envelope && (auditor.is_some() || print_call_key) {
                 anyhow::bail!("--no-envelope publishes no transcript, so there is no auditor and no call key");
             }
@@ -1487,10 +1556,14 @@ async fn main() -> Result<()> {
                 // The program's public input, then the binding (issue #55: a program with one is
                 // bound too).
                 let segment_words = public.len() + randprotocol_core::types::TX_BINDING_WORDS;
-                let tier = match tier {
-                    Some(t) => t,
-                    None => executor::call_tier(&prog, &inputs, segment_words).map_err(|e| anyhow::anyhow!(e))?,
-                };
+                let mut segment = public.clone();
+                segment.resize(segment_words, 0);
+                let run = executor::dry_run_call(&prog, &inputs, &segment).map_err(|e| anyhow::anyhow!("the call does not run: {e}"))?;
+                let tier = tier.unwrap_or(run.tier);
+                // The limit is fixed here, before proving, because the fee is (the binding covers
+                // the fee bundle). `max` proves with `None` — the real header's ceiling — and is
+                // priced at the dry run's; the guard after proving re-prices the real one.
+                let (declare, priced_gas) = resolve_gas_limit(gas_arg, &run, tier, limits.as_ref())?;
                 let salt = executor::fresh_call_salt();
                 let (envelope, call_key) = if no_envelope {
                     (None, None)
@@ -1515,12 +1588,16 @@ async fn main() -> Result<()> {
                 let bytes = wallet::hardened_call_quote_bytes(limits.as_ref(), envelope.as_ref().map_or(0, |e| e.len()));
                 let fee = match fee {
                     Some(f) => parse_amount(&f)?,
-                    None => wallet::call_fee_default(limits.as_ref(), tier, 0, 0, bytes),
+                    None => wallet::call_fee_default(limits.as_ref(), tier, 0, 0, priced_gas, bytes),
                 };
+                if limits.as_ref().is_some_and(|l| l.gas_circuit) {
+                    eprintln!("fee {} RAND{}", format_amount(fee), headroom_note(limits.as_ref()));
+                }
                 let prove = |binding: &[u32; randprotocol_core::types::TX_BINDING_WORDS]| -> Result<Vec<u8>> {
                     let t = std::time::Instant::now();
                     let (proof, outputs, tier) =
-                        executor::prove_call_hardened(profile, &prog, &inputs, &public, binding, salt, Some(tier)).map_err(|e| anyhow::anyhow!(e))?;
+                        executor::prove_call_hardened(profile, &prog, &inputs, &public, binding, salt, Some(tier), declare)
+                            .map_err(|e| anyhow::anyhow!(e))?;
                     eprintln!("proved in {:.1?}: tier {tier}, {} bytes, outputs {outputs:?}", t.elapsed(), proof.len());
                     wallet::check_proof_size(proof.len(), cap)?;
                     Ok(proof)
@@ -1530,6 +1607,8 @@ async fn main() -> Result<()> {
                     wallet::submit_bound_call(&rpc, &w, &mut store, action, fee, &prove, limits.as_ref(), profile, &proving, chain_id, true).await;
                 (s, call_key)
             } else {
+                let run = executor::dry_run_call(&prog, &inputs, &public).map_err(|e| anyhow::anyhow!("the call does not run: {e}"))?;
+                let (declare, _) = resolve_gas_limit(gas_arg, &run, tier.unwrap_or(run.tier), limits.as_ref())?;
                 let t = std::time::Instant::now();
                 // Two provers, one difference: `prove_call` returns the `H_IN` salt as well, which is
                 // what the transcript is sealed with. It is CPU-only — every other backend draws that
@@ -1537,11 +1616,12 @@ async fn main() -> Result<()> {
                 // and says so in its own words rather than being quietly downgraded here.
                 let (proof, outputs, tier, envelope, call_key) = if no_envelope {
                     let (proof, outputs, tier) =
-                        executor::prove(profile, &prog, &inputs, &public, tier, backend).map_err(|e| anyhow::anyhow!(e))?;
+                        executor::prove(profile, &prog, &inputs, &public, tier, backend, declare).map_err(|e| anyhow::anyhow!(e))?;
                     (proof, outputs, tier, None, None)
                 } else {
                     let (proof, outputs, tier, salt) =
-                        executor::prove_call(profile, &prog, &inputs, &public, tier, backend, caps.max_input_words).map_err(|e| anyhow::anyhow!(e))?;
+                        executor::prove_call(profile, &prog, &inputs, &public, tier, backend, caps.max_input_words, declare)
+                            .map_err(|e| anyhow::anyhow!(e))?;
                     let h_in = hash::input_digest(salt, &inputs);
                     let (e, key) = call_envelope::seal_call_envelope(&w.vk, auditor.as_ref(), &h_in, salt, &inputs, caps)
                         .map_err(|e| anyhow::anyhow!(e))?;
@@ -1558,16 +1638,20 @@ async fn main() -> Result<()> {
                 let header = randprotocol_zkvm::executor::decode_canonical(&proof).map_err(|e| anyhow::anyhow!("{e:?}"))?;
                 let (klh, slh) = (header.keccak_log_height, header.sha256_log_height);
                 let gas_bound = gas::gas_max(tier, klh, slh);
-                let floor = wallet::call_fee_default(limits.as_ref(), tier, klh, slh, bytes);
+                // Constraint set 8: the limit the proof declares (`pv::GAS`), what a gas section
+                // charges — read off the proof itself, so `max` prices the real header's ceiling.
+                let declared = header.public_values.get(randprotocol_zkvm::tables::cpu::pv::GAS).copied().unwrap_or(gas_bound);
+                let floor = wallet::call_fee_default(limits.as_ref(), tier, klh, slh, declared, bytes);
                 let fee = match fee {
                     Some(f) => parse_amount(&f)?,
                     None => floor,
                 };
                 eprintln!(
-                    "gas bound {gas_bound} (tier {tier}{}{}), {bytes} bytes, fee {} RAND",
+                    "gas bound {gas_bound} (tier {tier}{}{}), declared {declared}, {bytes} bytes, fee {} RAND{}",
                     if klh > 0 { format!(", keccak 2^{klh}") } else { String::new() },
                     if slh > 0 { format!(", sha256 2^{slh}") } else { String::new() },
-                    format_amount(fee)
+                    format_amount(fee),
+                    headroom_note(limits.as_ref())
                 );
                 let action = Action::Call { program: pid, proof, input_envelope: envelope };
                 let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, &proving, chain_id, true).await;
@@ -2123,7 +2207,10 @@ async fn main() -> Result<()> {
                 None => println!("no receipt (not a call, or not yet committed)"),
             }
         }
-        Cmd::Fee { kind, n, public_words, bytes, keccak_log_height, sha256_log_height } => {
+        Cmd::Fee { kind, n, public_words, bytes, keccak_log_height, sha256_log_height, gas } => {
+            if gas.is_some() && kind != "call" {
+                anyhow::bail!("--gas is for `fee call`");
+            }
             if public_words.is_some() && kind != "deploy" {
                 anyhow::bail!("--public-words is for `fee deploy`");
             }
@@ -2155,6 +2242,17 @@ async fn main() -> Result<()> {
                     }
                     if let Some(s) = sha256_log_height {
                         obj.insert("sha256_log_height".to_string(), serde_json::json!(s));
+                    }
+                    // Spec §3.3, §9: a chain with a gas section prices the declared limit and its
+                    // node refuses an estimate without one (-32602); say so here instead.
+                    match gas {
+                        Some(g) => {
+                            obj.insert("gas".to_string(), serde_json::json!(g));
+                        }
+                        None if rpc.limits().await?.is_some_and(|l| l.gas_circuit) => anyhow::bail!(
+                            "this chain prices a call by the gas its proof declares: pass --gas <N> (`rand call` prints it before proving)"
+                        ),
+                        None => {}
                     }
                     spec
                 }
