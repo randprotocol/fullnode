@@ -1,6 +1,7 @@
 //! Limits and the v0 fee schedule for the shielded pool and confidential computation.
 
 use crate::types::Action;
+use serde::{Deserialize, Serialize};
 
 /// Largest program, in 32-bit words (16 KiB of code), on a chain whose genesis file does not set
 /// `max_program_words` — every chain cut before v0.4, chain 12 included. The ledger holds the cap
@@ -137,6 +138,64 @@ pub fn call_fee(tier: u8, bytes: usize) -> u64 {
 /// its own cap measures it (`proof.len()`, [`crate::types::CallEnvelope::len`]).
 pub fn call_bytes(proof: &[u8], envelope: Option<&crate::types::CallEnvelope>) -> usize {
     proof.len() + envelope.map_or(0, |e| e.len())
+}
+
+/// Spec 2026-09-28 §3.1: what a `KECCAK` row costs in gas — its cpu row plus the 32 keccak-table
+/// rows (2 612 columns) and 100 memory rows it pulls in, ≈ 189 cycle-equivalents, rounded up.
+pub const KECCAK_GAS: u64 = 192;
+/// Its sha256 twin: one row plus 64 rows of 466 columns, ≈ 66 cycle-equivalents, rounded down
+/// to the block size.
+pub const SHA256_GAS: u64 = 64;
+/// Spec §3.3: the default price of one gas, 10⁻⁷ RAND.
+pub const GAS_PRICE_DEFAULT: u64 = 100;
+/// Spec §3.3: the default price of one KiB of call proof and envelope, from byte 0 — a bare
+/// 1.25 MB proof is ≈ 1 000 000 units, today's `CALL_BASE` under another name.
+pub const BYTE_PRICE_DEFAULT: u64 = 800;
+
+/// The gas no run under this proof header can exceed (spec §3.2): the tier's cycle budget, plus
+/// `KECCAK_GAS − 1` for every permutation the declared keccak table could hold (one 32-row block
+/// each, `0` = no table) and `SHA256_GAS − 1` for every compression of the sha256 table (64-row
+/// blocks). Phase 0 charges exactly this; Phase 1's in-circuit meter charges a declared limit at
+/// or under it.
+pub fn gas_max(tier: u8, keccak_log_height: u8, sha256_log_height: u8) -> u64 {
+    let tier = tier.clamp(MIN_TIER, MAX_TIER);
+    let cycles = (1u64 << tier) - 1;
+    let blocks = |log_height: u8, block: u64| if log_height == 0 { 0 } else { (1u64 << log_height.min(40)) / block };
+    cycles
+        .saturating_add(blocks(keccak_log_height, 32).saturating_mul(KECCAK_GAS - 1))
+        .saturating_add(blocks(sha256_log_height, 64).saturating_mul(SHA256_GAS - 1))
+}
+
+/// A node's gas prices (spec §4.1, Phase 0): admission policy, not a ledger rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GasPolicy {
+    /// Units per gas.
+    pub gas_price: u64,
+    /// Units per KiB (or part) of call proof plus input envelope, from byte 0.
+    pub byte_price: u64,
+}
+
+impl GasPolicy {
+    pub const DEFAULT: GasPolicy = GasPolicy { gas_price: GAS_PRICE_DEFAULT, byte_price: BYTE_PRICE_DEFAULT };
+
+    /// The policy two prices name, or `None` — no policy at all — when both are zero.
+    pub fn from_prices(gas_price: u64, byte_price: u64) -> Option<GasPolicy> {
+        (gas_price != 0 || byte_price != 0).then_some(GasPolicy { gas_price, byte_price })
+    }
+
+    /// `BUNDLE_BASE + gas_price·gas + byte_price·⌈bytes/1024⌉`, saturating.
+    pub fn gas_floor(&self, gas: u64, bytes: usize) -> u64 {
+        let kib = bytes.div_ceil(1024) as u64;
+        BUNDLE_BASE.saturating_add(self.gas_price.saturating_mul(gas)).saturating_add(self.byte_price.saturating_mul(kib))
+    }
+
+    /// What a call with this proof header and these bytes must pay under this policy: the gas
+    /// floor over [`gas_max`], but never under the ledger's own `BUNDLE_BASE + call_fee` — the
+    /// validity rule this policy sits above.
+    pub fn call_floor(&self, tier: u8, keccak_log_height: u8, sha256_log_height: u8, bytes: usize) -> u64 {
+        let ledger = BUNDLE_BASE.saturating_add(call_fee(tier, bytes));
+        ledger.max(self.gas_floor(gas_max(tier, keccak_log_height, sha256_log_height), bytes))
+    }
 }
 
 /// The floor a bundle must pay before the action's proof is verified. A call's tier-dependent
@@ -381,6 +440,65 @@ mod tests {
         assert_eq!(call_bytes(&[0; 500], None), 500);
         assert_eq!(call_bytes(&[0; 500], Some(&e)), 500 + e.len());
         assert_eq!(call_bytes(&[], Some(&e)), 1248);
+    }
+
+    /// Spec 2026-09-28 §3.2: the ceiling a proof header implies — the tier's cycle budget plus
+    /// the weight of every permutation and compression the declared hash tables could hold.
+    #[test]
+    fn gas_max_is_the_headers_ceiling() {
+        assert_eq!(gas_max(10, 0, 0), 1_023);
+        assert_eq!(gas_max(20, 0, 0), 1_048_575);
+        // One keccak block (2^5 rows = 1 permutation) adds KECCAK_GAS − 1 beyond its cycle.
+        assert_eq!(gas_max(10, 5, 0), 1_023 + 191);
+        // One sha256 block (2^6 rows = 1 compression) adds SHA256_GAS − 1.
+        assert_eq!(gas_max(10, 0, 6), 1_023 + 63);
+        // The call caps: tier 14, keccak 2^12 (128 perms), sha256 2^13 (128 comps).
+        assert_eq!(gas_max(14, 12, 13), 16_383 + 128 * 191 + 128 * 63);
+        // Below MIN_TIER clamps up; above MAX_TIER clamps down.
+        assert_eq!(gas_max(0, 0, 0), gas_max(10, 0, 0));
+        assert_eq!(gas_max(99, 0, 0), gas_max(20, 0, 0));
+    }
+
+    /// Spec §3.3's calibration table, base included, and the rule that the policy floor never
+    /// undercuts the ledger's validity floor.
+    #[test]
+    fn the_policy_floor_is_the_larger_of_the_two_floors() {
+        let p = GasPolicy::DEFAULT;
+        // tier-10 fib-sized, 1.30 MB: bytes 1 270 KiB · 800 = 1 016 000, gas 1 023 · 100.
+        assert_eq!(p.call_floor(10, 0, 0, 1_300_000), BUNDLE_BASE + 102_300 + 1_016_000);
+        // tier 20, 1.45 MB: 1 048 575 · 100 + 1 417 KiB · 800 (1 450 000 B is 16 B into its
+        // 1 417th KiB, so the "or part of one" rule rounds up from 1 450 000 / 1024 = 1416.015625).
+        assert_eq!(p.call_floor(20, 0, 0, 1_450_000), BUNDLE_BASE + 104_857_500 + 1_133_600);
+        // A 32 MiB proof at tier 10: the old schedule's byte term is the higher floor.
+        let big = 32 << 20;
+        let old = BUNDLE_BASE + call_fee(10, big);
+        assert!(p.gas_floor(gas_max(10, 0, 0), big) < old);
+        assert_eq!(p.call_floor(10, 0, 0, big), old);
+        // Zero bytes still pays the base and the gas.
+        assert_eq!(p.gas_floor(1, 0), BUNDLE_BASE + 100);
+        // Every call at every tier pays at least the old floor.
+        for tier in [10u8, 12, 14, 16, 18, 20] {
+            for bytes in [0usize, 1_300_000, 3_200_000, 8 << 20] {
+                assert!(p.call_floor(tier, 0, 0, bytes) >= BUNDLE_BASE + call_fee(tier, bytes), "tier {tier} {bytes} B");
+            }
+        }
+    }
+
+    #[test]
+    fn from_prices_is_none_only_when_both_are_zero() {
+        assert_eq!(GasPolicy::from_prices(0, 0), None);
+        assert_eq!(GasPolicy::from_prices(100, 0), Some(GasPolicy { gas_price: 100, byte_price: 0 }));
+        assert_eq!(GasPolicy::from_prices(0, 800), Some(GasPolicy { gas_price: 0, byte_price: 800 }));
+        assert_eq!(GasPolicy::from_prices(100, 800), Some(GasPolicy::DEFAULT));
+    }
+
+    /// Review focus 5: the largest header times the largest price saturates, never wraps.
+    #[test]
+    fn the_policy_saturates() {
+        let p = GasPolicy { gas_price: u64::MAX, byte_price: u64::MAX };
+        assert_eq!(p.gas_floor(gas_max(20, 20, 20), usize::MAX), u64::MAX);
+        assert_eq!(p.call_floor(20, 20, 20, usize::MAX), u64::MAX);
+        assert_eq!(gas_max(20, 255, 255), gas_max(20, 40, 40), "a height past 40 is clamped");
     }
 }
 
