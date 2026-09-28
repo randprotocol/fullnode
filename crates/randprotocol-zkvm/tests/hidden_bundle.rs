@@ -750,7 +750,7 @@ fn a_v3_witness_with_another_keys_nk_taints() {
 
 /// The v3 builder refuses an input not owned by `vk.pk()`, as v1's does for `sk`.
 #[test]
-#[should_panic(expected = "input 2 is not owned by this spend key")]
+#[should_panic(expected = "input 2 is not owned by this viewing key")]
 fn the_v3_builder_refuses_an_input_owned_by_another_key() {
     let mut c = rand_only();
     c.ins[2].0.pk = [1; 8];

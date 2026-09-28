@@ -177,17 +177,18 @@ pub fn hidden_bundle_inputs(
     asset_a: u32,
     time: u32,
 ) -> Vec<u32> {
-    let mut v = witness_body(&sk.viewing_key().pk(), inputs, outputs, anchor, fee, burn_a, burn_r, asset_a, time);
+    let mut v = witness_body(&sk.viewing_key().pk(), "spend key", inputs, outputs, anchor, fee, burn_a, burn_r, asset_a, time);
     v[hidden_input::SK..hidden_input::SK + 8].copy_from_slice(&sk.0);
     v
 }
 
 /// The [`hidden_input::COUNT`] words every hidden guest's witness shares — everything but words
 /// `0..8` (the spend key in v1/v2, `nk` in v3), left zero for the caller. Refuses (panics) an
-/// input not owned by `pk_self`.
+/// input not owned by `pk_self`, naming the caller's key as `key` ("spend key", "viewing key").
 #[allow(clippy::too_many_arguments)]
 fn witness_body(
     pk_self: &Word8,
+    key: &str,
     inputs: &[(Note, [Word8; DEPTH], u32); SLOTS],
     outputs: &[HiddenOutput; SLOTS],
     anchor: Word8,
@@ -201,7 +202,7 @@ fn witness_body(
     let pk_self = *pk_self;
     let mut v = vec![0u32; COUNT];
     for (k, (note, path, index)) in inputs.iter().enumerate() {
-        assert_eq!(note.pk, pk_self, "input {k} is not owned by this spend key");
+        assert_eq!(note.pk, pk_self, "input {k} is not owned by this {key}");
         let b = in_slot(k);
         v[b + S_FROM..b + S_FROM + 8].copy_from_slice(&note.from);
         v[b + S_AMOUNT_LO] = note.amount as u32;
@@ -281,15 +282,22 @@ pub fn hidden_bundle_preimage_v3(i: &HiddenDigestInputV3) -> [u32; PREIMAGE_WORD
 /// `H(HIDDEN_BUNDLE_DOMAIN, anchor, nf0..3, cm0..3, fee, burn_a, burn_r, burn_asset, time,
 /// auth_commit, bad = 0)` — what an honest run of `guests::bundle_hidden_v3()` publishes.
 ///
-/// **The same tag, 64, as v1/v2**, deliberately. `notes::hash` is the padding-free sponge
-/// (`hash::sponge_hash`: rate 4, overwrite mode, zero initial state) over `[tag, msg…]`, with the
-/// tag at word 0. Its only structural ambiguity is a zero-extension *within the first,
-/// zero-initialised block* (ZKH-3); past that block every absorbed chunk overwrites lanes a
-/// permutation already mixed. A v1/v2 message is 82 words with the tag (21 permutations), a v3
-/// one 90 (23): both run far past the first block and absorb a different number of blocks, so a
-/// v3 digest equal to a v1/v2 digest would be a Poseidon2 collision between inputs of different
-/// lengths, not a property of the encoding. (And no chain accepts both: a genesis pins one
-/// `hc_bundle`, and the ledger recomputes that guest's digest only.)
+/// **The same tag, 64, as v1/v2**, and why that is safe *for these two lengths only*.
+/// `notes::hash` is p3's `PaddingFreeSponge<_, 8, 4, 4>` over `[tag, msg…]`: rate 4, overwrite
+/// mode, zero initial state, no padding, no length binding. A partial final block overwrites only
+/// the lanes it has words for; the rest keep the previous permutation's output, which anyone can
+/// compute from the message. So a message `M` of length `4k + 2` and `M ‖ [S[2], S[3]]` (length
+/// `4k + 4`, `S` the state before the last absorption) collide **by construction, for every `k`**
+/// — ZKH-3's zero-extension in the first block is only the `k = 0` case. Reusing one tag for two
+/// preimage lengths that end in the same block is therefore NOT safe: an 82- and an 84-word
+/// message under tag 64 would be forgeable into each other.
+///
+/// v1/v2's message is 82 words with the tag (`4·20 + 2`, 21 permutations) and v3's is 90
+/// (`4·22 + 2`, 23 permutations): they absorb a different number of blocks, so no such
+/// construction links them, and a v3 digest equal to a v1/v2 digest needs a generic collision of
+/// the sponge (124-bit capacity). And no chain accepts both: a genesis pins one `hc_bundle`, and
+/// the ledger recomputes that guest's digest only. A future preimage length must be checked the
+/// same way, or given its own tag.
 pub fn hidden_bundle_digest_v3(i: &HiddenDigestInputV3) -> Word8 {
     hash(HIDDEN_BUNDLE_DOMAIN, &hidden_bundle_preimage_v3(i))
 }
@@ -298,7 +306,8 @@ pub fn hidden_bundle_digest_v3(i: &HiddenDigestInputV3) -> Word8 {
 /// [`hidden_bundle_inputs`]' witness with `vk.nk` in place of the spend key and `salt` appended.
 /// What a light client hands a prover — no word of it can move a note without the auth proof,
 /// which only the spend key's holder can make. Every input must be owned by `vk.pk()` (panics
-/// otherwise, as [`hidden_bundle_inputs`] does); the same fresh-`r` rule for dummies holds.
+/// otherwise — "not owned by this viewing key" — as [`hidden_bundle_inputs`] does for its spend
+/// key); the same fresh-`r` rule for dummies holds.
 #[allow(clippy::too_many_arguments)]
 pub fn hidden_bundle_inputs_v3(
     vk: &ViewingKey,
@@ -313,7 +322,7 @@ pub fn hidden_bundle_inputs_v3(
     time: u32,
 ) -> Vec<u32> {
     use hidden_input_v3::{COUNT, NK, SALT};
-    let mut v = witness_body(&vk.pk(), inputs, outputs, anchor, fee, burn_a, burn_r, asset_a, time);
+    let mut v = witness_body(&vk.pk(), "viewing key", inputs, outputs, anchor, fee, burn_a, burn_r, asset_a, time);
     v[NK..NK + 8].copy_from_slice(&vk.nk);
     debug_assert_eq!(v.len(), SALT);
     v.extend_from_slice(salt);
