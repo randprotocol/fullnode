@@ -153,8 +153,8 @@ pub struct ChainLimits {
     pub hardening_v6: bool,
     /// Gas units per RAND-unit, under the node's gas policy (spec 2026-09-28 §4.1/§8). `None`
     /// from a node that runs no policy or predates the field — paired with `byte_price` below to
-    /// decide [`ChainLimits::gas_policy`]. `gas_metering` (`"header"` or `null`) is deliberately
-    /// not decoded here: the wallet needs only the two prices.
+    /// decide [`ChainLimits::gas_policy`]. `gas_metering` is decoded only as
+    /// [`ChainLimits::gas_circuit`], the one fact about it the wallet acts on.
     ///
     /// A price is a RAND amount, so the node sends a decimal string (docs/rpc.md); a number is
     /// accepted too, for a node built before that rule reached these two fields.
@@ -163,6 +163,27 @@ pub struct ChainLimits {
     /// Byte-units per RAND-unit, under the node's gas policy. See `gas_price` above.
     #[serde(default, deserialize_with = "opt_u64_string_or_number")]
     pub byte_price: Option<u64>,
+    /// Spec 2026-09-28 §3.3, §9: `gas_metering == "circuit"` — the chain's genesis carries a
+    /// `gas` section, so a call pays for the `GAS_LIMIT` its proof declares
+    /// (`gas::circuit_call_floor`), not for its header's ceiling. `"header"` (a node's Phase 0
+    /// policy), `null`, an absent key and any value this wallet does not know all read `false`.
+    #[serde(default, rename = "gas_metering", deserialize_with = "metering_is_circuit")]
+    pub gas_circuit: bool,
+    /// The bundle guest's flat declared gas under a `gas` section (genesis
+    /// `gas.bundle_gas_limit`); `None` without one. The wallet proves only the guest whose
+    /// ceiling it is (`wallet::check_bundle_gas_limit`).
+    #[serde(default)]
+    pub bundle_gas_limit: Option<u64>,
+    /// The dynamic price controller's step, in basis points (genesis `gas.dynamic.adjust_bps`),
+    /// `None` on a chain whose prices never move. The wallet pays one step of headroom over the
+    /// tip's floor (spec §7.1).
+    #[serde(default)]
+    pub adjust_bps: Option<u32>,
+}
+
+/// `gas_metering` as the one fact the wallet acts on: is it `"circuit"`?
+fn metering_is_circuit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(<Option<String> as serde::Deserialize>::deserialize(d)?.as_deref() == Some("circuit"))
 }
 
 /// An optional u64 sent as a decimal string or as a JSON number; `None` for `null` (and, with
@@ -1180,6 +1201,10 @@ mod tests {
                 // Nor a gas policy: no `gas_price`/`byte_price` key in this reply either.
                 gas_price: None,
                 byte_price: None,
+                // Nor a gas section.
+                gas_circuit: false,
+                bundle_gas_limit: None,
+                adjust_bps: None,
             })
         );
         let older = RpcClient::new(scripted_rpc(vec![]).await);
@@ -1188,9 +1213,8 @@ mod tests {
         assert!(broken.limits().await.is_err());
     }
 
-    /// `gas_policy()`: `None` from a node that predates the fields or runs no policy; the
-    /// unknown `gas_metering` key is ignored (task 6 does not decode it — the wallet needs only
-    /// the prices).
+    /// `gas_policy()`: `None` from a node that predates the fields or runs no policy;
+    /// `gas_metering: "header"` decodes as no gas section (`limits_decode_the_gas_section`).
     #[tokio::test]
     async fn limits_gas_policy_is_none_without_both_prices() {
         use test_rpc::{scripted_rpc, Reply};
@@ -1235,6 +1259,35 @@ mod tests {
         });
         let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(junk))]).await);
         assert!(rpc.limits().await.is_err(), "a price that is not a decimal u64 is an error, not a guess");
+    }
+
+    /// Task B5/B7: a chain with a `gas` section serves `gas_metering: "circuit"`, the bundle's
+    /// pinned limit and (under `dynamic`) the controller's step; the wallet reads `gas_circuit`
+    /// from the first and never mistakes `"header"`, `null` or an unknown value for it.
+    #[tokio::test]
+    async fn limits_decode_the_gas_section() {
+        use test_rpc::{scripted_rpc, Reply};
+        let base = || json!({
+            "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+            "max_call_envelope_bytes": 18432, "max_program_public_words": 64,
+            "gas_price": "100", "byte_price": "800"
+        });
+        let mut circuit = base();
+        circuit["gas_metering"] = json!("circuit");
+        circuit["bundle_gas_limit"] = json!(16383);
+        circuit["adjust_bps"] = json!(1250);
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(circuit))]).await);
+        let l = rpc.limits().await.unwrap().unwrap();
+        assert!(l.gas_circuit);
+        assert_eq!((l.bundle_gas_limit, l.adjust_bps), (Some(16_383), Some(1_250)));
+        for metering in [json!("header"), json!(null), json!("quantum")] {
+            let mut other = base();
+            other["gas_metering"] = metering.clone();
+            let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(other))]).await);
+            let l = rpc.limits().await.unwrap().unwrap();
+            assert!(!l.gas_circuit, "{metering} is not circuit metering");
+            assert_eq!((l.bundle_gas_limit, l.adjust_bps), (None, None));
+        }
     }
 
     /// [`RpcClient::envelope_format`] reads `rand_getLimits` at most once, however many times it

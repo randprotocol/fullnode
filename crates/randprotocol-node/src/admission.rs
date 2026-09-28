@@ -1269,7 +1269,7 @@ mod tests {
         let l = gs.ledger.clone();
         let program = randprotocol_zkvm::guests::private_payment(1000);
         let (bytes, _, _) =
-            randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu).unwrap();
+            randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu, None).unwrap();
         let honest: Proof = postcard::from_bytes(&bytes).unwrap();
         // The vendored prover floors the table itself since the COV-2 / INT-6 re-vendor, so a v0.6
         // wallet's four-word call declares 2^7; a wallet from before it declared 2^3 — the header
@@ -1422,7 +1422,7 @@ mod tests {
         let l = gs.ledger.clone();
         let program = randprotocol_zkvm::guests::private_payment(1000);
         let (bytes, _, _) =
-            randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu).unwrap();
+            randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu, None).unwrap();
         let honest: Proof = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(honest.mem_log_height, honest.tier.min_mem_log_height(), "the honest prover declares t + 2");
         let mut taller: Proof = postcard::from_bytes(&bytes).unwrap();

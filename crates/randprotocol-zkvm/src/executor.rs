@@ -1378,6 +1378,12 @@ pub fn zk_code_hash(program: &Program) -> String {
 /// program deployed without one. The proof's `H_PUB` commits to it, and the chain checks that
 /// against the program's recorded digest (`ZkExecutor::verify_call`), so a proof over any other
 /// public input is refused.
+///
+/// Constraint set 8 (spec 2026-09-28 §3.2, §9): `gas_limit` is the `GAS_LIMIT` the proof
+/// declares (`pv::GAS`, what a chain with a `gas` section charges); `None` declares the header's
+/// ceiling (`gas::gas_max`), which leaks nothing beyond the header. A limit is a
+/// `ProveOptions` field the CPU prover takes; the GPU/reference paths prove under the vendored
+/// `Machine::prove_with`, which has no options, so they refuse `Some` rather than drop it.
 pub fn prove(
     profile: FriProfile,
     program: &Program,
@@ -1385,11 +1391,18 @@ pub fn prove(
     public: &[u32],
     tier: Option<u8>,
     backend: Backend,
+    gas_limit: Option<u64>,
 ) -> Result<(Vec<u8>, [u32; 8], u8), String> {
     let m = Machine::new(profile);
-    let (proof, exec) = m
-        .prove_with(backend, program, inputs, public, tier.map(|t| Tier(t as usize)))
-        .map_err(|e| format!("{e:?}"))?;
+    let tier = tier.map(|t| Tier(t as usize));
+    let proved = if matches!(backend, Backend::Cpu) {
+        m.prove_with_options(program, inputs, public, tier, crate::machine::ProveOptions { gas_limit, ..Default::default() })
+    } else if gas_limit.is_none() {
+        m.prove_with(backend, program, inputs, public, tier)
+    } else {
+        return Err(format!("{backend:?} proves under the header's gas ceiling only; declare a gas limit on the CPU backend"));
+    };
+    let (proof, exec) = proved.map_err(|e| format!("{e:?}"))?;
     Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8))
 }
 
@@ -1412,7 +1425,8 @@ pub fn prove(
 ///
 /// `public` is the program's deploy-time public input, as for [`prove`]. `max_input_words` is the
 /// envelope's input cap (`call_envelope::CallCaps::max_input_words`, derived from the chain's
-/// `max_call_envelope_bytes`).
+/// `max_call_envelope_bytes`). `gas_limit` is the declared `GAS_LIMIT`, as for [`prove`].
+#[allow(clippy::too_many_arguments)]
 pub fn prove_call(
     profile: FriProfile,
     program: &Program,
@@ -1421,6 +1435,7 @@ pub fn prove_call(
     tier: Option<u8>,
     backend: Backend,
     max_input_words: usize,
+    gas_limit: Option<u64>,
 ) -> Result<(Vec<u8>, [u32; 8], u8, [u32; 4]), String> {
     // The envelope this proof is for cannot carry more than the chain's input cap, and proving
     // is minutes: refuse now rather than after the work is done (`call_envelope`'s own check is
@@ -1434,7 +1449,14 @@ pub fn prove_call(
             let salt: [u32; 4] = rand::rng().random();
             let m = Machine::new(profile);
             let (proof, exec) = m
-                .prove_salted(program, inputs, public, salt, tier.map(|t| Tier(t as usize)))
+                .prove_salted_with(
+                    program,
+                    inputs,
+                    public,
+                    salt,
+                    tier.map(|t| Tier(t as usize)),
+                    crate::machine::ProveOptions { gas_limit, ..Default::default() },
+                )
                 .map_err(|e| format!("{e:?}"))?;
             Ok((proof.to_bytes(), exec.outputs, proof.tier.0 as u8, salt))
         }
@@ -1455,13 +1477,47 @@ pub fn prove_call(
 /// known yet); a guest that branches on its public words could land elsewhere with the real ones,
 /// and [`prove_call_hardened`] then fails at the pinned tier rather than proving a different one.
 pub fn call_tier(program: &Program, inputs: &[u32], public_segment_words: usize) -> Result<u8, String> {
-    let public = vec![0u32; public_segment_words];
-    let exec = crate::emulator::execute(program, inputs, &public, Tier(*TIERS.last().unwrap()).max_cycles()).map_err(|e| format!("{e:?}"))?;
+    dry_run_call(program, inputs, &vec![0u32; public_segment_words]).map(|r| r.tier)
+}
+
+/// What a call's dry run says before anything is proved (spec 2026-09-28 §9): the exact gas the
+/// circuit's meter will count (`gas::gas_of` over the emulator's run — witness, never published),
+/// the tier the prover picks, and the hash-table heights it declares under the default options.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallDryRun {
+    pub gas: u64,
+    pub tier: u8,
+    pub keccak_log_height: u8,
+    pub sha256_log_height: u8,
+}
+
+impl CallDryRun {
+    /// The header's ceiling this run will prove under: what `--gas-limit max` (and a `None`
+    /// limit) declares.
+    pub fn gas_max(&self) -> u64 {
+        crate::gas::gas_max(Tier(self.tier as usize), self.keccak_log_height, self.sha256_log_height)
+    }
+}
+
+/// Run `program` on `inputs` over the public segment `public` in the emulator, no proving:
+/// [`CallDryRun`]. `public` is the segment the proof will commit to — the program's public input,
+/// or under `hardening_v6` that followed by [`TX_BINDING_WORDS`] zeros (the binding is not known
+/// yet; see [`call_tier`]).
+pub fn dry_run_call(program: &Program, inputs: &[u32], public: &[u32]) -> Result<CallDryRun, String> {
+    let exec = crate::emulator::execute(program, inputs, public, Tier(*TIERS.last().unwrap()).max_cycles()).map_err(|e| format!("{e:?}"))?;
     let digests = program.digest_rows() + crate::hash::input_digest_row_count(inputs.len()) + crate::hash::public_digest_row_count(public.len());
     let absorb_rows = exec.events.iter().filter(|e| matches!(e.hash_row, Some(crate::emulator::HashRow::Absorb { .. }))).count();
-    Tier::for_workload(exec.cycles() + digests, digests + absorb_rows)
+    let tier = Tier::for_workload(exec.cycles() + digests, digests + absorb_rows)
         .map(|t| t.0 as u8)
-        .ok_or_else(|| format!("no tier holds {} cycles", exec.cycles() + digests))
+        .ok_or_else(|| format!("no tier holds {} cycles", exec.cycles() + digests))?;
+    let keccaks = exec.events.iter().filter(|e| e.keccak_row.is_some()).count();
+    let sha256s = exec.events.iter().filter(|e| e.sha256_row.is_some()).count();
+    Ok(CallDryRun {
+        gas: crate::gas::gas_of(program, inputs, public, &exec.events),
+        tier,
+        keccak_log_height: crate::tables::keccak::keccak_log_height(keccaks),
+        sha256_log_height: crate::tables::sha256::sha256_log_height(sha256s),
+    })
 }
 
 /// A fresh `H_IN` salt from OS entropy — the draw [`prove_call`] makes internally, for a caller
@@ -1482,8 +1538,9 @@ pub fn fresh_call_salt() -> [u32; 4] {
 /// `salt` is the `H_IN` salt, drawn by the caller: the call-input envelope is sealed against
 /// `hash::input_digest(salt, inputs)` and sits inside the binding, so the wallet seals it before
 /// this proof exists (the salt's freshness is the caller's duty, exactly as `prove_call`'s doc
-/// comment states it). `tier` pins the tier the fee was computed for ([`call_tier`]). CPU only,
-/// for `prove_call`'s reason. Returns (proof bytes, outputs, tier).
+/// comment states it). `tier` pins the tier the fee was computed for ([`call_tier`]); `gas_limit`
+/// the declared `GAS_LIMIT` it was priced at, as for [`prove`]. CPU only, for `prove_call`'s
+/// reason. Returns (proof bytes, outputs, tier).
 #[allow(clippy::too_many_arguments)]
 pub fn prove_call_hardened(
     profile: FriProfile,
@@ -1493,6 +1550,7 @@ pub fn prove_call_hardened(
     binding: &[u32; TX_BINDING_WORDS],
     salt: [u32; 4],
     tier: Option<u8>,
+    gas_limit: Option<u64>,
 ) -> Result<(Vec<u8>, [u32; 8], u8), String> {
     let segment = &randprotocol_core::program::hardened_call_segment(public, binding)[..];
     // `Machine::prove_salted`'s body, from its public parts, with one difference: the program
@@ -1507,7 +1565,8 @@ pub fn prove_call_hardened(
         Some(t) => return Err(format!("tier {t} is not one of {TIERS:?}")),
         None => Tier(call_tier(program, inputs, segment.len())? as usize),
     };
-    let mut traces = crate::machine::build_traces_salted_with(program, inputs, segment, salt, &exec, tier, crate::machine::ProveOptions::default()).map_err(|e| format!("{e:?}"))?;
+    let opts = crate::machine::ProveOptions { gas_limit, ..Default::default() };
+    let mut traces = crate::machine::build_traces_salted_with(program, inputs, segment, salt, &exec, tier, opts).map_err(|e| format!("{e:?}"))?;
     let floored = hardened_program_log_height(program.words.len());
     if traces.program_log_height < floored {
         traces.program = crate::tables::program::program_trace(program, &exec.events, 1usize << floored);
@@ -1733,7 +1792,7 @@ mod tests {
                 public_len: 0,
             };
             let proved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                prove_call_hardened(FriProfile::Test, &program, &[], &[], &binding, [0; 4], Some(10))
+                prove_call_hardened(FriProfile::Test, &program, &[], &[], &binding, [0; 4], Some(10), None)
             }));
             match proved {
                 Ok(Ok((bytes, _, _))) => zk.verify_call_hardened(&record, &bytes, &binding).map(|_| ()).map_err(|e| format!("{e:?}")),
@@ -1805,7 +1864,7 @@ mod tests {
         use super::*;
         use crate::machine::{Backend, FriProfile, MAX_MEM_LOG_HEIGHT};
         for (what, program) in [("keccak", crate::guests::keccak_demo(b"abc")), ("sha256", crate::guests::sha256_demo())] {
-            let (bytes, _, _) = prove(FriProfile::Test, &program, &[], &[], None, Backend::Cpu).unwrap();
+            let (bytes, _, _) = prove(FriProfile::Test, &program, &[], &[], None, Backend::Cpu, None).unwrap();
             let honest = decode_canonical(&bytes).unwrap();
             assert!(honest.keccak_log_height != NO_KECCAK || honest.sha256_log_height != NO_SHA256, "{what} declares a hash table");
             assert_eq!(non_canonical(&honest), None, "{what}: the honest proof is canonical");
@@ -1871,7 +1930,7 @@ mod tests {
         use super::*;
         use crate::machine::{Backend, FriProfile};
         let payment = crate::guests::private_payment(1000);
-        let (base, _, _) = prove(FriProfile::Test, &payment, &[400, 250, 300, 75], &[], None, Backend::Cpu).unwrap();
+        let (base, _, _) = prove(FriProfile::Test, &payment, &[400, 250, 300, 75], &[], None, Backend::Cpu, None).unwrap();
         // The mutants first (cheap: one tier-10 proof), the sweep of honest shapes after.
         // The same arities in another order: the same total fold, a different transcript.
         let mut swapped = decode_canonical(&base).unwrap();
@@ -1886,10 +1945,10 @@ mod tests {
         assert!(non_canonical(&padded).is_some_and(|w| w.starts_with("random-codeword")), "a padded random opening");
         let mut honest: Vec<(String, Vec<u8>)> = vec![("call at tier 10".into(), base)];
         for tier in [Some(12), Some(14)] {
-            let (bytes, _, t) = prove(FriProfile::Test, &payment, &[400, 250, 300, 75], &[], tier, Backend::Cpu).unwrap();
+            let (bytes, _, t) = prove(FriProfile::Test, &payment, &[400, 250, 300, 75], &[], tier, Backend::Cpu, None).unwrap();
             honest.push((format!("call at tier {t}"), bytes));
         }
-        let (fib, _, _) = prove(FriProfile::Test, &crate::guests::fib(10), &[], &[], None, Backend::Cpu).unwrap();
+        let (fib, _, _) = prove(FriProfile::Test, &crate::guests::fib(10), &[], &[], None, Backend::Cpu, None).unwrap();
         honest.push(("fib".into(), fib));
         let (bundle, _, _) =
             prove_hidden_bundle(FriProfile::Test, &vec![0; crate::hidden::hidden_input::COUNT], &[7; TX_BINDING_WORDS], Backend::Cpu).unwrap();
@@ -1920,7 +1979,7 @@ mod tests {
         use crate::machine::{Backend, FriProfile, Val};
         use p3_field::PrimeCharacteristicRing;
         let program = crate::guests::private_payment(1000);
-        let (bytes, _, _) = prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu).unwrap();
+        let (bytes, _, _) = prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu, None).unwrap();
         let honest = decode_canonical(&bytes).unwrap();
         assert!(honest.batch.opening_proof.1.commit_pow_witnesses.iter().all(|w| *w == Val::ZERO), "the honest prover grinds 0 bits to zero");
         let zk = ZkExecutor::new(FriProfile::Test);
@@ -1973,7 +2032,7 @@ mod tests {
         };
         let binding = [3u32, 1, 4, 1, 5, 9, 2, 6];
         let tier = call_tier(&program, &inputs, TX_BINDING_WORDS).unwrap();
-        let (bound, outputs, t) = prove_call_hardened(FriProfile::Test, &program, &inputs, &[], &binding, [1, 2, 3, 4], Some(tier)).unwrap();
+        let (bound, outputs, t) = prove_call_hardened(FriProfile::Test, &program, &inputs, &[], &binding, [1, 2, 3, 4], Some(tier), None).unwrap();
         assert_eq!(t, tier, "the wallet's tier is the prover's");
         let outcome = zk.verify_call_hardened(&record, &bound, &binding).expect("its own binding");
         assert_eq!(outcome.outputs, outputs);
@@ -1986,7 +2045,7 @@ mod tests {
         // The old rule refuses it too — on its floored program table first (PROGRAM-TABLE-LEAK:
         // private_payment is under 64 words), and on the segment behind that.
         assert!(zk.verify_call(&record, &bound).is_err(), "the old rule wants the empty segment and the record's height");
-        let (unbound, _, _) = prove(FriProfile::Test, &program, &inputs, &[], None, Backend::Cpu).unwrap();
+        let (unbound, _, _) = prove(FriProfile::Test, &program, &inputs, &[], None, Backend::Cpu, None).unwrap();
         // Today's proof under the flag: refused on its record-height program table before the
         // segment is even compared (private_payment is under 64 words).
         assert!(zk.verify_call_hardened(&record, &unbound, &binding).is_err(), "today's proof under the flag");
@@ -2017,7 +2076,7 @@ mod tests {
         let binding = [3u32, 1, 4, 1, 5, 9, 2, 6];
         let segment = randprotocol_core::program::hardened_call_segment(&public, &binding);
         let tier = call_tier(&program, &inputs, segment.len()).unwrap();
-        let (bound, outputs, _) = prove_call_hardened(FriProfile::Test, &program, &inputs, &public, &binding, [1, 2, 3, 4], Some(tier)).unwrap();
+        let (bound, outputs, _) = prove_call_hardened(FriProfile::Test, &program, &inputs, &public, &binding, [1, 2, 3, 4], Some(tier), None).unwrap();
         let outcome = zk.verify_call_hardened(&record, &bound, &segment).expect("public ‖ its own binding");
         assert_eq!(outcome.outputs, outputs);
         assert_eq!(zk.decode_call_hardened(&record, &bound, &segment), Ok(outcome), "the decode path agrees");
@@ -2058,7 +2117,7 @@ mod tests {
             public_len: 0,
         };
         let binding = [9u32; TX_BINDING_WORDS];
-        let (bytes, _, _) = prove_call_hardened(FriProfile::Test, &program, &[], &[], &binding, [0; 4], None).unwrap();
+        let (bytes, _, _) = prove_call_hardened(FriProfile::Test, &program, &[], &[], &binding, [0; 4], None, None).unwrap();
         let proof = decode_canonical(&bytes).unwrap();
         assert_eq!(proof.program_log_height, MIN_PRIVATE_TABLE_LOG_HEIGHT, "the hardened prover floors the program table");
         assert!(zk.verify_call_hardened(&record, &bytes, &binding).is_ok(), "and the hardened rule accepts it");
