@@ -288,7 +288,9 @@ hidden_bundle` 25/25 (119 s); `cargo check --workspace --tests --release` clean.
 recursion 179/0.
 
 **Cut order** (not yet run): push circuits `feat/cs8-gas` to origin → final whole-branch review →
-tag (spec §11: v0.6.5 unless the line has moved) → `deploy/cut-chain18-genesis.sh` (26 validators,
+tag (`v0.6.5` unless the line has moved — named in `deploy/cut-chain18-genesis.sh`'s header and
+`deploy/cutover-fleet-chain18.sh`'s `TAG` default, not the spec, which names no version) →
+`deploy/cut-chain18-genesis.sh` (26 validators,
 carries chain 16's bridge/tokens/supply snapshot forward, `hc_bundle` unchanged from chain 16's —
 cs8 changes only the STARK verifier key, not the hidden-asset guest's words) →
 `deploy/cutover-fleet-chain18.sh` all-stop/all-start (C, D first) → `deploy/chain18-bridge-steps.md`
