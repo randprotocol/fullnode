@@ -127,7 +127,9 @@ struct Entry {
 
 struct Inner {
     entries: HashMap<String, Entry>,
-    queue: VecDeque<(String, ProveJob)>,
+    /// Boxed so a job's token, reply key and witness live in one heap cell that its drop
+    /// zeroizes: the deque's buffer holds only the pointer, never a copy of the secrets.
+    queue: VecDeque<(String, Box<ProveJob>)>,
     proving: usize,
 }
 
@@ -183,7 +185,7 @@ impl Service {
         if sealed.len() > MAX_SEALED_JOB_BYTES {
             return Err(Refusal::Bad(format!("sealed job of {} bytes exceeds {MAX_SEALED_JOB_BYTES}", sealed.len())));
         }
-        let job = open_job(self.cfg.key.dk(), sealed).map_err(|e| Refusal::Bad(e.to_string()))?;
+        let job = Box::new(open_job(self.cfg.key.dk(), sealed).map_err(|e| Refusal::Bad(e.to_string()))?);
         let label = {
             let pairings = self.cfg.pairings.read().unwrap();
             pairings.lookup(&job.token).ok_or(Refusal::Unpaired)?.label.clone()
@@ -201,7 +203,8 @@ impl Service {
             return Err(Refusal::Bad(format!("unknown bundle guest {}", word8_to_hex(&job.hc_bundle))));
         }
         if ZkExecutor::profile_from_str(&job.profile).is_none() {
-            return Err(Refusal::Bad(format!("unknown fri profile {:?}", job.profile)));
+            // Not echoed: the profile string is the submitter's, and refusals reach logs and callers.
+            return Err(Refusal::Bad("unknown fri profile".into()));
         }
         if job.inputs.len() != hidden_input::COUNT {
             return Err(Refusal::Bad(format!("witness of {} words, expected {}", job.inputs.len(), hidden_input::COUNT)));
@@ -242,13 +245,15 @@ impl Service {
     }
 
     /// A finished entry past `result_ttl` becomes `Expired` and loses its reply; an expired
-    /// entry is forgotten a further `result_ttl` later, so the map stays bounded.
+    /// entry is forgotten a further `max(result_ttl, 60 s)` later, so `Expired` stays observable
+    /// for at least a minute and the map stays bounded.
     fn sweep(&self, g: &mut Inner) {
         let ttl = self.cfg.result_ttl;
+        let forget = ttl.saturating_add(ttl.max(Duration::from_secs(60)));
         g.entries.retain(|_, e| {
             let Some(t) = e.finished else { return true };
             let age = t.elapsed();
-            if age >= ttl.saturating_mul(2) { return false; }
+            if age >= forget { return false; }
             if age >= ttl && e.state != State::Expired {
                 e.state = State::Expired;
                 e.reply = None;
@@ -321,7 +326,7 @@ impl Service {
             let out = tokio::task::spawn_blocking(move || {
                 let out = match profile {
                     Some(p) => (prove)(&hc, p, &job.inputs, &binding, backend),
-                    None => Err(format!("unknown fri profile {:?}", job.profile)),
+                    None => Err("unknown fri profile".into()),
                 };
                 drop(job);
                 out
