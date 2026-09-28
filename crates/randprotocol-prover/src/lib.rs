@@ -6,3 +6,7 @@ pub mod key;
 pub mod pairing;
 #[cfg(feature = "service")]
 pub mod service;
+#[cfg(feature = "service")]
+pub mod http;
+#[cfg(feature = "service")]
+pub mod memory;
