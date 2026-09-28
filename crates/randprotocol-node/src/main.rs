@@ -418,7 +418,7 @@ enum Cmd {
         byte_price: Option<u64>,
         /// The gas section's flat bundle gas limit (spec §4.3): every bundle proof's declared
         /// `GAS_LIMIT` must equal this exactly. Only meaningful with `--gas-price`; defaults to
-        /// `16 383` (today's tier-14 bundle guest) when that is given and this is not.
+        /// `gas_max(14, 0, 0)` = `20 479` (today's tier-14 bundle guest) when that is given and this is not.
         #[arg(long)]
         bundle_gas_limit: Option<u64>,
         /// Phase 2 (spec §7.1): the dynamic price controller, as
@@ -893,7 +893,7 @@ async fn main() -> Result<()> {
                 Some(gas_price) => Some(randprotocol_core::gas::GasConfig {
                     gas_price,
                     byte_price: byte_price.unwrap_or(randprotocol_core::gas::BYTE_PRICE_DEFAULT),
-                    bundle_gas_limit: bundle_gas_limit.unwrap_or(16_383),
+                    bundle_gas_limit: bundle_gas_limit_or_default(bundle_gas_limit),
                     metering: randprotocol_core::gas::GasMetering::Circuit,
                     dynamic: match &gas_dynamic {
                         Some(spec) => {
@@ -1669,6 +1669,12 @@ pub fn parse_prune_history(s: &str) -> Result<Duration, String> {
     Ok(d)
 }
 
+/// `rand-node genesis --bundle-gas-limit`'s value, or its default: what every real hidden-asset
+/// bundle proof declares, the tier-14 hash-free ceiling `gas_max(14, 0, 0)` (spec §4.3).
+fn bundle_gas_limit_or_default(v: Option<u64>) -> u64 {
+    v.unwrap_or_else(|| randprotocol_core::gas::gas_max(14, 0, 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2131,6 +2137,16 @@ mod tests {
         assert_ne!(built.hash(), pinned_genesis().build(&ZkExecutor::new(FriProfile::Test)).unwrap().hash());
     }
 
+    /// `--bundle-gas-limit`'s default is what every real hidden-asset bundle proof declares:
+    /// `gas_max(14, 0, 0)` = 20 479 (the absorb term included), not the bare cycle budget 16 383
+    /// — a genesis cut at 16 383 would refuse every bundle.
+    #[test]
+    fn the_bundle_gas_limit_defaults_to_the_bundle_guests_ceiling() {
+        assert_eq!(bundle_gas_limit_or_default(None), randprotocol_core::gas::gas_max(14, 0, 0));
+        assert_eq!(bundle_gas_limit_or_default(None), 20_479);
+        assert_eq!(bundle_gas_limit_or_default(Some(7)), 7);
+    }
+
     /// `rand-node genesis` takes the four gas flags (design 2026-09-28 §4.2, §4.3, §7.1); the
     /// section is written only when `--gas-price` is given, and `--gas-dynamic` sets the
     /// controller's floors to the section's own starting prices.
@@ -2148,8 +2164,8 @@ mod tests {
         };
         assert_eq!(parse(&[]), (None, None, None, None));
         assert_eq!(
-            parse(&["--gas-price", "100", "--byte-price", "800", "--bundle-gas-limit", "16383"]),
-            (Some(100), Some(800), Some(16_383), None)
+            parse(&["--gas-price", "100", "--byte-price", "800", "--bundle-gas-limit", "20479"]),
+            (Some(100), Some(800), Some(20_479), None)
         );
         assert_eq!(
             parse(&["--gas-price", "100", "--gas-dynamic", "2097152,262144,1250"]).3,
@@ -2169,7 +2185,7 @@ mod tests {
         with_gas.gas = Some(randprotocol_core::gas::GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 16_383,
+            bundle_gas_limit: 20_479,
             metering: randprotocol_core::gas::GasMetering::Circuit,
             dynamic: Some(randprotocol_core::gas::DynamicGas {
                 target_block_bytes: 2_097_152,
@@ -2183,7 +2199,7 @@ mod tests {
         assert!(json.contains("\"gas_price\": \"100\""));
         assert!(json.contains("\"metering\": \"circuit\""));
         let built = with_gas.build(&ZkExecutor::new(FriProfile::Test)).unwrap();
-        assert_eq!(built.ledger.gas().unwrap().bundle_gas_limit, 16_383);
+        assert_eq!(built.ledger.gas().unwrap().bundle_gas_limit, 20_479);
         assert_ne!(built.hash(), pinned_genesis().build(&ZkExecutor::new(FriProfile::Test)).unwrap().hash());
     }
 

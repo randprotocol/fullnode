@@ -5444,7 +5444,7 @@ mod tests {
         gas::GasConfig {
             gas_price: 100,
             byte_price: 800,
-            bundle_gas_limit: 16_383,
+            bundle_gas_limit: gas::gas_max(14, 0, 0),
             metering: gas::GasMetering::Circuit,
             dynamic: Some(gas::DynamicGas {
                 target_block_bytes: 4096,
@@ -5473,7 +5473,7 @@ mod tests {
         for l in [&mut a, &mut b] {
             l.apply_tx(&tx, &proposer, &StubExecutor).unwrap();
             // B1/B3 have not landed: the call's own gas is driven directly here.
-            l.close_block(1, &proposer, tx.encoded_len() as u64, 40_000 + 16_383);
+            l.close_block(1, &proposer, tx.encoded_len() as u64, 40_000 + gas::gas_max(14, 0, 0));
         }
         assert_eq!(a.gas_prices(), b.gas_prices());
         assert_eq!(a.state_root(), b.state_root());
@@ -5598,7 +5598,7 @@ mod tests {
         expect.apply_tx(&tx, &a0.address(), &StubExecutor).unwrap();
         // The call's declared limit (a stub tier-12 proof declares `gas_max(12, 0, 0)`) plus the
         // one bundle's `bundle_gas_limit`.
-        expect.close_block(2, &a0.address(), tx.encoded_len() as u64, gas::gas_max(12, 0, 0) + 16_383);
+        expect.close_block(2, &a0.address(), tx.encoded_len() as u64, gas::gas_max(12, 0, 0) + gas::gas_max(14, 0, 0));
         let block = signed_block(vec![tx], &a0, 2, expect.state_root());
         let mut replica = l.clone();
         replica.apply_block(&block, &StubExecutor).unwrap();
@@ -5607,13 +5607,13 @@ mod tests {
     }
 
     /// A ledger with the test program deployed and a fixed-price `gas` section (100 / 800,
-    /// bundle limit 16 383).
+    /// bundle limit `gas_max(14, 0, 0)` = 20 479).
     fn gas_ledger() -> (Ledger, ProgramId) {
         ledger_with_program(|l| {
             l.set_gas(Some(gas::GasConfig {
                 gas_price: 100,
                 byte_price: 800,
-                bundle_gas_limit: 16_383,
+                bundle_gas_limit: gas::gas_max(14, 0, 0),
                 metering: gas::GasMetering::Circuit,
                 dynamic: None,
             }))
@@ -5684,20 +5684,20 @@ mod tests {
         let (l, _) = gas_ledger();
         let ok = tx(&l, [[50; 8], [51; 8]], [[52; 8], [53; 8]]);
         assert!(l.validate(&ok, &StubExecutor).is_ok());
-        for other in [16_382u64, 16_384, 1] {
+        for other in [20_478u64, 20_480, 16_383, 1] {
             let mut t = ok.clone();
             StubExecutor::with_bundle_gas(&mut t.bundle.as_mut().unwrap().proof, other);
             let t = StubExecutor::bound(t);
-            assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::BundleGasLimit { want: 16_383, got: Some(other) }), "{other}");
+            assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::BundleGasLimit { want: 20_479, got: Some(other) }), "{other}");
             // A wrong limit buys no verify.
             let exec = CountingExecutor::default();
-            assert_eq!(l.validate(&t, &exec), Err(TxError::BundleGasLimit { want: 16_383, got: Some(other) }));
+            assert_eq!(l.validate(&t, &exec), Err(TxError::BundleGasLimit { want: 20_479, got: Some(other) }));
             assert_eq!(exec.bundles(), 0, "refused before the verify");
             // And the verified-set hit, which skips the verify, still checks the limit.
             let mut applied = l.clone();
             assert_eq!(
                 applied.apply_tx_with(&t, &a.address(), &StubExecutor, &Admitted::of(&[&t])),
-                Err(TxError::BundleGasLimit { want: 16_383, got: Some(other) })
+                Err(TxError::BundleGasLimit { want: 20_479, got: Some(other) })
             );
         }
         // An executor whose proofs carry no limit declares none, and is refused under the section.
@@ -5740,7 +5740,7 @@ mod tests {
                 StubExecutor.verify_aggregate(shape, covered, proof, binding)
             }
         }
-        assert_eq!(l.validate(&ok, &NoGas), Err(TxError::BundleGasLimit { want: 16_383, got: None }));
+        assert_eq!(l.validate(&ok, &NoGas), Err(TxError::BundleGasLimit { want: 20_479, got: None }));
         // Without the section any limit is accepted (chains 16/17).
         let (plain, _) = ledger_with_program(|_| {});
         let mut t = tx(&plain, [[60; 8], [61; 8]], [[62; 8], [63; 8]]);
@@ -5750,7 +5750,7 @@ mod tests {
     }
 
     /// Spec §7.1: a block's `gas_used` is Σ its calls' declared limits plus `bundle_gas_limit` per
-    /// bundle proof. One call at limit 40 000 riding its bundle is 40 000 + 16 383 — over the
+    /// bundle proof. One call at limit 40 000 riding its bundle is 40 000 + 20 479 — over the
     /// 20 000 target, so the gas price rises.
     #[test]
     fn a_blocks_gas_used_is_its_calls_limits_and_its_bundles() {
@@ -5762,11 +5762,11 @@ mod tests {
         let mut expect = l.clone();
         expect.set_height(2);
         expect.apply_tx(&tx, &a0.address(), &StubExecutor).unwrap();
-        expect.close_block(2, &a0.address(), tx.encoded_len() as u64, 40_000 + 16_383);
+        expect.close_block(2, &a0.address(), tx.encoded_len() as u64, 40_000 + gas::gas_max(14, 0, 0));
         let block = signed_block(vec![tx], &a0, 2, expect.state_root());
         let mut replica = l.clone();
         replica.apply_block(&block, &StubExecutor).unwrap();
         assert_eq!(replica.gas_prices(), expect.gas_prices());
-        assert!(replica.gas_prices().gas_price > 100, "56 383 gas against a 20 000 target raised the price");
+        assert!(replica.gas_prices().gas_price > 100, "60 479 gas against a 20 000 target raised the price");
     }
 }

@@ -24,7 +24,7 @@
 #     other amount and no pending unbond) and what chain 16's genesis gave its eighteen. Quorum is
 #     now 18 of 26 — the guardian hosts count for liveness.
 #   * `rand-node genesis --hardening-v6 --bundle-guest v2 --gas-price 100 --byte-price 800
-#     --bundle-gas-limit 16383 --gas-dynamic 2097152,262144,1250`: the v0.6 validity rules, the
+#     --bundle-gas-limit 20479 --gas-dynamic 2097152,262144,1250`: the v0.6 validity rules, the
 #     branch-free hidden-asset guest (hc_bundle is whatever THIS rand-node reports for v2; the cut
 #     is made with the release binary the fleet will run — never a local build) AND the gas
 #     section on, testnet with the Phase 2 controller running: mins equal the fixed prices, target
@@ -180,7 +180,10 @@ done
 # ── gas (spec §4.2, §7.1): Phase 1 fixed prices + Phase 2 dynamic controller, testnet on ──────
 GAS_PRICE=${GAS_PRICE:-100}
 BYTE_PRICE=${BYTE_PRICE:-800}
-BUNDLE_GAS_LIMIT=${BUNDLE_GAS_LIMIT:-16383}
+# Every bundle proof declares exactly this (spec §4.3): the v2 guest's header ceiling
+# gas_max(14, 0, 0) = (2^14 − 1) + 2^12 = 20 479 — the absorb term included (circuits 18c2627); the
+# bare cycle budget 16 383 would refuse every bundle the fleet's prover makes.
+BUNDLE_GAS_LIMIT=${BUNDLE_GAS_LIMIT:-20479}
 # target_block_bytes,target_block_gas,adjust_bps — half the 4 MiB soft target in bytes, 2^18 gas,
 # 12.5% per step; mins default to gas_price/byte_price above (rand-node genesis's own rule).
 GAS_DYNAMIC=${GAS_DYNAMIC:-2097152,262144,1250}

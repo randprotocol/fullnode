@@ -1716,6 +1716,35 @@ fn prove_pinned_bundle(
 
 #[cfg(test)]
 mod tests {
+    /// The ledger prices gas with `randprotocol_core::gas::gas_max` (core cannot name this crate);
+    /// the verifier refuses a `GAS_LIMIT` above the vendored `gas::gas_max`. The two must agree
+    /// for every tier and every height a header can carry, or the chain would pin a
+    /// `bundle_gas_limit` (or price a call's ceiling) no proof can declare.
+    #[test]
+    fn the_cores_gas_max_mirror_matches_the_vendored_one() {
+        use crate::machine::Tier;
+        let keccak = [0u8].into_iter().chain(5..=13);
+        let sha256: Vec<u8> = [0u8].into_iter().chain(6..=13).collect();
+        let mut checked = 0;
+        // Every tier of the clamp range [10, 20] (the odd ones too) and a few outside it, which
+        // both sides clamp.
+        for t in 0u8..=24 {
+            for k in keccak.clone() {
+                for &sh in &sha256 {
+                    assert_eq!(
+                        randprotocol_core::gas::gas_max(t, k, sh),
+                        crate::gas::gas_max(Tier(t as usize), k, sh),
+                        "tier {t}, keccak 2^{k}, sha256 2^{sh}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 25 * 10 * 9);
+        assert_eq!(randprotocol_core::gas::gas_max(14, 0, 0), 20_479);
+        assert_eq!(randprotocol_core::gas::gas_max(10, 0, 0), 1_279);
+    }
+
     /// The ledger mirrors this machine's public-value layout as `randprotocol_core::types::pv` (it
     /// cannot name a zkvm type — the dependency points this way). If a constraint-set change
     /// moves the real layout, this fails here, where both sides are visible, rather than
