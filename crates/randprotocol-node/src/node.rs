@@ -4543,6 +4543,21 @@ mod tests {
         assert!(reloaded.hardening_v6(), "restored from the genesis state");
     }
 
+    /// Split authorisation's auth guest survives a restart the same way (review M-2): a node that
+    /// came back without `hc_auth` would recompute the v1 bundle digest and refuse every v3 bundle
+    /// its peers apply — a fork at its first transaction after the restart.
+    #[test]
+    fn a_restart_restores_hc_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        gs.ledger.set_hc_auth(Some([21; 8]));
+        storage.init_genesis(&gs).unwrap();
+        assert_eq!(storage.load_ledger(&StubExecutor).unwrap().hc_auth(), None);
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.hc_auth(), Some([21; 8]), "restored from the genesis state");
+    }
+
     /// The four call-limits parameters survive a restart the same way: `load_ledger` comes back
     /// at today's caps, and a node that kept them would disagree with its peers about which
     /// proofs, blocks, envelopes and deploys fit.

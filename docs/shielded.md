@@ -171,7 +171,10 @@ and refuses chains 14–16 at startup (`node::CHAINS_THIS_BUILD_CANNOT_RUN`).
 
 The cost is size: the auth proof is about 1.37 MB at Production FRI, so a transfer carries about
 2.85 MB of proof (1.49 MB of it the bundle proof, in one measured run) — one per block at the 4 MiB
-default (spec §4.2). The soundness evidence is in
+default, and no `Call` (spec §4.2). A v3 transaction carries three proofs at most (bundle, auth,
+call), so a genesis with `hc_auth` must set `max_block_bytes ≥ 3·max_proof_bytes + 1 MiB` —
+`Genesis::validate` refuses it otherwise, the 4 MiB default included, since a 4 MiB block admits
+transfers but no `Call` at Production FRI. The soundness evidence is in
 `docs/confidential.md` ("The hidden-asset bundle guest: soundness").
 
 ### What is public and what is hidden

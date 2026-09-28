@@ -552,5 +552,7 @@ It is a hard fork, selected at genesis by `rand-node genesis --bundle-guest v3 -
 Measured (spec §4.2): the auth proof is tier 10, about 1.37 MB at Production FRI (313 KB at Test)
 and about 7 s to prove on one laptop core; in the wallet-flow test (Test FRI profile) a v3 bundle
 proof took 102 s on the wallet's machine and 108 s through a paired prover. A v3 transfer carries both proofs, about
-2.85 MB at Production FRI (1.36 MB auth + 1.49 MB bundle in one measured run): one per block at the 4 MiB default, about seven at the 20 MiB `max_block_bytes` chains 15
-and 16 set. The implementation plan is `docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md`.
+2.85 MB at Production FRI (1.36 MB auth + 1.49 MB bundle in one measured run): one per block at the 4 MiB default and no `Call`, about seven at the 20 MiB `max_block_bytes` chains 15
+and 16 set. A v3 transaction carries three proofs at most (bundle, auth, call), so the genesis block
+cap must hold `3·max_proof_bytes + 1 MiB` (`Genesis::validate` refuses a `hc_auth` genesis below it,
+the 4 MiB default included): a 4 MiB block admits transfers but no `Call` at Production FRI. The implementation plan is `docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md`.

@@ -507,9 +507,13 @@ impl ChainLimits {
 /// `rand_sendTransaction` carries `hex(bincode(tx))` inside a JSON envelope, so every byte of the
 /// transaction costs two here. The terms, all per single transaction:
 ///
-/// - `2 * max_proof_bytes` — a `Call` carries **two** proofs, the bundle's and the call's own
-///   (since the hidden-asset bundle no other action carries more than one). This is the term the
-///   retired limit missed: it
+/// - `2 * max_proof_bytes` — a `Call` carries **two** proofs at the cap, the bundle's and the
+///   call's own (since the hidden-asset bundle no other action carries more than one). Under split
+///   authorisation (genesis `hc_auth`) it carries **three** — bundle, auth, call — and the genesis
+///   block cap is sized for three (`gas::min_block_bytes`); this node-policy body cap still counts
+///   two at the cap, which covers every honest v3 `Call`, because the auth proof is one fixed,
+///   small shape (~1.36 MB at production FRI) and a real bundle proof sits far under the cap. This
+///   is the term the retired limit missed: it
 ///   allowed `2 * MAX_PROOF_BYTES + 256 KiB` *in total*, which is one hex-encoded proof, so a
 ///   constraint-set-5 `Call` — measured at 1 321 773 bytes for the fee bundle's proof plus ~1.2 MB
 ///   for the call's — was refused after about a hundred seconds of proving.

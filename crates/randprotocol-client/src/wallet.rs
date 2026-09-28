@@ -1639,6 +1639,19 @@ struct Prepared {
     auth_commit: Word8,
 }
 
+/// The witness carries a long-term secret — `nk` on v3, the spend key on v1/v2 — and `salt` is
+/// what keeps `auth_commit` unlinkable, so both are wiped when the bundle is dropped (review M-9),
+/// on every path, the error returns included. `zeroize` writes through volatile stores the
+/// optimiser cannot elide; a copy the prover or the RPC client took is theirs to wipe. Not unit
+/// tested: reading freed memory to prove the wipe is undefined behaviour.
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.words.zeroize();
+        self.salt.zeroize();
+    }
+}
+
 /// One transaction's proofs, made against its binding: the bundle's, and on a v3 chain the auth
 /// proof (empty elsewhere).
 struct Proved {

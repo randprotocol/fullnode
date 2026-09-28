@@ -54,7 +54,9 @@ fn genesis_v3(validator: &Keypair) -> Genesis {
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words: None,
         max_proof_bytes: None,
-        max_block_bytes: None,
+        // Room for three proofs at the default 2 MiB proof cap (`gas::min_block_bytes`): a
+        // split-authorisation genesis at the 4 MiB default is refused.
+        max_block_bytes: Some(7 << 20),
         max_call_envelope_bytes: None,
         max_program_public_words: None,
         envelope_bytes: None,

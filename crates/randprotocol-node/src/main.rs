@@ -300,7 +300,8 @@ enum Cmd {
         #[arg(long)]
         max_proof_bytes: Option<u32>,
         /// The largest block, and so the largest transaction, in bytes (4194304..=67108864, and
-        /// at least 2 * the proof cap + 1 MiB). Omitted, today's 4 MiB; given, it is part of the
+        /// at least 2 * the proof cap + 1 MiB,
+        /// 3 * the proof cap + 1 MiB with --auth-guest, where a `Call` carries three proofs). Omitted, today's 4 MiB; given, it is part of the
         /// genesis hash.
         #[arg(long)]
         max_block_bytes: Option<u32>,
@@ -1792,8 +1793,12 @@ mod tests {
             assert_eq!(state.ledger.hc_auth(), None, "{file}: the ledger keeps the v1 digest");
             assert!(!gen.to_json().contains("hc_auth"), "{file}: rewriting the file adds no field");
             // And the same file naming the auth guest is another chain.
+            // (With the chain-17 caps: a split-authorisation genesis needs block room for three
+            // proofs, which neither file has.)
             let mut split = gen.clone();
             split.hc_auth = Some(word8_to_hex(&ZkExecutor::hc_auth()));
+            split.max_proof_bytes = Some(4 << 20);
+            split.max_block_bytes = Some(20 << 20);
             assert_ne!(split.build(executor.as_ref()).unwrap().hash().to_hex(), hash, "{file}");
         }
     }

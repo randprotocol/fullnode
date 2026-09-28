@@ -180,6 +180,11 @@ a spike (task P2-0): aggregation is active on the target chain; the auth proof m
 enough to keep two transfers per block; or the owners accept the throughput. **Decided
 2026-09-28:** the owners accept the throughput — the user ordered Phase 2 executed and the chain
 cut; the cost, until aggregation is active, is one transfer per 4 MiB of block.
+A v3 transaction carries three proofs at most (bundle, auth, call), so a genesis that sets
+`hc_auth` must give `max_block_bytes ≥ 3·max_proof_bytes + 1 MiB` (`gas::min_block_bytes`; refused
+at `Genesis::validate` otherwise, the defaults included): a 4 MiB block admits transfers but no
+`Call` at Production FRI (bundle 1.49 MB + auth 1.36 MB + a tier-10 call proof ≈ 4.22 MB), and
+chain 17 is cut with 4 MiB proofs in 20 MiB blocks.
 
 ### 4.3 Rejected
 

@@ -372,7 +372,8 @@ pub struct Genesis {
     /// Call limits: the largest block, and so the largest transaction, in bytes,
     /// `gas::MAX_BLOCK_BYTES_MIN..=gas::MAX_BLOCK_BYTES_LIMIT` (4 MiB ..= 64 MiB) and at least
     /// `2 · max_proof_bytes + 1 MiB` (the effective proof cap: the default when that field is
-    /// absent). Absent means [`gas::MAX_BLOCK_BYTES`].
+    /// absent), `3 · max_proof_bytes + 1 MiB` when `hc_auth` is set ([`gas::min_block_bytes`]).
+    /// Absent means [`gas::MAX_BLOCK_BYTES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_block_bytes: Option<u32>,
     /// Call limits: the largest call input envelope, in bytes, 18 432 ..=
@@ -521,6 +522,15 @@ pub enum GenesisError {
         headroom = gas::BLOCK_PROOF_HEADROOM
     )]
     BadMaxBlockBytes(u32),
+    /// Split authorisation (`hc_auth` set): a transaction carries up to three proofs, so the block
+    /// cap must hold three at the proof cap plus the headroom ([`gas::min_block_bytes`]).
+    #[error(
+        "max_block_bytes {block} is too small for split authorisation: a transaction carries three proofs \
+         (bundle, auth, call), so with max_proof_bytes {proof} a block needs at least \
+         3 * {proof} + {headroom} = {need} bytes (set max_block_bytes, or a smaller max_proof_bytes)",
+        headroom = gas::BLOCK_PROOF_HEADROOM
+    )]
+    BlockTooSmallForSplitAuth { block: usize, proof: usize, need: usize },
     #[error(
         "bad max_call_envelope_bytes {0} ({min}..={limit})",
         min = crate::types::actions::MAX_CALL_ENVELOPE_BYTES,
@@ -621,18 +631,25 @@ impl Genesis {
                 return Err(GenesisError::BadMaxProofBytes(n));
             }
         }
-        // A block must carry a transaction with two worst-case proofs — the fee bundle's and the
-        // call's — plus 1 MiB for the rest, or the proof cap admits proofs no block can hold. The
-        // rule reads the effective proof cap, the default when the file leaves it out. A file
-        // with neither field is today's chain, whose 4 MiB block predates the rule, and is not
-        // judged by it.
-        if self.max_proof_bytes.is_some() || self.max_block_bytes.is_some() {
+        // A block must carry a transaction with every worst-case proof it can hold — the fee
+        // bundle's and the call's, plus the auth proof under split authorisation — plus 1 MiB
+        // for the rest, or the proof cap admits proofs no block can hold (`gas::min_block_bytes`).
+        // The rule reads the effective caps, the defaults when the file leaves them out. A file
+        // with neither field and no `hc_auth` is a pre-rule chain, whose 4 MiB block predates the
+        // rule, and is not judged by it; an `hc_auth` chain always is — at the defaults (2 MiB
+        // proofs, 4 MiB blocks) it is refused, since at production FRI it would admit no `Call`.
+        let split_auth = self.hc_auth.is_some();
+        if split_auth || self.max_proof_bytes.is_some() || self.max_block_bytes.is_some() {
             let proof = self.max_proof_bytes.map_or(gas::MAX_PROOF_BYTES, |n| n as usize);
             let block = self.max_block_bytes.map_or(gas::MAX_BLOCK_BYTES, |n| n as usize);
+            let need = gas::min_block_bytes(proof, split_auth);
             if !(gas::MAX_BLOCK_BYTES_MIN..=gas::MAX_BLOCK_BYTES_LIMIT).contains(&block)
-                || block < 2 * proof + gas::BLOCK_PROOF_HEADROOM
+                || (!split_auth && block < need)
             {
                 return Err(GenesisError::BadMaxBlockBytes(block as u32));
+            }
+            if block < need {
+                return Err(GenesisError::BlockTooSmallForSplitAuth { block, proof, need });
             }
         }
         if let Some(n) = self.max_call_envelope_bytes {
@@ -2873,7 +2890,11 @@ mod tests {
     /// malformed one is refused.
     #[test]
     fn hc_auth_is_bound_into_the_hash_only_when_present() {
-        let plain = genesis(2);
+        // Block room for three proofs (`gas::min_block_bytes`): the chain-17 caps, on both sides
+        // so the pin is the only difference.
+        let mut plain = genesis(2);
+        plain.max_proof_bytes = Some(4 << 20);
+        plain.max_block_bytes = Some(20 << 20);
         assert_eq!(plain.hc_auth, None);
         assert!(!plain.to_json().contains("hc_auth"), "an absent pin is absent from the file");
         let s = build(&plain);
@@ -2900,6 +2921,51 @@ mod tests {
         let mut bad = plain.clone();
         bad.hc_auth = Some("not hex".into());
         assert!(matches!(bad.build(&StubExecutor), Err(GenesisError::BadHcAuth(_))));
+    }
+
+    /// Split authorisation (review I-1): a v3 `Call` carries three proofs — bundle, auth, call —
+    /// so with `hc_auth` set the block cap must hold `3 · max_proof_bytes + 1 MiB`, judged even
+    /// when the file sets neither cap (the 4 MiB default would admit no `Call` at production FRI).
+    /// A chain without `hc_auth` keeps the two-proof rule, both edges.
+    #[test]
+    fn a_split_auth_genesis_needs_block_room_for_three_proofs() {
+        let headroom = crate::gas::BLOCK_PROOF_HEADROOM as u32;
+        let caps = |auth: bool, proof: Option<u32>, block: Option<u32>| {
+            let mut g = genesis(2);
+            g.hc_auth = auth.then(|| word8_to_hex(&[21; 8]));
+            g.max_proof_bytes = proof;
+            g.max_block_bytes = block;
+            g
+        };
+        let p = 4u32 << 20;
+        // v3: one byte under 3p + 1 MiB is refused, naming the three proofs and both numbers.
+        let under = caps(true, Some(p), Some(3 * p + headroom - 1));
+        match under.build(&StubExecutor) {
+            Err(e @ GenesisError::BlockTooSmallForSplitAuth { block, proof, need }) => {
+                assert_eq!((block, proof, need), ((3 * p + headroom - 1) as usize, p as usize, (3 * p + headroom) as usize));
+                let msg = e.to_string();
+                assert!(msg.contains("bundle, auth, call") && msg.contains(&p.to_string()) && msg.contains(&(3 * p + headroom - 1).to_string()), "{msg}");
+            }
+            other => panic!("expected BlockTooSmallForSplitAuth, got {:?}", other.map(|s| s.hash())),
+        }
+        // Exactly 3p + 1 MiB passes; so do chain 17's 4 MiB proofs in 20 MiB blocks.
+        assert!(caps(true, Some(p), Some(3 * p + headroom)).build(&StubExecutor).is_ok());
+        assert!(caps(true, Some(p), Some(20 << 20)).build(&StubExecutor).is_ok());
+        // Neither cap set: the defaults (2 MiB proofs, 4 MiB blocks) are refused under hc_auth…
+        assert!(matches!(
+            caps(true, None, None).build(&StubExecutor),
+            Err(GenesisError::BlockTooSmallForSplitAuth { block, proof, need })
+                if block == crate::gas::MAX_BLOCK_BYTES && proof == crate::gas::MAX_PROOF_BYTES && need == 7 << 20
+        ));
+        // …and chain 16's 8 MiB proofs in 20 MiB blocks would be too.
+        assert!(caps(true, Some(8 << 20), Some(20 << 20)).build(&StubExecutor).is_err());
+        // Pre-v3: the two-proof threshold, both edges, and the rule-free defaults.
+        assert!(matches!(
+            caps(false, Some(p), Some(2 * p + headroom - 1)).build(&StubExecutor),
+            Err(GenesisError::BadMaxBlockBytes(n)) if n == 2 * p + headroom - 1
+        ));
+        assert!(caps(false, Some(p), Some(2 * p + headroom)).build(&StubExecutor).is_ok());
+        assert!(caps(false, None, None).build(&StubExecutor).is_ok());
     }
 
     /// The cap must be a program length the zkVM can prove: at least one word, and no more than

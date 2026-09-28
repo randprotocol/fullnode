@@ -57,17 +57,29 @@ pub const MAX_ATTESTATION_BYTES: usize = 16_384;
 /// aggregation, not a bigger block, is the queued remedy (§6).
 ///
 /// Since the call-limits change this is the *default*: a genesis file may set `max_block_bytes`
-/// (`MAX_BLOCK_BYTES_MIN..=MAX_BLOCK_BYTES_LIMIT`, and at least `2 · max_proof_bytes +
-/// BLOCK_PROOF_HEADROOM`), and the ledger holds what it set (`Ledger::max_block_bytes`).
+/// (`MAX_BLOCK_BYTES_MIN..=MAX_BLOCK_BYTES_LIMIT`, and at least [`min_block_bytes`]: `2 ·
+/// max_proof_bytes + BLOCK_PROOF_HEADROOM`, three proofs on a split-authorisation chain), and the
+/// ledger holds what it set (`Ledger::max_block_bytes`).
 pub const MAX_BLOCK_BYTES: usize = 4 << 20;
 /// The smallest `max_block_bytes` a genesis file may set: today's 4 MiB.
 pub const MAX_BLOCK_BYTES_MIN: usize = 4 << 20;
 /// The largest `max_block_bytes` a genesis file may set: 64 MiB.
 pub const MAX_BLOCK_BYTES_LIMIT: usize = 64 << 20;
-/// What a block must hold beyond two worst-case proofs (the fee bundle's and a call's) when a
-/// genesis file sets either size cap: `max_block_bytes ≥ 2 · max_proof_bytes + 1 MiB`, so the
-/// largest proof the proof cap admits is one a transaction can actually carry.
+/// What a block must hold beyond the worst-case proofs one transaction carries (see
+/// [`min_block_bytes`]), so the largest proof the proof cap admits is one a transaction can
+/// actually carry.
 pub const BLOCK_PROOF_HEADROOM: usize = 1 << 20;
+/// The smallest `max_block_bytes` a genesis file may pair with a proof cap of `max_proof_bytes`:
+/// room for every proof one transaction can carry, each at the cap, plus
+/// [`BLOCK_PROOF_HEADROOM`] for the rest. A `Call` carries two proofs — the fee bundle's and the
+/// call's — so `2 · max_proof_bytes + 1 MiB`; under split authorisation (genesis `hc_auth` set)
+/// it carries three — the bundle's, the auth proof and the call's — so `3 · max_proof_bytes +
+/// 1 MiB`. Below it, the proof cap would admit proofs no block can hold (at production FRI a
+/// 4 MiB split-authorisation block admits transfers but no `Call`).
+pub fn min_block_bytes(max_proof_bytes: usize, split_auth: bool) -> usize {
+    let proofs = if split_auth { 3 } else { 2 };
+    proofs * max_proof_bytes + BLOCK_PROOF_HEADROOM
+}
 /// The largest `max_call_envelope_bytes` a genesis file may set: 1 MiB. The smallest is today's
 /// cap, [`crate::types::actions::MAX_CALL_ENVELOPE_BYTES`] (18 432), which stays the default.
 pub const MAX_CALL_ENVELOPE_BYTES_LIMIT: usize = 1 << 20;

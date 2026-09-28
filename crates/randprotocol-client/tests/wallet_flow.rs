@@ -124,6 +124,9 @@ fn genesis_v3(validator: &Keypair) -> Genesis {
     Genesis {
         hc_bundle: word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()),
         hc_auth: Some(word8_to_hex(&ZkExecutor::hc_auth())),
+        // Room for three proofs at the default 2 MiB proof cap (`gas::min_block_bytes`): a
+        // split-authorisation genesis at the 4 MiB default is refused.
+        max_block_bytes: Some(7 << 20),
         ..genesis(validator)
     }
 }

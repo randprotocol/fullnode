@@ -56,7 +56,9 @@ it onto the chain-16 fleet; it lands with the chain-17 cut.** Phase 1's v0.6.2 s
 - **Measured** (laptop, test profile): v3 bundle 102 s local / 108–111 s via a paired prover, auth
   6.4–7.4 s; the 2026-09-29 end-to-end run (`docs/prover.md`): a non-own viewing-key-only
   `rand-prover` proved a 5 RAND send, committed, payee credited. A transfer is ~2.85 MB of proofs
-  (1.49 + 1.36 MB) — one per 4 MiB block, ~7 per 20 MiB block; aggregation is the remedy.
+  (1.49 + 1.36 MB) — one per 4 MiB block and no Call, ~7 per 20 MiB block; aggregation is the remedy.
+  A v3 genesis must set `max_block_bytes ≥ 3·max_proof_bytes + 1 MiB` (three proofs: bundle, auth,
+  call; `Genesis::validate` refuses the 4 MiB default); chain 17: 4 MiB proofs, 20 MiB blocks.
 - **Trap — the wallet's remote path on a pre-v3 chain is unchanged** (a spend-key job to an own
   prover); the same binary speaks both, decided by `rand_status.hc_bundle`.
 - **Open (v0.6.4+)**: the wallet does not remember the fee seen at pairing (a prover can raise its
@@ -270,7 +272,7 @@ fullnode, randscan, randprotocol.org and clients; every task reviewed, then two 
 - **The memo**: body plaintext `note (112) ‖ memo field (512)` = `len u16 LE ‖ UTF-8 ‖ zero pad`, sealed
   in the research note layer (`viewing::seal_with_memo`/`memo`, vendored); a malformed field opens as
   no memo, never costing the note. **Genesis `envelope_bytes: 1860`** (only 1860; bound into the hash
-  LAST, only when present — chain 14 `1cff3b7d…` and chain 15 `cc30e085…` unchanged) makes every note
+  after the fields before it — `hardening_v6` and `hc_auth` follow it since v0.6.1/v0.6.3 — only when present — chain 14 `1cff3b7d…` and chain 15 `cc30e085…` unchanged) makes every note
   envelope exactly 1,860 B, genesis allocs included (`TxError::EnvelopeSize`, permanent). It turns on
   at the v1.0 genesis (~chain 20, `rand-node genesis --envelope-bytes 1860`); wallets seal the memo
   form only where `rand_getLimits.envelope_bytes == 1860`, legacy 1,348 B elsewhere.

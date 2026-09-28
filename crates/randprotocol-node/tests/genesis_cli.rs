@@ -149,8 +149,21 @@ fn the_genesis_command_pins_guest_v3_with_the_auth_guest() {
     assert!(!run.status.success(), "--auth-guest with the default guest (v1) is refused too");
     assert!(!default_json.exists(), "and nothing is written");
 
+    // At the default caps (2 MiB proofs, 4 MiB blocks) the pair is refused: a v3 `Call` carries
+    // three proofs and the block must hold 3 * 2 MiB + 1 MiB (review I-1). Nothing is written.
+    let small = dir.path().join("small.json");
+    let run = genesis(&small, &["--bundle-guest", "v3", "--auth-guest"]);
+    assert!(!run.status.success(), "v3 at the 4 MiB default block cap must be refused");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("three proofs (bundle, auth, call)") && stderr.contains("7340032"), "{stderr}");
+    assert!(!small.exists(), "and nothing is written");
+
+    // With chain 17's caps (4 MiB proofs, 20 MiB blocks) it is written.
     let out = dir.path().join("split.json");
-    let run = genesis(&out, &["--bundle-guest", "v3", "--auth-guest", "--hardening-v6"]);
+    let run = genesis(
+        &out,
+        &["--bundle-guest", "v3", "--auth-guest", "--hardening-v6", "--max-proof-bytes", "4194304", "--max-block-bytes", "20971520"],
+    );
     assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
     let gen = read(&out);
     assert_eq!(gen.hc_bundle, word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()));
