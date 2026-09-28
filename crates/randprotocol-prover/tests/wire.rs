@@ -105,7 +105,7 @@ fn zeroizing_a_job_clears_its_secrets() {
     let mut j = job();
     assert_ne!(j.inputs[5], 0);
     zeroize::Zeroize::zeroize(&mut j);
-    assert!(j.inputs.iter().all(|&w| w == 0), "the witness was not zeroized");
+    assert!(j.inputs.is_empty(), "the witness was not zeroized");
     assert_eq!(j.token, [0; 32]);
     assert_eq!(j.reply_key, [0; 32]);
     assert_eq!(j.binding, [0; 8]);

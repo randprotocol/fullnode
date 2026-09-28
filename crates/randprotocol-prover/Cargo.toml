@@ -26,9 +26,11 @@ zeroize = { workspace = true, features = ["derive"] }
 # HCS-1's pins, verbatim from crates/randprotocol-zkvm/Cargo.toml: a job sealed by a wallet must
 # open on a prover, and both sides are this one implementation.
 ml-kem = "=0.3.2"
-chacha20poly1305 = "=0.11.0"
+chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
 rand = { version = "=0.10.2", features = ["std_rng"] }
 rand_core = "=0.10.1"
+# StdRng's stream is ChaCha12 from `chacha20` (HCS-1's third pin, as in the zkvm crate); named only for the pin.
+chacha20 = { version = "=0.10.2", default-features = false }
 axum = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 sysinfo = { version = "0.33", optional = true, default-features = false, features = ["system"] }
