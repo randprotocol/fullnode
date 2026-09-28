@@ -2489,6 +2489,8 @@ mod tests {
         let mut m = Mempool::new(64);
         m.set_gas_policy(GasPolicy::DEFAULT);
         assert_eq!(m.precheck(&call, &ledger, &StubExecutor).unwrap().floor, want);
+    }
+
     /// Spec 2026-09-28 §4.2: on a chain whose genesis carries the `gas` section the pool's floor
     /// for a call IS the ledger's rule — `BUNDLE_BASE + gas_price·GAS_LIMIT + byte_price·KiB` at
     /// the ledger's current prices over the proof's declared limit — with or without a node
