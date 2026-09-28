@@ -263,7 +263,14 @@ async fn a_wallet_mints_scans_sends_and_spends_its_change() {
     let h_in = hash::input_digest(salt, &inputs);
     let (envelope, key) = call_envelope::seal_call_envelope(&a.vk, None, &h_in, salt, &inputs, call_envelope::CallCaps::FALLBACK)
         .expect("the transcript seals");
-    let fee = wallet::call_fee_default(tier, randprotocol_core::gas::call_bytes(&proof, Some(&envelope)));
+    let header = randprotocol_zkvm::executor::decode_canonical(&proof).expect("the call proof decodes");
+    let fee = wallet::call_fee_default(
+        None,
+        tier,
+        header.keccak_log_height,
+        header.sha256_log_height,
+        randprotocol_core::gas::call_bytes(&proof, Some(&envelope)),
+    );
     let action = Action::Call { program: pid, proof, input_envelope: Some(envelope) };
     let call = wallet::submit(
         &rpc,
@@ -448,7 +455,14 @@ async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
     wallet::check_proof_size(proof.len(), wallet::proof_cap(Some(&limits))).expect("inside the proof cap");
     let h_in = hash::input_digest(salt, &inputs);
     let (envelope, _) = call_envelope::seal_call_envelope(&a.vk, None, &h_in, salt, &inputs, caps).expect("seals");
-    let fee = wallet::call_fee_default(tier, gas::call_bytes(&proof, Some(&envelope)));
+    let header = randprotocol_zkvm::executor::decode_canonical(&proof).expect("the call proof decodes");
+    let fee = wallet::call_fee_default(
+        Some(&limits),
+        tier,
+        header.keccak_log_height,
+        header.sha256_log_height,
+        gas::call_bytes(&proof, Some(&envelope)),
+    );
     let action = Action::Call { program: pid, proof, input_envelope: Some(envelope) };
     let call = wallet::submit(&rpc, &a, &mut store, None, action, fee, Burn::None, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
         .await
@@ -468,7 +482,8 @@ async fn a_program_with_a_public_input_is_deployed_and_called_over_it() {
     let (proof, _, _, _) =
         executor::prove_call(FriProfile::Test, &onchain, &inputs, &other, None, Backend::Cpu, caps.max_input_words)
             .expect("a proof over another public input still proves");
-    let fee = wallet::call_fee_default(tier, gas::call_bytes(&proof, None));
+    let header = randprotocol_zkvm::executor::decode_canonical(&proof).expect("the call proof decodes");
+    let fee = wallet::call_fee_default(Some(&limits), tier, header.keccak_log_height, header.sha256_log_height, gas::call_bytes(&proof, None));
     let action = Action::Call { program: pid, proof, input_envelope: None };
     let refused = wallet::submit(&rpc, &a, &mut store, None, action, fee, Burn::None, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true).await;
     drop(slot);

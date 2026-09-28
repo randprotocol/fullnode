@@ -980,7 +980,14 @@ async fn confidential_call_rides_on_a_bundle() {
         randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu)
             .expect("the call proves");
     eprintln!("call: tier {tier}, {} proof bytes, outputs {outputs:?}", proof.len());
-    let call_fee = wallet::call_fee_default(tier, randprotocol_core::gas::call_bytes(&proof, None));
+    let header = randprotocol_zkvm::executor::decode_canonical(&proof).expect("the call proof decodes");
+    let call_fee = wallet::call_fee_default(
+        None,
+        tier,
+        header.keccak_log_height,
+        header.sha256_log_height,
+        randprotocol_core::gas::call_bytes(&proof, None),
+    );
     let called = wallet::submit(
         &n0.rpc,
         &a,
@@ -1619,7 +1626,14 @@ async fn a_call_envelope_is_opened_by_the_caller_and_the_auditor_only() {
     let h_in = hash::input_digest(salt, &inputs);
     let (sealed, key) = call_envelope::seal_call_envelope(&caller.vk, Some(&auditor.address), &h_in, salt, &inputs, call_envelope::CallCaps::FALLBACK)
         .expect("sealing the transcript");
-    let fee = wallet::call_fee_default(tier, randprotocol_core::gas::call_bytes(&proof, Some(&sealed)));
+    let header = randprotocol_zkvm::executor::decode_canonical(&proof).expect("the call proof decodes");
+    let fee = wallet::call_fee_default(
+        None,
+        tier,
+        header.keccak_log_height,
+        header.sha256_log_height,
+        randprotocol_core::gas::call_bytes(&proof, Some(&sealed)),
+    );
     let called = wallet::submit(
         &n0.rpc,
         &caller,

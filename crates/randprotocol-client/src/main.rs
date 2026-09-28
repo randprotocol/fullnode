@@ -355,7 +355,7 @@ enum Cmd {
     /// The outbound burn message with this sequence, for a guardian to sign.
     BridgeMessage { sequence: u64 },
     /// Minimum fee: `fee bundle`, `fee deploy <words> [--public-words M]` or
-    /// `fee call <tier> [--bytes B]`.
+    /// `fee call <tier> [--bytes B] [--keccak-log-height K] [--sha256-log-height S]`.
     Fee {
         /// bundle | deploy | call
         kind: String,
@@ -364,10 +364,17 @@ enum Cmd {
         /// `deploy`: public-input words, priced like code words.
         #[arg(long)]
         public_words: Option<u64>,
-        /// `call`: the call's proof plus input-envelope bytes; only bytes past the free allowance
-        /// (2 MiB + 18 432) add to the fee.
+        /// `call`: the call's proof plus input-envelope bytes. Under a node's gas policy every
+        /// byte prices in; without one, only bytes past the free allowance (2 MiB + 18 432) add
+        /// to the fee.
         #[arg(long)]
         bytes: Option<u64>,
+        /// `call`: the proof's declared hash-table heights, 0 = none.
+        #[arg(long)]
+        keccak_log_height: Option<u8>,
+        /// `call`: the proof's declared hash-table heights, 0 = none.
+        #[arg(long)]
+        sha256_log_height: Option<u8>,
     },
     /// Look up a transaction by hash.
     Tx { hash: String },
@@ -1493,12 +1500,14 @@ async fn main() -> Result<()> {
                         .map_err(|e| anyhow::anyhow!(e))?;
                     (Some(e), Some(key))
                 };
-                // The proof's own bytes cannot be priced before it exists; every call a chain
-                // admits today is inside the free allowance, and `submit_bound_call` refuses a
-                // proof that comes out dearer than this, naming the fee to retry with.
+                // The proof's own bytes, and its hash-table heights, cannot be priced before it
+                // exists — the header the fee is priced on (spec 2026-09-28 §4.1) is what the
+                // hardened path proves for, not what it starts from — so this is priced at 0, 0
+                // (no hash tables) same as an unhardened call under today's caps; `submit_bound_call`
+                // refuses a proof that comes out dearer than this, naming the fee to retry with.
                 let fee = match fee {
                     Some(f) => parse_amount(&f)?,
-                    None => wallet::call_fee_default(tier, gas::call_bytes(&[], envelope.as_ref())),
+                    None => wallet::call_fee_default(limits.as_ref(), tier, 0, 0, gas::call_bytes(&[], envelope.as_ref())),
                 };
                 let cap = wallet::proof_cap(limits.as_ref());
                 let prove = |binding: &[u32; randprotocol_core::types::TX_BINDING_WORDS]| -> Result<Vec<u8>> {
@@ -1533,14 +1542,26 @@ async fn main() -> Result<()> {
                 eprintln!("proved in {:.1?}: tier {tier}, {} bytes, outputs {outputs:?}", t.elapsed(), proof.len());
                 // Before the paying bundle is proved: a proof over the chain's cap would be refused.
                 wallet::check_proof_size(proof.len(), wallet::proof_cap(limits.as_ref()))?;
-                // The fee's byte term counts the proof and the envelope (spec §7); a call under the
-                // free allowance, every call a default chain admits, pays the tier's fee alone.
+                // The fee's byte term counts the proof and the envelope (spec §7); under a node's
+                // gas policy every byte prices in, and without one only what is past the free
+                // allowance does.
                 let bytes = gas::call_bytes(&proof, envelope.as_ref());
-                let action = Action::Call { program: pid, proof, input_envelope: envelope };
+                // The header the fee is priced on (spec 2026-09-28 §4.1): the proof just made.
+                let header = randprotocol_zkvm::executor::decode_canonical(&proof).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                let (klh, slh) = (header.keccak_log_height, header.sha256_log_height);
+                let gas_bound = gas::gas_max(tier, klh, slh);
+                let floor = wallet::call_fee_default(limits.as_ref(), tier, klh, slh, bytes);
                 let fee = match fee {
                     Some(f) => parse_amount(&f)?,
-                    None => wallet::call_fee_default(tier, bytes),
+                    None => floor,
                 };
+                eprintln!(
+                    "gas bound {gas_bound} (tier {tier}{}{}), {bytes} bytes, fee {} RAND",
+                    if klh > 0 { format!(", keccak 2^{klh}") } else { String::new() },
+                    if slh > 0 { format!(", sha256 2^{slh}") } else { String::new() },
+                    format_amount(fee)
+                );
+                let action = Action::Call { program: pid, proof, input_envelope: envelope };
                 let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, &proving, chain_id, true).await;
                 (s, call_key)
             };
@@ -2094,12 +2115,18 @@ async fn main() -> Result<()> {
                 None => println!("no receipt (not a call, or not yet committed)"),
             }
         }
-        Cmd::Fee { kind, n, public_words, bytes } => {
+        Cmd::Fee { kind, n, public_words, bytes, keccak_log_height, sha256_log_height } => {
             if public_words.is_some() && kind != "deploy" {
                 anyhow::bail!("--public-words is for `fee deploy`");
             }
             if bytes.is_some() && kind != "call" {
                 anyhow::bail!("--bytes is for `fee call`");
+            }
+            if keccak_log_height.is_some() && kind != "call" {
+                anyhow::bail!("--keccak-log-height is for `fee call`");
+            }
+            if sha256_log_height.is_some() && kind != "call" {
+                anyhow::bail!("--sha256-log-height is for `fee call`");
             }
             // The optional fields are sent only when given, so an older node is asked exactly
             // what it always was.
@@ -2109,10 +2136,20 @@ async fn main() -> Result<()> {
                     Some(m) => serde_json::json!({ "kind": "deploy", "words": words, "public_words": m }),
                     None => serde_json::json!({ "kind": "deploy", "words": words }),
                 },
-                ("call", Some(tier)) => match bytes {
-                    Some(b) => serde_json::json!({ "kind": "call", "tier": tier, "bytes": b }),
-                    None => serde_json::json!({ "kind": "call", "tier": tier }),
-                },
+                ("call", Some(tier)) => {
+                    let mut spec = serde_json::json!({ "kind": "call", "tier": tier });
+                    let obj = spec.as_object_mut().expect("just built as an object");
+                    if let Some(b) = bytes {
+                        obj.insert("bytes".to_string(), serde_json::json!(b));
+                    }
+                    if let Some(k) = keccak_log_height {
+                        obj.insert("keccak_log_height".to_string(), serde_json::json!(k));
+                    }
+                    if let Some(s) = sha256_log_height {
+                        obj.insert("sha256_log_height".to_string(), serde_json::json!(s));
+                    }
+                    spec
+                }
                 ("deploy", None) => anyhow::bail!("`fee deploy` needs a word count"),
                 ("call", None) => anyhow::bail!("`fee call` needs a tier"),
                 (other, _) => anyhow::bail!("unknown fee kind {other}; expected bundle, deploy or call"),

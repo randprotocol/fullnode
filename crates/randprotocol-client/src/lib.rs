@@ -151,6 +151,26 @@ pub struct ChainLimits {
     /// that predates the field, which is right — such a node runs no chain with the flag.
     #[serde(default)]
     pub hardening_v6: bool,
+    /// Gas units per RAND-unit, under the node's gas policy (spec 2026-09-28 §4.1/§8). `None`
+    /// from a node that runs no policy or predates the field — paired with `byte_price` below to
+    /// decide [`ChainLimits::gas_policy`]. `gas_metering` (`"header"` or `null`) is deliberately
+    /// not decoded here: the wallet needs only the two prices.
+    #[serde(default)]
+    pub gas_price: Option<u64>,
+    /// Byte-units per RAND-unit, under the node's gas policy. See `gas_price` above.
+    #[serde(default)]
+    pub byte_price: Option<u64>,
+}
+
+impl ChainLimits {
+    /// The node's gas policy (spec 2026-09-28 §8), `None` from a node that runs none or
+    /// predates the fields.
+    pub fn gas_policy(&self) -> Option<randprotocol_core::gas::GasPolicy> {
+        match (self.gas_price, self.byte_price) {
+            (Some(gas_price), Some(byte_price)) => Some(randprotocol_core::gas::GasPolicy { gas_price, byte_price }),
+            _ => None,
+        }
+    }
 }
 
 /// Words from `rand_getProgramPublic`'s one hex string: each word as its four little-endian bytes,
@@ -1130,12 +1150,39 @@ mod tests {
                 envelope_bytes: None,
                 // Nor `hardening_v6`: at `false`, the old call rule.
                 hardening_v6: false,
+                // Nor a gas policy: no `gas_price`/`byte_price` key in this reply either.
+                gas_price: None,
+                byte_price: None,
             })
         );
         let older = RpcClient::new(scripted_rpc(vec![]).await);
         assert_eq!(older.limits().await.unwrap(), None);
         let broken = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Err(-32603, "db closed"))]).await);
         assert!(broken.limits().await.is_err());
+    }
+
+    /// `gas_policy()`: `None` from a node that predates the fields or runs no policy; the
+    /// unknown `gas_metering` key is ignored (task 6 does not decode it — the wallet needs only
+    /// the prices).
+    #[tokio::test]
+    async fn limits_gas_policy_is_none_without_both_prices() {
+        use test_rpc::{scripted_rpc, Reply};
+        let no_fields = json!({
+            "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+            "max_call_envelope_bytes": 18432, "max_program_public_words": 64
+        });
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(no_fields))]).await);
+        let limits = rpc.limits().await.unwrap().unwrap();
+        assert_eq!(limits.gas_policy(), None);
+
+        let priced = json!({
+            "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+            "max_call_envelope_bytes": 18432, "max_program_public_words": 64,
+            "gas_price": 100, "byte_price": 800, "gas_metering": "header"
+        });
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(priced))]).await);
+        let limits = rpc.limits().await.unwrap().unwrap();
+        assert_eq!(limits.gas_policy(), Some(randprotocol_core::gas::GasPolicy::DEFAULT));
     }
 
     /// [`RpcClient::envelope_format`] reads `rand_getLimits` at most once, however many times it
