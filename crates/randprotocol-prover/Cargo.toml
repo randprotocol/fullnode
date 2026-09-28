@@ -44,3 +44,7 @@ qrcode = { version = "0.14", default-features = false, optional = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
+
+[[test]]
+name = "service"
+required-features = ["service"]
