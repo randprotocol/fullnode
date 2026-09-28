@@ -6,7 +6,28 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-28)
 
-### v0.6.1 — constraint set 7 (2026-09-28, branch `feat/v061`; NOT tagged, NOT rolled)
+### Chain 16 — LIVE 2026-09-28 16:39 UTC (genesis `20925ae6…3005`, build v0.6.1 `2c75e08`)
+
+Genesis `20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005`, chain id **16**, file
+`deploy/genesis-chain16.json` (sha256 `98036c41…d624`), cut by `deploy/cut-chain16-genesis.sh` with the
+macOS build of the tag (its v2 `hc_bundle` `651043e2…839b` checked equal to the Linux release
+binary's), rolled all-stop/all-start by `deploy/cutover-fleet-chain16.sh` over all 26 hosts. Chain 15
+stopped at ~157 370; its data dirs stay on every host for rollback (retire with
+`deploy/retire-chain-dirs.sh` after a day). `--hardening-v6 --bundle-guest v2`, `consensus_domain 1`,
+26 validators × 1000 RAND (quorum 18), `faucet_minters` = the 18 operator keys, the chain-15 faucet
+allowlist, no aggregation. Bridge: guardian set 1, burn sequence 7, `min_inbound_sequence`
+`{2:2,3:2,4:2,5:2}`, the CURRENT endpoints (the 2026-09-29 contract redeploy needs a later genesis to
+be usable); zUSD carried: 10 zUSD to Anish, locked Tron USDT 9 + Solana USDT 1, audited
+custody == locked == supply after launch. Relayer `rand_cli` → `~/rand-node-a/bin-v061/rand`
+(macOS v0.6.1), funded by 3 × 100 RAND faucet mints (blocks 593/600/608); all 8 guardians
+co-signing for chain 16. GitHub release v0.6.1: `rand-node` sha256 `aed1a3be…58ad6`, `rand`
+`1a6a0419…67ec5` (built on the testbox, Ubuntu 24.04). **Trap from the cut:** chaining
+`push … | tail && switch … | tail && start` let `start` run after `push` failed (`LOCAL_NODE`
+unset — `push` needs a local rand-node to re-derive the hash) — the pipe's exit status is `tail`'s;
+the fleet came back up on chain 15/v0.6 for a minute and was stopped again. Run each phase alone
+and read its rc.
+
+### v0.6.1 — constraint set 7 (2026-09-28; tagged `2c75e08`, released, chain 16's build)
 
 circuits `feat/cs7` at **`b9ffc39`** re-vendored by `deploy/sync-zkvm.sh` (CI `CIRCUITS_PIN` =
 PROVENANCE.md = `b9ffc39`). **A hard fork: v0.6.1 runs ONLY on a new genesis — chain 16.** Every
