@@ -259,13 +259,37 @@ holders in `ZUSD_CARRY` (Σ notes == Σ locked == source custody); RAND as one g
 wallet the operator holds, at its chain-16 balance; the vesting register re-emitted with each
 entry's claimed amount subtracted; validator stakes as chain 16's register holds them (asserted,
 not assumed). **Shielded notes of wallets the operator does not hold cannot be carried** — a
-genesis note needs an opening — and the launch notes must say so. **The `balances` step**
+genesis note needs an opening — and the launch notes must say so. Two more things are refused
+rather than silently dropped, each with an explicit opt-out: a validator with unwithdrawn
+`rewards` on chain 16 (`REWARDS_DROPPED_OK=1` — rewards are never carried either way, withdraw
+them first if that is not the intent) and a wallet reporting pending notes (`PENDING_OK=1`, a
+note submitted but not yet confirmed is not in `balance` and would otherwise vanish with no
+trace). **The vesting carry is an approximation, not the correct one**: the right carry is
+`A·f(t) − C` (`A` = amount, `C` = claimed, `f` = the vesting curve), which the genesis format
+cannot express without a `claimed` field; carrying `(A − C)` on the same schedule instead
+front-loads `C·(1 − f(t))` — that much unlocks early — so an entry with `claimed > 0` is refused
+unless `VESTING_CLAIMED_OK=1` accepts the approximation. **The `balances` step**
 (`cut-chain17-genesis.sh balances <snapshot dir>`, read-only toward the chain, after `snapshot`,
-while chain 16 is up) runs `rand sync` + `balance` for every `*.key.json` under `WALLETS_DIRS`
-against chain 16 and writes `ALLOC_ADDRESSES` from the non-zero balances plus `balances.json`
-beside the snapshot; the cut asserts the alloc list is those wallets one-for-one and Σ alloc ==
-Σ scanned (`NO_BALANCES=1` is the explicit opt-out). `SELFTEST=1` runs the assembly and thirteen
-refusal cases on fixtures derived from `deploy/genesis-chain16.json`, with no network and no binary.
+while chain 16 is up) runs `rand sync` + `balance` + `notes` for every `*.key.json` under
+`WALLETS_DIRS` (default: chain 14's and chain 15's `wallets/` and `payout/`, plus chain 16's
+`wallets/`, since chain 16 has no `payout/` of its own yet) against chain 16 and writes
+`ALLOC_ADDRESSES` from the non-zero balances plus `balances.json` beside the snapshot; it refuses
+against a pruned `CHAIN16_RPC` (a scan needs an archive). It also decodes chain 16's own genesis
+alloc notes' `pk` and lists any that match no scanned wallet ("uncovered genesis allocs" —
+`UNCOVERED_ALLOCS_OK=1` to drop them knowingly; none of the `shielded-1..5` chain-16 alloc wallets'
+key files were found on this laptop when this default was chosen — if they turn up, add their
+directory too). The cut asserts the alloc list is those wallets one-for-one and Σ alloc ==
+Σ scanned (`NO_BALANCES=1` is the explicit opt-out); it warns, but does not refuse, when an
+operator wallet's Σ zUSD differs from `ZUSD_CARRY`'s (a non-operator holder like Anish's wallet
+legitimately differs). A changed `FAUCET_RECIPIENTS` list needs `FAUCET_RECIPIENTS_CHANGED=1`,
+the same rule chain 16 enforces. `EXPECT_HC_AUTH` has no compiled-in default — as of this build,
+`crates/randprotocol-zkvm/tests/guest_provenance.rs` pins the bundle guest's v1/v2/v3 digests but
+not the auth guest's — so read it from a Linux host after `stage`: `/root/rand-node.c17 genesis
+--bundle-guest v3 --auth-guest --hardening-v6 …` and its printed `hc_auth`. `SELFTEST=1` runs the
+assembly twice (once plain, once accepting the `VESTING_CLAIMED_OK=1` front-load) and sixteen
+refusal cases on fixtures derived from `deploy/genesis-chain16.json` (eighteen checks total),
+with no network and no binary; each refusal is checked against its expected reason phrase, not
+just its exit code.
 
 **Order and the gate.** `stage` → bridge stop → `snapshot` → `balances` → **the user's go, typed in
 the executing session** → `stop` → cut → `push` → `switch` → `start` → `wait` → bridge restart →

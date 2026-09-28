@@ -11,8 +11,15 @@
 #   * `rand-node genesis --hardening-v6 --bundle-guest v3 --auth-guest`: delegated proving Phase 2.
 #     `hc_bundle` is the v3 hidden-asset guest (nk and salt in, c = H(AUTH, nk, salt) in the digest;
 #     60af094a… on the v0.6.3 build — EXPECT_HC_BUNDLE), and the new `hc_auth` is the auth guest's
-#     program commitment, hashed after `hardening_v6`. EXPECT_HC_AUTH has NO default: the operator
-#     pins the value the v0.6.3 RELEASE binary reports (the script prints it and refuses unset).
+#     program commitment, hashed after `hardening_v6`. `crates/randprotocol-zkvm/tests/guest_provenance.rs`
+#     pins the bundle guest v1/v2/v3 digests but, as of this build, NO auth-guest digest — so
+#     EXPECT_HC_AUTH has NO compiled-in default and the operator pins the value the v0.6.3 RELEASE
+#     binary reports (the script prints it and refuses unset). Read it from a Linux host after
+#     `stage`: `/root/rand-node.c17 genesis --bundle-guest v3 --auth-guest --hardening-v6 <the
+#     same validator/limits flags this script passes> --out /tmp/x.json`, then read the printed
+#     `hc_auth <hex>` line (or `hc_auth` in /tmp/x.json). Once a `guest_provenance` test pins the
+#     auth guest's digest the way v1/v2/v3 are pinned, default EXPECT_HC_AUTH to it like
+#     EXPECT_HC_BUNDLE — this script still cross-checks it against the built binary's own output.
 #     Every bundle carries an auth proof, every txid is `rand-txid-3`, and the wire changes: a
 #     v0.6.3 node refuses chains 14/15/16 at startup and a v0.6.1/v0.6.2 node cannot decode a
 #     chain-17 bundle — so the roll is all-stop/all-start (deploy/cutover-fleet-chain17.sh).
@@ -36,10 +43,21 @@
 #         of $ZUSD_CARRY (`rand-node alloc-note --asset 1`); Σ notes == Σ locked == source custody.
 #       - RAND: every wallet the operator holds (the `balances` step scans each key file under
 #         $WALLETS_DIRS on chain 16 and writes $ALLOC_ADDRESSES) gets one genesis alloc note of its
-#         chain-16 balance to the same address; Σ alloc == Σ scanned is asserted.
+#         chain-16 balance to the same address; Σ alloc == Σ scanned is asserted. `balances` also
+#         decodes chain 16's own genesis alloc notes' `pk` and lists any that match none of the
+#         scanned wallets ("uncovered genesis allocs"); the cut refuses while that list is
+#         non-empty (UNCOVERED_ALLOCS_OK=1 to drop them knowingly). A wallet's pending notes
+#         (submitted, not yet confirmed) are refused too (PENDING_OK=1 to drop them). `balances`
+#         also refuses against a pruned $CHAIN16_RPC (an archive is needed for a full scan).
 #       - vesting: chain 16's genesis `vesting` section, if any, re-emitted with each entry's claimed
 #         amount subtracted (rand_getVesting at the snapshot); verbatim with a warning if the RPC
-#         lacks it.
+#         lacks it. THIS IS AN APPROXIMATION: the mathematically right carry is `A·f(t) − C` (`A` =
+#         amount, `C` = claimed, `f` = the vesting curve), which the genesis format cannot express
+#         without a `claimed` field. Carrying `(A − C)` on the same schedule instead front-loads
+#         `C·(1 − f(t))` — that much unlocks early — so an entry with `claimed > 0` is refused
+#         unless VESTING_CLAIMED_OK=1 accepts the approximation.
+#       - a validator with unwithdrawn `rewards` on chain 16 is refused (withdraw before the cut,
+#         or REWARDS_DROPPED_OK=1 to drop them — rewards are NOT carried either way).
 #       - SHIELDED NOTES OF WALLETS THE OPERATOR DOES NOT HOLD ARE NOT CARRIED: a genesis alloc note
 #         needs an opening, which only the holder (or the cut, for a note it makes itself) has. The
 #         launch notes must say so.
@@ -75,7 +93,7 @@ FAUCET_RECIPIENTS=${FAUCET_RECIPIENTS:-}           # unset: chain 16's genesis a
 STAKE_RAND=${STAKE_RAND:-1000}
 ALLOC_ADDRESSES=${ALLOC_ADDRESSES:-$HOME/.rand-chain17/alloc-rand.txt}   # "<label> rand1… <RAND>" per line (`balances` writes it)
 ZUSD_CARRY=${ZUSD_CARRY:-$HOME/.rand-chain17/zusd-carry.txt}             # "<label> rand1… <zUSD>" per line
-WALLETS_DIRS=${WALLETS_DIRS:-$HOME/.rand-chain15/wallets $HOME/.rand-chain16/wallets}   # `balances`: dirs of *.key.json
+WALLETS_DIRS=${WALLETS_DIRS:-$HOME/.rand-chain14/wallets $HOME/.rand-chain15/wallets $HOME/.rand-chain16/wallets $HOME/.rand-chain14/payout $HOME/.rand-chain15/payout}   # `balances`: dirs of *.key.json (a missing dir is skipped, printed, never an error)
 RELAYER_DONE_DIR=${RELAYER_DONE_DIR:-}             # optional: the relayer's done/ (done/<chain>/<seq>), a floor cross-check
 EXPECT_HC_BUNDLE=${EXPECT_HC_BUNDLE:-60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce}   # v3
 EXPECT_HC_AUTH=${EXPECT_HC_AUTH:-}                 # REQUIRED for the cut: the auth guest's hc the v0.6.3 release reports
@@ -112,8 +130,8 @@ TRON_API=${TRON_API:-https://api.trongrid.io}
 SOL_RPC=${SOL_RPC:-https://api.mainnet-beta.solana.com}
 SOL_PROGRAM=${SOL_PROGRAM:-FGA3kY3RjfDKjUszJESMYtYXAbsnkFhhoxM3Mb34vycu}
 
-export CHAIN_ID CHAIN16_GENESIS CHAIN16_HASH CHAIN16_RPC VALIDATORS_TSV REGISTRATIONS BONDED GENESIS_NAMES \
-  FAUCET_MINTERS FAUCET_RECIPIENTS STAKE_RAND ALLOC_ADDRESSES ZUSD_CARRY RELAYER_DONE_DIR EXPECT_HC_BUNDLE \
+export CHAIN_ID CHAIN16_GENESIS CHAIN16_HASH CHAIN16_GENESIS_SHA256 CHAIN16_RPC VALIDATORS_TSV REGISTRATIONS BONDED GENESIS_NAMES \
+  FAUCET_MINTERS FAUCET_RECIPIENTS STAKE_RAND ALLOC_ADDRESSES ZUSD_CARRY WALLETS_DIRS RELAYER_DONE_DIR EXPECT_HC_BUNDLE \
   EXPECT_HC_AUTH MAX_PROGRAM_WORDS MAX_PROOF_BYTES MAX_BLOCK_BYTES MAX_CALL_ENVELOPE_BYTES \
   MAX_PROGRAM_PUBLIC_WORDS EPOCH_BLOCKS EMITTER_2 EMITTER_3 EMITTER_4 EMITTER_5 C16_EMITTER_2 C16_EMITTER_3 \
   C16_EMITTER_4 C16_EMITTER_5 MIN_INBOUND_2 MIN_INBOUND_3 MIN_INBOUND_4 MIN_INBOUND_5 ETH_RPC BSC_RPC \
@@ -145,8 +163,12 @@ export UNITS_PY
 # ══ snapshot: read-only reads of chain 16 and of the source endpoints ═════════════════════════
 py_snapshot() {
   python3 - <<'PY'
-import base64, json, os, struct, sys, time, urllib.request, urllib.error
+import base64, hashlib, json, os, struct, sys, time, urllib.request, urllib.error
 E = os.environ
+sha = hashlib.sha256(open(E["CHAIN16_GENESIS"], "rb").read()).hexdigest()
+if sha != E["CHAIN16_GENESIS_SHA256"]:
+    sys.exit(f"cut-chain17: {E['CHAIN16_GENESIS']} is not chain 16's committed genesis file "
+             f"(sha256 {sha[:8]}…, expected {E['CHAIN16_GENESIS_SHA256'][:8]}…)")
 g16 = json.load(open(E["CHAIN16_GENESIS"]))
 BACKINGS = g16["tokens"]["tokens"][0]["backings"]
 
@@ -203,6 +225,7 @@ snap["tokens"] = rand("rand_getTokens")
 snap["supply"] = rand("rand_getSupply")
 
 # ── the vesting register (v0.5.11): only when chain 16's genesis has a section ────────────────
+VESTING_ENTRY_KEYS = {"amount", "claimed", "revoked_at", "revoked_out", "bonded", "unbonding"}
 if g16.get("vesting"):
     entries, unavailable = {}, None
     for e in g16["vesting"]["entries"]:
@@ -210,7 +233,14 @@ if g16.get("vesting"):
         if "error" in r:
             unavailable = f"rand_getVesting: {r['error']}"
             break
-        entries[e["id"]] = r["result"]
+        res = r.get("result")
+        # A disabled or reshaped register ({"enabled": false}, or any answer missing the fields
+        # the cut reads) is treated the same as an RPC error: a clean "copy verbatim" fallback,
+        # never a KeyError deep in the splice step.
+        if not isinstance(res, dict) or not VESTING_ENTRY_KEYS.issubset(res):
+            unavailable = f"rand_getVesting: unexpected answer {res!r}"
+            break
+        entries[e["id"]] = res
     snap["vesting"] = {"unavailable": unavailable} if unavailable else {"entries": entries}
     print(f"cut-chain17: vesting register: {unavailable or f'{len(entries)} entries read'}")
 else:
@@ -264,7 +294,7 @@ PY
 # `rand sync` does. The key files are opened by `rand` only — this script never reads them.
 py_balances() {
   python3 - <<'PY'
-import glob, json, os, subprocess, sys, time, urllib.request
+import glob, json, os, re, subprocess, sys, time, urllib.request
 E = os.environ
 exec(E["UNITS_PY"])
 def rpc(method):
@@ -274,8 +304,14 @@ def rpc(method):
         return json.load(r)["result"]
 if rpc("rand_getGenesisHash") != E["CHAIN16_HASH"]:
     sys.exit(f"cut-chain17: {E['CHAIN16_RPC']} is not chain 16")
+status0 = rpc("rand_status")
+if int(status0.get("prune_floor", 0) or 0) > 0:
+    sys.exit(f"cut-chain17: {E['CHAIN16_RPC']} is pruned (prune_floor {status0['prune_floor']}) — "
+             f"`balances` needs a full scan; point CHAIN16_RPC at an archive (obs1, rand-archive-2)")
 def rand(key, *args):
     p = subprocess.run([E["WALLET"], "--rpc", E["CHAIN16_RPC"], "--key", key, *args], capture_output=True, text=True)
+    if p.stderr.strip():
+        print(p.stderr.strip(), file=sys.stderr)   # RS-1's pruned-node warning and friends: never swallowed
     if p.returncode != 0:
         sys.exit(f"cut-chain17: rand {' '.join(args)} for {key}: {p.stderr.strip()}")
     return p.stdout
@@ -287,8 +323,8 @@ for d in E["WALLETS_DIRS"].split():
         print(f"cut-chain17: {d} does not exist — skipped")
 if not files:
     sys.exit("cut-chain17: no *.key.json under WALLETS_DIRS")
-height0 = rpc("rand_status")["height"]
-by_addr = {}
+height0 = status0["height"]
+by_addr, pending_by_wallet = {}, []
 for f in files:
     label = os.path.basename(f)[: -len(".key.json")]
     addr = rand(f, "address").splitlines()[0].strip()
@@ -300,6 +336,18 @@ for f in files:
     ru = units(line[len("balance: "):-len(" RAND")])
     zo = rand(f, "asset-balance", "1").strip()
     zu = int(zo.split()[2]) if zo.startswith("asset 1: ") else 0
+    # `notes` breaks every row out (including a `pending` column); a note held pending (submitted,
+    # not yet confirmed) does not count toward `balance` and would otherwise vanish from the carry
+    # with no trace.
+    pend = []
+    for nline in rand(f, "notes").splitlines():
+        cols = re.split(r"  +", nline.strip())
+        if len(cols) < 6 or cols[0] == "index":
+            continue
+        if cols[5] != "-":
+            pend.append((cols[1], cols[2], cols[5]))
+    if pend:
+        pending_by_wallet.append((label, pend))
     row = {"label": label, "address": addr, "rand_units": ru, "zusd_units": zu, "file": f}
     prev = by_addr.get(addr)
     if prev and (prev["rand_units"], prev["zusd_units"]) != (ru, zu):
@@ -308,14 +356,51 @@ for f in files:
         by_addr[addr] = row
     print(f"cut-chain17:   {label:<24} {ru / 1e9:>16.9f} RAND  {zu:>12} zUSD units{'  (duplicate key file)' if prev else ''}")
 height1 = rpc("rand_status")["height"]
+if pending_by_wallet and not E.get("PENDING_OK"):
+    detail = "; ".join(f"{label}: " + ", ".join(f"asset {a} amount {amt} ({since})" for a, amt, since in rows) for label, rows in pending_by_wallet)
+    sys.exit(f"cut-chain17: pending note(s) would be dropped from the carry silently: {detail} — wait for them to "
+             f"clear (or fail) and re-run, or set PENDING_OK=1 to drop them")
+elif pending_by_wallet:
+    detail = "; ".join(f"{label}: " + ", ".join(f"asset {a} amount {amt}" for a, amt, _ in rows) for label, rows in pending_by_wallet)
+    print(f"cut-chain17: ⚠ dropping pending note(s) (PENDING_OK=1): {detail}")
 rows = sorted(by_addr.values(), key=lambda r: r["label"])
 carry = [r for r in rows if r["rand_units"] > 0]
 labels = [r["label"] for r in carry]
 if len(set(labels)) != len(labels):
     sys.exit("cut-chain17: two wallets with one label — rename a key file")
 total = sum(r["rand_units"] for r in carry)
+
+# ── chain 16's own genesis alloc notes this scan does not cover ────────────────────────────────
+# A genesis alloc note's owner is `opening.pk` (32 raw bytes); a shielded address is
+# "rand1" + base58(pk || kem_ek), so decoding a scanned wallet's address and comparing its first
+# 32 bytes finds every alloc this operator can still open.
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def b58decode(s):
+    n = 0
+    for c in s:
+        i = B58.find(c)
+        if i < 0:
+            sys.exit(f"cut-chain17: {s!r} is not base58")
+        n = n * 58 + i
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    pad = len(s) - len(s.lstrip("1"))
+    return b"\x00" * pad + body
+scanned_pks = set()
+for addr in by_addr:
+    if addr.startswith("rand1"):
+        raw = b58decode(addr[len("rand1"):])
+        if len(raw) >= 32:
+            scanned_pks.add(raw[:32].hex())
+g16 = json.load(open(E["CHAIN16_GENESIS"]))
+alloc_pks = {n["opening"]["pk"]: n["amount"] for n in g16["alloc"] if n.get("opening", {}).get("asset", 0) == 0}
+uncovered = [{"pk": pk, "amount": amt} for pk, amt in alloc_pks.items() if pk not in scanned_pks]
+if uncovered:
+    print("cut-chain17: uncovered genesis allocs (no scanned wallet's pk matches — the cut refuses "
+          "unless UNCOVERED_ALLOCS_OK=1): " + ", ".join(f"{u['pk'][:12]}… ({u['amount']})" for u in uncovered))
+
 json.dump({"chain16_hash": E["CHAIN16_HASH"], "taken_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-           "height_from": height0, "height_to": height1, "wallets": rows, "carried_rand_units": total},
+           "height_from": height0, "height_to": height1, "wallets": rows, "carried_rand_units": total,
+           "uncovered_genesis_allocs": uncovered},
           open(os.path.join(E["SNAP"], "balances.json"), "w"), indent=1)
 def fmt(u):
     w, f = divmod(u, 10**9)
@@ -328,9 +413,13 @@ with open(E["ALLOC_ADDRESSES"], "w") as out:
 print(f"cut-chain17: {len(carry)} wallet(s) with RAND, Σ {fmt(total)} RAND → {E['ALLOC_ADDRESSES']} (+ {E['SNAP']}/balances.json)")
 z = [r for r in rows if r["zusd_units"]]
 if z:
-    print("cut-chain17: zUSD held by operator wallets (compare with ZUSD_CARRY): " + ", ".join(f"{r['label']} {r['zusd_units']}" for r in z))
-if height1 != height0:
-    print(f"cut-chain17: ⚠ chain 16 moved {height0} → {height1} during the scan — make sure nothing spent from these wallets meanwhile")
+    op_total = sum(r["zusd_units"] for r in z)
+    print(f"cut-chain17: zUSD held by operator wallets: " + ", ".join(f"{r['label']} {r['zusd_units']}" for r in z) + f" (Σ {op_total})")
+    if os.path.isfile(E["ZUSD_CARRY"]):
+        carry_total = sum(units(a, 8) for _, _, a in alloc_lines(E["ZUSD_CARRY"]))
+        if carry_total != op_total:
+            print(f"cut-chain17: ⚠ Σ operator-wallet zUSD ({op_total}) != Σ ZUSD_CARRY ({carry_total}) — "
+                  f"a non-operator holder (e.g. Anish's wallet) legitimately differs; verify by hand")
 PY
 }
 
@@ -372,7 +461,13 @@ for r in rows:
     need(live["payout"] == r["payout"], f"{r['name']}: payout differs from chain 16's register")
     need(int(live["stake"]) == stake and not live["pending"], f"{r['name']}: chain 16 stake {live['stake']} / pending {live['pending']}, not a plain {stake}")
     need(live["active"], f"{r['name']} is not active on chain 16")
+    need(int(live.get("rewards", "0")) == 0 or E.get("REWARDS_DROPPED_OK"),
+         f"{r['name']}: chain 16 shows {live['rewards']} unwithdrawn reward units — withdraw them before the cut "
+         f"(rewards are not carried), or set REWARDS_DROPPED_OK=1 to drop them")
 need(len({r["public_key"] for r in rows}) == 26 and len({r["address"] for r in rows}) == 26, "a validator twice")
+total_rewards = sum(int(register[r["address"]].get("rewards", "0")) for r in rows)
+if total_rewards:
+    print(f"cut-chain17: ⚠ dropping {total_rewards} unwithdrawn reward unit(s) across the register (REWARDS_DROPPED_OK=1)")
 # Chain 16's genesis set is these 26, in this order, with these payouts: nothing re-keyed.
 need([(v["public_key"], v["payout"]) for v in g16["validators"]] == [(r["public_key"], r["payout"]) for r in rows],
      "the 26 are not chain 16's genesis validators (keys, payouts or order)")
@@ -403,6 +498,24 @@ warnings = []
 def need(cond, msg):
     if not cond:
         sys.exit(f"cut-chain17: {msg}")
+
+t_ms = int(time.time() * 1000)
+
+def vested_fraction(e, at_ms):
+    """`vested(entry, t) / amount`, the same cliff-then-linear(-then-step) curve as
+    `ledger::vesting::vested` (crates/randprotocol-core/src/ledger/vesting.rs) — used only to
+    report how far a claimed-out entry's carry would front-load, never to change the carry."""
+    cliff = int(e["start_ms"]) + int(e["cliff_ms"])
+    if at_ms < cliff:
+        return 0.0
+    elapsed = at_ms - cliff
+    linear = int(e["linear_ms"])
+    if elapsed >= linear:
+        return 1.0
+    step = e.get("step_ms")
+    if step:
+        elapsed -= elapsed % int(step)
+    return elapsed / linear
 
 need(snap["genesis_hash"] == E["CHAIN16_HASH"], "the snapshot is not of chain 16")
 b16 = g16["bridge"]
@@ -532,6 +645,14 @@ if os.path.isfile(bal_file):
     listed = sorted((addr, units(a)) for _, addr, a in alloc)
     need(sum(u for _, u in scanned) == alloc_total, f"Σ alloc RAND {alloc_total} != Σ scanned balances {sum(u for _, u in scanned)}")
     need(scanned == listed, "ALLOC_ADDRESSES is not the scanned wallets one-for-one (address, amount) — regenerate it with `balances`")
+    uncovered = bal.get("uncovered_genesis_allocs") or []
+    need(not uncovered or E.get("UNCOVERED_ALLOCS_OK"),
+         "chain 16 genesis alloc(s) match no scanned wallet, so their value would be dropped silently: "
+         + ", ".join(f"pk {u['pk'][:12]}… ({u['amount']})" for u in uncovered)
+         + " — find the key file(s) and add its directory to WALLETS_DIRS, or set UNCOVERED_ALLOCS_OK=1 to drop them")
+    if uncovered:
+        warnings.append("dropped uncovered chain-16 genesis alloc(s): "
+                         + ", ".join(f"pk {u['pk'][:12]}… ({u['amount']})" for u in uncovered))
     rand_carry = f"== Σ scanned ({len(scanned)} wallets, heights {bal['height_from']}..{bal['height_to']})"
 else:
     need(E.get("NO_BALANCES"), f"no {bal_file or 'balances.json'} — run `balances` (the carry-over rule), or set NO_BALANCES=1 to cut from a hand-made list")
@@ -558,15 +679,30 @@ if g16.get("vesting"):
                  f"vesting entry {e['id'][:12]}… was revoked on chain 16 — carry it by hand")
             need(int(r.get("bonded", "0")) == 0 and not r.get("unbonding"),
                  f"vesting entry {e['id'][:12]}… has vesting stake bonded or unbonding — a bond does not carry; carry it by hand")
-            left = int(e["amount"]) - int(r["claimed"])
+            claimed = int(r["claimed"])
+            left = int(e["amount"]) - claimed
             need(left >= 0, f"vesting entry {e['id'][:12]}… claimed more than its amount")
+            if claimed > 0:
+                # The right carry is A·f(t) − C (A = amount, C = claimed, f = the vesting curve at
+                # now); the genesis format has no `claimed` field to express it. Carrying (A − C) on
+                # the SAME schedule instead gives (A − C)·f(t) = A·f(t) − C·f(t), i.e. C·(1 − f(t))
+                # MORE than correct at every future t: that much unlocks early. Refused unless the
+                # operator accepts the approximation.
+                frac = vested_fraction(e, t_ms)
+                frontload = int(round(claimed * (1 - frac)))
+                need(E.get("VESTING_CLAIMED_OK"),
+                     f"vesting entry {e['id'][:12]}…: claimed {claimed} > 0 — carrying (amount − claimed) on the "
+                     f"same schedule front-loads {frontload} unit(s) (C·(1−f(t)), t = now) ahead of the correct "
+                     f"A·f(t) − C curve; set VESTING_CLAIMED_OK=1 to accept this approximation")
             if left == 0:
                 dropped += 1
                 continue
             entries.append({**e, "amount": str(left)})
         if any(int(sv["entries"][e["id"]]["claimed"]) for e in g16["vesting"]["entries"]):
-            warnings.append("vesting: claimed amounts were subtracted but the schedules kept — an entry now vests "
-                            "(amount − claimed) along the original curve; confirm that is the intended remaining schedule")
+            warnings.append("vesting: claimed amounts were subtracted from carried entries on the SAME schedule "
+                            "(VESTING_CLAIMED_OK=1) — this front-loads each entry's claimed amount by C·(1−f(now)) "
+                            "units early; the mathematically right carry, A·f(t) − C, is not expressible without a "
+                            "`claimed` field in the genesis format")
         vest_note = f"{len(entries)} entries carried, {dropped} fully claimed dropped, Σ {sum(int(e['amount']) for e in entries)}"
     if entries:
         g["vesting"] = {"entries": entries}
@@ -577,6 +713,9 @@ if E.get("FAUCET_RECIPIENTS"):
     recipients = [l.split()[-1] for l in open(E["FAUCET_RECIPIENTS"]) if l.strip() and not l.startswith("#")]
     need(recipients and all(r.startswith("rand1") for r in recipients) and len(set(recipients)) == len(recipients),
          "FAUCET_RECIPIENTS: rand1… addresses, each once")
+    need(recipients == s16["faucet_recipients"] or E.get("FAUCET_RECIPIENTS_CHANGED"),
+         f"the faucet allowlist differs from chain 16's ({len(s16['faucet_recipients'])} → {len(recipients)}) "
+         f"— set FAUCET_RECIPIENTS_CHANGED=1 if that is the decision")
     if recipients != s16["faucet_recipients"]:
         warnings.append(f"faucet allowlist changed from chain 16's ({len(s16['faucet_recipients'])} → {len(recipients)})")
 else:
@@ -677,8 +816,8 @@ snap = {"taken_at": "selftest", "genesis_hash": E["CHAIN16_HASH"], "status_heigh
         "tokens": {"tokens": [{"index": 1, "symbol": "zUSD", "total_supply": str(sum(x.get("locked", 0) for x in z["backings"])),
                                "authority": {"kind": "bridged", "backings": [{**{k: x[k] for k in ("chain", "token", "decimals")}, "locked": str(x.get("locked", 0))} for x in z["backings"]]}}]},
         "supply": {},
-        "vesting": {"entries": {"11" * 32: {"amount": "1000000000000", "claimed": "250000000000", "revoked_out": "0", "revoked_at": None, "bonded": "0", "unbonding": []},
-                                "22" * 32: {"amount": "5000000000", "claimed": "5000000000", "revoked_out": "0", "revoked_at": None, "bonded": "0", "unbonding": []}}},
+        "vesting": {"entries": {"11" * 32: {"amount": "1000000000000", "claimed": "0", "revoked_out": "0", "revoked_at": None, "bonded": "0", "unbonding": []},
+                                "22" * 32: {"amount": "5000000000", "claimed": "0", "revoked_out": "0", "revoked_at": None, "bonded": "0", "unbonding": []}}},
         "source": {"emitters": b["emitters"], "next_sequence": {c: int(v) for c, v in b["min_inbound_sequence"].items()},
                    "custody": {f"{x['chain']}:{x['token']}": {"custody": x.get("locked", 0) * 10**x["decimals"] // 10**8 if x["decimals"] <= 8 else x.get("locked", 0) * 10**(x["decimals"] - 8), "fees": 0} for x in z["backings"]}}}
 json.dump(snap, open(f"{st}/snap/chain16-state.json", "w"))
@@ -686,12 +825,13 @@ rand_notes = [n for n in g16["alloc"] if n["opening"].get("asset", 0) == 0]
 zusd_notes = [n for n in g16["alloc"] if n["opening"].get("asset", 0) == 1]
 wallets = [{"label": f"w{i}", "address": f"rand1SELFTEST{i}", "rand_units": n["amount"], "zusd_units": 0, "file": "-"} for i, n in enumerate(rand_notes)]
 wallets.append({"label": "empty", "address": "rand1SELFTESTempty", "rand_units": 0, "zusd_units": 0, "file": "-"})
-json.dump({"chain16_hash": E["CHAIN16_HASH"], "height_from": 200000, "height_to": 200000, "wallets": wallets}, open(f"{st}/snap/balances.json", "w"))
+json.dump({"chain16_hash": E["CHAIN16_HASH"], "height_from": 200000, "height_to": 200000, "wallets": wallets, "uncovered_genesis_allocs": []}, open(f"{st}/snap/balances.json", "w"))
 with open(f"{st}/alloc-rand.txt", "w") as f:
     f.write("# selftest\n")
     for w in wallets[:-1]:
         f.write(f"{w['label']} {w['address']} {w['rand_units'] // 10**9}\n")
 open(f"{st}/zusd-carry.txt", "w").write("".join(f"holder rand1SELFTESTz {n['amount'] / 1e8:g}\n" for n in zusd_notes))
+open(f"{st}/faucet-recipients-changed.txt", "w").write("someone rand1SELFTESTfaucetrecipientchanged\n")
 with open(f"{st}/tmp/token-notes.jsonl", "w") as f:
     for n in zusd_notes:
         f.write(json.dumps(n) + "\n")
@@ -723,34 +863,63 @@ g = json.load(open(E["OUT"]))
 assert g["chain_id"] == 17 and g["hc_auth"] == E["EXPECT_HC_AUTH"] and g["hc_bundle"] == E["EXPECT_HC_BUNDLE"]
 assert list(g)[-2:] == ["hardening_v6", "hc_auth"], list(g)
 assert g["bridge"]["min_inbound_sequence"] == {"2": 2, "3": 2, "4": 2, "5": 2}
-assert g["vesting"] == {"entries": [{**json.load(open(E["CHAIN16_GENESIS"]))["vesting"]["entries"][0], "amount": "750000000000"}]}, g["vesting"]
+assert g["vesting"] == {"entries": json.load(open(E["CHAIN16_GENESIS"]))["vesting"]["entries"]}, g["vesting"]
 assert sum(n["amount"] for n in g["alloc"] if n["opening"].get("asset", 0) == 1) == 1000000000
 assert len(g["validators"]) == 26 and g["consensus_domain"] == 1
 PY
-    then ok "the chain-16 fixture assembles into a chain-17 genesis (floors 2, vesting 1e12−2.5e11 carried, the claimed-out entry dropped)"; else bad "assembled genesis content"; fi
+    then ok "the chain-16 fixture assembles into a chain-17 genesis (floors 2, no claims, both vesting entries carried unchanged)"; else bad "assembled genesis content"; fi
   else bad "the happy path refused"; fi
 
-  # every refusal the cut must make, one per case: <description> <python mutation of a fixture file> [env]
+  # VESTING_CLAIMED_OK=1: the front-loaded approximation still carries (the fully-claimed entry drops)
+  cp "$ST/snap/chain16-state.json" "$ST/snap/chain16-state.json.claimtest"
+  python3 -c 'import json,sys
+p = sys.argv[1]; d = json.load(open(p))
+d["vesting"]["entries"]["11"*32]["claimed"] = "250000000000"
+d["vesting"]["entries"]["22"*32]["claimed"] = "5000000000"
+json.dump(d, open(p, "w"))' "$ST/snap/chain16-state.json"
+  fresh
+  if VESTING_CLAIMED_OK=1 py_validators >/dev/null 2>"$ST/log" && VESTING_CLAIMED_OK=1 py_splice >>"$ST/log" 2>&1; then
+    if python3 - <<'PY2'
+import json, os
+g = json.load(open(os.environ["OUT"]))
+g16 = json.load(open(os.environ["CHAIN16_GENESIS"]))
+assert g["vesting"] == {"entries": [{**g16["vesting"]["entries"][0], "amount": "750000000000"}]}, g["vesting"]
+PY2
+    then ok "VESTING_CLAIMED_OK=1 carries the front-loaded approximation (fully-claimed entry dropped)"
+    else bad "VESTING_CLAIMED_OK=1 produced the wrong genesis: $(tail -3 "$ST/log")"; fi
+  else bad "VESTING_CLAIMED_OK=1 happy path refused: $(tail -3 "$ST/log")"; fi
+  mv "$ST/snap/chain16-state.json.claimtest" "$ST/snap/chain16-state.json"
+
+  # every refusal the cut must make, one per case: <description> <file> <mutation> <expected reason phrase> [env]
   refuse() {
-    local what=$1 file=$2 mutation=$3; shift 3
+    local what=$1 file=$2 mutation=$3 phrase=$4; shift 4
     cp "$file" "$file.orig"
     python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); $mutation; json.dump(d, open(p,'w'))" "$file"
     fresh
-    if (env "$@" bash -c 'py_validators >/dev/null && py_splice' >"$ST/log" 2>&1); then bad "$what — accepted"; else ok "$what — $(grep -o 'cut-chain17: .*' "$ST/log" | tail -1 | cut -c1-110)"; fi
+    if (env "$@" bash -c 'py_validators >/dev/null && py_splice' >"$ST/log" 2>&1); then
+      bad "$what — accepted"
+    else
+      local msg; msg=$(grep -o 'cut-chain17: .*' "$ST/log" | tail -1 | cut -c1-110)
+      if grep -qF "$phrase" "$ST/log"; then ok "$what — $msg"; else bad "$what — refused, but not for the expected reason (wanted \"$phrase\"): $msg"; fi
+    fi
     mv "$file.orig" "$file"
   }
   export -f py_validators py_splice
-  refuse "custody one unit above locked"     "$ST/snap/chain16-state.json" 'd["source"]["custody"][[k for k in d["source"]["custody"] if k.startswith("4:")][0]]["custody"] += 1'
-  refuse "a scanned balance the list lacks"  "$ST/snap/balances.json"      'd["wallets"][0]["rand_units"] += 1'
-  refuse "a validator bonded on chain 16"    "$ST/snap/chain16-state.json" 'd["validators"].append(dict(d["validators"][0], address="new"))'
-  refuse "a stake that is not 1000 RAND"     "$ST/snap/chain16-state.json" 'd["validators"][3]["stake"] = "2000000000000"'
-  refuse "an unminted lock (next seq 3)"     "$ST/snap/chain16-state.json" 'd["source"]["next_sequence"]["3"] = 3' MIN_INBOUND_3=2
-  refuse "a floor below chain 16's"          "$ST/snap/chain16-state.json" 'pass' MIN_INBOUND_2=1
-  refuse "a guardian rotation on chain 16"   "$ST/snap/chain16-state.json" 'd["bridge"]["guardian_set_index"] = 2'
-  refuse "a revoked vesting entry"           "$ST/snap/chain16-state.json" 'd["vesting"]["entries"]["11"*32]["revoked_at"] = 5'
-  refuse "zUSD supply above Σ locked"        "$ST/snap/chain16-state.json" 'd["tokens"]["tokens"][0]["total_supply"] = "1000000001"'
-  refuse "hc_auth not the pinned one"        "$ST/snap/chain16-state.json" 'pass' EXPECT_HC_AUTH="$(printf 'cd%.0s' $(seq 32))"
-  refuse "no balances.json, no NO_BALANCES"  "$ST/snap/chain16-state.json" 'pass' BALANCES_FILE=/nonexistent
+  refuse "custody one unit above locked"     "$ST/snap/chain16-state.json" 'd["source"]["custody"][[k for k in d["source"]["custody"] if k.startswith("4:")][0]]["custody"] += 1' "source custody"
+  refuse "a scanned balance the list lacks"  "$ST/snap/balances.json"      'd["wallets"][0]["rand_units"] += 1' "!= Σ scanned balances"
+  refuse "a validator bonded on chain 16"    "$ST/snap/chain16-state.json" 'd["validators"].append(dict(d["validators"][0], address="new"))' "chain 16's register holds"
+  refuse "a stake that is not 1000 RAND"     "$ST/snap/chain16-state.json" 'd["validators"][3]["stake"] = "2000000000000"' "not a plain"
+  refuse "an unminted lock (next seq 3)"     "$ST/snap/chain16-state.json" 'd["source"]["next_sequence"]["3"] = 3' "will mint on chain 17" MIN_INBOUND_3=2
+  refuse "a floor below chain 16's"          "$ST/snap/chain16-state.json" 'pass' "below chain 16's own floor" MIN_INBOUND_2=1
+  refuse "a guardian rotation on chain 16"   "$ST/snap/chain16-state.json" 'd["bridge"]["guardian_set_index"] = 2' "BRIDGE_ROTATED=1"
+  refuse "a revoked vesting entry"           "$ST/snap/chain16-state.json" 'd["vesting"]["entries"]["11"*32]["revoked_at"] = 5' "was revoked on chain 16"
+  refuse "zUSD supply above Σ locked"        "$ST/snap/chain16-state.json" 'd["tokens"]["tokens"][0]["total_supply"] = "1000000001"' "!= Σ locked"
+  refuse "hc_auth not the pinned one"        "$ST/snap/chain16-state.json" 'pass' "is not EXPECT_HC_AUTH" EXPECT_HC_AUTH="$(printf 'cd%.0s' $(seq 32))"
+  refuse "no balances.json, no NO_BALANCES"  "$ST/snap/chain16-state.json" 'pass' "the carry-over rule" BALANCES_FILE=/nonexistent
+  refuse "a vesting entry with claimed but no VESTING_CLAIMED_OK" "$ST/snap/chain16-state.json" 'd["vesting"]["entries"]["11"*32]["claimed"] = "1"' "VESTING_CLAIMED_OK=1 to accept"
+  refuse "unwithdrawn validator rewards, no REWARDS_DROPPED_OK"   "$ST/snap/chain16-state.json" 'd["validators"][0]["rewards"] = "1"' "REWARDS_DROPPED_OK=1 to drop"
+  refuse "an uncovered genesis alloc, no UNCOVERED_ALLOCS_OK"     "$ST/snap/balances.json"      'd["uncovered_genesis_allocs"] = [{"pk": "ab" * 32, "amount": 1}]' "UNCOVERED_ALLOCS_OK=1 to drop"
+  refuse "a changed faucet allowlist, no FAUCET_RECIPIENTS_CHANGED" "$ST/snap/chain16-state.json" 'pass' "FAUCET_RECIPIENTS_CHANGED=1 if that is" FAUCET_RECIPIENTS="$ST/faucet-recipients-changed.txt"
   # the bash-level guard: a redeployed endpoint without an explicit floor
   if env -u MIN_INBOUND_2 SELFTEST=0 EMITTER_2=$NEW_EMITTER bash "$0" >"$ST/log" 2>&1; then bad "a changed emitter without MIN_INBOUND — accepted"
   else grep -q 'set MIN_INBOUND_2 explicitly' "$ST/log" && ok "a changed emitter without MIN_INBOUND_2 — refused before anything runs" || bad "changed emitter: wrong refusal: $(tail -1 "$ST/log")"; fi
@@ -872,7 +1041,7 @@ cut-chain17: genesis hash $HASH
 cut-chain17: chain id $CHAIN_ID, hc_bundle $HC_REPORTED (guest v3), hc_auth $HC_AUTH_REPORTED, hardening_v6, consensus_domain 1, no aggregation
 cut-chain17: 26 validators × $STAKE_RAND RAND (quorum 18); faucet minters: $FAUCET_MINTERS
 cut-chain17: floors 2:$MIN_INBOUND_2 3:$MIN_INBOUND_3 4:$MIN_INBOUND_4 5:$MIN_INBOUND_5 (auto = the snapshot's next sequence; see the splice line above)
-cut-chain17: NOT carried: shielded notes of wallets the operator does not hold — say so in the launch notes.
+cut-chain17: NOT carried: shielded notes of wallets the operator does not hold, and any unwithdrawn validator rewards — say so in the launch notes.
 
 ⚠  Stamped $AGE s ago; the chain's clock starts there. Launch within MINUTES, or delete $OUT and re-cut.
 EOF

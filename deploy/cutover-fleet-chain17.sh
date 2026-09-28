@@ -195,6 +195,8 @@ start)
   echo "== start the other 24 $(date -u +%T)"
   for ip in $ALL; do case " $BOOTS " in *" $ip "*) continue;; esac
     ( on "$ip" 'systemctl start rand-node; sleep 2; echo "   $(hostname): $(systemctl is-active rand-node)"' ) & done; wait
+  # A start that ran is a start that happened; keep the marker from licensing a second one later.
+  rm -f "$1"
   echo "START-DONE $(date -u +%T) — nothing commits until 18 of the 26 validators are up"
   ;;
 wait)
