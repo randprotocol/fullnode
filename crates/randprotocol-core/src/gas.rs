@@ -611,8 +611,10 @@ pub fn subsidy(n: u64, cfg: &crate::ledger::aggregation::AggregationConfig) -> u
 /// flat gas limit, and how gas is metered. A genesis parameter like `max_program_words` — outside
 /// the state root and `Ledger`'s equality, restored by `reload_ledger` on every restart — bound
 /// into the genesis hash only when the section is present, so a chain without one hashes
-/// byte-for-byte as before.
+/// byte-for-byte as before. Unknown keys are refused (`deny_unknown_fields`): a misspelled
+/// `dynamic` must not quietly mean fixed prices.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GasConfig {
     /// Units of RAND per gas (spec §3.1's unit; §3.3's default is [`GAS_PRICE_DEFAULT`]). A
     /// decimal string in the file, like every other genesis amount.
@@ -645,8 +647,10 @@ pub enum GasMetering {
 
 /// Phase 2 (spec §7.1): the parameters of the per-block price controller. State derived from
 /// this section (the live `gas_price`/`byte_price`) lives on the ledger, not here — this is only
-/// the genesis file's declaration of how that state starts and moves.
+/// the genesis file's declaration of how that state starts and moves. Unknown keys are refused,
+/// as in [`GasConfig`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DynamicGas {
     /// The block-bytes figure the controller targets: `byte_price` falls when a block is under
     /// this and rises when it is over. Must be `1..=max_block_bytes` (today's default when the

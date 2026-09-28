@@ -1618,7 +1618,7 @@ async fn main() -> Result<()> {
                 let bytes = wallet::hardened_call_quote_bytes(limits.as_ref(), envelope.as_ref().map_or(0, |e| e.len()));
                 let fee = match fee {
                     Some(f) => parse_amount(&f)?,
-                    None => wallet::call_fee_default(limits.as_ref(), tier, 0, 0, priced_gas, bytes),
+                    None => wallet::call_fee_default(limits.as_ref(), tier, 0, 0, priced_gas, bytes)?,
                 };
                 if limits.as_ref().is_some_and(|l| l.gas_circuit) {
                     eprintln!("fee {} RAND{}", format_amount(fee), headroom_note(limits.as_ref()));
@@ -1673,7 +1673,7 @@ async fn main() -> Result<()> {
                 // Fail-closed (`wallet::declared_gas`): a proof whose public values stop short of
                 // GAS is an error here, never silently priced at the header's ceiling.
                 let declared = wallet::declared_gas(&header.public_values)?;
-                let floor = wallet::call_fee_default(limits.as_ref(), tier, klh, slh, declared, bytes);
+                let floor = wallet::call_fee_default(limits.as_ref(), tier, klh, slh, declared, bytes)?;
                 let fee = match fee {
                     Some(f) => parse_amount(&f)?,
                     None => floor,

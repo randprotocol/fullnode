@@ -425,8 +425,9 @@ pub struct Genesis {
     /// controller's parameters. A genesis parameter like `max_program_words`: outside the state
     /// root and `Ledger`'s equality, restored by `reload_ledger` on every restart. Absent from a
     /// chain cut before it — chain 15's file included — hashes byte-for-byte as before; present,
-    /// it is bound into the genesis hash after `hardening_v6`. No fee floor or price rule reads
-    /// it yet (a later task).
+    /// it is bound into the genesis hash after `hardening_v6`. Read by the call floor (a validity
+    /// rule: `Ledger::gas_call_floor`), the bundle's pinned `bundle_gas_limit`
+    /// (`TxError::BundleGasLimit`) and, under `dynamic`, the per-block price controller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gas: Option<gas::GasConfig>,
 }
@@ -584,6 +585,27 @@ pub struct GenesisState {
     pub block: Block,
     /// The alloc notes in file order: commitment, envelope, amount.
     pub notes: Vec<(Word8, Envelope, u64)>,
+}
+
+/// The bytes a `gas` section appends to the genesis commitment, last (design 2026-09-28 §4.2,
+/// §4.3, §7.1): `"gas" ‖ be64(gas_price) ‖ be64(byte_price) ‖ be64(bundle_gas_limit) ‖
+/// "circuit"`, then, under `dynamic`, `"gas_dynamic" ‖ be64(target_block_bytes) ‖
+/// be64(target_block_gas) ‖ be64(adjust_bps) ‖ be64(min_gas_price) ‖ be64(min_byte_price)`.
+/// Pinned byte for byte by `the_gas_sections_hash_contribution_is_pinned`.
+fn gas_commit(g: &gas::GasConfig) -> Vec<u8> {
+    let mut commit = Vec::new();
+    commit.extend_from_slice(b"gas");
+    commit.extend_from_slice(&g.gas_price.to_be_bytes());
+    commit.extend_from_slice(&g.byte_price.to_be_bytes());
+    commit.extend_from_slice(&g.bundle_gas_limit.to_be_bytes());
+    commit.extend_from_slice(b"circuit");
+    if let Some(d) = &g.dynamic {
+        commit.extend_from_slice(b"gas_dynamic");
+        for x in [d.target_block_bytes, d.target_block_gas, d.adjust_bps as u64, d.min_gas_price, d.min_byte_price] {
+            commit.extend_from_slice(&x.to_be_bytes());
+        }
+    }
+    commit
 }
 
 impl GenesisState {
@@ -1173,17 +1195,7 @@ impl Genesis {
         // Gas (design 2026-09-28 §4.2, §4.3, §7.1), last: only when the file sets it, so every
         // genesis cut before it hashes byte-for-byte as before.
         if let Some(g) = &self.gas {
-            commit.extend_from_slice(b"gas");
-            commit.extend_from_slice(&g.gas_price.to_be_bytes());
-            commit.extend_from_slice(&g.byte_price.to_be_bytes());
-            commit.extend_from_slice(&g.bundle_gas_limit.to_be_bytes());
-            commit.extend_from_slice(b"circuit");
-            if let Some(d) = &g.dynamic {
-                commit.extend_from_slice(b"gas_dynamic");
-                for x in [d.target_block_bytes, d.target_block_gas, d.adjust_bps as u64, d.min_gas_price, d.min_byte_price] {
-                    commit.extend_from_slice(&x.to_be_bytes());
-                }
-            }
+            commit.extend_from_slice(&gas_commit(g));
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -3082,6 +3094,94 @@ mod tests {
             bad_dyn(gas::DynamicGas { min_gas_price: 101, ..d.clone() }).contains("min_gas_price"),
             "the floor cannot exceed the starting price"
         );
+    }
+
+    /// Final-review minor 6: the gas section's contribution to the genesis hash, byte for byte,
+    /// written out by hand — a reordered, re-endianed or re-tagged field is a new chain, so it
+    /// must fail here first. And it is what `build` appends: each field moves the hash.
+    #[test]
+    fn the_gas_sections_hash_contribution_is_pinned() {
+        let fixed = gas::GasConfig {
+            gas_price: 0x0102,
+            byte_price: 0x0304,
+            bundle_gas_limit: 20_479,
+            metering: gas::GasMetering::Circuit,
+            dynamic: None,
+        };
+        let mut want = b"gas".to_vec();
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x01, 0x02]);
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x03, 0x04]);
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x4f, 0xff]); // 20 479
+        want.extend_from_slice(b"circuit");
+        assert_eq!(gas_commit(&fixed), want);
+
+        let dynamic = gas::GasConfig {
+            dynamic: Some(gas::DynamicGas {
+                target_block_bytes: 10_485_760,
+                target_block_gas: 262_144,
+                adjust_bps: 1250,
+                min_gas_price: 0x0102,
+                min_byte_price: 0x0304,
+            }),
+            ..fixed.clone()
+        };
+        want.extend_from_slice(b"gas_dynamic");
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0xa0, 0, 0]); // 10 485 760
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0x04, 0, 0]); // 262 144
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x04, 0xe2]); // 1 250
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x01, 0x02]);
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x03, 0x04]);
+        assert_eq!(gas_commit(&dynamic), want);
+
+        // Every field reaches the hash `build` computes.
+        let hash_of = |cfg: gas::GasConfig| {
+            let mut g = genesis(1);
+            g.max_block_bytes = Some(20 << 20);
+            g.gas = Some(cfg);
+            build(&g).hash()
+        };
+        let base = hash_of(dynamic.clone());
+        let d = dynamic.dynamic.clone().unwrap();
+        for moved in [
+            gas::GasConfig { gas_price: 0x0103, dynamic: Some(gas::DynamicGas { min_gas_price: 0x0103, ..d.clone() }), ..dynamic.clone() },
+            gas::GasConfig { byte_price: 0x0305, ..dynamic.clone() },
+            gas::GasConfig { dynamic: Some(gas::DynamicGas { target_block_bytes: 10_485_761, ..d.clone() }), ..dynamic.clone() },
+            gas::GasConfig { dynamic: Some(gas::DynamicGas { target_block_gas: 262_145, ..d.clone() }), ..dynamic.clone() },
+            gas::GasConfig { dynamic: Some(gas::DynamicGas { adjust_bps: 1251, ..d.clone() }), ..dynamic.clone() },
+            gas::GasConfig { dynamic: Some(gas::DynamicGas { min_byte_price: 0x0303, ..d.clone() }), ..dynamic.clone() },
+            fixed.clone(),
+        ] {
+            assert_ne!(hash_of(moved.clone()), base, "{moved:?}");
+        }
+    }
+
+    /// Final-review minor 5: a misspelled key inside `gas` (or `gas.dynamic`) is refused at
+    /// parse — a `"dynamik"` must not quietly mean fixed prices, nor a `"min_gas_prise"` a floor
+    /// of the default.
+    #[test]
+    fn a_misspelled_gas_key_is_refused() {
+        let mut g = genesis(1);
+        g.gas = Some(gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: 20_479,
+            metering: gas::GasMetering::Circuit,
+            dynamic: Some(gas::DynamicGas {
+                target_block_bytes: 2 << 20,
+                target_block_gas: 1 << 18,
+                adjust_bps: 1250,
+                min_gas_price: 100,
+                min_byte_price: 800,
+            }),
+        });
+        let json = g.to_json();
+        assert!(Genesis::from_json(&json).is_ok());
+        let dynamik = json.replacen("\"dynamic\"", "\"dynamik\"", 1);
+        assert_ne!(dynamik, json);
+        assert!(Genesis::from_json(&dynamik).is_err(), "a misspelled `dynamic` must not parse as fixed prices");
+        let inner = json.replacen("\"adjust_bps\"", "\"adjust_bps\": 1250, \"adjust_bsp\"", 1);
+        assert_ne!(inner, json);
+        assert!(Genesis::from_json(&inner).is_err(), "an unknown key inside `dynamic` is refused too");
     }
 
     /// Final-review I3: `bundle_gas_limit` must be the bundle guest's own ceiling,

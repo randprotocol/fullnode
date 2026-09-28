@@ -508,7 +508,7 @@ impl randprotocol_core::consensus::CoveredSource for StoreCovered {
 
 /// The form a stored block is served in (spec §7): every transaction whose record is
 /// `Pruned` rides as the record's marker form with a side-table entry — the raw hash, the
-/// proof hash, the 34 public values and the declared shape — in transaction order. A block
+/// proof hash, the `pv::NUM` (35) public values and the declared shape — in transaction order. A block
 /// with no pruned records is raw by construction: the two forms share one wire type.
 fn sealed_form_of(storage: &Storage, cb: &CommittedBlock) -> CommittedBlock {
     let mut block = cb.block.clone();
@@ -4930,7 +4930,7 @@ mod tests {
         (dir, storage, gs, covered_tx, mint_tx)
     }
 
-    /// Assembly reads the store (spec §3.2): the covered bundle's 34 public values and its
+    /// Assembly reads the store (spec §3.2): the covered bundle's `pv::NUM` public values and its
     /// declared shape come back off the stored proof's header, the profile filled from the chain.
     #[test]
     fn assembly_reads_the_stored_bundle_records() {
@@ -5129,7 +5129,7 @@ mod tests {
         storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
 
         // The pruned record exactly as the pruning pass writes it: the marker form, the proof
-        // hash, 34 public values whose `OUT` words are the bundle's digest, a declared shape.
+        // hash, `pv::NUM` public values whose `OUT` words are the bundle's digest, a declared shape.
         let bundle = raw.bundle.as_ref().unwrap();
         let digest = StubExecutor.bundle_digest(&bundle.digest_input());
         let mut public_values = vec![0u64; pv::NUM];
