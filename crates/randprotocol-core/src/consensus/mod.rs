@@ -25,6 +25,22 @@ pub const MAX_CLOCK_DRIFT_MS: u64 = 15_000;
 /// rule: a block refused here is still valid to a replica whose view has caught up.
 pub const PROPOSAL_VIEW_WINDOW: u64 = 8;
 
+/// The most blocks one proposer keeps in a replica's orphan pool (CN-5, issue #46): a sixteenth
+/// of the 256-block pool.
+///
+/// An honest proposer's orphans at a replica are its live proposals that overtook their parents
+/// while the replica fetches or syncs, one per view it leads (CON-3's sibling bound) — so a
+/// proposer with more than sixteen of them outstanding is one whose every rotation for the last
+/// sixteen went unlinked, which on an 18-validator set is ~290 views, longer than the pool itself
+/// could remember for all proposers together. At that depth the replica is batch-syncing anyway
+/// (the pool is the shortcut for the last few blocks, never the catch-up path), so the cap costs
+/// an honest proposer nothing. Without it one validator of the current set, which the leader
+/// check admits, could fill all 256 slots with blocks on made-up parents just above the head —
+/// the lowest heights, which the pool's evict-the-highest rule keeps — and every other
+/// proposer's out-of-order block would be refused until those were pruned. A one-validator chain
+/// is the corner: its replica buffers at most sixteen live blocks and syncs the rest.
+pub const MAX_ORPHANS_PER_PROPOSER: usize = 16;
+
 use crate::crypto::{Address, Hash, Keypair, PublicKey, Signature};
 use crate::types::{Block, QuorumCertificate, ValidatorSet, Vote};
 use serde::{Deserialize, Serialize};
@@ -294,6 +310,8 @@ pub struct ConsensusConfig {
     /// 2026-09-26, SW-1): the count cap alone let 256 blocks at the transport's size limit hold
     /// gigabytes.
     pub max_orphan_bytes: usize,
+    /// Cap on the orphans one proposer holds (CN-5, issue #46). See [`MAX_ORPHANS_PER_PROPOSER`].
+    pub max_orphans_per_proposer: usize,
     /// Cap on blocks held in the speculative tree (committed head plus
     /// uncommitted blocks). Each entry carries a full ledger clone, so an
     /// uncapped tree is a memory-exhaustion vector.
@@ -314,6 +332,7 @@ impl ConsensusConfig {
             max_timeout: Duration::from_secs(8),
             max_orphans: 256,
             max_orphan_bytes: 64 << 20,
+            max_orphans_per_proposer: MAX_ORPHANS_PER_PROPOSER,
             max_tree_blocks: 512,
         }
     }

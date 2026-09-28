@@ -2815,7 +2815,10 @@ fn an_outsiders_orphans_are_refused_and_never_pin_the_pool() {
 /// the one out-of-order block that mattered. A full pool now gives way to a lower height.
 #[test]
 fn a_full_orphan_pool_gives_way_to_a_lower_height() {
-    let (cfg, gs, key, b1, b2) = sw1_parts();
+    let (mut cfg, gs, key, b1, b2) = sw1_parts();
+    // One validator fills the whole pool here, which the per-proposer cap (CN-5) now forbids:
+    // lift it, so this stays a test of the pool-wide rule.
+    cfg.max_orphans_per_proposer = cfg.max_orphans;
     let mut z = sw1_observer(&cfg, &gs);
     for i in 0..cfg.max_orphans as u64 {
         let r = z.on_proposal(sw1_orphan(&cfg, &key, 100 + i, 2, i, vec![]), 0);
@@ -2824,6 +2827,53 @@ fn a_full_orphan_pool_gives_way_to_a_lower_height() {
     assert_eq!(z.orphans_held().0, cfg.max_orphans);
     assert!(sw1_honest_orphan_survives(&mut z, &b1, &b2), "a full orphan pool refused the honest out-of-order block");
     assert!(z.orphans_held().0 <= cfg.max_orphans);
+}
+
+/// CN-5 (issue #46): `check_orphan` accepted a proposer that led the block's view in *any* set
+/// this replica knew — and `EpochSets` keeps epoch 0 for ever — so a validator that unbonded
+/// long ago (or any key of any retired set) could still park blocks in every replica's orphan
+/// pool. Only the current epoch's set and the next one's can propose a block a replica will link.
+#[test]
+fn an_orphan_from_a_retired_sets_leader_is_refused() {
+    let mut sim = setup_epochs(4, 4, 4);
+    sim.step(vec![]); // block 1
+    let leaver = Keypair::from_seed(*sim.keys[3].seed()).unwrap();
+    // Genesis stakes exactly the minimum: unbonding one unit leaves the register at epoch 1.
+    sim.step(vec![unbond_tx(&leaver, 1, 0)]); // block 2
+    sim.run_to_height(13, 80);
+    let epoch0 = sim.gs.validators.clone();
+    let z = &mut sim.nodes[0];
+    assert!(z.current_set().len() == 3 && !z.current_set().contains(&leaver.address()), "the leaver left the set at epoch 1");
+    assert!(epoch0.contains(&leaver.address()), "epoch 0 still names it");
+    let view = (z.view() + 1..=z.view() + PROPOSAL_VIEW_WINDOW)
+        .find(|v| epoch0.leader(*v) == leaver.address())
+        .expect("four validators rotate within the proposal window");
+    let height = z.committed_height() + 2;
+    let orphan = sw1_orphan(&config_of(&sim), &leaver, height, view, 7, vec![]);
+    let z = &mut sim.nodes[0];
+    let r = z.on_proposal(orphan.clone(), 0);
+    assert!(!z.holds_orphan(&orphan.hash()), "a retired epoch-0 leader's block was kept as an orphan: {r:?}");
+    assert_eq!(r, Err(ConsensusError::WrongLeader(view)));
+}
+
+/// CN-5's second half (issue #46): one proposer's orphans are capped
+/// (`max_orphans_per_proposer`), so a single key of the current set — which may lead a view in
+/// every rotation — cannot hold the whole pool, low heights first, against every other
+/// proposer's out-of-order blocks.
+#[test]
+fn one_proposer_holds_at_most_its_share_of_the_orphan_pool() {
+    let (cfg, gs, key, b1, b2) = sw1_parts();
+    let mut z = sw1_observer(&cfg, &gs);
+    for i in 0..cfg.max_orphans as u64 {
+        let r = z.on_proposal(sw1_orphan(&cfg, &key, 3 + i, 2, i, vec![]), 0);
+        assert!(r.is_err(), "{r:?}");
+    }
+    let (held, _) = z.orphans_held();
+    assert!(
+        held <= MAX_ORPHANS_PER_PROPOSER,
+        "one proposer holds {held} orphans against a per-proposer cap of {MAX_ORPHANS_PER_PROPOSER}"
+    );
+    assert!(sw1_honest_orphan_survives(&mut z, &b1, &b2), "the capped proposer's own lower block still gets in");
 }
 
 /// CN-3: a validator holding a block only as an orphan — it has not seen the parent yet — used

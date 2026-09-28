@@ -1533,8 +1533,9 @@ impl HotStuff {
     ///
     /// - A height the speculative tree could reach from the committed head (`max_tree_blocks`),
     ///   and a view above the committed head's: nothing else can ever link.
-    /// - A proposer that leads the block's view in a set this replica knows: the current set,
-    ///   the recorded epoch sets, and the sets derived for blocks in the tree. The set of an
+    /// - A proposer that leads the block's view in the current epoch's set or the next one's
+    ///   (CN-5, issue #46: not every recorded set — epoch 0's is kept for ever), recorded or
+    ///   derived for blocks in the tree. The set of an
     ///   epoch derived from a block this replica does not hold is not knowable here, so an
     ///   out-of-order block from a validator only that set admits is refused; it arrives again
     ///   through sync, which is how a replica that far behind catches up anyway.
@@ -1547,14 +1548,23 @@ impl HotStuff {
         if block.height() > self.committed_height.saturating_add(self.cfg.max_tree_blocks as u64) || block.view() <= head_view {
             return Err(ConsensusError::OrphanOutOfRange { height: block.height(), view: block.view() });
         }
+        // Only the current epoch's set and the next one's (CN-5, issue #46). Before, every set in
+        // `epoch_sets` counted — and `forget_before` keeps epoch 0 for ever — so a key the chain
+        // retired at epoch 1 could still park blocks in the pool as long as the chain ran. An
+        // orphan links within `max_tree_blocks` of the committed head, and the head's epoch is at
+        // or below `current_epoch`, so a block this replica could ever link is proposed by the
+        // current set or — just past a boundary it has not reached — the next one; the recorded
+        // or derived set of either, whichever this replica holds. A block from an epoch further
+        // on is from a replica this far behind that it catches up through sync, as before.
         let proposer = block.proposer();
+        let near = |epoch: u64| epoch == self.current_epoch || epoch == self.current_epoch.saturating_add(1);
         let mut leads = self.current.leader(block.view()) == proposer;
         let mut largest = self.current.len();
-        for (_, set) in self.epoch_sets.known() {
+        for (_, set) in self.epoch_sets.known().filter(|(e, _)| near(*e)) {
             leads |= set.leader(block.view()) == proposer;
             largest = largest.max(set.len());
         }
-        for set in self.derived().values() {
+        for (_, set) in self.derived().iter().filter(|((e, _), _)| near(*e)) {
             leads |= set.leader(block.view()) == proposer;
             largest = largest.max(set.len());
         }
@@ -1587,7 +1597,8 @@ impl HotStuff {
     /// receives `ConsensusError::UnknownParent(parent)` and is responsible for fetching it
     /// (or batch-syncing); once the parent arrives via `on_proposal` the orphan is replayed.
     ///
-    /// Bounded by `max_orphans` and `max_orphan_bytes` (scan sweep 2026-09-26, SW-1). A full pool
+    /// Bounded by `max_orphans` and `max_orphan_bytes` (scan sweep 2026-09-26, SW-1), and by
+    /// `max_orphans_per_proposer` per proposer (CN-5, issue #46). A full pool
     /// evicts its highest orphans for a strictly lower one, and otherwise refuses the newcomer:
     /// the block an honest replica is missing sits just above its head, and a block far above
     /// it can only be resolved by sync — so filling the pool at far heights, which the first-come
@@ -1601,6 +1612,29 @@ impl HotStuff {
         if self.orphans.get(&parent).is_some_and(|v| v.iter().any(|(b, _)| b.hash() == hash)) {
             return;
         }
+        // One proposer's share (CN-5, issue #46): at its cap, the proposer's own highest orphan
+        // gives way to a strictly lower one — the same rule as the whole pool's — and otherwise
+        // the newcomer is refused, so no single key holds more than `max_orphans_per_proposer`.
+        let proposer = block.proposer();
+        loop {
+            let mine: Vec<_> = self
+                .orphans
+                .iter()
+                .flat_map(|(p, v)| v.iter().enumerate().map(move |(i, (b, _))| (b, *p, i)))
+                .filter(|(b, _, _)| b.proposer() == proposer)
+                .map(|(b, p, i)| ((b.height(), b.view(), b.hash()), p, i))
+                .collect();
+            let count = mine.len();
+            let highest = mine.into_iter().max_by_key(|(key, _, _)| *key);
+            if count < self.cfg.max_orphans_per_proposer {
+                break;
+            }
+            let Some(((height, _, _), p, i)) = highest else { return };
+            if height <= block.height() {
+                return;
+            }
+            self.remove_orphan_at(&p, i);
+        }
         while self.orphan_count >= self.cfg.max_orphans || self.orphan_bytes + bytes > self.cfg.max_orphan_bytes {
             let highest = self
                 .orphans
@@ -1611,16 +1645,21 @@ impl HotStuff {
             if height <= block.height() {
                 return;
             }
-            let v = self.orphans.get_mut(&p).expect("found above");
-            let (_, freed) = v.swap_remove(i);
-            if v.is_empty() {
-                self.orphans.remove(&p);
-            }
-            self.orphan_count -= 1;
-            self.orphan_bytes -= freed;
+            self.remove_orphan_at(&p, i);
         }
         self.orphans.entry(parent).or_default().push((block, bytes));
         self.orphan_count += 1;
         self.orphan_bytes += bytes;
+    }
+
+    /// Drop the `i`th orphan waiting on `parent`, keeping the pool's counters in step.
+    fn remove_orphan_at(&mut self, parent: &Hash, i: usize) {
+        let v = self.orphans.get_mut(parent).expect("an orphan the caller found");
+        let (_, freed) = v.swap_remove(i);
+        if v.is_empty() {
+            self.orphans.remove(parent);
+        }
+        self.orphan_count -= 1;
+        self.orphan_bytes -= freed;
     }
 }
