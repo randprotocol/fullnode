@@ -13,6 +13,7 @@
 //! `shutdown` on the returned [`Shared`], then aborts the returned listener task.
 
 use crate::key::ProverKey;
+use crate::origins::AllowedOrigins;
 use crate::pairing::{token_hash, Pairings};
 use crate::wire::{open_job, seal_reply, ProveJob, ProveReply, WitnessKind, MAX_SEALED_JOB_BYTES};
 use rand::Rng;
@@ -46,11 +47,14 @@ pub struct Config {
     /// How long a finished job's sealed reply is kept for the wallet to collect.
     pub result_ttl: Duration,
     pub prove: ProveFn,
+    /// The web origins whose pages may read replies (`crate::origins`); default: extensions and
+    /// loopback pages only, never an arbitrary website.
+    pub allowed_origins: AllowedOrigins,
 }
 
 impl Config {
     /// CPU, one worker, a queue of 8, spend keys refused, 2 jobs per token, replies kept 600 s,
-    /// the real prover.
+    /// the real prover, the default origin list.
     pub fn new(key: ProverKey, pairings: Pairings) -> Config {
         Config {
             key,
@@ -62,6 +66,7 @@ impl Config {
             per_token: 2,
             result_ttl: Duration::from_secs(600),
             prove: Arc::new(prove_bundle_for),
+            allowed_origins: AllowedOrigins::default(),
         }
     }
 }
@@ -100,6 +105,9 @@ pub struct Info {
     pub queue: QueueInfo,
     /// No fees in this build.
     pub fee: Option<()>,
+    /// The origin patterns whose pages may read replies, or `["*"]`, so a refused wallet can
+    /// tell why.
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -164,6 +172,10 @@ impl Service {
         svc
     }
 
+    pub fn allowed_origins(&self) -> &AllowedOrigins {
+        &self.cfg.allowed_origins
+    }
+
     fn backend_name(&self) -> &'static str {
         match self.cfg.backend { Backend::Cpu => "cpu", #[allow(unreachable_patterns)] _ => "cuda" }
     }
@@ -183,6 +195,7 @@ impl Service {
             witness_kinds: if self.cfg.accept_spend_key { vec![WitnessKind::SpendKey.as_str()] } else { vec![] },
             queue: QueueInfo { depth, max: self.cfg.max_queue, proving },
             fee: None,
+            allowed_origins: self.cfg.allowed_origins.to_list(),
         }
     }
 

@@ -71,6 +71,7 @@ fn options(addr: &str, home: &Path) -> Options {
         cuda: false,
         // The gate is `rand-prover`'s own, tested there; a test machine need not hold a prover.
         skip_memory_check: true,
+        allow_origins: vec![],
     }
 }
 
@@ -124,6 +125,7 @@ async fn the_hosted_prover_answers_beside_the_node_and_its_exit_stops_the_node()
     let info = &info["result"];
     assert_eq!(info["kem_fingerprint"], json!(prover_key.fingerprint().to_string()), "{info}");
     assert_eq!(info["witness_kinds"], json!([]), "--prover-accept-spend-key is off: {info}");
+    assert_eq!(info["allowed_origins"][0], json!("chrome-extension://*"), "no --prover-allow-origin: the default list: {info}");
     // The node's own RPC is up beside it, and knows nothing of `prover_*`.
     let on_node: Value = http
         .post(format!("http://{node_rpc}"))
@@ -217,4 +219,33 @@ fn a_prover_address_in_use_fails_before_the_database_opens() {
     assert!(err.contains("binding the prover on"), "{err}");
     assert!(!dir.path().join("db").exists(), "no database was opened");
     drop(taken);
+}
+
+/// `--prover-allow-origin` reaches the listener: the given list is the whole list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hosted_prover_serves_its_origin_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("prover");
+    prover_home(&home);
+    let mut o = options("127.0.0.1:0", &home);
+    o.allow_origins = vec!["https://wallet.example".into()];
+    let hosted = hosted_prover::prepare(&o).expect("prepare");
+    let (bound, served) = hosted_prover::start(hosted).await.expect("serve");
+    let http = reqwest::Client::new();
+    let post = |origin: &'static str| {
+        http.post(format!("http://{bound}"))
+            .header("origin", origin)
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "prover_info", "params": [] }))
+            .send()
+    };
+    let ok = post("https://wallet.example").await.unwrap();
+    assert_eq!(ok.headers()["access-control-allow-origin"], "https://wallet.example");
+    let v: Value = ok.json().await.unwrap();
+    assert_eq!(v["result"]["allowed_origins"], json!(["https://wallet.example"]), "{v}");
+    let refused = post("chrome-extension://abcdefghijklmnopabcdefghijklmnop").await.unwrap();
+    assert!(refused.headers().get("access-control-allow-origin").is_none());
+    let v: Value = refused.json().await.unwrap();
+    assert_eq!(v["error"]["code"], -32007, "{v}");
+    served.svc.shutdown();
+    served.task.abort();
 }

@@ -110,6 +110,7 @@ wallet can take pasted text, paste the link instead.
 | `--per-token <N>` | `2` | jobs one pairing may have queued or proving at once |
 | `--cuda` | off | prove on the CUDA backend; needs a build with `--features cuda`, and there is no CPU fallback |
 | `--skip-memory-check` | off | start even when the memory gate below would refuse |
+| `--allow-origin <ORIGIN>` | extensions and loopback pages | a browser origin whose pages may read replies, repeatable; given once or more, the values are the whole list; `*` = every origin (opt-in, warned) — §6.1 |
 
 A job over the pairing's `--per-token` cap, or one that would push queued plus proving jobs past
 `--max-queue` plus `--max-parallel`, is refused `busy` (§6.2).
@@ -167,6 +168,7 @@ rand-node run --datadir /root/data --key /root/keys/node.key.json \
 | `--prover-max-queue <N>` | `8` | as `--max-queue` |
 | `--prover-cuda` | off | as `--cuda` (a `rand-node` built with `--features cuda`) |
 | `--prover-skip-memory-check` | off | as `--skip-memory-check` |
+| `--prover-allow-origin <ORIGIN>` | extensions and loopback pages | as `--allow-origin` (§6.1) |
 
 The per-pairing cap is the default, 2 jobs; there is no node flag for it.
 
@@ -266,18 +268,47 @@ served (`-32600`); `params` must be an array. The request body is capped at 135 
 (twice `MAX_SEALED_JOB_BYTES` for the hex, plus 4 KiB); a larger body gets HTTP 413 with a
 JSON-RPC error.
 
-The listener is reachable from a browser page on another origin (the web wallet): `OPTIONS /`
-answers a CORS preflight with 204, `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods:
-POST, OPTIONS`, `Access-Control-Allow-Headers: content-type` and `Access-Control-Max-Age: 86400`,
-and every reply to a `POST` — results, JSON-RPC errors and the 413 alike — carries
-`Access-Control-Allow-Origin: *`. Any origin is safe here because nothing about a request is
-authorised by the browser: the only credential is the pairing token inside the sealed job, which a
-page can present only if it already holds it, never a cookie or other ambient credential another
-site could make the browser send.
+**Browser origins.** A browser page on another origin (a web or extension wallet) may call the
+listener, but only from an origin on its allow-list. The reason is `prover_info`: its `kem_ek` and
+`kem_fingerprint` are stable for the prover's life, and a desktop wallet serves this listener on
+`127.0.0.1:8600`, so an `Access-Control-Allow-Origin: *` would let every website the user visits
+read that key and recognise the same machine across sites — a cross-site identifier for a privacy
+wallet. The pairing token protects submission, not enumeration. The default list is
+wallet-shaped origins only:
+
+```
+chrome-extension://*   moz-extension://*   safari-web-extension://*
+http://localhost:*     http://127.0.0.1:*  http://[::1]:*
+```
+
+A pattern is an exact origin (`https://wallet.example`, `http://host:8080`), `scheme://*` (any
+extension id under that scheme: letters, digits, `-`, `_`, `.`, no port or path), or
+`scheme://host:*` (that exact scheme and host on any port, or none). There is no other wildcard and
+no substring match: `http://localhost.evil.example` is not `http://localhost:*`. A browser sends
+origins in lowercase and so must the list. Per request, by its `Origin` header:
+
+- **No `Origin`** (curl, the `rand` CLI, a same-origin page): served, with no CORS headers.
+- **An allowed origin**: `OPTIONS /` answers 204 with `Access-Control-Allow-Origin: <that origin>`,
+  `Vary: Origin`, `Access-Control-Allow-Methods: POST, OPTIONS`, `Access-Control-Allow-Headers:
+  content-type` and `Access-Control-Max-Age: 86400`; every reply to a `POST` — results, JSON-RPC
+  errors and the 413 alike — carries the same `Access-Control-Allow-Origin` and `Vary: Origin`.
+- **Any other origin**: `OPTIONS /` answers 403 with no CORS headers, and every method, `prover_info`
+  included, answers `-32007 origin not allowed` with no CORS headers, so the page can read neither.
+
+`--allow-origin <ORIGIN>` (`rand-prover run`) or `--prover-allow-origin <ORIGIN>` (`rand-node run`)
+replaces the list: repeat it, and the values given are the whole list (the default is not kept).
+`--allow-origin '*'` allows every origin and answers `Access-Control-Allow-Origin: *`; it is opt-in
+and prints a one-line warning, since any website can then read the prover's key. A malformed
+pattern (a path, a trailing slash, a `*` elsewhere) refuses the start. `prover_info` serves the
+effective list as `allowed_origins` (`["*"]` under `*`), so a wallet can tell why it was refused.
+
+Nothing about a request is authorised by the browser either way: the only credential is the pairing
+token inside the sealed job, never a cookie or other ambient credential another site could make the
+browser send.
 
 | method | params | result |
 |---|---|---|
-| `prover_info` | — | `{version, kem_fingerprint, kem_ek, hc_bundles[], profiles[], backend, witness_kinds[], queue: {depth, max, proving}, fee}` |
+| `prover_info` | — | `{version, kem_fingerprint, kem_ek, hc_bundles[], profiles[], backend, witness_kinds[], queue: {depth, max, proving}, fee, allowed_origins[]}` |
 | `prover_submit` | `[sealed_hex]` | `{job}` — 128 random bits, hex |
 | `prover_status` | `[job]` | `{state, position?, reply?, error?}`; `state` ∈ `queued｜proving｜done｜failed｜expired` |
 | `prover_cancel` | `[job]` | `{cancelled}` |
@@ -285,7 +316,8 @@ site could make the browser send.
 `prover_info`: `kem_ek` is the ML-KEM-768 encapsulation key in hex; `hc_bundles` are the bundle
 guests this build proves, in the hex form `rand_status.hc_bundle` serves; `profiles` is
 `["test", "production"]`; `backend` is `cpu` or `cuda`; `witness_kinds` is `["spend_key"]` with
-`--accept-spend-key` and `[]` without; `fee` is `null`.
+`--accept-spend-key` and `[]` without; `fee` is `null`; `allowed_origins` is the origin allow-list
+above, or `["*"]`.
 
 `prover_status`: `position` (1-based) is present while `queued`; `reply` (hex of the sealed reply)
 while `done`, on every poll; `error` while `failed` (a cancelled proving job ends `failed` with
@@ -309,6 +341,7 @@ proving, `false` if it had already finished.
 | `-32003` | `the job's token is not paired with this prover` | |
 | `-32004` | `witness kind not accepted` | `data.reason`: spend-key witnesses refused (no `--accept-spend-key`), or a viewing-key witness (no guest in this build takes one) |
 | `-32005` | `busy` | `data: {depth, max}` — the pairing's cap or the queue is full |
+| `-32007` | `origin not allowed` | any method, from a request whose `Origin` header is not on the allow-list (§6.1); answered before the body is read as a request, without CORS headers |
 
 Admission runs cheap before expensive — size, open, pairing, witness kind, guest, profile,
 witness length, the pairing's cap, the queue's cap — and a refused job is zeroized before the
@@ -380,6 +413,14 @@ A `--listen` (or `--prover`) address off loopback needs that fronting proxy to t
 to meter requests: the prover itself caps only jobs per pairing and its queue, not requests, and `prover_info` is
 unauthenticated — anyone who reaches it learns the prover's key, backend, queue depth and
 `witness_kinds` (whether it takes spend keys).
+
+The origin allow-list (§6.1) is a browser rule, not access control: it stops a website the user
+visits from reading the prover's key through the user's own browser — the fingerprinting a
+desktop wallet's loopback listener would otherwise allow — and it does nothing against a client
+that sends no `Origin`, or a forged one, over the network. A proxy in front of the prover passes
+the browser's `Origin` through unchanged (Caddy's `reverse_proxy` does), so the list keeps
+working behind it; a web wallet served from its own `https://` origin needs that origin added with
+`--allow-origin`, and `*` is never needed for it.
 
 A certificate a browser or phone accepts on a LAN is the operator's to arrange; whether a desktop
 app should carry a relay instead is spec §8 open question 4, unresolved.

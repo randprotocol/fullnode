@@ -9,6 +9,7 @@
 use crate::node::NodeHandle;
 use anyhow::{Context, Result};
 use randprotocol_prover::key::ProverKey;
+use randprotocol_prover::origins::AllowedOrigins;
 use randprotocol_prover::pairing::Pairings;
 use randprotocol_prover::service::{Config, Shared};
 use randprotocol_zkvm::machine::Backend;
@@ -34,6 +35,9 @@ pub struct Options {
     pub max_queue: usize,
     pub cuda: bool,
     pub skip_memory_check: bool,
+    /// `--prover-allow-origin` values: empty = the default list (extensions and loopback pages),
+    /// otherwise the whole list; `*` = every origin.
+    pub allow_origins: Vec<String>,
 }
 
 /// What `run --prover` loaded before the node started: everything that can refuse has done so,
@@ -71,6 +75,7 @@ pub fn prepare(o: &Options) -> Result<HostedProver> {
     if o.max_parallel == 0 {
         anyhow::bail!("--prover-max-parallel must be at least 1");
     }
+    let allowed_origins = AllowedOrigins::from_flags(&o.allow_origins).map_err(|e| anyhow::anyhow!(e.replace("--allow-origin", "--prover-allow-origin")))?;
     let key_path = home.join("prover.key.json");
     let key = match ProverKey::load(&key_path) {
         Ok(k) => k,
@@ -112,6 +117,12 @@ pub fn prepare(o: &Options) -> Result<HostedProver> {
     cfg.max_parallel = o.max_parallel;
     cfg.max_queue = o.max_queue;
     cfg.accept_spend_key = o.accept_spend_key;
+    if allowed_origins == AllowedOrigins::Any {
+        let line = "--prover-allow-origin '*': every website can read this prover's replies, its key included (a cross-site identifier)";
+        eprintln!("{line}");
+        tracing::warn!("{line}");
+    }
+    cfg.allowed_origins = allowed_origins;
     Ok(HostedProver { cfg, listener, fingerprint })
 }
 

@@ -482,6 +482,11 @@ enum Cmd {
         /// Skip the free-memory gate that refuses a prover the machine cannot hold.
         #[arg(long)]
         prover_skip_memory_check: bool,
+        /// A web origin whose pages may read the hosted prover's replies (repeatable). Given at
+        /// least once, the values are the whole list; absent, browser extensions and loopback
+        /// pages only (`docs/prover.md` §6.1). `*` allows every website.
+        #[arg(long = "prover-allow-origin", value_name = "ORIGIN")]
+        prover_allow_origin: Vec<String>,
     },
     /// Verify the chain in a data directory without running the node.
     Verify {
@@ -985,6 +990,7 @@ async fn main() -> Result<()> {
             prover_max_queue,
             prover_cuda,
             prover_skip_memory_check,
+            prover_allow_origin,
         } => {
             // Every prover check runs, and its address is bound, before the node key is read or
             // the database opened, so a misconfigured prover (or a port in use) exits at once.
@@ -999,6 +1005,7 @@ async fn main() -> Result<()> {
                     max_queue: prover_max_queue,
                     cuda: prover_cuda,
                     skip_memory_check: prover_skip_memory_check,
+                    allow_origins: prover_allow_origin,
                 })?),
             };
             let kp = load_keypair(&key)?;

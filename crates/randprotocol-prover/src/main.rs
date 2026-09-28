@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use randprotocol_prover::http;
 use randprotocol_prover::key::ProverKey;
 use randprotocol_prover::memory;
+use randprotocol_prover::origins::AllowedOrigins;
 use randprotocol_prover::pairing::{PairingLink, Pairings};
 use randprotocol_prover::service::Config;
 use randprotocol_zkvm::machine::Backend;
@@ -65,7 +66,24 @@ enum Cmd {
         cuda: bool,
         #[arg(long)]
         skip_memory_check: bool,
+        /// A web origin whose pages may read this prover's replies (repeatable). Given at least
+        /// once, the values are the whole list; absent, the default is browser extensions and
+        /// loopback pages (`chrome-extension://*`, `moz-extension://*`, `safari-web-extension://*`,
+        /// `http://localhost:*`, `http://127.0.0.1:*`, `http://[::1]:*`). `*` allows every
+        /// website, which can then read this prover's key as a cross-site identifier.
+        #[arg(long = "allow-origin", value_name = "ORIGIN")]
+        allow_origin: Vec<String>,
     },
+}
+
+/// `--allow-origin` → the listener's list, with the one-line warning `*` earns (printed, so no
+/// log filter can hide it).
+fn allowed_origins(values: &[String], flag: &str) -> Result<AllowedOrigins> {
+    let allowed = AllowedOrigins::from_flags(values).map_err(|e| anyhow::anyhow!(e.replace("--allow-origin", flag)))?;
+    if allowed == AllowedOrigins::Any {
+        eprintln!("{flag} '*': every website can read this prover's replies, its key included (a cross-site identifier)");
+    }
+    Ok(allowed)
 }
 
 fn expand_home(s: &str) -> Result<PathBuf> {
@@ -177,10 +195,11 @@ async fn main() -> Result<()> {
                 println!("{}  {}  {}", p.label, if p.own { "own" } else { "-" }, date_of(p.created_unix));
             }
         }
-        Cmd::Run { listen, accept_spend_key, max_parallel, max_queue, per_token, cuda, skip_memory_check } => {
+        Cmd::Run { listen, accept_spend_key, max_parallel, max_queue, per_token, cuda, skip_memory_check, allow_origin } => {
             if max_parallel == 0 {
                 bail!("--max-parallel must be at least 1");
             }
+            let allowed = allowed_origins(&allow_origin, "--allow-origin")?;
             let backend = backend_for(cuda)?;
             let key = load_key(&key_path)?;
             let pairings = Pairings::load(&pairings_path)?;
@@ -206,6 +225,7 @@ async fn main() -> Result<()> {
             cfg.max_queue = max_queue;
             cfg.per_token = per_token;
             cfg.accept_spend_key = accept_spend_key;
+            cfg.allowed_origins = allowed;
             let (bound, svc, mut task) = http::serve(listen, cfg).await?;
             eprintln!("rand-prover {fingerprint} listening on http://{bound}");
             tokio::select! {

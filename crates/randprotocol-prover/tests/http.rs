@@ -1,6 +1,7 @@
 use randprotocol_prover::http::{serve, MAX_BODY_BYTES};
 use randprotocol_prover::key::ProverKey;
 use randprotocol_prover::pairing::Pairings;
+use randprotocol_prover::origins::AllowedOrigins;
 use randprotocol_prover::service::{Config, ProveFn};
 use randprotocol_prover::wire::*;
 use randprotocol_zkvm::executor::ZkExecutor;
@@ -13,6 +14,10 @@ use std::time::Duration;
 fn ok_prover() -> ProveFn { Arc::new(|_, _, inputs, _, _| Ok((vec![0xAA; 64], [inputs[0]; 8], 14))) }
 
 async fn start() -> (SocketAddr, Vec<u8>, [u8; 32], reqwest::Client) {
+    start_with(AllowedOrigins::default()).await
+}
+
+async fn start_with(origins: AllowedOrigins) -> (SocketAddr, Vec<u8>, [u8; 32], reqwest::Client) {
     let key = ProverKey::from_seed([4; 64]);
     let ek = key.kem_ek().to_vec();
     let mut pairings = Pairings::default();
@@ -20,6 +25,7 @@ async fn start() -> (SocketAddr, Vec<u8>, [u8; 32], reqwest::Client) {
     let mut cfg = Config::new(key, pairings);
     cfg.accept_spend_key = true;
     cfg.prove = ok_prover();
+    cfg.allowed_origins = origins;
     let (addr, _svc, _task) = serve("127.0.0.1:0".parse().unwrap(), cfg).await.unwrap();
     (addr, ek, token, reqwest::Client::new())
 }
@@ -89,36 +95,134 @@ fn required_bytes_is_peak_times_parallel_plus_a_gib() {
     assert!(e.contains("GB"), "{e}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_preflight_is_answered_for_a_browser_page() {
-    let (addr, _ek, _token, http) = start().await;
-    let r = http
-        .request(reqwest::Method::OPTIONS, format!("http://{addr}/"))
-        .header("origin", "https://wallet.example")
+async fn preflight(http: &reqwest::Client, addr: SocketAddr, origin: &str) -> reqwest::Response {
+    http.request(reqwest::Method::OPTIONS, format!("http://{addr}/"))
+        .header("origin", origin)
         .header("access-control-request-method", "POST")
         .header("access-control-request-headers", "content-type")
         .send()
         .await
-        .unwrap();
-    assert_eq!(r.status(), 204);
+        .unwrap()
+}
+
+async fn post_from(http: &reqwest::Client, addr: SocketAddr, origin: Option<&str>, body: Value) -> reqwest::Response {
+    let mut r = http.post(format!("http://{addr}/")).json(&body);
+    if let Some(o) = origin {
+        r = r.header("origin", o);
+    }
+    r.send().await.unwrap()
+}
+
+fn info_req() -> Value { json!({"jsonrpc":"2.0","id":1,"method":"prover_info","params":[]}) }
+
+/// An allowed origin: the preflight is a 204 echoing it, and every POST reply (a success, a
+/// JSON-RPC error, the 413) carries the same header.
+async fn assert_allowed(http: &reqwest::Client, addr: SocketAddr, origin: &str, echoed: &str) {
+    let r = preflight(http, addr, origin).await;
+    assert_eq!(r.status(), 204, "{origin}");
     let h = r.headers();
-    assert_eq!(h["access-control-allow-origin"], "*");
+    assert_eq!(h["access-control-allow-origin"], echoed, "{origin}");
     assert_eq!(h["access-control-allow-methods"], "POST, OPTIONS");
     assert_eq!(h["access-control-allow-headers"], "content-type");
     assert_eq!(h["access-control-max-age"], "86400");
+    assert_eq!(h["vary"], "Origin");
+    let ok = post_from(http, addr, Some(origin), info_req()).await;
+    assert_eq!(ok.status(), 200);
+    assert_eq!(ok.headers()["access-control-allow-origin"], echoed, "a success");
+    assert_eq!(ok.headers()["vary"], "Origin");
+    assert!(ok.json::<Value>().await.unwrap()["result"]["kem_ek"].is_string());
+    let err = post_from(http, addr, Some(origin), json!({"jsonrpc":"2.0","id":1,"method":"prover_nope","params":[]})).await;
+    assert_eq!(err.headers()["access-control-allow-origin"], echoed, "a JSON-RPC error");
+    assert_eq!(err.json::<Value>().await.unwrap()["error"]["code"], -32601);
+    let big = post_from(http, addr, Some(origin), json!({"jsonrpc":"2.0","id":1,"method":"prover_submit","params":["a".repeat(MAX_BODY_BYTES + 1)]})).await;
+    assert_eq!(big.status(), 413);
+    assert_eq!(big.headers()["access-control-allow-origin"], echoed, "the 413");
+}
+
+/// A refused origin: the preflight is a 403 with no CORS headers, and every method is -32007
+/// with no `Access-Control-Allow-Origin` — the page can read neither.
+async fn assert_refused(http: &reqwest::Client, addr: SocketAddr, origin: &str) {
+    let r = preflight(http, addr, origin).await;
+    assert_eq!(r.status(), 403, "{origin}");
+    for h in ["access-control-allow-origin", "access-control-allow-methods", "access-control-allow-headers", "access-control-max-age"] {
+        assert!(r.headers().get(h).is_none(), "{origin}: {h} on a refused preflight");
+    }
+    for method in ["prover_info", "prover_status", "prover_nope"] {
+        let res = post_from(http, addr, Some(origin), json!({"jsonrpc":"2.0","id":1,"method":method,"params":["ab"]})).await;
+        assert!(res.headers().get("access-control-allow-origin").is_none(), "{origin}: {method}");
+        let v = res.json::<Value>().await.unwrap();
+        assert_eq!(v["error"]["code"], -32007, "{origin}: {method}: {v}");
+        assert_eq!(v["error"]["message"], "origin not allowed");
+        assert!(v.get("result").is_none(), "{v}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_post_reply_carries_allow_origin() {
+async fn a_page_origin_is_refused_by_default() {
     let (addr, _ek, _token, http) = start().await;
-    let post = |body: Value| http.post(format!("http://{addr}/")).header("origin", "https://wallet.example").json(&body).send();
-    let ok = post(json!({"jsonrpc":"2.0","id":1,"method":"prover_info","params":[]})).await.unwrap();
-    assert_eq!(ok.status(), 200);
-    assert_eq!(ok.headers()["access-control-allow-origin"], "*", "a success");
-    let err = post(json!({"jsonrpc":"2.0","id":1,"method":"prover_nope","params":[]})).await.unwrap();
-    assert_eq!(err.headers()["access-control-allow-origin"], "*", "a JSON-RPC error");
-    assert_eq!(err.json::<Value>().await.unwrap()["error"]["code"], -32601);
-    let big = post(json!({"jsonrpc":"2.0","id":1,"method":"prover_submit","params":["a".repeat(MAX_BODY_BYTES + 1)]})).await.unwrap();
+    assert_refused(&http, addr, "https://evil.example").await;
+    assert_refused(&http, addr, "http://localhost.evil.example").await;
+    assert_refused(&http, addr, "null").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_extension_origin_is_allowed_by_default() {
+    let (addr, _ek, _token, http) = start().await;
+    let o = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+    assert_allowed(&http, addr, o, o).await;
+    let o = "moz-extension://2b0c6f2a-8d6e-4f5b-9c1d-3e4f5a6b7c8d";
+    assert_allowed(&http, addr, o, o).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn localhost_any_port_is_allowed() {
+    let (addr, _ek, _token, http) = start().await;
+    for o in ["http://localhost:5173", "http://127.0.0.1:3000", "http://[::1]:8080"] {
+        assert_allowed(&http, addr, o, o).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_origin_header_gets_no_cors_headers_and_is_served() {
+    let (addr, _ek, _token, http) = start().await;
+    let r = post_from(&http, addr, None, info_req()).await;
+    assert_eq!(r.status(), 200);
+    for h in ["access-control-allow-origin", "vary"] {
+        assert!(r.headers().get(h).is_none(), "{h} without an Origin");
+    }
+    let v = r.json::<Value>().await.unwrap();
+    assert!(v["result"]["kem_ek"].is_string(), "{v}");
+    let big = post_from(&http, addr, None, json!({"jsonrpc":"2.0","id":1,"method":"prover_submit","params":["a".repeat(MAX_BODY_BYTES + 1)]})).await;
     assert_eq!(big.status(), 413);
-    assert_eq!(big.headers()["access-control-allow-origin"], "*", "the 413");
+    assert!(big.headers().get("access-control-allow-origin").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_list_replaces_the_default() {
+    let (addr, _ek, _token, http) = start_with(AllowedOrigins::List(vec!["https://wallet.example".into()])).await;
+    assert_allowed(&http, addr, "https://wallet.example", "https://wallet.example").await;
+    assert_refused(&http, addr, "chrome-extension://abcdefghijklmnopabcdefghijklmnop").await;
+    assert_refused(&http, addr, "http://localhost:5173").await;
+    assert_refused(&http, addr, "https://wallet.example:8443").await;
+    let info = rpc(&http, addr, "prover_info", json!([])).await;
+    assert_eq!(info["result"]["allowed_origins"], json!(["https://wallet.example"]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn star_allows_everything() {
+    let (addr, _ek, _token, http) = start_with(AllowedOrigins::Any).await;
+    assert_allowed(&http, addr, "https://wallet.example", "*").await;
+    assert_allowed(&http, addr, "https://evil.example", "*").await;
+    let info = rpc(&http, addr, "prover_info", json!([])).await;
+    assert_eq!(info["result"]["allowed_origins"], json!(["*"]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prover_info_names_the_default_list() {
+    let (addr, _ek, _token, http) = start().await;
+    let info = rpc(&http, addr, "prover_info", json!([])).await;
+    assert_eq!(
+        info["result"]["allowed_origins"],
+        json!(["chrome-extension://*", "moz-extension://*", "safari-web-extension://*", "http://localhost:*", "http://127.0.0.1:*", "http://[::1]:*"])
+    );
 }

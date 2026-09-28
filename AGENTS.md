@@ -21,7 +21,10 @@ guest takes `sk` as a private input, so a Phase 1 prover can spend for every wal
   `randprover:` links, `own=1` only with `pair --own`), the queue (`service.rs`: per-pairing cap 2,
   `max_queue` 8, `max_parallel` 1, witnesses zeroized; `Service::shutdown` drops the queue, lets a
   proof in flight finish and discards its reply), the `prover_*` JSON-RPC listener (`http.rs`,
-  CORS preflight 204 / `Allow-Origin: *`, `serve_on` a pre-bound listener), a free-memory gate.
+  CORS by origin allow-list — default extensions + loopback pages, echoed with `Vary: Origin`; any
+  other `Origin` = 403 preflight and `-32007` to every method, so no website can read `kem_ek` as a
+  cross-site identifier of a desktop wallet; `--allow-origin`/`--prover-allow-origin`, `*` opt-in —
+  `serve_on` a pre-bound listener), a free-memory gate.
   `prover_info` is unauthenticated; a Phase 1 prover's `fee` is `null`.
 - **Binary `rand-prover`** (`keygen`, `pair`, `unpair`, `pairings`, `run`; plain HTTP on `127.0.0.1:8600`, TLS by a
   fronting proxy). `run` refuses every `SpendKey` job without `--accept-spend-key`, which prints its

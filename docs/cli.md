@@ -255,6 +255,7 @@ one the cut announced; a mismatch on one node is almost always an old binary.
 | `--prover-max-queue <N>` | `8` | jobs queued beyond those running |
 | `--prover-cuda` | off | prove on the CUDA backend (a build with `--features cuda`); no CPU fallback |
 | `--prover-skip-memory-check` | off | skip the free-memory gate |
+| `--prover-allow-origin <ORIGIN>` | extensions and loopback pages | a browser origin whose pages may read the prover's replies, repeatable; given once or more, the values are the whole list (default `chrome-extension://*`, `moz-extension://*`, `safari-web-extension://*`, `http://localhost:*`, `http://127.0.0.1:*`, `http://[::1]:*`); `*` allows every website and prints a warning; any other origin gets a 403 preflight and `-32007` (`docs/prover.md` §6.1) |
 
 Environment: `RUST_LOG` (default `info,libp2p=warn,libp2p_mdns=off`). Ctrl-C or SIGTERM (systemd's default stop signal) shuts down cleanly.
 

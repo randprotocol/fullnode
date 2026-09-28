@@ -2,21 +2,29 @@
 //! batches, no notifications), four methods over a [`Service`]. Nothing here logs a request body:
 //! a sealed job is opaque bytes to this layer and is handed straight to [`Service::submit`].
 //!
-//! CORS: a browser wallet on another origin posts here, so `OPTIONS /` answers the preflight (204)
-//! and every reply carries `Access-Control-Allow-Origin: *`. Any origin is safe: a request is
-//! authorised only by the pairing token sealed inside the job, never by a cookie or other ambient
-//! credential a page could borrow.
+//! CORS (`docs/prover.md` §6.1): a browser wallet on another origin posts here, but `prover_info`
+//! hands out a stable identifier (`kem_ek`, `kem_fingerprint`), and a desktop wallet serves this
+//! on loopback — so a page may read replies only from an origin in [`Config::allowed_origins`]
+//! (default: browser extensions and loopback pages). Per request, by its `Origin` header:
+//! - none (curl, the `rand` CLI, a same-origin page): served, no CORS headers;
+//! - allowed: `Access-Control-Allow-Origin` echoes it (`*` under [`AllowedOrigins::Any`]) with
+//!   `Vary: Origin`, on the 204 preflight and on every POST reply, the 413 and errors included;
+//! - refused: the preflight is a 403 and every method is [`ORIGIN_NOT_ALLOWED`], both without CORS
+//!   headers. Submission is still authorised only by the pairing token sealed inside the job,
+//!   never by a cookie or other ambient credential a page could borrow.
 //!
 //! Stopping: [`serve`]/[`serve_on`] return the service and the listener task. An embedder stops
 //! both in two calls — [`Service::shutdown`] on the service (queue dropped, workers exit, a proof in
 //! flight finishes with its reply discarded), then `abort()` on the task.
 
+use crate::origins::AllowedOrigins;
 use crate::service::{Config, Refusal, Service, Shared};
 use crate::wire::MAX_SEALED_JOB_BYTES;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::State;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -35,6 +43,8 @@ pub const UNKNOWN_JOB: i64 = -32001;
 pub const UNPAIRED: i64 = -32003;
 pub const WITNESS_KIND: i64 = -32004;
 pub const BUSY: i64 = -32005;
+/// Any method, from a page whose `Origin` is not in [`Config::allowed_origins`].
+pub const ORIGIN_NOT_ALLOWED: i64 = -32007;
 
 /// Binds `addr`, starts the [`Service`] on the current runtime and serves it. Returns the bound
 /// address (for `:0`), the service and the server task.
@@ -49,7 +59,7 @@ pub async fn serve_on(listener: tokio::net::TcpListener, cfg: Config) -> anyhow:
     let svc = Service::start(cfg);
     let app = Router::new()
         .route("/", post(handle).options(preflight))
-        .layer(axum::middleware::map_response(allow_any_origin))
+        .layer(axum::middleware::from_fn_with_state(svc.clone(), cors))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(svc.clone());
     let task = tokio::spawn(async move {
@@ -61,21 +71,50 @@ pub async fn serve_on(listener: tokio::net::TcpListener, cfg: Config) -> anyhow:
     Ok((bound, svc, task))
 }
 
-/// A browser's CORS preflight for `POST /` with a JSON body.
-async fn preflight() -> impl IntoResponse {
-    (
-        StatusCode::NO_CONTENT,
-        [
-            (header::ACCESS_CONTROL_ALLOW_METHODS, "POST, OPTIONS"),
-            (header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type"),
-            (header::ACCESS_CONTROL_MAX_AGE, "86400"),
-        ],
-    )
+/// What a request's `Origin` header earns it.
+enum Origin {
+    /// No `Origin`: not a cross-origin browser request; no CORS headers.
+    Absent,
+    /// The value to answer in `Access-Control-Allow-Origin`: the origin itself, or `*`.
+    Allowed(HeaderValue),
+    Refused,
 }
 
-/// Every reply, the 413 and JSON-RPC errors included, may be read by a page on any origin.
-async fn allow_any_origin(mut res: Response) -> Response {
-    res.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+fn origin_of(headers: &HeaderMap, allowed: &AllowedOrigins) -> Origin {
+    let Some(v) = headers.get(header::ORIGIN) else { return Origin::Absent };
+    match v.to_str() {
+        Ok(o) if allowed.allows(o) => {
+            Origin::Allowed(if *allowed == AllowedOrigins::Any { HeaderValue::from_static("*") } else { v.clone() })
+        }
+        _ => Origin::Refused,
+    }
+}
+
+/// The preflight's own answer; [`cors`] adds the CORS headers, or refuses it first.
+async fn preflight() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+/// Answers a refused origin's preflight 403 without running it, and puts the CORS headers on an
+/// allowed origin's every reply (the 413 and JSON-RPC errors included). A refused POST reaches
+/// [`handle`], which answers it [`ORIGIN_NOT_ALLOWED`]; nothing here adds a header to it.
+async fn cors(State(svc): State<Shared>, req: Request, next: Next) -> Response {
+    let origin = origin_of(req.headers(), svc.allowed_origins());
+    let is_preflight = req.method() == Method::OPTIONS;
+    if is_preflight && matches!(origin, Origin::Refused) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut res = next.run(req).await;
+    if let Origin::Allowed(allow) = origin {
+        let h = res.headers_mut();
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow);
+        h.append(header::VARY, HeaderValue::from_static("Origin"));
+        if is_preflight {
+            h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("POST, OPTIONS"));
+            h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("content-type"));
+            h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+        }
+    }
     res
 }
 
@@ -94,7 +133,12 @@ fn error_value(id: Value, e: RpcError) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": Value::Object(err) })
 }
 
-async fn handle(State(svc): State<Shared>, body: Result<Bytes, BytesRejection>) -> (StatusCode, Json<Value>) {
+async fn handle(State(svc): State<Shared>, headers: HeaderMap, body: Result<Bytes, BytesRejection>) -> (StatusCode, Json<Value>) {
+    if matches!(origin_of(&headers, svc.allowed_origins()), Origin::Refused) {
+        // Every method, before the body is even parsed as a request: the page learns nothing.
+        let id = body.ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| v.get("id").cloned()).unwrap_or(Value::Null);
+        return (StatusCode::OK, Json(error_value(id, RpcError::new(ORIGIN_NOT_ALLOWED, "origin not allowed"))));
+    }
     let body = match body {
         Ok(b) => b,
         // axum's own status (413 over the limit), with a body a JSON-RPC client can read.
