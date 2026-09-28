@@ -42,6 +42,14 @@
   E → E's `127.0.0.1:8545` (`deploy/caddy/README.md` has the chain; F's Caddy is not in it and does
   not run). Every droplet keeps its node's RPC loopback-only. E's viewing-key slots are safe because
   the proxy's allowlist never forwards `rand_importViewingKey`.
+- **A delegated prover is never on the public RPC path.** An operator node started with
+  `rand-node run --prover <ADDR>` (or a separate `rand-prover run`) listens on its own address,
+  and with `--prover-accept-spend-key` it holds the sending wallet's spend key while it proves.
+  Keep that listener on loopback (`127.0.0.1:8600`, the default) unless a TLS-terminating proxy
+  fronts it for a LAN or a phone, and never run it on E, the web droplet or any other host in the
+  `rpc.randprotocol.org` chain, nor route it through that chain. In a systemd unit set
+  `KillSignal=SIGINT` and `TimeoutStopSec=180`, so a stop lets the proof in flight (about 100 s)
+  finish. Runbook and trust model: `docs/prover.md`.
 
 ## Provisioning a Linux server (DigitalOcean example)
 

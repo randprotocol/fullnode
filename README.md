@@ -49,6 +49,7 @@ crates/randprotocol-zkvm     the Rand zkVM (vendored from circuits/research; res
 crates/randprotocol-node     RocksDB storage, libp2p networking, mempool, block sync, JSON-RPC server,
                        the node event loop, and the rand-node binary
 crates/randprotocol-client   the rand wallet binary and the RpcClient library (no RocksDB/libp2p dependency)
+crates/randprotocol-prover   the rand-prover binary: a delegated prover that proves bundles for paired wallets
 deploy/                testnet genesis, test keys, run scripts, cloud provisioning and rebuild scripts
 docs/                  reference documentation and the design spec / plan
 scripts/               local two-validator testnet
@@ -60,7 +61,7 @@ Requirements: Rust 1.98.1 (pinned in `rust-toolchain.toml`; rustup installs it),
 and `cmake` (RocksDB). First build: 10 to 20 minutes (RocksDB and Plonky3 from source).
 
 ```bash
-cargo build --release        # target/release/rand-node, target/release/rand
+cargo build --release        # target/release/rand-node, target/release/rand, target/release/rand-prover
 cargo test --release         # all crates; release because STARK proving is slow in debug
 ```
 
@@ -330,6 +331,7 @@ all hard forks together as chain 14:
 | [docs/zkvm-milestones.md](docs/zkvm-milestones.md) | the Rand zkVM milestone by milestone (M1–M4, CUDA backend): what was built and why |
 | [docs/zkvm-m4-m5-progress.md](docs/zkvm-m4-m5-progress.md) | M4 and M5 as delivered: constraint sets 4–6, the recursion VM (M5.1–M5.4) with all measured numbers, what is deferred to which hardware |
 | [docs/bridge.md](docs/bridge.md) | the guardian bridge: trust model, wire format, guardian sets, state, the two bridge actions, what stays public, and (v0.5) one token with many backings, the mint cap and pause, bounded timestamps, the post-quantum co-signature, and listing a token after genesis |
+| [docs/prover.md](docs/prover.md) | the delegated prover (`rand-prover`, `rand-node run --prover`): the trust model (a Phase 1 prover receives the spend key), pairing, running one, what the wallet checks, the wire |
 | [docs/deploy.md](docs/deploy.md) | multi-machine and cloud deployment, rebuilds, fault tests |
 | [docs/node-hardware.md](docs/node-hardware.md) | what validators, wallets and aggregators compute; measured RAM, disk and prover memory per tier; DigitalOcean sizes; setup |
 | [deploy/README.md](deploy/README.md) | the live testnet: nodes, addresses, peer ids |

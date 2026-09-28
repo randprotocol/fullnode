@@ -165,6 +165,11 @@ The test-profile row is `/usr/bin/time -l rand call …` on this laptop, 2026-09
 ([`guests.md`](guests.md#46-call-it)). The production rows are the deploys and the call made on
 the live chain 13 on 2026-09-19 ([`translators.md`](translators.md) §4.6, §4.6.1, §5.4).
 
+A wallet that cannot hold that peak can hand the bundle proof to a delegated prover it owns
+([`docs/prover.md`](prover.md)). The prover needs the same 5.74 GB per proof it runs at once, plus
+1 GiB of headroom: `rand-prover run` (and `rand-node run --prover`) refuses to start unless
+`5.74 GB × --max-parallel + 1 GiB` of memory is available.
+
 ## 4. Aggregator
 
 An aggregator proves one rVM STARK over N bundle proofs and submits it for a sealing window. It
