@@ -71,6 +71,7 @@
 # fresh timestamp). Cut once, distribute the file byte-identically, launch within minutes.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+FULLNODE_DIR=${FULLNODE_DIR:-$(pwd)}    # the repo root the line above just cd'd into ($(cd "$(dirname "$0")/.." && pwd), pre-computed)
 . deploy/lib/key-guard.sh
 
 NODE=${NODE:-target/release/rand-node}
@@ -93,7 +94,7 @@ FAUCET_RECIPIENTS=${FAUCET_RECIPIENTS:-}           # unset: chain 16's genesis a
 STAKE_RAND=${STAKE_RAND:-1000}
 ALLOC_ADDRESSES=${ALLOC_ADDRESSES:-$HOME/.rand-chain17/alloc-rand.txt}   # "<label> rand1… <RAND>" per line (`balances` writes it)
 ZUSD_CARRY=${ZUSD_CARRY:-$HOME/.rand-chain17/zusd-carry.txt}             # "<label> rand1… <zUSD>" per line
-WALLETS_DIRS=${WALLETS_DIRS:-$HOME/.rand-chain14/wallets $HOME/.rand-chain15/wallets $HOME/.rand-chain16/wallets $HOME/.rand-chain14/payout $HOME/.rand-chain15/payout}   # `balances`: dirs of *.key.json (a missing dir is skipped, printed, never an error)
+WALLETS_DIRS=${WALLETS_DIRS:-$HOME/.rand-chain14/wallets $HOME/.rand-chain15/wallets $HOME/.rand-chain16/wallets $HOME/.rand-chain14/payout $HOME/.rand-chain15/payout $FULLNODE_DIR/wallets}   # `balances`: dirs of *.key.json (a missing dir is skipped, printed, never an error); $FULLNODE_DIR/wallets is the repo's gitignored wallets/ (shielded-1..5, the chain-15 cut's ALLOC_WALLETS default)
 RELAYER_DONE_DIR=${RELAYER_DONE_DIR:-}             # optional: the relayer's done/ (done/<chain>/<seq>), a floor cross-check
 EXPECT_HC_BUNDLE=${EXPECT_HC_BUNDLE:-60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce}   # v3
 EXPECT_HC_AUTH=${EXPECT_HC_AUTH:-}                 # REQUIRED for the cut: the auth guest's hc the v0.6.3 release reports

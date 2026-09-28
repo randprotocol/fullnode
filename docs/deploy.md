@@ -272,13 +272,14 @@ unless `VESTING_CLAIMED_OK=1` accepts the approximation. **The `balances` step**
 (`cut-chain17-genesis.sh balances <snapshot dir>`, read-only toward the chain, after `snapshot`,
 while chain 16 is up) runs `rand sync` + `balance` + `notes` for every `*.key.json` under
 `WALLETS_DIRS` (default: chain 14's and chain 15's `wallets/` and `payout/`, plus chain 16's
-`wallets/`, since chain 16 has no `payout/` of its own yet) against chain 16 and writes
-`ALLOC_ADDRESSES` from the non-zero balances plus `balances.json` beside the snapshot; it refuses
-against a pruned `CHAIN16_RPC` (a scan needs an archive). It also decodes chain 16's own genesis
-alloc notes' `pk` and lists any that match no scanned wallet ("uncovered genesis allocs" —
-`UNCOVERED_ALLOCS_OK=1` to drop them knowingly; none of the `shielded-1..5` chain-16 alloc wallets'
-key files were found on this laptop when this default was chosen — if they turn up, add their
-directory too). The cut asserts the alloc list is those wallets one-for-one and Σ alloc ==
+`wallets/` (since chain 16 has no `payout/` of its own yet) and `$FULLNODE_DIR/wallets` — this
+repo's own gitignored `wallets/`, where the chain-16 genesis allocs `shielded-1..5` (the chain-15
+cut's `ALLOC_WALLETS` default) actually live) against chain 16 and writes `ALLOC_ADDRESSES` from
+the non-zero balances plus `balances.json` beside the snapshot; it refuses against a pruned
+`CHAIN16_RPC` (a scan needs an archive). It also decodes chain 16's own genesis alloc notes' `pk`
+and lists any that match no scanned wallet ("uncovered genesis allocs" — `UNCOVERED_ALLOCS_OK=1`
+to drop them knowingly if a wallet's key file genuinely cannot be found). The cut asserts the
+alloc list is those wallets one-for-one and Σ alloc ==
 Σ scanned (`NO_BALANCES=1` is the explicit opt-out); it warns, but does not refuse, when an
 operator wallet's Σ zUSD differs from `ZUSD_CARRY`'s (a non-operator holder like Anish's wallet
 legitimately differs). A changed `FAUCET_RECIPIENTS` list needs `FAUCET_RECIPIENTS_CHANGED=1`,
