@@ -168,7 +168,8 @@
 # `build_traces_salted_with(.., ProveOptions::default())` — the header's own ceiling
 # (`gas::gas_max`), what every `Machine::prove*` declares by default. No patch below changed.
 # The recursion section at `f95a1ce` is byte-identical to `b9ffc39`'s; the rVM's own cs8 re-pin
-# is a separate recursion change and needs a second run of this script once it lands.
+# landed at `6d4f124` (the 35-word-per-proof aggregate interface and the staged-absorb sponge fix;
+# the research section is unchanged since `f95a1ce`) and is vendored by the recursion section below.
 #
 # The CUDA backend is *not* vendored either: crates/randprotocol-zkvm depends on it by path, as
 # ../../../circuits/rand-zkvm-cuda, so `circuits` must be checked out beside `fullnode` when building
@@ -350,7 +351,10 @@ echo "reminder: --features cuda / mock-cuda need circuits checked out at ../../.
 # runs `check_program`; a Poseidon2 known-answer test — again no aggregate-digest move), then at
 # `b9ffc39` (constraint set 7: the verifier program refuses a non-zero commit-phase PoW word
 # (VERIFIER-1), every chip's writes bound on its row (#58), keys salted from `key_derivation_v2`,
-# new inner vk / interface digests — the aggregate program digest DOES move here). Re-vendoring the rVM alone is this section alone: the research
+# new inner vk / interface digests — the aggregate program digest DOES move here), then at
+# `6d4f124` (constraint set 8: the interface carries 35 public values a proof, `pv::GAS` the 35th;
+# `dsl::hash::absorb_staged` defers each permutation so a list ending on a block boundary digests
+# right; aggregate program digest `66a8094f…` → `1831f036…`). Re-vendoring the rVM alone is this section alone: the research
 # section above rewrites `guests-compiled/PROVENANCE.md` and would carry research's older drift. Two vendored files carry hand fixes this
 # section does not reproduce — keep them when re-syncing: `Cargo.toml`'s `license.workspace`
 # line and `tests/backend.rs`'s doc comment (`randprotocol-zkvm`, not the old crate name). What the
@@ -424,4 +428,4 @@ open(p, 'w').write(s)
 PY
 grep -rl "recursion::" "$RVM_DST/tests" | xargs -I{} sed -i '' 's/recursion::/randprotocol_rvm::/g' {} 2>/dev/null || true
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin b9ffc39) into $RVM_DST"
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 6d4f124) into $RVM_DST"

@@ -332,7 +332,7 @@ pub fn verify_rv32_with(
     //
     // `inner_vk_digest`, recomputed in-program from the compile-time shape words and the key's
     // cap (so it is bound by the program digest twice over), then the §4.4 list — the vk digest,
-    // `N = 1`, the 34 inner public values — stored, sponged with the capacity header, and the
+    // `N = 1`, the 35 inner public values — stored, sponged with the capacity header, and the
     // digest's four lanes published. The batch public values are always exactly those four (R5):
     // the node recomputes the list from the covered bundles' public fields and compares digests
     // (the cs6 `H_PUB` pattern). What used to be thirty-nine `PUBLIC` rows is the digest's four.

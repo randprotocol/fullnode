@@ -40,9 +40,10 @@ pub fn public_digest(words: &[F]) -> [F; 4] {
 
 /// The §4.4 list for one verified inner-proof set, in order: the inner verifier key digest
 /// (4 elements), `N`, then `N ×` the shape's public-value count inner public values (constraint
-/// set 6's `pv::NUM = 34` on the RV32 machine, `machine::NUM_PUBLIC_VALUES = 4` on the rVM —
-/// `PUB0..7` included on both, since dropping `HC0..7` would let an aggregate accept a proof of
-/// a different guest). The fullnode recomputes this list from the covered bundles' public fields
+/// set 8's `pv::NUM = 35` on the RV32 machine — `GAS` appended after `PUB0..7` — and
+/// `machine::NUM_PUBLIC_VALUES = 4` on the rVM; every value included, since dropping `HC0..7`
+/// would let an aggregate accept a proof of a different guest). The fullnode recomputes this
+/// list from the covered bundles' public fields
 /// and its registered `hc`, hashes it with [`public_digest`], and compares.
 ///
 /// This is the *single-proof program's* list (`rv32.rs`'s phase 8 computes exactly it). The
@@ -65,7 +66,7 @@ pub fn interface_words<S: VerifierShape>(shape: &S, key: &S::Key, pvs: &[Vec<u64
     w
 }
 
-/// The aggregate family's §4.4 list: `[vk(4) ‖ N ‖ B(8) ‖ 34·N]` — the eight aggregate-binding
+/// The aggregate family's §4.4 list: `[vk(4) ‖ N ‖ B(8) ‖ 35·N]` — the eight aggregate-binding
 /// words absorbed between `N` and the public values (audit v3, AGG-2). The binding is the
 /// chain's `H("rand-aggregate-bind-1", chain_id ‖ aggregator ‖ nonce)`: the rVM absorbs the
 /// eight words like any other — the derivation is the fullnode's, mirrored for tests — so a

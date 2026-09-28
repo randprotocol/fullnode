@@ -737,7 +737,7 @@ mod tests {
     /// The conformance suite (spec §4, and the plan's gate): the admission stub is not trusted
     /// until the fullnode's recompute reproduces `circuits/recursion/docs/02-aggregate.md`'s
     /// pinned vectors byte-for-byte — the `inner_vk_digest` (a constant of the fixture shape),
-    /// the 115-word bound interface list `[vk ‖ 3 ‖ B(8) ‖ 34·3]` for the 3-proof test-profile
+    /// the 118-word bound interface list `[vk ‖ 3 ‖ B(8) ‖ 35·3]` for the 3-proof test-profile
     /// fixture set under the doc's stand-in binding (AGG-2), and its digest.
     /// The list rides on the fixtures' random notes, so this pins against *this* fixture
     /// cache, the same one the doc's worked example measured (regenerated 2026-09-21 after the
@@ -746,6 +746,8 @@ mod tests {
     /// (v0.6.1) moved all three with the inner machine: the values are circuits `b9ffc39`'s
     /// `docs/02-aggregate.md`, measured on the cs7 fixture cache generated 2026-09-28 on the
     /// testbox (`/root/recursion-fixtures-cs7`), and this test reproduces them from that cache.
+    /// Constraint set 8 (`pv::GAS`, 35 public values a proof) moved them again: circuits
+    /// `6d4f124`'s `docs/02-aggregate.md`, measured on a fresh cs8 fixture cache.
     #[test]
     fn the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte() {
         use p3_field::PrimeField64;
@@ -761,18 +763,18 @@ mod tests {
         // The inner vk digest, a data-independent constant of the shape.
         assert_eq!(
             hex_words(&randprotocol_rvm::shape::inner_vk_digest(&vk.shape, &vk.key)),
-            "ee072b7a8eb766c7de6fb4fffa1f9f1b6098c8971b1b49eec2f4e0091edadfbe",
+            "346ee1841980e46a3501f5b04cdf40dd3208e5b1c67360285353cf7a0b735fb9",
             "the pinned inner_vk_digest"
         );
-        // The 115-word interface list, built the way admission builds it: from the covered
+        // The 118-word interface list, built the way admission builds it: from the covered
         // bundles' `pv::NUM` public values, in cover order, with the binding after the count.
         let pvs: Vec<Vec<u64>> = (0..3).map(|k| covered(k).1.public_values.to_vec()).collect();
         let list = randprotocol_rvm::public_values::interface_words_bound(&vk.shape, &vk.key, &DOC_BINDING, &pvs);
         assert_eq!(list.len(), 4 + 1 + 8 + randprotocol_core::types::pv::NUM * 3);
-        assert_eq!(hex_words(&list), INTERFACE_LIST_HEX, "the pinned 115-word interface list");
+        assert_eq!(hex_words(&list), INTERFACE_LIST_HEX, "the pinned 118-word interface list");
         assert_eq!(
             hex_words(&randprotocol_rvm::public_values::public_digest(&list)),
-            "6059c52aeeebd1243688b6bf62c8218cc5770e9f00ebe5fdfe80717d48f3a6ee",
+            "36b414c0205da8dc6653f2e12f34596ece718d4ef22c1b947012582e55dcf5dd",
             "the pinned interface digest"
         );
     }
@@ -782,39 +784,39 @@ mod tests {
     const DOC_BINDING: [u32; 8] =
         [0xA662_0000, 0xA662_0001, 0xA662_0002, 0xA662_0003, 0xA662_0004, 0xA662_0005, 0xA662_0006, 0xA662_0007];
 
-    /// `docs/02-aggregate.md`'s worked example: the 115-word interface list for the 3-proof
+    /// `docs/02-aggregate.md`'s worked example: the 118-word interface list for the 3-proof
     /// test-profile fixture set, each word the canonical `u64` as 16 lowercase hex chars.
     const INTERFACE_LIST_HEX: &str = concat!(
-        "ee072b7a8eb766c7de6fb4fffa1f9f1b6098c8971b1b49eec2f4e0091edadfbe",
-        "0000000000000003",
-        "00000000a662000000000000a662000100000000a662000200000000a6620003",
-        "00000000a662000400000000a662000500000000a662000600000000a6620007",
-        "0000000000000000000000000000000e000000000587886b0000000015ece23a",
-        "000000008a938f4600000000e608b6ac00000000fcd6b78000000000cc295ac5",
-        "0000000061631dbb000000006be6e8b9000000006f35274a0000000003719537",
+        "346ee1841980e46a3501f5b04cdf40dd3208e5b1c67360285353cf7a0b735fb9",
+        "000000000000000300000000a662000000000000a662000100000000a6620002",
+        "00000000a662000300000000a662000400000000a662000500000000a6620006",
+        "00000000a66200070000000000000000000000000000000e00000000f2eacadf",
+        "00000000154e27ee000000009495530b00000000eb1a4314000000008d8f3c97",
+        "0000000007226b1e000000004adab5a300000000c2ee9aae000000006f35274a",
+        "000000000371953700000000a8a42560000000004b291c6600000000b7c2de0e",
+        "00000000d6bf7fcf00000000182b470b00000000fb4abd6c0000000094c64fd5",
+        "00000000990ca6c20000000003fd4b4f000000006f1a722f000000001d066fdd",
+        "000000008093b44c0000000058fbb79100000000494dd5aa00000000934a2759",
+        "00000000d5389ac8000000002e612784000000008639ed090000000085f58a21",
+        "000000004448d889000000006bb9c915000000000671dc2c0000000000003fff",
+        "0000000000000000000000000000000e000000009571a6ab000000009d741bb4",
+        "00000000f9159e5a000000008776086700000000049bbfde0000000026a23ed4",
+        "0000000053f0e25e0000000028e469d0000000006f35274a0000000003719537",
         "00000000a8a42560000000004b291c6600000000b7c2de0e00000000d6bf7fcf",
-        "00000000182b470b00000000fb4abd6c000000007b11c71600000000a3449738",
-        "0000000052a475e900000000fb8398e800000000ccbe4f6500000000c98e5478",
-        "00000000f919a6cc000000005ffaca0c00000000934a275900000000d5389ac8",
+        "00000000182b470b00000000fb4abd6c00000000977abd0e00000000c1d64b9b",
+        "000000004eedc30e00000000dcadaf0f000000007ab2ba9d000000006d69f3fd",
+        "000000008ca7c70f000000002d458a3c00000000934a275900000000d5389ac8",
         "000000002e612784000000008639ed090000000085f58a21000000004448d889",
-        "000000006bb9c915000000000671dc2c0000000000000000000000000000000e",
-        "000000000de5b97300000000a7464a860000000007d91d93000000009a780e0a",
-        "00000000c54249d90000000036e445ad00000000b63ef87a00000000c0b6899f",
-        "000000006f35274a000000000371953700000000a8a42560000000004b291c66",
-        "00000000b7c2de0e00000000d6bf7fcf00000000182b470b00000000fb4abd6c",
-        "0000000043fcea87000000005262fd4a00000000ead95f1d000000007fb040bc",
-        "00000000dffd6a2200000000ca135deb00000000e8b3ff85000000001620b410",
-        "00000000934a275900000000d5389ac8000000002e612784000000008639ed09",
-        "0000000085f58a21000000004448d889000000006bb9c915000000000671dc2c",
-        "0000000000000000000000000000000e00000000d7164a9a00000000895cc912",
-        "00000000f240d9b60000000038a4b1b3000000004e09c47c00000000b729a056",
-        "00000000aeab4c0f000000007c431794000000006f35274a0000000003719537",
-        "00000000a8a42560000000004b291c6600000000b7c2de0e00000000d6bf7fcf",
-        "00000000182b470b00000000fb4abd6c00000000544be89600000000a419ef53",
-        "00000000e519b51b0000000018efedb100000000d92a54e400000000a311d494",
-        "00000000773849cb00000000dbac1cdd00000000934a275900000000d5389ac8",
-        "000000002e612784000000008639ed090000000085f58a21000000004448d889",
-        "000000006bb9c915000000000671dc2c",
+        "000000006bb9c915000000000671dc2c0000000000003fff0000000000000000",
+        "000000000000000e00000000920f4477000000000dd3c1d50000000039830762",
+        "00000000e83ccc8e0000000038fca13500000000e1670fd900000000c906a4c1",
+        "00000000d7bd0cb9000000006f35274a000000000371953700000000a8a42560",
+        "000000004b291c6600000000b7c2de0e00000000d6bf7fcf00000000182b470b",
+        "00000000fb4abd6c00000000556e70dd00000000e800bcf600000000ac814bde",
+        "000000000383bb650000000047ca6436000000006da3029100000000d27f2517",
+        "0000000028f4776800000000934a275900000000d5389ac8000000002e612784",
+        "000000008639ed090000000085f58a21000000004448d889000000006bb9c915",
+        "000000000671dc2c0000000000003fff",
     );
 
     /// An RV32 bundle proof's bytes are not an rVM aggregate proof: the answer is a named error,

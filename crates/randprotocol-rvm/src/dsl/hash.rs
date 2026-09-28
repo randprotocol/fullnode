@@ -164,28 +164,35 @@ pub fn compress(b: &mut Builder, left: Digest, right: Digest, out: Digest) {
 /// One word into a *running* sponge whose state is the eight cells at `st` and whose next rate
 /// lane is the absolute address in the cell at `cursor` — the runtime-length sponge's absorb
 /// step (M5.3's aggregate program, where the interface list's length is a tape value, not a
-/// build-time constant): store at `*cursor`, bump, and when the cursor reaches `st + RATE` the
-/// rate is full — permute and rewind.
+/// build-time constant): when the cursor stands at `st + RATE` the previous block is full —
+/// permute and rewind — then store at `*cursor` and bump.
+///
+/// The permutation is *deferred* to the next word, never taken on the word that fills the rate:
+/// after any word the cursor is in `(st, st + RATE]`, so a block — full or partial — is always
+/// pending, and the caller's one unconditional permutation after the last word closes it. That
+/// is the padding-free rule (`public_values::public_digest`: every block, the last one
+/// included, overwrites its own lanes and permutes exactly once) for *every* list length. The
+/// eager form this replaced (permute when the fourth word lands) was right only while the
+/// list never ended on a block boundary — true for 34 public values a proof, false for cs8's
+/// 35, where `[vk ‖ N ‖ B(8) ‖ 35·N]` ends on one for every `N ≡ 1 (mod 4)` and the eager
+/// schedule permuted one time too many.
 ///
 /// The overwrite rule is the padding-free one, one word at a time: lanes the cursor has not
 /// reached keep their values, so a trailing partial block is exactly "overwrite only its own
-/// lanes, permute once" — the caller permutes once more after the last word rather than here.
-/// `st` must be a *dedicated* region, never `Builder::hash_scratch`: the whole point is that the
-/// state survives unrelated hashing between absorbs.
-///
-/// Measured: six rows per word plus, on the word that fills the rate, one permutation and the
-/// rewind (four more).
+/// lanes, permute once". `st` must be a *dedicated* region, never `Builder::hash_scratch`: the
+/// whole point is that the state survives unrelated hashing between absorbs.
 pub fn absorb_staged(b: &mut Builder, st: Ptr, cursor: Ptr, v: Felt) {
     let at = b.load(cursor, 0);
-    b.store_indirect(at, v);
-    let bumped = b.add_const(at, F::ONE);
-    b.store(cursor, 0, bumped);
     let full = b.constant(F::from_u64(b.addr_of(st) + RATE as u64));
-    b.if_eq(bumped, full, |b| {
+    b.if_eq(at, full, |b| {
         b.poseidon2(st);
         let base = b.constant(F::from_u64(b.addr_of(st)));
         b.store(cursor, 0, base);
     });
+    let at = b.load(cursor, 0);
+    b.store_indirect(at, v);
+    let bumped = b.add_const(at, F::ONE);
+    b.store(cursor, 0, bumped);
 }
 
 /// One Merkle authentication path, exactly `MerkleTreeMmcs::verify_batch`'s loop at arity 2 with
