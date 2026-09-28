@@ -3,6 +3,7 @@
 pub mod admission;
 pub mod agg_executor;
 pub mod disk;
+pub mod hosted_prover;
 pub mod rlimit;
 pub mod keyfile;
 pub mod mempool;
