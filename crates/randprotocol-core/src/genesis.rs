@@ -3084,6 +3084,31 @@ mod tests {
         );
     }
 
+    /// Final-review I3: `bundle_gas_limit` must be the bundle guest's own ceiling,
+    /// `gas_max(BUNDLE_PROOF_TIER, 0, 0)` = 20 479 — every bundle proof declares exactly that, so
+    /// any other value is a chain on which no bundle can ever be admitted.
+    #[test]
+    fn the_bundle_gas_limit_must_be_the_bundle_guests_ceiling() {
+        let pin = gas::gas_max(crate::types::BUNDLE_PROOF_TIER, 0, 0);
+        assert_eq!(pin, 20_479);
+        let with = |limit: u64| {
+            let mut g = genesis(1);
+            g.gas = Some(gas::GasConfig {
+                gas_price: 100,
+                byte_price: 800,
+                bundle_gas_limit: limit,
+                metering: gas::GasMetering::Circuit,
+                dynamic: None,
+            });
+            g.validate()
+        };
+        for bad in [7, pin - 1, pin + 1, gas::gas_max(12, 0, 0)] {
+            let e = with(bad).expect_err(&format!("bundle_gas_limit {bad} must be refused")).to_string();
+            assert!(e.contains("bundle_gas_limit") && e.contains("20479"), "{e}");
+        }
+        assert!(with(pin).is_ok());
+    }
+
     /// Controller ruling (task B6): `gas.dynamic` prices bytes by Σ `encoded_len` over the block
     /// as served, and a pruned (marker-form) bundle encodes shorter than its raw form, so a node
     /// syncing sealed history would compute another byte price and fail the root. Refused by name

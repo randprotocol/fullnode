@@ -713,10 +713,11 @@ in only when present):
   per KiB of call proof plus input envelope. A call's floor is `BUNDLE_BASE + gas_price·GAS_LIMIT
   + byte_price·⌈bytes/1024⌉`, priced at the proof's own declared `GAS_LIMIT`, not the header's
   ceiling (`docs/fees.md` §1.1).
-- **`bundle_gas_limit`** (`> 0`): every bundle proof's declared `GAS_LIMIT` must equal this
-  exactly, or the proof is refused (`TxError::BundleGasLimit`, permanent). Must be `gas_max(14, 0,
-  0) = 20479` for today's tier-14 hidden-asset (v2) guest — any other value means no real bundle
-  can ever be admitted.
+- **`bundle_gas_limit`** (exactly `20479`): every bundle proof's declared `GAS_LIMIT` must equal
+  this exactly, or the proof is refused (`TxError::BundleGasLimit`, permanent). It must be
+  `gas_max(14, 0, 0) = 20479` for today's tier-14 hidden-asset (v2) guest, and genesis refuses any
+  other value (`GasConfig::check`, `gas::bundle_gas_limit_pin`) — any other value would mean no
+  real bundle could ever be admitted.
 - **`metering`**: only `"circuit"` parses; the field exists so a later metering scheme has a name.
 - **`dynamic`** (optional, Phase 2 — absent means the two starting prices never move):
   `target_block_bytes` (`1..=max_block_bytes`, the ledger's effective cap; half `max_block_bytes`

@@ -1670,9 +1670,11 @@ pub fn parse_prune_history(s: &str) -> Result<Duration, String> {
 }
 
 /// `rand-node genesis --bundle-gas-limit`'s value, or its default: what every real hidden-asset
-/// bundle proof declares, the tier-14 hash-free ceiling `gas_max(14, 0, 0)` (spec §4.3).
+/// bundle proof declares, the tier-14 hash-free ceiling `gas_max(BUNDLE_PROOF_TIER, 0, 0)` (spec
+/// §4.3) — also the only value `Genesis::build` accepts (`GasConfig::check`), so a flag naming
+/// anything else is refused before the file is written.
 fn bundle_gas_limit_or_default(v: Option<u64>) -> u64 {
-    v.unwrap_or_else(|| randprotocol_core::gas::gas_max(14, 0, 0))
+    v.unwrap_or_else(randprotocol_core::gas::bundle_gas_limit_pin)
 }
 
 #[cfg(test)]
@@ -2170,7 +2172,21 @@ mod tests {
     fn the_bundle_gas_limit_defaults_to_the_bundle_guests_ceiling() {
         assert_eq!(bundle_gas_limit_or_default(None), randprotocol_core::gas::gas_max(14, 0, 0));
         assert_eq!(bundle_gas_limit_or_default(None), 20_479);
+        // Any other value passes the flag through and is refused when the genesis is built
+        // (final-review I3), which `rand-node genesis` does before it writes the file.
         assert_eq!(bundle_gas_limit_or_default(Some(7)), 7);
+        for bad in [7, 16_383, 20_478] {
+            let mut g = pinned_genesis();
+            g.gas = Some(randprotocol_core::gas::GasConfig {
+                gas_price: 100,
+                byte_price: 800,
+                bundle_gas_limit: bundle_gas_limit_or_default(Some(bad)),
+                metering: randprotocol_core::gas::GasMetering::Circuit,
+                dynamic: None,
+            });
+            let e = g.build(&ZkExecutor::new(FriProfile::Test)).err().expect("refused").to_string();
+            assert!(e.contains("bundle_gas_limit") && e.contains("20479"), "{e}");
+        }
     }
 
     /// `rand-node genesis` takes the four gas flags (design 2026-09-28 §4.2, §4.3, §7.1); the

@@ -320,9 +320,9 @@ impl StubExecutor {
         v.extend_from_slice(&Hash::digest_domain(b"rand-stub-bundle", &word8_to_bytes(hc_bundle)).0[..8]);
         v.extend_from_slice(&word8_to_bytes(binding));
         // The gas limit a stub bundle proof declares unless a test chooses one (`with_bundle_gas`):
-        // `gas_max(14, 0, 0)`, what every real hidden-asset bundle proof declares (tier 14, no hash
-        // table).
-        v.extend_from_slice(&crate::gas::gas_max(14, 0, 0).to_le_bytes());
+        // `gas_max(BUNDLE_PROOF_TIER, 0, 0)`, what every real hidden-asset bundle proof declares
+        // (tier 14, no hash table) and the one `bundle_gas_limit` a genesis may name.
+        v.extend_from_slice(&crate::gas::bundle_gas_limit_pin().to_le_bytes());
         v
     }
 
