@@ -277,12 +277,15 @@ impl Mempool {
         self.gas_policy = Some(policy);
     }
 
-    /// The floor `tx` must pay here: the gas policy's for a call under one, the schedule's
-    /// otherwise — refusing below it.
+    /// The floor `tx` must pay here: on a chain with the genesis `gas` section, the ledger's own
+    /// rule for a call (spec §4.2 — the policy is not read there); else the gas policy's for a
+    /// call under one, the schedule's otherwise — refusing below it.
     fn gas_policy_floor(&self, tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> Result<u64, TxError> {
-        let floor = match &self.gas_policy {
-            Some(p) => crate::admission::call_floor(tx, ledger, executor, p)?,
-            None => randprotocol_core::gas::fee_floor(&tx.action),
+        let floor = match (&self.gas_policy, ledger.gas()) {
+            (Some(p), _) => crate::admission::call_floor(tx, ledger, executor, p)?,
+            // `call_floor` answers the ledger rule under the section whatever policy it is handed.
+            (None, Some(_)) => crate::admission::call_floor(tx, ledger, executor, &randprotocol_core::gas::GasPolicy::DEFAULT)?,
+            (None, None) => randprotocol_core::gas::fee_floor(&tx.action),
         };
         match crate::admission::fee_below_floor(tx, floor) {
             Some(e) => Err(e),
@@ -2444,7 +2447,7 @@ mod tests {
     /// to it, even though the ledger itself would have accepted the same proof. The fix reads the
     /// segment the same way the ledger does.
     #[test]
-    fn a_hardened_call_to_a_public_input_program_is_priced_not_refused() {
+    fn a_hardened_call_to_a_public_input_program_is_priced_not_refused_under_a_node_policy() {
         use randprotocol_core::gas::GasPolicy;
         use randprotocol_core::program::{hardened_call_segment, program_id_with_public};
 
@@ -2485,6 +2488,44 @@ mod tests {
         let mut m = Mempool::new(64);
         m.set_gas_policy(GasPolicy::DEFAULT);
         assert_eq!(m.precheck(&call, &ledger, &StubExecutor).unwrap().floor, want);
+    /// Spec 2026-09-28 §4.2: on a chain whose genesis carries the `gas` section the pool's floor
+    /// for a call IS the ledger's rule — `BUNDLE_BASE + gas_price·GAS_LIMIT + byte_price·KiB` at
+    /// the ledger's current prices over the proof's declared limit — with or without a node
+    /// policy, and never the schedule's `fee_floor` (which would refuse a call the chain admits).
+    #[test]
+    fn under_the_gas_section_the_pools_call_floor_is_the_ledger_rule() {
+        use randprotocol_core::gas::{self, GasConfig, GasMetering, GasPolicy, GasPrices};
+        let section = GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 16_383, metering: GasMetering::Circuit, dynamic: None };
+        let stub_len = StubExecutor::make_proof_with_public(&Hash::ZERO, 12, [0; 8], &[]).len();
+        // A stub tier-12 proof declares gas_max(12, 0, 0) = 4 095.
+        let want = gas::circuit_call_floor(100, 800, gas::gas_max(12, 0, 0), stub_len);
+        assert!(want < gas::fee_floor(&Action::Call { program: Hash::ZERO, proof: vec![], input_envelope: None }), "cheaper than the schedule's pre-verify floor");
+        for policy in [None, Some(GasPolicy::DEFAULT), GasPolicy::from_prices(1_000, 8_000)] {
+            let (mut ledger, _, short) = program_and_call(12, want - 1, 50);
+            ledger.set_gas(Some(section.clone()));
+            let mut m = Mempool::new(64);
+            if let Some(p) = policy {
+                m.set_gas_policy(p);
+            }
+            assert_eq!(
+                m.precheck(&short, &ledger, &StubExecutor).unwrap_err(),
+                MempoolError::Invalid(TxError::FeeTooLow { min: want, fee: want - 1 }),
+                "{policy:?}"
+            );
+            let (mut ledger, _, paid) = program_and_call(12, want, 60);
+            ledger.set_gas(Some(section.clone()));
+            assert_eq!(ledger.validate(&paid, &StubExecutor), Ok(()), "the ledger admits it at the rule's floor");
+            assert_eq!(m.precheck(&paid, &ledger, &StubExecutor).unwrap().floor, want, "{policy:?}");
+            m.insert(paid, &ledger, &StubExecutor).unwrap();
+            // `call_floor` itself answers the rule, at the ledger's current prices.
+            let (mut ledger, _, call) = program_and_call(12, want, 70);
+            ledger.set_gas(Some(section.clone()));
+            ledger.set_gas_prices(GasPrices { gas_price: 300, byte_price: 900 });
+            assert_eq!(
+                crate::admission::call_floor(&call, &ledger, &StubExecutor, &GasPolicy::DEFAULT).unwrap(),
+                gas::circuit_call_floor(300, 900, gas::gas_max(12, 0, 0), stub_len)
+            );
+        }
     }
 
     /// Review focus 1 and 2: the policy check never decodes a proof it should not.

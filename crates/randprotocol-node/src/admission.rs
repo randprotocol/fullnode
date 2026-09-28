@@ -369,6 +369,9 @@ pub fn is_permanent(e: &TxError) -> bool {
             | TxError::EnvelopeTooLarge
             // Spec 2026-09-26 §2.4: an envelope's length against the genesis constant.
             | TxError::EnvelopeSize { .. }
+            // Spec 2026-09-28 §4.3: a bundle proof's declared gas limit is its own bytes, against
+            // the genesis `bundle_gas_limit`.
+            | TxError::BundleGasLimit { .. }
             | TxError::ProofTooLarge
             | TxError::AttestationTooLarge
             // fix-sync-stall's: the whole transaction is bigger than a block. A byte length is a
@@ -762,6 +765,11 @@ pub fn minter_not_allowed(
 /// Every other action's floor is the schedule's `fee_floor`. Admission policy above
 /// the ledger's `call_fee` validity rule, the LEDGER-1 pattern: the pool and the proposer
 /// demand it, a block never does.
+///
+/// Spec §4.2 (Phase 1): on a chain whose genesis carries the `gas` section, `policy` is not
+/// read — the floor is the ledger's own rule (`Ledger::gas_call_floor` over the decoded
+/// outcome's declared `gas_limit`, at the ledger's current prices), so the pool demands
+/// exactly what a block does.
 pub fn call_floor(
     tx: &Transaction,
     ledger: &randprotocol_core::Ledger,
@@ -788,6 +796,9 @@ pub fn call_floor(
         executor.decode_call(record, proof)
     }
     .map_err(TxError::InvalidProof)?;
+    if let Some(floor) = ledger.gas_call_floor(outcome.gas_limit, gas::call_bytes(proof, input_envelope.as_ref())) {
+        return Ok(floor);
+    }
     Ok(policy.call_floor(outcome.tier, outcome.keccak_log_height, outcome.sha256_log_height, gas::call_bytes(proof, input_envelope.as_ref())))
 }
 
@@ -903,6 +914,9 @@ mod tests {
             TxError::EnvelopeTooLarge,
             // Spec 2026-09-26 §2.4: an envelope's length against the genesis constant.
             TxError::EnvelopeSize { expected: 1860, got: 1348 },
+            // Spec 2026-09-28 §4.3: the proof's own declared limit against a genesis constant.
+            TxError::BundleGasLimit { want: 16_383, got: Some(16_384) },
+            TxError::BundleGasLimit { want: 16_383, got: None },
             TxError::TransactionTooLarge { size: 9_000_000, max: 4 << 20 },
             TxError::DuplicateNullifierInBundle,
             TxError::WrongChain { expected: 7, actual: 8 },

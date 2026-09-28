@@ -86,6 +86,11 @@ pub enum TxError {
     /// any other length. Every envelope is the same size so none tells a memo from its absence.
     #[error("envelope is {got} bytes, this chain requires exactly {expected}")]
     EnvelopeSize { expected: usize, got: usize },
+    /// Spec 2026-09-28 §4.3: on a chain whose genesis carries a `gas` section, a bundle proof
+    /// whose declared `GAS_LIMIT` (`pv::GAS`) is not exactly the section's `bundle_gas_limit`.
+    /// `got` is `None` when the executor's proofs carry no limit at all.
+    #[error("bundle proof declares gas limit {got:?}, this chain requires exactly {want}")]
+    BundleGasLimit { want: u64, got: Option<u64> },
     #[error("proof too large")]
     ProofTooLarge,
     #[error("attestation exceeds {} bytes", gas::MAX_ATTESTATION_BYTES)]
@@ -1310,14 +1315,21 @@ impl Ledger {
         self.gas_prices = Some(p);
     }
 
-    /// The gas a verified call adds to its block's `gas_used` (spec §7.1). **0 today, on
-    /// purpose**: the call's declared `GAS_LIMIT` reaches `CallOutcome` only with the
-    /// constraint-set-8 vendor (B1); B3 reads `outcome.gas_limit` here once the cs8 vendor lands,
-    /// red-first against `a_calls_gas_used_is_zero_until_b3`. Until then a block's gas is its
-    /// bundles' flat `bundle_gas_limit` alone.
+    /// The gas a verified call adds to its block's `gas_used` (spec §7.1): its declared
+    /// `GAS_LIMIT` (`pv::GAS`), the bound it paid for — never the cycle count, which the proof
+    /// does not reveal.
     pub fn call_gas_used(outcome: &crate::program::CallOutcome) -> u64 {
-        let _ = outcome;
-        0
+        outcome.gas_limit
+    }
+
+    /// A call's floor under the `gas` section (spec §4.2, §7.1): `BUNDLE_BASE +
+    /// gas_price·gas_limit + byte_price·⌈bytes/1024⌉` at the prices in force at this block's
+    /// start ([`Self::gas_prices`]). `None` on a chain without the section, whose tier schedule
+    /// ([`gas::call_fee`]) is unchanged. With `gas_limit` 1 it is the pre-verify floor.
+    pub fn gas_call_floor(&self, gas_limit: u64, bytes: usize) -> Option<u64> {
+        self.gas.as_ref()?;
+        let p = self.gas_prices();
+        Some(gas::circuit_call_floor(p.gas_price, p.byte_price, gas_limit, bytes))
     }
 
     /// What a block of `txs` feeds the controller, given the Σ of its calls' gas
@@ -1675,6 +1687,16 @@ impl Ledger {
         if published != self.expected_bundle_digest(b, executor) {
             return Err(TxError::BadDigest);
         }
+        // Spec §4.3: under the `gas` section every bundle proof declares exactly the genesis
+        // `bundle_gas_limit`. A decode, before the verify — a wrong limit must not buy one — and
+        // on the verified-set path too, since the value is a statement about these bytes. The
+        // verify that follows (or admission's, on a hit) is what makes the decoded value binding.
+        if let Some(g) = &self.gas {
+            let got = executor.bundle_gas_limit(&b.proof).map_err(TxError::InvalidBundleProof)?;
+            if got != Some(g.bundle_gas_limit) {
+                return Err(TxError::BundleGasLimit { want: g.bundle_gas_limit, got });
+            }
+        }
         // B5: the one step a hit on the verified set skips. Everything else about this bundle —
         // the digest just compared, and every structural and stateful check `validate_inner` ran
         // before this function — is checked at apply exactly as at admission. The transaction id
@@ -1844,7 +1866,17 @@ impl Ledger {
             // The burn shape (the hidden-asset bundle, spec §3.7): which of the three burn fields
             // this action may set. Comparisons only, before anything else about the bundle.
             self.check_burn_shape(&tx.action, b)?;
-            let min = gas::fee_floor(&tx.action);
+            // Spec §4.2: under the `gas` section a call's pre-verify floor is the rule at a
+            // declared limit of 1 — its bytes are known before any verification, and they are
+            // what keeps a verify from being bought for nothing (the byte term replaces
+            // `CALL_BASE` in that role). Every other action, and every chain without the
+            // section, keeps `fee_floor`.
+            let min = match &tx.action {
+                Action::Call { proof, input_envelope, .. } => self
+                    .gas_call_floor(1, gas::call_bytes(proof, input_envelope.as_ref()))
+                    .unwrap_or_else(|| gas::fee_floor(&tx.action)),
+                _ => gas::fee_floor(&tx.action),
+            };
             if b.fee < min {
                 return Err(TxError::FeeTooLow { min, fee: b.fee });
             }
@@ -2048,7 +2080,12 @@ impl Ledger {
             }
             .map_err(TxError::InvalidProof)?;
             let bytes = gas::call_bytes(proof, input_envelope.as_ref());
-            let min = gas::BUNDLE_BASE + gas::call_fee(outcome.tier, bytes);
+            // Spec §4.2 (cs8): under the `gas` section the declared limit at the prices in force
+            // plus the bytes — the tier floor is gone on such a chain. Without the section, the
+            // tier schedule byte for byte.
+            let min = self
+                .gas_call_floor(outcome.gas_limit, bytes)
+                .unwrap_or_else(|| gas::BUNDLE_BASE + gas::call_fee(outcome.tier, bytes));
             let fee = tx.fee();
             if fee < min {
                 return Err(TxError::FeeTooLow { min, fee });
@@ -3166,6 +3203,9 @@ mod tests {
         fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
             StubExecutor.verify_auth(hc_auth, proof, binding)
         }
+        fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            StubExecutor.bundle_gas_limit(proof)
+        }
         fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
             self.bundles.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             StubExecutor.verify_bundle(hc_bundle, proof, binding)
@@ -3975,6 +4015,9 @@ mod tests {
         fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
             StubExecutor.verify_auth(hc_auth, proof, binding)
         }
+        fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            StubExecutor.bundle_gas_limit(proof)
+        }
         fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
             StubExecutor.verify_bundle(hc_bundle, proof, binding)
         }
@@ -4281,6 +4324,9 @@ mod tests {
         }
         fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
             StubExecutor.verify_auth(hc_auth, proof, binding)
+        }
+        fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            StubExecutor.bundle_gas_limit(proof)
         }
         fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
             StubExecutor.verify_bundle(hc_bundle, proof, binding)
@@ -5520,10 +5566,10 @@ mod tests {
         assert_eq!(fixed.state_root(), Hash::digest_domain(b"rand-state-6", &buf));
     }
 
-    /// The deliberate seam for B3: until the constraint-set-8 vendor gives `CallOutcome` its
-    /// `gas_limit`, a call adds nothing to a block's gas. B3's change must turn this red first.
+    /// Spec §7.1: a call adds its declared `GAS_LIMIT` (`pv::GAS`, `CallOutcome::gas_limit`) to
+    /// its block's `gas_used` — the bound it paid for, not a count it revealed.
     #[test]
-    fn a_calls_gas_used_is_zero_until_b3() {
+    fn a_calls_gas_used_is_its_declared_limit() {
         let o = crate::program::CallOutcome {
             tier: 20,
             outputs: [0; 8],
@@ -5532,11 +5578,12 @@ mod tests {
             sha256_log_height: 13,
             gas_limit: crate::gas::gas_max(20, 12, 13),
         };
-        assert_eq!(Ledger::call_gas_used(&o), 0);
+        assert_eq!(Ledger::call_gas_used(&o), crate::gas::gas_max(20, 12, 13));
+        assert_eq!(Ledger::call_gas_used(&crate::program::CallOutcome { gas_limit: 40_000, ..o }), 40_000);
     }
 
-    /// `apply_block` charges the controller Σ `encoded_len` in bytes and `bundle_gas_limit` per
-    /// bundle proof in gas: the replica's prices after a one-call block are exactly what a
+    /// `apply_block` charges the controller Σ `encoded_len` in bytes and, in gas, each call's
+    /// declared limit plus `bundle_gas_limit` per bundle proof: the replica's prices after a one-call block are exactly what a
     /// direct `close_block` with those two sums gives.
     #[test]
     fn apply_block_feeds_the_controller_the_blocks_bytes_and_gas() {
@@ -5549,11 +5596,177 @@ mod tests {
         let mut expect = l.clone();
         expect.set_height(2);
         expect.apply_tx(&tx, &a0.address(), &StubExecutor).unwrap();
-        expect.close_block(2, &a0.address(), tx.encoded_len() as u64, 16_383);
+        // The call's declared limit (a stub tier-12 proof declares `gas_max(12, 0, 0)`) plus the
+        // one bundle's `bundle_gas_limit`.
+        expect.close_block(2, &a0.address(), tx.encoded_len() as u64, gas::gas_max(12, 0, 0) + 16_383);
         let block = signed_block(vec![tx], &a0, 2, expect.state_root());
         let mut replica = l.clone();
         replica.apply_block(&block, &StubExecutor).unwrap();
         assert_eq!(replica.gas_prices(), expect.gas_prices());
         assert_ne!(replica.gas_prices(), l.gas_prices(), "the block moved the prices");
+    }
+
+    /// A ledger with the test program deployed and a fixed-price `gas` section (100 / 800,
+    /// bundle limit 16 383).
+    fn gas_ledger() -> (Ledger, ProgramId) {
+        ledger_with_program(|l| {
+            l.set_gas(Some(gas::GasConfig {
+                gas_price: 100,
+                byte_price: 800,
+                bundle_gas_limit: 16_383,
+                metering: gas::GasMetering::Circuit,
+                dynamic: None,
+            }))
+        })
+    }
+
+    /// Spec §4.2: under the section a call pays gas_price·GAS_LIMIT + byte_price·KiB over the
+    /// base — the declared limit, not the tier — and the old tier floor no longer applies. The
+    /// pre-verify floor is the same rule at a limit of 1, so a verify is still never bought for
+    /// less than the bytes.
+    #[test]
+    fn under_the_gas_section_a_call_pays_its_declared_limit() {
+        let (l, id) = gas_ledger();
+        let proof = StubExecutor::make_proof_with_gas(&id, 12, [7; 8], 3_000);
+        let kib = proof.len().div_ceil(1024) as u64;
+        assert_eq!(kib, 1, "a stub proof is under one KiB");
+        let floor = gas::BUNDLE_BASE + 100 * 3_000 + 800 * kib;
+        assert!(floor < gas::BUNDLE_BASE + gas::call_fee(12, proof.len()), "cheaper than the tier floor for a small declared limit");
+        let short = call_tx(&l, 20, id, proof.clone(), floor - 1);
+        assert_eq!(l.validate(&short, &StubExecutor), Err(TxError::FeeTooLow { min: floor, fee: floor - 1 }));
+        let paid = call_tx(&l, 30, id, proof.clone(), floor);
+        assert!(l.validate(&paid, &StubExecutor).is_ok());
+        // A limit of gas_max(20, 0, 0) with the same bytes costs 0.1 RAND more.
+        let big = StubExecutor::make_proof_with_gas(&id, 14, [7; 8], 1_048_575);
+        let kib = big.len().div_ceil(1024) as u64;
+        let floor = gas::BUNDLE_BASE + 100 * 1_048_575 + 800 * kib;
+        assert_eq!(l.validate(&call_tx(&l, 40, id, big.clone(), floor - 1), &StubExecutor), Err(TxError::FeeTooLow { min: floor, fee: floor - 1 }));
+        assert!(l.validate(&call_tx(&l, 50, id, big, floor), &StubExecutor).is_ok());
+        // The pre-verify floor: under `BUNDLE_BASE + gas_price·1 + byte_price·KiB` the call is
+        // refused at step 3, before its proof is decoded or verified.
+        let pre = gas::BUNDLE_BASE + 100 + 800;
+        let exec = CountingExecutor::default();
+        assert_eq!(l.validate(&call_tx(&l, 60, id, proof.clone(), pre - 1), &exec), Err(TxError::FeeTooLow { min: pre, fee: pre - 1 }));
+        assert_eq!((exec.calls(), exec.bundles()), (0, 0), "no verify is bought under the byte floor");
+        // Without the section the tier schedule stands, byte for byte.
+        let (plain, id) = ledger_with_program(|_| {});
+        let proof = StubExecutor::make_proof_with_gas(&id, 12, [7; 8], 3_000);
+        let cheap = gas::BUNDLE_BASE + 100 * 3_000 + 800;
+        assert_eq!(
+            plain.validate(&call_tx(&plain, 20, id, proof.clone(), cheap), &StubExecutor),
+            Err(TxError::FeeTooLow { min: gas::BUNDLE_BASE + gas::CALL_BASE, fee: cheap })
+        );
+        let old = gas::BUNDLE_BASE + gas::call_fee(12, proof.len());
+        assert!(plain.validate(&call_tx(&plain, 30, id, proof.clone(), old), &StubExecutor).is_ok());
+        assert_eq!(
+            plain.validate(&call_tx(&plain, 40, id, proof.clone(), old - 1), &StubExecutor),
+            Err(TxError::FeeTooLow { min: old, fee: old - 1 })
+        );
+    }
+
+    /// Phase 2 prices a call at the prices in force (`gas_prices`), not the section's: once the
+    /// controller has moved the gas price, the floor moves with it.
+    #[test]
+    fn a_calls_floor_is_at_the_current_prices() {
+        let (mut l, id) = ledger_with_program(|l| l.set_gas(Some(dynamic_gas())));
+        l.set_gas_prices(gas::GasPrices { gas_price: 300, byte_price: 900 });
+        let proof = StubExecutor::make_proof_with_gas(&id, 12, [7; 8], 3_000);
+        let floor = gas::BUNDLE_BASE + 300 * 3_000 + 900;
+        assert_eq!(l.validate(&call_tx(&l, 20, id, proof.clone(), floor - 1), &StubExecutor), Err(TxError::FeeTooLow { min: floor, fee: floor - 1 }));
+        assert!(l.validate(&call_tx(&l, 30, id, proof, floor), &StubExecutor).is_ok());
+    }
+
+    /// Review focus 4 (spec §4.3): every bundle proof declares exactly `bundle_gas_limit`, checked
+    /// before the STARK verify and on the verified-set (B5) path too.
+    #[test]
+    fn a_bundle_declaring_any_other_gas_limit_is_refused() {
+        let (a, _) = keys();
+        let (l, _) = gas_ledger();
+        let ok = tx(&l, [[50; 8], [51; 8]], [[52; 8], [53; 8]]);
+        assert!(l.validate(&ok, &StubExecutor).is_ok());
+        for other in [16_382u64, 16_384, 1] {
+            let mut t = ok.clone();
+            StubExecutor::with_bundle_gas(&mut t.bundle.as_mut().unwrap().proof, other);
+            let t = StubExecutor::bound(t);
+            assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::BundleGasLimit { want: 16_383, got: Some(other) }), "{other}");
+            // A wrong limit buys no verify.
+            let exec = CountingExecutor::default();
+            assert_eq!(l.validate(&t, &exec), Err(TxError::BundleGasLimit { want: 16_383, got: Some(other) }));
+            assert_eq!(exec.bundles(), 0, "refused before the verify");
+            // And the verified-set hit, which skips the verify, still checks the limit.
+            let mut applied = l.clone();
+            assert_eq!(
+                applied.apply_tx_with(&t, &a.address(), &StubExecutor, &Admitted::of(&[&t])),
+                Err(TxError::BundleGasLimit { want: 16_383, got: Some(other) })
+            );
+        }
+        // An executor whose proofs carry no limit declares none, and is refused under the section.
+        struct NoGas;
+        impl ConfidentialExecutor for NoGas {
+            fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
+                StubExecutor.check_program(base_pc, words)
+            }
+            fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+                StubExecutor.verify_call(program, proof)
+            }
+            fn public_digest(&self, words: &[u32]) -> Word8 {
+                StubExecutor.public_digest(words)
+            }
+            fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
+                StubExecutor.node_hash(left, right)
+            }
+            fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
+                StubExecutor.note_commitment(pk, from, amount, asset, time, r)
+            }
+            fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+                StubExecutor.bundle_digest(input)
+            }
+            fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+                StubExecutor.bundle_proof_digest(proof)
+            }
+            fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
+                StubExecutor.verify_bundle(hc_bundle, proof, binding)
+            }
+            fn aggregate_program_digest(&self, shape: &crate::types::DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
+                StubExecutor.aggregate_program_digest(shape)
+            }
+            fn verify_aggregate(
+                &self,
+                shape: &crate::types::DeclaredShape,
+                covered: &[crate::types::CoveredBundle],
+                proof: &[u8],
+                binding: &[u32; 8],
+            ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+                StubExecutor.verify_aggregate(shape, covered, proof, binding)
+            }
+        }
+        assert_eq!(l.validate(&ok, &NoGas), Err(TxError::BundleGasLimit { want: 16_383, got: None }));
+        // Without the section any limit is accepted (chains 16/17).
+        let (plain, _) = ledger_with_program(|_| {});
+        let mut t = tx(&plain, [[60; 8], [61; 8]], [[62; 8], [63; 8]]);
+        StubExecutor::with_bundle_gas(&mut t.bundle.as_mut().unwrap().proof, 1);
+        assert!(plain.validate(&StubExecutor::bound(t), &StubExecutor).is_ok());
+        assert!(plain.validate(&tx(&plain, [[70; 8], [71; 8]], [[72; 8], [73; 8]]), &NoGas).is_ok());
+    }
+
+    /// Spec §7.1: a block's `gas_used` is Σ its calls' declared limits plus `bundle_gas_limit` per
+    /// bundle proof. One call at limit 40 000 riding its bundle is 40 000 + 16 383 — over the
+    /// 20 000 target, so the gas price rises.
+    #[test]
+    fn a_blocks_gas_used_is_its_calls_limits_and_its_bundles() {
+        let (a0, _) = keys();
+        let (l, id) = ledger_with_program(|l| l.set_gas(Some(dynamic_gas())));
+        let proof = StubExecutor::make_proof_with_gas(&id, 12, [7; 8], 40_000);
+        let fee = gas::circuit_call_floor(100, 800, 40_000, proof.len());
+        let tx = call_tx(&l, 20, id, proof, fee);
+        let mut expect = l.clone();
+        expect.set_height(2);
+        expect.apply_tx(&tx, &a0.address(), &StubExecutor).unwrap();
+        expect.close_block(2, &a0.address(), tx.encoded_len() as u64, 40_000 + 16_383);
+        let block = signed_block(vec![tx], &a0, 2, expect.state_root());
+        let mut replica = l.clone();
+        replica.apply_block(&block, &StubExecutor).unwrap();
+        assert_eq!(replica.gas_prices(), expect.gas_prices());
+        assert!(replica.gas_prices().gas_price > 100, "56 383 gas against a 20 000 target raised the price");
     }
 }

@@ -1912,6 +1912,9 @@ mod admission_tests {
             fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
                 StubExecutor.verify_auth(hc_auth, proof, binding)
             }
+            fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+                StubExecutor.bundle_gas_limit(proof)
+            }
             fn verify_bundle(&self, hc: &Word8, proof: &[u8], binding: &[u32; crate::types::TX_BINDING_WORDS]) -> Result<(), ConfidentialError> {
                 StubExecutor.verify_bundle(hc, proof, binding)
             }
