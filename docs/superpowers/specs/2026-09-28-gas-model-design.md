@@ -336,7 +336,7 @@ tracks fullness. That is **Phase 2**, cut with chain 18 beside Phase 1 (the user
 Genesis `gas.dynamic` (optional inside the `gas` section; absent = the fixed prices of §3.3):
 
 ```json
-"gas": { "gas_price": "100", "byte_price": "800", "bundle_gas_limit": 16383, "metering": "circuit",
+"gas": { "gas_price": "100", "byte_price": "800", "bundle_gas_limit": 20479, "metering": "circuit",
          "dynamic": { "target_block_bytes": 2097152, "target_block_gas": 262144,
                       "adjust_bps": 1250, "min_gas_price": "100", "min_byte_price": "800" } }
 ```
