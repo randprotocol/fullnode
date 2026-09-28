@@ -271,6 +271,9 @@ async fn bridge_mint(
     let state = n.rpc.bridge_state().await.unwrap();
     let assets = n.rpc.assets().await.unwrap();
     let index = wallet::deposit_index(&state, &assets, &asset_id).expect("the coin is a listed backing");
+    // The slot before the head is read (`time` is held to the bundle window): the cluster suite's
+    // twin of this function outran its window waiting behind other proofs (v0.6.1 suite).
+    let slot = proving_slot().await;
     let time = u32::try_from(n.rpc.head().await.unwrap()["height"].as_u64().unwrap()).unwrap();
     // The blinding is derived from the attestation digest (F1), inside `deposit_note_for`.
     let (note, mut envelope) =
@@ -288,7 +291,6 @@ async fn bridge_mint(
     wallet::check_pq_cosignatures(&state, CHAIN_ID, &attestation, &pq_signatures).expect("the quorum is well formed");
     let action = Action::BridgeAttest { attestation, recipient: to.clone(), r: note.r, time, asset: index, envelope, pq_signatures };
     let fee = gas::fee_floor(&action);
-    let slot = proving_slot().await;
     let s = wallet::submit_bridge_action(&n.rpc, relayer, store, action, fee, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the attestation's fee bundle commits");

@@ -1349,6 +1349,10 @@ async fn bridge_mint(
     let state = node.rpc.bridge_state().await.expect("bridge state");
     let assets = node.rpc.assets().await.expect("the registry");
     let index = wallet::deposit_index(&state, &assets, &asset_id).expect("the token is listed on this chain");
+    // The slot before the head is read: `time` is the deposit note's, held to the bundle window,
+    // and a wait behind other tests' proofs (~230 s each at constraint set 7 on a shared box)
+    // outran it — "time 2 is outside [58, 314]" (v0.6.1 suite).
+    let slot = proving_slot().await;
     let time = u32::try_from(node.rpc.head().await.expect("head")["height"].as_u64().expect("height")).unwrap();
     // The blinding is the attestation digest's (F1), derived inside `deposit_note_for`, so the
     // note this wallet seals against is the one the ledger will append whoever submits it.
@@ -1373,7 +1377,6 @@ async fn bridge_mint(
         pq_signatures,
     };
     let fee = gas::fee_floor(&action);
-    let slot = proving_slot().await;
     let s = wallet::submit(&node.rpc, relayer, store, None, action, fee, Burn::None, FriProfile::Test, Backend::Cpu, CHAIN_ID, true)
         .await
         .expect("the attestation's fee bundle commits");
