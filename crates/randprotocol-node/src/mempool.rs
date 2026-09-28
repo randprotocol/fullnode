@@ -558,7 +558,18 @@ impl Mempool {
         // `fee() == 0` by design — it must work from a wallet holding no RAND at all — so fee
         // order sorted the emergency brake behind every transaction that pays, which is the
         // wrong end of a block while a compromised guardian set is minting.
-        let surplus_per_kib = |p: &Pooled| (p.tx.fee().saturating_sub(p.floor) as u128 * 1024) / p.len.max(1) as u128;
+        //
+        // The surplus-per-KiB key applies only under a gas policy: a node without one orders
+        // exactly as before the gas work (governance, total fee, hash), so switching the policy
+        // off is a true no-op.
+        let priced = self.gas_policy.is_some();
+        let surplus_per_kib = |p: &Pooled| {
+            if priced {
+                (p.tx.fee().saturating_sub(p.floor) as u128 * 1024) / p.len.max(1) as u128
+            } else {
+                0
+            }
+        };
         ready.sort_by(|a, b| {
             is_governance(&b.1.tx.action)
                 .cmp(&is_governance(&a.1.tx.action))
@@ -2453,6 +2464,39 @@ mod tests {
         assert_eq!(r.unwrap_err(), TxError::ProofTooLarge);
     }
 
+    /// Review focus 3 (final review I1): no policy is no change. Without a gas policy the pool
+    /// orders as it did before the gas work — governance, then total fee, then hash — and only a
+    /// node running a policy orders by surplus per KiB. The same two transactions: a call paying
+    /// one more than a transfer in total, but less above its floor per KiB.
+    #[test]
+    fn zero_prices_mean_no_policy() {
+        use randprotocol_core::gas::{self, GasPolicy};
+        assert!(GasPolicy::from_prices(0, 0).is_none(), "zero prices name no policy");
+        let stub_len = StubExecutor::make_proof_with_public(&Hash::ZERO, 12, [0; 8], &[]).len();
+        let call_fee = GasPolicy::DEFAULT.call_floor(12, 0, 0, stub_len) + 3_000;
+        let (ledger, _, call) = program_and_call(12, call_fee, 50);
+        let transfer = fixtures::bundle_tx(&ledger, [[80; 8], [81; 8]], [[82; 8], [83; 8]], call_fee - 1);
+        assert!(call.fee() > transfer.fee(), "the call pays more in total");
+        assert!(call.encoded_len() > transfer.encoded_len(), "and is the bigger transaction");
+
+        let mut plain = Mempool::new(64);
+        let call_hash = plain.insert(call.clone(), &ledger, &StubExecutor).unwrap();
+        let transfer_hash = plain.insert(transfer.clone(), &ledger, &StubExecutor).unwrap();
+        // Under the schedule's floors the transfer's surplus per KiB is the larger one too, so
+        // only the pre-gas key — total fee — puts the call first.
+        let per_kib = |t: &Transaction| (t.fee() - gas::fee_floor(&t.action)) as u128 * 1024 / t.encoded_len() as u128;
+        assert!(per_kib(&transfer) > per_kib(&call));
+        let picked: Vec<Hash> = plain.candidates(&ledger, 10).iter().map(|t| t.hash()).collect();
+        assert_eq!(picked, vec![call_hash, transfer_hash], "no policy: total fee first");
+
+        let mut priced = Mempool::new(64);
+        priced.set_gas_policy(GasPolicy::DEFAULT);
+        priced.insert(call, &ledger, &StubExecutor).unwrap();
+        priced.insert(transfer, &ledger, &StubExecutor).unwrap();
+        let picked: Vec<Hash> = priced.candidates(&ledger, 10).iter().map(|t| t.hash()).collect();
+        assert_eq!(picked, vec![transfer_hash, call_hash], "a policy: surplus per KiB first");
+    }
+
     /// Spec §7: candidates order by fee above the floor per KiB, governance first. A big call
     /// paying a little more in total sorts behind a small transfer paying more per KiB.
     #[test]
@@ -2471,5 +2515,37 @@ mod tests {
         assert!(call.fee() > transfer.fee(), "and pays more in total");
         let picked: Vec<Hash> = m.candidates(&ledger, 10).iter().map(|t| t.hash()).collect();
         assert_eq!(picked, vec![transfer_hash, call_hash], "more surplus per KiB first");
+    }
+
+    /// Final review I3: the key is surplus *per KiB*, not absolute surplus. Here the bigger call
+    /// carries MORE surplus above its floor than the transfer, but less per KiB, and the smaller
+    /// transfer still sorts first — an absolute-surplus key would have put the call first.
+    #[test]
+    fn candidates_order_by_surplus_per_kib_not_by_absolute_surplus() {
+        use randprotocol_core::gas::{self, GasPolicy};
+        let policy = GasPolicy::DEFAULT;
+        // Lengths do not depend on the fee (a fixed-width u64), so measure them first.
+        let (ledger, _, probe) = program_and_call(12, 0, 50);
+        let floor_c = crate::admission::call_floor(&probe, &ledger, &StubExecutor, &policy).unwrap();
+        let floor_t = gas::fee_floor(&Action::None);
+        let len_t = fixtures::bundle_tx(&ledger, [[80; 8], [81; 8]], [[82; 8], [83; 8]], 0).encoded_len();
+        let len_c = probe.encoded_len();
+        assert!(len_c > len_t, "the call is the bigger transaction ({len_c} vs {len_t} B)");
+        // The transfer's surplus, and a call surplus above it but below it scaled by the size
+        // ratio: halfway into that gap.
+        let s_t: u64 = 10_000_000;
+        let s_c = s_t + (s_t as u128 * (len_c - len_t) as u128 / len_t as u128 / 2) as u64;
+        let (ledger, _, call) = program_and_call(12, floor_c + s_c, 50);
+        let transfer = fixtures::bundle_tx(&ledger, [[80; 8], [81; 8]], [[82; 8], [83; 8]], floor_t + s_t);
+        assert_eq!((call.encoded_len(), transfer.encoded_len()), (len_c, len_t));
+        let per_kib = |s: u64, len: usize| s as u128 * 1024 / len as u128;
+        assert!(s_c > s_t, "the call has more absolute surplus ({s_c} vs {s_t})");
+        assert!(per_kib(s_c, len_c) < per_kib(s_t, len_t), "but less per KiB");
+        let mut m = Mempool::new(64);
+        m.set_gas_policy(policy);
+        let call_hash = m.insert(call, &ledger, &StubExecutor).unwrap();
+        let transfer_hash = m.insert(transfer, &ledger, &StubExecutor).unwrap();
+        let picked: Vec<Hash> = m.candidates(&ledger, 10).iter().map(|t| t.hash()).collect();
+        assert_eq!(picked, vec![transfer_hash, call_hash], "more surplus per KiB first, not more surplus");
     }
 }
