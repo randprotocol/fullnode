@@ -2527,3 +2527,308 @@ async fn a_chain_15_shaped_genesis_commits_mints_only_to_the_allowlist_and_syncs
     assert_eq!(s["guardian_set_index"].as_u64(), Some(1), "{s}");
     assert_eq!(s["burn_sequence"].as_u64(), Some(7), "{s}");
 }
+
+// ---------------------------------------------------------------- chain 18: the gas section
+//
+// The capstone of the gas model's Phase 1 + Phase 2 (spec 2026-09-28 §10, §11): a three-node
+// cluster on a genesis shaped exactly as `deploy/cut-chain18-genesis.sh` cuts it — `hardening_v6`,
+// the branch-free bundle guest, and the `gas` section with the dynamic controller at the cut's
+// numbers — carrying real proofs end to end.
+
+/// The cut script's `gas` section: `--gas-price 100 --byte-price 800 --bundle-gas-limit 20479
+/// --gas-dynamic 2097152,262144,1250`, the floors at the starting prices.
+fn chain18_gas() -> gas::GasConfig {
+    gas::GasConfig {
+        gas_price: 100,
+        byte_price: 800,
+        bundle_gas_limit: gas::gas_max(14, 0, 0),
+        metering: gas::GasMetering::Circuit,
+        dynamic: Some(gas::DynamicGas {
+            target_block_bytes: 2 << 20,
+            target_block_gas: 1 << 18,
+            adjust_bps: 1250,
+            min_gas_price: 100,
+            min_byte_price: 800,
+        }),
+    }
+}
+
+/// [`genesis_funding`] reshaped as chain 18: `hardening_v6`, bundle guest v2, and `gas`. No
+/// `aggregation` section.
+fn genesis_chain18(validators: &[Keypair], funded: &[&Wallet], gas: Option<gas::GasConfig>) -> Genesis {
+    let mut gen = genesis_funding(validators, funded);
+    gen.hardening_v6 = Some(true);
+    gen.hc_bundle = word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2());
+    gen.gas = gas;
+    gen
+}
+
+/// The committed transaction `hash`, read back from `node`'s store.
+fn committed_tx(node: &TestNode, hash: &Hash) -> Transaction {
+    let (height, index) = node.handle.storage.tx_location(hash).unwrap().expect("the transaction is committed");
+    node.handle.storage.block_by_height(height).unwrap().unwrap().transactions[index as usize].clone()
+}
+
+/// A proof's declared `GAS_LIMIT` (`pv::GAS`), off its canonical decode.
+fn declared_gas_of(proof: &[u8]) -> u64 {
+    let header = randprotocol_zkvm::executor::decode_canonical(proof).expect("the proof decodes");
+    header.public_values[randprotocol_zkvm::tables::cpu::pv::GAS]
+}
+
+/// Spec §7.1's controller, replayed from genesis by this test alone: every committed block's
+/// `(bytes_used, gas_used)` recomputed from its transactions — Σ encoded length; each bundle's
+/// declared limit (read off its proof, not assumed) plus each call's — and folded through
+/// [`gas::next_price`]. Returns the prices in force *after* each height, index = height.
+fn replay_prices(node: &TestNode, cfg: &gas::GasConfig, head: u64) -> Vec<(u64, u64, u64, u64)> {
+    let d = cfg.dynamic.as_ref().unwrap();
+    let (mut gp, mut bp) = (cfg.gas_price, cfg.byte_price);
+    let mut out = vec![(gp, bp, 0, 0)];
+    for h in 1..=head {
+        let b = node.handle.storage.block_by_height(h).unwrap().expect("a committed block below the head");
+        let bytes: u64 = b.transactions.iter().map(|t| t.encoded_len() as u64).sum();
+        let used: u64 = b
+            .transactions
+            .iter()
+            .map(|t| {
+                let bundle = t.bundle.as_ref().map_or(0, |b| declared_gas_of(&b.proof));
+                let call = match &t.action {
+                    Action::Call { proof, .. } => declared_gas_of(proof),
+                    _ => 0,
+                };
+                bundle + call
+            })
+            .sum();
+        gp = gas::next_price(gp, d.min_gas_price, used, d.target_block_gas, d.adjust_bps);
+        bp = gas::next_price(bp, d.min_byte_price, bytes, d.target_block_bytes, d.adjust_bps);
+        out.push((gp, bp, bytes, used));
+    }
+    out
+}
+
+/// A call under the chain-18 rules: proved over its transaction's call binding
+/// (`hardening_v6`), declaring `declare` (`None` = the header's ceiling), paying `fee`.
+#[allow(clippy::too_many_arguments)]
+async fn chain18_call(
+    node: &TestNode,
+    a: &Wallet,
+    store: &mut NoteStore,
+    program: &randprotocol_zkvm::isa::Program,
+    id: Hash,
+    inputs: &[u32],
+    tier: u8,
+    declare: Option<u64>,
+    fee: u64,
+    limits: &randprotocol_client::ChainLimits,
+) -> wallet::Submission {
+    let prove = |binding: &[u32; randprotocol_core::types::TX_BINDING_WORDS]| -> anyhow::Result<Vec<u8>> {
+        let salt = randprotocol_zkvm::executor::fresh_call_salt();
+        let (proof, outputs, t) = randprotocol_zkvm::executor::prove_call_hardened(
+            FriProfile::Test,
+            program,
+            inputs,
+            &[],
+            binding,
+            salt,
+            Some(tier),
+            declare,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        eprintln!("call proof: tier {t}, {} bytes, outputs {outputs:?}", proof.len());
+        Ok(proof)
+    };
+    let action = Action::Call { program: id, proof: Vec::new(), input_envelope: None };
+    let slot = proving_slot().await;
+    let s = wallet::submit_bound_call(&node.rpc, a, store, action, fee, &prove, Some(limits), FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
+        .await
+        .expect("the bound call commits");
+    drop(slot);
+    s
+}
+
+/// Spec 2026-09-28 §10–§11, the chain-18 capstone. On the cut's genesis:
+///
+/// 1. a plain transfer commits, its bundle proof declaring exactly `bundle_gas_limit`;
+/// 2. a deployed program is called at the wallet's default (tight) limit and pays the floor of
+///    *that* limit, which `rand_estimateFee` reproduces;
+/// 3. called again at `max`, it declares and pays the header's ceiling;
+/// 4. a transfer whose (real, verifying) bundle proof declares one gas under the pin is refused
+///    `BundleGasLimit`, permanently (`rejected`);
+/// 5. the dynamic prices the node publishes are exactly the controller replayed over every
+///    committed block by this test, and never under the floors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_chain18_genesis_prices_calls_by_their_declared_limit() {
+    use randprotocol_zkvm::executor;
+    init_tracing();
+    let started = Instant::now();
+    let ks = keys(3);
+    let (a, b) = (wallet(18), wallet(19));
+    let cfg = chain18_gas();
+    let pin = cfg.bundle_gas_limit;
+    let gen = genesis_chain18(&ks, &[&a], Some(cfg.clone()));
+    let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
+    let boot = vec![bootstrap_addr(&n0)];
+    let n1 = start_node_at(&ks[1], &gen, boot.clone(), true, PROVING).await;
+    let n2 = start_node_at(&ks[2], &gen, boot.clone(), true, PROVING).await;
+    let nodes = [&n0, &n1, &n2];
+    wait_height(&nodes, 2, Duration::from_secs(90)).await;
+
+    let limits = n0.rpc.limits().await.unwrap().expect("the node serves rand_getLimits");
+    assert!(limits.hardening_v6, "{limits:?}");
+    assert!(limits.gas_circuit, "the section meters in-circuit: {limits:?}");
+    assert_eq!(limits.bundle_gas_limit, Some(pin), "rand_getLimits.bundle_gas_limit is the genesis pin");
+    assert_eq!(pin, 20_479);
+    assert_eq!(limits.adjust_bps, Some(1250));
+    assert_eq!((limits.gas_price, limits.byte_price), (Some(100), Some(800)));
+    let status = n0.rpc.status().await.unwrap();
+    assert_eq!(status["hc_bundle"], word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2()), "bundle guest v2");
+    assert_eq!(status["gas_prices"]["gas_price"], "100", "{status}");
+    assert_eq!(status["gas_prices"]["byte_price"], "800", "{status}");
+
+    // ---- 1. a plain transfer; its bundle declares exactly the pin ----
+    let mut store = NoteStore::default();
+    let pay = UNITS_PER_RAND;
+    let slot = proving_slot().await;
+    let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, pay, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
+        .await
+        .expect("the transfer commits");
+    drop(slot);
+    let tx = committed_tx(&n0, &sent.hash);
+    let bundle_limit = declared_gas_of(&tx.bundle.as_ref().unwrap().proof);
+    eprintln!("1. transfer {} committed: tier {}, proved in {:.1?}, bundle GAS_LIMIT {bundle_limit}", sent.hash, sent.tier, sent.proving);
+    assert_eq!(bundle_limit, pin, "an honest bundle declares exactly bundle_gas_limit");
+    for n in nodes {
+        wait_for("the transfer reaches every node", Duration::from_secs(60), || n.handle.storage.tx_location(&sent.hash).unwrap().is_some()).await;
+    }
+    assert_eq!(balance(&n1, &b).await, pay, "B was paid");
+
+    // ---- 2. deploy, then call at the wallet's default (tight) limit ----
+    let program = randprotocol_zkvm::guests::private_payment(1_000);
+    let inputs = [400u32, 250, 300, 75];
+    let id = randprotocol_core::program::program_id_with_public(program.base_pc, &program.words, &[]);
+    let action = Action::Deploy { base_pc: program.base_pc, words: program.words.clone(), public: vec![] };
+    let deploy_fee = wallet::deploy_fee_default(&action);
+    let slot = proving_slot().await;
+    let deployed = wallet::submit(&n0.rpc, &a, &mut store, None, action, deploy_fee, Burn::None, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
+        .await
+        .expect("the deploy commits");
+    drop(slot);
+    eprintln!("2. deploy {} committed, fee {deploy_fee}", deployed.hash);
+    for n in nodes {
+        wait_for("the program reaches every node", Duration::from_secs(60), || n.handle.storage.program(&id).unwrap().is_some()).await;
+    }
+
+    // What `rand call` does before proving under `hardening_v6`: the dry run over the program's
+    // public input (none) followed by the binding's width of zeros.
+    let segment = vec![0u32; randprotocol_core::types::TX_BINDING_WORDS];
+    let run = executor::dry_run_call(&program, &inputs, &segment).expect("the call runs");
+    let tier = run.tier;
+    let ceiling = gas::gas_max(tier, 0, 0);
+    let tight = wallet::default_gas_limit(run.gas, tier);
+    eprintln!("2. call dry run: exact gas {}, tier {tier}, declaring {tight} (ceiling {ceiling})", run.gas);
+    assert!(run.gas <= tight && tight < ceiling, "the default bucket sits between the exact gas and the ceiling");
+    let limits = n0.rpc.limits().await.unwrap().unwrap();
+    let quote = wallet::hardened_call_quote_bytes(Some(&limits), 0);
+    let tight_fee = wallet::call_fee_default(Some(&limits), tier, 0, 0, tight, quote);
+    let called = chain18_call(&n0, &a, &mut store, &program, id, &inputs, tier, Some(tight), tight_fee, &limits).await;
+    let call_tx = committed_tx(&n0, &called.hash);
+    let Action::Call { proof: call_proof, .. } = &call_tx.action else { panic!("not a call") };
+    let call_bytes = gas::call_bytes(call_proof, None);
+    let (call_height, _) = n0.handle.storage.tx_location(&called.hash).unwrap().unwrap();
+    eprintln!("2. tight call {} committed at {call_height}: fee {tight_fee}, {call_bytes} call bytes, proved in {:.1?}", called.hash, called.proving);
+    assert_eq!(declared_gas_of(call_proof), tight, "the committed call declares the tight limit");
+    assert_eq!(call_tx.fee(), tight_fee);
+    for n in nodes {
+        wait_for("the receipt reaches every node", Duration::from_secs(60), || n.handle.storage.receipt(&called.hash).unwrap().is_some()).await;
+        let r = n.handle.storage.receipt(&called.hash).unwrap().unwrap();
+        assert_eq!((r.program, r.tier), (id, tier));
+    }
+    // The floor the node held this call to: the declared limit's, at the prices in force at the
+    // start of its block (the replay below confirms those are the ones the node published).
+    let head = n0.height();
+    let prices = replay_prices(&n0, &cfg, head.max(call_height));
+    let (gp, bp, _, _) = prices[call_height as usize - 1];
+    let floor = gas::circuit_call_floor(gp, bp, tight, call_bytes);
+    assert!(tight_fee >= floor, "the default fee {tight_fee} pays the floor {floor}");
+    let estimate = |gas_limit: u64| {
+        let rpc = n0.rpc.clone();
+        async move {
+            let v = rpc.call("rand_estimateFee", json!([{"kind": "call", "tier": tier, "bytes": call_bytes, "gas": gas_limit}])).await.unwrap();
+            units(&v)
+        }
+    };
+    let (tgp, tbp) = {
+        let s = n0.rpc.status().await.unwrap();
+        (units(&s["gas_prices"]["gas_price"]), units(&s["gas_prices"]["byte_price"]))
+    };
+    let est_tight = estimate(tight).await;
+    assert_eq!(est_tight, gas::circuit_call_floor(tgp, tbp, tight, call_bytes), "rand_estimateFee prices the declared limit at the tip");
+    if (tgp, tbp) == (gp, bp) {
+        assert_eq!(est_tight, floor, "rand_estimateFee reproduces the floor the node demanded");
+    }
+    assert_eq!(est_tight, wallet::call_floor(Some(&n0.rpc.limits().await.unwrap().unwrap()), tier, 0, 0, tight, call_bytes));
+    let est_max = estimate(ceiling).await;
+    assert!(est_tight < est_max, "a tight limit pays less than the ceiling: {est_tight} vs {est_max}");
+    eprintln!("2. floor {floor}, estimate(tight) {est_tight}, estimate(ceiling) {est_max}");
+
+    // ---- 3. the same call at `max` (`None` → the header's ceiling) ----
+    let limits = n0.rpc.limits().await.unwrap().unwrap();
+    let max_fee = wallet::call_fee_default(Some(&limits), tier, 0, 0, ceiling, quote);
+    let called_max = chain18_call(&n0, &a, &mut store, &program, id, &inputs, tier, None, max_fee, &limits).await;
+    let max_tx = committed_tx(&n0, &called_max.hash);
+    let Action::Call { proof: max_proof, .. } = &max_tx.action else { panic!("not a call") };
+    eprintln!("3. max call {} committed: fee {max_fee}, declared {}", called_max.hash, declared_gas_of(max_proof));
+    assert_eq!(declared_gas_of(max_proof), ceiling, "`max` declares gas_max of the header");
+    assert!(max_fee > tight_fee, "the ceiling costs more than the tight bucket");
+
+    // ---- 4. a real bundle proof declaring one gas under the pin ----
+    let forged_limit = pin - 1;
+    let slot = proving_slot().await;
+    let forged = wallet::build_transfer_declaring_bundle_gas(
+        &n0.rpc,
+        &a,
+        &mut store,
+        &b.address,
+        pay,
+        gas::BUNDLE_BASE,
+        FriProfile::Test,
+        CHAIN_ID,
+        forged_limit,
+    )
+    .await
+    .expect("a bundle declaring a limit inside [its gas, the ceiling] proves");
+    drop(slot);
+    assert_eq!(declared_gas_of(&forged.bundle.as_ref().unwrap().proof), forged_limit);
+    let forged_hash = forged.hash();
+    let refused = n0.rpc.send_transaction(&forged).await;
+    eprintln!("4. forged bundle ({forged_limit}) {forged_hash}: {refused:?}");
+    let err = refused.expect_err("a bundle declaring anything but the pin is refused").to_string();
+    assert!(err.contains("gas limit") && err.contains(&pin.to_string()), "refused as BundleGasLimit: {err}");
+    let st = n0.rpc.call("rand_getTransactionStatus", json!([[forged_hash.to_hex()]])).await.unwrap();
+    assert_eq!(st[0]["status"], "rejected", "BundleGasLimit is permanent: {st}");
+    // And no other node let it in either (it never gossiped).
+    let h = n0.height();
+    wait_height(&nodes, h + 3, Duration::from_secs(60)).await;
+    for n in nodes {
+        assert!(n.handle.storage.tx_location(&forged_hash).unwrap().is_none(), "the forged bundle committed");
+    }
+
+    // ---- 5. Phase 2: the published prices are the controller replayed over every block ----
+    let (head, published) = {
+        let s = n0.rpc.status().await.unwrap();
+        (s["height"].as_u64().unwrap(), (units(&s["gas_prices"]["gas_price"]), units(&s["gas_prices"]["byte_price"])))
+    };
+    let prices = replay_prices(&n0, &cfg, head);
+    let (rgp, rbp, _, _) = prices[head as usize];
+    assert_eq!((rgp, rbp), published, "the node's prices at {head} are the controller replayed from genesis");
+    let busy: Vec<(u64, u64, u64)> = prices.iter().enumerate().filter(|(_, p)| p.3 > 0).map(|(h, p)| (h as u64, p.2, p.3)).collect();
+    eprintln!("5. head {head}: prices {published:?}; blocks with gas (height, bytes_used, gas_used): {busy:?}");
+    assert!(busy.len() >= 4, "the transfer, the deploy and both calls each fed the controller: {busy:?}");
+    for (h, (g, b, _, _)) in prices.iter().enumerate() {
+        assert!(*g >= 100 && *b >= 800, "height {h}: prices ({g}, {b}) under the floors");
+    }
+    let limits = n0.rpc.limits().await.unwrap().unwrap();
+    assert_eq!((limits.gas_price, limits.byte_price), (Some(published.0), Some(published.1)), "rand_getLimits serves the tip's prices");
+
+    assert_chains_equal(&nodes);
+    eprintln!("a_chain18_genesis_prices_calls_by_their_declared_limit in {:.1?}", started.elapsed());
+}
