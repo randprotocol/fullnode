@@ -2,3 +2,5 @@
 //! wallet seals to a prover, the prover's key and pairings, and — behind `service` — the queue and
 //! the `prover_*` listener. The wire half builds for wasm; the service half does not need to.
 pub mod wire;
+pub mod key;
+pub mod pairing;
