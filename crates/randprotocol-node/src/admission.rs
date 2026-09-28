@@ -757,8 +757,9 @@ pub fn minter_not_allowed(
 
 /// Spec 2026-09-28 §4.1 (gas, Phase 0): what `tx` must pay under `policy`. A `Call` pays
 /// `GasPolicy::call_floor` of its proof header — `gas_max(tier, keccak, sha256)` and its bytes —
-/// read by `decode_call` (no verification; the size cap first, so an oversized blob buys no
-/// decode). Every other action's floor is the schedule's `fee_floor`. Admission policy above
+/// read by `decode_call` (`decode_call_hardened` under genesis `hardening_v6`, as the ledger
+/// reads it; no verification; the size cap first, so an oversized blob buys no decode).
+/// Every other action's floor is the schedule's `fee_floor`. Admission policy above
 /// the ledger's `call_fee` validity rule, the LEDGER-1 pattern: the pool and the proposer
 /// demand it, a block never does.
 pub fn call_floor(
@@ -776,7 +777,15 @@ pub fn call_floor(
         return Err(TxError::ProofTooLarge);
     }
     let record = ledger.program(program).ok_or(TxError::UnknownProgram(*program))?;
-    let outcome = executor.decode_call(record, proof).map_err(TxError::InvalidProof)?;
+    // Read the header as the ledger's step 10 does: under genesis `hardening_v6` a program
+    // without a public input is proved over the call binding (INT-4), which the plain decoder
+    // would refuse as `PublicValues`.
+    let outcome = if ledger.hardening_v6() {
+        executor.decode_call_hardened(record, proof, &tx.call_binding())
+    } else {
+        executor.decode_call(record, proof)
+    }
+    .map_err(TxError::InvalidProof)?;
     Ok(policy.call_floor(outcome.tier, outcome.keccak_log_height, outcome.sha256_log_height, gas::call_bytes(proof, input_envelope.as_ref())))
 }
 
