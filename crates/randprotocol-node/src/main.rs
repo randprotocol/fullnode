@@ -1657,6 +1657,53 @@ mod tests {
         assert!(gen.validators.iter().all(|v| minters.contains(&v.public_key.address())));
     }
 
+    /// Chain 16, cut by `deploy/cut-chain16-genesis.sh` with the v0.6.1 release binary: every
+    /// genesis-gated field chain 15 lacks is present and builds — `staking.faucet_minters`, C15-1's
+    /// `bridge.min_inbound_sequence`, `hardening_v6` and the v2 bundle guest — beside chain 15's
+    /// custody, carried at genesis. **Ignored until the real file is committed**: at the cut, commit
+    /// `deploy/genesis-chain16.json`, set `CHAIN_16_HASH` to what `rand-node init` printed on it,
+    /// and drop the `#[ignore]`. Until then `CHAIN16_GENESIS=<a dry-run cut> cargo test … --ignored`
+    /// checks the structure of any cut (the hash assertion is then skipped).
+    #[test]
+    #[ignore = "deploy/genesis-chain16.json is cut at launch — pin CHAIN_16_HASH then"]
+    fn chain_16s_genesis_file_builds_chain_16() {
+        const CHAIN_16_HASH: &str = "";
+        let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain16.json");
+        let path = std::env::var("CHAIN16_GENESIS").unwrap_or_else(|_| committed.to_string());
+        let gen = Genesis::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(gen.chain_id, 16);
+        assert_eq!(gen.consensus_domain, Some(1));
+        assert_eq!(gen.hardening_v6, Some(true), "the v0.6 rules are validity rules on chain 16");
+        assert!(gen.aggregation.is_none() && gen.vesting.is_none() && gen.envelope_bytes.is_none());
+        assert_eq!(gen.validators.len(), 26, "chain 15's eighteen genesis validators and the eight it bonded");
+        assert!(gen.validators.iter().all(|v| v.stake == u128::from(1000 * UNITS_PER_RAND)));
+        let chain15 = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain15.json");
+        let g15 = Genesis::from_json(&std::fs::read_to_string(chain15).unwrap()).unwrap();
+        assert!(g15.validators.iter().all(|v| gen.validators.iter().any(|w| w.public_key == v.public_key)));
+        assert_ne!(gen.hc_bundle, g15.hc_bundle, "chain 16 pins the v2 guest, not chain 15's v1");
+        let staking = gen.staking.as_ref().expect("a staking section");
+        let minters = staking.faucet_minters.as_ref().expect("LEDGER-1's minter list");
+        assert!(!minters.is_empty());
+        assert_eq!(staking.faucet_recipients, g15.staking.as_ref().unwrap().faucet_recipients);
+        let bridge = gen.bridge.as_ref().expect("chain 16 is bridged");
+        let floor = bridge.min_inbound_sequence.as_ref().expect("C15-1's replay floor");
+        assert!(!floor.is_empty() && floor.values().all(|&f| f > 0));
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        if std::env::var("CHAIN16_GENESIS").is_err() {
+            assert_eq!(state.hash().to_hex(), CHAIN_16_HASH);
+        }
+        assert!(state.ledger.hardening_v6());
+        assert_eq!(state.ledger.bridge().unwrap().replay_floor(), Some(floor));
+        let pool = randprotocol_node::admission::faucet_minters(&state);
+        assert_eq!(pool.len(), minters.len(), "the pool admits the listed minters, not every genesis validator");
+        // Σ carried zUSD == Σ locked: the custody chain 15 leaves behind, as notes at genesis.
+        let locked: u64 = gen.tokens.as_ref().unwrap().tokens[0].backings.iter().map(|b| b.locked.unwrap_or(0)).sum();
+        let notes: u64 = gen.alloc.iter().filter(|n| n.opening.as_ref().is_some_and(|o| o.asset == 1)).map(|n| n.amount).sum();
+        assert!(locked > 0);
+        assert_eq!(notes, locked);
+    }
+
     /// Chain 15's genesis custody, end to end on the real chain-14 file: chain 14's zUSD listed
     /// at genesis (same name, symbol and salt, so the same asset id), 9 USDT locked on Tron and 1
     /// on Solana, and one ten-zUSD note written by `rand-node alloc-note --asset 1` — which the
