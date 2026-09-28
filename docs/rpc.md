@@ -354,8 +354,9 @@ by the payee, the sender's own history, and anyone handed that output's per-tran
 There is no other value yet: `validate` accepts only `1860` once the field is present.
 
 `hardening_v6` is `true` when the genesis sets the v0.6 switch (`docs/deploy.md`, "The next cut:
-`hardening_v6`"). A wallet then proves a call against a program deployed without a public input over
-the transaction's call binding (`Transaction::call_binding`, INT-4) instead of the empty segment —
+`hardening_v6`"). A wallet then proves a call over the program's public input (empty for most)
+followed by the transaction's call binding (`Transaction::call_binding`, INT-4; issue #55 for a
+program with a public input) instead of the public input alone —
 the fee bundle's notes chosen first, the call proved second, the bundle last; a chain with the flag
 refuses the old proof, a chain without it the new one. A node that predates the field answers
 without it, which a wallet reads as `false`.

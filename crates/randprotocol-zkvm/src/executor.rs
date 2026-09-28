@@ -754,28 +754,32 @@ impl ZkExecutor {
         self.verify_pinned_bundle(Self::hidden_bundle_heights(), hc, proof, binding)
     }
 
-    /// `verify_call`, and under genesis `hardening_v6` `verify_call_hardened` (`binding` set — it
-    /// is what "hardened" means here: the binding and the program-table floor below), and its
-    /// decode-only twin (`verify` false: everything but `Machine::verify`).
+    /// `verify_call`, and under genesis `hardening_v6` `verify_call_hardened` (`segment` set — it
+    /// is what "hardened" means here: the bound segment and the program-table floor below), and
+    /// its decode-only twin (`verify` false: everything but `Machine::verify`).
     ///
-    /// INT-4: with `binding` set, a call against a program deployed without a public input must
-    /// carry the eight binding words (`Transaction::call_binding`) as its public segment — its
-    /// declared public height is theirs and `pv::PUB0..7` is their digest — where the old rule
-    /// wants the empty segment. A copy of the proof under another fee bundle then fails the digest
-    /// compare. A program deployed with a public input keeps its recorded digest either way: the
-    /// chain holds the digest, not the words, so it cannot recompute one over the words and the
-    /// binding (the residual `ConfidentialExecutor::verify_call_hardened` documents).
+    /// INT-4: with `segment` set, a call must carry it as its public segment — its declared public
+    /// height is its length's and `pv::PUB0..7` is its digest. The ledger builds it as the
+    /// program's deploy-time public words followed by the eight binding words
+    /// (`Transaction::call_binding`, `program::hardened_call_segment`), so just the binding for a
+    /// program without a public input, where the old rule wants the empty segment. A copy of the
+    /// proof under another fee bundle then fails the digest compare. Before issue #55 a program
+    /// with a public input kept its recorded digest here — the ledger held only that digest — and
+    /// its calls stayed unbound. A segment of any length but `public_len + TX_BINDING_WORDS` is
+    /// refused as `PublicValues`.
     fn check_call(
         &self,
         record: &ProgramRecord,
         proof: &[u8],
-        binding: Option<&[u32; TX_BINDING_WORDS]>,
+        segment: Option<&[u32]>,
         verify: bool,
     ) -> Result<CallOutcome, ConfidentialError> {
-        // INT-4: the segment this call proves over — the binding, for a program without a public
-        // input under the hardened rule; otherwise the deploy-time input, as ever.
-        let bound = binding.filter(|_| record.public_len == 0);
-        let segment_len = if bound.is_some() { TX_BINDING_WORDS } else { record.public_len as usize };
+        // INT-4: the segment this call proves over — `public ‖ call_binding` under the hardened
+        // rule; otherwise the deploy-time input, as ever.
+        if segment.is_some_and(|s| s.len() != record.public_len as usize + TX_BINDING_WORDS) {
+            return Err(ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues)));
+        }
+        let segment_len = segment.map_or(record.public_len as usize, |s| s.len());
         // `Machine::verify` runs `check_declared_heights` on the proof's tier and six declared
         // table heights before using any of them to size anything — but the degree-bits pre-check
         // inside `decode_and_check` shifts by them too, so it runs that same function in front of
@@ -823,7 +827,7 @@ impl ZkExecutor {
         // PROGRAM-TABLE-LEAK: under `hardening_v6` the height is the record's floored at
         // `MIN_PRIVATE_TABLE_LOG_HEIGHT` (`hardened_program_log_height`), exactly — the hardened
         // prover declares that and nothing else, so the pin stays a single value.
-        let want_program_height = match binding {
+        let want_program_height = match segment {
             Some(_) => hardened_program_log_height(record.words.len()),
             None => program::program_log_height(record.words.len()),
         };
@@ -857,7 +861,7 @@ impl ZkExecutor {
         if verify {
             self.machine.verify(&hc, &proof).map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
         }
-        let want = match bound {
+        let want = match segment {
             Some(words) => crate::hash::public_digest(words),
             None => record.public_digest.unwrap_or_else(|| crate::hash::public_digest(&[])),
         };
@@ -1061,11 +1065,11 @@ impl ConfidentialExecutor for ZkExecutor {
         self.warm_shape(program::program_log_height(record.words.len()), record.public_len as usize)
     }
 
-    /// `warm` under genesis `hardening_v6`: a program without a public input is called with the
-    /// eight call-binding words as its segment (INT-4, `check_call`), so that is the public height
+    /// `warm` under genesis `hardening_v6`: every call carries the eight call-binding words after
+    /// the program's public input (INT-4 and issue #55, `check_call`), so that is the public height
     /// its keys are built for.
     fn warm_hardened(&self, record: &ProgramRecord) {
-        let segment = if record.public_len == 0 { TX_BINDING_WORDS } else { record.public_len as usize };
+        let segment = record.public_len as usize + TX_BINDING_WORDS;
         // And the floored program table (PROGRAM-TABLE-LEAK).
         self.warm_shape(hardened_program_log_height(record.words.len()), segment)
     }
@@ -1079,9 +1083,9 @@ impl ConfidentialExecutor for ZkExecutor {
         &self,
         record: &ProgramRecord,
         proof: &[u8],
-        binding: &[u32; TX_BINDING_WORDS],
+        segment: &[u32],
     ) -> Result<CallOutcome, ConfidentialError> {
-        self.check_call(record, proof, Some(binding), true)
+        self.check_call(record, proof, Some(segment), true)
     }
 
     /// Every check of [`Self::verify_call_hardened`] but `Machine::verify` itself (B5: the
@@ -1090,9 +1094,9 @@ impl ConfidentialExecutor for ZkExecutor {
         &self,
         record: &ProgramRecord,
         proof: &[u8],
-        binding: &[u32; TX_BINDING_WORDS],
+        segment: &[u32],
     ) -> Result<CallOutcome, ConfidentialError> {
-        self.check_call(record, proof, Some(binding), false)
+        self.check_call(record, proof, Some(segment), false)
     }
 
     /// `H_PUB` exactly as the circuit publishes it in `pv::PUB0..7`.
@@ -1271,7 +1275,8 @@ pub fn prove_call(
 }
 
 /// The tier `Machine::prove` would pick for a call of `program` over `inputs` with a public
-/// segment of `public_segment_words` words — without proving. What a wallet needs *before* it
+/// segment of `public_segment_words` words — without proving. Under `hardening_v6` that is the
+/// program's public input plus [`TX_BINDING_WORDS`] (`program::hardened_call_segment`). What a wallet needs *before* it
 /// proves a call under genesis `hardening_v6` (INT-4): the call proof commits to
 /// `Transaction::call_binding`, which covers the fee bundle, and the fee follows the tier, so the
 /// tier has to be known first. The run uses a zero segment of that length (the binding is not
@@ -1296,10 +1301,11 @@ pub fn fresh_call_salt() -> [u32; 4] {
 }
 
 /// The call prover for a chain whose genesis sets `hardening_v6` (INT-4): [`prove_call`]'s proof,
-/// but for a program deployed without a public input the public segment is `binding` —
+/// but the public segment is the program's public input followed by `binding` —
 /// `Transaction::call_binding` of the transaction the call will ride in, built with both proofs
-/// empty — so the chain can refuse a copy of the proof under any other fee bundle
-/// (`ZkExecutor::verify_call_hardened`). A program with a public input proves over it, as ever.
+/// empty (`program::hardened_call_segment`) — so the chain can refuse a copy of the proof under
+/// any other fee bundle (`ZkExecutor::verify_call_hardened`). Before issue #55 a program with a
+/// public input proved over it alone, and its calls were unbound.
 ///
 /// `salt` is the `H_IN` salt, drawn by the caller: the call-input envelope is sealed against
 /// `hash::input_digest(salt, inputs)` and sits inside the binding, so the wallet seals it before
@@ -1316,7 +1322,7 @@ pub fn prove_call_hardened(
     salt: [u32; 4],
     tier: Option<u8>,
 ) -> Result<(Vec<u8>, [u32; 8], u8), String> {
-    let segment: &[u32] = if public.is_empty() { binding } else { public };
+    let segment = &randprotocol_core::program::hardened_call_segment(public, binding)[..];
     // `Machine::prove_salted`'s body, from its public parts, with one difference: the program
     // table is floored at `MIN_PRIVATE_TABLE_LOG_HEIGHT` (PROGRAM-TABLE-LEAK,
     // [`hardened_program_log_height`]). A taller program table than the program needs is sound —
@@ -1789,6 +1795,43 @@ mod tests {
         // segment is even compared (private_payment is under 64 words).
         assert!(zk.verify_call_hardened(&record, &unbound, &binding).is_err(), "today's proof under the flag");
         assert!(zk.verify_call(&record, &unbound).is_ok());
+    }
+
+    /// Issue #55 (INT-4's residual) on the real executor: a program deployed with a public input
+    /// is bound too — the hardened prover proves over `public ‖ binding`, which verifies under
+    /// that segment and refuses another transaction's binding, the public input alone (the copy
+    /// the old hardened rule let through), and the binding alone.
+    #[test]
+    fn int4_a_call_to_a_program_with_a_public_input_is_bound_too() {
+        use super::*;
+        use crate::machine::FriProfile;
+        let program = crate::guests::private_payment(1000);
+        let inputs = [400, 250, 300, 75];
+        let public = [7u32, 8, 9];
+        let zk = ZkExecutor::new(FriProfile::Test);
+        let record = ProgramRecord {
+            id: randprotocol_core::program::program_id_with_public(program.base_pc, &program.words, &public),
+            base_pc: program.base_pc,
+            words: program.words.clone(),
+            code_hash: zk.check_program(program.base_pc, &program.words).unwrap(),
+            deployed_at: 0,
+            public_digest: Some(crate::hash::public_digest(&public)),
+            public_len: public.len() as u32,
+        };
+        let binding = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let segment = randprotocol_core::program::hardened_call_segment(&public, &binding);
+        let tier = call_tier(&program, &inputs, segment.len()).unwrap();
+        let (bound, outputs, _) = prove_call_hardened(FriProfile::Test, &program, &inputs, &public, &binding, [1, 2, 3, 4], Some(tier)).unwrap();
+        let outcome = zk.verify_call_hardened(&record, &bound, &segment).expect("public ‖ its own binding");
+        assert_eq!(outcome.outputs, outputs);
+        assert_eq!(zk.decode_call_hardened(&record, &bound, &segment), Ok(outcome), "the decode path agrees");
+        let public_values = Err(ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues)));
+        let mut other = binding;
+        other[0] ^= 1;
+        let lifted = randprotocol_core::program::hardened_call_segment(&public, &other);
+        assert_eq!(zk.verify_call_hardened(&record, &bound, &lifted), public_values, "another transaction's binding");
+        assert_eq!(zk.verify_call_hardened(&record, &bound, &public), public_values, "the public input alone");
+        assert_eq!(zk.verify_call_hardened(&record, &bound, &binding), public_values, "the binding alone");
     }
 
     /// PROGRAM-TABLE-LEAK (the INT-1 family's open member): a call's program table is as tall as

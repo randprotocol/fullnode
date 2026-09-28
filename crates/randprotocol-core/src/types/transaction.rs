@@ -793,8 +793,9 @@ impl Transaction {
     /// domain, [`CALL_BINDING_DOMAIN`], with the `Call`'s proof blanked as well as the bundle's —
     /// a proof cannot commit to itself. Everything else is inside it: the chain id, the program,
     /// the call's input envelope, and every public field of the fee bundle (its four nullifiers
-    /// among them). The call proof carries these words as its public input segment when its
-    /// program was deployed without one (`ConfidentialExecutor::verify_call_hardened`), so a copy
+    /// among them). The call proof carries these words as its public input segment, after the
+    /// program's deploy-time public input when it has one (issue #55,
+    /// `program::hardened_call_segment`, `ConfidentialExecutor::verify_call_hardened`), so a copy
     /// of it attached to any other fee bundle no longer verifies, and since those nullifiers can
     /// be spent once, one call proof yields one receipt.
     ///

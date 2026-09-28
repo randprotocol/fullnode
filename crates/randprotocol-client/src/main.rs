@@ -1386,7 +1386,9 @@ async fn main() -> Result<()> {
                 if !matches!(backend, Backend::Cpu) {
                     anyhow::bail!("this chain binds each call proof to its transaction (hardening_v6); prove it on the CPU backend");
                 }
-                let segment_words = if public.is_empty() { randprotocol_core::types::TX_BINDING_WORDS } else { public.len() };
+                // The program's public input, then the binding (issue #55: a program with one is
+                // bound too).
+                let segment_words = public.len() + randprotocol_core::types::TX_BINDING_WORDS;
                 let tier = match tier {
                     Some(t) => t,
                     None => executor::call_tier(&prog, &inputs, segment_words).map_err(|e| anyhow::anyhow!(e))?,

@@ -78,21 +78,23 @@ pub trait ConfidentialExecutor: Send + Sync {
         self.verify_call(program, proof)
     }
     /// `verify_call` under genesis `hardening_v6` (INT-4 of the 2026-09-27 zkVM/ISA review): the
-    /// same checks, but a call against a program deployed *without* a public input must carry
-    /// `binding` — [`crate::types::Transaction::call_binding`] of the transaction it rides in — as
-    /// its public segment (`pv::PUB0..7 == H_PUB(binding)`), where today's rule wants the empty
+    /// same checks, but the call must carry `segment` as its public segment
+    /// (`pv::PUB0..7 == H_PUB(segment)`) — the program's deploy-time public words followed by
+    /// [`crate::types::Transaction::call_binding`] of the transaction it rides in
+    /// ([`crate::program::hardened_call_segment`], built by the ledger, which keeps the words), so
+    /// just the binding for a program without a public input, where today's rule wants the empty
     /// segment. A copy of the proof under any other fee bundle is then refused (`PublicValues`).
-    /// A program deployed with a public input keeps its recorded digest: the chain holds only that
-    /// digest, not the words, so it cannot recompute a digest over the words and the binding —
-    /// such calls stay unbound (a documented residual). And every call's program table is floored
-    /// at 2^7 rows (PROGRAM-TABLE-LEAK: a smaller one publishes the call's fetch counts), so the
-    /// declared height is `max(record height, 7)`, exactly. The default refuses every call: an
-    /// executor that has not implemented the rules must not pass them by default.
+    /// Until issue #55 a program deployed with a public input kept its recorded digest and stayed
+    /// unbound, because the ledger held only that digest; it holds the words now. A segment that is
+    /// not `public_len + TX_BINDING_WORDS` long is refused the same way. And every call's program
+    /// table is floored at 2^7 rows (PROGRAM-TABLE-LEAK: a smaller one publishes the call's fetch
+    /// counts), so the declared height is `max(record height, 7)`, exactly. The default refuses
+    /// every call: an executor that has not implemented the rules must not pass them by default.
     fn verify_call_hardened(
         &self,
         _program: &ProgramRecord,
         _proof: &[u8],
-        _binding: &[u32; TX_BINDING_WORDS],
+        _segment: &[u32],
     ) -> Result<CallOutcome, ConfidentialError> {
         Err(ConfidentialError::InvalidProof("this executor does not implement the hardening_v6 call rules".into()))
     }
@@ -102,9 +104,9 @@ pub trait ConfidentialExecutor: Send + Sync {
         &self,
         program: &ProgramRecord,
         proof: &[u8],
-        binding: &[u32; TX_BINDING_WORDS],
+        segment: &[u32],
     ) -> Result<CallOutcome, ConfidentialError> {
-        self.verify_call_hardened(program, proof, binding)
+        self.verify_call_hardened(program, proof, segment)
     }
     /// Precompute whatever makes `verify_call` fast for `program` (the zkVM verifier key,
     /// ~2 s). Called from a background task after a deploy commits and at startup; may be a no-op.
@@ -288,14 +290,15 @@ impl StubExecutor {
         tx
     }
 
-    /// `verify_call`'s body, and `verify_call_hardened`'s with `binding`: the expected `H_PUB` is
-    /// the record's digest, or — for a program without a public input — the empty segment's, or
-    /// the binding's under the hardened rule.
+    /// `verify_call`'s body, and `verify_call_hardened`'s with `segment`: the expected `H_PUB` is
+    /// the record's digest, or — for a program without a public input — the empty segment's; under
+    /// the hardened rule it is the segment's (`public ‖ call_binding`), whose length must be the
+    /// record's `public_len` plus the binding's.
     fn verify_stub_call(
         &self,
         program: &ProgramRecord,
         proof: &[u8],
-        binding: Option<&[u32; TX_BINDING_WORDS]>,
+        segment: Option<&[u32]>,
     ) -> Result<CallOutcome, ConfidentialError> {
         if proof.len() != STUB_LEN || &proof[..4] != STUB_MARKER {
             return Err(ConfidentialError::MalformedProof);
@@ -311,9 +314,12 @@ impl StubExecutor {
         }
         let h_in = word8_from_bytes(&proof[37..69]).expect("32 bytes");
         let h_pub = word8_from_bytes(&proof[69..101]).expect("32 bytes");
-        let want = match (program.public_digest, binding) {
-            (Some(d), _) => d,
-            (None, Some(b)) => self.public_digest(b),
+        let want = match (program.public_digest, segment) {
+            (_, Some(s)) if s.len() != program.public_len as usize + TX_BINDING_WORDS => {
+                return Err(ConfidentialError::InvalidProof("PublicValues".into()));
+            }
+            (_, Some(s)) => self.public_digest(s),
+            (Some(d), None) => d,
             (None, None) => self.public_digest(&[]),
         };
         if h_pub != want {
@@ -348,16 +354,16 @@ impl ConfidentialExecutor for StubExecutor {
         self.verify_stub_call(program, proof, None)
     }
 
-    /// The stub's INT-4 rule, as the zkVM's: a program without a public input wants the binding's
-    /// digest where `verify_call` wants the empty segment's (`make_proof_with_public(.., &binding)`
-    /// makes such a proof).
+    /// The stub's INT-4 rule, as the zkVM's: the segment's digest, `public ‖ call_binding`, where
+    /// `verify_call` wants the record's (`make_proof_with_public(.., &segment)` makes such a
+    /// proof).
     fn verify_call_hardened(
         &self,
         program: &ProgramRecord,
         proof: &[u8],
-        binding: &[u32; TX_BINDING_WORDS],
+        segment: &[u32],
     ) -> Result<CallOutcome, ConfidentialError> {
-        self.verify_stub_call(program, proof, Some(binding))
+        self.verify_stub_call(program, proof, Some(segment))
     }
 
     /// A blake3 stand-in for `H_PUB`, length-prefixed like the real one's header, so the empty

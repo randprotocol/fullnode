@@ -57,6 +57,15 @@ pub fn program_id_with_public(base_pc: u32, words: &[u32], public: &[u32]) -> Pr
     Hash::digest_domain(b"rand-program-2", &buf)
 }
 
+/// The public segment a call proves over under genesis `hardening_v6` (INT-4, and issue #55 for a
+/// program with a public input): the program's deploy-time public words, then the eight words of
+/// `Transaction::call_binding`. The guest reads its own public words at the indices it always did;
+/// the binding after them only moves `H_PUB`, so a proof copied under another fee bundle fails the
+/// digest compare. The ledger, the wallet and the prover all build it here, so they cannot drift.
+pub fn hardened_call_segment(public: &[u32], binding: &[u32; crate::types::TX_BINDING_WORDS]) -> Vec<u32> {
+    [public, binding.as_slice()].concat()
+}
+
 /// Rows in the zkVM's program table for a program of `len` words: `max(len + 1, 16)` rounded up to
 /// a power of two — `1 << tables::program::program_log_height(len)` in the zkVM (`pad_height(len +
 /// 1, MIN_HEIGHT)`, `MIN_HEIGHT` 16). Core cannot name a zkvm function (the dependency points the

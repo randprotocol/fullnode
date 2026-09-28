@@ -466,7 +466,8 @@ pub struct ChainLimits {
     /// keeps today's at-most rule.
     pub envelope_bytes: Option<usize>,
     /// Whether the genesis sets `hardening_v6` (the v0.6 switch). What a wallet reads to prove a
-    /// call over `Transaction::call_binding` (INT-4) instead of the empty segment: a chain with
+    /// call over its program's public input followed by `Transaction::call_binding` (INT-4, issue
+    /// #55) instead of the public input alone: a chain with
     /// the flag refuses the old proof, a chain without it the new one.
     pub hardening_v6: bool,
 }

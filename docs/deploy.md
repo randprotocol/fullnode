@@ -543,10 +543,12 @@ larger one deploys, is charged `deploy_fee`, and can never be called — the shi
 ### The call binding (INT-4)
 
 A call proof is not bound to its transaction today, so a copy of someone's call proof attached
-under another fee bundle yields a second receipt. Under `hardening_v6` a call against a program
-deployed *without* a public input must carry `Transaction::call_binding` — the transaction with its
-bundle proof and call proof blanked, under `rand-call-bind-1`, which covers the fee bundle's
-nullifiers — as its public segment (`ConfidentialExecutor::verify_call_hardened`). The same proof
+under another fee bundle yields a second receipt. Under `hardening_v6` every call must carry
+`Transaction::call_binding` — the transaction with its bundle proof and call proof blanked, under
+`rand-call-bind-1`, which covers the fee bundle's nullifiers — in its public segment
+(`ConfidentialExecutor::verify_call_hardened`): the whole segment for a program deployed without a
+public input, and after the program's deploy-time public words for one deployed with them
+(`program::hardened_call_segment`, `public ‖ call_binding`; issue #55). The same proof
 under another fee bundle is refused, and the nullifiers spend once, so one proof yields one receipt.
 
 - **Flag-only, no pool policy**: every wallet in the field proves the empty segment, so screening
@@ -555,12 +557,13 @@ under another fee bundle is refused, and the nullifiers spend once, so one proof
   (`wallet::submit_bound_call`): notes chosen and the fee fixed from the call's tier first
   (`executor::call_tier`), the input envelope sealed, the call proved over the call binding, the
   bundle proved last.
-- **Residual**: a program deployed *with* a public input keeps its recorded digest — the ledger
-  holds the digest, not the words, so it cannot recompute one over the words and the binding.
-  Calls against such programs stay unbound until the ledger keeps the public words (or an
-  extendable digest) — a later cut.
-- Under the flag the CPU-1 bound for a program without a public input is taken with the binding's
-  eight-word segment: 8 180 words.
+- **Programs with a public input (issue #55, v0.6.1)**: the ledger now keeps each program's
+  deploy-time public words (`Ledger::program_public`, outside the state root — the program id
+  already binds them — restored from the node's `program_public` column at open and checked against
+  the record's digest there), so such a call is bound too. The guest reads its public words at the
+  same indices; only `H_PUB` moves. Before, such calls kept the recorded digest and stayed unbound.
+- Under the flag the CPU-1 bound is taken with the segment a call carries, `public.len() + 8`
+  words: 8 180 for a program without a public input.
 
 ### The program-table floor (PROGRAM-TABLE-LEAK)
 

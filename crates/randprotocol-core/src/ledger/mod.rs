@@ -507,6 +507,14 @@ pub struct Ledger {
     anchors: VecDeque<(u64, Word8)>,
     validators: BTreeMap<Address, ValidatorEntry>,
     programs: BTreeMap<ProgramId, ProgramRecord>,
+    /// The deploy-time public words of every program deployed with a public input (issue #55,
+    /// INT-4's residual): under genesis `hardening_v6` a call against such a program proves over
+    /// `public ‖ call_binding`, and the chain has to hold the words to recompute that digest.
+    /// Bound by the record's `public_digest` (in the state root through the program's id), so
+    /// outside both the state root and `Ledger`'s equality, like the node's `program_public`
+    /// column it is restored from (`Storage::load_ledger`); written at `Deploy`, so replay rebuilds
+    /// it. No entry for a program without a public input.
+    program_public: BTreeMap<ProgramId, Vec<u32>>,
     /// Blocks per epoch (spec §8), from genesis. Not state: like `faucet` and `confidential`,
     /// a reloading node sets it from its genesis file.
     epoch_blocks: u64,
@@ -577,8 +585,8 @@ pub struct Ledger {
     ///   (`program::pc_window_fits`).
     /// - CPU-1: a `Deploy` of more words than any call can hold is refused
     ///   (`ConfidentialExecutor::max_callable_program_words`, `TxError::ProgramUncallable`).
-    /// - INT-4: a call against a program deployed without a public input carries
-    ///   `Transaction::call_binding` as its public segment
+    /// - INT-4: a call carries `Transaction::call_binding` as its public segment, after the
+    ///   program's deploy-time public input when it has one (issue #55, `program_public`)
     ///   (`ConfidentialExecutor::verify_call_hardened`), so its proof cannot be copied under
     ///   another fee bundle; and every call's program table is floored at 2^7 rows
     ///   (PROGRAM-TABLE-LEAK), both in the executor's hardened verify.
@@ -692,6 +700,7 @@ impl Ledger {
             anchors,
             validators,
             programs: BTreeMap::new(),
+            program_public: BTreeMap::new(),
             epoch_blocks: staking::EPOCH_BLOCKS_DEFAULT,
             bridge: None,
             tokens: None,
@@ -746,6 +755,7 @@ impl Ledger {
             anchors: anchors.into_iter().collect(),
             validators,
             programs,
+            program_public: BTreeMap::new(),
             epoch_blocks: staking::EPOCH_BLOCKS_DEFAULT,
             bridge: None,
             tokens: None,
@@ -1297,6 +1307,44 @@ impl Ledger {
         self.programs.get(id)
     }
 
+    /// The public words program `id` was deployed with (issue #55); `None` for a program without
+    /// a public input, or one this ledger does not hold.
+    pub fn program_public(&self, id: &ProgramId) -> Option<&[u32]> {
+        self.program_public.get(id).map(|w| w.as_slice())
+    }
+
+    /// Restore the deployed public words (`Storage::load_ledger`, from its `program_public`
+    /// column). Each entry must be for a held program and hash to its record's digest, and every
+    /// program with a public input must have one — a call under `hardening_v6` is verified over
+    /// them, so a node missing them would refuse what its peers accept. Refused whole otherwise,
+    /// naming the program.
+    pub fn set_program_public(
+        &mut self,
+        words: BTreeMap<ProgramId, Vec<u32>>,
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<(), String> {
+        for (id, rec) in &self.programs {
+            match (rec.public_digest, words.get(id)) {
+                (None, None) => {}
+                (Some(d), Some(w)) if w.len() == rec.public_len as usize && executor.public_digest(w) == d => {}
+                _ => return Err(format!("program {id}: its stored public words do not match its record")),
+            }
+        }
+        if let Some(id) = words.keys().find(|id| !self.programs.contains_key(*id)) {
+            return Err(format!("public words for program {id}, which is not deployed"));
+        }
+        self.program_public = words;
+        Ok(())
+    }
+
+    /// The public segment a call against `record` proves over under genesis `hardening_v6`
+    /// (INT-4 and its residual, issue #55): the program's deploy-time public words followed by
+    /// `binding` (`Transaction::call_binding`) — just the binding for a program without a public
+    /// input. The guest reads its public words at the indices it always did.
+    pub fn hardened_call_segment(&self, record: &ProgramRecord, binding: &[u32; crate::types::TX_BINDING_WORDS]) -> Vec<u32> {
+        crate::program::hardened_call_segment(self.program_public(&record.id).unwrap_or(&[]), binding)
+    }
+
     /// Record the root at the end of block `height`. Idempotent per height: re-recording the
     /// same height replaces that entry rather than filling the window with one block's roots.
     pub fn record_anchor(&mut self, height: u64) {
@@ -1698,11 +1746,11 @@ impl Ledger {
                 // only (`admission::deploy_uncallable`), and a block carrying such a deploy
                 // applies as before.
                 //
-                // Under the flag a call against a program without a public input carries the
-                // call binding (INT-4) as its segment, `TX_BINDING_WORDS` words, so that is the
+                // Under the flag every call carries the call binding (INT-4) after the program's
+                // public input (issue #55), `public.len() + TX_BINDING_WORDS` words, so that is the
                 // segment the bound is taken against.
                 if self.hardening_v6 {
-                    let segment = if public.is_empty() { crate::types::TX_BINDING_WORDS } else { public.len() };
+                    let segment = public.len() + crate::types::TX_BINDING_WORDS;
                     if let Some(max_words) = executor.max_callable_program_words(segment) {
                         if words.len() > max_words {
                             return Err(TxError::ProgramUncallable { words: words.len(), public_words: public.len(), max_words });
@@ -1803,9 +1851,15 @@ impl Ledger {
             // `call_binding` as its public segment when the program has none of its own, so a copy
             // under another fee bundle is refused (`verify_call_hardened`). Without the flag the
             // old rule, the empty segment, stands.
+            //
+            // Issue #55 (INT-4's residual): a program deployed with a public input is bound too —
+            // its segment is `public ‖ call_binding`, the words this ledger kept at deploy
+            // (`hardened_call_segment`). Before, it kept its recorded digest alone and a copy of the
+            // proof verified under any fee bundle.
+            let segment = if self.hardening_v6 { self.hardened_call_segment(record, &tx.call_binding()) } else { Vec::new() };
             let outcome = match (self.hardening_v6, admitted) {
-                (true, true) => executor.decode_call_hardened(record, proof, &tx.call_binding()),
-                (true, false) => executor.verify_call_hardened(record, proof, &tx.call_binding()),
+                (true, true) => executor.decode_call_hardened(record, proof, &segment),
+                (true, false) => executor.verify_call_hardened(record, proof, &segment),
                 (false, true) => executor.decode_call(record, proof),
                 (false, false) => executor.verify_call(record, proof),
             }
@@ -1934,6 +1988,9 @@ impl Ledger {
                     // Hashed once, here: a call compares its proof's `H_PUB` with this and never
                     // re-hashes the words (spec §5).
                     let public_digest = (!public.is_empty()).then(|| executor.public_digest(public));
+                    if !public.is_empty() {
+                        self.program_public.insert(id, public.clone());
+                    }
                     self.programs.insert(
                         id,
                         ProgramRecord {
@@ -3791,11 +3848,59 @@ mod tests {
         assert_eq!(plain.validate(&bound, &StubExecutor), refused, "without the flag a bound proof is a stranger");
     }
 
+    /// INT-4's residual (issue #55): under `hardening_v6` a call against a program deployed *with*
+    /// a public input kept the record's digest as its whole expectation — the ledger held only the
+    /// digest, not the words — so a call proof made for one transaction verified under any other
+    /// fee bundle, exactly the copy INT-4 closed for programs without one. The ledger now keeps the
+    /// words (`Ledger::program_public`), and under the flag such a call proves over the program's
+    /// public input followed by the call binding, `public ‖ call_binding`: the guest reads its
+    /// public words at the same indices as before, and the copy fails the digest compare.
+    #[test]
+    fn under_hardening_v6_a_call_to_a_program_with_a_public_input_is_bound_too() {
+        let (a, _) = keys();
+        let mut gated = ledger();
+        gated.set_hardening_v6(true);
+        gated.set_max_program_public_words(64);
+        let words = vec![0x13u32; 4];
+        let public = vec![7u32, 8, 9];
+        let deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: public.clone() };
+        let d = StubExecutor::bound(Transaction::shielded(7, bundle(&gated, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::fee_floor(&deploy)), deploy));
+        gated.apply_tx(&d, &a.address(), &StubExecutor).unwrap();
+        gated.record_anchor(gated.height());
+        let id = crate::program::program_id_with_public(0, &words, &public);
+        assert_eq!(gated.program_public(&id), Some(&public[..]), "the ledger keeps the deployed words");
+        let fee = gas::BUNDLE_BASE + gas::call_fee(12, 0);
+        let segment = |t: &Transaction| [public.as_slice(), t.call_binding().as_slice()].concat();
+        let call_tx = |l: &Ledger, nfs: [Word8; 2], proof: Option<Vec<u8>>| {
+            let mut t = Transaction::shielded(7, bundle(l, nfs, [[nfs[0][0] + 2; 8], [nfs[0][0] + 3; 8]], fee), Action::Call { program: id, proof: vec![], input_envelope: None });
+            let proof = proof.unwrap_or_else(|| StubExecutor::make_proof_with_public(&id, 12, [5; 8], &segment(&t)));
+            let Action::Call { proof: p, .. } = &mut t.action else { unreachable!() };
+            *p = proof;
+            StubExecutor::bound(t)
+        };
+        let refused = Err(TxError::InvalidProof(ConfidentialError::InvalidProof("PublicValues".into())));
+        // Before the fix: a proof over the public input alone, made once and attached anywhere.
+        let unbound = StubExecutor::make_proof_with_public(&id, 12, [5; 8], &public);
+        let copy = call_tx(&gated, [[20; 8], [21; 8]], Some(unbound));
+        assert_eq!(gated.validate(&copy, &StubExecutor), refused, "an unbound proof, under any fee bundle, is refused under the flag");
+        let bound = call_tx(&gated, [[30; 8], [31; 8]], None);
+        assert_eq!(gated.validate(&bound, &StubExecutor), Ok(()), "the proof over public ‖ its own call binding");
+        let Action::Call { proof: bound_proof, .. } = &bound.action else { unreachable!() };
+        let lifted = call_tx(&gated, [[40; 8], [41; 8]], Some(bound_proof.clone()));
+        assert_eq!(gated.validate(&lifted, &StubExecutor), refused, "the same proof under another fee bundle");
+        assert_eq!(gated.clone().apply_tx(&lifted, &a.address(), &StubExecutor).map(|_| ()), refused);
+        // Without the flag nothing moves: the record's digest, the words alone.
+        let mut plain = gated.clone();
+        plain.set_hardening_v6(false);
+        let old = call_tx(&plain, [[50; 8], [51; 8]], Some(StubExecutor::make_proof_with_public(&id, 12, [5; 8], &public)));
+        assert_eq!(plain.validate(&old, &StubExecutor), Ok(()));
+    }
+
     /// CPU-1: under genesis `hardening_v6` a deploy of more words than any call can hold is
     /// refused, at admission and at apply alike — 8 180 words at tier 14 for a program without a
     /// public input, whose calls carry the eight-word call binding under the flag (8 184 with the
-    /// empty segment, the pool's number), fewer beside a public input (the stub restates the
-    /// zkVM's bound). Without the flag
+    /// empty segment, the pool's number), fewer beside a public input, which the binding follows
+    /// (the stub restates the zkVM's bound). Without the flag
     /// — chain 15, whose genesis admits 65 535-word programs — the old rule stands and such a
     /// deploy is charged for a program no call can prove.
     #[test]
@@ -3820,12 +3925,13 @@ mod tests {
         assert_eq!(gated.validate(&over, &StubExecutor), refused);
         assert_eq!(gated.clone().apply_tx(&over, &a.address(), &StubExecutor).map(|_| ()), refused);
         assert_eq!(gated.validate(&deploy(&gated, 8180, 0), &StubExecutor), Ok(()), "the bound itself fits");
-        // A 9-word public input takes three digest slots, two more than the empty segment's one.
+        // A 9-word public input is followed by the binding too under the flag (issue #55): a
+        // 17-word segment, five digest slots, four more than the empty segment's one.
         assert_eq!(
-            gated.validate(&deploy(&gated, 8177, 9), &StubExecutor),
-            Err(TxError::ProgramUncallable { words: 8177, public_words: 9, max_words: 8176 })
+            gated.validate(&deploy(&gated, 8169, 9), &StubExecutor),
+            Err(TxError::ProgramUncallable { words: 8169, public_words: 9, max_words: 8168 })
         );
-        assert_eq!(gated.validate(&deploy(&gated, 8176, 9), &StubExecutor), Ok(()));
+        assert_eq!(gated.validate(&deploy(&gated, 8168, 9), &StubExecutor), Ok(()));
         // The EVM interpreter guest, 18 009 words, is what the report found deployable and dead.
         assert!(matches!(gated.validate(&deploy(&gated, 18_009, 0), &StubExecutor), Err(TxError::ProgramUncallable { .. })));
     }

@@ -287,18 +287,18 @@ impl ConfidentialExecutor for AggExecutor {
         &self,
         program: &ProgramRecord,
         proof: &[u8],
-        binding: &[u32; randprotocol_core::types::TX_BINDING_WORDS],
+        segment: &[u32],
     ) -> Result<CallOutcome, ConfidentialError> {
-        self.inner.verify_call_hardened(program, proof, binding)
+        self.inner.verify_call_hardened(program, proof, segment)
     }
 
     fn decode_call_hardened(
         &self,
         program: &ProgramRecord,
         proof: &[u8],
-        binding: &[u32; randprotocol_core::types::TX_BINDING_WORDS],
+        segment: &[u32],
     ) -> Result<CallOutcome, ConfidentialError> {
-        self.inner.decode_call_hardened(program, proof, binding)
+        self.inner.decode_call_hardened(program, proof, segment)
     }
 
     fn warm_hardened(&self, program: &ProgramRecord) {

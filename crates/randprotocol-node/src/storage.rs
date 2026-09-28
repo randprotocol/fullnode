@@ -1924,6 +1924,15 @@ impl Storage {
         }
         let mut ledger =
             Ledger::from_parts(chain_id, hc_bundle, tree, commitments, nullifiers, anchors, validators, programs);
+        // Issue #55: the deployed public words, which a call under `hardening_v6` is verified over.
+        // Each row is checked against its record's digest; a program missing its row is corrupt.
+        let mut public = BTreeMap::new();
+        for item in self.db.iterator_cf(self.cf(CF_PROGRAM_PUBLIC), IteratorMode::Start) {
+            let (k, v) = item?;
+            let id = <[u8; 32]>::try_from(&k[..]).map_err(|_| StorageError::Corrupt("program_public key".into()))?;
+            public.insert(Hash(id), bincode::deserialize::<Vec<u32>>(&v)?);
+        }
+        ledger.set_program_public(public, executor).map_err(StorageError::Corrupt)?;
         ledger.set_supply(self.supply()?);
         let (faucet_epoch, faucet_minted) = self.faucet_epoch_counters()?;
         ledger.set_faucet_epoch_counters(faucet_epoch, faucet_minted);
@@ -2210,8 +2219,8 @@ impl Storage {
                 batch.put_cf(self.cf(CF_PROGRAMS), rec.id.as_bytes(), bincode::serialize(rec)?);
             }
         }
-        // The public words are read off the deploys themselves — the ledger keeps only their
-        // digest. A redeploy of a program already on chain rewrites the same words under the
+        // The public words are read off the deploys themselves (the ledger's copy,
+        // `Ledger::program_public`, is restored from this column at open). A redeploy of a program already on chain rewrites the same words under the
         // same content-addressed id, which is harmless.
         for tx in blocks.iter().flat_map(|cb| cb.block.transactions.iter()) {
             if let Action::Deploy { base_pc, words, public } = &tx.action {
@@ -5786,6 +5795,12 @@ mod tests {
         let st = Storage::open(dir.path()).unwrap();
         assert_eq!(st.program_public(&pid).unwrap(), Some(public.clone()));
         assert_eq!(st.load_ledger(&StubExecutor).unwrap().program(&pid).unwrap().public_digest, Some(StubExecutor.public_digest(&public)));
+        // And the ledger's own copy is restored from them (issue #55: a call under `hardening_v6`
+        // is verified over them); a row that does not hash to its record's digest is corruption.
+        assert_eq!(st.load_ledger(&StubExecutor).unwrap().program_public(&pid), Some(&public[..]));
+        st.db.put_cf(st.cf(CF_PROGRAM_PUBLIC), pid.as_bytes(), bincode::serialize(&vec![7u32, 8, 10]).unwrap()).unwrap();
+        assert!(matches!(st.load_ledger(&StubExecutor), Err(StorageError::Corrupt(_))), "a tampered row");
+        st.db.put_cf(st.cf(CF_PROGRAM_PUBLIC), pid.as_bytes(), bincode::serialize(&public).unwrap()).unwrap();
         // Truncating below the deploy removes them with the program.
         let at_two = {
             let mut l = gs.ledger.clone();
