@@ -44,8 +44,10 @@ A node prices a call by the work its proof header bounds, as admission policy on
 them and `rand_estimateFee` prices them; a wallet pays the floor by default. It is a policy above
 the ledger's schedule, never a block rule: the pool refuses `FeeTooLow` (not permanent), a block
 that carries a cheaper call is still valid. One gas is one cpu row; a `KECCAK` row is 192, a
-`SHA256` row 64 (§3.1 of the spec). What this changes: a tier-20 call pays ~0.107 RAND, not
-0.0025; a tier-10 call pays what it paid (~0.0021). The declared limit and the in-circuit meter
+`SHA256` row 64 (§3.1 of the spec). What this changes, for a ~1.2–1.3 MB production proof: a
+tier-14 call — the highest tier a chain admits a call at (`MAX_CALL_TIER`) — goes from ~0.0022 to
+~0.0037 RAND, and a tier-10 call pays ~0.0021 (was 0.0020). The schedule would charge a tier-20
+header ~0.107 RAND, but no such call is admitted today. The declared limit and the in-circuit meter
 that make this per-instruction rather than per-header come with the chain 18 cut.
 
 ## 2. What the sender pays with its own machine: proving
