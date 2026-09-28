@@ -1565,7 +1565,8 @@ impl Prepared {
 /// transfer built and proved exactly as [`send`] builds and proves one — the same scan, plan,
 /// anchor, envelopes and binding — except that its bundle proof declares `bundle_gas_limit` as
 /// its `GAS_LIMIT` rather than the guest's ceiling. Returned unsubmitted, so the caller submits
-/// it and reads the refusal by hash. Never a wallet path: every honest bundle declares the
+/// it and reads the refusal by hash. The store is left as though nothing was sent: the spent
+/// notes are not marked pending, so a caller that did get the transaction committed must rescan. Never a wallet path: every honest bundle declares the
 /// ceiling ([`check_bundle_gas_limit`]).
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]

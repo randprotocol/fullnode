@@ -2576,6 +2576,11 @@ fn declared_gas_of(proof: &[u8]) -> u64 {
 /// `(bytes_used, gas_used)` recomputed from its transactions — Σ encoded length; each bundle's
 /// declared limit (read off its proof, not assumed) plus each call's — and folded through
 /// [`gas::next_price`]. Returns the prices in force *after* each height, index = height.
+///
+/// A bundle's gas here is its proof's declared `pv::GAS`, while the node charges the genesis
+/// `bundle_gas_limit` per bundle (`Ledger::block_usage`). The two agree only because the pin
+/// holds on every committed bundle — so this is an independent check of the pin as well, not a
+/// mismatch with the node's rule.
 fn replay_prices(node: &TestNode, cfg: &gas::GasConfig, head: u64) -> Vec<(u64, u64, u64, u64)> {
     let d = cfg.dynamic.as_ref().unwrap();
     let (mut gp, mut bp) = (cfg.gas_price, cfg.byte_price);
@@ -2759,6 +2764,9 @@ async fn a_chain18_genesis_prices_calls_by_their_declared_limit() {
     };
     let est_tight = estimate(tight).await;
     assert_eq!(est_tight, gas::circuit_call_floor(tgp, tbp, tight, call_bytes), "rand_estimateFee prices the declared limit at the tip");
+    // On this genesis the prices never leave their floors (no block reaches either target), so
+    // this branch always runs and adds nothing the line above has not checked; it is the
+    // statement that matters on a chain whose prices move between the call's block and the tip.
     if (tgp, tbp) == (gp, bp) {
         assert_eq!(est_tight, floor, "rand_estimateFee reproduces the floor the node demanded");
     }
@@ -2828,4 +2836,79 @@ async fn a_chain18_genesis_prices_calls_by_their_declared_limit() {
 
     assert_chains_equal(&nodes);
     eprintln!("a_chain18_genesis_prices_calls_by_their_declared_limit in {:.1?}", started.elapsed());
+}
+
+/// The companion to the capstone's step 5, which cannot see the controller move (on the cut's
+/// numbers no block reaches either target, and the floors are the starting prices). Here the
+/// same section has floors under its starting prices — `min_gas_price` 50, `min_byte_price` 400,
+/// which `GasConfig::check` allows — and the chain carries only empty blocks, so each block cuts
+/// both prices by 12.5 % (floor division, `gas::next_price`) until they reach the floors. No
+/// proofs: a few seconds of 1 s blocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dynamic_chain_decays_its_prices_to_the_floors_on_empty_blocks() {
+    init_tracing();
+    let ks = keys(3);
+    let mut cfg = chain18_gas();
+    let d = cfg.dynamic.as_mut().unwrap();
+    (d.min_gas_price, d.min_byte_price) = (50, 400);
+    cfg.check(gas::MAX_BLOCK_BYTES).expect("floors under the starting prices are a valid section");
+    let gen = genesis_chain18(&ks, &[], Some(cfg.clone()));
+    // One-second blocks, so a height whose prices are between the start and the floors is there
+    // to be read (gas: 100, 87, 76, 66, 57, 50; bytes: 800, 700, 612, 535, 468, 409, 400).
+    let slow = Duration::from_millis(1000);
+    let n0 = start_node_at(&ks[0], &gen, vec![], true, slow).await;
+    let boot = vec![bootstrap_addr(&n0)];
+    let n1 = start_node_at(&ks[1], &gen, boot.clone(), true, slow).await;
+    let n2 = start_node_at(&ks[2], &gen, boot.clone(), true, slow).await;
+    let nodes = [&n0, &n1, &n2];
+
+    // One consistent read: the status's head and prices, and rand_getLimits' prices at that same
+    // head (the status read again after, and retried if the head moved in between).
+    let read = |rpc: RpcClient| async move {
+        loop {
+            let s = rpc.status().await.unwrap();
+            let l = rpc.limits().await.unwrap().unwrap();
+            let again = rpc.status().await.unwrap();
+            if s["height"] == again["height"] {
+                let h = s["height"].as_u64().unwrap();
+                let st = (units(&s["gas_prices"]["gas_price"]), units(&s["gas_prices"]["byte_price"]));
+                return (h, st, (l.gas_price.unwrap(), l.byte_price.unwrap()));
+            }
+        }
+    };
+
+    // A height where the prices have moved but not yet reached the floors.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (h, moved, served) = loop {
+        assert!(Instant::now() < deadline, "never saw a price between the start and the floors");
+        let (h, st, l) = read(n0.rpc.clone()).await;
+        if st != (100, 800) && st != (50, 400) {
+            break (h, st, l);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let replay = replay_prices(&n0, &cfg, h);
+    let (rg, rb, bytes, used) = replay[h as usize];
+    eprintln!("height {h}: rand_status {moved:?}, rand_getLimits {served:?}, replay ({rg}, {rb}) over empty blocks ({bytes}, {used})");
+    assert_eq!(moved, (rg, rb), "rand_status.gas_prices at {h} is next_price replayed from genesis");
+    assert_eq!(served, (rg, rb), "rand_getLimits serves the same moved prices");
+    assert!(moved.0 < 100 && moved.1 < 800, "both prices fell: {moved:?}");
+
+    // They reach exactly the floors, and stay there.
+    wait_height(&nodes, 12, Duration::from_secs(90)).await;
+    let (h, st, l) = read(n0.rpc.clone()).await;
+    let replay = replay_prices(&n0, &cfg, h);
+    assert_eq!(st, (50, 400), "the prices decay to exactly the floors by {h}");
+    assert_eq!(l, (50, 400));
+    assert_eq!((replay[h as usize].0, replay[h as usize].1), (50, 400));
+    let first_floor = replay.iter().position(|p| (p.0, p.1) == (50, 400)).unwrap();
+    assert!(replay[first_floor..].iter().all(|p| (p.0, p.1) == (50, 400)), "once at the floors, they stay: {replay:?}");
+    eprintln!("floors reached at height {first_floor}; replay {:?}", &replay[..=first_floor]);
+    wait_height(&nodes, h + 3, Duration::from_secs(30)).await;
+    assert_eq!(read(n0.rpc.clone()).await.1, (50, 400), "still at the floors");
+    for n in [&n1, &n2] {
+        assert_eq!(read(n.rpc.clone()).await.1, (50, 400), "every node publishes the floors");
+    }
+    // The moved prices are in every header's state root; proposer and replicas agree on them.
+    assert_chains_equal(&nodes);
 }
