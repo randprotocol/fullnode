@@ -141,9 +141,11 @@ TimeoutStopSec=180
 ```
 
 On the stop the service stops admitting (a submit in the meantime is refused `bad job` with
-`shutting down`), drops every queued job with its witness zeroized, lets the proof in flight finish
+`shutting down` — though over HTTP a client mostly sees a closed connection instead, since the
+listener is aborted right after the service shuts down), drops every queued job with its witness zeroized, lets the proof in flight finish
 but discards its reply (the job ends `failed`, `shutting down`), and stops its workers; `rand-node
-run --prover` stops its hosted prover the same way when the node stops.
+run --prover` stops its hosted prover the same way when the node stops, closing the prover's
+queue before it stops the node.
 
 ## 4. In a node
 
