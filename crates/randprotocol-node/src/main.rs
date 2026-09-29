@@ -1835,6 +1835,34 @@ mod tests {
         }
     }
 
+    /// Chain 17, cut by `deploy/cut-chain17-genesis.sh` with the v0.6.3 release binary from a
+    /// snapshot of chain 16 at height 30 191 (2026-09-29 03:03 UTC): the first split-authorisation
+    /// chain — bundle guest v3 and `hc_auth`, the three-proof block rule (4 MiB proofs, 20 MiB
+    /// blocks), chain 16's 26 validators, its bridge state (set 1, burn sequence 7, the replay
+    /// floors at the snapshot's next sequences) and its zUSD, plus the RAND the operator's wallets
+    /// held. `deploy/genesis-chain17.json` is committed; this build runs it.
+    #[test]
+    fn chain_17s_genesis_file_builds_chain_17() {
+        let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain17.json");
+        let gen = Genesis::from_json(&std::fs::read_to_string(committed).unwrap()).unwrap();
+        assert_eq!(gen.chain_id, 17);
+        assert_eq!(gen.consensus_domain, Some(1));
+        assert_eq!(gen.hardening_v6, Some(true));
+        assert_eq!(gen.hc_bundle, word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), "the v3 bundle guest");
+        assert_eq!(gen.hc_auth.as_deref(), Some(word8_to_hex(&ZkExecutor::hc_auth()).as_str()), "the auth guest");
+        assert_eq!(gen.max_proof_bytes, Some(4 << 20), "three proofs per transaction fit a 20 MiB block");
+        assert_eq!(gen.max_block_bytes, Some(20 << 20));
+        assert_eq!(gen.validators.len(), 26, "chain 16's register, carried");
+        assert_eq!(gen.alloc.len(), 7, "six RAND allocs (shielded-1..5, the relayer) and the zUSD note");
+        let bridge = gen.bridge.as_ref().expect("the bridge section");
+        assert_eq!(bridge.burn_sequence, Some(7));
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        assert_eq!(state.hash().to_hex(), "d1afefc3dd68f73e3799aa0803b692d0e6a5c7c27d228bdeb3d06cdf4027e7ff", "chain 17's live genesis");
+        assert_eq!(state.ledger.hc_auth(), Some(ZkExecutor::hc_auth()), "the ledger enforces split authorisation");
+        node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 17");
+    }
+
     /// Chain 16, cut by `deploy/cut-chain16-genesis.sh` with the v0.6.1 release binary: every
     /// genesis-gated field chain 15 lacks is present and builds — `staking.faucet_minters`, C15-1's
     /// `bridge.min_inbound_sequence`, `hardening_v6` and the v2 bundle guest — beside chain 15's

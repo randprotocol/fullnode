@@ -160,6 +160,43 @@ guest takes `sk` as a private input, so a Phase 1 prover can spend for every wal
   and fixed a hard-coded `production` FRI profile and a local path that always proved the v1 guest.
 - **Open (v0.6.3 / Phase 2):** `docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md`.
 
+### Chain 17 — LIVE 2026-09-29 03:03 UTC (genesis `d1afefc3…e7ff`, build v0.6.3 `d4fd0a3`; the first split-authorisation chain)
+
+Cut on the user's standing go ("don't ask me — tag it v0.6.3 or v0.6.4 and update to chain 17 once ready",
+2026-09-29, typed in session fullnode-fc) with the current bridge emitters — the endpoint redeploy was
+not done and waits for chain 18. Genesis `d1afefc3dd68f73e3799aa0803b692d0e6a5c7c27d228bdeb3d06cdf4027e7ff`,
+chain id **17**, file `deploy/genesis-chain17.json` (sha256 `3d96abcb…d638`), cut by
+`deploy/cut-chain17-genesis.sh` from a snapshot of chain 16 at height 30 191, rolled all-stop/all-start
+by `deploy/cutover-fleet-chain17.sh` (stop 02:57:58 at chain-16 height 31 761 → push → switch 02:58:55 →
+start 02:59:54 → 26/26 healthy 03:03:18, committing at 189). Chain 16 stopped at 31 761; its data dirs
+and the `*.pre-c17` binaries stay on every host for rollback — retire them with
+`deploy/retire-chain-dirs.sh` after a day.
+
+- **What is new in the genesis:** `hc_bundle` = bundle guest v3 (`60af094a…3fce`), `hc_auth` =
+  the auth guest (`1e4e347f…39c1`), `max_proof_bytes` **4 MiB** (was 8: a v3 transaction carries up to
+  three proofs and `Genesis::validate` requires `max_block_bytes ≥ 3·max_proof_bytes + 1 MiB`),
+  `max_block_bytes` 20 MiB unchanged. Everything else is chain 16's: `hardening_v6`, `consensus_domain
+  1`, the 26 validators × 1 000 RAND (same keys, same peer ids, `deploy/nodes.env` unchanged), the
+  faucet allowlist and minters, the staking section, the tokens section.
+- **Carried:** 5 300 RAND as genesis allocs — shielded-1..5 (1 000 each; keys in the main checkout's
+  gitignored `wallets/`) and the relayer (300) — from a `balances` scan of every operator wallet on
+  chain 16 (all others held 0); 10 zUSD to Anish's address (locked Tron 9 + Solana 1 == supply ==
+  custody, one genesis note). **Not carried:** 130 RAND faucet-minted on chain 16 to a wallet the
+  operator does not hold (unknown owner; a shielded note cannot be re-created without its address),
+  and validator rewards (all 0 at the snapshot).
+- **Bridge:** guardian set 1 at index 1, `burn_sequence` 7, `min_inbound_sequence` {2:2, 3:2, 4:2,
+  5:2} (the snapshot's next sequences; C15-1), emitters unchanged. The bridge daemons (relayer +
+  guardian-7/8 on the laptop, `rand-guardian` on the six guardian hosts) are fullnode-cb's: stopped
+  before the snapshot, switched to chain 17 after the cutover per `deploy/chain17-bridge-steps.md` — **bridge up on chain 17 at 03:05 UTC** (guardians 1–8 co-signing, relayer on the v0.6.3 `rand`, custody == locked == supply 10 zUSD).
+- **Traps from the cut:** the `balances` step's default `WALLETS_DIRS` resolves the repo's `wallets/`
+  from the script's own checkout — a worktree has none, so the five alloc wallets were "uncovered"
+  on the first scan (the cut would have refused); the main checkout's `wallets/` also holds a
+  pre-v2 `wallet-1.key.json` that is not a wallet and aborts the scan — scan a curated directory of
+  symlinks (`~/.rand-chain17/alloc-wallets/`). The public RPC (Cloudflare) answers Python's
+  `urllib` with 403 — snapshot/balances against an SSH tunnel to obs1's RPC (`prune_floor` 0).
+- **v0.6.4** is the launch record: this entry, the genesis file and its pin test
+  (`chain_17s_genesis_file_builds_chain_17`); binaries identical to v0.6.3.
+
 ### Chain 16 — LIVE 2026-09-28 16:39 UTC (genesis `20925ae6…3005`, build v0.6.1 `2c75e08`)
 
 Genesis `20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005`, chain id **16**, file
