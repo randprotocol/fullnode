@@ -1192,6 +1192,31 @@ fn a_branch_free_bundle_proves_at_tier_14_at_the_pinned_shape() {
     assert!(ex.verify_bundle(&ZkExecutor::hc_hidden_bundle(), &proof, &BINDING_A).is_err(), "v1's hc refuses a v2 proof");
 }
 
+/// Constraint set 8 on split authorisation's bundle guest (the rebase of gas onto v0.6.3): bundle
+/// guest v3 — a wider witness and a longer program than v2 — still proves at tier 14 with no hash
+/// table, so `BUNDLE_PROOF_TIER` and `gas::bundle_gas_limit_pin` = `gas_max(14, 0, 0)` = 20 479
+/// hold for it unchanged: a real v3 proof declares exactly the pin chain 18's `gas` section
+/// requires, reads back through the trait the ledger calls, and verifies (Test profile — neither
+/// the tier nor the declared limit depends on it).
+#[test]
+fn a_v3_bundle_proof_declares_the_bundle_gas_pin() {
+    use randprotocol_core::confidential::ConfidentialExecutor;
+    let c = mixed();
+    let hc3 = ZkExecutor::hc_hidden_bundle_v3();
+    let started = std::time::Instant::now();
+    let (proof, digest, tier) = prove_bundle_for(&hc3, FriProfile::Test, &c.inputs_v3(), &BINDING_A, Backend::Cpu).unwrap();
+    println!("v3 bundle proved at tier {tier} in {:.1?} ({} proof bytes, Test FRI, CPU)", started.elapsed(), proof.len());
+    assert_eq!(digest, hidden::hidden_bundle_digest_v3(&c.claimed_v3()));
+    let decoded = randprotocol_zkvm::executor::decode_canonical(&proof).unwrap();
+    assert_eq!((decoded.tier, decoded.keccak_log_height, decoded.sha256_log_height), (Tier(14), 0, 0), "v3 stays at the bundle pin's header");
+    assert_eq!(tier, randprotocol_core::types::BUNDLE_PROOF_TIER);
+    assert_eq!(decoded.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], randprotocol_core::gas::bundle_gas_limit_pin());
+    assert_eq!(randprotocol_core::gas::bundle_gas_limit_pin(), 20_479);
+    let ex = ZkExecutor::new(FriProfile::Test);
+    assert_eq!(ex.bundle_gas_limit(&proof).unwrap(), Some(20_479));
+    assert_eq!(ex.verify_bundle(&hc3, &proof, &BINDING_A), Ok(()));
+}
+
 
 /// The proof size a chain-16 genesis (`--bundle-guest v2`) has to admit, measured rather than
 /// assumed: a mixed transfer under the branch-free guest at the **Production** FRI profile the
