@@ -8,9 +8,43 @@ invariants, and known traps.
 
 ### v0.6.6 — gas: Phase 1 + Phase 2 (constraint set 8), the chain-18 cut scripts (tagged 2026-09-29 as v0.6.6, retagged from v0.6.5 the same day; NOT cut)
 
-**v0.6.6 = v0.6.2 (the delegated prover) + gas Phase 0 (the v0.6.4 line, folded in: its own entry below) + this.**
-`feat/gas` was rebased onto the `v0.6.2` tag, then this branch's 26 chain-18 commits onto it; the
-workspace version is `0.6.6`.
+**Rebased onto v0.6.3 (chain 17) on 2026-09-29; chain 18 follows chain 17; the auth proof's limit is
+pinned.** v0.6.6 = main at the `v0.6.4` tag (`b388540`: v0.6.3's split authorisation + chain 17's
+launch record) + gas Phase 0 (its own entry below, the line once numbered v0.6.4 — that tag number
+went to chain 17's launch record) + this. `feat/gas` (23 commits) was rebased onto `b388540`, then
+this branch's 28 chain-18 commits onto it, then the reconciliation commits below; the workspace
+version is `0.6.6`. What the rebase onto v0.6.3 decided (report
+`.superpowers/sdd/2026-09-28-gas-phase1-phase2-chain18/rebase-v063-report.md`):
+- **Bundle guest v3 keeps the bundle pin.** v3 (1 212 input words, a 2 854-word program) proves at
+  tier 14 with no hash table — 12 359 cycles / 1 775 permutations, 4 024 / 273 of headroom under
+  cs8 — and declares `gas_max(14, 0, 0)` = 20 479; `BUNDLE_PROOF_TIER` did not move
+  (`a_v3_bundle_proof_declares_the_bundle_gas_pin`).
+- **The auth proof's `GAS_LIMIT` is pinned, not priced.** Under the gas section it must be exactly
+  `gas::auth_gas_limit_pin()` = `gas_max(AUTH_PROOF_TIER = 10, 0, 0)` = 1 279 (no genesis field);
+  `TxError::AuthGasLimit { want, got }`, permanent, checked in `check_auth_fields` before either
+  verify and on the B5/pruned paths; `ConfidentialExecutor::auth_gas_limit` (stub, zkVM,
+  `AggExecutor` forward). `prove_auth` declares the ceiling by default — wallets unchanged. The
+  auth proof adds nothing to `gas_used`; a v3 bundle still pays the flat `BUNDLE_BASE`.
+- **This build refuses chains 14–17** (`node::CHAINS_THIS_BUILD_CANNOT_RUN`, v0.6.3's one list —
+  the gas branch's `OLDER_CONSTRAINT_SET_CHAINS` folded into it; chain 17 `d1afefc3…` with
+  "constraint set 7 … this build is constraint set 8"); `chain_17s_genesis_file_builds_chain_17`
+  now expects the refusal and reads the hash from the list.
+- **The chain-18 scripts derive from chain 17's** (snapshot / `balances` / carry-over, chain 17's
+  caps 4 MiB / 20 MiB so the byte target stays 10 485 760, the guests and `hc_auth` asserted equal
+  to chain 17's, the bridge emitters stay chain 17's — the redeploy waits; the chain-17 cut's traps
+  as defaults: curated `~/.rand-chain17/alloc-wallets`, an SSH tunnel to obs1, the v0.6.3 `rand`
+  for `balances`). `SELFTEST=1` 29/29; `DRY_RUN=1` runs the real binaries on inputs synthesised
+  from `deploy/genesis-chain17.json` and `init` prints the gas section.
+- **Chain 18 turns the encrypted memo on** (user ruling): the cut passes `--envelope-bytes 1860`;
+  `genesis` seals its `--alloc` notes and `alloc-note --envelope-bytes 1860` the zUSD carry in the
+  1 860-B form; the cut asserts the field and every note (SELFTEST 29/29; DRY_RUN 7 notes at
+  1 860 B, Σ zUSD == Σ locked). The capstone genesis does NOT set it (it tests gas).
+- The capstone's genesis is v3 + `hc_auth` + 4 MiB proofs; `prove_bundle_for_with_limit` takes the
+  guest's own witness width (it required 1 204 words, so could not prove v3).
+- Found on main, fixed here: `guest_provenance`'s genesis-file test did not know v3, so
+  `deploy/genesis-chain17.json` (committed with v0.6.4) made it red on `b388540` too.
+- Measured under cs8: auth proof tier 10, 1 366 827–1 376 300 B production (~7–10 s); bundle v2
+  1 506 343 B, v1 1 496 297 B production (was 1 497 156 / 1 498 821 under cs7).
 
 Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md` §4.2–4.3, §7.1; plan
 `docs/superpowers/plans/2026-09-28-gas-phase1-phase2-chain18.md` (A1–A6 circuits, B1–B8
@@ -18,7 +52,7 @@ fullnode, C1 deploy); live ledger
 `.superpowers/sdd/2026-09-28-gas-phase1-phase2-chain18/progress.md` (every `Ruling:` line).
 Circuits worktree `/private/tmp/circuits-cs8` (branch `feat/cs8-gas`, **final `18c2627`, unpushed
 to origin**); fullnode worktree `/private/tmp/fullnode-gas18` (branch `feat/gas-chain18`, off
-`feat/gas`). Both Phase 0 (v0.6.4, node policy, see the entry
+`feat/gas`). Both Phase 0 (the gas Phase 0 line, node policy, see the entry
 below) and Phase 1+2 ship in v0.6.6 — nothing here is live, nothing is cut, nothing is rolled.
 
 **What it is.** One column, one public value in the cpu AIR (`pv::GAS = 34`, `pv::NUM 34 → 35`):
@@ -97,10 +131,10 @@ old value now).
 - **A chain-18 build would have started on chain 16.** Constraint set 8 moves every verifier key
   again, but chain 16 pins guest v2, which this build still carries, so the `hc_bundle` check alone
   let it start there — its replay (or a `verify --repair`) would then refuse, and truncate, chain
-  16's history, on an archive the only full copy. `node::OLDER_CONSTRAINT_SET_CHAINS` now lists
-  chain 16 (set 7) beside 14 and 15 (set 6), refused at `run` and `verify`
-  (`a_constraint_set_8_build_refuses_chain_16`). No chain-17 genesis file is in this tree; add it
-  there when one is.
+  16's history, on an archive the only full copy. `node::CHAINS_THIS_BUILD_CANNOT_RUN` (v0.6.3's
+  list) names chain 16 with both reasons (cs7 and the wire) beside 14 and 15 (cs6) and, since the
+  rebase onto v0.6.4, chain 17 (cs7), refused at `run` and `verify`
+  (`a_constraint_set_8_build_refuses_chain_16`, `this_build_refuses_chains_14_to_17`).
 - **The cut's block cap is 20 MiB, so the byte target is 10 MiB — half the cap.** The first cut
   script said "half the 4 MiB soft cap" and set `target_block_bytes` 2 097 152, a tenth of the real
   `MAX_BLOCK_BYTES=20971520`: a full block would have been 10× the target. It is now
@@ -135,18 +169,29 @@ Run together, each taking the proving slot in turn: the chain-18 capstone
 `a_chain18_genesis_prices_calls_by_their_declared_limit` 1/1 in **2 634 s** (595 s alone — it
 waited on the slot), `wallet_flow` 7/7 in **2 517 s** (the delegated-prover send included).
 
+**Rebase gate (2026-09-29, onto v0.6.4 `b388540`, release profile, `RECURSION_FIXTURES` = `fx2`):**
+core lib 563; node lib 394 (+1 ignored); node bin 30; client lib 163; `rand` bin 17; genesis_cli 4;
+submit 2 (+1 ignored); ws 9; prover_hosted 5; prover_flag 3; split_auth 2 (183 s); prover crate
+all green; zkvm lib 25, `executor` 20/20 with `--skip measure` (the three stale failures listed
+above are gone — v0.6.3 fixed them), guest_provenance 9, auth_spike 4 + auth_cheating 3, shielded
+8, gas 15, hidden_cheating fast set 9, hidden_bundle 33; `a_dynamic_chain_decays…` 1/1 (18 s);
+`cargo check --workspace --tests --release` clean; the chain-18 capstone on the v3 genesis 1/1 in
+**935 s**, `wallet_flow` 9/9 in **2 247 s** (both under proving contention). Not run: the full
+`cluster` suite, `zusd_e2e`, hidden_cheating's 26 real proofs (~38 min).
+
 **Cut order** (not yet run): push circuits `feat/cs8-gas` to origin → final whole-branch review →
 tag (`v0.6.6` unless the line has moved — named in `deploy/cut-chain18-genesis.sh`'s header and
 `deploy/cutover-fleet-chain18.sh`'s `TAG` default, not the spec, which names no version) →
 `deploy/cut-chain18-genesis.sh` (26 validators,
-carries chain 16's bridge/tokens/supply snapshot forward, `hc_bundle` unchanged from chain 16's —
-cs8 changes only the STARK verifier key, not the hidden-asset guest's words) →
+carries chain 17's bridge/tokens/supply snapshot and operator RAND forward, `hc_bundle` v3 and
+`hc_auth` unchanged from chain 17's — cs8 changes only the STARK verifier key, not the guests'
+words) →
 `deploy/cutover-fleet-chain18.sh` all-stop/all-start (C, D first) → `deploy/chain18-bridge-steps.md`
 (relayer rebuilds `rand` first, its RPC tunnel repoints). Every client (wallet, randscan, the
 website) needs a cs8 rebuild before or with the cut, same rule as every prior verifier-key fork —
 none of the built work here changes that rule.
 
-### v0.6.4 — gas, Phase 0: the header-priced call floor (2026-09-28; never tagged on its own — ships inside v0.6.6)
+### gas, Phase 0: the header-priced call floor (2026-09-28; planned as v0.6.4 — that tag is chain 17's launch record — never tagged on its own, ships inside v0.6.6)
 
 Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md`, plan
 `…/plans/2026-09-28-gas-phase0-v0.6.4.md`. **Node policy only, any chain, rolls one node at a
