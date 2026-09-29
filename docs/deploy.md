@@ -684,7 +684,7 @@ Under `hardening_v6` a transaction carrying such a proof is `NonCanonicalProof` 
 apply (`ConfidentialExecutor::non_canonical_proof`, before either proof is verified). Every node
 already refuses it at its pool (`admission::non_canonical_proofs`), as a non-permanent Ignore.
 
-## The next cut: split authorisation (`--bundle-guest v3 --auth-guest`, v0.6.3)
+## The chain-17 cut: split authorisation (`--bundle-guest v3 --auth-guest`, v0.6.3; live 2026-09-29)
 
 Delegated proving Phase 2 (`docs/prover.md` §8, `docs/shielded.md` §2) is genesis-gated and a hard
 fork: `rand-node genesis --bundle-guest v3 --auth-guest` pins `hc_bundle`
@@ -699,9 +699,12 @@ chain-17 scripts).
 ## The next cut: the gas section (chain 18)
 
 Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md` §3.2–§4.3, §7.1. **Built on
-`feat/gas-chain18`, not yet cut** — see the AGENTS.md `chain 18` entry for the review traps and
-gate counts. Genesis `gas` (optional, absent from every chain up to and including 16 and hashed
-in only when present):
+`feat/gas-chain18`, not yet cut** — see the AGENTS.md v0.6.6 entry for the review traps and
+gate counts. Chain 18 follows chain 17 (live since 2026-09-29, v0.6.3): it carries chain 17's
+split authorisation (bundle guest v3 + `hc_auth`), its caps (4 MiB proofs, 20 MiB blocks — room for
+three proofs), its validators, bridge state and value, and adds the genesis `gas` section
+(optional, absent from every chain up to and including 17 and hashed in only when present, after
+`hc_auth`):
 
 ```json
 "gas": { "gas_price": "100", "byte_price": "800", "bundle_gas_limit": 20479, "metering": "circuit",
@@ -715,9 +718,11 @@ in only when present):
   ceiling (`docs/fees.md` §1.1).
 - **`bundle_gas_limit`** (exactly `20479`): every bundle proof's declared `GAS_LIMIT` must equal
   this exactly, or the proof is refused (`TxError::BundleGasLimit`, permanent). It must be
-  `gas_max(14, 0, 0) = 20479` for today's tier-14 hidden-asset (v2) guest, and genesis refuses any
-  other value (`GasConfig::check`, `gas::bundle_gas_limit_pin`) — any other value would mean no
-  real bundle could ever be admitted.
+  `gas_max(14, 0, 0) = 20479` for today's tier-14 hidden-asset guests (v1, v2 and chain 18's v3),
+  and genesis refuses any other value (`GasConfig::check`, `gas::bundle_gas_limit_pin`) — any
+  other value would mean no real bundle could ever be admitted. On a split-authorisation chain the
+  auth proof is pinned the same way with no field of its own: `gas_max(10, 0, 0) = 1279`
+  (`gas::auth_gas_limit_pin`, `TxError::AuthGasLimit`, permanent).
 - **`metering`**: only `"circuit"` parses; the field exists so a later metering scheme has a name.
 - **`dynamic`** (optional, Phase 2 — absent means the two starting prices never move):
   `target_block_bytes` (`1..=max_block_bytes`, the ledger's effective cap; half `max_block_bytes`
@@ -736,7 +741,8 @@ in only when present):
 
 **Constraint set 8 changes every verifier key** (the cpu AIR itself changes, `docs/confidential.md`
 "Constraint set 8"), so — like every prior constraint-set cut — this is **all-stop, all-start**, no
-mixed-fleet path: a v0.6.1 node cannot verify a cs8 proof and vice versa. **Clients and randscan
+mixed-fleet path: a v0.6.3 node cannot verify a cs8 proof and vice versa, and a v0.6.6 node refuses
+chains 14–17 by genesis hash (`node::CHAINS_THIS_BUILD_CANNOT_RUN`). **Clients and randscan
 rebuild against cs8 first**, same rule as constraint sets 5–7: a wallet or explorer built before
 the cut cannot prove or verify anything the new chain admits.
 
@@ -745,10 +751,18 @@ the cut cannot prove or verify anything the new chain admits.
 at all; the other three flags are meaningless without it, and default to `800`, `gas_max(14, 0,
 0)` and "off"). `rand-node genesis`/`init` print `gas: price P/gas, B/KiB, bundle limit N,
 dynamic: …` (or `gas: none`) on the finished file — the hash that matters, as with every gated
-section. `deploy/cut-chain18-genesis.sh` writes chain 18's testnet defaults (the JSON above) and
-asserts the section is present, `dynamic` is set with the right target/adjust/floor values, and no
-`aggregation` section rides beside it; `deploy/cutover-fleet-chain18.sh` is the all-stop/all-start
-roll; `deploy/chain18-bridge-steps.md` has the bridge relayer's own rebuild step.
+section. `deploy/cut-chain18-genesis.sh` is derived from `deploy/cut-chain17-genesis.sh` (the
+same snapshot → `balances` → cut, with chain 17 as the source: its live register, bridge, zUSD
+custody and the operator's RAND, scanned from the curated `~/.rand-chain17/alloc-wallets` through
+an SSH tunnel to obs1 with the v0.6.3 `rand`; the bridge emitters stay chain 17's — the endpoint
+redeploy waits); it writes chain 18's testnet defaults (the JSON above) and asserts the section is
+present, `dynamic` is set with the right target/adjust/floor values (the byte target half of
+`max_block_bytes`), the guests and `hc_auth` are chain 17's, and no `aggregation` section rides
+beside it. `SELFTEST=1` runs its assembly on fixtures; `DRY_RUN=1 NODE=… WALLET=…` runs the real
+cut path — `rand-node genesis` with the gas flags, `alloc-note`, both `init`s, which print the gas
+section — on inputs synthesised from `deploy/genesis-chain17.json`, into a temp dir.
+`deploy/cutover-fleet-chain18.sh` (from chain 17's) is the all-stop/all-start roll;
+`deploy/chain18-bridge-steps.md` has the bridge relayer's own rebuild step.
 
 ## The `staking` genesis section (v0.5.4)
 

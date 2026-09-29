@@ -382,6 +382,11 @@ Genesis `gas.dynamic` (optional inside the `gas` section; absent = the fixed pri
                       "adjust_bps": 1250, "min_gas_price": "100", "min_byte_price": "800" } }
 ```
 
+`target_block_bytes` is half of `max_block_bytes`: chain 18 keeps chain 17's 20 MiB blocks (the
+split-authorisation rule `max_block_bytes ≥ 3·max_proof_bytes + 1 MiB` at 4 MiB proofs), so
+10 485 760. A v3 transaction's auth proof adds nothing to `gas_used` — like the bundle's, its limit
+is pinned and unpriced (§4.3); its bytes count in `bytes_used` as every byte does.
+
 - **State.** The ledger holds `GasPrices { gas_price, byte_price }`, starting at the section's
   two prices, persisted beside `META_SUPPLY` (`META_GAS_PRICES`), replay-audited, and folded
   into the state root last under `rand-state-7` only when `dynamic` is present (the vesting
