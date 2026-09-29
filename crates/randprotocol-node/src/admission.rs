@@ -372,6 +372,8 @@ pub fn is_permanent(e: &TxError) -> bool {
             // Spec 2026-09-28 §4.3: a bundle proof's declared gas limit is its own bytes, against
             // the genesis `bundle_gas_limit`.
             | TxError::BundleGasLimit { .. }
+            // And an auth proof's, against the auth guest's fixed ceiling.
+            | TxError::AuthGasLimit { .. }
             | TxError::ProofTooLarge
             | TxError::AttestationTooLarge
             // fix-sync-stall's: the whole transaction is bigger than a block. A byte length is a
@@ -917,6 +919,8 @@ mod tests {
             // Spec 2026-09-28 §4.3: the proof's own declared limit against a genesis constant.
             TxError::BundleGasLimit { want: 20_479, got: Some(20_480) },
             TxError::BundleGasLimit { want: 20_479, got: None },
+            TxError::AuthGasLimit { want: 1_279, got: Some(1_280) },
+            TxError::AuthGasLimit { want: 1_279, got: None },
             TxError::TransactionTooLarge { size: 9_000_000, max: 4 << 20 },
             TxError::DuplicateNullifierInBundle,
             TxError::WrongChain { expected: 7, actual: 8 },

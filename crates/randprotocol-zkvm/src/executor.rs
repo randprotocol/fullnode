@@ -1291,6 +1291,14 @@ impl ConfidentialExecutor for ZkExecutor {
         Ok(Some(proof.public_values[pv::GAS]))
     }
 
+    /// Constraint set 8, split authorisation: `pv::GAS` of an auth proof decoded at the auth
+    /// guest's pinned shape (tier 10, its heights, no hash table) — a decode, no verification.
+    fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+        let (plh, ilh, pubh) = Self::auth_heights();
+        let p = self.decode_and_check(proof, plh, ilh, pubh, true, AUTH_TIER)?;
+        Ok(Some(p.public_values[pv::GAS]))
+    }
+
     fn verify_bundle(
         &self,
         hc_bundle: &Word8,
@@ -2238,6 +2246,9 @@ mod tests {
         assert_eq!(ZkExecutor::hc_auth(), crate::guests::auth().digest());
         assert!(!ZkExecutor::known_hc_bundles().contains(&ZkExecutor::hc_auth()), "not a bundle guest");
         assert_eq!(ZkExecutor::auth_heights().2, public::public_log_height(TX_BINDING_WORDS));
+        // Core's mirror of the auth tier, which prices the auth proof's gas pin.
+        assert_eq!(AUTH_TIER as u8, randprotocol_core::types::AUTH_PROOF_TIER);
+        assert_eq!(ex.auth_gas_limit(b"junk"), Err(ConfidentialError::MalformedProof));
         // Junk is refused by the cheap reader, never read as a `c`.
         assert_eq!(ex.auth_proof_digest(b"junk"), Err(ConfidentialError::MalformedProof));
         assert_eq!(ex.verify_auth(&ZkExecutor::hc_auth(), b"junk", &[0; 8]), Err(ConfidentialError::MalformedProof));

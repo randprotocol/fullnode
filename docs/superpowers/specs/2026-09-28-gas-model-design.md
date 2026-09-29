@@ -322,7 +322,13 @@ guest spends, and the ledger must never let it vary on chain. Rule: **a bundle p
 today's tier-14 guest), exactly, or the proof is refused. Every bundle then publishes the same
 value and the per-instruction schedule collapses to the flat `BUNDLE_BASE` it has today: a fixed
 price is the right price for a fixed program. The same holds for the aggregate (rVM) proof and
-for every bundle-less action; nothing outside `Call` changes.
+for every bundle-less action; nothing outside `Call` changes. On a split-authorisation chain
+(genesis `hc_auth`, v0.6.3 — chain 18 carries it) every bundle also carries an **auth proof**, and
+it is pinned the same way with no genesis field of its own: its `GAS_LIMIT` must equal
+`gas_max(10, 0, 0) = 1 279`, the auth guest's tier-10, hash-free ceiling
+(`gas::auth_gas_limit_pin`), or it is refused (`TxError::AuthGasLimit`, permanent) — checked
+before either proof is verified, like the bundle's (bundle guest v3 still lands at tier 14 with
+no hash table, so `bundle_gas_limit` stays 20 479).
 
 ## 5. Privacy
 

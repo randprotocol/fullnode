@@ -242,6 +242,12 @@ pub enum TxError {
     /// `auth_commit` — the spend key holder did not authorise this bundle.
     #[error("the auth proof publishes a different commitment than the bundle's auth_commit")]
     AuthMismatch,
+    /// Spec 2026-09-28 §4.3, split authorisation: on a chain with both a `gas` section and
+    /// `hc_auth`, an auth proof whose declared `GAS_LIMIT` (`pv::GAS`) is not exactly
+    /// [`gas::auth_gas_limit_pin`] — the auth guest's tier-10, hash-free ceiling. `got` is `None`
+    /// when the executor's proofs carry no limit at all.
+    #[error("auth proof declares gas limit {got:?}, this chain requires exactly {want}")]
+    AuthGasLimit { want: u64, got: Option<u64> },
     /// Split authorisation: the auth proof does not decode at the auth guest's pinned shape, or
     /// does not verify against the pinned auth guest and this transaction's binding.
     #[error("auth proof: {0}")]
@@ -1721,7 +1727,10 @@ impl Ledger {
 
     /// Split authorisation's cheap half: without genesis `hc_auth`, no auth field at all
     /// (`AuthUnexpected`); with it, an auth proof whose published `c` — read, not verified — is
-    /// the bundle's `auth_commit` (`AuthMissing`, `InvalidAuthProof`, `AuthMismatch`).
+    /// the bundle's `auth_commit` (`AuthMissing`, `InvalidAuthProof`, `AuthMismatch`), and, under
+    /// the `gas` section, whose declared `GAS_LIMIT` is exactly the auth guest's ceiling
+    /// (`AuthGasLimit`, spec 2026-09-28 §4.3). Every path runs this — admission, apply, a
+    /// verified-set hit, a pruned bundle — before either proof's verify, so a wrong limit buys none.
     fn check_auth_fields(&self, b: &Bundle, executor: &dyn ConfidentialExecutor) -> Result<(), TxError> {
         match self.hc_auth {
             None if b.auth_commit != [0; 8] || !b.auth_proof.is_empty() => Err(TxError::AuthUnexpected),
@@ -1731,6 +1740,13 @@ impl Ledger {
                 let c = executor.auth_proof_digest(&b.auth_proof).map_err(TxError::InvalidAuthProof)?;
                 if c != b.auth_commit {
                     return Err(TxError::AuthMismatch);
+                }
+                if self.gas.is_some() {
+                    let want = gas::auth_gas_limit_pin();
+                    let got = executor.auth_gas_limit(&b.auth_proof).map_err(TxError::InvalidAuthProof)?;
+                    if got != Some(want) {
+                        return Err(TxError::AuthGasLimit { want, got });
+                    }
                 }
                 Ok(())
             }
@@ -3157,11 +3173,15 @@ mod tests {
     struct CountingExecutor {
         bundles: std::sync::atomic::AtomicUsize,
         calls: std::sync::atomic::AtomicUsize,
+        auths: std::sync::atomic::AtomicUsize,
     }
 
     impl CountingExecutor {
         fn bundles(&self) -> usize {
             self.bundles.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn auths(&self) -> usize {
+            self.auths.load(std::sync::atomic::Ordering::SeqCst)
         }
         fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
@@ -3203,10 +3223,14 @@ mod tests {
             StubExecutor.auth_proof_digest(proof)
         }
         fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
+            self.auths.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             StubExecutor.verify_auth(hc_auth, proof, binding)
         }
         fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
             StubExecutor.bundle_gas_limit(proof)
+        }
+        fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            StubExecutor.auth_gas_limit(proof)
         }
         fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
             self.bundles.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4020,6 +4044,9 @@ mod tests {
         fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
             StubExecutor.bundle_gas_limit(proof)
         }
+        fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            StubExecutor.auth_gas_limit(proof)
+        }
         fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
             StubExecutor.verify_bundle(hc_bundle, proof, binding)
         }
@@ -4329,6 +4356,9 @@ mod tests {
         }
         fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
             StubExecutor.bundle_gas_limit(proof)
+        }
+        fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            StubExecutor.auth_gas_limit(proof)
         }
         fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
             StubExecutor.verify_bundle(hc_bundle, proof, binding)
@@ -5758,6 +5788,47 @@ mod tests {
         StubExecutor::with_bundle_gas(&mut t.bundle.as_mut().unwrap().proof, 1);
         assert!(plain.validate(&StubExecutor::bound(t), &StubExecutor).is_ok());
         assert!(plain.validate(&tx(&plain, [[70; 8], [71; 8]], [[72; 8], [73; 8]]), &NoGas).is_ok());
+    }
+
+    /// Spec §4.3 for the second proof a v3 (split-authorisation) transaction carries: under the gas
+    /// section the auth proof declares exactly the auth guest's tier-10, hash-free ceiling
+    /// (`gas::auth_gas_limit_pin`, 1 279) — checked before either proof's verify, and on the
+    /// verified-set (B5) path too, exactly like the bundle proof's `bundle_gas_limit`. A chain with
+    /// `hc_auth` but no gas section (chain 17) reads no limit at all.
+    #[test]
+    fn an_auth_proof_declaring_any_other_gas_limit_is_refused() {
+        let (a, _) = keys();
+        let mut l = v3_ledger();
+        l.set_gas(Some(gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: gas::bundle_gas_limit_pin(),
+            metering: gas::GasMetering::Circuit,
+            dynamic: None,
+        }));
+        assert_eq!(gas::auth_gas_limit_pin(), 1_279, "(2^10 − 1) + 2^8: tier 10, no hash table");
+        assert_eq!(gas::auth_gas_limit_pin(), crate::confidential::STUB_AUTH_GAS_LIMIT);
+        let ok = v3_tx(&l);
+        assert_eq!(l.validate(&ok, &StubExecutor), Ok(()), "the ceiling passes");
+        for other in [1_278u64, 1_280, 20_479, 1] {
+            let mut t = ok.clone();
+            StubExecutor::with_auth_gas(&mut t.bundle.as_mut().unwrap().auth_proof, other);
+            let t = StubExecutor::bound(t);
+            let want = Err(TxError::AuthGasLimit { want: 1_279, got: Some(other) });
+            assert_eq!(l.validate(&t, &StubExecutor), want, "{other}");
+            // A wrong limit buys no verify, of either proof.
+            let exec = CountingExecutor::default();
+            assert_eq!(l.validate(&t, &exec), want);
+            assert_eq!((exec.bundles(), exec.auths()), (0, 0), "refused before either verify");
+            // And the verified-set hit, which skips both verifies, still checks the limit.
+            let mut applied = l.clone();
+            assert_eq!(applied.apply_tx_with(&t, &a.address(), &StubExecutor, &Admitted::of(&[&t])).map(|_| ()), want);
+        }
+        // Without the gas section (chain 17's rules) the auth proof's limit is not read.
+        let plain = v3_ledger();
+        let mut t = v3_tx(&plain);
+        StubExecutor::with_auth_gas(&mut t.bundle.as_mut().unwrap().auth_proof, 1);
+        assert_eq!(plain.validate(&StubExecutor::bound(t), &StubExecutor), Ok(()));
     }
 
     /// Spec §7.1: a block's `gas_used` is Σ its calls' declared limits plus `bundle_gas_limit` per

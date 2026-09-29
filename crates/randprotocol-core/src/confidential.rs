@@ -168,6 +168,13 @@ pub trait ConfidentialExecutor: Send + Sync {
     fn bundle_gas_limit(&self, _proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
         Ok(None)
     }
+    /// Constraint set 8, split authorisation: the gas limit an auth proof declares (`pv::GAS`) —
+    /// a decode at the auth guest's pinned shape, not a verification: trusted only once
+    /// [`Self::verify_auth`] has accepted the same bytes. `None` (the default) is "this
+    /// executor's proofs carry no limit".
+    fn auth_gas_limit(&self, _proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+        Ok(None)
+    }
     /// Expensive: the STARK verification of a bundle proof against the pinned bundle guest (the
     /// hidden-asset guest since chain 14, `hc_bundle` in genesis), and
     /// against `binding` — the [`crate::types::Transaction::binding`] of the transaction the
@@ -254,11 +261,17 @@ const STUB_AGGREGATE_TAG: &[u8] = b"rand-stub-aggregate-bound";
 /// Where the binding words start inside a stub bundle proof.
 const STUB_BUNDLE_BINDING: usize = 4 + 32 + 8;
 /// Stub auth proof: `auth:` || the 32-byte `c` || blake3("rand-stub-auth", hc_auth bytes)[..8] ||
-/// the 8 binding words (32 bytes, little-endian) — [`STUB_BUNDLE_LEN`]'s layout under its own tag.
+/// the 8 binding words (32 bytes, little-endian) || the declared gas limit (8 bytes, little-endian)
+/// — [`STUB_BUNDLE_LEN`]'s layout under its own tag.
 const STUB_AUTH_MARKER: &[u8; 5] = b"auth:";
-const STUB_AUTH_LEN: usize = 5 + 32 + 8 + 32;
+const STUB_AUTH_LEN: usize = 5 + 32 + 8 + 32 + 8;
 /// Where the binding words start inside a stub auth proof.
 const STUB_AUTH_BINDING: usize = 5 + 32 + 8;
+/// Where the gas limit starts inside a stub auth proof: its last eight bytes.
+const STUB_AUTH_GAS: usize = STUB_AUTH_BINDING + 32;
+/// The gas limit a stub auth proof declares unless a test chooses one: `gas_max(10, 0, 0)`,
+/// what every real auth proof declares (tier 10, no hash table).
+pub const STUB_AUTH_GAS_LIMIT: u64 = 1_279;
 /// Where the gas limit starts inside a stub bundle proof: its last eight bytes.
 const STUB_BUNDLE_GAS: usize = STUB_BUNDLE_BINDING + 32;
 
@@ -333,7 +346,16 @@ impl StubExecutor {
         v.extend_from_slice(&word8_to_bytes(c));
         v.extend_from_slice(&Hash::digest_domain(b"rand-stub-auth", &word8_to_bytes(hc_auth)).0[..8]);
         v.extend_from_slice(&word8_to_bytes(binding));
+        v.extend_from_slice(&STUB_AUTH_GAS_LIMIT.to_le_bytes());
         v
+    }
+
+    /// Rewrite the gas limit a stub auth proof declares, as [`Self::with_bundle_gas`] does a
+    /// bundle proof's. Anything that is not a well-formed stub auth proof is left untouched.
+    pub fn with_auth_gas(proof: &mut Vec<u8>, gas_limit: u64) {
+        if proof.len() == STUB_AUTH_LEN && &proof[..5] == STUB_AUTH_MARKER {
+            proof[STUB_AUTH_GAS..].copy_from_slice(&gas_limit.to_le_bytes());
+        }
     }
 
     /// Rewrite the gas limit a stub bundle proof declares. Anything that is not a well-formed
@@ -360,7 +382,7 @@ impl StubExecutor {
                 b.proof[STUB_BUNDLE_BINDING..STUB_BUNDLE_GAS].copy_from_slice(&binding);
             }
             if b.auth_proof.len() == STUB_AUTH_LEN && &b.auth_proof[..5] == STUB_AUTH_MARKER {
-                b.auth_proof[STUB_AUTH_BINDING..].copy_from_slice(&binding);
+                b.auth_proof[STUB_AUTH_BINDING..STUB_AUTH_GAS].copy_from_slice(&binding);
             }
         }
     }
@@ -529,7 +551,7 @@ impl ConfidentialExecutor for StubExecutor {
         if &proof[37..STUB_AUTH_BINDING] != expected {
             return Err(ConfidentialError::WrongProgram);
         }
-        if proof[STUB_AUTH_BINDING..] != word8_to_bytes(binding) {
+        if proof[STUB_AUTH_BINDING..STUB_AUTH_GAS] != word8_to_bytes(binding) {
             return Err(ConfidentialError::InvalidProof("PublicValues".into()));
         }
         Ok(c)
@@ -538,6 +560,11 @@ impl ConfidentialExecutor for StubExecutor {
     fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
         self.bundle_proof_digest(&[0; 8], proof)?;
         Ok(Some(u64::from_le_bytes(proof[STUB_BUNDLE_GAS..].try_into().expect("8 bytes"))))
+    }
+
+    fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+        self.auth_proof_digest(proof)?;
+        Ok(Some(u64::from_le_bytes(proof[STUB_AUTH_GAS..].try_into().expect("8 bytes"))))
     }
 
     fn verify_bundle(

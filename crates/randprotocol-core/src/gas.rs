@@ -186,6 +186,14 @@ pub fn bundle_gas_limit_pin() -> u64 {
     gas_max(crate::types::BUNDLE_PROOF_TIER, 0, 0)
 }
 
+/// The `GAS_LIMIT` every auth proof (split authorisation) must declare on a chain with a `gas`
+/// section: the auth guest's header ceiling `gas_max(AUTH_PROOF_TIER, 0, 0)` = 1 279 — the auth
+/// proof is pinned to tier 10 with no hash tables, and the auth prover declares the ceiling
+/// (the machine's default). A fixed rule, not a genesis field: there is exactly one honest value.
+pub fn auth_gas_limit_pin() -> u64 {
+    gas_max(crate::types::AUTH_PROOF_TIER, 0, 0)
+}
+
 /// A node's gas prices (spec §4.1, Phase 0): admission policy, not a ledger rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GasPolicy {

@@ -355,6 +355,10 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.bundle_gas_limit(proof)
     }
 
+    fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+        self.inner.auth_gas_limit(proof)
+    }
+
     fn verify_bundle(
         &self,
         hc_bundle: &Word8,
@@ -696,6 +700,11 @@ mod tests {
         let record = ProgramRecord { id: randprotocol_core::Hash::digest(b"p"), base_pc: 0, words: vec![0x13; 4], code_hash: vec![0; 32], deployed_at: 0, public_digest: None, public_len: 0 };
         assert_eq!(w.verify_call_hardened(&record, b"junk", &[0; 8]), zk.verify_call_hardened(&record, b"junk", &[0; 8]));
         assert_eq!(w.decode_call_hardened(&record, b"junk", &[0; 8]), Err(ConfidentialError::MalformedProof));
+        // Constraint set 8's decodes: the trait defaults answer `Ok(None)` ("no limit"), which
+        // under a gas section refuses every honest proof — the zkVM decodes the bytes.
+        assert_eq!(w.bundle_gas_limit(b"junk"), zk.bundle_gas_limit(b"junk"));
+        assert_eq!(w.auth_gas_limit(b"junk"), zk.auth_gas_limit(b"junk"));
+        assert!(w.auth_gas_limit(b"junk").is_err(), "not the trait default");
     }
 
     /// The registered artifact (spec §2.3): the wrapper's digest is the rVM's own

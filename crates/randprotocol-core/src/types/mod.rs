@@ -45,6 +45,13 @@ pub struct DeclaredShape {
 /// (the interface review's IFACE-9): no bundle a chain accepts can have another.
 pub const BUNDLE_PROOF_TIER: u8 = 14;
 
+/// The one tier an auth proof (split authorisation, v0.6.3) may declare —
+/// `randprotocol_zkvm::executor`'s `AUTH_TIER`: the auth guest is straight-line, so every witness
+/// lands at tier 10, and it issues no hash syscall, so neither optional table is declared
+/// (`decode_and_check` pins both). Mirrored because core cannot name the zkVM; the zkvm
+/// executor's tests pin mirror == the real constant.
+pub const AUTH_PROOF_TIER: u8 = 10;
+
 /// The one public-table height a bundle proof may declare: the transaction binding's
 /// ([`TX_BINDING_WORDS`] words) `public_log_height`, pinned by `decode_and_check` since the
 /// transaction binding (Task 5b). Mirrored like [`BUNDLE_PROOF_TIER`]; the node's

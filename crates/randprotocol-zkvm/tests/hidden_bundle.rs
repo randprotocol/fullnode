@@ -1217,6 +1217,37 @@ fn a_v3_bundle_proof_declares_the_bundle_gas_pin() {
     assert_eq!(ex.verify_bundle(&hc3, &proof, &BINDING_A), Ok(()));
 }
 
+/// Constraint set 8 on split authorisation's second proof: the auth guest proves at tier 10 with
+/// no hash table and declares its header's ceiling, `gas::auth_gas_limit_pin` = `gas_max(10, 0, 0)`
+/// = 1 279 — what chain 18's ledger requires of every auth proof under a `gas` section
+/// (`TxError::AuthGasLimit`). `prove_auth` passes no limit, so the machine's default (the ceiling)
+/// is what wallets write; the zkVM's `auth_gas_limit` decode reads it back at the auth guest's
+/// pinned shape, and refuses a bundle proof.
+#[test]
+fn an_auth_proof_declares_the_auth_gas_pin() {
+    use randprotocol_core::confidential::ConfidentialExecutor;
+    let c = mixed();
+    let started = std::time::Instant::now();
+    let (auth_proof, c_pub, auth_tier) =
+        randprotocol_zkvm::executor::prove_auth(FriProfile::Test, &c.sk, &c.salt, &BINDING_A, Backend::Cpu).unwrap();
+    println!("auth proved at tier {auth_tier} in {:.1?} ({} proof bytes)", started.elapsed(), auth_proof.len());
+    assert_eq!(c_pub, c.claimed_v3().auth_commit);
+    let decoded = randprotocol_zkvm::executor::decode_canonical(&auth_proof).unwrap();
+    assert_eq!((decoded.tier, decoded.keccak_log_height, decoded.sha256_log_height), (Tier(10), 0, 0));
+    assert_eq!(auth_tier, randprotocol_core::types::AUTH_PROOF_TIER);
+    assert_eq!(decoded.public_values[randprotocol_zkvm::tables::cpu::pv::GAS], randprotocol_core::gas::auth_gas_limit_pin());
+    assert_eq!(randprotocol_core::gas::auth_gas_limit_pin(), 1_279);
+    let ex = ZkExecutor::new(FriProfile::Test);
+    assert_eq!(ex.auth_gas_limit(&auth_proof).unwrap(), Some(1_279));
+    assert_eq!(ex.verify_auth(&ZkExecutor::hc_auth(), &auth_proof, &BINDING_A), Ok(c_pub));
+    // The auth decode is the auth guest's pinned shape: the same proof declaring another tier is
+    // refused before its limit is read.
+    let mut other = randprotocol_zkvm::executor::decode_canonical(&auth_proof).unwrap();
+    other.tier = Tier(12);
+    other.public_values[randprotocol_core::types::pv::TIER] = 12;
+    assert!(ex.auth_gas_limit(&other.to_bytes()).is_err());
+}
+
 
 /// The proof size a chain-16 genesis (`--bundle-guest v2`) has to admit, measured rather than
 /// assumed: a mixed transfer under the branch-free guest at the **Production** FRI profile the

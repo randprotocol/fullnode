@@ -1915,6 +1915,9 @@ mod admission_tests {
             fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
                 StubExecutor.bundle_gas_limit(proof)
             }
+            fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+                StubExecutor.auth_gas_limit(proof)
+            }
             fn verify_bundle(&self, hc: &Word8, proof: &[u8], binding: &[u32; crate::types::TX_BINDING_WORDS]) -> Result<(), ConfidentialError> {
                 StubExecutor.verify_bundle(hc, proof, binding)
             }
