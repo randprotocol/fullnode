@@ -884,6 +884,19 @@ fn parse_word8(params: &Value, idx: usize, name: &str) -> Result<randprotocol_co
         .ok_or_else(|| RpcError::invalid_params(format!("{name} must be 64 hex characters")))
 }
 
+/// A viewing key's `nk` from `params[idx]`, as [`parse_word8`] reads a word, but with the hex
+/// string and the parsed words each wiped when dropped (issue #65): the three viewing-key methods
+/// then leave no copy of the key behind on their own account. What remains outside this function
+/// is the request's own `serde_json::Value` (the hex text, freed with the request, not wiped), the
+/// by-value copy handed to `Registry::import` (moved into the zeroised `Import`), and whatever
+/// copies the vendored `ViewingKey` (a `Copy` type) makes while it trial-decrypts.
+fn parse_viewing_key(params: &Value, idx: usize) -> Result<zeroize::Zeroizing<randprotocol_core::Word8>, RpcError> {
+    let s: zeroize::Zeroizing<String> = zeroize::Zeroizing::new(param(params, idx, "viewing_key")?);
+    randprotocol_core::notes::word8_from_hex(s.strip_prefix("0x").unwrap_or(&s))
+        .map(zeroize::Zeroizing::new)
+        .ok_or_else(|| RpcError::invalid_params("viewing_key must be 64 hex characters"))
+}
+
 /// A note as the viewing-key methods report it. The amount is a **string**, like every amount
 /// this RPC serves as chain state (`getValidators`, `getSupply`): a note's amount is a u64 a
 /// JSON number cannot hold past 2^53, and these rows exist to be summed.
@@ -1796,7 +1809,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // in memory only; a restart clears them.
         "rand_importViewingKey" => {
             require_loopback(st, "rand_importViewingKey")?;
-            let nk = parse_word8(p, 0, "viewing_key")?;
+            let nk = parse_viewing_key(p, 0)?;
             let rescan_from_height: u64 = match p.get(1) {
                 None | Some(Value::Null) => 0,
                 Some(_) => param(p, 1, "rescan_from_height")?,
@@ -1807,7 +1820,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // scan never reads — let alone trial-decrypts — anything earlier.
                 let start = storage.first_note_at_or_after(rescan_from_height)?;
                 let mut reg = viewing.write().unwrap_or_else(|e| e.into_inner());
-                let imported = reg.import(nk, rescan_from_height, start)?;
+                let imported = reg.import(*nk, rescan_from_height, start)?;
                 Ok(json!({ "imported": imported, "rescan_from_height": rescan_from_height, "viewing_keys": reg.len() }))
             })
             .await
@@ -1817,7 +1830,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // request can never make the node re-walk unbounded history.
         "rand_getViewingNotes" => {
             require_loopback(st, "rand_getViewingNotes")?;
-            let nk = parse_word8(p, 0, "viewing_key")?;
+            let nk = parse_viewing_key(p, 0)?;
             let from_index: u64 = match p.get(1) {
                 None | Some(Value::Null) => 0,
                 Some(_) => param(p, 1, "from_index")?,
@@ -1869,7 +1882,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // process's life (audit v3, VK-2).
         "rand_removeViewingKey" => {
             require_loopback(st, "rand_removeViewingKey")?;
-            let nk = parse_word8(p, 0, "viewing_key")?;
+            let nk = parse_viewing_key(p, 0)?;
             let mut reg = st.viewing.write().unwrap_or_else(|e| e.into_inner());
             let removed = reg.remove(&nk);
             Ok(json!({ "removed": removed, "viewing_keys": reg.len() }))

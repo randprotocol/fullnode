@@ -277,6 +277,11 @@ Params: `[viewing_key]`. Reply: `{"removed": bool, "viewing_keys": n}` — `remo
 the node was not holding that key. The import's scan state goes with it, its slot is freed, and
 the key is zeroised in memory. Loopback only, like the other two.
 
+The registry is keyed by a one-way id of the key (`blake3("rand-viewing-registry-id-1" ‖ nk)`),
+never by `nk` itself, so the only long-lived copy of the key is the import that removal zeroises
+(issue #65), and the three viewing methods parse the key into buffers wiped on drop. Not wiped:
+the request's own JSON text, and transient copies the trial decryption makes.
+
 ### `rand_getViewingNotes`
 Params: `[viewing_key]` or `[viewing_key, from_index, limit]` — `from_index` pages the matched
 notes by leaf index (default 0), `limit` caps the page (default and maximum 1000, as everywhere).
