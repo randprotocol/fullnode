@@ -1217,6 +1217,24 @@ fn a_v3_bundle_proof_declares_the_bundle_gas_pin() {
     assert_eq!(ex.verify_bundle(&hc3, &proof, &BINDING_A), Ok(()));
 }
 
+/// The chain-18 capstone's forged bundle (`tests/cluster.rs`, step 4) on a v3 chain:
+/// `prove_bundle_for_with_limit` proves bundle guest v3 on its own 1 212-word witness — it used to
+/// require v1/v2's 1 204 whatever the guest — and the proof declares the limit asked for (one
+/// under the pin here), still verifying: only the chain's `bundle_gas_limit` pin refuses it.
+#[test]
+fn a_v3_bundle_proved_with_another_limit_declares_it_and_verifies() {
+    use randprotocol_core::confidential::ConfidentialExecutor;
+    let c = mixed();
+    let hc3 = ZkExecutor::hc_hidden_bundle_v3();
+    let limit = randprotocol_core::gas::bundle_gas_limit_pin() - 1;
+    let (proof, digest, tier) = randprotocol_zkvm::executor::prove_bundle_for_with_limit(&hc3, FriProfile::Test, &c.inputs_v3(), &BINDING_A, limit)
+        .expect("a v3 witness proves under a chosen limit");
+    assert_eq!((digest, tier), (hidden::hidden_bundle_digest_v3(&c.claimed_v3()), 14));
+    let ex = ZkExecutor::new(FriProfile::Test);
+    assert_eq!(ex.bundle_gas_limit(&proof).unwrap(), Some(limit));
+    assert_eq!(ex.verify_bundle(&hc3, &proof, &BINDING_A), Ok(()));
+}
+
 /// Constraint set 8 on split authorisation's second proof: the auth guest proves at tier 10 with
 /// no hash table and declares its header's ceiling, `gas::auth_gas_limit_pin` = `gas_max(10, 0, 0)`
 /// = 1 279 — what chain 18's ledger requires of every auth proof under a `gas` section

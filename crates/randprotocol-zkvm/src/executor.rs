@@ -1715,8 +1715,10 @@ pub fn prove_bundle_for_with_limit(
 ) -> Result<(Vec<u8>, Word8, u8), String> {
     let program = ZkExecutor::bundle_program_for(hc)
         .ok_or_else(|| format!("this build cannot prove for the bundle guest {}", randprotocol_core::notes::word8_to_hex(hc)))?;
-    if inputs.len() != crate::hidden::hidden_input::COUNT {
-        return Err(format!("hidden bundle inputs must be exactly {} words, got {}", crate::hidden::hidden_input::COUNT, inputs.len()));
+    // Each guest's own witness width: v3 (split authorisation) reads 1 212 words, v1/v2 1 204.
+    let words = ZkExecutor::bundle_input_words(hc);
+    if inputs.len() != words {
+        return Err(format!("hidden bundle inputs must be exactly {words} words, got {}", inputs.len()));
     }
     let opts = crate::machine::ProveOptions { gas_limit: Some(gas_limit), ..Default::default() };
     let (proof, exec) = Machine::new(profile).prove_with_options(program, inputs, binding, None, opts).map_err(|e| format!("{e:?}"))?;

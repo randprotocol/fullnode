@@ -2531,12 +2531,16 @@ async fn a_chain_15_shaped_genesis_commits_mints_only_to_the_allowlist_and_syncs
 // ---------------------------------------------------------------- chain 18: the gas section
 //
 // The capstone of the gas model's Phase 1 + Phase 2 (spec 2026-09-28 §10, §11): a three-node
-// cluster on a genesis shaped exactly as `deploy/cut-chain18-genesis.sh` cuts it — `hardening_v6`,
-// the branch-free bundle guest, and the `gas` section with the dynamic controller at the cut's
-// numbers — carrying real proofs end to end.
+// cluster on a genesis shaped exactly as `deploy/cut-chain18-genesis.sh` cuts it — chain 17's
+// split authorisation (`hardening_v6`, bundle guest v3 + `hc_auth`, 4 MiB proofs in 20 MiB blocks)
+// and the `gas` section with the dynamic controller at the cut's numbers — carrying real proofs
+// end to end.
 
-/// The cut script's block cap, `MAX_BLOCK_BYTES=20971520` (20 MiB).
+/// The cut script's block cap, `MAX_BLOCK_BYTES=20971520` (20 MiB) — chain 17's.
 const CHAIN18_MAX_BLOCK_BYTES: u32 = 20 << 20;
+/// The cut script's proof cap, `MAX_PROOF_BYTES=4194304` (4 MiB) — chain 17's: three proofs (bundle,
+/// auth, call) fit a block with 1 MiB to spare, as `Genesis::validate` requires under `hc_auth`.
+const CHAIN18_MAX_PROOF_BYTES: u32 = 4 << 20;
 
 /// The cut script's `gas` section: `--gas-price 100 --byte-price 800 --bundle-gas-limit 20479
 /// --gas-dynamic 10485760,262144,1250` (the byte target half the 20 MiB cap), the floors at the
@@ -2557,12 +2561,15 @@ fn chain18_gas() -> gas::GasConfig {
     }
 }
 
-/// [`genesis_funding`] reshaped as chain 18: `hardening_v6`, bundle guest v2, the cut's 20 MiB
-/// block cap, and `gas`. No `aggregation` section.
+/// [`genesis_funding`] reshaped as chain 18: chain 17's `hardening_v6`, bundle guest v3 and
+/// `hc_auth` (split authorisation), its 4 MiB proof and 20 MiB block caps, and `gas`. No
+/// `aggregation` section.
 fn genesis_chain18(validators: &[Keypair], funded: &[&Wallet], gas: Option<gas::GasConfig>) -> Genesis {
     let mut gen = genesis_funding(validators, funded);
     gen.hardening_v6 = Some(true);
-    gen.hc_bundle = word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2());
+    gen.hc_bundle = word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3());
+    gen.hc_auth = Some(word8_to_hex(&ZkExecutor::hc_auth()));
+    gen.max_proof_bytes = Some(CHAIN18_MAX_PROOF_BYTES);
     gen.max_block_bytes = Some(CHAIN18_MAX_BLOCK_BYTES);
     gen.gas = gas;
     gen
@@ -2690,7 +2697,9 @@ async fn a_chain18_genesis_prices_calls_by_their_declared_limit() {
     assert_eq!(limits.adjust_bps, Some(1250));
     assert_eq!((limits.gas_price, limits.byte_price), (Some(100), Some(800)));
     let status = n0.rpc.status().await.unwrap();
-    assert_eq!(status["hc_bundle"], word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2()), "bundle guest v2");
+    assert_eq!(status["hc_bundle"], word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), "bundle guest v3");
+    assert_eq!(status["hc_auth"], word8_to_hex(&ZkExecutor::hc_auth()), "split authorisation, as on chain 17");
+    assert_eq!(limits.max_proof_bytes, CHAIN18_MAX_PROOF_BYTES as usize);
     assert_eq!(status["gas_prices"]["gas_price"], "100", "{status}");
     assert_eq!(status["gas_prices"]["byte_price"], "800", "{status}");
 
@@ -2706,6 +2715,10 @@ async fn a_chain18_genesis_prices_calls_by_their_declared_limit() {
     let bundle_limit = declared_gas_of(&tx.bundle.as_ref().unwrap().proof);
     eprintln!("1. transfer {} committed: tier {}, proved in {:.1?}, bundle GAS_LIMIT {bundle_limit}", sent.hash, sent.tier, sent.proving);
     assert_eq!(bundle_limit, pin, "an honest bundle declares exactly bundle_gas_limit");
+    let auth = &tx.bundle.as_ref().unwrap().auth_proof;
+    assert!(!auth.is_empty(), "a v3 transfer carries its auth proof");
+    assert_eq!(declared_gas_of(auth), gas::auth_gas_limit_pin(), "and the auth proof declares exactly its pin, 1 279");
+    assert_eq!(gas::auth_gas_limit_pin(), 1_279);
     for n in nodes {
         wait_for("the transfer reaches every node", Duration::from_secs(60), || n.handle.storage.tx_location(&sent.hash).unwrap().is_some()).await;
     }
