@@ -163,12 +163,16 @@ fn the_auth_guest_is_pinned() {
 /// (`guests::bundle_hidden()`); chains 6–13 pin the retired 2-in-2-out guest, which still
 /// assembles from this crate's source (`ZkExecutor::legacy_bundle_program`). A file whose
 /// `hc_bundle` is neither is a genesis this build could not have cut. Chains 14 and 15 pin v1
-/// exactly; a later file may name v1 or the branch-free v2 (`bundle_hidden_v2()`).
+/// exactly; a later file may name v1 or the branch-free v2 (`bundle_hidden_v2()`), and from chain
+/// 17 on the split-authorisation v3 (`bundle_hidden_v3()`) — whose file must then name this
+/// source's auth guest as `hc_auth` too (and a file naming `hc_auth` must pin v3).
 #[test]
 fn every_genesis_files_bundle_guest_is_the_one_this_source_assembles() {
     let hidden = word8_to_hex(&ZkExecutor::hc_bundle());
     let branch_free = word8_to_hex(&ZkExecutor::hc_hidden_bundle_v2());
     let legacy = word8_to_hex(&ZkExecutor::hc_legacy_bundle());
+    let split = word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3());
+    let auth = word8_to_hex(&ZkExecutor::hc_auth());
     let deploy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy");
     let mut checked = BTreeSet::new();
     for entry in std::fs::read_dir(&deploy).unwrap() {
@@ -181,6 +185,13 @@ fn every_genesis_files_bundle_guest_is_the_one_this_source_assembles() {
         let Some(pin) = genesis.get("hc_bundle").and_then(|v| v.as_str()) else {
             continue;
         };
+        let hc_auth = genesis.get("hc_auth").and_then(|v| v.as_str());
+        assert_eq!(hc_auth.is_some(), pin == split, "{name}: hc_auth and bundle guest v3 come as a pair");
+        if chain >= 17 && pin == split {
+            assert_eq!(hc_auth, Some(auth.as_str()), "{name}'s hc_auth is not auth()'s digest");
+            checked.insert(chain);
+            continue;
+        }
         if chain >= 16 && pin == branch_free {
             checked.insert(chain);
             continue;
@@ -190,4 +201,5 @@ fn every_genesis_files_bundle_guest_is_the_one_this_source_assembles() {
         checked.insert(chain);
     }
     assert!(checked.contains(&14) && checked.contains(&15), "chains 14 and 15 must be among the files checked: {checked:?}");
+    assert!(checked.contains(&17), "chain 17 (the first v3 + hc_auth genesis) must be among the files checked: {checked:?}");
 }
