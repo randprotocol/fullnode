@@ -203,11 +203,11 @@ fn envelope_at(v: &Value) -> Result<Envelope> {
 }
 
 /// The chain ids of every public chain whose genesis carries no `envelope_bytes` (issue #64):
-/// chains 14–18 (18: the gas chain, cut without the memo rule, which waits for the v1.0 genesis), every chain that ran a build able to seal the memo form. Chains before 14 are
+/// chains 14–17, every chain that ran a build able to seal the memo form. Chains before 14 are
 /// retired and their data deleted fleet-wide, so nothing admits a transaction for them. **Every
 /// chain cut without `envelope_bytes` is added here** — `every_committed_genesis_without_
 /// envelope_bytes_is_pinned` fails until it is.
-pub const LEGACY_ENVELOPE_CHAIN_IDS: &[u64] = &[14, 15, 16, 17, 18];
+pub const LEGACY_ENVELOPE_CHAIN_IDS: &[u64] = &[14, 15, 16, 17];
 
 /// The envelope format for a transaction on `chain_id` given the node's `envelope_bytes` claim:
 /// [`EnvelopeFormat::Legacy`] on a chain id pinned in [`LEGACY_ENVELOPE_CHAIN_IDS`] whatever the
