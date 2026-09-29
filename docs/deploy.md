@@ -704,7 +704,13 @@ gate counts. Chain 18 follows chain 17 (live since 2026-09-29, v0.6.3): it carri
 split authorisation (bundle guest v3 + `hc_auth`), its caps (4 MiB proofs, 20 MiB blocks — room for
 three proofs), its validators, bridge state and value, and adds the genesis `gas` section
 (optional, absent from every chain up to and including 17 and hashed in only when present, after
-`hc_auth`):
+`hc_auth`). **Chain 18 also turns the encrypted memo on** (the user's ruling): the cut passes
+`--envelope-bytes 1860` (the v0.5.10 field — every note-creating envelope exactly 1 860 B,
+`rand_getLimits.envelope_bytes == 1860`, wallets seal the memo form). `rand-node genesis
+--envelope-bytes` seals its own `--alloc` notes in that form; the zUSD carry notes come from
+`rand-node alloc-note --envelope-bytes 1860` (without the flag it writes the legacy 1 348-B form,
+which the genesis refuses), and the cut asserts the field and every alloc note's 1 860 B. The gas
+section:
 
 ```json
 "gas": { "gas_price": "100", "byte_price": "800", "bundle_gas_limit": 20479, "metering": "circuit",
@@ -757,7 +763,8 @@ custody and the operator's RAND, scanned from the curated `~/.rand-chain17/alloc
 an SSH tunnel to obs1 with the v0.6.3 `rand`; the bridge emitters stay chain 17's — the endpoint
 redeploy waits); it writes chain 18's testnet defaults (the JSON above) and asserts the section is
 present, `dynamic` is set with the right target/adjust/floor values (the byte target half of
-`max_block_bytes`), the guests and `hc_auth` are chain 17's, and no `aggregation` section rides
+`max_block_bytes`), `envelope_bytes` is 1860 with every genesis note in that form, the guests and
+`hc_auth` are chain 17's, and no `aggregation` section rides
 beside it. `SELFTEST=1` runs its assembly on fixtures; `DRY_RUN=1 NODE=… WALLET=…` runs the real
 cut path — `rand-node genesis` with the gas flags, `alloc-note`, both `init`s, which print the gas
 section — on inputs synthesised from `deploy/genesis-chain17.json`, into a temp dir.

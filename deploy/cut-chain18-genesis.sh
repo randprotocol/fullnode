@@ -44,6 +44,14 @@
 #     Constraint set 8 changes every verifier key: a v0.6.6 node refuses chains 14–17 at startup and
 #     a v0.6.3 node verifies no chain-18 proof — so the roll is all-stop/all-start
 #     (deploy/cutover-fleet-chain18.sh), and wallets/randscan ship at cs8 before the cut.
+#   * THE ENCRYPTED MEMO ON (the user's ruling for chain 18): `--envelope-bytes 1860`, the v0.5.10
+#     field — every note-creating envelope exactly 1 860 B (`note ‖ 512-B memo field`), genesis
+#     allocs included, so `rand_getLimits.envelope_bytes == 1860` and wallets seal the memo form.
+#     `rand-node genesis --envelope-bytes` seals its own `--alloc` notes that way; the zUSD carry
+#     notes come from `rand-node alloc-note --envelope-bytes 1860` (without the flag alloc-note
+#     writes the legacy 1 348-B form, which such a genesis refuses). Asserted on the finished file:
+#     the field is 1860 and every alloc note's envelope is 1 860 B. A memo is hostile text on every
+#     chain — every surface sanitises it (AGENTS.md v0.5.10).
 #   * The genesis MUST NOT carry an `aggregation` section beside `gas.dynamic`
 #     (`GenesisError::DynamicGasWithAggregation`); asserted below.
 #   * The 26 validators chain 17 runs, on the same keys (the 18 of $VALIDATORS_TSV and the 8 of
@@ -167,13 +175,15 @@ BUNDLE_GAS_LIMIT=${BUNDLE_GAS_LIMIT:-20479}
 # and an empty one move byte_price by the same 12.5%; next_price also caps `used` at 2·target), 2^18
 # gas, 12.5% a step; the floors are the starting prices above (rand-node genesis's own rule).
 GAS_DYNAMIC=${GAS_DYNAMIC:-$((MAX_BLOCK_BYTES / 2)),262144,1250}
+# The encrypted memo (v0.5.10, spec 2026-09-26 §2.4): every note envelope exactly this many bytes.
+ENVELOPE_BYTES=${ENVELOPE_BYTES:-1860}
 
 export CHAIN_ID CHAIN17_GENESIS CHAIN17_HASH CHAIN17_GENESIS_SHA256 CHAIN17_RPC VALIDATORS_TSV REGISTRATIONS BONDED GENESIS_NAMES \
   FAUCET_MINTERS FAUCET_RECIPIENTS STAKE_RAND ALLOC_ADDRESSES ZUSD_CARRY WALLETS_DIRS RELAYER_DONE_DIR EXPECT_HC_BUNDLE \
   EXPECT_HC_AUTH MAX_PROGRAM_WORDS MAX_PROOF_BYTES MAX_BLOCK_BYTES MAX_CALL_ENVELOPE_BYTES \
   MAX_PROGRAM_PUBLIC_WORDS EPOCH_BLOCKS EMITTER_2 EMITTER_3 EMITTER_4 EMITTER_5 C17_EMITTER_2 C17_EMITTER_3 \
   C17_EMITTER_4 C17_EMITTER_5 MIN_INBOUND_2 MIN_INBOUND_3 MIN_INBOUND_4 MIN_INBOUND_5 ETH_RPC BSC_RPC \
-  TRON_API SOL_RPC SOL_PROGRAM GAS_PRICE BYTE_PRICE BUNDLE_GAS_LIMIT GAS_DYNAMIC
+  TRON_API SOL_RPC SOL_PROGRAM GAS_PRICE BYTE_PRICE BUNDLE_GAS_LIMIT GAS_DYNAMIC ENVELOPE_BYTES
 
 # Decimal RAND/zUSD text → base units, the exact rule of `parse_amount` (no float anywhere).
 # shellcheck disable=SC2089,SC2090  # python source in a string, exported whole, never word-split
@@ -788,7 +798,13 @@ need(re.fullmatch(r"[0-9a-f]{64}", g.get("hc_auth") or ""), "hc_auth is missing 
 need(g["hc_auth"] == E["EXPECT_HC_AUTH"], f"hc_auth {g['hc_auth']} is not EXPECT_HC_AUTH {E['EXPECT_HC_AUTH']}")
 need(g["hc_auth"] == g17.get("hc_auth"), "hc_auth differs from chain 17's — --auth-guest is not the auth guest chain 17 runs")
 need(g["faucet"] is True and g["confidential"] is True and g["fri_profile"] == "production", "faucet/confidential/fri_profile wrong")
-need("aggregation" not in g and "envelope_bytes" not in g, "an aggregation or envelope_bytes section is present — none belongs in chain 18")
+need("aggregation" not in g, "an aggregation section is present — none belongs in chain 18")
+# The encrypted memo: the field, and every alloc note (RAND via --alloc, zUSD via alloc-note) in its format.
+need(g.get("envelope_bytes") == int(E["ENVELOPE_BYTES"]) == 1860, f"envelope_bytes is {g.get('envelope_bytes')!r}, not 1860 — --envelope-bytes did not take")
+need("envelope_bytes" not in g17, "chain 17 already had envelope_bytes?")
+for i, n in enumerate(g["alloc"]):
+    size = sum(len(v) // 2 for v in n["envelope"].values())
+    need(size == 1860, f"alloc note {i}'s envelope is {size} B, not 1860 — sealed in the legacy format (alloc-note without --envelope-bytes?)")
 # The gas section (spec §4.2, §7.1): present, Phase 2's controller on, never beside an aggregation
 # section (GenesisError::DynamicGasWithAggregation — asserted absent just above, and again here so a
 # later edit that adds aggregation back cannot silently defeat it).
@@ -833,6 +849,7 @@ print(f"cut-chain18: spliced bridge (set {g['bridge']['guardian_set_index']}, bu
       f"floor {floor}, redeployed {redeployed or 'none'}); zUSD locked {locked_total} == notes {notes_total} == chain 17 supply "
       f"== custody ({len(token_notes)} note(s)); RAND allocs Σ {alloc_total} {rand_carry}; vesting {vest_note}; "
       f"staking ({len(recipients)} recipients, {len(minters)} minters); hc_bundle v3, hc_auth {g['hc_auth'][:8]}…; "
+      f"envelope_bytes {g['envelope_bytes']} ({len(g['alloc'])} notes at 1860 B); "
       f"gas {gas['gas_price']}/gas {gas['byte_price']}/KiB, bundle limit {gas['bundle_gas_limit']}, dynamic {dyn['target_block_bytes']}/{dyn['target_block_gas']}/{dyn['adjust_bps']} bps")
 for w in warnings:
     print(f"cut-chain18: ⚠ {w}")
@@ -909,6 +926,14 @@ holder = payouts[len(rand_notes)] if dry else "rand1SELFTESTz"
 open(f"{st}/zusd-carry.txt", "w").write("".join(f"holder {holder} {n['amount'] / 1e8:g}\n" for n in zusd_notes))
 if dry:
     raise SystemExit(0)
+def memo_form(n):
+    """A fixture note in the 1 860-B memo form (selftest only: the body padded, nothing opened)."""
+    n = copy.deepcopy(n)
+    size = sum(len(v) // 2 for v in n["envelope"].values())
+    n["envelope"]["body"] += "00" * (1860 - size)
+    return n
+rand_notes = [memo_form(n) for n in rand_notes]
+zusd_notes = [memo_form(n) for n in zusd_notes]
 open(f"{st}/faucet-recipients-changed.txt", "w").write("someone rand1SELFTESTfaucetrecipientchanged\n")
 with open(f"{st}/tmp/token-notes.jsonl", "w") as f:
     for n in zusd_notes:
@@ -921,6 +946,7 @@ base = {k: g17[k] for k in ("chain_id", "timestamp_ms", "validators", "faucet", 
 tb, tg, bps = (int(x) for x in E["GAS_DYNAMIC"].split(","))
 base.update(chain_id=18, timestamp_ms=int(time.time() * 1000), alloc=rand_notes, hc_bundle=E["EXPECT_HC_BUNDLE"], hc_auth=E["EXPECT_HC_AUTH"],
             tokens={"registration_fee": g17["tokens"]["registration_fee"], "mint_cap_per_day": g17["tokens"]["mint_cap_per_day"], "tokens": []},
+            envelope_bytes=int(E["ENVELOPE_BYTES"]),
             gas={"gas_price": E["GAS_PRICE"], "byte_price": E["BYTE_PRICE"], "bundle_gas_limit": int(E["BUNDLE_GAS_LIMIT"]), "metering": "circuit",
                  "dynamic": {"target_block_bytes": tb, "target_block_gas": tg, "adjust_bps": bps,
                              "min_gas_price": E["GAS_PRICE"], "min_byte_price": E["BYTE_PRICE"]}})
@@ -949,7 +975,8 @@ import json, os
 E = os.environ
 g = json.load(open(E["OUT"]))
 assert g["chain_id"] == 18 and g["hc_auth"] == E["EXPECT_HC_AUTH"] and g["hc_bundle"] == E["EXPECT_HC_BUNDLE"]
-assert list(g)[-3:] == ["hardening_v6", "hc_auth", "gas"], list(g)
+assert list(g)[-5:] == ["envelope_bytes", "vesting", "hardening_v6", "hc_auth", "gas"], list(g)
+assert g["envelope_bytes"] == 1860 and all(sum(len(v) // 2 for v in n["envelope"].values()) == 1860 for n in g["alloc"])
 assert g["gas"]["bundle_gas_limit"] == 20479 and g["gas"]["dynamic"]["target_block_bytes"] * 2 == g["max_block_bytes"] == 20971520
 assert (g["max_proof_bytes"], g["max_block_bytes"]) == (4194304, 20971520), "chain 17's caps"
 assert g["bridge"]["min_inbound_sequence"] == {"2": 2, "3": 2, "4": 2, "5": 2}
@@ -1021,6 +1048,10 @@ PY2
   refuse "a byte target not half the block"  "$ST/base.json"               'd["gas"]["dynamic"]["target_block_bytes"] = 4194304' "gas.dynamic targets are"
   refuse "floors not the starting prices"    "$ST/base.json"               'd["gas"]["dynamic"]["min_gas_price"] = "50"' "floors are not the section's own starting prices"
   refuse "an aggregation section beside gas" "$ST/base.json"               'd["aggregation"] = {}' "aggregation"
+  # the encrypted memo (chain 18's own): the field, and every note in the 1 860-B form
+  refuse "no envelope_bytes"                 "$ST/base.json"               'del d["envelope_bytes"]' "envelope_bytes is None, not 1860"
+  refuse "a legacy (1 348-B) RAND alloc"     "$ST/base.json"               'd["alloc"][0]["envelope"]["body"] = d["alloc"][0]["envelope"]["body"][:-1024]' "sealed in the legacy format"
+  refuse "a legacy (1 348-B) zUSD note"      "$ST/tmp/token-notes.jsonl"   'd["envelope"]["body"] = d["envelope"]["body"][:-1024]' "sealed in the legacy format"
   # the bash-level guard: a redeployed endpoint without an explicit floor
   if env -u MIN_INBOUND_2 SELFTEST=0 EMITTER_2=$NEW_EMITTER bash "$0" >"$ST/log" 2>&1; then bad "a changed emitter without MIN_INBOUND — accepted"
   else grep -q 'set MIN_INBOUND_2 explicitly' "$ST/log" && ok "a changed emitter without MIN_INBOUND_2 — refused before anything runs" || bad "changed emitter: wrong refusal: $(tail -1 "$ST/log")"; fi
@@ -1088,7 +1119,7 @@ for n in $BONDED; do refuse_in_tree_key "$REGISTRATIONS/$n.txt"; done
 [ "$(shasum -a 256 "$CHAIN17_GENESIS" | cut -c1-64)" = "$CHAIN17_GENESIS_SHA256" ] \
   || { echo "cut-chain18: $CHAIN17_GENESIS is not chain 17's committed genesis file (sha256 ${CHAIN17_GENESIS_SHA256:0:8}…)" >&2; exit 1; }
 [ ! -e "$OUT" ] || { echo "cut-chain18: $OUT already exists — a genesis is cut once; move it aside deliberately" >&2; exit 1; }
-for flag in --hardening-v6 --bundle-guest --auth-guest --gas-price --gas-dynamic; do
+for flag in --hardening-v6 --bundle-guest --auth-guest --gas-price --gas-dynamic --envelope-bytes; do
   "$NODE" genesis --help | grep -q -- "$flag" || { echo "cut-chain18: $NODE genesis has no $flag (not the v0.6.6 cs8/gas build)" >&2; exit 1; }
 done
 
@@ -1108,7 +1139,7 @@ done < "$ALLOC_ADDRESSES"
 : > "$TMP/token-notes.jsonl"
 while read -r label addr amount; do
   case "$label" in ''|'#'*) continue;; esac
-  "$NODE" alloc-note --to "$addr" --amount "$amount" --asset 1 | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)))' >> "$TMP/token-notes.jsonl"
+  "$NODE" alloc-note --to "$addr" --amount "$amount" --asset 1 --envelope-bytes "$ENVELOPE_BYTES" | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)))' >> "$TMP/token-notes.jsonl"
   echo "cut-chain18: zUSD genesis note, $amount zUSD to $label"
 done < "$ZUSD_CARRY"
 
@@ -1122,6 +1153,7 @@ echo "cut-chain18: writing the base file (its printed hash is NOT chain 18's)"
   --tokens "$TMP/tokens.json" \
   --bundle-guest v3 --auth-guest --hardening-v6 \
   --gas-price "$GAS_PRICE" --byte-price "$BYTE_PRICE" --bundle-gas-limit "$BUNDLE_GAS_LIMIT" --gas-dynamic "$GAS_DYNAMIC" \
+  --envelope-bytes "$ENVELOPE_BYTES" \
   --epoch-blocks "$EPOCH_BLOCKS" --faucet --fri-profile production --out "$TMP/genesis.json" | tee "$TMP/genesis.out"
 
 # What the binary wrote is authoritative; its stdout is cross-checked where it names a value.
@@ -1162,6 +1194,7 @@ cut-chain18: wrote $OUT (sha256 $(shasum -a 256 "$OUT" | cut -c1-64))
 cut-chain18: genesis hash $HASH
 cut-chain18: chain id $CHAIN_ID, hc_bundle $HC_REPORTED (guest v3), hc_auth $HC_AUTH_REPORTED, hardening_v6, consensus_domain 1, no aggregation
 cut-chain18: gas: $GAS_PRICE/gas, $BYTE_PRICE/KiB, bundle limit $BUNDLE_GAS_LIMIT (auth 1279), dynamic $GAS_DYNAMIC (constraint set 8)
+cut-chain18: envelope_bytes $ENVELOPE_BYTES — the encrypted memo on; every genesis note sealed in the 1 860-B form
 cut-chain18: 26 validators × $STAKE_RAND RAND (quorum 18); faucet minters: $FAUCET_MINTERS
 cut-chain18: floors 2:$MIN_INBOUND_2 3:$MIN_INBOUND_3 4:$MIN_INBOUND_4 5:$MIN_INBOUND_5 (auto = the snapshot's next sequence; see the splice line above)
 cut-chain18: NOT carried: shielded notes of wallets the operator does not hold, and any unwithdrawn validator rewards — say so in the launch notes.
