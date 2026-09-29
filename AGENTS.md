@@ -6,11 +6,11 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-29)
 
-### v0.6.5 — gas: Phase 1 + Phase 2 (constraint set 8), the chain-18 cut scripts (tagged 2026-09-29, NOT cut)
+### v0.6.6 — gas: Phase 1 + Phase 2 (constraint set 8), the chain-18 cut scripts (tagged 2026-09-29 as v0.6.6, retagged from v0.6.5 the same day; NOT cut)
 
-**v0.6.5 = v0.6.2 (the delegated prover) + gas Phase 0 (the v0.6.4 line, folded in: its own entry below) + this.**
+**v0.6.6 = v0.6.2 (the delegated prover) + gas Phase 0 (the v0.6.4 line, folded in: its own entry below) + this.**
 `feat/gas` was rebased onto the `v0.6.2` tag, then this branch's 26 chain-18 commits onto it; the
-workspace version is `0.6.5`.
+workspace version is `0.6.6`.
 
 Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md` §4.2–4.3, §7.1; plan
 `docs/superpowers/plans/2026-09-28-gas-phase1-phase2-chain18.md` (A1–A6 circuits, B1–B8
@@ -19,7 +19,7 @@ fullnode, C1 deploy); live ledger
 Circuits worktree `/private/tmp/circuits-cs8` (branch `feat/cs8-gas`, **final `18c2627`, unpushed
 to origin**); fullnode worktree `/private/tmp/fullnode-gas18` (branch `feat/gas-chain18`, off
 `feat/gas`). Both Phase 0 (v0.6.4, node policy, see the entry
-below) and Phase 1+2 ship in v0.6.5 — nothing here is live, nothing is cut, nothing is rolled.
+below) and Phase 1+2 ship in v0.6.6 — nothing here is live, nothing is cut, nothing is rolled.
 
 **What it is.** One column, one public value in the cpu AIR (`pv::GAS = 34`, `pv::NUM 34 → 35`):
 `GAS` accumulates `1` per row plus `2` per Poseidon2 absorb row (`IS_HASH`), `191` per `KECCAK`
@@ -50,7 +50,7 @@ chains default to `max`, the only thing they can declare), `rand fee call <tier>
 `dynamic`; `rand-node genesis --gas-price/--byte-price/--bundle-gas-limit/--gas-dynamic`. Cut:
 `deploy/cut-chain18-genesis.sh`, `deploy/cutover-fleet-chain18.sh` (all-stop/all-start — cs8
 changes every verifier key, no mixed-fleet path), `deploy/chain18-bridge-steps.md` (relayer needs
-a v0.6.5 `rand`); randscan and the client apps must rebuild against cs8 before or with the cut,
+a v0.6.6 `rand`); randscan and the client apps must rebuild against cs8 before or with the cut,
 same as every prior constraint-set fork. **Parked, operator task:** the ≥ 64 GB rVM round trips
 (tier-19/20/21 real proofs; commands and cache instructions in `task-A6-report.md`) — killed at
 54.8 GB peak on this 48 GB laptop; needs a provisioned box before the cut's suite can claim the
@@ -126,7 +126,7 @@ hidden_bundle` 25/25 (119 s); `cargo check --workspace --tests --release` clean.
 `--release`: gas 15, cheating 120, zk 3, tables 25, verifier_key 2, e2e 25 (3 ignored), 0 failed;
 recursion 179/0.
 
-**Release gate (v0.6.5, the rebased head, release profile, `RECURSION_FIXTURES` = the cs8 cache
+**Release gate (v0.6.6, the rebased head, release profile, `RECURSION_FIXTURES` = the cs8 cache
 `fx2`):** core lib 549/549; node lib 392/392 (+1 ignored); `rand-node` bin 27/27 (+1 ignored);
 client lib 147/147; `rand` bin 17/17; zkvm `--test executor --skip measure` 17 passed / the 3
 known-stale failures above; node `submit` 2 (+1 ignored), `ws` 9/9, `prover_hosted` 4/4,
@@ -136,7 +136,7 @@ Run together, each taking the proving slot in turn: the chain-18 capstone
 waited on the slot), `wallet_flow` 7/7 in **2 517 s** (the delegated-prover send included).
 
 **Cut order** (not yet run): push circuits `feat/cs8-gas` to origin → final whole-branch review →
-tag (`v0.6.5` unless the line has moved — named in `deploy/cut-chain18-genesis.sh`'s header and
+tag (`v0.6.6` unless the line has moved — named in `deploy/cut-chain18-genesis.sh`'s header and
 `deploy/cutover-fleet-chain18.sh`'s `TAG` default, not the spec, which names no version) →
 `deploy/cut-chain18-genesis.sh` (26 validators,
 carries chain 16's bridge/tokens/supply snapshot forward, `hc_bundle` unchanged from chain 16's —
@@ -146,7 +146,7 @@ cs8 changes only the STARK verifier key, not the hidden-asset guest's words) →
 website) needs a cs8 rebuild before or with the cut, same rule as every prior verifier-key fork —
 none of the built work here changes that rule.
 
-### v0.6.4 — gas, Phase 0: the header-priced call floor (2026-09-28; never tagged on its own — ships inside v0.6.5)
+### v0.6.4 — gas, Phase 0: the header-priced call floor (2026-09-28; never tagged on its own — ships inside v0.6.6)
 
 Spec `docs/superpowers/specs/2026-09-28-gas-model-design.md`, plan
 `…/plans/2026-09-28-gas-phase0-v0.6.4.md`. **Node policy only, any chain, rolls one node at a
@@ -194,7 +194,7 @@ this laptop); node bin 21/21; client lib 119/119; zkvm `tests/executor.rs` 19/19
 Roll: wallets first (an old wallet against a policy node is refused with the floor named in the
 error), nodes a week later. Branch state: `feat/gas` rebased onto the `v0.6.2` tag (it keeps the
 one-line `CallOutcome` seam in `zkvm/src/executor.rs`, a fullnode-local file); never tagged on its
-own — **it ships inside v0.6.5** (entry above), not rolled.
+own — **it ships inside v0.6.6** (entry above), not rolled.
 
 ### v0.6.3 — delegated proving, Phase 2: split authorisation (2026-09-29; tagged `d4fd0a3`, released, chain 17 only)
 

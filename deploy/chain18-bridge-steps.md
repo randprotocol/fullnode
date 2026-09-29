@@ -40,7 +40,7 @@ What is expected to differ from chain 16 (structural; the specifics are TBD, see
   snapshot's `next_sequence` against `done/<chain>/…` before trusting `{2,3,4,5}`
   unconditionally the way chain 16's table did for chain 15→16).
 - **Constraint set 8 changes every verifier key, and the gas section changes the fee floor.**
-  The relayer's `rand` must be the v0.6.5 (cs8/gas) build: a pre-cs8 `rand bridge-mint`
+  The relayer's `rand` must be the v0.6.6 (cs8/gas) build: a pre-cs8 `rand bridge-mint`
   proves a fee bundle chain 18 refuses outright (wrong verifier key), and even a cs8 build
   built without `--gas-price` awareness would compute too low a fee once chain 18's `gas`
   section is live (`docs/rpc.md`'s `rand_getLimits` serves the floor — the relayer's fee
@@ -95,7 +95,7 @@ What is expected to differ from chain 16 (structural; the specifics are TBD, see
    for d in relayer guardian-7 guardian-8:
      cp -Rp data/mainnet/$d/cursors data/mainnet/$d/cursors.chain16
      echo '{"next_block": 0, "next_sequence": <TBD, next burn sequence>}' > data/mainnet/$d/cursors/rand.json
-   # the relayer's rand CLI: a macOS build of the v0.6.5 tag (fullnode, cs8/gas)
+   # the relayer's rand CLI: a macOS build of the v0.6.6 tag (fullnode, cs8/gas)
    sed -i '' -E 's#^rand_cli = "[^"]*"#rand_cli = "'$HOME'/rand-node-a/bin-v065/rand"#' mainnet/relayer.toml
    ```
    The relayer wallet's note store is bound to chain 16 (or whichever chain it last scanned);
@@ -113,7 +113,7 @@ What is expected to differ from chain 16 (structural; the specifics are TBD, see
 7. Audit — `rand-bridge-audit` against chain 18: `total_supply` == Σ `locked` == endpoint
    custody (carried forward from chain 16's own audited state); `rand_getBridgeState.
    min_inbound_sequence` shows the floors read at the chain-18 snapshot. Every zUSD holder
-   opens their carried balance with a v0.6.5 wallet (`rand asset-balance 1`).
+   opens their carried balance with a v0.6.6 wallet (`rand asset-balance 1`).
 
 ## If an endpoint redeploy lands BEFORE the cut
 

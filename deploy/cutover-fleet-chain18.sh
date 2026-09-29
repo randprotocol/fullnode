@@ -21,11 +21,11 @@
 # drop-in, chain 16's `chain16.conf` with `data-16` → `data-18`, and chain16.conf is moved aside.
 #
 #   deploy/cutover-fleet-chain18.sh stage              # chain 16 running: every host downloads the
-#                                                      # v0.6.5 (cs8/gas) release binaries, sha-checked, aside
+#                                                      # v0.6.6 (cs8/gas) release binaries, sha-checked, aside
 #   (bridge: deploy/chain18-bridge-steps.md "stop" — relayer + guardians down, BEFORE the snapshot)
 #   deploy/cut-chain18-genesis.sh snapshot <dir>       # chain 16 still up
 #   deploy/cutover-fleet-chain18.sh stop               # stop every chain-16 node (26)
-#   (cut: CHAIN16_SNAPSHOT=<dir> NODE=<v0.6.5 rand-node> WALLET=<v0.6.5 rand> deploy/cut-chain18-genesis.sh)
+#   (cut: CHAIN16_SNAPSHOT=<dir> NODE=<v0.6.6 rand-node> WALLET=<v0.6.6 rand> deploy/cut-chain18-genesis.sh)
 #   deploy/cutover-fleet-chain18.sh push <genesis>     # the genesis to every host, sha-checked, and
 #                                                      # its hash re-derived there by the staged binary
 #   deploy/cutover-fleet-chain18.sh switch <genesis>   # install, init, rewrite unit / drop-in — no start
@@ -33,7 +33,7 @@
 #   deploy/cutover-fleet-chain18.sh wait <genesis>     # until all 26 serve chain 18 healthy, committing
 #   deploy/cutover-fleet-chain18.sh status             # read-only: version, genesis, height per host
 #
-# Env: TAG (v0.6.5 unless the line has moved — the cs8/gas release, spec §11), WANT_SHA /
+# Env: TAG (v0.6.6 unless the line has moved — the cs8/gas release, spec §11), WANT_SHA /
 # WANT_SHA_WALLET (sha256 of the release's Linux rand-node / rand; both required for `stage` and
 # re-checked by `switch`), RELEASE_URL (default the GitHub release of $TAG — each host downloads
 # it itself: the laptop's upload is too slow to relay 47 MB × 26), OLD (chain 16's datadir prefix —
@@ -55,7 +55,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PHASE=${1:?stage|stop|push|switch|start|wait|status}
-TAG=${TAG:-v0.6.5}
+TAG=${TAG:-v0.6.6}
 RELEASE_URL=${RELEASE_URL:-https://github.com/randprotocol/fullnode/releases/download/$TAG}
 # No default (unlike chain 16's own script, which could pin chain 15's already-known cc30e085):
 # chain 16 was not yet live when this script was written. Only `switch` needs it, so it is
