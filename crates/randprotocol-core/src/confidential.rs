@@ -675,7 +675,7 @@ mod tests {
         assert_eq!(crate::gas::gas_max(14, 0, 0), 20_479, "(2^14 − 1) + 2^12, the absorb term included");
         StubExecutor::with_bundle_gas(&mut b, 20_480);
         assert_eq!(StubExecutor.bundle_gas_limit(&b).unwrap(), Some(20_480));
-        assert_eq!(StubExecutor.bundle_proof_digest(&b).unwrap(), digest);
+        assert_eq!(StubExecutor.bundle_proof_digest(&hc, &b).unwrap(), digest);
         assert_eq!(StubExecutor.verify_bundle(&hc, &b, &binding), Ok(()));
         assert_eq!(StubExecutor.bundle_gas_limit(b"junk"), Err(ConfidentialError::MalformedProof));
     }
@@ -700,6 +700,8 @@ mod tests {
             time: 1,
             envelopes: std::array::from_fn(|_| crate::notes::Envelope { kem_ct: vec![1], to_receiver: vec![2], to_sender: vec![3], body: vec![4] }),
             proof,
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
         };
         let tx = StubExecutor::bound(Transaction::shielded(7, bundle, Action::None));
         let p = &tx.bundle.as_ref().unwrap().proof;

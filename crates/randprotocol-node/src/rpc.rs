@@ -2006,7 +2006,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             Ok(json!(hex::encode(words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())))
         }
         "rand_getLimits" => {
-            let mut limits = st.limits;
+            let mut limits = st.limits.clone();
             // Spec §7.1, §8: under a `gas` section the prices reported are the tip's current
             // ones, not this process's genesis snapshot — `tip_gas_prices` tracks `dynamic`'s
             // moves through the published status; a non-`dynamic` section's own fixed prices are
@@ -3686,7 +3686,7 @@ mod tests {
         assert_eq!(e.code, -32602, "under the section a call estimate needs its gas");
 
         // `with_gas_policy` never overrides a chain's own section: the node's flags are ignored.
-        let overridden = st.limits.with_gas_policy(Some(randprotocol_core::gas::GasPolicy::DEFAULT));
+        let overridden = st.limits.clone().with_gas_policy(Some(randprotocol_core::gas::GasPolicy::DEFAULT));
         assert_eq!(overridden, st.limits, "a node policy cannot override the chain's own gas section");
     }
 

@@ -1742,18 +1742,21 @@ pub async fn build_transfer_declaring_bundle_gas(
     bundle_gas_limit: u64,
 ) -> Result<Transaction> {
     scan(rpc, w, store).await?;
-    let plan = Plan::select(store, Spend { asset: 0, to: Some((to, amount)), memo: "", fee, burn_a: 0, burn_r: 0 })?;
+    let guest = chain_bundle_guest(rpc).await?;
+    let plan = Plan::select(store, Spend { asset: 0, to: Some((to, amount)), memo: "", fee, burn_a: 0, burn_r: 0, prover_fee: None })?;
     let format = rpc.envelope_format().await?;
-    let (prepared, _) = prepare_bundle(rpc, w, store, &plan, format).await?;
+    let (prepared, _) = prepare_bundle(rpc, w, store, &plan, format, &guest).await?;
     let mut tx = Transaction::shielded(chain_id, prepared.bundle.clone(), Action::None);
     let p = &prepared;
     prove_transaction_by(&mut tx, |binding| async move {
+        // On a v3 chain the auth proof rides beside the bundle, exactly as `send` makes it.
+        let auth = p.v3.then(|| prove_auth_locally(p, &w.sk, &binding, profile, Backend::Cpu)).transpose()?;
         let started = Instant::now();
         let (proof, digest, tier) =
             randprotocol_zkvm::executor::prove_bundle_for_with_limit(&p.guest, profile, &p.words, &binding, bundle_gas_limit)
                 .map_err(|e| anyhow!("proving the bundle failed: {e}"))?;
         check_published_digest(&digest, &p.expected)?;
-        Ok(Proved { proof, tier, proving: started.elapsed() })
+        Ok(with_auth(Proved { proof, tier, proving: started.elapsed(), auth_proof: Vec::new(), auth_proving: None }, auth))
     })
     .await?;
     Ok(tx)

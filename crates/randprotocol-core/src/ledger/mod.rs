@@ -5723,8 +5723,17 @@ mod tests {
             fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
                 StubExecutor.bundle_digest(input)
             }
-            fn bundle_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
-                StubExecutor.bundle_proof_digest(proof)
+            fn bundle_digest_v3(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+                StubExecutor.bundle_digest_v3(input)
+            }
+            fn bundle_proof_digest(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+                StubExecutor.bundle_proof_digest(hc_bundle, proof)
+            }
+            fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+                StubExecutor.auth_proof_digest(proof)
+            }
+            fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
+                StubExecutor.verify_auth(hc_auth, proof, binding)
             }
             fn verify_bundle(&self, hc_bundle: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), ConfidentialError> {
                 StubExecutor.verify_bundle(hc_bundle, proof, binding)
