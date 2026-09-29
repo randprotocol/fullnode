@@ -11,19 +11,21 @@ chain with a proof instead of their inputs.
 |---|---|
 | Consensus | chained HotStuff BFT, stake-weighted quorums (more than 2/3), round-robin leaders, three-chain commit, view synchronisation, exponential timeouts |
 | Signatures / hashes | Dilithium2 (post-quantum) / BLAKE3 for validators and blocks; Poseidon2 for notes, the tree and nullifiers; ML-KEM-768 + ChaCha20-Poly1305 for note envelopes |
-| Networking | libp2p 0.54: TCP + Noise + Yamux, gossipsub, Kademlia + bootstrap list, mDNS on LANs, request-response block sync, ping keepalive, automatic redial |
-| Ledger | shielded note pool: a depth-32 Poseidon2 commitment tree, a nullifier set, 4-in-4-out hidden-asset proved bundles (one bundle moves any asset — RAND, a bridged coin or an RPL token — and nobody without a key can tell which), public fees to the proposer's register entry, BLAKE3 Merkle state root over tree, nullifiers, validators and programs, plus the bridge and the RPL token registry on a chain that carries them |
-| Staking | a public validator register — bond out of a bundle's burn, unbond over two epochs, withdraw into a shielded note — epochs that re-derive the validator set from it, and a supply audit that adds the register and the pool back up to what the chain issued |
+| Networking | libp2p 0.57: TCP + Noise + Yamux, gossipsub, Kademlia + bootstrap list, mDNS on LANs, request-response block sync, ping keepalive, automatic redial |
+| Ledger | shielded note pool: a depth-32 Poseidon2 commitment tree, a nullifier set, 4-in-4-out hidden-asset proved bundles (one bundle moves any asset — RAND, a bridged coin or an RPL token — and nobody without a key can tell which), split authorisation (since chain 17 a bundle carries a second, small auth proof, so the bundle proof itself no longer takes the spend key), 1,860-byte note envelopes with an encrypted memo (chain 18), public fees to the proposer's register entry, BLAKE3 Merkle state root over tree, nullifiers, validators and programs, plus the bridge and the RPL token registry on a chain that carries them |
+| Staking | a public validator register — bond out of a bundle's burn (v2 registrations, a two-epoch activation delay), unbond over two epochs, withdraw into a shielded note — epochs that re-derive the validator set from it, timelocked genesis vesting (`docs/vesting.md`), and a supply audit that adds the register and the pool back up to what the chain issued |
 | Wallet keys | a 256-bit spend key; viewing key, note-owner field, nullifier key, outgoing viewing key, ML-KEM-768 decapsulation key and `rand1…` address all derived from it |
 | Bridged assets | the guardian bridge as notes: a bridged holding is a note whose `asset` word is the registry's index, an attestation deposits one note the chain computes itself, and a burn is a single hidden-asset bundle — the same bundle spends the bridged asset from slots 0–1 and pays the RAND fee from slots 2–3 (`docs/bridge.md`) |
-| Confidential computation | Rand zkVM: RV32I under a Plonky3 batch STARK (Goldilocks, Poseidon2, ZK-hiding FRI); programs deployed on chain, calls carry a proof + 8 public outputs, gas by tier, and pay through a bundle like everything else |
-| Storage | one RocksDB per node with column families for blocks, certificates, indexes, notes, nullifiers, anchors, validators, programs and receipts; fsynced commits; startup integrity check with truncate-and-resync |
-| Interfaces | JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` / `receipts` / `transaction` subscription on the same port (`rand-node`), `rand` wallet CLI with a local prover, Rust client library |
+| Confidential computation | Rand zkVM: RV32I under a Plonky3 batch STARK (Goldilocks, Poseidon2, ZK-hiding FRI, constraint set 8); programs deployed on chain, calls carry a proof + 8 public outputs and a declared gas limit the circuit enforces, priced per gas and per KiB with dynamic prices (chain 18), and pay through a bundle like everything else |
+| Storage | one RocksDB per node with column families for blocks, certificates, indexes, notes, nullifiers, anchors, validators, programs and receipts; fsynced commits; startup integrity check with truncate-and-resync; optional history pruning (`--prune-history 24h`) with archive nodes keeping everything |
+| Interfaces | JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` / `receipts` / `transaction` subscription on the same port (`rand-node`), `rand` wallet CLI with a local prover, `rand-prover` delegated prover (`docs/prover.md`), Rust client library |
 
-Status: an experimental testnet runs **chain 14** (v0.5, live since 2026-09-20; genesis
-`1cff3b7d…`, pinned build `b3c594c`) on 16 DigitalOcean droplets and a laptop validator, with 18
-validators in the register — RPL tokens and a hardened, zUSD-backed guardian bridge (see
-`deploy/README.md`). Not audited; not for real value.
+Status: an experimental testnet runs **chain 18** (live since 2026-09-29 04:56 UTC; genesis
+`a7cb020c…4da76`, build **v0.6.7** `86941a1`) on 26 DigitalOcean validators — quorum 18 of 26 —
+including two archive nodes that keep full history; the others keep one day. Chain 18 is the first
+gas-metered chain (constraint set 8), runs split authorisation, carries the encrypted memo, and
+keeps the zUSD-backed guardian bridge (10 zUSD, audited `supply == locked == custody`). Public RPC:
+`https://rpc.randprotocol.org`. Not audited as a whole; not for real value — mainnet is v1.0.
 
 ## Contents
 
@@ -35,6 +37,7 @@ validators in the register — RPL tokens and a hardened, zUSD-backed guardian b
 - [Confidential computation](#confidential-computation)
 - [Operating a node](#operating-a-node)
 - [How it works](#how-it-works)
+- [Release history](#release-history)
 - [v0.5: RPL, zUSD and bridge hardening](#v05-rpl-zusd-and-bridge-hardening)
 - [Documentation](#documentation)
 - [Roadmap](#roadmap)
@@ -65,27 +68,20 @@ cargo build --release        # target/release/rand-node, target/release/rand, ta
 cargo test --release         # all crates; release because STARK proving is slow in debug
 ```
 
-Test coverage: 155 core tests (crypto, notes and the tree, ledger admission rules, the staking
-register and its epochs, the supply audit, gas, genesis, a deterministic multi-replica HotStuff
-simulation with partitions, restarts and epoch rollovers), node unit tests (storage, corruption
-cases, the conflict mempool, the redacted RPC), wallet tests (key file, scanning, coin selection),
-the zkVM suite (the upstream tests wholesale — including, since constraint set 6, the EVM, sBPF
-and SHA-256 suites and a tier-16 EVM-call proof — plus executor tests with real proofs), one wallet-flow test against a
-real one-node chain (mint, scan, send, spend the change, bond, and a confidential call whose input
-transcript it opens back), and 18 cluster tests that start real nodes over TCP: a shielded transfer
-between wallets, a double-spend race between two validators, a deploy-and-call paid by bundles, a
-call whose input envelope only its caller and its auditor open, a guardian-attested bridge deposit
-and a burn, a fifth validator that registers and bonds itself into the next epoch, a
-validator that unbonds out of the set and withdraws into a note its payout wallet spends, late
-joiners, restart cycles, quorum loss and recovery, corrupted database recovery, and the faucet.
+Test coverage spans the core crate (crypto, notes and the tree, ledger admission rules, staking,
+gas, genesis, and a deterministic multi-replica HotStuff simulation with partitions, restarts and
+epoch rollovers), node unit tests (storage, pruning, sync, the mempool, the RPC), wallet tests,
+the vendored zkVM and rVM suites (upstream's tests wholesale, including cheating-prover suites and
+real proofs), a wallet-flow test against a real one-node chain, and cluster tests that start real
+nodes over TCP (transfers, a double-spend race, deploy-and-call, a bridge deposit and burn,
+validators bonding in and unbonding out, restarts, quorum loss and recovery, database recovery).
 
-**678 tests, all green.** `cargo test --workspace --release` measured ~43½ minutes on 2026-09-14
-from a cold release target, on a machine that was also running other sessions' work — most of it
-proving. The proofs dominate: the wallet flow 9m37s (six bundle proofs and a call proof), the
-cluster suite 22m44s (18 tests, 12 bundle proofs and 2 program proofs serialised through the
-proving slot), and the zkVM end-to-end file 7m25s (a tier-16 EVM-call proof among its 24). Six
-upstream tests are `#[ignore]`d: three production-profile measurement harnesses, the sBPF cycle
-breakdown, and the two interpreter guests' exit proofs (memory-bound; they want ≥ 64 GB).
+The full suite takes one to two hours because the proofs dominate. At v0.6.1, on a 16-vCPU
+machine: core lib 521, node lib 373, client lib 117, cheating 116, hidden_cheating 21 (75 min),
+wallet_flow 6 (53 min), cluster 26 (44 min), zusd_e2e 2 (51 min). Each release's measured
+numbers are in `AGENTS.md`. The recursion-VM aggregation tests need a fixture cache
+(`RECURSION_FIXTURES`), and the production rVM exit and aggregate proofs need a large machine:
+N=2 took 133 GB, N=3 221 GB, and the production exit proof more than 256 GB under constraint set 7.
 
 ## Run a node
 
@@ -172,7 +168,7 @@ export RAND_RPC=http://127.0.0.1:8545     # or --rpc on each call
 rand keygen                                # wallet.key.json (or --key <file>, RAND_KEY)
 rand address                               # rand1… — about 1.6 KB of base58
 rand balance                               # scans the tree with this key; nobody else can
-rand send <rand1 address> 1.5            # proves a bundle locally (~100 s), submits, waits
+rand send <rand1 address> 1.5            # confirms, proves a bundle locally (~100 s), submits, waits
 rand bond <validator address> 1000         # stake: the bundle burns it out of this wallet's notes
 rand faucet [address]                      # testnet chains only: mint up to 100 RAND
 rand notes | rand history
@@ -182,6 +178,14 @@ rand tx <hash> | rand block <height|hash> | rand head | rand status | rand peers
 Amounts are decimal RAND (1 RAND = 10^9 units). The fee floor is 0.001 RAND per bundle and
 goes to the proposer of the block that includes the transaction. There is no
 `rand balance <address>`: a balance is a fact about your key file, not about the chain.
+
+The ~1,667-character address is made shareable rather than shorter: `rand address` prints a
+16-character fingerprint (`1WCV-YC8F-47BY-5RZY`) on stderr, and a `randpay:` link or QR code
+carries the address, an optional amount and asset, and a memo of up to 510 bytes. On a chain
+whose genesis sets `envelope_bytes: 1860` (chain 18) every note carries that memo, sealed to the
+recipient. A memo is sender-chosen text: every client shows it sanitised, on one line. A wallet
+that cannot hold a tier-14 proof in memory can pair a prover its owner runs (`rand prover pair`,
+then `--prover` on any proving command; `docs/prover.md`).
 
 ## The shielded pool
 
@@ -196,7 +200,8 @@ proved by a pinned zkVM guest. One bundle moves any asset (RAND, a bridged coin,
 nobody without a key can tell which:
 
 ```
-Bundle { anchor, nullifiers[4], commitments[4], fee, burn_a, burn_r, burn_asset, time, envelopes[4], proof }
+Bundle { anchor, nullifiers[4], commitments[4], fee, burn_a, burn_r, burn_asset, time, envelopes[4], proof,
+         auth_commit, auth_proof }
 ```
 
 Slots 0–1 carry the private asset moved (dummies on a RAND-only transfer); a token or bridge burn
@@ -204,7 +209,10 @@ accounts for it there, in `burn_a`/`burn_asset`. Slots 2–3 always carry RAND �
 a bond or an aggregator registration, the stake burned in `burn_r`. The proof says: all four
 inputs are leaves under `anchor`, their nullifiers are the published ones, each pair's inputs
 balance its outputs plus whatever it burns or pays as fee, and the spender holds the keys —
-without revealing which leaves, which amounts, which asset, or who. A wallet finds its own notes
+without revealing which leaves, which amounts, which asset, or who. Since chain 17 the spend key
+never enters the bundle proof: a small separate auth proof shows the spender holds it, bound to
+the bundle by `auth_commit`, so the bundle can be proved by a delegated prover without handing
+over custody. A wallet finds its own notes
 by trial-decrypting every envelope on
 the chain with its viewing key, so a node answers "here is the whole tree" and never "here is your
 balance". `docs/howto.md` (five questions, end to end) and `docs/shielded.md` is the full guide, including the public/hidden table per action and
@@ -220,7 +228,8 @@ Value enters the pool through a faucet mint, a genesis `alloc` note, or a valida
 and every one of those amounts is **public** — the same one-hop visibility a transparent-to-shielded
 deposit has anywhere. It leaves as a bundle's fee or a bond's burn, both public too, which is what
 lets `rand_getSupply` account for a chain nobody can add up (`docs/supply.md`). Staking is where
-those public amounts live: `docs/staking.md`. Bridged assets are phase S3.
+those public amounts live: `docs/staking.md`. Bridged assets arrive as notes too
+(`docs/bridge.md`).
 
 ## Confidential computation
 
@@ -246,8 +255,11 @@ Silicon: proving 21 s, proof 0.9 MB, on-chain verification 19 ms with a cached v
 key costs 2 s per program on a laptop, 7 s on a 2-vCPU server, computed once in the background
 when the program is deployed).
 
-Gas: every bundle 0.001 RAND, plus 100,000 units per code word to deploy, plus 0.001 RAND at
-tier 10 rising 0.0001 per two tiers to call. See `docs/confidential.md`.
+Gas: every bundle 0.001 RAND and 100,000 units per code word to deploy. On chain 18 a call pays
+per gas: its proof declares a gas limit the circuit enforces (`GAS ≤ GAS_LIMIT`), and the fee
+floor is `BUNDLE_BASE + gas_price · gas_limit + byte_price · ⌈bytes / 1024⌉`. The prices start at
+100 units per gas and 800 per KiB and adjust per block toward a target. A tier-14 call costs
+about 0.004 RAND. See `docs/fees.md` and `docs/confidential.md`.
 
 ## Operating a node
 
@@ -260,6 +272,9 @@ RUST_LOG=debug rand-node run ...                  # verbose logs
 
 At startup a node checks its chain (`--verify-chain quick|full|off`), truncates anything
 inconsistent while keeping its vote-safety state, and refetches the missing blocks from peers.
+`--prune-history 24h` keeps one day of blocks and certificates (the ledger itself is never
+pruned); a node without the flag is an archive. A pruned node answers a lookup below its floor
+with `-32010`, so point wallets and explorers at an archive for old history.
 `deploy/` has scripts to provision a Linux server as a systemd service and to rebuild it on new
 commits; `docs/deploy.md` describes the rollout and the fault tests that have been run.
 
@@ -283,6 +298,26 @@ commits; `docs/deploy.md` describes the rollout and the fault tests that have be
    receipts before accepting.
 
 Full detail in `docs/architecture.md`.
+
+## Release history
+
+Every release is tagged on GitHub with Linux binaries and `SHA256SUMS`; `AGENTS.md` has the full
+record of each, with the measured suite and the roll. A release that changes consensus, the wire
+format or a verifier key ships with a new chain; the others roll onto the live chain one node at
+a time.
+
+| release | what it brought | chain |
+|---|---|---|
+| v0.5 – v0.5.8 | RPL tokens, zUSD and the hardened bridge (below); the audit fixes; history pruning; consensus and sync hardening | 14, 15 |
+| v0.5.9 | rescan fixes: faucet mints only from genesis validators, sync back-off, gossip prechecks | 15 |
+| v0.5.10 | address sharing: fingerprints, `randpay:` links and QR codes, the encrypted memo | 15 |
+| v0.5.11 | timelocked genesis vesting for team, investor and partner allocations | — |
+| v0.6 | the zkVM, rVM and aggregation fixes from the September reviews | 15 |
+| v0.6.1 | constraint set 7: LogUp blinding, a 2^7 table floor, 32-bit range checks, `POSEIDON2_LEN`, JALR fix | 16 |
+| v0.6.2 | delegated proving, phase 1: `rand-prover` and `--prover` | 16 |
+| v0.6.3 / v0.6.4 | delegated proving, phase 2: split authorisation (the auth proof, `rand-txid-3`) | 17 |
+| v0.6.6 / v0.6.7-rc1 | gas: constraint set 8, a declared gas limit per proof, dynamic gas and byte prices; the memo turned on | 18 |
+| v0.6.7 | fixes on chain 18: sealed-proof pruning, the envelope-format pin, viewing-key hygiene, the rVM allocator, GPU-kernel aliasing, ALU test coverage | 18 |
 
 ## v0.5: RPL, zUSD and bridge hardening
 
@@ -323,7 +358,12 @@ all hard forks together as chain 14:
 | [docs/shielded.md](docs/shielded.md) | the shielded pool: keys, what is public, the wallet, the RPC, admission, what still leaks |
 | [docs/staking.md](docs/staking.md) | the validator register, epochs, and the four staking commands: register, bond, unbond, withdraw |
 | [docs/supply.md](docs/supply.md) | the supply audit: the counters, the invariant a node checks, and how exact it is |
-| [docs/confidential.md](docs/confidential.md) | programs, calls, outputs, gas, privacy |
+| [docs/confidential.md](docs/confidential.md) | programs, calls, outputs, gas, privacy, and each constraint set |
+| [docs/fees.md](docs/fees.md) | what a transaction pays: the floors, the gas rule, dynamic prices |
+| [docs/zkvm.md](docs/zkvm.md) | the Rand zkVM: ISA and execution model, memory and syscalls, trace to STARK, what is public, costs |
+| [docs/aggregation.md](docs/aggregation.md) | block aggregation with the recursion VM: sealing, pruning, sealed-form sync (off on every chain today) |
+| [docs/vesting.md](docs/vesting.md) | timelocked genesis allocations: claims, revocation, bonding locked RAND |
+| [docs/consensus.md](docs/consensus.md) | the consensus rules added since the architecture write-up (the not-held quorum, durable pending blocks, recovery rules) |
 | [docs/tokens.md](docs/tokens.md) | RPL, the token standard (v0.5): a token as a registry entry, asset ids and `rpl1…`, mint authorities, creation, hidden-asset transfers, burning, the CLI and RPC, ERC-20/SPL comparison |
 | [docs/guests.md](docs/guests.md) | writing and deploying a RISC-V program: the Rand ISA, the syscall ABI, the image container, `rand-guest` build/check/run/pack, `hc` versus program id, the program-size cap |
 | [docs/translators.md](docs/translators.md) | the Solana (`sbpf2rv`) and Ethereum (`evm2rv`) translators: trust model, parity, the ERC-20 and SPL Token walkthroughs, measured cycles, limits |
@@ -339,37 +379,32 @@ all hard forks together as chain 14:
 
 ## Roadmap
 
-The shielded pool lands in three phases, each a hard fork (`docs/shielded.md` §7). **S1** is the
-pool itself: notes, bundles, the wallet, the redacted RPC. **S2** adds staking on top of it — Bond,
-Unbond and Withdraw, epochs that re-derive the validator set from the register, and the validator
-rewards S1 accrued but could not pay out (`docs/staking.md`). **S3** brings the bridge back as
-notes — a deposit is one note the chain computes from the amount the guardians signed, a burn is
-one hidden-asset bundle since chain 14 (`docs/bridge.md`) — and gives call inputs their own
-envelopes, so a
-caller can disclose what a program ran on to an auditor, or to itself later, without publishing it.
-Both are here, in this release. Still outstanding from S2's own plan: the local wallet commitment
-tree, so a wallet stops telling its node which leaf it is about to spend.
+Done: the shielded pool, staking and the bridge as notes (phases S1–S3), RPL tokens, history
+pruning, address sharing and the memo, genesis vesting, delegated proving with split
+authorisation, and gas.
 
-Not yet implemented beyond that: persistent per-program state and cross-program calls; slashing and jailing;
-a nullifier accumulator in place of the per-block recomputation; block rewards; the hash-sortition
-leader beacon; proof pruning after finality; fee markets.
+Next:
+- **Mainnet (v1.0)**, with a fresh genesis and a network marker that makes archive rules into
+  consensus rules.
+- **The bridge endpoint redeploy** (the reentrancy guard and the separate pauser). New Ethereum,
+  BNB and Tron contracts only become usable in a genesis that names them.
+- **Block aggregation**, off on every chain today. It still needs the end-to-end
+  forged-aggregate exercise (#45), and the production rVM proofs need more than 256 GB of memory
+  under constraint sets 7–8, which the aggregator machine class has to account for.
+- **The timeout-certificate pacemaker** (B3); slashing and jailing; persistent per-program state
+  and cross-program calls; a nullifier accumulator; the hash-sortition leader beacon.
 
-## Open ops tasks (hardware, for any future session)
+## Open ops tasks
 
-Two user-owned hardware tasks gate the next milestones. The full checklist with exact commands is
-in `docs/deploy.md` ("Deferred proof runs and hardware tasks"); both were accepted by the user on
-2026-09-15 and are scheduled for **2026-09-16**.
-
-1. **A ≥ 64 GB machine, one batch session** — runs the deferred production proofs (runbook rows
-   1–6 in `circuits/recursion/docs/03-gpu-and-self-recursion.md` Appendix A): the ERC-20 and SPL
-   token guest proofs, the rVM tier-21 exit, the N=2/N=3 aggregate twins, the production N=1
-   aggregate. Its measurements fill chain-9's `genesis.aggregation.admitted_shapes[0]` — **chain-9
-   activation is blocked on this batch** (the 2026-09-15 ruling: production proofs execute on
-   ≥ 64 GB after chain-side aggregation lands).
-2. **A fleet GPU node** — for the rVM CUDA backend's remaining tasks (the first PTX build +
-   hardware bring-up per `circuits` `PTX_BUILD.md`, then the production N re-measurement). Spec:
-   Linux, R580+ driver, CUDA 13, LLVM 21, sm_80+, 80 GB device (H100/A100-80G), ≥ 160 GB host.
-   None exists today.
+- **An aggregator machine.** The production rVM exit proof exceeds 256 GB under constraint set 7
+  (N=2 aggregate 133 GB, N=3 221 GB, measured on a 256 GB DigitalOcean droplet, 2026-09-28/29);
+  re-measure under constraint set 8 before sizing one.
+- **The GPU backend.** It was first run on an NVIDIA H100 on 2026-09-28: the kernels build to PTX
+  for sm_80 and sm_90 and match the CPU and Plonky3 reference (#49). The production
+  N re-measurement on a fleet GPU node is still to do.
+- **Wallets and the explorer on constraint set 8.** Every proof format changed with chain 18, so
+  the clients repository (desktop, web, iOS, Android) and randscan need builds against circuits
+  `aeacf31` before users can prove for chain 18.
 
 ## License
 
