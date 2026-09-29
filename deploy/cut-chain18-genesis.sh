@@ -47,7 +47,7 @@
 #     Σ notes == Σ locked == source custody at block 0.
 #
 # ROLLOUT ORDER (spec §11, and the release-gating rule): tag the fullnode release that carries cs8
-# (v0.6.5 unless the line has moved) only after the full suite on the testbox and a final review;
+# (v0.6.6 unless the line has moved) only after the full suite on the testbox and a final review;
 # ship the clients (core re-vendored at cs8, `--gas-limit` in the apps) and randscan's
 # `randscan-viewing`/pv decoding BEFORE the cut — a wallet still on cs7 can prove nothing chain 18
 # accepts. Then the cut: every proof format changes (constraint set 8 changes every verifier key),
@@ -522,7 +522,7 @@ fi
 [ -n "$CHAIN16_HASH" ] || { echo "cut-chain18: CHAIN16_HASH is unset — chain 16 was not live when this script was written (see the header); set it once chain 16's genesis hash is known, or run with DRY_RUN=1" >&2; exit 1; }
 SNAPSHOT_FILE=$CHAIN16_SNAPSHOT/$SNAPSHOT_BASENAME; export SNAPSHOT_FILE
 for bin in "$NODE" "$WALLET"; do
-  [ -x "$bin" ] || { echo "cut-chain18: $bin is not executable — the cs8/gas release binaries (v0.6.5+)" >&2; exit 1; }
+  [ -x "$bin" ] || { echo "cut-chain18: $bin is not executable — the cs8/gas release binaries (v0.6.6+)" >&2; exit 1; }
 done
 for f in "$SNAPSHOT_FILE" "$VALIDATORS_TSV" "$PQ_GUARDIANS" "$PAUSE_KEY" "$FAUCET_RECIPIENTS" "$ALLOC_ADDRESSES" "$ZUSD_CARRY" "$CHAIN16_GENESIS"; do
   [ -f "$f" ] || { echo "cut-chain18: missing $f" >&2; exit 1; }
