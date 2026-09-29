@@ -559,6 +559,14 @@ fullnode, randscan, randprotocol.org and clients; every task reviewed, then two 
   envelope exactly 1,860 B, genesis allocs included (`TxError::EnvelopeSize`, permanent). It turns on
   at the v1.0 genesis (~chain 20, `rand-node genesis --envelope-bytes 1860`); wallets seal the memo
   form only where `rand_getLimits.envelope_bytes == 1860`, legacy 1,348 B elsewhere.
+- **Trap — `rand_getLimits.envelope_bytes` is the node's unauthenticated word (issue #64).** On a chain
+  without the field a 1,860-B envelope is still admitted, so believing a lying node tags every
+  transaction the wallet sends. `RpcClient::envelope_format(chain_id)` returns Legacy on every chain id
+  in `randprotocol_client::LEGACY_ENVELOPE_CHAIN_IDS` (14–17) whatever the node says — the chain id is
+  the transaction's own, so a node cannot move it (`WrongChain`). **Add every chain cut without
+  `envelope_bytes` to that list**; `every_committed_genesis_without_envelope_bytes_is_pinned` fails
+  until you do. The node keeps only the genesis hash, not the file, so the claim cannot be checked
+  against the genesis itself.
 - **Trap — a memo is hostile text on every chain today.** A 1,860-B envelope is ≤ 2,048 so chains 14/15
   accept it, and the opener reads a 624-B body anywhere: anyone can pay a dust note carrying any memo,
   and a link can carry one. Every surface (CLI `memo_display`, UI `ui/lib/memo.js`, iOS/Android
@@ -576,6 +584,11 @@ fullnode, randscan, randprotocol.org and clients; every task reviewed, then two 
   shared UI, desktop deep link + single-instance, web wallet `web+randpay`, iOS, Android). Apps and
   website ship before any genesis sets `envelope_bytes`; the bridge relayer needs only a `rand` rebuilt
   from this release (it shells out to `rand bridge-mint`).
+- **Viewing-key registry (issue #65):** `viewing::Registry` is keyed by `KeyId` =
+  `blake3("rand-viewing-registry-id-1" ‖ nk)`, never by `nk` — a `BTreeMap` frees a removed key
+  unwiped, so only the zeroised `Import` may hold the secret. The RPC parses the key through
+  `parse_viewing_key` (`Zeroizing`); the request JSON and the vendored `ViewingKey`'s `Copy`
+  copies are not wiped (vendored code — change it upstream if ever needed).
 - **Open (v0.5.11):** a node-supplied token symbol is not length-bounded in the wallet; the
   `RPC_BLOCKING` process-wide semaphore (v0.5.8) makes `rpc::tests::a_token_transfer_reveals…` flaky
   under parallel load (passes alone).
