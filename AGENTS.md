@@ -6,7 +6,18 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-28)
 
-### v0.6.3 — delegated proving, Phase 2: split authorisation (2026-09-29; chain 17 only)
+### v0.6.3 — delegated proving, Phase 2: split authorisation (2026-09-29; tagged `d4fd0a3`, released, chain 17 only)
+
+**Released 2026-09-29 00:35 UTC:** https://github.com/randprotocol/fullnode/releases/tag/v0.6.3 — `rand-node`
+sha256 `64b362f7…f04c`, `rand` `b23b50fc…beca`, `rand-prover` `a8cc1caa…9258` (+ `SHA256SUMS`), built on E in
+`/root/build063` (`git archive` of the tag as `fullnode/`, circuits `b9ffc39` as `circuits/`; `RAND_BUILD_SHA`
+= the COMMIT `d4fd0a3`, not the tag object — v0.6.2's binaries report the tag object `de69480`). Gate: the
+full suite on the laptop (core 534, client lib 151, prover 46 across six binaries, node lib 354 + 21
+fixture-gap, node bin 24, genesis_cli 4, prover_hosted 5, prover_flag 3, ws 9, submit 2, split_auth 2,
+zkvm node-local 43, wallet_flow 9 (2 808 s under contention), cluster 26 (2 260 s), zusd_e2e 2 (2 669 s)),
+the whole-branch review (one Important: the three-proof block rule, fixed) and a fix-wave re-review. **Not
+rolled and never to be rolled onto chain 16** — it lands with the chain-17 cut. Trap: `gh release create`
+needs `-R randprotocol/fullnode` when run outside a checkout (bit twice).
 
 The bundle proof no longer takes the spend key. Spec `docs/superpowers/specs/2026-09-28-delegated-proving-design.md`
 §4–§5, plan `docs/superpowers/plans/2026-09-28-delegated-proving-phase2.md` (10 tasks, every task
