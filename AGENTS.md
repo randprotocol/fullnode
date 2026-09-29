@@ -6,6 +6,25 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-29)
 
+### v0.6.7 — the fixes on the chain-18 build (2026-09-29; rolls onto chain 18 one node at a time)
+
+`v0.6.7-rc1` (the gas model, chain 18's cut build) plus fixes that change no consensus rule, wire
+format, verifier key or shipped program digest, so it rolls onto the live chain 18 node by node:
+**#51** (the sealed-proof pruning pass keeps a height index of seal marks and shrinks the block row
+with the pruned record — dormant, no chain aggregates), **#64** (a wallet takes the note-envelope
+format from `LEGACY_ENVELOPE_CHAIN_IDS` = 14–17 by chain id, never from a node's `envelope_bytes`
+claim there; chain 18 is memo-on), **#65** (the viewing-key registry is keyed by
+`blake3("rand-viewing-registry-id-1" ‖ nk)`), and circuits `aeacf31` = cs8 `18c2627` + **#49**
+(rand-zkvm-cuda kernels without aliasing `&mut`, H100-tested), **#63** (rVM DSL allocator: the loop
+back edge inside the markers, an `if_eq` body may not move a live handle — all 14 shipped rVM
+programs byte-identical) and **#66** (ALU mutation fuzz, completeness, nine cheating cases, column
+roles; tests only). **Tagged before its full workspace suite finished, on the user's instruction**
+(the 256 GB box `rand-rvm-bigbox` was running it; it is destroyed 2026-09-30 04:00 UTC by the laptop
+launchd job `org.randprotocol.destroy-bigbox`). Known under a regenerated fixture cache:
+`the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte` rides on the original cache's
+random notes and fails on any fresh one. rVM under cs7: N=2 aggregate 133 GB, N=3 221 GB, the
+production exit proof exceeds 256 GB — aggregation stays off.
+
 ### Chain 18 — LIVE 2026-09-29 04:56 UTC (genesis `a7cb020c…4da76`, build v0.6.7-rc1 `0017de7`; the first gas-metered chain, constraint set 8)
 
 Cut on the user's go in this session ("chain 17 is already in production, feel free to move to chain 18
