@@ -121,9 +121,11 @@ fn sealed_withdraw_note(payout: &ShieldedAddress, amount: u64, time: u32, format
 /// method, or whose reply carries no such field (it predates the genesis field), leaves
 /// `envelope_bytes` at `None` — the same input that makes `EnvelopeFormat::for_chain` answer
 /// `Legacy` for a chain that never declared one at all, so `withdraw`, `aggregator withdraw` and
-/// `aggregate` all fall back the same way.
-async fn envelope_format(rpc: &RpcClient) -> Result<EnvelopeFormat> {
-    rpc.envelope_format().await
+/// `aggregate` all fall back the same way. `chain_id` is the transaction's own: on a chain pinned
+/// as pre-`envelope_bytes` the node's memo claim is not believed (issue #64,
+/// `randprotocol_client::LEGACY_ENVELOPE_CHAIN_IDS`).
+async fn envelope_format(rpc: &RpcClient, chain_id: u64) -> Result<EnvelopeFormat> {
+    rpc.envelope_format(chain_id).await
 }
 
 /// The `--aggregation` flag: `<bond RAND>,<max_covers>,<subsidy_base RAND>,<halving_blocks>,<window>`.
@@ -1147,7 +1149,7 @@ async fn main() -> Result<()> {
             // applying the transaction: that height does not exist yet. Admission takes any
             // `time` within the window (256 blocks), so the head is simply the freshest one.
             let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
-            let (note, envelope) = sealed_withdraw_note(&payout, amount - base, time, envelope_format(&rpc).await?)?;
+            let (note, envelope) = sealed_withdraw_note(&payout, amount - base, time, envelope_format(&rpc, chain_id).await?)?;
             let signature = kp
                 .sign(withdraw_message(chain_id, &kp.address(), amount, nonce, time, &note.r, &envelope).as_bytes());
             let action = randprotocol_core::Action::Withdraw {
@@ -1203,7 +1205,7 @@ async fn main() -> Result<()> {
                 let chain_id = rpc.chain_id().await?;
                 let genesis = rpc.genesis_hash().await?;
                 let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
-                let (note, envelope) = sealed_vesting_note(&to, amount - base, time, envelope_format(&rpc).await?)?;
+                let (note, envelope) = sealed_vesting_note(&to, amount - base, time, envelope_format(&rpc, chain_id).await?)?;
                 let signature = kp.sign(
                     claim_vested_message(&genesis, chain_id, &id, amount, nonce, &to, time, &note.r, &envelope).as_bytes(),
                 );
@@ -1234,7 +1236,7 @@ async fn main() -> Result<()> {
                 let chain_id = rpc.chain_id().await?;
                 let genesis = rpc.genesis_hash().await?;
                 let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
-                let (note, envelope) = sealed_vesting_note(&to, unvested - base, time, envelope_format(&rpc).await?)?;
+                let (note, envelope) = sealed_vesting_note(&to, unvested - base, time, envelope_format(&rpc, chain_id).await?)?;
                 let signature = kp.sign(
                     revoke_vesting_message(&genesis, chain_id, &id, unvested, nonce, &to, time, &note.r, &envelope).as_bytes(),
                 );
@@ -1321,7 +1323,7 @@ async fn main() -> Result<()> {
                 let base = randprotocol_core::gas::BUNDLE_BASE;
                 anyhow::ensure!(bond > base, "the bond does not cover the bundle base");
                 let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
-                let (note, envelope) = sealed_withdraw_note(&payout, bond - base, time, envelope_format(&rpc).await?)?;
+                let (note, envelope) = sealed_withdraw_note(&payout, bond - base, time, envelope_format(&rpc, chain_id).await?)?;
                 let signature = kp.sign(
                     aggregator_withdraw_message(chain_id, &kp.address(), nonce, time, &note.r, &envelope).as_bytes(),
                 );
@@ -1349,16 +1351,17 @@ async fn main() -> Result<()> {
 trait AggregateNode {
     async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value>;
     /// The chain's note-envelope format (`rand_getLimits.envelope_bytes`, v0.5.10): the payout
-    /// note is sealed in it, or a memo-format chain refuses the aggregate's envelope.
-    async fn envelope_format(&self) -> Result<EnvelopeFormat>;
+    /// note is sealed in it, or a memo-format chain refuses the aggregate's envelope. `chain_id` is
+    /// the transaction's own (issue #64).
+    async fn envelope_format(&self, chain_id: u64) -> Result<EnvelopeFormat>;
 }
 
 impl AggregateNode for RpcClient {
     async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         RpcClient::call(self, method, params).await
     }
-    async fn envelope_format(&self) -> Result<EnvelopeFormat> {
-        envelope_format(self).await
+    async fn envelope_format(&self, chain_id: u64) -> Result<EnvelopeFormat> {
+        envelope_format(self, chain_id).await
     }
 }
 
@@ -1489,7 +1492,7 @@ async fn aggregate_pass(
     // sealed to the register's payout address (spec §5.4).
     let subsidy = subsidy_base.checked_shr((n / halving) as u32).unwrap_or(0);
     let time = height as u32 + 1;
-    let (note, envelope) = sealed_withdraw_note(&payout, subsidy.saturating_add(shares), time, rpc.envelope_format().await?)?;
+    let (note, envelope) = sealed_withdraw_note(&payout, subsidy.saturating_add(shares), time, rpc.envelope_format(chain_id).await?)?;
     let signature = kp.sign(
         aggregate_signing_hash(chain_id, nonce, time, &note.r, &covers, &randprotocol_core::Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&envelope))
             .as_bytes(),
@@ -2238,7 +2241,7 @@ mod tests {
                 other => anyhow::bail!("unexpected call {other}"),
             })
         }
-        async fn envelope_format(&self) -> Result<EnvelopeFormat> {
+        async fn envelope_format(&self, _chain_id: u64) -> Result<EnvelopeFormat> {
             // A chain without `envelope_bytes`, as chains 14 and 15.
             Ok(EnvelopeFormat::for_chain(None))
         }

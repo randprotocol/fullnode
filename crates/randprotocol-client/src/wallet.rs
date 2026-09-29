@@ -2247,8 +2247,9 @@ async fn submit_spend(
     let plan = Plan::select(store, spend)?;
     // One `rand_getLimits` read (cached after the first) decides the envelope every slot of this
     // bundle is sealed in — before any proof is paid for, a memo this chain cannot carry is
-    // refused inside `build_bundle`.
-    let format = rpc.envelope_format().await?;
+    // refused inside `build_bundle`. Checked against this transaction's own chain id: a node's
+    // memo claim on a chain pinned as pre-`envelope_bytes` is not believed (issue #64).
+    let format = rpc.envelope_format(chain_id).await?;
     let (prepared, time) = prepare_bundle(rpc, w, store, &plan, format, &guest).await?;
     // The whole transaction first, its bundle's proof empty; then the proof, bound to it. Nothing
     // is set on the transaction after the proof but the proof itself.
@@ -3253,10 +3254,12 @@ pub struct RegisterTokenPlan {
 /// `initial` is `(amount, recipient)`; `None` registers a `Key`-authorised token empty. The caller
 /// has already refused `authority == MintAuthority::None` without an `initial` (the ledger's own
 /// rule, `TokenError::InitialMintRequired`) and a zero `--fixed-supply`/`--initial` amount, so
-/// this only checks the metadata, reads the chain and builds the note.
+/// this only checks the metadata, reads the chain and builds the note. `chain_id` is the one the
+/// transaction is built for, which decides the initial mint's envelope format (issue #64).
 pub async fn build_register_token(
     rpc: &RpcClient,
     w: &Wallet,
+    chain_id: u64,
     name: &str,
     symbol: &str,
     decimals: u8,
@@ -3286,7 +3289,7 @@ pub async fn build_register_token(
             }
             let time = u32::try_from(rpc.head().await?["height"].as_u64().context("head height")?)
                 .context("chain height does not fit a note's time field")?;
-            let (note, envelope) = mint_note_for(w, &recipient, amount, index, time, rpc.envelope_format().await?)?;
+            let (note, envelope) = mint_note_for(w, &recipient, amount, index, time, rpc.envelope_format(chain_id).await?)?;
             Some(InitialMint { amount, recipient, r: note.r, time, envelope })
         }
         None => None,
@@ -3341,7 +3344,7 @@ pub async fn build_token_mint(
     let (asset_id, nonce) = row_id_and_nonce(row, asset)?;
     let time = u32::try_from(rpc.head().await?["height"].as_u64().context("head height")?)
         .context("chain height does not fit a note's time field")?;
-    let (note, envelope) = mint_note_for(w, recipient, amount, asset, time, rpc.envelope_format().await?)?;
+    let (note, envelope) = mint_note_for(w, recipient, amount, asset, time, rpc.envelope_format(chain_id).await?)?;
     let cm = note.commitment();
     let signature = authority.sign(token_mint_message(chain_id, &asset_id, nonce, amount, &cm, &envelope).as_bytes());
     Ok(Action::TokenMint { asset, amount, recipient: recipient.clone(), r: note.r, time, envelope, nonce, signature })
@@ -3455,7 +3458,7 @@ async fn create_token_with(
         Some((kp, _)) => MintAuthority::Key(kp.public_key().clone()),
         None => MintAuthority::None,
     };
-    let plan = build_register_token(rpc, w, name, symbol, decimals, mint_authority, initial, salt).await?;
+    let plan = build_register_token(rpc, w, chain_id, name, symbol, decimals, mint_authority, initial, salt).await?;
     let index = plan.index;
     let id = match &plan.action {
         Action::RegisterToken { name, symbol, decimals, authority, initial, salt, .. } => {
@@ -4703,9 +4706,15 @@ mod tests {
         /// fake otherwise leaves to the caller (see every other test's manual `commit`) — so a
         /// scan of the payee finds it without a second, separate step.
         async fn send(&self, from: &Wallet, to: &ShieldedAddress, amount: u64, memo: &str) -> Result<Submission> {
+            self.send_on(7, from, to, amount, memo).await
+        }
+
+        /// [`send`](Self::send), with the transaction built for `chain_id` rather than the
+        /// fake's usual 7 (issue #64: a chain id this build knows predates `envelope_bytes`).
+        async fn send_on(&self, chain_id: u64, from: &Wallet, to: &ShieldedAddress, amount: u64, memo: &str) -> Result<Submission> {
             let rpc = serve(&self.inner).await;
             let mut store = NoteStore::default();
-            let submission = send_asset_with(&rpc, from, &mut store, to, 0, amount, memo, 1, FriProfile::Test, &Proving::Emulated, 7, false).await?;
+            let submission = send_asset_with(&rpc, from, &mut store, to, 0, amount, memo, 1, FriProfile::Test, &Proving::Emulated, chain_id, false).await?;
             let tx = self.last_tx();
             let b = tx.bundle.as_ref().expect("a plain transfer has a bundle");
             let leaves: Vec<(Word8, Envelope)> = b.commitments.iter().zip(&b.envelopes).map(|(cm, e)| (*cm, e.clone())).collect();
@@ -4756,6 +4765,25 @@ mod tests {
         chain.send(&alice, &bob.address, 1, "").await.unwrap();
         for e in chain.last_tx().bundle.unwrap().envelopes.iter() {
             assert_eq!(e.len(), 1348, "an old wallet can open it");
+        }
+    }
+
+    /// Issue #64: `rand_getLimits` is the node's word, not the genesis'. A node (or anything
+    /// between the wallet and it) that answers `envelope_bytes: 1860` for a chain whose genesis
+    /// has no such field — chain 15 here — must not make the wallet seal 1,860-byte envelopes:
+    /// the chain would admit them (≤ 2,048) and every transaction this wallet sent would carry a
+    /// permanent public tag among everyone else's 1,348-byte ones. The chain id is the
+    /// transaction's own (a lie about it gets the transaction refused `WrongChain`), so it is
+    /// what the wallet checks the claim against.
+    #[tokio::test]
+    async fn a_node_claiming_the_memo_format_on_a_pre_memo_chain_is_not_believed() {
+        let chain = FakeChain::with_envelope_bytes(Some(1860)); // the lie
+        let (alice, bob) = (chain.funded_wallet(10), chain.fresh_wallet());
+        let err = chain.send_on(15, &alice, &bob.address, 1, "coffee").await.unwrap_err();
+        assert!(err.to_string().contains("no memo"), "{err}");
+        chain.send_on(15, &alice, &bob.address, 1, "").await.unwrap();
+        for e in chain.last_tx().bundle.unwrap().envelopes.iter() {
+            assert_eq!(e.len(), 1348, "chain 15's genesis has no envelope_bytes, whatever the node says");
         }
     }
 
@@ -5595,11 +5623,11 @@ mod tests {
         let me = Wallet::from_spend_key(SpendKey([65; 8]));
         let rpc =
             RpcClient::new(rpc_fn(|_m, _p| panic!("build_register_token must refuse bad metadata before any RPC call")).await);
-        let e = build_register_token(&rpc, &me, "", "FIX", 6, MintAuthority::None, None, [0; 32]).await.unwrap_err().to_string();
+        let e = build_register_token(&rpc, &me, 7, "", "FIX", 6, MintAuthority::None, None, [0; 32]).await.unwrap_err().to_string();
         assert!(e.to_lowercase().contains("name"), "{e}");
-        let e = build_register_token(&rpc, &me, "Fixed", "", 6, MintAuthority::None, None, [0; 32]).await.unwrap_err().to_string();
+        let e = build_register_token(&rpc, &me, 7, "Fixed", "", 6, MintAuthority::None, None, [0; 32]).await.unwrap_err().to_string();
         assert!(e.to_lowercase().contains("symbol"), "{e}");
-        let e = build_register_token(&rpc, &me, "Fixed", "FIX", 250, MintAuthority::None, None, [0; 32]).await.unwrap_err().to_string();
+        let e = build_register_token(&rpc, &me, 7, "Fixed", "FIX", 250, MintAuthority::None, None, [0; 32]).await.unwrap_err().to_string();
         assert!(e.to_lowercase().contains("decimals"), "{e}");
     }
 
@@ -5852,7 +5880,7 @@ mod tests {
         let mut store = NoteStore::default();
 
         // ---- fixed supply: authority None, the whole initial mint required ----
-        let plan = build_register_token(&rpc, &me, "Fixed", "FIX", 6, MintAuthority::None, Some((1_000, me.address.clone())), [1; 32])
+        let plan = build_register_token(&rpc, &me, 7, "Fixed", "FIX", 6, MintAuthority::None, Some((1_000, me.address.clone())), [1; 32])
             .await
             .unwrap();
         assert_eq!((plan.index, plan.registration_fee), (1, 1_000));
@@ -5878,7 +5906,7 @@ mod tests {
         // ---- Key authority, registering empty: a second next_index, a different id ----
         chain.lock().unwrap().tokens["next_index"] = serde_json::json!(2);
         let authority_kp = Keypair::generate();
-        let plan = build_register_token(&rpc, &me, "Keyed", "KEY", 6, MintAuthority::Key(authority_kp.public_key().clone()), None, [2; 32])
+        let plan = build_register_token(&rpc, &me, 7, "Keyed", "KEY", 6, MintAuthority::Key(authority_kp.public_key().clone()), None, [2; 32])
             .await
             .unwrap();
         assert_eq!(plan.index, 2);

@@ -1675,7 +1675,11 @@ async fn main() -> Result<()> {
             // The blinding is the attestation digest's, not this wallet's (F1): the same note
             // whoever submits this attestation at this `time`, which is what makes a copier's
             // submission a conflict rather than a second, different note.
-            let (note, envelope) = wallet::deposit_note_for(&w, &recipient, &bytes, d.amount, index, time, rpc.envelope_format().await?)?;
+            // The chain id this transaction is built for, read once: it also decides the envelope
+            // format, so a node's memo claim on a pre-`envelope_bytes` chain is not believed (#64).
+            let chain_id = rpc.chain_id().await?;
+            let (note, envelope) =
+                wallet::deposit_note_for(&w, &recipient, &bytes, d.amount, index, time, rpc.envelope_format(chain_id).await?)?;
             let owner = recipient.to_string();
             // The action names the index this envelope was sealed for, and admission refuses a
             // mismatch (`Action::BridgeAttest`) — which nothing on a listed token can now cause,
@@ -1693,7 +1697,6 @@ async fn main() -> Result<()> {
                 Some(f) => parse_amount(&f)?,
                 None => gas::fee_floor(&action),
             };
-            let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
             let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
                 .await;

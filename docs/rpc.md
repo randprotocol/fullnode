@@ -355,6 +355,17 @@ exactly that long — a wallet seals the memo-carrying format instead, and a mem
 by the payee, the sender's own history, and anyone handed that output's per-transaction key.
 There is no other value yet: `validate` accepts only `1860` once the field is present.
 
+**A wallet does not take `envelope_bytes` on the node's word alone** (issue #64). Nothing in this
+reply is authenticated, and a chain without the field still admits any note envelope up to 2 048
+bytes — so a node answering `1860` there could make a wallet seal 1 860-byte envelopes among
+everyone else's 1 348-byte ones, tagging every transaction it sends. The node keeps only the
+genesis hash, not the file, so the claim cannot be checked against the genesis; instead the `rand`
+wallet (and `rand-node`'s operator commands) seal the legacy form on every chain id pinned in
+`randprotocol_client::LEGACY_ENVELOPE_CHAIN_IDS` (14–17 today) whatever this field says. The chain
+id is the transaction's own, and a transaction carrying another is refused `WrongChain`, so a node
+cannot move it. Every chain cut without `envelope_bytes` must be added to that list (a test over
+`deploy/genesis-chain*.json` fails until it is). Other clients should do the same.
+
 `hardening_v6` is `true` when the genesis sets the v0.6 switch (`docs/deploy.md`, "The next cut:
 `hardening_v6`"). A wallet then proves a call over the program's public input (empty for most)
 followed by the transaction's call binding (`Transaction::call_binding`, INT-4; issue #55 for a
