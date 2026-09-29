@@ -194,3 +194,124 @@ pub fn fib_proof_tier_10() -> (randprotocol_zkvm::isa::Program, randprotocol_zkv
     let (proof, _exec) = m.prove(&p, &[], &[], Some(Tier(10))).expect("fib(20) proves at tier 10");
     (p, proof)
 }
+
+// ── The fixed lookup tables (issue #66) ──────────────────────────────────────────────────────────
+// Five buses have a *fixed* provider: `range` (RANGE8, POW2) and `nibble` (AND4, OR4, XOR4) are
+// preprocessed tables whose only witness is how often each row is used. A cheating prover picks
+// those multiplicities freely, so after it tampers a row the only question a fixed bus asks is
+// whether every tuple the row now consumes is a row of the table at all. The helpers below answer
+// that, and rewrite the two tables' multiplicity columns the way such a prover would — so a
+// cheating test that tampers an ALU row is caught by the constraint it is written for, never by a
+// multiplicity the test forgot to move.
+use randprotocol_zkvm::machine::{chips, Chip, Tier, Traces};
+use randprotocol_zkvm::tables::{bus, nibble, range};
+
+/// Is `name` one of the five buses a fixed table provides?
+pub fn is_fixed_bus(name: &str) -> bool {
+    [bus::RANGE8.name(), bus::POW2.name(), bus::AND4.name(), bus::OR4.name(), bus::XOR4.name()].contains(&name)
+}
+
+/// Is `tuple` a row of the fixed table behind bus `name`? (`false` for any other bus.)
+pub fn in_fixed_table(name: &str, tuple: &[Val]) -> bool {
+    use p3_field::PrimeField64;
+    let u: Vec<u64> = tuple.iter().map(|v| v.as_canonical_u64()).collect();
+    let nib = |f: fn(u64, u64) -> u64| u.len() == 3 && u[0] < 16 && u[1] < 16 && u[2] == f(u[0], u[1]);
+    if name == bus::RANGE8.name() {
+        u.len() == 1 && u[0] < 256
+    } else if name == bus::POW2.name() {
+        u.len() == 2 && u[0] < 32 && u[1] == 1 << u[0]
+    } else if name == bus::AND4.name() {
+        nib(|a, b| a & b)
+    } else if name == bus::OR4.name() {
+        nib(|a, b| a | b)
+    } else if name == bus::XOR4.name() {
+        nib(|a, b| a ^ b)
+    } else {
+        false
+    }
+}
+
+/// The table rows of `t` padded to the chip's width with zero blind columns (constraint set 7's
+/// blind is not in `Traces`; on every row but the first it is zero, and no fixed bus reads it).
+fn chip_row(m: &p3_matrix::dense::RowMajorMatrix<Val>, r: usize) -> Vec<Val> {
+    use p3_matrix::Matrix;
+    let (w, h) = (m.width(), m.height());
+    m.values[(r % h) * w..(r % h) * w + w].to_vec()
+}
+
+/// Every fixed-bus tuple the non-fixed tables of `t` consume, with its summed (signed) count.
+pub fn fixed_demand(t: &Traces, tier: Tier) -> std::collections::BTreeMap<(String, Vec<u64>), Val> {
+    use p3_air::BaseAir;
+    use p3_field::{PrimeCharacteristicRing, PrimeField64};
+    use p3_matrix::Matrix;
+    let mut demand = std::collections::BTreeMap::new();
+    for (chip, m) in chips(tier, t.keccak_log_height, t.sha256_log_height).iter().zip(t.as_slice()) {
+        if matches!(chip, Chip::Range(_) | Chip::Nibble(_)) {
+            continue;
+        }
+        let (interactions, _) = symbolic_air(chip);
+        let fixed: Vec<&Interaction> = interactions.iter().filter(|i| is_fixed_bus(&i.bus_name)).collect();
+        if fixed.is_empty() {
+            continue;
+        }
+        let pre = BaseAir::<Val>::preprocessed_trace(chip);
+        let pre_row = |i: usize| pre.as_ref().map(|p| chip_row(p, i)).unwrap_or_default();
+        let public = if matches!(chip, Chip::Cpu(_)) { t.public_values.clone() } else { vec![] };
+        let h = m.height();
+        for r in 0..h {
+            let rows = Rows { cur: chip_row(m, r), next: chip_row(m, r + 1), pre_cur: pre_row(r), pre_next: pre_row(r + 1), public: public.clone() };
+            for i in &fixed {
+                let c = eval_boundary(&i.count, &rows, r == 0, r == h - 1);
+                if c == Val::ZERO {
+                    continue;
+                }
+                let key: Vec<u64> = i.fields.iter().map(|f| eval_boundary(f, &rows, r == 0, r == h - 1).as_canonical_u64()).collect();
+                *demand.entry((i.bus_name.clone(), key)).or_insert(Val::ZERO) += c;
+            }
+        }
+    }
+    demand
+}
+
+/// Rewrite the range and nibble tables' multiplicity columns so they pay exactly what the other
+/// tables of `t` consume — what a cheating prover, who picks those columns freely, does after a
+/// tamper. Returns every demanded tuple no table row can pay (those stay unpaid: the bus is left
+/// unbalanced, which is the fixed table catching the tamper).
+pub fn repay_fixed_tables(t: &mut Traces, tier: Tier) -> Vec<String> {
+    use p3_field::PrimeCharacteristicRing;
+    // The provider's sign: a table row with multiplicity 1, read through the range table's own
+    // symbolic interaction. `demand + sign·M = 0` is what balances, so `M = −sign·demand`.
+    let (range_ints, _) = symbolic_air(&randprotocol_zkvm::tables::range::RangeAir);
+    let probe = Rows { cur: vec![Val::ONE; range::col::WIDTH], next: vec![Val::ONE; range::col::WIDTH], pre_cur: vec![Val::ZERO; range::pre::WIDTH], pre_next: vec![Val::ZERO; range::pre::WIDTH], public: vec![] };
+    let sign = eval_rows(&range_ints.iter().find(|i| i.bus_name == bus::RANGE8.name()).expect("range provides RANGE8").count, &probe);
+    assert!(sign == Val::ONE || sign == Val::NEG_ONE, "a table row's count is its multiplicity");
+    let demand = fixed_demand(t, tier);
+    for r in 0..range::HEIGHT {
+        t.range.values[r * range::col::WIDTH + range::col::M_RANGE] = Val::ZERO;
+        t.range.values[r * range::col::WIDTH + range::col::M_POW2] = Val::ZERO;
+    }
+    for r in 0..nibble::HEIGHT {
+        for c in [nibble::col::M_AND, nibble::col::M_OR, nibble::col::M_XOR] {
+            t.nibble.values[r * nibble::col::WIDTH + c] = Val::ZERO;
+        }
+    }
+    let mut unpaid = Vec::new();
+    for ((name, key), d) in demand {
+        let tuple: Vec<Val> = key.iter().map(|&k| Val::from_u64(k)).collect();
+        if !in_fixed_table(&name, &tuple) {
+            unpaid.push(format!("{name}{key:?}"));
+            continue;
+        }
+        let m = -(sign * d);
+        let slot = if name == bus::RANGE8.name() {
+            &mut t.range.values[key[0] as usize * range::col::WIDTH + range::col::M_RANGE]
+        } else if name == bus::POW2.name() {
+            &mut t.range.values[key[0] as usize * range::col::WIDTH + range::col::M_POW2]
+        } else {
+            let c = if name == bus::AND4.name() { nibble::col::M_AND } else if name == bus::OR4.name() { nibble::col::M_OR } else { nibble::col::M_XOR };
+            &mut t.nibble.values[nibble::row_of(key[0] as u32, key[1] as u32) * nibble::col::WIDTH + c]
+        };
+        *slot = m;
+    }
+    unpaid
+}

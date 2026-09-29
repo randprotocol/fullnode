@@ -10,7 +10,7 @@ use randprotocol_zkvm::asm::{ops::*, Assembler};
 use randprotocol_zkvm::emulator::{execute, CycleEvent, HashRow, MemAccess, Syscall, SLOT_W, SPACE_RAM};
 use randprotocol_zkvm::guests;
 use randprotocol_zkvm::isa::{AluOp, Decoded, Instr, Program, REG_A0, REG_A1, REG_A2, REG_A7, SYS_POSEIDON2};
-use randprotocol_zkvm::machine::{build_traces_salted, FriProfile, Machine, Tier, Traces, Val};
+use randprotocol_zkvm::machine::{build_traces_salted, build_traces_salted_with, FriProfile, Machine, Tier, Traces, Val};
 use randprotocol_zkvm::tables::{alu, cpu, keccak, limbs, memory, nibble, poseidon2, program, range, F};
 
 /// `rejects()`, and the two constraint-panic prefixes it matches (`CONSTRAINT_PANIC` and
@@ -650,6 +650,274 @@ fn a_sign_flipped_mulh_is_rejected() {
     // genuine mismatch, and the public output stays whatever the (now-inconsistent) row
     // claims so `verify` doesn't reject on a public-value mismatch instead.
     assert!(rejects(|| { let pr = m.prove_traces(&p, &t, Tier(10)); m.verify(&p.digest(), &pr) }));
+}
+
+// ---------------------------------------------------------------------------------------
+// Issue #66: the seven ALU forgeries the #62 review found no test for.
+//
+// Every test above that tampers an ALU row changes the row's `C` but leaves the cpu row, the
+// register file and the public output saying the honest value — so the `ALU` bus is unbalanced
+// and the proof fails whether or not the constraint the test is named after holds. These do not.
+// Each one is a *closed* edit: the op writes `a1` directly and the `WRITE_OUTPUT` ecall publishes
+// it, and `forge_the_op_result` carries the forged value through the cpu row, every later read of
+// `a1`, the memory table and the public output; the fixed tables (range, nibble) are then repaid
+// for whatever the forged row consumes (`common::repay_fixed_tables`). What is left is one ALU row
+// providing a wrong `(op, a, b, c)` that the rest of the batch agrees with — so the ALU AIR's own
+// constraints are the only thing between the forgery and a verifying proof. Each test's doc names
+// the constraint that catches it, and each was run with that constraint removed from
+// `tables/alu.rs` and seen to verify (the commit message quotes the runs).
+// ---------------------------------------------------------------------------------------
+
+/// `op(a1, t0, t1)` on `a`, `b`, then `WRITE_OUTPUT(0, a1)` and `HALT`. The op writes `a1` itself,
+/// so no `mv` (itself an ALU `Add` whose tuple would also need forging) stands between the op and
+/// the output.
+fn one_op(op: fn(u32, u32, u32) -> Instr, a: u32, b: u32) -> Program {
+    let mut asm = Assembler::new(0);
+    asm.extend(li(5, a as i32));
+    asm.extend(li(6, b as i32));
+    asm.push(op(REG_A1, 5, 6));
+    asm.extend(li(REG_A7, randprotocol_zkvm::isa::SYS_WRITE_OUTPUT as i32));
+    asm.extend(li(REG_A0, 0));
+    asm.push(ecall());
+    asm.extend(halt());
+    asm.assemble()
+}
+
+/// The honest tier-10 traces of `p` and the machine to prove them with.
+fn one_op_traces(p: &Program) -> (Machine, Traces) {
+    let e = execute(p, &[], &[], 10_000).unwrap();
+    (Machine::new(FriProfile::Test), build_traces_salted_with(p, &[], &[], [0u32; 4], &e, Tier(10), Default::default()).unwrap())
+}
+
+/// The ALU row that provides `(op, a, b, ·)` with a nonzero multiplicity.
+fn alu_row_for(t: &Traces, op: AluOp, a: u32, b: u32) -> usize {
+    let w = alu::col::WIDTH;
+    (0..t.alu.height())
+        .find(|r| {
+            let row = &t.alu.values[r * w..(r + 1) * w];
+            row[alu::col::FLAG0 + op.code() as usize] == F::ONE && row[alu::col::A] == F::from_u32(a) && row[alu::col::B] == F::from_u32(b) && row[alu::col::MULT] != F::ZERO
+        })
+        .unwrap_or_else(|| panic!("no ALU row provides {op:?}({a:#x}, {b:#x})"))
+}
+
+/// Set an ALU row's `C` and its four limbs to `c`.
+fn set_alu_c(t: &mut Traces, row: usize, c: u32) {
+    let w = alu::col::WIDTH;
+    t.alu.values[row * w + alu::col::C] = F::from_u32(c);
+    for (k, l) in limbs(c).into_iter().enumerate() { t.alu.values[row * w + alu::col::C0 + k] = l; }
+}
+
+/// Set four byte-limb columns starting at `base` to `x`'s bytes.
+fn set_alu_word(t: &mut Traces, row: usize, base: usize, x: u32) {
+    let w = alu::col::WIDTH;
+    for (k, l) in limbs(x).into_iter().enumerate() { t.alu.values[row * w + base + k] = l; }
+}
+
+/// The closed edit: the register-register `op` that writes `a1` now yields `forged`. The cpu row's
+/// `ALU_OUT`/`C`, every later ecall row that reads `a1` (`MEM_VAL`), every memory-table row of `a1`
+/// from the write on, the public output word and the providing ALU row's `C` (and limbs) all move
+/// together. Returns the ALU row, whose remaining columns the caller forges.
+fn forge_the_op_result(t: &mut Traces, op: AluOp, a: u32, b: u32, forged: u32) -> usize {
+    let (wc, wm) = (cpu::col::WIDTH, memory::col::WIDTH);
+    let honest = F::from_u32(op.eval(a, b));
+    let new = F::from_u32(forged);
+    let op_row = (0..t.cpu.height())
+        .find(|r| {
+            let row = &t.cpu.values[r * wc..(r + 1) * wc];
+            row[cpu::col::IS_ALU] == F::ONE && row[cpu::col::ALU_OP] == F::from_u32(op.code()) && row[cpu::col::RD] == F::from_u32(REG_A1)
+        })
+        .expect("the op writes a1");
+    assert_eq!(t.cpu.values[op_row * wc + cpu::col::C], honest);
+    let write_ts = 4 * t.cpu.values[op_row * wc + cpu::col::CLK].as_canonical_u64() + SLOT_W as u64;
+    t.cpu.values[op_row * wc + cpu::col::ALU_OUT] = new;
+    t.cpu.values[op_row * wc + cpu::col::C] = new;
+    for r in op_row + 1..t.cpu.height() {
+        let row = &mut t.cpu.values[r * wc..(r + 1) * wc];
+        if row[cpu::col::IS_ECALL] == F::ONE && row[cpu::col::MEM_VAL] == honest { row[cpu::col::MEM_VAL] = new; }
+    }
+    for r in 0..t.memory.height() {
+        let row = &mut t.memory.values[r * wm..(r + 1) * wm];
+        if row[memory::col::IS_REAL] == F::ONE && row[memory::col::SPACE] == F::ZERO && row[memory::col::ADDR] == F::from_u32(REG_A1) && row[memory::col::TS].as_canonical_u64() >= write_ts {
+            row[memory::col::VALUE] = new;
+        }
+    }
+    t.public_values[cpu::pv::OUT0] = new;
+    let alu_row = alu_row_for(t, op, a, b);
+    set_alu_c(t, alu_row, forged);
+    alu_row
+}
+
+/// Repay the fixed tables for the forged row and prove: `true` iff the batch refuses it.
+fn forged_is_rejected(m: &Machine, p: &Program, mut t: Traces) -> bool {
+    let unpaid = common::repay_fixed_tables(&mut t, Tier(10));
+    if !unpaid.is_empty() { eprintln!("the forged row consumes tuples no fixed table holds: {unpaid:?}"); }
+    rejects(|| { let pr = m.prove_traces(p, &t, Tier(10)); m.verify(&p.digest(), &pr) })
+}
+
+/// The harness itself: an honest one-op run, pushed through the closed edit with its own honest
+/// value and the fixed-table repayment, still proves — so every test below that is rejected is
+/// rejected for its forgery, not for something the edit or the repayment broke.
+#[test]
+fn the_closed_alu_edit_with_the_honest_value_still_proves() {
+    for (op, ins, a, b) in [(AluOp::Div, div as fn(u32, u32, u32) -> Instr, (-7i32) as u32, 2u32), (AluOp::And, and, 0x0f, 0x0f)] {
+        let p = one_op(ins, a, b);
+        let (m, mut t) = one_op_traces(&p);
+        forge_the_op_result(&mut t, op, a, b, op.eval(a, b));
+        assert!(!forged_is_rejected(&m, &p, t), "{op:?}: the honest closed edit must verify");
+    }
+}
+
+/// DIV/REM sign fix-up, the `QH3` gadget. `DIV(-7, 2) = -3` and `REM(-7, 2) = -1` both negate a
+/// nonzero magnitude (`Q = 3`, `R = 1`). Forging `QH3 = 1` ("the magnitude is zero", with `INV =
+/// 0` so `mag·INV = 1 − QH3` holds) switches the negation off, and the row claims `+3` / `+1`, in
+/// range and otherwise consistent. Caught by the gadget's second half,
+/// `normal·QH3·mag = 0` (`tables/alu.rs`, the division block). Removed, both forgeries verify.
+#[test]
+fn a_div_or_rem_skipping_its_sign_fix_through_qh3_is_rejected() {
+    for (op, ins) in [(AluOp::Div, div as fn(u32, u32, u32) -> Instr), (AluOp::Rem, rem)] {
+        let (a, b) = ((-7i32) as u32, 2u32);
+        let p = one_op(ins, a, b);
+        let (m, mut t) = one_op_traces(&p);
+        let honest = op.eval(a, b);
+        let forged = honest.wrapping_neg(); // +3 / +1: the magnitude, unnegated
+        let row = forge_the_op_result(&mut t, op, a, b, forged);
+        let w = alu::col::WIDTH;
+        assert_eq!(t.alu.values[row * w + alu::col::QH3], F::ZERO, "the magnitude is nonzero");
+        t.alu.values[row * w + alu::col::QH3] = F::ONE;
+        t.alu.values[row * w + alu::col::INV] = F::ZERO;
+        assert!(forged_is_rejected(&m, &p, t), "{op:?}(-7, 2) claiming {forged}");
+    }
+}
+
+/// SRA sign fill. `SRA(-8, 1) = -4 = 0xffff_fffc`. Forging `SA = 0` (A "non-negative") turns the
+/// row into a logical shift — complement-free, `Q = 0x7fff_fffc`, `R = 0`, `T = PW − 1 − R = 1` — and
+/// it claims `0x7fff_fffc`, every identity of the shift block satisfied. Caught by A's sign-bit
+/// extraction, `AND4[AH3, 8, SA·8]` (`AH3 = 0xf`, so `0xf & 8 = 8 ≠ 0`), counted on `sra` rows
+/// through `need_sa`. With `sra` removed from `need_sa`, it verifies.
+#[test]
+fn an_sra_without_its_sign_fill_is_rejected() {
+    let (a, b) = ((-8i32) as u32, 1u32);
+    let p = one_op(sra, a, b);
+    let (m, mut t) = one_op_traces(&p);
+    let forged = a >> 1; // the logical shift
+    let row = forge_the_op_result(&mut t, AluOp::Sra, a, b, forged);
+    let w = alu::col::WIDTH;
+    assert_eq!(t.alu.values[row * w + alu::col::SA], F::ONE);
+    t.alu.values[row * w + alu::col::SA] = F::ZERO;
+    set_alu_word(&mut t, row, alu::col::Q0, forged); // a' = A >> 1, uncomplemented
+    set_alu_word(&mut t, row, alu::col::S0, 0);      // r = A mod 2
+    set_alu_word(&mut t, row, alu::col::T0, 1);      // t = PW − 1 − r
+    assert!(forged_is_rejected(&m, &p, t));
+}
+
+/// SLT on mixed signs. `SLT(-1, 1) = 1`, but the unsigned compare says `0xffff_ffff ≥ 1` (the
+/// adder's borrow is 0). Claiming `C = 0` — the unsigned answer — with `SA`/`SB` left honest is
+/// caught only by the mixed-sign selection, `slt·(C − (1 − sx)·borrow − sx·SA) = 0` with `sx = 1`.
+/// Removed, it verifies (`C` stays boolean; nothing else on an `slt` row reads it).
+#[test]
+fn an_slt_answering_the_unsigned_compare_on_mixed_signs_is_rejected() {
+    let (a, b) = ((-1i32) as u32, 1u32);
+    let p = one_op(slt, a, b);
+    let (m, mut t) = one_op_traces(&p);
+    forge_the_op_result(&mut t, AluOp::Slt, a, b, 0);
+    assert!(forged_is_rejected(&m, &p, t));
+}
+
+/// DIVU by zero. `DIVU(10, 0) = 0xffff_ffff`; claiming `0` is caught only by
+/// `DIVZ·(div + divu)·(C − 0xffff_ffff) = 0` (the division identity is off: `normal = 0`).
+/// Removed, it verifies.
+#[test]
+fn a_divu_by_zero_not_returning_all_ones_is_rejected() {
+    let p = one_op(divu, 10, 0);
+    let (m, mut t) = one_op_traces(&p);
+    forge_the_op_result(&mut t, AluOp::Divu, 10, 0, 0);
+    assert!(forged_is_rejected(&m, &p, t));
+}
+
+/// REM by zero. `REM(-7, 0) = -7` (the dividend); claiming `0` is caught only by
+/// `DIVZ·(rem + remu)·(C − A) = 0`. Removed, it verifies.
+#[test]
+fn a_rem_by_zero_not_returning_the_dividend_is_rejected() {
+    let a = (-7i32) as u32;
+    let p = one_op(rem, a, 0);
+    let (m, mut t) = one_op_traces(&p);
+    forge_the_op_result(&mut t, AluOp::Rem, a, 0, 0);
+    assert!(forged_is_rejected(&m, &p, t));
+}
+
+/// MULHSU. `MULHSU(-1, 1) = 0xffff_ffff` (`-1 · 1`, high word). Forging `SA = 0` makes it the
+/// unsigned product's high word, `0` — with the sign-correction `borrow` (`S0`) set to `0` to
+/// match, every product identity holds. Caught by A's sign-bit extraction, which `need_sa` counts
+/// on `mulhsu` rows (and `need_sb` deliberately does not: MULHSU's `B` is unsigned). With
+/// `mulhsu` removed from `need_sa`, it verifies.
+#[test]
+fn a_mulhsu_dropping_as_sign_is_rejected() {
+    let (a, b) = ((-1i32) as u32, 1u32);
+    let p = one_op(mulhsu, a, b);
+    let (m, mut t) = one_op_traces(&p);
+    let row = forge_the_op_result(&mut t, AluOp::Mulhsu, a, b, 0);
+    let w = alu::col::WIDTH;
+    assert_eq!(t.alu.values[row * w + alu::col::SA], F::ONE);
+    assert_eq!(t.alu.values[row * w + alu::col::S0], F::ONE, "the honest row borrows");
+    t.alu.values[row * w + alu::col::SA] = F::ZERO;
+    t.alu.values[row * w + alu::col::S0] = F::ZERO;
+    assert!(forged_is_rejected(&m, &p, t));
+}
+
+/// A branch on `EQ` whose target is its own fall-through, so taken and not taken continue at the
+/// same pc and the cpu side of an `EQ` forgery is one column (`ALU_OUT`).
+fn one_beq(a: u32, b: u32) -> Program {
+    let mut asm = Assembler::new(0);
+    asm.extend(li(5, a as i32));
+    asm.extend(li(6, b as i32));
+    asm.branch(randprotocol_zkvm::isa::BranchCond::Eq, 5, 6, "next");
+    asm.label("next");
+    asm.extend(halt());
+    asm.assemble()
+}
+
+/// Forge the `EQ` row behind `one_beq(a, b)` to say `c` (and `INV` to `inv`).
+fn forge_eq(a: u32, b: u32, c: u32, inv: F) -> (Machine, Program, Traces) {
+    let p = one_beq(a, b);
+    let (m, mut t) = one_op_traces(&p);
+    let wc = cpu::col::WIDTH;
+    let br = (0..t.cpu.height()).find(|r| t.cpu.values[r * wc + cpu::col::IS_BRANCH] == F::ONE).expect("a branch row");
+    assert_eq!(t.cpu.values[br * wc + cpu::col::ALU_OUT], F::from_u32(AluOp::Eq.eval(a, b)));
+    t.cpu.values[br * wc + cpu::col::ALU_OUT] = F::from_u32(c);
+    let row = alu_row_for(&t, AluOp::Eq, a, b);
+    set_alu_c(&mut t, row, c);
+    t.alu.values[row * alu::col::WIDTH + alu::col::INV] = inv;
+    (m, p, t)
+}
+
+/// The EQ inverse gadget, second half: `EQ(5, 7) = 0`. Claiming `1` with `INV = 0` satisfies the
+/// first half, `diff·INV + C − 1 = 0`; it is caught only by `eq·C·diff = 0`. Removed, it verifies.
+#[test]
+fn an_eq_claiming_equal_for_different_operands_is_rejected() {
+    let (m, p, t) = forge_eq(5, 7, 1, F::ZERO);
+    assert!(forged_is_rejected(&m, &p, t));
+}
+
+/// The EQ inverse gadget, first half: `EQ(5, 5) = 1`. Claiming `0` satisfies `eq·C·diff = 0`
+/// (`diff = 0`), and no `INV` makes `diff·INV + C − 1 = −1` vanish: caught only by
+/// `eq·(diff·INV + C − 1) = 0`. Removed, it verifies.
+#[test]
+fn an_eq_claiming_different_for_equal_operands_is_rejected() {
+    let (m, p, t) = forge_eq(5, 5, 0, F::ZERO);
+    assert!(forged_is_rejected(&m, &p, t));
+}
+
+/// The derived high nibble on a bitwise row. `AND(0x0f, 0x0f) = 0x0f`; forge `C = 0xff`. The low
+/// nibbles are untouched (`AND4[0xf, 0xf, 0xf]` still holds) and `C0`'s `RANGE8` is off on bitwise
+/// rows (`g_c = 0`), so the only thing binding `C0`'s top half is the high-nibble lookup on the
+/// *derived* `ch = (C0 − cl)·16⁻¹ = 0xf`: `AND4[0, 0, 0xf]` is no row of the table. With that
+/// lookup removed (the `AND4.lookup_key(b, [ah, bh, ch], …)` line), it verifies.
+#[test]
+fn a_bitwise_row_with_a_forged_high_nibble_is_rejected() {
+    let p = one_op(and, 0x0f, 0x0f);
+    let (m, mut t) = one_op_traces(&p);
+    forge_the_op_result(&mut t, AluOp::And, 0x0f, 0x0f, 0xff);
+    assert!(forged_is_rejected(&m, &p, t));
 }
 
 /// M3.1: the Poseidon2 table's round-transition constraints are gated by the *preprocessed*

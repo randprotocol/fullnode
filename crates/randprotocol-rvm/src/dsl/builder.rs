@@ -148,6 +148,11 @@ enum Op2 {
     /// Loop markers, paired by `id`: the liveness clamp and the allocation-invariant check.
     LoopTop { id: u32 },
     LoopEnd { id: u32 },
+    /// `if_eq` body markers, paired by nesting: the replay snapshots the allocation at the top
+    /// and checks at the end that the body left every handle still live where it found it
+    /// (issue #63, R62-DSL-2). They emit nothing and move no liveness.
+    BranchTop,
+    BranchEnd,
     /// A phase boundary for `Stats::phase_rows`: the replay counts emitted instructions between
     /// consecutive markers.
     Phase { name: &'static str },
@@ -733,15 +738,25 @@ impl Builder {
 
     /// `body` emitted once and executed when `a == b`: a `JNE` over it. Assertions branch to a
     /// trap; this is the working conditional — the one the runtime-length sponge's rate-fill
-    /// branch needs (M5.3). The body's allocation effects are its own; a taken branch simply
-    /// skips its rows.
+    /// branch needs (M5.3).
+    ///
+    /// The replay allocates straight through the body, but the not-taken path skips its rows —
+    /// spills included. So the body must leave every handle that is still live after it exactly
+    /// where it found it (no eviction of a handle the code after the body reads: its spill
+    /// `STORE` would not have run), and no handle defined in the body may outlive it (on the
+    /// not-taken path it was never written). The replay checks both at the body's end and
+    /// refuses the build otherwise (issue #63, R62-DSL-2: a skipped spill was reloaded from a
+    /// stale cell). A pre-branch handle whose last use is inside the body may be freed there;
+    /// it is dead on both paths. Pass results out through memory.
     pub fn if_eq(&mut self, a: Felt, b: Felt, body: impl FnOnce(&mut Self)) {
         self.begin();
         let ra = self.materialise(a.0);
         let rb = self.materialise(b.0);
         self.emit(Op::Jne, ra, rb, BRef::Imm(F::ZERO));
         let at = self.ops.len() as u32 - 1;
+        self.ops.push(Op2::BranchTop);
         body(self);
+        self.ops.push(Op2::BranchEnd);
         // The branch lands on the group marker that follows the body, so it resolves even when
         // the body's last buffer entry is itself a marker.
         self.begin();
@@ -804,8 +819,15 @@ impl Builder {
         let top = self.ops.len() as u32;
         self.ops.push(Op2::LoopTop { id: loop_id });
         body(self);
-        self.ops.push(Op2::LoopEnd { id: loop_id });
 
+        // The back edge — the counter's reload, decrement and store, and the `JNE` — runs every
+        // iteration, so it sits *inside* the loop markers (issue #63, R62-DSL-1). With `LoopEnd`
+        // before it, a pre-loop handle the body reads had its last use clamped to that marker
+        // and its register freed there, and the back edge's `t`/`dec` claimed it: from the
+        // second iteration the body read the counter. And a back-edge claim that evicted a
+        // pre-loop handle put a spill `STORE` inside the loop that re-ran from a reused register,
+        // unseen by the invariant check at the marker. Inside the markers, the first is live
+        // across the back edge and the second is the invariant's refusal.
         let t = self.load(cell, 0);
         let dec = self.add_const(t, F::NEG_ONE);
         self.store(cell, 0, dec);
@@ -813,6 +835,7 @@ impl Builder {
         let r = self.materialise(dec.0);
         self.emit(Op::Jne, r, RRef::Raw(0), BRef::Imm(F::ZERO));
         self.set_target(top + 1);
+        self.ops.push(Op2::LoopEnd { id: loop_id });
     }
 
     // ---------------------------------------------------------------- output
@@ -1046,7 +1069,7 @@ impl Builder {
                     let top = loop_stack.pop().expect("unbalanced loop markers");
                     loops.push((top, i as u32));
                 }
-                Op2::Group | Op2::TakeScratch { .. } | Op2::Phase { .. } => {}
+                Op2::Group | Op2::TakeScratch { .. } | Op2::Phase { .. } | Op2::BranchTop | Op2::BranchEnd => {}
             }
         }
         for &(top, end) in &loops {
@@ -1134,6 +1157,7 @@ impl Builder {
         let mut phase_mark = 0usize;
         let mut stats = self.stats;
         let mut loop_snap: Vec<(u32, Vec<Option<u8>>, Vec<Option<u64>>)> = Vec::new();
+        let mut branch_snap: Vec<(Vec<Option<u8>>, Vec<Option<u64>>)> = Vec::new();
 
         let ops = self.ops;
         for (i, op) in ops.iter().enumerate() {
@@ -1240,6 +1264,26 @@ impl Builder {
                 Op2::LoopTop { id } => {
                     loop_snap.push((*id, home.clone(), cells.clone()));
                 }
+                Op2::BranchTop => {
+                    branch_snap.push((home.clone(), cells.clone()));
+                }
+                Op2::BranchEnd => {
+                    let (was_home, was_cells) = branch_snap.pop().expect("unbalanced if_eq markers");
+                    for h in 0..was_home.len() {
+                        // Freed in the body (its last use was there): dead on both paths.
+                        let dead = home[h].is_none() && cells[h].is_none();
+                        let defined_before = was_home[h].is_some() || was_cells[h].is_some();
+                        assert!(
+                            (home[h] == was_home[h] && cells[h] == was_cells[h]) || (dead && defined_before),
+                            "if_eq: the body moved handle {h} from ({:?}, {:?}) to ({:?}, {:?}). A not-taken \
+                             branch skips the body's rows — its spills and definitions included — so the body \
+                             must leave every handle live after it where it found it, and define none that \
+                             outlives it. Pass results out through memory, or lower the register pressure \
+                             around the branch.",
+                            was_home[h], was_cells[h], home[h], cells[h]
+                        );
+                    }
+                }
                 Op2::Phase { name } => {
                     phase_rows.push((name, out.len() - phase_mark));
                     phase_mark = out.len();
@@ -1252,7 +1296,9 @@ impl Builder {
                             home[h] == was_home[h] && cells[h] == was_cells[h],
                             "counted_loop: the body moved handle {h} from ({:?}, {:?}) to ({:?}, {:?}). A loop body is \
                              emitted once and run many times, so it must leave the allocation of every handle \
-                             that existed before it untouched — pass values in and out through memory.",
+                             that existed before it untouched — pass values in and out through memory. (For \
+                             counted_loop_mem the back edge's counter reload counts as body: it too may not \
+                             evict a pre-loop handle, so leave it a free register.)",
                             was_home[h], was_cells[h], home[h], cells[h]
                         );
                     }
