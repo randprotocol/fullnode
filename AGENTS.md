@@ -6,6 +6,58 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-29)
 
+### Chain 18 — LIVE 2026-09-29 04:56 UTC (genesis `a7cb020c…4da76`, build v0.6.7-rc1 `0017de7`; the first gas-metered chain, constraint set 8)
+
+Cut on the user's go in this session ("chain 17 is already in production, feel free to move to chain 18
+and update all the fleet"; memo ON: "yes cut it with the new --envelope-bytes 1860"), on the build
+fullnode-cb agreed to (v0.6.6's content rebased onto v0.6.4 = `b388540`, tagged **`v0.6.7-rc1` =
+`0017de7`**, its own GitHub pre-release: `rand-node` sha256 `500b2995…a3fa`, `rand` `e80e5692…f79a`,
+`rand-prover` `0b23afbe…d02c`, built on E in `/root/build067rc1` with circuits `18c2627`;
+`rand_getVersion` reads `0.6.7-rc.1`; fullnode-cb tags **v0.6.7** on top and rolls it node by node).
+Genesis `a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76`, chain id **18**, file
+`deploy/genesis-chain18.json` (sha256 `ffeb68f0…a4d7`, pinned by `chain_18s_genesis_file_builds_chain_18`),
+cut by `deploy/cut-chain18-genesis.sh` from a snapshot of chain 17 at height 5 604 (bridge stopped
+04:48:56 by fullnode-cb first), rolled all-stop/all-start by `deploy/cutover-fleet-chain18.sh`
+(`stage` 04:47 → stop 04:51:26 at chain-17 height 5 691 → cut → push 04:51:54 → switch 04:52:16 →
+start 04:52:33 (C, D) / 04:52:44 → 26/26 healthy 04:56:05, committing at 160). Chain 17 stopped at
+5 691; its data dirs (`-d1afefc3`) and the `*.pre-c18` binaries stay on every host for rollback —
+retire them with `deploy/retire-chain-dirs.sh` after a day (chain 16's after 2026-09-30 03:00 UTC).
+
+- **What is new in the genesis:** the `gas` section — `gas_price` 100, `byte_price` 800 (units per
+  gas / per KiB), `bundle_gas_limit` 20 479 (= `gas_max(14,0,0)`, every bundle proof's declared
+  limit; auth proofs 1 279), metering `circuit`, `dynamic` {target 10 485 760 B / 262 144 gas,
+  1 250 bps a step, floors = the starting prices} — and **`envelope_bytes: 1860`** (the memo on;
+  every genesis note, the zUSD carry included, sealed in the 1 860-B form by `alloc-note
+  --envelope-bytes 1860`). Everything else is chain 17's: bundle guest v3 `60af094a…`, `hc_auth`
+  `1e4e347f…`, `hardening_v6`, `consensus_domain 1`, 4 MiB proofs / 20 MiB blocks, the 26 validators
+  × 1 000 RAND on the same keys and peer ids, the faucet allowlist and 18 minters, tokens, no
+  aggregation. Live: `rand_getLimits` = `{gas_metering: "circuit", gas_price: "100", byte_price:
+  "800", bundle_gas_limit: 20479, adjust_bps: 1250, envelope_bytes: 1860}`, `rand_status.gas_prices`
+  100/800 at height 188.
+- **Carried:** 5 300 RAND as genesis allocs — shielded-1..5 (1 000 each) and the relayer (300, key
+  `~/.rand-chain14/wallets/relayer.key.json`) — from a `balances` scan at heights 5 667..5 678; 10 zUSD
+  to Anish (locked Tron 9 + Solana 1 == supply == custody, one note). **Not carried:** 0.001 RAND
+  (1 000 000 units) of unwithdrawn validator reward on tor1 (`REWARDS_DROPPED_OK=1`: withdrawing
+  meant restarting chain 17 for a thousandth of a RAND on the operator's own validator).
+- **Bridge:** guardian set 1 at index 1, `burn_sequence` 7, `min_inbound_sequence` {2:2, 3:2, 4:2,
+  5:2}, emitters unchanged (the endpoint redeploy still waits). The daemons are fullnode-cb's:
+  stopped before the snapshot, switched to chain 18 on the genesis hash per
+  `deploy/chain18-bridge-steps.md`, on the v0.6.7-rc1 `rand` (a cs7 wallet proves nothing chain 18
+  accepts; the relayer's alloc is a memo-form note only that build opens) — **bridge up on chain 18 at
+  04:57:28 UTC** (guardians 1–8 co-signing for chain 18, rand cursor 7, source cursors kept; audit:
+  supply 10 zUSD == Σ locked == custody, custody − locked = 0).
+- **Traps from the cut:** (1) the curated `~/.rand-chain17/alloc-wallets/` had lost the relayer's
+  symlink since the chain-17 cut — the first `balances` scan reported its 300-RAND alloc "uncovered"
+  and the cut would have refused; the relayer's key is `~/.rand-chain14/wallets/relayer.key.json`
+  (`run-relayer.sh`'s `RAND_KEY`), now linked there. Check that directory holds every alloc wallet
+  before each cut, not after. (2) `balances` refuses to overwrite `balances.json`; move the first
+  scan aside to re-scan. (3) The `ssh -f -N -L` tunnel to obs1 died twice in the hour (once silently
+  before the snapshot: `ConnectionRefused` on 127.0.0.1); `curl` the tunnel port right before each
+  step and re-open it — obs1 itself was fine. (4) A run-of-the-mill `grep -c` at the end of a build
+  watcher exits 1 on zero matches and reports the whole watch "failed" — read the log, not the code.
+  (5) Two sessions built the same tag into `~/rand-node-a/bin-v067rc1/` — harmless for one commit,
+  a trap for two: name the directory after the commit, not the tag, when a tag may move.
+
 ### v0.6.6 — gas: Phase 1 + Phase 2 (constraint set 8), the chain-18 cut scripts (tagged 2026-09-29 as v0.6.6, retagged from v0.6.5 the same day; NOT cut)
 
 **Rebased onto v0.6.3 (chain 17) on 2026-09-29; chain 18 follows chain 17; the auth proof's limit is

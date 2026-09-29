@@ -2021,6 +2021,45 @@ mod tests {
         assert!(refused.contains("chain 17") && refused.contains("constraint set 7") && refused.contains("constraint set 8"), "{refused}");
     }
 
+    /// The committed chain-18 genesis (LIVE 2026-09-29 04:56 UTC, cut by `deploy/cut-chain18-genesis.sh`
+    /// from chain 17 at height 5 604 on the v0.6.7-rc1 build) builds chain 18: the hash the fleet runs,
+    /// the gas section (Phase 1 prices 100/800, the bundle pin, the Phase 2 controller), the memo on,
+    /// and this build accepts it — the counterpart of the chain-17 test above.
+    #[test]
+    fn chain_18s_genesis_file_builds_chain_18() {
+        let chain_18_hash = "a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76";
+        let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain18.json");
+        let gen = Genesis::from_json(&std::fs::read_to_string(committed).unwrap()).unwrap();
+        assert_eq!(gen.chain_id, 18);
+        assert_eq!(gen.consensus_domain, Some(1));
+        assert_eq!(gen.hardening_v6, Some(true));
+        assert_eq!(gen.hc_bundle, word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), "the v3 bundle guest, as chain 17");
+        assert_eq!(gen.hc_auth.as_deref(), Some(word8_to_hex(&ZkExecutor::hc_auth()).as_str()), "the auth guest");
+        assert_eq!(gen.max_proof_bytes, Some(4 << 20));
+        assert_eq!(gen.max_block_bytes, Some(20 << 20));
+        assert_eq!(gen.envelope_bytes, Some(1860), "the encrypted memo is on");
+        assert!(gen.aggregation.is_none(), "no aggregation beside gas.dynamic");
+        assert_eq!(gen.validators.len(), 26, "chain 17's register, carried");
+        assert_eq!(gen.alloc.len(), 7, "six RAND allocs (shielded-1..5, the relayer) and the zUSD note");
+        let gas = gen.gas.as_ref().expect("the gas section");
+        assert_eq!(gas.gas_price, 100);
+        assert_eq!(gas.byte_price, 800);
+        assert_eq!(gas.bundle_gas_limit, randprotocol_core::gas::bundle_gas_limit_pin());
+        assert_eq!(gas.bundle_gas_limit, 20_479);
+        let dynamic = gas.dynamic.as_ref().expect("the Phase 2 controller");
+        assert_eq!(dynamic.target_block_bytes, 10_485_760, "half the 20 MiB block cap");
+        assert_eq!(dynamic.target_block_gas, 262_144);
+        assert_eq!(dynamic.adjust_bps, 1250);
+        let bridge = gen.bridge.as_ref().expect("the bridge section");
+        assert_eq!(bridge.burn_sequence, Some(7));
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        assert_eq!(state.hash().to_hex(), chain_18_hash, "chain 18's live genesis");
+        assert!(state.ledger.gas().is_some(), "the ledger prices calls and pins the bundle limit");
+        assert_eq!(state.ledger.envelope_bytes(), Some(1860));
+        node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 18");
+    }
+
     /// This build is constraint set 8 (the gas meter, chain 18): every verifier key moved again, so
     /// no proof chain 16 (constraint set 7, v0.6.1) committed verifies here. Chain 16 pins the v2
     /// guest, which this build still carries, so the `hc_bundle` check alone would let this binary
