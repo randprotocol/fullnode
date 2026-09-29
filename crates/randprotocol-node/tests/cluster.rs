@@ -1374,7 +1374,7 @@ async fn bridge_mint(
         d.amount,
         index,
         time,
-        node.rpc.envelope_format().await.expect("envelope format"),
+        node.rpc.envelope_format(CHAIN_ID).await.expect("envelope format"),
     )
     .expect("sealing the deposit");
     let pq_signatures = pq_quorum(&attestation);

@@ -269,6 +269,23 @@ fn envelope_at(v: &Value) -> Result<Envelope> {
     })
 }
 
+/// The chain ids of every public chain whose genesis carries no `envelope_bytes` (issue #64):
+/// chains 14–17, every chain that ran a build able to seal the memo form. Chains before 14 are
+/// retired and their data deleted fleet-wide, so nothing admits a transaction for them. **Every
+/// chain cut without `envelope_bytes` is added here** — `every_committed_genesis_without_
+/// envelope_bytes_is_pinned` fails until it is.
+pub const LEGACY_ENVELOPE_CHAIN_IDS: &[u64] = &[14, 15, 16, 17];
+
+/// The envelope format for a transaction on `chain_id` given the node's `envelope_bytes` claim:
+/// [`EnvelopeFormat::Legacy`] on a chain id pinned in [`LEGACY_ENVELOPE_CHAIN_IDS`] whatever the
+/// node claimed (issue #64), the claim's format everywhere else.
+pub fn envelope_format_for(chain_id: u64, node_envelope_bytes: Option<u32>) -> EnvelopeFormat {
+    if LEGACY_ENVELOPE_CHAIN_IDS.contains(&chain_id) {
+        return EnvelopeFormat::Legacy;
+    }
+    EnvelopeFormat::for_chain(node_envelope_bytes)
+}
+
 #[derive(Clone)]
 pub struct RpcClient {
     url: String,
@@ -576,17 +593,29 @@ impl RpcClient {
         }
     }
 
-    /// This chain's note-envelope format (spec 2026-09-26 §2.4), read off [`limits`](Self::limits)'
-    /// `envelope_bytes` and cached for the life of this client: the first call pays one
-    /// `rand_getLimits` round trip and every later call — one per output a wallet ever seals —
-    /// reuses the answer instead of paying for it again. A node too old for `rand_getLimits`, or
-    /// whose reply predates the field, reads `envelope_bytes` as `None`, which
-    /// `EnvelopeFormat::for_chain` turns into [`EnvelopeFormat::Legacy`] — the same shape it gives
-    /// a chain that never declared one, so an old wallet can still open everything sent to it.
+    /// This chain's note-envelope format (spec 2026-09-26 §2.4) for a transaction built for
+    /// `chain_id` — the chain id the caller puts on that very transaction.
     ///
-    /// A failed read is never cached (`get_or_try_init` only stores the `Ok` arm), so a transient
-    /// RPC failure does not wrongly pin this client to `Legacy` for the rest of its life.
-    pub async fn envelope_format(&self) -> Result<EnvelopeFormat> {
+    /// `rand_getLimits.envelope_bytes` is the node's word, and nothing in its reply is
+    /// authenticated (issue #64). On a chain whose genesis sets no `envelope_bytes` the ledger
+    /// still admits any note envelope up to 2 048 bytes, so a node — or anything between the
+    /// wallet and it — answering `1860` there would make this wallet seal every output at
+    /// 1 860 bytes among everyone else's 1 348: a permanent, public tag on each of its
+    /// transactions. The node cannot serve the genesis file itself (`rand-node run` keeps only
+    /// its hash), so the claim cannot be checked against the genesis; instead the memo form is
+    /// refused outright on every chain id in [`LEGACY_ENVELOPE_CHAIN_IDS`], whatever the node
+    /// says. The chain id is the one thing here a lying node cannot move: it is bound into the
+    /// transaction, and a transaction carrying the wrong one is refused `WrongChain` by the real
+    /// chain — no admission, so no tag. The reverse lie (a memo chain answered as legacy) only
+    /// gets this wallet's transactions refused `EnvelopeSize`: a liveness nuisance, not a leak.
+    ///
+    /// The node's answer is cached for the life of this client: the first call pays one
+    /// `rand_getLimits` round trip and every later call reuses it. A node too old for
+    /// `rand_getLimits`, or whose reply predates the field, reads `envelope_bytes` as `None`,
+    /// which `EnvelopeFormat::for_chain` turns into [`EnvelopeFormat::Legacy`]. A failed read is
+    /// never cached (`get_or_try_init` only stores the `Ok` arm), so a transient RPC failure does
+    /// not wrongly pin this client to `Legacy` for the rest of its life.
+    pub async fn envelope_format(&self, chain_id: u64) -> Result<EnvelopeFormat> {
         let envelope_bytes = self
             .envelope_format
             .get_or_try_init(|| async {
@@ -594,7 +623,7 @@ impl RpcClient {
                 Ok::<_, anyhow::Error>(bytes)
             })
             .await?;
-        Ok(EnvelopeFormat::for_chain(*envelope_bytes))
+        Ok(envelope_format_for(chain_id, *envelope_bytes))
     }
 
     pub async fn receipt(&self, tx: &Hash) -> Result<Option<Value>> {
@@ -1313,19 +1342,54 @@ mod tests {
             })
             .await,
         );
-        assert_eq!(rpc.envelope_format().await.unwrap(), EnvelopeFormat::Memo);
-        assert_eq!(rpc.envelope_format().await.unwrap(), EnvelopeFormat::Memo);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "the second call must not repeat the read");
+        assert_eq!(rpc.envelope_format(7).await.unwrap(), EnvelopeFormat::Memo);
+        assert_eq!(rpc.envelope_format(7).await.unwrap(), EnvelopeFormat::Memo);
+        // Issue #64: the same claim on a chain id pinned as pre-`envelope_bytes` is not believed.
+        assert_eq!(rpc.envelope_format(15).await.unwrap(), EnvelopeFormat::Legacy);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "the later calls must not repeat the read");
 
         let old = RpcClient::new(scripted_rpc(vec![]).await);
-        assert_eq!(old.envelope_format().await.unwrap(), EnvelopeFormat::Legacy, "a node with no rand_getLimits at all");
+        assert_eq!(old.envelope_format(7).await.unwrap(), EnvelopeFormat::Legacy, "a node with no rand_getLimits at all");
 
         let reply = json!({
             "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
             "max_call_envelope_bytes": 18432, "max_program_public_words": 64
         });
         let no_field = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(reply))]).await);
-        assert_eq!(no_field.envelope_format().await.unwrap(), EnvelopeFormat::Legacy, "a reply that predates the field");
+        assert_eq!(no_field.envelope_format(7).await.unwrap(), EnvelopeFormat::Legacy, "a reply that predates the field");
+    }
+
+    /// Issue #64: every committed genesis file (`deploy/genesis-chain*.json`) of a chain that
+    /// could still run — chain 14 on — and carries no `envelope_bytes` has its chain id in
+    /// [`LEGACY_ENVELOPE_CHAIN_IDS`], so a node claiming the memo form there is never believed.
+    /// A new cut without the field fails here until it is pinned.
+    #[test]
+    fn every_committed_genesis_without_envelope_bytes_is_pinned() {
+        let deploy = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&deploy).expect("deploy/") {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !(name.starts_with("genesis-chain") && name.ends_with(".json")) {
+                continue;
+            }
+            let g: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let chain_id = g["chain_id"].as_u64().expect("chain_id");
+            if chain_id < 14 {
+                continue;
+            }
+            seen += 1;
+            match g.get("envelope_bytes") {
+                None | Some(Value::Null) => {
+                    assert!(LEGACY_ENVELOPE_CHAIN_IDS.contains(&chain_id), "{name}: chain {chain_id} has no envelope_bytes and is not pinned")
+                }
+                Some(_) => assert!(!LEGACY_ENVELOPE_CHAIN_IDS.contains(&chain_id), "{name}: chain {chain_id} sets envelope_bytes but is pinned legacy"),
+            }
+        }
+        assert!(seen >= 4, "chains 14–17 are committed");
+        assert_eq!(envelope_format_for(17, Some(1860)), EnvelopeFormat::Legacy);
+        assert_eq!(envelope_format_for(20, Some(1860)), EnvelopeFormat::Memo);
+        assert_eq!(envelope_format_for(20, None), EnvelopeFormat::Legacy);
     }
 
     /// `rand_getProgramPublic`: words for a program with a public input, none for one without,

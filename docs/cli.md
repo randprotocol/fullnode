@@ -455,9 +455,11 @@ rand tx-key <hash>                                             # hand the sent r
 A payee reads the same memo two ways: their own `scan`/`notes`, and anyone with that output's
 per-transaction key through `rand_checkTransaction <hash> <key>` — the memo is inside the same
 sealed body as the note, so whoever can open one can open the other. On a chain whose genesis
-carries no `envelope_bytes` (chains 14 and 15, and every earlier chain), `--memo` is refused before anything proves:
+carries no `envelope_bytes` (chains 14–17, and every earlier chain), `--memo` is refused before anything proves:
 there is no room in the legacy 1 348-byte envelope for a memo field, and an old wallet's
-`Note::from_bytes` would not open a memo-carrying one.
+`Note::from_bytes` would not open a memo-carrying one. Which chains those are is not the node's word alone: `rand_getLimits.envelope_bytes` is unauthenticated,
+so on a chain id pinned in `LEGACY_ENVELOPE_CHAIN_IDS` (14–17) the wallet seals the legacy form whatever the
+node claims (issue #64 — a lying node would otherwise tag every transaction this wallet sends).
 
 **How a memo is shown.** Anyone can pay a dust note carrying any memo to any public address, and
 a `randpay:` link can carry any memo, so every memo (and every contact name) the CLI prints —
