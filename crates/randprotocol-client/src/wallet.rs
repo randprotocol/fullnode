@@ -1744,7 +1744,7 @@ pub async fn build_transfer_declaring_bundle_gas(
     scan(rpc, w, store).await?;
     let guest = chain_bundle_guest(rpc).await?;
     let plan = Plan::select(store, Spend { asset: 0, to: Some((to, amount)), memo: "", fee, burn_a: 0, burn_r: 0, prover_fee: None })?;
-    let format = rpc.envelope_format().await?;
+    let format = rpc.envelope_format(chain_id).await?;
     let (prepared, _) = prepare_bundle(rpc, w, store, &plan, format, &guest).await?;
     let mut tx = Transaction::shielded(chain_id, prepared.bundle.clone(), Action::None);
     let p = &prepared;

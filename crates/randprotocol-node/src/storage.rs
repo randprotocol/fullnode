@@ -3761,7 +3761,7 @@ pub(crate) mod fixtures {
         let bundle = tx.bundle.as_ref().expect("a bundle-carrying transaction");
         let digest = StubExecutor.bundle_digest(&bundle.digest_input());
         let hpub = StubExecutor.public_digest(&tx.binding());
-        let mut public_values = [0u64; 34];
+        let mut public_values = [0u64; pv::NUM];
         public_values[pv::TIER] = 14;
         for k in 0..8 {
             public_values[pv::OUT0 + k] = digest[k] as u64;
