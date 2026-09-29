@@ -112,7 +112,23 @@ impl Drop for Import {
     }
 }
 
-/// Every key this node holds, keyed by the viewing key's `nk` words. In memory only, by design:
+/// The registry's map key for a viewing key: `blake3("rand-viewing-registry-id-1" ‖ nk)`, a one-way
+/// id (issue #65). A `BTreeMap` frees a removed entry's key without overwriting it, so were the
+/// key `nk` itself, a removed viewing key would stay in the heap after `remove`; keyed by this
+/// id, the secret lives only inside the [`Import`], whose `Drop` zeroises it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct KeyId([u8; 32]);
+
+impl KeyId {
+    fn of(nk: &Word8) -> KeyId {
+        // The byte form is a copy of the key: wiped once hashed.
+        let bytes = zeroize::Zeroizing::new(randprotocol_core::notes::word8_to_bytes(nk));
+        KeyId(randprotocol_core::Hash::digest_domain(b"rand-viewing-registry-id-1", &bytes[..]).0)
+    }
+}
+
+/// Every key this node holds, keyed by a one-way id of the viewing key ([`KeyId`], issue #65),
+/// never by `nk` itself. In memory only, by design:
 /// a viewing key on disk would be a new secret-at-rest this node has never had, and the
 /// operator's orchestration already knows which keys to re-import after a restart.
 ///
@@ -123,7 +139,7 @@ impl Drop for Import {
 /// the map for exactly that reader.
 #[derive(Default)]
 pub struct Registry {
-    keys: BTreeMap<Word8, std::sync::Arc<std::sync::Mutex<Import>>>,
+    keys: BTreeMap<KeyId, std::sync::Arc<std::sync::Mutex<Import>>>,
     count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -148,14 +164,15 @@ impl Registry {
     /// held is a no-op — `false`, and the cursor is *not* reset: a rescan from an earlier
     /// height is a restart plus re-import, since imports are in-memory by design.
     pub fn import(&mut self, nk: Word8, rescan_from_height: u64, start_index: u64) -> Result<bool, RegistryFull> {
-        if self.keys.contains_key(&nk) {
+        let id = KeyId::of(&nk);
+        if self.keys.contains_key(&id) {
             return Ok(false);
         }
         if self.keys.len() >= MAX_VIEWING_KEYS {
             return Err(RegistryFull);
         }
         self.keys.insert(
-            nk,
+            id,
             std::sync::Arc::new(std::sync::Mutex::new(Import {
                 vk: ViewingKey { nk },
                 rescan_from_height,
@@ -170,17 +187,23 @@ impl Registry {
     /// The import's own lock. Take the registry's lock to get this, drop it, then scan under the
     /// import's lock alone (audit v3, VK-1).
     pub fn handle(&self, nk: &Word8) -> Option<std::sync::Arc<std::sync::Mutex<Import>>> {
-        self.keys.get(nk).cloned()
+        self.keys.get(&KeyId::of(nk)).cloned()
     }
 
     /// Forget a key: it stops being scanned, its slot is freed, and its `nk` is zeroised when the
     /// last holder of the import drops it (audit v3, VK-2). `false` when the key was not held.
     pub fn remove(&mut self, nk: &Word8) -> bool {
-        let gone = self.keys.remove(nk).is_some();
+        let gone = self.keys.remove(&KeyId::of(nk)).is_some();
         if gone {
             self.count.store(self.keys.len(), std::sync::atomic::Ordering::Relaxed);
         }
         gone
+    }
+
+    /// The map's keys as bytes — what a heap dump of the map's nodes would show (issue #65).
+    #[cfg(test)]
+    fn map_keys(&self) -> Vec<Vec<u8>> {
+        self.keys.keys().map(|k| k.0.to_vec()).collect()
     }
 
     /// The live key count, readable without taking the registry's lock — what the node loop's
@@ -451,6 +474,30 @@ mod tests {
         assert!(!reg.remove(&[0; 8]), "and is not held twice");
         assert_eq!(reg.count().load(std::sync::atomic::Ordering::Relaxed), MAX_VIEWING_KEYS - 1);
         assert_eq!(reg.import([0xbeef; 8], 0, 0), Ok(true), "the freed slot takes a new key");
+    }
+
+    /// Issue #65: the registry's map is keyed by a one-way id of `nk`, never by `nk` itself, so
+    /// the secret lives only inside the `Import` that `Drop` zeroises. A map key dropped by
+    /// `remove` is freed without being overwritten; if it were `nk`, a removed key would linger
+    /// in the heap. The lookups every caller makes — by `nk` — are unchanged.
+    #[test]
+    fn the_registry_map_never_holds_nk_as_a_key() {
+        let mut reg = Registry::default();
+        let (alice, bob) = ([0x1111_2222; 8], [0x3333_4444; 8]);
+        let bytes = |nk: &Word8| randprotocol_core::notes::word8_to_bytes(nk).to_vec();
+        assert_eq!(reg.import(alice, 0, 0), Ok(true));
+        assert_eq!(reg.import(bob, 0, 0), Ok(true));
+        assert!(reg.handle(&alice).is_some() && reg.handle(&bob).is_some(), "found by nk while held");
+        assert_eq!(reg.handle(&alice).unwrap().lock().unwrap().vk.nk, alice, "and it is alice's import");
+        assert_eq!(reg.import(alice, 0, 0), Ok(false), "a re-import is still recognised");
+        for k in reg.map_keys() {
+            assert!(k != bytes(&alice) && k != bytes(&bob), "a map key is a raw viewing key");
+        }
+        assert!(reg.remove(&alice));
+        assert!(reg.handle(&alice).is_none() && reg.handle(&bob).is_some());
+        for k in reg.map_keys() {
+            assert!(k != bytes(&alice) && k != bytes(&bob), "a map key is a raw viewing key");
+        }
     }
 
     /// Audit v3, VK-2: neither the registry nor an import prints key material. Both end up in node
