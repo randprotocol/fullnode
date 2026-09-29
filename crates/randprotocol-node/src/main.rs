@@ -1945,15 +1945,18 @@ mod tests {
     /// still carries (a new chain may pin it), so the `hc_bundle` check alone let a v0.6.1 binary
     /// start on either chain — and its startup replay would then refuse the chain's own history.
     /// Chain 16 pins guest v2, also still carried, but this build (split authorisation) changes the
-    /// bundle wire and every transaction id, so it would fail at chain 16's first bundle. The
-    /// startup guard names all three and refuses them before any datadir is opened — at `run`
-    /// (`check_build_runs_genesis`) and `verify` (`refuse_chains_this_build_cannot_run`).
+    /// bundle wire and every transaction id, so it would fail at chain 16's first bundle. Chain 17
+    /// (v0.6.3, live since 2026-09-29) pins bundle guest v3 and `hc_auth`, both still carried, and
+    /// committed its proofs under constraint set 7. The startup guard names all four and refuses
+    /// them before any datadir is opened — at `run` (`check_build_runs_genesis`) and `verify`
+    /// (`refuse_chains_this_build_cannot_run`).
     #[test]
-    fn this_build_refuses_chains_14_15_and_16() {
+    fn this_build_refuses_chains_14_to_17() {
         for (chain, file, why) in [
             (14, "genesis-chain14.json", "constraint set 6"),
             (15, "genesis-chain15.json", "constraint set 6"),
             (16, "genesis-chain16.json", "rand-txid-3, split authorisation"),
+            (17, "genesis-chain17.json", "constraint set 7"),
         ] {
             let path = format!("{}/../../deploy/{file}", env!("CARGO_MANIFEST_DIR"));
             let gen = Genesis::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
@@ -1978,9 +1981,19 @@ mod tests {
     /// chain — bundle guest v3 and `hc_auth`, the three-proof block rule (4 MiB proofs, 20 MiB
     /// blocks), chain 16's 26 validators, its bridge state (set 1, burn sequence 7, the replay
     /// floors at the snapshot's next sequences) and its zUSD, plus the RAND the operator's wallets
-    /// held. `deploy/genesis-chain17.json` is committed; this build runs it.
+    /// held. `deploy/genesis-chain17.json` is committed and its hash is pinned in
+    /// `node::CHAINS_THIS_BUILD_CANNOT_RUN`: this build is constraint set 8 (the gas meter) and
+    /// refuses to run chain 17 — it verifies none of its cs7 proofs — but still names its exact
+    /// genesis hash there, so the hash assertion below reads it from that one place (chain 16's
+    /// test, the same way since v0.6.3).
     #[test]
     fn chain_17s_genesis_file_builds_chain_17() {
+        let chain_17_hash = node::CHAINS_THIS_BUILD_CANNOT_RUN
+            .iter()
+            .find(|(chain, _, _)| *chain == 17)
+            .map(|(_, hash, _)| *hash)
+            .expect("chain 17 is pinned in CHAINS_THIS_BUILD_CANNOT_RUN");
+        assert_eq!(chain_17_hash, "d1afefc3dd68f73e3799aa0803b692d0e6a5c7c27d228bdeb3d06cdf4027e7ff");
         let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain17.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(committed).unwrap()).unwrap();
         assert_eq!(gen.chain_id, 17);
@@ -1996,9 +2009,13 @@ mod tests {
         assert_eq!(bridge.burn_sequence, Some(7));
         let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
         let state = gen.build(executor.as_ref()).unwrap();
-        assert_eq!(state.hash().to_hex(), "d1afefc3dd68f73e3799aa0803b692d0e6a5c7c27d228bdeb3d06cdf4027e7ff", "chain 17's live genesis");
+        assert_eq!(state.hash().to_hex(), chain_17_hash, "chain 17's live genesis");
         assert_eq!(state.ledger.hc_auth(), Some(ZkExecutor::hc_auth()), "the ledger enforces split authorisation");
-        node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 17");
+        assert!(state.ledger.gas().is_none(), "chain 17 has no gas section");
+        let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles())
+            .expect_err("a constraint-set-8 build must refuse chain 17")
+            .to_string();
+        assert!(refused.contains("chain 17") && refused.contains("constraint set 7") && refused.contains("constraint set 8"), "{refused}");
     }
 
     /// This build is constraint set 8 (the gas meter, chain 18): every verifier key moved again, so
