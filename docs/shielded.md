@@ -43,7 +43,11 @@ pure derivation of it:
 and overwriting one destroys every note it could still open. Next to it lives
 `<key>.key.json.notes.json`, the note store — a cache of the notes this key has opened, every row
 of which is recoverable by rescanning from leaf 0. It holds note plaintexts, so it is written
-mode 0600 like the key itself.
+mode 0600 like the key itself (through a fresh temporary file, synced, then renamed over the store).
+
+The wallet **refuses to load a key file that group or other can read** (`… is group/world readable
+(mode 644): it holds this wallet's spend key — run chmod 600 …`): a key restored from a backup or
+copied by hand often lands at 0644, and nothing else would say so. `chmod 600 <key>` fixes it.
 
 The spend key is the only authority to spend. Under bundle guests v1 and v2 the bundle proof
 itself takes `sk` as a private input. On a chain whose genesis names `hc_auth` (split

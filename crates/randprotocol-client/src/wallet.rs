@@ -89,7 +89,25 @@ impl Wallet {
         Wallet::from_spend_key(SpendKey::random())
     }
 
+    /// Reads a key file written by [`Wallet::save_new`]. On unix one that group or other can
+    /// read is refused, as `rand-prover` refuses its `prover.key.json` (VK-6, audit v6): the file
+    /// is the wallet, the same spend key opens every chain, and a copy restored or moved at 0644
+    /// is otherwise never noticed. `metadata` follows a symlink, so the mode checked is the key
+    /// file's own.
     pub fn load(path: &Path) -> Result<Wallet> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path).with_context(|| format!("reading key file {}", path.display()))?.permissions().mode();
+            if mode & 0o077 != 0 {
+                return Err(anyhow!(
+                    "{} is group/world readable (mode {:o}): it holds this wallet's spend key — run `chmod 600 {}`, then try again",
+                    path.display(),
+                    mode & 0o777,
+                    path.display()
+                ));
+            }
+        }
         let text = std::fs::read_to_string(path).with_context(|| format!("reading key file {}", path.display()))?;
         let kf: KeyFile = serde_json::from_str(&text).with_context(|| format!("{} is not a wallet key file", path.display()))?;
         if kf.version != KEY_FILE_VERSION {
@@ -465,7 +483,8 @@ impl NoteStore {
     /// plaintext, nullifier and leaf index this wallet knows — a world-readable copy of it
     /// discloses the wallet's whole history to anyone on the machine, which is exactly what the
     /// envelope layer exists to prevent. The rename makes the replacement atomic, so a crash
-    /// halfway through leaves the previous store intact instead of a truncated one.
+    /// halfway through leaves the previous store intact instead of a truncated one. The
+    /// temporary file is always a fresh one, 0600 and synced ([`write_private`], VK-6).
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = serde_json::to_string_pretty(self)? + "\n";
         let mut tmp = path.as_os_str().to_os_string();
@@ -510,22 +529,41 @@ impl NoteStore {
     }
 }
 
-/// Create (or replace) `path` with mode 0600 from the start: writing first and chmodding
-/// afterwards leaves the contents world-readable for a window.
+/// Write `bytes` to the new file `path`, owner-only and on disk before this returns (VK-6, audit
+/// v6; the approach of `Contacts::save` and `PairedProver::save`, 2b6da966). Whatever sits at
+/// `path` already — a stale temporary file from a crash, or one somebody else planted — is
+/// removed first, never reused: `open(create)` applies its mode only to a file it creates, so a
+/// stale 0644 file stayed 0644, and it follows a symlink, so a link planted at the (predictable)
+/// temporary name had the store written into whatever it pointed at. `remove_file` deletes a
+/// link itself, not its target, and `create_new` (`O_EXCL`) refuses to open through one, so a
+/// link planted between the two fails the save instead of redirecting it.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-        f.write_all(bytes)?;
-        return Ok(());
+        o.mode(0o600);
     }
-    #[cfg(not(unix))]
+    let mut f = o.open(path)?;
+    // Pinned on the descriptor as well: the mode above is masked by the umask, never widened by
+    // it, but this says 0600 whatever created the file.
+    #[cfg(unix)]
     {
-        std::fs::write(path, bytes)?;
-        Ok(())
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    f.write_all(bytes)?;
+    // Before the rename that follows: without it a power loss can leave the new name pointing
+    // at a file whose bytes never reached the disk — an empty store where the old one was.
+    f.sync_all()?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------- keys a holder hands out
@@ -4063,6 +4101,87 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    /// VK-6 (audit v6): a spend-key file anyone else on the machine can read is refused on load,
+    /// with the fix named, exactly as `rand-prover` refuses its `prover.key.json`. The file is the
+    /// wallet — a copy of it spends every note on every chain — and nothing else notices a key that
+    /// was restored from a backup, or copied by hand, at 0644.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_or_world_readable_key_file_is_refused_on_load() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.key.json");
+        let w = Wallet::generate();
+        w.save_new(&path).unwrap();
+        for mode in [0o644, 0o640, 0o604, 0o660] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let Err(e) = Wallet::load(&path) else { panic!("a key file at mode {mode:o} was loaded") };
+            let e = format!("{e:#}");
+            assert!(e.contains("group/world readable") && e.contains(&format!("(mode {mode:o})")), "{e}");
+            assert!(e.contains("chmod 600") && e.contains("w.key.json"), "the fix is named: {e}");
+        }
+        for mode in [0o600, 0o400] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(Wallet::load(&path).unwrap().sk, w.sk, "mode {mode:o}");
+        }
+        // Through a symlink (the cut scripts scan a curated directory of them) the mode that
+        // counts is the key file's own, not the link's.
+        let link = dir.path().join("link.key.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(Wallet::load(&link).unwrap().sk, w.sk);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(Wallet::load(&link).is_err());
+    }
+
+    /// VK-6 (audit v6): `NoteStore::save` opened `<store>.tmp` with `create(true).truncate(true)`,
+    /// which follows a symlink — so a link planted at that name (the path is predictable: the key
+    /// file's, plus `.notes.json.tmp`) had the wallet's whole history written through it into
+    /// whatever it pointed at, and was then renamed over the store. The stale name is removed and
+    /// the temporary file created with `create_new`, which never follows one.
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_planted_symlink_temp_file_is_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.key.json.notes.json");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "not the wallet's to write").unwrap();
+        let tmp = dir.path().join("w.key.json.notes.json.tmp");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        let store = NoteStore { genesis: Some(Hash([7; 32])), scanned_index: 41, ..NoteStore::default() };
+        store.save(&path).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "not the wallet's to write", "the store was written through the symlink");
+        assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink(), "the store is a file of its own, not the planted link");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(std::fs::symlink_metadata(&tmp).is_err(), "no temporary file is left behind");
+        let back = NoteStore::load(&path);
+        assert_eq!((back.genesis, back.scanned_index), (Some(Hash([7; 32])), 41));
+    }
+
+    /// The other half of VK-6: a stale `.tmp` left world-readable (a crash between write and
+    /// rename, or a file someone else made) kept its mode through `open(create)` — a mode applies
+    /// only at creation — and carried it over the store by the rename. As `Contacts::save`
+    /// (2b6da966).
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_world_readable_temp_file_does_not_leak_its_mode_into_the_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.key.json.notes.json");
+        let tmp = dir.path().join("w.key.json.notes.json.tmp");
+        std::fs::write(&tmp, "stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        NoteStore::default().save(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        // And a save over an existing store replaces it (the rename), still owner-only.
+        let store = NoteStore { scanned_index: 9, ..NoteStore::default() };
+        store.save(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"scanned_index\": 9"));
     }
 
     /// A fresh authority key file is `{seed, address, public_key}` — `rand-node keygen`'s own

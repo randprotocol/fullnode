@@ -548,6 +548,10 @@ outgoing viewing key, ML-KEM decapsulation key, address) is a pure derivation of
 { "version": 2, "spend_key": "hex of 8 little-endian u32 words (64 characters)" }
 ```
 
+`rand keygen` writes it mode 0600, and every `rand` command refuses a wallet key file that group or
+other can read, naming the fix (`chmod 600 <key>`) — a key copied or restored by hand must be put
+back at 0600 before the wallet will use it (unix).
+
 The libp2p peer id is derived as an ed25519 key from `blake3("rand-p2p-identity" || seed)`, so it
 is stable across restarts. Losing a wallet key loses every note it could open; there is no
 recovery phrase in this release.
