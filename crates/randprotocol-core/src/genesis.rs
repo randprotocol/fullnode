@@ -241,8 +241,12 @@ pub struct TokensCommit {
     /// the pair so a backing's declared source precision is committed exactly like its chain and
     /// address are — a genesis file that changed only a backing's decimals must build a different
     /// chain.
-    pub tokens: Vec<(String, String, [u8; 32], Vec<(u16, [u8; 32], u8)>)>,
+    pub tokens: Vec<TokenCommitRow>,
 }
+
+/// One token as the genesis hash commits to it: name, symbol, asset id and its backings, each
+/// `(source chain, source token address, source decimals)`.
+pub type TokenCommitRow = (String, String, [u8; 32], Vec<(u16, [u8; 32], u8)>);
 
 impl From<&TokensConfig> for TokensCommit {
     /// Destructured on purpose, like [`BridgeCommit::from`]: a new [`TokensConfig`],
@@ -1152,7 +1156,7 @@ impl Genesis {
         // before each optional one. Absent, nothing.
         if let Some(v) = &self.vesting {
             let mut entries: Vec<_> = v.entries.iter().collect();
-            entries.sort_by(|a, b| a.id.cmp(&b.id));
+            entries.sort_by_key(|a| a.id);
             commit.extend_from_slice(b"vesting");
             commit.extend_from_slice(&(entries.len() as u32).to_be_bytes());
             for e in entries {

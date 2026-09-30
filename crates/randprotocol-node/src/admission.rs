@@ -138,6 +138,10 @@ impl VerifiedSet {
     pub fn len(&self) -> usize {
         self.seen.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
 }
 
 impl randprotocol_core::VerifiedProofs for VerifiedSet {
@@ -676,7 +680,7 @@ pub fn deploy_uncallable(tx: &Transaction) -> Option<TxError> {
         return None;
     };
     let max_words = randprotocol_zkvm::executor::max_callable_program_words(public.len());
-    (words.len() > max_words).then(|| TxError::ProgramUncallable { words: words.len(), public_words: public.len(), max_words })
+    (words.len() > max_words).then_some(TxError::ProgramUncallable { words: words.len(), public_words: public.len(), max_words })
 }
 
 /// A transaction whose bundle proof or call proof carries a field the honest prover would not
@@ -1612,7 +1616,7 @@ mod tests {
         assert!(!l.allow(&mut b, t0), "the ninth in the same instant is refused");
         // The e2e gate's shape — five faucet mints back to back — fits inside the burst with
         // room to spare, which is why 8 was chosen rather than something tighter.
-        assert!(FAUCET_MINT_BURST >= 5);
+        const { assert!(FAUCET_MINT_BURST >= 5) };
         assert!(l.allow(&mut b, t0 + Duration::from_secs(1)), "one a second");
         assert!(!l.allow(&mut b, t0 + Duration::from_secs(1)));
         // And it never refills past the burst, however long the faucet is left alone.

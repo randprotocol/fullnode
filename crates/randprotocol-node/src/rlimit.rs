@@ -49,7 +49,7 @@ fn current() -> std::io::Result<(u64, u64)> {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok((rl.rlim_cur as u64, rl.rlim_max as u64))
+    Ok((rl.rlim_cur, rl.rlim_max))
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ pub struct Status {
     pub floor: u64,
 }
 
+#[allow(clippy::large_enum_variant)] // moved once, never stored in bulk: boxing buys nothing
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum GossipMessage {
     Consensus(ConsensusMessage),

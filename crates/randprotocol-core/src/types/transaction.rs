@@ -1663,11 +1663,11 @@ mod tests {
         let blanked_proof = [13usize];
         let kept_proof = [3usize];
         let mut seen = [false; VARIANTS];
-        for i in 0..VARIANTS {
+        for (i, seen) in seen.iter_mut().enumerate() {
             let with = sample(i, vec![0x99; 7]);
             let without = sample(i, Vec::new());
             assert_eq!(variant_index(&with), i, "the table's row {i} is variant {i}");
-            seen[i] = true;
+            *seen = true;
             assert_eq!(with != without, blanked_proof.contains(&i) || kept_proof.contains(&i), "variant {i}: carries a proof field");
             assert_eq!(without.blanked(), without, "variant {i}: blanking is idempotent");
             let t = |a: Action| Transaction::shielded(7, bundle(), a);

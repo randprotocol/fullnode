@@ -1787,7 +1787,7 @@ mod tests {
         // admitted profile must be the chain's own (audit v3).
         let mut g_bad_profile = pinned_genesis();
         let mut bad_profile = cfg.clone();
-        bad_profile.admitted_shapes = vec![shape.clone()];
+        bad_profile.admitted_shapes = vec![shape];
         g_bad_profile.aggregation = Some(bad_profile);
         match g_bad_profile.build(&ZkExecutor::new(FriProfile::Test)) {
             Err(randprotocol_core::genesis::GenesisError::BadAggregationConfig(m)) => {
@@ -2273,7 +2273,7 @@ mod tests {
                 metering: randprotocol_core::gas::GasMetering::Circuit,
                 dynamic: None,
             });
-            let e = g.build(&ZkExecutor::new(FriProfile::Test)).err().expect("refused").to_string();
+            let e = g.build(&ZkExecutor::new(FriProfile::Test)).expect_err("refused").to_string();
             assert!(e.contains("bundle_gas_limit") && e.contains("20479"), "{e}");
         }
     }

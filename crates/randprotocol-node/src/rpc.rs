@@ -256,6 +256,7 @@ pub struct AggregationStatus {
     pub sealed_blocks: u64,
 }
 
+#[allow(clippy::large_enum_variant)] // moved once, never stored in bulk: boxing buys nothing
 pub enum NodeCommand {
     SubmitTx { tx: Transaction, reply: oneshot::Sender<Result<Hash, MempoolError>> },
     Peers { reply: oneshot::Sender<Vec<PeerInfo>> },
@@ -982,14 +983,7 @@ fn parse_bytes32(params: &Value, idx: usize, name: &str) -> Result<[u8; 32], Rpc
         .map_err(|v: Vec<u8>| RpcError::invalid_params(format!("{name} must be 32 bytes, got {}", v.len())))
 }
 
-/// A `Word8` parameter as 64 hex characters, with or without `0x` — a viewing key's `nk`.
-fn parse_word8(params: &Value, idx: usize, name: &str) -> Result<randprotocol_core::Word8, RpcError> {
-    let s: String = param(params, idx, name)?;
-    randprotocol_core::notes::word8_from_hex(s.strip_prefix("0x").unwrap_or(&s))
-        .ok_or_else(|| RpcError::invalid_params(format!("{name} must be 64 hex characters")))
-}
-
-/// A viewing key's `nk` from `params[idx]`, as [`parse_word8`] reads a word, but with the hex
+/// A viewing key's `nk` from `params[idx]` — 64 hex characters, with or without `0x` — with the hex
 /// string and the parsed words each wiped when dropped (issue #65): the three viewing-key methods
 /// then leave no copy of the key behind on their own account. What remains outside this function
 /// is the request's own `serde_json::Value` (the hex text, freed with the request, not wiped), the
@@ -3201,7 +3195,7 @@ mod tests {
         let mut l2 = l1.clone();
         l2.set_height(2);
         l2.set_timestamp_ms(2);
-        l2.apply_transactions_with_covered(&[aggregate.clone()], &key(1).address(), &sidecar, &StubExecutor).unwrap();
+        l2.apply_transactions_with_covered(std::slice::from_ref(&aggregate), &key(1).address(), &sidecar, &StubExecutor).unwrap();
         l2.record_anchor(2);
         let b2 = make_block_unchecked(&b1, &l2, vec![aggregate.clone()], &key(1));
         st.storage.commit(std::slice::from_ref(&b2), &l2, &[], &StubExecutor).unwrap();
@@ -5825,7 +5819,7 @@ mod tests {
             st.storage.commit(std::slice::from_ref(&b), &ledger, &[], &StubExecutor).unwrap();
             parent = b.block.clone();
         }
-        assert!(MAX_BLOCK_HEADERS >= 8 * MAX_COMPACT_BLOCKS, "a header page is many block pages");
+        const { assert!(MAX_BLOCK_HEADERS >= 8 * MAX_COMPACT_BLOCKS, "a header page is many block pages") };
         let v = ok(&st, "rand_getBlocks", json!([0, blocks])).await;
         let rows = v.as_array().unwrap();
         assert_eq!(rows.len(), MAX_BLOCK_HEADERS as usize);
@@ -6381,10 +6375,10 @@ mod tests {
         assert_eq!(rows.len(), 6, "one response per element, whatever the element was");
         assert_eq!(rows[0]["result"], json!(st.chain_id));
         assert_eq!(rows[5]["result"], json!(st.chain_id));
-        for i in 1..5 {
-            assert_eq!(rows[i]["error"]["code"], -32600, "row {i}");
-            assert_eq!(rows[i]["id"], Value::Null, "row {i}: nothing to echo");
-            assert!(rows[i].get("result").is_none(), "row {i}: an error response carries no result");
+        for (i, row) in rows.iter().enumerate().take(5).skip(1) {
+            assert_eq!(row["error"]["code"], -32600, "row {i}");
+            assert_eq!(row["id"], Value::Null, "row {i}: nothing to echo");
+            assert!(row.get("result").is_none(), "row {i}: an error response carries no result");
         }
     }
 
@@ -6438,10 +6432,7 @@ mod tests {
 
     #[test]
     fn health_reports_disk_low_ahead_of_everything_else() {
-        let mut s = NodeStatus::default();
-        s.disk_low = true;
-        s.disk_free_bytes = 123;
-        s.sync_inflight_age_ms = Some(5);
+        let s = NodeStatus { disk_low: true, disk_free_bytes: 123, sync_inflight_age_ms: Some(5), ..NodeStatus::default() };
         let v = health_json(&s);
         assert_eq!(v["status"], "disk_low");
         assert_eq!(v["free_bytes"], "123");

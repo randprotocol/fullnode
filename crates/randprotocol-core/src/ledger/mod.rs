@@ -2569,7 +2569,7 @@ impl Ledger {
         // (`HotStuff::shared_set_for_height`, the sync paths), so the admission and the
         // derivation read one state. A no-op without a `staking` section.
         let blocks = self.epoch_blocks.max(1);
-        if self.staking.is_some() && height.saturating_add(1) % blocks == 0 {
+        if self.staking.is_some() && height.saturating_add(1).is_multiple_of(blocks) {
             self.admit_queued_stake(height.saturating_add(1) / blocks);
         }
         self.record_anchor(height);

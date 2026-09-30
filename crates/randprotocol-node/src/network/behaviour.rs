@@ -24,6 +24,7 @@ pub struct RandBehaviour {
     pub ping: ping::Behaviour,
 }
 
+#[allow(clippy::large_enum_variant)] // moved once, never stored in bulk: boxing buys nothing
 #[derive(Debug)]
 pub enum RandEvent {
     Gossipsub(gossipsub::Event),

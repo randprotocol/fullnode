@@ -424,7 +424,7 @@ mod tests {
         let burn = Action::BridgeBurn { asset: 1, amount: 1, relayer_fee: 0, to_chain: 2, token: [9; 32], to: [0; 32] };
         assert_eq!(fee_floor(&burn), BRIDGE_BURN_FEE);
         assert_eq!(BRIDGE_BURN_FEE, 10_000_000, "0.01 RAND");
-        assert!(BRIDGE_BURN_FEE >= BUNDLE_BASE, "its one bundle is paid for");
+        const { assert!(BRIDGE_BURN_FEE >= BUNDLE_BASE, "its one bundle is paid for") };
         let token_burn = Action::TokenBurn { asset: 1, amount: 1 };
         assert_eq!(fee_floor(&token_burn), BUNDLE_BASE, "one bundle, one base");
         assert!(token_burn.bundle_less().is_none(), "it rides a bundle");

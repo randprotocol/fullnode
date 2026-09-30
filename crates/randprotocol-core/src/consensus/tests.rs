@@ -888,7 +888,7 @@ fn a_resumed_replica_holds_the_set_for_its_heads_epoch() {
     let victim = 0;
     let height = sim.nodes[victim].committed_height();
     assert!(height >= 4, "the chain crossed at least two epoch boundaries: height {height}");
-    let want_epoch = (height + 1) / 2;
+    let want_epoch = height.div_ceil(2);
     assert!(want_epoch > 0, "the head is past epoch 0");
 
     sim.restart(victim);
@@ -1045,10 +1045,7 @@ fn restart_does_not_double_vote_for_same_view() {
     let victim = (0..4).find(|&i| i != li && i != next_leader).unwrap();
     // Votes are broadcast; a SendTo from an older scheme would count too.
     let has_vote = |acts: &[Action], view: u64| {
-        acts.iter().any(|a| match a {
-            Action::Broadcast(ConsensusMessage::Vote(v)) | Action::SendTo(_, ConsensusMessage::Vote(v)) if v.view == view => true,
-            _ => false,
-        })
+        acts.iter().any(|a| matches!(a, Action::Broadcast(ConsensusMessage::Vote(v)) | Action::SendTo(_, ConsensusMessage::Vote(v)) if v.view == view))
     };
     let acts = sim.nodes[victim].on_proposal(proposal.clone(), sim.now).unwrap();
     let voted = has_vote(&acts, view);
@@ -1076,10 +1073,7 @@ fn restart_does_not_double_vote_for_same_view() {
         };
         let b = Block::sign(&sim.domain(), header, vec![], &sim.keys[li]);
         let acts = sim.nodes[victim].on_proposal(b, sim.now).unwrap_or_default();
-        assert!(!acts.iter().any(|a| match a {
-            Action::Broadcast(ConsensusMessage::Vote(_)) | Action::SendTo(_, ConsensusMessage::Vote(_)) => true,
-            _ => false,
-        }));
+        assert!(!acts.iter().any(|a| matches!(a, Action::Broadcast(ConsensusMessage::Vote(_)) | Action::SendTo(_, ConsensusMessage::Vote(_)))));
     }
     sim.queue.clear();
 }
@@ -1657,7 +1651,7 @@ fn qcs_across_a_boundary_verify_against_their_own_epoch() {
     sim.run_to_height(7, 40);
     sim.assert_consistent();
 
-    let gh = sim.gs.hash();
+    let _gh = sim.gs.hash();
     let b3 = sim.block_at(0, 3);
     let b4 = sim.block_at(0, 4);
     let b5 = sim.block_at(0, 5);
@@ -2979,7 +2973,7 @@ fn one_validators_votes_cannot_fill_the_vote_map() {
             let mut h = [0u8; 32];
             h[..4].copy_from_slice(&fresh.to_be_bytes());
             // Mostly far-future views, which nothing prunes; one in eight inside the window.
-            let ahead = if fresh % 8 != 0 { 900_000 } else { u64::from(fresh / 8 % 9) };
+            let ahead = if !fresh.is_multiple_of(8) { 900_000 } else { u64::from(fresh / 8 % 9) };
             let _ = node.on_vote(Vote::sign(&domain, node.view() + ahead, Hash(h), &attacker));
         }
     };

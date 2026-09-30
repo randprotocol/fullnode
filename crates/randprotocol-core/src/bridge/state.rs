@@ -934,7 +934,7 @@ impl BridgeState {
         if to == &[0u8; 32] {
             return Err(BridgeError::BadRecipient);
         }
-        if matches!(to_chain, 2 | 3 | 4) && to[..12] != [0u8; 12] {
+        if matches!(to_chain, 2..=4) && to[..12] != [0u8; 12] {
             return Err(BridgeError::BadRecipient);
         }
         if relayer_fee > amount {
@@ -2152,7 +2152,7 @@ mod tests {
             assert_eq!(t.token_chain, t.to_chain, "the coin is released on the chain it is sent to");
             assert_eq!(t.to_chain, to_chain);
             assert_eq!(t.token_address, token, "the backing the burner chose, not a second lookup");
-            if matches!(to_chain, 2 | 3 | 4) {
+            if matches!(to_chain, 2..=4) {
                 assert_eq!(t.to[..12], [0u8; 12], "a left-padded 20-byte recipient");
                 assert_eq!(t.token_address[..12], [0u8; 12], "and a left-padded 20-byte token");
             }

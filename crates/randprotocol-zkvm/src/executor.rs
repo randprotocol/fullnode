@@ -1118,7 +1118,7 @@ pub fn decode_canonical(bytes: &[u8]) -> Result<Proof, ConfidentialError> {
 
 impl ConfidentialExecutor for ZkExecutor {
     fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
-        if base_pc % 4 != 0 {
+        if !base_pc.is_multiple_of(4) {
             return Err(ConfidentialError::BadInstruction { index: 0, reason: "base_pc not word aligned".into() });
         }
         if words.is_empty() {
@@ -1434,6 +1434,10 @@ pub fn prove(
 /// `public` is the program's deploy-time public input, as for [`prove`]. `max_input_words` is the
 /// envelope's input cap (`call_envelope::CallCaps::max_input_words`, derived from the chain's
 /// `max_call_envelope_bytes`). `gas_limit` is the declared `GAS_LIMIT`, as for [`prove`].
+/// What [`prove_call`] returns: the proof bytes, its eight output words, the tier it proved at,
+/// and the input salt the call envelope has to carry.
+pub type CallProofWithSalt = (Vec<u8>, [u32; 8], u8, [u32; 4]);
+
 #[allow(clippy::too_many_arguments)]
 pub fn prove_call(
     profile: FriProfile,
@@ -1444,7 +1448,7 @@ pub fn prove_call(
     backend: Backend,
     max_input_words: usize,
     gas_limit: Option<u64>,
-) -> Result<(Vec<u8>, [u32; 8], u8, [u32; 4]), String> {
+) -> Result<CallProofWithSalt, String> {
     // The envelope this proof is for cannot carry more than the chain's input cap, and proving
     // is minutes: refuse now rather than after the work is done (`call_envelope`'s own check is
     // the same one, reached by a caller that seals without proving).

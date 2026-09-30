@@ -583,8 +583,12 @@ struct MintWindowsDisk {
     window_secs: u32,
     global_cap: u64,
     global: randprotocol_core::ledger::tokens::MintWindow,
-    backings: Vec<((u32, u16, [u8; 32]), randprotocol_core::ledger::tokens::MintWindow)>,
+    backings: Vec<BackingWindowRow>,
 }
+
+/// One backing's rolling mint window as it is stored: `(token index, source chain, source token)`
+/// and the window — the map's tuple key as a list entry, which JSON can carry.
+type BackingWindowRow = ((u32, u16, [u8; 32]), randprotocol_core::ledger::tokens::MintWindow);
 
 impl From<&randprotocol_core::ledger::tokens::RegistryExt> for RegistryExtDisk {
     fn from(e: &randprotocol_core::ledger::tokens::RegistryExt) -> Self {
@@ -1694,6 +1698,7 @@ impl Storage {
     /// pruning pass's write, and the only way a `Pruned` record reaches the store besides a
     /// sealed-form sync's commit. `pub(crate)` so a test can store the pruned form of a stub-proved bundle, whose
     /// proof the pass (which decodes a real one) cannot read.
+    #[cfg(test)]
     pub(crate) fn put_pruned(&self, record: &TxRecord) -> Result<()> {
         let mut batch = rocksdb::WriteBatch::default();
         self.stage_pruned(&mut batch, record)?;
@@ -1983,7 +1988,7 @@ impl Storage {
             let r: CallReceipt = bincode::deserialize(&v)?;
             batch.put_cf(self.cf(CF_RECEIPTS_BY_PROGRAM), receipt_index_key(&r.program, r.height, r.index), r.tx.as_bytes());
             n += 1;
-            if n % 1_000 == 0 {
+            if n.is_multiple_of(1_000) {
                 self.db.write(std::mem::take(&mut batch))?;
             }
         }
@@ -4016,7 +4021,7 @@ mod tests {
         let mut batch = WriteBatch::default();
         batch.put_cf(s.cf(CF_META), META_TOKENS, bincode::serialize(&Some(reg.clone())).unwrap());
         // What an older build would have written: the fields it knew, and no more.
-        batch.put_cf(s.cf(CF_META), META_TOKENS_V2, br#"{"max_tokens":7,"windows":null}"#.to_vec());
+        batch.put_cf(s.cf(CF_META), META_TOKENS_V2, br#"{"max_tokens":7,"windows":null}"#);
         s.db.write(batch).unwrap();
         let back = s.tokens().unwrap().unwrap();
         assert_eq!(back.ext().max_tokens, Some(7));
@@ -5300,7 +5305,7 @@ mod tests {
                 s.note(withdraw_leaf).unwrap().expect("the withdraw's deposit is indexed at the leaf it named");
             assert_eq!(withdraw_row.height, 2, "attest_first={attest_first}");
 
-            let bridge = ledger.bridge().expect("bridged genesis");
+            let _bridge = ledger.bridge().expect("bridged genesis");
             let expected_deposit =
                 randprotocol_core::ledger::bridge_notes::deposit_note(&att, ledger.tokens().unwrap(), &StubExecutor)
                 .expect("the attestation registered an asset and deposits into it");
@@ -6875,7 +6880,7 @@ mod seal_tests {
         let mut l2 = l1.clone();
         l2.set_height(2);
         l2.set_timestamp_ms(2);
-        l2.apply_transactions_with_covered(&[aggregate.clone()], &key(1).address(), &sidecar, &StubExecutor).unwrap();
+        l2.apply_transactions_with_covered(std::slice::from_ref(&aggregate), &key(1).address(), &sidecar, &StubExecutor).unwrap();
         l2.record_anchor(2);
         let b2 = make_block_unchecked(&b1, &l2, vec![aggregate.clone()], &key(1));
         storage.commit(std::slice::from_ref(&b2), &l2, &[], &StubExecutor).unwrap();
@@ -7262,7 +7267,7 @@ mod seal_tests {
         let mut l2 = l1.clone();
         l2.set_height(2);
         l2.set_timestamp_ms(2);
-        l2.apply_transactions_with_covered(&[aggregate.clone()], &key(1).address(), &sidecar, &StubExecutor).unwrap();
+        l2.apply_transactions_with_covered(std::slice::from_ref(&aggregate), &key(1).address(), &sidecar, &StubExecutor).unwrap();
         l2.record_anchor(2);
         let b2 = make_block_unchecked(&b1, &l2, vec![aggregate.clone()], &key(1));
         storage.commit(std::slice::from_ref(&b2), &l2, &[], &StubExecutor).unwrap();

@@ -899,10 +899,10 @@ impl TokenRegistry {
         let unit = backing.release_unit();
         // Byte-cheap (a modulus against a decimals-derived constant that never changes for this
         // backing) and ahead of the locked comparison, which is the state-dependent half.
-        if amount % unit != 0 {
+        if !amount.is_multiple_of(unit) {
             return Err(TokenError::NotReleasable { amount, unit });
         }
-        if relayer_fee % unit != 0 {
+        if !relayer_fee.is_multiple_of(unit) {
             return Err(TokenError::NotReleasable { amount: relayer_fee, unit });
         }
         // The token's supply last: while the backing invariant holds, `amount <= locked` implies

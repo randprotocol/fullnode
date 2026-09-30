@@ -58,7 +58,7 @@ fn main() {
         "tier {} → cpu 2^{} rows (actual {} cycles incl. {} digest rows), padding hides the rest",
         tier.0, tier.0, cycles, digest_rows
     );
-    println!("{:<10}{:>10}{:>8}   {}", "table", "rows", "cols", "role");
+    println!("{:<10}{:>10}{:>8}   role", "table", "rows", "cols");
     for (name, h, w, role) in [
         ("program", traces.program.height(), program::col::WIDTH, "witness now; in-circuit decoder, hc is proved not preprocessed"),
         ("cpu", traces.cpu.height(), cpu::col::WIDTH, "one row per cycle (+ digest rows); fetch, decode selectors, pc"),

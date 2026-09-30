@@ -361,7 +361,7 @@ impl HotStuff {
 
     /// Tests only: put this replica's committed head somewhere the tree does not reach, which is
     /// the position conflicting finality leaves a node in (audit v3).
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     pub fn force_committed_hash_for_testing(&mut self, hash: Hash) {
         self.committed_hash = hash;
     }

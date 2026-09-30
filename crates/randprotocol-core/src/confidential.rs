@@ -352,7 +352,7 @@ impl StubExecutor {
 
     /// Rewrite the gas limit a stub auth proof declares, as [`Self::with_bundle_gas`] does a
     /// bundle proof's. Anything that is not a well-formed stub auth proof is left untouched.
-    pub fn with_auth_gas(proof: &mut Vec<u8>, gas_limit: u64) {
+    pub fn with_auth_gas(proof: &mut [u8], gas_limit: u64) {
         if proof.len() == STUB_AUTH_LEN && &proof[..5] == STUB_AUTH_MARKER {
             proof[STUB_AUTH_GAS..].copy_from_slice(&gas_limit.to_le_bytes());
         }
@@ -361,7 +361,7 @@ impl StubExecutor {
     /// Rewrite the gas limit a stub bundle proof declares. Anything that is not a well-formed
     /// stub bundle proof is left untouched, as [`Self::bind`] leaves it. The limit is not part of
     /// the transaction binding (the binding blanks the proof), so no re-bind is needed after.
-    pub fn with_bundle_gas(proof: &mut Vec<u8>, gas_limit: u64) {
+    pub fn with_bundle_gas(proof: &mut [u8], gas_limit: u64) {
         if proof.len() == STUB_BUNDLE_LEN && &proof[..4] == STUB_MARKER {
             proof[STUB_BUNDLE_GAS..].copy_from_slice(&gas_limit.to_le_bytes());
         }

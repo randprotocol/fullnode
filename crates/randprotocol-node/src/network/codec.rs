@@ -37,7 +37,7 @@ use std::marker::PhantomData;
 pub fn cbor_size<T: Serialize>(value: &T) -> io::Result<usize> {
     cbor4ii::serde::to_vec(Vec::new(), value)
         .map(|v| v.len())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| io::Error::other(e.to_string()))
 }
 
 /// A CBOR codec whose request and response size limits are given rather than assumed.
@@ -87,7 +87,7 @@ where
     V: Serialize,
 {
     let data = cbor4ii::serde::to_vec(Vec::new(), &value)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     if data.len() as u64 > limit {
         // Fail here rather than write a message the peer is guaranteed not to be able to read.
         return Err(io::Error::new(

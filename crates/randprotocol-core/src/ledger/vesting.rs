@@ -302,7 +302,7 @@ pub struct VestingRegister {
 impl VestingRegister {
     pub fn from_config(c: &VestingConfig) -> VestingRegister {
         let mut entries: Vec<Entry> = c.entries.iter().map(Entry::from_config).collect();
-        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        entries.sort_by_key(|a| a.id);
         VestingRegister { entries, released: 0 }
     }
 

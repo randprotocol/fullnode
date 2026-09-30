@@ -143,12 +143,12 @@ fn plaintext(salt: [u32; 4], inputs: &[u32]) -> Vec<u8> {
 
 /// The inverse of [`plaintext`]: 16 salt bytes followed by whole words, or nothing.
 fn parse_plaintext(pt: &[u8]) -> Option<([u32; 4], Vec<u32>)> {
-    if pt.len() < 16 || pt.len() % 4 != 0 {
+    if pt.len() < 16 || !pt.len().is_multiple_of(4) {
         return None;
     }
     let word = |b: &[u8]| u32::from_le_bytes(b.try_into().expect("4 bytes"));
     let salt: [u32; 4] = std::array::from_fn(|i| word(&pt[4 * i..4 * i + 4]));
-    let inputs = pt[16..].chunks_exact(4).map(word).collect();
+    let inputs = pt[16..].as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect();
     Some((salt, inputs))
 }
 

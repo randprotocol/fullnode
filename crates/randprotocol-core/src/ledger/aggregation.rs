@@ -738,6 +738,7 @@ impl Ledger {
     /// Pay the released bond as a derived deposit note and delete the entry (spec §2.2). The
     /// note itself is created by [`apply`], which owns the executor; this is the register's
     /// half. The base goes to the block's proposer (also in [`apply`]).
+    #[allow(clippy::too_many_arguments)] // the action's own fields, as `check_withdraw` takes them
     pub fn withdraw_aggregator(
         &mut self,
         aggregator: &Address,
@@ -1142,7 +1143,7 @@ mod tests {
             gas::MAX_PROOF_BYTES + 3 * 32 + (4 + 1 + 35 * 3) * 8 + 4_400
         );
         // And it admits a 2 MiB proof with the three covers and the envelope.
-        assert!(gas::MAX_AGGREGATE_BYTES > gas::MAX_PROOF_BYTES + 3 * 32 + 2_000);
+        const { assert!(gas::MAX_AGGREGATE_BYTES > gas::MAX_PROOF_BYTES + 3 * 32 + 2_000) };
     }
 
     /// The genesis section gates the ledger (spec §9): a genesis without it builds a ledger

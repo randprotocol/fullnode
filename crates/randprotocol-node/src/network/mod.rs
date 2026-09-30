@@ -283,6 +283,7 @@ pub struct GossipId {
     pub propagation_source: PeerId,
 }
 
+#[allow(clippy::large_enum_variant)] // moved once, never stored in bulk: boxing buys nothing
 #[derive(Debug)]
 pub enum NetworkEvent {
     Listening(Multiaddr),
@@ -297,6 +298,7 @@ pub enum NetworkEvent {
     SyncFailed { peer: PeerId, request_id: OutboundRequestId, error: String },
 }
 
+#[allow(clippy::large_enum_variant)] // moved once, never stored in bulk: boxing buys nothing
 #[derive(Debug)]
 pub enum NetworkCommand {
     Broadcast(GossipMessage),

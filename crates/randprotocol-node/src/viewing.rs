@@ -159,6 +159,10 @@ impl Registry {
         self.keys.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
     /// Record `nk` for scanning from `start_index` (the first leaf at or after
     /// `rescan_from_height`). Returns `true` when the key is new. Re-importing a key already
     /// held is a no-op — `false`, and the cursor is *not* reset: a rescan from an earlier

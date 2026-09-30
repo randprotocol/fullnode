@@ -302,6 +302,7 @@ impl NotHeldCache {
         Some(n)
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.by_hash.len()
     }
@@ -713,7 +714,7 @@ fn pick_sync_peer(
     // A peer backed off after a miss — an empty answer to a live request (SYNC-2), a failed or
     // abandoned one (CN-1) — is no candidate on either branch until its back-off expires.
     let askable = |p: &PeerId, peer: &Peer| {
-        peer.connected && !skipped.contains(p) && peer.sync_backoff_until.map_or(true, |until| now >= until)
+        peer.connected && !skipped.contains(p) && peer.sync_backoff_until.is_none_or(|until| now >= until)
     };
     // And once it has expired, a peer's record ranks before its claim (CN-1): fewest consecutive
     // misses first (`sync_backoff` is zero until one, doubles per miss, clears on a batch that
@@ -735,7 +736,7 @@ fn pick_sync_peer(
             peers
                 .iter()
                 .filter(|(p, peer)| askable(p, peer))
-                .filter(|(_, peer)| peer.status.as_ref().map_or(true, serves))
+                .filter(|(_, peer)| peer.status.as_ref().is_none_or(serves))
                 .min_by_key(|(_, peer)| peer.sync_backoff)
                 .map(|(p, _)| *p)
         } else {
@@ -771,10 +772,8 @@ struct Node {
     mempool: Mempool,
     net: NetworkHandle,
     status: Arc<RwLock<NodeStatus>>,
-    /// Viewing keys imported over RPC, shared with the `RpcState`; read here only so
-    /// `publish_status` can report the count (`NodeStatus::viewing_keys`).
-    viewing: Arc<RwLock<crate::viewing::Registry>>,
-    /// The registry's live key count, for `publish_status` (audit v3, VK-1).
+    /// The viewing-key registry's live key count, for `publish_status` (audit v3, VK-1). The
+    /// registry itself is the `RpcState`'s alone: the node loop never takes its lock.
     viewing_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Committed heads, for whatever WebSocket clients are subscribed. Held here rather than read
     /// back out of the `RpcState` because this is the only place that writes it.
@@ -1231,6 +1230,7 @@ impl PeerMemory {
         Some(m)
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.by_id.len()
     }
@@ -1394,7 +1394,7 @@ fn prune_cutoff_ms(head_ms: u64, now_ms: u64, keep: Duration) -> u64 {
 /// practice (the node loop is single-threaded here), but the compare-exchange is what makes the
 /// flag's meaning exact rather than advisory.
 fn should_compact(prune_passes: u64, compacting: &AtomicBool) -> bool {
-    prune_passes % 64 == 0 && compacting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    prune_passes.is_multiple_of(64) && compacting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
 }
 
 /// The background compaction's body: run `compact`, then mark the compaction finished — on a
@@ -1816,7 +1816,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             commits: commits.clone(),
             refusals: refusals.clone(),
             ws_conns: ws_conns.clone(),
-            viewing: viewing.clone(),
+            viewing,
         },
     )
     .await?;
@@ -1889,7 +1889,6 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         mempool,
         net: net.clone(),
         status: status.clone(),
-        viewing,
         viewing_count,
         heads,
         commits,
@@ -2403,7 +2402,7 @@ impl Node {
         // has passed become their pruned record. Every 16 blocks is often enough that the pass
         // lags the gate by at most that; `--keep-raw-proofs` archives instead.
         let head = self.hs.committed_height();
-        if !self.cfg.keep_raw_proofs && head % 16 == 0 {
+        if !self.cfg.keep_raw_proofs && head.is_multiple_of(16) {
             if let Some(agg) = self.hs.committed_ledger().aggregation().cloned() {
                 let profile = core_profile(&self.gs.fri_profile);
                 let storage = self.storage.clone();
@@ -2419,7 +2418,7 @@ impl Node {
         // older than the window measured on the chain's own clock lose their history. Never
         // inside the aggregation window, never the head or its parent, never genesis.
         if let Some(keep) = self.cfg.prune_history {
-            if head % 16 == 0 {
+            if head.is_multiple_of(16) {
                 let head_ms = self.storage.head_block()?.header.timestamp_ms;
                 let cutoff_ms = prune_cutoff_ms(head_ms, now_ms(), keep);
                 let window = self.hs.committed_ledger().aggregation().map(|a| a.window).unwrap_or(0);
@@ -2444,7 +2443,7 @@ impl Node {
                                 }
                             })
                         });
-                    } else if self.prune_passes % 64 == 0 {
+                    } else if self.prune_passes.is_multiple_of(64) {
                         tracing::debug!("history compaction already running; skipping this pass");
                     }
                 }
@@ -2972,7 +2971,7 @@ impl Node {
                 // on every sync tick.
                 if self.best_peer_height() > my_height + 1 {
                     let now = Instant::now();
-                    if self.no_peer_warned_at.map_or(true, |at| now.duration_since(at) >= Duration::from_secs(60)) {
+                    if self.no_peer_warned_at.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(60)) {
                         self.no_peer_warned_at = Some(now);
                         tracing::warn!(
                             height = my_height,
@@ -5771,7 +5770,7 @@ mod tests {
 
     #[test]
     fn the_batch_budget_is_at_most_half_the_reader_limit() {
-        assert!(2 * network::SYNC_MAX_WIRE_BYTES <= network::SYNC_RESPONSE_WIRE_LIMIT);
+        const { assert!(2 * network::SYNC_MAX_WIRE_BYTES <= network::SYNC_RESPONSE_WIRE_LIMIT) };
         assert_eq!(serve_sync_budget(&network::WireLimits::default()), network::SYNC_MAX_WIRE_BYTES);
         // A raised chain's budget is its own, and keeps the same relation to its reader limit.
         let raised = network::WireLimits::for_block_bytes(20 << 20);

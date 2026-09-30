@@ -1,4 +1,5 @@
 //! A small assembler so guests can be written in Rust source without a RISC-V toolchain.
+#![allow(clippy::doc_overindented_list_items)] // the parameter tables below align their continuation lines
 use crate::isa::*;
 use std::collections::HashMap;
 
@@ -208,6 +209,7 @@ pub fn emit_derive_nk(a: &mut Assembler, base: u32, tmp: u32, sk_at: i32, buf: i
 /// sequence — every spend in this crate derives its own `pk_self` from the private spend key
 /// rather than taking an owner from the witness, which is what makes "you can only spend notes
 /// committed to your own key" structural — so it is emitted from one place.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_derive_keys(a: &mut Assembler, base: u32, tmp: u32, sk_at: i32, buf: i32, ptr_words: i32, nk_out: i32, pk_out: i32) {
     emit_derive_nk(a, base, tmp, sk_at, buf, ptr_words, nk_out);
     emit_derive_pk(a, base, tmp, nk_out, buf, ptr_words, pk_out);
@@ -268,6 +270,7 @@ pub fn emit_note_commit(a: &mut Assembler, base: u32, tmp: u32, note_at: i32, bu
 /// `nk`/`cm` (8 words each) must already be at `base + nk_at` / `base + cm_at`. Stages
 /// `[NF_DOMAIN, nk(8), cm(8)]` at `base + buf` (17 words of scratch), calls `POSEIDON2`, and
 /// copies the digest to `base + nf_out`.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_nullify(a: &mut Assembler, base: u32, tmp: u32, nk_at: i32, cm_at: i32, buf: i32, ptr_words: i32, nf_out: i32) {
     a.extend(ops::li(tmp, domain::NF as i32));
     a.push(ops::sw(base, tmp, buf));

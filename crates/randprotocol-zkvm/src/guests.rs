@@ -377,7 +377,7 @@ pub fn poseidon2_demo(msg: &[u32]) -> Program {
     a.extend(li(S0, HEAP));
     for (i, w) in msg.iter().enumerate() { a.extend(li(T0, *w as i32)); a.push(sw(S0, T0, 4 * i as i32)); }
     a.extend(call_poseidon2(HEAP / 4, msg.len()));
-    for i in 0..8 { a.push(lw(T1, S0, 4 * i as i32)); a.extend(write_output(i as u32, T1)); }
+    for i in 0..8 { a.push(lw(T1, S0, 4 * i)); a.extend(write_output(i as u32, T1)); }
     a.extend(halt());
     a.assemble()
 }
@@ -392,7 +392,7 @@ pub fn poseidon2_len_demo(msg: &[u32]) -> Program {
     a.extend(li(S0, HEAP));
     for (i, w) in msg.iter().enumerate() { a.extend(li(T0, *w as i32)); a.push(sw(S0, T0, 4 * i as i32)); }
     a.extend(call_poseidon2_len(HEAP / 4, msg.len()));
-    for i in 0..8 { a.push(lw(T1, S0, 4 * i as i32)); a.extend(write_output(i as u32, T1)); }
+    for i in 0..8 { a.push(lw(T1, S0, 4 * i)); a.extend(write_output(i as u32, T1)); }
     a.extend(halt());
     a.assemble()
 }
@@ -428,7 +428,7 @@ pub fn keccak_demo(msg: &[u8]) -> Program {
     }
     a.extend(call_keccak(HEAP / 4));
     for k in 0..8 {
-        a.push(lw(T0, S0, 4 * k as i32));
+        a.push(lw(T0, S0, 4 * k));
         a.extend(write_output(k as u32, T0));
     }
     a.extend(halt());

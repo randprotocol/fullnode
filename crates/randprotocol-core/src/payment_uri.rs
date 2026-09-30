@@ -72,7 +72,7 @@ fn is_amount(a: &str) -> bool {
     let frac = parts.next();
     !int.is_empty()
         && int.bytes().all(|c| c.is_ascii_digit())
-        && frac.map_or(true, |f| !f.is_empty() && f.bytes().all(|c| c.is_ascii_digit()))
+        && frac.is_none_or(|f| !f.is_empty() && f.bytes().all(|c| c.is_ascii_digit()))
         && a.bytes().any(|c| (b'1'..=b'9').contains(&c))
 }
 

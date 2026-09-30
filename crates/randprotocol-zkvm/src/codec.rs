@@ -14,7 +14,7 @@ use crate::isa::{Program, IMAGE_MAGIC};
 /// A file shorter than 4 bytes or not a multiple of 4 keeps today's raw-word error: the magic
 /// check itself needs a whole first word to read.
 pub fn program_from_bytes(bytes: &[u8]) -> Result<Program, String> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err("program bytes must be a multiple of 4".into());
     }
     if bytes.len() >= 4 {
@@ -34,7 +34,7 @@ struct ProgramJson {
 
 pub fn program_from_json(s: &str) -> Result<Program, String> {
     let p: ProgramJson = serde_json::from_str(s).map_err(|e| e.to_string())?;
-    if p.base_pc % 4 != 0 {
+    if !p.base_pc.is_multiple_of(4) {
         return Err("base_pc must be word aligned".into());
     }
     Ok(Program { base_pc: p.base_pc, words: p.words })
