@@ -430,6 +430,15 @@ enum Cmd {
         /// `--gas-price`; omitted, the prices this command writes never move.
         #[arg(long, value_name = "TARGET_BYTES,TARGET_GAS,ADJUST_BPS")]
         gas_dynamic: Option<String>,
+        /// RPL-2 (`docs/superpowers/specs/2026-09-30-rpl2-program-state-design.md`): the
+        /// `program_state` section — program cells, program vaults and the `Invoke` action —
+        /// with this cell fee in RAND units, added to an invoke's fee floor per cell it creates
+        /// (at most 1 000 RAND). Given, the section is part of the genesis hash, bound last;
+        /// omitted, the file has none and hashes byte-for-byte as before. It needs `--tokens`,
+        /// `--gas-price`, `--hardening-v6` and `--auth-guest` (with `--bundle-guest v3`), each
+        /// refused by name before any file is written.
+        #[arg(long, value_name = "UNITS")]
+        program_state_cell_fee: Option<u64>,
     },
     /// Print one genesis alloc note as JSON — the object that goes into a genesis file's `alloc`
     /// list — sealed to `--to` exactly as `genesis --alloc` seals one, so the owner's wallet finds
@@ -922,6 +931,7 @@ async fn main() -> Result<()> {
             byte_price,
             bundle_gas_limit,
             gas_dynamic,
+            program_state_cell_fee,
         } => {
             let hc_bundle = match bundle_guest.as_str() {
                 "v3" => ZkExecutor::hc_hidden_bundle_v3(),
@@ -945,6 +955,20 @@ async fn main() -> Result<()> {
             // The gas section (spec §4.2, §4.3, §7.1): written only when `--gas-price` is given,
             // so a chain cut without it hashes byte-for-byte as before.
             let gas = gas_section(gas_price, byte_price, bundle_gas_limit, gas_dynamic.as_deref())?;
+            // RPL-2: the section stands on four others (`Genesis::validate` enforces it; said
+            // here, by flag name, before a file is written).
+            if program_state_cell_fee.is_some() {
+                for (on, flag) in [
+                    (tokens.is_some(), "--tokens"),
+                    (gas_price.is_some(), "--gas-price"),
+                    (hardening_v6, "--hardening-v6"),
+                    (auth_guest, "--auth-guest"),
+                ] {
+                    if !on {
+                        anyhow::bail!("--program-state-cell-fee needs {flag}: the program_state section requires the section it writes");
+                    }
+                }
+            }
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -1044,7 +1068,10 @@ async fn main() -> Result<()> {
                 // The gas section: absent unless `--gas-price` is given, so a genesis cut
                 // without it hashes byte-for-byte as before.
                 gas,
-                program_state: None,
+                // RPL-2: absent unless `--program-state-cell-fee` is given, so a genesis cut
+                // without it hashes byte-for-byte as before.
+                program_state: program_state_cell_fee
+                    .map(|cell_fee| randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee }),
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
@@ -1080,6 +1107,9 @@ async fn main() -> Result<()> {
                 gen.hc_auth.as_deref().unwrap_or("none"),
             );
             println!("{}", gas_summary(state.ledger.gas()));
+            if let Some(p) = state.ledger.program_state() {
+                println!("program_state: cell fee {} RAND", format_amount(p.cell_fee));
+            }
         }
         Cmd::AllocNote { to, amount, asset, envelope_bytes } => {
             println!("{}", serde_json::to_string_pretty(&alloc_note_cmd(&to, &amount, asset, envelope_bytes)?)?);

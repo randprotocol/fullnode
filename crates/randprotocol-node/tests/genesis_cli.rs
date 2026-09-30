@@ -116,6 +116,76 @@ fn the_genesis_command_pins_guest_v2_and_the_v06_switch_when_asked() {
     assert!(genesis(&dir.path().join("bad.json"), &["--bundle-guest", "v4"]).status.code() != Some(0), "an unknown guest is refused");
 }
 
+/// RPL-2 from the command line: `--program-state-cell-fee` writes the `program_state` section
+/// with that fee, the chain it builds has program state, and the section is part of the genesis
+/// hash — while the default writes no section at all. It stands on four other flags, each
+/// refused by name before any file is written; the section's own bound is the build's to refuse.
+#[test]
+fn the_genesis_command_writes_the_program_state_section_when_asked() {
+    use randprotocol_core::ledger::program_state::ProgramStateConfig;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = TokensConfig { registration_fee: 1_000_000_000, tokens: Vec::new(), mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None };
+    let cfg_path = dir.path().join("tokens.json");
+    std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
+    let tokens = cfg_path.to_str().unwrap();
+    // A v3 chain's block holds three proofs (`gas::min_block_bytes`), hence the block cap.
+    let all = ["--tokens", tokens, "--gas-price", "100", "--bundle-guest", "v3", "--auth-guest", "--hardening-v6", "--max-block-bytes", "8388608"];
+
+    let plain = dir.path().join("plain.json");
+    let run = genesis(&plain, &all);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let p = read(&plain);
+    assert_eq!(p.program_state, None, "no flag, no section");
+    assert!(!std::fs::read_to_string(&plain).unwrap().contains("program_state"));
+
+    let with = dir.path().join("with.json");
+    let run = genesis(&with, &[all.as_slice(), &["--program-state-cell-fee", "10000000"]].concat());
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let w = read(&with);
+    assert_eq!(w.program_state, Some(ProgramStateConfig { cell_fee: 10_000_000 }));
+    let executor = randprotocol_node::node::executor_for_profile(&w.fri_profile).unwrap();
+    let state = w.build(executor.as_ref()).unwrap();
+    assert_eq!(state.ledger.program_state().map(|s| s.cell_fee), Some(10_000_000));
+    randprotocol_node::node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).unwrap();
+    assert_ne!(state.hash(), p.build(executor.as_ref()).unwrap().hash(), "the section is bound by the genesis hash");
+    assert_eq!(printed_hash(&run, "genesis hash "), state.hash().to_hex());
+    assert!(String::from_utf8_lossy(&run.stdout).contains("program_state: cell fee 0.01 RAND"));
+
+    // Each flag it stands on, missing one at a time, refused by name; and a fee past the bound.
+    let without = |skip: &str| -> Vec<&str> {
+        let mut args = Vec::new();
+        let mut i = 0;
+        while i < all.len() {
+            if all[i] == skip {
+                i += if all[i].starts_with("--") && i + 1 < all.len() && !all[i + 1].starts_with("--") { 2 } else { 1 };
+                continue;
+            }
+            args.push(all[i]);
+            i += 1;
+        }
+        args
+    };
+    for flag in ["--tokens", "--gas-price", "--hardening-v6", "--auth-guest"] {
+        let mut args = without(flag);
+        if flag == "--auth-guest" {
+            // v3 without the auth guest is refused for its own reason first; drop the guest too.
+            args = without("--auth-guest").into_iter().filter(|a| *a != "--bundle-guest" && *a != "v3").collect();
+        }
+        args.extend(["--program-state-cell-fee", "1"]);
+        let bad = dir.path().join(format!("bad{}.json", flag.trim_start_matches('-')));
+        let run = genesis(&bad, &args);
+        assert!(!run.status.success(), "{flag}");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(stderr.contains(&format!("--program-state-cell-fee needs {flag}")), "{flag}: {stderr}");
+        assert!(!bad.exists(), "{flag}: nothing is written");
+    }
+    let over = dir.path().join("over.json");
+    let run = genesis(&over, &[all.as_slice(), &["--program-state-cell-fee", "1000000000001"]].concat());
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("program_state"), "{}", String::from_utf8_lossy(&run.stderr));
+    assert!(!over.exists());
+}
+
 /// The genesis hash a `rand-node` run printed (`genesis hash <hex>` or `at genesis <hex>`).
 fn printed_hash(out: &Output, after: &str) -> String {
     let stdout = String::from_utf8_lossy(&out.stdout);
