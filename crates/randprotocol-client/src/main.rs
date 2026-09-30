@@ -1776,7 +1776,16 @@ async fn main() -> Result<()> {
             // difference means the transcript is not what produced that receipt.
             let pid = Hash::from_hex(receipt["program"].as_str().unwrap_or_default()).context("receipt program id")?;
             let (base_pc, words) = rpc.program_code(&pid).await?.context("the program is no longer on chain")?;
-            let exec = emulator::execute(&Program { base_pc, words }, &inputs, &[], Tier(*TIERS.last().expect("a tier")).max_cycles())
+            // The public segment the proof was made over (issue #116): the program's deploy-time
+            // public words and, under genesis `hardening_v6`, the eight-word call binding after
+            // them — what the ledger verified the call against. The re-run used to pass an empty
+            // segment, so every program deployed with `--public` trapped at its first
+            // `READ_PUBLIC` and the faithfulness check never ran.
+            let public = rpc.program_public(&pid).await?.context("the program is no longer on chain")?;
+            let hardened = rpc.limits().await?.is_some_and(|l| l.hardening_v6);
+            let tx = rpc.raw_transaction(&h).await?.context("the node no longer holds this transaction")?;
+            let segment = wallet::open_call_public_segment(&public, hardened, &tx);
+            let exec = emulator::execute(&Program { base_pc, words }, &inputs, &segment, Tier(*TIERS.last().expect("a tier")).max_cycles())
                 .map_err(|e| anyhow::anyhow!("re-running the program on these inputs failed: {e:?}"))?;
             println!("emulator outputs: {:?}\nreceipt outputs:  {}", exec.outputs, receipt["outputs"]);
             // The verdict is the exit status, not a line of output: whoever runs this in a script is

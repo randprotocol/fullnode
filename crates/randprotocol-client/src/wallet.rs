@@ -2763,6 +2763,19 @@ pub async fn deploy_precheck(rpc: &RpcClient, words: usize, public_words: usize)
 /// eight-word call binding under genesis `hardening_v6` (`program::hardened_call_segment`) — with
 /// zero words, as `call_tier` does; a guest that branches on its public words may land elsewhere.
 /// Returns the tier the call would prove at.
+/// The public segment a committed call's proof was made over, for `rand open-call`'s re-run
+/// (issue #116): the program's public words, then — under genesis `hardening_v6` — the call's own
+/// eight-word binding, exactly as `program::hardened_call_segment` builds it for the ledger and
+/// `deploy_dry_run` sizes it. A guest reads its public words from this segment, so a re-run over
+/// an empty one traps at the first `READ_PUBLIC` of any program deployed with a public input.
+pub fn open_call_public_segment(public: &[u32], hardened: bool, tx: &Transaction) -> Vec<u32> {
+    if hardened {
+        randprotocol_core::program::hardened_call_segment(public, &tx.call_binding())
+    } else {
+        public.to_vec()
+    }
+}
+
 pub fn deploy_dry_run(program: &randprotocol_zkvm::isa::Program, public: &[u32], inputs: &[u32], hardened: bool) -> Result<u8> {
     let segment = if hardened { public.len() + TX_BINDING_WORDS } else { public.len() };
     let max = randprotocol_zkvm::executor::MAX_CALL_TIER;
@@ -3969,6 +3982,21 @@ async fn send_asset_with(
 mod tests {
     use super::*;
     use randprotocol_zkvm::notes::SpendKey;
+
+    /// Issue #116: `rand open-call` re-ran a program over an empty public segment, so any program
+    /// deployed with `--public` trapped at its first `READ_PUBLIC`. The segment is the program's
+    /// public words, plus the call's own binding under `hardening_v6`.
+    #[test]
+    fn the_open_call_re_run_uses_the_programs_public_words_and_the_hardened_binding() {
+        let tx = Transaction::shielded(7, unread_bundle(), Action::Call { program: Hash::ZERO, proof: vec![1, 2, 3], input_envelope: None });
+        let public = [61u32, 62, 63];
+        assert_eq!(open_call_public_segment(&public, false, &tx), vec![61, 62, 63]);
+        let hardened = open_call_public_segment(&public, true, &tx);
+        assert_eq!(hardened.len(), 3 + randprotocol_core::types::TX_BINDING_WORDS);
+        assert_eq!(&hardened[..3], &public);
+        assert_eq!(&hardened[3..], &tx.call_binding()[..], "the binding the ledger verified the call against");
+        assert_eq!(open_call_public_segment(&[], true, &tx), tx.call_binding().to_vec(), "a program without a public input: the binding alone");
+    }
 
     fn env() -> Envelope {
         Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] }
