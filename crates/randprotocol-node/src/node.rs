@@ -768,7 +768,10 @@ fn pick_sync_peer(
     // A peer backed off after a miss — an empty answer to a live request (SYNC-2), a failed or
     // abandoned one (CN-1) — is no candidate on either branch until its back-off expires.
     let askable = |p: &PeerId, peer: &Peer| {
-        peer.connected && !skipped.contains(p) && peer.sync_backoff_until.is_none_or(|until| now >= until)
+        peer.connected
+            && !skipped.contains(p)
+            && peer.sync_backoff_until.is_none_or(|until| now >= until)
+            && peer.sync_busy_until.is_none_or(|until| now >= until)
     };
     // And once it has expired, a peer's record ranks before its claim (CN-1): fewest consecutive
     // misses first (`sync_backoff` is zero until one, doubles per miss, clears on a batch that
@@ -996,6 +999,11 @@ struct Peer {
     /// zero after a batch from this peer applied. Outlives the back-off itself: `pick_sync_peer`
     /// ranks on it before the claimed height (CN-1).
     sync_backoff: Duration,
+    /// Not asked for a batch before this instant because it answered our last one `Busy`
+    /// (audit v6, SYNC-3): its node-wide budget was spent by others, which says nothing about
+    /// whether it holds the blocks, so this is a pause of [`SYNC_BUSY_PAUSE`] — never a
+    /// back-off, and the peer's rank in `pick_sync_peer` does not move.
+    sync_busy_until: Option<Instant>,
 }
 
 /// `Status` messages one forwarding peer may deliver back to back, and the rate it recovers them
@@ -1143,29 +1151,69 @@ fn classify_consensus_gossip(
 pub const SYNC_REQUEST_BURST: u32 = 8;
 pub const SYNC_REQUEST_PER_SEC: f64 = 2.0;
 
+/// What [`admit_sync_request`] decided, and so what the asker hears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncAdmission {
+    Serve,
+    /// Over the peer's own bucket: the protocol's empty answer ([`refused_sync_response`]), which
+    /// the asker counts as a miss — that peer is asking too often.
+    OverPeerLimit,
+    /// Over the node-wide budget (audit v6, SYNC-3): `SyncResponse::Busy`, which the asker
+    /// counts as nothing and takes elsewhere — someone else spent the budget.
+    NodeBusy,
+}
+
+impl SyncAdmission {
+    #[cfg(test)]
+    fn serve(self) -> bool {
+        self == SyncAdmission::Serve
+    }
+}
+
 /// Whether to serve `peer`'s sync request now (SW-2): metered on its own `sync_bucket`. `peer` is
 /// the request's connection, never a claimed identity, and only a connected peer can send one,
 /// so an entry made here is bounded by the swarm's connection cap. The bucket outlives the
 /// connection (CN-2, [`PeerMemory`]), and a `Blocks` request within it is charged to the node's
-/// own budget too ([`SyncServeBudget`]).
+/// own budget too ([`SyncServeBudget`]) — to the validators' share first when `validator` says
+/// the peer is one (audit v6, SYNC-3: `PeerBindings::is_validator_peer`), so a handful of
+/// strangers spending the general share cannot starve a lagging validator's batch.
+#[allow(clippy::too_many_arguments)]
 fn admit_sync_request(
     peers: &mut HashMap<PeerId, Peer>,
     memory: &mut PeerMemory,
     limiter: &admission::PeerLimiter,
     global: &mut SyncServeBudget,
     peer: PeerId,
+    validator: bool,
     req: &SyncRequest,
     now: Instant,
-) -> bool {
+) -> SyncAdmission {
     // Spent in place: `TokenBucket` is `Copy`. The peer's own bucket first, restored if it has
     // been here before (CN-2), so a request its own limit refuses spends nothing node-wide.
     if !limiter.allow(&mut peer_entry(peers, memory, peer).sync_bucket, now) {
-        return false;
+        return SyncAdmission::OverPeerLimit;
     }
     match req {
-        SyncRequest::Blocks { .. } => global.allow(now),
+        SyncRequest::Blocks { .. } if global.allow(validator, now) => SyncAdmission::Serve,
+        SyncRequest::Blocks { .. } => SyncAdmission::NodeBusy,
         // One block, per-peer metered; see [`SYNC_SERVE_BURST`] for why it is not charged here.
-        SyncRequest::BlockByHash(_) => true,
+        SyncRequest::BlockByHash(_) => SyncAdmission::Serve,
+    }
+}
+
+/// How long a peer that answered our batch `Busy` sits out of the pick (audit v6, SYNC-3): long
+/// enough that two busy peers are not asked in alternation at round-trip speed — which would
+/// spend their per-peer buckets and earn the empty answers a back-off *is* for — and short
+/// against the node-wide budget's refill (eight a second).
+pub const SYNC_BUSY_PAUSE: Duration = Duration::from_secs(1);
+
+/// Our live batch request was answered `Busy` (audit v6, SYNC-3): paused for
+/// [`SYNC_BUSY_PAUSE`], with its back-off and its miss count untouched — the budget it ran out of
+/// was spent by others, and backing it off 5–120 s as if it had nothing is what let a few
+/// identities push a lagging validator off its best peers.
+fn on_sync_busy(peers: &mut HashMap<PeerId, Peer>, peer: PeerId, now: Instant) {
+    if let Some(p) = peers.get_mut(&peer) {
+        p.sync_busy_until = Some(now + SYNC_BUSY_PAUSE);
     }
 }
 
@@ -1342,9 +1390,9 @@ fn disconnect_peer(peers: &mut HashMap<PeerId, Peer>, memory: &mut PeerMemory, i
 /// which takes longer than half a second for a full batch — and caps what one node reads and
 /// sends for sync at eight budgets a second.
 ///
-/// Over it the answer is the per-peer limit's own empty batch ([`refused_sync_response`]), and an
-/// honest syncer backs this node off for SYNC-2's 5 s and asks another, so no honest peer is
-/// penalised past that back-off, which a batch from here clears. The price of any node-wide
+/// Over it the answer is `SyncResponse::Busy` (audit v6, SYNC-3; it used to be the per-peer
+/// limit's empty batch, which the asker backed off for 5–120 s as if this node had nothing), and
+/// an honest syncer asks another peer without holding it against this one. The price of any node-wide
 /// budget is that it can be spent by someone else: four ids at their own full rate keep this
 /// node's sync service busy — the service, not the consensus loop, which is the point
 /// ([`spawn_sync_serve`]) — and a lagging node goes to another peer, every node having its own.
@@ -1355,10 +1403,15 @@ pub const SYNC_SERVE_BURST: u32 = 32;
 pub const SYNC_SERVE_PER_SEC: f64 = 8.0;
 
 /// The node-wide `Blocks` budget ([`SYNC_SERVE_BURST`]): one bucket, like the faucet's, since it
-/// meters the node and not a peer.
+/// meters the node and not a peer — and a second of the same size for validator peers only
+/// (audit v6, SYNC-3). A validator draws on its own share first and on the general one after,
+/// a stranger on the general one alone, so the general share spent by strangers leaves a
+/// validator a full budget; the most this node serves is twice the old figure, and only while
+/// validators are asking.
 struct SyncServeBudget {
     limiter: admission::PeerLimiter,
     bucket: admission::TokenBucket,
+    validators: admission::TokenBucket,
 }
 
 impl SyncServeBudget {
@@ -1366,12 +1419,14 @@ impl SyncServeBudget {
         SyncServeBudget {
             limiter: admission::PeerLimiter::new(SYNC_SERVE_BURST, SYNC_SERVE_PER_SEC),
             bucket: admission::TokenBucket::default(),
+            validators: admission::TokenBucket::default(),
         }
     }
 
-    fn allow(&mut self, now: Instant) -> bool {
-        // Spent in place: `TokenBucket` is `Copy`.
-        self.limiter.allow(&mut self.bucket, now)
+    fn allow(&mut self, validator: bool, now: Instant) -> bool {
+        // Spent in place: `TokenBucket` is `Copy`. `allow` spends nothing when it refuses, so a
+        // validator refused by its own share is not charged for trying.
+        (validator && self.limiter.allow(&mut self.validators, now)) || self.limiter.allow(&mut self.bucket, now)
     }
 }
 
@@ -2926,15 +2981,17 @@ impl Node {
                 }
             },
             NetworkEvent::SyncRequest { peer, request, channel } => {
-                let response = if admit_sync_request(
+                let admission = admit_sync_request(
                     &mut self.peers,
                     &mut self.peer_memory,
                     &self.sync_limiter,
                     &mut self.sync_serve_budget,
                     peer,
+                    self.peer_bindings.is_validator_peer(&peer),
                     &request,
                     Instant::now(),
-                ) {
+                );
+                let response = if admission == SyncAdmission::Serve {
                     tracing::debug!("serving sync request from {peer}");
                     match request {
                         // Read and assembled off this loop (CN-2), answered from the worker
@@ -2946,10 +3003,11 @@ impl Node {
                                 move |r| async move { net.send_sync_response(channel, r).await },
                             );
                             if let Err(reply) = spawn_sync_serve(&self.sync_serving, work, reply) {
-                                // Every slot taken: answered as an over-budget request is, through
-                                // the reply the refusal handed back (it owns the channel).
-                                tracing::debug!(%peer, "sync request past the serving slots; answered empty");
-                                reply(refused_sync_response(&request)).await;
+                                // Every slot taken: this node is busy, as over the node-wide
+                                // budget (SYNC-3), through the reply the refusal handed back (it
+                                // owns the channel).
+                                tracing::debug!(%peer, "sync request past the serving slots; answered busy");
+                                reply(SyncResponse::Busy).await;
                             }
                             return Ok(());
                         }
@@ -2957,8 +3015,11 @@ impl Node {
                         // the replica's tree.
                         SyncRequest::BlockByHash(_) => self.serve_sync(request),
                     }
+                } else if admission == SyncAdmission::NodeBusy {
+                    tracing::debug!(%peer, "sync request over the node-wide budget; answered busy");
+                    SyncResponse::Busy
                 } else {
-                    tracing::debug!(%peer, "sync request over the peer's or the node's limit; answered empty");
+                    tracing::debug!(%peer, "sync request over the peer's own limit; answered empty");
                     refused_sync_response(&request)
                 };
                 self.net.send_sync_response(channel, response).await;
@@ -3253,6 +3314,20 @@ impl Node {
                 }
                 tracing::debug!("peer {peer} attests it does not hold a requested block; trying another");
                 self.retry_fetch(request_id).await?;
+            }
+            SyncResponse::Busy => {
+                // The peer's node-wide budget is spent (audit v6, SYNC-3): no miss, no back-off,
+                // no batch halving — ask another peer now, and this one again after a pause.
+                if self.sync_inflight.map(|s| s.1) == Some(request_id) {
+                    self.sync_inflight = None;
+                    on_sync_busy(&mut self.peers, peer, Instant::now());
+                    tracing::debug!(%peer, "sync peer busy; asking another");
+                    self.sync_from(Some(peer)).await;
+                } else {
+                    // Only a batch is ever answered busy; a by-hash fetch that somehow is moves on
+                    // like a `Block(None)`.
+                    self.retry_fetch(request_id).await?;
+                }
             }
             SyncResponse::Blocks(blocks) => {
                 let current = self.sync_inflight.map(|s| s.1) == Some(request_id);
@@ -4527,7 +4602,7 @@ mod tests {
         let (mut memory, mut global) = (PeerMemory::default(), SyncServeBudget::new());
         let req = SyncRequest::Blocks { from_height: 1, max: 100 };
         let mut admit_sync_request = |peers: &mut HashMap<PeerId, Peer>, limiter: &PeerLimiter, p: PeerId, t: Instant| {
-            admit_sync_request(peers, &mut memory, limiter, &mut global, p, &req, t)
+            admit_sync_request(peers, &mut memory, limiter, &mut global, p, false, &req, t).serve()
         };
         let now = Instant::now();
         for i in 0..SYNC_REQUEST_BURST {
@@ -4571,7 +4646,7 @@ mod tests {
             connect_peer(&mut peers, &mut memory, p, CAP);
             for _ in 0..SYNC_REQUEST_BURST {
                 // A fresh global budget per request: this test is about the peer's own bucket.
-                served += admit_sync_request(&mut peers, &mut memory, &limiter, &mut SyncServeBudget::new(), p, &req, now) as u32;
+                served += admit_sync_request(&mut peers, &mut memory, &limiter, &mut SyncServeBudget::new(), p, false, &req, now).serve() as u32;
             }
             for _ in 0..CONSENSUS_GOSSIP_BURST {
                 on_consensus_gossip(&mut peers, &consensus, p, now);
@@ -4593,7 +4668,7 @@ mod tests {
         assert!(peers[&p].sync_backoff_until.is_some_and(|u| u > now));
         // A peer rejected mid-connection (its entry dropped for a bad batch) is restored too.
         disconnect_peer(&mut peers, &mut memory, p, false, now);
-        assert!(!admit_sync_request(&mut peers, &mut memory, &limiter, &mut SyncServeBudget::new(), p, &req, now));
+        assert_eq!(admit_sync_request(&mut peers, &mut memory, &limiter, &mut SyncServeBudget::new(), p, false, &req, now), SyncAdmission::OverPeerLimit);
         // Bounded: the oldest record goes first, and a restored record leaves the memory.
         let mut memory = PeerMemory::default();
         let mut peers = HashMap::new();
@@ -4626,7 +4701,7 @@ mod tests {
         let now = Instant::now();
         let ids: Vec<PeerId> = (0..64).map(pid).collect();
         let mut admit = |t: Instant, req: &SyncRequest| {
-            ids.iter().map(|p| admit_sync_request(&mut peers, &mut memory, &limiter, &mut global, *p, req, t) as u32).sum::<u32>()
+            ids.iter().map(|p| admit_sync_request(&mut peers, &mut memory, &limiter, &mut global, *p, false, req, t).serve() as u32).sum::<u32>()
         };
         // Two requests from each of 64 ids — a quarter of each one's own burst.
         let served = admit(now, &blocks) + admit(now, &blocks);
@@ -4635,6 +4710,77 @@ mod tests {
         assert_eq!(admit(later, &blocks), SYNC_SERVE_PER_SEC as u32, "and the node-wide rate after it");
         // By-hash requests are not charged to it: each id still has its own tokens for them.
         assert_eq!(admit(later, &SyncRequest::BlockByHash(Hash::ZERO)), 64);
+    }
+
+    /// Audit v6, SYNC-3: eight stranger identities at their own full rate spend the node-wide
+    /// budget — before, a lagging validator's batch request then got an empty answer and backed
+    /// this node off. A validator peer draws on a share of its own first, so it is still served;
+    /// and when that share is spent too it falls back to the general one, never below a
+    /// stranger. A budget refusal is `NodeBusy` (answered `Busy`), an own-bucket one
+    /// `OverPeerLimit` (answered empty, as before).
+    #[test]
+    fn stranger_identities_spending_the_sync_budget_cannot_starve_a_validator_peer() {
+        use crate::admission::PeerLimiter;
+        let pid = |seed: u8| PeerId::from(libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap().public());
+        let limiter = PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC);
+        let blocks = SyncRequest::Blocks { from_height: 1, max: 100 };
+        let (mut peers, mut memory, mut global) = (HashMap::new(), PeerMemory::default(), SyncServeBudget::new());
+        let now = Instant::now();
+        let strangers: Vec<PeerId> = (1..=8).map(pid).collect();
+        let validator = pid(99);
+        let mut busy = 0;
+        for _ in 0..SYNC_REQUEST_BURST {
+            for s in &strangers {
+                if admit_sync_request(&mut peers, &mut memory, &limiter, &mut global, *s, false, &blocks, now) == SyncAdmission::NodeBusy {
+                    busy += 1;
+                }
+            }
+        }
+        assert_eq!(busy, 8 * SYNC_REQUEST_BURST - SYNC_SERVE_BURST, "the strangers spent the general share, and heard busy past it");
+        assert_eq!(
+            admit_sync_request(&mut peers, &mut memory, &limiter, &mut global, pid(50), false, &blocks, now),
+            SyncAdmission::NodeBusy,
+            "a ninth stranger too"
+        );
+        for i in 0..SYNC_REQUEST_BURST {
+            assert_eq!(
+                admit_sync_request(&mut peers, &mut memory, &limiter, &mut global, validator, true, &blocks, now),
+                SyncAdmission::Serve,
+                "the validator's batch request {i} is served from its own share"
+            );
+        }
+        // Its own bucket still binds it, answered empty as before.
+        assert_eq!(admit_sync_request(&mut peers, &mut memory, &limiter, &mut global, validator, true, &blocks, now), SyncAdmission::OverPeerLimit);
+
+        // With the validators' share spent, a validator falls back to the general one.
+        let mut global = SyncServeBudget::new();
+        for _ in 0..SYNC_SERVE_BURST {
+            assert!(global.allow(true, now));
+        }
+        assert!(global.allow(true, now), "the general share is still there for a validator");
+        assert!(global.allow(false, now), "and for a stranger: the validators' share took nothing from it");
+    }
+
+    /// Audit v6, SYNC-3, the asker's side: a `Busy` answer to our batch is no miss — the peer's
+    /// back-off and rank do not move — and the next request goes to another peer; the busy one
+    /// is asked again once [`SYNC_BUSY_PAUSE`] passes, still ahead of a peer that missed.
+    #[test]
+    fn a_busy_answer_does_not_back_the_peer_off_and_the_next_request_goes_elsewhere() {
+        let pid = |seed: u8| PeerId::from(libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap().public());
+        let at = |h: u64| Peer { status: Some(Status { height: h, head_hash: Hash::ZERO, view: h, floor: 0 }), connected: true, ..Default::default() };
+        let (busy, other) = (pid(1), pid(2));
+        let mut peers: HashMap<PeerId, Peer> = [(busy, at(1_000)), (other, at(900))].into_iter().collect();
+        let t0 = Instant::now();
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000, &[], t0), Some(busy));
+        on_sync_busy(&mut peers, busy, t0);
+        assert_eq!(peers[&busy].sync_backoff, Duration::ZERO, "no miss recorded");
+        assert_eq!(peers[&busy].sync_backoff_until, None, "not backed off");
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000, &[], t0), Some(other), "the next request goes to another peer");
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000, &[other], t0), None, "the busy one sits out the pause");
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000, &[], t0 + SYNC_BUSY_PAUSE), Some(busy), "and is first again after it");
+        // A peer that missed ranks behind it: busy is not a miss.
+        back_off_sync_peer(peers.get_mut(&other).unwrap(), t0);
+        assert_eq!(pick_sync_peer(&peers, 43, 1_000, &[], t0 + SYNC_BACKOFF_BASE + SYNC_BUSY_PAUSE), Some(busy));
     }
 
     /// CN-2, the off-loop half: a `Blocks` answer is read and assembled on a blocking worker, not

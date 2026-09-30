@@ -128,6 +128,15 @@ half-open connections, and a connection that has not finished its handshake in 5
 (libp2p's default was 10 s). The binding topic is new: an older build does not subscribe to it,
 so this rolls node by node.
 
+Serving sync batches (audit v6, SYNC-3): a node serves at most 32 batch requests back to back and
+8 a second to all strangers together, and the same again to validator peers (the reserved ones)
+from a share of their own. Over the node-wide budget — or with every serving slot busy — it
+answers `Busy`, and a new asker takes the request to another peer without backing this one off.
+A build older than this one cannot decode `Busy`: it counts the request as failed, backs the
+peer off and halves its next batch, a little more than the empty answer it used to get. That
+lasts only while such a node syncs from an upgraded one whose budget is spent, and ends with
+the roll.
+
 ## Rolling out a new commit
 
 1. `cargo test` locally, commit, push.

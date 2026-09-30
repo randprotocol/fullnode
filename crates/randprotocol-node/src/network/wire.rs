@@ -111,6 +111,11 @@ pub enum SyncResponse {
     /// sync wire is CBOR with named fields, so both directions still decode across the roll and
     /// neither counts the other's word (the decode test below pins it).
     NotHeld(NotHeld),
+    /// "This node's node-wide budget for serving batches is spent" (audit v6, SYNC-3): not
+    /// "I have nothing", which the empty `Blocks` answer says and an asker backs a peer off for.
+    /// The asker takes it elsewhere without a back-off. Appended last; a build without it cannot
+    /// decode it and counts the request as failed (the decode test below pins it).
+    Busy,
 }
 
 #[cfg(test)]
@@ -247,6 +252,23 @@ mod tests {
         let mut m = genesis.as_bytes().to_vec();
         m.extend_from_slice(hash.as_bytes());
         Hash::digest_domain(b"rand-not-held-1", &m).0.to_vec()
+    }
+
+    /// Audit v6, SYNC-3, the roll: `Busy` is appended, so the three answers a v0.6.7 node knows
+    /// encode as before on the CBOR sync wire, and a v0.6.7 node reading `Busy` fails to decode
+    /// it — `read_response` returns an `InvalidData` error, libp2p reports `OutboundFailure::Io`,
+    /// and that node treats it as a failed batch request (a back-off of the peer, a halved next
+    /// batch), which is more than the empty answer it used to get costs it (a back-off alone).
+    #[test]
+    fn busy_is_appended_and_an_old_node_reads_it_as_a_failed_request() {
+        let cbor = |v: &SyncResponse| cbor4ii::serde::to_vec(Vec::new(), v).unwrap();
+        let old_cbor = |v: &OldSyncResponse| cbor4ii::serde::to_vec(Vec::new(), v).unwrap();
+        assert_eq!(cbor(&SyncResponse::Blocks(vec![])), old_cbor(&OldSyncResponse::Blocks(vec![])));
+        assert_eq!(cbor(&SyncResponse::Block(None)), old_cbor(&OldSyncResponse::Block(None)));
+        let busy = cbor(&SyncResponse::Busy);
+        assert!(cbor4ii::serde::from_slice::<OldSyncResponse>(&busy).is_err(), "an old node cannot decode busy");
+        assert!(matches!(cbor4ii::serde::from_slice::<SyncResponse>(&busy).unwrap(), SyncResponse::Busy));
+        assert!(busy.len() < 16, "a few bytes on the wire");
     }
 
     /// The CN-3 roll, pinned (scan 2026-09-27): the sync wire is CBOR (`cbor4ii::serde`, what the
