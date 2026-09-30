@@ -213,6 +213,10 @@ pub fn call_private_table_under_floor(proof: &[u8]) -> Option<(&'static str, u8)
 /// carrying such a proof (`admission::non_canonical_proofs`), and the ledger refuses it under
 /// genesis `hardening_v6` (`ConfidentialExecutor::non_canonical_proof`).
 pub fn non_canonical(proof: &Proof) -> Option<String> {
+    // ZKV-4: before anything sizes a loop, a shift or a sum on a word of the proof's own.
+    if let Some(bits) = proof.batch.degree_bits.iter().find(|&&bits| bits > MAX_HONEST_DEGREE_BITS) {
+        return Some(format!("degree bits {bits} where no accepted proof declares more than {MAX_HONEST_DEGREE_BITS}"));
+    }
     if proof.keccak_log_height == NO_KECCAK
         && proof.sha256_log_height == NO_SHA256
         && TIERS.contains(&proof.tier.0)
@@ -260,8 +264,8 @@ pub fn non_canonical(proof: &Proof) -> Option<String> {
     // choose as far as that layer is concerned.
     let preprocessed = crate::machine::chips(
         if TIERS.contains(&proof.tier.0) { proof.tier } else { Tier(TIERS[0]) },
-        proof.keccak_log_height,
-        proof.sha256_log_height,
+        clamped_hash_log_height(proof.keccak_log_height, crate::tables::keccak::MAX_LOG_HEIGHT),
+        clamped_hash_log_height(proof.sha256_log_height, crate::tables::sha256::MAX_LOG_HEIGHT),
     )
     .iter()
     .filter(|c| p3_air::BaseAir::<crate::machine::Val>::preprocessed_width(*c) > 0)
@@ -322,6 +326,41 @@ const FRI_LOG_FINAL_POLY_LEN: usize = 0;
 const FRI_MAX_LOG_ARITY: usize = 3;
 const NUM_RANDOM_CODEWORDS: usize = 4;
 
+/// ZKV-4 (audit v6): the largest `degree_bits` entry a proof `Machine::verify` accepts can carry.
+/// `verify` requires the proof's `degree_bits` to equal `Machine::log_ext_degrees` of its declared
+/// shape, whose entries are a table's log height plus the zk doubling: the memory table's
+/// declared height is the tallest any table reaches (`MAX_MEM_LOG_HEIGHT`, 24), so 25. The
+/// asserts below fail the build if a re-vendor raises another table's ceiling past the memory
+/// table's, which is what would make this bound refuse an honest proof.
+///
+/// Why a bound at all: the entries are the proof's own words, `usize` each, and
+/// [`honest_fri_arities`] walks from the largest of them down in steps of at most three. It runs
+/// before any signature or proof check — on the node's event loop for every gossiped or submitted
+/// transaction (`Mempool::precheck`), and in block validation under genesis `hardening_v6` — so
+/// without the bound one message costs the node as much time and memory as its sender writes
+/// into that field.
+pub const MAX_HONEST_DEGREE_BITS: usize = crate::machine::MAX_MEM_LOG_HEIGHT as usize + 1;
+const _: () = {
+    let mem = crate::machine::MAX_MEM_LOG_HEIGHT;
+    assert!(crate::tables::program::MAX_LOG_HEIGHT <= mem);
+    assert!(crate::tables::input::MAX_LOG_HEIGHT <= mem);
+    assert!(crate::tables::public::MAX_LOG_HEIGHT <= mem);
+    assert!(crate::tables::keccak::MAX_LOG_HEIGHT <= mem);
+    assert!(crate::tables::sha256::MAX_LOG_HEIGHT <= mem);
+    // cpu 2^t, alu 2^(t+1), poseidon2 2^(t+2), the memory floor t+2: the tallest tier's.
+    assert!(TIERS[TIERS.len() - 1] + 2 <= mem as usize);
+    assert!(crate::tables::range::HEIGHT <= 1 << mem && crate::tables::nibble::HEIGHT <= 1 << mem);
+};
+
+/// ZKV-4: a declared keccak or sha256 height as `machine::chips` may be handed it before
+/// `check_declared_heights` has run. `chips` shifts by the height to size the table (a debug-build
+/// panic at 64 and above) and the canonical-proof rules need only whether the table exists and
+/// how many instances the batch has — neither of which the clamp changes: `0` stays "no table",
+/// anything else stays a table. A height past the ceiling is refused by the verifier, as before.
+fn clamped_hash_log_height(declared: u8, ceiling: u8) -> u8 {
+    declared.min(ceiling)
+}
+
 /// VERIFIER-2: the FRI folding schedule the honest prover writes for a proof of this declared
 /// shape, or `None` for a shape that has no batch (a tier outside `TIERS`, an instance count the
 /// chip set does not have — refused elsewhere).
@@ -342,7 +381,16 @@ pub fn honest_fri_arities(proof: &Proof) -> Option<Vec<u8>> {
     if !TIERS.contains(&proof.tier.0) {
         return None;
     }
-    let chips = crate::machine::chips(proof.tier, proof.keccak_log_height, proof.sha256_log_height);
+    // ZKV-4: the walk below is one turn per three units of the largest entry, so the entries are
+    // bounded before it starts. `non_canonical` names the refusal; here it is "no schedule".
+    if proof.batch.degree_bits.iter().any(|&bits| bits > MAX_HONEST_DEGREE_BITS) {
+        return None;
+    }
+    let chips = crate::machine::chips(
+        proof.tier,
+        clamped_hash_log_height(proof.keccak_log_height, crate::tables::keccak::MAX_LOG_HEIGHT),
+        clamped_hash_log_height(proof.sha256_log_height, crate::tables::sha256::MAX_LOG_HEIGHT),
+    );
     if chips.len() != proof.batch.degree_bits.len() {
         return None;
     }
@@ -2194,6 +2242,53 @@ mod tests {
             assert_eq!(non_canonical(&p), None, "{what}: honest is canonical");
         }
         assert_eq!(non_canonical_proof(&padded.to_bytes()), non_canonical(&padded), "the byte form reads the same");
+    }
+
+    /// ZKV-4 (audit v6, high, live on chains 15–18): `honest_fri_arities` re-derived the folding
+    /// schedule in a loop of one turn per three units of the largest `degree_bits` entry — a
+    /// field of the proof, read before any signature or proof check on the node's event loop
+    /// (`Mempool::precheck`) and in block validation under `hardening_v6` — so one gossiped
+    /// transaction held a node for as long, and in as much memory, as its sender chose. The
+    /// entry is bounded first now, by the most an accepted proof can carry; the refusal is still
+    /// `non_canonical`'s (the verifier refuses the same header on its degree-bits equality).
+    /// Beside it, the two debug-build panics the same header reached: the addition on the
+    /// entry, and `chips`' shifts by the declared keccak and sha256 heights.
+    #[test]
+    fn zkv4_a_declared_degree_is_bounded_before_the_schedule_is_derived() {
+        use super::*;
+        use crate::machine::{Backend, FriProfile};
+        let payment = crate::guests::private_payment(1000);
+        let (base, _, _) = prove(FriProfile::Test, &payment, &[400, 250, 300, 75], &[], None, Backend::Cpu, None).unwrap();
+        let honest = decode_canonical(&base).unwrap();
+        assert_eq!(non_canonical(&honest), None, "the honest proof is canonical");
+        assert!(honest.batch.degree_bits.iter().all(|&db| db <= MAX_HONEST_DEGREE_BITS), "and inside the bound");
+        // Large enough that the unbounded loop is seconds and hundreds of megabytes, small enough
+        // that the unfixed tree still finishes and shows the wrong refusal rather than an abort.
+        for (what, value) in [("a large entry", 600_000_000usize), ("one past the bound", MAX_HONEST_DEGREE_BITS + 1), ("the largest", usize::MAX)] {
+            for slot in [0, honest.batch.degree_bits.len() - 1] {
+                let mut forged = decode_canonical(&base).unwrap();
+                forged.batch.degree_bits[slot] = value;
+                let started = std::time::Instant::now();
+                let verdict = non_canonical(&forged);
+                let took = started.elapsed();
+                assert!(verdict.as_deref().is_some_and(|w| w.starts_with("degree bits")), "{what} in slot {slot}: {verdict:?}");
+                assert!(took < std::time::Duration::from_millis(250), "{what} in slot {slot}: the check took {took:?}");
+                assert_eq!(honest_fri_arities(&forged), None, "{what} in slot {slot}: no schedule is derived for it");
+                assert_eq!(non_canonical_proof(&forged.to_bytes()), verdict, "the byte form reads the same");
+            }
+        }
+        // The bound itself is an honest value: a proof at it is judged on its schedule as before.
+        let mut at_bound = decode_canonical(&base).unwrap();
+        at_bound.batch.degree_bits[0] = MAX_HONEST_DEGREE_BITS;
+        assert!(non_canonical(&at_bound).is_some_and(|w| w.starts_with("FRI folding schedule")));
+        // The declared hash-table heights size a shift in `chips`: any byte must be survivable.
+        for height in [21u8, 63, 64, 200, 255] {
+            let mut forged = decode_canonical(&base).unwrap();
+            forged.keccak_log_height = height;
+            forged.sha256_log_height = height;
+            let _ = non_canonical(&forged);
+            let _ = honest_fri_arities(&forged);
+        }
     }
 
     /// VERIFIER-1: the FRI commit-phase proof-of-work words were read and dropped — the chain's
