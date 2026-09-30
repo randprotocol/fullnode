@@ -747,6 +747,38 @@ the same rule off one `rand_getTokens`/`rand_getBridgeState` read, before any pr
 *"{coin} on chain {c} has {d} decimals: the amount and the relayer fee must be multiples of
 {unit}"*.
 
+### 13.1 zUSD is a basket: what a holder bears (audit v6, TOK-3; stated 2026-09-30)
+
+zUSD is one token over a pool of backings taken at face value. Said plainly:
+
+- **A zUSD holder bears the risk of every listed backing**, not of the coin they deposited. One
+  zUSD is a claim on the pool — any backing with enough `locked` — not on a particular coin.
+- **A depegged backing deposited at par can redeem a sound one.** Nothing prices a backing: a lock
+  of 1 unit of any listed coin mints 1 zUSD, and a burn may name any backing whose `locked` covers
+  it (`TokenRegistry::check_release` checks that backing's custody and nothing about the coin's
+  market price). If one listed coin loses its peg, it can be deposited at par and the zUSD burned
+  toward a coin that kept its peg, until the sound backings are drained; the holders left hold a
+  token backed by the weak coin.
+- **The loss bound is the rolling window and the custody actually locked.** Under rules v2 (§21.2)
+  a mint is refused once the window is full: on chain 18, 100 000 zUSD per backing and **4 000
+  zUSD across all backings** per rolling 24 hours (`deploy/genesis-chain18.json`:
+  `tokens.mint_cap_per_day`, `bridge.rules_v2.global_mint_cap_per_window`, `cap_window_secs`
+  86 400). So at most 4 000 zUSD of a weak coin can enter in any 24 hours, and no more can leave
+  through a sound backing than that backing holds. The window limits the rate, not the total: it
+  buys the time to pause mints (the pause key, §15), which stops new deposits of the weak coin;
+  burns stay open while paused. The custody locked on 2026-09-29 was 10 zUSD (Tron USDT 9, Solana
+  USDT 1).
+- **Listing a backing is the decision that adds risk.** A new backing enters only through
+  `ListBacking` (or `RegisterBridgedToken`), which needs the post-quantum guardian quorum (§18)
+  and, under rules v2, is refused while mints are paused (§21.3). There is no per-backing
+  redemption limit and no per-backing pause: those would make zUSD non-fungible across backings
+  and need a state change, so a hard fork. They are the option to take before a backing with real
+  depeg risk is listed.
+
+The paragraph above that says the source endpoints' own pauser and rate caps are "the only limit"
+was written for chain 14, before rules v2; on chains 15 to 18 the two rolling windows are the
+Rand-side limit.
+
 ## 14. Bridge hardening (v0.5): what it closes
 
 Per-backing `locked` and `InsufficientBacking` guarantee the custody invariant for

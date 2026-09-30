@@ -305,6 +305,16 @@ many backings (zUSD's seven), the `total_supply == Σ locked` invariant, the rel
 per-backing daily mint cap and pause, the post-quantum co-signature every mint needs, and listing a
 new bridged token or backing after genesis under a PQ guardian quorum.
 
+**zUSD is a basket, not seven separate claims** (audit v6, TOK-3; stated 2026-09-30). Its backings
+are pooled at face value, so a holder bears the risk of every listed backing: a backing that has
+lost its peg can be deposited at par and the zUSD burned toward a sound backing, until the sound
+ones are drained. What bounds the loss is the rolling global mint window — 4 000 zUSD across all
+backings per 24 hours on chain 18, beside 100 000 per backing — and the custody actually locked;
+the window limits the rate and gives time to pause mints, it does not cap the total. A backing is
+listed only by `ListBacking` under the post-quantum guardian quorum, refused while mints are
+paused. `docs/bridge.md` §13.1 has the detail and the alternative (per-backing redemption limits,
+a hard fork).
+
 ## 14. The registry cap (v0.5.4, audit v4 TOK-1)
 
 The registry root is a merkle root over every token's leaf, recomputed at every state root, and
