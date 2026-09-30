@@ -157,6 +157,12 @@ const META_HEAD_HEIGHT: &str = "head_height";
 const META_GENESIS_HASH: &str = "genesis_hash";
 const META_CHAIN_ID: &str = "chain_id";
 const META_SAFETY: &str = "safety";
+/// The safety halt (audit v6, CON-5): written when the replica reports conflicting finality
+/// (`Action::SafetyViolation`), before the node stops. While it is there the node refuses to
+/// start — under `Restart=always` it otherwise came straight back, passed `verify_chain` and
+/// served as if nothing had happened, with nothing written down. JSON ([`SafetyHalt`]); cleared
+/// only by `rand-node safety clear-halt`, an operator's explicit act.
+const META_SAFETY_HALT: &str = "safety_halt";
 /// v0.5.4's locked block (audit v4, CON-4): the block the persisted `locked_qc` certified,
 /// written beside the safety state by that build. Never written by this one — `resume_consensus`
 /// reads it once, folds it into [`META_PENDING_BLOCKS`], and retires the key.
@@ -561,6 +567,21 @@ pub fn derived_note_count(tx: &randprotocol_core::Transaction) -> usize {
 /// log since their last flush. On 2026-09-24 that was 13 GB of `.log` beside 27 GB of tables on
 /// each chain-14 validator, and seven 48 GB droplets full at once. 256 MB is ~2 300 chain-14
 /// blocks: a forced flush of a few kilobytes about once an hour.
+/// What a node writes down when it stops on conflicting finality (audit v6, CON-5): the committed
+/// head it held, the block a three-chain tried to commit that does not descend from it, and
+/// when. Kept as JSON under [`META_SAFETY_HALT`] so a field can be added without a migration.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SafetyHalt {
+    /// The hash of this node's committed head when it stopped.
+    pub committed: Hash,
+    /// The block the conflicting three-chain would have committed.
+    pub attempted: Hash,
+    /// This node's committed height then.
+    pub height: u64,
+    /// Wall-clock milliseconds since the epoch, this node's clock.
+    pub at_ms: u64,
+}
+
 const MAX_TOTAL_WAL_BYTES: u64 = 256 * 1024 * 1024;
 
 /// `RegistryExt` as the `tokens_v2` key stores it: JSON, so a field this build knows but the
@@ -2478,8 +2499,71 @@ impl Storage {
         Ok(())
     }
 
+    /// The persisted safety state. A row written before audit v6's `voted` record existed (every
+    /// build through v0.6.7) is four fields, and bincode is positional: it is read as those four
+    /// with an empty record, so a rolled node keeps its lock and its last voted view. The other
+    /// direction needs nothing: `voted` is appended last and an older build's `bincode::deserialize`
+    /// stops after the fields it knows, so a rollback reads the row this build wrote.
     pub fn load_safety(&self) -> Result<Option<SafetyState>> {
-        self.get(CF_META, META_SAFETY.as_bytes())
+        #[derive(serde::Deserialize)]
+        struct SafetyStateV1 {
+            view: u64,
+            high_qc: QuorumCertificate,
+            locked_qc: QuorumCertificate,
+            last_voted_view: u64,
+        }
+        let Some(bytes) = self.get_meta_raw(META_SAFETY)? else { return Ok(None) };
+        if let Ok(s) = bincode::deserialize::<SafetyState>(&bytes) {
+            return Ok(Some(s));
+        }
+        let v1: SafetyStateV1 = bincode::deserialize(&bytes)?;
+        Ok(Some(SafetyState {
+            view: v1.view,
+            high_qc: v1.high_qc,
+            locked_qc: v1.locked_qc,
+            last_voted_view: v1.last_voted_view,
+            voted: Vec::new(),
+        }))
+    }
+
+    /// Record a safety halt (audit v6, CON-5), fsynced: the node is about to stop on conflicting
+    /// finality, and must not be able to come back without an operator reading this.
+    pub fn save_safety_halt(&self, halt: &SafetyHalt) -> Result<()> {
+        let bytes = serde_json::to_vec(halt).map_err(|e| StorageError::Corrupt(format!("safety halt: {e}")))?;
+        self.db.put_cf_opt(self.cf(CF_META), META_SAFETY_HALT, bytes, &sync_opts())?;
+        Ok(())
+    }
+
+    /// The recorded safety halt, if the node stopped on one and nobody has cleared it.
+    pub fn safety_halt(&self) -> Result<Option<SafetyHalt>> {
+        match self.get_meta_raw(META_SAFETY_HALT)? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| StorageError::Corrupt(format!("safety halt: {e}")))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Clear the safety halt — the operator's act, behind `rand-node safety clear-halt`. Returns
+    /// what was recorded, so the caller can print what it cleared.
+    pub fn clear_safety_halt(&self) -> Result<Option<SafetyHalt>> {
+        let halt = self.safety_halt()?;
+        if halt.is_some() {
+            self.db.delete_cf_opt(self.cf(CF_META), META_SAFETY_HALT, &sync_opts())?;
+        }
+        Ok(halt)
+    }
+
+    /// The operator's offline lock release (audit v6, CON-4, decision D23): lower the persisted
+    /// lock to the committed head's certificate, fsynced. Returns the lock that was given up, or
+    /// `None` when there was none above the head. Only ever called on a stopped node's store —
+    /// RocksDB's own lock file refuses a second opener, so a running node cannot be edited.
+    pub fn release_lock(&self) -> Result<Option<QuorumCertificate>> {
+        let Some(mut safety) = self.load_safety()? else { return Ok(None) };
+        let was = safety.locked_qc.clone();
+        if !safety.release_lock(&self.head_qc()?) {
+            return Ok(None);
+        }
+        self.save_safety(&safety)?;
+        Ok(Some(was))
     }
 
     /// Persist the certified blocks above the head (audit v5, CON-4: `Action::PersistPending`),
@@ -5822,9 +5906,69 @@ mod tests {
             high_qc: QuorumCertificate::genesis(gs.hash()),
             locked_qc: QuorumCertificate::genesis(gs.hash()),
             last_voted_view: 8,
+            voted: vec![(7, Hash([7; 32])), (8, Hash([8; 32]))],
         };
         s.save_safety(&state).unwrap();
         assert_eq!(s.load_safety().unwrap(), Some(state));
+    }
+
+    /// Audit v6, CON-4: the safety state gained the `voted` record, appended last, and bincode is
+    /// positional — a row every build through v0.6.7 wrote is four fields and would not decode as
+    /// five. A rolled validator must come back with its lock and its last voted view, not with
+    /// "no safety state" (which resumes at the head's QC: the lock gone, a second vote in the
+    /// last voted view possible).
+    #[test]
+    fn a_safety_row_written_before_the_voted_record_still_loads() {
+        #[derive(serde::Serialize)]
+        struct V067 {
+            view: u64,
+            high_qc: QuorumCertificate,
+            locked_qc: QuorumCertificate,
+            last_voted_view: u64,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = genesis(1);
+        s.init_genesis(&gs).unwrap();
+        let qc = QuorumCertificate::genesis(gs.hash());
+        let old = V067 { view: 41, high_qc: qc.clone(), locked_qc: qc.clone(), last_voted_view: 40 };
+        s.db.put_cf(s.cf(CF_META), META_SAFETY, bincode::serialize(&old).unwrap()).unwrap();
+        let got = s.load_safety().unwrap().expect("the v0.6.7 row is read, not lost");
+        assert_eq!((got.view, got.last_voted_view, &got.high_qc, &got.locked_qc), (41, 40, &qc, &qc));
+        assert!(got.voted.is_empty(), "with an empty vote record");
+        // And what this build writes, a v0.6.7 build reads: the new field is a suffix.
+        let new = SafetyState { view: 50, high_qc: qc.clone(), locked_qc: qc.clone(), last_voted_view: 49, voted: vec![(49, Hash([1; 32]))] };
+        s.save_safety(&new).unwrap();
+        #[derive(serde::Deserialize)]
+        struct V067Read {
+            view: u64,
+            #[allow(dead_code)]
+            high_qc: QuorumCertificate,
+            #[allow(dead_code)]
+            locked_qc: QuorumCertificate,
+            last_voted_view: u64,
+        }
+        let bytes = s.get_meta_raw(META_SAFETY).unwrap().unwrap();
+        let back: V067Read = bincode::deserialize(&bytes).expect("a rollback reads the prefix it knows");
+        assert_eq!((back.view, back.last_voted_view), (50, 49));
+    }
+
+    /// Audit v6, CON-5: the halt is written down, survives a reopen, and is cleared only on request.
+    #[test]
+    fn a_safety_halt_survives_a_reopen_until_it_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let halt = SafetyHalt { committed: Hash([1; 32]), attempted: Hash([2; 32]), height: 77, at_ms: 1_759_000_000_000 };
+        {
+            let s = Storage::open(dir.path()).unwrap();
+            s.init_genesis(&genesis(1)).unwrap();
+            assert_eq!(s.safety_halt().unwrap(), None);
+            s.save_safety_halt(&halt).unwrap();
+        }
+        let s = Storage::open(dir.path()).unwrap();
+        assert_eq!(s.safety_halt().unwrap(), Some(halt.clone()));
+        assert_eq!(s.clear_safety_halt().unwrap(), Some(halt));
+        assert_eq!(s.safety_halt().unwrap(), None);
+        assert_eq!(s.clear_safety_halt().unwrap(), None, "nothing to clear twice");
     }
 
     /// The certified chain above the head (audit v5, CON-4) round-trips in order, replaces the

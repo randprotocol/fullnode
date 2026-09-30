@@ -1,6 +1,6 @@
 use super::{
     Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, EpochSets, NewView, NotHeld, SafetyState,
-    SigningDomain, NOT_HELD_VIEW_WINDOW, PROPOSAL_VIEW_WINDOW,
+    SigningDomain, MAX_VOTED_KEPT, NOT_HELD_VIEW_WINDOW, PROPOSAL_VIEW_WINDOW,
 };
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{Address, Hash, Keypair};
@@ -85,6 +85,10 @@ pub struct HotStuff {
     /// QC certifying the committed head; the fallback when `high_qc`'s block is unobtainable.
     head_qc: QuorumCertificate,
     last_voted_view: u64,
+    /// The block this replica voted for in each view above the committed head's (audit v6,
+    /// CON-4), persisted with the vote (`SafetyState::voted`). What `not_held` consults: a
+    /// replica does not attest not holding a block its own vote helped certify, held or not.
+    voted: BTreeMap<u64, Hash>,
     consecutive_timeouts: u32,
     proposed_in_view: bool,
 
@@ -216,13 +220,16 @@ impl HotStuff {
         // extra vote a conflicting QC needs. So a persisted `locked_qc`/`high_qc` is restored
         // whenever it is *ahead* of the head's QC, and a stale one is raised to the head — never
         // lowered below it, because nothing under the committed head can be contradicted any more.
-        let (view, high_qc, locked_qc, last_voted_view) = match safety {
+        let head_view = tree[&head_hash].block.view();
+        let (view, high_qc, locked_qc, last_voted_view, voted) = match safety {
             Some(s) => {
                 let view = s.view.max(head_qc.view.saturating_add(1));
                 let newer = |qc: QuorumCertificate| if qc.view > head_qc.view { qc } else { head_qc.clone() };
-                (view, newer(s.high_qc), newer(s.locked_qc), s.last_voted_view)
+                // Votes at or under the head's view are decided; the rest is this replica's word.
+                let voted: BTreeMap<u64, Hash> = s.voted.into_iter().filter(|(v, _)| *v > head_view).collect();
+                (view, newer(s.high_qc), newer(s.locked_qc), s.last_voted_view, voted)
             }
-            None => (head_qc.view.saturating_add(1), head_qc.clone(), head_qc.clone(), 0),
+            None => (head_qc.view.saturating_add(1), head_qc.clone(), head_qc.clone(), 0, BTreeMap::new()),
         };
         let current = epoch_sets.shared(0).expect("epoch 0 is seeded above");
         let mut hs = HotStuff {
@@ -236,6 +243,7 @@ impl HotStuff {
             locked_qc,
             head_qc,
             last_voted_view,
+            voted,
             consecutive_timeouts: 0,
             proposed_in_view: false,
             committed_height: head_height,
@@ -592,6 +600,7 @@ impl HotStuff {
             high_qc: self.high_qc.clone(),
             locked_qc: self.locked_qc.clone(),
             last_voted_view: self.last_voted_view,
+            voted: self.voted.iter().map(|(view, hash)| (*view, *hash)).collect(),
         }
     }
 
@@ -645,11 +654,27 @@ impl HotStuff {
     /// sits in the tree or in the orphan pool: a replica holding it, parent or not, does not
     /// attest otherwise (scan 2026-09-27, CN-3 — a lagging validator used to sign for a block it
     /// kept as an orphan).
+    ///
+    /// Audit v6, CON-4 (the signer side, C3 of the 2026-09-21 design): `None` too for a block this
+    /// replica **voted for** (the persisted `voted` record) and for the block it is **locked on**.
+    /// A validator that voted for a block and restarted before the block was certified locally
+    /// no longer holds it — the pending set keeps certified blocks only — and used to sign that
+    /// it did not, the false word the counterexample needs from an honest validator (two
+    /// Byzantine keys plus a restart of honest ones released a lock on chain 18's shape). Its
+    /// vote is in the certificate; it does not get to say the block is not there.
     pub fn not_held(&self, hash: &Hash) -> Option<NotHeld> {
         if self.tree.contains_key(hash) || self.holds_orphan(hash) {
             return None;
         }
+        if self.voted_for(hash) || (self.locked_qc.block_hash == *hash && self.locked_qc.view > self.head_qc.view) {
+            return None;
+        }
         self.signer.as_ref().map(|k| NotHeld::sign(k, &self.cfg.genesis_hash, hash, self.view))
+    }
+
+    /// Whether this replica's persisted record holds a vote for `hash` above the committed head.
+    pub fn voted_for(&self, hash: &Hash) -> bool {
+        self.voted.values().any(|h| h == hash)
     }
 
     /// Whether `hash` is a block waiting in the orphan pool for its parent.
@@ -682,18 +707,27 @@ impl HotStuff {
     /// Record a peer's signed not-held for the locked block (audit v4, CON-4). Counts only an
     /// attestation for the block this replica is locked on above its head and does not hold,
     /// from a validator of the *current* set (a member of an earlier epoch's set counts
-    /// nothing), with a signature over this chain's genesis. Once the signers hold a quorum —
-    /// strictly more than two thirds of the set's stake (audit v5: a third is exactly what the
-    /// Byzantine validators may hold, so "more than a third" need not include anyone honest) —
-    /// the block is attested unobtainable by a majority of the honest stake, and the lock is
-    /// lowered to the committed head's QC, which is safe for the same reason the old unsigned
-    /// fallback was: nothing above the head is committed. Returns whether the lock was released
-    /// by this attestation.
+    /// nothing), with a signature over this chain's genesis, whose signer's view is above the
+    /// locked QC's and within [`NOT_HELD_VIEW_WINDOW`] of this replica's (CN-3). Returns whether
+    /// the signers now hold a quorum — strictly more than two thirds of the set's stake.
     ///
-    /// Scan 2026-09-27, CN-3: an attestation counts only when its signer's view is above the
-    /// locked QC's — signed after the signer left the view the block was certified in, so not a
-    /// word harvested before the block had propagated — and within [`NOT_HELD_VIEW_WINDOW`] of
-    /// this replica's view. Anything else is refused before the signature is checked.
+    /// **The lock is no longer released on it** (audit v6, CON-4, decision D23). v0.5.4 lowered
+    /// the lock on a third of the stake and v0.5.5 on a quorum, and the model still had a
+    /// counterexample on chain 18's shape — 26 equal validators, quorum 18: eight Byzantine words
+    /// plus three honest validators that lost the block (or two plus a restart of honest ones)
+    /// release a lock whose block did certify, and conflicting blocks commit. That is a safety
+    /// failure bought with words, and no count of words fixes it while an honest validator that
+    /// lost its state can sign a false one. So a quorum here is *evidence for the operator* and
+    /// nothing else: it is logged once, and the lock stands until a proposal whose justify
+    /// outranks it arrives (`try_vote`'s first disjunct — the protocol's own release), the block
+    /// is fetched, or the operator clears the lock offline (`rand-node safety release-lock`,
+    /// which refuses to run beside a live node and prints what it gives up).
+    ///
+    /// What this costs: a validator locked on a block nobody can serve stays silent until one of
+    /// those three. Since v0.5.5 every certified block above the head is persisted before the
+    /// lock that names it (`Action::PersistPending`), so a lock on a block its own replica does
+    /// not hold means lost state, not a restart — the case the automatic release was built for
+    /// (chain 14, 2026-09-24) no longer arises from a whole-fleet restart.
     pub fn record_not_held(&mut self, n: &NotHeld) -> bool {
         let locked = self.locked_qc.block_hash;
         // Evidence for any other hash is stale — the lock moved on — or never mattered.
@@ -708,22 +742,22 @@ impl HotStuff {
         if !self.current.contains(&signer) || !n.verify(&self.cfg.genesis_hash) {
             return false;
         }
+        let had_quorum = self.current.has_quorum(self.not_held_stake(&locked));
         let seen = self.not_held.entry(locked).or_default().entry(signer).or_insert(n.view);
         *seen = (*seen).max(n.view);
         let stake = self.not_held_stake(&locked);
         if !self.current.has_quorum(stake) {
             return false;
         }
-        tracing::warn!(
-            "locked block {:?} (view {}) is attested unheld by a quorum of the stake; \
-             releasing the lock to the committed head QC (view {})",
-            locked,
-            self.locked_qc.view,
-            self.head_qc.view
-        );
-        self.locked_qc = self.head_qc.clone();
-        self.not_held.clear();
-        self.unobtainable.clear();
+        if !had_quorum {
+            tracing::error!(
+                "locked block {:?} (view {}) is attested unheld by a quorum of the stake. The lock is NOT released \
+                 automatically (audit v6, CON-4): it yields to a proposal whose justify outranks it, or to the block \
+                 arriving. If this validator stays silent, stop it and run `rand-node safety release-lock`.",
+                locked,
+                self.locked_qc.view,
+            );
+        }
         true
     }
 
@@ -747,9 +781,10 @@ impl HotStuff {
     /// same evidence — `MAX_FETCH_ATTEMPTS` failed fetches, each an unsigned `Block(None)` or a
     /// timeout from a peer chosen by an unsigned status — which let eight sybils take back any
     /// honest validator's promise. `high_qc` is liveness state and keeps this fallback; the lock
-    /// is released only by [`record_not_held`](Self::record_not_held), on signed not-held from
-    /// validators holding a quorum — more than two thirds of the stake. The whole-fleet-restart case that
-    /// motivated the old release is covered by the persisted locked block (`resume`).
+    /// is not released on anyone's word at all since audit v6 ([`record_not_held`](Self::record_not_held)
+    /// only counts the evidence) — it yields to a higher justify, the block arriving, or the
+    /// operator's offline override. The whole-fleet-restart case that motivated the old release
+    /// is covered by the persisted certified chain (`resume`).
     pub fn fallback_high_qc(&mut self, unobtainable: &Hash) -> Vec<Action> {
         let mut out = Vec::new();
         if self.high_qc.block_hash != *unobtainable || self.tree.contains_key(unobtainable) {
@@ -1037,6 +1072,8 @@ impl HotStuff {
         if view > self.view {
             self.enter_view(view, &mut out);
             if let Some(key) = &self.signer {
+                // Persisted before this replica signs at the new view (audit v6, CON-4).
+                out.push(Action::PersistSafety(self.safety_state()));
                 let mine = NewView::sign(&self.cfg.domain, view, self.high_qc.clone(), key);
                 out.push(Action::Broadcast(ConsensusMessage::NewView(mine.clone())));
                 if self.is_leader(view) {
@@ -1078,6 +1115,13 @@ impl HotStuff {
         self.consecutive_timeouts += 1;
         let next = self.view.saturating_add(1);
         self.enter_view(next, &mut out);
+        // A view reached without a vote is persisted too (audit v6, CON-4): until now the view
+        // hit disk only with a vote, so a validator that timed out through a stall and restarted
+        // came back at the view of its last vote and signed — a NewView, a not-held — at a view
+        // lower than the one it had reached. Timeouts are rare; the write is the vote's own.
+        if self.signer.is_some() {
+            out.push(Action::PersistSafety(self.safety_state()));
+        }
         if let Some(key) = &self.signer {
             let nv = NewView::sign(&self.cfg.domain, next, self.high_qc.clone(), key);
             out.push(Action::Broadcast(ConsensusMessage::NewView(nv.clone())));
@@ -1396,6 +1440,8 @@ impl HotStuff {
         // a pruned dead branch's entries stay — its leader proposed in those views all the same.
         let head_view = self.tree.get(&keep).map(|e| e.block.view()).unwrap_or(0);
         self.proposed.retain(|(view, _), _| *view > head_view);
+        // And this replica's own votes: at or under the head's view they are decided.
+        self.voted.retain(|view, _| *view > head_view);
     }
 
     /// Drop every tree entry that no longer descends from the committed head, and the derived
@@ -1518,6 +1564,12 @@ impl HotStuff {
             return;
         }
         self.last_voted_view = block.view();
+        // The vote's own record (audit v6, CON-4), on disk with `last_voted_view` before the
+        // vote leaves: what `not_held` answers from after a restart that lost the block.
+        self.voted.insert(block.view(), block.hash());
+        while self.voted.len() > MAX_VOTED_KEPT {
+            self.voted.pop_first();
+        }
         out.push(Action::PersistSafety(self.safety_state()));
         let vote = Vote::sign(&self.cfg.domain, block.view(), block.hash(), signer);
         // Votes are broadcast and every validator assembles the QC locally

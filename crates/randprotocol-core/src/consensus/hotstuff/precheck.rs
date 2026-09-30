@@ -266,7 +266,7 @@ mod tests {
         let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
         cfg.domain = gs.signing_domain();
         let qc = QuorumCertificate::genesis(gs.hash());
-        let safety = SafetyState { view: VIEW, high_qc: qc.clone(), locked_qc: qc.clone(), last_voted_view: 0 };
+        let safety = SafetyState { view: VIEW, high_qc: qc.clone(), locked_qc: qc.clone(), last_voted_view: 0, voted: Vec::new() };
         HotStuff::resume(
             cfg.clone(),
             Some(key(1)),

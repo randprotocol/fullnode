@@ -295,6 +295,34 @@ Exit code 0 if the chain is consistent, 2 if a problem was found and `--repair` 
 Replay re-verifies every bundle proof, so a build whose zkVM constraints differ from the one that
 made the chain will stop at the first bundle (`docs/confidential.md`).
 
+### `rand-node safety status` / `clear-halt` / `release-lock`
+
+A stopped validator's consensus safety state. Each command opens the data directory itself, so
+none of them runs beside a live node (RocksDB's lock refuses the second opener).
+
+```
+rand-node safety status       --datadir <dir>
+rand-node safety clear-halt   --datadir <dir> --i-have-compared-this-node-with-the-fleet
+rand-node safety release-lock --datadir <dir> --i-give-up-this-validators-lock
+```
+
+- `status` prints the committed head, the view and last voted view, the high QC, whether the
+  validator is **locked above its head**, how many votes and certified blocks it has persisted
+  above the head, and any recorded **safety halt**.
+- **The safety halt** (audit v6, CON-5). A node that sees a certified three-chain try to commit a
+  block that does not descend from its own committed head stops, and writes down what it saw.
+  It does not start again until the halt is cleared: `rand-node run` exits with the record. Read
+  it, compare this node's head with two other validators' (`rand_status`), re-sync from an
+  archive if it differs — then `clear-halt`. Without the acknowledgement flag the command prints
+  the record and changes nothing.
+- **The lock** (audit v6, CON-4). A validator locked on a block it cannot obtain stays silent
+  until a proposal whose justify outranks the lock arrives or the block is fetched. No quorum of
+  "not held" answers releases it any more: counting words was unsound (eight Byzantine validators
+  plus three honest ones that lost their state could free a lock whose block did certify). The
+  node logs once when a quorum attests the block unheld. `release-lock` lowers the persisted lock
+  to the committed head's certificate; it prints what is given up and needs the flag to write.
+  One validator at a time, and only when the block is lost for good.
+
 ### `rand-node status`
 
 | argument | default | meaning |

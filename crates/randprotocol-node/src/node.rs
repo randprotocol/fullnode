@@ -203,6 +203,27 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     Ok(ledger)
 }
 
+/// Audit v6, CON-5: a node that stopped on conflicting finality does not start again on its own.
+/// The halt it recorded names what it saw; an operator reads it (`rand-node safety status`),
+/// decides what the store is worth — a re-sync from an archive is the usual answer — and clears
+/// it (`rand-node safety clear-halt`). Before the chain is even verified: a store this node has
+/// reason to distrust is not one to repair in place on a restart loop.
+pub fn refuse_a_halted_store(storage: &Storage) -> Result<()> {
+    match storage.safety_halt()? {
+        None => Ok(()),
+        Some(h) => Err(anyhow!(
+            "this node stopped on conflicting finality and has not been cleared: at height {} it held committed head {:?} \
+             and a certified three-chain tried to commit {:?}, which does not descend from it (recorded at {} ms). \
+             Do not restart it blindly: compare its head with the fleet's, re-sync from an archive if it differs, \
+             then run `rand-node safety clear-halt --datadir <dir>` (audit v6, CON-5)",
+            h.height,
+            h.committed,
+            h.attempted,
+            h.at_ms
+        )),
+    }
+}
+
 /// The consensus replica a node comes back up on: the persisted head and its certificate, the
 /// reloaded ledger, the safety state, and **every epoch set storage recorded**.
 ///
@@ -1709,6 +1730,7 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         .map_err(|e| anyhow::anyhow!(e))?;
     let storage = Arc::new(Storage::open(&cfg.datadir)?);
     storage.init_genesis(&gs)?;
+    refuse_a_halted_store(&storage)?;
     check_and_repair_chain(&storage, &gs, cfg.verify, executor.as_ref())?;
 
     // "Is a validator" is "has a signer", not "is in the genesis set" (spec §8): a validator that
@@ -2332,6 +2354,13 @@ impl Node {
                 // store (audit v3).
                 Action::SafetyViolation { committed, attempted } => {
                     tracing::error!(?committed, ?attempted, "conflicting finality: stopping this node");
+                    // Written down before the stop (audit v6, CON-5): the unit restarts a stopped
+                    // node, and without a record it came back and served again. With it, the next
+                    // start refuses until an operator has read it and cleared it.
+                    let halt = crate::storage::SafetyHalt { committed, attempted, height: self.hs.committed_height(), at_ms: now_ms() };
+                    if let Err(e) = self.storage.save_safety_halt(&halt) {
+                        tracing::error!("the safety halt could not be recorded: {e}");
+                    }
                     // Tagged, because the sync path turns an ordinary error into "sync batch
                     // rejected" and carries on (review M2): this one must not be swallowed there.
                     return Err(anyhow::Error::new(FatalSafety { committed, attempted }));
@@ -3023,17 +3052,13 @@ impl Node {
             }
             SyncResponse::NotHeld(n) => {
                 // Signed evidence (audit v4, CON-4), counted only for the hash this request asked
-                // for; the replica verifies the signer against its current set and releases the
-                // lock once a quorum of the stake — strictly more than two thirds (audit v5) —
-                // has attested. Then on to the next peer, as for `Block(None)`.
+                // for; the replica verifies the signer against its current set. Then on to the
+                // next peer, as for `Block(None)`.
                 match self.fetch_inflight.get(&request_id).map(|(h, _)| *h) {
                     Some(h) if n.hash == h => {
-                        if self.hs.record_not_held(&n) {
-                            tracing::warn!(
-                                "lock on {h:?} released: validators holding a quorum of the stake attest \
-                                 they do not hold it (audit v4 CON-4, audit v5)"
-                            );
-                        }
+                        // Counted, reported by the replica once a quorum has said so, and never
+                        // acted on (audit v6, CON-4): the lock is the operator's to release.
+                        self.hs.record_not_held(&n);
                     }
                     _ => tracing::debug!("peer {peer} attested not-held for a hash this node did not ask it for; ignored"),
                 }
@@ -4065,6 +4090,58 @@ mod tests {
         assert_eq!(blind.on_proposal(proposal, 3), Err(ConsensusError::UnknownEpochSet(1)));
     }
 
+    /// Audit v6, CON-5 and CON-4 (D23), the operator's side. A node that stopped on conflicting
+    /// finality wrote nothing down and the unit restarted it; now the halt is on disk and the
+    /// start refuses until it is cleared. And the lock, which no quorum of words releases any
+    /// more, is lowered offline — to the head's certificate, keeping the view and the votes.
+    #[test]
+    fn a_recorded_safety_halt_refuses_the_start_and_the_lock_is_released_only_offline() {
+        let (_d, storage, gs, ledger) = chain_past_a_boundary();
+        let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
+        assert!(refuse_a_halted_store(&storage).is_ok(), "no halt, no refusal");
+        let halt = crate::storage::SafetyHalt { committed: Hash([1; 32]), attempted: Hash([2; 32]), height: 9, at_ms: 5 };
+        storage.save_safety_halt(&halt).unwrap();
+        let refused = refuse_a_halted_store(&storage).unwrap_err().to_string();
+        assert!(refused.contains("conflicting finality") && refused.contains("safety clear-halt"), "{refused}");
+        assert_eq!(storage.clear_safety_halt().unwrap(), Some(halt));
+        assert!(refuse_a_halted_store(&storage).is_ok(), "cleared by the operator");
+
+        // A lock above the head whose block this store does not hold.
+        let head = storage.head_block().unwrap();
+        let head_qc = storage.head_qc().unwrap();
+        let lost = next_block(&head, &ledger, &key(1));
+        let qc = QuorumCertificate {
+            view: lost.view(),
+            block_hash: lost.hash(),
+            votes: vec![Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), lost.view(), lost.hash(), &key(1))],
+        };
+        assert_eq!(storage.release_lock().unwrap(), None, "no safety state, nothing to release");
+        let voted = vec![(lost.view(), lost.hash())];
+        storage
+            .save_safety(&randprotocol_core::consensus::SafetyState {
+                view: lost.view() + 3,
+                high_qc: head_qc.clone(),
+                locked_qc: qc.clone(),
+                last_voted_view: lost.view(),
+                voted: voted.clone(),
+            })
+            .unwrap();
+        let resume = || {
+            resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), executor.clone()).unwrap()
+        };
+        let hs = resume();
+        assert_eq!(hs.locked_qc(), &qc, "the lock is restored as it was persisted");
+        assert_eq!(hs.not_held(&lost.hash()), None, "and no not-held is signed for the block it names");
+        assert_eq!(storage.release_lock().unwrap(), Some(qc), "the override returns what it gave up");
+        let after = storage.load_safety().unwrap().unwrap();
+        assert_eq!(after.locked_qc, head_qc, "lowered to the head's certificate");
+        assert_eq!((after.view, after.last_voted_view, after.voted), (lost.view() + 3, lost.view(), voted), "the view and the votes stay");
+        assert_eq!(storage.release_lock().unwrap(), None, "a second release finds nothing above the head");
+        let hs = resume();
+        assert_eq!(hs.locked_qc().view, hs.committed_qc_view());
+        assert_eq!(hs.not_held(&lost.hash()), None, "a released lock does not un-cast the vote");
+    }
+
     /// The upgrade from v0.5.4 (audit v5, CON-4): a database holding the locked block under the
     /// old key and no pending set resumes with that block in the tree exactly as v0.5.4 did —
     /// once. The first startup folds it into the pending set and retires the old key, and the
@@ -4088,6 +4165,7 @@ mod tests {
                 high_qc: qc.clone(),
                 locked_qc: qc.clone(),
                 last_voted_view: locked.view(),
+                voted: Vec::new(),
             })
             .unwrap();
         storage.put_locked_block_v054_for_testing(&locked).unwrap();

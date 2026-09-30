@@ -574,6 +574,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DbCmd,
     },
+    /// A stopped validator's consensus safety state: read it, clear a recorded safety halt, or
+    /// release a lock on a block that is lost for good. Every one of these opens the data
+    /// directory itself, so none runs beside a live node.
+    Safety {
+        #[command(subcommand)]
+        cmd: SafetyCmd,
+    },
     /// Show node status.
     Status {
         #[arg(long, default_value = "http://127.0.0.1:8545")]
@@ -659,6 +666,38 @@ enum DbCmd {
     DropReceiptsIndex {
         #[arg(long)]
         datadir: PathBuf,
+    },
+}
+
+/// `rand-node safety …` (audit v6, CON-4 and CON-5).
+#[derive(Subcommand)]
+enum SafetyCmd {
+    /// Print the view, the last voted view, the high QC, the lock and any recorded safety halt.
+    Status {
+        #[arg(long)]
+        datadir: PathBuf,
+    },
+    /// Clear a recorded safety halt so the node may start again. The node stopped because a
+    /// certified three-chain tried to commit a block that does not descend from its committed
+    /// head: read `safety status`, compare this node's head with the fleet's, and re-sync from
+    /// an archive if it differs, before clearing anything.
+    ClearHalt {
+        #[arg(long)]
+        datadir: PathBuf,
+        /// Required: this is the acknowledgement that the halt was read and acted on.
+        #[arg(long)]
+        i_have_compared_this_node_with_the_fleet: bool,
+    },
+    /// Lower the persisted lock to the committed head's certificate. The lock is this
+    /// validator's promise not to vote for a branch that does not extend the locked block;
+    /// releasing it gives that promise up. For a validator whose locked block is lost for good
+    /// (no peer serves it, no proposal outranks the lock) — never to hurry one along.
+    ReleaseLock {
+        #[arg(long)]
+        datadir: PathBuf,
+        /// Required: this is the acknowledgement of what is given up.
+        #[arg(long)]
+        i_give_up_this_validators_lock: bool,
     },
 }
 
@@ -818,7 +857,7 @@ struct StakingArgs {
 /// reaches for. Every arm that calls `Storage::open` (or `Storage::drop_receipts_index`, which
 /// opens the families itself) belongs here; the RPC-client and key-file commands do not.
 fn opens_storage(cmd: &Cmd) -> bool {
-    matches!(cmd, Cmd::Run { .. } | Cmd::Verify { .. } | Cmd::Db { .. } | Cmd::Init { .. })
+    matches!(cmd, Cmd::Run { .. } | Cmd::Verify { .. } | Cmd::Db { .. } | Cmd::Init { .. } | Cmd::Safety { .. })
 }
 
 #[tokio::main]
@@ -1151,6 +1190,78 @@ async fn main() -> Result<()> {
             };
             hosted_prover::run(handle, prover_task, hosted_prover::shutdown_signal()).await?;
         }
+        Cmd::Safety { cmd } => match cmd {
+            SafetyCmd::Status { datadir } => {
+                let storage = Storage::open(&datadir)?;
+                let head = storage.head()?;
+                let head_qc = storage.head_qc()?;
+                println!("committed head: height {} hash {:?} (QC view {})", head.height, head.hash, head_qc.view);
+                match storage.load_safety()? {
+                    None => println!("safety state: none recorded (this node has not voted)"),
+                    Some(s) => {
+                        println!("view {}  last voted view {}", s.view, s.last_voted_view);
+                        println!("high QC: view {} block {:?}", s.high_qc.view, s.high_qc.block_hash);
+                        match s.locked_qc.view > head_qc.view {
+                            true => println!("LOCKED above the head: view {} block {:?}", s.locked_qc.view, s.locked_qc.block_hash),
+                            false => println!("lock: at or under the committed head (view {})", s.locked_qc.view),
+                        }
+                        println!("votes remembered above the head: {}", s.voted.len());
+                    }
+                }
+                println!("certified blocks persisted above the head: {}", storage.pending_blocks()?.len());
+                match storage.safety_halt()? {
+                    None => println!("safety halt: none"),
+                    Some(h) => println!(
+                        "SAFETY HALT recorded at {} ms, height {}: committed head {:?}; a three-chain tried to commit {:?}, which does not descend from it",
+                        h.at_ms, h.height, h.committed, h.attempted
+                    ),
+                }
+            }
+            SafetyCmd::ClearHalt { datadir, i_have_compared_this_node_with_the_fleet } => {
+                let storage = Storage::open(&datadir)?;
+                let Some(h) = storage.safety_halt()? else {
+                    println!("no safety halt is recorded in {}", datadir.display());
+                    return Ok(());
+                };
+                println!(
+                    "recorded at {} ms, height {}: committed head {:?}; a three-chain tried to commit {:?}, which does not descend from it",
+                    h.at_ms, h.height, h.committed, h.attempted
+                );
+                if !i_have_compared_this_node_with_the_fleet {
+                    anyhow::bail!(
+                        "not cleared. Compare this node's committed head with the fleet's (rand_status on two other validators); \
+                         if it differs, re-sync this node from an archive instead. Then pass --i-have-compared-this-node-with-the-fleet"
+                    );
+                }
+                storage.clear_safety_halt()?;
+                println!("cleared: the node will start again");
+            }
+            SafetyCmd::ReleaseLock { datadir, i_give_up_this_validators_lock } => {
+                let storage = Storage::open(&datadir)?;
+                let head_qc = storage.head_qc()?;
+                let Some(s) = storage.load_safety()?.filter(|s| s.locked_qc.view > head_qc.view) else {
+                    println!("no lock above the committed head (QC view {}) in {}: nothing to release", head_qc.view, datadir.display());
+                    return Ok(());
+                };
+                println!(
+                    "this validator is locked on block {:?} (view {}), above its committed head (QC view {}).",
+                    s.locked_qc.block_hash, s.locked_qc.view, head_qc.view
+                );
+                println!(
+                    "The lock is its promise not to vote for a branch that does not extend that block. Releasing it gives the \
+                     promise up: if the block was certified and other validators still hold it, this validator's next vote can \
+                     help certify a conflicting branch. Release only when no peer can serve the block and no proposal has \
+                     outranked the lock, and never on more than one validator at a time."
+                );
+                if !i_give_up_this_validators_lock {
+                    anyhow::bail!("not released. Pass --i-give-up-this-validators-lock to write it");
+                }
+                match storage.release_lock()? {
+                    Some(was) => println!("released: the lock (view {}) is lowered to the committed head's certificate (view {})", was.view, head_qc.view),
+                    None => println!("nothing to release"),
+                }
+            }
+        },
         Cmd::Db { cmd: DbCmd::DropReceiptsIndex { datadir } } => {
             let dropped = Storage::drop_receipts_index(&datadir)?;
             let db = datadir.join("db");

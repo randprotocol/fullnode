@@ -137,6 +137,11 @@ pub enum ConsensusMessage {
     NewView(NewView),
 }
 
+/// The most votes a replica remembers above its committed head ([`SafetyState::voted`]). Entries
+/// at or under the head's view are dropped at every commit, so the record reaches this only on a
+/// chain that certified a thousand blocks without committing one; the oldest views go first.
+pub const MAX_VOTED_KEPT: usize = 1024;
+
 /// Safety-critical state that must hit disk before the corresponding vote leaves the node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SafetyState {
@@ -144,6 +149,31 @@ pub struct SafetyState {
     pub high_qc: QuorumCertificate,
     pub locked_qc: QuorumCertificate,
     pub last_voted_view: u64,
+    /// The blocks this replica voted for above its committed head, `(view, block hash)` in view
+    /// order, at most [`MAX_VOTED_KEPT`] (audit v6, CON-4). Written with the vote, before it
+    /// leaves the node, so a replica that voted for a block and restarted before the block was
+    /// certified locally — the pending set holds certified blocks only — still knows it voted
+    /// for it, and does not sign a [`NotHeld`] for it. Appended last: a row written before the
+    /// field existed is read with an empty record (`Storage::load_safety`).
+    #[serde(default)]
+    pub voted: Vec<(u64, Hash)>,
+}
+
+impl SafetyState {
+    /// The operator's offline override (audit v6, CON-4, decision D23): lower the persisted lock
+    /// to the committed head's certificate. Returns whether there was a lock above the head to
+    /// lower. This gives up the promise the lock was — not to vote for a branch that does not
+    /// extend the locked block — so it is for a stopped validator whose locked block is lost for
+    /// good, never for a running one; `rand-node safety release-lock` is the only caller and
+    /// says so before it writes. The vote record and the view are kept: a released lock does
+    /// not un-cast a vote.
+    pub fn release_lock(&mut self, head_qc: &QuorumCertificate) -> bool {
+        if self.locked_qc.view <= head_qc.view {
+            return false;
+        }
+        self.locked_qc = head_qc.clone();
+        true
+    }
 }
 
 /// A finalized block together with the QC that certifies it.

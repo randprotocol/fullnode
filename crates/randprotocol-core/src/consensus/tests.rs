@@ -766,37 +766,25 @@ fn late_starter_syncs_view_with_partner() {
 impl Sim {
     /// Simulate a process restart of node `i`: everything in memory is lost except
     /// what a real node persists (committed head + QC, committed ledger, safety state).
+    ///
+    /// No pending set: the restart this models is the one where a QC formed and the process
+    /// died before the certified blocks were written (audit v4, review focus 1; audit v5
+    /// CON-4) — `restart_durable` is the restart with what storage holds.
     fn restart(&mut self, i: usize) {
-        let old = &self.nodes[i];
-        let safety = old.safety_state();
-        let ledger = old.committed_ledger().clone();
-        let (head, qc) = match self.committed[i].last() {
-            Some(cb) => (cb.block.clone(), cb.qc.clone()),
-            None => {
-                let g = old.block(&old.committed_hash()).unwrap().clone();
-                let gh = g.hash();
-                (g, QuorumCertificate::genesis(gh))
-            }
-        };
-        let cfg = config_of(self);
-        let epoch_sets = old.epoch_sets().clone();
-        let signer = if old.is_validator() { Some(Keypair::from_seed(*self.keys[i].seed()).unwrap()) } else { None };
-        // No pending set: the restart this models is the one where a QC formed and the process
-        // died before the certified blocks were written (audit v4, review focus 1; audit v5
-        // CON-4) — `restart_durable` is the restart with what storage holds.
-        self.nodes[i] =
-            HotStuff::resume(cfg, signer, head, qc, ledger, Some(safety), Vec::new(), epoch_sets, std::sync::Arc::new(StubExecutor));
-        self.timers[i] = None;
-        self.pending_propose[i] = None;
-        let acts = self.nodes[i].start();
-        self.handle(i, acts);
+        self.restart_with(i, false, |_, _| {});
     }
 
     /// `restart`, with the pending set the replica last persisted (`Action::PersistPending`)
     /// handed back to `resume` — the restart a real node makes (audit v5, CON-4).
     fn restart_durable(&mut self, i: usize) {
+        self.restart_with(i, true, |_, _| {});
+    }
+
+    /// The restart itself. `edit` sees the persisted safety state and the head's QC before the
+    /// replica resumes on them — what an operator's offline tool does to a stopped node's store.
+    fn restart_with(&mut self, i: usize, durable: bool, edit: impl FnOnce(&mut SafetyState, &QuorumCertificate)) {
         let old = &self.nodes[i];
-        let safety = old.safety_state();
+        let mut safety = old.safety_state();
         let ledger = old.committed_ledger().clone();
         let (head, qc) = match self.committed[i].last() {
             Some(cb) => (cb.block.clone(), cb.qc.clone()),
@@ -806,10 +794,11 @@ impl Sim {
                 (g, QuorumCertificate::genesis(gh))
             }
         };
+        edit(&mut safety, &qc);
         let cfg = config_of(self);
         let epoch_sets = old.epoch_sets().clone();
         let signer = if old.is_validator() { Some(Keypair::from_seed(*self.keys[i].seed()).unwrap()) } else { None };
-        let pending = self.pending[i].clone();
+        let pending = if durable { self.pending[i].clone() } else { Vec::new() };
         self.nodes[i] =
             HotStuff::resume(cfg, signer, head, qc, ledger, Some(safety), pending, epoch_sets, std::sync::Arc::new(StubExecutor));
         self.timers[i] = None;
@@ -1273,8 +1262,11 @@ fn leader_falls_back_when_high_qc_block_is_unobtainable() {
     }
     sim.fetches.clear();
     fallback_all(&mut sim);
-    // The signed evidence the node layer gathers: every other validator attests it does not hold
-    // the block a replica is locked on — more than a third of the stake, so the lock releases.
+    // A replica locked on a block the whole set lost — every validator's pending set gone at
+    // once, which `restart` models and a real fleet's fsynced pending set rules out — is not
+    // freed by anyone's word (audit v6, CON-4): every other validator attests, and the lock
+    // stands. The operator's offline override is what clears it (`SafetyState::release_lock`,
+    // behind `rand-node safety release-lock`), one stopped node at a time.
     for i in 0..4 {
         let locked = sim.nodes[i].locked_qc().clone();
         if locked.view <= sim.nodes[i].committed_qc_view() || sim.nodes[i].has_block(&locked.block_hash) {
@@ -1284,7 +1276,11 @@ fn leader_falls_back_when_high_qc_block_is_unobtainable() {
             let n = NotHeld::sign(&sim.keys[j], &sim.gs.hash(), &locked.block_hash, sim.nodes[i].view());
             sim.nodes[i].record_not_held(&n);
         }
-        assert_eq!(sim.nodes[i].locked_qc().view, sim.nodes[i].committed_qc_view(), "released on more than a third");
+        assert_eq!(*sim.nodes[i].locked_qc(), locked, "words do not release a lock");
+        sim.restart_with(i, false, |safety, head_qc| {
+            assert!(safety.release_lock(head_qc), "the override lowers a lock above the head");
+        });
+        assert_eq!(sim.nodes[i].locked_qc().view, sim.nodes[i].committed_qc_view(), "released by the operator");
     }
     let before = sim.committed[0].len();
     for _ in 0..12 {
@@ -2262,31 +2258,123 @@ fn eight_unsigned_not_found_replies_no_longer_release_the_lock() {
     assert_eq!(*sim.nodes[victim].locked_qc(), locked, "no signed evidence, no release");
 }
 
+/// Audit v6, CON-4 (decision D23): a quorum of not-held words is counted and reported, and the
+/// lock stands. v0.5.5 released it here (five of six), which the model showed unsound on chain
+/// 18's shape: eight Byzantine words plus three honest validators that lost the block — or two
+/// plus a restart — release a lock whose block did certify. The thresholds still hold for what
+/// the evidence *says*: a repeat signer counts once, four of six is exactly two thirds and not a
+/// quorum, five is one.
 #[test]
-fn not_held_releases_the_lock_only_on_a_quorum() {
-    // Six equal stakes: a quorum is strictly more than two thirds (`ValidatorSet::has_quorum`,
-    // `3·stake > 2·total`), so 5 signers; 4 is exactly two thirds and is not one. Audit v5,
-    // CON-4: v0.5.4 released on more than a third (3 of 6), which is not sound — a third can be
-    // exactly the Byzantine validators, so nobody honest need be among them.
+fn a_not_held_quorum_is_evidence_and_no_longer_releases_the_lock() {
     let mut sim = setup(6, 6);
     let victim = lock_on_unobtainable(&mut sim);
-    let h = sim.nodes[victim].locked_qc().block_hash;
+    let locked = sim.nodes[victim].locked_qc().clone();
+    let h = locked.block_hash;
     let g = sim.gs.hash();
     let others: Vec<usize> = (0..6).filter(|&i| i != victim).collect();
     let now = sim.nodes[victim].view();
-    assert!(now > sim.nodes[victim].locked_qc().view);
+    assert!(now > locked.view);
     let sign = |i: usize| NotHeld::sign(&sim.keys[i], &g, &h, now);
     assert!(!sim.nodes[victim].record_not_held(&sign(others[0])));
     assert!(!sim.nodes[victim].record_not_held(&sign(others[1])));
     assert!(!sim.nodes[victim].record_not_held(&sign(others[2])), "three of six is not a quorum");
     assert!(!sim.nodes[victim].record_not_held(&sign(others[2])), "a repeat signer counts once");
     assert_eq!(sim.nodes[victim].not_held_stake(&h), 3 * MIN_STAKE as u128);
-    assert_eq!(sim.nodes[victim].locked_qc().block_hash, h, "three of six is not more than two thirds");
     assert!(!sim.nodes[victim].record_not_held(&sign(others[3])), "four of six is exactly two thirds, not more");
-    assert_eq!(sim.nodes[victim].locked_qc().block_hash, h);
-    assert!(sim.nodes[victim].record_not_held(&sign(others[4])), "five of six is a quorum");
-    assert_eq!(sim.nodes[victim].locked_qc().view, sim.nodes[victim].committed_qc_view());
-    assert_eq!(sim.nodes[victim].not_held_stake(&h), 0, "the evidence is cleared with the release");
+    assert!(sim.nodes[victim].record_not_held(&sign(others[4])), "five of six is a quorum of evidence");
+    assert_eq!(*sim.nodes[victim].locked_qc(), locked, "and the lock stands all the same");
+    assert_eq!(sim.nodes[victim].not_held_stake(&h), 5 * MIN_STAKE as u128, "the evidence is kept for the operator");
+    // Every validator of the set saying so changes nothing either.
+    for &i in &others {
+        sim.nodes[victim].record_not_held(&NotHeld::sign(&sim.keys[i], &g, &h, now + 1));
+    }
+    assert_eq!(*sim.nodes[victim].locked_qc(), locked);
+}
+
+/// The protocol's own release, which is what is left (audit v6, CON-4): a replica locked on a
+/// block it cannot obtain keeps its promise — no vote under the lock — and votes again for a
+/// proposal whose justify outranks the lock, so the chain it stalled on commits past it.
+#[test]
+fn a_lock_on_an_unobtainable_block_yields_to_a_higher_justify_not_to_words() {
+    let mut sim = setup(4, 4);
+    let victim = lock_on_unobtainable(&mut sim);
+    let mut lock_view = sim.nodes[victim].locked_qc().view;
+    let before = sim.committed[victim].len();
+    for _ in 0..30 {
+        sim.step(vec![]);
+        let now = sim.nodes[victim].locked_qc().view;
+        assert!(now >= lock_view, "the lock never moves down: {now} < {lock_view}");
+        lock_view = now;
+    }
+    sim.assert_consistent();
+    assert!(sim.committed[victim].len() >= before + 6, "the locked replica followed the chain past its lock");
+}
+
+/// Audit v6, CON-4, the signer side. A validator votes for a block and restarts before the block
+/// is certified locally: the pending set holds certified blocks only, so the block is gone, and
+/// the safety state held a view and two certificates but not what was voted for — asked for the
+/// block, the validator signed that it did not hold it. With eight Byzantine words, three such
+/// honest ones released a lock on chain 18's shape (two plus a restart of honest validators).
+/// The vote's hash is persisted with the vote now, and no word is signed for it.
+#[test]
+fn a_validator_does_not_attest_not_holding_a_block_it_voted_for() {
+    let mut sim = setup(4, 4);
+    for _ in 0..6 {
+        sim.step(vec![]);
+    }
+    // A replica with a vote above its head whose block a restart without the pending set drops.
+    let (voter, voted) = (0..4)
+        .find_map(|i| {
+            let hs = &sim.nodes[i];
+            let last = hs.safety_state().voted.last().copied()?;
+            (hs.has_block(&last.1) && last.1 != hs.committed_hash()).then_some((i, last))
+        })
+        .expect("some replica has voted above its head");
+    assert!(sim.nodes[voter].voted_for(&voted.1));
+    assert_eq!(sim.nodes[voter].not_held(&voted.1), None, "it holds the block");
+    sim.restart(voter);
+    let hs = &sim.nodes[voter];
+    assert!(!hs.has_block(&voted.1), "the restart dropped the uncertified block");
+    assert!(hs.voted_for(&voted.1), "the vote's record survived the restart");
+    assert_eq!(hs.not_held(&voted.1), None, "no not-held for a block this replica voted for");
+    // A block it never voted for and does not hold is still attested, at its own view.
+    let other = Hash([0x5a; 32]);
+    let word = hs.not_held(&other).expect("a validator attests a block it never saw");
+    assert_eq!((word.hash, word.view), (other, hs.view()));
+    // Nor for the block it is locked on, held or not.
+    let mut sim = setup(4, 4);
+    let victim = lock_on_unobtainable(&mut sim);
+    let locked = sim.nodes[victim].locked_qc().block_hash;
+    assert_eq!(sim.nodes[victim].not_held(&locked), None, "no not-held for the block this replica is locked on");
+}
+
+/// The record is bounded by the commit, and the view a replica reached on timeouts is persisted
+/// without a vote (audit v6, CON-4: it was written only with one, so a validator restarted after
+/// a stall signed at the view of its last vote).
+#[test]
+fn the_voted_record_is_pruned_at_commit_and_a_timeout_persists_the_view() {
+    let mut sim = setup(4, 4);
+    for _ in 0..14 {
+        sim.step(vec![]);
+    }
+    assert!(sim.committed[0].len() >= 8);
+    for hs in &sim.nodes {
+        let head_view = hs.block(&hs.committed_hash()).unwrap().view();
+        let voted = hs.safety_state().voted;
+        assert!(voted.iter().all(|(v, _)| *v > head_view), "nothing at or under the head's view is kept");
+        assert!(voted.len() <= 8, "the record stays a few views long on a committing chain: {}", voted.len());
+        assert!(voted.windows(2).all(|w| w[0].0 < w[1].0), "in view order");
+    }
+    let view = sim.nodes[0].view();
+    let acts = sim.nodes[0].on_timeout(view);
+    let persisted = acts.iter().find_map(|a| match a {
+        Action::PersistSafety(s) => Some(s.view),
+        _ => None,
+    });
+    assert_eq!(persisted, Some(view + 1), "the timed-out view is on disk before the NewView is signed");
+    let first_new_view = acts.iter().position(|a| matches!(a, Action::Broadcast(ConsensusMessage::NewView(_)))).unwrap();
+    let first_persist = acts.iter().position(|a| matches!(a, Action::PersistSafety(_))).unwrap();
+    assert!(first_persist < first_new_view);
 }
 
 /// CN-3 (medium): a not-held carried no freshness, so one signed before the lock formed — asked
@@ -2325,16 +2413,16 @@ fn a_not_held_signed_before_the_lock_formed_does_not_release_it() {
     if now > v + 1 + super::NOT_HELD_VIEW_WINDOW {
         assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&sim.keys[others[0]], &g, &h, v + 1)));
     }
-    // Fresh words — signed after the lock formed — still release it on a quorum (CON-4 intact),
-    // and a signer's second word counts once.
+    // Fresh words — signed after the lock formed — are counted (a signer's second word once),
+    // and a quorum of them is reported; the lock stands either way (audit v6, CON-4).
     let fresh = |i: usize| NotHeld::sign(&sim.keys[i], &g, &h, now);
     for &i in &others[..4] {
         assert!(!sim.nodes[victim].record_not_held(&fresh(i)));
     }
     assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&sim.keys[others[0]], &g, &h, now + 1)), "a repeat signer counts once");
     assert_eq!(sim.nodes[victim].not_held_stake(&h), 4 * MIN_STAKE as u128);
-    assert!(sim.nodes[victim].record_not_held(&fresh(others[4])), "five fresh of six release the lock");
-    assert_eq!(sim.nodes[victim].locked_qc().view, sim.nodes[victim].committed_qc_view());
+    assert!(sim.nodes[victim].record_not_held(&fresh(others[4])), "five fresh of six are a quorum of evidence");
+    assert_eq!(sim.nodes[victim].locked_qc().block_hash, h, "which no longer releases the lock");
 }
 
 /// CN-3: the window half. Evidence recorded while recent stops counting once this replica's
@@ -2731,7 +2819,8 @@ fn the_consensus_suite_holds_under_signing_domain_v1() {
         a_resumed_validator_keeps_its_lock();
         a_resumed_validator_finds_its_locked_block_without_a_fetch();
         eight_unsigned_not_found_replies_no_longer_release_the_lock();
-        not_held_releases_the_lock_only_on_a_quorum();
+        a_not_held_quorum_is_evidence_and_no_longer_releases_the_lock();
+        a_validator_does_not_attest_not_holding_a_block_it_voted_for();
         a_restart_keeps_the_blocks_a_qc_certified();
         commit_rule_requires_three_consecutive_views();
         a_leaders_second_block_for_one_view_is_refused_as_equivocation();
