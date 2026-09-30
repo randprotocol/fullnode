@@ -144,6 +144,7 @@ fn genesis_funding(validators: &[Keypair], funded: &[&Wallet]) -> Genesis {
 /// [`genesis_funding`] with an optional `bridge` section. A chain built with `None` has no bridge
 /// at all — no registry, no bridge root, and both bridge actions inadmissible.
 fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<BridgeConfig>) -> Genesis {
+    let testnet = bridge.is_some().then_some(true);
     Genesis {
         chain_id: CHAIN_ID,
         timestamp_ms: 0,
@@ -204,6 +205,8 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         staking: None,
         vesting: None,
         gas: None,
+        // Audit v6, STAKE-2: a faucet beside a bridge needs the marker on a new chain id.
+        testnet,
     }
 }
 

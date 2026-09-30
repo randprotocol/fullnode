@@ -434,7 +434,31 @@ pub struct Genesis {
     /// (`TxError::BundleGasLimit`) and, under `dynamic`, the per-block price controller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gas: Option<gas::GasConfig>,
+    /// Audit v6, STAKE-2 (§8.5 option 2): the explicit testnet marker. A genesis with `faucet:
+    /// true` and a `bridge` section — free RAND beside real custody — is refused
+    /// ([`GenesisError::FaucetWithBridgeNeedsTestnet`]) unless it says `"testnet": true` here;
+    /// "mainnet never carries a faucet" was a sentence in `docs/deploy.md`, and this is the check.
+    /// The chains cut before the marker existed and carry both (14–18,
+    /// [`FAUCET_BESIDE_BRIDGE_CHAIN_IDS`]) are grandfathered by chain id, so their committed files
+    /// still build. Committed to the genesis hash under its own tag, after every earlier one, only
+    /// when `true` (`false` commits nothing, like `hardening_v6`); on the ledger as a parameter
+    /// (`Ledger::testnet`, restored by `reload_ledger`), never state; served as `testnet` by
+    /// `rand_status` and `rand_getLimits` so a wallet and an explorer can show it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub testnet: Option<bool>,
 }
+
+/// The chains whose committed genesis file (`deploy/genesis-chain<N>.json`) carries both
+/// `faucet: true` and a `bridge` section and predates the `testnet` marker (audit v6, STAKE-2):
+/// chain 14 (no `staking` section at all) and chains 15–18 (a section with a faucet allowlist).
+/// `Genesis::validate` exempts exactly these chain ids from
+/// [`GenesisError::FaucetWithBridgeNeedsTestnet`], so every one of those files still validates
+/// and builds its pinned hash — `every_committed_genesis_file_still_validates` walks them — and
+/// every later chain id must carry the marker. The pattern of
+/// `randprotocol_client::LEGACY_ENVELOPE_CHAIN_IDS` and `node::CHAINS_THIS_BUILD_CANNOT_RUN`: a
+/// named list, never a rule that reads the file's own shape, so a new chain cannot slip in by
+/// looking like an old one. Add nothing here: a chain cut from now on says `testnet: true`.
+pub const FAUCET_BESIDE_BRIDGE_CHAIN_IDS: &[u64] = &[14, 15, 16, 17, 18];
 
 fn default_true() -> bool {
     true
@@ -493,6 +517,11 @@ pub enum GenesisError {
     /// named spend keys.
     #[error("a staking section refuses a faucet on a bridged chain (faucet: true with a bridge section) unless staking.faucet_recipients limits it")]
     FaucetWithBridge,
+    /// Audit v6, STAKE-2 (option 2): a faucet beside a bridge, on a chain id not in
+    /// [`FAUCET_BESIDE_BRIDGE_CHAIN_IDS`], without the explicit `testnet: true` marker. A mainnet
+    /// genesis cannot carry a faucet, and a testnet that needs both has to say so.
+    #[error("chain {chain_id} has faucet: true beside a bridge section and no \"testnet\": true marker: a chain holding custody hands out no free RAND unless its genesis says it is a testnet")]
+    FaucetWithBridgeNeedsTestnet { chain_id: u64 },
     /// A `staking` section field no chain could run: a weight cap outside `1..=10000` basis
     /// points, a zero entry budget (nothing would ever become weight), or an empty or duplicated
     /// faucet allowlist.
@@ -585,6 +614,8 @@ pub struct GenesisState {
     /// Audit v4, STAKE-2: the `staking` section, as the genesis file set it (also on the
     /// ledger, `Ledger::staking`, which is what a reloading node restores from).
     pub staking: Option<StakingConfig>,
+    /// Audit v6, STAKE-2: whether the file says `testnet: true` (also `Ledger::testnet`).
+    pub testnet: bool,
     pub ledger: Ledger,
     pub block: Block,
     /// The alloc notes in file order: commitment, envelope, amount.
@@ -740,6 +771,14 @@ impl Genesis {
             if v > SigningDomain::MAX_VERSION {
                 return Err(GenesisError::BadConsensusDomain(v));
             }
+        }
+        // Audit v6, STAKE-2 (option 2): a faucet and a bridge exclude each other on every chain
+        // — section or no section, allowlist or none — unless the genesis says `testnet: true`.
+        // The chains cut before the marker (14–18) carry both and are named, by id, so their
+        // committed files still build; the section rule below stands on top of this one, so a
+        // sectioned testnet still needs its allowlist as well.
+        if self.faucet && self.bridge.is_some() && self.testnet != Some(true) && !FAUCET_BESIDE_BRIDGE_CHAIN_IDS.contains(&self.chain_id) {
+            return Err(GenesisError::FaucetWithBridgeNeedsTestnet { chain_id: self.chain_id });
         }
         // Audit v4, STAKE-2 rule 1, only under the section: a faucet and a bridge exclude each
         // other. Chain 14's genesis has both and no section, so it still loads.
@@ -923,6 +962,7 @@ impl Genesis {
         };
         ledger.set_hc_auth(hc_auth);
         ledger.set_gas(self.gas.clone());
+        ledger.set_testnet(self.testnet == Some(true));
         // The genesis ledger is positioned at the genesis block, so it carries that block's
         // time structurally rather than relying on every caller to patch it in. The timestamp
         // is transient state, not part of the state root or the genesis hash.
@@ -1233,6 +1273,12 @@ impl Genesis {
             commit.extend_from_slice(b"staking_admission_by_vote");
             commit.push(1);
         }
+        // The testnet marker (audit v6, STAKE-2), after it: only when `true` — `false` and
+        // absent are both "not a testnet" and commit nothing, so chains 14–18 hash as before.
+        if self.testnet == Some(true) {
+            commit.extend_from_slice(b"testnet");
+            commit.push(1);
+        }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
             height: 0,
@@ -1259,6 +1305,7 @@ impl Genesis {
             epoch_blocks: self.epoch_blocks,
             consensus_domain,
             staking: self.staking.clone(),
+            testnet: self.testnet == Some(true),
             ledger,
             block,
             notes,
@@ -1642,6 +1689,7 @@ mod tests {
             hardening_v6: None,
             hc_auth: None,
             gas: None,
+            testnet: None,
         }
     }
 
@@ -3678,7 +3726,11 @@ mod tests {
         g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], max_tokens: None, burn_registration_fee: None, bound_note_value: None, mint_cap_per_day: 100_000 * 100_000_000 });
         g.alloc = opened_alloc();
         g.faucet = true;
-        assert!(g.validate().is_ok(), "chain 14's shape still loads");
+        // Audit v6, STAKE-2: chain 14's shape — a faucet beside a bridge, no section — loads
+        // on chain 14's own id and, on any other, only with the explicit `testnet` marker
+        // (`a_faucet_beside_a_bridge_needs_the_testnet_marker_on_a_new_chain`).
+        g.testnet = Some(true);
+        assert!(g.validate().is_ok(), "chain 14's shape still loads, marked");
         let unsectioned = build(&g);
         assert!(unsectioned.ledger.staking().is_none());
         assert!(!g.to_json().contains("staking"), "and its file never mentions the section");
@@ -3720,6 +3772,98 @@ mod tests {
         );
     }
 
+    /// Audit v6, STAKE-2 (option 2): "mainnet never carries a faucet" was a sentence in
+    /// `docs/deploy.md`. Now a genesis with `faucet: true` and a `bridge` section is refused on
+    /// any chain id not in [`FAUCET_BESIDE_BRIDGE_CHAIN_IDS`] unless it says `testnet: true` —
+    /// whether or not it has a `staking` section or an allowlist. The marker is committed to the
+    /// hash only when `true`, rides on the ledger for the node to serve, and chains 14–18 (the
+    /// committed files with both and no marker) still validate by id alone.
+    #[test]
+    fn a_faucet_beside_a_bridge_needs_the_testnet_marker_on_a_new_chain() {
+        let mut g = genesis(1);
+        g.bridge = Some(bridge_cfg());
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], max_tokens: None, burn_registration_fee: None, bound_note_value: None, mint_cap_per_day: 100_000 * 100_000_000 });
+        g.alloc = opened_alloc();
+        g.faucet = true;
+        assert_eq!(g.testnet, None, "the shape every chain through 18 was cut with");
+        let id = g.chain_id;
+        assert!(!FAUCET_BESIDE_BRIDGE_CHAIN_IDS.contains(&id), "a new chain id");
+        assert!(matches!(g.validate(), Err(GenesisError::FaucetWithBridgeNeedsTestnet { chain_id }) if chain_id == id), "{:?}", g.validate());
+        assert!(matches!(g.build(&StubExecutor), Err(GenesisError::FaucetWithBridgeNeedsTestnet { chain_id }) if chain_id == id));
+        g.testnet = Some(false);
+        assert!(matches!(g.validate(), Err(GenesisError::FaucetWithBridgeNeedsTestnet { .. })), "`false` is not a marker");
+        // A staking section with an allowlist does not stand in for it: the two rules stack.
+        let mut listed = g.clone();
+        listed.staking = Some(StakingConfig {
+            faucet_budget_per_epoch: 100 * UNITS_PER_RAND,
+            bond_activation_epochs: 2,
+            faucet_recipients: Some(vec![FaucetRecipient([1; 8])]),
+            ..Default::default()
+        });
+        assert!(matches!(listed.validate(), Err(GenesisError::FaucetWithBridgeNeedsTestnet { .. })));
+        // Marked, it builds; the marker is on the ledger, in the file and in the hash.
+        g.testnet = Some(true);
+        let s = build(&g);
+        assert!(s.ledger.testnet() && s.testnet);
+        assert!(g.to_json().contains("\"testnet\": true"));
+        assert_eq!(Genesis::from_json(&g.to_json()).unwrap(), g);
+        listed.testnet = Some(true);
+        assert!(listed.validate().is_ok(), "marked and allowlisted: chain 15's shape on a new id");
+        // Without a bridge the marker is optional, and only `true` moves the hash.
+        let plain = genesis(1);
+        let mut marked = plain.clone();
+        marked.testnet = Some(true);
+        let mut unmarked = plain.clone();
+        unmarked.testnet = Some(false);
+        assert_ne!(build(&marked).hash(), build(&plain).hash(), "the marker is part of the genesis hash");
+        assert_eq!(build(&unmarked).hash(), build(&plain).hash(), "`false` commits nothing");
+        assert!(!plain.to_json().contains("testnet"), "absent from a file that does not set it");
+        assert!(!build(&plain).ledger.testnet());
+        assert_eq!(build(&marked).ledger.state_root(), build(&plain).ledger.state_root(), "never state");
+        // The chains cut before the marker are grandfathered by id, and nothing else is.
+        let mut old = g.clone();
+        old.testnet = None;
+        for id in FAUCET_BESIDE_BRIDGE_CHAIN_IDS {
+            old.chain_id = *id;
+            assert!(old.validate().is_ok(), "chain {id} predates the marker");
+        }
+        assert_eq!(FAUCET_BESIDE_BRIDGE_CHAIN_IDS, &[14, 15, 16, 17, 18]);
+        old.chain_id = 19;
+        assert!(matches!(old.validate(), Err(GenesisError::FaucetWithBridgeNeedsTestnet { chain_id: 19 })));
+    }
+
+    /// Every committed genesis file still validates under the rule above: the ones with a faucet
+    /// beside a bridge are exactly the grandfathered ids, and every other file is untouched by it.
+    /// A file this build's `Genesis` no longer parses (a chain cut before a required field
+    /// existed) is skipped, named — the rule cannot be what refuses it.
+    #[test]
+    fn every_committed_genesis_file_still_validates() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
+        let mut seen = 0;
+        let mut both = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !(name.starts_with("genesis-chain") && name.ends_with(".json")) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let Ok(g) = Genesis::from_json(&text) else {
+                eprintln!("{name}: predates a required field; skipped");
+                continue;
+            };
+            seen += 1;
+            assert!(g.validate().is_ok(), "{name}: {:?}", g.validate().err());
+            assert_eq!(g.testnet, None, "{name}: cut before the marker existed");
+            if g.faucet && g.bridge.is_some() {
+                both.push(g.chain_id);
+            }
+        }
+        assert!(seen >= 5, "the chain 14–18 files at least");
+        both.sort();
+        assert_eq!(both, FAUCET_BESIDE_BRIDGE_CHAIN_IDS, "the grandfathered ids are exactly the committed files with both");
+    }
+
     /// Chain 15: `staking.faucet_recipients` limits the faucet to named spend keys, and that is
     /// what lets `faucet: true` sit beside a `bridge` section. An empty or duplicated list is
     /// refused; the list is committed to the genesis hash only when present, key by key, and a
@@ -3732,6 +3876,7 @@ mod tests {
         g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], max_tokens: None, burn_registration_fee: None, bound_note_value: None, mint_cap_per_day: 100_000 * 100_000_000 });
         g.alloc = opened_alloc();
         g.faucet = true;
+        g.testnet = Some(true);
         g.staking = Some(StakingConfig { faucet_budget_per_epoch: 100 * UNITS_PER_RAND, bond_activation_epochs: 2, ..Default::default() });
         let plain = g.clone();
         assert!(matches!(plain.validate(), Err(GenesisError::FaucetWithBridge)), "no list, no faucet beside a bridge");

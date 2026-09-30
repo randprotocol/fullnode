@@ -3435,6 +3435,7 @@ pub(crate) mod fixtures {
             envelope_bytes: None,
             vesting: None,
             gas: None,
+            testnet: None,
             hardening_v6: None,
             hc_auth: None,
         }
@@ -3548,6 +3549,8 @@ pub(crate) mod fixtures {
             envelope_bytes: None,
             vesting: None,
             gas: None,
+            // Audit v6, STAKE-2: a faucet beside a bridge needs the marker on a new chain id.
+            testnet: Some(true),
             hardening_v6: None,
             hc_auth: None,
         }

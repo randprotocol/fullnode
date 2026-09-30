@@ -679,6 +679,12 @@ pub struct Ledger {
     /// (`node::check_build_runs_genesis`): core cannot name guests. A genesis parameter like
     /// `hardening_v6`: outside the state root and equality, restored by `reload_ledger`.
     hc_auth: Option<Word8>,
+    /// Audit v6, STAKE-2: the genesis `testnet` marker, what lets `faucet: true` sit beside a
+    /// `bridge` section (`Genesis::validate`). No rule of this ledger reads it — it is here so
+    /// the node can serve it (`rand_status`, `rand_getLimits`) from the one place every genesis
+    /// parameter lives. A parameter like `hardening_v6`: outside the state root and equality,
+    /// restored by `reload_ledger`; `false` on every chain through 18.
+    testnet: bool,
     /// The aggregator register, hashed into the state root (spec §2.1) when `aggregation` is
     /// set; empty otherwise and at chain-9 block 0.
     aggregators: BTreeMap<Address, aggregation::AggregatorEntry>,
@@ -809,6 +815,7 @@ impl Ledger {
             gas_prices: None,
             hardening_v6: false,
             hc_auth: None,
+            testnet: false,
             aggregators: BTreeMap::new(),
             retired_aggregator_nonces: BTreeMap::new(),
             height: 0,
@@ -868,6 +875,7 @@ impl Ledger {
             gas_prices: None,
             hardening_v6: false,
             hc_auth: None,
+            testnet: false,
             aggregators: BTreeMap::new(),
             retired_aggregator_nonces: BTreeMap::new(),
             height: 0,
@@ -1280,6 +1288,16 @@ impl Ledger {
 
     /// The largest proof a transaction may carry, in bytes, as genesis set it (default
     /// [`gas::MAX_PROOF_BYTES`]).
+    /// Audit v6, STAKE-2: whether the genesis says `testnet: true` — the marker a faucet beside
+    /// a bridge needs. Served, never judged, here.
+    pub fn testnet(&self) -> bool {
+        self.testnet
+    }
+
+    pub fn set_testnet(&mut self, on: bool) {
+        self.testnet = on;
+    }
+
     pub fn max_proof_bytes(&self) -> usize {
         self.max_proof_bytes
     }

@@ -544,6 +544,12 @@ enum Cmd {
         /// to this genesis. Omitted, the file has no such field (domain 0, chain 14's messages).
         #[arg(long, value_name = "0|1")]
         consensus_domain: Option<u32>,
+        /// The testnet marker (audit v6, STAKE-2): the file says `"testnet": true`, which is
+        /// what lets `--faucet` sit beside a `bridge` section spliced in later — a chain holding
+        /// custody hands out no free RAND unless its genesis says it is a testnet. Part of the
+        /// genesis hash when given; omitted, the file has no such field.
+        #[arg(long)]
+        testnet: bool,
     },
     /// Print one genesis alloc note as JSON — the object that goes into a genesis file's `alloc`
     /// list — sealed to `--to` exactly as `genesis --alloc` seals one, so the owner's wallet finds
@@ -1317,6 +1323,7 @@ async fn main() -> Result<()> {
             gas_byte_load,
             staking,
             consensus_domain,
+            testnet,
         } => {
             let hc_bundle = match bundle_guest.as_str() {
                 "v3" => ZkExecutor::hc_hidden_bundle_v3(),
@@ -1451,6 +1458,8 @@ async fn main() -> Result<()> {
                 // The gas section: absent unless `--gas-price` is given, so a genesis cut
                 // without it hashes byte-for-byte as before.
                 gas,
+                // The testnet marker (audit v6, STAKE-2): absent unless asked for.
+                testnet: testnet.then_some(true),
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
@@ -3260,6 +3269,7 @@ mod tests {
             staking: None,
             vesting: None,
             gas: None,
+            testnet: None,
         }
     }
 

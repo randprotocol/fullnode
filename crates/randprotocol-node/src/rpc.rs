@@ -254,6 +254,11 @@ pub struct NodeStatus {
     pub active_validator: bool,
     pub faucet: bool,
     pub confidential: bool,
+    /// Audit v6, STAKE-2: the genesis says `testnet: true` — the marker that lets a faucet sit
+    /// beside a bridge. What a wallet or an explorer shows as "testnet"; `false` on every chain
+    /// through 18, whose files predate the marker.
+    #[serde(default)]
+    pub testnet: bool,
     pub fri_profile: String,
     pub programs: u64,
     /// Leaves in the commitment tree — every note the chain has ever created.
@@ -714,6 +719,8 @@ pub struct ChainLimits {
     /// (`NotAdmitted`) until the validator set has voted the key in — `rand_getAdmitted` lists
     /// the keys that may register. `false` on every chain without the flag.
     pub admission_by_vote: bool,
+    /// Audit v6, STAKE-2: the genesis `testnet` marker — `true` only where the file says so.
+    pub testnet: bool,
 }
 
 impl ChainLimits {
@@ -736,6 +743,7 @@ impl ChainLimits {
             max_byte_price: None,
             byte_load: None,
             admission_by_vote: ledger.staking().is_some_and(|s| s.admission_by_vote()),
+            testnet: ledger.testnet(),
         };
         if let Some(g) = ledger.gas() {
             let prices = ledger.gas_prices();
@@ -4197,6 +4205,7 @@ mod tests {
                 "max_byte_price": null,
                 "byte_load": null,
                 "admission_by_vote": false,
+                "testnet": false,
             })
         );
         let gs = raised_genesis();
@@ -4221,6 +4230,7 @@ mod tests {
                 "max_byte_price": null,
                 "byte_load": null,
                 "admission_by_vote": false,
+                "testnet": false,
             })
         );
         // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
@@ -4247,6 +4257,7 @@ mod tests {
                 "max_byte_price": null,
                 "byte_load": null,
                 "admission_by_vote": false,
+                "testnet": false,
             })
         );
         // The v0.6 switch: what a wallet reads to prove its calls over the call binding (INT-4).
@@ -4876,6 +4887,24 @@ mod tests {
                 "voters": [key(1).address().to_base58()],
             })
         );
+    }
+
+    /// Audit v6, STAKE-2: the genesis `testnet` marker is served by `rand_getLimits` and
+    /// `rand_status`, so a wallet and an explorer can show it; `false` on a chain without it.
+    #[tokio::test]
+    async fn get_limits_and_status_serve_the_testnet_marker() {
+        let (_d, st, _) = chain();
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["testnet"], json!(false));
+        assert_eq!(ok(&st, "rand_status", json!([])).await["testnet"], json!(false));
+        let mut g = fixtures::genesis_file_of(7, &[&key(1)], vec![], 2);
+        g.testnet = Some(true);
+        let gs = g.build(&StubExecutor).unwrap();
+        let (_d, st) = state_for(&gs);
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["testnet"], json!(true));
+        {
+            st.status.write().unwrap_or_else(|e| e.into_inner()).testnet = gs.testnet;
+        }
+        assert_eq!(ok(&st, "rand_status", json!([])).await["testnet"], json!(true));
     }
 
     #[tokio::test]

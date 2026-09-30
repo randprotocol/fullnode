@@ -376,7 +376,7 @@ gas policy:
   "hardening_v6": false, "hc_auth": null, "gas_price": "100", "byte_price": "800",
   "gas_metering": "header", "bundle_gas_limit": null, "adjust_bps": null,
   "max_gas_price": null, "max_byte_price": null, "byte_load": null,
-  "admission_by_vote": false }
+  "admission_by_vote": false, "testnet": false }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -442,7 +442,9 @@ a call's proof and input envelope move `byte_price` (audit v6, POOL-2; `docs/fee
 all three `null` where the genesis sets none, chain 18 included. `admission_by_vote` (audit v6, STAKE-2) is whether
 the genesis sets `staking.admission_by_vote`: there a bond that registers a new validator key is
 refused (`NotAdmitted`) until the validator set has voted the key in — `rand_getAdmitted` lists
-the keys that may register (`docs/staking.md` §2).
+the keys that may register (`docs/staking.md` §2). `testnet` is the genesis `testnet` marker
+(audit v6, STAKE-2): `true` only where the file says so — what lets a faucet sit beside a bridge
+section — so a wallet or an explorer can label the chain; `false` on every chain through 18.
 
 ### `rand_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
@@ -728,7 +730,7 @@ Params: `[]`. Result:
   "peer_count": 5, "connected_peers": 5, "reserved_peers": 5, "ws_clients": 3, "refused_cache": 0,
   "verify_queue": 0, "mempool_size": 0,
   "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
-  "fri_profile": "production", "programs": 2, "viewing_keys": 0,
+  "testnet": false, "fri_profile": "production", "programs": 2, "viewing_keys": 0,
   "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19", "hc_auth": null,
   "address": "2nRdFC…", "peer_id": "12D3KooW...",
   "gas_prices": null
@@ -1487,6 +1489,13 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-10-01 — audit v6, STAKE-2: the `testnet` marker
+
+- **`rand_status.testnet`** and **`rand_getLimits.testnet`** (bool): whether the genesis says
+  `"testnet": true`. A genesis with `faucet: true` beside a `bridge` section is refused on any
+  chain id past 18 without it, so a client can label a chain by this field alone; `false` on
+  every chain through 18, whose files predate the marker.
 
 ### 2026-10-01 — audit v6, STAKE-2: admission by vote (`staking.admission_by_vote`)
 

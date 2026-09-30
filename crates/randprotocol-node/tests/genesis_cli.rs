@@ -289,3 +289,22 @@ fn the_genesis_command_round_trips_a_staking_section_with_admission_by_vote() {
     assert!(String::from_utf8_lossy(&run.stderr).contains("not a valid staking config"), "{}", String::from_utf8_lossy(&run.stderr));
     assert!(!refused.exists());
 }
+
+/// Audit v6, STAKE-2: `--testnet` writes the marker that lets a faucet sit beside a bridge
+/// section spliced in later; without it the file has no such field.
+#[test]
+fn the_genesis_command_writes_the_testnet_marker_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("genesis.json");
+    let run = genesis(&out, &["--faucet", "--testnet"]);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let gen = read(&out);
+    assert_eq!((gen.faucet, gen.testnet), (true, Some(true)));
+    assert!(std::fs::read_to_string(&out).unwrap().contains("\"testnet\": true"));
+    let executor = ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test);
+    assert!(gen.build(&executor).unwrap().ledger.testnet());
+    let plain = dir.path().join("plain.json");
+    assert!(genesis(&plain, &["--faucet"]).status.success());
+    assert_eq!(read(&plain).testnet, None);
+    assert!(!std::fs::read_to_string(&plain).unwrap().contains("testnet"));
+}

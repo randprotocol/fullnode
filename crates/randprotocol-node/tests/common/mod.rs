@@ -96,6 +96,7 @@ fn genesis_with_aggregation(key: &Keypair, aggregation: Option<randprotocol_core
         staking: None,
         vesting: None,
         gas: None,
+        testnet: None,
     }
 }
 

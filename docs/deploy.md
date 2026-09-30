@@ -609,7 +609,13 @@ same section, and sets `"faucet": true` at the top level:
   `bridge` section is refused (`FaucetWithBridge`). Each entry is a full `rand1…` address — what
   `rand address` prints — or its `pk` as 64 hex characters; only the `pk` is committed, so an
   address can be pasted as it is. `rand_mint` to any other
-  address is refused at admission. **Mainnet never carries a faucet**, allowlisted or not.
+  address is refused at admission. **Mainnet never carries a faucet**, allowlisted or not — and
+  since audit v6 (STAKE-2) that is a check, not a sentence: a genesis with `faucet: true` and a
+  `bridge` section is refused at `init` (`FaucetWithBridgeNeedsTestnet`) unless its top level
+  says `"testnet": true` (`rand-node genesis --testnet`), whatever its `staking` section and
+  allowlist say; chains 14–18, cut before the marker, are grandfathered by chain id in
+  `genesis::FAUCET_BESIDE_BRIDGE_CHAIN_IDS`. A mainnet genesis carries neither the faucet nor the
+  marker, and `rand_status.testnet` / `rand_getLimits.testnet` tell every client which it is.
 - **`faucet_minters`** (RESCAN-LEDGER-1; the next cut that keeps a faucet sets it, to the operator's
   own validator keys): a `Mint` may be signed only by these keys (`MinterNotAllowed` otherwise).
   Without it the ledger accepts any key with a register row — which a permissionless `Bond` writes,
@@ -1133,6 +1139,13 @@ Audit v6 (2026-09-30) §8.5. Each is optional, absent from every genesis through
 committed to the genesis hash under its own tag — after every tag that existed before it — only
 when set; a file without them hashes and runs byte-for-byte as before.
 
+- **`testnet: true`** (top level; `rand-node genesis --testnet`). Required on any chain whose
+  genesis keeps `faucet: true` beside a `bridge` section — free RAND beside real custody — on a
+  chain id past 18 (`GenesisError::FaucetWithBridgeNeedsTestnet`; chains 14–18 are grandfathered
+  by id, `genesis::FAUCET_BESIDE_BRIDGE_CHAIN_IDS`). Hashed under the tag `testnet` only when
+  `true`; a mainnet genesis never carries it. `rand_status.testnet` and
+  `rand_getLimits.testnet` serve it. The next testnet cut passes it; a mainnet cut passes
+  neither it nor `--faucet`.
 - **`staking.admission_by_vote: true`** (`docs/staking.md` §2, "Admission by vote"). A `Bond`
   that registers a new validator key is refused `NotAdmitted` until validators holding strictly
   more than two thirds of the voting set's weight have signed it in (`AdmitValidator`, the

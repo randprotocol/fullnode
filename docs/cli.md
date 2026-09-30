@@ -77,7 +77,8 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | `--max-call-envelope-bytes <N>` | none (18 432) | the largest call input envelope, in bytes, `18432..=1048576`. `rand call` derives its input-word cap from it: `(N − 1 252) / 4` |
 | `--max-program-public-words <N>` | none (0) | the largest public input a `Deploy` may fix (`rand program deploy --public`), in words, `0..=65535`. 0, the default, admits no public input |
 | `--out <OUT>` | `genesis.json` | output path |
-| `--faucet` | off | **testnet only**: enable `Mint` transactions (`rand_mint`, up to 100 RAND per call). Part of the genesis hash |
+| `--faucet` | off | **testnet only**: enable `Mint` transactions (`rand_mint`, up to 100 RAND per call). Part of the genesis hash. Beside a `bridge` section (spliced in later) it needs `--testnet` |
+| `--testnet` | off | audit v6, STAKE-2: write `"testnet": true`, the marker that lets a faucet sit beside a bridge section — a chain holding custody hands out no free RAND unless its genesis says it is a testnet. Part of the genesis hash when given; served as `testnet` by `rand_status` and `rand_getLimits` |
 | `--no-confidential` | off | disable Deploy/Call transactions on this chain. Part of the genesis hash |
 | `--fri-profile <production\|test>` | `production` | zkVM FRI profile every node must use; `test` is insecure and for the test suite (the command warns on stderr, and `init`/`run`/`verify` refuse the file without `--allow-test-fri-profile`). Part of the genesis hash |
 | `--bundle-guest <v1\|v2\|v3>` | `v1` | the bundle guest pinned as `hc_bundle`: `v1` (the hidden-asset guest chains 14 and 15 run), `v2` (the branch-free guest, INT-2 / GV-1), or `v3` (split authorisation: `nk` and a salt instead of the spend key, `60af094a…`). `v3` needs `--auth-guest` |

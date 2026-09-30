@@ -195,6 +195,9 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // `None`, and a node that kept it would run without the prices and the bundle gas limit its
     // peers enforce.
     ledger.set_gas(gs.ledger.gas().cloned());
+    // And the testnet marker (audit v6, STAKE-2): served, not judged, but a node that came
+    // back without it would tell wallets a testnet is not one.
+    ledger.set_testnet(gs.ledger.testnet());
     // And the consensus signing domain (audit v4): `load_ledger` comes back at v0, and a node
     // that kept it on a v1 chain would refuse every peer's proposal at the ledger's own
     // signature check.
@@ -1977,6 +1980,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         active_validator: hs.current_set().contains(&key.address()),
         faucet: gs.faucet,
         confidential: gs.confidential,
+        testnet: gs.testnet,
         fri_profile: gs.fri_profile.clone(),
         address: Some(key.address().to_base58()),
         peer_id: net.local_peer_id.to_string(),
@@ -5038,6 +5042,23 @@ mod tests {
         assert_eq!(reloaded.admitted(), ledger.admitted());
         assert_eq!(reloaded.state_root(), ledger.state_root(), "the same state root after the restart");
         assert_eq!(reloaded, ledger);
+    }
+
+    /// Audit v6, STAKE-2: the testnet marker survives a restart the same way — it lives in the
+    /// genesis file, `load_ledger` comes back without it, and a node that kept running without it
+    /// would tell every wallet and explorer a testnet is not one.
+    #[test]
+    fn a_restart_restores_the_testnet_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut g = crate::storage::fixtures::genesis_file_of(7, &[&key(1)], vec![], 2);
+        g.testnet = Some(true);
+        let gs = g.build(&StubExecutor).unwrap();
+        storage.init_genesis(&gs).unwrap();
+        assert!(!storage.load_ledger(&StubExecutor).unwrap().testnet(), "storage does not hold the marker");
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert!(reloaded.testnet(), "restored from the genesis state");
+        assert_eq!(reloaded, gs.ledger, "and it is not state");
     }
 
     /// The program cap survives a restart the same way: it lives in the genesis file, and
