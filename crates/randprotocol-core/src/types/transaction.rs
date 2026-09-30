@@ -357,10 +357,13 @@ pub enum Action {
         envelope: Envelope,
         signature: Signature,
     },
-    /// Genesis vesting (spec §6.2): pay exactly `unvested` of a revocable entry's not-yet-vested
-    /// RAND to `to` as a note of `unvested − BUNDLE_BASE`, and freeze the entry at
-    /// `amount − unvested`. `to` must be the treasury the entry names in genesis, and
-    /// `signatures` at least the entry's `threshold` of its revokers, each over
+    /// Genesis vesting (spec §6.2): revoke a revocable entry — stop its schedule at the applying
+    /// block, so its whole unvested part leaves the holder's reach — and pay `unvested` of that
+    /// part to `to` as a note of `unvested − BUNDLE_BASE`. `unvested` is the least the revokers
+    /// expect to be unvested (refused if less is); what it leaves in the register is the
+    /// treasury's and a later revoke pays it out (audit v6, STAKE-4). `nonce` is the entry's
+    /// `revoke_nonce`. `to` must be the treasury the entry names in genesis, and `signatures` at
+    /// least the entry's `threshold` of its revokers, each over
     /// [`crate::types::actions::revoke_vesting_message`] (audit v6, STAKE-3 — the shape changed
     /// from one `signature`; no chain has carried a `vesting` section, so none ever admitted one).
     RevokeVesting {

@@ -227,7 +227,7 @@ pub fn withdraw_message(
 }
 
 /// What a vesting entry's beneficiary signs to claim (`ClaimVested`, genesis vesting spec §6.1):
-/// the genesis and chain, the entry, the gross amount, the entry's nonce, and the note it asks
+/// the genesis and chain, the entry, the gross amount, the entry's (beneficiary) nonce, and the note it asks
 /// for — the recipient, `time`, blinding and envelope — so nobody relaying it can redirect it.
 #[allow(clippy::too_many_arguments)]
 pub fn claim_vested_message(
@@ -256,8 +256,10 @@ pub struct RevokerSignature {
 }
 
 /// What each of a vesting entry's revokers signs (`RevokeVesting`, spec §6.2): as a claim, with
-/// the exact unvested amount the treasury note carries in place of the claimed amount. `to` is in
-/// the message and must be the entry's genesis treasury (audit v6, STAKE-3).
+/// the amount the treasury note carries in place of the claimed amount. `to` is in the message
+/// and must be the entry's genesis treasury (audit v6, STAKE-3); `nonce` is the entry's
+/// `revoke_nonce`, the revokers' own counter (STAKE-4) — the domain is `-2` since it stopped
+/// being the counter the beneficiary's actions share.
 #[allow(clippy::too_many_arguments)]
 pub fn revoke_vesting_message(
     genesis: &Hash,
@@ -271,7 +273,7 @@ pub fn revoke_vesting_message(
     envelope: &Envelope,
 ) -> Hash {
     let bytes = bincode::serialize(&(genesis, chain_id, entry, unvested, nonce, to, time, r, envelope)).expect("serializes");
-    Hash::digest_domain(b"rand-vest-revoke-1", &bytes)
+    Hash::digest_domain(b"rand-vest-revoke-2", &bytes)
 }
 
 /// What a beneficiary signs to bond locked RAND to a validator (`BondVested`): the entry, the

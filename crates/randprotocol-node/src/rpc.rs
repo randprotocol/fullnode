@@ -1821,7 +1821,7 @@ fn bundle_json(b: &randprotocol_core::Bundle) -> Value {
 /// The keys are served as their addresses (a Dilithium2 key is 1 312 bytes); nothing names the
 /// holder. A revocable entry also serves its revokers, its threshold and its treasury.
 fn vesting_entry_json(e: &randprotocol_core::ledger::vesting::Entry, t_ms: u64, epoch: u64) -> Value {
-    use randprotocol_core::ledger::vesting::{claimable, unvested, vested};
+    use randprotocol_core::ledger::vesting::{claimable, locked, unvested, vested};
     json!({
         "id": hex::encode(e.id),
         "class": e.class.as_str(),
@@ -1847,19 +1847,22 @@ fn vesting_entry_json(e: &randprotocol_core::ledger::vesting::Entry, t_ms: u64, 
             .map(|(release_epoch, amount)| json!({ "release_epoch": release_epoch, "amount": amount.to_string() }))
             .collect::<Vec<_>>(),
         "nonce": e.nonce,
+        // The revokers' own counter (audit v6, STAKE-4): what a `revoke_vesting` signs over.
+        "revoke_nonce": e.revoke_nonce,
         "vested_now": vested(e, t_ms).to_string(),
         "claimable_now": claimable(e, t_ms, epoch).to_string(),
+        // Before a revoke, what one could take; after, what is still the treasury's to sweep.
         "unvested_now": unvested(e, t_ms).to_string(),
+        "locked_now": locked(e, t_ms).to_string(),
     })
 }
 
-/// What of `reg` is still locked at `t_ms`: every entry's amount less what it lost to a revoke
-/// and less what has vested. The public lockup figure (SAFT Schedule 2 §3) — owners never enter.
+/// What of `reg` is still locked for its holders at `t_ms`: every unrevoked entry's part not
+/// yet vested (`vesting::locked` — a revoked entry's rest is the treasury's, not locked for
+/// anyone). The public lockup figure (SAFT Schedule 2 §3) — owners never enter.
 fn vesting_locked(reg: &randprotocol_core::ledger::vesting::VestingRegister, t_ms: u64) -> u64 {
-    use randprotocol_core::ledger::vesting::vested;
-    reg.entries
-        .iter()
-        .fold(0u64, |a, e| a.saturating_add(e.amount.saturating_sub(e.revoked_out).saturating_sub(vested(e, t_ms))))
+    use randprotocol_core::ledger::vesting::locked;
+    reg.entries.iter().fold(0u64, |a, e| a.saturating_add(locked(e, t_ms)))
 }
 
 /// The most points `rand_getVestingSchedule` answers in one call.
@@ -3095,7 +3098,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // Per-class totals — how much team / investor / partner RAND is still locked — and the
         // whole register's. No entry, key or owner in the answer.
         "rand_getVestingSummary" => {
-            use randprotocol_core::ledger::vesting::{vested, Class};
+            use randprotocol_core::ledger::vesting::{locked, vested, Class};
             let Some(reg) = st.storage.vesting().map_err(RpcError::internal)? else {
                 return Ok(json!({ "enabled": false }));
             };
@@ -3119,7 +3122,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                         "claimed": sum(&|e| e.claimed),
                         "revoked_out": sum(&|e| e.revoked_out),
                         "bonded": sum(&|e| e.bonded),
-                        "locked": sum(&|e| e.amount.saturating_sub(e.revoked_out).saturating_sub(vested(e, t))),
+                        "locked": sum(&|e| locked(e, t)),
                     }))
                 })
                 .collect();
@@ -4992,7 +4995,8 @@ mod tests {
         assert_eq!(v["claimed"], (5 * rand).to_string());
         assert_eq!(v["vested_now"], (5 * rand).to_string(), "t = 1 of 2");
         assert_eq!(v["claimable_now"], "0");
-        assert_eq!(v["nonce"], 1);
+        assert_eq!((v["nonce"].clone(), v["revoke_nonce"].clone()), (json!(1), json!(0)));
+        assert_eq!(v["locked_now"], (5 * rand).to_string());
         assert_eq!(v["as_of_ms"], 1, "the head block's timestamp");
         let later = ok(&st, "rand_getVesting", json!(["07".repeat(32), 2])).await;
         assert_eq!((later["as_of_ms"].clone(), later["vested_now"].clone()), (json!(2), json!((10 * rand).to_string())));

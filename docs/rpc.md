@@ -989,14 +989,18 @@ Params: `[id, at_ms?]` — the entry's 64-hex id, and optionally the time to eva
   "amount": "18000000000000000", "start_ms": 1790000000000, "cliff_ms": 31104000000,
   "linear_ms": 46656000000, "step_ms": 2592000000,
   "claimed": "0", "revoked_out": "0", "revoked_at": null,
-  "bonded": "0", "bonded_to": null, "unbonding": [], "nonce": 0,
-  "vested_now": "0", "claimable_now": "0", "unvested_now": "18000000000000000", "as_of_ms": 1790000000000 }
+  "bonded": "0", "bonded_to": null, "unbonding": [], "nonce": 0, "revoke_nonce": 0,
+  "vested_now": "0", "claimable_now": "0", "unvested_now": "18000000000000000",
+  "locked_now": "18000000000000000", "as_of_ms": 1790000000000 }
 ```
 
 Keys are served as their addresses. A revocable entry lists its `revokers` in the order a revoke's
 signer indices count them, the `threshold` of them a revoke needs, and the `treasury` (`rand1…`) a
 revoke pays — the only address it may pay. `claimable_now` is what a `claim_vested` may take: vested,
-unclaimed, and neither bonded nor still unbonding. `null` for an id the register does not hold;
+unclaimed, and neither bonded nor still unbonding. `nonce` is what the holder's actions sign over
+and `revoke_nonce` what a revoke does. `unvested_now` is what a `revoke_vesting`'s note may carry:
+before a revoke the part not yet vested, after one what is still in the register for the treasury;
+`locked_now` is the part still locked for the holder (`"0"` once revoked). `null` for an id the register does not hold;
 `{"enabled": false}` on a chain without a `vesting` section.
 
 ### `rand_getVestingSummary`
@@ -1522,6 +1526,17 @@ No chain has carried a `vesting` section, so nothing a client reads today moves.
   entry's genesis terms): `a revoke pays the entry's treasury, not the address it names`,
   `N revoker signatures, the entry needs M`, `revoker I signed twice`, `revoker index I is not in
   the entry's list`.
+
+### 2026-09-30 — audit v6: a revoke's own nonce, and no dust (STAKE-4; genesis-gated, on no chain)
+
+- **`rand_getVesting`** gains `revoke_nonce` — the counter a `revoke_vesting` signs over, moved
+  only by revokes; `nonce` stays the holder's (claims, bonds, unbonds) — and `locked_now` (what is
+  still locked for the holder; `"0"` once revoked). `unvested_now` now reads, after a revoke, what
+  is still in the register for the treasury (a later revoke sweeps it) rather than `"0"`.
+- **A revoke takes the whole unvested part as of its block** (the schedule stops at `revoked_at`);
+  its `unvested` field is the amount its note carries, at most what is unvested. A revoked entry
+  admits further `revoke_vesting`s until that rest is paid out; `the entry is already revoked and
+  its unvested part paid out` is the refusal after that.
 
 ### 2026-09-28 — gas (Phase 1 + Phase 2): the chain's own `gas` section, and the tip's moving prices
 

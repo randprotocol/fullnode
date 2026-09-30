@@ -192,7 +192,7 @@ prints the public key that goes into the genesis entry.
 |---|---|---|
 | `vesting status <id>` | `--rpc` | the entry as `rand_getVesting` serves it |
 | `vesting claim` | `--entry <id>`, `--to <rand1…>`, `--amount <RAND>` or `--all`, `--key`, `--rpc`, `--no-wait` | pay what has unlocked into a note at `--to`, less the 0.001 RAND base; the beneficiary key signs, `--to` included |
-| `vesting revoke prepare` | `--entry`, `--margin-secs` (600), `--out` (`revoke.json`), `--rpc` | no key: write the revoke every revoker signs — the part still unvested `--margin-secs` past the head, paid to the entry's genesis `treasury` (there is no `--to`) |
+| `vesting revoke prepare` | `--entry`, `--margin-secs` (600), `--out` (`revoke.json`), `--rpc` | no key: write the revoke every revoker signs — a note of the part still unvested `--margin-secs` past the head, paid to the entry's genesis `treasury` (there is no `--to`); on an entry already revoked, the exact rest left for the treasury |
 | `vesting revoke sign` | `--proposal <file>`, `--key`, `--index`? | one revoker key, offline: print `<index>:<signature hex>`; what is signed goes to stderr |
 | `vesting revoke submit` | `--proposal <file>`, `--signature <index:hex>` (repeat), `--rpc`, `--no-wait` | send the revoke with at least the entry's `threshold` of signatures, within 256 blocks of `prepare` |
 | `vesting bond <RAND>` | `--entry`, `--validator <address>`, `--registration <hex>`?, `--key`, … | irrevocable entries: bond locked RAND as that validator's stake (a new validator needs what `rand-node register` printed) |

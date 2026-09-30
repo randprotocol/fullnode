@@ -6,8 +6,9 @@
 //! `vesting` section, and enters the pool only as it unlocks: a `ClaimVested` (signed by the
 //! entry's beneficiary) pays the unlocked part into a note, a `RevokeVesting` (signed by a
 //! threshold of the entry's revokers) pays the unvested part to the treasury the entry names in
-//! genesis — and to no other address — and freezes the entry. The schedule is a cliff, then
-//! linear, on the applying block's timestamp.
+//! genesis — and to no other address — and freezes the entry at what the schedule had released
+//! by the block that applies it. The schedule is a cliff, then linear, on the applying block's
+//! timestamp.
 //!
 //! Genesis-gated: a chain without the section has no register (`Ledger::vesting` is `None`)
 //! and every one of the four actions is refused `UnsupportedAction("vesting")`.
@@ -205,10 +206,12 @@ pub struct Entry {
     /// Released to the beneficiary so far, gross (each claim's base included).
     #[serde(default)]
     pub claimed: u64,
-    /// The unvested part a revoke paid to the treasury, gross; 0 until revoked.
+    /// What revokes have paid to the treasury so far, gross; 0 until revoked. After the first
+    /// revoke the rest of the unvested part (`unvested`) is still in the register, the
+    /// treasury's, until a later revoke pays it out.
     #[serde(default)]
     pub revoked_out: u64,
-    /// The timestamp of the block that applied the revoke.
+    /// The timestamp of the block that applied the first revoke: the schedule stops there.
     #[serde(default)]
     pub revoked_at: Option<u64>,
     /// What of this entry is bonded as validator stake right now (`BondVested`): still locked,
@@ -224,9 +227,14 @@ pub struct Entry {
     /// unbond waits). Dropped by the entry's next action once released.
     #[serde(default)]
     pub unbonding: Vec<(u64, u64)>,
-    /// Bumped by every accepted vesting action on the entry: the replay protection.
+    /// Bumped by every accepted action of the entry's *beneficiary* — a claim, a bond, an
+    /// unbond: their replay protection.
     #[serde(default)]
     pub nonce: u64,
+    /// Bumped by every accepted revoke: the revokers' own replay protection (audit v6, STAKE-4).
+    /// Apart from `nonce`, so nothing the beneficiary does can make a signed revoke stale.
+    #[serde(default)]
+    pub revoke_nonce: u64,
 }
 
 /// `Option<ShieldedAddress>` as its `rand1…` text: the register is persisted as JSON, where the
@@ -265,6 +273,7 @@ impl Entry {
             bonded_to: None,
             unbonding: Vec::new(),
             nonce: 0,
+            revoke_nonce: 0,
         }
     }
 
@@ -337,6 +346,7 @@ impl Entry {
             None => b.push(0),
         }
         b.extend_from_slice(&self.nonce.to_be_bytes());
+        b.extend_from_slice(&self.revoke_nonce.to_be_bytes());
         // `-2` since audit v6 (STAKE-3, STAKE-4): the leaf's layout moved, and no chain ever
         // committed to a `-1` leaf (no genesis has carried a `vesting` section).
         Hash::digest_domain(b"rand-vesting-leaf-2", &b)
@@ -345,12 +355,18 @@ impl Entry {
 
 /// The schedule, the SAFT's shape: nothing until `start + cliff`; then `linear` more, either
 /// continuously or in whole `step`s (a step unlocks at the *end* of its period, so a 12-month
-/// cliff and 18 monthly steps release 1/18 at months 13, 14, …, 30). A revoked entry is frozen
-/// at `amount − revoked_out`, whatever the time.
+/// cliff and 18 monthly steps release 1/18 at months 13, 14, …, 30).
+///
+/// A revoked entry is frozen at what the schedule had released when the revoke applied
+/// (`revoked_at`), whatever the time and whatever amount the revoke's note carried (audit v6,
+/// STAKE-4). It used to be frozen at `amount − revoked_out`, so whatever the revokers left out
+/// of the signed amount — they sign under a margin, because the unvested part shrinks while
+/// the revoke travels — vested to the holder at once.
 pub fn vested(e: &Entry, t_ms: u64) -> u64 {
-    if e.revoked_at.is_some() {
-        return e.amount.saturating_sub(e.revoked_out);
-    }
+    let t_ms = match e.revoked_at {
+        Some(at) => t_ms.min(at),
+        None => t_ms,
+    };
     let cliff = e.start_ms.saturating_add(e.cliff_ms);
     if t_ms < cliff {
         return 0;
@@ -373,12 +389,20 @@ pub fn claimable(e: &Entry, t_ms: u64, epoch: u64) -> u64 {
     vested(e, t_ms).saturating_sub(e.claimed).min(e.free(epoch))
 }
 
-/// What a revoke at `t_ms` could take: the part not yet vested (0 once revoked).
+/// What a revoke at `t_ms` could pay the treasury: the part the schedule has not released —
+/// for a revoked entry, the part it never will — less what revokes have already paid out.
 pub fn unvested(e: &Entry, t_ms: u64) -> u64 {
-    if e.revoked_at.is_some() {
-        return 0;
+    e.amount.saturating_sub(vested(e, t_ms)).saturating_sub(e.revoked_out)
+}
+
+/// What of the entry is still locked for its holder at `t_ms`: the part not yet vested — and
+/// nothing once revoked, when the rest is the treasury's, not the holder's. The public lockup
+/// figure (SAFT Schedule 2 §3).
+pub fn locked(e: &Entry, t_ms: u64) -> u64 {
+    match e.revoked_at {
+        Some(_) => 0,
+        None => e.amount.saturating_sub(vested(e, t_ms)),
     }
-    e.amount.saturating_sub(vested(e, t_ms))
 }
 
 /// The register: every entry, in id order, and the net value its claims and revokes have put
@@ -450,7 +474,7 @@ pub enum VestingError {
     NotYetVested { available: u64, want: u64 },
     #[error("the entry has no revoker")]
     NotRevocable,
-    #[error("the entry is already revoked")]
+    #[error("the entry is already revoked and its unvested part paid out")]
     AlreadyRevoked,
     #[error("only {unvested_now} is unvested, cannot revoke {want}")]
     RevokeExceedsUnvested { unvested_now: u64, want: u64 },
@@ -491,6 +515,7 @@ fn entry<'a>(ledger: &'a Ledger, id: &[u8; 32]) -> Result<&'a Entry, TxError> {
     reg.get(id).ok_or_else(|| VestingError::UnknownEntry(hex::encode(id)).into())
 }
 
+/// The beneficiary's nonce: a claim's, a bond's, an unbond's.
 fn check_nonce(e: &Entry, nonce: u64) -> Result<(), VestingError> {
     if nonce != e.nonce {
         return Err(VestingError::BadNonce { expected: e.nonce, actual: nonce });
@@ -588,6 +613,17 @@ fn check_revoker_set(e: &Entry, signatures: &[RevokerSignature]) -> Result<(), V
 /// recipient is the entry's genesis treasury and nothing else, and a threshold of the entry's
 /// revokers — distinct keys, each over the same message — signs it; before, one key's signature
 /// sent the unvested part of every revocable entry to an address that key's holder named.
+///
+/// Audit v6, STAKE-4. The nonce is the revokers' own (`Entry::revoke_nonce`), which only a
+/// revoke moves, so a claim landing first cannot make a signed revoke stale. And the signed
+/// `amount` is what the revoke's *note* pays — the least the revokers expect to be unvested,
+/// refused if less is: the revoke itself takes the whole unvested part as of the applying
+/// block (`vested` stops at `revoked_at`), and what the note does not carry stays in the
+/// register, the treasury's, for a later revoke to pay out. The note's amount has to be signed
+/// — its envelope is sealed against the note, and a wallet finds a note by opening the envelope
+/// and recomputing the commitment — so "no signed amount" would leave the treasury a note its
+/// wallet cannot see; a signed minimum plus a sweep leaves the holder no dust and the treasury
+/// every unit.
 #[allow(clippy::too_many_arguments)]
 fn check_revoke(
     ledger: &Ledger,
@@ -611,13 +647,16 @@ fn check_revoke(
         return Err(VestingError::NotTheTreasury.into());
     }
     check_revoker_set(e, signatures)?;
-    if e.revoked_at.is_some() {
+    if nonce != e.revoke_nonce {
+        return Err(VestingError::BadNonce { expected: e.revoke_nonce, actual: nonce }.into());
+    }
+    // Until the first revoke the unvested part only shrinks with time, so the revokers sign a
+    // little less than they saw; from then on it is what is left to pay out, and only a revoke
+    // moves it.
+    let unvested_now = unvested(e, ledger.timestamp_ms()).min(e.free(ledger.epoch()));
+    if e.revoked_at.is_some() && unvested_now == 0 {
         return Err(VestingError::AlreadyRevoked.into());
     }
-    check_nonce(e, nonce)?;
-    // The true unvested part only shrinks with time, so the revoker signs a little less than
-    // it saw; what vests in between stays the beneficiary's.
-    let unvested_now = unvested(e, ledger.timestamp_ms()).min(e.free(ledger.epoch()));
     if amount > unvested_now {
         return Err(VestingError::RevokeExceedsUnvested { unvested_now, want: amount }.into());
     }
@@ -758,11 +797,16 @@ pub(super) fn apply(
             let e = reg.get_mut(entry).expect("validated above");
             if matches!(action, Action::ClaimVested { .. }) {
                 e.claimed = e.claimed.checked_add(*amount).ok_or(VestingError::Overflow)?;
+                e.nonce += 1;
             } else {
-                e.revoked_at = Some(now);
-                e.revoked_out = *amount;
+                // The first revoke stops the schedule at this block (STAKE-4): the whole
+                // unvested part leaves the holder's reach now, whatever this note carries. A
+                // later one only pays out more of it.
+                let revoked_out = e.revoked_out.checked_add(*amount).ok_or(VestingError::Overflow)?;
+                e.revoked_at.get_or_insert(now);
+                e.revoked_out = revoked_out;
+                e.revoke_nonce += 1;
             }
-            e.nonce += 1;
             settle(e, epoch);
             reg.released = released;
             ledger.append_deposit(cm, envelope.clone(), executor)?;
@@ -885,13 +929,20 @@ mod tests {
         e.claimed = 100;
         assert_eq!(claimable(&e, 300, 0), 200);
         assert_eq!(unvested(&e, 300), 700);
+        assert_eq!(locked(&e, 300), 700);
+        // Revoked at t = 300 by a note of 650: the schedule stops at 300, whatever the note
+        // carried (STAKE-4) — 50 stay in the register, the treasury's, not the holder's.
         e.revoked_at = Some(300);
         e.revoked_out = 650;
-        assert_eq!(vested(&e, 300), 350);
-        assert_eq!(vested(&e, 10_000), 350, "frozen, whatever the time");
-        assert_eq!(claimable(&e, 10_000, 0), 250);
-        assert_eq!(unvested(&e, 10_000), 0);
+        assert_eq!(vested(&e, 300), 300);
+        assert_eq!(vested(&e, 10_000), 300, "frozen at the revoke's block, whatever the time");
+        assert_eq!(vested(&e, 200), 200, "and the schedule before it is unchanged");
+        assert_eq!(claimable(&e, 10_000, 0), 200);
+        assert_eq!(unvested(&e, 10_000), 50, "what a later revoke may still pay the treasury");
+        assert_eq!(locked(&e, 10_000), 0, "nothing is locked for the holder any more");
         assert_eq!(e.held(), 250);
+        e.revoked_out = 700;
+        assert_eq!((unvested(&e, 10_000), claimable(&e, 10_000, 0), e.held()), (0, 200, 200));
     }
 
     #[test]
@@ -969,6 +1020,7 @@ mod tests {
             |r| r.entries[0].revoked_out += 1,
             |r| r.entries[0].revoked_at = Some(0),
             |r| r.entries[0].nonce += 1,
+            |r| r.entries[0].revoke_nonce += 1,
             |r| r.entries[0].amount += 1,
             |r| r.entries[0].start_ms += 1,
             |r| r.entries[0].cliff_ms += 1,
@@ -1221,23 +1273,36 @@ mod ledger_tests {
             verr(ap!(l, revoke(&l, 1, 7 * U + 1, 0)).unwrap_err()),
             VestingError::RevokeExceedsUnvested { unvested_now: 7 * U, want: 7 * U + 1 }
         );
-        // The revoker signs a little less than it saw (the margin): the rest is the holder's.
+        // The revokers sign a little less than they saw (the margin). The note carries that;
+        // the revoke takes the whole unvested part.
         let t = revoke(&l, 1, 6 * U, 0);
         let cm = l.derived_commitment(&t.action, &StubExecutor).unwrap();
         assert_eq!(cm, crate::ledger::mint_commitment(&StubExecutor, &addr(TREASURY).pk, 6 * U - BASE, l.height() as u32, &[9; 8]));
         apply(&mut l, &t).unwrap();
         assert!(l.has_commitment(&cm), "the treasury's note is in the tree");
-        assert_eq!((e(&l, 1).revoked_out, e(&l, 1).revoked_at), (6 * U, Some(5_000)));
+        assert_eq!((e(&l, 1).revoked_out, e(&l, 1).revoked_at, e(&l, 1).revoke_nonce, e(&l, 1).nonce), (6 * U, Some(5_000), 1, 0));
         assert!(l.audit().invariant_holds());
-        assert_eq!(verr(ap!(l, revoke(&l, 1, 2 * BASE, 1)).unwrap_err()), VestingError::AlreadyRevoked);
-        // Frozen at 10 U − 6 U, whatever the time: 4 U, claimable at once, and not a unit more.
+        // The same revoke again: its nonce is spent.
+        assert_eq!(verr(apply(&mut l, &t).unwrap_err()), VestingError::BadNonce { expected: 1, actual: 0 });
+        // Frozen at the 3 U that had vested, whatever the time: claimable at once, not a unit more.
         l.set_timestamp_ms(1_000_000);
-        assert!(matches!(verr(ap!(l, claim(&l, 1, 4 * U + 1, 1, HOLDER, 1)).unwrap_err()), VestingError::NotYetVested { .. }));
-        ap!(l, claim(&l, 1, 4 * U, 1, HOLDER, 1)).unwrap();
+        assert!(matches!(verr(ap!(l, claim(&l, 1, 3 * U + 1, 0, HOLDER, 1)).unwrap_err()), VestingError::NotYetVested { .. }));
+        ap!(l, claim(&l, 1, 3 * U, 0, HOLDER, 1)).unwrap();
+        // The seventh U is still in the register and is the treasury's: a second revoke pays
+        // it out — exactly, since nothing moves it now — and then there is nothing left.
+        assert_eq!((e(&l, 1).held(), unvested(e(&l, 1), 1_000_000)), (U, U));
+        assert_eq!(
+            verr(ap!(l, revoke(&l, 1, U + 1, 1)).unwrap_err()),
+            VestingError::RevokeExceedsUnvested { unvested_now: U, want: U + 1 }
+        );
+        ap!(l, revoke(&l, 1, U, 1)).unwrap();
+        assert_eq!((e(&l, 1).revoked_out, e(&l, 1).revoked_at, e(&l, 1).revoke_nonce), (7 * U, Some(5_000), 2), "the freeze stays where the first revoke put it");
+        assert_eq!(verr(ap!(l, revoke(&l, 1, 2 * BASE, 2)).unwrap_err()), VestingError::AlreadyRevoked);
         assert_eq!(e(&l, 1).held(), 0);
         let a = l.audit();
         assert!(a.invariant_holds(), "{a:?}");
-        assert_eq!(a.vesting_released, 10 * U - 2 * BASE);
+        assert_eq!(a.vesting_released, 10 * U - 3 * BASE, "one claim's and two revokes' notes");
+        assert_eq!(a.vesting_in_register, 10 * U, "entry 2, untouched");
     }
 
     /// Audit v6, STAKE-3a: a revoke pays the treasury the entry names in genesis and no other
@@ -1304,17 +1369,55 @@ mod ledger_tests {
         assert_eq!(verr(l.validate(&swapped, &StubExecutor).unwrap_err()), VestingError::BadSignature);
     }
 
+    /// Audit v6, STAKE-4: the revokers have their own nonce. Claims, revokes, bonds and unbonds
+    /// of an entry shared one, so a beneficiary who saw a revoke in flight landed a claim of a
+    /// little over the base first and the signed revoke went stale (`BadNonce`) — and again
+    /// after every re-signing, each round a ceremony for the revokers and one cheap
+    /// transaction for the holder.
+    #[test]
+    fn a_claim_in_flight_cannot_stale_a_revoke() {
+        let mut l = ledger(vec![cfg(1, true)], 5_000); // 3 U vested, 7 U not
+        let signed = revoke(&l, 1, 6 * U, 0);
+        // The holder sees it pooled and lands three dust claims ahead of it.
+        for n in 0..3 {
+            ap!(l, claim(&l, 1, 2 * BASE, n, HOLDER, n as u8 + 1)).unwrap();
+        }
+        let r = apply(&mut l, &signed);
+        assert!(r.is_ok(), "dust claims landed first and the signed revoke went stale: {r:?}");
+        assert_eq!((e(&l, 1).revoked_out, e(&l, 1).revoked_at), (6 * U, Some(5_000)));
+        assert!(l.audit().invariant_holds());
+    }
+
+    /// Audit v6, STAKE-4: a revoke takes the whole unvested part as of the block that applies
+    /// it, whatever amount its note carries. The entry was frozen at `amount − revoked_out`, so
+    /// whatever the revokers left out of the signed amount — the margin they sign under, or
+    /// more — vested to the holder at once.
+    #[test]
+    fn nothing_is_left_to_vest_after_a_revoke() {
+        let mut l = ledger(vec![cfg(1, true)], 5_000); // 3 U vested, 7 U not
+        ap!(l, revoke(&l, 1, 6 * U, 0)).unwrap();
+        for t in [5_000, 5_001, 12_000, 1_000_000] {
+            assert_eq!(vested(e(&l, 1), t), 3 * U, "t = {t}: the revokers signed 6 U of 7 U and the seventh vested at once");
+            assert_eq!(claimable(e(&l, 1), t, l.epoch()), 3 * U, "t = {t}");
+        }
+        l.set_timestamp_ms(1_000_000);
+        assert!(matches!(verr(ap!(l, claim(&l, 1, 3 * U + 1, 0, HOLDER, 1)).unwrap_err()), VestingError::NotYetVested { .. }));
+        ap!(l, claim(&l, 1, 3 * U, 0, HOLDER, 1)).unwrap();
+        assert_eq!(claimable(e(&l, 1), u64::MAX, l.epoch()), 0, "the holder has everything that had vested, and nothing more ever does");
+    }
+
     /// Review focus 1: a claim admitted against the head, a revoke landing first — the claim can
-    /// only ever have asked for what had vested, which the frozen total always covers.
+    /// only ever have asked for what had vested, which the frozen total always covers, and its
+    /// nonce is the beneficiary's, which a revoke no longer spends (STAKE-4): it applies as
+    /// signed.
     #[test]
     fn a_claim_admitted_before_a_revoke_still_applies_after_it() {
         let mut l = ledger(vec![cfg(1, true)], 5_000); // 3 U vested
         let c = claim(&l, 1, 3 * U, 0, HOLDER, 1);
         l.validate(&c, &StubExecutor).unwrap();
         ap!(l, revoke(&l, 1, 7 * U, 0)).unwrap();
-        // The claim was signed at nonce 0 and the revoke spent it: re-signed at 1, it applies.
-        assert!(matches!(verr(apply(&mut l, &c).unwrap_err()), VestingError::BadNonce { .. }));
-        ap!(l, claim(&l, 1, 3 * U, 1, HOLDER, 1)).unwrap();
+        apply(&mut l, &c).unwrap();
+        assert_eq!((e(&l, 1).nonce, e(&l, 1).revoke_nonce, e(&l, 1).held()), (1, 1, 0));
         assert!(l.audit().invariant_holds());
     }
 

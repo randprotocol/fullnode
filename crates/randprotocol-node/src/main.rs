@@ -833,10 +833,12 @@ enum VestingCmd {
 #[derive(Subcommand)]
 enum RevokeCmd {
     /// Write the revoke every revoker signs: the entry, the amount (what will still be unvested
-    /// `--margin-secs` after the head, so a revoke that lands a little later still fits), the
-    /// entry's nonce, the treasury note and its envelope. Needs no key. The note's `time` is the
-    /// head height, so the signatures must be gathered and submitted within the chain's time
-    /// window (256 blocks) — prepare again if that passes.
+    /// `--margin-secs` after the head, so a revoke that lands a little later still fits — the
+    /// revoke takes the whole unvested part either way, and what the note leaves behind is
+    /// swept by preparing again once the entry is revoked), the revokers' nonce, the treasury
+    /// note and its envelope. Needs no key. The note's `time` is the head height, so the
+    /// signatures must be gathered and submitted within the chain's time window (256 blocks) —
+    /// prepare again if that passes.
     Prepare {
         #[arg(long)]
         entry: String,
@@ -1664,17 +1666,26 @@ async fn main() -> Result<()> {
                     let rpc = RpcClient::new(rpc);
                     let now = vesting_entry(&rpc, &id, None).await?;
                     anyhow::ensure!(now["revocable"] == serde_json::json!(true), "entry {entry} has no revoker: it is irrevocable");
-                    anyhow::ensure!(now["revoked_at"].is_null(), "entry {entry} is already revoked");
                     // A revoke pays the entry's treasury and no other address (STAKE-3): there
                     // is nothing to choose, so there is no `--to`.
                     let treasury = now["treasury"].as_str().context("the node's vesting reply has no treasury")?;
                     let to = ShieldedAddress::parse(treasury).map_err(|e| anyhow::anyhow!("the entry's treasury {treasury}: {e}"))?;
-                    let head_ms = now["as_of_ms"].as_u64().context("the node's vesting reply has no as_of_ms")?;
-                    let at = head_ms.saturating_add(margin_secs.saturating_mul(1_000));
-                    let unvested = amount_field(&vesting_entry(&rpc, &id, Some(at)).await?, "unvested_now")?;
                     let base = randprotocol_core::gas::BUNDLE_BASE;
-                    anyhow::ensure!(unvested > base, "nothing left to revoke: {} RAND unvested {margin_secs} s from now", format_amount(unvested));
-                    let nonce = now["nonce"].as_u64().context("the node's vesting reply has no nonce")?;
+                    // Revoked already: the schedule has stopped, so what is left for the
+                    // treasury is fixed — sweep it exactly, no margin (STAKE-4).
+                    let revoked = !now["revoked_at"].is_null();
+                    let unvested = if revoked {
+                        let left = amount_field(&now, "unvested_now")?;
+                        anyhow::ensure!(left > base, "entry {entry} is revoked and nothing above the {} RAND base is left to sweep ({} RAND)", format_amount(base), format_amount(left));
+                        left
+                    } else {
+                        let head_ms = now["as_of_ms"].as_u64().context("the node's vesting reply has no as_of_ms")?;
+                        let at = head_ms.saturating_add(margin_secs.saturating_mul(1_000));
+                        let unvested = amount_field(&vesting_entry(&rpc, &id, Some(at)).await?, "unvested_now")?;
+                        anyhow::ensure!(unvested > base, "nothing left to revoke: {} RAND unvested {margin_secs} s from now", format_amount(unvested));
+                        unvested
+                    };
+                    let nonce = now["revoke_nonce"].as_u64().context("the node's vesting reply has no revoke_nonce")?;
                     let chain_id = rpc.chain_id().await?;
                     let genesis = rpc.genesis_hash().await?;
                     let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
@@ -1687,9 +1698,11 @@ async fn main() -> Result<()> {
                     proposal.threshold = now["threshold"].as_u64().unwrap_or(0) as u8;
                     std::fs::write(&out, serde_json::to_string_pretty(&proposal)?).with_context(|| format!("writing {}", out.display()))?;
                     println!(
-                        "prepared the revoke of entry {entry}: {} RAND unvested ({margin_secs} s margin) to the treasury {}\n  written to {}: {} of {} revokers sign it (`vesting revoke sign`), then `vesting revoke submit`, within 256 blocks of height {time}",
+                        "prepared the {} of entry {entry}: {} RAND to the treasury {}{}\n  written to {}: {} of {} revokers sign it (`vesting revoke sign`), then `vesting revoke submit`, within 256 blocks of height {time}",
+                        if revoked { "sweep" } else { "revoke" },
                         format_amount(unvested),
                         to.fingerprint(),
+                        if revoked { String::new() } else { format!(" (unvested {margin_secs} s from now; whatever the margin leaves is swept by preparing again once it lands)") },
                         out.display(),
                         proposal.threshold,
                         proposal.revokers.len(),

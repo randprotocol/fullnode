@@ -1003,11 +1003,11 @@ section — on inputs synthesised from `deploy/genesis-chain17.json`, into a tem
 `deploy/cutover-fleet-chain18.sh` (from chain 17's) is the all-stop/all-start roll;
 `deploy/chain18-bridge-steps.md` has the bridge relayer's own rebuild step.
 
-## The next cut: a `vesting` section is fit to carry (audit v6, STAKE-3)
+## The next cut: a `vesting` section is fit to carry (audit v6, STAKE-3, STAKE-4)
 
 Audit v6 (§8.13) said: put no `vesting` section in any genesis until a revoke's destination is
-pinned. It is now, so the section may ride the next cut that needs it (the v1.0 genesis, after a
-testnet rehearsal). No chain has carried one; a genesis without it hashes and behaves exactly as
+pinned. It is now — and a revoke has its own nonce and takes the whole unvested part (STAKE-4) —
+so the section may ride the next cut that needs it (the v1.0 genesis, after a testnet rehearsal). No chain has carried one; a genesis without it hashes and behaves exactly as
 before. What the cut passes, per **revocable** entry of the `--vesting` file (`docs/vesting.md`):
 
 - **`revokers`**: 1–5 distinct Dilithium2 public keys, none the beneficiary's. Use three, held
@@ -1026,7 +1026,9 @@ revoke on the testnet cut with two of the three keys on separate machines (`vest
 prepare` → `sign` ×2 → `submit`, inside 256 blocks) and open the note with the treasury wallet.
 The chain-18 cut script's vesting carry reads `rand_getVesting`'s `amount`/`claimed`/`revoked_*`
 fields, which are unchanged; a cut that carries a register forward must also carry each entry's
-`revokers`, `threshold` and `treasury`, which the genesis file holds.
+`revokers`, `threshold` and `treasury`, which the genesis file holds, and must not re-list a
+revoked entry on its old schedule (its `vested` is frozen at `revoked_at`, and what is left after
+`claimed` and `revoked_out` is the treasury's, not the holder's).
 
 ## The `staking` genesis section (v0.5.4)
 

@@ -163,8 +163,9 @@ fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
         Action::RegisterBridgedToken { nonce, .. } | Action::ListBacking { nonce, .. } => Some((Address([0; 32]), *nonce)),
         // Bridge rules v2: the bridge's `rotation_nonce`, shared by the two rotations.
         Action::RotatePqGuardians { nonce, .. } | Action::RotatePauseKey { nonce, .. } => Some((Address([0; 32]), *nonce)),
-        // Genesis vesting: the entry's nonce, which all four of its actions share — keyed on the
-        // entry's 32-byte id, kept apart from every address by `claim_key`'s role.
+        // Genesis vesting: the entry's nonce, which the beneficiary's three actions share, and
+        // the revokers' own (`Entry::revoke_nonce`, audit v6 STAKE-4) — both keyed on the entry's
+        // 32-byte id, kept apart from every address and from each other by `claim_key`'s role.
         Action::ClaimVested { entry, nonce, .. }
         | Action::RevokeVesting { entry, nonce, .. }
         | Action::BondVested { entry, nonce, .. }
@@ -221,7 +222,10 @@ fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
         Action::PauseMints { .. } | Action::UnpauseMints { .. } => 2,
         Action::RegisterBridgedToken { .. } | Action::ListBacking { .. } => 3,
         Action::RotatePqGuardians { .. } | Action::RotatePauseKey { .. } => 4,
-        Action::ClaimVested { .. } | Action::RevokeVesting { .. } | Action::BondVested { .. } | Action::UnbondVested { .. } => 5,
+        Action::ClaimVested { .. } | Action::BondVested { .. } | Action::UnbondVested { .. } => 5,
+        // STAKE-4: a revoke's nonce is the revokers' counter, so its slot is its own — a pooled
+        // claim never holds it.
+        Action::RevokeVesting { .. } => 6,
         _ => 0,
     };
     (role, claim.0, claim.1)
@@ -871,11 +875,13 @@ impl Mempool {
                 tx.action,
                 Action::ClaimVested { .. } | Action::RevokeVesting { .. } | Action::BondVested { .. } | Action::UnbondVested { .. }
             ) {
-                // Genesis vesting: the entry's nonce, which only moves forward. Never the
-                // validator lookup below — an entry id is not a validator address.
+                // Genesis vesting: the entry's nonce — the revokers' own for a revoke (STAKE-4) —
+                // which only moves forward. Never the validator lookup below — an entry id is not
+                // a validator address.
                 use randprotocol_core::ledger::vesting::VestingError;
                 let reg = ledger.vesting().ok_or(TxError::UnsupportedAction("vesting"))?;
-                match reg.get(&addr.0).map(|e| e.nonce) {
+                let is_revoke = matches!(tx.action, Action::RevokeVesting { .. });
+                match reg.get(&addr.0).map(|e| if is_revoke { e.revoke_nonce } else { e.nonce }) {
                     Some(current) if current == nonce => {}
                     Some(current) => {
                         return Err(TxError::Vesting(VestingError::BadNonce { expected: current, actual: nonce }))
@@ -1625,6 +1631,83 @@ mod tests {
         );
         m.prune(&after);
         assert_eq!(m.len(), 1, "entry 1's claim left, entry 2's stayed");
+    }
+
+    /// Audit v6, STAKE-4, the pool's half: a revoke claims the entry's *revoke* nonce, its own
+    /// slot. While claims, revokes, bonds and unbonds shared one counter — and so one pool slot —
+    /// a beneficiary who pooled a dust claim first kept the revoke out of the pool (`Conflict`),
+    /// and a claim committing first pruned a pooled revoke as stale. Now a pooled claim and a
+    /// pooled revoke of one entry sit side by side, a committed claim leaves the revoke pooled,
+    /// and only a committed revoke retires it.
+    #[test]
+    fn a_pooled_claim_does_not_hold_a_revokes_slot() {
+        use randprotocol_core::ledger::vesting::{Class, VestingConfig, VestingEntryConfig, VestingError, VestingRegister};
+        use randprotocol_core::types::actions::{claim_vested_message, revoke_vesting_message, RevokerSignature};
+        let holder = fixtures::key(40);
+        let revokers = [fixtures::key(41), fixtures::key(42), fixtures::key(43)];
+        let treasury = ShieldedAddress { pk: [7; 8], kem_ek: vec![7; randprotocol_core::notes::KEM_EK_BYTES] };
+        let rand = randprotocol_core::UNITS_PER_RAND;
+        let mut l = ledger();
+        l.set_vesting(Some(VestingRegister::from_config(&VestingConfig {
+            entries: vec![VestingEntryConfig {
+                id: [1; 32],
+                class: Class::Team,
+                beneficiary: holder.public_key().clone(),
+                revokers: revokers.iter().map(|k| k.public_key().clone()).collect(),
+                threshold: Some(2),
+                treasury: Some(treasury.to_string()),
+                amount: 10 * rand,
+                start_ms: 0,
+                cliff_ms: 0,
+                linear_ms: 100,
+                step_ms: None,
+            }],
+        })));
+        l.set_timestamp_ms(50); // half vested
+        let genesis = l.signing_domain().genesis;
+        let claim = |nonce: u64, r: u32| {
+            let to = ShieldedAddress { pk: [r; 8], kem_ek: vec![3; randprotocol_core::notes::KEM_EK_BYTES] };
+            let (time, r, envelope) = (l.height() as u32, [r; 8], fixtures::env(1));
+            let m = claim_vested_message(&genesis, l.chain_id(), &[1; 32], rand, nonce, &to, time, &r, &envelope);
+            Transaction {
+                chain_id: l.chain_id(),
+                bundle: None,
+                action: Action::ClaimVested { entry: [1; 32], amount: rand, nonce, to, time, r, envelope, signature: holder.sign(m.as_bytes()) },
+            }
+        };
+        let revoke = |amount: u64, nonce: u64, r: u32| {
+            let (time, r, envelope) = (l.height() as u32, [r; 8], fixtures::env(2));
+            let m = revoke_vesting_message(&genesis, l.chain_id(), &[1; 32], amount, nonce, &treasury, time, &r, &envelope);
+            let signatures = (0..2u8).map(|i| RevokerSignature { index: i, signature: revokers[i as usize].sign(m.as_bytes()) }).collect();
+            Transaction {
+                chain_id: l.chain_id(),
+                bundle: None,
+                action: Action::RevokeVesting { entry: [1; 32], unvested: amount, nonce, to: treasury.clone(), time, r, envelope, signatures },
+            }
+        };
+        let mut m = Mempool::new(100);
+        // The holder's dust claim is pooled first, at the entry's nonce 0 …
+        m.insert(claim(0, 1), &l, &StubExecutor).unwrap();
+        // … and the revoke, at the revokers' nonce 0, is pooled beside it.
+        let pooled = revoke(4 * rand, 0, 5);
+        m.insert(pooled.clone(), &l, &StubExecutor).expect("a pooled claim must not keep a revoke out of the pool");
+        assert_eq!(m.len(), 2);
+        // A second revoke at the same revoke nonce is the same slot.
+        assert!(matches!(m.insert(revoke(3 * rand, 0, 6), &l, &StubExecutor), Err(MempoolError::Conflict(_))));
+        // The claim commits: the entry's nonce moves, the revokers' does not — the revoke stays.
+        let mut after = l.clone();
+        after.apply_tx(&claim(0, 1), &fixtures::key(1).address(), &StubExecutor).unwrap();
+        m.prune(&after);
+        assert!(m.contains(&pooled.hash()), "a committed claim must not prune a pooled revoke");
+        assert_eq!(m.len(), 1);
+        // A revoke commits (another one, elsewhere): now the pooled one is spent.
+        after.apply_tx(&revoke(4 * rand, 0, 9), &fixtures::key(1).address(), &StubExecutor).unwrap();
+        assert_eq!(
+            Mempool::applies(&pooled, &[], claimed_nonce(&pooled.action), &after).unwrap_err(),
+            TxError::Vesting(VestingError::BadNonce { expected: 1, actual: 0 })
+        );
+        m.prune(&after);
+        assert_eq!(m.len(), 0);
     }
 
     /// The same `(validator, nonce)` claimed by an unbond and a withdraw is still one claim: the

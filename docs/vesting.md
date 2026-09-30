@@ -196,13 +196,23 @@ rand-node vesting revoke submit --proposal revoke.json --signature 0:<hex> --sig
   signer run it).
 - Fewer than `threshold` signatures, a revoker listed twice, or one bad signature among good ones
   is refused.
-- The amount is what will still be unvested 10 minutes after the head (`--margin-secs`), so the
-  revoke still fits when it lands a few blocks later; whatever vests in that margin stays the
-  holder's.
+- **The revoke takes the whole unvested part as of the block that applies it**: the schedule
+  stops there, and the holder can claim everything that had vested by then and nothing more.
+  The signed amount is what the revoke's *note* carries — `prepare` takes what will still be
+  unvested 10 minutes after the head (`--margin-secs`), so the revoke still fits when it lands a
+  few blocks later. What the margin leaves behind is not the holder's: it stays in the register as
+  the treasury's, and `prepare` on a revoked entry writes a second revoke that sweeps exactly
+  that (it is fixed now; no margin), signed and submitted the same way. Only a remainder of
+  0.001 RAND or less — the bundle base a note cannot pay — stays in the register for good.
+  (Why the note's amount must be signed: its envelope is sealed against the note, and a wallet
+  finds a note by opening the envelope and recomputing the commitment. A note whose amount the
+  chain set at apply time would be one the treasury's wallet cannot see.)
+- **The revokers have their own nonce** (`revoke_nonce` in `rand_getVesting`), which only a
+  revoke moves. A claim, bond or unbond the holder lands first — however many — cannot make a
+  signed revoke stale, and a pooled claim cannot keep a revoke out of the pool.
 - The note's `time` is the head height at `prepare`, and a note older than 256 blocks is refused:
   gather the signatures and submit within that window (about 13 minutes at 3-second blocks), or
   prepare again.
-- The entry is then frozen: the holder can claim everything that had vested, and nothing more.
 - A fully vested grant cannot be revoked; an entry without `revokers` never can.
 
 **Which entries are revocable is a choice made per entry in the genesis file.** The
@@ -215,6 +225,7 @@ and founding-partner allocations irrevocable (no `revokers`).
 |---|---|
 | each allocation's amount, class and schedule | who the holder is (only a key is visible) |
 | how much of each has been claimed, revoked, bonded | where claimed RAND goes after the claim note (shielded) |
+| when an entry was revoked, and what is left for the treasury | the treasury wallet's balance |
 | total locked / claimed per class, and the lockup table | balances of the wallets claims paid to |
 
 A claim reveals "entry X released N RAND" at that block; the receiving note is shielded, and from
@@ -227,7 +238,7 @@ matters.
 
 | method | answers |
 |---|---|
-| `rand_getVesting [id, at_ms?]` | one entry: terms (for a revocable one its `revokers`, `threshold` and `treasury`), `claimed`, `bonded`, `vested_now`, `claimable_now`, `unvested_now`, `nonce` (at the head, or at `at_ms`) |
+| `rand_getVesting [id, at_ms?]` | one entry: terms (for a revocable one its `revokers`, `threshold` and `treasury`), `claimed`, `bonded`, `vested_now`, `claimable_now`, `unvested_now` (before a revoke what one would take; after, what is left for the treasury), `locked_now`, `nonce` (the holder's), `revoke_nonce` (at the head, or at `at_ms`) |
 | `rand_getVestingSummary []` | per class: entries, amount, vested, claimed, revoked, bonded, locked — no keys, no owners |
 | `rand_getVestingSchedule [from_ms, to_ms, step_ms]` | the lockup table: the locked total at each point (≤ 1 000 points) |
 | `rand_getSupply []` | adds `vesting_issued`, `vesting_released`, `vesting_in_register`, `vesting_locked`; the identity `total_supply == issued` covers the register |
