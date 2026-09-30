@@ -164,6 +164,13 @@ pub struct Audit {
     /// … and what the vesting register itself still holds (RAND bonded from it is in the
     /// validator register's `stake`, so inside `register_total`).
     pub vesting_in_register: u64,
+    /// RPL-2, both 0 without a `program_state` section and kept off [`Supply`] for the same
+    /// layout reason: RAND that `Invoke`s have paid out of program vaults as notes (value
+    /// entering the pool, like `withdraw_deposited`) …
+    pub program_rand_out: u64,
+    /// … and what the vaults still hold. It got there through a bundle's `burn_r`, so it is
+    /// already inside [`Supply::burned`] on the pool side; this is its register-side twin.
+    pub program_rand_held: u64,
 }
 
 impl Audit {
@@ -176,6 +183,19 @@ impl Audit {
             vesting_issued: 0,
             vesting_released: 0,
             vesting_in_register: 0,
+            program_rand_out: 0,
+            program_rand_held: 0,
+        }
+    }
+
+    /// The same audit with the program vaults' RAND in it: `rand_in` is every `burn_r` an
+    /// `Invoke` deposited, `rand_out` every RAND note a vault paid.
+    pub fn with_program_vaults(self, rand_in: u64, rand_out: u64) -> Audit {
+        Audit {
+            pool_value: self.pool_value.saturating_add(rand_out),
+            program_rand_out: rand_out,
+            program_rand_held: rand_in.saturating_sub(rand_out),
+            ..self
         }
     }
 
@@ -196,7 +216,10 @@ impl Audit {
     }
 
     pub fn total_supply(&self) -> u64 {
-        self.pool_value.saturating_add(self.register_total).saturating_add(self.vesting_in_register)
+        self.pool_value
+            .saturating_add(self.register_total)
+            .saturating_add(self.vesting_in_register)
+            .saturating_add(self.program_rand_held)
     }
 
     /// Everything the chain issued is either in the pool or in the register, less what was

@@ -106,6 +106,7 @@ fn genesis_full(
         envelope_bytes: None,
         vesting: None,
         gas: None,
+        program_state: None,
         hardening_v6: None,
         hc_auth: None,
     }

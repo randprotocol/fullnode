@@ -287,7 +287,9 @@ pub fn fee_floor(action: &Action) -> u64 {
         Action::None => BUNDLE_BASE,
         // Public words are charged like code words (spec §5): the chain stores both.
         Action::Deploy { words, public, .. } => BUNDLE_BASE + deploy_fee(words.len() + public.len()),
-        Action::Call { .. } => BUNDLE_BASE + CALL_BASE,
+        // RPL-2: an invoke carries a call proof and pays a call's floor. Its cell fee is a
+        // ledger fact (`program_state::cell_fee_of`) and is added where the ledger is at hand.
+        Action::Call { .. } | Action::Invoke { .. } => BUNDLE_BASE + CALL_BASE,
         // A bond is the one staking action that rides on a bundle — the bundle is what burns the
         // stake out of the pool — so it pays the plain base like a transfer.
         Action::Bond { .. } => BUNDLE_BASE,

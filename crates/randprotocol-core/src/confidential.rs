@@ -108,6 +108,32 @@ pub trait ConfidentialExecutor: Send + Sync {
     ) -> Result<CallOutcome, ConfidentialError> {
         self.verify_call_hardened(program, proof, segment)
     }
+    /// RPL-2 (`docs/superpowers/specs/2026-09-30-rpl2-program-state-design.md` §5): verify an
+    /// `Invoke`'s call proof. [`Self::verify_call_hardened`] with one rule relaxed — `segment` is
+    /// `public ‖ call_binding ‖ context`, longer than a call's by the transition's context words,
+    /// and must still sit in the public table a hardened call to `program` is proved over
+    /// ([`crate::ledger::program_state::segment_fits`], which the ledger has already held it
+    /// to). Every other pin — tier, program height, input height, the hash tables, the floored
+    /// program table — is a hardened call's, whether or not the chain sets `hardening_v6`: an
+    /// invoke is always bound to its transaction. The default refuses, as the hardened rule's
+    /// does.
+    fn verify_invoke(
+        &self,
+        _program: &ProgramRecord,
+        _proof: &[u8],
+        _segment: &[u32],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        Err(ConfidentialError::InvalidProof("this executor does not implement the RPL-2 invoke rules".into()))
+    }
+    /// [`Self::decode_call_hardened`]'s twin for [`Self::verify_invoke`]. Defaults to the full verify.
+    fn decode_invoke(
+        &self,
+        program: &ProgramRecord,
+        proof: &[u8],
+        segment: &[u32],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.verify_invoke(program, proof, segment)
+    }
     /// Precompute whatever makes `verify_call` fast for `program` (the zkVM verifier key,
     /// ~2 s). Called from a background task after a deploy commits and at startup; may be a no-op.
     fn warm(&self, _program: &ProgramRecord) {}
@@ -402,6 +428,7 @@ impl StubExecutor {
         program: &ProgramRecord,
         proof: &[u8],
         segment: Option<&[u32]>,
+        invoke: bool,
     ) -> Result<CallOutcome, ConfidentialError> {
         if proof.len() != STUB_LEN || &proof[..4] != STUB_MARKER {
             return Err(ConfidentialError::MalformedProof);
@@ -418,7 +445,18 @@ impl StubExecutor {
         let h_in = word8_from_bytes(&proof[37..69]).expect("32 bytes");
         let h_pub = word8_from_bytes(&proof[69..101]).expect("32 bytes");
         let want = match (program.public_digest, segment) {
-            (_, Some(s)) if s.len() != program.public_len as usize + TX_BINDING_WORDS => {
+            (_, Some(s)) if !invoke && s.len() != program.public_len as usize + TX_BINDING_WORDS => {
+                return Err(ConfidentialError::InvalidProof("PublicValues".into()));
+            }
+            // RPL-2: an invoke's segment is a call's plus the context, within the same table.
+            (_, Some(s))
+                if invoke
+                    && (s.len() < program.public_len as usize + TX_BINDING_WORDS
+                        || !crate::ledger::program_state::segment_fits(
+                            program.public_len as usize,
+                            s.len() - program.public_len as usize - TX_BINDING_WORDS,
+                        )) =>
+            {
                 return Err(ConfidentialError::InvalidProof("PublicValues".into()));
             }
             (_, Some(s)) => self.public_digest(s),
@@ -455,7 +493,7 @@ impl ConfidentialExecutor for StubExecutor {
     }
 
     fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
-        self.verify_stub_call(program, proof, None)
+        self.verify_stub_call(program, proof, None, false)
     }
 
     /// The stub's INT-4 rule, as the zkVM's: the segment's digest, `public ‖ call_binding`, where
@@ -467,7 +505,18 @@ impl ConfidentialExecutor for StubExecutor {
         proof: &[u8],
         segment: &[u32],
     ) -> Result<CallOutcome, ConfidentialError> {
-        self.verify_stub_call(program, proof, Some(segment))
+        self.verify_stub_call(program, proof, Some(segment), false)
+    }
+
+    /// The stub's RPL-2 rule: the segment's digest, `public ‖ call_binding ‖ context`
+    /// (`make_proof_with_public(.., &segment)` makes such a proof).
+    fn verify_invoke(
+        &self,
+        program: &ProgramRecord,
+        proof: &[u8],
+        segment: &[u32],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.verify_stub_call(program, proof, Some(segment), true)
     }
 
     /// A blake3 stand-in for `H_PUB`, length-prefixed like the real one's header, so the empty

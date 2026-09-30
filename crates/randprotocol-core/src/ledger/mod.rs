@@ -12,6 +12,7 @@ pub mod aggregation;
 pub mod bridge_gov;
 pub mod bridge_notes;
 pub mod call_envelope;
+pub mod program_state;
 pub mod staking;
 pub mod supply;
 pub mod tokens;
@@ -323,6 +324,11 @@ pub enum TxError {
     /// Phase S2: a `Bond`, `Unbond` or `Withdraw` the register refused (see [`StakingError`]).
     #[error("vesting: {0}")]
     Vesting(#[from] vesting::VestingError),
+    /// RPL-2: an `Invoke` the program-state module refused (see
+    /// [`program_state::ProgramStateError`]) — the gate itself, a malformed transition, a cell
+    /// that is no longer what the transition read, a vault that cannot pay.
+    #[error("program state: {0}")]
+    ProgramState(#[from] program_state::ProgramStateError),
     #[error("staking: {0}")]
     Staking(#[from] StakingError),
     /// Block aggregation: a register action or aggregate the aggregation module refused (see
@@ -527,8 +533,9 @@ pub fn non_canonical_proofs(tx: &Transaction, check: &dyn Fn(&[u8]) -> Option<St
 /// HB-3: the most commitment-tree leaves one transaction can append — a bundle's four slots and
 /// at most one note the ledger derives itself (a `Withdraw` or `BridgeAttest` deposit, a faucet
 /// `Mint`, a `TokenMint` or `RegisterToken` initial mint, a vesting claim or revoke, an aggregate
-/// payout). `validate_inner` refuses a transaction when the tree has fewer left.
-pub const MAX_LEAVES_PER_TX: u64 = crate::notes::BUNDLE_SLOTS as u64 + 1;
+/// payout) — or, for an RPL-2 `Invoke`, the up to [`program_state::MAX_PAYOUTS`] notes its
+/// transition pays out. `validate_inner` refuses a transaction when the tree has fewer left.
+pub const MAX_LEAVES_PER_TX: u64 = crate::notes::BUNDLE_SLOTS as u64 + program_state::MAX_PAYOUTS as u64;
 
 fn has_duplicate(words: &[Word8]) -> bool {
     words.iter().enumerate().any(|(i, w)| words[i + 1..].contains(w))
@@ -594,6 +601,10 @@ pub struct Ledger {
     /// Genesis vesting (`vesting.rs`): the register a genesis `vesting` section seeds, `None`
     /// without one. Consensus state, in the state root (`rand-state-6`), persisted whole.
     vesting: Option<vesting::VestingRegister>,
+    /// RPL-2 (`program_state.rs`): every program's cells and vault balances, `None` on a chain
+    /// whose genesis has no `program_state` section. Consensus state, in the state root
+    /// (`rand-state-8`), persisted whole.
+    program_state: Option<program_state::ProgramState>,
     /// Σ of every registration fee burned under `tokens.burn_registration_fee` (audit v5,
     /// TOK-2). A supply counter in kind — derived, outside the state root and this ledger's
     /// equality, persisted beside `META_SUPPLY` and replay-audited — kept off [`Supply`] so
@@ -739,6 +750,10 @@ impl PartialEq for Ledger {
             // The vesting register: consensus state under its section, `None` on both sides
             // without one.
             && self.vesting == o.vesting
+            // Program state (RPL-2): consensus state under its section, `None` on both sides
+            // without one. Its two RAND counters are audit state and compared with it; a
+            // rebuilt ledger restores the whole blob, counters included.
+            && self.program_state == o.program_state
             // The live gas prices (Phase 2): consensus state under `gas.dynamic`, compared by
             // effective value so a restored `Some(section prices)` equals an unmoved `None`.
             && self.gas_prices() == o.gas_prices()
@@ -780,6 +795,7 @@ impl Ledger {
             faucet_minted_in_epoch: 0,
             bond_queue: Vec::new(),
             vesting: None,
+            program_state: None,
             registration_fees_burned: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
@@ -838,6 +854,7 @@ impl Ledger {
             faucet_minted_in_epoch: 0,
             bond_queue: Vec::new(),
             vesting: None,
+            program_state: None,
             registration_fees_burned: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
@@ -1053,10 +1070,44 @@ impl Ledger {
             register_total(&self.validators).saturating_add(supply::aggregators_total(&self.aggregators)),
             self.registration_fees_burned,
         );
-        match &self.vesting {
+        let audit = match &self.vesting {
             Some(v) => audit.with_vesting(v.issued(), v.released, v.in_register()),
             None => audit,
+        };
+        match &self.program_state {
+            Some(p) => audit.with_program_vaults(p.rand_in, p.rand_out),
+            None => audit,
         }
+    }
+
+    /// Program state (RPL-2), `None` on a chain without the section.
+    pub fn program_state(&self) -> Option<&program_state::ProgramState> {
+        self.program_state.as_ref()
+    }
+
+    /// Install it: genesis from its section, a reloading node from what it persisted.
+    pub fn set_program_state(&mut self, p: Option<program_state::ProgramState>) {
+        self.program_state = p;
+    }
+
+    pub(crate) fn program_state_mut(&mut self) -> Option<&mut program_state::ProgramState> {
+        self.program_state.as_mut()
+    }
+
+    /// The public segment an `Invoke`'s call proof is made over and verified against (RPL-2,
+    /// spec §5): the program's deploy-time public words, this transaction's
+    /// [`Transaction::call_binding`], then the transition's context with the bundle's three burn
+    /// fields. Built from the transaction alone — never from this ledger's cells — so a proof's
+    /// verdict is a function of the transaction's bytes. `None` for any other action or a
+    /// bundle-less transaction.
+    pub fn invoke_segment(&self, record: &ProgramRecord, tx: &Transaction) -> Option<Vec<u32>> {
+        let Action::Invoke { transition, .. } = &tx.action else { return None };
+        let b = tx.bundle.as_ref()?;
+        Some(program_state::invoke_segment(
+            self.program_public(&record.id).unwrap_or(&[]),
+            &tx.call_binding(),
+            &transition.context(b.burn_r, b.burn_asset, b.burn_a),
+        ))
     }
 
     /// The vesting register (genesis vesting), `None` on a chain without the section.
@@ -1604,8 +1655,11 @@ impl Ledger {
                 no_asset_burn(b)?;
                 aggregation::check_burn(self, b.burn_r)?;
             }
-            // Their module's rule, after their module's gate (see the doc comment).
-            Action::TokenBurn { .. } | Action::BridgeBurn { .. } => {}
+            // Their module's rule, after their module's gate (see the doc comment). An RPL-2
+            // `Invoke` may set all three: `burn_r` and `burn_a` are what comes into the program's
+            // vault (or, for the program's own token, what is destroyed), and
+            // `program_state::validate` decides which.
+            Action::TokenBurn { .. } | Action::BridgeBurn { .. } | Action::Invoke { .. } => {}
             _ => {
                 no_asset_burn(b)?;
                 if b.burn_r != 0 {
@@ -1850,6 +1904,17 @@ impl Ledger {
             | Action::ClaimVested { envelope, .. }
             | Action::RevokeVesting { envelope, .. } => self.check_note_envelope(envelope)?,
             Action::RegisterToken { initial: Some(m), .. } => self.check_note_envelope(&m.envelope)?,
+            // RPL-2: every note a transition pays out carries a note envelope. The count is
+            // capped first, so a transaction cannot buy unbounded envelope checks.
+            Action::Invoke { transition, .. } => {
+                let payouts = transition.pays.len() + transition.mints.len();
+                if payouts > program_state::MAX_PAYOUTS {
+                    return Err(program_state::ProgramStateError::TooManyPayouts(payouts).into());
+                }
+                for p in transition.payouts() {
+                    self.check_note_envelope(&p.envelope)?;
+                }
+            }
             _ => {}
         }
         match &tx.action {
@@ -1859,7 +1924,9 @@ impl Ledger {
             Action::Deploy { public, .. } if public.len() > self.max_program_public_words => {
                 return Err(TxError::ProgramPublicTooLarge)
             }
-            Action::Call { proof, .. } if proof.len() > self.max_proof_bytes => return Err(TxError::ProofTooLarge),
+            Action::Call { proof, .. } | Action::Invoke { proof, .. } if proof.len() > self.max_proof_bytes => {
+                return Err(TxError::ProofTooLarge)
+            }
             Action::BridgeAttest { attestation, .. } if attestation.len() > gas::MAX_ATTESTATION_BYTES => {
                 return Err(TxError::AttestationTooLarge)
             }
@@ -1896,7 +1963,7 @@ impl Ledger {
             // `CALL_BASE` in that role). Every other action, and every chain without the
             // section, keeps `fee_floor`.
             let min = match &tx.action {
-                Action::Call { proof, input_envelope, .. } => self
+                Action::Call { proof, input_envelope, .. } | Action::Invoke { proof, input_envelope, .. } => self
                     .gas_call_floor(1, gas::call_bytes(proof, input_envelope.as_ref()))
                     .unwrap_or_else(|| gas::fee_floor(&tx.action)),
                 _ => gas::fee_floor(&tx.action),
@@ -2014,6 +2081,23 @@ impl Ledger {
                 call_envelope::validate(input_envelope, self.max_call_envelope_bytes)?;
                 call_record = Some(self.programs.get(program).ok_or(TxError::UnknownProgram(*program))?);
             }
+            // RPL-2. Gated absolutely on the `program_state` genesis section, which
+            // `program_state::validate` checks before anything else it does; then the
+            // transition's own rules, the vault, the cells read and the payout notes. The cell
+            // fee is decided here, before either proof: it is a ledger fact like a registration
+            // fee, and a transaction that cannot pay it buys no verification.
+            a @ Action::Invoke { program, input_envelope, .. } => {
+                if !self.confidential {
+                    return Err(TxError::ConfidentialDisabled);
+                }
+                call_envelope::validate(input_envelope, self.max_call_envelope_bytes)?;
+                program_state::validate(self, tx, a, executor)?;
+                let min = gas::BUNDLE_BASE.saturating_add(program_state::cell_fee_of(self, a));
+                if tx.fee() < min {
+                    return Err(TxError::FeeTooLow { min, fee: tx.fee() });
+                }
+                call_record = Some(self.programs.get(program).ok_or(TxError::UnknownProgram(*program))?);
+            }
             a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. }) => {
                 staking::validate(self, tx, a, executor)?;
             }
@@ -2081,7 +2165,9 @@ impl Ledger {
         }
         // 10. the call's own proof, then its fee: the tier's, and the byte term for proof and
         // envelope bytes past the free allowance (spec §7)
-        if let (Some(record), Action::Call { proof, input_envelope, .. }) = (call_record, &tx.action) {
+        if let (Some(record), Action::Call { proof, input_envelope, .. } | Action::Invoke { proof, input_envelope, .. }) =
+            (call_record, &tx.action)
+        {
             // B5: on a verified-set hit the proof is decoded, not verified — admission's
             // `verify_call` over these same bytes already ran, and the outcome the tier's fee
             // floor and the receipt are read from is the one it computed.
@@ -2095,21 +2181,35 @@ impl Ledger {
             // its segment is `public ‖ call_binding`, the words this ledger kept at deploy
             // (`hardened_call_segment`). Before, it kept its recorded digest alone and a copy of the
             // proof verified under any fee bundle.
-            let segment = if self.hardening_v6 { self.hardened_call_segment(record, &tx.call_binding()) } else { Vec::new() };
-            let outcome = match (self.hardening_v6, admitted) {
-                (true, true) => executor.decode_call_hardened(record, proof, &segment),
-                (true, false) => executor.verify_call_hardened(record, proof, &segment),
-                (false, true) => executor.decode_call(record, proof),
-                (false, false) => executor.verify_call(record, proof),
+            //
+            // RPL-2: an `Invoke`'s segment is `public ‖ call_binding ‖ context` (`invoke_segment`),
+            // built from the transaction alone, so the verified set's verdict stands for it as it
+            // does for a call: what depends on this ledger's state — the cells read — was compared
+            // in step 7 and is never inside the proof's verdict.
+            let outcome = match self.invoke_segment(record, tx) {
+                Some(segment) if admitted => executor.decode_invoke(record, proof, &segment),
+                Some(segment) => executor.verify_invoke(record, proof, &segment),
+                None => {
+                    let segment =
+                        if self.hardening_v6 { self.hardened_call_segment(record, &tx.call_binding()) } else { Vec::new() };
+                    match (self.hardening_v6, admitted) {
+                        (true, true) => executor.decode_call_hardened(record, proof, &segment),
+                        (true, false) => executor.verify_call_hardened(record, proof, &segment),
+                        (false, true) => executor.decode_call(record, proof),
+                        (false, false) => executor.verify_call(record, proof),
+                    }
+                }
             }
             .map_err(TxError::InvalidProof)?;
             let bytes = gas::call_bytes(proof, input_envelope.as_ref());
             // Spec §4.2 (cs8): under the `gas` section the declared limit at the prices in force
             // plus the bytes — the tier floor is gone on such a chain. Without the section, the
             // tier schedule byte for byte.
+            // An invoke adds its cell fee (zero for a call, and for an invoke that creates no cell).
             let min = self
                 .gas_call_floor(outcome.gas_limit, bytes)
-                .unwrap_or_else(|| gas::BUNDLE_BASE + gas::call_fee(outcome.tier, bytes));
+                .unwrap_or_else(|| gas::BUNDLE_BASE + gas::call_fee(outcome.tier, bytes))
+                .saturating_add(program_state::cell_fee_of(self, &tx.action));
             let fee = tx.fee();
             if fee < min {
                 return Err(TxError::FeeTooLow { min, fee });
@@ -2249,7 +2349,12 @@ impl Ledger {
                     );
                 }
             }
-            Action::Call { program, input_envelope, .. } => {
+            Action::Call { program, input_envelope, .. } | Action::Invoke { program, input_envelope, .. } => {
+                // RPL-2: the transition first — vault, supplies, cells, payout notes — then the
+                // receipt, which is a call's. Every refusal was decided by `validate_inner`.
+                if let a @ Action::Invoke { .. } = &tx.action {
+                    program_state::apply(self, tx, a, executor)?;
+                }
                 let o = verified.call.expect("validate_inner returns the outcome for calls");
                 receipt = Some(CallReceiptData {
                     program: *program,
@@ -2667,8 +2772,12 @@ impl Ledger {
             Some(v) => format!("{:?}", v.root()),
             None => "none".into(),
         };
+        let pstate = match &self.program_state {
+            Some(p) => format!("{:?}", p.root()),
+            None => "none".into(),
+        };
         format!(
-            "tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} tokens {tok} aggregators {agg} vesting {vest} gas prices {:?}",
+            "tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} tokens {tok} aggregators {agg} vesting {vest} gas prices {:?} program state {pstate}",
             self.tree.root(),
             self.gas_prices()
         )
@@ -2759,10 +2868,20 @@ impl Ledger {
         // Phase 2 (spec §7.1): the live gas prices after everything else, big-endian, re-domained
         // `rand-state-7`. Only under `gas.dynamic`: a fixed-price section (or none) keeps its
         // domain and bytes, since those prices never move.
-        if self.gas.as_ref().is_some_and(|g| g.dynamic.is_some()) {
+        let dynamic = self.gas.as_ref().is_some_and(|g| g.dynamic.is_some());
+        if dynamic {
             let p = self.gas_prices();
             buf.extend_from_slice(&p.gas_price.to_be_bytes());
             buf.extend_from_slice(&p.byte_price.to_be_bytes());
+        }
+        // RPL-2: the program-state root after everything else, the live gas prices included,
+        // re-domained `rand-state-8`. Only under the `program_state` section, so every chain
+        // without one keeps its domain and bytes.
+        if let Some(p) = &self.program_state {
+            buf.extend_from_slice(p.root().as_bytes());
+            return Hash::digest_domain(b"rand-state-8", &buf);
+        }
+        if dynamic {
             return Hash::digest_domain(b"rand-state-7", &buf);
         }
         if self.vesting.is_some() {

@@ -1044,6 +1044,7 @@ async fn main() -> Result<()> {
                 // The gas section: absent unless `--gas-price` is given, so a genesis cut
                 // without it hashes byte-for-byte as before.
                 gas,
+                program_state: None,
             };
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
@@ -2620,6 +2621,7 @@ mod tests {
             staking: None,
             vesting: None,
             gas: None,
+            program_state: None,
         }
     }
 

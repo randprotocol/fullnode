@@ -1287,6 +1287,15 @@ pub(super) fn validate(
             // the bridge or a program is supposed to own.
             match authority {
                 MintAuthority::None | MintAuthority::Key(_) => {}
+                // RPL-2: under the `program_state` section a token may name a program as its
+                // authority — that program's `Invoke`s are then the only thing that mints or
+                // burns it. Its supply starts at zero: an initial mint would be units the
+                // program never issued. Without the section it stays refused, as it always was.
+                MintAuthority::Program(_) if ledger.program_state().is_some() => {
+                    if initial.is_some() {
+                        return Err(TokenError::AuthorityNotAllowed.into());
+                    }
+                }
                 MintAuthority::Bridge { .. } | MintAuthority::Program(_) => {
                     return Err(TokenError::AuthorityNotAllowed.into())
                 }

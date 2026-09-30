@@ -133,6 +133,7 @@ fn zusd_genesis(validators: &[randprotocol_core::Keypair]) -> Genesis {
         staking: None,
         vesting: None,
         gas: None,
+        program_state: None,
     }
 }
 

@@ -434,6 +434,14 @@ pub struct Genesis {
     /// (`TxError::BundleGasLimit`) and, under `dynamic`, the per-block price controller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gas: Option<gas::GasConfig>,
+    /// RPL-2 (design 2026-09-30): program state, program vaults and the `Invoke` action. Present,
+    /// it switches on the `program_state` ledger module with an empty state, lets a token name a
+    /// program as its mint authority, appends the program-state root to the state root
+    /// (`rand-state-8`) and is bound into the genesis hash last, after `gas`. It requires
+    /// `tokens`, `gas`, `hardening_v6` and `hc_auth`. Absent — every chain cut before it — the
+    /// genesis hashes byte-for-byte as before and every `Invoke` is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_state: Option<crate::ledger::program_state::ProgramStateConfig>,
 }
 
 fn default_true() -> bool {
@@ -504,6 +512,9 @@ pub enum GenesisError {
     /// The `gas` section breaks one of `GasConfig::check`'s rules.
     #[error("bad gas config: {0}")]
     Gas(String),
+    /// The `program_state` section is out of bounds, or a section it depends on is missing.
+    #[error("bad program_state config: {0}")]
+    BadProgramState(String),
     /// Controller ruling (task B6): the byte price is driven by Σ `encoded_len` over a block as
     /// served, and a pruned bundle's marker form encodes shorter than its raw form, so a sealed-form
     /// sync would compute another price and fail the state root.
@@ -766,6 +777,25 @@ impl Genesis {
         if let Some(v) = &self.vesting {
             v.check().map_err(GenesisError::BadVesting)?;
         }
+        // RPL-2: the section's own bound, then what it stands on. An invoke pays into a vault
+        // through the token-aware bundle and mints registry tokens (`tokens`); its proof is a
+        // call proof priced by gas (`gas`) and always bound to its transaction, under the
+        // hardened call rules (`hardening_v6`); and every chain that has those runs the v3
+        // bundle guest with split authorisation (`hc_auth`).
+        if let Some(p) = &self.program_state {
+            p.check().map_err(GenesisError::BadProgramState)?;
+            for (on, name) in [
+                (self.tokens.is_some(), "tokens"),
+                (self.gas.is_some(), "gas"),
+                (self.hardening_v6 == Some(true), "hardening_v6"),
+                (self.hc_auth.is_some(), "hc_auth"),
+                (self.confidential, "confidential"),
+            ] {
+                if !on {
+                    return Err(GenesisError::BadProgramState(format!("program_state needs `{name}`")));
+                }
+            }
+        }
         if let Some(g) = &self.gas {
             let max_block_bytes = self.max_block_bytes.map_or(gas::MAX_BLOCK_BYTES, |n| n as usize);
             g.check(max_block_bytes).map_err(GenesisError::Gas)?;
@@ -977,6 +1007,11 @@ impl Genesis {
             let vested = v.check().map_err(GenesisError::BadVesting)?;
             deposited.checked_add(staked).and_then(|t| t.checked_add(vested)).ok_or(GenesisError::SupplyOverflow)?;
             ledger.set_vesting(Some(crate::ledger::vesting::VestingRegister::from_config(v)));
+        }
+        // RPL-2: an empty program state under the section. No value is seeded — a vault fills
+        // only through an `Invoke`'s bundle — so the supply check above is unaffected.
+        if let Some(p) = &self.program_state {
+            ledger.set_program_state(Some(crate::ledger::program_state::ProgramState::from_config(p)));
         }
         // Replaces the empty-tree root `Ledger::new` recorded, so the only anchor a chain
         // starts with is the root the deposit notes leave behind.
@@ -1200,6 +1235,12 @@ impl Genesis {
         // genesis cut before it hashes byte-for-byte as before.
         if let Some(g) = &self.gas {
             commit.extend_from_slice(&gas_commit(g));
+        }
+        // RPL-2, last: tagged, and only when the file has the section, so every genesis cut
+        // before it hashes byte-for-byte as before. One fixed-width field.
+        if let Some(p) = &self.program_state {
+            commit.extend_from_slice(b"program_state");
+            commit.extend_from_slice(&p.cell_fee.to_be_bytes());
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -1610,6 +1651,7 @@ mod tests {
             hardening_v6: None,
             hc_auth: None,
             gas: None,
+            program_state: None,
         }
     }
 
@@ -2978,6 +3020,79 @@ mod tests {
         let mut bad = plain.clone();
         bad.hc_auth = Some("not hex".into());
         assert!(matches!(bad.build(&StubExecutor), Err(GenesisError::BadHcAuth(_))));
+    }
+
+    /// A genesis every section `program_state` stands on is switched on in: `tokens`, a fixed
+    /// `gas` section, `hardening_v6` and `hc_auth`, with a block big enough for three proofs.
+    fn rpl2_ready() -> Genesis {
+        let mut g = genesis(1);
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None });
+        g.max_block_bytes = Some(20 << 20);
+        g.gas = Some(gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: gas::bundle_gas_limit_pin(),
+            metering: gas::GasMetering::Circuit,
+            dynamic: None,
+        });
+        g.hardening_v6 = Some(true);
+        g.hc_auth = Some(word8_to_hex(&[21; 8]));
+        // A chain with a `tokens` section opens every genesis note; these tests need none.
+        g.alloc.clear();
+        g
+    }
+
+    /// RPL-2: the `program_state` section switches the ledger's program state on, empty, and is
+    /// bound into the hash and the state root only when present. It needs the four sections it
+    /// stands on, and its one parameter is bounded.
+    #[test]
+    fn a_program_state_section_is_committed_only_when_present_and_needs_what_it_stands_on() {
+        use crate::ledger::program_state::{ProgramStateConfig, MAX_CELL_FEE};
+        let plain = rpl2_ready();
+        assert!(!plain.to_json().contains("program_state"), "an absent section is absent from the file");
+        let bare = build(&plain);
+        assert!(bare.ledger.program_state().is_none());
+
+        let mut on = plain.clone();
+        on.program_state = Some(ProgramStateConfig { cell_fee: 10_000_000 });
+        let g = build(&on);
+        let state = g.ledger.program_state().expect("the section seeds an empty program state");
+        assert_eq!((state.cell_fee, state.cell_count(), state.rand_held()), (10_000_000, 0, 0));
+        assert_ne!(g.hash(), bare.hash(), "the section is a different chain");
+        assert_ne!(g.ledger.state_root(), bare.ledger.state_root(), "and its root is in the state root");
+        assert!(g.ledger.audit().invariant_holds() == bare.ledger.audit().invariant_holds(), "no value is seeded");
+        let mut dearer = on.clone();
+        dearer.program_state = Some(ProgramStateConfig { cell_fee: 10_000_001 });
+        assert_ne!(build(&dearer).hash(), g.hash(), "the cell fee is bound");
+        assert_eq!(build(&dearer).ledger.state_root(), g.ledger.state_root(), "a parameter, not state");
+        assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "it round-trips");
+        assert!(Genesis::from_json(&on.to_json().replace("\"cell_fee\"", "\"cell_fees\"")).is_err(), "a stray key is refused");
+
+        // What it stands on, one missing at a time.
+        type Drop = fn(&mut Genesis);
+        let drops: [(&str, Drop); 4] = [
+            ("tokens", |g| g.tokens = None),
+            ("gas", |g| g.gas = None),
+            ("hardening_v6", |g| g.hardening_v6 = None),
+            ("hc_auth", |g| g.hc_auth = None),
+        ];
+        for (name, drop) in drops {
+            let mut g = on.clone();
+            drop(&mut g);
+            match g.build(&StubExecutor) {
+                Err(GenesisError::BadProgramState(why)) => assert!(why.contains(name), "{name}: {why}"),
+                other => panic!("{name}: {:?}", other.map(|s| s.hash())),
+            }
+        }
+        let mut off = on.clone();
+        off.confidential = false;
+        assert!(matches!(off.build(&StubExecutor), Err(GenesisError::BadProgramState(_))));
+        let mut over = on.clone();
+        over.program_state = Some(ProgramStateConfig { cell_fee: MAX_CELL_FEE + 1 });
+        assert!(matches!(over.build(&StubExecutor), Err(GenesisError::BadProgramState(_))));
+        let mut edge = on;
+        edge.program_state = Some(ProgramStateConfig { cell_fee: MAX_CELL_FEE });
+        edge.build(&StubExecutor).unwrap();
     }
 
     /// Split authorisation (review I-1): a v3 `Call` carries three proofs — bundle, auth, call —

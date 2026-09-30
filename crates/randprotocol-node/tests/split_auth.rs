@@ -64,6 +64,7 @@ fn genesis_v3(validator: &Keypair) -> Genesis {
         hardening_v6: None,
         hc_auth: Some(word8_to_hex(&ZkExecutor::hc_auth())),
         gas: None,
+        program_state: None,
     }
 }
 
