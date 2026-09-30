@@ -272,6 +272,12 @@ pub struct NodeStatus {
     /// The auth guest (split authorisation) the genesis pins as `hc_auth`, `null` on a chain
     /// without it. Set, every bundle carries an auth proof against it and `hc_bundle` is v3.
     pub hc_auth: Option<String>,
+    /// BIND-1 (audit v6): the genesis `binding_domain` — `0` where transaction bindings and
+    /// signed action messages bind the chain id alone (chains 14 to 19), `1` where they carry the
+    /// genesis hash. Informational: a wallet decides by chain id and its own store's genesis
+    /// hash, never by this field alone (`randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS`).
+    #[serde(default)]
+    pub binding_domain: u32,
     pub address: Option<String>,
     pub peer_id: String,
     /// The aggregation section (spec §8): the register's size, the coverable bundles the
@@ -725,6 +731,13 @@ pub struct ChainLimits {
     /// costs (`equivocation_bps` of the stake, `jail_epochs` out of the set; 0 = for good) —
     /// `null` on a chain without it, where nothing is at stake.
     pub slashing: Option<randprotocol_core::ledger::SlashingConfig>,
+    /// BIND-1 (audit v6): the genesis `binding_domain`, `0` or `1` — whether this chain's
+    /// transaction bindings and signed action messages carry the genesis hash
+    /// (`randprotocol_core::BindingDomain`). A node's unauthenticated word, like every field
+    /// here: a wallet uses it only to refuse early, with a reason, a chain it could not transact
+    /// on; which binding it proves is decided by the transaction's own chain id
+    /// (`randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS`).
+    pub binding_domain: u32,
 }
 
 impl ChainLimits {
@@ -749,6 +762,7 @@ impl ChainLimits {
             admission_by_vote: ledger.staking().is_some_and(|s| s.admission_by_vote()),
             testnet: ledger.testnet(),
             slashing: ledger.staking().and_then(|s| s.slashing),
+            binding_domain: ledger.binding_domain().version(),
         };
         if let Some(g) = ledger.gas() {
             let prices = ledger.gas_prices();
@@ -4227,6 +4241,7 @@ mod tests {
                 "admission_by_vote": false,
                 "testnet": false,
                 "slashing": null,
+                "binding_domain": 0,
             })
         );
         let gs = raised_genesis();
@@ -4253,6 +4268,7 @@ mod tests {
                 "admission_by_vote": false,
                 "testnet": false,
                 "slashing": null,
+                "binding_domain": 0,
             })
         );
         // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
@@ -4281,6 +4297,7 @@ mod tests {
                 "admission_by_vote": false,
                 "testnet": false,
                 "slashing": null,
+                "binding_domain": 0,
             })
         );
         // The v0.6 switch: what a wallet reads to prove its calls over the call binding (INT-4).
@@ -4293,6 +4310,12 @@ mod tests {
         gs.ledger.set_hc_auth(Some([7; 8]));
         let (_d, st) = state_for(&gs);
         assert_eq!(ok(&st, "rand_getLimits", json!([])).await["hc_auth"], json!(word8_to_hex(&[7; 8])));
+        // BIND-1: the genesis `binding_domain`, so a wallet can refuse early a chain whose ledger
+        // would refuse the form it signs; `0` on every chain without the field (above).
+        let mut gs = raised_genesis();
+        gs.ledger.set_binding_domain(randprotocol_core::BindingDomain::Genesis(gs.hash()));
+        let (_d, st) = state_for(&gs);
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["binding_domain"], json!(1));
     }
 
     /// Spec 2026-09-28 §8: a node with a gas policy announces it; review focus 3: zero prices
@@ -4629,6 +4652,7 @@ mod tests {
         assert_eq!(v["tree_root"], word8_to_hex(&st.storage.tree().unwrap().root()));
         assert_eq!(v["hc_bundle"], word8_to_hex(&fixtures::HC));
         assert!(v["hc_auth"].is_null(), "present, null without split authorisation");
+        assert_eq!(v["binding_domain"], 0, "BIND-1: present, 0 without the genesis field");
         // Written by the node loop's publish_status, which these tests don't run: zero here, and
         // present — an operator must be able to see the node is holding keys at all.
         assert_eq!(v["viewing_keys"], 0);

@@ -3493,6 +3493,7 @@ pub(crate) mod fixtures {
             vesting: None,
             gas: None,
             testnet: None,
+            binding_domain: None,
             hardening_v6: None,
             hc_auth: None,
         }
@@ -3608,6 +3609,7 @@ pub(crate) mod fixtures {
             gas: None,
             // Audit v6, STAKE-2: a faucet beside a bridge needs the marker on a new chain id.
             testnet: Some(true),
+            binding_domain: None,
             hardening_v6: None,
             hc_auth: None,
         }
@@ -4045,7 +4047,7 @@ pub(crate) mod fixtures {
         use randprotocol_core::types::pv;
         let bundle = tx.bundle.as_ref().expect("a bundle-carrying transaction");
         let digest = StubExecutor.bundle_digest(&bundle.digest_input());
-        let hpub = StubExecutor.public_digest(&tx.binding());
+        let hpub = StubExecutor.public_digest(&tx.binding(&randprotocol_core::BindingDomain::ChainId));
         let mut public_values = [0u64; pv::NUM];
         public_values[pv::TIER] = 14;
         for k in 0..8 {
@@ -7454,7 +7456,7 @@ mod seal_tests {
         let mut public_values = vec![0u64; pv::NUM];
         public_values[pv::TIER] = 14;
         // The covered proof's H_PUB is its transaction's binding (INTERFACE-6 checks it).
-        let hpub = StubExecutor.public_digest(&raw.binding());
+        let hpub = StubExecutor.public_digest(&raw.binding(&randprotocol_core::BindingDomain::ChainId));
         for k in 0..8 {
             public_values[pv::OUT0 + k] = digest[k] as u64;
             public_values[pv::PUB0 + k] = hpub[k] as u64;

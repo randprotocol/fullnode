@@ -49,6 +49,7 @@ fn genesis(validator: &Keypair) -> Genesis {
         hc_auth: None,
         gas: None,
         testnet: None,
+        binding_domain: None,
     }
 }
 

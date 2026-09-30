@@ -837,7 +837,7 @@ pub fn call_pricing(
     // a program's deploy-time public words, then the binding — issue #55), so a program with a
     // public input decodes here too.
     let outcome = if ledger.hardening_v6() {
-        executor.decode_call_hardened(record, proof, &ledger.hardened_call_segment(record, &tx.call_binding()))
+        executor.decode_call_hardened(record, proof, &ledger.hardened_call_segment(record, &tx.call_binding(ledger.binding_domain())))
     } else {
         executor.decode_call(record, proof)
     }

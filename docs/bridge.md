@@ -1087,6 +1087,36 @@ response needs to be immediate.
 `tx_json` renders them as `rotate_pq_guardians` (`new_pq_guardians` hex, `nonce`, `pq_signers`)
 and `rotate_pause_key` (`new_pause_key` hex, `nonce`, `pq_signers`) — `docs/rpc.md`.
 
+#### BIND-1 (audit v6): the governance messages under genesis `binding_domain: 1`
+
+On a chain whose top-level genesis sets `binding_domain: 1` (`docs/deploy.md`, "The next cut:
+`binding_domain`") every message of §8/§21 carries the genesis hash — `M'_x = <M_x's tag with
+its version digit bumped to 2> ‖ genesis [32] ‖ chain_id u64 ‖ nonce u64 ‖ <M_x's tail>`:
+`rand-bridge-pause-2`, `rand-bridge-pq-unpause-2`, `rand-bridge-pq-list-2`,
+`rand-bridge-pq-register-2`, `rand-bridge-pq-rotate-pq-2`, `rand-bridge-pq-rotate-pause-2`
+(`crates/randprotocol-core/src/bridge/gov.rs`, the `*_message_in` functions; pinned by
+`the_genesis_bound_governance_messages_are_the_v1_layout_behind_the_genesis_hash`). A quorum
+or a pause signature made for one chain then verifies on no other chain sharing its chain id — a
+re-cut keeps its guardians and its pause key, and before this a signature for the old chain's
+nonce `n` was one for the new chain's. Without the field (chains 14–19) the §8 layouts stand,
+byte for byte. **The signing tools must follow**: `rand-bridge-gov` (bridge repository) signs
+the `…-2` layouts on such a chain, and `rand bridge-pause`/`bridge-unpause`/`token
+register-bridged`/`token list-backing` check a file against the chain's form
+(`governance::GovState::bound_to`, `RpcClient::binding_domain` — decided by chain id, never by
+the node's `rand_getLimits.binding_domain` claim).
+
+**Open, deliberately not done here — the mint co-signature.** `rand-bridge-pq-cosign-1 ‖
+chain_id ‖ mu` (§4, `bridge/pq.rs`) still binds the chain id only, on every chain: the guardian
+daemons sign it, in another repository, and a half-measure (the ledger demanding a `…-2`
+co-signature the daemons do not make) would refuse every deposit. What it leaves: a same-id copy
+of a chain that also copies the guardian set (the re-cut case) accepts a deposit's co-signatures
+made for the original — bounded by the copy needing the same guardian keys, the same emitters
+and the ECDSA attestation itself, which names the source chain, the sequence and the recipient
+but never the Rand genesis. The change, when the bridge repository takes it: the daemon signs
+`rand-bridge-pq-cosign-2 ‖ genesis [32] ‖ chain_id ‖ mu` on a `binding_domain: 1` chain, and
+`BridgeState::check_attest` verifies that message under the flag (`verify_pq_signatures` takes
+the domain); its vectors (`tests/fixtures/pq-cosignatures.json`) gain a `genesis` field.
+
 ### 21.2 Rolling-window mint caps
 
 B1's per-backing cap (`tokens.mint_cap_per_day`) is measured over a **rolling window of

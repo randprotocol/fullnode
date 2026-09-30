@@ -1064,6 +1064,107 @@ fields, which are unchanged; a cut that carries a register forward must also car
 revoked entry on its old schedule (its `vested` is frozen at `revoked_at`, and what is left after
 `claimed` and `revoked_out` is the treasury's, not the holder's).
 
+## The next cut: `binding_domain` (audit v6, BIND-1, issue #79)
+
+**What it is.** Votes, new-views and proposals have signed the genesis hash since
+`consensus_domain: 1`; v2 registrations and the vesting messages bind it too. Everything else a
+user or an operator proves or signs bound the **chain id alone**: the eight-word binding every
+bundle, auth and call proof is made over (`Transaction::binding`, `call_binding`) and the signed
+messages of a faucet `Mint`, `Unbond`, `Withdraw`, an RPL `TokenMint`/`SetAuthority`, the
+aggregator register actions and the bridge governance actions (pause, unpause, register, list,
+the two rotations). Two chains sharing a chain id — a re-cut, a private copy — would accept each
+other's proofs and signatures; that chain ids 14–19 never repeated was the only protection
+(`deploy/lib/cut-policy.sh` now refuses a reused id, OPS-7). The top-level genesis field
+`binding_domain: 1` puts the genesis hash first in every one of those preimages under a fresh tag
+(`rand-tx-bind-2`, `rand-call-bind-2`, `rand-mint-3`, `rand-unbond-2`, `rand-withdraw-2`,
+`rand-rpl-mint-2`, `rand-rpl-authority-2`, `rand-aggregator-{register,unbond,withdraw}-2`,
+`rand-aggregate-3`, `rand-aggregate-bind-2`, and the bridge's `…-2` fixed layouts with the 32-byte
+hash between the tag and the chain id — `crates/randprotocol-core/src/types/binding.rs`,
+`bridge/gov.rs`). The binding is a *public input* of the proofs — the wallet, a prover service
+and the ledger compute it and hand it to the circuit — so nothing in any guest or verifier key
+moves (`guest_provenance` stays green). A genesis-bound registration is exactly the v2 message,
+whether or not `staking.registration_v2` is also set. Absent or `0`: chains 14–19's messages,
+byte for byte, pinned by `the_chain_id_domain_is_the_messages_chain_18_signs_byte_for_byte`.
+
+**What the cut passes.** `rand-node genesis … --binding-domain 1` — from **chain 20**, the first
+chain that can carry the field: chain 19 is the v0.6.7 re-genesis, cut without it, and is pinned
+with 14–18 in `CHAIN_ID_BINDING_CHAIN_IDS`. The field is tagged and
+appended to the genesis hash after `gas`, only when present; `rand-node genesis` warns when a
+chain id outside 14–19 is cut without it, because **no wallet can transact on such a chain**:
+`randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS` (= 14–19) pins which chain ids get the
+chain-id form, and a wallet uses the genesis-bound form on every other id, over the genesis hash
+its note store is bound to — never the node's `rand_getLimits.binding_domain` claim, which it
+reads only to refuse early (the `envelope_bytes` trap, issue #64). A node lying about the hash
+can only make that wallet's own transactions invalid (a genesis-bound binding verifies on exactly
+the chain whose genesis hash it carries); it cannot make them valid on a second chain, which is
+what BIND-1 is about. **A cut without the field must add its chain id to that list first**
+(`every_committed_genesis_without_binding_domain_is_pinned` fails until it does) — do not: cut
+with the field.
+
+**Every signer of an action message must be on a build with the field before the cut**, as with
+every prior message change: the wallet (`rand` — `wallet::binding_domain`), the operator commands
+(`rand-node register/unbond/withdraw/aggregator …` — `RpcClient::binding_domain`), the aggregate
+daemon, and **the bridge repository's `rand-bridge-gov`**, whose pause, unpause, register and
+list signatures must be made over the `…-2` layouts (`docs/bridge.md` §21, "BIND-1") — a pause
+file signed in the chain-id form is refused `BadPauseSignature` on a `binding_domain: 1` chain.
+The clients repository (wasm core, the apps) and randscan must carry the same chain-id rule.
+
+**Already genesis-bound, so not re-domained:** `AdmitValidator`'s votes (`rand-admit-validator-1
+‖ genesis ‖ candidate`, on every chain) and `SlashEquivocation`'s evidence (two block signatures
+under the consensus signing domain; genesis validation refuses `staking.slashing` without
+`consensus_domain: 1`, so that evidence always carries the genesis hash).
+
+**Not re-domained (deliberately, out of this repository's hands):** the mint co-signature
+`rand-bridge-pq-cosign-1 ‖ chain_id ‖ mu` the guardian daemons sign. It still binds the chain id
+only, so a same-id copy of a chain that also copies the guardian set would accept a deposit's
+co-signatures; binding it needs the guardian daemon (another repository) to sign
+`rand-bridge-pq-cosign-2 ‖ genesis ‖ chain_id ‖ mu` and the ledger to verify it under the flag.
+Recorded in `docs/bridge.md` §21 as the open half; the attest transaction's own fee bundle is
+genesis-bound, the attestation body inside it is not.
+
+**Tests that pin it:** core `ledger::bind_tests` (a transfer, an auth proof, a hardened call, a
+mint, unbond/withdraw, a registration, each made for genesis A refused on B with the same chain
+id, and the chain-id form refused under the flag), `tokens::action_tests::under_binding_domain_…`,
+`aggregation::admission_tests::under_binding_domain_…`, `bridge_gov::tests::under_binding_domain_…`,
+`genesis::tests::a_genesis_with_binding_domain_1_…`; node `a_restart_restores_the_binding_domain`;
+client `the_binding_domain_is_the_chain_ids_never_the_nodes_claim`; `split_auth` (chain 20, real
+proofs under the flag) and `wallet_flow` (chain 7 under the flag); `cluster` and `zusd_e2e` moved
+to chain id 18 so their hand-signed chain-id messages stay today's.
+
+### CH-8 re-verified (audit v6: 8a–8d, "chain-id binding, faucet key, quick-verify, guest wrap")
+
+The audit's registry names the four halves of CH-8 without their text; what each is in the tree
+today, as re-read on 2026-10-01:
+
+- **8a, chain-id binding** — BIND-1 above: closed by `binding_domain: 1` at the next cut; until
+  then chains 14–19 bind the chain id only, as before.
+- **8b, the faucet key** — a faucet mint is signed by the node's *validator* key
+  (`Node::mint`, `crates/randprotocol-node/src/node.rs`: `Keypair::from_seed(self.cfg.seed)`),
+  the one key that also signs its votes. What bounds it: the message is domain-separated from
+  every consensus message (`rand-mint-2`, `rand-mint-3` under the flag — a mint signature can
+  never be read as a vote or a new-view, and vice versa); the ledger admits a mint only from a
+  register row and, under `staking.faucet_minters`, only from the genesis list (`ledger/mod.rs`,
+  `MinterNotValidator` / `MinterNotAllowed`); `rand_mint` is refused on the public listener
+  (`rpc.rs`, `PUBLIC_METHODS`) and metered on the operator's; the faucet is off on mainnet by the
+  cut policy. Not changed: a separate faucet key would be a genesis change (a `faucet_minters`
+  entry that is not a validator) and the faucet is a testnet-only feature — recorded, not fixed.
+- **8c, quick-verify mode** — `rand-node run --verify-chain quick` is the default
+  (`main.rs`, `verify_chain`; `storage.rs`, `VerifyMode`): at startup every block's hash links,
+  indexes, QC/block match and tx roots are checked and the ledger replayed against every
+  header's state root, with bundle proofs re-verified; **QC votes are not verified** — `full`
+  does that too. It is a check of the node's *own* disk, not of anything a peer sends (synced
+  blocks are fully verified on arrival, `apply_synced`); a QC on disk that no quorum signed can
+  only have been written by whoever writes the data directory. On a pruned node the check is
+  structural over the retained range (v0.5.7). Not changed: `full` costs a Dilithium2 verify per
+  vote per block (26 validators × 18 signatures × ~250 000 blocks on chain 18's archive) and the
+  default stays `quick`; run `full` after any restore from a foreign copy of a data directory.
+- **8d, the demo guest's wrapping add** — `circuits/guests-compiled/fib/src/main.rs` computes
+  `fib(n)` with `u32::wrapping_add`, so `fib(48)` and up wrap silently. It is the zkVM's demo
+  and test guest (`randprotocol-zkvm-demo`, `tests/executor.rs`), vendored from the circuits
+  repository (`deploy/sync-zkvm.sh`), deployed on no chain, and its wrapping is the RV32 `add`
+  it compiles to — the guest is a fixture, not a program anyone is paid by. Not changed here
+  (vendored); a guest that must not wrap uses `checked_add` and halts on `None`.
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and

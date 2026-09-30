@@ -115,10 +115,7 @@ pub fn aggregators_component(
 use crate::crypto::Signature;
 use crate::gas;
 use crate::ledger::{Ledger, TxError};
-use crate::types::actions::{
-    aggregate_signing_hash, aggregator_register_message, aggregator_unbond_message,
-    aggregator_withdraw_message, envelope_digest, AggregatorRegistration,
-};
+use crate::types::actions::{envelope_digest, AggregatorRegistration};
 use crate::types::{Action, Transaction};
 
 /// Why an aggregation action was refused. Carried inside [`TxError::Aggregation`] so admission
@@ -458,7 +455,7 @@ pub(super) fn validate_aggregate(
     // 2. The aggregator: registered, not unbonding, the nonce the register expects, and the
     //    signature over the action's signing hash — `signed_by`'s three, plus the bar.
     let entry = signed_by(ledger, aggregator, nonce, signature, || {
-        aggregate_signing_hash(tx.chain_id, nonce, time, r, covers, &Hash::digest(proof), &envelope_digest(envelope))
+        ledger.binding_domain().aggregate_signing_hash(tx.chain_id, nonce, time, r, covers, &Hash::digest(proof), &envelope_digest(envelope))
     })?;
     if entry.unbonding.is_some() {
         return Err(AggregationError::Unbonding(*aggregator).into());
@@ -554,7 +551,7 @@ pub(super) fn validate_aggregate(
     //    this transaction's own `(chain, aggregator, nonce)` (audit v3, AGG-2), recomputed here
     //    and never read from the proof: the proof committed to its prover's triple, so a copy
     //    re-signed by another aggregator, or replayed at another nonce, does not verify.
-    let binding = crate::types::actions::aggregate_binding(tx.chain_id, aggregator, nonce);
+    let binding = ledger.binding_domain().aggregate_binding(tx.chain_id, aggregator, nonce);
     let outs = executor
         .verify_aggregate(&first.shape, covered, proof, &binding)
         .map_err(TxError::InvalidAggregateProof)?;
@@ -622,7 +619,7 @@ impl Ledger {
             }
         }
         let entry = signed_by(self, aggregator, *nonce, signature, || {
-            aggregate_signing_hash(tx.chain_id, *nonce, *time, r, covers, &Hash::digest(proof), &envelope_digest(envelope))
+            self.binding_domain().aggregate_signing_hash(tx.chain_id, *nonce, *time, r, covers, &Hash::digest(proof), &envelope_digest(envelope))
         })?;
         if entry.unbonding.is_some() {
             return Err(AggregationError::Unbonding(*aggregator).into());
@@ -778,7 +775,7 @@ fn check_register(
     }
     if !registration
         .public_key
-        .verify(aggregator_register_message(chain_id, &registration.payout).as_bytes(), &registration.signature)
+        .verify(ledger.binding_domain().aggregator_register_message(chain_id, &aggregator, &registration.payout).as_bytes(), &registration.signature)
     {
         return Err(AggregationError::BadSignature);
     }
@@ -812,7 +809,7 @@ fn check_unbond(
     signature: &Signature,
     chain_id: u64,
 ) -> Result<(), AggregationError> {
-    let e = signed_by(ledger, aggregator, nonce, signature, || aggregator_unbond_message(chain_id, aggregator, nonce))?;
+    let e = signed_by(ledger, aggregator, nonce, signature, || ledger.binding_domain().aggregator_unbond_message(chain_id, aggregator, nonce))?;
     if e.unbonding.is_some() {
         return Err(AggregationError::Unbonding(*aggregator));
     }
@@ -831,7 +828,7 @@ fn check_withdraw(
     chain_id: u64,
 ) -> Result<(), AggregationError> {
     let e = signed_by(ledger, aggregator, nonce, signature, || {
-        aggregator_withdraw_message(chain_id, aggregator, nonce, time, r, envelope)
+        ledger.binding_domain().aggregator_withdraw_message(chain_id, aggregator, nonce, time, r, envelope)
     })?;
     if e.bond <= gas::BUNDLE_BASE {
         return Err(AggregationError::BelowBundleBase { amount: e.bond, base: gas::BUNDLE_BASE });
@@ -1181,6 +1178,7 @@ mod tests {
             vesting: None,
             gas: None,
             testnet: None,
+            binding_domain: None,
             hardening_v6: None,
             hc_auth: None,
         }
@@ -2337,6 +2335,87 @@ mod admission_tests {
         let tx = aggregate_tx(&kp, 0, 100, covers(1), b"ok".to_vec());
         assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::AggregateNeedsCovered));
     }
+
+    /// BIND-1 (audit v6; dormant — aggregation is on no chain): under genesis `binding_domain: 1`
+    /// the aggregator's four signed messages and the aggregate binding the proof commits to carry
+    /// the genesis hash. Two ledgers, one chain id, one register: a registration, an unbond, a
+    /// withdraw and an aggregate signed for genesis A are refused on B, and A's proof under a
+    /// signature made for B is refused at the proof step — its binding is A's.
+    #[test]
+    fn under_binding_domain_the_aggregator_messages_and_the_aggregate_binding_bind_the_genesis() {
+        use crate::types::BindingDomain;
+        let genesis_root = gated().root();
+        let (base, kp) = setup();
+        let on = |g: u8| {
+            let mut l = base.clone();
+            l.set_binding_domain(BindingDomain::Genesis(Hash([g; 32])));
+            l
+        };
+        let (la, lb) = (on(0xa), on(0xb));
+        let (da, db, v1) = (*la.binding_domain(), *lb.binding_domain(), BindingDomain::ChainId);
+        let bad = |r: Result<(), TxError>| r == Err(TxError::Aggregation(AggregationError::BadSignature));
+        let aggregator = kp.public_key().address();
+
+        // Register: a second aggregator, its fee bundle anchored at the genesis root.
+        let (_, newcomer) = keys();
+        let register = |l: &Ledger, d: &BindingDomain| {
+            let payout = payout_addr();
+            let message = d.aggregator_register_message(7, &newcomer.public_key().address(), &payout);
+            let registration = AggregatorRegistration { public_key: newcomer.public_key().clone(), payout, signature: newcomer.sign(message.as_bytes()) };
+            let mut b = bundle(l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::BUNDLE_BASE, cfg().bond);
+            b.anchor = genesis_root;
+            b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
+            StubExecutor::bound_in(Transaction::shielded(7, b, Action::RegisterAggregator { registration }), l.binding_domain())
+        };
+        assert_eq!(base.validate(&register(&base, &v1), &StubExecutor), Ok(()), "today");
+        assert_eq!(la.validate(&register(&la, &da), &StubExecutor), Ok(()));
+        assert!(bad(lb.validate(&register(&lb, &da), &StubExecutor)), "A's registration on B");
+        assert!(bad(la.validate(&register(&la, &v1), &StubExecutor)), "a chain-id registration under the flag");
+
+        // Unbond and withdraw, bundle-less.
+        let unbond = |d: &BindingDomain| Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::UnbondAggregator { aggregator, nonce: 0, signature: kp.sign(d.aggregator_unbond_message(7, &aggregator, 0).as_bytes()) },
+        };
+        assert_eq!(base.validate(&unbond(&v1), &StubExecutor), Ok(()), "today");
+        assert_eq!(la.validate(&unbond(&da), &StubExecutor), Ok(()));
+        assert!(bad(lb.validate(&unbond(&da), &StubExecutor)));
+        assert!(bad(la.validate(&unbond(&v1), &StubExecutor)));
+        let withdraw = |d: &BindingDomain| Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::WithdrawAggregator {
+                aggregator,
+                nonce: 0,
+                time: 1,
+                r: [4; 8],
+                envelope: env(),
+                signature: kp.sign(d.aggregator_withdraw_message(7, &aggregator, 0, 1, &[4; 8], &env()).as_bytes()),
+            },
+        };
+        // Not unbonding, so the honest withdraw stops one rule after the signature — on both.
+        let honest = base.validate(&withdraw(&v1), &StubExecutor);
+        assert!(honest.is_err() && !bad(honest.clone()), "{honest:?}");
+        assert_eq!(la.validate(&withdraw(&da), &StubExecutor), honest);
+        assert!(bad(lb.validate(&withdraw(&da), &StubExecutor)));
+        assert!(bad(la.validate(&withdraw(&v1), &StubExecutor)));
+
+        // The aggregate: signed over `signed`'s signing hash, its proof bound to `proved`'s binding.
+        let aggregate = |signed: &BindingDomain, proved: &BindingDomain| {
+            let proof = StubExecutor::make_aggregate_proof(&proved.aggregate_binding(7, &aggregator, 0));
+            let (covers, r) = (covers(2), [9; 8]);
+            let signature = kp.sign(signed.aggregate_signing_hash(7, 0, 100, &r, &covers, &Hash::digest(&proof), &envelope_digest(&env())).as_bytes());
+            Transaction { chain_id: 7, bundle: None, action: Action::Aggregate { covers, proof, aggregator, nonce: 0, time: 100, r, envelope: env(), signature } }
+        };
+        let covered = covered_records(&shape(), &[1, 2]);
+        assert!(base.validate_aggregate(&aggregate(&v1, &v1), &covered, &StubExecutor).is_ok(), "today");
+        assert!(la.validate_aggregate(&aggregate(&da, &da), &covered, &StubExecutor).is_ok());
+        assert!(bad(lb.validate_aggregate(&aggregate(&da, &da), &covered, &StubExecutor).map(|_| ())), "A's aggregate on B");
+        assert!(bad(la.validate_aggregate(&aggregate(&v1, &v1), &covered, &StubExecutor).map(|_| ())));
+        let lifted = lb.validate_aggregate(&aggregate(&db, &da), &covered, &StubExecutor).map(|_| ());
+        assert!(matches!(lifted, Err(TxError::InvalidAggregateProof(_))), "A's proof re-signed for B: {lifted:?}");
+    }
 }
 
 // ── Task 5: the subsidy, the proving share, and the supply audit ─────────────────────────────
@@ -2896,7 +2975,7 @@ mod payment_tests {
         let digest = StubExecutor.bundle_digest(&tx.bundle.as_ref().unwrap().digest_input());
         let mut pv = [0u64; crate::types::pv::NUM];
         // The covered proof's H_PUB is its transaction's binding (INTERFACE-6 checks it).
-        let hpub = StubExecutor.public_digest(&tx.binding());
+        let hpub = StubExecutor.public_digest(&tx.binding(&crate::types::BindingDomain::ChainId));
         for k in 0..8 {
             pv[pv::OUT0 + k] = digest[k] as u64;
             pv[pv::PUB0 + k] = hpub[k] as u64;
@@ -2947,7 +3026,7 @@ mod payment_tests {
         let digest = StubExecutor.bundle_digest(&tx.bundle.as_ref().unwrap().digest_input());
         let mut pv = [0u64; crate::types::pv::NUM];
         // The covered proof's H_PUB is its transaction's binding (INTERFACE-6 checks it).
-        let hpub = StubExecutor.public_digest(&tx.binding());
+        let hpub = StubExecutor.public_digest(&tx.binding(&crate::types::BindingDomain::ChainId));
         for k in 0..8 {
             pv[pv::OUT0 + k] = digest[k] as u64;
             pv[pv::PUB0 + k] = hpub[k] as u64;
@@ -3007,7 +3086,7 @@ mod payment_tests {
         let mut rich_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::BUNDLE_BASE + 60, 0), Action::None));
         let rich_digest = StubExecutor.bundle_digest(&rich_tx.bundle.as_ref().unwrap().digest_input());
         let mut rich_pv = [0u64; crate::types::pv::NUM];
-        let rich_hpub = StubExecutor.public_digest(&rich_tx.binding());
+        let rich_hpub = StubExecutor.public_digest(&rich_tx.binding(&crate::types::BindingDomain::ChainId));
         for k in 0..8 {
             rich_pv[pv::OUT0 + k] = rich_digest[k] as u64;
             rich_pv[pv::PUB0 + k] = rich_hpub[k] as u64;

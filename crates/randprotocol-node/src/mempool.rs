@@ -2930,7 +2930,7 @@ mod tests {
         let want = GasPolicy::DEFAULT.call_floor(14, 0, 0, stub_len);
         let b = fixtures::bundle_tx(&ledger, [[60; 8], [61; 8]], [[62; 8], [63; 8]], want).bundle.expect("bundle");
         let mut call = Transaction::shielded(ledger.chain_id(), b, Action::Call { program: pid, proof: vec![], input_envelope: None });
-        let proof = StubExecutor::make_proof_with_public(&pid, 14, [7; 8], &call.call_binding());
+        let proof = StubExecutor::make_proof_with_public(&pid, 14, [7; 8], &call.call_binding(&randprotocol_core::BindingDomain::ChainId));
         let Action::Call { proof: p, .. } = &mut call.action else { unreachable!() };
         *p = proof;
         let call = StubExecutor::bound(call);
@@ -2972,7 +2972,7 @@ mod tests {
         let stub_len = StubExecutor::make_proof_with_public(&Hash::ZERO, 12, [0; 8], &[]).len();
         let want = GasPolicy::DEFAULT.call_floor(12, 0, 0, stub_len);
         let call = with_bundle(&ledger, 60, want, Action::Call { program: pid, proof: vec![], input_envelope: None });
-        let binding = call.call_binding();
+        let binding = call.call_binding(&randprotocol_core::BindingDomain::ChainId);
         let segment = hardened_call_segment(&public, &binding);
         let proof = StubExecutor::make_proof_with_public(&pid, 12, [7; 8], &segment);
         let mut call = call;
@@ -3290,7 +3290,7 @@ mod tests {
         let floor = gas::circuit_call_floor(100, 800, gas::gas_max(12, 0, 0), stub_len);
         let b = fixtures::bundle_tx(&ledger, [[60; 8], [61; 8]], [[62; 8], [63; 8]], floor).bundle.expect("bundle");
         let mut call = Transaction::shielded(ledger.chain_id(), b, Action::Call { program: pid, proof: vec![], input_envelope: None });
-        let segment = [public.as_slice(), call.call_binding().as_slice()].concat();
+        let segment = [public.as_slice(), call.call_binding(&randprotocol_core::BindingDomain::ChainId).as_slice()].concat();
         let proof = StubExecutor::make_proof_with_public(&pid, 12, [7; 8], &segment);
         let Action::Call { proof: p, .. } = &mut call.action else { unreachable!() };
         *p = proof;

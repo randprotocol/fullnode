@@ -17,10 +17,10 @@
 
 use crate::RpcClient;
 use anyhow::{anyhow, bail, Context, Result};
-use randprotocol_core::bridge::gov::{list_message, pause_message, register_message, unpause_message};
+use randprotocol_core::bridge::gov::{list_message_in, pause_message_in, register_message_in, unpause_message_in};
 use randprotocol_core::bridge::{check_pq_quorum_message, BridgeError, PqSignature};
 use randprotocol_core::ledger::tokens::{check_metadata, BRIDGE_DECIMALS, MAX_BACKING_DECIMALS};
-use randprotocol_core::{Action, Hash, PublicKey, Signature, Transaction};
+use randprotocol_core::{Action, BindingDomain, Hash, PublicKey, Signature, Transaction};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -42,6 +42,12 @@ pub struct GovState {
     /// The token registry's registration fee, which a `RegisterBridgedToken` owes past the bundle
     /// base; `None` from a node that does not serve it.
     pub registration_fee: Option<u64>,
+    /// BIND-1: what the governance messages this state checks are over — the chain id alone
+    /// (what [`GovState::from_bridge_state`] leaves it at: chains 14–18), or the genesis hash too
+    /// on a chain whose genesis sets `binding_domain: 1` ([`GovState::bound_to`]). It is the
+    /// caller's decision, from the chain id (`RpcClient::binding_domain`), never read off the
+    /// bridge state the node served.
+    pub binding: BindingDomain,
 }
 
 impl GovState {
@@ -78,7 +84,15 @@ impl GovState {
                 .unwrap_or_default(),
             // Either encoding (node I3): a decimal string on chain 14, a number before it.
             registration_fee: crate::amount_field(&v["registration_fee"]),
+            binding: BindingDomain::ChainId,
         })
+    }
+
+    /// This state with its messages rebuilt under `domain` (BIND-1): the pre-submission checks
+    /// then verify a signature file against exactly the message the chain's ledger will.
+    pub fn bound_to(mut self, domain: BindingDomain) -> GovState {
+        self.binding = domain;
+        self
     }
 }
 
@@ -105,8 +119,8 @@ pub fn pause_action(state: &GovState, chain_id: u64, signature: Signature) -> Re
         bail!("bridge minting is already paused (pause_nonce {})", state.pause_nonce);
     }
     let nonce = state.pause_nonce;
-    if !key.verify(&pause_message(chain_id, nonce), &signature) {
-        return Err(match signed_nonce(nonce, |n| key.verify(&pause_message(chain_id, n), &signature)) {
+    if !key.verify(&pause_message_in(&state.binding, chain_id, nonce), &signature) {
+        return Err(match signed_nonce(nonce, |n| key.verify(&pause_message_in(&state.binding, chain_id, n), &signature)) {
             Some(n) => anyhow!("this pause signature was made for pause_nonce {n}; the bridge is at {nonce}: sign again"),
             None => anyhow!(
                 "this pause signature does not verify for chain {chain_id} at pause_nonce {nonce} under the bridge's \
@@ -125,7 +139,7 @@ pub fn unpause_action(state: &GovState, chain_id: u64, pq_signatures: Vec<PqSign
         bail!("bridge minting is not paused (pause_nonce {})", state.pause_nonce);
     }
     let nonce = state.pause_nonce;
-    check_quorum(state, &pq_signatures, nonce, "pause_nonce", |n| unpause_message(chain_id, n))?;
+    check_quorum(state, &pq_signatures, nonce, "pause_nonce", |n| unpause_message_in(&state.binding, chain_id, n))?;
     Ok(Action::UnpauseMints { nonce, pq_signatures })
 }
 
@@ -149,7 +163,7 @@ pub fn register_bridged_action(
     check_backing(state, chain, decimals)?;
     let nonce = state.list_nonce;
     check_quorum(state, &pq_signatures, nonce, "list_nonce", |n| {
-        register_message(chain_id, n, name, symbol, &salt, chain, &token, decimals).expect("check_metadata bounds both")
+        register_message_in(&state.binding, chain_id, n, name, symbol, &salt, chain, &token, decimals).expect("check_metadata bounds both")
     })?;
     Ok(Action::RegisterBridgedToken {
         name: name.into(),
@@ -178,7 +192,7 @@ pub fn list_backing_action(
     check_backing(state, chain, decimals)?;
     let nonce = state.list_nonce;
     check_quorum(state, &pq_signatures, nonce, "list_nonce", |n| {
-        list_message(chain_id, n, token_index, chain, &token, decimals)
+        list_message_in(&state.binding, chain_id, n, token_index, chain, &token, decimals)
     })?;
     Ok(Action::ListBacking { token_index, chain, token, decimals, nonce, pq_signatures })
 }
@@ -330,7 +344,7 @@ pub(crate) mod tests {
         // exact message the node will check.
         let seed: [u8; 32] = hex::decode(v["pause_key_seed"].as_str().unwrap()).unwrap().try_into().unwrap();
         let key = Keypair::from_seed(seed).unwrap();
-        assert_eq!(key.sign(&pause_message(99, 0)), tx_signature(&tx));
+        assert_eq!(key.sign(&randprotocol_core::bridge::gov::pause_message(99, 0)), tx_signature(&tx));
     }
 
     fn tx_signature(tx: &Transaction) -> Signature {

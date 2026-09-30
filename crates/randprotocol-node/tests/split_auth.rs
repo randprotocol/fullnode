@@ -27,7 +27,10 @@ use randprotocol_zkvm::notes::{Note, SpendKey};
 use randprotocol_zkvm::viewing::TxKey;
 use std::time::{Duration, Instant};
 
-const CHAIN_ID: u64 = 17;
+/// 20, not 17, since BIND-1: a chain id outside `CHAIN_ID_BINDING_CHAIN_IDS` under genesis
+/// `binding_domain: 1`, so both real proofs here are made over the genesis-bound binding — the
+/// one real-proof run of that form on a real node (the wallet flow is the other).
+const CHAIN_ID: u64 = 20;
 
 /// A one-validator Test-profile chain with the faucet on, pinning bundle guest v3 and the auth
 /// guest — what `rand-node genesis --bundle-guest v3 --auth-guest` writes.
@@ -65,6 +68,7 @@ fn genesis_v3(validator: &Keypair) -> Genesis {
         hc_auth: Some(word8_to_hex(&ZkExecutor::hc_auth())),
         gas: None,
         testnet: None,
+        binding_domain: Some(1),
     }
 }
 
@@ -167,7 +171,13 @@ async fn a_v3_chain_admits_a_real_auth_proof_and_refuses_a_swapped_one() {
         auth_proof: Vec::new(),
     };
     let mut tx = Transaction::shielded(CHAIN_ID, bundle, Action::None);
-    let binding = tx.binding();
+    // BIND-1: what a wallet does on this chain id — the genesis hash the node serves, which
+    // `rand_getLimits` says the chain binds.
+    assert_eq!(status["binding_domain"], 1, "rand_status serves binding_domain");
+    let domain = rpc.binding_domain(CHAIN_ID).await.expect("the node says the chain binds its genesis");
+    assert_eq!(domain, randprotocol_core::BindingDomain::Genesis(rpc.genesis_hash().await.unwrap()));
+    let binding = tx.binding(&domain);
+    assert_ne!(binding, tx.binding(&randprotocol_core::BindingDomain::ChainId), "not the chain-id form");
 
     let hc = ZkExecutor::hc_hidden_bundle_v3();
     let t = Instant::now();
@@ -190,7 +200,7 @@ async fn a_v3_chain_admits_a_real_auth_proof_and_refuses_a_swapped_one() {
     let (resalted, other_c, _) = prove_auth(FriProfile::Test, &w.sk, &fresh(), &binding, Backend::Cpu).unwrap();
     assert_ne!(other_c, c);
     tx.bundle.as_mut().unwrap().proof = bundle_proof;
-    assert_eq!(tx.binding(), binding, "the binding blanks both proofs");
+    assert_eq!(tx.binding(&domain), binding, "the binding blanks both proofs");
 
     // ---- the swapped ones first (while the note is unspent, so only the auth proof can refuse) ----
     let mut swapped = tx.clone();

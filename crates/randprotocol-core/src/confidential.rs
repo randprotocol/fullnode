@@ -376,7 +376,13 @@ impl StubExecutor {
     /// The binding blanks the bundle proof, so rewriting it does not move the binding. A stub
     /// auth proof (split authorisation) is re-bound the same way; the binding blanks it too.
     pub fn bind(tx: &mut Transaction) {
-        let binding = word8_to_bytes(&tx.binding());
+        Self::bind_in(tx, &crate::types::BindingDomain::ChainId)
+    }
+
+    /// [`Self::bind`] on a chain of `domain` (BIND-1): the stub proofs are re-bound to
+    /// `tx.binding(domain)`, what a wallet on a `binding_domain: 1` chain proves against.
+    pub fn bind_in(tx: &mut Transaction, domain: &crate::types::BindingDomain) {
+        let binding = word8_to_bytes(&tx.binding(domain));
         if let Some(b) = tx.bundle.as_mut() {
             if b.proof.len() == STUB_BUNDLE_LEN && &b.proof[..4] == STUB_MARKER {
                 b.proof[STUB_BUNDLE_BINDING..STUB_BUNDLE_GAS].copy_from_slice(&binding);
@@ -390,6 +396,12 @@ impl StubExecutor {
     /// [`Self::bind`], by value.
     pub fn bound(mut tx: Transaction) -> Transaction {
         Self::bind(&mut tx);
+        tx
+    }
+
+    /// [`Self::bind_in`], by value.
+    pub fn bound_in(mut tx: Transaction, domain: &crate::types::BindingDomain) -> Transaction {
+        Self::bind_in(&mut tx, domain);
         tx
     }
 
@@ -733,9 +745,9 @@ mod tests {
         let tx = StubExecutor::bound(Transaction::shielded(7, bundle, Action::None));
         let p = &tx.bundle.as_ref().unwrap().proof;
         assert_eq!(StubExecutor.bundle_gas_limit(p).unwrap(), Some(777), "bound keeps the gas tail");
-        let binding = word8_to_bytes(&tx.binding());
+        let binding = word8_to_bytes(&tx.binding(&crate::types::BindingDomain::ChainId));
         assert_eq!(&p[STUB_BUNDLE_BINDING..STUB_BUNDLE_GAS], &binding[..], "and the binding is this transaction's");
-        assert_eq!(StubExecutor.verify_bundle(&hc, p, &tx.binding()), Ok(()));
+        assert_eq!(StubExecutor.verify_bundle(&hc, p, &tx.binding(&crate::types::BindingDomain::ChainId)), Ok(()));
         let again = StubExecutor::bound(tx.clone());
         assert_eq!(again, tx, "binding is idempotent");
     }

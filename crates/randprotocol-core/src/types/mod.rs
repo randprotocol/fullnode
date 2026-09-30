@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod binding;
 pub mod block;
 pub mod transaction;
 pub mod validator;
@@ -7,10 +8,12 @@ pub use actions::{
     registration_message, registration_message_v2, set_authority_message, token_mint_message, unbond_message, withdraw_message,
     AggregatorRegistration, CallEnvelope, InitialMint, Registration, SignedAggregateHeader, MAX_CALL_ENVELOPE_BYTES,
 };
+pub use binding::BindingDomain;
 pub use block::{Block, BlockHeader, QuorumCertificate, Vote, SigningDomain};
 pub use transaction::{
     format_amount, parse_amount, Action, AmountError, Transaction, CALL_BINDING_DOMAIN, FAUCET_MAX_UNITS, TOKEN_DECIMALS,
     TOKEN_SYMBOL, TX_BINDING_DOMAIN, TX_BINDING_WORDS, UNITS_PER_RAND,
+    CALL_BINDING_DOMAIN_V2, TX_BINDING_DOMAIN_V2,
 };
 pub use validator::{Validator, ValidatorSet};
 

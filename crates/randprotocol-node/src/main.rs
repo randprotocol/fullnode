@@ -5,11 +5,7 @@ use randprotocol_client::wallet;
 use randprotocol_client::RpcClient;
 use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisOpening, GenesisValidator, TokensConfig};
 use randprotocol_core::notes::{word8_to_hex, Envelope, EnvelopeFormat, ShieldedAddress};
-use randprotocol_core::types::actions::{
-    admit_validator_message, aggregate_signing_hash, aggregator_register_message, aggregator_unbond_message,
-    aggregator_withdraw_message, registration_message, registration_message_v2, unbond_message, withdraw_message,
-    AggregatorRegistration, Registration,
-};
+use randprotocol_core::types::actions::{admit_validator_message, registration_message_v2, AggregatorRegistration, Registration};
 use randprotocol_zkvm::machine::FriProfile;
 use randprotocol_core::{format_amount, parse_amount};
 use randprotocol_core::{Keypair, PublicKey, UNITS_PER_RAND};
@@ -550,6 +546,15 @@ enum Cmd {
         /// genesis hash when given; omitted, the file has no such field.
         #[arg(long)]
         testnet: bool,
+        /// BIND-1 (audit v6): the top-level `binding_domain`. `1` binds the genesis hash into
+        /// every transaction binding and every signed action message (a faucet mint, unbond,
+        /// withdraw, the RPL token messages, the aggregator actions, the bridge governance
+        /// messages), so a proof or a signature for this chain verifies on no other chain that
+        /// shares its chain id; part of the genesis hash. Omitted, the file has no field —
+        /// chains 14 to 19's rules, byte for byte — and **a wallet signs nothing for a chain id
+        /// outside 14–19 without it**: every new chain from chain 20 is cut with `--binding-domain 1`.
+        #[arg(long, value_name = "0|1")]
+        binding_domain: Option<u32>,
     },
     /// Print one genesis alloc note as JSON — the object that goes into a genesis file's `alloc`
     /// list — sealed to `--to` exactly as `genesis --alloc` seals one, so the owner's wallet finds
@@ -1324,6 +1329,7 @@ async fn main() -> Result<()> {
             staking,
             consensus_domain,
             testnet,
+            binding_domain,
         } => {
             let hc_bundle = match bundle_guest.as_str() {
                 "v3" => ZkExecutor::hc_hidden_bundle_v3(),
@@ -1460,7 +1466,18 @@ async fn main() -> Result<()> {
                 gas,
                 // The testnet marker (audit v6, STAKE-2): absent unless asked for.
                 testnet: testnet.then_some(true),
+                // BIND-1: absent unless asked for, so a genesis cut without it hashes
+                // byte-for-byte as before.
+                binding_domain,
             };
+            if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
+                eprintln!(
+                    "warning: no --binding-domain 1: chain {chain_id} is not one of the chains cut before binding_domain \
+                     ({:?}), and a wallet proves only the genesis-bound form there — no wallet will be able to transact on this \
+                     chain (BIND-1, docs/deploy.md \"The next cut\")",
+                    randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS
+                );
+            }
             for v in &validators {
                 gen.validators.push(parse_genesis_validator(v)?);
             }
@@ -1753,9 +1770,13 @@ async fn main() -> Result<()> {
             let chain_id = client.chain_id().await?;
             let payout = ShieldedAddress::parse(&payout)
                 .map_err(|e| anyhow::anyhow!("{payout} is not a shielded address: {e}"))?;
+            // BIND-1: on a chain whose genesis sets `binding_domain: 1` the registration is the
+            // genesis-bound (v2) message whether or not `--v2` was asked for; the chain-id-only
+            // message registers nothing there.
+            let domain = client.binding_domain(chain_id).await?;
             let message = match v2 {
                 true => registration_message_v2(&client.genesis_hash().await?, chain_id, &kp.address(), &payout),
-                false => registration_message(chain_id, &payout),
+                false => domain.registration_message(chain_id, &kp.address(), &payout),
             };
             let signature = kp.sign(message.as_bytes());
             let registration = Registration { public_key: kp.public_key().clone(), payout, signature };
@@ -1771,7 +1792,8 @@ async fn main() -> Result<()> {
             let rpc = RpcClient::new(staking.rpc.clone());
             let chain_id = rpc.chain_id().await?;
             let (nonce, _) = register_row(&rpc, &kp.address()).await?;
-            let signature = kp.sign(unbond_message(chain_id, &kp.address(), amount, nonce).as_bytes());
+            let domain = rpc.binding_domain(chain_id).await?;
+            let signature = kp.sign(domain.unbond_message(chain_id, &kp.address(), amount, nonce).as_bytes());
             let action = randprotocol_core::Action::Unbond { validator: kp.address(), amount, nonce, signature };
             submit_staking(&staking, chain_id, action, &format!("unbond of {} RAND", format_amount(amount))).await?;
         }
@@ -1796,8 +1818,9 @@ async fn main() -> Result<()> {
             // `time` within the window (256 blocks), so the head is simply the freshest one.
             let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
             let (note, envelope) = sealed_withdraw_note(&payout, amount - base, time, envelope_format(&rpc, chain_id).await?)?;
+            let domain = rpc.binding_domain(chain_id).await?;
             let signature = kp
-                .sign(withdraw_message(chain_id, &kp.address(), amount, nonce, time, &note.r, &envelope).as_bytes());
+                .sign(domain.withdraw_message(chain_id, &kp.address(), amount, nonce, time, &note.r, &envelope).as_bytes());
             let action = randprotocol_core::Action::Withdraw {
                 validator: kp.address(),
                 amount,
@@ -2018,10 +2041,12 @@ async fn main() -> Result<()> {
         Cmd::Aggregator { cmd } => match cmd {
             AggregatorCmd::Register { key, bond, payout, rpc } => {
                 let kp = load_keypair(&key)?;
-                let chain_id = RpcClient::new(rpc).chain_id().await?;
+                let rpc = RpcClient::new(rpc);
+                let chain_id = rpc.chain_id().await?;
                 let payout = ShieldedAddress::parse(&payout)
                     .map_err(|e| anyhow::anyhow!("{payout} is not a shielded address: {e}"))?;
-                let signature = kp.sign(aggregator_register_message(chain_id, &payout).as_bytes());
+                let domain = rpc.binding_domain(chain_id).await?;
+                let signature = kp.sign(domain.aggregator_register_message(chain_id, &kp.address(), &payout).as_bytes());
                 let registration = AggregatorRegistration { public_key: kp.public_key().clone(), payout, signature };
                 println!(
                     "aggregator {} on chain {chain_id}\nregistration: {}\n  bond {} RAND rides through the wallet's `submit` as the register bundle's burn",
@@ -2035,7 +2060,8 @@ async fn main() -> Result<()> {
                 let rpc = RpcClient::new(staking.rpc.clone());
                 let chain_id = rpc.chain_id().await?;
                 let nonce = aggregator_row(&rpc, &kp.address()).await?.0;
-                let signature = kp.sign(aggregator_unbond_message(chain_id, &kp.address(), nonce).as_bytes());
+                let domain = rpc.binding_domain(chain_id).await?;
+                let signature = kp.sign(domain.aggregator_unbond_message(chain_id, &kp.address(), nonce).as_bytes());
                 let action = randprotocol_core::Action::UnbondAggregator { aggregator: kp.address(), nonce, signature };
                 submit_staking(&staking, chain_id, action, "aggregator unbond").await?;
             }
@@ -2051,8 +2077,9 @@ async fn main() -> Result<()> {
                 anyhow::ensure!(bond > base, "the bond does not cover the bundle base");
                 let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
                 let (note, envelope) = sealed_withdraw_note(&payout, bond - base, time, envelope_format(&rpc, chain_id).await?)?;
+                let domain = rpc.binding_domain(chain_id).await?;
                 let signature = kp.sign(
-                    aggregator_withdraw_message(chain_id, &kp.address(), nonce, time, &note.r, &envelope).as_bytes(),
+                    domain.aggregator_withdraw_message(chain_id, &kp.address(), nonce, time, &note.r, &envelope).as_bytes(),
                 );
                 let action = randprotocol_core::Action::WithdrawAggregator {
                     aggregator: kp.address(),
@@ -2081,6 +2108,9 @@ trait AggregateNode {
     /// note is sealed in it, or a memo-format chain refuses the aggregate's envelope. `chain_id` is
     /// the transaction's own (issue #64).
     async fn envelope_format(&self, chain_id: u64) -> Result<EnvelopeFormat>;
+    /// The chain's binding domain for `chain_id` (BIND-1, `RpcClient::binding_domain`): what
+    /// the aggregate binding the proof commits to and the signing hash carry.
+    async fn binding_domain(&self, chain_id: u64) -> Result<randprotocol_core::BindingDomain>;
 }
 
 impl AggregateNode for RpcClient {
@@ -2089,6 +2119,9 @@ impl AggregateNode for RpcClient {
     }
     async fn envelope_format(&self, chain_id: u64) -> Result<EnvelopeFormat> {
         envelope_format(self, chain_id).await
+    }
+    async fn binding_domain(&self, chain_id: u64) -> Result<randprotocol_core::BindingDomain> {
+        RpcClient::binding_domain(self, chain_id).await
     }
 }
 
@@ -2195,7 +2228,8 @@ async fn aggregate_pass(
     // register nonce is read before proving, and the submission below signs the same nonce — a
     // proof made for one nonce verifies at no other.
     let nonce = aggregator_row(rpc, &kp.address()).await?.0;
-    let binding = randprotocol_core::types::actions::aggregate_binding(chain_id, &kp.address(), nonce);
+    let domain = rpc.binding_domain(chain_id).await?;
+    let binding = domain.aggregate_binding(chain_id, &kp.address(), nonce);
     let proof_bytes = prove(profile, &raw_proofs, &binding)?;
 
     // After the prove, immediately before the transaction: the head, the schedule, the payout
@@ -2221,7 +2255,8 @@ async fn aggregate_pass(
     let time = height as u32 + 1;
     let (note, envelope) = sealed_withdraw_note(&payout, subsidy.saturating_add(shares), time, rpc.envelope_format(chain_id).await?)?;
     let signature = kp.sign(
-        aggregate_signing_hash(chain_id, nonce, time, &note.r, &covers, &randprotocol_core::Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&envelope))
+        domain
+            .aggregate_signing_hash(chain_id, nonce, time, &note.r, &covers, &randprotocol_core::Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&envelope))
             .as_bytes(),
     );
     Ok(Some(randprotocol_core::Transaction {
@@ -2536,7 +2571,7 @@ mod tests {
         let registration = Registration {
             public_key: candidate.public_key().clone(),
             payout: payout.clone(),
-            signature: candidate.sign(registration_message(7, &payout).as_bytes()),
+            signature: candidate.sign(randprotocol_core::types::actions::registration_message(7, &payout).as_bytes()),
         };
         let blob = hex::encode(registration.encode());
         assert_eq!(&parse_candidate(&blob).unwrap(), candidate.public_key());
@@ -3270,6 +3305,7 @@ mod tests {
             vesting: None,
             gas: None,
             testnet: None,
+            binding_domain: None,
         }
     }
 
@@ -3355,6 +3391,10 @@ mod tests {
         async fn envelope_format(&self, _chain_id: u64) -> Result<EnvelopeFormat> {
             // A chain without `envelope_bytes`, as chains 14 and 15.
             Ok(EnvelopeFormat::for_chain(None))
+        }
+        async fn binding_domain(&self, _chain_id: u64) -> Result<randprotocol_core::BindingDomain> {
+            // A chain without `binding_domain`, as chains 14 to 19.
+            Ok(randprotocol_core::BindingDomain::ChainId)
         }
     }
 

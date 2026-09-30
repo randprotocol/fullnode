@@ -31,8 +31,7 @@ use randprotocol_core::ledger::tokens::{MintAuthority, MINT_FROM};
 use randprotocol_core::ledger::{bridge_notes, TIME_WINDOW};
 use randprotocol_core::notes::{word8_from_hex, word8_to_hex, Bundle, Envelope, EnvelopeFormat, ShieldedAddress, Word8, DEPTH};
 use randprotocol_core::types::TX_BINDING_WORDS;
-use randprotocol_core::{format_amount, gas, Action, Hash, InitialMint, Keypair, PublicKey, Transaction};
-use randprotocol_core::{set_authority_message, token_mint_message};
+use randprotocol_core::{format_amount, gas, Action, BindingDomain, Hash, InitialMint, Keypair, PublicKey, Transaction};
 use randprotocol_zkvm::address::{address_of, envelope_from_core, seal_note_as};
 // `seal_note` (the format-less, always-`Legacy` sealer) is only used by test fixtures now that
 // every production sealing site goes through `seal_note_as` with the chain's format.
@@ -1821,8 +1820,9 @@ pub async fn build_transfer_declaring_bundle_gas(
     let format = rpc.envelope_format(chain_id).await?;
     let (prepared, _) = prepare_bundle(rpc, w, store, &plan, format, &guest).await?;
     let mut tx = Transaction::shielded(chain_id, prepared.bundle.clone(), Action::None);
+    let domain = scanned_binding_domain(rpc, store, chain_id).await?;
     let p = &prepared;
-    prove_transaction_by(&mut tx, |binding| async move {
+    prove_transaction_by(&mut tx, &domain, |binding| async move {
         // On a v3 chain the auth proof rides beside the bundle, exactly as `send` makes it.
         let auth = p.v3.then(|| prove_auth_locally(p, &w.sk, &binding, profile, Backend::Cpu)).transpose()?;
         let started = Instant::now();
@@ -2209,25 +2209,61 @@ fn is_anchor_miss(e: &anyhow::Error) -> bool {
 
 /// Prove `tx`'s one bundle — and on a v3 chain its auth proof, over `sk` — against `tx`'s own
 /// binding, in place, with `proving` at `profile`.
-async fn prove_transaction(tx: &mut Transaction, prepared: &Prepared, sk: &SpendKey, proving: &Proving, profile: FriProfile, proof_cap: usize) -> Result<Proved> {
-    prove_transaction_by(tx, |binding| async move { proving.prove(prepared, sk, &binding, profile, proof_cap).await }).await
+///
+/// BIND-1: `domain` is the chain's binding domain as this wallet decided it ([`binding_domain`]):
+/// what the binding the proofs are made over carries — the chain id, or the genesis hash too.
+async fn prove_transaction(tx: &mut Transaction, domain: &BindingDomain, prepared: &Prepared, sk: &SpendKey, proving: &Proving, profile: FriProfile, proof_cap: usize) -> Result<Proved> {
+    prove_transaction_by(tx, domain, |binding| async move { proving.prove(prepared, sk, &binding, profile, proof_cap).await }).await
+}
+
+/// The [`BindingDomain`] of a transaction this wallet builds for `chain_id` (BIND-1, audit v6):
+/// the chain-id domain on the chains cut before genesis `binding_domain`
+/// ([`crate::CHAIN_ID_BINDING_CHAIN_IDS`], 14–19), and on every other chain id the genesis-bound
+/// one over **the genesis hash this wallet's note store is bound to** — never the node's
+/// `binding_domain` claim, and [`crate::binding_domain_for`] says why a node lying about the
+/// hash can only make this wallet's own transactions invalid.
+///
+/// `store` must have been scanned against the node this transaction goes to ([`scan`] binds it,
+/// and starts a store bound to another chain over). On a chain outside the list the node's claim
+/// is read once, only to refuse early — before a minute and a half of proving — a chain whose
+/// ledger would refuse the genesis-bound form ([`RpcClient::require_binding_domain`]).
+async fn scanned_binding_domain(rpc: &RpcClient, store: &NoteStore, chain_id: u64) -> Result<BindingDomain> {
+    if crate::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
+        return Ok(BindingDomain::ChainId);
+    }
+    rpc.require_binding_domain(chain_id).await?;
+    let genesis = store.genesis.context("the note store is bound to no chain yet (wallet bug: scan before binding)")?;
+    Ok(crate::binding_domain_for(chain_id, genesis))
+}
+
+/// [`scanned_binding_domain`] for a caller that has not scanned yet — one that signs an action
+/// message before its fee bundle is built (`rand token mint`, `rand token set-authority`, a
+/// bridge governance submission): scans first, so the hash is the one the submission's own scan
+/// binds the store to, then answers. On a chain cut before `binding_domain` it answers without
+/// touching the node.
+pub async fn binding_domain(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore, chain_id: u64) -> Result<BindingDomain> {
+    if crate::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
+        return Ok(BindingDomain::ChainId);
+    }
+    scan(rpc, w, store).await?;
+    scanned_binding_domain(rpc, store, chain_id).await
 }
 
 /// The order [`prove_transaction`] keeps: the binding is taken with both proofs still empty, the
 /// bundle (and the auth proof, on a v3 chain) proved against it, the proofs filled in; filling
 /// them in cannot move the binding, because the binding blanks both. `prove` is handed the binding — a unit test hands in a stub
 /// prover, which is what lets the ordering be tested without a minute of proving.
-async fn prove_transaction_by<F, Fut>(tx: &mut Transaction, prove: F) -> Result<Proved>
+async fn prove_transaction_by<F, Fut>(tx: &mut Transaction, domain: &BindingDomain, prove: F) -> Result<Proved>
 where
     F: FnOnce([u32; TX_BINDING_WORDS]) -> Fut,
     Fut: std::future::Future<Output = Result<Proved>>,
 {
-    let binding = tx.binding();
+    let binding = tx.binding(domain);
     let p = prove(binding).await?;
     let bundle = tx.bundle.as_mut().context("a shielded transaction has a bundle")?;
     bundle.proof = p.proof.clone();
     bundle.auth_proof = p.auth_proof.clone();
-    debug_assert_eq!(tx.binding(), binding, "filling the proofs in never moves the binding");
+    debug_assert_eq!(tx.binding(domain), binding, "filling the proofs in never moves the binding");
     Ok(p)
 }
 
@@ -2239,14 +2275,14 @@ pub type CallProver<'a> = dyn Fn(&[u32; TX_BINDING_WORDS]) -> Result<Vec<u8>> + 
 /// [`Transaction::call_binding`], in place — the call binding blanks the call proof and the bundle
 /// proof, so filling the call proof in cannot move it, and the bundle's binding, taken next, then
 /// covers the finished call. The chain refuses the proof under any other fee bundle.
-fn bind_call(tx: &mut Transaction, prove: &CallProver<'_>) -> Result<()> {
-    let binding = tx.call_binding();
+fn bind_call(tx: &mut Transaction, domain: &BindingDomain, prove: &CallProver<'_>) -> Result<()> {
+    let binding = tx.call_binding(domain);
     let proof = prove(&binding)?;
     match &mut tx.action {
         Action::Call { proof: p, .. } => *p = proof,
         _ => return Err(anyhow!("a call binding for an action that is not a call (wallet bug)")),
     }
-    debug_assert_eq!(tx.call_binding(), binding, "filling the call proof in never moves the call binding");
+    debug_assert_eq!(tx.call_binding(domain), binding, "filling the call proof in never moves the call binding");
     Ok(())
 }
 
@@ -2413,15 +2449,18 @@ async fn submit_spend(
     // The whole transaction first, its bundle's proof empty; then the proof, bound to it. Nothing
     // is set on the transaction after the proof but the proof itself.
     let mut tx = Transaction::shielded(chain_id, prepared.bundle.clone(), action);
+    // BIND-1: what both bindings carry — decided by this transaction's chain id and, off the
+    // chains cut before `binding_domain`, the genesis hash the scan above bound the store to.
+    let domain = scanned_binding_domain(rpc, store, chain_id).await?;
     if let Some(prove_call) = call_prover {
-        bind_call(&mut tx, prove_call)?;
+        bind_call(&mut tx, &domain, prove_call)?;
     }
     // A remote prover's reply is held to the chain's proof cap; a local proof needs no read.
     let cap = match proving {
         Proving::Remote(_) => proof_cap(rpc.limits().await?.as_ref()),
         _ => gas::MAX_PROOF_BYTES,
     };
-    let proved = prove_transaction(&mut tx, &prepared, &w.sk, proving, profile, cap).await?;
+    let proved = prove_transaction(&mut tx, &domain, &prepared, &w.sk, proving, profile, cap).await?;
     // `submit_refused` labels a JSON-RPC error reply *from this call* as `SubmitRefused`
     // (node I1): it is the only failure here that means nothing was admitted, and `rand token
     // create` deletes a freshly generated authority key on it and on nothing else. Everything
@@ -2805,9 +2844,12 @@ pub async fn deploy_precheck(rpc: &RpcClient, words: usize, public_words: usize)
 /// eight-word binding, exactly as `program::hardened_call_segment` builds it for the ledger and
 /// `deploy_dry_run` sizes it. A guest reads its public words from this segment, so a re-run over
 /// an empty one traps at the first `READ_PUBLIC` of any program deployed with a public input.
-pub fn open_call_public_segment(public: &[u32], hardened: bool, tx: &Transaction) -> Vec<u32> {
+///
+/// BIND-1: `domain` is the chain's binding domain for `tx.chain_id` — the call binding the ledger
+/// recomputed carries the genesis hash under `binding_domain: 1`.
+pub fn open_call_public_segment(public: &[u32], hardened: bool, tx: &Transaction, domain: &BindingDomain) -> Vec<u32> {
     if hardened {
-        randprotocol_core::program::hardened_call_segment(public, &tx.call_binding())
+        randprotocol_core::program::hardened_call_segment(public, &tx.call_binding(domain))
     } else {
         public.to_vec()
     }
@@ -3624,10 +3666,14 @@ fn row_id_and_nonce(row: &Value, asset: u32) -> Result<(Hash, u64)> {
 /// `authority` is not that key, then the note the chain will compute and `authority`'s Dilithium2
 /// signature over [`token_mint_message`], which binds the note's commitment and the envelope's
 /// digest.
+///
+/// BIND-1: `domain` is [`binding_domain`]'s answer for `chain_id` — under genesis
+/// `binding_domain: 1` the authority's message carries the genesis hash.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_token_mint(
     rpc: &RpcClient,
     w: &Wallet,
+    domain: &BindingDomain,
     chain_id: u64,
     asset: u32,
     row: &Value,
@@ -3644,7 +3690,7 @@ pub async fn build_token_mint(
         .context("chain height does not fit a note's time field")?;
     let (note, envelope) = mint_note_for(w, recipient, amount, asset, time, rpc.envelope_format(chain_id).await?)?;
     let cm = note.commitment();
-    let signature = authority.sign(token_mint_message(chain_id, &asset_id, nonce, amount, &cm, &envelope).as_bytes());
+    let signature = authority.sign(domain.token_mint_message(chain_id, &asset_id, nonce, amount, &cm, &envelope).as_bytes());
     Ok(Action::TokenMint { asset, amount, recipient: recipient.clone(), r: note.r, time, envelope, nonce, signature })
 }
 
@@ -3652,10 +3698,18 @@ pub async fn build_token_mint(
 /// already-fetched row and refusals as [`build_token_mint`] — then `authority`'s signature over
 /// [`set_authority_message`] for `new`: a key to hand the token to, or `None` to renounce minting
 /// for good.
-pub fn build_token_set_authority(chain_id: u64, asset: u32, row: &Value, authority: &Keypair, new: Option<PublicKey>) -> Result<Action> {
+/// `domain` as in [`build_token_mint`] (BIND-1).
+pub fn build_token_set_authority(
+    domain: &BindingDomain,
+    chain_id: u64,
+    asset: u32,
+    row: &Value,
+    authority: &Keypair,
+    new: Option<PublicKey>,
+) -> Result<Action> {
     check_key_authority(row, asset, authority, "hand on")?;
     let (asset_id, nonce) = row_id_and_nonce(row, asset)?;
-    let signature = authority.sign(set_authority_message(chain_id, &asset_id, nonce, &new).as_bytes());
+    let signature = authority.sign(domain.set_authority_message(chain_id, &asset_id, nonce, &new).as_bytes());
     Ok(Action::SetAuthority { asset, new, nonce, signature })
 }
 
@@ -4027,12 +4081,17 @@ mod tests {
     fn the_open_call_re_run_uses_the_programs_public_words_and_the_hardened_binding() {
         let tx = Transaction::shielded(7, unread_bundle(), Action::Call { program: Hash::ZERO, proof: vec![1, 2, 3], input_envelope: None });
         let public = [61u32, 62, 63];
-        assert_eq!(open_call_public_segment(&public, false, &tx), vec![61, 62, 63]);
-        let hardened = open_call_public_segment(&public, true, &tx);
+        let d = BindingDomain::ChainId;
+        assert_eq!(open_call_public_segment(&public, false, &tx, &d), vec![61, 62, 63]);
+        let hardened = open_call_public_segment(&public, true, &tx, &d);
         assert_eq!(hardened.len(), 3 + randprotocol_core::types::TX_BINDING_WORDS);
         assert_eq!(&hardened[..3], &public);
-        assert_eq!(&hardened[3..], &tx.call_binding()[..], "the binding the ledger verified the call against");
-        assert_eq!(open_call_public_segment(&[], true, &tx), tx.call_binding().to_vec(), "a program without a public input: the binding alone");
+        assert_eq!(&hardened[3..], &tx.call_binding(&d)[..], "the binding the ledger verified the call against");
+        assert_eq!(open_call_public_segment(&[], true, &tx, &d), tx.call_binding(&d).to_vec(), "a program without a public input: the binding alone");
+        // BIND-1: under `binding_domain: 1` the segment carries the genesis-bound binding.
+        let g = BindingDomain::Genesis(Hash([0xa; 32]));
+        assert_eq!(&open_call_public_segment(&public, true, &tx, &g)[3..], &tx.call_binding(&g)[..]);
+        assert_ne!(tx.call_binding(&g), tx.call_binding(&d));
     }
 
     fn env() -> Envelope {
@@ -4899,6 +4958,10 @@ mod tests {
         /// `rand_status`'s `hc_auth`: `None` (served as null) unless a test runs split
         /// authorisation.
         hc_auth: Option<Word8>,
+        /// `rand_getLimits`' `binding_domain` claim (BIND-1): `1` by default — this fake is chain
+        /// 7, outside `CHAIN_ID_BINDING_CHAIN_IDS`, so the wallet proves the genesis-bound form
+        /// there and a node claiming otherwise only gets a refusal.
+        binding_domain: u32,
     }
 
     fn kind(a: &Action) -> &'static str {
@@ -4941,7 +5004,14 @@ mod tests {
                 envelope_bytes: None,
                 hc_bundle: ZkExecutor::hc_bundle(),
                 hc_auth: None,
+                binding_domain: 1,
             }
+        }
+
+        /// BIND-1: the domain every transaction this fake accepts is bound under — the wallet's
+        /// own answer for chain 7 over the genesis this fake serves.
+        fn domain(&self) -> BindingDomain {
+            crate::binding_domain_for(7, self.genesis)
         }
 
         fn head(&self) -> u64 {
@@ -5066,6 +5136,7 @@ mod tests {
                     "max_program_words": 4096, "max_proof_bytes": 2_097_152, "max_block_bytes": 4_194_304,
                     "max_call_envelope_bytes": 18_432, "max_program_public_words": 64,
                     "envelope_bytes": self.envelope_bytes,
+                    "binding_domain": self.binding_domain,
                 }),
                 _ => return Reply::Err(-32601, "unknown method"),
             })
@@ -5231,7 +5302,15 @@ mod tests {
     /// check the stub can make: every nullifier and commitment distinct, the digest the ledger
     /// recomputes (through the real executor) is the one the emulated guest published, and the
     /// proof verifies against the transaction's own binding.
+    ///
+    /// BIND-1: the binding is the one the wallet chose for `tx.chain_id` — the genesis-bound form
+    /// over the fake chain's default genesis ([`ChainState::new`]) off chains 14–19, the chain-id
+    /// form on them — so a wallet that proved the wrong form fails here.
     fn assert_admissible_shape(tx: &Transaction) {
+        assert_admissible_shape_on(tx, &crate::binding_domain_for(tx.chain_id, ChainState::new().genesis))
+    }
+
+    fn assert_admissible_shape_on(tx: &Transaction, domain: &BindingDomain) {
         let b = tx.bundle.as_ref().expect("a bundle");
         for i in 0..SLOTS {
             for j in i + 1..SLOTS {
@@ -5241,7 +5320,10 @@ mod tests {
         }
         let recomputed = ZkExecutor::new(FriProfile::Test).bundle_digest(&b.digest_input());
         assert_eq!(StubExecutor.bundle_proof_digest(&[0; 8], &b.proof).unwrap(), recomputed, "the ledger's digest is the guest's");
-        assert_eq!(StubExecutor.verify_bundle(&EMULATED_HC, &b.proof, &tx.binding()), Ok(()), "bound to this transaction");
+        assert_eq!(StubExecutor.verify_bundle(&EMULATED_HC, &b.proof, &tx.binding(domain)), Ok(()), "bound to this transaction");
+        if let BindingDomain::Genesis(_) = domain {
+            assert!(StubExecutor.verify_bundle(&EMULATED_HC, &b.proof, &tx.binding(&BindingDomain::ChainId)).is_err(), "not the chain-id form");
+        }
     }
 
     /// What each slot of `tx`'s bundle is to `w`: the note it received, the note it sent, or
@@ -6452,22 +6534,24 @@ mod tests {
 
         // A non-`Key` token refuses a mint and a rotation alike, before any network read past the
         // registry itself.
-        let e = build_token_mint(&rpc, &me, 7, 1, &row(1), &me.address, 500, &authority_kp).await.unwrap_err().to_string();
+        let domain = binding_domain(&rpc, &me, &mut store, 7).await.unwrap();
+        assert_eq!(domain, chain.lock().unwrap().domain(), "BIND-1: genesis-bound on chain 7, over the store's genesis");
+        let e = build_token_mint(&rpc, &me, &domain, 7, 1, &row(1), &me.address, 500, &authority_kp).await.unwrap_err().to_string();
         assert!(e.contains("not Key-authorised"), "{e}");
-        let e = build_token_set_authority(7, 1, &row(1), &authority_kp, None).unwrap_err().to_string();
+        let e = build_token_set_authority(&domain, 7, 1, &row(1), &authority_kp, None).unwrap_err().to_string();
         assert!(e.contains("not Key-authorised"), "{e}");
 
         // A stranger's key is refused too, against the `Key` token.
         let stranger = Keypair::generate();
-        let e = build_token_mint(&rpc, &me, 7, 2, &row(2), &me.address, 500, &stranger).await.unwrap_err().to_string();
+        let e = build_token_mint(&rpc, &me, &domain, 7, 2, &row(2), &me.address, 500, &stranger).await.unwrap_err().to_string();
         assert!(e.contains("not token 2's mint authority"), "{e}");
 
         // Zero moves nothing either way, refused before the registry is even read.
-        let e = build_token_mint(&rpc, &me, 7, 2, &row(2), &me.address, 0, &authority_kp).await.unwrap_err().to_string();
+        let e = build_token_mint(&rpc, &me, &domain, 7, 2, &row(2), &me.address, 0, &authority_kp).await.unwrap_err().to_string();
         assert!(e.contains("zero"), "{e}");
 
         // The right key mints: `TokenMint` at `mint_nonce` 0, signed, riding a fee bundle.
-        let action = build_token_mint(&rpc, &me, 7, 2, &row(2), &me.address, 500, &authority_kp).await.unwrap();
+        let action = build_token_mint(&rpc, &me, &domain, 7, 2, &row(2), &me.address, 500, &authority_kp).await.unwrap();
         assert!(matches!(&action, Action::TokenMint { asset: 2, amount: 500, nonce: 0, .. }));
         submit_token_mint_with(&rpc, &me, &mut store, action, gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false).await.unwrap();
         let tx = chain.lock().unwrap().sent.pop().unwrap();
@@ -6477,7 +6561,7 @@ mod tests {
         // And hands the token on: `SetAuthority` at the same nonce it reads, signed by the
         // current key over the new one.
         let successor = Keypair::generate();
-        let action = build_token_set_authority(7, 2, &row(2), &authority_kp, Some(successor.public_key().clone())).unwrap();
+        let action = build_token_set_authority(&domain, 7, 2, &row(2), &authority_kp, Some(successor.public_key().clone())).unwrap();
         assert!(matches!(&action, Action::SetAuthority { asset: 2, new: Some(pk), nonce: 0, .. } if *pk == *successor.public_key()));
         submit_token_set_authority_with(&rpc, &me, &mut store, action, gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false).await.unwrap();
         let tx = chain.lock().unwrap().sent.pop().unwrap();
@@ -6566,7 +6650,7 @@ mod tests {
                 | Action::ListBacking { pq_signatures, .. } => pq_signatures[1].signature[0] ^= 1,
                 _ => unreachable!(),
             }
-            assert!(StubExecutor.verify_bundle(&EMULATED_HC, &b.proof, &swapped.binding()).is_err(), "{what}: a swapped quorum unbinds the proof");
+            assert!(StubExecutor.verify_bundle(&EMULATED_HC, &b.proof, &swapped.binding(&chain.lock().unwrap().domain())).is_err(), "{what}: a swapped quorum unbinds the proof");
         }
         let e = submit_bridge_action_with(&rpc, &me, &mut store, Action::None, gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
             .await
@@ -6927,7 +7011,7 @@ mod tests {
         let tx = Transaction::shielded(7, p.bundle.clone(), Action::None);
         let mut moved = tx.clone();
         moved.bundle.as_mut().unwrap().auth_commit[0] ^= 1;
-        assert_ne!(tx.binding(), moved.binding(), "the binding covers auth_commit");
+        assert_ne!(tx.binding(&randprotocol_core::BindingDomain::ChainId), moved.binding(&randprotocol_core::BindingDomain::ChainId), "the binding covers auth_commit");
 
         // The whole path against a v3 chain.
         let you = Wallet::from_spend_key(SpendKey([58; 8]));
@@ -6949,8 +7033,9 @@ mod tests {
         assert!(!b.auth_proof.is_empty(), "the auth proof rides in the bundle");
         let recomputed = ZkExecutor::new(FriProfile::Test).bundle_digest_v3(&b.digest_input());
         assert_eq!(StubExecutor.bundle_proof_digest(&[0; 8], &b.proof).unwrap(), recomputed, "the v3 digest, auth_commit inside");
-        assert_eq!(StubExecutor.verify_bundle(&EMULATED_HC, &b.proof, &tx.binding()), Ok(()));
-        assert_eq!(StubExecutor.verify_auth(&EMULATED_AUTH_HC, &b.auth_proof, &tx.binding()), Ok(b.auth_commit), "auth bound to this transaction");
+        let domain = chain.lock().unwrap().domain();
+        assert_eq!(StubExecutor.verify_bundle(&EMULATED_HC, &b.proof, &tx.binding(&domain)), Ok(()));
+        assert_eq!(StubExecutor.verify_auth(&EMULATED_AUTH_HC, &b.auth_proof, &tx.binding(&domain)), Ok(b.auth_commit), "auth bound to this transaction");
 
         // Another auth guest, or none, on a v3 chain: refused before any proof.
         for hc_auth in [Some([0xbad; 8]), None] {
@@ -7930,8 +8015,8 @@ mod tests {
             let d = StubExecutor.bundle_digest(&p.bundle.digest_input());
             Ok(Proved { proof: StubExecutor::make_bundle_proof(&HC, &d, binding), tier: 14, proving: Duration::ZERO, auth_proof: Vec::new(), auth_proving: None })
         };
-        prove_transaction_by(&mut tx, |b| std::future::ready(stub(&prepared, &b))).await.unwrap();
-        let binding = tx.binding();
+        prove_transaction_by(&mut tx, &BindingDomain::ChainId, |b| std::future::ready(stub(&prepared, &b))).await.unwrap();
+        let binding = tx.binding(&BindingDomain::ChainId);
         let b = tx.bundle.as_ref().unwrap();
         assert_eq!(StubExecutor.bundle_proof_digest(&[0; 8], &b.proof).unwrap(), StubExecutor.bundle_digest(&b.digest_input()));
         assert_eq!(StubExecutor.verify_bundle(&HC, &b.proof, &binding), Ok(()));
@@ -7941,7 +8026,7 @@ mod tests {
         let Action::BridgeBurn { to, .. } = &mut copy.action else { panic!("a burn") };
         *to = [2; 32];
         let refused = Err(ConfidentialError::InvalidBundleProof("PublicValues".into()));
-        assert_eq!(StubExecutor.verify_bundle(&HC, &copy.bundle.as_ref().unwrap().proof, &copy.binding()), refused);
+        assert_eq!(StubExecutor.verify_bundle(&HC, &copy.bundle.as_ref().unwrap().proof, &copy.binding(&randprotocol_core::BindingDomain::ChainId)), refused);
     }
 
     /// INT-4, the wallet's order under genesis `hardening_v6`: the call is proved over the
@@ -7975,24 +8060,24 @@ mod tests {
         let call = Action::Call { program: id, proof: Vec::new(), input_envelope: None };
         let mut tx = Transaction::shielded(13, prepared.bundle.clone(), call);
         let prove_call = |b: &[u32; TX_BINDING_WORDS]| -> Result<Vec<u8>> { Ok(StubExecutor::make_proof_with_public(&id, 12, [5; 8], b)) };
-        bind_call(&mut tx, &prove_call).unwrap();
+        bind_call(&mut tx, &BindingDomain::ChainId, &prove_call).unwrap();
         let stub = |p: &Prepared, binding: &[u32; TX_BINDING_WORDS]| -> Result<Proved> {
             let d = StubExecutor.bundle_digest(&p.bundle.digest_input());
             Ok(Proved { proof: StubExecutor::make_bundle_proof(&HC, &d, binding), tier: 14, proving: Duration::ZERO, auth_proof: Vec::new(), auth_proving: None })
         };
-        prove_transaction_by(&mut tx, |b| std::future::ready(stub(&prepared, &b))).await.unwrap();
+        prove_transaction_by(&mut tx, &BindingDomain::ChainId, |b| std::future::ready(stub(&prepared, &b))).await.unwrap();
         let Action::Call { proof, .. } = &tx.action else { panic!("a call") };
-        assert!(StubExecutor.verify_call_hardened(&record, proof, &tx.call_binding()).is_ok(), "bound to its own transaction");
-        assert_eq!(StubExecutor.verify_bundle(&HC, &tx.bundle.as_ref().unwrap().proof, &tx.binding()), Ok(()));
+        assert!(StubExecutor.verify_call_hardened(&record, proof, &tx.call_binding(&randprotocol_core::BindingDomain::ChainId)).is_ok(), "bound to its own transaction");
+        assert_eq!(StubExecutor.verify_bundle(&HC, &tx.bundle.as_ref().unwrap().proof, &tx.binding(&randprotocol_core::BindingDomain::ChainId)), Ok(()));
         let mut lifted = Transaction::shielded(13, bundle(40), tx.action.clone());
         StubExecutor::bind(&mut lifted);
         let Action::Call { proof, .. } = &lifted.action else { panic!("a call") };
         assert_eq!(
-            StubExecutor.verify_call_hardened(&record, proof, &lifted.call_binding()),
+            StubExecutor.verify_call_hardened(&record, proof, &lifted.call_binding(&randprotocol_core::BindingDomain::ChainId)),
             Err(ConfidentialError::InvalidProof("PublicValues".into())),
             "the same call proof under another fee bundle"
         );
-        assert!(bind_call(&mut Transaction::shielded(13, bundle(50), Action::None), &prove_call).is_err(), "only a call is bound");
+        assert!(bind_call(&mut Transaction::shielded(13, bundle(50), Action::None), &BindingDomain::ChainId, &prove_call).is_err(), "only a call is bound");
     }
 
     /// Review finding (fix round 1 of 5): under a node's gas policy, `submit_bound_call`'s guard

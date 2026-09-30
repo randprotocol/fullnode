@@ -446,6 +446,17 @@ pub struct Genesis {
     /// `rand_status` and `rand_getLimits` so a wallet and an explorer can show it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub testnet: Option<bool>,
+    /// BIND-1 (audit v6, issue #79): what every transaction binding and every signed action
+    /// message on this chain is over ([`crate::types::BindingDomain`]). Absent — chains 14 to 19 —
+    /// or `0`: the chain id alone, exactly the messages those chains' wallets prove and sign. `1`:
+    /// the genesis hash enters every one under a fresh tag (`rand-tx-bind-2`, `rand-call-bind-2`,
+    /// the faucet mint's, `Unbond`'s, `Withdraw`'s, the RPL token messages', the aggregator
+    /// actions' and the bridge governance messages' `-N+1` tags), so a proof or a signature made
+    /// for this chain verifies on no other chain, whatever its chain id. Part of the genesis hash,
+    /// tagged and appended after `gas`, only when present — a file without it hashes byte-for-byte
+    /// as before; never part of the state root (a genesis parameter `reload_ledger` restores).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_domain: Option<u32>,
 }
 
 /// The chains whose committed genesis file (`deploy/genesis-chain<N>.json`) carries both
@@ -512,6 +523,8 @@ pub enum GenesisError {
     BadTokens(String),
     #[error("unknown consensus_domain {0} (0 or 1)")]
     BadConsensusDomain(u32),
+    #[error("unknown binding_domain {0} (0 or 1)")]
+    BadBindingDomain(u32),
     /// Audit v4, STAKE-2 rule 1: under a `staking` section a chain that holds bridged custody
     /// cannot also hand out free RAND — unless `staking.faucet_recipients` limits the faucet to
     /// named spend keys.
@@ -779,6 +792,13 @@ impl Genesis {
         // sectioned testnet still needs its allowlist as well.
         if self.faucet && self.bridge.is_some() && self.testnet != Some(true) && !FAUCET_BESIDE_BRIDGE_CHAIN_IDS.contains(&self.chain_id) {
             return Err(GenesisError::FaucetWithBridgeNeedsTestnet { chain_id: self.chain_id });
+        }
+        // The binding domain (audit v6, BIND-1), likewise: a version this build cannot compute
+        // would leave every wallet and the ledger hashing different words.
+        if let Some(v) = self.binding_domain {
+            if v > crate::types::BindingDomain::MAX_VERSION {
+                return Err(GenesisError::BadBindingDomain(v));
+            }
         }
         // Audit v4, STAKE-2 rule 1, only under the section: a faucet and a bridge exclude each
         // other. Chain 14's genesis has both and no section, so it still loads.
@@ -1326,6 +1346,13 @@ impl Genesis {
             commit.extend_from_slice(&sl.equivocation_bps.to_be_bytes());
             commit.extend_from_slice(&sl.jail_epochs.to_be_bytes());
         }
+        // The binding domain (audit v6, BIND-1), after `gas` — last — tagged like the consensus
+        // domain and only when the file sets it, so chain 18 (`a7cb020c…`) and every genesis cut
+        // before it hashes byte-for-byte as before.
+        if let Some(v) = self.binding_domain {
+            commit.extend_from_slice(b"binding_domain");
+            commit.extend_from_slice(&v.to_be_bytes());
+        }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
             height: 0,
@@ -1342,6 +1369,9 @@ impl Genesis {
         // exists; it is not state, so the root above is unaffected.
         let consensus_domain = self.consensus_domain.unwrap_or(0);
         ledger.set_signing_domain(SigningDomain { version: consensus_domain, genesis: block.hash() });
+        // BIND-1: the binding domain carries the same hash, for the same reason set here; like the
+        // signing domain it is not state.
+        ledger.set_binding_domain(crate::types::BindingDomain::for_version(self.binding_domain.unwrap_or(0), block.hash()));
         Ok(GenesisState {
             chain_id: self.chain_id,
             faucet: self.faucet,
@@ -1737,6 +1767,7 @@ mod tests {
             hc_auth: None,
             gas: None,
             testnet: None,
+            binding_domain: None,
         }
     }
 
@@ -1773,6 +1804,44 @@ mod tests {
         assert_eq!(Genesis::from_json(&g.to_json()).unwrap().consensus_domain, Some(1));
         assert!(!base.to_json().contains("consensus_domain"));
         assert_eq!(build(&Genesis::from_json(&base.to_json()).unwrap()).hash(), plain.hash());
+    }
+
+    /// BIND-1 (audit v6): the binding domain is genesis-gated exactly as the consensus domain is.
+    /// The field is committed — tagged, last — only when present, so a file without it builds to
+    /// the same hash and a `ChainId` ledger; with `1` the ledger's domain carries the genesis hash
+    /// the file itself builds to; validation refuses a version this build does not compute.
+    #[test]
+    fn a_genesis_with_binding_domain_1_commits_it_and_one_without_is_unchanged() {
+        use crate::types::BindingDomain;
+        let base = genesis(1);
+        assert_eq!(base.binding_domain, None, "chain 18's shape has no field");
+        let plain = build(&base);
+        assert_eq!(plain.ledger.binding_domain(), &BindingDomain::ChainId);
+        let mut g = base.clone();
+        g.binding_domain = Some(1);
+        let v1 = build(&g);
+        assert_ne!(v1.hash(), plain.hash(), "the version is part of the genesis binding");
+        assert_eq!(v1.ledger.binding_domain(), &BindingDomain::Genesis(v1.hash()), "the ledger binds this genesis' own hash");
+        assert_eq!(v1.ledger.state_root(), plain.ledger.state_root(), "a genesis parameter, never state");
+        assert_eq!(v1.ledger, plain.ledger, "and outside the ledger's equality");
+        // `0` is today's messages, but it is a field in the file, so it is in the hash.
+        let mut zero = base.clone();
+        zero.binding_domain = Some(0);
+        let v0 = build(&zero);
+        assert_eq!(v0.ledger.binding_domain(), &BindingDomain::ChainId);
+        assert_ne!(v0.hash(), plain.hash());
+        assert_ne!(v0.hash(), v1.hash());
+        let mut bad = base.clone();
+        bad.binding_domain = Some(2);
+        assert!(matches!(bad.validate(), Err(GenesisError::BadBindingDomain(2))));
+        // The field round-trips through the file, and an absent one stays absent.
+        assert_eq!(Genesis::from_json(&g.to_json()).unwrap().binding_domain, Some(1));
+        assert!(!base.to_json().contains("binding_domain"));
+        assert_eq!(build(&Genesis::from_json(&base.to_json()).unwrap()).hash(), plain.hash());
+        // Beside the consensus domain the two tags are independent: each moves the hash alone.
+        let mut both = g.clone();
+        both.consensus_domain = Some(1);
+        assert_ne!(build(&both).hash(), v1.hash());
     }
 
     /// Audit v3, CHAIN9-1: the admitted shapes are declared with a FRI profile of their own, and

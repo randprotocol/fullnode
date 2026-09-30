@@ -45,7 +45,7 @@ use super::tokens::{
     MAX_BACKING_DECIMALS,
 };
 use super::{Ledger, TxError};
-use crate::bridge::gov::{list_message, pause_message, register_message, rotate_pause_message, rotate_pq_message, unpause_message};
+use crate::bridge::gov::{list_message_in, pause_message_in, register_message_in, rotate_pause_message_in, rotate_pq_message_in, unpause_message_in};
 use crate::bridge::pq::{check_pq_structure, verify_pq_message};
 use crate::bridge::{BridgeError, BridgeState};
 use crate::gas;
@@ -111,7 +111,7 @@ pub(super) fn validate(ledger: &Ledger, tx: &Transaction, action: &Action) -> Re
                 return Err(TxError::Bridge(BridgeError::AlreadyPaused));
             }
             // Last: one Dilithium2 verification, over the fixed-layout message for this chain.
-            if !key.verify(&pause_message(tx.chain_id, *nonce), signature) {
+            if !key.verify(&pause_message_in(ledger.binding_domain(), tx.chain_id, *nonce), signature) {
                 return Err(TxError::Bridge(BridgeError::BadPauseSignature));
             }
             Ok(())
@@ -128,7 +128,7 @@ pub(super) fn validate(ledger: &Ledger, tx: &Transaction, action: &Action) -> Re
                 return Err(TxError::Bridge(BridgeError::NotPaused));
             }
             // Rule 4 last: one verification per listed signature.
-            verify_pq_message(pq_signatures, &bridge.pq_guardians, &unpause_message(tx.chain_id, *nonce))
+            verify_pq_message(pq_signatures, &bridge.pq_guardians, &unpause_message_in(ledger.binding_domain(), tx.chain_id, *nonce))
                 .map_err(TxError::Bridge)
         }
         Action::RegisterBridgedToken { name, symbol, salt, chain, token: coin, decimals, nonce, pq_signatures } => {
@@ -160,7 +160,7 @@ pub(super) fn validate(ledger: &Ledger, tx: &Transaction, action: &Action) -> Re
                 return Err(token(TokenError::RegistrationFeeTooLow { min, fee: tx.fee() }));
             }
             // Last: the quorum's Dilithium2 verifications over the fixed-layout message.
-            let message = register_message(tx.chain_id, *nonce, name, symbol, salt, *chain, coin, *decimals)
+            let message = register_message_in(ledger.binding_domain(), tx.chain_id, *nonce, name, symbol, salt, *chain, coin, *decimals)
                 .expect("check_metadata bounds the name and the symbol well under 255 bytes");
             verify_pq_message(pq_signatures, &bridge.pq_guardians, &message).map_err(TxError::Bridge)
         }
@@ -178,7 +178,7 @@ pub(super) fn validate(ledger: &Ledger, tx: &Transaction, action: &Action) -> Re
             verify_pq_message(
                 pq_signatures,
                 &bridge.pq_guardians,
-                &list_message(tx.chain_id, *nonce, *token_index, *chain, coin, *decimals),
+                &list_message_in(ledger.binding_domain(), tx.chain_id, *nonce, *token_index, *chain, coin, *decimals),
             )
             .map_err(TxError::Bridge)
         }
@@ -205,7 +205,7 @@ pub(super) fn validate(ledger: &Ledger, tx: &Transaction, action: &Action) -> Re
                 return Err(TxError::Bridge(BridgeError::GuardianIsPauseKey));
             }
             // Last: the current set's quorum over the fixed-layout message.
-            verify_pq_message(pq_signatures, &bridge.pq_guardians, &rotate_pq_message(tx.chain_id, *nonce, new_pq_guardians))
+            verify_pq_message(pq_signatures, &bridge.pq_guardians, &rotate_pq_message_in(ledger.binding_domain(), tx.chain_id, *nonce, new_pq_guardians))
                 .map_err(TxError::Bridge)
         }
         Action::RotatePauseKey { new_pause_key, nonce, pq_signatures } => {
@@ -218,7 +218,7 @@ pub(super) fn validate(ledger: &Ledger, tx: &Transaction, action: &Action) -> Re
             if bridge.pq_guardians.contains(new_pause_key) {
                 return Err(TxError::Bridge(BridgeError::PauseKeyIsGuardian));
             }
-            verify_pq_message(pq_signatures, &bridge.pq_guardians, &rotate_pause_message(tx.chain_id, *nonce, new_pause_key))
+            verify_pq_message(pq_signatures, &bridge.pq_guardians, &rotate_pause_message_in(ledger.binding_domain(), tx.chain_id, *nonce, new_pause_key))
                 .map_err(TxError::Bridge)
         }
         _ => Err(NOT_BRIDGE_GOV),
@@ -297,6 +297,7 @@ pub(super) fn apply(ledger: &mut Ledger, _tx: &Transaction, action: &Action) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::gov::{list_message, pause_message, register_message, rotate_pause_message, rotate_pq_message, unpause_message};
     use crate::bridge::pq::tests::{hex32, vector_keys, vector_sigs, vectors};
     use crate::bridge::{guardian_address, BridgeConfig, PqSignature};
     use crate::confidential::{ConfidentialExecutor, StubExecutor};
@@ -886,5 +887,101 @@ mod tests {
         let c = paid(&l, 30, gas::BUNDLE_BASE, list(2, 1, coins[2]));
         l.apply_transactions(&[a, c], &p, &StubExecutor).unwrap();
         assert_eq!(l.bridge().unwrap().list_nonce, 3);
+    }
+
+    /// BIND-1 (audit v6): under genesis `binding_domain: 1` each of the six governance messages
+    /// carries the genesis hash. Two ledgers, one chain id, one guardian set, one pause key, the
+    /// same nonces — what a re-cut looks like: the pause key's signature and every quorum made
+    /// for genesis A are refused on B, today's chain-id messages are refused on both, and without
+    /// the flag today's messages are the valid ones (every other test of this module).
+    #[test]
+    fn under_binding_domain_every_governance_message_binds_the_genesis() {
+        use crate::bridge::gov::{list_message_in, pause_message_in, register_message_in, rotate_pause_message_in, rotate_pq_message_in, unpause_message_in};
+        use crate::types::BindingDomain;
+        let coins = coins();
+        let p = proposer().address();
+        // One token registered and minting not yet paused, in the chain-id world, then the same
+        // state under two genesis hashes.
+        let mut base = ledger_v2();
+        base.apply_tx(&paid(&base, 10, gas::BUNDLE_BASE + FEE, register(0, coins[0], salt())), &p, &StubExecutor).unwrap();
+        base.record_anchor(base.height());
+        let on = |l: &Ledger, g: u8| {
+            let mut l = l.clone();
+            l.set_binding_domain(BindingDomain::Genesis(crate::crypto::Hash([g; 32])));
+            l
+        };
+        let (la, lb) = (on(&base, 0xa), on(&base, 0xb));
+        let (da, v1) = (*la.binding_domain(), BindingDomain::ChainId);
+        let pause_key = Keypair::from_seed([0x7f; 32]).unwrap();
+        let bare = |action: Action| Transaction { chain_id: CHAIN, bundle: None, action };
+        let bad_quorum = bridge_err(BridgeError::PqBadSignature { index: 0 });
+
+        // Pause: the one key, its one message.
+        let pause = |d: &BindingDomain| bare(Action::PauseMints { nonce: 0, signature: pause_key.sign(&pause_message_in(d, CHAIN, 0)) });
+        assert_eq!(base.validate(&pause(&v1), &StubExecutor), Ok(()));
+        assert_eq!(la.validate(&pause(&da), &StubExecutor), Ok(()));
+        assert_eq!(lb.validate(&pause(&da), &StubExecutor), bridge_err(BridgeError::BadPauseSignature));
+        assert_eq!(la.validate(&pause(&v1), &StubExecutor), bridge_err(BridgeError::BadPauseSignature));
+        assert_eq!(base.validate(&pause(&da), &StubExecutor), bridge_err(BridgeError::BadPauseSignature));
+
+        // The listings: a registration (list_nonce 1 after the base's own) and a further backing.
+        let reg = |l: &Ledger, d: &BindingDomain| {
+            let (chain, token, decimals) = coins[2];
+            let m = register_message_in(d, CHAIN, 1, "Second USD", "zUSD2", &salt(), chain, &token, decimals).unwrap();
+            let action = Action::RegisterBridgedToken {
+                name: "Second USD".into(),
+                symbol: "zUSD2".into(),
+                salt: salt(),
+                chain,
+                token,
+                decimals,
+                nonce: 1,
+                pq_signatures: quorum(&[0, 1, 2, 3, 4], &m),
+            };
+            StubExecutor::bound_in(paid(l, 30, gas::BUNDLE_BASE + FEE, action), l.binding_domain())
+        };
+        let list = |l: &Ledger, d: &BindingDomain| {
+            let (chain, token, decimals) = coins[1];
+            let m = list_message_in(d, CHAIN, 1, 1, chain, &token, decimals);
+            let action = Action::ListBacking { token_index: 1, chain, token, decimals, nonce: 1, pq_signatures: quorum(&[0, 1, 2, 3, 4], &m) };
+            StubExecutor::bound_in(paid(l, 40, gas::BUNDLE_BASE, action), l.binding_domain())
+        };
+        for (name, build) in [("register", &reg as &dyn Fn(&Ledger, &BindingDomain) -> Transaction), ("list", &list)] {
+            assert_eq!(base.validate(&build(&base, &v1), &StubExecutor), Ok(()), "{name}: today");
+            assert_eq!(la.validate(&build(&la, &da), &StubExecutor), Ok(()), "{name}");
+            assert_eq!(lb.validate(&build(&lb, &da), &StubExecutor), bad_quorum, "{name}: A's quorum on B");
+            assert_eq!(la.validate(&build(&la, &v1), &StubExecutor), bad_quorum, "{name}: a chain-id quorum under the flag");
+        }
+
+        // The two rotations, at rotation nonce 0 under the current set.
+        let guardians = pq_keys();
+        let new_set = pks(&fresh_pq_set(6));
+        let new_pause = Keypair::from_seed([0x99; 32]).unwrap().public_key().clone();
+        let rotate_pq = |l: &Ledger, d: &BindingDomain| {
+            rotate_pq_tx(l, new_set.clone(), 0, quorum_of(&guardians, &[0, 1, 2, 3, 4], &rotate_pq_message_in(d, CHAIN, 0, &new_set)))
+        };
+        let rotate_pause = |l: &Ledger, d: &BindingDomain| {
+            rotate_pause_tx(l, new_pause.clone(), 0, quorum_of(&guardians, &[0, 1, 2, 3, 4], &rotate_pause_message_in(d, CHAIN, 0, &new_pause)))
+        };
+        for (name, build) in [("rotate-pq", &rotate_pq as &dyn Fn(&Ledger, &BindingDomain) -> Transaction), ("rotate-pause", &rotate_pause)] {
+            assert_eq!(base.validate(&build(&base, &v1), &StubExecutor), Ok(()), "{name}: today");
+            assert_eq!(la.validate(&build(&la, &da), &StubExecutor), Ok(()), "{name}");
+            assert_eq!(lb.validate(&build(&lb, &da), &StubExecutor), bad_quorum, "{name}: A's quorum on B");
+            assert_eq!(la.validate(&build(&la, &v1), &StubExecutor), bad_quorum, "{name}: a chain-id quorum under the flag");
+        }
+
+        // Unpause: both chains paused by their own pause, then A's unpause quorum tried on B.
+        let paused = |l: &Ledger| {
+            let mut l = l.clone();
+            let d = *l.binding_domain();
+            l.apply_tx(&pause(&d), &p, &StubExecutor).unwrap();
+            l
+        };
+        let (pa, pb, p0) = (paused(&la), paused(&lb), paused(&base));
+        let unpause = |d: &BindingDomain| bare(Action::UnpauseMints { nonce: 1, pq_signatures: quorum(&[0, 1, 2, 3, 4], &unpause_message_in(d, CHAIN, 1)) });
+        assert_eq!(p0.validate(&unpause(&v1), &StubExecutor), Ok(()));
+        assert_eq!(pa.validate(&unpause(&da), &StubExecutor), Ok(()));
+        assert_eq!(pb.validate(&unpause(&da), &StubExecutor), bad_quorum);
+        assert_eq!(pa.validate(&unpause(&v1), &StubExecutor), bad_quorum);
     }
 }

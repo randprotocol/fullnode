@@ -92,6 +92,8 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | `--max-gas-price <UNITS>`, `--max-byte-price <UNITS>` | none — no ceiling (chain 18) | audit v6, POOL-2: the ceilings the controller never lifts a price over, each at least the starting price. Refused without `--gas-dynamic` |
 | `--gas-byte-load paying` | none — every transaction's bytes (chain 18) | audit v6, POOL-2: only a call's proof and input envelope move `byte_price`, so a block of transfers moves none. Refused without `--gas-dynamic`; `paying` is the only value |
 
+| `--binding-domain <0\|1>` | none — no field | audit v6, BIND-1: `1` binds the genesis hash into every transaction binding (`rand-tx-bind-2`, `rand-call-bind-2`) and every signed action message (a faucet mint, unbond, withdraw, the RPL token messages, the aggregator actions, the bridge governance messages), so a proof or a signature for this chain verifies on no other chain that shares its chain id. Tagged and appended to the genesis hash after the `gas` section, only when present; omitted, the file has no field — chains 14 to 19's rules, byte for byte — and the command warns: a wallet proves only the genesis-bound form on a chain id outside 14–19, so **every new chain from chain 20 on is cut with `--binding-domain 1`** (chain 19, the v0.6.7 re-genesis, is cut without it) (`docs/deploy.md`, "The next cut: `binding_domain`") |
+
 `rand-node genesis`/`init` print `gas: price P/gas, B/KiB, bundle limit N, dynamic: target … / …
 gas, adjust … bps, floor …/…, ceiling …/…, byte load all|paying` (or `gas: none` without
 `--gas-price`).

@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use randprotocol_core::notes::{word8_from_hex, Envelope, EnvelopeFormat, Word8, DEPTH};
 use randprotocol_core::program::ProgramId;
 use randprotocol_core::types::CallEnvelope;
-use randprotocol_core::{Hash, Transaction};
+use randprotocol_core::{BindingDomain, Hash, Transaction};
 use std::time::{Duration, Instant};
 
 pub mod contacts;
@@ -286,6 +286,38 @@ pub fn envelope_format_for(chain_id: u64, node_envelope_bytes: Option<u32>) -> E
     EnvelopeFormat::for_chain(node_envelope_bytes)
 }
 
+/// BIND-1 (audit v6, issue #79): the chain ids of every public chain whose genesis carries no
+/// `binding_domain` — chains 14–19 (19 the v0.6.7 re-genesis, cut without it), where a transaction's binding and every signed action message
+/// bind the chain id alone. On these, and only on these, a wallet proves and signs the chain-id
+/// form. **Every chain cut without `binding_domain` is added here** —
+/// `every_committed_genesis_without_binding_domain_is_pinned` fails until it is.
+pub const CHAIN_ID_BINDING_CHAIN_IDS: &[u64] = &[14, 15, 16, 17, 18, 19];
+
+/// The [`BindingDomain`] a wallet uses for a transaction it builds for `chain_id`, given the
+/// genesis hash its note store is bound to (BIND-1).
+///
+/// Whether a chain uses `binding_domain` is decided by the transaction's own chain id, never by
+/// the node's `rand_getLimits.binding_domain` — nothing in that reply is authenticated (the
+/// `envelope_bytes` trap, issue #64). A chain id in [`CHAIN_ID_BINDING_CHAIN_IDS`] gets the
+/// chain-id form whatever the node says: the real chain with that id accepts nothing else. Every
+/// other chain id gets the genesis-bound form, over `genesis`.
+///
+/// `genesis` is itself the node's word (`rand_getGenesisHash`, which the store was bound to at
+/// its first scan), and that is the safe direction to be lied to in. A genesis-bound binding or
+/// signature is valid on exactly one chain: the one whose genesis hash is the hash inside it. A
+/// node that reports a hash other than the real chain's makes this wallet's transactions invalid
+/// on the real chain — refused `InvalidBundleProof` / a bad signature, nothing admitted, nothing
+/// spent — and valid only on a chain whose genesis *is* the hash it reported, which is the chain
+/// the liar described. It can never make them valid on a second chain, which is the whole of what
+/// BIND-1 is about. The reverse lie does not exist: there is no answer a node can give that makes
+/// this function return the chain-id form on a chain id outside the list.
+pub fn binding_domain_for(chain_id: u64, genesis: Hash) -> BindingDomain {
+    if CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
+        return BindingDomain::ChainId;
+    }
+    BindingDomain::Genesis(genesis)
+}
+
 #[derive(Clone)]
 pub struct RpcClient {
     url: String,
@@ -298,7 +330,10 @@ pub struct RpcClient {
     /// [`RpcClient::envelope_format`]'s cache: one `rand_getLimits` read for the life of this
     /// client and everything cloned from it (the `Arc` is shared, like `legacy_status` above),
     /// not one per bundle a wallet builds.
-    envelope_format: std::sync::Arc<tokio::sync::OnceCell<Option<u32>>>,
+    ///
+    /// BIND-1: the same one read carries the node's `binding_domain` claim beside it
+    /// ([`RpcClient::claimed_binding_domain`]) — `(envelope_bytes, binding_domain)`.
+    envelope_format: std::sync::Arc<tokio::sync::OnceCell<(Option<u32>, u32)>>,
     /// The first wait after a rate-limit refusal (issue #117); doubled per retry up to
     /// [`RATE_LIMIT_RETRIES`] retries. A second in production; tests shorten it.
     rate_limit_wait: Duration,
@@ -659,14 +694,72 @@ impl RpcClient {
     /// never cached (`get_or_try_init` only stores the `Ok` arm), so a transient RPC failure does
     /// not wrongly pin this client to `Legacy` for the rest of its life.
     pub async fn envelope_format(&self, chain_id: u64) -> Result<EnvelopeFormat> {
-        let envelope_bytes = self
+        let (envelope_bytes, _) = self.cached_limits().await?;
+        Ok(envelope_format_for(chain_id, envelope_bytes))
+    }
+
+    /// The one cached `rand_getLimits` read behind [`RpcClient::envelope_format`] and
+    /// [`RpcClient::claimed_binding_domain`]: `(envelope_bytes, binding_domain)`, `(None, 0)` from
+    /// a node too old for the method or for either field. A failed read is never cached.
+    async fn cached_limits(&self) -> Result<(Option<u32>, u32)> {
+        let cached = self
             .envelope_format
             .get_or_try_init(|| async {
-                let bytes = self.limits().await?.and_then(|l| l.envelope_bytes).and_then(|n| u32::try_from(n).ok());
-                Ok::<_, anyhow::Error>(bytes)
+                let v = match self.call("rand_getLimits", json!([])).await {
+                    Ok(v) => v,
+                    Err(e) if is_method_not_found(&e) => return Ok((None, 0)),
+                    Err(e) => return Err(e),
+                };
+                // The envelope size through the typed reply, exactly as before; the binding
+                // domain off the same JSON, absent (an older node) read as 0.
+                let limits: ChainLimits = serde_json::from_value(v.clone()).context("decoding rand_getLimits")?;
+                let bytes = limits.envelope_bytes.and_then(|n| u32::try_from(n).ok());
+                let binding = v.get("binding_domain").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
+                Ok::<_, anyhow::Error>((bytes, binding))
             })
             .await?;
-        Ok(envelope_format_for(chain_id, *envelope_bytes))
+        Ok(*cached)
+    }
+
+    /// What this node says the chain's genesis `binding_domain` is (BIND-1): `0` or `1`, `0` from
+    /// a node that predates the field. **The node's unauthenticated word** — it never decides
+    /// which binding a wallet proves ([`binding_domain_for`] does, from the chain id); it is read
+    /// only to refuse early, with a reason, what the chain would refuse after a proof
+    /// ([`RpcClient::binding_domain`], `wallet::binding_domain`).
+    pub async fn claimed_binding_domain(&self) -> Result<u32> {
+        Ok(self.cached_limits().await?.1)
+    }
+
+    /// Refuse, before anything is proved or signed, a chain this wallet could not transact on
+    /// (BIND-1): `chain_id` is not one of the chains cut before `binding_domain`
+    /// ([`CHAIN_ID_BINDING_CHAIN_IDS`]), so this wallet signs only genesis-bound messages for it —
+    /// and the node says its genesis has no `binding_domain`, so its ledger would refuse every one
+    /// of them. A lying node can only make this wallet refuse to send; it cannot make it sign the
+    /// chain-id form.
+    pub async fn require_binding_domain(&self, chain_id: u64) -> Result<()> {
+        if CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) || self.claimed_binding_domain().await? >= 1 {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "this node reports no binding_domain for chain {chain_id}, and chain {chain_id} is not one of the chains cut before it \
+             ({CHAIN_ID_BINDING_CHAIN_IDS:?}): this wallet signs only genesis-bound transactions there (BIND-1), which a chain \
+             without binding_domain refuses. Cut the genesis with `rand-node genesis --binding-domain 1`, or use a node on a \
+             build that serves rand_getLimits.binding_domain"
+        ))
+    }
+
+    /// The [`BindingDomain`] of a transaction or a signed message for `chain_id`, for a tool that
+    /// holds no note store — an operator's `rand-node unbond`, a governance submission: the
+    /// chain-id domain on the chains cut before `binding_domain`, otherwise the genesis-bound one
+    /// over this node's own `rand_getGenesisHash` ([`binding_domain_for`] says why a lie there is
+    /// harmless), refused early when the node says the chain has no such domain. A wallet with a
+    /// store takes the hash from the store instead (`wallet::binding_domain`).
+    pub async fn binding_domain(&self, chain_id: u64) -> Result<BindingDomain> {
+        if CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
+            return Ok(BindingDomain::ChainId);
+        }
+        self.require_binding_domain(chain_id).await?;
+        Ok(binding_domain_for(chain_id, self.genesis_hash().await?))
     }
 
     pub async fn receipt(&self, tx: &Hash) -> Result<Option<Value>> {
@@ -1467,6 +1560,92 @@ mod tests {
         assert_eq!(envelope_format_for(17, Some(1860)), EnvelopeFormat::Legacy);
         assert_eq!(envelope_format_for(20, Some(1860)), EnvelopeFormat::Memo);
         assert_eq!(envelope_format_for(20, None), EnvelopeFormat::Legacy);
+    }
+
+    /// BIND-1: every committed genesis file (`deploy/genesis-chain*.json`) of a chain that could
+    /// still run — chain 14 on — and carries no `binding_domain` (or `0`) has its chain id in
+    /// [`CHAIN_ID_BINDING_CHAIN_IDS`], and no chain that sets it is pinned there. A new cut
+    /// without the field fails here until it is pinned — and should not be cut without it: on
+    /// any other chain id this wallet signs only the genesis-bound form.
+    #[test]
+    fn every_committed_genesis_without_binding_domain_is_pinned() {
+        let deploy = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&deploy).expect("deploy/") {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !(name.starts_with("genesis-chain") && name.ends_with(".json")) {
+                continue;
+            }
+            let g: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let chain_id = g["chain_id"].as_u64().expect("chain_id");
+            if chain_id < 14 {
+                continue;
+            }
+            seen += 1;
+            match g.get("binding_domain").and_then(Value::as_u64) {
+                None | Some(0) => {
+                    assert!(CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id), "{name}: chain {chain_id} has no binding_domain and is not pinned")
+                }
+                Some(_) => assert!(!CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id), "{name}: chain {chain_id} sets binding_domain but is pinned chain-id"),
+            }
+        }
+        assert!(seen >= 5, "chains 14–18 are committed");
+        let g = Hash([7; 32]);
+        for pinned in [14, 15, 16, 17, 18, 19] {
+            assert_eq!(binding_domain_for(pinned, g), BindingDomain::ChainId, "chain {pinned}");
+        }
+        for other in [0, 1, 7, 13, 20, 21, 99, u64::MAX] {
+            assert_eq!(binding_domain_for(other, g), BindingDomain::Genesis(g), "chain {other}");
+        }
+    }
+
+    /// BIND-1: which binding a tool without a store uses is the chain id's to decide, never the
+    /// node's claim. On a pinned chain id a node claiming `binding_domain: 1` is not believed (and
+    /// not even asked); on any other the genesis-bound form is the only one there is, and a node
+    /// claiming the chain has no such domain — or too old to say — gets a refusal, not a chain-id
+    /// signature.
+    #[tokio::test]
+    async fn the_binding_domain_is_the_chain_ids_never_the_nodes_claim() {
+        use test_rpc::{rpc_fn, scripted_rpc, Reply};
+        let limits = |binding: Option<u32>| {
+            let mut v = json!({
+                "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+                "max_call_envelope_bytes": 18432, "max_program_public_words": 64,
+            });
+            if let Some(b) = binding {
+                v["binding_domain"] = json!(b);
+            }
+            v
+        };
+        let genesis = Hash([0x5a; 32]);
+        let node = |binding: Option<u32>| async move {
+            RpcClient::new(
+                rpc_fn(move |m, _p| match m {
+                    "rand_getLimits" => Reply::Ok(limits(binding)),
+                    "rand_getGenesisHash" => Reply::Ok(json!(genesis.to_hex())),
+                    other => panic!("unexpected {other}"),
+                })
+                .await,
+            )
+        };
+        // A pinned chain: the chain-id form, whatever the node claims.
+        assert_eq!(node(Some(1)).await.binding_domain(18).await.unwrap(), BindingDomain::ChainId);
+        assert_eq!(node(None).await.binding_domain(14).await.unwrap(), BindingDomain::ChainId);
+        let silent = RpcClient::new(scripted_rpc(vec![]).await);
+        assert_eq!(silent.binding_domain(18).await.unwrap(), BindingDomain::ChainId, "not even asked");
+        // Any other chain: genesis-bound over the node's hash when it says the chain has the domain…
+        assert_eq!(node(Some(1)).await.binding_domain(20).await.unwrap(), BindingDomain::Genesis(genesis));
+        assert_eq!(node(Some(1)).await.claimed_binding_domain().await.unwrap(), 1);
+        // …and a refusal — never the chain-id form — when it says it has none, or cannot say.
+        for claim in [Some(0), None] {
+            let e = node(claim).await.binding_domain(20).await.unwrap_err().to_string();
+            assert!(e.contains("binding_domain") && e.contains("chain 20"), "{e}");
+            assert!(node(claim).await.require_binding_domain(20).await.is_err());
+            assert!(node(claim).await.require_binding_domain(18).await.is_ok());
+        }
+        let e = silent.binding_domain(20).await.unwrap_err().to_string();
+        assert!(e.contains("binding_domain"), "a node with no rand_getLimits at all: {e}");
     }
 
     /// `rand_getProgramPublic`: words for a program with a public input, none for one without,

@@ -47,7 +47,12 @@ mod common;
 use common::cluster::*;
 use proving_slot::proving_slot;
 
-const CHAIN_ID: u64 = 7;
+/// 18, not 7, since BIND-1: this suite signs its staking, aggregator and governance messages by
+/// hand in the chain-id form and its genesis sets no `binding_domain`, and a wallet on a chain id
+/// outside `CHAIN_ID_BINDING_CHAIN_IDS` (14–19) proves only the genesis-bound form. Chain 18's
+/// id keeps the suite on today's rules, byte for byte; `wallet_flow` and `split_auth` run the
+/// genesis-bound form.
+const CHAIN_ID: u64 = 18;
 
 /// What one funded wallet holds at genesis.
 const ALLOC: u64 = 1_000 * UNITS_PER_RAND;
@@ -207,6 +212,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         gas: None,
         // Audit v6, STAKE-2: a faucet beside a bridge needs the marker on a new chain id.
         testnet,
+        binding_domain: None,
     }
 }
 

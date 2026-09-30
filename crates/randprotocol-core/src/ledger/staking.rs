@@ -24,7 +24,7 @@ use crate::crypto::{Address, PublicKey, Signature};
 use crate::gas;
 use crate::notes::{ShieldedAddress, Word8, KEM_EK_BYTES};
 use crate::types::actions::{
-    admit_validator_message, registration_message, registration_message_v2, unbond_message, withdraw_message, Registration,
+    admit_validator_message, registration_message_v2, Registration,
     SignedHeader,
 };
 use crate::types::{Action, Transaction, ValidatorSet, UNITS_PER_RAND};
@@ -913,7 +913,9 @@ pub(crate) fn check_bond(
             let v2 = ledger.staking().and_then(|s| s.registration_v2) == Some(true);
             let message = match v2 {
                 true => registration_message_v2(&ledger.signing_domain().genesis, chain_id, validator, &r.payout),
-                false => registration_message(chain_id, &r.payout),
+                // BIND-1: under genesis `binding_domain: 1` the chain-id-only v1 message is gone —
+                // the domain answers the v2 message here too.
+                false => ledger.binding_domain().registration_message(chain_id, validator, &r.payout),
             };
             if !r.public_key.verify(message.as_bytes(), &r.signature) {
                 return Err(StakingError::BadSignature);
@@ -954,7 +956,7 @@ fn check_unbond(
     signature: &Signature,
     chain_id: u64,
 ) -> Result<(), StakingError> {
-    let e = signed_by(ledger, validator, nonce, signature, || unbond_message(chain_id, validator, amount, nonce))?;
+    let e = signed_by(ledger, validator, nonce, signature, || ledger.binding_domain().unbond_message(chain_id, validator, amount, nonce))?;
     // A zero unbond would spend a nonce and a `pending` row to move nothing.
     if amount == 0 {
         return Err(StakingError::ZeroAmount);
@@ -1305,7 +1307,7 @@ fn check_withdraw(
     chain_id: u64,
 ) -> Result<u64, StakingError> {
     signed_by(ledger, validator, nonce, signature, || {
-        withdraw_message(chain_id, validator, amount, nonce, time, r, envelope)
+        ledger.binding_domain().withdraw_message(chain_id, validator, amount, nonce, time, r, envelope)
     })?;
     // The base fee comes out of the amount, so an amount that cannot cover it buys a note worth
     // nothing — or nothing at all. This subsumes a zero withdraw, which is why there is no

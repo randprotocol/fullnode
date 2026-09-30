@@ -1796,7 +1796,12 @@ async fn main() -> Result<()> {
             let public = rpc.program_public(&pid).await?.context("the program is no longer on chain")?;
             let hardened = rpc.limits().await?.is_some_and(|l| l.hardening_v6);
             let tx = rpc.raw_transaction(&h).await?.context("the node no longer holds this transaction")?;
-            let segment = wallet::open_call_public_segment(&public, hardened, &tx);
+            // BIND-1: the call binding in the chain's domain — asked only when it is read at all.
+            let domain = match hardened {
+                true => rpc.binding_domain(tx.chain_id).await?,
+                false => randprotocol_core::BindingDomain::ChainId,
+            };
+            let segment = wallet::open_call_public_segment(&public, hardened, &tx, &domain);
             let exec = emulator::execute(&Program { base_pc, words }, &inputs, &segment, Tier(*TIERS.last().expect("a tier")).max_cycles())
                 .map_err(|e| anyhow::anyhow!("re-running the program on these inputs failed: {e:?}"))?;
             println!("emulator outputs: {:?}\nreceipt outputs:  {}", exec.outputs, receipt["outputs"]);
@@ -2041,8 +2046,10 @@ async fn main() -> Result<()> {
         Cmd::Token(TokenCmd::RegisterBridged { name, symbol, salt, chain, token, decimals, pq, fee, no_wait, cuda }) => {
             let salt = randprotocol_client::hex32(&salt).context("--salt must be 32 bytes of hex")?;
             let token = randprotocol_client::hex32(&token).context("--token must be 32 bytes of hex")?;
-            let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?;
             let chain_id = rpc.chain_id().await?;
+            // BIND-1: the message the file is checked against is this chain's — genesis-bound off
+            // the chains cut before `binding_domain`, by chain id, never by the node's claim.
+            let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?.bound_to(rpc.binding_domain(chain_id).await?);
             let pq_signatures = wallet::parse_pq_signatures(&read_text_arg(&pq)?)?;
             // Everything refusable is refused here, before a key file is opened or a bundle
             // proved: the name rules, the backing, and the quorum at the bridge's list_nonce.
@@ -2067,8 +2074,10 @@ async fn main() -> Result<()> {
         }
         Cmd::Token(TokenCmd::ListBacking { asset, chain, token, decimals, pq, fee, no_wait, cuda }) => {
             let token = randprotocol_client::hex32(&token).context("--token must be 32 bytes of hex")?;
-            let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?;
             let chain_id = rpc.chain_id().await?;
+            // BIND-1: the message the file is checked against is this chain's — genesis-bound off
+            // the chains cut before `binding_domain`, by chain id, never by the node's claim.
+            let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?.bound_to(rpc.binding_domain(chain_id).await?);
             let pq_signatures = wallet::parse_pq_signatures(&read_text_arg(&pq)?)?;
             let action = governance::list_backing_action(&state, chain_id, asset, chain, token, decimals, pq_signatures)?;
             let fee = match fee {
@@ -2195,7 +2204,10 @@ async fn main() -> Result<()> {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             // Refused up front (not the token's authority, or not Key-authorised at all) inside
             // `build_token_mint`, before any RAND is touched.
-            let action = wallet::build_token_mint(&rpc, &w, chain_id, asset, &row, &recipient, amount, &authority).await?;
+            // BIND-1: the authority signs this chain's message — the store is scanned first, so
+            // the genesis hash in it is the one the fee bundle's binding will carry.
+            let domain = wallet::binding_domain(&rpc, &w, &mut store, chain_id).await?;
+            let action = wallet::build_token_mint(&rpc, &w, &domain, chain_id, asset, &row, &recipient, amount, &authority).await?;
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
                 None => gas::fee_floor(&action),
@@ -2222,12 +2234,14 @@ async fn main() -> Result<()> {
                 None => None,
             };
             let chain_id = rpc.chain_id().await?;
-            let action = wallet::build_token_set_authority(chain_id, asset, &row, &authority, new.clone())?;
+            let (w, path, mut store) = open_wallet(&cli.key)?;
+            // BIND-1, as for a mint: scan, then sign this chain's message.
+            let domain = wallet::binding_domain(&rpc, &w, &mut store, chain_id).await?;
+            let action = wallet::build_token_set_authority(&domain, chain_id, asset, &row, &authority, new.clone())?;
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
                 None => gas::fee_floor(&action),
             };
-            let (w, path, mut store) = open_wallet(&cli.key)?;
             let profile = profile_of(&rpc).await?;
             let s =
                 wallet::submit_token_set_authority(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
@@ -2249,8 +2263,10 @@ async fn main() -> Result<()> {
         }
         Cmd::BridgePause { sig, no_wait } => {
             // No key file: a pause must work from a machine holding no spend key and no RAND.
-            let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?;
             let chain_id = rpc.chain_id().await?;
+            // BIND-1: the message the file is checked against is this chain's — genesis-bound off
+            // the chains cut before `binding_domain`, by chain id, never by the node's claim.
+            let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?.bound_to(rpc.binding_domain(chain_id).await?);
             let signature = governance::parse_pause_signature(&read_text_arg(&sig)?)?;
             let action = governance::pause_action(&state, chain_id, signature)?;
             let hash = governance::submit_bundle_less(&rpc, chain_id, action, !no_wait).await?;
@@ -2262,8 +2278,10 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::BridgeUnpause { pq, no_wait } => {
-            let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?;
             let chain_id = rpc.chain_id().await?;
+            // BIND-1: the message the file is checked against is this chain's — genesis-bound off
+            // the chains cut before `binding_domain`, by chain id, never by the node's claim.
+            let state = governance::GovState::from_bridge_state(&rpc.bridge_state().await?)?.bound_to(rpc.binding_domain(chain_id).await?);
             let pq_signatures = wallet::parse_pq_signatures(&read_text_arg(&pq)?)?;
             let action = governance::unpause_action(&state, chain_id, pq_signatures)?;
             let hash = governance::submit_bundle_less(&rpc, chain_id, action, !no_wait).await?;

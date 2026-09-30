@@ -278,6 +278,7 @@ mod tests {
             vesting: None,
             gas: None,
             testnet: None,
+            binding_domain: None,
         };
         let gs = genesis.build(&StubExecutor).unwrap();
         let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());

@@ -50,7 +50,9 @@ mod common;
 use common::bridge::{bridge_config_for, pause_keypair, pq_quorum, pq_quorum_message, transfer_attestation};
 use common::cluster::*;
 
-const CHAIN_ID: u64 = 7;
+/// 18, not 7, since BIND-1 (`cluster.rs` says why): the governance messages here are signed by
+/// hand in the chain-id form, which a wallet proves only on chains 14–19.
+const CHAIN_ID: u64 = 18;
 
 /// One zUSD: a bridged token has eight decimals on Rand whatever its backings have at home.
 const ZUSD: u64 = 100_000_000;
@@ -135,6 +137,7 @@ fn zusd_genesis(validators: &[randprotocol_core::Keypair]) -> Genesis {
         gas: None,
         // Audit v6, STAKE-2: a faucet beside a bridge needs the marker on a new chain id.
         testnet: Some(true),
+        binding_domain: None,
     }
 }
 

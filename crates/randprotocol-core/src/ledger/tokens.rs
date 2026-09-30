@@ -30,7 +30,7 @@ use crate::crypto::{merkle_root, Hash, PublicKey};
 use crate::gas;
 use crate::notes::{ShieldedAddress, Word8, KEM_EK_BYTES, MAX_NOTE_VALUE};
 use crate::program::ProgramId;
-use crate::types::actions::{set_authority_message, token_mint_message, InitialMint};
+use crate::types::actions::InitialMint;
 use crate::types::{Action, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1379,7 +1379,7 @@ pub(super) fn validate(
             // party could re-wrap a gossiped mint with garbage and spend the authority's nonce
             // (spec §4, amended 2026-09-19). So the leaf the ledger appends is the leaf the
             // authority signed for, and the envelope that travels with it is the one it sealed.
-            if !pk.verify(token_mint_message(tx.chain_id, &info.id, *nonce, *amount, &cm, envelope).as_bytes(), signature)
+            if !pk.verify(ledger.binding_domain().token_mint_message(tx.chain_id, &info.id, *nonce, *amount, &cm, envelope).as_bytes(), signature)
             {
                 return Err(TokenError::BadSignature.into());
             }
@@ -1397,7 +1397,7 @@ pub(super) fn validate(
             let (info, pk) = key_authority(registry, *asset, *nonce)?;
             // By the **current** key: handing the token on is the holder's decision, never the
             // heir's. Last, as in the mint arm.
-            if !pk.verify(set_authority_message(tx.chain_id, &info.id, *nonce, new).as_bytes(), signature) {
+            if !pk.verify(ledger.binding_domain().set_authority_message(tx.chain_id, &info.id, *nonce, new).as_bytes(), signature) {
                 return Err(TokenError::BadSignature.into());
             }
         }
@@ -3760,7 +3760,7 @@ mod action_tests {
         l.record_anchor(l.height());
         let original = burn_tx(&l, keyed, 100, 60, |_| {});
         assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
-        let binding = original.binding();
+        let binding = original.binding(&crate::types::BindingDomain::ChainId);
         let rewired = |asset: u32, amount: u64| {
             let mut t = original.clone();
             t.action = Action::TokenBurn { asset, amount };
@@ -3780,4 +3780,43 @@ mod action_tests {
         assert_eq!(l.validate(&original, &StubExecutor), Ok(()));
     }
 
+    /// BIND-1 (audit v6): under genesis `binding_domain: 1` a `Key` authority's two messages
+    /// carry the genesis hash. One token, one authority key, one nonce, on two chains sharing a
+    /// chain id: a mint or a rotation signed for genesis A is refused on B — before the flag the
+    /// authority's signature for one was a signature for both — and today's chain-id signature is
+    /// refused on either.
+    #[test]
+    fn under_binding_domain_a_token_mint_and_an_authority_change_bind_the_genesis() {
+        use crate::types::BindingDomain;
+        let mut base = ledger();
+        let asset = register_keyed(&mut base, 20);
+        base.record_anchor(base.height());
+        let on = |g: u8| {
+            let mut l = base.clone();
+            l.set_binding_domain(BindingDomain::Genesis(crate::crypto::Hash([g; 32])));
+            l
+        };
+        let (la, lb) = (on(0xa), on(0xb));
+        let (da, v1) = (*la.binding_domain(), BindingDomain::ChainId);
+        let id = base.tokens().unwrap().get(asset).unwrap().id;
+        let time = base.height() as u32;
+        let mint = |l: &Ledger, d: &BindingDomain| {
+            let cm = mint_commitment(&recipient(), 250, asset, time, &[9; 8], &StubExecutor);
+            let signature = issuer().sign(d.token_mint_message(CHAIN, &id, 0, 250, &cm, &env()).as_bytes());
+            let action = Action::TokenMint { asset, amount: 250, recipient: recipient(), r: [9; 8], time, envelope: env(), nonce: 0, signature };
+            StubExecutor::bound_in(Transaction::shielded(CHAIN, fee_bundle(l, 30, gas::BUNDLE_BASE), action), l.binding_domain())
+        };
+        let rotate = |l: &Ledger, d: &BindingDomain| {
+            let signature = issuer().sign(d.set_authority_message(CHAIN, &id, 0, &None).as_bytes());
+            let action = Action::SetAuthority { asset, new: None, nonce: 0, signature };
+            StubExecutor::bound_in(Transaction::shielded(CHAIN, fee_bundle(l, 40, gas::BUNDLE_BASE), action), l.binding_domain())
+        };
+        for (name, build) in [("mint", &mint as &dyn Fn(&Ledger, &BindingDomain) -> Transaction), ("set-authority", &rotate)] {
+            assert_eq!(base.validate(&build(&base, &v1), &StubExecutor), Ok(()), "{name}: today");
+            assert_eq!(la.validate(&build(&la, &da), &StubExecutor), Ok(()), "{name}");
+            assert_eq!(lb.validate(&build(&lb, &da), &StubExecutor), Err(tok(TokenError::BadSignature)), "{name}: A's signature on B");
+            assert_eq!(la.validate(&build(&la, &v1), &StubExecutor), Err(tok(TokenError::BadSignature)), "{name}: a chain-id signature under the flag");
+            assert_eq!(base.validate(&build(&base, &da), &StubExecutor), Err(tok(TokenError::BadSignature)), "{name}: a genesis-bound signature without it");
+        }
+    }
 }

@@ -8,6 +8,7 @@ use crate::program::ProgramId;
 use crate::types::actions::{
     AggregatorRegistration, CallEnvelope, InitialMint, Registration, SignedAggregateHeader, SignedHeader,
 };
+use crate::types::binding::BindingDomain;
 use serde::{Deserialize, Serialize};
 
 /// Native token symbol. The whitepaper (Draft 3) calls this RAND; rename here if needed.
@@ -715,6 +716,13 @@ pub const TX_BINDING_DOMAIN: &[u8] = b"rand-tx-bind-1";
 /// [`Transaction::call_binding`]'s hash domain (INT-4, genesis `hardening_v6`).
 pub const CALL_BINDING_DOMAIN: &[u8] = b"rand-call-bind-1";
 
+/// BIND-1 (audit v6): the binding's hash domain on a chain whose genesis sets `binding_domain: 1`
+/// — the genesis hash leads the preimage ([`crate::types::BindingDomain::Genesis`]).
+pub const TX_BINDING_DOMAIN_V2: &[u8] = b"rand-tx-bind-2";
+
+/// BIND-1: [`Transaction::call_binding`]'s hash domain under `binding_domain: 1`.
+pub const CALL_BINDING_DOMAIN_V2: &[u8] = b"rand-call-bind-2";
+
 /// A transaction: a shielded bundle, an action, or (for a faucet mint) an action alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
@@ -759,9 +767,27 @@ impl Transaction {
         minter: &Keypair,
         executor: &dyn crate::confidential::ConfidentialExecutor,
     ) -> Transaction {
+        Self::mint_in(&BindingDomain::ChainId, chain_id, pk, time, r, envelope, amount, minter, executor)
+    }
+
+    /// [`Transaction::mint`] on a chain of `domain` (BIND-1): the minter signs
+    /// [`BindingDomain::mint_signing_hash`], which under `binding_domain: 1` carries the genesis
+    /// hash. What a node's faucet calls, with its ledger's own domain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_in(
+        domain: &BindingDomain,
+        chain_id: u64,
+        pk: Word8,
+        time: u32,
+        r: Word8,
+        envelope: Envelope,
+        amount: u64,
+        minter: &Keypair,
+        executor: &dyn crate::confidential::ConfidentialExecutor,
+    ) -> Transaction {
         let cm = crate::ledger::mint_commitment(executor, &pk, amount, time, &r);
         let signature =
-            minter.sign(Self::mint_signing_hash(chain_id, &cm, &pk, time, &r, &envelope, amount).as_bytes());
+            minter.sign(domain.mint_signing_hash(chain_id, &cm, &pk, time, &r, &envelope, amount).as_bytes());
         Transaction {
             chain_id,
             bundle: None,
@@ -855,8 +881,15 @@ impl Transaction {
     ///
     /// Not the transaction id: [`Transaction::hash`] is unchanged and still takes each bundle
     /// proof by its digest.
-    pub fn binding(&self) -> [u32; TX_BINDING_WORDS] {
-        self.binding_of(TX_BINDING_DOMAIN, self.action.blanked())
+    ///
+    /// BIND-1 (audit v6): `domain` is the chain's [`BindingDomain`] — the ledger's own
+    /// (`Ledger::binding_domain`) on the verifying side, the wallet's on the proving side. Under
+    /// `ChainId` the preimage and tag are the ones above, byte for byte; under `Genesis` the
+    /// genesis hash leads the preimage, `(genesis, chain_id, bundle', action')`, under
+    /// [`TX_BINDING_DOMAIN_V2`], so a proof made for one chain verifies on no other chain that
+    /// shares its chain id.
+    pub fn binding(&self, domain: &BindingDomain) -> [u32; TX_BINDING_WORDS] {
+        self.binding_of(domain, TX_BINDING_DOMAIN, TX_BINDING_DOMAIN_V2, self.action.blanked())
     }
 
     /// What a call proof of this transaction is bound to under genesis `hardening_v6` (INT-4 of
@@ -874,25 +907,37 @@ impl Transaction {
     /// so the wallet builds the transaction with both proofs empty, proves the call against this,
     /// fills it in, and only then takes the bundle's binding and proves the bundle. For any other
     /// action it is simply a second digest of the same transaction, which nothing checks.
-    pub fn call_binding(&self) -> [u32; TX_BINDING_WORDS] {
+    ///
+    /// BIND-1: `domain` as in [`Transaction::binding`]; genesis-bound under
+    /// [`CALL_BINDING_DOMAIN_V2`].
+    pub fn call_binding(&self, domain: &BindingDomain) -> [u32; TX_BINDING_WORDS] {
         let action = match self.action.blanked() {
             Action::Call { program, input_envelope, .. } => Action::Call { program, proof: Vec::new(), input_envelope },
             other => other,
         };
-        self.binding_of(CALL_BINDING_DOMAIN, action)
+        self.binding_of(domain, CALL_BINDING_DOMAIN, CALL_BINDING_DOMAIN_V2, action)
     }
 
-    /// `(chain_id, bundle', action)` under `domain`, as eight little-endian words: the bundle's
+    /// `(chain_id, bundle', action)` under `tag`, as eight little-endian words: the bundle's
     /// proof blanked, the action as the caller blanked it. The one construction both bindings use.
-    fn binding_of(&self, domain: &[u8], action: Action) -> [u32; TX_BINDING_WORDS] {
+    /// BIND-1: under [`BindingDomain::Genesis`] the preimage is `(genesis, chain_id, bundle',
+    /// action)` under `tag_v2` — the same pinned bincode configuration, the genesis hash its first
+    /// 32 bytes.
+    fn binding_of(&self, domain: &BindingDomain, tag: &[u8], tag_v2: &[u8], action: Action) -> [u32; TX_BINDING_WORDS] {
         use bincode::Options;
         let bundle = self.bundle.as_ref().map(blank_bundle);
-        let bytes = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_little_endian()
-            .serialize(&(self.chain_id, &bundle, &action))
-            .expect("Transaction serializes");
-        let digest = Hash::digest_domain(domain, &bytes);
+        let options = bincode::DefaultOptions::new().with_fixint_encoding().with_little_endian();
+        let digest = match domain {
+            BindingDomain::ChainId => {
+                let bytes = options.serialize(&(self.chain_id, &bundle, &action)).expect("Transaction serializes");
+                Hash::digest_domain(tag, &bytes)
+            }
+            BindingDomain::Genesis(genesis) => {
+                let bytes =
+                    options.serialize(&(genesis, self.chain_id, &bundle, &action)).expect("Transaction serializes");
+                Hash::digest_domain(tag_v2, &bytes)
+            }
+        };
         std::array::from_fn(|i| u32::from_le_bytes(digest.0[4 * i..4 * i + 4].try_into().expect("four bytes")))
     }
 
@@ -997,11 +1042,11 @@ mod tests {
         let mut other_proof = t.clone();
         other_proof.bundle.as_mut().unwrap().auth_proof = vec![0xa1; 50];
         assert_ne!(other_proof.hash(), t.hash(), "the auth proof is inside the id");
-        assert_eq!(other_proof.binding(), t.binding(), "and outside the binding it is proved against");
+        assert_eq!(other_proof.binding(&BindingDomain::ChainId), t.binding(&BindingDomain::ChainId), "and outside the binding it is proved against");
         let mut other_commit = t.clone();
         other_commit.bundle.as_mut().unwrap().auth_commit = [0xc1; 8];
         assert_ne!(other_commit.hash(), t.hash(), "auth_commit is inside the id");
-        assert_ne!(other_commit.binding(), t.binding(), "and inside the binding");
+        assert_ne!(other_commit.binding(&BindingDomain::ChainId), t.binding(&BindingDomain::ChainId), "and inside the binding");
         // By digest, not by bytes: the id is the digest of a view carrying `Hash::digest(auth_proof)`.
         let mut marker = t.clone();
         let bm = marker.bundle.as_mut().unwrap();
@@ -1762,11 +1807,11 @@ mod tests {
             let t = |a: Action| Transaction::shielded(7, bundle(), a);
             if kept_proof.contains(&i) {
                 assert_eq!(with.blanked(), with, "variant {i}: its proof is kept whole");
-                assert_ne!(t(with).binding(), t(without).binding(), "variant {i}: the binding moves with its proof");
+                assert_ne!(t(with).binding(&BindingDomain::ChainId), t(without).binding(&BindingDomain::ChainId), "variant {i}: the binding moves with its proof");
             } else {
                 assert_eq!(with.blanked(), without, "variant {i}: blanking keeps every non-proof field and empties the proofs");
                 // The binding sees the blanked form only: the proof bytes never move it.
-                assert_eq!(t(with).binding(), t(without).binding(), "variant {i}");
+                assert_eq!(t(with).binding(&BindingDomain::ChainId), t(without).binding(&BindingDomain::ChainId), "variant {i}");
             }
         }
         assert!(seen.iter().all(|s| *s), "every variant has a row");
@@ -1781,12 +1826,12 @@ mod tests {
             let base = Transaction::shielded(7, bundle(), sample(i, vec![1; 5]));
             let mut other = Transaction::shielded(7, bundle(), sample(i, vec![2; 900]));
             other.bundle.as_mut().unwrap().proof = vec![0xee; 3];
-            assert_eq!(base.binding(), other.binding(), "variant {i}");
+            assert_eq!(base.binding(&BindingDomain::ChainId), other.binding(&BindingDomain::ChainId), "variant {i}");
             let mut marker = base.clone();
             let mut pruned = crate::notes::PRUNED_PROOF_MARKER.to_vec();
             pruned.extend_from_slice(&[9; 32]);
             marker.bundle.as_mut().unwrap().proof = pruned;
-            assert_eq!(base.binding(), marker.binding(), "variant {i}: the pruned form binds the same");
+            assert_eq!(base.binding(&BindingDomain::ChainId), marker.binding(&BindingDomain::ChainId), "variant {i}: the pruned form binds the same");
         }
     }
 
@@ -1798,12 +1843,12 @@ mod tests {
     fn the_binding_moves_when_the_call_proof_changes() {
         let base = Transaction::shielded(7, bundle(), sample(3, vec![1; 5]));
         let swapped = Transaction::shielded(7, bundle(), sample(3, vec![2; 5]));
-        assert_ne!(base.binding(), swapped.binding());
+        assert_ne!(base.binding(&BindingDomain::ChainId), swapped.binding(&BindingDomain::ChainId));
         let emptied = Transaction::shielded(7, bundle(), sample(3, Vec::new()));
-        assert_ne!(base.binding(), emptied.binding());
+        assert_ne!(base.binding(&BindingDomain::ChainId), emptied.binding(&BindingDomain::ChainId));
         let mut fee_proof = base.clone();
         fee_proof.bundle.as_mut().unwrap().proof = vec![0xee; 3];
-        assert_eq!(base.binding(), fee_proof.binding());
+        assert_eq!(base.binding(&BindingDomain::ChainId), fee_proof.binding(&BindingDomain::ChainId));
     }
 
     /// …and moves with every other field: the chain id, every bundle field — each of the four
@@ -1852,7 +1897,7 @@ mod tests {
         for (what, change) in burn_cases {
             let mut t = base.clone();
             change(&mut t);
-            assert_ne!(t.binding(), base.binding(), "{what}");
+            assert_ne!(t.binding(&BindingDomain::ChainId), base.binding(&BindingDomain::ChainId), "{what}");
         }
         // Every other action's fields, variant by variant: each row edits one field of `sample(i)`.
         let action_cases: Vec<(usize, &str, Change)> = vec![
@@ -2091,12 +2136,12 @@ mod tests {
             let base = Transaction::shielded(7, bundle(), sample(i, vec![1; 5]));
             let mut t = base.clone();
             change(&mut t);
-            assert_ne!(t.binding(), base.binding(), "{what}");
+            assert_ne!(t.binding(&BindingDomain::ChainId), base.binding(&BindingDomain::ChainId), "{what}");
         }
         // And the action as a whole: the same fee bundle under `None` and under an attest.
         let none = Transaction::shielded(7, bundle(), Action::None);
         let attest = Transaction::shielded(7, bundle(), sample(7, Vec::new()));
-        assert_ne!(none.binding(), attest.binding());
+        assert_ne!(none.binding(&BindingDomain::ChainId), attest.binding(&BindingDomain::ChainId));
     }
 
     /// The pinned bincode configuration is exactly what `bincode::serialize` writes — the
@@ -2124,7 +2169,7 @@ mod tests {
         let digest = Hash::digest_domain(TX_BINDING_DOMAIN, &pinned);
         let words: [u32; TX_BINDING_WORDS] =
             std::array::from_fn(|i| u32::from_le_bytes(digest.0[4 * i..4 * i + 4].try_into().unwrap()));
-        assert_eq!(tx.binding(), words);
+        assert_eq!(tx.binding(&BindingDomain::ChainId), words);
         assert_eq!(hex::encode(digest.0), BURN_BINDING);
     }
 

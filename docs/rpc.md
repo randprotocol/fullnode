@@ -376,7 +376,7 @@ gas policy:
   "hardening_v6": false, "hc_auth": null, "gas_price": "100", "byte_price": "800",
   "gas_metering": "header", "bundle_gas_limit": null, "adjust_bps": null,
   "max_gas_price": null, "max_byte_price": null, "byte_load": null,
-  "admission_by_vote": false, "testnet": false, "slashing": null }
+  "admission_by_vote": false, "testnet": false, "slashing": null, "binding_domain": 0 }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -415,6 +415,16 @@ without it, which a wallet reads as `false`.
 an auth proof: a wallet gives the bundle guest `nk` and a fresh salt and proves the auth guest over
 the spend key and the same binding itself. A node that predates the field answers without it — a
 chain it runs has none.
+
+`binding_domain` (audit v6, BIND-1) is the genesis `binding_domain`: `0` — chains 14 to 19, and
+every genesis without the field — where a transaction's binding and every signed action message
+bind the chain id alone, `1` where they carry the genesis hash under fresh tags
+(`docs/deploy.md`, "The next cut: `binding_domain`"). **Informational, like every field here**: a
+wallet decides which form to prove by the transaction's own chain id
+(`randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS` — 14 to 19 get the chain-id form whatever a
+node says; every other id gets the genesis-bound form over the genesis hash the wallet's store is
+bound to), and reads this only to refuse early a chain whose ledger would refuse that form. A
+node that predates the field answers without it, which a wallet reads as `0`.
 
 `gas_price`, `byte_price` and `gas_metering` are this **node's** own gas policy (spec
 `2026-09-28-gas-model-design.md` §4.1, Phase 0) *or* the chain's own `gas` section (§4.2, §7.1,
@@ -731,7 +741,7 @@ Params: `[]`. Result:
   "verify_queue": 0, "mempool_size": 0,
   "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
   "testnet": false, "fri_profile": "production", "programs": 2, "viewing_keys": 0,
-  "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19", "hc_auth": null,
+  "notes": 41, "nullifiers": 12, "tree_root": "6b1d…c4", "hc_bundle": "f07a…19", "hc_auth": null, "binding_domain": 0,
   "address": "2nRdFC…", "peer_id": "12D3KooW...",
   "gas_prices": null
 }
@@ -781,7 +791,8 @@ says that key is in the set running the current epoch (spec §8) — a validator
 but whose epoch has not arrived is the first without the second. `notes` is every note the chain has ever created, `nullifiers` every note
 it has ever spent, and `hc_bundle` the bundle guest this chain's proofs are against — a node whose
 build disagrees with the genesis value refuses to start at all. `hc_auth` is the genesis auth guest
-(split authorisation) or `null`, checked against the build the same way.
+(split authorisation) or `null`, checked against the build the same way. `binding_domain` is the
+genesis `binding_domain` (`0` or `1`, BIND-1), as `rand_getLimits` serves it.
 
 `gas_prices` (spec 2026-09-28 §7.1, §8) is `{ "gas_price": "…", "byte_price": "…" }`, the tip
 ledger's current gas prices, `null` on a chain without a `gas` section. Refreshed every commit,
@@ -1489,6 +1500,19 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-10-01 — audit v6, BIND-1: `binding_domain` (genesis-gated; no chain carries it yet)
+
+- **`rand_getLimits` and `rand_status` gain `binding_domain`** (`0` or `1`): whether the chain's
+  transaction bindings (`rand-tx-bind-2`, `rand-call-bind-2`) and its signed action messages — a
+  faucet mint, unbond, withdraw, the RPL token mint and authority messages, the aggregator
+  actions, the bridge governance messages — carry the genesis hash. Chains 14 to 19 answer `0`; chain 20 is the first that can carry `1`.
+- **A wallet never takes the node's word for it.** The form it proves is decided by the
+  transaction's chain id: 14 to 19 are pinned to the chain-id form (`CHAIN_ID_BINDING_CHAIN_IDS`),
+  every other id gets the genesis-bound form over the store's genesis hash, and a node claiming
+  `0` there only gets a refusal before any proof is made. A client of another kind (randscan, the
+  apps) must follow the same rule before any chain is cut with the field.
+- Nothing on the wire changes; no existing chain's messages move.
 
 ### 2026-10-01 — audit v6, STAKE-1: slashing leader equivocation (`staking.slashing`)
 

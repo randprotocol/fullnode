@@ -202,6 +202,12 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // that kept it on a v1 chain would refuse every peer's proposal at the ledger's own
     // signature check.
     ledger.set_signing_domain(gs.signing_domain());
+    // And the binding domain (audit v6, BIND-1; genesis `binding_domain`): `load_ledger` comes
+    // back at `ChainId`, and a node that kept it on a `binding_domain: 1` chain would recompute
+    // every transaction's binding and every signed action message without the genesis hash —
+    // refusing each transaction its peers apply, and admitting ones made for any other chain
+    // that shares the chain id. A fork at the first transaction after its restart.
+    ledger.set_binding_domain(*gs.ledger.binding_domain());
     // The vesting register is state, not a switch: storage holds it (claims move it), so it is
     // never re-seeded from the file — but the two must agree that the chain has one, or this
     // node would compute a different state-root domain from its peers at its first block.
@@ -2364,6 +2370,7 @@ impl Node {
         s.tree_root = randprotocol_core::notes::word8_to_hex(&ledger.root());
         s.hc_bundle = randprotocol_core::notes::word8_to_hex(&ledger.hc_bundle());
         s.hc_auth = ledger.hc_auth().map(|h| randprotocol_core::notes::word8_to_hex(&h));
+        s.binding_domain = ledger.binding_domain().version();
         let target = self.peers.values().filter_map(|p| p.status.as_ref()).map(|p| p.height).max().unwrap_or(0);
         s.sync_target = target.max(s.height);
         s.syncing = self.sync_inflight.is_some();
@@ -2951,7 +2958,8 @@ impl Node {
         let key = Keypair::from_seed(self.cfg.seed).expect("seed validated at startup");
         let height = self.hs.tip_ledger().height();
         let envelope_bytes = self.hs.tip_ledger().envelope_bytes();
-        let tx = faucet_mint_tx(self.gs.chain_id, envelope_bytes, &to, amount, height, &key, self.executor.as_ref())?;
+        let domain = *self.hs.tip_ledger().binding_domain();
+        let tx = faucet_mint_tx(&domain, self.gs.chain_id, envelope_bytes, &to, amount, height, &key, self.executor.as_ref())?;
         let hash = self
             .mempool
             .insert(tx.clone(), self.hs.tip_ledger(), self.executor.as_ref())
@@ -3835,7 +3843,9 @@ impl Node {
 /// Factored out of [`Node::mint`] as the pure half — no network, no mempool, no rate limiter —
 /// so it is unit-testable against a bare ledger rather than the whole running node. No memo: a
 /// faucet has no sender's intent to write one for.
+#[allow(clippy::too_many_arguments)]
 fn faucet_mint_tx(
+    domain: &randprotocol_core::BindingDomain,
     chain_id: u64,
     envelope_bytes: Option<usize>,
     to: &ShieldedAddress,
@@ -3849,7 +3859,9 @@ fn faucet_mint_tx(
     let note = Note::new(to.pk, [0; 8], amount, 0, height as u32);
     let throwaway = SpendKey::random().viewing_key();
     let envelope = randprotocol_zkvm::address::seal_note_as(format, &throwaway, to, &note, &TxKey::random(), "")?;
-    let tx = Transaction::mint(chain_id, note.pk, note.time, note.r, envelope, amount, minter, executor);
+    // BIND-1: signed under the chain's binding domain — with the genesis hash under genesis
+    // `binding_domain: 1` — which is what the ledger verifies the mint against.
+    let tx = Transaction::mint_in(domain, chain_id, note.pk, note.time, note.r, envelope, amount, minter, executor);
     debug_assert_eq!(tx.commitments(), vec![note.commitment()], "the sealed note is the one admission derives");
     Ok(tx)
 }
@@ -5263,6 +5275,39 @@ mod tests {
         assert_eq!(g.bundle_gas_limit, 20_479);
     }
 
+    /// BIND-1 (audit v6): the binding domain survives a restart the same way. `load_ledger`
+    /// comes back at `ChainId`, and a node that kept it on a `binding_domain: 1` chain would
+    /// recompute every binding and signed message without the genesis hash: refusing what its
+    /// peers apply, admitting what any chain sharing the id would — a fork at its first
+    /// transaction after the restart.
+    #[test]
+    fn a_restart_restores_the_binding_domain() {
+        use randprotocol_core::BindingDomain;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        gs.ledger.set_binding_domain(BindingDomain::Genesis(gs.hash()));
+        storage.init_genesis(&gs).unwrap();
+        assert_eq!(storage.load_ledger(&StubExecutor).unwrap().binding_domain(), &BindingDomain::ChainId, "storage does not hold it");
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.binding_domain(), &BindingDomain::Genesis(gs.hash()), "restored from the genesis state");
+        // A chain-id-bound mint (today's) is refused on the reloaded ledger and a genesis-bound one
+        // is admitted — the restored domain is the one that decides.
+        let env = randprotocol_core::Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] };
+        let chain_id = Transaction::mint(7, [5; 8], 0, [6; 8], env.clone(), 1, &key(1), &StubExecutor);
+        let bound = Transaction::mint_in(reloaded.binding_domain(), 7, [5; 8], 0, [6; 8], env, 1, &key(1), &StubExecutor);
+        assert_eq!(reloaded.validate(&chain_id, &StubExecutor), Err(randprotocol_core::TxError::BadMintSignature));
+        assert_eq!(reloaded.validate(&bound, &StubExecutor), Ok(()));
+        // Without the field (chain 18) a restart keeps the chain-id domain and today's mint.
+        let plain = genesis_of(7, &[&key(1)], vec![], 2);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        storage.init_genesis(&plain).unwrap();
+        let reloaded = reload_ledger(&storage, &plain, &StubExecutor).unwrap();
+        assert_eq!(reloaded.binding_domain(), &BindingDomain::ChainId);
+        assert_eq!(reloaded.validate(&chain_id, &StubExecutor), Ok(()));
+    }
+
     /// The four call-limits parameters survive a restart the same way: `load_ledger` comes back
     /// at today's caps, and a node that kept them would disagree with its peers about which
     /// proofs, blocks, envelopes and deploys fit.
@@ -5322,7 +5367,7 @@ mod tests {
 
         // The plain chain: legacy format, and the ledger admits it.
         let gs = crate::storage::fixtures::genesis(1);
-        let tx = faucet_mint_tx(gs.ledger.chain_id(), gs.ledger.envelope_bytes(), &to, 1_000, gs.ledger.height(), &key(1), &ex)
+        let tx = faucet_mint_tx(gs.ledger.binding_domain(), gs.ledger.chain_id(), gs.ledger.envelope_bytes(), &to, 1_000, gs.ledger.height(), &key(1), &ex)
             .unwrap();
         let randprotocol_core::types::Action::Mint { envelope, .. } = &tx.action else { panic!("not a mint") };
         assert_ne!(envelope.len(), randprotocol_core::notes::MEMO_ENVELOPE_BYTES, "the legacy shape is shorter");
@@ -5333,6 +5378,7 @@ mod tests {
         let mut memo_gs = crate::storage::fixtures::genesis(1);
         memo_gs.ledger.set_envelope_bytes(Some(randprotocol_core::notes::MEMO_ENVELOPE_BYTES));
         let tx = faucet_mint_tx(
+            memo_gs.ledger.binding_domain(),
             memo_gs.ledger.chain_id(),
             memo_gs.ledger.envelope_bytes(),
             &to,
@@ -5360,7 +5406,7 @@ mod tests {
         let mut to = crate::storage::fixtures::payout(9);
         to.kem_ek = vec![0xff; randprotocol_core::notes::KEM_EK_BYTES];
         let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            faucet_mint_tx(gs.ledger.chain_id(), gs.ledger.envelope_bytes(), &to, 1_000, gs.ledger.height(), &key(1), &ex)
+            faucet_mint_tx(gs.ledger.binding_domain(), gs.ledger.chain_id(), gs.ledger.envelope_bytes(), &to, 1_000, gs.ledger.height(), &key(1), &ex)
         }));
         let err = got.expect("the finding: sealing to a length-valid bad key panics").expect_err("refused");
         assert!(err.contains("not a valid ML-KEM-768 encapsulation key"), "{err}");
@@ -5788,7 +5834,7 @@ mod tests {
         let mut public_values = vec![0u64; pv::NUM];
         public_values[pv::TIER] = 14;
         // The covered proof's H_PUB is its transaction's binding (INTERFACE-6 checks it).
-        let hpub = StubExecutor.public_digest(&raw.binding());
+        let hpub = StubExecutor.public_digest(&raw.binding(&randprotocol_core::BindingDomain::ChainId));
         for k in 0..8 {
             public_values[pv::OUT0 + k] = digest[k] as u64;
             public_values[pv::HC0 + k] = HC[k] as u64;

@@ -1606,7 +1606,7 @@ mod tests {
             *amount = 500;
         });
         {
-            let binding = original.binding();
+            let binding = original.binding(&crate::types::BindingDomain::ChainId);
             let b = burn_a.bundle.as_mut().unwrap();
             b.burn_a = 500;
             b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()), &binding);

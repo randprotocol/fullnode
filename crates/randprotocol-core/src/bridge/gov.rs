@@ -129,6 +129,113 @@ pub fn rotate_pause_message(chain_id: u64, rotation_nonce: u64, new_pause_key: &
     m
 }
 
+// ── BIND-1 (audit v6, issue #79): the genesis-bound forms ────────────────────────────────────
+//
+// On a chain whose genesis sets `binding_domain: 1` every governance message carries the genesis
+// hash, so a pause, an unpause, a listing or a rotation signed for one chain is a signature on no
+// other chain that shares its chain id — a re-cut keeps its guardians and its pause key, and
+// before this a quorum's signature for the old chain's nonce `n` was one for the new chain's.
+//
+// ```text
+// M'_x = b"<M_x's domain with its version bumped: …-2>" ‖ genesis [32] ‖ chain_id u64 ‖ nonce u64 ‖ <M_x's tail>
+// ```
+//
+// Still fixed big-endian layouts a hardware signer can rebuild by hand: the v1 message with the
+// tag's last digit `2` and the 32-byte genesis hash between the tag and the chain id. Each `_in`
+// function is its v1 twin under [`BindingDomain::ChainId`], byte for byte. The mint co-signature
+// (`pq::pq_cosign_message`) is NOT among them: the guardian daemons sign it (another repository)
+// — `docs/bridge.md` records it as the open half.
+
+use crate::types::BindingDomain;
+
+/// `M_pause`'s genesis-bound domain tag.
+pub const PAUSE_DOMAIN_V2: &[u8] = b"rand-bridge-pause-2";
+/// `M_unpause`'s genesis-bound domain tag.
+pub const UNPAUSE_DOMAIN_V2: &[u8] = b"rand-bridge-pq-unpause-2";
+/// `M_list`'s genesis-bound domain tag.
+pub const LIST_DOMAIN_V2: &[u8] = b"rand-bridge-pq-list-2";
+/// `M_register`'s genesis-bound domain tag.
+pub const REGISTER_DOMAIN_V2: &[u8] = b"rand-bridge-pq-register-2";
+/// `M_rotate_pq`'s genesis-bound domain tag.
+pub const ROTATE_PQ_DOMAIN_V2: &[u8] = b"rand-bridge-pq-rotate-pq-2";
+/// `M_rotate_pause`'s genesis-bound domain tag.
+pub const ROTATE_PAUSE_DOMAIN_V2: &[u8] = b"rand-bridge-pq-rotate-pause-2";
+
+/// `v1` as it stands under [`BindingDomain::ChainId`]; under `Genesis`, `v1` with its tag
+/// (`tag`, a prefix of it) replaced by `tag_v2 ‖ genesis`.
+fn rebind(domain: &BindingDomain, tag: &[u8], tag_v2: &[u8], v1: Vec<u8>) -> Vec<u8> {
+    match domain {
+        BindingDomain::ChainId => v1,
+        BindingDomain::Genesis(genesis) => {
+            let mut m = Vec::with_capacity(tag_v2.len() + 32 + v1.len() - tag.len());
+            m.extend_from_slice(tag_v2);
+            m.extend_from_slice(genesis.as_bytes());
+            m.extend_from_slice(&v1[tag.len()..]);
+            m
+        }
+    }
+}
+
+/// [`pause_message`] on a chain of `domain`.
+pub fn pause_message_in(domain: &BindingDomain, chain_id: u64, pause_nonce: u64) -> Vec<u8> {
+    rebind(domain, PAUSE_DOMAIN, PAUSE_DOMAIN_V2, pause_message(chain_id, pause_nonce))
+}
+
+/// [`unpause_message`] on a chain of `domain`.
+pub fn unpause_message_in(domain: &BindingDomain, chain_id: u64, pause_nonce: u64) -> Vec<u8> {
+    rebind(domain, UNPAUSE_DOMAIN, UNPAUSE_DOMAIN_V2, unpause_message(chain_id, pause_nonce))
+}
+
+/// [`list_message`] on a chain of `domain`.
+pub fn list_message_in(
+    domain: &BindingDomain,
+    chain_id: u64,
+    list_nonce: u64,
+    token_index: u32,
+    chain: u16,
+    token: &[u8; 32],
+    decimals: u8,
+) -> Vec<u8> {
+    rebind(domain, LIST_DOMAIN, LIST_DOMAIN_V2, list_message(chain_id, list_nonce, token_index, chain, token, decimals))
+}
+
+/// [`register_message`] on a chain of `domain`.
+#[allow(clippy::too_many_arguments)]
+pub fn register_message_in(
+    domain: &BindingDomain,
+    chain_id: u64,
+    list_nonce: u64,
+    name: &str,
+    symbol: &str,
+    salt: &[u8; 32],
+    chain: u16,
+    token: &[u8; 32],
+    decimals: u8,
+) -> Option<Vec<u8>> {
+    let v1 = register_message(chain_id, list_nonce, name, symbol, salt, chain, token, decimals)?;
+    Some(rebind(domain, REGISTER_DOMAIN, REGISTER_DOMAIN_V2, v1))
+}
+
+/// [`rotate_pq_message`] on a chain of `domain`.
+pub fn rotate_pq_message_in(
+    domain: &BindingDomain,
+    chain_id: u64,
+    rotation_nonce: u64,
+    new_pq_guardians: &[crate::crypto::PublicKey],
+) -> Vec<u8> {
+    rebind(domain, ROTATE_PQ_DOMAIN, ROTATE_PQ_DOMAIN_V2, rotate_pq_message(chain_id, rotation_nonce, new_pq_guardians))
+}
+
+/// [`rotate_pause_message`] on a chain of `domain`.
+pub fn rotate_pause_message_in(
+    domain: &BindingDomain,
+    chain_id: u64,
+    rotation_nonce: u64,
+    new_pause_key: &crate::crypto::PublicKey,
+) -> Vec<u8> {
+    rebind(domain, ROTATE_PAUSE_DOMAIN, ROTATE_PAUSE_DOMAIN_V2, rotate_pause_message(chain_id, rotation_nonce, new_pause_key))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -346,5 +453,63 @@ pub(crate) mod tests {
         let mut kinds: Vec<&str> = g.as_object().unwrap().keys().map(String::as_str).collect();
         kinds.sort();
         assert_eq!(kinds, ["list", "pause", "register", "unpause"]);
+    }
+
+    /// BIND-1: every governance message, genesis-bound. Under `ChainId` each `_in` function is its
+    /// v1 twin byte for byte (what the bridge repo's vectors pin); under `Genesis` it is the `-2`
+    /// tag, the 32-byte genesis hash, then the v1 message's own bytes after its tag — so a quorum's
+    /// or the pause key's signature for one genesis is none for another with the same chain id.
+    #[test]
+    fn the_genesis_bound_governance_messages_are_the_v1_layout_behind_the_genesis_hash() {
+        use crate::crypto::Hash;
+        let keys: Vec<PublicKey> = (0..2u8).map(|i| Keypair::from_seed([0x40 + i; 32]).unwrap().public_key().clone()).collect();
+        let v0 = BindingDomain::ChainId;
+        let (ga, gb) = (BindingDomain::Genesis(Hash([0xa; 32])), BindingDomain::Genesis(Hash([0xb; 32])));
+        let all = |d: &BindingDomain| -> Vec<Vec<u8>> {
+            vec![
+                pause_message_in(d, 7, 9),
+                unpause_message_in(d, 7, 9),
+                list_message_in(d, 7, 9, 3, 2, &[0x11; 32], 6),
+                register_message_in(d, 7, 9, "Shielded USD", "zUSD", &[0x5a; 32], 2, &[0x22; 32], 18).unwrap(),
+                rotate_pq_message_in(d, 7, 9, &keys),
+                rotate_pause_message_in(d, 7, 9, &keys[1]),
+            ]
+        };
+        let v1 = vec![
+            pause_message(7, 9),
+            unpause_message(7, 9),
+            list_message(7, 9, 3, 2, &[0x11; 32], 6),
+            register_message(7, 9, "Shielded USD", "zUSD", &[0x5a; 32], 2, &[0x22; 32], 18).unwrap(),
+            rotate_pq_message(7, 9, &keys),
+            rotate_pause_message(7, 9, &keys[1]),
+        ];
+        assert_eq!(all(&v0), v1, "the chain-id domain is today's messages");
+        let tags: [(&[u8], &[u8]); 6] = [
+            (PAUSE_DOMAIN, PAUSE_DOMAIN_V2),
+            (UNPAUSE_DOMAIN, UNPAUSE_DOMAIN_V2),
+            (LIST_DOMAIN, LIST_DOMAIN_V2),
+            (REGISTER_DOMAIN, REGISTER_DOMAIN_V2),
+            (ROTATE_PQ_DOMAIN, ROTATE_PQ_DOMAIN_V2),
+            (ROTATE_PAUSE_DOMAIN, ROTATE_PAUSE_DOMAIN_V2),
+        ];
+        let (on_a, on_b) = (all(&ga), all(&gb));
+        for (i, (tag, tag_v2)) in tags.iter().enumerate() {
+            assert_eq!(tag_v2.len(), tag.len(), "kind {i}: the tag keeps its length, only its version digit moves");
+            assert_eq!(&tag_v2[..tag.len() - 1], &tag[..tag.len() - 1]);
+            assert_eq!(tag_v2[tag.len() - 1], b'2');
+            let m = &on_a[i];
+            assert_eq!(&m[..tag.len()], *tag_v2, "kind {i}");
+            assert_eq!(&m[tag.len()..tag.len() + 32], &[0xa; 32], "kind {i}: the genesis hash follows the tag");
+            assert_eq!(&m[tag.len() + 32..], &v1[i][tag.len()..], "kind {i}: then the v1 message's own bytes");
+            assert_ne!(on_a[i], on_b[i], "kind {i}: two genesis hashes, one chain id");
+            assert_ne!(on_a[i], v1[i]);
+        }
+        assert_eq!(register_message_in(&ga, 7, 9, "", "zUSD", &[0; 32], 2, &[0; 32], 6), None);
+        // A signature over one chain's message verifies under no other's.
+        let key = Keypair::from_seed([9; 32]).unwrap();
+        let sig = key.sign(&pause_message_in(&ga, 7, 9));
+        assert!(key.public_key().verify(&pause_message_in(&ga, 7, 9), &sig));
+        assert!(!key.public_key().verify(&pause_message_in(&gb, 7, 9), &sig));
+        assert!(!key.public_key().verify(&pause_message(7, 9), &sig));
     }
 }

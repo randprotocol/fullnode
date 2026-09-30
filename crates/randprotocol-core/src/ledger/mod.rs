@@ -9,6 +9,8 @@
 //! parallel: each phase owns its own file.
 
 pub mod aggregation;
+#[cfg(test)]
+mod bind_tests;
 pub mod bridge_gov;
 pub mod bridge_notes;
 pub mod call_envelope;
@@ -727,6 +729,12 @@ pub struct Ledger {
     /// v1): a genesis parameter like `epoch_blocks`, set by `Genesis::build` and restored by a
     /// reloading node from its genesis file; never state, so outside equality and the root.
     signing_domain: crate::types::SigningDomain,
+    /// BIND-1 (audit v6): what this chain's transaction bindings and signed action messages are
+    /// over — the chain id alone, or the genesis hash too under genesis `binding_domain: 1`
+    /// ([`crate::types::BindingDomain`]). A genesis parameter like `signing_domain`: set by
+    /// `Genesis::build`, restored by a reloading node from its genesis file, never state, so
+    /// outside equality and the root.
+    binding_domain: crate::types::BindingDomain,
 }
 
 /// Equality is over consensus state only. `height` and `timestamp_ms` are the position of the
@@ -836,6 +844,7 @@ impl Ledger {
             supply: Supply::default(),
             unsealed_fees: BTreeMap::new(),
             signing_domain: crate::types::SigningDomain::v0(Hash::ZERO),
+            binding_domain: crate::types::BindingDomain::ChainId,
         }
     }
 
@@ -897,6 +906,7 @@ impl Ledger {
             supply: Supply::default(),
             unsealed_fees: BTreeMap::new(),
             signing_domain: crate::types::SigningDomain::v0(Hash::ZERO),
+            binding_domain: crate::types::BindingDomain::ChainId,
         }
     }
 
@@ -1281,6 +1291,19 @@ impl Ledger {
 
     pub fn signing_domain(&self) -> &crate::types::SigningDomain {
         &self.signing_domain
+    }
+
+    /// BIND-1 (audit v6): the binding domain. Genesis sets it once the genesis block — whose hash
+    /// it carries — exists; a reloading node sets it from its genesis file (`node::reload_ledger`),
+    /// because storage does not hold it: a node that came back at `ChainId` on a `binding_domain:
+    /// 1` chain would refuse every transaction its peers apply.
+    pub fn set_binding_domain(&mut self, domain: crate::types::BindingDomain) {
+        self.binding_domain = domain;
+    }
+
+    /// What every proof and signed action message on this chain binds ([`Self::set_binding_domain`]).
+    pub fn binding_domain(&self) -> &crate::types::BindingDomain {
+        &self.binding_domain
     }
 
     /// Install (or clear) the aggregation section. Genesis calls this once from its
@@ -2087,7 +2110,7 @@ impl Ledger {
                         return Err(TxError::MinterNotAllowed(addr));
                     }
                 }
-                let signing_hash = Transaction::mint_signing_hash(tx.chain_id, cm, pk, *time, r, envelope, *amount);
+                let signing_hash = self.binding_domain.mint_signing_hash(tx.chain_id, cm, pk, *time, r, envelope, *amount);
                 if !minter.verify(signing_hash.as_bytes(), signature) {
                     return Err(TxError::BadMintSignature);
                 }
@@ -2209,7 +2232,7 @@ impl Ledger {
         // on the `NoVerified` paths — an empty set is not worth hashing the transaction for.
         let admitted = !verified_proofs.is_empty() && verified_proofs.contains(&tx.hash());
         if let Some(b) = bundle {
-            let binding = tx.binding();
+            let binding = tx.binding(&self.binding_domain);
             self.check_bundle_proof(tx, b, &binding, executor, admitted)?;
         }
         // 10. the call's own proof, then its fee: the tier's, and the byte term for proof and
@@ -2228,7 +2251,7 @@ impl Ledger {
             // its segment is `public ‖ call_binding`, the words this ledger kept at deploy
             // (`hardened_call_segment`). Before, it kept its recorded digest alone and a copy of the
             // proof verified under any fee bundle.
-            let segment = if self.hardening_v6 { self.hardened_call_segment(record, &tx.call_binding()) } else { Vec::new() };
+            let segment = if self.hardening_v6 { self.hardened_call_segment(record, &tx.call_binding(&self.binding_domain)) } else { Vec::new() };
             let outcome = match (self.hardening_v6, admitted) {
                 (true, true) => executor.decode_call_hardened(record, proof, &segment),
                 (true, false) => executor.verify_call_hardened(record, proof, &segment),
@@ -4267,7 +4290,7 @@ mod tests {
             bundle(&plain, [[20; 8], [21; 8]], [[22; 8], [23; 8]], gas::BUNDLE_BASE + gas::call_fee(12, 0)),
             Action::Call { program: id, proof: vec![], input_envelope: None },
         );
-        let call_proof = StubExecutor::make_proof_with_public(&id, 12, [5; 8], &call.call_binding());
+        let call_proof = StubExecutor::make_proof_with_public(&id, 12, [5; 8], &call.call_binding(&crate::types::BindingDomain::ChainId));
         let Action::Call { proof, .. } = &mut call.action else { unreachable!() };
         *proof = call_proof.clone();
         let call = StubExecutor::bound(call);
@@ -4308,7 +4331,7 @@ mod tests {
         // call binding, then the bundle bound to the whole.
         let call_tx = |l: &Ledger, nfs: [Word8; 2], proof: Option<Vec<u8>>| {
             let mut t = Transaction::shielded(7, bundle(l, nfs, [[nfs[0][0] + 2; 8], [nfs[0][0] + 3; 8]], fee), Action::Call { program: id, proof: vec![], input_envelope: None });
-            let proof = proof.unwrap_or_else(|| StubExecutor::make_proof_with_public(&id, 12, [5; 8], &t.call_binding()));
+            let proof = proof.unwrap_or_else(|| StubExecutor::make_proof_with_public(&id, 12, [5; 8], &t.call_binding(&crate::types::BindingDomain::ChainId)));
             let Action::Call { proof: p, .. } = &mut t.action else { unreachable!() };
             *p = proof;
             StubExecutor::bound(t)
@@ -4354,7 +4377,7 @@ mod tests {
         let id = crate::program::program_id_with_public(0, &words, &public);
         assert_eq!(gated.program_public(&id), Some(&public[..]), "the ledger keeps the deployed words");
         let fee = gas::BUNDLE_BASE + gas::call_fee(12, 0);
-        let segment = |t: &Transaction| [public.as_slice(), t.call_binding().as_slice()].concat();
+        let segment = |t: &Transaction| [public.as_slice(), t.call_binding(&crate::types::BindingDomain::ChainId).as_slice()].concat();
         let call_tx = |l: &Ledger, nfs: [Word8; 2], proof: Option<Vec<u8>>| {
             let mut t = Transaction::shielded(7, bundle(l, nfs, [[nfs[0][0] + 2; 8], [nfs[0][0] + 3; 8]], fee), Action::Call { program: id, proof: vec![], input_envelope: None });
             let proof = proof.unwrap_or_else(|| StubExecutor::make_proof_with_public(&id, 12, [5; 8], &segment(&t)));
@@ -5149,7 +5172,7 @@ mod tests {
         m.extend_from_slice(ph.as_bytes());
         b.proof = m;
         let b = marker.bundle.as_ref().unwrap();
-        let binding = marker.binding();
+        let binding = marker.binding(&crate::types::BindingDomain::ChainId);
         let record = |hpub: Word8| {
             let mut pv = vec![0u64; crate::types::pv::NUM];
             let digest = StubExecutor.bundle_digest(&b.digest_input());
@@ -5502,7 +5525,7 @@ mod tests {
         let t = v3_tx_with(&l, C, [0xc1; 8], HCA);
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::AuthMismatch));
         let b = t.bundle.as_ref().unwrap();
-        assert_eq!(l.check_bundle_proof(&t, b, &t.binding(), &StubExecutor, true), Err(TxError::AuthMismatch), "the cheap half runs on a verified-set hit too");
+        assert_eq!(l.check_bundle_proof(&t, b, &t.binding(&crate::types::BindingDomain::ChainId), &StubExecutor, true), Err(TxError::AuthMismatch), "the cheap half runs on a verified-set hit too");
 
         /// An executor whose cheap read reports the bundle's own `c` while the verified proof
         /// publishes another — the verify's answer is compared as well.
@@ -5571,7 +5594,7 @@ mod tests {
             Err(TxError::InvalidAuthProof(ConfidentialError::InvalidProof("PublicValues".into())))
         );
         // B5: admission verified it, so a verified-set hit skips the verify, as for the bundle.
-        assert_eq!(l.check_bundle_proof(&t, b, &t.binding(), &StubExecutor, true), Ok(()));
+        assert_eq!(l.check_bundle_proof(&t, b, &t.binding(&crate::types::BindingDomain::ChainId), &StubExecutor, true), Ok(()));
         let other_guest = v3_tx_with(&l, C, C, [22; 8]);
         assert_eq!(l.validate(&other_guest, &StubExecutor), Err(TxError::InvalidAuthProof(ConfidentialError::WrongProgram)));
         let mut junk = v3_tx(&l);
@@ -5622,7 +5645,7 @@ mod tests {
         m.extend_from_slice(ph.as_bytes());
         b.proof = m;
         assert_eq!(marker.hash(), raw.hash(), "the marker form keeps the raw id");
-        let binding = marker.binding();
+        let binding = marker.binding(&crate::types::BindingDomain::ChainId);
         let record = |digest: Word8| {
             let mut pv = vec![0u64; crate::types::pv::NUM];
             let hpub = StubExecutor.public_digest(&binding);

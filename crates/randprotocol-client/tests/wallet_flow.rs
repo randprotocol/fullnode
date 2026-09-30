@@ -107,6 +107,9 @@ fn genesis_full(
         vesting: None,
         gas: None,
         testnet: None,
+        // BIND-1: this suite runs the genesis-bound form end to end — chain 7 is not one of the
+        // chains cut before `binding_domain`, so the wallet signs and proves nothing else there.
+        binding_domain: Some(1),
         hardening_v6: None,
         hc_auth: None,
     }
@@ -589,7 +592,9 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
     // set 7 on a shared box) outran its window — "time 82 is outside [160, 416]" (v0.6.1 suite).
     let slot = proving_slot().await;
     let row = wallet::find_token_row(&rpc, "1").await.unwrap();
-    let mint_action = wallet::build_token_mint(&rpc, &a, CHAIN_ID, 1, &row, &a.address, supply, &authority)
+    let domain = wallet::binding_domain(&rpc, &a, &mut a_store, CHAIN_ID).await.expect("the chain binds its genesis");
+    assert_eq!(domain, randprotocol_core::BindingDomain::Genesis(rpc.genesis_hash().await.unwrap()), "BIND-1: genesis-bound on chain 7");
+    let mint_action = wallet::build_token_mint(&rpc, &a, &domain, CHAIN_ID, 1, &row, &a.address, supply, &authority)
         .await
         .expect("the authority mints against its own token");
     assert!(matches!(&mint_action, Action::TokenMint { asset: 1, amount: 1_000_000, nonce: 0, .. }));
