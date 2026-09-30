@@ -6,6 +6,56 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-09-29)
 
+### Chain 19 — cut scripts PREPARED 2026-09-30 (branch `feat/chain19-cut`; NOT cut, nothing rolled, no genesis file yet)
+
+A **pure re-genesis of chain 18 on the same build** (v0.6.7, constraint set 8): the same shape, 26
+validators, gas section, `envelope_bytes` 1860, guests, limits, faucet lists, guardian set 1 / PQ set /
+pause key / `rules_v2`. The only intended difference is the bridge section, for the Ethereum, BNB
+Chain and Tron endpoints redeployed on 2026-09-30 (bridge `docs/mainnet-deployment.md`): `emitters`
+2/3 = `…7af6b17047c1db6cb54347fdea45cf9179075bfa`, 4 = `…6410797df959987a5baf65b5fab97edeb34d5163`,
+5 (Solana) and the Rand-side `emitter` unchanged; `min_inbound_sequence` `{2:1, 3:1, 4:1, 5:4}`
+expected (each new endpoint's sequence 0 is the operator's consume-step lock and must never mint);
+`burn_sequence` 8 and zUSD `locked` Solana-USDT 10 expected (the old Tron endpoint's 9 USDT was
+rebalanced through Solana on chain 18).
+
+- **No code change and no release is needed: the released v0.6.7 binaries cut and run chain 19.**
+  The node's refuse-list is by genesis hash and names chains 14–17 only
+  (`node::CHAINS_THIS_BUILD_CANNOT_RUN`, `node.rs`), the wallet's `LEGACY_ENVELOPE_CHAIN_IDS` is
+  14–17 (`randprotocol-client/src/lib.rs`; chain 19 sets `envelope_bytes`, so it must NOT be added —
+  `every_committed_genesis_without_envelope_bytes_is_pinned` passes as is once
+  `deploy/genesis-chain19.json` is committed, and `guest_provenance`'s genesis-file test takes any
+  chain ≥ 17 with v3 + `hc_auth`), `rand-prover` names no chain. Checked at run time too: the
+  v0.6.7-rc.1 macOS `rand-node` `init`s and `run`s a dry-run chain-19 genesis (`rand_getVersion`
+  `chain_id: 19`, `rand_getHealth` ok, `rand_getBridgeState` the new emitters and floors). After the
+  cut add the launch record as for chain 18: the genesis file and `chain_19s_genesis_file_builds_chain_19`.
+  **Outside this repo one consumer does pin the chain id: the client apps** (`clients`
+  `wallet-core` `DEFAULT_CHAIN_ID = 18`, mirrored as the UI's `chainId`) — they need a build aimed
+  at 19 (as `e830acc` aimed them at 18).
+- **`deploy/cut-chain19-genesis.sh`** (from chain 18's): predecessor = chain 18 (`a7cb020c…`,
+  file sha256 `ffeb68f0…a4d7`); the new emitters are the DEFAULTS and pinned (`R19_EMITTER_*`;
+  anything else refused unless `EMITTERS_CHANGED=1`); `MIN_INBOUND_2/3/4` must be given explicitly
+  for the cut (not for `snapshot`/`balances`); a floor ahead of a redeployed endpoint's next
+  sequence needs `FLOOR_AHEAD_OK=1` (the consume step not run yet); the gas section and
+  `envelope_bytes` asserted equal to chain 18's, and every top-level field outside chain id /
+  timestamp / alloc / bridge / tokens asserted equal to chain 18's genesis; `NODE` must report
+  0.6.7; `WALLETS_DIRS` = `~/.rand-chain17/alloc-wallets` (the six chain-18 allocs) +
+  `~/.rand-chain18/wallets`; expected floors / burn sequence compared and warned about, never
+  refused. `SELFTEST=1` 49/49; `DRY_RUN=1` with `~/rand-node-a/bin-v067rc1` passes (fixtures =
+  chain 18 as the rebalancing left it, read at the new endpoints).
+- **`deploy/cutover-fleet-chain19.sh`** (from chain 18's, minus the new-build parts): no `stage`, no
+  binary install, no `.pre-c19` copies — `preflight` (read-only) proves every host's INSTALLED
+  `rand-node`/`rand` are the v0.6.7 release binaries (`WANT_SHA` `f365317e…08f9`, `WANT_SHA_WALLET`
+  `480bd838…0fc4`), on chain 18 and healthy; `push`/`switch` use the installed binary; `OLD`
+  defaults to `a7cb020c`; `push`/`switch` refuse a file whose `chain_id` is not 19; guardian hosts
+  get a `data-19.genesis` stamp and a stale `data-19` is moved aside on a re-cut; new `rollback`
+  phase (units / drop-ins back to chain 18, then `start`). Rehearsed only against 26 fake local
+  hosts: `deploy/rehearse-cutover-fleet-chain19.sh` 52/52 — `preflight`, `rollback` and the stamp
+  have never run on a real host.
+- **`deploy/chain19-bridge-steps.md`**: the bridge side (the daemons' script is bridge
+  `daemons/mainnet/cut-chain19.sh`): `rand_cli` unchanged, contracts + start blocks + cursors at
+  sequence 1 for chains 2/3/4, the old endpoints paused before the snapshot.
+- `~/.rand-chain19/zusd-carry.txt` = chain 18's (one line, 10 zUSD to the same third-party address).
+
 ### v0.6.7 — the fixes on the chain-18 build (2026-09-29; rolls onto chain 18 one node at a time)
 
 `v0.6.7-rc1` (the gas model, chain 18's cut build) plus fixes that change no consensus rule, wire
