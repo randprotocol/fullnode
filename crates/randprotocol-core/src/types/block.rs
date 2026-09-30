@@ -212,6 +212,31 @@ impl Block {
         Block::tx_root(&self.transactions) == self.header.tx_root
     }
 
+    /// What is wrong with this block's transaction list against its own header, if anything
+    /// (audit v6, GOSSIP-2): a list whose root is not the header's, or one that names the same
+    /// transaction twice. The second is not covered by the first — [`crate::crypto::merkle_root`]
+    /// duplicates the last leaf of an odd level, so a list and the same list with its tail
+    /// repeated (the last transaction, the last pair, …) share a root, and therefore a header, a
+    /// block hash and the proposer's signature. No honest proposer repeats a transaction (the
+    /// pool holds each once and the second apply would fail), so a repeat is a forgery of the
+    /// list under someone else's header, not a block.
+    ///
+    /// For the places that take a block on its header alone — the gossip relay's precheck and
+    /// the orphan pool. Not a rule of `apply_block`: changing what the root means would be a
+    /// hard fork, and an executed block's repeat is refused by the ledger on its own terms.
+    /// One pass of transaction hashes, which is what the root costs anyway.
+    pub fn transaction_list_fault(&self) -> Option<&'static str> {
+        let leaves: Vec<Hash> = self.transactions.iter().map(|t| t.hash()).collect();
+        let mut seen = std::collections::HashSet::with_capacity(leaves.len());
+        if !leaves.iter().all(|h| seen.insert(*h)) {
+            return Some("a transaction appears twice in the block");
+        }
+        if merkle_root(&leaves) != self.header.tx_root {
+            return Some("the transactions are not the ones the header's root commits to");
+        }
+        None
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         bincode::serialize(self).expect("Block serializes")
     }

@@ -179,6 +179,14 @@ impl HotStuff {
                 if !block.verify_signature(&self.cfg.domain) {
                     return GossipPrecheck::Reject("proposal signature does not verify");
                 }
+                // The list the signed header commits to, and no transaction twice (audit v6,
+                // GOSSIP-2) — last, so only a header its leader really signed costs the hashing
+                // (one pass over the transactions, bounded by the byte cap above). Without it a
+                // relayer could repeat the last transaction of a leader's block, or swap the
+                // list outright, and the variant went out under the leader's hash and signature.
+                if let Some(fault) = block.transaction_list_fault() {
+                    return GossipPrecheck::Reject(fault);
+                }
                 GossipPrecheck::Accept
             }
         }
@@ -319,6 +327,48 @@ mod tests {
         let leader = leader_key(&hs, VIEW);
         let block = proposal(&hs, VIEW, &leader);
         assert_eq!(hs.precheck_gossip(&ConsensusMessage::Proposal(block)), GossipPrecheck::Accept);
+    }
+
+    /// Audit v6, GOSSIP-2. The transaction root duplicates the last leaf of an odd level
+    /// (`crypto::merkle_root`), so a block and the same block with its last transaction repeated
+    /// share a root — and so a header, a hash and the leader's signature. The relay precheck
+    /// checked neither the root nor the list, so anyone could take a leader's honest proposal,
+    /// repeat its last transaction (or swap the list for another), and have every node forward
+    /// the variant under the leader's name; in the orphan pool, which keys on the header hash,
+    /// it then held the place of the honest block.
+    #[test]
+    fn a_proposal_whose_transactions_are_not_the_ones_its_header_commits_to_is_not_forwarded() {
+        use crate::confidential::StubExecutor;
+        let hs = replica();
+        let leader = leader_key(&hs, VIEW);
+        let mint = |n: u32| crate::types::Transaction::mint(1, [n; 8], 0, [n; 8], crate::notes::Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] }, 1, &leader, &StubExecutor);
+        let with = |txs: Vec<crate::types::Transaction>, root_of: &[crate::types::Transaction]| {
+            let mut header = proposal(&hs, VIEW, &leader).header;
+            header.tx_root = Block::tx_root(root_of);
+            Block::sign(&hs.cfg.domain, header, txs, &leader)
+        };
+        let honest = vec![mint(1), mint(2), mint(3)];
+        let block = with(honest.clone(), &honest);
+        assert_eq!(hs.precheck_gossip(&ConsensusMessage::Proposal(block.clone())), GossipPrecheck::Accept);
+        // The same header and signature over the list with its last transaction repeated.
+        let mut repeated = block.clone();
+        repeated.transactions.push(honest[2].clone());
+        assert_eq!(repeated.header, block.header);
+        assert_eq!(repeated.hash(), block.hash(), "the finding: one hash, two blocks");
+        assert!(repeated.verify_tx_root(), "the finding: the repeated list has the honest root");
+        assert!(repeated.verify_signature(&hs.cfg.domain));
+        assert!(is_reject(hs.precheck_gossip(&ConsensusMessage::Proposal(repeated.clone()))), "a repeated transaction");
+        // The pair repeated one level up has the honest root too.
+        let six: Vec<_> = (1..=6).map(mint).collect();
+        let mut eight = with(six.clone(), &six);
+        eight.transactions.extend([six[4].clone(), six[5].clone()]);
+        assert!(eight.verify_tx_root());
+        assert!(is_reject(hs.precheck_gossip(&ConsensusMessage::Proposal(eight))), "a repeated pair");
+        // And a list the header does not commit to at all.
+        let swapped = with(vec![mint(7)], &honest);
+        assert!(is_reject(hs.precheck_gossip(&ConsensusMessage::Proposal(swapped))), "another list under the header");
+        assert_eq!(repeated.transaction_list_fault(), Some("a transaction appears twice in the block"));
+        assert_eq!(block.transaction_list_fault(), None);
     }
 
     #[test]

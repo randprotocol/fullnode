@@ -354,6 +354,12 @@ pub enum BlockError {
     InvalidTx { index: usize, error: TxError },
     #[error("tx root mismatch")]
     TxRootMismatch,
+    /// The block names one transaction twice (audit v6, GOSSIP-2). The transaction root
+    /// duplicates the last leaf of an odd level, so such a list can carry the root — and the
+    /// header, hash and signature — of the honest list it was made from. Reported by the orphan
+    /// pool, which takes a block on its header; an executed block's repeat fails on its own.
+    #[error("a transaction appears twice in the block")]
+    RepeatedTransaction,
     #[error("state root mismatch: computed {computed}, header {header}")]
     StateRootMismatch { computed: Hash, header: Hash },
     #[error("bad proposer signature")]

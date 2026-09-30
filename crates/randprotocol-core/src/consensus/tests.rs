@@ -3032,6 +3032,19 @@ fn an_orphan_is_checked_before_it_is_kept() {
     let fat = Block::sign(&cfg.domain, fat.header, fat.transactions, &key);
     assert_eq!(z.on_proposal(fat, 0), Err(ConsensusError::BadJustify));
     assert_eq!(z.orphans_held().0, 0);
+    // Audit v6, GOSSIP-2: the same block with its last transaction repeated carries the honest
+    // root, hash and signature. It was kept, and — the pool dedupes by hash — the honest block
+    // arriving after it was dropped as a duplicate.
+    let honest = sw1_orphan(&cfg, &key, 5, 2, 5, vec![mint(&key, 6), mint(&key, 7), mint(&key, 8)]);
+    let mut repeated = honest.clone();
+    repeated.transactions.push(honest.transactions[2].clone());
+    assert_eq!(repeated.hash(), honest.hash());
+    assert!(repeated.verify_tx_root());
+    let r = z.on_proposal(repeated, 0);
+    assert_eq!(r, Err(ConsensusError::Execution(crate::ledger::BlockError::RepeatedTransaction)));
+    assert!(!z.holds_orphan(&honest.hash()), "the variant is not in the pool under the honest hash");
+    assert_eq!(z.on_proposal(honest.clone(), 0), Err(ConsensusError::UnknownParent(honest.parent())));
+    assert!(z.holds_orphan(&honest.hash()), "and the honest block is kept when it arrives");
     assert!(sw1_honest_orphan_survives(&mut z, &b1, &b2));
 }
 

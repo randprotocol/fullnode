@@ -1642,8 +1642,17 @@ impl HotStuff {
         if block.header.justify.votes.len() > largest {
             return Err(ConsensusError::BadJustify);
         }
-        if !block.verify_tx_root() {
-            return Err(BlockError::TxRootMismatch.into());
+        // The root, and no transaction twice (audit v6, GOSSIP-2): a block with its last
+        // transaction repeated has the honest block's root, hash and signature, and the pool
+        // dedupes by that hash — kept here, it held the honest orphan's place and then failed
+        // to execute when the parent arrived.
+        match block.transaction_list_fault() {
+            None => {}
+            Some(fault) if block.verify_tx_root() => {
+                tracing::warn!(height = block.height(), view = block.view(), "orphan refused: {fault}");
+                return Err(BlockError::RepeatedTransaction.into());
+            }
+            Some(_) => return Err(BlockError::TxRootMismatch.into()),
         }
         // Bounded by the checks above: the transactions by the byte cap, the header by the vote
         // count.
