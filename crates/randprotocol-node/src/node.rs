@@ -1501,6 +1501,20 @@ fn expire_stale_fetches<K: std::hash::Hash + Eq + Clone>(
 }
 
 /// Whether a by-hash fetch for `h` is still outstanding, after [`expire_stale_fetches`].
+/// Whether a by-hash fetch should wait for batch sync instead (audit v6, PROC-8's third failure
+/// mode, seen three times in four CI runs at `restart_cycles_keep_all_nodes_in_sync`). A node
+/// that is behind hears a certificate — through every NewView and every proposal's justify — for
+/// each block it lacks, and fetched each one by hash: dozens of requests in a second to the same
+/// three peers, past their per-peer sync allowance (`SYNC_REQUEST_BURST`, `SYNC_REQUEST_PER_SEC`).
+/// The peers then answered its *batch* request with an empty batch too, which is a miss, and the
+/// node backed every peer off for 5–120 s while the chain moved on without it. Batch sync brings
+/// those same blocks in order, so while the node knows it is more than a block behind it does not
+/// also fetch by hash; the fetch resumes once it has caught up (a parent for a live proposal, the
+/// locked block, a leader's high-QC block).
+fn fetch_deferred_to_batch_sync(best_peer_height: u64, committed_height: u64) -> bool {
+    best_peer_height > committed_height.saturating_add(1)
+}
+
 fn fetch_blocked<K>(inflight: &HashMap<K, (Hash, Instant)>, h: &Hash) -> bool {
     inflight.values().any(|(x, _)| x == h)
 }
@@ -3139,6 +3153,10 @@ impl Node {
             tracing::debug!("by-hash fetch of {stale:?} got no answer within the wire timeout; abandoned");
         }
         if self.hs.has_block(&h) || fetch_blocked(&self.fetch_inflight, &h) {
+            return Vec::new();
+        }
+        if fetch_deferred_to_batch_sync(self.best_peer_height(), self.hs.committed_height()) {
+            tracing::debug!("not fetching block {h:?} by hash while {} blocks behind: batch sync brings it", self.best_peer_height() - self.hs.committed_height());
             return Vec::new();
         }
         let entry = self.fetch_attempts.entry(h).or_insert((0, Vec::new()));
@@ -5176,6 +5194,18 @@ mod tests {
         assert!(!admission::is_permanent(&verdict.unwrap_err()), "never cached");
         assert_eq!(guard_verify(|| Ok(())), Ok(()), "a verdict passes through");
         assert_eq!(guard_verify(|| Err(randprotocol_core::TxError::BadDigest)), Err(randprotocol_core::TxError::BadDigest));
+    }
+
+    /// Audit v6, PROC-8: a node more than one block behind defers by-hash fetches to batch sync;
+    /// at the head, and one block behind (a live proposal's parent), it fetches.
+    #[test]
+    fn by_hash_fetches_wait_for_batch_sync_while_behind() {
+        assert!(!fetch_deferred_to_batch_sync(0, 0), "no status yet: fetch");
+        assert!(!fetch_deferred_to_batch_sync(100, 100));
+        assert!(!fetch_deferred_to_batch_sync(101, 100), "one block behind is a live proposal's parent");
+        assert!(fetch_deferred_to_batch_sync(102, 100));
+        assert!(fetch_deferred_to_batch_sync(1_000, 100));
+        assert!(!fetch_deferred_to_batch_sync(50, 100), "peers behind us say nothing about what we lack");
     }
 
     /// The register and the bucket survive the same restart, hashed into and computed into the
