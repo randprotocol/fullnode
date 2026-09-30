@@ -9,6 +9,7 @@ pub mod keyfile;
 pub mod mempool;
 pub mod network;
 pub mod node;
+pub mod peer_bindings;
 pub mod rpc;
 pub mod storage;
 pub mod viewing;

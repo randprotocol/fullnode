@@ -717,7 +717,7 @@ Params: `[]`. Result:
   "height": 1998, "head_hash": "…", "view": 2251, "high_qc_view": 2250,
   "syncing": false, "sync_target": 1998,
   "sync_inflight_age_ms": null, "sync_failures": 0, "sync_late_batches": 0,
-  "peer_count": 5, "connected_peers": 5, "ws_clients": 3, "refused_cache": 0,
+  "peer_count": 5, "connected_peers": 5, "reserved_peers": 5, "ws_clients": 3, "refused_cache": 0,
   "verify_queue": 0, "mempool_size": 0,
   "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
   "fri_profile": "production", "programs": 2, "viewing_keys": 0,
@@ -750,6 +750,10 @@ otherwise looks identical to a node that is behind and working:
   nothing ever removed, and a peer id is free to mint), so the two numbers now differ only by
   peers that disconnected since the map was last pruned — `peer_count` far above
   `connected_peers` was hearsay before that date and is a bug after it.
+- `reserved_peers` — peers admitted past the inbound connection cap (audit v6, NET-1): the
+  bootstraps, the `--reserved-peer` list and every validator identity learned from a signed
+  peer binding, each counted once. On a fleet node it should reach the validator count within a
+  minute of start.
 - `ws_clients` — WebSocket clients connected right now, against the 64 this node will carry (see
   [Subscriptions](#subscriptions-websocket)). At 64 the next upgrade is refused with a `503`, which
   otherwise shows up only as clients that cannot connect for no visible reason.

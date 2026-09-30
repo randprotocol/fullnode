@@ -83,6 +83,14 @@ impl HotStuff {
         self.any_known_set(|s| s.contains(addr))
     }
 
+    /// Whether `addr` is a validator of a set this replica knows — the current one, a kept
+    /// earlier one, or one derived ahead. The node asks it of a signed peer binding's signer
+    /// (audit v6, NET-1): a key in none of them may be a validator of an epoch this replica has
+    /// not reached, so the answer `false` is "not known here", never "not a validator".
+    pub fn knows_validator(&self, addr: &Address) -> bool {
+        self.known_validator(addr)
+    }
+
     /// A certificate's shape, before any of its signatures: every vote well-formed and naming
     /// the certificate's own (view, block) — `QuorumCertificate::verify` refuses anything else on
     /// every replica, so those are `Reject` — and no more votes than the largest set this replica

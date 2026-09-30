@@ -13,6 +13,9 @@ pub struct RandBehaviour {
     /// the peer (deep scan 2026-09-24 — without it a swarm accepted every fresh identity thrown at
     /// it). It emits nothing.
     pub limits: connection_limits::Behaviour,
+    /// Second, for the same reason: the per-source pending cap and the per-peer cap that holds
+    /// reserved peers too (audit v6, NET-1; [`super::edge`]). It emits nothing either.
+    pub guard: super::edge::Guard,
     pub gossipsub: gossipsub::Behaviour,
     pub identify: identify::Behaviour,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
@@ -35,8 +38,8 @@ pub enum RandEvent {
     Ping(ping::Event),
 }
 
-/// `connection_limits::Behaviour`'s `ToSwarm` is uninhabited: this arm exists for the derive and
-/// can never run.
+/// `connection_limits::Behaviour`'s `ToSwarm` is uninhabited, and so is the guard's: this arm
+/// exists for the derive and can never run.
 impl From<Infallible> for RandEvent {
     fn from(e: Infallible) -> Self {
         match e {}

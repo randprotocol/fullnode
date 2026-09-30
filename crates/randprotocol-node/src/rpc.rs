@@ -224,6 +224,10 @@ pub struct NodeStatus {
     /// Peers this node holds an open connection to — the ones sync can actually ask for blocks. A
     /// `peer_count` far above this says most of what we know about the network is hearsay.
     pub connected_peers: usize,
+    /// Peers admitted past the inbound connection cap (audit v6, NET-1): the bootstraps, the
+    /// operator's `--reserved-peer` list and every validator identity learned from a signed
+    /// peer binding, each counted once.
+    pub reserved_peers: usize,
     /// WebSocket clients currently connected, against `ws::MAX_WS_CONNECTIONS`. At the cap the
     /// next upgrade is refused with a 503, which an operator would otherwise only see as clients
     /// that cannot connect for no visible reason.

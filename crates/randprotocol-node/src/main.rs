@@ -471,9 +471,16 @@ enum Cmd {
         key: PathBuf,
         #[arg(long, default_value = "/ip4/0.0.0.0/tcp/30303")]
         listen: Vec<Multiaddr>,
-        /// Bootstrap peer multiaddr (with /p2p/<peer-id>), repeatable.
+        /// Bootstrap peer multiaddr (with /p2p/<peer-id>), repeatable. Its peer id is reserved:
+        /// admitted past the inbound connection cap.
         #[arg(long)]
         bootstrap: Vec<Multiaddr>,
+        /// A peer id admitted past the inbound connection cap and served from the validators'
+        /// share of the sync budget (audit v6, NET-1), repeatable. Validators' ids are learned
+        /// from their signed bindings and remembered across restarts; list them here for a freshly
+        /// cut chain, whose store has none yet.
+        #[arg(long = "reserved-peer", value_name = "PEER_ID")]
+        reserved_peer: Vec<libp2p::PeerId>,
         #[arg(long, default_value = "127.0.0.1:8545")]
         rpc: SocketAddr,
         /// Take part in consensus with this node's key. A key in no current epoch's validator
@@ -1135,6 +1142,7 @@ async fn main() -> Result<()> {
             key,
             listen,
             bootstrap,
+            reserved_peer,
             rpc,
             validator,
             no_mdns,
@@ -1212,7 +1220,7 @@ async fn main() -> Result<()> {
                 min_free_disk_bytes: min_free_disk_mb << 20,
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
-            }, rpc_options)
+            }, rpc_options, node::NetOptions { reserved_peers: reserved_peer })
             .await?;
             // The prover is served once the node's RPC is up and stops with the node; a prover
             // that exits stops the node too.

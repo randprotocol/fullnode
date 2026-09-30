@@ -273,6 +273,21 @@ const META_TOKENS_V2: &str = "tokens_v2";
 /// The history-retention floor (history pruning spec §1): the lowest height, other than genesis,
 /// whose block this store still holds. Absent on a store that never pruned — an archive.
 const META_PRUNE_FLOOR: &str = "prune_floor";
+/// The validators' peer bindings this node has verified (audit v6, NET-1): validator address →
+/// the libp2p identity it signed for, as JSON ([`PeerBindingRow`]). A cache, not state: nothing
+/// in consensus reads it, a lost or corrupt row costs only the wait for the next announcement,
+/// so it is written without an fsync and read back leniently.
+const META_PEER_BINDINGS: &str = "peer_bindings";
+
+/// One persisted peer binding (audit v6, NET-1): the peer id in its base58 text form, and the
+/// signer's `issued_ms` of the binding it came from, so a restart still ignores anything older.
+/// The signature is not kept: the row is this node's own record of a check it made.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerBindingRow {
+    pub peer: String,
+    pub issued_ms: u64,
+}
+
 /// Blocks one `prune_history` pass deletes at most, so enabling the flag on a node holding days
 /// of history drains it over minutes of passes rather than one long stall. ~30–40 MB of block
 /// reads per pass on chain 14; a node holding four days of history drains in a few hours of
@@ -2550,6 +2565,24 @@ impl Storage {
             self.db.delete_cf_opt(self.cf(CF_META), META_SAFETY_HALT, &sync_opts())?;
         }
         Ok(halt)
+    }
+
+    /// The persisted peer bindings (audit v6, NET-1), keyed by validator address (base58). An
+    /// absent row is an empty map; an unreadable one is an error the caller logs and treats as
+    /// empty — a cache must never stop a node from starting.
+    pub fn peer_bindings(&self) -> Result<BTreeMap<String, PeerBindingRow>> {
+        match self.get_meta_raw(META_PEER_BINDINGS)? {
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| StorageError::Corrupt(format!("peer bindings: {e}"))),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    /// Replace the persisted peer bindings. Not synced: a crash loses at most the last change,
+    /// which the validator's next announcement (every minute) brings back.
+    pub fn put_peer_bindings(&self, rows: &BTreeMap<String, PeerBindingRow>) -> Result<()> {
+        let bytes = serde_json::to_vec(rows).map_err(|e| StorageError::Corrupt(format!("peer bindings: {e}")))?;
+        self.db.put_cf(self.cf(CF_META), META_PEER_BINDINGS, bytes)?;
+        Ok(())
     }
 
     /// The operator's offline lock release (audit v6, CON-4, decision D23): lower the persisted

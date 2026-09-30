@@ -102,6 +102,32 @@ rand status
 rand-node verify --datadir /root/data-<letter>-<genesis8> --mode full   # stop the service first
 ```
 
+### Reserved peers (audit v6, NET-1)
+
+A node accepts at most 256 established and 64 half-open inbound connections, and a libp2p
+identity costs nothing to mint, so strangers can hold every slot. Three kinds of peer are
+**reserved** — admitted past the established-inbound cap however many strangers hold it, and
+served from the validators' share of the sync budget (SYNC-3):
+
+- every `--bootstrap` address's peer id;
+- every `--reserved-peer <PEER_ID>` (repeatable; `rand-node address --key <file>` prints a key's
+  id — the same id the fleet's `nodes.env` bootstrap lines end in);
+- every validator identity learned from a signed peer binding. Each `--validator` node signs
+  "my libp2p identity is …" with its validator key and gossips it on `rand/<chain>/peers` when a
+  peer connects (at most every 10 s) and every minute; a node that knows the key from a
+  validator set records it, reserves the peer and persists the record (`peer_bindings` in the
+  meta column, a cache — not fsynced), so a restart or a node-by-node roll comes back with its
+  validators reserved before gossip says anything.
+
+A freshly cut chain has an empty store, so until the first announcements arrive only the first
+two kinds are reserved: pass the fleet's validator peer ids with `--reserved-peer` in the unit
+(or keep them in the bootstrap list) for a cut. Reserved peers still count toward the 256, so
+they take slots from strangers, never the other way round; each is held to four connections of
+its own (two for anyone else). Independently, one source address may hold at most four
+half-open connections, and a connection that has not finished its handshake in 5 s is dropped
+(libp2p's default was 10 s). The binding topic is new: an older build does not subscribe to it,
+so this rolls node by node.
+
 ## Rolling out a new commit
 
 1. `cargo test` locally, commit, push.

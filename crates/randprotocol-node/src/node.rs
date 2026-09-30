@@ -914,6 +914,18 @@ struct Node {
     consensus_limiter: admission::PeerLimiter,
     /// The byte policy over every peer's `consensus_byte_bucket` ([`consensus_byte_limiter`], CN-4).
     consensus_byte_limiter: admission::PeerLimiter,
+    /// The policy over every peer's `binding_bucket` ([`crate::peer_bindings::on_binding_gossip`]).
+    binding_limiter: admission::PeerLimiter,
+    /// The validators' libp2p identities this node has verified, and the operator's pinned ones
+    /// (audit v6, NET-1): reserved at the swarm, persisted, and SYNC-3's "validator peer".
+    peer_bindings: crate::peer_bindings::PeerBindings,
+    /// This validator's key, for signing its own binding; `None` on a node without `--validator`,
+    /// which has no validator identity to state.
+    binding_signer: Option<Keypair>,
+    /// When this node last announced its binding, and whether a peer connected since
+    /// ([`crate::peer_bindings::announce_due`]).
+    binding_announced_at: Option<Instant>,
+    binding_announce_wanted: bool,
     /// The policy over every peer's `sync_bucket` (see [`admit_sync_request`]).
     sync_limiter: admission::PeerLimiter,
     /// This validator's signed not-held answers, re-served to repeated by-hash requests (SW-2).
@@ -973,6 +985,9 @@ struct Peer {
     consensus_byte_bucket: admission::TokenBucket,
     /// The same, for the sync requests this peer sends us ([`admit_sync_request`]).
     sync_bucket: admission::TokenBucket,
+    /// The same, for the peer bindings this peer forwards (audit v6, NET-1): each new one costs a
+    /// signature verify.
+    binding_bucket: admission::TokenBucket,
     /// Not asked for a batch before this instant (SYNC-2): set by [`back_off_sync_peer`] when the
     /// peer answered our live batch request with nothing we could use, or when that request failed
     /// or was abandoned (CN-1, [`on_sync_batch_failed`]).
@@ -1227,6 +1242,7 @@ struct PeerMeters {
     status_bucket: admission::TokenBucket,
     consensus_bucket: admission::TokenBucket,
     sync_bucket: admission::TokenBucket,
+    binding_bucket: admission::TokenBucket,
     sync_backoff_until: Option<Instant>,
     sync_backoff: Duration,
 }
@@ -1238,6 +1254,7 @@ impl PeerMeters {
             status_bucket: p.status_bucket,
             consensus_bucket: p.consensus_bucket,
             sync_bucket: p.sync_bucket,
+            binding_bucket: p.binding_bucket,
             sync_backoff_until: p.sync_backoff_until,
             sync_backoff: p.sync_backoff,
         }
@@ -1248,6 +1265,7 @@ impl PeerMeters {
         p.status_bucket = self.status_bucket;
         p.consensus_bucket = self.consensus_bucket;
         p.sync_bucket = self.sync_bucket;
+        p.binding_bucket = self.binding_bucket;
         p.sync_backoff_until = self.sync_backoff_until;
         p.sync_backoff = self.sync_backoff;
     }
@@ -1750,11 +1768,23 @@ pub struct RpcOptions {
     pub viewing_token: Option<Arc<str>>,
 }
 
-pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
-    start_with(cfg, RpcOptions::default()).await
+/// What [`start_with`] adds to the network beyond [`NodeConfig`] (audit v6, NET-1): its own
+/// struct, beside [`RpcOptions`], so the many places that build a `NodeConfig` literally are
+/// untouched.
+#[derive(Clone, Debug, Default)]
+pub struct NetOptions {
+    /// Peers admitted past the inbound connection cap for the life of the process, and served
+    /// from the validators' share of the sync budget (`--reserved-peer`). The bootstraps' peer
+    /// ids are reserved the same way without being listed; validators' identities learned over
+    /// gossip are added as they arrive.
+    pub reserved_peers: Vec<PeerId>,
 }
 
-pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions) -> Result<NodeHandle> {
+pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
+    start_with(cfg, RpcOptions::default(), NetOptions::default()).await
+}
+
+pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: NetOptions) -> Result<NodeHandle> {
     // The public listener is its own socket (audit v6): the same address as the operator's
     // would make one of them unreachable, and a wildcard operator port beside it would put the
     // full method set back on the path the public listener exists to close.
@@ -1819,7 +1849,24 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions) -> Result<Node
     let wire = network::WireLimits::for_ledger(&gs.ledger);
     // The consensus byte budget is sized off the same genesis cap (CN-4).
     let max_block_bytes = gs.ledger.max_block_bytes();
-    let (net, mut events) = network::start(
+    // The validators' identities this node verified before it stopped (audit v6, NET-1), read
+    // before the swarm starts so they are reserved before the first connection is accepted. The
+    // operator's `--reserved-peer` list and the bootstraps are pinned beside them.
+    let pinned: std::collections::HashSet<PeerId> = cfg
+        .bootstrap
+        .iter()
+        .filter_map(|a| a.iter().find_map(|p| match p { libp2p::multiaddr::Protocol::P2p(id) => Some(id), _ => None }))
+        .chain(net_options.reserved_peers.iter().copied())
+        .collect();
+    let rows = storage.peer_bindings().unwrap_or_else(|e| {
+        tracing::warn!("persisted peer bindings unreadable, starting without them: {e}");
+        Default::default()
+    });
+    let peer_bindings = crate::peer_bindings::PeerBindings::load(gs.hash(), pinned, rows);
+    if !peer_bindings.is_empty() {
+        tracing::info!(bound = peer_bindings.len(), "validator peer bindings restored from the last run");
+    }
+    let (net, mut events) = network::start_with(
         NetworkConfig {
             chain_id: gs.chain_id,
             listen: cfg.listen.clone(),
@@ -1828,6 +1875,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions) -> Result<Node
             limits: wire,
         },
         identity,
+        network::EdgeConfig { reserved: net_options.reserved_peers.clone(), bound: peer_bindings.bound_peers() },
     )
     .await?;
 
@@ -1858,6 +1906,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions) -> Result<Node
         peer_id: net.local_peer_id.to_string(),
         prune_floor: 0,
         prune_history_secs: cfg.prune_history.map(|d| d.as_secs()),
+        reserved_peers: peer_bindings.reserved_count(),
         ..Default::default()
     }));
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -1976,6 +2025,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions) -> Result<Node
     if let Some(p) = cfg.gas_policy {
         mempool.set_gas_policy(p);
     }
+    let binding_signer = if cfg.validator { Some(Keypair::from_seed(cfg.seed)?) } else { None };
     let node = Node {
         cfg,
         gs,
@@ -2013,6 +2063,14 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions) -> Result<Node
         status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
         consensus_limiter: admission::PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC),
         consensus_byte_limiter: consensus_byte_limiter(max_block_bytes),
+        binding_limiter: admission::PeerLimiter::new(
+            crate::peer_bindings::BINDING_GOSSIP_BURST,
+            crate::peer_bindings::BINDING_GOSSIP_PER_SEC,
+        ),
+        peer_bindings,
+        binding_signer,
+        binding_announced_at: None,
+        binding_announce_wanted: false,
         sync_limiter: admission::PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC),
         not_held_signed: NotHeldCache::default(),
         peer_memory: PeerMemory::default(),
@@ -2095,7 +2153,8 @@ impl Node {
                 },
                 _ = status_tick.tick() => {
                     self.check_disk();
-                    self.broadcast_status().await
+                    self.broadcast_status().await;
+                    self.announce_binding().await;
                 }
                 _ = sync_tick.tick() => self.maybe_sync().await,
             }
@@ -2150,6 +2209,7 @@ impl Node {
         // matters for sync: only a peer we hold an open connection to can be asked for blocks.
         s.peer_count = self.peers.len();
         s.connected_peers = self.peers.values().filter(|p| p.connected).count();
+        s.reserved_peers = self.peer_bindings.reserved_count();
         s.mempool_size = self.mempool.len();
         // Whether this node's key is in the set running the epoch the next block belongs to.
         // Distinct from `is_validator`, which only says the node holds a key at all.
@@ -2367,6 +2427,39 @@ impl Node {
         }
         self.verify_queue.push_back((tx, VerifySource::Rpc(reply)));
         self.pump_verify();
+    }
+
+    /// Announce this validator's peer binding when it is due (audit v6, NET-1;
+    /// [`crate::peer_bindings::announce_due`]): hung off the status tick, so a connect is answered
+    /// within one tick — by when gossipsub has learned the new peer's subscriptions, which a
+    /// publish at the connect itself would be too early for. Signed afresh each time with the
+    /// current clock, so every announcement is a new message and supersedes the last.
+    async fn announce_binding(&mut self) {
+        let Some(key) = &self.binding_signer else { return };
+        let now = Instant::now();
+        if !crate::peer_bindings::announce_due(self.binding_announced_at, self.binding_announce_wanted, now) {
+            return;
+        }
+        let binding = network::PeerBinding::sign(key, &self.gs.hash(), &self.net.local_peer_id, now_ms());
+        self.binding_announced_at = Some(now);
+        self.binding_announce_wanted = false;
+        self.net.broadcast(GossipMessage::PeerBinding(binding)).await;
+    }
+
+    /// Do what a binding offer asked for (audit v6, NET-1): reserve, un-reserve, persist.
+    async fn apply_binding_change(&mut self, change: crate::peer_bindings::BindingChange) {
+        for p in change.unreserve {
+            self.net.unreserve_peer(p).await;
+        }
+        if let Some(p) = change.reserve {
+            tracing::info!(peer = %p, "validator peer binding recorded; peer reserved");
+            self.net.reserve_peer(p).await;
+        }
+        if change.persist {
+            if let Err(e) = self.storage.put_peer_bindings(&self.peer_bindings.rows()) {
+                tracing::warn!("persisting peer bindings: {e}");
+            }
+        }
     }
 
     async fn broadcast_status(&self) {
@@ -2758,6 +2851,8 @@ impl Node {
             NetworkEvent::PeerConnected(p) => {
                 connect_peer(&mut self.peers, &mut self.peer_memory, p, self.wire.max_established_incoming as usize);
                 self.broadcast_status().await;
+                // Announced at the next status tick, rate-limited (audit v6, NET-1).
+                self.binding_announce_wanted = true;
             }
             NetworkEvent::PeerDisconnected(p) => {
                 let held_our_batch = self.sync_inflight.map(|s| s.0) == Some(p);
@@ -2809,6 +2904,24 @@ impl Node {
                     self.report(id, outcome).await;
                     if recorded && ahead && self.sync_inflight.is_none() {
                         self.maybe_sync().await;
+                    }
+                }
+                // Metered per forwarder, then shape, signer, freshness and signature (audit v6,
+                // NET-1): one report on every path, then whatever the record asks for.
+                GossipMessage::PeerBinding(b) => {
+                    let hs = &self.hs;
+                    let verdict = crate::peer_bindings::on_binding_gossip(
+                        &mut self.peer_bindings,
+                        &mut self.peers.entry(id.propagation_source).or_default().binding_bucket,
+                        &self.binding_limiter,
+                        |a| hs.knows_validator(a),
+                        &b,
+                        Instant::now(),
+                        now_ms(),
+                    );
+                    self.report(id, GossipOutcome::Report(verdict.report)).await;
+                    if let Some(change) = verdict.change {
+                        self.apply_binding_change(change).await;
                     }
                 }
             },

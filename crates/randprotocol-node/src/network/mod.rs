@@ -7,9 +7,11 @@
 
 mod behaviour;
 pub mod codec;
+pub mod edge;
 pub mod wire;
 
-pub use wire::{GossipMessage, Status, SyncRequest, SyncResponse};
+pub use edge::{MAX_ESTABLISHED_PER_RESERVED_PEER, MAX_PENDING_INCOMING_PER_ADDR};
+pub use wire::{GossipMessage, PeerBinding, Status, SyncRequest, SyncResponse};
 
 /// Re-exported so the node can name a verdict without depending on libp2p directly. It derives
 /// `Debug` and nothing else — see `admission::Acceptance` for the comparable copy the decision path
@@ -147,6 +149,13 @@ pub struct WireLimits {
     pub max_established_per_peer: u32,
     /// Inbound connections still in their handshake at once ([`MAX_PENDING_INCOMING`]).
     pub max_pending_incoming: u32,
+    /// Of those, how many one source address may hold ([`MAX_PENDING_INCOMING_PER_ADDR`]; audit
+    /// v6, NET-1): without it the 64 above were one host's to fill.
+    pub max_pending_incoming_per_addr: u32,
+    /// Established connections per *reserved* peer ([`MAX_ESTABLISHED_PER_RESERVED_PEER`]): a
+    /// reserved peer bypasses libp2p's caps, the per-peer one included, so the guard holds it to
+    /// this instead.
+    pub max_established_per_reserved_peer: u32,
 }
 
 /// The default inbound connection cap: eighteen validators plus every explorer and observer fit
@@ -157,6 +166,16 @@ pub const MAX_ESTABLISHED_INCOMING: u32 = 256;
 pub const MAX_ESTABLISHED_PER_PEER: u32 = 2;
 /// The default cap on inbound connections mid-handshake.
 pub const MAX_PENDING_INCOMING: u32 = 64;
+
+/// How long a connection may take to set up, in either direction, before the transport drops it
+/// (audit v6, NET-1): the TCP connect of a dial, then the whole upgrade — multistream-select,
+/// the Noise handshake and the yamux negotiation — on both dials and accepted connections.
+/// libp2p's builder default is ten seconds; an inbound connection that stalls holds one of the
+/// [`MAX_PENDING_INCOMING`] slots for all of it, so the time is the other half of the pending
+/// cap. Five seconds is still several times an honest handshake across the fleet's longest
+/// path (four or five round trips at ~300 ms). It does not bound an established connection —
+/// that is the swarm's idle timeout and ping.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl WireLimits {
     pub const fn for_block_bytes(max_block_bytes: usize) -> WireLimits {
@@ -170,6 +189,8 @@ impl WireLimits {
             max_established_incoming: MAX_ESTABLISHED_INCOMING,
             max_established_per_peer: MAX_ESTABLISHED_PER_PEER,
             max_pending_incoming: MAX_PENDING_INCOMING,
+            max_pending_incoming_per_addr: MAX_PENDING_INCOMING_PER_ADDR,
+            max_established_per_reserved_peer: MAX_ESTABLISHED_PER_RESERVED_PEER,
         }
     }
 
@@ -261,6 +282,22 @@ pub struct NetworkConfig {
     pub limits: WireLimits,
 }
 
+/// What [`start_with`] is told about the edge beyond [`NetworkConfig`] (audit v6, NET-1). Its
+/// own struct, not fields of `NetworkConfig`, so every caller that builds that one literally —
+/// the tests of three crates' worth of files — keeps compiling, and [`start`] means "no
+/// reserved peers beyond the bootstraps".
+#[derive(Clone, Debug, Default)]
+pub struct EdgeConfig {
+    /// Peers reserved for the life of the process: the operator's `--reserved-peer` list. The
+    /// peer ids of [`NetworkConfig::bootstrap`] are reserved the same way without being named
+    /// here. [`NetworkHandle::unreserve_peer`] never removes one of these.
+    pub reserved: Vec<PeerId>,
+    /// Peers reserved from the start that may later stop being: the validators' identities this
+    /// node learned over gossip before its last restart (`node`'s persisted peer bindings),
+    /// handed over here so they are reserved before the first connection is accepted.
+    pub bound: Vec<PeerId>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct PeerInfo {
     pub peer_id: String,
@@ -308,6 +345,11 @@ pub enum NetworkCommand {
     Peers(oneshot::Sender<Vec<PeerInfo>>),
     /// The application's verdict on one delivered gossip message (see [`GossipId`]).
     ReportValidation { id: GossipId, acceptance: MessageAcceptance },
+    /// Reserve a peer (audit v6, NET-1): see [`NetworkHandle::reserve_peer`].
+    Reserve(PeerId),
+    /// Stop reserving a peer reserved through [`NetworkCommand::Reserve`] or
+    /// [`EdgeConfig::bound`]; a bootstrap or `--reserved-peer` identity stays reserved.
+    Unreserve(PeerId),
     Shutdown,
 }
 
@@ -338,6 +380,20 @@ impl NetworkHandle {
         let _ = self.cmd.send(NetworkCommand::ReportValidation { id, acceptance }).await;
     }
 
+    /// Reserve `peer` (audit v6, NET-1): its connections are no longer checked against the
+    /// established-inbound cap, so it is admitted however many strangers hold slots; the guard
+    /// still holds it to [`WireLimits::max_established_per_reserved_peer`] connections. Takes
+    /// effect for connections made from now on; idempotent.
+    pub async fn reserve_peer(&self, peer: PeerId) {
+        let _ = self.cmd.send(NetworkCommand::Reserve(peer)).await;
+    }
+
+    /// Undo [`NetworkHandle::reserve_peer`] for a peer that is no longer a validator's identity.
+    /// A no-op for a bootstrap or `--reserved-peer` identity. Connections it already holds stay.
+    pub async fn unreserve_peer(&self, peer: PeerId) {
+        let _ = self.cmd.send(NetworkCommand::Unreserve(peer)).await;
+    }
+
     pub async fn dial(&self, addr: Multiaddr) {
         let _ = self.cmd.send(NetworkCommand::Dial(addr)).await;
     }
@@ -359,6 +415,10 @@ struct Topics {
     consensus: IdentTopic,
     tx: IdentTopic,
     status: IdentTopic,
+    /// Validators' signed peer bindings (audit v6, NET-1). A topic of its own: a build that
+    /// predates it is not subscribed, so it never receives a `GossipMessage` variant it cannot
+    /// decode — a mixed fleet sees no change on the three topics it shares.
+    peers: IdentTopic,
 }
 
 impl Topics {
@@ -367,6 +427,7 @@ impl Topics {
             consensus: IdentTopic::new(format!("rand/{chain_id}/consensus")),
             tx: IdentTopic::new(format!("rand/{chain_id}/tx")),
             status: IdentTopic::new(format!("rand/{chain_id}/status")),
+            peers: IdentTopic::new(format!("rand/{chain_id}/peers")),
         }
     }
 
@@ -375,6 +436,7 @@ impl Topics {
             GossipMessage::Consensus(_) => &self.consensus,
             GossipMessage::Transaction(_) => &self.tx,
             GossipMessage::Status(_) => &self.status,
+            GossipMessage::PeerBinding(_) => &self.peers,
         }
     }
 }
@@ -384,10 +446,20 @@ struct ConnectedPeer {
     connected_at: Instant,
 }
 
-/// Build the swarm, listen, and spawn the event loop. Returns immediately.
+/// Build the swarm, listen, and spawn the event loop. Returns immediately. No reserved peers
+/// beyond the bootstraps: [`start_with`] under a default [`EdgeConfig`].
 pub async fn start(
     cfg: NetworkConfig,
     identity_seed: [u8; 32],
+) -> anyhow::Result<(NetworkHandle, mpsc::Receiver<NetworkEvent>)> {
+    start_with(cfg, identity_seed, EdgeConfig::default()).await
+}
+
+/// [`start`], with the operator's reserved peers and the bindings learned before this start.
+pub async fn start_with(
+    cfg: NetworkConfig,
+    identity_seed: [u8; 32],
+    edge: EdgeConfig,
 ) -> anyhow::Result<(NetworkHandle, mpsc::Receiver<NetworkEvent>)> {
     let mut seed = identity_seed;
     let keypair = identity::Keypair::ed25519_from_bytes(&mut seed)?;
@@ -437,13 +509,29 @@ pub async fn start(
     let ping = libp2p::ping::Behaviour::new(libp2p::ping::Config::new().with_interval(Duration::from_secs(15)).with_timeout(Duration::from_secs(20)));
     // Inbound only, plus the per-peer bound: this node's own dials are never refused by its own
     // caps, so a validator always reaches the peers it bootstraps to (`WireLimits`'s field docs).
-    let limits = libp2p::connection_limits::Behaviour::new(
+    let mut limits = libp2p::connection_limits::Behaviour::new(
         libp2p::connection_limits::ConnectionLimits::default()
             .with_max_established_incoming(Some(cfg.limits.max_established_incoming))
             .with_max_established_per_peer(Some(cfg.limits.max_established_per_peer))
             .with_max_pending_incoming(Some(cfg.limits.max_pending_incoming)),
     );
-    let behaviour = RandBehaviour { limits, gossipsub, identify, kademlia, mdns: Toggle::from(mdns), sync, ping };
+    let mut guard = edge::Guard::new(edge::GuardLimits {
+        max_pending_incoming_per_addr: cfg.limits.max_pending_incoming_per_addr,
+        max_established_per_peer: cfg.limits.max_established_per_peer,
+        max_established_per_reserved_peer: cfg.limits.max_established_per_reserved_peer,
+    });
+    // Reserved before the swarm exists, so before the first connection is accepted (audit v6,
+    // NET-1): the bootstraps and the operator's list for good (`pinned`), the bindings learned
+    // before this start until the node says otherwise. libp2p's limiter does not check a
+    // bypassed peer against the established caps — it does still count its connections, so a
+    // reserved peer's inbound connection takes one of the 256 from the strangers' side, never
+    // the other way round.
+    let pinned: HashSet<PeerId> = cfg.bootstrap.iter().filter_map(peer_id_of).chain(edge.reserved.iter().copied()).collect();
+    for id in pinned.iter().chain(edge.bound.iter()) {
+        limits.bypass_peer_id(id);
+        guard.reserve(*id);
+    }
+    let behaviour = RandBehaviour { limits, guard, gossipsub, identify, kademlia, mdns: Toggle::from(mdns), sync, ping };
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -451,10 +539,12 @@ pub async fn start(
         .with_behaviour(|_| behaviour)
         .map_err(|e| anyhow::anyhow!("behaviour: {e}"))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
+        // Only settable here, after the swarm config (libp2p 0.57's builder: the build phase).
+        .with_connection_timeout(HANDSHAKE_TIMEOUT)
         .build();
 
     let topics = Topics::new(cfg.chain_id);
-    for t in [&topics.consensus, &topics.tx, &topics.status] {
+    for t in [&topics.consensus, &topics.tx, &topics.status, &topics.peers] {
         swarm.behaviour_mut().gossipsub.subscribe(t)?;
     }
     for addr in &cfg.listen {
@@ -463,7 +553,7 @@ pub async fn start(
 
     let (cmd_tx, cmd_rx) = mpsc::channel(4096);
     let (evt_tx, evt_rx) = mpsc::channel(4096);
-    tokio::spawn(run(swarm, cfg, topics, cmd_rx, evt_tx));
+    tokio::spawn(run(swarm, cfg, pinned, topics, cmd_rx, evt_tx));
     Ok((NetworkHandle { cmd: cmd_tx, local_peer_id }, evt_rx))
 }
 
@@ -539,6 +629,8 @@ fn dial_bootstrap(swarm: &mut Swarm<RandBehaviour>, cfg: &NetworkConfig, peers: 
 async fn run(
     mut swarm: Swarm<RandBehaviour>,
     cfg: NetworkConfig,
+    // Reserved for the life of the process: no `Unreserve` removes one (see [`EdgeConfig`]).
+    pinned: HashSet<PeerId>,
     topics: Topics,
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
     evt_tx: mpsc::Sender<NetworkEvent>,
@@ -622,6 +714,18 @@ async fn run(
                     NetworkCommand::ReportValidation { id, acceptance } => {
                         report_to_gossipsub(&mut swarm, &id, acceptance);
                     }
+                    NetworkCommand::Reserve(id) => {
+                        let b = swarm.behaviour_mut();
+                        b.limits.bypass_peer_id(&id);
+                        b.guard.reserve(id);
+                    }
+                    NetworkCommand::Unreserve(id) => {
+                        if !pinned.contains(&id) {
+                            let b = swarm.behaviour_mut();
+                            b.limits.remove_peer_id(&id);
+                            b.guard.unreserve(&id);
+                        }
+                    }
                     NetworkCommand::Shutdown => break,
                 }
             }
@@ -669,6 +773,11 @@ async fn handle_swarm_event(
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             tracing::debug!(?peer_id, "outgoing connection error: {error}");
+        }
+        SwarmEvent::IncomingConnectionError { send_back_addr, error, .. } => {
+            // A refusal by the caps or the guard lands here, as does a handshake that failed or
+            // ran past [`HANDSHAKE_TIMEOUT`].
+            tracing::debug!(%send_back_addr, "incoming connection error: {error}");
         }
         SwarmEvent::Behaviour(RandEvent::Gossipsub(gossipsub::Event::Message {
             propagation_source,
@@ -1104,6 +1213,134 @@ mod tests {
         for (d, _) in &dialers {
             d.shutdown().await;
         }
+    }
+
+    fn loopback_cfg(bootstrap: Vec<Multiaddr>, limits: WireLimits) -> NetworkConfig {
+        NetworkConfig { chain_id: 7, listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()], bootstrap, enable_mdns: false, limits }
+    }
+
+    fn peer_of_seed(seed: u8) -> PeerId {
+        PeerId::from(identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap().public())
+    }
+
+    /// Audit v6, NET-1: with the inbound cap full of strangers, a further stranger is refused —
+    /// and a reserved peer is still admitted. Before, the cap was first come, first served, and a
+    /// validator restarting into a host whose slots strangers held could not get back in.
+    #[tokio::test]
+    async fn a_reserved_peer_is_admitted_past_an_inbound_cap_full_of_strangers() {
+        const CAP: u32 = 2;
+        let reserved_seed = 90u8;
+        let capped = WireLimits { max_established_incoming: CAP, ..WireLimits::default() };
+        let edge = EdgeConfig { reserved: vec![peer_of_seed(reserved_seed)], bound: vec![] };
+        let (target, mut target_rx) = start_with(loopback_cfg(vec![], capped), [80u8; 32], edge).await.unwrap();
+        let addr = wait_for(&mut target_rx, Duration::from_secs(5), |e| match e {
+            NetworkEvent::Listening(addr) => Some(addr),
+            _ => None,
+        })
+        .await
+        .expect("target listening");
+        let full = addr.with(libp2p::multiaddr::Protocol::P2p(target.local_peer_id));
+
+        // Two strangers fill the cap, one after the other.
+        let mut nodes = Vec::new();
+        for seed in [81u8, 82] {
+            let (d, rx) = start(loopback_cfg(vec![full.clone()], WireLimits::default()), [seed; 32]).await.unwrap();
+            let id = d.local_peer_id;
+            let got = wait_for(&mut target_rx, Duration::from_secs(10), |e| matches!(e, NetworkEvent::PeerConnected(p) if p == id).then_some(())).await;
+            assert!(got.is_some(), "stranger {seed} fills a slot");
+            nodes.push((d, rx));
+        }
+        // A third stranger is refused; the reserved peer gets in.
+        let (late, late_rx) = start(loopback_cfg(vec![full.clone()], WireLimits::default()), [83u8; 32]).await.unwrap();
+        let (reserved, reserved_rx) = start(loopback_cfg(vec![full.clone()], WireLimits::default()), [reserved_seed; 32]).await.unwrap();
+        let (late_id, reserved_id) = (late.local_peer_id, reserved.local_peer_id);
+        let mut saw_late = false;
+        let got = wait_for(&mut target_rx, Duration::from_secs(10), |e| match e {
+            NetworkEvent::PeerConnected(p) if p == late_id => {
+                saw_late = true;
+                None
+            }
+            NetworkEvent::PeerConnected(p) if p == reserved_id => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(got.is_some(), "the reserved peer was refused at a cap full of strangers");
+        // Give the stranger the same window again: still out.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let peers: Vec<String> = target.peers().await.into_iter().map(|p| p.peer_id).collect();
+        assert!(!saw_late && !peers.contains(&late_id.to_string()), "a stranger past the cap was admitted: {peers:?}");
+        assert_eq!(peers.len(), CAP as usize + 1, "the strangers who filled the cap, and the reserved peer");
+
+        target.shutdown().await;
+        for (d, _) in nodes.iter().chain([(late, late_rx), (reserved, reserved_rx)].iter()) {
+            d.shutdown().await;
+        }
+    }
+
+    /// Whether the node closed a raw TCP connection within `within`: a read that ends (EOF or
+    /// reset) rather than timing out. The bytes the listener's multistream-select sends first,
+    /// if any, are read past.
+    async fn closed_within(stream: &mut tokio::net::TcpStream, within: Duration) -> bool {
+        use tokio::io::AsyncReadExt;
+        let deadline = tokio::time::Instant::now() + within;
+        let mut buf = [0u8; 256];
+        loop {
+            match tokio::time::timeout_at(deadline, stream.read(&mut buf)).await {
+                Err(_) => return false,
+                Ok(Ok(0)) | Ok(Err(_)) => return true,
+                Ok(Ok(_)) => continue,
+            }
+        }
+    }
+
+    /// Audit v6, NET-1, the pending half: TCP connections from one address that never begin a
+    /// handshake. Past [`MAX_PENDING_INCOMING_PER_ADDR`] the node closes them at once — before,
+    /// all of them held a pending slot, and 64 held every one — and the ones it keeps are
+    /// dropped at [`HANDSHAKE_TIMEOUT`], not libp2p's ten seconds.
+    #[tokio::test]
+    async fn stalled_handshakes_are_capped_per_address_and_dropped_at_the_handshake_timeout() {
+        let (target, mut target_rx) = start(loopback_cfg(vec![], WireLimits::default()), [84u8; 32]).await.unwrap();
+        let addr = wait_for(&mut target_rx, Duration::from_secs(5), |e| match e {
+            NetworkEvent::Listening(addr) => Some(addr),
+            _ => None,
+        })
+        .await
+        .expect("target listening");
+        let port = addr
+            .iter()
+            .find_map(|p| match p {
+                libp2p::multiaddr::Protocol::Tcp(port) => Some(port),
+                _ => None,
+            })
+            .unwrap();
+        let extra = 3usize;
+        let mut stalled = Vec::new();
+        for _ in 0..MAX_PENDING_INCOMING_PER_ADDR as usize + extra {
+            stalled.push(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+            // One at a time, so the node has taken each before the next arrives.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let started = tokio::time::Instant::now();
+        let mut closed_now = 0;
+        for s in stalled.iter_mut() {
+            if closed_within(s, Duration::from_millis(300)).await {
+                closed_now += 1;
+            }
+        }
+        assert_eq!(closed_now, extra, "the connections past the per-address cap are refused at once, the rest held");
+        // The held ones go at the handshake timeout, well before libp2p's default of ten seconds.
+        for s in stalled.iter_mut() {
+            assert!(closed_within(s, Duration::from_secs(8)).await, "a stalled handshake outlived the handshake timeout");
+        }
+        let held_for = started.elapsed();
+        assert!(held_for < Duration::from_secs(8), "held for {held_for:?}");
+        // Their places are given back: a real peer from the same address connects.
+        let (d, _d_rx) = start(loopback_cfg(vec![addr.with(libp2p::multiaddr::Protocol::P2p(target.local_peer_id))], WireLimits::default()), [85u8; 32]).await.unwrap();
+        let id = d.local_peer_id;
+        let got = wait_for(&mut target_rx, Duration::from_secs(10), |e| matches!(e, NetworkEvent::PeerConnected(p) if p == id).then_some(())).await;
+        assert!(got.is_some(), "a real peer from the same address after the stalled ones went");
+        target.shutdown().await;
+        d.shutdown().await;
     }
 
     #[tokio::test]

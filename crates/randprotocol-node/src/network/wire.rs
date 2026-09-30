@@ -1,7 +1,8 @@
 //! Wire types exchanged between RAND nodes.
 
+use libp2p::PeerId;
 use randprotocol_core::consensus::{CommittedBlock, ConsensusMessage, NotHeld};
-use randprotocol_core::{Block, Hash, Transaction};
+use randprotocol_core::{Block, Hash, Keypair, PublicKey, Signature, Transaction};
 use serde::{Deserialize, Serialize};
 
 /// Periodic advertisement of a node's committed head.
@@ -21,6 +22,74 @@ pub enum GossipMessage {
     Consensus(ConsensusMessage),
     Transaction(Transaction),
     Status(Status),
+    /// A validator's signed libp2p identity (audit v6, NET-1), on its own topic
+    /// (`rand/{chain_id}/peers`). Appended last: bincode numbers variants by position, so the
+    /// three above encode exactly as before, and a build without this variant is not subscribed
+    /// to the topic that carries it.
+    PeerBinding(PeerBinding),
+}
+
+/// The longest peer id a binding may carry. An Ed25519 identity — every node's — is 38 bytes;
+/// the bound is what keeps a claimed id from being an arbitrary blob before it is parsed.
+pub const MAX_PEER_ID_BYTES: usize = 64;
+
+/// A validator's statement "my node's libp2p identity is `peer_id`", signed with its Dilithium2
+/// validator key (audit v6, NET-1).
+///
+/// The identity is `derive_subkey("rand-p2p-identity")` of the validator's secret seed, so
+/// nothing public — not the register, not the validator key — gives it: the validator has to say
+/// it. A node that holds a binding from a validator of a set it knows reserves that peer
+/// (`NetworkHandle::reserve_peer`), so the validator is admitted past the inbound cap.
+///
+/// Signed over `rand-peer-binding-1 ‖ genesis ‖ issued_ms ‖ peer_id`: the genesis hash keeps a
+/// binding on its own chain, and `issued_ms` — the signer's clock — makes each announcement a
+/// distinct message (gossipsub drops a repeat of identical bytes for a minute, at the publisher
+/// too, so an unchanging binding could not be re-announced to a peer that just connected) and
+/// orders them: a node keeps a validator's newest and ignores anything older, so a captured
+/// binding cannot be replayed over a later one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerBinding {
+    pub validator: PublicKey,
+    /// `PeerId::to_bytes` of the identity bound.
+    pub peer_id: Vec<u8>,
+    /// When the validator signed this, in its own clock's milliseconds since the epoch.
+    pub issued_ms: u64,
+    pub signature: Signature,
+}
+
+impl PeerBinding {
+    fn message(genesis: &Hash, peer_id: &[u8], issued_ms: u64) -> Vec<u8> {
+        // Fixed-width fields first, the variable-length id last: no two inputs share an encoding.
+        let mut m = Vec::with_capacity(40 + peer_id.len());
+        m.extend_from_slice(genesis.as_bytes());
+        m.extend_from_slice(&issued_ms.to_be_bytes());
+        m.extend_from_slice(peer_id);
+        Hash::digest_domain(b"rand-peer-binding-1", &m).0.to_vec()
+    }
+
+    pub fn sign(key: &Keypair, genesis: &Hash, peer: &PeerId, issued_ms: u64) -> PeerBinding {
+        let peer_id = peer.to_bytes();
+        let signature = key.sign(&Self::message(genesis, &peer_id, issued_ms));
+        PeerBinding { validator: key.public_key().clone(), peer_id, issued_ms, signature }
+    }
+
+    /// The key, the signature and the id have the lengths a real one has. Checked before
+    /// anything else reads them: serde puts no bound on either byte vector.
+    pub fn well_formed(&self) -> bool {
+        self.validator.as_bytes().len() == randprotocol_core::crypto::PUBLIC_KEY_LEN
+            && self.signature.is_well_formed()
+            && !self.peer_id.is_empty()
+            && self.peer_id.len() <= MAX_PEER_ID_BYTES
+    }
+
+    /// The identity bound, or `None` when the bytes are not a peer id.
+    pub fn peer(&self) -> Option<PeerId> {
+        PeerId::from_bytes(&self.peer_id).ok()
+    }
+
+    pub fn verify(&self, genesis: &Hash) -> bool {
+        self.validator.verify(&Self::message(genesis, &self.peer_id, self.issued_ms), &self.signature)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,6 +136,94 @@ mod tests {
         let mut framed = bincode::serialize(&2u32).unwrap();
         framed.extend_from_slice(&short);
         assert!(bincode::deserialize::<GossipMessage>(&framed).is_err());
+    }
+
+    /// The v0.6.7 `GossipMessage`, variant for variant.
+    #[derive(Serialize, Deserialize)]
+    #[allow(dead_code, clippy::large_enum_variant)]
+    enum OldGossipMessage {
+        Consensus(ConsensusMessage),
+        Transaction(Transaction),
+        Status(Status),
+    }
+
+    /// Audit v6, NET-1, the roll: `PeerBinding` is appended to `GossipMessage`, and bincode
+    /// numbers variants by position, so every message a v0.6.7 node sends or reads encodes to
+    /// the same bytes under both builds. The new variant itself is tag 3, which a v0.6.7 node
+    /// cannot decode — and never has to, because it rides a topic (`rand/{chain_id}/peers`)
+    /// that build is not subscribed to.
+    #[test]
+    fn the_peer_binding_variant_is_appended_so_the_first_three_encode_as_before() {
+        let key = Keypair::from_seed([5; 32]).unwrap();
+        let vote = randprotocol_core::Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::digest(b"g")), 7, Hash::digest(b"block"), &key);
+        let status = Status { height: 7, head_hash: Hash::digest(b"h"), view: 9, floor: 1 };
+        let pairs = [
+            (
+                bincode::serialize(&GossipMessage::Consensus(ConsensusMessage::Vote(vote.clone()))).unwrap(),
+                bincode::serialize(&OldGossipMessage::Consensus(ConsensusMessage::Vote(vote))).unwrap(),
+            ),
+            (
+                bincode::serialize(&GossipMessage::Status(status.clone())).unwrap(),
+                bincode::serialize(&OldGossipMessage::Status(status)).unwrap(),
+            ),
+        ];
+        for (new, old) in &pairs {
+            assert_eq!(new, old, "a shared variant's bytes moved");
+            assert!(bincode::deserialize::<OldGossipMessage>(new).is_ok());
+            assert!(bincode::deserialize::<GossipMessage>(old).is_ok());
+        }
+        // A transaction is the third shared variant: tag 1 under both, checked on the tag alone
+        // (building one needs an executor).
+        assert_eq!(bincode::serialize(&1u32).unwrap(), [1, 0, 0, 0]);
+
+        let peer = PeerId::random();
+        let binding = PeerBinding::sign(&key, &Hash::digest(b"genesis"), &peer, 1_000);
+        let bytes = bincode::serialize(&GossipMessage::PeerBinding(binding.clone())).unwrap();
+        assert_eq!(&bytes[..4], &[3, 0, 0, 0], "the new variant is the fourth");
+        assert!(bincode::deserialize::<OldGossipMessage>(&bytes).is_err(), "an old node cannot read it; it is never sent one");
+        let GossipMessage::PeerBinding(read) = bincode::deserialize::<GossipMessage>(&bytes).unwrap() else { panic!("decoded as another variant") };
+        assert_eq!(read, binding);
+    }
+
+    /// A binding verifies for the chain, the identity and the moment it was signed over, and
+    /// for nothing else (audit v6, NET-1).
+    #[test]
+    fn a_peer_binding_verifies_only_for_what_was_signed() {
+        let key = Keypair::from_seed([5; 32]).unwrap();
+        let genesis = Hash::digest(b"genesis");
+        let peer = PeerId::random();
+        let b = PeerBinding::sign(&key, &genesis, &peer, 1_000);
+        assert!(b.well_formed());
+        assert_eq!(b.peer(), Some(peer));
+        assert!(b.verify(&genesis));
+        assert!(!b.verify(&Hash::digest(b"another chain")), "another genesis");
+        let mut other_peer = b.clone();
+        other_peer.peer_id = PeerId::random().to_bytes();
+        assert!(!other_peer.verify(&genesis), "another identity under the same signature");
+        let mut later = b.clone();
+        later.issued_ms += 1;
+        assert!(!later.verify(&genesis), "another moment under the same signature");
+        let mut other_key = b.clone();
+        other_key.validator = Keypair::from_seed([6; 32]).unwrap().public_key().clone();
+        assert!(!other_key.verify(&genesis), "another validator's key");
+
+        // The shape checks: a short key, a short signature, an empty or oversized id, and bytes
+        // that are no peer id.
+        let mut short_sig = b.clone();
+        short_sig.signature = bincode::deserialize(&bincode::serialize(&vec![0u8; 10]).unwrap()).unwrap();
+        assert!(!short_sig.well_formed());
+        let mut short_key = b.clone();
+        short_key.validator = bincode::deserialize(&bincode::serialize(&vec![0u8; 10]).unwrap()).unwrap();
+        assert!(!short_key.well_formed());
+        let mut empty = b.clone();
+        empty.peer_id = vec![];
+        assert!(!empty.well_formed());
+        let mut huge = b.clone();
+        huge.peer_id = vec![0; MAX_PEER_ID_BYTES + 1];
+        assert!(!huge.well_formed());
+        let mut junk = b;
+        junk.peer_id = vec![0xff; 20];
+        assert!(junk.well_formed() && junk.peer().is_none());
     }
 
     /// The v0.5.8 `NotHeld`: no view, signed under `rand-not-held-1 ‖ genesis ‖ hash`.

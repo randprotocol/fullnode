@@ -261,6 +261,7 @@ one the cut announced; a mismatch on one node is almost always an old binary.
 | `--key <KEY>` | required | key file (validator identity, p2p identity, fee recipient) |
 | `--listen <LISTEN>` | `/ip4/0.0.0.0/tcp/30303` | libp2p listen multiaddr, repeatable |
 | `--bootstrap <BOOTSTRAP>` | none, repeatable | peer to dial at start and every 30 s while disconnected: `/ip4/<ip>/tcp/<port>/p2p/<peer-id>` |
+| `--reserved-peer <PEER_ID>` | none, repeatable | a peer admitted past the inbound connection cap and served from the validators' share of the sync budget (audit v6, NET-1). Bootstrap peers and every validator whose signed peer binding this node has seen are reserved without it; list the fleet's validators here for a freshly cut chain, whose store holds no bindings yet (`docs/deploy.md`, "Reserved peers") |
 | `--rpc <RPC>` | `127.0.0.1:8545` | the operator's JSON-RPC listener: every method, and it trusts loopback. Keep it on loopback; never forward a public endpoint to it |
 | `--public-rpc <ADDR>` | off | a second, public listener (audit v6): a fixed method set (no viewing-key methods, `rand_mint` or `rand_getPeers`), no batches, no WebSocket, one meter for all callers. What a reverse proxy or an SSH forward points at (`docs/rpc.md`, "Two listeners") |
 | `--rpc-viewing-token-file <PATH>` | off | require `Authorization: Bearer <first line of the file>` (32+ characters) on the viewing-key methods of `--rpc` |
