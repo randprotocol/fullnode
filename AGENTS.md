@@ -86,6 +86,48 @@ one CI failure mode left), and everything outside this repository — the websit
 repositories (BR-*), the papers (PA-*, DOC-*), and custody (OPS-6, BR-4, BR-7).
 
 
+### prover.randprotocol.org — the validators' prover pool (LIVE 2026-10-01 ~05:00 WITA; the `parallel` build)
+
+The user's instruction (2026-09-30, then asleep: "always choose the recommended decision; commit and
+push to origin/main often"): five current validators become delegated provers behind one name like
+`rpc.randprotocol.org`, and every client carries it as a trusted prover. Runbook and live status:
+`deploy/prover/README.md`; user-facing: `docs/prover.md` §9; CLI: `rand prover pair --trusted`
+(`prover::TRUSTED_PROVER_LINK`, fingerprint **`RGTF-7HKJ-XZFV-GQ1J`** pinned beside it, red-first).
+
+- **Shape.** nginx on the web droplet (TLS, `limit_req` per address, no access log) →
+  `deploy/prover/router.py` (least-loaded member for a submit, the holder for a status; 14 tests
+  against fake provers) → one SSH tunnel per member → `rand-prover.service` on the validator host,
+  a sibling of `rand-node` as its own sandboxed user on loopback (`systemd-analyze security` 3.2),
+  `--max-parallel 1 --max-queue 1 --per-token 2`, `RAYON_NUM_THREADS = cores − 1`, `MemoryMax=8G`,
+  `CPUWeight=50`, `Nice=10`. Every member holds the SAME `prover.key.json` + `pairings.json`
+  (laptop copy `~/rand-prover-trusted/`, mode 0700 — losing it means a new fingerprint in every
+  client), so the pool has one link, served too at `/.well-known/rand-prover.json`. Viewing-key jobs
+  only, no `own=1`, no fee. Members: rand-node-a, rand-archive-2, rand-guardian-1, -2, -5, each
+  resized CPU/RAM-only to `c-8` (8 vCPU / 16 GB, disk untouched, ~$168/mo) with
+  `deploy/prover/resize-host.sh` — the hosts this laptop's DigitalOcean token can resize; **the
+  three guardian hosts are a stopgap** (audit-v6 #112 key separation) until three of the original
+  validators, in the other DO team, can be resized instead.
+- **Trap — the prover was single-threaded by build, not by nature.** `p3-maybe-rayon` was built
+  without its `parallel` feature. Measured on chain 18 with real transfers: v0.6.7's `rand-prover`
+  took 236.8 s (c-8, Xeon 8168), 234.4 s (c2-8vcpu), 217.0 s (premium-Intel c-8, Xeon 8358) and
+  **294.3 s on a premium-AMD shared droplet, which was refused: `time 102225 is outside [102230,
+  102486]`** — `ledger::TIME_WINDOW` is 256 blocks ≈ 300 s at chain 18's 1.17 s blocks. With the
+  feature (one Cargo line, `parallel`, on with `service`; tag **`v0.6.7-prover.1`** = v0.6.7 +
+  `5ed29fc`, `rand-prover` sha256 `cb634a25…4a39`, pre-release) the same droplets take 68.6–72.9 s
+  at 5.88 GB peak; through the public name 75.4 s (transfer `684f9a4b…252e`). Main carries the
+  feature since this entry (prover crate default with `service`; the CLI enables it too). The
+  `docs/node-hardware.md` "single-threaded" paragraph describes the old build. Raise `TIME_WINDOW`
+  at a cut if server-class provers are to have real margin.
+- **Traps from the night.** The web droplet's certbot Cloudflare credential does not see this
+  zone (`Unable to determine zone_id`) — `install-web.sh` gets the certificate over HTTP-01 through
+  a temporary http-only vhost. `set -- $var` in this laptop's zsh does not word-split — a loop that
+  relied on it ran nothing; call the scripts one line each. The laptop's `18545` tunnel died twice
+  (chain-18 note (3)); `curl` it before every step. The clients vendor fullnode **v0.6.6 = d742a9b,
+  the pre-rebase line with no split authorisation**, so client 0.6.6 cannot send on chain 18/19 at
+  all — its re-vendor to v0.6.7 + Phase 2 is on clients `feat/fullnode-v0.6.7` (session clients-58
+  merges; it holds PRIVACY.md and the store texts), the trusted prover stacked as
+  `feat/trusted-prover` for a client 0.6.7.
+
 ### v0.6.7 — the fixes on the chain-18 build (2026-09-29; rolls onto chain 18 one node at a time)
 
 `v0.6.7-rc1` (the gas model, chain 18's cut build) plus fixes that change no consensus rule, wire

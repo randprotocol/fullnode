@@ -9,7 +9,14 @@ description = "RandProtocol delegated prover: the sealed job wire, the pairing s
 [features]
 default = ["service"]
 # The listener, the queue, the CLI. Off for a wasm wallet core that only needs the wire codec.
-service = ["dep:axum", "dep:tokio", "dep:sysinfo", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:anyhow", "dep:qrcode"]
+service = ["dep:axum", "dep:tokio", "dep:sysinfo", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:anyhow", "dep:qrcode", "parallel"]
+# Plonky3's own `parallel` feature (rayon), switched on for the whole build through this one
+# dependency: the STARK prover then uses every core instead of one. Measured on an 8-vCPU
+# DigitalOcean c2 droplet (Xeon 8168), one production tier-14 bundle proof: 234.4 s without it,
+# 68.6 s with it, peak RSS 5.88 GB against 5.74 GB; the proof verifies and commits the same. It
+# comes with `service` because a prover has a deadline (a bundle lands within
+# `ledger::TIME_WINDOW` blocks or not at all) and never builds for wasm, where rayon does not.
+parallel = ["dep:p3-maybe-rayon"]
 cuda = ["randprotocol-zkvm/cuda"]
 mock-cuda = ["randprotocol-zkvm/mock-cuda"]
 
@@ -29,6 +36,8 @@ ml-kem = "=0.3.2"
 chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
 rand = { version = "=0.10.2", features = ["std_rng"] }
 rand_core = "=0.10.1"
+# Named only for its feature (see `parallel` above); the version is the zkvm crate's Plonky3 pin.
+p3-maybe-rayon = { version = "=0.7.0", features = ["parallel"], optional = true }
 # StdRng's stream is ChaCha12 from `chacha20` (HCS-1's third pin, as in the zkvm crate); named only for the pin.
 chacha20 = { version = "=0.10.2", default-features = false }
 axum = { workspace = true, optional = true }

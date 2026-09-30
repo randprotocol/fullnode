@@ -229,8 +229,12 @@ rand-node aggregate --key agg.key.json --rpc <URL> --watch
 
 ## 5. Prover memory per tier
 
-**The prover is single-threaded.** A 16-vCPU box ran it at 99 % of one core. More cores do not
-shorten a proof today; more RAM decides whether it finishes.
+**The prover uses every core since the `parallel` build** (2026-10-01: `p3-maybe-rayon`'s
+`parallel` feature, on with the prover crate's `service` and in the CLI). Before it the prover
+was single-threaded — a 16-vCPU box ran it at 99 % of one core — and a production tier-14 bundle
+took 217–237 s on an 8-vCPU DigitalOcean c-8; with it, 68.6–72.9 s on the same class of droplet
+at 5.88 GB peak (`deploy/prover/README.md`). Memory per proof is unchanged in kind, and the
+figures below were measured on the single-core build.
 
 | tier | cycles (up to) | workload measured | memory measured | time measured | final |
 |---|---:|---|---|---|---|

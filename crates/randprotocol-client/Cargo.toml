@@ -14,7 +14,7 @@ path = "src/main.rs"
 randprotocol-core = { workspace = true }
 randprotocol-zkvm = { workspace = true }
 # The delegated-proving wire (sealed job, sealed reply, pairing link) — never the service half.
-randprotocol-prover = { workspace = true, default-features = false }
+randprotocol-prover = { workspace = true, default-features = false, features = ["parallel"] }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
