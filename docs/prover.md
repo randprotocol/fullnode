@@ -483,7 +483,13 @@ randprover:<base58(kem_ek)>?url=<percent-encoded URL>&token=<64 hex>[&own=1]
 
 The URL is percent-encoded except for RFC 3986's unreserved characters. A parser must refuse a
 key that is not 1 184 bytes, a repeated parameter, a missing or empty `url`, a token that is not 64
-hex digits, and any `own` value other than `1`; unknown parameters are ignored. The fingerprint a
+hex digits, and any `own` value other than `1`; unknown parameters are ignored. It must also refuse
+a `url` that, once percent-decoded, holds anything but printable ASCII (U+0021–U+007E): the URL is
+the prover's to choose and the wallet shows it to its owner, so it may carry no control character
+(a terminal escape, a newline), no bidi or other format character, no space and no non-ASCII text —
+an internationalised host name is written in its `xn--` form. `rand-prover pair --url` refuses to
+mint such a link, and the wallet prints a pairing's URL and name only through its display
+sanitiser, like every other string a prover supplies. The fingerprint a
 wallet shows and checks is `blake3("rand-prover-fingerprint-1" ‖ kem_ek)[..10]` in Crockford
 base32, grouped `XXXX-XXXX-XXXX-XXXX` — its own domain, so it never collides in meaning with an
 address fingerprint.

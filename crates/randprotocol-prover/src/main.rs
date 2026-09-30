@@ -173,6 +173,8 @@ async fn main() -> Result<()> {
         Cmd::Pair { name, url, own, qr } => {
             ensure_dir(&home)?;
             let key = load_key(&key_path)?;
+            // Before the pairing is recorded: a link no wallet would parse is never minted (VK-5).
+            randprotocol_prover::pairing::check_link_url(&url).map_err(|e| anyhow::anyhow!("--url: {e}"))?;
             let mut pairings = Pairings::load(&pairings_path)?;
             let token = pairings.pair(&name, own).map_err(anyhow::Error::msg)?;
             pairings.save(&pairings_path).with_context(|| format!("writing {}", pairings_path.display()))?;

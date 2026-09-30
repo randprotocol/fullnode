@@ -64,7 +64,7 @@ impl PairingLink {
             if slot.replace(v).is_some() { return Err(format!("parameter {k} given twice")); }
         }
         let url = percent_decode(url.ok_or("the link has no url")?)?;
-        if url.is_empty() { return Err("the link's url is empty".into()); }
+        check_link_url(&url)?;
         let token_hex = token.ok_or("the link has no token")?;
         let mut token = [0u8; 32];
         hex::decode_to_slice(token_hex, &mut token).map_err(|e| format!("token is not 64 hex digits: {e}"))?;
@@ -77,6 +77,27 @@ impl PairingLink {
     }
 
     pub fn fingerprint(&self) -> Fingerprint { fingerprint_of(&self.kem_ek) }
+}
+
+/// The rule for the URL a `randprover:` link carries (VK-5, audit v6): not empty, and printable
+/// ASCII only (U+0021–U+007E). The URL is the prover's to choose and the wallet shows it to its
+/// owner, so a link must not be able to carry a terminal escape (`ESC [ 2K` and a redrawn
+/// `(own: …)` line), a newline, a bidi override that reorders the host name, or an invisible
+/// format character. Printable ASCII excludes every one of those — all of Cc, Cf, Zl, Zp and
+/// every space — without a Unicode table in this crate (the wallet's display sanitiser, which has
+/// one, sits in a crate that depends on this one); an internationalised host name goes in its
+/// `xn--` form, which is also the form that cannot be a homograph. Checked where a link is
+/// parsed and where one is minted (`rand-prover pair --url`). The refusal never echoes the URL.
+pub fn check_link_url(url: &str) -> Result<(), String> {
+    if url.is_empty() { return Err("the link's url is empty".into()); }
+    if let Some(at) = url.chars().position(|c| !c.is_ascii_graphic()) {
+        return Err(format!(
+            "the link's url is not printable ASCII (character {} is a control, space, format or non-ASCII character); \
+             a prover URL carries none — write an internationalised host name in its xn-- form",
+            at + 1
+        ));
+    }
+    Ok(())
 }
 
 /// Everything but RFC 3986's unreserved characters is escaped, so the URL survives as one

@@ -1143,7 +1143,8 @@ async fn main() -> Result<()> {
                 // `info` refuses a prover whose key is not the one the link names.
                 RemoteProver::new(paired.clone()).info().await?;
                 paired.save(&cli.key)?;
-                println!("paired {} at {} (own: {})", paired.fingerprint, paired.url, if paired.own { "yes" } else { "no" });
+                // The URL goes through `shown()` like every other prover-supplied string (VK-5).
+                println!("{}", paired.paired_line());
                 if !paired.own {
                     // What a pairing that is not the owner's own can and cannot do, said now
                     // rather than at the first send.

@@ -82,10 +82,10 @@ pub struct PairedProver {
 impl std::fmt::Debug for PairedProver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PairedProver")
-            .field("url", &self.url)
+            .field("url", &self.shown_url())
             .field("fingerprint", &self.fingerprint)
             .field("own", &self.own)
-            .field("name", &self.name)
+            .field("name", &self.name.as_deref().map(shown))
             .finish_non_exhaustive()
     }
 }
@@ -167,21 +167,35 @@ impl PairedProver {
         }
     }
 
-    /// What `rand prover show` prints: everything but the token.
+    /// The URL as the wallet prints it (VK-5, audit v6): through [`shown`], like every other
+    /// prover-supplied string — the link it came in was the prover's to write, and a raw URL
+    /// could carry a terminal escape that redraws the line it is printed on. `PairingLink::parse`
+    /// refuses such a URL before it gets here; this holds for a `<key>.prover.json` that did not
+    /// come through it. Only ever for display: requests go to [`url`](Self::url) itself.
+    pub fn shown_url(&self) -> String {
+        shown(&self.url)
+    }
+
+    /// What `rand prover show` prints: everything but the token, the name and URL sanitised.
     pub fn show(&self) -> String {
         format!(
             "name: {}\nurl: {}\nfingerprint: {}\nown: {}\nkem_ek: {}",
-            self.name.as_deref().unwrap_or("-"),
-            self.url,
+            self.name.as_deref().map_or_else(|| "-".to_string(), shown),
+            self.shown_url(),
             self.fingerprint,
             if self.own { "yes" } else { "no" },
             self.kem_ek
         )
     }
 
-    /// The name to print for this prover: its `--name`, else its URL.
-    pub fn label(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.url)
+    /// What `rand prover pair` prints once the pairing is saved.
+    pub fn paired_line(&self) -> String {
+        format!("paired {} at {} (own: {})", shown(&self.fingerprint), self.shown_url(), if self.own { "yes" } else { "no" })
+    }
+
+    /// The name to print for this prover: its `--name`, else its URL — sanitised either way.
+    pub fn label(&self) -> String {
+        self.name.as_deref().map_or_else(|| self.shown_url(), shown)
     }
 
     fn kem_ek_bytes(&self) -> Result<Vec<u8>> {
@@ -199,18 +213,23 @@ impl PairedProver {
 /// (`localhost`, `127.0.0.1`, `[::1]`). A job is sealed either way, but the pairing token travels
 /// in it and the reply's timing and size are visible to anyone on the path.
 pub fn check_prover_url(url: &str) -> Result<()> {
-    let u = reqwest::Url::parse(url).map_err(|e| anyhow!("{url}: not a URL ({e}); a prover URL is https:// (or http:// to 127.0.0.1/localhost)"))?;
+    // The link parser's own rule first (printable ASCII only, VK-5), for a URL that reached here
+    // another way — a `<key>.prover.json` edited by hand — and every refusal below names the URL
+    // as it may be shown, never raw.
+    randprotocol_prover::pairing::check_link_url(url).map_err(|e| anyhow!("the prover URL: {e}"))?;
+    let named = shown(url);
+    let u = reqwest::Url::parse(url).map_err(|e| anyhow!("{named}: not a URL ({e}); a prover URL is https:// (or http:// to 127.0.0.1/localhost)"))?;
     // `http://localhost:80@evil.com/` names host evil.com: credentials in a prover URL are refused
     // outright, and the host checked is the one the URL resolves to, never a prefix of its text.
     if !u.username().is_empty() || u.password().is_some() {
-        return Err(anyhow!("{url}: a prover URL carries no user name or password"));
+        return Err(anyhow!("{named}: a prover URL carries no user name or password"));
     }
     let host = u.host_str().unwrap_or("");
     match u.scheme() {
         "https" if !host.is_empty() => Ok(()),
         "http" if matches!(host, "localhost" | "127.0.0.1" | "[::1]") => Ok(()),
-        "http" => Err(anyhow!("{url}: a prover is reached over https anywhere but 127.0.0.1/localhost")),
-        _ => Err(anyhow!("{url}: a prover URL is https:// (or http:// to 127.0.0.1/localhost)")),
+        "http" => Err(anyhow!("{named}: a prover is reached over https anywhere but 127.0.0.1/localhost")),
+        _ => Err(anyhow!("{named}: a prover URL is https:// (or http:// to 127.0.0.1/localhost)")),
     }
 }
 
@@ -330,7 +349,7 @@ impl RemoteProver {
             .body(body)
             .send()
             .await
-            .map_err(|e| anyhow!(e).context(format!("{method}: reaching the prover at {}", self.paired.url)))?;
+            .map_err(|e| anyhow!(e).context(format!("{method}: reaching the prover at {}", self.paired.shown_url())))?;
         let bytes = crate::read_capped(resp, MAX_REPLY_BYTES).await?;
         let resp: Value = serde_json::from_slice(&bytes).with_context(|| format!("{method}: the prover's reply is not JSON"))?;
         if let Some(err) = resp.get("error") {
@@ -353,7 +372,7 @@ impl RemoteProver {
                 if got != self.paired.fingerprint {
                     return Err(anyhow!(
                         "the prover at {} answers with key fingerprint {:?}, but this wallet paired with {} — not sending it anything",
-                        self.paired.url,
+                        self.paired.shown_url(),
                         shown(got),
                         self.paired.fingerprint
                     ));
@@ -422,7 +441,7 @@ impl RemoteProver {
         };
         let job = match self.call("prover_submit", json!([hex::encode(&sealed)])).await {
             Ok(v) => v["job"].as_str().context("prover_submit returned no job id")?.to_string(),
-            Err(e) => return Err(submit_error(e, self.paired.label())),
+            Err(e) => return Err(submit_error(e, &self.paired.label())),
         };
         match self.finish(&job, &reply_key, hc, profile, binding, expected, proof_cap).await {
             Ok(out) => Ok(out),
@@ -1030,6 +1049,42 @@ mod tests {
         p.save(&key_file).expect("re-pairing overwrites");
         assert!(PairedProver::forget(&key_file).unwrap());
         assert!(!PairedProver::forget(&key_file).unwrap());
+    }
+
+    /// VK-5 (audit v6): every line the wallet prints about a pairing shows the URL — and the
+    /// `--name` — through [`shown`], like every other prover-supplied string. `PairingLink::parse`
+    /// refuses such a URL outright; this is the second line of defence, for a pairing that did not
+    /// come through it (a `<key>.prover.json` written by an older build, or by hand).
+    #[test]
+    fn a_pairings_url_is_never_printed_raw() {
+        let key = ProverKey::generate();
+        let hostile = "https://prover.example/\u{1b}[2K\rpaired at https://good.example (own: no)\u{202e}";
+        let link = PairingLink { kem_ek: key.kem_ek().to_vec(), url: hostile.into(), token: [1; 32], own: true };
+        let clean = |s: &str| !s.chars().any(|c| (c.is_control() && c != '\n') || c == '\u{202e}');
+        for name in [None, Some("box\u{1b}[1A".to_string())] {
+            let p = PairedProver::from_link(&link, name);
+            assert!(clean(&p.show()), "show: {:?}", p.show());
+            assert_eq!(p.show().lines().count(), 5, "five fields, five lines: {:?}", p.show());
+            assert!(clean(&p.label()) && !p.label().contains('\n'), "label: {:?}", p.label());
+            assert!(clean(&p.paired_line()) && !p.paired_line().contains('\n'), "paired: {:?}", p.paired_line());
+            assert!(p.paired_line().contains(&p.fingerprint) && p.paired_line().contains("https://prover.example/"), "{:?}", p.paired_line());
+            assert!(clean(&format!("{p:?}")), "Debug escapes it too");
+        }
+        let e = check_prover_url(hostile).unwrap_err().to_string();
+        assert!(clean(&e) && !e.contains('\n') && e.contains("printable ASCII"), "{e:?}");
+        let e = check_prover_url("ftp://x/\u{1b}[2K").unwrap_err().to_string();
+        assert!(clean(&e) && !e.contains('\n'), "{e:?}");
+        let e = check_prover_url("\u{1b}[2Knot a url").unwrap_err().to_string();
+        assert!(clean(&e) && !e.contains('\n'), "{e:?}");
+    }
+
+    /// `rand prover pair` refuses a link whose URL carries an escape before anything is saved or
+    /// contacted: the link never parses (VK-5).
+    #[test]
+    fn a_link_with_an_escape_in_its_url_does_not_parse() {
+        let key = ProverKey::generate();
+        let link = PairingLink { kem_ek: key.kem_ek().to_vec(), url: "https://prover.example/\u{1b}[2K".into(), token: [1; 32], own: true };
+        assert!(PairingLink::parse(&link.format()).is_err());
     }
 
     #[test]

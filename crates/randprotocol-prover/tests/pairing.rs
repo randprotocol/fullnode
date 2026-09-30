@@ -66,6 +66,43 @@ fn a_malformed_link_is_refused_with_a_reason() {
     assert!(e.contains("key"), "{e}");
 }
 
+/// VK-5 (audit v6): the link's URL is the prover's to choose and the wallet prints it — a URL
+/// carrying a terminal escape could erase and redraw the `(own: …)` line `rand prover pair`
+/// shows. A `randprover:` link whose (percent-decoded) URL holds anything but printable ASCII — a
+/// control character, a bidi or other format character, a space, any non-ASCII text — is no link.
+#[test]
+fn a_link_whose_url_carries_control_or_format_characters_is_refused() {
+    let k = ProverKey::from_seed([1; 64]);
+    let link = |url: &str| PairingLink { kem_ek: k.kem_ek().to_vec(), url: url.into(), token: [1; 32], own: false }.format();
+    for bad in [
+        "https://prover.example/\u{1b}[2K\rpaired 0000-0000-0000-0000 at https://good.example (own: no)",
+        "https://prover.example/\u{1b}]0;title\u{7}",
+        "https://prover.example/\n(own: yes)",
+        "https://prover.example/\t",
+        "https://prover.example/\u{7f}",
+        "https://prover.example/\u{9b}2K",
+        "https://prover.example/\u{202e}moc.live",
+        "https://prover.example/\u{200b}",
+        "https://prover.example/\u{feff}",
+        "https://prover.example/\u{2028}",
+        "https://prover.example/a b",
+        "https://pr\u{43e}ver.example/",
+    ] {
+        let text = link(bad);
+        assert!(!text.chars().any(|c| c.is_control()), "the link text itself is clean: the escape rides percent-encoded");
+        let e = PairingLink::parse(&text).expect_err(&format!("{bad:?} parsed"));
+        assert!(e.contains("printable ASCII"), "{bad:?}: {e}");
+        assert!(!e.contains("example") && !e.chars().any(|c| c.is_control() || c == '\u{202e}'), "the refusal does not echo the URL: {e:?}");
+    }
+    // The same rule for whoever mints the link (`rand-prover pair --url`).
+    assert!(check_link_url("https://prover.example:8600/path?x=1#f").is_ok());
+    assert!(check_link_url("http://[::1]:8600").is_ok());
+    assert!(check_link_url("https://prover.example/\u{1b}[2K").is_err());
+    assert!(check_link_url("").is_err());
+    // An honest link still parses.
+    assert_eq!(PairingLink::parse(&link("https://prover.example:8600/p?q=1")).unwrap().url, "https://prover.example:8600/p?q=1");
+}
+
 #[test]
 fn pairings_mint_lookup_and_revoke_without_storing_the_token() {
     let dir = tempfile::tempdir().unwrap();
