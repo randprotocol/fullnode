@@ -63,7 +63,21 @@ scripts/               local two-validator testnet
 Requirements: Rust 1.98.1 (pinned in `rust-toolchain.toml`; rustup installs it), a C++ compiler
 and `cmake` (RocksDB). First build: 10 to 20 minutes (RocksDB and Plonky3 from source).
 
+**The build needs the circuits repository checked out beside this one, as `circuits/`.**
+`randprotocol-zkvm` has path dependencies on `../circuits/guests-compiled/evm-core` and
+`sbpf-core`, and it and `randprotocol-rvm` an optional one on `../circuits/rand-zkvm-cuda`; cargo
+reads all three manifests for every command, so a clone of this repository alone fails at
+`cargo metadata` (audit v6, PROC-2 — open; CI's `clean-clone` job is the test for it). The commit
+to check out is the one this tree's vendored crates were synced from: the `circuits:` line of
+`crates/randprotocol-zkvm/guests-compiled/PROVENANCE.md`, the same value as `CIRCUITS_PIN` in
+`.github/workflows/ci.yml` (`aeacf31…` for v0.6.7). It is on a branch of zkp-circuits, not yet on
+a tag.
+
 ```bash
+git clone https://github.com/randprotocol/fullnode.git
+git clone https://github.com/randprotocol/zkp-circuits.git circuits   # the sibling directory must be named `circuits`
+git -C circuits checkout "$(sed -n 's/^circuits: //p' fullnode/crates/randprotocol-zkvm/guests-compiled/PROVENANCE.md)"
+cd fullnode
 cargo build --release        # target/release/rand-node, target/release/rand, target/release/rand-prover
 cargo test --release         # all crates; release because STARK proving is slow in debug
 ```

@@ -3,19 +3,45 @@
 # back within a day. CI from a clean checkout is the cheapest thing that would have caught any of
 # it.
 #
-# Two jobs, because the suites are two different animals:
+# The jobs, by when they run:
 #
-#   check-and-test  every push and pull request, minutes. `cargo check --workspace --tests`
-#                   (a `--lib`-only gate has silently broken `main.rs` and `tests/` here before)
-#                   and every library suite. The proving suites and the fixture-backed aggregation
-#                   tests are skipped by name — see below.
-#   nightly         the long ones: the wallet flow and the cluster suite really prove bundles
-#                   (~90 minutes together on this project's own machines), then the hidden
-#                   bundle's real-proof cheats again against guest v2 (~35 minutes).
+#   every push (branches and tags) and pull request
+#     check-and-test    minutes. `cargo check --workspace --tests` (a `--lib`-only gate has
+#                       silently broken `main.rs` and `tests/` here before) and every library
+#                       suite. The proving suites and the fixture-backed aggregation tests are
+#                       skipped by name: scripts/ci-fixture-skips.sh is the one list.
+#     lint              clippy, warnings denied, on the hand-maintained crates.
+#     supply-chain      `cargo audit` and `cargo deny check` (deny.toml).
+#     guest-provenance  the vendored guests are circuits' files at the pin and rebuild from source.
+#     clean-clone       fullnode checked out ALONE. Not yet required: it fails (PROC-2).
+#   every `v*` tag and every night
+#     zk-guards         the guards of the Fixed High zk findings, so that a regression in one is
+#                       caught at the tag and not only by hand.
+#   every night (18:00 UTC)
+#     nightly-proving   the wallet flow and the cluster suite, which really prove bundles.
+#     nightly-zkvm      the zkVM's whole suite, then guest v2's real-proof cheats.
+#     nightly-rvm       the rVM's whole suite less its two tier-19/20 round trips.
+#
+# Audit v6 (2026-09-30), what this file was and is now:
+#   PROC-7  the nightly ran the workspace without --no-fail-fast, skipped only `agg_executor::`
+#           and set no RECURSION_FIXTURES, so it died at `randprotocol-node --lib` on the
+#           fixture-backed aggregation tests on every run: 0 of 6 nightlies were green and the
+#           zkVM and rVM suites had never run in CI. Now: --no-fail-fast, the same skip list as
+#           the fast job, and the two proof suites in jobs of their own.
+#   PROC-6  no permissions block, actions pinned by tag, no dependency gate. Now: read-only
+#           token, every action pinned by commit, `supply-chain`.
+#   PROC-2  see `clean-clone`.
+# `.github/workflows/release.yml` builds a tag's binaries only when this workflow's run for the
+# tagged commit is green (PROC-4), so a job that is red here blocks a release.
 #
 # `randprotocol-zkvm` has *path* dependencies on `../../../circuits/guests-compiled/{evm-core,
-# sbpf-core}`, so the circuits repository must be checked out as a sibling directory named
-# `circuits/` or nothing in this workspace builds. It is public: randprotocol/zkp-circuits.
+# sbpf-core}`, and it and `randprotocol-rvm` an optional one on `../../../circuits/rand-zkvm-cuda`,
+# so the circuits repository must be checked out as a sibling directory named `circuits/` or
+# nothing in this workspace builds. It is public: randprotocol/zkp-circuits.
+#
+# Every `uses:` is a full commit sha with its tag in the trailing comment (looked up with
+# `git ls-remote` on 2026-09-30). To move one: look the new tag's sha up the same way (the peeled
+# `^{}` sha for an annotated tag) and change both halves of the line.
 name: ci
 
 on:
@@ -24,6 +50,10 @@ on:
   schedule:
     # 18:00 UTC daily, for the proving suites.
     - cron: "0 18 * * *"
+
+# The token every job gets: read the repository, nothing else. No job here writes.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,16 +67,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: fullnode
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: randprotocol/zkp-circuits
           ref: ${{ env.CIRCUITS_PIN }}
           path: circuits
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: fullnode
       - name: System dependencies
@@ -58,28 +88,12 @@ jobs:
         run: cargo check --workspace --tests
       - name: Library suites
         working-directory: fullnode
-        # The skips, and why each one is here (checked by running them, not by reading names):
-        #   agg_executor::, and the aggregation tests scattered through node::, rpc:: and
-        #     storage::seal_tests, need a RECURSION_FIXTURES cache. A fixture is minutes of real
-        #     proving, and `fixture_proof` panics loudly rather than skipping when the cache is
-        #     absent — deliberately, so a fleet build cannot quietly not test aggregation. On a
-        #     clean runner there is no cache, so they are named here and covered by the nightly job.
-        #   round_trips / two_test_profile are the rVM's own long proving tests.
-        run: |
-          cargo test --workspace --lib --bins --release -- \
-            --skip agg_executor:: \
-            --skip round_trips --skip two_test_profile \
-            --skip node::tests::a_batch_cut \
-            --skip node::tests::a_proposal_carrying_an_aggregate \
-            --skip node::tests::assembly_ \
-            --skip node::tests::the_covered_source_answers_replayed_history_past_the_window \
-            --skip node::tests::the_extension_stops_at_the_reader_limit_and_serves_what_it_can \
-            --skip node::tests::the_sealed_coverage_rule_accepts_marks_and_batch_and_falls_back_otherwise \
-            --skip node::tests::the_serve_form_carries_the_marker_and_the_table_once_pruned \
-            --skip node::tests::validate_for_pool_ \
-            --skip rpc::tests::get_emission_is_zero_inflation_and_the_subsidy_schedule \
-            --skip rpc::tests::the_aggregation_rpc_surface_reports \
-            --skip storage::seal_tests::
+        # The skips are scripts/ci-fixture-skips.sh's, the one list this job and the nightly share:
+        # the fixture-backed aggregation tests (no RECURSION_FIXTURES cache on a clean runner) and
+        # the rVM's two long round trips. This comment used to say the fixture-backed tests were
+        # "covered by the nightly job". They were not, and are not: no CI job has a fixture cache,
+        # so they run only on a machine that holds one. The script's header says so.
+        run: cargo test --workspace --lib --bins --release -- $(scripts/ci-fixture-skips.sh)
       - name: Integration suites that do not prove
         working-directory: fullnode
         # Named one by one rather than filtered by a `--skip` pattern: the cluster suite's proving
@@ -124,10 +138,10 @@ jobs:
       SOLC_URL: https://github.com/ethereum/solidity/releases/download/v0.8.37/solc-static-linux
       SOLC_SHA256: 5de843c2c93563cc66425c99a4fb13fdbf32b4c4ae07469480faaf126e14404a
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: fullnode
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: randprotocol/zkp-circuits
           ref: ${{ env.CIRCUITS_PIN }}
@@ -144,7 +158,7 @@ jobs:
         run: |
           rustup toolchain install 1.98.1 --profile minimal --target riscv32im-unknown-none-elf --component llvm-tools
           rm -f "${CARGO_HOME:-$HOME/.cargo}/config" "${CARGO_HOME:-$HOME/.cargo}/config.toml"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: circuits/rand-guest
       # Builds fib, keccak256, evm and sbpf from source with `rand-guest build` and compares:
@@ -165,46 +179,257 @@ jobs:
             | tail -1 > "$RUNNER_TEMP/erc20.runtime.hex"
           diff contracts/erc20.runtime.hex "$RUNNER_TEMP/erc20.runtime.hex"
 
+  # Clippy with warnings denied, on the crates maintained in this repository. `--no-deps` is what
+  # limits the lint to the named packages: without it `-D warnings` also lands on the vendored
+  # `randprotocol-zkvm` and `randprotocol-rvm` when they are compiled as dependencies. Those two
+  # are copies of circuits' `research` and `recursion` crates (deploy/sync-zkvm.sh) and are linted
+  # upstream, not here; a lint fixed in the copy would be lost at the next re-vendor.
+  lint:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: fullnode
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: randprotocol/zkp-circuits
+          ref: ${{ env.CIRCUITS_PIN }}
+          path: circuits
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fullnode
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      # rust-toolchain.toml pins the channel cargo uses in this directory; the component has to
+      # be added to that toolchain, not to the runner's default one.
+      - name: Clippy for the pinned toolchain
+        working-directory: fullnode
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component clippy
+      - name: Clippy, warnings denied, hand-maintained crates only
+        working-directory: fullnode
+        run: |
+          cargo clippy --no-deps \
+            -p randprotocol-core -p randprotocol-node -p randprotocol-client \
+            -p randprotocol-prover -p bridge-codec \
+            --all-targets -- -D warnings
+
+  # Audit v6, PROC-6: a dependency and supply-chain gate. `cargo audit` fails on a RUSTSEC
+  # vulnerability in Cargo.lock and prints unmaintained crates as warnings; `cargo deny check`
+  # (deny.toml) fails on a vulnerability, a yanked crate, a registry or git source that is not
+  # listed, and a licence that is not listed, and reports duplicate versions. The two tools are
+  # built from crates.io at pinned versions with --locked, not fetched as prebuilt binaries by a
+  # third-party action.
+  supply-chain:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_AUDIT_VERSION: 0.22.2
+      CARGO_DENY_VERSION: 0.20.2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: fullnode
+      # cargo-deny reads `cargo metadata`, which needs the sibling (see the header).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: randprotocol/zkp-circuits
+          ref: ${{ env.CIRCUITS_PIN }}
+          path: circuits
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Caches the two installed tools between runs; nothing in the workspace is built here.
+          workspaces: fullnode
+          cache-targets: false
+      # Installed from outside the checkout, so `fullnode/rust-toolchain.toml` does not pick the
+      # compiler that builds the tools.
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          cargo install --locked cargo-audit --version "$CARGO_AUDIT_VERSION"
+          cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
+      - name: cargo audit
+        working-directory: fullnode
+        run: cargo audit
+      - name: cargo deny check
+        working-directory: fullnode
+        run: cargo deny check
+
+  # Audit v6, PROC-2: a third party who clones fullnode alone cannot build it. This job is that
+  # clone — no sibling `circuits/` — and it FAILS today, at `cargo metadata`, on the first sibling
+  # path dependency cargo reads. It is `continue-on-error` so that it shows the state on every
+  # run without holding every other job's result hostage; drop that line the day it goes green,
+  # and it becomes the test that keeps PROC-2 closed.
+  #
+  # Why it cannot be fixed by a cargo feature (tried 2026-09-30, in a copy with no sibling): cargo
+  # loads the manifest of every path dependency while resolving, optional or not. With `evm-core`
+  # and `sbpf-core` removed from `randprotocol-zkvm` altogether, `cargo metadata` fails next on
+  # the optional `rand-zkvm-cuda`, and with that removed from `randprotocol-zkvm` too it fails on
+  # `randprotocol-rvm`'s, whose Cargo.toml is a copy of circuits' (deploy/sync-zkvm.sh). What
+  # closes it is one of: the three crates vendored here with a recorded pin, or all three as git
+  # dependencies at a revision that sits on a protected tag of zkp-circuits (it is on a branch
+  # today). README.md, "Build and test", has the clone step a builder needs meanwhile.
+  clean-clone:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: cargo metadata, locked, with no sibling checkout
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - name: cargo check, locked, default features
+        run: cargo check --workspace --locked
+
+  # Audit v6, PROC-7: the guards of the Fixed High zk rows, on every `v*` tag and every night.
+  # They pass in private runs and fail when their fix is reverted; before this job nothing ran
+  # them routinely, so a regression would have been caught only by hand.
+  #   zkVM  tests/privacy_floor.rs  the 2^7 floor on private tables (INT-1, COV-2, INT-6, HCS-3)
+  #         tests/logup_blind.rs    blinded LogUp terminals (INT-2, GV-1)
+  #   rVM   tests/cheating.rs       the recursion machine refuses every forged trace
+  #         tests/tables.rs         its tables' constraints
+  # None of the four reads RECURSION_FIXTURES (the rVM tests that do are aggregate, exit,
+  # fixtures, verifier, tape_n and self_verify, which stay in nightly-rvm). Measured on a laptop
+  # on 2026-09-30, release profile, after the build: the zkVM pair 259 s and 6.2 GB peak resident
+  # (logup_blind's two tests are 227 s of it), the rVM pair 3.3 s and 0.3 GB — inside a hosted
+  # runner's memory, though this job has not yet run on one.
+  zk-guards:
+    if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: fullnode
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: randprotocol/zkp-circuits
+          ref: ${{ env.CIRCUITS_PIN }}
+          path: circuits
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fullnode
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: zkVM guards (privacy floor, LogUp blinding)
+        working-directory: fullnode
+        run: cargo test -p randprotocol-zkvm --release --test privacy_floor --test logup_blind
+      - name: rVM guards (cheating, tables)
+        if: always()
+        working-directory: fullnode
+        run: cargo test -p randprotocol-rvm --release --test cheating --test tables
+
+  # The wallet flow and the cluster suite prove real bundles in the test FRI profile. They take
+  # the workspace proving slot, so they run one after another whatever the runner's core count.
+  # If a hosted runner cannot carry them (memory, or wall time), point this job at a self-hosted
+  # runner on a fleet machine rather than deleting it.
+  #
+  # `--no-fail-fast`: cargo runs every test binary and reports every failure, where it used to
+  # stop at the first red binary (PROC-7). The skips are the fast job's, from the one script; the
+  # zkVM and rVM crates are excluded here because they have jobs of their own below.
   nightly-proving:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: fullnode
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: randprotocol/zkp-circuits
           ref: ${{ env.CIRCUITS_PIN }}
           path: circuits
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: fullnode
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-      # The wallet flow and the cluster suite prove real bundles in the test FRI profile. They take
-      # the workspace proving slot, so they run one after another whatever the runner's core count.
-      # If a hosted runner cannot carry them (memory, or wall time), point this job at a
-      # self-hosted runner on a fleet machine rather than deleting it.
-      - name: The proving suites
+      - name: The node, wallet, prover and core suites
         working-directory: fullnode
         run: |
-          cargo test --workspace --release \
-            -- --skip agg_executor:: --skip round_trips --skip two_test_profile
-      # Issue #61: `tests/hidden_cheating.rs`'s nineteen real-proof cheats prove the guest
-      # `HIDDEN_BUNDLE_GUEST` names, v1 by default — so the step above covers v1 end to end and the
-      # branch-free v2 (`hc_bundle 651043e2…`) only in the emulator and one tier-14 proof. The
-      # chain-16 cut (`rand-node genesis --bundle-guest v2`) makes v2 the live guest, so its cheats
-      # have to be real proofs every night too, not a manual run someone remembers before a cut.
-      # Only `real_proof_` here: the fuzz and the emulator companions are guest-agnostic (they
-      # compare v1 and v2 on every run) and already ran above. ~35 min; Production FRI, one proof
-      # at a time through the workspace proving slot.
+          cargo test --workspace --exclude randprotocol-zkvm --exclude randprotocol-rvm \
+            --release --no-fail-fast -- $(scripts/ci-fixture-skips.sh)
+
+  # The zkVM's own suite: the AIR and cheating tests, the end-to-end proofs, the hidden bundle's
+  # real-proof cheats. One test at a time: a real-proof cheat needs about 5.7 GB.
+  nightly-zkvm:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: fullnode
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: randprotocol/zkp-circuits
+          ref: ${{ env.CIRCUITS_PIN }}
+          path: circuits
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fullnode
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: The zkVM suite
+        working-directory: fullnode
+        run: cargo test -p randprotocol-zkvm --release --no-fail-fast -- --test-threads=1
+      # Issue #61: `tests/hidden_cheating.rs`'s real-proof cheats prove the guest
+      # `HIDDEN_BUNDLE_GUEST` names, v1 by default — so the step above covers v1 end to end and
+      # the branch-free v2 (`hc_bundle 651043e2…`, chain 16's guest) only in the emulator and one
+      # tier-14 proof. Its cheats have to be real proofs every night too, not a manual run someone
+      # remembers before a cut. Only `real_proof_` here: the fuzz and the emulator companions are
+      # guest-agnostic (they compare v1 and v2 on every run) and already ran above. ~35 min;
+      # Production FRI, one proof at a time.
       - name: Guest v2's real-proof cheating suite
+        if: always()
         working-directory: fullnode
         env:
           HIDDEN_BUNDLE_GUEST: v2
         run: |
           cargo test -p randprotocol-zkvm --release --test hidden_cheating real_proof_ \
             -- --test-threads=1
+
+  # The rVM's own suite, less its two long round trips (tier 19 and tier 20: tens of GB, the
+  # exit's own runs, not a gate's). No RECURSION_FIXTURES is set, so the fixture-using tests
+  # (aggregate, exit, verifier, tape_n, self_verify) prove their fixtures into
+  # `target/recursion-fixtures` on the runner first; whether a hosted runner's memory and the
+  # time limit carry that is untested (audit v6 says as much). If they do not, this is the job to
+  # move to a self-hosted runner with a provisioned cache — the same cache the node's
+  # fixture-backed aggregation tests need (scripts/ci-fixture-skips.sh).
+  nightly-rvm:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: fullnode
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: randprotocol/zkp-circuits
+          ref: ${{ env.CIRCUITS_PIN }}
+          path: circuits
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fullnode
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: The rVM suite
+        working-directory: fullnode
+        run: |
+          cargo test -p randprotocol-rvm --release --no-fail-fast \
+            -- --skip round_trips --skip two_test_profile

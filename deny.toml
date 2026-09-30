@@ -1,0 +1,73 @@
+# cargo-deny configuration (audit v6, PROC-6). CI's `supply-chain` job runs
+# `cargo deny check` and `cargo audit` on every push and pull request
+# (.github/workflows/ci.yml). Before this file the repository had no dependency gate:
+# RUSTSEC-2026-0285 in rustls was found by a manual audit and fixed by hand.
+#
+# The workspace has path dependencies on the sibling `circuits` checkout, so `cargo deny` needs
+# `circuits/` beside `fullnode/`, like every other cargo command here.
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+# A vulnerability advisory always fails the check in this schema. A yanked crate fails too.
+yanked = "deny"
+# Unmaintained crates do not fail the job: `cargo audit`, run in the same job, prints each one as
+# a warning on every run. As of 2026-09-30 there are four, all transitive or long-standing:
+# atomic-polyfill (RUSTSEC-2023-0089), bincode 1.x (RUSTSEC-2025-0141), derivative
+# (RUSTSEC-2024-0388), paste (RUSTSEC-2024-0436). cargo-deny has no "warn" level for this class
+# (only a scope), hence "none" here and the warning from cargo audit.
+unmaintained = "none"
+ignore = []
+
+[bans]
+# Two versions of one crate are reported, not refused: the tree has many (the RustCrypto 0.10 and
+# 0.11 generations side by side, for one).
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# Everything comes from crates.io or from a path; a new registry or a git dependency is a
+# decision, so it fails until it is listed here.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[licenses]
+version = 2
+# The licenses actually present in the tree on 2026-09-30 (`cargo deny list`), no others. The
+# workspace's own crates are GPL-3.0-only, so every entry here is one GPL-3.0 can take in.
+allow = [
+    "GPL-3.0-only",
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+# evm-core and sbpf-core are path dependencies in the sibling circuits checkout
+# (randprotocol/zkp-circuits, GPL-3.0-only at the repository root) and their manifests carry no
+# `license` field, so cargo-deny cannot read one. Stated here rather than ignored.
+[[licenses.clarify]]
+crate = "evm-core"
+expression = "GPL-3.0-only"
+license-files = []
+
+[[licenses.clarify]]
+crate = "sbpf-core"
+expression = "GPL-3.0-only"
+license-files = []
