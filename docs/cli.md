@@ -85,6 +85,8 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | `--gas-price <UNITS>` | none — no `gas` section | units of RAND per gas the chain itself charges a call (constraint set 8, `docs/fees.md` §1.1). Writing this flag is what turns the section on at all; the other three below are refused without it (`rand-node genesis` errors, naming the flag). Part of the genesis hash |
 | `--byte-price <UNITS>` | `800` (`BYTE_PRICE_DEFAULT`), only with `--gas-price` | units of RAND per KiB of call proof plus input envelope, from byte 0 |
 | `--bundle-gas-limit <N>` | `gas_max(14, 0, 0)` = `20479`, only with `--gas-price` | the exact `GAS_LIMIT` every bundle proof (transfer, bond, burn, …) must declare on this chain; a bundle proof declaring any other value is refused (`TxError::BundleGasLimit`, permanent), and the genesis itself refuses any value but `20479` (`GasConfig::check`, `gas::bundle_gas_limit_pin`) |
+| `--staking <STAKING.JSON>` | none | the `staking` section as a `StakingConfig` JSON file (`docs/staking.md` §2 lists every field: `faucet_budget_per_epoch`, `bond_activation_epochs`, `max_weight_bps`, `max_stake_entry_per_epoch`, `registration_v2`, `faucet_recipients`, `faucet_minters`, and audit v6's `admission_by_vote`); validated by the build. Omitted entirely when absent — chains 15–18 had theirs spliced in by the cut script |
+| `--consensus-domain <0\|1>` | none (0) | the consensus signing domain (audit v4): `1` binds every vote, new-view and proposal to this genesis. Chains 15–18 had it spliced in by the cut script |
 | `--gas-dynamic <target_bytes>,<target_gas>,<adjust_bps>` | none — fixed prices | Phase 2 (`docs/fees.md` §1.2): turns on the per-block price controller, floored at the section's own starting `gas_price`/`byte_price`. Refused beside `--aggregation` (`GenesisError::DynamicGasWithAggregation`) |
 | `--max-gas-price <UNITS>`, `--max-byte-price <UNITS>` | none — no ceiling (chain 18) | audit v6, POOL-2: the ceilings the controller never lifts a price over, each at least the starting price. Refused without `--gas-dynamic` |
 | `--gas-byte-load paying` | none — every transaction's bytes (chain 18) | audit v6, POOL-2: only a call's proof and input envelope move `byte_price`, so a block of transfers moves none. Refused without `--gas-dynamic`; `paying` is the only value |
@@ -192,6 +194,22 @@ payout wallet finds by scanning.
 
 `docs/staking.md` is the whole picture these three sit in: the register, the epochs, what each action
 publishes, and a worked join-and-leave.
+
+### `rand-node admit sign` / `submit`
+
+Admission by vote (audit v6, STAKE-2; `docs/staking.md` §2): on a chain whose genesis sets
+`staking.admission_by_vote`, a new validator key registers only once validators holding strictly
+more than two thirds of the voting weight have signed it in.
+
+| command | arguments | meaning |
+|---|---|---|
+| `admit sign` | `--candidate <key hex, registration hex, or a file holding either>`, `--key <validator key>`, `--genesis-hash <hex>` | print this validator's vote as one line, `<voter key hex>:<signature hex>` — over the genesis hash and the candidate's address, so it is good on exactly one chain. Offline: reads no node |
+| `admit submit` | `--candidate …`, `--signature <line>` (repeatable), `--rpc`, `--no-wait` | check every vote against the node's genesis hash (a vote for another genesis or candidate, or a voter twice, is named here), order them and submit the fee-less `AdmitValidator`; the chain then needs the voters' weight to be a quorum |
+
+The candidate is the key the registration will carry: `rand-node address --key` prints it, and the
+registration `rand-node register` printed holds it, so either can be handed to `--candidate`. After
+the admission commits, the bond is as before (`rand bond … --registration`), and it consumes the
+admission. `rand_getAdmitted` lists what is admitted and waiting.
 
 ### `rand-node vesting status` / `claim` / `revoke` / `bond` / `unbond`
 

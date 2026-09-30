@@ -1126,3 +1126,20 @@ from the same commit.
 | a validator warns it is not in the validator set | the key is not in genesis; it runs as an observer |
 | views advance but nothing commits after nodes restarted | validators are waiting for uncommitted blocks behind the newest certificate that no reachable peer holds; since `f5b8dfd` they fall back to the committed head after failed fetches (log: `falling back to the committed head QC`). Make sure every node runs the same build: the sync protocol is chain-scoped and builds cannot fetch across versions |
 | a peer keeps connecting but never helps | it may run another chain or an older build; gossip topics and the sync protocol are per chain id, so it is harmless but useless |
+
+## The next cut: audit v6's staking fields (STAKE-2)
+
+Audit v6 (2026-09-30) §8.5. Each is optional, absent from every genesis through chain 18, and
+committed to the genesis hash under its own tag — after every tag that existed before it — only
+when set; a file without them hashes and runs byte-for-byte as before.
+
+- **`staking.admission_by_vote: true`** (`docs/staking.md` §2, "Admission by vote"). A `Bond`
+  that registers a new validator key is refused `NotAdmitted` until validators holding strictly
+  more than two thirds of the voting set's weight have signed it in (`AdmitValidator`, the
+  `rand-node admit sign` / `admit submit` commands); a top-up needs no vote. The admitted set is
+  consensus state (`rand-state-admitted-1` around the root, `META_ADMITTED`, `rand_getAdmitted`).
+  Recommended for any chain that will hold value: until slashing exists it turns the price of two
+  thirds of the stake into a vote. The cut passes it inside the `staking` section it splices in
+  (or writes with `rand-node genesis --staking STAKING.JSON`), and every validator that will vote
+  needs its key file at hand — `admit sign` is offline. Every wallet that bonds should read
+  `rand_getLimits.admission_by_vote` and say so before it proves a registering bond.

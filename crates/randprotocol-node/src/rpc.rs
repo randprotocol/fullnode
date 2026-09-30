@@ -557,7 +557,7 @@ pub const PUBLIC_METHODS: &[&str] = &[
     "rand_getReceipt", "rand_getReceipts", "rand_getCallEnvelope",
     "rand_getProgram", "rand_getProgramCode", "rand_getProgramPublic",
     "rand_getBlockByHeight", "rand_getBlockByHash", "rand_getBlocks",
-    "rand_getValidators", "rand_getEpoch", "rand_getSupply", "rand_getEmission",
+    "rand_getValidators", "rand_getAdmitted", "rand_getEpoch", "rand_getSupply", "rand_getEmission",
     "rand_getTokens", "rand_getToken", "rand_getTokenSupply",
     "rand_getBridgeState", "rand_getAssets", "rand_getBridgeBurn", "rand_bridgeAssetId",
     "rand_getAggregate", "rand_getAggregators", "rand_getUnsealed",
@@ -709,6 +709,11 @@ pub struct ChainLimits {
     /// call's proof and input envelope do, `null` when every transaction's bytes do (chain 18)
     /// or the chain has no `dynamic`.
     pub byte_load: Option<&'static str>,
+    /// Audit v6, STAKE-2: whether the genesis sets `staking.admission_by_vote`. What a wallet
+    /// reads before it bonds a new validator key: on such a chain the registration is refused
+    /// (`NotAdmitted`) until the validator set has voted the key in — `rand_getAdmitted` lists
+    /// the keys that may register. `false` on every chain without the flag.
+    pub admission_by_vote: bool,
 }
 
 impl ChainLimits {
@@ -730,6 +735,7 @@ impl ChainLimits {
             max_gas_price: None,
             max_byte_price: None,
             byte_load: None,
+            admission_by_vote: ledger.staking().is_some_and(|s| s.admission_by_vote()),
         };
         if let Some(g) = ledger.gas() {
             let prices = ledger.gas_prices();
@@ -2081,6 +2087,15 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
         Action::UnbondVested { entry, amount, nonce, .. } => json!({
             "kind": "unbond_vested", "entry": hex::encode(entry), "amount": amount.to_string(), "nonce": nonce
         }),
+        // Audit v6, STAKE-2: the validator set's vote to admit a key to the register. The
+        // candidate as the address a registration will carry and as the key itself (hex), and
+        // the voters by address, in the order the action lists them.
+        Action::AdmitValidator { candidate, signatures } => json!({
+            "kind": "admit_validator",
+            "candidate": candidate.address().to_base58(),
+            "candidate_key": candidate.to_hex(),
+            "voters": signatures.iter().map(|(key, _)| key.address().to_base58()).collect::<Vec<_>>(),
+        }),
     };
     json!({
         "hash": t.hash().to_hex(),
@@ -2944,6 +2959,19 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 })
                 .collect();
             Ok(json!(out))
+        }
+        // Audit v6, STAKE-2: the admitted set — the keys the validator set has voted in
+        // (`AdmitValidator`) that have not registered yet, by address, in address order — with
+        // whether this chain asks for the vote at all and how many the set holds at most. On a
+        // chain without `staking.admission_by_vote` the list is always empty and a registration
+        // needs no vote.
+        "rand_getAdmitted" => {
+            let admitted = st.storage.admitted().map_err(RpcError::internal)?;
+            Ok(json!({
+                "admission_by_vote": st.limits.admission_by_vote,
+                "max": randprotocol_core::ledger::staking::MAX_ADMITTED,
+                "admitted": admitted.iter().map(|a| a.to_base58()).collect::<Vec<_>>(),
+            }))
         }
         "rand_getEpoch" => {
             let info = epoch_info(st).await?;
@@ -4168,6 +4196,7 @@ mod tests {
                 "max_gas_price": null,
                 "max_byte_price": null,
                 "byte_load": null,
+                "admission_by_vote": false,
             })
         );
         let gs = raised_genesis();
@@ -4191,6 +4220,7 @@ mod tests {
                 "max_gas_price": null,
                 "max_byte_price": null,
                 "byte_load": null,
+                "admission_by_vote": false,
             })
         );
         // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
@@ -4216,6 +4246,7 @@ mod tests {
                 "max_gas_price": null,
                 "max_byte_price": null,
                 "byte_load": null,
+                "admission_by_vote": false,
             })
         );
         // The v0.6 switch: what a wallet reads to prove its calls over the call binding (INT-4).
@@ -4809,6 +4840,42 @@ mod tests {
         assert_eq!(new["payout"], Value::String(payout.to_string()));
         assert_eq!(new["nonce"], 3);
         assert_eq!(new["active"], false, "in the register, not in the current set");
+    }
+
+    /// Audit v6, STAKE-2: `rand_getAdmitted` serves the admitted set from storage with the flag
+    /// and the bound, `rand_getLimits` tells a wallet whether a registration needs the vote, and
+    /// `tx_json` names the action with its candidate and voters.
+    #[tokio::test]
+    async fn get_admitted_serves_the_admitted_set_and_tx_json_names_the_vote() {
+        use crate::storage::fixtures::{admission_genesis, admit_tx, make_block};
+        // A chain without the flag: nothing to serve, and no vote asked.
+        let (_d, st, _) = chain();
+        assert_eq!(ok(&st, "rand_getAdmitted", json!([])).await, json!({ "admission_by_vote": false, "max": 256, "admitted": [] }));
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["admission_by_vote"], json!(false));
+
+        let gs = admission_genesis(&[&key(1)]);
+        let (_d, st) = state_for(&gs);
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["admission_by_vote"], json!(true));
+        assert_eq!(ok(&st, "rand_getAdmitted", json!([])).await, json!({ "admission_by_vote": true, "max": 256, "admitted": [] }));
+        let newcomer = key(9);
+        let mut ledger = gs.ledger.clone();
+        let vote = admit_tx(&ledger, &newcomer, &[&key(1)]);
+        let b1 = make_block(&gs.block, &mut ledger, vec![vote.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(
+            ok(&st, "rand_getAdmitted", json!([])).await,
+            json!({ "admission_by_vote": true, "max": 256, "admitted": [newcomer.address().to_base58()] })
+        );
+        assert!(PUBLIC_METHODS.contains(&"rand_getAdmitted"), "a read a wallet needs is on the public listener");
+        assert_eq!(
+            tx_json(&vote, None, &StubExecutor)["action"],
+            json!({
+                "kind": "admit_validator",
+                "candidate": newcomer.address().to_base58(),
+                "candidate_key": newcomer.public_key().to_hex(),
+                "voters": [key(1).address().to_base58()],
+            })
+        );
     }
 
     #[tokio::test]

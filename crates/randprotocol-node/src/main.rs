@@ -6,9 +6,9 @@ use randprotocol_client::RpcClient;
 use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisOpening, GenesisValidator, TokensConfig};
 use randprotocol_core::notes::{word8_to_hex, Envelope, EnvelopeFormat, ShieldedAddress};
 use randprotocol_core::types::actions::{
-    aggregate_signing_hash, aggregator_register_message, aggregator_unbond_message, aggregator_withdraw_message,
-    registration_message, registration_message_v2, unbond_message, withdraw_message, AggregatorRegistration,
-    Registration,
+    admit_validator_message, aggregate_signing_hash, aggregator_register_message, aggregator_unbond_message,
+    aggregator_withdraw_message, registration_message, registration_message_v2, unbond_message, withdraw_message,
+    AggregatorRegistration, Registration,
 };
 use randprotocol_zkvm::machine::FriProfile;
 use randprotocol_core::{format_amount, parse_amount};
@@ -283,6 +283,63 @@ async fn submit_staking(args: &StakingArgs, chain_id: u64, action: randprotocol_
     Ok(())
 }
 
+/// The candidate an `admit` command names (audit v6, STAKE-2), in any of the forms an operator
+/// has to hand: the validator public key in hex (`rand-node address` prints it), the
+/// registration blob `rand-node register` prints (the candidate's key is inside it), or a file
+/// holding either — the last whitespace-separated word of the file, so the two lines `register`
+/// prints can be saved as they are.
+fn parse_candidate(spec: &str) -> Result<PublicKey> {
+    let text = std::fs::read_to_string(spec).unwrap_or_else(|_| spec.to_string());
+    let word = text.split_whitespace().last().context("--candidate is empty")?;
+    let word = word.strip_prefix("0x").unwrap_or(word);
+    if let Ok(key) = PublicKey::from_hex(word) {
+        return Ok(key);
+    }
+    let bytes = hex::decode(word)
+        .map_err(|_| anyhow::anyhow!("--candidate is neither a validator public key in hex, a registration blob, nor a file holding one"))?;
+    let registration = Registration::decode(&bytes)
+        .map_err(|_| anyhow::anyhow!("--candidate is hex, but neither a {}-byte validator public key nor a registration blob", randprotocol_core::crypto::PUBLIC_KEY_LEN))?;
+    anyhow::ensure!(
+        registration.public_key.as_bytes().len() == randprotocol_core::crypto::PUBLIC_KEY_LEN,
+        "the registration's key is not a validator public key"
+    );
+    Ok(registration.public_key)
+}
+
+/// One validator's vote to admit `candidate` on the chain of `genesis`, as the line `admit sign`
+/// prints and `admit submit --signature` reads: `<voter public key hex>:<signature hex>`.
+fn admit_vote_line(voter: &Keypair, genesis: &randprotocol_core::Hash, candidate: &PublicKey) -> String {
+    let signature = voter.sign(admit_validator_message(genesis, &candidate.address()).as_bytes());
+    format!("{}:{}", voter.public_key().to_hex(), hex::encode(signature.as_bytes()))
+}
+
+/// The `AdmitValidator` action over `lines` (each an [`admit_vote_line`]): every vote checked
+/// against this chain's admission message before anything is sent — a vote signed for another
+/// genesis or another candidate is named here rather than refused by the node — a voter listed
+/// once, and the votes in the ascending voter order the ledger requires.
+fn admit_action(genesis: &randprotocol_core::Hash, candidate: &PublicKey, lines: &[String]) -> Result<randprotocol_core::Action> {
+    let message = admit_validator_message(genesis, &candidate.address());
+    let mut signatures = Vec::with_capacity(lines.len());
+    for line in lines {
+        let (key, sig) = line.trim().split_once(':').context("a --signature is `<voter public key hex>:<signature hex>`, as `admit sign` prints it")?;
+        let key = PublicKey::from_hex(key).map_err(|e| anyhow::anyhow!("a --signature's voter key: {e}"))?;
+        let sig = randprotocol_core::Signature::from_bytes(&hex::decode(sig).context("a --signature's signature is not hex")?)
+            .map_err(|e| anyhow::anyhow!("the vote by {}: {e}", key.address()))?;
+        anyhow::ensure!(
+            key.verify(message.as_bytes(), &sig),
+            "the vote by {} is not a signature over this chain's admission of {} (another genesis hash, or another candidate?)",
+            key.address(),
+            candidate.address()
+        );
+        signatures.push((key, sig));
+    }
+    signatures.sort_by_key(|(key, _)| key.address());
+    if let Some(w) = signatures.windows(2).find(|w| w[0].0.address() == w[1].0.address()) {
+        anyhow::bail!("validator {} votes twice; list each vote once", w[0].0.address());
+    }
+    Ok(randprotocol_core::Action::AdmitValidator { candidate: candidate.clone(), signatures })
+}
+
 #[derive(Parser)]
 #[command(name = "rand-node", version, about = "RAND full node: HotStuff BFT consensus, p2p discovery, shielded note ledger")]
 struct Cli {
@@ -476,6 +533,17 @@ enum Cmd {
         /// without `--gas-dynamic`; omitted, every transaction's bytes count (chain 18's rule).
         #[arg(long, value_name = "paying")]
         gas_byte_load: Option<String>,
+        /// The `staking` section, as a `StakingConfig` JSON file (`{"faucet_budget_per_epoch": …,
+        /// "bond_activation_epochs": …, …}`; `docs/staking.md` lists every field, audit v6's
+        /// `admission_by_vote` among them). `Genesis::build` validates it. Omitted entirely when
+        /// absent, so a chain without the flag hashes byte-for-byte as before — a cut script may
+        /// still splice the section in by hand, as chains 15–18 were cut.
+        #[arg(long, value_name = "STAKING.JSON")]
+        staking: Option<PathBuf>,
+        /// The consensus signing domain (audit v4): `1` binds every vote, new-view and proposal
+        /// to this genesis. Omitted, the file has no such field (domain 0, chain 14's messages).
+        #[arg(long, value_name = "0|1")]
+        consensus_domain: Option<u32>,
     },
     /// Print one genesis alloc note as JSON — the object that goes into a genesis file's `alloc`
     /// list — sealed to `--to` exactly as `genesis --alloc` seals one, so the owner's wallet finds
@@ -694,6 +762,15 @@ enum Cmd {
         #[command(flatten)]
         staking: StakingArgs,
     },
+    /// Admission by vote (audit v6, STAKE-2; `docs/staking.md`): on a chain whose genesis sets
+    /// `staking.admission_by_vote`, a new validator key registers only once validators holding
+    /// more than two thirds of the voting weight have signed it in. `sign` is each validator's
+    /// half (offline: a key file and the genesis hash); `submit` assembles the votes and sends the
+    /// fee-less `AdmitValidator`.
+    Admit {
+        #[command(subcommand)]
+        cmd: AdmitCmd,
+    },
     /// Genesis vesting (`docs/vesting.md`): a timelocked allocation's holder and revoker side —
     /// status, claim, revoke, and bonding locked RAND. The key is made with `keygen` and its
     /// public key read with `address`; `--key` below is the entry's beneficiary (or revoker) key.
@@ -812,6 +889,42 @@ enum AggregatorCmd {
 /// block that applies it. So neither command takes a wallet, and both return in a block's time
 /// rather than a proof's.
 /// `rand-node vesting …` (genesis vesting).
+#[derive(Subcommand)]
+enum AdmitCmd {
+    /// Sign this validator's vote to admit `--candidate` and print it as one line,
+    /// `<voter public key hex>:<signature hex>`, for whoever runs `admit submit`. Reads no node:
+    /// the vote is over the genesis hash and the candidate's address, nothing else.
+    Sign {
+        /// The candidate: its validator public key in hex, the registration blob `rand-node
+        /// register` printed for it, or a file holding either.
+        #[arg(long)]
+        candidate: String,
+        /// This validator's key file — a key in the chain's voting set.
+        #[arg(long)]
+        key: PathBuf,
+        /// The chain's genesis hash, 64 hex characters (`rand-node init` prints it; a node
+        /// serves it as `rand_getGenesisHash`). A vote is good on exactly this chain.
+        #[arg(long)]
+        genesis_hash: String,
+    },
+    /// Assemble validators' votes into one `AdmitValidator` and submit it. Each vote is checked
+    /// here against the node's genesis hash first; the chain then needs the voters to hold more
+    /// than two thirds of the voting set's weight. Bundle-less and fee-less: no wallet needed.
+    Submit {
+        /// The candidate, as for `admit sign`.
+        #[arg(long)]
+        candidate: String,
+        /// One vote, as `admit sign` printed it; repeat for each voter.
+        #[arg(long = "signature", required = true, value_name = "KEY:SIGNATURE")]
+        signatures: Vec<String>,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Return once the node accepts the transaction instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum VestingCmd {
     /// Show an entry: its terms, what has vested, what is claimable now.
@@ -1202,6 +1315,8 @@ async fn main() -> Result<()> {
             max_gas_price,
             max_byte_price,
             gas_byte_load,
+            staking,
+            consensus_domain,
         } => {
             let hc_bundle = match bundle_guest.as_str() {
                 "v3" => ZkExecutor::hc_hidden_bundle_v3(),
@@ -1261,10 +1376,10 @@ async fn main() -> Result<()> {
                     ),
                     None => None,
                 },
-                // The consensus signing domain (audit v4) is set in the file by the cut script,
-                // like the bridge section: `"consensus_domain": 1` from the next cut on. This
-                // command writes today's shape, which is chain 14's.
-                consensus_domain: None,
+                // The consensus signing domain (audit v4): `--consensus-domain 1` from the next
+                // cut on (chains 15–18 had it spliced in by the cut script, like the bridge
+                // section). Omitted, this command writes chain 14's shape.
+                consensus_domain,
                 // An aggregating chain is cut with the section spelled out on the command
                 // line (chain 9, spec §2.3): the bond, the subsidy schedule and the registered
                 // shapes with their measured program digests.
@@ -1307,9 +1422,20 @@ async fn main() -> Result<()> {
                 // every alloc note comes out the declared length; omitted, `None`, byte-for-byte
                 // today's shape.
                 envelope_bytes,
-                // The audit-v4 `staking` section (STAKE-2) is spliced in by hand like the
-                // `bridge` section: a chain without it hashes byte-for-byte as before.
-                staking: None,
+                // The `staking` section (audit v4 STAKE-2; audit v6's `admission_by_vote`): read
+                // from a `StakingConfig` JSON file when `--staking` is given, so `Genesis::build`
+                // validates it; omitted entirely otherwise (chains 15–18 had theirs spliced in
+                // by hand, like the `bridge` section), so a chain without the flag hashes
+                // byte-for-byte as before.
+                staking: match &staking {
+                    Some(path) => Some(
+                        serde_json::from_str::<randprotocol_core::genesis::StakingConfig>(
+                            &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
+                        )
+                        .with_context(|| format!("{} is not a valid staking config", path.display()))?,
+                    ),
+                    None => None,
+                },
                 // Genesis vesting: read from a `VestingConfig` JSON file when `--vesting` is given
                 // (`Genesis::build` validates it); omitted entirely otherwise.
                 vesting: match &vesting {
@@ -1682,6 +1808,32 @@ async fn main() -> Result<()> {
             );
             submit_staking(&staking, chain_id, action, &format!("withdraw of {} RAND", format_amount(amount))).await?;
         }
+        Cmd::Admit { cmd } => match cmd {
+            AdmitCmd::Sign { candidate, key, genesis_hash } => {
+                let candidate = parse_candidate(&candidate)?;
+                let kp = load_keypair(&key)?;
+                let genesis = randprotocol_core::Hash::from_hex(&genesis_hash)
+                    .map_err(|e| anyhow::anyhow!("--genesis-hash: {e}"))?;
+                eprintln!("validator {} votes to admit {} on the chain of genesis {genesis}", kp.address(), candidate.address());
+                println!("{}", admit_vote_line(&kp, &genesis, &candidate));
+            }
+            AdmitCmd::Submit { candidate, signatures, rpc, no_wait } => {
+                let candidate = parse_candidate(&candidate)?;
+                let client = RpcClient::new(rpc);
+                let chain_id = client.chain_id().await?;
+                let genesis = client.genesis_hash().await?;
+                let action = admit_action(&genesis, &candidate, &signatures)?;
+                let tx = randprotocol_core::Transaction { chain_id, bundle: None, action };
+                let hash = client.send_transaction(&tx).await?;
+                let what = format!("admission of {} by {} vote(s)", candidate.address(), signatures.len());
+                if no_wait {
+                    println!("submitted {what} {hash}");
+                } else {
+                    let receipt = client.wait_for_transaction(&hash, wallet::COMMIT_TIMEOUT).await?;
+                    println!("submitted {what} {hash}\n  committed in block {}", receipt.height);
+                }
+            }
+        },
         Cmd::Vesting { cmd } => match cmd {
             VestingCmd::Status { entry, rpc } => {
                 let v = vesting_entry(&RpcClient::new(rpc), &parse_entry_id(&entry)?, None).await?;
@@ -2346,6 +2498,73 @@ mod tests {
     /// public words, `public_digest`/`public_len`, `h_pub`), non-canonical proof encodings are now
     /// refused, and the sync wire carries byte strings, so it must not be same-chain-updated onto
     /// chain 12 (CHANGELOG, v0.4 Known limits).
+    /// Audit v6, STAKE-2: the `admit` commands. `sign` prints one vote line; `submit` checks
+    /// every line against the chain's own admission message before it sends anything — a vote for
+    /// another genesis or another candidate is named, a voter listed twice is refused — and puts
+    /// the votes in the ascending voter order the ledger requires. The candidate is taken as a
+    /// key, as the registration `rand-node register` printed, or as a file holding either.
+    #[test]
+    fn the_admit_commands_sign_check_and_order_the_votes() {
+        let cli = Cli::try_parse_from([
+            "rand-node", "admit", "sign", "--candidate", "ab", "--key", "k.json", "--genesis-hash", "00",
+        ])
+        .unwrap();
+        assert!(matches!(cli.cmd, Cmd::Admit { cmd: AdmitCmd::Sign { .. } }));
+        let cli = Cli::try_parse_from([
+            "rand-node", "admit", "submit", "--candidate", "ab", "--signature", "a:b", "--signature", "c:d",
+        ])
+        .unwrap();
+        let Cmd::Admit { cmd: AdmitCmd::Submit { signatures, rpc, no_wait, .. } } = cli.cmd else { panic!("admit submit") };
+        assert_eq!((signatures.len(), rpc.as_str(), no_wait), (2, "http://127.0.0.1:8545", false));
+        assert!(Cli::try_parse_from(["rand-node", "admit", "submit", "--candidate", "ab"]).is_err(), "at least one vote");
+
+        let key = |n: u8| Keypair::from_seed([n; 32]).unwrap();
+        let (candidate, genesis) = (key(9), randprotocol_core::Hash::digest(b"this chain"));
+        // The candidate, three ways.
+        let as_key = parse_candidate(&candidate.public_key().to_hex()).unwrap();
+        assert_eq!(&as_key, candidate.public_key());
+        let payout = ShieldedAddress { pk: [1; 8], kem_ek: vec![2; randprotocol_core::notes::KEM_EK_BYTES] };
+        let registration = Registration {
+            public_key: candidate.public_key().clone(),
+            payout: payout.clone(),
+            signature: candidate.sign(registration_message(7, &payout).as_bytes()),
+        };
+        let blob = hex::encode(registration.encode());
+        assert_eq!(&parse_candidate(&blob).unwrap(), candidate.public_key());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("registration.txt");
+        std::fs::write(&file, format!("validator {} on chain 7\nregistration: {blob}\n", candidate.address())).unwrap();
+        assert_eq!(&parse_candidate(file.to_str().unwrap()).unwrap(), candidate.public_key());
+        assert!(parse_candidate("not-hex").is_err());
+        assert!(parse_candidate("abcd").is_err(), "hex, but neither a key nor a registration");
+
+        // The votes: checked, sorted, each voter once.
+        let lines: Vec<String> = [3u8, 1, 2].iter().map(|n| admit_vote_line(&key(*n), &genesis, candidate.public_key())).collect();
+        let randprotocol_core::Action::AdmitValidator { candidate: named, signatures } =
+            admit_action(&genesis, candidate.public_key(), &lines).unwrap()
+        else {
+            panic!("an admission")
+        };
+        assert_eq!(&named, candidate.public_key());
+        let voters: Vec<_> = signatures.iter().map(|(k, _)| k.address()).collect();
+        let mut sorted = voters.clone();
+        sorted.sort();
+        assert_eq!(voters, sorted, "ascending voter order");
+        assert_eq!(voters.len(), 3);
+        let message = admit_validator_message(&genesis, &candidate.address());
+        assert!(signatures.iter().all(|(k, s)| k.verify(message.as_bytes(), s)));
+        // A vote signed for another genesis, or for another candidate, is named before anything is sent.
+        let foreign = admit_vote_line(&key(1), &randprotocol_core::Hash::digest(b"another chain"), candidate.public_key());
+        let e = admit_action(&genesis, candidate.public_key(), &[lines[0].clone(), foreign]).unwrap_err().to_string();
+        assert!(e.contains(&key(1).address().to_string()) && e.contains("another genesis"), "{e}");
+        let other = admit_vote_line(&key(1), &genesis, key(10).public_key());
+        assert!(admit_action(&genesis, candidate.public_key(), &[other]).is_err());
+        // A voter twice.
+        let e = admit_action(&genesis, candidate.public_key(), &[lines[0].clone(), lines[0].clone()]).unwrap_err().to_string();
+        assert!(e.contains("votes twice"), "{e}");
+        assert!(admit_action(&genesis, candidate.public_key(), &["nocolon".to_string()]).is_err());
+    }
+
     #[test]
     fn chain_12s_genesis_file_still_builds_chain_12() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain12.json");

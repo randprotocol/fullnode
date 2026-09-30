@@ -2531,6 +2531,8 @@ async fn a_chain_15_shaped_genesis_commits_mints_only_to_the_allowlist_and_syncs
         faucet_recipients: Some(vec![FaucetRecipient(wallet(1).address.pk)]),
         // Chain 15 predates RESCAN-LEDGER-1's list; every node's admission policy stands in.
         faucet_minters: None,
+        // And audit v6's fields (admission by vote and what follows): absent, as on chain 15.
+        ..Default::default()
     });
 
     let n0 = start_node(&ks[0], &gen, vec![], true).await;

@@ -201,6 +201,20 @@ pub fn registration_message_v2(genesis: &Hash, chain_id: u64, validator: &Addres
     Hash::digest_domain(b"rand-register-2", &bytes)
 }
 
+/// What a validator signs to admit `candidate` to the register (audit v6, STAKE-2;
+/// `Action::AdmitValidator` under genesis `staking.admission_by_vote`): the genesis hash and the
+/// candidate's address, under their own tag. The genesis hash binds the vote to one chain — a
+/// vote cast on another chain that shares the validators' keys admits nobody here — and there is
+/// no nonce because there is nothing to replay: an admission is consumed by the registration it
+/// permits, a registered key can never be admitted again, and a vote for a key is a vote for that
+/// key whenever it is counted.
+pub fn admit_validator_message(genesis: &Hash, candidate: &Address) -> Hash {
+    let mut m = Vec::with_capacity(64);
+    m.extend_from_slice(genesis.as_bytes());
+    m.extend_from_slice(candidate.as_bytes());
+    Hash::digest_domain(b"rand-admit-validator-1", &m)
+}
+
 /// What a validator signs to move stake into unbonding. The register's `nonce` is the replay
 /// protection: there are no accounts on this chain to carry one.
 pub fn unbond_message(chain_id: u64, validator: &Address, amount: u64, nonce: u64) -> Hash {

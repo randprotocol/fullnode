@@ -375,7 +375,8 @@ gas policy:
   "max_call_envelope_bytes": 18432, "max_program_public_words": 0, "envelope_bytes": null,
   "hardening_v6": false, "hc_auth": null, "gas_price": "100", "byte_price": "800",
   "gas_metering": "header", "bundle_gas_limit": null, "adjust_bps": null,
-  "max_gas_price": null, "max_byte_price": null, "byte_load": null }
+  "max_gas_price": null, "max_byte_price": null, "byte_load": null,
+  "admission_by_vote": false }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -438,7 +439,10 @@ points (genesis `gas.dynamic.adjust_bps`), `null` on a chain without `dynamic` �
 with a `gas` section whose prices never move. `max_gas_price`/`max_byte_price` (decimal strings)
 are the ceilings the controller never lifts a price over and `byte_load` is `"paying"` when only
 a call's proof and input envelope move `byte_price` (audit v6, POOL-2; `docs/fees.md` §1.2) —
-all three `null` where the genesis sets none, chain 18 included.
+all three `null` where the genesis sets none, chain 18 included. `admission_by_vote` (audit v6, STAKE-2) is whether
+the genesis sets `staking.admission_by_vote`: there a bond that registers a new validator key is
+refused (`NotAdmitted`) until the validator set has voted the key in — `rand_getAdmitted` lists
+the keys that may register (`docs/staking.md` §2).
 
 ### `rand_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
@@ -930,6 +934,20 @@ because a JSON number is not an exact integer past 2^53 and a stake is 10^9 unit
 validator as proposer; `payout` is where a `Withdraw` pays; `nonce` is what its next signed
 `Unbond` or `Withdraw` must carry. The register is the only place this chain stores amounts in the
 clear — `docs/staking.md` is the guide to it.
+
+### `rand_getAdmitted`
+Params: `[]`. Result:
+
+```json
+{ "admission_by_vote": true, "max": 256, "admitted": ["rand-node address …", "…"] }
+```
+
+Audit v6, STAKE-2 (`docs/staking.md` §2, "Admission by vote"): the keys the validator set has
+voted in with an `AdmitValidator` that have not registered yet, by address, in address order —
+what a `Bond` that registers a new key must be among on a chain whose genesis sets
+`staking.admission_by_vote`. `max` is how many the ledger holds at once (`MAX_ADMITTED`). On a
+chain without the flag `admission_by_vote` is `false`, the list is always empty and a
+registration needs no vote. Served from storage, as of the committed head.
 
 ### `rand_getEpoch`
 Params: `[]`. Result: `{ "epoch": 41, "epoch_blocks": 1000, "next_set": ["…", "…"] }`. `epoch` is
@@ -1469,6 +1487,20 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-10-01 — audit v6, STAKE-2: admission by vote (`staking.admission_by_vote`)
+
+Genesis-gated; nothing changes on a chain without the flag (every chain through 18).
+
+- **`Action::AdmitValidator { candidate, signatures }`** (variant 28, appended last): the validator
+  set's vote to admit a key to the register — bundle-less, fee-less, pooled like a bridge
+  governance action. `tx_json` renders it as `{ "kind": "admit_validator", "candidate": <address>,
+  "candidate_key": <hex>, "voters": [<address>, …] }`.
+- **`rand_getAdmitted`** (public listener too): the admitted set with the flag and the bound.
+- **`rand_getLimits.admission_by_vote`** (bool): whether a registration needs the vote.
+- Under the flag `rand_sendTransaction` refuses a registering `Bond` whose key is not admitted
+  with `staking: validator … has not been admitted by the validator set's vote` (not permanent —
+  a vote one block later makes it valid).
 
 ### 2026-10-01 — a header row carries its block's public-note transactions (issue #117)
 

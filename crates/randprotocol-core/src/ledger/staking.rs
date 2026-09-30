@@ -24,7 +24,7 @@ use crate::crypto::{Address, PublicKey, Signature};
 use crate::gas;
 use crate::notes::{ShieldedAddress, Word8, KEM_EK_BYTES};
 use crate::types::actions::{
-    registration_message, registration_message_v2, unbond_message, withdraw_message, Registration,
+    admit_validator_message, registration_message, registration_message_v2, unbond_message, withdraw_message, Registration,
 };
 use crate::types::{Action, Transaction, ValidatorSet, UNITS_PER_RAND};
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,12 @@ pub const UNBONDING_EPOCHS: u64 = 2;
 pub const MIN_STAKE: u64 = 1000 * UNITS_PER_RAND;
 /// Largest validator set an epoch can have.
 pub const MAX_VALIDATORS: usize = 100;
+/// The most admissions the ledger holds at once under `staking.admission_by_vote` (audit v6,
+/// STAKE-2): keys the set has voted in that have not registered yet. The set is consensus state
+/// — hashed, persisted, cloned with the ledger — so it is bounded; past it an `AdmitValidator`
+/// is refused `AdmissionSetFull` until a registration consumes a row. 256 is two and a half
+/// full validator sets' worth of candidates waiting at once.
+pub const MAX_ADMITTED: usize = 256;
 
 /// One row of the register (spec §8). `stake`, `pending` and `rewards` are token units like
 /// every other amount on this chain; they are the only amounts stored in the clear.
@@ -110,6 +116,15 @@ pub struct ValidatorEntry {
 ///   `bond_activation_epochs + 1` epochs later — so neither bounds who drains the budget. An empty
 ///   or duplicated list is refused; absent, the register row is the rule and every node's
 ///   admission policy admits the genesis validators only.
+///
+/// And audit v6's (STAKE-2), each absent from every genesis through chain 18, omitted from the file
+/// when absent and committed to the genesis hash under its own tag, after every tag that existed
+/// before it, only when set:
+///
+/// - `admission_by_vote`: a `Bond` that would *register* a new validator key is refused
+///   ([`StakingError::NotAdmitted`]) unless the set has voted the key in with an
+///   `Action::AdmitValidator`. Until slashing exists an open register turns the price of two
+///   thirds of the stake into a purchase; this turns it into a vote. Only `true` switches it on.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StakingConfig {
@@ -126,6 +141,15 @@ pub struct StakingConfig {
     pub faucet_recipients: Option<Vec<FaucetRecipient>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub faucet_minters: Option<Vec<FaucetMinter>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_by_vote: Option<bool>,
+}
+
+impl StakingConfig {
+    /// Whether registrations need the set's vote (audit v6, STAKE-2): only `Some(true)`.
+    pub fn admission_by_vote(&self) -> bool {
+        self.admission_by_vote == Some(true)
+    }
 }
 
 /// One entry of `staking.faucet_recipients`: the spend public key `pk` a faucet `Mint` may pay.
@@ -288,6 +312,40 @@ pub enum StakingError {
     BurnMismatch { burn: u64, amount: u64 },
     #[error("arithmetic overflow")]
     Overflow,
+    /// Audit v6, STAKE-2: under `staking.admission_by_vote`, a `Bond` that would register a key
+    /// the validator set has not voted in. State — an `AdmitValidator` one block later makes the
+    /// same bond valid — so never a permanent admission verdict.
+    #[error("validator {0} has not been admitted by the validator set's vote (staking.admission_by_vote); ask the validators for an AdmitValidator first")]
+    NotAdmitted(Address),
+    /// An `AdmitValidator` for a key that is already admitted and waiting to register.
+    #[error("validator {0} is already admitted")]
+    AlreadyAdmitted(Address),
+    /// The admitted set holds [`MAX_ADMITTED`] keys that have not registered yet.
+    #[error("the admitted set is full ({max} keys admitted and not yet registered)")]
+    AdmissionSetFull { max: usize },
+    /// An `AdmitValidator` whose candidate key is not a Dilithium2 public key's length: no such
+    /// key could ever sign a registration. About the bytes alone.
+    #[error("the candidate key is {len} bytes, not a validator key")]
+    BadCandidateKey { len: usize },
+    /// An `AdmitValidator` carrying no vote, or more votes than the voting set has members.
+    #[error("an admission carries {got} votes; the voting set has {max} members")]
+    AdmissionVoteCount { got: usize, max: usize },
+    /// The votes are not in strictly ascending order of their voters' addresses — which is also
+    /// what a voter listed twice is. About the bytes alone.
+    #[error("the admission's votes are not in strictly ascending voter order (a voter may appear once)")]
+    AdmissionVoteOrder,
+    /// A vote by a key that is not in the voting set: not registered, not yet active, or below
+    /// the minimum stake.
+    #[error("{0} is not in the voting validator set")]
+    AdmissionVoterNotInSet(Address),
+    /// The voters' combined weight is not strictly more than two thirds of the voting set's.
+    #[error("the admission's voters hold {weight} of {total}: not more than two thirds")]
+    AdmissionNoQuorum { weight: u128, total: u128 },
+    /// A vote whose signature does not verify under its own key over this chain's admission
+    /// message for this candidate — a vote for another chain's genesis, or for another key.
+    /// About the bytes against the genesis hash.
+    #[error("the vote by {0} is not a signature over this chain's admission of this candidate")]
+    BadAdmissionVote(Address),
 }
 
 /// The validator set for an epoch, from the register as of the last block of the epoch before
@@ -505,6 +563,10 @@ impl Ledger {
         check_bond(self, &validator, amount, registration, chain_id)?;
         match registration {
             Some(r) => {
+                // STAKE-2 (audit v6): the registration consumes the admission that permitted it
+                // (`check_bond` just required it under the flag). Without the flag the set is
+                // empty and this removes nothing.
+                self.admitted.remove(&validator);
                 // STAKE-2 rule 3: under the section a new entry waits `bond_activation_epochs`
                 // whole epochs past the boundary it would otherwise have joined at (`epoch() +
                 // 1`). Without the section the field stays 0 — today's rule, and today's leaf.
@@ -702,6 +764,14 @@ pub(crate) fn check_bond(
             if r.payout.kem_ek.len() != KEM_EK_BYTES {
                 return Err(StakingError::BadRegistration);
             }
+            // Audit v6, STAKE-2, under `staking.admission_by_vote`: a new key registers only once
+            // the validator set has voted it in (`Action::AdmitValidator`). A set lookup, so it
+            // comes before the signature. A top-up of an existing entry (the arm above) is not a
+            // registration and needs no vote; a `BondVested` that registers comes through here
+            // too. Without the flag — every chain through 18 — nothing is asked.
+            if ledger.staking().is_some_and(|s| s.admission_by_vote()) && !ledger.admitted().contains(validator) {
+                return Err(StakingError::NotAdmitted(*validator));
+            }
             // Under `staking.registration_v2` the registration is bound to this chain's genesis
             // and to the validator's address as well (the v4 re-review's "proof of
             // possession"): a v1 registration signed for another chain that shares the chain id
@@ -770,6 +840,92 @@ fn check_unbond(
     Ok(())
 }
 
+/// What an `AdmitValidator` gets on a chain whose genesis does not set
+/// `staking.admission_by_vote`: the gate, before a byte of the action is read, so an old node's
+/// refusal of the unknown wire variant and this node's refusal of the action agree.
+const NO_ADMISSION: TxError = TxError::UnsupportedAction("admission by vote is not enabled on this chain (genesis staking.admission_by_vote)");
+
+/// The set whose vote admits a validator (audit v6, STAKE-2): the register's validators whose
+/// activation epoch has come, weighted by their stake less what is still queued, the top
+/// [`MAX_VALIDATORS`], capped by `max_weight_bps` — [`derive_set_with`] over this ledger for its
+/// own epoch, the very function the epoch's consensus set was derived by.
+///
+/// It is **not** byte-for-byte the set consensus is running the epoch with: that one was derived
+/// from the register as of the last block of the epoch before, and the ledger does not keep it.
+/// The two differ only by what happened since that boundary, and only downwards — under a
+/// `staking` section every bond (registration or top-up) is queued for a later epoch and is not
+/// weight here either, while an `Unbond` leaves this set at once and the consensus set at the
+/// next boundary. So a validator on its way out stops voting on admissions a little before it
+/// stops voting on blocks, and nothing that is not weight in consensus is weight here.
+pub fn voting_set(ledger: &Ledger) -> ValidatorSet {
+    ledger.derive_next_set(ledger.epoch())
+}
+
+/// The state half of an admission, with no signature work: the gate, then a candidate that is
+/// neither registered nor already admitted, then room in the set. What the mempool asks at every
+/// tip (`Mempool::applies`), and the first thing [`check_admit`] asks.
+pub fn check_admission_open(ledger: &Ledger, candidate: &Address) -> Result<(), TxError> {
+    if !ledger.staking().is_some_and(|s| s.admission_by_vote()) {
+        return Err(NO_ADMISSION);
+    }
+    if ledger.validators().contains_key(candidate) {
+        return Err(StakingError::AlreadyRegistered(*candidate).into());
+    }
+    if ledger.admitted().contains(candidate) {
+        return Err(StakingError::AlreadyAdmitted(*candidate).into());
+    }
+    if ledger.admitted().len() >= MAX_ADMITTED {
+        return Err(StakingError::AdmissionSetFull { max: MAX_ADMITTED }.into());
+    }
+    Ok(())
+}
+
+/// `AdmitValidator`'s rules (audit v6, STAKE-2), cheap before expensive: the gate, the candidate
+/// key's length, the state lookups ([`check_admission_open`]), the vote list's shape against the
+/// voting set (count, strict voter order, membership, quorum weight), and only then one
+/// Dilithium2 verification per vote. Every vote listed must count: a vote by a key outside the
+/// set, a repeated voter or a signature that does not verify refuses the whole action rather than
+/// being skipped, so one voter set has exactly one admissible encoding.
+fn check_admit(
+    ledger: &Ledger,
+    candidate: &crate::crypto::PublicKey,
+    signatures: &[(crate::crypto::PublicKey, Signature)],
+) -> Result<(), TxError> {
+    if !ledger.staking().is_some_and(|s| s.admission_by_vote()) {
+        return Err(NO_ADMISSION);
+    }
+    let len = candidate.as_bytes().len();
+    if len != crate::crypto::PUBLIC_KEY_LEN {
+        return Err(StakingError::BadCandidateKey { len }.into());
+    }
+    let address = candidate.address();
+    check_admission_open(ledger, &address)?;
+    let set = voting_set(ledger);
+    if signatures.is_empty() || signatures.len() > set.len() {
+        return Err(StakingError::AdmissionVoteCount { got: signatures.len(), max: set.len() }.into());
+    }
+    let voters: Vec<Address> = signatures.iter().map(|(key, _)| key.address()).collect();
+    if voters.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(StakingError::AdmissionVoteOrder.into());
+    }
+    let mut weight = 0u128;
+    for voter in &voters {
+        let v = set.get(voter).ok_or(StakingError::AdmissionVoterNotInSet(*voter))?;
+        weight = weight.saturating_add(v.stake);
+    }
+    // Strictly more than two thirds, by the arithmetic a quorum certificate is judged with.
+    if !set.has_quorum(weight) {
+        return Err(StakingError::AdmissionNoQuorum { weight, total: set.total_stake() }.into());
+    }
+    let message = admit_validator_message(&ledger.signing_domain().genesis, &address);
+    for ((key, signature), voter) in signatures.iter().zip(&voters) {
+        if !key.verify(message.as_bytes(), signature) {
+            return Err(StakingError::BadAdmissionVote(*voter).into());
+        }
+    }
+    Ok(())
+}
+
 /// What an action reaching this module that it does not own gets. Only a routing mistake in
 /// [`super::Ledger::validate_inner`] can produce one, and refusing it is the safe answer: `Ok`
 /// would let a mis-routed action skip the rules of the module that does own it.
@@ -800,6 +956,7 @@ pub(super) fn validate(
                 return Err(TxError::CommitmentExists(cm));
             }
         }
+        Action::AdmitValidator { candidate, signatures } => check_admit(ledger, candidate, signatures)?,
         _ => return Err(NOT_STAKING),
     }
     Ok(())
@@ -849,6 +1006,12 @@ pub(super) fn apply(
             // the same way.
             ledger.supply.withdraw_deposited =
                 ledger.supply.withdraw_deposited.checked_add(paid).ok_or(TxError::Overflow)?;
+        }
+        Action::AdmitValidator { candidate, signatures } => {
+            // Re-checked against this very state, like every arm here, then the one write: the
+            // candidate's address joins the admitted set, where its registration will find it.
+            check_admit(ledger, candidate, signatures)?;
+            ledger.admitted.insert(candidate.address());
         }
         _ => return Err(NOT_STAKING),
     }
@@ -1904,5 +2067,229 @@ mod tests {
             staking_err(plain.validate(&bond_tx(&plain, 10, &x, MIN_STAKE, Some(v2(&genesis, &x.address()))), &StubExecutor).unwrap_err()),
             StakingError::BadSignature
         );
+    }
+
+    // ---- audit v6, STAKE-2: admission by vote ---------------------------------------------------
+
+    fn this_chain() -> crate::crypto::Hash {
+        crate::crypto::Hash::digest(b"this chain")
+    }
+
+    /// Four genesis validators of `MIN_STAKE` each at height 1 of ten-block epochs, under a
+    /// `staking` section with `admission_by_vote` on or off, signing under `this_chain()`.
+    fn four_validators(admission: bool) -> (Vec<Keypair>, Ledger) {
+        let vals: Vec<Keypair> = (1..=4u8).map(key).collect();
+        let cfg = StakingConfig { admission_by_vote: admission.then_some(true), ..Default::default() };
+        let mut l = sectioned(vals.iter().enumerate().map(|(i, k)| entry(k, MIN_STAKE, payout(i as u8 + 1))).collect(), cfg);
+        l.set_signing_domain(crate::types::SigningDomain::v1(this_chain()));
+        (vals, l)
+    }
+
+    /// An `AdmitValidator` of `candidate` voted by `voters`, each over `genesis`'s admission
+    /// message for `candidate`, in the canonical (ascending voter address) order.
+    fn admit_tx(genesis: &crate::crypto::Hash, candidate: &Keypair, voters: &[&Keypair]) -> Transaction {
+        let message = admit_validator_message(genesis, &candidate.address());
+        let mut signatures: Vec<(crate::crypto::PublicKey, Signature)> =
+            voters.iter().map(|k| (k.public_key().clone(), k.sign(message.as_bytes()))).collect();
+        signatures.sort_by_key(|(key, _)| key.address());
+        signed_tx(Action::AdmitValidator { candidate: candidate.public_key().clone(), signatures })
+    }
+
+    /// Audit v6, STAKE-2: `Bond` was permissionless — anyone holding `MIN_STAKE` registered a
+    /// validator, so the price of two thirds of the stake was a purchase. Under
+    /// `staking.admission_by_vote` a registration is refused until validators holding strictly
+    /// more than two thirds of the voting set's weight have signed the key in, and the
+    /// registration consumes that admission. Without the flag nothing changes, and the action
+    /// itself is refused by name.
+    #[test]
+    fn under_admission_by_vote_a_registration_needs_the_validator_sets_vote() {
+        let newcomer = key(9);
+        let register = |l: &Ledger, n: u32| bond_tx(l, n, &newcomer, MIN_STAKE, Some(registration(&newcomer, payout(9))));
+
+        // Without the flag: a registration needs no vote, and an admission is not an action here.
+        let (vals, open) = four_validators(false);
+        assert_eq!(open.validate(&register(&open, 10), &StubExecutor), Ok(()));
+        let vote = admit_tx(&this_chain(), &newcomer, &[&vals[0], &vals[1], &vals[2]]);
+        assert!(matches!(open.validate(&vote, &StubExecutor), Err(TxError::UnsupportedAction(_))), "{:?}", open.validate(&vote, &StubExecutor));
+        let mut scratch = open.clone();
+        assert!(matches!(scratch.apply_tx(&vote, &vals[0].address(), &StubExecutor), Err(TxError::UnsupportedAction(_))));
+        assert_eq!(scratch, open, "and nothing of it is applied");
+        assert!(open.admitted().is_empty());
+
+        // Under the flag: the same registration is refused until the set has voted.
+        let (vals, mut l) = four_validators(true);
+        let proposer = vals[0].address();
+        assert_eq!(staking_err(l.validate(&register(&l, 10), &StubExecutor).unwrap_err()), StakingError::NotAdmitted(newcomer.address()));
+        let mut scratch = l.clone();
+        assert!(scratch.apply_tx(&register(&l, 10), &proposer, &StubExecutor).is_err());
+        assert!(!scratch.validators().contains_key(&newcomer.address()), "a refused registration writes no row");
+        // A top-up of an entry already in the register is not a registration: no vote asked.
+        assert_eq!(l.validate(&bond_tx(&l, 20, &vals[1], MIN_STAKE, None), &StubExecutor), Ok(()));
+
+        // A lone validator of four cannot admit — one of four is not a quorum — and neither can
+        // the candidate vote itself in: it is not in the set its admission is judged by.
+        let lone = admit_tx(&this_chain(), &newcomer, &[&vals[0]]);
+        assert_eq!(
+            staking_err(l.validate(&lone, &StubExecutor).unwrap_err()),
+            StakingError::AdmissionNoQuorum { weight: MIN_STAKE as u128, total: 4 * MIN_STAKE as u128 }
+        );
+        let two = admit_tx(&this_chain(), &newcomer, &[&vals[0], &vals[1]]);
+        assert!(matches!(staking_err(l.validate(&two, &StubExecutor).unwrap_err()), StakingError::AdmissionNoQuorum { .. }), "two of four is not more than two thirds");
+        let itself = admit_tx(&this_chain(), &newcomer, &[&newcomer]);
+        assert_eq!(staking_err(l.validate(&itself, &StubExecutor).unwrap_err()), StakingError::AdmissionVoterNotInSet(newcomer.address()));
+
+        // Three of four can. The admission is state: in the set, in the root.
+        let three = admit_tx(&this_chain(), &newcomer, &[&vals[0], &vals[1], &vals[2]]);
+        assert_eq!(l.validate(&three, &StubExecutor), Ok(()));
+        let root_before = l.state_root();
+        l.apply_tx(&three, &proposer, &StubExecutor).unwrap();
+        assert!(l.admitted().contains(&newcomer.address()));
+        assert_ne!(l.state_root(), root_before, "the admitted set is in the state root");
+        // A second admission of an admitted key is refused, whoever votes it.
+        let again = admit_tx(&this_chain(), &newcomer, &[&vals[1], &vals[2], &vals[3]]);
+        assert_eq!(staking_err(l.validate(&again, &StubExecutor).unwrap_err()), StakingError::AlreadyAdmitted(newcomer.address()));
+
+        // The registration now applies, and consumes the admission it was permitted by.
+        l.apply_tx(&register(&l, 10), &proposer, &StubExecutor).unwrap();
+        l.record_anchor(l.height());
+        assert!(l.validators().contains_key(&newcomer.address()));
+        assert!(l.admitted().is_empty(), "the admission is consumed by the registration");
+        // A registered key can never be admitted again.
+        assert_eq!(staking_err(l.validate(&again, &StubExecutor).unwrap_err()), StakingError::AlreadyRegistered(newcomer.address()));
+        // And the newcomer does not vote yet: its weight waits in the bond queue.
+        let other = key(10);
+        let with_newcomer = admit_tx(&this_chain(), &other, &[&vals[0], &vals[1], &newcomer]);
+        assert_eq!(
+            staking_err(l.validate(&with_newcomer, &StubExecutor).unwrap_err()),
+            StakingError::AdmissionVoterNotInSet(newcomer.address()),
+            "a key whose stake is not weight yet is not in the voting set"
+        );
+    }
+
+    /// The votes that do not count (audit v6, STAKE-2): one signed for another chain's genesis or
+    /// for another candidate, a voter listed twice, a voter outside the set, a list out of order,
+    /// an empty or over-long list, and a candidate that is not a key. Each refuses the whole
+    /// action — and in every case the same three honest votes alone would have admitted.
+    #[test]
+    fn a_vote_for_another_chain_a_repeated_voter_and_an_outsider_do_not_admit() {
+        let (vals, l) = four_validators(true);
+        let newcomer = key(9);
+        let message = admit_validator_message(&this_chain(), &newcomer.address());
+        let vote = |k: &Keypair| (k.public_key().clone(), k.sign(message.as_bytes()));
+        let sorted = |mut v: Vec<(crate::crypto::PublicKey, Signature)>| {
+            v.sort_by_key(|(key, _)| key.address());
+            v
+        };
+        let admit = |signatures: Vec<(crate::crypto::PublicKey, Signature)>| {
+            signed_tx(Action::AdmitValidator { candidate: newcomer.public_key().clone(), signatures })
+        };
+        let refusal = |t: &Transaction| staking_err(l.validate(t, &StubExecutor).unwrap_err());
+        assert_eq!(l.validate(&admit(sorted(vec![vote(&vals[0]), vote(&vals[1]), vote(&vals[2])])), &StubExecutor), Ok(()));
+
+        // A vote signed for another genesis (another chain sharing the validators' keys).
+        let elsewhere = admit_validator_message(&crate::crypto::Hash::digest(b"another chain"), &newcomer.address());
+        let foreign = (vals[2].public_key().clone(), vals[2].sign(elsewhere.as_bytes()));
+        assert_eq!(
+            refusal(&admit(sorted(vec![vote(&vals[0]), vote(&vals[1]), foreign]))),
+            StakingError::BadAdmissionVote(vals[2].address())
+        );
+        // A vote for another candidate, moved under this one.
+        let other = admit_validator_message(&this_chain(), &key(10).address());
+        let moved = (vals[2].public_key().clone(), vals[2].sign(other.as_bytes()));
+        assert_eq!(
+            refusal(&admit(sorted(vec![vote(&vals[0]), vote(&vals[1]), moved]))),
+            StakingError::BadAdmissionVote(vals[2].address())
+        );
+        // A voter listed twice: two distinct voters and a repeat are not three.
+        assert_eq!(refusal(&admit(sorted(vec![vote(&vals[0]), vote(&vals[0]), vote(&vals[1])]))), StakingError::AdmissionVoteOrder);
+        // The same three honest votes out of canonical order.
+        let mut reversed = sorted(vec![vote(&vals[0]), vote(&vals[1]), vote(&vals[2])]);
+        reversed.reverse();
+        assert_eq!(refusal(&admit(reversed)), StakingError::AdmissionVoteOrder);
+        // A voter that is not in the set: its signature is good and counts for nothing.
+        let outsider = key(11);
+        assert_eq!(
+            refusal(&admit(sorted(vec![vote(&vals[0]), vote(&vals[1]), vote(&outsider)]))),
+            StakingError::AdmissionVoterNotInSet(outsider.address())
+        );
+        // No votes, and more votes than the set has members.
+        assert_eq!(refusal(&admit(vec![])), StakingError::AdmissionVoteCount { got: 0, max: 4 });
+        let five = sorted(vec![vote(&vals[0]), vote(&vals[1]), vote(&vals[2]), vote(&vals[3]), vote(&outsider)]);
+        assert_eq!(refusal(&admit(five)), StakingError::AdmissionVoteCount { got: 5, max: 4 });
+        // A candidate that is not a validator key.
+        // (`PublicKey::from_bytes` refuses the length; the wire does not, so it arrives by decode.)
+        let short_key: crate::crypto::PublicKey = serde_json::from_str(&format!("\"{}\"", hex::encode([7u8; 16]))).unwrap();
+        let short = signed_tx(Action::AdmitValidator { candidate: short_key, signatures: vec![vote(&vals[0])] });
+        assert_eq!(refusal(&short), StakingError::BadCandidateKey { len: 16 });
+        // A bundle on it is refused by shape, like every bundle-less action.
+        let with_bundle = Transaction {
+            bundle: Some(bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], 0)),
+            ..admit(sorted(vec![vote(&vals[0]), vote(&vals[1]), vote(&vals[2])]))
+        };
+        assert_eq!(l.validate(&with_bundle, &StubExecutor), Err(TxError::ActionCarriesBundle("admit_validator")));
+    }
+
+    /// The quorum is by weight, not by head count, and the voting set is the register's own
+    /// derivation: a validator whose activation epoch has not come, or whose stake has left,
+    /// does not vote; and the admitted set is bounded.
+    #[test]
+    fn an_admission_is_judged_by_weight_in_the_derived_voting_set() {
+        let newcomer = key(9);
+        let (big, a, b, c) = (key(1), key(2), key(3), key(4));
+        let cfg = StakingConfig { admission_by_vote: Some(true), ..Default::default() };
+        let mut pending = entry(&c, 10 * MIN_STAKE, payout(4));
+        pending.activation_epoch = 5;
+        let mut l = sectioned(
+            vec![entry(&big, 10 * MIN_STAKE, payout(1)), entry(&a, MIN_STAKE, payout(2)), entry(&b, MIN_STAKE, payout(3)), pending],
+            cfg,
+        );
+        l.set_signing_domain(crate::types::SigningDomain::v1(this_chain()));
+        let set = voting_set(&l);
+        assert_eq!((set.len(), set.total_stake()), (3, 12 * MIN_STAKE as u128), "the not-yet-active entry is not in it");
+        // Two of three by count, a sixth by weight.
+        assert_eq!(
+            staking_err(l.validate(&admit_tx(&this_chain(), &newcomer, &[&a, &b]), &StubExecutor).unwrap_err()),
+            StakingError::AdmissionNoQuorum { weight: 2 * MIN_STAKE as u128, total: 12 * MIN_STAKE as u128 }
+        );
+        // One of three by count, ten twelfths by weight.
+        assert_eq!(l.validate(&admit_tx(&this_chain(), &newcomer, &[&big]), &StubExecutor), Ok(()));
+        // The entry whose activation epoch is ahead does not vote, whatever its stake.
+        assert_eq!(
+            staking_err(l.validate(&admit_tx(&this_chain(), &newcomer, &[&big, &c]), &StubExecutor).unwrap_err()),
+            StakingError::AdmissionVoterNotInSet(c.address())
+        );
+        // The admitted set is bounded: at `MAX_ADMITTED` the next admission is refused.
+        let full: std::collections::BTreeSet<Address> = (0..MAX_ADMITTED as u32).map(|i| {
+            let mut a = [0u8; 32];
+            a[..4].copy_from_slice(&i.to_be_bytes());
+            Address(a)
+        }).collect();
+        l.set_admitted(full);
+        assert_eq!(
+            staking_err(l.validate(&admit_tx(&this_chain(), &newcomer, &[&big]), &StubExecutor).unwrap_err()),
+            StakingError::AdmissionSetFull { max: MAX_ADMITTED }
+        );
+    }
+
+    /// The admitted set reaches the state root only under the flag, and the root moves with it:
+    /// without `admission_by_vote` — every chain through 18 — the root is the one the section
+    /// alone commits, whatever the (always empty) set holds.
+    #[test]
+    fn the_admitted_set_is_in_the_state_root_only_under_the_flag() {
+        let (_, off) = four_validators(false);
+        let (_, on) = four_validators(true);
+        assert_ne!(on.state_root(), off.state_root(), "the flag re-domains the root");
+        let mut with_one = on.clone();
+        with_one.set_admitted([Address([7; 32])].into_iter().collect());
+        assert_ne!(with_one.state_root(), on.state_root());
+        assert_ne!(with_one, on, "and the set is inside the ledger's equality");
+        let mut other = on.clone();
+        other.set_admitted([Address([8; 32])].into_iter().collect());
+        assert_ne!(other.state_root(), with_one.state_root());
+        // The wrapped root is exactly `H("rand-state-admitted-1", inner ‖ admitted_root)` over
+        // the root the same ledger commits without the flag.
+        let mut expect = off.state_root().as_bytes().to_vec();
+        expect.extend_from_slice(on.admitted_root().as_bytes());
+        assert_eq!(on.state_root(), crate::crypto::Hash::digest_domain(b"rand-state-admitted-1", &expect));
     }
 }

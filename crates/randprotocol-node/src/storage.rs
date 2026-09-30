@@ -204,6 +204,15 @@ const META_FAUCET_EPOCH: &str = "faucet_epoch";
 /// replay, and absent — read as empty — on a database written before the key existed and on
 /// every chain without the section, where the ledger's queue is empty too.
 const META_BOND_QUEUE: &str = "bond_queue";
+/// `bincode(BTreeSet<Address>)`: the admitted set as of the head (audit v6, STAKE-2,
+/// `Ledger::admitted`) — the keys the validator set has voted in that have not registered yet.
+/// Consensus state under `staking.admission_by_vote`: hashed into the state root
+/// (`rand-state-admitted-1`) and inside `Ledger`'s equality, so a restarted node that lost it
+/// would refuse a registration its peers apply. Written at the bond queue's three sites, but
+/// only when the set is non-empty and deleted otherwise (the `put_vesting` rule) — it is empty
+/// on every chain without the flag, so chain 18's database never gains the key; absent reads
+/// as empty. Restored by `load_ledger`, audited by replay.
+const META_ADMITTED: &str = "admitted";
 /// `bincode(u64)`: Σ of the registration fees burned under `tokens.burn_registration_fee` as of
 /// the head (audit v5, TOK-2, `Ledger::registration_fees_burned`). `META_SUPPLY`'s twin in every
 /// respect — derived, outside the root and `Ledger`'s equality, written at the same three sites,
@@ -840,6 +849,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&gs.ledger.supply())?);
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&gs.ledger.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(gs.ledger.bond_queue())?);
+        self.put_admitted(&mut batch, gs.ledger.admitted())?;
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&gs.ledger.registration_fees_burned())?);
         // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
         // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
@@ -1214,6 +1224,23 @@ impl Storage {
     /// a database written before the key existed: empty.
     pub fn bond_queue(&self) -> Result<Vec<randprotocol_core::ledger::QueuedStake>> {
         Ok(self.get_meta_raw(META_BOND_QUEUE)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
+    /// The admitted set as of the head (audit v6, STAKE-2) — `bond_queue()`'s twin: empty on a
+    /// database without the key, which is every chain without `staking.admission_by_vote`.
+    pub fn admitted(&self) -> Result<BTreeSet<Address>> {
+        Ok(self.get_meta_raw(META_ADMITTED)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
+    /// Write the admitted set beside the rest of the head's state — present while it holds a
+    /// key, deleted otherwise, so a chain that never admits anyone never gains the row.
+    fn put_admitted(&self, batch: &mut WriteBatch, admitted: &BTreeSet<Address>) -> Result<()> {
+        if admitted.is_empty() {
+            batch.delete_cf(self.cf(CF_META), META_ADMITTED);
+        } else {
+            batch.put_cf(self.cf(CF_META), META_ADMITTED, bincode::serialize(admitted)?);
+        }
+        Ok(())
     }
 
     /// The vesting register as of the head (genesis vesting), `None` on a chain without the
@@ -2151,6 +2178,7 @@ impl Storage {
         let (faucet_epoch, faucet_minted) = self.faucet_epoch_counters()?;
         ledger.set_faucet_epoch_counters(faucet_epoch, faucet_minted);
         ledger.set_bond_queue(self.bond_queue()?);
+        ledger.set_admitted(self.admitted()?);
         ledger.set_registration_fees_burned(self.registration_fees_burned()?);
         if let Some(p) = self.gas_prices()? {
             ledger.set_gas_prices(p);
@@ -2479,6 +2507,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger_after.supply())?);
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger_after.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger_after.bond_queue())?);
+        self.put_admitted(&mut batch, ledger_after.admitted())?;
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger_after.registration_fees_burned())?);
         // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
         // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
@@ -2980,6 +3009,15 @@ impl Storage {
                     ledger.bond_queue()
                 ))
             }
+            // The admitted set likewise (audit v6, STAKE-2): inside the equality, hashed under
+            // `staking.admission_by_vote`, named so the repair knows the key.
+            Ok(stored) if stored.admitted() != ledger.admitted() => {
+                check.problem = Some(format!(
+                    "stored admitted set {:?} does not match the replayed chain's {:?}",
+                    stored.admitted(),
+                    ledger.admitted()
+                ))
+            }
             // The vesting register likewise (genesis vesting): inside the equality, hashed under
             // its section, named so the repair knows the key.
             Ok(stored) if stored.vesting() != ledger.vesting() => {
@@ -3236,6 +3274,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger.supply())?);
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger.bond_queue())?);
+        self.put_admitted(&mut batch, ledger.admitted())?;
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger.registration_fees_burned())?);
         // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
         // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
@@ -3823,6 +3862,28 @@ pub(crate) mod fixtures {
 
     /// A bundle whose stub proof publishes exactly the digest the ledger recomputes, anchored to
     /// the newest root `ledger` has recorded and timed at its current height.
+    /// A chain of `validators` whose genesis sets `staking.admission_by_vote` (audit v6,
+    /// STAKE-2), with ten-block epochs: a registration there needs the set's vote.
+    pub(crate) fn admission_genesis(validators: &[&Keypair]) -> GenesisState {
+        let mut g = genesis_file_of(7, validators, vec![], 10);
+        g.staking = Some(randprotocol_core::genesis::StakingConfig { admission_by_vote: Some(true), ..Default::default() });
+        g.build(&StubExecutor).unwrap()
+    }
+
+    /// A bundle-less `AdmitValidator` of `candidate` on `ledger`'s chain, voted by `voters` in
+    /// canonical (ascending address) order.
+    pub(crate) fn admit_tx(ledger: &Ledger, candidate: &Keypair, voters: &[&Keypair]) -> Transaction {
+        let message = randprotocol_core::types::actions::admit_validator_message(&ledger.signing_domain().genesis, &candidate.address());
+        let mut signatures: Vec<(randprotocol_core::PublicKey, randprotocol_core::Signature)> =
+            voters.iter().map(|k| (k.public_key().clone(), k.sign(message.as_bytes()))).collect();
+        signatures.sort_by_key(|(key, _)| key.address());
+        Transaction {
+            chain_id: ledger.chain_id(),
+            bundle: None,
+            action: Action::AdmitValidator { candidate: candidate.public_key().clone(), signatures },
+        }
+    }
+
     pub(crate) fn bundle_tx(ledger: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64) -> Transaction {
         randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(ledger.chain_id(), bundle(ledger, nfs, cms, fee), Action::None))
     }
@@ -6887,6 +6948,53 @@ mod tests {
         s.db.delete_cf(s.cf(CF_META), META_VESTING).unwrap();
         let err = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap_err().to_string();
         assert!(err.contains("vesting"), "{err}");
+    }
+
+    /// Audit v6, STAKE-2: the admitted set is consensus state under `staking.admission_by_vote`
+    /// — a registration is valid or not by it, and it is in the state root — so, like the bond
+    /// queue, it is committed with the state, restored by `load_ledger`, audited by
+    /// `verify_chain`'s replay and rewritten by the repair. A node that came back without it
+    /// would refuse the admitted key's registration, which its peers apply.
+    #[test]
+    fn the_admitted_set_is_persisted_restored_and_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = admission_genesis(&[&key(1)]);
+        s.init_genesis(&gs).unwrap();
+        assert!(s.admitted().unwrap().is_empty());
+        assert!(s.get_meta_raw(META_ADMITTED).unwrap().is_none(), "an empty set writes no row");
+
+        // Block 1: the one validator (a quorum of its own set) admits a newcomer.
+        let newcomer = key(9);
+        let mut ledger = gs.ledger.clone();
+        let vote = admit_tx(&ledger, &newcomer, &[&key(1)]);
+        let b1 = make_block(&gs.block, &mut ledger, vec![vote], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let admitted: BTreeSet<Address> = [newcomer.address()].into_iter().collect();
+        assert_eq!(ledger.admitted(), &admitted);
+        assert_eq!(s.admitted().unwrap(), admitted, "committed with the state");
+
+        // Restored, and the reloaded ledger hashes the same root.
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap().admitted(), &admitted);
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.admitted(), &admitted);
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(reloaded, ledger);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A lost set is named by the audit, and the repair rewrites it from the replay.
+        s.db.delete_cf(s.cf(CF_META), META_ADMITTED).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.expect("a lost admitted set is a problem");
+        assert!(problem.contains("admitted set"), "{problem}");
+        assert_eq!(check.last_good, 1, "the block itself is fine");
+        s.truncate_to(&gs, 1, &check.ledger).unwrap();
+        assert_eq!(s.admitted().unwrap(), admitted);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A truncation to genesis empties it again, and drops the row.
+        s.truncate_to(&gs, 0, &gs.ledger).unwrap();
+        assert!(s.get_meta_raw(META_ADMITTED).unwrap().is_none());
     }
 
     /// The v4 re-review's bond queue is consensus state under a `staking` section, so — like

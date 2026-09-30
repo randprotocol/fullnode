@@ -385,6 +385,21 @@ pub enum Action {
     /// after `UNBONDING_EPOCHS`, never to a note. Signed by the beneficiary over
     /// [`crate::types::actions::unbond_vested_message`].
     UnbondVested { entry: [u8; 32], amount: u64, nonce: u64, signature: Signature },
+    /// Audit v6, STAKE-2 (genesis `staking.admission_by_vote`): the validator set's vote to admit
+    /// `candidate` to the register. Under the flag a `Bond` that would *register* a new key is
+    /// refused unless the key's address is in the ledger's admitted set, and this action is the
+    /// only thing that puts one there; the registration it permits consumes it.
+    ///
+    /// `signatures` is one `(validator key, signature)` per voter, over
+    /// [`crate::types::actions::admit_validator_message`]`(genesis hash, candidate address)`, in
+    /// strictly ascending order of the voters' addresses (one canonical encoding per voter set,
+    /// and a repeated voter is refused by the order rule alone). Every listed voter must be in the
+    /// voting set, every signature must verify, and the voters' combined weight must be strictly
+    /// more than two thirds of the set's (`ValidatorSet::has_quorum`). Bundle-less and fee-less,
+    /// like the bridge's governance actions: the vote, not a payer, is the authority. Refused
+    /// `UnsupportedAction` on a chain without the flag (every chain through 18), before anything
+    /// else is read. Appended last: bincode is positional, and chain 18's history must decode.
+    AdmitValidator { candidate: PublicKey, signatures: Vec<(PublicKey, Signature)> },
 }
 
 impl Action {
@@ -413,6 +428,7 @@ impl Action {
             Action::RevokeVesting { .. } => Some("revoke_vesting"),
             Action::BondVested { .. } => Some("bond_vested"),
             Action::UnbondVested { .. } => Some("unbond_vested"),
+            Action::AdmitValidator { .. } => Some("admit_validator"),
             _ => None,
         }
     }
@@ -626,6 +642,10 @@ impl Action {
             },
             Action::UnbondVested { entry, amount, nonce, signature } => {
                 Action::UnbondVested { entry: *entry, amount: *amount, nonce: *nonce, signature: signature.clone() }
+            }
+            // STAKE-2's admission vote: bundle-less, no proof, the candidate and every vote kept.
+            Action::AdmitValidator { candidate, signatures } => {
+                Action::AdmitValidator { candidate: candidate.clone(), signatures: signatures.clone() }
             }
         }
     }
@@ -1179,6 +1199,7 @@ mod tests {
             (Action::RotatePqGuardians { new_pq_guardians: Vec::new(), nonce: 0, pq_signatures: Vec::new() }, "rotate_pq_guardians"),
             (Action::RotatePauseKey { new_pause_key: minter.clone(), nonce: 0, pq_signatures: Vec::new() }, "rotate_pause_key"),
             (Action::UnbondVested { entry: [0; 32], amount: 1, nonce: 0, signature: Signature::empty() }, "unbond_vested"),
+            (Action::AdmitValidator { candidate: minter.clone(), signatures: Vec::new() }, "admit_validator"),
             (
                 Action::BondVested { entry: [0; 32], validator: v, amount: 1, registration: None, nonce: 0, signature: Signature::empty() },
                 "bond_vested",
@@ -1426,7 +1447,7 @@ mod tests {
     /// The number of `Action` variants, and each one's position — an exhaustive match with no
     /// wildcard, so a new variant fails to compile here until [`sample`] has a row for it (and
     /// [`Action::blanked`] has an arm).
-    const VARIANTS: usize = 28;
+    const VARIANTS: usize = 29;
     fn variant_index(a: &Action) -> usize {
         match a {
             Action::None => 0,
@@ -1457,6 +1478,7 @@ mod tests {
             Action::RevokeVesting { .. } => 25,
             Action::BondVested { .. } => 26,
             Action::UnbondVested { .. } => 27,
+            Action::AdmitValidator { .. } => 28,
         }
     }
 
@@ -1652,6 +1674,10 @@ mod tests {
                 signature: sig(),
             },
             27 => Action::UnbondVested { entry: [0x55; 32], amount: 9, nonce: 1, signature: sig() },
+            28 => Action::AdmitValidator {
+                candidate: PublicKey::from_bytes(&[0x44; crate::crypto::PUBLIC_KEY_LEN]).unwrap(),
+                signatures: vec![(pk(), sig())],
+            },
             _ => panic!("no variant {i}"),
         }
     }

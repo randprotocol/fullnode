@@ -223,6 +223,19 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | V::BadRevokerIndex(_)
         );
     }
+    // The validator register's verdicts are state, every one (see the doc comment) — with the
+    // three an `AdmitValidator` (audit v6, STAKE-2) can earn on its own bytes: a candidate key of
+    // the wrong length, votes out of strict voter order (which is what a repeated voter is), and
+    // a vote that does not verify under the key the action itself lists beside it, over the
+    // genesis hash and the candidate the action itself names. No register, height or pool state
+    // enters any of them, so a node one block behind refuses the same bytes. They are worth
+    // caching because the action is fee-less: without it each repeat costs a set derivation and
+    // a Dilithium2 verification. Membership of the voting set, the quorum, the candidate being
+    // registered or admitted, the set being full — and `NotAdmitted` itself — move with the chain.
+    if let TxError::Staking(s) = e {
+        use randprotocol_core::ledger::StakingError as S;
+        return matches!(s, S::BadCandidateKey { .. } | S::AdmissionVoteOrder | S::BadAdmissionVote(_));
+    }
     // The aggregation register's verdicts, split like `Staking`'s: the byte-verdicts (and the
     // ones against genesis-pinned constants) are cacheable, the register's state is not. A
     // signature is over the transaction's own fields against the entry's key — and an address

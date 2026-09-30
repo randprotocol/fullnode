@@ -5006,6 +5006,40 @@ mod tests {
         assert_eq!(reloaded, gs.ledger);
     }
 
+    /// Audit v6, STAKE-2: the admitted set survives a restart — it is state, so storage holds
+    /// it — and so does the flag that gives it meaning, which lives in the genesis file's
+    /// `staking` section. A node that came back without either would compute another state root
+    /// than its peers (the `rand-state-admitted-1` wrapper) and judge the admitted key's
+    /// registration differently: a fork at its first restart.
+    #[test]
+    fn a_restart_restores_the_admitted_set() {
+        use crate::storage::fixtures::{admission_genesis, admit_tx, make_block};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        let gs = admission_genesis(&[&a, &b, &c, &d]);
+        storage.init_genesis(&gs).unwrap();
+        let newcomer = key(9);
+        let mut ledger = gs.ledger.clone();
+        // Three of four vote the newcomer in, in a block the first validator proposes.
+        let proposer = gs.validators.iter().next().unwrap().address();
+        let proposer = [&a, &b, &c, &d].into_iter().find(|k| k.address() == proposer).unwrap();
+        let vote = admit_tx(&ledger, &newcomer, &[&a, &b, &c]);
+        let b1 = make_block(&gs.block, &mut ledger, vec![vote], proposer);
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert!(ledger.admitted().contains(&newcomer.address()));
+
+        let bare = storage.load_ledger(&StubExecutor).unwrap();
+        assert!(bare.staking().is_none(), "storage does not hold the gate");
+        assert!(bare.admitted().contains(&newcomer.address()), "but it holds the set");
+        assert_ne!(bare.state_root(), ledger.state_root(), "without the gate the root is another chain's");
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert!(reloaded.staking().is_some_and(|s| s.admission_by_vote()));
+        assert_eq!(reloaded.admitted(), ledger.admitted());
+        assert_eq!(reloaded.state_root(), ledger.state_root(), "the same state root after the restart");
+        assert_eq!(reloaded, ledger);
+    }
+
     /// The program cap survives a restart the same way: it lives in the genesis file, and
     /// `load_ledger` alone comes back at the 4 096-word default — so a v0.4 node that resumed
     /// without `reload_ledger` setting it would refuse, as `ProgramTooLarge`, a deploy its peers

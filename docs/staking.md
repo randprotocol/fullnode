@@ -203,6 +203,60 @@ address, only the 32 address bytes are committed, key by key in file order, and 
 duplicated list is refused at `init` (`BadStaking`). Where a genesis lists it, every node's pool
 admits exactly that list. Absent, it commits nothing — chain 15 runs without it.
 
+### Admission by vote (audit v6, STAKE-2: `staking.admission_by_vote`)
+
+Every rule above bounds how fast bought stake becomes weight; none asks whether the set wants
+the key at all, and `Bond` stays permissionless — anyone holding `MIN_STAKE` (1 000 RAND) and a
+key registers a validator. On chain 18's 26 keys of 1 000 RAND that makes a blocking third about
+13 000 RAND and two thirds about 52 000: at the seed-sale price, a purchase, not a vote. Until
+slashing exists the register is therefore permissioned where it holds value, and one optional
+field says so:
+
+```json
+"staking": { …, "admission_by_vote": true }
+```
+
+Only `true` switches it on; absent or `false` is every chain through 18, byte for byte (the field
+is committed to the genesis hash under its own tag, after every earlier one, only when `true`).
+Under it:
+
+- **A registration needs the set's vote.** A `Bond` that would register a *new* key (one with a
+  `registration`) is refused `NotAdmitted` unless the key's address is in the ledger's **admitted
+  set**; a top-up of a row already in the register is not a registration and needs no vote. A
+  `BondVested` that registers goes through the same check.
+- **The vote is an action**, `AdmitValidator { candidate, signatures }` — bundle-less and
+  fee-less like the bridge's governance actions, pooled past a full pool and offered first, one
+  pooled vote per candidate. `candidate` is the key that will register; `signatures` is one
+  `(validator key, Dilithium2 signature)` per voter over `blake3("rand-admit-validator-1" ‖
+  genesis hash ‖ candidate address)`, in strictly ascending order of the voters' addresses. Every
+  listed vote must count: each voter must be in the **voting set**, each signature must verify,
+  a voter listed twice or out of order refuses the action, and the voters' combined weight must be
+  **strictly more than two thirds** of the set's — the arithmetic of a quorum certificate
+  (`ValidatorSet::has_quorum`). A vote is bound to one genesis, so a chain that shares the
+  validators' keys cannot reuse it, and it needs no nonce: an admission is consumed by the
+  registration it permits, and a registered key can never be admitted again.
+- **The voting set** is the register's own derivation for the ledger's current epoch —
+  `derive_set_with` over the register, the bond queue and `max_weight_bps`, the function every
+  epoch's consensus set is derived by. The ledger does not keep the set consensus is running
+  the epoch with (that one was derived from the register as of the last block of the epoch
+  before), so the two differ only by what happened since the boundary, and only downwards: under
+  the section every bond is queued and is weight in neither, while an `Unbond` leaves the voting
+  set at once and the consensus set at the next boundary. A key that unbonded below the minimum
+  stops voting on admissions a little before it stops voting on blocks; nothing that is not
+  weight in consensus is weight here. A lone validator of four cannot admit (one of four is not a
+  quorum), and a candidate cannot vote itself in.
+- **The admitted set is consensus state**, at most `MAX_ADMITTED` = 256 keys waiting to register
+  (`AdmissionSetFull` past it, until a registration consumes a row): folded into the state root
+  as `H("rand-state-admitted-1", root ‖ admitted_root)` around the root the section already
+  commits, persisted beside the bond queue (`META_ADMITTED`, written only while non-empty),
+  restored on restart and replayed by `rand-node verify`. `rand_getAdmitted` serves it;
+  `rand_getLimits.admission_by_vote` tells a wallet whether a registration needs the vote.
+- **The commands.** Each voter runs `rand-node admit sign --candidate <key or registration>
+  --key <its validator key> --genesis-hash <hash>` (offline) and hands back one line; whoever
+  collects them runs `rand-node admit submit --candidate … --signature <line>… --rpc …`, which
+  checks each vote against the node's genesis hash, orders them and sends the action. Then the
+  bond as before: `rand bond <validator> 1000 --registration <hex>`.
+
 Not in v0.5.4: slashing (audit decision D8 — "it means nothing while stake is free").
 
 A node runs with `--validator` when it holds a validator key at all; being in the current set is a
@@ -335,6 +389,11 @@ Joining, from the two sides:
 rand-node register --key node.key.json --payout "$(rand --key payout.key.json address)"
 rand-node run --datadir ./data --key node.key.json --validator --bootstrap /ip4/…/p2p/…
 #   … it syncs and observes; rand_status says is_validator true, active_validator false
+
+# on a chain with staking.admission_by_vote: each of enough validators signs the key in first,
+# and someone submits the votes (docs/staking.md §2, "Admission by vote")
+rand-node admit sign --candidate <hex from above> --key node.key.json --genesis-hash <hash>
+rand-node admit submit --candidate <hex from above> --signature <line> … --rpc http://127.0.0.1:8545
 
 # on the machine holding the stake, with the hex from above
 rand bond <validator base58> 1000 --registration <hex>

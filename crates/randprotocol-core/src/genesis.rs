@@ -1225,6 +1225,14 @@ impl Genesis {
         if let Some(g) = &self.gas {
             commit.extend_from_slice(&gas_commit(g));
         }
+        // Audit v6, STAKE-2: the staking section's later fields, each under its own tag after
+        // every tag that existed before it and only when set — inside the `staking` block above
+        // they would sit between tags chain 18's hash already commits. `false` is today's rule
+        // and commits nothing, like `registration_v2`.
+        if self.staking.as_ref().is_some_and(|s| s.admission_by_vote()) {
+            commit.extend_from_slice(b"staking_admission_by_vote");
+            commit.push(1);
+        }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
             height: 0,
@@ -3850,6 +3858,39 @@ mod tests {
         }
         assert!(with(|s| s.max_weight_bps = Some(10_000)).validate().is_ok());
         assert!(matches!(with(|s| s.max_stake_entry_per_epoch = Some(0)).validate(), Err(GenesisError::BadStaking(_))));
+    }
+
+    /// Audit v6, STAKE-2: `staking.admission_by_vote` rides the section's gate like the fields
+    /// before it — absent from a file that does not set it, committed to the genesis hash (after
+    /// every earlier tag) only when `true`, on the ledger the chain runs with, and in the state
+    /// root only then. A section without it builds exactly the chain it built before.
+    #[test]
+    fn admission_by_vote_is_committed_only_when_true() {
+        let mut base = genesis(4);
+        base.staking = Some(StakingConfig { faucet_budget_per_epoch: 100 * UNITS_PER_RAND, bond_activation_epochs: 2, ..Default::default() });
+        let plain = build(&base);
+        assert!(!base.to_json().contains("admission_by_vote"), "absent from a file that does not set it");
+        assert!(!plain.ledger.staking().unwrap().admission_by_vote());
+        let with = |v: Option<bool>| {
+            let mut g = base.clone();
+            g.staking.as_mut().unwrap().admission_by_vote = v;
+            g
+        };
+        let on = with(Some(true));
+        let built = build(&on);
+        assert_ne!(built.hash(), plain.hash(), "the flag is part of the genesis hash");
+        assert!(built.ledger.staking().unwrap().admission_by_vote(), "the ledger runs the rule genesis names");
+        assert!(built.ledger.admitted().is_empty(), "nobody is admitted at genesis: the genesis validators are the register");
+        assert_ne!(built.ledger.state_root(), plain.ledger.state_root(), "and the admitted set is in the root");
+        assert!(on.to_json().contains("\"admission_by_vote\": true"));
+        assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "the file round-trips it");
+        // `false` is today's rule: the same hash and the same root as a file without the field.
+        let off = build(&with(Some(false)));
+        assert_eq!(off.hash(), plain.hash());
+        assert_eq!(off.ledger.state_root(), plain.ledger.state_root());
+        // The section still refuses a key it does not know.
+        let misspelled = on.to_json().replace("admission_by_vote", "admission_by_votes");
+        assert!(Genesis::from_json(&misspelled).is_err(), "deny_unknown_fields still holds");
     }
 
     // ------------------------------------------------------------------ genesis vesting

@@ -598,6 +598,13 @@ pub struct Ledger {
     /// the order it was bonded. Consensus state on a chain with a `staking` section — folded
     /// into the state root and persisted beside `META_SUPPLY` — and always empty without one.
     bond_queue: Vec<staking::QueuedStake>,
+    /// The admitted set (audit v6, STAKE-2; `staking.admission_by_vote`): the addresses the
+    /// validator set has voted in (`Action::AdmitValidator`) that have not registered yet. A
+    /// registering `Bond` is refused unless its key is here, and consumes the row. Consensus
+    /// state under the flag — folded into the state root (`rand-state-admitted-1`), inside this
+    /// ledger's equality, persisted beside `META_BOND_QUEUE` — and always empty without it, on
+    /// every chain through 18. At most `staking::MAX_ADMITTED` rows.
+    admitted: BTreeSet<Address>,
     /// Genesis vesting (`vesting.rs`): the register a genesis `vesting` section seeds, `None`
     /// without one. Consensus state, in the state root (`rand-state-6`), persisted whole.
     vesting: Option<vesting::VestingRegister>,
@@ -743,6 +750,9 @@ impl PartialEq for Ledger {
             && self.faucet_minted_in_epoch == o.faucet_minted_in_epoch
             // The bond queue likewise: consensus state under the section, empty without one.
             && self.bond_queue == o.bond_queue
+            // The admitted set (audit v6, STAKE-2): consensus state under
+            // `staking.admission_by_vote`, empty on both sides without it.
+            && self.admitted == o.admitted
             // The vesting register: consensus state under its section, `None` on both sides
             // without one.
             && self.vesting == o.vesting
@@ -786,6 +796,7 @@ impl Ledger {
             faucet_epoch: 0,
             faucet_minted_in_epoch: 0,
             bond_queue: Vec::new(),
+            admitted: BTreeSet::new(),
             vesting: None,
             registration_fees_burned: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
@@ -844,6 +855,7 @@ impl Ledger {
             faucet_epoch: 0,
             faucet_minted_in_epoch: 0,
             bond_queue: Vec::new(),
+            admitted: BTreeSet::new(),
             vesting: None,
             registration_fees_burned: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
@@ -934,6 +946,30 @@ impl Ledger {
     /// would seat stake its peers still hold back, and fork at the next boundary.
     pub fn set_bond_queue(&mut self, queue: Vec<staking::QueuedStake>) {
         self.bond_queue = queue;
+    }
+
+    /// The admitted set (audit v6, STAKE-2): keys the validator set has voted in and that have
+    /// not registered yet. For the node's persistence, the replay audit and `rand_getAdmitted`.
+    pub fn admitted(&self) -> &BTreeSet<Address> {
+        &self.admitted
+    }
+
+    /// Restore the admitted set a node persisted beside the state — `set_bond_queue`'s twin:
+    /// hashed into the root under `staking.admission_by_vote`, so a restarted node that lost it
+    /// would refuse a registration its peers apply, and fork there.
+    pub fn set_admitted(&mut self, admitted: BTreeSet<Address>) {
+        self.admitted = admitted;
+    }
+
+    /// The admitted set as one hash: its length, then every address in the set's own (ascending)
+    /// order — fixed-width rows, so the count makes the encoding unambiguous.
+    pub fn admitted_root(&self) -> Hash {
+        let mut buf = Vec::with_capacity(8 + 32 * self.admitted.len());
+        buf.extend_from_slice(&(self.admitted.len() as u64).to_be_bytes());
+        for a in &self.admitted {
+            buf.extend_from_slice(a.as_bytes());
+        }
+        Hash::digest_domain(b"rand-admitted-1", &buf)
     }
 
     /// The `staking` section, or `None` on a chain without one — where the faucet has no
@@ -2037,7 +2073,9 @@ impl Ledger {
                 call_envelope::validate(input_envelope, self.max_call_envelope_bytes)?;
                 call_record = Some(self.programs.get(program).ok_or(TxError::UnknownProgram(*program))?);
             }
-            a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. }) => {
+            // `AdmitValidator` (audit v6, STAKE-2) is the register's too: gated on
+            // `staking.admission_by_vote`, which `staking::validate` checks before anything else.
+            a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. } | Action::AdmitValidator { .. }) => {
                 staking::validate(self, tx, a, executor)?;
             }
             a @ (Action::ClaimVested { .. }
@@ -2285,7 +2323,7 @@ impl Ledger {
                     gas_used: Ledger::call_gas_used(&o),
                 });
             }
-            a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. }) => {
+            a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. } | Action::AdmitValidator { .. }) => {
                 // The proposer is passed in because a `Withdraw` pays it the bundle base out of
                 // the amount it withdraws — the one fee that does not come from a bundle.
                 staking::apply(self, tx, a, proposer, executor)?;
@@ -2693,9 +2731,10 @@ impl Ledger {
             None => "none".into(),
         };
         format!(
-            "tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} tokens {tok} aggregators {agg} vesting {vest} gas prices {:?}",
+            "tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} tokens {tok} aggregators {agg} vesting {vest} gas prices {:?} admitted {:?}",
             self.tree.root(),
-            self.gas_prices()
+            self.gas_prices(),
+            self.admitted_root()
         )
     }
 
@@ -2751,7 +2790,26 @@ impl Ledger {
     /// the gas model (spec §7.1), under `gas.dynamic` only, appends the live `gas_price ‖
     /// byte_price` (big-endian u64) after everything, vesting included, re-domained
     /// `rand-state-7`. A fixed-price `gas` section is not in the root: its prices never move.
+    ///
+    /// Audit v6's staking state is folded in *around* all of that rather than appended inside
+    /// it: under `staking.admission_by_vote` the root is `H("rand-state-admitted-1", root ‖
+    /// admitted_root)` over the root every paragraph above describes. A wrapper with its own
+    /// domain composes with whatever the inner layout grows next, and without the flag — every
+    /// chain through 18 — the inner root is returned untouched, byte for byte.
     pub fn state_root(&self) -> Hash {
+        let mut root = self.state_root_base();
+        if self.staking.as_ref().is_some_and(|s| s.admission_by_vote()) {
+            let mut buf = Vec::with_capacity(64);
+            buf.extend_from_slice(root.as_bytes());
+            buf.extend_from_slice(self.admitted_root().as_bytes());
+            root = Hash::digest_domain(b"rand-state-admitted-1", &buf);
+        }
+        root
+    }
+
+    /// [`Ledger::state_root`] before audit v6's wrappers: the `rand-state-2` … `rand-state-7`
+    /// layouts, exactly as every chain through 18 commits them.
+    fn state_root_base(&self) -> Hash {
         let (nf_root, val_root, prog_root) = self.state_root_leaves();
         let mut buf = Vec::with_capacity(128);
         buf.extend_from_slice(&word8_to_bytes(&self.tree.root()));

@@ -245,3 +245,47 @@ fn the_binary_refuses_a_test_profile_genesis_unless_allowed() {
     let init = node().env_remove("RAND_ALLOW_TEST_FRI_PROFILE").args(["init", "--datadir"]).arg(dir.path().join("prod-data")).arg("--genesis").arg(&prod).output().unwrap();
     assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
 }
+
+/// Audit v6, STAKE-2: `--staking` writes a `StakingConfig` file into the genesis unchanged —
+/// `admission_by_vote` with it — and `--consensus-domain` the signing domain; the chain the file
+/// builds runs with both, and the flag is part of the genesis hash. Without `--staking` the file
+/// has no section, as before. A section the build refuses fails the command.
+#[test]
+fn the_genesis_command_round_trips_a_staking_section_with_admission_by_vote() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = serde_json::json!({
+        "faucet_budget_per_epoch": "0", "bond_activation_epochs": 2, "max_weight_bps": 3333,
+        "registration_v2": true, "admission_by_vote": true,
+    });
+    let cfg_path = dir.path().join("staking.json");
+    std::fs::write(&cfg_path, cfg.to_string()).unwrap();
+
+    let out = dir.path().join("genesis.json");
+    let run = genesis(&out, &["--staking", cfg_path.to_str().unwrap(), "--consensus-domain", "1"]);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let gen = read(&out);
+    let section = gen.staking.clone().expect("the section is in the file");
+    assert_eq!(section.admission_by_vote, Some(true));
+    assert_eq!((section.bond_activation_epochs, section.max_weight_bps, section.registration_v2), (2, Some(3333), Some(true)));
+    assert_eq!(gen.consensus_domain, Some(1));
+    let executor = ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test);
+    let state = gen.build(&executor).unwrap();
+    assert!(state.ledger.staking().unwrap().admission_by_vote());
+    let mut without = gen.clone();
+    without.staking.as_mut().unwrap().admission_by_vote = None;
+    assert_ne!(without.build(&executor).unwrap().hash(), state.hash(), "the flag is bound by the genesis hash");
+
+    // No flag, no section, no domain: the shape this command always wrote.
+    let plain = dir.path().join("plain.json");
+    assert!(genesis(&plain, &[]).status.success());
+    assert!(read(&plain).staking.is_none() && read(&plain).consensus_domain.is_none());
+
+    // A misspelled key is refused by the section's own `deny_unknown_fields`, and nothing is written.
+    let bad_path = dir.path().join("bad.json");
+    std::fs::write(&bad_path, r#"{"faucet_budget_per_epoch":"0","bond_activation_epochs":2,"admission_by_votes":true}"#).unwrap();
+    let refused = dir.path().join("refused.json");
+    let run = genesis(&refused, &["--staking", bad_path.to_str().unwrap()]);
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("not a valid staking config"), "{}", String::from_utf8_lossy(&run.stderr));
+    assert!(!refused.exists());
+}

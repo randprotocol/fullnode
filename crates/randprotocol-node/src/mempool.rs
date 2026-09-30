@@ -170,6 +170,11 @@ fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
         | Action::RevokeVesting { entry, nonce, .. }
         | Action::BondVested { entry, nonce, .. }
         | Action::UnbondVested { entry, nonce, .. } => Some((Address(*entry), *nonce)),
+        // Audit v6, STAKE-2: an admission's candidate. The ledger admits a key once
+        // (`AlreadyAdmitted` the second time), so two pooled votes for one candidate — two voter
+        // sets, two transaction ids — are a block that dies on its own second candidate. There
+        // is no nonce; the slot is the candidate's address under `claim_key`'s own role.
+        Action::AdmitValidator { candidate, .. } => Some((candidate.address(), 0)),
         _ => None,
     }
 }
@@ -190,6 +195,12 @@ fn claim_conflict_key(validator: &Address) -> Word8 {
 /// brake that can be crowded out is not a brake, and a key rotation after a compromise is the
 /// same kind of thing. All are safe only because [`claimed_nonce`]/[`claim_key`] already bound
 /// roles 2, 3 and 4 to one pooled transaction each, which tests assert.
+///
+/// Audit v6, STAKE-2 adds the validator set's own vote, `AdmitValidator`: bundle-less and
+/// fee-less, so fee order would sort it behind everything that pays. Its exemption is bounded
+/// differently — one pooled admission per candidate (role 7), each of which passed a quorum of
+/// the voting set's signatures at admission, and at most `staking::MAX_ADMITTED` of them before
+/// the ledger refuses the next.
 fn is_governance(action: &Action) -> bool {
     matches!(
         action,
@@ -199,6 +210,7 @@ fn is_governance(action: &Action) -> bool {
             | Action::ListBacking { .. }
             | Action::RotatePqGuardians { .. }
             | Action::RotatePauseKey { .. }
+            | Action::AdmitValidator { .. }
     )
 }
 
@@ -226,6 +238,7 @@ fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
         // STAKE-4: a revoke's nonce is the revokers' counter, so its slot is its own — a pooled
         // claim never holds it.
         Action::RevokeVesting { .. } => 6,
+        Action::AdmitValidator { .. } => 7,
         _ => 0,
     };
     (role, claim.0, claim.1)
@@ -897,6 +910,13 @@ impl Mempool {
                 if bridge.list_nonce != nonce {
                     return Err(TxError::Bridge(BridgeError::BadListNonce { expected: bridge.list_nonce, got: nonce }));
                 }
+            } else if matches!(tx.action, Action::AdmitValidator { .. }) {
+                // Audit v6, STAKE-2: an admission stands while its candidate is neither
+                // registered nor admitted (and the set has room) — the ledger's own state
+                // checks, without the signature work. Once the candidate is admitted by another
+                // vote, or registered, this one can never apply and leaves here. Never the
+                // validator lookup below: a candidate is by definition not in the register.
+                randprotocol_core::ledger::staking::check_admission_open(ledger, &addr)?;
             } else if matches!(
                 tx.action,
                 Action::ClaimVested { .. } | Action::RevokeVesting { .. } | Action::BondVested { .. } | Action::UnbondVested { .. }
@@ -1817,6 +1837,59 @@ mod tests {
         assert!(after.bridge().unwrap().mint_paused);
         m.prune(&after);
         assert!(m.is_empty());
+    }
+
+    /// Audit v6, STAKE-2: the validator set's vote (`AdmitValidator`) is pooled like a governance
+    /// action — past a full pool, ahead of fee order — and claims its candidate: the ledger
+    /// admits a key once, so a second vote for the same candidate (another voter set, another
+    /// transaction id) would be a block that dies on its own candidate. Once the ledger has
+    /// admitted the key the pooled vote can never apply and leaves.
+    #[test]
+    fn two_admissions_of_one_candidate_do_not_both_pool() {
+        let vals: Vec<randprotocol_core::Keypair> = (1..=4u8).map(fixtures::key).collect();
+        let gs = fixtures::admission_genesis(&vals.iter().collect::<Vec<_>>());
+        let l = gs.ledger.clone();
+        let newcomer = fixtures::key(9);
+        let first = fixtures::admit_tx(&l, &newcomer, &[&vals[0], &vals[1], &vals[2]]);
+        let second = fixtures::admit_tx(&l, &newcomer, &[&vals[1], &vals[2], &vals[3]]);
+        assert_ne!(first.hash(), second.hash(), "two voter sets are two transactions");
+
+        // A pool at its cap still takes the vote, and offers it first.
+        let mut m = Mempool::new(1);
+        let paid = fixtures::bundle_tx(&l, [nf(1), nf(2)], [cm(1), cm(2)], fixtures::bundle_fee() * 5);
+        m.insert(paid.clone(), &l, &StubExecutor).unwrap();
+        let extra = fixtures::bundle_tx(&l, [nf(9), nf(10)], [cm(9), cm(10)], fixtures::bundle_fee());
+        assert_eq!(m.insert(extra, &l, &StubExecutor), Err(MempoolError::Full));
+        m.insert(first.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.len(), 2, "one past the cap");
+        assert_eq!(m.candidates(&l, 10).iter().map(|t| t.hash()).collect::<Vec<_>>(), vec![first.hash(), paid.hash()]);
+
+        // The second vote for the same candidate is a conflict, not a second pooled entry.
+        assert_eq!(
+            m.insert(second.clone(), &l, &StubExecutor),
+            Err(MempoolError::Conflict(claim_conflict_key(&newcomer.address())))
+        );
+        // A vote for another candidate is its own claim.
+        let other = fixtures::admit_tx(&l, &fixtures::key(10), &[&vals[0], &vals[1], &vals[2]]);
+        m.insert(other.clone(), &l, &StubExecutor).unwrap();
+        // A vote short of a quorum is the ledger's refusal, and is not pooled.
+        let short = fixtures::admit_tx(&l, &fixtures::key(11), &[&vals[0]]);
+        assert!(matches!(
+            m.insert(short, &l, &StubExecutor),
+            Err(MempoolError::Invalid(TxError::Staking(randprotocol_core::ledger::StakingError::AdmissionNoQuorum { .. })))
+        ));
+
+        // The ledger admits the candidate: the pooled vote is spent, and so is the other one.
+        let mut after = l.clone();
+        after.apply_tx(&first, &vals[0].address(), &StubExecutor).unwrap();
+        m.remove(&[first.hash()]);
+        assert_eq!(
+            m.precheck(&second, &after, &StubExecutor).map(|_| ()),
+            Err(MempoolError::Invalid(TxError::Staking(randprotocol_core::ledger::StakingError::AlreadyAdmitted(newcomer.address()))))
+        );
+        after.apply_tx(&other, &vals[0].address(), &StubExecutor).unwrap();
+        m.prune(&after);
+        assert!(!m.contains(&other.hash()), "a vote whose candidate is admitted leaves the pool");
     }
 
     /// Node I4: the emergency brake cannot be crowded out. A `PauseMints` is bundle-less and

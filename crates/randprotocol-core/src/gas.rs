@@ -343,6 +343,10 @@ pub fn fee_floor(action: &Action) -> u64 {
         // Genesis vesting: a claim and a revoke pay the base out of what they release, like a
         // `Withdraw`; a bond and an unbond from the lock move no value into or out of the pool.
         Action::ClaimVested { .. } | Action::RevokeVesting { .. } | Action::BondVested { .. } | Action::UnbondVested { .. } => 0,
+        // Audit v6, STAKE-2: the set's vote to admit a validator. Bundle-less like the bridge's
+        // governance actions, and unspammable for their reason: it needs a quorum of the voting
+        // set's signatures, and the admission it writes is one row of at most 256.
+        Action::AdmitValidator { .. } => 0,
     }
 }
 
