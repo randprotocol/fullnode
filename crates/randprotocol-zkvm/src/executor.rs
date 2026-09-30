@@ -1654,7 +1654,10 @@ fn prove_over_segment(
     let tier = match tier {
         Some(t) if TIERS.contains(&(t as usize)) => Tier(t as usize),
         Some(t) => return Err(format!("tier {t} is not one of {TIERS:?}")),
-        None => Tier(call_tier(program, inputs, segment.len())? as usize),
+        // Over the real segment, never `call_tier`'s zero stand-in: an invoke's guest branches on
+        // its context words (RPL-2), and a zeroed transition is one it refuses — a tier read off
+        // that run was a tier for a run that never halts.
+        None => Tier(dry_run_call(program, inputs, segment)?.tier as usize),
     };
     let opts = crate::machine::ProveOptions { gas_limit, ..Default::default() };
     let mut traces = crate::machine::build_traces_salted_with(program, inputs, segment, salt, &exec, tier, opts).map_err(|e| format!("{e:?}"))?;
@@ -2291,6 +2294,33 @@ mod tests {
         // A transition the program does not accept has no run, so no proof.
         let bad = invoke_segment(&[], &binding, &step(41, 43).context(0, 0, 0));
         assert!(dry_run_call(&program, &[], &bad).is_err(), "41 → 43 is not a step");
+    }
+
+    /// RPL-2: `prove_invoke` left to pick the tier itself picks it from a run over the *real*
+    /// segment. The guest branches on the context words — that is the whole point of an invoke —
+    /// so a tier read off a zero segment (`call_tier`'s stand-in for an unknown binding) is a tier
+    /// for a run that never halts: the counter refuses a zeroed transition and spins to the cycle
+    /// cap, and the prover reported `OutOfCycles` for a transition it had just executed fine.
+    #[test]
+    fn rpl2_an_invoke_left_to_pick_its_tier_runs_the_real_segment() {
+        use super::*;
+        use crate::machine::FriProfile;
+        use randprotocol_core::ledger::program_state::{Cell, Inflow, Transition};
+        let program = crate::guests::rpl2_counter();
+        let step = Transition {
+            reads: vec![Cell { key: [1, 0, 0, 0, 0, 0, 0, 0], value: [41, 0, 0, 0, 0, 0, 0, 0] }],
+            writes: vec![Cell { key: [1, 0, 0, 0, 0, 0, 0, 0], value: [42, 0, 0, 0, 0, 0, 0, 0] }],
+            inflow: Inflow::None,
+            pays: vec![],
+            mints: vec![],
+        };
+        let binding = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let context = step.context(0, 0, 0);
+        let (_, outputs, tier) =
+            prove_invoke(FriProfile::Test, &program, &[], &[], &binding, &context, [1, 2, 3, 4], None, None).expect("the tier is the real run's");
+        assert_eq!(outputs[0], 42);
+        let run = dry_run_call(&program, &[], &randprotocol_core::ledger::program_state::invoke_segment(&[], &binding, &context)).unwrap();
+        assert_eq!(tier, run.tier, "the tier the dry run over the same segment picks");
     }
 
     /// `program_state::public_table_rows` is core's mirror of the public table's height: pinned to
