@@ -358,9 +358,11 @@ pub enum Action {
         signature: Signature,
     },
     /// Genesis vesting (spec §6.2): pay exactly `unvested` of a revocable entry's not-yet-vested
-    /// RAND to `to` (the treasury) as a note of `unvested − BUNDLE_BASE`, and freeze the entry
-    /// at `amount − unvested`. Signed by the entry's revoker over
-    /// [`crate::types::actions::revoke_vesting_message`].
+    /// RAND to `to` as a note of `unvested − BUNDLE_BASE`, and freeze the entry at
+    /// `amount − unvested`. `to` must be the treasury the entry names in genesis, and
+    /// `signatures` at least the entry's `threshold` of its revokers, each over
+    /// [`crate::types::actions::revoke_vesting_message`] (audit v6, STAKE-3 — the shape changed
+    /// from one `signature`; no chain has carried a `vesting` section, so none ever admitted one).
     RevokeVesting {
         entry: [u8; 32],
         unvested: u64,
@@ -369,7 +371,7 @@ pub enum Action {
         time: u32,
         r: Word8,
         envelope: Envelope,
-        signature: Signature,
+        signatures: Vec<crate::types::actions::RevokerSignature>,
     },
     /// Genesis vesting, bond-from-lock (SAFT Schedule 2 §4): bond `amount` of an irrevocable
     /// entry's locked RAND as `validator`'s stake — a `Bond` whose value comes from the vesting
@@ -601,7 +603,7 @@ impl Action {
                 envelope: envelope.clone(),
                 signature: signature.clone(),
             },
-            Action::RevokeVesting { entry, unvested, nonce, to, time, r, envelope, signature } => Action::RevokeVesting {
+            Action::RevokeVesting { entry, unvested, nonce, to, time, r, envelope, signatures } => Action::RevokeVesting {
                 entry: *entry,
                 unvested: *unvested,
                 nonce: *nonce,
@@ -609,7 +611,7 @@ impl Action {
                 time: *time,
                 r: *r,
                 envelope: envelope.clone(),
-                signature: signature.clone(),
+                signatures: signatures.clone(),
             },
             Action::BondVested { entry, validator, amount, registration, nonce, signature } => Action::BondVested {
                 entry: *entry,
@@ -1200,7 +1202,7 @@ mod tests {
                     time: 0,
                     r: [0; 8],
                     envelope: env(),
-                    signature: Signature::empty(),
+                    signatures: Vec::new(),
                 },
                 "revoke_vesting",
             ),
@@ -1633,7 +1635,10 @@ mod tests {
                 time: 4,
                 r: [7; 8],
                 envelope: env(),
-                signature: sig(),
+                signatures: vec![
+                    crate::types::actions::RevokerSignature { index: 0, signature: sig() },
+                    crate::types::actions::RevokerSignature { index: 2, signature: sig() },
+                ],
             },
             26 => Action::BondVested {
                 entry: [0x53; 32],
@@ -1976,6 +1981,14 @@ mod tests {
             (25, "revoke to", |t| {
                 let Action::RevokeVesting { to, .. } = &mut t.action else { panic!() };
                 to.kem_ek[0] ^= 1;
+            }),
+            (25, "revoke signer index", |t| {
+                let Action::RevokeVesting { signatures, .. } = &mut t.action else { panic!() };
+                signatures[1].index = 1;
+            }),
+            (25, "revoke signature dropped", |t| {
+                let Action::RevokeVesting { signatures, .. } = &mut t.action else { panic!() };
+                signatures.pop();
             }),
             (26, "bond validator", |t| {
                 let Action::BondVested { validator, .. } = &mut t.action else { panic!() };

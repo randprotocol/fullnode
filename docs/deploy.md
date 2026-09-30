@@ -1003,6 +1003,31 @@ section — on inputs synthesised from `deploy/genesis-chain17.json`, into a tem
 `deploy/cutover-fleet-chain18.sh` (from chain 17's) is the all-stop/all-start roll;
 `deploy/chain18-bridge-steps.md` has the bridge relayer's own rebuild step.
 
+## The next cut: a `vesting` section is fit to carry (audit v6, STAKE-3)
+
+Audit v6 (§8.13) said: put no `vesting` section in any genesis until a revoke's destination is
+pinned. It is now, so the section may ride the next cut that needs it (the v1.0 genesis, after a
+testnet rehearsal). No chain has carried one; a genesis without it hashes and behaves exactly as
+before. What the cut passes, per **revocable** entry of the `--vesting` file (`docs/vesting.md`):
+
+- **`revokers`**: 1–5 distinct Dilithium2 public keys, none the beneficiary's. Use three, held
+  by three parties; each party generates its own (`rand-node keygen`) and sends only the public
+  key. The list's order is a term: a revoke names its signers by position.
+- **`threshold`**: how many of them sign a revoke — required, no default. Use `2`.
+- **`treasury`**: the `rand1…` address a revoke pays, the only one it may. Create the treasury
+  wallet and back up its key **before** the cut: the address cannot be changed afterwards, and
+  `rand-node genesis` refuses one whose ML-KEM key does not decode.
+
+An irrevocable entry (investors, partners) names none of the three. The old one-key `revoker`
+field is refused. Check before `rand-node init`'s hash is published: every team entry shows
+`"revocable": true`, three `revokers`, `"threshold": 2` and the treasury's address in
+`rand_getVesting`; every investor and partner entry shows `"revocable": false`. Rehearse one
+revoke on the testnet cut with two of the three keys on separate machines (`vesting revoke
+prepare` → `sign` ×2 → `submit`, inside 256 blocks) and open the note with the treasury wallet.
+The chain-18 cut script's vesting carry reads `rand_getVesting`'s `amount`/`claimed`/`revoked_*`
+fields, which are unchanged; a cut that carries a register forward must also carry each entry's
+`revokers`, `threshold` and `treasury`, which the genesis file holds.
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and

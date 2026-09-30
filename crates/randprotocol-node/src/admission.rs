@@ -203,6 +203,9 @@ pub fn is_permanent(e: &TxError) -> bool {
     // verdicts on the bytes against constants, as are the byte rules (a recipient's key length,
     // an amount under the base, a zero amount). Everything else — the nonce, what has vested,
     // what is free or bonded, whether the entry was revoked — moves with the chain and time.
+    // Audit v6, STAKE-3: an entry's revokers, its threshold and its treasury are genesis terms
+    // too, so a revoke to another address, a signature list naming a position the entry does not
+    // have or one revoker twice, and one shorter than the threshold are byte verdicts as well.
     if let TxError::Vesting(v) = e {
         use randprotocol_core::ledger::vesting::VestingError as V;
         return matches!(
@@ -214,6 +217,10 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | V::BadRecipient
                 | V::BelowBundleBase { .. }
                 | V::ZeroAmount
+                | V::NotTheTreasury
+                | V::BelowThreshold { .. }
+                | V::DuplicateRevoker(_)
+                | V::BadRevokerIndex(_)
         );
     }
     // The aggregation register's verdicts, split like `Staking`'s: the byte-verdicts (and the
@@ -1087,6 +1094,43 @@ mod tests {
         use randprotocol_core::bridge::BridgeError as B;
         let e = TxError::Bridge(B::BadPauseSignature);
         assert!(!is_permanent(&e), "{e} reads the chain's current pause key");
+    }
+
+    /// Genesis vesting: a verdict against the entry's genesis terms — its keys, its revokers and
+    /// their threshold, its treasury (audit v6, STAKE-3) — is about the bytes; the nonce, the
+    /// schedule's position and whether the entry was revoked are state.
+    #[test]
+    fn vesting_verdicts_are_cached_only_when_they_are_about_the_bytes_or_genesis_terms() {
+        use randprotocol_core::ledger::vesting::VestingError as V;
+        for v in [
+            V::BadSignature,
+            V::UnknownEntry("07".repeat(32)),
+            V::NotRevocable,
+            V::BondNeedsIrrevocable,
+            V::BadRecipient,
+            V::BelowBundleBase { amount: 1, base: 2 },
+            V::ZeroAmount,
+            V::NotTheTreasury,
+            V::BelowThreshold { have: 1, need: 2 },
+            V::DuplicateRevoker(0),
+            V::BadRevokerIndex(7),
+        ] {
+            let e = TxError::Vesting(v);
+            assert!(is_permanent(&e), "{e} is a statement about the bytes or the entry's genesis terms");
+        }
+        for v in [
+            V::BadNonce { expected: 1, actual: 0 },
+            V::NotYetVested { available: 0, want: 1 },
+            V::AlreadyRevoked,
+            V::RevokeExceedsUnvested { unvested_now: 0, want: 1 },
+            V::BondedElsewhere,
+            V::NotFreeToBond { available: 0, want: 1 },
+            V::NotBonded { bonded: 0, want: 1 },
+            V::Overflow,
+        ] {
+            let e = TxError::Vesting(v);
+            assert!(!is_permanent(&e), "{e} moves with the chain and time");
+        }
     }
 
     /// The aggregate verdicts, split: the byte-verdicts and the genesis-constant ones are

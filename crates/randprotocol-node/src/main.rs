@@ -792,19 +792,13 @@ enum VestingCmd {
         #[command(flatten)]
         staking: StakingArgs,
     },
-    /// Revoke a revocable entry: its unvested part is paid to `--to` (the treasury) and the
-    /// entry is frozen. Signed by the revoker key. The amount is what will still be unvested
-    /// `--margin-secs` after the head, so a revoke that lands a little later still fits; what
-    /// vests in the margin stays the holder's.
+    /// Revoke a revocable entry: its unvested part is paid to the treasury the entry names in
+    /// genesis and the entry is frozen. A revoke is signed by a threshold of the entry's revoker
+    /// keys (audit v6, STAKE-3), so it is three steps, like a multisig: `prepare` writes the
+    /// revoke, each revoker runs `sign` on that file, and `submit` sends it with the signatures.
     Revoke {
-        #[arg(long)]
-        entry: String,
-        #[arg(long)]
-        to: String,
-        #[arg(long, default_value_t = 600)]
-        margin_secs: u64,
-        #[command(flatten)]
-        staking: StakingArgs,
+        #[command(subcommand)]
+        cmd: RevokeCmd,
     },
     /// Bond an irrevocable entry's locked RAND as `--validator`'s stake (SAFT Schedule 2 §4).
     /// A validator not yet in the register needs `--registration` (what `rand-node register`
@@ -831,6 +825,225 @@ enum VestingCmd {
         #[command(flatten)]
         staking: StakingArgs,
     },
+}
+
+/// `rand-node vesting revoke …` (audit v6, STAKE-3): a revoke needs a threshold of the entry's
+/// revokers over one message, and that message holds a random blinding and a sealed envelope, so
+/// the revoke is written once (`prepare`) and every revoker signs that file (`sign`).
+#[derive(Subcommand)]
+enum RevokeCmd {
+    /// Write the revoke every revoker signs: the entry, the amount (what will still be unvested
+    /// `--margin-secs` after the head, so a revoke that lands a little later still fits), the
+    /// entry's nonce, the treasury note and its envelope. Needs no key. The note's `time` is the
+    /// head height, so the signatures must be gathered and submitted within the chain's time
+    /// window (256 blocks) — prepare again if that passes.
+    Prepare {
+        #[arg(long)]
+        entry: String,
+        #[arg(long, default_value_t = 600)]
+        margin_secs: u64,
+        /// Where the revoke is written (an existing file is refused).
+        #[arg(long, default_value = "revoke.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+    /// Sign a prepared revoke with one revoker key and print `<index>:<signature hex>` — what
+    /// `submit --signature` takes. Offline: it reads only the file and the key. It prints what
+    /// is being signed on stderr; compare the treasury with the genesis file before trusting it.
+    Sign {
+        #[arg(long)]
+        proposal: PathBuf,
+        /// One of the entry's revoker keys.
+        #[arg(long)]
+        key: PathBuf,
+        /// This key's position in the entry's `revokers` list. Default: looked up in the list
+        /// the prepared file carries.
+        #[arg(long)]
+        index: Option<u8>,
+    },
+    /// Send a prepared revoke with at least the entry's threshold of signatures.
+    Submit {
+        #[arg(long)]
+        proposal: PathBuf,
+        /// A `sign` step's output; repeatable, one per revoker.
+        #[arg(long = "signature", required = true, value_name = "INDEX:HEX")]
+        signatures: Vec<String>,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Return once the node accepts the transaction instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+    },
+}
+
+/// A prepared revoke (`rand-node vesting revoke prepare`): every field of the message the
+/// revokers sign, as text, so the file can be read before it is signed. `revokers` and
+/// `threshold` are the node's word at `prepare` — a convenience for `sign`'s index lookup, not
+/// part of what is signed (a wrong list yields a signature the chain refuses, nothing worse).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeProposal {
+    chain_id: u64,
+    /// The genesis hash, hex.
+    genesis: String,
+    /// The entry id, hex.
+    entry: String,
+    /// The gross amount revoked, in units, a decimal string.
+    unvested: String,
+    nonce: u64,
+    /// The treasury, `rand1…`.
+    to: String,
+    time: u32,
+    /// The note's blinding, hex.
+    r: String,
+    /// `bincode(Envelope)`, hex.
+    envelope: String,
+    #[serde(default)]
+    revokers: Vec<String>,
+    #[serde(default)]
+    threshold: u8,
+}
+
+/// A [`RevokeProposal`]'s fields as the types the ledger reads.
+struct RevokeParts {
+    chain_id: u64,
+    genesis: randprotocol_core::Hash,
+    entry: [u8; 32],
+    unvested: u64,
+    nonce: u64,
+    to: ShieldedAddress,
+    time: u32,
+    r: randprotocol_core::notes::Word8,
+    envelope: Envelope,
+}
+
+impl RevokeProposal {
+    /// Seal the treasury note and write the revoke down.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        chain_id: u64,
+        genesis: &randprotocol_core::Hash,
+        entry: &[u8; 32],
+        unvested: u64,
+        nonce: u64,
+        to: &ShieldedAddress,
+        time: u32,
+        format: EnvelopeFormat,
+    ) -> Result<RevokeProposal> {
+        let base = randprotocol_core::gas::BUNDLE_BASE;
+        anyhow::ensure!(unvested > base, "a revoke pays the {} RAND bundle base out of its amount", format_amount(base));
+        let (note, envelope) = sealed_vesting_note(to, unvested - base, time, format)?;
+        Ok(RevokeProposal {
+            chain_id,
+            genesis: genesis.to_hex(),
+            entry: hex::encode(entry),
+            unvested: unvested.to_string(),
+            nonce,
+            to: to.to_string(),
+            time,
+            r: word8_to_hex(&note.r),
+            envelope: hex::encode(bincode::serialize(&envelope).context("encoding the envelope")?),
+            revokers: Vec::new(),
+            threshold: 0,
+        })
+    }
+
+    fn read(path: &std::path::Path) -> Result<RevokeProposal> {
+        serde_json::from_str(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?)
+            .with_context(|| format!("{} is not a prepared revoke", path.display()))
+    }
+
+    fn parts(&self) -> Result<RevokeParts> {
+        Ok(RevokeParts {
+            chain_id: self.chain_id,
+            genesis: randprotocol_core::Hash::from_hex(&self.genesis).map_err(|e| anyhow::anyhow!("genesis: {e}"))?,
+            entry: parse_entry_id(&self.entry)?,
+            unvested: self.unvested.parse().with_context(|| format!("unvested: {} is not an amount in units", self.unvested))?,
+            nonce: self.nonce,
+            to: ShieldedAddress::parse(&self.to).map_err(|e| anyhow::anyhow!("to: {e}"))?,
+            time: self.time,
+            r: randprotocol_core::notes::word8_from_hex(&self.r).context("r: not a 32-byte hex blinding")?,
+            envelope: bincode::deserialize(&hex::decode(&self.envelope).context("envelope: not hex")?).context("envelope: not an envelope")?,
+        })
+    }
+
+    /// One revoker's signature over this revoke, as `<index>:<signature hex>`. `index` absent,
+    /// the key is looked up in the file's `revokers`.
+    fn sign(&self, kp: &Keypair, index: Option<u8>) -> Result<String> {
+        let index = match index {
+            Some(i) => i,
+            None => {
+                let me = kp.address().to_base58();
+                let at = self.revokers.iter().position(|r| *r == me).with_context(|| {
+                    format!("this key ({me}) is not among the revokers the prepared file lists; pass --index if the file's list is wrong")
+                })?;
+                at as u8
+            }
+        };
+        let signature = kp.sign(self.parts()?.message().as_bytes());
+        Ok(format!("{index}:{}", hex::encode(signature.as_bytes())))
+    }
+
+    /// The transaction's action with `signatures` (each a `sign` step's output), in index
+    /// order. Refuses what the chain would: a position named twice.
+    fn action(&self, signatures: &[String]) -> Result<randprotocol_core::Action> {
+        use randprotocol_core::types::actions::RevokerSignature;
+        let mut list = Vec::with_capacity(signatures.len());
+        for s in signatures {
+            let (index, sig) = s.trim().split_once(':').with_context(|| format!("--signature takes <index>:<hex>, got {s}"))?;
+            let index: u8 = index.parse().with_context(|| format!("--signature index: {index}"))?;
+            let signature = randprotocol_core::crypto::Signature::from_bytes(&hex::decode(sig).context("--signature: not hex")?)
+                .map_err(|e| anyhow::anyhow!("--signature {index}: {e}"))?;
+            anyhow::ensure!(list.iter().all(|x: &RevokerSignature| x.index != index), "revoker {index} is given twice");
+            list.push(RevokerSignature { index, signature });
+        }
+        list.sort_by_key(|x| x.index);
+        let p = self.parts()?;
+        Ok(randprotocol_core::Action::RevokeVesting {
+            entry: p.entry,
+            unvested: p.unvested,
+            nonce: p.nonce,
+            to: p.to,
+            time: p.time,
+            r: p.r,
+            envelope: p.envelope,
+            signatures: list,
+        })
+    }
+}
+
+impl RevokeParts {
+    fn message(&self) -> randprotocol_core::Hash {
+        randprotocol_core::types::actions::revoke_vesting_message(
+            &self.genesis,
+            self.chain_id,
+            &self.entry,
+            self.unvested,
+            self.nonce,
+            &self.to,
+            self.time,
+            &self.r,
+            &self.envelope,
+        )
+    }
+}
+
+/// The `--vesting` file: the section, its rules (`VestingConfig::check`), and — what the core
+/// crate cannot test — that every treasury's ML-KEM key decodes, so the revoke that pays it can
+/// be sealed at all.
+fn read_vesting_config(path: &std::path::Path) -> Result<randprotocol_core::ledger::vesting::VestingConfig> {
+    let cfg: randprotocol_core::ledger::vesting::VestingConfig =
+        serde_json::from_str(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?)
+            .with_context(|| format!("{} is not a valid vesting config", path.display()))?;
+    cfg.check().map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    for e in &cfg.entries {
+        if let Some(t) = e.treasury_address() {
+            randprotocol_zkvm::address::to_research(&t)
+                .map_err(|why| anyhow::anyhow!("{}: entry {}: the treasury cannot be sealed to: {why}", path.display(), hex::encode(e.id)))?;
+        }
+    }
+    Ok(cfg)
 }
 
 /// A 64-hex vesting entry id.
@@ -1042,12 +1255,7 @@ async fn main() -> Result<()> {
                 // Genesis vesting: read from a `VestingConfig` JSON file when `--vesting` is given
                 // (`Genesis::build` validates it); omitted entirely otherwise.
                 vesting: match &vesting {
-                    Some(path) => Some(
-                        serde_json::from_str::<randprotocol_core::ledger::vesting::VestingConfig>(
-                            &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
-                        )
-                        .with_context(|| format!("{} is not a valid vesting config", path.display()))?,
-                    ),
+                    Some(path) => Some(read_vesting_config(path)?),
                     None => None,
                 },
                 // The v0.6 `hardening_v6` switch: absent unless asked for, so a genesis cut without
@@ -1449,36 +1657,80 @@ async fn main() -> Result<()> {
                 let action = randprotocol_core::Action::ClaimVested { entry: id, amount, nonce, to, time, r: note.r, envelope, signature };
                 submit_staking(&staking, chain_id, action, &format!("claim of {} RAND", format_amount(amount))).await?;
             }
-            VestingCmd::Revoke { entry, to, margin_secs, staking } => {
-                use randprotocol_core::types::actions::revoke_vesting_message;
-                let kp = load_keypair(&staking.key)?;
-                let id = parse_entry_id(&entry)?;
-                let to = ShieldedAddress::parse(&to).map_err(|e| anyhow::anyhow!("{to} is not a shielded address: {e}"))?;
-                let rpc = RpcClient::new(staking.rpc.clone());
-                let now = vesting_entry(&rpc, &id, None).await?;
-                anyhow::ensure!(now["revocable"] == serde_json::json!(true), "entry {entry} has no revoker: it is irrevocable");
-                anyhow::ensure!(now["revoked_at"].is_null(), "entry {entry} is already revoked");
-                let head_ms = now["as_of_ms"].as_u64().context("the node's vesting reply has no as_of_ms")?;
-                let at = head_ms.saturating_add(margin_secs.saturating_mul(1_000));
-                let unvested = amount_field(&vesting_entry(&rpc, &id, Some(at)).await?, "unvested_now")?;
-                let base = randprotocol_core::gas::BUNDLE_BASE;
-                anyhow::ensure!(unvested > base, "nothing left to revoke: {} RAND unvested {margin_secs} s from now", format_amount(unvested));
-                let nonce = now["nonce"].as_u64().context("the node's vesting reply has no nonce")?;
-                let chain_id = rpc.chain_id().await?;
-                let genesis = rpc.genesis_hash().await?;
-                let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
-                let (note, envelope) = sealed_vesting_note(&to, unvested - base, time, envelope_format(&rpc, chain_id).await?)?;
-                let signature = kp.sign(
-                    revoke_vesting_message(&genesis, chain_id, &id, unvested, nonce, &to, time, &note.r, &envelope).as_bytes(),
-                );
-                println!(
-                    "revoking entry {entry}: {} RAND unvested ({margin_secs} s margin) to {to}; the holder keeps everything vested by then",
-                    format_amount(unvested)
-                );
-                let action =
-                    randprotocol_core::Action::RevokeVesting { entry: id, unvested, nonce, to, time, r: note.r, envelope, signature };
-                submit_staking(&staking, chain_id, action, &format!("revoke of {} RAND", format_amount(unvested))).await?;
-            }
+            VestingCmd::Revoke { cmd } => match cmd {
+                RevokeCmd::Prepare { entry, margin_secs, out, rpc } => {
+                    anyhow::ensure!(!out.exists(), "{} exists: a prepared revoke is never overwritten", out.display());
+                    let id = parse_entry_id(&entry)?;
+                    let rpc = RpcClient::new(rpc);
+                    let now = vesting_entry(&rpc, &id, None).await?;
+                    anyhow::ensure!(now["revocable"] == serde_json::json!(true), "entry {entry} has no revoker: it is irrevocable");
+                    anyhow::ensure!(now["revoked_at"].is_null(), "entry {entry} is already revoked");
+                    // A revoke pays the entry's treasury and no other address (STAKE-3): there
+                    // is nothing to choose, so there is no `--to`.
+                    let treasury = now["treasury"].as_str().context("the node's vesting reply has no treasury")?;
+                    let to = ShieldedAddress::parse(treasury).map_err(|e| anyhow::anyhow!("the entry's treasury {treasury}: {e}"))?;
+                    let head_ms = now["as_of_ms"].as_u64().context("the node's vesting reply has no as_of_ms")?;
+                    let at = head_ms.saturating_add(margin_secs.saturating_mul(1_000));
+                    let unvested = amount_field(&vesting_entry(&rpc, &id, Some(at)).await?, "unvested_now")?;
+                    let base = randprotocol_core::gas::BUNDLE_BASE;
+                    anyhow::ensure!(unvested > base, "nothing left to revoke: {} RAND unvested {margin_secs} s from now", format_amount(unvested));
+                    let nonce = now["nonce"].as_u64().context("the node's vesting reply has no nonce")?;
+                    let chain_id = rpc.chain_id().await?;
+                    let genesis = rpc.genesis_hash().await?;
+                    let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
+                    let mut proposal =
+                        RevokeProposal::new(chain_id, &genesis, &id, unvested, nonce, &to, time, envelope_format(&rpc, chain_id).await?)?;
+                    proposal.revokers = now["revokers"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
+                    proposal.threshold = now["threshold"].as_u64().unwrap_or(0) as u8;
+                    std::fs::write(&out, serde_json::to_string_pretty(&proposal)?).with_context(|| format!("writing {}", out.display()))?;
+                    println!(
+                        "prepared the revoke of entry {entry}: {} RAND unvested ({margin_secs} s margin) to the treasury {}\n  written to {}: {} of {} revokers sign it (`vesting revoke sign`), then `vesting revoke submit`, within 256 blocks of height {time}",
+                        format_amount(unvested),
+                        to.fingerprint(),
+                        out.display(),
+                        proposal.threshold,
+                        proposal.revokers.len(),
+                    );
+                }
+                RevokeCmd::Sign { proposal, key, index } => {
+                    let kp = load_keypair(&key)?;
+                    let proposal = RevokeProposal::read(&proposal)?;
+                    let p = proposal.parts()?;
+                    // stderr, so stdout is exactly the signature line a script passes on.
+                    eprintln!(
+                        "signing the revoke of entry {} on chain {} (genesis {}):\n  {} RAND unvested, nonce {}, note time {}\n  paid to {} (fingerprint {})\n  check that address against the entry's `treasury` in the genesis file",
+                        proposal.entry,
+                        p.chain_id,
+                        proposal.genesis,
+                        format_amount(p.unvested),
+                        p.nonce,
+                        p.time,
+                        proposal.to,
+                        p.to.fingerprint(),
+                    );
+                    println!("{}", proposal.sign(&kp, index)?);
+                }
+                RevokeCmd::Submit { proposal, signatures, rpc, no_wait } => {
+                    let proposal = RevokeProposal::read(&proposal)?;
+                    let action = proposal.action(&signatures)?;
+                    let rpc = RpcClient::new(rpc);
+                    let chain_id = rpc.chain_id().await?;
+                    anyhow::ensure!(chain_id == proposal.chain_id, "the revoke was prepared for chain {}, this node serves chain {chain_id}", proposal.chain_id);
+                    let unvested = proposal.parts()?.unvested;
+                    let tx = randprotocol_core::Transaction { chain_id, bundle: None, action };
+                    let hash = rpc.send_transaction(&tx).await?;
+                    let what = format!("revoke of {} RAND", format_amount(unvested));
+                    if no_wait {
+                        println!("submitted {what} {hash}");
+                    } else {
+                        let receipt = rpc.wait_for_transaction(&hash, wallet::COMMIT_TIMEOUT).await?;
+                        println!("submitted {what} {hash}\n  committed in block {}", receipt.height);
+                    }
+                }
+            },
             VestingCmd::Bond { entry, validator, amount, registration, staking } => {
                 use randprotocol_core::types::actions::{bond_vested_message, Registration};
                 let kp = load_keypair(&staking.key)?;
@@ -2875,7 +3127,9 @@ mod tests {
                 id: [1; 32],
                 class: Class::Partner,
                 beneficiary: key.public_key().clone(),
-                revoker: None,
+                revokers: Vec::new(),
+                threshold: None,
+                treasury: None,
                 amount: 10 * UNITS_PER_RAND,
                 start_ms: 0,
                 cliff_ms: 0,
@@ -2898,12 +3152,21 @@ mod tests {
         let start = doc.find("```json\n{\n  \"entries\"").expect("docs/vesting.md carries the example file");
         let body = &doc[start + "```json\n".len()..];
         let mut json = body[..body.find("```").unwrap()].to_string();
-        // The keys are `"<…>"` placeholders in the doc: stand a real one in for each.
+        // The keys and the treasury are `"<…>"` placeholders in the doc: stand a real one in
+        // for each (a distinct key per revoker: the section refuses one listed twice).
         let key = Keypair::from_seed([6; 32]).unwrap().public_key().to_hex();
-        let revoker = Keypair::from_seed([7; 32]).unwrap().public_key().to_hex();
+        let treasury = pinned_payee().to_string();
+        let mut revokers = 0u8;
         while let Some(a) = json.find("\"<") {
             let b = a + json[a..].find(">\"").unwrap() + 2;
-            let k = if json[a..b].contains("revoker") { &revoker } else { &key };
+            let k = if json[a..b].contains("revoker") {
+                revokers += 1;
+                Keypair::from_seed([6 + revokers; 32]).unwrap().public_key().to_hex()
+            } else if json[a..b].contains("treasury") {
+                treasury.clone()
+            } else {
+                key.clone()
+            };
             json.replace_range(a..b, &format!("\"{k}\""));
         }
         let cfg: randprotocol_core::ledger::vesting::VestingConfig = serde_json::from_str(&json).expect("the example parses");
@@ -2913,7 +3176,97 @@ mod tests {
         let founding = &cfg.entries[0];
         const MONTH: u64 = 30 * 86_400_000;
         assert_eq!((founding.cliff_ms, founding.linear_ms, founding.step_ms), (12 * MONTH, 18 * MONTH, Some(MONTH)));
-        assert!(founding.revoker.is_none() && cfg.entries[1].revoker.is_some(), "investor irrevocable, team revocable");
+        let team = &cfg.entries[1];
+        assert!(founding.revokers.is_empty() && founding.treasury.is_none(), "investor irrevocable");
+        assert_eq!((team.revokers.len(), team.threshold, team.treasury.as_deref()), (3, Some(2), Some(treasury.as_str())), "team revocable, 2 of 3, to the treasury");
+        // `rand-node genesis --vesting` reads the file through the same function the test does.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vesting.json");
+        std::fs::write(&path, &json).unwrap();
+        assert_eq!(read_vesting_config(&path).unwrap(), cfg);
+        // A treasury whose ML-KEM key does not decode is an address nobody can seal a revoke's
+        // note to: the core crate checks its length, the CLI its key.
+        let junk = ShieldedAddress { pk: [1; 8], kem_ek: vec![0xff; randprotocol_core::notes::KEM_EK_BYTES] }.to_string();
+        std::fs::write(&path, json.replace(&treasury, &junk)).unwrap();
+        let err = format!("{:#}", read_vesting_config(&path).unwrap_err());
+        assert!(err.contains("the treasury cannot be sealed to"), "{err}");
+    }
+
+    /// Audit v6, STAKE-3: `vesting revoke prepare` → `sign` (per revoker) → `submit` builds the
+    /// action the ledger accepts — the treasury's note sealed by the first step, one message
+    /// for every signer, the signatures in index order — and the treasury's wallet opens the
+    /// note. One signature of a 2-of-3 entry is refused by the chain, as is a revoke paying any
+    /// address but the entry's treasury.
+    #[test]
+    fn a_prepared_revoke_signed_by_a_threshold_is_the_revoke_the_ledger_accepts() {
+        use randprotocol_core::ledger::vesting::{Class, VestingConfig, VestingEntryConfig, VestingError, VestingRegister};
+        use randprotocol_core::ledger::TxError;
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let treasury_key = SpendKey([9; 8]);
+        let treasury = randprotocol_zkvm::address::address_of(&treasury_key.viewing_key());
+        let revokers: Vec<Keypair> = (20..23u8).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect();
+        let mut ledger = pinned_genesis().build(&ex).unwrap().ledger;
+        ledger.set_vesting(Some(VestingRegister::from_config(&VestingConfig {
+            entries: vec![VestingEntryConfig {
+                id: [1; 32],
+                class: Class::Team,
+                beneficiary: Keypair::from_seed([4; 32]).unwrap().public_key().clone(),
+                revokers: revokers.iter().map(|k| k.public_key().clone()).collect(),
+                threshold: Some(2),
+                treasury: Some(treasury.to_string()),
+                amount: 10 * UNITS_PER_RAND,
+                start_ms: ledger.timestamp_ms(),
+                cliff_ms: 0,
+                linear_ms: 1_000_000,
+                step_ms: None,
+            }],
+        })));
+        let (chain_id, genesis, time) = (ledger.chain_id(), ledger.signing_domain().genesis, ledger.height() as u32);
+        let unvested = 9 * UNITS_PER_RAND;
+        let prepare = |to: &ShieldedAddress| {
+            let mut p = RevokeProposal::new(chain_id, &genesis, &[1; 32], unvested, 0, to, time, EnvelopeFormat::Legacy).unwrap();
+            p.revokers = revokers.iter().map(|k| k.address().to_base58()).collect();
+            p.threshold = 2;
+            // Through the file, as the three steps pass it.
+            serde_json::from_str::<RevokeProposal>(&serde_json::to_string_pretty(&p).unwrap()).unwrap()
+        };
+        let p = prepare(&treasury);
+        // Each revoker finds its own position in the file's list; a key outside it is told so.
+        let sigs: Vec<String> = revokers.iter().map(|k| p.sign(k, None).unwrap()).collect();
+        assert!(sigs[2].starts_with("2:"), "{}", &sigs[2][..8]);
+        assert!(p.sign(&Keypair::from_seed([99; 32]).unwrap(), None).unwrap_err().to_string().contains("not among the revokers"));
+        let tx = |action| randprotocol_core::Transaction { chain_id, bundle: None, action };
+        let verdict = |t: &randprotocol_core::Transaction| match ledger.validate(t, &ex) {
+            Err(TxError::Vesting(v)) => Err(v),
+            Err(other) => panic!("only a vesting refusal is expected here, got {other:?}"),
+            Ok(_) => Ok(()),
+        };
+        // 2 of 3, given out of order: accepted, the list in index order.
+        let revoke = tx(p.action(&[sigs[2].clone(), sigs[0].clone()]).unwrap());
+        let randprotocol_core::Action::RevokeVesting { signatures, r, envelope, .. } = &revoke.action else { panic!("a revoke") };
+        assert_eq!(signatures.iter().map(|s| s.index).collect::<Vec<_>>(), [0, 2]);
+        assert_eq!(verdict(&revoke), Ok(()));
+        // The note is the one the treasury's wallet opens.
+        let cm = ledger.derived_commitment(&revoke.action, &ex).expect("a revoke creates a note");
+        let (_, opened) = randprotocol_zkvm::address::envelope_from_core(envelope)
+            .open_as_receiver(cm, &treasury_key.viewing_key())
+            .expect("the treasury's wallet opens the revoke's note");
+        assert_eq!((opened.amount, opened.r), (unvested - randprotocol_core::gas::BUNDLE_BASE, *r));
+        // 1 of 3 is refused by the chain; the same revoker twice, by `submit` itself.
+        assert_eq!(verdict(&tx(p.action(&sigs[..1]).unwrap())), Err(VestingError::BelowThreshold { have: 1, need: 2 }));
+        assert!(p.action(&[sigs[0].clone(), sigs[0].clone()]).unwrap_err().to_string().contains("given twice"));
+        // A key signing under a position that is not its own.
+        let misplaced = p.sign(&revokers[0], Some(1)).unwrap();
+        assert_eq!(verdict(&tx(p.action(&[sigs[0].clone(), misplaced]).unwrap())), Err(VestingError::BadSignature));
+        // Prepared for any other address — every revoker signing it — it is refused.
+        let elsewhere = randprotocol_zkvm::address::address_of(&SpendKey([8; 8]).viewing_key());
+        let q = prepare(&elsewhere);
+        let all: Vec<String> = revokers.iter().map(|k| q.sign(k, None).unwrap()).collect();
+        assert_eq!(verdict(&tx(q.action(&all).unwrap())), Err(VestingError::NotTheTreasury));
+        // A file edited after it was signed is another message.
+        let mut edited = p.clone();
+        edited.unvested = (unvested - 1).to_string();
+        assert_eq!(verdict(&tx(edited.action(&sigs[..2]).unwrap())), Err(VestingError::BadSignature));
     }
 
     /// Two allocations of the same amount to the same address are two different notes. A

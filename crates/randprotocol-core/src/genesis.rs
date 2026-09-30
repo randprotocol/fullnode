@@ -1164,12 +1164,21 @@ impl Genesis {
                 commit.extend_from_slice(e.class.as_str().as_bytes());
                 commit.push(0);
                 commit.extend_from_slice(e.beneficiary.as_bytes());
-                match &e.revoker {
-                    Some(r) => {
-                        commit.push(1);
+                // Audit v6, STAKE-3: the revokers' count (0 = irrevocable, and then nothing
+                // more), the threshold, each key in file order — a revoke names its signers by
+                // position, so the order is a term — and the treasury's two fields. `validate`
+                // has held the keys and the address to their lengths and made the threshold and
+                // the treasury present, so every field is fixed-width.
+                commit.push(e.revokers.len() as u8);
+                if !e.revokers.is_empty() {
+                    commit.push(e.threshold.unwrap_or(0));
+                    for r in &e.revokers {
                         commit.extend_from_slice(r.as_bytes());
                     }
-                    None => commit.push(0),
+                    if let Some(t) = e.treasury_address() {
+                        commit.extend_from_slice(&word8_to_bytes(&t.pk));
+                        commit.extend_from_slice(&t.kem_ek);
+                    }
                 }
                 for w in [e.amount, e.start_ms, e.cliff_ms, e.linear_ms] {
                     commit.extend_from_slice(&w.to_be_bytes());
@@ -3787,7 +3796,9 @@ mod tests {
             id: [id; 32],
             class: crate::ledger::vesting::Class::Investor,
             beneficiary: Keypair::from_seed([50 + id; 32]).unwrap().public_key().clone(),
-            revoker: None,
+            revokers: Vec::new(),
+            threshold: None,
+            treasury: None,
             amount,
             start_ms: 1_700_000_000_000,
             cliff_ms: 1_000,
@@ -3840,7 +3851,7 @@ mod tests {
             with(|e| e.id = [9; 32]),
             with(|e| e.class = crate::ledger::vesting::Class::Team),
             with(|e| e.beneficiary = Keypair::from_seed([99; 32]).unwrap().public_key().clone()),
-            with(|e| e.revoker = Some(Keypair::from_seed([98; 32]).unwrap().public_key().clone())),
+            with(|e| revocable(e, &[98], 1, 3)),
             with(|e| e.amount += 1),
             with(|e| e.start_ms += 1),
             with(|e| e.cliff_ms += 1),
@@ -3850,6 +3861,68 @@ mod tests {
         for (i, h) in moved.iter().enumerate() {
             assert_ne!(*h, gs.hash(), "field {i} must be in the genesis binding");
         }
+        // Audit v6, STAKE-3: who may revoke, how many of them it takes and where a revoke pays
+        // are each in the binding — and so is the revokers' order, which a revoke's signer
+        // indices read.
+        let base = with(|e| revocable(e, &[97, 98, 99], 2, 3));
+        let moved = [
+            with(|e| revocable(e, &[97, 98, 96], 2, 3)),
+            with(|e| revocable(e, &[98, 97, 99], 2, 3)),
+            with(|e| revocable(e, &[97, 98], 2, 3)),
+            with(|e| revocable(e, &[97, 98, 99], 3, 3)),
+            with(|e| revocable(e, &[97, 98, 99], 2, 4)),
+        ];
+        for (i, h) in moved.iter().enumerate() {
+            assert_ne!(*h, base, "revocation term {i} must be in the genesis binding");
+        }
+        // …and in the register's root: the treasury is part of the entry.
+        let root = |f: fn(&mut crate::ledger::vesting::VestingEntryConfig)| {
+            let mut x = g.clone();
+            f(&mut x.vesting.as_mut().unwrap().entries[0]);
+            build(&x).ledger.vesting().unwrap().root()
+        };
+        assert_ne!(root(|e| revocable(e, &[97, 98, 99], 2, 3)), root(|e| revocable(e, &[97, 98, 99], 2, 4)));
+    }
+
+    /// Make `e` revocable by `threshold` of the keys seeded by `seeds`, paying the treasury
+    /// `payout(treasury)`.
+    fn revocable(e: &mut crate::ledger::vesting::VestingEntryConfig, seeds: &[u8], threshold: u8, treasury: u8) {
+        e.class = crate::ledger::vesting::Class::Team;
+        e.revokers = seeds.iter().map(|s| Keypair::from_seed([*s; 32]).unwrap().public_key().clone()).collect();
+        e.threshold = Some(threshold);
+        e.treasury = Some(payout(treasury));
+    }
+
+    /// Audit v6, STAKE-3: a revocable entry without a treasury — the address a revoke pays — is
+    /// refused at the file, and so is every other malformed revoker set. Before, an entry named
+    /// one key and no destination, and that key's holder chose where the unvested part went.
+    #[test]
+    fn a_revocable_vesting_entry_without_a_treasury_is_refused() {
+        let with = |f: fn(&mut crate::ledger::vesting::VestingEntryConfig)| {
+            let mut e = vesting_entry(1, 5);
+            revocable(&mut e, &[97, 98, 99], 2, 3);
+            f(&mut e);
+            vested_genesis(vec![e]).validate()
+        };
+        assert!(with(|_| ()).is_ok(), "{:?}", with(|_| ()));
+        let refused = |r: Result<(), GenesisError>, what: &str| match r {
+            Err(GenesisError::BadVesting(why)) => assert!(why.contains(what), "{why:?} should mention {what:?}"),
+            other => panic!("expected a vesting refusal mentioning {what:?}, got {other:?}"),
+        };
+        refused(with(|e| e.treasury = None), "needs a treasury");
+        refused(with(|e| e.treasury = Some("rand1nonsense".into())), "not a shielded address");
+        refused(with(|e| e.threshold = None), "needs a threshold");
+        refused(with(|e| e.threshold = Some(0)), "outside 1..=3");
+        refused(with(|e| e.threshold = Some(4)), "outside 1..=3");
+        refused(with(|e| e.revokers[2] = e.revokers[0].clone()), "listed twice");
+        refused(with(|e| e.revokers[1] = e.beneficiary.clone()), "its own revoker");
+        refused(with(|e| revocable(e, &[91, 92, 93, 94, 95, 96], 2, 3)), "at most 5");
+        // An irrevocable entry names neither: a treasury or a threshold with no revoker is a
+        // file that means something other than it says.
+        refused(with(|e| e.revokers.clear()), "without revokers");
+        // One key with threshold 1 is still expressible (and five keys are the most).
+        assert!(with(|e| revocable(e, &[97], 1, 3)).is_ok());
+        assert!(with(|e| revocable(e, &[91, 92, 93, 94, 95], 5, 3)).is_ok());
     }
 
     #[test]

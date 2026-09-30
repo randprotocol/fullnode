@@ -245,8 +245,19 @@ pub fn claim_vested_message(
     Hash::digest_domain(b"rand-vest-claim-1", &bytes)
 }
 
-/// What a vesting entry's revoker signs (`RevokeVesting`, spec §6.2): as a claim, with the exact
-/// unvested amount the treasury note carries in place of the claimed amount.
+/// One revoker's signature on a `RevokeVesting` (audit v6, STAKE-3): `index` is the signer's
+/// position in the entry's genesis `revokers` list, `signature` its Dilithium2 signature over
+/// [`revoke_vesting_message`] — the same message for every signer. A revoke carries at least the
+/// entry's `threshold` of them, no revoker twice.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokerSignature {
+    pub index: u8,
+    pub signature: Signature,
+}
+
+/// What each of a vesting entry's revokers signs (`RevokeVesting`, spec §6.2): as a claim, with
+/// the exact unvested amount the treasury note carries in place of the claimed amount. `to` is in
+/// the message and must be the entry's genesis treasury (audit v6, STAKE-3).
 #[allow(clippy::too_many_arguments)]
 pub fn revoke_vesting_message(
     genesis: &Hash,

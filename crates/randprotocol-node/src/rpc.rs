@@ -1819,15 +1819,19 @@ fn bundle_json(b: &randprotocol_core::Bundle) -> Value {
 /// One vesting entry as `rand_getVesting` serves it (genesis vesting): its genesis terms, what
 /// happened to it, and what the schedule says at `t_ms` in `epoch` — amounts as decimal strings.
 /// The keys are served as their addresses (a Dilithium2 key is 1 312 bytes); nothing names the
-/// holder.
+/// holder. A revocable entry also serves its revokers, its threshold and its treasury.
 fn vesting_entry_json(e: &randprotocol_core::ledger::vesting::Entry, t_ms: u64, epoch: u64) -> Value {
     use randprotocol_core::ledger::vesting::{claimable, unvested, vested};
     json!({
         "id": hex::encode(e.id),
         "class": e.class.as_str(),
         "beneficiary": e.beneficiary.address().to_base58(),
-        "revocable": e.revoker.is_some(),
-        "revoker": e.revoker.as_ref().map(|k| k.address().to_base58()),
+        "revocable": e.is_revocable(),
+        // Audit v6, STAKE-3: who may revoke (addresses, in the order a revoke's signer indices
+        // count them), how many of them it takes, and the one address a revoke pays.
+        "revokers": e.revokers.iter().map(|k| k.address().to_base58()).collect::<Vec<_>>(),
+        "threshold": e.threshold,
+        "treasury": e.treasury.as_ref().map(|t| t.to_string()),
         "amount": e.amount.to_string(),
         "start_ms": e.start_ms,
         "cliff_ms": e.cliff_ms,
@@ -2042,8 +2046,11 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
         Action::ClaimVested { entry, amount, nonce, time, .. } => json!({
             "kind": "claim_vested", "entry": hex::encode(entry), "amount": amount.to_string(), "nonce": nonce, "time": time
         }),
-        Action::RevokeVesting { entry, unvested, nonce, time, .. } => json!({
-            "kind": "revoke_vesting", "entry": hex::encode(entry), "unvested": unvested.to_string(), "nonce": nonce, "time": time
+        // The signers are named by their position in the entry's `revokers` (`rand_getVesting`);
+        // the recipient is the entry's treasury by rule, so it is not repeated here.
+        Action::RevokeVesting { entry, unvested, nonce, time, signatures, .. } => json!({
+            "kind": "revoke_vesting", "entry": hex::encode(entry), "unvested": unvested.to_string(), "nonce": nonce, "time": time,
+            "signers": signatures.iter().map(|s| s.index).collect::<Vec<_>>()
         }),
         Action::BondVested { entry, validator, amount, registration, nonce, .. } => json!({
             "kind": "bond_vested", "entry": hex::encode(entry), "validator": validator.to_base58(),
@@ -4938,16 +4945,23 @@ mod tests {
             id: [id; 32],
             class,
             beneficiary: holder.public_key().clone(),
-            revoker: None,
+            revokers: Vec::new(),
+            threshold: None,
+            treasury: None,
             amount,
             start_ms: 0,
             cliff_ms: 0,
             linear_ms,
             step_ms: None,
         };
-        g.vesting = Some(VestingConfig {
-            entries: vec![entry(7, Class::Investor, 10 * rand, 2), entry(8, Class::Team, 4 * rand, 1_000)],
-        });
+        // Audit v6, STAKE-3: the team entry is revocable by 2 of 3 keys, to a treasury.
+        let mut team = entry(8, Class::Team, 4 * rand, 1_000);
+        let revokers = [key(50), key(51), key(52)];
+        let treasury = ShieldedAddress { pk: [6; 8], kem_ek: vec![6; randprotocol_core::notes::KEM_EK_BYTES] };
+        team.revokers = revokers.iter().map(|k| k.public_key().clone()).collect();
+        team.threshold = Some(2);
+        team.treasury = Some(treasury.to_string());
+        g.vesting = Some(VestingConfig { entries: vec![entry(7, Class::Investor, 10 * rand, 2), team] });
         let gs = g.build(&StubExecutor).unwrap();
         let (_d, st) = state_for(&gs);
         let mut ledger = gs.ledger.clone();
@@ -4969,6 +4983,11 @@ mod tests {
         assert_eq!(v["class"], "investor");
         assert_eq!(v["beneficiary"], holder.address().to_base58());
         assert_eq!(v["revocable"], false);
+        assert_eq!((v["revokers"].clone(), v["threshold"].clone(), v["treasury"].clone()), (json!([]), json!(0), Value::Null));
+        let t = ok(&st, "rand_getVesting", json!(["08".repeat(32)])).await;
+        assert_eq!(t["revocable"], true);
+        assert_eq!(t["revokers"], json!(revokers.iter().map(|k| k.address().to_base58()).collect::<Vec<_>>()), "in list order");
+        assert_eq!((t["threshold"].clone(), t["treasury"].clone()), (json!(2), json!(treasury.to_string())));
         assert_eq!(v["amount"], (10 * rand).to_string());
         assert_eq!(v["claimed"], (5 * rand).to_string());
         assert_eq!(v["vested_now"], (5 * rand).to_string(), "t = 1 of 2");
@@ -5266,10 +5285,12 @@ mod tests {
             time: 9,
             r: [0; 8],
             envelope: env,
-            signature: Signature::empty(),
+            signatures: [0u8, 2]
+                .iter()
+                .map(|i| randprotocol_core::types::actions::RevokerSignature { index: *i, signature: Signature::empty() })
+                .collect(),
         });
-        assert_eq!(revoke["kind"], "revoke_vesting");
-        assert_eq!(revoke["unvested"], "7");
+        assert_eq!(revoke, json!({ "kind": "revoke_vesting", "entry": "ab".repeat(32), "unvested": "7", "nonce": 3, "time": 9, "signers": [0, 2] }));
         let bond = bundle_less(Action::BondVested {
             entry: [1; 32],
             validator: Address([2; 32]),

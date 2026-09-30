@@ -984,7 +984,8 @@ Params: `[id, at_ms?]` — the entry's 64-hex id, and optionally the time to eva
 (default: the head block's timestamp). Result, genesis vesting (`docs/vesting.md`):
 
 ```json
-{ "id": "3f9a…", "class": "investor", "beneficiary": "<address>", "revocable": false, "revoker": null,
+{ "id": "3f9a…", "class": "investor", "beneficiary": "<address>", "revocable": false,
+  "revokers": [], "threshold": 0, "treasury": null,
   "amount": "18000000000000000", "start_ms": 1790000000000, "cliff_ms": 31104000000,
   "linear_ms": 46656000000, "step_ms": 2592000000,
   "claimed": "0", "revoked_out": "0", "revoked_at": null,
@@ -992,7 +993,9 @@ Params: `[id, at_ms?]` — the entry's 64-hex id, and optionally the time to eva
   "vested_now": "0", "claimable_now": "0", "unvested_now": "18000000000000000", "as_of_ms": 1790000000000 }
 ```
 
-Keys are served as their addresses. `claimable_now` is what a `claim_vested` may take: vested,
+Keys are served as their addresses. A revocable entry lists its `revokers` in the order a revoke's
+signer indices count them, the `threshold` of them a revoke needs, and the `treasury` (`rand1…`) a
+revoke pays — the only address it may pay. `claimable_now` is what a `claim_vested` may take: vested,
 unclaimed, and neither bonded nor still unbonding. `null` for an id the register does not hold;
 `{"enabled": false}` on a chain without a `vesting` section.
 
@@ -1503,6 +1506,22 @@ there, and the RPC went on serving it.
   unchanged.
 - **`rand_getBridgeState.rules_v2`** gains `global_minted_in_window` and `global_mint_headroom`
   (decimal strings).
+
+### 2026-09-30 — audit v6: a vesting revoke pays a pinned treasury, signed by a threshold (STAKE-3; genesis-gated, on no chain)
+
+No chain has carried a `vesting` section, so nothing a client reads today moves.
+
+- **`rand_getVesting`**: `revoker` (one address or `null`) is replaced by `revokers` (addresses, in
+  the order a revoke's signer indices count them; `[]` for an irrevocable entry), `threshold`
+  (how many of them a revoke needs; `0` when irrevocable) and `treasury` (the `rand1…` address a
+  revoke pays, the only one it may; `null` when irrevocable). `revocable` is unchanged.
+- **`revoke_vesting`** in `rand_getTransaction` gains `signers`: the positions, in the entry's
+  `revokers`, of the keys that signed it. The action's wire form changed (one `signature` became
+  a list of `(index, signature)`), which no chain has ever admitted.
+- **Refusals a submitter may hear** (all permanent — they are the transaction's bytes against the
+  entry's genesis terms): `a revoke pays the entry's treasury, not the address it names`,
+  `N revoker signatures, the entry needs M`, `revoker I signed twice`, `revoker index I is not in
+  the entry's list`.
 
 ### 2026-09-28 — gas (Phase 1 + Phase 2): the chain's own `gas` section, and the tip's moving prices
 

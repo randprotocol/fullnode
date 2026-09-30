@@ -192,11 +192,15 @@ prints the public key that goes into the genesis entry.
 |---|---|---|
 | `vesting status <id>` | `--rpc` | the entry as `rand_getVesting` serves it |
 | `vesting claim` | `--entry <id>`, `--to <rand1…>`, `--amount <RAND>` or `--all`, `--key`, `--rpc`, `--no-wait` | pay what has unlocked into a note at `--to`, less the 0.001 RAND base; the beneficiary key signs, `--to` included |
-| `vesting revoke` | `--entry`, `--to <treasury rand1…>`, `--margin-secs` (600), `--key`, … | revoker key: pay the part still unvested `--margin-secs` past the head to `--to` and freeze the entry |
+| `vesting revoke prepare` | `--entry`, `--margin-secs` (600), `--out` (`revoke.json`), `--rpc` | no key: write the revoke every revoker signs — the part still unvested `--margin-secs` past the head, paid to the entry's genesis `treasury` (there is no `--to`) |
+| `vesting revoke sign` | `--proposal <file>`, `--key`, `--index`? | one revoker key, offline: print `<index>:<signature hex>`; what is signed goes to stderr |
+| `vesting revoke submit` | `--proposal <file>`, `--signature <index:hex>` (repeat), `--rpc`, `--no-wait` | send the revoke with at least the entry's `threshold` of signatures, within 256 blocks of `prepare` |
 | `vesting bond <RAND>` | `--entry`, `--validator <address>`, `--registration <hex>`?, `--key`, … | irrevocable entries: bond locked RAND as that validator's stake (a new validator needs what `rand-node register` printed) |
 | `vesting unbond <RAND>` | `--entry`, `--key`, … | take bonded RAND back into the lock; claimable again after the unbonding epochs |
 
-`rand-node genesis … --vesting VESTING.JSON` writes the section (format in `docs/vesting.md`).
+`rand-node genesis … --vesting VESTING.JSON` writes the section (format in `docs/vesting.md`). A
+revocable entry lists `revokers` (1–5 keys), a `threshold` and the `treasury` a revoke pays; the
+command refuses a file that leaves any of the three out, and one whose treasury cannot be sealed to.
 
 ### `rand-node aggregator register` / `unbond` / `withdraw` (chain 9)
 
