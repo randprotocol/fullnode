@@ -509,14 +509,35 @@ fn validate_for_pool(
 /// verifier-key cache — is behind a `Mutex` whose poisoning later `lock().unwrap()`s would surface
 /// as further panics this same guard catches, not as silent corruption.
 fn guard_verify(f: impl FnOnce() -> Result<(), randprotocol_core::TxError>) -> Result<(), randprotocol_core::TxError> {
+    guard_admission("the proof verifier", f, |what| what)
+}
+
+/// [`guard_verify`] for the pool's pre-screen (`Mempool::precheck`), which runs inline on the
+/// node's event loop for every gossiped and every submitted transaction, before any signature or
+/// proof check (audit v6, ZKV-4's second recommendation). The pre-screen reads proof headers —
+/// the canonical-proof rules, the call floor's decode — so it is the first code an outsider's
+/// bytes reach, and a panic there took the whole node down rather than one worker. It is a
+/// verdict instead: `VerifierPanicked`, never permanent, never cached.
+///
+/// Not a bound on time: a loop that does not panic is not caught here (ZKV-4's own fix bounds the
+/// one that was found). And not extended to block apply or sync, for the reason above.
+fn guard_precheck<T>(f: impl FnOnce() -> Result<T, MempoolError>) -> Result<T, MempoolError> {
+    guard_admission("the pool pre-screen", f, MempoolError::Invalid)
+}
+
+fn guard_admission<T, E>(
+    what_ran: &str,
+    f: impl FnOnce() -> Result<T, E>,
+    refusal: impl FnOnce(randprotocol_core::TxError) -> E,
+) -> Result<T, E> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
         let what = payload
             .downcast_ref::<&str>()
             .map(|s| s.to_string())
             .or_else(|| payload.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "a non-string panic".into());
-        tracing::warn!("the proof verifier panicked during admission: {what}");
-        Err(randprotocol_core::TxError::VerifierPanicked(what))
+        tracing::warn!("{what_ran} panicked during admission: {what}");
+        Err(refusal(randprotocol_core::TxError::VerifierPanicked(what)))
     })
 }
 
@@ -2536,7 +2557,7 @@ impl Node {
         }
         // Everything the pool can answer for free, before a ~20 ms proof is scheduled for it. A
         // duplicate or a conflict never reaches the queue.
-        if let Err(e) = self.mempool.precheck(&tx, self.hs.tip_ledger(), self.executor.as_ref()) {
+        if let Err(e) = guard_precheck(|| self.mempool.precheck(&tx, self.hs.tip_ledger(), self.executor.as_ref())) {
             let hash = tx.hash();
             let a = admission::acceptance_for_pool(&e, hash, &mut self.refused);
             self.note_refusal(hash);
@@ -2570,7 +2591,7 @@ impl Node {
         // can hear is the one `Mempool::insert` always produced (`docs/rpc.md` quotes them). The
         // acceptance is discarded here — only its caching side effect matters, so a resubmission of
         // a permanently bad transaction is answered for free.
-        if let Err(e) = self.mempool.precheck(&tx, self.hs.tip_ledger(), self.executor.as_ref()) {
+        if let Err(e) = guard_precheck(|| self.mempool.precheck(&tx, self.hs.tip_ledger(), self.executor.as_ref())) {
             let _ = admission::acceptance_for_pool(&e, hash, &mut self.refused);
             self.note_refusal(hash);
             let _ = reply.send(Err(e));
@@ -5516,6 +5537,25 @@ mod tests {
         assert!(fetch_deferred_to_batch_sync(102, 100));
         assert!(fetch_deferred_to_batch_sync(1_000, 100));
         assert!(!fetch_deferred_to_batch_sync(50, 100), "peers behind us say nothing about what we lack");
+    }
+
+    /// Audit v6, ZKV-4's second recommendation: the pool's pre-screen runs inline on the event
+    /// loop and reads proof headers before anything is verified, so a panic in it (the debug-build
+    /// overflow beside ZKV-4's loop; anything a later re-vendor adds) stopped the node. Under
+    /// `guard_precheck` it is a refusal of that one transaction.
+    #[test]
+    fn a_panic_inside_the_pool_pre_screen_is_a_refusal_not_a_dead_node() {
+        let got = std::panic::catch_unwind(|| guard_precheck::<()>(|| panic!("attempt to shift left with overflow")));
+        let verdict = got.expect("the finding: the panic escapes the event loop");
+        match verdict {
+            Err(MempoolError::Invalid(e @ randprotocol_core::TxError::VerifierPanicked(_))) => {
+                assert!(e.to_string().contains("shift left"), "{e}");
+                assert!(!admission::is_permanent(&e), "never cached");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(guard_precheck(|| Ok(7)).ok(), Some(7), "an answer passes through");
+        assert!(matches!(guard_precheck::<()>(|| Err(MempoolError::Full)), Err(MempoolError::Full)));
     }
 
     /// The register and the bucket survive the same restart, hashed into and computed into the
