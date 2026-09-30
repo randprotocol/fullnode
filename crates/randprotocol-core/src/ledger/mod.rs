@@ -522,7 +522,9 @@ pub fn non_canonical_proofs(tx: &Transaction, check: &dyn Fn(&[u8]) -> Option<St
             }
         }
     }
-    if let Action::Call { proof, .. } = &tx.action {
+    // An RPL-2 `Invoke` carries a call proof too, and the call binding blanks it exactly as it
+    // blanks a call's.
+    if let Action::Call { proof, .. } | Action::Invoke { proof, .. } = &tx.action {
         if let Some(why) = check(proof) {
             return Some(TxError::NonCanonicalProof(format!("call proof: {why}")));
         }
