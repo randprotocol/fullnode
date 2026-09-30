@@ -488,6 +488,31 @@ impl Ledger {
         }
     }
 
+    /// Every note `tx` would make the ledger create beyond the ones it carries on the wire, in
+    /// the order the ledger appends them: [`Self::derived_commitment`]'s one for the actions it
+    /// answers, and for an RPL-2 `Invoke` one per payout of its transition, pays then mints
+    /// ([`super::program_state::payout_commitment`]). An invoke's notes are stamped with its
+    /// bundle's `time`, which is why this takes the transaction and the singular form, which
+    /// sees only the action, cannot answer for it.
+    ///
+    /// Like the singular form this runs before validation — the mempool claims what a
+    /// transaction would create in order to decide whether to validate it at all — so the payout
+    /// count is capped before anything is hashed: a transition over
+    /// [`super::program_state::MAX_PAYOUTS`] derives nothing here, and `validate` refuses it
+    /// (`ProgramStateError::TooManyPayouts`), as it does an invoke without a bundle.
+    pub fn derived_commitments(&self, tx: &Transaction, executor: &dyn ConfidentialExecutor) -> Vec<Word8> {
+        match (&tx.action, &tx.bundle) {
+            (Action::Invoke { transition, .. }, Some(b)) => {
+                if transition.pays.len() + transition.mints.len() > super::program_state::MAX_PAYOUTS {
+                    return Vec::new();
+                }
+                transition.payouts().map(|p| super::program_state::payout_commitment(p, b.time, executor)).collect()
+            }
+            (Action::Invoke { .. }, None) => Vec::new(),
+            (action, _) => self.derived_commitment(action, executor).into_iter().collect(),
+        }
+    }
+
     /// Add `amount` to `validator`'s stake, inserting the entry when `registration` is present.
     /// The bundle's `burn` is checked by admission (spec §7 step 3), not here — which is why
     /// this is crate-internal: a bond only ever arrives as an `Action::Bond` whose bundle burned

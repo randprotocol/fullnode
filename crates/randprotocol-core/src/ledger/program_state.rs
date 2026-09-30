@@ -492,6 +492,48 @@ fn moves(ledger: &Ledger, tx: &Transaction, program: &ProgramId, t: &Transition)
     Ok(Moves { vault: vault.into_iter().collect(), burned, minted, rand_in: b.burn_r, rand_out })
 }
 
+/// The two rules of an `Invoke` that read this ledger's moving state (spec §6, steps 7–8 and
+/// the registry half of 4–5): the vault can pay and the supplies can move, and every cell read
+/// still holds the value the transition declares. Map lookups and compares, no hash.
+fn check_state(
+    ledger: &Ledger,
+    state: &ProgramState,
+    tx: &Transaction,
+    program: &ProgramId,
+    t: &Transition,
+) -> Result<(), TxError> {
+    moves(ledger, tx, program, t)?;
+    for c in &t.reads {
+        if state.cell(program, &c.key) != c.value {
+            return Err(ProgramStateError::StaleRead { key: key_hex(&c.key) }.into());
+        }
+    }
+    Ok(())
+}
+
+/// Whether `tx`, an `Invoke` that [`validate`] accepted on an earlier state, can still apply on
+/// `ledger`: exactly the state-dependent half of [`validate`] (the vault, the supplies, the cells
+/// read), with the verdict [`validate`] would give. For a node's pool, which asks at every tip:
+/// another transaction writing a cell this one read, or draining the vault it pays from, makes it
+/// inapplicable for good unless the state comes back, and it must leave the pool rather than be
+/// offered to every block. Nothing here costs a hash or a proof. `Ok` for every other action.
+pub fn still_applies(ledger: &Ledger, tx: &Transaction) -> Result<(), TxError> {
+    let Action::Invoke { program, transition, .. } = &tx.action else {
+        return Ok(());
+    };
+    let state = ledger.program_state().ok_or(ProgramStateError::Disabled)?;
+    // The counts first, as `check_shape` has them: this may run before `validate` has (a pool's
+    // pre-screen), and an oversized transition must not buy a lookup per entry.
+    if transition.reads.len() > MAX_READS {
+        return Err(ProgramStateError::TooManyReads(transition.reads.len()).into());
+    }
+    let payouts = transition.pays.len() + transition.mints.len();
+    if payouts > MAX_PAYOUTS {
+        return Err(ProgramStateError::TooManyPayouts(payouts).into());
+    }
+    check_state(ledger, state, tx, program, transition)
+}
+
 /// The action step of admission for an `Invoke` (spec §6, steps 2–8). The call proof, its fee
 /// and the bundle's proof are the common path's, after this.
 ///
@@ -517,12 +559,7 @@ pub(super) fn validate(
         return Err(ProgramStateError::ContextTooLong { context, public, max }.into());
     }
     // The vault and the supplies, then the reads: all map lookups.
-    moves(ledger, tx, program, transition)?;
-    for c in &transition.reads {
-        if state.cell(program, &c.key) != c.value {
-            return Err(ProgramStateError::StaleRead { key: key_hex(&c.key) }.into());
-        }
-    }
+    check_state(ledger, state, tx, program, transition)?;
     // Every note the transition creates is new: against the tree, the bundle's own four, and
     // each other. The hashes are the most expensive thing here, so they come last.
     let b = tx.bundle.as_ref().ok_or(TxError::MissingBundle)?;
@@ -1071,6 +1108,67 @@ mod tests {
         let twice = Transition { pays: vec![pay(0, 6, 2), pay(0, 6, 2)], ..empty() };
         let cm = payout_commitment(&twice.pays[0], 1, &StubExecutor);
         assert_eq!(refusal(&l, &invoke(&l, 30, (0, 0, 0), twice)), TxError::CommitmentExists(cm));
+    }
+
+    /// `still_applies` is `validate`'s state-dependent half, with `validate`'s verdicts: what a
+    /// pool asks of a transaction it already verified, at every tip.
+    #[test]
+    fn still_applies_answers_the_state_rules_alone() {
+        let mut l = ledger();
+        let fund = invoke(&l, 10, (1_000, 0, 0), empty());
+        apply(&mut l, &fund).unwrap();
+        let reader = invoke(&l, 20, (0, 0, 0), Transition { reads: vec![cell(1, 0)], writes: vec![cell(1, 7)], ..empty() });
+        let payer = invoke(&l, 30, (0, 0, 0), Transition { pays: vec![pay(0, 600, 1)], ..empty() });
+        let minter = invoke(&l, 40, (0, 0, 0), Transition { mints: vec![pay(2, 5, 3)], ..empty() });
+        for tx in [&reader, &payer, &minter, &fund] {
+            assert_eq!(still_applies(&l, tx), Ok(()));
+            assert_eq!(still_applies(&l, tx), l.validate(tx, &StubExecutor).or_else(|e| match e {
+                // `fund`'s own nullifiers are spent by now: not this function's question.
+                TxError::Spent(_) => Ok(()),
+                e => Err(e),
+            }));
+        }
+        // Another invoke writes the cell `reader` read, and another drains the vault `payer` pays from.
+        let writer = invoke(&l, 50, (0, 0, 0), Transition { writes: vec![cell(1, 5)], ..empty() });
+        let drain = invoke(&l, 60, (0, 0, 0), Transition { pays: vec![pay(0, 600, 2)], ..empty() });
+        l.apply_transactions(&[writer, drain], &proposer().address(), &StubExecutor).unwrap();
+        assert_eq!(still_applies(&l, &reader), Err(ps(ProgramStateError::StaleRead { key: key_hex(&key(1)) })));
+        assert_eq!(still_applies(&l, &reader), Err(refusal(&l, &reader)), "validate's own verdict");
+        assert_eq!(still_applies(&l, &payer), Err(ps(ProgramStateError::VaultShort { asset: 0, have: 400, want: 600 })));
+        assert_eq!(still_applies(&l, &payer), Err(refusal(&l, &payer)));
+        assert_eq!(still_applies(&l, &minter), Ok(()), "untouched by either");
+        // Not an invoke: nothing to ask. Without the section: the gate.
+        let deploy = Transaction::shielded(CHAIN, bundle(&l, 70, FEE, 0, 0, 0), Action::None);
+        assert_eq!(still_applies(&l, &deploy), Ok(()));
+        assert_eq!(still_applies(&ledger_with(false), &reader), Err(ps(ProgramStateError::Disabled)));
+        // An oversized transition buys no lookups.
+        let many = Transition { reads: (1..=9).map(|i| cell(i, 0)).collect(), ..empty() };
+        assert_eq!(still_applies(&l, &invoke(&l, 80, (0, 0, 0), many)), Err(ps(ProgramStateError::TooManyReads(9))));
+    }
+
+    /// `Ledger::derived_commitments`: an invoke's payout notes, pays then mints, stamped with the
+    /// bundle's time — what a pool claims and an indexer appends — and the singular form's one
+    /// note for every other action.
+    #[test]
+    fn an_invokes_derived_commitments_are_its_payout_notes_in_order() {
+        let mut l = ledger();
+        let t = Transition { pays: vec![pay(0, 10, 1), pay(0, 20, 2)], mints: vec![pay(2, 40, 3)], ..empty() };
+        let tx = invoke(&l, 10, (100, 0, 0), t.clone());
+        let time = tx.bundle.as_ref().unwrap().time;
+        let want: Vec<Word8> = t.payouts().map(|p| payout_commitment(p, time, &StubExecutor)).collect();
+        assert_eq!(l.derived_commitments(&tx, &StubExecutor), want);
+        assert_eq!(l.derived_commitment(&tx.action, &StubExecutor), None, "the singular form cannot see the bundle's time");
+        let first = l.next_index();
+        apply(&mut l, &tx).unwrap();
+        assert_eq!(l.next_index(), first + 4 + 3, "the bundle's four, then the three payouts");
+        assert!(want.iter().all(|cm| l.has_commitment(cm)));
+        // No payouts, no notes; a transition over the cap derives nothing (and is refused).
+        assert!(l.derived_commitments(&invoke(&l, 20, (0, 0, 0), empty()), &StubExecutor).is_empty());
+        let five = Transition { pays: (1..=5).map(|n| pay(0, 1, n)).collect(), ..empty() };
+        assert!(l.derived_commitments(&invoke(&l, 30, (10, 0, 0), five), &StubExecutor).is_empty());
+        // Every other action answers as the singular form does.
+        let reg = register(&l, MintAuthority::Program(pid()), 960);
+        assert_eq!(l.derived_commitments(&reg, &StubExecutor), Vec::<Word8>::new());
     }
 
     /// The v0.6 canonical-proof rule (`hardening_v6`, which the section requires) reaches an
