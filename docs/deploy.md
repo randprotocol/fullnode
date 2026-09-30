@@ -1139,6 +1139,12 @@ Audit v6 (2026-09-30) §8.5. Each is optional, absent from every genesis through
 committed to the genesis hash under its own tag — after every tag that existed before it — only
 when set; a file without them hashes and runs byte-for-byte as before.
 
+- **`staking.max_stake_entry_bps_per_epoch`** (`docs/staking.md` §2): the entry budget as basis
+  points of the active weight at the boundary, in place of the fixed
+  `max_stake_entry_per_epoch` (the two are refused together). Chain 18's 10 000 RAND holds an
+  entrant to a third for two epochs of a 26 000-RAND set and for 1 301 of a 26 000 000-RAND one;
+  `2500` holds it for two at either scale. Size it with the genesis stake (audit decision D24):
+  a mainnet cut that changes the stake sizes must not carry chain 18's fixed figure.
 - **`testnet: true`** (top level; `rand-node genesis --testnet`). Required on any chain whose
   genesis keeps `faucet: true` beside a `bridge` section — free RAND beside real custody — on a
   chain id past 18 (`GenesisError::FaucetWithBridgeNeedsTestnet`; chains 14–18 are grandfathered

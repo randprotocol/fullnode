@@ -125,6 +125,13 @@ pub struct ValidatorEntry {
 ///   ([`StakingError::NotAdmitted`]) unless the set has voted the key in with an
 ///   `Action::AdmitValidator`. Until slashing exists an open register turns the price of two
 ///   thirds of the stake into a purchase; this turns it into a vote. Only `true` switches it on.
+/// - `max_stake_entry_bps_per_epoch`: the entry budget as a fraction — the most weight, in basis
+///   points of the active bonded weight at the boundary, that may become weight at one epoch
+///   boundary ([`Ledger::admit_queued_stake`]). `max_stake_entry_per_epoch` is a fixed RAND
+///   figure: 10 000 RAND an epoch bounds a 26 000-RAND genesis for two epochs and a 26 000 000-RAND
+///   one for two thousand, so the time an entrant needs to reach a third of the weight scales with
+///   the genesis stake; as a fraction that time is the same at every scale. `1..=10 000`; refused
+///   beside `max_stake_entry_per_epoch` (one budget, not two).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StakingConfig {
@@ -143,6 +150,8 @@ pub struct StakingConfig {
     pub faucet_minters: Option<Vec<FaucetMinter>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_by_vote: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_stake_entry_bps_per_epoch: Option<u32>,
 }
 
 impl StakingConfig {
@@ -645,7 +654,19 @@ impl Ledger {
     /// admitted, which is the delay rule alone.
     pub(crate) fn admit_queued_stake(&mut self, next_epoch: u64) {
         let Some(cfg) = self.staking() else { return };
-        let mut budget = cfg.max_stake_entry_per_epoch.unwrap_or(u64::MAX);
+        // Audit v6, STAKE-2: the budget as a fraction of the weight already active — the register
+        // as `derive_set_with` reads it for `next_epoch` with *every* queued row still waiting
+        // (nothing this boundary is about to admit counts towards its own budget), the top
+        // `MAX_VALIDATORS`, uncapped (the cap is a vote-weight rule; the budget bounds what
+        // enters the stake). `⌊active · bps / 10 000⌋`, so a budget that comes to less than a
+        // registration admits it over several boundaries, as the fixed figure does.
+        let fraction = cfg.max_stake_entry_bps_per_epoch.map(|bps| {
+            let waiting: Vec<QueuedStake> =
+                self.bond_queue.iter().map(|q| QueuedStake { validator: q.validator, amount: q.amount, epoch: u64::MAX }).collect();
+            let active = derive_set_with(&self.validators, &waiting, next_epoch, None).total_stake();
+            u64::try_from(active.saturating_mul(u128::from(bps)) / u128::from(MAX_WEIGHT_BPS)).unwrap_or(u64::MAX)
+        });
+        let mut budget = fraction.or(cfg.max_stake_entry_per_epoch).unwrap_or(u64::MAX);
         let mut kept = Vec::with_capacity(self.bond_queue.len());
         for mut q in std::mem::take(&mut self.bond_queue) {
             if q.epoch > next_epoch {
@@ -2067,6 +2088,79 @@ mod tests {
             staking_err(plain.validate(&bond_tx(&plain, 10, &x, MIN_STAKE, Some(v2(&genesis, &x.address()))), &StubExecutor).unwrap_err()),
             StakingError::BadSignature
         );
+    }
+
+    // ---- audit v6, STAKE-2: the entry budget as a fraction ------------------------------------
+
+    /// Audit v6, STAKE-2 (§8.5 option 3): `max_stake_entry_per_epoch` is a fixed RAND figure, so
+    /// the epochs an entrant needs to reach a blocking third scale with the genesis stake — two
+    /// on chain 18's 26 × 1 000 RAND, over a thousand on 26 × 1 000 000. As basis points of the
+    /// active weight (`max_stake_entry_bps_per_epoch`) the count is the same at every scale: the
+    /// budget is a fraction of what is already there, so the entrant's share after `k` boundaries
+    /// is `1 − (1 + b)^−k` whatever the unit.
+    #[test]
+    fn a_fractional_entry_budget_holds_the_time_to_a_third_constant_across_scales() {
+        let epochs_to_a_third = |stake: u64, cfg: StakingConfig| -> u64 {
+            let vals: Vec<Keypair> = (1..=26u8).map(key).collect();
+            let entrant = key(30);
+            let mut l = sectioned(vals.iter().enumerate().map(|(i, k)| entry(k, stake, payout(i as u8 + 1))).collect(), cfg);
+            let proposer = vals[0].address();
+            // Bonds as much as the whole set holds: the budget, not the bond, is what paces it.
+            let amount = 26 * stake;
+            let t = bond_tx(&l, 40, &entrant, amount, Some(registration(&entrant, payout(30))));
+            l.apply_tx(&t, &proposer, &StubExecutor).unwrap();
+            for epoch in 1..=10_000u64 {
+                close_epoch(&mut l, epoch * 10 - 1, &proposer);
+                let set = l.derive_next_set(epoch);
+                if let Some(v) = set.get(&entrant.address()) {
+                    if set.has_third(v.stake) {
+                        return epoch;
+                    }
+                }
+            }
+            panic!("never a third");
+        };
+        let (small, large) = (1_000 * UNITS_PER_RAND, 1_000_000 * UNITS_PER_RAND);
+        let fixed = StakingConfig { max_stake_entry_per_epoch: Some(10_000 * UNITS_PER_RAND), ..Default::default() };
+        let (small_fixed, large_fixed) = (epochs_to_a_third(small, fixed.clone()), epochs_to_a_third(large, fixed));
+        assert_eq!(small_fixed, 2, "chain 18's figures: 10 000 RAND an epoch against 26 000");
+        assert_eq!(large_fixed, 1301, "the same figure against 26 000 000: a thousand times longer");
+        let fraction = StakingConfig { max_stake_entry_bps_per_epoch: Some(2_500), ..Default::default() };
+        let (small_bps, large_bps) = (epochs_to_a_third(small, fraction.clone()), epochs_to_a_third(large, fraction));
+        assert_eq!((small_bps, large_bps), (2, 2), "a quarter of the active weight an epoch: 1 − 1.25⁻² > 1/3 at every scale");
+        // Without either budget every due row is admitted at once: a third at the first boundary.
+        assert_eq!(epochs_to_a_third(small, StakingConfig::default()), 1);
+    }
+
+    /// The fraction is of the weight *already active* at the boundary — the register with every
+    /// queued row still waiting, `derive_set_with`'s own view — so what a boundary admits never
+    /// counts towards its own budget, the leftover keeps its place for the next one, and a budget
+    /// under a registration admits it in parts, as the fixed figure does.
+    #[test]
+    fn the_fractional_budget_is_of_the_weight_active_before_the_boundary() {
+        let (g, x, y) = (key(1), key(2), key(3));
+        let cfg = StakingConfig { max_stake_entry_bps_per_epoch: Some(2_000), ..Default::default() };
+        let mut l = sectioned(vec![entry(&g, 10 * MIN_STAKE, payout(1))], cfg);
+        let proposer = g.address();
+        l.apply_tx(&bond_tx(&l, 10, &x, 3 * MIN_STAKE, Some(registration(&x, payout(2)))), &proposer, &StubExecutor).unwrap();
+        l.record_anchor(1);
+        l.apply_tx(&bond_tx(&l, 20, &y, MIN_STAKE, Some(registration(&y, payout(3)))), &proposer, &StubExecutor).unwrap();
+        // 20% of the 10·MIN active: 2·MIN of the 4·MIN due — two thirds of x's row, none of y's.
+        close_epoch(&mut l, 9, &proposer);
+        let set = l.derive_next_set(1);
+        assert_eq!((weight(&set, &x), weight(&set, &y)), (Some(2 * MIN_STAKE as u128), None));
+        assert_eq!(
+            l.bond_queue(),
+            &[
+                QueuedStake { validator: x.address(), amount: MIN_STAKE, epoch: 2 },
+                QueuedStake { validator: y.address(), amount: MIN_STAKE, epoch: 2 },
+            ]
+        );
+        // 20% of the 12·MIN now active: 2.4·MIN — the rest of x's row and y's whole row.
+        close_epoch(&mut l, 19, &proposer);
+        let set = l.derive_next_set(2);
+        assert_eq!((weight(&set, &x), weight(&set, &y)), (Some(3 * MIN_STAKE as u128), Some(MIN_STAKE as u128)));
+        assert!(l.bond_queue().is_empty());
     }
 
     // ---- audit v6, STAKE-2: admission by vote ---------------------------------------------------

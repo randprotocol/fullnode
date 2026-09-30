@@ -816,6 +816,17 @@ impl Genesis {
             if s.max_stake_entry_per_epoch == Some(0) {
                 return Err(GenesisError::BadStaking("max_stake_entry_per_epoch 0 would admit no stake ever".into()));
             }
+            // Audit v6, STAKE-2: the fraction, bounded like the weight cap, and one budget only.
+            if let Some(bps) = s.max_stake_entry_bps_per_epoch {
+                if bps == 0 || bps > crate::ledger::staking::MAX_WEIGHT_BPS {
+                    return Err(GenesisError::BadStaking(format!("max_stake_entry_bps_per_epoch {bps} is outside 1..=10000")));
+                }
+                if s.max_stake_entry_per_epoch.is_some() {
+                    return Err(GenesisError::BadStaking(
+                        "max_stake_entry_bps_per_epoch and max_stake_entry_per_epoch are two entry budgets; set one".into(),
+                    ));
+                }
+            }
         }
         if let Some(v) = &self.vesting {
             v.check().map_err(GenesisError::BadVesting)?;
@@ -1278,6 +1289,11 @@ impl Genesis {
         if self.testnet == Some(true) {
             commit.extend_from_slice(b"testnet");
             commit.push(1);
+        }
+        // The entry budget as a fraction (audit v6, STAKE-2), after it, only when set.
+        if let Some(bps) = self.staking.as_ref().and_then(|s| s.max_stake_entry_bps_per_epoch) {
+            commit.extend_from_slice(b"staking_max_stake_entry_bps_per_epoch");
+            commit.extend_from_slice(&bps.to_be_bytes());
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -4003,6 +4019,32 @@ mod tests {
         }
         assert!(with(|s| s.max_weight_bps = Some(10_000)).validate().is_ok());
         assert!(matches!(with(|s| s.max_stake_entry_per_epoch = Some(0)).validate(), Err(GenesisError::BadStaking(_))));
+    }
+
+    /// Audit v6, STAKE-2: `staking.max_stake_entry_bps_per_epoch` — committed only when present,
+    /// bounded `1..=10000`, and never beside the fixed `max_stake_entry_per_epoch` (one budget).
+    #[test]
+    fn the_fractional_entry_budget_is_committed_only_when_present_bounded_and_exclusive() {
+        let mut base = genesis(4);
+        base.staking = Some(StakingConfig { faucet_budget_per_epoch: 100 * UNITS_PER_RAND, bond_activation_epochs: 2, ..Default::default() });
+        let plain = build(&base);
+        assert!(!base.to_json().contains("max_stake_entry_bps_per_epoch"));
+        let with = |bps: Option<u32>, fixed: Option<u64>| {
+            let mut g = base.clone();
+            let s = g.staking.as_mut().unwrap();
+            s.max_stake_entry_bps_per_epoch = bps;
+            s.max_stake_entry_per_epoch = fixed;
+            g
+        };
+        let quarter = with(Some(2_500), None);
+        assert_ne!(build(&quarter).hash(), plain.hash(), "part of the genesis hash");
+        assert_ne!(build(&with(Some(2_501), None)).hash(), build(&quarter).hash());
+        assert_eq!(Genesis::from_json(&quarter.to_json()).unwrap(), quarter);
+        assert_eq!(build(&quarter).ledger.staking().unwrap().max_stake_entry_bps_per_epoch, Some(2_500));
+        for g in [with(Some(0), None), with(Some(10_001), None), with(Some(2_500), Some(5 * MIN_STAKE))] {
+            assert!(matches!(g.validate(), Err(GenesisError::BadStaking(_))), "{:?}", g.staking);
+        }
+        assert!(with(Some(10_000), None).validate().is_ok());
     }
 
     /// Audit v6, STAKE-2: `staking.admission_by_vote` rides the section's gate like the fields

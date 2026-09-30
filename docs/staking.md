@@ -154,6 +154,18 @@ section without them hashes exactly as v0.5.4's did:
   is derived from that very ledger, so it counts exactly what was admitted. Absent, every due row
   is admitted (the delay rule alone). A large bond at the head of the queue holds everyone behind
   it for as many epochs as it needs — the price of an order nobody can jump.
+- **`max_stake_entry_bps_per_epoch` — the same limit as a fraction (audit v6, STAKE-2).** A
+  fixed RAND figure is sized to one genesis: 10 000 RAND an epoch holds an entrant to a third of
+  chain 18's 26 000 RAND for two epochs, and of a 26 000 000-RAND genesis for thirteen hundred —
+  so the safety it buys scales with the stake the genesis happens to carry. As basis points
+  (`1..=10000`) of the **active weight at the boundary** — the register as the set derivation
+  reads it for the epoch being opened, with every queued row still waiting, uncapped, the top
+  100 — the budget is `⌊active · bps / 10 000⌋` and an entrant's share after `k` boundaries is
+  `1 − (1 + b)^−k` at every scale (a quarter an epoch: a third in two epochs, whatever the unit).
+  What a boundary admits never counts towards its own budget; a budget under one registration
+  admits it in parts across boundaries, as the fixed figure does. Refused beside
+  `max_stake_entry_per_epoch` (one budget), committed to the genesis hash under its own tag only
+  when set. Chain 18 keeps its fixed figure.
 - **`registration_v2` — proof of possession, bound to the chain.** The v1 registration a new row
   carries is the key's signature over `(chain_id, payout)` under `rand-register`: it proves the
   key, but binds neither the chain's genesis (any chain sharing the id accepts it) nor the address
