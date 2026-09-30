@@ -1585,28 +1585,63 @@ fn find_token<'a>(tokens: &'a TokenRegistry, key: &Result<u64, randprotocol_core
     }
 }
 
-/// The one note the *chain* computes for `tx` — a `BridgeAttest`'s deposit, a `TokenMint`'s
-/// minted note, a `RegisterToken`'s initial mint — as `storage::created_notes` appended it.
-/// `None` for every other action, for a rotation, for a registration without an initial mint,
-/// and for an attestation whose asset the registry does not hold. `rand_checkTransaction` opens
-/// the action's envelope against it.
-fn derived_note_cm(
+/// The notes the *chain* computes for `tx` and an envelope of the action opens — a
+/// `BridgeAttest`'s deposit, a `TokenMint`'s minted note, a `RegisterToken`'s initial mint, and
+/// the notes an RPL-2 `Invoke` pays out (one per payout, pays then mints) — in the order
+/// `storage::created_notes` appended them. Empty for every other action, for a rotation, for a
+/// registration without an initial mint, and for an attestation whose asset the registry does
+/// not hold. `rand_checkTransaction` opens the action's envelopes against them.
+fn derived_note_cms(
     tx: &Transaction,
     tokens: Option<&TokenRegistry>,
     executor: &dyn ConfidentialExecutor,
-) -> Option<randprotocol_core::Word8> {
-    use randprotocol_core::ledger::{bridge_notes, tokens::mint_commitment};
-    match &tx.action {
-        Action::BridgeAttest { attestation, recipient, r, time, .. } => attest_deposit(attestation, tokens)
-            .map(|(index, amount)| bridge_notes::deposit_commitment(recipient, amount, index, *time, r, executor)),
-        Action::TokenMint { asset, amount, recipient, r, time, .. } => {
-            Some(mint_commitment(recipient, *amount, *asset, *time, r, executor))
+) -> Vec<randprotocol_core::Word8> {
+    use randprotocol_core::ledger::{bridge_notes, program_state::payout_commitment, tokens::mint_commitment};
+    match (&tx.action, &tx.bundle) {
+        (Action::BridgeAttest { attestation, recipient, r, time, .. }, _) => attest_deposit(attestation, tokens)
+            .map(|(index, amount)| bridge_notes::deposit_commitment(recipient, amount, index, *time, r, executor))
+            .into_iter()
+            .collect(),
+        (Action::TokenMint { asset, amount, recipient, r, time, .. }, _) => {
+            vec![mint_commitment(recipient, *amount, *asset, *time, r, executor)]
         }
-        Action::RegisterToken { initial: Some(m), index, .. } => {
-            Some(mint_commitment(&m.recipient, m.amount, *index, m.time, &m.r, executor))
+        (Action::RegisterToken { initial: Some(m), index, .. }, _) => {
+            vec![mint_commitment(&m.recipient, m.amount, *index, m.time, &m.r, executor)]
         }
-        _ => None,
+        // Stamped with the bundle's `time`, as the ledger stamps them.
+        (Action::Invoke { transition, .. }, Some(b)) => {
+            transition.payouts().map(|p| payout_commitment(p, b.time, executor)).collect()
+        }
+        _ => Vec::new(),
     }
+}
+
+/// One note an `Invoke` pays out, as `tx_json` renders it inside `transition.pays` / `.mints`.
+/// Every word of the note is here — the recipient, the amount, the asset index, the blinding
+/// `r` and `time` (the *bundle's*, which is what the chain stamps a payout note with; the `from`
+/// word is the chain's `PROGRAM_FROM`) — under the field names a `token_mint` uses, so one
+/// rebuild reads both; `cm` is the leaf the chain appended for it.
+fn payout_json(p: &randprotocol_core::ledger::program_state::Payout, time: u32, executor: &dyn ConfidentialExecutor) -> Value {
+    json!({
+        "asset": p.asset,
+        "amount": p.amount.to_string(),
+        "recipient": p.recipient.to_string(),
+        "time": time,
+        "r": word8_to_hex(&p.r),
+        "cm": word8_to_hex(&randprotocol_core::ledger::program_state::payout_commitment(p, time, executor)),
+    })
+}
+
+/// A cell as the RPC serves it: key and value, 64 hex each.
+fn cell_json(c: &randprotocol_core::ledger::program_state::Cell) -> Value {
+    json!({ "key": word8_to_hex(&c.key), "value": word8_to_hex(&c.value) })
+}
+
+/// A cell key from a JSON string: 64 hex characters, with or without `0x`.
+fn parse_cell_key(v: &Value, name: &str) -> Result<randprotocol_core::Word8, RpcError> {
+    let s = v.as_str().ok_or_else(|| RpcError::invalid_params(format!("{name} must be 64 hex characters")))?;
+    randprotocol_core::notes::word8_from_hex(s.strip_prefix("0x").unwrap_or(s))
+        .ok_or_else(|| RpcError::invalid_params(format!("{name} must be 64 hex characters")))
 }
 
 /// One block as a light wallet reads it: the header fields it chains on, and per transaction
@@ -2034,6 +2069,35 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
         Action::UnbondVested { entry, amount, nonce, .. } => json!({
             "kind": "unbond_vested", "entry": hex::encode(entry), "amount": amount.to_string(), "nonce": nonce
         }),
+        // RPL-2. A call's fields, then the transition the proof vouches for and the ledger
+        // applied — all of it public by design (spec §2, §9): the cells read and written, what
+        // the bundle's burn fields were to the program (`inflow`; the amounts are the bundle's
+        // `burn_r` / `burn_a` / `burn_asset` above), and every note paid out or minted. The
+        // wallet's public-note scan keys on the kind string `invoke`: do not rename it.
+        Action::Invoke { program, proof, input_envelope, transition } => {
+            use randprotocol_core::ledger::program_state::Inflow;
+            // A payout note's `time` is the bundle's. An invoke always rides one; without it
+            // (no committed transaction is) the notes are not computable and 0 is rendered.
+            let time = t.bundle.as_ref().map_or(0, |b| b.time);
+            let payouts = |ps: &[randprotocol_core::ledger::program_state::Payout]| {
+                ps.iter().map(|p| payout_json(p, time, executor)).collect::<Vec<_>>()
+            };
+            json!({
+                "kind": "invoke", "program": program.to_hex(), "proof_len": proof.len(),
+                "input_envelope_len": input_envelope.as_ref().map(|e| e.len() as u64),
+                "transition": {
+                    "reads": transition.reads.iter().map(cell_json).collect::<Vec<_>>(),
+                    "writes": transition.writes.iter().map(cell_json).collect::<Vec<_>>(),
+                    "inflow": match transition.inflow {
+                        Inflow::None => "none",
+                        Inflow::Deposit => "deposit",
+                        Inflow::Burn => "burn",
+                    },
+                    "pays": payouts(&transition.pays),
+                    "mints": payouts(&transition.mints),
+                },
+            })
+        }
     };
     json!({
         "hash": t.hash().to_hex(),
@@ -2569,15 +2633,15 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 _ => RpcError::not_found("block missing"),
             })?;
             let tx = b.transactions.get(index as usize).ok_or_else(|| RpcError::not_found("tx index"))?;
-            // The action's chain-computed note — a deposit, a token mint or a registration's
-            // initial mint, the commitments the wire does not carry — as the notes index
-            // appended it. Only an attestation needs the registry.
+            // The action's chain-computed notes — a deposit, a token mint, a registration's
+            // initial mint or an invoke's payouts, the commitments the wire does not carry — as
+            // the notes index appended them. Only an attestation needs the registry.
             let tokens = match &tx.action {
                 Action::BridgeAttest { .. } => st.storage.tokens().map_err(RpcError::internal)?,
                 _ => None,
             };
-            let derived_cm = derived_note_cm(tx, tokens.as_ref(), st.executor.as_ref());
-            let opened = crate::viewing::disclosed(tx, derived_cm, &randprotocol_zkvm::viewing::TxKey(key));
+            let derived = derived_note_cms(tx, tokens.as_ref(), st.executor.as_ref());
+            let opened = crate::viewing::disclosed(tx, &derived, &randprotocol_zkvm::viewing::TxKey(key));
             if opened.is_empty() {
                 return Ok(json!({ "tx": h.to_hex(), "height": height, "disclosed": [] }));
             }
@@ -2595,6 +2659,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     "output": match o.output {
                         // The action's one derived note: no slot to number.
                         single @ ("deposit" | "token_mint" | "initial_mint") => single.to_string(),
+                        // `bundle:0..3`, `mint:0`, and an invoke's `payout:0..3` — the slot is
+                        // the payout's place in the transition, pays then mints.
                         other => format!("{other}:{}", o.slot),
                     },
                     "cm": word8_to_hex(&o.cm),
@@ -6001,14 +6067,15 @@ mod tests {
         let tokens = st.storage.tokens().unwrap();
         for (tx, height) in [(&register, 3), (&mint, 4)] {
             let rows = st.storage.notes_in_heights(height, height, 100).unwrap();
-            let derived = derived_note_cm(tx, tokens.as_ref(), &StubExecutor).expect("one derived note");
-            assert_eq!(rows.last().unwrap().1.cm, derived, "height {height}: the last leaf is the minted note");
+            let derived = derived_note_cms(tx, tokens.as_ref(), &StubExecutor);
+            assert_eq!(derived.len(), 1, "one derived note");
+            assert_eq!(rows.last().unwrap().1.cm, derived[0], "height {height}: the last leaf is the minted note");
         }
         let mut bare = register.clone();
         if let Action::RegisterToken { initial, .. } = &mut bare.action {
             *initial = None;
         }
-        assert_eq!(derived_note_cm(&bare, tokens.as_ref(), &StubExecutor), None);
+        assert!(derived_note_cms(&bare, tokens.as_ref(), &StubExecutor).is_empty());
     }
 
     /// On a bridged chain the explorer resolves an attestation against the registry: the

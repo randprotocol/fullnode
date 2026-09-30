@@ -310,6 +310,29 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.decode_call_hardened(program, proof, segment)
     }
 
+    /// RPL-2's invoke rules, forwarded for the same reason: the trait's default refuses every
+    /// `Invoke`, and this wrapper is what every node runs.
+    fn verify_invoke(
+        &self,
+        program: &ProgramRecord,
+        proof: &[u8],
+        segment: &[u32],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.inner.verify_invoke(program, proof, segment)
+    }
+
+    fn decode_invoke(
+        &self,
+        program: &ProgramRecord,
+        proof: &[u8],
+        segment: &[u32],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.inner.decode_invoke(program, proof, segment)
+    }
+
+    /// The keys an `Invoke` verifies under are these too: its segment sits in the hardened
+    /// call's public table (`program_state::segment_fits`), so it declares no shape a call to
+    /// the same program does not.
     fn warm_hardened(&self, program: &ProgramRecord) {
         self.inner.warm_hardened(program)
     }
@@ -700,6 +723,12 @@ mod tests {
         let record = ProgramRecord { id: randprotocol_core::Hash::digest(b"p"), base_pc: 0, words: vec![0x13; 4], code_hash: vec![0; 32], deployed_at: 0, public_digest: None, public_len: 0 };
         assert_eq!(w.verify_call_hardened(&record, b"junk", &[0; 8]), zk.verify_call_hardened(&record, b"junk", &[0; 8]));
         assert_eq!(w.decode_call_hardened(&record, b"junk", &[0; 8]), Err(ConfidentialError::MalformedProof));
+        // RPL-2's invoke rules: the trait default refuses every invoke with `InvalidProof`
+        // ("this executor does not implement …"), which would make the feature dead on every
+        // node — the zkVM decodes the bytes.
+        assert_eq!(w.verify_invoke(&record, b"junk", &[0; 19]), zk.verify_invoke(&record, b"junk", &[0; 19]));
+        assert_eq!(w.verify_invoke(&record, b"junk", &[0; 19]), Err(ConfidentialError::MalformedProof), "not the trait default");
+        assert_eq!(w.decode_invoke(&record, b"junk", &[0; 19]), Err(ConfidentialError::MalformedProof));
         // Constraint set 8's decodes: the trait defaults answer `Ok(None)` ("no limit"), which
         // under a gas section refuses every honest proof — the zkVM decodes the bytes.
         assert_eq!(w.bundle_gas_limit(b"junk"), zk.bundle_gas_limit(b"junk"));

@@ -209,6 +209,29 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
             if ledger.vesting().is_some() { "holds" } else { "holds no" },
         );
     }
+    // Program state (RPL-2) is state too — cells and vaults move with every `Invoke` — and the
+    // same presence rule holds: a node on one side of it would hash `rand-state-8` against
+    // peers that do not, or refuse every invoke they apply.
+    if gs.ledger.program_state().is_some() != ledger.program_state().is_some() {
+        anyhow::bail!(
+            "the genesis file {} program_state section but the database {} program state",
+            if gs.ledger.program_state().is_some() { "has a" } else { "has no" },
+            if ledger.program_state().is_some() { "holds" } else { "holds no" },
+        );
+    }
+    // One field of the blob is not state: `cell_fee` is the genesis parameter, bound into the
+    // genesis hash and outside the state root. The file's value is the authority, as for every
+    // other genesis parameter this function restores — a stored fee that differed (a damaged
+    // blob; nothing on chain moves it) would otherwise price this node's invokes unlike its
+    // peers' and refuse blocks they apply. `verify_chain` names such a blob and the repair
+    // rewrites it; this makes the running ledger right either way.
+    if let (Some(genesis), Some(stored)) = (gs.ledger.program_state(), ledger.program_state()) {
+        if stored.cell_fee != genesis.cell_fee {
+            let mut fixed = stored.clone();
+            fixed.cell_fee = genesis.cell_fee;
+            ledger.set_program_state(Some(fixed));
+        }
+    }
     Ok(ledger)
 }
 
@@ -2628,6 +2651,10 @@ impl Node {
             return;
         }
         let hardened = ledger.hardening_v6();
+        // RPL-2: an `Invoke` needs nothing more warmed. Its segment is held to the hardened
+        // call's public table (`program_state::segment_fits`) and every other pin is the
+        // hardened call's, so the keys `warm_hardened` builds are the keys it verifies under —
+        // and the `program_state` section requires `hardening_v6`.
         let ex = self.executor.clone();
         tokio::task::spawn_blocking(move || {
             for rec in records {
@@ -5222,6 +5249,81 @@ mod tests {
             leader.committed_ledger().state_root(),
             "proposer and peer hold one root"
         );
+    }
+
+    /// RPL-2, the pool and the proposer together. Three invokes are pooled: two on disjoint
+    /// cells and a third that reads and writes the first one's cell. The proposer is offered all
+    /// three, packs the two that do not touch each other into one block and skips the third
+    /// where it sits (its read is stale on the state the first left); a peer applies that block
+    /// to the same root; and at the prune that follows the block the third leaves the pool
+    /// rather than being re-offered to every block after.
+    #[test]
+    fn the_proposer_packs_two_invokes_on_disjoint_cells_and_the_stale_third_is_pruned() {
+        use crate::mempool::Mempool;
+        use crate::storage::fixtures::{rpl2_cell, rpl2_genesis, rpl2_invoke_tx, rpl2_program, rpl2_setup_txs, rpl2_transition, RPL2_FEE};
+        use randprotocol_core::consensus::{ConsensusConfig, HotStuff};
+        use randprotocol_core::ledger::program_state::Transition;
+
+        let gs = rpl2_genesis(7);
+        // The state the proposal builds on: the program deployed and its token registered (the
+        // fixture chain's first block, applied in place — the replicas start from it).
+        let mut ledger = gs.ledger.clone();
+        for tx in rpl2_setup_txs(&gs.ledger) {
+            ledger.apply_tx(&tx, &key(1).address(), &StubExecutor).unwrap();
+        }
+        let step = |k, from, to| Transition { reads: vec![rpl2_cell(k, from)], writes: vec![rpl2_cell(k, to)], ..rpl2_transition() };
+        let first = rpl2_invoke_tx(&ledger, 10, RPL2_FEE, (0, 0, 0), step(1, 0, 5));
+        let disjoint = rpl2_invoke_tx(&ledger, 20, RPL2_FEE, (0, 0, 0), step(2, 0, 5));
+        // Pays less, so it is tried after `first` — and reads the cell `first` writes.
+        let loser = rpl2_invoke_tx(&ledger, 30, RPL2_FEE - 1_000, (0, 0, 0), step(1, 0, 9));
+        let mut pool = Mempool::new(100);
+        for tx in [&first, &disjoint, &loser] {
+            pool.insert(tx.clone(), &ledger, &StubExecutor).unwrap();
+        }
+
+        let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
+        let mk = || {
+            HotStuff::new(
+                ConsensusConfig::new(7, gs.validators.clone(), gs.hash()),
+                Some(key(1)),
+                gs.block.clone(),
+                ledger.clone(),
+                executor.clone(),
+            )
+        };
+        let (mut leader, mut peer) = (mk(), mk());
+        leader.start();
+        peer.start();
+        let candidates = pool.block_candidates(leader.tip_ledger());
+        assert_eq!(candidates.len(), 3, "the pool offers all three: which fit is the trial apply's to say");
+        let acts = leader.propose(1, candidates, 1).expect("the leader's own block applies");
+        let block = acts
+            .iter()
+            .find_map(|a| match a {
+                randprotocol_core::consensus::Action::Broadcast(randprotocol_core::consensus::ConsensusMessage::Proposal(b)) => Some(b.clone()),
+                _ => None,
+            })
+            .expect("a proposal was built");
+        let mined: Vec<Hash> = block.transactions.iter().map(|t| t.hash()).collect();
+        assert_eq!(mined.len(), 2, "two invokes in one block");
+        assert!(mined.contains(&first.hash()) && mined.contains(&disjoint.hash()), "the two on disjoint cells");
+        peer.on_proposal(block.clone(), 1).expect("the peer applies the same block");
+
+        // The state after the block, and the commit path's two pool steps against it.
+        let mut after = ledger.clone();
+        after.apply_transactions(&block.transactions, &key(1).address(), &StubExecutor).unwrap();
+        let (program, _) = rpl2_program();
+        let state = after.program_state().unwrap();
+        assert_eq!(state.cell(&program, &rpl2_cell(1, 0).key), rpl2_cell(1, 5).value, "`first` won cell 1");
+        assert_eq!(state.cell(&program, &rpl2_cell(2, 0).key), rpl2_cell(2, 5).value);
+        pool.remove(&mined);
+        assert_eq!(pool.len(), 1);
+        assert!(matches!(
+            after.validate(&loser, &StubExecutor),
+            Err(randprotocol_core::TxError::ProgramState(randprotocol_core::ledger::program_state::ProgramStateError::StaleRead { .. }))
+        ));
+        pool.prune(&after);
+        assert!(pool.is_empty(), "the stale invoke is pruned at the block that made it stale");
     }
 
     /// The replay flavor (spec §3.2's data, not its admission policy): a cover whose window
