@@ -2597,6 +2597,14 @@ impl Storage {
         Ok(())
     }
 
+    /// Test hook: a nullifier row no block put there — a damaged or altered ledger snapshot, for
+    /// the state-root check at resume (audit v6, OPS-5).
+    #[cfg(test)]
+    pub(crate) fn plant_nullifier_for_testing(&self, nf: &Word8) -> Result<()> {
+        self.db.put_cf_opt(self.cf(CF_NULLIFIERS), word8_to_bytes(nf), 1u64.to_be_bytes(), &sync_opts())?;
+        Ok(())
+    }
+
     /// Test hook: plant the locked block the way v0.5.4 wrote it, so the upgrade path — read
     /// once, folded into the pending set, key retired — can be exercised.
     #[cfg(test)]

@@ -1089,11 +1089,16 @@ async fn main() -> Result<()> {
             let storage = Storage::open(&datadir)?;
             let check = storage.verify_chain(&gs, mode, executor.as_ref())?;
             match &check.problem {
-                None if check.floor > 0 => println!(
-                    "ok: {} blocks verified structurally from {} ({mode:?}); ledger snapshot trusted",
-                    check.head - check.floor + 1,
-                    check.floor
-                ),
+                None if check.floor > 0 => {
+                    // The snapshot half (audit v6, OPS-5): the same comparison `run` makes.
+                    let reloaded = node::reload_ledger(&storage, &gs, executor.as_ref())?;
+                    node::snapshot_is_the_head_state(&storage.head_block()?, &reloaded)?;
+                    println!(
+                        "ok: {} blocks verified structurally from {} ({mode:?}); the ledger snapshot hashes to the head's state root",
+                        check.head - check.floor + 1,
+                        check.floor
+                    )
+                }
                 None => println!("ok: {} blocks verified ({mode:?})", check.head + 1),
                 Some(p) => {
                     println!("CORRUPT: {p}\nhead {} last good {} genesis_ok {}", check.head, check.last_good, check.genesis_ok);

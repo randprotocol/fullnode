@@ -224,6 +224,29 @@ pub fn refuse_a_halted_store(storage: &Storage) -> Result<()> {
     }
 }
 
+/// The snapshot is the head block's state or this node does not start on it (audit v6, OPS-5).
+/// A pruned node's startup check is structural — blocks, links, certificates from the floor —
+/// and `--verify-chain off` checks nothing, so until this comparison the stored ledger was taken
+/// on trust: a damaged or altered nullifier set, note tree or register was resumed on, voted
+/// with, and answered from. The head header's `state_root` is certified by the head's QC; the
+/// reload reproduces it exactly on an honest store (the restart tests pin that), so any
+/// difference is the snapshot's. Not repaired in place: a pruned node holds one ledger and no
+/// history to rebuild it from.
+pub fn snapshot_is_the_head_state(head_block: &Block, reloaded: &Ledger) -> Result<()> {
+    let reloaded_root = reloaded.state_root();
+    if reloaded_root != head_block.header.state_root {
+        anyhow::bail!(
+            "the stored ledger snapshot is not the state of the head block: height {} commits to state root {:?} and the \
+             snapshot hashes to {:?}. The store is damaged or was altered; do not run this node on it — re-sync it \
+             (from an archive if it is pruned) (audit v6, OPS-5)",
+            head_block.height(),
+            head_block.header.state_root,
+            reloaded_root
+        );
+    }
+    Ok(())
+}
+
 /// The consensus replica a node comes back up on: the persisted head and its certificate, the
 /// reloaded ledger, the safety state, and **every epoch set storage recorded**.
 ///
@@ -241,6 +264,7 @@ pub fn resume_consensus(
     let head_block = storage.head_block()?;
     let head_qc = storage.head_qc()?;
     let ledger = reload_ledger(storage, gs, executor.as_ref())?;
+    snapshot_is_the_head_state(&head_block, &ledger)?;
     let safety = storage.load_safety()?;
     // The certified chain above the head (audit v5, CON-4), which `resume` puts back in the
     // tree. A database v0.5.4 wrote holds instead the one locked block it kept beside the lock
@@ -339,7 +363,7 @@ pub fn check_and_repair_chain(storage: &Storage, gs: &GenesisState, mode: Verify
         return match &check.problem {
             None => {
                 tracing::info!(
-                    "pruned node: history verified from {} to {} ({:?}, {:.1?}); ledger snapshot trusted",
+                    "pruned node: history verified from {} to {} ({:?}, {:.1?}); the ledger snapshot is compared with the head's state root at resume",
                     check.floor, check.head, mode, t.elapsed()
                 );
                 Ok(check.head)
@@ -4140,6 +4164,25 @@ mod tests {
         let hs = resume();
         assert_eq!(hs.locked_qc().view, hs.committed_qc_view());
         assert_eq!(hs.not_held(&lost.hash()), None, "a released lock does not un-cast the vote");
+    }
+
+    /// Audit v6, OPS-5 (the integrity half). A pruned validator verifies its retained blocks
+    /// structurally and then loads the stored ledger snapshot without comparing it with anything
+    /// ("ledger snapshot trusted"), and `--verify-chain off` loads it on any node; a damaged or
+    /// altered snapshot was resumed on, voted with and attested from. The reloaded ledger's state
+    /// root is now compared with the head block's before a replica is built on it.
+    #[test]
+    fn a_ledger_snapshot_that_is_not_the_head_blocks_state_is_refused_at_resume() {
+        let (_d, storage, gs, ledger) = chain_past_a_boundary();
+        let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
+        let resume = || resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), executor.clone());
+        let hs = resume().expect("the honest store resumes");
+        assert_eq!(hs.committed_ledger().state_root(), storage.head_block().unwrap().header.state_root);
+        assert_eq!(ledger.state_root(), storage.head_block().unwrap().header.state_root);
+        // One nullifier no block spent: every later double-spend check would read it.
+        storage.plant_nullifier_for_testing(&[0xdead_beef; 8]).unwrap();
+        let err = resume().err().expect("the altered snapshot is refused").to_string();
+        assert!(err.contains("ledger snapshot") && err.contains("state root") && err.contains("re-sync"), "{err}");
     }
 
     /// The upgrade from v0.5.4 (audit v5, CON-4): a database holding the locked block under the
