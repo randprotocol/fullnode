@@ -759,6 +759,15 @@ above):**
   and the legacy `poseidon2` is `unsafe`). No shipped guest and no consensus path uses syscall 7
   yet; retiring the legacy syscall (3) is for a constraint set that re-derives every hash.
 
+**A precondition recorded beside the call cap (audit v6, ZKV-6; 2026-09-30).** evm-core places a
+contract storage leaf by the top 32 bits of `keccak256(slot)`, so a slot colliding with a chosen
+victim's costs about 2^32 Keccaks and, while it holds a non-zero value, freezes the victim slot
+(no forgery, no lost value). It is dormant: the EVM interpreter is 18 009 words and the most a
+call can hold at the tier-14 cap is 8 184 (`executor::max_callable_program_words`). **Before any
+chain lifts the tier-14 call cap (`MAX_CALL_TIER`) or admits an EVM runtime small enough to call,
+evm-core's storage index must be deepened and `evm.bin` re-pinned.** The same note sits on both
+constants in `crates/randprotocol-zkvm/src/executor.rs`.
+
 ## Call input envelopes
 
 A call's private inputs are private because nothing published them — but the caller may want to be

@@ -98,6 +98,17 @@ pub const AUTH_TIER: usize = 10;
 /// `ConfidentialError::CallTierTooHigh` with the remedy in the message. Raising it means
 /// raising what `warm` covers with it (`TIERS[..N]` below) and re-measuring the worst
 /// admissible shape at the new tier on a fleet droplet.
+///
+/// **A precondition for raising it (audit v6, ZKV-6; recorded 2026-09-30).** This cap is also
+/// what keeps evm-core's storage-index weakness dormant. evm-core places a storage leaf by the
+/// top 32 bits of `keccak256(slot)` (circuits `guests-compiled/evm-core/src/storage.rs`), so a
+/// slot colliding with a chosen victim slot costs about 2^32 Keccaks, and while the attacker's
+/// slot holds a non-zero value the victim's can be neither read nor written — a targeted,
+/// persistent denial of one slot (no forgery, no lost value). It is unreachable today only
+/// because the EVM interpreter (18 009 words) exceeds [`max_callable_program_words`] at this
+/// tier. **Before any chain lifts this cap, or admits an EVM runtime small enough to call under
+/// it, the storage index must be deepened and `evm.bin` and its digest re-pinned**
+/// (`guests-compiled/PROVENANCE.md`, `tests/guest_provenance.rs`); it would then be a Medium.
 pub const MAX_CALL_TIER: u8 = 14;
 
 /// The highest `keccak_log_height` a call proof may declare — 2^12 rows, 128 permutations
@@ -391,6 +402,11 @@ pub fn max_input_log_height(tier: Tier) -> u8 {
 /// but no call can ever prove it — the shipped EVM interpreter (18 009 words) and sBPF interpreter
 /// (8 317) among them — so a deploy past it is refused: the node's pool policy on every chain
 /// (`admission::deploy_uncallable`), and a validity rule under genesis `hardening_v6`.
+///
+/// ZKV-6 (audit v6): this limit, with [`MAX_CALL_TIER`], is the only thing between the chain and
+/// evm-core's 32-bit storage index — see the precondition recorded on `MAX_CALL_TIER`. A change
+/// that lets the EVM interpreter, or a smaller EVM runtime, become callable needs the deeper
+/// index and a re-pinned `evm.bin` first.
 pub fn max_callable_program_words(public_segment_words: usize) -> usize {
     let tier = Tier(MAX_CALL_TIER as usize);
     let slots = tier.poseidon2_height() / crate::tables::poseidon2::BLOCK;
