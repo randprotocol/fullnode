@@ -285,35 +285,27 @@ pub fn is_permanent(e: &TxError) -> bool {
     }
     // The Dilithium2 co-signature's verdicts (bridge hardening B3). Every other bridge verdict
     // stays out: a digest's `Replay`, a guardian set's expiry and the registry's listings all move
-    // with this node's state. Of the five PQ refusals only the three that are about the list's
-    // own bytes are cached:
+    // with this node's state. Of the five PQ refusals only the two that are about the list's own
+    // bytes are cached:
     //
     // - `PqIndexOrder` — the indices as written, and nothing else;
-    // - `PqBadSignatureLength` — a byte length, like every other length above;
-    // - `PqIndexOutOfRange` — the index against `n`, the size of the genesis PQ set, which no
-    //   action changes (a payload-2 rotation moves the ECDSA set only; a PQ rotation is the
-    //   deferred payload 3, and when it lands this arm must be revisited, as `WrongChain` would
-    //   be if chain ids could move).
+    // - `PqBadSignatureLength` — a byte length, like every other length above.
     //
-    // `PqNoQuorum` also reads only the list's length and `n`, and `PqBadSignature` only the bytes,
-    // the genesis keys and the chain id, so both would qualify on `InvalidBundleProof`'s argument —
-    // they stay out on the conservative side of this line, like `MintTooLarge`: the quorum formula
-    // is shared with the governance quorums a later PQ-set change would move, and re-refusing
-    // either is cheap next to what a wrongly cached refusal costs (a relayer's mint censored on
-    // this node until restart). `PqNoQuorum` is decided before any other attest check and
-    // `PqBadSignature` only after a valid ECDSA quorum over an unconsumed digest.
+    // **Not cached since audit v6 (BRG-18), because bridge rules v2 made them state:**
     //
-    // B1's `BadPauseSignature` is cached: it depends on the transaction's bytes alone. The ledger
-    // checks the nonce first (`BadPauseNonce`, state, never cached) and the flag second, and only
-    // then verifies the signature over `pause_message(tx.chain_id, nonce)` — built from the
-    // transaction's own nonce and chain id — under the genesis `pause_key`, which no action
-    // changes. So a signature that fails once fails at every tip. Caching it matters because a
-    // `PauseMints` is bundle-less and fee-less: without the cache a peer could replay one bad
-    // pause and buy a Dilithium2 verification per delivery for free (the per-peer token bucket
-    // bounds the rate; this makes the repeats cost nothing). If a later action ever rotates the
-    // pause key, this arm must move out, as `PqIndexOutOfRange` would with a PQ rotation.
+    // - `PqIndexOutOfRange` — the index against `n`, the size of the PQ set. It was the genesis
+    //   set's, "which no action changes"; `RotatePqGuardians` (chains 15–18) changes it, so a
+    //   node one block behind a rotation to a larger set refused a valid mint for good.
+    // - `BadPauseSignature` — the signature under the chain's pause key, which `RotatePauseKey`
+    //   replaces. A node that had not yet applied the rotation cached a refusal of the new
+    //   holder's `PauseMints` and kept it until restart — the emergency brake, of all things.
+    //   What the cache bought there was free repeats of one bad pause (it is bundle-less and
+    //   fee-less); without it each repeat costs a Dilithium2 verify, bounded by the per-peer
+    //   token bucket like every other uncached refusal.
     //
-    // F1's `WrongDepositBlinding` is cached too: it compares the action's `r` with
+    // `PqNoQuorum` and `PqBadSignature` were always out, on the same side of this line.
+    //
+    // F1's `WrongDepositBlinding` is cached: it compares the action's `r` with
     // `blake3("rand-deposit-r-1" ‖ mu)` of the action's own `attestation` bytes — no key, no
     // registry, no height — so the same bytes are refused at every tip.
     if let TxError::Bridge(b) = e {
@@ -321,9 +313,7 @@ pub fn is_permanent(e: &TxError) -> bool {
         return matches!(
             b,
             B::PqIndexOrder
-                | B::PqIndexOutOfRange { .. }
                 | B::PqBadSignatureLength { .. }
-                | B::BadPauseSignature
                 | B::WrongDepositBlinding
                 // A transfer amount that fits no note — past `u64`, or at or above 2^63 under
                 // `tokens.bound_note_value` (deep scan 2026-09-24): the wire bytes against a
@@ -975,17 +965,27 @@ mod tests {
         assert_eq!(c.len(), 0);
     }
 
-    /// B3's co-signature verdicts: the list's own bytes (order, lengths) and its indices against
-    /// the genesis PQ set's size are cached; the count and a failed verification are not, and no
-    /// other bridge verdict is either.
+    /// B3's co-signature verdicts: the list's own bytes (order, lengths) are cached; the count
+    /// and a failed verification are not, and no other bridge verdict is either.
+    ///
+    /// Audit v6, BRG-18: an index against the PQ set's size was cached too, as "the genesis PQ
+    /// set, which no action changes" — and since bridge rules v2 (chains 15–18) `RotatePqGuardians`
+    /// changes it. A node one block behind a rotation to a larger set cached `PqIndexOutOfRange`
+    /// against the old size and refused the relayer's valid mint until it was restarted.
     #[test]
     fn only_the_byte_level_pq_verdicts_are_cached() {
         use randprotocol_core::bridge::BridgeError as B;
-        for b in [B::PqIndexOrder, B::PqIndexOutOfRange { index: 6, n: 6 }, B::PqBadSignatureLength { index: 4, len: 2419 }] {
+        for b in [B::PqIndexOrder, B::PqBadSignatureLength { index: 4, len: 2419 }] {
             let e = TxError::Bridge(b);
             assert!(is_permanent(&e), "{e} is a statement about the list's bytes");
         }
-        for b in [B::PqNoQuorum { have: 4, need: 5, n: 6 }, B::PqBadSignature { index: 0 }, B::Replay, B::WrongEmitter] {
+        for b in [
+            B::PqIndexOutOfRange { index: 6, n: 6 },
+            B::PqNoQuorum { have: 4, need: 5, n: 6 },
+            B::PqBadSignature { index: 0 },
+            B::Replay,
+            B::WrongEmitter,
+        ] {
             let e = TxError::Bridge(b);
             assert!(!is_permanent(&e), "{e} is kept out of the cache");
         }
@@ -1061,14 +1061,15 @@ mod tests {
         assert!(is_permanent(&e), "{e} is the body's bytes against a genesis constant");
     }
 
+    /// Audit v6, BRG-18: a bad pause signature was cached as a verdict on the bytes against
+    /// "the genesis `pause_key`, which no action changes". `RotatePauseKey` (bridge rules v2)
+    /// changes it: a node that had not yet applied the rotation refused the new holder's valid
+    /// `PauseMints` — the emergency brake — and remembered the refusal until restart.
     #[test]
-    fn a_bad_pause_signature_is_a_byte_verdict_and_is_cached() {
+    fn a_bad_pause_signature_depends_on_the_pause_key_and_is_not_cached() {
         use randprotocol_core::bridge::BridgeError as B;
         let e = TxError::Bridge(B::BadPauseSignature);
-        assert!(is_permanent(&e), "{e} depends on the transaction's bytes alone");
-        let mut c = RefusedCache::new(4);
-        c.insert(h(7), e.clone());
-        assert_eq!(c.get(&h(7)), Some(&e), "the cache keeps it");
+        assert!(!is_permanent(&e), "{e} reads the chain's current pause key");
     }
 
     /// The aggregate verdicts, split: the byte-verdicts and the genesis-constant ones are
