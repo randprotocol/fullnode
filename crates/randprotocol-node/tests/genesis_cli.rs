@@ -178,7 +178,10 @@ fn the_genesis_command_pins_guest_v3_with_the_auth_guest() {
     assert_eq!(printed, state.hash().to_hex());
 
     let datadir = dir.path().join("data");
+    // The genesis this harness writes names the `test` profile, which the binary refuses at
+    // `init` without being told this is a test (ZK-5a): the harness's environment variable.
     let init = Command::new(env!("CARGO_BIN_EXE_rand-node"))
+        .env("RAND_ALLOW_TEST_FRI_PROFILE", "1")
         .args(["init", "--datadir"])
         .arg(&datadir)
         .arg("--genesis")
@@ -191,4 +194,54 @@ fn the_genesis_command_pins_guest_v3_with_the_auth_guest() {
     let help = Command::new(env!("CARGO_BIN_EXE_rand-node")).args(["genesis", "--help"]).output().unwrap();
     let help = String::from_utf8_lossy(&help.stdout);
     assert!(help.contains("--auth-guest") && help.contains("v1|v2|v3"), "{help}");
+}
+
+/// Audit v6, ZK-5a: a genesis naming `fri_profile: "test"` proves about 17 bits, and whoever
+/// writes a genesis file can select it. The binary refuses it at `init` and `run` unless told
+/// this is a test — `--allow-test-fri-profile` or `RAND_ALLOW_TEST_FRI_PROFILE=1` — and says
+/// what the profile is worth; `genesis --fri-profile test` warns on stderr; a production-profile
+/// genesis needs nothing. (`verify` reads the same genesis through the same check as `run`.)
+#[test]
+fn the_binary_refuses_a_test_profile_genesis_unless_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("genesis.json");
+    let written = genesis(&out, &[]);
+    assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));
+    let warned = String::from_utf8_lossy(&written.stderr);
+    assert!(warned.contains("fri_profile \"test\"") && warned.contains("17 bits"), "genesis warns: {warned}");
+
+    let node = || Command::new(env!("CARGO_BIN_EXE_rand-node"));
+    let datadir = dir.path().join("data");
+    // `init` without the flag: refused, naming the profile's worth; nothing initialised.
+    let refused = node().env_remove("RAND_ALLOW_TEST_FRI_PROFILE").args(["init", "--datadir"]).arg(&datadir).arg("--genesis").arg(&out).output().unwrap();
+    assert!(!refused.status.success());
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(err.contains("fri_profile \"test\"") && err.contains("17 bits") && err.contains("--allow-test-fri-profile"), "{err}");
+    assert!(!datadir.join("db").exists(), "the refusal opened no database");
+    // With the flag: accepted.
+    let allowed = node().env_remove("RAND_ALLOW_TEST_FRI_PROFILE").args(["init", "--allow-test-fri-profile", "--datadir"]).arg(&datadir).arg("--genesis").arg(&out).output().unwrap();
+    assert!(allowed.status.success(), "{}", String::from_utf8_lossy(&allowed.stderr));
+    // `run` on that datadir without the flag: refused before the key is read (no key exists).
+    let key = dir.path().join("node.key.json");
+    let refused = node().env_remove("RAND_ALLOW_TEST_FRI_PROFILE").args(["run", "--datadir"]).arg(&datadir).arg("--key").arg(&key).output().unwrap();
+    assert!(!refused.status.success());
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(err.contains("fri_profile \"test\""), "{err}");
+    assert!(!err.contains("node.key.json"), "refused before the key was read: {err}");
+    // With the environment variable it gets past the profile, to the missing key.
+    let past = node().env("RAND_ALLOW_TEST_FRI_PROFILE", "1").args(["run", "--datadir"]).arg(&datadir).arg("--key").arg(&key).output().unwrap();
+    let err = String::from_utf8_lossy(&past.stderr);
+    assert!(!err.contains("fri_profile"), "{err}");
+
+    // A production-profile genesis: no warning, and `init` needs nothing.
+    let prod = dir.path().join("production.json");
+    let written = node()
+        .args(["genesis", "--chain-id", "14", "--fri-profile", "production", "--validator", &validator_arg(), "--out"])
+        .arg(&prod)
+        .output()
+        .unwrap();
+    assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));
+    assert!(!String::from_utf8_lossy(&written.stderr).contains("17 bits"));
+    let init = node().env_remove("RAND_ALLOW_TEST_FRI_PROFILE").args(["init", "--datadir"]).arg(dir.path().join("prod-data")).arg("--genesis").arg(&prod).output().unwrap();
+    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
 }

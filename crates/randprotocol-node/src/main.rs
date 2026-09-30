@@ -288,6 +288,33 @@ async fn submit_staking(args: &StakingArgs, chain_id: u64, action: randprotocol_
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Audit v6, ZK-5a: run `init`, `run` or `verify` on a genesis whose `fri_profile` is `test`
+    /// — 16 FRI queries and 4 grinding bits, about 17 bits of soundness, no protection against a
+    /// forged proof. A release node refuses such a genesis without this (or
+    /// `RAND_ALLOW_TEST_FRI_PROFILE=1`, for the test harnesses). Never on a chain with value.
+    #[arg(long, global = true)]
+    allow_test_fri_profile: bool,
+}
+
+/// Audit v6, ZK-5a: whoever writes or alters a genesis file can name the `test` FRI profile, and
+/// a validator started from that file would run it — proving under 16 queries and 4 grinding
+/// bits, ~17 bits, where a forgery is a few thousand attempts. The library (`node::start`, the
+/// suites' path) is unchanged; the *binary* refuses the profile at `init`, `run` and `verify`
+/// unless told, in so many words, that this is a test.
+fn refuse_test_fri_profile(profile: &str, allowed: bool) -> Result<()> {
+    if profile == "test" && !allowed {
+        anyhow::bail!(
+            "this genesis names fri_profile \"test\": 16 FRI queries and 4 grinding bits, about 17 bits of soundness — a \
+             forged proof is a few thousand attempts, so it protects nothing. A release node refuses it; pass \
+             --allow-test-fri-profile (or set RAND_ALLOW_TEST_FRI_PROFILE=1) only for a test harness"
+        );
+    }
+    Ok(())
+}
+
+/// The flag, or the environment variable the test harnesses set.
+fn test_fri_profile_allowed(cli: &Cli) -> bool {
+    cli.allow_test_fri_profile || std::env::var("RAND_ALLOW_TEST_FRI_PROFILE").is_ok_and(|v| v == "1")
 }
 
 #[derive(Subcommand)]
@@ -1127,6 +1154,7 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,libp2p=warn,libp2p_mdns=off".into()))
         .init();
     let cli = Cli::parse();
+    let test_profile_allowed = test_fri_profile_allowed(&cli);
     if opens_storage(&cli.cmd) {
         match randprotocol_node::rlimit::raise_nofile_limit() {
             Ok((soft, hard)) => tracing::debug!(soft, hard, "open-files limit"),
@@ -1310,6 +1338,12 @@ async fn main() -> Result<()> {
                 gen.alloc.push(deposit_note(addr, amount, envelope_format)?);
                 println!("  alloc {} RAND to {addr}", format_amount(amount));
             }
+            if gen.fri_profile == "test" {
+                eprintln!(
+                    "warning: fri_profile \"test\" proves about 17 bits and protects nothing; a release node refuses this genesis \
+                     at init, run and verify without --allow-test-fri-profile"
+                );
+            }
             let executor = node::executor_for_profile(&gen.fri_profile)?;
             let state = gen.build(executor.as_ref())?;
             std::fs::write(&out, gen.to_json())?;
@@ -1340,6 +1374,7 @@ async fn main() -> Result<()> {
             std::fs::create_dir_all(&datadir)?;
             let text = std::fs::read_to_string(&genesis)?;
             let g = Genesis::from_json(&text)?;
+            refuse_test_fri_profile(&g.fri_profile, test_profile_allowed)?;
             let executor = node::executor_for_profile(&g.fri_profile)?;
             let gs = g.build(executor.as_ref())?;
             std::fs::write(datadir.join("genesis.json"), &text)?;
@@ -1351,6 +1386,7 @@ async fn main() -> Result<()> {
         Cmd::Verify { datadir, mode, repair } => {
             let mode: VerifyMode = mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let (gs, executor) = node::load_genesis(&datadir)?;
+            refuse_test_fri_profile(&gs.fri_profile, test_profile_allowed)?;
             node::refuse_chains_this_build_cannot_run(&gs)?;
             let storage = Storage::open(&datadir)?;
             let check = storage.verify_chain(&gs, mode, executor.as_ref())?;
@@ -1417,6 +1453,12 @@ async fn main() -> Result<()> {
             // it fails here, loudly, rather than starting as though it were honoured (VK-4).
             if prover_accept_spend_key {
                 anyhow::bail!(randprotocol_prover::service::spend_key_flag_retired("--prover-accept-spend-key"));
+            }
+            // ZK-5a: the datadir's genesis file, read for its profile alone, before the key is
+            // read or the database opened. A datadir without one is left to `node::start_with`
+            // to report as it always has.
+            if let Ok(text) = std::fs::read_to_string(datadir.join("genesis.json")) {
+                refuse_test_fri_profile(&Genesis::from_json(&text)?.fri_profile, test_profile_allowed)?;
             }
             // Every prover check runs, and its address is bound, before the node key is read or
             // the database opened, so a misconfigured prover (or a port in use) exits at once.

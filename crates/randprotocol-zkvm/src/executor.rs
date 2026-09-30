@@ -1769,6 +1769,76 @@ fn prove_pinned_bundle(
 
 #[cfg(test)]
 mod tests {
+    /// Audit v6, ZKV-3 (and the paper's Theorem `frisoundness`, `randprotocol.tex`): the
+    /// composite soundness of the production FRI profile, computed from the constants the chain
+    /// runs — never written down as an answer — must clear the margin the paper claims, at the
+    /// largest trace the verifier admits. The accounting, in bits:
+    ///
+    /// - query term (proven, proximity gaps, unique-decoding regime): a word `δ`-far from the
+    ///   rate-`ρ` Reed–Solomon code survives one query with probability at most `(1 + ρ)/2`, so
+    ///   `q` queries buy `q · log2(2 / (1 + ρ))` bits — 0.830 a query at `ρ = 1/8` — and `g`
+    ///   grinding bits multiply the cheater's attempts by `2^g`: `q · log2(2/(1+ρ)) + g`;
+    /// - field/DEEP term: the folding and out-of-domain challenges come from `F_{p^k}`, and a
+    ///   break there is a root of a degree-`≤ C·N` identity, `C·N / |F_{p^k}|` by
+    ///   Schwartz–Zippel: `k · log2(p) − log2(N) − log2(C)` bits, with the paper's pessimistic
+    ///   `C = 8` and `N` the largest committed trace — `2^MAX_MEM_LOG_HEIGHT` rows, doubled by
+    ///   the hiding PCS (`degree_bits` counts the zk doubling), the paper's `N ≤ 2^25`;
+    /// - the composite is the minimum of the two; the ethSTARK-conjectured query term
+    ///   (`q · log2(1/ρ) + g`) is what the "≈ 100 bits, limited by the field" figure rests on.
+    ///
+    /// Targets: 86 bits proven classical (the paper's `80 × 0.830 + 20 = 86.4`) and a field term
+    /// at 100 bits (`2 · 64 − 25 − 3`; `p = 2^64 − 2^32 + 1` rounds to `2^64` in an f64, and the
+    /// true term is `100 − 6.7·10⁻¹⁰`), so the conjectured composite is the paper's `≈ 100`. Every constant is read from where the
+    /// prover and verifier read it, and each is pinned besides, so the test goes red when the
+    /// queries drop (27, the M2.2 retune: 27 × 0.830 + 20 = 42.4), the grinding shrinks, the
+    /// blowup or the extension degree moves, or the memory ceiling rises (25 rows of log height
+    /// puts the field term at 99 bits, under the paper's claim).
+    #[test]
+    fn the_production_fri_profiles_composite_soundness_clears_its_target_at_the_memory_ceiling() {
+        use crate::machine::{Challenge, FriProfile, Val, MAX_MEM_LOG_HEIGHT};
+        use p3_field::{BasedVectorSpace, PrimeField64};
+        const PROVEN_TARGET_BITS: f64 = 86.0;
+        const FIELD_TERM_TARGET_BITS: f64 = 100.0 - 1e-6;
+        const PESSIMISTIC_C_BITS: f64 = 3.0; // C = 8
+
+        let q = FriProfile::Production.num_queries() as f64;
+        let g = FriProfile::Production.pow_bits() as f64;
+        let rho = 1.0 / (1u64 << super::FRI_LOG_BLOWUP) as f64;
+        let k = <Challenge as BasedVectorSpace<Val>>::DIMENSION as f64;
+        let log2_p = (Val::ORDER_U64 as f64).log2();
+        let log2_n = MAX_MEM_LOG_HEIGHT as f64 + 1.0;
+
+        let per_query = (2.0 / (1.0 + rho)).log2();
+        let proven_query_bits = q * per_query + g;
+        let conjectured_query_bits = q * (1.0 / rho).log2() + g;
+        let field_term_bits = k * log2_p - log2_n - PESSIMISTIC_C_BITS;
+        let proven_composite = proven_query_bits.min(field_term_bits);
+        let conjectured_composite = conjectured_query_bits.min(field_term_bits);
+
+        assert!((per_query - 0.830).abs() < 5e-4, "0.830 bits a query at ρ = 1/8, got {per_query}");
+        assert!(
+            proven_composite >= PROVEN_TARGET_BITS,
+            "proven composite {proven_composite:.1} bits (queries {proven_query_bits:.1}, field {field_term_bits:.3}) is under the {PROVEN_TARGET_BITS}-bit target"
+        );
+        assert!(
+            field_term_bits >= FIELD_TERM_TARGET_BITS,
+            "the field/DEEP term at the memory ceiling is {field_term_bits:.6} bits, under the paper's 100"
+        );
+        assert!(conjectured_composite >= 99.0 && conjectured_composite < 101.0, "the conjectured composite is the field term, ≈ 100: {conjectured_composite:.3}");
+        assert!(conjectured_query_bits > field_term_bits, "under the conjecture the field, not the queries, is the bound");
+        // The constants themselves, so a re-vendor that moves one is caught here by name and not
+        // only by the arithmetic above.
+        assert_eq!(FriProfile::Production.num_queries(), 80);
+        assert_eq!(FriProfile::Production.pow_bits(), 20);
+        assert_eq!(super::FRI_LOG_BLOWUP, 3);
+        assert_eq!(<Challenge as BasedVectorSpace<Val>>::DIMENSION, 2);
+        assert_eq!(Val::ORDER_U64, 0xffff_ffff_0000_0001, "Goldilocks, 2^64 − 2^32 + 1");
+        assert_eq!(MAX_MEM_LOG_HEIGHT, 24);
+        // And the test profile is what ZK-5a says it is: 16 queries, 4 grinding bits, ~17 bits.
+        let test_bits = FriProfile::Test.num_queries() as f64 * per_query + FriProfile::Test.pow_bits() as f64;
+        assert!(test_bits < 20.0, "the test profile is no protection: {test_bits:.1} bits");
+    }
+
     /// The ledger prices gas with `randprotocol_core::gas::gas_max` (core cannot name this crate);
     /// the verifier refuses a `GAS_LIMIT` above the vendored `gas::gas_max`. The two must agree
     /// for every tier and every height a header can carry, or the chain would pin a

@@ -28,6 +28,14 @@ rand-node <COMMAND>
 There is no `balance` and no `transfer` subcommand: this chain has no accounts to query and a
 transfer needs a shielded spend key, which only the wallet holds. Use `rand` for both.
 
+One global flag, `--allow-test-fri-profile` (or `RAND_ALLOW_TEST_FRI_PROFILE=1` in the
+environment), lets `init`, `run` and `verify` accept a genesis whose `fri_profile` is `test`
+(audit v6, ZK-5a). That profile is 16 FRI queries and 4 grinding bits — about 17 bits of
+soundness, a forged proof in a few thousand attempts — and whoever writes a genesis file can name
+it, so a release node refuses such a genesis and says what the profile is worth. The test suites
+set the variable; nothing else should. A production-profile genesis (every chain ever cut) needs
+neither.
+
 ### `rand-node keygen`
 
 | argument | default | meaning |
@@ -71,7 +79,7 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | `--out <OUT>` | `genesis.json` | output path |
 | `--faucet` | off | **testnet only**: enable `Mint` transactions (`rand_mint`, up to 100 RAND per call). Part of the genesis hash |
 | `--no-confidential` | off | disable Deploy/Call transactions on this chain. Part of the genesis hash |
-| `--fri-profile <production\|test>` | `production` | zkVM FRI profile every node must use; `test` is insecure and for the test suite. Part of the genesis hash |
+| `--fri-profile <production\|test>` | `production` | zkVM FRI profile every node must use; `test` is insecure and for the test suite (the command warns on stderr, and `init`/`run`/`verify` refuse the file without `--allow-test-fri-profile`). Part of the genesis hash |
 | `--bundle-guest <v1\|v2\|v3>` | `v1` | the bundle guest pinned as `hc_bundle`: `v1` (the hidden-asset guest chains 14 and 15 run), `v2` (the branch-free guest, INT-2 / GV-1), or `v3` (split authorisation: `nk` and a salt instead of the spend key, `60af094a…`). `v3` needs `--auth-guest` |
 | `--auth-guest` | off | pin this build's auth guest as `hc_auth` (`1e4e347f…`): every bundle then carries an auth proof over the spend key, bound to its transaction, whose output equals the bundle's `auth_commit` (`docs/shielded.md` §2). Required with `--bundle-guest v3` and refused with `v1`/`v2`, each with its reason, before any file is written. Absent, the file has no `hc_auth` field and the genesis hash is what it was; present, it is tagged and appended to the hash after `hardening_v6` (a `gas` section, when set, comes after it) |
 | `--gas-price <UNITS>` | none — no `gas` section | units of RAND per gas the chain itself charges a call (constraint set 8, `docs/fees.md` §1.1). Writing this flag is what turns the section on at all; the other three below are refused without it (`rand-node genesis` errors, naming the flag). Part of the genesis hash |
