@@ -1107,6 +1107,23 @@ mod tests {
         assert_eq!(refusal(&l, &invoke(&l, 30, (0, 0, 0), twice)), TxError::CommitmentExists(cm));
     }
 
+    /// The v0.6 canonical-proof rule (`hardening_v6`, which the section requires) reaches an
+    /// invoke's call proof as it reaches a call's: a header field the verifier accepts at more
+    /// than one value lets whoever relays the transaction re-encode the proof into a second
+    /// transaction id, and the call binding blanks the proof, so both ids would verify.
+    #[test]
+    fn the_canonical_proof_rule_covers_an_invokes_call_proof() {
+        let l = ledger();
+        let tx = invoke(&l, 10, (0, 0, 0), Transition { writes: vec![cell(1, 5)], ..empty() });
+        let Action::Invoke { proof, .. } = &tx.action else { panic!("an invoke") };
+        let flagged = proof.clone();
+        let check = |p: &[u8]| (p == flagged.as_slice()).then(|| "memory height 17".to_string());
+        assert_eq!(
+            crate::ledger::non_canonical_proofs(&tx, &check),
+            Some(TxError::NonCanonicalProof("call proof: memory height 17".into()))
+        );
+    }
+
     /// The context layout is the program ABI: pinned word for word.
     #[test]
     fn the_context_words_are_pinned() {
