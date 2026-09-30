@@ -1288,7 +1288,7 @@ async fn main() -> Result<()> {
                     if rows.is_empty() {
                         println!("no notes (run `rand sync`)");
                     } else {
-                        println!("{:>8}  {:>22}  {}", "asset", "units", "token");
+                        println!("{:>8}  {:>22}  token", "asset", "units");
                         for (index, units) in rows {
                             println!("{index:>8}  {units:>22}  {}", token_of(index));
                         }
@@ -1315,7 +1315,7 @@ async fn main() -> Result<()> {
                 // the commit: not spent, not spendable, and the next `sync` decides which.
                 // `amount` is in the asset's own smallest unit, so only asset 0 is a RAND figure;
                 // a bridged asset's decimals belong to its source chain, not to this one.
-                println!("{:>8}  {:>5}  {:>22}  {:>8}  {:>7}  {:<9}  {}", "index", "asset", "amount", "height", "spent", "pending", "memo");
+                println!("{:>8}  {:>5}  {:>22}  {:>8}  {:>7}  {:<9}  memo", "index", "asset", "amount", "height", "spent", "pending");
                 for n in &store.notes {
                     let pending = match n.pending {
                         Some(time) => format!("since {time}"),
@@ -2550,7 +2550,7 @@ mod tests {
             format!("\r\x1b[2K{tail}"),
             format!("\n\nto alice\u{2028}{tail}\u{2029}"),
             format!("\u{202E}DNAR 1\u{202C} \u{2066}{tail}\u{2069}\u{200E}\u{200F}\u{061C}"),
-            format!("a\u{200B}\u{200C}\u{200D}b\u{2060}\u{2064}c\u{FEFF}d\u{00AD}e"),
+            "a\u{200B}\u{200C}\u{200D}b\u{2060}\u{2064}c\u{FEFF}d\u{00AD}e".to_string(),
         ]
     }
 

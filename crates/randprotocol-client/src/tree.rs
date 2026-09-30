@@ -219,8 +219,8 @@ impl LocalTree {
                     None => (peak, d),
                     Some((right, level)) => {
                         let mut right = right;
-                        for lvl in level..d {
-                            right = h(&right, &empty[lvl]);
+                        for e in &empty[level..d] {
+                            right = h(&right, e);
                         }
                         (h(&peak, &right), d + 1)
                     }
@@ -229,8 +229,8 @@ impl LocalTree {
         }
         match acc {
             Some((mut root, level)) => {
-                for lvl in level..DEPTH {
-                    root = h(&root, &empty[lvl]);
+                for e in &empty[level..DEPTH] {
+                    root = h(&root, e);
                 }
                 root
             }

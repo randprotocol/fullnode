@@ -177,7 +177,7 @@ impl Pairings {
         tmp.push(".tmp");
         let tmp = std::path::PathBuf::from(tmp);
         let out = Pairings { version: PAIRINGS_VERSION, pairings: self.pairings.clone() };
-        let text = serde_json::to_string_pretty(&out).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        let text = serde_json::to_string_pretty(&out).map_err(Error::other)?;
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]

@@ -185,7 +185,7 @@ pub(crate) mod tests {
             format!("\r\x1b[2K{tail}"),
             format!("\n\nto alice\u{2028}{tail}\u{2029}"),
             format!("\u{202E}DNAR 1\u{202C} \u{2066}{tail}\u{2069}\u{200E}\u{200F}\u{061C}"),
-            format!("a\u{200B}\u{200C}\u{200D}b\u{2060}\u{2061}\u{2062}\u{2063}\u{2064}c\u{FEFF}d\u{00AD}e"),
+            "a\u{200B}\u{200C}\u{200D}b\u{2060}\u{2061}\u{2062}\u{2063}\u{2064}c\u{FEFF}d\u{00AD}e".to_string(),
             format!("\t{tail}\u{7f}\u{85}\u{9b}31m"),
         ]
     }

@@ -414,6 +414,7 @@ async fn restart_cycles_keep_all_nodes_in_sync() {
 
     // Restart nodes 1, 2, 3 in turn (never the bootstrap node, so the others keep an address to dial).
     for cycle in 0..2u8 {
+        #[allow(clippy::needless_range_loop)] // `i` is the node's place in three parallel lists
         for i in 1..4 {
             // `before` is the head the node left on disk, read after it stopped. Reading it
             // from the running node first raced the node's own commits (audit v6, PROC-8: CI run

@@ -56,7 +56,7 @@ impl ProverKey {
     /// (`ErrorKind::AlreadyExists`), so a prover's key is never silently rotated.
     pub fn save_new(&self, path: &Path) -> std::io::Result<()> {
         let file = KeyFile { version: KEY_FILE_VERSION, kind: KEY_FILE_KIND.into(), seed: hex::encode(&self.seed[..]) };
-        let text = Zeroizing::new(serde_json::to_string_pretty(&file).map_err(|e| Error::new(ErrorKind::Other, e))?);
+        let text = Zeroizing::new(serde_json::to_string_pretty(&file).map_err(Error::other)?);
         drop(Zeroizing::new(file.seed)); // the struct's hex copy of the seed, wiped now that `text` holds it
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);

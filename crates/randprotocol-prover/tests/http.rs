@@ -49,7 +49,7 @@ async fn info_submit_status_cancel_over_json_rpc() {
     let rk = j.reply_key;
     let sealed = hex::encode(seal_job(&ek, &j).unwrap());
     let r = rpc(&http, addr, "prover_submit", json!([sealed])).await;
-    let id = r["result"]["job"].as_str().expect(&r.to_string()).to_string();
+    let id = r["result"]["job"].as_str().unwrap_or_else(|| panic!("{}", r.to_string())).to_string();
     let mut last = Value::Null;
     for _ in 0..100 {
         last = rpc(&http, addr, "prover_status", json!([id])).await;

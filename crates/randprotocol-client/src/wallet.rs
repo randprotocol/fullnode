@@ -143,7 +143,7 @@ impl Wallet {
             // handed out must not leave an empty file where the only copy of a secret should be
             // (node I1's companion).
             f.sync_all().with_context(|| format!("flushing {}", path.display()))?;
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(unix))]
         {
@@ -1233,7 +1233,7 @@ pub enum SelectError {
 /// group.
 pub fn select_inputs(spendable: &[&OwnedNote], need: u64) -> Result<Vec<OwnedNote>, SelectError> {
     let mut sorted: Vec<&OwnedNote> = spendable.to_vec();
-    sorted.sort_by(|a, b| b.note.amount.cmp(&a.note.amount));
+    sorted.sort_by_key(|n| std::cmp::Reverse(n.note.amount));
     let have: u64 = sorted.iter().map(|n| n.note.amount).sum();
     if have < need {
         return Err(SelectError::Insufficient { have });
@@ -1959,7 +1959,7 @@ fn build_bundle(w: &Wallet, plan: &Plan, anchor: Word8, paths: &[[Word8; DEPTH]]
         slot_input(2, plan.r_notes.first())?,
         slot_input(3, plan.r_notes.get(1))?,
     ];
-    debug_assert!(A_SLOTS == 2 && SLOTS == 4, "the slot layout this builder fills");
+    const { assert!(A_SLOTS == 2 && SLOTS == 4, "the slot layout this builder fills") };
 
     let mut outs = [HiddenOutput { pk: [0; 8], amount: 0, r: [0; 8] }; SLOTS];
     let mut envelopes: Vec<Envelope> = Vec::with_capacity(SLOTS);
@@ -2326,7 +2326,6 @@ async fn settle(
 /// the proof empty, take its binding, prove against it, fill the proof in, submit. One code path,
 /// so the fee, the anchor, the witnesses and the digest check cannot drift apart between a
 /// transfer, a bond, a deploy, a call, an attestation and a burn.
-#[allow(clippy::too_many_arguments)]
 ///
 /// `call_prover` is the INT-4 hook (genesis `hardening_v6`): for a `Call` it is handed the
 /// transaction's [`Transaction::call_binding`] — taken with both proofs empty — and returns the
@@ -2573,7 +2572,7 @@ fn burn_is_possible(
     let decimals = backing["decimals"].as_u64().context("an asset row without the coin's decimals")?;
     let decimals = u8::try_from(decimals).context("an asset row whose decimals is not a byte")?;
     let unit = randprotocol_core::ledger::tokens::release_unit(decimals);
-    if amount % unit != 0 || relayer_fee % unit != 0 {
+    if !amount.is_multiple_of(unit) || !relayer_fee.is_multiple_of(unit) {
         return Err(anyhow!(
             "{hex_token} on chain {to_chain} has {decimals} decimals: \
              the amount and the relayer fee must be multiples of {unit}"
@@ -3503,6 +3502,7 @@ pub struct RegisterTokenPlan {
 /// rule, `TokenError::InitialMintRequired`) and a zero `--fixed-supply`/`--initial` amount, so
 /// this only checks the metadata, reads the chain and builds the note. `chain_id` is the one the
 /// transaction is built for, which decides the initial mint's envelope format (issue #64).
+#[allow(clippy::too_many_arguments)]
 pub async fn build_register_token(
     rpc: &RpcClient,
     w: &Wallet,
@@ -3574,6 +3574,7 @@ fn row_id_and_nonce(row: &Value, asset: u32) -> Result<(Hash, u64)> {
 /// `authority` is not that key, then the note the chain will compute and `authority`'s Dilithium2
 /// signature over [`token_mint_message`], which binds the note's commitment and the envelope's
 /// digest.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_token_mint(
     rpc: &RpcClient,
     w: &Wallet,
@@ -7450,7 +7451,7 @@ mod tests {
         assert_eq!(back.scanned_attest_height, 5, "the deposit-rebuild cursor survives the round trip");
         assert_eq!(back.notes.len(), 2);
         assert_eq!(back.notes[0].note, store.notes[0].note);
-        assert_eq!(back.notes[1].spent, true);
+        assert!(back.notes[1].spent);
         assert_eq!(back.sent[0].amount, 11);
         assert_eq!(back.balance(), 5);
     }
@@ -7502,9 +7503,9 @@ mod tests {
         let rows = output_keys(&me, &tx);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!((rows[0].output, rows[0].slot, rows[0].role), ("bundle", 0, KeyRole::Sent));
-        assert_eq!((rows[0].key, rows[0].note.clone()), (k_pay, pay.clone()));
+        assert_eq!((rows[0].key, rows[0].note), (k_pay, pay));
         assert_eq!((rows[1].output, rows[1].slot, rows[1].role), ("bundle", 1, KeyRole::Change));
-        assert_eq!((rows[1].key, rows[1].note.clone()), (k_change, change));
+        assert_eq!((rows[1].key, rows[1].note), (k_change, change));
         // The recovered key is the disclosure key: it opens that output and no other.
         let env = envelope_from_core(&tx.bundle.as_ref().unwrap().envelopes[0]);
         assert_eq!(env.open_with_tx_key(pay.commitment(), &rows[0].key), Some(pay));
@@ -7518,7 +7519,7 @@ mod tests {
         let (tx, k_pay, _, pay, _) = payment(&me, &you);
         let rows = output_keys(&you, &tx);
         assert_eq!(rows.len(), 1, "the change is none of the receiver's business: {rows:?}");
-        assert_eq!((rows[0].role, rows[0].key, rows[0].note.clone()), (KeyRole::Received, k_pay, pay));
+        assert_eq!((rows[0].role, rows[0].key, rows[0].note), (KeyRole::Received, k_pay, pay));
         assert!(output_keys(&Wallet::from_spend_key(SpendKey([13; 8])), &tx).is_empty());
     }
 

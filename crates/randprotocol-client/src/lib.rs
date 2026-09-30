@@ -227,7 +227,7 @@ pub fn words_from_le_hex(s: &str) -> Result<Vec<u32>> {
     if bytes.len() % 4 != 0 {
         return Err(anyhow!("the public input is {} bytes, not whole words", bytes.len()));
     }
-    Ok(bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes"))).collect())
+    Ok(bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect())
 }
 
 /// One leaf of the commitment tree as `rand_getCommitments` reports it: the leaf index, the
