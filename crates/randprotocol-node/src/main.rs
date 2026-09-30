@@ -536,8 +536,9 @@ enum Cmd {
         /// Directory holding the prover's prover.key.json and pairings.json [default: <datadir>/prover].
         #[arg(long)]
         prover_home: Option<PathBuf>,
-        /// Accept spend-key witnesses (only for wallets you own).
-        #[arg(long)]
+        /// Retired (VK-4): still parsed, so a unit file that passes it fails with the reason
+        /// instead of an "unexpected argument"; `run` refuses to start when it is given.
+        #[arg(long, hide = true)]
         prover_accept_spend_key: bool,
         /// Proofs the hosted prover runs at once.
         #[arg(long, default_value_t = 1)]
@@ -1159,6 +1160,11 @@ async fn main() -> Result<()> {
             gas_price,
             byte_price,
         } => {
+            // The retired flag first, with or without `--prover`: a unit file that still passes
+            // it fails here, loudly, rather than starting as though it were honoured (VK-4).
+            if prover_accept_spend_key {
+                anyhow::bail!(randprotocol_prover::service::spend_key_flag_retired("--prover-accept-spend-key"));
+            }
             // Every prover check runs, and its address is bound, before the node key is read or
             // the database opened, so a misconfigured prover (or a port in use) exits at once.
             let hosted: Option<HostedProver> = match prover {
@@ -1167,7 +1173,6 @@ async fn main() -> Result<()> {
                     addr,
                     rpc,
                     home: prover_home.unwrap_or_else(|| datadir.join("prover")),
-                    accept_spend_key: prover_accept_spend_key,
                     max_parallel: prover_max_parallel,
                     max_queue: prover_max_queue,
                     cuda: prover_cuda,

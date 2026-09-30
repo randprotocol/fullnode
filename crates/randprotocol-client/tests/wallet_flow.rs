@@ -662,60 +662,52 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
 
 /// One validator's bonded stake, as `rand_getValidators` reports it: amounts go out as decimal
 /// strings, since a stake in units does not fit a JSON number safely.
-/// Delegated proving, Phase 1 end to end: a prover service (its own ML-KEM key, one `own` pairing,
-/// spend-key witnesses accepted, the real prove function) proves a wallet's send on a chain that
-/// pins the v2 hidden guest; the wallet opens the sealed reply, checks the digest and size,
-/// verifies locally and submits; the node admits it and the payee's scan finds the note.
+/// VK-4 (audit v6, decision D33) — this was the Phase 1 end to end, a spend-key witness proved by
+/// an `own` prover on a chain that pins the v2 guest; that witness path is retired. Against a real
+/// node on a v2-guest chain and a real prover service behind its listener, paired with `own=1`: a
+/// send through the prover is refused before the prover is sent anything (its queue stays empty)
+/// and before anything is proved or submitted — so this test takes no proving slot — and the
+/// wallet's RAND is untouched. Proving on this machine on such a chain is every other test here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_send_proved_by_a_paired_prover_is_admitted() {
+async fn a_pre_v3_chain_refuses_a_paired_prover_before_anything_is_sent() {
     init_tracing();
-    let started = Instant::now();
     let dir = tempfile::tempdir().unwrap();
     let key = Keypair::from_seed([107; 32]).unwrap();
     let handle = start_with(&dir, &key, genesis_v2(&key)).await;
     let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
 
-    // ---- the prover: its own key, one own pairing, spend-key jobs accepted ----
+    // ---- the prover: its own key, one pairing whose link says own=1 ----
     let pkey = randprotocol_prover::key::ProverKey::generate();
     let ek = pkey.kem_ek().to_vec();
     let mut pairings = randprotocol_prover::pairing::Pairings::default();
     let token = pairings.pair("laptop", true).unwrap();
-    let mut cfg = randprotocol_prover::service::Config::new(pkey, pairings);
-    cfg.accept_spend_key = true;
-    let (paddr, _svc, _ptask) = randprotocol_prover::http::serve("127.0.0.1:0".parse().unwrap(), cfg).await.expect("the prover listens");
+    let cfg = randprotocol_prover::service::Config::new(pkey, pairings);
+    let (paddr, svc, _ptask) = randprotocol_prover::http::serve("127.0.0.1:0".parse().unwrap(), cfg).await.expect("the prover listens");
     let link = randprotocol_prover::pairing::PairingLink { kem_ek: ek, url: format!("http://{paddr}"), token, own: true };
     let paired = randprotocol_client::prover::PairedProver::from_link(&link, Some("laptop".into()));
-    let proving = Proving::Remote(std::sync::Arc::new(randprotocol_client::prover::RemoteProver::new(paired)));
+    let remote = std::sync::Arc::new(randprotocol_client::prover::RemoteProver::new(paired));
+    let proving = Proving::Remote(remote.clone());
 
-    // ---- fund A, send to B through the prover ----
+    // ---- fund A, try to send to B through the prover ----
     let a = Wallet::from_spend_key(SpendKey([21; 8]));
     let b = Wallet::from_spend_key(SpendKey([22; 8]));
     let mut a_store = NoteStore::default();
-    let mut b_store = NoteStore::default();
     let mint = 100 * UNITS_PER_RAND;
     let hash = rpc.mint_shielded(&a.address.to_string(), Some(mint)).await.expect("mint accepted");
     rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
     wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
     assert_eq!(a_store.balance(), mint);
 
-    let fee = gas::BUNDLE_BASE;
-    let pay = UNITS_PER_RAND;
-    let slot = proving_slot().await;
-    let sub = wallet::send(&rpc, &a, &mut a_store, &b.address, pay, "", fee, FriProfile::Test, &proving, CHAIN_ID, true)
+    let e = wallet::send(&rpc, &a, &mut a_store, &b.address, UNITS_PER_RAND, "", gas::BUNDLE_BASE, FriProfile::Test, &proving, CHAIN_ID, true)
         .await
-        .expect("the remotely proved bundle is accepted and commits");
-    drop(slot);
-    eprintln!("remote bundle: tier {}, proved in {:.1?}, {} proof bytes", sub.tier, sub.proving, sub.proof_bytes);
-    assert_eq!(sub.tier, 14);
-    assert_eq!(sub.amount, pay);
-    assert_eq!(sub.change, mint - pay - fee);
-
-    // ---- B finds the note the prover's proof carried; A keeps its change ----
-    wallet::scan(&rpc, &b, &mut b_store).await.unwrap();
-    assert_eq!(b_store.balance(), pay, "B received the note the prover's proof carried");
-    wallet::scan(&rpc, &a, &mut a_store).await.unwrap();
-    assert_eq!(a_store.balance(), mint - pay - fee, "A keeps its change");
-    eprintln!("delegated send end to end in {:.1?}", started.elapsed());
+        .expect_err("a paired prover on a v2-guest chain");
+    assert_eq!(e.to_string(), randprotocol_client::prover::PRE_V3_REFUSAL);
+    assert_eq!(wallet::prover_confirmation(&rpc, &proving).await.unwrap_err().to_string(), randprotocol_client::prover::PRE_V3_REFUSAL, "and before `rand send`'s y/N");
+    let info = svc.info();
+    assert_eq!((info.queue.depth, info.queue.proving), (0, 0), "the prover was sent no job");
+    assert!(!remote.warned_history(), "and the wallet warned of no witness: none was headed anywhere");
+    assert_eq!(a_store.balance(), mint, "nothing is held back as pending");
+    assert_eq!(info.witness_kinds, vec!["viewing_key"], "the prover takes no spend-key witness either");
     handle.shutdown().await;
 }
 
@@ -767,10 +759,10 @@ async fn a_v3_send_proves_both_and_is_admitted() {
     handle.shutdown().await;
 }
 
-/// Split authorisation through a delegated prover: the prover runs WITHOUT spend-key witnesses and
-/// is paired as not the owner's own (`own=0`), so on a v3 chain the wallet sends it the viewing-key
-/// witness (`nk`, never the spend key), warns once that it can read this wallet's history, makes
-/// the auth proof itself, and the node admits the pair.
+/// Split authorisation through a delegated prover — the only delegated proving there is (VK-4):
+/// the prover is paired as not the owner's own (`own=0`), and on a v3 chain the wallet sends it the
+/// viewing-key witness (`nk`, never the spend key), warns once that it can read this wallet's
+/// history, makes the auth proof itself, and the node admits the pair.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_v3_send_through_a_viewing_key_prover_is_admitted() {
     init_tracing();
@@ -780,13 +772,12 @@ async fn a_v3_send_through_a_viewing_key_prover_is_admitted() {
     let handle = start_with(&dir, &key, genesis_v3(&key)).await;
     let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
 
-    // ---- the prover: its own key, one pairing that is NOT the owner's, no spend-key jobs ----
+    // ---- the prover: its own key, one pairing that is NOT the owner's ----
     let pkey = randprotocol_prover::key::ProverKey::generate();
     let ek = pkey.kem_ek().to_vec();
     let mut pairings = randprotocol_prover::pairing::Pairings::default();
     let token = pairings.pair("friend", false).unwrap();
     let cfg = randprotocol_prover::service::Config::new(pkey, pairings);
-    assert!(!cfg.accept_spend_key, "started without --accept-spend-key");
     let (paddr, _svc, _ptask) = randprotocol_prover::http::serve("127.0.0.1:0".parse().unwrap(), cfg).await.expect("the prover listens");
     let link = randprotocol_prover::pairing::PairingLink { kem_ek: ek, url: format!("http://{paddr}"), token, own: false };
     let paired = randprotocol_client::prover::PairedProver::from_link(&link, Some("friend".into()));

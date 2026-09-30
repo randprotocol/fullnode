@@ -410,13 +410,18 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ProverOp {
-    /// Pair with the prover a `randprover:` link names: its key's fingerprint is checked against
-    /// what the prover itself answers before anything is saved (`<key>.prover.json`, mode 0600).
+    /// Pair with the prover a `randprover:` link names. Shows what that prover will receive (this
+    /// wallet's viewing key: it can read the whole history, it cannot spend) and asks first; then
+    /// its key's fingerprint is checked against what the prover itself answers before anything
+    /// is saved (`<key>.prover.json`, mode 0600).
     Pair {
         link: String,
         /// A name to print for this prover instead of its URL.
         #[arg(long)]
         name: Option<String>,
+        /// Pair without asking for confirmation first.
+        #[arg(long)]
+        yes: bool,
     },
     /// Print the pairing (never its token).
     Show,
@@ -1136,20 +1141,24 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Prover { op } => match op {
-            ProverOp::Pair { link, name } => {
+            ProverOp::Pair { link, name, yes } => {
                 let link = PairingLink::parse(link.trim()).map_err(|e| anyhow!("{e}"))?;
                 prover::check_prover_url(&link.url)?;
                 let paired = PairedProver::from_link(&link, name);
+                // VK-4: who is being paired and what it will receive, then the question — before
+                // the prover is contacted and before anything is saved. The same for every link:
+                // its `own=1` is a label, never what decides which key a prover is sent.
+                for line in paired.pairing_confirmation() {
+                    println!("{line}");
+                }
+                if !yes {
+                    confirm("pair?", "pair", "not paired")?;
+                }
                 // `info` refuses a prover whose key is not the one the link names.
                 RemoteProver::new(paired.clone()).info().await?;
                 paired.save(&cli.key)?;
                 // The URL goes through `shown()` like every other prover-supplied string (VK-5).
                 println!("{}", paired.paired_line());
-                if !paired.own {
-                    // What a pairing that is not the owner's own can and cannot do, said now
-                    // rather than at the first send.
-                    eprintln!("warning: {}", prover::NOT_OWN_PAIRING_NOTE);
-                }
             }
             ProverOp::Show => match PairedProver::load(&cli.key)? {
                 Some(p) => println!("{}", p.show()),

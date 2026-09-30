@@ -19,7 +19,10 @@ pub struct PairingLink {
     pub kem_ek: Vec<u8>,
     pub url: String,
     pub token: [u8; 32],
-    /// The prover is the wallet owner's own machine: it may receive spend-key witnesses.
+    /// A label: the operator minted the link with `--own`, for a machine the wallet's owner runs.
+    /// It decides nothing (VK-4, audit v6) — the link is the prover's to write, so a flag in it
+    /// can never be what releases key material, and since the spend-key witness was retired every
+    /// pairing receives the same thing, a viewing-key witness.
     pub own: bool,
 }
 

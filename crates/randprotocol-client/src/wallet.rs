@@ -43,7 +43,6 @@ use randprotocol_zkvm::hidden::{self, HiddenDigestInput, HiddenDigestInputV3, Hi
 use randprotocol_zkvm::machine::{Backend, FriProfile};
 use randprotocol_zkvm::notes::{Note, SpendKey, ViewingKey};
 use randprotocol_zkvm::viewing::TxKey;
-use randprotocol_prover::wire::WitnessKind;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1808,6 +1807,9 @@ pub async fn build_transfer_declaring_bundle_gas(
 /// On a v3 chain (split authorisation) the transaction's second proof, the auth proof, is made on
 /// this machine whichever is chosen — its witness is the spend key, which never leaves the wallet
 /// — and a remote prover is sent the v3 witness, which carries the viewing key's `nk` instead.
+/// On a chain whose bundle guest is v1 or v2 the bundle's own witness carries the spend key, so
+/// there [`Proving::Remote`] is refused ([`Proving::refuse_remote_before_v3`], VK-4) and only a
+/// local proof is made.
 #[derive(Clone)]
 pub enum Proving {
     Local(Backend),
@@ -1842,6 +1844,21 @@ impl Proving {
         }
     }
 
+    /// VK-4 (audit v6, decision D33): a paired prover proves only on a split-authorisation chain.
+    /// `guest` is the chain's bundle guest as the node named it ([`chain_bundle_guest`]); for v1
+    /// or v2 the witness is the spend key's, and no wallet of this build sends one to anybody —
+    /// whatever the pairing's `own` says, since that is the prover's own link's word. Called
+    /// before the prover is asked anything (its fee included) and before a bundle is built, so
+    /// on such a chain `--prover` costs nothing and discloses nothing. A node that lies the other
+    /// way (v3 for a v1/v2 chain) gets a viewing-key witness proved for a guest the chain refuses:
+    /// a wasted proof, never a key.
+    fn refuse_remote_before_v3(&self, guest: &Word8) -> Result<()> {
+        if matches!(self, Proving::Remote(_)) && *guest != ZkExecutor::hc_hidden_bundle_v3() {
+            return Err(anyhow!(crate::prover::PRE_V3_REFUSAL));
+        }
+        Ok(())
+    }
+
     /// Whether the "prover fee" line is still to be shown: once per prover, so `rand send`, which
     /// shows it in its confirmation, does not print it again when the bundle is built.
     fn announce_fee(&self) -> bool {
@@ -1863,14 +1880,16 @@ impl Proving {
                 Ok(with_auth(proved, auth))
             }
             Proving::Remote(remote) => {
-                // The prover never sees the spend key: on a v3 chain it gets the viewing-key
-                // witness and the auth proof is made here, on the CPU (tier 10, seconds).
-                let auth = prepared.v3.then(|| prove_auth_locally(prepared, sk, binding, profile, Backend::Cpu)).transpose()?;
-                let kind = if prepared.v3 { WitnessKind::ViewingKey } else { WitnessKind::SpendKey };
+                // The prover never sees the spend key: it gets a v3 bundle's viewing-key witness
+                // and nothing else. `submit_spend` refused a v1/v2 chain before this bundle was
+                // built; held again here, where the witness would leave, so no later caller can
+                // hand a spend-key witness (`prepared.words` of a v1/v2 bundle) to a prover (VK-4).
+                self.refuse_remote_before_v3(&prepared.guest)?;
+                // The auth proof is made here, on the CPU (tier 10, seconds).
+                let auth = Some(prove_auth_locally(prepared, sk, binding, profile, Backend::Cpu)?);
                 eprintln!("proving the bundle on {} (paired prover {})…", remote.paired().label(), remote.paired().fingerprint);
                 let started = Instant::now();
-                let (proof, tier) =
-                    remote.prove(&prepared.guest, profile, kind, &prepared.words, binding, &prepared.expected, proof_cap).await?;
+                let (proof, tier) = remote.prove(&prepared.guest, profile, &prepared.words, binding, &prepared.expected, proof_cap).await?;
                 let proving = started.elapsed();
                 eprintln!("proved remotely in {proving:.1?}: tier {tier}, {} bytes", proof.len());
                 Ok(with_auth(Proved { proof, tier, proving, auth_proof: Vec::new(), auth_proving: None }, auth))
@@ -2063,29 +2082,22 @@ async fn chain_bundle_guest(rpc: &RpcClient) -> Result<Word8> {
 }
 
 /// The lines `rand send` shows beside its recipient before the y/N, when a paired prover makes
-/// the bundle proof: the prover's fee ("prover fee: X RAND to <fingerprint>", spec §5) and — on a
-/// split-authorisation chain, for a prover that is not the owner's own — the history warning,
-/// once ([`RemoteProver::history_warning`]; the proof itself then says nothing more). Empty for a
-/// local proof. A fee on a chain whose witness cannot carry it is refused here, before anything
-/// is asked of the user.
+/// the bundle proof: the prover's fee ("prover fee: X RAND to <fingerprint>", spec §5) and the
+/// history warning, once ([`RemoteProver::history_warning`]; the proof itself then says nothing
+/// more) — for every pairing, `own=1` or not (VK-4). Empty for a local proof. On a chain whose
+/// bundle guest is v1 or v2 a paired prover is refused here ([`PRE_V3_REFUSAL`]), before the
+/// prover is asked for its fee and before anything is asked of the user.
+///
+/// [`PRE_V3_REFUSAL`]: crate::prover::PRE_V3_REFUSAL
 pub async fn prover_confirmation(rpc: &RpcClient, proving: &Proving) -> Result<Vec<String>> {
     let Proving::Remote(remote) = proving else { return Ok(Vec::new()) };
-    let v3 = chain_bundle_guest(rpc).await? == ZkExecutor::hc_hidden_bundle_v3();
+    proving.refuse_remote_before_v3(&chain_bundle_guest(rpc).await?)?;
     let mut lines = Vec::new();
     if let Some((to, amount)) = remote.fee().await? {
-        if !v3 {
-            return Err(anyhow!(
-                "the paired prover charges {} RAND, which only a split-authorisation chain's (bundle guest v3) witness can carry; \
-                 this chain's is v1/v2 — prove on this machine (drop --prover) or use a prover that charges nothing",
-                format_amount(amount)
-            ));
-        }
         lines.push(format!("prover fee: {} RAND to {}", format_amount(amount), to.fingerprint()));
         remote.announce_fee();
     }
-    if v3 {
-        lines.extend(remote.history_warning());
-    }
+    lines.extend(remote.history_warning());
     Ok(lines)
 }
 
@@ -2336,8 +2348,11 @@ async fn submit_spend(
     wait: bool,
 ) -> Result<Submission> {
     scan(rpc, w, store).await?;
-    // The chain's guest first: it decides whether a prover's fee can ride in this bundle at all.
+    // The chain's guest first: it decides whether a paired prover may prove this bundle at all
+    // (VK-4: never on a v1/v2 chain — refused before the prover is asked anything), and whether a
+    // prover's fee can ride in it.
     let guest = chain_bundle_guest(rpc).await?;
+    proving.refuse_remote_before_v3(&guest)?;
     let quoted = proving.fee().await?;
     if let Some((to, amount)) = &quoted {
         if guest != ZkExecutor::hc_hidden_bundle_v3() {
@@ -7067,9 +7082,9 @@ mod tests {
     }
 
     /// Carried from the Task 6 review: what `rand send` shows before its y/N — the prover's fee
-    /// and, for a prover not the owner's own on a v3 chain, the history warning, once (the proof
-    /// then prints no second one). A local proof shows nothing; a charging prover on a pre-v3
-    /// chain is refused here, before the question.
+    /// and the history warning, once (the proof then prints no second one), for an `own=1`
+    /// pairing as for any other (VK-4). A local proof shows nothing; on a pre-v3 chain a paired
+    /// prover is refused here, before the question.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_send_confirmation_names_the_prover_fee_and_the_history_warning_once() {
         let prover = Wallet::from_spend_key(SpendKey([70; 8]));
@@ -7088,20 +7103,99 @@ mod tests {
         assert!(r.warned_history(), "shown once: the proof prints no second warning");
         assert!(!remote.announce_fee(), "the fee line was shown here: building the bundle does not print it again (M-1)");
         assert_eq!(prover_confirmation(&rpc, &remote).await.unwrap(), vec![lines[0].clone()]);
-        // The owner's own prover, charging nothing: nothing to show.
-        assert!(prover_confirmation(&rpc, &info_only_prover(serde_json::Value::Null, true).await).await.unwrap().is_empty());
-        // A pre-v3 chain: no history (the witness carries the spend key), and a fee is refused.
+        // A pairing whose link said own=1, charging nothing: the history warning all the same —
+        // `own` is the link's word, and no pairing is exempt from being told (VK-4).
+        let own = prover_confirmation(&rpc, &info_only_prover(serde_json::Value::Null, true).await).await.unwrap();
+        assert_eq!(own.len(), 1, "{own:?}");
+        assert!(own[0].contains(crate::prover::VIEWING_KEY_WARNING), "{own:?}");
+        // A pre-v3 chain: a paired prover is refused outright, charging or not, own or not (the
+        // witness there carries the spend key, which goes nowhere).
         chain.lock().unwrap().hc_bundle = ZkExecutor::hc_bundle();
         chain.lock().unwrap().hc_auth = None;
-        assert!(prover_confirmation(&rpc, &info_only_prover(serde_json::Value::Null, false).await).await.unwrap().is_empty());
-        let e = prover_confirmation(&rpc, &info_only_prover(fee, false).await).await.unwrap_err().to_string();
-        assert!(e.contains("only a split-authorisation chain"), "{e}");
+        for (f, own) in [(serde_json::Value::Null, false), (serde_json::Value::Null, true), (fee.clone(), false)] {
+            let e = prover_confirmation(&rpc, &info_only_prover(f, own).await).await.unwrap_err().to_string();
+            assert_eq!(e, crate::prover::PRE_V3_REFUSAL);
+        }
+        assert!(prover_confirmation(&rpc, &Proving::local(Backend::Cpu)).await.unwrap().is_empty(), "a local proof there is as before");
         // Above the default cap (1 RAND): refused before the y/N (I-1).
         chain.lock().unwrap().hc_bundle = ZkExecutor::hc_hidden_bundle_v3();
         chain.lock().unwrap().hc_auth = Some(ZkExecutor::hc_auth());
         let greedy = serde_json::json!({ "amount": "14000000000", "address": prover.address.to_string() });
         let e = prover_confirmation(&rpc, &info_only_prover(greedy, false).await).await.unwrap_err().to_string();
         assert!(e.contains("the prover quotes 14 RAND; the cap is 1 RAND (--max-prover-fee)"), "{e}");
+    }
+
+    /// VK-4 (audit v6, decision D33): the spend-key witness path is retired. On a chain whose
+    /// bundle guest is v1 or v2 the only witness a prover could be sent carries the spend key, and
+    /// which guest the chain runs is `rand_status.hc_bundle` as the node says it — so a hostile
+    /// prover's `own=1` link, beside a node answering v1 or v2, used to get the spend key sealed to
+    /// itself. `--prover` on such a chain is now refused before the prover is asked anything
+    /// (not even `prover_info`) and before anything is proved or submitted, whatever the pairing's
+    /// `own` says. The fake prover here is the hostile one: it advertises the chain's guest and
+    /// `spend_key`, and records whether a job it opens holds this wallet's spend key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pre_v3_chain_refuses_a_paired_prover_before_anything_is_sent() {
+        use randprotocol_prover::wire::open_job;
+        for hc in [ZkExecutor::hc_hidden_bundle(), ZkExecutor::hc_hidden_bundle_v2()] {
+            let me = Wallet::from_spend_key(SpendKey([77; 8]));
+            let you = Wallet::from_spend_key(SpendKey([78; 8]));
+            let chain = Arc::new(Mutex::new(ChainState::new()));
+            chain.lock().unwrap().hc_bundle = hc;
+            chain.lock().unwrap().hc_auth = None;
+            chain.lock().unwrap().fund(&me, 10 * randprotocol_core::UNITS_PER_RAND, 0);
+            let rpc = serve(&chain).await;
+
+            let key = randprotocol_prover::key::ProverKey::generate();
+            let info = serde_json::json!({
+                "kem_fingerprint": key.fingerprint().to_string(),
+                "hc_bundles": ZkExecutor::known_hc_bundles().iter().map(word8_to_hex).collect::<Vec<_>>(),
+                "profiles": ["test", "production"], "witness_kinds": ["viewing_key", "spend_key"], "fee": null,
+            });
+            let kem_ek = key.kem_ek().to_vec();
+            // (every method asked, whether an opened job carried the spend key)
+            let seen: Arc<Mutex<(Vec<String>, bool)>> = Arc::default();
+            let (s, sk) = (seen.clone(), me.sk.0);
+            let url = rpc_fn(move |method, params| {
+                let mut g = s.lock().unwrap();
+                g.0.push(method.to_string());
+                match method {
+                    "prover_info" => Reply::Ok(info.clone()),
+                    "prover_submit" => {
+                        let sealed = hex::decode(params[0].as_str().unwrap()).unwrap();
+                        let job = open_job(key.dk(), &sealed).expect("sealed to this prover");
+                        g.1 |= job.inputs.windows(8).any(|w| w == sk);
+                        Reply::Err(-32000, "bad job")
+                    }
+                    _ => Reply::Err(-32601, "method not found"),
+                }
+            })
+            .await;
+            // The hostile link says own=1.
+            let link = randprotocol_prover::pairing::PairingLink { kem_ek, url, token: [9; 32], own: true };
+            let remote = Proving::Remote(Arc::new(RemoteProver::new(crate::prover::PairedProver::from_link(&link, Some("box".into())))));
+
+            let mut store = NoteStore::default();
+            let e = send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000_000, "", gas::BUNDLE_BASE, FriProfile::Test, &remote, 7, false)
+                .await
+                .unwrap_err()
+                .to_string();
+            let (asked, got_the_spend_key) = seen.lock().unwrap().clone();
+            assert!(!got_the_spend_key, "the prover was sent this wallet's spend key (asked: {asked:?})");
+            assert!(asked.is_empty(), "the prover was asked {asked:?} before the refusal");
+            assert_eq!(e, crate::prover::PRE_V3_REFUSAL);
+            assert!(e.contains("bundle guest v3") && e.contains("spend key never leaves the wallet") && e.contains("--prover"), "{e}");
+            assert!(chain.lock().unwrap().sent.is_empty(), "nothing was submitted");
+            assert!(store.notes.iter().all(|n| n.pending.is_none()), "and nothing held back");
+            // `rand send`'s confirmation refuses the same way, before its y/N.
+            let e = prover_confirmation(&rpc, &remote).await.unwrap_err().to_string();
+            assert_eq!(e, crate::prover::PRE_V3_REFUSAL);
+            assert!(seen.lock().unwrap().0.is_empty(), "nor for the confirmation");
+            // Proving on this machine there is unchanged.
+            send_asset_with(&rpc, &me, &mut store, &you.address, 0, 1_000_000, "", gas::BUNDLE_BASE, FriProfile::Test, &Proving::Emulated, 7, false)
+                .await
+                .expect("a local proof on a pre-v3 chain");
+            assert_eq!(chain.lock().unwrap().sent.len(), 1);
+        }
     }
 
     /// Final review minor 1: the hardened pre-price stands the proof cap in for the unproved

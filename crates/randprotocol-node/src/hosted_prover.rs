@@ -18,9 +18,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
 
-/// Shown whenever `--prover-accept-spend-key` is on (the same sentence `rand-prover run` prints).
-pub const SPEND_KEY_SENTENCE: &str = "every SpendKey job holds the sending wallet's spend key: run this only for wallets you own";
-
 /// `run`'s `--prover*` flags.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -30,7 +27,6 @@ pub struct Options {
     pub rpc: SocketAddr,
     /// `--prover-home` (default `<datadir>/prover`).
     pub home: PathBuf,
-    pub accept_spend_key: bool,
     pub max_parallel: usize,
     pub max_queue: usize,
     pub cuda: bool,
@@ -126,7 +122,6 @@ pub fn prepare(o: &Options) -> Result<HostedProver> {
     cfg.backend = backend;
     cfg.max_parallel = o.max_parallel;
     cfg.max_queue = o.max_queue;
-    cfg.accept_spend_key = o.accept_spend_key;
     if allowed_origins == AllowedOrigins::Any {
         let line = "--prover-allow-origin '*': every website can read this prover's replies, its key included (a cross-site identifier)";
         eprintln!("{line}");
@@ -150,11 +145,6 @@ pub struct Served {
 
 /// Serves the listener [`prepare`] bound: the prover's address, and its service and server task.
 pub async fn start(hp: HostedProver) -> Result<(SocketAddr, Served)> {
-    if hp.cfg.accept_spend_key {
-        // The spec's disclosure sentence: printed, so no log filter can hide it.
-        eprintln!("{SPEND_KEY_SENTENCE}");
-        tracing::warn!("{SPEND_KEY_SENTENCE}");
-    }
     let listener = tokio::net::TcpListener::from_std(hp.listener)?;
     let (bound, svc, task) = randprotocol_prover::http::serve_on(listener, hp.cfg).await?;
     tracing::info!("prover listening on {bound}, fingerprint {}", hp.fingerprint);

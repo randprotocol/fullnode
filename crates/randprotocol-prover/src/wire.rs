@@ -32,6 +32,12 @@ const AAD_REPLY: &[u8] = b"rand-prover-reply-1";
 
 /// Which key the witness carries: a spend key's witness can move the notes it proves for, a
 /// viewing key's cannot.
+///
+/// **`SpendKey` is retired (VK-4, audit v6): no wallet of this build seals one and no prover
+/// admits one.** The variant stays, at its index, only so the wire still decodes what a wallet
+/// older than the retirement sends — it then gets the prover's `-32004` refusal, which it prints,
+/// rather than a postcard decode error (`bad job`). Do not reorder the variants: postcard writes
+/// the index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WitnessKind { SpendKey, ViewingKey }
 

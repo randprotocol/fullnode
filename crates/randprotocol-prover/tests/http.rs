@@ -5,7 +5,7 @@ use randprotocol_prover::origins::AllowedOrigins;
 use randprotocol_prover::service::{Config, ProveFn};
 use randprotocol_prover::wire::*;
 use randprotocol_zkvm::executor::ZkExecutor;
-use randprotocol_zkvm::hidden::hidden_input;
+use randprotocol_zkvm::hidden::hidden_input_v3;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,7 +23,6 @@ async fn start_with(origins: AllowedOrigins) -> (SocketAddr, Vec<u8>, [u8; 32], 
     let mut pairings = Pairings::default();
     let token = pairings.pair("laptop", true).unwrap();
     let mut cfg = Config::new(key, pairings);
-    cfg.accept_spend_key = true;
     cfg.prove = ok_prover();
     cfg.allowed_origins = origins;
     let (addr, _svc, _task) = serve("127.0.0.1:0".parse().unwrap(), cfg).await.unwrap();
@@ -35,14 +34,15 @@ async fn rpc(http: &reqwest::Client, addr: SocketAddr, method: &str, params: Val
 }
 
 fn job(token: [u8; 32]) -> ProveJob {
-    ProveJob { version: WIRE_VERSION, token, witness_kind: WitnessKind::SpendKey, hc_bundle: ZkExecutor::hc_bundle(), profile: "test".into(), binding: [1; 8], inputs: vec![42; hidden_input::COUNT], reply_key: fresh_reply_key() }
+    ProveJob { version: WIRE_VERSION, token, witness_kind: WitnessKind::ViewingKey, hc_bundle: ZkExecutor::hc_hidden_bundle_v3(), profile: "test".into(), binding: [1; 8], inputs: vec![42; hidden_input_v3::COUNT], reply_key: fresh_reply_key() }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn info_submit_status_cancel_over_json_rpc() {
     let (addr, ek, token, http) = start().await;
     let info = rpc(&http, addr, "prover_info", json!([])).await;
-    assert_eq!(info["result"]["witness_kinds"], json!(["viewing_key", "spend_key"]));
+    assert_eq!(info["result"]["witness_kinds"], json!(["viewing_key"]), "the spend-key kind is retired (VK-4)");
+    assert_eq!(info["result"]["hc_bundles"], json!([randprotocol_core::notes::word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3())]));
     assert_eq!(info["result"]["queue"]["max"], 8);
     assert!(info["result"]["fee"].is_null());
     let j = job(token);
@@ -65,9 +65,19 @@ async fn info_submit_status_cancel_over_json_rpc() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refusals_map_to_their_codes() {
-    let (addr, ek, _token, http) = start().await;
+    let (addr, ek, token, http) = start().await;
     let sealed = hex::encode(seal_job(&ek, &job([0; 32])).unwrap());
     assert_eq!(rpc(&http, addr, "prover_submit", json!([sealed])).await["error"]["code"], -32003);
+    // VK-4: a spend-key job — what a wallet older than the retirement sends on a v1/v2 chain —
+    // still decodes, and is answered with the "witness kind not accepted" code and the reason,
+    // which that wallet prints; never a decode error.
+    for hc in ZkExecutor::known_hc_bundles() {
+        let mut old = job(token);
+        (old.witness_kind, old.hc_bundle, old.inputs) = (WitnessKind::SpendKey, hc, vec![42; ZkExecutor::bundle_input_words(&hc)]);
+        let r = rpc(&http, addr, "prover_submit", json!([hex::encode(seal_job(&ek, &old).unwrap())])).await;
+        assert_eq!(r["error"]["code"], -32004, "{r}");
+        assert_eq!(r["error"]["data"]["reason"], randprotocol_prover::service::SPEND_KEY_RETIRED, "{r}");
+    }
     assert_eq!(rpc(&http, addr, "prover_submit", json!(["zz"])).await["error"]["code"], -32602);
     assert_eq!(rpc(&http, addr, "prover_submit", json!([hex::encode([0u8; 200])])).await["error"]["code"], -32000);
     assert_eq!(rpc(&http, addr, "prover_nope", json!([])).await["error"]["code"], -32601);

@@ -35,7 +35,8 @@ enum Cmd {
         /// The URL the wallet reaches this prover at.
         #[arg(long, default_value = "http://127.0.0.1:8600")]
         url: String,
-        /// This prover is the wallet owner's own machine.
+        /// Label the pairing as the wallet owner's own machine (`own=1` in the link). A label
+        /// only: every pairing is sent the same viewing-key witness, never a spend key.
         #[arg(long)]
         own: bool,
         /// Also print the link as a QR code.
@@ -53,8 +54,9 @@ enum Cmd {
     Run {
         #[arg(long, default_value = "127.0.0.1:8600")]
         listen: SocketAddr,
-        /// Accept spend-key witnesses (only for wallets you own).
-        #[arg(long)]
+        /// Retired (VK-4): still parsed, so a unit file that passes it fails with the reason
+        /// instead of an "unexpected argument"; `run` refuses to start when it is given.
+        #[arg(long, hide = true)]
         accept_spend_key: bool,
         #[arg(long, default_value_t = 1)]
         max_parallel: usize,
@@ -205,6 +207,11 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Run { listen, accept_spend_key, max_parallel, max_queue, per_token, cuda, skip_memory_check, allow_origin, fee, fee_address } => {
+            // First, before the key or anything else is looked at: the flag's absence of effect
+            // must never be silent (VK-4).
+            if accept_spend_key {
+                bail!(randprotocol_prover::service::spend_key_flag_retired("--accept-spend-key"));
+            }
             if max_parallel == 0 {
                 bail!("--max-parallel must be at least 1");
             }
@@ -227,18 +234,12 @@ async fn main() -> Result<()> {
                 eprintln!("no pairings: every job will be refused — run `rand-prover pair`");
                 tracing::warn!("no pairings: every job will be refused — run `rand-prover pair`");
             }
-            if accept_spend_key {
-                // The spec's disclosure sentence: printed, so no log filter can hide it.
-                eprintln!("every SpendKey job holds the sending wallet's spend key: run this only for wallets you own");
-                tracing::warn!("every SpendKey job holds the sending wallet's spend key: run this only for wallets you own");
-            }
             let fingerprint = key.fingerprint();
             let mut cfg = Config::new(key, pairings);
             cfg.backend = backend;
             cfg.max_parallel = max_parallel;
             cfg.max_queue = max_queue;
             cfg.per_token = per_token;
-            cfg.accept_spend_key = accept_spend_key;
             cfg.allowed_origins = allowed;
             if let Some(f) = &fee {
                 eprintln!("charging {} RAND per job to {}", randprotocol_core::format_amount(f.amount), f.address.fingerprint());

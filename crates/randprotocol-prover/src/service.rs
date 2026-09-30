@@ -40,8 +40,6 @@ pub struct Config {
     pub max_parallel: usize,
     /// Jobs waiting beyond the ones proving.
     pub max_queue: usize,
-    /// Whether spend-key witnesses are accepted at all; off by default.
-    pub accept_spend_key: bool,
     /// Jobs one token may have queued or proving at once.
     pub per_token: usize,
     /// How long a finished job's sealed reply is kept for the wallet to collect.
@@ -85,8 +83,8 @@ pub struct FeeInfo {
 }
 
 impl Config {
-    /// CPU, one worker, a queue of 8, spend keys refused, 2 jobs per token, replies kept 600 s,
-    /// the real prover, the default origin list.
+    /// CPU, one worker, a queue of 8, 2 jobs per token, replies kept 600 s, the real prover, the
+    /// default origin list.
     pub fn new(key: ProverKey, pairings: Pairings) -> Config {
         Config {
             key,
@@ -94,7 +92,6 @@ impl Config {
             backend: Backend::Cpu,
             max_parallel: 1,
             max_queue: 8,
-            accept_spend_key: false,
             per_token: 2,
             result_ttl: Duration::from_secs(600),
             prove: Arc::new(prove_bundle_for),
@@ -102,6 +99,33 @@ impl Config {
             fee: None,
         }
     }
+}
+
+/// The refusal a `SpendKey` job gets (`-32004`, `data.reason`), VK-4 (audit v6, decision D33).
+/// Phase 1 of delegated proving (v0.6.2) sealed the spend key to a prover the wallet's owner ran;
+/// which witness a wallet built was decided by the bundle guest its node reported, and whether it
+/// might send a spend-key one by an `own=1` the prover's own link supplied — so a hostile prover
+/// and a lying node together were handed the key. Split authorisation (guest v3) needs no such
+/// witness, and nothing live used it, so the path is gone on both ends.
+pub const SPEND_KEY_RETIRED: &str = "spend-key witnesses were retired: this prover proves bundle guest v3 from a viewing-key witness only, \
+     and a wallet's spend key never leaves the wallet — update the wallet";
+
+/// What the retired `--accept-spend-key` (`rand-prover run`) and `--prover-accept-spend-key`
+/// (`rand-node run`) say before anything else is checked: a unit file that still passes the flag
+/// fails at startup with the reason, rather than starting as though it were honoured.
+pub fn spend_key_flag_retired(flag: &str) -> String {
+    format!(
+        "{flag} was retired in this release (audit v6, VK-4): a prover no longer accepts a spend-key witness from any wallet — \
+         it proves bundle guest v3 from a viewing-key witness, and the spend key never leaves the wallet; remove the flag"
+    )
+}
+
+/// The bundle guests a prover proves: those whose witness carries the viewing key `nk` — v3
+/// (split authorisation), the only one today. v1 and v2 take the spend key as a private input,
+/// which no prover is sent any more (VK-4), so they are neither advertised in
+/// `prover_info.hc_bundles` nor admitted.
+pub fn provable_hc_bundles() -> [Word8; 1] {
+    [ZkExecutor::hc_hidden_bundle_v3()]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,8 +153,8 @@ pub struct Info {
     pub kem_fingerprint: String,
     /// Hex of the ML-KEM-768 encapsulation key.
     pub kem_ek: String,
-    /// The bundle guests this build proves, in `known_hc_bundles()` order, each in the hex form
-    /// `rand_status.hc_bundle` serves (`randprotocol_core::notes::word8_to_hex`).
+    /// The bundle guests this prover proves ([`provable_hc_bundles`]: v3 only since VK-4), each
+    /// in the hex form `rand_status.hc_bundle` serves (`randprotocol_core::notes::word8_to_hex`).
     pub hc_bundles: Vec<String>,
     pub profiles: Vec<&'static str>,
     pub backend: &'static str,
@@ -152,7 +176,8 @@ pub enum Refusal {
     Bad(String),
     /// The token is not paired.
     Unpaired,
-    /// A witness kind this prover does not accept.
+    /// A witness kind this prover does not accept: every spend-key job ([`SPEND_KEY_RETIRED`]),
+    /// and a viewing-key job for a guest that reads a spend key (v1/v2).
     WitnessKind(String),
     /// The token's cap or the queue is full; `depth` is the queued count, `max` the queue's size.
     Busy { depth: usize, max: usize },
@@ -224,17 +249,13 @@ impl Service {
             version: env!("CARGO_PKG_VERSION").to_string(),
             kem_fingerprint: self.cfg.key.fingerprint().to_string(),
             kem_ek: hex::encode(self.cfg.key.kem_ek()),
-            hc_bundles: ZkExecutor::known_hc_bundles().iter().map(word8_to_hex).collect(),
+            hc_bundles: provable_hc_bundles().iter().map(word8_to_hex).collect(),
             profiles: vec!["test", "production"],
             backend: self.backend_name(),
-            // A viewing-key job (bundle guest v3, split authorisation) is always accepted: its
-            // witness holds `nk`, which can prove but never authorise a spend. A spend-key job
-            // (v1/v2) only behind `--accept-spend-key`.
-            witness_kinds: if self.cfg.accept_spend_key {
-                vec![WitnessKind::ViewingKey.as_str(), WitnessKind::SpendKey.as_str()]
-            } else {
-                vec![WitnessKind::ViewingKey.as_str()]
-            },
+            // A viewing-key job (bundle guest v3, split authorisation) is the only kind there
+            // is: its witness holds `nk`, which can prove but never authorise a spend. The
+            // spend-key kind (guests v1/v2) was retired — VK-4, [`SPEND_KEY_RETIRED`].
+            witness_kinds: vec![WitnessKind::ViewingKey.as_str()],
             queue: QueueInfo { depth, max: self.cfg.max_queue, proving },
             fee: self.cfg.fee.as_ref().map(|f| FeeInfo { amount: f.amount.to_string(), address: f.address.to_string() }),
             allowed_origins: self.cfg.allowed_origins.to_list(),
@@ -256,28 +277,25 @@ impl Service {
             let pairings = self.cfg.pairings.read().unwrap();
             pairings.lookup(&job.token).ok_or(Refusal::Unpaired)?.label.clone()
         };
-        if job.witness_kind == WitnessKind::SpendKey && !self.cfg.accept_spend_key {
-            return Err(Refusal::WitnessKind("this prover does not accept spend-key witnesses".into()));
+        // VK-4 (audit v6, D33): no spend-key witness is proved, for any guest, from any pairing,
+        // under any configuration — refused first, before the guest is even looked at, and the
+        // job (which did carry a spend key here, sealed by a wallet older than the retirement)
+        // is dropped and zeroized with this return. `-32004`, as it always was.
+        if job.witness_kind == WitnessKind::SpendKey {
+            return Err(Refusal::WitnessKind(SPEND_KEY_RETIRED.into()));
         }
         if !ZkExecutor::known_hc_bundles().contains(&job.hc_bundle) {
             return Err(Refusal::Bad(format!("unknown bundle guest {}", word8_to_hex(&job.hc_bundle))));
         }
-        // The witness kind follows the guest: bundle guest v3 (split authorisation) takes `nk` and
-        // a salt, v1/v2 take the spend key. A job whose kind does not match its guest is refused
-        // before its words are even counted, so a v3 job never runs with a spend key in it. The
-        // width itself comes from `ZkExecutor::bundle_input_words`, the one place that maps a
-        // guest digest to its witness length — not duplicated here.
-        let v3 = job.hc_bundle == ZkExecutor::hc_hidden_bundle_v3();
-        match (job.witness_kind, v3) {
-            (WitnessKind::ViewingKey, true) | (WitnessKind::SpendKey, false) => {}
-            (WitnessKind::SpendKey, true) => {
-                return Err(Refusal::WitnessKind("a v3 guest takes nk — send a viewing-key witness".into()));
-            }
-            (WitnessKind::ViewingKey, false) => {
-                return Err(Refusal::WitnessKind(
-                    "viewing-key witnesses need bundle guest v3: this build's v1/v2 guests take a spend key".into(),
-                ));
-            }
+        // What is left is a viewing-key witness, which only bundle guest v3 (split authorisation:
+        // `nk` and a salt) reads; v1 and v2 read a spend key where `nk` would sit, so a
+        // viewing-key job naming one of them is refused before its words are counted. The width
+        // itself comes from `ZkExecutor::bundle_input_words`, the one place that maps a guest
+        // digest to its witness length — not duplicated here.
+        if !provable_hc_bundles().contains(&job.hc_bundle) {
+            return Err(Refusal::WitnessKind(
+                "viewing-key witnesses need bundle guest v3: the v1/v2 guests take a spend key, which no prover is sent".into(),
+            ));
         }
         let expected_words = ZkExecutor::bundle_input_words(&job.hc_bundle);
         if ZkExecutor::profile_from_str(&job.profile).is_none() {
@@ -289,10 +307,8 @@ impl Service {
         }
         // The fee (spec §5), read from the opened witness — never logged, never echoed back.
         // After the length check, so every output offset is in range.
+        // (Every job that reaches here is a v3 witness, the only one that can carry a fee.)
         if let Some(fee) = &self.cfg.fee {
-            if !v3 {
-                return Err(Refusal::Fee("this prover charges a fee, which only a v3 witness can carry".into()));
-            }
             check_fee(&job.inputs, fee)?;
         }
         let th = token_hash(&job.token);

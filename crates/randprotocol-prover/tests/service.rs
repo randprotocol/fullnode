@@ -22,14 +22,13 @@ fn stub(behaviour: Arc<Mutex<Behaviour>>) -> ProveFn {
 
 struct Rig { svc: Shared, ek: Vec<u8>, token: [u8; 32], own_token: [u8; 32] }
 
-fn rig(accept_spend_key: bool, max_queue: usize, max_parallel: usize, behaviour: Behaviour) -> Rig {
+fn rig(max_queue: usize, max_parallel: usize, behaviour: Behaviour) -> Rig {
     let key = ProverKey::from_seed([2; 64]);
     let ek = key.kem_ek().to_vec();
     let mut pairings = Pairings::default();
     let own_token = pairings.pair("laptop", true).unwrap();
     let token = pairings.pair("phone", false).unwrap();
     let mut cfg = Config::new(key, pairings);
-    cfg.accept_spend_key = accept_spend_key;
     cfg.max_queue = max_queue;
     cfg.max_parallel = max_parallel;
     cfg.result_ttl = Duration::from_millis(300);
@@ -37,9 +36,19 @@ fn rig(accept_spend_key: bool, max_queue: usize, max_parallel: usize, behaviour:
     Rig { svc: Service::start(cfg), ek, token, own_token }
 }
 
-fn job(token: [u8; 32], kind: WitnessKind) -> ProveJob {
-    ProveJob { version: WIRE_VERSION, token, witness_kind: kind, hc_bundle: ZkExecutor::hc_bundle(), profile: "test".into(),
-               binding: [5; 8], inputs: vec![77; hidden_input::COUNT], reply_key: fresh_reply_key() }
+/// The one job a prover admits: a viewing-key witness for bundle guest v3 (split authorisation) —
+/// `nk` and a salt, 1 212 words.
+fn job(token: [u8; 32]) -> ProveJob {
+    ProveJob { version: WIRE_VERSION, token, witness_kind: WitnessKind::ViewingKey, hc_bundle: ZkExecutor::hc_hidden_bundle_v3(), profile: "test".into(),
+               binding: [5; 8], inputs: vec![77; hidden_input_v3::COUNT], reply_key: fresh_reply_key() }
+}
+
+/// What a wallet older than VK-4 could still send: a spend-key witness, for the guest `hc`, at
+/// that guest's own witness width — so nothing but its kind can be what refuses it.
+fn spend_key_job(token: [u8; 32], hc: randprotocol_core::notes::Word8) -> ProveJob {
+    let mut j = job(token);
+    (j.witness_kind, j.hc_bundle, j.inputs) = (WitnessKind::SpendKey, hc, vec![77; ZkExecutor::bundle_input_words(&hc)]);
+    j
 }
 
 async fn wait_terminal(svc: &Service, id: &str) -> Status {
@@ -63,8 +72,8 @@ async fn wait_proving(svc: &Service, id: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_paired_job_proves_and_the_reply_opens_under_the_reply_key() {
-    let r = rig(true, 8, 1, Behaviour::Ok);
-    let j = job(r.own_token, WitnessKind::SpendKey);
+    let r = rig(8, 1, Behaviour::Ok);
+    let j = job(r.own_token);
     let reply_key = j.reply_key;
     let id = r.svc.submit(&seal_job(&r.ek, &j).unwrap()).unwrap();
     assert_eq!(id.len(), 32, "128 bits, hex");
@@ -79,83 +88,82 @@ async fn a_paired_job_proves_and_the_reply_opens_under_the_reply_key() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_token_is_refused_before_queueing() {
-    let r = rig(true, 8, 1, Behaviour::Ok);
-    let j = job([0; 32], WitnessKind::SpendKey);
+    let r = rig(8, 1, Behaviour::Ok);
+    let j = job([0; 32]);
     assert!(matches!(r.svc.submit(&seal_job(&r.ek, &j).unwrap()), Err(Refusal::Unpaired)));
     assert_eq!(r.svc.info().queue.depth, 0);
 }
 
+/// VK-4 (audit v6, decision D33): the spend-key witness is retired. No configuration makes this
+/// prover take one — for any guest, from any pairing, `own` or not — and `prover_info` says so:
+/// `witness_kinds` is `["viewing_key"]` and `hc_bundles` names only the guest a viewing-key
+/// witness can prove (v3). The wire still decodes the variant, so an older wallet gets a refusal
+/// it can print (`-32004`), not a decode error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_spend_key_job_needs_the_flag_and_info_says_so() {
-    let r = rig(false, 8, 1, Behaviour::Ok);
-    assert_eq!(r.svc.info().witness_kinds, vec!["viewing_key"], "viewing-key jobs (v3) are always accepted");
-    let j = job(r.own_token, WitnessKind::SpendKey);
-    assert!(matches!(r.svc.submit(&seal_job(&r.ek, &j).unwrap()), Err(Refusal::WitnessKind(_))));
-    let r = rig(true, 8, 1, Behaviour::Ok);
-    assert_eq!(r.svc.info().witness_kinds, vec!["viewing_key", "spend_key"]);
+async fn a_spend_key_job_is_refused_whatever_the_pairing_and_info_lists_only_viewing_key() {
+    let r = rig(8, 1, Behaviour::Ok);
+    let info = r.svc.info();
+    assert_eq!(info.witness_kinds, vec!["viewing_key"]);
+    assert_eq!(info.hc_bundles, vec![randprotocol_core::notes::word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3())]);
+    for token in [r.own_token, r.token] {
+        for hc in ZkExecutor::known_hc_bundles() {
+            let j = spend_key_job(token, hc);
+            match r.svc.submit(&seal_job(&r.ek, &j).unwrap()) {
+                Err(Refusal::WitnessKind(why)) => {
+                    assert_eq!(why, SPEND_KEY_RETIRED);
+                    assert!(why.contains("retired") && why.contains("viewing-key") && why.contains("never leaves the wallet"), "{why}");
+                }
+                other => panic!("a spend-key job was not refused as a witness kind: {other:?}"),
+            }
+        }
+    }
+    assert_eq!(r.svc.info().queue.depth, 0);
 }
 
-/// A job for bundle guest v3 (split authorisation): `nk` and a salt, 1 212 words.
-fn v3_job(token: [u8; 32], kind: WitnessKind) -> ProveJob {
-    let mut j = job(token, kind);
-    j.hc_bundle = ZkExecutor::hc_hidden_bundle_v3();
-    j.inputs = vec![77; hidden_input_v3::COUNT];
-    j
-}
-
-/// The witness kind follows the guest, whatever the flag: a viewing-key job for v3 is accepted
-/// (with or without `--accept-spend-key`), a spend-key job for v3 is refused (v3 takes `nk`), and
-/// a viewing-key job for v1/v2 is refused (those take a spend key).
+/// A viewing-key witness is read only by bundle guest v3: a v3 job is accepted, proved and
+/// replied to (from a pairing that is not `own` too); a v3 job at the v1/v2 width is a bad job;
+/// and a viewing-key job naming v1 or v2 — guests that read a spend key where `nk` would sit — is
+/// refused as a witness kind, so nothing is ever proved for them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_witness_kind_follows_the_guest() {
-    for accept_spend_key in [false, true] {
-        let r = rig(accept_spend_key, 8, 1, Behaviour::Ok);
-        // v3 + viewing key: accepted, proved, replied.
-        let j = v3_job(r.token, WitnessKind::ViewingKey);
+async fn a_viewing_key_job_is_for_guest_v3_only() {
+    let r = rig(8, 1, Behaviour::Ok);
+    for token in [r.token, r.own_token] {
+        let j = job(token);
         let reply_key = j.reply_key;
-        let id = r.svc.submit(&seal_job(&r.ek, &j).unwrap()).unwrap_or_else(|e| panic!("accept_spend_key {accept_spend_key}: {e:?}"));
+        let id = r.svc.submit(&seal_job(&r.ek, &j).unwrap()).unwrap();
         let s = wait_terminal(&r.svc, &id).await;
         assert_eq!(s.state, State::Done);
         assert_eq!(open_reply(&reply_key, s.reply.as_ref().unwrap()).unwrap().digest, [77; 8]);
-        // v3 witness of the v1/v2 width: bad.
-        let mut short = v3_job(r.token, WitnessKind::ViewingKey);
-        short.inputs = vec![77; hidden_input::COUNT];
-        let Err(Refusal::Bad(e)) = r.svc.submit(&seal_job(&r.ek, &short).unwrap()) else { panic!() };
-        assert!(e.contains(&hidden_input_v3::COUNT.to_string()), "{e}");
-        // v1 and v2 + viewing key: refused.
-        for hc in [ZkExecutor::hc_hidden_bundle(), ZkExecutor::hc_hidden_bundle_v2()] {
-            let mut j = job(r.own_token, WitnessKind::ViewingKey);
-            j.hc_bundle = hc;
-            let Err(Refusal::WitnessKind(e)) = r.svc.submit(&seal_job(&r.ek, &j).unwrap()) else { panic!() };
-            assert!(e.contains("v1/v2 guests take a spend key"), "{e}");
-        }
     }
-    // v3 + spend key: refused even where spend keys are accepted…
-    let r = rig(true, 8, 1, Behaviour::Ok);
-    let Err(Refusal::WitnessKind(e)) = r.svc.submit(&seal_job(&r.ek, &v3_job(r.own_token, WitnessKind::SpendKey)).unwrap()) else { panic!() };
-    assert!(e.contains("a v3 guest takes nk"), "{e}");
-    // …and, without the flag, refused as a spend-key job before the guest is looked at.
-    let r = rig(false, 8, 1, Behaviour::Ok);
-    let Err(Refusal::WitnessKind(e)) = r.svc.submit(&seal_job(&r.ek, &v3_job(r.own_token, WitnessKind::SpendKey)).unwrap()) else { panic!() };
-    assert!(e.contains("does not accept spend-key"), "{e}");
-    // v1 + spend key without the flag: refused (the flag is the gate).
-    let Err(Refusal::WitnessKind(_)) = r.svc.submit(&seal_job(&r.ek, &job(r.own_token, WitnessKind::SpendKey)).unwrap()) else { panic!() };
+    // v3 witness of the v1/v2 width: bad.
+    let mut short = job(r.token);
+    short.inputs = vec![77; hidden_input::COUNT];
+    let Err(Refusal::Bad(e)) = r.svc.submit(&seal_job(&r.ek, &short).unwrap()) else { panic!() };
+    assert!(e.contains(&hidden_input_v3::COUNT.to_string()), "{e}");
+    // v1 and v2 + viewing key: refused.
+    for hc in [ZkExecutor::hc_hidden_bundle(), ZkExecutor::hc_hidden_bundle_v2()] {
+        let mut j = job(r.own_token);
+        j.hc_bundle = hc;
+        j.inputs = vec![77; hidden_input::COUNT];
+        let Err(Refusal::WitnessKind(e)) = r.svc.submit(&seal_job(&r.ek, &j).unwrap()) else { panic!() };
+        assert!(e.contains("v1/v2 guests take a spend key"), "{e}");
+    }
     assert_eq!(r.svc.info().queue.depth, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_guest_profile_or_witness_length_is_bad() {
-    let r = rig(true, 8, 1, Behaviour::Ok);
-    let mut j = job(r.own_token, WitnessKind::SpendKey);
+    let r = rig(8, 1, Behaviour::Ok);
+    let mut j = job(r.own_token);
     j.hc_bundle = [1; 8];
     assert!(matches!(r.svc.submit(&seal_job(&r.ek, &j).unwrap()), Err(Refusal::Bad(_))));
-    let mut j = job(r.own_token, WitnessKind::SpendKey);
+    let mut j = job(r.own_token);
     j.profile = "fast\u{1b}[2J".into();
     match r.svc.submit(&seal_job(&r.ek, &j).unwrap()) {
         Err(Refusal::Bad(why)) => assert_eq!(why, "unknown fri profile", "the submitter's profile string is never echoed"),
         other => panic!("{other:?}"),
     }
-    let mut j = job(r.own_token, WitnessKind::SpendKey);
+    let mut j = job(r.own_token);
     j.inputs.truncate(10);
     assert!(matches!(r.svc.submit(&seal_job(&r.ek, &j).unwrap()), Err(Refusal::Bad(_))));
     assert!(matches!(r.svc.submit(&[0u8; 50]), Err(Refusal::Bad(_))));
@@ -165,14 +173,14 @@ async fn an_unknown_guest_profile_or_witness_length_is_bad() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_full_queue_is_busy_with_the_depth_and_a_token_is_capped() {
-    let r = rig(true, 1, 1, Behaviour::Block(400));
-    let first = r.svc.submit(&seal_job(&r.ek, &job(r.own_token, WitnessKind::SpendKey)).unwrap()).unwrap();
+    let r = rig(1, 1, Behaviour::Block(400));
+    let first = r.svc.submit(&seal_job(&r.ek, &job(r.own_token)).unwrap()).unwrap();
     wait_proving(&r.svc, &first).await;
-    let second = r.svc.submit(&seal_job(&r.ek, &job(r.own_token, WitnessKind::SpendKey)).unwrap()).unwrap();
+    let second = r.svc.submit(&seal_job(&r.ek, &job(r.own_token)).unwrap()).unwrap();
     // per_token is 2: a third from the same token is busy even though the queue (1 proving + 1 queued == max_queue + max_parallel) is also full
-    let e = r.svc.submit(&seal_job(&r.ek, &job(r.own_token, WitnessKind::SpendKey)).unwrap()).unwrap_err();
+    let e = r.svc.submit(&seal_job(&r.ek, &job(r.own_token)).unwrap()).unwrap_err();
     assert!(matches!(e, Refusal::Busy { depth: 1, max: 1 }), "depth is the queued count");
-    let e = r.svc.submit(&seal_job(&r.ek, &job(r.token, WitnessKind::SpendKey)).unwrap()).unwrap_err();
+    let e = r.svc.submit(&seal_job(&r.ek, &job(r.token)).unwrap()).unwrap_err();
     assert!(matches!(e, Refusal::Busy { .. }), "queue full for another token too");
     assert_eq!(r.svc.status(&second).unwrap().position, Some(1));
     wait_terminal(&r.svc, &first).await;
@@ -181,8 +189,8 @@ async fn a_full_queue_is_busy_with_the_depth_and_a_token_is_capped() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_proof_reports_its_error_and_never_its_inputs() {
-    let r = rig(true, 8, 1, Behaviour::Fail("unknown hc".into()));
-    let id = r.svc.submit(&seal_job(&r.ek, &job(r.own_token, WitnessKind::SpendKey)).unwrap()).unwrap();
+    let r = rig(8, 1, Behaviour::Fail("unknown hc".into()));
+    let id = r.svc.submit(&seal_job(&r.ek, &job(r.own_token)).unwrap()).unwrap();
     let s = wait_terminal(&r.svc, &id).await;
     assert_eq!(s.state, State::Failed);
     assert_eq!(s.error.as_deref(), Some("unknown hc"));
@@ -191,8 +199,8 @@ async fn a_failed_proof_reports_its_error_and_never_its_inputs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_done_reply_expires_after_the_ttl_and_cancel_drops_a_queued_job() {
-    let r = rig(true, 8, 1, Behaviour::Ok);
-    let id = r.svc.submit(&seal_job(&r.ek, &job(r.own_token, WitnessKind::SpendKey)).unwrap()).unwrap();
+    let r = rig(8, 1, Behaviour::Ok);
+    let id = r.svc.submit(&seal_job(&r.ek, &job(r.own_token)).unwrap()).unwrap();
     let s = wait_terminal(&r.svc, &id).await;
     assert_eq!(s.state, State::Done);
     assert!(r.svc.status(&id).unwrap().reply.is_some(), "served again within the ttl");
@@ -200,10 +208,10 @@ async fn a_done_reply_expires_after_the_ttl_and_cancel_drops_a_queued_job() {
     let s = r.svc.status(&id).unwrap();
     assert_eq!(s.state, State::Expired);
     assert!(s.reply.is_none());
-    let r = rig(true, 8, 1, Behaviour::Block(300));
-    let a = r.svc.submit(&seal_job(&r.ek, &job(r.own_token, WitnessKind::SpendKey)).unwrap()).unwrap();
+    let r = rig(8, 1, Behaviour::Block(300));
+    let a = r.svc.submit(&seal_job(&r.ek, &job(r.own_token)).unwrap()).unwrap();
     wait_proving(&r.svc, &a).await;
-    let b = r.svc.submit(&seal_job(&r.ek, &job(r.token, WitnessKind::SpendKey)).unwrap()).unwrap();
+    let b = r.svc.submit(&seal_job(&r.ek, &job(r.token)).unwrap()).unwrap();
     assert!(r.svc.cancel(&b));
     assert!(r.svc.status(&b).is_none(), "a cancelled queued job is gone");
     assert!(!r.svc.cancel(&b));
@@ -217,12 +225,14 @@ async fn a_done_reply_expires_after_the_ttl_and_cancel_drops_a_queued_job() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn info_names_the_guests_the_profiles_the_backend_and_the_fingerprint() {
-    let r = rig(true, 8, 1, Behaviour::Ok);
+    let r = rig(8, 1, Behaviour::Ok);
     let i = r.svc.info();
     // The same hex form `rand_status.hc_bundle` serves, so a wallet compares strings directly.
     let known: Vec<String> = ZkExecutor::known_hc_bundles().iter().map(randprotocol_core::notes::word8_to_hex).collect();
-    assert_eq!(i.hc_bundles, known);
-    assert!(i.hc_bundles.contains(&randprotocol_core::notes::word8_to_hex(&ZkExecutor::hc_bundle())));
+    // Only the guest a viewing-key witness proves — v3 — of the three this build knows (VK-4).
+    assert_eq!(i.hc_bundles, vec![randprotocol_core::notes::word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3())]);
+    assert!(known.contains(&i.hc_bundles[0]) && known.len() == 3);
+    assert_eq!(i.witness_kinds, vec!["viewing_key"]);
     assert_eq!(i.profiles, vec!["test", "production"]);
     assert_eq!(i.backend, "cpu");
     assert_eq!(i.kem_fingerprint, randprotocol_prover::key::fingerprint_of(&r.ek).to_string());
@@ -239,7 +249,6 @@ async fn shutdown_drops_queued_jobs_refuses_new_ones_and_stops_the_workers() {
     let own = pairings.pair("laptop", true).unwrap();
     let other = pairings.pair("phone", false).unwrap();
     let mut cfg = Config::new(key, pairings);
-    cfg.accept_spend_key = true;
     let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let inner = stub(Arc::new(Mutex::new(Behaviour::Block(300))));
     let count = started.clone();
@@ -248,17 +257,17 @@ async fn shutdown_drops_queued_jobs_refuses_new_ones_and_stops_the_workers() {
         inner(hc, p, inputs, binding, backend)
     });
     let svc = Service::start(cfg);
-    let proving = svc.submit(&seal_job(&ek, &job(own, WitnessKind::SpendKey)).unwrap()).unwrap();
+    let proving = svc.submit(&seal_job(&ek, &job(own)).unwrap()).unwrap();
     wait_proving(&svc, &proving).await;
-    let q1 = svc.submit(&seal_job(&ek, &job(own, WitnessKind::SpendKey)).unwrap()).unwrap();
-    let q2 = svc.submit(&seal_job(&ek, &job(other, WitnessKind::SpendKey)).unwrap()).unwrap();
+    let q1 = svc.submit(&seal_job(&ek, &job(own)).unwrap()).unwrap();
+    let q2 = svc.submit(&seal_job(&ek, &job(other)).unwrap()).unwrap();
     assert_eq!(svc.info().queue.depth, 2);
 
     svc.shutdown();
     assert!(svc.status(&q1).is_none(), "a queued job is dropped");
     assert!(svc.status(&q2).is_none(), "a queued job is dropped");
     assert_eq!(svc.info().queue.depth, 0);
-    match svc.submit(&seal_job(&ek, &job(other, WitnessKind::SpendKey)).unwrap()) {
+    match svc.submit(&seal_job(&ek, &job(other)).unwrap()) {
         Err(Refusal::Bad(why)) => assert_eq!(why, "shutting down"),
         other => panic!("{other:?}"),
     }
@@ -285,7 +294,7 @@ fn prover_address() -> randprotocol_core::notes::ShieldedAddress {
     randprotocol_core::notes::ShieldedAddress { pk: PROVER_PK, kem_ek: vec![9; 1184] }
 }
 
-/// A rig whose prover charges `fee` (or nothing), spend keys accepted so a v1 job reaches the fee check.
+/// A rig whose prover charges `fee` (or nothing).
 fn fee_rig(fee: Option<Fee>) -> Rig {
     let key = ProverKey::from_seed([4; 64]);
     let ek = key.kem_ek().to_vec();
@@ -293,7 +302,6 @@ fn fee_rig(fee: Option<Fee>) -> Rig {
     let own_token = pairings.pair("laptop", true).unwrap();
     let token = pairings.pair("phone", false).unwrap();
     let mut cfg = Config::new(key, pairings);
-    cfg.accept_spend_key = true;
     cfg.fee = fee;
     cfg.prove = stub(Arc::new(Mutex::new(Behaviour::Ok)));
     Rig { svc: Service::start(cfg), ek, token, own_token }
@@ -305,7 +313,7 @@ fn charging() -> Option<Fee> {
 
 /// A v3 witness whose four outputs pay nobody in particular (pk 1, amount 0), asset `A` = `asset_a`.
 fn v3_witness(token: [u8; 32], asset_a: u32) -> ProveJob {
-    let mut j = v3_job(token, WitnessKind::ViewingKey);
+    let mut j = job(token);
     for k in 0..4 {
         let o = hidden_input_v3::out(k);
         j.inputs[o + hidden_input_v3::O_PK..o + hidden_input_v3::O_PK + 8].copy_from_slice(&[1; 8]);
@@ -371,9 +379,9 @@ async fn a_fee_output_to_another_pk_is_refused() {
     pay(&mut j, 2, [0xBEEF; 8], FEE * 10);
     let Err(Refusal::Fee(why)) = submit(&r, &j) else { panic!("paying someone else is no fee") };
     assert!(why.contains("no output pays this prover"), "{why}");
-    // A v1/v2 (spend-key) witness cannot carry the fee this prover charges.
-    let Err(Refusal::Fee(why)) = submit(&r, &job(r.own_token, WitnessKind::SpendKey)) else { panic!() };
-    assert!(why.contains("only a v3 witness can carry"), "{why}");
+    // A spend-key job is refused for its kind before any fee is read (VK-4), charging or not.
+    let Err(Refusal::WitnessKind(why)) = submit(&r, &spend_key_job(r.own_token, ZkExecutor::hc_hidden_bundle_v2())) else { panic!() };
+    assert_eq!(why, SPEND_KEY_RETIRED);
     assert_eq!(r.svc.info().queue.depth, 0);
     // prover_info quotes it: base units as a decimal string, and the address.
     let fee = r.svc.info().fee.expect("quoted");
@@ -385,10 +393,9 @@ async fn a_fee_output_to_another_pk_is_refused() {
 async fn no_fee_configured_accepts_any_witness() {
     let r = fee_rig(None);
     assert!(r.svc.info().fee.is_none());
-    // The outputs are never read: all-77 words, a token transfer paying nobody, and a v1 job.
-    submit(&r, &v3_job(r.token, WitnessKind::ViewingKey)).expect("any v3 witness");
+    // The outputs are never read: all-77 words, and a token transfer paying nobody.
+    submit(&r, &job(r.token)).expect("any v3 witness");
     submit(&r, &v3_witness(r.token, 1)).expect("no output pays anyone we know");
-    submit(&r, &job(r.own_token, WitnessKind::SpendKey)).expect("a spend-key job, spend keys accepted");
 }
 
 #[test]

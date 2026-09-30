@@ -44,7 +44,8 @@
   the proxy's allowlist never forwards `rand_importViewingKey`.
 - **A delegated prover is never on the public RPC path.** An operator node started with
   `rand-node run --prover <ADDR>` (or a separate `rand-prover run`) listens on its own address,
-  and with `--prover-accept-spend-key` it holds the sending wallet's spend key while it proves.
+  and holds the sending wallet's viewing key — its whole history — while it proves (never a spend
+  key: that witness is retired, and `--prover-accept-spend-key` is refused at startup).
   Keep that listener on loopback (`127.0.0.1:8600` is `rand-prover run`'s default; the node's
   `--prover` has none and must be given) unless a TLS-terminating proxy fronts it for a LAN or a
   phone, and never run it on E, the web droplet or any other host in the `rpc.randprotocol.org` chain, nor route it through that chain. Both stop gracefully on

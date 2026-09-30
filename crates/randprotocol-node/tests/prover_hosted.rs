@@ -67,7 +67,6 @@ fn options(addr: &str, home: &Path) -> Options {
         addr: addr.parse().unwrap(),
         rpc: "127.0.0.1:0".parse().unwrap(),
         home: home.to_path_buf(),
-        accept_spend_key: false,
         max_parallel: 1,
         max_queue: 4,
         cuda: false,
@@ -129,7 +128,7 @@ async fn the_hosted_prover_answers_beside_the_node_and_its_exit_stops_the_node()
         .unwrap();
     let info = &info["result"];
     assert_eq!(info["kem_fingerprint"], json!(prover_key.fingerprint().to_string()), "{info}");
-    assert_eq!(info["witness_kinds"], json!(["viewing_key"]), "--prover-accept-spend-key is off: viewing-key (v3) jobs only: {info}");
+    assert_eq!(info["witness_kinds"], json!(["viewing_key"]), "viewing-key (v3) jobs only — the spend-key kind is retired (VK-4): {info}");
     assert_eq!(info["allowed_origins"][0], json!("chrome-extension://*"), "no --prover-allow-origin: the default list: {info}");
     // The node's own RPC is up beside it, and knows nothing of `prover_*`.
     let on_node: Value = http

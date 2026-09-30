@@ -117,3 +117,18 @@ fn a_jobs_debug_does_not_print_the_witness() {
     assert!(s.contains("inputs_len: 1204"), "{s}");
     assert!(!s.contains("token") && !s.contains("reply_key") && !s.contains("binding"), "{s}");
 }
+
+/// VK-4 (audit v6): the spend-key kind is retired, but its variant keeps its place on the wire —
+/// postcard writes the variant's index — so a job from a wallet older than the retirement still
+/// opens (and is then refused as a witness kind, which that wallet can print) and a viewing-key
+/// job means the same thing to both.
+#[test]
+fn the_retired_spend_key_kind_still_decodes_at_its_index() {
+    assert_eq!(postcard::to_allocvec(&WitnessKind::SpendKey).unwrap(), [0]);
+    assert_eq!(postcard::to_allocvec(&WitnessKind::ViewingKey).unwrap(), [1]);
+    assert_eq!(postcard::from_bytes::<WitnessKind>(&[0]).unwrap(), WitnessKind::SpendKey);
+    let (dk, ek) = keypair(5);
+    let opened = open_job(&dk, &seal_job(&ek, &job()).unwrap()).expect("a spend-key job is still a well-formed job");
+    assert_eq!(opened.witness_kind, WitnessKind::SpendKey);
+    assert_eq!((WitnessKind::parse("spend_key"), WitnessKind::parse("viewing_key")), (Some(WitnessKind::SpendKey), Some(WitnessKind::ViewingKey)));
+}

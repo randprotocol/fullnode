@@ -21,21 +21,27 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
-/// The refusal for a spend-key witness bound for a prover that is not the owner's own.
-pub const NOT_OWN: &str = "this build's witness carries the spend key; only a prover paired as your own (own=1) may receive it";
+/// The refusal for `--prover` on a chain whose bundle guest is v1 or v2 (VK-4, audit v6, decision
+/// D33). Those guests take the spend key as a private input, so the only witness a prover could
+/// be sent there carries it — and that witness path is retired: which guest a chain runs is
+/// `rand_status.hc_bundle` as the node reports it, and whether a prover might receive a spend-key
+/// witness was an `own=1` its own pairing link supplied, so a hostile prover beside a lying node
+/// was handed the key. No wallet of this build seals a spend-key witness for anyone. Delegated
+/// proving is for split-authorisation chains (guest v3, chains 17 and later); on an older chain
+/// the wallet proves on this machine, as before.
+pub const PRE_V3_REFUSAL: &str = "delegated proving needs a split-authorisation chain (bundle guest v3): this chain's bundle guest is v1 or v2, \
+     whose witness carries the spend key, and the spend key never leaves the wallet — prove on this machine instead (drop --prover)";
 
-/// Printed once, before a viewing-key witness goes to a prover that is not the owner's own: the
-/// v3 witness carries `nk`, which opens every note this wallet ever received or spent, and moves
-/// none of them (the auth proof, made on this machine over the spend key, is what spends).
+/// Printed once per prover before a witness goes to it, and in `rand send`'s confirmation: the v3
+/// witness carries `nk`, which opens every note this wallet ever received or spent, and moves
+/// none of them (the auth proof, made on this machine over the spend key, is what spends). Said
+/// of every pairing, `own=1` or not (VK-4): `own` is the link's word, and a link is the prover's
+/// to write.
 pub const VIEWING_KEY_WARNING: &str = "this prover can read this wallet's whole history; it cannot spend";
 
-/// What `rand prover pair` says of a link without `own=1`: such a pairing proves on a
-/// split-authorisation chain (its witness carries the viewing key) and is refused on an older one
-/// (whose witness carries the spend key).
-pub const NOT_OWN_PAIRING_NOTE: &str = "this link has no own=1: on a chain with split authorisation (bundle guest v3) this \
-     prover can prove your bundles from a viewing-key witness — it learns this wallet's whole history, never its spend key — \
-     and on a pre-v3 chain, whose witness carries the spend key, every --prover use is refused; re-pair with a link from \
-     `rand-prover pair --own` only for a machine you run";
+/// What `rand prover pair` shows before its y/N (VK-4): what the prover being paired will be
+/// sent, the same for every pairing.
+pub const PAIRING_DISCLOSURE: &str = "this prover will receive this wallet's viewing key: it can read the wallet's whole history; it cannot spend";
 
 /// `--max-prover-fee`'s default: 1 RAND. A prover quoting more is refused before any bundle is
 /// built, whatever the command (review I-1: the quote is the prover's to set, at any time).
@@ -72,7 +78,9 @@ pub struct PairedProver {
     pub kem_ek: String,
     /// The pairing token, hex.
     pub token: String,
-    /// Paired as the wallet owner's own machine: it may receive spend-key witnesses.
+    /// The link said `own=1` (`rand-prover pair --own`: a machine the wallet's owner runs). A
+    /// label, shown by `rand prover show` — it gates nothing (VK-4): every pairing is sent the
+    /// same viewing-key witness and told the same thing, and no pairing is sent a spend key.
     pub own: bool,
     /// `fingerprint_of(kem_ek)`, `XXXX-XXXX-XXXX-XXXX`.
     pub fingerprint: String,
@@ -186,6 +194,14 @@ impl PairedProver {
             if self.own { "yes" } else { "no" },
             self.kem_ek
         )
+    }
+
+    /// What `rand prover pair` shows before it asks (VK-4, audit v6): who is being paired — the
+    /// fingerprint of the key the link carries, which `prover_info` must then answer with, and
+    /// the URL — and [`PAIRING_DISCLOSURE`], what that prover will receive. The same two lines
+    /// whatever the link's `own` says.
+    pub fn pairing_confirmation(&self) -> Vec<String> {
+        vec![format!("prover {} at {}", shown(&self.fingerprint), self.shown_url()), PAIRING_DISCLOSURE.to_string()]
     }
 
     /// What `rand prover pair` prints once the pairing is saved.
@@ -312,11 +328,12 @@ impl RemoteProver {
     }
 
     /// The history warning, once: `Some(line)` the first time a viewing-key witness is headed
-    /// for this prover and it is not the owner's own, `None` afterwards (and for an own prover).
+    /// for this prover, `None` afterwards. For every pairing: an `own=1` one used to be skipped,
+    /// but `own` is only what the prover's link said (VK-4).
     /// `rand send` shows it in the confirmation before its y/N, so the user can decline; a command
     /// that asks nothing gets it from [`prove`](Self::prove), before the job is sent.
     pub fn history_warning(&self) -> Option<String> {
-        if self.paired.own || self.warned_history.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if self.warned_history.swap(true, std::sync::atomic::Ordering::Relaxed) {
             return None;
         }
         Some(format!("warning: {} — {VIEWING_KEY_WARNING}", self.paired.label()))
@@ -385,26 +402,27 @@ impl RemoteProver {
 
     /// Seal, submit, poll, open, check. `expected` and `proof_cap` are the wallet's own numbers:
     /// the digest it computed from its own plaintext and the chain's `max_proof_bytes`.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// `inputs` is a **viewing-key** witness — bundle guest v3's, `nk` and a salt — and the job
+    /// says so; there is no other kind to send (VK-4, audit v6). A guest other than v3 is refused
+    /// here, before the prover is asked anything: its witness would carry the spend key.
     pub async fn prove(
         &self,
         hc: &Word8,
         profile: FriProfile,
-        witness_kind: WitnessKind,
         inputs: &[u32],
         binding: &[u32; TX_BINDING_WORDS],
         expected: &Word8,
         proof_cap: usize,
     ) -> Result<(Vec<u8>, u8)> {
-        if witness_kind == WitnessKind::SpendKey && !self.paired.own {
-            return Err(anyhow!(NOT_OWN));
+        if *hc != ZkExecutor::hc_hidden_bundle_v3() {
+            return Err(anyhow!(PRE_V3_REFUSAL));
         }
-        // A viewing-key witness (bundle guest v3) may go to any paired prover; one that is not the
-        // owner's own is told what it can then see, once, before anything is sent.
-        if witness_kind == WitnessKind::ViewingKey {
-            if let Some(line) = self.history_warning() {
-                eprintln!("{line}");
-            }
+        let witness_kind = WitnessKind::ViewingKey;
+        // What this prover can then see, once, before anything is sent — whatever its pairing's
+        // `own` says.
+        if let Some(line) = self.history_warning() {
+            eprintln!("{line}");
         }
         let info = self.info().await?;
         let has = |field: &str, want: &str| info[field].as_array().is_some_and(|a| a.iter().any(|v| v.as_str() == Some(want)));
@@ -417,11 +435,7 @@ impl RemoteProver {
             return Err(anyhow!("the prover {} does not prove under this chain's FRI profile ({pname})", self.paired.label()));
         }
         if !has("witness_kinds", witness_kind.as_str()) {
-            return Err(anyhow!(
-                "the prover {} does not accept {} witnesses (its operator started it without them)",
-                self.paired.label(),
-                witness_kind.as_str()
-            ));
+            return Err(anyhow!("the prover {} does not accept {} witnesses", self.paired.label(), witness_kind.as_str()));
         }
         let ek = self.paired.kem_ek_bytes()?;
         let reply_key = Zeroizing::new(fresh_reply_key());
@@ -641,10 +655,10 @@ mod tests {
             "version": "0.6.2",
             "kem_fingerprint": key.fingerprint().to_string(),
             "kem_ek": hex::encode(key.kem_ek()),
-            "hc_bundles": [word8_to_hex(&ZkExecutor::hc_bundle())],
+            "hc_bundles": [word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3())],
             "profiles": ["test", "production"],
             "backend": "cpu",
-            "witness_kinds": ["spend_key"],
+            "witness_kinds": ["viewing_key"],
             "queue": { "depth": 0, "max": 8, "proving": 0 },
             "fee": null,
         })
@@ -670,7 +684,7 @@ mod tests {
                     assert_eq!(job.profile, "test");
                     assert_eq!(job.inputs, vec![1, 2, 3]);
                     f.kind = Some(job.witness_kind);
-                    assert_eq!(job.hc_bundle, ZkExecutor::hc_bundle());
+                    assert_eq!(job.hc_bundle, ZkExecutor::hc_hidden_bundle_v3());
                     assert_eq!(job.token, [9; 32]);
                     assert_eq!(job.version, WIRE_VERSION);
                     f.reply_key = Some(job.reply_key);
@@ -724,7 +738,7 @@ mod tests {
     }
 
     async fn prove(r: &RemoteProver, cap: usize) -> Result<(Vec<u8>, u8)> {
-        r.prove(&ZkExecutor::hc_bundle(), FriProfile::Test, WitnessKind::SpendKey, &[1, 2, 3], &BINDING, &EXPECTED, cap).await
+        r.prove(&ZkExecutor::hc_hidden_bundle_v3(), FriProfile::Test, &[1, 2, 3], &BINDING, &EXPECTED, cap).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -733,54 +747,44 @@ mod tests {
         let (proof, tier) = prove(&quick(paired), 1000).await.unwrap();
         assert_eq!((proof.len(), tier), (100, 14));
         assert_eq!(state.lock().unwrap().seen, ["prover_info", "prover_submit", "prover_status"], "one info, no cancel");
-        assert_eq!(state.lock().unwrap().kind, Some(WitnessKind::SpendKey));
+        assert_eq!(state.lock().unwrap().kind, Some(WitnessKind::ViewingKey), "the only kind a wallet sends");
     }
 
     async fn vk(r: &RemoteProver) -> Result<(Vec<u8>, u8)> {
-        r.prove(&ZkExecutor::hc_bundle(), FriProfile::Test, WitnessKind::ViewingKey, &[1, 2, 3], &BINDING, &EXPECTED, 1000).await
+        prove(r, 1000).await
     }
 
     /// Split authorisation: a viewing-key witness (bundle guest v3) goes to any paired prover —
-    /// `own` or not — and a prover that is not the owner's own is warned about once, before the
-    /// first job, never again for the same prover.
+    /// `own` or not — and every prover is warned about once, before the first job, never again
+    /// for the same prover. An `own=1` pairing gets the warning too (VK-4): the flag is the
+    /// link's word, and the link is the prover's to write.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_viewing_key_witness_goes_to_any_paired_prover_with_one_warning() {
-        let (paired, state) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, false, |i| {
-            i["witness_kinds"] = json!(["viewing_key"]);
-        })
-        .await;
-        let r = quick(paired);
-        assert!(!r.warned_history());
-        vk(&r).await.expect("a viewing-key job needs no own pairing");
-        assert!(r.warned_history(), "a prover not the owner's own is told what it can read");
-        assert_eq!(r.history_warning(), None, "already said: `rand send`'s confirmation shows it only once too");
-        assert_eq!(state.lock().unwrap().kind, Some(WitnessKind::ViewingKey));
-        vk(&r).await.expect("and again");
-        // The same prover, own: no warning.
-        let (paired, _) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, true, |i| {
-            i["witness_kinds"] = json!(["spend_key", "viewing_key"]);
-        })
-        .await;
-        let r = quick(paired);
-        vk(&r).await.unwrap();
-        assert!(!r.warned_history(), "the owner's own prover already holds the spend key");
-        assert_eq!(r.history_warning(), None);
+        for own in [false, true] {
+            let (paired, state) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, own, |_| {}).await;
+            let r = quick(paired);
+            assert!(!r.warned_history());
+            vk(&r).await.expect("a viewing-key job needs no own pairing");
+            assert!(r.warned_history(), "own={own}: the prover is told what it can read");
+            assert_eq!(r.history_warning(), None, "already said: `rand send`'s confirmation shows it only once too");
+            assert_eq!(state.lock().unwrap().kind, Some(WitnessKind::ViewingKey));
+            vk(&r).await.expect("and again");
+        }
     }
 
     /// The warning moved before `rand send`'s y/N: taken there (`history_warning`), the proof that
     /// follows prints nothing more — one warning per send, shown where it can be declined.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_history_warning_taken_by_the_confirmation_is_not_repeated() {
-        let (paired, _) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, false, |i| {
-            i["witness_kinds"] = json!(["viewing_key"]);
-        })
-        .await;
-        let r = quick(paired);
-        let line = r.history_warning().expect("the first time");
-        assert!(line.contains(VIEWING_KEY_WARNING) && line.contains("box"), "{line}");
-        assert_eq!(r.history_warning(), None, "once");
-        vk(&r).await.unwrap();
-        assert!(r.warned_history());
+        for own in [false, true] {
+            let (paired, _) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, own, |_| {}).await;
+            let r = quick(paired);
+            let line = r.history_warning().expect("the first time, own or not");
+            assert!(line.contains(VIEWING_KEY_WARNING) && line.contains("box"), "{line}");
+            assert_eq!(r.history_warning(), None, "once");
+            vk(&r).await.unwrap();
+            assert!(r.warned_history());
+        }
     }
 
     /// `prover_info.fee`: null is no fee; `{amount, address}` in base units and `rand1…`; anything
@@ -846,16 +850,25 @@ mod tests {
         assert!(quick(paired).with_max_fee(0).fee().await.is_err(), "0 refuses any fee");
     }
 
-    /// `rand prover pair`'s note for a link without own=1 (Phase 2): such a pairing proves on a
-    /// split-authorisation chain and is refused only on a pre-v3 one.
+    /// VK-4 (audit v6): what `rand prover pair` shows before its y/N — who, and what that prover
+    /// will receive — is the same for a link with `own=1` and one without: the viewing key, the
+    /// whole history, never the ability to spend. Nothing in it promises (or threatens) a spend key.
     #[test]
-    fn the_not_own_pairing_note_names_both_chains() {
-        let n = NOT_OWN_PAIRING_NOTE;
-        assert!(n.contains("split authorisation") && n.contains("viewing-key witness"), "{n}");
-        assert!(n.contains("whole history") && n.contains("never its spend key"), "{n}");
-        assert!(n.contains("pre-v3 chain") && n.contains("refused"), "{n}");
-        assert!(n.contains("--own") && n.contains("a machine you run"), "{n}");
-        assert!(!n.contains("in this build"), "the Phase 1 wording is gone");
+    fn the_pairing_confirmation_says_what_the_prover_receives_whatever_own_says() {
+        let key = ProverKey::generate();
+        let lines = |own: bool| {
+            let link = PairingLink { kem_ek: key.kem_ek().to_vec(), url: "https://prover.example".into(), token: [1; 32], own };
+            PairedProver::from_link(&link, None).pairing_confirmation()
+        };
+        assert_eq!(lines(true), lines(false), "own is a label: it changes nothing that is disclosed");
+        let l = lines(true);
+        assert_eq!(l[0], format!("prover {} at https://prover.example", key.fingerprint()));
+        assert_eq!(l[1], "this prover will receive this wallet's viewing key: it can read the wallet's whole history; it cannot spend");
+        assert_eq!(l[1], PAIRING_DISCLOSURE);
+        assert!(!l.iter().any(|x| x.contains("spend key")), "{l:?}");
+        // The refusal on a pre-v3 chain is the other half of what a user is told.
+        assert!(PRE_V3_REFUSAL.contains("bundle guest v3") && PRE_V3_REFUSAL.contains("spend key never leaves the wallet"), "{PRE_V3_REFUSAL}");
+        assert!(PRE_V3_REFUSAL.contains("drop --prover"), "{PRE_V3_REFUSAL}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -907,12 +920,26 @@ mod tests {
         assert!(e.contains("did not verify"), "{e}");
     }
 
+    /// VK-4: `RemoteProver::prove` sends a viewing-key witness or nothing. Asked to prove for a
+    /// v1 or v2 guest — whose witness is the spend key's — it refuses before the prover is asked
+    /// anything, for an `own=1` pairing as for any other, even when the prover advertises the
+    /// guest and the retired kind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_spend_key_witness_goes_only_to_an_own_prover() {
-        let (paired, state) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, false, |_| {}).await;
-        let e = prove(&quick(paired), 1000).await.unwrap_err().to_string();
-        assert!(e.contains("only a prover paired as your own (own=1) may receive it"), "{e}");
-        assert!(state.lock().unwrap().seen.is_empty(), "no request before the refusal");
+    async fn a_pre_v3_guest_is_refused_before_the_prover_is_asked_anything() {
+        for own in [true, false] {
+            for hc in [ZkExecutor::hc_hidden_bundle(), ZkExecutor::hc_hidden_bundle_v2(), [1; 8]] {
+                let (paired, state) = fake(Finish::Done { flip: 0, publish_flip: 0, proof_len: 100 }, own, |i| {
+                    i["hc_bundles"] = json!(ZkExecutor::known_hc_bundles().iter().map(word8_to_hex).collect::<Vec<_>>());
+                    i["witness_kinds"] = json!(["viewing_key", "spend_key"]);
+                })
+                .await;
+                let r = quick(paired);
+                let e = r.prove(&hc, FriProfile::Test, &[1, 2, 3], &BINDING, &EXPECTED, 1000).await.unwrap_err().to_string();
+                assert_eq!(e, PRE_V3_REFUSAL);
+                assert!(state.lock().unwrap().seen.is_empty(), "no request before the refusal");
+                assert!(!r.warned_history(), "and no warning about a witness that is never sent");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1002,7 +1029,7 @@ mod tests {
         assert!(!state.lock().unwrap().seen.contains(&"prover_submit".to_string()));
         let (paired, _) = fake(Finish::Never, true, |i| i["witness_kinds"] = json!([])).await;
         let e = prove(&quick(paired), 1000).await.unwrap_err().to_string();
-        assert!(e.contains("spend_key"), "{e}");
+        assert!(e.contains("does not accept viewing_key witnesses"), "{e}");
         let (paired, _) = fake(Finish::Never, true, |i| i["profiles"] = json!(["production"])).await;
         let e = prove(&quick(paired), 1000).await.unwrap_err().to_string();
         assert!(e.contains("profile"), "{e}");
