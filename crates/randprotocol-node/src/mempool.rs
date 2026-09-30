@@ -62,6 +62,10 @@ pub struct Claims {
     pub token: Option<TokenClaim>,
     /// The floor this transaction was admitted against (spec 2026-09-28 §7's ordering key).
     pub floor: u64,
+    /// A call's declared `GAS_LIMIT` on a chain with the genesis `gas` section, else `None`
+    /// (audit v6, CH-9): what the pool re-prices the call from at selection, when the prices
+    /// have moved since it was admitted.
+    pub gas_limit: Option<u64>,
 }
 
 /// A token-registry slot at most one pooled transaction may hold (H4 review minor): the ledger
@@ -121,6 +125,8 @@ struct Pooled {
     len: usize,
     /// The floor this transaction was admitted against — see [`Claims::floor`].
     floor: u64,
+    /// See [`Claims::gas_limit`].
+    gas_limit: Option<u64>,
 }
 
 /// The register nonce a bundle-less `Unbond` or `Withdraw` claims — and the aggregator
@@ -280,16 +286,36 @@ impl Mempool {
     /// The floor `tx` must pay here: on a chain with the genesis `gas` section, the ledger's own
     /// rule for a call (spec §4.2 — the policy is not read there); else the gas policy's for a
     /// call under one, the schedule's otherwise — refusing below it.
-    fn gas_policy_floor(&self, tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> Result<u64, TxError> {
-        let floor = match (&self.gas_policy, ledger.gas()) {
-            (Some(p), _) => crate::admission::call_floor(tx, ledger, executor, p)?,
-            // `call_floor` answers the ledger rule under the section whatever policy it is handed.
-            (None, Some(_)) => crate::admission::call_floor(tx, ledger, executor, &randprotocol_core::gas::GasPolicy::DEFAULT)?,
-            (None, None) => randprotocol_core::gas::fee_floor(&tx.action),
+    fn gas_policy_floor(
+        &self,
+        tx: &Transaction,
+        ledger: &Ledger,
+        executor: &dyn ConfidentialExecutor,
+    ) -> Result<crate::admission::CallPricing, TxError> {
+        use crate::admission::{call_pricing, CallPricing};
+        let pricing = match (&self.gas_policy, ledger.gas()) {
+            (Some(p), _) => call_pricing(tx, ledger, executor, p)?,
+            // `call_pricing` answers the ledger rule under the section whatever policy it is handed.
+            (None, Some(_)) => call_pricing(tx, ledger, executor, &randprotocol_core::gas::GasPolicy::DEFAULT)?,
+            (None, None) => CallPricing { floor: randprotocol_core::gas::fee_floor(&tx.action), gas_limit: None },
         };
-        match crate::admission::fee_below_floor(tx, floor) {
+        match crate::admission::fee_below_floor(tx, pricing.floor) {
             Some(e) => Err(e),
-            None => Ok(floor),
+            None => Ok(pricing),
+        }
+    }
+
+    /// The floor a pooled transaction must pay on top of `ledger` (audit v6, CH-9). For a call
+    /// admitted under the genesis `gas` section that is the ledger's rule at the prices in force
+    /// *now* — `BUNDLE_BASE + gas_price·GAS_LIMIT + byte_price·KiB`, from the limit remembered at
+    /// admission and the call's own bytes — and for everything else the floor it was admitted
+    /// at, which does not move.
+    fn current_floor(p: &Pooled, ledger: &Ledger) -> u64 {
+        match (&p.tx.action, p.gas_limit) {
+            (Action::Call { proof, input_envelope, .. }, Some(limit)) => ledger
+                .gas_call_floor(limit, randprotocol_core::gas::call_bytes(proof, input_envelope.as_ref()))
+                .unwrap_or(p.floor),
+            _ => p.floor,
         }
     }
 
@@ -342,7 +368,8 @@ impl Mempool {
         // verdict: this path runs no `precheck`, and it is the one a local `rand_mint` takes.
         self.pool_policy(&tx, ledger).map_err(MempoolError::Invalid)?;
         let mut c = c;
-        c.floor = self.gas_policy_floor(&tx, ledger, executor).map_err(MempoolError::Invalid)?;
+        let pricing = self.gas_policy_floor(&tx, ledger, executor).map_err(MempoolError::Invalid)?;
+        (c.floor, c.gas_limit) = (pricing.floor, pricing.gas_limit);
         Ok(self.admit(tx, c))
     }
 
@@ -403,7 +430,7 @@ impl Mempool {
         if !is_governance(&tx.action) && self.txs.len() >= self.max_size {
             return Err(MempoolError::Full);
         }
-        Ok(Claims { commitments, claim, token, floor: randprotocol_core::gas::fee_floor(&tx.action) })
+        Ok(Claims { commitments, claim, token, floor: randprotocol_core::gas::fee_floor(&tx.action), gas_limit: None })
     }
 
     /// Everything the pool can decide about a transaction without verifying a proof: the pool
@@ -430,7 +457,8 @@ impl Mempool {
         Self::applies(tx, &c.commitments, c.claim, ledger).map_err(MempoolError::Invalid)?;
         self.pool_policy(tx, ledger).map_err(MempoolError::Invalid)?;
         let mut c = c;
-        c.floor = self.gas_policy_floor(tx, ledger, executor).map_err(MempoolError::Invalid)?;
+        let pricing = self.gas_policy_floor(tx, ledger, executor).map_err(MempoolError::Invalid)?;
+        (c.floor, c.gas_limit) = (pricing.floor, pricing.gas_limit);
         Ok(c)
     }
 
@@ -492,7 +520,7 @@ impl Mempool {
     /// [`Mempool::pool_conflicts`] for this transaction, so no index entry written here can collide
     /// with one that exists.
     fn admit(&mut self, tx: Transaction, c: Claims) -> Hash {
-        let Claims { commitments, claim, token, floor } = c;
+        let Claims { commitments, claim, token, floor, gas_limit } = c;
         let hash = tx.hash();
         for nf in tx.nullifiers() {
             self.nullifiers.insert(nf, hash);
@@ -513,7 +541,7 @@ impl Mempool {
         self.bytes += len;
         // `pool_conflicts` refuses a hash already pooled, so nothing is replaced here; if that
         // ever changes, the replaced entry's bytes must leave the total with it.
-        if let Some(old) = self.txs.insert(hash, Pooled { tx, commitments, claim, token, since: Instant::now(), len, floor }) {
+        if let Some(old) = self.txs.insert(hash, Pooled { tx, commitments, claim, token, since: Instant::now(), len, floor, gas_limit }) {
             self.bytes -= old.len;
         }
         hash
@@ -553,8 +581,16 @@ impl Mempool {
     /// now exists is skipped rather than offered. The proposer's own `apply_transactions` is
     /// still the authority; this only avoids proposing a block that would fail.
     pub fn candidates_within(&self, ledger: &Ledger, max: usize, max_bytes: usize) -> Vec<Transaction> {
-        let mut ready: Vec<(&Hash, &Pooled)> =
-            self.txs.iter().filter(|(_, p)| Self::still_applies(p, ledger)).collect();
+        // Each entry with the floor it must pay on this tip (audit v6, CH-9): a call whose floor
+        // has risen past its fee would fail `FeeTooLow` in the proposer's trial apply, so it is
+        // not offered — it stays pooled, the price falls again — and it takes no candidate slot.
+        let mut ready: Vec<(&Hash, &Pooled, u64)> = self
+            .txs
+            .iter()
+            .filter(|(_, p)| Self::still_applies(p, ledger))
+            .map(|(h, p)| (h, p, Self::current_floor(p, ledger)))
+            .filter(|(_, p, floor)| p.tx.fee() >= *floor)
+            .collect();
         // Spec 2026-09-28 §7: governance first, then the fee above the admitted floor per KiB of
         // transaction (bytes are what a block is short of), then total fee, then hash so every
         // honest proposer on the same pool picks the same block. A `PauseMints` pays
@@ -567,9 +603,10 @@ impl Mempool {
         // floor is that rule's): a node without either orders exactly as before the gas work
         // (governance, total fee, hash), so switching the policy off is a true no-op there.
         let priced = self.gas_policy.is_some() || ledger.gas().is_some();
-        let surplus_per_kib = |p: &Pooled| {
+        // The surplus is over the floor on this tip, not the one the entry was admitted at.
+        let surplus_per_kib = |p: &Pooled, floor: u64| {
             if priced {
-                (p.tx.fee().saturating_sub(p.floor) as u128 * 1024) / p.len.max(1) as u128
+                (p.tx.fee().saturating_sub(floor) as u128 * 1024) / p.len.max(1) as u128
             } else {
                 0
             }
@@ -577,13 +614,13 @@ impl Mempool {
         ready.sort_by(|a, b| {
             is_governance(&b.1.tx.action)
                 .cmp(&is_governance(&a.1.tx.action))
-                .then_with(|| surplus_per_kib(b.1).cmp(&surplus_per_kib(a.1)))
+                .then_with(|| surplus_per_kib(b.1, b.2).cmp(&surplus_per_kib(a.1, a.2)))
                 .then_with(|| b.1.tx.fee().cmp(&a.1.tx.fee()))
                 .then_with(|| a.0.cmp(b.0))
         });
         let mut out = Vec::new();
         let mut bytes = 0usize;
-        for (_, p) in ready.into_iter().take(max) {
+        for (_, p, _) in ready.into_iter().take(max) {
             let len = p.len;
             if bytes + len > max_bytes {
                 // Skip it, do not end the block. `break` meant one transaction that cannot fit —
@@ -2529,6 +2566,48 @@ mod tests {
                 gas::circuit_call_floor(300, 900, gas::gas_max(12, 0, 0), stub_len)
             );
         }
+    }
+
+    /// Audit v6, CH-9. Under `gas.dynamic` a call's floor moves every block; the pool stored the
+    /// floor once, at admission, ranked by the fee above *that* floor, and never looked at the
+    /// fee again. After a price rise a call that no longer pays its floor fails `FeeTooLow` in
+    /// the proposer's trial apply — yet it was offered first, on its old surplus, and counted
+    /// against the candidate caps until its anchor left the window: thin or empty blocks for
+    /// minutes. Selection re-prices each call at the ledger's current prices: below the floor it
+    /// is not offered (it stays pooled — prices fall again), and the rank is the surplus now.
+    #[test]
+    fn a_pooled_call_is_repriced_at_selection_not_ranked_on_the_floor_it_was_admitted_at() {
+        use randprotocol_core::gas::{self, GasConfig, GasMetering, GasPrices};
+        let section = GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 20_479, metering: GasMetering::Circuit, dynamic: None };
+        let stub_len = StubExecutor::make_proof_with_public(&Hash::ZERO, 12, [0; 8], &[]).len();
+        let limit = gas::gas_max(12, 0, 0);
+        let at_start = gas::circuit_call_floor(100, 800, limit, stub_len);
+        let at_triple = gas::circuit_call_floor(300, 900, limit, stub_len);
+        assert!(at_triple > at_start + 1_000_000);
+        // `stale` pays a large surplus at the start prices and less than the floor after the rise;
+        // `keeps` still pays its floor after it, by 10; a transfer pays 1 000 over its flat base.
+        let (mut ledger, pid, stale) = program_and_call(12, at_start + 1_000_000, 50);
+        ledger.set_gas(Some(section));
+        let second = |n: u32, fee: u64, action| {
+            let b = fixtures::bundle_tx(&ledger, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], fee).bundle.expect("bundle");
+            StubExecutor::bound(Transaction::shielded(ledger.chain_id(), b, action))
+        };
+        let keeps = second(60, at_triple + 10, Action::Call { program: pid, proof: StubExecutor::make_proof_with_public(&pid, 12, [8; 8], &[]), input_envelope: None });
+        let transfer = fixtures::bundle_tx(&ledger, [[80; 8], [81; 8]], [[82; 8], [83; 8]], gas::BUNDLE_BASE + 1_000);
+        let mut m = Mempool::new(64);
+        let stale_hash = m.insert(stale, &ledger, &StubExecutor).unwrap();
+        let keeps_hash = m.insert(keeps, &ledger, &StubExecutor).unwrap();
+        let transfer_hash = m.insert(transfer, &ledger, &StubExecutor).unwrap();
+        let picked = |l: &Ledger| m.candidates(l, 10).iter().map(|t| t.hash()).collect::<Vec<Hash>>();
+        assert_eq!(picked(&ledger), vec![keeps_hash, stale_hash, transfer_hash], "at the start prices: by surplus per KiB");
+
+        let mut risen = ledger.clone();
+        risen.set_gas_prices(GasPrices { gas_price: 300, byte_price: 900 });
+        let now = picked(&risen);
+        assert!(!now.contains(&stale_hash), "a call under the current floor is not offered: {now:?}");
+        assert_eq!(now, vec![transfer_hash, keeps_hash], "and the rank is the surplus over the current floor (1 000 against 10)");
+        assert_eq!(m.len(), 3, "nothing is evicted: the price falls again");
+        assert_eq!(picked(&ledger).len(), 3, "and at the old prices all three are offered once more");
     }
 
     /// Review focus 1 and 2: the policy check never decodes a proof it should not.

@@ -776,16 +776,16 @@ pub fn minter_not_allowed(
 /// read — the floor is the ledger's own rule (`Ledger::gas_call_floor` over the decoded
 /// outcome's declared `gas_limit`, at the ledger's current prices), so the pool demands
 /// exactly what a block does.
-pub fn call_floor(
+pub fn call_pricing(
     tx: &Transaction,
     ledger: &randprotocol_core::Ledger,
     executor: &dyn randprotocol_core::confidential::ConfidentialExecutor,
     policy: &randprotocol_core::gas::GasPolicy,
-) -> Result<u64, TxError> {
+) -> Result<CallPricing, TxError> {
     use randprotocol_core::gas;
     use randprotocol_core::Action;
     let Action::Call { program, proof, input_envelope } = &tx.action else {
-        return Ok(gas::fee_floor(&tx.action));
+        return Ok(CallPricing { floor: gas::fee_floor(&tx.action), gas_limit: None });
     };
     if proof.len() > ledger.max_proof_bytes() {
         return Err(TxError::ProofTooLarge);
@@ -803,9 +803,31 @@ pub fn call_floor(
     }
     .map_err(TxError::InvalidProof)?;
     if let Some(floor) = ledger.gas_call_floor(outcome.gas_limit, gas::call_bytes(proof, input_envelope.as_ref())) {
-        return Ok(floor);
+        return Ok(CallPricing { floor, gas_limit: Some(outcome.gas_limit) });
     }
-    Ok(policy.call_floor(outcome.tier, outcome.keccak_log_height, outcome.sha256_log_height, gas::call_bytes(proof, input_envelope.as_ref())))
+    let floor = policy.call_floor(outcome.tier, outcome.keccak_log_height, outcome.sha256_log_height, gas::call_bytes(proof, input_envelope.as_ref()));
+    Ok(CallPricing { floor, gas_limit: None })
+}
+
+/// What [`call_pricing`] read off a transaction: the floor it must pay at the ledger's prices
+/// now, and — for a call on a chain with the genesis `gas` section — the `GAS_LIMIT` its proof
+/// declares, which with the call's own bytes is all the ledger's rule needs to price it again
+/// at another block's prices (audit v6, CH-9: the pool re-prices at selection without decoding
+/// the proof a second time).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallPricing {
+    pub floor: u64,
+    pub gas_limit: Option<u64>,
+}
+
+/// [`call_pricing`]'s floor alone.
+pub fn call_floor(
+    tx: &Transaction,
+    ledger: &randprotocol_core::Ledger,
+    executor: &dyn randprotocol_core::confidential::ConfidentialExecutor,
+    policy: &randprotocol_core::gas::GasPolicy,
+) -> Result<u64, TxError> {
+    call_pricing(tx, ledger, executor, policy).map(|p| p.floor)
 }
 
 /// `FeeTooLow` naming `floor` when `tx` pays less; non-permanent (a floor a fee market moves).
