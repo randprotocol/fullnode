@@ -563,6 +563,7 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
         6,
         Some((&authority, authority_out.as_path())),
         None,
+        None,
         [7; 32],
         None,
         FriProfile::Test,

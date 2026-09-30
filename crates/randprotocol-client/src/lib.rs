@@ -180,6 +180,29 @@ pub struct ChainLimits {
     /// two or three certified blocks later).
     #[serde(default)]
     pub adjust_bps: Option<u32>,
+    /// RPL-2 (program state): the genesis `program_state` section and the invoke limits with
+    /// it, `None` on a chain without the section — where no invoke is admitted — and from a
+    /// node that predates the field, which runs no chain with it.
+    #[serde(default)]
+    pub program_state: Option<ProgramStateLimits>,
+}
+
+/// `rand_getLimits.program_state` (RPL-2): what an invoke is sized and priced by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct ProgramStateLimits {
+    /// RAND units added to an invoke's fee floor per cell it creates. A decimal string on the
+    /// wire, like every amount.
+    #[serde(deserialize_with = "u64_string_or_number")]
+    pub cell_fee: u64,
+    pub max_reads: usize,
+    pub max_writes: usize,
+    pub max_payouts: usize,
+}
+
+/// A u64 sent as a decimal string or as a JSON number (the required-field twin of
+/// [`opt_u64_string_or_number`]).
+fn u64_string_or_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    opt_u64_string_or_number(d)?.ok_or_else(|| serde::de::Error::custom("a u64 amount, not null"))
 }
 
 /// `gas_metering` as the one fact the wallet acts on: is it `"circuit"`?
@@ -581,6 +604,67 @@ impl RpcClient {
         }
         let hex = v.as_str().context("rand_getProgramPublic did not return a hex string")?;
         words_from_le_hex(hex).map(Some)
+    }
+
+    // ---- program state (RPL-2) ----
+
+    /// One cell of `program` (`rand_getProgramCell`): its value, 64 zeros when absent. `None` on
+    /// a chain without the `program_state` section.
+    pub async fn program_cell(&self, program: &ProgramId, key: &Word8) -> Result<Option<Word8>> {
+        let v = self.call("rand_getProgramCell", json!([program.to_hex(), randprotocol_core::notes::word8_to_hex(key)])).await?;
+        if v["enabled"] == json!(false) {
+            return Ok(None);
+        }
+        let value = v["value"].as_str().context("rand_getProgramCell did not return a value")?;
+        word8_from_hex(value).map(Some).ok_or_else(|| anyhow!("rand_getProgramCell's value is not 64 hex: {value}"))
+    }
+
+    /// A page of `program`'s cells in key order (`rand_getProgramCells`), starting after `after`:
+    /// the cells and the key to continue from (`None` on the last page). `None` on a chain
+    /// without the section.
+    pub async fn program_cells(
+        &self,
+        program: &ProgramId,
+        after: Option<&Word8>,
+        limit: usize,
+    ) -> Result<Option<(Vec<randprotocol_core::ledger::program_state::Cell>, Option<Word8>)>> {
+        let page = json!({ "after": after.map(randprotocol_core::notes::word8_to_hex), "limit": limit });
+        let v = self.call("rand_getProgramCells", json!([program.to_hex(), page])).await?;
+        if v["enabled"] == json!(false) {
+            return Ok(None);
+        }
+        let cell = |c: &Value| -> Result<randprotocol_core::ledger::program_state::Cell> {
+            let word = |name: &str| {
+                let s = c[name].as_str().with_context(|| format!("a cell without its {name}"))?;
+                word8_from_hex(s).ok_or_else(|| anyhow!("a cell's {name} is not 64 hex: {s}"))
+            };
+            Ok(randprotocol_core::ledger::program_state::Cell { key: word("key")?, value: word("value")? })
+        };
+        let cells = v["cells"].as_array().context("rand_getProgramCells did not return cells")?.iter().map(cell).collect::<Result<Vec<_>>>()?;
+        let next = match v["next"].as_str() {
+            Some(s) => Some(word8_from_hex(s).ok_or_else(|| anyhow!("rand_getProgramCells's next is not 64 hex: {s}"))?),
+            None => None,
+        };
+        Ok(Some((cells, next)))
+    }
+
+    /// `program`'s vault (`rand_getProgramVault`): `(asset, amount)` ascending by asset, 0 being
+    /// RAND. `None` on a chain without the section.
+    pub async fn program_vault(&self, program: &ProgramId) -> Result<Option<Vec<(u32, u64)>>> {
+        let v = self.call("rand_getProgramVault", json!([program.to_hex()])).await?;
+        if v["enabled"] == json!(false) {
+            return Ok(None);
+        }
+        v.as_array()
+            .context("rand_getProgramVault did not return a list")?
+            .iter()
+            .map(|row| {
+                let asset = u32::try_from(row["asset"].as_u64().context("a vault row without its asset")?).context("asset index")?;
+                let amount = amount_field(&row["amount"]).context("a vault row without its amount")?;
+                Ok((asset, amount))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
     }
 
     /// The chain's limits (`rand_getLimits`), or `None` from a node that predates the method —
@@ -1235,6 +1319,8 @@ mod tests {
                 gas_circuit: false,
                 bundle_gas_limit: None,
                 adjust_bps: None,
+                // Nor a program_state section.
+                program_state: None,
             })
         );
         let older = RpcClient::new(scripted_rpc(vec![]).await);
