@@ -103,13 +103,35 @@ Re-fetched on 2026-09-26: the same digest. CI does not run this, because a publi
 can rate-limit a runner. circuits' `guests-compiled/sbpf/programs/SPL_TOKEN.md` has the ELF's
 section and relocation inventory.
 
-## The guest the chain runs is not here
+## The guests the chain runs are not here
 
-Chain 14's bundle guest, the hidden-asset bundle (`hc_bundle`
-`83d3a3704a1fcdb9bae7136c0a947ffa34bd53f055388395ed705fe8cacd0ef8`, `deploy/genesis-chain14.json`),
-is not a vendored binary. It is `guests::bundle_hidden()` in `src/guests.rs`: hand-written
-assembly in this crate's own DSL (`src/asm.rs`), assembled at run time. Its source is the program.
-`tests/guest_provenance.rs` asserts that `ZkExecutor::hc_bundle()` still equals the genesis pin,
-so a change to that source that would move `hc` fails a test instead of forking a node. No
-genesis pins any of the four guests above. One reaches a chain only as a program someone deploys
-(`rand program deploy`), and the chain names it by its `hc`.
+The chain's own guests — the three bundle guests and the auth guest — are not vendored binaries
+and are not in circuits at all. **This repository's `src/guests.rs` is their only source**
+(corrected 2026-09-30, audit v6, CS6-1: this section named only chain 14's v1 guest). Each is
+hand-written assembly in this crate's own DSL (`src/asm.rs`), assembled at run time; its source is
+the program, and its `hc` is what a genesis pins:
+
+| guest | source (`src/guests.rs`) | `hc` | genesis that pins it |
+|---|---|---|---|
+| bundle, hidden-asset v1 | `bundle_hidden()` | `83d3a3704a1fcdb9bae7136c0a947ffa34bd53f055388395ed705fe8cacd0ef8` | `hc_bundle` of chains 14 and 15 (`deploy/genesis-chain14.json`, `-chain15.json`) |
+| bundle, branch-free v2 | `bundle_hidden_v2()` | `651043e2ff2fef28df2d8edbdbbc387668577af72dcc584ee7d850e093a2839b` | `hc_bundle` of chain 16 (`deploy/genesis-chain16.json`) |
+| bundle, split-authorisation v3 | `bundle_hidden_v3()` | `60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce` | `hc_bundle` of chains 17 and 18 (`deploy/genesis-chain17.json`, `-chain18.json`) |
+| auth | `auth()` | `1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1` | `hc_auth` of chains 17 and 18 |
+
+`tests/guest_provenance.rs` asserts that each of the four still assembles to the digest above
+(`the_chain_14_bundle_guest_is_the_genesis_pin`, `the_branch_free_bundle_guest_is_pinned`,
+`the_split_authorisation_bundle_guest_is_pinned`, `the_auth_guest_is_pinned`), so a change to that
+source that would move an `hc` fails a test instead of forking a node. The digests in the table
+were read from the genesis files and from that test on 2026-09-30. What this does not give: a
+third party cannot rebuild these four guests from the circuits pin, because they are not there;
+the audit trail for them is this repository's history alone. Publishing their build inputs in
+circuits under the same pin is the later step.
+
+No genesis pins any of the four vendored guests above (`fib`, `keccak256`, `evm`, `sbpf`). One
+reaches a chain only as a program someone deploys (`rand program deploy`), and the chain names it
+by its `hc`.
+
+**The SPL Token image's source release is not recorded.** As the table in the previous section
+says, neither circuits nor this repository records which `solana-program-library` release built
+`sbpf/programs/spl_token.so`; it was looked for again on 2026-09-30 and not found. What is pinned
+is the deployed program-data account and the file's sha256, not a source tag.
