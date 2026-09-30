@@ -4,7 +4,87 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-29)
+## Project memory (state as of 2026-09-30)
+
+### Audit v6 fixes — on `main`, untagged, NOT rolled, NOT cut (2026-09-30)
+
+The final audit v6 (`~/Downloads/Rand_Final_Security_Audit_v6_2026-09-30.pdf`, 232 rows, against
+`48dc04b` = v0.6.7) and what this repository did about it. One GitHub issue per fullnode finding
+(#67–#115, label `audit-v6`), one commit per finding, each red-first with the red quoted in its
+commit. **The user's standing instruction for this work (2026-09-30): take the audit's
+recommended option every time; commit and push to `main` often; the chain-19 cut waits for these
+fixes and is a deployer session's job, not the fixing session's.**
+
+**The build still runs chain 18 byte for byte** — no existing wire type, hash domain, state root
+or validity rule changed without a new genesis field. That is the rule every later change to
+this line must keep (`/private/tmp/auditv6/GATED-RULES.md` was the brief; the pins are
+`chain_18s_genesis_file_builds_chain_18`, `the_consensus_encoding_and_txid_are_pinned`,
+`guest_provenance`).
+
+**Three classes, and the class decides how it ships:**
+
+- **Node-only, any chain** (no wire or validity change): CON-5 (a
+  `SafetyHalt` record; `run` refuses to start on one; `rand-node safety status|clear-halt|
+  release-lock`), GOSSIP-2 (`Block::transaction_list_fault` in the relay precheck and the orphan
+  pool), OPS-5 (`snapshot_is_the_head_state`: the reloaded ledger's state root must equal the
+  head header's or the node does not start — **canary this**: a new refusal at startup), CH-9
+  (the pool re-prices calls at selection), BRG-19 (`mint_headroom`, `minted_in_window` in every
+  backing row; read `mint_headroom`), BRG-18, BRG-12, VK-2/RPC-4/RPC-2/RPC-3 (**`--public-rpc`**:
+  a second listener with `rpc::PUBLIC_METHODS`, no batches, no WebSocket, one meter; a 30 s read
+  timeout and a 64 MiB page bound on both listeners; `--rpc-viewing-token-file`), VK-1, VK-4
+  (**the spend-key witness path is retired**: `--accept-spend-key` / `--prover-accept-spend-key`
+  are startup errors; `prover_info` lists guest v3 and `viewing_key` only), VK-5, VK-6 (**a
+  wallet key file that is group/world readable is refused on load** — chmod 600 the operator
+  wallets before the next `balances`), VK-7 (`rand-node keygen` refuses an existing `--out`),
+  NET-1 (reserved peers: `--reserved-peer`, bootstrap peers, and validators' signed
+  `PeerBinding`s learned over a new gossip topic and persisted; a per-source-address cap on
+  pending handshakes; a 5 s handshake timeout), SYNC-3 (a validator-only share of the Blocks
+  budget; `SyncResponse::Busy`), GOSSIP-1, CH-7 (a pool byte cap with eviction; `--strict-gossip`,
+  which the interop test showed CAN roll node by node — the older "a Strict/Permissive mix drops
+  messages" notes in this file are wrong for this codebase: every node already signs).
+- **Consensus behaviour, no format change — all-stop/all-start, never node by node:**
+  **CON-4** (the vote's hash is persisted with the vote, `SafetyState::voted`; no NotHeld is
+  signed for a voted or locked block; **the automatic lock release is gone** — `record_not_held`
+  only counts and logs; the lock yields to a higher justify, the block arriving, or
+  `rand-node safety release-lock`) and **CH-1** (a timeout-certificate pacemaker: a view is
+  entered on a QC for the view before or on NewViews from more than two thirds of the stake; more
+  than a third makes a replica join; a timeout no longer enters the next view; a proposal no
+  longer moves the view). An old replica still follows one NewView and a new one does not; a
+  mixed fleet was not tested.
+- **Genesis-gated, dormant on chain 18** — see the entries that follow this one as they land
+  (staking admission and slashing, vesting treasury/threshold/nonces, the gas ceilings and
+  paying-bytes load, the genesis-hash binding, rotation possession and delay).
+
+**Suite on the laptop at the network-edge head (release):** core lib 572; node lib 416 passed,
+21 failed (all the `RECURSION_FIXTURES` gap); `cluster` 25 passed, 1 ignored, 3 filtered out by
+name, in 1 656 s — the proving tests included, on the new pacemaker; `ws` 9, `submit` 2 (+1
+ignored); client lib 171, `rand` bin 17; the prover crate whole. Not run: `wallet_flow`,
+`zusd_e2e`.
+
+**Traps from this work:**
+- A subagent's `cargo test … --test cluster -- --skip proves` does not skip the proving tests
+  (their names do not say so): name the twelve non-proving tests with `--exact`, as CI does.
+- One new consensus test looped for ever under the first pacemaker cut (a test that timed a lone
+  replica through 256 views): run each consensus test alone under an alarm after touching the
+  pacemaker (`perl -e 'alarm 40; exec @ARGV' <test binary> --exact <name>`).
+- bincode is positional: `SafetyState` gained a field, so `Storage::load_safety` reads the
+  four-field row every build through v0.6.7 wrote; a new field on any persisted bincode row needs
+  the same.
+- The RPC's blocking-read slots were process statics; a hundred RPC tests in one process queued
+  on them and answered each other "busy" (the recorded flake of `a_pruned_height_answers_32010…`
+  and `a_token_transfer_reveals…`). They are per-state now (`ReadSlots`).
+- The laptop's disk filled (98%): clippy's debug tree and four worktrees' build dirs. Use
+  `CARGO_INCREMENTAL=0` and `cargo clippy --release`; delete `target/debug` before a long run.
+
+**Open after this work** (issues left open say why): PROC-2 (#109, blocked: cargo reads every
+path dependency's manifest; needs the circuits crates vendored or git deps on a protected tag),
+PROC-4/5 (#110: `release.yml` and `deploy/lib/verify-release.sh` exist; the release key is not in
+`deploy/release-signers`, `main` is unprotected), OPS-7/OPS-6 (#112: the cut policy and
+`deploy/lib/cut-policy.sh` exist; the key-separation schedule is the operators'), PROC-8 (#108:
+one CI failure mode left), and everything outside this repository — the website and sale service
+(WEB-*, due before 2026-10-07), randscan (SCAN-2), the clients (CLI-6/7, PRIV-1), the bridge
+repositories (BR-*), the papers (PA-*, DOC-*), and custody (OPS-6, BR-4, BR-7).
+
 
 ### v0.6.7 — the fixes on the chain-18 build (2026-09-29; rolls onto chain 18 one node at a time)
 
@@ -1469,7 +1549,7 @@ against the running build: the sync path commits only through `committed_prefix`
 whole-batch-verified run (the plan's `CommitProof` serving was deliberately superseded — the
 tail commits via the live path instead), the lock survives restart/sync/fallback, conflicting
 finality stops the node as `FatalSafety`, and B5's verified-proof cache skips only the STARK
-verify. **B3 — the timeout-certificate pacemaker — is the one open consensus item**: CH-1's
+verify. **(Superseded 2026-09-30: B3 landed as audit v6's CH-1 fix — see the top entry.)** **B3 — the timeout-certificate pacemaker — is the one open consensus item**: CH-1's
 f+1-NewViews rule was dropped (`has_weak_quorum` is not in the tree), so `on_new_view` still
 advances on one signed NewView bounded by `MAX_VIEW_AHEAD`; that needs a validator key and buys
 no safety break, but it is a liveness lever, not only view inflation: **one validator key can
@@ -2042,16 +2122,25 @@ never move them.
   (old collectors still eat QCs).
 - **Views are bounded** (`MAX_VIEW_AHEAD = 1e6`) and all `view + 1` math is
   saturating. A signed NewView for `u64::MAX` used to halt every node.
+- **A view is entered on a quorum's evidence only** (audit v6, CH-1): a QC for
+  the view before, or NewViews from more than two thirds of the stake
+  (`HotStuff::pace`). One validator's NewView, a replica's own timer, or a
+  proposal for a later view moves nobody. Any relaxation re-opens the one-key
+  stall (regression test:
+  `one_validator_announcing_the_views_it_leads_does_not_stop_commits`).
 - **Sync commits only through the three-chain rule.** `apply_synced` verifies
   the whole batch (every QC, epoch set, leader, execution) and commits only
   `commit_rule::committed_prefix` of it; the tail enters through the live
   path (`offer_pending`), never on a peer's word (regression test:
   `a_synced_certified_but_uncommitted_chain_is_not_committed`).
-- **The lock is durable.** `resume` restores a persisted `locked_qc` ahead of
-  the head's QC and never lowers one below it; `record_not_held` is the only
-  place the lock is lowered, and only on signed `NotHeld` attestations from
-  validators holding a quorum of the current set's stake — strictly more than
-  two thirds — each signed at a view above the locked QC's
+- **The lock is durable, and no one's word lowers it** (audit v6, CON-4,
+  2026-09-30 — this bullet said `record_not_held` lowered it on a not-held
+  quorum; that release is removed). `resume` restores a persisted `locked_qc`
+  ahead of the head's QC and never lowers one below it; `record_not_held` only
+  counts and logs the evidence; the lock yields to a proposal whose justify
+  outranks it, to the block arriving, or to the operator's offline
+  `rand-node safety release-lock`. A replica signs no `NotHeld` for a block it
+  voted for or is locked on (`SafetyState::voted`)
   (`hotstuff.rs`; regression tests: `a_resumed_validator_keeps_its_lock`,
   `a_stale_safety_state_never_lowers_the_lock`). `fallback_high_qc` lowers
   `high_qc` only and has not touched the lock since v0.5.4. (Corrected
@@ -2110,7 +2199,9 @@ never move them.
   would need admission to accept `current ≤ nonce ≤ current + pooled_run` as well, because the
   ledger requires the nonce to equal the current one exactly (`staking.rs`, `aggregation.rs`).
   Returning N+1 alone would be refused at the tip.
-- **The lock is released in exactly one place, `record_not_held`** (`hotstuff.rs`): on signed
+- **(Superseded 2026-09-30 by audit v6's CON-4 fix: no automatic release at all; see the
+  invariant above. The text below is the v0.5.5–v0.6.7 rule, kept as history.)**
+  The lock is released in exactly one place, `record_not_held` (`hotstuff.rs`): on signed
   `NotHeld` attestations for the locked block from validators of the current set holding a quorum
   — strictly more than two thirds of the stake (v0.5.5; v0.5.4 released on a third) — each signed
   at a view above the locked QC's and within `NOT_HELD_VIEW_WINDOW` (v0.5.9, CN-3).
