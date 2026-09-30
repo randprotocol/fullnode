@@ -364,6 +364,30 @@ as its 4 little-endian bytes (8 hex digits a word, the same byte order as a `Wor
 input, `null` for an id no program has. A wallet proving a call passes these words to the prover:
 the proof commits to them and the ledger checks that commitment against `public_digest`.
 
+### `rand_getProgramCell`
+RPL-2 (program state; genesis-gated). Params: `[program_id, key]`, the key 64 hex characters
+(a `Word8`, with or without `0x`). Result: `{ "key": "<64 hex>", "value": "<64 hex>" }`. A cell
+the program never wrote — or wrote zeros to, which deletes it — reads as 64 zeros, the one
+encoding of "absent"; so does any key of a program nobody deployed (the program's existence is
+not checked). `{"enabled": false}` on a chain without a `program_state` section. A cell is
+public by design (spec §2): what a wallet reads to build an `invoke`'s `reads`.
+
+### `rand_getProgramCells`
+Params: `[program_id, { "after": "<64 hex>" | null, "limit": n }]`, the object optional. Result:
+`{ "cells": [{ "key", "value" }, …], "next": "<64 hex>" | null }` — the program's cells in key
+order (an unsigned comparison of the eight words), starting after `after`, at most `limit` of
+them (clamped to 1 000, at least 1). `next` is the last key served when more follow — pass it
+back as `after` — and `null` on the last page. `{ "cells": [], "next": null }` for a program with
+no cell; `{"enabled": false}` without the section.
+
+### `rand_getProgramVault`
+Params: `[program_id]`. Result: `[{ "asset": 0, "amount": "123" }, …]`, ascending by asset index
+(0 is RAND, every other index the token registry's), amounts as decimal strings in the asset's
+own units. A row at zero does not exist, so an empty vault — and a program nobody deployed — is
+`[]`. `{"enabled": false}` without the section. Value enters a vault through an `invoke`'s bundle
+(`burn_r`, and `burn_a` of `burn_asset` when the transition's `inflow` is `deposit`) and leaves
+it as the notes the transition's `pays` name.
+
 ### `rand_getLimits`
 Params: `[]`. Result: what a wallet needs from the chain's genesis to build a transaction — the
 call limits (`max_program_words` through `max_program_public_words`), the envelope size, the v0.6
@@ -377,7 +401,7 @@ gas policy:
   "gas_metering": "header", "bundle_gas_limit": null, "adjust_bps": null,
   "max_gas_price": null, "max_byte_price": null, "byte_load": null,
   "admission_by_vote": false, "testnet": false, "slashing": null, "binding_domain": 0,
-  "proof_window_blocks": null }
+  "proof_window_blocks": null, "program_state": null }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -467,6 +491,23 @@ the keys that may register (`docs/staking.md` §2). `testnet` is the genesis `te
 (audit v6, STAKE-2): `true` only where the file says so — what lets a faucet sit beside a bridge
 section — so a wallet or an explorer can label the chain; `false` on every chain through 18.
 
+`program_state` (RPL-2, `docs/superpowers/specs/2026-09-30-rpl2-program-state-design.md`) is the
+genesis `program_state` section and the `invoke` limits that come with it, or `null` on a chain
+without the section — where every `invoke` is refused and no program token can be registered:
+
+```json
+"program_state": { "cell_fee": "10000000", "max_reads": 8, "max_writes": 8, "max_payouts": 4 }
+```
+
+`cell_fee` is the RAND units (a decimal string) an invoke's fee floor gains per cell it
+*creates* — a write of a non-zero value to a cell that reads as zeros; rewriting, deleting or
+writing zeros over nothing costs no cell fee. `max_reads`, `max_writes` and `max_payouts` (pays
+and mints together) are the transition's hard caps; the binding bound in practice is the segment
+rule — the transition's context words (11 + 16 per read or write + 3 per payout) must fit beside
+the program's public input and the 8 binding words in a 128-row public table, so 119 context
+words for a program without a public input. A node that predates the field answers without it,
+which a wallet reads as `null`.
+
 ### `rand_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
 proves against).
@@ -547,6 +588,13 @@ byte_price·⌈bytes/1024⌉`, at `rand_getLimits`'s current prices — the tip'
 (§7.1). `keccak_log_height`/`sha256_log_height` are accepted but unused under a section: the
 declared limit already bounds the header, hash tables included. On a chain with no `gas` section
 this field does not exist and the estimate behaves exactly as above.
+
+`{"kind":"invoke", …, "created_cells": c}` (RPL-2) takes every field a call spec takes — an
+invoke carries a call proof and is priced as a call — plus `created_cells` (optional, default 0;
+at most `max_writes`, else `-32602`): the cells the transition would create, each adding the
+chain's `cell_fee` (`rand_getLimits.program_state`). The caller counts them: a write of a
+non-zero value to a cell `rand_getProgramCell` reads as zeros. On a chain without the section
+the kind is `-32602`.
 
 ### `rand_getTransaction`
 Params: `[hash]`. Result: `null` until committed, then:
@@ -660,6 +708,36 @@ units:
 
 There is no `token_transfer`: a token transfer is `none`, indistinguishable from a RAND payment.
 
+The RPL-2 `invoke` (program state, `docs/superpowers/specs/2026-09-30-rpl2-program-state-design.md`):
+
+```json
+{ "kind": "invoke", "program": "<program id>", "proof_len": 268123, "input_envelope_len": null,
+  "transition": {
+    "reads":  [{ "key": "<64 hex>", "value": "<64 hex>" }],
+    "writes": [{ "key": "<64 hex>", "value": "<64 hex>" }],
+    "inflow": "none" | "deposit" | "burn",
+    "pays":  [{ "asset": 0, "amount": "300", "recipient": "<shielded address>", "time": 41,
+                "r": "<64 hex>", "cm": "<64 hex>" }],
+    "mints": [{ "asset": 2, "amount": "40", "recipient": "<shielded address>", "time": 41,
+                "r": "<64 hex>", "cm": "<64 hex>" }] } }
+```
+
+A call's fields, then the state transition the proof vouched for and the ledger applied — all of
+it public by design (spec §2, §9). `reads` are the cells the program read with the values it
+read (the proof was made against them; the ledger refused the transaction unless they still
+held), `writes` the cells it wrote; a cell key or value is a `Word8`, 64 hex of its eight words
+little-endian, and a written value of 64 zeros deletes the cell. What came *in* is the bundle's
+and is rendered with it: `burn_r` is RAND deposited into the program's vault, `burn_a` of
+`burn_asset` is the token the transition's `inflow` names — `deposit` into the vault, `burn`
+destroyed (the program's own token only), `none` when `burn_a` is 0. What went *out* is one
+chain-computed note per payout, `pays` (out of the vault) then `mints` (new units of a token
+whose mint authority is this program), in that order in the tree: every word of each note is
+here under the field names a `token_mint` uses — `time` is the **bundle's** `time`, `cm` the leaf
+the chain appended, and the `from` word is the chain's fixed `PROGRAM_FROM` — so a recipient
+rebuilds it from these fields with nothing decrypted, as it rebuilds a mint. **The kind string
+`invoke` is what the wallet's scan keys on and is pinned by a test.** The program's eight output
+words are on the receipt (`rand_getReceipt`), as a call's are.
+
 No reply from this method carries the sender, recipient, nonce or amount of a *transfer*: no such
 field exists in a stored transfer. The staking and bridge actions above are the deliberate
 exception — a validator address, an amount and a replay nonce are public in them by design, the
@@ -691,8 +769,10 @@ envelope the key opened: `output` names the envelope set (`bundle:0` … `bundle
 transaction's bundle, one per output slot — slots 0–1 the private-asset outputs, slots 2–3 the
 RAND outputs, dummies included — `deposit` for a `BridgeAttest`'s deposit envelope, `token_mint`
 for a `TokenMint`'s note, `initial_mint` for a `RegisterToken`'s initial mint, `mint:0` for a
-faucet mint's one envelope), `cm` the on-chain commitment the note commits to, and `index` its
-leaf. The disclosed `note` carries its `asset`: this call — with the key the sender sealed under —
+faucet mint's one envelope, `payout:0` … `payout:3` for the notes an RPL-2 `invoke` paid out —
+one per payout, numbered by its place in the transition, `pays` then `mints`, each opened against
+the commitment the chain computed for it), `cm` the on-chain commitment the note commits to, and
+`index` its leaf. The disclosed `note` carries its `asset`: this call — with the key the sender sealed under —
 is the one place the RPC reveals which asset a transfer moved. The binding is the proof: the AEAD
 authenticates the note *and* checks it against `cm`, so a key lifted onto another transaction —
 or a note that is not the commitment's preimage — yields an empty list, never a forged row. A
@@ -990,6 +1070,7 @@ Params: `[]`. Result:
   "subsidised": "…", "sealed_blocks": "…", "aggregator_bonds": "…", "slashed": "…",
   "registration_fees_burned": "…",
   "vesting_issued": "…", "vesting_released": "…", "vesting_in_register": "…", "vesting_locked": "…",
+  "program_rand_out": "…", "program_rand_held": "…",
   "pool_value": "…", "register_total": "…", "total_supply": "…", "invariant_holds": true }
 ```
 
@@ -1024,6 +1105,13 @@ two together, and `invariant_holds` is whether it still equals everything the ch
 every one of them by replaying the chain, which is what makes them auditable. `docs/supply.md`
 works the identity through a bond and a withdraw and says where it rests on a claim (the genesis
 file's own amounts) rather than on a check.
+
+`program_rand_out` and `program_rand_held` (RPL-2, program state; `"0"` without a
+`program_state` section): RAND that invokes have paid out of program vaults as notes (value
+entering the pool, inside `pool_value` beside `withdraw_deposited`), and what the vaults still
+hold — register-side value, inside `total_supply`. It entered through an invoke's bundle
+`burn_r`, so it is inside `burned` on the pool side; this is its register-side twin, and a
+token in a vault is still in that token's `total_supply`.
 
 ### `rand_getVesting`
 Params: `[id, at_ms?]` — the entry's 64-hex id, and optionally the time to evaluate the schedule at
@@ -1511,6 +1599,32 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-10-01 — RPL-2: program state, program vaults and the `invoke` (genesis-gated; on no chain yet)
+
+`docs/superpowers/specs/2026-09-30-rpl2-program-state-design.md`. Inert on every chain whose
+genesis has no `program_state` section; chain 20 is the first that can carry one.
+
+- **A new action, `invoke`** (`Action` 33, appended after audit v6's 28–32): a call whose proof vouches for one declared state
+  transition of a program, which the ledger applies. `rand_getTransaction` renders it as a call
+  plus its transition — cells read and written, the inflow kind, and every payout note with all
+  its words (`time` is the bundle's; `cm` the leaf appended). Its receipt is a call's:
+  `rand_getReceipt`, `rand_getReceipts` and the `receipts` topic carry it unchanged.
+- **`rand_getProgramCell`, `rand_getProgramCells`, `rand_getProgramVault`**: a program's cells
+  (one, or paged in key order) and its vault. `{"enabled": false}` without the section. All
+  three are on the public listener.
+- **`rand_getLimits` gains `program_state`** (`{ cell_fee, max_reads, max_writes, max_payouts }`
+  or `null`); **`rand_estimateFee` takes `{"kind":"invoke", …, "created_cells": c}`** — a call's
+  estimate plus `cell_fee · c`.
+- **`rand_getSupply` gains `program_rand_out` and `program_rand_held`** (both `"0"` without the
+  section); `invariant_holds` covers the vaults.
+- **`rand_getCompactBlocks` and `rand_getCommitments`** serve an invoke's payout notes at the
+  leaves the ledger gave them (after the bundle's four, pays then mints), each with the payout's
+  own envelope, so a wallet finds a note paid to it by trial decryption as it finds a mint.
+  `rand_checkTransaction` names them `payout:<i>`.
+- `register_token` may carry `"authority": "program"` under the section (a token the named
+  program mints and burns through its invokes); `rand_getToken` renders such an authority as
+  `{ "kind": "program", "program": "<id>" }`, as it always could.
 
 ### 2026-10-01 — issue #118: `proof_window_blocks` (genesis-gated; no chain carries it yet)
 
