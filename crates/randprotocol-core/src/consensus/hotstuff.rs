@@ -17,12 +17,15 @@ pub use precheck::GossipPrecheck;
 /// rejected. Deliberately generous (days of timed-out views): the bound exists to keep
 /// `view + 1` arithmetic away from u64 overflow and to bound speculative state, not to
 /// police legitimate catch-up, which goes through block sync and `resume`.
+///
+/// It is **not** what stops one validator moving the fleet (audit v6, CH-1): until the
+/// timeout-certificate pacemaker a single signed NewView inside this bound moved every replica
+/// there. A view is now entered only on a certificate for the view before it or on the NewViews
+/// of more than two thirds of the stake (see [`HotStuff::on_new_view`]).
 const MAX_VIEW_AHEAD: u64 = 1_000_000;
 /// Cap on distinct (view, block) vote collections kept. A backstop only since CONS-1: the view
 /// window and one vote per (view, voter) hold the map to validators × (window + 2) keys.
 const MAX_PENDING_VOTE_KEYS: usize = 4096;
-/// Cap on distinct views with buffered NewView messages.
-const MAX_NEW_VIEW_KEYS: usize = 2048;
 /// The equivocation record (`proposed`) is bounded on its own, not by the tree: entries above
 /// the committed head's view are kept whether or not their block still is (deep scan
 /// 2026-09-24), oldest views dropped past this many.
@@ -133,8 +136,23 @@ pub struct HotStuff {
     /// not counted, so one key opens at most one `pending_votes` entry per view. Pruned with
     /// `pending_votes` in `enter_view`.
     vote_of: BTreeMap<(u64, Address), Hash>,
-    /// NewView messages per view: view -> sender -> message.
-    new_views: BTreeMap<u64, BTreeMap<Address, NewView>>,
+    /// The pacemaker's evidence (audit v6, CH-1): for each validator, the highest view it has
+    /// asked to enter — its latest signed NewView's view, this replica's own included. One
+    /// entry per validator of the current set, so one key holds one slot however many views it
+    /// names (the old per-view map let one key open 2 048 views and crowd honest ones out). A
+    /// view `v` is *asked for* by every validator whose entry is at or past `v`: an ask for a
+    /// later view is an ask to leave every earlier one.
+    asked: BTreeMap<Address, u64>,
+    /// The view this replica's own latest NewView asked for; each timeout in one view asks for
+    /// one view further, so a repeated NewView is a new message (gossip drops repeats) and a
+    /// replica that was away hears how far the others have got.
+    my_ask: u64,
+    /// Proposals this replica holds for views it has not reached, by view (audit v6, CH-1): a
+    /// proposal no longer moves the view, so one that arrives ahead of the evidence for its view
+    /// waits here and gets its vote when the replica enters that view. Only a block that passed
+    /// the clock-drift vote rule on arrival is listed. At most `PROPOSAL_VIEW_WINDOW` entries:
+    /// nothing further ahead is accepted, and entering a view drops everything under it.
+    deferred: BTreeMap<u64, Hash>,
 
     /// Sets of the epochs whose first block has committed, for the node to persist (spec §8).
     epoch_sets: EpochSets,
@@ -258,7 +276,9 @@ impl HotStuff {
             unobtainable: std::collections::HashSet::new(),
             pending_votes: BTreeMap::new(),
             vote_of: BTreeMap::new(),
-            new_views: BTreeMap::new(),
+            asked: BTreeMap::new(),
+            my_ask: 0,
+            deferred: BTreeMap::new(),
             epoch_sets,
             derived: Mutex::new(HashMap::new()),
             current,
@@ -925,9 +945,12 @@ impl HotStuff {
         if self.high_qc.block_hash == hash {
             out.push(Action::PersistPending(self.certified_chain_blocks()));
         }
-        if block.view() > self.view {
-            self.enter_view(block.view(), &mut out);
-        }
+        // A proposal does not move the view (audit v6, CH-1). Its justify does, when it certifies
+        // the view before (`update_high_qc` above entered `justify.view + 1`); a proposal for a
+        // view this replica has no evidence for yet is kept — it is valid — and voted for when
+        // the replica gets there (`enter_view`). Before, a leader whose turn lay within the
+        // eight-view proposal window proposed early, every replica followed it into that view,
+        // and the honest leaders between were skipped: the same lever as the NewView, shorter.
         self.update_lock_and_commit(&block, &mut out);
         // B2's vote rule (bridge hardening spec §3): on a bridged chain, no vote for a block
         // more than `MAX_CLOCK_DRIFT_MS` ahead of this replica's clock. The block stays in the
@@ -935,7 +958,12 @@ impl HotStuff {
         // certify it. Sync's replay calls the ledger's `apply_block_for_sync` itself and never
         // comes through here.
         if !(bridged && block.header.timestamp_ms > now_ms.saturating_add(super::MAX_CLOCK_DRIFT_MS)) {
-            self.try_vote(&block, &mut out);
+            if block.view() > self.view {
+                // Ahead of this replica's view (audit v6, CH-1): held, voted for on arrival there.
+                self.deferred.entry(block.view()).or_insert(hash);
+            } else {
+                self.try_vote(&block, &mut out);
+            }
         }
         self.maybe_ready_to_propose(&mut out);
 
@@ -1032,14 +1060,33 @@ impl HotStuff {
             self.pending_votes.remove(&key);
             self.consecutive_timeouts = 0;
             self.update_high_qc(&qc, &mut out);
-            if qc.view.saturating_add(1) > self.view {
-                self.enter_view(qc.view.saturating_add(1), &mut out);
-            }
             self.maybe_ready_to_propose(&mut out);
         }
         Ok(out)
     }
 
+    /// A validator's signed wish to enter `nv.view`, with its high QC — the timeout vote of this
+    /// pacemaker (audit v6, CH-1; the 2026-09-21 design's B3).
+    ///
+    /// Before: any one validator's NewView up to `MAX_VIEW_AHEAD` ahead moved this replica to
+    /// that view, and the replica echoed it. A validator announced a view it leads, every honest
+    /// replica jumped there, and it withheld its proposal; at each of its turns that broke the run
+    /// of three consecutive certified views a commit needs — one key stalled every commit, and
+    /// with no slashing only a chain cut removed it.
+    ///
+    /// Now the message is a vote and nothing more. It is recorded as the sender's latest ask
+    /// (`asked`, one slot a validator), its high QC is taken (a verified certificate is evidence
+    /// in its own right), and [`Self::pace`] applies the two thresholds:
+    ///
+    /// - **enter** a view when validators holding a quorum — strictly more than two thirds of
+    ///   the stake — ask for it or a later one (a timeout certificate: more than a third of the
+    ///   stake is honest and has really timed out);
+    /// - **join** — sign this replica's own NewView — when more than a third ask for a view past
+    ///   its own: at least one of them is honest, so the view really is failing somewhere, and
+    ///   a replica that was away catches up to the others' view without timing out through
+    ///   every view between.
+    ///
+    /// No single key moves anyone: a validator's NewView, however far ahead, changes one slot.
     pub fn on_new_view(&mut self, nv: NewView) -> Result<Vec<Action>, ConsensusError> {
         let mut out = Vec::new();
         // Admission and the quorum below are counted in `current`, so a set known to be for the
@@ -1057,6 +1104,10 @@ impl HotStuff {
         if nv.view > self.view.saturating_add(MAX_VIEW_AHEAD) {
             return Err(ConsensusError::ViewOutOfRange { view: nv.view });
         }
+        // Nothing new from this sender: its slot already says as much or more.
+        if self.asked.get(&sender).is_some_and(|asked| *asked >= nv.view) {
+            return Ok(out);
+        }
         if !nv.verify(&self.cfg.domain) {
             return Err(ConsensusError::BadNewView);
         }
@@ -1064,72 +1115,98 @@ impl HotStuff {
             return Err(ConsensusError::BadJustify);
         }
         self.update_high_qc(&nv.high_qc.clone(), &mut out);
-        let view = nv.view;
-        // View synchronisation: a validator ahead of us pulls us into its view so
-        // a node that started late (or was partitioned) does not have to time out
-        // through every intermediate view. We echo our own NewView so the leader
-        // of that view can reach quorum.
-        if view > self.view {
-            self.enter_view(view, &mut out);
-            if let Some(key) = &self.signer {
-                // Persisted before this replica signs at the new view (audit v6, CON-4).
-                out.push(Action::PersistSafety(self.safety_state()));
-                let mine = NewView::sign(&self.cfg.domain, view, self.high_qc.clone(), key);
-                out.push(Action::Broadcast(ConsensusMessage::NewView(mine.clone())));
-                if self.is_leader(view) {
-                    self.record_new_view(view, mine);
-                }
-            }
-        }
-        if !self.is_leader(view) {
-            return Ok(out);
-        }
-        self.record_new_view(view, nv);
-        let Some(collected) = self.new_views.get(&view) else { return Ok(out) };
-        let stake: u128 = collected.keys().filter_map(|a| self.current.get(a)).map(|v| v.stake).sum();
-        if self.current.has_quorum(stake) {
-            if view > self.view {
-                self.enter_view(view, &mut out);
-            }
-            self.maybe_ready_to_propose(&mut out);
-        }
+        self.asked.insert(sender, nv.view);
+        self.pace(&mut out);
         Ok(out)
     }
 
-    /// Buffer a NewView for quorum counting, bounding how many distinct views
-    /// are tracked so speculative bookkeeping stays finite.
-    fn record_new_view(&mut self, view: u64, nv: NewView) {
-        if self.new_views.len() >= MAX_NEW_VIEW_KEYS && !self.new_views.contains_key(&view) {
-            tracing::warn!("new-view bookkeeping full; dropping NewView for view {view}");
+    /// The highest view that validators of the current set holding `enough` of its stake have
+    /// asked to enter (their latest NewView is for it or a later one); 0 when no view has that
+    /// much behind it.
+    fn asked_by(&self, enough: impl Fn(&ValidatorSet, u128) -> bool) -> u64 {
+        let mut asks: Vec<(u64, u128)> =
+            self.asked.iter().filter_map(|(a, view)| self.current.get(a).map(|v| (*view, v.stake))).collect();
+        asks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let mut stake = 0u128;
+        for (view, s) in asks {
+            stake = stake.saturating_add(s);
+            if enough(&self.current, stake) {
+                return view;
+            }
+        }
+        0
+    }
+
+    /// Whether a quorum has asked for this replica's current view or a later one: the timeout
+    /// certificate a leader proposes on when it holds no certificate for the view before.
+    fn view_has_timeout_quorum(&self) -> bool {
+        self.asked_by(|set, stake| set.has_quorum(stake)) >= self.view
+    }
+
+    /// Sign and broadcast this replica's NewView for `view`, and count it.
+    fn ask_for(&mut self, view: u64, out: &mut Vec<Action>) {
+        let Some(key) = &self.signer else { return };
+        let me = key.address();
+        self.my_ask = view;
+        let nv = NewView::sign(&self.cfg.domain, view, self.high_qc.clone(), key);
+        // Counted only while this replica is a validator of the set that counts: an observer's
+        // key (or one between epochs) asks for nothing.
+        if self.current.contains(&me) {
+            self.asked.insert(me, view);
+        }
+        out.push(Action::Broadcast(ConsensusMessage::NewView(nv)));
+    }
+
+    /// The pacemaker's two thresholds over `asked` (audit v6, CH-1), to a fixed point: join a
+    /// view more than a third is asking for, enter one a quorum is, and let the leader of the
+    /// view this leaves the replica in propose if its turn has come.
+    fn pace(&mut self, out: &mut Vec<Action>) {
+        if self.current_set_epoch_gap().is_some() {
             return;
         }
-        self.new_views.entry(view).or_default().insert(nv.sender_address(), nv);
+        // Validators that have left the set hold no slot.
+        let current = self.current.clone();
+        self.asked.retain(|a, _| current.contains(a));
+        let joinable = self.asked_by(|set, stake| set.has_third(stake));
+        if joinable > self.view && self.my_ask < joinable && self.signer.as_ref().is_some_and(|k| current.contains(&k.address())) {
+            self.ask_for(joinable, out);
+        }
+        let entered = self.asked_by(|set, stake| set.has_quorum(stake));
+        if entered > self.view {
+            self.enter_view(entered, out);
+            // A view reached on a timeout certificate has no vote to ride to disk on: written
+            // here, so a restart does not bring the replica back asking for a view it had left.
+            if self.signer.is_some() {
+                out.push(Action::PersistSafety(self.safety_state()));
+            }
+        }
+        self.maybe_ready_to_propose(out);
     }
 
     /// Pacemaker: the timer for `view` fired.
+    ///
+    /// The replica **stays in its view** (audit v6, CH-1): it signs a NewView asking for the next
+    /// one and arms the timer again. It used to enter the next view on its own timer; now it
+    /// enters when a quorum has asked ([`Self::pace`]), so the honest replicas change view
+    /// together and a replica that is merely slow does not wander off alone. Each further
+    /// timeout in the same view asks for one view later still — a different message, so gossip
+    /// does not drop it as a repeat, and one that tells a replica that was away how long the
+    /// others have been waiting.
     pub fn on_timeout(&mut self, view: u64) -> Vec<Action> {
         let mut out = Vec::new();
         if view != self.view {
             return out; // stale timer
         }
         self.consecutive_timeouts += 1;
-        let next = self.view.saturating_add(1);
-        self.enter_view(next, &mut out);
-        // A view reached without a vote is persisted too (audit v6, CON-4): until now the view
-        // hit disk only with a vote, so a validator that timed out through a stall and restarted
-        // came back at the view of its last vote and signed — a NewView, a not-held — at a view
-        // lower than the one it had reached. Timeouts are rare; the write is the vote's own.
         if self.signer.is_some() {
-            out.push(Action::PersistSafety(self.safety_state()));
+            let ask = self.my_ask.max(self.view).saturating_add(1);
+            self.ask_for(ask, &mut out);
         }
-        if let Some(key) = &self.signer {
-            let nv = NewView::sign(&self.cfg.domain, next, self.high_qc.clone(), key);
-            out.push(Action::Broadcast(ConsensusMessage::NewView(nv.clone())));
-            if self.is_leader(next) {
-                if let Ok(more) = self.on_new_view(nv) {
-                    out.extend(more);
-                }
-            }
+        self.pace(&mut out);
+        // Still in the view (no quorum has asked yet): wait again, longer. Entering a view arms
+        // its own timer.
+        if self.view == view {
+            out.push(self.schedule_timeout());
         }
         out
     }
@@ -1262,11 +1339,17 @@ impl HotStuff {
         self.view = view;
         self.proposed_in_view = false;
         // drop stale bookkeeping
-        self.new_views = self.new_views.split_off(&view);
         let keep = self.pending_votes.split_off(&(view.saturating_sub(1), Hash::ZERO));
         self.pending_votes = keep;
         self.vote_of.retain(|(v, _), _| *v >= view.saturating_sub(1));
         out.push(self.schedule_timeout());
+        // The proposal for this view may have arrived before the evidence for the view did
+        // (audit v6, CH-1): it was kept, and gets its vote now.
+        let held = self.deferred.remove(&view).and_then(|h| self.tree.get(&h)).map(|e| e.block.clone());
+        self.deferred = self.deferred.split_off(&view);
+        if let Some(block) = held {
+            self.try_vote(&block, out);
+        }
     }
 
     fn update_high_qc(&mut self, qc: &QuorumCertificate, out: &mut Vec<Action>) {
@@ -1287,6 +1370,13 @@ impl HotStuff {
                 out.push(Action::PersistPending(self.certified_chain_blocks()));
             }
         }
+        // A certificate for view `q` is a quorum's word that `q` is done (audit v6, CH-1): the
+        // one other way into a view besides a timeout certificate, whichever path the QC came
+        // by — assembled from votes, a proposal's justify, a NewView's high QC. Every caller has
+        // verified it.
+        if qc.view.saturating_add(1) > self.view {
+            self.enter_view(qc.view.saturating_add(1), out);
+        }
     }
 
     /// Leader of the current view proposes once it holds a QC for view-1 or a
@@ -1296,14 +1386,7 @@ impl HotStuff {
             return;
         }
         let have_qc = self.high_qc.view.saturating_add(1) == self.view;
-        let have_new_views = self
-            .new_views
-            .get(&self.view)
-            .map(|m| {
-                let stake: u128 = m.keys().filter_map(|a| self.current.get(a)).map(|v| v.stake).sum();
-                self.current.has_quorum(stake)
-            })
-            .unwrap_or(false);
+        let have_new_views = self.view_has_timeout_quorum();
         if !(have_qc || have_new_views) {
             return;
         }

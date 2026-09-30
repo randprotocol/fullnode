@@ -739,18 +739,22 @@ fn a_ledger_resumed_at_height_h_accepts_a_bundle_timed_at_h() {
 
 #[test]
 fn late_starter_syncs_view_with_partner() {
-    // Two validators: node 1 is offline while node 0 times out many views.
+    // Two validators: node 1 is offline while node 0 times out again and again. Alone it is
+    // half the stake — no timeout certificate — so it stays in its view and asks for a later one
+    // each time (audit v6, CH-1: a replica no longer wanders off on its own timer).
     let mut sim = setup(2, 2);
     sim.down[1] = true;
     for _ in 0..6 {
         sim.fire_timeouts();
     }
-    assert!(sim.nodes[0].view() >= 6);
+    assert_eq!(sim.nodes[0].view(), 1, "half the stake does not enter a view");
     assert_eq!(sim.nodes[1].view(), 1);
-    // Node 1 comes online; node 0's next NewView pulls it forward.
+    // Node 1 comes online; node 0's next NewView is more than a third asking, so node 1 joins,
+    // and the two together are the quorum that enters — at the view node 0 had got to asking for.
     sim.down[1] = false;
     sim.fire_timeouts();
     assert_eq!(sim.nodes[1].view(), sim.nodes[0].view());
+    assert!(sim.nodes[0].view() >= 7, "they resume where the waiting replica's asks had reached: {}", sim.nodes[0].view());
     for _ in 0..8 {
         sim.step(vec![]);
     }
@@ -1290,6 +1294,212 @@ fn leader_falls_back_when_high_qc_block_is_unobtainable() {
     }
     sim.assert_consistent();
     assert!(sim.committed[0].len() > before, "chain did not resume after fallback");
+}
+
+// ---------------------------------------------------------------------------
+// The pacemaker moves on a quorum's word, never on one key's (audit v6, CH-1)
+// ---------------------------------------------------------------------------
+
+/// An empty block for `view`, signed by `key`, on the block `node`'s high QC certifies — what
+/// that view's leader would propose on this replica's tip.
+fn block_on_high_qc(sim: &Sim, node: usize, view: u64, key: &Keypair) -> Block {
+    let hs = &sim.nodes[node];
+    let justify = hs.high_qc().clone();
+    let parent = hs.block(&justify.block_hash).expect("the high QC's block is held").clone();
+    let height = parent.height() + 1;
+    let proposer = key.public_key().clone();
+    let mut after = hs.tip_ledger().clone();
+    after.set_height(height);
+    after.set_timestamp_ms(sim.now);
+    after.apply_transactions(&[], &proposer.address(), &StubExecutor).expect("an empty block applies");
+    after.close_block(height, &proposer.address(), 0, 0);
+    let header = crate::types::BlockHeader {
+        height,
+        view,
+        parent: parent.hash(),
+        proposer,
+        timestamp_ms: sim.now,
+        tx_root: Block::tx_root(&[]),
+        state_root: after.state_root(),
+        justify,
+    };
+    Block::sign(&sim.domain(), header, vec![], key)
+}
+
+/// Validator `from` tells every other replica it wants to enter `view`, carrying its own high QC:
+/// a real signature from a real validator, which is all the old pacemaker asked for.
+fn announce_view(sim: &mut Sim, from: usize, view: u64) {
+    let nv = NewView::sign(&sim.domain(), view, sim.nodes[from].high_qc().clone(), &sim.keys[from]);
+    let live: Vec<usize> = (0..sim.nodes.len()).filter(|&j| j != from && !sim.down[j]).collect();
+    for j in live {
+        if let Ok(acts) = sim.nodes[j].on_new_view(nv.clone()) {
+            sim.handle(j, acts);
+        }
+    }
+}
+
+/// The next view above every live replica's that `who` leads.
+fn next_view_led_by(sim: &Sim, who: usize) -> u64 {
+    let top = (0..sim.nodes.len()).filter(|&j| !sim.down[j]).map(|j| sim.nodes[j].view()).max().unwrap();
+    let me = sim.keys[who].address();
+    (top + 1..).find(|v| sim.nodes[(who + 1) % sim.nodes.len()].leader(*v) == me).unwrap()
+}
+
+/// Audit v6, CH-1 (high, open since 2026-09-10). `on_new_view` moved a replica to any view up
+/// to a million ahead on one validator's signed NewView, and the replica echoed it. One key
+/// therefore announced a view it leads whenever it liked, every honest replica jumped there, and
+/// the key withheld its proposal: repeated, no three consecutive views were ever certified and
+/// nothing committed — with no slashing, only a chain cut removed the key.
+///
+/// Seven equal validators, one of them silent except for announcing, before every round, the
+/// next view it leads. The other six (a quorum is five) must keep committing.
+#[test]
+fn one_validator_announcing_the_views_it_leads_does_not_stop_commits() {
+    let mut sim = setup(7, 7);
+    let attacker = 3;
+    sim.down[attacker] = true;
+    for _ in 0..80 {
+        let view = next_view_led_by(&sim, attacker);
+        announce_view(&mut sim, attacker, view);
+        sim.step(vec![]);
+    }
+    sim.assert_consistent();
+    let committed = sim.committed[0].len();
+    assert!(committed >= 20, "one validator's NewViews held the chain to {committed} commits in 80 rounds");
+}
+
+/// The rule itself: one validator's NewView moves nobody and is echoed by nobody, however far
+/// ahead it points; a third's makes a replica add its own; more than two thirds' moves it.
+#[test]
+fn a_replica_enters_a_view_on_a_quorums_new_views_and_joins_on_a_thirds() {
+    let mut sim = setup(7, 7);
+    for _ in 0..4 {
+        sim.step(vec![]);
+    }
+    let me = 0;
+    let at = sim.nodes[me].view();
+    let target = at + 40;
+    let nv = |sim: &Sim, i: usize, view: u64| NewView::sign(&sim.domain(), view, sim.nodes[me].high_qc().clone(), &sim.keys[i]);
+    let echoes = |acts: &[Action]| acts.iter().filter(|a| matches!(a, Action::Broadcast(ConsensusMessage::NewView(_)))).count();
+
+    // One of seven, a million views ahead or forty: nothing moves, nothing is echoed.
+    let m = nv(&sim, 1, at + 900_000);
+    let acts = sim.nodes[me].on_new_view(m).unwrap();
+    assert_eq!((sim.nodes[me].view(), echoes(&acts)), (at, 0), "one validator's word moved the replica or was echoed");
+    // A second: two of seven is still not more than a third (3·2 = 6 < 7).
+    let m = nv(&sim, 2, target);
+    let acts = sim.nodes[me].on_new_view(m).unwrap();
+    assert_eq!((sim.nodes[me].view(), echoes(&acts)), (at, 0));
+    // A third validator at or past `target`: more than a third now asks for it, so at least one
+    // honest replica timed out — this one adds its own NewView for `target` (once), and stays.
+    let m = nv(&sim, 3, target);
+    let acts = sim.nodes[me].on_new_view(m).unwrap();
+    assert_eq!(sim.nodes[me].view(), at, "a third is not enough to enter");
+    let joined: Vec<u64> = acts
+        .iter()
+        .filter_map(|a| match a {
+            Action::Broadcast(ConsensusMessage::NewView(n)) => Some(n.view),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(joined, vec![target], "it joins the view a third is asking for");
+    // A fourth (with this replica's own, five of seven: more than two thirds): it enters.
+    let m = nv(&sim, 4, target + 5);
+    let acts = sim.nodes[me].on_new_view(m).unwrap();
+    assert_eq!(sim.nodes[me].view(), target, "a quorum at or past the view enters it");
+    assert_eq!(echoes(&acts), 0, "it does not sign again for a view it already asked for");
+    assert!(
+        acts.iter().any(|a| matches!(a, Action::PersistSafety(s) if s.view == target)),
+        "the view is on disk once entered: {acts:?}"
+    );
+}
+
+/// A leader cannot pull replicas into its view with an early proposal either. A valid proposal
+/// used to move a replica up to eight views; a leader whose turn lay inside that window proposed
+/// early, skipped the honest leaders before it and broke the run of consecutive views. The block
+/// is kept — it is valid — and voted for only once the replica has reached its view on evidence.
+#[test]
+fn a_proposal_for_a_later_view_is_held_not_followed() {
+    let mut sim = setup(4, 4);
+    for _ in 0..3 {
+        sim.step(vec![]);
+    }
+    let me = 0;
+    let at = sim.nodes[me].view();
+    // A later view's leader builds on the block the high QC certifies, three views early.
+    let early_view = at + 3;
+    let leader = (0..4).find(|&i| sim.keys[i].address() == sim.nodes[me].leader(early_view)).unwrap();
+    let block = block_on_high_qc(&sim, me, early_view, &sim.keys[leader]);
+    let acts = sim.nodes[me].on_proposal(block.clone(), sim.now).unwrap();
+    assert_eq!(sim.nodes[me].view(), at, "a proposal for a later view moved the replica");
+    assert!(sim.nodes[me].has_block(&block.hash()), "the block is valid and is kept");
+    assert!(!acts.iter().any(|a| matches!(a, Action::Broadcast(ConsensusMessage::Vote(_)))), "and not voted for early");
+    // Once a quorum's NewViews bring the replica to that view, the held proposal gets its vote.
+    let mut acts = Vec::new();
+    for i in (0..4).filter(|&i| i != me) {
+        let nv = NewView::sign(&sim.domain(), early_view, sim.nodes[me].high_qc().clone(), &sim.keys[i]);
+        acts.extend(sim.nodes[me].on_new_view(nv).unwrap());
+    }
+    assert_eq!(sim.nodes[me].view(), early_view);
+    let voted = acts.iter().any(|a| matches!(a, Action::Broadcast(ConsensusMessage::Vote(v)) if v.block_hash == block.hash()));
+    assert!(voted, "the held proposal is voted for on entering its view: {acts:?}");
+}
+
+/// Liveness the old rule got from one message and the new one must still have: a replica that
+/// was away while the rest timed out through many views rejoins them, and the chain commits.
+#[test]
+fn a_replica_far_behind_rejoins_a_fleet_that_is_timing_out() {
+    let mut sim = setup(4, 4);
+    for _ in 0..3 {
+        sim.step(vec![]);
+    }
+    // Two of four down: no quorum, the other two time out and ask for ever later views.
+    sim.down[2] = true;
+    sim.down[3] = true;
+    for _ in 0..12 {
+        sim.fire_timeouts();
+    }
+    let before = sim.committed[0].len();
+    // Both come back where they stopped; nobody re-sends them what they missed.
+    sim.down[2] = false;
+    sim.down[3] = false;
+    for _ in 0..40 {
+        sim.step(vec![]);
+    }
+    sim.assert_consistent();
+    let views: Vec<u64> = sim.nodes.iter().map(|n| n.view()).collect();
+    assert!(views.iter().max().unwrap() - views.iter().min().unwrap() <= 1, "the replicas did not converge on a view: {views:?}");
+    assert!(sim.committed[0].len() >= before + 6, "no progress after the replicas rejoined: {} then {}", before, sim.committed[0].len());
+}
+
+/// Every validator restarted at once, each resuming at the view it had persisted: they converge
+/// and commit without anyone's single word.
+#[test]
+fn a_whole_fleet_restart_converges_on_a_view_and_commits() {
+    let mut sim = setup(7, 7);
+    for _ in 0..5 {
+        sim.step(vec![]);
+    }
+    // Leave the replicas at different views first: three time out alone a few times.
+    for i in [0, 1, 2] {
+        for _ in 0..(i + 1) {
+            if let Some(view) = sim.timers[i].take() {
+                let acts = sim.nodes[i].on_timeout(view);
+                sim.handle(i, acts);
+            }
+        }
+    }
+    sim.queue.clear();
+    let before = sim.committed.iter().map(|c| c.len()).max().unwrap();
+    for i in 0..7 {
+        sim.restart_durable(i);
+    }
+    for _ in 0..60 {
+        sim.step(vec![]);
+    }
+    sim.assert_consistent();
+    let least = sim.committed.iter().map(|c| c.len()).min().unwrap();
+    assert!(least >= before + 10, "the restarted fleet committed {least} against {before} before the restart");
 }
 
 // ---------------------------------------------------------------------------
@@ -2106,12 +2316,23 @@ fn block_on_head(sim: &Sim, node: usize, view: u64, timestamp_ms: u64) -> Block 
     Block::sign(&sim.domain(), header, vec![], &sim.keys[li])
 }
 
+/// Move `node` to `view` the only way a replica moves without a certificate (audit v6, CH-1):
+/// every other validator's NewView for it — a timeout certificate.
+fn drive_to_view(sim: &mut Sim, node: usize, view: u64) {
+    let others: Vec<usize> = (0..sim.keys.len()).filter(|&i| i != node).collect();
+    for i in others {
+        let nv = NewView::sign(&sim.domain(), view, sim.nodes[node].high_qc().clone(), &sim.keys[i]);
+        let _ = sim.nodes[node].on_new_view(nv);
+    }
+    assert_eq!(sim.nodes[node].view(), view, "every other validator's NewView is a quorum");
+}
+
 /// A Byzantine validator (`attacker`) feeds `victim` `count` distinct blocks, one per view it
-/// leads, every one a child of the committed head: it pulls the victim into each such view with
-/// one signed NewView (all a validator needs today) and proposes there. Returns how many the
+/// leads, every one a child of the committed head, while the set times out through those views
+/// (since audit v6, CH-1 the attacker's own NewView no longer takes the victim there; a quorum's
+/// does, which is the worst case the tree's bound still has to hold in). Returns how many the
 /// victim accepted into its tree.
 fn fill_with_siblings(sim: &mut Sim, victim: usize, attacker: usize, count: usize) -> usize {
-    let key = Keypair::from_seed(*sim.keys[attacker].seed()).unwrap();
     let attacker_addr = sim.keys[attacker].address();
     let mut accepted = 0;
     let mut sent = 0;
@@ -2121,9 +2342,7 @@ fn fill_with_siblings(sim: &mut Sim, victim: usize, attacker: usize, count: usiz
         if sim.nodes[victim].leader(view) != attacker_addr {
             continue;
         }
-        let nv = NewView::sign(&sim.domain(), view, sim.nodes[victim].high_qc().clone(), &key);
-        sim.nodes[victim].on_new_view(nv).expect("a validator's NewView is admitted");
-        assert_eq!(sim.nodes[victim].view(), view);
+        drive_to_view(sim, victim, view);
         let now = 1_000 + view;
         let b = block_on_head(sim, victim, view, now);
         sent += 1;
@@ -2348,11 +2567,9 @@ fn a_validator_does_not_attest_not_holding_a_block_it_voted_for() {
     assert_eq!(sim.nodes[victim].not_held(&locked), None, "no not-held for the block this replica is locked on");
 }
 
-/// The record is bounded by the commit, and the view a replica reached on timeouts is persisted
-/// without a vote (audit v6, CON-4: it was written only with one, so a validator restarted after
-/// a stall signed at the view of its last vote).
+/// The vote record is bounded by the commit: nothing at or under the head's view is kept.
 #[test]
-fn the_voted_record_is_pruned_at_commit_and_a_timeout_persists_the_view() {
+fn the_voted_record_is_pruned_at_commit() {
     let mut sim = setup(4, 4);
     for _ in 0..14 {
         sim.step(vec![]);
@@ -2365,16 +2582,6 @@ fn the_voted_record_is_pruned_at_commit_and_a_timeout_persists_the_view() {
         assert!(voted.len() <= 8, "the record stays a few views long on a committing chain: {}", voted.len());
         assert!(voted.windows(2).all(|w| w[0].0 < w[1].0), "in view order");
     }
-    let view = sim.nodes[0].view();
-    let acts = sim.nodes[0].on_timeout(view);
-    let persisted = acts.iter().find_map(|a| match a {
-        Action::PersistSafety(s) => Some(s.view),
-        _ => None,
-    });
-    assert_eq!(persisted, Some(view + 1), "the timed-out view is on disk before the NewView is signed");
-    let first_new_view = acts.iter().position(|a| matches!(a, Action::Broadcast(ConsensusMessage::NewView(_)))).unwrap();
-    let first_persist = acts.iter().position(|a| matches!(a, Action::PersistSafety(_))).unwrap();
-    assert!(first_persist < first_new_view);
 }
 
 /// CN-3 (medium): a not-held carried no freshness, so one signed before the lock formed — asked
@@ -2441,11 +2648,8 @@ fn a_not_held_ages_out_of_the_count() {
         assert!(!sim.nodes[victim].record_not_held(&NotHeld::sign(&sim.keys[i], &g, &h, now)));
     }
     assert_eq!(sim.nodes[victim].not_held_stake(&h), 4 * MIN_STAKE as u128);
-    // Let the replica's view run past the window on timeouts, the lock held throughout.
-    while sim.nodes[victim].view() <= now + super::NOT_HELD_VIEW_WINDOW {
-        let view = sim.nodes[victim].view();
-        sim.nodes[victim].on_timeout(view);
-    }
+    // Let the replica's view run past the window (the set timing out), the lock held throughout.
+    drive_to_view(&mut sim, victim, now + super::NOT_HELD_VIEW_WINDOW + 1);
     assert_eq!(sim.nodes[victim].locked_qc().view, v);
     assert_eq!(sim.nodes[victim].not_held_stake(&h), 0, "the old words aged out");
     let later = sim.nodes[victim].view();
