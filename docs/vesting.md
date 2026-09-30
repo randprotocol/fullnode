@@ -120,6 +120,9 @@ are only an estimate of the calendar).
    rand-node keygen --out my-vesting.key.json
    rand-node address --key my-vesting.key.json     # prints public_key: …
    ```
+   Back the file up at once: it is the only copy of the key that claims your entry. `keygen`
+   refuses a path that already exists (builds up to v0.6.7 overwrote it silently — never re-run
+   the command on the same `--out` with one of those).
 2. Keep a RAND wallet (`rand`) for receiving; its `rand1…` address is where claims pay.
 3. Check your allocation at any time:
    ```bash

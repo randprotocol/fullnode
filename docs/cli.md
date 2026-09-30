@@ -13,7 +13,7 @@ on chain (`docs/shielded.md` §1).
 
 ```
 rand-node <COMMAND>
-  keygen    Generate a new Dilithium2 key file
+  keygen    Generate a new Dilithium2 key file (refuses to overwrite an existing one)
   address   Print the address, public key, and libp2p peer id of a key file
   genesis   Write a genesis.json: every validator key is staked, each --alloc becomes a deposit note
   init      Initialise a data directory from a genesis file
@@ -36,6 +36,15 @@ transfer needs a shielded spend key, which only the wallet holds. Use `rand` for
 
 Writes `{ "seed": <32-byte hex>, "address": <base58>, "public_key": <hex> }` with mode 0600. Only the
 seed is secret; the Dilithium2 key pair is re-derived from it on every load.
+
+**The file is the only copy of the seed — back it up before it controls anything.** The same command
+writes a validator's key, a token authority's, a vesting beneficiary's and the pause key, and the key
+signs its own `Unbond`, `Withdraw` and `ClaimVested`: lose the file and the stake, the authority or
+the vesting entry behind it is lost with it. `keygen` therefore **refuses an `--out` that already
+exists** (`… already exists or cannot be created; refusing to overwrite a key file`) and leaves the
+file untouched; there is no `--force`. To replace a key on purpose, move the old file aside first.
+Builds up to v0.6.7 truncated the existing file without a word (audit v6, VK-7) — on one of those,
+check the path yourself before running it.
 
 ### `rand-node address`
 

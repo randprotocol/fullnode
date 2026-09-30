@@ -285,7 +285,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Generate a new Dilithium2 key file.
+    /// Generate a new Dilithium2 key file (refuses to overwrite an existing one).
     Keygen {
         #[arg(long, default_value = "node.key.json")]
         out: PathBuf,
@@ -888,7 +888,8 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Keygen { out } => {
             let kp = Keypair::generate();
-            KeyFile::from_keypair(&kp).write(&out)?;
+            // Never over an existing file (VK-7): the key at `out` may be the only copy of a seed.
+            KeyFile::from_keypair(&kp).write_new(&out)?;
             println!("wrote {}\naddress: {}", out.display(), kp.address());
         }
         Cmd::Address { key } => {

@@ -27,7 +27,8 @@
 # datadir the way `deploy/cutover-droplet.sh` did for chains 9–13.
 #
 # Re-running is refused per file: a key that already exists is never overwritten (`rand keygen`
-# refuses on its own; `rand-node keygen` would happily truncate, so this script checks first).
+# refuses on its own, and so does `rand-node keygen` since VK-7; a build up to v0.6.7 truncated,
+# so this script still checks first).
 # Delete a file deliberately to regenerate it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -62,8 +63,8 @@ for n in "${NAMES[@]}"; do
   nk="$KEYDIR/node-$n.key.json"
   pk="$KEYDIR/payout/$n.key.json"
   if [ -e "$nk" ]; then kept=$((kept + 1)); else
-    # `rand-node keygen` truncates an existing path without asking, so the guard above is this
-    # script's, not the binary's.
+    # A `rand-node` up to v0.6.7 truncates an existing path without asking (VK-7; later builds
+    # refuse), so the guard above stays this script's as well as the binary's.
     "$NODE" keygen --out "$nk" > /dev/null
     made=$((made + 1))
   fi
