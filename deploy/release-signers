@@ -1,0 +1,18 @@
+# Release signers — the SSH public keys allowed to sign a release's SHA256SUMS
+# (deploy/lib/verify-release.sh; docs/deploy.md, "Release trust"; audit v6, PROC-5).
+#
+# One key per line, in ssh-keygen's allowed-signers format:
+#
+#   <who> namespaces="rand-release" <key type> <base64 public key>
+#
+# for example (not a real key):
+#
+#   release-officer@randprotocol namespaces="rand-release" sk-ssh-ed25519@openssh.com AAAA…
+#
+# Rules:
+#   - PUBLIC keys only. The private half never touches this repository, the build host or CI.
+#     It is held off the build host, preferably hardware-backed (ed25519-sk / ecdsa-sk).
+#   - Adding or removing a line is a reviewed change to this file: whoever is listed here can
+#     authorise a binary that runs as root on the fleet.
+#   - THIS FILE LISTS NO KEY YET (2026-09-30). Until the operator adds one, verify_release_sums
+#     refuses every release, and the roll scripts install only with ALLOW_UNSIGNED=1.

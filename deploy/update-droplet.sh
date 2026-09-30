@@ -11,6 +11,13 @@
 # - both copies (rand-node and rand) are checked against WANT_SHA / WANT_SHA_WALLET (or, without
 #   them, the build host's sha256) before anything is installed or the service is stopped;
 # - a droplet already on that binary is left alone (idempotent, safe to re-run over the fleet).
+# - the release's signature is checked first (audit v6, PROC-5; deploy/lib/verify-release.sh):
+#   pass RELEASE_SUMS=<SHA256SUMS> and RELEASE_SIG=<SHA256SUMS.sig>, the release's checksum file
+#   and the release key holder's SSH signature over it. The signature must verify against a key
+#   in deploy/release-signers, and the two shas the rest of this script checks at every hop are
+#   then READ FROM the signed file (a WANT_SHA/WANT_SHA_WALLET passed as well must agree with
+#   it). Without RELEASE_SUMS/RELEASE_SIG the install is unsigned — the sha is only as good as
+#   whoever typed it — and the script refuses unless ALLOW_UNSIGNED=1 says so on purpose.
 #
 # Run one droplet at a time and let it rejoin (16 peers, height moving) before the next, so the
 # validator quorum is never short by more than one node.
@@ -21,7 +28,31 @@ BIN_NODE=${BIN_NODE:-rand-node}
 BIN_WALLET=${BIN_WALLET:-rand}
 BUILD_DIR=${BUILD_DIR:-/root/fullnode/target/release}
 . "$(dirname "$0")/lib/relay-binaries.sh"
+. "$(dirname "$0")/lib/verify-release.sh"
 SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 root@$IP"
+
+# The signature, before anything else is asked of any host (PROC-5). The allowed signers are
+# deploy/release-signers in this checkout and nothing else: no environment variable points it
+# elsewhere.
+if [ -n "${RELEASE_SUMS:-}" ] || [ -n "${RELEASE_SIG:-}" ]; then
+  { [ -n "${RELEASE_SUMS:-}" ] && [ -n "${RELEASE_SIG:-}" ]; } || { echo "RELEASE_SUMS and RELEASE_SIG go together: the release's SHA256SUMS and its SHA256SUMS.sig" >&2; exit 1; }
+  verify_release_sums "$RELEASE_SUMS" "$RELEASE_SIG" || exit 1
+  SIGNED_NODE=$(release_sha "$RELEASE_SUMS" "$BIN_NODE") || exit 1
+  SIGNED_WALLET=$(release_sha "$RELEASE_SUMS" "$BIN_WALLET") || exit 1
+  [ -z "${WANT_SHA:-}" ] || [ "$WANT_SHA" = "$SIGNED_NODE" ] || { echo "WANT_SHA ${WANT_SHA:0:12} is not what the signed SHA256SUMS lists for $BIN_NODE (${SIGNED_NODE:0:12}) — not rolling" >&2; exit 1; }
+  [ -z "${WANT_SHA_WALLET:-}" ] || [ "$WANT_SHA_WALLET" = "$SIGNED_WALLET" ] || { echo "WANT_SHA_WALLET ${WANT_SHA_WALLET:0:12} is not what the signed SHA256SUMS lists for $BIN_WALLET (${SIGNED_WALLET:0:12}) — not rolling" >&2; exit 1; }
+  WANT_SHA=$SIGNED_NODE
+  WANT_SHA_WALLET=$SIGNED_WALLET
+else
+  {
+    echo "################################################################################"
+    echo "# UNSIGNED INSTALL: no RELEASE_SUMS/RELEASE_SIG. Nothing ties these binaries to a"
+    echo "# release the key holder signed; a sha256 typed by hand or read off the build host"
+    echo "# proves only that the copy is intact. They will run as root on $IP."
+    echo "################################################################################"
+  } >&2
+  [ "${ALLOW_UNSIGNED:-}" = 1 ] || { echo "refusing an unsigned install — pass RELEASE_SUMS and RELEASE_SIG, or ALLOW_UNSIGNED=1 to go ahead anyway" >&2; exit 1; }
+fi
 
 # The shas the copies must match — BOTH binaries: rand-node runs as the service, and `rand` (the
 # wallet) is installed beside it and run as root below, so an unchecked wallet binary is root code

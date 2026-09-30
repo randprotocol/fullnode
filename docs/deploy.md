@@ -207,6 +207,79 @@ tick with a warning in the log — the 2026-09-24 stall was seven full disks and
 said `ok` right up to the crash loop. A roll waits on `ok`, so a droplet near full now stops the
 roll at that node instead of at the next one that fills.
 
+## Release trust
+
+Written 2026-09-30 (audit v6, PROC-4 and PROC-5). Until now every fleet binary was built by hand
+on one host — which is also the explorer's host and a validator — uploaded with a `SHA256SUMS`
+copied from that build by the person who made it, and installed as root on 26 nodes. That
+checksum catches a corrupt download. It does not catch a compromised build host: the build host
+was the trust root of the fleet, and on the 20 non-guardian hosts a bad `rand-node` reads the
+validator key beside it — 20 keys, more than the quorum of 18. No commit and no tag is signed,
+and `main` is not a protected branch.
+
+What a release is from the next tag on, and who is trusted for what:
+
+1. **The build: CI, from the tag.** `.github/workflows/release.yml` runs on a pushed `v*` tag.
+   Its first job refuses unless the `ci` workflow's latest push run for the tagged commit
+   concluded `success`, or the tag's annotation carries `ci-override: <who> <why>` (copied into
+   the release notes; a lightweight tag cannot carry one). Its second job builds `rand-node`,
+   `rand` and `rand-prover` on a clean `ubuntu-24.04` runner — fullnode at the tag, zkp-circuits
+   at the tag's own `CIRCUITS_PIN` beside it, the compiler `rust-toolchain.toml` pins,
+   `cargo build --release --locked`, `RAND_BUILD_SHA` = the commit — writes `SHA256SUMS`, attests
+   build provenance over the three binaries, and creates the GitHub release with the CI run's id
+   in its notes. Check a downloaded binary's provenance with
+   `gh attestation verify <binary> -R randprotocol/fullnode`. No `gh release create` by hand for
+   a fleet binary. The binaries need the glibc of Ubuntu 24.04 or newer.
+2. **The signature: a person, off the build host.** The workflow does not sign. The release key
+   holder downloads `SHA256SUMS`, checks the attestation, and signs the file on a machine that is
+   not a build host and not CI:
+
+   ```bash
+   ssh-keygen -Y sign -n rand-release -f <key> SHA256SUMS      # writes SHA256SUMS.sig
+   gh release upload <tag> SHA256SUMS.sig -R randprotocol/fullnode
+   ```
+
+   **The key is held off the build host**, preferably hardware-backed (`ed25519-sk`); its public
+   half is one line of `deploy/release-signers`, and a change to that file is a reviewed change —
+   whoever is listed there can authorise a binary that runs as root on the fleet. SSH signatures
+   because `ssh-keygen` is on every host already.
+3. **The check: every roll script, before it installs.** `deploy/lib/verify-release.sh`:
+   `verify_release_sums <SHA256SUMS> <SHA256SUMS.sig>` refuses a missing signature, one that does
+   not verify, one made for another namespace, a signer not in `deploy/release-signers`, and an
+   allowed-signers file with no key in it; `verify_binary <file> <SHA256SUMS>` refuses a binary
+   the signed file does not list at that sha256. `deploy/update-droplet.sh` and
+   `deploy/roll-all.sh` take `RELEASE_SUMS` and `RELEASE_SIG`, verify first, and read the expected
+   sha256s from the signed file. Without them they print that the install is unsigned and refuse,
+   unless `ALLOW_UNSIGNED=1` says so on purpose. `SELFTEST=1 bash deploy/lib/verify-release.sh`
+   runs the cases on a throwaway key (13 checks).
+
+   ```bash
+   gh release download <tag> -R randprotocol/fullnode -D rel     # rand-node, rand, rand-prover, SHA256SUMS, SHA256SUMS.sig
+   RELEASE_SUMS=rel/SHA256SUMS RELEASE_SIG=rel/SHA256SUMS.sig \
+     deploy/roll-all.sh rel/rand-node rel/rand "$(awk '$2=="rand-node"{print $1}' rel/SHA256SUMS)" "$(awk '$2=="rand"{print $1}' rel/SHA256SUMS)"
+   ```
+
+**What is not in place yet (2026-09-30), stated so nobody reads the above as done:**
+
+- **`deploy/release-signers` lists no key.** Until the operator adds the public key,
+  `verify_release_sums` refuses every release and the scripts install only with
+  `ALLOW_UNSIGNED=1` — which is exactly the old trust model, now said out loud on every run.
+- **`release.yml` has not produced a release.** Its first run is the first tag after this date.
+  The releases up to v0.6.7 were hand-built and are unsigned.
+- **`main` is not a protected branch and no review is required.** Both are repository settings
+  the operator applies: protect `main` and the `v*` tags, require a pull request with one review
+  and a green `ci` run before merge. Until they are applied, anyone with write access can change
+  `deploy/release-signers` or the workflows without a second person seeing it.
+- **The per-chain cutover scripts** (`deploy/cutover-fleet-chain18.sh` and earlier) still fetch
+  and check a bare sha256; the next cut script sources `verify-release.sh` the same way it
+  sources `cut-policy.sh`.
+- **The guardian hosts.** A `rand` binary installed as root there can read the guardian keys. The
+  audit asks that each guardian operator installs on the hosts they run, with a second person
+  checking the hash; that is a process, not a script, and is not in place.
+- **Reproducible builds** — two builders reaching the same hash from the tag — are the step that
+  takes the build host out of the trust root altogether. Not attempted; it needs the clean-clone
+  build first (PROC-2).
+
 ## Fault tests that have been run on the live testnet
 
 - Stop one of four validators: the chain keeps committing, with a timeout on the absent leader's

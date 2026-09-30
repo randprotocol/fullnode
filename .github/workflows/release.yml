@@ -1,0 +1,237 @@
+# Audit v6, PROC-4 and PROC-5 (2026-09-30). The release rule — a tag only from a green CI run,
+# the annotation naming the run — existed in words (docs/deploy.md) and was not followed: CI was
+# red at the tagged commit for 10 of the 12 tags since v0.5.8 and no annotation names a run. And
+# every fleet binary was built by hand on one host that is also the explorer and a validator,
+# with a SHA256SUMS copied from that build by the person who made it.
+#
+# This workflow is the rule as a mechanism. On a pushed `v*` tag:
+#
+#   ci-gate  waits for the `ci` workflow's push runs for the tagged commit and refuses unless the
+#            latest concluded `success` — or the tag's annotation carries a line
+#                ci-override: <who> <why>
+#            which lets the release go ahead and is copied into the release notes. An override is
+#            a recorded exception for a hot fix, not a default; a lightweight tag has no
+#            annotation and so cannot carry one.
+#   build    on a clean ubuntu-24.04 runner: fullnode at the tag and zkp-circuits at the tag's
+#            own CIRCUITS_PIN as siblings, the toolchain rust-toolchain.toml pins, Cargo.lock
+#            locked; `rand-node`, `rand`, `rand-prover`; SHA256SUMS; a build-provenance
+#            attestation over the three binaries; the GitHub release, its notes naming the CI run.
+#
+# What it does not do: sign. The release signature is an SSH signature over SHA256SUMS made by
+# the release key holder with a key held OFF this runner and off every build host
+# (docs/deploy.md, "Release trust"); the roll scripts verify it (deploy/lib/verify-release.sh).
+# The nightly suites are not part of the gate: they have never been green on a hosted runner, and
+# gating on them would mean no release at all. The notes say which run was checked.
+#
+# Every `uses:` is a full commit sha with its tag in the trailing comment. Only the `build` job
+# holds a token that can write, and only for the three things it does.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      ci_run_id: ${{ steps.gate.outputs.ci_run_id }}
+      ci_run_url: ${{ steps.gate.outputs.ci_run_url }}
+      ci_conclusion: ${{ steps.gate.outputs.ci_conclusion }}
+      override: ${{ steps.gate.outputs.override }}
+    steps:
+      - name: The ci run for the tagged commit is green, or the tag says why not
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          TAG: ${{ github.ref_name }}
+          # How long to wait for the ci runs of this commit to finish (its tag run includes the
+          # zk guards), and how long for one to appear at all.
+          WAIT_MINUTES: "300"
+          APPEAR_MINUTES: "10"
+        run: |
+          set -euo pipefail
+
+          # The override, read from the tag OBJECT's message. A lightweight tag points straight
+          # at the commit, and a commit message is not an annotation.
+          override=""
+          ref_type=$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq '.object.type')
+          if [ "$ref_type" = tag ]; then
+            tag_sha=$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq '.object.sha')
+            override=$(gh api "repos/$REPO/git/tags/$tag_sha" --jq '.message' \
+              | grep -E '^ci-override:[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]' | head -1 || true)
+          fi
+
+          # The push runs of `ci` for this commit, newest first: `id status conclusion url ref`.
+          # Pushing the tag starts a run of its own (ref = the tag), and that run is the one
+          # that carries the zk guards; a run from the commit's branch push may already exist.
+          runs() {
+            gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&per_page=100" \
+              --jq '.workflow_runs | sort_by(.created_at) | reverse | .[] | "\(.id) \(.status) \(.conclusion // "none") \(.html_url) \(.head_branch // "none")"'
+          }
+
+          deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
+          appear=$(( $(date +%s) + APPEAR_MINUTES * 60 ))
+          while :; do
+            list=$(runs)
+            if [ -n "$override" ]; then break; fi
+            tag_run=$(echo "$list" | awk -v t="$TAG" '$5 == t' | head -1)
+            if [ -z "$tag_run" ] && [ "$(date +%s)" -lt "$appear" ]; then
+              :   # the tag's own run has not been created yet; give it APPEAR_MINUTES
+            elif [ -z "$list" ]; then
+              echo "::error::no ci run exists for $SHA — a tag is released only from a commit ci has run on"
+              exit 1
+            elif ! echo "$list" | awk '$2 != "completed" { found = 1 } END { exit !found }'; then
+              break   # every run for this commit has completed
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::the ci runs for $SHA had not finished after $WAIT_MINUTES minutes"
+              exit 1
+            fi
+            sleep 60
+          done
+
+          latest=$(echo "$list" | head -1)
+          run_id=$(echo "$latest" | cut -d' ' -f1)
+          conclusion=$(echo "$latest" | cut -d' ' -f3)
+          run_url=$(echo "$latest" | cut -d' ' -f4)
+          [ -n "$latest" ] || { run_id=none; conclusion=none; run_url=none; }
+          {
+            echo "ci_run_id=$run_id"
+            echo "ci_run_url=$run_url"
+            echo "ci_conclusion=$conclusion"
+            echo "override=$override"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$conclusion" = success ]; then
+            echo "ci run $run_id for $SHA concluded success: $run_url"
+          elif [ -n "$override" ]; then
+            echo "::warning::releasing $TAG over ci run $run_id ($conclusion) on the tag's own word: $override"
+          else
+            echo "::error::ci run $run_id for $SHA concluded '$conclusion' ($run_url). Fix it and tag a green commit, or — for a recorded exception — annotate the tag with a line 'ci-override: <who> <why>'."
+            exit 1
+          fi
+
+  build:
+    needs: ci-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write        # create the release and upload its assets
+      id-token: write        # the attestation's signing identity
+      attestations: write    # store the attestation
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: fullnode
+          persist-credentials: false
+      # The circuits commit this tag's vendored crates were synced from: CIRCUITS_PIN in the
+      # tag's own ci.yml, which must be the commit PROVENANCE.md names
+      # (tests/guest_provenance.rs holds the two equal; checked again here because this build
+      # does not run that test).
+      - name: The circuits pin of this tag
+        id: pin
+        run: |
+          set -euo pipefail
+          pin=$(sed -n 's/^  CIRCUITS_PIN: //p' fullnode/.github/workflows/ci.yml)
+          manifest=$(sed -n 's/^circuits: //p' fullnode/crates/randprotocol-zkvm/guests-compiled/PROVENANCE.md)
+          echo "$pin" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::ci.yml's CIRCUITS_PIN is not a full commit sha: '$pin'"; exit 1; }
+          [ "$pin" = "$manifest" ] || { echo "::error::ci.yml pins circuits $pin, PROVENANCE.md names $manifest"; exit 1; }
+          echo "circuits=$pin" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: randprotocol/zkp-circuits
+          ref: ${{ steps.pin.outputs.circuits }}
+          path: circuits
+          persist-credentials: false
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake
+      # The compiler rust-toolchain.toml pins, installed by rustup itself: no third-party action
+      # and no build cache stand between the tag and the binaries.
+      - name: The pinned toolchain
+        id: toolchain
+        working-directory: fullnode
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal
+          echo "rustc=$(rustc --version)" >> "$GITHUB_OUTPUT"
+      # RAND_BUILD_SHA is what `rand_getVersion` reports (crates/randprotocol-node/build.rs): the
+      # COMMIT, not the tag object.
+      - name: Build, locked
+        working-directory: fullnode
+        env:
+          RAND_BUILD_SHA: ${{ github.sha }}
+        run: |
+          cargo build --release --locked \
+            -p randprotocol-node -p randprotocol-client -p randprotocol-prover
+      - name: The binaries and their checksums
+        working-directory: fullnode
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cp target/release/rand-node target/release/rand target/release/rand-prover dist/
+          ( cd dist && sha256sum rand-node rand rand-prover > SHA256SUMS && cat SHA256SUMS )
+          dist/rand-node --version
+      - name: Build provenance
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: |
+            fullnode/dist/rand-node
+            fullnode/dist/rand
+            fullnode/dist/rand-prover
+      - name: The release
+        working-directory: fullnode
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          CIRCUITS: ${{ steps.pin.outputs.circuits }}
+          RUSTC: ${{ steps.toolchain.outputs.rustc }}
+          CI_RUN_ID: ${{ needs.ci-gate.outputs.ci_run_id }}
+          CI_RUN_URL: ${{ needs.ci-gate.outputs.ci_run_url }}
+          CI_CONCLUSION: ${{ needs.ci-gate.outputs.ci_conclusion }}
+          OVERRIDE: ${{ needs.ci-gate.outputs.override }}
+          RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Built by \`.github/workflows/release.yml\` ($RELEASE_RUN_URL) on a clean \`ubuntu-24.04\` runner, \`cargo build --release --locked\`."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`$SHA\` |"
+            echo "| circuits pin | \`$CIRCUITS\` |"
+            echo "| compiler | \`$RUSTC\` |"
+            echo "| ci run | [$CI_RUN_ID]($CI_RUN_URL), conclusion \`$CI_CONCLUSION\` |"
+            if [ -n "$OVERRIDE" ]; then
+              echo "| **ci override** | \`$OVERRIDE\` — released on the tag annotation's word, not on a green run |"
+            fi
+            echo
+            echo "The nightly proving suites are not part of the gate; the ci run above is the push run for this commit."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo
+            echo "Build provenance: \`gh attestation verify <binary> -R $REPO\`."
+            echo
+            echo "**Not signed by this workflow.** The release key holder signs \`SHA256SUMS\` off the build host and attaches \`SHA256SUMS.sig\`; the fleet's roll scripts refuse a release without it (\`docs/deploy.md\`, \"Release trust\")."
+          } > notes.md
+          prerelease=""
+          case "$TAG" in *-rc*|*-alpha*|*-beta*) prerelease="--prerelease" ;; esac
+          gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" --notes-file notes.md $prerelease \
+            dist/rand-node dist/rand dist/rand-prover dist/SHA256SUMS
