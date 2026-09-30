@@ -76,7 +76,9 @@ pub struct ViewingNote {
 /// `Debug` is written by hand and prints no key material: the registry ends up in node logs and in
 /// panic output, and an `nk` there is the key itself (audit v3, VK-2). `Drop` zeroises it for the
 /// same reason — a freed import should not leave the key lying in the heap.
-#[derive(Clone)]
+///
+/// Not `Clone` (audit v6, VK-1): a copy is a second key, and a second set of the wallet's notes
+/// and memos, that nothing would wipe. An import is reached through its registry handle only.
 pub struct Import {
     pub vk: ViewingKey,
     /// Leaves appended below this height are never tried: the cursor starts at
@@ -109,7 +111,32 @@ impl Drop for Import {
             // overwriting it without reading is sound.
             unsafe { std::ptr::write_volatile(w, 0) };
         }
+        // And what the key opened (audit v6, VK-1): every matched note — who owns it, who made
+        // it, how much, of what, and the randomness that opens its commitment — and every memo.
+        // Removing a viewing key used to wipe the key and leave the wallet's history it had
+        // decrypted lying in freed heap.
+        wipe_notes(&mut self.notes);
     }
+}
+
+/// Overwrite every matched note and memo in place, then leave the list empty.
+fn wipe_notes(notes: &mut Vec<ViewingNote>) {
+    use zeroize::Zeroize;
+    for n in notes.iter_mut() {
+        n.cm.zeroize();
+        n.note.pk.zeroize();
+        n.note.from.zeroize();
+        n.note.amount.zeroize();
+        n.note.asset.zeroize();
+        n.note.time.zeroize();
+        n.note.r.zeroize();
+        n.index.zeroize();
+        n.height.zeroize();
+        if let Some(memo) = n.memo.as_mut() {
+            memo.zeroize();
+        }
+    }
+    notes.clear();
 }
 
 /// The registry's map key for a viewing key: `blake3("rand-viewing-registry-id-1" ‖ nk)`, a one-way
@@ -368,6 +395,30 @@ pub(crate) mod testkit {
 
 #[cfg(test)]
 mod tests {
+    /// Audit v6, VK-1: removing an import wipes what it holds, not only the key. The wipe is
+    /// what `Drop` runs; here it is run on a list still in scope so the result can be read.
+    #[test]
+    fn a_removed_imports_notes_and_memos_are_wiped() {
+        use super::*;
+        let note = |n: u32| ViewingNote {
+            index: n as u64,
+            cm: [n; 8],
+            height: 9,
+            role: Role::Received,
+            note: Note { pk: [1; 8], from: [2; 8], amount: 5_000, asset: 1, time: 3, r: [4; 8] },
+            memo: Some("rent, September".into()),
+        };
+        let mut notes = vec![note(1), note(2)];
+        // Keep a view of the first note's storage to read after the wipe.
+        let first: *const ViewingNote = notes.as_ptr();
+        wipe_notes(&mut notes);
+        assert!(notes.is_empty());
+        // SAFETY: `clear` keeps the allocation, so `first` still points at the (now logically
+        // dropped, physically present) first element's bytes; only plain integers are read.
+        let (pk, amount, r) = unsafe { ((*first).note.pk, (*first).note.amount, (*first).note.r) };
+        assert_eq!((pk, amount, r), ([0; 8], 0, [0; 8]), "the note's words were overwritten before the list was emptied");
+    }
+
     use super::*;
     use crate::storage::fixtures::{self, alloc_note, bundle_fee, genesis_with, key, make_block};
     use crate::storage::Storage;

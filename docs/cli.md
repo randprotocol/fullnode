@@ -252,7 +252,9 @@ one the cut announced; a mismatch on one node is almost always an old binary.
 | `--key <KEY>` | required | key file (validator identity, p2p identity, fee recipient) |
 | `--listen <LISTEN>` | `/ip4/0.0.0.0/tcp/30303` | libp2p listen multiaddr, repeatable |
 | `--bootstrap <BOOTSTRAP>` | none, repeatable | peer to dial at start and every 30 s while disconnected: `/ip4/<ip>/tcp/<port>/p2p/<peer-id>` |
-| `--rpc <RPC>` | `127.0.0.1:8545` | JSON-RPC listen address; bind `0.0.0.0` only behind a firewall |
+| `--rpc <RPC>` | `127.0.0.1:8545` | the operator's JSON-RPC listener: every method, and it trusts loopback. Keep it on loopback; never forward a public endpoint to it |
+| `--public-rpc <ADDR>` | off | a second, public listener (audit v6): a fixed method set (no viewing-key methods, `rand_mint` or `rand_getPeers`), no batches, no WebSocket, one meter for all callers. What a reverse proxy or an SSH forward points at (`docs/rpc.md`, "Two listeners") |
+| `--rpc-viewing-token-file <PATH>` | off | require `Authorization: Bearer <first line of the file>` (32+ characters) on the viewing-key methods of `--rpc` |
 | `--validator` | off | this node holds a validator key and takes part in consensus. A key in no current epoch's set observes until an epoch admits it, so a validator that bonds in after genesis needs no restart; `rand_status` reports `is_validator` (the key is here) and `active_validator` (it is in the current set) separately |
 | `--no-mdns` | off | disable LAN discovery (recommended on servers) |
 | `--block-interval-ms <MS>` | `1000` | minimum spacing between proposals |

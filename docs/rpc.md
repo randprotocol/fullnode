@@ -54,6 +54,33 @@ key arrives in memory only, is capped at 64 per node, dies with the process, and
 notes but never move them. It also means the RPC port should be treated as key-bearing once an
 import has happened: bind it where you would bind a wallet, not to the public internet.
 
+## Two listeners: the operator's and the public one (audit v6)
+
+`rand-node run --rpc <ADDR>` is the **operator's listener**: every method, batches, the
+WebSocket. It identifies a caller by its socket address and trusts loopback — the viewing-key
+methods answer loopback only, and loopback is not metered — so it belongs on `127.0.0.1` and
+nothing that faces the Internet should forward to it. A reverse proxy or an SSH forward *arrives
+on loopback*: behind one, every visitor is the operator.
+
+`rand-node run --public-rpc <ADDR>` opens a second, **public listener** for exactly that hop:
+
+- a fixed method set — the reads a wallet, an explorer or a page needs, and
+  `rand_sendTransaction`. Not served, whatever else is configured: `rand_importViewingKey`,
+  `rand_getViewingNotes`, `rand_removeViewingKey`, `rand_mint`, `rand_getPeers`, and any method
+  added later until it is listed (`rpc::PUBLIC_METHODS`);
+- no batch arrays (`-32600`), and no WebSocket (`GET /` and `GET /ws` have no route);
+- **one meter for every caller together** (600 in a burst, 150 a second; HTTP 429 with a
+  JSON-RPC body past it). Per-visitor limits belong to the proxy, which can see the visitors;
+- at most half of the node's blocking-read slots, so the operator's listener is never starved.
+
+Both listeners share the read limits: a range read is answered `-32000` "busy" after 30 s, and
+`rand_getBlocks` ends its page once it has read 64 MiB of blocks (a short page, as at the head).
+
+`--rpc-viewing-token-file <PATH>` puts a bearer token on the viewing-key methods of the
+operator's listener: the first line of the file (32+ characters), sent as
+`Authorization: Bearer <token>`. With it loopback alone is not enough, and a caller anywhere
+that presents it is served.
+
 ## Batches
 
 The body of a POST to `/` is either one request object or an **array of at most 20** of them. A
@@ -1424,6 +1451,21 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-30 — audit v6: a public listener, read limits, a viewing token (VK-2, RPC-2/3/4, VK-1)
+
+Node-only. Nothing changes for a client of `--rpc` except the two read limits.
+
+- **`--public-rpc <ADDR>`**: a second listener with a fixed method set, no batches, no WebSocket
+  and one meter for all callers — see "Two listeners" above. A public endpoint must forward to
+  this port, not to `--rpc`.
+- **Read limits, both listeners**: a blocking read that has not returned within 30 s is answered
+  `-32000` ("took longer than 30 s … retry with a smaller range"); `rand_getBlocks` ends its page
+  after 64 MiB of block reads, so a page can be shorter than the range asked — advance from the
+  last header returned, as at the head.
+- **`--rpc-viewing-token-file`**: an optional bearer token on the three viewing-key methods.
+- A removed viewing key's matched notes and memos are wiped with the key, and a viewing method's
+  request parameters are wiped once it has run.
 
 ### 2026-09-30 — audit v6: the mint figures are the ones the ledger judges (BRG-19)
 

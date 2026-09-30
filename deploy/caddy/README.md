@@ -69,6 +69,25 @@ two octets:
 No request in the two uncompressed logs comes from `159.89.185.254`. The limits are per client, as
 designed. What remains for the operator is housekeeping, listed at the end.
 
+## The node's own public listener (audit v6, VK-2 / RPC-4) — point the tunnel at it
+
+From v0.6.8 the node has a listener made for this hop: `rand-node run --public-rpc 127.0.0.1:8546`.
+It serves a fixed method set (no viewing-key methods, no `rand_mint`, no `rand_getPeers`), takes
+no batch and no WebSocket, meters every caller together, and never counts a caller as loopback —
+so the method gate and the meter are the node's, not only the sale proxy's `RPC_ALLOWED` in
+another repository. **To do on the roll, by the operator** (not yet done; this file records the
+target, not the state):
+
+1. obs1's unit: add `--public-rpc 127.0.0.1:8546` to `ExecStart`.
+2. obs1's `rpctunnel` key: `permitopen="127.0.0.1:8546"` in place of `:8545`.
+3. The web droplet's `rpc-tunnel-obs1.service`: `-L 127.0.0.1:18545:127.0.0.1:8546`.
+4. Check from the web droplet: `rand_chainId` answers through `127.0.0.1:18545`;
+   `rand_getPeers` answers "not served on this node's public listener".
+5. E, if randscan's `/rpc` route is ever used again: the same flag, and the route's upstream to
+   `127.0.0.1:8546`. randscan's own explorer keeps `127.0.0.1:8545` — it needs the viewing methods.
+
+Until then the section below describes the running chain.
+
 ## Why the proxy is security-critical
 
 E's node sees every proxied request from loopback (randscan's Caddy), and it decides two protections

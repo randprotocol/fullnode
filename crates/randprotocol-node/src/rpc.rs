@@ -92,14 +92,97 @@ pub const MAX_CONCURRENT_RPC_BLOCKING: usize = 16;
 /// a waiting request is a parked future, not a thread, but a client should hear "retry" soon.
 const BLOCKING_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-static RPC_BLOCKING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_RPC_BLOCKING);
 
-/// A blocking-pool slot for one RPC read, held until its blocking task has returned.
-async fn blocking_slot() -> Result<tokio::sync::SemaphorePermit<'static>, RpcError> {
-    match tokio::time::timeout(BLOCKING_SLOT_WAIT, RPC_BLOCKING.acquire()).await {
+/// The most of those slots the public listener's callers hold at once (audit v6, RPC-2/RPC-3):
+/// half. Without a share of its own the public path could take all sixteen and the operator's
+/// own listener — the explorer's scans, the relayer, `rand-node status` — waited behind it.
+pub const MAX_PUBLIC_RPC_BLOCKING: usize = MAX_CONCURRENT_RPC_BLOCKING / 2;
+
+/// The blocking-read slots of one node: every listener's state holds the same `Arc`, so the cap
+/// is the process's, as it has to be (the cost is) — and each test's state holds its own, so a
+/// hundred RPC tests running at once no longer queue on one static and answer each other "busy"
+/// (the recorded load flake of `a_token_transfer_reveals…` and `a_pruned_height_answers_32010…`).
+pub struct ReadSlots {
+    all: Arc<tokio::sync::Semaphore>,
+    public: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for ReadSlots {
+    fn default() -> ReadSlots {
+        ReadSlots {
+            all: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RPC_BLOCKING)),
+            public: Arc::new(tokio::sync::Semaphore::new(MAX_PUBLIC_RPC_BLOCKING)),
+        }
+    }
+}
+
+/// How long one blocking read may keep its caller waiting (audit v6, RPC-3: no call had a
+/// timeout). The caller is answered "busy"; the read itself cannot be cancelled and keeps its
+/// slot until it returns, so the concurrency cap still counts it — which is why the range reads
+/// are also bounded in bytes ([`MAX_RANGE_READ_BYTES`]) rather than left to this alone.
+const RPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most block bytes one header range read (`rand_getBlocks`) loads before it ends its page
+/// (audit v6, RPC-3). The page was bounded by count alone — 1,024 heights — and rendering a
+/// header reads the whole block, up to 20 MiB each on chain 18: twenty gigabytes of reads for
+/// one unauthenticated call. A short page is already something every caller handles (the head
+/// ends one), and the walk resumes from the last header it got.
+pub const MAX_RANGE_READ_BYTES: usize = 64 << 20;
+
+/// The slot, or slots, one RPC read holds until its blocking task has returned: one of the
+/// process-wide sixteen, and for a caller on the public listener one of that listener's eight.
+struct BlockingSlot {
+    _all: tokio::sync::OwnedSemaphorePermit,
+    _public: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+async fn acquire(sem: &Arc<tokio::sync::Semaphore>) -> Result<tokio::sync::OwnedSemaphorePermit, RpcError> {
+    match tokio::time::timeout(BLOCKING_SLOT_WAIT, sem.clone().acquire_owned()).await {
         Ok(Ok(permit)) => Ok(permit),
         Ok(Err(_)) => Err(RpcError::internal("rpc blocking semaphore closed")),
         Err(_) => Err(RpcError::rejected("this node's RPC is busy; retry shortly")),
+    }
+}
+
+/// A blocking-pool slot for one RPC read, held until its blocking task has returned.
+async fn blocking_slot(st: &RpcState) -> Result<BlockingSlot, RpcError> {
+    // The public share first, so a public flood queues on its own eight and never holds one of
+    // the sixteen while it waits.
+    let public = match st.public || caller().is_some_and(|c| c.public) {
+        true => Some(acquire(&st.read_slots.public).await?),
+        false => None,
+    };
+    Ok(BlockingSlot { _all: acquire(&st.read_slots.all).await?, _public: public })
+}
+
+/// Run one blocking read for an RPC caller: on the blocking pool, under a slot that the read
+/// itself carries (so a read its caller stopped waiting for still counts against the cap until it
+/// really ends), and answered "busy" if it has not returned within [`RPC_READ_TIMEOUT`].
+async fn run_blocking<R, F>(st: &RpcState, f: F) -> Result<R, RpcError>
+where
+    R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
+{
+    run_blocking_within(st, RPC_READ_TIMEOUT, f).await
+}
+
+async fn run_blocking_within<R, F>(st: &RpcState, limit: std::time::Duration, f: F) -> Result<R, RpcError>
+where
+    R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
+{
+    let slot = blocking_slot(st).await?;
+    let task = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        f()
+    });
+    match tokio::time::timeout(limit, task).await {
+        Ok(Ok(r)) => Ok(r),
+        Ok(Err(e)) => Err(RpcError::internal(format!("storage task failed: {e}"))),
+        Err(_) => Err(RpcError::rejected(format!(
+            "this read took longer than {} s on this node; retry with a smaller range",
+            limit.as_secs()
+        ))),
     }
 }
 
@@ -421,13 +504,87 @@ pub struct RpcState {
     pub viewing_open: bool,
     /// Per-client-address metering for this port (audit v3, RPC-2 / D13).
     pub limiter: Arc<RpcLimiter>,
+    /// Whether this state serves the **public listener** (`--public-rpc`, audit v6 VK-2 / RPC-4)
+    /// rather than the operator's. The public listener answers a fixed method set
+    /// ([`PUBLIC_METHODS`]), takes no batch and no WebSocket, never counts a caller as loopback,
+    /// and is metered as one client ([`PublicMeter`]) — because behind a reverse proxy or an SSH
+    /// forward every caller *is* one address, and that address is loopback.
+    pub public: bool,
+    /// The public listener's one meter, shared by every state that serves it.
+    pub public_meter: Arc<PublicMeter>,
+    /// This node's blocking-read slots ([`ReadSlots`]), shared by both listeners.
+    pub read_slots: Arc<ReadSlots>,
+    /// A bearer token the viewing-key methods require when set (`--rpc-viewing-token-file`):
+    /// with it, being on loopback is no longer enough — any process on the host can be on
+    /// loopback — and a caller anywhere that presents it is served.
+    pub viewing_token: Option<Arc<str>>,
 }
 
 impl RpcState {
     /// Whether the caller this task is serving is on loopback. An in-process caller — no address
-    /// set — counts as loopback.
+    /// set — counts as loopback; a caller on the public listener never does, whatever its address.
     fn peer_is_loopback(&self) -> bool {
-        PEER_ADDR.try_with(|addr| addr.ip().is_loopback()).unwrap_or(true)
+        caller().is_none_or(|c| !c.public && c.addr.ip().is_loopback())
+    }
+
+    /// This state, serving the public listener.
+    pub fn for_public_listener(&self) -> RpcState {
+        RpcState { public: true, ..self.clone() }
+    }
+}
+
+/// The methods the public listener answers (audit v6, VK-2 / RPC-4) — what a wallet, an explorer
+/// or a page needs, and nothing that hands this node a key, mints, or describes its peers. An
+/// allow-list, so a method added to `dispatch` later is not public until it is named here.
+///
+/// Left out on purpose: `rand_importViewingKey`, `rand_getViewingNotes` and
+/// `rand_removeViewingKey` (they hand a viewing key to a node the caller does not run, and fill
+/// its 64 slots), `rand_mint` (the faucet) and `rand_getPeers`.
+///
+/// Until this list the only thing between the Internet and those five was another repository's
+/// allow-list in front of the node: the node itself trusted loopback, and the public path —
+/// Cloudflare, a web host, a proxy, an SSH forward — arrives on loopback.
+pub const PUBLIC_METHODS: &[&str] = &[
+    "rand_chainId", "rand_status", "rand_syncStatus", "rand_getVersion", "rand_getGenesisHash", "rand_getHealth",
+    "rand_getLimits", "rand_getHead", "rand_getFinality", "rand_getProposer", "rand_getMempoolInfo", "rand_tokenInfo",
+    "rand_getTreeInfo", "rand_getCommitments", "rand_getNullifiers", "rand_getCompactBlocks", "rand_getAnchor",
+    "rand_getWitness", "rand_getWitnesses", "rand_estimateFee",
+    "rand_checkTransaction", "rand_sendTransaction", "rand_getTransaction", "rand_getTransactionStatus", "rand_getRawTransaction",
+    "rand_getReceipt", "rand_getReceipts", "rand_getCallEnvelope",
+    "rand_getProgram", "rand_getProgramCode", "rand_getProgramPublic",
+    "rand_getBlockByHeight", "rand_getBlockByHash", "rand_getBlocks",
+    "rand_getValidators", "rand_getEpoch", "rand_getSupply", "rand_getEmission",
+    "rand_getTokens", "rand_getToken", "rand_getTokenSupply",
+    "rand_getBridgeState", "rand_getAssets", "rand_getBridgeBurn", "rand_bridgeAssetId",
+    "rand_getAggregate", "rand_getAggregators", "rand_getUnsealed",
+    "rand_getVesting", "rand_getVestingSchedule", "rand_getVestingSummary",
+];
+
+/// The public listener's burst and refill, for **every caller together**: there is one address
+/// behind a proxy hop, so there is one bucket. Five times one operator-side client's allowance;
+/// the per-visitor limits belong to the proxy that can see the visitors.
+pub const PUBLIC_RPC_BURST: u32 = 600;
+pub const PUBLIC_RPC_REFILL_PER_SEC: f64 = 150.0;
+
+/// One token bucket for the whole public listener (audit v6, RPC-2). Nothing is exempt: the
+/// loopback exemption of the operator's listener is exactly what made the public path unmetered.
+pub struct PublicMeter {
+    limiter: crate::admission::PeerLimiter,
+    bucket: std::sync::Mutex<crate::admission::TokenBucket>,
+}
+
+impl Default for PublicMeter {
+    fn default() -> PublicMeter {
+        PublicMeter {
+            limiter: crate::admission::PeerLimiter::new(PUBLIC_RPC_BURST, PUBLIC_RPC_REFILL_PER_SEC),
+            bucket: std::sync::Mutex::new(crate::admission::TokenBucket::default()),
+        }
+    }
+}
+
+impl PublicMeter {
+    pub fn allow_at(&self, now: Instant) -> bool {
+        self.limiter.allow(&mut self.bucket.lock().unwrap_or_else(|e| e.into_inner()), now)
     }
 }
 
@@ -647,11 +804,15 @@ pub const RPC_MAX_BODY_BYTES: usize = rpc_max_body_bytes(
 
 pub async fn serve(addr: SocketAddr, state: RpcState) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let max_body_bytes = state.max_body_bytes;
-    let app = Router::new()
+    let app = match state.public {
         // Same port, two protocols: `POST /` is the JSON-RPC this file serves, `GET /` and
         // `GET /ws` are the WebSocket upgrade. A client that knows only the POST sees no change.
-        .route("/", post(handle).get(crate::ws::upgrade))
-        .route("/ws", axum::routing::get(crate::ws::upgrade))
+        false => Router::new().route("/", post(handle_http).get(crate::ws::upgrade)).route("/ws", axum::routing::get(crate::ws::upgrade)),
+        // The public listener is the POST alone (audit v6): no WebSocket — an upgrade is
+        // unmetered and holds one of 64 node-wide connections for as long as it likes.
+        true => Router::new().route("/", post(handle_http)),
+    };
+    let app = app
         // `RpcState::max_body_bytes`, from the genesis limits — it bounds the POST. A WebSocket
         // upgrade is a GET with no body, so the layer costs it nothing; frames are bounded by
         // `ws::WS_MAX_FRAME_BYTES` instead.
@@ -736,22 +897,54 @@ impl RpcLimiter {
     }
 }
 
+/// Who a request came from, as the arms that care can read it.
+#[derive(Clone, Copy, Debug)]
+struct Caller {
+    addr: SocketAddr,
+    /// It arrived on the public listener.
+    public: bool,
+    /// It presented the node's viewing token (`Authorization: Bearer …`).
+    viewing_token: bool,
+}
+
 tokio::task_local! {
-    /// The address of the caller whose request this task is serving. Set by the HTTP handler and
-    /// by the WebSocket upgrade; unset means an in-process caller (the tests, and anything this
-    /// binary dispatches to itself), which counts as loopback.
-    static PEER_ADDR: SocketAddr;
+    /// The caller whose request this task is serving. Set by the HTTP handler and by the
+    /// WebSocket upgrade; unset means an in-process caller (the tests, and anything this binary
+    /// dispatches to itself), which counts as a loopback caller on the operator's listener.
+    static CALLER: Caller;
 }
 
-/// Run `f` as the request from `peer`, so [`RpcState::peer_is_loopback`] can see who is asking
-/// without threading an address through every arm of `dispatch`.
+fn caller() -> Option<Caller> {
+    CALLER.try_with(|c| *c).ok()
+}
+
+/// Run `f` as the request from `peer` on the operator's listener, so
+/// [`RpcState::peer_is_loopback`] can see who is asking without threading an address through
+/// every arm of `dispatch`.
 pub async fn with_peer<F: std::future::Future>(peer: SocketAddr, f: F) -> F::Output {
-    PEER_ADDR.scope(peer, f).await
+    CALLER.scope(Caller { addr: peer, public: false, viewing_token: false }, f).await
 }
 
-/// The viewing-key methods answer loopback callers only, unless the operator opened them
-/// (audit v3, VK-3 — decision D5: the facility is for this node's own explorer).
+/// The viewing-key methods' gate (audit v3, VK-3 — decision D5: the facility is for this node's
+/// own explorer; audit v6, VK-2):
+///
+/// - never on the public listener, whatever else is configured;
+/// - with a viewing token configured, only for a caller that presented it — loopback alone is no
+///   longer enough, because every process on the host is on loopback;
+/// - otherwise loopback callers only, unless the operator opened them (`--rpc-viewing-open`).
 fn require_loopback(st: &RpcState, method: &str) -> Result<(), RpcError> {
+    let who = caller();
+    if st.public || who.is_some_and(|c| c.public) {
+        return Err(RpcError::rejected(format!("{method} is not served on this node's public listener")));
+    }
+    if st.viewing_token.is_some() {
+        return match who {
+            // An in-process caller is the node itself.
+            None => Ok(()),
+            Some(c) if c.viewing_token => Ok(()),
+            Some(_) => Err(RpcError::rejected(format!("{method} needs this node's viewing token (Authorization: Bearer …)"))),
+        };
+    }
     if st.viewing_open || st.peer_is_loopback() {
         return Ok(());
     }
@@ -789,15 +982,91 @@ async fn dispatch_one(st: &RpcState, v: Value) -> Value {
             RpcError::invalid_request("this node does not accept notifications; every request must carry an id"),
         );
     };
-    match dispatch(st, &req).await {
+    // The public listener's fixed method set (audit v6, VK-2 / RPC-4), before anything is parsed
+    // for a method it does not serve.
+    if st.public && !PUBLIC_METHODS.contains(&req.method.as_str()) {
+        return error_value(id, RpcError::rejected(format!("{} is not served on this node's public listener", req.method)));
+    }
+    let mut req = req;
+    let out = match dispatch(st, &req).await {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err(e) => error_value(id, e),
+    };
+    // A viewing method's params are a viewing key in hex (audit v6, VK-1): wipe the request's
+    // copy before it is freed. (The HTTP body's bytes were the transport's and are gone already.)
+    if matches!(req.method.as_str(), "rand_importViewingKey" | "rand_getViewingNotes" | "rand_removeViewingKey") {
+        wipe_strings(&mut req.params);
+    }
+    out
+}
+
+/// The headers of `from..=to`, bounded in bytes as well as in count (audit v6, RPC-3): a header
+/// costs a read of its whole block. The page ends after the block that crosses `max_read_bytes`,
+/// so it always carries at least one header and a caller's walk always advances.
+fn block_headers_page(storage: &Storage, from: u64, to: u64, max_read_bytes: usize) -> crate::storage::Result<Vec<Value>> {
+    let mut out = Vec::new();
+    let mut read = 0usize;
+    for h in from..=to {
+        if let Some(b) = storage.block_by_height(h)? {
+            read = read.saturating_add(b.transactions.iter().map(|t| t.encoded_len()).sum::<usize>());
+            let sealed = storage.block_sealed(&b.hash())?;
+            out.push(header_json(&b, sealed));
+            if read > max_read_bytes {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Overwrite every string inside `v` with zeros, in place.
+fn wipe_strings(v: &mut Value) {
+    use zeroize::Zeroize;
+    match v {
+        Value::String(s) => s.zeroize(),
+        Value::Array(items) => items.iter_mut().for_each(wipe_strings),
+        Value::Object(map) => map.values_mut().for_each(wipe_strings),
+        _ => {}
     }
 }
 
+/// The HTTP entry: [`handle`], with whether the request carried this node's viewing token.
+async fn handle_http(
+    State(st): State<RpcState>,
+    peer: axum::extract::ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    req: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let authorized = match (&st.viewing_token, presented) {
+        (Some(want), Some(got)) => constant_time_eq(want.as_bytes(), got.as_bytes()),
+        _ => false,
+    };
+    handle_as(st, peer.0, authorized, req).await
+}
+
+/// Byte equality that does not stop at the first difference: the viewing token is a secret
+/// compared against caller-chosen bytes.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
 async fn handle(
     State(st): State<RpcState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    req: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    handle_as(st, peer, false, req).await
+}
+
+async fn handle_as(
+    st: RpcState,
+    peer: SocketAddr,
+    viewing_token: bool,
     // `Result<Json<_>, _>` rather than `Json<_>`: a body axum refuses — over the limit, or not
     // JSON at all — otherwise comes back as a *plain-text* 413 or 400, which no JSON-RPC client can
     // read. `rand send` reported a body over the limit as
@@ -824,7 +1093,28 @@ async fn handle(
         Value::Array(items) => items.len(),
         _ => 1,
     };
-    if !st.limiter.allow(peer.ip(), cost) {
+    if st.public {
+        // No batch on the public listener (audit v6): a batch is a request amplifier, and the
+        // proxies in front of this port refuse them too.
+        if body.is_array() {
+            return (
+                StatusCode::OK,
+                Json(error_value(Value::Null, RpcError::invalid_request("batch requests are not accepted on this node's public listener"))),
+            );
+        }
+        // One bucket for the whole listener, loopback included.
+        if !st.public_meter.allow_at(Instant::now()) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(error_value(
+                    Value::Null,
+                    RpcError::rejected(format!(
+                        "rate limited: this node's public listener serves {PUBLIC_RPC_BURST} requests in a burst and {PUBLIC_RPC_REFILL_PER_SEC} a second, all callers together"
+                    )),
+                )),
+            );
+        }
+    } else if !st.limiter.allow(peer.ip(), cost) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(error_value(
@@ -838,7 +1128,8 @@ async fn handle(
     // Everything past here parsed, so the HTTP status is 200 and the errors are in the body.
     // Served inside `with_peer`, so the arms that care who is asking — the viewing-key methods —
     // can tell a loopback caller from a stranger (audit v3, VK-3).
-    let out = with_peer(peer, async move {
+    let who = Caller { addr: peer, public: st.public, viewing_token };
+    let out = CALLER.scope(who, async move {
     match body {
         Value::Array(items) if items.is_empty() => {
             error_value(Value::Null, RpcError::invalid_request("invalid request: empty batch"))
@@ -893,16 +1184,12 @@ fn refuse_pruned(st: &RpcState, h: u64) -> Result<(), RpcError> {
 /// workers the node loop shares, under one of [`MAX_CONCURRENT_RPC_BLOCKING`] slots (refused
 /// busy after [`BLOCKING_SLOT_WAIT`]) so RPC can never own that pool. The closure takes owned handles (`Arc` clones) because it
 /// outlives this call's borrow of the state.
-async fn blocking<T, F>(f: F) -> Result<T, RpcError>
+async fn blocking<T, F>(st: &RpcState, f: F) -> Result<T, RpcError>
 where
     T: Send + 'static,
     F: FnOnce() -> crate::storage::Result<T> + Send + 'static,
 {
-    let _slot = blocking_slot().await?;
-    match tokio::task::spawn_blocking(f).await {
-        Ok(r) => r.map_err(RpcError::internal),
-        Err(e) => Err(RpcError::internal(format!("storage task failed: {e}"))),
-    }
+    run_blocking(st, f).await?.map_err(RpcError::internal)
 }
 
 /// The viewing-key surface's own failure set. Storage errors ride the same channel so the arms
@@ -928,20 +1215,16 @@ impl From<crate::viewing::RegistryFull> for ViewingError {
 /// `blocking` for the viewing-key arms: same spawn-blocking discipline (a scan trial-decrypts up
 /// to `viewing::MAX_SCAN_ROWS` envelopes per call), a different error channel — the import cap
 /// is a refusal and an unimported key is not-found, and neither is an internal error.
-async fn blocking_viewing<T, F>(f: F) -> Result<T, RpcError>
+async fn blocking_viewing<T, F>(st: &RpcState, f: F) -> Result<T, RpcError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, ViewingError> + Send + 'static,
 {
-    let _slot = blocking_slot().await?;
-    match tokio::task::spawn_blocking(f).await {
-        Ok(Ok(t)) => Ok(t),
-        Ok(Err(ViewingError::Full)) => Err(RpcError::rejected(crate::viewing::RegistryFull.to_string())),
-        Ok(Err(ViewingError::NotImported)) => {
-            Err(RpcError::not_found("that viewing key is not imported on this node"))
-        }
-        Ok(Err(ViewingError::Storage(e))) => Err(RpcError::internal(e)),
-        Err(e) => Err(RpcError::internal(format!("storage task failed: {e}"))),
+    match run_blocking(st, f).await? {
+        Ok(t) => Ok(t),
+        Err(ViewingError::Full) => Err(RpcError::rejected(crate::viewing::RegistryFull.to_string())),
+        Err(ViewingError::NotImported) => Err(RpcError::not_found("that viewing key is not imported on this node")),
+        Err(ViewingError::Storage(e)) => Err(RpcError::internal(e)),
     }
 }
 
@@ -990,8 +1273,14 @@ fn parse_bytes32(params: &Value, idx: usize, name: &str) -> Result<[u8; 32], Rpc
 /// by-value copy handed to `Registry::import` (moved into the zeroised `Import`), and whatever
 /// copies the vendored `ViewingKey` (a `Copy` type) makes while it trial-decrypts.
 fn parse_viewing_key(params: &Value, idx: usize) -> Result<zeroize::Zeroizing<randprotocol_core::Word8>, RpcError> {
-    let s: zeroize::Zeroizing<String> = zeroize::Zeroizing::new(param(params, idx, "viewing_key")?);
-    randprotocol_core::notes::word8_from_hex(s.strip_prefix("0x").unwrap_or(&s))
+    // Read in place (audit v6, VK-1): `param` would clone the JSON value — a second copy of the
+    // key in hex, freed unwiped. The request's own copy is wiped by `dispatch_one`.
+    let s = params
+        .get(idx)
+        .ok_or_else(|| RpcError::invalid_params("missing param viewing_key"))?
+        .as_str()
+        .ok_or_else(|| RpcError::invalid_params("bad param viewing_key: expected a string"))?;
+    randprotocol_core::notes::word8_from_hex(s.strip_prefix("0x").unwrap_or(s))
         .map(zeroize::Zeroizing::new)
         .ok_or_else(|| RpcError::invalid_params("viewing_key must be 64 hex characters"))
 }
@@ -1846,7 +2135,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             // Scans and sorts the whole family (the rows are keyed by nullifier, not height), so
             // it grows with the chain and does not belong on a runtime worker.
             let storage = st.storage.clone();
-            let rows = blocking(move || storage.nullifiers_from(from, limit)).await?;
+            let rows = blocking(st, move || storage.nullifiers_from(from, limit)).await?;
             Ok(json!(rows
                 .into_iter()
                 .map(|(height, nf)| json!({ "height": height, "nullifier": word8_to_hex(&nf) }))
@@ -1870,7 +2159,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let storage = st.storage.clone();
             // Reads every block in the range and scans a slice of the notes family: linear in the
             // range, so it goes on the blocking pool like the other unbounded reads here.
-            let out = blocking(move || {
+            let out = blocking(st, move || {
                 let head = storage.head()?.height;
                 let to = to.min(head);
                 let mut rows: Vec<Value> = Vec::new();
@@ -1918,7 +2207,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             // expensive read this node serves, and unbounded in the chain's size.
             let (storage, executor) = (st.storage.clone(), st.executor.clone());
             let _slot = witness_slot().await?;
-            match blocking(move || storage.witness(index, executor.as_ref())).await? {
+            match blocking(st, move || storage.witness(index, executor.as_ref())).await? {
                 None => Ok(Value::Null),
                 Some((root, path)) => Ok(json!({
                     "index": index,
@@ -1937,7 +2226,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let (storage, executor) = (st.storage.clone(), st.executor.clone());
             let idx = indices.clone();
             let _slot = witness_slot().await?;
-            let (root, paths) = blocking(move || storage.witnesses(&idx, executor.as_ref())).await?;
+            let (root, paths) = blocking(st, move || storage.witnesses(&idx, executor.as_ref())).await?;
             let witnesses: Vec<Value> = indices
                 .iter()
                 .zip(paths)
@@ -1968,7 +2257,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 Some(_) => param(p, 1, "rescan_from_height")?,
             };
             let (viewing, storage) = (st.viewing.clone(), st.storage.clone());
-            blocking_viewing(move || {
+            blocking_viewing(st, move || {
                 // The cursor starts at the first leaf of that height (one binary search), so the
                 // scan never reads — let alone trial-decrypts — anything earlier.
                 let start = storage.first_note_at_or_after(rescan_from_height)?;
@@ -1990,7 +2279,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             };
             let limit = parse_limit(p, 2)?;
             let (viewing, storage) = (st.viewing.clone(), st.storage.clone());
-            blocking_viewing(move || {
+            blocking_viewing(st, move || {
                 // The registry's lock is held for the lookup alone; the scan below runs under this
                 // key's own lock (audit v3, VK-1). Holding the registry across the scan blocked
                 // every other viewing call *and* the node loop's `publish_status`, so one scan
@@ -2113,7 +2402,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 Some(_) => param::<usize>(p, 3, "limit")?.clamp(1, MAX_RECEIPTS_PAGE),
             };
             let storage = st.storage.clone();
-            let (rows, next) = blocking(move || storage.receipts_for_program(&program, from, to, limit)).await?;
+            let (rows, next) = blocking(st, move || storage.receipts_for_program(&program, from, to, limit)).await?;
             Ok(json!({ "receipts": rows.iter().map(receipt_json).collect::<Vec<_>>(), "next_height": next }))
         }
         // The sealed transcript of a call's private inputs (spec §6.1), verbatim, in hex. The
@@ -2343,17 +2632,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let head = st.storage.head().map_err(RpcError::internal)?.height;
             let to = to.min(head).min(from.saturating_add(MAX_BLOCK_HEADERS - 1));
             let storage = st.storage.clone();
-            let headers = blocking(move || {
-                let mut out = Vec::new();
-                for h in from..=to {
-                    if let Some(b) = storage.block_by_height(h)? {
-                        let sealed = storage.block_sealed(&b.hash())?;
-                        out.push(header_json(&b, sealed));
-                    }
-                }
-                Ok(out)
-            })
-            .await?;
+            let headers = blocking(st, move || block_headers_page(&storage, from, to, MAX_RANGE_READ_BYTES)).await?;
             Ok(Value::Array(headers))
         }
         // ---- block aggregation (spec §8) ----
@@ -2659,7 +2938,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let pool = rx.await.map_err(|_| RpcError::internal("node loop dropped reply"))?;
             // Up to 64 RocksDB reads: one blocking task for all of them, not one per hash.
             let storage = st.storage.clone();
-            let located = blocking(move || {
+            let located = blocking(st, move || {
                 hashes.into_iter().map(|h| Ok((h, storage.tx_location(&h)?))).collect::<crate::storage::Result<Vec<_>>>()
             })
             .await?;
@@ -2928,7 +3207,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let faucet = st.status.read().unwrap_or_else(|e| e.into_inner()).faucet;
             let storage = st.storage.clone();
             let (cfg, sealed) =
-                blocking(move || Ok((storage.aggregation_config()?, storage.supply()?.sealed_blocks))).await?;
+                blocking(st, move || Ok((storage.aggregation_config()?, storage.supply()?.sealed_blocks))).await?;
             let subsidy = cfg.map(|cfg| {
                 let current = randprotocol_core::gas::subsidy(sealed, &cfg);
                 // Saturating: past the last representable halving the multiply would overflow
@@ -3031,6 +3310,10 @@ mod tests {
         });
         RpcState {
             viewing_open: false,
+            public: false,
+            public_meter: Arc::new(PublicMeter::default()),
+            read_slots: Arc::new(ReadSlots::default()),
+            viewing_token: None,
             limiter: Arc::new(RpcLimiter::default()),
             storage,
             status: Arc::new(RwLock::new(NodeStatus::default())),
@@ -3136,6 +3419,192 @@ mod tests {
             l.allow_at(ip, 1, t0);
         }
         assert!(l.clients.lock().unwrap().len() <= MAX_RPC_CLIENTS, "the client table grew past its cap");
+    }
+
+    /// Audit v6, VK-2 / RPC-4 / RPC-2. The node trusted loopback for the viewing-key gate and for
+    /// the rate limiter, and the public path — a CDN, a web host, a proxy, an SSH forward —
+    /// arrives on loopback: every public caller was unmetered and allowed the viewing methods,
+    /// and the only thing in the way was another repository's allow-list. The public listener is
+    /// the node's own: a fixed method set, no batch, one meter, and no caller counted as loopback.
+    #[tokio::test]
+    async fn the_public_listener_serves_a_fixed_method_set_to_everyone_as_one_metered_client() {
+        let (_d, st, _gs) = chain();
+        let public = st.for_public_listener();
+        let from_loopback = || axum::extract::ConnectInfo("127.0.0.1:40000".parse().unwrap());
+        let post = |st: RpcState, body: Value| async move { handle(State(st), from_loopback(), Ok(Json(body))).await };
+        let req = |method: &str, params: Value| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+        let nk = word8_to_hex(&[5; 8]);
+
+        // The five that must never be public, each refused on the listener — from loopback, which
+        // is where a proxy's requests come from — before any parameter is read.
+        for method in ["rand_importViewingKey", "rand_getViewingNotes", "rand_removeViewingKey", "rand_mint", "rand_getPeers"] {
+            let (code, Json(out)) = post(public.clone(), req(method, json!([nk]))).await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(out["error"]["code"], -32000, "{method}: {out}");
+            assert!(out["error"]["message"].as_str().unwrap().contains("public listener"), "{method}: {out}");
+            assert!(!PUBLIC_METHODS.contains(&method));
+        }
+        // Opening the viewing methods on the operator's side does not open them here.
+        let opened = RpcState { viewing_open: true, ..public.clone() };
+        let (_, Json(out)) = post(opened, req("rand_importViewingKey", json!([nk]))).await;
+        assert!(out["error"]["message"].as_str().unwrap().contains("public listener"), "{out}");
+        assert_eq!(st.viewing.read().unwrap().len(), 0, "nothing was imported");
+        // A method nobody listed is not public either: the set is an allow-list.
+        let (_, Json(out)) = post(public.clone(), req("rand_aMethodAddedNextYear", json!([]))).await;
+        assert!(out["error"]["message"].as_str().unwrap().contains("public listener"), "{out}");
+        // What a wallet needs is served, and every listed method is one `dispatch` knows.
+        let (_, Json(out)) = post(public.clone(), req("rand_chainId", json!([]))).await;
+        assert_eq!(out["result"], json!(st.chain_id));
+        for method in PUBLIC_METHODS {
+            let (_, Json(out)) = post(RpcState { public_meter: Arc::new(PublicMeter::default()), ..public.clone() }, req(method, json!([]))).await;
+            assert_ne!(out["error"]["code"], -32601, "{method} is listed as public but is not a method of this node");
+        }
+        // No batch.
+        let (code, Json(out)) = post(public.clone(), json!([req("rand_chainId", json!([])), req("rand_getHead", json!([]))])).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(out["error"]["code"], -32600, "{out}");
+        assert!(out["error"]["message"].as_str().unwrap().contains("batch"), "{out}");
+
+        // One meter for the whole listener, and loopback is not exempt from it.
+        let metered = RpcState { public_meter: Arc::new(PublicMeter::default()), ..public.clone() };
+        let mut served = 0u32;
+        let mut refused = None;
+        for i in 0..PUBLIC_RPC_BURST + 50 {
+            // Two "clients": behind a proxy they are one address anyway.
+            let peer = axum::extract::ConnectInfo(format!("127.0.0.{}:4000", 1 + i % 2).parse().unwrap());
+            let (code, Json(out)) = handle(State(metered.clone()), peer, Ok(Json(req("rand_chainId", json!([]))))).await;
+            match code {
+                StatusCode::OK => served += 1,
+                other => {
+                    refused = Some((other, out));
+                    break;
+                }
+            }
+        }
+        let (code, out) = refused.expect("the listener's bucket empties");
+        assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+        assert!(out["error"]["message"].as_str().unwrap().contains("all callers together"), "{out}");
+        assert!((PUBLIC_RPC_BURST..PUBLIC_RPC_BURST + 50).contains(&served), "{served} served against a burst of {PUBLIC_RPC_BURST}");
+        // The operator's listener is as it was: loopback unmetered, the viewing methods served.
+        for _ in 0..PUBLIC_RPC_BURST + 50 {
+            let (code, _) = post(st.clone(), req("rand_chainId", json!([]))).await;
+            assert_eq!(code, StatusCode::OK);
+        }
+        let (_, Json(out)) = post(st.clone(), req("rand_importViewingKey", json!([nk]))).await;
+        assert!(out.get("error").is_none(), "{out}");
+    }
+
+    /// Audit v6, VK-2 (defence in depth): with a viewing token configured, loopback alone no
+    /// longer opens the viewing methods — every process on the host is on loopback — and the
+    /// token does, from anywhere.
+    #[tokio::test]
+    async fn a_viewing_token_replaces_the_loopback_rule() {
+        let (_d, st, _gs) = chain();
+        let st = RpcState { viewing_token: Some(Arc::from("a-token-of-at-least-thirty-two-chars")), ..st };
+        let nk = word8_to_hex(&[5; 8]);
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "rand_importViewingKey", "params": [nk] });
+        let ask = |peer: &str, authorized: bool| handle_as(st.clone(), peer.parse().unwrap(), authorized, Ok(Json(body.clone())));
+        let (_, Json(out)) = ask("127.0.0.1:4000", false).await;
+        assert!(out["error"]["message"].as_str().unwrap().contains("viewing token"), "loopback without the token: {out}");
+        let (_, Json(out)) = ask("203.0.113.9:4000", true).await;
+        assert!(out.get("error").is_none(), "the token, from anywhere: {out}");
+        assert!(constant_time_eq(b"abc", b"abc") && !constant_time_eq(b"abc", b"abd") && !constant_time_eq(b"abc", b"abcd"));
+        // The request's copy of the key is wiped once the method has run (VK-1).
+        let mut params = json!(["00ff", { "k": "secret" }, 7]);
+        wipe_strings(&mut params);
+        assert_eq!(params, json!(["", { "k": "" }, 7]), "zeroised strings are emptied (the bytes overwritten first)");
+    }
+
+    /// Audit v6, RPC-3: a header page is bounded by the block bytes it reads, not only by 1,024
+    /// heights, and a blocking read that overruns its time answers "busy" while still holding
+    /// its slot until it really ends.
+    #[tokio::test]
+    async fn a_header_page_is_bounded_in_bytes_and_a_slow_read_is_answered_busy() {
+        let (_d, st, _gs, _) = bridged_chain();
+        let head = st.storage.head().unwrap().height;
+        assert!(head >= 2);
+        let all = block_headers_page(&st.storage, 1, head, usize::MAX).unwrap();
+        assert_eq!(all.len() as u64, head);
+        // A budget the first block already crosses: one header, so the walk still advances.
+        let one = block_headers_page(&st.storage, 1, head, 0).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0], all[0]);
+        assert_eq!(ok(&st, "rand_getBlocks", json!([1, head])).await.as_array().unwrap().len() as u64, head);
+
+        let started = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let slow = run_blocking_within(&st, Duration::from_millis(50), move || {
+            // Ends only when the test says so: the read outlives its caller's patience.
+            let _ = rx.recv_timeout(Duration::from_secs(20));
+            7
+        })
+        .await;
+        let e = slow.expect_err("a read past its limit is answered, not awaited for ever");
+        assert_eq!(e.code, -32000);
+        assert!(e.message.contains("took longer"), "{}", e.message);
+        assert!(started.elapsed() < Duration::from_secs(5), "the caller was released at the limit");
+        assert_eq!(st.read_slots.all.available_permits(), MAX_CONCURRENT_RPC_BLOCKING - 1, "the overrun read still holds its slot");
+        drop(tx);
+        assert_eq!(run_blocking_within(&st, Duration::from_secs(20), || 7).await.ok(), Some(7), "a read inside its limit is served");
+        for _ in 0..200 {
+            if st.read_slots.all.available_permits() == MAX_CONCURRENT_RPC_BLOCKING {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(st.read_slots.all.available_permits(), MAX_CONCURRENT_RPC_BLOCKING, "and gives it back when it really ends");
+        // A public caller takes one of the listener's eight as well as one of the sixteen.
+        let public = st.for_public_listener();
+        let (tx2, rx2) = std::sync::mpsc::channel::<()>();
+        let _ = run_blocking_within(&public, Duration::from_millis(20), move || {
+            let _ = rx2.recv_timeout(Duration::from_secs(20));
+        })
+        .await;
+        assert_eq!(public.read_slots.public.available_permits(), MAX_PUBLIC_RPC_BLOCKING - 1);
+        drop(tx2);
+    }
+
+    /// The public listener on a real socket (audit v6): the POST is served, a WebSocket upgrade
+    /// finds no route, and the viewing token arrives as an `Authorization` header.
+    #[tokio::test]
+    async fn the_public_listener_has_no_websocket_and_the_token_is_read_from_the_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (_d, st, _gs) = chain();
+        let st = RpcState { viewing_token: Some(Arc::from("a-token-of-at-least-thirty-two-chars")), ..st };
+        let (operator, _t1) = serve("127.0.0.1:0".parse().unwrap(), st.clone()).await.unwrap();
+        let (public, _t2) = serve("127.0.0.1:0".parse().unwrap(), st.for_public_listener()).await.unwrap();
+        async fn http(addr: SocketAddr, request: String) -> String {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(request.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf)).await.unwrap().unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        }
+        let upgrade = |path: &str| {
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+        };
+        let post = |method: &str, params: Value, auth: Option<&str>| {
+            let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }).to_string();
+            let auth = auth.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+            format!("POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+        };
+        assert!(http(operator, upgrade("/ws")).await.starts_with("HTTP/1.1 101"), "the operator's listener upgrades");
+        for path in ["/ws", "/"] {
+            let answer = http(public, upgrade(path)).await;
+            assert!(!answer.starts_with("HTTP/1.1 101"), "the public listener upgraded {path}: {answer}");
+        }
+        assert!(http(public, post("rand_chainId", json!([]), None)).await.contains("\"result\""));
+        assert!(http(public, post("rand_getPeers", json!([]), None)).await.contains("public listener"));
+        let nk = word8_to_hex(&[5; 8]);
+        let refused = http(operator, post("rand_importViewingKey", json!([nk]), None)).await;
+        assert!(refused.contains("viewing token"), "{refused}");
+        let wrong = http(operator, post("rand_importViewingKey", json!([nk]), Some("not-the-token-but-thirty-two-chars-xx"))).await;
+        assert!(wrong.contains("viewing token"), "{wrong}");
+        let served = http(operator, post("rand_importViewingKey", json!([nk]), Some("a-token-of-at-least-thirty-two-chars"))).await;
+        assert!(served.contains("\"result\""), "{served}");
+        // And the token does not open them on the public listener.
+        let public_with_token = http(public, post("rand_importViewingKey", json!([nk]), Some("a-token-of-at-least-thirty-two-chars"))).await;
+        assert!(public_with_token.contains("public listener"), "{public_with_token}");
     }
 
     /// `call`, as a request from `peer` — what the viewing-key methods' loopback rule reads.
@@ -4220,7 +4689,7 @@ mod tests {
     #[tokio::test]
     async fn a_range_read_is_refused_busy_when_every_rpc_blocking_slot_is_taken() {
         let (_d, st, _gs) = chain();
-        let held = RPC_BLOCKING.acquire_many(MAX_CONCURRENT_RPC_BLOCKING as u32).await.unwrap();
+        let held = st.read_slots.all.clone().acquire_many_owned(MAX_CONCURRENT_RPC_BLOCKING as u32).await.unwrap();
         let started = std::time::Instant::now();
         let r = tokio::time::timeout(BLOCKING_SLOT_WAIT * 4, call(&st, "rand_getBlocks", json!([0, 0]))).await;
         drop(held);

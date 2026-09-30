@@ -166,6 +166,10 @@ pub async fn serve_heads(capacity: usize) -> (SocketAddr, broadcast::Sender<Head
     let state = RpcState {
             limiter: std::sync::Arc::new(randprotocol_node::rpc::RpcLimiter::default()),
         viewing_open: false,
+        public: false,
+        public_meter: std::sync::Arc::new(randprotocol_node::rpc::PublicMeter::default()),
+        read_slots: std::sync::Arc::new(randprotocol_node::rpc::ReadSlots::default()),
+        viewing_token: None,
         storage,
         status: Arc::new(RwLock::new(NodeStatus::default())),
         node: node_tx,

@@ -92,6 +92,9 @@ pub struct NodeHandle {
     pub address: randprotocol_core::Address,
     pub task: tokio::task::JoinHandle<Result<()>>,
     pub rpc_task: tokio::task::JoinHandle<()>,
+    /// The public listener's bound address and task, when `--public-rpc` was given.
+    pub public_rpc_addr: Option<SocketAddr>,
+    pub public_rpc_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl NodeHandle {
@@ -101,8 +104,14 @@ impl NodeHandle {
         self.network.shutdown().await;
         self.task.abort();
         self.rpc_task.abort();
+        if let Some(t) = &self.public_rpc_task {
+            t.abort();
+        }
         let _ = self.task.await;
         let _ = self.rpc_task.await;
+        if let Some(t) = self.public_rpc_task {
+            let _ = t.await;
+        }
         drop(self.storage);
     }
 }
@@ -1728,7 +1737,32 @@ pub fn check_build_runs_genesis(gs: &GenesisState, built_hc_bundles: &[randproto
     Ok(())
 }
 
+/// What [`start_with`] adds to the RPC beyond [`NodeConfig`] (audit v6, VK-2 / RPC-4).
+#[derive(Clone, Default)]
+pub struct RpcOptions {
+    /// A second, **public** listener (`--public-rpc`): a fixed method set, no batches, no
+    /// WebSocket, one meter for every caller together, and no caller counted as loopback. This
+    /// is what a reverse proxy or an SSH forward should be pointed at; the operator's listener
+    /// (`--rpc`) stays on loopback with everything on it.
+    pub public_addr: Option<SocketAddr>,
+    /// A bearer token the viewing-key methods require on the operator's listener
+    /// (`--rpc-viewing-token-file`). `None` keeps the loopback rule.
+    pub viewing_token: Option<Arc<str>>,
+}
+
 pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
+    start_with(cfg, RpcOptions::default()).await
+}
+
+pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions) -> Result<NodeHandle> {
+    // The public listener is its own socket (audit v6): the same address as the operator's
+    // would make one of them unreachable, and a wildcard operator port beside it would put the
+    // full method set back on the path the public listener exists to close.
+    if let Some(public) = rpc_options.public_addr {
+        if public == cfg.rpc_addr || (public.port() == cfg.rpc_addr.port() && (public.ip().is_unspecified() || cfg.rpc_addr.ip().is_unspecified())) {
+            anyhow::bail!("--public-rpc {public} collides with --rpc {}: the public listener needs its own port", cfg.rpc_addr);
+        }
+    }
     let key = Keypair::from_seed(cfg.seed).context("bad key seed")?;
     let (gs, executor) = load_genesis(&cfg.datadir)?;
     check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles())?;
@@ -1845,11 +1879,13 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         tracing::warn!("this chain's genesis carries its own gas section; --gas-price/--byte-price are ignored");
     }
     let rpc_limits = rpc::ChainLimits::of(&gs.ledger).with_gas_policy(cfg.gas_policy);
-    let (rpc_addr, rpc_task) = rpc::serve(
-        cfg.rpc_addr,
-        RpcState {
+    let rpc_state = RpcState {
             limiter: Arc::new(crate::rpc::RpcLimiter::default()),
             viewing_open: cfg.viewing_open,
+            public: false,
+            public_meter: Arc::new(crate::rpc::PublicMeter::default()),
+            read_slots: Arc::new(crate::rpc::ReadSlots::default()),
+            viewing_token: rpc_options.viewing_token.clone(),
             storage: storage.clone(),
             status: status.clone(),
             node: cmd_tx,
@@ -1863,10 +1899,25 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             refusals: refusals.clone(),
             ws_conns: ws_conns.clone(),
             viewing,
-        },
-    )
-    .await?;
+    };
+    let public_rpc = match rpc_options.public_addr {
+        Some(addr) => Some(rpc::serve(addr, rpc_state.for_public_listener()).await.with_context(|| format!("binding --public-rpc {addr}"))?),
+        None => None,
+    };
+    let (rpc_addr, rpc_task) = rpc::serve(cfg.rpc_addr, rpc_state).await?;
     tracing::info!("rpc listening on http://{rpc_addr}");
+    match &public_rpc {
+        Some((addr, _)) => tracing::info!(
+            "public rpc listening on http://{addr}: {} methods, no batches, no websocket, one meter for all callers",
+            rpc::PUBLIC_METHODS.len()
+        ),
+        // Said plainly, because the operator's listener trusts loopback and a proxy or an SSH
+        // forward arrives on loopback (audit v6, VK-2 / RPC-4).
+        None if !cfg.rpc_addr.ip().is_loopback() => tracing::warn!(
+            "--rpc {rpc_addr} is not loopback and serves every method; put a public endpoint on --public-rpc instead"
+        ),
+        None => {}
+    }
     tracing::info!(
         "node {} height {} view {} validator={}",
         key.address(),
@@ -1986,7 +2037,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         }
         outcome
     });
-    Ok(NodeHandle { rpc_addr, network: net, listen_addrs, status, storage, address, task, rpc_task })
+    let (public_rpc_addr, public_rpc_task) = public_rpc.map_or((None, None), |(a, t)| (Some(a), Some(t)));
+    Ok(NodeHandle { rpc_addr, public_rpc_addr, network: net, listen_addrs, status, storage, address, task, rpc_task, public_rpc_task })
 }
 
 async fn sleep_until(t: Option<Instant>) {

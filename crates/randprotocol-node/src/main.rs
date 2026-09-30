@@ -504,6 +504,19 @@ enum Cmd {
         /// running against this node.
         #[arg(long)]
         rpc_viewing_open: bool,
+        /// A second, public JSON-RPC listener (audit v6, VK-2 / RPC-4): point a reverse proxy or
+        /// an SSH forward at this, never at `--rpc`. It answers a fixed set of read methods and
+        /// `rand_sendTransaction` — no viewing-key methods, no `rand_mint`, no `rand_getPeers` —
+        /// takes no batch and no WebSocket, and meters every caller together (behind a proxy
+        /// they all arrive from one address, and that address is loopback, which `--rpc` trusts).
+        #[arg(long)]
+        public_rpc: Option<SocketAddr>,
+        /// Require a bearer token on the viewing-key methods of `--rpc`: the first line of this
+        /// file, at least 32 characters, sent by the explorer as `Authorization: Bearer <token>`.
+        /// With it, being on loopback is no longer enough (every process on the host is), and a
+        /// caller anywhere that presents it is served. A file, so the token is not in `ps`.
+        #[arg(long)]
+        rpc_viewing_token_file: Option<PathBuf>,
         /// Refuse to start with less than this many MB free on the data directory's filesystem,
         /// and report `disk_low` in `rand_getHealth` under four times it (audit v4 OPS-3). Zero
         /// disables the guard.
@@ -1128,6 +1141,8 @@ async fn main() -> Result<()> {
             verify_chain,
             keep_raw_proofs,
             rpc_viewing_open,
+            public_rpc,
+            rpc_viewing_token_file,
             min_free_disk_mb,
             prune_history,
             prover,
@@ -1162,7 +1177,19 @@ async fn main() -> Result<()> {
                 })?),
             };
             let kp = load_keypair(&key)?;
-            let handle = node::start(NodeConfig {
+            let viewing_token = match &rpc_viewing_token_file {
+                None => None,
+                Some(path) => {
+                    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+                    let token = text.lines().next().unwrap_or("").trim();
+                    if token.len() < 32 {
+                        anyhow::bail!("{}: the viewing token must be at least 32 characters on the first line", path.display());
+                    }
+                    Some(std::sync::Arc::<str>::from(token))
+                }
+            };
+            let rpc_options = node::RpcOptions { public_addr: public_rpc, viewing_token };
+            let handle = node::start_with(NodeConfig {
                 viewing_open: rpc_viewing_open,
                 datadir,
                 seed: *kp.seed(),
@@ -1179,7 +1206,7 @@ async fn main() -> Result<()> {
                 min_free_disk_bytes: min_free_disk_mb << 20,
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
-            })
+            }, rpc_options)
             .await?;
             // The prover is served once the node's RPC is up and stops with the node; a prover
             // that exits stops the node too.
