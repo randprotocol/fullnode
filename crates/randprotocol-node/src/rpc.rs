@@ -1668,11 +1668,25 @@ pub(crate) fn receipt_json(r: &CallReceipt) -> Value {
 /// A block's header fields alone — everything `block_json` reports except `transactions`, and
 /// what `rand_getBlocks` pages over instead of the full block.
 fn header_json(b: &randprotocol_core::Block, sealed: bool) -> Value {
+    // The three actions that append a note whose every word is on the wire — a bridge deposit, a
+    // token mint, a registration's initial mint — carried raw beside the header (issue #117). A
+    // wallet's first sync used to read the header page and then fetch, one call each, every
+    // block with a transaction in it, only to find these three kinds: 537 of 645 requests on a
+    // 99 000-block chain, and the public endpoint's per-address budget refused it. Rendering a
+    // header already reads the whole block, so this costs the node nothing more; the
+    // transactions are rare (none on an idle chain) and small.
+    let public_notes: Vec<Value> = b
+        .transactions
+        .iter()
+        .filter(|t| matches!(t.action, Action::BridgeAttest { .. } | Action::TokenMint { .. } | Action::RegisterToken { .. }))
+        .map(|t| json!({ "hash": t.hash().to_hex(), "raw": hex::encode(t.encode()) }))
+        .collect();
     json!({
         "hash": b.hash().to_hex(), "height": b.height(), "view": b.view(), "parent": b.parent().to_hex(),
         "proposer": b.proposer().to_base58(), "timestamp_ms": b.header.timestamp_ms,
         "tx_root": b.header.tx_root.to_hex(), "state_root": b.header.state_root.to_hex(),
         "justify_view": b.header.justify.view, "sealed": sealed, "tx_count": b.transactions.len(),
+        "public_notes": public_notes,
     })
 }
 

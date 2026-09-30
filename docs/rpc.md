@@ -1459,6 +1459,16 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
+### 2026-10-01 — a header row carries its block's public-note transactions (issue #117)
+
+Additive. Every header `rand_getBlocks` returns gains `public_notes`: the block's `bridge_attest`,
+`token_mint` and `register_token` transactions as `[{ "hash": hex, "raw": hex }]` (the same
+encoding `rand_getRawTransaction` serves), empty for every other block. A wallet's first sync
+reads the header pages and nothing else on such a node; on an older node it still fetches each
+block with a transaction. The `rand` wallet also waits out a rate-limit refusal (`-32005`, or a
+`-32000` that says rate limited / busy) with doubling waits before giving up, and saves the scan's
+progress whether or not it finished, so an interrupted first sync resumes.
+
 ### 2026-09-30 — audit v6: a public listener, read limits, a viewing token (VK-2, RPC-2/3/4, VK-1)
 
 Node-only. Nothing changes for a client of `--rpc` except the two read limits.

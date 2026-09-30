@@ -1259,14 +1259,22 @@ async fn main() -> Result<()> {
         }
         Cmd::Balance => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
-            wallet::scan(&rpc, &w, &mut store).await?;
+            // Saved whether or not the scan finished (issue #117): every cursor and the walk's
+            // pending notes are consistent at each point the scan can fail, so a first sync cut
+            // short by a rate limit or a dropped connection resumes instead of starting over.
+            let scanned = wallet::scan(&rpc, &w, &mut store).await;
             store.save(&path)?;
+            scanned?;
             println!("balance: {} RAND\nnotes: {} unspent", format_amount(store.balance()), store.spendable().len());
         }
         Cmd::AssetBalance { index } => {
             let (w, path, mut store) = open_wallet(&cli.key)?;
-            wallet::scan(&rpc, &w, &mut store).await?;
+            // Saved whether or not the scan finished (issue #117): every cursor and the walk's
+            // pending notes are consistent at each point the scan can fail, so a first sync cut
+            // short by a rate limit or a dropped connection resumes instead of starting over.
+            let scanned = wallet::scan(&rpc, &w, &mut store).await;
             store.save(&path)?;
+            scanned?;
             // The registry names the token behind an index; a note whose asset it does not name is
             // still reported, under its own index, because the note is real either way. Same for a
             // chain with no bridge at all, which answers with an empty registry — or a node too old
@@ -1315,8 +1323,12 @@ async fn main() -> Result<()> {
                 store.reset();
                 eprintln!("rescanning from leaf 0: every note and spent mark is rebuilt from the chain");
             }
-            wallet::scan(&rpc, &w, &mut store).await?;
+            // Saved whether or not the scan finished (issue #117): every cursor and the walk's
+            // pending notes are consistent at each point the scan can fail, so a first sync cut
+            // short by a rate limit or a dropped connection resumes instead of starting over.
+            let scanned = wallet::scan(&rpc, &w, &mut store).await;
             store.save(&path)?;
+            scanned?;
             println!("scanned {} leaves and {} blocks; {} notes, {} unspent", store.scanned_index, store.scanned_height, store.notes.len(), store.spendable().len());
         }
         Cmd::Notes { memo } => {

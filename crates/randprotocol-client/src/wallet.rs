@@ -316,6 +316,14 @@ mod hex_note {
     }
 }
 
+/// A deposit or mint rebuilt from a block and not yet placed at its leaf ([`NoteStore::
+/// pending_public_notes`]), in the store's own note encoding.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingNote {
+    #[serde(with = "hex_note")]
+    pub note: Note,
+}
+
 /// A note this wallet can spend: the leaf it sits at, its plaintext, and the two values the
 /// chain knows it by.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -392,6 +400,13 @@ pub struct NoteStore {
     /// written before that path existed, which is what makes an older store re-read its blocks
     /// once and recover anything it missed. (The name is the first of those kinds'.)
     pub scanned_attest_height: u64,
+    /// Deposits and mints rebuilt from blocks the walk has read but not yet placed at their leaf
+    /// (issue #117): the walk advances `scanned_attest_height` page by page and keeps what it
+    /// found here, so an interrupted first sync — the public endpoint's rate limit, a dropped
+    /// connection — resumes where it stopped instead of re-reading every block. Emptied once the
+    /// leaf pass has placed each. Keyed by the note's commitment, as hex.
+    #[serde(default)]
+    pub pending_public_notes: BTreeMap<String, PendingNote>,
     pub notes: Vec<OwnedNote>,
     pub sent: Vec<SentRow>,
     /// The wallet's own copy of the commitment tree and a witness per owned note (audit v3
@@ -410,6 +425,8 @@ impl<'de> Deserialize<'de> for NoteStore {
             scanned_height: u64,
             #[serde(default)]
             scanned_attest_height: u64,
+            #[serde(default)]
+            pending_public_notes: BTreeMap<String, PendingNote>,
             notes: Vec<OwnedNote>,
             #[serde(default)]
             sent: Vec<SentRow>,
@@ -428,6 +445,7 @@ impl<'de> Deserialize<'de> for NoteStore {
             scanned_index,
             scanned_height: w.scanned_height,
             scanned_attest_height: w.scanned_attest_height,
+            pending_public_notes: w.pending_public_notes,
             notes: w.notes,
             sent: w.sent,
             tree: w.tree.unwrap_or_default(),
@@ -777,23 +795,25 @@ pub fn rebuilt_notes(w: &Wallet, tx: &Transaction) -> Vec<Note> {
 /// that carries that commitment, which is what turns a rebuilt note into an owned one at a known
 /// index.
 ///
-/// Blocks are read once: the height returned is where `scanned_attest_height` moves to, past them
-/// whether or not they held a note for this wallet — but only once [`scan`] has placed every note
-/// found here at its leaf. The cursor lives in a store that is saved even when a scan fails, so
-/// moving it here, before the notes are placed, would let a failed scan persist a cursor past a
-/// garbage-envelope deposit that was never recorded — and nothing would ever read it again. The
-/// pass reads headers [`BLOCK_PAGE`] at a time (`rand_getBlocks`), a block only when it carries
-/// a transaction, and a raw transaction only for the three kinds that append a public note — so
-/// an idle chain costs a header page per `BLOCK_PAGE` blocks.
+/// The pass reads headers [`BLOCK_PAGE`] at a time (`rand_getBlocks`). A node since audit v6
+/// carries every public-note transaction raw beside its header (`public_notes`, issue #117), so
+/// a page is all the walk reads; an older node's headers say only `tx_count`, and a block with
+/// a transaction is fetched to look, and a raw transaction read for the three kinds that append
+/// a public note. An idle chain costs a header page per `BLOCK_PAGE` blocks either way.
+///
+/// **The walk is resumable** (issue #117): `scanned_attest_height` moves past each page as it is
+/// read, and what the page yielded is kept in `store.pending_public_notes` until the leaf pass
+/// places it — the store is saved by every caller whether or not the scan finished, so a first
+/// sync stopped by a rate limit or a dropped connection continues from the last page rather than
+/// from block 0. Returns the notes to place: what earlier walks left pending, plus this one's.
 ///
 /// A node started with `--prune-history` (every validator: one day) answers a page reaching below
 /// its retention floor `-32010`, naming the floor — a fresh or rescanned store starts at 0, so
 /// that is the first page it asks for. The walk resumes at the floor, and the scan warns once
 /// ([`warn_pruned`]): what lies below it cannot be read from this node, and the cursor still
 /// passes it, because asking again would only be refused again.
-async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &NoteStore) -> Result<(BTreeMap<Word8, Note>, u64)> {
+async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<BTreeMap<Word8, Note>> {
     let head = rpc.head().await?["height"].as_u64().context("getHead did not return a height")?;
-    let mut out = BTreeMap::new();
     let mut from = store.scanned_attest_height;
     // The highest floor a refusal named, if any page was refused.
     let mut pruned: Option<u64> = None;
@@ -811,11 +831,22 @@ async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &NoteStore) -> Re
         if last < from {
             return Err(anyhow!("getBlocks returned headers below height {from}"));
         }
+        let mut found: Vec<Note> = Vec::new();
         for header in &headers {
+            let height = header["height"].as_u64().context("a block header without a height")?;
+            if let Some(carried) = header.get("public_notes").and_then(|v| v.as_array()) {
+                // A node that carries the transactions beside the header: nothing else to read.
+                for entry in carried {
+                    let raw = hex::decode(entry["raw"].as_str().unwrap_or_default())
+                        .map_err(|e| anyhow!("block {height} carries a public-note transaction that is not hex: {e}"))?;
+                    let tx = Transaction::decode(&raw).map_err(|e| anyhow!("block {height} carries a public-note transaction that does not decode: {e}"))?;
+                    found.extend(rebuilt_notes(w, &tx));
+                }
+                continue;
+            }
             if header["tx_count"].as_u64().unwrap_or(0) == 0 {
                 continue;
             }
-            let height = header["height"].as_u64().context("a block header without a height")?;
             // A pruning pass can raise the floor between the header page and this read.
             let block = match rpc.block_by_height(height).await {
                 Ok(block) => block,
@@ -836,17 +867,22 @@ async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &NoteStore) -> Re
                     .raw_transaction(&hash)
                     .await?
                     .with_context(|| format!("the node serves no raw transaction for {hash}, committed in block {height}"))?;
-                for note in rebuilt_notes(w, &raw) {
-                    out.insert(note.commitment(), note);
-                }
+                found.extend(rebuilt_notes(w, &raw));
             }
         }
+        // The page is read whole: keep what it held and move the cursor past it together, so a
+        // store saved after this point neither re-reads the page nor forgets its notes.
+        for note in found {
+            store.pending_public_notes.insert(word8_to_hex(&note.commitment()), PendingNote { note });
+        }
         from = last + 1;
+        store.scanned_attest_height = store.scanned_attest_height.max(from);
     }
+    store.scanned_attest_height = store.scanned_attest_height.max(head + 1);
     if let Some(floor) = pruned {
         warn_pruned(floor);
     }
-    Ok((out, store.scanned_attest_height.max(head + 1)))
+    Ok(store.pending_public_notes.values().map(|p| (p.note.commitment(), p.note)).collect())
 }
 
 /// Where the block walk resumes after `e`, an error answered for a read at height `at`: the floor
@@ -1057,7 +1093,7 @@ async fn scan_pass(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result
     // What the envelope layer cannot be trusted to deliver, read off the wire instead. Done
     // before the leaves are paged, so a deposit or a mint is placed by the same pass that first sees its
     // leaf rather than a scan later.
-    let (mut rebuilt, rebuilt_through) = rebuildable_notes(rpc, w, store).await?;
+    let mut rebuilt = rebuildable_notes(rpc, w, store).await?;
     let h = tree_hash();
     // The height of the last leaf the tree took this scan — the tip its freshest checkpoint is
     // recorded at below.
@@ -1121,11 +1157,12 @@ async fn scan_pass(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result
         }
     }
 
-    // Every rebuilt note is at its leaf now, so the blocks they came from need not be read again.
-    // Only here: any error above returns before this line, leaving the cursor where it was, and
-    // the next scan re-reads those blocks and places what this one could not.
+    // Every rebuilt note is at its leaf now; the walk's cursor already passed the blocks they came
+    // from, and what it kept for the leaf pass is placed, so nothing is pending any more. Any
+    // error above returns before this line and leaves the pending set in the store, for the next
+    // scan to place without re-reading a block (issue #117).
     debug_assert!(rebuilt.is_empty());
-    store.scanned_attest_height = rebuilt_through;
+    store.pending_public_notes.clear();
 
     // The leaf pass paged to empty, so the tree holds every committed leaf the node had — the
     // last leaf's own block is provably complete, and the root at its end is the freshest anchor
@@ -4848,6 +4885,11 @@ mod tests {
         /// How many `rand_getWitness` calls this node has answered. A wallet that keeps its own
         /// tree (audit v3 PRIV-1) never makes one, so every send asserts this stays at zero.
         witness_calls: usize,
+        /// Whether this fake's headers carry the public-note transactions raw (`public_notes`,
+        /// issue #117 — a node since audit v6), or only `tx_count`, as an older node's do.
+        headers_carry_public_notes: bool,
+        /// How many `rand_getBlockByHeight` calls this node has answered (issue #117).
+        block_reads: usize,
         /// `rand_getLimits`' `envelope_bytes` (task 7): `None` — this fake's default — is a chain
         /// that predates the field, same as a genuinely absent one; `Some(MEMO_ENVELOPE_BYTES)`
         /// is the memo format.
@@ -4894,6 +4936,8 @@ mod tests {
                 floor: 0,
                 genesis: Hash([9; 32]),
                 witness_calls: 0,
+                headers_carry_public_notes: false,
+                block_reads: 0,
                 envelope_bytes: None,
                 hc_bundle: ZkExecutor::hc_bundle(),
                 hc_auth: None,
@@ -4948,9 +4992,20 @@ mod tests {
                 "rand_getHead" => json!({ "height": head }),
                 "rand_getGenesisHash" => json!(self.genesis.to_hex()),
                 "rand_getBlocks" => json!((n(0)..=n(1).min(head).min(n(0) + 127))
-                    .map(|h| json!({ "height": h, "tx_count": self.blocks[h as usize].len() }))
+                    .map(|h| {
+                        let mut header = json!({ "height": h, "tx_count": self.blocks[h as usize].len() });
+                        if self.headers_carry_public_notes {
+                            header["public_notes"] = json!(self.blocks[h as usize]
+                                .iter()
+                                .filter(|t| kind(&t.action) != "other" && kind(&t.action) != "none")
+                                .map(|t| json!({ "hash": t.hash().to_hex(), "raw": hex::encode(t.encode()) }))
+                                .collect::<Vec<_>>());
+                        }
+                        header
+                    })
                     .collect::<Vec<_>>()),
                 "rand_getBlockByHeight" => {
+                    self.block_reads += 1;
                     let txs: Vec<_> = self.blocks[n(0) as usize]
                         .iter()
                         .map(|t| json!({ "hash": t.hash().to_hex(), "action": { "kind": kind(&t.action) } }))
@@ -5415,8 +5470,9 @@ mod tests {
     }
 
     /// A scan that fails after reading the blocks but before placing the rebuilt notes at their
-    /// leaves does not move the public-rebuild cursor — the store `rand` saves on that failure
-    /// still re-reads those blocks, and the next scan finds the garbage-envelope deposit.
+    /// leaves loses nothing: since issue #117 the cursor moves past the blocks as they are read,
+    /// and what they held stays pending in the store `rand` saves on that failure, so the next
+    /// scan places the garbage-envelope deposit without reading the blocks again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_scan_never_saves_a_cursor_past_an_unplaced_deposit() {
         let me = Wallet::from_spend_key(SpendKey([55; 8]));
@@ -5433,7 +5489,8 @@ mod tests {
         let mut store = NoteStore::default();
         assert!(scan(&rpc, &me, &mut store).await.unwrap_err().to_string().contains("injected"));
         let mut store = saved(&store);
-        assert_eq!(store.scanned_attest_height, 0, "the blocks are still unread as far as the store knows");
+        assert_eq!(store.scanned_attest_height, chain.lock().unwrap().head() + 1, "the blocks were read and the cursor says so");
+        assert_eq!(store.pending_public_notes.len(), notes.len(), "their notes wait in the saved store");
         assert!(store.notes.is_empty());
 
         // And a failure after the leaves were read but in the nullifier pages: the notes were placed,
@@ -5478,6 +5535,78 @@ mod tests {
         scan(&rpc, &me, &mut store).await.unwrap();
         assert_eq!(store.notes.len(), 2, "a second scan adds nothing");
         assert_eq!(store.scanned_index, 2);
+    }
+
+    /// Issue #117: a node since audit v6 carries the public-note transactions beside their
+    /// headers, so the walk reads a header page and no block; an older node's headers say only
+    /// `tx_count`, and the walk still fetches every block with a transaction.
+    #[tokio::test]
+    async fn the_block_walk_reads_no_block_when_the_headers_carry_the_public_notes() {
+        for carried in [false, true] {
+            let me = Wallet::from_spend_key(SpendKey([57; 8]));
+            let chain = Arc::new(Mutex::new(ChainState::new()));
+            let (txs, notes) = public_notes_for(&me);
+            {
+                let mut c = chain.lock().unwrap();
+                c.headers_carry_public_notes = carried;
+                for (tx, note) in txs.into_iter().zip(notes.iter()) {
+                    c.commit(vec![tx], vec![(note.commitment(), garbage())]);
+                }
+                c.fund(&me, 5, 0);
+            }
+            let rpc = serve(&chain).await;
+            let mut store = NoteStore::default();
+            scan(&rpc, &me, &mut store).await.unwrap();
+            assert_eq!(store.notes.len(), notes.len() + 1, "carried {carried}: every public note is placed");
+            let reads = chain.lock().unwrap().block_reads;
+            match carried {
+                true => assert_eq!(reads, 0, "the headers carried the transactions: no block was read"),
+                false => assert_eq!(reads, notes.len(), "an older node: one read per block with a transaction"),
+            }
+            assert!(store.pending_public_notes.is_empty(), "nothing left pending after a finished scan");
+        }
+    }
+
+    /// Issue #117: a first sync stopped part-way — here the leaf page after the block walk fails
+    /// — keeps the walk's progress: the cursor is past the blocks it read and their notes are
+    /// pending in the store, so the next scan places them without reading a block again, and
+    /// the wallet ends with exactly the notes it would have had in one go.
+    #[tokio::test]
+    async fn an_interrupted_first_sync_resumes_from_the_walks_last_page() {
+        let me = Wallet::from_spend_key(SpendKey([58; 8]));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        let (txs, notes) = public_notes_for(&me);
+        {
+            let mut c = chain.lock().unwrap();
+            for (tx, note) in txs.into_iter().zip(notes.iter()) {
+                c.commit(vec![tx], vec![(note.commitment(), garbage())]);
+            }
+            c.fund(&me, 5, 0);
+            c.fail = Some("rand_getCommitments");
+            c.fail_code = -32005;
+        }
+        let rpc = serve(&chain).await.with_rate_limit_wait(Duration::from_millis(1));
+        let mut store = NoteStore::default();
+        let err = scan(&rpc, &me, &mut store).await.unwrap_err();
+        assert!(err.to_string().contains("injected failure"), "{err}");
+        let head = chain.lock().unwrap().head();
+        assert_eq!(store.scanned_attest_height, head + 1, "the walk's cursor is past every block it read");
+        assert_eq!(store.pending_public_notes.len(), notes.len(), "and what it found is kept for the next scan");
+        assert!(store.notes.is_empty(), "nothing placed yet");
+        // The store as a caller saves and reloads it (`rand balance` saves whether or not the
+        // scan finished).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.notes.json");
+        store.save(&path).unwrap();
+        let mut store = NoteStore::load(&path);
+        assert_eq!(store.pending_public_notes.len(), notes.len(), "pending notes survive the file");
+        let reads_before = chain.lock().unwrap().block_reads;
+        chain.lock().unwrap().fail = None;
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(chain.lock().unwrap().block_reads, reads_before, "the second scan read no block again");
+        assert_eq!(store.notes.len(), notes.len() + 1, "every note placed");
+        assert!(store.pending_public_notes.is_empty());
+        assert!(store.tree.path(0).is_some(), "with its witness");
     }
 
     /// A store scanned against one chain is a cache of that chain alone. Carried to a node on

@@ -299,6 +299,22 @@ pub struct RpcClient {
     /// client and everything cloned from it (the `Arc` is shared, like `legacy_status` above),
     /// not one per bundle a wallet builds.
     envelope_format: std::sync::Arc<tokio::sync::OnceCell<Option<u32>>>,
+    /// The first wait after a rate-limit refusal (issue #117); doubled per retry up to
+    /// [`RATE_LIMIT_RETRIES`] retries. A second in production; tests shorten it.
+    rate_limit_wait: Duration,
+}
+
+/// How many times a call refused for rate limiting is retried, with waits of `rate_limit_wait`
+/// × 1, 2, 4, 8, 16: about 31 s in all at the production base. A first sync used to make several
+/// hundred calls in one burst and give up at the first `-32005` with nothing saved, so every
+/// retry started from zero (issue #117).
+pub const RATE_LIMIT_RETRIES: u32 = 5;
+
+/// Whether `code`/`message` is a proxy's or a node's "slow down": the sale proxy's `-32005`, HTTP
+/// 429's usual text, and the node's own `-32000` refusals that say so ("rate limited", "busy").
+pub fn is_rate_limited(code: i64, message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    code == -32005 || m.contains("rate limit") || m.contains("slow down") || m.contains("too many requests") || (code == -32000 && m.contains("busy"))
 }
 
 #[derive(Clone, Debug)]
@@ -372,7 +388,14 @@ impl RpcClient {
             http: reqwest::Client::builder().timeout(READ_TIMEOUT).build().expect("client"),
             legacy_status: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             envelope_format: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            rate_limit_wait: Duration::from_secs(1),
         }
+    }
+
+    /// This client with another first rate-limit wait (tests: milliseconds instead of a second).
+    pub fn with_rate_limit_wait(mut self, wait: Duration) -> RpcClient {
+        self.rate_limit_wait = wait;
+        self
     }
 
     pub fn url(&self) -> &str {
@@ -385,6 +408,26 @@ impl RpcClient {
     /// big enough to be an upload gets [`upload_timeout`] on the request itself, which overrides the
     /// client's read timeout, and names both numbers if it does fire.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let mut wait = self.rate_limit_wait;
+        for retry in 0..=RATE_LIMIT_RETRIES {
+            match self.call_once(method, params.clone()).await {
+                Err(e) if retry < RATE_LIMIT_RETRIES && e.downcast_ref::<RpcError>().is_some_and(|r| is_rate_limited(r.code, &r.message)) => {
+                    // A refusal to slow down is not a failure of the call (issue #117): wait and
+                    // ask again, longer each time, and say so once so a long first sync is not
+                    // mistaken for a hang.
+                    if retry == 0 {
+                        eprintln!("{method}: the node asked this wallet to slow down; waiting and retrying");
+                    }
+                    tokio::time::sleep(wait).await;
+                    wait *= 2;
+                }
+                r => return r,
+            }
+        }
+        unreachable!("the loop returns on its last iteration")
+    }
+
+    async fn call_once(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
         let raw = serde_json::to_vec(&body).context("encoding rpc request")?;
         let bytes = raw.len();
@@ -1192,6 +1235,40 @@ mod tests {
 
     /// An error reply keeps its code, so a caller can tell "this node has no such method" (an older
     /// node) from every other failure, and the message still reads as it always did.
+    /// Issue #117: a "slow down" from the proxy (`-32005`) or the node (`-32000` rate limited /
+    /// busy) is waited out and the call retried, with the wait doubling; any other error, and a
+    /// refusal that outlasts every retry, is the caller's as before.
+    #[tokio::test]
+    async fn a_rate_limited_call_waits_and_retries_and_gives_up_after_the_last_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let url = test_rpc::rpc_fn(move |method, _| {
+            let n = h.fetch_add(1, Ordering::SeqCst);
+            match method {
+                "rand_chainId" if n < 2 => test_rpc::Reply::Err(-32005, "rate limit: slow down"),
+                "rand_chainId" => test_rpc::Reply::Ok(json!(7)),
+                "rand_getHead" => test_rpc::Reply::Err(-32000, "this node's RPC is busy; retry shortly"),
+                _ => test_rpc::Reply::Err(-32602, "bad params"),
+            }
+        })
+        .await;
+        let rpc = RpcClient::new(url).with_rate_limit_wait(Duration::from_millis(2));
+        assert_eq!(rpc.chain_id().await.unwrap(), 7, "two refusals, then served");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        // A refusal that never lifts is reported after the last retry, as the refusal it was.
+        hits.store(0, Ordering::SeqCst);
+        let e = rpc.call("rand_getHead", json!([])).await.unwrap_err();
+        assert!(e.downcast_ref::<RpcError>().is_some_and(|r| r.code == -32000 && r.message.contains("busy")), "{e}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1 + RATE_LIMIT_RETRIES as usize);
+        // Not a rate limit: no retry.
+        hits.store(0, Ordering::SeqCst);
+        assert!(rpc.call("rand_other", json!([])).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(is_rate_limited(-32005, "anything") && is_rate_limited(-32000, "rate limited: this node serves 120") && is_rate_limited(0, "Too Many Requests"));
+        assert!(!is_rate_limited(-32000, "rejected: fee too low") && !is_rate_limited(-32010, "pruned"));
+    }
+
     #[tokio::test]
     async fn an_rpc_error_keeps_its_code() {
         use test_rpc::{scripted_rpc, Reply};
