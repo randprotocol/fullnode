@@ -5,8 +5,18 @@ set one up. Every number has a source: this repo's docs and `deploy/`, the circu
 command run for this page on 2026-09-19 (local date). Numbers nobody has measured yet are marked
 "not measured yet", with the current bound beside them.
 
-The testnet runs chain 13 (genesis `8123ccac…`, pinned build `86af6eb`, live since 2026-09-19) on
-16 DigitalOcean droplets and node A (`deploy/README.md`).
+The testnet runs **chain 18** (genesis `a7cb020c…4da76`, build v0.6.7 `86941a1`, live since
+2026-09-29 04:56 UTC) on 26 DigitalOcean validators; a quorum is 18 of 26. Twenty-four run
+`--prune-history 24h`; two (obs1 and rand-archive-2) keep every block. Its caps: 4 MiB per proof,
+20 MiB per block; every note envelope is 1 860 bytes; calls and bundles declare a gas limit
+(`docs/deploy.md`, "The network today"; `docs/fees.md`).
+
+**Most measurements below were taken on chains 12 and 13 (2026-09-18/19) and are kept with their
+dates; they have not been re-measured on chain 18** (updated 2026-09-30, audit v6 DOC-6). What
+changed since, where a row depends on it: a transfer now carries two proofs (the tier-14 bundle
+proof and a tier-10 auth proof, since chain 17); a call above tier 14 is refused by every node
+since v0.5.6 (`MAX_CALL_TIER`), so the tier-16 call measured on chain 13 is not admissible on
+chain 18; validators prune, so the disk rows describe an archive.
 
 ## 1. What each role does
 
@@ -40,8 +50,10 @@ on an aggregation chain, in aggregators.
 | RAM, resident | 650.5 MiB: node A, chain 12, production profile, height about 86 425, macOS | `ps -o rss`, 2026-09-19 |
 | RAM, resident, fresh test chain | 65.9 MiB idle; 312.8 MiB after verifying one deploy | `ps -o rss` on a local one-validator chain, test profile |
 | disk | 10 GB at height 62 276; 14 GB at height about 86 425 (node A, chain 12) | `deploy/README.md` (v0.3 update, step 4); `du -sh`, 2026-09-19 |
-| disk, full blocks | about 170 GB per day if every block were full (4 MiB per block) | `docs/block-space.md` |
-| startup | about 4 minutes: the quick chain verification took 239 s at 59 183 blocks before the RPC opened | `deploy/README.md` (v0.3 update, step 2) |
+| disk, full blocks | about 170 GB per day if every block were full (4 MiB per block, chains ≤ 12; chain 18's block cap is 20 MiB) | `docs/block-space.md` |
+| disk, pruning validator | block tables 3.3–4.4 GB with one day kept (≤ 65.5k blocks), where they were 19 GB unpruned: chain 14, 18 validators, 2026-09-25. Not re-measured with chain 18's 26-signature certificates | `AGENTS.md`, "v0.5.7" |
+| disk, idle growth, archive | about 60 KB a block (the certificate inside the header), ≈ 3.6 GB/day at 1.4 s blocks: chain 14, 18 validators. Not re-measured on chain 18 | `AGENTS.md`, "v0.5.5" |
+| startup | about 4 minutes: the quick chain verification took 239 s at 59 183 blocks before the RPC opened (chain 12, unpruned). A pruned node's startup check is structural, not a replay | `deploy/README.md` (v0.3 update, step 2); `AGENTS.md`, "v0.5.7" |
 | bundle verify | 838 ms cold, about 16 ms warm | `docs/superpowers/specs/2026-09-15-block-aggregation.md` §1 |
 | call verify | about 233 ms first (uncached) verify at tier 10, production profile (constraint set 5) | `docs/confidential.md` |
 | network | TCP 30303 inbound on public nodes | `docs/deploy.md` |
@@ -51,11 +63,17 @@ data dir grew by about 4 GB. Plan disk from the chain's age and load, not from t
 
 ### 2.2 DigitalOcean sizes in use
 
-| size | nodes | status |
+The size table was read on 2026-09-19, when the fleet was 16 droplets and a laptop on chain 13. The
+fleet on chain 18 is 26 validators: the 18 nodes of `deploy/nodes.env` (`NODE_A` … `NODE_MEM1`; A
+moved from the laptop to a droplet on 2026-09-27), the two archives (obs1 and rand-archive-2) and
+the six guardian hosts. The sizes of the nodes added since 2026-09-19 are not recorded in this
+repository, and whether mkc1 and mem1 were resized is not recorded here either.
+
+| size | nodes | status (as read 2026-09-19, chain 13) |
 |---|---|---|
-| `s-1vcpu-2gb` | ams3, nyc1, nyc2, sfo2 (validators) | running chain 13 |
-| `s-2vcpu-2gb` | part of the rest of the fleet (the per-node sizes are not recorded in `deploy/`) | running chain 13 |
-| `s5-1vcpu-2gb-30gb` | mkc1, mem1 (validators) | running chain 13. Their 29 GB disks were full at the chain-13 cut-over; the dead chain-11 data dirs (7 GB) were deleted, leaving 7 GB free. **They need a resize.** |
+| `s-1vcpu-2gb` | ams3, nyc1, nyc2, sfo2 (validators) | running |
+| `s-2vcpu-2gb` | part of the rest of the fleet (the per-node sizes are not recorded in `deploy/`) | running |
+| `s5-1vcpu-2gb-30gb` | mkc1, mem1 (validators) | running. Their 29 GB disks were full at the chain-13 cut-over; the dead chain-11 data dirs (7 GB) were deleted, leaving 7 GB free. **They need a resize.** |
 | 4 vCPU, 8 GB | E (validator, explorer, build host) | builds the Linux binaries: 4 min 17 s for `4504a03` |
 
 Sources: `deploy/nodes.env`, `deploy/README.md`.
@@ -64,7 +82,10 @@ Rules that follow from these numbers:
 
 - **2 GB of RAM runs a validator** on this chain today. The fleet's `s-1vcpu-2gb` droplets do it.
 - **Disk, not RAM, is the limit.** Keep at least 20 GB free for builds (`docs/block-space.md` §5)
-  and delete a retired chain's data dir after a cut-over.
+  and delete a retired chain's data dir after a cut-over (`deploy/retire-chain-dirs.sh`). A
+  validator runs `--prune-history 24h`; a node refuses to start under 1 GB free and
+  `rand_getHealth` answers `disk_low` under 4 GB (`docs/deploy.md`, "Disk guard"). Chain 14
+  stalled on full 48 GB disks on 2026-09-24.
 - **Do not build on a 2 GB droplet.** Build once on the 8 GB build host and copy the binaries
   (`deploy/update-droplet.sh`, `deploy/cutover-droplet.sh`). Copying 36 MB per node from a laptop
   uplink takes minutes each; droplet-to-droplet takes under a minute for all 15.
@@ -152,16 +173,19 @@ proposing at the next epoch boundary without a restart.
 | task | command | source |
 |---|---|---|
 | same-chain binary update | `deploy/update-droplet.sh <ip>`, one droplet at a time; wait for `rand_getHealth` = `ok` before the next | `deploy/README.md` |
-| cut over to a new chain | `deploy/cutover-droplet.sh <ip> <old-prefix> <new-prefix> <genesis-file>` | `deploy/README.md` |
+| cut over to a new chain | a per-chain fleet script (chain 18: `deploy/cutover-fleet-chain18.sh`, all-stop/all-start), under the rules of `docs/deploy.md`, "Cut policy" | `docs/deploy.md` |
 | verify the stored chain | `rand-node verify --datadir <dir> --mode full` (stop the service first) | `docs/deploy.md` |
-| laptop validator behind NAT | `deploy/run-a.sh` | `deploy/run-a.sh` |
+| laptop validator behind NAT | `deploy/run-a.sh` — retired 2026-09-27: validator A runs on a droplet and the script refuses to start a second copy of its key | `deploy/run-a.sh` |
 
 Keep `--block-interval-ms` at 1000 or slower. A bundle proof takes about 100 s and its anchor is
 valid for 256 blocks (`docs/cli.md`).
 
 ## 3. Wallet
 
-A wallet proves locally. Its hardware sets how fast a user can send or call.
+A wallet proves locally. Its hardware sets how fast a user can send or call. On chain 17 and 18 a
+send makes two proofs: the bundle proof (guest v3, tier 14; 102 s locally on the laptop, test
+profile) and the auth proof (tier 10; 6.4–7.4 s), about 1.49 MB + 1.36 MB at the production
+profile (`AGENTS.md`, "v0.6.3", measured 2026-09-29). The table below predates that.
 
 | proof | tier | time | peak memory |
 |---|---|---|---|

@@ -3,6 +3,160 @@
 Every tagged release of the RAND full node, newest first. The client-facing RPC changes are also
 logged, method by method, in [`docs/rpc.md`](docs/rpc.md#changelog).
 
+From v0.5 on, each entry is a short summary: the date is the tag's, in UTC; "hard fork" means the
+release runs only on a new chain, "node-only" that it rolled onto the live chain. The full record
+of each release (the measured suite, the roll, the traps) is its entry in `AGENTS.md`. This file
+stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written from `AGENTS.md`,
+`git tag` and the GitHub release list (audit v6, DOC-6). There is no tag v0.5.2, v0.5.3 or v0.6.5.
+"Assets" says what the GitHub release carries, as read on 2026-09-30.
+
+## v0.6.7 — 2026-09-29 (chain 18)
+
+Tag `86941a1`. Node-only: fixes on the chain-18 build that change no consensus rule, wire format,
+verifier key or shipped program digest; rolled onto chain 18 one node at a time. The sealed-proof
+pruning pass keeps a height index of seal marks (#51, dormant: no chain aggregates); a wallet takes
+the note-envelope format from the chain id, not from a node's claim (#64); the viewing-key
+registry is keyed by a one-way id (#65); circuits `aeacf31` (#49 GPU kernels without aliasing
+`&mut`, #63 the rVM DSL allocator, #66 ALU test coverage). **Tagged before its full workspace suite
+finished**, on the operator's instruction; no result of that full suite is recorded. Assets:
+`rand-node`, `rand`, `rand-prover`, `SHA256SUMS`.
+
+## v0.6.7-rc1 — 2026-09-29 (chain 18's cut build)
+
+Tag `0017de7`, a pre-release. Hard fork: v0.6.6's content (gas, constraint set 8) rebased onto
+v0.6.4 (split authorisation). The build chain 18 was cut with: genesis
+`a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76`, live 2026-09-29 04:56 UTC, the
+first gas-metered chain and the first with the encrypted memo on (`envelope_bytes: 1860`). Refuses
+chains 14 to 17. Assets: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`.
+
+## v0.6.6 — 2026-09-29 (no chain)
+
+Tag `d742a9b`. Hard fork, never cut as tagged: the gas model (Phase 0's header-priced call floor as
+node policy; Phase 1's in-circuit meter, `pv::GAS`, the genesis `gas` section and the pinned
+bundle gas limit 20 479; Phase 2's dynamic gas and byte prices) on constraint set 8, and the
+chain-18 cut scripts. Its content reached a chain as v0.6.7-rc1. The tag has no GitHub release.
+
+## v0.6.4 — 2026-09-29 (chain 17)
+
+Tag `b388540`. The launch record of chain 17 (genesis
+`d1afefc3dd68f73e3799aa0803b692d0e6a5c7c27d228bdeb3d06cdf4027e7ff`, live 2026-09-29 03:03 UTC,
+replaced by chain 18 at 04:56 UTC): the committed genesis file, its pin test and the `AGENTS.md`
+entry. The code is v0.6.3's. Assets: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`.
+
+## v0.6.3 — 2026-09-29 (chain 17)
+
+Tag `d4fd0a3`. Hard fork: delegated proving, phase 2 — split authorisation. A `Bundle` gains
+`auth_commit` and `auth_proof` on the wire and the transaction id domain becomes `rand-txid-3`; the
+bundle proof no longer takes the spend key (bundle guest v3 plus the auth guest, genesis `hc_auth`),
+so a paired prover holding only a viewing key can prove; an optional prover fee. Refuses chains 14
+to 16. Assets: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`.
+
+## v0.6.2 — 2026-09-28 (chain 16)
+
+Tag `98d1ff6`. Node-only and opt-in: delegated proving, phase 1 — the `randprotocol-prover` crate,
+the `rand-prover` binary, `rand-node run --prover`, and the wallet's `--prover`. A phase-1 prover
+receives the spend key, so delegating is handing over custody. One change every node gets: SIGTERM
+is handled like ctrl-c. Assets: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`.
+
+## v0.6.1 — 2026-09-28 (chain 16)
+
+Tag `2c75e08`. Hard fork: constraint set 7 (circuits `b9ffc39`) — every LogUp terminal blinded,
+every declared table floored at 2^7 rows, 32-bit range checks on input, public and salt words, the
+`POSEIDON2_LEN` syscall, the JALR fix, verifier keys salted from `key_derivation_v2`. Every
+verifier key changed. Chain 16 (genesis
+`20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005`, live 2026-09-28 16:39 UTC) was
+cut with `--hardening-v6 --bundle-guest v2`. Refuses chains 14 and 15. Assets: `rand-node`, `rand`,
+`SHA256SUMS`.
+
+## v0.6 — 2026-09-27 (chain 15)
+
+Tag `12a56d1`. Same chain, but rolled all-stop/all-start, not one node at a time: `Machine::verify`
+refuses a non-zero commit-phase proof-of-work word unconditionally, so a mixed fleet could
+disagree on a rewritten proof. The zkVM, rVM and aggregation fixes of the 27–28 September reviews:
+the prover floors private tables at 2^7 rows and nodes refuse to pool a call proof below it; the
+branch-free bundle guest v2 and the `hardening_v6` switch, both for the next cut; the bundle key in
+its own `Machine`; the dormant rVM and aggregation-interface fixes. Assets: `rand-node`, `rand`,
+`SHA256SUMS`.
+
+## v0.5.11 — 2026-09-27 (no chain)
+
+Tag `cc65c5e`. Genesis-gated, active on no chain: timelocked genesis vesting for team, investor
+and partner allocations (a public vesting register, actions 24 to 27, state root domain
+`rand-state-6`). Without a `vesting` genesis section the four actions are refused at admission.
+The cluster and wallet-flow suites were not run for this tag. Assets: none.
+
+## v0.5.10 — 2026-09-27 (chain 15)
+
+Tag `0c0f4db`. Node-only on chain 15: address sharing — the 80-bit address fingerprint, `randpay:`
+links and QR codes — and the encrypted memo (genesis `envelope_bytes: 1860`, first set by chain
+18). CLI changes: token amounts are display units, `rand address` prints only the address on
+stdout, `rand send` confirms first. Assets: `rand-node`, `rand`, `SHA256SUMS`.
+
+## v0.5.9 — 2026-09-27 (chain 15)
+
+Tag `8abf85e`. Node-only, rolled one node at a time: the fixes of the 2026-09-27 rescan. A faucet
+mint is admitted only from a genesis validator (LEDGER-1; the validity rule is genesis
+`staking.faucet_minters`, set from chain 16); sync back-off and peer ranking (CN-1); meters that
+survive a reconnect and a node-wide `Blocks` budget (CN-2); consensus gossip prechecked before it
+is forwarded (CN-4); a signed `NotHeld` view (CN-3); `bridge.min_inbound_sequence` (C15-1); the
+wallet resumes at a pruning node's floor (RS-1). Assets: `rand-node`, `rand`, `SHA256SUMS`.
+
+## v0.5.8 — 2026-09-26 (chain 15)
+
+Tag `b933724`. Node-only: the fixes of the ten-reviewer pre-release scan — the orphan pool bounded
+(SW-1), a `Status` read only from its propagation source (SYNC-1), one vote per (view, voter)
+within a view window (CONS-1), wallet defences against a lying node (WAL-1, WAL-2, WAL-3), RPC
+blocking reads capped, deploy scripts that ship `git archive HEAD` only. The fleet took it through
+the chain-15 cut (genesis `cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8`, live
+2026-09-26 13:05 UTC, build `dd2ccbe`). Assets: `rand-node`, `rand`, `SHA256SUMS`.
+
+## v0.5.7 — 2026-09-25 (chain 14)
+
+Tag `089bdd6`. Same chain, rolled all-stop/all-start: `Status` gains `floor`, and a v0.5.7 node
+cannot decode a v0.5.6 `Status`. History pruning: `rand-node run --prune-history <n>m|h|d` keeps
+that much history and prunes the rest; a node without the flag is an archive; RPC error `-32010`
+answers a height below the floor. The database is forward-only for a pruned data directory.
+Assets: `rand-node`, `rand` (no `SHA256SUMS`).
+
+## v0.5.6 — 2026-09-24 (chain 14)
+
+Tag `a2d4021`. Same chain, rolled all-stop/all-start: DS-3 is a validity rule (a call proof's
+header is pinned before a key is built: tier at most 14, keccak at most 2^12, sha256 at most
+2^13). The rest of the deep security-and-math scan (DS-1 to DS-9): a pruned record is
+length-checked, connection limits on the swarm, the equivocation record outlives eviction, the
+2^63 note bound. Assets: `rand-node-v056`, `rand-v056` (no `SHA256SUMS`).
+
+## v0.5.5 — 2026-09-24 (chain 14)
+
+Tag `0154fe2`. Same chain, rolled to all 18 validators at once. The audit-v5 fixes and the recovery
+from the chain-14 stall: a committed block's QC is stored once (a node rolled back below v0.5.5
+needs a resync); the lock is released only on a not-held quorum; certified blocks above the head
+are durable; three recovery rules for a QC on a block no replica holds; `tokens.burn_registration_fee`
+(genesis-gated). Assets: none.
+
+## v0.5.4 — 2026-09-24 (chain 14)
+
+Tag `d0778d8`. The audit-v4 fixes, in three classes. Node-only: a disk guard, a bound on sibling
+proposals, the ghost-QC memory, the 256 MB write-ahead-log cap. Wire-coordinated: signed `NotHeld`
+attestations. Genesis-gated, for the next cut: the `staking` section, `consensus_domain: 1`, bridge
+`rules_v2` with rolling mint caps, `tokens.max_tokens`. Assets: none.
+
+## v0.5.1 — 2026-09-20 (chain 14)
+
+Tag `9c142c1`. Node-to-node only, rolled one validator at a time: the audit-v3 consensus fixes —
+sync commits only through the three-chain rule, the lock survives a restart and a sync,
+conflicting finality stops the node. Assets: none.
+
+## v0.5 — 2026-09-20 (chain 14)
+
+Tag `b143cb9` (fleet build `b3c594c`). Hard fork: chain 14, genesis
+`1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff`, on eighteen fresh validator
+keys generated off-repo. RPL tokens (a ledger-level registry of shielded native assets), one
+4-in/4-out hidden-asset bundle for every transfer, every bundle proof bound to its transaction,
+a mint's commitment opening checked (POOL-1), and the hardened bridge for zUSD: per-backing mint
+caps, a pause key, a forward bound on block timestamps, a post-quantum co-signature quorum.
+Every `u64` RPC amount became a decimal string. Assets: none.
+
 ## v0.4 — 2026-09-19 (chain 13)
 
 | | |

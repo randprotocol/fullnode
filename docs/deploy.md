@@ -1,5 +1,29 @@
 # Deployment
 
+## The network today: chain 18 (read 2026-09-30)
+
+This page is a log as well as a manual: the roll notes and "the next cut" sections below are dated
+and describe the chain they were written for (14 to 17). What runs now, from
+`deploy/genesis-chain18.json` and `AGENTS.md`'s "Chain 18" and "v0.6.7" entries:
+
+| | |
+|---|---|
+| chain | id **18**, genesis `a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76`, live since 2026-09-29 04:56 UTC |
+| build | v0.6.7 `86941a1` (cut on v0.6.7-rc1 `0017de7`; v0.6.7 rolled node by node) |
+| validators | 26 at genesis, 1 000 RAND each; a quorum is strictly more than two thirds of the stake, so **18 of 26**, and the chain commits with up to 8 down |
+| history | 24 validators run `--prune-history 24h`; two keep every block: obs1 (`ARCHIVE` in `deploy/nodes.env`) and rand-archive-2 (`ARCHIVE2`) |
+| caps | `max_proof_bytes` 4 194 304 (4 MiB), `max_block_bytes` 20 971 520 (20 MiB), `max_program_words` 65 535, `max_call_envelope_bytes` 65 536 |
+| guests | `hc_bundle` = bundle guest v3, `hc_auth` = the auth guest (split authorisation, since chain 17); `hardening_v6`; `consensus_domain` 1 |
+| gas | `gas_price` 100, `byte_price` 800, `bundle_gas_limit` 20 479, `metering: "circuit"`, `dynamic` {`target_block_bytes` 10 485 760, `target_block_gas` 262 144, `adjust_bps` 1 250, floors 100 / 800} |
+| note envelopes | `envelope_bytes: 1860` — every note envelope is exactly 1 860 bytes and carries the encrypted memo field |
+| faucet | on, for an allow-list: 16 `faucet_recipients`, 18 `faucet_minters`, 10 000 RAND per 1 000-block epoch |
+| bridge | guardian set 1, rules v2: 100 000 zUSD per backing and 4 000 zUSD across all backings per rolling 24 h |
+| aggregation | off: no genesis carries the section and the node refuses one |
+
+All 26 validator keys are one operator's ("Key separation", below). The release rule and how far
+it has been followed are under "Rolling out a new commit"; the rules for the next cut are under
+"Cut policy".
+
 ## Topology rules
 
 - A chain is defined by its genesis file. Every node needs the identical file; validators are the keys
@@ -12,7 +36,7 @@
   against the clock on the machine that will actually launch the fleet, not the one that cut the
   file.
 - More than 2/3 of stake must be online to commit. With equal stakes: 2 validators tolerate none down,
-  4 tolerate one, 7 tolerate two.
+  4 tolerate one, 7 tolerate two, 26 tolerate eight (chain 18's quorum is 18).
 - Nodes behind NAT dial out to nodes with public addresses (`--bootstrap`). On one LAN, mDNS finds
   peers without configuration. Open TCP 30303 inbound on public nodes.
 - Bind RPC to `127.0.0.1` unless it is firewalled; it accepts transactions from anyone who can reach it.
@@ -20,7 +44,7 @@
   connections, 64 inbound handshakes in flight and 2 connections per remote peer
   (`network::WireLimits`); the next inbound connection is refused at the handshake and the dialer
   sees a `ConnectionDenied`. A node's own dials — its bootstraps and redials — are never counted
-  against its own caps, so a validator always reaches the peers it dials, and 18 validators plus
+  against its own caps, so a validator always reaches the peers it dials, and 26 validators plus
   every explorer and observer sit far under 256; the cap is a bound on what one host can be made
   to hold, since a fresh libp2p identity costs nothing to mint. The node's peer map is held to
   the same bound: a new connection evicts the entries that are not connected before it is
@@ -30,18 +54,19 @@
 - **History pruning (testnet only).** `--prune-history <n>m|<n>h|<n>d`, at least `1h` (`24h`
   keeps the ledger and one day of blocks); the rest is deleted every 16 blocks
   (`docs/superpowers/specs/2026-09-24-history-pruning-design.md`).
-  Exactly one node keeps everything — the archive, `ARCHIVE` in `deploy/nodes.env` (obs1 on
-  randbridge-web, data dir on a volume) — and a node that falls more than a day behind must sync
-  from it. **Mainnet units never pass the flag.** A pruned node that fails its startup check does
+  Two nodes keep everything — the archives, `ARCHIVE` in `deploy/nodes.env` (obs1 on
+  randbridge-web, data dir on a volume) and, since 2026-09-27, `ARCHIVE2` (rand-archive-2, fra1,
+  a 250 GiB volume) — and a node that falls more than a day behind must sync from one of them. **Mainnet units never pass the flag.** A pruned node that fails its startup check does
   not repair itself: re-sync it from the archive. **Rollback:** a pruned data directory opened by
   a build ≤ v0.5.6 with the default `--verify-chain quick` replays from genesis, finds block 1
   missing and truncates the whole ledger to genesis; run an older build on a pruned data
   directory only with `--verify-chain off`, or re-sync from the archive.
 - **The one public RPC endpoint is `https://rpc.randprotocol.org`** — Cloudflare → the web
-  droplet's nginx → the sale service's filtered, per-IP-metered proxy → randscan's `/rpc` route on
-  E → E's `127.0.0.1:8545` (`deploy/caddy/README.md` has the chain; F's Caddy is not in it and does
-  not run). Every droplet keeps its node's RPC loopback-only. E's viewing-key slots are safe because
-  the proxy's allowlist never forwards `rand_importViewingKey`.
+  droplet's nginx → the sale service's filtered, per-IP-metered proxy → an SSH tunnel to obs1 →
+  obs1's `127.0.0.1:8545`, the archive (since 2026-09-27; before that randscan's `/rpc` route on E.
+  `deploy/caddy/README.md` has the chain; F's Caddy is not in it and does not run). Every droplet
+  keeps its node's RPC loopback-only. The proxy's allowlist never forwards
+  `rand_importViewingKey`.
 - **A delegated prover is never on the public RPC path.** An operator node started with
   `rand-node run --prover <ADDR>` (or a separate `rand-prover run`) listens on its own address,
   and holds the sending wallet's viewing key — its whole history — while it proves (never a spend
@@ -81,10 +106,25 @@ rand-node verify --datadir /root/data-<letter>-<genesis8> --mode full   # stop t
 
 1. `cargo test` locally, commit, push.
 2. Restart local validators from the new binary (`cargo build --release`, point `run-a.sh`'s `BINDIR` at it, then `launchctl kill TERM gui/$(id -u)/org.randprotocol.node-a` — launchd restarts A from the script).
-**Release rule (audit v4 PROC-3).** A version tag is made only from a commit whose CI run
-(`.github/workflows/ci.yml`) is green and whose full `cargo test --workspace --release` passed on
-the release machine, `the_genesis_hash_is_pinned` included; the tag annotation names the run. A
+**Release rule (audit v4 PROC-3).** The rule: a version tag is made only from a commit whose CI
+run (`.github/workflows/ci.yml`) is green and whose full `cargo test --workspace --release` passed
+on the release machine, `the_genesis_hash_is_pinned` included; the tag annotation names the run. A
 known-failing test is a reason not to tag, never a note to tag over.
+
+**The record (audit v6, 2026-09-30): the rule was written and not followed.** By the audit's count
+CI was red at the tagged commit for 10 of the 12 tags since v0.5.8 — eight died at the checkout of
+the pinned circuits commit, v0.6.3 on the write-ahead-log test, v0.6.4 on a guest-provenance test
+that lagged chain 17's genesis — no tag annotation names a run, no nightly run has been green, and
+v0.6.7 was tagged before its full suite finished, on instruction (`AGENTS.md`, "v0.6.7"). Until
+2026-09-30 this paragraph stated the rule as if it were the practice.
+
+**The mechanism (from 2026-09-30).** `.github/workflows/release.yml` runs on a pushed `v*` tag. It
+refuses to build unless the `ci` workflow's latest run for the tagged commit concluded `success`,
+or the tag's annotation carries a line `ci-override: <who> <why>` — an exception that is copied
+into the release notes, not a default. It then builds the three binaries on a clean runner and
+publishes them with `SHA256SUMS` and a build attestation; the release notes name the CI run. Fleet
+binaries come from that release, not from a hand build ("Release trust", below). The workflow has
+not yet produced a release: the first tag after 2026-09-30 is its first run.
 
 3. `deploy/rebuild-vps.sh <ip>` per server, staggered so that more than 2/3 of stake stays up. A
    restart costs a node a few seconds; it resumes from its persisted head, verifies the chain, and

@@ -1,4 +1,19 @@
-# Testnet: chain id 14 (RPL tokens, zUSD and the hardened bridge, v0.5)
+# Testnet deploy notes (live chain: 18; this page is mostly the chain 8–14 record)
+
+> **Read this first (2026-09-30, audit v6 DOC-6).** This page was written for chains 8 to 14 and
+> its body is kept as the dated record of those cuts. **The live chain is 18**: genesis
+> `a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76` (`deploy/genesis-chain18.json`),
+> live since 2026-09-29 04:56 UTC, build v0.6.7 `86941a1`, 26 validators (quorum 18), 24-hour
+> pruning on the validators with two archives (obs1, rand-archive-2), 4 MiB proofs and 20 MiB
+> blocks, a `gas` section, and 1 860-byte note envelopes with the encrypted memo. It was cut by
+> `deploy/cut-chain18-genesis.sh` and rolled by `deploy/cutover-fleet-chain18.sh`; the bridge steps
+> are `deploy/chain18-bridge-steps.md`. The current facts table is `docs/deploy.md`, "The network
+> today"; the launch records of chains 15 to 18 are in `AGENTS.md`. The per-node scripts named
+> below (`cutover-droplet.sh`, `cutover-droplet-chain14.sh`, `cutover-droplet-rand.sh`) are history:
+> a cut since chain 15 is a fleet script, under `docs/deploy.md`, "Cut policy". Keys on a droplet
+> live in `/root/keys/node-<name>.key.json`, as the first note below says.
+
+## Chain 14 (v0.5: RPL tokens, zUSD and the hardened bridge) — the record
 
 > **No key in this repository is tracked any more** (audit v3, OPS-1). `deploy/node-a..f.key.json`
 > and `deploy/payout/*.key.json` were committed on purpose for chains 8–13 so any machine could
@@ -243,7 +258,8 @@ commands.
 
 **`https://rpc.randprotocol.org`** — served since 2026-09-20 03:04 UTC (within the hour F's Caddy
 hop was written) by the web droplet's own vhost: Cloudflare → web droplet nginx → the sale service's
-filtered proxy → randscan's `/rpc` route on E → E's `127.0.0.1:8545`. F's Caddy is not in the path
+filtered proxy → randscan's `/rpc` route on E → E's `127.0.0.1:8545` (until 2026-09-27; since then
+the proxy's upstream is an SSH tunnel to obs1, the archive). F's Caddy is not in the path
 and does not run; `deploy/caddy/README.md` has the chain and the evidence. Every droplet's node RPC
 stays bound to `127.0.0.1`, per the topology rule in `docs/deploy.md`.
 

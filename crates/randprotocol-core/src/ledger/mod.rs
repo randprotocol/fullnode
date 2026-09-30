@@ -535,7 +535,14 @@ fn has_duplicate(words: &[Word8]) -> bool {
 }
 
 /// In-memory chain state: the note commitment tree, the nullifier set, the validator register
-/// and the deployed programs. Cheap to clone (used for speculative execution).
+/// and the deployed programs. It is cloned for speculative execution (one clone per block in the
+/// consensus tree, and per trial-apply), and a clone is **not** cheap: the tree is a frontier
+/// (constant size), but `commitments` and `nullifiers` are ordinary `BTreeSet`s, so a clone
+/// copies every commitment and nullifier the chain has — O(state). The audit-v6 review measured
+/// 1.6 ms at 100 000 leaves and nullifiers and 28 ms at 1 000 000 (its own private run; not
+/// re-measured here). This comment said "Cheap to clone" until 2026-09-30. A persistent
+/// (structurally shared) set is the fix when state grows; `AGENTS.md`, "Speculative state is
+/// capped".
 #[derive(Clone, Debug)]
 pub struct Ledger {
     chain_id: u64,

@@ -1029,10 +1029,14 @@ M_rotate_pause = b"rand-bridge-pq-rotate-pause-1" ‖ chain_id u64 ‖ rotation_
   in hex), concatenated in the order the new set will have — index `i` of the new set is the PQ
   key of the operator of guardian `i` of the current ECDSA set.
 - `M_rotate_pq` is `46 + 1312 × count` bytes long; `M_rotate_pause` is `45 + 1312 = 1357` bytes.
-  `rand-bridge-gov pq-rotate-pq` / `pq-rotate-pause` (bridge repo) build exactly these from the
-  chain id, the nonce read off `rand_getBridgeState` and the key file(s); the node rebuilds them
-  in `bridge/gov.rs`'s `rotate_pq_message`/`rotate_pause_message` and verifies with the same
-  `verify_pq_message` every other governance quorum goes through.
+  The node rebuilds them in `bridge/gov.rs`'s `rotate_pq_message`/`rotate_pause_message` and
+  verifies with the same `verify_pq_message` every other governance quorum goes through.
+  **No tool builds or signs either message yet** (corrected 2026-09-30, audit v6, BRG-14): this
+  page said `rand-bridge-gov pq-rotate-pq` / `pq-rotate-pause` (bridge repo) do, but
+  `rand-bridge-gov`'s subcommands are `rotate` (the ECDSA set), `verify`, `cosign`, `pq-list`,
+  `pq-register`, `pq-unpause`, `pause`, `pq-public-key` and the submit commands (bridge repo
+  `d9cde20`, `daemons/src/bin/gov.rs`). A post-quantum guardian or pause-key rotation therefore
+  cannot be carried out today without writing that signer first.
 
 Admission order for `RotatePqGuardians`, cheapest first: the `bridge` gate (`Disabled`), the
 `rules_v2` gate (`RulesV2Disabled` — a genesis constant, cached as permanent), the quorum's

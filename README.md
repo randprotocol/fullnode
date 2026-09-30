@@ -301,8 +301,13 @@ Full detail in `docs/architecture.md`.
 
 ## Release history
 
-Every release is tagged on GitHub with Linux binaries and `SHA256SUMS`; `AGENTS.md` has the full
-record of each, with the measured suite and the roll. A release that changes consensus, the wire
+Every release is a git tag, and `CHANGELOG.md` has one entry per tag; `AGENTS.md` has the full
+record of each, with the measured suite and the roll. Not every tag has binaries on GitHub (as
+read on 2026-09-30): v0.5.8 to v0.6.7 carry Linux binaries and `SHA256SUMS`, except v0.5.11 (no
+assets) and v0.6.6 (a tag with no release); v0.5, v0.5.1, v0.5.4 and v0.5.5 have no assets, v0.5.6
+has two differently named binaries and no `SHA256SUMS`, v0.5.7 has the binaries and no
+`SHA256SUMS`. Those binaries were built by hand on one host and are unsigned; from the next tag
+the release is built by `.github/workflows/release.yml` (`docs/deploy.md`, "Release trust"). A release that changes consensus, the wire
 format or a verifier key ships with a new chain; the others roll onto the live chain one node at
 a time.
 

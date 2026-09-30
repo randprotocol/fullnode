@@ -566,7 +566,10 @@ release binaries (sha-checked) with nodes running, stopped together at head 105 
 ~23:39, all 26 healthy on 12a56d1 by 23:46 (block 105 818); public RPC 0.6.0; guardian daemons active. Before it, chain
 15's full history (104 850 blocks) was re-verified with the v0.6 binary (`rand-node verify --mode quick` on a copy of
 rand-archive-2) — no proof carries a non-zero commit-phase PoW word. Rollback: `/root/rand-node.pre-v06` and
-`/root/rand.pre-v06` on every host (= v0.5.10 0c0f4db), all-stop/all-start again. circuits main = 27732e9.
+`/root/rand.pre-v06` on every host (= v0.5.10 0c0f4db), all-stop/all-start again. circuits main = 27732e9 (corrected 2026-09-30, audit v6: true of the
+local checkout that day, not of the published repository — zkp-circuits `origin/main` is `dcb026c`
+and `27732e9` is not an ancestor of it, by the audit's reading; the pins the chains used live on
+branches).
 Final checks on 12a56d1: the full suite on 06e688d (only the recursion-fixture tests, the OOM-bound rVM aggregate
 binary and the since-fixed TEST-1 failed), then core 518, zkvm lib 21, executor 19, verifier_key 2+1, node lib 351
 (21 fixture), genesis_cli 3, client 116, and guest v2's 21 real-proof cheats (HIDDEN_BUNDLE_GUEST=v2) — all green.
@@ -903,7 +906,9 @@ time**; a relayed Status is now ignored (one hop), which an older node's forward
   signed not-helds cached (`NotHeldCache`); a peer answering a live batch with nothing is backed off
   5 s → 120 s; prune cutoff `min(head, now) − keep`; the compaction flag cleared by a drop guard.
   The scan's OPS-4 (`--prune-history` refused on a faucet-off genesis) was written and **reverted
-  before the tag**: chain 15 is a testnet with its faucet off (STAKE-2) and must prune; mainnet is
+  before the tag**: chain 15 is a testnet and must prune (corrected 2026-09-30, audit v6: this
+  said "with its faucet off (STAKE-2)", a plan written before the chain-15 cut — chains 15 to 18
+  all run the faucet, for an allow-list of 16 `faucet_recipients`); mainnet is
   v1.0, and the archive rule stays a docs rule until a genesis carries an explicit network marker.
 - **Deploy:** `deploy/lib/clean-tree.sh` (rebuild/push ship `git archive HEAD`, never `wallets/`);
   `WANT_SHA_WALLET` beside `WANT_SHA` (the `rand` binary is checked too); `deploy/lib/relay-
@@ -1459,10 +1464,13 @@ tail commits via the live path instead), the lock survives restart/sync/fallback
 finality stops the node as `FatalSafety`, and B5's verified-proof cache skips only the STARK
 verify. **B3 — the timeout-certificate pacemaker — is the one open consensus item**: CH-1's
 f+1-NewViews rule was dropped (`has_weak_quorum` is not in the tree), so `on_new_view` still
-advances on one signed NewView bounded by `MAX_VIEW_AHEAD`; that needs a validator key (all 18
-are the operator's) and buys no safety break, only view inflation. Do not patch it
+advances on one signed NewView bounded by `MAX_VIEW_AHEAD`; that needs a validator key and buys
+no safety break, but it is a liveness lever, not only view inflation: **one validator key can
+prevent every commit**, and the key cannot be removed without a cutover. There are 26 validator
+keys on chain 18, all one operator's. (Corrected 2026-09-30, audit v6: this said "all 18 are the
+operator's" and "only view inflation".) Do not patch it
 incrementally; the redesign needs the `av3review/pm.py` model (currently lost — rewrite it) and
-18-validator tests. Residual note: `PersistSafety` is persist-on-vote (`hotstuff.rs`'s
+tests at the fleet's size (26 validators). Residual note: `PersistSafety` is persist-on-vote (`hotstuff.rs`'s
 `try_vote`), so a lock never voted under before a crash is lost — bounded, standard, recorded
 in the re-review.
 
@@ -2033,10 +2041,15 @@ never move them.
   path (`offer_pending`), never on a peer's word (regression test:
   `a_synced_certified_but_uncommitted_chain_is_not_committed`).
 - **The lock is durable.** `resume` restores a persisted `locked_qc` ahead of
-  the head's QC and never lowers one below it; `fallback_high_qc` is the only
-  place the lock is lowered, and only after every fetch for the block failed
-  (regression tests: `a_resumed_validator_keeps_its_lock`,
-  `a_stale_safety_state_never_lowers_the_lock`).
+  the head's QC and never lowers one below it; `record_not_held` is the only
+  place the lock is lowered, and only on signed `NotHeld` attestations from
+  validators holding a quorum of the current set's stake — strictly more than
+  two thirds — each signed at a view above the locked QC's
+  (`hotstuff.rs`; regression tests: `a_resumed_validator_keeps_its_lock`,
+  `a_stale_safety_state_never_lowers_the_lock`). `fallback_high_qc` lowers
+  `high_qc` only and has not touched the lock since v0.5.4. (Corrected
+  2026-09-30, audit v6: this bullet said `fallback_high_qc` was the only
+  release, after every fetch failed — true of v0.5.1, stale since v0.5.4/v0.5.5.)
 - **Conflicting finality is fatal, not a log line.** A three-chain whose
   commit path does not reach the committed head stops the node
   (`Action::SafetyViolation` → `FatalSafety`); startup's `verify_chain`
@@ -2065,8 +2078,9 @@ never move them.
   transactions.
 - Lock promises **are durable across restarts as of v0.5.1** (`resume` restores
   a persisted `locked_qc` ahead of the head's, `extends_locked` withholds the
-  vote and fetches an unknown locked block, only `fallback_high_qc` lowers the
-  lock and only after every fetch failed). Residual, recorded in the 2026-09-22
+  vote and fetches an unknown locked block, only `record_not_held` lowers the
+  lock and only on a signed not-held quorum — corrected 2026-09-30, audit v6:
+  this said `fallback_high_qc`, stale since v0.5.4). Residual, recorded in the 2026-09-22
   re-review: `PersistSafety` is persist-on-vote, so a lock never voted under
   before a crash is lost — bounded by quorum intersection.
 - No CLI prints a wallet's `recipient_hash` (a `rand address --recipient-hash`
@@ -2089,10 +2103,13 @@ never move them.
   would need admission to accept `current ≤ nonce ≤ current + pooled_run` as well, because the
   ledger requires the nonce to equal the current one exactly (`staking.rs`, `aggregation.rs`).
   Returning N+1 alone would be refused at the tip.
-- **The lock is released in exactly one place** (`fallback_high_qc`), after every fetch for that
-  block has failed. To be sound against a Byzantine peer that answers "I do not have it", that
-  should require f+1 failed fetches; it does not yet (audit v3 review, I5 — strictly narrower
-  than the behaviour before the CON-1b fix, not a regression).
+- **The lock is released in exactly one place, `record_not_held`** (`hotstuff.rs`): on signed
+  `NotHeld` attestations for the locked block from validators of the current set holding a quorum
+  — strictly more than two thirds of the stake (v0.5.5; v0.5.4 released on a third) — each signed
+  at a view above the locked QC's and within `NOT_HELD_VIEW_WINDOW` (v0.5.9, CN-3).
+  `fallback_high_qc` lowers only `high_qc`. The audit-v3 I5 item this bullet used to carry (an
+  unsigned "I do not have it" released the lock after the fetches failed) is therefore closed.
+  (Corrected 2026-09-30, audit v6: the bullet named `fallback_high_qc` and called the item open.)
 
 ### Repo workflow traps
 
