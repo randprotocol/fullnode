@@ -1126,7 +1126,7 @@ impl HotStuff {
     fn asked_by(&self, enough: impl Fn(&ValidatorSet, u128) -> bool) -> u64 {
         let mut asks: Vec<(u64, u128)> =
             self.asked.iter().filter_map(|(a, view)| self.current.get(a).map(|v| (*view, v.stake))).collect();
-        asks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        asks.sort_unstable_by_key(|ask| std::cmp::Reverse(ask.0));
         let mut stake = 0u128;
         for (view, s) in asks {
             stake = stake.saturating_add(s);
