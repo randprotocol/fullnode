@@ -1,0 +1,18 @@
+# One SSH tunnel from the web droplet to one prover of the pool: local 127.0.0.1:<instance> ->
+# the prover host's 127.0.0.1:8600. The instance name is the local port; the host comes from
+# /etc/rand-prover-pool/<port>.env (REMOTE=provertunnel@<ip>). The key may open that one port on
+# the prover host and nothing else (install-host.sh writes the restriction); the prover itself
+# stays on loopback, so a validator gains no public listener by becoming a prover.
+[Unit]
+Description=SSH tunnel 127.0.0.1:%i -> a prover.randprotocol.org pool member
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/rand-prover-pool/%i.env
+ExecStart=/usr/bin/ssh -N -i /etc/rand-prover-pool/tunnel_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/rand-prover-pool/known_hosts -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -L 127.0.0.1:%i:127.0.0.1:8600 ${REMOTE}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

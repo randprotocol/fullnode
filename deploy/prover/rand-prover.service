@@ -1,0 +1,65 @@
+# One prover of the prover.randprotocol.org pool, beside a validator's rand-node on the same host.
+# A sibling service, not `rand-node run --prover`: a prover that is killed for memory must not take
+# the validator with it, a chain cut rewrites the rand-node unit and should not have to know about
+# this one, and the pool's shared pairing needs `--per-token`, which the node's flags do not carry.
+#
+# Installed by deploy/prover/install-host.sh, which fills in @THREADS@ (the cores the proof may
+# use: all but one, which stays the validator's) and @MEMORY_MAX@.
+[Unit]
+Description=Rand delegated prover (prover.randprotocol.org pool)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=randprover
+Group=randprover
+# One proof at a time on every core it is given (the `parallel` build, v0.6.7-prover.1: 68.6 s on
+# 8 vCPUs), and one job waiting: a bundle proof has ledger::TIME_WINDOW = 256 blocks (about five
+# minutes) to land, so a longer line would hand wallets proofs too late to use. A prover with its
+# slot and its one waiting place taken answers `busy` and the router tries the next member.
+# --per-token is the whole capacity because every wallet pairs with the same public token.
+Environment=RAYON_NUM_THREADS=@THREADS@
+ExecStart=/usr/local/bin/rand-prover --home /var/lib/randprover run \
+    --listen 127.0.0.1:8600 --max-parallel 1 --max-queue 1 --per-token 2 \
+    --allow-origin chrome-extension://* --allow-origin moz-extension://* \
+    --allow-origin safari-web-extension://* --allow-origin http://localhost:* \
+    --allow-origin http://127.0.0.1:* --allow-origin http://[::1]:* \
+    --allow-origin tauri://localhost --allow-origin http://tauri.localhost
+Restart=always
+RestartSec=5
+# A proof in flight finishes before the stop (docs/prover.md §3.4).
+TimeoutStopSec=180
+
+# The validator comes first: the prover yields the CPU to rand-node and cannot take its memory.
+Nice=10
+CPUWeight=50
+MemoryMax=@MEMORY_MAX@
+MemorySwapMax=0
+
+# The prover reads its key and pairings and nothing else on this host — not the validator key,
+# not the chain data, not (on a guardian host) the guardian's keys.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/var/lib/randprover
+InaccessiblePaths=-/root -/var/lib/randnode -/var/lib/rand-guardian -/etc/rand-guardian -/mnt
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

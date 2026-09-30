@@ -43,6 +43,22 @@ pub const VIEWING_KEY_WARNING: &str = "this prover can read this wallet's whole 
 /// sent, the same for every pairing.
 pub const PAIRING_DISCLOSURE: &str = "this prover will receive this wallet's viewing key: it can read the wallet's whole history; it cannot spend";
 
+/// The pairing link of the validators' prover pool, `https://prover.randprotocol.org`
+/// (`deploy/prover/README.md`, `docs/prover.md` §9): what `rand prover pair --trusted` pairs with.
+/// Every member of the pool holds the key this link names, so one link and one fingerprint cover
+/// all of them. The token in it is public — it is in every client — and authorises nothing by
+/// itself; the link has no `own=1`, so no wallet ever sends this pool a spend key.
+pub const TRUSTED_PROVER_LINK: &str = include_str!("trusted-prover.link");
+/// Where [`TRUSTED_PROVER_LINK`] points, and the fingerprint of the key it names. Pinned beside
+/// the link so a link replaced in the file without these two lines moving is a failing test.
+pub const TRUSTED_PROVER_URL: &str = "https://prover.randprotocol.org";
+pub const TRUSTED_PROVER_FINGERPRINT: &str = "RGTF-7HKJ-XZFV-GQ1J";
+
+/// [`TRUSTED_PROVER_LINK`], parsed.
+pub fn trusted_prover_link() -> Result<PairingLink> {
+    PairingLink::parse(TRUSTED_PROVER_LINK.trim()).map_err(|e| anyhow!("the built-in trusted prover link: {e}"))
+}
+
 /// `--max-prover-fee`'s default: 1 RAND. A prover quoting more is refused before any bundle is
 /// built, whatever the command (review I-1: the quote is the prover's to set, at any time).
 pub const DEFAULT_MAX_PROVER_FEE: u64 = randprotocol_core::UNITS_PER_RAND;
@@ -619,6 +635,19 @@ mod tests {
     use randprotocol_zkvm::executor::ZkExecutor;
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
+
+    /// The built-in link is the pool's: it parses, it points at the pool's URL, it names the pinned
+    /// key, and it is not an `own=1` link — a wallet must never send this pool a spend key.
+    #[test]
+    fn the_trusted_prover_link_is_the_pools_and_not_an_own_link() {
+        let link = trusted_prover_link().expect("the built-in link parses");
+        assert_eq!(link.url, TRUSTED_PROVER_URL);
+        assert_eq!(link.fingerprint().to_string(), TRUSTED_PROVER_FINGERPRINT);
+        assert!(!link.own, "the pool is nobody's own prover");
+        check_prover_url(&link.url).expect("an https URL");
+        let paired = PairedProver::from_link(&link, None);
+        assert_eq!(paired.fingerprint, TRUSTED_PROVER_FINGERPRINT);
+    }
 
     const EXPECTED: Word8 = [7; 8];
     const BINDING: [u32; TX_BINDING_WORDS] = [3; TX_BINDING_WORDS];

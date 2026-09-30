@@ -415,7 +415,14 @@ enum ProverOp {
     /// its key's fingerprint is checked against what the prover itself answers before anything
     /// is saved (`<key>.prover.json`, mode 0600).
     Pair {
-        link: String,
+        /// The `randprover:` link `rand-prover pair` printed. Omit it with `--trusted`.
+        #[arg(required_unless_present = "trusted")]
+        link: Option<String>,
+        /// Pair with the validators' prover pool, `https://prover.randprotocol.org`, whose link
+        /// this build carries. It is not your own prover: it proves from a viewing-key witness,
+        /// so its operators can read this wallet's whole history; they cannot spend.
+        #[arg(long, conflicts_with = "link")]
+        trusted: bool,
         /// A name to print for this prover instead of its URL.
         #[arg(long)]
         name: Option<String>,
@@ -930,7 +937,7 @@ fn proving_for(prover: bool, cuda: bool, key: &Path, max_prover_fee: &str) -> Re
     if cuda {
         anyhow::bail!("--prover and --cuda: the bundle is proved on the paired prover or on this machine's GPU, not both");
     }
-    let paired = PairedProver::load(key)?.ok_or_else(|| anyhow!("no prover paired for this wallet: rand prover pair <link>"))?;
+    let paired = PairedProver::load(key)?.ok_or_else(|| anyhow!("no prover paired for this wallet: rand prover pair <link>, or `rand prover pair --trusted` for prover.randprotocol.org"))?;
     prover::check_prover_url(&paired.url)?;
     Ok(Proving::Remote(std::sync::Arc::new(RemoteProver::new(paired).with_max_fee(cap))))
 }
@@ -1141,8 +1148,14 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Prover { op } => match op {
-            ProverOp::Pair { link, name, yes } => {
-                let link = PairingLink::parse(link.trim()).map_err(|e| anyhow!("{e}"))?;
+            ProverOp::Pair { link, trusted, name, yes } => {
+                let (link, name) = match link {
+                    Some(text) => (PairingLink::parse(text.trim()).map_err(|e| anyhow!("{e}"))?, name),
+                    None => {
+                        debug_assert!(trusted, "clap requires a link unless --trusted");
+                        (prover::trusted_prover_link()?, name.or_else(|| Some("prover.randprotocol.org".into())))
+                    }
+                };
                 prover::check_prover_url(&link.url)?;
                 let paired = PairedProver::from_link(&link, name);
                 // VK-4: who is being paired and what it will receive, then the question — before
