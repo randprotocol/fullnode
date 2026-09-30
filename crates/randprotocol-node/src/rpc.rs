@@ -55,6 +55,9 @@ const MAX_ADDRESS_CHARS: usize = 2000;
 /// The most receipts one `rand_getReceipts` page may return; an out-of-range `limit` is clamped
 /// to it rather than refused.
 pub const MAX_RECEIPTS_PAGE: usize = 256;
+/// Most cells one `rand_getProgramCells` page returns (RPL-2). A cell is 64 bytes, so a full
+/// page is 128 KB of hex.
+pub const MAX_PROGRAM_CELLS_PAGE: usize = 1000;
 
 /// The most leaf indices one `rand_getWitnesses` call may fold into a single tree build.
 pub const MAX_WITNESSES: usize = 32;
@@ -552,6 +555,7 @@ pub const PUBLIC_METHODS: &[&str] = &[
     "rand_checkTransaction", "rand_sendTransaction", "rand_getTransaction", "rand_getTransactionStatus", "rand_getRawTransaction",
     "rand_getReceipt", "rand_getReceipts", "rand_getCallEnvelope",
     "rand_getProgram", "rand_getProgramCode", "rand_getProgramPublic",
+    "rand_getProgramCell", "rand_getProgramCells", "rand_getProgramVault",
     "rand_getBlockByHeight", "rand_getBlockByHash", "rand_getBlocks",
     "rand_getValidators", "rand_getEpoch", "rand_getSupply", "rand_getEmission",
     "rand_getTokens", "rand_getToken", "rand_getTokenSupply",
@@ -694,6 +698,23 @@ pub struct ChainLimits {
     /// `null` on a chain without `dynamic` — including one with a `gas` section whose prices
     /// never move.
     pub adjust_bps: Option<u32>,
+    /// RPL-2: the genesis `program_state` section and the `Invoke` limits that come with it,
+    /// `null` on a chain without the section (where every invoke is refused).
+    pub program_state: Option<ProgramStateLimits>,
+}
+
+/// `rand_getLimits`' `program_state` object: what a wallet needs to size and price an `Invoke`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProgramStateLimits {
+    /// RAND units added to an invoke's fee floor per cell it creates (genesis). A decimal
+    /// string, like every amount.
+    #[serde(serialize_with = "u64_as_decimal_string")]
+    pub cell_fee: u64,
+    /// The most cells a transition may read, write, and the most notes it may pay out (pays and
+    /// mints together). The segment rule is usually the tighter bound (`docs/rpc.md`).
+    pub max_reads: usize,
+    pub max_writes: usize,
+    pub max_payouts: usize,
 }
 
 impl ChainLimits {
@@ -712,6 +733,10 @@ impl ChainLimits {
             gas_metering: None,
             bundle_gas_limit: None,
             adjust_bps: None,
+            program_state: ledger.program_state().map(|p| {
+                use randprotocol_core::ledger::program_state::{MAX_PAYOUTS, MAX_READS, MAX_WRITES};
+                ProgramStateLimits { cell_fee: p.cell_fee, max_reads: MAX_READS, max_writes: MAX_WRITES, max_payouts: MAX_PAYOUTS }
+            }),
         };
         if let Some(g) = ledger.gas() {
             let prices = ledger.gas_prices();
@@ -2419,6 +2444,72 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let words = st.storage.program_public(&id).map_err(RpcError::internal)?.unwrap_or_default();
             Ok(json!(hex::encode(words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())))
         }
+        // ---- program state (RPL-2) ----
+        // Public state by design (spec §2): a program's cells and its vault. All three answer
+        // `{"enabled": false}` on a chain without the `program_state` section, and none checks
+        // that the program exists — a program that was never deployed has no cell and no vault
+        // row, which is what it is told. Read on the blocking pool: the state is one blob.
+        //
+        // One cell: `[program, key]` → `{"key", "value"}`; an absent cell reads as 64 zeros,
+        // which is also what writing zeros leaves (the one encoding of "absent").
+        "rand_getProgramCell" => {
+            let program: ProgramId = parse_hash(p, 0)?;
+            let key = parse_cell_key(p.get(1).ok_or_else(|| RpcError::invalid_params("missing param key"))?, "key")?;
+            let storage = st.storage.clone();
+            let Some(state) = blocking(st, move || storage.program_state()).await? else {
+                return Ok(json!({ "enabled": false }));
+            };
+            Ok(cell_json(&randprotocol_core::ledger::program_state::Cell { key, value: state.cell(&program, &key) }))
+        }
+        // A program's cells in key order: `[program, {"after": key | null, "limit": n}]`, both
+        // optional, at most `MAX_PROGRAM_CELLS_PAGE` a page. `next` is the last key served when
+        // more follow — pass it back as `after` — and `null` on the last page.
+        "rand_getProgramCells" => {
+            let program: ProgramId = parse_hash(p, 0)?;
+            let (after, limit) = match p.get(1) {
+                None | Some(Value::Null) => (None, MAX_PROGRAM_CELLS_PAGE),
+                Some(Value::Object(o)) => {
+                    let after = match o.get("after") {
+                        None | Some(Value::Null) => None,
+                        Some(k) => Some(parse_cell_key(k, "after")?),
+                    };
+                    let limit = match o.get("limit") {
+                        None | Some(Value::Null) => MAX_PROGRAM_CELLS_PAGE,
+                        Some(n) => n
+                            .as_u64()
+                            .map(|n| (n.min(MAX_PROGRAM_CELLS_PAGE as u64) as usize).max(1))
+                            .ok_or_else(|| RpcError::invalid_params("limit must be a non-negative integer"))?,
+                    };
+                    (after, limit)
+                }
+                Some(_) => return Err(RpcError::invalid_params("the second param is an object: {\"after\": key | null, \"limit\": n}")),
+            };
+            let storage = st.storage.clone();
+            let Some(state) = blocking(st, move || storage.program_state()).await? else {
+                return Ok(json!({ "enabled": false }));
+            };
+            // One past the page, to know whether anything follows it.
+            let mut cells = state.cells_of(&program, after.as_ref(), limit + 1);
+            let more = cells.len() > limit;
+            cells.truncate(limit);
+            let next = if more { cells.last().map(|c| word8_to_hex(&c.key)) } else { None };
+            Ok(json!({ "cells": cells.iter().map(cell_json).collect::<Vec<_>>(), "next": next }))
+        }
+        // A program's vault: `[program]` → `[{"asset", "amount"}]`, ascending by asset index
+        // (0 is RAND), amounts as decimal strings. A row at zero does not exist, so an empty
+        // vault is `[]`.
+        "rand_getProgramVault" => {
+            let program: ProgramId = parse_hash(p, 0)?;
+            let storage = st.storage.clone();
+            let Some(state) = blocking(st, move || storage.program_state()).await? else {
+                return Ok(json!({ "enabled": false }));
+            };
+            Ok(json!(state
+                .vault_of(&program)
+                .into_iter()
+                .map(|(asset, amount)| json!({ "asset": asset, "amount": amount.to_string() }))
+                .collect::<Vec<_>>()))
+        }
         "rand_getLimits" => {
             let mut limits = st.limits.clone();
             // Spec §7.1, §8: under a `gas` section the prices reported are the tip's current
@@ -2533,9 +2624,29 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     // `BUNDLE_BASE` for a deploy, so call it directly instead.
                     randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::deploy_fee(words + public)
                 }
-                "call" => {
+                // RPL-2: an invoke carries a call proof and is priced as a call, plus the
+                // chain's `cell_fee` for each cell it creates (`created_cells`, optional, 0
+                // without it — the caller counts them: a write of a non-zero value to a cell
+                // that reads as zeros). Refused on a chain without the `program_state` section.
+                "call" | "invoke" => {
+                    let cells = match (kind, &st.limits.program_state) {
+                        ("invoke", None) => {
+                            return Err(RpcError::invalid_params("this chain has no program_state section: no invoke is admitted"));
+                        }
+                        ("invoke", Some(ps)) => {
+                            let created = match spec.get("created_cells") {
+                                None | Some(Value::Null) => 0,
+                                Some(c) => c
+                                    .as_u64()
+                                    .filter(|c| *c <= ps.max_writes as u64)
+                                    .ok_or_else(|| RpcError::invalid_params(format!("created_cells must be an integer in 0..={}", ps.max_writes)))?,
+                            };
+                            ps.cell_fee.saturating_mul(created)
+                        }
+                        _ => 0,
+                    };
                     let Some(n) = spec.get("tier").and_then(|t| t.as_u64()) else {
-                        return Err(RpcError::invalid_params("call needs a tier"));
+                        return Err(RpcError::invalid_params(format!("{kind} needs a tier")));
                     };
                     // Tiers are the even log2 heights 10..=20; `n as u8` alone would silently
                     // truncate (256 became tier 0).
@@ -2583,15 +2694,16 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                                 .ok_or_else(|| RpcError::invalid_params("gas must be a non-negative integer"))?,
                         };
                         let (gas_price, byte_price) = tip_gas_prices(st);
-                        randprotocol_core::gas::circuit_call_floor(gas_price, byte_price, gas_limit, bytes)
+                        randprotocol_core::gas::circuit_call_floor(gas_price, byte_price, gas_limit, bytes).saturating_add(cells)
                     } else {
                         match (st.limits.gas_price, st.limits.byte_price) {
                             (Some(g), Some(b)) => randprotocol_core::gas::GasPolicy { gas_price: g, byte_price: b }.call_floor(tier, klh, slh, bytes),
                             _ => randprotocol_core::gas::BUNDLE_BASE + randprotocol_core::gas::call_fee(tier, bytes),
                         }
+                        .saturating_add(cells)
                     }
                 }
-                _ => return Err(RpcError::invalid_params("kind must be bundle, deploy or call")),
+                _ => return Err(RpcError::invalid_params("kind must be bundle, deploy, call or invoke")),
             };
             Ok(json!(fee.to_string()))
         }
@@ -3222,8 +3334,19 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 Some(v) => vesting_locked(v, st.storage.head_block().map_err(RpcError::internal)?.header.timestamp_ms),
                 None => 0,
             };
+            // RPL-2: the program vaults' RAND is the identity's fourth term (`Ledger::audit`).
+            let audit = match st.storage.program_state().map_err(RpcError::internal)? {
+                Some(p) => audit.with_program_vaults(p.rand_in, p.rand_out),
+                None => audit,
+            };
             Ok(json!({
                 "height": height,
+                // RPL-2: RAND that invokes have paid out of program vaults as notes (inside
+                // `pool_value`), and what the vaults still hold (register-side, inside
+                // `total_supply`; it entered through a bundle's `burn_r`, so it is inside
+                // `burned` too). Both "0" without the `program_state` section.
+                "program_rand_out": audit.program_rand_out.to_string(),
+                "program_rand_held": audit.program_rand_held.to_string(),
                 // Genesis vesting: what genesis issued into the register, what claims and revokes
                 // released into the pool, what the register still holds (bonded RAND is in
                 // `register_total`), and what of it has not unlocked yet. All "0" without the
@@ -4184,6 +4307,7 @@ mod tests {
                 "gas_metering": null,
                 "bundle_gas_limit": null,
                 "adjust_bps": null,
+                "program_state": null,
             })
         );
         let gs = raised_genesis();
@@ -4204,6 +4328,7 @@ mod tests {
                 "gas_metering": null,
                 "bundle_gas_limit": null,
                 "adjust_bps": null,
+                "program_state": null,
             })
         );
         // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
@@ -4226,6 +4351,7 @@ mod tests {
                 "gas_metering": null,
                 "bundle_gas_limit": null,
                 "adjust_bps": null,
+                "program_state": null,
             })
         );
         // The v0.6 switch: what a wallet reads to prove its calls over the call binding (INT-4).
@@ -6056,6 +6182,263 @@ mod tests {
             *initial = None;
         }
         assert_eq!(tx_json(&bare, tokens.as_ref(), &StubExecutor)["action"]["initial"], Value::Null);
+    }
+
+    // ---------------------------------- RPL-2: program state and the invoke
+
+    /// The RPL-2 fixture chain two blocks in, behind an RPC state: block 1 deploys the program
+    /// and registers tokens 1 (plain) and 2 (the program's own); block 2 holds one invoke —
+    /// 1 000 RAND units and 500 of token 1 deposited, cell 1 created, two RAND notes paid out
+    /// and 40 of token 2 minted — and a plain transfer behind it. Returns the invoke and its
+    /// transition.
+    fn rpl2_state() -> (tempfile::TempDir, RpcState, Transaction, randprotocol_core::ledger::program_state::Transition) {
+        use fixtures::{rpl2_cell, rpl2_invoke_tx, rpl2_payout, RPL2_FEE};
+        use randprotocol_core::ledger::program_state::{Inflow, Transition};
+        let gs = fixtures::rpl2_genesis(7);
+        let (dir, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let b1 = make_block(&gs.block, &mut ledger, fixtures::rpl2_setup_txs(&gs.ledger), &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let transition = Transition {
+            reads: vec![rpl2_cell(1, 0)],
+            writes: vec![rpl2_cell(1, 5)],
+            inflow: Inflow::Deposit,
+            pays: vec![rpl2_payout(0, 300, 1), rpl2_payout(0, 200, 2)],
+            mints: vec![rpl2_payout(2, 40, 3)],
+        };
+        let invoke = rpl2_invoke_tx(&ledger, 10, RPL2_FEE, (1_000, 1, 500), transition.clone());
+        let transfer = fixtures::v3_tx(&ledger, 20, bundle_fee(), Action::None);
+        let mut probe = ledger.clone();
+        let mut b2 = make_block(&b1, &mut ledger, vec![invoke.clone(), transfer], &key(1));
+        b2.receipts = probe.apply_block(&b2.block, &StubExecutor).unwrap();
+        st.storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+        (dir, st, invoke, transition)
+    }
+
+    /// `tx_json` renders an invoke as a call plus the transition it declared: cells as 64-hex
+    /// pairs, the inflow by name, and each payout with every word of its note — the recipient,
+    /// the amount as a decimal string, the *bundle's* `time`, the blinding and the leaf the
+    /// chain appended — under the field names a `token_mint` uses.
+    #[tokio::test]
+    async fn tx_json_renders_an_invoke_with_its_transition_and_payout_notes() {
+        use randprotocol_core::ledger::program_state::payout_commitment;
+        let (_d, st, invoke, transition) = rpl2_state();
+        let (program, _) = fixtures::rpl2_program();
+        let time = invoke.bundle.as_ref().unwrap().time;
+        assert_eq!(time, 1, "the bundle's time, stamped at the height it was built on");
+        let Action::Invoke { proof, .. } = &invoke.action else { unreachable!() };
+        let key = |k: u32| word8_to_hex(&[k, 0, 0, 0, 0, 0, 0, 0]);
+        let payout = |p: &randprotocol_core::ledger::program_state::Payout| {
+            json!({
+                "asset": p.asset,
+                "amount": p.amount.to_string(),
+                "recipient": p.recipient.to_string(),
+                "time": 1,
+                "r": word8_to_hex(&p.r),
+                "cm": word8_to_hex(&payout_commitment(p, time, &StubExecutor)),
+            })
+        };
+        let want = json!({
+            "kind": "invoke",
+            "program": program.to_hex(),
+            "proof_len": proof.len(),
+            "input_envelope_len": null,
+            "transition": {
+                "reads": [{ "key": key(1), "value": "00".repeat(32) }],
+                "writes": [{ "key": key(1), "value": key(5) }],
+                "inflow": "deposit",
+                "pays": [payout(&transition.pays[0]), payout(&transition.pays[1])],
+                "mints": [payout(&transition.mints[0])],
+            },
+        });
+        let rendered = tx_json(&invoke, None, &StubExecutor);
+        assert_eq!(rendered["action"], want);
+        // A cell key is its eight words little-endian, like every `Word8` on this RPC.
+        assert_eq!(key(1), format!("01{}", "00".repeat(31)));
+        assert_eq!(rendered["action"]["transition"]["pays"][0]["amount"], "300");
+        // What came in is the bundle's, rendered with the bundle.
+        assert_eq!(rendered["bundle"]["burn_r"], "1000");
+        assert_eq!((rendered["bundle"]["burn_asset"].clone(), rendered["bundle"]["burn_a"].clone()), (json!(1), json!("500")));
+        // Served the same through the RPC, and the rendered leaves are the appended ones.
+        let served = ok(&st, "rand_getTransaction", json!([invoke.hash().to_hex()])).await;
+        assert_eq!(served["tx"]["action"], want);
+        assert_eq!(served["height"], 2);
+        let rows = st.storage.notes_in_heights(2, 2, usize::MAX).unwrap();
+        let cms: Vec<String> = rows[4..7].iter().map(|(_, r)| word8_to_hex(&r.cm)).collect();
+        assert_eq!(json!(cms), json!([want["transition"]["pays"][0]["cm"], want["transition"]["pays"][1]["cm"], want["transition"]["mints"][0]["cm"]]));
+        // The other inflow words, and an envelope's length.
+        let mut other = invoke.clone();
+        if let Action::Invoke { transition, input_envelope, .. } = &mut other.action {
+            transition.inflow = randprotocol_core::ledger::program_state::Inflow::Burn;
+            *input_envelope = Some(randprotocol_core::types::CallEnvelope { kem_ct: vec![1; 4], to_sender: vec![2; 4], to_auditor: vec![], body: vec![3; 8] });
+        }
+        let j = tx_json(&other, None, &StubExecutor);
+        assert_eq!(j["action"]["transition"]["inflow"], "burn");
+        assert_eq!(j["action"]["input_envelope_len"], 16);
+        if let Action::Invoke { transition, .. } = &mut other.action {
+            *transition = fixtures::rpl2_transition();
+        }
+        let j = tx_json(&other, None, &StubExecutor);
+        assert_eq!(j["action"]["transition"], json!({ "reads": [], "writes": [], "inflow": "none", "pays": [], "mints": [] }));
+    }
+
+    /// The three program-state reads, the limits, the fee estimate and the supply audit on a
+    /// chain with the section — and what a chain without it answers.
+    #[tokio::test]
+    async fn program_state_is_served_priced_and_audited() {
+        let (_d, st, _invoke, _t) = rpl2_state();
+        let (program, _) = fixtures::rpl2_program();
+        let pid = program.to_hex();
+        let key = |k: u32| word8_to_hex(&[k, 0, 0, 0, 0, 0, 0, 0]);
+        let zeros = "00".repeat(32);
+
+        // One cell: present, absent (zeros), and a program nobody deployed (zeros too).
+        assert_eq!(ok(&st, "rand_getProgramCell", json!([pid, key(1)])).await, json!({ "key": key(1), "value": key(5) }));
+        assert_eq!(ok(&st, "rand_getProgramCell", json!([pid, format!("0x{}", key(1))])).await["value"], key(5), "0x is accepted");
+        assert_eq!(ok(&st, "rand_getProgramCell", json!([pid, key(2)])).await, json!({ "key": key(2), "value": zeros }));
+        assert_eq!(ok(&st, "rand_getProgramCell", json!(["ab".repeat(32), key(1)])).await["value"], zeros);
+        for bad in [json!([pid]), json!([pid, "01"]), json!([pid, 1]), json!(["zz", key(1)])] {
+            assert_eq!(call(&st, "rand_getProgramCell", bad.clone()).await.unwrap_err().code, -32602, "{bad}");
+        }
+
+        // The vault, ascending by asset; an empty one is `[]`.
+        assert_eq!(
+            ok(&st, "rand_getProgramVault", json!([pid])).await,
+            json!([{ "asset": 0, "amount": "500" }, { "asset": 1, "amount": "500" }])
+        );
+        assert_eq!(ok(&st, "rand_getProgramVault", json!(["ab".repeat(32)])).await, json!([]));
+
+        // Cells page in key order. Three more cells, written straight into the stored blob's
+        // ledger twin through another block.
+        let mut ledger = crate::node::reload_ledger(&st.storage, &fixtures::rpl2_genesis(7), &StubExecutor).unwrap();
+        let parent = st.storage.committed_block(2).unwrap().unwrap();
+        let more = randprotocol_core::ledger::program_state::Transition {
+            writes: vec![fixtures::rpl2_cell(3, 7), fixtures::rpl2_cell(4, 8), fixtures::rpl2_cell(9, 9)],
+            ..fixtures::rpl2_transition()
+        };
+        let tx = fixtures::rpl2_invoke_tx(&ledger, 30, fixtures::RPL2_FEE, (0, 0, 0), more);
+        let b3 = make_block(&parent, &mut ledger, vec![tx], &fixtures::key(1));
+        st.storage.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
+        let cell = |k: u32, v: u32| json!({ "key": key(k), "value": key(v) });
+        assert_eq!(
+            ok(&st, "rand_getProgramCells", json!([pid])).await,
+            json!({ "cells": [cell(1, 5), cell(3, 7), cell(4, 8), cell(9, 9)], "next": null })
+        );
+        assert_eq!(ok(&st, "rand_getProgramCells", json!([pid, null])).await["cells"].as_array().unwrap().len(), 4);
+        let page = ok(&st, "rand_getProgramCells", json!([pid, { "limit": 2 }])).await;
+        assert_eq!(page, json!({ "cells": [cell(1, 5), cell(3, 7)], "next": key(3) }));
+        let page = ok(&st, "rand_getProgramCells", json!([pid, { "after": page["next"], "limit": 2 }])).await;
+        assert_eq!(page, json!({ "cells": [cell(4, 8), cell(9, 9)], "next": null }), "a full last page still ends the walk");
+        assert_eq!(ok(&st, "rand_getProgramCells", json!([pid, { "after": key(9) }])).await, json!({ "cells": [], "next": null }));
+        assert_eq!(ok(&st, "rand_getProgramCells", json!([pid, { "limit": 0 }])).await["cells"].as_array().unwrap().len(), 1, "at least one");
+        let clamped = ok(&st, "rand_getProgramCells", json!([pid, { "limit": 1_000_000 }])).await;
+        assert_eq!(clamped["cells"].as_array().unwrap().len(), 4, "an oversized limit is clamped to the page cap, not refused");
+        assert_eq!(ok(&st, "rand_getProgramCells", json!(["ab".repeat(32)])).await, json!({ "cells": [], "next": null }));
+        for bad in [json!([pid, 5]), json!([pid, { "after": "01" }]), json!([pid, { "limit": "many" }])] {
+            assert_eq!(call(&st, "rand_getProgramCells", bad.clone()).await.unwrap_err().code, -32602, "{bad}");
+        }
+
+        // The limits carry the section; an invoke is priced as a call plus the cell fee.
+        let limits = ok(&st, "rand_getLimits", json!([])).await;
+        assert_eq!(
+            limits["program_state"],
+            json!({ "cell_fee": fixtures::CELL_FEE.to_string(), "max_reads": 8, "max_writes": 8, "max_payouts": 4 })
+        );
+        let spec = |kind: &str, extra: Value| {
+            let mut s = json!({ "kind": kind, "tier": 12, "bytes": 1_300_000, "gas": 3_000 });
+            for (k, v) in extra.as_object().unwrap() {
+                s[k] = v.clone();
+            }
+            json!([s])
+        };
+        let fee = |v: Value| v.as_str().unwrap().parse::<u64>().unwrap();
+        let as_call = fee(ok(&st, "rand_estimateFee", spec("call", json!({}))).await);
+        assert_eq!(fee(ok(&st, "rand_estimateFee", spec("invoke", json!({}))).await), as_call, "no cell created");
+        assert_eq!(
+            fee(ok(&st, "rand_estimateFee", spec("invoke", json!({ "created_cells": 3 }))).await),
+            as_call + 3 * fixtures::CELL_FEE
+        );
+        for bad in [json!({ "created_cells": 9 }), json!({ "created_cells": "two" }), json!({ "created_cells": -1 })] {
+            assert_eq!(call(&st, "rand_estimateFee", spec("invoke", bad.clone())).await.unwrap_err().code, -32602, "{bad}");
+        }
+        assert_eq!(call(&st, "rand_estimateFee", json!([{ "kind": "invoke" }])).await.unwrap_err().code, -32602, "a tier, like a call");
+
+        // The supply audit: RAND paid out of vaults is in the pool, what they hold is its own term.
+        let supply = ok(&st, "rand_getSupply", json!([])).await;
+        assert_eq!((supply["program_rand_out"].clone(), supply["program_rand_held"].clone()), (json!("500"), json!("500")));
+        assert_eq!(supply["invariant_holds"], true, "{supply}");
+        assert_eq!(supply["total_supply"], ledger.audit().total_supply().to_string());
+
+        // A chain without the section: `enabled: false`, null limits, zero counters, no estimate.
+        let (_p, plain) = state_for(&fixtures::genesis_with(1, vec![]));
+        for (method, params) in [
+            ("rand_getProgramCell", json!([pid, key(1)])),
+            ("rand_getProgramCells", json!([pid])),
+            ("rand_getProgramVault", json!([pid])),
+        ] {
+            assert_eq!(ok(&plain, method, params).await, json!({ "enabled": false }), "{method}");
+        }
+        assert_eq!(ok(&plain, "rand_getLimits", json!([])).await["program_state"], Value::Null);
+        let supply = ok(&plain, "rand_getSupply", json!([])).await;
+        assert_eq!((supply["program_rand_out"].clone(), supply["program_rand_held"].clone()), (json!("0"), json!("0")));
+        let e = call(&plain, "rand_estimateFee", json!([{ "kind": "invoke", "tier": 12 }])).await.unwrap_err();
+        assert_eq!(e.code, -32602);
+        assert!(e.message.contains("program_state"), "{}", e.message);
+        // All three are on the public listener.
+        for method in ["rand_getProgramCell", "rand_getProgramCells", "rand_getProgramVault"] {
+            assert!(PUBLIC_METHODS.contains(&method), "{method}");
+        }
+    }
+
+    /// An invoke's receipt is a call's: `rand_getReceipt` and `rand_getReceipts` carry it, the
+    /// WebSocket's `receipts` topic is fed the same rows, and a served block needs it.
+    #[tokio::test]
+    async fn an_invoke_leaves_a_calls_receipt() {
+        let (_d, st, invoke, _t) = rpl2_state();
+        let (program, _) = fixtures::rpl2_program();
+        let r = ok(&st, "rand_getReceipt", json!([invoke.hash().to_hex()])).await;
+        assert_eq!(r["tx"], invoke.hash().to_hex());
+        assert_eq!(r["program"], program.to_hex());
+        assert_eq!((r["tier"].clone(), r["height"].clone(), r["index"].clone()), (json!(10), json!(2), json!(0)));
+        assert_eq!(r["outputs"], json!([9, 8, 7, 6, 5, 4, 3, 2]), "the program's eight output words");
+        let page = ok(&st, "rand_getReceipts", json!([program.to_hex(), 0, 10])).await;
+        assert_eq!(page["receipts"], json!([r]));
+        // The same row is what a commit hands the `receipts` topic.
+        let stored = st.storage.receipt(&invoke.hash()).unwrap().expect("stored with the block");
+        assert_eq!(receipt_json(&stored), r);
+        // Serving the block to a peer needs the invoke's receipt as it needs a call's.
+        let served = st.storage.committed_block(2).unwrap().unwrap();
+        assert_eq!(served.receipts, vec![stored]);
+    }
+
+    /// A compact block attributes an invoke's payout notes to it — the bundle's four slots, then
+    /// one leaf per payout with the payout's own envelope — and the transaction behind it starts
+    /// at the right leaf.
+    #[tokio::test]
+    async fn compact_blocks_attribute_an_invokes_payout_notes() {
+        let (_d, st, invoke, transition) = rpl2_state();
+        let v = ok(&st, "rand_getCompactBlocks", json!([2, 2])).await;
+        let block = &v.as_array().unwrap()[0];
+        assert_eq!(block["commitments"], json!([]), "every leaf of the block belongs to a transaction");
+        let txs = block["transactions"].as_array().unwrap();
+        let (first, second) = (txs[0]["commitments"].as_array().unwrap(), txs[1]["commitments"].as_array().unwrap());
+        assert_eq!((first.len(), second.len()), (7, 4));
+        assert_eq!(txs[0]["hash"], invoke.hash().to_hex());
+        let rows = st.storage.notes_in_heights(2, 2, usize::MAX).unwrap();
+        for (k, leaf) in first.iter().chain(second.iter()).enumerate() {
+            assert_eq!(leaf["index"], rows[k].0, "leaf {k}");
+            assert_eq!(leaf["cm"], word8_to_hex(&rows[k].1.cm), "leaf {k}");
+        }
+        let time = invoke.bundle.as_ref().unwrap().time;
+        for (k, p) in transition.payouts().enumerate() {
+            let cm = randprotocol_core::ledger::program_state::payout_commitment(p, time, &StubExecutor);
+            assert_eq!(first[4 + k]["cm"], word8_to_hex(&cm), "payout {k}");
+            assert_eq!(first[4 + k]["envelope"], envelope_json(&p.envelope), "payout {k}: its own envelope");
+        }
+        // The commitment feed a wallet trial-decrypts serves them in the same place.
+        let feed = ok(&st, "rand_getCommitments", json!([rows[4].0, 3])).await;
+        assert_eq!(feed.as_array().unwrap().len(), 3);
+        assert_eq!(feed[0]["cm"], first[4]["cm"]);
     }
 
     /// `rand_checkTransaction` computes the chain's one derived note for a `TokenMint` and a
