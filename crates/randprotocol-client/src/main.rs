@@ -22,7 +22,7 @@ use randprotocol_prover::pairing::PairingLink;
 use randprotocol_client::contacts;
 use randprotocol_client::contacts::Contacts;
 use randprotocol_core::ledger::staking::MIN_STAKE;
-use randprotocol_core::notes::{ShieldedAddress, Word8};
+use randprotocol_core::notes::{word8_to_hex, ShieldedAddress, Word8};
 use randprotocol_core::payment_uri::PaymentUri;
 use randprotocol_core::types::actions::Registration;
 use randprotocol_core::{format_amount, gas, parse_amount, Action, Address, Hash, Keypair};
@@ -577,6 +577,11 @@ enum TokenCmd {
         /// The initial mint's recipient. Required with `--fixed-supply` or `--initial`.
         #[arg(long)]
         to: Option<String>,
+        /// RPL-2: a program token — its mint authority is this program (hex id), and only that
+        /// program's invokes mint or burn it. Starts at zero supply (no `--initial`), needs the
+        /// chain's `program_state` section. Mutually exclusive with the other two authorities.
+        #[arg(long)]
+        program: Option<String>,
         /// Fee in RAND; default the bundle base plus the registry's registration fee.
         #[arg(long)]
         fee: Option<String>,
@@ -658,7 +663,7 @@ enum TokenCmd {
 enum ProgramCmd {
     /// Assemble a built-in guest program to a JSON file.
     Build {
-        /// fib | memcpy | bubble_sort | balance_check | private_payment | public_echo
+        /// fib | memcpy | bubble_sort | balance_check | private_payment | public_echo | rpl2_counter
         #[arg(long)]
         guest: String,
         /// Guest argument(s): fib n, memcpy n, bubble_sort v..., balance_check threshold, private_payment threshold
@@ -690,6 +695,175 @@ enum ProgramCmd {
     },
     /// Show a deployed program.
     Show { id: String },
+    /// RPL-2: invoke a program — declare a state transition (`--transition FILE.json`), prove the
+    /// call over it, pay from one bundle (the fee, plus what the transition deposits), wait for
+    /// the receipt. Exit 3 when the chain refuses it as a stale read (a cell moved since the
+    /// transition was quoted: re-read it and retry).
+    Invoke {
+        /// Program id (hex).
+        program: String,
+        /// The transition, as JSON: `{"reads": [{"key", "value"}], "writes": [...], "deposit":
+        /// {"rand": "<units>", "asset": n, "amount": "<units>", "kind": "none"|"deposit"|"burn"},
+        /// "pays": [{"asset", "amount", "to"?}], "mints": [...]}`; every field optional, keys and
+        /// values 64 hex, amounts decimal strings in units, `to` a rand1… address (default: this
+        /// wallet's own).
+        #[arg(long)]
+        transition: PathBuf,
+        /// Private inputs (u32), in order; never leave this machine.
+        #[arg(long = "input")]
+        inputs: Vec<u32>,
+        /// Private inputs as a JSON array of u32, appended after `--input`s.
+        #[arg(long)]
+        inputs_file: Option<PathBuf>,
+        /// Fee in RAND; default: the call's floor for the declared gas plus the cell fee for
+        /// each cell the transition creates (plus price headroom where prices move).
+        #[arg(long)]
+        fee: Option<String>,
+        /// The gas limit the proof declares, `N` or `max` (as `rand call --gas-limit`).
+        #[arg(long)]
+        gas_limit: Option<String>,
+        /// Force a gas tier (10, 12, ..., 20); default: smallest that fits.
+        #[arg(long)]
+        tier: Option<u8>,
+        /// Return once the node accepts the transaction instead of waiting for the receipt.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// RPL-2: a program's cells (`rand_getProgramCells`), or one cell with `--cell`.
+    State {
+        /// Program id (hex).
+        id: String,
+        /// One cell's key, 64 hex; without it, every cell in key order. (`--key` is the wallet
+        /// key file, as everywhere in `rand`.)
+        #[arg(long)]
+        cell: Option<String>,
+    },
+    /// RPL-2: a program's vault (`rand_getProgramVault`): what it holds, per asset.
+    Vault {
+        /// Program id (hex).
+        id: String,
+    },
+}
+
+/// `rand program invoke --transition FILE.json`, as another tool emits it (RPL-2). Every field
+/// is optional: absent is empty, zero or `none`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransitionFile {
+    #[serde(default)]
+    reads: Vec<CellFile>,
+    #[serde(default)]
+    writes: Vec<CellFile>,
+    #[serde(default)]
+    deposit: DepositFile,
+    #[serde(default)]
+    pays: Vec<PayoutFile>,
+    #[serde(default)]
+    mints: Vec<PayoutFile>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CellFile {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DepositFile {
+    /// RAND units into the vault (`burn_r`), a decimal string.
+    #[serde(default)]
+    rand: Option<String>,
+    /// The token (registry index) and units (`burn_asset`, `burn_a`) the bundle burns.
+    #[serde(default)]
+    asset: u32,
+    #[serde(default)]
+    amount: Option<String>,
+    /// `none` | `deposit` | `burn`: what `amount` of `asset` is to the program.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PayoutFile {
+    #[serde(default)]
+    asset: u32,
+    amount: String,
+    /// A `rand1…` address; this wallet's own when absent.
+    #[serde(default)]
+    to: Option<String>,
+}
+
+/// The exit code `rand program invoke` leaves on a stale read — distinct, so a calling tool can
+/// re-quote the cells and retry rather than treat it as a hard refusal.
+const STALE_READ_EXIT: i32 = 3;
+
+/// A decimal amount in units (never RAND's decimals: a payout may be a token's).
+fn parse_units(s: &str, what: &str) -> Result<u64> {
+    s.trim().parse::<u64>().with_context(|| format!("{what}: {s:?} is not a decimal amount in units"))
+}
+
+/// A 64-hex `Word8` (with or without `0x`), as a cell key or value.
+fn parse_word8(s: &str, what: &str) -> Result<randprotocol_core::Word8> {
+    let h = s.strip_prefix("0x").unwrap_or(s);
+    randprotocol_core::notes::word8_from_hex(h).with_context(|| format!("{what}: {s:?} is not 64 hex characters"))
+}
+
+/// The plan a transition file asks for: parsed, amounts and words decoded, recipients resolved
+/// (this wallet's address when a payout names none). Nothing is read from the chain here.
+fn read_transition_file(
+    path: &Path,
+    program: randprotocol_core::program::ProgramId,
+    me: &randprotocol_core::notes::ShieldedAddress,
+) -> Result<wallet::InvokePlan> {
+    use randprotocol_core::ledger::program_state::{Cell, Inflow};
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let file: TransitionFile = serde_json::from_str(&text).with_context(|| format!("{} is not a transition file", path.display()))?;
+    let cells = |list: &[CellFile], what: &str| -> Result<Vec<Cell>> {
+        list.iter()
+            .map(|c| Ok(Cell { key: parse_word8(&c.key, &format!("{what} key"))?, value: parse_word8(&c.value, &format!("{what} value"))? }))
+            .collect()
+    };
+    let payouts = |list: &[PayoutFile], what: &str| -> Result<Vec<wallet::PayoutRequest>> {
+        list.iter()
+            .map(|p| {
+                let to = match &p.to {
+                    Some(a) => parse_address(a).with_context(|| format!("{what}: `to`"))?,
+                    None => me.clone(),
+                };
+                Ok(wallet::PayoutRequest { asset: p.asset, amount: parse_units(&p.amount, &format!("{what} amount"))?, to })
+            })
+            .collect()
+    };
+    let burn_r = file.deposit.rand.as_deref().map(|s| parse_units(s, "deposit.rand")).transpose()?.unwrap_or(0);
+    let burn_a = file.deposit.amount.as_deref().map(|s| parse_units(s, "deposit.amount")).transpose()?.unwrap_or(0);
+    let inflow = match file.deposit.kind.as_deref().unwrap_or("none") {
+        "none" => Inflow::None,
+        "deposit" => Inflow::Deposit,
+        "burn" => Inflow::Burn,
+        other => anyhow::bail!("deposit.kind must be none, deposit or burn, not {other:?}"),
+    };
+    if (burn_a == 0) != matches!(inflow, Inflow::None) {
+        anyhow::bail!("deposit.kind is `none` exactly when deposit.amount is zero or absent");
+    }
+    if burn_a != 0 && file.deposit.asset == 0 {
+        anyhow::bail!("deposit.asset 0 is RAND, which goes in through deposit.rand");
+    }
+    Ok(wallet::InvokePlan {
+        program,
+        reads: cells(&file.reads, "reads")?,
+        writes: cells(&file.writes, "writes")?,
+        inflow,
+        pays: payouts(&file.pays, "pays")?,
+        mints: payouts(&file.mints, "mints")?,
+        burn_r,
+        burn_asset: if burn_a != 0 { file.deposit.asset } else { 0 },
+        burn_a,
+        input_envelope: None,
+        created_cells: 0,
+    })
 }
 
 fn build_guest(name: &str, args: &[u32]) -> Result<Program> {
@@ -702,6 +876,9 @@ fn build_guest(name: &str, args: &[u32]) -> Result<Program> {
         "private_payment" => { need(1)?; guests::private_payment(args[0]) }
         // Reads four public words (deploy it with `--public`): out0 = their sum + public[1].
         "public_echo" => guests::public_echo(),
+        // RPL-2's counter: accepts exactly the transitions that read one cell and write it to its
+        // first word plus one, `out0` the new count (`rand program invoke`).
+        "rpl2_counter" => guests::rpl2_counter(),
         other => anyhow::bail!("unknown guest {other}"),
     })
 }
@@ -1568,6 +1745,202 @@ async fn main() -> Result<()> {
                 None => println!("unknown program"),
             }
         }
+        Cmd::Program(ProgramCmd::State { id, cell }) => {
+            let id = Hash::from_hex(&id).context("invalid program id")?;
+            match cell {
+                Some(k) => {
+                    let key = parse_word8(&k, "--cell")?;
+                    let value = rpc.program_cell(&id, &key).await?.context("this chain has no program_state section")?;
+                    println!("{}", pretty(&serde_json::json!({ "key": word8_to_hex(&key), "value": word8_to_hex(&value) })));
+                }
+                None => {
+                    let mut after = None;
+                    let mut cells = Vec::new();
+                    loop {
+                        let (page, next) =
+                            rpc.program_cells(&id, after.as_ref(), 1000).await?.context("this chain has no program_state section")?;
+                        cells.extend(page.iter().map(|c| serde_json::json!({ "key": word8_to_hex(&c.key), "value": word8_to_hex(&c.value) })));
+                        match next {
+                            Some(n) => after = Some(n),
+                            None => break,
+                        }
+                    }
+                    println!("{}", pretty(&serde_json::json!({ "program": id.to_hex(), "cells": cells })));
+                }
+            }
+        }
+        Cmd::Program(ProgramCmd::Vault { id }) => {
+            let id = Hash::from_hex(&id).context("invalid program id")?;
+            let vault = rpc.program_vault(&id).await?.context("this chain has no program_state section")?;
+            let rows: Vec<_> = vault.iter().map(|(asset, amount)| serde_json::json!({ "asset": asset, "amount": amount.to_string() })).collect();
+            println!("{}", pretty(&serde_json::json!({ "program": id.to_hex(), "vault": rows })));
+        }
+        Cmd::Program(ProgramCmd::Invoke { program, transition, inputs, inputs_file, fee, gas_limit, tier, no_wait }) => {
+            use randprotocol_core::ledger::program_state::{segment_fits, CONTEXT_HEADER_WORDS};
+            let gas_arg = parse_gas_limit(gas_limit.as_deref())?;
+            let (w, path, mut store) = open_wallet(&cli.key)?;
+            let pid = Hash::from_hex(&program).context("invalid program id")?;
+            let mut plan = read_transition_file(&transition, pid, &w.address)?;
+            let mut inputs = inputs;
+            if let Some(f) = &inputs_file {
+                let more: Vec<u32> = serde_json::from_str(&std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?)
+                    .with_context(|| format!("{} is not a JSON array of u32", f.display()))?;
+                inputs.extend(more);
+            }
+            // Everything cheap before a proof is paid for, in the ledger's own order: the gate,
+            // the program, the segment rule, the cells read, the vault, and what this wallet
+            // holds — so nothing below spends a minute of proving on a transaction the chain
+            // would refuse in a microsecond.
+            let limits = rpc.limits().await?;
+            let Some(ps) = limits.and_then(|l| l.program_state) else {
+                anyhow::bail!("this chain has no program_state section: no invoke is admitted");
+            };
+            let (prog, public) = wallet::load_call_program(&rpc, &pid).await?;
+            let context_words = CONTEXT_HEADER_WORDS + 16 * (plan.reads.len() + plan.writes.len()) + 3 * (plan.pays.len() + plan.mints.len());
+            if !segment_fits(public.len(), context_words) {
+                anyhow::bail!(
+                    "the transition's context is {context_words} words, which does not fit beside this program's {}-word public input                      and the 8 binding words in one public table (the segment rule): fewer cells or payouts",
+                    public.len()
+                );
+            }
+            let zero = [0u32; 8];
+            for c in &plan.reads {
+                let live = rpc.program_cell(&pid, &c.key).await?.context("this chain has no program_state section")?;
+                if live != c.value {
+                    eprintln!(
+                        "cell {} is stale: the transition read {} and the chain holds {}; re-read the program's state and retry",
+                        word8_to_hex(&c.key),
+                        word8_to_hex(&c.value),
+                        word8_to_hex(&live)
+                    );
+                    std::process::exit(STALE_READ_EXIT);
+                }
+            }
+            // The cells the writes create, for the fee: a non-zero value where the chain holds
+            // zeros (a read of the same key already told us; the rest are asked).
+            let mut created = 0u64;
+            for c in plan.writes.iter().filter(|c| c.value != zero) {
+                let live = match plan.reads.iter().find(|r| r.key == c.key) {
+                    Some(r) => r.value,
+                    None => rpc.program_cell(&pid, &c.key).await?.context("this chain has no program_state section")?,
+                };
+                if live == zero {
+                    created += 1;
+                }
+            }
+            plan.created_cells = created;
+            let vault = rpc.program_vault(&pid).await?.context("this chain has no program_state section")?;
+            let mut assets: Vec<u32> = plan.pays.iter().map(|p| p.asset).collect();
+            assets.sort_unstable();
+            assets.dedup();
+            for asset in assets {
+                let held = vault.iter().find(|(a, _)| *a == asset).map_or(0, |(_, v)| *v);
+                let deposited = if asset == 0 {
+                    plan.burn_r
+                } else if plan.burn_asset == asset && matches!(plan.inflow, randprotocol_core::ledger::program_state::Inflow::Deposit) {
+                    plan.burn_a
+                } else {
+                    0
+                };
+                let want: u64 = plan.pays.iter().filter(|p| p.asset == asset).map(|p| p.amount).sum();
+                if held.saturating_add(deposited) < want {
+                    anyhow::bail!("the vault holds {held} of asset {asset} (plus {deposited} this transition deposits) and the transition pays {want}");
+                }
+            }
+            if plan.burn_a != 0 && store.balance_of(plan.burn_asset) < plan.burn_a {
+                anyhow::bail!("this wallet holds {} of asset {} and the transition deposits {}", store.balance_of(plan.burn_asset), plan.burn_asset, plan.burn_a);
+            }
+            let chain_id = rpc.chain_id().await?;
+            let profile = profile_of(&rpc).await?;
+            let proving = if cli.prover { proving_for(true, false, &cli.key, &cli.max_prover_fee)? } else { Proving::local(Backend::Cpu) };
+            // The dry run over the REAL context words — the guest branches on them — with eight
+            // zero words standing in for the binding, which the guest never reads.
+            let context = {
+                use randprotocol_core::ledger::program_state::{Payout, Transition};
+                let dummy = |p: &wallet::PayoutRequest| Payout {
+                    asset: p.asset,
+                    amount: p.amount,
+                    recipient: w.address.clone(),
+                    r: [0; 8],
+                    envelope: randprotocol_core::notes::Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] },
+                };
+                let probe = Transition {
+                    reads: plan.reads.clone(),
+                    writes: plan.writes.clone(),
+                    inflow: plan.inflow,
+                    pays: plan.pays.iter().map(dummy).collect(),
+                    mints: plan.mints.iter().map(dummy).collect(),
+                };
+                probe.context(plan.burn_r, plan.burn_asset, plan.burn_a)
+            };
+            let segment = [public.as_slice(), &zero, context.as_slice()].concat();
+            let run = executor::dry_run_call(&prog, &inputs, &segment)
+                .map_err(|e| anyhow::anyhow!("the program does not accept this transition: {e}"))?;
+            let tier = tier.unwrap_or(run.tier);
+            let (declare, priced_gas) = resolve_gas_limit(gas_arg, &run, tier, limits.as_ref(), true)?;
+            let salt = executor::fresh_call_salt();
+            let cap = wallet::proof_cap(limits.as_ref());
+            let cell_term = ps.cell_fee.saturating_mul(created);
+            let fee = match fee {
+                Some(f) => parse_amount(&f)?,
+                None => wallet::call_fee_default(limits.as_ref(), tier, 0, 0, priced_gas, wallet::hardened_call_quote_bytes(limits.as_ref(), 0))?
+                    .checked_add(cell_term)
+                    .context("fee overflow")?,
+            };
+            eprintln!(
+                "fee {} RAND ({created} cell{} created at {} RAND each){}",
+                format_amount(fee),
+                if created == 1 { "" } else { "s" },
+                format_amount(ps.cell_fee),
+                headroom_note(limits.as_ref())
+            );
+            let need_rand = fee.checked_add(plan.burn_r).context("fee + deposit overflows")?;
+            if store.balance_of(0) < need_rand {
+                anyhow::bail!(
+                    "this wallet holds {} RAND and the invoke needs {} (fee {} + {} deposited)",
+                    format_amount(store.balance_of(0)),
+                    format_amount(need_rand),
+                    format_amount(fee),
+                    format_amount(plan.burn_r)
+                );
+            }
+            eprintln!("proving the invoke locally ({} inputs stay private, over {context_words} context words)…", inputs.len());
+            let prove = |binding: &[u32; randprotocol_core::types::TX_BINDING_WORDS], context: &[u32]| -> Result<Vec<u8>> {
+                let t = std::time::Instant::now();
+                let (proof, outputs, tier) =
+                    executor::prove_invoke(profile, &prog, &inputs, &public, binding, context, salt, Some(tier), declare)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                eprintln!("proved in {:.1?}: tier {tier}, {} bytes, outputs {outputs:?}", t.elapsed(), proof.len());
+                wallet::check_proof_size(proof.len(), cap)?;
+                Ok(proof)
+            };
+            let s = wallet::submit_bound_invoke(&rpc, &w, &mut store, &plan, fee, &prove, limits.as_ref(), profile, &proving, chain_id, !no_wait).await;
+            store.save(&path)?;
+            let (s, sent) = match s {
+                Ok(v) => v,
+                Err(e) => {
+                    // The chain's stale-read verdict is not a refusal of the bytes: a cell moved
+                    // between the quote and the block. Distinct, so a calling tool re-quotes.
+                    if format!("{e:#}").contains("is no longer what this transition read") {
+                        eprintln!("{e:#}");
+                        std::process::exit(STALE_READ_EXIT);
+                    }
+                    return Err(e);
+                }
+            };
+            report(&s, "invoke");
+            for (what, list) in [("paid", &sent.pays), ("minted", &sent.mints)] {
+                for p in list {
+                    println!("  {what} {} of asset {} to {}", p.amount, p.asset, p.recipient.fingerprint());
+                }
+            }
+            if !no_wait {
+                let receipt = rpc.wait_for_receipt(&s.hash, Duration::from_secs(120)).await?;
+                let outputs: Vec<u64> = receipt["outputs"].as_array().map(|o| o.iter().filter_map(|v| v.as_u64()).collect()).unwrap_or_default();
+                println!("outputs {outputs:?}");
+                println!("{}", pretty(&receipt));
+            }
+        }
         Cmd::Call { program, inputs, expect_public, tier, gas_limit, fee, auditor, no_envelope, print_call_key, cuda } => {
             let gas_arg = parse_gas_limit(gas_limit.as_deref())?;
             if no_envelope && (auditor.is_some() || print_call_key) {
@@ -2093,13 +2466,20 @@ async fn main() -> Result<()> {
             report(&s, "backing listing");
             println!("listed chain {chain} token {} under asset {asset}, at list_nonce {}", hex::encode(token), state.list_nonce);
         }
-        Cmd::Token(TokenCmd::Create { name, symbol, decimals, salt, fixed_supply, authority_key_out, initial, to, fee, no_wait, cuda }) => {
+        Cmd::Token(TokenCmd::Create { name, symbol, decimals, salt, fixed_supply, authority_key_out, initial, to, program, fee, no_wait, cuda }) => {
             // Every cheap refusal — the flag combination — before any key file, network read or
             // proof.
-            if fixed_supply.is_some() == authority_key_out.is_some() {
-                anyhow::bail!("pass exactly one of --fixed-supply or --authority-key-out");
+            let program = program.as_deref().map(|p| Hash::from_hex(p).context("--program: invalid program id")).transpose()?;
+            if program.is_some() {
+                if fixed_supply.is_some() || authority_key_out.is_some() || initial.is_some() || to.is_some() {
+                    anyhow::bail!("--program is the token's whole authority: no --fixed-supply, --authority-key-out, --initial or --to beside it");
+                }
+            } else if fixed_supply.is_some() == authority_key_out.is_some() {
+                anyhow::bail!("pass exactly one of --fixed-supply, --authority-key-out or --program");
             }
-            let (authority_keypair, initial_amount) = if let Some(supply) = fixed_supply {
+            let (authority_keypair, initial_amount) = if program.is_some() {
+                (None, None)
+            } else if let Some(supply) = fixed_supply {
                 if initial.is_some() {
                     anyhow::bail!("--fixed-supply is the whole initial supply; do not also pass --initial");
                 }
@@ -2155,7 +2535,7 @@ async fn main() -> Result<()> {
                 &symbol,
                 decimals,
                 authority,
-                None,
+                program,
                 initial_amount.map(|amount| (amount, recipient.clone().expect("checked above"))),
                 salt,
                 fee,
@@ -2463,6 +2843,74 @@ mod tests {
         assert_eq!((asset, chain, decimals), (1, 3, 18));
         assert!(matches!(parse(&["bridge-pause", "--sig", "@pause.sig"]), Ok(Cmd::BridgePause { .. })));
         assert!(matches!(parse(&["bridge-unpause", "--pq", "@unpause.json", "--no-wait"]), Ok(Cmd::BridgeUnpause { no_wait: true, .. })));
+    }
+
+    /// RPL-2's three `rand program` commands and `rand token create --program` parse with their
+    /// documented flags, and a transition file — the interface another tool emits — is read
+    /// field for field: every field optional, amounts in units, `to` defaulting to this wallet.
+    #[test]
+    fn the_program_state_commands_parse_and_the_transition_file_is_read_as_documented() {
+        use randprotocol_core::ledger::program_state::Inflow;
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("rand").chain(args.iter().copied())).map(|c| c.cmd);
+        let id = "ab".repeat(32);
+        let Ok(Cmd::Program(ProgramCmd::Invoke { program, transition, inputs, inputs_file, fee, no_wait, .. })) = parse(&[
+            "program", "invoke", &id, "--transition", "t.json", "--input", "3", "--input", "4", "--inputs-file", "in.json", "--fee", "0.5", "--no-wait",
+        ]) else {
+            panic!("invoke parses")
+        };
+        assert_eq!((program.as_str(), transition.to_str(), inputs, inputs_file.as_deref().and_then(|p| p.to_str()), fee.as_deref(), no_wait), (id.as_str(), Some("t.json"), vec![3, 4], Some("in.json"), Some("0.5"), true));
+        assert!(matches!(parse(&["program", "state", &id]), Ok(Cmd::Program(ProgramCmd::State { cell: None, .. }))));
+        assert!(matches!(parse(&["program", "state", &id, "--cell", "00"]), Ok(Cmd::Program(ProgramCmd::State { cell: Some(_), .. }))));
+        assert!(matches!(parse(&["program", "vault", &id]), Ok(Cmd::Program(ProgramCmd::Vault { .. }))));
+        assert!(matches!(parse(&["program", "build", "--guest", "rpl2_counter"]), Ok(Cmd::Program(ProgramCmd::Build { .. }))));
+        assert_eq!(build_guest("rpl2_counter", &[]).unwrap().words, guests::rpl2_counter().words);
+        let Ok(Cmd::Token(TokenCmd::Create { program, fixed_supply, authority_key_out, .. })) =
+            parse(&["token", "create", "--name", "Pool Share", "--symbol", "LP", "--decimals", "6", "--program", &id])
+        else {
+            panic!("token create --program parses")
+        };
+        assert_eq!((program.as_deref(), fixed_supply, authority_key_out), (Some(id.as_str()), None, None));
+
+        let me = Wallet::generate();
+        let you = Wallet::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.json");
+        let key = format!("01{}", "00".repeat(31));
+        let file = serde_json::json!({
+            "reads": [{ "key": key, "value": "00".repeat(32) }],
+            "writes": [{ "key": key, "value": format!("0x2a{}", "00".repeat(31)) }],
+            "deposit": { "rand": "1000", "asset": 2, "amount": "300", "kind": "deposit" },
+            "pays": [{ "asset": 0, "amount": "600", "to": you.address.to_string() }],
+            "mints": [{ "asset": 3, "amount": "40" }],
+        });
+        std::fs::write(&path, file.to_string()).unwrap();
+        let pid = Hash([0xab; 32]);
+        let plan = read_transition_file(&path, pid, &me.address).unwrap();
+        assert_eq!((plan.program, plan.reads[0].key, plan.reads[0].value, plan.writes[0].value[0]), (pid, [1, 0, 0, 0, 0, 0, 0, 0], [0; 8], 42));
+        assert_eq!((plan.burn_r, plan.burn_asset, plan.burn_a, plan.inflow), (1000, 2, 300, Inflow::Deposit));
+        assert_eq!((plan.pays[0].asset, plan.pays[0].amount, &plan.pays[0].to), (0, 600, &you.address));
+        assert_eq!((plan.mints[0].asset, plan.mints[0].amount, &plan.mints[0].to), (3, 40, &me.address), "`to` defaults to this wallet");
+        assert_eq!(plan.created_cells, 0, "counted against the chain later");
+        // Every field optional.
+        std::fs::write(&path, "{}").unwrap();
+        let empty = read_transition_file(&path, pid, &me.address).unwrap();
+        assert!(empty.reads.is_empty() && empty.writes.is_empty() && empty.pays.is_empty() && empty.mints.is_empty());
+        assert_eq!((empty.burn_r, empty.burn_asset, empty.burn_a, empty.inflow), (0, 0, 0, Inflow::None));
+        // The cheap refusals: an inflow word without a burn, a burn without one, RAND as a token,
+        // a stray key, a malformed word.
+        for (bad, why) in [
+            (r#"{"deposit": {"kind": "burn"}}"#, "kind is `none` exactly when"),
+            (r#"{"deposit": {"asset": 2, "amount": "5"}}"#, "kind is `none` exactly when"),
+            (r#"{"deposit": {"asset": 0, "amount": "5", "kind": "deposit"}}"#, "deposit.asset 0 is RAND"),
+            (r#"{"deposit": {"kind": "melt"}}"#, "must be none, deposit or burn"),
+            (r#"{"read": []}"#, "not a transition file"),
+            (r#"{"writes": [{"key": "01", "value": "02"}]}"#, "not 64 hex"),
+            (r#"{"pays": [{"amount": "1.5"}]}"#, "decimal amount in units"),
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let e = format!("{:#}", read_transition_file(&path, pid, &me.address).unwrap_err());
+            assert!(e.contains(why), "{bad}: {e}");
+        }
     }
 
     /// `rand sync` scans from where the store left off; `--rescan` starts the store over first
