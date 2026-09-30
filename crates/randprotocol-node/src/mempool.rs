@@ -66,6 +66,12 @@ pub struct Claims {
     /// (audit v6, CH-9): what the pool re-prices the call from at selection, when the prices
     /// have moved since it was admitted.
     pub gas_limit: Option<u64>,
+    /// For a `BridgeAttest`, the bridge's `rotation_nonce` on the ledger it was screened against
+    /// (audit v6, BRG-12); `None` for everything else. The attestation's post-quantum
+    /// co-signatures were verified against the PQ guardian set of that moment, and a
+    /// `RotatePqGuardians` replaces the set: once the nonce has moved the pooled verdict is no
+    /// longer the ledger's, and the transaction leaves ([`Mempool::still_applies`]).
+    pub bridge_rotation: Option<u64>,
 }
 
 /// A token-registry slot at most one pooled transaction may hold (H4 review minor): the ledger
@@ -127,6 +133,8 @@ struct Pooled {
     floor: u64,
     /// See [`Claims::gas_limit`].
     gas_limit: Option<u64>,
+    /// See [`Claims::bridge_rotation`].
+    bridge_rotation: Option<u64>,
 }
 
 /// The register nonce a bundle-less `Unbond` or `Withdraw` claims — and the aggregator
@@ -430,7 +438,11 @@ impl Mempool {
         if !is_governance(&tx.action) && self.txs.len() >= self.max_size {
             return Err(MempoolError::Full);
         }
-        Ok(Claims { commitments, claim, token, floor: randprotocol_core::gas::fee_floor(&tx.action), gas_limit: None })
+        let bridge_rotation = match &tx.action {
+            Action::BridgeAttest { .. } => ledger.bridge().map(|b| b.rotation_nonce),
+            _ => None,
+        };
+        Ok(Claims { commitments, claim, token, floor: randprotocol_core::gas::fee_floor(&tx.action), gas_limit: None, bridge_rotation })
     }
 
     /// Everything the pool can decide about a transaction without verifying a proof: the pool
@@ -520,7 +532,7 @@ impl Mempool {
     /// [`Mempool::pool_conflicts`] for this transaction, so no index entry written here can collide
     /// with one that exists.
     fn admit(&mut self, tx: Transaction, c: Claims) -> Hash {
-        let Claims { commitments, claim, token, floor, gas_limit } = c;
+        let Claims { commitments, claim, token, floor, gas_limit, bridge_rotation } = c;
         let hash = tx.hash();
         for nf in tx.nullifiers() {
             self.nullifiers.insert(nf, hash);
@@ -541,7 +553,7 @@ impl Mempool {
         self.bytes += len;
         // `pool_conflicts` refuses a hash already pooled, so nothing is replaced here; if that
         // ever changes, the replaced entry's bytes must leave the total with it.
-        if let Some(old) = self.txs.insert(hash, Pooled { tx, commitments, claim, token, since: Instant::now(), len, floor, gas_limit }) {
+        if let Some(old) = self.txs.insert(hash, Pooled { tx, commitments, claim, token, since: Instant::now(), len, floor, gas_limit, bridge_rotation }) {
             self.bytes -= old.len;
         }
         hash
@@ -732,8 +744,16 @@ impl Mempool {
                 // `Ledger::validate` gives it, so a caller that prechecks before validating hears
                 // the same thing either way. A pooled attest can only exist on a bridged chain, so
                 // this arm is unreachable from `still_applies`.
-                if ledger.bridge().is_none() {
+                let Some(bridge) = ledger.bridge() else {
                     return Err(TxError::Bridge(BridgeError::Disabled));
+                };
+                // A transfer is refused while mints are paused (audit v6, BRG-12) — the ledger's
+                // own first verdict on it (`BridgeState::check_attestation`), asked here so a
+                // pooled mint leaves at the tip that paused rather than being offered to, and
+                // failing, every block until its `time` expires. Rotations are not transfers
+                // and stay open under a pause, as the ledger keeps them.
+                if bridge.mint_paused {
+                    return Err(TxError::Bridge(BridgeError::MintsPaused));
                 }
                 // A coin nobody listed as a backing deposits nothing at all, and `validate`'s
                 // answer for it is the bridge's `UnlistedToken` rather than a mismatched index —
@@ -855,6 +875,13 @@ impl Mempool {
     }
 
     fn still_applies(p: &Pooled, ledger: &Ledger) -> bool {
+        // A pooled attestation whose PQ co-signatures were checked against a set that has since
+        // been rotated (audit v6, BRG-12). Compared by the bridge's rotation nonce rather than by
+        // verifying again: six Dilithium2 verifies per pooled attestation per tip change is the
+        // cost this avoids, and a pause-key rotation (the same nonce) costs a relayer one resend.
+        if p.bridge_rotation.is_some() && p.bridge_rotation != ledger.bridge().map(|b| b.rotation_nonce) {
+            return false;
+        }
         Self::applies(&p.tx, &p.commitments, p.claim, ledger).is_ok()
     }
 
@@ -2141,6 +2168,50 @@ mod tests {
 
         m.prune(&l);
         assert_eq!(m.len(), 0, "the attestation outlived the set that signed it");
+    }
+
+    /// Audit v6, BRG-12: the two other things that can turn a pooled attestation's verdict and
+    /// that the pool did not look at — a pause, and a rotation of the post-quantum guardian set
+    /// its co-signatures were verified against (rotation exists since chain 15). It stayed
+    /// pooled and was offered to every block until its `time` left the window, failing each
+    /// trial apply. A relayer resubmits after an unpause or with the new set's co-signatures.
+    #[test]
+    fn a_pooled_attest_leaves_on_a_pause_and_on_a_post_quantum_rotation() {
+        let pooled = || {
+            let (l, secrets) = bridged_ledger();
+            let tx = attest_tx(&l, attestation(&secrets), 10);
+            let mut m = Mempool::new(100);
+            m.insert(tx, &l, &StubExecutor).unwrap();
+            m.prune(&l);
+            assert_eq!(m.len(), 1, "nothing about the bridge moved: it stays");
+            (m, l)
+        };
+        let (mut m, mut l) = pooled();
+        let mut bridge = l.bridge().unwrap().clone();
+        bridge.mint_paused = true;
+        l.set_bridge(Some(bridge));
+        m.prune(&l);
+        assert_eq!(m.len(), 0, "a transfer attest does not wait out a pause in the pool");
+
+        let (mut m, mut l) = pooled();
+        let mut bridge = l.bridge().unwrap().clone();
+        bridge.rotation_nonce += 1;
+        l.set_bridge(Some(bridge));
+        assert!(m.candidates(&l, 10).is_empty(), "not offered once the set it was verified against has rotated");
+        m.prune(&l);
+        assert_eq!(m.len(), 0, "and gone at the tip change");
+
+        // While paused a new one is refused at the pre-screen with the ledger's own verdict.
+        let (l0, secrets) = bridged_ledger();
+        let tx = attest_tx(&l0, attestation(&secrets), 10);
+        let mut paused = l0.clone();
+        let mut bridge = paused.bridge().unwrap().clone();
+        bridge.mint_paused = true;
+        paused.set_bridge(Some(bridge));
+        assert_eq!(
+            Mempool::new(4).precheck(&tx, &paused, &StubExecutor).map(|_| ()),
+            Err(MempoolError::Invalid(TxError::Bridge(BridgeError::MintsPaused)))
+        );
     }
 
     /// An oversized attestation must not buy a decode from the pre-screen.
