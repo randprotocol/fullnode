@@ -731,6 +731,34 @@ above):**
   VERIFIER-2's FRI schedule): every v0.6 pool refuses a non-canonical header, and the ledger does
   under `hardening_v6` (`docs/deploy.md`, "Canonical proofs").
 
+**Two residuals that are still true on chain 18 (audit v6, HCS-3 and HCS-4; stated 2026-09-30).**
+
+- **A call proof's header shows whether the call hashed, and roughly how much** (HCS-3; Low,
+  live). Every proof declares `keccak_log_height` and `sha256_log_height` in the clear, and `0`
+  means "no such table". So anyone reading a call proof learns whether the call used the `KECCAK`
+  or `SHA256` precompile at all. The 2^7 floor removes small counts (one to four keccak
+  permutations, or one or two sha256 compressions, all declare 7), and the chain caps what a call
+  may declare (keccak ≤ 2^12, sha256 ≤ 2^13, `MAX_CALL_TIER` 14); between the floor and the
+  ceiling the height shows the count to within a factor of two, because the table doubles. The
+  memory table's declared height can move with a hashing call too. The prover can hide presence:
+  `ProveOptions::pad_absent_hash_tables` declares both tables at the floor even when the run never
+  hashes, and the ordinary verifier accepts the proof. **It is off by default, and no wallet sets
+  it**: on a tier-10 call that never hashes, the production proof grew from 1 305 415 to
+  3 622 604 bytes (one laptop run each; `machine.rs`'s doc comment on the option), against chain
+  18's 4 MiB proof cap and its per-byte price. It also hides nothing unless the calls it hides
+  among use it too. So "a call proof reveals only its public values" is not true of the header:
+  the tier and both hash-table heights are visible. Turning the option on for calls with private
+  inputs is a wallet- or chain-wide decision that has not been taken.
+- **The legacy `POSEIDON2` syscall is not length-injective** (HCS-4; Low, live). It is an
+  overwrite sponge with no padding, so `[a]` and `[a, 0]` hash alike. It is left exactly as it is
+  because every note commitment, nullifier, tree root and program digest depends on it; the
+  shipped guests call it on fixed-length inputs only. Constraint set 7 added **`POSEIDON2_LEN`
+  (syscall 7)**, the same sponge with the message length in capacity lane 4. **A new guest must
+  use `POSEIDON2_LEN`** for anything whose length an adversary can choose (`asm::call_poseidon2_len`
+  in this repo's assembler; in circuits' guest SDK at `aeacf31`, `poseidon2_len` is the safe call
+  and the legacy `poseidon2` is `unsafe`). No shipped guest and no consensus path uses syscall 7
+  yet; retiring the legacy syscall (3) is for a constraint set that re-derives every hash.
+
 ## Call input envelopes
 
 A call's private inputs are private because nothing published them — but the caller may want to be

@@ -69,6 +69,12 @@ comes back in `a0`. Pointer arguments are **word** addresses (the byte pointer d
 | 4 | Keccak-f[1600] | `a0` word ptr to a 50-word state, permuted in place | `rand_keccak(ptr)` | `keccak(ptr)`, `keccak256(msg)` |
 | 5 | SHA-256 compression | `a0` word ptr to 24 words: block at 0..16, state at 16..24 | `rand_sha256_compress(ptr)` | `sha256_compress(ptr)`, `sha256(msg)` |
 | 6 | read public input | `a0` index; returns the word | `rand_read_public(idx)` | `read_public(idx)` |
+| 7 | Poseidon2, length-bound (constraint set 7) | as syscall 3, with the message length in the sponge's capacity | — (no C wrapper in `guest.h` as of circuits `aeacf31`) | `poseidon2_len(buf, n)` |
+
+**Use syscall 7 in new guests.** Syscall 3 does not pad: `[a]` and `[a, 0]` hash alike (HCS-4). It
+stays as it is because every commitment and program digest on the chain depends on it; in the
+Rust SDK it is an `unsafe fn` and `poseidon2_len` is the safe call (`docs/confidential.md`,
+"Privacy").
 
 - Private inputs are bound to the salted commitment `H_IN`. A read past the end cannot be proven.
 - `rand call` seals the private inputs into the call envelope, so the envelope cap bounds them:

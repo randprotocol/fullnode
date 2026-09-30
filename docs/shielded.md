@@ -217,7 +217,12 @@ disclose more, and until the next chain cut they do:
   reduction. The **program table** of every program under 64 words — all 105 programs on chain 15
   are 43 words — publishes its per-instruction fetch counts, i.e. the call's control flow. The
   declared hash-table heights (`keccak_log_height`, `sha256_log_height`) say whether a call hashed
-  and roughly how often.
+  and roughly how often. **That last part is still true on chain 18** (audit v6, HCS-3; stated
+  2026-09-30): the 2^7 floor hides small counts, not presence — `0` still means "this call never
+  used keccak" (or sha256) — and above the floor the height shows the count to within a factor of
+  two, up to the chain's cap. The prover option that hides presence
+  (`ProveOptions::pad_absent_hash_tables`) is off by default and no wallet sets it; it costs about
+  3.6 MB a proof against 1.3 MB (`docs/confidential.md`, "Privacy").
 - **A call's LogUp totals are a public function of its private inputs, so low-entropy inputs can
   be brute-forced from them** (INT-2 on calls; the v0.6 rescan). The same unblinded terminals as
   the bundle item above: the input table's is the sum over its rows of one term per committed
