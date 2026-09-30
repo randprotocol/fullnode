@@ -70,8 +70,15 @@ fn gas_summary(g: Option<&randprotocol_core::gas::GasConfig>) -> String {
             let dynamic = match &g.dynamic {
                 None => "off".to_string(),
                 Some(d) => format!(
-                    "target {} B / {} gas, adjust {} bps, floor {}/{}",
-                    d.target_block_bytes, d.target_block_gas, d.adjust_bps, d.min_gas_price, d.min_byte_price
+                    "target {} B / {} gas, adjust {} bps, floor {}/{}, ceiling {}/{}, byte load {}",
+                    d.target_block_bytes,
+                    d.target_block_gas,
+                    d.adjust_bps,
+                    d.min_gas_price,
+                    d.min_byte_price,
+                    d.max_gas_price.map_or("none".to_string(), |m| m.to_string()),
+                    d.max_byte_price.map_or("none".to_string(), |m| m.to_string()),
+                    if d.byte_load.is_some() { "paying" } else { "all" },
                 ),
             };
             format!(
@@ -430,6 +437,18 @@ enum Cmd {
         /// `--gas-price`; omitted, the prices this command writes never move.
         #[arg(long, value_name = "TARGET_BYTES,TARGET_GAS,ADJUST_BPS")]
         gas_dynamic: Option<String>,
+        /// Audit v6, POOL-2: the ceiling the controller never lifts `gas_price` over (units);
+        /// at least `--gas-price`. Refused without `--gas-dynamic`; omitted, no ceiling.
+        #[arg(long)]
+        max_gas_price: Option<u64>,
+        /// The ceiling on `byte_price`, the same way; at least `--byte-price`.
+        #[arg(long)]
+        max_byte_price: Option<u64>,
+        /// Audit v6, POOL-2: which bytes move `byte_price` — `paying` for a call's proof and
+        /// input envelope only (a transfer, which pays no byte price, then moves none). Refused
+        /// without `--gas-dynamic`; omitted, every transaction's bytes count (chain 18's rule).
+        #[arg(long, value_name = "paying")]
+        gas_byte_load: Option<String>,
     },
     /// Print one genesis alloc note as JSON — the object that goes into a genesis file's `alloc`
     /// list — sealed to `--to` exactly as `genesis --alloc` seals one, so the owner's wallet finds
@@ -1152,6 +1171,9 @@ async fn main() -> Result<()> {
             byte_price,
             bundle_gas_limit,
             gas_dynamic,
+            max_gas_price,
+            max_byte_price,
+            gas_byte_load,
         } => {
             let hc_bundle = match bundle_guest.as_str() {
                 "v3" => ZkExecutor::hc_hidden_bundle_v3(),
@@ -1174,7 +1196,13 @@ async fn main() -> Result<()> {
             }
             // The gas section (spec §4.2, §4.3, §7.1): written only when `--gas-price` is given,
             // so a chain cut without it hashes byte-for-byte as before.
-            let gas = gas_section(gas_price, byte_price, bundle_gas_limit, gas_dynamic.as_deref())?;
+            let gas = gas_section(
+                gas_price,
+                byte_price,
+                bundle_gas_limit,
+                gas_dynamic.as_deref(),
+                DynamicExtras { max_gas_price, max_byte_price, byte_load: gas_byte_load.as_deref() },
+            )?;
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -2072,12 +2100,36 @@ pub fn parse_prune_history(s: &str) -> Result<Duration, String> {
 /// `rand-node genesis`'s gas flags as the genesis `gas` section (spec §4.2, §4.3, §7.1):
 /// `None` without `--gas-price`, so a chain cut without it hashes byte-for-byte as before — and
 /// then any of the other three gas flags is an error, never a silently section-less genesis.
+/// `rand-node genesis`'s three audit-v6 (POOL-2) additions to `--gas-dynamic`: the two ceilings
+/// and the byte load. Each is refused without `--gas-dynamic` (there is no controller for a
+/// ceiling to bound), never silently dropped.
+#[derive(Clone, Copy, Default)]
+struct DynamicExtras<'a> {
+    max_gas_price: Option<u64>,
+    max_byte_price: Option<u64>,
+    byte_load: Option<&'a str>,
+}
+
 fn gas_section(
     gas_price: Option<u64>,
     byte_price: Option<u64>,
     bundle_gas_limit: Option<u64>,
     gas_dynamic: Option<&str>,
+    extras: DynamicExtras<'_>,
 ) -> Result<Option<randprotocol_core::gas::GasConfig>> {
+    if gas_dynamic.is_none() {
+        let given: Vec<&str> = [
+            extras.max_gas_price.map(|_| "--max-gas-price"),
+            extras.max_byte_price.map(|_| "--max-byte-price"),
+            extras.byte_load.map(|_| "--gas-byte-load"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !given.is_empty() {
+            anyhow::bail!("{} given without --gas-dynamic: a ceiling or a byte load bounds the dynamic controller, which this genesis would not have", given.join(", "));
+        }
+    }
     if gas_price.is_none() {
         let given: Vec<&str> = [
             byte_price.map(|_| "--byte-price"),
@@ -2122,6 +2174,13 @@ fn gas_section(
                             .with_context(|| format!("--gas-dynamic {spec}: bad adjust_bps"))?,
                         min_gas_price: gas_price,
                         min_byte_price: byte_price,
+                        max_gas_price: extras.max_gas_price,
+                        max_byte_price: extras.max_byte_price,
+                        byte_load: match extras.byte_load {
+                            None => None,
+                            Some("paying") => Some(randprotocol_core::gas::ByteLoad::Paying),
+                            Some(other) => anyhow::bail!("--gas-byte-load {other}: only `paying` is a byte load"),
+                        },
                     })
                 }
                 None => None,
@@ -2722,6 +2781,37 @@ mod tests {
                 _ => unreachable!(),
             }
         };
+        // Audit v6, POOL-2: the two ceilings and the byte load ride `--gas-dynamic`.
+        let section = |extra: &[&str]| {
+            let mut args = vec!["rand-node", "genesis", "--validator", "k,1000,p"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().cmd {
+                Cmd::Genesis { gas_price, byte_price, bundle_gas_limit, gas_dynamic, max_gas_price, max_byte_price, gas_byte_load, .. } => {
+                    gas_section(
+                        gas_price,
+                        byte_price,
+                        bundle_gas_limit,
+                        gas_dynamic.as_deref(),
+                        DynamicExtras { max_gas_price, max_byte_price, byte_load: gas_byte_load.as_deref() },
+                    )
+                }
+                _ => unreachable!(),
+            }
+        };
+        let capped = section(&["--gas-price", "100", "--gas-dynamic", "10485760,262144,1250", "--max-gas-price", "1000", "--max-byte-price", "80000", "--gas-byte-load", "paying"])
+            .unwrap()
+            .unwrap();
+        let d = capped.dynamic.unwrap();
+        assert_eq!((d.max_gas_price, d.max_byte_price, d.byte_load), (Some(1_000), Some(80_000), Some(randprotocol_core::gas::ByteLoad::Paying)));
+        let plain = section(&["--gas-price", "100", "--gas-dynamic", "10485760,262144,1250"]).unwrap().unwrap().dynamic.unwrap();
+        assert_eq!((plain.max_gas_price, plain.max_byte_price, plain.byte_load), (None, None, None), "chain 18's shape without the flags");
+        for extra in [&["--max-gas-price", "1000"][..], &["--max-byte-price", "9"], &["--gas-byte-load", "paying"]] {
+            let mut args = vec!["--gas-price", "100"];
+            args.extend_from_slice(extra);
+            let err = section(&args).unwrap_err().to_string();
+            assert!(err.contains("without --gas-dynamic"), "{err}");
+        }
+        assert!(section(&["--gas-price", "100", "--gas-dynamic", "1,1,1250", "--gas-byte-load", "all"]).unwrap_err().to_string().contains("only `paying`"));
         assert_eq!(parse(&[]), (None, None, None, None));
         assert_eq!(
             parse(&["--gas-price", "100", "--byte-price", "800", "--bundle-gas-limit", "20479"]),
@@ -2753,6 +2843,9 @@ mod tests {
                 adjust_bps: 1250,
                 min_gas_price: 100,
                 min_byte_price: 800,
+                max_gas_price: None,
+                max_byte_price: None,
+                byte_load: None,
             }),
         });
         let json = with_gas.to_json();
@@ -2767,16 +2860,16 @@ mod tests {
     /// `--gas-price` is an error naming the flag, not a genesis silently cut with no gas section.
     #[test]
     fn a_gas_flag_without_gas_price_is_refused() {
-        assert_eq!(gas_section(None, None, None, None).unwrap(), None, "no flags: no section");
+        assert_eq!(gas_section(None, None, None, None, DynamicExtras::default()).unwrap(), None, "no flags: no section");
         for (byte_price, bundle, dynamic, flag) in [
             (Some(800), None, None, "--byte-price"),
             (None, Some(20_479), None, "--bundle-gas-limit"),
             (None, None, Some("10485760,262144,1250"), "--gas-dynamic"),
         ] {
-            let e = gas_section(None, byte_price, bundle, dynamic).expect_err(&format!("{flag} alone must be refused")).to_string();
+            let e = gas_section(None, byte_price, bundle, dynamic, DynamicExtras::default()).expect_err(&format!("{flag} alone must be refused")).to_string();
             assert!(e.contains(flag) && e.contains("--gas-price"), "{e}");
         }
-        let with = gas_section(Some(100), Some(800), None, Some("10485760,262144,1250")).unwrap().unwrap();
+        let with = gas_section(Some(100), Some(800), None, Some("10485760,262144,1250"), DynamicExtras::default()).unwrap().unwrap();
         assert_eq!(with.bundle_gas_limit, 20_479);
         assert_eq!(with.dynamic.unwrap().target_block_bytes, 10_485_760);
     }

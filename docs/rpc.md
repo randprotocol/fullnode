@@ -374,7 +374,8 @@ gas policy:
 { "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
   "max_call_envelope_bytes": 18432, "max_program_public_words": 0, "envelope_bytes": null,
   "hardening_v6": false, "hc_auth": null, "gas_price": "100", "byte_price": "800",
-  "gas_metering": "header", "bundle_gas_limit": null, "adjust_bps": null }
+  "gas_metering": "header", "bundle_gas_limit": null, "adjust_bps": null,
+  "max_gas_price": null, "max_byte_price": null, "byte_load": null }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -434,7 +435,10 @@ startup; without `dynamic` they are the section's own fixed prices, which never 
 `bundle_gas_limit` is the bundle guest's flat declared gas (genesis `gas.bundle_gas_limit`;
 `20479` on chain 18, the tier-14 hash-free ceiling `gas_max(14, 0, 0)`), `null` without a section. `adjust_bps` is the dynamic controller's per-block step size in basis
 points (genesis `gas.dynamic.adjust_bps`), `null` on a chain without `dynamic` — including one
-with a `gas` section whose prices never move.
+with a `gas` section whose prices never move. `max_gas_price`/`max_byte_price` (decimal strings)
+are the ceilings the controller never lifts a price over and `byte_load` is `"paying"` when only
+a call's proof and input envelope move `byte_price` (audit v6, POOL-2; `docs/fees.md` §1.2) —
+all three `null` where the genesis sets none, chain 18 included.
 
 ### `rand_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
@@ -1526,6 +1530,17 @@ No chain has carried a `vesting` section, so nothing a client reads today moves.
   entry's genesis terms): `a revoke pays the entry's treasury, not the address it names`,
   `N revoker signatures, the entry needs M`, `revoker I signed twice`, `revoker index I is not in
   the entry's list`.
+
+### 2026-09-30 — audit v6: price ceilings and the paying byte load (POOL-2; genesis-gated, chain 18 unchanged)
+
+- **`rand_getLimits`** gains `max_gas_price`, `max_byte_price` (decimal strings; the ceilings the
+  dynamic controller never lifts a price over) and `byte_load` (`"paying"` when only a call's
+  proof and input envelope move `byte_price`). All three are `null` on chain 18 and on every chain
+  without `gas.dynamic` — a wallet's two-step headroom (`docs/fees.md` §1.2) is unchanged, and
+  under a ceiling it simply never needs more than the ceiling.
+- Node policy, every chain: while a call is pooled and pays its floor, the proposer holds
+  flat-fee transactions to three quarters of a block's bytes so the call is offered
+  (`Mempool::candidates_within`); a submitter sees nothing of it but a call that lands.
 
 ### 2026-09-30 — audit v6: a revoke's own nonce, and no dust (STAKE-4; genesis-gated, on no chain)
 

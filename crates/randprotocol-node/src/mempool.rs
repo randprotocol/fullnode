@@ -700,8 +700,20 @@ impl Mempool {
                 .then_with(|| b.1.tx.fee().cmp(&a.1.tx.fee()))
                 .then_with(|| a.0.cmp(b.0))
         });
+        // Audit v6, POOL-2 (option 4, node policy — never a validity rule): only a `Call` pays
+        // the byte price, and a transfer out-ranks it on surplus per KiB whenever it pays a
+        // little over its flat base, so a stream of transfers could fill every block and keep a
+        // ready Call out for as long as it lasted. While a Call is ready, the flat-fee
+        // transactions (everything but a Call; governance is exempt, as everywhere) take at most
+        // three quarters of the block's bytes in the first pass; what that quarter leaves once
+        // the Calls have been placed is filled with the transfers held back, in their order, so
+        // the reservation costs no block space. With no Call ready the cap is the block's.
+        let call_ready = ready.iter().any(|(_, p, _)| matches!(p.tx.action, Action::Call { .. }));
+        let flat_cap = if call_ready { max_bytes / 4 * 3 } else { max_bytes };
         let mut out = Vec::new();
+        let mut held_back = Vec::new();
         let mut bytes = 0usize;
+        let mut flat_bytes = 0usize;
         for (_, p, _) in ready.into_iter().take(max) {
             let len = p.len;
             if bytes + len > max_bytes {
@@ -713,8 +725,22 @@ impl Mempool {
                 // still travel.
                 continue;
             }
+            let flat = !matches!(p.tx.action, Action::Call { .. }) && !is_governance(&p.tx.action);
+            if flat && flat_bytes + len > flat_cap {
+                held_back.push(p);
+                continue;
+            }
             bytes += len;
+            if flat {
+                flat_bytes += len;
+            }
             out.push(p.tx.clone());
+        }
+        for p in held_back {
+            if bytes + p.len <= max_bytes {
+                bytes += p.len;
+                out.push(p.tx.clone());
+            }
         }
         out
     }
@@ -2912,6 +2938,52 @@ mod tests {
         assert_eq!(now, vec![transfer_hash, keeps_hash], "and the rank is the surplus over the current floor (1 000 against 10)");
         assert_eq!(m.len(), 3, "nothing is evicted: the price falls again");
         assert_eq!(picked(&ledger).len(), 3, "and at the old prices all three are offered once more");
+    }
+
+    /// Audit v6, POOL-2 (option 4, a proposer policy): while a Call is pooled and ready, flat-fee
+    /// transactions take at most three quarters of the block's bytes, so a block full of
+    /// transfers — which pay no byte price and out-rank a Call on surplus per KiB — cannot crowd
+    /// the Call out for as long as they keep coming. What the quarter leaves is filled with the
+    /// transfers that were held back, so no block space is wasted; with no Call pooled nothing
+    /// changes.
+    #[test]
+    fn a_pooled_call_is_not_crowded_out_by_a_block_of_transfers() {
+        use randprotocol_core::gas;
+        let stub_len = StubExecutor::make_proof_with_public(&Hash::ZERO, 12, [0; 8], &[]).len();
+        // The call pays a whisker over its floor; every transfer pays 5 000 over its flat base,
+        // and carries 4 KiB of envelope so eight of them are a block.
+        let (ledger, _, call) = program_and_call(12, gas::GasPolicy::DEFAULT.call_floor(12, 0, 0, stub_len) + 1, 50);
+        let mut m = Mempool::new(64);
+        m.set_gas_policy(gas::GasPolicy::DEFAULT);
+        let transfer = |n: u32| {
+            let mut b = fixtures::bundle(&ledger, [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], gas::BUNDLE_BASE + 5_000);
+            for e in &mut b.envelopes {
+                e.body = vec![n as u8; 1024];
+            }
+            StubExecutor::bound(Transaction::shielded(ledger.chain_id(), b, Action::None))
+        };
+        let transfers: Vec<Transaction> = (0..12).map(|i| transfer(100 + 4 * i)).collect();
+        let per = transfers[0].encoded_len();
+        let block = 8 * per;
+        assert!(call.encoded_len() < block / 4, "the call fits the reserved quarter: {} of {}", call.encoded_len(), block / 4);
+        for t in &transfers {
+            m.insert(t.clone(), &ledger, &StubExecutor).unwrap();
+        }
+        // No Call pooled: eight transfers fill the block, nothing is held back.
+        let picked = m.candidates_within(&ledger, 100, block);
+        assert_eq!(picked.len(), 8);
+        assert!(picked.iter().all(|t| matches!(t.action, Action::None)));
+        // A Call pooled behind them: it is in the block, and the transfers fill the rest.
+        let call_hash = m.insert(call.clone(), &ledger, &StubExecutor).unwrap();
+        let picked = m.candidates_within(&ledger, 100, block);
+        assert!(picked.iter().any(|t| t.hash() == call_hash), "the Call is crowded out by transfers paying more per KiB");
+        let bytes: usize = picked.iter().map(Transaction::encoded_len).sum();
+        assert!(bytes <= block);
+        assert_eq!(picked.len() - 1, (block - call.encoded_len()) / per, "the space the Call leaves is filled with transfers");
+        // The order is the block's: the Call is in it, and the held-back transfers come last.
+        assert!(picked.iter().position(|t| t.hash() == call_hash).unwrap() <= 6);
+        // A budget with no room past the reserved quarter still carries the Call.
+        assert!(m.candidates_within(&ledger, 100, 4 * per).iter().any(|t| t.hash() == call_hash));
     }
 
     /// Review focus 1 and 2: the policy check never decodes a proof it should not.

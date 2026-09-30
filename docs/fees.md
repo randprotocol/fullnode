@@ -105,6 +105,31 @@ prices are the committed head's, and a transaction lands two or three certified 
 two raises before it lands still admit it; `--fee` overrides. `rand_status` reports
 `gas_prices`.
 
+**Ceilings and the byte load (audit v6, POOL-2; genesis-gated, chain 18 unchanged).** Only a
+Call pays the byte price, but under chain 18's rule every transaction's bytes move it: seven
+transfers (~2.85 MB of proofs each, no byte price paid) fill a block to ~1.9× the 10 MiB target
+and lift `byte_price` ~11 % a block, with no ceiling — about 65 such blocks take it to 1 000× its
+start, and a 1.3 MB Call then costs ~1 RAND instead of ~0.004. Two optional `gas.dynamic` fields
+bound that, each hashed only when set:
+
+- `max_gas_price` / `max_byte_price` (decimal strings, each ≥ the section's starting price):
+  ceilings the controller never lifts a price over. The step is the same
+  (`gas::next_price_capped` = `next_price` clamped), so a price at its ceiling stays there through
+  any run of full blocks and falls from it on the first block under target. Served by
+  `rand_getLimits`. Without them a price has no ceiling — chain 18's rule.
+- `byte_load: "paying"`: `bytes_used` counts only the bytes the byte price is charged on — each
+  Call's proof plus input envelope (`gas::call_bytes`), nothing of a transfer, bond or burn — so a
+  block of transfers moves no byte price. Absent, every transaction's encoded length, as on chain
+  18. `Ledger::block_usage` is the one function the proposer and the replica both call, so the two
+  cannot disagree on the figure.
+
+Under `byte_load: "paying"` a block full of transfers gives a Call no price signal, so the
+proposer reserves room for it (option 4 of the audit, node policy, not a rule): while a Call is
+pooled and pays its current floor, flat-fee transactions take at most three quarters of the
+block's bytes in `Mempool::candidates_within`, and what the Calls leave of the last quarter is
+filled with the transfers held back — no block space is wasted, and with no Call pooled nothing
+changes. A hostile proposer can ignore it; an honest one on chain 18 runs it today.
+
 ## 2. What the sender pays with its own machine: proving
 
 The one cost that varies is producing the STARK proof, and only the sender's machine pays it.

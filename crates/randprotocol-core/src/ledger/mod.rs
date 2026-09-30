@@ -1357,9 +1357,25 @@ impl Ledger {
     /// (`CallReceiptData::gas_used`): `(bytes_used, gas_used)` = (Σ `encoded_len`, calls' gas +
     /// `bundle_gas_limit` per transaction carrying a bundle proof). One function for the
     /// proposer (`HotStuff::propose`) and the replica (`apply_block_for_sync`), which must agree.
+    ///
+    /// Audit v6, POOL-2: under `gas.dynamic.byte_load: "paying"` the bytes are only those the
+    /// byte price is charged on — each `Call`'s proof and input envelope ([`gas::call_bytes`]),
+    /// nothing of a transfer, a bond or a burn — so a block of flat-fee transfers moves no byte
+    /// price. Absent (chain 18), every transaction's encoded length, as before.
     pub fn block_usage(&self, txs: &[Transaction], call_gas: u64) -> (u64, u64) {
         let bundle_gas = self.gas.as_ref().map_or(0, |g| g.bundle_gas_limit);
-        let bytes = txs.iter().fold(0u64, |a, tx| a.saturating_add(tx.encoded_len() as u64));
+        let paying = self.gas.as_ref().and_then(|g| g.dynamic.as_ref()).is_some_and(|d| d.byte_load == Some(gas::ByteLoad::Paying));
+        let bytes = txs.iter().fold(0u64, |a, tx| {
+            let n = if paying {
+                match &tx.action {
+                    Action::Call { proof, input_envelope, .. } => gas::call_bytes(proof, input_envelope.as_ref()),
+                    _ => 0,
+                }
+            } else {
+                tx.encoded_len()
+            };
+            a.saturating_add(n as u64)
+        });
         let bundles = txs.iter().filter(|tx| tx.bundle.is_some()).count() as u64;
         (bytes, call_gas.saturating_add(bundles.saturating_mul(bundle_gas)))
     }
@@ -2572,9 +2588,11 @@ impl Ledger {
         self.sweep_expired_excesses(height, proposer);
         if let Some(d) = self.gas.as_ref().and_then(|g| g.dynamic.as_ref()) {
             let p = self.gas_prices();
+            // Under a ceiling (audit v6, POOL-2) the step is the same and then clamped; without
+            // one `next_price_capped` is `next_price` exactly.
             self.gas_prices = Some(gas::GasPrices {
-                gas_price: gas::next_price(p.gas_price, d.min_gas_price, gas_used, d.target_block_gas, d.adjust_bps),
-                byte_price: gas::next_price(p.byte_price, d.min_byte_price, bytes_used, d.target_block_bytes, d.adjust_bps),
+                gas_price: gas::next_price_capped(p.gas_price, d.min_gas_price, d.max_gas_price(), gas_used, d.target_block_gas, d.adjust_bps),
+                byte_price: gas::next_price_capped(p.byte_price, d.min_byte_price, d.max_byte_price(), bytes_used, d.target_block_bytes, d.adjust_bps),
             });
         }
         // The last block of an epoch admits the bond queue's due stake for the next one, before
@@ -5497,7 +5515,104 @@ mod tests {
                 adjust_bps: 1250,
                 min_gas_price: 100,
                 min_byte_price: 800,
+                max_gas_price: None,
+                max_byte_price: None,
+                byte_load: None,
             }),
+        }
+    }
+
+    /// Audit v6, POOL-2: under `byte_load: "paying"` a block of transfers moves no byte price,
+    /// since a transfer pays none — and under chain 18's rule (no `byte_load`) the same block
+    /// still does, pinned. Seven full transfers, each padded to a chain-18 transfer's ~2.85 MB
+    /// against a 10 MiB target: ~1.9× the target, `+adjust_bps` a block.
+    #[test]
+    fn a_block_of_transfers_moves_the_byte_price_only_under_the_all_bytes_load() {
+        let (a0, _) = keys();
+        let proposer = a0.address();
+        let mut cfg = dynamic_gas();
+        cfg.dynamic.as_mut().unwrap().target_block_bytes = 10_485_760;
+        let transfers: Vec<Transaction> = (0..7u32)
+            .map(|i| {
+                let n = 100 + 4 * i;
+                let mut b = bundle(&ledger(), [[n; 8], [n + 1; 8]], [[n + 2; 8], [n + 3; 8]], gas::BUNDLE_BASE);
+                b.proof = vec![i as u8; 2_850_000];
+                Transaction::shielded(7, b, Action::None)
+            })
+            .collect();
+        let total: usize = transfers.iter().map(Transaction::encoded_len).sum();
+        assert!(total > 19 << 20, "seven of them are a chain-18 block: {total}");
+        // Chain 18's rule: every byte counts, and the block is past twice the target.
+        let mut all = ledger();
+        all.set_gas(Some(cfg.clone()));
+        let (bytes, _) = all.block_usage(&transfers, 0);
+        assert_eq!(bytes as usize, total);
+        all.close_block(1, &proposer, bytes, 0);
+        assert_eq!(all.gas_prices().byte_price, gas::next_price(800, 800, bytes, 10_485_760, 1250));
+        assert_eq!(all.gas_prices().byte_price, 890, "chain 18: 1.9× the target, +11.25 % on a block of transfers");
+        // `paying`: the same block is zero bytes to the controller, and the price falls instead.
+        cfg.dynamic.as_mut().unwrap().byte_load = Some(gas::ByteLoad::Paying);
+        let mut paying = ledger();
+        paying.set_gas(Some(cfg.clone()));
+        paying.set_gas_prices(gas::GasPrices { gas_price: 100, byte_price: 1_000 });
+        let (bytes, gas_used) = paying.block_usage(&transfers, 0);
+        assert_eq!((bytes, gas_used), (0, 7 * gas::gas_max(14, 0, 0)), "no call bytes; the bundles' flat gas as before");
+        paying.close_block(1, &proposer, bytes, gas_used);
+        assert_eq!(paying.gas_prices().byte_price, 875, "an empty block to the byte meter: −12.5 %");
+        // A call's proof and envelope are what count: exactly `call_bytes`, whatever rides beside it.
+        let (mut with_call, id) = ledger_with_program(|l| l.set_gas(Some(cfg.clone())));
+        let proof = vec![5u8; 6 << 20];
+        let call = call_tx(&with_call, 20, id, proof.clone(), fee_for(proof.len()));
+        let mut block = transfers.clone();
+        block.push(call.clone());
+        let (bytes, _) = with_call.block_usage(&block, 0);
+        assert_eq!(bytes as usize, gas::call_bytes(&proof, None));
+        assert!(bytes < call.encoded_len() as u64, "the call's own fee bundle is not charged either");
+        with_call.set_gas_prices(gas::GasPrices { gas_price: 100, byte_price: 1_000 });
+        with_call.close_block(1, &proposer, bytes, 0);
+        let expected = gas::next_price(1_000, 800, bytes, 10_485_760, 1250);
+        assert!(expected < 1_000, "6 MiB of call bytes is under the 10 MiB target");
+        assert_eq!(with_call.gas_prices().byte_price, expected);
+    }
+
+    /// Audit v6, POOL-2: the proposer and the replica compute one figure for a block of mixed
+    /// traffic (`block_usage` is the one function both call), under either byte load, and a
+    /// ceiling holds through full blocks on both sides.
+    #[test]
+    fn proposer_and_replica_agree_on_the_capped_price_after_a_block_of_mixed_traffic() {
+        let (a0, _) = keys();
+        let proposer = a0.address();
+        for byte_load in [None, Some(gas::ByteLoad::Paying)] {
+            let mut cfg = dynamic_gas();
+            let d = cfg.dynamic.as_mut().unwrap();
+            d.byte_load = byte_load;
+            d.max_byte_price = Some(1_000);
+            d.max_gas_price = Some(150);
+            // A stub call proof is ~110 B: a target both loads' blocks pass twice over.
+            d.target_block_bytes = 32;
+            let (l, id) = ledger_with_program(|l| l.set_gas(Some(cfg.clone())));
+            let proof = StubExecutor::make_proof(&id, 12, [7; 8]);
+            let call = call_tx(&l, 20, id, proof.clone(), fee_for(proof.len()) + 1_000_000);
+            let mut transfer = bundle(&l, [[40; 8], [41; 8]], [[42; 8], [43; 8]], gas::BUNDLE_BASE);
+            for e in &mut transfer.envelopes {
+                e.body = vec![9u8; 2048];
+            }
+            let transfer = Transaction::shielded(7, transfer, Action::None);
+            let block = vec![transfer, call];
+            let (mut a, mut b) = (l.clone(), l.clone());
+            // Twelve full blocks: the price climbs to its ceiling and no further, on both sides.
+            for h in 1..=12 {
+                let (bytes, gas_used) = a.block_usage(&block, 40_000);
+                assert_eq!((bytes, gas_used), b.block_usage(&block, 40_000), "{byte_load:?}");
+                a.close_block(h, &proposer, bytes, gas_used);
+                b.close_block(h, &proposer, bytes, gas_used);
+                assert_eq!(a.gas_prices(), b.gas_prices(), "{byte_load:?} block {h}");
+                assert_eq!(a.state_root(), b.state_root(), "{byte_load:?} block {h}");
+            }
+            assert_eq!(a.gas_prices(), gas::GasPrices { gas_price: 150, byte_price: 1_000 }, "{byte_load:?}: at both ceilings");
+            // And falls from the ceiling on an empty block.
+            a.close_block(13, &proposer, 0, 0);
+            assert_eq!(a.gas_prices(), gas::GasPrices { gas_price: 131, byte_price: 875 }, "{byte_load:?}: −12.5 %, floor division");
         }
     }
 

@@ -594,8 +594,11 @@ pub struct GenesisState {
 /// The bytes a `gas` section appends to the genesis commitment, last (design 2026-09-28 §4.2,
 /// §4.3, §7.1): `"gas" ‖ be64(gas_price) ‖ be64(byte_price) ‖ be64(bundle_gas_limit) ‖
 /// "circuit"`, then, under `dynamic`, `"gas_dynamic" ‖ be64(target_block_bytes) ‖
-/// be64(target_block_gas) ‖ be64(adjust_bps) ‖ be64(min_gas_price) ‖ be64(min_byte_price)`.
-/// Pinned byte for byte by `the_gas_sections_hash_contribution_is_pinned`.
+/// be64(target_block_gas) ‖ be64(adjust_bps) ‖ be64(min_gas_price) ‖ be64(min_byte_price)`,
+/// then (audit v6, POOL-2) each of `"max_gas_price" ‖ be64`, `"max_byte_price" ‖ be64` and
+/// `"byte_load" ‖ "paying"` only when the file sets it, in that order — so chain 18's section,
+/// which sets none, commits byte for byte as before. Pinned byte for byte by
+/// `the_gas_sections_hash_contribution_is_pinned`.
 fn gas_commit(g: &gas::GasConfig) -> Vec<u8> {
     let mut commit = Vec::new();
     commit.extend_from_slice(b"gas");
@@ -607,6 +610,18 @@ fn gas_commit(g: &gas::GasConfig) -> Vec<u8> {
         commit.extend_from_slice(b"gas_dynamic");
         for x in [d.target_block_bytes, d.target_block_gas, d.adjust_bps as u64, d.min_gas_price, d.min_byte_price] {
             commit.extend_from_slice(&x.to_be_bytes());
+        }
+        if let Some(m) = d.max_gas_price {
+            commit.extend_from_slice(b"max_gas_price");
+            commit.extend_from_slice(&m.to_be_bytes());
+        }
+        if let Some(m) = d.max_byte_price {
+            commit.extend_from_slice(b"max_byte_price");
+            commit.extend_from_slice(&m.to_be_bytes());
+        }
+        if d.byte_load == Some(gas::ByteLoad::Paying) {
+            commit.extend_from_slice(b"byte_load");
+            commit.extend_from_slice(b"paying");
         }
     }
     commit
@@ -3063,6 +3078,9 @@ mod tests {
             adjust_bps: 1250,
             min_gas_price: 100,
             min_byte_price: 800,
+            max_gas_price: None,
+            max_byte_price: None,
+            byte_load: None,
         });
         assert_ne!(build(&d).hash(), build(&g).hash(), "dynamic is bound under its own tag");
         assert_eq!(Genesis::from_json(&d.to_json()).unwrap(), d, "round-trips");
@@ -3098,6 +3116,9 @@ mod tests {
             adjust_bps: 1250,
             min_gas_price: 100,
             min_byte_price: 800,
+            max_gas_price: None,
+            max_byte_price: None,
+            byte_load: None,
         };
         assert!(bad_dyn(gas::DynamicGas { adjust_bps: 0, ..d.clone() }).contains("adjust_bps"));
         assert!(bad_dyn(gas::DynamicGas { adjust_bps: 5001, ..d.clone() }).contains("adjust_bps"));
@@ -3135,6 +3156,9 @@ mod tests {
                 adjust_bps: 1250,
                 min_gas_price: 0x0102,
                 min_byte_price: 0x0304,
+                max_gas_price: None,
+                max_byte_price: None,
+                byte_load: None,
             }),
             ..fixed.clone()
         };
@@ -3166,6 +3190,39 @@ mod tests {
         ] {
             assert_ne!(hash_of(moved.clone()), base, "{moved:?}");
         }
+        // Audit v6, POOL-2: the two ceilings and the byte load, each tagged and appended only
+        // when set, in this order after the floors — chain 18's section commits as above.
+        let capped = gas::GasConfig {
+            dynamic: Some(gas::DynamicGas {
+                max_gas_price: Some(0x0105),
+                max_byte_price: Some(0x0306),
+                byte_load: Some(gas::ByteLoad::Paying),
+                ..d.clone()
+            }),
+            ..dynamic.clone()
+        };
+        want.extend_from_slice(b"max_gas_price");
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x01, 0x05]);
+        want.extend_from_slice(b"max_byte_price");
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x03, 0x06]);
+        want.extend_from_slice(b"byte_load");
+        want.extend_from_slice(b"paying");
+        assert_eq!(gas_commit(&capped), want);
+        let cd = capped.dynamic.clone().unwrap();
+        for moved in [
+            gas::GasConfig { dynamic: Some(gas::DynamicGas { max_gas_price: Some(0x0106), ..cd.clone() }), ..capped.clone() },
+            gas::GasConfig { dynamic: Some(gas::DynamicGas { max_byte_price: Some(0x0307), ..cd.clone() }), ..capped.clone() },
+            gas::GasConfig { dynamic: Some(gas::DynamicGas { byte_load: None, ..cd.clone() }), ..capped.clone() },
+            gas::GasConfig { dynamic: Some(gas::DynamicGas { max_gas_price: None, ..cd.clone() }), ..capped.clone() },
+            dynamic.clone(),
+        ] {
+            assert_ne!(hash_of(moved.clone()), hash_of(capped.clone()), "{moved:?}");
+        }
+        // A ceiling under the starting price is refused at the file.
+        let mut g = genesis(1);
+        g.max_block_bytes = Some(20 << 20);
+        g.gas = Some(gas::GasConfig { dynamic: Some(gas::DynamicGas { max_gas_price: Some(0x0101), ..cd.clone() }), ..capped.clone() });
+        assert!(matches!(g.validate(), Err(GenesisError::Gas(ref why)) if why.contains("max_gas_price 257 is under the starting gas_price 258")), "{:?}", g.validate());
     }
 
     /// Final-review minor 5: a misspelled key inside `gas` (or `gas.dynamic`) is refused at
@@ -3185,6 +3242,9 @@ mod tests {
                 adjust_bps: 1250,
                 min_gas_price: 100,
                 min_byte_price: 800,
+                max_gas_price: None,
+                max_byte_price: None,
+                byte_load: None,
             }),
         });
         let json = g.to_json();
@@ -3254,6 +3314,9 @@ mod tests {
                 adjust_bps: 1250,
                 min_gas_price: 100,
                 min_byte_price: 800,
+                max_gas_price: None,
+                max_byte_price: None,
+                byte_load: None,
             }),
             ..fixed.clone()
         };

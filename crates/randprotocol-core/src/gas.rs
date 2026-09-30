@@ -265,6 +265,14 @@ pub fn next_price(price: u64, min: u64, used: u64, target: u64, adjust_bps: u32)
     next.max(min)
 }
 
+/// [`next_price`] under a ceiling too (audit v6, POOL-2): the same step, then never over `max`
+/// — a price at its ceiling stays there through any run of full blocks and falls from it as
+/// soon as a block is under target. `max` is `u64::MAX` on a chain without one, which is
+/// [`next_price`] exactly. Genesis holds `min <= start <= max`, so the clamp order is moot.
+pub fn next_price_capped(price: u64, min: u64, max: u64, used: u64, target: u64, adjust_bps: u32) -> u64 {
+    next_price(price, min, used, target, adjust_bps).min(max).max(min)
+}
+
 /// A call's floor on a chain with a `gas` section (spec §3.3, §7.1, §8): `BUNDLE_BASE +
 /// gas_price·gas_limit + byte_price·⌈bytes/1024⌉`, saturating. The declared limit prices the
 /// call, not the header's `gas_max` ceiling — [`GasPolicy::call_floor`] is Phase 0's node-policy
@@ -678,6 +686,58 @@ pub struct DynamicGas {
     /// The floor `byte_price` never falls under, the same way. Must be `<= byte_price`.
     #[serde(with = "crate::ledger::staking::amount_string")]
     pub min_byte_price: u64,
+    /// Audit v6, POOL-2: the ceiling `gas_price` never rises over (a decimal string), so a run of
+    /// full blocks bounds a call's price at a known multiple of the start instead of 1 000× and
+    /// rising. Must be `>= gas_price` (and so `>= min_gas_price`). Absent: no ceiling — chain
+    /// 18's rule, byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_amount_string")]
+    pub max_gas_price: Option<u64>,
+    /// The ceiling `byte_price` never rises over, the same way. Must be `>= byte_price`.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_amount_string")]
+    pub max_byte_price: Option<u64>,
+    /// Audit v6, POOL-2: which bytes move `byte_price`. Absent, every transaction's encoded
+    /// length (chain 18's rule) — so seven transfers, which pay no byte price, can price a Call
+    /// out. `"paying"`: only the bytes that pay it, a Call's proof and input envelope
+    /// ([`call_bytes`]), so the price answers the load it is charged on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_load: Option<ByteLoad>,
+}
+
+/// `DynamicGas::byte_load`: what `bytes_used` counts (audit v6, POOL-2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ByteLoad {
+    /// Only the bytes the byte price is charged on: each `Call`'s proof and input envelope.
+    Paying,
+}
+
+impl DynamicGas {
+    /// The two ceilings as [`next_price`]'s `max`: `u64::MAX` when the file sets none.
+    pub fn max_gas_price(&self) -> u64 {
+        self.max_gas_price.unwrap_or(u64::MAX)
+    }
+
+    pub fn max_byte_price(&self) -> u64 {
+        self.max_byte_price.unwrap_or(u64::MAX)
+    }
+}
+
+/// `Option<u64>` as `amount_string` writes a `u64`: a decimal string when present.
+mod opt_amount_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(n) => crate::ledger::staking::amount_string::serialize(n, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        #[derive(Deserialize)]
+        struct Wrap(#[serde(with = "crate::ledger::staking::amount_string")] u64);
+        Ok(Option::<Wrap>::deserialize(d)?.map(|w| w.0))
+    }
 }
 
 impl GasConfig {
@@ -738,6 +798,14 @@ impl GasConfig {
                     d.min_byte_price, d.adjust_bps
                 ));
             }
+            // Audit v6, POOL-2: a ceiling under the starting price would name a chain that starts
+            // above its own cap (and, through `min <= start`, one whose floor is above it).
+            if d.max_gas_price.is_some_and(|m| m < self.gas_price) {
+                return Err(format!("max_gas_price {} is under the starting gas_price {}", d.max_gas_price(), self.gas_price));
+            }
+            if d.max_byte_price.is_some_and(|m| m < self.byte_price) {
+                return Err(format!("max_byte_price {} is under the starting byte_price {}", d.max_byte_price(), self.byte_price));
+            }
         }
         Ok(())
     }
@@ -760,6 +828,9 @@ mod gas_config_tests {
             adjust_bps: 1250,
             min_gas_price: 100,
             min_byte_price: 800,
+            max_gas_price: None,
+            max_byte_price: None,
+            byte_load: None,
         };
         let mut g = ok();
         g.dynamic = Some(d);
@@ -777,7 +848,16 @@ mod gas_config_tests {
 
     #[test]
     fn the_dynamic_controller_is_bounded() {
-        let base = DynamicGas { target_block_bytes: 2 << 20, target_block_gas: 1 << 18, adjust_bps: 1250, min_gas_price: 100, min_byte_price: 800 };
+        let base = DynamicGas {
+            target_block_bytes: 2 << 20,
+            target_block_gas: 1 << 18,
+            adjust_bps: 1250,
+            min_gas_price: 100,
+            min_byte_price: 800,
+            max_gas_price: None,
+            max_byte_price: None,
+            byte_load: None,
+        };
         let bad = |d: DynamicGas| -> String {
             let mut g = ok();
             g.dynamic = Some(d);
@@ -801,6 +881,33 @@ mod gas_config_tests {
         assert!(bad(DynamicGas { target_block_gas: 0, ..base.clone() }).contains("target_block_gas"));
         assert!(bad(DynamicGas { min_gas_price: 101, ..base.clone() }).contains("min_gas_price"), "the floor cannot exceed the starting price");
         assert!(bad(DynamicGas { min_byte_price: 801, ..base.clone() }).contains("min_byte_price"));
+        // Audit v6, POOL-2: a ceiling under the starting price (so under the floor too) is refused;
+        // one at the starting price is a chain whose price never rises, which is allowed.
+        assert!(bad(DynamicGas { max_gas_price: Some(99), ..base.clone() }).contains("max_gas_price 99 is under the starting gas_price 100"));
+        assert!(bad(DynamicGas { max_byte_price: Some(799), ..base.clone() }).contains("max_byte_price 799 is under the starting byte_price 800"));
+        let mut capped = ok();
+        capped.dynamic = Some(DynamicGas { max_gas_price: Some(100), max_byte_price: Some(8_000), byte_load: Some(ByteLoad::Paying), ..base.clone() });
+        assert!(capped.check(MAX_BLOCK_BYTES).is_ok());
+        let json = serde_json::to_string(&capped).unwrap();
+        assert!(json.contains("\"max_byte_price\":\"8000\"") && json.contains("\"byte_load\":\"paying\""), "{json}");
+        assert_eq!(serde_json::from_str::<GasConfig>(&json).unwrap(), capped);
+        let plain = serde_json::to_string(&ok()).unwrap();
+        assert!(!plain.contains("max_") && !plain.contains("byte_load"), "absent fields are absent: {plain}");
+        assert!(serde_json::from_str::<GasConfig>(&json.replace("paying", "all")).is_err(), "only `paying` is a byte load");
+    }
+
+    /// Audit v6, POOL-2: a price at its ceiling stays there through any run of full blocks, and
+    /// the controller still falls from it; without a ceiling the step is `next_price`'s exactly.
+    #[test]
+    fn a_price_at_its_ceiling_stays_there_and_still_falls() {
+        let t = 2u64 << 20;
+        assert_eq!(next_price_capped(1_000, 800, 1_100, 2 * t, t, 1250), 1_100, "+12.5 % would pass the ceiling: it stops there");
+        assert_eq!(next_price_capped(1_100, 800, 1_100, 2 * t, t, 1250), 1_100, "at the ceiling, a full block: stays");
+        assert_eq!(next_price_capped(1_100, 800, 1_100, u64::MAX, t, 1250), 1_100);
+        assert_eq!(next_price_capped(1_100, 800, 1_100, t, t, 1250), 1_100, "at target: stays");
+        assert_eq!(next_price_capped(1_100, 800, 1_100, 0, t, 1250), 962, "an empty block: falls −12.5 % (floor division)");
+        assert_eq!(next_price_capped(1_000, 800, u64::MAX, 2 * t, t, 1250), next_price(1_000, 800, 2 * t, t, 1250), "no ceiling: next_price");
+        assert_eq!(next_price_capped(800, 800, 800, 2 * t, t, 1250), 800, "floor == ceiling: a fixed price");
     }
 
     /// Spec §7.1: price' = max(min, price + price·adjust·(used − target)/(10 000·target)).

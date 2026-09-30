@@ -698,6 +698,17 @@ pub struct ChainLimits {
     /// `null` on a chain without `dynamic` — including one with a `gas` section whose prices
     /// never move.
     pub adjust_bps: Option<u32>,
+    /// Audit v6, POOL-2: the ceilings the controller never lifts a price over (genesis
+    /// `gas.dynamic.max_gas_price` / `max_byte_price`, decimal strings), `null` where the file
+    /// sets none — chain 18 — or the chain has no `dynamic`.
+    #[serde(serialize_with = "opt_u64_as_decimal_string")]
+    pub max_gas_price: Option<u64>,
+    #[serde(serialize_with = "opt_u64_as_decimal_string")]
+    pub max_byte_price: Option<u64>,
+    /// Which bytes move `byte_price` (genesis `gas.dynamic.byte_load`): `"paying"` when only a
+    /// call's proof and input envelope do, `null` when every transaction's bytes do (chain 18)
+    /// or the chain has no `dynamic`.
+    pub byte_load: Option<&'static str>,
 }
 
 impl ChainLimits {
@@ -716,6 +727,9 @@ impl ChainLimits {
             gas_metering: None,
             bundle_gas_limit: None,
             adjust_bps: None,
+            max_gas_price: None,
+            max_byte_price: None,
+            byte_load: None,
         };
         if let Some(g) = ledger.gas() {
             let prices = ledger.gas_prices();
@@ -724,6 +738,11 @@ impl ChainLimits {
             limits.gas_metering = Some("circuit");
             limits.bundle_gas_limit = Some(g.bundle_gas_limit);
             limits.adjust_bps = g.dynamic.as_ref().map(|d| d.adjust_bps);
+            if let Some(d) = &g.dynamic {
+                limits.max_gas_price = d.max_gas_price;
+                limits.max_byte_price = d.max_byte_price;
+                limits.byte_load = d.byte_load.map(|_| "paying");
+            }
         }
         limits
     }
@@ -4146,6 +4165,9 @@ mod tests {
                 "gas_metering": null,
                 "bundle_gas_limit": null,
                 "adjust_bps": null,
+                "max_gas_price": null,
+                "max_byte_price": null,
+                "byte_load": null,
             })
         );
         let gs = raised_genesis();
@@ -4166,6 +4188,9 @@ mod tests {
                 "gas_metering": null,
                 "bundle_gas_limit": null,
                 "adjust_bps": null,
+                "max_gas_price": null,
+                "max_byte_price": null,
+                "byte_load": null,
             })
         );
         // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
@@ -4188,6 +4213,9 @@ mod tests {
                 "gas_metering": null,
                 "bundle_gas_limit": null,
                 "adjust_bps": null,
+                "max_gas_price": null,
+                "max_byte_price": null,
+                "byte_load": null,
             })
         );
         // The v0.6 switch: what a wallet reads to prove its calls over the call binding (INT-4).
@@ -4243,6 +4271,7 @@ mod tests {
         assert_eq!(v["bundle_gas_limit"], 20_479);
         assert_eq!(v["gas_metering"], "circuit");
         assert_eq!(v["adjust_bps"], serde_json::Value::Null, "no dynamic section");
+        assert_eq!((v["max_gas_price"].clone(), v["max_byte_price"].clone(), v["byte_load"].clone()), (Value::Null, Value::Null, Value::Null));
 
         let fee = ok(&st, "rand_estimateFee", json!([{"kind": "call", "tier": 12, "bytes": 1_300_000, "gas": 3_000}])).await;
         assert_eq!(fee, gas::circuit_call_floor(100, 800, 3_000, 1_300_000).to_string());
@@ -4274,6 +4303,9 @@ mod tests {
                 adjust_bps: 1_250,
                 min_gas_price: 100,
                 min_byte_price: 800,
+                max_gas_price: Some(1_000),
+                max_byte_price: Some(80_000),
+                byte_load: Some(randprotocol_core::gas::ByteLoad::Paying),
             }),
         }));
         let (_d, st) = state_for(&gs);
@@ -4283,6 +4315,8 @@ mod tests {
         let v = ok(&st, "rand_getLimits", json!([])).await;
         assert_eq!(v["gas_price"], "100");
         assert_eq!(v["byte_price"], "800");
+        // Audit v6, POOL-2: the ceilings and the byte load are the genesis's, served as set.
+        assert_eq!((v["max_gas_price"].clone(), v["max_byte_price"].clone(), v["byte_load"].clone()), (json!("1000"), json!("80000"), json!("paying")));
         assert_eq!(ok(&st, "rand_status", json!([])).await["gas_prices"], serde_json::Value::Null);
 
         // An over-target block (double `target_block_bytes`, at-target gas): `close_block`

@@ -1003,6 +1003,34 @@ section — on inputs synthesised from `deploy/genesis-chain17.json`, into a tem
 `deploy/cutover-fleet-chain18.sh` (from chain 17's) is the all-stop/all-start roll;
 `deploy/chain18-bridge-steps.md` has the bridge relayer's own rebuild step.
 
+## The next cut: gas price ceilings and the paying byte load (audit v6, POOL-2)
+
+Audit v6 (§8.22): chain 18's byte price follows every transaction's bytes while only a Call pays
+it, and has no ceiling — a stream of transfers lifts it without bound. Three optional fields
+inside `gas.dynamic`, each hashed only when set, so chain 18's genesis (which sets none) hashes
+and behaves byte for byte as before:
+
+```json
+"dynamic": { …chain 18's five fields…,
+             "max_gas_price": "10000", "max_byte_price": "80000", "byte_load": "paying" }
+```
+
+- **`max_gas_price`, `max_byte_price`** (decimal strings, each ≥ the section's starting price;
+  `GasConfig::check` refuses less): the ceilings. Pick them as the multiple of the start the
+  chain is willing to charge a call at its busiest — 100× is a bound at ~0.4 RAND for a 1.3 MB
+  call against chain 18's unbounded 1 000×-and-rising. `rand-node genesis --max-gas-price
+  --max-byte-price`.
+- **`byte_load: "paying"`** (`rand-node genesis --gas-byte-load paying`): `byte_price` moves by
+  the bytes that pay it — each Call's proof and input envelope — not by every transaction's
+  length. Under it a block of transfers gives no byte-price signal; the proposer's reservation
+  of a quarter of the block for pooled Calls (node policy, live on every build from this one) is
+  what keeps a Call in the block then.
+
+Check on the finished file: `rand-node init` prints `ceiling …/…, byte load paying` in its gas
+line, and `rand_getLimits` on the first node serves `max_gas_price`, `max_byte_price` and
+`byte_load: "paying"`. Wallets need no rebuild: the headroom they pay is unchanged and
+`rand_getLimits` keeps every field it had.
+
 ## The next cut: a `vesting` section is fit to carry (audit v6, STAKE-3, STAKE-4)
 
 Audit v6 (§8.13) said: put no `vesting` section in any genesis until a revoke's destination is

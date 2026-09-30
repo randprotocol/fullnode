@@ -78,9 +78,12 @@ same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap add
 | `--byte-price <UNITS>` | `800` (`BYTE_PRICE_DEFAULT`), only with `--gas-price` | units of RAND per KiB of call proof plus input envelope, from byte 0 |
 | `--bundle-gas-limit <N>` | `gas_max(14, 0, 0)` = `20479`, only with `--gas-price` | the exact `GAS_LIMIT` every bundle proof (transfer, bond, burn, …) must declare on this chain; a bundle proof declaring any other value is refused (`TxError::BundleGasLimit`, permanent), and the genesis itself refuses any value but `20479` (`GasConfig::check`, `gas::bundle_gas_limit_pin`) |
 | `--gas-dynamic <target_bytes>,<target_gas>,<adjust_bps>` | none — fixed prices | Phase 2 (`docs/fees.md` §1.2): turns on the per-block price controller, floored at the section's own starting `gas_price`/`byte_price`. Refused beside `--aggregation` (`GenesisError::DynamicGasWithAggregation`) |
+| `--max-gas-price <UNITS>`, `--max-byte-price <UNITS>` | none — no ceiling (chain 18) | audit v6, POOL-2: the ceilings the controller never lifts a price over, each at least the starting price. Refused without `--gas-dynamic` |
+| `--gas-byte-load paying` | none — every transaction's bytes (chain 18) | audit v6, POOL-2: only a call's proof and input envelope move `byte_price`, so a block of transfers moves none. Refused without `--gas-dynamic`; `paying` is the only value |
 
 `rand-node genesis`/`init` print `gas: price P/gas, B/KiB, bundle limit N, dynamic: target … / …
-gas, adjust … bps, floor …/…` (or `gas: none` without `--gas-price`).
+gas, adjust … bps, floor …/…, ceiling …/…, byte load all|paying` (or `gas: none` without
+`--gas-price`).
 
 Prints one `alloc` line per `--alloc`, then the genesis hash, the validator and note counts, the
 blocks per epoch, the program cap (`programs up to N words`: 4096 unless `--max-program-words` set

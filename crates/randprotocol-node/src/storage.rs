@@ -6645,6 +6645,9 @@ mod tests {
                 adjust_bps: 1250,
                 min_gas_price: 100,
                 min_byte_price: 800,
+                max_gas_price: None,
+                max_byte_price: None,
+                byte_load: None,
             }),
         });
         let gs = g.build(&StubExecutor).unwrap();
