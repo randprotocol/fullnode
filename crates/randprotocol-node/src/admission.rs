@@ -538,12 +538,14 @@ impl GossipOutcome {
     /// `GossipId.propagation_source`), and `None` for an RPC submission, which is not metered.
     /// `queued` is the current verification queue depth.
     ///
-    /// The order is the point. The refused cache first, because it is a hash lookup and because a
-    /// peer flooding one known-bad transaction must not spend an allowance it could have used on a
-    /// good one; then [`oversized_note`] and [`deploy_outside_pc_window`], byte verdicts decided the
-    /// same way. Then the bucket, so
-    /// a burst is shed before anything reads the ledger. Then the queue depth. Everything more expensive than this — `Mempool::precheck`, which hashes a
-    /// bridge attestation, and the proof itself — happens only after a `Verify`.
+    /// The order is the point. The bucket first (audit v6, GOSSIP-1): the transaction id hashes
+    /// the whole transaction, proofs included — up to a block's worth of bytes — so nothing that
+    /// needs it runs until the forwarder is known to be within its allowance. A peer re-sending a
+    /// known-bad transaction now spends a token on it, which is the price of not hashing for it
+    /// first. Then the hash, once, and the refused cache; then [`oversized_note`] and
+    /// [`deploy_outside_pc_window`], byte verdicts cached like a cache hit. Then the queue depth.
+    /// Everything more expensive than this — `Mempool::precheck`, which hashes a bridge
+    /// attestation, and the proof itself — happens only after a `Verify`.
     pub fn for_transaction(
         tx: &Transaction,
         bucket: Option<&mut TokenBucket>,
@@ -552,26 +554,41 @@ impl GossipOutcome {
         queued: usize,
         now: Instant,
     ) -> GossipOutcome {
-        if refused.get(&tx.hash()).is_some() {
+        Self::for_transaction_hashed(tx, || tx.hash(), bucket, refused, limiter, queued, now)
+    }
+
+    /// [`GossipOutcome::for_transaction`] with the transaction id computed by `hash`, called at
+    /// most once — the seam a test counts the hashing through.
+    pub(crate) fn for_transaction_hashed(
+        tx: &Transaction,
+        hash: impl FnOnce() -> Hash,
+        bucket: Option<&mut TokenBucket>,
+        refused: &mut RefusedCache,
+        limiter: &PeerLimiter,
+        queued: usize,
+        now: Instant,
+    ) -> GossipOutcome {
+        if let Some(b) = bucket {
+            if !limiter.allow(b, now) {
+                return GossipOutcome::Report(Acceptance::Ignore);
+            }
+        }
+        let h = hash();
+        if refused.get(&h).is_some() {
             return GossipOutcome::Report(Acceptance::Reject);
         }
         // Then the note-value screen, a field compare (a payload decode for a deposit) and a
         // byte verdict like a cache hit — cached like one too, so the RPC answer names it and a
-        // repeat is the lookup above; before the bucket, for the cache's reason.
+        // repeat is the lookup above.
         if let Some(e) = oversized_note(tx) {
-            refused.insert(tx.hash(), e);
+            refused.insert(h, e);
             return GossipOutcome::Report(Acceptance::Reject);
         }
         // And the pc-window screen (ZKV-11), a comparison on the deploy's own fields, for the
         // same reasons and the same way.
         if let Some(e) = deploy_outside_pc_window(tx) {
-            refused.insert(tx.hash(), e);
+            refused.insert(h, e);
             return GossipOutcome::Report(Acceptance::Reject);
-        }
-        if let Some(b) = bucket {
-            if !limiter.allow(b, now) {
-                return GossipOutcome::Report(Acceptance::Ignore);
-            }
         }
         if queued >= MAX_VERIFY_QUEUE {
             return GossipOutcome::Report(Acceptance::Ignore);
@@ -1279,7 +1296,9 @@ mod tests {
             GossipOutcome::for_transaction(&deposit(MAX_NOTE_VALUE as u128, 4), Some(&mut bucket), &mut refused, &limiter, 0, now),
             GossipOutcome::Report(Acceptance::Reject)
         );
-        assert_eq!(bucket.tokens, None, "a refused deposit spends none of the peer's allowance");
+        // A byte verdict needs the hash, which is paid for only within the forwarder's allowance
+        // (audit v6, GOSSIP-1): the refusal spent one token.
+        assert_eq!(bucket.tokens, Some(15.0), "the refusal was reached within the peer's allowance");
         assert_eq!(GossipOutcome::for_transaction(&fits, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
     }
 

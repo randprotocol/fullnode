@@ -207,6 +207,60 @@ impl Default for WireLimits {
     }
 }
 
+/// The per-forwarder byte budget on gossip frames, in whole frames of the chain's
+/// [`WireLimits::gossip_max_transmit_size`] (audit v6, GOSSIP-1): a burst of eight and two a
+/// second. Charged by a frame's length before it is decoded, so a forwarder over it costs this
+/// node neither the decode nor, for a transaction, the hash that follows.
+///
+/// Sized from CN-4's consensus byte budget (eight views of burst, two a second), which already
+/// has to pass an honest forwarder carrying full blocks — plus the transactions those blocks
+/// carry, which reach a node over the same forwarder as gossip before the proposal does: at the
+/// fleet's ~1.4 s a block and every block full, that is two blocks' bytes a view, about 1.4
+/// frames a second. One frame a second would refuse an honest peer at full load; two is the
+/// headroom. What the budget bounds is the rest: an attacker's frames cost it a connection's
+/// worth of bandwidth for each byte this node decodes, as before, but no longer without a cap.
+pub const GOSSIP_FRAME_BURST: u32 = 8;
+pub const GOSSIP_FRAMES_PER_SEC: f64 = 2.0;
+
+/// The per-forwarder byte meter on gossip frames (audit v6, GOSSIP-1; [`GOSSIP_FRAME_BURST`]).
+/// Its entries are the forwarders of frames — connected peers, bounded by the swarm's caps —
+/// and each leaves when its peer's last connection closes.
+pub struct FrameMeter {
+    limiter: crate::admission::PeerLimiter,
+    buckets: HashMap<PeerId, crate::admission::TokenBucket>,
+}
+
+impl FrameMeter {
+    pub fn new(max_transmit: usize) -> FrameMeter {
+        let frame = max_transmit as u64;
+        let burst = frame.saturating_mul(GOSSIP_FRAME_BURST as u64).min(u32::MAX as u64) as u32;
+        FrameMeter {
+            limiter: crate::admission::PeerLimiter::new(burst, frame as f64 * GOSSIP_FRAMES_PER_SEC),
+            buckets: HashMap::new(),
+        }
+    }
+
+    /// Whether to decode a frame of `len` bytes `forwarder` delivered: charged all or nothing,
+    /// so a refused frame spends none of the budget.
+    pub fn admit(&mut self, forwarder: PeerId, len: usize, now: Instant) -> bool {
+        let bucket = self.buckets.entry(forwarder).or_default();
+        self.limiter.allow_n(bucket, len as f64, now)
+    }
+
+    /// `peer`'s last connection closed.
+    pub fn forget(&mut self, peer: &PeerId) {
+        self.buckets.remove(peer);
+    }
+
+    pub fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+}
+
 /// How reachable an address a peer advertised for itself actually is, from our side of the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddrScope {
@@ -642,6 +696,8 @@ async fn run(
     // Peers mDNS found on our own link: for these, and only these, a private advertised address is
     // worth dialing.
     let mut lan_peers: HashSet<PeerId> = HashSet::new();
+    // What each forwarder may deliver before its frames are decoded (GOSSIP-1).
+    let mut frames = FrameMeter::new(cfg.limits.gossip_max_transmit_size);
     dial_bootstrap(&mut swarm, &cfg, &peers);
     if !cfg.bootstrap.is_empty() {
         let _ = swarm.behaviour_mut().kademlia.bootstrap();
@@ -730,7 +786,7 @@ async fn run(
                 }
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &mut peers, &mut known, &mut lan_peers, &evt_tx).await;
+                handle_swarm_event(event, &mut swarm, &mut peers, &mut known, &mut lan_peers, &mut frames, &evt_tx).await;
             }
         }
     }
@@ -743,6 +799,7 @@ async fn handle_swarm_event(
     peers: &mut HashMap<PeerId, ConnectedPeer>,
     known: &mut HashMap<PeerId, Vec<Multiaddr>>,
     lan_peers: &mut HashSet<PeerId>,
+    frames: &mut FrameMeter,
     evt_tx: &mpsc::Sender<NetworkEvent>,
 ) {
     match event {
@@ -767,6 +824,7 @@ async fn handle_swarm_event(
         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
             if num_established == 0 {
                 peers.remove(&peer_id);
+                frames.forget(&peer_id);
                 tracing::info!(%peer_id, "peer disconnected");
                 let _ = evt_tx.send(NetworkEvent::PeerDisconnected(peer_id)).await;
             }
@@ -784,6 +842,15 @@ async fn handle_swarm_event(
             message,
             message_id,
         })) => {
+            // Metered by length before anything reads the bytes (audit v6, GOSSIP-1): up to a
+            // transmit size's worth of bincode was decoded, and a transaction hashed, before any
+            // per-peer meter ran. Over the budget: `Ignore` — not relayed, no one penalised, and
+            // reported here because the node loop never sees it.
+            if !frames.admit(propagation_source, message.data.len(), Instant::now()) {
+                tracing::debug!(%propagation_source, bytes = message.data.len(), "gossip frame over the forwarder's byte budget; not decoded");
+                report_to_gossipsub(swarm, &GossipId { message_id, propagation_source }, MessageAcceptance::Ignore);
+                return;
+            }
             match bincode::deserialize::<GossipMessage>(&message.data) {
                 Ok(msg) => {
                     // `from` falls back to `propagation_source` for a message that carries no
@@ -914,6 +981,33 @@ mod tests {
         assert_eq!(WireLimits::for_block_bytes(8 << 20).gossip_max_transmit_size, 16 << 20);
         assert_eq!(WireLimits::for_block_bytes(15 << 20).gossip_max_transmit_size, 16 << 20);
         assert_eq!(WireLimits::for_block_bytes(64 << 20).gossip_max_transmit_size, 65 << 20);
+    }
+
+    /// Audit v6, GOSSIP-1: a forwarder's frames are charged by length before decoding. Its burst
+    /// of full frames passes — an honest forwarder relaying full blocks is not refused — and the
+    /// next frame is not decoded until the budget refills; another forwarder's budget is its
+    /// own, a refused frame is charged nothing, and a departed peer's entry goes.
+    #[test]
+    fn a_forwarder_over_its_frame_budget_is_not_decoded() {
+        let limits = WireLimits::for_block_bytes(20 << 20);
+        let frame = limits.gossip_max_transmit_size;
+        let mut m = FrameMeter::new(frame);
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let t = Instant::now();
+        for i in 0..GOSSIP_FRAME_BURST {
+            assert!(m.admit(a, frame, t), "full frame {i} of the burst");
+        }
+        assert!(!m.admit(a, frame, t), "past the burst: not decoded");
+        assert!(!m.admit(a, 1 << 20, t), "not even a small one while the budget is spent");
+        assert!(m.admit(b, frame, t), "another forwarder's budget is its own");
+        // Refill: two frames a second, and a refused frame was charged nothing.
+        let later = t + Duration::from_millis(500);
+        assert!(m.admit(a, frame, later), "half a second buys one frame back");
+        assert!(!m.admit(a, frame, later));
+        assert_eq!(m.len(), 2);
+        m.forget(&a);
+        assert_eq!(m.len(), 1);
+        assert!(m.admit(a, frame, later), "a returning peer starts full: its connection was the cost");
     }
 
     // ------------------------------------------- advertised-address filtering

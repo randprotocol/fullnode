@@ -6683,9 +6683,11 @@ mod tests {
         // A consensus or status message is accepted at once — this node does not validate them at
         // the application level, exactly as before validate_messages() was turned on.
         assert_eq!(GossipOutcome::for_consensus(), GossipOutcome::Report(Acceptance::Accept));
-        // A transaction already refused here is rejected without any verification.
+        // A transaction already refused here is rejected without any verification — from within
+        // its forwarder's allowance, which the hash that finds it in the cache is paid from
+        // (audit v6, GOSSIP-1).
         assert_eq!(
-            GossipOutcome::for_transaction(&tx, Some(&mut bucket), &mut refused, &limiter, 0, t),
+            GossipOutcome::for_transaction(&tx, Some(&mut TokenBucket::default()), &mut refused, &limiter, 0, t),
             GossipOutcome::Report(Acceptance::Reject)
         );
         // A fresh one is queued (and the caller must report when the verdict lands).
@@ -6711,13 +6713,49 @@ mod tests {
             GossipOutcome::for_transaction(&fresh, None, &mut refused, &limiter, MAX_VERIFY_QUEUE, t),
             GossipOutcome::Report(Acceptance::Ignore)
         );
-        // The refused cache is consulted *before* the bucket, so a peer flooding one known-bad
-        // transaction never spends an allowance it could have used on a good one — and the queue
-        // depth last, so a full queue does not mask a free refusal.
+        // The refused cache is consulted before the queue depth, so a full queue does not mask a
+        // refusal — but after the bucket (GOSSIP-1): a forwarder over its allowance is ignored
+        // before its transaction is hashed, known-bad or not.
         assert_eq!(
             GossipOutcome::for_transaction(&tx, Some(&mut TokenBucket::default()), &mut refused, &limiter, MAX_VERIFY_QUEUE, t),
             GossipOutcome::Report(Acceptance::Reject)
         );
+        assert_eq!(
+            GossipOutcome::for_transaction(&tx, Some(&mut bucket), &mut refused, &limiter, 0, t),
+            GossipOutcome::Report(Acceptance::Ignore)
+        );
+    }
+
+    /// Audit v6, GOSSIP-1: the transaction id hashes the whole transaction, proofs included, and
+    /// it was computed for the refused-cache lookup before the forwarder's bucket was consulted —
+    /// so a forwarder over its allowance still cost a hash of every frame. Counted through the
+    /// hashing seam: an empty bucket, no hash; within the allowance, one.
+    #[test]
+    fn a_gossiped_transaction_is_hashed_only_within_its_forwarders_allowance() {
+        use crate::admission::{Acceptance, GossipOutcome, PeerLimiter, RefusedCache, TokenBucket};
+        let (mut refused, limiter, t) = (RefusedCache::new(4), PeerLimiter::new(1, 0.0), Instant::now());
+        let tx = transfer(3);
+        let hashes = std::cell::Cell::new(0u32);
+        let counted = || {
+            hashes.set(hashes.get() + 1);
+            tx.hash()
+        };
+        let mut spent = TokenBucket::default();
+        assert!(limiter.allow(&mut spent, t));
+        assert_eq!(
+            GossipOutcome::for_transaction_hashed(&tx, counted, Some(&mut spent), &mut refused, &limiter, 0, t),
+            GossipOutcome::Report(Acceptance::Ignore)
+        );
+        assert_eq!(hashes.get(), 0, "a forwarder over its allowance cost no hash");
+        let counted = || {
+            hashes.set(hashes.get() + 1);
+            tx.hash()
+        };
+        assert_eq!(
+            GossipOutcome::for_transaction_hashed(&tx, counted, Some(&mut TokenBucket::default()), &mut refused, &limiter, 0, t),
+            GossipOutcome::Verify
+        );
+        assert_eq!(hashes.get(), 1, "within it, the transaction is hashed once");
     }
 
     /// Task 5b review, fix round 1: a marker-form copy must not poison the refused cache. The
