@@ -13,14 +13,13 @@ wallet ──https──> nginx (web droplet, TLS, per-address limit, no access 
                           └─ …
 ```
 
-**Status, 2026-09-30 14:40 UTC — not serving yet.** Done: the DNS record (`prover.randprotocol.org`
-→ the web droplet, DNS-only), the pool's key and public pairing (fingerprint `RGTF-7HKJ-XZFV-GQ1J`),
-the tunnel key on the web droplet, the `v0.6.7-prover.1` pre-release, and every script here —
-`install-host.sh` and the unit were run on a throwaway `c-8` droplet and proved a real chain-18
-transfer in 72.9 s. Not done: the five resizes and host installs (planned: rand-node-a, rand-archive-2,
-rand-guardian-1, -2, -5 — the hosts this operator's DigitalOcean token can resize; the three guardian
-hosts are a stopgap until three of the original validators can be resized instead), `install-web.sh`
-(never run), and the end-to-end send through the public name.
+**Status, 2026-10-01 ~05:00 WITA — serving.** `https://prover.randprotocol.org` answers with the
+pool key (fingerprint `RGTF-7HKJ-XZFV-GQ1J`); the first member (rand-node-a, resized to `c-8`) proved a
+real chain-18 transfer through the public name in 75.4 s (`684f9a4b…252e`, `rand prover pair
+--trusted` then `rand --prover send`). The other four members (rand-archive-2, rand-guardian-1, -2,
+-5 — the hosts this operator's DigitalOcean token can resize; the three guardian hosts are a
+stopgap until three of the original validators can be resized instead) were being resized and
+installed one at a time when this was written; their tunnels come up by themselves.
 
 ## What the pool is
 

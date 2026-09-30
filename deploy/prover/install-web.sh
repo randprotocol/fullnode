@@ -65,8 +65,15 @@ done
     systemctl restart rand-prover-router
     echo 'limit_req_zone \$binary_remote_addr zone=prover:2m rate=240r/m;' > /etc/nginx/conf.d/prover.conf
     if [ ! -f /etc/letsencrypt/live/prover.randprotocol.org/fullchain.pem ]; then
-        # The same DNS-01 method rpc.randprotocol.org's certificate uses (its renewal is automatic).
-        certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini -d prover.randprotocol.org --non-interactive --agree-tos 2>&1 | tail -3
+        # First time: an http-only vhost serves the ACME challenge (the name is DNS-only, so port 80
+        # reaches this host directly), then the real vhost replaces it.
+        install -d -m 0755 /var/www/letsencrypt
+        printf 'server {\n    listen 80;\n    listen [::]:80;\n    server_name prover.randprotocol.org;\n    location /.well-known/acme-challenge/ { root /var/www/letsencrypt; }\n    location / { return 301 https://\$host\$request_uri; }\n}\n' > /etc/nginx/sites-available/prover-randprotocol-acme
+        ln -sf /etc/nginx/sites-available/prover-randprotocol-acme /etc/nginx/sites-enabled/prover-randprotocol-acme
+        rm -f /etc/nginx/sites-enabled/prover-randprotocol
+        nginx -t && systemctl reload nginx
+        certbot certonly --webroot -w /var/www/letsencrypt -d prover.randprotocol.org --non-interactive --agree-tos 2>&1 | tail -3
+        rm -f /etc/nginx/sites-enabled/prover-randprotocol-acme
     fi
     ln -sf /etc/nginx/sites-available/prover-randprotocol /etc/nginx/sites-enabled/prover-randprotocol
     nginx -t && systemctl reload nginx

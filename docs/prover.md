@@ -588,9 +588,6 @@ the 4 MiB default included): a 4 MiB block admits transfers but no `Call` at Pro
 
 ## 9. The validators' prover pool: `prover.randprotocol.org`
 
-*As of 2026-09-30 the pool is being stood up and does not answer yet; `deploy/prover/README.md`
-carries its status.*
-
 A wallet that cannot make a bundle proof and whose owner runs no prover can use the pool the
 chain's validators run: five validator hosts that also prove, behind one name,
 `https://prover.randprotocol.org`. It exists on split-authorisation chains only — it takes
