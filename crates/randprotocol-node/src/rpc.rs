@@ -1070,8 +1070,8 @@ fn attest_deposit(attestation: &[u8], tokens: Option<&TokenRegistry>) -> Option<
 /// with a 10 M supply is 1e16, past `Number.MAX_SAFE_INTEGER`, and zUSD passes it at ~90 M
 /// locked; a JS client reading these as numbers got a silently wrong integer. `mint_day`,
 /// `decimals`, `chain` and `index` are not amounts and stay numbers.
-fn asset_json(index: u32, b: &Backing, mint_cap_per_day: u64, day: u32) -> Value {
-    let (minted_today, mint_day) = backing_mint_figures(b, day);
+fn asset_json(index: u32, b: &Backing, mint: &MintClock) -> Value {
+    let f = mint.backing(index, b);
     json!({
         "index": index,
         "chain": b.chain,
@@ -1079,29 +1079,79 @@ fn asset_json(index: u32, b: &Backing, mint_cap_per_day: u64, day: u32) -> Value
         "asset_id": randprotocol_core::bridge::asset_id(b.chain, &b.token).to_hex(),
         "decimals": b.decimals,
         "locked": b.locked.to_string(),
-        "mint_cap_per_day": mint_cap_per_day.to_string(),
-        "minted_today": minted_today.to_string(),
-        "mint_day": mint_day,
+        "mint_cap_per_day": mint.tokens.mint_cap_per_day().to_string(),
+        "minted_today": f.minted.to_string(),
+        "mint_day": f.mint_day,
+        "minted_in_window": f.in_window.map(|m| m.to_string()),
+        "mint_window_secs": mint.window_secs(),
+        "mint_headroom": f.headroom.to_string(),
     })
 }
 
-/// Bridge hardening B1's mint-cap figures for one backing on `day`: `minted_today`
-/// (`Backing::minted_on`, the figure the cap is checked against, never the raw counter — a
-/// counter left from an earlier day reads zero rather than a stale figure) and `mint_day` (the
-/// day that figure is for; the counter's own day never runs ahead of the head's, since block
-/// timestamps are monotonic). The one place both `rand_getAssets`/`rand_getBridgeState`
-/// (`asset_json`) and the token RPC (`backing_json`) compute these two numbers, so the
-/// day-boundary rule lives in exactly one place regardless of which endpoint's shape wraps it.
-fn backing_mint_figures(b: &Backing, day: u32) -> (u64, u32) {
-    (b.minted_on(day), day.max(b.mint_day))
+/// The mint-cap figures of one backing at the committed head, as the ledger's `check_lock` would
+/// read them for the next deposit (audit v6, BRG-19).
+struct BackingMintFigures {
+    /// What the per-backing cap is checked against: under bridge rules v2 the backing's rolling
+    /// window at the head's block time, else the UTC-day counter (`Backing::minted_on`, never the
+    /// raw counter — one left from an earlier day reads zero). Served as `minted_today`, the
+    /// name the field has always had, because it is the figure readers took it for.
+    minted: u64,
+    /// The UTC day the head's block time falls in (the counter's own day never runs ahead of it).
+    mint_day: u32,
+    /// The rolling-window figure under rules v2, `None` on a day-counter chain.
+    in_window: Option<u64>,
+    /// The largest deposit to this backing the caps would admit now: the per-backing cap less
+    /// `minted`, and under rules v2 no more than what the registry-wide window has left.
+    headroom: u64,
 }
 
-/// B1's mint-cap day of the committed head: the UTC day of its block timestamp, the day the
-/// ledger's `check_lock` would count the next deposit against were it applied on the head's
-/// state (`randprotocol_core::bridge::mint_day` of `timestamp_ms / 1000`).
-fn head_mint_day(storage: &Storage) -> Result<u32, RpcError> {
+/// The head's block time and the registry, which together are every mint-cap figure the RPC
+/// serves. One place, so `rand_getAssets`, `rand_getBridgeState` and the token reads cannot
+/// disagree about the day boundary or the window.
+///
+/// Before audit v6 (BRG-19) the rows carried the UTC-day counter on every chain. Under bridge
+/// rules v2 (chains 15–18) the ledger never reads it: a deposit is judged against a rolling
+/// window per backing and one for all backings together, so across midnight the RPC showed a
+/// full cap of headroom the ledger did not grant, and a lock made on that word could not mint.
+struct MintClock<'a> {
+    tokens: &'a TokenRegistry,
+    /// Unix seconds of the committed head's block.
+    now: u64,
+}
+
+impl MintClock<'_> {
+    fn day(&self) -> u32 {
+        randprotocol_core::bridge::mint_day(self.now)
+    }
+
+    fn window_secs(&self) -> Option<u32> {
+        self.tokens.ext().windows.as_ref().map(|w| w.window_secs)
+    }
+
+    /// `(minted, headroom)` of the registry-wide window; `None` on a day-counter chain.
+    fn global(&self) -> Option<(u64, u64)> {
+        let w = self.tokens.ext().windows.as_ref()?;
+        let minted = w.global_minted(self.now);
+        Some((minted, w.global_cap.saturating_sub(minted)))
+    }
+
+    fn backing(&self, index: u32, b: &Backing) -> BackingMintFigures {
+        let day = self.day();
+        let in_window = self.tokens.ext().windows.as_ref().map(|w| w.backing_minted(index, b.chain, &b.token, self.now));
+        let minted = in_window.unwrap_or_else(|| b.minted_on(day));
+        let own = self.tokens.mint_cap_per_day().saturating_sub(minted);
+        let headroom = self.global().map_or(own, |(_, left)| own.min(left));
+        BackingMintFigures { minted, mint_day: day.max(b.mint_day), in_window, headroom }
+    }
+}
+
+/// The committed head's block time in unix seconds: the `now` the ledger's `check_lock` would
+/// count the next deposit against were it applied on the head's state — its UTC day
+/// (`randprotocol_core::bridge::mint_day`) for the day counter, the end of the rolling windows
+/// under bridge rules v2.
+fn head_mint_now(storage: &Storage) -> Result<u64, RpcError> {
     let head = storage.head_block().map_err(RpcError::internal)?;
-    Ok(randprotocol_core::bridge::mint_day(head.header.timestamp_ms / 1000))
+    Ok(head.header.timestamp_ms / 1000)
 }
 
 /// The bridged half of the token registry as `rand_getAssets` serves it: one row **per backing**,
@@ -1109,12 +1159,13 @@ fn head_mint_day(storage: &Storage) -> Result<u32, RpcError> {
 /// its coins. One zUSD backed by seven coins is seven rows all carrying `index` 1 (spec §12). A
 /// native RPL token is not a bridged asset and is not here (Task 7's `rand_getTokens` is the
 /// whole registry).
-fn assets_json(tokens: &TokenRegistry, day: u32) -> Vec<Value> {
+fn assets_json(tokens: &TokenRegistry, now: u64) -> Vec<Value> {
+    let mint = MintClock { tokens, now };
     tokens
         .iter()
         .flat_map(|info| match &info.authority {
             MintAuthority::Bridge { backings } => {
-                backings.iter().map(|b| asset_json(info.index, b, tokens.mint_cap_per_day(), day)).collect::<Vec<_>>()
+                backings.iter().map(|b| asset_json(info.index, b, &mint)).collect::<Vec<_>>()
             }
             _ => Vec::new(),
         })
@@ -1148,29 +1199,32 @@ const MAX_TOKEN_KEY_CHARS: usize = 100;
 /// `backing_mint_figures` `asset_json` uses for `rand_getAssets`/`rand_getBridgeState` — one
 /// computation, and since chain 14 one encoding too (node I3: every u64 amount is a decimal
 /// string on both, `mint_day` and `decimals` numbers on both).
-fn backing_json(b: &Backing, mint_cap_per_day: u64, day: u32) -> Value {
-    let (minted_today, mint_day) = backing_mint_figures(b, day);
+fn backing_json(index: u32, b: &Backing, mint: &MintClock) -> Value {
+    let f = mint.backing(index, b);
     json!({
         "chain": b.chain,
         "token": hex::encode(b.token),
         "decimals": b.decimals,
         "locked": b.locked.to_string(),
-        "mint_cap_per_day": mint_cap_per_day.to_string(),
-        "minted_today": minted_today.to_string(),
-        "mint_day": mint_day,
+        "mint_cap_per_day": mint.tokens.mint_cap_per_day().to_string(),
+        "minted_today": f.minted.to_string(),
+        "mint_day": f.mint_day,
+        "minted_in_window": f.in_window.map(|m| m.to_string()),
+        "mint_window_secs": mint.window_secs(),
+        "mint_headroom": f.headroom.to_string(),
     })
 }
 
 /// A mint authority in full: `{"kind":"none"}`, `{"kind":"key","key":hex,"address":base58}`,
 /// `{"kind":"bridge","backings":[…]}` or `{"kind":"program","program":hex}`.
-fn authority_json(a: &MintAuthority, mint_cap_per_day: u64, day: u32) -> Value {
+fn authority_json(index: u32, a: &MintAuthority, mint: &MintClock) -> Value {
     match a {
         MintAuthority::None => json!({ "kind": "none" }),
         MintAuthority::Key(pk) => json!({ "kind": "key", "key": pk.to_hex(), "address": pk.address().to_base58() }),
         MintAuthority::Bridge { backings } => {
             json!({
                 "kind": "bridge",
-                "backings": backings.iter().map(|b| backing_json(b, mint_cap_per_day, day)).collect::<Vec<_>>(),
+                "backings": backings.iter().map(|b| backing_json(index, b, mint)).collect::<Vec<_>>(),
             })
         }
         MintAuthority::Program(id) => json!({ "kind": "program", "program": id.to_hex() }),
@@ -1179,7 +1233,7 @@ fn authority_json(a: &MintAuthority, mint_cap_per_day: u64, day: u32) -> Value {
 
 /// One registry row, as `rand_getTokens` lists it and `rand_getToken` returns it. Everything here
 /// is public registry state (RPL spec §4); nothing says which notes hold the token.
-fn token_json(info: &TokenInfo, mint_cap_per_day: u64, day: u32) -> Value {
+fn token_json(info: &TokenInfo, mint: &MintClock) -> Value {
     json!({
         "index": info.index,
         "id": info.id.to_hex(),
@@ -1187,7 +1241,7 @@ fn token_json(info: &TokenInfo, mint_cap_per_day: u64, day: u32) -> Value {
         "name": info.name,
         "symbol": info.symbol,
         "decimals": info.decimals,
-        "authority": authority_json(&info.authority, mint_cap_per_day, day),
+        "authority": authority_json(info.index, &info.authority, mint),
         "mint_nonce": info.mint_nonce,
         "total_supply": info.total_supply.to_string(),
         "registered_at": info.registered_at,
@@ -1197,10 +1251,10 @@ fn token_json(info: &TokenInfo, mint_cap_per_day: u64, day: u32) -> Value {
 /// A token's public supply and, for a bridged token, each backing's locked amount (and B1's mint
 /// cap figures) — what `rand-bridge-audit` reconciles against custody on the source chains.
 /// `backings` is empty for a native token.
-fn supply_json(info: &TokenInfo, mint_cap_per_day: u64, day: u32) -> Value {
+fn supply_json(info: &TokenInfo, mint: &MintClock) -> Value {
     let backings = match &info.authority {
         MintAuthority::Bridge { backings } => {
-            backings.iter().map(|b| backing_json(b, mint_cap_per_day, day)).collect::<Vec<_>>()
+            backings.iter().map(|b| backing_json(info.index, b, mint)).collect::<Vec<_>>()
         }
         _ => Vec::new(),
     };
@@ -2385,7 +2439,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let tokens = st.storage.tokens().map_err(RpcError::internal)?;
             let v2 = st.storage.bridge_meta_v2().map_err(RpcError::internal)?;
             let floor = st.storage.bridge_replay_floor().map_err(RpcError::internal)?;
-            let day = head_mint_day(&st.storage)?;
+            let now = head_mint_now(&st.storage)?;
             let guardians = bridge
                 .guardian_sets
                 .get(&bridge.current_set)
@@ -2420,10 +2474,17 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // carry, and the two cap parameters (`null` on a chain without the section —
                 // chain 14 — where the nonce reads 0 and nothing can move it).
                 "rotation_nonce": v2.as_ref().map_or(0, |m| m.rotation_nonce),
-                "rules_v2": v2.as_ref().map(|m| json!({
-                    "global_mint_cap_per_window": m.rules.global_mint_cap_per_window.to_string(),
-                    "cap_window_secs": m.rules.cap_window_secs,
-                })),
+                // Audit v6, BRG-19: with what the registry-wide window holds at the head's block
+                // time and what it has left — the figures `check_lock` judges a deposit on.
+                "rules_v2": v2.as_ref().map(|m| {
+                    let global = tokens.as_ref().and_then(|t| MintClock { tokens: t, now }.global());
+                    json!({
+                        "global_mint_cap_per_window": m.rules.global_mint_cap_per_window.to_string(),
+                        "cap_window_secs": m.rules.cap_window_secs,
+                        "global_minted_in_window": global.map(|(minted, _)| minted.to_string()),
+                        "global_mint_headroom": global.map(|(_, left)| left.to_string()),
+                    })
+                }),
                 // C15-1: the genesis replay floor, per source chain the lowest sequence a transfer
                 // may carry (`null` on a chain without one — chain 15 and every earlier chain). A
                 // relayer reads it to drop a lock the chain this one was cut from already minted.
@@ -2434,7 +2495,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // `next_index` is gone with the bridge's own registry: there is no index to
                 // predict any more, because a bridged token is listed before it can be deposited
                 // and its index is a fact a wallet reads off `assets` (`rand_getAssets`).
-                "assets": tokens.as_ref().map(|t| assets_json(t, day)).unwrap_or_default(),
+                "assets": tokens.as_ref().map(|t| assets_json(t, now)).unwrap_or_default(),
             }))
         }
         // ---- the token registry (RPL spec §6) ----
@@ -2454,12 +2515,11 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 None | Some(Value::Null) => MAX_TOKEN_PAGE,
                 Some(_) => (param::<u64>(p, 1, "limit")? as usize).min(MAX_TOKEN_PAGE),
             };
-            let day = head_mint_day(&st.storage)?;
-            let cap = tokens.mint_cap_per_day();
+            let mint = MintClock { tokens: &tokens, now: head_mint_now(&st.storage)? };
             // By range from `from`, never a scan of the rows below it (audit v4 TOK-1).
             let rows: Vec<Value> = randprotocol_core::ledger::tokens::page_tokens(&tokens, from, limit)
                 .into_iter()
-                .map(|info| token_json(info, cap, day))
+                .map(|info| token_json(info, &mint))
                 .collect();
             Ok(json!({
                 "enabled": true,
@@ -2482,10 +2542,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         "rand_getToken" => {
             let key = parse_token_key(p, 0)?;
             let tokens = st.storage.tokens().map_err(RpcError::internal)?;
-            let day = head_mint_day(&st.storage)?;
+            let now = head_mint_now(&st.storage)?;
             Ok(tokens
                 .as_ref()
-                .and_then(|t| find_token(t, &key).map(|info| token_json(info, t.mint_cap_per_day(), day)))
+                .and_then(|t| find_token(t, &key).map(|info| token_json(info, &MintClock { tokens: t, now })))
                 .unwrap_or(Value::Null))
         }
         // A token's supply and each backing's locked amount (decimal strings) — the numbers
@@ -2494,10 +2554,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         "rand_getTokenSupply" => {
             let key = parse_token_key(p, 0)?;
             let tokens = st.storage.tokens().map_err(RpcError::internal)?;
-            let day = head_mint_day(&st.storage)?;
+            let now = head_mint_now(&st.storage)?;
             Ok(tokens
                 .as_ref()
-                .and_then(|t| find_token(t, &key).map(|info| supply_json(info, t.mint_cap_per_day(), day)))
+                .and_then(|t| find_token(t, &key).map(|info| supply_json(info, &MintClock { tokens: t, now })))
                 .unwrap_or(Value::Null))
         }
         // The registry alone, which is what a wallet needs to read a note's `asset` word: the
@@ -2506,8 +2566,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         "rand_getAssets" => {
             let tokens = st.storage.tokens().map_err(RpcError::internal)?;
             let bridged = st.storage.bridge_meta().map_err(RpcError::internal)?.is_some();
-            let day = head_mint_day(&st.storage)?;
-            Ok(json!(tokens.as_ref().filter(|_| bridged).map(|t| assets_json(t, day)).unwrap_or_default()))
+            let now = head_mint_now(&st.storage)?;
+            Ok(json!(tokens.as_ref().filter(|_| bridged).map(|t| assets_json(t, now)).unwrap_or_default()))
         }
         // The outbound message with this sequence, verbatim, for guardians to sign.
         "rand_getBridgeBurn" => {
@@ -5032,10 +5092,65 @@ mod tests {
         st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         let v = ok(&st, "rand_getBridgeState", json!([])).await;
         assert_eq!(v["rotation_nonce"], 1);
-        assert_eq!(v["rules_v2"], json!({ "global_mint_cap_per_window": "1000000", "cap_window_secs": 86_400 }));
+        assert_eq!(
+            v["rules_v2"],
+            json!({
+                "global_mint_cap_per_window": "1000000", "cap_window_secs": 86_400,
+                "global_minted_in_window": "0", "global_mint_headroom": "1000000",
+            })
+        );
         assert_eq!(v["pause_key"], key(0x99).public_key().to_hex(), "the rotated key");
         let t = ok(&st, "rand_getTransaction", json!([rotate.hash().to_hex()])).await;
         assert_eq!(t["tx"]["action"]["kind"], "rotate_pause_key");
+    }
+
+    /// Audit v6, BRG-19. Under bridge rules v2 the ledger judges a deposit against rolling
+    /// windows — one per backing, one for every backing together — and the UTC-day counter bounds
+    /// nothing. The RPC went on serving that counter as `minted_today`, and nothing served the
+    /// windows: twelve hours after a deposit, across midnight, it read zero and a tool took the
+    /// whole cap for headroom while the ledger still counted the deposit against both windows
+    /// (and would refuse a lock the site had just called fine). The rows now carry the figures
+    /// `check_lock` reads, and the smaller of the two headrooms.
+    #[tokio::test]
+    async fn under_rules_v2_the_mint_figures_are_the_rolling_windows_not_the_utc_day() {
+        let (gs, secrets) = fixtures::bridged_genesis_v2(1);
+        let (_d, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let att = fixtures::attest_tx(&ledger, fixtures::attestation(&secrets, &fixtures::recipient(), 1_000, 0), 20);
+        // 18:00 on day 0, then an empty block at 06:00 on day 1: a new UTC day, the same window.
+        let b1 = crate::storage::fixtures::make_block_at(&gs.block, &mut ledger, vec![att], &key(1), 64_800_000);
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let b2 = crate::storage::fixtures::make_block_at(&b1, &mut ledger, vec![], &key(1), 108_000_000);
+        st.storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+        let stored = st.storage.tokens().unwrap().unwrap();
+        assert_eq!(stored.backing(1, 2, &fixtures::TOKEN).unwrap().minted_on(1), 0, "the day counter reads nothing on day 1");
+        let windows = stored.ext().windows.as_ref().expect("rules v2");
+        assert_eq!(windows.backing_minted(1, 2, &fixtures::TOKEN, 108_000), 1_000, "the ledger still counts it");
+
+        let assets = ok(&st, "rand_getAssets", json!([])).await;
+        let row = &assets[0];
+        assert_eq!(row["minted_today"], "1000", "the figure the cap is checked against, not the stale day counter's zero");
+        assert_eq!(row["minted_in_window"], "1000");
+        assert_eq!(row["mint_window_secs"], 86_400);
+        // The global window (1 000 000 in this fixture) is the tighter of the two caps.
+        assert_eq!(row["mint_headroom"], "999000");
+        let v = ok(&st, "rand_getBridgeState", json!([])).await;
+        assert_eq!(v["assets"], assets, "both reads serve the same rows");
+        assert_eq!(
+            v["rules_v2"],
+            json!({
+                "global_mint_cap_per_window": "1000000", "cap_window_secs": 86_400,
+                "global_minted_in_window": "1000", "global_mint_headroom": "999000",
+            })
+        );
+        let supply = ok(&st, "rand_getTokenSupply", json!([1])).await;
+        assert_eq!(supply["backings"][0]["minted_in_window"], "1000");
+        assert_eq!(supply["backings"][0]["mint_headroom"], "999000");
+        // A day-counter chain keeps its shape and says there is no window.
+        let (_d, st, _gs, _) = bridged_chain();
+        let assets = ok(&st, "rand_getAssets", json!([])).await;
+        assert_eq!((&assets[0]["minted_in_window"], &assets[0]["mint_window_secs"]), (&Value::Null, &Value::Null));
+        assert_eq!(assets[0]["mint_headroom"], (100_000u64 * 100_000_000 - 1_000).to_string());
     }
 
     /// The bridge's public state, as a relayer and a guardian read it: who signs, who may
@@ -5079,6 +5194,7 @@ mod tests {
             // B1: the registry's per-backing daily cap, and this coin's counter — the 1 000
             // deposited on the fixture's day 0; the burn released custody, not the counter.
             "mint_cap_per_day": (100_000u64 * 100_000_000).to_string(), "minted_today": "1000", "mint_day": 0,
+            "minted_in_window": null, "mint_window_secs": null, "mint_headroom": (100_000u64 * 100_000_000 - 1_000).to_string(),
         });
         assert_eq!(ok(&st, "rand_getAssets", json!([])).await, json!([row]));
         assert_eq!(v["assets"], json!([row]));
@@ -5244,6 +5360,7 @@ mod tests {
                 {
                     "chain": 2, "token": hex::encode(fixtures::TOKEN), "decimals": 8, "locked": "600",
                     "mint_cap_per_day": (100_000u64 * 100_000_000).to_string(), "minted_today": "1000", "mint_day": 0,
+            "minted_in_window": null, "mint_window_secs": null, "mint_headroom": (100_000u64 * 100_000_000 - 1_000).to_string(),
                 }
             ] })
         );
@@ -5327,6 +5444,7 @@ mod tests {
                 {
                     "chain": 2, "token": hex::encode(fixtures::TOKEN), "decimals": 8, "locked": "600",
                     "mint_cap_per_day": (100_000u64 * 100_000_000).to_string(), "minted_today": "1000", "mint_day": 0,
+            "minted_in_window": null, "mint_window_secs": null, "mint_headroom": (100_000u64 * 100_000_000 - 1_000).to_string(),
                 }
             ] })
         );

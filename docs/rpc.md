@@ -796,6 +796,9 @@ registry. One row per **backing** (source coin). `locked`, `mint_cap_per_day` an
 are decimal strings in the token's own eight-decimal units, never RAND's; `mint_day` is a plain
 integer, a UTC day number, not an amount. `mint_cap_per_day` (bridge hardening B1) is the
 genesis `tokens.mint_cap_per_day`, the most one backing may mint per UTC day of the block time;
+Under bridge rules v2 each row also carries `minted_in_window`, `mint_window_secs` and
+`mint_headroom` (see the 2026-09-30 changelog entry), and `minted_today` is the rolling-window
+count; the rest of this paragraph describes a day-counter chain (chain 14).
 `minted_today` is what this backing has minted on `mint_day`, the
 UTC day (`timestamp_ms / 86 400 000`) of the **head block** — the figure the cap would count the
 next deposit against, so a counter left from an earlier day reads `"0"` once the head crosses
@@ -1421,6 +1424,26 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-09-30 — audit v6: the mint figures are the ones the ledger judges (BRG-19)
+
+Node-only, additive. On a chain with bridge rules v2 (chains 15–18) a deposit is judged against a
+rolling window per backing and one for all backings together; the UTC-day counter bounds nothing
+there, and the RPC went on serving it.
+
+- **Every backing row** (`rand_getAssets`, `rand_getBridgeState.assets[]`, the `backings` of
+  `rand_getToken`/`rand_getTokens`/`rand_getTokenSupply`) gains `minted_in_window` (decimal
+  string; `null` on a day-counter chain), `mint_window_secs` (number; `null` likewise) and
+  **`mint_headroom`** (decimal string): the largest deposit to that backing the caps admit at
+  the head's block time — the per-backing cap less what it has minted, and under rules v2 no
+  more than the registry-wide window has left. **Read `mint_headroom`, not
+  `mint_cap_per_day − minted_today`**: the second ignores the global cap.
+- **`minted_today`** is, as its description always said, the figure the per-backing cap is
+  checked against — under rules v2 that is now the rolling-window count, not the day counter
+  (which read zero after midnight while the ledger still counted the deposit). `mint_day` is
+  unchanged.
+- **`rand_getBridgeState.rules_v2`** gains `global_minted_in_window` and `global_mint_headroom`
+  (decimal strings).
 
 ### 2026-09-28 — gas (Phase 1 + Phase 2): the chain's own `gas` section, and the tip's moving prices
 
