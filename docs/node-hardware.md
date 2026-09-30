@@ -99,10 +99,19 @@ On the new droplet, as root, with the binaries copied from E to `/usr/local/bin/
 (or at least `deploy/`) at `/root/fullnode`:
 
 ```bash
-rand-node keygen --out /root/fullnode/deploy/node-<name>.key.json
-rand-node address --key /root/fullnode/deploy/node-<name>.key.json   # address, public key, peer id
+install -d -m 700 /root/keys
+test -e /root/keys/node-<name>.key.json || rand-node keygen --out /root/keys/node-<name>.key.json
+rand-node address --key /root/keys/node-<name>.key.json   # address, public key, peer id
 rand-node init --datadir /root/data-<name>-<genesis8> --genesis /root/fullnode/deploy/genesis-chain<N>.json
 ```
+
+**The key goes in `/root/keys`, never under `/root/fullnode`.** `deploy/rebuild-vps.sh` and
+`deploy/push-to-vps.sh` rsync `/root/fullnode` with `--delete` from a `git archive` of the commit,
+which holds no key file: a key kept in that tree is deleted by the next rebuild and the unit then
+fails to restart (audit v6, OPS-8; until 2026-09-30 this page and `deploy/vps-setup.sh` said
+`/root/fullnode/deploy/`). The fleet has kept its keys in `/root/keys/node-<name>.key.json` since
+the chain-14 cut. `keygen` overwrites an existing file, hence the `test -e`. Back the key up off
+the host before bonding it.
 
 `init` prints the genesis hash. It must equal the one the chain announced. On a chain whose
 genesis sets `max_program_words`, the binary must be a v0.4 build before `init`, or the hash
@@ -116,7 +125,7 @@ Description=RAND full node (<name>)
 After=network-online.target
 [Service]
 Environment=RUST_LOG=info,libp2p=warn,libp2p_mdns=off
-ExecStart=/usr/local/bin/rand-node run --datadir /root/data-<name>-<genesis8> --key /root/fullnode/deploy/node-<name>.key.json --validator --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:8545 --no-mdns --bootstrap <multiaddr> --bootstrap <multiaddr>
+ExecStart=/usr/local/bin/rand-node run --datadir /root/data-<name>-<genesis8> --key /root/keys/node-<name>.key.json --validator --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:8545 --no-mdns --bootstrap <multiaddr> --bootstrap <multiaddr>
 Restart=always
 RestartSec=3
 [Install]
