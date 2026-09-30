@@ -351,17 +351,46 @@ async fn validator_restarts_from_disk_and_resumes() {
     let b = start_node(&ks[1], &gen, vec![bootstrap_addr(&a)], true).await;
     wait_height(&[&a, &b], 4, Duration::from_secs(40)).await;
 
-    // Stop B. With two validators the chain must halt: no QC without both signatures.
-    let height_at_stop = b.height();
-    let dir = stop(b).await;
+    // Stop B. `height_at_stop` is the head B left on disk, read after it stopped — not a height
+    // read from the running node first, which is stale by whatever B commits before its loop is
+    // gone (audit v6, PROC-8; `stop_and_head`).
+    let (dir, height_at_stop) = stop_and_head(b).await;
+
+    // With two validators the chain must halt: no QC without both signatures. What A may still
+    // commit is what B's last votes certified, and that is at most two blocks past B's disk head:
+    // the node loop broadcasts a vote before it persists the commit the same proposal earned, so
+    // B stopped between the two has head h on disk and a vote out for the block at h + 4, whose
+    // QC lets A commit h + 2. B cannot have voted for h + 5: that is a later turn of its loop,
+    // and the turn before it ends by persisting h + 1. (The old bound was `+ 1` against a height
+    // read before the stop.) So: let A finish whatever is in flight, check the bound, then watch
+    // it NOT move for three seconds — many times the block interval, and no condition to wait on,
+    // because the thing asserted is that nothing happens.
+    let a_head = || a.handle.storage.head().unwrap().height;
+    let mut a_height = a_head();
+    let settle = Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = a_head();
+        if now == a_height {
+            break;
+        }
+        assert!(settle.elapsed() < Duration::from_secs(20), "A is still committing {:?} after B stopped: {a_height} -> {now}", settle.elapsed());
+        a_height = now;
+    }
+    assert!(
+        a_height <= height_at_stop + 2,
+        "A committed {a_height}, more than two past the head B left on disk ({height_at_stop}): blocks were certified without B"
+    );
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let a_height = a.height();
-    assert!(a_height <= height_at_stop + 1, "chain advanced without quorum: {a_height} > {height_at_stop}");
+    assert_eq!(a_head(), a_height, "chain advanced without quorum");
 
     // Restart B from the same directory: it resumes at its persisted head and the chain continues.
+    // `>=`, not `==`: B is running again by the time this reads its head, and with A waiting on
+    // it the pair can commit at once. What the restart must not do is LOSE a block — a startup
+    // check that truncated would show as a head below the one B left on disk.
     let b = start_in(dir, &ks[1], vec![bootstrap_addr(&a)], true).await;
     let resumed_from = b.handle.storage.head().unwrap().height;
-    assert_eq!(resumed_from, height_at_stop);
+    assert!(resumed_from >= height_at_stop, "restart lost committed blocks: reopened at {resumed_from}, left {height_at_stop} on disk");
     wait_height(&[&a, &b], a_height + 4, Duration::from_secs(60)).await;
     let common = a.height().min(b.height());
     assert_eq!(
@@ -386,9 +415,11 @@ async fn restart_cycles_keep_all_nodes_in_sync() {
     // Restart nodes 1, 2, 3 in turn (never the bootstrap node, so the others keep an address to dial).
     for cycle in 0..2u8 {
         for i in 1..4 {
-            let before = nodes[i].handle.storage.head().unwrap().height;
+            // `before` is the head the node left on disk, read after it stopped. Reading it
+            // from the running node first raced the node's own commits (audit v6, PROC-8: CI run
+            // 36522467514, "restart lost committed blocks, left: 79, right: 76").
             let stopped = nodes.remove(i);
-            let dir = stop(stopped).await;
+            let (dir, before) = stop_and_head(stopped).await;
             // Others advance while it is down.
             let rest: Vec<&TestNode> = nodes.iter().collect();
             let target = rest.iter().map(|n| n.height()).max().unwrap() + 4;
@@ -397,7 +428,11 @@ async fn restart_cycles_keep_all_nodes_in_sync() {
             let (_, cm) = nodes[0].mint(10 + cycle * 4 + i as u8, UNITS_PER_RAND).await;
 
             let restarted = start_in(dir, &ks[i], boot.clone(), true).await;
-            assert_eq!(restarted.handle.storage.head().unwrap().height, before, "restart lost committed blocks");
+            // `>=`, not `==`: the restarted node is behind three live peers and starts syncing
+            // as soon as its loop runs, so by the time this reads its head it may already have
+            // taken blocks. Losing one is the failure, and that is a head BELOW the disk head.
+            let reopened = restarted.handle.storage.head().unwrap().height;
+            assert!(reopened >= before, "restart lost committed blocks: reopened at {reopened}, left {before} on disk");
             wait_caught_up(&restarted, &nodes.iter().collect::<Vec<_>>(), Duration::from_secs(60)).await;
             wait_for("the missed note arrives", Duration::from_secs(30), || restarted.holds(&cm)).await;
             nodes.insert(i, restarted);

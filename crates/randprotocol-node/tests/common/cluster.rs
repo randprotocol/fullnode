@@ -146,6 +146,41 @@ pub async fn stop(n: TestNode) -> tempfile::TempDir {
     n.dir
 }
 
+/// Stop a node, keep its data directory, and return the height of the head the node left ON
+/// DISK, read after it has stopped. The restart tests use this; [`stop`] is unchanged for the
+/// tests that only take a node down.
+///
+/// A restart test must compare what the restarted node opens with this, never with a height read
+/// from the running node before the stop (audit v6, PROC-8): the node keeps committing until its
+/// loop is actually gone, so a height taken first is stale by however many blocks it commits in
+/// between — CI run 36522467514 failed `restart_cycles_keep_all_nodes_in_sync` with "restart lost
+/// committed blocks, left: 79, right: 76", three blocks committed between the read and the stop.
+///
+/// It also waits on the condition a restart needs instead of a fixed 300 ms: that this function
+/// holds the last reference to the node's `Storage`, i.e. every task of the stopped node has let
+/// go of the database. RocksDB refuses a second open of a directory this process still holds, and
+/// a blocking task that outlives the abort holds it for as long as it runs.
+pub async fn stop_and_head(n: TestNode) -> (tempfile::TempDir, u64) {
+    let TestNode { handle, dir, rpc } = n;
+    // The client first: a kept-alive connection keeps the RPC server's connection task, and with
+    // it the server's handle on the storage, alive.
+    drop(rpc);
+    let storage = handle.storage.clone();
+    handle.shutdown().await;
+    let start = Instant::now();
+    while std::sync::Arc::strong_count(&storage) > 1 {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "a stopped node still holds its database after 60 s ({} other references to its storage)",
+            std::sync::Arc::strong_count(&storage) - 1
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let head = storage.head().unwrap().height;
+    drop(storage);
+    (dir, head)
+}
+
 pub fn bootstrap_addr(n: &TestNode) -> libp2p::Multiaddr {
     let mut a = n.handle.listen_addrs[0].clone();
     a.push(libp2p::multiaddr::Protocol::P2p(n.handle.network.local_peer_id));

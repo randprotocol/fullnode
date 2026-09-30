@@ -4156,10 +4156,29 @@ mod tests {
             batch.put_cf(s.cf(CF_ANCHORS), i.to_be_bytes(), [1u8; 8]);
             s.db.write(batch).unwrap();
         }
-        // The cap's forced flushes and the log deletions they earn run on RocksDB's background
-        // threads, so a slow runner measured mid-flush (the v0.5.4 tag's CI run did) and saw the
-        // pile still there. Poll instead of reading once: under the cap the pile shrinks within
-        // seconds; without it `anchors` pins every log and it never does (the probe stays red).
+        // What is being waited for, and why a read-once (v0.5.4) and then a poll with a fixed
+        // 20 s (v0.5.5) were both racy (audit v6, PROC-8):
+        //
+        // RocksDB enforces `max_total_wal_size` in the WRITE path and nowhere else. A write that
+        // finds the logs over the cap marks the oldest log "being flushed", switches the
+        // memtables that pin it and schedules their flush on a background thread; until that
+        // flush lands, no further write re-checks the cap, and the writes above do not wait for
+        // it. So when the loop ends, the pile is whatever was written while the last flush was in
+        // flight — measured on a laptop, 13–61 MB alone and up to 68 MB under load, against the
+        // 72 MB this test allows — and once the writes stop NOTHING brings it down to the cap:
+        // the old poll only watched the in-flight flush finish (it settled at 0–31 MB, wherever
+        // that flush happened to leave it). On a runner whose flush is slower relative to its
+        // writes the pile starts above the bound, and whether it got under it within 20 s was
+        // the runner's luck, not the cap's doing.
+        //
+        // So wait on the condition the cap actually guarantees, the way the node meets it: a
+        // quiet chain keeps committing small blocks. Each pass below writes one more anchor — a
+        // few bytes to the quiet family, nothing to `blocks` — which makes RocksDB re-check the
+        // cap; under the cap the next flush releases the old logs and the pile falls under the
+        // bound and stays there. Without the cap those same writes change nothing: `anchors`
+        // pins every log since the first and the ~256 MB never moves (checked by opening with
+        // RocksDB's default instead: red, at the full 256 MB). The deadline is long because a
+        // loaded runner can take tens of seconds to flush; a healthy run leaves in well under one.
         let wal_bytes = || -> u64 {
             std::fs::read_dir(dir.path().join("db"))
                 .unwrap()
@@ -4169,13 +4188,32 @@ mod tests {
                 .sum()
         };
         let write_buffer: u64 = 64 * 1024 * 1024;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        let mut wal = wal_bytes();
-        while wal > cap + write_buffer && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+        let bound = cap + write_buffer;
+        let patience = std::time::Duration::from_secs(180);
+        let started = std::time::Instant::now();
+        let at_end_of_writes = wal_bytes();
+        let mut wal = at_end_of_writes;
+        let mut peak = wal;
+        let mut next: u64 = 4096;
+        while wal > bound && started.elapsed() < patience {
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.put_cf(s.cf(CF_ANCHORS), next.to_be_bytes(), [1u8; 8]);
+            s.db.write(batch).unwrap();
+            next += 1;
+            std::thread::sleep(std::time::Duration::from_millis(100));
             wal = wal_bytes();
+            peak = peak.max(wal);
         }
-        assert!(wal <= cap + write_buffer, "{wal} bytes of write-ahead log against a {cap}-byte cap");
+        assert!(
+            wal <= bound,
+            "the write-ahead log is still {wal} bytes ({} MB) after {:.1} s and {} more quiet blocks, against a \
+             {cap}-byte cap (bound {bound} = cap + one write buffer); it was {at_end_of_writes} bytes when the \
+             writes ended and peaked at {peak}. Under the cap every further write re-checks it, so a pile \
+             that never falls means the cap is not applied (or a quiet family pins the logs again).",
+            wal >> 20,
+            started.elapsed().as_secs_f64(),
+            next - 4096,
+        );
     }
 
     #[test]
