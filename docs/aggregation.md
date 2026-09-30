@@ -141,6 +141,17 @@ bincode index is part of every txid); `slashed` stays in the supply identity at 
 
 ## Before enabling aggregation
 
+**Aggregation does not remove the auth proof (audit v6, AGG-7; recorded 2026-09-30).** On a
+split-authorisation chain (`hc_auth` set: chains 17 and 18) a bundle carries two proofs: the
+tier-14 bundle proof (~1.49 MB) and the tier-10 auth proof (~1.36 MB). The aggregate program
+verifies bundle proofs only, and the pruned form replaces only `Bundle.proof`
+(`Transaction::hash`'s doc comment: "The pruned form replaces only `proof`, never `auth_proof`").
+So sealing a window shrinks a transfer from ~2.85 MB to ~1.36 MB, not to nothing, and a node
+syncing sealed history still verifies every auth proof itself. Either the aggregate program is
+extended to verify the auth proof too, so the pruned form can replace both — a program change,
+with the digest re-measured and re-pinned — or storage is planned on 1.36 MB a transfer. Decide
+before aggregation is switched on.
+
 Aggregation is off on every live chain, and `rand-node` refuses to start on any genesis that
 carries an `aggregation` section (`node::check_build_runs_genesis`). Two reasons hold it there;
 both have to clear before a genesis may switch it on.

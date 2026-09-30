@@ -373,7 +373,14 @@ it onto the chain-16 fleet; it lands with the chain-17 cut.** Phase 1's v0.6.2 s
 - **Measured** (laptop, test profile): v3 bundle 102 s local / 108–111 s via a paired prover, auth
   6.4–7.4 s; the 2026-09-29 end-to-end run (`docs/prover.md`): a non-own viewing-key-only
   `rand-prover` proved a 5 RAND send, committed, payee credited. A transfer is ~2.85 MB of proofs
-  (1.49 + 1.36 MB) — one per 4 MiB block and no Call, ~7 per 20 MiB block; aggregation is the remedy.
+  (1.49 + 1.36 MB) — one per 4 MiB block and no Call, ~7 per 20 MiB block; aggregation is the
+  remedy for at most the 1.49 MB half. (Corrected 2026-09-30, audit v6, AGG-7: this said
+  "aggregation is the remedy". The pruned form replaces only `Bundle.proof`; the aggregate program
+  never covers the auth proof, the sealed-sync path verifies it itself, and the txid takes it by
+  digest — so a split-authorisation transfer keeps its ~1.36 MB auth proof for ever until the
+  aggregate program also verifies it, which is a program change: re-measure and re-pin the digest.
+  Plan storage on 1.36 MB a transfer on an `hc_auth` chain. Dormant: aggregation is off on every
+  chain.)
   A v3 genesis must set `max_block_bytes ≥ 3·max_proof_bytes + 1 MiB` (three proofs: bundle, auth,
   call; `Genesis::validate` refuses the 4 MiB default); chain 17: 4 MiB proofs, 20 MiB blocks.
 - **Trap — the wallet's remote path on a pre-v3 chain is unchanged** (a spend-key job to an own
