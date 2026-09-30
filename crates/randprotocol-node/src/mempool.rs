@@ -66,6 +66,10 @@ pub struct Claims {
     /// (audit v6, CH-9): what the pool re-prices the call from at selection, when the prices
     /// have moved since it was admitted.
     pub gas_limit: Option<u64>,
+    /// Pooled transactions to drop so this one fits under the pool's byte cap (audit v6, CH-7;
+    /// [`MAX_POOL_BLOCKS`]): each ranked strictly below it, cheapest per KiB first. Empty while
+    /// the pool is under the cap, and always for a governance action.
+    pub evict: Vec<Hash>,
     /// For a `BridgeAttest`, the bridge's `rotation_nonce` on the ledger it was screened against
     /// (audit v6, BRG-12); `None` for everything else. The attestation's post-quantum
     /// co-signatures were verified against the PQ guardian set of that moment, and a
@@ -195,6 +199,20 @@ fn is_governance(action: &Action) -> bool {
             | Action::RotatePqGuardians { .. }
             | Action::RotatePauseKey { .. }
     )
+}
+
+/// The pool holds at most this many blocks' worth of transaction bytes (audit v6, CH-7): eight
+/// times the ledger's `max_block_bytes` — 160 MiB on a 20 MiB-block chain. The count cap alone
+/// (10 000) bounded nothing in bytes when a transaction runs from 1.3 MB to over 12 MB. Eight
+/// blocks is more than a proposer can use before the pool is refilled by gossip; past it an
+/// entry that pays more per KiB displaces the cheapest (see [`Mempool::make_room`]).
+pub const MAX_POOL_BLOCKS: usize = 8;
+
+/// A transaction's fee above its floor, per KiB of its encoding (spec 2026-09-28 §7): the key the
+/// proposer ranks candidates by under a price, and the key the byte cap evicts by (audit v6,
+/// CH-7) — what a byte of this transaction pays beyond what it must.
+fn surplus_per_kib(fee: u64, floor: u64, len: usize) -> u128 {
+    (fee.saturating_sub(floor) as u128 * 1024) / len.max(1) as u128
 }
 
 fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
@@ -378,7 +396,51 @@ impl Mempool {
         let mut c = c;
         let pricing = self.gas_policy_floor(&tx, ledger, executor).map_err(MempoolError::Invalid)?;
         (c.floor, c.gas_limit) = (pricing.floor, pricing.gas_limit);
+        c.evict = self.make_room(&tx, c.floor, ledger)?;
         Ok(self.admit(tx, c))
+    }
+
+    /// Room for `tx` under the byte cap (audit v6, CH-7): `MAX_POOL_BLOCKS` × the ledger's
+    /// `max_block_bytes`, read from the ledger each time so it follows the chain's genesis. Under
+    /// the cap, nothing to drop. Over it, the pooled entries ranked strictly below `tx` — by
+    /// [`surplus_per_kib`] over each one's floor on this tip, then fee — are taken cheapest first
+    /// until `tx` fits; if they are not enough, `tx` is the one that does not belong: `Full`.
+    /// A tie is not "below", so an equal newcomer never churns the pool. Governance actions are
+    /// exempt from the cap as from the count cap — admitted past it and never taken to make room
+    /// — and their bytes still count, as their entries count towards the count cap.
+    fn make_room(&self, tx: &Transaction, floor: u64, ledger: &Ledger) -> Result<Vec<Hash>, MempoolError> {
+        if is_governance(&tx.action) {
+            return Ok(Vec::new());
+        }
+        let cap = ledger.max_block_bytes().saturating_mul(MAX_POOL_BLOCKS);
+        let len = tx.encoded_len();
+        let over = self.bytes.saturating_add(len).saturating_sub(cap);
+        if over == 0 {
+            return Ok(Vec::new());
+        }
+        let key = (surplus_per_kib(tx.fee(), floor, len), tx.fee());
+        let mut below: Vec<((u128, u64), &Hash, usize)> = self
+            .txs
+            .iter()
+            .filter(|(_, p)| !is_governance(&p.tx.action))
+            .map(|(h, p)| ((surplus_per_kib(p.tx.fee(), Self::current_floor(p, ledger), p.len), p.tx.fee()), h, p.len))
+            .filter(|(k, _, _)| *k < key)
+            .collect();
+        // Cheapest first; among equals the higher hash goes first, the mirror of the proposer's
+        // lower-hash-first tie break, so every node evicts the same entries.
+        below.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)));
+        let (mut freed, mut evict) = (0usize, Vec::new());
+        for (_, h, l) in below {
+            if freed >= over {
+                break;
+            }
+            freed += l;
+            evict.push(*h);
+        }
+        if freed < over {
+            return Err(MempoolError::Full);
+        }
+        Ok(evict)
     }
 
     /// The pool's own half of admission: this transaction against the ones already held, and
@@ -442,7 +504,7 @@ impl Mempool {
             Action::BridgeAttest { .. } => ledger.bridge().map(|b| b.rotation_nonce),
             _ => None,
         };
-        Ok(Claims { commitments, claim, token, floor: randprotocol_core::gas::fee_floor(&tx.action), gas_limit: None, bridge_rotation })
+        Ok(Claims { commitments, claim, token, floor: randprotocol_core::gas::fee_floor(&tx.action), gas_limit: None, evict: Vec::new(), bridge_rotation })
     }
 
     /// Everything the pool can decide about a transaction without verifying a proof: the pool
@@ -471,6 +533,9 @@ impl Mempool {
         let mut c = c;
         let pricing = self.gas_policy_floor(tx, ledger, executor).map_err(MempoolError::Invalid)?;
         (c.floor, c.gas_limit) = (pricing.floor, pricing.gas_limit);
+        // Before any proof is verified for it: a transaction the byte cap would refuse costs no
+        // verification (audit v6, CH-7).
+        c.evict = self.make_room(tx, c.floor, ledger)?;
         Ok(c)
     }
 
@@ -532,7 +597,14 @@ impl Mempool {
     /// [`Mempool::pool_conflicts`] for this transaction, so no index entry written here can collide
     /// with one that exists.
     fn admit(&mut self, tx: Transaction, c: Claims) -> Hash {
-        let Claims { commitments, claim, token, floor, gas_limit, bridge_rotation } = c;
+        let Claims { commitments, claim, token, floor, gas_limit, evict, bridge_rotation } = c;
+        // The byte cap's evictions first (audit v6, CH-7), through `remove_one`, which releases
+        // every index the entry held; `make_room` chose them on this same pool a moment ago.
+        for h in &evict {
+            if self.remove_one(h).is_some() {
+                tracing::debug!(evicted = %h, "pool at its byte cap: evicted for a transaction paying more per KiB");
+            }
+        }
         let hash = tx.hash();
         for nf in tx.nullifiers() {
             self.nullifiers.insert(nf, hash);
@@ -616,13 +688,7 @@ impl Mempool {
         // (governance, total fee, hash), so switching the policy off is a true no-op there.
         let priced = self.gas_policy.is_some() || ledger.gas().is_some();
         // The surplus is over the floor on this tip, not the one the entry was admitted at.
-        let surplus_per_kib = |p: &Pooled, floor: u64| {
-            if priced {
-                (p.tx.fee().saturating_sub(floor) as u128 * 1024) / p.len.max(1) as u128
-            } else {
-                0
-            }
-        };
+        let surplus_per_kib = |p: &Pooled, floor: u64| if priced { surplus_per_kib(p.tx.fee(), floor, p.len) } else { 0 };
         ready.sort_by(|a, b| {
             is_governance(&b.1.tx.action)
                 .cmp(&is_governance(&a.1.tx.action))
@@ -1291,6 +1357,88 @@ mod tests {
             pool.precheck(&tx, &ledger, &StubExecutor).unwrap_err(),
             MempoolError::Invalid(TxError::UnknownAnchor)
         );
+    }
+
+    /// Audit v6, CH-7: at the byte cap (eight blocks of the ledger's `max_block_bytes`) a
+    /// newcomer paying more per KiB evicts the cheapest entry; one paying less is refused
+    /// `Full`; one paying the same churns nothing. Every index follows the eviction: the evicted
+    /// transaction's nullifiers are free again, so it can re-enter once there is room, and the
+    /// byte total is the entries'.
+    #[test]
+    fn at_the_byte_cap_the_cheapest_per_kib_is_evicted_for_a_better_payer() {
+        let mut l = ledger();
+        let tx = |n: u8, mult: u64| fixtures::bundle_tx(&l, [nf(n), nf(n + 100)], [cm(n), cm(n + 100)], fixtures::bundle_fee() * mult);
+        let len = tx(1, 2).encoded_len();
+        let pooled: Vec<Transaction> = (0..MAX_POOL_BLOCKS as u8).map(|i| tx(i + 1, 2 + i as u64)).collect();
+        assert!(pooled.iter().all(|t| t.encoded_len() == len));
+        l.set_max_block_bytes(len);
+        let mut m = Mempool::new(10_000);
+        for t in &pooled {
+            m.insert(t.clone(), &l, &StubExecutor).unwrap();
+        }
+        assert_eq!(m.info(Instant::now()).bytes, MAX_POOL_BLOCKS * len, "exactly at the cap");
+
+        let worse = fixtures::bundle_tx(&l, [nf(50), nf(150)], [cm(50), cm(150)], fixtures::bundle_fee());
+        assert_eq!(m.insert(worse.clone(), &l, &StubExecutor), Err(MempoolError::Full), "a newcomer ranked lowest is refused");
+        assert_eq!(m.precheck(&worse, &l, &StubExecutor).map(|_| ()), Err(MempoolError::Full), "before any proof is verified");
+        let equal = fixtures::bundle_tx(&l, [nf(51), nf(151)], [cm(51), cm(151)], fixtures::bundle_fee() * 2);
+        assert_eq!(m.insert(equal, &l, &StubExecutor), Err(MempoolError::Full), "a tie is not below: nothing churns");
+
+        let better = fixtures::bundle_tx(&l, [nf(60), nf(160)], [cm(60), cm(160)], fixtures::bundle_fee() * 50);
+        m.insert(better.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.len(), MAX_POOL_BLOCKS);
+        assert!(!m.contains(&pooled[0].hash()), "the cheapest per KiB made room");
+        assert!(m.contains(&better.hash()));
+        assert!(pooled[1..].iter().all(|t| m.contains(&t.hash())), "and nothing else did");
+        let sum: usize = m.txs.values().map(|p| p.len).sum();
+        assert_eq!(m.info(Instant::now()).bytes, sum, "the byte total is the entries' after the eviction");
+        assert_eq!(sum, MAX_POOL_BLOCKS * len);
+        // The evicted entry's indices went with it: its nullifiers are claimable again, and with
+        // room made it re-enters.
+        assert!(pooled[0].nullifiers().iter().all(|nf| !m.nullifiers.contains_key(nf)));
+        assert!(pooled[0].commitments().iter().all(|cm| !m.commitments.contains_key(cm)));
+        m.remove(&[better.hash()]);
+        m.insert(pooled[0].clone(), &l, &StubExecutor).unwrap();
+    }
+
+    /// A governance action is admitted at the byte cap, as at the count cap, and never taken to
+    /// make room: a better-paying newcomer displaces fee-payers around it.
+    #[test]
+    fn a_governance_action_passes_the_byte_cap_and_is_never_evicted() {
+        let (mut l, _) = bridged_ledger();
+        let pause_key = fixtures::key(0x7f);
+        let brake = Transaction {
+            chain_id: l.chain_id(),
+            bundle: None,
+            action: Action::PauseMints { nonce: 0, signature: pause_key.sign(&randprotocol_core::bridge::gov::pause_message(l.chain_id(), 0)) },
+        };
+        // Blocks as large as the brake (a Dilithium2 signature outweighs a stub bundle), and the
+        // pool filled with fee-payers to the last one that fits under eight of them.
+        l.set_max_block_bytes(brake.encoded_len());
+        let cap = MAX_POOL_BLOCKS * brake.encoded_len();
+        let tx = |l: &Ledger, n: u8, mult: u64| fixtures::bundle_tx(l, [nf(n), nf(n + 100)], [cm(n), cm(n + 100)], fixtures::bundle_fee() * mult);
+        let len = tx(&l, 1, 2).encoded_len();
+        let mut m = Mempool::new(10_000);
+        let pooled: Vec<Transaction> = (0..(cap / len) as u8).map(|i| tx(&l, i + 1, 2 + i as u64)).collect();
+        for t in &pooled {
+            m.insert(t.clone(), &l, &StubExecutor).unwrap();
+        }
+        let worse = tx(&l, 90, 1);
+        assert_eq!(m.insert(worse, &l, &StubExecutor), Err(MempoolError::Full), "the pool is at its byte cap");
+        m.insert(brake.clone(), &l, &StubExecutor).unwrap();
+        assert!(m.info(Instant::now()).bytes > cap, "the brake is admitted past the byte cap");
+
+        let better = tx(&l, 95, 500);
+        m.insert(better.clone(), &l, &StubExecutor).unwrap();
+        assert!(m.contains(&brake.hash()) && m.contains(&better.hash()), "the brake is never evicted");
+        // The fee-payers that made room are the cheapest, in order; the brake's bytes count, so
+        // more of them went than the newcomer alone would need.
+        let gone = pooled.iter().take_while(|t| !m.contains(&t.hash())).count();
+        assert!(gone * len >= len + brake.encoded_len() - (cap - pooled.len() * len), "enough went to fit both");
+        assert!(pooled[gone..].iter().all(|t| m.contains(&t.hash())), "only the cheapest went");
+        let sum: usize = m.txs.values().map(|p| p.len).sum();
+        assert_eq!(m.info(Instant::now()).bytes, sum);
+        assert!(sum - brake.encoded_len() <= cap, "the fee-payers are back under the cap");
     }
 
     #[test]

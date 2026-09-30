@@ -481,6 +481,12 @@ enum Cmd {
         /// cut chain, whose store has none yet.
         #[arg(long = "reserved-peer", value_name = "PEER_ID")]
         reserved_peer: Vec<libp2p::PeerId>,
+        /// Accept only gossip that carries a valid author signature, sequence number and source
+        /// (gossipsub's strict validation; audit v6, CH-7). Every node signs what it publishes,
+        /// so this drops only forged unsigned messages, and a strict node and a permissive one
+        /// exchange honest gossip both ways.
+        #[arg(long)]
+        strict_gossip: bool,
         #[arg(long, default_value = "127.0.0.1:8545")]
         rpc: SocketAddr,
         /// Take part in consensus with this node's key. A key in no current epoch's validator
@@ -1143,6 +1149,7 @@ async fn main() -> Result<()> {
             listen,
             bootstrap,
             reserved_peer,
+            strict_gossip,
             rpc,
             validator,
             no_mdns,
@@ -1220,7 +1227,7 @@ async fn main() -> Result<()> {
                 min_free_disk_bytes: min_free_disk_mb << 20,
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
-            }, rpc_options, node::NetOptions { reserved_peers: reserved_peer })
+            }, rpc_options, node::NetOptions { reserved_peers: reserved_peer, strict_gossip })
             .await?;
             // The prover is served once the node's RPC is up and stops with the node; a prover
             // that exits stops the node too.

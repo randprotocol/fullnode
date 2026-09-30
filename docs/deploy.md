@@ -137,6 +137,24 @@ peer off and halves its next batch, a little more than the empty answer it used 
 lasts only while such a node syncs from an upgraded one whose budget is spent, and ends with
 the roll.
 
+### The pool's byte cap and `--strict-gossip` (audit v6, CH-7)
+
+The pool holds at most eight blocks' worth of transaction bytes (8 × the genesis
+`max_block_bytes`: 160 MiB on a 20 MiB-block chain) beside its 10 000-entry count cap. At the
+cap a transaction that pays more above its floor per KiB displaces the cheapest pooled ones;
+one that pays less, or the same, is refused `mempool full`. Governance actions (pause, unpause,
+listings, rotations) pass both caps and are never displaced.
+
+`rand-node run --strict-gossip` switches gossipsub to strict validation: a delivered message must
+carry a valid author signature, sequence number and source, so an unsigned message claiming
+someone else's authorship is dropped by gossipsub itself (without it the node's own rules
+already refuse such a `Status`, SYNC-1). Off by default. The mode governs only what a node
+*accepts*, and every node signs what it publishes, so — tested, not assumed — a strict node and a
+permissive one exchange every honest message in both directions: the flag **can roll node by
+node**, and the older advice here (a strict/permissive mix drops messages; only at an
+all-stop/all-start) does not hold for this fleet. Turn it on everywhere once it has run on a
+canary.
+
 ## Rolling out a new commit
 
 1. `cargo test` locally, commit, push.

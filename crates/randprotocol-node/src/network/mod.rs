@@ -350,6 +350,14 @@ pub struct EdgeConfig {
     /// node learned over gossip before its last restart (`node`'s persisted peer bindings),
     /// handed over here so they are reserved before the first connection is accepted.
     pub bound: Vec<PeerId>,
+    /// gossipsub's `ValidationMode::Strict` instead of `Permissive` (audit v6, CH-7;
+    /// `--strict-gossip`): every delivered message must carry a valid author signature, sequence
+    /// number and source, so an unsigned message claiming any author is dropped by gossipsub
+    /// itself. Off by default. Every node already signs what it publishes
+    /// (`MessageAuthenticity::Signed`), and the mode only governs what a node accepts, so a
+    /// strict node and a permissive one exchange honest messages both ways (pinned by
+    /// `a_strict_node_takes_a_permissive_nodes_signed_gossip_and_drops_a_forged_unsigned_one`).
+    pub strict_gossip: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -521,15 +529,17 @@ pub async fn start_with(
 
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_millis(500))
-        .validation_mode(ValidationMode::Permissive)
+        .validation_mode(if edge.strict_gossip { ValidationMode::Strict } else { ValidationMode::Permissive })
         .max_transmit_size(cfg.limits.gossip_max_transmit_size)
         .message_id_fn(|m: &gossipsub::Message| MessageId::from(blake3::hash(&m.data).as_bytes().to_vec()))
         // Application-level validation: this node forwards a transaction only after it has
         // verified here, off the consensus loop. Local to this node — the wire is unchanged, so it
-        // rolls out onto a mixed fleet by ordinary restart. `ValidationMode` stays `Permissive`
-        // above: that one *is* on the wire, and a Strict/Permissive mix across the fleet drops
-        // messages. The cost of the switch is that every delivered message must be reported
-        // exactly once (see [`GossipId`]) or this node stops forwarding it.
+        // rolls out onto a mixed fleet by ordinary restart. `ValidationMode` is `Permissive`
+        // unless `--strict-gossip` ([`EdgeConfig::strict_gossip`]): it too governs only what this
+        // node accepts, and since every node signs what it publishes, a strict node drops nothing
+        // an honest permissive one sends (tested, audit v6 CH-7). The cost of the switch is that
+        // every delivered message must be reported exactly once (see [`GossipId`]) or this node
+        // stops forwarding it.
         .validate_messages()
         .build()
         .map_err(|e| anyhow::anyhow!("gossipsub config: {e}"))?;
@@ -1325,7 +1335,7 @@ mod tests {
         const CAP: u32 = 2;
         let reserved_seed = 90u8;
         let capped = WireLimits { max_established_incoming: CAP, ..WireLimits::default() };
-        let edge = EdgeConfig { reserved: vec![peer_of_seed(reserved_seed)], bound: vec![] };
+        let edge = EdgeConfig { reserved: vec![peer_of_seed(reserved_seed)], ..EdgeConfig::default() };
         let (target, mut target_rx) = start_with(loopback_cfg(vec![], capped), [80u8; 32], edge).await.unwrap();
         let addr = wait_for(&mut target_rx, Duration::from_secs(5), |e| match e {
             NetworkEvent::Listening(addr) => Some(addr),
@@ -1435,6 +1445,91 @@ mod tests {
         assert!(got.is_some(), "a real peer from the same address after the stalled ones went");
         target.shutdown().await;
         d.shutdown().await;
+    }
+
+    /// A forged status — an unsigned message claiming `victim`'s authorship — published at
+    /// `target` from a fresh identity until `target` delivers it or `within` passes. Whether it
+    /// was delivered.
+    async fn forged_status_is_delivered(target: &NetworkHandle, target_addr: Multiaddr, rx: &mut mpsc::Receiver<NetworkEvent>, within: Duration) -> bool {
+        use libp2p::futures::StreamExt;
+        let victim_id = peer_of_seed(9);
+        let gcfg = gossipsub::ConfigBuilder::default()
+            .validation_mode(ValidationMode::Permissive)
+            .heartbeat_interval(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let gs: gossipsub::Behaviour = gossipsub::Behaviour::new(MessageAuthenticity::Author(victim_id), gcfg).unwrap();
+        let mut sw = libp2p::SwarmBuilder::with_existing_identity(identity::Keypair::generate_ed25519())
+            .with_tokio()
+            .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
+            .unwrap()
+            .with_behaviour(|_| gs)
+            .unwrap()
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
+        let topic = IdentTopic::new("rand/7/status");
+        sw.behaviour_mut().subscribe(&topic).unwrap();
+        sw.dial(target_addr.with(libp2p::multiaddr::Protocol::P2p(target.local_peer_id))).unwrap();
+        let data = bincode::serialize(&GossipMessage::Status(Status { height: 5, head_hash: Hash::ZERO, view: 5, floor: u64::MAX })).unwrap();
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < deadline {
+            let _ = sw.behaviour_mut().publish(topic.clone(), data.clone());
+            let until = tokio::time::Instant::now() + Duration::from_millis(300);
+            loop {
+                tokio::select! {
+                    _ = sw.select_next_some() => {}
+                    ev = rx.recv() => {
+                        if let Some(NetworkEvent::Gossip { from, msg: GossipMessage::Status(_), .. }) = ev {
+                            if from == victim_id {
+                                return true;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep_until(until) => break,
+                }
+            }
+        }
+        false
+    }
+
+    /// Audit v6, CH-7, `--strict-gossip`. What a mixed fleet actually does, found by running it:
+    /// gossipsub's validation mode governs only what a node *accepts*, and every node publishes
+    /// signed (`MessageAuthenticity::Signed`), so a strict node delivers a permissive node's
+    /// gossip exactly as a permissive one does, and the other way round — two strict nodes
+    /// likewise. What strict changes is the forged, unsigned message: a permissive node delivers
+    /// it under the author it claims (`a_forged_unsigned_status_reaches_the_node_under_the_claimed_author`),
+    /// a strict one drops it before the application sees it. So the flag can roll node by node.
+    #[tokio::test]
+    async fn a_strict_node_takes_a_permissive_nodes_signed_gossip_and_drops_a_forged_unsigned_one() {
+        let strict = EdgeConfig { strict_gossip: true, ..EdgeConfig::default() };
+        // A strict node, and a permissive and a strict node dialing it.
+        let (s, mut s_rx) = start_with(loopback_cfg(vec![], WireLimits::default()), [70u8; 32], strict.clone()).await.unwrap();
+        let s_addr = wait_for(&mut s_rx, Duration::from_secs(5), |e| match e {
+            NetworkEvent::Listening(addr) => Some(addr),
+            _ => None,
+        })
+        .await
+        .expect("listening");
+        let s_full = s_addr.clone().with(libp2p::multiaddr::Protocol::P2p(s.local_peer_id));
+        let (p, mut p_rx) = start(loopback_cfg(vec![s_full.clone()], WireLimits::default()), [71u8; 32]).await.unwrap();
+        let (s2, mut s2_rx) = start_with(loopback_cfg(vec![s_full], WireLimits::default()), [72u8; 32], strict).await.unwrap();
+        for id in [p.local_peer_id, s2.local_peer_id] {
+            assert!(wait_for(&mut s_rx, Duration::from_secs(10), |e| matches!(e, NetworkEvent::PeerConnected(x) if x == id).then_some(())).await.is_some());
+        }
+        // Permissive → strict, strict → strict, strict → permissive.
+        let (from, _) = gossip_status_to(&p, &mut s_rx, Status { height: 1, head_hash: Hash::digest(b"p"), view: 1, floor: 0 }).await;
+        assert_eq!(from, p.local_peer_id, "a strict node delivers a permissive node's signed gossip");
+        let (from, _) = gossip_status_to(&s2, &mut s_rx, Status { height: 2, head_hash: Hash::digest(b"s2"), view: 2, floor: 0 }).await;
+        assert_eq!(from, s2.local_peer_id, "two strict nodes exchange gossip");
+        let (from, _) = gossip_status_to(&s, &mut p_rx, Status { height: 3, head_hash: Hash::digest(b"s"), view: 3, floor: 0 }).await;
+        assert_eq!(from, s.local_peer_id, "a permissive node delivers a strict node's gossip");
+        let _ = &mut s2_rx;
+
+        // The forged unsigned message: dropped by the strict node.
+        assert!(!forged_status_is_delivered(&s, s_addr, &mut s_rx, Duration::from_secs(6)).await, "a strict node delivered an unsigned message");
+        for n in [s, p, s2] {
+            n.shutdown().await;
+        }
     }
 
     #[tokio::test]

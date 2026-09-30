@@ -1833,6 +1833,9 @@ pub struct NetOptions {
     /// ids are reserved the same way without being listed; validators' identities learned over
     /// gossip are added as they arrive.
     pub reserved_peers: Vec<PeerId>,
+    /// gossipsub's strict validation (`--strict-gossip`, audit v6, CH-7): see
+    /// [`network::EdgeConfig::strict_gossip`].
+    pub strict_gossip: bool,
 }
 
 pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
@@ -1930,7 +1933,11 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             limits: wire,
         },
         identity,
-        network::EdgeConfig { reserved: net_options.reserved_peers.clone(), bound: peer_bindings.bound_peers() },
+        network::EdgeConfig {
+            reserved: net_options.reserved_peers.clone(),
+            bound: peer_bindings.bound_peers(),
+            strict_gossip: net_options.strict_gossip,
+        },
     )
     .await?;
 

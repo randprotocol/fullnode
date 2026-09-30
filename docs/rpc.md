@@ -1188,7 +1188,10 @@ Params: `[]`. Result:
 { "count": 2, "bytes": 2611200, "oldest_ms": 1450, "max_count": 10000 }
 ```
 `bytes` is the sum of every pooled transaction's encoded length. `oldest_ms` is how long the
-longest-pooled transaction has waited, `null` when the pool is empty.
+longest-pooled transaction has waited, `null` when the pool is empty. Beside `max_count` the pool
+is capped at eight times the genesis `max_block_bytes` in `bytes` (audit v6, CH-7): past it a
+transaction paying more above its floor per KiB displaces the cheapest, and one paying less is
+refused `mempool full`; governance actions pass both caps.
 
 ### `rand_getEmission`
 Params: `[]`. Result:
