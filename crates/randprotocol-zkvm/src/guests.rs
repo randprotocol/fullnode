@@ -201,6 +201,39 @@ pub fn private_payment(threshold: u32) -> Program {
     a.assemble()
 }
 
+/// RPL-2's smallest stateful program: a counter in one cell. It accepts exactly the transitions
+/// that read one cell and write one cell whose first value word is the read one plus one, and
+/// publishes the new count in `out0`. Anything else — another number of reads or writes, a write
+/// that is not the successor — never halts, so no proof of it exists.
+///
+/// It reads its transition from the public segment after the eight call-binding words
+/// (`read_public(8 + i)`, the program has no public input of its own): context word 1 is
+/// `n_reads`, word 2 `n_writes`, the read cell's value starts at word 11 + 8 and the written
+/// cell's at word 11 + 16 + 8 (`randprotocol_core::ledger::program_state::Transition::context`).
+/// It checks only the first value word and neither key, so it is a demonstration of the ABI, not
+/// a program to put value behind: `docs/guests.md`'s rule is that a program checks everything it
+/// is shown.
+///
+/// Node-local, like [`private_payment`]: the executor's and the node's `Invoke` tests deploy it.
+pub fn rpl2_counter() -> Program {
+    const CTX: u32 = 8;
+    let mut a = Assembler::new(0);
+    a.extend(li(T1, 1));
+    a.extend(read_public(CTX + 1));
+    a.branch(BranchCond::Ne, REG_A0, T1, "fail");
+    a.extend(read_public(CTX + 2));
+    a.branch(BranchCond::Ne, REG_A0, T1, "fail");
+    a.extend(read_public(CTX + 11 + 8));
+    a.push(addi(T2, REG_A0, 1));
+    a.extend(read_public(CTX + 11 + 16 + 8));
+    a.branch(BranchCond::Ne, REG_A0, T2, "fail");
+    a.extend(write_output(0, T2));
+    a.extend(halt());
+    a.label("fail");
+    a.jal(0, "fail");
+    a.assemble()
+}
+
 /// Reads the four public words, sums them, and reads `public[1]` a second time — so one proof
 /// exercises a multi-word digest region, a `MULT_READ` of 2, and the `PUBLIC_READ` bus.
 ///

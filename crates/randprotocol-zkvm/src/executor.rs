@@ -890,10 +890,25 @@ impl ZkExecutor {
         proof: &[u8],
         segment: Option<&[u32]>,
         verify: bool,
+        invoke: bool,
     ) -> Result<CallOutcome, ConfidentialError> {
         // INT-4: the segment this call proves over — `public ‖ call_binding` under the hardened
         // rule; otherwise the deploy-time input, as ever.
-        if segment.is_some_and(|s| s.len() != record.public_len as usize + TX_BINDING_WORDS) {
+        //
+        // RPL-2 (`invoke`): `public ‖ call_binding ‖ context`. The ledger has already held the
+        // context to the segment rule (`program_state::segment_fits`: the same public table as
+        // the hardened call's), and it is held again here, so no invoke can ask for a verifier
+        // key a call to the same program would not. Every pin below is the hardened call's.
+        let hardened_len = record.public_len as usize + TX_BINDING_WORDS;
+        let bad_len = |s: &[u32]| {
+            if invoke {
+                s.len() < hardened_len
+                    || !randprotocol_core::ledger::program_state::segment_fits(record.public_len as usize, s.len() - hardened_len)
+            } else {
+                s.len() != hardened_len
+            }
+        };
+        if segment.is_some_and(bad_len) {
             return Err(ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues)));
         }
         let segment_len = segment.map_or(record.public_len as usize, |s| s.len());
@@ -1210,7 +1225,7 @@ impl ConfidentialExecutor for ZkExecutor {
 
 
     fn verify_call(&self, record: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
-        self.check_call(record, proof, None, true)
+        self.check_call(record, proof, None, true, false)
     }
 
     fn verify_call_hardened(
@@ -1219,7 +1234,7 @@ impl ConfidentialExecutor for ZkExecutor {
         proof: &[u8],
         segment: &[u32],
     ) -> Result<CallOutcome, ConfidentialError> {
-        self.check_call(record, proof, Some(segment), true)
+        self.check_call(record, proof, Some(segment), true, false)
     }
 
     /// Every check of [`Self::verify_call_hardened`] but `Machine::verify` itself (B5: the
@@ -1230,7 +1245,28 @@ impl ConfidentialExecutor for ZkExecutor {
         proof: &[u8],
         segment: &[u32],
     ) -> Result<CallOutcome, ConfidentialError> {
-        self.check_call(record, proof, Some(segment), false)
+        self.check_call(record, proof, Some(segment), false, false)
+    }
+
+    /// RPL-2: an `Invoke`'s call proof, over `public ‖ call_binding ‖ context` — the hardened
+    /// call's rules with the segment's length relaxed to the segment rule (`check_call`).
+    fn verify_invoke(
+        &self,
+        record: &ProgramRecord,
+        proof: &[u8],
+        segment: &[u32],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.check_call(record, proof, Some(segment), true, true)
+    }
+
+    /// Every check of [`Self::verify_invoke`] but `Machine::verify` itself (B5).
+    fn decode_invoke(
+        &self,
+        record: &ProgramRecord,
+        proof: &[u8],
+        segment: &[u32],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.check_call(record, proof, Some(segment), false, true)
     }
 
     /// `H_PUB` exactly as the circuit publishes it in `pv::PUB0..7`.
@@ -1565,6 +1601,49 @@ pub fn prove_call_hardened(
     gas_limit: Option<u64>,
 ) -> Result<(Vec<u8>, [u32; 8], u8), String> {
     let segment = &randprotocol_core::program::hardened_call_segment(public, binding)[..];
+    prove_over_segment(profile, program, inputs, segment, salt, tier, gas_limit)
+}
+
+/// RPL-2: prove an `Invoke`'s call — [`prove_call_hardened`] over the longer segment
+/// `public ‖ call_binding ‖ context`, where `context` is the transition's
+/// (`Transition::context`, with the fee bundle's three burn fields) and `binding` is
+/// `Transaction::call_binding` of the transaction built with both proofs empty. The guest reads
+/// the context with `read_public(public.len() + 8 + i)`. Refused before any work if the context
+/// does not fit the hardened call's public table (the chain would refuse the proof).
+#[allow(clippy::too_many_arguments)]
+pub fn prove_invoke(
+    profile: FriProfile,
+    program: &Program,
+    inputs: &[u32],
+    public: &[u32],
+    binding: &[u32; TX_BINDING_WORDS],
+    context: &[u32],
+    salt: [u32; 4],
+    tier: Option<u8>,
+    gas_limit: Option<u64>,
+) -> Result<(Vec<u8>, [u32; 8], u8), String> {
+    if !randprotocol_core::ledger::program_state::segment_fits(public.len(), context.len()) {
+        return Err(format!(
+            "a {}-word context does not fit beside {} public words and the binding in one public table",
+            context.len(),
+            public.len()
+        ));
+    }
+    let segment = randprotocol_core::ledger::program_state::invoke_segment(public, binding, context);
+    prove_over_segment(profile, program, inputs, &segment, salt, tier, gas_limit)
+}
+
+/// The body [`prove_call_hardened`] and [`prove_invoke`] share: a call proved over `segment`
+/// with the hardened rules' floored program table.
+fn prove_over_segment(
+    profile: FriProfile,
+    program: &Program,
+    inputs: &[u32],
+    segment: &[u32],
+    salt: [u32; 4],
+    tier: Option<u8>,
+    gas_limit: Option<u64>,
+) -> Result<(Vec<u8>, [u32; 8], u8), String> {
     // `Machine::prove_salted`'s body, from its public parts, with one difference: the program
     // table is floored at `MIN_PRIVATE_TABLE_LOG_HEIGHT` (PROGRAM-TABLE-LEAK,
     // [`hardened_program_log_height`]). A taller program table than the program needs is sound —
@@ -2153,6 +2232,84 @@ mod tests {
         assert_eq!(zk.verify_call_hardened(&record, &bound, &lifted), public_values, "another transaction's binding");
         assert_eq!(zk.verify_call_hardened(&record, &bound, &public), public_values, "the public input alone");
         assert_eq!(zk.verify_call_hardened(&record, &bound, &binding), public_values, "the binding alone");
+    }
+
+    /// RPL-2 on the real executor: an invoke's proof is made over `public ‖ binding ‖ context`
+    /// and verifies under `verify_invoke` with exactly that segment — not with another context,
+    /// another binding, or under the call rules — and the guest decides which transitions have a
+    /// proof at all.
+    #[test]
+    fn rpl2_an_invoke_verifies_over_its_own_transition_only() {
+        use super::*;
+        use crate::machine::FriProfile;
+        use randprotocol_core::ledger::program_state::{invoke_segment, Cell, Inflow, Transition};
+        let program = crate::guests::rpl2_counter();
+        let zk = ZkExecutor::new(FriProfile::Test);
+        let record = ProgramRecord {
+            id: randprotocol_core::program::program_id(program.base_pc, &program.words),
+            base_pc: program.base_pc,
+            words: program.words.clone(),
+            code_hash: zk.check_program(program.base_pc, &program.words).unwrap(),
+            deployed_at: 0,
+            public_digest: None,
+            public_len: 0,
+        };
+        let step = |from: u32, to: u32| Transition {
+            reads: vec![Cell { key: [1, 0, 0, 0, 0, 0, 0, 0], value: [from, 0, 0, 0, 0, 0, 0, 0] }],
+            writes: vec![Cell { key: [1, 0, 0, 0, 0, 0, 0, 0], value: [to, 0, 0, 0, 0, 0, 0, 0] }],
+            inflow: Inflow::None,
+            pays: vec![],
+            mints: vec![],
+        };
+        let binding = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let context = step(41, 42).context(0, 0, 0);
+        let segment = invoke_segment(&[], &binding, &context);
+        let run = dry_run_call(&program, &[], &segment).expect("the counter accepts 41 → 42");
+        let (proof, outputs, tier) =
+            prove_invoke(FriProfile::Test, &program, &[], &[], &binding, &context, [1, 2, 3, 4], Some(run.tier), None).unwrap();
+        assert_eq!((outputs[0], tier), (42, run.tier));
+        let outcome = zk.verify_invoke(&record, &proof, &segment).expect("its own segment");
+        assert_eq!(outcome.outputs, outputs);
+        assert_eq!(zk.decode_invoke(&record, &proof, &segment), Ok(outcome), "the decode path agrees");
+
+        let public_values = Err(ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues)));
+        // Another transition — the write the chain would apply — under the same proof.
+        let forged = invoke_segment(&[], &binding, &step(41, 1_000_000).context(0, 0, 0));
+        assert_eq!(zk.verify_invoke(&record, &proof, &forged), public_values, "another written value");
+        let funded = invoke_segment(&[], &binding, &step(41, 42).context(7, 0, 0));
+        assert_eq!(zk.verify_invoke(&record, &proof, &funded), public_values, "another burn");
+        let mut other = binding;
+        other[0] ^= 1;
+        assert_eq!(zk.verify_invoke(&record, &proof, &invoke_segment(&[], &other, &context)), public_values, "another transaction");
+        // The call rules want exactly the binding, and the invoke rules at least it.
+        assert_eq!(zk.verify_call_hardened(&record, &proof, &segment), public_values, "not a call");
+        assert_eq!(zk.verify_invoke(&record, &proof, &binding[..7]), public_values, "shorter than a binding");
+        // Past the segment rule: refused before any key is built, and the prover refuses to start.
+        let long = vec![0u32; 120];
+        assert_eq!(zk.verify_invoke(&record, &proof, &invoke_segment(&[], &binding, &long)), public_values);
+        assert!(prove_invoke(FriProfile::Test, &program, &[], &[], &binding, &long, [0; 4], None, None).is_err());
+        // A transition the program does not accept has no run, so no proof.
+        let bad = invoke_segment(&[], &binding, &step(41, 43).context(0, 0, 0));
+        assert!(dry_run_call(&program, &[], &bad).is_err(), "41 → 43 is not a step");
+    }
+
+    /// `program_state::public_table_rows` is core's mirror of the public table's height: pinned to
+    /// the real function over every length an invoke's segment can have, and past it.
+    #[test]
+    fn rpl2_cores_public_table_mirror_is_the_zkvms() {
+        use randprotocol_core::ledger::program_state::{public_table_rows, segment_fits};
+        use randprotocol_core::types::TX_BINDING_WORDS;
+        for n in 0..1100usize {
+            assert_eq!(public_table_rows(n), 1u64 << crate::tables::public::public_log_height(n), "{n} words");
+        }
+        // What the segment rule means in table heights: an invoke declares the hardened call's.
+        for public in [0usize, 1, 100, 119, 120, 500] {
+            for context in [0usize, 11, 46, 119, 120, 300] {
+                let call = crate::tables::public::public_log_height(public + TX_BINDING_WORDS);
+                let invoke = crate::tables::public::public_log_height(public + TX_BINDING_WORDS + context);
+                assert_eq!(segment_fits(public, context), call == invoke, "{public} public, {context} context");
+            }
+        }
     }
 
     /// PROGRAM-TABLE-LEAK (the INT-1 family's open member): a call's program table was as tall as
