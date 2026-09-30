@@ -1,0 +1,46 @@
+# Cut record — one per chain cut (docs/deploy.md, "Cut policy"; audit v6, OPS-7).
+#
+# Copy this file to a place outside the working tree's ignored paths (for example
+# deploy/cut-records/chain<N>.record), fill in every field on ONE line each, commit and publish it
+# BEFORE the cut, and pass its path to the cut script. deploy/lib/cut-policy.sh's
+# `require_cut_record` refuses a cut whose record is missing or has an empty field. Write
+# `nothing` where a list is empty — a blank is refused, so that "nothing is dropped" is a
+# statement somebody made and not an omission.
+#
+# Lines starting with # are ignored. A value in <angle brackets> counts as not filled in.
+
+# The new chain's id. Never one used before (`refuse_reused_chain_id`).
+chain-id: <N>
+
+# Why a rolling update cannot do this: name the validity rule, the wire format or the verifier key
+# that changes. "A new feature" is not a reason; a node-only change rolls onto the live chain.
+reason: <the validity rule, wire format or verifier key that forces a new genesis>
+
+# What the new genesis carries over from the old chain: the validator register, each bridged
+# token's per-backing `locked`, the vesting register, and every balance re-issued as a genesis
+# note, by holder.
+carries: <the register, the bridge state, the balances carried, by holder>
+
+# What it does not carry: EVERY balance on the old chain that is not re-issued, operator's or not,
+# with the amount — in particular every non-operator balance (a shielded note cannot be re-created
+# without its owner's address). Validator rewards not withdrawn. Write `nothing` only if a scan
+# showed nothing.
+drops: <every balance not carried, with amounts; every non-operator balance>
+
+# The client rebuild checklist, each item with the version or commit that was built against the
+# new chain and checked before the cut: the wallet CLI (`rand`), the clients repository's apps
+# (desktop, web, extension, iOS, Android), randscan, the website's WASM, the bridge relayer's
+# `rand`.
+clients: <rand CLI …; clients repo …; randscan …; website WASM …; bridge relayer …>
+
+# The second operator: who rebuilt the genesis from the tag on another machine. Not the author,
+# and not a session acting on the author's go.
+second-operator: <name, and the machine they rebuilt on>
+
+# The genesis hash the second operator got. Filled in by them after their rebuild; the cut script
+# compares it with the author's (`require_second_rebuild`) and refuses to publish on a mismatch.
+second-hash:
+
+# How to go back: what is kept on every host (old data dirs, old binaries), for how long, and the
+# command sequence that returns the fleet to the old chain.
+rollback: <what is kept, for how long, and the steps back>

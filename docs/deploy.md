@@ -241,6 +241,71 @@ lines in their test files.
    the production N re-measurement (runbook rows 7–8, production N=2/N=3, the ≥ 160 GB host
    classes), and later the self-verifier's end-to-end (row 11, est. tier 22 / ≥ 128 GB).
 
+## Cut policy
+
+Written 2026-09-30 (audit v6, OPS-7). Chains 15, 16, 17 and 18 went live on 2026-09-26 13:05,
+2026-09-28 16:39, 2026-09-29 03:03 and 2026-09-29 04:56 UTC: four hard forks in 2.7 days, chain 17
+replaced after 1 hour 53 minutes. Each was an all-stop of the fleet from one laptop on one
+operator's go, with a genesis nobody else rebuilt; only chain 17's record says what it dropped
+(130 RAND faucet-minted to a wallet the operator does not hold), and wallets, the explorer and the
+site were not rebuilt for constraint set 8 before chain 18. None of that loses anyone's money
+while every balance is the operator's to re-issue. Once anyone else holds a balance, a cut that
+does not say what it carries can lose it. So, from the next cut on, **a chain cut needs all six**:
+
+1. **A reason a rolling update cannot meet.** A changed validity rule, wire format or verifier
+   key. A node-only change rolls onto the live chain (`deploy/update-droplet.sh`, or
+   `deploy/roll-all.sh` when the fleet must never run mixed). A feature that is merely ready is
+   not a reason; several fork-requiring changes wait and ship in one cut.
+2. **A published list of what the cut carries and what it drops, written before the cut.** Every
+   balance re-issued at genesis, by holder; every balance not re-issued, with its amount —
+   **every non-operator balance in particular** — and unwithdrawn validator rewards. "Nothing" is
+   written out, from a scan, not left blank.
+3. **A client rebuild checklist, done before the cut**: the wallet CLI (`rand`), the clients
+   repository's apps (desktop, web, extension, iOS, Android), randscan, the website's WASM, and
+   the bridge relayer's `rand`. Each named with the version or commit built against the new
+   chain. A chain no shipped wallet can send on is not live for anyone but the operator.
+4. **Two people.** One authors the genesis. A second rebuilds it from the tag on another machine,
+   and the two genesis hashes must match before anything is published or stopped. Neither is a
+   session acting on the other's go.
+5. **A rollback plan**: what stays on every host (the old chain's data dirs, the old binaries),
+   for how long, and the steps back.
+6. **A chain id never used before.** Signatures, the PQ co-signature and the bridge governance
+   messages bind the chain id; ids 14 to 18 have not repeated, and that is what protects them.
+
+**The mechanism.** `deploy/lib/cut-policy.sh` is sourced by a cut script and refuses, non-zero and
+with the reason on stderr:
+
+| function | refuses when |
+|---|---|
+| `require_cut_record <file>` | the record is missing, or has no non-empty `reason:`, `carries:`, `drops:`, `clients:`, `second-operator:` or `rollback:` line (an unfilled `<placeholder>` counts as empty) |
+| `refuse_reused_chain_id <id>` | any `deploy/genesis*.json` in the repository already has that `chain_id`, the id is not a positive integer, or no genesis file can be read |
+| `require_second_rebuild <file> <hash>` | the record's `second-hash:` line is absent or differs from the author's genesis hash |
+
+`deploy/cut-record.template` is the form; a filled record is committed and published before the
+cut. `SELFTEST=1 bash deploy/lib/cut-policy.sh` exercises all three on temp files (33 checks). The
+scripts that cut chains 15 to 18 do not source it — they predate it and are history; **the next
+cut script must**, calling `require_cut_record` and `refuse_reused_chain_id` before its first
+step and `require_second_rebuild` before it pushes a genesis. The library checks that a record
+exists and is complete. It cannot check that the record is true, that it was published
+beforehand, or that the second operator is a second person: the record is the evidence for
+those, and they are the operators' to keep.
+
+### Key separation (a dated exception, 2026-09-30)
+
+The audit's target (its option 1 under OPS-6, from the 29 September key-management policy it
+cites; that policy is not in this repository): **at most 8 of the 26 validator keys, and at most
+2 of the 8 guardian keys of each set, per person and per hosting account.** A holder of nine
+validator keys can stop a quorum of 18 of 26; a holder of eight cannot. Meeting both caps needs
+at least four independent operators.
+
+**Not met, as of 2026-09-30.** All 26 validator keys are one operator's, and so are the guardian
+keys (`AGENTS.md`, "Chain 15": the eight validators added on 2026-09-27 include the six guardian
+hosts). One compromise of that operator's control plane is a quorum. Where the validator keys
+generated on the laptop for chain 14 are backed up, and whether a live copy remains there, is not
+recorded in this repository. This is carried as a dated exception, recorded here so that it is a
+decision and not an oversight. **Schedule: to be set by the operators** — none exists yet. Until
+it is met, the network is a testnet run by its authors, and the bridge caps stay where they are.
+
 ## The chain-14 cut (v0.5, 2026-09-20)
 
 Full step-by-step order of operations: `docs/superpowers/handoffs/2026-09-20-chain14-cut-runbook.md`.
