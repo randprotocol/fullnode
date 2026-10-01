@@ -821,10 +821,10 @@ impl Mempool {
         }
         if let Some(b) = &tx.bundle {
             if !ledger.is_anchor(&b.anchor) {
-                return Err(TxError::UnknownAnchor);
+                return Err(TxError::UnknownAnchor { window: ledger.proof_window() });
             }
             if !ledger.time_in_window(b.time) {
-                return Err(TxError::TimeOutOfWindow { time: b.time, height: ledger.height() });
+                return Err(TxError::TimeOutOfWindow { time: b.time, height: ledger.height(), window: ledger.proof_window() });
             }
         }
         // A bundle-less `Withdraw` (S2) carries a `time` of its own, under the same window rule —
@@ -838,7 +838,7 @@ impl Mempool {
         | Action::RevokeVesting { time, .. } = &tx.action
         {
             if !ledger.time_in_window(*time) {
-                return Err(TxError::TimeOutOfWindow { time: *time, height: ledger.height() });
+                return Err(TxError::TimeOutOfWindow { time: *time, height: ledger.height(), window: ledger.proof_window() });
             }
         }
         // A `BridgeAttest`'s `time` (S3) goes stale by that same rule, and it is not the bundle's:
@@ -856,7 +856,7 @@ impl Mempool {
                 return Err(TxError::AttestationTooLarge);
             }
             if !ledger.time_in_window(*time) {
-                return Err(TxError::TimeOutOfWindow { time: *time, height: ledger.height() });
+                return Err(TxError::TimeOutOfWindow { time: *time, height: ledger.height(), window: ledger.proof_window() });
             }
             // And its `asset` is screened against the registry the same way: the action names the
             // index its envelope was sealed for, and admission holds it to the index the token
@@ -1424,7 +1424,7 @@ mod tests {
         // The cheap pre-screen still refuses it, on the staleness it is there to see.
         assert_eq!(
             m.precheck(&tx, &l, &StubExecutor).unwrap_err(),
-            MempoolError::Invalid(TxError::UnknownAnchor)
+            MempoolError::Invalid(TxError::UnknownAnchor { window: 256 })
         );
     }
 
@@ -1439,7 +1439,7 @@ mod tests {
         let pool = Mempool::new(10);
         assert_eq!(
             pool.precheck(&tx, &ledger, &StubExecutor).unwrap_err(),
-            MempoolError::Invalid(TxError::UnknownAnchor)
+            MempoolError::Invalid(TxError::UnknownAnchor { window: 256 })
         );
     }
 
@@ -2889,13 +2889,13 @@ mod tests {
             },
         };
         match l.validate(&tx, &StubExecutor) {
-            Err(TxError::TimeOutOfWindow { time: 2, height: 1 }) => {}
+            Err(TxError::TimeOutOfWindow { time: 2, height: 1, window: 256 }) => {}
             other => panic!("a stale note time must be refused, got {other:?}"),
         }
         // And the pre-screen reports it the same way.
         let m = Mempool::new(10);
         match m.precheck(&tx, &l, &StubExecutor) {
-            Err(MempoolError::Invalid(TxError::TimeOutOfWindow { time: 2, height: 1 })) => {}
+            Err(MempoolError::Invalid(TxError::TimeOutOfWindow { time: 2, height: 1, window: 256 })) => {}
             other => panic!("the pre-screen must report it too, got {other:?}"),
         }
     }

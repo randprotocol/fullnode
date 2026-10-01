@@ -1179,6 +1179,7 @@ mod tests {
             gas: None,
             testnet: None,
             binding_domain: None,
+            proof_window_blocks: None,
             hardening_v6: None,
             hc_auth: None,
         }
@@ -2211,7 +2212,7 @@ mod admission_tests {
         // A future time: at height 100 every past time is inside the 256-block window.
         let tx = aggregate_tx(&kp, 0, 101, covers(1), b"ok".to_vec());
         match l.validate_aggregate(&tx, &covered_records(&shape(), &[1]), &StubExecutor) {
-            Err(TxError::TimeOutOfWindow { time: 101, height: 100 }) => {}
+            Err(TxError::TimeOutOfWindow { time: 101, height: 100, window: 256 }) => {}
             other => panic!("expected TimeOutOfWindow, got {other:?}"),
         }
     }

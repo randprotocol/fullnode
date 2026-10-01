@@ -213,6 +213,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         // Audit v6, STAKE-2: a faucet beside a bridge needs the marker on a new chain id.
         testnet,
         binding_domain: None,
+        proof_window_blocks: None,
     }
 }
 

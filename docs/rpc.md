@@ -376,7 +376,8 @@ gas policy:
   "hardening_v6": false, "hc_auth": null, "gas_price": "100", "byte_price": "800",
   "gas_metering": "header", "bundle_gas_limit": null, "adjust_bps": null,
   "max_gas_price": null, "max_byte_price": null, "byte_load": null,
-  "admission_by_vote": false, "testnet": false, "slashing": null, "binding_domain": 0 }
+  "admission_by_vote": false, "testnet": false, "slashing": null, "binding_domain": 0,
+  "proof_window_blocks": null }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -425,6 +426,16 @@ wallet decides which form to prove by the transaction's own chain id
 node says; every other id gets the genesis-bound form over the genesis hash the wallet's store is
 bound to), and reads this only to refuse early a chain whose ledger would refuse that form. A
 node that predates the field answers without it, which a wallet reads as `0`.
+
+`proof_window_blocks` (issue #118) is the genesis `proof_window_blocks`, 256 to 4 096, or `null`
+on every genesis without the field (chains 14 to 19): how old, in blocks, a bundle's anchor may
+be (one of the last N block-end roots) and how far behind the height its `time` may be — one
+window for both, 256 for both when `null`. A chain's refusals name it: `anchor is not one of the
+last N roots`, `time T is outside [H − N, H]`. A wallet with a slow or delegated prover reads it
+for how long a proof may take; the `rand` wallet also uses it to decide when a `--no-wait` spend
+that never appeared can no longer commit (clamped to 256..4 096, since this reply is
+unauthenticated — it moves only the wallet's own bookkeeping, never what the chain admits). A
+node that predates the field answers without it, which a wallet reads as `null`.
 
 `gas_price`, `byte_price` and `gas_metering` are this **node's** own gas policy (spec
 `2026-09-28-gas-model-design.md` §4.1, Phase 0) *or* the chain's own `gas` section (§4.2, §7.1,
@@ -1500,6 +1511,16 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-10-01 — issue #118: `proof_window_blocks` (genesis-gated; no chain carries it yet)
+
+- **`rand_getLimits` gains `proof_window_blocks`** (a number, 256..4 096, or `null`): the genesis
+  window that replaces both the 256-block anchor window and the 256-block `time` window. `null` on
+  chains 14 to 19, where both stay 256; chain 20 is the first that can carry it (`docs/deploy.md`
+  recommends 1024).
+- **The two refusals name the window in force**: `anchor is not one of the last N roots` and
+  `time T is outside [H − N, H]` (`-32000`), where `N` was always 256 before.
+- Nothing on the wire changes; no existing chain's rules move.
 
 ### 2026-10-01 — audit v6, BRG-14: rotation possession, delay and cancel (genesis-gated; no chain carries it yet)
 

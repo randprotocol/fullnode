@@ -555,6 +555,12 @@ enum Cmd {
         /// outside 14–19 without it**: every new chain from chain 20 is cut with `--binding-domain 1`.
         #[arg(long, value_name = "0|1")]
         binding_domain: Option<u32>,
+        /// Issue #118: the top-level `proof_window_blocks`, 256..=4096 — how old, in blocks, a
+        /// bundle's anchor and its `time` may be (one window for both). Omitted, the file has no
+        /// field: 256 blocks, ~300 s at chain 18's 1.17 s blocks, which a delegated proof on a slow
+        /// prover can miss. Part of the genesis hash when given; `docs/deploy.md` recommends 1024.
+        #[arg(long, value_name = "BLOCKS")]
+        proof_window_blocks: Option<u64>,
     },
     /// Print one genesis alloc note as JSON — the object that goes into a genesis file's `alloc`
     /// list — sealed to `--to` exactly as `genesis --alloc` seals one, so the owner's wallet finds
@@ -1555,6 +1561,7 @@ async fn main() -> Result<()> {
             consensus_domain,
             testnet,
             binding_domain,
+            proof_window_blocks,
         } => {
             let hc_bundle = match bundle_guest.as_str() {
                 "v3" => ZkExecutor::hc_hidden_bundle_v3(),
@@ -1694,6 +1701,9 @@ async fn main() -> Result<()> {
                 // BIND-1: absent unless asked for, so a genesis cut without it hashes
                 // byte-for-byte as before.
                 binding_domain,
+                // Issue #118: absent unless asked for, so a genesis cut without it hashes
+                // byte-for-byte as before.
+                proof_window_blocks,
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -3532,6 +3542,7 @@ mod tests {
             gas: None,
             testnet: None,
             binding_domain: None,
+            proof_window_blocks: None,
         }
     }
 

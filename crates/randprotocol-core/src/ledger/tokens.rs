@@ -3090,8 +3090,8 @@ mod action_tests {
             l.validate(&tx, &StubExecutor)
         };
         let oldest = (height - TIME_WINDOW) as u32;
-        assert_eq!(at(height as u32 + 1), Err(TxError::TimeOutOfWindow { time: height as u32 + 1, height }));
-        assert_eq!(at(oldest - 1), Err(TxError::TimeOutOfWindow { time: oldest - 1, height }));
+        assert_eq!(at(height as u32 + 1), Err(TxError::TimeOutOfWindow { time: height as u32 + 1, height, window: TIME_WINDOW }));
+        assert_eq!(at(oldest - 1), Err(TxError::TimeOutOfWindow { time: oldest - 1, height, window: TIME_WINDOW }));
         assert_eq!(at(oldest), Ok(()));
     }
 
@@ -3299,7 +3299,7 @@ mod action_tests {
         *time = l.height() as u32 + 1;
         assert_eq!(
             l.validate(&tx, &StubExecutor),
-            Err(TxError::TimeOutOfWindow { time: l.height() as u32 + 1, height: l.height() })
+            Err(TxError::TimeOutOfWindow { time: l.height() as u32 + 1, height: l.height(), window: TIME_WINDOW })
         );
     }
 

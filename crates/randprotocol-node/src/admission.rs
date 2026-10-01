@@ -1009,8 +1009,8 @@ mod tests {
         // cached them would refuse transactions that are about to be valid — for good, since
         // nothing evicts on a state change.
         for e in [
-            TxError::UnknownAnchor,
-            TxError::TimeOutOfWindow { time: 3, height: 900 },
+            TxError::UnknownAnchor { window: 256 },
+            TxError::TimeOutOfWindow { time: 3, height: 900, window: 256 },
             TxError::Spent([1; 8]),
             TxError::CommitmentExists([2; 8]),
             TxError::UnknownProgram(Hash::ZERO),
@@ -1023,7 +1023,7 @@ mod tests {
         }
         // And the cache itself refuses one, so a wrong caller cannot poison it.
         let mut c = RefusedCache::new(4);
-        c.insert(h(1), TxError::UnknownAnchor);
+        c.insert(h(1), TxError::UnknownAnchor { window: 256 });
         assert_eq!(c.len(), 0);
     }
 

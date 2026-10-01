@@ -457,6 +457,17 @@ pub struct Genesis {
     /// as before; never part of the state root (a genesis parameter `reload_ledger` restores).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding_domain: Option<u32>,
+    /// Issue #118: one window, in blocks, for both of a bundle's freshness rules — how far
+    /// behind the height its `time` may be and how many block-end roots it may anchor to
+    /// (`ledger::TIME_WINDOW` and `ledger::ANCHOR_WINDOW`, both 256, which exist for the same
+    /// reason: a prover needs the chain to still accept what it started proving). 256 blocks is
+    /// ~300 s at chain 18's 1.17 s blocks, and a delegated proof on a slow prover was refused at
+    /// 294 s. Absent — chains 14 to 19 — is 256/256 byte for byte; present, it must lie in
+    /// `[MIN_PROOF_WINDOW_BLOCKS, MAX_PROOF_WINDOW_BLOCKS]` = `[256, 4096]`. Part of the genesis
+    /// hash, tagged and appended after `bridge_rotation`, only when present; never part of the
+    /// state root (a genesis parameter `reload_ledger` restores).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_window_blocks: Option<u64>,
 }
 
 /// The chains whose committed genesis file (`deploy/genesis-chain<N>.json`) carries both
@@ -525,6 +536,14 @@ pub enum GenesisError {
     BadConsensusDomain(u32),
     #[error("unknown binding_domain {0} (0 or 1)")]
     BadBindingDomain(u32),
+    /// Issue #118: a `proof_window_blocks` outside `[MIN_PROOF_WINDOW_BLOCKS,
+    /// MAX_PROOF_WINDOW_BLOCKS]`.
+    #[error(
+        "bad proof_window_blocks {0} ({min}..={max})",
+        min = crate::ledger::MIN_PROOF_WINDOW_BLOCKS,
+        max = crate::ledger::MAX_PROOF_WINDOW_BLOCKS
+    )]
+    BadProofWindowBlocks(u64),
     /// Audit v4, STAKE-2 rule 1: under a `staking` section a chain that holds bridged custody
     /// cannot also hand out free RAND — unless `staking.faucet_recipients` limits the faucet to
     /// named spend keys.
@@ -800,6 +819,13 @@ impl Genesis {
                 return Err(GenesisError::BadBindingDomain(v));
             }
         }
+        // Issue #118: the proof window, inside its bounds — never below today's 256, never past
+        // the ceiling that keeps the anchor deque and a live anchor's age bounded.
+        if let Some(w) = self.proof_window_blocks {
+            if !(crate::ledger::MIN_PROOF_WINDOW_BLOCKS..=crate::ledger::MAX_PROOF_WINDOW_BLOCKS).contains(&w) {
+                return Err(GenesisError::BadProofWindowBlocks(w));
+            }
+        }
         // Audit v4, STAKE-2 rule 1, only under the section: a faucet and a bridge exclude each
         // other. Chain 14's genesis has both and no section, so it still loads.
         // A faucet limited to named spend keys (`faucet_recipients`, chain 15) cannot buy the
@@ -1019,6 +1045,7 @@ impl Genesis {
         ledger.set_hc_auth(hc_auth);
         ledger.set_gas(self.gas.clone());
         ledger.set_testnet(self.testnet == Some(true));
+        ledger.set_proof_window_blocks(self.proof_window_blocks);
         // The genesis ledger is positioned at the genesis block, so it carries that block's
         // time structurally rather than relying on every caller to patch it in. The timestamp
         // is transient state, not part of the state root or the genesis hash.
@@ -1372,6 +1399,12 @@ impl Genesis {
                 }
                 None => commit.push(0),
             }
+        }
+        // The proof window (issue #118), after `bridge_rotation` — last — tagged and only when the
+        // file sets it, so chain 18 (`a7cb020c…`) and every genesis cut before it hash as before.
+        if let Some(w) = self.proof_window_blocks {
+            commit.extend_from_slice(b"proof_window_blocks");
+            commit.extend_from_slice(&w.to_be_bytes());
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -1804,6 +1837,7 @@ mod tests {
             gas: None,
             testnet: None,
             binding_domain: None,
+            proof_window_blocks: None,
         }
     }
 
@@ -1839,6 +1873,41 @@ mod tests {
         // The field round-trips through the file, and an absent one stays absent.
         assert_eq!(Genesis::from_json(&g.to_json()).unwrap().consensus_domain, Some(1));
         assert!(!base.to_json().contains("consensus_domain"));
+        assert_eq!(build(&Genesis::from_json(&base.to_json()).unwrap()).hash(), plain.hash());
+    }
+
+    /// Issue #118: `proof_window_blocks` is genesis-gated — committed, tagged and last, only when
+    /// present, so a file without it builds the same hash and a 256/256 ledger; with it the ledger
+    /// runs the window; validation holds it to [256, 4096]; never state.
+    #[test]
+    fn a_genesis_proof_window_is_committed_only_when_present_and_bounded() {
+        use crate::ledger::{MAX_PROOF_WINDOW_BLOCKS, MIN_PROOF_WINDOW_BLOCKS, TIME_WINDOW};
+        let base = genesis(1);
+        assert_eq!(base.proof_window_blocks, None, "chain 18's shape has no field");
+        let plain = build(&base);
+        assert_eq!((plain.ledger.proof_window(), plain.ledger.proof_window_blocks()), (TIME_WINDOW, None));
+        let mut g = base.clone();
+        g.proof_window_blocks = Some(1024);
+        let wide = build(&g);
+        assert_ne!(wide.hash(), plain.hash(), "the window is part of the genesis binding");
+        assert_eq!((wide.ledger.proof_window(), wide.ledger.proof_window_blocks()), (1024, Some(1024)));
+        assert_eq!(wide.ledger.state_root(), plain.ledger.state_root(), "a genesis parameter, never state");
+        // `256` is today's window, but it is a field in the file, so it is in the hash.
+        let mut floor = base.clone();
+        floor.proof_window_blocks = Some(MIN_PROOF_WINDOW_BLOCKS);
+        assert_ne!(build(&floor).hash(), plain.hash());
+        assert_ne!(build(&floor).hash(), wide.hash());
+        let mut ceiling = base.clone();
+        ceiling.proof_window_blocks = Some(MAX_PROOF_WINDOW_BLOCKS);
+        assert!(ceiling.validate().is_ok());
+        for bad in [0, MIN_PROOF_WINDOW_BLOCKS - 1, MAX_PROOF_WINDOW_BLOCKS + 1, u64::MAX] {
+            let mut b = base.clone();
+            b.proof_window_blocks = Some(bad);
+            assert!(matches!(b.validate(), Err(GenesisError::BadProofWindowBlocks(v)) if v == bad), "{bad}");
+        }
+        // The field round-trips through the file, and an absent one stays absent.
+        assert_eq!(Genesis::from_json(&g.to_json()).unwrap().proof_window_blocks, Some(1024));
+        assert!(!base.to_json().contains("proof_window_blocks"));
         assert_eq!(build(&Genesis::from_json(&base.to_json()).unwrap()).hash(), plain.hash());
     }
 

@@ -50,6 +50,7 @@ fn genesis(validator: &Keypair) -> Genesis {
         gas: None,
         testnet: None,
         binding_domain: None,
+        proof_window_blocks: None,
     }
 }
 

@@ -110,6 +110,7 @@ fn genesis_full(
         // BIND-1: this suite runs the genesis-bound form end to end — chain 7 is not one of the
         // chains cut before `binding_domain`, so the wallet signs and proves nothing else there.
         binding_domain: Some(1),
+        proof_window_blocks: None,
         hardening_v6: None,
         hc_auth: None,
     }

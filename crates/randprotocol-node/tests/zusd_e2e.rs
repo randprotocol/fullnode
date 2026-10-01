@@ -138,6 +138,7 @@ fn zusd_genesis(validators: &[randprotocol_core::Keypair]) -> Genesis {
         // Audit v6, STAKE-2: a faucet beside a bridge needs the marker on a new chain id.
         testnet: Some(true),
         binding_domain: None,
+        proof_window_blocks: None,
     }
 }
 

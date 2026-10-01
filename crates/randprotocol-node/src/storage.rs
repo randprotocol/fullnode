@@ -2155,6 +2155,34 @@ impl Storage {
         Ok((out, next))
     }
 
+    /// Issue #118: give `ledger` (fresh from `load_ledger`) the genesis `proof_window_blocks`,
+    /// and, when it is set, the deeper anchor rows the wider window keeps. A no-op without the
+    /// field, so every chain through 19 loads exactly as before.
+    pub fn restore_proof_window(&self, ledger: &mut Ledger, gs: &GenesisState) -> Result<()> {
+        if let Some(window) = gs.ledger.proof_window_blocks() {
+            ledger.set_proof_window_blocks(Some(window));
+            ledger.restore_anchors(self.newest_anchors(window as usize)?);
+        }
+        Ok(())
+    }
+
+    /// The newest `n` stored block-end roots, oldest first: the anchor window `load_ledger`
+    /// reads ([`randprotocol_core::ledger::ANCHOR_WINDOW`] rows), and what `reload_ledger` re-reads
+    /// on a chain whose genesis `proof_window_blocks` is wider (issue #118). The family keeps
+    /// every height it was written (only `truncate_to` rewrites it), so the rows are there.
+    pub fn newest_anchors(&self, n: usize) -> Result<Vec<(u64, Word8)>> {
+        let mut anchors: Vec<(u64, Word8)> = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_ANCHORS), IteratorMode::End) {
+            if anchors.len() >= n {
+                break;
+            }
+            let (k, v) = item?;
+            anchors.push((be_u64(k.as_ref(), "anchor key")?, word8(&v, "anchor")?));
+        }
+        anchors.reverse();
+        Ok(anchors)
+    }
+
     /// Rebuild the in-memory ledger from the note, nullifier, anchor, validator and program
     /// families plus the stored frontier.
     ///
@@ -2196,16 +2224,10 @@ impl Storage {
             nullifiers.insert(word8(k.as_ref(), "nullifier key")?);
         }
         // The window is the newest ANCHOR_WINDOW heights; the family may hold older rows if a
-        // commit wrote more than a window's worth of blocks at once.
-        let mut anchors: Vec<(u64, Word8)> = Vec::new();
-        for item in self.db.iterator_cf(self.cf(CF_ANCHORS), IteratorMode::End) {
-            if anchors.len() >= randprotocol_core::ledger::ANCHOR_WINDOW {
-                break;
-            }
-            let (k, v) = item?;
-            anchors.push((be_u64(k.as_ref(), "anchor key")?, word8(&v, "anchor")?));
-        }
-        anchors.reverse();
+        // commit wrote more than a window's worth of blocks at once. A chain whose genesis sets a
+        // wider `proof_window_blocks` (issue #118) gets the rest from `reload_ledger`, which knows
+        // the genesis — this function does not.
+        let anchors = self.newest_anchors(randprotocol_core::ledger::ANCHOR_WINDOW)?;
         let validators = self.register()?;
         let mut programs = BTreeMap::new();
         for item in self.db.iterator_cf(self.cf(CF_PROGRAMS), IteratorMode::Start) {
@@ -3050,9 +3072,12 @@ impl Storage {
         // — everything these families hold.
         // The stored ledger carries no genesis parameters; the gas section is the one the
         // comparison needs, so an unset (pre-key) price reads as the section's, like a restart.
-        match self.load_ledger(executor).map(|mut stored| {
+        // The proof window (issue #118) likewise: the anchors are inside the equality, and a
+        // wider genesis window keeps rows `load_ledger` alone does not read.
+        match self.load_ledger(executor).and_then(|mut stored| {
             stored.set_gas(gs.ledger.gas().cloned());
-            stored
+            self.restore_proof_window(&mut stored, gs)?;
+            Ok(stored)
         }) {
             // The live gas prices (Phase 2): inside the equality, hashed under `gas.dynamic`,
             // named first so the repair knows the key.
@@ -3521,6 +3546,7 @@ pub(crate) mod fixtures {
             gas: None,
             testnet: None,
             binding_domain: None,
+            proof_window_blocks: None,
             hardening_v6: None,
             hc_auth: None,
         }
@@ -3649,6 +3675,7 @@ pub(crate) mod fixtures {
             // Audit v6, STAKE-2: a faucet beside a bridge needs the marker on a new chain id.
             testnet: Some(true),
             binding_domain: None,
+            proof_window_blocks: None,
             hardening_v6: None,
             hc_auth: None,
         }
@@ -4220,8 +4247,14 @@ pub(crate) mod fixtures {
 
     /// `n` blocks, each carrying one bundle that spends a fresh pair of nullifiers.
     pub(crate) fn chain_fixture(n: u64) -> (tempfile::TempDir, Storage, GenesisState, Vec<CommittedBlock>) {
+        chain_fixture_with(n, |_| {})
+    }
+
+    /// [`chain_fixture`] on a genesis state `tweak` adjusts first (a genesis parameter, say).
+    pub(crate) fn chain_fixture_with(n: u64, tweak: impl FnOnce(&mut GenesisState)) -> (tempfile::TempDir, Storage, GenesisState, Vec<CommittedBlock>) {
         use randprotocol_core::Vote;
-        let (dir, st, gs) = genesis_with_two_notes();
+        let (dir, st, mut gs) = genesis_with_two_notes();
+        tweak(&mut gs);
         st.init_genesis(&gs).unwrap();
         let k = key(1);
         let mut ledger = gs.ledger.clone();
@@ -6519,6 +6552,27 @@ mod tests {
         assert!(l.is_anchor(&st.anchor(n).unwrap().unwrap()));
         assert_eq!(st.latest_anchor().unwrap().map(|(h, _)| h), Some(n));
         let _ = blocks;
+    }
+
+    /// Issue #118: on a chain whose genesis sets `proof_window_blocks` past 256, a restart keeps
+    /// every anchor of the window — `load_ledger` reads `ANCHOR_WINDOW` rows, not knowing the
+    /// genesis, so `reload_ledger` sets the window and re-reads the deeper rows — and a replaying
+    /// verify finds the stored snapshot equal to the chain. Without either, the restarted node
+    /// would refuse bundles anchored 257..window blocks back that its peers apply.
+    #[test]
+    fn a_wider_proof_window_survives_a_restart_and_a_verify() {
+        let n = ANCHOR_WINDOW as u64 + 44;
+        let (_d, st, gs, _blocks) = chain_fixture_with(n, |gs| gs.ledger.set_proof_window_blocks(Some(1024)));
+        let reloaded = crate::node::reload_ledger(&st, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.proof_window_blocks(), Some(1024), "restored from the genesis state");
+        assert_eq!(reloaded.anchors().len() as u64, n + 1, "every block-end root since genesis is still an anchor");
+        assert!(reloaded.is_anchor(&st.anchor(10).unwrap().unwrap()), "an anchor 290 blocks back");
+        let check = st.verify_chain(&gs, VerifyMode::Full, &StubExecutor).unwrap();
+        assert_eq!(check.problem, None);
+        // And without the field, the same chain reloads to today's 256.
+        let (_d, st, gs, _blocks) = chain_fixture(n);
+        let reloaded = crate::node::reload_ledger(&st, &gs, &StubExecutor).unwrap();
+        assert_eq!((reloaded.proof_window_blocks(), reloaded.anchors().len()), (None, ANCHOR_WINDOW));
     }
 
     #[test]

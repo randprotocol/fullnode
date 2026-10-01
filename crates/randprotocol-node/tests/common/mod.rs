@@ -98,6 +98,7 @@ fn genesis_with_aggregation(key: &Keypair, aggregation: Option<randprotocol_core
         gas: None,
         testnet: None,
         binding_domain: None,
+        proof_window_blocks: None,
     }
 }
 

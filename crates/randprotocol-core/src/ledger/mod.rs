@@ -35,12 +35,21 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 /// ~100 s on a laptop and the fleet makes a block every ~2 s, so 64 blocks expired an anchor
 /// roughly halfway through proving one honest transfer. 256 blocks is ~8.5 minutes at the fleet's
 /// pace and ~2 minutes even at 500 ms blocks — comfortably longer than the proof it has to outlive.
+/// (At chain 18's 1.17 s blocks it is ~300 s, which a delegated proof on a slow prover missed:
+/// a genesis `proof_window_blocks` replaces this and [`TIME_WINDOW`] together, issue #118; this is
+/// the window without one.)
 pub const ANCHOR_WINDOW: usize = 256;
 /// How far behind the current height a bundle's `time` may be (spec §7 item 5). Kept equal to
 /// [`ANCHOR_WINDOW`]: the two windows exist for the same reason (a prover needs the chain to still
 /// accept what it started proving), and a shorter `time` window would reject bundles whose anchor
 /// is still live.
 pub const TIME_WINDOW: u64 = 256;
+/// The bounds a genesis `proof_window_blocks` must sit inside (issue #118). The floor is today's
+/// window, so no chain can make a prover's margin shorter than every chain through 19 gave it; the
+/// ceiling keeps the anchor deque — one entry per block, in every speculative clone of the ledger
+/// — and the age of a spendable anchor bounded: 4 096 blocks is ~80 minutes at chain 18's 1.17 s.
+pub const MIN_PROOF_WINDOW_BLOCKS: u64 = TIME_WINDOW;
+pub const MAX_PROOF_WINDOW_BLOCKS: u64 = 4096;
 
 pub use staking::{QueuedStake, StakingError, ValidatorEntry};
 pub use supply::{register_total, Audit, Supply};
@@ -128,11 +137,15 @@ pub enum TxError {
     NonCanonicalRandBurn(u64),
     #[error("fee {fee} below minimum {min}")]
     FeeTooLow { min: u64, fee: u64 },
-    #[error("anchor is not one of the last {ANCHOR_WINDOW} roots")]
-    UnknownAnchor,
+    /// The anchor is not one of the chain's recorded block-end roots; `window` is how many it
+    /// keeps — [`ANCHOR_WINDOW`], or genesis `proof_window_blocks` (issue #118) — so the message
+    /// names the window this chain runs, not a constant.
+    #[error("anchor is not one of the last {window} roots")]
+    UnknownAnchor { window: u64 },
     /// A bundle's `time`, or a bundle-less `Withdraw`'s, outside the window (spec §7 item 5).
-    #[error("time {time} is outside [{}, {height}]", height.saturating_sub(TIME_WINDOW))]
-    TimeOutOfWindow { time: u32, height: u64 },
+    /// `window` is the one in force ([`TIME_WINDOW`], or genesis `proof_window_blocks`).
+    #[error("time {time} is outside [{}, {height}]", height.saturating_sub(*window))]
+    TimeOutOfWindow { time: u32, height: u64, window: u64 },
     /// One bundle spends the same nullifier in two of its four slots — a double spend within one
     /// transaction (the guest's distinctness check, repeated here as a cheap refusal).
     #[error("the transaction spends the same nullifier twice")]
@@ -556,7 +569,8 @@ pub struct Ledger {
     /// Every leaf ever appended — spec §7 item 6 needs membership the frontier cannot answer.
     commitments: BTreeSet<Word8>,
     nullifiers: BTreeSet<Word8>,
-    /// Block-end roots, oldest first, at most ANCHOR_WINDOW.
+    /// Block-end roots, oldest first, at most [`Ledger::proof_window`] (ANCHOR_WINDOW without a
+    /// genesis `proof_window_blocks`).
     anchors: VecDeque<(u64, Word8)>,
     validators: BTreeMap<Address, ValidatorEntry>,
     programs: BTreeMap<ProgramId, ProgramRecord>,
@@ -694,6 +708,14 @@ pub struct Ledger {
     /// parameter lives. A parameter like `hardening_v6`: outside the state root and equality,
     /// restored by `reload_ledger`; `false` on every chain through 18.
     testnet: bool,
+    /// Issue #118: genesis `proof_window_blocks`, the one window that replaces both
+    /// [`ANCHOR_WINDOW`] and [`TIME_WINDOW`] when set — how old a bundle's anchor and its `time`
+    /// may be — read through [`Ledger::proof_window`]. `None`, every chain through 19, is today's
+    /// 256/256. A genesis parameter like `max_program_words`: outside the state root (the anchor
+    /// deque it sizes never entered one) and this ledger's equality, restored by `reload_ledger`
+    /// on every restart — which also has to re-read the deeper anchor rows `load_ledger` stops
+    /// short of, or a restarted node would refuse anchors its peers accept.
+    proof_window_blocks: Option<u64>,
     /// The aggregator register, hashed into the state root (spec §2.1) when `aggregation` is
     /// set; empty otherwise and at chain-9 block 0.
     aggregators: BTreeMap<Address, aggregation::AggregatorEntry>,
@@ -835,6 +857,7 @@ impl Ledger {
             hardening_v6: false,
             hc_auth: None,
             testnet: false,
+            proof_window_blocks: None,
             aggregators: BTreeMap::new(),
             retired_aggregator_nonces: BTreeMap::new(),
             height: 0,
@@ -897,6 +920,7 @@ impl Ledger {
             hardening_v6: false,
             hc_auth: None,
             testnet: false,
+            proof_window_blocks: None,
             aggregators: BTreeMap::new(),
             retired_aggregator_nonces: BTreeMap::new(),
             height: 0,
@@ -1366,6 +1390,42 @@ impl Ledger {
         self.testnet = on;
     }
 
+    /// Issue #118: the genesis `proof_window_blocks`, `None` on a chain whose file does not set
+    /// it. Served as is by `rand_getLimits`; the rules read [`Ledger::proof_window`].
+    pub fn proof_window_blocks(&self) -> Option<u64> {
+        self.proof_window_blocks
+    }
+
+    /// The window in force, in blocks: how far behind the height a `time` may be and how many
+    /// block-end roots are anchors — genesis `proof_window_blocks`, or [`TIME_WINDOW`] (=
+    /// [`ANCHOR_WINDOW`]) without it.
+    pub fn proof_window(&self) -> u64 {
+        self.proof_window_blocks.unwrap_or(TIME_WINDOW)
+    }
+
+    /// Set by genesis from `proof_window_blocks`, and by `reload_ledger` on every restart. A
+    /// narrower window drops the anchors that fell out of it at once, so the deque never holds
+    /// more than the window whichever order a caller sets things in.
+    pub fn set_proof_window_blocks(&mut self, window: Option<u64>) {
+        self.proof_window_blocks = window;
+        self.trim_anchors();
+    }
+
+    /// Put back the newest stored block-end roots, oldest first (`reload_ledger`, issue #118):
+    /// `Storage::load_ledger` reads [`ANCHOR_WINDOW`] rows, because it does not know the genesis,
+    /// so a chain with a wider window re-reads the rest here. Trimmed to the window in force.
+    pub fn restore_anchors(&mut self, anchors: Vec<(u64, Word8)>) {
+        self.anchors = anchors.into_iter().collect();
+        self.trim_anchors();
+    }
+
+    fn trim_anchors(&mut self) {
+        let window = self.proof_window() as usize;
+        while self.anchors.len() > window {
+            self.anchors.pop_front();
+        }
+    }
+
     pub fn max_proof_bytes(&self) -> usize {
         self.max_proof_bytes
     }
@@ -1550,7 +1610,7 @@ impl Ledger {
     }
 
     /// Spec §7 item 5: a `time` is this height at the latest and at most [`TIME_WINDOW`] blocks
-    /// behind it. Three things carry one — a bundle's `time`, which its proof binds the notes it
+    /// behind it — or genesis `proof_window_blocks` (issue #118, [`Ledger::proof_window`]). Three things carry one — a bundle's `time`, which its proof binds the notes it
     /// creates to, a bundle-less `Withdraw`'s (S2) and a `BridgeAttest`'s (S3), each of which the
     /// ledger stamps its derived note with — and all three are a promise about *when* that the
     /// chain has to hold to the same window, or they would drift apart on a chain where only one
@@ -1558,12 +1618,12 @@ impl Ledger {
     /// chain scrolls on, rather than re-deriving the rule.
     pub fn time_in_window(&self, time: u32) -> bool {
         let t = time as u64;
-        t <= self.height && self.height - t <= TIME_WINDOW
+        t <= self.height && self.height - t <= self.proof_window()
     }
 
     fn check_time(&self, time: u32) -> Result<(), TxError> {
         if !self.time_in_window(time) {
-            return Err(TxError::TimeOutOfWindow { time, height: self.height });
+            return Err(TxError::TimeOutOfWindow { time, height: self.height, window: self.proof_window() });
         }
         Ok(())
     }
@@ -1644,9 +1704,7 @@ impl Ledger {
             return;
         }
         self.anchors.push_back((height, root));
-        while self.anchors.len() > ANCHOR_WINDOW {
-            self.anchors.pop_front();
-        }
+        self.trim_anchors();
     }
 
     /// Append one note the chain created itself rather than accepted from a bundle: a genesis
@@ -1684,7 +1742,7 @@ impl Ledger {
     /// action (`validate_inner` step 3, and [`tokens::check_asset_burn`] for the two burns).
     fn check_bundle(&self, b: &Bundle) -> Result<(), TxError> {
         if !self.is_anchor(&b.anchor) {
-            return Err(TxError::UnknownAnchor);
+            return Err(TxError::UnknownAnchor { window: self.proof_window() });
         }
         self.check_time(b.time)?;
         if has_duplicate(&b.nullifiers) {
@@ -3263,7 +3321,7 @@ mod tests {
         // unknown anchor
         let mut t = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
         t.bundle.as_mut().unwrap().anchor = [9; 8];
-        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::UnknownAnchor));
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::UnknownAnchor { window: 256 }));
         // time window: future and too old. The height is chosen past the window so both edges
         // exist; the edges themselves are expressed in TIME_WINDOW, never in its current value.
         const H: u64 = TIME_WINDOW + 100;
@@ -3272,9 +3330,9 @@ mod tests {
         l.record_anchor(H);
         let mut t = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
         t.bundle.as_mut().unwrap().time = H as u32 + 1;
-        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::TimeOutOfWindow { time: H as u32 + 1, height: H }));
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::TimeOutOfWindow { time: H as u32 + 1, height: H, window: TIME_WINDOW }));
         t.bundle.as_mut().unwrap().time = oldest - 1;
-        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::TimeOutOfWindow { time: oldest - 1, height: H }));
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::TimeOutOfWindow { time: oldest - 1, height: H, window: TIME_WINDOW }));
         t.bundle.as_mut().unwrap().time = oldest; // exactly height - TIME_WINDOW is allowed
         let mut b = t.bundle.clone().unwrap();
         b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
@@ -3339,8 +3397,49 @@ mod tests {
         assert!(!l.is_anchor(&l.root()), "a mid-block root is not an anchor");
         assert_eq!(
             l.validate(&tx(&l, [[10_004; 8], [10_005; 8]], [[10_006; 8], [10_007; 8]]), &StubExecutor),
-            Err(TxError::UnknownAnchor)
+            Err(TxError::UnknownAnchor { window: 256 })
         );
+    }
+
+    /// Issue #118: genesis `proof_window_blocks` replaces both windows. Under 1 024 the anchor
+    /// deque keeps 1 024 block-end roots and a `time` 1 024 blocks old is still inside; both
+    /// refusals name the window in force; without the field (and back at `None`) it is 256/256.
+    #[test]
+    fn a_genesis_proof_window_widens_both_windows_and_the_errors_name_it() {
+        const W: u64 = 1024;
+        let mut wide = ledger();
+        wide.set_proof_window_blocks(Some(W));
+        let mut plain = ledger();
+        assert_eq!((plain.proof_window(), plain.proof_window_blocks()), (TIME_WINDOW, None));
+        assert_eq!((wide.proof_window(), wide.proof_window_blocks()), (W, Some(W)));
+        for h in 1..=(W + 100) {
+            for l in [&mut wide, &mut plain] {
+                l.set_height(h);
+                l.record_anchor(h);
+            }
+        }
+        assert_eq!(plain.anchors().len(), ANCHOR_WINDOW, "no field: today's deque");
+        assert_eq!(wide.anchors().len(), W as usize, "the deque keeps the genesis window");
+        assert_eq!(wide.anchors().front().map(|(h, _)| *h), Some(100 + 1));
+        // The time window, at both edges, under each.
+        let h = W + 100;
+        assert!(wide.time_in_window((h - W) as u32) && !wide.time_in_window((h - W) as u32 - 1));
+        assert!(!plain.time_in_window((h - W) as u32) && plain.time_in_window((h - TIME_WINDOW) as u32));
+        // A stale `time` is refused with the window this chain runs, and the text says so.
+        let mut t = tx(&wide, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        t.bundle.as_mut().unwrap().time = (h - W) as u32 - 1;
+        let err = wide.validate(&t, &StubExecutor).unwrap_err();
+        assert_eq!(err, TxError::TimeOutOfWindow { time: (h - W) as u32 - 1, height: h, window: W });
+        assert_eq!(err.to_string(), format!("time {} is outside [{}, {h}]", h - W - 1, h - W));
+        // An unknown anchor likewise.
+        let mut t = tx(&wide, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        t.bundle.as_mut().unwrap().anchor = [9; 8];
+        let err = wide.validate(&t, &StubExecutor).unwrap_err();
+        assert_eq!(err, TxError::UnknownAnchor { window: W });
+        assert_eq!(err.to_string(), "anchor is not one of the last 1024 roots");
+        // Back to no field: the deque narrows at once to today's window.
+        wide.set_proof_window_blocks(None);
+        assert_eq!(wide.anchors(), plain.anchors());
     }
 
     #[test]
@@ -3587,7 +3686,7 @@ mod tests {
         // A stale opening time is refused like a withdraw's, before any signature work.
         l.set_height(TIME_WINDOW + 1);
         let stale = Transaction::mint(7, pk, 0, r, env(), 1, &a, &StubExecutor);
-        assert_eq!(l.validate(&stale, &StubExecutor), Err(TxError::TimeOutOfWindow { time: 0, height: TIME_WINDOW + 1 }));
+        assert_eq!(l.validate(&stale, &StubExecutor), Err(TxError::TimeOutOfWindow { time: 0, height: TIME_WINDOW + 1, window: TIME_WINDOW }));
     }
 
     #[test]

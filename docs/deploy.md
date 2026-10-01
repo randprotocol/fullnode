@@ -1251,6 +1251,27 @@ from the same commit.
 | views advance but nothing commits after nodes restarted | validators are waiting for uncommitted blocks behind the newest certificate that no reachable peer holds; since `f5b8dfd` they fall back to the committed head after failed fetches (log: `falling back to the committed head QC`). Make sure every node runs the same build: the sync protocol is chain-scoped and builds cannot fetch across versions |
 | a peer keeps connecting but never helps | it may run another chain or an older build; gossip topics and the sync protocol are per chain id, so it is harmless but useless |
 
+## The next cut: `proof_window_blocks` (issue #118)
+
+**What it is.** A bundle's anchor must be one of the last 256 block-end roots
+(`ledger::ANCHOR_WINDOW`) and its `time` at most 256 blocks behind the height
+(`ledger::TIME_WINDOW`). At chain 18's 1.17 s blocks that is ~300 s for the whole trip — the auth
+proof, the bundle proof, the wallet's verify, submission and inclusion — and a delegated bundle
+proof on a loaded single-core prover took 294 s and was refused (`time 102225 is outside [102230,
+102486]`). The top-level genesis field `proof_window_blocks` replaces **both** windows (they exist
+for the same reason) with one value in `[256, 4096]`. Hashed under the tag `proof_window_blocks`,
+after `bridge_rotation`, only when present; never in the state root (the anchor deque it sizes
+never was); `reload_ledger` restores it and re-reads the deeper anchor rows on every restart;
+served as `rand_getLimits.proof_window_blocks`.
+
+**Recommended: `--proof-window-blocks 1024` for chain 20** (`rand-node genesis
+--proof-window-blocks 1024`, or `"proof_window_blocks": 1024` spliced in): ~20 minutes at
+1.17 s blocks, room for any prover the pool or a user runs, while a stale anchor still dies within
+the hour. Chain 19 (v0.6.7, being cut now) carries no field and stays 256/256. The chain-20 cut
+script (not written yet) should assert the field is present and `rand_getLimits.proof_window_blocks == 1024` after launch. Every validator
+must run a build that knows the field before a genesis carries it — a v0.6.7 node does not parse
+it (and would compute a different genesis hash).
+
 ## The next cut: audit v6's staking fields (STAKE-2)
 
 Audit v6 (2026-09-30) §8.5. Each is optional, absent from every genesis through chain 18, and

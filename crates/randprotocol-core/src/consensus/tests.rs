@@ -155,6 +155,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         // Audit v6, STAKE-2: a faucet beside a bridge needs the marker on a new chain id.
         testnet: bridged.then_some(true),
         binding_domain: None,
+        proof_window_blocks: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -1581,6 +1582,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         gas: None,
         testnet: None,
         binding_domain: None,
+        proof_window_blocks: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -2062,6 +2064,7 @@ fn aggregation_node_with(
         gas: None,
         testnet: None,
         binding_domain: None,
+        proof_window_blocks: None,
     };
     let mut gs = genesis.build(&StubExecutor).unwrap();
     // Register the aggregator directly on the genesis ledger the node builds on (the register

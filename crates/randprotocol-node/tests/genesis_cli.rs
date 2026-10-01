@@ -308,3 +308,27 @@ fn the_genesis_command_writes_the_testnet_marker_when_asked() {
     assert_eq!(read(&plain).testnet, None);
     assert!(!std::fs::read_to_string(&plain).unwrap().contains("testnet"));
 }
+
+/// Issue #118: `--proof-window-blocks N` writes the window; out of [256, 4096] it is refused and
+/// nothing is written; without it the file has no such field (256/256, chain 18's rules).
+#[test]
+fn the_genesis_command_writes_the_proof_window_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("genesis.json");
+    let run = genesis(&out, &["--proof-window-blocks", "1024"]);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let gen = read(&out);
+    assert_eq!(gen.proof_window_blocks, Some(1024));
+    assert!(std::fs::read_to_string(&out).unwrap().contains("\"proof_window_blocks\": 1024"));
+    let executor = ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test);
+    assert_eq!(gen.build(&executor).unwrap().ledger.proof_window(), 1024);
+    let refused = dir.path().join("refused.json");
+    let run = genesis(&refused, &["--proof-window-blocks", "255"]);
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("bad proof_window_blocks 255"), "{}", String::from_utf8_lossy(&run.stderr));
+    assert!(!refused.exists());
+    let plain = dir.path().join("plain.json");
+    assert!(genesis(&plain, &[]).status.success());
+    assert_eq!(read(&plain).proof_window_blocks, None);
+    assert!(!std::fs::read_to_string(&plain).unwrap().contains("proof_window_blocks"));
+}

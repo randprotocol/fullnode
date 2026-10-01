@@ -1733,7 +1733,7 @@ mod tests {
         let oldest = (h - TIME_WINDOW) as u32;
         for time in [h as u32 + 1, oldest - 1] {
             let t = withdraw_tx(&v, 5 * BASE, 0, time, [3; 8]);
-            assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::TimeOutOfWindow { time, height: h }));
+            assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::TimeOutOfWindow { time, height: h, window: TIME_WINDOW }));
         }
         // Exactly `height - TIME_WINDOW` is still inside it.
         assert_eq!(l.validate(&withdraw_tx(&v, 5 * BASE, 0, oldest, [3; 8]), &StubExecutor), Ok(()));
@@ -1746,7 +1746,7 @@ mod tests {
         }
         assert_eq!(
             l.validate(&forged, &StubExecutor),
-            Err(TxError::TimeOutOfWindow { time: h as u32 + 1, height: h })
+            Err(TxError::TimeOutOfWindow { time: h as u32 + 1, height: h, window: TIME_WINDOW })
         );
     }
 

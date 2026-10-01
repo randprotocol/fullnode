@@ -28,7 +28,7 @@ use serde_json::Value;
 use randprotocol_core::bridge::{AssetId, Attestation, Payload};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::ledger::tokens::{MintAuthority, MINT_FROM};
-use randprotocol_core::ledger::{bridge_notes, TIME_WINDOW};
+use randprotocol_core::ledger::{bridge_notes, MAX_PROOF_WINDOW_BLOCKS, MIN_PROOF_WINDOW_BLOCKS, TIME_WINDOW};
 use randprotocol_core::notes::{word8_from_hex, word8_to_hex, Bundle, Envelope, EnvelopeFormat, ShieldedAddress, Word8, DEPTH};
 use randprotocol_core::types::TX_BINDING_WORDS;
 use randprotocol_core::{format_amount, gas, Action, BindingDomain, Hash, InitialMint, Keypair, PublicKey, Transaction};
@@ -338,7 +338,8 @@ pub struct OwnedNote {
     /// Set by a `--no-wait` submission to the `time` of the bundle that spends this note: the
     /// note is not spendable, but the chain has not confirmed the spend either. A later [`scan`]
     /// clears it once the chain answers — the nullifier appeared (`spent`), or the blocks this
-    /// wallet has actually read the nullifiers of reach past `time + TIME_WINDOW`, past which
+    /// wallet has actually read the nullifiers of reach past `time + TIME_WINDOW` (or the chain's
+    /// genesis `proof_window_blocks`, issue #118), past which
     /// that bundle can never be admitted at all (`Ledger::validate_inner`'s time check) so the
     /// note is spendable again.
     #[serde(default)]
@@ -1207,8 +1208,10 @@ async fn scan_pass(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result
     }
     store.scanned_height = advance_scanned_height(store.scanned_height, from, head_before);
 
-    // Resolve anything a `--no-wait` submission left pending, now that the chain has answered.
-    clear_pending(store, store.scanned_height.saturating_sub(1));
+    // Resolve anything a `--no-wait` submission left pending, now that the chain has answered —
+    // after the chain's own window (issue #118), read only when something is pending.
+    let window = if store.notes.iter().any(|n| n.pending.is_some()) { pending_window(rpc.limits().await?.as_ref()) } else { TIME_WINDOW };
+    clear_pending(store, store.scanned_height.saturating_sub(1), window);
     Ok(ScanPass::Done)
 }
 
@@ -1232,17 +1235,34 @@ fn advance_scanned_height(previous: u64, paged_to: u64, head_before: u64) -> u64
 /// is the last block height this scan has read (`scanned_height - 1`).
 ///
 /// A note clears either because its spend landed (`spent`, set by the nullifier pages) or
-/// because the blocks read reach past `time + TIME_WINDOW`, the last height at which a bundle
-/// stamped `time` could still be admitted: after that the submission can never commit, so the
+/// because the blocks read reach past `time + window` (the chain's proof window, [`TIME_WINDOW`]
+/// without a genesis `proof_window_blocks`), the last height at which a bundle stamped `time`
+/// could still be admitted: after that the submission can never commit, so the
 /// note is free again. The bound is what was read, never a head fetched later.
-fn clear_pending(store: &mut NoteStore, read_through: u64) {
+fn clear_pending(store: &mut NoteStore, read_through: u64, window: u64) {
     for n in store.notes.iter_mut() {
         if let Some(time) = n.pending {
-            if n.spent || read_through > time as u64 + TIME_WINDOW {
+            if n.spent || read_through > time as u64 + window {
                 n.pending = None;
             }
         }
     }
+}
+
+/// The window [`clear_pending`] waits out (issue #118): the chain's `proof_window_blocks` from
+/// `rand_getLimits`, or [`TIME_WINDOW`] where the node serves none (no field, or a node that
+/// predates it or the method).
+///
+/// The node's word is unauthenticated, and it decides only this wallet's own bookkeeping: when a
+/// `--no-wait` spend that never showed up is given up on. Clamped to the bounds a genesis can
+/// carry, so a lying node can move that moment only inside [256, 4096] blocks: too early, and the
+/// wallet may try to spend the note again — the chain refuses the second spend if the first one
+/// committed (`Spent`), so nothing is lost but a fee-less refusal; too late, and the note looks
+/// unspendable for at most 4 096 blocks. It changes nothing the chain checks.
+fn pending_window(limits: Option<&ChainLimits>) -> u64 {
+    limits
+        .and_then(|l| l.proof_window_blocks)
+        .map_or(TIME_WINDOW, |w| w.clamp(MIN_PROOF_WINDOW_BLOCKS, MAX_PROOF_WINDOW_BLOCKS))
 }
 
 // ---------------------------------------------------------------- coin selection
@@ -4962,6 +4982,9 @@ mod tests {
         /// 7, outside `CHAIN_ID_BINDING_CHAIN_IDS`, so the wallet proves the genesis-bound form
         /// there and a node claiming otherwise only gets a refusal.
         binding_domain: u32,
+        /// `rand_getLimits`' `proof_window_blocks` (issue #118): `None`, served as null, unless a
+        /// test runs a wider window.
+        proof_window_blocks: Option<u64>,
     }
 
     fn kind(a: &Action) -> &'static str {
@@ -5005,6 +5028,7 @@ mod tests {
                 hc_bundle: ZkExecutor::hc_bundle(),
                 hc_auth: None,
                 binding_domain: 1,
+                proof_window_blocks: None,
             }
         }
 
@@ -5137,6 +5161,7 @@ mod tests {
                     "max_call_envelope_bytes": 18_432, "max_program_public_words": 64,
                     "envelope_bytes": self.envelope_bytes,
                     "binding_domain": self.binding_domain,
+                    "proof_window_blocks": self.proof_window_blocks,
                 }),
                 _ => return Reply::Err(-32601, "unknown method"),
             })
@@ -5750,6 +5775,32 @@ mod tests {
         assert!(store.notes.is_empty() && store.sent.is_empty(), "every spent mark and hold is gone");
         assert_eq!(store.tree.next_index(), 0, "the tree is rebuilt from leaf 0 too");
         assert_eq!(store.bind(this), Bound::Same, "and the next scan does not treat it as a foreign store");
+    }
+
+    /// Issue #118, through a whole scan: a `--no-wait` spend 400 blocks old is still pending on a
+    /// chain whose `rand_getLimits` says `proof_window_blocks: 1024` (the bundle can still commit
+    /// there), and released on one that serves none (256).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_holds_a_pending_spend_for_the_chains_proof_window() {
+        let me = Wallet::from_spend_key(SpendKey([59; 8]));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        {
+            let mut c = chain.lock().unwrap();
+            c.fund(&me, 5, 0);
+            for _ in 0..400 {
+                c.commit(Vec::new(), Vec::new());
+            }
+            c.proof_window_blocks = Some(1024);
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        scan(&rpc, &me, &mut store).await.unwrap();
+        store.notes[0].pending = Some(1);
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.notes[0].pending, Some(1), "400 blocks is inside the chain's 1 024-block window");
+        chain.lock().unwrap().proof_window_blocks = None;
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.notes[0].pending, None, "and past today's 256");
     }
 
     /// The reproduction from 2026-09-23: a store whose leaf cursor sat past every leaf of the
@@ -7451,7 +7502,7 @@ mod tests {
         let raised = ChainLimits {
             max_program_words: 4096, max_proof_bytes: 20 << 20, max_block_bytes: 24 << 20, max_call_envelope_bytes: 18_432,
             max_program_public_words: 0, envelope_bytes: None, hardening_v6: true,
-            gas_price: None, byte_price: None, gas_circuit: false, bundle_gas_limit: None, adjust_bps: None,
+            gas_price: None, byte_price: None, gas_circuit: false, bundle_gas_limit: None, adjust_bps: None, proof_window_blocks: None,
         };
         let priced = ChainLimits { gas_price: Some(100), byte_price: Some(800), ..raised };
         assert_eq!(hardened_call_quote_bytes(Some(&raised), 1_000), 1_000, "no policy: the envelope, as before");
@@ -7470,7 +7521,7 @@ mod tests {
         let policy = ChainLimits {
             max_program_words: 4096, max_proof_bytes: 2 << 20, max_block_bytes: 4 << 20, max_call_envelope_bytes: 18_432,
             max_program_public_words: 0, envelope_bytes: None, hardening_v6: false,
-            gas_price: Some(100), byte_price: Some(800), gas_circuit: false, bundle_gas_limit: None, adjust_bps: None,
+            gas_price: Some(100), byte_price: Some(800), gas_circuit: false, bundle_gas_limit: None, adjust_bps: None, proof_window_blocks: None,
         };
         let old = ChainLimits { gas_price: None, byte_price: None, ..policy };
         for tier in [10u8, 12, 14, 20] {
@@ -7644,20 +7695,43 @@ mod tests {
 
         // One block short of the last height at which the bundle could still be admitted.
         let mut store = pending_at(9, false);
-        clear_pending(&mut store, 9 + TIME_WINDOW);
+        clear_pending(&mut store, 9 + TIME_WINDOW, TIME_WINDOW);
         assert_eq!(store.notes[0].pending, Some(9), "the bundle can still commit at this height");
         assert_eq!(store.balance(), 0);
 
         // One past it: the submission can never be admitted now, so the note is free again.
-        clear_pending(&mut store, 9 + TIME_WINDOW + 1);
+        clear_pending(&mut store, 9 + TIME_WINDOW + 1, TIME_WINDOW);
         assert_eq!(store.notes[0].pending, None);
         assert_eq!(store.balance(), 5);
 
         // A spend that did land clears the mark immediately, whatever the height reached.
         let mut store = pending_at(9, true);
-        clear_pending(&mut store, 0);
+        clear_pending(&mut store, 0, TIME_WINDOW);
         assert_eq!(store.notes[0].pending, None);
         assert_eq!(store.balance(), 0, "but a spent note is still spent");
+    }
+
+    /// Issue #118: on a chain whose genesis sets `proof_window_blocks`, a pending spend stays
+    /// pending until the blocks read pass *that* window — the bundle can still commit up to it.
+    /// The window comes from `rand_getLimits`, a node's unauthenticated word, so it is clamped to
+    /// what a genesis can carry: a lying node can move the release only inside [256, 4096].
+    #[test]
+    fn pending_waits_out_the_chains_proof_window() {
+        let mut n = owned(0, 5, false);
+        n.pending = Some(9);
+        let mut store = NoteStore { notes: vec![n], ..NoteStore::default() };
+        clear_pending(&mut store, 9 + TIME_WINDOW + 1, 1024);
+        assert_eq!(store.notes[0].pending, Some(9), "past 256 but inside the chain's 1 024: it can still commit");
+        clear_pending(&mut store, 9 + 1024, 1024);
+        assert_eq!(store.notes[0].pending, Some(9));
+        clear_pending(&mut store, 9 + 1024 + 1, 1024);
+        assert_eq!(store.notes[0].pending, None);
+        let with = |w: Option<u64>| ChainLimits { proof_window_blocks: w, ..limits(18_432, 2 << 20) };
+        assert_eq!(pending_window(None), TIME_WINDOW, "a node without rand_getLimits");
+        assert_eq!(pending_window(Some(&with(None))), TIME_WINDOW, "a chain without the field");
+        assert_eq!(pending_window(Some(&with(Some(1024)))), 1024);
+        assert_eq!(pending_window(Some(&with(Some(3)))), MIN_PROOF_WINDOW_BLOCKS, "never released before 256");
+        assert_eq!(pending_window(Some(&with(Some(u64::MAX)))), MAX_PROOF_WINDOW_BLOCKS, "never held past 4 096");
     }
 
     #[test]
@@ -7830,6 +7904,7 @@ mod tests {
             gas_circuit: false,
             bundle_gas_limit: None,
             adjust_bps: None,
+            proof_window_blocks: None,
         }
     }
 
@@ -8104,6 +8179,7 @@ mod tests {
             gas_circuit: false,
             bundle_gas_limit: None,
             adjust_bps: None,
+            proof_window_blocks: None,
         };
         let want = GasPolicy::DEFAULT.call_floor(tier, 0, 0, bytes);
         assert!(want > ledger_floor, "the policy floor must exceed the ledger floor for this test to say anything");

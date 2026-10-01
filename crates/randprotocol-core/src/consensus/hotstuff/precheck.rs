@@ -279,6 +279,7 @@ mod tests {
             gas: None,
             testnet: None,
             binding_domain: None,
+            proof_window_blocks: None,
         };
         let gs = genesis.build(&StubExecutor).unwrap();
         let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());

@@ -198,6 +198,11 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // And the testnet marker (audit v6, STAKE-2): served, not judged, but a node that came
     // back without it would tell wallets a testnet is not one.
     ledger.set_testnet(gs.ledger.testnet());
+    // And the proof window (issue #118; genesis `proof_window_blocks`), with the anchor rows past
+    // the 256 `load_ledger` reads: a node that came back at 256 would refuse every bundle whose
+    // anchor or `time` is older than that and inside the genesis window — applied by its peers,
+    // so a fork at the first one after its restart.
+    storage.restore_proof_window(&mut ledger, gs)?;
     // And the consensus signing domain (audit v4): `load_ledger` comes back at v0, and a node
     // that kept it on a v1 chain would refuse every peer's proposal at the ledger's own
     // signature check.
@@ -5275,6 +5280,23 @@ mod tests {
         assert_eq!(g.bundle_gas_limit, 20_479);
     }
 
+    /// Issue #118: genesis `proof_window_blocks` survives a restart. `load_ledger` comes back at
+    /// `None`, 256/256, and a node that kept it would refuse a bundle whose anchor or `time` is
+    /// 257..window blocks old — admitted and applied by its peers: a fork at the first one.
+    #[test]
+    fn a_restart_restores_the_proof_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        gs.ledger.set_proof_window_blocks(Some(1024));
+        storage.init_genesis(&gs).unwrap();
+        assert_eq!(storage.load_ledger(&StubExecutor).unwrap().proof_window_blocks(), None, "storage does not hold it");
+        let mut reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.proof_window_blocks(), Some(1024), "restored from the genesis state");
+        reloaded.set_height(1000);
+        assert!(reloaded.time_in_window(0), "a time 1 000 blocks old is inside the restored window");
+    }
+
     /// BIND-1 (audit v6): the binding domain survives a restart the same way. `load_ledger`
     /// comes back at `ChainId`, and a node that kept it on a `binding_domain: 1` chain would
     /// recompute every binding and signed message without the genesis hash: refusing what its
@@ -7074,7 +7096,7 @@ mod tests {
         );
         assert_eq!(refused.len(), 1, "a bad digest is worth remembering");
         assert_eq!(
-            acceptance_for(&Err(TxError::UnknownAnchor), Hash::digest(b"b"), &mut refused),
+            acceptance_for(&Err(TxError::UnknownAnchor { window: 256 }), Hash::digest(b"b"), &mut refused),
             Acceptance::Ignore
         );
         assert_eq!(refused.len(), 1, "a stale anchor is not this transaction's fault");

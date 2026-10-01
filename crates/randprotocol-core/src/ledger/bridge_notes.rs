@@ -758,8 +758,8 @@ mod tests {
             l.validate(&tx, &StubExecutor)
         };
         let oldest = (height - TIME_WINDOW) as u32;
-        assert_eq!(at(height as u32 + 1), Err(TxError::TimeOutOfWindow { time: height as u32 + 1, height }));
-        assert_eq!(at(oldest - 1), Err(TxError::TimeOutOfWindow { time: oldest - 1, height }));
+        assert_eq!(at(height as u32 + 1), Err(TxError::TimeOutOfWindow { time: height as u32 + 1, height, window: TIME_WINDOW }));
+        assert_eq!(at(oldest - 1), Err(TxError::TimeOutOfWindow { time: oldest - 1, height, window: TIME_WINDOW }));
         assert_eq!(at(oldest), Ok(()), "exactly height - TIME_WINDOW is inside it");
         assert_eq!(at(height as u32), Ok(()));
         // Before any decode: a `time` outside the window is refused even with attestation bytes
@@ -771,7 +771,7 @@ mod tests {
             *t = time;
             l.validate(&tx, &StubExecutor)
         };
-        assert_eq!(junk(height as u32 + 1), Err(TxError::TimeOutOfWindow { time: height as u32 + 1, height }));
+        assert_eq!(junk(height as u32 + 1), Err(TxError::TimeOutOfWindow { time: height as u32 + 1, height, window: TIME_WINDOW }));
         assert!(matches!(junk(height as u32), Err(TxError::Bridge(_))), "the decode is what refuses it now");
     }
 

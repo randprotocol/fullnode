@@ -30,7 +30,8 @@ const MAX_PAGE: usize = 1000;
 
 /// The most blocks one `rand_getCompactBlocks` call may cover. Half the 256-block anchor
 /// window (`ledger::ANCHOR_WINDOW`), so a wallet syncing forward never crosses more than one
-/// window per request.
+/// window per request. A genesis `proof_window_blocks` (issue #118) can only widen the window,
+/// never below 256, so this still holds there.
 const MAX_COMPACT_BLOCKS: u64 = 128;
 
 /// The most headers one `rand_getBlocks` call may return. A header is ~100 bytes and carries
@@ -738,6 +739,11 @@ pub struct ChainLimits {
     /// on; which binding it proves is decided by the transaction's own chain id
     /// (`randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS`).
     pub binding_domain: u32,
+    /// Issue #118: the genesis `proof_window_blocks` — how old, in blocks, a bundle's anchor and
+    /// its `time` may be — `null` on a chain without it, where both windows are 256
+    /// (`ledger::ANCHOR_WINDOW`, `ledger::TIME_WINDOW`). The wallet reads it for its own
+    /// bookkeeping only (when a `--no-wait` spend can no longer commit).
+    pub proof_window_blocks: Option<u64>,
 }
 
 impl ChainLimits {
@@ -763,6 +769,7 @@ impl ChainLimits {
             testnet: ledger.testnet(),
             slashing: ledger.staking().and_then(|s| s.slashing),
             binding_domain: ledger.binding_domain().version(),
+            proof_window_blocks: ledger.proof_window_blocks(),
         };
         if let Some(g) = ledger.gas() {
             let prices = ledger.gas_prices();
@@ -4283,6 +4290,7 @@ mod tests {
                 "testnet": false,
                 "slashing": null,
                 "binding_domain": 0,
+                "proof_window_blocks": null,
             })
         );
         let gs = raised_genesis();
@@ -4310,6 +4318,7 @@ mod tests {
                 "testnet": false,
                 "slashing": null,
                 "binding_domain": 0,
+                "proof_window_blocks": null,
             })
         );
         // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
@@ -4339,6 +4348,7 @@ mod tests {
                 "testnet": false,
                 "slashing": null,
                 "binding_domain": 0,
+                "proof_window_blocks": null,
             })
         );
         // The v0.6 switch: what a wallet reads to prove its calls over the call binding (INT-4).
@@ -4668,7 +4678,7 @@ mod tests {
         tx.bundle.as_mut().unwrap().anchor = [0xdead; 8];
         let err = ledger.validate(&tx, &StubExecutor).unwrap_err();
         assert!(
-            matches!(err, randprotocol_core::TxError::UnknownAnchor),
+            matches!(err, randprotocol_core::TxError::UnknownAnchor { window: 256 }),
             "the anchor is checked before the digest it no longer matches: {err}"
         );
         assert!(err.to_string().contains("anchor"), "{err}");
@@ -5026,6 +5036,18 @@ mod tests {
             st.status.write().unwrap_or_else(|e| e.into_inner()).testnet = gs.testnet;
         }
         assert_eq!(ok(&st, "rand_status", json!([])).await["testnet"], json!(true));
+    }
+
+    /// Issue #118: `rand_getLimits.proof_window_blocks` is the genesis field, `null` without it.
+    #[tokio::test]
+    async fn get_limits_serves_the_proof_window() {
+        let (_d, st, _) = chain();
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["proof_window_blocks"], Value::Null);
+        let mut g = fixtures::genesis_file_of(7, &[&key(1)], vec![], 2);
+        g.proof_window_blocks = Some(1024);
+        let gs = g.build(&StubExecutor).unwrap();
+        let (_d, st) = state_for(&gs);
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["proof_window_blocks"], json!(1024));
     }
 
     #[tokio::test]

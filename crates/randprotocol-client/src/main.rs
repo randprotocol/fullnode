@@ -2406,6 +2406,7 @@ mod tests {
             gas_circuit: true,
             bundle_gas_limit: Some(gas::gas_max(14, 0, 0)),
             adjust_bps: None,
+            proof_window_blocks: None,
         }
     }
 

@@ -180,6 +180,12 @@ pub struct ChainLimits {
     /// two or three certified blocks later).
     #[serde(default)]
     pub adjust_bps: Option<u32>,
+    /// Issue #118: the genesis `proof_window_blocks` — how old, in blocks, a bundle's anchor and
+    /// `time` may be on this chain — `None` where the genesis has none (both windows 256) and from
+    /// a node that predates the field. The wallet reads it only for when a `--no-wait` spend can
+    /// no longer commit (`wallet::clear_pending`), clamped to the bounds a genesis can carry.
+    #[serde(default)]
+    pub proof_window_blocks: Option<u64>,
 }
 
 /// `gas_metering` as the one fact the wallet acts on: is it `"circuit"`?
@@ -1405,6 +1411,8 @@ mod tests {
                 gas_circuit: false,
                 bundle_gas_limit: None,
                 adjust_bps: None,
+                // Nor a proof window (issue #118): 256 blocks.
+                proof_window_blocks: None,
             })
         );
         let older = RpcClient::new(scripted_rpc(vec![]).await);
