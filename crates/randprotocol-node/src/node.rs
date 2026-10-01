@@ -1605,8 +1605,14 @@ fn expire_stale_fetches<K: std::hash::Hash + Eq + Clone>(
 /// those same blocks in order, so while the node knows it is more than a block behind it does not
 /// also fetch by hash; the fetch resumes once it has caught up (a parent for a live proposal, the
 /// locked block, a leader's high-QC block).
-fn fetch_deferred_to_batch_sync(best_peer_height: u64, committed_height: u64) -> bool {
-    best_peer_height > committed_height.saturating_add(1)
+///
+/// "Behind" is measured on what the node *holds* (audit v7 addendum, SYNC-6, #127): its pending
+/// tip, never below its committed head, as [`orphan_wants_batch_sync`] measures it. A batch
+/// commits all but the last two blocks it carries, so a node synced to its peers' head H has
+/// committed H − 2 and holds H − 1 and H pending; measured from the committed height it read as
+/// behind and kept deferring the one fetch no batch serves, an uncommitted block's.
+fn fetch_deferred_to_batch_sync(best_peer_height: u64, held_height: u64) -> bool {
+    best_peer_height > held_height.saturating_add(1)
 }
 
 /// How long one block's by-hash fetch may wait on [`fetch_deferred_to_batch_sync`] (audit v7
@@ -1618,9 +1624,9 @@ fn fetch_deferred_to_batch_sync(best_peer_height: u64, committed_height: u64) ->
 pub const FETCH_DEFER_GRACE: Duration = Duration::from_secs(10);
 
 /// Whether a by-hash fetch of a block first deferred at `first_deferred` (`None`: not yet) still
-/// waits for batch sync at `now`.
-fn fetch_deferred(best_peer_height: u64, committed_height: u64, first_deferred: Option<Instant>, now: Instant) -> bool {
-    fetch_deferred_to_batch_sync(best_peer_height, committed_height)
+/// waits for batch sync at `now`; `held_height` as in [`fetch_deferred_to_batch_sync`].
+fn fetch_deferred(best_peer_height: u64, held_height: u64, first_deferred: Option<Instant>, now: Instant) -> bool {
+    fetch_deferred_to_batch_sync(best_peer_height, held_height)
         && first_deferred.is_none_or(|t| now.duration_since(t) < FETCH_DEFER_GRACE)
 }
 
@@ -3323,7 +3329,7 @@ impl Node {
         if self.hs.has_block(&h) || fetch_blocked(&self.fetch_inflight, &h) {
             return Vec::new();
         }
-        let (best, held) = (self.best_peer_height(), self.hs.committed_height());
+        let (best, held) = (self.best_peer_height(), self.hs.pending_tip_height().max(self.hs.committed_height()));
         if fetch_deferred_to_batch_sync(best, held) {
             let now = Instant::now();
             if self.fetch_deferred_since.len() >= MAX_FETCH_DEFERRALS && !self.fetch_deferred_since.contains_key(&h) {
@@ -5732,6 +5738,37 @@ mod tests {
             vec![(claimer, missing)],
             "a claim that has not brought the block within the grace no longer holds the fetch back"
         );
+    }
+
+    /// Audit v7 addendum, SYNC-6 (#127): a batch commits all but the last two blocks it carries,
+    /// so a node synced to its peers' head H has committed H − 2 and holds H − 1 and H as pending.
+    /// The by-hash gate read the committed height and called that node behind, deferring the one
+    /// fetch no batch can serve (an uncommitted block). It measures what the node holds — its
+    /// pending tip — as [`orphan_wants_batch_sync`] does; a claim past that still defers.
+    #[tokio::test]
+    async fn fetch_block_measures_the_gate_from_the_pending_tip() {
+        let (_d, storage, gs, ledger) = chain_past_a_boundary();
+        let mut hs = resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), Arc::new(StubExecutor)).unwrap();
+        let b3 = next_block(&storage.head_block().unwrap(), &ledger, &key(1));
+        hs.on_proposal(b3.clone(), 3).expect("block 3");
+        let mut l3 = ledger.clone();
+        l3.set_height(3);
+        l3.set_timestamp_ms(3);
+        l3.apply_transactions(&[], &key(1).address(), &StubExecutor).unwrap();
+        l3.record_anchor(3);
+        hs.on_proposal(next_block(&b3, &l3, &key(1)), 4).expect("block 4");
+        assert_eq!((hs.committed_height(), hs.pending_tip_height()), (2, 4), "synced to 4: 2 committed, 3 and 4 pending");
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let peer = claiming_peer(&mut node, 4);
+        let parent = Hash::digest(b"an uncommitted block no batch serves");
+
+        assert!(node.fetch_block(parent).await.is_empty());
+        assert_eq!(sent_by_hash(&mut seen).await, vec![(peer, parent)], "at the peers' head: fetch it by hash");
+
+        node.peers.get_mut(&peer).unwrap().status.as_mut().unwrap().height = 6;
+        let far = Hash::digest(b"a block a batch brings");
+        assert!(node.fetch_block(far).await.is_empty());
+        assert_eq!(sent_by_hash(&mut seen).await, vec![], "two past what it holds: the batch sync brings it");
     }
 
     /// Audit v6, PROC-8: a node more than one block behind defers by-hash fetches to batch sync;

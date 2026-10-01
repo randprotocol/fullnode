@@ -110,6 +110,20 @@ ignored); client lib 171, `rand` bin 17; the prover crate whole. Not run: `walle
   restarted node that had heard no peer's Status (b677708: the proposals' height counts until one
   is heard; an over-limit batch is answered `Busy`, never an empty "miss"). In `cluster.rs` every
   node dials only the bootstrap node, so a relayed Status (ignored, SYNC-1) is no help there.
+- **By-hash fetches and batch sync** (PROC-8, SYNC-5 #120, SYNC-6 #127, PROC-11 #128). While a
+  node is more than one block behind the best height it knows (the largest peer Status, or the
+  highest proposal seen while no Status has arrived), `Node::fetch_block` does not fetch by hash:
+  the batch sync brings those blocks in order, and by-hash requests on top of it spent the peers'
+  sync allowance until they answered the batch with nothing. "Behind" is measured from the
+  pending tip, never below the committed head (`pending_tip_height().max(committed_height())`,
+  as `orphan_wants_batch_sync` measures it): a batch commits all but its last two blocks, so a
+  caught-up node's committed height is two short and the one block no batch serves, an
+  uncommitted one, would stay deferred. Each block waits at most `FETCH_DEFER_GRACE` (10 s) — a
+  Status is unsigned, so one peer's claim must not hold the locked-block fetch and the ghost-QC
+  attempts back for ever. Pinned through `fetch_block` itself by
+  `fetch_block_defers_to_batch_sync_on_a_claimed_height_for_the_grace_only` and
+  `fetch_block_measures_the_gate_from_the_pending_tip` (on `bare_node`, a `Node` with a detached
+  network handle — the harness for any other test of a `Node` method).
 - A rebased branch can carry a test that no longer compiles against main (HB-4's
   `tx.binding()` after BIND-1 gave it a domain argument): `cargo check --workspace --tests` after
   every rebase, not only `--lib`.
