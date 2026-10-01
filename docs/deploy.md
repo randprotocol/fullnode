@@ -1290,6 +1290,19 @@ from the same commit.
 | views advance but nothing commits after nodes restarted | validators are waiting for uncommitted blocks behind the newest certificate that no reachable peer holds; since `f5b8dfd` they fall back to the committed head after failed fetches (log: `falling back to the committed head QC`). Make sure every node runs the same build: the sync protocol is chain-scoped and builds cannot fetch across versions |
 | a peer keeps connecting but never helps | it may run another chain or an older build; gossip topics and the sync protocol are per chain id, so it is harmless but useless |
 
+## Chain 20's faucet, and where testnet RAND comes from
+
+Chain 20 (like 15–19) runs the faucet **for an allow-list only**: genesis
+`staking.faucet_recipients` names 16 wallets, and the ledger refuses a `Mint` to any other address
+(`rand_status.faucet: true` says the faucet exists, not that anyone may mint). `rand_mint` is also
+not on the public listener (`rpc::PUBLIC_METHODS`) nor through `https://rpc.randprotocol.org` (the
+website's sale proxy allow-list). A session or a developer that needs testnet RAND asks the operator,
+who sends it from an operator wallet with `rand send` (a v0.6.8 `rand`; on 2026-10-01, 300 RAND each
+to durian.market's treasury and to example-programs). The RPL-2 reads (`rand_getProgramCell`,
+`rand_getProgramCells`, `rand_getProgramVault`) are on the node's public listener but were **not**
+on the website proxy's allow-list at chain 20's launch — `rand program invoke/state/vault` through
+the public URL fails until that proxy (randprotocol.org, `server/sale/src/rpc.rs`) lists them.
+
 ## The next cut: `proof_window_blocks` (issue #118)
 
 **What it is.** A bundle's anchor must be one of the last 256 block-end roots
