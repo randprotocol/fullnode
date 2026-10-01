@@ -1,0 +1,17 @@
+# Cut record — chain 20 (docs/deploy.md, "Cut policy"; audit v6, OPS-7). Filled 2026-10-01.
+
+chain-id: 20
+
+reason: v0.6.8's genesis-gated rules need a new genesis — testnet, binding_domain 1 (the transaction binding and every signed action message over the genesis hash), proof_window_blocks 1024, the gas ceilings and paying byte load, staking admission by vote and a fractional entry budget, bridge.rotation, bridge.fees (the zUSD bridge fees, both ways), RPL-2's program_state — and the build carries CON-4/CH-1 consensus changes that roll only all-stop/all-start.
+
+carries: the 26 validators × 1 000 RAND on chain 19's keys (same peer ids); the bridge state from a chain-19 snapshot at height 7258 (guardian set 1, burn_sequence 13, inbound floors {2:3, 3:3, 4:3, 5:7}, chain 19's emitters, locked ETH-USDT 22 / BSC-USDT 22 / Tron-USDT 30 / Sol-USDT 25 = 99 == custody); 99 zUSD as two genesis notes (anish 10, the owner's wallet 89DS-4Q4X-HXSX-MBYW 89); 5 184.243719258 RAND as genesis allocs to the seven operator wallets the balances scan found (relayer 299.979, shielded-1 994.998, -2 999.998, -3 999.993, -4 839.998, -5 989.947, docs-programs 59.330719258)
+
+drops: ≈ 519.901176341 RAND: chain 19's shielded pool held 5 704.144895599 RAND at height 7636 and the operator wallets 5 184.243719258 — the rest is held by wallets the operator does not hold (faucet mints to the allow-list's recipients, payments made to users), whose notes cannot be re-created without their addresses; 0.499464030 RAND of validator fee rewards not withdrawn; no zUSD (Σ carried == Σ locked == custody)
+
+clients: rand CLI v0.6.8 (c9c9bd3c, built and tested: client lib 183, rand bin 18, wallet_flow 9 + the RPL-2 invoke e2e); bridge relayer: the Linux v0.6.8 rand from the same build (sha256 155dfe66…ee2d), installed by the bridge session; clients repo apps (desktop, web, extension, iOS, Android): NOT rebuilt — they vendor fullnode v0.6.6/v0.6.7 and cannot send on chain 20 (binding_domain 1) until re-vendored to v0.6.8; randscan: NOT rebuilt — needs v0.6.8's decoders (Action 28–33, bridge fee fields) to index chain 20 fully; website WASM: NOT rebuilt (same reason). Known and accepted by the operator's go for this cut.
+
+second-operator: none — one operator holds every validator key and every host; the second rebuild is waived (SECOND_REBUILD_WAIVED=1, recorded below by the cutover's push).
+
+second-hash:
+
+rollback: every host keeps chain 19's data dir (-a3defc93…) and the v0.6.7 binaries as /root/rand-node.pre-c20 and /root/rand.pre-c20 (sha-checked) for at least a day; `deploy/cutover-fleet-chain20.sh stop` then `rollback` restores the units/drop-ins and binaries and licenses one `start`; the bridge session restores the endpoints' 10 bps protocol fee and switches the daemons back to chain 19 (deploy/chain20-bridge-steps.md, rollback).
