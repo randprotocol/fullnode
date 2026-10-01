@@ -11,8 +11,8 @@
 # DERIVED from deploy/rehearse-cutover-fleet-chain19.sh, plus what chain 20 adds: a NEW BUILD. The
 # fleet starts on "v0.6.7" and is staged and switched to "v0.6.8". Both are small wrapper scripts
 # around $NODE / $WALLET with distinct sha256s: the old one answers `--version` as 0.6.7, the new one
-# as 0.6.8 and adds a `--program-state-cell-fee` line to `genesis --help` (RPL-2 is not on main yet;
-# the wrapper stands in for that one line so the script's default NEED_FLAGS is what is exercised).
+# as 0.6.8 and, only when $NODE lacks it, adds a `--program-state-cell-fee` line to `genesis --help`
+# (so the script's default NEED_FLAGS is what is exercised on a pre-RPL-2 build too).
 # Every other call goes to the real binary — `init` really derives each genesis hash on every fake
 # host. Two dry-run chain-20 genesis files are cut first (DRY_RUN=1 deploy/cut-chain20-genesis.sh
 # with the REAL $NODE, a first cut and a re-cut).
@@ -51,7 +51,8 @@ cat > "$BIN/new/rand-node" <<EOF
 # rehearsal wrapper: chain 20's build, "v0.6.8"
 case "\${1:-}" in --version) echo "rand-node 0.6.8 (rehearsal wrapper: chain 20's build)"; exit 0;; esac
 if [ "\${1:-}" = genesis ] && [ "\${2:-}" = --help ]; then
-  "$RN" genesis --help; echo "      --program-state-cell-fee <UNITS>  [rehearsal wrapper: RPL-2's flag, not in this binary]"; exit 0; fi
+  h=\$("$RN" genesis --help); printf '%s\\n' "\$h"
+  printf '%s' "\$h" | grep -q -- --program-state-cell-fee || echo "      --program-state-cell-fee <UNITS>  [rehearsal wrapper: RPL-2's flag, not in this binary]"; exit 0; fi
 exec "$RN" "\$@"
 EOF
 printf '#!/usr/bin/env bash\n# rehearsal wrapper: chain 19 rand\nexec "%s" "$@"\n' "$RW" > "$BIN/old/rand"
@@ -242,7 +243,7 @@ chk "…switched nothing, installed nothing, no marker" '[ "$(units)" = "$U0" ] 
 t "stop" 0 "STOPPED" $F stop
 chk "all 26 inactive" '[ "$(active)" = 0 ]'
 t "push without LOCAL_NODE" 1 "LOCAL_NODE is unset" env "${NEWENV[@]}" $F push $G20
-t "push with chain 19's v0.6.7 as LOCAL_NODE" 1 "not the v0.6.8 build" env "${NEWENV[@]}" LOCAL_NODE=$BIN/old/rand-node $F push $G20
+t "push with chain 19's v0.6.7 as LOCAL_NODE" 1 "nothing done" env "${NEWENV[@]}" LOCAL_NODE=$BIN/old/rand-node $F push $G20
 t "push of chain 19's genesis" 1 "has chain_id 19, not 20" env "${NEWENV[@]}" "${LN[@]}" $F push $G19
 t "push with no cut record" 1 "no cut record" env "${NEWENV[@]}" "${LN[@]}" $F push $G20
 record "$H20B"
@@ -288,8 +289,16 @@ t "wait for chain 20 after a rollback never completes (the fleet serves chain 19
 t "preflight after the rollback flags the leftovers (*.pre-c20, data-20)" 1 "not every host is ready" $F preflight
 # ── a re-cut ──
 t "stop again" 0 "STOPPED" $F stop
-record "$H20B"
-t "push of a RE-CUT genesis" 0 "PUSHED" env "${NEWENV[@]}" "${LN[@]}" $F push $G20B
+record "$H20"   # the second-hash names the FIRST cut: the re-cut goes through the waiver instead
+t "push of a re-cut genesis whose second-hash is another cut's, no waiver" 1 "differ" env "${NEWENV[@]}" "${LN[@]}" $F push $G20B
+mv "$CUT_RECORD" "$CUT_RECORD.keep"
+t "push with SECOND_REBUILD_WAIVED=1 but no cut record" 1 "nothing pushed" env "${NEWENV[@]}" "${LN[@]}" SECOND_REBUILD_WAIVED=1 $F push $G20B
+mv "$CUT_RECORD.keep" "$CUT_RECORD"
+t "push of a RE-CUT genesis with SECOND_REBUILD_WAIVED=1" 0 "PUSHED" env "${NEWENV[@]}" "${LN[@]}" SECOND_REBUILD_WAIVED=1 $F push $G20B
+grep -q 'Why waived: one operator holds every validator key' $T/out.log && { echo "ok   — …it printed why"; pass=$((pass+1)); } || { echo "FAIL — no reason printed"; fail=$((fail+1)); }
+chk "…and recorded the waiver for this hash in the cut record, once" '[ "$(grep -c "^second-rebuild-waived: .*genesis $H20B by .*one operator" $CUT_RECORD)" = 1 ]'
+t "push of the re-cut again with the waiver (idempotent)" 0 "PUSHED" env "${NEWENV[@]}" "${LN[@]}" SECOND_REBUILD_WAIVED=1 $F push $G20B
+chk "…the waiver is still recorded once" '[ "$(grep -c "^second-rebuild-waived:" $CUT_RECORD)" = 1 ]'
 t "switch to the re-cut genesis (guardian hosts still hold the first cut's data-20)" 0 "SWITCHED" env "${NEWENV[@]}" "${LN[@]}" $F switch $G20B
 NEWB=$(cut -d' ' -f1 $T/markers/*)
 chk "each guardian host moved the first cut's data-20 aside (kept) and initialised a fresh one" '[ "$(ls -d $T/hosts/192.0.2.10{1..6}/var/lib/randnode/data-20.stale-$P/db | wc -l | tr -d " ")" = 6 ] && [ "$(ls -d $T/hosts/192.0.2.10{1..6}/var/lib/randnode/data-20/db | wc -l | tr -d " ")" = 6 ] && [ "$(cat $T/hosts/192.0.2.10{1..6}/var/lib/randnode/data-20.genesis | sort -u)" = "$NEWB" ] && [ "$NEWB" != "$NEW" ]'

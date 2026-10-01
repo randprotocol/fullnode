@@ -33,7 +33,10 @@
 #     OLD_SHA_WALLET), then leaves the marker that licenses one `start`.
 #   * `push` refuses unless the cut record (CUT_RECORD) carries `second-hash: <this genesis hash>`
 #     — the second operator's rebuild, deploy/lib/cut-policy.sh `require_second_rebuild` (OPS-7).
-#     SECOND_REBUILD_WAIVED=1 skips it, loudly; the policy says not to.
+#     SECOND_REBUILD_WAIVED=1 skips it, loudly: it prints what the waiver leaves unchecked and
+#     appends `second-rebuild-waived: <UTC> genesis <hash> by <user@host>: <why>` to the (filled)
+#     cut record before anything is pushed (SECOND_REBUILD_WAIVED_REASON overrides the default why:
+#     one operator holds every key). The policy says not to.
 #   * `preflight` (read-only) proves every host runs the v0.6.7 release binaries on chain 19 and is
 #     healthy, that no chain-20 datadir / drop-in / binary backup is lying around, and prints disk.
 #
@@ -280,7 +283,23 @@ push)
   [ "${NEW:0:8}" != "$OLD" ] || { echo "push: $GENESIS is chain 19's genesis ($NEW) — nothing pushed" >&2; exit 1; }
   # OPS-7: the second operator rebuilt this hash on another machine before anything is published.
   if [ "${SECOND_REBUILD_WAIVED:-}" = 1 ]; then
-    echo "== ⚠⚠ SECOND_REBUILD_WAIVED=1 — pushing genesis $NEW WITHOUT a second operator's rebuild (docs/deploy.md \"Cut policy\" item 4 is not met)"
+    # The waiver is a decision, so it is written down: the record must exist and be filled in
+    # (require_cut_record), and the waiver — why, who, when, for which hash — is appended to it
+    # before anything is pushed. Re-running push for the same hash does not append twice.
+    require_cut_record "$CUT_RECORD" || { echo "push: a waiver is recorded in the cut record, and $CUT_RECORD is not a filled one — nothing pushed" >&2; exit 1; }
+    WHY=${SECOND_REBUILD_WAIVED_REASON:-one operator holds every validator key and every host; no second operator exists to rebuild the genesis for this cut}
+    cat <<EOF
+== ⚠⚠ SECOND_REBUILD_WAIVED=1 — pushing genesis $NEW WITHOUT a second operator's rebuild.
+==    docs/deploy.md "Cut policy" item 4 (two people: a second operator rebuilds the genesis from
+==    the tag on another machine and the hashes match before anything is published) is NOT met.
+==    What that leaves unchecked: that this genesis file is the one the scripts at this commit cut
+==    from the snapshot — a wrong or tampered file would be caught by no one but its author.
+==    Why waived: $WHY
+==    Recorded in $CUT_RECORD.
+EOF
+    if ! grep -q "^second-rebuild-waived: .*genesis $NEW" "$CUT_RECORD"; then
+      printf 'second-rebuild-waived: %s genesis %s by %s@%s: %s\n' "$(date -u +%FT%TZ)" "$NEW" "$(id -un)" "$(hostname -s)" "$WHY" >> "$CUT_RECORD"
+    fi
   else
     require_second_rebuild "$CUT_RECORD" "$NEW" || { echo "push: nothing pushed" >&2; exit 1; }
   fi
