@@ -1622,6 +1622,15 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
+### 2026-10-01 — headers carry `invoke` transactions in `public_notes` (node-only, after v0.6.8)
+
+Additive. A `rand_getBlocks` header's `public_notes` now also carries every `invoke` in its block,
+with every proof stripped (the bundle's, the auth proof and the call proof; `"proofs_stripped":
+true`) under its real `hash`. An invoke's payout and mint notes are public (recipient, amount,
+asset, blinding, the bundle's `time`), and a wallet that reads header pages fetches no block — so on
+v0.6.8 nodes it found a payout only through the envelope the invoker sealed. A wallet rebuilds the
+notes from the stripped copy (the client's `rebuilt_notes_with` already does); nothing else changes.
+
 ### 2026-10-01 — v0.6.8: zUSD bridge fees, `bridge.fees` (genesis-gated; chain 20 at the earliest)
 
 `docs/bridge.md` §25. Inert on every chain whose genesis bridge section has no `fees` group (chains

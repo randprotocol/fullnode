@@ -1827,15 +1827,21 @@ fn header_json(b: &randprotocol_core::Block, sealed: bool, fees: Option<&randpro
         .transactions
         .iter()
         .filter(|t| {
-            matches!(t.action, Action::BridgeAttest { .. } | Action::TokenMint { .. } | Action::RegisterToken { .. })
+            // An invoke's payouts and mints are public notes too (RPL-2): without it here a
+            // wallet reading this page — and fetching no block — found them only through the
+            // envelope the invoker sealed.
+            matches!(t.action, Action::BridgeAttest { .. } | Action::TokenMint { .. } | Action::RegisterToken { .. } | Action::Invoke { .. })
                 || (fees.is_some() && matches!(t.action, Action::BridgeBurn { .. }))
         })
         .map(|t| match &t.action {
-            Action::BridgeBurn { .. } => {
+            Action::BridgeBurn { .. } | Action::Invoke { .. } => {
                 let mut stripped = t.clone();
                 if let Some(bundle) = stripped.bundle.as_mut() {
                     bundle.proof = Vec::new();
                     bundle.auth_proof = Vec::new();
+                }
+                if let Action::Invoke { proof, .. } = &mut stripped.action {
+                    *proof = Vec::new();
                 }
                 json!({ "hash": t.hash().to_hex(), "raw": hex::encode(stripped.encode()), "proofs_stripped": true })
             }
@@ -6732,6 +6738,28 @@ mod tests {
         b2.receipts = probe.apply_block(&b2.block, &StubExecutor).unwrap();
         st.storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
         (dir, st, invoke, transition)
+    }
+
+    /// An invoke's payout and mint notes are public (recipient, amount, asset, blinding, the
+    /// bundle's time), so a header carries the invoke in `public_notes` like a deposit or a mint:
+    /// a v0.6.8 wallet reads that page and fetches no block, and without the invoke there it found
+    /// a payout only through the envelope the invoker sealed, which nothing checks. Carried with
+    /// every proof stripped (bundle, auth, call) under its real id, the transition intact.
+    #[tokio::test]
+    async fn a_header_carries_an_invoke_with_its_proofs_stripped() {
+        let (_d, st, invoke, transition) = rpl2_state();
+        let headers = ok(&st, "rand_getBlocks", json!([2, 2])).await;
+        let carried = headers[0]["public_notes"].as_array().unwrap();
+        assert_eq!(carried.len(), 1, "the invoke, not the plain transfer beside it: {carried:?}");
+        assert_eq!(carried[0]["hash"], invoke.hash().to_hex(), "under its real id");
+        assert_eq!(carried[0]["proofs_stripped"], true);
+        let stripped = Transaction::decode(&hex::decode(carried[0]["raw"].as_str().unwrap()).unwrap()).unwrap();
+        let bundle = stripped.bundle.as_ref().unwrap();
+        assert!(bundle.proof.is_empty() && bundle.auth_proof.is_empty());
+        assert_eq!(bundle.time, invoke.bundle.as_ref().unwrap().time, "the payouts' time");
+        let Action::Invoke { proof, transition: t, .. } = &stripped.action else { panic!("{:?}", stripped.action) };
+        assert!(proof.is_empty(), "the call proof is stripped too");
+        assert_eq!(t, &transition);
     }
 
     /// `tx_json` renders an invoke as a call plus the transition it declared: cells as 64-hex
