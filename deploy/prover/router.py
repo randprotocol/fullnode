@@ -137,6 +137,13 @@ class Pool:
             random.shuffle(live)  # ties go to a random prover, not always the first
             return sorted(live, key=lambda b: b.load())
 
+    def by_load_all(self):
+        """Every member, the ones the poll last saw up first: a member that just came back must
+        still be asked for a job it may hold."""
+        with self.lock:
+            members = list(self.backends)
+        return sorted(members, key=lambda b: (not b.up, b.load()))
+
     def remember(self, job, backend):
         with self.lock:
             if len(self.jobs) >= MAX_JOBS:
@@ -170,21 +177,25 @@ class Pool:
     def about_job(self, job, body, headers):
         b = self.holder(job)
         if b is not None:
-            got = self.exchange(b, "POST", body, headers)
-            if got is not None:
-                return got
-        # The router restarted, or the holder is unreachable: ask around. A prover that does not
-        # hold the job answers `unknown job`; the one that does answers for it.
+            # Only the holder can answer for its job. If it does not answer, that is an outage the
+            # wallet waits out and retries (docs/prover.md §5.2), never the other members' `unknown
+            # job`, which a wallet reads as final (seen 2026-10-01: a member wedged mid-proof, and
+            # the first status poll came back `unknown job`, so the send was abandoned).
+            return self.exchange(b, "POST", body, headers)
+        # The router restarted and forgot the job: ask every member. One that holds it answers for
+        # it; `unknown job` is only the answer when every member answered and none holds it.
+        silent = False
         last = None
-        for b in self.by_load():
+        for b in self.by_load_all():
             got = self.exchange(b, "POST", body, headers)
             if got is None:
+                silent = True
                 continue
             last = got
             if error_code(parse(got[2])) != UNKNOWN_JOB:
                 self.remember(job, b)
                 return got
-        return last
+        return None if silent else last
 
     def info(self, body, headers):
         for b in self.by_load():
@@ -249,7 +260,16 @@ def make_handler(pool):
 
         def relay(self, got):
             if got is None:
-                self.plain(503, {"jsonrpc": "2.0", "id": None, "error": {"code": -32000, "message": "no prover in the pool answered"}})
+                # A plain-text 503, like any proxy's error page, never a JSON-RPC error: a wallet
+                # treats a JSON-RPC error as the prover's final word and abandons the job, and an
+                # error page as an outage it waits out.
+                body = b"no prover in the pool answered\n"
+                self.send_response(503)
+                self.send_header("content-type", "text/plain")
+                self.send_header("retry-after", "2")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             status, headers, body = got
             self.send_response(status)

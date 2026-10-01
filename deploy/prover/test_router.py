@@ -131,7 +131,11 @@ class RouterTest(unittest.TestCase):
             with urllib.request.urlopen(req, timeout=5) as r:
                 return r.status, r.headers, json.loads(r.read())
         except urllib.error.HTTPError as e:
-            return e.code, e.headers, json.loads(e.read() or b"null")
+            raw = e.read()
+            try:
+                return e.code, e.headers, json.loads(raw or b"null")
+            except ValueError:
+                return e.code, e.headers, None
 
     def test_a_submit_goes_to_the_least_loaded_prover(self):
         self.a.depth, self.b.depth, self.c.depth = 3, 0, 2
@@ -177,12 +181,29 @@ class RouterTest(unittest.TestCase):
         _, _, r = self.call("prover_submit", ["00"])
         self.assertTrue(r["result"]["job"].startswith("c-"), r)
 
-    def test_no_prover_answering_is_a_503(self):
+    def test_no_prover_answering_is_a_plain_503(self):
         for f in (self.a, self.b, self.c):
             f.stop()
-        status, _, r = self.call("prover_submit", ["00"])
+        status, h, r = self.call("prover_submit", ["00"])
         self.assertEqual(status, 503)
-        self.assertEqual(r["error"]["message"], "no prover in the pool answered")
+        self.assertEqual(h.get("content-type"), "text/plain")
+        self.assertIsNone(r, "an error page, not a JSON-RPC error a wallet would take as final")
+
+    def test_a_job_whose_holder_stops_answering_is_an_outage_not_unknown(self):
+        # 2026-10-01: a member wedged mid-proof, the router asked the others, they answered
+        # `unknown job`, and the wallet abandoned a job that was only waiting on its holder.
+        self.a.busy = self.c.busy = True
+        job = self.call("prover_submit", ["00"])[2]["result"]["job"]
+        self.b.stop()
+        status, _, r = self.call("prover_status", [job])
+        self.assertEqual(status, 503)
+        self.assertIsNone(r)
+
+    def test_a_forgotten_job_with_a_member_silent_is_an_outage_not_unknown(self):
+        self.c.stop()
+        status, _, r = self.call("prover_status", ["held-by-the-silent-one"])
+        self.assertEqual(status, 503)
+        self.assertIsNone(r)
 
     def test_info_reports_the_pools_queue(self):
         self.a.depth, self.b.depth, self.b.proving, self.c.proving = 1, 2, 1, 1
