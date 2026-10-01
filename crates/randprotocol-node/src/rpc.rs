@@ -3317,6 +3317,9 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // Deep scan 2026-09-24: whether a mint or deposit is held below 2^63 as a
                 // validity rule (`docs/tokens.md` §16); `false` on chain 14.
                 "bound_note_value": tokens.ext().bound_note_value,
+                // Audit v6 TOK-1 (issue #86): whether the registry commits incrementally
+                // (`docs/tokens.md` §17); `false` on every chain through 20.
+                "incremental_root": tokens.incremental_root(),
                 "tokens": rows,
             }))
         }
@@ -6718,14 +6721,17 @@ mod tests {
             .clone()
             .with_max_tokens(3)
             .with_burn_registration_fee(true)
-            .with_bound_note_value(true);
+            .with_bound_note_value(true)
+            .with_incremental_root(true);
         gs.ledger.set_tokens(Some(capped));
         let (_d, st) = state_for(&gs);
         let v = ok(&st, "rand_getTokens", json!([])).await;
         assert_eq!(v["max_tokens"], 3);
         assert_eq!(v["burn_registration_fee"], true, "TOK-2");
         assert_eq!(v["bound_note_value"], true, "deep scan 2026-09-24: the note-value bound is served beside the other flags");
+        assert_eq!(v["incremental_root"], true, "audit v6 TOK-1: the incremental root is served beside them");
         assert!(st.storage.tokens().unwrap().unwrap().burns_registration_fee(), "the flag rides the store");
+        assert!(st.storage.tokens().unwrap().unwrap().incremental_root(), "the rows layout rides the store");
         assert_eq!(v["tokens"].as_array().unwrap().len(), 1);
         assert_eq!(ok(&st, "rand_getTokens", json!([2, 10])).await["tokens"], json!([]));
         assert_eq!(st.storage.tokens().unwrap().unwrap().max_tokens(), 3, "the cap rides the store");

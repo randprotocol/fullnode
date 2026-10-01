@@ -146,7 +146,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         tokens: bridged.then(|| crate::genesis::TokensConfig {
             registration_fee: crate::genesis::MIN_REGISTRATION_FEE,
             tokens: vec![],
-            mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None,
+            mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None, incremental_root: None,
         }),
         aggregation: None,
         consensus_domain: fixture_domain(),

@@ -1336,6 +1336,31 @@ script (`deploy/cut-chain20-genesis.sh`) asserts the field, and its `check-limit
 must run a build that knows the field before a genesis carries it — a v0.6.7 node does not parse
 it (and would compute a different genesis hash).
 
+## The next cut: `tokens.incremental_root` (audit v6, TOK-1, issue #86)
+
+**What it is.** The token registry's root was a merkle root over every token's leaf, recomputed
+from every leaf at every state root, and the node rewrote the whole registry blob (`META_TOKENS`)
+at every commit, whatever the block changed — bounded by `tokens.max_tokens` (4 096) and the
+burned registration fee, so a Low. The tokens-section field `incremental_root: true` makes the
+root an incremental merkle commitment over `rand-token-leaf-2` leaves (one leaf and `log n` nodes
+re-hashed per changed token; `rand-token-registry-4`; the state root re-domained
+`rand-state-tokens-1`, innermost of the audit-v6 wrappers) and the store one row per token under
+a `tokens_header` key, rewriting only the rows a block changed (`docs/tokens.md` §17). Hashed under
+the tag `tokens_incremental_root`, after `bridge_fees`, only when `true`; `reload_ledger` restores
+the flag from the file on every restart; `verify --mode full` rebuilds the registry from its rows
+and compares it with the replay; served as `rand_getTokens.incremental_root`. No validity rule
+changes. Node-only on every chain, already: the legacy root is computed once per change and reused.
+
+**Recommended: on, for the next cut** (`rand-node genesis --tokens tokens.json
+--tokens-incremental-root`, or `"incremental_root": true` in the tokens file the cut script
+splices). Chains 18, 19 and 20 carry no field and hash, root and store exactly as before. Every
+validator must run a build that knows the field before a genesis carries it — a v0.6.9 node does
+not parse it (`deny_unknown_fields` on the section) and would compute a different genesis hash.
+After launch: `rand_getTokens.incremental_root == true`, and a validator's `meta` family holds
+`tokens_header` and one `token/…` row per listed token and no `tokens` blob. Rolling back a node
+to a build before this one on such a chain is not possible (it cannot parse the genesis) — the
+same rule as every genesis field before it.
+
 ## The next cut: audit v6's staking fields (STAKE-2)
 
 Audit v6 (2026-09-30) §8.5. Each is optional, absent from every genesis through chain 18, and

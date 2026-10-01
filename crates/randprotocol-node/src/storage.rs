@@ -293,12 +293,27 @@ const META_BRIDGE_FEES: &str = "bridge_fees";
 /// holds and `TokenRegistry::root` hashes into the state root. `META_AGGREGATORS`'s twin, not
 /// `META_AGGREGATION`'s: unlike the aggregation *config*, a genesis `tokens` section has no
 /// separate immutable half — the whole registry is state, and `load_ledger` restores it from
-/// here so a restarted node does not fork at its own first block.
+/// here so a restarted node does not fork at its own first block. Under `tokens.incremental_root`
+/// (audit v6 TOK-1) this key is deleted and the registry lives in [`META_TOKENS_HEADER`] and the
+/// [`TOKEN_ROW_PREFIX`] rows instead.
 const META_TOKENS: &str = "tokens";
 /// Audit v4: the registry's v0.5.4 half (`RegistryExt` — TOK-1's cap and bridge rules v2's
 /// windows), beside — never inside — `META_TOKENS`'s v1 layout; written only when it is not the
 /// default, so chain 14's registry blob and key set are what they were.
 const META_TOKENS_V2: &str = "tokens_v2";
+/// Audit v6 (TOK-1, issue #86): under `tokens.incremental_root` the registry is stored as its
+/// small header here — `registration_fee`, `next_index`, `mint_cap_per_day`, JSON so a field can
+/// be appended — and one row per token under [`TOKEN_ROW_PREFIX`], and [`META_TOKENS`] is
+/// deleted: a commit rewrites only the rows of the tokens its blocks changed, not the whole
+/// registry. The key's presence is what tells [`Storage::tokens`] which layout a store holds; a
+/// chain without the field never writes it and keeps the v1 blob exactly as before.
+const META_TOKENS_HEADER: &str = "tokens_header";
+/// One token's row (`bincode(TokenInfo)` — the bytes its `rand-token-leaf-2` leaf hashes, so a
+/// row and its leaf cannot disagree) under `token/` ‖ the index, big-endian, in `CF_META`. A key
+/// prefix rather than a column family on purpose: a family added to a store cannot be opened by
+/// the build before it (the v0.3 `receipts_by_program` trap), and this build rolls onto chains
+/// that will never write a row.
+const TOKEN_ROW_PREFIX: &[u8] = b"token/";
 
 /// The history-retention floor (history pruning spec §1): the lowest height, other than genesis,
 /// whose block this store still holds. Absent on a store that never pruned — an archive.
@@ -380,6 +395,43 @@ pub struct Storage {
     /// How many seal rows the sealed-proof pruning pass has visited, for the tests that bound
     /// its work per pass (INTERFACE-9).
     seal_rows_examined: std::sync::atomic::AtomicU64,
+    /// Audit v6 (TOK-1, issue #86): the `rand-token-leaf-2` leaf of every token row this store
+    /// holds, by index — what a commit under `tokens.incremental_root` compares the registry's
+    /// leaves against to write only the rows that changed (`stage_tokens`). `None` until first
+    /// needed, then loaded once from the rows (one hash per row) and kept current by
+    /// `tokens_landed` after each batch lands; a row is never written from this map, only
+    /// skipped because of it. Exact, not a dirty set: the ledger a commit hands over is one of
+    /// many clones, and a set kept on it would have no clear point.
+    token_rows: std::sync::Mutex<Option<BTreeMap<u32, Hash>>>,
+    /// How many token rows have been written, for the tests that pin a commit to the tokens
+    /// its blocks changed.
+    token_rows_written: std::sync::atomic::AtomicUsize,
+}
+
+/// Audit v6 (TOK-1, issue #86): the registry's header under `tokens.incremental_root` —
+/// everything in the root that is not a token leaf. JSON, like `tokens_v2`, so a later field
+/// reads as its default from an older store.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TokensHeaderDisk {
+    registration_fee: u64,
+    next_index: u32,
+    mint_cap_per_day: u64,
+}
+
+/// What `stage_tokens` put into a batch and `tokens_landed` records once the batch is on disk:
+/// each written row's new leaf, each deleted row's index.
+#[derive(Default)]
+struct TokenRowsStaged {
+    rows: Vec<(u32, Option<Hash>)>,
+}
+
+/// A token row's key: [`TOKEN_ROW_PREFIX`] ‖ the index, big-endian, so the rows iterate in index
+/// order and the prefix scan stops at the first key outside it.
+fn token_row_key(index: u32) -> Vec<u8> {
+    let mut k = Vec::with_capacity(TOKEN_ROW_PREFIX.len() + 4);
+    k.extend_from_slice(TOKEN_ROW_PREFIX);
+    k.extend_from_slice(&index.to_be_bytes());
+    k
 }
 
 /// What [`Storage::drop_receipts_index`] found and removed: whether the `receipts_by_program`
@@ -801,6 +853,8 @@ impl Storage {
             tree_builds: std::sync::atomic::AtomicUsize::new(0),
             torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX),
             seal_rows_examined: std::sync::atomic::AtomicU64::new(0),
+            token_rows: std::sync::Mutex::new(None),
+            token_rows_written: std::sync::atomic::AtomicUsize::new(0),
         };
         storage.backfill_receipts_index()?;
         storage.prune_committed_qcs()?;
@@ -970,7 +1024,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
-        batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&gs.ledger.tokens().cloned())?);
+        let tokens_staged = self.stage_tokens(&mut batch, gs.ledger.tokens())?;
         self.put_tokens_ext(&mut batch, gs.ledger.tokens())?;
         batch.put_cf(self.cf(CF_ANCHORS), height_key(0), word8_to_bytes(&gs.ledger.root()));
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(gs.ledger.tree())?);
@@ -985,6 +1039,7 @@ impl Storage {
             self.put_bridge(&mut batch, bridge)?;
         }
         self.db.write_opt(batch, &sync_opts())?;
+        self.tokens_landed(tokens_staged);
         Ok(())
     }
 
@@ -1044,6 +1099,101 @@ impl Storage {
             None => batch.delete_cf(self.cf(CF_META), META_TOKENS_V2),
         }
         Ok(())
+    }
+
+    /// The registry into `batch` (audit v6 TOK-1, issue #86). Without `tokens.incremental_root`
+    /// — every chain through 20 — the v1 blob [`META_TOKENS`] whole, exactly as every build
+    /// before this one wrote it. Under the field: the header under [`META_TOKENS_HEADER`], the
+    /// blob deleted, and one row per token whose `rand-token-leaf-2` leaf differs from the row
+    /// this store holds ([`Storage::token_rows`]) — a token no block changed costs no write —
+    /// plus a delete for every row at or past `next_index` (a truncation's). The caller lands
+    /// the returned record with [`Storage::tokens_landed`] once the batch is on disk, and
+    /// [`Storage::put_tokens_ext`] writes the extension beside either layout as before.
+    fn stage_tokens(&self, batch: &mut WriteBatch, tokens: Option<&TokenRegistry>) -> Result<TokenRowsStaged> {
+        let mut staged = TokenRowsStaged::default();
+        let Some((registry, leaves)) = tokens.and_then(|t| t.leaf_hashes().map(|l| (t, l))) else {
+            batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&tokens.cloned())?);
+            batch.delete_cf(self.cf(CF_META), META_TOKENS_HEADER);
+            return Ok(staged);
+        };
+        batch.delete_cf(self.cf(CF_META), META_TOKENS);
+        let header = TokensHeaderDisk {
+            registration_fee: registry.registration_fee,
+            next_index: registry.next_index(),
+            mint_cap_per_day: registry.mint_cap_per_day(),
+        };
+        batch.put_cf(
+            self.cf(CF_META),
+            META_TOKENS_HEADER,
+            serde_json::to_vec(&header).map_err(|e| StorageError::Corrupt(format!("tokens_header: {e}")))?,
+        );
+        let mut cache = self.token_rows.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.is_none() {
+            let mut held = BTreeMap::new();
+            for (index, info) in self.token_rows_on_disk()? {
+                held.insert(index, randprotocol_core::ledger::tokens::leaf_v2(&info));
+            }
+            *cache = Some(held);
+        }
+        let held = cache.as_ref().expect("loaded above");
+        for (n, leaf) in leaves.iter().enumerate() {
+            let index = randprotocol_core::ledger::tokens::FIRST_TOKEN_INDEX + n as u32;
+            if held.get(&index) != Some(leaf) {
+                let info = registry.get(index).ok_or_else(|| StorageError::Corrupt(format!("the registry's leaf {index} has no token")))?;
+                batch.put_cf(self.cf(CF_META), token_row_key(index), bincode::serialize(info)?);
+                staged.rows.push((index, Some(*leaf)));
+            }
+        }
+        for index in held.range(registry.next_index()..).map(|(i, _)| *i) {
+            batch.delete_cf(self.cf(CF_META), token_row_key(index));
+            staged.rows.push((index, None));
+        }
+        Ok(staged)
+    }
+
+    /// Records what [`Storage::stage_tokens`] wrote once its batch is on disk: the cache now
+    /// says those rows hold those leaves (or are gone).
+    fn tokens_landed(&self, staged: TokenRowsStaged) {
+        if staged.rows.is_empty() {
+            return;
+        }
+        let mut cache = self.token_rows.lock().unwrap_or_else(|e| e.into_inner());
+        let held = cache.get_or_insert_with(BTreeMap::new);
+        let mut written = 0;
+        for (index, leaf) in staged.rows {
+            match leaf {
+                Some(leaf) => {
+                    held.insert(index, leaf);
+                    written += 1;
+                }
+                None => {
+                    held.remove(&index);
+                }
+            }
+        }
+        self.token_rows_written.fetch_add(written, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many token rows this store has written since it was opened (audit v6 TOK-1): the
+    /// tests' probe that a commit writes the tokens its blocks changed and no other.
+    pub fn token_rows_written(&self) -> usize {
+        self.token_rows_written.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Every token row under [`TOKEN_ROW_PREFIX`], in index order, each decoded.
+    fn token_rows_on_disk(&self) -> Result<Vec<(u32, randprotocol_core::ledger::tokens::TokenInfo)>> {
+        let mut rows = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_META), IteratorMode::From(TOKEN_ROW_PREFIX, rocksdb::Direction::Forward)) {
+            let (k, v) = item?;
+            if !k.starts_with(TOKEN_ROW_PREFIX) {
+                break;
+            }
+            let index = <[u8; 4]>::try_from(&k[TOKEN_ROW_PREFIX.len()..])
+                .map(u32::from_be_bytes)
+                .map_err(|_| StorageError::Corrupt("token row key".into()))?;
+            rows.push((index, bincode::deserialize(&v)?));
+        }
+        Ok(rows)
     }
 
     /// Delete every bridge row and the `meta` blobs into `batch`.
@@ -1525,10 +1675,23 @@ impl Storage {
     /// would have left it.
     ///
     /// The v1 blob is what it always was; the v0.5.4 half (`META_TOKENS_V2`, audit v4) is
-    /// re-attached when the store has one — a chain-14 store never does.
+    /// re-attached when the store has one — a chain-14 store never does. A store written under
+    /// `tokens.incremental_root` (audit v6 TOK-1, issue #86) holds the header and one row per
+    /// token instead of the blob, and the registry is rebuilt from them with the flag on
+    /// (`TokenRegistry::from_rows`; a gap or a duplicate is `Corrupt`).
     pub fn tokens(&self) -> Result<Option<randprotocol_core::ledger::tokens::TokenRegistry>> {
-        let mut tokens: Option<randprotocol_core::ledger::tokens::TokenRegistry> =
-            self.get_meta_raw(META_TOKENS)?.map(|b| bincode::deserialize(&b)).transpose()?.flatten();
+        let mut tokens: Option<randprotocol_core::ledger::tokens::TokenRegistry> = match self.get_meta_raw(META_TOKENS_HEADER)? {
+            Some(bytes) => {
+                let header: TokensHeaderDisk =
+                    serde_json::from_slice(&bytes).map_err(|e| StorageError::Corrupt(format!("tokens_header: {e}")))?;
+                let rows = self.token_rows_on_disk()?.into_iter().map(|(_, info)| info).collect();
+                Some(
+                    TokenRegistry::from_rows(header.registration_fee, header.next_index, header.mint_cap_per_day, rows)
+                        .map_err(|e| StorageError::Corrupt(format!("token rows: {e}")))?,
+                )
+            }
+            None => self.get_meta_raw(META_TOKENS)?.map(|b| bincode::deserialize(&b)).transpose()?.flatten(),
+        };
         if let Some(t) = tokens.as_mut() {
             if let Some(bytes) = self.get_meta_raw(META_TOKENS_V2)? {
                 // JSON since v0.5.5; a positional blob is what v0.5.4 wrote (no chain has one).
@@ -2737,10 +2900,11 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
         self.stage_retired_aggregator_nonces(&mut batch, ledger_after)?;
-        batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger_after.tokens().cloned())?);
+        let tokens_staged = self.stage_tokens(&mut batch, ledger_after.tokens())?;
         self.put_tokens_ext(&mut batch, ledger_after.tokens())?;
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(last_height));
         self.db.write_opt(batch, &sync_opts())?;
+        self.tokens_landed(tokens_staged);
         // The sealing marks' per-block half (spec §6.1): the bundle marks went in with the
         // batch above; the flags read them, so they refresh after it lands.
         for cb in blocks {
@@ -3219,9 +3383,12 @@ impl Storage {
         // comparison needs, so an unset (pre-key) price reads as the section's, like a restart.
         // The proof window (issue #118) likewise: the anchors are inside the equality, and a
         // wider genesis window keeps rows `load_ledger` alone does not read.
+        // And the incremental token root (audit v6 TOK-1): a genesis parameter the stored
+        // registry's layout implies; the file is the authority, as at a restart.
         match self.load_ledger(executor).and_then(|mut stored| {
             stored.set_gas(gs.ledger.gas().cloned());
             self.restore_proof_window(&mut stored, gs)?;
+            stored.set_tokens_incremental_root(gs.ledger.tokens().is_some_and(|t| t.incremental_root()));
             Ok(stored)
         }) {
             // The live gas prices (Phase 2): inside the equality, hashed under `gas.dynamic`,
@@ -3547,7 +3714,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
         self.stage_retired_aggregator_nonces(&mut batch, ledger)?;
-        batch.put_cf(self.cf(CF_META), META_TOKENS, bincode::serialize(&ledger.tokens().cloned())?);
+        let tokens_staged = self.stage_tokens(&mut batch, ledger.tokens())?;
         self.put_tokens_ext(&mut batch, ledger.tokens())?;
         if height == 0 {
             let hk = height_key(0);
@@ -3560,6 +3727,7 @@ impl Storage {
         }
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(height));
         self.db.write_opt(batch, &sync_opts())?;
+        self.tokens_landed(tokens_staged);
         Ok(())
     }
 
@@ -3787,6 +3955,19 @@ pub(crate) mod fixtures {
         rotation: Option<randprotocol_core::bridge::RotationRules>,
         fees: Option<randprotocol_core::bridge::BridgeFees>,
     ) -> (GenesisState, Vec<[u8; 32]>) {
+        let (gs, secrets) = bridged_genesis_config(chain_id, rules_v2, min_inbound_sequence, rotation, fees);
+        (gs.build(&StubExecutor).unwrap(), secrets)
+    }
+
+    /// The unbuilt [`bridged_genesis_with_fees`] file, for a test that sets a field it has no
+    /// parameter for (audit v6 TOK-1's `tokens.incremental_root`) before building.
+    pub(crate) fn bridged_genesis_config(
+        chain_id: u64,
+        rules_v2: Option<randprotocol_core::bridge::BridgeRulesV2>,
+        min_inbound_sequence: Option<BTreeMap<u16, u64>>,
+        rotation: Option<randprotocol_core::bridge::RotationRules>,
+        fees: Option<randprotocol_core::bridge::BridgeFees>,
+    ) -> (Genesis, Vec<[u8; 32]>) {
         let (mut config, secrets) = bridge_config();
         config.rules_v2 = rules_v2;
         config.min_inbound_sequence = min_inbound_sequence;
@@ -3825,7 +4006,7 @@ pub(crate) mod fixtures {
                     // `randprotocol-core`'s to test.
                     backings: vec![randprotocol_core::genesis::GenesisBacking { chain: 2, token: TOKEN, decimals: 8, locked: None }],
                 }],
-                mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None,
+                mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None, incremental_root: None,
             }),
             aggregation: None,
             consensus_domain: None,
@@ -3846,9 +4027,7 @@ pub(crate) mod fixtures {
             program_state: None,
             hardening_v6: None,
             hc_auth: None,
-        }
-        .build(&StubExecutor)
-        .unwrap();
+        };
         (gs, secrets)
     }
 
@@ -4276,7 +4455,7 @@ pub(crate) mod fixtures {
             mint_cap_per_day: 100_000 * 100_000_000,
             max_tokens: None,
             burn_registration_fee: None,
-            bound_note_value: None,
+            bound_note_value: None, incremental_root: None,
         });
         g.max_block_bytes = Some(20 << 20);
         g.gas = Some(gas::GasConfig {
@@ -5282,6 +5461,88 @@ mod tests {
         assert_eq!(check.problem, None);
         assert_eq!(check.ledger.bridge(), ledger.bridge());
         assert_eq!(check.ledger.tokens(), ledger.tokens());
+    }
+
+    /// Audit v6 (TOK-1, issue #86), the registry on disk under `tokens.incremental_root`: the
+    /// header and one row per token in place of the whole-registry blob; a commit writes the rows
+    /// of the tokens its blocks changed and no other (a registration its one new row, a deposit
+    /// the one row it moved, a block without token changes none); `load_ledger`,
+    /// `node::reload_ledger` and the replay audit rebuild the same registry, flag and tree
+    /// included, at the same state root; a reopened store — an empty cache — compares against
+    /// its rows and writes nothing for an unchanged registry; a truncation rewrites the rows
+    /// from the replayed state and drops the ones past it.
+    #[test]
+    fn an_incremental_registry_is_stored_as_rows_and_a_commit_rewrites_only_the_tokens_it_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (mut genesis, secrets) = bridged_genesis_config(9, None, None, None, None);
+        genesis.tokens.as_mut().unwrap().incremental_root = Some(true);
+        let gs = genesis.build(&StubExecutor).unwrap();
+        assert!(gs.ledger.tokens().unwrap().incremental_root());
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.get_meta_raw(META_TOKENS).unwrap(), None, "no whole-registry blob");
+        assert!(s.get_meta_raw(META_TOKENS_HEADER).unwrap().is_some(), "the header");
+        assert_eq!(s.token_rows_on_disk().unwrap().len(), 1, "one row per listed token");
+        assert_eq!(s.token_rows_written(), 1);
+        assert_eq!(s.tokens().unwrap().as_ref(), gs.ledger.tokens(), "rebuilt from the rows, flag and tree included");
+
+        let mut ledger = gs.ledger.clone();
+        let register = register_bridged_tx(&ledger, 0, 40);
+        let b1 = make_block(&gs.block, &mut ledger, vec![register], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.token_rows_written(), 2, "a registration writes its one new row");
+        assert_eq!(s.token_rows_on_disk().unwrap().len(), 2);
+        let att = attest_tx(&ledger, attestation(&secrets, &recipient(), 1_000, 1), 20);
+        let b2 = make_block(&b1, &mut ledger, vec![att], &key(1));
+        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.token_rows_written(), 3, "a deposit rewrites the one row it moved");
+        let b3 = make_block(&b2, &mut ledger, vec![], &key(1));
+        s.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.token_rows_written(), 3, "a block without token changes writes no row");
+        assert_eq!(s.get_meta_raw(META_TOKENS).unwrap(), None, "and still no blob");
+        assert_restart_round_trips(&s, &gs, &ledger, "an incremental registry from its rows");
+        assert!(s.load_ledger(&StubExecutor).unwrap().tokens().unwrap().incremental_root());
+
+        drop(s);
+        let s = Storage::open(dir.path()).unwrap();
+        assert_eq!(s.tokens().unwrap().as_ref(), ledger.tokens());
+        let b4 = make_block(&b3, &mut ledger, vec![], &key(1));
+        s.commit(std::slice::from_ref(&b4), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.token_rows_written(), 0, "a reopened store compares against its rows, not a dirty set");
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(check.problem, None, "the replay audit agrees with the rows");
+        assert_eq!(check.ledger.tokens(), ledger.tokens());
+
+        s.truncate_to(&gs, 0, &gs.ledger).unwrap();
+        assert_eq!(s.token_rows_on_disk().unwrap().len(), 1, "the second token's row is gone");
+        assert_eq!(s.tokens().unwrap().as_ref(), gs.ledger.tokens());
+        assert_eq!(s.load_ledger(&StubExecutor).unwrap().state_root(), gs.ledger.state_root());
+    }
+
+    /// Audit v6 (TOK-1, issue #86): the flag is a genesis parameter, and `node::reload_ledger`
+    /// re-applies it from the file — a store holding the whole-registry blob (the layout every
+    /// build through v0.6.9 wrote) comes back as the incremental registry when the genesis says
+    /// so, at the genesis' state root; `load_ledger` alone, which has no genesis, gives the
+    /// blob's shape back.
+    #[test]
+    fn reload_ledger_restores_the_incremental_token_root_from_the_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (mut genesis, _) = bridged_genesis_config(9, None, None, None, None);
+        let off = genesis.build(&StubExecutor).unwrap();
+        s.init_genesis(&off).unwrap();
+        assert!(s.get_meta_raw(META_TOKENS).unwrap().is_some(), "the blob layout");
+        genesis.tokens.as_mut().unwrap().incremental_root = Some(true);
+        let on = genesis.build(&StubExecutor).unwrap();
+        assert_ne!(on.ledger.state_root(), off.ledger.state_root());
+        let loaded = s.load_ledger(&StubExecutor).unwrap();
+        assert!(!loaded.tokens().unwrap().incremental_root(), "load_ledger alone: the blob's shape");
+        let reloaded = crate::node::reload_ledger(&s, &on, &StubExecutor).unwrap();
+        assert!(reloaded.tokens().unwrap().incremental_root(), "reload_ledger: the genesis' flag");
+        assert_eq!(reloaded.state_root(), on.ledger.state_root());
+        assert_eq!(reloaded.tokens(), on.ledger.tokens());
+        let back = crate::node::reload_ledger(&s, &off, &StubExecutor).unwrap();
+        assert_eq!(back.state_root(), off.ledger.state_root(), "and off again from a file without it");
     }
 
     /// v0.6.8, `bridge.fees` on disk. A chain without the group writes no `META_BRIDGE_FEES` key
@@ -7269,7 +7530,7 @@ mod tests {
         {
             // `init_genesis` touches no family the old build lacks, so it runs over the raw
             // fifteen-family handle exactly as the old build's own did.
-            let old = Storage { db: open_as_pre_v03(dir.path(), true).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX), seal_rows_examined: Default::default() };
+            let old = Storage { db: open_as_pre_v03(dir.path(), true).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX), seal_rows_examined: Default::default(), token_rows: Default::default(), token_rows_written: Default::default() };
             old.init_genesis(&gs).unwrap();
             let r = a_receipt(pid);
             old.db.put_cf(old.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(&r).unwrap()).unwrap();
@@ -7305,7 +7566,7 @@ mod tests {
                 .iter()
                 .filter(|c| **c != CF_PROGRAM_PUBLIC)
                 .map(|n| ColumnFamilyDescriptor::new(*n, Options::default()));
-            let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX), seal_rows_examined: Default::default() };
+            let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX), seal_rows_examined: Default::default(), token_rows: Default::default(), token_rows_written: Default::default() };
             st.backfill_receipts_index().unwrap();
             st.init_genesis(&gs).unwrap();
             let r = a_receipt(pid);

@@ -220,6 +220,12 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     if let Some(bridge) = ledger.bridge_mut() {
         bridge.fees = gs.ledger.bridge().and_then(|b| b.fees.clone());
     }
+    // And the incremental token root (audit v6 TOK-1, issue #86; genesis
+    // `tokens.incremental_root`): the store's layout implies it, but the file is the authority
+    // — a node that came back without it would hash the registry under `rand-token-registry-3`
+    // and the state under `rand-state-4` against peers on `rand-token-registry-4` and
+    // `rand-state-tokens-1`: a fork at its first block.
+    ledger.set_tokens_incremental_root(gs.ledger.tokens().is_some_and(|t| t.incremental_root()));
     // The vesting register is state, not a switch: storage holds it (claims move it), so it is
     // never re-seeded from the file — but the two must agree that the chain has one, or this
     // node would compute a different state-root domain from its peers at its first block.

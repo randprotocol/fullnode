@@ -215,6 +215,162 @@ pub struct TokenRegistry {
     /// not the default; a chain without it hashes under `rand-token-registry-2` as before.
     #[serde(skip)]
     ext: RegistryExt,
+    /// Audit v6 (TOK-1, issue #86): the incremental commitment over the token leaves — `Some`
+    /// exactly on a chain whose genesis says `tokens.incremental_root: true`. Every level of the
+    /// merkle tree [`TokenRegistry::root`] commits to, kept up to date leaf by leaf
+    /// ([`TokenRegistry::touched`]: `O(log n)` hashes per changed token instead of `O(n)` per
+    /// block), and the row-level view storage writes per token. Outside the v1 blob and outside
+    /// [`RegistryExt`]'s bincode (which chains 15–20 hash under `rand-token-registry-3`): a
+    /// chain without the field carries `None` and hashes, serialises and compares exactly as it
+    /// did. The tree is a function of `by_index` alone, so it is inside `PartialEq`: two
+    /// registries that agree on their tokens and the flag agree on it, and the replay audit
+    /// (`verify --mode full`) would catch a tree that drifted from its leaves.
+    #[serde(skip)]
+    incremental: Option<TokenTree>,
+    /// The leaves' merkle root as last computed by [`TokenRegistry::root`], cleared by every
+    /// writer of `by_index` ([`TokenRegistry::touched`]). Node-only, any chain (TOK-1's
+    /// performance half): before it, every `Ledger::state_root` — once per proposal, vote and
+    /// commit — re-serialised and re-hashed every token, changed or not. The value is what the
+    /// uncached computation gives, byte for byte; only the work moves. Never state: outside
+    /// serde, and [`LeafRootCache`]'s equality is unconditional.
+    #[serde(skip)]
+    leaf_root: LeafRootCache,
+}
+
+/// [`TokenRegistry::leaf_root`]'s cell: a [`std::sync::OnceLock`] (so a `Ledger` snapshot
+/// shared across threads stays `Sync`) whose equality is always `true` — a cache is not state,
+/// and a registry whose root has been asked for must equal one whose root has not.
+#[derive(Clone, Debug, Default)]
+pub struct LeafRootCache(std::sync::OnceLock<Hash>);
+
+impl PartialEq for LeafRootCache {
+    fn eq(&self, _: &LeafRootCache) -> bool {
+        true
+    }
+}
+impl Eq for LeafRootCache {}
+
+/// Audit v6 (TOK-1, issue #86): the incremental merkle tree over the token leaves, under
+/// `tokens.incremental_root`.
+///
+/// `levels[0]` is the leaves in index order (position `index − FIRST_TOKEN_INDEX`, dense:
+/// the registry hands out indices in order and never retires one); `levels[k][j]` is
+/// `H("rand-merkle-node", levels[k−1][2j] ‖ levels[k−1][2j+1])`, with an odd last child paired
+/// with itself — exactly the shape [`merkle_root`] builds from scratch, so the root here is the
+/// root that function would give for the same leaves (`the_incremental_tree_is_merkle_root`
+/// pins it leaf count by leaf count). A changed leaf recomputes one node per level; an appended
+/// leaf adds one node per level and, when the top level has grown to two nodes, one level.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenTree {
+    levels: Vec<Vec<Hash>>,
+}
+
+impl TokenTree {
+    /// The tree over `leaves`, built level by level.
+    pub fn from_leaves(leaves: Vec<Hash>) -> TokenTree {
+        let mut tree = TokenTree { levels: Vec::new() };
+        for leaf in leaves {
+            tree.push(leaf);
+        }
+        tree
+    }
+
+    /// How many leaves the tree holds.
+    pub fn len(&self) -> usize {
+        self.levels.first().map_or(0, Vec::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The leaves in position order.
+    pub fn leaves(&self) -> &[Hash] {
+        self.levels.first().map_or(&[], Vec::as_slice)
+    }
+
+    /// The root — [`Hash::ZERO`] with no leaves, as [`merkle_root`] answers.
+    pub fn root(&self) -> Hash {
+        self.levels.last().map_or(Hash::ZERO, |top| top[0])
+    }
+
+    fn node(left: &Hash, right: &Hash) -> Hash {
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&left.0);
+        buf[32..].copy_from_slice(&right.0);
+        Hash::digest_domain(b"rand-merkle-node", &buf)
+    }
+
+    /// Recomputes the path above leaf `pos` after `levels[0][pos]` changed or was appended:
+    /// at each level the one node whose pair holds the position, appending it when the level
+    /// did not reach that far yet, until a level holds one node.
+    fn rehash_path(&mut self, pos: usize) {
+        let mut k = 1;
+        while self.levels[k - 1].len() > 1 {
+            if self.levels.len() == k {
+                self.levels.push(Vec::new());
+            }
+            let j = pos >> k;
+            let below = &self.levels[k - 1];
+            let left = below[2 * j];
+            let right = below.get(2 * j + 1).copied().unwrap_or(left);
+            let node = Self::node(&left, &right);
+            if j < self.levels[k].len() {
+                self.levels[k][j] = node;
+            } else {
+                debug_assert_eq!(j, self.levels[k].len(), "a path appends at most one node per level");
+                self.levels[k].push(node);
+            }
+            k += 1;
+        }
+    }
+
+    /// Replaces the leaf at `pos` (which must exist) and rehashes its path.
+    pub fn set(&mut self, pos: usize, leaf: Hash) {
+        self.levels[0][pos] = leaf;
+        self.rehash_path(pos);
+    }
+
+    /// Appends a leaf and rehashes its path.
+    pub fn push(&mut self, leaf: Hash) {
+        if self.levels.is_empty() {
+            self.levels.push(Vec::new());
+        }
+        let pos = self.levels[0].len();
+        self.levels[0].push(leaf);
+        self.rehash_path(pos);
+    }
+}
+
+/// The leaf a token hashes to in the chain-14 … chain-20 registry root: `rand-token-leaf-1`
+/// over `bincode(TokenInfo)`.
+fn leaf_v1(info: &TokenInfo) -> Hash {
+    probe_leaf_hash();
+    let bytes = bincode::serialize(info).expect("TokenInfo serializes");
+    Hash::digest_domain(b"rand-token-leaf-1", &bytes)
+}
+
+/// The leaf a token hashes to under `tokens.incremental_root` (audit v6 TOK-1, issue #86):
+/// `rand-token-leaf-2` over the same `bincode(TokenInfo)` — the bytes storage keeps as the
+/// token's row ([`TokenRegistry::from_rows`]), so a row and its leaf can never disagree.
+pub fn leaf_v2(info: &TokenInfo) -> Hash {
+    probe_leaf_hash();
+    let bytes = bincode::serialize(info).expect("TokenInfo serializes");
+    Hash::digest_domain(b"rand-token-leaf-2", &bytes)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many token leaves this thread has hashed — the probe behind the tests that pin
+    /// `root()`'s work (a block without token changes hashes nothing; an incremental change
+    /// hashes one leaf). Per thread, so parallel tests cannot see each other's counts.
+    static LEAF_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn probe_leaf_hash() {
+    #[cfg(test)]
+    LEAF_HASHES.with(|c| c.set(c.get() + 1));
 }
 
 /// The v0.5.4 half of a [`TokenRegistry`] (audit v4): genesis-derived limits and the rolling
@@ -365,9 +521,10 @@ pub enum TokenError {
     /// `PublicKey` deserialises from the wire as any-length bytes — the length rule lives in
     /// `PublicKey::from_bytes`, which the wire path never goes through — and a `Key` authority is
     /// the one field of a registration that lands in *permanent consensus state*: it is inside the
-    /// `rand-token-leaf-1` leaf, so every `state_root()` re-serialises and re-hashes it, the whole
-    /// `Ledger` (registry included) is cloned per speculative tree entry and per candidate
-    /// transaction, and the node persists the registry as one blob per commit. Registration is
+    /// `rand-token-leaf-1` leaf, so every change re-serialises and re-hashes it (every `state_root()`
+    /// did, before the leaf-root cache; audit v6 TOK-1), the whole `Ledger` (registry included) is
+    /// cloned per speculative tree entry and per candidate transaction, and the node persists the
+    /// registry as one blob per commit (one row per token under `tokens.incremental_root`). Registration is
     /// permissionless and its fee is flat, so without this check a faucet-funded attacker buys
     /// megabytes of that state per RAND (final-review core I-1). Refused byte-for-byte, so it is a
     /// permanent admission verdict.
@@ -464,6 +621,99 @@ impl TokenRegistry {
             next_index: FIRST_TOKEN_INDEX,
             mint_cap_per_day: u64::MAX,
             ext: RegistryExt::default(),
+            incremental: None,
+            leaf_root: LeafRootCache::default(),
+        }
+    }
+
+    /// Audit v6 (TOK-1, issue #86): the registry storage rebuilds from its per-token rows under
+    /// `tokens.incremental_root` — the three header words and every [`TokenInfo`] row, from
+    /// which `index_of` and `backing_of` are derived (`the_backing_index_is_the_map_the_tokens_describe`
+    /// pins that the derived map is the persisted one) and the incremental tree is built. The
+    /// rows must be dense from [`FIRST_TOKEN_INDEX`] and each must carry its own index; a gap, a
+    /// duplicate asset id or a doubly-backed pair is a corrupt store, reported as the
+    /// [`TokenError`] the live registry would have refused it with. The result has the flag on.
+    pub fn from_rows(registration_fee: u64, next_index: u32, mint_cap_per_day: u64, rows: Vec<TokenInfo>) -> Result<TokenRegistry, TokenError> {
+        let mut r = TokenRegistry::new(registration_fee).with_mint_cap(mint_cap_per_day);
+        for (n, info) in rows.into_iter().enumerate() {
+            let expected = FIRST_TOKEN_INDEX + n as u32;
+            if info.index != expected {
+                return Err(TokenError::IndexMismatch { expected, got: info.index });
+            }
+            if r.index_of.insert(info.id, info.index).is_some() {
+                return Err(TokenError::AlreadyRegistered(info.id));
+            }
+            if let MintAuthority::Bridge { backings } = &info.authority {
+                for b in backings {
+                    if r.backing_of.insert((b.chain, b.token), info.index).is_some() {
+                        return Err(TokenError::BackingTaken { chain: b.chain });
+                    }
+                }
+            }
+            r.by_index.insert(info.index, info);
+        }
+        if next_index != FIRST_TOKEN_INDEX + r.by_index.len() as u32 {
+            return Err(TokenError::IndexMismatch { expected: FIRST_TOKEN_INDEX + r.by_index.len() as u32, got: next_index });
+        }
+        r.next_index = next_index;
+        Ok(r.with_incremental_root(true))
+    }
+
+    /// This registry under `tokens.incremental_root` (audit v6 TOK-1, issue #86) — what genesis
+    /// builds from the field, and what a reloading node re-applies from the genesis file
+    /// (`node::reload_ledger`). See [`Self::set_incremental_root`].
+    pub fn with_incremental_root(mut self, on: bool) -> TokenRegistry {
+        self.set_incremental_root(on);
+        self
+    }
+
+    /// Switches the incremental commitment on (building the tree from the tokens held) or off
+    /// (dropping it). Idempotent, and never a change of state: the tree is derived from
+    /// `by_index`, and the root's domain follows the flag.
+    pub fn set_incremental_root(&mut self, on: bool) {
+        match (on, &self.incremental) {
+            (true, None) => {
+                self.incremental = Some(TokenTree::from_leaves(self.by_index.values().map(leaf_v2).collect()));
+                self.leaf_root = LeafRootCache::default();
+            }
+            (false, Some(_)) => {
+                self.incremental = None;
+                self.leaf_root = LeafRootCache::default();
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether this registry commits under `tokens.incremental_root` (`rand-token-registry-4`
+    /// over `rand-token-leaf-2` leaves). `false` without the genesis field — every chain
+    /// through 20.
+    pub fn incremental_root(&self) -> bool {
+        self.incremental.is_some()
+    }
+
+    /// Under `tokens.incremental_root`, every token's `rand-token-leaf-2` leaf in index order
+    /// (position `index − FIRST_TOKEN_INDEX`): what storage compares against the rows it last
+    /// wrote, so a commit writes only the tokens that changed. `None` without the field.
+    pub fn leaf_hashes(&self) -> Option<&[Hash]> {
+        self.incremental.as_ref().map(TokenTree::leaves)
+    }
+
+    /// Every writer of `by_index` ends here with the index it wrote: the cached leaf root is
+    /// dropped and, under `tokens.incremental_root`, the token's leaf is re-hashed into the
+    /// tree — set in place for a token the tree holds, appended for the one `register` just
+    /// handed the next index to. A writer that forgets this leaves the root stale, which is a
+    /// consensus break; `the_incremental_root_tracks_every_writer` goes through each one.
+    fn touched(&mut self, index: u32) {
+        self.leaf_root = LeafRootCache::default();
+        if let Some(tree) = &mut self.incremental {
+            let pos = (index - FIRST_TOKEN_INDEX) as usize;
+            let leaf = leaf_v2(self.by_index.get(&index).expect("a touched token is registered"));
+            if pos < tree.len() {
+                tree.set(pos, leaf);
+            } else {
+                debug_assert_eq!(pos, tree.len(), "indices are dense: a new token is the next leaf");
+                tree.push(leaf);
+            }
         }
     }
 
@@ -706,6 +956,7 @@ impl TokenRegistry {
             },
         );
         self.index_of.insert(id, index);
+        self.touched(index);
         Ok(index)
     }
 
@@ -724,6 +975,7 @@ impl TokenRegistry {
         };
         backings.push(Backing::new(chain, token, decimals));
         self.backing_of.insert((chain, token), index);
+        self.touched(index);
         Ok(())
     }
 
@@ -774,6 +1026,8 @@ impl TokenRegistry {
         if let Some(w) = &mut self.ext.windows {
             w.add(index, chain, token, now, amount);
         }
+        // After the last write to the leaf (the day counters above are inside it).
+        self.touched(index);
         Ok(())
     }
 
@@ -861,6 +1115,7 @@ impl TokenRegistry {
     ) -> Result<(), TokenError> {
         self.check_release(index, chain, token, amount, relayer_fee)?;
         self.move_backing(index, chain, token, amount, false);
+        self.touched(index);
         Ok(())
     }
 
@@ -945,6 +1200,7 @@ impl TokenRegistry {
             return Err(TokenError::BridgedToken(index));
         }
         info.total_supply = info.total_supply.checked_add(amount).ok_or(TokenError::SupplyOverflow)?;
+        self.touched(index);
         Ok(())
     }
 
@@ -956,6 +1212,7 @@ impl TokenRegistry {
             return Err(TokenError::BridgedToken(index));
         }
         info.total_supply = info.total_supply.checked_sub(amount).ok_or(TokenError::SupplyUnderflow)?;
+        self.touched(index);
         Ok(())
     }
 
@@ -966,6 +1223,7 @@ impl TokenRegistry {
     pub fn bump_nonce(&mut self, index: u32) {
         if let Some(info) = self.by_index.get_mut(&index) {
             info.mint_nonce += 1;
+            self.touched(index);
         }
     }
 
@@ -1000,22 +1258,32 @@ impl TokenRegistry {
             Some(pk) => MintAuthority::Key(pk),
             None => MintAuthority::None,
         };
+        self.touched(index);
         Ok(())
+    }
+
+    /// The merkle root over the token leaves: the incremental tree's under
+    /// `tokens.incremental_root`, otherwise [`merkle_root`] over every `rand-token-leaf-1` —
+    /// computed once per change and held in [`Self::leaf_root`] until the next writer clears
+    /// it (audit v6 TOK-1's node-only half: a `state_root` on a block that moved no token
+    /// hashes no token).
+    fn leaves_root(&self) -> Hash {
+        *self.leaf_root.0.get_or_init(|| match &self.incremental {
+            Some(tree) => tree.root(),
+            None => merkle_root(&self.by_index.values().map(leaf_v1).collect::<Vec<_>>()),
+        })
     }
 
     /// Folds the registry into one hash for the state root: a merkle root over every
     /// [`TokenInfo`] leaf in index order, then domain-separated together with `next_index` and
     /// `registration_fee` so a fee change or a still-empty next index also moves the root.
+    ///
+    /// Under `tokens.incremental_root` (audit v6 TOK-1, issue #86) the leaves are
+    /// `rand-token-leaf-2` in the incremental tree and the whole is `rand-token-registry-4`,
+    /// the extension always appended; without the field — every chain through 20 — the
+    /// `rand-token-registry-2`/`-3` bytes below, exactly as before.
     pub fn root(&self) -> Hash {
-        let leaves: Vec<Hash> = self
-            .by_index
-            .values()
-            .map(|info| {
-                let bytes = bincode::serialize(info).expect("TokenInfo serializes");
-                Hash::digest_domain(b"rand-token-leaf-1", &bytes)
-            })
-            .collect();
-        let leaves_root = merkle_root(&leaves);
+        let leaves_root = self.leaves_root();
         let mut buf = Vec::with_capacity(32 + 4 + 8 + 8);
         buf.extend_from_slice(leaves_root.as_bytes());
         buf.extend_from_slice(&self.next_index.to_be_bytes());
@@ -1023,6 +1291,10 @@ impl TokenRegistry {
         // B1: the cap decides which deposits are admissible, so it is committed like the fee.
         // (Each backing's own counters are in its token's leaf, above.)
         buf.extend_from_slice(&self.mint_cap_per_day.to_be_bytes());
+        if self.incremental.is_some() {
+            buf.extend_from_slice(&bincode::serialize(&self.ext).expect("the registry extension serializes"));
+            return Hash::digest_domain(b"rand-token-registry-4", &buf);
+        }
         // Audit v4: the v0.5.4 half — TOK-1's cap and bridge rules v2's windows, slot by slot —
         // appended, and the domain bumped, only on a chain that has any of it; chain 14's
         // registry hashes exactly as before.
@@ -2495,6 +2767,156 @@ mod tests {
         assert_eq!(rebuilt, v2);
         assert_eq!(rebuilt.root(), after_lock);
     }
+
+    /// Audit v6 (TOK-1, issue #86): the incremental tree is [`merkle_root`] leaf for leaf — for
+    /// every leaf count up to 40, built by appends, and after any one leaf is replaced — and
+    /// equal to the tree built from scratch over the same leaves.
+    #[test]
+    fn the_incremental_tree_is_merkle_root() {
+        let leaf = |n: u32| Hash::digest_domain(b"a leaf", &n.to_be_bytes());
+        let mut tree = TokenTree::from_leaves(Vec::new());
+        assert_eq!((tree.root(), tree.len()), (merkle_root(&[]), 0), "empty");
+        let mut leaves = Vec::new();
+        for n in 0..40u32 {
+            leaves.push(leaf(n));
+            tree.push(leaf(n));
+            assert_eq!(tree.root(), merkle_root(&leaves), "{} leaves", leaves.len());
+            assert_eq!(TokenTree::from_leaves(leaves.clone()), tree, "{} leaves, from scratch", leaves.len());
+            assert_eq!(tree.leaves(), leaves.as_slice());
+            for pos in 0..leaves.len() {
+                let mut moved = tree.clone();
+                let mut moved_leaves = leaves.clone();
+                moved_leaves[pos] = leaf(1_000 + pos as u32);
+                moved.set(pos, moved_leaves[pos]);
+                assert_eq!(moved.root(), merkle_root(&moved_leaves), "{} leaves, leaf {pos} replaced", leaves.len());
+                assert_eq!(TokenTree::from_leaves(moved_leaves), moved);
+            }
+        }
+    }
+
+    /// Audit v6 (TOK-1, issue #86): under `tokens.incremental_root` every writer of the registry
+    /// leaves the root equal to a from-scratch computation — the tree rebuilt from the tokens,
+    /// and [`merkle_root`] over the `rand-token-leaf-2` leaves — and moves it; the flag changes
+    /// the root's domain (`rand-token-registry-4`) and nothing in the v1 blob or the
+    /// extension's bytes, so chains 15–20's `rand-token-registry-3` stays what it is.
+    #[test]
+    fn the_incremental_root_tracks_every_writer() {
+        let mut r = reg().with_mint_cap(100_000).with_incremental_root(true);
+        assert!(r.incremental_root());
+        let scratch = |r: &TokenRegistry| {
+            let leaves: Vec<Hash> = r.iter().map(leaf_v2).collect();
+            assert_eq!(r.leaf_hashes().unwrap(), leaves.as_slice(), "the tree's leaves are the tokens'");
+            assert_eq!(r.leaves_root(), merkle_root(&leaves), "the tree's root is merkle_root's");
+            let rebuilt = r.clone().with_incremental_root(false).with_incremental_root(true);
+            assert_eq!(rebuilt, *r, "the tree rebuilt from the tokens is the tree maintained");
+            assert_eq!(rebuilt.root(), r.root());
+            r.root()
+        };
+        let mut last = scratch(&r);
+        let mut step = |r: &TokenRegistry, what: &str| {
+            let now = scratch(r);
+            assert_ne!(now, last, "{what} moves the root");
+            last = now;
+        };
+        let key = PublicKey::from_bytes(&[0x33; crate::crypto::PUBLIC_KEY_LEN]).unwrap();
+        r.register(id(1), "Key Coin".into(), "KEY".into(), 6, MintAuthority::Key(key), 1).unwrap();
+        step(&r, "register (Key)");
+        let z = list_zusd(&mut r, &[USDT2, USDC2]);
+        step(&r, "register (Bridge)");
+        r.add_supply(1, 5).unwrap();
+        step(&r, "add_supply");
+        r.bump_nonce(1);
+        step(&r, "bump_nonce");
+        r.sub_supply(1, 2).unwrap();
+        step(&r, "sub_supply");
+        r.lock(z, USDT2.0, &USDT2.1, 10, 0).unwrap();
+        step(&r, "lock");
+        r.release(z, USDT2.0, &USDT2.1, 4, 0).unwrap();
+        step(&r, "release");
+        r.add_backing(z, 7, [0xee; 32], 8).unwrap();
+        step(&r, "add_backing");
+        r.set_key(1, None).unwrap();
+        step(&r, "set_key");
+        // An odd leaf count, then an even one: the duplicated-last-child shape and its repair.
+        r.register(id(3), "C".into(), "C".into(), 0, MintAuthority::None, 3).unwrap();
+        step(&r, "register (third leaf)");
+        r.register(id(4), "D".into(), "D".into(), 0, MintAuthority::None, 4).unwrap();
+        step(&r, "register (fourth leaf)");
+
+        let legacy = r.clone().with_incremental_root(false);
+        assert!(!legacy.incremental_root());
+        assert_ne!(legacy.root(), r.root(), "rand-token-registry-4 is not the legacy root");
+        assert_eq!(bincode::serialize(&legacy).unwrap(), bincode::serialize(&r).unwrap(), "the flag is outside the v1 blob");
+        assert_eq!(bincode::serialize(legacy.ext()).unwrap(), bincode::serialize(r.ext()).unwrap(), "and outside the extension's bytes");
+        let back: TokenRegistry = bincode::deserialize(&bincode::serialize(&r).unwrap()).unwrap();
+        assert!(!back.incremental_root(), "a blob decodes to the legacy shape");
+        assert_eq!(back, legacy);
+        assert_eq!(back.with_incremental_root(true), r, "and the flag re-applied rebuilds the same tree");
+    }
+
+    /// TOK-1's node-only half, any chain: `root()` hashes every leaf once per change, not once
+    /// per call — a block that moved no token re-hashes nothing — and the value is the uncached
+    /// one (`the_token_leaf_and_registry_root_are_pinned_for_a_fixed_registry` pins it). Under
+    /// the field a change re-hashes the one leaf it touched.
+    #[test]
+    fn a_root_asked_twice_without_a_change_hashes_no_leaf() {
+        let hashes = || LEAF_HASHES.with(|c| c.get());
+        let mut r = reg();
+        for n in 1..=5u8 {
+            r.register(id(n), "T".into(), "T".into(), 0, MintAuthority::None, 0).unwrap();
+        }
+        let before = hashes();
+        let root = r.root();
+        assert_eq!(hashes() - before, 5, "the first root hashes every leaf");
+        assert_eq!((r.root(), hashes() - before), (root, 5), "the second hashes none");
+        r.add_supply(3, 1).unwrap();
+        let moved = r.root();
+        assert_ne!(moved, root);
+        assert_eq!(hashes() - before, 10, "a change on a legacy chain re-hashes every leaf, once");
+        let cloned = r.clone();
+        assert_eq!((cloned.root(), hashes() - before), (moved, 10), "a clone carries the cache");
+        let mut fee = r.clone();
+        fee.registration_fee += 1;
+        assert_ne!(fee.root(), moved, "the words outside the leaves are not cached");
+        assert_eq!(hashes() - before, 10);
+
+        let mut inc = r.clone().with_incremental_root(true);
+        let at = hashes();
+        let inc_root = inc.root();
+        assert_eq!(hashes() - at, 0, "under the field the tree's root is already known");
+        inc.add_supply(2, 1).unwrap();
+        assert_ne!(inc.root(), inc_root);
+        assert_eq!(hashes() - at, 1, "a change re-hashes the one leaf it touched");
+        inc.register(id(6), "T".into(), "T".into(), 0, MintAuthority::None, 0).unwrap();
+        assert_eq!(hashes() - at, 2, "a registration hashes its one new leaf");
+        inc.root();
+        assert_eq!(hashes() - at, 2);
+    }
+
+    /// Audit v6 (TOK-1, issue #86): the registry rebuilt from its per-token rows — the header
+    /// words and each `TokenInfo` — is the live one, derived maps and tree included; a gap, a
+    /// wrong next index or a duplicate id is refused as the corrupt store it is.
+    #[test]
+    fn from_rows_rebuilds_the_registry_the_rows_describe_and_refuses_a_gap() {
+        let mut r = reg().with_mint_cap(7).with_incremental_root(true);
+        let z = list_zusd(&mut r, &[USDT2, USDC2]);
+        r.register(id(9), "N".into(), "N".into(), 3, MintAuthority::None, 4).unwrap();
+        r.lock(z, USDT2.0, &USDT2.1, 5, 0).unwrap();
+        let rows: Vec<TokenInfo> = r.iter().cloned().collect();
+        let back = TokenRegistry::from_rows(r.registration_fee, r.next_index(), r.mint_cap_per_day(), rows.clone()).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.root(), r.root());
+        assert!(back.incremental_root());
+        assert_eq!(back.bridged(USDC2.0, &USDC2.1).unwrap().index, z);
+        assert_eq!(back.backing(z, USDT2.0, &USDT2.1).unwrap().locked, 5);
+        let mut gap = rows.clone();
+        gap.remove(0);
+        assert_eq!(TokenRegistry::from_rows(1, 3, 7, gap).unwrap_err(), TokenError::IndexMismatch { expected: 1, got: 2 });
+        assert_eq!(TokenRegistry::from_rows(1, 4, 7, rows.clone()).unwrap_err(), TokenError::IndexMismatch { expected: 3, got: 4 });
+        let mut dup = rows.clone();
+        dup[1].id = dup[0].id;
+        assert_eq!(TokenRegistry::from_rows(1, 3, 7, dup).unwrap_err(), TokenError::AlreadyRegistered(rows[0].id));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -2802,7 +3224,7 @@ mod action_tests {
     }
 
     /// Core I-1. A `Key` mint authority is the one field of a registration that lands in
-    /// permanent consensus state (the `rand-token-leaf-1` leaf, re-hashed on every `state_root`,
+    /// permanent consensus state (the `rand-token-leaf-1` leaf, re-hashed on every change,
     /// cloned per speculative block, persisted per commit), and `PublicKey` decodes from the wire
     /// as any-length bytes. Registration is permissionless at a flat fee, so an unbounded key is
     /// a faucet-priced state-bloat DoS. Refused on both paths that can write one — the

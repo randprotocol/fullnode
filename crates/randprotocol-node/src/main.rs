@@ -460,6 +460,16 @@ enum Cmd {
         /// (`Genesis::build` validates both).
         #[arg(long, value_name = "TOKENS.JSON")]
         tokens: Option<PathBuf>,
+        /// Audit v6 (TOK-1, issue #86): sets `"incremental_root": true` on the `--tokens`
+        /// section — the registry's root becomes an incremental merkle commitment over
+        /// `rand-token-leaf-2` leaves (`rand-token-registry-4`, the state root re-domained
+        /// `rand-state-tokens-1`) and the node stores one row per token, rewriting only what a
+        /// block changed. Part of the genesis hash (tagged `tokens_incremental_root`, after every
+        /// tag before it); omitted, the section is the config file's and every chain through 20
+        /// hashes as before. The file may carry the key itself; this is the same thing from the
+        /// command line. Needs `--tokens`, refused by name without it.
+        #[arg(long)]
+        tokens_incremental_root: bool,
         /// The exact note-envelope size (spec 2026-09-26 §2.4): every note envelope — a bundle
         /// output, a faucet mint, a withdraw, a bridge deposit, a genesis alloc — must be exactly
         /// this many bytes, which lets every one of them carry a memo. Only `notes::
@@ -1554,6 +1564,7 @@ async fn main() -> Result<()> {
             aggregation,
             admitted_shapes,
             tokens,
+            tokens_incremental_root,
             envelope_bytes,
             vesting,
             bundle_guest,
@@ -1615,6 +1626,11 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // Audit v6 TOK-1 (issue #86): the flag sets a field of the tokens section, so it
+            // needs one — said here, by flag name, before a file is written.
+            if tokens_incremental_root && tokens.is_none() {
+                anyhow::bail!("--tokens-incremental-root needs --tokens: the flag sets `incremental_root` on the tokens section");
+            }
             let mut gen = Genesis {
                 chain_id,
                 timestamp_ms: std::time::SystemTime::now()
@@ -1637,12 +1653,19 @@ async fn main() -> Result<()> {
                 // needs one, a listed token needs a `bridge` section); omitted entirely
                 // otherwise, so a chain without the flag hashes byte-for-byte as before.
                 tokens: match &tokens {
-                    Some(path) => Some(
-                        serde_json::from_str::<TokensConfig>(
+                    Some(path) => {
+                        let mut cfg = serde_json::from_str::<TokensConfig>(
                             &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
                         )
-                        .with_context(|| format!("{} is not a valid tokens config", path.display()))?,
-                    ),
+                        .with_context(|| format!("{} is not a valid tokens config", path.display()))?;
+                        // Audit v6 TOK-1 (issue #86): `--tokens-incremental-root` is the file's
+                        // `"incremental_root": true` from the command line; absent, the file's
+                        // own word stands (and a file without the key hashes as before).
+                        if tokens_incremental_root {
+                            cfg.incremental_root = Some(true);
+                        }
+                        Some(cfg)
+                    }
                     None => None,
                 },
                 // The consensus signing domain (audit v4): `--consensus-domain 1` from the next

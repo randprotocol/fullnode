@@ -335,9 +335,11 @@ held to at least one and at least the number of tokens the section lists. At the
 last index has always given — after the identity check and before any index is spent; a
 `ListBacking` adds no token and is unaffected. `rand_getTokens` serves the cap as `max_tokens`
 (`null` without one) and pages **by range** (`BTreeMap::range(from..)`), so a page from a high
-index no longer reads the rows below it. The O(tokens) root stays: under a cap of a few thousand
-it is bounded work per block, and an incremental root would move the token root domain for every
-chain — deferred to the cut that needs it.
+index no longer reads the rows below it. The O(tokens) root stays on every chain through 20: under
+a cap of a few thousand it is bounded work per block, and an incremental root moves the token root
+domain — it is the genesis field of §17, dormant until a cut carries it. (Node-only, any chain: the
+root is computed once per change and reused, so a block that moves no token re-hashes none; the
+value is unchanged.)
 
 ## 15. The burned registration fee (v0.5.5, audit v5 TOK-2)
 
@@ -392,3 +394,45 @@ a byte verdict, cached like a bad proof (`admission::oversized_note`; a faucet m
 `TxError::AmountTooLarge` there) — so on chain 14 such a transaction is never pooled or forwarded
 by a node carrying the screen, while a block carrying one would still be valid until the next cut switches the
 rule on.
+
+## 17. The incremental registry root (audit v6 TOK-1, issue #86)
+
+The registry root (§14) is a merkle root over every token's leaf — `rand-token-leaf-1` over
+`bincode(TokenInfo)` — recomputed from every leaf at every state root, and the node stored the
+whole registry as one blob, rewritten at every commit whatever the block changed. Bounded by
+`max_tokens` (4 096 on chains 15–20) and the burned registration fee, so a Low; the audit's fix is
+an incremental commitment and per-token rows. A genesis may ask for both:
+
+```json
+"tokens": { "registration_fee": 1000000000, "mint_cap_per_day": 10000000000000, "max_tokens": 4096, "incremental_root": true }
+```
+
+`incremental_root` is optional and **absent on every chain through 20**, where the root, the
+state-root domain and the stored registry are byte-for-byte what they were; `false` is the same
+rule spelled out and commits nothing. When `true` it is committed to the genesis hash
+(`b"tokens_incremental_root"` ‖ `1`, tagged, after every tag that existed before it, only then) —
+`rand-node genesis --tokens … --tokens-incremental-root`, or the key in the tokens file — and:
+
+- **The root.** Each token's leaf is `rand-token-leaf-2` over the same `bincode(TokenInfo)`, held
+  in a merkle tree whose every level is kept (`TokenTree`); a changed token re-hashes its leaf and
+  one node per level (`O(log n)`), a registration appends one. The tree's root is exactly what
+  `merkle_root` gives over the same leaves. The registry hashes under `rand-token-registry-4`
+  (leaves root ‖ `next_index` ‖ `registration_fee` ‖ `mint_cap_per_day` ‖ the extension's bytes,
+  always), and the state root is re-domained `H("rand-state-tokens-1", base)` over the base layout
+  the chain would otherwise have — innermost of the audit-v6 wrappers, before
+  `rand-state-admitted-1` and `rand-state-slashing-1`.
+- **The store.** The node keeps the registry's header (`registration_fee`, `next_index`,
+  `mint_cap_per_day`; JSON under `tokens_header`) and one row per token (`token/` ‖ index in the
+  `meta` family, `bincode(TokenInfo)` — the leaf's own bytes) and deletes the `tokens` blob. A
+  commit rewrites only the rows whose leaf differs from the row on disk (a registration its one
+  new row, a deposit the one row it moved, a block without token changes none); `verify --mode
+  full` rebuilds the registry from the rows and compares it with the replay, tree included. A key
+  prefix rather than a column family, so a build before this one can still open a store this one
+  wrote on a chain without the field.
+- **The flag is a genesis parameter**: `node::reload_ledger` re-applies it from the file on every
+  restart (the rows layout implies it, but the file is the authority, as for every other
+  parameter outside the state root). Served as `rand_getTokens.incremental_root` (`false` on
+  every chain through 20).
+
+Nothing about which transactions are valid changes: the field moves only how the registry is
+committed and stored. Wallets and explorers see one new boolean.

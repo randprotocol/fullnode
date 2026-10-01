@@ -57,7 +57,7 @@ fn the_genesis_command_pins_the_hidden_asset_guest() {
 #[test]
 fn the_genesis_command_round_trips_a_tokens_section() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = TokensConfig { registration_fee: 1_000_000_000, tokens: Vec::new(), mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None };
+    let cfg = TokensConfig { registration_fee: 1_000_000_000, tokens: Vec::new(), mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None, incremental_root: None };
     let cfg_path = dir.path().join("tokens.json");
     std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
 
@@ -124,7 +124,7 @@ fn the_genesis_command_pins_guest_v2_and_the_v06_switch_when_asked() {
 fn the_genesis_command_writes_the_program_state_section_when_asked() {
     use randprotocol_core::ledger::program_state::ProgramStateConfig;
     let dir = tempfile::tempdir().unwrap();
-    let cfg = TokensConfig { registration_fee: 1_000_000_000, tokens: Vec::new(), mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None };
+    let cfg = TokensConfig { registration_fee: 1_000_000_000, tokens: Vec::new(), mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None, incremental_root: None };
     let cfg_path = dir.path().join("tokens.json");
     std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
     let tokens = cfg_path.to_str().unwrap();
@@ -377,6 +377,42 @@ fn the_genesis_command_writes_the_testnet_marker_when_asked() {
     assert!(genesis(&plain, &["--faucet"]).status.success());
     assert_eq!(read(&plain).testnet, None);
     assert!(!std::fs::read_to_string(&plain).unwrap().contains("testnet"));
+}
+
+/// Audit v6 (TOK-1, issue #86): `--tokens-incremental-root` sets `"incremental_root": true` on the
+/// tokens section the file carries, and the chain it builds commits its registry incrementally;
+/// without `--tokens` it is refused by name and nothing is written; without the flag the section
+/// is what the config file says — no field, chain 20's shape.
+#[test]
+fn the_genesis_command_writes_the_incremental_token_root_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = TokensConfig { registration_fee: 1_000_000_000, tokens: Vec::new(), mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None, incremental_root: None };
+    let cfg_path = dir.path().join("tokens.json");
+    std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
+    let out = dir.path().join("genesis.json");
+    let run = genesis(&out, &["--tokens", cfg_path.to_str().unwrap(), "--tokens-incremental-root"]);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let gen = read(&out);
+    assert_eq!(gen.tokens.as_ref().unwrap().incremental_root, Some(true));
+    assert!(std::fs::read_to_string(&out).unwrap().contains("\"incremental_root\": true"));
+    let executor = ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test);
+    let state = gen.build(&executor).unwrap();
+    assert!(state.ledger.tokens().unwrap().incremental_root(), "the chain's registry commits incrementally");
+    let mut without = gen.clone();
+    without.tokens.as_mut().unwrap().incremental_root = None;
+    assert_ne!(without.build(&executor).unwrap().hash(), state.hash(), "the field is bound by the genesis hash");
+
+    let refused = dir.path().join("refused.json");
+    let run = genesis(&refused, &["--tokens-incremental-root"]);
+    assert!(!run.status.success());
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("--tokens-incremental-root needs --tokens"), "{stderr}");
+    assert!(!refused.exists(), "and nothing is written");
+
+    let plain = dir.path().join("plain.json");
+    assert!(genesis(&plain, &["--tokens", cfg_path.to_str().unwrap()]).status.success());
+    assert_eq!(read(&plain).tokens.unwrap().incremental_root, None);
+    assert!(!std::fs::read_to_string(&plain).unwrap().contains("incremental_root"));
 }
 
 /// Issue #118: `--proof-window-blocks N` writes the window; out of [256, 4096] it is refused and

@@ -542,7 +542,7 @@ async fn a_token_is_created_minted_sent_privately_burned_and_read_back() {
     let started = Instant::now();
     let dir = tempfile::tempdir().unwrap();
     let key = Keypair::from_seed([103; 32]).unwrap();
-    let tokens = TokensConfig { registration_fee: MIN_REGISTRATION_FEE, mint_cap_per_day: 0, max_tokens: None, burn_registration_fee: None, bound_note_value: None, tokens: vec![] };
+    let tokens = TokensConfig { registration_fee: MIN_REGISTRATION_FEE, mint_cap_per_day: 0, max_tokens: None, burn_registration_fee: None, bound_note_value: None, incremental_root: None, tokens: vec![] };
     let handle = start_with(&dir, &key, genesis_full(&key, None, None, Some(tokens))).await;
     let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
     let a = Wallet::from_spend_key(SpendKey([5; 8]));
@@ -862,7 +862,7 @@ fn genesis_rpl2(validator: &Keypair) -> Genesis {
             mint_cap_per_day: 0,
             max_tokens: None,
             burn_registration_fee: None,
-            bound_note_value: None,
+            bound_note_value: None, incremental_root: None,
             tokens: vec![],
         }),
         gas: Some(gas::GasConfig {

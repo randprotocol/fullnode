@@ -1334,6 +1334,17 @@ impl Ledger {
         self.tokens.as_ref()
     }
 
+    /// Audit v6 (TOK-1, issue #86): re-applies the genesis `tokens.incremental_root` flag to the
+    /// registry a store gave back — a genesis parameter, so the file is the authority, like every
+    /// other one `node::reload_ledger` restores. Idempotent; a no-op on a chain without a
+    /// registry. A node that came back without it would hash `rand-token-registry-2`/`-3` under
+    /// `rand-state-4` … against peers on `rand-state-tokens-1`: a fork at its first block.
+    pub fn set_tokens_incremental_root(&mut self, on: bool) {
+        if let Some(t) = &mut self.tokens {
+            t.set_incremental_root(on);
+        }
+    }
+
     /// The registry to write: a bridged deposit credits a token's supply and a burn debits it
     /// (`bridge_notes::apply`), and a later task's `Action::RegisterToken` and friends mint
     /// through the same handle.
@@ -3087,8 +3098,18 @@ impl Ledger {
     /// A wrapper with its own domain composes with whatever the inner layout grows next, and
     /// without the flags — every chain through 18 — the inner root is returned untouched, byte
     /// for byte.
+    ///
+    /// Audit v6's TOK-1 (issue #86) is the innermost of them: under `tokens.incremental_root`
+    /// the registry's component inside the base is already the incremental
+    /// `rand-token-registry-4` root, and the whole is re-domained
+    /// `H("rand-state-tokens-1", base)` before the staking wrappers — so a chain on the field
+    /// can never collide with one off it whose registry happened to hash alike, and every chain
+    /// through 20 (no field) is untouched.
     pub fn state_root(&self) -> Hash {
         let mut root = self.state_root_base();
+        if self.tokens.as_ref().is_some_and(|t| t.incremental_root()) {
+            root = Hash::digest_domain(b"rand-state-tokens-1", root.as_bytes());
+        }
         if self.staking.as_ref().is_some_and(|s| s.admission_by_vote()) {
             let mut buf = Vec::with_capacity(64);
             buf.extend_from_slice(root.as_bytes());
@@ -6135,6 +6156,39 @@ mod tests {
             buf.extend_from_slice(&[0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]);
             assert_eq!(l.state_root(), Hash::digest_domain(b"rand-state-7", &buf), "vesting {vesting}");
         }
+    }
+
+    /// Audit v6 (TOK-1, issue #86): under `tokens.incremental_root` the state root is
+    /// `H("rand-state-tokens-1", base)` over the base whose tokens component is the registry's
+    /// `rand-token-registry-4` root; without the field the base is returned untouched — chain
+    /// 18's `rand-state-4` layout, byte for byte — and the flag re-applied off again gives the
+    /// same ledger and root back.
+    #[test]
+    fn the_incremental_token_root_wraps_the_state_root_only_under_the_field() {
+        let mut off = ledger();
+        off.set_tokens(Some(tokens::TokenRegistry::new(1_000_000_000)));
+        let (nf, val, prog) = off.state_root_leaves();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&word8_to_bytes(&off.tree.root()));
+        buf.extend_from_slice(nf.as_bytes());
+        buf.extend_from_slice(val.as_bytes());
+        buf.extend_from_slice(prog.as_bytes());
+        let head = buf.clone();
+        buf.extend_from_slice(off.tokens().unwrap().root().as_bytes());
+        assert_eq!(off.state_root(), Hash::digest_domain(b"rand-state-4", &buf), "no field: chain 18's layout");
+
+        let mut on = off.clone();
+        on.set_tokens_incremental_root(true);
+        assert!(on.tokens().unwrap().incremental_root());
+        let mut inner = head;
+        inner.extend_from_slice(on.tokens().unwrap().root().as_bytes());
+        let base = Hash::digest_domain(b"rand-state-4", &inner);
+        assert_eq!(on.state_root(), Hash::digest_domain(b"rand-state-tokens-1", base.as_bytes()), "the field: re-domained over the incremental registry root");
+        assert_ne!(on.state_root(), off.state_root());
+        assert_ne!(on, off, "the flag is inside the ledger's equality");
+        on.set_tokens_incremental_root(false);
+        assert_eq!(on.state_root(), off.state_root(), "the flag off again is the old root");
+        assert_eq!(on, off);
     }
 
     /// A chain with `vesting` and a FIXED gas section keeps exactly the `rand-state-6` root it

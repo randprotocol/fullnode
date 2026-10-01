@@ -1011,7 +1011,10 @@ registration's `registration_fee` is burned rather than paid to the block's prop
 (`docs/tokens.md` §15) — `false` on chain 14. `bound_note_value` (v0.5.6, deep scan) is a
 boolean: whether a mint or deposit is held below 2^63 as a validity rule (`docs/tokens.md` §16;
 the admission screen refuses such an amount on every chain regardless) — `false` on chain 14.
-A page shorter than `limit` is the last.
+`incremental_root` (audit v6 TOK-1, issue #86) is a boolean: whether the registry's root is the
+incremental commitment of `docs/tokens.md` §17 (`rand-token-registry-4`, the state root under
+`rand-state-tokens-1`, one stored row per token) — `false` on every chain through 20; it changes
+no row of this listing and no validity rule. A page shorter than `limit` is the last.
 
 A wallet resolves a token id **through this listing** (`wallet::resolve_asset`), never through
 `rand_getToken`: a transfer's asset is private on chain, and reading the whole registry costs the
@@ -1637,6 +1640,17 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-10-01 — audit v6, TOK-1: `tokens.incremental_root` (genesis-gated; no chain carries it yet)
+
+Additive. `rand_getTokens` gains `incremental_root` (boolean, `false` on every chain through 20):
+whether the chain's genesis carries `tokens.incremental_root: true` (`docs/tokens.md` §17), under
+which the registry's root is an incremental merkle commitment over `rand-token-leaf-2` leaves
+(`rand-token-registry-4`; the state root re-domained `rand-state-tokens-1`) and the node stores one
+row per token, rewriting only what a block changed. No validity rule, no listing row and no other
+method changes; a client that recomputes the registry root from `rand_getTokens` must use the new
+leaf domain and registry domain on such a chain. Node-only on every chain: the root is computed
+once per change and reused, so a block that moves no token re-hashes none — the value is the same.
 
 ### 2026-10-01 — audit v7, RPC-5: `rand_getBlocks` pages bounded by their reply; every public note stripped (node-only)
 
