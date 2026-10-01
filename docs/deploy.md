@@ -1182,6 +1182,19 @@ rehearsal checklist in `docs/bridge.md` §21.5 on a private chain; the signer is
 relayers holding attestations co-signed by the old set must re-collect co-signatures from the new
 set after `effective_at_secs`.
 
+## The next cut: `program_state` (RPL-2, v0.6.8; chain 20 at the earliest)
+
+RPL-2's program cells, program vaults and `Invoke` (variant 33) switch on with a top-level
+`"program_state": { "cell_fee": <units> }` (a JSON number) (`docs/program-state.md`). Chain 19 is cut on v0.6.7
+without it; **chain 20 is the first chain that can carry it**. Hashed last (after
+`proof_window_blocks`), folded into the state root as `rand-state-8` and persisted under
+`META_PROGRAM_STATE`, all only when present — chain 18 is byte for byte unchanged. **What the cut
+passes:** `rand-node genesis --program-state-cell-fee <UNITS>` (at most 1 000 RAND), which needs
+`--tokens`, `--gas-price`, `--hardening-v6` and `--auth-guest` (with `--bundle-guest v3`), each
+refused by name; `Genesis::validate` also requires `confidential`. Check `rand_getLimits.program_state`
+after the cut. randscan and the clients render the `invoke` kind and its payout notes before or
+with it (`docs/rpc.md`, changelog).
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and

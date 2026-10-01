@@ -1522,9 +1522,15 @@ Action::RegisterBridgedToken { name: String, symbol: String, salt: [u8; 32], cha
                                pq_signatures: Vec<PqSignature> }      // B4
 Action::ListBacking { token_index: u32, chain: u16, token: [u8; 32], decimals: u8, nonce: u64,
                       pq_signatures: Vec<PqSignature> }               // B4
+Action::Invoke { program: Hash, proof: Vec<u8>, input_envelope: Option<CallEnvelope>,
+                 transition: Transition }                             // RPL-2, tag 33 (after the vesting actions and audit v6's AdmitValidator … CancelRotation, 28–32)
 
 MintAuthority = None | Key(PublicKey) | Bridge { backings: Vec<Backing> } | Program(Hash)
 InitialMint { amount: u64, recipient: ShieldedAddress, r: Word8, time: u32, envelope: Envelope }
+Transition { reads: Vec<Cell>, writes: Vec<Cell>, inflow: Inflow, pays: Vec<Payout>, mints: Vec<Payout> }
+Cell { key: Word8, value: Word8 }              // keys strictly ascending in each list
+Inflow = None | Deposit | Burn                  // what the bundle's burn_a of burn_asset is to the program
+Payout { asset: u32, amount: u64, recipient: ShieldedAddress, r: Word8, envelope: Envelope }
 
 Registration { public_key: PublicKey, payout: ShieldedAddress, signature: Signature }
 PqSignature { index: u8, signature: Vec<u8> }   // one guardian's Dilithium2 co-signature, by set index

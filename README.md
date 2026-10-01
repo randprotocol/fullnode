@@ -337,6 +337,7 @@ a time.
 | v0.6.3 / v0.6.4 | delegated proving, phase 2: split authorisation (the auth proof, `rand-txid-3`) | 17 |
 | v0.6.6 / v0.6.7-rc1 | gas: constraint set 8, a declared gas limit per proof, dynamic gas and byte prices; the memo turned on | 18 |
 | v0.6.7 | fixes on chain 18: sealed-proof pruning, the envelope-format pin, viewing-key hygiene, the rVM allocator, GPU-kernel aliasing, ALU test coverage | 18 |
+| v0.6.8 | RPL-2: program state, program vaults and the `Invoke` action, behind a `program_state` genesis section; `MintAuthority::Program` (`docs/program-state.md`) | not cut (chain 20 at the earliest) |
 
 ## v0.5: RPL, zUSD and bridge hardening
 
@@ -383,6 +384,7 @@ all hard forks together as chain 14:
 | [docs/aggregation.md](docs/aggregation.md) | block aggregation with the recursion VM: sealing, pruning, sealed-form sync (off on every chain today) |
 | [docs/vesting.md](docs/vesting.md) | timelocked genesis allocations: claims, revocation, bonding locked RAND |
 | [docs/consensus.md](docs/consensus.md) | the consensus rules added since the architecture write-up (the not-held quorum, durable pending blocks, recovery rules) |
+| [docs/program-state.md](docs/program-state.md) | RPL-2 (v0.6.8): program cells and vaults, the `Invoke` action and its declared transition, the context ABI a program reads, the two rules a program must keep, fees, the genesis section |
 | [docs/tokens.md](docs/tokens.md) | RPL, the token standard (v0.5): a token as a registry entry, asset ids and `rpl1…`, mint authorities, creation, hidden-asset transfers, burning, the CLI and RPC, ERC-20/SPL comparison |
 | [docs/guests.md](docs/guests.md) | writing and deploying a RISC-V program: the Rand ISA, the syscall ABI, the image container, `rand-guest` build/check/run/pack, `hc` versus program id, the program-size cap |
 | [docs/translators.md](docs/translators.md) | the Solana (`sbpf2rv`) and Ethereum (`evm2rv`) translators: trust model, parity, the ERC-20 and SPL Token walkthroughs, measured cycles, limits |
@@ -400,7 +402,8 @@ all hard forks together as chain 14:
 
 Done: the shielded pool, staking and the bridge as notes (phases S1–S3), RPL tokens, history
 pruning, address sharing and the memo, genesis vesting, delegated proving with split
-authorisation, and gas.
+authorisation, gas, and RPL-2 (program state, program vaults, `Invoke` — in the v0.6.8 build,
+on no chain yet).
 
 Next:
 - **Mainnet (v1.0)**, with a fresh genesis and a network marker that makes archive rules into
@@ -413,7 +416,7 @@ Next:
 - Slashing beyond leader equivocation (vote equivocation is logged, not slashed), and slashing
   stake bonded from a vesting lock (audit v6 STAKE-1 built leader-equivocation slashing and
   jailing behind the genesis `staking.slashing` section — on no chain yet; `docs/staking.md`);
-  persistent per-program state and cross-program calls; a nullifier accumulator; the
+  cross-program calls and block context for RPL-2 programs; a nullifier accumulator; the
   hash-sortition leader beacon.
 
 ## Open ops tasks
