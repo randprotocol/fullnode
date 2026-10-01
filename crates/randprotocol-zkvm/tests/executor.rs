@@ -477,10 +477,20 @@ fn words_for_log_height(h: u8) -> usize {
 /// next bundle not already in the verified set paid a tier-14 key build inside consensus (~3.3 s
 /// at the production profile). The bundle guest now has a `Machine` of its own, which program
 /// shapes never touch.
+///
+/// Audit v6 HB-4: since constraint set 7 (#54) the cache is a 64-key LRU, and the timing check at
+/// the end alone stayed green with the bundle key built into the shared program-key `Machine`
+/// (the mutation control `CPUV-1` in `scripts/mutation-controls.sh`): these shapes no longer
+/// overflow it. So the separation is asserted directly — the bundle key is in the bundle's own
+/// cache (`cached_bundle_keys`) and never in the program cache (`cached_keys`), before and after
+/// the program shapes.
 #[test]
 fn the_bundle_key_survives_eleven_program_shapes_warmed_after_it() {
     let ex = ZkExecutor::new(FriProfile::Test);
+    let empty = ex.cached_keys();
     ex.warm_bundle();
+    assert_eq!(ex.cached_bundle_keys(), 1, "warm_bundle builds the bundle key in the bundle's own Machine");
+    assert_eq!(ex.cached_keys(), empty, "the bundle key went into the shared program-key cache");
     // Twelve distinct (program height, public height) pairs. Constraint set 7 floors both tables
     // at 2^7, so program heights 4–6 no longer exist; the public height supplies the second axis.
     for h in 7u8..=12 {
@@ -490,10 +500,14 @@ fn the_bundle_key_survives_eleven_program_shapes_warmed_after_it() {
             ex.warm(&rec);
         }
     }
+    let programs = ex.cached_keys();
+    assert!(programs > empty, "the program shapes were warmed into the program cache");
     let t = std::time::Instant::now();
     ex.warm_bundle();
     let took = t.elapsed();
     assert!(took.as_millis() < 100, "the bundle key was rebuilt ({took:?}): evicted by the program shapes");
+    assert_eq!(ex.cached_bundle_keys(), 1, "still exactly the one bundle key");
+    assert_eq!(ex.cached_keys(), programs, "a bundle warm touched the program cache");
 }
 
 /// CPUV-1 (b): warm-ups are serialised node-wide. `warm_new_programs` spawns a blocking task per

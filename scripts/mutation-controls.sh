@@ -53,20 +53,24 @@
 #                  limbs as ZKM-1 (input), controlled below. VERIFIER-2, V-VERIFIER-1, ISA-5, HB-1:
 #                  not done in this pass.
 #
-# Notes recorded by the first run (2026-10-01; 13 ok, 3 MISSING — the commit message has the output):
-#   HCS-1  `key_derivation_v2::ACTIVE` is read by nothing — setting it false changes no key — so
-#          the control edits the derivation itself (the two labels swapped in `key_rngs`) and shows
-#          the verifier-key pins catch a change to it. The constant is documentation, not a switch.
-#   AGG-1, INTERFACE-1  MISSING: each fix has a validate half and an apply half that refuse with
-#          the SAME error, and the named tests go through `apply_tx`/`apply_block_with_covered`, so
-#          with the validate half removed the apply half still answers and the test cannot tell.
-#          What no test pins: `Ledger::validate` alone (the pool's admission path) refusing a
-#          re-covered bundle (step 4) or a `SlashAggregator`. Dormant (no chain aggregates).
-#   CPUV-1 MISSING: with `warm_bundle` building the bundle key into the shared program-key
-#          `Machine`, the test still passes — its twelve program shapes cannot evict anything from
-#          the vendored cache (LRU, `KEY_CACHE_CAPACITY` = 64 keys, since constraint set 7 / #54). The
-#          test's premise (a FIFO that eleven shapes overflow) is stale; it no longer shows the
-#          bundle key needs its own `Machine`.
+# Notes from the runs (2026-10-01):
+#   HCS-1  `key_derivation_v2::ACTIVE` (vendored, `pub const ACTIVE: bool = true;`) is DEAD: no code
+#          in randprotocol-zkvm or randprotocol-rvm reads it, so setting it false changes no key and
+#          proves nothing. It documents that the v2 derivation is in force; it is not a switch. The
+#          control therefore edits the derivation itself (the two labels swapped in `key_rngs`) and
+#          shows the verifier-key pins catch a change to it. Vendored: left as it is here.
+#   AGG-1, INTERFACE-1, CPUV-1  MISSING on the first run (13 ok, 3 MISSING); closed:
+#          INTERFACE-1 had a validate arm and an apply arm refusing with the same error, and its
+#          test went through apply only — it now also asserts `Ledger::validate` (the pool's entry).
+#          AGG-1's first control (`if false` on `validate_aggregate`'s step-4 membership check)
+#          stayed green even with a new assertion on `Ledger::validate_aggregate`: step 5's payout
+#          derivation (`aggregate_payment`) looks the cover up in the same `unsealed_fees` map and
+#          refuses with the same `CoverNotCoverable`, so step 4 is redundant by construction and no
+#          test can tell it is gone (not a bug: both refuse). The control now removes the half of
+#          the fix the audit names that nothing duplicates — `apply_aggregate` taking the covers
+#          out of the coverable set (aggregation.rs, `unsealed_fees.remove`). CPUV-1's test only timed a re-warm,
+#          which a 64-key LRU (constraint set 7, #54) never evicts from; it now asserts the bundle
+#          key is in the bundle's own `Machine` and never in the program cache.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -83,7 +87,7 @@ CONTROLS=(
   "ZKV-1|$Z/machine.rs|Self::Production => 80,|Self::Production => 27,|-p randprotocol-zkvm --lib|machine::fri_soundness_tests::production_profile_meets_the_100_bit_conjectured_target"
   "ZKV-2|$Z/poseidon2_constants.rs|0xee75a7f2107126c1|0xee75a7f2107126c0|-p randprotocol-zkvm --lib|poseidon2_constants::tests::the_permutation_answers_its_known_vectors"
   "HCS-1|$Z/key_derivation_v2.rs|(KeyRngV2::from_label(MMCS_LABEL), KeyRngV2::from_label(PCS_LABEL))|(KeyRngV2::from_label(PCS_LABEL), KeyRngV2::from_label(MMCS_LABEL))|-p randprotocol-zkvm --test verifier_key|the_verifier_keys_answer_their_known_digests"
-  "AGG-1|$C/ledger/aggregation.rs|if !ledger.unsealed_fees.contains_key(cover) {|if false {|-p randprotocol-core --lib|ledger::aggregation::payment_tests::an_aggregate_over_an_already_covered_bundle_is_refused_under_a_fresh_nonce"
+  "AGG-1|$C/ledger/aggregation.rs|self.unsealed_fees.remove(c);|let _ = c;|-p randprotocol-core --lib|ledger::aggregation::payment_tests::an_aggregate_over_an_already_covered_bundle_is_refused_under_a_fresh_nonce"
   "INTERFACE-1|$C/ledger/aggregation.rs|return Err(AggregationError::SlashingRetired.into());|return Ok(());|-p randprotocol-core --lib|ledger::aggregation::register_tests::a_slash_is_refused_whatever_its_headers"
   "CH-3|$Z/executor.rs|if tier > MAX_CALL_TIER {|if false {|-p randprotocol-zkvm --test executor|a_call_declaring_a_tier_above_the_cap_is_refused_before_any_key_is_built"
   "CPU-1|$C/ledger/mod.rs|if words.len() > max_words {|if false {|-p randprotocol-core --lib|ledger::tests::under_hardening_v6_a_deploy_no_call_can_hold_is_refused"

@@ -1591,6 +1591,13 @@ mod register_tests {
         ];
         for (a, b) in pairs {
             let slash = Transaction { chain_id: 7, bundle: None, action: Action::SlashAggregator { a, b } };
+            // The pool's half (audit v6 HB-4: the mutation control showed the apply arm alone
+            // answered here, so the `validate` arm's refusal had no test of its own).
+            assert_eq!(
+                l.validate(&slash, &StubExecutor),
+                Err(crate::ledger::TxError::Aggregation(AggregationError::SlashingRetired)),
+                "admission refuses a slash by name, before apply"
+            );
             match l.apply_tx(&slash, &proposer(&l), &StubExecutor) {
                 Err(crate::ledger::TxError::Aggregation(AggregationError::SlashingRetired)) => {}
                 other => panic!("every slash is refused by name, got {other:?}"),
@@ -2906,6 +2913,14 @@ mod payment_tests {
         assert_eq!(l.supply().sealed_blocks, 1);
         let subsidised = l.supply().subsidised;
         let replay = aggregate_tx(&kp, 1, 1, vec![c1.hash()], b"ok".to_vec());
+        // Admission's half first (audit v6 HB-4): `validate_aggregate` is the pool's entry and
+        // must name the sealed cover itself, not only the block apply below. (Step 4's explicit
+        // membership check and step 5's payout derivation read the same set and refuse with the
+        // same error, so this pins the refusal, not which of the two lines makes it.)
+        match l.validate_aggregate(&replay, &sidecar[&0], &StubExecutor) {
+            Err(TxError::Aggregation(AggregationError::CoverNotCoverable(h))) if h == c1.hash() => {}
+            other => panic!("expected admission to refuse the sealed cover by name, got {:?}", other.map(|_| ())),
+        }
         let block = unchecked_block(&l, vec![replay], &a, 3);
         match l.apply_block_with_covered(&block, &sidecar, &StubExecutor) {
             Err(crate::ledger::BlockError::InvalidTx {
