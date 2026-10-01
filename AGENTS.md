@@ -156,6 +156,42 @@ push to origin/main often"): five current validators become delegated provers be
   merges; it holds PRIVACY.md and the store texts), the trusted prover stacked as
   `feat/trusted-prover` for a client 0.6.7.
 
+### Chain 20 — PLANNED (not cut; scripts on `feat/chain20-cut`, 2026-10-01; nothing run against the fleet)
+
+Cut **from a snapshot of chain 19** (`a3defc93…228a`, file sha256 `92e46bc0…46e0`) the way chain 19
+was cut from chain 18 — the same 26 validators and keys, the zUSD carry, operator RAND from a
+`balances` scan, chain 19's bridge state and **its emitters unchanged** (the 2026-09-30 endpoints;
+the 2026-09-19 ones refused outright) — on the coming **v0.6.8** build (main + RPL-2; RPL-2 is not
+on main yet). Chain 19's shape plus, each at docs/deploy.md's recommended value:
+
+- top-level `testnet: true` (required: faucet beside a bridge past chain 19), `binding_domain: 1`,
+  `proof_window_blocks: 1024`;
+- `gas.dynamic` + `max_gas_price "10000"`, `max_byte_price "80000"`, `byte_load "paying"`;
+- `bridge.rotation {delay_secs: 86400, needs_possession: true}` (spliced; no flag);
+- `staking`: chain 19's with `max_stake_entry_per_epoch` replaced by `max_stake_entry_bps_per_epoch:
+  2500`, plus `admission_by_vote: true`; **no `slashing`** (recommended only once stake is held by
+  more than one operator);
+- RPL-2 `program_state {cell_fee: 10000000}` (0.01 RAND; `docs/program-state.md` on `feat/rpl2`);
+- no `vesting`, no `aggregation`.
+
+Scripts: **`deploy/cut-chain20-genesis.sh`** (asserts every field; a field probe re-derives the hash
+with each new field removed and refuses if it does not move; `check-limits <rpc> <genesis>` reads
+`rand_getLimits`/`rand_getBridgeState` back after launch; OPS-7 `refuse_reused_chain_id` +
+`require_cut_record "$CUT_RECORD"`; floors `auto` = next sequence, explicit via `MIN_INBOUND_<c>` or
+`MIN_INBOUND_FILE`, refused below 1 on chains 2–4; `balances` rescans from leaf 0 and requires
+`relayer.key.json` in the curated dir; the tunnel is curl-checked before `snapshot`/`balances`; the
+real cut refuses a `rand-node` without `--program-state-cell-fee` or not 0.6.8) — `SELFTEST=1` 81/81,
+`DRY_RUN=1` passes on main's build with program_state **skipped loudly** (main lacks the flag) and a
+loopback probe node serving every new field. **`deploy/cutover-fleet-chain20.sh`** (all-stop/all-start
+— v0.6.8 carries CON-4/CH-1; `TAG v0.6.8`; `stage` from the release, a private `STAGE_URL`, or a
+local `STAGE_DIR` with sha checks; `*.pre-c20` kept only if they are the v0.6.7 release binaries;
+`push` needs the cut record's `second-hash`; `rollback` restores units and binaries) —
+**`deploy/rehearse-cutover-fleet-chain20.sh`** 70/70 against 26 fake hosts. **`deploy/chain20-bridge-steps.md`**:
+the relayer (droplet `rand-relayer-1`) needs a Linux v0.6.8 `rand`; `rand-bridge-gov` must sign the
+`…-2` governance layouts; the mint co-signature is unchanged; wallets/clients need v0.6.8.
+Before the cut: re-run `DRY_RUN=1` with the v0.6.8 build (the program_state path has never run end
+to end), pin `WANT_SHA`/`WANT_SHA_WALLET`, and add `chain_20s_genesis_file_builds_chain_20` after.
+
 ### Chain 19 — cut scripts PREPARED 2026-09-30 (branch `feat/chain19-cut`; NOT cut, nothing rolled, no genesis file yet)
 
 A **pure re-genesis of chain 18 on the same build** (v0.6.7, constraint set 8): the same shape, 26

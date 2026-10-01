@@ -1281,7 +1281,7 @@ served as `rand_getLimits.proof_window_blocks`.
 --proof-window-blocks 1024`, or `"proof_window_blocks": 1024` spliced in): ~20 minutes at
 1.17 s blocks, room for any prover the pool or a user runs, while a stale anchor still dies within
 the hour. Chain 19 (v0.6.7, being cut now) carries no field and stays 256/256. The chain-20 cut
-script (not written yet) should assert the field is present and `rand_getLimits.proof_window_blocks == 1024` after launch. Every validator
+script (`deploy/cut-chain20-genesis.sh`) asserts the field, and its `check-limits` step reads `rand_getLimits.proof_window_blocks == 1024` back after launch. Every validator
 must run a build that knows the field before a genesis carries it — a v0.6.7 node does not parse
 it (and would compute a different genesis hash).
 
