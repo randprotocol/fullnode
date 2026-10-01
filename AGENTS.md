@@ -197,6 +197,11 @@ the 2026-09-19 ones refused outright) — on **v0.6.8** (main since `4b6233e2`, 
   2500`, plus `admission_by_vote: true`; **no `slashing`** (recommended only once stake is held by
   more than one operator);
 - RPL-2 `program_state {cell_fee: 10000000}` (0.01 RAND; `docs/program-state.md` on `feat/rpl2`);
+- `bridge.fees {mint_bps: 10, burn_bps: 10, recipient}` (docs/bridge.md §25, the user's decision):
+  the recipient is the user's own wallet, read from `~/.rand-chain20/fee-recipient-address.txt` and
+  refused unless the `rand` binary computes fingerprint `89DS-4Q4X-HXSX-MBYW`; at the cut bridge-fa
+  sets the endpoints' own protocol fee to 0 (Tron by EOA before 2026-10-03 04:24 UTC, else a 48-h
+  timelock op) and the guardians release the burn body's `release_amount`;
 - no `vesting`, no `aggregation`.
 
 Scripts: **`deploy/cut-chain20-genesis.sh`** (asserts every field; a field probe re-derives the hash
@@ -205,10 +210,10 @@ with each new field removed and refuses if it does not move; `check-limits <rpc>
 `require_cut_record "$CUT_RECORD"`; floors `auto` = next sequence, explicit via `MIN_INBOUND_<c>` or
 `MIN_INBOUND_FILE`, refused below 1 on chains 2–4; `balances` rescans from leaf 0 and requires
 `relayer.key.json` in the curated dir; the tunnel is curl-checked before `snapshot`/`balances`; the
-real cut refuses a `rand-node` without `--program-state-cell-fee` or not 0.6.8) — `SELFTEST=1` 81/81,
-`DRY_RUN=1` passes on the v0.6.8 build (`rand-node 0.6.8` from main at `9115638b`): all 10 new fields,
-program_state included, move the genesis hash in the field probe, and a loopback probe node serves
-every one (`rand_getLimits.program_state.cell_fee "10000000"`). **`deploy/cutover-fleet-chain20.sh`** (all-stop/all-start
+real cut refuses a `rand-node` without `--program-state-cell-fee` or not 0.6.8) — `SELFTEST=1` 93/93,
+`DRY_RUN=1` passes on the v0.6.8 build (`rand-node 0.6.8` from main at `01389adb`): all 11 new fields,
+program_state and bridge.fees included, move the genesis hash in the field probe, and a loopback probe node serves
+every one (`rand_getLimits.program_state.cell_fee "10000000"`, `rand_getBridgeState.fees`). **`deploy/cutover-fleet-chain20.sh`** (all-stop/all-start
 — v0.6.8 carries CON-4/CH-1; `TAG v0.6.8`; `stage` from the release, a private `STAGE_URL`, or a
 local `STAGE_DIR` with sha checks; `*.pre-c20` kept only if they are the v0.6.7 release binaries;
 `push` needs the cut record's `second-hash`, or `SECOND_REBUILD_WAIVED=1`, which prints what is

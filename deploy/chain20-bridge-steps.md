@@ -36,6 +36,29 @@ What is different from chain 19:
     and `DEFAULT_CHAIN_ID` → 20), randscan (the new `rand_getLimits` fields, `rand_getAdmitted`,
     `invoke` transactions) and the website's WASM. A v0.6.7-line wallet signs nothing chain 20
     accepts. This is the cut record's `clients:` line.
+- **The zUSD bridge fee moves on chain: genesis `bridge.fees: {mint_bps: 10, burn_bps: 10,
+  recipient}`** (`docs/bridge.md` §25; the user's decision 2026-10-01). The fee is taken in zUSD,
+  on Rand, as a shielded note to `recipient` — the user's own wallet, fingerprint
+  `89DS-4Q4X-HXSX-MBYW` (the cut reads `~/.rand-chain20/fee-recipient-address.txt` and refuses any
+  other fingerprint). 1 USDT in → 0.999 zUSD to the depositor, 0.001 zUSD to the treasury; a burn
+  of `amount` keeps `⌊amount·10/10⁴⌋` (rounded down to a whole release unit) and releases the rest.
+  Three things follow on the bridge side:
+  - **At the cut, the endpoints' own protocol fee goes to 0**, so a transfer is not charged twice
+    (the 10 bps skim of USDT on release that the endpoints take today). bridge-fa does it:
+    Ethereum, BNB Chain and Solana by their admin key; **Tron by its EOA before 2026-10-03 04:24
+    UTC**, or after that through a 48-hour timelock operation (schedule it 48 h ahead of the cut).
+    Check each endpoint reads 0 before the bridge reopens on chain 20.
+  - **Guardians release the burn body's amount, which is now `release_amount`** (`amount − fee`;
+    `rand_getBridgeBurn` serves `amount`, `release_amount` and `fee`). The guardians sign and the
+    endpoint releases exactly the body's amount — a guardian or relayer that recomputes the release
+    from the burn transaction's `amount` would sign 0.1 % too much and the chain-side `locked`
+    would no longer match custody. The relayer's own release `fee` must fit inside
+    `release_amount` (`FeeExceedsAmount`).
+  - **The relayer needs a v0.6.8 `rand`** (above, and for the fee too): `rand bridge-mint` seals the
+    depositor's envelope for the NET amount on a fee chain; a v0.6.7 one would seal the gross.
+  The supply rule is unchanged: a deposit locks and issues the gross (both notes are backed), a
+  burn unlocks and destroys only `release_amount` (the fee note stays issued and backed), so
+  `total_supply == Σ locked == custody` still holds after every mint and release.
 - **The emitters do not change.** Chain 20 trusts exactly chain 19's `bridge.emitters` — the
   2026-09-30 Ethereum / BNB Chain / Tron endpoints and the unchanged Solana program — and the
   same Rand-side `bridge.emitter`. `cut-chain20-genesis.sh` defaults to them, checks them against
@@ -84,14 +107,19 @@ What is different from chain 19:
 | Guardian set index | 1 | chain 19's live value (1 unless rotated) |
 | Floors `min_inbound_sequence` | `{2: 1, 3: 1, 4: 1, 5: 4}` | each endpoint's next sequence at the snapshot (= last minted + 1), never below chain 19's, never below 1 on 2/3/4; `{2: 1, 3: 1, 4: 1, 5: 4}` expected if nothing was locked on chain 19 |
 | `bridge.rotation` | absent | `{delay_secs: 86400, needs_possession: true}` |
+| `bridge.fees` | absent | `{mint_bps: 10, burn_bps: 10, recipient: <fingerprint 89DS-4Q4X-HXSX-MBYW>}` |
+| endpoints' protocol fee (on release) | 10 bps | **0** — set by bridge-fa at the cut (Tron: EOA before 2026-10-03 04:24 UTC, else a 48-h timelock op) |
 | zUSD locked | Solana USDT 10 | chain 19's per-backing `locked` at the snapshot == source custody |
 | zUSD carry | `~/.rand-chain19/zusd-carry.txt` | `~/.rand-chain20/zusd-carry.txt` (the same one line, 10 zUSD to the same third-party address, unless it moved), Σ == Σ locked |
 
 ## Order at the cut (with the fleet runbook)
 
 0. Before anything: the v0.6.8 Linux `rand` is built and its sha256 known (the fleet's
-   `WANT_SHA_WALLET`); `rand-bridge-gov` signs the `…-2` layouts; the clients' v0.6.8 builds are
-   ready (the cut record's `clients:` line).
+   `WANT_SHA_WALLET`); `rand-bridge-gov` signs the `…-2` layouts; the guardian daemons and the
+   relayer release the burn body's `release_amount`; the clients' v0.6.8 builds are ready (the cut
+   record's `clients:` line); bridge-fa has the endpoints' protocol-fee change ready — on Tron
+   either done by the EOA before 2026-10-03 04:24 UTC or its 48-hour timelock operation scheduled
+   to land at the cut.
 1. `stop` — before the snapshot, so no mint or release can move chain 19 after it is read (the
    template's stop step, with these hosts):
    ```
@@ -111,6 +139,8 @@ What is different from chain 19:
    rand-relayer-1's done/>`) → the second operator's `second-hash` → `push` → `switch` (refuses a
    guardian host whose `rand-guardian` is still active) → `start` → `wait` → `check-limits`. Each
    phase alone, its `$?` read before the next.
+2b. bridge-fa: set the protocol fee to 0 on the four endpoints (Ethereum, BNB Chain, Solana by
+   admin; Tron by EOA or the timelock op), and read each back as 0, while the daemons are stopped.
 3. `droplet <1..6>` — on each guardian host, once its node answers `rand_getGenesisHash` with the
    chain-20 hash and `rand_getHealth` ok (the fleet's `wait` phase):
    ```
@@ -140,10 +170,13 @@ What is different from chain 19:
 7. Audit — `rand-bridge-audit` against chain 20 and the four endpoints: `total_supply` == Σ
    `locked` == endpoint custody; `rand_getBridgeState` shows chain 19's `emitters`, the floors the
    cut printed, `burn_sequence`, and `rotation_rules {delay_secs: 86400, needs_possession: true}`
-   (`check-limits` reads the same). The carried zUSD holder opens his note with a **v0.6.8** wallet
+   and `fees {mint_bps: 10, burn_bps: 10, recipient}` (`check-limits` reads the same); each
+   endpoint's protocol fee reads 0. The carried zUSD holder opens his note with a **v0.6.8** wallet
    (`rand asset-balance 1`).
 8. Then: one 1 USDT round trip on one endpoint (the first real proof under `binding_domain: 1`
-   through the relayer); re-make the kept-ready pause file for chain 20 with `rand-bridge-gov`.
+   through the relayer): the deposit leaves 0.999 zUSD with the depositor and 0.001 with the
+   treasury (its `rand balance` after a sync, v0.6.8 wallet); the burn releases `release_amount`
+   and the endpoint takes no fee of its own; re-make the kept-ready pause file for chain 20 with `rand-bridge-gov`.
 
 ## Rollback (chain 19 again)
 
@@ -151,6 +184,8 @@ Stop the daemons; restore `rand-guardian.toml.chain19` and `cursors.chain19` on 
 the relayer's toml and cursors on `rand-relayer-1` **and its v0.6.7 `rand`**
 (`/usr/local/bin/rand.pre-c20` → `/usr/local/bin/rand`, sha-checked), the laptop guardians' tomls
 and cursors; the fleet restores its units and binaries (`cutover-fleet-chain20.sh rollback`, then
-`start`). Start as in step 6. Chain 19 resumes at the height it stopped at with `burn_sequence` and
+`start`). Start as in step 6. **Chain 19 has no `bridge.fees`**: restore the endpoints' protocol fee
+to 10 bps (bridge-fa; Tron through the timelock if the EOA window has passed) before the bridge
+reopens there, or chain-19 transfers go uncharged. Chain 19 resumes at the height it stopped at with `burn_sequence` and
 `locked` as the snapshot read them — provided nothing was minted or released on chain 20 in
 between (a release paid out on a source chain for a chain-20 burn has no burn on chain 19).

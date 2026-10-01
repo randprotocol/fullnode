@@ -46,6 +46,14 @@
 #         value docs/program-state.md on feat/rpl2 gives: 0.01 RAND a created cell). The flag
 #         exists only on a build carrying RPL-2: the real cut REFUSES a rand-node without it;
 #         DRY_RUN skips the section, LOUDLY, when the binary in hand lacks it (main today).
+#       - `bridge.fees: {mint_bps: 10, burn_bps: 10, recipient: <rand1…>}` (docs/bridge.md §25,
+#         docs/deploy.md "The next cut: `bridge.fees`"; the user's decision 2026-10-01): the zUSD
+#         bridge fee taken in zUSD on Rand, both ways, as a shielded note to `recipient`. Spliced
+#         beside `rotation` (no flag). The recipient is the user's own wallet, read from
+#         FEE_RECIPIENT_FILE (default ~/.rand-chain20/fee-recipient-address.txt) and refused unless
+#         its fingerprint — computed by the WALLET binary (`rand contacts add`, under a throwaway
+#         key in a temp dir) — is FEE_RECIPIENT_FINGERPRINT (default 89DS-4Q4X-HXSX-MBYW). A
+#         validator's payout address is refused as the recipient (FEE_RECIPIENT_IS_PAYOUT_OK=1).
 #       - No `vesting` section (chain 19 has none; one there is refused), no `aggregation`.
 #   * THE BRIDGE IS CHAIN 19'S, NOT RE-DEPLOYED: EMITTER_2..5 default to chain 19's genesis
 #     `bridge.emitters` (the 2026-09-30 endpoints; Solana unchanged), checked against
@@ -213,6 +221,11 @@ ROTATION_DELAY_SECS=${ROTATION_DELAY_SECS:-86400}
 ROTATION_NEEDS_POSSESSION=${ROTATION_NEEDS_POSSESSION:-true}
 PROGRAM_STATE_CELL_FEE=${PROGRAM_STATE_CELL_FEE:-10000000}   # 0.01 RAND a created cell: docs/program-state.md (feat/rpl2 6f5a4708)
 PROGRAM_STATE_SKIPPED=${PROGRAM_STATE_SKIPPED:-}             # set by DRY_RUN only, when the binary lacks RPL-2
+BRIDGE_MINT_BPS=${BRIDGE_MINT_BPS:-10}                       # docs/deploy.md "The next cut: bridge.fees": 0.1 % each way
+BRIDGE_BURN_BPS=${BRIDGE_BURN_BPS:-10}
+FEE_RECIPIENT_FILE=${FEE_RECIPIENT_FILE:-$HOME/.rand-chain20/fee-recipient-address.txt}   # the user's own wallet (one rand1… line)
+FEE_RECIPIENT_FINGERPRINT=${FEE_RECIPIENT_FINGERPRINT:-89DS-4Q4X-HXSX-MBYW}
+FEE_RECIPIENT=${FEE_RECIPIENT:-}                             # set by load_fee_recipient (the selftest sets a fixture)
 
 export CHAIN_ID CHAIN19_GENESIS CHAIN19_HASH CHAIN19_GENESIS_SHA256 CHAIN19_RPC VALIDATORS_TSV REGISTRATIONS BONDED GENESIS_NAMES \
   FAUCET_MINTERS FAUCET_RECIPIENTS STAKE_RAND ALLOC_ADDRESSES ZUSD_CARRY WALLETS_DIRS RELAYER_DONE_DIR EXPECT_HC_BUNDLE \
@@ -221,7 +234,8 @@ export CHAIN_ID CHAIN19_GENESIS CHAIN19_HASH CHAIN19_GENESIS_SHA256 CHAIN19_RPC 
   C19_EMITTER_4 C19_EMITTER_5 OLD_EMITTERS EXPECT_FLOORS EXPECT_BURN_SEQUENCE MIN_INBOUND_2 MIN_INBOUND_3 MIN_INBOUND_4 MIN_INBOUND_5 \
   ETH_RPC BSC_RPC TRON_API SOL_RPC SOL_PROGRAM GAS_PRICE BYTE_PRICE BUNDLE_GAS_LIMIT GAS_DYNAMIC MAX_GAS_PRICE MAX_BYTE_PRICE \
   GAS_BYTE_LOAD ENVELOPE_BYTES BINDING_DOMAIN PROOF_WINDOW_BLOCKS STAKE_ENTRY_BPS ROTATION_DELAY_SECS ROTATION_NEEDS_POSSESSION \
-  PROGRAM_STATE_CELL_FEE PROGRAM_STATE_SKIPPED BALANCES_RESCAN
+  PROGRAM_STATE_CELL_FEE PROGRAM_STATE_SKIPPED BALANCES_RESCAN BRIDGE_MINT_BPS BRIDGE_BURN_BPS FEE_RECIPIENT \
+  FEE_RECIPIENT_FINGERPRINT
 
 # Decimal RAND/zUSD text → base units, the exact rule of `parse_amount` (no float anywhere).
 # shellcheck disable=SC2089,SC2090  # python source in a string, exported whole, never word-split
@@ -259,6 +273,25 @@ need_chain19_rpc() {
   [ -n "$got" ] || { echo "cut-chain20: $CHAIN19_RPC is not answering — the SSH tunnel to obs1 is down? Re-open it (ssh -N -L 8545:127.0.0.1:8545 root@<obs1>) and re-run; nothing was read" >&2; exit 1; }
   [ "$got" = "$CHAIN19_HASH" ] || { echo "cut-chain20: $CHAIN19_RPC serves genesis $got, not chain 19 ($CHAIN19_HASH)" >&2; exit 1; }
   echo "cut-chain20: $CHAIN19_RPC answers as chain 19 ($(date -u +%T))"
+}
+
+# The fee recipient: one rand1… address from FEE_RECIPIENT_FILE whose fingerprint, as the WALLET
+# binary computes it, is FEE_RECIPIENT_FINGERPRINT. `rand contacts add` prints an address's
+# fingerprint; it runs under a throwaway --key in a temp dir (it writes only <key>.contacts.json).
+load_fee_recipient() {
+  local d got
+  [ -f "$FEE_RECIPIENT_FILE" ] || { echo "cut-chain20: no fee recipient file $FEE_RECIPIENT_FILE (the user's wallet address, one rand1… line)" >&2; exit 1; }
+  FEE_RECIPIENT=$(tr -d ' \t\r\n' < "$FEE_RECIPIENT_FILE")
+  case "$FEE_RECIPIENT" in rand1*) ;; *) echo "cut-chain20: $FEE_RECIPIENT_FILE does not hold a rand1… address" >&2; exit 1;; esac
+  [ "$(wc -l < "$FEE_RECIPIENT_FILE" | tr -d ' ')" -le 1 ] || { echo "cut-chain20: $FEE_RECIPIENT_FILE holds more than one line" >&2; exit 1; }
+  [ -x "$WALLET" ] || { echo "cut-chain20: WALLET=$WALLET is not executable — it computes the fee recipient's fingerprint" >&2; exit 1; }
+  d=$(mktemp -d)
+  got=$("$WALLET" --key "$d/fingerprint-only.key.json" contacts add fee-recipient "$FEE_RECIPIENT" --yes 2>&1 | sed -n 's/^fingerprint \([0-9A-Z-]*\)$/\1/p' | head -1 || true)
+  rm -rf "$d"
+  [ -n "$got" ] || { echo "cut-chain20: $WALLET printed no fingerprint for the fee recipient in $FEE_RECIPIENT_FILE (not a shielded address?)" >&2; exit 1; }
+  [ "$got" = "$FEE_RECIPIENT_FINGERPRINT" ] || { echo "cut-chain20: the fee recipient in $FEE_RECIPIENT_FILE has fingerprint $got, not FEE_RECIPIENT_FINGERPRINT $FEE_RECIPIENT_FINGERPRINT — refusing (the wrong wallet would collect every bridge fee for the chain's life)" >&2; exit 1; }
+  export FEE_RECIPIENT
+  echo "cut-chain20: bridge fee recipient: ${#FEE_RECIPIENT}-char address from $FEE_RECIPIENT_FILE, fingerprint $got (= FEE_RECIPIENT_FINGERPRINT)"
 }
 
 # ══ snapshot: read-only reads of chain 19 and of the source endpoints ═════════════════════════
@@ -651,6 +684,7 @@ g["bridge"] = {
     "burn_sequence": int(sb["burn_sequence"]),
     "min_inbound_sequence": floor,
     "rotation": rotation,
+    "fees": {"mint_bps": int(E["BRIDGE_MINT_BPS"]), "burn_bps": int(E["BRIDGE_BURN_BPS"]), "recipient": E["FEE_RECIPIENT"]},
 }
 
 # ── tokens: zUSD at genesis, locked = chain 19's per backing == custody == supply ───────────────
@@ -830,6 +864,16 @@ need("max_stake_entry_per_epoch" not in st, "staking still carries the fixed max
 need("slashing" not in st, "staking.slashing is present — recommended only once stake is held by more than one operator (docs/deploy.md, D8)")
 # the bridge rotation rules
 need(g["bridge"].get("rotation") == {"delay_secs": 86400, "needs_possession": True}, f"bridge.rotation is {g['bridge'].get('rotation')!r}, not {{delay_secs: 86400, needs_possession: true}}")
+# the zUSD bridge fees (docs/bridge.md §25)
+fees = g["bridge"].get("fees") or {}
+need(E.get("FEE_RECIPIENT", "").startswith("rand1"), "FEE_RECIPIENT is unset — load_fee_recipient did not run")
+need(fees == {"mint_bps": 10, "burn_bps": 10, "recipient": E["FEE_RECIPIENT"]},
+     f"bridge.fees is {({k: (v if k != 'recipient' else v[:12] + '…') for k, v in fees.items()})!r}, not {{mint_bps: 10, burn_bps: 10, recipient: <FEE_RECIPIENT>}}")
+payouts = {v["payout"] for v in g["validators"]}
+need(fees["recipient"] not in payouts or E.get("FEE_RECIPIENT_IS_PAYOUT_OK"),
+     "bridge.fees.recipient is a validator's payout address — docs/deploy.md: a dedicated key, never a validator's (FEE_RECIPIENT_IS_PAYOUT_OK=1 to accept)")
+if fees["recipient"] in {a for _, a, _ in alloc}:
+    warnings.append("the bridge fee recipient is also a carried RAND wallet (an alloc) — its viewing key sees every fee note")
 need(g["epoch_blocks"] == int(E["EPOCH_BLOCKS"]) == g19["epoch_blocks"], "epoch_blocks is not chain 19's")
 need(len(g["validators"]) == 26 and all(v["stake"] == int(E["STAKE_RAND"]) * 10**9 for v in g["validators"]), "validators wrong")
 need([v["public_key"] for v in g["validators"]] == [vals[n]["public_key"] for n in vals], "validator order/keys wrong")
@@ -858,7 +902,7 @@ if not (E.get("FAUCET_RECIPIENTS_CHANGED") or E.get("FAUCET_MINTERS_CHANGED")):
     need(st == want_staking, f"staking is not chain 19's with the bps budget and admission by vote: "
          f"{sorted(k for k in set(st) | set(want_staking) if st.get(k) != want_staking.get(k))} differ")
 bridge_moved = sorted(k for k in set(g["bridge"]) | set(b19)
-                      if k not in ("burn_sequence", "min_inbound_sequence", "rotation") and g["bridge"].get(k) != b19.get(k))
+                      if k not in ("burn_sequence", "min_inbound_sequence", "rotation", "fees") and g["bridge"].get(k) != b19.get(k))
 need(not bridge_moved or rotated or (bridge_moved == ["emitters"] and E.get("EMITTERS_CHANGED")),
      f"bridge fields {bridge_moved} differ from chain 19's genesis (BRIDGE_ROTATED=1 carries a live rotation)")
 strip_locked = lambda toks: [{**t, "backings": [{k: v for k, v in b.items() if k != "locked"} for b in t["backings"]]} for t in toks]
@@ -873,6 +917,7 @@ print(f"cut-chain20: spliced bridge (set {g['bridge']['guardian_set_index']}, bu
       f"emitters = chain 19's{' (CHANGED: ' + ','.join(changed) + ')' if changed else ''}, rotation {rotation}); "
       f"zUSD locked {locked_total} == notes {notes_total} == chain 19 supply == custody ({len(token_notes)} note(s)); "
       f"RAND allocs Σ {alloc_total} {rand_carry}; staking ({len(recipients)} recipients, {len(minters)} minters, entry 2500 bps, admission by vote, no slashing); "
+      f"bridge fees {fees['mint_bps']}/{fees['burn_bps']} bps to {fees['recipient'][:10]}…; "
       f"testnet, binding_domain 1, proof_window_blocks 1024; gas {gas['gas_price']}/{gas['byte_price']} ceilings {dyn['max_gas_price']}/{dyn['max_byte_price']}, byte load {dyn['byte_load']}; "
       f"program_state {g.get('program_state', 'SKIPPED')}; every other field equal to chain 19's genesis")
 print("cut-chain20: zUSD locked per backing: " + (", ".join(f"{b['chain']}:{b['token'][-8:]}={b['locked']}" for b in backings if b.get("locked")) or "none"))
@@ -905,6 +950,7 @@ drop("gas.dynamic.max_gas_price", ["gas", "dynamic", "max_gas_price"])
 drop("gas.dynamic.max_byte_price", ["gas", "dynamic", "max_byte_price"])
 drop("gas.dynamic.byte_load", ["gas", "dynamic", "byte_load"])
 drop("bridge.rotation", ["bridge", "rotation"])
+drop("bridge.fees", ["bridge", "fees"])
 drop("staking.admission_by_vote", ["staking", "admission_by_vote"])
 v = copy.deepcopy(g); del v["staking"]["max_stake_entry_bps_per_epoch"]
 v["staking"]["max_stake_entry_per_epoch"] = g19["staking"]["max_stake_entry_per_epoch"]
@@ -977,6 +1023,7 @@ want("bridge emitters", B.get("emitters"), gen["bridge"]["emitters"])
 want("bridge min_inbound_sequence", {str(k): v for k, v in (B.get("min_inbound_sequence") or {}).items()}, gen["bridge"]["min_inbound_sequence"])
 want("bridge burn_sequence", B.get("burn_sequence"), gen["bridge"]["burn_sequence"])
 want("bridge rotation_rules", B.get("rotation_rules"), {"delay_secs": 86400, "needs_possession": True})
+want("bridge fees", B.get("fees"), {"mint_bps": 10, "burn_bps": 10, "recipient": gen["bridge"]["fees"]["recipient"]})
 if bad:
     sys.exit(f"check-limits: {url} does NOT serve chain 20 as cut: {', '.join(bad)}")
 print(f"check-limits: {url} serves chain 20 as cut ({len(L)} limits read)")
@@ -1113,7 +1160,7 @@ PY
 # ══ SELFTEST: the python steps on fixtures derived from deploy/genesis-chain19.json ════════════
 if [ "${SELFTEST:-}" = 1 ]; then
   ST=$(mktemp -d); FAKE_RPC_PID=; trap 'rm -rf "$ST"; [ -z "$FAKE_RPC_PID" ] || kill "$FAKE_RPC_PID" 2>/dev/null || true' EXIT
-  export ST FIXTURE_MODE=selftest
+  export ST FIXTURE_MODE=selftest FEE_RECIPIENT=rand1SELFTESTfeerecipient
   py_fixtures
   NEW_EMITTER=$(printf '0%.0s' $(seq 63))1
   export SNAPSHOT_FILE=$ST/snap/chain19-state.json BALANCES_FILE=$ST/snap/balances.json CHAIN19_GENESIS=$ST/genesis-chain19.json \
@@ -1139,6 +1186,8 @@ d = g["gas"]["dynamic"]
 assert (d["max_gas_price"], d["max_byte_price"], d["byte_load"]) == ("10000", "80000", "paying")
 assert {k: v for k, v in d.items() if k not in ("max_gas_price", "max_byte_price", "byte_load")} == g19["gas"]["dynamic"]
 assert g["bridge"]["rotation"] == {"delay_secs": 86400, "needs_possession": True}
+assert g["bridge"]["fees"] == {"mint_bps": 10, "burn_bps": 10, "recipient": "rand1SELFTESTfeerecipient"}
+assert list(g["bridge"])[-2:] == ["rotation", "fees"]
 assert g["bridge"]["emitters"] == g19["bridge"]["emitters"] and g["bridge"]["min_inbound_sequence"] == {"2": 1, "3": 1, "4": 1, "5": 4}
 assert g["bridge"]["burn_sequence"] == 8 and g["bridge"]["guardian_set_index"] == 1
 s = g["staking"]
@@ -1151,7 +1200,7 @@ assert g["validators"] == g19["validators"] and g["consensus_domain"] == 1
 assert sum(n["amount"] for n in g["alloc"] if n["opening"].get("asset", 0) == 0) == sum(n["amount"] for n in g19["alloc"] if n["opening"].get("asset", 0) == 0)
 assert all(sum(len(v) // 2 for v in n["envelope"].values()) == 1860 for n in g["alloc"])
 PY
-    then ok "the chain-19 fixture assembles into a chain-20 genesis (testnet, binding_domain 1, proof_window_blocks 1024, gas ceilings 10000/80000 + paying, bridge.rotation 86400/possession, staking 2500 bps + admission by vote and no slashing, program_state cell_fee 10000000, chain 19's emitters, floors 1/1/1/4, burn sequence 8, locked Solana USDT 10, chain 19's validators and allocs)"; else bad "assembled genesis content"; fi
+    then ok "the chain-19 fixture assembles into a chain-20 genesis (bridge.fees 10/10 bps to the recipient, testnet, binding_domain 1, proof_window_blocks 1024, gas ceilings 10000/80000 + paying, bridge.rotation 86400/possession, staking 2500 bps + admission by vote and no slashing, program_state cell_fee 10000000, chain 19's emitters, floors 1/1/1/4, burn sequence 8, locked Solana USDT 10, chain 19's validators and allocs)"; else bad "assembled genesis content"; fi
   else bad "the happy path refused"; fi
   cp "$ST/out.json" "$ST/good.json"
 
@@ -1195,6 +1244,10 @@ PY
   refuse "a cell fee env off docs"           "$B" 'd["program_state"]["cell_fee"] = 5' "docs/program-state.md's 10000000" PROGRAM_STATE_CELL_FEE=5
   refuse "a rotation delay off 86400"        "$S" 'pass' "bridge.rotation is" ROTATION_DELAY_SECS=3600
   refuse "rotation without possession"       "$S" 'pass' "bridge.rotation is" ROTATION_NEEDS_POSSESSION=false
+  refuse "a mint fee off 10 bps"             "$S" 'pass' "bridge.fees is" BRIDGE_MINT_BPS=30
+  refuse "a burn fee off 10 bps"             "$S" 'pass' "bridge.fees is" BRIDGE_BURN_BPS=0
+  refuse "no fee recipient loaded"           "$S" 'pass' "load_fee_recipient did not run" FEE_RECIPIENT=
+  refuse "a validator payout as fee recipient" "$S" 'pass' "a validator's payout address" FEE_RECIPIENT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["validators"][0]["payout"])' "$ST/genesis-chain19.json")"
   refuse "a stake entry budget off 2500 bps" "$S" 'pass' "not 2500" STAKE_ENTRY_BPS=3333
   refuse "slashing in chain 19's staking"    "$G" 'd["staking"]["slashing"] = {"equivocation_bps": 500, "jail_epochs": 2}' "carries none"
   refuse "a vesting section on chain 19"     "$G" 'd["vesting"] = {"entries": []}' "vesting section"
@@ -1262,7 +1315,8 @@ json.dump({"rand_getGenesisHash": "ab" * 32,
                               "hardening_v6": True, "hc_auth": g["hc_auth"],
                               "program_state": {"cell_fee": str(g["program_state"]["cell_fee"]), "max_reads": 8, "max_writes": 8, "max_payouts": 4}},
            "rand_getBridgeState": {"emitters": g["bridge"]["emitters"], "min_inbound_sequence": g["bridge"]["min_inbound_sequence"],
-                                   "burn_sequence": g["bridge"]["burn_sequence"], "rotation_rules": {"delay_secs": 86400, "needs_possession": True}}},
+                                   "burn_sequence": g["bridge"]["burn_sequence"], "rotation_rules": {"delay_secs": 86400, "needs_possession": True},
+                                   "fees": g["bridge"]["fees"]}},
           open(sys.argv[2], "w"))
 PY
   fake_rpc "$ST/answers.json" "$ST/port"
@@ -1271,7 +1325,7 @@ PY
     ok "check-limits accepts a node serving chain 20 as cut ($(grep -c '^check-limits:   ' "$ST/log") values read)"
   else bad "check-limits on a correct node: $(tail -3 "$ST/log")"; fi
   for m in 'L["proof_window_blocks"] = 256' 'L["binding_domain"] = 0' 'L["testnet"] = False' 'L["admission_by_vote"] = False' \
-           'L["byte_load"] = None' 'L["max_gas_price"] = None' 'L["program_state"] = None' 'B["rotation_rules"] = None' 'B["min_inbound_sequence"]["2"] = 0'; do
+           'L["byte_load"] = None' 'L["max_gas_price"] = None' 'L["program_state"] = None' 'B["rotation_rules"] = None' 'B["min_inbound_sequence"]["2"] = 0' 'B["fees"] = None' 'B["fees"]["burn_bps"] = 20'; do
     cp "$ST/answers.json" "$ST/answers.keep"
     python3 -c "import json,sys; p=sys.argv[1]; a=json.load(open(p)); L=a['rand_getLimits']; B=a['rand_getBridgeState']; $m; json.dump(a, open(p,'w'))" "$ST/answers.json"
     if CHECK_RPC=$RPC CHECK_GENESIS=$ST/good.json EXPECT_GENESIS_HASH=$(printf 'ab%.0s' $(seq 32)) py_check_limits >"$ST/log" 2>&1; then bad "check-limits accepted a node with $m"
@@ -1313,6 +1367,22 @@ PY
   bash_refuses "balances without the relayer's key file" "relayer.key.json is in none of" WALLETS_DIRS="$ST/wd" WALLET=/usr/bin/true ALLOC_ADDRESSES="$ST/none.txt" CHAIN19_RPC=http://127.0.0.1:9 -- balances "$ST/snap-bal"
   echo '{}' > "$ST/wd/relayer.key.json"
   bash_refuses "balances on a dead tunnel (relayer present)" "is not answering" WALLETS_DIRS="$ST/wd" WALLET=/usr/bin/true ALLOC_ADDRESSES="$ST/none.txt" CHAIN19_RPC=http://127.0.0.1:9 -- balances "$ST/snap-bal"
+  # the fee recipient's fingerprint, computed by WALLET: a fake `rand` that prints one
+  printf '#!/usr/bin/env bash\necho "fingerprint ${FAKE_FP:-89DS-4Q4X-HXSX-MBYW}"\necho saved\n' > "$ST/fake-rand"; chmod +x "$ST/fake-rand"
+  echo "rand1SELFTESTfeerecipient" > "$ST/fee-ok.txt"; echo "not-an-address" > "$ST/fee-bad.txt"; printf 'rand1a\nrand1b\n' > "$ST/fee-two.txt"
+  fp_case() {  # <description> <want ok|refuse> <phrase> <env…>
+    local what=$1 want=$2 phrase=$3; shift 3
+    if env "$@" bash -c 'WALLET=$FAKE_WALLET; load_fee_recipient' >"$ST/log" 2>&1; then r=ok; else r=refuse; fi
+    if [ "$r" = "$want" ] && grep -qF -- "$phrase" "$ST/log"; then ok "$what — $(grep -o 'cut-chain20: .*' "$ST/log" | tail -1 | cut -c1-110)"
+    else bad "$what — got $r: $(tail -1 "$ST/log")"; fi
+  }
+  export -f load_fee_recipient
+  fp_case "the fee recipient with the expected fingerprint is loaded" ok "fingerprint 89DS-4Q4X-HXSX-MBYW (= FEE_RECIPIENT_FINGERPRINT)" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-ok.txt"
+  fp_case "a fee recipient whose fingerprint differs is refused" refuse "not FEE_RECIPIENT_FINGERPRINT" FAKE_WALLET="$ST/fake-rand" FAKE_FP=AAAA-BBBB-CCCC-DDDD FEE_RECIPIENT_FILE="$ST/fee-ok.txt"
+  fp_case "a missing fee recipient file is refused" refuse "no fee recipient file" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/none.txt"
+  fp_case "a fee recipient file without an address is refused" refuse "does not hold a rand1" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-bad.txt"
+  fp_case "a fee recipient file of two lines is refused" refuse "more than one line" FAKE_WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-two.txt"
+  fp_case "a wallet that prints no fingerprint is refused" refuse "printed no fingerprint" FAKE_WALLET=/usr/bin/true FEE_RECIPIENT_FILE="$ST/fee-ok.txt"
   echo "selftest: $pass passed, $fail failed"
   [ "$fail" = 0 ]; exit
 fi
@@ -1409,6 +1479,7 @@ case "$NODE_VERSION" in
      else [ "${NODE_VERSION_OK:-}" = 1 ] || { echo "cut-chain20: $NODE reports '$NODE_VERSION', not rand-node $EXPECT_NODE_VERSION — NODE_VERSION_OK=1 to cut with it knowingly" >&2; exit 1; }; fi ;;
 esac
 echo "cut-chain20: cutting with $NODE_VERSION"
+load_fee_recipient
 
 TMP=$(mktemp -d); PROBE_PID=; trap 'rm -rf "$TMP"; [ -z "$PROBE_PID" ] || kill "$PROBE_PID" 2>/dev/null || true' EXIT
 export TMP
@@ -1511,6 +1582,7 @@ cut-chain20: chain id $CHAIN_ID, hc_bundle $HC_REPORTED (guest v3), hc_auth $HC_
 cut-chain20: testnet: true; binding_domain: $BINDING_DOMAIN; proof_window_blocks: $PROOF_WINDOW_BLOCKS
 cut-chain20: gas: $GAS_PRICE/gas, $BYTE_PRICE/KiB, bundle limit $BUNDLE_GAS_LIMIT, dynamic $GAS_DYNAMIC, ceilings $MAX_GAS_PRICE/$MAX_BYTE_PRICE, byte load $GAS_BYTE_LOAD
 cut-chain20: envelope_bytes $ENVELOPE_BYTES — every genesis note sealed in the 1 860-B form
+cut-chain20: bridge.fees: mint $BRIDGE_MINT_BPS bps, burn $BRIDGE_BURN_BPS bps, recipient fingerprint $FEE_RECIPIENT_FINGERPRINT (from $FEE_RECIPIENT_FILE)
 cut-chain20: staking: chain 19's + max_stake_entry_bps_per_epoch $STAKE_ENTRY_BPS, admission_by_vote; no slashing
 cut-chain20: program_state: $([ -n "${PROGRAM_STATE_SKIPPED:-}" ] && echo "SKIPPED (this binary lacks RPL-2) — NOT what chain 20 will be" || echo "cell_fee $PROGRAM_STATE_CELL_FEE")
 cut-chain20: 26 validators × $STAKE_RAND RAND (quorum 18); faucet minters: $FAUCET_MINTERS
