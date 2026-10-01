@@ -21,6 +21,7 @@
 #     nightly-proving   the wallet flow and the cluster suite, which really prove bundles.
 #     nightly-zkvm      the zkVM's whole suite, then guest v2's real-proof cheats.
 #     nightly-rvm       the rVM's whole suite less its two tier-19/20 round trips.
+#     mutation-controls one named edit per Fixed zk finding must turn its named test red (HB-4).
 #
 # Audit v6 (2026-09-30), what this file was and is now:
 #   PROC-7  the nightly ran the workspace without --no-fail-fast, skipped only `agg_executor::`
@@ -433,3 +434,37 @@ jobs:
         run: |
           cargo test -p randprotocol-rvm --release --no-fail-fast \
             -- --skip round_trips --skip two_test_profile
+
+  # HB-4 (audit v6 §8.28, option 2; issue #100): a mutation control per Fixed zkVM finding — one
+  # named one-line edit that removes the fix, and the named test that must go red under it,
+  # applied and restored one at a time by scripts/mutation-controls.sh (its header lists every
+  # control and the findings without one, with the reason). Nightly only: each control recompiles
+  # the crate it touches in release, and some of the named tests prove. The script exits non-zero
+  # on a test that stays green under its mutation (`MISSING`) — that is a finding about the suite,
+  # to be fixed with a test, not by softening the mutation. The checkout is the runner's own, so
+  # the in-place edits never reach a commit.
+  mutation-controls:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: fullnode
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: randprotocol/zkp-circuits
+          ref: ${{ env.CIRCUITS_PIN }}
+          path: circuits
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fullnode
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: Mutation controls
+        working-directory: fullnode
+        env:
+          CARGO_INCREMENTAL: "0"
+          LOGDIR: ${{ runner.temp }}/mutation-controls
+        run: scripts/mutation-controls.sh
