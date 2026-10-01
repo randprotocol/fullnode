@@ -14,5 +14,8 @@
 #     It is held off the build host, preferably hardware-backed (ed25519-sk / ecdsa-sk).
 #   - Adding or removing a line is a reviewed change to this file: whoever is listed here can
 #     authorise a binary that runs as root on the fleet.
-#   - THIS FILE LISTS NO KEY YET (2026-09-30). Until the operator adds one, verify_release_sums
-#     refuses every release, and the roll scripts install only with ALLOW_UNSIGNED=1.
+#
+# 2026-10-01: Dendi's release key — ed25519, passphrase-protected, private half on the operator's
+# laptop at ~/.rand-release/release_ed25519 (not the build host, not CI). A software key, chosen
+# over a hardware key for now; replace it with an ed25519-sk key when one is available.
+dendi@randprotocol namespaces="rand-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBPHj0QRoPCZ/aXno8nmZGiV496BKWeOPr11mPUpK+U5
