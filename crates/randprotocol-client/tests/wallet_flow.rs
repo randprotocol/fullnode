@@ -851,3 +851,227 @@ fn a_wallet_that_cannot_pay_says_so_without_proving() {
     let err = wallet::select_inputs(&store.spendable(), 1).unwrap_err();
     assert_eq!(err, wallet::SelectError::Insufficient { have: 0 });
 }
+
+/// The chain RPL-2 runs on: split authorisation (`genesis_v3`), a token registry, a fixed-price
+/// `gas` section, the v0.6 rules and the `program_state` section with a 0.01 RAND cell fee —
+/// every section the feature stands on (`Genesis::validate` refuses it otherwise).
+fn genesis_rpl2(validator: &Keypair) -> Genesis {
+    use randprotocol_core::genesis::{TokensConfig, MIN_REGISTRATION_FEE};
+    use randprotocol_core::ledger::program_state::ProgramStateConfig;
+    Genesis {
+        tokens: Some(TokensConfig {
+            registration_fee: MIN_REGISTRATION_FEE,
+            mint_cap_per_day: 0,
+            max_tokens: None,
+            burn_registration_fee: None,
+            bound_note_value: None,
+            tokens: vec![],
+        }),
+        gas: Some(gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: gas::bundle_gas_limit_pin(),
+            metering: gas::GasMetering::Circuit,
+            dynamic: None,
+        }),
+        hardening_v6: Some(true),
+        program_state: Some(ProgramStateConfig { cell_fee: RPL2_CELL_FEE }),
+        ..genesis_v3(validator)
+    }
+}
+
+const RPL2_CELL_FEE: u64 = UNITS_PER_RAND / 100;
+
+/// RPL-2 end to end, with real proofs: on the chain above, A deploys the counter guest,
+/// registers a fixed-supply token it holds (token 1) and the counter's own program token
+/// (token 2), then makes ONE invoke that reads the counter's cell (absent), writes it to 1,
+/// deposits 5 RAND and 300 of token 1 into the counter's vault, pays 2 of that RAND to B and
+/// mints 40 of token 2 to itself — three proofs, the call's over the transition's context. The
+/// cell, the vault, token 2's supply, the receipt's outputs, both wallets' scans (B's payout and
+/// A's mint found by the ordinary trial decryption of the commitment feed, the node having
+/// served the derived notes) and the supply identity are all checked. Then a second invoke
+/// declaring the read the chain has moved past is refused with the stale-read verdict — before
+/// any proof of it is looked at, which is the point of the segment being built from the
+/// transaction: the read check is the one thing that depends on state, so the second invoke is
+/// sent with its proofs empty and the chain still answers `StaleRead`.
+///
+/// Seven proofs (a bundle and an auth proof each for the deploy and the two registrations, plus
+/// the invoke's three), so this is the slowest test in the binary; it sits last for that reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invoke_moves_a_cell_fills_a_vault_pays_out_and_mints_end_to_end() {
+    use randprotocol_core::genesis::MIN_REGISTRATION_FEE;
+    use randprotocol_core::ledger::program_state::{payout_commitment, Cell, Inflow, PROGRAM_FROM};
+    use randprotocol_core::program::program_id;
+
+    init_tracing();
+    let started = Instant::now();
+    let dir = tempfile::tempdir().unwrap();
+    let key = Keypair::from_seed([109; 32]).unwrap();
+    let handle = start_with(&dir, &key, genesis_rpl2(&key)).await;
+    let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
+    let a = Wallet::from_spend_key(SpendKey([31; 8]));
+    let b = Wallet::from_spend_key(SpendKey([32; 8]));
+    let (mut a_store, mut b_store) = (NoteStore::default(), NoteStore::default());
+    let mint = 100 * UNITS_PER_RAND;
+    let hash = rpc.mint_shielded(&a.address.to_string(), Some(mint)).await.expect("mint accepted");
+    rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
+    let limits = rpc.limits().await.unwrap().expect("this node reports its limits");
+    let ps = limits.program_state.expect("the chain has the program_state section");
+    assert_eq!((ps.cell_fee, ps.max_reads, ps.max_writes, ps.max_payouts), (RPL2_CELL_FEE, 8, 8, 4));
+    assert!(limits.hardening_v6 && limits.gas_circuit, "the sections the feature stands on");
+    let cpu = Proving::local(Backend::Cpu);
+
+    // ---- deploy the counter ----
+    let prog = guests::rpl2_counter();
+    let pid = program_id(prog.base_pc, &prog.words);
+    let deploy = Action::Deploy { base_pc: prog.base_pc, words: prog.words.clone(), public: vec![] };
+    let deploy_fee = wallet::deploy_fee_default(&deploy);
+    let slot = proving_slot().await;
+    let deployed = wallet::submit(&rpc, &a, &mut a_store, None, deploy, deploy_fee, Burn::None, FriProfile::Test, &cpu, CHAIN_ID, true)
+        .await
+        .expect("the counter deploys");
+    drop(slot);
+    eprintln!("deploy: tier {}, proved in {:.1?} + auth {:?}", deployed.tier, deployed.proving, deployed.auth_proving);
+    assert!(rpc.program(&pid).await.unwrap().is_some());
+    assert_eq!(rpc.program_vault(&pid).await.unwrap(), Some(vec![]), "an empty vault");
+    let k = Cell { key: [7, 0, 0, 0, 0, 0, 0, 0], value: [0; 8] };
+    assert_eq!(rpc.program_cell(&pid, &k.key).await.unwrap(), Some([0; 8]), "the cell is absent");
+
+    // ---- token 1: a fixed supply A holds; token 2: the counter's own ----
+    let supply = 1_000_000u64;
+    let slot = proving_slot().await;
+    let held = wallet::create_token(&rpc, &a, &mut a_store, "Held Coin", "HLD", 0, None, None, Some((supply, a.address.clone())), [8; 32], None, FriProfile::Test, &cpu, CHAIN_ID, true)
+        .await
+        .expect("token 1 registers with its supply");
+    drop(slot);
+    assert_eq!(held.index, 1);
+    assert_eq!(a_store.balance_of(1), supply, "A holds the initial mint");
+    let slot = proving_slot().await;
+    let own = wallet::create_token(&rpc, &a, &mut a_store, "Counter Share", "CTR", 0, None, Some(pid), None, [9; 32], None, FriProfile::Test, &cpu, CHAIN_ID, true)
+        .await
+        .expect("the program token registers");
+    drop(slot);
+    assert_eq!(own.index, 2);
+    let row = wallet::find_token_row(&rpc, "2").await.unwrap();
+    assert_eq!(row["authority"], serde_json::json!({ "kind": "program", "program": pid.to_hex() }));
+    assert_eq!(row["total_supply"], "0");
+    let fees_so_far = deploy_fee + 2 * (gas::BUNDLE_BASE + MIN_REGISTRATION_FEE);
+    assert_eq!(a_store.balance(), mint - fees_so_far);
+
+    // ---- the invoke ----
+    let deposit_rand = 5 * UNITS_PER_RAND;
+    let deposit_token = 300u64;
+    let pay_b = 2 * UNITS_PER_RAND;
+    let mint_ctr = 40u64;
+    let plan = wallet::InvokePlan {
+        program: pid,
+        reads: vec![k],
+        writes: vec![Cell { key: k.key, value: [1, 0, 0, 0, 0, 0, 0, 0] }],
+        inflow: Inflow::Deposit,
+        pays: vec![wallet::PayoutRequest { asset: 0, amount: pay_b, to: b.address.clone() }],
+        mints: vec![wallet::PayoutRequest { asset: 2, amount: mint_ctr, to: a.address.clone() }],
+        burn_r: deposit_rand,
+        burn_asset: 1,
+        burn_a: deposit_token,
+        input_envelope: None,
+        created_cells: 1,
+    };
+    // The dry run over the real context words, eight zeros for the binding: the tier, the gas.
+    let probe = randprotocol_core::ledger::program_state::Transition {
+        reads: plan.reads.clone(),
+        writes: plan.writes.clone(),
+        inflow: plan.inflow,
+        pays: vec![randprotocol_core::ledger::program_state::Payout { asset: 0, amount: pay_b, recipient: b.address.clone(), r: [0; 8], envelope: randprotocol_core::notes::Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] } }],
+        mints: vec![randprotocol_core::ledger::program_state::Payout { asset: 2, amount: mint_ctr, recipient: a.address.clone(), r: [0; 8], envelope: randprotocol_core::notes::Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] } }],
+    }
+    .context(deposit_rand, 1, deposit_token);
+    let segment = [&[0u32; 8][..], &probe].concat();
+    let run = executor::dry_run_call(&prog, &[], &segment).expect("the counter accepts 0 → 1");
+    let tier = run.tier;
+    let fee = wallet::call_fee_default(Some(&limits), tier, 0, 0, run.gas_max(), wallet::hardened_call_quote_bytes(Some(&limits), 0)).unwrap() + RPL2_CELL_FEE;
+    let salt = executor::fresh_call_salt();
+    let proved_at = std::sync::Mutex::new(None);
+    let prove = |binding: &[u32; 8], context: &[u32]| -> anyhow::Result<Vec<u8>> {
+        let t = Instant::now();
+        let (proof, outputs, tier) = executor::prove_invoke(FriProfile::Test, &prog, &[], &[], binding, context, salt, Some(tier), None).map_err(|e| anyhow::anyhow!(e))?;
+        eprintln!("invoke call proof: tier {tier}, {} bytes, outputs {outputs:?}, proved in {:.1?}", proof.len(), t.elapsed());
+        *proved_at.lock().unwrap() = Some((t.elapsed(), proof.len(), tier, outputs));
+        Ok(proof)
+    };
+    let slot = proving_slot().await;
+    let (s, transition) = wallet::submit_bound_invoke(&rpc, &a, &mut a_store, &plan, fee, &prove, Some(&limits), FriProfile::Test, &cpu, CHAIN_ID, true)
+        .await
+        .expect("the invoke is admitted and commits");
+    drop(slot);
+    eprintln!("invoke bundle: tier {}, proved in {:.1?} ({} bytes), auth {:?}; call {:?}", s.tier, s.proving, s.proof_bytes, s.auth_proving, proved_at.lock().unwrap());
+    eprintln!("{}", s.summary("invoke"));
+    assert_eq!(s.burn, Burn::Both { rand: deposit_rand, index: 1, amount: deposit_token });
+    assert_eq!((s.asset, s.amount, s.change), (1, deposit_token, supply - deposit_token));
+
+    // The cell, the vault, the supply, the receipt.
+    assert_eq!(rpc.program_cell(&pid, &k.key).await.unwrap(), Some([1, 0, 0, 0, 0, 0, 0, 0]));
+    let (cells, next) = rpc.program_cells(&pid, None, 10).await.unwrap().unwrap();
+    assert_eq!((cells, next), (vec![Cell { key: k.key, value: [1, 0, 0, 0, 0, 0, 0, 0] }], None));
+    assert_eq!(rpc.program_vault(&pid).await.unwrap(), Some(vec![(0, deposit_rand - pay_b), (1, deposit_token)]));
+    let row = wallet::find_token_row(&rpc, "2").await.unwrap();
+    assert_eq!(row["total_supply"], mint_ctr.to_string(), "the program minted its token");
+    let receipt = rpc.wait_for_receipt(&s.hash, Duration::from_secs(120)).await.expect("an invoke has a call's receipt");
+    assert_eq!(receipt["outputs"][0], 1, "the counter's new count");
+    assert_eq!(receipt["program"], pid.to_hex());
+    let shown = rpc.call("rand_getTransaction", serde_json::json!([s.hash.to_hex()])).await.unwrap();
+    assert_eq!(shown["tx"]["action"]["kind"], "invoke");
+    assert_eq!(shown["tx"]["action"]["transition"]["inflow"], "deposit");
+    assert_eq!(shown["tx"]["bundle"]["burn_r"], deposit_rand.to_string());
+    let zk = ZkExecutor::new(FriProfile::Test);
+    let time = shown["tx"]["bundle"]["time"].as_u64().unwrap() as u32;
+    assert_eq!(time, s.time);
+    let pay_cm = payout_commitment(&transition.pays[0], time, &zk);
+    let mint_cm = payout_commitment(&transition.mints[0], time, &zk);
+    assert_eq!(shown["tx"]["action"]["transition"]["pays"][0]["cm"], word8_to_hex(&pay_cm));
+    assert_eq!(shown["tx"]["action"]["transition"]["mints"][0]["cm"], word8_to_hex(&mint_cm));
+
+    // Both recipients find their notes by the ordinary scan: the node served the derived leaves
+    // with the payouts' own envelopes in the commitment feed.
+    wallet::scan(&rpc, &b, &mut b_store).await.unwrap();
+    assert_eq!(b_store.balance(), pay_b, "B was paid out of the vault");
+    let paid = b_store.notes.iter().find(|n| n.cm == pay_cm).expect("at the leaf the chain appended");
+    assert_eq!((paid.note.from, paid.note.time, paid.note.amount), (PROGRAM_FROM, time, pay_b));
+    assert_eq!(a_store.balance_of(2), mint_ctr, "A holds what the program minted");
+    assert!(a_store.notes.iter().any(|n| n.cm == mint_cm));
+    assert_eq!(a_store.balance_of(1), supply - deposit_token, "300 of token 1 went into the vault");
+    assert_eq!(a_store.balance(), mint - fees_so_far - s.fee - deposit_rand, "the fee and the RAND deposit left A");
+    let supply_json = rpc.call("rand_getSupply", serde_json::json!([])).await.unwrap();
+    assert_eq!(supply_json["program_rand_held"], (deposit_rand - pay_b).to_string());
+    assert_eq!(supply_json["program_rand_out"], pay_b.to_string());
+    assert_eq!(supply_json["invariant_holds"], true, "{supply_json}");
+
+    // ---- a second invoke against the value the chain has moved past: StaleRead, no proof read ----
+    let (head, anchor) = rpc.anchor(None).await.unwrap();
+    let stale = randprotocol_core::Transaction::shielded(
+        CHAIN_ID,
+        randprotocol_core::notes::Bundle {
+            anchor,
+            nullifiers: [[0xa1; 8], [0xa2; 8], [0xa3; 8], [0xa4; 8]],
+            commitments: [[0xb1; 8], [0xb2; 8], [0xb3; 8], [0xb4; 8]],
+            fee,
+            burn_a: 0,
+            burn_r: 0,
+            burn_asset: 0,
+            time: head as u32,
+            envelopes: std::array::from_fn(|_| transition.pays[0].envelope.clone()),
+            proof: Vec::new(),
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
+        },
+        Action::Invoke {
+            program: pid,
+            proof: Vec::new(),
+            input_envelope: None,
+            transition: randprotocol_core::ledger::program_state::Transition { pays: vec![], mints: vec![], inflow: Inflow::None, ..transition.clone() },
+        },
+    );
+    let e = rpc.send_transaction(&stale).await.expect_err("the read the chain has moved past is refused").to_string();
+    assert!(e.contains("is no longer what this transition read"), "{e}");
+    eprintln!("rpl2 flow in {:.1?}", started.elapsed());
+    handle.shutdown().await;
+}
