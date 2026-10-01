@@ -31,8 +31,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]
 default = []
-# `rand call --cuda` proves on an attached NVIDIA GPU. Needs a CUDA 13 toolkit at build time
-# and the sibling `circuits` checkout for the backend crate.
+# `rand call --cuda` proves on an attached NVIDIA GPU. Needs a CUDA 13 toolkit at build time;
+# the backend crate is a git dependency of `randprotocol-zkvm` (no sibling checkout).
 cuda = ["randprotocol-zkvm/cuda"]
 # The same `--cuda` path with the kernels running on the host mock driver: no GPU, no toolkit.
 mock-cuda = ["randprotocol-zkvm/mock-cuda"]

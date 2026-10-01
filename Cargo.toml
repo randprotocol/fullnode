@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
 members = ["crates/randprotocol-core", "crates/randprotocol-zkvm", "crates/randprotocol-client", "crates/randprotocol-node", "crates/bridge-codec", "crates/randprotocol-rvm", "crates/randprotocol-prover"]
+# The two circuits crates vendored under `vendor/circuits/` (audit v6 PROC-2, issue #109;
+# `vendor/circuits/PROVENANCE.md`) are copied verbatim, and upstream each is a workspace root of
+# its own (`[workspace]` in its manifest). A path dependency inside this directory would otherwise
+# become a member, and a member that is its own root is refused by cargo; excluded, they are
+# ordinary path dependencies of `randprotocol-zkvm`, as they were from the sibling checkout.
+exclude = ["vendor/circuits/evm-core", "vendor/circuits/sbpf-core"]
 
 [workspace.package]
 version = "0.6.9"

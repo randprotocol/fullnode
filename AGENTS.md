@@ -128,8 +128,9 @@ ignored); client lib 171, `rand` bin 17; the prover crate whole. Not run: `walle
   `tx.binding()` after BIND-1 gave it a domain argument): `cargo check --workspace --tests` after
   every rebase, not only `--lib`.
 
-**Open after this work** (issues left open say why): PROC-2 (#109, blocked: cargo reads every
-path dependency's manifest; needs the circuits crates vendored or git deps on a protected tag),
+**Open after this work** (issues left open say why): PROC-2 (#109, fixed 2026-10-01 on `fix/vendor`:
+`evm-core`/`sbpf-core` vendored, `rand-zkvm-cuda` a git dependency — the cuda revision must stay
+reachable on the public remote, so tag it in zkp-circuits; see the cs6 entry's note),
 PROC-4/5 (#110: `release.yml` and `deploy/lib/verify-release.sh` exist; the release key is not in
 `deploy/release-signers`, `main` is unprotected), OPS-7/OPS-6 (#112: the cut policy and
 `deploy/lib/cut-policy.sh` exist; the key-separation schedule is the operators'), the three
@@ -2193,7 +2194,12 @@ set before it; fleets must run the same build (`docs/confidential.md`, "Constrai
 - **New build requirement**: `evm-core` and `sbpf-core` are *path* dependencies of
   `randprotocol-zkvm` (`../../../circuits/guests-compiled/{evm-core,sbpf-core}`) and, unlike
   `rand-zkvm-cuda`, they are NOT optional — `circuits/` must sit beside `fullnode/` for any
-  build of the crate. In a `/tmp/fullnode-*` worktree that means `ln -s
+  build of the crate. **(Superseded 2026-10-01, audit v6 PROC-2 / #109: both crates are vendored under
+  `vendor/circuits/` by `deploy/sync-zkvm.sh` — verbatim, `[workspace]` table included, so the
+  root manifest `exclude`s them — and `rand-zkvm-cuda` is an optional git dependency on
+  zkp-circuits at a pinned revision in both manifests; a clone of this repository alone builds,
+  `scripts/clean-clone-check.sh` and CI's `clean-clone` job prove it. A sibling checkout is needed
+  only to re-vendor.)** In a `/tmp/fullnode-*` worktree that means `ln -s
   <real circuits checkout> /tmp/circuits` first, or `cargo metadata` fails on the (already
   pre-existing) optional cuda path dep too. Dev-oracles at upstream's exact pins: `revm
   =43.0.2`, `solana-sbpf =0.11.1`, `sha2 =0.10.9`, `num-bigint 0.4`.

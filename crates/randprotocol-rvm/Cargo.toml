@@ -42,7 +42,7 @@ postcard = { version = "1", features = ["alloc"] }
 randprotocol-zkvm = { path = "../randprotocol-zkvm" }
 # The GPU (CUDA) and CPU-twin NTT/Poseidon2-Merkle engines the proving backends run on —
 # research's dependency, consumed as-is (M5.4 R1: the rVM's shapes need no new kernels).
-rand-zkvm-cuda = { path = "../../../circuits/rand-zkvm-cuda", optional = true }
+rand-zkvm-cuda = { git = "https://github.com/randprotocol/zkp-circuits", rev = "aeacf31974fc409ed852017a4107ffa63df32182", optional = true }
 
 [dev-dependencies]
 hex = "0.4"

@@ -16,13 +16,25 @@ fn dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("guests-compiled")
 }
 
+/// The vendored circuits crates (`evm-core`, `sbpf-core`), the second directory with the same
+/// manifest-and-pin shape as `guests-compiled/` (audit v6 PROC-2, issue #109:
+/// `vendor/circuits/PROVENANCE.md`).
+fn vendor_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/circuits")
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// `SHA256SUMS`'s lines, `(digest, path relative to guests-compiled/)`, in `shasum -a 256` form.
 fn manifest() -> Vec<(String, String)> {
-    let text = std::fs::read_to_string(dir().join("SHA256SUMS")).expect("guests-compiled/SHA256SUMS");
+    manifest_in(&dir())
+}
+
+/// The same, for any directory that carries a `SHA256SUMS` in that form.
+fn manifest_in(root: &Path) -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(root.join("SHA256SUMS")).unwrap_or_else(|e| panic!("{}/SHA256SUMS: {e}", root.display()));
     text.lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
@@ -35,6 +47,11 @@ fn manifest() -> Vec<(String, String)> {
 
 /// Every regular file under `guests-compiled/`, relative to it, except the two manifest files.
 fn vendored_files() -> BTreeSet<String> {
+    vendored_files_in(&dir())
+}
+
+/// The same, for any directory with the `SHA256SUMS` + `PROVENANCE.md` pair.
+fn vendored_files_in(root: &Path) -> BTreeSet<String> {
     fn walk(root: &Path, d: &Path, out: &mut BTreeSet<String>) {
         for e in std::fs::read_dir(d).unwrap().flatten() {
             let p = e.path();
@@ -46,10 +63,31 @@ fn vendored_files() -> BTreeSet<String> {
         }
     }
     let mut out = BTreeSet::new();
-    walk(&dir(), &dir(), &mut out);
+    walk(root, root, &mut out);
     out.remove("SHA256SUMS");
     out.remove("PROVENANCE.md");
     out
+}
+
+/// The `circuits: <commit>` line of a PROVENANCE.md.
+fn provenance_commit(root: &Path) -> String {
+    let provenance = std::fs::read_to_string(root.join("PROVENANCE.md")).unwrap_or_else(|e| panic!("{}/PROVENANCE.md: {e}", root.display()));
+    provenance
+        .lines()
+        .find_map(|l| l.strip_prefix("circuits: "))
+        .unwrap_or_else(|| panic!("{}/PROVENANCE.md has no `circuits: <commit>` line", root.display()))
+        .trim()
+        .to_string()
+}
+
+/// ci.yml's `CIRCUITS_PIN`.
+fn ci_pin() -> String {
+    let ci = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml")).unwrap();
+    ci.lines()
+        .find_map(|l| l.trim().strip_prefix("CIRCUITS_PIN: "))
+        .expect("ci.yml has no CIRCUITS_PIN")
+        .trim()
+        .to_string()
 }
 
 #[test]
@@ -202,4 +240,86 @@ fn every_genesis_files_bundle_guest_is_the_one_this_source_assembles() {
     }
     assert!(checked.contains(&14) && checked.contains(&15), "chains 14 and 15 must be among the files checked: {checked:?}");
     assert!(checked.contains(&17), "chain 17 (the first v3 + hc_auth genesis) must be among the files checked: {checked:?}");
+}
+
+// ── vendor/circuits: the two interpreter cores (audit v6 PROC-2, issue #109) ────────────────────
+//
+// `evm-core` and `sbpf-core` were path dependencies on a sibling `circuits/` checkout, which no
+// clone of this repository alone has. They are vendored copies now, with the same manifest and
+// pin `guests-compiled/` has, and the same tests hold them to it.
+
+#[test]
+fn every_vendored_circuits_crate_file_hashes_to_its_manifest_line() {
+    let root = vendor_dir();
+    for (want, path) in manifest_in(&root) {
+        let bytes = std::fs::read(root.join(&path)).unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(sha256_hex(&bytes), want, "vendor/circuits/{path} is not the file PROVENANCE.md names");
+    }
+}
+
+#[test]
+fn the_vendored_circuits_manifest_covers_every_file_and_nothing_else() {
+    let root = vendor_dir();
+    let listed: BTreeSet<String> = manifest_in(&root).into_iter().map(|(_, p)| p).collect();
+    assert_eq!(listed, vendored_files_in(&root), "vendor/circuits/ and its SHA256SUMS disagree on which files are vendored");
+    for crate_name in ["evm-core", "sbpf-core"] {
+        assert!(listed.contains(&format!("{crate_name}/Cargo.toml")), "{crate_name} is not among the vendored crates");
+        assert!(!listed.contains(&format!("{crate_name}/Cargo.lock")), "{crate_name}/Cargo.lock must not be vendored: the workspace's lock is the one cargo reads");
+    }
+}
+
+/// Both vendored directories are copies of ONE circuits commit, the one CI checks them against.
+#[test]
+fn the_vendored_circuits_crates_name_the_circuits_commit_ci_pins() {
+    assert_eq!(provenance_commit(&vendor_dir()), ci_pin(), "vendor/circuits/PROVENANCE.md and ci.yml's CIRCUITS_PIN name different circuits commits");
+    assert_eq!(provenance_commit(&vendor_dir()), provenance_commit(&dir()), "vendor/circuits/ and guests-compiled/ were synced from different circuits commits");
+}
+
+/// The premise of vendoring them: neither crate has a dependency, so the copies add nothing to the
+/// dependency tree beyond themselves (`deploy/sync-zkvm.sh` refuses to vendor one that grew any;
+/// this is the same check on what is committed).
+#[test]
+fn the_vendored_circuits_crates_have_no_dependencies() {
+    for crate_name in ["evm-core", "sbpf-core"] {
+        let manifest = std::fs::read_to_string(vendor_dir().join(crate_name).join("Cargo.toml")).unwrap();
+        let mut in_deps = false;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_deps = line == "[dependencies]" || line.starts_with("[dependencies.") || line == "[dev-dependencies]" || line == "[build-dependencies]";
+                assert!(!line.starts_with("[dependencies."), "{crate_name}: {line}");
+                continue;
+            }
+            if in_deps && !line.is_empty() && !line.starts_with('#') {
+                panic!("{crate_name}/Cargo.toml declares a dependency: {line}");
+            }
+        }
+        assert!(manifest.contains("[workspace]"), "{crate_name}/Cargo.toml lost its `[workspace]` table; the root Cargo.toml's `exclude` entry counts on it");
+    }
+}
+
+/// The CUDA backend `rand-zkvm-cuda` is a git dependency of two crates; cargo treats two
+/// revisions of one git package as two packages, so both manifests must name one revision, a
+/// full commit hash, of the public repository.
+#[test]
+fn the_cuda_backend_is_one_git_revision_in_both_manifests() {
+    let line_in = |crate_dir: &str| {
+        let manifest = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../").join(crate_dir).join("Cargo.toml")).unwrap();
+        manifest
+            .lines()
+            .find(|l| l.starts_with("rand-zkvm-cuda = "))
+            .unwrap_or_else(|| panic!("{crate_dir}/Cargo.toml has no rand-zkvm-cuda dependency line"))
+            .to_string()
+    };
+    let (zkvm, rvm) = (line_in("randprotocol-zkvm"), line_in("randprotocol-rvm"));
+    assert_eq!(zkvm, rvm, "the two manifests name rand-zkvm-cuda differently");
+    let rev = zkvm
+        .split_once("rev = \"")
+        .and_then(|(_, r)| r.split_once('"'))
+        .map(|(r, _)| r)
+        .unwrap_or_else(|| panic!("no rev in {zkvm}"));
+    assert!(rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit()), "rev must be a full commit hash: {rev}");
+    assert!(zkvm.contains("git = \"https://github.com/randprotocol/zkp-circuits\""), "{zkvm}");
+    assert!(zkvm.contains("optional = true"), "{zkvm}");
+    assert!(!zkvm.contains("path ="), "a path dependency outside the repository again: {zkvm}");
 }

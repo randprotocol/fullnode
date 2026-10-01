@@ -5237,6 +5237,7 @@ dependencies = [
 [[package]]
 name = "rand-zkvm-cuda"
 version = "0.1.0"
+source = "git+https://github.com/randprotocol/zkp-circuits?rev=aeacf31974fc409ed852017a4107ffa63df32182#aeacf31974fc409ed852017a4107ffa63df32182"
 dependencies = [
  "chacha20 0.10.2",
  "cuda-core",

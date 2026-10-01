@@ -1,0 +1,19 @@
+[package]
+name = "evm-core"
+version = "0.1.0"
+edition = "2021"
+description = "no_std EVM interpreter core (256-bit arithmetic, storage tree, dispatch) for the Rand zkVM's EVM guest"
+
+[dependencies]
+
+[features]
+# `ffi`: the `extern "C"` storage and Keccak entry points (`src/ffi.rs`) a translated contract's C
+# runtime calls. Off by default so the interpreter's guest (`guests-compiled/evm`) builds to the
+# pinned `bin/evm.bin`; `evm2rv` shims and research's host tests turn it on.
+ffi = []
+
+# Its own workspace root, like guests-compiled/keccak256: research/ depends on it by path as a
+# dev-dependency (host tests), guests-compiled/evm depends on it by path (the target build).
+# Never swept into research's `cargo test`/`cargo build`, so a plain `cargo test` from research/
+# never needs the riscv32im target.
+[workspace]

@@ -10,8 +10,5 @@ SSH="ssh -i $KEY -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 root@$
 stage_clean_tree
 rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" \
     --exclude target --exclude 'data-*' --exclude testnet --exclude .git "$STAGE/" root@$IP:/root/fullnode/
-# The zkVM manifest has an optional path dependency on ../../../circuits/rand-zkvm-cuda; cargo needs the
-# manifest to exist even for default builds, so ship that crate's sources alongside (no GPU code is built).
-CUDA=$(cd "$(dirname "$0")/../../circuits/rand-zkvm-cuda" 2>/dev/null && pwd || true)
-if [ -n "$CUDA" ]; then ssh -i $KEY -o StrictHostKeyChecking=accept-new root@$IP 'mkdir -p /root/circuits/rand-zkvm-cuda'; rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" --exclude target "$CUDA/" root@$IP:/root/circuits/rand-zkvm-cuda/; fi
+# The zkVM's CUDA backend is a git dependency since PROC-2 (#109); nothing beside the tree is shipped.
 $SSH "bash /root/fullnode/deploy/vps-setup.sh $NODE \"$BOOT\" $ROLE"

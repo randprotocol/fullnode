@@ -13,8 +13,7 @@ KEY=${SSH_KEY:-~/.ssh/id_ed25519}
 stage_clean_tree
 rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" \
     --exclude target --exclude 'data-*' --exclude testnet --exclude .git "$STAGE/" root@$IP:/root/fullnode/
-CUDA=$(cd "$(dirname "$0")/../../circuits/rand-zkvm-cuda" 2>/dev/null && pwd || true)
-if [ -n "$CUDA" ]; then ssh -i $KEY -o StrictHostKeyChecking=accept-new root@$IP 'mkdir -p /root/circuits/rand-zkvm-cuda'; rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" --exclude target "$CUDA/" root@$IP:/root/circuits/rand-zkvm-cuda/; fi
+# The zkVM's CUDA backend is a git dependency since PROC-2 (#109); nothing beside the tree is shipped.
 # RAND_BUILD_SHA overrides build.rs's own git lookup: E's tree keeps a stale .git left over
 # from long ago (rsync's --exclude .git above protects it from --delete), so git rev-parse HEAD
 # there would answer with some other commit even though .git-rev was just written fresh. Pass

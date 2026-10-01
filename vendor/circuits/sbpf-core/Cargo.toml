@@ -1,0 +1,13 @@
+[package]
+name = "sbpf-core"
+version = "0.1.0"
+edition = "2021"
+description = "no_std SBPF v1 interpreter core (ISA, memory regions, syscalls, ELF loader) for the Rand zkVM's Solana guest"
+
+[dependencies]
+
+# Its own workspace root, like guests-compiled/keccak256 and guests-compiled/evm-core: research/
+# depends on it by path as a dev-dependency (host tests), guests-compiled/sbpf depends on it by
+# path (the target build). Never swept into research's `cargo test`/`cargo build`, so a plain
+# `cargo test` from research/ never needs the riscv32im target.
+[workspace]

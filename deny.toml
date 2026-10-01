@@ -3,8 +3,9 @@
 # (.github/workflows/ci.yml). Before this file the repository had no dependency gate:
 # RUSTSEC-2026-0285 in rustls was found by a manual audit and fixed by hand.
 #
-# The workspace has path dependencies on the sibling `circuits` checkout, so `cargo deny` needs
-# `circuits/` beside `fullnode/`, like every other cargo command here.
+# The workspace resolves from a clone of this repository alone (audit v6 PROC-2, issue #109):
+# circuits' `evm-core`/`sbpf-core` are vendored under `vendor/circuits/` and the optional CUDA
+# backend is the one git dependency listed under `[sources]` below.
 
 [graph]
 all-features = false
@@ -28,12 +29,15 @@ multiple-versions = "warn"
 wildcards = "allow"
 
 [sources]
-# Everything comes from crates.io or from a path; a new registry or a git dependency is a
-# decision, so it fails until it is listed here.
+# Everything comes from crates.io, from a path, or from the one git source below; a new registry
+# or another git dependency is a decision, so it fails until it is listed here. The git source is
+# `rand-zkvm-cuda`, the optional CUDA backend, taken from the public zkp-circuits repository at a
+# pinned revision (`crates/randprotocol-zkvm/Cargo.toml` says how the revision is chosen) — a
+# path to a sibling checkout before PROC-2 (#109), which no clone of this repository alone had.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = ["https://github.com/randprotocol/zkp-circuits"]
 
 [licenses]
 version = 2
@@ -59,9 +63,10 @@ allow = [
 ]
 confidence-threshold = 0.8
 
-# evm-core and sbpf-core are path dependencies in the sibling circuits checkout
-# (randprotocol/zkp-circuits, GPL-3.0-only at the repository root) and their manifests carry no
-# `license` field, so cargo-deny cannot read one. Stated here rather than ignored.
+# evm-core and sbpf-core are vendored copies of circuits' crates (`vendor/circuits/`, from
+# randprotocol/zkp-circuits, GPL-3.0-only at that repository's root) and their manifests carry no
+# `license` field, so cargo-deny cannot read one. Stated here rather than ignored. The git
+# dependency `rand-zkvm-cuda` is from the same repository and carries none either.
 [[licenses.clarify]]
 crate = "evm-core"
 expression = "GPL-3.0-only"
@@ -69,5 +74,10 @@ license-files = []
 
 [[licenses.clarify]]
 crate = "sbpf-core"
+expression = "GPL-3.0-only"
+license-files = []
+
+[[licenses.clarify]]
+crate = "rand-zkvm-cuda"
 expression = "GPL-3.0-only"
 license-files = []

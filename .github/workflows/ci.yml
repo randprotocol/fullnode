@@ -13,7 +13,8 @@
 #     lint              clippy, warnings denied, on the hand-maintained crates.
 #     supply-chain      `cargo audit` and `cargo deny check` (deny.toml).
 #     guest-provenance  the vendored guests are circuits' files at the pin and rebuild from source.
-#     clean-clone       fullnode checked out ALONE. Not yet required: it fails (PROC-2).
+#     clean-clone       fullnode checked out ALONE: `cargo metadata --locked` and a locked check of
+#                       every target. The test that keeps PROC-2 closed.
 #   every `v*` tag and every night
 #     zk-guards         the guards of the Fixed High zk findings, so that a regression in one is
 #                       caught at the tag and not only by hand.
@@ -35,10 +36,12 @@
 # `.github/workflows/release.yml` builds a tag's binaries only when this workflow's run for the
 # tagged commit is green (PROC-4), so a job that is red here blocks a release.
 #
-# `randprotocol-zkvm` has *path* dependencies on `../../../circuits/guests-compiled/{evm-core,
-# sbpf-core}`, and it and `randprotocol-rvm` an optional one on `../../../circuits/rand-zkvm-cuda`,
-# so the circuits repository must be checked out as a sibling directory named `circuits/` or
-# nothing in this workspace builds. It is public: randprotocol/zkp-circuits.
+# The workspace builds from this repository alone (audit v6 PROC-2, issue #109, 2026-10-01).
+# circuits' `evm-core`/`sbpf-core` are vendored under `vendor/circuits/` and the optional CUDA
+# backend `rand-zkvm-cuda` is a git dependency on the public randprotocol/zkp-circuits repository
+# at a pinned revision, which cargo fetches. Only `guest-provenance` checks circuits out, to compare
+# the vendored copies with their source at `CIRCUITS_PIN`; `clean-clone` is the job that proves
+# the rest need no sibling, and it is a required job.
 #
 # Every `uses:` is a full commit sha with its tag in the trailing comment (looked up with
 # `git ls-remote` on 2026-09-30). To move one: look the new tag's sha up the same way (the peeled
@@ -71,11 +74,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: fullnode
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: randprotocol/zkp-circuits
-          ref: ${{ env.CIRCUITS_PIN }}
-          path: circuits
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -155,6 +153,29 @@ jobs:
             cmp "$f" "$GITHUB_WORKSPACE/circuits/guests-compiled/$f"
           done < SHA256SUMS
           cd "$GITHUB_WORKSPACE/circuits/guests-compiled/sbpf/programs" && sha256sum -c spl_token.so.sha256
+      # PROC-2 (#109): the vendored `evm-core`/`sbpf-core` crates are circuits' at the pin, whole
+      # (`vendor/circuits/PROVENANCE.md`); `diff -r` rather than the manifest alone so a file added
+      # upstream and not copied is found too (the manifest cannot list what is not here).
+      - name: The vendored circuits crates are circuits' at the pin
+        run: |
+          cd fullnode/vendor/circuits
+          sha256sum -c SHA256SUMS
+          grep -q "^circuits: $CIRCUITS_PIN$" PROVENANCE.md
+          for crate in evm-core sbpf-core; do
+            diff -r --exclude Cargo.lock --exclude target "$crate" "$GITHUB_WORKSPACE/circuits/guests-compiled/$crate"
+          done
+      # The CUDA backend is a git dependency at its own revision (`crates/randprotocol-zkvm/Cargo.toml`),
+      # which may trail CIRCUITS_PIN; what must not differ between the two is the backend itself and
+      # the constants table it `#[path]`-includes from research, or a cuda build would prove with a
+      # table the vendored crate does not have.
+      - name: rand-zkvm-cuda's revision matches the pin where it matters
+        run: |
+          rev=$(sed -n 's/^rand-zkvm-cuda = { git = "https:\/\/github.com\/randprotocol\/zkp-circuits", rev = "\([0-9a-f]*\)", optional = true }$/\1/p' fullnode/crates/randprotocol-zkvm/Cargo.toml)
+          test -n "$rev"
+          grep -q "rev = \"$rev\"" fullnode/crates/randprotocol-rvm/Cargo.toml
+          cd circuits
+          git fetch --depth 1 origin "$rev"
+          git diff --quiet "$rev" "$CIRCUITS_PIN" -- rand-zkvm-cuda research/src/poseidon2_constants.rs
       - name: The guest toolchain rand-guest pins
         run: |
           rustup toolchain install 1.98.1 --profile minimal --target riscv32im-unknown-none-elf --component llvm-tools
@@ -194,11 +215,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: fullnode
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: randprotocol/zkp-circuits
-          ref: ${{ env.CIRCUITS_PIN }}
-          path: circuits
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -237,12 +253,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: fullnode
-      # cargo-deny reads `cargo metadata`, which needs the sibling (see the header).
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: randprotocol/zkp-circuits
-          ref: ${{ env.CIRCUITS_PIN }}
-          path: circuits
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -262,34 +272,28 @@ jobs:
         working-directory: fullnode
         run: cargo deny check
 
-  # Audit v6, PROC-2: a third party who clones fullnode alone cannot build it. This job is that
-  # clone — no sibling `circuits/` — and it FAILS today, at `cargo metadata`, on the first sibling
-  # path dependency cargo reads. It is `continue-on-error` so that it shows the state on every
-  # run without holding every other job's result hostage; drop that line the day it goes green,
-  # and it becomes the test that keeps PROC-2 closed.
-  #
-  # Why it cannot be fixed by a cargo feature (tried 2026-09-30, in a copy with no sibling): cargo
-  # loads the manifest of every path dependency while resolving, optional or not. With `evm-core`
-  # and `sbpf-core` removed from `randprotocol-zkvm` altogether, `cargo metadata` fails next on
-  # the optional `rand-zkvm-cuda`, and with that removed from `randprotocol-zkvm` too it fails on
-  # `randprotocol-rvm`'s, whose Cargo.toml is a copy of circuits' (deploy/sync-zkvm.sh). What
-  # closes it is one of: the three crates vendored here with a recorded pin, or all three as git
-  # dependencies at a revision that sits on a protected tag of zkp-circuits (it is on a branch
-  # today). README.md, "Build and test", has the clone step a builder needs meanwhile.
+  # Audit v6, PROC-2 (issue #109): a third party who clones fullnode alone can build it. This job
+  # is that clone — no sibling `circuits/` — and it is the test that keeps PROC-2 closed: it failed
+  # at `cargo metadata` until 2026-10-01, on the first sibling path dependency cargo read (cargo
+  # loads every path dependency's manifest, optional or not, so no feature could fix it; the
+  # sibling crates are vendored under `vendor/circuits/` now and the CUDA backend is a git
+  # dependency cargo fetches). `scripts/clean-clone-check.sh` is the same test run locally, on the
+  # working tree. `--tests` on the check, so the dev-dependencies resolve from a lone clone too.
   clean-clone:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    continue-on-error: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: No sibling checkout
+        run: test ! -e ../circuits
       - name: cargo metadata, locked, with no sibling checkout
         run: cargo metadata --locked --format-version 1 > /dev/null
-      - name: cargo check, locked, default features
-        run: cargo check --workspace --locked
+      - name: cargo check, locked, every target, default features
+        run: cargo check --workspace --tests --locked
 
   # Audit v6, PROC-7: the guards of the Fixed High zk rows, on every `v*` tag and every night.
   # They pass in private runs and fail when their fix is reverted; before this job nothing ran
@@ -311,11 +315,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: fullnode
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: randprotocol/zkp-circuits
-          ref: ${{ env.CIRCUITS_PIN }}
-          path: circuits
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -346,11 +345,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: fullnode
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: randprotocol/zkp-circuits
-          ref: ${{ env.CIRCUITS_PIN }}
-          path: circuits
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -373,11 +367,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: fullnode
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: randprotocol/zkp-circuits
-          ref: ${{ env.CIRCUITS_PIN }}
-          path: circuits
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -418,11 +407,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: fullnode
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: randprotocol/zkp-circuits
-          ref: ${{ env.CIRCUITS_PIN }}
-          path: circuits
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -451,11 +435,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: fullnode
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: randprotocol/zkp-circuits
-          ref: ${{ env.CIRCUITS_PIN }}
-          path: circuits
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, 2026-09-30)
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:

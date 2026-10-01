@@ -54,24 +54,35 @@ chacha20poly1305 = "=0.11.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 postcard = { version = "1", features = ["alloc"] }
-# The GPU backend lives in the sibling `circuits` checkout and is referenced by path, never
-# vendored: `circuits/` must sit beside `fullnode/` to build any of the features below.
-rand-zkvm-cuda = { path = "../../../circuits/rand-zkvm-cuda", optional = true }
+# The GPU backend is circuits' `rand-zkvm-cuda`, taken from the public zkp-circuits repository at
+# a pinned revision — a git dependency, not a path to a sibling checkout (audit v6 PROC-2, issue
+# #109: cargo loads every path dependency's manifest, optional or not, so a sibling path made a
+# clone of this repository alone fail at `cargo metadata`). It is never vendored. Optional, off
+# by default, and still resolved: cargo fetches the repository (a few MB) to read this manifest
+# and record the revision in Cargo.lock, so a first build needs the network for it like for
+# crates.io. The revision is the one `deploy/sync-zkvm.sh` writes into
+# `crates/randprotocol-rvm/Cargo.toml` (the same package must come from the same source in both,
+# or cargo sees two crates); CI's `guest-provenance` job checks that `rand-zkvm-cuda/` and the
+# `research/src/poseidon2_constants.rs` it `#[path]`-includes are identical between this
+# revision and `CIRCUITS_PIN`, which may be ahead of it when the pin moved for a change outside
+# the backend. It must be a commit reachable from the public repository.
+rand-zkvm-cuda = { git = "https://github.com/randprotocol/zkp-circuits", rev = "aeacf31974fc409ed852017a4107ffa63df32182", optional = true }
 # M4.3/M4.4 (arrived with the constraint-set-6 re-vendor): the EVM and sBPF interpreter cores —
-# no_std libraries with their own workspace roots, compiled into the `evm`/`sbpf` guests on
-# riscv32im and run natively here. Normal dependencies, not dev-dependencies, because
-# `src/evm.rs`/`src/sbpf.rs` (the host sides: `HostRef`, the storage tree, the aligned
-# serializer) are part of this library — the vendored `tests/{evm,sbpf}_*.rs` link
-# `randprotocol_zkvm` as an external crate. Same sibling-checkout rule as `rand-zkvm-cuda` above,
-# but NOT optional: `circuits/` must sit beside `fullnode/` for any build of this crate.
-evm-core = { path = "../../../circuits/guests-compiled/evm-core" }
-sbpf-core = { path = "../../../circuits/guests-compiled/sbpf-core" }
+# no_std libraries with no dependencies, compiled into the `evm`/`sbpf` guests on riscv32im and
+# run natively here. Normal dependencies, not dev-dependencies, because `src/evm.rs`/`src/sbpf.rs`
+# (the host sides: `HostRef`, the storage tree, the aligned serializer) are part of this library
+# — the vendored `tests/{evm,sbpf}_*.rs` link `randprotocol_zkvm` as an external crate. Vendored
+# copies of circuits' `guests-compiled/{evm-core,sbpf-core}` at `CIRCUITS_PIN`, made by
+# `deploy/sync-zkvm.sh` and pinned by `vendor/circuits/PROVENANCE.md` and
+# `tests/guest_provenance.rs` (PROC-2, #109; they were sibling path dependencies before).
+evm-core = { path = "../../vendor/circuits/evm-core" }
+sbpf-core = { path = "../../vendor/circuits/sbpf-core" }
 
 [dev-dependencies]
 # The same `evm-core` with its `ffi` feature, for tests only (upstream's dev-dependency, taken with
 # constraint set 7's re-vendor): `tests/evm_abi.rs` drives the C ABI (`evm_sload`/`evm_sstore`/
 # `evm_keccak256`) `evm2rv`'s translated contracts call.
-evm-core = { path = "../../../circuits/guests-compiled/evm-core", features = ["ffi"] }
+evm-core = { path = "../../vendor/circuits/evm-core", features = ["ffi"] }
 # M4.2: the vendored `tests/keccak.rs` states its known-answer vectors as hex strings. Same
 # version upstream's `[dev-dependencies]` pins.
 hex = "0.4"

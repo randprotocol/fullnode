@@ -12,8 +12,9 @@
 #            which lets the release go ahead and is copied into the release notes. An override is
 #            a recorded exception for a hot fix, not a default; a lightweight tag has no
 #            annotation and so cannot carry one.
-#   build    on a clean ubuntu-24.04 runner: fullnode at the tag and zkp-circuits at the tag's
-#            own CIRCUITS_PIN as siblings, the toolchain rust-toolchain.toml pins, Cargo.lock
+#   build    on a clean ubuntu-24.04 runner: fullnode at the tag, alone (nothing beside it since
+#            PROC-2, #109; the CUDA backend is a git dependency cargo fetches at a pinned
+#            revision), the toolchain rust-toolchain.toml pins, Cargo.lock
 #            locked; `rand-node`, `rand`, `rand-prover`; SHA256SUMS; a build-provenance
 #            attestation over the three binaries; the GitHub release, its notes naming the CI run.
 #
@@ -138,24 +139,21 @@ jobs:
           path: fullnode
           persist-credentials: false
       # The circuits commit this tag's vendored crates were synced from: CIRCUITS_PIN in the
-      # tag's own ci.yml, which must be the commit PROVENANCE.md names
-      # (tests/guest_provenance.rs holds the two equal; checked again here because this build
-      # does not run that test).
+      # tag's own ci.yml, which must be the commit both PROVENANCE.md files name
+      # (tests/guest_provenance.rs holds them equal; checked again here because this build
+      # does not run that test). Recorded in the release notes; the build itself needs no
+      # circuits checkout (PROC-2, #109).
       - name: The circuits pin of this tag
         id: pin
         run: |
           set -euo pipefail
           pin=$(sed -n 's/^  CIRCUITS_PIN: //p' fullnode/.github/workflows/ci.yml)
           manifest=$(sed -n 's/^circuits: //p' fullnode/crates/randprotocol-zkvm/guests-compiled/PROVENANCE.md)
+          vendored=$(sed -n 's/^circuits: //p' fullnode/vendor/circuits/PROVENANCE.md)
           echo "$pin" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::ci.yml's CIRCUITS_PIN is not a full commit sha: '$pin'"; exit 1; }
-          [ "$pin" = "$manifest" ] || { echo "::error::ci.yml pins circuits $pin, PROVENANCE.md names $manifest"; exit 1; }
+          [ "$pin" = "$manifest" ] || { echo "::error::ci.yml pins circuits $pin, guests-compiled/PROVENANCE.md names $manifest"; exit 1; }
+          [ "$pin" = "$vendored" ] || { echo "::error::ci.yml pins circuits $pin, vendor/circuits/PROVENANCE.md names $vendored"; exit 1; }
           echo "circuits=$pin" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: randprotocol/zkp-circuits
-          ref: ${{ steps.pin.outputs.circuits }}
-          path: circuits
-          persist-credentials: false
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake
       # The compiler rust-toolchain.toml pins, installed by rustup itself: no third-party action

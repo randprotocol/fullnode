@@ -1050,10 +1050,12 @@ attached NVIDIA GPU instead of the CPU. The proof is the same object either way 
 values, same tier, verified by the same CPU verifier — so nothing on the node changes and a chain
 cannot tell which backend produced a proof.
 
-The backend lives in the sibling repository, `circuits/rand-zkvm-cuda`, and is referenced by path
-(`../../../circuits/rand-zkvm-cuda`); it is not vendored into this repo. `circuits/` must therefore
-be checked out beside `fullnode/` to build any of the features below. `deploy/sync-zkvm.sh` prints
-the same reminder.
+The backend lives in the circuits repository, `rand-zkvm-cuda`, and is not vendored into this
+repo: it is an optional git dependency on the public zkp-circuits repository at a pinned revision
+(`crates/randprotocol-zkvm/Cargo.toml`; the same line in `crates/randprotocol-rvm/Cargo.toml`,
+written by `deploy/sync-zkvm.sh`). cargo fetches it itself, so no sibling checkout is needed for
+any of the features below — until 2026-10-01 it was a path to `../../../circuits/rand-zkvm-cuda`,
+which is what made a clone of this repository alone fail to build (audit v6, PROC-2).
 
 **Building.** On a machine with a CUDA 13 toolkit, an NVIDIA driver, and the compiled PTX:
 

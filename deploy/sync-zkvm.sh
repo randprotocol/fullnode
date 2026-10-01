@@ -186,9 +186,30 @@
 # and `check_public_values` refuses a tier outside `TIERS`; sister GAS cheating tests. The rVM is
 # unchanged; only its fixture cache's GAS values (so the stub interface list and digest) moved.
 #
-# The CUDA backend is *not* vendored either: crates/randprotocol-zkvm depends on it by path, as
-# ../../../circuits/rand-zkvm-cuda, so `circuits` must be checked out beside `fullnode` when building
-# with --features cuda or --features mock-cuda.
+# Audit v6 PROC-2 (issue #109, 2026-10-01): a clone of this repository alone has to build, so no
+# manifest here may name a path outside the repository — cargo loads every path dependency's
+# manifest, optional or not, and `cargo metadata` failed on the first sibling path a lone clone
+# lacked. Two things changed. (1) `evm-core` and `sbpf-core` (circuits' `guests-compiled/`, no
+# dependencies of their own) are VENDORED: the section after the guest copy below copies the two
+# crates whole, less `Cargo.lock` and `target/`, into `vendor/circuits/<crate>/`, lists every file
+# in `vendor/circuits/SHA256SUMS` and names the circuits commit in `vendor/circuits/PROVENANCE.md`,
+# the same manifest-and-pin shape `guests-compiled/` has (`tests/guest_provenance.rs` holds both
+# copies to their manifests and both pins to ci.yml's `CIRCUITS_PIN`; CI's `guest-provenance` job
+# byte-compares both against circuits at the pin). The two crates' manifests carry their own
+# `[workspace]` table (they are workspace roots upstream, so the guests' target builds never sweep
+# research in); the root `Cargo.toml` lists them under `[workspace] exclude` for that reason, and
+# the workspace depends on them by path like any external crate. (2) The CUDA backend
+# `rand-zkvm-cuda` is still NOT vendored (it `#[path]`-includes research's
+# `poseidon2_constants.rs` and carries the kernels); both manifests that name it
+# (`crates/randprotocol-zkvm/Cargo.toml`, hand-maintained, and `crates/randprotocol-rvm/Cargo.toml`,
+# written by the recursion section below) take it as an optional GIT dependency on the public
+# zkp-circuits repository at `CUDA_REV`, which cargo fetches itself (a few MB; the revision goes
+# into Cargo.lock whether or not a cuda feature is on). `CUDA_REV` defaults to the circuits commit
+# being synced and must be reachable from the public remote, or every `cargo metadata` fails until
+# it is pushed: set `CUDA_REV=<pushed commit>` to sync research from a commit that is not pushed
+# yet, and the script checks that `rand-zkvm-cuda/` and `research/src/poseidon2_constants.rs` are
+# identical between the two (CI's `guest-provenance` job checks the same). Building with
+# `--features cuda` / `mock-cuda` / `reference-backend` needs no sibling checkout any more.
 set -euo pipefail
 SRC=${1:-../circuits/research}
 DST=crates/randprotocol-zkvm
@@ -244,6 +265,54 @@ CIRCUITS_COMMIT=$(git -C "$CIRCUITS_ROOT" rev-parse HEAD)
     | while read -r f; do shasum -a 256 "$f"; done > SHA256SUMS )
 sed -i '' "s|^circuits: .*|circuits: $CIRCUITS_COMMIT|" "$DST/guests-compiled/PROVENANCE.md"
 echo "guests-compiled/SHA256SUMS regenerated; PROVENANCE.md names circuits $CIRCUITS_COMMIT — set ci.yml's CIRCUITS_PIN to it in the same commit"
+# Audit v6 PROC-2 (#109): the two interpreter cores, vendored whole (see the header). Copied from
+# the same checkout and refused under the same uncommitted-changes rule as the guests above, so
+# `vendor/circuits/PROVENANCE.md` names a commit the files are from. `Cargo.lock` is dropped (the
+# workspace's lock is the one cargo reads) and `target/` is never copied. Their manifests are
+# taken verbatim, `[workspace]` table included: the root `Cargo.toml` excludes the two paths from
+# membership, which is what lets a package with its own `[workspace]` sit inside this one.
+VENDOR=vendor/circuits
+if [ -n "$(git -C "$CIRCUITS_ROOT" status --porcelain -- guests-compiled/evm-core guests-compiled/sbpf-core 2>/dev/null)" ]; then
+  echo "sync-zkvm.sh: circuits' guests-compiled/{evm-core,sbpf-core} have uncommitted changes; $VENDOR/PROVENANCE.md would name a commit these files are not from" >&2
+  exit 1
+fi
+for CRATE in evm-core sbpf-core; do
+  if [ ! -f "$CIRCUITS_ROOT/guests-compiled/$CRATE/Cargo.toml" ]; then
+    echo "sync-zkvm.sh: expected crate at $CIRCUITS_ROOT/guests-compiled/$CRATE — not found" >&2
+    exit 1
+  fi
+  mkdir -p "$VENDOR/$CRATE"
+  rsync -a --delete --exclude target --exclude Cargo.lock "$CIRCUITS_ROOT/guests-compiled/$CRATE/" "$VENDOR/$CRATE/"
+  if grep -q '^\[dependencies\]' "$VENDOR/$CRATE/Cargo.toml" && awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f && NF && $1 !~ /^#/' "$VENDOR/$CRATE/Cargo.toml" | grep -q .; then
+    echo "sync-zkvm.sh: $CRATE grew a dependency; the vendored copy was chosen because it has none — read its manifest before vendoring it" >&2
+    exit 1
+  fi
+done
+( cd "$VENDOR" && find . -type f ! -name SHA256SUMS ! -name PROVENANCE.md | sed 's|^\./||' | LC_ALL=C sort \
+    | while read -r f; do shasum -a 256 "$f"; done > SHA256SUMS )
+sed -i '' "s|^circuits: .*|circuits: $CIRCUITS_COMMIT|" "$VENDOR/PROVENANCE.md"
+echo "$VENDOR/{evm-core,sbpf-core} re-copied; $VENDOR/SHA256SUMS regenerated; $VENDOR/PROVENANCE.md names circuits $CIRCUITS_COMMIT"
+# The CUDA backend's git revision (see the header): the commit being synced unless the caller
+# names one, and it has to be on the public remote or cargo cannot fetch it. The remote-tracking
+# check is against whatever remotes this checkout has; it cannot see a push it has not fetched.
+if [ -z "${CUDA_REV:-}" ]; then
+  CUDA_REV=$CIRCUITS_COMMIT
+  if [ -z "$(git -C "$CIRCUITS_ROOT" branch -r --contains "$CUDA_REV" 2>/dev/null)" ]; then
+    echo "sync-zkvm.sh: circuits $CUDA_REV is on no remote-tracking branch of $CIRCUITS_ROOT, so cargo could not fetch it as rand-zkvm-cuda's revision; push it, or pass CUDA_REV=<a pushed commit at which rand-zkvm-cuda/ and research/src/poseidon2_constants.rs are identical to this one>" >&2
+    exit 1
+  fi
+else
+  CUDA_REV=$(git -C "$CIRCUITS_ROOT" rev-parse --verify "$CUDA_REV^{commit}")
+  if ! git -C "$CIRCUITS_ROOT" diff --quiet "$CUDA_REV" "$CIRCUITS_COMMIT" -- rand-zkvm-cuda research/src/poseidon2_constants.rs; then
+    echo "sync-zkvm.sh: rand-zkvm-cuda/ or research/src/poseidon2_constants.rs differ between CUDA_REV=$CUDA_REV and the synced commit $CIRCUITS_COMMIT; the backend would build against a different constants table than the vendored crate" >&2
+    exit 1
+  fi
+fi
+# `crates/randprotocol-zkvm/Cargo.toml` is hand-maintained; its `rand-zkvm-cuda` line is rewritten
+# here so the two manifests name one revision (cargo treats two revisions as two crates).
+sed -i '' -E "s|^(rand-zkvm-cuda = \{ git = \"https://github.com/randprotocol/zkp-circuits\", rev = \")[0-9a-f]+(\", optional = true \})$|\1$CUDA_REV\2|" "$DST/Cargo.toml"
+grep -q "rev = \"$CUDA_REV\"" "$DST/Cargo.toml" || { echo "sync-zkvm.sh: $DST/Cargo.toml's rand-zkvm-cuda line did not match the pattern this script rewrites; update one of them" >&2; exit 1; }
+echo "rand-zkvm-cuda is zkp-circuits at $CUDA_REV in $DST/Cargo.toml (and in crates/randprotocol-rvm/Cargo.toml, below)"
 # rand_zkvm -> randprotocol_zkvm, but the *dependency* rand_zkvm_cuda keeps its own name (it is an
 # unmodified external crate), so park it behind a placeholder while the rename runs.
 grep -rl "rand_zkvm" "$DST/src" "$DST/tests" | xargs -I{} sed -i '' \
@@ -351,9 +420,15 @@ s = s.replace(anchor, const, 1)
 open(p, 'w').write(s)
 PY
 fi
+# The one hand fix the research section used to need after every sync, done here instead
+# (2026-10-01): upstream's `ledger.rs` doc comments still call the coin SHRUGG (three comments on
+# `fees_collected`/`burned`/`FeeInForeignAsset`); this side's copy says RAND. Comments only — the
+# file has no SHRUGG identifier — and `notes.rs`'s two SHRUGG comment lines are deliberately left
+# as upstream has them, as they always were.
+sed -i '' 's/SHRUGG/RAND/g' "$DST/src/ledger.rs"
 REV=$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
 echo "synced zkVM from $SRC at $REV into $DST"
-echo "reminder: --features cuda / mock-cuda need circuits checked out at ../../../circuits/rand-zkvm-cuda (i.e. circuits/ beside fullnode/)"
+echo "reminder: --features cuda / mock-cuda / reference-backend fetch rand-zkvm-cuda from zkp-circuits at $CUDA_REV; no sibling checkout is needed"
 
 # ── the recursion VM (rVM) → crates/randprotocol-rvm ────────────────────────────────────────────────
 # M5.3/M5.4's recursion VM, vendored at circuits main `271679d` ("Merge zkvm-m5-4") and re-vendored
@@ -385,9 +460,10 @@ echo "reminder: --features cuda / mock-cuda need circuits checked out at ../../.
 # `rand_zkvm` references point at the vendored `randprotocol_zkvm`, so the proof types unify.
 #
 # `rand-zkvm-cuda` is an *optional* path dependency of recursion (`reference-backend` /
-# `mock-cuda` / `cuda` features, all off by default): the vendored copy repoints it outside the
-# repo to `../../../circuits/rand-zkvm-cuda` exactly as `crates/randprotocol-zkvm`'s own optional cuda
-# dep already works — default features off, the CUDA feature stays unvendored. Building the
+# `mock-cuda` / `cuda` features, all off by default): the vendored copy repoints it to the public
+# zkp-circuits repository at `CUDA_REV` (the git form `crates/randprotocol-zkvm`'s own optional
+# cuda dep has; PROC-2, see the header) — default features off, the CUDA feature stays
+# unvendored, and no path leaves the repository. Building the
 # vendored crate's *tests* wants the fixture cache: `RECURSION_FIXTURES` pointing at a warm
 # `recursion/target/recursion-fixtures` saves the first run's re-proving (the cache re-verifies
 # every proof it loads, so a stale entry is a reprove, never a wrong pass). The two heavy test
@@ -412,8 +488,10 @@ grep -rl "rand_zkvm" "$RVM_DST" | xargs -I{} sed -i '' \
 sed -i '' \
       -e 's|^name = "recursion"|name = "randprotocol-rvm"|' \
       -e 's|path = "../research"|path = "../randprotocol-zkvm"|' \
-      -e 's|path = "../rand-zkvm-cuda"|path = "../../../circuits/rand-zkvm-cuda"|' \
+      -e "s|path = \"../rand-zkvm-cuda\"|git = \"https://github.com/randprotocol/zkp-circuits\", rev = \"$CUDA_REV\"|" \
       "$RVM_DST/Cargo.toml"
+grep -q "^rand-zkvm-cuda = { git = \"https://github.com/randprotocol/zkp-circuits\", rev = \"$CUDA_REV\", optional = true }$" "$RVM_DST/Cargo.toml" \
+  || { echo "sync-zkvm.sh: recursion's rand-zkvm-cuda line no longer matches the form this script rewrites (expected \`rand-zkvm-cuda = { path = \"../rand-zkvm-cuda\", optional = true }\`)" >&2; exit 1; }
 # Two manifest adjustments the rename cannot express: the dependency key must match the
 # *package* name (`randprotocol-zkvm`, hyphenated) even though the lib it links is `randprotocol_zkvm` —
 # the rename underscored it too — and recursion's own `[profile.*]` sections have to go: they
@@ -443,5 +521,20 @@ s = s.replace(anchor, want, 1)
 open(p, 'w').write(s)
 PY
 grep -rl "recursion::" "$RVM_DST/tests" | xargs -I{} sed -i '' 's/recursion::/randprotocol_rvm::/g' {} 2>/dev/null || true
+# Recursion's two hand fixes, done here instead of by hand after every sync (2026-10-01): the
+# manifest's `license.workspace = true` (the workspace licence, which upstream's own-root manifest
+# has no reason to carry) and `tests/backend.rs`'s doc comment naming this crate's sibling by its
+# current name.
+python3 - "$RVM_DST/Cargo.toml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if "license.workspace = true" not in s:
+    anchor = 'edition = "2021"\n'
+    assert anchor in s, "recursion's Cargo.toml lost its edition line; update sync-zkvm.sh"
+    s = s.replace(anchor, anchor + "license.workspace = true\n", 1)
+    open(p, 'w').write(s)
+PY
+sed -i '' 's|crates/shrugg-zkvm/tests/backend.rs|crates/randprotocol-zkvm/tests/backend.rs|' "$RVM_DST/tests/backend.rs"
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
 echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 18c2627) into $RVM_DST"
