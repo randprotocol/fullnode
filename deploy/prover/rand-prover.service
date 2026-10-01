@@ -4,9 +4,12 @@
 # this one, and the pool's shared pairing needs `--per-token`, which the node's flags do not carry.
 #
 # Installed by deploy/prover/install-host.sh, which fills in @THREADS@ (the cores the proof may
-# use: all but one, which stays the validator's) and @MEMORY_MAX@.
+# use: all but one, which stays the validator's), @MEMORY_MAX@, @HOME@ and @PORT@. Two instances
+# may run on one host while the pool moves to per-member keys (audit v7, VK-9):
+#   rand-prover-member.service  the member's own key, /var/lib/randprover-member, 127.0.0.1:8610
+#   rand-prover.service         the retiring shared pool key (wallet 0.6.8), /var/lib/randprover, :8600
 [Unit]
-Description=Rand delegated prover (prover.randprotocol.org pool)
+Description=Rand delegated prover (prover.randprotocol.org pool, @HOME@)
 After=network-online.target
 Wants=network-online.target
 
@@ -17,10 +20,10 @@ Group=randprover
 # 8 vCPUs), and one job waiting: a bundle proof has ledger::TIME_WINDOW = 256 blocks (about five
 # minutes) to land, so a longer line would hand wallets proofs too late to use. A prover with its
 # slot and its one waiting place taken answers `busy` and the router tries the next member.
-# --per-token is the whole capacity because every wallet pairs with the same public token.
+# --per-token is the whole capacity because every wallet pairs with the member's public token.
 Environment=RAYON_NUM_THREADS=@THREADS@
-ExecStart=/usr/local/bin/rand-prover --home /var/lib/randprover run \
-    --listen 127.0.0.1:8600 --max-parallel 1 --max-queue 1 --per-token 2 \
+ExecStart=/usr/local/bin/rand-prover --home @HOME@ run \
+    --listen 127.0.0.1:@PORT@ --max-parallel 1 --max-queue 1 --per-token 2 \
     --allow-origin chrome-extension://* --allow-origin moz-extension://* \
     --allow-origin safari-web-extension://* --allow-origin http://localhost:* \
     --allow-origin http://127.0.0.1:* --allow-origin http://[::1]:* \
@@ -57,7 +60,16 @@ SystemCallArchitectures=native
 CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-ReadOnlyPaths=/var/lib/randprover
+# Loopback only (audit v7, VK-13): the prover listens on 127.0.0.1 and is reached through the web
+# droplet's SSH tunnel, which lands on loopback too; it never needs to open a connection out, so a
+# compromised binary cannot send a viewing key or this member's key anywhere.
+IPAddressDeny=any
+IPAddressAllow=localhost
+# Only the system calls an ordinary service makes (VK-13).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete @raw-io @reboot @swap @module @clock
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=@HOME@
 InaccessiblePaths=-/root -/var/lib/randnode -/var/lib/rand-guardian -/etc/rand-guardian -/mnt
 UMask=0077
 

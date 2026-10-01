@@ -13,15 +13,18 @@ wallet ──https──> nginx (web droplet, TLS, per-address limit, no access 
                           └─ …
 ```
 
-**Status, 2026-10-01 06:00 UTC — four members, serving chain 19.** rand-node-a (sgp1) and
-rand-archive-2 (fra1), validators; **rand-prover-nyc3** (138.197.113.180) and **rand-prover-sfo3**
-(64.23.228.252), dedicated `c-8` prover droplets added on the user's request (no rand-node, no key
-of any kind but the pool's; DigitalOcean tag `prover`). All on `v0.6.7-prover.3` with
-`prover-watchdog.timer`; tunnels `prover-tunnel@8601…8604`; `prover_info.queue.max` is 4.
-Each new member proved a real chain-19 send directly (`260182c4…449b` 85.9 s, `48bbc2f5…404d`
-81.9 s). The guardian hosts were members for one night and are out for good — add capacity with
-more dedicated droplets (`doctl compute droplet create … --size c-8 --tag-names rand,prover`, then
-`install-host.sh` and `install-web.sh` with the whole member list). Window: issue #118.
+**Status, 2026-10-01 11:20 UTC — per-member keys (audit v7, VK-9).** Four members, each with
+its OWN key generated on its host and never copied (no backup): `a` (rand-node-a, ZEXQ-1JHV-ZT60-KFB5),
+`archive2` (rand-archive-2, D2XV-WXVT-PZRC-D7G8), `nyc3` (SR28-MYT0-GR6A-03DE) and `sfo3`
+(GMNX-Q1QD-FEXG-JHJM), at `https://prover.randprotocol.org/m/<member>`, listed in the pool descriptor
+`/.well-known/rand-prover-pool.json` that wallet 0.6.9 pins (`rand-prover-member.service`, port
+8610). **The shared key RGTF-7HKJ-XZFV-GQ1J is retiring:** wallet 0.6.8 pins it, so it still serves
+the root URL from the two dedicated droplets only (`rand-prover.service`, port 8600) until 0.6.9 is
+out and the owner decides the cut-over; then `retire-shared.sh` on nyc3/sfo3 and shred
+`~/rand-prover-trusted/home`. Every instance runs the hardened unit (loopback only, a syscall filter;
+`systemd-analyze security` 1.5, VK-13), installed only from a release whose SHA256SUMS verified against
+the release key (OPS-9), with a 600 s proving timeout coming in the next release (VK-12) and the
+watchdog meanwhile. The router meters submits per address across the pool (VK-10). Window: #118.
 
 ## What the pool is
 

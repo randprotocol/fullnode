@@ -15,15 +15,27 @@ request's method:
 - `prover_info` is any prover's answer with `queue` replaced by the pool's sums;
 - anything else, and every `OPTIONS` preflight, goes to one prover unchanged.
 
+Since the move to per-member keys (audit v7, VK-9) each member also has its own path,
+`/m/<name>`, which a wallet that pinned the pool descriptor uses: a job sealed to one member's key
+can only go to that member, so those requests are passed to it as they are. The root path above
+serves the retiring shared key (wallet 0.6.8).
+
 It opens nothing: jobs and replies are sealed end to end (docs/prover.md §6.3) and pass through as
 bytes. It authorises nothing either — the provers check the pairing token and the origin
-allow-list; the `Origin` header and the CORS reply headers are relayed untouched. Per-client
-metering is the fronting web server's job (nginx `limit_req`), not this process's.
+allow-list; the `Origin` header and the CORS reply headers are relayed untouched. nginx meters
+every request per address; this router also meters `prover_submit` per address across the whole
+pool (audit v7, VK-10): every token is public, so a slot is the only thing a flood can take, and a
+wallet submits once per send.
 
 Python 3 standard library only. Configuration, all environment:
 
-  PROVER_BACKENDS   comma-separated base URLs, e.g. http://127.0.0.1:8601,http://127.0.0.1:8602
+  PROVER_BACKENDS   the shared-key backends behind `/`, comma-separated base URLs
+  PROVER_MEMBERS    the members behind `/m/<name>`, comma-separated name=url
+  SUBMIT_BURST      submits one address may make at once (default 6)
+  SUBMIT_PER_MIN    and their refill per minute (default 3)
   ROUTER_LISTEN     ip:port to listen on (default 127.0.0.1:8650)
+
+The client address is nginx's X-Real-IP (the router listens on loopback only).
 """
 
 import json
@@ -60,6 +72,39 @@ FORWARDED_REQUEST_HEADERS = (
     "access-control-request-method",
     "access-control-request-headers",
 )
+
+
+class SubmitMeter:
+    """A token bucket per client address for `prover_submit` (VK-10). Bounded: past MAX_CLIENTS
+    addresses the stalest half is dropped, which can only ever be generous."""
+
+    MAX_CLIENTS = 100_000
+
+    def __init__(self, burst, per_min):
+        self.burst = float(burst)
+        self.rate = per_min / 60.0
+        self.lock = threading.Lock()
+        self.buckets = {}  # address -> (tokens, last)
+
+    def allow(self, address, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            tokens, last = self.buckets.get(address, (self.burst, now))
+            tokens = min(self.burst, tokens + (now - last) * self.rate)
+            if tokens < 1.0:
+                self.buckets[address] = (tokens, now)
+                return False
+            self.buckets[address] = (tokens - 1.0, now)
+            if len(self.buckets) > self.MAX_CLIENTS:
+                for addr, _ in sorted(self.buckets.items(), key=lambda kv: kv[1][1])[: self.MAX_CLIENTS // 2]:
+                    del self.buckets[addr]
+            return True
+
+
+def rate_limited(req_id):
+    """The answer to a submit over its address's budget: `busy`, which a wallet reads as "try the
+    next member" and, when every member says it, as "busy, try again later"."""
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": BUSY, "message": "busy", "data": {"reason": "too many submissions from this address; try again in a minute"}}}
 
 
 class Backend:
@@ -248,7 +293,9 @@ def error_code(reply):
     return None
 
 
-def make_handler(pool):
+def make_handler(pool, members=None, meter=None):
+    members = members or {}
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "rand-prover-router"
@@ -288,8 +335,26 @@ def make_handler(pool):
             self.end_headers()
             self.wfile.write(body)
 
+        def member(self):
+            """The member a `/m/<name>` path names, `None` for the root path, or False when the
+            path names no member."""
+            path = self.path.split("?", 1)[0]
+            if path in ("/", ""):
+                return None
+            if path.startswith("/m/") and path[3:] in members:
+                return members[path[3:]]
+            return False
+
         def do_OPTIONS(self):
-            self.relay(pool.any("OPTIONS", None, self.headers))
+            m = self.member()
+            if m is False:
+                return self.not_found()
+            self.relay(pool.any("OPTIONS", None, self.headers) if m is None else pool.exchange(m, "OPTIONS", None, self.headers))
+
+        def not_found(self):
+            self.send_response(404)
+            self.send_header("content-length", "0")
+            self.end_headers()
 
         def do_POST(self):
             try:
@@ -302,7 +367,16 @@ def make_handler(pool):
                 self.close_connection = True
                 self.plain(413, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": f"request body is larger than the {MAX_BODY_BYTES}-byte limit"}})
                 return
-            self.relay(pool.route(self.rfile.read(length), self.headers))
+            body = self.rfile.read(length)
+            m = self.member()
+            if m is False:
+                return self.not_found()
+            req = parse(body)
+            if meter is not None and isinstance(req, dict) and req.get("method") == "prover_submit":
+                address = self.headers.get("x-real-ip") or self.client_address[0]
+                if not meter.allow(address):
+                    return self.plain(200, rate_limited(req.get("id")))
+            self.relay(pool.route(body, self.headers) if m is None else pool.exchange(m, "POST", body, self.headers))
 
         def do_GET(self):
             self.send_response(405)
@@ -315,15 +389,21 @@ def make_handler(pool):
 
 def main():
     urls = [u.strip() for u in os.environ.get("PROVER_BACKENDS", "").split(",") if u.strip()]
-    if not urls:
-        sys.exit("PROVER_BACKENDS is empty: name at least one prover, e.g. http://127.0.0.1:8601")
+    members = {}
+    for item in os.environ.get("PROVER_MEMBERS", "").split(","):
+        if "=" in item:
+            name, url = item.split("=", 1)
+            members[name.strip()] = Backend(url.strip())
+    if not urls and not members:
+        sys.exit("PROVER_BACKENDS and PROVER_MEMBERS are empty: name at least one prover")
     host, _, port = os.environ.get("ROUTER_LISTEN", "127.0.0.1:8650").rpartition(":")
     pool = Pool(urls)
     pool.poll_once()
     threading.Thread(target=pool.poll_forever, daemon=True).start()
-    server = ThreadingHTTPServer((host, int(port)), make_handler(pool))
+    meter = SubmitMeter(int(os.environ.get("SUBMIT_BURST", "6")), float(os.environ.get("SUBMIT_PER_MIN", "3")))
+    server = ThreadingHTTPServer((host, int(port)), make_handler(pool, members, meter))
     server.daemon_threads = True
-    print(f"routing {len(urls)} prover(s) on {host}:{port}", file=sys.stderr, flush=True)
+    print(f"routing {len(urls)} shared-key prover(s) and {len(members)} member(s) on {host}:{port}", file=sys.stderr, flush=True)
     server.serve_forever()
 
 

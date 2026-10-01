@@ -245,5 +245,87 @@ class RouterTest(unittest.TestCase):
         self.assertIn("larger than", r["error"]["message"])
 
 
+class MemberRouteTest(unittest.TestCase):
+    """VK-9 and VK-10: `/m/<name>` goes to that member only; submits are metered per address."""
+
+    def setUp(self):
+        self.a, self.b = FakeProver("a"), FakeProver("b")
+        self.pool = router.Pool([])
+        members = {"a": router.Backend(self.a.url), "b": router.Backend(self.b.url)}
+        self.meter = router.SubmitMeter(burst=2, per_min=0)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), router.make_handler(self.pool, members, self.meter))
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        for f in (self.a, self.b):
+            try:
+                f.stop()
+            except Exception:
+                pass
+
+    def call(self, path, method, params=None, ip=None):
+        body = json.dumps({"jsonrpc": "2.0", "id": 9, "method": method, "params": params or []}).encode()
+        req = urllib.request.Request(self.base + path, data=body, method="POST", headers={"content-type": "application/json"})
+        if ip:
+            req.add_header("x-real-ip", ip)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                return e.code, json.loads(raw or b"null")
+            except ValueError:
+                return e.code, None
+
+    def test_a_member_path_reaches_that_member_only(self):
+        _, r = self.call("/m/b", "prover_submit", ["00"])
+        self.assertTrue(r["result"]["job"].startswith("b-"), r)
+        _, r = self.call("/m/b", "prover_status", [r["result"]["job"]])
+        self.assertEqual(r["result"]["held_by"], "b")
+        self.assertEqual(self.a.submits, 0)
+
+    def test_a_busy_member_is_not_replaced_by_another(self):
+        # A job sealed to b's key opens only on b: never forward it elsewhere.
+        self.b.busy = True
+        _, r = self.call("/m/b", "prover_submit", ["00"])
+        self.assertEqual(r["error"]["code"], -32005)
+        self.assertEqual(self.a.submits, 0)
+
+    def test_an_unknown_member_path_is_404(self):
+        status, _ = self.call("/m/zz", "prover_info")
+        self.assertEqual(status, 404)
+
+    def test_a_silent_member_is_a_plain_503(self):
+        self.a.stop()
+        status, r = self.call("/m/a", "prover_info")
+        self.assertEqual((status, r), (503, None))
+
+    def test_submits_are_metered_per_address_across_members(self):
+        # burst 2, no refill: the third submit from one address is busy, whichever member it names
+        for path in ("/m/a", "/m/b"):
+            _, r = self.call(path, "prover_submit", ["00"], ip="198.51.100.7")
+            self.assertIn("result", r)
+        _, r = self.call("/m/a", "prover_submit", ["00"], ip="198.51.100.7")
+        self.assertEqual(r["error"]["code"], -32005)
+        self.assertIn("too many submissions", r["error"]["data"]["reason"])
+        self.assertEqual(self.a.submits + self.b.submits, 2, "the metered submit never reached a prover")
+        # another address is unaffected, and status polls are never metered
+        _, r = self.call("/m/a", "prover_submit", ["00"], ip="198.51.100.8")
+        self.assertIn("result", r)
+        for _ in range(5):
+            _, r = self.call("/m/a", "prover_info", ip="198.51.100.7")
+            self.assertIn("result", r)
+
+    def test_the_meter_refills(self):
+        m = router.SubmitMeter(burst=1, per_min=60)
+        self.assertTrue(m.allow("x", now=0.0))
+        self.assertFalse(m.allow("x", now=0.5))
+        self.assertTrue(m.allow("x", now=1.1))
+
+
 if __name__ == "__main__":
     unittest.main()
