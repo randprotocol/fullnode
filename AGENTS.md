@@ -4,7 +4,23 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-09-30)
+## Project memory (state as of 2026-10-01)
+
+### v0.6.8 — RPL-2: program state, program vaults and `Invoke` (`feat/rpl2` rebased onto the audit-v6 fixes; untagged; on no chain yet)
+
+Program cells (`Word8` → `Word8` per program), program vaults (per-asset balances a program holds)
+and `Action::Invoke` (tag 33, appended after audit v6's `AdmitValidator` … `CancelRotation`, 28–32) with a declared `Transition` (reads, writes, inflow, pays, mints),
+all behind a `program_state` genesis section (`rand-node genesis --program-state-cell-fee`); a chain
+without the section refuses the action, so **no live chain changes by running this build** — but it
+is a consensus feature, so it reaches a chain only by a cut: chain 19 is cut on v0.6.7 without it,
+so **chain 20 is the first chain that can carry RPL-2**. `MintAuthority::Program(id)` lets a
+program mint its own token through an invoke's `mints`. Spec: `docs/program-state.md`. Traps:
+a read of an absent cell declares zero; reads are checked against state at admission and again by
+the pool (`program_state::still_applies` prunes a stale invoke), and a replay fails on its spent
+nullifiers before its read is looked at; payout notes are sealed against the bundle's `time` and
+appended after the bundle's four commitments (pays, then mints). The real-proof e2e
+(`wallet_flow::an_invoke_moves_a_cell_fills_a_vault_pays_out_and_mints_end_to_end`) passed on
+2026-10-01 in 931 s on a c-16. First user: the durian.market AMM devnet (chain 1919).
 
 ### Audit v6 fixes — on `main`, untagged, NOT rolled, NOT cut (2026-09-30)
 
