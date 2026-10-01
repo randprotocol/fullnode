@@ -6,6 +6,26 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-10-01)
 
+### Proving defaults: `--threads`, `--cpu`, the GPU by default (2026-10-01, after v0.7.0; node-only, any chain)
+
+The audit v7 addendum's proving slide, the user's ruling ("CPU tuning for now; if a GPU is
+detected, default to GPU proving"). One module decides for all three proving binaries,
+`randprotocol_prover::proving` (8 unit tests): **threads** — `--threads N` (`--prover-threads` on
+`rand-node run --prover`) > `RAYON_NUM_THREADS` > the role's default, `rand` every core (one
+proof, a person waiting), `rand-prover run` / the hosted prover the cores minus one capped at
+`SERVICE_THREAD_CAP` 8 (a c-8 member gets 7, what `install-host.sh` set by hand; it now caps at
+8 too); `0` or a junk env value is refused, never defaulted; the global rayon pool is built at
+startup (`install_thread_pool`; an already-built pool is a warning, not a refusal). **Backend** —
+`choose_backend(cuda, cpu, BUILD_HAS_CUDA, gpu_visible())`: `--cuda` is the GPU and nothing else
+(no fallback, as before), `--cpu` (`--prover-cpu`) the CPU, neither = a CUDA build takes a
+visible GPU (`/dev/nvidia*`, `/proc/driver/nvidia/version`, `nvidia-smi` on PATH — a presence
+check, not a probe) and says so once; a build without the backend prints once that a visible GPU
+is going unused. The release binaries have no CUDA backend, so the default changes nothing on
+the fleet or the pool. Measurements (M4 Max, tier-14 production bundle: 1→107.5 s, 4→30.7 s 87 %,
+8→17.1 s 78 %, 16→13.9 s ~48 %; 80 % Poseidon2 Merkle hashing; the GPU covers 87.4 %) are
+`docs/node-hardware.md` §6. Trap: `match cli.cmd` partially moves `Cli`, so the wallet's new
+globals are threaded through `proving_for(…, cuda, cpu, …)` by value, not through `&cli`.
+
 ### v0.6.8 — RPL-2: program state, program vaults and `Invoke` (`feat/rpl2` rebased onto the audit-v6 fixes; untagged; on no chain yet)
 
 Program cells (`Word8` → `Word8` per program), program vaults (per-asset balances a program holds)

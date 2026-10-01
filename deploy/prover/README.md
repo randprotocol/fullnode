@@ -60,7 +60,7 @@ router (a `e89e2cc4…`, archive2 `7c404236…`, nyc3 `bdc88a53…`, sfo3 `f925b
 |---|---|---|
 | `install-host.sh` | operator's machine → a prover host | the release's `rand-prover` (sha-checked), the pool's key and pairing, the unit, the tunnel user |
 | `resize-host.sh` | operator's machine → DigitalOcean | a CPU/RAM-only resize of one validator host (default `c-8`), node stopped cleanly, waits for health |
-| `rand-prover.service` | prover host | the sandboxed unit (`@THREADS@`, `@MEMORY_MAX@` filled in by the script) |
+| `rand-prover.service` | prover host | the sandboxed unit (`@THREADS@`, `@MEMORY_MAX@` filled in by the script; `@THREADS@` = the cores minus one, at most 8 — the same figure `rand-prover run` now defaults to, kept explicit in the unit so a host reads it) |
 | `install-web.sh` | operator's machine → the web droplet | tunnels, router, nginx vhost, certificate, the pairing document |
 | `prover-tunnel@.service` | web droplet | one tunnel; the instance name is the local port |
 | `rand-prover-router.service`, `router.py` | web droplet | the router; `test_router.py` tests it against fake provers |

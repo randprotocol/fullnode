@@ -50,7 +50,7 @@ if [ "$AVAIL_MB" -lt 7000 ] || [ "$CPUS" -lt 2 ]; then
     echo "$TARGET: $CPUS cpu(s), $AVAIL_MB MB available — a prover needs ~7 GB available and a second core. Resize the host first." >&2
     exit 1
 fi
-THREADS=$((CPUS - 1))
+THREADS=$((CPUS - 1)); [ "$THREADS" -le 8 ] || THREADS=8   # rand-prover's own default (docs/node-hardware.md §6)
 MEMORY_MAX=8G
 echo "$TARGET ($MEMBER): $CPUS cpus, $AVAIL_MB MB available; $TAG rand-prover ${WANT_SHA:0:16}… (signature verified)"
 

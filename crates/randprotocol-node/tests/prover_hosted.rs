@@ -74,6 +74,8 @@ fn options(addr: &str, home: &Path) -> Options {
         max_parallel: 1,
         max_queue: 4,
         cuda: false,
+        cpu: false,
+        threads: None,
         // The gate is `rand-prover`'s own, tested there; a test machine need not hold a prover.
         skip_memory_check: true,
         allow_origins: vec![],

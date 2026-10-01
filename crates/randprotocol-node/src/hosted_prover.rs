@@ -30,6 +30,10 @@ pub struct Options {
     pub max_parallel: usize,
     pub max_queue: usize,
     pub cuda: bool,
+    /// `--prover-cpu`.
+    pub cpu: bool,
+    /// `--prover-threads`.
+    pub threads: Option<usize>,
     pub skip_memory_check: bool,
     /// `--prover-allow-origin` values: empty = the default list (extensions and loopback pages),
     /// otherwise the whole list; `*` = every origin.
@@ -92,13 +96,30 @@ pub fn prepare(o: &Options) -> Result<HostedProver> {
         ),
         Err(e) => return Err(anyhow::Error::new(e).context(format!("loading {}", key_path.display()))),
     };
-    let backend = match o.cuda {
-        false => Backend::Cpu,
-        #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
-        true => Backend::Cuda,
-        #[cfg(not(any(feature = "cuda", feature = "mock-cuda")))]
-        true => anyhow::bail!("built without CUDA support; rebuild rand-node with --features cuda"),
+    let backend = {
+        use randprotocol_prover::proving::{self, Choice};
+        let (choice, note) = proving::choose_backend(o.cuda, o.cpu, proving::BUILD_HAS_CUDA, proving::gpu_visible()).map_err(anyhow::Error::msg)?;
+        if let Some(n) = note {
+            eprintln!("{n}");
+            tracing::info!("{n}");
+        }
+        match choice {
+            Choice::Cpu => Backend::Cpu,
+            #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
+            Choice::Cuda => Backend::Cuda,
+            #[cfg(not(any(feature = "cuda", feature = "mock-cuda")))]
+            Choice::Cuda => unreachable!("choose_backend never picks the GPU for a build without it"),
+        }
     };
+    {
+        use randprotocol_prover::proving;
+        let n = proving::threads_for(o.threads, std::env::var("RAYON_NUM_THREADS").ok().as_deref(), proving::available_threads(), proving::Role::Service)
+            .map_err(anyhow::Error::msg)?;
+        if let Err(e) = proving::install_thread_pool(n) {
+            tracing::warn!("{e}");
+        }
+        tracing::info!(threads = n, backend = ?backend, "hosted prover proving");
+    }
     let pairings_path = home.join("pairings.json");
     let pairings = Pairings::load(&pairings_path).with_context(|| format!("loading {}", pairings_path.display()))?;
     if o.skip_memory_check {

@@ -277,3 +277,40 @@ recursion machine) has its own tiers, sized in rows (`docs/zkvm-m4-m5-progress.m
 
 No proof above tier 14 is part of normal chain operation today. Tier 18 and 20 matter for calls to
 the translated ERC-20 and SPL Token programs ([`translators.md`](translators.md#7-what-works-on-chain-today)).
+
+## 6. Threads and the GPU
+
+Measured 2026-10-01 (the audit v7 addendum's proving slide): one production tier-14 bundle proof
+on an Apple M4 Max, the `parallel` build, threads set with `RAYON_NUM_THREADS`.
+
+| threads | wall time | speed-up | parallel efficiency |
+|---:|---:|---:|---:|
+| 1 | 107.5 s | 1.0× | 100 % |
+| 4 | 30.7 s | 3.5× | 87 % |
+| 8 | 17.1 s | 6.3× | 78 % |
+| 16 | 13.9 s | 7.7× | about 48 % |
+
+About 80 % of the time is Poseidon2 Merkle hashing (170 million permutations a proof); the FFTs
+are most of the rest. The CUDA backend (`rand-zkvm-cuda`) moves the Merkle hashing and the FFTs,
+87.4 % of the CPU time, to the device.
+
+**What the binaries do with it** (`randprotocol_prover::proving`, the one place all three
+decide):
+
+- `rand` proves one bundle with a person waiting, so it takes **every core** by default; the
+  eighth-to-sixteenth threads still cut the wall time by a fifth.
+- `rand-prover run` and `rand-node run --prover` share their host (the pool's members run
+  beside a validator) and prove jobs back to back, so they take **the cores minus one, at most
+  8** — the eighth thread returns 78 % of itself, the sixteenth about half — and a bigger host
+  serves more jobs at once (`--max-parallel`) rather than one job on more threads. A c-8 member
+  gets 7, which is what `deploy/prover/install-host.sh` has always set.
+- `--threads N` (`--prover-threads` on the node) overrides either; so does `RAYON_NUM_THREADS`
+  when no flag is given. `0`, or an env value that is not a count, is refused, never defaulted.
+- **The GPU is used by default when it can be.** A build with the CUDA backend (`--features
+  cuda`) proves on a visible NVIDIA GPU (a `/dev/nvidia*` node, `/proc/driver/nvidia`, or
+  `nvidia-smi` on the `PATH`) without being asked, and says so once; `--cpu` (`--prover-cpu`)
+  keeps it on the CPU. `--cuda` still means the GPU and nothing else — no CPU fallback, a device
+  that will not open is an error. A build without the backend proves on the CPU and, when a GPU
+  is visible, prints once that it is going unused and how to rebuild. The release binaries are
+  built without the backend (a CUDA 13 toolkit is not on the release runner), so a GPU host
+  builds its own `rand`/`rand-prover` with `--features cuda`.

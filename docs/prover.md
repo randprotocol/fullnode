@@ -135,6 +135,8 @@ wallet can take pasted text, paste the link instead.
 | `--max-queue <N>` | `8` | jobs waiting beyond those proving |
 | `--per-token <N>` | `2` | jobs one pairing may have queued or proving at once |
 | `--cuda` | off | prove on the CUDA backend; needs a build with `--features cuda`, and there is no CPU fallback |
+| `--cpu` | off | prove on the CPU even when a GPU is visible to a CUDA build (without either flag such a build takes the GPU and logs that it did; `docs/node-hardware.md` §6) |
+| `--threads <N>` | the cores minus one, at most 8 | CPU threads one proof uses (`RAYON_NUM_THREADS` when set and no flag); `docs/node-hardware.md` §6 has the measured curve |
 | `--skip-memory-check` | off | start even when the memory gate below would refuse |
 | `--prove-timeout-secs <S>` | `600` | the longest one proof may take; past it the job fails `the proof did not finish in time` and the process exits with status 75 so systemd restarts a clean prover (audit v7, VK-12); `0` = no limit. `rand-node run --prover` applies the same 600 s limit but only logs, so a validator is never stopped by its prover |
 | `--allow-origin <ORIGIN>` | extensions and loopback pages | a browser origin whose pages may read replies, repeatable; given once or more, the values are the whole list; `*` = every origin (opt-in, warned) — §6.1 |
@@ -223,6 +225,8 @@ rand-node run --datadir /root/data --key /root/keys/node.key.json \
 | `--prover-max-parallel <N>` | `1` | as `--max-parallel` |
 | `--prover-max-queue <N>` | `8` | as `--max-queue` |
 | `--prover-cuda` | off | as `--cuda` (a `rand-node` built with `--features cuda`) |
+| `--prover-cpu` | off | as `--cpu` |
+| `--prover-threads <N>` | the cores minus one, at most 8 | as `--threads` |
 | `--prover-skip-memory-check` | off | as `--skip-memory-check` |
 | `--prover-allow-origin <ORIGIN>` | extensions and loopback pages | as `--allow-origin` (§6.1) |
 | `--prover-fee <RAND>` | none | as `--fee` (§3.5); needs `--prover-fee-address` |

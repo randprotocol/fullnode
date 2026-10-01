@@ -16,7 +16,7 @@ service = ["dep:axum", "dep:tokio", "dep:sysinfo", "dep:tracing", "dep:tracing-s
 # 68.6 s with it, peak RSS 5.88 GB against 5.74 GB; the proof verifies and commits the same. It
 # comes with `service` because a prover has a deadline (a bundle lands within
 # `ledger::TIME_WINDOW` blocks or not at all) and never builds for wasm, where rayon does not.
-parallel = ["dep:p3-maybe-rayon"]
+parallel = ["dep:p3-maybe-rayon", "dep:rayon"]
 cuda = ["randprotocol-zkvm/cuda"]
 mock-cuda = ["randprotocol-zkvm/mock-cuda"]
 
@@ -38,6 +38,8 @@ rand = { version = "=0.10.2", features = ["std_rng"] }
 rand_core = "=0.10.1"
 # Named only for its feature (see `parallel` above); the version is the zkvm crate's Plonky3 pin.
 p3-maybe-rayon = { version = "=0.7.0", features = ["parallel"], optional = true }
+# The pool `proving::install_thread_pool` sizes (`--threads`); the version is whatever Plonky3 pulls.
+rayon = { version = "1", optional = true }
 # StdRng's stream is ChaCha12 from `chacha20` (HCS-1's third pin, as in the zkvm crate); named only for the pin.
 chacha20 = { version = "=0.10.2", default-features = false }
 axum = { workspace = true, optional = true }

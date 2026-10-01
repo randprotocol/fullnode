@@ -333,7 +333,9 @@ one the cut announced; a mismatch on one node is almost always an old binary.
 | `--prover-accept-spend-key` | retired | **refused at startup** (audit v6, VK-4): a prover no longer accepts a spend-key witness from any wallet. `rand-node run` given this flag, with or without `--prover`, exits before the node key is read with `--prover-accept-spend-key was retired in this release … remove the flag` — take it out of the unit file (`docs/prover.md` §2) |
 | `--prover-max-parallel <N>` | `1` | proofs the hosted prover runs at once; the start is refused unless 5.74 GB × N + 1 GiB of memory is available |
 | `--prover-max-queue <N>` | `8` | jobs queued beyond those running |
-| `--prover-cuda` | off | prove on the CUDA backend (a build with `--features cuda`); no CPU fallback |
+| `--prover-cuda` | off | prove on the CUDA backend (a build with `--features cuda`); no CPU fallback. Without it or `--prover-cpu`, a CUDA build takes a visible GPU and logs that it did (`docs/node-hardware.md` §6) |
+| `--prover-cpu` | off | prove on the CPU even when a GPU is visible to a CUDA build |
+| `--prover-threads <N>` | the cores minus one, at most 8 | CPU threads the hosted prover's proofs use (`RAYON_NUM_THREADS` when set and no flag) |
 | `--prover-skip-memory-check` | off | skip the free-memory gate |
 | `--prover-fee <RAND>` | none | the fee every job sent to the hosted prover must pay, in RAND (display units, up to 9 decimals): one RAND output to `--prover-fee-address` inside the bundle proved; needs `--prover-fee-address`, and only a v3 (split-authorisation) witness can carry it (`docs/prover.md` §3.5) |
 | `--prover-fee-address <ADDRESS>` | none | the `rand1…` address the hosted prover's fee is paid to; needs `--prover-fee` |
@@ -412,6 +414,8 @@ Global options, accepted before or after the subcommand:
 | `--key <KEY>` | `RAND_KEY` | `wallet.key.json` | spend-key file; the note store lives beside it at `<key>.notes.json`. The store is bound to the chain it was scanned against (its `genesis` field, the node's `rand_getGenesisHash`): pointed at a node on another chain — a wallet file kept across a chain cut — it is emptied and rescanned from leaf 0 with a warning, never scanned from a cursor past the new chain's tree. A store written before the binding existed is rescanned once, the same way |
 | `--prover` | | off | prove the bundle on the prover paired with this wallet (`rand prover pair`) instead of on this machine; the proof is checked here — its digest read off the proof, its size and a local verify — before it goes into a transaction. Applies to every command that proves a bundle: `send`, `bond`, `program deploy`, `call` (the paying bundle only; the call proof stays local), `bridge-mint`, `bridge-rotate`, `bridge-burn`, and `token create`/`mint`/`burn`/`set-authority`/`register-bridged`/`list-backing`. Refused together with `--cuda` — except `call`, whose call proof takes `--cuda`; the paying bundle still goes to the prover — and without a pairing. The trust model is in [`docs/prover.md`](prover.md): a prover is sent the viewing-key witness (`nk`), never the spend key. It works on a split-authorisation chain (`rand_status` names bundle guest v3 and `hc_auth`): any paired prover may take the witness — each gets a one-time warning that it can read this wallet's whole history and cannot spend — and the auth proof is always made on this machine; the summary line then reports both proving times. On a chain whose bundle guest is v1 or v2 `--prover` is refused before the prover is asked anything (`delegated proving needs a split-authorisation chain (bundle guest v3): … the spend key never leaves the wallet`); prove on this machine there. A prover that quotes a fee (`prover_info.fee`) is paid by one more RAND output in the same bundle, shown as `prover fee: <amount> RAND to <fingerprint>` (in `send`'s confirmation, on stderr elsewhere) and capped by `--max-prover-fee` |
 | `--max-prover-fee <RAND>` | | `1` | the most a paired prover may charge per bundle, in RAND (display units, up to 9 decimals). A quote above it is refused before any bundle is built, on every command (`the prover quotes <q> RAND; the cap is <c> RAND (--max-prover-fee) — not building the bundle`); `0` refuses any fee. A fee on a chain whose bundle guest is v1 or v2 is refused whatever the cap: only a v3 witness can carry it |
+| `--threads <N>` | | every core | CPU threads a proof made on this machine uses; `RAYON_NUM_THREADS` when set and no flag; `0` refused. A wallet proves one bundle with a person waiting, so the default is every core (`docs/node-hardware.md` §6: 8 threads 17.1 s, 16 threads 13.9 s on an M4 Max) |
+| `--cpu` | | off | prove on the CPU even when a GPU is visible to a build with the CUDA backend; without `--cpu` or `--cuda` such a build takes the GPU and says so once on stderr |
 
 | command | arguments | behaviour |
 |---|---|---|
@@ -499,7 +503,9 @@ public in that transaction) for every mint, so the note can be rebuilt by hand, 
 registry already names cannot move: an index is assigned once, forever.
 
 `--cuda` proves on an attached NVIDIA GPU and requires a build with `--features cuda`. There is no
-fallback: a missing driver is an error rather than a silent CPU run.
+fallback: a missing driver is an error rather than a silent CPU run. A CUDA build given neither
+`--cuda` nor `--cpu` proves on a visible GPU and says so once on stderr; a build without the
+backend prints once, when a GPU is visible, that it is going unused (`docs/node-hardware.md` §6).
 
 **Public inputs.** `program deploy --public <FILE>` stores a public input with the program, on a
 chain whose genesis sets `max_program_public_words` (0, none, by default). The file is one of two

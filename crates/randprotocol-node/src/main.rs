@@ -709,9 +709,17 @@ enum Cmd {
         /// Jobs the hosted prover queues beyond those running.
         #[arg(long, default_value_t = 8)]
         prover_max_queue: usize,
-        /// Prove on the CUDA backend (a build with the `cuda` feature); no CPU fallback.
+        /// Prove on the CUDA backend (a build with the `cuda` feature); no CPU fallback. With
+        /// neither this nor `--prover-cpu`, a CUDA build takes a visible GPU and logs that it did.
         #[arg(long)]
         prover_cuda: bool,
+        /// Prove on the CPU even when a GPU is visible to a CUDA build.
+        #[arg(long, conflicts_with = "prover_cuda")]
+        prover_cpu: bool,
+        /// CPU threads the hosted prover's proofs use (default: the cores minus one, at most 8 —
+        /// `docs/node-hardware.md` §6; `RAYON_NUM_THREADS` when set).
+        #[arg(long, value_name = "N")]
+        prover_threads: Option<usize>,
         /// Skip the free-memory gate that refuses a prover the machine cannot hold.
         #[arg(long)]
         prover_skip_memory_check: bool,
@@ -1883,6 +1891,8 @@ async fn main() -> Result<()> {
             prover_max_parallel,
             prover_max_queue,
             prover_cuda,
+            prover_cpu,
+            prover_threads,
             prover_skip_memory_check,
             prover_allow_origin,
             prover_fee,
@@ -1912,6 +1922,8 @@ async fn main() -> Result<()> {
                     max_parallel: prover_max_parallel,
                     max_queue: prover_max_queue,
                     cuda: prover_cuda,
+                    cpu: prover_cpu,
+                    threads: prover_threads,
                     skip_memory_check: prover_skip_memory_check,
                     allow_origins: prover_allow_origin,
                     fee: prover_fee,

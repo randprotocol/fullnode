@@ -51,6 +51,13 @@ struct Cli {
     /// fee.
     #[arg(long, global = true, value_name = "RAND", default_value = "1")]
     max_prover_fee: String,
+    /// CPU threads a proof made on this machine uses (default: every core; `RAYON_NUM_THREADS`
+    /// when set). `docs/node-hardware.md` §6 has the measured curve.
+    #[arg(long, global = true, value_name = "N")]
+    threads: Option<usize>,
+    /// Prove on the CPU even when a GPU is visible to a build that has the CUDA backend.
+    #[arg(long, global = true)]
+    cpu: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -1093,27 +1100,31 @@ async fn profile_of(rpc: &RpcClient) -> Result<FriProfile> {
 }
 
 /// No fallback: `--cuda` on a build or a machine that cannot run it is an error, so a proof is
-/// never quietly produced somewhere other than where it was asked for.
-fn backend_for(cuda: bool) -> Result<Backend> {
-    if !cuda {
-        return Ok(Backend::Cpu);
+/// never quietly produced somewhere other than where it was asked for. With neither `--cuda` nor
+/// `--cpu`, a build that has the CUDA backend takes a visible GPU and says so on stderr
+/// (`randprotocol_prover::proving::choose_backend`).
+fn backend_for(cuda: bool, cpu: bool) -> Result<Backend> {
+    use randprotocol_prover::proving::{self, Choice};
+    let (choice, note) = proving::choose_backend(cuda, cpu, proving::BUILD_HAS_CUDA, proving::gpu_visible()).map_err(|e| anyhow!("{e}"))?;
+    if let Some(n) = note {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| eprintln!("{n}"));
     }
-    #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
-    {
-        Ok(Backend::Cuda)
-    }
-    #[cfg(not(any(feature = "cuda", feature = "mock-cuda")))]
-    {
-        anyhow::bail!("built without CUDA support; rebuild rand with --features cuda")
-    }
+    Ok(match choice {
+        Choice::Cpu => Backend::Cpu,
+        #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
+        Choice::Cuda => Backend::Cuda,
+        #[cfg(not(any(feature = "cuda", feature = "mock-cuda")))]
+        Choice::Cuda => unreachable!("choose_backend never picks the GPU for a build without it"),
+    })
 }
 
 /// How this invocation proves its bundle: on the paired prover under `--prover`, else here on
 /// `--cuda`'s backend. Both at once is refused — a proof is made in one place, the one asked for.
-fn proving_for(prover: bool, cuda: bool, key: &Path, max_prover_fee: &str) -> Result<Proving> {
+fn proving_for(prover: bool, cuda: bool, cpu: bool, key: &Path, max_prover_fee: &str) -> Result<Proving> {
     let cap = parse_amount(max_prover_fee).map_err(|e| anyhow!("--max-prover-fee {max_prover_fee}: {e}"))?;
     if !prover {
-        return Ok(Proving::local(backend_for(cuda)?));
+        return Ok(Proving::local(backend_for(cuda, cpu)?));
     }
     if cuda {
         anyhow::bail!("--prover and --cuda: the bundle is proved on the paired prover or on this machine's GPU, not both");
@@ -1299,6 +1310,16 @@ fn read_hex_arg(arg: &str) -> Result<Vec<u8>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // The thread pool a local proof runs on, sized before anything proves (`--threads`, else
+    // `RAYON_NUM_THREADS`, else every core — a wallet proves one bundle with a person waiting).
+    {
+        use randprotocol_prover::proving;
+        let threads = proving::threads_for(cli.threads, std::env::var("RAYON_NUM_THREADS").ok().as_deref(), proving::available_threads(), proving::Role::Wallet)
+            .map_err(|e| anyhow!("{e}"))?;
+        if let Err(e) = proving::install_thread_pool(threads) {
+            eprintln!("warning: {e}");
+        }
+    }
     let rpc = RpcClient::new(cli.rpc.clone());
     match cli.cmd {
         Cmd::Keygen => {
@@ -1605,7 +1626,7 @@ async fn main() -> Result<()> {
             println!("{}", confirmation(name.as_deref(), &to.fingerprint().to_string(), &shown, &memo_text));
             // A paired prover's fee and, for one not the owner's own, what it can read: shown
             // before the y/N, so both can be declined (spec §5).
-            let proving = proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?;
+            let proving = proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?;
             for line in wallet::prover_confirmation(&rpc, &proving).await? {
                 println!("{line}");
             }
@@ -1676,7 +1697,7 @@ async fn main() -> Result<()> {
             // note, and the ledger admits a bond only when the bundle burns exactly what is
             // bonded. The unit is RAND, which is now in the type rather than in this comment.
             let s =
-                wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::rand(amount), profile, &proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
+                wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::rand(amount), profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
                     .await;
             store.save(&path)?;
             report(&s?, "bond");
@@ -1757,7 +1778,7 @@ async fn main() -> Result<()> {
             let fee = wallet::deploy_fee_default(&action);
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, &proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?, chain_id, true).await;
+            let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, true).await;
             store.save(&path)?;
             // No repeat of the program id/hc line after submission: both are pure functions of
             // the file the wallet loaded (checked above, before the proof), never of the chain's
@@ -1879,7 +1900,7 @@ async fn main() -> Result<()> {
             }
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let proving = if cli.prover { proving_for(true, false, &cli.key, &cli.max_prover_fee)? } else { Proving::local(Backend::Cpu) };
+            let proving = if cli.prover { proving_for(true, false, false, &cli.key, &cli.max_prover_fee)? } else { Proving::local(Backend::Cpu) };
             // The dry run over the REAL context words — the guest branches on them — with eight
             // zero words standing in for the binding, which the guest never reads.
             let context = {
@@ -1994,10 +2015,10 @@ async fn main() -> Result<()> {
             }
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let backend = backend_for(cuda)?;
+            let backend = backend_for(cuda, cli.cpu)?;
             // The call proof is always made here, on `--cuda`'s backend; `--prover` moves only the
             // paying bundle.
-            let proving = if cli.prover { proving_for(true, false, &cli.key, &cli.max_prover_fee)? } else { Proving::local(backend) };
+            let proving = if cli.prover { proving_for(true, false, false, &cli.key, &cli.max_prover_fee)? } else { Proving::local(backend) };
             if public.is_empty() {
                 eprintln!("proving the call locally ({} inputs stay private)…", inputs.len());
             } else {
@@ -2293,7 +2314,7 @@ async fn main() -> Result<()> {
                 None => gas::fee_floor(&action),
             };
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
+            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;
@@ -2382,7 +2403,7 @@ async fn main() -> Result<()> {
                 None => gas::fee_floor(&action),
             };
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
+            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;
@@ -2431,7 +2452,7 @@ async fn main() -> Result<()> {
                 to,
                 fee,
                 profile,
-                &proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?,
+                &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?,
                 chain_id,
                 !no_wait,
             )
@@ -2460,7 +2481,7 @@ async fn main() -> Result<()> {
             };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit_token_burn(&rpc, &w, &mut store, asset, amount, fee, profile, &proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
+            let s = wallet::submit_token_burn(&rpc, &w, &mut store, asset, amount, fee, profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             report(&s?, "token burn");
@@ -2489,7 +2510,7 @@ async fn main() -> Result<()> {
             eprintln!("registering {symbol} ({name}): fee {} RAND", format_amount(fee));
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
+            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;
@@ -2511,7 +2532,7 @@ async fn main() -> Result<()> {
             };
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
+            let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
                 .await;
             store.save(&path)?;
             let s = s?;
@@ -2592,7 +2613,7 @@ async fn main() -> Result<()> {
                 salt,
                 fee,
                 profile,
-                &proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?,
+                &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?,
                 chain_id,
                 !no_wait,
             )
@@ -2646,7 +2667,7 @@ async fn main() -> Result<()> {
                 None => gas::fee_floor(&action),
             };
             let profile = profile_of(&rpc).await?;
-            let s = wallet::submit_token_mint(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait).await;
+            let s = wallet::submit_token_mint(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait).await;
             store.save(&path)?;
             report(&s?, "token mint");
             println!("minted {amount_text} ({amount} units) of asset {asset} to {to}");
@@ -2677,7 +2698,7 @@ async fn main() -> Result<()> {
             };
             let profile = profile_of(&rpc).await?;
             let s =
-                wallet::submit_token_set_authority(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
+                wallet::submit_token_set_authority(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
                     .await;
             store.save(&path)?;
             report(&s?, "set token authority");
@@ -3309,5 +3330,17 @@ mod tests {
         let text = pay_link(&a);
         assert!(text.starts_with("randpay:"), "{text}");
         assert_eq!(PaymentUri::parse(&text).unwrap().address, a);
+    }
+
+    #[test]
+    fn cuda_and_cpu_together_are_refused_and_cpu_alone_is_the_cpu() {
+        let e = backend_for(true, true).unwrap_err().to_string();
+        assert!(e.contains("--cuda and --cpu"), "{e}");
+        assert_eq!(backend_for(false, true).unwrap(), Backend::Cpu);
+        // The global `--threads` and `--cpu` parse on every subcommand.
+        let cli = Cli::try_parse_from(["rand", "--threads", "3", "--cpu", "address"]).unwrap();
+        assert_eq!((cli.threads, cli.cpu), (Some(3), true));
+        let cli = Cli::try_parse_from(["rand", "address", "--threads", "3"]).unwrap();
+        assert_eq!(cli.threads, Some(3));
     }
 }

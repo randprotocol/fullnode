@@ -5,6 +5,7 @@ pub mod wire;
 pub mod key;
 pub mod pairing;
 pub mod origins;
+pub mod proving;
 #[cfg(feature = "service")]
 pub mod service;
 #[cfg(feature = "service")]

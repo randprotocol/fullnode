@@ -64,8 +64,17 @@ enum Cmd {
         max_queue: usize,
         #[arg(long, default_value_t = 2)]
         per_token: usize,
+        /// Prove on the CUDA backend (a build with `--features cuda`); no CPU fallback. With
+        /// neither this nor `--cpu`, a CUDA build takes a visible GPU and logs that it did.
         #[arg(long)]
         cuda: bool,
+        /// Prove on the CPU even when a GPU is visible to a CUDA build.
+        #[arg(long, conflicts_with = "cuda")]
+        cpu: bool,
+        /// CPU threads a proof uses (default: the cores minus one, at most 8 —
+        /// `docs/node-hardware.md` §6; `RAYON_NUM_THREADS` when set).
+        #[arg(long, value_name = "N")]
+        threads: Option<usize>,
         #[arg(long)]
         skip_memory_check: bool,
         /// The longest one proof may take, in seconds (audit v7, VK-12); 0 = no limit. A proof
@@ -124,19 +133,22 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 }
 
 /// No fallback: `--cuda` on a build that cannot run it is an error, so a proof is never quietly
-/// produced somewhere other than where it was asked for.
-fn backend_for(cuda: bool) -> Result<Backend> {
-    if !cuda {
-        return Ok(Backend::Cpu);
+/// produced somewhere other than where it was asked for. With neither flag a CUDA build takes a
+/// visible GPU (`proving::choose_backend`); the note is printed and logged.
+fn backend_for(cuda: bool, cpu: bool) -> Result<Backend> {
+    use randprotocol_prover::proving::{self, Choice};
+    let (choice, note) = proving::choose_backend(cuda, cpu, proving::BUILD_HAS_CUDA, proving::gpu_visible()).map_err(anyhow::Error::msg)?;
+    if let Some(n) = note {
+        eprintln!("{n}");
+        tracing::info!("{n}");
     }
-    #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
-    {
-        Ok(Backend::Cuda)
-    }
-    #[cfg(not(any(feature = "cuda", feature = "mock-cuda")))]
-    {
-        anyhow::bail!("built without CUDA support; rebuild rand-prover with --features cuda")
-    }
+    Ok(match choice {
+        Choice::Cpu => Backend::Cpu,
+        #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
+        Choice::Cuda => Backend::Cuda,
+        #[cfg(not(any(feature = "cuda", feature = "mock-cuda")))]
+        Choice::Cuda => unreachable!("choose_backend never picks the GPU for a build without it"),
+    })
 }
 
 /// `YYYY-MM-DD` (UTC) of a unix time, days-from-civil inverted (Howard Hinnant's algorithm).
@@ -212,7 +224,7 @@ async fn main() -> Result<()> {
                 println!("{}  {}  {}", p.label, if p.own { "own" } else { "-" }, date_of(p.created_unix));
             }
         }
-        Cmd::Run { listen, accept_spend_key, max_parallel, max_queue, per_token, cuda, skip_memory_check, prove_timeout_secs, allow_origin, fee, fee_address } => {
+        Cmd::Run { listen, accept_spend_key, max_parallel, max_queue, per_token, cuda, cpu, threads, skip_memory_check, prove_timeout_secs, allow_origin, fee, fee_address } => {
             // First, before the key or anything else is looked at: the flag's absence of effect
             // must never be silent (VK-4).
             if accept_spend_key {
@@ -227,7 +239,17 @@ async fn main() -> Result<()> {
                 _ => None,
             };
             let allowed = allowed_origins(&allow_origin, "--allow-origin")?;
-            let backend = backend_for(cuda)?;
+            let backend = backend_for(cuda, cpu)?;
+            let threads = {
+                use randprotocol_prover::proving;
+                let n = proving::threads_for(threads, std::env::var("RAYON_NUM_THREADS").ok().as_deref(), proving::available_threads(), proving::Role::Service)
+                    .map_err(anyhow::Error::msg)?;
+                if let Err(e) = proving::install_thread_pool(n) {
+                    tracing::warn!("{e}");
+                }
+                n
+            };
+            tracing::info!(threads, backend = ?backend, "proving");
             let key = load_key(&key_path)?;
             let pairings = Pairings::load(&pairings_path)?;
             if skip_memory_check {

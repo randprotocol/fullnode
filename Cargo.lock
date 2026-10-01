@@ -5420,6 +5420,7 @@ dependencies = [
  "rand_core 0.10.1",
  "randprotocol-core",
  "randprotocol-zkvm",
+ "rayon",
  "reqwest",
  "serde",
  "serde_json",
