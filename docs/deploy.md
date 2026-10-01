@@ -1300,8 +1300,9 @@ website's sale proxy allow-list). A session or a developer that needs testnet RA
 who sends it from an operator wallet with `rand send` (a v0.6.8 `rand`; on 2026-10-01, 300 RAND each
 to durian.market's treasury and to example-programs). The RPL-2 reads (`rand_getProgramCell`,
 `rand_getProgramCells`, `rand_getProgramVault`) are on the node's public listener but were **not**
-on the website proxy's allow-list at chain 20's launch — `rand program invoke/state/vault` through
-the public URL fails until that proxy (randprotocol.org, `server/sale/src/rpc.rs`) lists them.
+on the website proxy's allow-list at chain 20's launch; randprotocol.org `e77ec7a` (2026-10-01,
+`server/sale/src/rpc.rs` `RPC_ALLOWED`) added them, and `rand program invoke/state/vault` work
+through the public URL since. A new public method needs that list too.
 
 ## The next cut: `proof_window_blocks` (issue #118)
 
