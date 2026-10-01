@@ -665,6 +665,21 @@ impl std::fmt::Display for RawFallback {
 
 impl std::error::Error for RawFallback {}
 
+/// How far the chain is known to have committed: the highest height any peer's own `Status`
+/// claims, or — while no status has been heard at all — three under the highest proposal this
+/// replica has handled (a block is committed under the three-chain rule once three more are
+/// certified above it, so a proposal at `h` puts the committed head near `h − 3`, never above).
+///
+/// The proposal half is for the seconds after a restart (audit v6, PROC-8): a node whose one
+/// peer's status had not reached it for 40 s fetched each proposal's parent by hash, spent that
+/// peer's allowance, and never batch-synced. A proposal's height is signed by its leader alone
+/// — the justify certifies the parent's hash, not its height — so it counts only while there is
+/// no status to weigh it against: the most a lying leader buys is a few batch requests from a
+/// node that has heard from no peer yet.
+fn chain_height_known(best_status: Option<u64>, highest_proposal: u64) -> u64 {
+    best_status.unwrap_or_else(|| highest_proposal.saturating_sub(3))
+}
+
 /// The sync peer for the next batch request, or `None` when nothing usable exists: the
 /// freshest connected peer ahead of `my_height`; and when no peer is connected *and* fresh at
 /// once but the chain is known to be ahead (`best_peer_height` says so), any connected peer
@@ -901,6 +916,9 @@ struct Node {
     /// rate-limited to once per minute so a node stuck behind every peer's retention floor does
     /// not spam its log once per sync attempt.
     no_peer_warned_at: Option<Instant>,
+    /// The highest proposal this replica has handled (passed the gossip precheck), for
+    /// [`chain_height_known`] while no peer's status has been heard.
+    highest_proposal_seen: u64,
     /// Free space on the data directory's filesystem, measured at startup and on every status
     /// tick; what `NodeStatus::disk_free_bytes` and `disk_low` publish (audit v4 OPS-3).
     disk_free_bytes: u64,
@@ -1158,8 +1176,9 @@ pub const SYNC_REQUEST_PER_SEC: f64 = 2.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SyncAdmission {
     Serve,
-    /// Over the peer's own bucket: the protocol's empty answer ([`refused_sync_response`]), which
-    /// the asker counts as a miss — that peer is asking too often.
+    /// Over the peer's own bucket ([`refused_sync_response`]): `Busy` to a batch, an unsigned
+    /// `Block(None)` to a by-hash fetch. Never a miss for the asker — the peer it asked did
+    /// nothing wrong; the asker spent its own allowance.
     OverPeerLimit,
     /// Over the node-wide budget (audit v6, SYNC-3): `SyncResponse::Busy`, which the asker
     /// counts as nothing and takes elsewhere — someone else spent the budget.
@@ -1220,12 +1239,21 @@ fn on_sync_busy(peers: &mut HashMap<PeerId, Peer>, peer: PeerId, now: Instant) {
     }
 }
 
-/// The answer to a request over its peer's limit: the protocol's own "nothing" — an empty batch,
-/// or an unsigned `Block(None)`, which is a fetch attempt and never lock-release evidence. Every
-/// request is still answered, so the asker is not left waiting out a wire timeout.
+/// The answer to a request over its peer's limit: `Busy` to a batch, and an unsigned
+/// `Block(None)` to a by-hash fetch, which is a fetch attempt and never lock-release evidence.
+/// Every request is still answered, so the asker is not left waiting out a wire timeout.
+///
+/// A batch is answered `Busy`, not empty (audit v6, PROC-8, the fourth shape of the
+/// `restart_cycles_keep_all_nodes_in_sync` failure, CI run on `e55ad51`): a node that restarts
+/// hears certificates for blocks it lacks before any peer's `Status` reaches it, so it does not
+/// yet know it is behind and fetches them by hash — a dozen requests in milliseconds, past this
+/// bucket. Its first batch request was then answered empty, which the asker counts as a miss
+/// and backs the peer off for 5 s, 10 s, 20 s: 42 s without a batch while the chain moved on.
+/// `Busy` costs the asker [`SYNC_BUSY_PAUSE`] on this peer and sends it to another, which is
+/// what an over-limit request should cost — the bucket still bounds what it is served.
 fn refused_sync_response(req: &SyncRequest) -> SyncResponse {
     match req {
-        SyncRequest::Blocks { .. } => SyncResponse::Blocks(vec![]),
+        SyncRequest::Blocks { .. } => SyncResponse::Busy,
         SyncRequest::BlockByHash(_) => SyncResponse::Block(None),
     }
 }
@@ -1437,7 +1465,7 @@ impl SyncServeBudget {
 /// admission verifiers' number, against a pool the node shares with them, the RPC's blocking
 /// reads and the prune pass; each holds at most a reader limit's worth of blocks
 /// (`sync_response_wire_limit`) from the read until its answer is handed to the swarm, so the
-/// memory this can pin is bounded too. With every slot taken the request is answered empty, as
+/// memory this can pin is bounded too. With every slot taken the request is answered `Busy`, as
 /// an over-budget one is.
 pub const MAX_SYNC_SERVES_IN_FLIGHT: usize = 4;
 
@@ -2136,6 +2164,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         prune_passes: 0,
         compacting: Arc::new(AtomicBool::new(false)),
         no_peer_warned_at: None,
+        highest_proposal_seen: 0,
         disk_free_bytes,
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
         verified,
@@ -2999,6 +3028,9 @@ impl Node {
                     );
                     self.report(id, GossipOutcome::Report(verdict.report)).await;
                     if verdict.handle {
+                        if let ConsensusMessage::Proposal(b) = &m {
+                            self.highest_proposal_seen = self.highest_proposal_seen.max(b.height());
+                        }
                         self.on_consensus(m).await?
                     }
                 }
@@ -3014,6 +3046,7 @@ impl Node {
                         Instant::now(),
                     );
                     let recorded = outcome == GossipOutcome::for_consensus();
+                    tracing::debug!(%from, forwarder = %id.propagation_source, recorded, "status gossip");
                     self.report(id, outcome).await;
                     if recorded && ahead && self.sync_inflight.is_none() {
                         self.maybe_sync().await;
@@ -3077,7 +3110,7 @@ impl Node {
                     tracing::debug!(%peer, "sync request over the node-wide budget; answered busy");
                     SyncResponse::Busy
                 } else {
-                    tracing::debug!(%peer, "sync request over the peer's own limit; answered empty");
+                    tracing::debug!(%peer, "sync request over the peer's own limit; answered busy or Block(None)");
                     refused_sync_response(&request)
                 };
                 self.net.send_sync_response(channel, response).await;
@@ -3263,7 +3296,10 @@ impl Node {
     }
 
     fn best_peer_height(&self) -> u64 {
-        self.peers.values().filter_map(|p| p.status.as_ref()).map(|s| s.height).max().unwrap_or(0)
+        chain_height_known(
+            self.peers.values().filter_map(|p| p.status.as_ref()).map(|s| s.height).max(),
+            self.highest_proposal_seen,
+        )
     }
 
     async fn maybe_sync(&mut self) {
@@ -4234,6 +4270,28 @@ mod tests {
         assert_eq!(peers[&pid(1)].status.as_ref().map(|s| s.height), Some(501));
     }
 
+    /// Audit v6, PROC-8 (CI on `e55ad51`, `restart_cycles_keep_all_nodes_in_sync`): a restarted
+    /// node connected to one peer whose `Status` did not reach it for 40 s knew of no height
+    /// above its own, so it fetched every proposal's parent by hash, spent that peer's allowance,
+    /// and never batch-synced. Until a status arrives the proposals it handles say how far the
+    /// chain has gone — three blocks under the newest, what the three-chain rule has committed at
+    /// most — and once any status is known, statuses alone decide: one leader's header (its
+    /// height is signed by it alone) never outbids the peers.
+    #[test]
+    fn with_no_status_heard_the_proposals_say_how_far_the_chain_has_committed() {
+        assert_eq!(chain_height_known(None, 0), 0, "nothing heard: nothing known");
+        assert_eq!(chain_height_known(None, 2), 0);
+        assert_eq!(chain_height_known(None, 144), 141, "no status: a proposal at 144 means 141 is committed");
+        assert_eq!(chain_height_known(Some(120), 144), 120, "a status heard: the peers decide, not one leader");
+        assert_eq!(chain_height_known(Some(150), 144), 150);
+        // And with it a fresh node far behind asks a connected peer that has told it nothing.
+        let pid = PeerId::from(libp2p::identity::Keypair::ed25519_from_bytes([7; 32]).unwrap().public());
+        let peers: HashMap<PeerId, Peer> = [(pid, Peer { connected: true, ..Default::default() })].into_iter().collect();
+        assert_eq!(pick_sync_peer(&peers, 127, chain_height_known(None, 144), &[], Instant::now()), Some(pid));
+        assert!(orphan_wants_batch_sync(chain_height_known(None, 144), 127, 130));
+        assert!(fetch_deferred_to_batch_sync(chain_height_known(None, 144), 127));
+    }
+
     #[test]
     fn pick_sync_peer_prefers_fresh_and_falls_back_to_any_connected() {
         let pid = |seed: u8| {
@@ -4664,7 +4722,7 @@ mod tests {
     /// the protocol's own "nothing" — an empty batch or `Block(None)`, which an honest syncer
     /// already treats as "ask someone else" (SYNC-2's back-off) — so no request goes unanswered.
     #[test]
-    fn inbound_sync_requests_are_metered_per_peer_and_answered_empty_over_the_limit() {
+    fn inbound_sync_requests_are_metered_per_peer_and_answered_busy_over_the_limit() {
         use crate::admission::PeerLimiter;
         let pid = |seed: u8| PeerId::from(libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap().public());
         let limiter = PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC);
@@ -4686,7 +4744,13 @@ mod tests {
             assert!(admit_sync_request(&mut peers, &limiter, p1, later), "refilled {i}");
         }
         assert!(!admit_sync_request(&mut peers, &limiter, p1, later));
-        assert!(matches!(refused_sync_response(&SyncRequest::Blocks { from_height: 1, max: 100 }), SyncResponse::Blocks(b) if b.is_empty()));
+        // A batch over the asker's own limit is answered `Busy`, never an empty batch (audit v6,
+        // PROC-8): an empty batch is a miss, and the asker backed off a peer that had done nothing
+        // wrong — for 5 s, then 10, 20 — after its own by-hash fetches at startup spent the bucket.
+        assert!(
+            matches!(refused_sync_response(&SyncRequest::Blocks { from_height: 1, max: 100 }), SyncResponse::Busy),
+            "a batch over the peer's own limit must be answered busy, not empty"
+        );
         assert!(matches!(refused_sync_response(&SyncRequest::BlockByHash(Hash::ZERO)), SyncResponse::Block(None)));
     }
 
@@ -4788,7 +4852,7 @@ mod tests {
     /// this node off. A validator peer draws on a share of its own first, so it is still served;
     /// and when that share is spent too it falls back to the general one, never below a
     /// stranger. A budget refusal is `NodeBusy` (answered `Busy`), an own-bucket one
-    /// `OverPeerLimit` (answered empty, as before).
+    /// `OverPeerLimit` (answered `Busy` to a batch too since PROC-8, but still bounded by the bucket).
     #[test]
     fn stranger_identities_spending_the_sync_budget_cannot_starve_a_validator_peer() {
         use crate::admission::PeerLimiter;
@@ -4820,7 +4884,7 @@ mod tests {
                 "the validator's batch request {i} is served from its own share"
             );
         }
-        // Its own bucket still binds it, answered empty as before.
+        // Its own bucket still binds it.
         assert_eq!(admit_sync_request(&mut peers, &mut memory, &limiter, &mut global, validator, true, &blocks, now), SyncAdmission::OverPeerLimit);
 
         // With the validators' share spent, a validator falls back to the general one.
@@ -4856,7 +4920,7 @@ mod tests {
 
     /// CN-2, the off-loop half: a `Blocks` answer is read and assembled on a blocking worker, not
     /// on the loop that handles votes and proposals, under [`MAX_SYNC_SERVES_IN_FLIGHT`] slots —
-    /// with every slot taken the request is refused (the caller answers it empty) and no read
+    /// with every slot taken the request is refused (the caller answers it `Busy`) and no read
     /// starts.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_batch_is_served_off_the_loop_under_a_bounded_number_of_slots() {
