@@ -277,6 +277,42 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | A::SlashingRetired
         );
     }
+    // RPL-2's verdicts, split the same way. Cacheable are the ones `program_state::check_shape`
+    // and the segment rule give — the transition's own lists and amounts against compile-time
+    // constants, and its inflow word against its own bundle's `burn_a`:
+    //
+    // - `TooManyReads` / `TooManyWrites` / `TooManyPayouts`, `UnorderedKeys`;
+    // - `InflowWithoutBurn` / `InflowMissing` — the action's word against the bundle's field;
+    // - `ZeroPayout` / `PayoutTooLarge` — an amount as written against 0 and 2^63;
+    // - `ContextTooLong` — the transition's word count against the length of the program's
+    //   public input. That length is read off the program's record, but it is no more state
+    //   than a chain id: a program id is the hash of its words *and* its public words
+    //   (`program_id_with_public`), records are never rewritten, and the verdict is only
+    //   answered once the record is found (before that the same bytes are `UnknownProgram`,
+    //   which is not cached) — so no later state gives the id the transaction names another
+    //   length.
+    //
+    // Everything else moves with this node's state and stays out: `StaleRead` (the cells — a
+    // node one block behind would poison itself against an invoke proved on the tip),
+    // `VaultShort` (the vault), `NotProgramToken` (a token's authority is the registry's, and
+    // the index may be registered to this program a block later), `Overflow` (arithmetic over
+    // amounts this node holds) and `Disabled` (which modules the genesis switched on — a
+    // statement about the chain, like `UnsupportedAction`).
+    if let TxError::ProgramState(p) = e {
+        use randprotocol_core::ledger::program_state::ProgramStateError as P;
+        return matches!(
+            p,
+            P::TooManyReads(_)
+                | P::TooManyWrites(_)
+                | P::TooManyPayouts(_)
+                | P::UnorderedKeys
+                | P::InflowWithoutBurn
+                | P::InflowMissing { .. }
+                | P::ZeroPayout
+                | P::PayoutTooLarge(_)
+                | P::ContextTooLong { .. }
+        );
+    }
     // The RPL registry's verdicts, split the same way: only the ones a transaction's *own bytes*
     // decide are cacheable — the metadata rules (`BadName`, `BadSymbol`, `TooManyDecimals`), the
     // authority kind a registration may choose, a fixed-supply registration with no initial mint,
@@ -685,6 +721,20 @@ pub fn oversized_note(tx: &Transaction) -> Option<TxError> {
             };
             too_large.then_some(TxError::Bridge(BridgeError::AmountTooLarge))
         }
+        // RPL-2: a payout at or above the bound, the ledger's own verdict for it
+        // (`program_state::check_shape` refuses it on every chain that admits an invoke, whatever
+        // `tokens.bound_note_value` says). The count is capped first, as the ledger caps it: an
+        // unvalidated transition must not buy a walk of any length.
+        Action::Invoke { transition, .. } => {
+            use randprotocol_core::ledger::program_state::{ProgramStateError, MAX_PAYOUTS};
+            if transition.pays.len() + transition.mints.len() > MAX_PAYOUTS {
+                return None;
+            }
+            transition
+                .payouts()
+                .find(|p| p.amount >= MAX_NOTE_VALUE)
+                .map(|p| TxError::ProgramState(ProgramStateError::PayoutTooLarge(p.amount)))
+        }
         _ => None,
     }
 }
@@ -765,7 +815,9 @@ pub fn non_canonical_proofs(tx: &Transaction) -> Option<TxError> {
 /// which can move, and a peer on an older build that forwards the call must not be penalised), so
 /// it is an Ignore and is never cached.
 pub fn call_reveals_private_inputs(tx: &Transaction) -> Option<TxError> {
-    let randprotocol_core::Action::Call { proof, .. } = &tx.action else {
+    // An RPL-2 `Invoke`'s call proof is a call proof: the same private tables, the same floor.
+    let (randprotocol_core::Action::Call { proof, .. } | randprotocol_core::Action::Invoke { proof, .. }) = &tx.action
+    else {
         return None;
     };
     let (table, log_height) = randprotocol_zkvm::executor::call_private_table_under_floor(proof)?;
@@ -835,8 +887,11 @@ pub fn call_pricing(
     policy: &randprotocol_core::gas::GasPolicy,
 ) -> Result<CallPricing, TxError> {
     use randprotocol_core::gas;
+    use randprotocol_core::ledger::program_state;
     use randprotocol_core::Action;
-    let Action::Call { program, proof, input_envelope } = &tx.action else {
+    let (Action::Call { program, proof, input_envelope } | Action::Invoke { program, proof, input_envelope, .. }) =
+        &tx.action
+    else {
         return Ok(CallPricing { floor: gas::fee_floor(&tx.action), gas_limit: None });
     };
     if proof.len() > ledger.max_proof_bytes() {
@@ -848,17 +903,41 @@ pub fn call_pricing(
     // would refuse as `PublicValues`. The segment is the ledger's own (`hardened_call_segment`:
     // a program's deploy-time public words, then the binding — issue #55), so a program with a
     // public input decodes here too.
-    let outcome = if ledger.hardening_v6() {
-        executor.decode_call_hardened(record, proof, &ledger.hardened_call_segment(record, &tx.call_binding(ledger.binding_domain())))
-    } else {
-        executor.decode_call(record, proof)
+    //
+    // RPL-2: an `Invoke`'s header is read over its own segment (`Ledger::invoke_segment`:
+    // `public ‖ call_binding ‖ context`), by the invoke decoder, whatever the flag — the
+    // ledger's step 10 again. Before the decode the transition's counts are held to the
+    // ledger's caps, so an unvalidated transition cannot make this build a segment of any
+    // length (the context is 16 words a cell).
+    let outcome = match &tx.action {
+        Action::Invoke { transition, .. } => {
+            if transition.reads.len() > program_state::MAX_READS {
+                return Err(program_state::ProgramStateError::TooManyReads(transition.reads.len()).into());
+            }
+            if transition.writes.len() > program_state::MAX_WRITES {
+                return Err(program_state::ProgramStateError::TooManyWrites(transition.writes.len()).into());
+            }
+            let payouts = transition.pays.len() + transition.mints.len();
+            if payouts > program_state::MAX_PAYOUTS {
+                return Err(program_state::ProgramStateError::TooManyPayouts(payouts).into());
+            }
+            let segment = ledger.invoke_segment(record, tx).ok_or(TxError::MissingBundle)?;
+            executor.decode_invoke(record, proof, &segment)
+        }
+        _ if ledger.hardening_v6() => {
+            executor.decode_call_hardened(record, proof, &ledger.hardened_call_segment(record, &tx.call_binding(ledger.binding_domain())))
+        }
+        _ => executor.decode_call(record, proof),
     }
     .map_err(TxError::InvalidProof)?;
+    // An invoke pays a call's floor plus `cell_fee` per cell it creates on this ledger (zero for
+    // a call): the ledger's own post-verify floor, so the pool demands what a block does.
+    let cells = program_state::cell_fee_of(ledger, &tx.action);
     if let Some(floor) = ledger.gas_call_floor(outcome.gas_limit, gas::call_bytes(proof, input_envelope.as_ref())) {
-        return Ok(CallPricing { floor, gas_limit: Some(outcome.gas_limit) });
+        return Ok(CallPricing { floor: floor.saturating_add(cells), gas_limit: Some(outcome.gas_limit) });
     }
     let floor = policy.call_floor(outcome.tier, outcome.keccak_log_height, outcome.sha256_log_height, gas::call_bytes(proof, input_envelope.as_ref()));
-    Ok(CallPricing { floor, gas_limit: None })
+    Ok(CallPricing { floor: floor.saturating_add(cells), gas_limit: None })
 }
 
 /// What [`call_pricing`] read off a transaction: the floor it must pay at the ledger's prices
@@ -1251,6 +1330,117 @@ mod tests {
         ] {
             assert!(!is_permanent(&e), "{e} depends on state and must not be cached");
         }
+    }
+
+    /// RPL-2's verdicts, split like the registry's: cached are the ones the transition's own
+    /// bytes decide (against compile-time constants, its own bundle's burn field, and the
+    /// content-addressed program's public length); every verdict about cells, vaults, the
+    /// registry or the chain's gate stays out — and for the two a busy program produces all day,
+    /// the very same bytes are shown refused on one state and valid on the next.
+    #[test]
+    fn program_state_verdicts_are_cached_only_when_they_are_about_the_bytes() {
+        use crate::storage::fixtures::{self, rpl2_cell, rpl2_invoke_tx, rpl2_payout, rpl2_transition, RPL2_FEE};
+        use randprotocol_core::confidential::StubExecutor;
+        use randprotocol_core::ledger::program_state::{ProgramStateError as P, Transition};
+        let ps = |p: P| TxError::ProgramState(p);
+        for e in [
+            ps(P::TooManyReads(9)),
+            ps(P::TooManyWrites(9)),
+            ps(P::TooManyPayouts(5)),
+            ps(P::UnorderedKeys),
+            ps(P::InflowWithoutBurn),
+            ps(P::InflowMissing { asset: 1, amount: 5 }),
+            ps(P::ZeroPayout),
+            ps(P::PayoutTooLarge(1 << 63)),
+            ps(P::ContextTooLong { context: 139, public: 0, max: 119 }),
+        ] {
+            assert!(is_permanent(&e), "{e} is a statement about the bytes");
+        }
+        for e in [
+            ps(P::Disabled),
+            ps(P::StaleRead { key: "00".repeat(32) }),
+            ps(P::VaultShort { asset: 0, have: 400, want: 600 }),
+            // A token's authority is the registry's: the index may be this program's a block on.
+            ps(P::NotProgramToken(3)),
+            ps(P::Overflow),
+        ] {
+            assert!(!is_permanent(&e), "{e} depends on state and must not be cached");
+        }
+
+        // What makes caching the first list sound and the second unsound, on a ledger.
+        let (_d, _s, _gs, l, _b1) = fixtures::rpl2_chain(7);
+        let proposer = fixtures::key(1).address();
+        // A read of cell 1 = 5 while the cell is absent is stale; once another invoke has
+        // written 5 there, the same bytes are valid.
+        let reader = rpl2_invoke_tx(&l, 10, RPL2_FEE, (0, 0, 0), Transition { reads: vec![rpl2_cell(1, 5)], ..rpl2_transition() });
+        assert!(matches!(l.validate(&reader, &StubExecutor), Err(TxError::ProgramState(P::StaleRead { .. }))));
+        let mut written = l.clone();
+        let writer = rpl2_invoke_tx(&l, 20, RPL2_FEE, (0, 0, 0), Transition { writes: vec![rpl2_cell(1, 5)], ..rpl2_transition() });
+        written.apply_tx(&writer, &proposer, &StubExecutor).unwrap();
+        assert_eq!(written.validate(&reader, &StubExecutor), Ok(()), "the same bytes, one block later");
+        // A payout from an empty vault is short; once another invoke has funded it, valid.
+        let payer = rpl2_invoke_tx(&l, 30, RPL2_FEE, (0, 0, 0), Transition { pays: vec![rpl2_payout(0, 600, 1)], ..rpl2_transition() });
+        assert_eq!(l.validate(&payer, &StubExecutor), Err(ps(P::VaultShort { asset: 0, have: 0, want: 600 })));
+        let mut funded = l.clone();
+        funded.apply_tx(&rpl2_invoke_tx(&l, 40, RPL2_FEE, (1_000, 0, 0), rpl2_transition()), &proposer, &StubExecutor).unwrap();
+        assert_eq!(funded.validate(&payer, &StubExecutor), Ok(()));
+        // A byte verdict is the same on every one of those states.
+        let unordered = Transition { writes: vec![rpl2_cell(2, 1), rpl2_cell(1, 1)], ..rpl2_transition() };
+        let bad = rpl2_invoke_tx(&l, 50, RPL2_FEE, (0, 0, 0), unordered);
+        for state in [&l, &written, &funded] {
+            assert_eq!(state.validate(&bad, &StubExecutor), Err(ps(P::UnorderedKeys)));
+        }
+
+        // The note-value screen reaches a payout: refused at the door, cached, before the bucket.
+        let huge = Transition { pays: vec![rpl2_payout(0, 1 << 63, 1)], ..rpl2_transition() };
+        let huge = rpl2_invoke_tx(&l, 60, RPL2_FEE, (0, 0, 0), huge);
+        assert_eq!(oversized_note(&huge), Some(ps(P::PayoutTooLarge(1 << 63))));
+        assert_eq!(l.validate(&huge, &StubExecutor), Err(ps(P::PayoutTooLarge(1 << 63))), "the ledger's own verdict");
+        assert_eq!(oversized_note(&payer), None);
+        let mut refused = RefusedCache::new(4);
+        assert_eq!(
+            GossipOutcome::for_transaction(&huge, None, &mut refused, &PeerLimiter::new(16, 4.0), 0, Instant::now()),
+            GossipOutcome::Report(Acceptance::Reject)
+        );
+        assert!(refused.get(&huge.hash()).is_some());
+    }
+
+    /// The two header policies the pool applies to a call's proof — the private-table floor
+    /// (COV-2) and the canonical-proof rules (INT-5) — read an `Invoke`'s call proof exactly as
+    /// they read a `Call`'s: the same bytes under either action get the same answer.
+    #[test]
+    fn the_call_proof_policies_read_an_invokes_proof_as_a_calls() {
+        use crate::storage::fixtures;
+        use randprotocol_core::Action;
+        use randprotocol_zkvm::machine::{Backend, FriProfile, Proof};
+
+        let l = fixtures::rpl2_genesis(7).ledger;
+        let program = randprotocol_zkvm::guests::private_payment(1000);
+        let (bytes, _, _) =
+            randprotocol_zkvm::executor::prove(FriProfile::Test, &program, &[400, 250, 300, 75], &[], None, Backend::Cpu, None).unwrap();
+        let rewritten = |f: &dyn Fn(&mut Proof)| {
+            let mut p: Proof = postcard::from_bytes(&bytes).unwrap();
+            f(&mut p);
+            p.to_bytes()
+        };
+        let pid = randprotocol_core::Hash::digest(b"program");
+        let as_call = |proof: Vec<u8>| fixtures::v3_tx(&l, 50, fixtures::RPL2_FEE, Action::Call { program: pid, proof, input_envelope: None });
+        let as_invoke = |proof: Vec<u8>| {
+            let action = Action::Invoke { program: pid, proof, input_envelope: None, transition: fixtures::rpl2_transition() };
+            fixtures::v3_tx(&l, 50, fixtures::RPL2_FEE, action)
+        };
+        assert_eq!(call_reveals_private_inputs(&as_invoke(bytes.clone())), None, "the honest header");
+        assert_eq!(non_canonical_proofs(&as_invoke(bytes.clone())), None);
+        let small = rewritten(&|p| p.input_log_height = 3);
+        assert_eq!(
+            call_reveals_private_inputs(&as_invoke(small.clone())),
+            Some(TxError::CallRevealsPrivateInputs { table: "input", log_height: 3, min: 7 })
+        );
+        assert_eq!(call_reveals_private_inputs(&as_invoke(small.clone())), call_reveals_private_inputs(&as_call(small)));
+        let taller = rewritten(&|p| p.mem_log_height += 1);
+        let got = non_canonical_proofs(&as_invoke(taller.clone())).expect("a taller memory table is not what the honest prover writes");
+        assert!(matches!(&got, TxError::NonCanonicalProof(w) if w.starts_with("call proof: memory height")), "{got}");
+        assert_eq!(Some(got), non_canonical_proofs(&as_call(taller)));
     }
 
     /// The hidden-asset bundle's burn-shape verdicts are byte verdicts: `UnsupportedAsset`,

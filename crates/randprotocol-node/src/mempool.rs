@@ -13,7 +13,22 @@
 //! the attestation and the registry, and an `Aggregate`'s payout (spec §4 step 5), whose amount
 //! is the subsidy the block would pay. Two of either can collide over one note just as two
 //! bundles can collide over an output, so `Ledger::derived_commitment` answers for all three
-//! and the pool claims what it answers.
+//! and the pool claims what it answers — through `Ledger::derived_commitments`, which adds the
+//! up to four notes an RPL-2 `Invoke` pays out.
+//!
+//! **Two pooled invokes on one cell are not a pool conflict.** An `Invoke` reads and writes
+//! program cells, and two of them that write the same `(program, key)`, or where one reads a
+//! cell the other writes, cannot both be mined — yet the pool holds both. A cell is not a
+//! one-shot resource like a nullifier: which of the two applies depends on the order the
+//! proposer packs them in and on the state at that moment, and either may be the one that fits
+//! (a transition that read what the other writes is *valid* after it). Refusing the second at
+//! the door would let anyone park a cheap invoke on a contended cell and keep every other
+//! caller of that program out of the pool until it mined. So the rule is the ledger's alone:
+//! the proposer trial-applies candidates in fee order and skips one that fails against the
+//! state an earlier one left (`HotStuff::propose`'s packing loop), and after the block the
+//! loser's read no longer matches — [`Mempool::applies`] asks `program_state::still_applies` —
+//! so it is pruned at that tip, not re-offered. The cost of a loser is one trial apply on a
+//! clone, with both proofs already in the verified set.
 
 use randprotocol_core::bridge::BridgeError;
 use randprotocol_core::confidential::ConfidentialExecutor;
@@ -302,7 +317,9 @@ pub struct Mempool {
 /// silently drops at its trial apply.
 fn claimed_commitments(tx: &Transaction, ledger: &Ledger, executor: &dyn ConfidentialExecutor) -> Vec<Word8> {
     let mut v = tx.commitments();
-    v.extend(ledger.derived_commitment(&tx.action, executor));
+    // The plural form: an RPL-2 `Invoke` pays out up to four notes, each a leaf two pooled
+    // transactions could collide over exactly as they could over a mint's one.
+    v.extend(ledger.derived_commitments(tx, executor));
     v
 }
 
@@ -372,10 +389,19 @@ impl Mempool {
     /// *now* — `BUNDLE_BASE + gas_price·GAS_LIMIT + byte_price·KiB`, from the limit remembered at
     /// admission and the call's own bytes — and for everything else the floor it was admitted
     /// at, which does not move.
+    ///
+    /// An RPL-2 `Invoke` is a call plus its cell fee, and the cell fee moves too: it is charged
+    /// per cell the transition *creates*, which another transaction creating (or deleting) one
+    /// of those cells first changes. So it is re-read here against this tip, as the ledger's own
+    /// floor reads it.
     fn current_floor(p: &Pooled, ledger: &Ledger) -> u64 {
         match (&p.tx.action, p.gas_limit) {
             (Action::Call { proof, input_envelope, .. }, Some(limit)) => ledger
                 .gas_call_floor(limit, randprotocol_core::gas::call_bytes(proof, input_envelope.as_ref()))
+                .unwrap_or(p.floor),
+            (a @ Action::Invoke { proof, input_envelope, .. }, Some(limit)) => ledger
+                .gas_call_floor(limit, randprotocol_core::gas::call_bytes(proof, input_envelope.as_ref()))
+                .map(|f| f.saturating_add(randprotocol_core::ledger::program_state::cell_fee_of(ledger, a)))
                 .unwrap_or(p.floor),
             _ => p.floor,
         }
@@ -740,7 +766,8 @@ impl Mempool {
         // three quarters of the block's bytes in the first pass; what that quarter leaves once
         // the Calls have been placed is filled with the transfers held back, in their order, so
         // the reservation costs no block space. With no Call ready the cap is the block's.
-        let call_ready = ready.iter().any(|(_, p, _)| matches!(p.tx.action, Action::Call { .. }));
+        // An RPL-2 `Invoke` is a call that pays the byte price too, so it counts as one here.
+        let call_ready = ready.iter().any(|(_, p, _)| matches!(p.tx.action, Action::Call { .. } | Action::Invoke { .. }));
         let flat_cap = if call_ready { max_bytes / 4 * 3 } else { max_bytes };
         let mut out = Vec::new();
         let mut held_back = Vec::new();
@@ -757,7 +784,7 @@ impl Mempool {
                 // still travel.
                 continue;
             }
-            let flat = !matches!(p.tx.action, Action::Call { .. }) && !is_governance(&p.tx.action);
+            let flat = !matches!(p.tx.action, Action::Call { .. } | Action::Invoke { .. }) && !is_governance(&p.tx.action);
             if flat && flat_bytes + len > flat_cap {
                 held_back.push(p);
                 continue;
@@ -1008,6 +1035,12 @@ impl Mempool {
                 _ => {}
             }
         }
+        // RPL-2: an `Invoke` was proved against the cells it read and the vault it pays from.
+        // Another transaction writing one of those cells, or draining the vault, makes it
+        // inapplicable — the ledger's `StaleRead` / `VaultShort` — and it must leave here rather
+        // than be offered to, and fail, every block until its anchor scrolls out. The ledger's
+        // own rules, asked through its own function: map lookups and compares, no hash.
+        randprotocol_core::ledger::program_state::still_applies(ledger, tx)?;
         let nullifiers = tx.nullifiers();
         if let Some(nf) = nullifiers.iter().find(|nf| ledger.is_spent(nf)) {
             return Err(TxError::Spent(*nf));
@@ -3344,5 +3377,151 @@ mod tests {
         assert_eq!(ledger.validate(&call, &StubExecutor), Ok(()), "the ledger accepts the call at the floor");
         assert_eq!(crate::admission::call_floor(&call, &ledger, &StubExecutor, &GasPolicy::DEFAULT), Ok(floor));
         assert_eq!(Mempool::new(64).precheck(&call, &ledger, &StubExecutor).unwrap().floor, floor);
+    }
+
+    // ---------------------------------- RPL-2: invokes
+
+    /// The RPL-2 fixture chain one block in: the program deployed, token 1 a plain token and
+    /// token 2 the program's own.
+    fn rpl2_ledger() -> Ledger {
+        fixtures::rpl2_chain(7).3
+    }
+
+    fn cell_key_hex(k: u32) -> String {
+        hex::encode(randprotocol_core::notes::word8_to_bytes(&fixtures::rpl2_cell(k, 0).key))
+    }
+
+    /// The pool's rule for two invokes on one cell (the module doc): both are held and both are
+    /// offered, the proposer's trial apply mines whichever fits, and at the next tip the other's
+    /// read no longer matches — so it leaves at the prune, with the ledger's own verdict, instead
+    /// of being offered to every block until its anchor scrolls out.
+    #[test]
+    fn two_pooled_invokes_on_one_cell_are_both_held_and_the_loser_is_pruned() {
+        use fixtures::{rpl2_cell, rpl2_invoke_tx, rpl2_transition, RPL2_FEE};
+        use randprotocol_core::ledger::program_state::{ProgramStateError, Transition};
+        let l = rpl2_ledger();
+        let step = |k, from, to| Transition { reads: vec![rpl2_cell(k, from)], writes: vec![rpl2_cell(k, to)], ..rpl2_transition() };
+        let a = rpl2_invoke_tx(&l, 10, RPL2_FEE, (0, 0, 0), step(1, 0, 5));
+        let b = rpl2_invoke_tx(&l, 20, RPL2_FEE, (0, 0, 0), step(2, 0, 5));
+        let c = rpl2_invoke_tx(&l, 30, RPL2_FEE - 1, (0, 0, 0), step(1, 0, 9));
+        let mut m = Mempool::new(100);
+        for tx in [&a, &b, &c] {
+            m.insert(tx.clone(), &l, &StubExecutor).unwrap();
+        }
+        assert_eq!(m.len(), 3, "`a` and `c` write the same cell and are both held");
+        assert_eq!(m.candidates(&l, 10).len(), 3, "and both offered: the trial apply decides");
+
+        // The block: `a` and `b` are mined (disjoint cells); `c` does not apply on what `a` left.
+        let mut after = l.clone();
+        after.apply_transactions(&[a.clone(), b.clone()], &fixtures::key(1).address(), &StubExecutor).unwrap();
+        m.remove(&[a.hash(), b.hash()]);
+        let stale = TxError::ProgramState(ProgramStateError::StaleRead { key: cell_key_hex(1) });
+        assert_eq!(Mempool::applies(&c, &c.commitments(), None, &after).unwrap_err(), stale);
+        assert_eq!(after.validate(&c, &StubExecutor).unwrap_err(), stale, "the ledger's own verdict");
+        assert!(!crate::admission::is_permanent(&stale), "the state moved; the bytes are not wrong");
+        // A pre-pool screen on the new tip hears it too, before any proof is looked at.
+        assert_eq!(Mempool::new(10).precheck(&c, &after, &StubExecutor).unwrap_err(), MempoolError::Invalid(stale));
+        assert_eq!(m.candidates(&after, 10), vec![], "never offered again");
+        m.prune(&after);
+        assert!(m.is_empty(), "the stale invoke left the pool at the tip that made it stale");
+    }
+
+    /// An invoke's payout notes are leaves like any other: the pool claims them (through
+    /// `Ledger::derived_commitments`), so a second transaction that would create the same note
+    /// is a conflict. And the vault is state the pool watches: once another invoke has drained
+    /// it, a pooled payer leaves with `VaultShort`.
+    #[test]
+    fn an_invokes_payout_notes_are_claimed_and_a_drained_vault_prunes_it() {
+        use fixtures::{rpl2_invoke_tx, rpl2_payout, rpl2_transition, RPL2_FEE};
+        use randprotocol_core::ledger::program_state::{payout_commitment, ProgramStateError, Transition};
+        let mut l = rpl2_ledger();
+        let proposer = fixtures::key(1).address();
+        let fund = rpl2_invoke_tx(&l, 10, RPL2_FEE, (1_000, 0, 0), rpl2_transition());
+        l.apply_tx(&fund, &proposer, &StubExecutor).unwrap();
+        let pay = |seed, amount, n| {
+            rpl2_invoke_tx(&l, seed, RPL2_FEE, (0, 0, 0), Transition { pays: vec![rpl2_payout(0, amount, n)], ..rpl2_transition() })
+        };
+        let first = pay(20, 600, 1);
+        let mut m = Mempool::new(100);
+        let cm = payout_commitment(&rpl2_payout(0, 600, 1), first.bundle.as_ref().unwrap().time, &StubExecutor);
+        let claims = m.precheck(&first, &l, &StubExecutor).unwrap();
+        assert_eq!(claims.commitments.len(), 5, "the bundle's four and the payout");
+        assert_eq!(claims.commitments[4], cm);
+        m.insert(first.clone(), &l, &StubExecutor).unwrap();
+        // The same recipient, amount, blinding and time under another bundle is the same leaf.
+        assert_eq!(m.insert(pay(30, 600, 1), &l, &StubExecutor), Err(MempoolError::Conflict(cm)));
+        // Another payer of the same vault is held: 600 + 600 is more than it has, so only one
+        // of the two can be mined — the trial apply's to decide, like two writers of one cell.
+        let second = pay(40, 600, 2);
+        m.insert(second.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.len(), 2);
+
+        let mut after = l.clone();
+        after.apply_tx(&first, &proposer, &StubExecutor).unwrap();
+        m.remove(&[first.hash()]);
+        let short = TxError::ProgramState(ProgramStateError::VaultShort { asset: 0, have: 400, want: 600 });
+        assert_eq!(after.validate(&second, &StubExecutor).unwrap_err(), short);
+        assert!(!crate::admission::is_permanent(&short));
+        m.prune(&after);
+        assert!(m.is_empty(), "the payer the vault can no longer pay left the pool");
+        // And a transaction that would re-create a payout note the chain now holds is refused.
+        assert_eq!(
+            Mempool::new(10).precheck(&pay(50, 600, 1), &after, &StubExecutor).unwrap_err(),
+            MempoolError::Invalid(short.clone()),
+            "the vault is asked before the leaf"
+        );
+    }
+
+    /// The pool's floor for an invoke is a call's — the ledger's gas rule over the declared
+    /// limit and the call's bytes — plus `cell_fee` for each cell it creates *on this tip*: the
+    /// cell term moves when another transaction creates or deletes the cell first, and the pool
+    /// re-reads it at selection as it re-prices the gas.
+    #[test]
+    fn an_invokes_pool_floor_is_a_calls_plus_the_cell_fee_at_this_tip() {
+        use fixtures::{rpl2_cell, rpl2_invoke_tx, rpl2_transition, CELL_FEE, RPL2_FEE};
+        use randprotocol_core::gas;
+        use randprotocol_core::ledger::program_state::Transition;
+        let l = rpl2_ledger();
+        let proposer = fixtures::key(1).address();
+        // A blind write of cell 1 (nothing read, so nothing another writer can make stale).
+        let blind = |l: &Ledger, seed, fee, v| {
+            rpl2_invoke_tx(l, seed, fee, (0, 0, 0), Transition { writes: vec![rpl2_cell(1, v)], ..rpl2_transition() })
+        };
+        let probe = blind(&l, 10, RPL2_FEE, 5);
+        let Action::Invoke { proof, .. } = &probe.action else { unreachable!() };
+        let call = l.gas_call_floor(gas::gas_max(10, 0, 0), gas::call_bytes(proof, None)).expect("the fixture chain has a gas section");
+        let m = Mempool::new(100);
+        assert_eq!(m.precheck(&probe, &l, &StubExecutor).unwrap().floor, call + CELL_FEE, "it creates cell 1");
+        assert_eq!(crate::admission::call_floor(&probe, &l, &StubExecutor, &gas::GasPolicy::DEFAULT), Ok(call + CELL_FEE));
+        // One unit under: the ledger's verdict and the pool's, naming the same floor.
+        let under = blind(&l, 20, call + CELL_FEE - 1, 5);
+        let too_low = TxError::FeeTooLow { min: call + CELL_FEE, fee: call + CELL_FEE - 1 };
+        assert_eq!(l.validate(&under, &StubExecutor).unwrap_err(), too_low);
+        assert_eq!(m.precheck(&under, &l, &StubExecutor).unwrap_err(), MempoolError::Invalid(too_low));
+        // At the floor it is valid, pooled and offered.
+        let exact = blind(&l, 30, call + CELL_FEE, 5);
+        assert_eq!(l.validate(&exact, &StubExecutor), Ok(()));
+
+        // Cell 1 exists: a blind rewrite creates nothing and pays the call's floor alone.
+        let mut created = l.clone();
+        created.apply_tx(&blind(&l, 40, RPL2_FEE, 7), &proposer, &StubExecutor).unwrap();
+        let rewrite = blind(&created, 50, call, 5);
+        let mut m = Mempool::new(100);
+        m.insert(rewrite.clone(), &created, &StubExecutor).unwrap();
+        assert_eq!(m.candidates(&created, 10), vec![rewrite.clone()]);
+        // The cell is deleted (a write of zeros): the pooled rewrite would now create it, its
+        // floor has risen by the cell fee, and it is not offered while it cannot pay — but it
+        // stays pooled, since the cell may come back.
+        let mut deleted = created.clone();
+        deleted.apply_tx(&blind(&created, 60, RPL2_FEE, 0), &proposer, &StubExecutor).unwrap();
+        // (The ledger's cheap floor answers first — the base and the cell fee, before any proof.)
+        assert_eq!(
+            deleted.validate(&rewrite, &StubExecutor).unwrap_err(),
+            TxError::FeeTooLow { min: gas::BUNDLE_BASE + CELL_FEE, fee: call }
+        );
+        assert_eq!(m.candidates(&deleted, 10), vec![], "below its floor on this tip");
+        m.prune(&deleted);
+        assert_eq!(m.len(), 1, "a price is not staleness");
+        assert_eq!(m.candidates(&created, 10), vec![rewrite]);
     }
 }
