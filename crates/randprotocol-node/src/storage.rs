@@ -245,6 +245,13 @@ const META_GAS_PRICES: &str = "gas_prices";
 /// `#[serde(default)]`) so a field appended later reads as its default rather than breaking a
 /// positional blob. Absent on every chain without a `vesting` section.
 const META_VESTING: &str = "vesting";
+/// `bincode(ProgramState)`: every program's cells and vault balances as of the head, with the
+/// two RAND audit counters (RPL-2, `ledger::program_state::ProgramState`). Consensus state —
+/// hashed into the state root under `rand-state-8`, inside `Ledger`'s equality — written at the
+/// same three sites as the vesting register and replay-audited. Bincode rather than JSON, unlike
+/// the register: its maps are keyed by tuples, which JSON cannot hold as object keys. Absent on
+/// every chain without a `program_state` section.
+const META_PROGRAM_STATE: &str = "program_state";
 /// `bincode(BTreeMap<Address, AggregatorEntry>)`: the aggregator register as of the head.
 /// `META_SUPPLY`'s twin in kind — derived, replay-audited — but unlike the bucket this one is
 /// hashed into the state root, so a restarted node that lost it would fork at the next block.
@@ -490,8 +497,9 @@ fn sync_opts() -> WriteOptions {
 
 /// Every note a transaction creates, paired with the envelope that opens it: the bundle's four
 /// output slots in slot order — dummies included, every one of them is a leaf — then a mint's
-/// single note or a bridge deposit. Exactly the order the ledger appends them in, so the index a
-/// leaf gets on disk is the index the ledger gave it.
+/// single note, a bridge deposit, or the notes an RPL-2 `Invoke` pays out (up to four, pays then
+/// mints). Exactly the order the ledger appends them in, so the index a leaf gets on disk is the
+/// index the ledger gave it.
 ///
 /// A `BridgeAttest`'s deposit is the one commitment the wire does not carry: the chain computes
 /// it from the amount the guardians signed, the `time` the action published and the index the
@@ -550,6 +558,22 @@ fn created_notes(
             );
             out.push((cm, m.envelope.clone()));
         }
+        // RPL-2: the notes an `Invoke` pays out are chain-computed the same way — the ledger
+        // appends them through `Ledger::deposit(cm)`, which records no `Deposit` (it has no
+        // envelope to record), so they never arrive through `cb.deposits` and are rebuilt here:
+        // one per payout, pays then mints, each with the payout's own envelope and the
+        // commitment `program_state::apply` computed — stamped with the *bundle's* `time`.
+        Action::Invoke { transition, .. } => {
+            let time = tx
+                .bundle
+                .as_ref()
+                .ok_or_else(|| StorageError::Corrupt("committed invoke carries no bundle".into()))?
+                .time;
+            for p in transition.payouts() {
+                let cm = randprotocol_core::ledger::program_state::payout_commitment(p, time, executor);
+                out.push((cm, p.envelope.clone()));
+            }
+        }
         _ => {}
     }
     Ok(out)
@@ -590,6 +614,9 @@ pub fn derived_note_count(tx: &randprotocol_core::Transaction) -> usize {
         // this wrong and every wallet leaf index after the transaction slides.
         Action::TokenMint { .. } => 1,
         Action::RegisterToken { initial, .. } => usize::from(initial.is_some()),
+        // RPL-2: one note per payout, which `created_notes` rebuilds above — the one action that
+        // derives more than one. A count of the transition's own lists, nothing decoded.
+        Action::Invoke { transition, .. } => transition.pays.len() + transition.mints.len(),
         _ => 0,
     }
 }
@@ -869,6 +896,7 @@ impl Storage {
             batch.put_cf(self.cf(CF_META), META_GAS_PRICES, bincode::serialize(&gs.ledger.gas_prices())?);
         }
         self.put_vesting(&mut batch, gs.ledger.vesting())?;
+        self.put_program_state(&mut batch, gs.ledger.program_state())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
@@ -1319,6 +1347,27 @@ impl Storage {
         Ok(())
     }
 
+    /// Program state as of the head (RPL-2), `None` on a chain without the section.
+    pub fn program_state(&self) -> Result<Option<randprotocol_core::ledger::program_state::ProgramState>> {
+        self.get_meta_raw(META_PROGRAM_STATE)?
+            .map(|b| bincode::deserialize(&b).map_err(|e| StorageError::Corrupt(format!("program state: {e}"))))
+            .transpose()
+    }
+
+    /// Write it beside the rest of the head's state — present when the chain has the section,
+    /// deleted otherwise (`put_vesting`'s rule).
+    fn put_program_state(
+        &self,
+        batch: &mut WriteBatch,
+        p: Option<&randprotocol_core::ledger::program_state::ProgramState>,
+    ) -> Result<()> {
+        match p {
+            Some(p) => batch.put_cf(self.cf(CF_META), META_PROGRAM_STATE, bincode::serialize(p)?),
+            None => batch.delete_cf(self.cf(CF_META), META_PROGRAM_STATE),
+        }
+        Ok(())
+    }
+
     /// Σ of the registration fees burned under `tokens.burn_registration_fee` as of the head
     /// (audit v5, TOK-2) — `supply()`'s twin, with the same rule for a database written before
     /// the key existed: 0, which on a chain without the gate is also the only value it holds.
@@ -1541,7 +1590,8 @@ impl Storage {
             match self.receipt(&tx.hash())? {
                 Some(r) => receipts.push(r),
                 None => {
-                    if matches!(tx.action, Action::Call { .. }) {
+                    // An RPL-2 `Invoke` leaves a call's receipt too.
+                    if matches!(tx.action, Action::Call { .. } | Action::Invoke { .. }) {
                         return Err(StorageError::Corrupt(format!(
                             "receipt for call {} in block {h} missing",
                             tx.hash()
@@ -2257,6 +2307,7 @@ impl Storage {
             ledger.set_gas_prices(p);
         }
         ledger.set_vesting(self.vesting()?);
+        ledger.set_program_state(self.program_state()?);
         ledger.set_unsealed_fees(self.unsealed_fees()?);
         ledger.set_aggregators(self.aggregators()?);
         ledger.set_retired_aggregator_nonces(self.retired_aggregator_nonces()?);
@@ -2589,6 +2640,7 @@ impl Storage {
             batch.put_cf(self.cf(CF_META), META_GAS_PRICES, bincode::serialize(&ledger_after.gas_prices())?);
         }
         self.put_vesting(&mut batch, ledger_after.vesting())?;
+        self.put_program_state(&mut batch, ledger_after.program_state())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
         self.stage_retired_aggregator_nonces(&mut batch, ledger_after)?;
@@ -3131,6 +3183,13 @@ impl Storage {
             Ok(stored) if stored.vesting() != ledger.vesting() => {
                 check.problem = Some("stored vesting register does not match the replayed chain's".into())
             }
+            // Program state likewise (RPL-2): inside the equality, hashed under its section
+            // (`rand-state-8`), named so the repair knows the key. Its `cell_fee` and the two
+            // RAND counters are compared with it: the replay starts from the genesis file's fee
+            // and rebuilds the counters, so a blob wrong in either is rewritten too.
+            Ok(stored) if stored.program_state() != ledger.program_state() => {
+                check.problem = Some("stored program state does not match the replayed chain's".into())
+            }
             // The supply counters are outside `Ledger`'s equality (nothing hashes them), so they
             // are audited here explicitly: this is the replay the RPC's numbers are worth.
             Ok(stored) if stored == ledger && stored.supply() != ledger.supply() => {
@@ -3391,6 +3450,7 @@ impl Storage {
             batch.put_cf(self.cf(CF_META), META_GAS_PRICES, bincode::serialize(&ledger.gas_prices())?);
         }
         self.put_vesting(&mut batch, ledger.vesting())?;
+        self.put_program_state(&mut batch, ledger.program_state())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
         self.stage_retired_aggregator_nonces(&mut batch, ledger)?;
@@ -4072,6 +4132,194 @@ pub(crate) mod fixtures {
         let d = StubExecutor.bundle_digest(&b.digest_input());
         b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
         b
+    }
+
+    // ---- RPL-2: a chain with the `program_state` section, and the transactions it admits ----
+
+    /// The auth guest commitment the RPL-2 fixture chain pins (genesis `hc_auth`). Arbitrary,
+    /// like [`HC`]: the stub checks a proof carries it, nothing more.
+    pub(crate) const HCA: Word8 = [21; 8];
+    /// The RPL-2 fixture chain's `cell_fee`.
+    pub(crate) const CELL_FEE: u64 = 10_000_000;
+    /// A fee that covers anything the RPL-2 fixtures do: the base, a registration, a stub call
+    /// at the section's gas prices and a few cells.
+    pub(crate) const RPL2_FEE: u64 = 2_000_000_000;
+
+    /// A genesis file with the `program_state` section and everything it stands on — `tokens`,
+    /// a fixed-price `gas` section, `hardening_v6` and `hc_auth` — built through
+    /// `Genesis::validate` like a real one, so every transaction on it rides a v3 bundle
+    /// ([`v3_bundle`]). No alloc: a chain with `tokens` opens every genesis note, and the stub
+    /// spends notes that never existed anyway.
+    pub(crate) fn rpl2_genesis_file(chain_id: u64) -> Genesis {
+        // One opened RAND note (a `tokens` chain opens every genesis note), worth enough that
+        // the fees and burns the stub bundles pay come out of a pool that holds them — the
+        // supply audit's identity then holds on this chain as it does on a real one.
+        let (pk, r, amount) = ([70u32; 8], [71u32; 8], 1_000 * randprotocol_core::UNITS_PER_RAND);
+        let mut note = alloc_note(70, amount);
+        note.cm = word8_to_hex(&randprotocol_core::ledger::mint_commitment(&StubExecutor, &pk, amount, 0, &r));
+        note.opening = Some(randprotocol_core::genesis::GenesisOpening { pk: word8_to_hex(&pk), time: 0, r: word8_to_hex(&r), asset: 0 });
+        let mut g = genesis_file_of(chain_id, &[&key(1)], vec![note], randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT);
+        g.tokens = Some(TokensConfig {
+            registration_fee: 1_000_000_000,
+            tokens: vec![],
+            mint_cap_per_day: 100_000 * 100_000_000,
+            max_tokens: None,
+            burn_registration_fee: None,
+            bound_note_value: None,
+        });
+        g.max_block_bytes = Some(20 << 20);
+        g.gas = Some(gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: gas::bundle_gas_limit_pin(),
+            metering: gas::GasMetering::Circuit,
+            dynamic: None,
+        });
+        g.hardening_v6 = Some(true);
+        g.hc_auth = Some(word8_to_hex(&HCA));
+        g.program_state = Some(randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee: CELL_FEE });
+        g
+    }
+
+    pub(crate) fn rpl2_genesis(chain_id: u64) -> GenesisState {
+        rpl2_genesis_file(chain_id).build(&StubExecutor).unwrap()
+    }
+
+    /// [`bundle`] as a split-authorisation chain admits it (genesis `hc_auth`): an `auth_commit`,
+    /// the v3 digest over it, and a stub auth proof by [`HCA`]. Keyed at `seed..seed + 3`;
+    /// `burns` is `(burn_r, burn_asset, burn_a)`.
+    pub(crate) fn v3_bundle(ledger: &Ledger, seed: u32, fee: u64, burns: (u64, u32, u64)) -> Bundle {
+        let mut b = bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], fee);
+        (b.burn_r, b.burn_asset, b.burn_a) = burns;
+        b.auth_commit = [seed ^ 0x00a0_0000; 8];
+        b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest_v3(&b.digest_input()), &[0; 8]);
+        b.auth_proof = StubExecutor::make_auth_proof(&HCA, &b.auth_commit, &[0; 8]);
+        b
+    }
+
+    /// `action` on a [`v3_bundle`] paying `fee`, bound.
+    pub(crate) fn v3_tx(ledger: &Ledger, seed: u32, fee: u64, action: Action) -> Transaction {
+        StubExecutor::bound(Transaction::shielded(ledger.chain_id(), v3_bundle(ledger, seed, fee, (0, 0, 0)), action))
+    }
+
+    /// The RPL-2 fixtures' program: four words, no public input. The stub never runs it.
+    pub(crate) fn rpl2_program() -> (ProgramId, Action) {
+        let words = vec![0x13u32; 4];
+        (randprotocol_core::program::program_id(0, &words), Action::Deploy { base_pc: 0, words, public: vec![] })
+    }
+
+    /// A registration of a token at the registry's next index: under `authority`, with `initial`
+    /// units minted to [`recipient`] when it is not zero (a `Program` token takes none).
+    pub(crate) fn rpl2_register_tx(
+        ledger: &Ledger,
+        authority: randprotocol_core::ledger::tokens::MintAuthority,
+        initial: u64,
+        seed: u32,
+    ) -> Transaction {
+        use randprotocol_core::types::actions::InitialMint;
+        let registry = ledger.tokens().expect("a chain with the tokens gate");
+        let initial = (initial > 0).then(|| InitialMint {
+            amount: initial,
+            recipient: recipient(),
+            r: [seed + 7; 8],
+            time: ledger.height() as u32,
+            envelope: env(seed as u8 ^ 0x40),
+        });
+        v3_tx(
+            ledger,
+            seed,
+            gas::BUNDLE_BASE + registry.registration_fee,
+            Action::RegisterToken {
+                name: "Test Coin".into(),
+                symbol: "TST".into(),
+                decimals: 6,
+                authority,
+                initial,
+                salt: [seed as u8; 32],
+                index: registry.next_index(),
+            },
+        )
+    }
+
+    /// Cell `k`, holding `[v, 0, …]` — eight zeros (absent) when `v` is 0.
+    pub(crate) fn rpl2_cell(k: u32, v: u32) -> randprotocol_core::ledger::program_state::Cell {
+        randprotocol_core::ledger::program_state::Cell { key: [k, 0, 0, 0, 0, 0, 0, 0], value: [v, 0, 0, 0, 0, 0, 0, 0] }
+    }
+
+    /// A payout of `amount` of `asset` to the address whose words are all `n`, blinding `n + 100`.
+    pub(crate) fn rpl2_payout(asset: u32, amount: u64, n: u32) -> randprotocol_core::ledger::program_state::Payout {
+        randprotocol_core::ledger::program_state::Payout {
+            asset,
+            amount,
+            recipient: ShieldedAddress { pk: [n; 8], kem_ek: vec![6; randprotocol_core::notes::KEM_EK_BYTES] },
+            r: [n + 100; 8],
+            envelope: env(n as u8 ^ 0x80),
+        }
+    }
+
+    /// A transition that does nothing, for `..rpl2_transition()`.
+    pub(crate) fn rpl2_transition() -> randprotocol_core::ledger::program_state::Transition {
+        randprotocol_core::ledger::program_state::Transition {
+            reads: vec![],
+            writes: vec![],
+            inflow: randprotocol_core::ledger::program_state::Inflow::None,
+            pays: vec![],
+            mints: vec![],
+        }
+    }
+
+    /// An `Invoke` of [`rpl2_program`] declaring `transition`, as a wallet makes it: the stub
+    /// call proof over the segment the ledger will build (`Ledger::invoke_segment`), outputs
+    /// `[9, 8, …, 2]` at tier 10, then the bundle bound. `burns` is the bundle's
+    /// `(burn_r, burn_asset, burn_a)`.
+    pub(crate) fn rpl2_invoke_tx(
+        ledger: &Ledger,
+        seed: u32,
+        fee: u64,
+        burns: (u64, u32, u64),
+        transition: randprotocol_core::ledger::program_state::Transition,
+    ) -> Transaction {
+        let (program, _) = rpl2_program();
+        let mut tx = Transaction::shielded(
+            ledger.chain_id(),
+            v3_bundle(ledger, seed, fee, burns),
+            Action::Invoke { program, proof: Vec::new(), input_envelope: None, transition },
+        );
+        let record = ledger.program(&program).expect("the fixture program is deployed");
+        let segment = ledger.invoke_segment(record, &tx).expect("an invoke with a bundle");
+        let call = StubExecutor::make_proof_with_public(&program, 10, [9, 8, 7, 6, 5, 4, 3, 2], &segment);
+        let Action::Invoke { proof, .. } = &mut tx.action else { unreachable!() };
+        *proof = call;
+        StubExecutor::bound(tx)
+    }
+
+    /// The RPL-2 fixture chain's first block, built on `ledger` (its genesis ledger): the
+    /// program deployed, token 1 a plain `Key` token ([`issuer`]'s, 1 000 000 units minted to
+    /// [`recipient`]) and token 2 the program's own.
+    pub(crate) fn rpl2_setup_txs(ledger: &Ledger) -> Vec<Transaction> {
+        use randprotocol_core::ledger::tokens::MintAuthority;
+        let (program, deploy) = rpl2_program();
+        let deploy = v3_tx(ledger, 900, gas::fee_floor(&deploy), deploy);
+        let plain = rpl2_register_tx(ledger, MintAuthority::Key(issuer().public_key().clone()), 1_000_000, 910);
+        // The second registration is held to the index after the first's.
+        let mut own = rpl2_register_tx(ledger, MintAuthority::Program(program), 0, 920);
+        if let Action::RegisterToken { index, .. } = &mut own.action {
+            *index += 1;
+        }
+        vec![deploy, plain, StubExecutor::bound(own)]
+    }
+
+    /// An opened store holding the RPL-2 fixture chain one block in ([`rpl2_setup_txs`]), with
+    /// the ledger after that block and the block itself.
+    pub(crate) fn rpl2_chain(chain_id: u64) -> (tempfile::TempDir, Storage, GenesisState, Ledger, CommittedBlock) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = rpl2_genesis(chain_id);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let b1 = make_block(&gs.block, &mut ledger, rpl2_setup_txs(&gs.ledger), &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        (dir, s, gs, ledger, b1)
     }
 
     /// A bundle-less `Withdraw` signed by `v` (ruling B of S2 task 3): it pays a note worth
@@ -7343,6 +7591,116 @@ mod tests {
         s.truncate_to(&gs, 1, &check.ledger).unwrap();
         assert_eq!(s.jailed().unwrap(), jailed);
         assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+    }
+
+    /// RPL-2: program state is consensus state, so it is committed beside the rest of the head's
+    /// state, restored by `load_ledger` (and the reloaded ledger hashes the same `rand-state-8`
+    /// root), named by `verify_chain` when stale and rewritten by the repair; a node whose
+    /// database and genesis file disagree about having it refuses to start, and the genesis
+    /// file's `cell_fee` is what a restarted node runs on whatever the blob says.
+    ///
+    /// And the notes an invoke pays out are leaves the wire does not carry: a block holding an
+    /// invoke with three payouts followed by another transaction indexes every note at the leaf
+    /// the ledger gave it (`commit` returns `Corrupt` if the counts disagree).
+    #[test]
+    fn program_state_is_persisted_restored_and_audited() {
+        use randprotocol_core::ledger::program_state::{payout_commitment, Inflow, ProgramState, Transition};
+        let (_dir, s, gs, mut ledger, b1) = rpl2_chain(7);
+        let (program, _) = rpl2_program();
+        assert_eq!(s.program_state().unwrap().as_ref(), ledger.program_state(), "written with genesis and block 1");
+        assert_eq!(s.program_state().unwrap().unwrap().cell_fee, CELL_FEE);
+
+        // Deposit 1 000 RAND units and 500 of token 1, create cell 1, pay two RAND notes out of
+        // the vault and mint 40 of the program's own token 2 — then a plain transfer behind it.
+        let transition = Transition {
+            reads: vec![rpl2_cell(1, 0)],
+            writes: vec![rpl2_cell(1, 5)],
+            inflow: Inflow::Deposit,
+            pays: vec![rpl2_payout(0, 300, 1), rpl2_payout(0, 200, 2)],
+            mints: vec![rpl2_payout(2, 40, 3)],
+        };
+        let invoke = rpl2_invoke_tx(&ledger, 10, RPL2_FEE, (1_000, 1, 500), transition.clone());
+        let transfer = v3_tx(&ledger, 20, bundle_fee(), Action::None);
+        assert_eq!(derived_note_count(&invoke), 3, "one leaf per payout");
+        let first = ledger.next_index();
+        let mut probe = ledger.clone();
+        let mut b2 = make_block(&b1, &mut ledger, vec![invoke.clone(), transfer.clone()], &key(1));
+        assert!(b2.deposits.is_empty(), "a payout note is not a ledger `Deposit`: storage rebuilds it from the transaction");
+        b2.receipts = probe.apply_block(&b2.block, &StubExecutor).unwrap();
+        assert_eq!(b2.receipts.len(), 1, "an invoke leaves a call's receipt");
+        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+
+        // Every leaf of the block, in the ledger's order: the invoke's four slots, its three
+        // payouts (pays, then mints) with the payouts' own envelopes, then the transfer's four.
+        let time = invoke.bundle.as_ref().unwrap().time;
+        let mut want: Vec<(Word8, Envelope)> = Vec::new();
+        let ib = invoke.bundle.as_ref().unwrap();
+        want.extend(ib.commitments.iter().copied().zip(ib.envelopes.iter().cloned()));
+        want.extend(transition.payouts().map(|p| (payout_commitment(p, time, &StubExecutor), p.envelope.clone())));
+        let tb = transfer.bundle.as_ref().unwrap();
+        want.extend(tb.commitments.iter().copied().zip(tb.envelopes.iter().cloned()));
+        let rows = s.notes_in_heights(2, 2, usize::MAX).unwrap();
+        assert_eq!(rows.len(), 11);
+        for (k, ((index, row), (cm, envelope))) in rows.iter().zip(&want).enumerate() {
+            assert_eq!(*index, first + k as u64, "leaf {k}");
+            assert_eq!((&row.cm, &row.envelope), (cm, envelope), "leaf {k}");
+            assert!(ledger.has_commitment(cm));
+        }
+        assert_eq!(ledger.next_index(), first + 11);
+
+        let stored = s.program_state().unwrap().expect("committed with the state");
+        assert_eq!(stored.cell(&program, &rpl2_cell(1, 0).key), rpl2_cell(1, 5).value);
+        assert_eq!(stored.vault_of(&program), vec![(0, 500), (1, 500)]);
+        assert_eq!((stored.rand_in, stored.rand_out), (1_000, 500));
+        assert_eq!(s.tokens().unwrap().unwrap().get(2).unwrap().total_supply, 40);
+        assert!(ledger.audit().invariant_holds(), "{:?}", ledger.audit());
+
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.program_state(), ledger.program_state());
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(reloaded, ledger);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A stale blob (the genesis one: the invoke lost) is named, and repaired from replay.
+        let put = |p: &ProgramState| s.db.put_cf(s.cf(CF_META), META_PROGRAM_STATE, bincode::serialize(p).unwrap()).unwrap();
+        put(gs.ledger.program_state().unwrap());
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.expect("a stale program state is a problem");
+        assert!(problem.contains("program state"), "{problem}");
+        assert_eq!(check.last_good, 2, "the blocks themselves are fine");
+        s.truncate_to(&gs, 2, &check.ledger).unwrap();
+        assert_eq!(s.program_state().unwrap().as_ref(), ledger.program_state());
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A blob whose `cell_fee` is not the genesis file's: the file wins on reload (the fee is
+        // a genesis parameter, outside the state root), and the audit names the blob.
+        let mut cheap = ledger.program_state().unwrap().clone();
+        cheap.cell_fee = 1;
+        put(&cheap);
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.program_state().unwrap().cell_fee, CELL_FEE, "the genesis file's fee");
+        assert_eq!(reloaded, ledger);
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(check.problem.expect("a wrong fee is a wrong blob").contains("program state"));
+        s.truncate_to(&gs, 2, &check.ledger).unwrap();
+        assert_eq!(s.program_state().unwrap().unwrap().cell_fee, CELL_FEE);
+
+        // A database without the blob under a genesis with the section: refuse to start. And the
+        // other way round.
+        s.db.delete_cf(s.cf(CF_META), META_PROGRAM_STATE).unwrap();
+        let err = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap_err().to_string();
+        assert!(err.contains("has a program_state section but the database holds no program state"), "{err}");
+        put(ledger.program_state().unwrap());
+        let mut without = rpl2_genesis_file(7);
+        without.program_state = None;
+        let err = crate::node::reload_ledger(&s, &without.build(&StubExecutor).unwrap(), &StubExecutor).unwrap_err().to_string();
+        assert!(err.contains("has no program_state section but the database holds program state"), "{err}");
+
+        // A chain without the section never gains the key.
+        let (_d2, plain, plain_gs) = genesis_with_two_notes();
+        plain.init_genesis(&plain_gs).unwrap();
+        assert_eq!(plain.program_state().unwrap(), None);
+        assert!(plain.get_meta_raw(META_PROGRAM_STATE).unwrap().is_none());
     }
 
     /// The v4 re-review's bond queue is consensus state under a `staking` section, so — like

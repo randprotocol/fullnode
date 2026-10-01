@@ -297,11 +297,12 @@ pub fn advance(storage: &Storage, import: &mut Import, max_rows: u64) -> Result<
 pub struct Opening {
     /// Which of the transaction's envelope sets this came from: `"bundle"` (its bundle's four
     /// output slots), `"deposit"` (a `BridgeAttest`'s deposit envelope), `"token_mint"` (a
-    /// `TokenMint`'s minted note), `"initial_mint"` (a `RegisterToken`'s initial mint) or
-    /// `"mint"` (a faucet mint's one envelope).
+    /// `TokenMint`'s minted note), `"initial_mint"` (a `RegisterToken`'s initial mint),
+    /// `"payout"` (a note an RPL-2 `Invoke` paid out) or `"mint"` (a faucet mint's one envelope).
     pub output: &'static str,
-    /// The slot inside `output`; meaningless for every output but `"bundle"`, each of which
-    /// carries exactly one envelope.
+    /// The slot inside `output`: a bundle's output slot, or a payout's place in its transition
+    /// (pays, then mints). Meaningless for every other output, each of which carries exactly
+    /// one envelope.
     pub slot: u8,
     /// The on-chain commitment the opened note commits to — what makes the disclosure a proof
     /// rather than a claim: `open_with_tx_key` authenticates the note *and* checks it against
@@ -322,12 +323,14 @@ pub struct Opening {
 /// envelopes are sealed inside the node under keys that are dropped at once (`seal_deposit`,
 /// `sealed_withdraw_note`), so no `TxKey` for them can ever be presented and they are not tried.
 ///
-/// `derived_cm` is the chain-computed commitment of the action's one derived note — a
-/// `BridgeAttest`'s deposit, a `TokenMint`'s note, a `RegisterToken`'s initial mint — which the
-/// wire does not carry and the caller computes as the notes index appended it (`rpc`'s
-/// `derived_note_cm`); `None` for any other action, for a rotation (which deposits nothing), for
-/// a registration without an initial mint, and on a chain whose registry does not hold the asset.
-pub fn disclosed(tx: &Transaction, derived_cm: Option<Word8>, key: &TxKey) -> Vec<Opening> {
+/// `derived` is the chain-computed commitments of the action's derived notes — a
+/// `BridgeAttest`'s deposit, a `TokenMint`'s note, a `RegisterToken`'s initial mint, each one
+/// note, or the up to four an RPL-2 `Invoke` pays out, in payout order — which the wire does not
+/// carry and the caller computes as the notes index appended them (`rpc`'s `derived_note_cms`);
+/// empty for any other action, for a rotation (which deposits nothing), for a registration
+/// without an initial mint, and on a chain whose registry does not hold the asset.
+pub fn disclosed(tx: &Transaction, derived: &[Word8], key: &TxKey) -> Vec<Opening> {
+    let derived_cm = derived.first().copied();
     let mut out = Vec::new();
     let mut try_env = |output: &'static str, slot: u8, cm: Word8, e: &Envelope| {
         let env = envelope_from_core(e);
@@ -359,6 +362,14 @@ pub fn disclosed(tx: &Transaction, derived_cm: Option<Word8>, key: &TxKey) -> Ve
         }
         // A faucet mint carries its one commitment and envelope on the wire.
         Action::Mint { cm, envelope, .. } => try_env("mint", 0, *cm, envelope),
+        // RPL-2: one envelope per payout, each against its own derived commitment — the i-th
+        // payout (pays, then mints) against the i-th. The caller sealed them, so a `TxKey` for
+        // each can exist. A short list opens only as far as it goes.
+        Action::Invoke { transition, .. } => {
+            for (i, (p, cm)) in transition.payouts().zip(derived).enumerate() {
+                try_env("payout", i as u8, *cm, &p.envelope);
+            }
+        }
         _ => {}
     }
     out
@@ -669,13 +680,13 @@ mod tests {
         let tx = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(7, bundle, Action::None));
 
         // The payment key discloses the payment and nothing else.
-        let opened = disclosed(&tx, None, &payment_key);
+        let opened = disclosed(&tx, &[], &payment_key);
         assert_eq!(opened.len(), 1);
         assert_eq!((opened[0].output, opened[0].slot), ("bundle", 0));
         assert_eq!((opened[0].cm, opened[0].note), (alice_note.commitment(), alice_note));
         // The change key discloses the change, and a wrong key nothing at all.
-        assert_eq!(disclosed(&tx, None, &change_key).len(), 1);
-        assert!(disclosed(&tx, None, &TxKey([99; 32])).is_empty());
+        assert_eq!(disclosed(&tx, &[], &change_key).len(), 1);
+        assert!(disclosed(&tx, &[], &TxKey([99; 32])).is_empty());
 
         // A bridge attestation's deposit envelope opens against the chain-computed commitment —
         // and does not open against anything else, so a key lifted from another transaction
@@ -695,12 +706,12 @@ mod tests {
                 pq_signatures: Vec::new(),
             },
         };
-        let opened = disclosed(&attest, Some(deposit.commitment()), &deposit_key);
+        let opened = disclosed(&attest, &[deposit.commitment()], &deposit_key);
         assert_eq!(opened.len(), 1);
         assert_eq!(opened[0].output, "deposit");
         assert_eq!(opened[0].note, deposit);
-        assert!(disclosed(&attest, None, &deposit_key).is_empty(), "no commitment, no opening");
-        assert!(disclosed(&attest, Some([6; 8]), &deposit_key).is_empty(), "the AEAD binds the real one");
+        assert!(disclosed(&attest, &[], &deposit_key).is_empty(), "no commitment, no opening");
+        assert!(disclosed(&attest, &[[6; 8]], &deposit_key).is_empty(), "the AEAD binds the real one");
     }
 
     /// A `TokenMint`'s envelope and a registration's initial-mint envelope are sealed by the
@@ -727,13 +738,13 @@ mod tests {
                 signature: randprotocol_core::Keypair::generate().sign(b"x"),
             },
         };
-        let opened = disclosed(&mint, Some(note.commitment()), &k);
+        let opened = disclosed(&mint, &[note.commitment()], &k);
         assert_eq!(opened.len(), 1);
         assert_eq!((opened[0].output, opened[0].cm), ("token_mint", note.commitment()));
         assert_eq!(opened[0].note, note);
-        assert!(disclosed(&mint, None, &k).is_empty(), "no commitment, no opening");
-        assert!(disclosed(&mint, Some([6; 8]), &k).is_empty(), "the AEAD binds the real one");
-        assert!(disclosed(&mint, Some(note.commitment()), &TxKey([42; 32])).is_empty());
+        assert!(disclosed(&mint, &[], &k).is_empty(), "no commitment, no opening");
+        assert!(disclosed(&mint, &[[6; 8]], &k).is_empty(), "the AEAD binds the real one");
+        assert!(disclosed(&mint, &[note.commitment()], &TxKey([42; 32])).is_empty());
 
         let register = Transaction {
             chain_id: 7,
@@ -748,10 +759,58 @@ mod tests {
                 index: 2,
             },
         };
-        let opened = disclosed(&register, Some(note.commitment()), &k);
+        let opened = disclosed(&register, &[note.commitment()], &k);
         assert_eq!(opened.len(), 1);
         assert_eq!((opened[0].output, opened[0].note), ("initial_mint", note));
-        assert!(disclosed(&register, Some([6; 8]), &k).is_empty());
+        assert!(disclosed(&register, &[[6; 8]], &k).is_empty());
+    }
+
+    /// RPL-2: each payout of an invoke carries its own envelope, opened against its own derived
+    /// commitment and reported as `payout` with its place in the transition (pays, then mints).
+    #[test]
+    fn an_invokes_payouts_disclose_their_notes_by_slot() {
+        use randprotocol_core::ledger::program_state::{Inflow, Payout, Transition, PROGRAM_FROM};
+        let paid = Note { from: PROGRAM_FROM, ..note_for(&alice(), &bob(), 300) };
+        let minted = Note { from: PROGRAM_FROM, asset: 2, ..note_for(&bob(), &alice(), 40) };
+        let (k0, k1) = (TxKey([51; 32]), TxKey([52; 32]));
+        let payout = |note: &Note, to: &ViewingKey, key: &TxKey| Payout {
+            asset: note.asset,
+            amount: note.amount,
+            recipient: address_of(to),
+            r: note.r,
+            envelope: sealed(&bob(), to, note, key),
+        };
+        let tx = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::Invoke {
+                program: randprotocol_core::Hash([7; 32]),
+                proof: Vec::new(),
+                input_envelope: None,
+                transition: Transition {
+                    reads: vec![],
+                    writes: vec![],
+                    inflow: Inflow::None,
+                    pays: vec![payout(&paid, &alice(), &k0)],
+                    mints: vec![payout(&minted, &bob(), &k1)],
+                },
+            },
+        };
+        let derived = [paid.commitment(), minted.commitment()];
+        let opened = disclosed(&tx, &derived, &k0);
+        assert_eq!(opened.len(), 1);
+        assert_eq!((opened[0].output, opened[0].slot, opened[0].cm), ("payout", 0, paid.commitment()));
+        assert_eq!(opened[0].note, paid);
+        let opened = disclosed(&tx, &derived, &k1);
+        assert_eq!(opened.len(), 1);
+        assert_eq!((opened[0].output, opened[0].slot, opened[0].note), ("payout", 1, minted));
+        assert!(disclosed(&tx, &derived, &TxKey([53; 32])).is_empty());
+        // Each envelope is bound to its own leaf: the other payout's commitment opens nothing,
+        // and a list that stops short opens only as far as it goes.
+        assert!(disclosed(&tx, &[derived[1], derived[0]], &k0).is_empty());
+        assert!(disclosed(&tx, &[], &k0).is_empty());
+        assert!(disclosed(&tx, &derived[..1], &k1).is_empty());
+        assert_eq!(disclosed(&tx, &derived[..1], &k0).len(), 1);
     }
 
     #[test]
@@ -764,10 +823,10 @@ mod tests {
         let ex = randprotocol_zkvm::executor::ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test);
         let env = sealed(&bob(), &alice(), &note, &k);
         let mint = Transaction::mint(7, note.pk, note.time, note.r, env, 100, &randprotocol_core::Keypair::generate(), &ex);
-        let opened = disclosed(&mint, None, &k);
+        let opened = disclosed(&mint, &[], &k);
         assert_eq!(opened.len(), 1);
         assert_eq!((opened[0].output, opened[0].slot, opened[0].cm), ("mint", 0, note.commitment()));
         assert_eq!(opened[0].note, note);
-        assert!(disclosed(&mint, None, &TxKey([32; 32])).is_empty());
+        assert!(disclosed(&mint, &[], &TxKey([32; 32])).is_empty());
     }
 }
