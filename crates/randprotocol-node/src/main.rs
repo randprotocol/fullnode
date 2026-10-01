@@ -1704,6 +1704,7 @@ async fn main() -> Result<()> {
                 // Issue #118: absent unless asked for, so a genesis cut without it hashes
                 // byte-for-byte as before.
                 proof_window_blocks,
+                program_state: None,
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -3565,6 +3566,7 @@ mod tests {
             testnet: None,
             binding_domain: None,
             proof_window_blocks: None,
+            program_state: None,
         }
     }
 

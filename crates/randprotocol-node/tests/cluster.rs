@@ -214,6 +214,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         testnet,
         binding_domain: None,
         proof_window_blocks: None,
+        program_state: None,
     }
 }
 

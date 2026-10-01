@@ -99,6 +99,7 @@ fn genesis_with_aggregation(key: &Keypair, aggregation: Option<randprotocol_core
         testnet: None,
         binding_domain: None,
         proof_window_blocks: None,
+        program_state: None,
     }
 }
 

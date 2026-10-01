@@ -111,6 +111,7 @@ fn genesis_full(
         // chains cut before `binding_domain`, so the wallet signs and proves nothing else there.
         binding_domain: Some(1),
         proof_window_blocks: None,
+        program_state: None,
         hardening_v6: None,
         hc_auth: None,
     }

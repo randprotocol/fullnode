@@ -2158,6 +2158,12 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
             "first": { "hash": first.hash().to_hex(), "height": first.header.height },
             "second": { "hash": second.hash().to_hex(), "height": second.header.height },
         }),
+        // RPL-2: the program and the proof's length; the transition is rendered once the node
+        // serves program state.
+        Action::Invoke { program, proof, input_envelope, .. } => json!({
+            "kind": "invoke", "program": program.to_hex(), "proof_len": proof.len(),
+            "input_envelope_len": input_envelope.as_ref().map(|e| e.len() as u64),
+        }),
     };
     json!({
         "hash": t.hash().to_hex(),

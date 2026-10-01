@@ -2,6 +2,7 @@
 
 use crate::bridge::{digest as attestation_digest, Attestation};
 use crate::crypto::{Address, Hash, Keypair, PublicKey, Signature};
+use crate::ledger::program_state::Transition;
 use crate::ledger::tokens::MintAuthority;
 use crate::notes::{Bundle, Envelope, ShieldedAddress, Word8, BUNDLE_SLOTS};
 use crate::program::ProgramId;
@@ -438,6 +439,20 @@ pub enum Action {
     /// bridge's `rotation_nonce`, which the cancel spends. Bundle-less and fee-less, like the
     /// pause. Refused `RotationRulesDisabled` on a chain without the group.
     CancelRotation { kind: u8, nonce: u64, signature: Signature },
+    /// RPL-2 (`docs/superpowers/specs/2026-09-30-rpl2-program-state-design.md`): a call whose
+    /// proof vouches for one declared state `transition` of `program` — cells read and written,
+    /// what the bundle's burn fields bring into the program's vault, what the vault pays out and
+    /// what the program mints — which the ledger then applies. `proof` and `input_envelope` are
+    /// a `Call`'s; the proof is made over `public ‖ call_binding ‖ transition.context(..)`. Rides
+    /// a bundle, whose `burn_r` / `burn_a` / `burn_asset` are the value coming in. Gated on the
+    /// genesis `program_state` section.
+    Invoke {
+        program: ProgramId,
+        #[serde(with = "crate::crypto::wire_bytes")]
+        proof: Vec<u8>,
+        input_envelope: Option<CallEnvelope>,
+        transition: Transition,
+    },
 }
 
 impl Action {
@@ -513,6 +528,14 @@ impl Action {
             Action::Call { program, proof, input_envelope } => {
                 Action::Call { program: *program, proof: proof.clone(), input_envelope: input_envelope.clone() }
             }
+            // An `Invoke`'s proof is a call proof and is kept for a `Call`'s reason; the transition
+            // is what the proof is about and what the ledger applies, so it is kept whole.
+            Action::Invoke { program, proof, input_envelope, transition } => Action::Invoke {
+                program: *program,
+                proof: proof.clone(),
+                input_envelope: input_envelope.clone(),
+                transition: transition.clone(),
+            },
             Action::Bond { validator, amount, registration } => {
                 Action::Bond { validator: *validator, amount: *amount, registration: registration.clone() }
             }
@@ -957,6 +980,11 @@ impl Transaction {
     pub fn call_binding(&self, domain: &BindingDomain) -> [u32; TX_BINDING_WORDS] {
         let action = match self.action.blanked() {
             Action::Call { program, input_envelope, .. } => Action::Call { program, proof: Vec::new(), input_envelope },
+            // RPL-2: the transition stays in, so an invoke's proof commits to exactly the state
+            // change, the payouts and the recipients the transaction declares.
+            Action::Invoke { program, input_envelope, transition, .. } => {
+                Action::Invoke { program, proof: Vec::new(), input_envelope, transition }
+            }
             other => other,
         };
         self.binding_of(domain, CALL_BINDING_DOMAIN, CALL_BINDING_DOMAIN_V2, action)
@@ -1582,7 +1610,7 @@ mod tests {
     /// The number of `Action` variants, and each one's position — an exhaustive match with no
     /// wildcard, so a new variant fails to compile here until [`sample`] has a row for it (and
     /// [`Action::blanked`] has an arm).
-    const VARIANTS: usize = 33;
+    const VARIANTS: usize = 34;
     fn variant_index(a: &Action) -> usize {
         match a {
             Action::None => 0,
@@ -1618,6 +1646,7 @@ mod tests {
             Action::RotatePqGuardiansV2 { .. } => 30,
             Action::RotatePauseKeyV2 { .. } => 31,
             Action::CancelRotation { .. } => 32,
+            Action::Invoke { .. } => 33,
         }
     }
 
@@ -1847,6 +1876,33 @@ mod tests {
                 pq_signatures: vec![crate::bridge::PqSignature { index: 2, signature: vec![0xac; 8] }],
             },
             32 => Action::CancelRotation { kind: 1, nonce: 4, signature: sig() },
+            33 => {
+                use crate::ledger::program_state::{Cell, Inflow, Payout, Transition};
+                let payout = |asset: u32| Payout {
+                    asset,
+                    amount: 5,
+                    recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+                    r: [5; 8],
+                    envelope: env(),
+                };
+                Action::Invoke {
+                    program: Hash([7; 32]),
+                    proof,
+                    input_envelope: Some(CallEnvelope {
+                        kem_ct: vec![1; 4],
+                        to_sender: vec![2; 4],
+                        to_auditor: vec![3; 4],
+                        body: vec![4; 4],
+                    }),
+                    transition: Transition {
+                        reads: vec![Cell { key: [1; 8], value: [2; 8] }],
+                        writes: vec![Cell { key: [1; 8], value: [3; 8] }],
+                        inflow: Inflow::Deposit,
+                        pays: vec![payout(0)],
+                        mints: vec![payout(2)],
+                    },
+                }
+            }
             _ => panic!("no variant {i}"),
         }
     }
@@ -1864,7 +1920,8 @@ mod tests {
         // Since the hidden-asset bundle (spec §3.7) only an `Aggregate` carries a proof that is
         // blanked: `BridgeBurn` (8) and `TokenBurn` (17) no longer carry a bundle of their own.
         let blanked_proof = [13usize];
-        let kept_proof = [3usize];
+        // A `Call` (3) and an RPL-2 `Invoke` (33) carry a call proof, which is kept.
+        let kept_proof = [3usize, 33];
         let mut seen = [false; VARIANTS];
         for (i, seen) in seen.iter_mut().enumerate() {
             let with = sample(i, vec![0x99; 7]);

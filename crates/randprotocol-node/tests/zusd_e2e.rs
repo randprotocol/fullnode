@@ -139,6 +139,7 @@ fn zusd_genesis(validators: &[randprotocol_core::Keypair]) -> Genesis {
         testnet: Some(true),
         binding_domain: None,
         proof_window_blocks: None,
+        program_state: None,
     }
 }
 
