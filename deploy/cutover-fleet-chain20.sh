@@ -220,7 +220,20 @@ stage)
         [ -n "$STAGE_URL" ] || { echo "stage: STAGE_FROM=url needs STAGE_URL (a private base URL holding rand-node and rand) — nothing staged" >&2; exit 1; }
         BASE=$STAGE_URL; SHOWN="${STAGE_URL%%\?*}"; SHOWN="${SHOWN%/*}/…"
       else BASE=$RELEASE_URL; SHOWN=$RELEASE_URL; fi
-      case "$BASE" in https://*) ;; *) echo "stage: $SHOWN is not https:// — nothing staged" >&2; exit 1;; esac
+      case "$BASE" in
+        https://*) ;;
+        http://*)
+          # A private build served from an operator host for the length of `stage` (chain 20's
+          # v0.6.8 was served from E). Integrity rests on the sha256 pins every host checks before
+          # it keeps a byte, not on TLS; what plain HTTP gives up is that anyone on the path sees
+          # the binaries. Allowed for STAGE_FROM=url only, and only when asked for by name.
+          if [ "$STAGE_FROM" = url ] && [ "${STAGE_ALLOW_HTTP:-0}" = 1 ]; then
+            echo "== ⚠ STAGE_ALLOW_HTTP=1: staging from plain http:// ($SHOWN) — the sha256 pins are the only integrity check" >&2
+          else
+            echo "stage: $SHOWN is not https:// — nothing staged (STAGE_ALLOW_HTTP=1 allows a private STAGE_FROM=url over http; the sha256 pins still decide)" >&2; exit 1
+          fi ;;
+        *) echo "stage: $SHOWN is not https:// — nothing staged" >&2; exit 1;;
+      esac
       Q=""; case "$BASE" in *\?*) Q="?${BASE#*\?}"; BASE=${BASE%%\?*};; esac
       echo "== stage $TAG on $(echo $ALL | wc -w) hosts from $SHOWN $(date -u +%T)"
       # Each host fetches the binaries itself and checks both pins; a mismatch deletes what it fetched.
