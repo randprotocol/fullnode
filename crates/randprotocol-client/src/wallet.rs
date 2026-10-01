@@ -912,7 +912,9 @@ async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -
     'pages: while from <= head {
         let headers = match rpc.blocks(from, head.min(from.saturating_add(span - 1))).await {
             Ok(headers) => headers,
-            Err(e) if crate::reply_too_large(&e) && span > 1 => {
+            // A page refused for its size, or still downloading when the read timeout ran out
+            // (a slow link and a page of proof-carrying deposits): asked again at half the range.
+            Err(e) if (crate::reply_too_large(&e) || crate::read_timed_out(&e)) && span > 1 => {
                 span /= 2;
                 continue;
             }
@@ -5329,6 +5331,8 @@ mod tests {
         /// for the client to read, as a node without a reply budget did with a page of whole
         /// deposits (audit v7, RPC-5). `None`: every page fits.
         max_header_page: Option<u64>,
+        /// Header pages longer than this stall until the client's read timeout runs out.
+        stall_header_page: Option<u64>,
         /// The span of every `rand_getBlocks` range this node was asked for, in order.
         header_pages: Vec<u64>,
         /// `rand_getLimits`' `envelope_bytes` (task 7): `None` — this fake's default — is a chain
@@ -5411,6 +5415,7 @@ mod tests {
                 block_reads: 0,
                 strip_public_notes: false,
                 max_header_page: None,
+                stall_header_page: None,
                 header_pages: Vec::new(),
                 envelope_bytes: None,
                 hc_bundle: ZkExecutor::hc_bundle(),
@@ -5483,6 +5488,9 @@ mod tests {
                 self.header_pages.push(span);
                 if self.max_header_page.is_some_and(|max| span > max) {
                     return Reply::TooLarge;
+                }
+                if self.stall_header_page.is_some_and(|max| span > max) {
+                    return Reply::Stall;
                 }
             }
             Reply::Ok(match method {
@@ -6237,6 +6245,37 @@ mod tests {
         let e = scan(&rpc, &me, &mut NoteStore::default()).await.unwrap_err();
         assert!(format!("{e:#}").contains("alone is larger than this wallet reads"), "{e:#}");
         assert!(crate::reply_too_large(&e));
+    }
+
+    /// A header page still downloading when the read timeout runs out — a 29 MB page of
+    /// proof-carrying deposits over a slow link did on chain 20, and every fresh wallet's first
+    /// sync failed at once with "error decoding response body … operation timed out" — is asked
+    /// again at half the range, like a page refused for its size, rather than asked again whole
+    /// and timed out again for ever.
+    #[tokio::test]
+    async fn the_block_walk_halves_a_page_that_times_out() {
+        let me = Wallet::from_spend_key(SpendKey([64; 8]));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        let (txs, notes) = proved_public_notes_for(&me);
+        {
+            let mut c = chain.lock().unwrap();
+            c.headers_carry_public_notes = true;
+            c.strip_public_notes = true;
+            c.stall_header_page = Some(3);
+            for (tx, note) in txs.into_iter().zip(notes.iter()) {
+                c.commit(vec![tx], vec![(note.commitment(), garbage())]);
+            }
+            for _ in 0..6 {
+                c.commit(Vec::new(), Vec::new());
+            }
+            c.fund(&me, 5, 0);
+        }
+        let rpc = serve(&chain).await.with_read_timeout(std::time::Duration::from_millis(300));
+        let mut store = NoteStore::default();
+        scan(&rpc, &me, &mut store).await.expect("the walk goes on in pages that arrive in time");
+        assert_eq!(store.notes.len(), notes.len() + 1, "every public note is placed");
+        let pages = chain.lock().unwrap().header_pages.clone();
+        assert!(pages.iter().filter(|s| **s <= 3).count() >= 4, "the walk went on in pages that fit: {pages:?}");
     }
 
     /// Issue #117: a first sync stopped part-way — here the leaf page after the block walk fails

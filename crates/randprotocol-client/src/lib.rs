@@ -366,6 +366,8 @@ pub struct RpcClient {
     /// The first wait after a rate-limit refusal (issue #117); doubled per retry up to
     /// [`RATE_LIMIT_RETRIES`] retries. A second in production; tests shorten it.
     rate_limit_wait: Duration,
+    /// How long a read (anything but a large upload) may take, body included ([`READ_TIMEOUT`]).
+    read_timeout: Duration,
 }
 
 /// How many times a call refused for rate limiting is retried, with waits of `rate_limit_wait`
@@ -416,6 +418,13 @@ impl std::error::Error for ReplyTooLarge {}
 /// Whether `e` is a reply refused for its size ([`ReplyTooLarge`]), under any context.
 pub fn reply_too_large(e: &anyhow::Error) -> bool {
     e.downcast_ref::<ReplyTooLarge>().is_some()
+}
+
+/// Whether `e` is a read that ran out of time ([`READ_TIMEOUT`], body included), under any
+/// context: the header walk asks again for less rather than for the same page, which a slow link
+/// would time out again for ever.
+pub fn read_timed_out(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<reqwest::Error>().is_some_and(|r| r.is_timeout()))
 }
 
 /// Read `resp`'s body, refusing it once it passes `limit` bytes — up front on a declared
@@ -473,7 +482,14 @@ impl RpcClient {
             legacy_status: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             envelope_format: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             rate_limit_wait: Duration::from_secs(1),
+            read_timeout: READ_TIMEOUT,
         }
+    }
+
+    /// This client with another read timeout (tests: milliseconds instead of [`READ_TIMEOUT`]).
+    pub fn with_read_timeout(mut self, timeout: Duration) -> RpcClient {
+        self.read_timeout = timeout;
+        self
     }
 
     /// This client with another first rate-limit wait (tests: milliseconds instead of a second).
@@ -525,7 +541,8 @@ impl RpcClient {
             req = req.timeout(t);
             t
         } else {
-            READ_TIMEOUT
+            req = req.timeout(self.read_timeout);
+            self.read_timeout
         };
         let resp = req
             .send()
@@ -1139,6 +1156,9 @@ pub(crate) mod test_rpc {
         /// Announce a body past the client's 64 MiB reply cap (`content-length` alone, no body
         /// sent), as a node without a reply budget answers an oversized page (audit v7, RPC-5).
         TooLarge,
+        /// Announce a short body and never finish sending it: a page still downloading when the
+        /// client's read timeout runs out, as a 29 MB header page did over a slow link.
+        Stall,
     }
 
     pub async fn scripted_rpc(script: Vec<(&'static str, Reply)>) -> String {
@@ -1150,6 +1170,7 @@ pub(crate) mod test_rpc {
             Some((_, Reply::Drop)) => Reply::Drop,
             Some((_, Reply::Malformed(body))) => Reply::Malformed(body),
             Some((_, Reply::TooLarge)) => Reply::TooLarge,
+            Some((_, Reply::Stall)) => Reply::Stall,
             None => Reply::Err(-32601, "unknown method"),
         })
         .await
@@ -1200,6 +1221,13 @@ pub(crate) mod test_rpc {
                     let method = req["method"].as_str().unwrap_or_default().to_string();
                     let body = match answer(&method, &req["params"]) {
                         Reply::Drop => return,
+                        Reply::Stall => {
+                            let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: 64\r\n\r\n{";
+                            let _ = sock.write_all(head.as_bytes()).await;
+                            let _ = sock.flush().await;
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            return;
+                        }
                         Reply::TooLarge => {
                             let head = format!(
                                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
