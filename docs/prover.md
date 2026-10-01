@@ -136,6 +136,7 @@ wallet can take pasted text, paste the link instead.
 | `--per-token <N>` | `2` | jobs one pairing may have queued or proving at once |
 | `--cuda` | off | prove on the CUDA backend; needs a build with `--features cuda`, and there is no CPU fallback |
 | `--skip-memory-check` | off | start even when the memory gate below would refuse |
+| `--prove-timeout-secs <S>` | `600` | the longest one proof may take; past it the job fails `the proof did not finish in time` and the process exits with status 75 so systemd restarts a clean prover (audit v7, VK-12); `0` = no limit. `rand-node run --prover` applies the same 600 s limit but only logs, so a validator is never stopped by its prover |
 | `--allow-origin <ORIGIN>` | extensions and loopback pages | a browser origin whose pages may read replies, repeatable; given once or more, the values are the whole list; `*` = every origin (opt-in, warned) — §6.1 |
 | `--fee <RAND>` | none | the fee every job must pay, in RAND (display units, up to 9 decimals); needs `--fee-address` — §3.5 |
 | `--fee-address <ADDRESS>` | none | the `rand1…` address the fee is paid to; needs `--fee` |

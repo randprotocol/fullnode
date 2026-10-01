@@ -51,7 +51,26 @@ pub struct Config {
     /// The fee this prover charges per job (spec §5), or none. When set, only a v3 job whose
     /// witness pays it — one RAND output to `address.pk` of at least `amount` — is admitted.
     pub fee: Option<Fee>,
+    /// The longest one proof may take (audit v7, VK-12). Past it the job ends `failed` with
+    /// [`PROVE_TIMED_OUT`], its slot is released, and [`Config::on_wedged`] runs: a proof that
+    /// outlives a bundle's validity window is useless to its wallet, and one that never returns
+    /// (the Plonky3 hiding-RNG spin lock, Plonky3 #2363, before the vendored fix) would otherwise
+    /// hold the slot until someone restarted the process. `None`: no limit.
+    pub prove_timeout: Option<Duration>,
+    /// Called once each time a proof outlives [`Config::prove_timeout`]. The blocking thread that
+    /// runs it cannot be stopped from outside and may keep spinning, so `rand-prover run` exits
+    /// here and lets systemd restart it; a node hosting the prover (`rand-node run --prover`)
+    /// only logs, since exiting would stop the validator. The default logs.
+    pub on_wedged: Arc<dyn Fn(Duration) + Send + Sync>,
 }
+
+/// The error a job ends with when its proof outlived [`Config::prove_timeout`].
+pub const PROVE_TIMED_OUT: &str = "the proof did not finish in time";
+
+/// [`Config::prove_timeout`]'s default: ten minutes, twice a bundle's validity window
+/// (`ledger::TIME_WINDOW`, 256 blocks of about 1.2 s) and about eight times a bundle proof on an
+/// 8-vCPU `parallel` build.
+pub const DEFAULT_PROVE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A prover's fee: a flat amount in RAND base units, paid to its shielded address by one output
 /// inside the bundle it proves.
@@ -97,6 +116,10 @@ impl Config {
             prove: Arc::new(prove_bundle_for),
             allowed_origins: AllowedOrigins::default(),
             fee: None,
+            prove_timeout: Some(DEFAULT_PROVE_TIMEOUT),
+            on_wedged: Arc::new(|after| {
+                tracing::error!(secs = after.as_secs(), "a proof outlived the proving timeout; its slot is released, its thread may still be running");
+            }),
         }
     }
 }
@@ -462,16 +485,27 @@ impl Service {
             let profile = ZkExecutor::profile_from_str(&job.profile);
             let (prove, backend) = (self.cfg.prove.clone(), self.cfg.backend);
             let started = Instant::now();
-            let out = tokio::task::spawn_blocking(move || {
+            let proving = tokio::task::spawn_blocking(move || {
                 let out = match profile {
                     Some(p) => (prove)(&hc, p, &job.inputs, &binding, backend),
                     None => Err("unknown fri profile".into()),
                 };
                 drop(job);
                 out
-            })
-            .await
-            .unwrap_or_else(|_| Err("the prover panicked".into()));
+            });
+            let out = match self.cfg.prove_timeout {
+                Some(limit) => match tokio::time::timeout(limit, proving).await {
+                    Ok(joined) => joined.unwrap_or_else(|_| Err("the prover panicked".into())),
+                    Err(_) => {
+                        // The blocking thread keeps the witness until it returns, if it ever
+                        // does; the job is answered now and the slot freed.
+                        tracing::error!(job = %id, label = %label, secs = limit.as_secs(), "proving timed out");
+                        (self.cfg.on_wedged)(limit);
+                        Err(PROVE_TIMED_OUT.into())
+                    }
+                },
+                None => proving.await.unwrap_or_else(|_| Err("the prover panicked".into())),
+            };
             let secs = started.elapsed().as_secs_f64();
             let sealed = out.as_ref().ok().map(|(proof, digest, tier)| seal_reply(&reply_key, &ProveReply { proof: proof.clone(), digest: *digest, tier: *tier }));
             reply_key.zeroize();

@@ -424,3 +424,39 @@ async fn a_fee_output_of_two_to_the_63_is_refused_before_proving() {
     pay(&mut j, 2, PROVER_PK, (1 << 63) - 1);
     submit(&r, &j).expect("just below 2^63 pays the quote");
 }
+
+/// VK-12 (audit v7): a proof that does not return in time ends `failed`, its slot is released for
+/// the next job, and the wedged hook runs once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proof_past_the_timeout_fails_frees_its_slot_and_calls_the_hook() {
+    let key = ProverKey::from_seed([2; 64]);
+    let ek = key.kem_ek().to_vec();
+    let mut pairings = Pairings::default();
+    let token = pairings.pair("phone", false).unwrap();
+    let mut cfg = Config::new(key, pairings);
+    cfg.max_queue = 1;
+    cfg.max_parallel = 1;
+    cfg.per_token = 2;
+    cfg.prove_timeout = Some(Duration::from_millis(300));
+    let wedged = Arc::new(Mutex::new(0u32));
+    let w = wedged.clone();
+    cfg.on_wedged = Arc::new(move |_| *w.lock().unwrap() += 1);
+    // The first proof never returns in time; the second returns at once.
+    let calls = Arc::new(Mutex::new(0u32));
+    let c = calls.clone();
+    cfg.prove = Arc::new(move |_hc, _p, inputs, _b, _be| {
+        let n = { let mut g = c.lock().unwrap(); *g += 1; *g };
+        if n == 1 { std::thread::sleep(Duration::from_secs(5)); }
+        Ok((vec![0xAA; 10], [inputs[0]; 8], 14))
+    });
+    let svc = Service::start(cfg);
+    let first = svc.submit(&seal_job(&ek, &job(token)).unwrap()).unwrap();
+    let s = wait_terminal(&svc, &first).await;
+    assert_eq!(s.state, State::Failed);
+    assert_eq!(s.error.as_deref(), Some(PROVE_TIMED_OUT));
+    assert_eq!(*wedged.lock().unwrap(), 1, "the wedged hook ran once");
+    // The slot is free again: the next job proves while the first thread still sleeps.
+    let second = svc.submit(&seal_job(&ek, &job(token)).unwrap()).unwrap();
+    assert_eq!(wait_terminal(&svc, &second).await.state, State::Done);
+    assert_eq!(svc.info().queue.proving, 0);
+}

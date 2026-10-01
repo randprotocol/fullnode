@@ -68,6 +68,12 @@ enum Cmd {
         cuda: bool,
         #[arg(long)]
         skip_memory_check: bool,
+        /// The longest one proof may take, in seconds (audit v7, VK-12); 0 = no limit. A proof
+        /// past it fails its job and this process exits with status 75 so its supervisor
+        /// (systemd's `Restart=`) starts a clean one: a proving thread cannot be stopped from
+        /// outside, and one that never returns would otherwise hold its slot for ever.
+        #[arg(long, default_value_t = 600)]
+        prove_timeout_secs: u64,
         /// A web origin whose pages may read this prover's replies (repeatable). Given at least
         /// once, the values are the whole list; absent, the default is browser extensions and
         /// loopback pages (`chrome-extension://*`, `moz-extension://*`, `safari-web-extension://*`,
@@ -206,7 +212,7 @@ async fn main() -> Result<()> {
                 println!("{}  {}  {}", p.label, if p.own { "own" } else { "-" }, date_of(p.created_unix));
             }
         }
-        Cmd::Run { listen, accept_spend_key, max_parallel, max_queue, per_token, cuda, skip_memory_check, allow_origin, fee, fee_address } => {
+        Cmd::Run { listen, accept_spend_key, max_parallel, max_queue, per_token, cuda, skip_memory_check, prove_timeout_secs, allow_origin, fee, fee_address } => {
             // First, before the key or anything else is looked at: the flag's absence of effect
             // must never be silent (VK-4).
             if accept_spend_key {
@@ -241,6 +247,11 @@ async fn main() -> Result<()> {
             cfg.max_queue = max_queue;
             cfg.per_token = per_token;
             cfg.allowed_origins = allowed;
+            cfg.prove_timeout = (prove_timeout_secs > 0).then(|| std::time::Duration::from_secs(prove_timeout_secs));
+            cfg.on_wedged = std::sync::Arc::new(|after| {
+                eprintln!("a proof outlived --prove-timeout-secs ({}s): exiting so the supervisor restarts a clean prover", after.as_secs());
+                std::process::exit(75);
+            });
             if let Some(f) = &fee {
                 eprintln!("charging {} RAND per job to {}", randprotocol_core::format_amount(f.amount), f.address.fingerprint());
             }
