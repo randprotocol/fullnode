@@ -157,6 +157,15 @@ pub struct SafetyState {
     /// field existed is read with an empty record (`Storage::load_safety`).
     #[serde(default)]
     pub voted: Vec<(u64, Hash)>,
+    /// The highest view this replica has signed a proposal for (audit v6, STAKE-1), on disk
+    /// *before* the proposal leaves the node (`HotStuff::propose` emits the `PersistSafety` ahead
+    /// of the `Broadcast`). `propose` refuses any view at or under it, so a leader that
+    /// restarted mid-view — `resume` restores the view it was in, and its `proposed_in_view` was
+    /// only memory — never signs a second, different header for a view it already proposed in:
+    /// that is exactly the evidence `SlashEquivocation` punishes, and an honest validator must
+    /// not be able to produce it by crashing. Appended last, read as 0 from an older row.
+    #[serde(default)]
+    pub last_proposed_view: u64,
 }
 
 impl SafetyState {
@@ -320,6 +329,14 @@ pub enum Action {
     /// arm is reached only when the replica's own committed head is not where its tree says it is.
     /// It is the last check on an invariant, not a detector for a forked chain.
     SafetyViolation { committed: Hash, attempted: Hash },
+    /// A leader signed two different headers for one view (audit v6, STAKE-1): the block this
+    /// replica already holds for `(view, proposer)` and the second one it just refused
+    /// (`ConsensusError::Equivocation`), each with the signature the block carried. Emitted only
+    /// on a chain whose genesis has `staking.slashing`, and only while the first block is still
+    /// in the tree; the node turns the pair into a `SlashEquivocation` transaction and pools it.
+    /// Handed back through [`HotStuff::take_equivocations`], since the refusal itself is an
+    /// error and carries no actions.
+    Equivocation { first: Box<crate::types::actions::SignedHeader>, second: Box<crate::types::actions::SignedHeader> },
 }
 
 #[derive(Clone, Debug)]

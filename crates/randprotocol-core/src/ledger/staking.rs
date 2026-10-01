@@ -25,6 +25,7 @@ use crate::gas;
 use crate::notes::{ShieldedAddress, Word8, KEM_EK_BYTES};
 use crate::types::actions::{
     admit_validator_message, registration_message, registration_message_v2, unbond_message, withdraw_message, Registration,
+    SignedHeader,
 };
 use crate::types::{Action, Transaction, ValidatorSet, UNITS_PER_RAND};
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,26 @@ pub const MAX_VALIDATORS: usize = 100;
 /// is refused `AdmissionSetFull` until a registration consumes a row. 256 is two and a half
 /// full validator sets' worth of candidates waiting at once.
 pub const MAX_ADMITTED: usize = 256;
+/// How far back equivocation evidence is admitted (audit v6, STAKE-1), in epochs: a
+/// `SlashEquivocation` is valid only while `epoch(header height) + EVIDENCE_EPOCHS >= epoch()`
+/// for both headers — the epoch the headers claim, or the one after it. The one inequality the
+/// rule rests on: **`EVIDENCE_EPOCHS < UNBONDING_EPOCHS`**. A leader of epoch `E` held at least
+/// `MIN_STAKE` at the end of `E − 1` (the set of `E` is derived from that register), so the
+/// earliest `Unbond` of that stake is in epoch `E` and its release epoch at least `E +
+/// UNBONDING_EPOCHS`; evidence for a header of epoch `E` is admissible through `E +
+/// EVIDENCE_EPOCHS`, strictly before that, so the stake is still bonded or still unbonding
+/// (`pending`) — slashable either way — whenever the evidence can land.
+/// `evidence_cannot_outlive_the_stake` pins the inequality.
+pub const EVIDENCE_EPOCHS: u64 = 1;
+const _: () = assert!(EVIDENCE_EPOCHS < UNBONDING_EPOCHS, "evidence must land before the offender's stake can leave");
+/// The most a `SlashEquivocation` transaction may encode to (audit v6, STAKE-1): 1 MiB. Each
+/// header carries its `justify` certificate, up to `MAX_VALIDATORS` Dilithium2 votes of ~3.8 KB
+/// (~380 KB a header); two of them and the rest fit with room. A header whose justify is bigger
+/// than that verifies as no block — a certificate holds at most one vote per validator of its
+/// set — so the pair a harmful equivocation consists of (two blocks some replica could accept)
+/// always fits; only a junk second header nobody could vote for can be too big to carry, and it
+/// harmed nobody.
+pub const MAX_EVIDENCE_BYTES: usize = 1 << 20;
 
 /// One row of the register (spec §8). `stake`, `pending` and `rewards` are token units like
 /// every other amount on this chain; they are the only amounts stored in the clear.
@@ -132,6 +153,12 @@ pub struct ValidatorEntry {
 ///   one for two thousand, so the time an entrant needs to reach a third of the weight scales with
 ///   the genesis stake; as a fraction that time is the same at every scale. `1..=10 000`; refused
 ///   beside `max_stake_entry_per_epoch` (one budget, not two).
+/// - `slashing` (audit v6, STAKE-1): leader equivocation is punished — `equivocation_bps` of the
+///   offender's bonded and unbonding stake is destroyed and the key is jailed for `jail_epochs`
+///   epochs (`0` = for good) from the next boundary. Absent, an equivocation is refused and
+///   logged as before and nothing is at stake. Needs `consensus_domain: 1` (the evidence is two
+///   signatures under the chain's own domain) and is refused beside a `vesting` section (stake
+///   bonded from a lock is not slashable yet — see [`SlashingConfig`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StakingConfig {
@@ -152,6 +179,50 @@ pub struct StakingConfig {
     pub admission_by_vote: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_stake_entry_bps_per_epoch: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slashing: Option<SlashingConfig>,
+}
+
+/// The `staking.slashing` section (audit v6, STAKE-1): what a leader equivocation costs.
+///
+/// - `equivocation_bps` (`1..=10 000`): the fraction of the offender's stake — bonded, and every
+///   unbonding row not yet withdrawn — destroyed at the slash, floor-rounded per amount, counted
+///   in the supply's `slashed` (`total_supply == issued − slashed` holds through it).
+/// - `jail_epochs`: how many whole epochs the key is out of the active set, from the boundary
+///   after the slash; `0` is for good, and otherwise more than [`EVIDENCE_EPOCHS`] (genesis
+///   refuses `1..=EVIDENCE_EPOCHS`: a shorter jail could end while the same evidence is still in
+///   its window, and the one offence would be slashed twice). A jailed key is refused a `Bond` top-up
+///   (`StakingError::Jailed`) and cannot re-register (a registered key never leaves the
+///   register). While jailed a second piece of evidence is refused (`Jailed`), and every piece
+///   that existed at the slash is outside [`EVIDENCE_EPOCHS`] by the time any jail ends — a jail
+///   is at least one boundary plus one epoch — so one offence is slashed once and a key that
+///   equivocated ten times in an epoch loses `equivocation_bps` once, and its seat.
+///
+/// What is **not** evidence: vote equivocation (two votes by one key for one view — refused and
+/// logged by `HotStuff::on_vote`, never slashed), a proposal for a wrong view or by a non-leader,
+/// and anything that is not two signatures by one key over two different headers of one view.
+///
+/// Refused beside a `vesting` section at genesis: stake a lock bonded (`BondVested`) sits in the
+/// validator's `stake` and returns to the lock's own unbonding rows — which carry no validator —
+/// so it could leave a slashed validator untouched. Slashing locked stake needs the vesting
+/// register to attribute its unbonding rows; until it does, a chain has one section or the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlashingConfig {
+    pub equivocation_bps: u32,
+    pub jail_epochs: u64,
+}
+
+impl SlashingConfig {
+    /// The first epoch a key slashed in `epoch` may be in a set again: the boundary after the
+    /// slash opens `epoch + 1`, and the jail holds through `jail_epochs` whole epochs from there
+    /// — `u64::MAX` for good, which no epoch reaches.
+    pub fn jailed_until(&self, epoch: u64) -> u64 {
+        match self.jail_epochs {
+            0 => u64::MAX,
+            n => epoch.saturating_add(1).saturating_add(n),
+        }
+    }
 }
 
 impl StakingConfig {
@@ -355,6 +426,30 @@ pub enum StakingError {
     /// About the bytes against the genesis hash.
     #[error("the vote by {0} is not a signature over this chain's admission of this candidate")]
     BadAdmissionVote(Address),
+    /// Audit v6, STAKE-1: a `Bond` top-up of a jailed key, or evidence against a key already
+    /// jailed (one slash per jail). `until` is the first epoch it may be in a set again
+    /// (`u64::MAX`: for good). State: the jail ends.
+    #[error("validator {validator} is jailed until epoch {until}")]
+    Jailed { validator: Address, until: u64 },
+    /// A `SlashEquivocation` whose two headers are not an equivocation: the same header twice,
+    /// two views, two keys, or the pair out of canonical order. About the bytes alone.
+    #[error("the two headers are not an equivocation: {0}")]
+    NotEquivocation(&'static str),
+    /// A `SlashEquivocation` over [`MAX_EVIDENCE_BYTES`]. About the bytes alone.
+    #[error("the evidence encodes to {size} bytes, over the {max} byte cap")]
+    EvidenceTooLarge { size: usize, max: usize },
+    /// A header from the future (past the ledger's height) or older than [`EVIDENCE_EPOCHS`]
+    /// epochs. State: the window moves.
+    #[error("evidence at height {height} (epoch {epoch}) is outside the window at epoch {current}: a header must be at most one block above the head and at most {} epoch(s) old", EVIDENCE_EPOCHS)]
+    EvidenceOutOfWindow { height: u64, epoch: u64, current: u64 },
+    /// The offender has neither bonded nor unbonding stake: nothing to slash. State.
+    #[error("validator {0} has nothing at stake")]
+    NothingAtStake(Address),
+    /// One of the two signatures does not verify under the header's own proposer key over this
+    /// chain's consensus signing domain (`SigningDomain::block_message`). About the bytes against
+    /// the genesis: a header signed for another chain never verifies here.
+    #[error("the {0} header's signature does not verify under its proposer key on this chain")]
+    BadEvidenceSignature(&'static str),
 }
 
 /// The validator set for an epoch, from the register as of the last block of the epoch before
@@ -393,6 +488,19 @@ pub fn derive_set_with(
     epoch: u64,
     max_weight_bps: Option<u32>,
 ) -> ValidatorSet {
+    derive_set_jailed(register, queue, epoch, max_weight_bps, &BTreeMap::new())
+}
+
+/// [`derive_set_with`] under `staking.slashing` (audit v6, STAKE-1): an entry jailed for `epoch`
+/// — `jailed[addr] > epoch` — is in no set, whatever its stake. `Ledger::derive_next_set` passes
+/// the ledger's jail; without the section the map is empty and this is [`derive_set_with`].
+pub fn derive_set_jailed(
+    register: &BTreeMap<Address, ValidatorEntry>,
+    queue: &[QueuedStake],
+    epoch: u64,
+    max_weight_bps: Option<u32>,
+    jailed: &BTreeMap<Address, u64>,
+) -> ValidatorSet {
     let mut waiting: BTreeMap<&Address, u64> = BTreeMap::new();
     for q in queue.iter().filter(|q| q.epoch > epoch) {
         let w = waiting.entry(&q.validator).or_default();
@@ -401,7 +509,7 @@ pub fn derive_set_with(
     let mut eligible: Vec<(&Address, &ValidatorEntry, u64)> = register
         .iter()
         .map(|(a, e)| (a, e, e.stake.saturating_sub(waiting.get(a).copied().unwrap_or(0))))
-        .filter(|(_, e, weight)| *weight >= MIN_STAKE && e.activation_epoch <= epoch)
+        .filter(|(a, e, weight)| *weight >= MIN_STAKE && e.activation_epoch <= epoch && !jailed.get(*a).is_some_and(|until| *until > epoch))
         .collect();
     // Descending weight, then ascending address: the cut must not depend on map order.
     eligible.sort_by(|(a_addr, _, a), (b_addr, _, b)| b.cmp(a).then_with(|| a_addr.cmp(b_addr)));
@@ -663,7 +771,7 @@ impl Ledger {
         let fraction = cfg.max_stake_entry_bps_per_epoch.map(|bps| {
             let waiting: Vec<QueuedStake> =
                 self.bond_queue.iter().map(|q| QueuedStake { validator: q.validator, amount: q.amount, epoch: u64::MAX }).collect();
-            let active = derive_set_with(&self.validators, &waiting, next_epoch, None).total_stake();
+            let active = derive_set_jailed(&self.validators, &waiting, next_epoch, None, &self.jailed).total_stake();
             u64::try_from(active.saturating_mul(u128::from(bps)) / u128::from(MAX_WEIGHT_BPS)).unwrap_or(u64::MAX)
         });
         let mut budget = fraction.or(cfg.max_stake_entry_per_epoch).unwrap_or(u64::MAX);
@@ -773,6 +881,11 @@ pub(crate) fn check_bond(
         (Some(_), Some(_)) => return Err(StakingError::AlreadyRegistered(*validator)),
         (None, None) => return Err(StakingError::RegistrationRequired),
         (Some(e), None) => {
+            // Audit v6, STAKE-1: a jailed key takes no top-up — nothing is bought back into a
+            // seat a slash took. A lookup, before the arithmetic. Empty without the section.
+            if let Some(until) = ledger.jailed_until(validator) {
+                return Err(StakingError::Jailed { validator: *validator, until });
+            }
             e.stake.checked_add(amount).ok_or(StakingError::Overflow)?;
         }
         (None, Some(r)) => {
@@ -947,6 +1060,88 @@ fn check_admit(
     Ok(())
 }
 
+/// What a `SlashEquivocation` gets on a chain whose genesis has no `staking.slashing`: the gate,
+/// before a byte of it is read — every chain through 18 refuses it by name, as an old node
+/// refuses the unknown wire variant.
+const NO_SLASHING: TxError = TxError::UnsupportedAction("slashing is not enabled on this chain (genesis staking.slashing)");
+
+/// The state half of a slash, with no signature work (audit v6, STAKE-1): the gate, both headers
+/// inside the evidence window, the offender registered, not jailed, with something at stake.
+/// What the mempool asks at every tip (`Mempool::applies`) and what [`check_slash`] asks before
+/// it verifies a signature.
+pub fn check_slash_open(ledger: &Ledger, offender: &Address, heights: [u64; 2]) -> Result<(), TxError> {
+    if ledger.staking().and_then(|s| s.slashing).is_none() {
+        return Err(NO_SLASHING);
+    }
+    // The window: a header at most one above the ledger's height — the block being applied when
+    // the slash is applied, and the block after the tip when a node pools the evidence against
+    // its tip ledger (the equivocating proposals extend the tip, so they are one above it) — and
+    // at most `EVIDENCE_EPOCHS` epochs old, which is what keeps the slash ahead of the offender's
+    // `UNBONDING_EPOCHS` (see the constant). The upper bound is what keeps one offence from
+    // being replayed after its jail: a header admitted at most one block past the slash is out
+    // of the window by the time any jail of more than `EVIDENCE_EPOCHS` epochs ends
+    // (`Genesis::validate` refuses a shorter one).
+    let (current, blocks) = (ledger.epoch(), ledger.epoch_blocks().max(1));
+    for height in heights {
+        let epoch = height / blocks;
+        if height > ledger.height().saturating_add(1) || epoch.saturating_add(EVIDENCE_EPOCHS) < current {
+            return Err(StakingError::EvidenceOutOfWindow { height, epoch, current }.into());
+        }
+    }
+    let e = ledger.validators().get(offender).ok_or(StakingError::UnknownValidator(*offender))?;
+    if let Some(until) = ledger.jailed_until(offender) {
+        return Err(StakingError::Jailed { validator: *offender, until }.into());
+    }
+    if slashable(e) == 0 {
+        return Err(StakingError::NothingAtStake(*offender).into());
+    }
+    Ok(())
+}
+
+/// What a slash can reach: the bonded stake and every unbonding row not yet withdrawn. Rewards
+/// are fees earned, not stake, and are left alone.
+fn slashable(e: &ValidatorEntry) -> u64 {
+    e.pending.iter().fold(e.stake, |acc, (_, amount)| acc.saturating_add(*amount))
+}
+
+/// `SlashEquivocation`'s rules (audit v6, STAKE-1), cheap before expensive: the gate; the pair's
+/// shape — one key, one view, two different headers, the lower hash first — which is what makes
+/// two headers an equivocation at all; the window and the offender's state
+/// ([`check_slash_open`]); and last, one Dilithium2 verification per header under this chain's
+/// consensus signing domain, the very check every replica made when it took the block. An
+/// honest leader's key never signs two headers for one view (`HotStuff::propose` persists the
+/// view before the proposal leaves and refuses a second), so the only thing between an honest
+/// validator and a slash is that nobody can produce its second signature: a tampered header
+/// fails here (`a_tampered_second_header_is_not_evidence`).
+fn check_slash(ledger: &Ledger, first: &SignedHeader, second: &SignedHeader) -> Result<(), TxError> {
+    if ledger.staking().and_then(|s| s.slashing).is_none() {
+        return Err(NO_SLASHING);
+    }
+    if first.header.proposer != second.header.proposer {
+        return Err(StakingError::NotEquivocation("the headers are signed by two different keys").into());
+    }
+    if first.header.view != second.header.view {
+        return Err(StakingError::NotEquivocation("the headers are for two different views").into());
+    }
+    let (a, b) = (first.hash(), second.hash());
+    if a == b {
+        return Err(StakingError::NotEquivocation("the same header twice").into());
+    }
+    if a > b {
+        return Err(StakingError::NotEquivocation("the pair is not in canonical order (the lower hash first)").into());
+    }
+    let offender = first.header.proposer.address();
+    check_slash_open(ledger, &offender, [first.header.height, second.header.height])?;
+    let domain = ledger.signing_domain();
+    if !first.verify(domain) {
+        return Err(StakingError::BadEvidenceSignature("first").into());
+    }
+    if !second.verify(domain) {
+        return Err(StakingError::BadEvidenceSignature("second").into());
+    }
+    Ok(())
+}
+
 /// What an action reaching this module that it does not own gets. Only a routing mistake in
 /// [`super::Ledger::validate_inner`] can produce one, and refusing it is the safe answer: `Ok`
 /// would let a mis-routed action skip the rules of the module that does own it.
@@ -978,6 +1173,7 @@ pub(super) fn validate(
             }
         }
         Action::AdmitValidator { candidate, signatures } => check_admit(ledger, candidate, signatures)?,
+        Action::SlashEquivocation { first, second } => check_slash(ledger, first, second)?,
         _ => return Err(NOT_STAKING),
     }
     Ok(())
@@ -1034,9 +1230,39 @@ pub(super) fn apply(
             check_admit(ledger, candidate, signatures)?;
             ledger.admitted.insert(candidate.address());
         }
+        Action::SlashEquivocation { first, second } => {
+            check_slash(ledger, first, second)?;
+            ledger.slash(&first.header.proposer.address())?;
+        }
         _ => return Err(NOT_STAKING),
     }
     Ok(())
+}
+
+impl Ledger {
+    /// Audit v6, STAKE-1: destroy `equivocation_bps` of `offender`'s bonded stake and of each
+    /// unbonding row (floor-rounded per amount, so the sum never exceeds the fraction of the
+    /// whole), count it in the supply's `slashed`, and jail the key from the next boundary.
+    /// `check_slash` has verified the evidence against this very state; this is the write.
+    pub(crate) fn slash(&mut self, offender: &Address) -> Result<(), TxError> {
+        let cfg = self.staking().and_then(|s| s.slashing).ok_or(NO_SLASHING)?;
+        let bps = u128::from(cfg.equivocation_bps);
+        let cut = |amount: u64| u64::try_from(u128::from(amount) * bps / u128::from(MAX_WEIGHT_BPS)).unwrap_or(amount);
+        let until = cfg.jailed_until(self.epoch());
+        let e = self.validators.get_mut(offender).ok_or(StakingError::UnknownValidator(*offender))?;
+        let mut destroyed = cut(e.stake);
+        e.stake -= destroyed;
+        for (_, amount) in e.pending.iter_mut() {
+            let c = cut(*amount);
+            *amount -= c;
+            destroyed = destroyed.checked_add(c).ok_or(TxError::Overflow)?;
+        }
+        // Rows cut to nothing are dropped: a zero row would be hashed into the leaf for nothing.
+        e.pending.retain(|(_, amount)| *amount > 0);
+        self.supply.slashed = self.supply.slashed.checked_add(destroyed).ok_or(TxError::Overflow)?;
+        self.jailed.insert(*offender, until);
+        Ok(())
+    }
 }
 
 /// The deposit note a withdraw creates: the register's payout address, no sender, the amount less
@@ -2088,6 +2314,198 @@ mod tests {
             staking_err(plain.validate(&bond_tx(&plain, 10, &x, MIN_STAKE, Some(v2(&genesis, &x.address()))), &StubExecutor).unwrap_err()),
             StakingError::BadSignature
         );
+    }
+
+    // ---- audit v6, STAKE-1: slashing leader equivocation -----------------------------------------
+
+    fn slashing_cfg(jail_epochs: u64) -> StakingConfig {
+        StakingConfig { slashing: Some(SlashingConfig { equivocation_bps: 1_000, jail_epochs }), ..Default::default() }
+    }
+
+    /// Four validators of `4·MIN_STAKE` at height 15 of ten-block epochs (epoch 1), signing under
+    /// `this_chain()` v1, with the supply seeded so the audit balances, under `cfg`.
+    fn slashing_ledger(cfg: StakingConfig) -> (Vec<Keypair>, Ledger) {
+        let vals: Vec<Keypair> = (1..=4u8).map(key).collect();
+        let mut l = sectioned(vals.iter().enumerate().map(|(i, k)| entry(k, 4 * MIN_STAKE, payout(i as u8 + 1))).collect(), cfg);
+        l.set_signing_domain(crate::types::SigningDomain::v1(this_chain()));
+        l.set_genesis_supply(0, 16 * MIN_STAKE);
+        l.set_height(15);
+        (vals, l)
+    }
+
+    /// A header `k` signs for `view` at `height`, its contents varied by `salt`, under `domain`.
+    fn signed_header_under(domain: &crate::types::SigningDomain, k: &Keypair, view: u64, height: u64, salt: u8) -> SignedHeader {
+        let header = crate::types::BlockHeader {
+            height,
+            view,
+            parent: crate::crypto::Hash([salt; 32]),
+            proposer: k.public_key().clone(),
+            timestamp_ms: u64::from(salt),
+            tx_root: crate::crypto::Hash::ZERO,
+            state_root: crate::crypto::Hash::ZERO,
+            justify: crate::types::QuorumCertificate::genesis(crate::crypto::Hash::ZERO),
+        };
+        let signature = k.sign(domain.block_message(&header).as_bytes());
+        SignedHeader { header, signature }
+    }
+
+    fn signed_header(k: &Keypair, view: u64, height: u64, salt: u8) -> SignedHeader {
+        signed_header_under(&crate::types::SigningDomain::v1(this_chain()), k, view, height, salt)
+    }
+
+    fn slash_tx(a: SignedHeader, b: SignedHeader) -> Transaction {
+        let (first, second) = SignedHeader::ordered(a, b);
+        signed_tx(Action::SlashEquivocation { first, second })
+    }
+
+    /// Audit v6, STAKE-1: a leader that signs two different headers for one view loses
+    /// `equivocation_bps` of its bonded *and* unbonding stake — destroyed, counted in `slashed`, the
+    /// supply identity intact — and is jailed: in no set from the next boundary, no top-up taken,
+    /// and a second piece of evidence refused, so one offence is slashed once.
+    #[test]
+    fn a_two_header_equivocation_slashes_and_jails_the_leader() {
+        let (vals, mut l) = slashing_ledger(slashing_cfg(3));
+        let offender = &vals[1];
+        // Some of the stake is already unbonding: the slash reaches it too.
+        l.apply_tx(&unbond_tx(offender, MIN_STAKE, 0), &vals[0].address(), &StubExecutor).unwrap();
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+        let evidence = slash_tx(signed_header(offender, 12, 12, 1), signed_header(offender, 12, 12, 2));
+        assert_eq!(l.validate(&evidence, &StubExecutor), Ok(()));
+        let root_before = l.state_root();
+        l.apply_tx(&evidence, &vals[0].address(), &StubExecutor).unwrap();
+        let e = &l.validators()[&offender.address()];
+        assert_eq!(e.stake, 3 * MIN_STAKE - 3 * MIN_STAKE / 10, "10% of the bonded 3·MIN");
+        assert_eq!(e.pending, vec![(1 + UNBONDING_EPOCHS, MIN_STAKE - MIN_STAKE / 10)], "10% of the unbonding MIN");
+        assert_eq!(l.supply().slashed, 4 * MIN_STAKE / 10, "destroyed, and counted");
+        let a = l.audit();
+        assert!(a.invariant_holds(), "total_supply == issued − slashed: {a:?}");
+        assert_eq!(a.total_supply(), 16 * MIN_STAKE - 4 * MIN_STAKE / 10);
+        assert_eq!(l.jailed_until(&offender.address()), Some(1 + 1 + 3), "from the next boundary, three whole epochs");
+        assert_ne!(l.state_root(), root_before);
+        // Out of the next epoch's set, whatever its stake.
+        assert!(!l.derive_next_set(2).contains(&offender.address()));
+        assert!(!l.derive_next_set(4).contains(&offender.address()));
+        assert!(l.derive_next_set(2).contains(&vals[0].address()));
+        // A top-up is refused while jailed.
+        l.record_anchor(l.height());
+        let top_up = bond_tx(&l, 50, offender, MIN_STAKE, None);
+        assert_eq!(
+            staking_err(l.validate(&top_up, &StubExecutor).unwrap_err()),
+            StakingError::Jailed { validator: offender.address(), until: 5 }
+        );
+        // The same evidence again, or another offence in another view, does not slash twice.
+        assert_eq!(staking_err(l.validate(&evidence, &StubExecutor).unwrap_err()), StakingError::Jailed { validator: offender.address(), until: 5 });
+        let other = slash_tx(signed_header(offender, 13, 13, 3), signed_header(offender, 13, 13, 4));
+        assert!(matches!(staking_err(l.validate(&other, &StubExecutor).unwrap_err()), StakingError::Jailed { .. }));
+        // The jail ends at its epoch: the boundary into epoch 5 drops the row and seats the key.
+        for h in [19u64, 29, 39, 49] {
+            close_epoch(&mut l, h, &vals[0].address());
+        }
+        assert_eq!(l.jailed_until(&offender.address()), None);
+        assert!(l.jailed().is_empty(), "the boundary dropped the expired row");
+        assert!(l.derive_next_set(5).contains(&offender.address()));
+        // And the old evidence cannot be replayed now that the jail is over: it is out of window.
+        l.set_height(50);
+        assert!(matches!(staking_err(l.validate(&evidence, &StubExecutor).unwrap_err()), StakingError::EvidenceOutOfWindow { .. }));
+    }
+
+    /// The pairs that are not evidence (audit v6, STAKE-1: "a slashing bug can itself remove honest
+    /// validators"): the same header twice, two views, two keys, the pair out of canonical order, a
+    /// pair signed under another chain's domain, and a tampered second header. In every case the
+    /// honest validator's stake is untouched; what stands in the way of slashing an honest leader
+    /// is that nobody can produce its second signature.
+    #[test]
+    fn only_two_signed_headers_of_one_key_for_one_view_are_evidence() {
+        let (vals, l) = slashing_ledger(slashing_cfg(3));
+        let v = &vals[1];
+        let refusal = |t: &Transaction| staking_err(l.validate(t, &StubExecutor).unwrap_err());
+        let h = signed_header(v, 12, 12, 1);
+        let same = signed_tx(Action::SlashEquivocation { first: Box::new(h.clone()), second: Box::new(h.clone()) });
+        assert_eq!(refusal(&same), StakingError::NotEquivocation("the same header twice"));
+        assert_eq!(refusal(&slash_tx(signed_header(v, 12, 12, 1), signed_header(v, 13, 13, 2))), StakingError::NotEquivocation("the headers are for two different views"));
+        assert_eq!(refusal(&slash_tx(signed_header(v, 12, 12, 1), signed_header(&vals[2], 12, 12, 2))), StakingError::NotEquivocation("the headers are signed by two different keys"));
+        let (a, b) = SignedHeader::ordered(signed_header(v, 12, 12, 1), signed_header(v, 12, 12, 2));
+        let reversed = signed_tx(Action::SlashEquivocation { first: b, second: a });
+        assert!(matches!(refusal(&reversed), StakingError::NotEquivocation(_)), "one canonical encoding per offence");
+        // Another chain's domain (same keys, another genesis): neither signature verifies here.
+        let elsewhere = crate::types::SigningDomain::v1(crate::crypto::Hash::digest(b"another chain"));
+        let foreign = slash_tx(signed_header_under(&elsewhere, v, 12, 12, 1), signed_header_under(&elsewhere, v, 12, 12, 2));
+        assert!(matches!(refusal(&foreign), StakingError::BadEvidenceSignature(_)));
+        // An honest leader's one real header, and a second one made by changing it: the
+        // tampered header carries a signature over something else.
+        let honest = signed_header(v, 12, 12, 1);
+        let mut forged = honest.clone();
+        forged.header.timestamp_ms += 1;
+        let t = slash_tx(honest, forged);
+        assert!(matches!(refusal(&t), StakingError::BadEvidenceSignature(_)), "the verification is what stands in the way");
+        let mut scratch = l.clone();
+        assert!(scratch.apply_tx(&t, &vals[0].address(), &StubExecutor).is_err());
+        assert_eq!(scratch.validators()[&v.address()].stake, 4 * MIN_STAKE, "nothing slashed");
+        assert!(scratch.jailed().is_empty());
+        // A key that is not in the register has nothing to slash.
+        let stranger = key(9);
+        assert_eq!(
+            refusal(&slash_tx(signed_header(&stranger, 12, 12, 1), signed_header(&stranger, 12, 12, 2))),
+            StakingError::UnknownValidator(stranger.address())
+        );
+    }
+
+    /// The evidence window and the one inequality it rests on: **`EVIDENCE_EPOCHS <
+    /// UNBONDING_EPOCHS`**. A leader of epoch `E` that unbonds everything in `E` has it in `pending`
+    /// until `E + UNBONDING_EPOCHS`, so evidence for its header — admissible through `E +
+    /// EVIDENCE_EPOCHS` — always finds the stake, and it cannot withdraw first. Older evidence, or a
+    /// header above the head, is refused.
+    #[test]
+    fn evidence_cannot_outlive_the_stake() {
+        const { assert!(EVIDENCE_EPOCHS < UNBONDING_EPOCHS) };
+        let (vals, mut l) = slashing_ledger(slashing_cfg(3));
+        let v = &vals[1];
+        // Height 15, epoch 1: v led view 12 at height 12 and unbonds all it has, at once.
+        l.apply_tx(&unbond_tx(v, 4 * MIN_STAKE, 0), &vals[0].address(), &StubExecutor).unwrap();
+        let evidence = slash_tx(signed_header(v, 12, 12, 1), signed_header(v, 12, 12, 2));
+        // The last epoch the evidence is admissible in: E + EVIDENCE_EPOCHS = 2.
+        l.set_height(29);
+        assert_eq!(l.epoch(), 1 + EVIDENCE_EPOCHS);
+        assert_eq!(l.released(&v.address()), 0, "the stake has not come back yet");
+        assert!(
+            matches!(staking_err(l.validate(&withdraw_tx(v, 4 * MIN_STAKE, 1, 29, [3; 8]), &StubExecutor).unwrap_err()), StakingError::NothingReleased { .. }),
+            "and cannot be withdrawn before the evidence window closes"
+        );
+        assert_eq!(l.validate(&evidence, &StubExecutor), Ok(()), "the evidence lands while the stake is still unbonding");
+        let mut slashed = l.clone();
+        slashed.apply_tx(&evidence, &vals[0].address(), &StubExecutor).unwrap();
+        assert_eq!(slashed.supply().slashed, 4 * MIN_STAKE / 10, "it reached the unbonding stake");
+        // One epoch later the evidence is out of the window.
+        l.set_height(30);
+        assert!(matches!(staking_err(l.validate(&evidence, &StubExecutor).unwrap_err()), StakingError::EvidenceOutOfWindow { height: 12, epoch: 1, current: 3 }));
+        // A header more than one block above the head is refused (it could replay after a jail);
+        // one above is the proposal that extends the tip, which a node pools at once.
+        let (_, l2) = slashing_ledger(slashing_cfg(3));
+        let future = slash_tx(signed_header(v, 40, 17, 1), signed_header(v, 40, 17, 2));
+        assert!(matches!(staking_err(l2.validate(&future, &StubExecutor).unwrap_err()), StakingError::EvidenceOutOfWindow { height: 17, .. }));
+        let next = slash_tx(signed_header(v, 16, 16, 1), signed_header(v, 16, 16, 2));
+        assert_eq!(l2.validate(&next, &StubExecutor), Ok(()));
+    }
+
+    /// Without `staking.slashing` — every chain through 18 — the evidence is refused by name and
+    /// the ledger is untouched; `jail_epochs: 0` jails for good.
+    #[test]
+    fn without_the_section_nothing_is_slashed_and_a_zero_jail_is_for_good() {
+        let (vals, l) = slashing_ledger(StakingConfig::default());
+        let evidence = slash_tx(signed_header(&vals[1], 12, 12, 1), signed_header(&vals[1], 12, 12, 2));
+        assert!(matches!(l.validate(&evidence, &StubExecutor), Err(TxError::UnsupportedAction(_))));
+        let mut scratch = l.clone();
+        assert!(matches!(scratch.apply_tx(&evidence, &vals[0].address(), &StubExecutor), Err(TxError::UnsupportedAction(_))));
+        assert_eq!(scratch, l);
+        let (vals, mut forever) = slashing_ledger(slashing_cfg(0));
+        let evidence = slash_tx(signed_header(&vals[1], 12, 12, 1), signed_header(&vals[1], 12, 12, 2));
+        forever.apply_tx(&evidence, &vals[0].address(), &StubExecutor).unwrap();
+        assert_eq!(forever.jailed_until(&vals[1].address()), Some(u64::MAX));
+        assert!(!forever.derive_next_set(1_000_000).contains(&vals[1].address()));
+        // The jail is in the root only under the section.
+        let mut jailed = forever.clone();
+        jailed.set_jailed(Default::default());
+        assert_ne!(jailed.state_root(), forever.state_root());
     }
 
     // ---- audit v6, STAKE-2: the entry budget as a fraction ------------------------------------

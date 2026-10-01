@@ -410,8 +410,11 @@ Next:
 - **Block aggregation**, off on every chain today. It still needs the end-to-end
   forged-aggregate exercise (#45), and the production rVM proofs need more than 256 GB of memory
   under constraint sets 7–8, which the aggregator machine class has to account for.
-- **The timeout-certificate pacemaker** (B3); slashing and jailing; persistent per-program state
-  and cross-program calls; a nullifier accumulator; the hash-sortition leader beacon.
+- Slashing beyond leader equivocation (vote equivocation is logged, not slashed), and slashing
+  stake bonded from a vesting lock (audit v6 STAKE-1 built leader-equivocation slashing and
+  jailing behind the genesis `staking.slashing` section — on no chain yet; `docs/staking.md`);
+  persistent per-program state and cross-program calls; a nullifier accumulator; the
+  hash-sortition leader beacon.
 
 ## Open ops tasks
 

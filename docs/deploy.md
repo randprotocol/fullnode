@@ -1145,6 +1145,15 @@ when set; a file without them hashes and runs byte-for-byte as before.
   entrant to a third for two epochs of a 26 000-RAND set and for 1 301 of a 26 000 000-RAND one;
   `2500` holds it for two at either scale. Size it with the genesis stake (audit decision D24):
   a mainnet cut that changes the stake sizes must not carry chain 18's fixed figure.
+- **`staking.slashing: { equivocation_bps, jail_epochs }`** (audit v6, STAKE-1; `docs/staking.md`
+  §2, "Slashing leader equivocation"). A leader that signs two headers for one view loses
+  `equivocation_bps` of its bonded and unbonding stake and is jailed for `jail_epochs` (0 = for
+  good, otherwise ≥ 2). Needs `consensus_domain: 1`; refused beside `vesting`. Vote equivocation
+  is not slashed. **The build that carries it persists `last_proposed_view` before every
+  proposal** (a node-only change that rolls with this build): a leader that restarted mid-view
+  could otherwise sign a second header and slash itself, so every validator must run this build
+  before any chain with the section starts. Recommended once stake is held by more than one
+  operator (D8) — with one operator's keys it changes nothing but the risk of a bug.
 - **`testnet: true`** (top level; `rand-node genesis --testnet`). Required on any chain whose
   genesis keeps `faucet: true` beside a `bridge` section — free RAND beside real custody — on a
   chain id past 18 (`GenesisError::FaucetWithBridgeNeedsTestnet`; chains 14–18 are grandfathered

@@ -24,7 +24,7 @@ use crate::gas;
 use crate::notes::{word8_to_bytes, Bundle, CommitmentTree, Envelope, Word8, MAX_ENVELOPE_BYTES};
 use crate::program::{program_id_with_public, CallOutcome, CallReceipt, ProgramId, ProgramRecord};
 use crate::types::{Action, Block, Transaction, ValidatorSet, FAUCET_MAX_UNITS};
-pub use staking::{FaucetMinter, FaucetRecipient, StakingConfig};
+pub use staking::{FaucetMinter, FaucetRecipient, SlashingConfig, StakingConfig};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// How many block-end roots a bundle may anchor to (spec §7 item 4).
@@ -605,6 +605,13 @@ pub struct Ledger {
     /// ledger's equality, persisted beside `META_BOND_QUEUE` — and always empty without it, on
     /// every chain through 18. At most `staking::MAX_ADMITTED` rows.
     admitted: BTreeSet<Address>,
+    /// The jail (audit v6, STAKE-1; `staking.slashing`): per slashed key, the first epoch it may
+    /// be in a set again (`u64::MAX`: for good). `derive_next_set` leaves a jailed key out, a
+    /// `Bond` top-up of one is refused, and so is a second piece of evidence against it. Rows
+    /// whose epoch has come are dropped at the boundary (`close_block`). Consensus state under
+    /// the section — the `rand-state-slashing-1` wrapper, inside equality, `META_JAILED` — and
+    /// always empty without it, on every chain through 18.
+    jailed: BTreeMap<Address, u64>,
     /// Genesis vesting (`vesting.rs`): the register a genesis `vesting` section seeds, `None`
     /// without one. Consensus state, in the state root (`rand-state-6`), persisted whole.
     vesting: Option<vesting::VestingRegister>,
@@ -759,6 +766,9 @@ impl PartialEq for Ledger {
             // The admitted set (audit v6, STAKE-2): consensus state under
             // `staking.admission_by_vote`, empty on both sides without it.
             && self.admitted == o.admitted
+            // The jail (audit v6, STAKE-1): consensus state under `staking.slashing`, empty on
+            // both sides without it.
+            && self.jailed == o.jailed
             // The vesting register: consensus state under its section, `None` on both sides
             // without one.
             && self.vesting == o.vesting
@@ -803,6 +813,7 @@ impl Ledger {
             faucet_minted_in_epoch: 0,
             bond_queue: Vec::new(),
             admitted: BTreeSet::new(),
+            jailed: BTreeMap::new(),
             vesting: None,
             registration_fees_burned: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
@@ -863,6 +874,7 @@ impl Ledger {
             faucet_minted_in_epoch: 0,
             bond_queue: Vec::new(),
             admitted: BTreeSet::new(),
+            jailed: BTreeMap::new(),
             vesting: None,
             registration_fees_burned: 0,
             max_program_words: gas::MAX_PROGRAM_WORDS,
@@ -940,7 +952,9 @@ impl Ledger {
     /// the queue is empty and there is no cap, which is `staking::derive_set` exactly.
     pub fn derive_next_set(&self, epoch: u64) -> ValidatorSet {
         let cap = self.staking.as_ref().and_then(|s| s.max_weight_bps);
-        staking::derive_set_with(&self.validators, &self.bond_queue, epoch, cap)
+        // Under `staking.slashing` a jailed key is in no set (audit v6, STAKE-1); the map is
+        // empty without it.
+        staking::derive_set_jailed(&self.validators, &self.bond_queue, epoch, cap, &self.jailed)
     }
 
     /// The bond queue (`staking::QueuedStake`), oldest bond first: for the node's persistence
@@ -978,6 +992,37 @@ impl Ledger {
             buf.extend_from_slice(a.as_bytes());
         }
         Hash::digest_domain(b"rand-admitted-1", &buf)
+    }
+
+    /// The jail (audit v6, STAKE-1): every slashed key with the first epoch it may be in a set
+    /// again, expired rows included until the next boundary drops them. For the node's
+    /// persistence, the replay audit and `rand_getValidators`.
+    pub fn jailed(&self) -> &BTreeMap<Address, u64> {
+        &self.jailed
+    }
+
+    /// `validator`'s jail as of this ledger's epoch: the first epoch it may be in a set again,
+    /// `None` when it is not jailed or its jail has ended.
+    pub fn jailed_until(&self, validator: &Address) -> Option<u64> {
+        self.jailed.get(validator).copied().filter(|until| *until > self.epoch())
+    }
+
+    /// Restore the jail a node persisted beside the state — `set_admitted`'s twin: hashed into
+    /// the root under `staking.slashing`, so a restarted node that lost it would seat a jailed
+    /// key its peers keep out, and fork at the next boundary.
+    pub fn set_jailed(&mut self, jailed: BTreeMap<Address, u64>) {
+        self.jailed = jailed;
+    }
+
+    /// The jail as one hash: its length, then every `(address, until)` row in address order.
+    pub fn jailed_root(&self) -> Hash {
+        let mut buf = Vec::with_capacity(8 + 40 * self.jailed.len());
+        buf.extend_from_slice(&(self.jailed.len() as u64).to_be_bytes());
+        for (a, until) in &self.jailed {
+            buf.extend_from_slice(a.as_bytes());
+            buf.extend_from_slice(&until.to_be_bytes());
+        }
+        Hash::digest_domain(b"rand-jailed-1", &buf)
     }
 
     /// The `staking` section, or `None` on a chain without one — where the faucet has no
@@ -1946,6 +1991,11 @@ impl Ledger {
             Action::Aggregate { .. } if encoded_len > self.max_aggregate_bytes() => {
                 return Err(TxError::AggregateTooLarge { size: encoded_len, max: self.max_aggregate_bytes() })
             }
+            // Audit v6, STAKE-1: two headers with their certificates, and no more (a byte length,
+            // before either signature is looked at).
+            Action::SlashEquivocation { .. } if encoded_len > staking::MAX_EVIDENCE_BYTES => {
+                return Err(StakingError::EvidenceTooLarge { size: encoded_len, max: staking::MAX_EVIDENCE_BYTES }.into())
+            }
             _ => {}
         }
         // Every variable-length field that reaches a node before any signature or proof work is
@@ -2093,7 +2143,11 @@ impl Ledger {
             }
             // `AdmitValidator` (audit v6, STAKE-2) is the register's too: gated on
             // `staking.admission_by_vote`, which `staking::validate` checks before anything else.
-            a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. } | Action::AdmitValidator { .. }) => {
+            a @ (Action::Bond { .. }
+            | Action::Unbond { .. }
+            | Action::Withdraw { .. }
+            | Action::AdmitValidator { .. }
+            | Action::SlashEquivocation { .. }) => {
                 staking::validate(self, tx, a, executor)?;
             }
             a @ (Action::ClaimVested { .. }
@@ -2341,7 +2395,11 @@ impl Ledger {
                     gas_used: Ledger::call_gas_used(&o),
                 });
             }
-            a @ (Action::Bond { .. } | Action::Unbond { .. } | Action::Withdraw { .. } | Action::AdmitValidator { .. }) => {
+            a @ (Action::Bond { .. }
+            | Action::Unbond { .. }
+            | Action::Withdraw { .. }
+            | Action::AdmitValidator { .. }
+            | Action::SlashEquivocation { .. }) => {
                 // The proposer is passed in because a `Withdraw` pays it the bundle base out of
                 // the amount it withdraws — the one fee that does not come from a bundle.
                 staking::apply(self, tx, a, proposer, executor)?;
@@ -2657,7 +2715,11 @@ impl Ledger {
         // derivation read one state. A no-op without a `staking` section.
         let blocks = self.epoch_blocks.max(1);
         if self.staking.is_some() && height.saturating_add(1).is_multiple_of(blocks) {
-            self.admit_queued_stake(height.saturating_add(1) / blocks);
+            let next_epoch = height.saturating_add(1) / blocks;
+            self.admit_queued_stake(next_epoch);
+            // Audit v6, STAKE-1: a jail whose epoch has come ends here, in the same state the
+            // next set is derived from. Empty without `staking.slashing`.
+            self.jailed.retain(|_, until| *until > next_epoch);
         }
         self.record_anchor(height);
         // Spec §12's invariant, checked once per block in a debug build: every bridged token's
@@ -2753,7 +2815,7 @@ impl Ledger {
             self.tree.root(),
             self.gas_prices(),
             self.admitted_root()
-        )
+        ) + &format!(" jailed {:?}", self.jailed_root())
     }
 
     /// `blake3("rand-state-2" || tree || nullifiers || validators || programs)`, with
@@ -2811,9 +2873,11 @@ impl Ledger {
     ///
     /// Audit v6's staking state is folded in *around* all of that rather than appended inside
     /// it: under `staking.admission_by_vote` the root is `H("rand-state-admitted-1", root ‖
-    /// admitted_root)` over the root every paragraph above describes. A wrapper with its own
-    /// domain composes with whatever the inner layout grows next, and without the flag — every
-    /// chain through 18 — the inner root is returned untouched, byte for byte.
+    /// admitted_root)` over the root every paragraph above describes, and under
+    /// `staking.slashing` (STAKE-1) `H("rand-state-slashing-1", root ‖ jailed_root)` over that.
+    /// A wrapper with its own domain composes with whatever the inner layout grows next, and
+    /// without the flags — every chain through 18 — the inner root is returned untouched, byte
+    /// for byte.
     pub fn state_root(&self) -> Hash {
         let mut root = self.state_root_base();
         if self.staking.as_ref().is_some_and(|s| s.admission_by_vote()) {
@@ -2821,6 +2885,12 @@ impl Ledger {
             buf.extend_from_slice(root.as_bytes());
             buf.extend_from_slice(self.admitted_root().as_bytes());
             root = Hash::digest_domain(b"rand-state-admitted-1", &buf);
+        }
+        if self.staking.as_ref().is_some_and(|s| s.slashing.is_some()) {
+            let mut buf = Vec::with_capacity(64);
+            buf.extend_from_slice(root.as_bytes());
+            buf.extend_from_slice(self.jailed_root().as_bytes());
+            root = Hash::digest_domain(b"rand-state-slashing-1", &buf);
         }
         root
     }

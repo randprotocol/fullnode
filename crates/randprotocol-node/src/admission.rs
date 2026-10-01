@@ -232,9 +232,22 @@ pub fn is_permanent(e: &TxError) -> bool {
     // caching because the action is fee-less: without it each repeat costs a set derivation and
     // a Dilithium2 verification. Membership of the voting set, the quorum, the candidate being
     // registered or admitted, the set being full — and `NotAdmitted` itself — move with the chain.
+    // And STAKE-1's evidence: two headers that are not an equivocation (one key, one view, two
+    // hashes, the lower first — all read off the action), an encoding over the cap, and a
+    // signature that does not verify under the key the header itself names over this chain's
+    // signing domain (a genesis constant). The window, the offender's stake and the jail are
+    // state and stay out.
     if let TxError::Staking(s) = e {
         use randprotocol_core::ledger::StakingError as S;
-        return matches!(s, S::BadCandidateKey { .. } | S::AdmissionVoteOrder | S::BadAdmissionVote(_));
+        return matches!(
+            s,
+            S::BadCandidateKey { .. }
+                | S::AdmissionVoteOrder
+                | S::BadAdmissionVote(_)
+                | S::NotEquivocation(_)
+                | S::EvidenceTooLarge { .. }
+                | S::BadEvidenceSignature(_)
+        );
     }
     // The aggregation register's verdicts, split like `Staking`'s: the byte-verdicts (and the
     // ones against genesis-pinned constants) are cacheable, the register's state is not. A

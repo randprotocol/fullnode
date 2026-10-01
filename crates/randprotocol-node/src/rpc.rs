@@ -721,6 +721,10 @@ pub struct ChainLimits {
     pub admission_by_vote: bool,
     /// Audit v6, STAKE-2: the genesis `testnet` marker — `true` only where the file says so.
     pub testnet: bool,
+    /// Audit v6, STAKE-1: the genesis `staking.slashing` section — what a leader equivocation
+    /// costs (`equivocation_bps` of the stake, `jail_epochs` out of the set; 0 = for good) —
+    /// `null` on a chain without it, where nothing is at stake.
+    pub slashing: Option<randprotocol_core::ledger::SlashingConfig>,
 }
 
 impl ChainLimits {
@@ -744,6 +748,7 @@ impl ChainLimits {
             byte_load: None,
             admission_by_vote: ledger.staking().is_some_and(|s| s.admission_by_vote()),
             testnet: ledger.testnet(),
+            slashing: ledger.staking().and_then(|s| s.slashing),
         };
         if let Some(g) = ledger.gas() {
             let prices = ledger.gas_prices();
@@ -2104,6 +2109,16 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
             "candidate_key": candidate.to_hex(),
             "voters": signatures.iter().map(|(key, _)| key.address().to_base58()).collect::<Vec<_>>(),
         }),
+        // Audit v6, STAKE-1: the evidence of a leader equivocation — the offender, the view, and
+        // the two headers by hash and height. The headers themselves (each a certificate of
+        // Dilithium2 votes) are on the raw transaction for whoever wants to re-verify them.
+        Action::SlashEquivocation { first, second } => json!({
+            "kind": "slash_equivocation",
+            "offender": first.header.proposer.address().to_base58(),
+            "view": first.header.view,
+            "first": { "hash": first.hash().to_hex(), "height": first.header.height },
+            "second": { "hash": second.hash().to_hex(), "height": second.header.height },
+        }),
     };
     json!({
         "hash": t.hash().to_hex(),
@@ -2946,6 +2961,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // says which of them are running the current epoch.
         "rand_getValidators" => {
             let register = st.storage.register().map_err(RpcError::internal)?;
+            // Audit v6, STAKE-1: the jail as of the head, `null` for a key that is not in it.
+            let jailed = st.storage.jailed().map_err(RpcError::internal)?;
             let active = epoch_info(st).await?.current;
             let out: Vec<Value> = register
                 .iter()
@@ -2963,6 +2980,9 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                         "payout": e.payout.to_string(),
                         "nonce": e.nonce,
                         "active": active.contains(addr),
+                        // The first epoch a slashed key may be in a set again (`u64::MAX`: for
+                        // good); `null` when it is not jailed.
+                        "jailed_until": jailed.get(addr),
                     })
                 })
                 .collect();
@@ -4206,6 +4226,7 @@ mod tests {
                 "byte_load": null,
                 "admission_by_vote": false,
                 "testnet": false,
+                "slashing": null,
             })
         );
         let gs = raised_genesis();
@@ -4231,6 +4252,7 @@ mod tests {
                 "byte_load": null,
                 "admission_by_vote": false,
                 "testnet": false,
+                "slashing": null,
             })
         );
         // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
@@ -4258,6 +4280,7 @@ mod tests {
                 "byte_load": null,
                 "admission_by_vote": false,
                 "testnet": false,
+                "slashing": null,
             })
         );
         // The v0.6 switch: what a wallet reads to prove its calls over the call binding (INT-4).
@@ -4887,6 +4910,39 @@ mod tests {
                 "voters": [key(1).address().to_base58()],
             })
         );
+    }
+
+    /// Audit v6, STAKE-1: `tx_json` names the evidence (offender, view, the two headers),
+    /// `rand_getValidators` serves each key's jail, and `rand_getLimits.slashing` the section.
+    #[tokio::test]
+    async fn the_slashing_surface_names_the_evidence_the_jail_and_the_section() {
+        use crate::storage::fixtures::{make_block, slash_tx, slashing_genesis};
+        let (_d, st, _) = chain();
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["slashing"], Value::Null);
+        let keys = [key(1), key(2), key(3), key(4)];
+        let gs = slashing_genesis(&keys.iter().collect::<Vec<_>>());
+        let (_d, st) = state_for(&gs);
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["slashing"], json!({ "equivocation_bps": 1000, "jail_epochs": 4 }));
+        let proposer = keys.iter().find(|k| k.address() == gs.validators.leader(1)).unwrap();
+        let offender = keys.iter().find(|k| k.address() != proposer.address()).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let evidence = slash_tx(&ledger, offender, 1, 1);
+        let rendered = tx_json(&evidence, None, &StubExecutor)["action"].clone();
+        let randprotocol_core::types::Action::SlashEquivocation { first, second } = &evidence.action else { unreachable!() };
+        assert_eq!(
+            rendered,
+            json!({
+                "kind": "slash_equivocation", "offender": offender.address().to_base58(), "view": 1,
+                "first": { "hash": first.hash().to_hex(), "height": 1 },
+                "second": { "hash": second.hash().to_hex(), "height": 1 },
+            })
+        );
+        let b1 = make_block(&gs.block, &mut ledger, vec![evidence], proposer);
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let rows = ok(&st, "rand_getValidators", json!([])).await;
+        let row = |a: randprotocol_core::Address| rows.as_array().unwrap().iter().find(|r| r["address"] == a.to_base58()).unwrap().clone();
+        assert_eq!(row(offender.address())["jailed_until"], json!(5));
+        assert_eq!(row(proposer.address())["jailed_until"], Value::Null);
     }
 
     /// Audit v6, STAKE-2: the genesis `testnet` marker is served by `rand_getLimits` and

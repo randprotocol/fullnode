@@ -290,7 +290,7 @@ impl From<&TokensConfig> for TokensCommit {
 }
 
 /// The `staking` genesis section (audit v4, STAKE-2), defined beside the rules it switches on.
-pub use crate::ledger::staking::{FaucetMinter, FaucetRecipient, StakingConfig};
+pub use crate::ledger::staking::{FaucetMinter, FaucetRecipient, SlashingConfig, StakingConfig};
 /// Shortest `bridge.rules_v2.cap_window_secs` (one hour) and longest (seven days) a genesis may set.
 pub const MIN_CAP_WINDOW_SECS: u32 = 3_600;
 pub const MAX_CAP_WINDOW_SECS: u32 = 7 * 86_400;
@@ -816,6 +816,31 @@ impl Genesis {
             if s.max_stake_entry_per_epoch == Some(0) {
                 return Err(GenesisError::BadStaking("max_stake_entry_per_epoch 0 would admit no stake ever".into()));
             }
+            // Audit v6, STAKE-1: the slash fraction bounded like the cap; the evidence is two
+            // signatures under the chain's own domain, so v1 it must be; and no `vesting`
+            // section beside it (`SlashingConfig`'s doc comment says why).
+            if let Some(sl) = s.slashing {
+                if sl.equivocation_bps == 0 || sl.equivocation_bps > crate::ledger::staking::MAX_WEIGHT_BPS {
+                    return Err(GenesisError::BadStaking(format!("slashing.equivocation_bps {} is outside 1..=10000", sl.equivocation_bps)));
+                }
+                if (1..=crate::ledger::staking::EVIDENCE_EPOCHS).contains(&sl.jail_epochs) {
+                    return Err(GenesisError::BadStaking(format!(
+                        "slashing.jail_epochs {} must be 0 (for good) or more than the {}-epoch evidence window, or one offence could be slashed twice",
+                        sl.jail_epochs,
+                        crate::ledger::staking::EVIDENCE_EPOCHS
+                    )));
+                }
+                if self.consensus_domain != Some(1) {
+                    return Err(GenesisError::BadStaking(
+                        "slashing needs consensus_domain 1: the evidence is two block signatures under this chain's own domain".into(),
+                    ));
+                }
+                if self.vesting.is_some() {
+                    return Err(GenesisError::BadStaking(
+                        "slashing beside a vesting section is not supported: stake bonded from a lock returns to the lock's unbonding rows, which name no validator, and would escape a slash".into(),
+                    ));
+                }
+            }
             // Audit v6, STAKE-2: the fraction, bounded like the weight cap, and one budget only.
             if let Some(bps) = s.max_stake_entry_bps_per_epoch {
                 if bps == 0 || bps > crate::ledger::staking::MAX_WEIGHT_BPS {
@@ -1294,6 +1319,12 @@ impl Genesis {
         if let Some(bps) = self.staking.as_ref().and_then(|s| s.max_stake_entry_bps_per_epoch) {
             commit.extend_from_slice(b"staking_max_stake_entry_bps_per_epoch");
             commit.extend_from_slice(&bps.to_be_bytes());
+        }
+        // Slashing (audit v6, STAKE-1), after it, only when set: the fraction and the jail.
+        if let Some(sl) = self.staking.as_ref().and_then(|s| s.slashing) {
+            commit.extend_from_slice(b"staking_slashing");
+            commit.extend_from_slice(&sl.equivocation_bps.to_be_bytes());
+            commit.extend_from_slice(&sl.jail_epochs.to_be_bytes());
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -4045,6 +4076,42 @@ mod tests {
             assert!(matches!(g.validate(), Err(GenesisError::BadStaking(_))), "{:?}", g.staking);
         }
         assert!(with(Some(10_000), None).validate().is_ok());
+    }
+
+    /// Audit v6, STAKE-1: `staking.slashing` — committed only when present, the fraction bounded,
+    /// the jail 0 or longer than the evidence window, consensus domain 1 required, and refused
+    /// beside a `vesting` section (locked stake would escape a slash).
+    #[test]
+    fn the_slashing_section_is_committed_only_when_present_and_validated() {
+        let mut base = genesis(4);
+        base.consensus_domain = Some(1);
+        base.staking = Some(StakingConfig { faucet_budget_per_epoch: 0, bond_activation_epochs: 2, ..Default::default() });
+        let plain = build(&base);
+        assert!(!base.to_json().contains("slashing"));
+        let with = |bps: u32, jail: u64| {
+            let mut g = base.clone();
+            g.staking.as_mut().unwrap().slashing = Some(SlashingConfig { equivocation_bps: bps, jail_epochs: jail });
+            g
+        };
+        let on = with(1_000, 4);
+        let built = build(&on);
+        assert_ne!(built.hash(), plain.hash(), "part of the genesis hash");
+        assert_ne!(build(&with(1_000, 5)).hash(), built.hash());
+        assert_ne!(build(&with(1_001, 4)).hash(), built.hash());
+        assert_ne!(built.ledger.state_root(), plain.ledger.state_root(), "the jail is in the root");
+        assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on);
+        assert!(with(10_000, 0).validate().is_ok() && with(1, 2).validate().is_ok());
+        for g in [with(0, 4), with(10_001, 4), with(1_000, 1)] {
+            assert!(matches!(g.validate(), Err(GenesisError::BadStaking(_))), "{:?}", g.staking);
+        }
+        let mut v0 = on.clone();
+        v0.consensus_domain = None;
+        assert!(matches!(v0.validate(), Err(GenesisError::BadStaking(_))), "domain 0 signs no genesis");
+        let mut vested = on.clone();
+        vested.vesting = Some(crate::ledger::vesting::VestingConfig { entries: vec![vesting_entry(1, 10 * MIN_STAKE)] });
+        assert!(matches!(vested.validate(), Err(GenesisError::BadStaking(_))));
+        let misspelled = on.to_json().replace("jail_epochs", "jail_epoch");
+        assert!(Genesis::from_json(&misspelled).is_err(), "deny_unknown_fields");
     }
 
     /// Audit v6, STAKE-2: `staking.admission_by_vote` rides the section's gate like the fields

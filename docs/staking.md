@@ -269,7 +269,55 @@ Under it:
   checks each vote against the node's genesis hash, orders them and sends the action. Then the
   bond as before: `rand bond <validator> 1000 --registration <hex>`.
 
-Not in v0.5.4: slashing (audit decision D8 — "it means nothing while stake is free").
+### Slashing leader equivocation (audit v6, STAKE-1: `staking.slashing`)
+
+Until audit v6 an equivocating leader's second block was refused and logged with both hashes and
+nothing was at stake. Under one optional sub-section
+
+```json
+"staking": { …, "slashing": { "equivocation_bps": 1000, "jail_epochs": 4 } }
+```
+
+(absent on every chain through 18; committed to the genesis hash under its own tag only when set;
+it needs `consensus_domain: 1` and is refused beside a `vesting` section — stake bonded from a lock
+returns to the lock's unbonding rows, which name no validator, and would escape a slash):
+
+- **What is evidence.** Two block headers for **one view**, signed by **one proposer key** under
+  this chain's consensus signing domain, with **different hashes** — `SlashEquivocation { first,
+  second }`, the lower hash first. Each header is checked exactly as a replica checks a proposal's
+  signature (`SigningDomain::block_message`); nothing else about the headers matters. **What is
+  not:** the same header twice, two views, two keys, a pair signed for another chain, a tampered
+  header (its signature covers something else), and — not slashed by this change at all — **vote
+  equivocation** (two votes by one key for one view, still only refused and logged by
+  `on_vote`), a wrong-view or non-leader proposal, or anything a leader did not sign twice. An
+  honest leader cannot be slashed: nobody can make its second signature, and a leader that
+  restarts mid-view does not sign one either (`SafetyState::last_proposed_view` is persisted
+  before every proposal leaves, and `propose` refuses a view at or under it).
+- **The action.** Bundle-less, fee-less, signer-less (the two signatures authenticate it),
+  pooled like a governance action with one pooled pair per `(offender, view)`, the whole
+  transaction capped at 1 MiB (two headers with their certificates of up to 100 Dilithium2 votes
+  each, ~380 KB a header). Every replica that sees the second proposal keeps both signed headers
+  and the node pools the evidence itself; anyone may also submit it.
+- **The window.** Both headers at most one block above the ledger's height and at most
+  `EVIDENCE_EPOCHS` = 1 epoch old. The inequality the rule rests on is **`EVIDENCE_EPOCHS <
+  UNBONDING_EPOCHS`** (1 < 2, asserted at compile time): a leader of epoch `E` that unbonds
+  everything in `E` has it in `pending` until `E + 2`, and the evidence lands by `E + 1`, so the
+  stake is always there to slash.
+- **The effect.** `equivocation_bps` of the offender's bonded stake and of each unbonding row is
+  destroyed (floor-rounded per amount) and counted in the supply's `slashed` —
+  `total_supply == issued − slashed` holds through it. The key is jailed: out of every set from the
+  next boundary for `jail_epochs` whole epochs (`0`: for good; otherwise more than the evidence
+  window, which genesis enforces, so one offence can never be replayed after its jail), a `Bond`
+  top-up is refused (`Jailed`), and so is any further evidence while jailed — ten equivocations in
+  one epoch cost the stake fraction once, and the seat. A registered key never leaves the register,
+  so it cannot re-register either. Rewards (fees earned) are not touched.
+- **State.** The jail is consensus state: `H("rand-state-slashing-1", root ‖ jailed_root)` around
+  the root, persisted beside the bond queue (`META_JAILED`), restored on restart, replayed by
+  `rand-node verify`; `rand_getValidators` shows each key's `jailed_until`, `rand_getLimits.slashing`
+  the section.
+
+Not in v0.5.4: slashing (audit decision D8 — "it means nothing while stake is free"); audit v6
+built the leader-equivocation half above, behind its own section.
 
 A node runs with `--validator` when it holds a validator key at all; being in the current set is a
 separate thing, and `rand_status` reports the two separately as `is_validator` and
@@ -458,8 +506,10 @@ the register did not already say.
 
 Rewards are the fees of the blocks a validator proposed: every bundle's fee, and the base a withdraw
 pays. They accrue in `rewards` and are paid out by `Withdraw` — there are no block rewards and no
-inflation. There is also **no slashing and no jailing** in S2 (spec §13): a validator that misbehaves
-costs its stake nothing, and the remedy is the operators'.
+inflation. On a chain without `staking.slashing` — every chain through 18 — there is **no slashing
+and no jailing** (spec §13): a validator that misbehaves costs its stake nothing, and the remedy is
+the operators'. Under the section a leader that signs two headers for one view is slashed and
+jailed (§2, "Slashing leader equivocation").
 
 ## 6. Reading it back
 

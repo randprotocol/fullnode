@@ -79,8 +79,10 @@ pub struct Supply {
     /// Σ of aggregator bonds burned in, minus bonds paid out or slashed (block aggregation,
     /// spec §5.3): the register-side twin of the aggregator register's outstanding bonds.
     pub aggregator_bonds: u64,
-    /// Σ of bonds burned by `SlashAggregator`. Slashing destroys issuance: the bond is not paid
-    /// out, so it appears on the right of the audit's identity (`total_supply == issued −
+    /// Σ of what slashing destroyed: aggregator bonds by `SlashAggregator` (retired), and — under
+    /// `staking.slashing` (audit v6, STAKE-1) — `equivocation_bps` of an equivocating leader's
+    /// bonded and unbonding stake by `SlashEquivocation`. Slashing destroys issuance: nothing is
+    /// paid out, so it appears on the right of the audit's identity (`total_supply == issued −
     /// slashed`).
     pub slashed: u64,
     /// The count of sealed blocks — blocks carrying an included `Aggregate` (spec §5.1's `n`).

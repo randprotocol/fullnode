@@ -33,6 +33,9 @@ const MAX_PROPOSED_KEYS: usize = 4096;
 /// Cap on cached epoch-set derivations. Every key is a block in the tree, so this only bites if
 /// the tree cap is raised far past it.
 const MAX_DERIVED_SETS: usize = 1024;
+/// The most equivocation evidence pairs held for the node to collect (audit v6, STAKE-1): each is
+/// two headers with their certificates, and the node drains them after every message.
+const MAX_EVIDENCE_HELD: usize = 16;
 
 /// Three certificate views are consecutive — the three-chain's commit condition — only when
 /// each is exactly one more than the last; the same arithmetic as `commit_rule` (checked, so
@@ -153,6 +156,13 @@ pub struct HotStuff {
     /// the clock-drift vote rule on arrival is listed. At most `PROPOSAL_VIEW_WINDOW` entries:
     /// nothing further ahead is accepted, and entering a view drops everything under it.
     deferred: BTreeMap<u64, Hash>,
+    /// The highest view this replica signed a proposal for, persisted before the proposal left
+    /// (audit v6, STAKE-1; `SafetyState::last_proposed_view`). `propose` refuses a view at or
+    /// under it.
+    last_proposed_view: u64,
+    /// Equivocation evidence detected by `on_proposal` and not yet collected by the node
+    /// (`Action::Equivocation`, [`HotStuff::take_equivocations`]); at most `MAX_EVIDENCE_HELD`.
+    evidence: Vec<Action>,
 
     /// Sets of the epochs whose first block has committed, for the node to persist (spec §8).
     epoch_sets: EpochSets,
@@ -239,15 +249,15 @@ impl HotStuff {
         // whenever it is *ahead* of the head's QC, and a stale one is raised to the head — never
         // lowered below it, because nothing under the committed head can be contradicted any more.
         let head_view = tree[&head_hash].block.view();
-        let (view, high_qc, locked_qc, last_voted_view, voted) = match safety {
+        let (view, high_qc, locked_qc, last_voted_view, voted, last_proposed_view) = match safety {
             Some(s) => {
                 let view = s.view.max(head_qc.view.saturating_add(1));
                 let newer = |qc: QuorumCertificate| if qc.view > head_qc.view { qc } else { head_qc.clone() };
                 // Votes at or under the head's view are decided; the rest is this replica's word.
                 let voted: BTreeMap<u64, Hash> = s.voted.into_iter().filter(|(v, _)| *v > head_view).collect();
-                (view, newer(s.high_qc), newer(s.locked_qc), s.last_voted_view, voted)
+                (view, newer(s.high_qc), newer(s.locked_qc), s.last_voted_view, voted, s.last_proposed_view)
             }
-            None => (head_qc.view.saturating_add(1), head_qc.clone(), head_qc.clone(), 0, BTreeMap::new()),
+            None => (head_qc.view.saturating_add(1), head_qc.clone(), head_qc.clone(), 0, BTreeMap::new(), 0),
         };
         let current = epoch_sets.shared(0).expect("epoch 0 is seeded above");
         let mut hs = HotStuff {
@@ -279,6 +289,8 @@ impl HotStuff {
             asked: BTreeMap::new(),
             my_ask: 0,
             deferred: BTreeMap::new(),
+            last_proposed_view,
+            evidence: Vec::new(),
             epoch_sets,
             derived: Mutex::new(HashMap::new()),
             current,
@@ -621,7 +633,16 @@ impl HotStuff {
             locked_qc: self.locked_qc.clone(),
             last_voted_view: self.last_voted_view,
             voted: self.voted.iter().map(|(view, hash)| (*view, *hash)).collect(),
+            last_proposed_view: self.last_proposed_view,
         }
+    }
+
+    /// The equivocation evidence detected since the last call (audit v6, STAKE-1), as
+    /// `Action::Equivocation`s: `on_proposal` refuses the second block with an error, which
+    /// carries no actions, so the node collects the evidence here after every message. Empty on
+    /// a chain without `staking.slashing`, where nothing is recorded.
+    pub fn take_equivocations(&mut self) -> Vec<Action> {
+        std::mem::take(&mut self.evidence)
     }
 
     /// The blocks `Action::PersistPending` carries (audit v5, CON-4): every block this replica
@@ -896,6 +917,20 @@ impl HotStuff {
                     second = ?hash,
                     "leader equivocated: a second block for a view it already proposed in"
                 );
+                // Audit v6, STAKE-1: keep both signed headers as evidence — the first block's,
+                // still in the tree, and this one's, whose signature was verified above — for
+                // the node to turn into a `SlashEquivocation`. Only on a chain that slashes
+                // (elsewhere the pair would be held for nothing), only while the first block is
+                // still held (its header and signature are what the tree keeps), bounded.
+                let slashes = self.committed_ledger.staking().is_some_and(|s| s.slashing.is_some());
+                if slashes && self.evidence.len() < MAX_EVIDENCE_HELD {
+                    if let Some(entry) = self.tree.get(first) {
+                        let held = crate::types::actions::SignedHeader { header: entry.block.header.clone(), signature: entry.block.signature.clone() };
+                        let refused = crate::types::actions::SignedHeader { header: block.header.clone(), signature: block.signature.clone() };
+                        let (first, second) = crate::types::actions::SignedHeader::ordered(held, refused);
+                        self.evidence.push(Action::Equivocation { first, second });
+                    }
+                }
                 return Err(ConsensusError::Equivocation { view: block.view(), first: *first, second: hash });
             }
         }
@@ -1221,7 +1256,11 @@ impl HotStuff {
         now_ms: u64,
     ) -> Result<Vec<Action>, ConsensusError> {
         let Some(signer) = &self.signer else { return Err(ConsensusError::NotReady) };
-        if view != self.view || self.proposed_in_view || !self.is_leader(view) {
+        // `last_proposed_view` (audit v6, STAKE-1): the durable half of `proposed_in_view`. A
+        // leader that restarts in the view it proposed in comes back with `proposed_in_view`
+        // false and would sign a second, different header for the same view — the evidence
+        // `SlashEquivocation` destroys stake on. Persisted below before the proposal leaves.
+        if view != self.view || self.proposed_in_view || view <= self.last_proposed_view || !self.is_leader(view) {
             return Err(ConsensusError::NotReady);
         }
         let parent_hash = self.high_qc.block_hash;
@@ -1314,7 +1353,11 @@ impl HotStuff {
         };
         let block = Block::sign(&self.cfg.domain, header, txs, signer);
         self.proposed_in_view = true;
-        let mut out = vec![Action::Broadcast(ConsensusMessage::Proposal(block.clone()))];
+        self.last_proposed_view = view;
+        // On disk before the broadcast (audit v6, STAKE-1): `PersistSafety` is executed before
+        // any later action in its batch, so the proposal never leaves a node that could forget
+        // it proposed in this view.
+        let mut out = vec![Action::PersistSafety(self.safety_state()), Action::Broadcast(ConsensusMessage::Proposal(block.clone()))];
         // The leader's own clock is "now": its vote on its own block follows B2's drift rule
         // like any validator's. `timestamp_ms` exceeds `now_ms` only when the parent already
         // did (monotonicity), so a leader withholds its own vote only when its clock lags the
@@ -1382,7 +1425,9 @@ impl HotStuff {
     /// Leader of the current view proposes once it holds a QC for view-1 or a
     /// quorum of NewView messages for this view, and knows the block to extend.
     fn maybe_ready_to_propose(&mut self, out: &mut Vec<Action>) {
-        if self.signer.is_none() || self.proposed_in_view || !self.is_leader(self.view) {
+        // A view already proposed in — in this process or, via `last_proposed_view`, before a
+        // restart — is not proposed in again (audit v6, STAKE-1).
+        if self.signer.is_none() || self.proposed_in_view || self.view <= self.last_proposed_view || !self.is_leader(self.view) {
             return;
         }
         let have_qc = self.high_qc.view.saturating_add(1) == self.view;

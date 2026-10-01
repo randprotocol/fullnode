@@ -4,6 +4,7 @@ use super::*;
 use crate::confidential::{ConfidentialExecutor, StubExecutor};
 use crate::genesis::{Genesis, GenesisValidator};
 use crate::notes::{word8_to_hex, Envelope};
+use crate::types::actions::SignedHeader;
 use crate::types::Transaction;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -30,6 +31,8 @@ struct Sim {
     /// `Action::SafetyViolation`s any replica emitted: a real node stops on one, and
     /// `assert_consistent` refuses to pass while one is recorded (audit v3).
     safety_violations: Vec<(usize, Hash, Hash)>,
+    /// Audit v6, STAKE-1: the equivocation evidence each replica captured.
+    equivocations: Vec<(usize, Box<SignedHeader>, Box<SignedHeader>)>,
 }
 
 /// A payout address for a test validator: phase S2 makes it a required genesis field, and
@@ -70,6 +73,23 @@ thread_local! {
 fn fixture_domain() -> Option<u32> {
     let v = DOMAIN_VERSION.with(|d| d.get());
     (v != 0).then_some(v)
+}
+
+thread_local! {
+    /// The `staking` section the fixtures build their genesis with (audit v6, STAKE-1): `None`,
+    /// the default, or whatever [`with_staking`] sets.
+    static STAKING: std::cell::RefCell<Option<crate::genesis::StakingConfig>> = const { std::cell::RefCell::new(None) };
+}
+
+fn fixture_staking() -> Option<crate::genesis::StakingConfig> {
+    STAKING.with(|s| s.borrow().clone())
+}
+
+fn with_staking<R>(cfg: crate::genesis::StakingConfig, f: impl FnOnce() -> R) -> R {
+    STAKING.with(|s| *s.borrow_mut() = Some(cfg));
+    let r = f();
+    STAKING.with(|s| *s.borrow_mut() = None);
+    r
 }
 
 fn with_domain<R>(version: u32, f: impl FnOnce() -> R) -> R {
@@ -128,7 +148,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         }),
         aggregation: None,
         consensus_domain: fixture_domain(),
-        staking: None,
+        staking: fixture_staking(),
         vesting: None,
         gas: None,
         // Audit v6, STAKE-2: a faucet beside a bridge needs the marker on a new chain id.
@@ -158,6 +178,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         fetches: Vec::new(),
         down: vec![false; n as usize],
         safety_violations: Vec::new(),
+        equivocations: Vec::new(),
         nodes,
         keys,
         gs,
@@ -198,6 +219,9 @@ impl Sim {
                 Action::SafetyViolation { committed, attempted } => {
                     self.safety_violations.push((i, committed, attempted))
                 }
+                // Audit v6, STAKE-1: a real node pools the pair as a `SlashEquivocation`; the
+                // simulator records it so a test can assert what was captured.
+                Action::Equivocation { first, second } => self.equivocations.push((i, first, second)),
             }
         }
     }
@@ -2425,6 +2449,86 @@ fn a_leaders_second_block_for_one_view_is_refused_as_equivocation() {
     assert!(sim.nodes[1].has_block(&a.hash()) && !sim.nodes[1].has_block(&b.hash()));
     // The same block again is not an equivocation: it is already held.
     assert!(sim.nodes[1].on_proposal(a, sim.now).is_ok());
+}
+
+/// A chain with `staking.slashing` (audit v6, STAKE-1): signing domain v1, as the section needs.
+fn setup_slashing(n: u8, validators: u8) -> Sim {
+    let cfg = crate::genesis::StakingConfig {
+        slashing: Some(crate::genesis::SlashingConfig { equivocation_bps: 1_000, jail_epochs: 2 }),
+        ..Default::default()
+    };
+    with_domain(1, || with_staking(cfg, || setup(n, validators)))
+}
+
+/// Audit v6, STAKE-1: the replica keeps both signed headers of an equivocating leader — the
+/// first block's, from the tree, and the refused one's — and hands them to the node as an
+/// `Action::Equivocation`, in canonical order, and the pair is evidence the ledger accepts.
+/// The refusal itself is unchanged. On a chain without the section nothing is kept.
+#[test]
+fn an_equivocation_is_captured_as_evidence_on_a_slashing_chain() {
+    let mut sim = setup_slashing(4, 4);
+    let (leader, view) = pending_leader(&sim);
+    sim.now += 1;
+    let acts = sim.nodes[leader].propose(view, vec![], sim.now).expect("the leader proposes");
+    let a = proposal_of(&acts);
+    let b = block_on_head(&sim, 1, view, a.header.timestamp_ms + 1);
+    assert!(sim.nodes[1].on_proposal(a.clone(), sim.now).is_ok());
+    assert!(sim.nodes[1].take_equivocations().is_empty(), "one block is not evidence");
+    assert!(matches!(sim.nodes[1].on_proposal(b.clone(), sim.now), Err(ConsensusError::Equivocation { .. })));
+    let evidence = sim.nodes[1].take_equivocations();
+    assert_eq!(evidence.len(), 1);
+    assert!(sim.nodes[1].take_equivocations().is_empty(), "collected once");
+    sim.handle(1, evidence.clone());
+    let (_, first, second) = sim.equivocations[0].clone();
+    let mut hashes = [a.hash(), b.hash()];
+    hashes.sort();
+    assert_eq!([first.hash(), second.hash()], hashes, "both headers, the lower hash first");
+    assert_eq!((first.signature.clone(), second.signature.clone()), if a.hash() < b.hash() { (a.signature.clone(), b.signature.clone()) } else { (b.signature.clone(), a.signature.clone()) });
+    // The node's transaction from it is valid on the replica's own tip.
+    let tx = Transaction { chain_id: sim.gs.chain_id, bundle: None, action: crate::types::Action::SlashEquivocation { first, second } };
+    assert_eq!(sim.nodes[1].tip_ledger().validate(&tx, &StubExecutor), Ok(()));
+
+    // Without the section: the same refusal, no evidence.
+    let mut plain = setup(4, 4);
+    let (leader, view) = pending_leader(&plain);
+    plain.now += 1;
+    let a = proposal_of(&plain.nodes[leader].propose(view, vec![], plain.now).unwrap());
+    let b = block_on_head(&plain, 1, view, a.header.timestamp_ms + 1);
+    assert!(plain.nodes[1].on_proposal(a, plain.now).is_ok());
+    assert!(matches!(plain.nodes[1].on_proposal(b, plain.now), Err(ConsensusError::Equivocation { .. })));
+    assert!(plain.nodes[1].take_equivocations().is_empty());
+}
+
+/// Audit v6, STAKE-1: an honest leader must not be able to produce the evidence by crashing.
+/// `proposed_in_view` was memory only, and `resume` restores the view the replica was in, so a
+/// leader that restarted after proposing signed a second header for the same view. The proposal
+/// is now preceded by a `PersistSafety` carrying `last_proposed_view`, and a resumed replica
+/// refuses to propose at or under it.
+#[test]
+fn a_leader_restarted_in_the_view_it_proposed_in_does_not_propose_again() {
+    let mut sim = setup(4, 4);
+    let (leader, view) = pending_leader(&sim);
+    sim.now += 1;
+    let acts = sim.nodes[leader].propose(view, vec![], sim.now).unwrap();
+    let persist = acts.iter().position(|a| matches!(a, Action::PersistSafety(s) if s.last_proposed_view == view));
+    let broadcast = acts.iter().position(|a| matches!(a, Action::Broadcast(ConsensusMessage::Proposal(_))));
+    assert!(persist.is_some() && persist < broadcast, "on disk before the proposal leaves: {persist:?} {broadcast:?}");
+    let safety = sim.nodes[leader].safety_state();
+    assert_eq!(safety.last_proposed_view, view);
+    let mut resumed = HotStuff::resume(
+        config_of(&sim),
+        Some(Keypair::from_seed(*sim.keys[leader].seed()).unwrap()),
+        sim.gs.block.clone(),
+        QuorumCertificate::genesis(sim.gs.hash()),
+        sim.gs.ledger.clone(),
+        Some(safety),
+        Vec::new(),
+        sim.nodes[leader].epoch_sets().clone(),
+        std::sync::Arc::new(StubExecutor),
+    );
+    assert_eq!(resumed.view(), view, "the restart comes back in the view it proposed in");
+    assert_eq!(resumed.propose(view, vec![], sim.now + 1).map(|_| ()), Err(ConsensusError::NotReady), "no second header for the view");
+    assert!(!resumed.start().iter().any(|a| matches!(a, Action::ReadyToPropose { .. })));
 }
 
 #[test]

@@ -503,6 +503,46 @@ pub struct SignedAggregateHeader {
     pub signature: Signature,
 }
 
+/// One signed block header, as `Action::SlashEquivocation`'s evidence carries it (audit v6,
+/// STAKE-1): the header a leader signed and the proposer signature over it, exactly as the block
+/// carried them (`Block::sign`, `Block::verify_signature`). Two of these with the same `view`
+/// and `proposer` and different header hashes, each verifying under this chain's consensus
+/// signing domain, are the equivocation the ledger slashes; nothing else about the header — its
+/// parent, its justify, its transactions — is checked or needed. Boxed in the action so a slash
+/// transaction's size is two headers, each of which carries a `justify` certificate of up to
+/// `MAX_VALIDATORS` Dilithium2 votes (~380 KB), never a list.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedHeader {
+    pub header: crate::types::BlockHeader,
+    pub signature: Signature,
+}
+
+impl SignedHeader {
+    /// The block's identity, `BlockHeader::hash` — domain-free, the same under every signing
+    /// domain version.
+    pub fn hash(&self) -> Hash {
+        self.header.hash()
+    }
+
+    /// Whether `signature` is the proposer's over this header under `domain` — `Block::
+    /// verify_signature`'s check, without the block.
+    pub fn verify(&self, domain: &crate::types::SigningDomain) -> bool {
+        self.header.proposer.verify(domain.block_message(&self.header).as_bytes(), &self.signature)
+    }
+
+    /// Two signed headers in the evidence's canonical order — the lower header hash first — so
+    /// every replica that saw the same pair builds the same transaction, and the pool and the
+    /// gossip layer see one id for one offence. The ledger refuses the other order
+    /// (`StakingError::NotEquivocation`).
+    pub fn ordered(a: SignedHeader, b: SignedHeader) -> (Box<SignedHeader>, Box<SignedHeader>) {
+        if a.hash() <= b.hash() {
+            (Box::new(a), Box::new(b))
+        } else {
+            (Box::new(b), Box::new(a))
+        }
+    }
+}
+
 /// What an aggregator signs to claim an address in the register: the chain and the payout —
 /// [`registration_message`]'s exact construction, one role over. As there, the enclosing
 /// action's `aggregator` field must equal `registration.public_key.address()`, so one key's

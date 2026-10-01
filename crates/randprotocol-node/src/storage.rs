@@ -213,6 +213,13 @@ const META_BOND_QUEUE: &str = "bond_queue";
 /// on every chain without the flag, so chain 18's database never gains the key; absent reads
 /// as empty. Restored by `load_ledger`, audited by replay.
 const META_ADMITTED: &str = "admitted";
+/// `bincode(BTreeMap<Address, u64>)`: the jail as of the head (audit v6, STAKE-1,
+/// `Ledger::jailed`) — per slashed key, the first epoch it may be in a set again. Consensus
+/// state under `staking.slashing` (the `rand-state-slashing-1` wrapper, inside `Ledger`'s
+/// equality): a restarted node that lost it would seat a jailed key its peers keep out.
+/// `META_ADMITTED`'s twin in every respect: the same three sites, written only while non-empty,
+/// absent reads as empty, restored by `load_ledger`, audited by replay.
+const META_JAILED: &str = "jailed";
 /// `bincode(u64)`: Σ of the registration fees burned under `tokens.burn_registration_fee` as of
 /// the head (audit v5, TOK-2, `Ledger::registration_fees_burned`). `META_SUPPLY`'s twin in every
 /// respect — derived, outside the root and `Ledger`'s equality, written at the same three sites,
@@ -850,6 +857,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&gs.ledger.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(gs.ledger.bond_queue())?);
         self.put_admitted(&mut batch, gs.ledger.admitted())?;
+        self.put_jailed(&mut batch, gs.ledger.jailed())?;
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&gs.ledger.registration_fees_burned())?);
         // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
         // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
@@ -1239,6 +1247,21 @@ impl Storage {
             batch.delete_cf(self.cf(CF_META), META_ADMITTED);
         } else {
             batch.put_cf(self.cf(CF_META), META_ADMITTED, bincode::serialize(admitted)?);
+        }
+        Ok(())
+    }
+
+    /// The jail as of the head (audit v6, STAKE-1) — `admitted()`'s twin: empty on a database
+    /// without the key, which is every chain without `staking.slashing`.
+    pub fn jailed(&self) -> Result<BTreeMap<Address, u64>> {
+        Ok(self.get_meta_raw(META_JAILED)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
+    fn put_jailed(&self, batch: &mut WriteBatch, jailed: &BTreeMap<Address, u64>) -> Result<()> {
+        if jailed.is_empty() {
+            batch.delete_cf(self.cf(CF_META), META_JAILED);
+        } else {
+            batch.put_cf(self.cf(CF_META), META_JAILED, bincode::serialize(jailed)?);
         }
         Ok(())
     }
@@ -2179,6 +2202,7 @@ impl Storage {
         ledger.set_faucet_epoch_counters(faucet_epoch, faucet_minted);
         ledger.set_bond_queue(self.bond_queue()?);
         ledger.set_admitted(self.admitted()?);
+        ledger.set_jailed(self.jailed()?);
         ledger.set_registration_fees_burned(self.registration_fees_burned()?);
         if let Some(p) = self.gas_prices()? {
             ledger.set_gas_prices(p);
@@ -2508,6 +2532,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger_after.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger_after.bond_queue())?);
         self.put_admitted(&mut batch, ledger_after.admitted())?;
+        self.put_jailed(&mut batch, ledger_after.jailed())?;
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger_after.registration_fees_burned())?);
         // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
         // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
@@ -2545,9 +2570,12 @@ impl Storage {
 
     /// The persisted safety state. A row written before audit v6's `voted` record existed (every
     /// build through v0.6.7) is four fields, and bincode is positional: it is read as those four
-    /// with an empty record, so a rolled node keeps its lock and its last voted view. The other
-    /// direction needs nothing: `voted` is appended last and an older build's `bincode::deserialize`
-    /// stops after the fields it knows, so a rollback reads the row this build wrote.
+    /// with an empty record, so a rolled node keeps its lock and its last voted view; one written
+    /// before STAKE-1's `last_proposed_view` (five fields) is read with it at 0 — which is the
+    /// one restart on which a leader could still re-propose in its view, and the roll's own
+    /// restart is not mid-proposal. The other direction needs nothing: each field is appended
+    /// last and an older build's `bincode::deserialize` stops after the fields it knows, so a
+    /// rollback reads the row this build wrote.
     pub fn load_safety(&self) -> Result<Option<SafetyState>> {
         #[derive(serde::Deserialize)]
         struct SafetyStateV1 {
@@ -2556,9 +2584,27 @@ impl Storage {
             locked_qc: QuorumCertificate,
             last_voted_view: u64,
         }
+        #[derive(serde::Deserialize)]
+        struct SafetyStateV2 {
+            view: u64,
+            high_qc: QuorumCertificate,
+            locked_qc: QuorumCertificate,
+            last_voted_view: u64,
+            voted: Vec<(u64, Hash)>,
+        }
         let Some(bytes) = self.get_meta_raw(META_SAFETY)? else { return Ok(None) };
         if let Ok(s) = bincode::deserialize::<SafetyState>(&bytes) {
             return Ok(Some(s));
+        }
+        if let Ok(v2) = bincode::deserialize::<SafetyStateV2>(&bytes) {
+            return Ok(Some(SafetyState {
+                view: v2.view,
+                high_qc: v2.high_qc,
+                locked_qc: v2.locked_qc,
+                last_voted_view: v2.last_voted_view,
+                voted: v2.voted,
+                last_proposed_view: 0,
+            }));
         }
         let v1: SafetyStateV1 = bincode::deserialize(&bytes)?;
         Ok(Some(SafetyState {
@@ -2567,6 +2613,7 @@ impl Storage {
             locked_qc: v1.locked_qc,
             last_voted_view: v1.last_voted_view,
             voted: Vec::new(),
+            last_proposed_view: 0,
         }))
     }
 
@@ -3018,6 +3065,15 @@ impl Storage {
                     ledger.admitted()
                 ))
             }
+            // The jail likewise (audit v6, STAKE-1): inside the equality, hashed under
+            // `staking.slashing`, named so the repair knows the key.
+            Ok(stored) if stored.jailed() != ledger.jailed() => {
+                check.problem = Some(format!(
+                    "stored jail {:?} does not match the replayed chain's {:?}",
+                    stored.jailed(),
+                    ledger.jailed()
+                ))
+            }
             // The vesting register likewise (genesis vesting): inside the equality, hashed under
             // its section, named so the repair knows the key.
             Ok(stored) if stored.vesting() != ledger.vesting() => {
@@ -3275,6 +3331,7 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger.bond_queue())?);
         self.put_admitted(&mut batch, ledger.admitted())?;
+        self.put_jailed(&mut batch, ledger.jailed())?;
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger.registration_fees_burned())?);
         // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
         // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
@@ -3885,6 +3942,40 @@ pub(crate) mod fixtures {
             bundle: None,
             action: Action::AdmitValidator { candidate: candidate.public_key().clone(), signatures },
         }
+    }
+
+    /// A chain of `validators` whose genesis sets `staking.slashing` (audit v6, STAKE-1): 10% a
+    /// slash, a four-epoch jail, ten-block epochs, signing domain v1.
+    pub(crate) fn slashing_genesis(validators: &[&Keypair]) -> GenesisState {
+        let mut g = genesis_file_of(7, validators, vec![], 10);
+        g.consensus_domain = Some(1);
+        g.staking = Some(randprotocol_core::genesis::StakingConfig {
+            slashing: Some(randprotocol_core::genesis::SlashingConfig { equivocation_bps: 1_000, jail_epochs: 4 }),
+            ..Default::default()
+        });
+        g.build(&StubExecutor).unwrap()
+    }
+
+    /// A `SlashEquivocation` of `offender` for `view` at `height`: two headers it signs under
+    /// `ledger`'s signing domain, differing in their timestamp.
+    pub(crate) fn slash_tx(ledger: &Ledger, offender: &Keypair, view: u64, height: u64) -> Transaction {
+        use randprotocol_core::types::actions::SignedHeader;
+        let header = |ts: u64| {
+            let header = BlockHeader {
+                height,
+                view,
+                parent: Hash::ZERO,
+                proposer: offender.public_key().clone(),
+                timestamp_ms: ts,
+                tx_root: Hash::ZERO,
+                state_root: Hash::ZERO,
+                justify: randprotocol_core::QuorumCertificate::genesis(Hash::ZERO),
+            };
+            let signature = offender.sign(ledger.signing_domain().block_message(&header).as_bytes());
+            SignedHeader { header, signature }
+        };
+        let (first, second) = SignedHeader::ordered(header(1), header(2));
+        Transaction { chain_id: ledger.chain_id(), bundle: None, action: Action::SlashEquivocation { first, second } }
     }
 
     pub(crate) fn bundle_tx(ledger: &Ledger, nfs: [Word8; 2], cms: [Word8; 2], fee: u64) -> Transaction {
@@ -6050,6 +6141,7 @@ mod tests {
             locked_qc: QuorumCertificate::genesis(gs.hash()),
             last_voted_view: 8,
             voted: vec![(7, Hash([7; 32])), (8, Hash([8; 32]))],
+            last_proposed_view: 6,
         };
         s.save_safety(&state).unwrap();
         assert_eq!(s.load_safety().unwrap(), Some(state));
@@ -6080,7 +6172,7 @@ mod tests {
         assert_eq!((got.view, got.last_voted_view, &got.high_qc, &got.locked_qc), (41, 40, &qc, &qc));
         assert!(got.voted.is_empty(), "with an empty vote record");
         // And what this build writes, a v0.6.7 build reads: the new field is a suffix.
-        let new = SafetyState { view: 50, high_qc: qc.clone(), locked_qc: qc.clone(), last_voted_view: 49, voted: vec![(49, Hash([1; 32]))] };
+        let new = SafetyState { view: 50, high_qc: qc.clone(), locked_qc: qc.clone(), last_voted_view: 49, voted: vec![(49, Hash([1; 32]))], last_proposed_view: 50 };
         s.save_safety(&new).unwrap();
         #[derive(serde::Deserialize)]
         struct V067Read {
@@ -6998,6 +7090,46 @@ mod tests {
         // A truncation to genesis empties it again, and drops the row.
         s.truncate_to(&gs, 0, &gs.ledger).unwrap();
         assert!(s.get_meta_raw(META_ADMITTED).unwrap().is_none());
+    }
+
+    /// Audit v6, STAKE-1: the jail is consensus state under `staking.slashing` — the next set and
+    /// every top-up are judged by it, and it is in the state root — so it is committed with the
+    /// state, restored by `load_ledger`, audited by `verify_chain`'s replay and rewritten by the
+    /// repair; the slash's `slashed` counter rides the supply blob and is audited the same way.
+    #[test]
+    fn the_jail_is_persisted_restored_and_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = slashing_genesis(&[&key(1), &key(2), &key(3), &key(4)]);
+        s.init_genesis(&gs).unwrap();
+        assert!(s.jailed().unwrap().is_empty());
+        assert!(s.get_meta_raw(META_JAILED).unwrap().is_none(), "an empty jail writes no row");
+        let mut ledger = gs.ledger.clone();
+        let proposer = [key(1), key(2), key(3), key(4)].into_iter().find(|k| k.address() == gs.validators.leader(1)).unwrap();
+        let offender = if proposer.address() == key(2).address() { key(3) } else { key(2) };
+        let evidence = slash_tx(&ledger, &offender, 1, 1);
+        let mut b1 = make_block(&gs.block, &mut ledger, vec![evidence], &proposer);
+        // The fixture signs under domain 0; this chain signs under v1, and the replay checks it.
+        b1.block = Block::sign(&gs.signing_domain(), b1.block.header.clone(), b1.block.transactions.clone(), &proposer);
+        b1.qc.block_hash = b1.block.hash();
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let jailed = s.jailed().unwrap();
+        assert_eq!(jailed.get(&offender.address()), Some(&5), "epoch 0 + 1 + 4");
+        assert_eq!(s.supply().unwrap().slashed, randprotocol_core::ledger::staking::MIN_STAKE / 10);
+        assert!(ledger.audit().invariant_holds(), "{:?}", ledger.audit());
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.jailed(), ledger.jailed());
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(reloaded, ledger);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+        // A lost jail is named by the audit and repaired from the replay.
+        s.db.delete_cf(s.cf(CF_META), META_JAILED).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.expect("a lost jail is a problem");
+        assert!(problem.contains("jail"), "{problem}");
+        s.truncate_to(&gs, 1, &check.ledger).unwrap();
+        assert_eq!(s.jailed().unwrap(), jailed);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
     }
 
     /// The v4 re-review's bond queue is consensus state under a `staking` section, so — like

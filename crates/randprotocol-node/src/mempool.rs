@@ -175,6 +175,11 @@ fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
         // sets, two transaction ids — are a block that dies on its own second candidate. There
         // is no nonce; the slot is the candidate's address under `claim_key`'s own role.
         Action::AdmitValidator { candidate, .. } => Some((candidate.address(), 0)),
+        // Audit v6, STAKE-1: evidence claims `(offender, view)` — one slash per offender per
+        // jail at the ledger, so two pooled pairs for one view (a third header, another order)
+        // are a block that dies on its second. Role 8 keeps it apart from the offender's own
+        // `Unbond` at that nonce.
+        Action::SlashEquivocation { first, .. } => Some((first.header.proposer.address(), first.header.view)),
         _ => None,
     }
 }
@@ -200,7 +205,10 @@ fn claim_conflict_key(validator: &Address) -> Word8 {
 /// fee-less, so fee order would sort it behind everything that pays. Its exemption is bounded
 /// differently — one pooled admission per candidate (role 7), each of which passed a quorum of
 /// the voting set's signatures at admission, and at most `staking::MAX_ADMITTED` of them before
-/// the ledger refuses the next.
+/// the ledger refuses the next. STAKE-1's `SlashEquivocation` is the same kind of thing — fee-less
+/// evidence that must reach a block while the offender still leads — bounded by one pooled pair
+/// per `(offender, view)` (role 8), each admitted only with two of a registered validator's own
+/// signatures.
 fn is_governance(action: &Action) -> bool {
     matches!(
         action,
@@ -211,6 +219,7 @@ fn is_governance(action: &Action) -> bool {
             | Action::RotatePqGuardians { .. }
             | Action::RotatePauseKey { .. }
             | Action::AdmitValidator { .. }
+            | Action::SlashEquivocation { .. }
     )
 }
 
@@ -239,6 +248,7 @@ fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
         // claim never holds it.
         Action::RevokeVesting { .. } => 6,
         Action::AdmitValidator { .. } => 7,
+        Action::SlashEquivocation { .. } => 8,
         _ => 0,
     };
     (role, claim.0, claim.1)
@@ -910,6 +920,12 @@ impl Mempool {
                 if bridge.list_nonce != nonce {
                     return Err(TxError::Bridge(BridgeError::BadListNonce { expected: bridge.list_nonce, got: nonce }));
                 }
+            } else if let Action::SlashEquivocation { first, second } = &tx.action {
+                // Audit v6, STAKE-1: evidence stands while its headers are inside the window
+                // and the offender has stake and is not jailed — the ledger's state checks,
+                // without the two signature verifications. Once the offender is jailed (by
+                // this pair or another) or the window has passed, it can never apply and leaves.
+                randprotocol_core::ledger::staking::check_slash_open(ledger, &addr, [first.header.height, second.header.height])?;
             } else if matches!(tx.action, Action::AdmitValidator { .. }) {
                 // Audit v6, STAKE-2: an admission stands while its candidate is neither
                 // registered nor admitted (and the set has room) — the ledger's own state
@@ -1890,6 +1906,50 @@ mod tests {
         after.apply_tx(&other, &vals[0].address(), &StubExecutor).unwrap();
         m.prune(&after);
         assert!(!m.contains(&other.hash()), "a vote whose candidate is admitted leaves the pool");
+    }
+
+    /// Audit v6, STAKE-1: equivocation evidence is pooled like a governance action — past a full
+    /// pool, offered first — and claims `(offender, view)`: a second pair for the same offence (a
+    /// third header) does not pool beside it, and once the offender is jailed every pooled pair
+    /// against it can never apply and leaves.
+    #[test]
+    fn one_pair_of_evidence_pools_per_offence_and_leaves_once_the_offender_is_jailed() {
+        let keys: Vec<randprotocol_core::Keypair> = (1..=4u8).map(fixtures::key).collect();
+        let gs = fixtures::slashing_genesis(&keys.iter().collect::<Vec<_>>());
+        let mut l = gs.ledger.clone();
+        l.set_height(5);
+        let offender = &keys[1];
+        let first = fixtures::slash_tx(&l, offender, 3, 3);
+        let mut m = Mempool::new(1);
+        let paid = fixtures::bundle_tx(&l, [nf(1), nf(2)], [cm(1), cm(2)], fixtures::bundle_fee() * 5);
+        m.insert(paid.clone(), &l, &StubExecutor).unwrap();
+        m.insert(first.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.len(), 2, "past the cap");
+        assert_eq!(m.candidates(&l, 10)[0].hash(), first.hash(), "offered first");
+        // Another pair for the same (offender, view): a conflict.
+        let mut third = first.clone();
+        if let Action::SlashEquivocation { second, .. } = &mut third.action {
+            second.header.timestamp_ms = 9;
+            second.signature = offender.sign(l.signing_domain().block_message(&second.header).as_bytes());
+        }
+        assert!(matches!(m.insert(third, &l, &StubExecutor), Err(MempoolError::Conflict(_))));
+        // A pair for another view is another claim — but once the slash applies, it is spent.
+        let other = fixtures::slash_tx(&l, offender, 4, 4);
+        m.insert(other.clone(), &l, &StubExecutor).unwrap();
+        let mut after = l.clone();
+        after.apply_tx(&first, &keys[0].address(), &StubExecutor).unwrap();
+        m.remove(&[first.hash()]);
+        m.prune(&after);
+        assert!(!m.contains(&other.hash()), "a pair against a jailed offender leaves the pool");
+        // A tampered pair is the ledger's refusal, and a permanent one.
+        let mut forged = fixtures::slash_tx(&l, &keys[2], 3, 3);
+        if let Action::SlashEquivocation { second, .. } = &mut forged.action {
+            second.header.timestamp_ms += 7;
+        }
+        match m.insert(forged, &l, &StubExecutor) {
+            Err(MempoolError::Invalid(e)) => assert!(crate::admission::is_permanent(&e), "{e:?}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Node I4: the emergency brake cannot be crowded out. A `PauseMints` is bundle-less and

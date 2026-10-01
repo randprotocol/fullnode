@@ -5,7 +5,9 @@ use crate::crypto::{Address, Hash, Keypair, PublicKey, Signature};
 use crate::ledger::tokens::MintAuthority;
 use crate::notes::{Bundle, Envelope, ShieldedAddress, Word8, BUNDLE_SLOTS};
 use crate::program::ProgramId;
-use crate::types::actions::{AggregatorRegistration, CallEnvelope, InitialMint, Registration, SignedAggregateHeader};
+use crate::types::actions::{
+    AggregatorRegistration, CallEnvelope, InitialMint, Registration, SignedAggregateHeader, SignedHeader,
+};
 use serde::{Deserialize, Serialize};
 
 /// Native token symbol. The whitepaper (Draft 3) calls this RAND; rename here if needed.
@@ -400,6 +402,17 @@ pub enum Action {
     /// `UnsupportedAction` on a chain without the flag (every chain through 18), before anything
     /// else is read. Appended last: bincode is positional, and chain 18's history must decode.
     AdmitValidator { candidate: PublicKey, signatures: Vec<(PublicKey, Signature)> },
+    /// Audit v6, STAKE-1 (genesis `staking.slashing`): the evidence that a leader signed two
+    /// different block headers for one view — two [`SignedHeader`]s with the same `view` and
+    /// `proposer` and different hashes, each verifying under this chain's consensus signing
+    /// domain, `first` the lower hash ([`SignedHeader::ordered`]). Self-authenticating: the
+    /// offender's own two signatures are the proof, so it carries no signer, no nonce, no bundle
+    /// and no fee, and anyone may submit it (every replica that saw both proposals builds the same
+    /// one). Under the section the ledger destroys `equivocation_bps` of the offender's bonded and
+    /// unbonding stake and jails the key (`docs/staking.md`); on a chain without it — every chain
+    /// through 18 — it is refused `UnsupportedAction` before a byte of it is read. The whole
+    /// transaction is capped at `staking::MAX_EVIDENCE_BYTES` (1 MiB). Appended last.
+    SlashEquivocation { first: Box<SignedHeader>, second: Box<SignedHeader> },
 }
 
 impl Action {
@@ -429,6 +442,7 @@ impl Action {
             Action::BondVested { .. } => Some("bond_vested"),
             Action::UnbondVested { .. } => Some("unbond_vested"),
             Action::AdmitValidator { .. } => Some("admit_validator"),
+            Action::SlashEquivocation { .. } => Some("slash_equivocation"),
             _ => None,
         }
     }
@@ -646,6 +660,10 @@ impl Action {
             // STAKE-2's admission vote: bundle-less, no proof, the candidate and every vote kept.
             Action::AdmitValidator { candidate, signatures } => {
                 Action::AdmitValidator { candidate: candidate.clone(), signatures: signatures.clone() }
+            }
+            // STAKE-1's evidence: two signed headers, no proof; the signatures are the action.
+            Action::SlashEquivocation { first, second } => {
+                Action::SlashEquivocation { first: first.clone(), second: second.clone() }
             }
         }
     }
@@ -1201,6 +1219,25 @@ mod tests {
             (Action::UnbondVested { entry: [0; 32], amount: 1, nonce: 0, signature: Signature::empty() }, "unbond_vested"),
             (Action::AdmitValidator { candidate: minter.clone(), signatures: Vec::new() }, "admit_validator"),
             (
+                {
+                    let h = SignedHeader {
+                        header: crate::types::BlockHeader {
+                            height: 1,
+                            view: 1,
+                            parent: Hash::ZERO,
+                            proposer: minter.clone(),
+                            timestamp_ms: 0,
+                            tx_root: Hash::ZERO,
+                            state_root: Hash::ZERO,
+                            justify: crate::types::QuorumCertificate::genesis(Hash::ZERO),
+                        },
+                        signature: Signature::empty(),
+                    };
+                    Action::SlashEquivocation { first: Box::new(h.clone()), second: Box::new(h) }
+                },
+                "slash_equivocation",
+            ),
+            (
                 Action::BondVested { entry: [0; 32], validator: v, amount: 1, registration: None, nonce: 0, signature: Signature::empty() },
                 "bond_vested",
             ),
@@ -1447,7 +1484,7 @@ mod tests {
     /// The number of `Action` variants, and each one's position — an exhaustive match with no
     /// wildcard, so a new variant fails to compile here until [`sample`] has a row for it (and
     /// [`Action::blanked`] has an arm).
-    const VARIANTS: usize = 29;
+    const VARIANTS: usize = 30;
     fn variant_index(a: &Action) -> usize {
         match a {
             Action::None => 0,
@@ -1479,6 +1516,7 @@ mod tests {
             Action::BondVested { .. } => 26,
             Action::UnbondVested { .. } => 27,
             Action::AdmitValidator { .. } => 28,
+            Action::SlashEquivocation { .. } => 29,
         }
     }
 
@@ -1678,6 +1716,23 @@ mod tests {
                 candidate: PublicKey::from_bytes(&[0x44; crate::crypto::PUBLIC_KEY_LEN]).unwrap(),
                 signatures: vec![(pk(), sig())],
             },
+            29 => {
+                let header = |view: u64| SignedHeader {
+                    header: crate::types::BlockHeader {
+                        height: 5,
+                        view,
+                        parent: Hash([0x61; 32]),
+                        proposer: pk(),
+                        timestamp_ms: 7,
+                        tx_root: Hash([0x62; 32]),
+                        state_root: Hash([0x63; 32]),
+                        justify: crate::types::QuorumCertificate::genesis(Hash([0x64; 32])),
+                    },
+                    signature: sig(),
+                };
+                let (first, second) = SignedHeader::ordered(header(9), header(10));
+                Action::SlashEquivocation { first, second }
+            }
             _ => panic!("no variant {i}"),
         }
     }

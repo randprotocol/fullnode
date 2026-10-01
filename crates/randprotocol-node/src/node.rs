@@ -2630,6 +2630,12 @@ impl Node {
                     self.propose_at = Some((view, at));
                 }
                 Action::FetchBlock(h) => queue.extend(self.fetch_block(h).await),
+                // Audit v6, STAKE-1: the replica saw a leader sign two headers for one view, on
+                // a chain that slashes. Pool the evidence as a `SlashEquivocation` — through the
+                // pool's own admission, so it is refused here exactly as a peer's copy would be
+                // (a jailed offender, an old header) — and gossip it: the next honest leader
+                // includes it.
+                Action::Equivocation { first, second } => self.pool_equivocation(first, second).await,
             }
         }
         self.commit(to_commit, to_record).await?;
@@ -2925,6 +2931,33 @@ impl Node {
         Ok(hash)
     }
 
+    /// Audit v6, STAKE-1: turn a captured equivocation into the transaction that slashes it and
+    /// pool it, exactly as the faucet pools a mint — the pool's `insert` runs the ledger's own
+    /// validation (the section, the window, the offender's stake and jail, both signatures), so
+    /// a pair the chain would refuse is dropped here with the reason, and a valid one is
+    /// gossiped for the next leader. Every replica that saw both proposals builds the same
+    /// transaction (`SignedHeader::ordered`), so the pool and gossip see one id per offence.
+    async fn pool_equivocation(
+        &mut self,
+        first: Box<randprotocol_core::types::actions::SignedHeader>,
+        second: Box<randprotocol_core::types::actions::SignedHeader>,
+    ) {
+        let (offender, view) = (first.header.proposer.address(), first.header.view);
+        let tx = Transaction {
+            chain_id: self.gs.chain_id,
+            bundle: None,
+            action: randprotocol_core::types::Action::SlashEquivocation { first, second },
+        };
+        match self.mempool.insert(tx.clone(), self.hs.tip_ledger(), self.executor.as_ref()) {
+            Ok(hash) => {
+                tracing::warn!(%offender, view, %hash, "leader equivocation evidence pooled as a SlashEquivocation");
+                self.net.broadcast(GossipMessage::Transaction(tx)).await;
+            }
+            Err(MempoolError::Duplicate) => {}
+            Err(e) => tracing::warn!(%offender, view, "leader equivocation evidence not pooled: {e}"),
+        }
+    }
+
     async fn on_network_event(&mut self, ev: NetworkEvent) -> Result<()> {
         match ev {
             NetworkEvent::Listening(a) => tracing::info!("listening on {a}"),
@@ -3094,7 +3127,14 @@ impl Node {
 
     async fn on_consensus(&mut self, m: ConsensusMessage) -> Result<()> {
         let is_proposal = matches!(m, ConsensusMessage::Proposal(_));
-        match self.hs.on_message(m, now_ms()) {
+        let result = self.hs.on_message(m, now_ms());
+        // Audit v6, STAKE-1: an equivocation is refused with an error, which carries no actions,
+        // so the evidence the replica kept is collected here, on every outcome.
+        let evidence = self.hs.take_equivocations();
+        if !evidence.is_empty() {
+            self.handle_actions(evidence).await?;
+        }
+        match result {
             Ok(acts) => {
                 if is_proposal {
                     // Pace proposals from the last block seen, whoever proposed it.
@@ -4417,6 +4457,7 @@ mod tests {
                 locked_qc: qc.clone(),
                 last_voted_view: lost.view(),
                 voted: voted.clone(),
+                last_proposed_view: 0,
             })
             .unwrap();
         let resume = || {
@@ -4478,6 +4519,7 @@ mod tests {
                 locked_qc: qc.clone(),
                 last_voted_view: locked.view(),
                 voted: Vec::new(),
+                last_proposed_view: 0,
             })
             .unwrap();
         storage.put_locked_block_v054_for_testing(&locked).unwrap();
@@ -5042,6 +5084,32 @@ mod tests {
         assert_eq!(reloaded.admitted(), ledger.admitted());
         assert_eq!(reloaded.state_root(), ledger.state_root(), "the same state root after the restart");
         assert_eq!(reloaded, ledger);
+    }
+
+    /// Audit v6, STAKE-1: a slash survives a restart — the jail and the cut stake are state
+    /// storage holds — and so does the section that gives them meaning, from the genesis file: the
+    /// reloaded ledger keeps the jailed key out and hashes the same `rand-state-slashing-1` root.
+    #[test]
+    fn a_restart_restores_the_slash_and_the_jail() {
+        use crate::storage::fixtures::{make_block, slash_tx, slashing_genesis};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let keys = [key(1), key(2), key(3), key(4)];
+        let gs = slashing_genesis(&keys.iter().collect::<Vec<_>>());
+        storage.init_genesis(&gs).unwrap();
+        let proposer = keys.iter().find(|k| k.address() == gs.validators.leader(1)).unwrap();
+        let offender = keys.iter().find(|k| k.address() != proposer.address()).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let evidence = slash_tx(&ledger, offender, 1, 1);
+        let b1 = make_block(&gs.block, &mut ledger, vec![evidence], proposer);
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let bare = storage.load_ledger(&StubExecutor).unwrap();
+        assert!(bare.staking().is_none(), "storage does not hold the section");
+        assert_eq!(bare.jailed(), ledger.jailed(), "but it holds the jail");
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(reloaded, ledger);
+        assert!(!reloaded.derive_next_set(1).contains(&offender.address()));
     }
 
     /// Audit v6, STAKE-2: the testnet marker survives a restart the same way — it lives in the

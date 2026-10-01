@@ -376,7 +376,7 @@ gas policy:
   "hardening_v6": false, "hc_auth": null, "gas_price": "100", "byte_price": "800",
   "gas_metering": "header", "bundle_gas_limit": null, "adjust_bps": null,
   "max_gas_price": null, "max_byte_price": null, "byte_load": null,
-  "admission_by_vote": false, "testnet": false }
+  "admission_by_vote": false, "testnet": false, "slashing": null }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -925,7 +925,7 @@ Params: `[]`. Result: array of
 
 ```json
 { "address": "…", "stake": "1000000000000", "pending": [{ "release_epoch": 41, "amount": "5000000000" }],
-  "rewards": "4000000", "payout": "rand1…", "nonce": 3, "active": true }
+  "rewards": "4000000", "payout": "rand1…", "nonce": 3, "active": true, "jailed_until": null }
 ```
 
 one row per entry of the **register** (spec §8), in address order. Since phase S2 that is every
@@ -1489,6 +1489,18 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-10-01 — audit v6, STAKE-1: slashing leader equivocation (`staking.slashing`)
+
+Genesis-gated; nothing changes on a chain without the section (every chain through 18).
+
+- **`Action::SlashEquivocation { first, second }`** (variant 29, appended last): two
+  `SignedHeader { header, signature }` of one key for one view. `tx_json` renders it as
+  `{ "kind": "slash_equivocation", "offender": <address>, "view": n, "first": { "hash", "height" },
+  "second": { "hash", "height" } }`.
+- **`rand_getValidators`** rows gain `jailed_until` (the first epoch the key may be in a set again;
+  `18446744073709551615` for good; `null` when not jailed).
+- **`rand_getLimits.slashing`**: `{ "equivocation_bps", "jail_epochs" }` or `null`.
 
 ### 2026-10-01 — audit v6, STAKE-2: the `testnet` marker
 
