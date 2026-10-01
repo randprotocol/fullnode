@@ -48,6 +48,8 @@ echo "$TARGET: $CPUS cpus, $AVAIL_MB MB available -> one proving slot on $THREAD
 
 "${SCP[@]}" "$POOL_HOME/prover.key.json" "$POOL_HOME/pairings.json" "$TARGET:/var/lib/randprover/"
 sed -e "s/@THREADS@/$THREADS/g" -e "s/@MEMORY_MAX@/$MEMORY_MAX/g" "$HERE/rand-prover.service" | "${SSH[@]}" 'cat > /etc/systemd/system/rand-prover.service'
+"${SCP[@]}" "$HERE/prover-watchdog.service" "$HERE/prover-watchdog.timer" "$TARGET:/etc/systemd/system/"
+"${SCP[@]}" "$HERE/prover-watchdog.sh" "$TARGET:/usr/local/bin/prover-watchdog.sh"
 { printf 'restrict,port-forwarding,permitopen="127.0.0.1:8600",command="/usr/sbin/nologin" '; cat "$TUNNEL_PUBKEY"; } \
     | "${SSH[@]}" 'cat > /home/provertunnel/.ssh/authorized_keys && chown provertunnel:provertunnel /home/provertunnel/.ssh/authorized_keys && chmod 0600 /home/provertunnel/.ssh/authorized_keys'
 
@@ -55,8 +57,10 @@ sed -e "s/@THREADS@/$THREADS/g" -e "s/@MEMORY_MAX@/$MEMORY_MAX/g" "$HERE/rand-pr
     chown randprover:randprover /var/lib/randprover/prover.key.json /var/lib/randprover/pairings.json
     chmod 0600 /var/lib/randprover/prover.key.json /var/lib/randprover/pairings.json
     systemctl daemon-reload
-    systemctl enable -q rand-prover
+    chmod 0755 /usr/local/bin/prover-watchdog.sh
+    systemctl enable -q rand-prover prover-watchdog.timer
     systemctl restart rand-prover
+    systemctl start prover-watchdog.timer
     for i in 1 2 3 4 5 6 7 8 9 10; do
         out=$(curl -s -m 3 -X POST -H "content-type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"prover_info\",\"params\":[]}" http://127.0.0.1:8600 || true)
         [ -n "$out" ] && break; sleep 1
