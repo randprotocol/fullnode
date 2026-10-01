@@ -43,20 +43,42 @@ pub const VIEWING_KEY_WARNING: &str = "this prover can read this wallet's whole 
 /// sent, the same for every pairing.
 pub const PAIRING_DISCLOSURE: &str = "this prover will receive this wallet's viewing key: it can read the wallet's whole history; it cannot spend";
 
-/// The pairing link of the validators' prover pool, `https://prover.randprotocol.org`
-/// (`deploy/prover/README.md`, `docs/prover.md` §9): what `rand prover pair --trusted` pairs with.
-/// Every member of the pool holds the key this link names, so one link and one fingerprint cover
-/// all of them. The token in it is public — it is in every client — and authorises nothing by
-/// itself; the link has no `own=1`, so no wallet ever sends this pool a spend key.
-pub const TRUSTED_PROVER_LINK: &str = include_str!("trusted-prover.link");
-/// Where [`TRUSTED_PROVER_LINK`] points, and the fingerprint of the key it names. Pinned beside
-/// the link so a link replaced in the file without these two lines moving is a failing test.
-pub const TRUSTED_PROVER_URL: &str = "https://prover.randprotocol.org";
-pub const TRUSTED_PROVER_FINGERPRINT: &str = "RGTF-7HKJ-XZFV-GQ1J";
+/// The validators' prover pool (`deploy/prover/README.md`, `docs/prover.md` §9): what `rand prover
+/// pair --trusted` pairs with. One line per member, `<name> <fingerprint> <link>`: each member has
+/// its OWN key, made on its host and never copied (audit v7, VK-9), so one host opens only the jobs
+/// sealed to it, and re-keying one member changes only its line. The tokens are public and
+/// authorise nothing by themselves; no link has `own=1`, so no wallet sends the pool a spend key.
+pub const TRUSTED_PROVERS: &str = include_str!("trusted-provers.txt");
 
-/// [`TRUSTED_PROVER_LINK`], parsed.
-pub fn trusted_prover_link() -> Result<PairingLink> {
-    PairingLink::parse(TRUSTED_PROVER_LINK.trim()).map_err(|e| anyhow!("the built-in trusted prover link: {e}"))
+/// One member of [`TRUSTED_PROVERS`].
+pub struct TrustedProver {
+    pub name: String,
+    pub fingerprint: String,
+    pub link: PairingLink,
+}
+
+/// [`TRUSTED_PROVERS`], parsed; refuses a line whose link names another key than its pinned
+/// fingerprint, or is not at `https://prover.randprotocol.org/m/<name>`.
+pub fn trusted_provers() -> Result<Vec<TrustedProver>> {
+    let mut out = Vec::new();
+    for line in TRUSTED_PROVERS.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let mut it = line.splitn(3, ' ');
+        let (Some(name), Some(fingerprint), Some(link)) = (it.next(), it.next(), it.next()) else {
+            return Err(anyhow!("the built-in prover list: a malformed line"));
+        };
+        let link = PairingLink::parse(link).map_err(|e| anyhow!("the built-in prover {name}: {e}"))?;
+        if link.fingerprint().to_string() != fingerprint {
+            return Err(anyhow!("the built-in prover {name}: its link names another key than {fingerprint}"));
+        }
+        if link.url != format!("https://prover.randprotocol.org/m/{name}") {
+            return Err(anyhow!("the built-in prover {name}: its link points at {}", link.url));
+        }
+        out.push(TrustedProver { name: name.to_string(), fingerprint: fingerprint.to_string(), link });
+    }
+    if out.is_empty() {
+        return Err(anyhow!("the built-in prover list is empty"));
+    }
+    Ok(out)
 }
 
 /// `--max-prover-fee`'s default: 1 RAND. A prover quoting more is refused before any bundle is
@@ -636,17 +658,19 @@ mod tests {
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
 
-    /// The built-in link is the pool's: it parses, it points at the pool's URL, it names the pinned
-    /// key, and it is not an `own=1` link — a wallet must never send this pool a spend key.
+    /// The built-in list is the pool's members, each with its own key at its own URL; none is an
+    /// `own=1` link; and the retired shared key (RGTF-7HKJ-XZFV-GQ1J, audit v7 VK-9) is gone.
     #[test]
-    fn the_trusted_prover_link_is_the_pools_and_not_an_own_link() {
-        let link = trusted_prover_link().expect("the built-in link parses");
-        assert_eq!(link.url, TRUSTED_PROVER_URL);
-        assert_eq!(link.fingerprint().to_string(), TRUSTED_PROVER_FINGERPRINT);
-        assert!(!link.own, "the pool is nobody's own prover");
-        check_prover_url(&link.url).expect("an https URL");
-        let paired = PairedProver::from_link(&link, None);
-        assert_eq!(paired.fingerprint, TRUSTED_PROVER_FINGERPRINT);
+    fn the_trusted_provers_are_the_pools_members_each_with_its_own_key() {
+        let members = trusted_provers().expect("the built-in list parses");
+        assert_eq!(members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["a", "archive2", "nyc3", "sfo3"]);
+        let mut keys = std::collections::HashSet::new();
+        for m in &members {
+            assert!(!m.link.own, "{}: the pool is nobody's own prover", m.name);
+            check_prover_url(&m.link.url).expect("an https URL");
+            assert!(keys.insert(m.fingerprint.clone()), "{}: two members share a key", m.name);
+        }
+        assert!(!TRUSTED_PROVERS.contains("RGTF-7HKJ-XZFV-GQ1J"), "the retired shared key is still pinned");
     }
 
     const EXPECTED: Word8 = [7; 8];

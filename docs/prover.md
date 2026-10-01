@@ -590,36 +590,37 @@ the 4 MiB default included): a 4 MiB block admits transfers but no `Call` at Pro
 ## 9. The validators' prover pool: `prover.randprotocol.org`
 
 A wallet that cannot make a bundle proof and whose owner runs no prover can use the pool the
-chain's validators run: five validator hosts that also prove, behind one name,
-`https://prover.randprotocol.org`. It exists on split-authorisation chains only — it takes
-viewing-key jobs and nothing else.
+chain's validators run: four machines (two validators and two dedicated droplets), each with its
+own prover key and its own URL, `https://prover.randprotocol.org/m/<member>`. It takes viewing-key
+jobs only, on split-authorisation chains.
 
 ```sh
-rand prover pair --trusted
+rand prover pair --trusted      # pairs with a member that answers and has room
 rand --prover send rand1… 1.5
 ```
 
-- **What it is trusted with.** A job carries the wallet's viewing key, so the pool's operators can
-  read everything that wallet ever received or sent, before and after. They cannot spend: the
-  auth proof over the spend key is made on the wallet's machine, and the pool's link has no
-  `own=1`, so no wallet sends it a spend key on any chain. "Trusted" means exactly that the user
-  has chosen to show these operators the wallet's history. Whoever wants it private runs their own
-  prover (§3) or proves locally.
+- **What it is trusted with.** A job carries the wallet's viewing key, so the operator of the
+  member that proves it can read everything that wallet ever received or sent, before and after.
+  No member can spend: the auth proof over the spend key is made on the wallet's machine, and no
+  member's link has `own=1`, so no wallet sends one a spend key. "Trusted" means exactly that the
+  user has chosen to show these operators the wallet's history. Whoever wants it private runs their
+  own prover (§3) or proves locally.
 - **What it is not trusted with.** Correctness: every reply is checked as any prover's is (§5.3) —
   the digest read off the proof, the size, a local verify — so a wrong proof never reaches a node.
-- **One link.** Every member holds the same prover key, so the pool has one fingerprint,
-  `RGTF-7HKJ-XZFV-GQ1J`, and one pairing link, which `rand` and the wallet apps carry
-  (`randprotocol_client::prover::TRUSTED_PROVER_LINK`) and which
-  `https://prover.randprotocol.org/.well-known/rand-prover.json` also serves (`link`, `url`,
-  `fingerprint`). The token in the link is public and authorises nothing by itself; a client pins
-  the fingerprint, so a document served from that URL cannot substitute another key.
-- **A short line, and no fee.** A bundle names a height and must land within
-  `ledger::TIME_WINDOW` = 256 blocks of it, so each member proves one bundle at a time and lets
-  one job wait: a job goes to the least loaded member, and when the whole pool is full the wallet
-  is told `busy` (-32005) at once and tries again, rather than being handed a proof too late to
-  use. The pool quotes no fee.
+- **One key per member** (audit v7, VK-9). Each member's key is made on its host and never copied,
+  and there is no backup: a member's host opens only the jobs sealed to that member, and
+  re-keying one member changes only its entry. `rand` and the wallet apps pin the member list
+  (`randprotocol_client::prover::TRUSTED_PROVERS`: name, fingerprint, link), which
+  `https://prover.randprotocol.org/.well-known/rand-prover-pool.json` also serves; a client checks
+  each member's answer against its pinned fingerprint, so a served copy cannot substitute a key.
+  The one key the pool first shared (`RGTF-7HKJ-XZFV-GQ1J`, pinned by wallet 0.6.8) was retired
+  on 2026-10-01, when wallet 0.6.9 shipped.
+- **A short line, and no fee.** A bundle must land within `ledger::TIME_WINDOW` = 256 blocks of
+  the height it names, so each member proves one bundle at a time and lets one job wait. A wallet
+  tries the members in turn and skips one that is busy or unreachable; when every member is, it
+  says so at once rather than being handed a proof too late to use. The pool quotes no fee.
 - **What is in front of it.** nginx on the web droplet terminates TLS, limits requests per address
-  and keeps no access log; a small router sends each job to the least loaded member and each
-  status poll to the member that holds the job; the members listen on loopback behind SSH tunnels.
-  None of those can read a job or a reply — both are sealed to keys they do not hold (§6.3).
-  The operator's runbook is `deploy/prover/README.md`.
+  and keeps no access log; a small router passes each `/m/<member>` request to that member only
+  and limits job submissions per address across the pool; the members listen on loopback behind
+  SSH tunnels, sandboxed with no outbound network. None of those can read a job or a reply — both
+  are sealed to keys they do not hold (§6.3). The operator's runbook is `deploy/prover/README.md`.

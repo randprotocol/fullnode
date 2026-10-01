@@ -1334,7 +1334,30 @@ async fn main() -> Result<()> {
                     Some(text) => (PairingLink::parse(text.trim()).map_err(|e| anyhow!("{e}"))?, name),
                     None => {
                         debug_assert!(trusted, "clap requires a link unless --trusted");
-                        (prover::trusted_prover_link()?, name.or_else(|| Some("prover.randprotocol.org".into())))
+                        // The pool's members from a varying start: the first that answers with its
+                        // pinned key and has room in its queue is paired. A pairing is one member,
+                        // so a job is always sealed to the key of the member that proves it.
+                        let mut members = prover::trusted_provers()?;
+                        // A varying first member, so pairings spread over the pool (no secret
+                        // depends on it).
+                        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos() as usize).unwrap_or(0);
+                        let len = members.len();
+                        members.rotate_left(nanos % len);
+                        let mut chosen = None;
+                        for m in members {
+                            let p = PairedProver::from_link(&m.link, Some(format!("RandProtocol prover {}", m.name)));
+                            match RemoteProver::new(p).info().await {
+                                Ok(info) if info["queue"]["depth"].as_u64() < info["queue"]["max"].as_u64() || info["queue"]["max"].as_u64() == Some(0) => {
+                                    chosen = Some(m);
+                                    break;
+                                }
+                                Ok(_) => eprintln!("RandProtocol prover {} is busy; trying the next", m.name),
+                                Err(e) => eprintln!("RandProtocol prover {} did not answer ({e:#}); trying the next", m.name),
+                            }
+                        }
+                        let m = chosen.ok_or_else(|| anyhow!("every RandProtocol prover is busy or unreachable; try again in a minute, or pair your own"))?;
+                        let label = format!("RandProtocol prover {}", m.name);
+                        (m.link, name.or(Some(label)))
                     }
                 };
                 prover::check_prover_url(&link.url)?;
