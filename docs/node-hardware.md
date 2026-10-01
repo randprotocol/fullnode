@@ -209,15 +209,31 @@ An aggregator proves one rVM STARK over N bundle proofs and submits it for a sea
 needs only an RPC endpoint and a registered aggregator key. It runs only on a chain whose genesis
 carries an `aggregation` section; none does today.
 
-| aggregate | tier | measured | machine class |
-|---|---|---|---|
-| test profile, N=1 | 19 | proven: 1568.2 s wall on a loaded shared box, 327 035 bytes; about 30 GB peak | — |
-| production, N=1 | 21 | 1 968 758 rows; 48.6 GB oracle, not yet proven | ≥ 64 GB host (bound). Not measured yet |
-| production, N=2 | 22 | about 95.3 GB estimate | ≥ 128 GB host (bound). Not measured yet |
-| production, N=3 | 23 | about 127 GB estimate | ≥ 160 GB host plus an 80 GB GPU (bound). Not measured yet |
+Measured 2026-09-30/10-01 on a 64-vCPU, 503 GB droplet (constraint set 8, circuits `feat/issue-45`
+`d38d6cf`, peak RSS from `/usr/bin/time -v`; issue #45). Every peak is 4–8× what earlier docs
+derived from the trace sizes.
 
-Sources: `docs/aggregation.md` §6, `docs/zkvm-m4-m5-progress.md`,
-`docs/superpowers/specs/2026-09-15-block-aggregation.md`.
+| aggregate | tier | cpu rows | prove | verify | proof | peak RSS |
+|---|---|---|---|---|---|---|
+| test profile, N=1 | 19 | 462 262 | 2 034.6 s (the whole aggregate test binary) | — | 334 778 B | **94.5 GB** |
+| test profile, N=2 | 20 | 924 115 | 3 983.5 s | — | 355 577 B | **183.7 GB** |
+| test profile, N=3 | 21 | 1 385 968 | 4 807.8 s | 24.75 s | 347 800 B | **221.0 GB** |
+| production, N=1 | 21 | 2 047 542 | 8 131.3 s | 99.36 s | 1 563 226 B | **376.9 GB** |
+| production, N=2 | 22 | 4 094 675 (2.4 % under 2²²) | not attempted | | | ~750 GB estimated |
+| production, N=3 | 23 | 6 141 808 | not attempted | | | over 1 TB estimated |
+
+What it means for hardware:
+
+- **A production aggregator needs a ≥ 512 GB host** for N = 1, the smallest useful aggregate.
+  The earlier "≥ 64 GB" class came from a 48.6 GB oracle that the measurement disproved.
+- **N ≥ 2 at production does not fit any single CPU host** on offer, and the GPU backend does not
+  change that: the traces live in host memory. Aggregating more than one proof needs a design
+  change (smaller inner proofs, a different recursion layout, or trace streaming), tracked in
+  issue #119 with the remaining soundness item.
+- These runs proved single-threaded (the recursion crate is built without Plonky3's `parallel` feature), so the 64 vCPUs ran several proofs side by side; the walls above are single-core walls.
+
+Sources: `circuits/recursion/docs/02-aggregate.md` ("Constraint set 8, proved"), the #45 closing
+comment, `~/rand-agg-512-results/` on the operator's laptop (all 24 step logs).
 
 Setup, on a chain with an `aggregation` section (`docs/cli.md`, `docs/deploy.md`):
 

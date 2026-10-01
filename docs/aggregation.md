@@ -20,7 +20,7 @@ have.
 | role | hardware | admitted by | does | paid by |
 |---|---|---|---|---|
 | **proposer** (HotStuff leader) | CPU | stake (`docs/staking.md`, the S2 register) | orders transactions, verifies one aggregate proof per sealed block (~0.8 s cold, ~16 ms warm) | the verification share of fees, as today |
-| **aggregator** (prover) | GPU | permissionless, a registered payout address | proves one recursive STARK that verifies N bundle proofs; submits it for a sealing block | the proving share of fees **plus a block subsidy in newly minted RAND** |
+| **aggregator** (prover) | GPU; measured: ≥ 512 GB host memory for one production proof (§ "Before enabling aggregation", item 3) | permissionless, a registered payout address | proves one recursive STARK that verifies N bundle proofs; submits it for a sealing block | the proving share of fees **plus a block subsidy in newly minted RAND** |
 
 Validators stay CPU-cheap, so a home node can still validate. GPU capital competes in its own
 market and is never a requirement for consensus. The two roles may be the same operator, but
@@ -171,17 +171,21 @@ both have to clear before a genesis may switch it on.
    (a pinned test says so); the rVM *verifier* does, so a proof from an unfixed prover no longer
    verifies. What has **not** been done, and has to be before a genesis enables aggregation:
 
-   - **An end-to-end forged-aggregate exercise against the fixed verifier**: a malicious inner
-     proof and a search for the lane values that would satisfy the verifier's final checks, run
-     against the fixed rVM and shown refused. The report traced that path statically (its §6)
-     and its proof of concept showed the missing constraint, not a full forgery. It needs the
-     ≥ 64 GB class of machine the production aggregate proofs need; **not run.**
+   - **An end-to-end forged-aggregate exercise against the fixed verifier** — **run 2026-09-30
+     (issue #45, closed; circuits `feat/issue-45` `d38d6cf`) on a 503 GB machine.** A malicious
+     inner proof never reaches the prover, and a forged stored lane inside a real tier-19
+     aggregate's trace is refused both ways it was built. With the RVM-1 fix reverted (scratch
+     copy, never committed) the isolating vectors accept the forgery (`the forged run VERIFIED
+     … publishing [12648430, 11, 11, 22]`), so they have teeth; the aggregate-scale test is
+     stopped by RAM read-after-write instead, and a lane *chosen* to cancel a failing final
+     check (the report's §6 path) was **not** built — issue #119.
    - The report's §11, what its review did not cover — rechecked on 2026-09-28 by the zk scan's
      "not covered" pass, which found no soundness break in any of them:
      - the generated constraint evaluation (`programs/constraints.rs`) against Plonky3 0.7.0's
        verifier folder, term by term (fold order, selectors, quotient recomposition, LogUp
-       terminals, `X² = 7`): no mismatch. Still missing: a Production-profile differential and a
-       test that breaks a single AIR constraint on a non-first instance;
+       terminals, `X² = 7`): no mismatch. The Production-profile differential (all 9 instances)
+       and a test that breaks a single AIR constraint on a non-first instance now exist and pass
+       (#45);
      - the `rv32n` absorb schedule (`[vk ‖ N ‖ B ‖ 34·N]` at the time of this review, `35·N` since
        constraint set 8 — the same schedule, re-checked at the new width by circuits `18c2627`'s
        fix for the sponge's block-boundary bug, `docs/confidential.md`'s "Constraint set 8"), the
@@ -196,6 +200,13 @@ both have to clear before a genesis may switch it on.
        every real row once the reduce clock is carried).
    - Deferred from the zk scan (ZKQ-6): a DSL-side check that a loop body never reads a
      register before writing it.
+3. **The hardware (measured 2026-09-30, #45).** A production aggregate of one bundle proof
+   (tier 21) peaked at **376.9 GB** and took 8 131 s; N = 2 (tier 22, 2.4 % row headroom) is
+   estimated at ~750 GB and N = 3 at over 1 TB — beyond any single CPU host, with or without the
+   GPU backend (host-resident traces). An aggregator therefore needs ≥ 512 GB for N = 1, and
+   N ≥ 2 needs a design change first (#119). Production N = 2 and N = 3 emulation (no proving)
+   is within the memory and timestamp bounds (`2^27`), and register pressure does not grow with N.
+   The full table is `docs/node-hardware.md` §4.
 
 ## 4. Fallback
 
@@ -234,7 +245,7 @@ filled at activation.
 | seal → pruned | sealed at block 46; the pass at head 64 rewrote the record (every 16 blocks, gated at `sealed_at + window`) | capstone |
 | sealed resync, a fresh joiner | **1 rVM verification per sealed window** (the covering aggregate's; a raw sync re-verifies each bundle); the 7-block sealed batch applied in under a second | capstone's verification counter |
 | the capstone end to end | **1873.2 s** (register 97 s → prove 1568 s → seal → prune → resync) | `tests/cluster.rs` |
-| rVM aggregate proof size, test profile | 325–327 KB measured here (the circuits M5.3 record is 328 121 bytes; production est. ~0.5–0.6 MB, far under the 2 MiB cap) | `circuits/recursion/docs/02-aggregate.md` |
+| rVM aggregate proof size, test profile | 325–327 KB measured here (the circuits M5.3 record is 328 121 bytes; production measured 2026-09-30 at **1 563 226 bytes** for N=1 under constraint set 8 — under the 2 MiB default cap, not the ~0.5–0.6 MB first estimated) | `circuits/recursion/docs/02-aggregate.md` |
 | the interface conformance vectors | `inner_vk_digest` `33a94ec6…92a1c8`, the 115-word bound list (AGG-2; the stand-in binding of `circuits/recursion/docs/02-aggregate.md`), digest `9833ac5b…fdc868e` — reproduced byte-for-byte by the fullnode's recompute | the conformance suite (`agg_executor.rs`) |
 
 ### The one capstone walk-through
