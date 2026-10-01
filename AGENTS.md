@@ -182,7 +182,38 @@ push to origin/main often"): five current validators become delegated provers be
   merges; it holds PRIVACY.md and the store texts), the trusted prover stacked as
   `feat/trusted-prover` for a client 0.6.7.
 
-### Chain 20 — PLANNED (not cut; scripts on `feat/chain20-cut`, 2026-10-01; nothing run against the fleet)
+### Chain 20 — LIVE 2026-10-01 06:17 UTC (genesis `6210cf07…5135`, build v0.6.8 `c9c9bd3c`; RPL-2, the zUSD bridge fees, every audit-v6 genesis field)
+
+Cut from a snapshot of chain 19 at height 7258 (bridge stopped first by bridge-fa), rolled
+all-stop/all-start by `deploy/cutover-fleet-chain20.sh` (preflight → stage 05:57 → stop 06:14:41 at
+chain-19 height 7700 → push 06:14:59 → switch 06:15:26 → start 06:15:40 (C, D) / 06:15:52 →
+26/26 healthy 06:32:03, committing at 809). Genesis
+`6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135`, chain id **20**, file
+`deploy/genesis-chain20.json` (sha256 `0020247a…3a21`), cut record
+`deploy/cut-records/chain20.record` (the second rebuild waived: one operator). `check-limits`
+against node A read all 22 values as cut. **v0.6.8** = tag `c9c9bd3c` (main `01389adb` + ZKV-4,
+which stayed private until the fleet ran it; on main as `efbdffde`), GitHub release with the
+E-built Linux `rand-node` `6b41af29…fc78`, `rand` `155dfe66…ee2d`, `rand-prover` `5fd62f59…0f7b`.
+Carried: 5 184.243719258 RAND to seven operator wallets, 99 zUSD (anish 10, the user's wallet
+89DS-4Q4X-HXSX-MBYW 89); dropped ≈ 519.90 RAND held by wallets the operator does not hold, and
+0.499 RAND of unwithdrawn validator fees. Bridge fees 10/10 bps to the user's wallet (the
+endpoints' USDT skim set to 0 by bridge-fa at the switch).
+- **Traps from the cut:** (1) the private build was staged over a temporary `python3 -m
+  http.server` on E behind a one-off `ufw allow` (index.html against the directory listing,
+  removed after); `stage` refuses `http://` without `STAGE_ALLOW_HTTP=1`. (2) syd1 came up
+  `disk_low` (3.9 GB free) and held the `wait` at 25/26 — chains 14–17's data dirs were still on
+  it; deleted by name (keep chain 19's for rollback, chain 18's until a day has passed), 22 GB
+  free. `deploy/retire-chain-dirs.sh` deletes every non-current dir, the rollback target
+  included, and refuses on a `disk_low` node. (3) The balances scan timed out through the
+  Frankfurt archive tunnel; node A's tunnel (sgp1, full chain-19 history) worked. (4) No v0.6.7
+  `rand` was on the laptop for the scan — built from the tag. (5) Sourcing a bash library into
+  this laptop's zsh breaks its word-splitting (`require_cut_record` saw every field empty): run it
+  under `bash -c`.
+- **Clients:** the apps, randscan and the website WASM vendor v0.6.6/v0.6.7 — they cannot send on
+  chain 20 (`binding_domain: 1`) until re-vendored to v0.6.8; fee notes have no envelope, so only a
+  wallet with the v0.6.8 public rebuild sees them.
+
+The plan, as written before the cut:
 
 Cut **from a snapshot of chain 19** (`a3defc93…228a`, file sha256 `92e46bc0…46e0`) the way chain 19
 was cut from chain 18 — the same 26 validators and keys, the zUSD carry, operator RAND from a

@@ -3142,6 +3142,25 @@ mod tests {
         node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 19");
     }
 
+    /// Chain 20, live 2026-10-01 06:17 UTC on v0.6.8: chain 19's shape plus every audit-v6 genesis
+    /// field at its recommended value, RPL-2's `program_state` and the zUSD bridge fees.
+    #[test]
+    fn chain_20s_genesis_file_builds_chain_20() {
+        let chain_20_hash = "6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135";
+        let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain20.json");
+        let gen = Genesis::from_json(&std::fs::read_to_string(committed).unwrap()).unwrap();
+        assert_eq!(gen.chain_id, 20);
+        assert_eq!(gen.testnet, Some(true));
+        assert_eq!(gen.binding_domain, Some(1));
+        assert_eq!(gen.proof_window_blocks, Some(1024));
+        let fees = gen.bridge.as_ref().and_then(|b| b.fees.as_ref()).expect("the zUSD bridge fees");
+        assert_eq!((fees.mint_bps, fees.burn_bps), (10, 10));
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        assert_eq!(state.hash().to_hex(), chain_20_hash, "chain 20's live genesis");
+        node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 20");
+    }
+
     /// This build is constraint set 8 (the gas meter, chain 18): every verifier key moved again, so
     /// no proof chain 16 (constraint set 7, v0.6.1) committed verifies here. Chain 16 pins the v2
     /// guest, which this build still carries, so the `hc_bundle` check alone would let this binary

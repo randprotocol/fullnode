@@ -10,6 +10,28 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 `git tag` and the GitHub release list (audit v6, DOC-6). There is no tag v0.5.2, v0.5.3 or v0.6.5.
 "Assets" says what the GitHub release carries, as read on 2026-09-30.
 
+## v0.6.8 — 2026-10-01 (chain 20)
+
+Tag `c9c9bd3c`. Hard fork for chain 20 (genesis `6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135`), rolled all-stop/all-start with
+the cut; it computes and runs chain 19's genesis too, but its consensus changes must never roll
+node by node. Two lines of work:
+
+- **The zUSD bridge fees** — genesis `bridge.fees`: 10 bps of each mint and each burn kept on Rand as a treasury zUSD note, the release attesting `amount − fee`.
+- **RPL-2** — program state, program vaults and the `Invoke` action (`Action` 33), behind a
+  `program_state` genesis section (`docs/program-state.md`).
+- **The final audit v6 fixes** (issues #67–#118, one commit each): consensus — CON-4 (no
+  automatic lock release; `rand-node safety release-lock`) and CH-1 (a timeout-certificate
+  pacemaker); node-only hardening (a second `--public-rpc` listener, read timeouts, reserved
+  validator peers, sync and gossip budgets, the pool's byte cap, a startup refusal when the
+  reloaded state is not the head's, wallet key-file permissions, and more); and genesis-gated
+  rules, dormant on any chain whose genesis does not set them: `testnet`, `binding_domain`
+  (proofs and signed messages bound to the genesis hash), `proof_window_blocks`, the gas price
+  ceilings and paying byte load, staking admission by vote and slashing, vesting revokes by a
+  threshold to a fixed treasury, and bridge rotations that need possession and wait out a delay.
+  Wallets need this build to send on a chain with `binding_domain`.
+
+Assets: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`.
+
 ## v0.6.7 — 2026-09-29 (chain 18)
 
 Tag `86941a1`. Node-only: fixes on the chain-18 build that change no consensus rule, wire format,

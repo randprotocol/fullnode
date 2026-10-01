@@ -4336,6 +4336,12 @@ mod tests {
             };
             seen += 1;
             assert!(g.validate().is_ok(), "{name}: {:?}", g.validate().err());
+            // A chain cut on a build with the marker (chain 20 on) says it; every grandfathered
+            // chain was cut before it existed and does not.
+            if g.testnet == Some(true) {
+                assert!(!FAUCET_BESIDE_BRIDGE_CHAIN_IDS.contains(&g.chain_id), "{name}: a grandfathered id needs no marker");
+                continue;
+            }
             assert_eq!(g.testnet, None, "{name}: cut before the marker existed");
             if g.faucet && g.bridge.is_some() {
                 both.push(g.chain_id);

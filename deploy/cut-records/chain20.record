@@ -15,3 +15,4 @@ second-operator: none — one operator holds every validator key and every host;
 second-hash:
 
 rollback: every host keeps chain 19's data dir (-a3defc93…) and the v0.6.7 binaries as /root/rand-node.pre-c20 and /root/rand.pre-c20 (sha-checked) for at least a day; `deploy/cutover-fleet-chain20.sh stop` then `rollback` restores the units/drop-ins and binaries and licenses one `start`; the bridge session restores the endpoints' 10 bps protocol fee and switches the daemons back to chain 19 (deploy/chain20-bridge-steps.md, rollback).
+second-rebuild-waived: 2026-10-01T06:14:59Z genesis 6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135 by dendisuhubdy@Dendis-MacBook-Pro: one operator holds every validator key and every host; no second operator exists to rebuild the genesis for this cut
