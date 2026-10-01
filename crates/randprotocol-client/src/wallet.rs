@@ -949,11 +949,16 @@ async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -
             if header["tx_count"].as_u64().unwrap_or(0) == 0 {
                 continue;
             }
-            // A pruning pass can raise the floor between the header page and this read.
+            // A pruning pass can raise the floor between the header page and this read. The page
+            // restarts at the floor and the cursor will pass every block below it, so what the
+            // page already read is kept now, not dropped with it (audit v7, CLI-18).
             let block = match rpc.block_by_height(height).await {
                 Ok(block) => block,
                 Err(e) => {
                     from = past_the_floor(e, height, &mut pruned)?;
+                    for note in found.drain(..) {
+                        store.pending_public_notes.insert(word8_to_hex(&note.commitment()), PendingNote { note });
+                    }
                     continue 'pages;
                 }
             };
@@ -5334,6 +5339,12 @@ mod tests {
         /// `rand_getLimits`' `proof_window_blocks` (issue #118): `None`, served as null, unless a
         /// test runs a wider window.
         proof_window_blocks: Option<u64>,
+        /// `Some((n, floor))`: the `n`-th `rand_getBlockByHeight` this node is asked (counting from
+        /// 1, refused reads included) finds a pruning pass has just raised the floor to `floor` —
+        /// a floor rising between a header page and a block read (CLI-18).
+        raise_floor_at_read: Option<(usize, u64)>,
+        /// How many `rand_getBlockByHeight` calls this node has been asked, refused ones included.
+        block_asks: usize,
     }
 
     /// The node's `rpc::public_rebuild_copy` (audit v7, RPC-5), mirrored for this fake: the
@@ -5398,6 +5409,8 @@ mod tests {
                 hc_auth: None,
                 binding_domain: 1,
                 proof_window_blocks: None,
+                raise_floor_at_read: None,
+                block_asks: 0,
             }
         }
 
@@ -5436,6 +5449,12 @@ mod tests {
             }
             let n = |i: usize| p[i].as_u64().unwrap_or(0);
             let head = self.head();
+            if method == "rand_getBlockByHeight" {
+                self.block_asks += 1;
+                if let Some((_, floor)) = self.raise_floor_at_read.filter(|(at, _)| *at == self.block_asks) {
+                    self.floor = floor;
+                }
+            }
             // The real node's check: `rand_getBlocks` refuses the whole range when its first
             // non-genesis height is pruned; `rand_getBlockByHeight` refuses a pruned height.
             let first = match method {
@@ -6252,6 +6271,37 @@ mod tests {
         assert_eq!(store.notes.len(), notes.len() + 1, "every note placed");
         assert!(store.pending_public_notes.is_empty());
         assert!(store.tree.path(0).is_some(), "with its witness");
+    }
+
+    /// CLI-18 (audit v7): on a node whose headers do not carry the public notes, a pruning pass
+    /// that raises the floor between the header page and a block read restarts the page at the
+    /// floor. The notes the page had already read, from blocks below the new floor, were dropped
+    /// with it while the cursor passed them; they are kept now.
+    #[tokio::test]
+    async fn a_floor_rising_mid_page_keeps_the_notes_the_page_already_read() {
+        let me = Wallet::from_spend_key(SpendKey([64; 8]));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        let (txs, notes) = public_notes_for(&me);
+        {
+            let mut c = chain.lock().unwrap();
+            // Blocks 1, 2, 3: a deposit, a mint, a registration's initial mint, garbage envelopes.
+            for (tx, note) in txs.into_iter().zip(notes.iter()) {
+                c.commit(vec![tx], vec![(note.commitment(), garbage())]);
+            }
+            c.fund(&me, 5, 0); // block 4
+            // The third block read finds the floor raised past block 3.
+            c.raise_floor_at_read = Some((3, 4));
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        scan(&rpc, &me, &mut store).await.expect("a floor is not a failed scan");
+        assert_eq!(
+            store.asset_balances(),
+            vec![(0, 5), (3, 1_000), (5, 250)],
+            "the deposit and the mint the page read before the floor rose are kept"
+        );
+        assert_eq!(store.scanned_attest_height, chain.lock().unwrap().head() + 1);
+        assert!(store.pending_public_notes.is_empty());
     }
 
     /// A store scanned against one chain is a cache of that chain alone. Carried to a node on
