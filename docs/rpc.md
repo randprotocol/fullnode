@@ -74,7 +74,8 @@ on loopback*: behind one, every visitor is the operator.
 - at most half of the node's blocking-read slots, so the operator's listener is never starved.
 
 Both listeners share the read limits: a range read is answered `-32000` "busy" after 30 s, and
-`rand_getBlocks` ends its page once it has read 64 MiB of blocks (a short page, as at the head).
+`rand_getBlocks` ends its page once it has read 64 MiB of blocks, or before the header that would
+take its reply past 16 MiB (a short page, as at the head).
 
 `--rpc-viewing-token-file <PATH>` puts a bearer token on the viewing-key methods of the
 operator's listener: the first line of the file (32+ characters), sent as
@@ -1296,6 +1297,21 @@ the transactions. A range wider than the cap, or past the head, is truncated, no
 client advances from the last height it got back, which is also what makes a 1024-header ask
 correct against an older node's 128.
 
+A page is also bounded in bytes, and ends early — never before its first header, so a walk always
+advances: after the block that takes what it has *read* past 64 MiB (`MAX_RANGE_READ_BYTES`), and
+before the header that would take its serialised *reply* past 16 MiB (`MAX_HEADER_REPLY_BYTES`, a
+quarter of the command-line wallet's 64 MiB reply cap; audit v7, RPC-5).
+
+Each header carries `public_notes`: the block's transactions that append a note whose every word
+is public — `bridge_attest`, `token_mint`, `register_token`, `invoke`, and `bridge_burn` on a chain
+with `bridge.fees` — as `{ "hash", "raw", "proofs_stripped": true }`. `raw` is the transaction's
+wire encoding in hex **with what a note's rebuild never reads emptied**: the bundle's `proof` and
+`auth_proof`, an invoke's call proof, and a deposit's `pq_signatures`. The attestation (its body
+and ECDSA signatures), every action field, the bundle's public fields and the envelopes are
+kept. The copy hashes differently from the committed transaction; `hash` is the real id, which a
+burn's fee note is blinded over. For the committed bytes, ask `rand_getRawTransaction` by that
+hash. A client that meets a reply too large to read from an older node asks for a shorter range.
+
 Errors: `-32602` for `to_height` below `from_height`.
 
 On a node started with `--prune-history`, a range that reaches a height below the floor (genesis
@@ -1621,6 +1637,21 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-10-01 — audit v7, RPC-5: `rand_getBlocks` pages bounded by their reply; every public note stripped (node-only)
+
+A header page ends before the header that would take its serialised reply past 16 MiB
+(`MAX_HEADER_REPLY_BYTES`), as well as after 64 MiB of blocks read; never before its first header.
+And every entry in `public_notes` is now carried stripped and marked `"proofs_stripped": true` —
+`bridge_attest`, `token_mint` and `register_token` included, which came whole before: the bundle's
+`proof` and `auth_proof` emptied, and a deposit's `pq_signatures`; every field a note is rebuilt
+from, the attestation and the envelopes stay. `hash` is the real id, as for burns and invokes. A
+deposit carried whole was ~2.9 MB of proofs doubled by hex, so about a dozen in one page made a
+reply past the command-line wallet's 64 MiB cap, which it refused — and asked for again, for ever:
+a fresh wallet's first sync stopped for good. The wallet also halves its page when a node (one
+without this change) answers one too large, down to a single height. Additive for a reader of
+the JSON; a client that needs the committed bytes of a carried transaction reads
+`rand_getRawTransaction` by its `hash`.
 
 ### 2026-10-01 — headers carry `invoke` transactions in `public_notes` (node-only, after v0.6.8)
 

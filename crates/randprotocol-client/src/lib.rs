@@ -398,10 +398,30 @@ pub struct TxReceipt {
 /// `rand_getBlocks` page — so this leaves them an order of magnitude and more.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
+/// A reply [`read_capped`] refused for passing its cap — typed, so a caller that can ask for
+/// less (the wallet's header walk, audit v7 RPC-5) tells it from any other failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplyTooLarge {
+    pub limit: usize,
+}
+
+impl std::fmt::Display for ReplyTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the reply is larger than {} MiB; refusing it", self.limit / (1024 * 1024))
+    }
+}
+
+impl std::error::Error for ReplyTooLarge {}
+
+/// Whether `e` is a reply refused for its size ([`ReplyTooLarge`]), under any context.
+pub fn reply_too_large(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ReplyTooLarge>().is_some()
+}
+
 /// Read `resp`'s body, refusing it once it passes `limit` bytes — up front on a declared
 /// `Content-Length`, otherwise chunk by chunk as it arrives.
 pub(crate) async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
-    let too_big = || anyhow!("the reply is larger than {} MiB; refusing it", limit / (1024 * 1024));
+    let too_big = || anyhow::Error::new(ReplyTooLarge { limit });
     if resp.content_length().is_some_and(|n| n > limit as u64) {
         return Err(too_big());
     }
@@ -911,8 +931,10 @@ impl RpcClient {
         self.call("rand_getBlockByHash", json!([h.to_hex()])).await
     }
     /// `rand_getBlocks`: the headers of `from..=to`, oldest first — each with its `height` and
-    /// `tx_count`. The node caps one reply (at 128 headers today) and at its head, so a caller
-    /// advances from the last height it got back rather than from `to`.
+    /// `tx_count`. The node caps one reply (1,024 headers, a byte budget since audit v7 RPC-5)
+    /// and at its head, so a caller advances from the last height it got back rather than from
+    /// `to`. A node without the byte budget can answer a page past this client's reply cap: that
+    /// is a [`ReplyTooLarge`] error, and the caller asks for a shorter range.
     pub async fn blocks(&self, from: u64, to: u64) -> Result<Vec<Value>> {
         let v = self.call("rand_getBlocks", json!([from, to])).await?;
         Ok(v.as_array().context("getBlocks did not return a list")?.clone())
@@ -1114,6 +1136,9 @@ pub(crate) mod test_rpc {
         Drop,
         /// Answer `200 OK` with this body, which is not JSON-RPC (a proxy's error page).
         Malformed(&'static str),
+        /// Announce a body past the client's 64 MiB reply cap (`content-length` alone, no body
+        /// sent), as a node without a reply budget answers an oversized page (audit v7, RPC-5).
+        TooLarge,
     }
 
     pub async fn scripted_rpc(script: Vec<(&'static str, Reply)>) -> String {
@@ -1124,6 +1149,7 @@ pub(crate) mod test_rpc {
             Some((_, Reply::ErrData(code, msg, data))) => Reply::ErrData(*code, msg.clone(), data.clone()),
             Some((_, Reply::Drop)) => Reply::Drop,
             Some((_, Reply::Malformed(body))) => Reply::Malformed(body),
+            Some((_, Reply::TooLarge)) => Reply::TooLarge,
             None => Reply::Err(-32601, "unknown method"),
         })
         .await
@@ -1174,6 +1200,15 @@ pub(crate) mod test_rpc {
                     let method = req["method"].as_str().unwrap_or_default().to_string();
                     let body = match answer(&method, &req["params"]) {
                         Reply::Drop => return,
+                        Reply::TooLarge => {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                                super::MAX_RESPONSE_BYTES + 1
+                            );
+                            let _ = sock.write_all(head.as_bytes()).await;
+                            let _ = sock.flush().await;
+                            return;
+                        }
                         Reply::Malformed(body) => body.to_string(),
                         Reply::Ok(v) => json!({ "jsonrpc": "2.0", "id": 1, "result": v }).to_string(),
                         Reply::Err(code, msg) => {

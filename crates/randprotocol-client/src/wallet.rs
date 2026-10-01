@@ -887,6 +887,10 @@ pub fn rebuilt_notes_with(w: &Wallet, tx: &Transaction, tx_hash: Option<&Hash>, 
 /// that is the first page it asks for. The walk resumes at the floor, and the scan warns once
 /// ([`warn_pruned`]): what lies below it cannot be read from this node, and the cursor still
 /// passes it, because asking again would only be refused again.
+///
+/// A page answered past this client's reply cap ([`crate::ReplyTooLarge`], a node without the
+/// audit v7 RPC-5 reply budget) is asked again at half the range, down to one height, rather
+/// than asked again whole — which would be refused again, for ever.
 async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<BTreeMap<Word8, Note>> {
     let head = rpc.head().await?["height"].as_u64().context("getHead did not return a height")?;
     // v0.6.8: the chain's `bridge.fees`, once per walk — what values this wallet's deposits and,
@@ -900,14 +904,27 @@ async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -
     let mut from = store.scanned_attest_height;
     // The highest floor a refusal named, if any page was refused.
     let mut pruned: Option<u64> = None;
+    // How many heights the next page asks for. A node without a reply budget (before audit v7,
+    // RPC-5) can answer a page past this client's reply cap — a dozen bridge deposits carried
+    // whole did — and asking for the same page again only gets the same refusal, for ever: the
+    // range is halved instead, down to one height, and grows back after each page that fits.
+    let mut span = BLOCK_PAGE;
     'pages: while from <= head {
-        let headers = match rpc.blocks(from, head.min(from.saturating_add(BLOCK_PAGE - 1))).await {
+        let headers = match rpc.blocks(from, head.min(from.saturating_add(span - 1))).await {
             Ok(headers) => headers,
+            Err(e) if crate::reply_too_large(&e) && span > 1 => {
+                span /= 2;
+                continue;
+            }
+            Err(e) if crate::reply_too_large(&e) => {
+                return Err(e.context(format!("the header of block {from} alone is larger than this wallet reads")));
+            }
             Err(e) => {
                 from = past_the_floor(e, from, &mut pruned)?;
                 continue;
             }
         };
+        span = span.saturating_mul(2).min(BLOCK_PAGE);
         let Some(last) = headers.iter().filter_map(|h| h["height"].as_u64()).max() else {
             return Err(anyhow!("getBlocks returned no header from height {from} though the head is {head}"));
         };
@@ -5291,6 +5308,16 @@ mod tests {
         headers_carry_public_notes: bool,
         /// How many `rand_getBlockByHeight` calls this node has answered (issue #117).
         block_reads: usize,
+        /// Whether the carried public-note transactions come stripped, as a node since audit v7
+        /// (RPC-5) carries them ([`public_rebuild_copy`]): proofs and co-signatures emptied,
+        /// `proofs_stripped`, the real `hash` beside the copy.
+        strip_public_notes: bool,
+        /// The most heights a `rand_getBlocks` page may span before this fake answers it too large
+        /// for the client to read, as a node without a reply budget did with a page of whole
+        /// deposits (audit v7, RPC-5). `None`: every page fits.
+        max_header_page: Option<u64>,
+        /// The span of every `rand_getBlocks` range this node was asked for, in order.
+        header_pages: Vec<u64>,
         /// `rand_getLimits`' `envelope_bytes` (task 7): `None` — this fake's default — is a chain
         /// that predates the field, same as a genuinely absent one; `Some(MEMO_ENVELOPE_BYTES)`
         /// is the memo format.
@@ -5307,6 +5334,23 @@ mod tests {
         /// `rand_getLimits`' `proof_window_blocks` (issue #118): `None`, served as null, unless a
         /// test runs a wider window.
         proof_window_blocks: Option<u64>,
+    }
+
+    /// The node's `rpc::public_rebuild_copy` (audit v7, RPC-5), mirrored for this fake: the
+    /// transaction with its bundle proof, auth proof, call proof and a deposit's co-signatures
+    /// emptied — what a header carries since then.
+    fn public_rebuild_copy(t: &Transaction) -> Transaction {
+        let mut s = t.clone();
+        if let Some(b) = s.bundle.as_mut() {
+            b.proof = Vec::new();
+            b.auth_proof = Vec::new();
+        }
+        match &mut s.action {
+            Action::Invoke { proof, .. } => *proof = Vec::new(),
+            Action::BridgeAttest { pq_signatures, .. } => *pq_signatures = Vec::new(),
+            _ => {}
+        }
+        s
     }
 
     fn kind(a: &Action) -> &'static str {
@@ -5346,6 +5390,9 @@ mod tests {
                 witness_calls: 0,
                 headers_carry_public_notes: false,
                 block_reads: 0,
+                strip_public_notes: false,
+                max_header_page: None,
+                header_pages: Vec::new(),
                 envelope_bytes: None,
                 hc_bundle: ZkExecutor::hc_bundle(),
                 hc_auth: None,
@@ -5404,6 +5451,13 @@ mod tests {
                     json!({ "floor": floor }),
                 );
             }
+            if method == "rand_getBlocks" {
+                let span = (n(1).min(head).min(n(0) + 127) + 1).saturating_sub(n(0));
+                self.header_pages.push(span);
+                if self.max_header_page.is_some_and(|max| span > max) {
+                    return Reply::TooLarge;
+                }
+            }
             Reply::Ok(match method {
                 "rand_getHead" => json!({ "height": head }),
                 "rand_getGenesisHash" => json!(self.genesis.to_hex()),
@@ -5414,7 +5468,13 @@ mod tests {
                             header["public_notes"] = json!(self.blocks[h as usize]
                                 .iter()
                                 .filter(|t| kind(&t.action) != "other" && kind(&t.action) != "none")
-                                .map(|t| json!({ "hash": t.hash().to_hex(), "raw": hex::encode(t.encode()) }))
+                                .map(|t| match self.strip_public_notes {
+                                    true => json!({
+                                        "hash": t.hash().to_hex(), "raw": hex::encode(public_rebuild_copy(t).encode()),
+                                        "proofs_stripped": true,
+                                    }),
+                                    false => json!({ "hash": t.hash().to_hex(), "raw": hex::encode(t.encode()) }),
+                                })
                                 .collect::<Vec<_>>());
                         }
                         header
@@ -6061,6 +6121,95 @@ mod tests {
             }
             assert!(store.pending_public_notes.is_empty(), "nothing left pending after a finished scan");
         }
+    }
+
+    /// [`public_notes_for`]'s transactions as a chain would carry them: real-sized proofs on every
+    /// bundle and a deposit co-signed by eight guardians.
+    fn proved_public_notes_for(me: &Wallet) -> (Vec<Transaction>, Vec<Note>) {
+        let (mut txs, notes) = public_notes_for(me);
+        for t in &mut txs {
+            let b = t.bundle.as_mut().unwrap();
+            b.proof = vec![7; 1 << 16];
+            b.auth_proof = vec![8; 1 << 16];
+            if let Action::BridgeAttest { pq_signatures, .. } = &mut t.action {
+                pq_signatures.extend((0..8).map(|i| randprotocol_core::bridge::PqSignature { index: i, signature: vec![9; 2420] }));
+            }
+        }
+        (txs, notes)
+    }
+
+    /// Audit v7, RPC-5: a header carries a deposit, a mint and a registration stripped of their
+    /// proofs and co-signatures; each note rebuilt from the stripped copy is word for word the
+    /// one rebuilt from the whole transaction — the commitment the chain appended — for the
+    /// recipient, and for the treasury its deposit fee note.
+    #[test]
+    fn every_public_note_rebuilds_from_a_stripped_copy() {
+        let me = Wallet::from_spend_key(SpendKey([61; 8]));
+        let (txs, notes) = proved_public_notes_for(&me);
+        for (tx, note) in txs.iter().zip(&notes) {
+            let copy = public_rebuild_copy(tx);
+            assert!(copy.encoded_len() < tx.encoded_len() / 4, "the copy sheds the proofs");
+            assert_ne!(copy.hash(), tx.hash(), "a stripped copy hashes differently");
+            let rebuilt = rebuilt_notes_with(&me, &copy, Some(&tx.hash()), None);
+            assert_eq!(rebuilt, rebuilt_notes(&me, tx));
+            assert_eq!(rebuilt.iter().map(Note::commitment).collect::<Vec<_>>(), vec![note.commitment()], "the leaf the chain appended");
+        }
+        // The treasury's deposit fee note: its blinding is over the attestation's `mu`, which the
+        // copy keeps whole.
+        let treasury = Wallet::from_spend_key(SpendKey([62; 8]));
+        let state = serde_json::json!({
+            "enabled": true,
+            "fees": { "mint_bps": 10, "burn_bps": 10, "recipient": treasury.address.to_string() },
+            "assets": [{ "index": 3, "chain": TOKEN_CHAIN, "token": hex::encode(TOKEN), "decimals": 6, "locked": "0" }],
+        });
+        let ctx = BridgeFeeCtx::from_bridge_state(&state).unwrap();
+        // 1 USDT, so the fee does not round to nothing.
+        let mut deposit = txs[0].clone();
+        let Action::BridgeAttest { attestation, r, .. } = &mut deposit.action else { unreachable!() };
+        *attestation = transfer_attestation(100_000_000, me.address.recipient_hash());
+        *r = bridge_notes::deposit_r(attestation).unwrap();
+        let whole = rebuilt_notes_with(&treasury, &deposit, None, Some(&ctx));
+        assert_eq!(whole.len(), 1, "the deposit's fee note");
+        assert_eq!(rebuilt_notes_with(&treasury, &public_rebuild_copy(&deposit), Some(&deposit.hash()), Some(&ctx)), whole);
+        assert_eq!(rebuilt_notes_with(&me, &public_rebuild_copy(&deposit), Some(&deposit.hash()), Some(&ctx)), rebuilt_notes_with(&me, &deposit, None, Some(&ctx)));
+    }
+
+    /// Audit v7, RPC-5: a node without a reply budget answers a page past this wallet's reply cap.
+    /// Asking again for the same page was refused the same way for ever, so a first sync stopped
+    /// for good; the walk now halves the range until a page fits, and every public note is
+    /// placed. A header too large alone is an error, not a loop.
+    #[tokio::test]
+    async fn the_block_walk_halves_a_page_the_node_answers_too_large() {
+        let me = Wallet::from_spend_key(SpendKey([63; 8]));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        let (txs, notes) = proved_public_notes_for(&me);
+        {
+            let mut c = chain.lock().unwrap();
+            c.headers_carry_public_notes = true;
+            c.strip_public_notes = true;
+            c.max_header_page = Some(3);
+            for (tx, note) in txs.into_iter().zip(notes.iter()) {
+                c.commit(vec![tx], vec![(note.commitment(), garbage())]);
+            }
+            for _ in 0..6 {
+                c.commit(Vec::new(), Vec::new());
+            }
+            c.fund(&me, 5, 0);
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(store.notes.len(), notes.len() + 1, "every public note is placed");
+        assert!(store.pending_public_notes.is_empty());
+        let pages = chain.lock().unwrap().header_pages.clone();
+        assert!(pages.iter().filter(|s| **s <= 3).count() >= 4, "the walk went on in pages that fit: {pages:?}");
+        assert!(pages.iter().filter(|s| **s > 3).count() < 20, "a refusal is never asked again as it was: {pages:?}");
+
+        // Nothing fits: the walk halves down to one height, and then says so.
+        chain.lock().unwrap().max_header_page = Some(0);
+        let e = scan(&rpc, &me, &mut NoteStore::default()).await.unwrap_err();
+        assert!(format!("{e:#}").contains("alone is larger than this wallet reads"), "{e:#}");
+        assert!(crate::reply_too_large(&e));
     }
 
     /// Issue #117: a first sync stopped part-way — here the leaf page after the block walk fails

@@ -133,6 +133,16 @@ const RPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 /// ends one), and the walk resumes from the last header it got.
 pub const MAX_RANGE_READ_BYTES: usize = 64 << 20;
 
+/// The most serialised JSON one `rand_getBlocks` page may come to before it ends (audit v7,
+/// RPC-5, issue #121). [`MAX_RANGE_READ_BYTES`] bounds what a page *reads*, not what it
+/// *answers*: since headers carry `public_notes`, a page of bridge deposits — each carried whole,
+/// its ~2.9 MB of proofs doubled by hex — passed the command-line wallet's 64 MiB reply cap at
+/// about a dozen, and the wallet asked for the same page every time. A quarter of that cap,
+/// so a reply plus its JSON-RPC framing stays far below every client this repository ships, and
+/// a page of ordinary headers (~150 bytes each, 1,024 of them) is nowhere near it. The page ends
+/// before the header that would cross it, never before its first, so a walk always advances.
+pub const MAX_HEADER_REPLY_BYTES: usize = 16 << 20;
+
 /// The slot, or slots, one RPC read holds until its blocking task has returned: one of the
 /// process-wide sixteen, and for a caller on the public listener one of that listener's eight.
 struct BlockingSlot {
@@ -1091,21 +1101,57 @@ async fn dispatch_one(st: &RpcState, v: Value) -> Value {
 /// The headers of `from..=to`, bounded in bytes as well as in count (audit v6, RPC-3): a header
 /// costs a read of its whole block. The page ends after the block that crosses `max_read_bytes`,
 /// so it always carries at least one header and a caller's walk always advances.
-fn block_headers_page(storage: &Storage, from: u64, to: u64, max_read_bytes: usize) -> crate::storage::Result<Vec<Value>> {
+///
+/// It is bounded in what it answers too (audit v7, RPC-5): it ends before the header whose
+/// serialised JSON would take the reply past `max_reply_bytes` — again never before the first.
+fn block_headers_page(
+    storage: &Storage,
+    from: u64,
+    to: u64,
+    max_read_bytes: usize,
+    max_reply_bytes: usize,
+) -> crate::storage::Result<Vec<Value>> {
     let mut out = Vec::new();
     let mut read = 0usize;
+    // `[` and `]`, then each header and the comma before every one but the first.
+    let mut reply = 2usize;
     let fees = storage.bridge_fees()?;
     for h in from..=to {
         if let Some(b) = storage.block_by_height(h)? {
             read = read.saturating_add(b.transactions.iter().map(|t| t.encoded_len()).sum::<usize>());
             let sealed = storage.block_sealed(&b.hash())?;
-            out.push(header_json(&b, sealed, fees.as_ref()));
+            let header = header_json(&b, sealed, fees.as_ref());
+            let size = json_len(&header) + usize::from(!out.is_empty());
+            if !out.is_empty() && reply.saturating_add(size) > max_reply_bytes {
+                break;
+            }
+            reply = reply.saturating_add(size);
+            out.push(header);
             if read > max_read_bytes {
                 break;
             }
         }
     }
     Ok(out)
+}
+
+/// The length of `v` serialised as compact JSON (what the reply carries), counted without
+/// building the string.
+fn json_len(v: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Count(0);
+    // Writing a `Value` to an infallible writer cannot fail.
+    let _ = serde_json::to_writer(&mut c, v);
+    c.0
 }
 
 /// Overwrite every string inside `v` with zeros, in place.
@@ -1815,6 +1861,10 @@ pub(crate) fn receipt_json(r: &CallReceipt) -> Value {
 /// real `hash`: a stripped copy hashes differently, and the fee note's blinding is over the real
 /// one. A wallet that trusts a lying `hash` only fails to find the note: it is matched against
 /// the leaf, never believed.
+///
+/// Since audit v7 (RPC-5) every carried transaction is stripped that way
+/// ([`public_rebuild_copy`]) and marked `proofs_stripped`, the deposit, mint and registration
+/// included: their proofs were what took a page past a wallet's reply cap.
 fn header_json(b: &randprotocol_core::Block, sealed: bool, fees: Option<&randprotocol_core::bridge::BridgeFees>) -> Value {
     // The three actions that append a note whose every word is on the wire — a bridge deposit, a
     // token mint, a registration's initial mint — carried raw beside the header (issue #117). A
@@ -1833,20 +1883,10 @@ fn header_json(b: &randprotocol_core::Block, sealed: bool, fees: Option<&randpro
             matches!(t.action, Action::BridgeAttest { .. } | Action::TokenMint { .. } | Action::RegisterToken { .. } | Action::Invoke { .. })
                 || (fees.is_some() && matches!(t.action, Action::BridgeBurn { .. }))
         })
-        .map(|t| match &t.action {
-            Action::BridgeBurn { .. } | Action::Invoke { .. } => {
-                let mut stripped = t.clone();
-                if let Some(bundle) = stripped.bundle.as_mut() {
-                    bundle.proof = Vec::new();
-                    bundle.auth_proof = Vec::new();
-                }
-                if let Action::Invoke { proof, .. } = &mut stripped.action {
-                    *proof = Vec::new();
-                }
-                json!({ "hash": t.hash().to_hex(), "raw": hex::encode(stripped.encode()), "proofs_stripped": true })
-            }
-            _ => json!({ "hash": t.hash().to_hex(), "raw": hex::encode(t.encode()) }),
-        })
+        // Every kind is carried stripped (audit v7, RPC-5; burns and invokes already were): the
+        // deposit, mint and registration used to come whole, ~2.9 MB of proofs each doubled by
+        // hex, and a dozen of them took a page past the wallet's reply cap.
+        .map(|t| json!({ "hash": t.hash().to_hex(), "raw": hex::encode(public_rebuild_copy(t).encode()), "proofs_stripped": true }))
         .collect();
     json!({
         "hash": b.hash().to_hex(), "height": b.height(), "view": b.view(), "parent": b.parent().to_hex(),
@@ -1855,6 +1895,27 @@ fn header_json(b: &randprotocol_core::Block, sealed: bool, fees: Option<&randpro
         "justify_view": b.header.justify.view, "sealed": sealed, "tx_count": b.transactions.len(),
         "public_notes": public_notes,
     })
+}
+
+/// What a header carries of a public-note transaction (audit v7, RPC-5): the transaction with
+/// every byte a wallet's public rebuild (`wallet::rebuilt_notes_with`) never reads emptied —
+/// the bundle's proof and auth proof, an invoke's call proof, and a deposit's Dilithium2
+/// co-signatures (`pq_signatures`: the rebuild takes the amount and `mu` from the attestation's
+/// body, which is kept whole, ECDSA signatures and all). Every field a note is rebuilt from —
+/// recipient, amount, asset, `time`, `r`, the bundle's `time`, the transition — stays, and so
+/// do the envelopes. The copy hashes differently; the entry names the real id beside it.
+fn public_rebuild_copy(t: &Transaction) -> Transaction {
+    let mut s = t.clone();
+    if let Some(bundle) = s.bundle.as_mut() {
+        bundle.proof = Vec::new();
+        bundle.auth_proof = Vec::new();
+    }
+    match &mut s.action {
+        Action::Invoke { proof, .. } => *proof = Vec::new(),
+        Action::BridgeAttest { pq_signatures, .. } => *pq_signatures = Vec::new(),
+        _ => {}
+    }
+    s
 }
 
 /// `rand_getFinality`'s response body, from either the storage-side committed answer or a
@@ -3042,7 +3103,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let head = st.storage.head().map_err(RpcError::internal)?.height;
             let to = to.min(head).min(from.saturating_add(MAX_BLOCK_HEADERS - 1));
             let storage = st.storage.clone();
-            let headers = blocking(st, move || block_headers_page(&storage, from, to, MAX_RANGE_READ_BYTES)).await?;
+            let headers =
+                blocking(st, move || block_headers_page(&storage, from, to, MAX_RANGE_READ_BYTES, MAX_HEADER_REPLY_BYTES)).await?;
             Ok(Value::Array(headers))
         }
         // ---- block aggregation (spec §8) ----
@@ -4010,10 +4072,10 @@ mod tests {
         let (_d, st, _gs, _) = bridged_chain();
         let head = st.storage.head().unwrap().height;
         assert!(head >= 2);
-        let all = block_headers_page(&st.storage, 1, head, usize::MAX).unwrap();
+        let all = block_headers_page(&st.storage, 1, head, usize::MAX, usize::MAX).unwrap();
         assert_eq!(all.len() as u64, head);
         // A budget the first block already crosses: one header, so the walk still advances.
-        let one = block_headers_page(&st.storage, 1, head, 0).unwrap();
+        let one = block_headers_page(&st.storage, 1, head, 0, usize::MAX).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0], all[0]);
         assert_eq!(ok(&st, "rand_getBlocks", json!([1, head])).await.as_array().unwrap().len() as u64, head);
@@ -6492,6 +6554,86 @@ mod tests {
         let b4 = make_block(&b3, &mut ledger, vec![mint.clone()], &key(1));
         st.storage.commit(std::slice::from_ref(&b4), &ledger, &[], &StubExecutor).unwrap();
         (dir, st, gs, register, mint)
+    }
+
+    /// Audit v7, RPC-5 (issue #121): a header page is bounded by what it *answers*, not only by
+    /// the block bytes it reads — it ends before the header that would take the reply past the
+    /// budget, never before the first one, so a walk always advances.
+    #[tokio::test]
+    async fn a_header_page_is_bounded_by_the_size_of_its_reply() {
+        let (_d, st, _gs, _, _) = token_chain();
+        let all = block_headers_page(&st.storage, 1, 4, usize::MAX, usize::MAX).unwrap();
+        assert_eq!(all.len(), 4);
+        // The reply's own size: the array, the headers, a comma between each two.
+        let two = 2 + json_len(&all[0]) + 1 + json_len(&all[1]);
+        assert_eq!(two, json_len(&Value::Array(all[..2].to_vec())), "the count is the serialised size");
+        let page = block_headers_page(&st.storage, 1, 4, usize::MAX, two).unwrap();
+        assert_eq!(page, all[..2].to_vec(), "ends before the header that would cross the budget");
+        assert!(json_len(&Value::Array(page)) <= two);
+        let page = block_headers_page(&st.storage, 1, 4, usize::MAX, two - 1).unwrap();
+        assert_eq!(page, all[..1].to_vec());
+        // A budget the first header alone crosses still answers it: the walk advances.
+        let one = block_headers_page(&st.storage, 1, 4, usize::MAX, 0).unwrap();
+        assert_eq!(one, all[..1].to_vec());
+        const { assert!(MAX_HEADER_REPLY_BYTES * 4 <= 64 << 20, "well below the wallet's 64 MiB reply cap") };
+    }
+
+    /// Audit v7, RPC-5: a deposit, a registration and a mint are carried with their proofs
+    /// stripped, as a burn and an invoke already were — the bundle proof, the auth proof and a
+    /// deposit's Dilithium2 co-signatures — under the real transaction id, marked
+    /// `proofs_stripped`, every field a note is rebuilt from intact. Carried whole, a deposit was
+    /// ~2.9 MB of proofs doubled by hex, and a dozen took a page past the wallet's reply cap.
+    #[tokio::test]
+    async fn a_header_carries_a_deposit_a_mint_and_a_registration_without_their_proofs() {
+        let (_d, st, _gs, register, mint) = token_chain();
+        // Production-sized proofs on each carried transaction (the stub's are a few bytes).
+        let fatten = |t: &Transaction| {
+            let mut t = t.clone();
+            let b = t.bundle.as_mut().expect("each carries a fee bundle");
+            b.proof = vec![7; 3 << 20];
+            b.auth_proof = vec![8; 1 << 20];
+            if let Action::BridgeAttest { pq_signatures, .. } = &mut t.action {
+                pq_signatures.extend((0..8).map(|i| randprotocol_core::bridge::PqSignature { index: i, signature: vec![9; 2420] }));
+            }
+            t
+        };
+        for (h, kind) in [(1u64, "bridge_attest"), (3, "register_token"), (4, "token_mint")] {
+            let mut b = st.storage.block_by_height(h).unwrap().unwrap();
+            assert_eq!(b.transactions.len(), 1);
+            b.transactions = vec![fatten(&b.transactions[0])];
+            let fat = b.transactions[0].clone();
+            let header = header_json(&b, false, None);
+            assert!(json_len(&header) < 64 << 10, "{kind}: a {}-byte header carries the proofs", json_len(&header));
+            let carried = header["public_notes"].as_array().unwrap();
+            assert_eq!(carried.len(), 1, "{kind}");
+            assert_eq!(carried[0]["hash"], fat.hash().to_hex(), "{kind}: under its real id");
+            assert_eq!(carried[0]["proofs_stripped"], true, "{kind}");
+            let copy = Transaction::decode(&hex::decode(carried[0]["raw"].as_str().unwrap()).unwrap()).unwrap();
+            let bundle = copy.bundle.as_ref().unwrap();
+            assert!(bundle.proof.is_empty() && bundle.auth_proof.is_empty(), "{kind}");
+            assert_eq!(bundle.time, fat.bundle.as_ref().unwrap().time, "{kind}");
+            assert_eq!(bundle.envelopes, fat.bundle.as_ref().unwrap().envelopes, "{kind}: the envelopes stay");
+            match (&copy.action, &fat.action) {
+                (
+                    Action::BridgeAttest { attestation, recipient, r, time, asset, envelope, pq_signatures },
+                    Action::BridgeAttest { attestation: a, recipient: rc, r: rr, time: t, asset: s, envelope: e, .. },
+                ) => {
+                    assert!(pq_signatures.is_empty(), "the co-signatures are stripped");
+                    assert_eq!((attestation, recipient, r, time, asset, envelope), (a, rc, rr, t, s, e), "the attestation stays whole");
+                }
+                (copied, original) => assert_eq!(copied, original, "{kind}: the action stays whole"),
+            }
+        }
+        // And through the method, on the committed (stub-proved) chain.
+        let headers = ok(&st, "rand_getBlocks", json!([1, 4])).await;
+        let hashes: Vec<&Value> = headers.as_array().unwrap().iter().flat_map(|h| h["public_notes"].as_array().unwrap()).map(|e| &e["hash"]).collect();
+        assert_eq!(hashes.len(), 3, "the deposit, the registration and the mint; the burn without the group is not carried");
+        assert!(hashes.contains(&&json!(register.hash().to_hex())) && hashes.contains(&&json!(mint.hash().to_hex())));
+        for h in headers.as_array().unwrap() {
+            for e in h["public_notes"].as_array().unwrap() {
+                assert_eq!(e["proofs_stripped"], true);
+            }
+        }
     }
 
     /// The native token's full row, as `rand_getTokens` and `rand_getToken` serve it.
