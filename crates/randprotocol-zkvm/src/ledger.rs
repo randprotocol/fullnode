@@ -2,7 +2,10 @@
 //! nullifier set, a clock, and one envelope per transaction. `apply` is what a node would
 //! run: check the proof's output-commitment digest against the plaintext values it is handed
 //! (`docs/06-viewing-keys.md`'s "Public outputs"), check the claimed anchor is a recent root,
-//! verify the proof under the transfer guest's `hc`, then apply the effects.
+//! verify the proof under the transfer guest's `hc` — with `Machine::verify_public` over the
+//! empty public segment, the rule a chain applies to a proof it publishes no public words for
+//! (audit v6 CS6-2: plain `verify` leaves `pv::PUB0..7` bound only to whatever segment the
+//! prover chose, so a proof made over a non-empty one would pass) — then apply the effects.
 //!
 //! M3.3: `cm_in` (the spent note's commitment) is no longer public anywhere — `MERKLE_VERIFY`
 //! proves it in-circuit against `anchor`, a tree root, so the chain no longer shows which
@@ -313,7 +316,8 @@ impl Ledger {
     /// published the same way `cm_out`/`time` always were, as plain transaction metadata, not
     /// hidden inside the envelope. Cheap structural checks run first so a node never pays for
     /// a STARK verification of a transaction it would reject anyway; the proof is then
-    /// verified and the tree/nullifier set updated.
+    /// verified (`verify_public` over the empty segment, the module doc comment says why) and
+    /// the tree/nullifier set updated.
     #[allow(clippy::too_many_arguments)]
     pub fn apply(&mut self, machine: &Machine, proof: &Proof, anchor: Word8, nf: Word8, cm_out: Word8, time: u32, envelope: Envelope) -> Result<usize, LedgerError> {
         use crate::tables::cpu::pv;
@@ -329,7 +333,7 @@ impl Ledger {
         if self.nullifiers.contains(&nf) { return Err(LedgerError::Spent(nf)); }
         if self.tree.index.contains_key(&cm_out) { return Err(LedgerError::Duplicate(cm_out)); }
         if time != self.now { return Err(LedgerError::Time { claimed: time, now: self.now }); }
-        machine.verify(&self.program.digest(), proof).map_err(LedgerError::Proof)?;
+        machine.verify_public(&self.program.digest(), &[], proof).map_err(LedgerError::Proof)?;
         self.nullifiers.insert(nf);
         self.tree.append(cm_out);
         self.record_root();
@@ -366,7 +370,9 @@ impl Ledger {
     /// 5. the two nullifiers differ, and neither is already spent;
     /// 6. the two commitments differ, and neither is already a leaf;
     /// 7. the digest recomputed from the published plaintext equals `pv::OUT0..8`;
-    /// 8. the proof verifies under `bundle_program`'s `hc` — last, and only then.
+    /// 8. the proof verifies under `bundle_program`'s `hc`, over the empty public segment
+    ///    (`verify_public`: a bundle publishes no public words, and a proof made over any
+    ///    other segment is `Proof(PublicValues)` here) — last, and only then.
     ///
     /// The digest is recomputed with `notes::bundle_digest`, which fixes the preimage's 47th
     /// word (`bad`) at `0`: `bad` is a guest-internal taint flag with no plaintext channel, so
@@ -391,7 +397,7 @@ impl Ledger {
         let published: Word8 = std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32);
         let expected = crate::notes::bundle_digest(&b.anchor, &b.nullifiers[0], &b.nullifiers[1], &b.commitments[0], &b.commitments[1], b.fee, b.burn, b.asset, b.time);
         if published != expected { return Err(LedgerError::BadDigest); }
-        machine.verify(&self.bundle_program.digest(), proof).map_err(LedgerError::Proof)?;
+        machine.verify_public(&self.bundle_program.digest(), &[], proof).map_err(LedgerError::Proof)?;
         for nf in &b.nullifiers { self.nullifiers.insert(*nf); }
         for cm in &b.commitments { self.tree.append(*cm); }
         self.record_root();

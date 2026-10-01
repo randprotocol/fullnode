@@ -10,7 +10,7 @@ lock is the one cargo reads) and `target/`; the manifests are verbatim, their `[
 included, which is why the root `Cargo.toml` lists both paths under `[workspace] exclude`. The
 copies are byte-identical to this circuits commit:
 
-circuits: aeacf31974fc409ed852017a4107ffa63df32182
+circuits: 6d2015d93988687f7c51d30f6a8a42a713a5b415
 
 That is the commit `.github/workflows/ci.yml` checks out as `CIRCUITS_PIN`, and the commit
 `crates/randprotocol-zkvm/guests-compiled/PROVENANCE.md` names;
