@@ -13,13 +13,14 @@ wallet ──https──> nginx (web droplet, TLS, per-address limit, no access 
                           └─ …
 ```
 
-**Status, 2026-10-01 03:50 UTC — serving chain 19 with all five members on `v0.6.7-prover.2`.**
-rand-node-a, rand-archive-2, rand-guardian-1, -2 and -5 (each `c-8`, same IP and disk); every member
-runs the deadlock-free build (`c07cecd0…`) and `prover-watchdog.timer`; the router answers a silent
-holder with a plain 503 (an outage the wallet waits out). First chain-19 transfer through the name:
-`5b8ec711…d6fa`, bundle proved in 77.4 s. The three guardian hosts are a stopgap — replace them with
-three of the original validators once that team's droplets can be resized (audit-v6 #112). The window
-measurement that shaped the pool is issue #118.
+**Status, 2026-10-01 04:35 UTC — two members, serving chain 19.** rand-node-a and rand-archive-2
+(`c-8`, `v0.6.7-prover.2`, `prover-watchdog.timer`); `prover_info.queue.max` is 2. The three
+guardian hosts that were members until 04:20 UTC (rand-guardian-1, -2, -5) were taken out on the
+user's decision — a prover beside bridge guardian keys mixes two trust domains — and resized back
+to `s-2vcpu-4gb`; their `randprover`/`provertunnel` users, prover key and units are gone, the
+bridge's own `tunnel` user untouched. Add capacity only on hosts that hold no bridge key
+(non-guardian validators or dedicated prover droplets): wallet 0.6.8 makes this pool every client's
+default. First chain-19 transfer through the name: `5b8ec711…d6fa` (77.4 s). Window: issue #118.
 
 ## What the pool is
 
