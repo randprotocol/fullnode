@@ -26,7 +26,7 @@ MEMBER=${MEMBER:?MEMBER: the member name, 1-16 of a-z0-9, used in its URL /m/<ME
 [[ "$MEMBER" =~ ^[a-z0-9]{1,16}$ ]] || { echo "MEMBER must be 1-16 of a-z0-9" >&2; exit 1; }
 # A release whose SHA256SUMS carries the release key's SHA256SUMS.sig. Never v0.6.7-prover.1 or .2:
 # they can deadlock (AGENTS.md, the prover pool entry).
-TAG=${TAG:-v0.6.7-prover.3}
+TAG=${TAG:-v0.6.9}
 TUNNEL_PUBKEY=${TUNNEL_PUBKEY:?TUNNEL_PUBKEY: the web droplet\'s tunnel public key file}
 PUBLIC_DIR=${PUBLIC_DIR:-$HOME/rand-prover-trusted/public}
 POOL_URL=${POOL_URL:-https://prover.randprotocol.org}

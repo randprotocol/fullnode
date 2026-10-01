@@ -21,10 +21,10 @@ its OWN key generated on its host and never copied (no backup): `a` (rand-node-a
 8610). **The shared key RGTF-7HKJ-XZFV-GQ1J is retiring:** wallet 0.6.8 pins it, so it still serves
 the root URL from the two dedicated droplets only (`rand-prover.service`, port 8600) until 0.6.9 is
 out and the owner decides the cut-over; then `retire-shared.sh` on nyc3/sfo3 and shred
-`~/rand-prover-trusted/home`. Every instance runs the hardened unit (loopback only, a syscall filter;
+`~/rand-prover-trusted/home`. Every instance runs the signed `v0.6.9` rand-prover (from main; installed 2026-10-01 through verify_release_sums + verify_binary, SHA256SUMS.sig on the release) under the hardened unit (loopback only, a syscall filter;
 `systemd-analyze security` 1.5, VK-13), installed only from a release whose SHA256SUMS verified against
-the release key (OPS-9), with a 600 s proving timeout coming in the next release (VK-12) and the
-watchdog meanwhile. The router meters submits per address across the pool (VK-10). Verified end to end through the
+the release key (OPS-9), with a 600 s proving timeout coming in v0.7.0 (VK-12) and the watchdog
+meanwhile. The router meters submits per address across the pool (VK-10). Verified end to end through the
 router on 2026-10-01, one real chain-20 transfer per member, each committed: a `e89e2cc4…` (73.4 s,
 height 15238), archive2 `7c404236…` (75.3 s, 15316), nyc3 `bdc88a53…` (76.3 s, 15492), sfo3
 `f925b4cd…` (76.4 s, 15571). Window: #118.
