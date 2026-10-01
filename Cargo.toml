@@ -84,8 +84,10 @@ opt-level = 2
 [profile.dev.package.randprotocol-rvm]
 opt-level = 2
 
-# Plonky3 0.7.0 with one fix: HidingFriPcs held a spin lock around its RNG across rayon work, and a
+# Plonky3 0.7.0 with one fix in two crates (upstream issue Plonky3 #2363, fix PR #2368): HidingFriPcs and
+# MerkleTreeHidingMmcs held a spin lock around their RNG across rayon work, and a
 # worker waiting on a stolen job could steal another `commit` and spin on its own lock for ever
 # (vendor/p3-fri/src/hiding_pcs.rs, "RandProtocol patch"). Everything else is the crates.io source.
 [patch.crates-io]
 p3-fri = { path = "vendor/p3-fri" }
+p3-merkle-tree = { path = "vendor/p3-merkle-tree" }
