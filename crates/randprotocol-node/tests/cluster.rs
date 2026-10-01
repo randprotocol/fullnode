@@ -559,10 +559,20 @@ async fn corrupted_rocksdb_is_detected_truncated_and_resynced() {
     wait_caught_up(&n2, &[&n0, &n1], Duration::from_secs(90)).await;
     assert!(n2.holds(&cm), "the repaired ledger lost the minted note");
     assert_chains_equal(&[&n0, &n1, &n2]);
-    // Verified clean again after the resync.
-    let gs_ = gen.build(executor.as_ref()).unwrap();
-    let check = n2.handle.storage.verify_chain(&gs_, randprotocol_node::storage::VerifyMode::Full, executor.as_ref()).unwrap();
-    assert!(check.is_ok(), "{:?}", check.problem);
+    // Verified clean again after the resync — with the node STOPPED, as the first check was.
+    // `verify_chain` reads the head once and then looks the head's certificate up in its own
+    // row; on a live node a commit in between moves the head, and the old head's row is pruned
+    // before the new head's is written (audit v5, OPS-4: a certificate is stored once), so the
+    // check on a running store can see "qc N missing" for a chain that is perfectly intact (the
+    // v0.7.0 tag's CI run 36870228620, attempt 1).
+    let (dir, _) = stop_and_head(n2).await;
+    {
+        let st = randprotocol_node::storage::Storage::open(dir.path()).unwrap();
+        let gs_ = gen.build(executor.as_ref()).unwrap();
+        let check = st.verify_chain(&gs_, randprotocol_node::storage::VerifyMode::Full, executor.as_ref()).unwrap();
+        assert!(check.is_ok(), "{:?}", check.problem);
+    }
+    let n2 = start_in(dir, &ks[2], boot.clone(), true).await;
     let h = n0.height();
     wait_height(&[&n0, &n1, &n2], h + 4, Duration::from_secs(60)).await;
     assert_chains_equal(&[&n0, &n1, &n2]);
