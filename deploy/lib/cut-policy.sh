@@ -10,6 +10,11 @@
 #   refuse_reused_chain_id <id>          returns 1 when any deploy/genesis*.json in this
 #                                        repository already has that `chain_id`, or <id> is not a
 #                                        positive integer
+#   require_key_separation_or_testnet <genesis.json> [status]
+#                                        returns 1 while deploy/key-separation (or <status>) says
+#                                        `met: no` and the genesis file does not set
+#                                        `"testnet": true` — no mainnet genesis until the keys
+#                                        are split (audit v6, OPS-6); warns past the deadline
 #   require_second_rebuild <file> <hash> returns 1 unless <file> carries `second-hash: <hash>` —
 #                                        the genesis hash the second operator got by rebuilding the
 #                                        genesis from the tag on another machine — equal to <hash>,
@@ -103,6 +108,46 @@ require_second_rebuild() {
   fi
 }
 
+require_key_separation_or_testnet() {
+  local genesis=${1:-} status=${2:-} met deadline
+  status=${status:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)/key-separation}
+  if [ ! -f "$status" ]; then
+    echo "cut-policy: no key-separation status at '$status' — deploy/key-separation says whether the validator and guardian keys are split (docs/deploy.md, \"Key separation\")" >&2
+    return 1
+  fi
+  met=$(_cut_record_value "$status" met)
+  deadline=$(_cut_record_value "$status" deadline)
+  case "$met" in
+    yes) return 0 ;;
+    no) ;;
+    *) echo "cut-policy: $status has no 'met: yes|no' line" >&2; return 1 ;;
+  esac
+  if [ -z "$genesis" ] || [ ! -f "$genesis" ]; then
+    echo "cut-policy: no genesis file at '${genesis}' to check for the testnet marker" >&2
+    return 1
+  fi
+  python3 - "$genesis" "$deadline" <<'PY'
+import datetime, json, sys
+genesis, deadline = sys.argv[1], sys.argv[2]
+try:
+    g = json.load(open(genesis))
+except Exception as e:
+    sys.stderr.write(f"cut-policy: cannot read {genesis}: {e}\n")
+    sys.exit(1)
+if g.get("testnet") is not True:
+    sys.stderr.write(
+        "cut-policy: refusing a genesis without \"testnet\": true — the validator and guardian keys are not "
+        f"split yet (deploy/key-separation: met: no, deadline {deadline or 'unset'}); a mainnet genesis waits "
+        "for the key-separation target (docs/deploy.md, \"Key separation\")\n")
+    sys.exit(1)
+try:
+    if deadline and datetime.date.today() > datetime.date.fromisoformat(deadline):
+        sys.stderr.write(f"cut-policy: warning — the key-separation deadline {deadline} has passed and met: is still no; set a new date in deploy/key-separation and docs/deploy.md\n")
+except ValueError:
+    sys.stderr.write(f"cut-policy: warning — deploy/key-separation's deadline '{deadline}' is not a date\n")
+PY
+}
+
 # ══ SELFTEST (only when this file is run, not sourced) ═══════════════════════════════════════
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${SELFTEST:-}" = 1 ]; then
   set -u
@@ -175,6 +220,26 @@ EOF
   refuses "a record without second-hash is refused" require_second_rebuild "$ST/good" "$H"
   refuses "a different second-operator hash is refused" require_second_rebuild "$ST/rebuilt" "${H%6}7"
   refuses "a malformed author hash is refused" require_second_rebuild "$ST/rebuilt" "a7cb020c"
+
+  # require_key_separation_or_testnet (audit v6, OPS-6)
+  printf 'met: no\ndeadline: 2099-01-01\n' > "$ST/ks-no"
+  printf 'met: yes\n' > "$ST/ks-yes"
+  printf 'met: no\ndeadline: 2000-01-01\n' > "$ST/ks-overdue"
+  printf 'deadline: 2099-01-01\n' > "$ST/ks-malformed"
+  echo '{"chain_id": 21, "testnet": true}' > "$ST/g-testnet"
+  echo '{"chain_id": 21}' > "$ST/g-mainnet"
+  echo '{"chain_id": 21, "testnet": false}' > "$ST/g-false"
+  accepts "keys unsplit: a testnet genesis is accepted" require_key_separation_or_testnet "$ST/g-testnet" "$ST/ks-no"
+  refuses "keys unsplit: a genesis without the testnet marker is refused" require_key_separation_or_testnet "$ST/g-mainnet" "$ST/ks-no"
+  refuses "keys unsplit: testnet: false is not the marker" require_key_separation_or_testnet "$ST/g-false" "$ST/ks-no"
+  accepts "keys split: a mainnet genesis is accepted" require_key_separation_or_testnet "$ST/g-mainnet" "$ST/ks-yes"
+  refuses "no status file is refused" require_key_separation_or_testnet "$ST/g-testnet" "$ST/ks-absent"
+  refuses "a status without met: is refused" require_key_separation_or_testnet "$ST/g-testnet" "$ST/ks-malformed"
+  refuses "no genesis file is refused" require_key_separation_or_testnet "$ST/g-absent" "$ST/ks-no"
+  accepts "a passed deadline warns but a testnet genesis still cuts" require_key_separation_or_testnet "$ST/g-testnet" "$ST/ks-overdue"
+  grep -q "deadline 2000-01-01 has passed" "$ST/err" && ok "the passed deadline is named" || bad "the passed deadline is not named: $(cat "$ST/err")"
+  accepts "the committed deploy/key-separation parses" require_key_separation_or_testnet "$ST/g-testnet"
+  refuses "the committed status (met: no) refuses a mainnet genesis today" require_key_separation_or_testnet "$ST/g-mainnet"
 
   echo "cut-policy selftest: $PASS passed, $FAIL failed"
   [ "$FAIL" -eq 0 ]

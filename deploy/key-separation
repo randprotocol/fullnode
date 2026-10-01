@@ -1,0 +1,9 @@
+# Key separation (audit v6, OPS-6; docs/deploy.md "Key separation"). Read by
+# deploy/lib/cut-policy.sh `require_key_separation_or_testnet`: while `met: no`, a genesis
+# without `"testnet": true` is refused. Flip `met:` to `yes` only when the target below holds,
+# and say in docs/deploy.md who holds what.
+met: no
+deadline: 2026-11-01
+target: at most 8 of the 26 validator keys and 2 of the 8 guardian keys per person and per hosting account
+plan: 18 validator keys and 6 guardian keys handed to three other operators, each on their own hosting account, before any mainnet genesis
+decided: 2026-10-01 by the operator
