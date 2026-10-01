@@ -69,4 +69,4 @@ sed -e "s/@THREADS@/$THREADS/g" -e "s/@MEMORY_MAX@/$MEMORY_MAX/g" "$HERE/rand-pr
     done
     [ -n "$out" ] || { journalctl -u rand-prover -n 20 --no-pager >&2; exit 1; }
     echo "$out" | python3 -c "import json,sys; r=json.load(sys.stdin)[\"result\"]; print(\"prover\", r[\"version\"], r[\"kem_fingerprint\"], r[\"witness_kinds\"], r[\"queue\"], \"fee\", r[\"fee\"])"
-    systemctl is-active rand-node'
+    systemctl is-active -q rand-node && echo "rand-node: active" || echo "rand-node: not on this host (a dedicated prover)"'

@@ -141,7 +141,7 @@ push to origin/main often"): five current validators become delegated provers be
   `CPUWeight=50`, `Nice=10`. Every member holds the SAME `prover.key.json` + `pairings.json`
   (laptop copy `~/rand-prover-trusted/`, mode 0700 — losing it means a new fingerprint in every
   client), so the pool has one link, served too at `/.well-known/rand-prover.json`. Viewing-key jobs
-  only, no `own=1`, no fee. Members (since 2026-10-01 04:35 UTC): **rand-node-a and rand-archive-2 only** — the three guardian hosts were members for one night and were removed on the user's decision (bridge keys and prover work never on one host; add capacity elsewhere). Originally five, each
+  only, no `own=1`, no fee. Members (since 2026-10-01 06:00 UTC): **rand-node-a, rand-archive-2 and two dedicated c-8 droplets, rand-prover-nyc3 / rand-prover-sfo3** — the three guardian hosts were members for one night and were removed on the user's decision (bridge keys and prover work never on one host; add capacity elsewhere). Originally five, each
   resized CPU/RAM-only to `c-8` (8 vCPU / 16 GB, disk untouched, ~$168/mo) with
   `deploy/prover/resize-host.sh` — the hosts this laptop's DigitalOcean token can resize; **the
   three guardian hosts are a stopgap** (audit-v6 #112 key separation) until three of the original

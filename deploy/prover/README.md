@@ -13,14 +13,15 @@ wallet ──https──> nginx (web droplet, TLS, per-address limit, no access 
                           └─ …
 ```
 
-**Status, 2026-10-01 04:35 UTC — two members, serving chain 19.** rand-node-a and rand-archive-2
-(`c-8`, `v0.6.7-prover.3`, `prover-watchdog.timer`); `prover_info.queue.max` is 2. The three
-guardian hosts that were members until 04:20 UTC (rand-guardian-1, -2, -5) were taken out on the
-user's decision — a prover beside bridge guardian keys mixes two trust domains — and resized back
-to `s-2vcpu-4gb`; their `randprover`/`provertunnel` users, prover key and units are gone, the
-bridge's own `tunnel` user untouched. Add capacity only on hosts that hold no bridge key
-(non-guardian validators or dedicated prover droplets): wallet 0.6.8 makes this pool every client's
-default. Chain-19 transfers through the name: `5b8ec711…d6fa` (77.4 s), and on prover.3 `b198a6e8…853b` (79.0 s). Window: issue #118.
+**Status, 2026-10-01 06:00 UTC — four members, serving chain 19.** rand-node-a (sgp1) and
+rand-archive-2 (fra1), validators; **rand-prover-nyc3** (138.197.113.180) and **rand-prover-sfo3**
+(64.23.228.252), dedicated `c-8` prover droplets added on the user's request (no rand-node, no key
+of any kind but the pool's; DigitalOcean tag `prover`). All on `v0.6.7-prover.3` with
+`prover-watchdog.timer`; tunnels `prover-tunnel@8601…8604`; `prover_info.queue.max` is 4.
+Each new member proved a real chain-19 send directly (`260182c4…449b` 85.9 s, `48bbc2f5…404d`
+81.9 s). The guardian hosts were members for one night and are out for good — add capacity with
+more dedicated droplets (`doctl compute droplet create … --size c-8 --tag-names rand,prover`, then
+`install-host.sh` and `install-web.sh` with the whole member list). Window: issue #118.
 
 ## What the pool is
 
