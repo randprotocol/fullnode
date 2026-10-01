@@ -10,6 +10,38 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 `git tag` and the GitHub release list (audit v6, DOC-6). There is no tag v0.5.2, v0.5.3 or v0.6.5.
 "Assets" says what the GitHub release carries, as read on 2026-09-30.
 
+## v0.7.0 — 2026-10-01 (chain 20, node-only)
+
+Tag `TAG_SHA`. Node-only: no consensus rule, wire format, verifier key or genesis change; rolled
+onto chain 20 one node at a time, from the first release built by `.github/workflows/release.yml`
+(CI-gated, `--locked`, attested) and signed by the release key (`SHA256SUMS.sig`; the fleet's roll
+scripts verify it, PROC-4/5, #110). What it carries beyond v0.6.9:
+
+- **The audit v7 addendum, every row but the aggregation one** — Medium: SYNC-5/CON-6 (#120, a
+  peer's unsigned claimed height holds a by-hash fetch back for at most 10 s), RPC-5 (#121, header
+  pages capped at 16 MiB of reply, carried public-note transactions proof-stripped, the wallet
+  halves a page answered too large or too slowly), VK-12 (#122, a proving timeout in
+  `rand-prover`); Low: SYNC-6 (#127, the by-hash gate measures the pending tip), PROC-11 (#128,
+  the gate pinned through `fetch_block`), CLI-18/CLI-19 (#129, #130, the wallet's first sync keeps
+  a page's notes across a rising floor and drops a planted note no leaf matches), VK-13/VK-10
+  (#125, #126, the pool's unit confined to loopback and a syscall filter; flood limits), VK-9/OPS-9
+  (#123, #124, a key per pool member, the pool installed only from a signed release).
+- **The last audit v6 rows**: PROC-2 (#109, the workspace builds from a clean clone: `evm-core`/`sbpf-core` vendored, the cuda backend a git dependency, CI's `clean-clone` job required),
+  CS6-2 (#97, the reference ledger verifies with `verify_public`, fixed upstream and re-vendored at circuits 6d2015d), TOK-1 (#86, genesis `tokens.incremental_root`: an incremental registry commitment and per-token storage rows, dormant until a genesis sets it; the legacy root cached on every chain), ZKV-5 (#95, the digest-prefix rows' gas under-count pinned numerically; the circuit fix is constraint set 9's, zkp-circuits#2), OPS-6 (#112, the
+  key-separation schedule — by 2026-11-01, before any mainnet genesis — enforced by
+  `require_key_separation_or_testnet`).
+- A fresh wallet's first sync on chain 20 no longer times out on a 29 MB header page (04092f28).
+
+Open after this release: #119 (aggregation's memory and a targeted rVM forgery, before any genesis
+enables aggregation). Assets: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`, `SHA256SUMS.sig`.
+
+## v0.6.9 — 2026-10-01 (chain 20, node-only)
+
+Tag `3f43101b`. Node-only, rolled onto chain 20 one node at a time: a `rand_getBlocks` header
+carries its block's invokes in `public_notes` with their proofs stripped, so a wallet rebuilds an
+RPL-2 payout from public fields rather than the invoker's envelope (`d0bb73fb`). Assets:
+`rand-node`, `rand`, `rand-prover`, `SHA256SUMS`.
+
 ## v0.6.8 — 2026-10-01 (chain 20)
 
 Tag `c9c9bd3c`. Hard fork for chain 20 (genesis `6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135`), rolled all-stop/all-start with
