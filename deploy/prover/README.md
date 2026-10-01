@@ -13,12 +13,12 @@ wallet ──https──> nginx (web droplet, TLS, per-address limit, no access 
                           └─ …
 ```
 
-**Status, 2026-10-01 05:00 WITA — serving with all five members.** rand-node-a, rand-archive-2,
-rand-guardian-1, -2 and -5, each resized to `c-8` one at a time (20:36–20:57 UTC, no IP or disk change);
-`https://prover.randprotocol.org` reports `queue.max` 5. First real transfer through the name:
-`684f9a4b…252e` on chain 18, proved in 75.4 s. The three guardian hosts are a stopgap — they are the
-hosts this operator's DigitalOcean token can resize; replace them with three of the original
-validators once that team's droplets can be resized (audit-v6 #112, key separation). The window
+**Status, 2026-10-01 03:50 UTC — serving chain 19 with all five members on `v0.6.7-prover.2`.**
+rand-node-a, rand-archive-2, rand-guardian-1, -2 and -5 (each `c-8`, same IP and disk); every member
+runs the deadlock-free build (`c07cecd0…`) and `prover-watchdog.timer`; the router answers a silent
+holder with a plain 503 (an outage the wallet waits out). First chain-19 transfer through the name:
+`5b8ec711…d6fa`, bundle proved in 77.4 s. The three guardian hosts are a stopgap — replace them with
+three of the original validators once that team's droplets can be resized (audit-v6 #112). The window
 measurement that shaped the pool is issue #118.
 
 ## What the pool is
