@@ -438,7 +438,7 @@ pub struct Genesis {
     /// true` and a `bridge` section — free RAND beside real custody — is refused
     /// ([`GenesisError::FaucetWithBridgeNeedsTestnet`]) unless it says `"testnet": true` here;
     /// "mainnet never carries a faucet" was a sentence in `docs/deploy.md`, and this is the check.
-    /// The chains cut before the marker existed and carry both (14–18,
+    /// The chains cut before the marker existed and carry both (14–19,
     /// [`FAUCET_BESIDE_BRIDGE_CHAIN_IDS`]) are grandfathered by chain id, so their committed files
     /// still build. Committed to the genesis hash under its own tag, after every earlier one, only
     /// when `true` (`false` commits nothing, like `hardening_v6`); on the ledger as a parameter
@@ -472,15 +472,16 @@ pub struct Genesis {
 
 /// The chains whose committed genesis file (`deploy/genesis-chain<N>.json`) carries both
 /// `faucet: true` and a `bridge` section and predates the `testnet` marker (audit v6, STAKE-2):
-/// chain 14 (no `staking` section at all) and chains 15–18 (a section with a faucet allowlist).
+/// chain 14 (no `staking` section at all) and chains 15–19 (a section with a faucet allowlist;
+/// chain 19 was cut on v0.6.7, 2026-10-01, after this list was written).
 /// `Genesis::validate` exempts exactly these chain ids from
 /// [`GenesisError::FaucetWithBridgeNeedsTestnet`], so every one of those files still validates
 /// and builds its pinned hash — `every_committed_genesis_file_still_validates` walks them — and
 /// every later chain id must carry the marker. The pattern of
 /// `randprotocol_client::LEGACY_ENVELOPE_CHAIN_IDS` and `node::CHAINS_THIS_BUILD_CANNOT_RUN`: a
 /// named list, never a rule that reads the file's own shape, so a new chain cannot slip in by
-/// looking like an old one. Add nothing here: a chain cut from now on says `testnet: true`.
-pub const FAUCET_BESIDE_BRIDGE_CHAIN_IDS: &[u64] = &[14, 15, 16, 17, 18];
+/// looking like an old one. Add nothing here: a chain cut on a build that has the marker says `testnet: true`.
+pub const FAUCET_BESIDE_BRIDGE_CHAIN_IDS: &[u64] = &[14, 15, 16, 17, 18, 19];
 
 fn default_true() -> bool {
     true
@@ -806,7 +807,7 @@ impl Genesis {
         }
         // Audit v6, STAKE-2 (option 2): a faucet and a bridge exclude each other on every chain
         // — section or no section, allowlist or none — unless the genesis says `testnet: true`.
-        // The chains cut before the marker (14–18) carry both and are named, by id, so their
+        // The chains cut before the marker (14–19) carry both and are named, by id, so their
         // committed files still build; the section rule below stands on top of this one, so a
         // sectioned testnet still needs its allowlist as well.
         if self.faucet && self.bridge.is_some() && self.testnet != Some(true) && !FAUCET_BESIDE_BRIDGE_CHAIN_IDS.contains(&self.chain_id) {
@@ -1357,7 +1358,7 @@ impl Genesis {
             commit.push(1);
         }
         // The testnet marker (audit v6, STAKE-2), after it: only when `true` — `false` and
-        // absent are both "not a testnet" and commit nothing, so chains 14–18 hash as before.
+        // absent are both "not a testnet" and commit nothing, so chains 14–19 hash as before.
         if self.testnet == Some(true) {
             commit.extend_from_slice(b"testnet");
             commit.push(1);
@@ -4061,7 +4062,7 @@ mod tests {
     /// `docs/deploy.md`. Now a genesis with `faucet: true` and a `bridge` section is refused on
     /// any chain id not in [`FAUCET_BESIDE_BRIDGE_CHAIN_IDS`] unless it says `testnet: true` —
     /// whether or not it has a `staking` section or an allowlist. The marker is committed to the
-    /// hash only when `true`, rides on the ledger for the node to serve, and chains 14–18 (the
+    /// hash only when `true`, rides on the ledger for the node to serve, and chains 14–19 (the
     /// committed files with both and no marker) still validate by id alone.
     #[test]
     fn a_faucet_beside_a_bridge_needs_the_testnet_marker_on_a_new_chain() {
@@ -4112,9 +4113,9 @@ mod tests {
             old.chain_id = *id;
             assert!(old.validate().is_ok(), "chain {id} predates the marker");
         }
-        assert_eq!(FAUCET_BESIDE_BRIDGE_CHAIN_IDS, &[14, 15, 16, 17, 18]);
-        old.chain_id = 19;
-        assert!(matches!(old.validate(), Err(GenesisError::FaucetWithBridgeNeedsTestnet { chain_id: 19 })));
+        assert_eq!(FAUCET_BESIDE_BRIDGE_CHAIN_IDS, &[14, 15, 16, 17, 18, 19]);
+        old.chain_id = 20;
+        assert!(matches!(old.validate(), Err(GenesisError::FaucetWithBridgeNeedsTestnet { chain_id: 20 })));
     }
 
     /// Every committed genesis file still validates under the rule above: the ones with a faucet
@@ -4144,7 +4145,7 @@ mod tests {
                 both.push(g.chain_id);
             }
         }
-        assert!(seen >= 5, "the chain 14–18 files at least");
+        assert!(seen >= 6, "the chain 14–19 files at least");
         both.sort();
         assert_eq!(both, FAUCET_BESIDE_BRIDGE_CHAIN_IDS, "the grandfathered ids are exactly the committed files with both");
     }

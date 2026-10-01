@@ -3089,6 +3089,28 @@ mod tests {
         node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 18");
     }
 
+    /// Chain 19, live 2026-10-01 03:43 UTC: a pure re-genesis of chain 18 on v0.6.7 (the
+    /// redeployed bridge endpoints as its emitters). This build must still compute its hash and
+    /// run it: none of the audit-v6 genesis fields (`testnet`, `binding_domain`, `bridge.rotation`,
+    /// `proof_window_blocks`, the staking and vesting additions) is in its file, and it carries a
+    /// faucet beside a bridge without the `testnet` marker, so its id is grandfathered
+    /// (`FAUCET_BESIDE_BRIDGE_CHAIN_IDS`).
+    #[test]
+    fn chain_19s_genesis_file_builds_chain_19() {
+        let chain_19_hash = "a3defc937d561d4beb1df9a08c9cb87a3dc32dadbfc2d1814ab6f627b0a2228a";
+        let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain19.json");
+        let gen = Genesis::from_json(&std::fs::read_to_string(committed).unwrap()).unwrap();
+        assert_eq!(gen.chain_id, 19);
+        assert!(gen.faucet && gen.bridge.is_some() && gen.testnet.is_none(), "chain 18's shape, no marker");
+        assert!(gen.binding_domain.is_none() && gen.proof_window_blocks.is_none(), "no audit-v6 genesis field");
+        assert_eq!(gen.envelope_bytes, Some(1860), "the encrypted memo is on");
+        assert_eq!(gen.hc_bundle, word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), "the v3 bundle guest");
+        let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
+        let state = gen.build(executor.as_ref()).unwrap();
+        assert_eq!(state.hash().to_hex(), chain_19_hash, "chain 19's live genesis");
+        node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 19");
+    }
+
     /// This build is constraint set 8 (the gas meter, chain 18): every verifier key moved again, so
     /// no proof chain 16 (constraint set 7, v0.6.1) committed verifies here. Chain 16 pins the v2
     /// guest, which this build still carries, so the `hc_bundle` check alone would let this binary
