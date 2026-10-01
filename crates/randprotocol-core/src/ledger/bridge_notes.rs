@@ -915,6 +915,68 @@ mod tests {
         assert_eq!(l.validate(&earlier, &StubExecutor), Ok(()));
     }
 
+    /// Audit v6, BRG-11: "a pending deposit's note commitment can be front-run" — what an
+    /// attacker who learns `mu` before the mint commits can and cannot do, pinned.
+    ///
+    /// The deposit note is `(recipient.pk, from = 0, amount, asset = the bridged index ≥ 1, time,
+    /// r = H(mu))`. Every other way a note enters the tree fixes a word that differs:
+    /// - a bundle output's `from` is the spender's `pk_self = H(PK, H(NK, sk))`, derived inside
+    ///   the guest (v1, v2 and v3 alike) — reaching `from = 0` is a Poseidon2 preimage of zero;
+    /// - a faucet `Mint`, a staking/aggregator `Withdraw`, an aggregate payout and a vesting
+    ///   claim all derive `from = 0` with asset **0** (RAND), and a bridged token's index is
+    ///   never 0;
+    /// - an RPL `TokenMint`/initial mint uses `from = MINT_FROM` (`"rpl-mint"`), never zero;
+    /// - genesis allocs are fixed at block 0.
+    ///
+    /// So the one transaction that can create the deposit commitment first is another
+    /// `BridgeAttest` of **the same attestation** (the same `mu`, so the same `r`) — and that one
+    /// is held to the same recipient (`BridgeRecipientMismatch` otherwise), mints the same amount
+    /// of the same asset into the depositor's note, and spends the attestation's digest. The
+    /// relayer it front-ran is refused `Replay` and spends nothing. What the front-runner does
+    /// choose — `time` and the envelope — are griefing only: the wallet rebuilds a deposit from
+    /// the action's public fields (`wallet::rebuilt_notes`), so a junk envelope or another `time`
+    /// costs the depositor nothing. No fix needed in this repository; `docs/bridge.md` §24.
+    #[test]
+    fn a_front_run_deposit_still_pays_its_recipient_and_no_other_path_makes_its_note() {
+        let (mut l, secrets) = ledger();
+        l.set_height(9);
+        l.record_anchor(9);
+        let a = attest(&secrets, transfer(1_000, 0, recipient().recipient_hash(), 0));
+        let relayer = attest_tx(&l, a.clone(), recipient(), 20);
+        let deposit_cm = l.derived_commitment(&relayer.action, &StubExecutor).unwrap();
+        let Action::BridgeAttest { r, time, asset, .. } = relayer.action.clone() else { unreachable!() };
+        assert!(asset >= 1, "a bridged token's index is never RAND's");
+
+        // No other path reaches that commitment: each fixes a different `from` or asset word.
+        let pk = recipient().pk;
+        let faucet = crate::ledger::mint_commitment(&StubExecutor, &pk, 1_000, time, &r);
+        let rpl = crate::ledger::tokens::mint_commitment(&recipient(), 1_000, asset, time, &r, &StubExecutor);
+        let spender = StubExecutor.note_commitment(&pk, &[0x1234; 8], 1_000, asset, time, &r);
+        for (what, cm) in [("faucet mint / withdraw / payout (asset 0)", faucet), ("RPL mint (MINT_FROM)", rpl), ("a bundle output (from = pk_self)", spender)] {
+            assert_ne!(cm, deposit_cm, "{what}");
+        }
+        assert_eq!(StubExecutor.note_commitment(&pk, &[0; 8], 1_000, asset, time, &r), deposit_cm, "the deposit is (pk, 0, amount, asset, time, r)");
+
+        // The front-run itself: the same attestation, a junk envelope, the attacker's own fee
+        // bundle. It cannot name another recipient…
+        let mut stolen = attest_tx(&l, a.clone(), ShieldedAddress { pk: [9; 8], kem_ek: vec![9; 32] }, 40);
+        StubExecutor::bind(&mut stolen);
+        assert_eq!(l.validate(&stolen, &StubExecutor), Err(TxError::BridgeRecipientMismatch));
+        // …so what lands is the depositor's own note, at the same commitment.
+        let mut front = attest_tx(&l, a, recipient(), 40);
+        let Action::BridgeAttest { envelope, .. } = &mut front.action else { unreachable!() };
+        envelope.body = vec![0xee; 8];
+        StubExecutor::bind(&mut front);
+        assert_eq!(l.derived_commitment(&front.action, &StubExecutor).unwrap(), deposit_cm);
+        let supply_before = l.tokens().unwrap().get(asset).unwrap().total_supply;
+        l.apply_tx(&front, &proposer().address(), &StubExecutor).unwrap();
+        assert!(l.has_commitment(&deposit_cm), "the depositor is credited, whoever submitted");
+        assert_eq!(l.tokens().unwrap().get(asset).unwrap().total_supply, supply_before + 1_000);
+        // The relayer it front-ran is refused on the spent digest — refused, so nothing it
+        // carried (its fee bundle's notes) is spent.
+        assert_eq!(l.validate(&relayer, &StubExecutor), Err(TxError::Bridge(BridgeError::Replay)));
+    }
+
     /// What a node's note index needs: the deposit note recomputed from the committed
     /// transaction alone, matching the one the ledger appended. The registry *after* the
     /// attestation is what a node has on disk, and it answers the same as the one before.

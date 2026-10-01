@@ -1357,3 +1357,37 @@ plus one). A guardian left to rescan from the deployment block re-observes every
 new and, with an empty store, co-signs it for chain 15; a quorum of such guardians re-mints them.
 Bringing more than one guardian up fresh at once, or any fresh guardian before its cursors are
 set, is the failure this section exists for.
+
+## 24. A pending deposit's note cannot be stolen by front-running it (audit v6, BRG-11)
+
+The audit's worry: the deposit blinding is `r = blake3("rand-deposit-r-1" ‖ mu)` (F1), `mu` is
+public — a guardian's read API serves it before the mint is submitted — so anyone who learns it
+could create the deposit's commitment first and make the real mint fail `CommitmentExists`. Traced
+through the code (2026-10-01), that cannot cost the depositor anything:
+
+- **The deposit note is `(recipient.pk, from = 0, amount, asset, time, r)`** with `asset` the
+  bridged token's registry index, never 0 (`ledger/bridge_notes.rs`, `deposit_commitment`).
+- **No other path makes such a note.** A bundle output's `from` is the spender's
+  `pk_self = H(PK, H(NK, sk))`, derived in the guest (v1, v2 and v3); reaching `from = 0` is a
+  Poseidon2 preimage of zero. A faucet `Mint`, a staking or aggregator `Withdraw`, an aggregate
+  payout and a vesting claim derive `from = 0` with asset **0**. An RPL mint uses
+  `from = MINT_FROM`. Genesis allocs exist only at block 0.
+- **The one colliding transaction is another `BridgeAttest` of the same attestation** (same `mu`,
+  so same `r`). It must name the same recipient (`recipient_hash` is bound by the guardians'
+  signature: `BridgeRecipientMismatch` otherwise), so it mints the depositor's own note, at the
+  same amount and asset, and spends the attestation's digest. The relayer it front-ran is refused
+  `Replay` and spends nothing (a refused transaction spends no note). No relayer fee is paid on
+  Rand either way (§13: the wire `fee` is not deducted on the mint side).
+- **What the first submitter still chooses is griefing only:** `time` (anywhere in the window) and
+  the envelope. A wallet rebuilds a deposit from the action's public fields
+  (`wallet::rebuilt_notes`; pinned by `a_garbage_envelope_deposit_is_still_found_and_spendable_by_
+  its_recipient`), so a junk envelope or another `time` hides nothing from it. A third-party
+  wallet that relied on the envelope alone would not see the deposit until it rebuilt it.
+
+Pinned by `a_front_run_deposit_still_pays_its_recipient_and_no_other_path_makes_its_note`
+(core) and `two_submitters_of_one_attestation_at_one_time_derive_one_note`. **No change in this
+repository.** What would remove the residual grief — and it needs the bridge repository: the
+guardians stop serving `mu` before a mint is submitted (the audit's first fix), or the depositor's
+envelope (or its digest) and `time` are fixed by what the source-chain lock commits to, so the
+guardians' signature binds them and a copier cannot choose them. Both change what the guardians
+publish or sign; neither is half-implemented here.
