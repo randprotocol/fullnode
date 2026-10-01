@@ -20,12 +20,17 @@ chain with a proof instead of their inputs.
 | Storage | one RocksDB per node with column families for blocks, certificates, indexes, notes, nullifiers, anchors, validators, programs and receipts; fsynced commits; startup integrity check with truncate-and-resync; optional history pruning (`--prune-history 24h`) with archive nodes keeping everything |
 | Interfaces | JSON-RPC 2.0 over HTTP with batch requests, a WebSocket `newHeads` / `receipts` / `transaction` subscription on the same port (`rand-node`), `rand` wallet CLI with a local prover, `rand-prover` delegated prover (`docs/prover.md`), Rust client library |
 
-Status: an experimental testnet runs **chain 18** (live since 2026-09-29 04:56 UTC; genesis
-`a7cb020c…4da76`, build **v0.6.7** `86941a1`) on 26 DigitalOcean validators — quorum 18 of 26 —
-including two archive nodes that keep full history; the others keep one day. Chain 18 is the first
-gas-metered chain (constraint set 8), runs split authorisation, carries the encrypted memo, and
-keeps the zUSD-backed guardian bridge (10 zUSD, audited `supply == locked == custody`). Public RPC:
-`https://rpc.randprotocol.org`. Not audited as a whole; not for real value — mainnet is v1.0.
+Status: an experimental testnet runs **chain 20** (live since 2026-10-01 06:17 UTC; genesis
+`6210cf07…5135`, build **v0.6.9** `3f43101b`, v0.7.0 rolling next) on 26 DigitalOcean validators —
+quorum 18 of 26 — including two archive nodes that keep full history; the others keep one day.
+Chain 20 is the first chain whose proofs and signed messages are bound to the genesis hash
+(`binding_domain: 1`), the first with RPL-2 program state and the `Invoke` action, and the first
+whose bridge takes its fees in zUSD (10 bps each way, kept on Rand as treasury notes); it keeps
+gas metering (constraint set 8), split authorisation, the encrypted memo, a 1,024-block proof
+window and the zUSD-backed guardian bridge (≈99 zUSD, audited `supply == locked == custody`).
+Public RPC: `https://rpc.randprotocol.org`; explorer `https://randscan.org`. Not audited as a
+whole; not for real value — mainnet is v1.0, and every validator and guardian key is one
+operator's until the key-separation schedule (`docs/deploy.md`) is met.
 
 ## Contents
 
@@ -319,8 +324,10 @@ record of each, with the measured suite and the roll. Not every tag has binaries
 read on 2026-09-30): v0.5.8 to v0.6.7 carry Linux binaries and `SHA256SUMS`, except v0.5.11 (no
 assets) and v0.6.6 (a tag with no release); v0.5, v0.5.1, v0.5.4 and v0.5.5 have no assets, v0.5.6
 has two differently named binaries and no `SHA256SUMS`, v0.5.7 has the binaries and no
-`SHA256SUMS`. Those binaries were built by hand on one host and are unsigned; from the next tag
-the release is built by `.github/workflows/release.yml` (`docs/deploy.md`, "Release trust"). A release that changes consensus, the wire
+`SHA256SUMS`. Those binaries, and v0.6.8's and v0.6.9's, were built by hand on one host; v0.6.9's
+`SHA256SUMS` is the first signed by the release key, and from v0.7.0 the release is built by
+`.github/workflows/release.yml` from the tag, attested, and signed (`docs/deploy.md`, "Release
+trust"; the roll scripts refuse an unsigned release). A release that changes consensus, the wire
 format or a verifier key ships with a new chain; the others roll onto the live chain one node at
 a time.
 
@@ -336,7 +343,9 @@ a time.
 | v0.6.3 / v0.6.4 | delegated proving, phase 2: split authorisation (the auth proof, `rand-txid-3`) | 17 |
 | v0.6.6 / v0.6.7-rc1 | gas: constraint set 8, a declared gas limit per proof, dynamic gas and byte prices; the memo turned on | 18 |
 | v0.6.7 | fixes on chain 18: sealed-proof pruning, the envelope-format pin, viewing-key hygiene, the rVM allocator, GPU-kernel aliasing, ALU test coverage | 18 |
-| v0.6.8 | RPL-2: program state, program vaults and the `Invoke` action, behind a `program_state` genesis section; `MintAuthority::Program` (`docs/program-state.md`) | not cut (chain 20 at the earliest) |
+| v0.6.8 | chain 20's cut build: RPL-2 (program state, program vaults, the `Invoke` action; `docs/program-state.md`), the zUSD bridge fees (`bridge.fees`), and the final audit v6 fixes — the timeout-certificate pacemaker and the durable lock (all-stop/all-start), a public RPC listener, genesis-bound signing, a proof window, admission by vote, vesting revokes by threshold, rotation possession and delay, gas price ceilings | 20 |
+| v0.6.9 | node-only: headers carry invokes in `public_notes`, so a wallet rebuilds RPL-2 payouts from public fields | 20 |
+| v0.7.0 | node-only: the audit v7 addendum (bounded by-hash deferral, header pages capped by reply size, a prover timeout, the wallet's resumable first sync hardened) and the last audit v6 rows (a clean-clone build, an incremental token root, the key-separation schedule); the first workflow-built, signed release | 20 |
 
 ## v0.5: RPL, zUSD and bridge hardening
 
@@ -401,20 +410,20 @@ all hard forks together as chain 14:
 
 Done: the shielded pool, staking and the bridge as notes (phases S1–S3), RPL tokens, history
 pruning, address sharing and the memo, genesis vesting, delegated proving with split
-authorisation, gas, and RPL-2 (program state, program vaults, `Invoke` — in the v0.6.8 build,
-on no chain yet).
+authorisation, gas, RPL-2 (program state, program vaults, `Invoke` — live on chain 20), the
+zUSD bridge fees, the bridge endpoint redeploy (chains 19 and 20 name the new Ethereum, BNB and
+Tron contracts), and the audit v6 and v7 fixes (`CHANGELOG.md`).
 
 Next:
 - **Mainnet (v1.0)**, with a fresh genesis and a network marker that makes archive rules into
   consensus rules.
-- **The bridge endpoint redeploy** (the reentrancy guard and the separate pauser). New Ethereum,
-  BNB and Tron contracts only become usable in a genesis that names them.
 - **Block aggregation**, off on every chain today. It still needs the end-to-end
   forged-aggregate exercise (#45), and the production rVM proofs need more than 256 GB of memory
   under constraint sets 7–8, which the aggregator machine class has to account for.
 - Slashing beyond leader equivocation (vote equivocation is logged, not slashed), and slashing
   stake bonded from a vesting lock (audit v6 STAKE-1 built leader-equivocation slashing and
-  jailing behind the genesis `staking.slashing` section — on no chain yet; `docs/staking.md`);
+  jailing behind the genesis `staking.slashing` section — chain 20 does not set it, because one
+  operator holds every key; `docs/staking.md`);
   cross-program calls and block context for RPL-2 programs; a nullifier accumulator; the
   hash-sortition leader beacon.
 
@@ -426,9 +435,12 @@ Next:
 - **The GPU backend.** It was first run on an NVIDIA H100 on 2026-09-28: the kernels build to PTX
   for sm_80 and sm_90 and match the CPU and Plonky3 reference (#49). The production
   N re-measurement on a fleet GPU node is still to do.
-- **Wallets and the explorer on constraint set 8.** Every proof format changed with chain 18, so
-  the clients repository (desktop, web, iOS, Android) and randscan need builds against circuits
-  `aeacf31` before users can prove for chain 18.
+- **Key separation.** Every validator and guardian key is one operator's; the schedule — 18 of 26
+  validator keys and 6 of 8 guardian keys to three other operators, each on their own hosting
+  account, by 2026-11-01 and before any mainnet genesis — is in `docs/deploy.md` and enforced by
+  `deploy/lib/cut-policy.sh` (no genesis without `testnet: true` until it is met).
+- **The prover pool's shared key.** Each pool member now has its own key; the old shared key is
+  retired once wallet 0.6.9, which pins the per-member descriptor, is published (fullnode #123).
 
 ## License
 
