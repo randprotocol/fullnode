@@ -2096,6 +2096,24 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
             "kind": "rotate_pause_key", "new_pause_key": new_pause_key.to_hex(), "nonce": nonce,
             "pq_signers": pq_signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
         }),
+        // Audit v6, BRG-14: the possession-carrying rotations render as their v1 twins plus how
+        // many holders signed; a cancel names its kind. The signatures themselves are not shown.
+        Action::RotatePqGuardiansV2 { new_pq_guardians, possession, nonce, pq_signatures } => json!({
+            "kind": "rotate_pq_guardians_v2",
+            "new_pq_guardians": new_pq_guardians.iter().map(|k| k.to_hex()).collect::<Vec<_>>(),
+            "possession_signatures": possession.len(),
+            "nonce": nonce,
+            "pq_signers": pq_signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
+        }),
+        Action::RotatePauseKeyV2 { new_pause_key, nonce, pq_signatures, .. } => json!({
+            "kind": "rotate_pause_key_v2", "new_pause_key": new_pause_key.to_hex(), "nonce": nonce,
+            "pq_signers": pq_signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
+        }),
+        Action::CancelRotation { kind, nonce, .. } => json!({
+            "kind": "cancel_rotation",
+            "rotation_kind": match kind { 0 => "pq_guardians", 1 => "pause_key", _ => "unknown" },
+            "nonce": nonce,
+        }),
         // Genesis vesting: the entry and the amounts are public register facts, like a
         // `Withdraw`'s; the note a claim or a revoke pays is rendered no further.
         Action::ClaimVested { entry, amount, nonce, time, .. } => json!({
@@ -2817,6 +2835,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let tokens = st.storage.tokens().map_err(RpcError::internal)?;
             let v2 = st.storage.bridge_meta_v2().map_err(RpcError::internal)?;
             let floor = st.storage.bridge_replay_floor().map_err(RpcError::internal)?;
+            let rotation = st.storage.bridge_rotation_meta().map_err(RpcError::internal)?;
             let now = head_mint_now(&st.storage)?;
             let guardians = bridge
                 .guardian_sets
@@ -2870,6 +2889,28 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     .iter()
                     .map(|(c, f)| (c.to_string(), json!(f)))
                     .collect::<serde_json::Map<String, Value>>()),
+                // Audit v6, BRG-14: the genesis `bridge.rotation` rules (`null` on a chain without
+                // the group — chain 18) and, under a delay, the rotations accepted and not yet in
+                // effect: a signer reads `rotation_nonce` above before it signs, and whoever holds
+                // the pause key reads these to decide whether to cancel one in time.
+                "rotation_rules": rotation.as_ref().map(|r| json!({
+                    "delay_secs": r.rules.delay_secs,
+                    "needs_possession": r.rules.needs_possession,
+                })),
+                "pending_rotations": rotation.as_ref().map(|r| {
+                    let mut pending = Vec::new();
+                    if let Some(p) = &r.pending_pq {
+                        pending.push(json!({
+                            "kind": "pq_guardians",
+                            "new_pq_guardians": p.keys.iter().map(|k| k.to_hex()).collect::<Vec<_>>(),
+                            "effective_at_secs": p.effective_at_secs,
+                        }));
+                    }
+                    if let Some(p) = &r.pending_pause {
+                        pending.push(json!({ "kind": "pause_key", "new_pause_key": p.key.to_hex(), "effective_at_secs": p.effective_at_secs }));
+                    }
+                    pending
+                }),
                 // `next_index` is gone with the bridge's own registry: there is no index to
                 // predict any more, because a bridged token is listed before it can be deposited
                 // and its index is a fact a wallet reads off `assets` (`rand_getAssets`).
@@ -5468,6 +5509,17 @@ mod tests {
         );
         let pause_key = bundle_less(Action::RotatePauseKey { new_pause_key: keys[1].clone(), nonce: 8, pq_signatures: vec![pq(0)] });
         assert_eq!(pause_key, json!({ "kind": "rotate_pause_key", "new_pause_key": keys[1].to_hex(), "nonce": 8, "pq_signers": [0] }));
+        // Audit v6, BRG-14: the possession-carrying rotations (a count of holders' signatures,
+        // never the bytes) and the cancel (its kind by name).
+        let v2 = bundle_less(Action::RotatePqGuardiansV2 { new_pq_guardians: keys.clone(), possession: vec![vec![1; 4], vec![2; 4]], nonce: 9, pq_signatures: vec![pq(2)] });
+        assert_eq!(
+            v2,
+            json!({ "kind": "rotate_pq_guardians_v2", "new_pq_guardians": [keys[0].to_hex(), keys[1].to_hex()], "possession_signatures": 2, "nonce": 9, "pq_signers": [2] })
+        );
+        let pause_v2 = bundle_less(Action::RotatePauseKeyV2 { new_pause_key: keys[0].clone(), possession: vec![3; 4], nonce: 10, pq_signatures: vec![pq(1)] });
+        assert_eq!(pause_v2, json!({ "kind": "rotate_pause_key_v2", "new_pause_key": keys[0].to_hex(), "nonce": 10, "pq_signers": [1] }));
+        let cancel = bundle_less(Action::CancelRotation { kind: 1, nonce: 11, signature: randprotocol_core::crypto::Signature::empty() });
+        assert_eq!(cancel, json!({ "kind": "cancel_rotation", "rotation_kind": "pause_key", "nonce": 11 }));
     }
 
     /// Genesis vesting: the four actions render their public register facts.

@@ -351,6 +351,10 @@ pub fn fee_floor(action: &Action) -> u64 {
         // it, and it needs no wallet — and unspammable: it is admissible only with two of a
         // registered validator's own signatures over one view, and once per offender per jail.
         Action::SlashEquivocation { .. } => 0,
+        // Audit v6, BRG-14: the possession-carrying rotations and the cancel are bundle-less like
+        // the two rotations above, and unspammable the same way (a quorum or the pause key over
+        // the current `rotation_nonce`, which each spends).
+        Action::RotatePqGuardiansV2 { .. } | Action::RotatePauseKeyV2 { .. } | Action::CancelRotation { .. } => 0,
     }
 }
 

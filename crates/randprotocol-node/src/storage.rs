@@ -7,7 +7,7 @@
 //! and the head.
 
 use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB};
-use randprotocol_core::bridge::{BridgeBurnRecord, BridgeMeta, BridgeState, BridgeMetaV2};
+use randprotocol_core::bridge::{BridgeBurnRecord, BridgeMeta, BridgeRotationMeta, BridgeState, BridgeMetaV2};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::consensus::{CommittedBlock, EpochSets, SafetyState};
 use randprotocol_core::genesis::GenesisState;
@@ -274,6 +274,10 @@ const META_BRIDGE_STATE_V2: &str = "bridge_state_v2";
 /// gains a key. Genesis truth like `META_AGGREGATION`, restored by `load_bridge` so a restarted
 /// node refuses what it refused before.
 const META_BRIDGE_REPLAY_FLOOR: &str = "bridge_replay_floor";
+/// Audit v6, BRG-14: `bincode(BridgeRotationMeta)` — the genesis `bridge.rotation` rules and
+/// the pending rotations — written only on a chain whose genesis has the group (never on chain
+/// 18, whose key set and blobs stay what they are), deleted otherwise.
+const META_BRIDGE_ROTATION: &str = "bridge_rotation";
 /// `bincode(Option<TokenRegistry>)`: the RPL token registry as of the head, whole — `by_index`,
 /// `index_of`, `next_index` and `registration_fee` all together, the same shape `Ledger::tokens`
 /// holds and `TokenRegistry::root` hashes into the state root. `META_AGGREGATORS`'s twin, not
@@ -915,6 +919,10 @@ impl Storage {
             Some(floor) => batch.put_cf(self.cf(CF_META), META_BRIDGE_REPLAY_FLOOR, bincode::serialize(floor)?),
             None => batch.delete_cf(self.cf(CF_META), META_BRIDGE_REPLAY_FLOOR),
         }
+        match bridge.rotation_meta() {
+            Some(rotation) => batch.put_cf(self.cf(CF_META), META_BRIDGE_ROTATION, bincode::serialize(&rotation)?),
+            None => batch.delete_cf(self.cf(CF_META), META_BRIDGE_ROTATION),
+        }
         Ok(())
     }
 
@@ -947,6 +955,7 @@ impl Storage {
         batch.delete_cf(self.cf(CF_META), META_BRIDGE_STATE);
         batch.delete_cf(self.cf(CF_META), META_BRIDGE_STATE_V2);
         batch.delete_cf(self.cf(CF_META), META_BRIDGE_REPLAY_FLOOR);
+        batch.delete_cf(self.cf(CF_META), META_BRIDGE_ROTATION);
         Ok(())
     }
 
@@ -996,6 +1005,17 @@ impl Storage {
         }
     }
 
+    /// The rotation half of the bridge blob (audit v6, BRG-14): the rules and the pending
+    /// rotations, `None` on a chain whose genesis has no `bridge.rotation` — chain 18 — where the
+    /// key is never written. Decoded strictly like [`Self::bridge_meta`].
+    pub fn bridge_rotation_meta(&self) -> Result<Option<BridgeRotationMeta>> {
+        use bincode::Options as _;
+        match self.get_meta_raw(META_BRIDGE_ROTATION)? {
+            Some(bytes) => Ok(Some(bincode::DefaultOptions::new().with_fixint_encoding().deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
     /// The outbound burn message with this sequence, for guardians to sign.
     pub fn bridge_burn(&self, sequence: u64) -> Result<Option<BridgeBurnRecord>> {
         self.get(CF_BRIDGE_BURNS, &height_key(sequence))
@@ -1021,7 +1041,14 @@ impl Storage {
             let rec: BridgeBurnRecord = bincode::deserialize(&v)?;
             burns.insert(rec.sequence, rec);
         }
-        Ok(Some(BridgeState::from_parts(meta, self.bridge_meta_v2()?, self.bridge_replay_floor()?, spent, burns)))
+        Ok(Some(BridgeState::from_parts_with_rotation(
+            meta,
+            self.bridge_meta_v2()?,
+            self.bridge_replay_floor()?,
+            spent,
+            burns,
+            self.bridge_rotation_meta()?,
+        )))
     }
 
     // ---- the shielded pool ----------------------------------------------
@@ -3518,6 +3545,7 @@ pub(crate) mod fixtures {
             guardian_set_index: None,
             burn_sequence: None,
             min_inbound_sequence: None,
+            rotation: None,
         };
         (config, secrets)
     }
@@ -3557,9 +3585,20 @@ pub(crate) mod fixtures {
         rules_v2: Option<randprotocol_core::bridge::BridgeRulesV2>,
         min_inbound_sequence: Option<BTreeMap<u16, u64>>,
     ) -> (GenesisState, Vec<[u8; 32]>) {
+        bridged_genesis_with_rotation(chain_id, rules_v2, min_inbound_sequence, None)
+    }
+
+    /// [`bridged_genesis_with`] plus the audit v6 BRG-14 `bridge.rotation` group.
+    pub(crate) fn bridged_genesis_with_rotation(
+        chain_id: u64,
+        rules_v2: Option<randprotocol_core::bridge::BridgeRulesV2>,
+        min_inbound_sequence: Option<BTreeMap<u16, u64>>,
+        rotation: Option<randprotocol_core::bridge::RotationRules>,
+    ) -> (GenesisState, Vec<[u8; 32]>) {
         let (mut config, secrets) = bridge_config();
         config.rules_v2 = rules_v2;
         config.min_inbound_sequence = min_inbound_sequence;
+        config.rotation = rotation;
         let k = key(1);
         let gs = Genesis {
             chain_id,
@@ -4160,7 +4199,7 @@ pub(crate) mod fixtures {
         make_block_unchecked_at(parent, ledger, txs, k, timestamp_ms)
     }
 
-    fn make_block_unchecked_at(parent: &impl FixtureParent, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair, timestamp_ms: u64) -> CommittedBlock {
+    pub(crate) fn make_block_unchecked_at(parent: &impl FixtureParent, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair, timestamp_ms: u64) -> CommittedBlock {
         let justify = parent.parent_qc();
         let parent = parent.parent_block();
         let height = parent.height() + 1;
@@ -4849,6 +4888,122 @@ mod tests {
         assert_eq!(check.problem, None);
         assert_eq!(check.ledger.bridge(), ledger.bridge());
         assert_eq!(check.ledger.tokens(), ledger.tokens());
+    }
+
+    /// Audit v6, BRG-14 on disk. A chain without `bridge.rotation` (chain 18) writes no
+    /// `META_BRIDGE_ROTATION` key and its v2 row keeps today's exact layout; a chain with the group
+    /// stores the rules and, under the delay, the pending rotation beside them: a PQ rotation
+    /// accepted at block 1 is pending through a restart, the old set's co-signatures still verify
+    /// at block 2, the rotation takes effect at the end of block 3 (whose time reaches
+    /// `effective_at`), and after it the old set's co-signatures fail while the new set's pass —
+    /// at every step `load_ledger`, `reload_ledger` and the replay audit rebuild the same bridge
+    /// and root.
+    #[test]
+    fn a_rotation_chain_persists_its_pending_rotation_and_chain_18s_rows_are_unchanged() {
+        use randprotocol_core::bridge::{pq_cosign, Attestation, BridgeError, PendingPqRotation, RotationRules};
+        use randprotocol_core::crypto::Keypair;
+        use fixtures::make_block_unchecked_at;
+        // Chain 18's shape: rules_v2, no rotation group — no rotation key, the v2 row byte for byte.
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (gs, _) = bridged_genesis_v2(9);
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.get_meta_raw(META_BRIDGE_ROTATION).unwrap(), None, "no rotation key without the group");
+        let rules = gs.ledger.bridge().unwrap().rules_v2.clone().unwrap();
+        assert_eq!(
+            s.get_meta_raw(META_BRIDGE_STATE_V2).unwrap(),
+            Some(bincode::serialize(&BridgeMetaV2 { rotation_nonce: 0, rules }).unwrap()),
+            "the v2 row is today's layout"
+        );
+        let loaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(loaded.bridge().unwrap().rotation_rules, None);
+        assert_eq!(loaded.state_root(), gs.ledger.state_root());
+
+        // A chain with the group: a day's delay, no possession rule.
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let rotation = RotationRules { delay_secs: Some(100), needs_possession: None };
+        let (gs, secrets) = bridged_genesis_with_rotation(
+            9,
+            Some(randprotocol_core::bridge::BridgeRulesV2 { global_mint_cap_per_window: 1_000_000, cap_window_secs: 86_400 }),
+            None,
+            Some(rotation.clone()),
+        );
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(
+            s.bridge_rotation_meta().unwrap(),
+            Some(randprotocol_core::bridge::BridgeRotationMeta { rules: rotation.clone(), pending_pq: None, pending_pause: None })
+        );
+        let mut ledger = gs.ledger.clone();
+        let old = pq_keys();
+        let new: Vec<Keypair> = (0..6u8).map(|i| Keypair::from_seed([0xa0 + i; 32]).unwrap()).collect();
+        let new_pks: Vec<_> = new.iter().map(|k| k.public_key().clone()).collect();
+        // A block as the proposer and every replica build one: the transactions, then the
+        // block-end steps (`close_block`, where a due rotation takes effect), then the header.
+        let block_at = |parent: &CommittedBlock, ledger: &mut Ledger, txs: Vec<Transaction>, at_ms: u64| {
+            let height = parent.block.height() + 1;
+            ledger.set_height(height);
+            ledger.set_timestamp_ms(at_ms);
+            ledger.apply_transactions(&txs, &key(1).address(), &StubExecutor).unwrap();
+            ledger.close_block(height, &key(1).address(), 0, 0);
+            make_block_unchecked_at(parent, ledger, txs, &key(1), at_ms)
+        };
+        let genesis_block = CommittedBlock { block: gs.block.clone(), pruned: Vec::new(), qc: QuorumCertificate::genesis(gs.block.hash()), receipts: Vec::new(), deposits: Vec::new() };
+        // Block 1 at 50 s (a bridged chain steps at most 60 s a block): the rotation lands,
+        // pending until 150 s.
+        let m = randprotocol_core::bridge::gov::rotate_pq_message(ledger.chain_id(), 0, &new_pks);
+        let rotate = Transaction {
+            chain_id: ledger.chain_id(),
+            bundle: None,
+            action: Action::RotatePqGuardians { new_pq_guardians: new_pks.clone(), nonce: 0, pq_signatures: pq_quorum_message(&m) },
+        };
+        let b1 = block_at(&genesis_block, &mut ledger, vec![rotate], 50_000);
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let b = ledger.bridge().unwrap();
+        assert_eq!(b.pending_pq, Some(PendingPqRotation { keys: new_pks.clone(), effective_at_secs: 150 }));
+        assert_eq!(b.pq_guardians, old.iter().map(|k| k.public_key().clone()).collect::<Vec<_>>(), "the old set still signs");
+        assert_eq!(b.rotation_nonce, 1);
+        assert_restart_round_trips(&s, &gs, &ledger, "a pending PQ rotation");
+        assert_eq!(s.bridge_rotation_meta().unwrap().unwrap().pending_pq.as_ref().map(|p| p.effective_at_secs), Some(150));
+        // Block 2 at 100 s: a deposit co-signed by the old set applies during the delay.
+        let att = attestation(&secrets, &recipient(), 1_000, 1);
+        let cosigned_by = |keys: &[Keypair], att: &[u8]| -> Vec<randprotocol_core::bridge::PqSignature> {
+            let mu = Attestation::body_bytes(att).map(randprotocol_core::bridge::digest).unwrap();
+            keys.iter().take(5).enumerate().map(|(i, k)| pq_cosign(k, i as u8, 9, &mu)).collect()
+        };
+        let with_quorum = |ledger: &Ledger, att: Vec<u8>, seed: u32, sigs: Vec<randprotocol_core::bridge::PqSignature>| {
+            let mut tx = attest_tx(ledger, att, seed);
+            let Action::BridgeAttest { pq_signatures, .. } = &mut tx.action else { unreachable!() };
+            *pq_signatures = sigs;
+            StubExecutor::bound(tx)
+        };
+        let deposit_old = with_quorum(&ledger, att.clone(), 20, cosigned_by(&old, &att));
+        assert_eq!(ledger.validate(&deposit_old, &StubExecutor), Ok(()));
+        let b2 = block_at(&b1, &mut ledger, vec![deposit_old], 100_000);
+        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+        assert_restart_round_trips(&s, &gs, &ledger, "a deposit under the old set during the delay");
+        // Block 3 at 150 s, empty: the rotation takes effect at its end.
+        let root_before = ledger.state_root();
+        let b3 = block_at(&b2, &mut ledger, vec![], 150_000);
+        s.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
+        let b = ledger.bridge().unwrap();
+        assert_eq!((b.pending_pq.clone(), b.pq_guardians.clone(), b.rotation_nonce), (None, new_pks.clone(), 2));
+        assert_ne!(ledger.state_root(), root_before);
+        assert_restart_round_trips(&s, &gs, &ledger, "the rotation in effect");
+        assert_eq!(s.bridge_rotation_meta().unwrap().unwrap().pending_pq, None);
+        // After it the old set's co-signatures fail and the new set's verify.
+        ledger.set_height(4);
+        ledger.set_timestamp_ms(160_000);
+        let att2 = attestation(&secrets, &recipient(), 1_000, 2);
+        let stale = with_quorum(&ledger, att2.clone(), 30, cosigned_by(&old, &att2));
+        assert_eq!(ledger.validate(&stale, &StubExecutor), Err(randprotocol_core::TxError::Bridge(BridgeError::PqBadSignature { index: 0 })));
+        let fresh = with_quorum(&ledger, att2.clone(), 30, cosigned_by(&new, &att2));
+        assert_eq!(ledger.validate(&fresh, &StubExecutor), Ok(()));
+        // The replay audit rebuilds the same bridge — the activation at block 3 included.
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(check.problem, None);
+        assert_eq!(check.ledger.bridge().unwrap().pq_guardians, new_pks);
+        assert_eq!(check.ledger.bridge().unwrap().rotation_nonce, 2);
     }
 
     /// C15-1 on disk: a genesis replay floor rides `META_BRIDGE_REPLAY_FLOOR` (strictly decoded)

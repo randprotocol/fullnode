@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod agg_executor;
+pub mod bridge_gov_tool;
 pub mod disk;
 pub mod hosted_prover;
 pub mod rlimit;

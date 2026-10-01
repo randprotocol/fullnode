@@ -422,6 +422,7 @@ mod tests {
             guardian_set_index: None,
             burn_sequence: None,
             min_inbound_sequence: None,
+            rotation: None,
         };
         (config, secrets)
     }

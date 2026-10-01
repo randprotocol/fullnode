@@ -236,6 +236,45 @@ pub fn rotate_pause_message_in(
     rebind(domain, ROTATE_PAUSE_DOMAIN, ROTATE_PAUSE_DOMAIN_V2, rotate_pause_message(chain_id, rotation_nonce, new_pause_key))
 }
 
+// ── BRG-14 (audit v6, issue #89): the cancel message, and the possession proof ────────────────
+//
+// ```text
+// M_cancel = b"rand-bridge-cancel-rotation-1" ‖ chain_id u64 ‖ nonce u64 ‖ kind u8
+// ```
+//
+// signed by the **current pause key** — the one key held apart from the PQ quorum — to drop the
+// pending rotation of `kind` (0 = the PQ set, 1 = the pause key) at the bridge's `rotation_nonce`,
+// which the cancel spends. Genesis-bound (`…-2`, the genesis hash between the tag and the chain
+// id) like every message above under `binding_domain: 1`.
+//
+// A proof of possession is not a new message: under `bridge.rotation.needs_possession` each NEW
+// key signs the very rotation message the quorum signs — `M_rotate_pq`/`M_rotate_pause` (or their
+// genesis-bound forms) — so one file signed by the current quorum and each new holder is the
+// whole rotation, and a key nobody holds cannot be rotated in.
+
+/// `M_cancel`'s domain tag: 29 ASCII bytes, no terminator.
+pub const CANCEL_ROTATION_DOMAIN: &[u8] = b"rand-bridge-cancel-rotation-1";
+/// `M_cancel`'s genesis-bound domain tag.
+pub const CANCEL_ROTATION_DOMAIN_V2: &[u8] = b"rand-bridge-cancel-rotation-2";
+
+/// `M_cancel`: what the current pause key signs to drop the pending rotation of `kind` at
+/// `rotation_nonce`.
+pub fn cancel_rotation_message(chain_id: u64, rotation_nonce: u64, kind: crate::bridge::RotationKind) -> Vec<u8> {
+    let mut m = head(CANCEL_ROTATION_DOMAIN, chain_id, rotation_nonce);
+    m.push(kind as u8);
+    m
+}
+
+/// [`cancel_rotation_message`] on a chain of `domain`.
+pub fn cancel_rotation_message_in(
+    domain: &BindingDomain,
+    chain_id: u64,
+    rotation_nonce: u64,
+    kind: crate::bridge::RotationKind,
+) -> Vec<u8> {
+    rebind(domain, CANCEL_ROTATION_DOMAIN, CANCEL_ROTATION_DOMAIN_V2, cancel_rotation_message(chain_id, rotation_nonce, kind))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -511,5 +550,27 @@ pub(crate) mod tests {
         assert!(key.public_key().verify(&pause_message_in(&ga, 7, 9), &sig));
         assert!(!key.public_key().verify(&pause_message_in(&gb, 7, 9), &sig));
         assert!(!key.public_key().verify(&pause_message(7, 9), &sig));
+    }
+
+    /// BRG-14: `M_cancel` byte for byte — the domain, the chain id, the rotation nonce, the kind
+    /// byte — its genesis-bound twin behind the hash, and no kind's message is the other's.
+    #[test]
+    fn the_cancel_message_is_fixed_bytes_over_the_nonce_and_the_kind() {
+        use crate::bridge::RotationKind;
+        let m = cancel_rotation_message(0x0102_0304_0506_0708, 5, RotationKind::PqGuardians);
+        assert_eq!(&m[..29], b"rand-bridge-cancel-rotation-1");
+        assert_eq!(&m[29..37], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&m[37..45], &5u64.to_be_bytes());
+        assert_eq!((m[45], m.len()), (0, 46));
+        assert_eq!(cancel_rotation_message(7, 5, RotationKind::PauseKey)[45], 1);
+        assert_ne!(cancel_rotation_message(7, 5, RotationKind::PauseKey), cancel_rotation_message(7, 5, RotationKind::PqGuardians));
+        assert_ne!(cancel_rotation_message(7, 6, RotationKind::PqGuardians), cancel_rotation_message(7, 5, RotationKind::PqGuardians));
+        let g = BindingDomain::Genesis(crate::crypto::Hash([0xa; 32]));
+        let b = cancel_rotation_message_in(&g, 7, 5, RotationKind::PqGuardians);
+        assert_eq!(&b[..29], b"rand-bridge-cancel-rotation-2");
+        assert_eq!(&b[29..61], &[0xa; 32]);
+        assert_eq!(&b[61..], &cancel_rotation_message(7, 5, RotationKind::PqGuardians)[29..]);
+        assert_eq!(cancel_rotation_message_in(&BindingDomain::ChainId, 7, 5, RotationKind::PqGuardians), cancel_rotation_message(7, 5, RotationKind::PqGuardians));
+        assert_eq!((RotationKind::from_byte(0), RotationKind::from_byte(1), RotationKind::from_byte(2)), (Some(RotationKind::PqGuardians), Some(RotationKind::PauseKey), None));
     }
 }

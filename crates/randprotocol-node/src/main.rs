@@ -789,6 +789,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: VestingCmd,
     },
+    /// Audit v6, BRG-14: sign and submit the bridge's post-quantum rotations (`docs/bridge.md`
+    /// §21.1, §21.5) — the PQ guardian set, the pause key, and a cancel of a pending rotation.
+    /// Each is `message` (print what will be signed, for every signer to compare), `sign` (one
+    /// key file → one `index:signature` line) and `submit` (assemble the collected lines).
+    BridgeGov {
+        #[command(subcommand)]
+        cmd: BridgeGovCmd,
+    },
     /// The aggregator role on a chain with an `aggregation` section (block aggregation,
     /// spec §2.2): register, unbond, withdraw. The register's twins, one register over.
     Aggregator {
@@ -899,6 +907,223 @@ enum AggregatorCmd {
 /// free; a withdraw pays the bundle base out of the amount it withdraws, to the proposer of the
 /// block that applies it. So neither command takes a wallet, and both return in a block's time
 /// rather than a proof's.
+/// `rand-node bridge-gov …` (audit v6, BRG-14).
+#[derive(Subcommand)]
+enum BridgeGovCmd {
+    /// Replace the whole PQ guardian set (`RotatePqGuardians`, or `…V2` with possession).
+    RotatePq {
+        #[command(subcommand)]
+        step: RotateStep,
+    },
+    /// Replace the pause key (`RotatePauseKey`, or `…V2` with possession).
+    RotatePause {
+        #[command(subcommand)]
+        step: RotateStep,
+    },
+    /// Drop a pending rotation before it takes effect (`CancelRotation`), signed by the current
+    /// pause key; only on a chain with `bridge.rotation.delay_secs`.
+    CancelRotation {
+        #[command(subcommand)]
+        step: CancelStep,
+    },
+}
+
+/// The new keys a rotation brings in: each a hex Dilithium2 public key, or `@path` to a file
+/// holding one in hex, or a key file (its public key is read; the seed is never needed).
+#[derive(clap::Args, Clone)]
+struct NewKeys {
+    /// Repeat once per key, in the new set's index order (one for a pause key).
+    #[arg(long = "new-key", required = true)]
+    new_key: Vec<String>,
+    #[arg(long, default_value = "http://127.0.0.1:8545")]
+    rpc: String,
+}
+
+#[derive(Subcommand)]
+enum RotateStep {
+    /// Print the hex rotation message for the chain's current `rotation_nonce`.
+    Message {
+        #[command(flatten)]
+        keys: NewKeys,
+    },
+    /// Sign the message with one key file and print `index:signature`. A current PQ guardian
+    /// signs for the quorum (`--index` its place in the current set); with `--possession` a NEW
+    /// key signs to prove it is held (`--index` its place in the new set, 0 for a pause key).
+    Sign {
+        #[command(flatten)]
+        keys: NewKeys,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        index: u8,
+        #[arg(long)]
+        possession: bool,
+    },
+    /// Assemble and send the rotation from the collected lines (`@file` or the text itself).
+    /// With `--possession` the `…V2` action is sent; without it, the v1 action.
+    Submit {
+        #[command(flatten)]
+        keys: NewKeys,
+        #[arg(long)]
+        quorum: String,
+        #[arg(long)]
+        possession: Option<String>,
+        #[arg(long)]
+        no_wait: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CancelStep {
+    /// Sign the cancel message with the current pause key and print `0:signature`.
+    Sign {
+        #[arg(long, value_parser = ["pq", "pause"])]
+        kind: String,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+    /// Send the cancel with the signature `sign` printed (`@file` or the text itself).
+    Submit {
+        #[arg(long, value_parser = ["pq", "pause"])]
+        kind: String,
+        #[arg(long)]
+        signature: String,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        #[arg(long)]
+        no_wait: bool,
+    },
+}
+
+/// `@path` reads the file; anything else is the text itself.
+fn text_arg(arg: &str) -> Result<String> {
+    match arg.strip_prefix('@') {
+        Some(path) => std::fs::read_to_string(path).with_context(|| format!("reading {path}")),
+        None => Ok(arg.to_string()),
+    }
+}
+
+/// One `--new-key`: a key file (its public key), or hex inline or behind `@path`.
+fn parse_new_key(arg: &str) -> Result<randprotocol_core::PublicKey> {
+    if let Some(path) = arg.strip_prefix('@') {
+        if let Ok(kp) = load_keypair(std::path::Path::new(path)) {
+            return Ok(kp.public_key().clone());
+        }
+    }
+    let text = text_arg(arg)?;
+    let text = text.trim();
+    randprotocol_core::PublicKey::from_hex(text.strip_prefix("0x").unwrap_or(text))
+        .map_err(|e| anyhow::anyhow!("--new-key {arg:.24}…: not a Dilithium2 public key or key file: {e}"))
+}
+
+/// What every bridge-gov step reads from the node: the chain id, its binding domain (BIND-1),
+/// the bridge's `rotation_nonce`, its current PQ set and pause key.
+struct GovView {
+    chain_id: u64,
+    domain: randprotocol_core::BindingDomain,
+    nonce: u64,
+    pq_guardians: Vec<randprotocol_core::PublicKey>,
+    pause_key: Option<randprotocol_core::PublicKey>,
+    needs_possession: bool,
+}
+
+async fn gov_view(rpc: &RpcClient) -> Result<GovView> {
+    let chain_id = rpc.chain_id().await?;
+    let domain = rpc.binding_domain(chain_id).await?;
+    let state = rpc.bridge_state().await?;
+    anyhow::ensure!(state["enabled"] == serde_json::Value::Bool(true), "this chain has no bridge");
+    anyhow::ensure!(!state["rules_v2"].is_null(), "this chain has no bridge rules v2: it has no rotations");
+    let key = |v: &serde_json::Value| randprotocol_core::PublicKey::from_hex(v.as_str().unwrap_or_default()).map_err(|e| anyhow::anyhow!("{e}"));
+    Ok(GovView {
+        chain_id,
+        domain,
+        nonce: state["rotation_nonce"].as_u64().context("the node serves no rotation_nonce")?,
+        pq_guardians: state["pq_guardians"].as_array().context("the node serves no pq_guardians")?.iter().map(key).collect::<Result<_>>()?,
+        pause_key: match &state["pause_key"] {
+            serde_json::Value::Null => None,
+            k => Some(key(k)?),
+        },
+        needs_possession: state["rotation_rules"]["needs_possession"].as_bool() == Some(true),
+    })
+}
+
+async fn bridge_gov(cmd: BridgeGovCmd) -> Result<()> {
+    use randprotocol_core::bridge::RotationKind;
+    use randprotocol_node::bridge_gov_tool as tool;
+    let rotation_of = |pause: bool, keys: &NewKeys| -> Result<tool::Rotation> {
+        let parsed = keys.new_key.iter().map(|k| parse_new_key(k)).collect::<Result<Vec<_>>>()?;
+        if pause {
+            anyhow::ensure!(parsed.len() == 1, "a pause-key rotation names exactly one --new-key");
+            Ok(tool::Rotation::Pause(parsed[0].clone()))
+        } else {
+            Ok(tool::Rotation::Pq(parsed))
+        }
+    };
+    let (pause, step) = match cmd {
+        BridgeGovCmd::RotatePq { step } => (false, step),
+        BridgeGovCmd::RotatePause { step } => (true, step),
+        BridgeGovCmd::CancelRotation { step } => {
+            let kind_of = |k: &str| if k == "pause" { RotationKind::PauseKey } else { RotationKind::PqGuardians };
+            match step {
+                CancelStep::Sign { kind, key, rpc } => {
+                    let v = gov_view(&RpcClient::new(rpc)).await?;
+                    let m = tool::cancel_message(&v.domain, v.chain_id, v.nonce, kind_of(&kind));
+                    println!("{}", tool::sign_line(&load_keypair(&key)?, 0, &m, v.pause_key.as_ref())?);
+                }
+                CancelStep::Submit { kind, signature, rpc, no_wait } => {
+                    let client = RpcClient::new(rpc.clone());
+                    let v = gov_view(&client).await?;
+                    let action = tool::assemble_cancel(kind_of(&kind), v.nonce, &text_arg(&signature)?)?;
+                    let args = StakingArgs { key: PathBuf::new(), rpc, no_wait };
+                    submit_staking(&args, v.chain_id, action, "rotation cancel").await?;
+                }
+            }
+            return Ok(());
+        }
+    };
+    match step {
+        RotateStep::Message { keys } => {
+            let v = gov_view(&RpcClient::new(keys.rpc.clone())).await?;
+            let m = tool::rotation_message(&v.domain, v.chain_id, v.nonce, &rotation_of(pause, &keys)?);
+            eprintln!("chain {} rotation_nonce {}{}", v.chain_id, v.nonce, if v.needs_possession { " (possession required)" } else { "" });
+            println!("{}", hex::encode(m));
+        }
+        RotateStep::Sign { keys, key, index, possession } => {
+            let v = gov_view(&RpcClient::new(keys.rpc.clone())).await?;
+            let rotation = rotation_of(pause, &keys)?;
+            let m = tool::rotation_message(&v.domain, v.chain_id, v.nonce, &rotation);
+            let expected = match (&rotation, possession) {
+                (tool::Rotation::Pq(new), true) => new.get(index as usize).cloned(),
+                (tool::Rotation::Pause(new), true) => Some(new.clone()),
+                (_, false) => v.pq_guardians.get(index as usize).cloned(),
+            }
+            .with_context(|| format!("there is no key at index {index}"))?;
+            println!("{}", tool::sign_line(&load_keypair(&key)?, index, &m, Some(&expected))?);
+        }
+        RotateStep::Submit { keys, quorum, possession, no_wait } => {
+            let v = gov_view(&RpcClient::new(keys.rpc.clone())).await?;
+            let rotation = rotation_of(pause, &keys)?;
+            let m = tool::rotation_message(&v.domain, v.chain_id, v.nonce, &rotation);
+            let possession = match possession {
+                Some(p) => tool::parse_signature_lines(&text_arg(&p)?)?,
+                None => Vec::new(),
+            };
+            anyhow::ensure!(
+                possession.is_empty() != v.needs_possession,
+                "this chain {} a proof of possession: {} --possession",
+                if v.needs_possession { "requires" } else { "does not take" },
+                if v.needs_possession { "pass" } else { "drop" }
+            );
+            let action = tool::assemble_rotation(rotation, v.nonce, tool::parse_signature_lines(&text_arg(&quorum)?)?, possession, &m)?;
+            let args = StakingArgs { key: PathBuf::new(), rpc: keys.rpc, no_wait };
+            submit_staking(&args, v.chain_id, action, if pause { "pause-key rotation" } else { "PQ guardian rotation" }).await?;
+        }
+    }
+    Ok(())
+}
+
 /// `rand-node vesting …` (genesis vesting).
 #[derive(Subcommand)]
 enum AdmitCmd {
@@ -1866,6 +2091,7 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Cmd::BridgeGov { cmd } => bridge_gov(cmd).await?,
         Cmd::Vesting { cmd } => match cmd {
             VestingCmd::Status { entry, rpc } => {
                 let v = vesting_entry(&RpcClient::new(rpc), &parse_entry_id(&entry)?, None).await?;

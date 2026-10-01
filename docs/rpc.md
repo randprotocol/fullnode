@@ -1501,6 +1501,16 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
+### 2026-10-01 — audit v6, BRG-14: rotation possession, delay and cancel (genesis-gated; no chain carries it yet)
+
+- **`rand_getBridgeState` gains `rotation_rules`** (`{ "delay_secs", "needs_possession" }`, `null`
+  without the genesis `bridge.rotation` group) **and `pending_rotations`** (`null` without it; else
+  a list of `{ "kind": "pq_guardians", "new_pq_guardians": [hex…], "effective_at_secs" }` /
+  `{ "kind": "pause_key", "new_pause_key": hex, "effective_at_secs" }`).
+- **Three new transaction kinds in `tx_json`**: `rotate_pq_guardians_v2` (the v1 fields plus
+  `possession_signatures`, a count), `rotate_pause_key_v2`, and `cancel_rotation`
+  (`rotation_kind` `"pq_guardians"`/`"pause_key"`, `nonce`). Wire variants 30, 31, 32 (after STAKE-2's `AdmitValidator` = 28 and STAKE-1's `SlashEquivocation` = 29).
+
 ### 2026-10-01 — audit v6, BIND-1: `binding_domain` (genesis-gated; no chain carries it yet)
 
 - **`rand_getLimits` and `rand_status` gain `binding_domain`** (`0` or `1`): whether the chain's

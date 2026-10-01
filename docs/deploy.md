@@ -1165,6 +1165,23 @@ today, as re-read on 2026-10-01:
   it compiles to — the guest is a fixture, not a program anyone is paid by. Not changed here
   (vendored); a guest that must not wrap uses `checked_add` and halts on `None`.
 
+## The next cut: `bridge.rotation` (audit v6, BRG-14, issue #89)
+
+A group inside the genesis `bridge` section, beside `rules_v2`: `"rotation": { "delay_secs":
+86400, "needs_possession": true }` (`docs/bridge.md` §21.5). `needs_possession` makes every PQ-set
+and pause-key rotation carry each new key's own signature over the rotation message (the V2
+actions, variants 30/31); `delay_secs` (1 s to 30 days) makes an accepted rotation pend until a
+block's time reaches `effective_at_secs`, while the current pause key can cancel it
+(`CancelRotation`, variant 32). Hashed after `binding_domain`, in the bridge root under
+`rand-bridge-rotation-1` and stored under `bridge_rotation`, all only when present — chain 18 is
+byte for byte unchanged. **What the cut passes:** the group in the bridge JSON the cut script
+splices in (`rand-node genesis` writes no bridge section, so there is no flag); recommended
+`delay_secs: 86400, needs_possession: true`. **Before the first real rotation**, run the
+rehearsal checklist in `docs/bridge.md` §21.5 on a private chain; the signer is
+`rand-node bridge-gov` (this repository). A rotation's activation spends a `rotation_nonce`, so
+relayers holding attestations co-signed by the old set must re-collect co-signatures from the new
+set after `effective_at_secs`.
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and

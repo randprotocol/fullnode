@@ -2203,7 +2203,10 @@ impl Ledger {
             | Action::RegisterBridgedToken { .. }
             | Action::ListBacking { .. }
             | Action::RotatePqGuardians { .. }
-            | Action::RotatePauseKey { .. }) => {
+            | Action::RotatePauseKey { .. }
+            | Action::RotatePqGuardiansV2 { .. }
+            | Action::RotatePauseKeyV2 { .. }
+            | Action::CancelRotation { .. }) => {
                 bridge_gov::validate(self, tx, a)?;
             }
             Action::Aggregate { .. } => {
@@ -2454,7 +2457,10 @@ impl Ledger {
             | Action::RegisterBridgedToken { .. }
             | Action::ListBacking { .. }
             | Action::RotatePqGuardians { .. }
-            | Action::RotatePauseKey { .. }) => {
+            | Action::RotatePauseKey { .. }
+            | Action::RotatePqGuardiansV2 { .. }
+            | Action::RotatePauseKeyV2 { .. }
+            | Action::CancelRotation { .. }) => {
                 bridge_gov::apply(self, tx, a)?;
             }
             Action::Aggregate { .. } => {
@@ -2743,6 +2749,14 @@ impl Ledger {
             // Audit v6, STAKE-1: a jail whose epoch has come ends here, in the same state the
             // next set is derived from. Empty without `staking.slashing`.
             self.jailed.retain(|_, until| *until > next_epoch);
+        }
+        // Audit v6, BRG-14: a pending PQ-set or pause-key rotation whose delay has run out takes
+        // effect at this block's end, by this block's own time — the proposer and every replica
+        // run this on the same timestamp, so the root both compute already carries the new set,
+        // and the next block's attestations verify under it. A no-op without `bridge.rotation`.
+        let now = self.now_secs();
+        if let Some(bridge) = self.bridge.as_mut() {
+            bridge.activate_due_rotations(now);
         }
         self.record_anchor(height);
         // Spec §12's invariant, checked once per block in a debug build: every bridged token's
@@ -4886,6 +4900,7 @@ mod tests {
                 guardian_set_index: None,
                 burn_sequence: None,
                 min_inbound_sequence: None,
+                rotation: None,
             };
         let mut bridged = plain.clone();
         bridged.set_bridge(Some(BridgeState::from_config(&config)));
@@ -4942,6 +4957,7 @@ mod tests {
                 guardian_set_index: None,
                 burn_sequence: None,
                 min_inbound_sequence: None,
+                rotation: None,
             };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));
@@ -5004,6 +5020,7 @@ mod tests {
                 guardian_set_index: None,
                 burn_sequence: None,
                 min_inbound_sequence: None,
+                rotation: None,
             };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));

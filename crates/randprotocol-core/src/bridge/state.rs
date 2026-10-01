@@ -77,6 +77,15 @@ pub struct BridgeConfig {
     pub pause_key: Option<PublicKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules_v2: Option<BridgeRulesV2>,
+    /// Audit v6, BRG-14: the rotation rules — a delay before a rotation takes effect and a proof
+    /// that the new keys are held ([`RotationRules`]). Its own group beside `rules_v2`, not
+    /// inside it: `BridgeRulesV2` is bincode inside the stored `BridgeMetaV2` blob and the
+    /// `rand-bridge-state-5` root, so a field added to it would stop chain 18's stored row
+    /// decoding and move its root. Requires `rules_v2`. Absent — chains 15 to 18 — nothing
+    /// changes: it is committed to the genesis hash under its own tag, folded into the bridge
+    /// root under its own domain and stored under its own key only when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<RotationRules>,
     /// The guardian-set index `guardians` start the chain as (chain 15, cut from chain 14 after
     /// the source endpoints rotated to set 1). The genesis bridge then holds exactly one set, at
     /// this index, as `current_set` — what a chain that rotated to it holds, less the sets it
@@ -133,6 +142,94 @@ pub struct BridgeRulesV2 {
     pub cap_window_secs: u32,
 }
 
+/// Audit v6, BRG-14: the genesis `bridge.rotation` group — how a PQ-set or pause-key rotation
+/// (`docs/bridge.md` §21) takes effect on this chain.
+///
+/// - `delay_secs`: an accepted rotation is recorded as *pending* with `effective_at = block
+///   time + delay` and takes effect at the end of the first block whose timestamp reaches it
+///   ([`BridgeState::activate_due_rotations`], run by `Ledger::close_block` on proposer and
+///   replica alike); until then the old set signs, and the current pause key can cancel it
+///   (`Action::CancelRotation`). One pending rotation per kind. Absent: a rotation takes effect
+///   in the block it lands in, as before.
+/// - `needs_possession`: a rotation must be the `…V2` action carrying each new key's own
+///   signature over the rotation message the quorum signs — a typo or a key nobody holds can no
+///   longer brick the PQ quorum. Under it the v1 actions are refused; without it the v2 ones are.
+///
+/// Both optional inside the group so each can be turned on alone; the group must sit beside
+/// `rules_v2`. Committed to the genesis hash as `b"bridge_rotation"` ‖ each field behind a
+/// presence byte; in the bridge root (`rand-bridge-rotation-1`) and on disk
+/// (`META_BRIDGE_ROTATION`) with the pending rotations, only when present.
+///
+/// The two fields are written even when absent (`null` in the file): the struct is also the
+/// bincode of the stored `BridgeRotationMeta`, and a skipped field would not decode.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotationRules {
+    #[serde(default)]
+    pub delay_secs: Option<u32>,
+    #[serde(default)]
+    pub needs_possession: Option<bool>,
+}
+
+impl RotationRules {
+    /// The delay in seconds, `0` when the group sets none (a rotation takes effect at once).
+    pub fn delay_secs(&self) -> u64 {
+        self.delay_secs.map_or(0, u64::from)
+    }
+
+    pub fn needs_possession(&self) -> bool {
+        self.needs_possession == Some(true)
+    }
+}
+
+/// Longest `bridge.rotation.delay_secs` a genesis may set: 30 days.
+pub const MAX_ROTATION_DELAY_SECS: u32 = 30 * 86_400;
+
+/// Which of the two rotations a `CancelRotation` names (BRG-14): the wire byte of
+/// `Action::CancelRotation::kind` and of the cancel message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum RotationKind {
+    PqGuardians = 0,
+    PauseKey = 1,
+}
+
+impl RotationKind {
+    pub fn from_byte(b: u8) -> Option<RotationKind> {
+        match b {
+            0 => Some(RotationKind::PqGuardians),
+            1 => Some(RotationKind::PauseKey),
+            _ => None,
+        }
+    }
+}
+
+/// A PQ-set rotation accepted under `bridge.rotation.delay_secs` and not yet in effect (BRG-14).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPqRotation {
+    pub keys: Vec<PublicKey>,
+    /// The block time, in unix seconds, at or past which it takes effect.
+    pub effective_at_secs: u64,
+}
+
+/// A pause-key rotation accepted under the delay and not yet in effect (BRG-14).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPauseRotation {
+    pub key: PublicKey,
+    pub effective_at_secs: u64,
+}
+
+/// The rotation half of the storage blob (BRG-14): the rules and the pending rotations, stored
+/// under its own key (`META_BRIDGE_ROTATION`) and only on a chain whose genesis has
+/// `bridge.rotation` — so chain 18's database keeps the key set and the blobs it has. Bincode,
+/// strictly decoded; a field added later goes under a key of its own, as this one did.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeRotationMeta {
+    pub rules: RotationRules,
+    pub pending_pq: Option<PendingPqRotation>,
+    pub pending_pause: Option<PendingPauseRotation>,
+}
+
 /// The plain-bytes twin of [`BridgeConfig`], used for the genesis
 /// commitment.
 ///
@@ -171,6 +268,8 @@ impl From<&BridgeConfig> for BridgeCommit {
             burn_sequence: _,
             // The replay floor (C15-1) likewise: tagged in `Genesis::build`, only when present.
             min_inbound_sequence: _,
+            // The rotation rules (BRG-14) likewise: tagged, last, only when present.
+            rotation: _,
         } = cfg;
         BridgeCommit {
             emitter: *emitter,
@@ -241,6 +340,14 @@ pub struct BridgeState {
     /// 15 and every earlier chain). Fixed for the chain's life; stored under its own key and
     /// folded into the root only when non-empty.
     pub min_inbound_sequence: BTreeMap<u16, u64>,
+    /// BRG-14: the genesis `bridge.rotation`, `None` on chains 15 to 18. The gate the delay, the
+    /// possession rule and `CancelRotation` read first ([`BridgeError::RotationRulesDisabled`]).
+    pub rotation_rules: Option<RotationRules>,
+    /// BRG-14: the PQ-set rotation accepted under the delay and not yet in effect, at most one.
+    /// Always `None` without `rotation_rules`, and then in no root and no blob.
+    pub pending_pq: Option<PendingPqRotation>,
+    /// BRG-14: the pause-key rotation accepted under the delay and not yet in effect.
+    pub pending_pause: Option<PendingPauseRotation>,
 }
 
 /// The small, whole-state half of a [`BridgeState`]: everything except the
@@ -421,6 +528,45 @@ pub enum BridgeError {
     /// verdict.
     #[error("chain {chain} sequence {sequence} is below this chain's replay floor {floor}")]
     BelowReplayFloor { chain: u16, sequence: u64, floor: u64 },
+    /// BRG-14: a `…V2` rotation or a `CancelRotation` on a chain whose genesis has no
+    /// `bridge.rotation` (chains 15 to 18). A genesis constant, so a permanent verdict.
+    #[error("bridge rotation rules (delay, possession) are not enabled on this chain")]
+    RotationRulesDisabled,
+    /// BRG-14: under `rotation.needs_possession` a v1 rotation — one carrying no proof that the
+    /// new keys are held — is refused; the `…V2` action is required. A genesis constant.
+    #[error("this chain requires a proof of possession with every rotation: submit the V2 action")]
+    PossessionRequired,
+    /// BRG-14: a `…V2` rotation on a chain whose rules do not ask for possession — the v1 action
+    /// is the one this chain admits. A genesis constant.
+    #[error("this chain does not take a proof of possession: submit the v1 rotation")]
+    PossessionNotEnabled,
+    /// BRG-14: a `RotatePqGuardiansV2` whose possession list is not one signature per new key.
+    #[error("{got} possession signatures for {expected} new PQ guardians: one per key, in key order")]
+    PossessionCountMismatch { expected: usize, got: usize },
+    /// BRG-14: a possession signature that is not exactly a Dilithium2 signature's 2 420 bytes.
+    /// A byte length, so a permanent verdict.
+    #[error("possession signature {index} is {len} bytes, not a Dilithium2 signature's 2420")]
+    BadPossessionLength { index: usize, len: usize },
+    /// BRG-14: possession signature `index` does not verify under new key `index` over the
+    /// rotation message — the key is not held by whoever assembled the rotation (or the message
+    /// was signed for another nonce or chain).
+    #[error("possession signature {index} does not verify under new key {index}")]
+    BadPossession { index: usize },
+    /// BRG-14: a rotation of a kind that already has one pending under the delay — one at a
+    /// time; cancel it first, or wait for it to take effect at `effective_at_secs`.
+    #[error("a rotation of this kind is already pending until block time {effective_at_secs}")]
+    RotationPending { effective_at_secs: u64 },
+    /// BRG-14: a `CancelRotation` naming a kind with nothing pending.
+    #[error("no rotation of that kind is pending")]
+    NoPendingRotation,
+    /// BRG-14: a `CancelRotation` whose `kind` byte is neither 0 (the PQ set) nor 1 (the pause
+    /// key). The action's own bytes, so a permanent verdict.
+    #[error("unknown rotation kind {0} (0 = PQ guardians, 1 = pause key)")]
+    BadRotationKind(u8),
+    /// BRG-14: a `CancelRotation` signed by something other than the current pause key over the
+    /// cancel message at the current rotation nonce.
+    #[error("bad cancel signature: not the pause key's over M_cancel at this chain's rotation nonce")]
+    BadCancelSignature,
 }
 
 /// A transfer attestation as the pool needs it: which asset, under which note
@@ -548,6 +694,7 @@ impl BridgeState {
             pause_key: cfg.pause_key.clone(),
             rules_v2: cfg.rules_v2.clone(),
             min_inbound_sequence: cfg.min_inbound_sequence.clone().unwrap_or_default(),
+            rotation_rules: cfg.rotation.clone(),
             ..Default::default()
         }
     }
@@ -575,6 +722,10 @@ impl BridgeState {
             rules_v2: _,
             // The replay floor: `replay_floor`'s, under its own key, never this blob's.
             min_inbound_sequence: _,
+            // The rotation half (BRG-14): `rotation_meta`'s, under its own key.
+            rotation_rules: _,
+            pending_pq: _,
+            pending_pause: _,
         } = self;
         BridgeMeta {
             emitter: *emitter,
@@ -596,6 +747,16 @@ impl BridgeState {
         self.rules_v2.clone().map(|rules| BridgeMetaV2 { rotation_nonce: self.rotation_nonce, rules })
     }
 
+    /// The rotation half for storage (BRG-14): `Some` exactly when the genesis carries
+    /// `bridge.rotation`, `None` on chains 15 to 18 — nothing to store, no key to write.
+    pub fn rotation_meta(&self) -> Option<BridgeRotationMeta> {
+        self.rotation_rules.clone().map(|rules| BridgeRotationMeta {
+            rules,
+            pending_pq: self.pending_pq.clone(),
+            pending_pause: self.pending_pause.clone(),
+        })
+    }
+
     /// The replay floor for storage (C15-1): `Some` exactly when the genesis carries one, `None`
     /// on chain 15 and every earlier chain — where there is nothing to store and no key to write,
     /// so their databases keep the key set they have.
@@ -614,6 +775,19 @@ impl BridgeState {
         spent: BTreeSet<Hash>,
         burns: BTreeMap<u64, BridgeBurnRecord>,
     ) -> BridgeState {
+        Self::from_parts_with_rotation(meta, v2, min_inbound_sequence, spent, burns, None)
+    }
+
+    /// [`Self::from_parts`] with the rotation half (BRG-14): the inverse of
+    /// [`BridgeState::rotation_meta`] too. `None` is a chain without `bridge.rotation`.
+    pub fn from_parts_with_rotation(
+        meta: BridgeMeta,
+        v2: Option<BridgeMetaV2>,
+        min_inbound_sequence: BTreeMap<u16, u64>,
+        spent: BTreeSet<Hash>,
+        burns: BTreeMap<u64, BridgeBurnRecord>,
+        rotation: Option<BridgeRotationMeta>,
+    ) -> BridgeState {
         let BridgeMeta {
             emitter,
             emitters,
@@ -629,6 +803,10 @@ impl BridgeState {
         let (rotation_nonce, rules_v2) = match v2 {
             Some(BridgeMetaV2 { rotation_nonce, rules }) => (rotation_nonce, Some(rules)),
             None => (0, None),
+        };
+        let (rotation_rules, pending_pq, pending_pause) = match rotation {
+            Some(BridgeRotationMeta { rules, pending_pq, pending_pause }) => (Some(rules), pending_pq, pending_pause),
+            None => (None, None, None),
         };
         BridgeState {
             emitter,
@@ -646,7 +824,34 @@ impl BridgeState {
             rotation_nonce,
             rules_v2,
             min_inbound_sequence,
+            rotation_rules,
+            pending_pq,
+            pending_pause,
         }
+    }
+
+    /// BRG-14: every pending rotation whose `effective_at_secs` is at or before `now_secs` takes
+    /// effect — the PQ set is replaced, the pause key is replaced — and each spends one
+    /// `rotation_nonce`, exactly as an immediate rotation does when it lands: the pool's stamp
+    /// on a pooled attestation (`Claims::bridge_rotation`, BRG-12) compares that nonce, so
+    /// attestations co-signed by the set that just left leave the pool with it. Run by
+    /// `Ledger::close_block` on the proposer and every replica against the same block time, so
+    /// the root both compute already has the new set in it. Returns whether anything moved.
+    pub fn activate_due_rotations(&mut self, now_secs: u64) -> bool {
+        let mut moved = false;
+        if self.pending_pq.as_ref().is_some_and(|p| p.effective_at_secs <= now_secs) {
+            let p = self.pending_pq.take().expect("checked");
+            self.pq_guardians = p.keys;
+            self.rotation_nonce = self.rotation_nonce.saturating_add(1);
+            moved = true;
+        }
+        if self.pending_pause.as_ref().is_some_and(|p| p.effective_at_secs <= now_secs) {
+            let p = self.pending_pause.take().expect("checked");
+            self.pause_key = Some(p.key);
+            self.rotation_nonce = self.rotation_nonce.saturating_add(1);
+            moved = true;
+        }
+        moved
     }
 
     /// Validates an encoded attestation without mutating anything: resolve
@@ -1091,11 +1296,23 @@ impl BridgeState {
         };
         // C15-1: the replay floor wraps whichever root the chain has, and only when the genesis
         // carries one — a fixed 32-byte root then the floor, under a domain of its own.
-        match self.replay_floor() {
+        let root = match self.replay_floor() {
             Some(floor) => {
                 let mut wrapped = root.as_bytes().to_vec();
                 wrapped.extend_from_slice(&bincode::serialize(floor).expect("the replay floor serializes"));
                 Hash::digest_domain(b"rand-bridge-replay-floor-1", &wrapped)
+            }
+            None => root,
+        };
+        // BRG-14: the rotation rules and the pending rotations wrap that, the same way and only
+        // when the genesis carries `bridge.rotation`: which set signs the next block's mints and
+        // when it changes is decided by them, so two nodes disagreeing must disagree at the root.
+        // Chains 15 to 18 hash byte-for-byte as above.
+        match self.rotation_meta() {
+            Some(meta) => {
+                let mut wrapped = root.as_bytes().to_vec();
+                wrapped.extend_from_slice(&bincode::serialize(&meta).expect("the rotation state serializes"));
+                Hash::digest_domain(b"rand-bridge-rotation-1", &wrapped)
             }
             None => root,
         }
@@ -1301,6 +1518,7 @@ mod tests {
             guardian_set_index: None,
             burn_sequence: None,
             min_inbound_sequence: None,
+            rotation: None,
         };
         (config, secrets)
     }
@@ -2204,6 +2422,7 @@ mod tests {
             guardian_set_index: None,
             burn_sequence: None,
             min_inbound_sequence: None,
+            rotation: None,
         });
         st.spent.insert(Hash([0x44; 32]));
         st.burn_sequence = 7;
@@ -2483,6 +2702,7 @@ mod tests {
             guardian_set_index: None,
             burn_sequence: None,
             min_inbound_sequence: None,
+            rotation: None,
         });
         let now = att["now"].as_u64().unwrap();
         let by_name = |name: &str| {

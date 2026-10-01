@@ -45,7 +45,12 @@ use super::tokens::{
     MAX_BACKING_DECIMALS,
 };
 use super::{Ledger, TxError};
-use crate::bridge::gov::{list_message_in, pause_message_in, register_message_in, rotate_pause_message_in, rotate_pq_message_in, unpause_message_in};
+use crate::bridge::gov::{
+    cancel_rotation_message_in, list_message_in, pause_message_in, register_message_in, rotate_pause_message_in,
+    rotate_pq_message_in, unpause_message_in,
+};
+use crate::bridge::{PendingPauseRotation, PendingPqRotation, RotationKind};
+use crate::crypto::{PublicKey, Signature};
 use crate::bridge::pq::{check_pq_structure, verify_pq_message};
 use crate::bridge::{BridgeError, BridgeState};
 use crate::gas;
@@ -73,23 +78,189 @@ fn check_listing(bridge: &BridgeState, nonce: u64, chain: u16) -> Result<(), TxE
     Ok(())
 }
 
-/// The rotations' shared rules (bridge rules v2): the gate first — a chain without the section
-/// refuses before it reads a byte — then the quorum's structure against the current PQ set, then
-/// the nonce.
-fn check_rotation(bridge: &BridgeState, nonce: u64, pq_signatures: &[crate::bridge::PqSignature]) -> Result<(), TxError> {
-    if bridge.rules_v2.is_none() {
-        return Err(TxError::Bridge(BridgeError::RulesV2Disabled));
+/// Spends one `rotation_nonce`: the last write of both rotations.
+fn bump_rotation_nonce(bridge: &mut BridgeState) {
+    bridge.rotation_nonce = bridge.rotation_nonce.saturating_add(1);
+}
+
+// ── BRG-14 (audit v6, issue #89): possession, the delay and the cancel ───────────────────────
+
+/// The possession gate, a genesis constant read before the quorum's structure: under
+/// `bridge.rotation.needs_possession` a rotation must be the `…V2` action (`carries` is true);
+/// without it — no `bridge.rotation` at all, or one without the rule — the v1 action is the one
+/// this chain admits.
+fn check_possession_gate(bridge: &BridgeState, carries: bool) -> Result<(), TxError> {
+    let required = bridge.rotation_rules.as_ref().is_some_and(|r| r.needs_possession());
+    match (required, carries) {
+        (true, false) => Err(TxError::Bridge(BridgeError::PossessionRequired)),
+        (false, true) => Err(TxError::Bridge(BridgeError::PossessionNotEnabled)),
+        _ => Ok(()),
     }
-    check_pq_structure(pq_signatures, bridge.pq_guardians.len()).map_err(TxError::Bridge)?;
-    if nonce != bridge.rotation_nonce {
-        return Err(TxError::Bridge(BridgeError::BadRotationNonce { expected: bridge.rotation_nonce, got: nonce }));
+}
+
+/// One rotation of each kind at a time under the delay: a second while one is pending is refused
+/// until it takes effect or is cancelled.
+fn check_nothing_pending(bridge: &BridgeState, kind: RotationKind) -> Result<(), TxError> {
+    let pending = match kind {
+        RotationKind::PqGuardians => bridge.pending_pq.as_ref().map(|p| p.effective_at_secs),
+        RotationKind::PauseKey => bridge.pending_pause.as_ref().map(|p| p.effective_at_secs),
+    };
+    match pending {
+        Some(effective_at_secs) => Err(TxError::Bridge(BridgeError::RotationPending { effective_at_secs })),
+        None => Ok(()),
+    }
+}
+
+/// The byte rules of a possession list, before any key is read: one signature per new key, each
+/// exactly a Dilithium2 signature's length.
+fn check_possession_shape(possession: &[Vec<u8>], keys: usize) -> Result<(), TxError> {
+    if possession.len() != keys {
+        return Err(TxError::Bridge(BridgeError::PossessionCountMismatch { expected: keys, got: possession.len() }));
+    }
+    if let Some((index, p)) = possession.iter().enumerate().find(|(_, p)| p.len() != crate::bridge::PQ_SIGNATURE_LEN) {
+        return Err(TxError::Bridge(BridgeError::BadPossessionLength { index, len: p.len() }));
     }
     Ok(())
 }
 
-/// Spends one `rotation_nonce`: the last write of both rotations.
-fn bump_rotation_nonce(bridge: &mut BridgeState) {
-    bridge.rotation_nonce = bridge.rotation_nonce.saturating_add(1);
+/// Every possession signature verifies `message` under its own new key: the holder of each key
+/// signed the rotation that brings it in. Last — one Dilithium2 verify per new key.
+fn verify_possession(keys: &[PublicKey], possession: &[Vec<u8>], message: &[u8]) -> Result<(), TxError> {
+    for (index, (key, sig)) in keys.iter().zip(possession).enumerate() {
+        let ok = Signature::from_bytes(sig).is_ok_and(|sig| key.verify(message, &sig));
+        if !ok {
+            return Err(TxError::Bridge(BridgeError::BadPossession { index }));
+        }
+    }
+    Ok(())
+}
+
+/// The whole of a PQ-set rotation's validation, v1 and v2 (`possession` is `Some` for the V2
+/// action): the gates, the quorum's structure, the nonce, nothing pending of this kind, the new
+/// set's shape, then the quorum's verifies and, last, the possession verifies.
+fn validate_pq_rotation(
+    ledger: &Ledger,
+    bridge: &BridgeState,
+    tx: &Transaction,
+    new_pq_guardians: &[PublicKey],
+    nonce: u64,
+    pq_signatures: &[crate::bridge::PqSignature],
+    possession: Option<&[Vec<u8>]>,
+) -> Result<(), TxError> {
+    if bridge.rules_v2.is_none() {
+        return Err(TxError::Bridge(BridgeError::RulesV2Disabled));
+    }
+    check_possession_gate(bridge, possession.is_some())?;
+    check_pq_structure(pq_signatures, bridge.pq_guardians.len()).map_err(TxError::Bridge)?;
+    if let Some(p) = possession {
+        check_possession_shape(p, new_pq_guardians.len())?;
+    }
+    if nonce != bridge.rotation_nonce {
+        return Err(TxError::Bridge(BridgeError::BadRotationNonce { expected: bridge.rotation_nonce, got: nonce }));
+    }
+    check_nothing_pending(bridge, RotationKind::PqGuardians)?;
+    // The new set's shape, the genesis rules over again (`genesis::check_bridge`): one
+    // PQ key per guardian of the current ECDSA set, each exactly a Dilithium2 key, none
+    // repeated, and the pause key held apart. Byte rules and set lookups, before the quorum.
+    let expected = bridge.guardian_sets.get(&bridge.current_set).map_or(0, |s| s.keys.len());
+    if new_pq_guardians.len() != expected {
+        return Err(TxError::Bridge(BridgeError::PqSetLengthMismatch { expected, got: new_pq_guardians.len() }));
+    }
+    if let Some((index, k)) = new_pq_guardians.iter().enumerate().find(|(_, k)| k.as_bytes().len() != crate::bridge::PQ_PUBLIC_KEY_LEN) {
+        return Err(TxError::Bridge(BridgeError::BadPqGuardianKey { index, len: k.as_bytes().len() }));
+    }
+    let unique: std::collections::BTreeSet<&[u8]> = new_pq_guardians.iter().map(|k| k.as_bytes()).collect();
+    if unique.len() != new_pq_guardians.len() {
+        return Err(TxError::Bridge(BridgeError::DuplicatePqGuardian));
+    }
+    if bridge.pause_key.as_ref().is_some_and(|p| new_pq_guardians.contains(p)) {
+        return Err(TxError::Bridge(BridgeError::GuardianIsPauseKey));
+    }
+    // The current set's quorum over the fixed-layout message, then each new holder's own
+    // signature over the very same message.
+    let message = rotate_pq_message_in(ledger.binding_domain(), tx.chain_id, nonce, new_pq_guardians);
+    verify_pq_message(pq_signatures, &bridge.pq_guardians, &message).map_err(TxError::Bridge)?;
+    if let Some(p) = possession {
+        verify_possession(new_pq_guardians, p, &message)?;
+    }
+    Ok(())
+}
+
+/// [`validate_pq_rotation`]'s twin for the pause key.
+fn validate_pause_rotation(
+    ledger: &Ledger,
+    bridge: &BridgeState,
+    tx: &Transaction,
+    new_pause_key: &PublicKey,
+    nonce: u64,
+    pq_signatures: &[crate::bridge::PqSignature],
+    possession: Option<&[u8]>,
+) -> Result<(), TxError> {
+    if bridge.rules_v2.is_none() {
+        return Err(TxError::Bridge(BridgeError::RulesV2Disabled));
+    }
+    check_possession_gate(bridge, possession.is_some())?;
+    check_pq_structure(pq_signatures, bridge.pq_guardians.len()).map_err(TxError::Bridge)?;
+    let possession = possession.map(|p| vec![p.to_vec()]);
+    if let Some(p) = &possession {
+        check_possession_shape(p, 1)?;
+    }
+    if nonce != bridge.rotation_nonce {
+        return Err(TxError::Bridge(BridgeError::BadRotationNonce { expected: bridge.rotation_nonce, got: nonce }));
+    }
+    check_nothing_pending(bridge, RotationKind::PauseKey)?;
+    let len = new_pause_key.as_bytes().len();
+    if len != crate::bridge::PQ_PUBLIC_KEY_LEN {
+        return Err(TxError::Bridge(BridgeError::BadPauseKeyLength { len }));
+    }
+    if bridge.pq_guardians.contains(new_pause_key) {
+        return Err(TxError::Bridge(BridgeError::PauseKeyIsGuardian));
+    }
+    let message = rotate_pause_message_in(ledger.binding_domain(), tx.chain_id, nonce, new_pause_key);
+    verify_pq_message(pq_signatures, &bridge.pq_guardians, &message).map_err(TxError::Bridge)?;
+    if let Some(p) = &possession {
+        verify_possession(std::slice::from_ref(new_pause_key), p, &message)?;
+    }
+    Ok(())
+}
+
+/// The apply step of a PQ-set rotation: under `bridge.rotation.delay_secs` it is recorded as
+/// pending, effective at this block's time plus the delay (`BridgeState::activate_due_rotations`
+/// replaces the set then, and spends the nonce then); otherwise the set is replaced now. Either
+/// way this transaction spends one `rotation_nonce`.
+fn apply_pq_rotation(ledger: &mut Ledger, new_pq_guardians: &[PublicKey]) -> Result<(), TxError> {
+    let now = ledger.now_secs();
+    let bridge = ledger.bridge_mut().ok_or(TxError::Bridge(BridgeError::Disabled))?;
+    // The second lock on the gate: `validate` refused a chain without the section, and a
+    // direct caller must not move a counter chain 14 has no root for.
+    if bridge.rules_v2.is_none() {
+        return Err(TxError::Bridge(BridgeError::RulesV2Disabled));
+    }
+    match bridge.rotation_rules.as_ref().map(|r| r.delay_secs()).filter(|d| *d > 0) {
+        Some(delay) => {
+            bridge.pending_pq = Some(PendingPqRotation { keys: new_pq_guardians.to_vec(), effective_at_secs: now.saturating_add(delay) })
+        }
+        None => bridge.pq_guardians = new_pq_guardians.to_vec(),
+    }
+    bump_rotation_nonce(bridge);
+    Ok(())
+}
+
+/// [`apply_pq_rotation`]'s twin for the pause key.
+fn apply_pause_rotation(ledger: &mut Ledger, new_pause_key: &PublicKey) -> Result<(), TxError> {
+    let now = ledger.now_secs();
+    let bridge = ledger.bridge_mut().ok_or(TxError::Bridge(BridgeError::Disabled))?;
+    if bridge.rules_v2.is_none() {
+        return Err(TxError::Bridge(BridgeError::RulesV2Disabled));
+    }
+    match bridge.rotation_rules.as_ref().map(|r| r.delay_secs()).filter(|d| *d > 0) {
+        Some(delay) => {
+            bridge.pending_pause = Some(PendingPauseRotation { key: new_pause_key.clone(), effective_at_secs: now.saturating_add(delay) })
+        }
+        None => bridge.pause_key = Some(new_pause_key.clone()),
+    }
+    bump_rotation_nonce(bridge);
+    Ok(())
 }
 
 /// What a mis-routed action gets: only a routing mistake in `Ledger::validate_inner` can produce
@@ -183,43 +354,37 @@ pub(super) fn validate(ledger: &Ledger, tx: &Transaction, action: &Action) -> Re
             .map_err(TxError::Bridge)
         }
         Action::RotatePqGuardians { new_pq_guardians, nonce, pq_signatures } => {
-            let bridge = bridge()?;
-            check_rotation(bridge, *nonce, pq_signatures)?;
-            // The new set's shape, the genesis rules over again (`genesis::check_bridge`): one
-            // PQ key per guardian of the current ECDSA set, each exactly a Dilithium2 key, none
-            // repeated, and the pause key held apart. Byte rules and set lookups, before the quorum.
-            let expected = bridge.guardian_sets.get(&bridge.current_set).map_or(0, |s| s.keys.len());
-            if new_pq_guardians.len() != expected {
-                return Err(TxError::Bridge(BridgeError::PqSetLengthMismatch { expected, got: new_pq_guardians.len() }));
-            }
-            if let Some((index, k)) =
-                new_pq_guardians.iter().enumerate().find(|(_, k)| k.as_bytes().len() != crate::bridge::PQ_PUBLIC_KEY_LEN)
-            {
-                return Err(TxError::Bridge(BridgeError::BadPqGuardianKey { index, len: k.as_bytes().len() }));
-            }
-            let unique: std::collections::BTreeSet<&[u8]> = new_pq_guardians.iter().map(|k| k.as_bytes()).collect();
-            if unique.len() != new_pq_guardians.len() {
-                return Err(TxError::Bridge(BridgeError::DuplicatePqGuardian));
-            }
-            if bridge.pause_key.as_ref().is_some_and(|p| new_pq_guardians.contains(p)) {
-                return Err(TxError::Bridge(BridgeError::GuardianIsPauseKey));
-            }
-            // Last: the current set's quorum over the fixed-layout message.
-            verify_pq_message(pq_signatures, &bridge.pq_guardians, &rotate_pq_message_in(ledger.binding_domain(), tx.chain_id, *nonce, new_pq_guardians))
-                .map_err(TxError::Bridge)
+            validate_pq_rotation(ledger, bridge()?, tx, new_pq_guardians, *nonce, pq_signatures, None)
         }
         Action::RotatePauseKey { new_pause_key, nonce, pq_signatures } => {
+            validate_pause_rotation(ledger, bridge()?, tx, new_pause_key, *nonce, pq_signatures, None)
+        }
+        // BRG-14: the same rotations with each new key's own signature over the rotation message.
+        Action::RotatePqGuardiansV2 { new_pq_guardians, possession, nonce, pq_signatures } => {
+            validate_pq_rotation(ledger, bridge()?, tx, new_pq_guardians, *nonce, pq_signatures, Some(possession))
+        }
+        Action::RotatePauseKeyV2 { new_pause_key, possession, nonce, pq_signatures } => {
+            validate_pause_rotation(ledger, bridge()?, tx, new_pause_key, *nonce, pq_signatures, Some(possession))
+        }
+        // BRG-14: the pause key drops a pending rotation. The gate (a genesis constant) and the
+        // kind byte first, then the nonce and the pending lookup, then the one verify.
+        Action::CancelRotation { kind, nonce, signature } => {
             let bridge = bridge()?;
-            check_rotation(bridge, *nonce, pq_signatures)?;
-            let len = new_pause_key.as_bytes().len();
-            if len != crate::bridge::PQ_PUBLIC_KEY_LEN {
-                return Err(TxError::Bridge(BridgeError::BadPauseKeyLength { len }));
+            if bridge.rotation_rules.is_none() {
+                return Err(TxError::Bridge(BridgeError::RotationRulesDisabled));
             }
-            if bridge.pq_guardians.contains(new_pause_key) {
-                return Err(TxError::Bridge(BridgeError::PauseKeyIsGuardian));
+            let kind = RotationKind::from_byte(*kind).ok_or(TxError::Bridge(BridgeError::BadRotationKind(*kind)))?;
+            if *nonce != bridge.rotation_nonce {
+                return Err(TxError::Bridge(BridgeError::BadRotationNonce { expected: bridge.rotation_nonce, got: *nonce }));
             }
-            verify_pq_message(pq_signatures, &bridge.pq_guardians, &rotate_pause_message_in(ledger.binding_domain(), tx.chain_id, *nonce, new_pause_key))
-                .map_err(TxError::Bridge)
+            if check_nothing_pending(bridge, kind).is_ok() {
+                return Err(TxError::Bridge(BridgeError::NoPendingRotation));
+            }
+            let key = bridge.pause_key.as_ref().ok_or(TxError::Bridge(BridgeError::NoPauseKey))?;
+            if !key.verify(&cancel_rotation_message_in(ledger.binding_domain(), tx.chain_id, *nonce, kind), signature) {
+                return Err(TxError::Bridge(BridgeError::BadCancelSignature));
+            }
+            Ok(())
         }
         _ => Err(NOT_BRIDGE_GOV),
     }
@@ -270,23 +435,21 @@ pub(super) fn apply(ledger: &mut Ledger, _tx: &Transaction, action: &Action) -> 
             registry.add_backing(*token_index, *chain, *coin, *decimals).map_err(token)?;
             bump_list_nonce(ledger)
         }
-        Action::RotatePqGuardians { new_pq_guardians, .. } => {
-            let bridge = ledger.bridge_mut().ok_or(TxError::Bridge(BridgeError::Disabled))?;
-            // The second lock on the gate: `validate` refused a chain without the section, and a
-            // direct caller must not move a counter chain 14 has no root for.
-            if bridge.rules_v2.is_none() {
-                return Err(TxError::Bridge(BridgeError::RulesV2Disabled));
-            }
-            bridge.pq_guardians = new_pq_guardians.clone();
-            bump_rotation_nonce(bridge);
-            Ok(())
+        Action::RotatePqGuardians { new_pq_guardians, .. } | Action::RotatePqGuardiansV2 { new_pq_guardians, .. } => {
+            apply_pq_rotation(ledger, new_pq_guardians)
         }
-        Action::RotatePauseKey { new_pause_key, .. } => {
+        Action::RotatePauseKey { new_pause_key, .. } | Action::RotatePauseKeyV2 { new_pause_key, .. } => {
+            apply_pause_rotation(ledger, new_pause_key)
+        }
+        Action::CancelRotation { kind, .. } => {
             let bridge = ledger.bridge_mut().ok_or(TxError::Bridge(BridgeError::Disabled))?;
-            if bridge.rules_v2.is_none() {
-                return Err(TxError::Bridge(BridgeError::RulesV2Disabled));
+            if bridge.rotation_rules.is_none() {
+                return Err(TxError::Bridge(BridgeError::RotationRulesDisabled));
             }
-            bridge.pause_key = Some(new_pause_key.clone());
+            match RotationKind::from_byte(*kind).ok_or(TxError::Bridge(BridgeError::BadRotationKind(*kind)))? {
+                RotationKind::PqGuardians => bridge.pending_pq = None,
+                RotationKind::PauseKey => bridge.pending_pause = None,
+            }
             bump_rotation_nonce(bridge);
             Ok(())
         }
@@ -367,6 +530,7 @@ mod tests {
             guardian_set_index: None,
             burn_sequence: None,
             min_inbound_sequence: None,
+            rotation: None,
         })));
         l.set_tokens(Some(TokenRegistry::new(FEE).with_mint_cap(100_000 * 100_000_000)));
         l.set_height(1);
@@ -983,5 +1147,197 @@ mod tests {
         assert_eq!(pa.validate(&unpause(&da), &StubExecutor), Ok(()));
         assert_eq!(pb.validate(&unpause(&da), &StubExecutor), bad_quorum);
         assert_eq!(pa.validate(&unpause(&v1), &StubExecutor), bad_quorum);
+    }
+
+    // ── BRG-14 (audit v6, issue #89): possession, the delay, the cancel ──────────────────────
+
+    fn ledger_rot(delay: Option<u32>, possession: bool) -> Ledger {
+        let mut l = ledger_v2();
+        l.bridge_mut().unwrap().rotation_rules =
+            Some(crate::bridge::RotationRules { delay_secs: delay, needs_possession: possession.then_some(true) });
+        l
+    }
+
+    fn possession_of(keys: &[Keypair], message: &[u8]) -> Vec<Vec<u8>> {
+        keys.iter().map(|k| k.sign(message).as_bytes().to_vec()).collect()
+    }
+
+    fn rotate_pq_v2_tx(l: &Ledger, new: Vec<PublicKey>, possession: Vec<Vec<u8>>, nonce: u64, pq_signatures: Vec<PqSignature>) -> Transaction {
+        Transaction { chain_id: l.chain_id(), bundle: None, action: Action::RotatePqGuardiansV2 { new_pq_guardians: new, possession, nonce, pq_signatures } }
+    }
+
+    fn rotate_pause_v2_tx(l: &Ledger, new: PublicKey, possession: Vec<u8>, nonce: u64, pq_signatures: Vec<PqSignature>) -> Transaction {
+        Transaction { chain_id: l.chain_id(), bundle: None, action: Action::RotatePauseKeyV2 { new_pause_key: new, possession, nonce, pq_signatures } }
+    }
+
+    fn cancel_tx(l: &Ledger, kind: u8, nonce: u64, signer: &Keypair) -> Transaction {
+        let message = crate::bridge::gov::cancel_rotation_message(l.chain_id(), nonce, crate::bridge::RotationKind::from_byte(kind).unwrap_or(crate::bridge::RotationKind::PqGuardians));
+        Transaction { chain_id: l.chain_id(), bundle: None, action: Action::CancelRotation { kind, nonce, signature: signer.sign(&message) } }
+    }
+
+    /// The quorum's message for a v1/v2 PQ rotation at the ledger's current nonce, and the
+    /// current set's quorum over it.
+    fn pq_rotation_parts(l: &Ledger, new: &[PublicKey]) -> (u64, Vec<u8>, Vec<PqSignature>) {
+        let nonce = l.bridge().unwrap().rotation_nonce;
+        let m = rotate_pq_message(l.chain_id(), nonce, new);
+        (nonce, m.clone(), quorum_of(&pq_keys(), &[0, 1, 2, 3, 4], &m))
+    }
+
+    /// BRG-14, possession. Under `rotation.needs_possession` a v1 rotation is refused before
+    /// the quorum is read (a typo'd key could otherwise be rotated in); the V2 action with every
+    /// new holder's own signature over the rotation message is admitted and applied; one signature
+    /// by the wrong key, a missing one or a short one is refused by index; without the rule the
+    /// V2 action is what is refused. The pause key the same way, one signature.
+    #[test]
+    fn under_needs_possession_a_rotation_carries_each_new_holders_signature() {
+        let l = ledger_rot(None, true);
+        let p = proposer().address();
+        let new = fresh_pq_set(6);
+        let (nonce, m, quorum) = pq_rotation_parts(&l, &pks(&new));
+        assert_eq!(l.validate(&rotate_pq_tx(&l, pks(&new), nonce, quorum.clone()), &StubExecutor), bridge_err(BridgeError::PossessionRequired));
+        let honest = rotate_pq_v2_tx(&l, pks(&new), possession_of(&new, &m), nonce, quorum.clone());
+        assert_eq!(l.validate(&honest, &StubExecutor), Ok(()));
+        // A signature by a key nobody in the new set holds, in slot 2.
+        let stranger = Keypair::from_seed([0xee; 32]).unwrap();
+        let mut forged = possession_of(&new, &m);
+        forged[2] = stranger.sign(&m).as_bytes().to_vec();
+        assert_eq!(l.validate(&rotate_pq_v2_tx(&l, pks(&new), forged, nonce, quorum.clone()), &StubExecutor), bridge_err(BridgeError::BadPossession { index: 2 }));
+        // One signed over another nonce's message: the holder signed some rotation, not this one.
+        let mut stale = possession_of(&new, &m);
+        stale[0] = new[0].sign(&rotate_pq_message(l.chain_id(), nonce + 1, &pks(&new))).as_bytes().to_vec();
+        assert_eq!(l.validate(&rotate_pq_v2_tx(&l, pks(&new), stale, nonce, quorum.clone()), &StubExecutor), bridge_err(BridgeError::BadPossession { index: 0 }));
+        let mut short = possession_of(&new, &m);
+        short.pop();
+        assert_eq!(l.validate(&rotate_pq_v2_tx(&l, pks(&new), short, nonce, quorum.clone()), &StubExecutor), bridge_err(BridgeError::PossessionCountMismatch { expected: 6, got: 5 }));
+        let mut cut = possession_of(&new, &m);
+        cut[4].pop();
+        assert_eq!(l.validate(&rotate_pq_v2_tx(&l, pks(&new), cut, nonce, quorum.clone()), &StubExecutor), bridge_err(BridgeError::BadPossessionLength { index: 4, len: 2419 }));
+        // Without the rule the V2 action is the one refused, and a chain without the group too.
+        let plain = ledger_rot(Some(60), false);
+        assert_eq!(plain.validate(&honest, &StubExecutor), bridge_err(BridgeError::PossessionNotEnabled));
+        assert_eq!(ledger_v2().validate(&honest, &StubExecutor), bridge_err(BridgeError::PossessionNotEnabled));
+        // Applied: no delay, so the set moves now and the nonce is spent.
+        let mut l = l;
+        l.apply_tx(&honest, &p, &StubExecutor).unwrap();
+        assert_eq!((l.bridge().unwrap().pq_guardians.clone(), l.bridge().unwrap().rotation_nonce), (pks(&new), 1));
+        assert_eq!(l.bridge().unwrap().pending_pq, None);
+
+        // The pause key: the new key's own signature over M_rotate_pause.
+        let l = ledger_rot(None, true);
+        let new_pause = Keypair::from_seed([0x99; 32]).unwrap();
+        let m = rotate_pause_message(l.chain_id(), 0, new_pause.public_key());
+        let quorum = quorum_of(&pq_keys(), &[0, 1, 2, 3, 4], &m);
+        assert_eq!(l.validate(&rotate_pause_tx(&l, new_pause.public_key().clone(), 0, quorum.clone()), &StubExecutor), bridge_err(BridgeError::PossessionRequired));
+        let honest = rotate_pause_v2_tx(&l, new_pause.public_key().clone(), new_pause.sign(&m).as_bytes().to_vec(), 0, quorum.clone());
+        assert_eq!(l.validate(&honest, &StubExecutor), Ok(()));
+        let wrong = rotate_pause_v2_tx(&l, new_pause.public_key().clone(), stranger.sign(&m).as_bytes().to_vec(), 0, quorum.clone());
+        assert_eq!(l.validate(&wrong, &StubExecutor), bridge_err(BridgeError::BadPossession { index: 0 }));
+        let short = rotate_pause_v2_tx(&l, new_pause.public_key().clone(), vec![1; 7], 0, quorum);
+        assert_eq!(l.validate(&short, &StubExecutor), bridge_err(BridgeError::BadPossessionLength { index: 0, len: 7 }));
+        let mut l = l;
+        l.apply_tx(&honest, &p, &StubExecutor).unwrap();
+        assert_eq!(l.bridge().unwrap().pause_key.as_ref(), Some(new_pause.public_key()));
+    }
+
+    /// BRG-14, the delay. Under `rotation.delay_secs` an accepted rotation is pending: the set
+    /// that signs is still the old one (a quorum of the old set verifies, one of the new does
+    /// not), a second rotation of the same kind is refused, the other kind may pend beside it,
+    /// and at the end of the first block whose time reaches `effective_at` the new set is in
+    /// force, the pending slot empty, the nonce spent again and the root moved.
+    #[test]
+    fn under_a_delay_a_rotation_is_pending_until_its_time_and_the_old_set_signs_meanwhile() {
+        use crate::bridge::pq::check_pq_quorum_message;
+        let mut l = ledger_rot(Some(3_600), false);
+        l.set_timestamp_ms(1_000_000);
+        let p = proposer().address();
+        let old = pq_keys();
+        let new = fresh_pq_set(6);
+        let root_before = l.state_root();
+        assert_eq!(rotate_pq(&mut l, pks(&new), &old), Ok(()));
+        let b = l.bridge().unwrap();
+        assert_eq!(b.pq_guardians, pks(&old), "the old set still signs");
+        assert_eq!(b.pending_pq, Some(crate::bridge::PendingPqRotation { keys: pks(&new), effective_at_secs: 1_000 + 3_600 }));
+        assert_eq!(b.rotation_nonce, 1);
+        assert_ne!(l.state_root(), root_before, "a pending rotation is in the root");
+        // What an attestation's co-signature check does (`check_attest` → `verify_pq_signatures`
+        // over `bridge.pq_guardians`): the old set's quorum passes, the new set's does not.
+        let mu = [0x5a; 32];
+        let chain_id = l.chain_id();
+        let cosign = move |keys: &[Keypair]| -> Vec<PqSignature> {
+            keys.iter().take(5).enumerate().map(|(i, k)| crate::bridge::pq_cosign(k, i as u8, chain_id, &mu)).collect()
+        };
+        let m = crate::bridge::pq_cosign_message(chain_id, &mu);
+        assert_eq!(check_pq_quorum_message(&cosign(&old), &l.bridge().unwrap().pq_guardians, &m), Ok(()));
+        assert!(check_pq_quorum_message(&cosign(&new), &l.bridge().unwrap().pq_guardians, &m).is_err());
+        // A second PQ rotation is refused while one pends; a pause-key rotation is not.
+        let newer = fresh_pq_set(6).into_iter().rev().collect::<Vec<_>>();
+        let (nonce, m2, q2) = pq_rotation_parts(&l, &pks(&newer));
+        assert_eq!(l.validate(&rotate_pq_tx(&l, pks(&newer), nonce, q2), &StubExecutor), bridge_err(BridgeError::RotationPending { effective_at_secs: 4_600 }));
+        let _ = m2;
+        let new_pause = Keypair::from_seed([0x99; 32]).unwrap();
+        assert_eq!(rotate_pause(&mut l, new_pause.public_key().clone(), &old), Ok(()));
+        assert_eq!(l.bridge().unwrap().pause_key.as_ref(), Some(Keypair::from_seed([0x7f; 32]).unwrap().public_key()), "the old pause key still holds");
+        assert_eq!(l.bridge().unwrap().pending_pause.as_ref().map(|p| p.effective_at_secs), Some(4_600));
+        assert_eq!(l.bridge().unwrap().rotation_nonce, 2);
+        // One second short: nothing moves at the block's end.
+        l.set_timestamp_ms(4_599_999);
+        let root = l.state_root();
+        l.close_block(2, &p, 0, 0);
+        assert_eq!(l.bridge().unwrap().pq_guardians, pks(&old));
+        assert!(l.bridge().unwrap().pending_pq.is_some());
+        // At its time: both take effect, each spending a nonce, and the root moves.
+        l.set_timestamp_ms(4_600_000);
+        l.close_block(3, &p, 0, 0);
+        let b = l.bridge().unwrap();
+        assert_eq!(b.pq_guardians, pks(&new), "the new set signs from the next block");
+        assert_eq!(b.pause_key.as_ref(), Some(new_pause.public_key()));
+        assert_eq!((b.pending_pq.clone(), b.pending_pause.clone()), (None, None));
+        assert_eq!(b.rotation_nonce, 4, "each activation spends a nonce, so the pool's stamp on pooled attestations moves");
+        assert_ne!(l.state_root(), root);
+        assert_eq!(check_pq_quorum_message(&cosign(&new), &l.bridge().unwrap().pq_guardians, &m), Ok(()));
+        assert!(check_pq_quorum_message(&cosign(&old), &l.bridge().unwrap().pq_guardians, &m).is_err(), "the old set's co-signatures fail after");
+        // Without a delay (possession only, or no group) a rotation lands at once, as before.
+        let mut at_once = ledger_rot(None, false);
+        assert_eq!(rotate_pq(&mut at_once, pks(&new), &old), Ok(()));
+        assert_eq!((at_once.bridge().unwrap().pq_guardians.clone(), at_once.bridge().unwrap().pending_pq.clone()), (pks(&new), None));
+    }
+
+    /// BRG-14, the cancel. The current pause key — the one key held apart from the quorum —
+    /// drops a pending rotation of either kind by a signature over `M_cancel` at the rotation
+    /// nonce, which the cancel spends; then nothing takes effect at the old time. A bad kind byte,
+    /// nothing pending, a guardian's signature, a stale nonce and a chain without the group are
+    /// each refused by name.
+    #[test]
+    fn the_pause_key_cancels_a_pending_rotation_and_the_nonce_moves() {
+        let mut l = ledger_rot(Some(3_600), false);
+        l.set_timestamp_ms(1_000_000);
+        let p = proposer().address();
+        let (old, new) = (pq_keys(), fresh_pq_set(6));
+        let pause = Keypair::from_seed([0x7f; 32]).unwrap();
+        assert_eq!(rotate_pq(&mut l, pks(&new), &old), Ok(()));
+        assert_eq!(l.validate(&cancel_tx(&l, 1, 1, &pause), &StubExecutor), bridge_err(BridgeError::NoPendingRotation), "nothing pending of that kind");
+        assert_eq!(l.validate(&cancel_tx(&l, 2, 1, &pause), &StubExecutor), bridge_err(BridgeError::BadRotationKind(2)));
+        assert_eq!(l.validate(&cancel_tx(&l, 0, 0, &pause), &StubExecutor), bridge_err(BridgeError::BadRotationNonce { expected: 1, got: 0 }));
+        assert_eq!(l.validate(&cancel_tx(&l, 0, 1, &old[0]), &StubExecutor), bridge_err(BridgeError::BadCancelSignature), "a guardian cannot cancel");
+        let honest = cancel_tx(&l, 0, 1, &pause);
+        assert_eq!(l.validate(&honest, &StubExecutor), Ok(()));
+        assert_eq!(ledger_v2().validate(&honest, &StubExecutor), bridge_err(BridgeError::RotationRulesDisabled));
+        l.apply_tx(&honest, &p, &StubExecutor).unwrap();
+        let b = l.bridge().unwrap();
+        assert_eq!((b.pending_pq.clone(), b.rotation_nonce), (None, 2));
+        assert_eq!(b.pq_guardians, pks(&old));
+        // The old time comes and goes: the cancelled set never takes effect.
+        l.set_timestamp_ms(4_600_000);
+        l.close_block(2, &p, 0, 0);
+        assert_eq!(l.bridge().unwrap().pq_guardians, pks(&old));
+        assert_eq!(l.bridge().unwrap().rotation_nonce, 2);
+        // The nonce having moved, the next rotation signs at 2 — and a cancel of a pending
+        // pause-key rotation works the same way, by the current (still old) pause key.
+        let new_pause = Keypair::from_seed([0x99; 32]).unwrap();
+        assert_eq!(rotate_pause(&mut l, new_pause.public_key().clone(), &old), Ok(()));
+        assert_eq!(l.bridge().unwrap().rotation_nonce, 3);
+        assert_eq!(l.validate(&cancel_tx(&l, 1, 3, &new_pause), &StubExecutor), bridge_err(BridgeError::BadCancelSignature), "the incoming key cannot cancel its own arrival");
+        l.apply_tx(&cancel_tx(&l, 1, 3, &pause), &p, &StubExecutor).unwrap();
+        assert_eq!((l.bridge().unwrap().pending_pause.clone(), l.bridge().unwrap().rotation_nonce), (None, 4));
     }
 }

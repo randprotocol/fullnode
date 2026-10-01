@@ -49,6 +49,7 @@ pub fn bridge_config_for(emitter: [u8; 32], source_chains: &[u16]) -> BridgeConf
         guardian_set_index: None,
         burn_sequence: None,
         min_inbound_sequence: None,
+        rotation: None,
     }
 }
 

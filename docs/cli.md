@@ -63,6 +63,23 @@ check the path yourself before running it.
 Prints `address`, `public_key` (hex, 1312 bytes) and `peer_id` (the libp2p identity derived from the
 same seed). The peer id is what other nodes put after `/p2p/` in a bootstrap address.
 
+### `rand-node bridge-gov` (audit v6, BRG-14)
+
+Signs and submits the bridge's post-quantum rotations (`docs/bridge.md` §21.1, §21.5). Every step
+reads the chain id, its binding domain and `rand_getBridgeState.rotation_nonce` from `--rpc`.
+
+| command | does |
+|---|---|
+| `rotate-pq message --new-key K…` | prints the hex `M_rotate_pq` for the current nonce (compare it on every signer) |
+| `rotate-pq sign --new-key K… --key F --index I [--possession]` | prints `I:signature`: a current PQ guardian's quorum line (I = its index in the current set), or with `--possession` a new holder's line (I = its index in the new set); refuses a key file that is not the key at I |
+| `rotate-pq submit --new-key K… --quorum @F [--possession @F] [--no-wait]` | assembles `RotatePqGuardians` (or `…V2` with possession lines) and sends it; refuses possession on a chain that does not take it and its absence on one that requires it |
+| `rotate-pause message\|sign\|submit --new-key K` | the same for the pause key (possession index 0) |
+| `cancel-rotation sign --kind pq\|pause --key PAUSE_KEY` | prints `0:signature` over `M_cancel`, checked against the chain's current pause key |
+| `cancel-rotation submit --kind pq\|pause --signature @F` | sends `CancelRotation` |
+
+`--new-key` is a hex Dilithium2 public key, `@file` holding one, or `@key-file` (its public key).
+Signature lines are `index:hex`, whitespace- or newline-separated, `#` comments allowed.
+
 ### `rand-node genesis`
 
 | argument | default | meaning |

@@ -163,6 +163,11 @@ fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
         Action::RegisterBridgedToken { nonce, .. } | Action::ListBacking { nonce, .. } => Some((Address([0; 32]), *nonce)),
         // Bridge rules v2: the bridge's `rotation_nonce`, shared by the two rotations.
         Action::RotatePqGuardians { nonce, .. } | Action::RotatePauseKey { nonce, .. } => Some((Address([0; 32]), *nonce)),
+        // Audit v6, BRG-14: the same `rotation_nonce`, which a possession-carrying rotation and a
+        // cancel spend too.
+        Action::RotatePqGuardiansV2 { nonce, .. } | Action::RotatePauseKeyV2 { nonce, .. } | Action::CancelRotation { nonce, .. } => {
+            Some((Address([0; 32]), *nonce))
+        }
         // Genesis vesting: the entry's nonce, which the beneficiary's three actions share, and
         // the revokers' own (`Entry::revoke_nonce`, audit v6 STAKE-4) — both keyed on the entry's
         // 32-byte id, kept apart from every address and from each other by `claim_key`'s role.
@@ -220,6 +225,9 @@ fn is_governance(action: &Action) -> bool {
             | Action::RotatePauseKey { .. }
             | Action::AdmitValidator { .. }
             | Action::SlashEquivocation { .. }
+            | Action::RotatePqGuardiansV2 { .. }
+            | Action::RotatePauseKeyV2 { .. }
+            | Action::CancelRotation { .. }
     )
 }
 
@@ -243,6 +251,7 @@ fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
         Action::PauseMints { .. } | Action::UnpauseMints { .. } => 2,
         Action::RegisterBridgedToken { .. } | Action::ListBacking { .. } => 3,
         Action::RotatePqGuardians { .. } | Action::RotatePauseKey { .. } => 4,
+        Action::RotatePqGuardiansV2 { .. } | Action::RotatePauseKeyV2 { .. } | Action::CancelRotation { .. } => 4,
         Action::ClaimVested { .. } | Action::BondVested { .. } | Action::UnbondVested { .. } => 5,
         // STAKE-4: a revoke's nonce is the revokers' counter, so its slot is its own — a pooled
         // claim never holds it.
@@ -908,7 +917,14 @@ impl Mempool {
                 if bridge.pause_nonce != nonce {
                     return Err(TxError::Bridge(BridgeError::BadPauseNonce { expected: bridge.pause_nonce, got: nonce }));
                 }
-            } else if matches!(tx.action, Action::RotatePqGuardians { .. } | Action::RotatePauseKey { .. }) {
+            } else if matches!(
+                tx.action,
+                Action::RotatePqGuardians { .. }
+                    | Action::RotatePauseKey { .. }
+                    | Action::RotatePqGuardiansV2 { .. }
+                    | Action::RotatePauseKeyV2 { .. }
+                    | Action::CancelRotation { .. }
+            ) {
                 // Bridge rules v2: the bridge's `rotation_nonce`, the same rule a counter over.
                 let bridge = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?;
                 if bridge.rotation_nonce != nonce {
@@ -2604,6 +2620,36 @@ mod tests {
             Mempool::new(4).precheck(&tx, &paused, &StubExecutor).map(|_| ()),
             Err(MempoolError::Invalid(TxError::Bridge(BridgeError::MintsPaused)))
         );
+    }
+
+    /// Audit v6, BRG-14: under `bridge.rotation.delay_secs` a PQ rotation is accepted pending and
+    /// takes effect later, at a block's end (`BridgeState::activate_due_rotations`). A pooled
+    /// attestation co-signed by the old set must stay while the rotation is only pending — the
+    /// old set still signs — and leave the moment it takes effect: the activation spends a
+    /// `rotation_nonce`, which is what the BRG-12 stamp compares.
+    #[test]
+    fn a_pooled_attest_stays_while_a_rotation_pends_and_leaves_when_it_takes_effect() {
+        use randprotocol_core::bridge::{PendingPqRotation, RotationRules};
+        let (mut l, secrets) = bridged_ledger();
+        let mut bridge = l.bridge().unwrap().clone();
+        bridge.rotation_rules = Some(RotationRules { delay_secs: Some(100), needs_possession: None });
+        bridge.pending_pq = Some(PendingPqRotation { keys: bridge.pq_guardians.iter().rev().cloned().collect(), effective_at_secs: 1_000 });
+        l.set_bridge(Some(bridge));
+        let tx = attest_tx(&l, attestation(&secrets), 10);
+        let mut m = Mempool::new(100);
+        m.insert(tx, &l, &StubExecutor).unwrap();
+        // Pending, not yet due: nothing the pool compares has moved.
+        let mut early = l.clone();
+        assert!(!early.bridge_mut().unwrap().activate_due_rotations(999));
+        m.prune(&early);
+        assert_eq!(m.len(), 1, "the old set still signs while the rotation pends");
+        // Due: the set changes and the nonce moves with it.
+        let mut due = l.clone();
+        assert!(due.bridge_mut().unwrap().activate_due_rotations(1_000));
+        assert_eq!(due.bridge().unwrap().rotation_nonce, l.bridge().unwrap().rotation_nonce + 1);
+        assert!(m.candidates(&due, 10).is_empty(), "not offered under the set that replaced its signers");
+        m.prune(&due);
+        assert_eq!(m.len(), 0, "and gone at the tip change");
     }
 
     /// An oversized attestation must not buy a decode from the pre-screen.

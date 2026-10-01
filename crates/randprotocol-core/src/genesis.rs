@@ -1353,6 +1353,26 @@ impl Genesis {
             commit.extend_from_slice(b"binding_domain");
             commit.extend_from_slice(&v.to_be_bytes());
         }
+        // The bridge rotation rules (audit v6, BRG-14), after `binding_domain` — last — tagged
+        // and only when the bridge section carries the group: each field behind a presence byte,
+        // fixed width. Chain 18's file has none and hashes byte-for-byte as before.
+        if let Some(r) = self.bridge.as_ref().and_then(|b| b.rotation.as_ref()) {
+            commit.extend_from_slice(b"bridge_rotation");
+            match r.delay_secs {
+                Some(d) => {
+                    commit.push(1);
+                    commit.extend_from_slice(&d.to_be_bytes());
+                }
+                None => commit.push(0),
+            }
+            match r.needs_possession {
+                Some(p) => {
+                    commit.push(1);
+                    commit.push(p as u8);
+                }
+                None => commit.push(0),
+            }
+        }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
             height: 0,
@@ -1477,6 +1497,22 @@ fn check_bridge(cfg: &BridgeConfig) -> Result<(), GenesisError> {
         }
         if rules.global_mint_cap_per_window == 0 {
             return bad("rules_v2.global_mint_cap_per_window is zero: the bridge could never mint".into());
+        }
+    }
+    // Audit v6, BRG-14: the rotation rules sit beside `rules_v2` (the rotations they govern are
+    // v2 actions), a delay is between a second and thirty days, and an empty group is refused
+    // rather than committed for nothing.
+    if let Some(r) = &cfg.rotation {
+        if cfg.rules_v2.is_none() {
+            return bad("rotation rules need rules_v2: the rotations they govern are bridge rules v2 actions".into());
+        }
+        if r.delay_secs.is_none() && r.needs_possession.is_none() {
+            return bad("rotation is an empty group: set delay_secs and/or needs_possession, or leave it out".into());
+        }
+        if let Some(d) = r.delay_secs {
+            if d == 0 || d > crate::bridge::MAX_ROTATION_DELAY_SECS {
+                return bad(format!("rotation.delay_secs {d} is out of bounds (1..={})", crate::bridge::MAX_ROTATION_DELAY_SECS));
+            }
         }
     }
     if cfg.emitter == [0u8; 32] {
@@ -2136,6 +2172,7 @@ mod tests {
             guardian_set_index: None,
             burn_sequence: None,
             min_inbound_sequence: None,
+            rotation: None,
         }
     }
 
@@ -2353,6 +2390,69 @@ mod tests {
         let mut edge = v2.clone();
         edge.bridge.as_mut().unwrap().rules_v2 = Some(crate::bridge::BridgeRulesV2 { global_mint_cap_per_window: 1, cap_window_secs: 7 * 86_400 });
         assert!(edge.validate().is_ok());
+    }
+
+    /// Audit v6, BRG-14: the `bridge.rotation` group is committed under its own tag only when
+    /// present (a chain-18-shaped file hashes, roots and stores as before), reaches the bridge
+    /// state, needs `rules_v2` beside it, refuses an empty group and a delay of zero or over
+    /// thirty days, and each of its two fields moves the hash alone.
+    #[test]
+    fn bridge_rotation_rules_are_committed_only_when_present_and_bounded() {
+        use crate::bridge::{RotationRules, MAX_ROTATION_DELAY_SECS};
+        let mut bridged = genesis(1);
+        bridged.bridge = Some(bridge_cfg());
+        bridged.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None });
+        bridged.alloc = opened_alloc();
+        bridged.bridge.as_mut().unwrap().rules_v2 = Some(crate::bridge::BridgeRulesV2 { global_mint_cap_per_window: 500_000 * 100_000_000, cap_window_secs: 86_400 });
+        let base = build(&bridged);
+        assert_eq!(base.ledger.bridge().unwrap().rotation_rules, None);
+        assert_eq!(base.ledger.bridge().unwrap().rotation_meta(), None, "nothing to store without the group");
+        assert!(!bridged.to_json().contains("rotation"), "absent from the file when absent");
+
+        let rules = RotationRules { delay_secs: Some(86_400), needs_possession: Some(true) };
+        let mut with = bridged.clone();
+        with.bridge.as_mut().unwrap().rotation = Some(rules.clone());
+        let built = build(&with);
+        assert_ne!(built.hash(), base.hash(), "the group is in the genesis hash");
+        // In the genesis commitment itself — the header's `parent` is its digest alone — and not
+        // only through the state root the header also carries.
+        assert_ne!(built.block.header.parent, base.block.header.parent, "the group is in the genesis commitment");
+        assert_ne!(built.ledger.state_root(), base.ledger.state_root(), "and in the bridge root");
+        assert_eq!(built.ledger.bridge().unwrap().rotation_rules, Some(rules.clone()));
+        assert_eq!((built.ledger.bridge().unwrap().pending_pq.clone(), built.ledger.bridge().unwrap().pending_pause.clone()), (None, None));
+        let back: Genesis = serde_json::from_str(&with.to_json()).unwrap();
+        assert_eq!(back, with);
+        assert!(with.to_json().contains("\"rotation\""));
+        // Each field alone moves the hash, and the two together differ from either.
+        let only = |r: RotationRules| {
+            let mut g = bridged.clone();
+            g.bridge.as_mut().unwrap().rotation = Some(r);
+            build(&g).hash()
+        };
+        let delay_only = only(RotationRules { delay_secs: Some(86_400), needs_possession: None });
+        let possession_only = only(RotationRules { delay_secs: None, needs_possession: Some(true) });
+        assert!(delay_only != possession_only && delay_only != built.hash() && possession_only != built.hash());
+        assert_ne!(only(RotationRules { delay_secs: Some(3_600), needs_possession: None }), delay_only);
+        assert_ne!(only(RotationRules { delay_secs: None, needs_possession: Some(false) }), possession_only);
+
+        let bad = |f: fn(&mut BridgeConfig)| {
+            let mut g = with.clone();
+            f(g.bridge.as_mut().unwrap());
+            match g.validate() {
+                Err(GenesisError::BadBridgeConfig(m)) => m,
+                other => panic!("expected BadBridgeConfig, got {other:?}"),
+            }
+        };
+        assert!(bad(|b| b.rules_v2 = None).contains("rules_v2"));
+        assert!(bad(|b| b.rotation = Some(RotationRules { delay_secs: None, needs_possession: None })).contains("empty"));
+        assert!(bad(|b| b.rotation.as_mut().unwrap().delay_secs = Some(0)).contains("delay_secs"));
+        assert!(bad(|b| b.rotation.as_mut().unwrap().delay_secs = Some(MAX_ROTATION_DELAY_SECS + 1)).contains("delay_secs"));
+        let mut edge = with.clone();
+        edge.bridge.as_mut().unwrap().rotation = Some(RotationRules { delay_secs: Some(MAX_ROTATION_DELAY_SECS), needs_possession: Some(false) });
+        assert!(edge.validate().is_ok());
+        // An unknown key inside the group is refused, as everywhere in the bridge section.
+        let json = with.to_json().replace("\"needs_possession\"", "\"needs_possesion\"");
+        assert!(Genesis::from_json(&json).is_err());
     }
 
     /// A `bridge` section a chain could not safely run is refused at build time rather than at

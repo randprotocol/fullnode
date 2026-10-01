@@ -360,6 +360,18 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | B::BadPqGuardianKey { .. }
                 | B::BadPauseKeyLength { .. }
                 | B::DuplicatePqGuardian
+                // Audit v6, BRG-14: the rotation group and its possession rule are genesis
+                // constants, and a possession list's count and lengths and a cancel's kind byte
+                // are the action's own bytes. `BadPossession` (a key's signature: the key list
+                // is the action's own, so no state turns it good — but the message it is over
+                // carries the nonce), `RotationPending`, `NoPendingRotation`,
+                // `BadCancelSignature` (the pause key rotates) and the nonce are state and stay out.
+                | B::RotationRulesDisabled
+                | B::PossessionRequired
+                | B::PossessionNotEnabled
+                | B::PossessionCountMismatch { .. }
+                | B::BadPossessionLength { .. }
+                | B::BadRotationKind(_)
                 // C15-1: the body's own `(emitter_chain, sequence)` against the genesis replay
                 // floor, which no action moves — like `WrongChain`'s chain id.
                 | B::BelowReplayFloor { .. }

@@ -414,6 +414,30 @@ pub enum Action {
     /// through 18 — it is refused `UnsupportedAction` before a byte of it is read. The whole
     /// transaction is capped at `staking::MAX_EVIDENCE_BYTES` (1 MiB). Appended last.
     SlashEquivocation { first: Box<SignedHeader>, second: Box<SignedHeader> },
+    /// Audit v6, BRG-14 (genesis `bridge.rotation.needs_possession`): [`Action::RotatePqGuardians`]
+    /// with a proof that every new key is held — `possession[i]` is new key `i`'s own Dilithium2
+    /// signature over the same rotation message the quorum signs
+    /// ([`crate::bridge::gov::rotate_pq_message`], or its genesis-bound form), one per key in key
+    /// order, each exactly 2 420 bytes (a `Vec` so a wrong length is refused by name, as a
+    /// `PqSignature`'s is). Required under the flag, refused without it. Under
+    /// `bridge.rotation.delay_secs` the rotation is recorded as pending and takes effect later
+    /// (`docs/bridge.md` §21.5).
+    RotatePqGuardiansV2 {
+        new_pq_guardians: Vec<PublicKey>,
+        possession: Vec<Vec<u8>>,
+        nonce: u64,
+        pq_signatures: Vec<crate::bridge::PqSignature>,
+    },
+    /// BRG-14: [`Action::RotatePauseKey`] with the new pause key's own signature over the
+    /// rotation message (`possession`, 2 420 bytes), gated and delayed like `RotatePqGuardiansV2`.
+    RotatePauseKeyV2 { new_pause_key: PublicKey, possession: Vec<u8>, nonce: u64, pq_signatures: Vec<crate::bridge::PqSignature> },
+    /// BRG-14 (genesis `bridge.rotation.delay_secs`): drop the pending rotation of `kind` (0 =
+    /// the PQ set, 1 = the pause key) before it takes effect. Signed by the **current pause key**
+    /// — the one key held apart from the PQ quorum — over
+    /// [`crate::bridge::gov::cancel_rotation_message`]`(chain_id, nonce, kind)`, `nonce` the
+    /// bridge's `rotation_nonce`, which the cancel spends. Bundle-less and fee-less, like the
+    /// pause. Refused `RotationRulesDisabled` on a chain without the group.
+    CancelRotation { kind: u8, nonce: u64, signature: Signature },
 }
 
 impl Action {
@@ -444,6 +468,9 @@ impl Action {
             Action::UnbondVested { .. } => Some("unbond_vested"),
             Action::AdmitValidator { .. } => Some("admit_validator"),
             Action::SlashEquivocation { .. } => Some("slash_equivocation"),
+            Action::RotatePqGuardiansV2 { .. } => Some("rotate_pq_guardians_v2"),
+            Action::RotatePauseKeyV2 { .. } => Some("rotate_pause_key_v2"),
+            Action::CancelRotation { .. } => Some("cancel_rotation"),
             _ => None,
         }
     }
@@ -665,6 +692,23 @@ impl Action {
             // STAKE-1's evidence: two signed headers, no proof; the signatures are the action.
             Action::SlashEquivocation { first, second } => {
                 Action::SlashEquivocation { first: first.clone(), second: second.clone() }
+            }
+            // BRG-14: bundle-less, every field kept — the keys, the possession signatures and
+            // the quorum are what the transaction is.
+            Action::RotatePqGuardiansV2 { new_pq_guardians, possession, nonce, pq_signatures } => Action::RotatePqGuardiansV2 {
+                new_pq_guardians: new_pq_guardians.clone(),
+                possession: possession.clone(),
+                nonce: *nonce,
+                pq_signatures: pq_signatures.clone(),
+            },
+            Action::RotatePauseKeyV2 { new_pause_key, possession, nonce, pq_signatures } => Action::RotatePauseKeyV2 {
+                new_pause_key: new_pause_key.clone(),
+                possession: possession.clone(),
+                nonce: *nonce,
+                pq_signatures: pq_signatures.clone(),
+            },
+            Action::CancelRotation { kind, nonce, signature } => {
+                Action::CancelRotation { kind: *kind, nonce: *nonce, signature: signature.clone() }
             }
         }
     }
@@ -1283,6 +1327,15 @@ mod tests {
                 "slash_equivocation",
             ),
             (
+                Action::RotatePqGuardiansV2 { new_pq_guardians: Vec::new(), possession: Vec::new(), nonce: 0, pq_signatures: Vec::new() },
+                "rotate_pq_guardians_v2",
+            ),
+            (
+                Action::RotatePauseKeyV2 { new_pause_key: minter.clone(), possession: Vec::new(), nonce: 0, pq_signatures: Vec::new() },
+                "rotate_pause_key_v2",
+            ),
+            (Action::CancelRotation { kind: 0, nonce: 0, signature: Signature::empty() }, "cancel_rotation"),
+            (
                 Action::BondVested { entry: [0; 32], validator: v, amount: 1, registration: None, nonce: 0, signature: Signature::empty() },
                 "bond_vested",
             ),
@@ -1529,7 +1582,7 @@ mod tests {
     /// The number of `Action` variants, and each one's position — an exhaustive match with no
     /// wildcard, so a new variant fails to compile here until [`sample`] has a row for it (and
     /// [`Action::blanked`] has an arm).
-    const VARIANTS: usize = 30;
+    const VARIANTS: usize = 33;
     fn variant_index(a: &Action) -> usize {
         match a {
             Action::None => 0,
@@ -1562,6 +1615,9 @@ mod tests {
             Action::UnbondVested { .. } => 27,
             Action::AdmitValidator { .. } => 28,
             Action::SlashEquivocation { .. } => 29,
+            Action::RotatePqGuardiansV2 { .. } => 30,
+            Action::RotatePauseKeyV2 { .. } => 31,
+            Action::CancelRotation { .. } => 32,
         }
     }
 
@@ -1778,6 +1834,19 @@ mod tests {
                 let (first, second) = SignedHeader::ordered(header(9), header(10));
                 Action::SlashEquivocation { first, second }
             }
+            30 => Action::RotatePqGuardiansV2 {
+                new_pq_guardians: vec![pk(), PublicKey::from_bytes(&[0x42; crate::crypto::PUBLIC_KEY_LEN]).unwrap()],
+                possession: vec![vec![0xb1; 8], vec![0xb2; 8]],
+                nonce: 2,
+                pq_signatures: vec![crate::bridge::PqSignature { index: 0, signature: vec![0x9c; 8] }],
+            },
+            31 => Action::RotatePauseKeyV2 {
+                new_pause_key: PublicKey::from_bytes(&[0x43; crate::crypto::PUBLIC_KEY_LEN]).unwrap(),
+                possession: vec![0xb3; 8],
+                nonce: 3,
+                pq_signatures: vec![crate::bridge::PqSignature { index: 2, signature: vec![0xac; 8] }],
+            },
+            32 => Action::CancelRotation { kind: 1, nonce: 4, signature: sig() },
             _ => panic!("no variant {i}"),
         }
     }
@@ -2130,6 +2199,28 @@ mod tests {
             (27, "unbond amount", |t| {
                 let Action::UnbondVested { amount, .. } = &mut t.action else { panic!() };
                 *amount += 1;
+            }),
+            // BRG-14: the possession signatures are inside the binding like the quorum's, and so
+            // is a cancel's kind and signature.
+            (30, "rotate pq v2 possession byte", |t| {
+                let Action::RotatePqGuardiansV2 { possession, .. } = &mut t.action else { panic!() };
+                possession[1][0] ^= 1;
+            }),
+            (30, "rotate pq v2 nonce", |t| {
+                let Action::RotatePqGuardiansV2 { nonce, .. } = &mut t.action else { panic!() };
+                *nonce += 1;
+            }),
+            (31, "rotate pause v2 possession byte", |t| {
+                let Action::RotatePauseKeyV2 { possession, .. } = &mut t.action else { panic!() };
+                possession[0] ^= 1;
+            }),
+            (32, "cancel kind", |t| {
+                let Action::CancelRotation { kind, .. } = &mut t.action else { panic!() };
+                *kind ^= 1;
+            }),
+            (32, "cancel signature", |t| {
+                let Action::CancelRotation { signature, .. } = &mut t.action else { panic!() };
+                *signature = Signature::empty();
             }),
         ];
         for (i, what, change) in action_cases {

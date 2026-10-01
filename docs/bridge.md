@@ -1063,12 +1063,11 @@ M_rotate_pause = b"rand-bridge-pq-rotate-pause-1" ‖ chain_id u64 ‖ rotation_
 - `M_rotate_pq` is `46 + 1312 × count` bytes long; `M_rotate_pause` is `45 + 1312 = 1357` bytes.
   The node rebuilds them in `bridge/gov.rs`'s `rotate_pq_message`/`rotate_pause_message` and
   verifies with the same `verify_pq_message` every other governance quorum goes through.
-  **No tool builds or signs either message yet** (corrected 2026-09-30, audit v6, BRG-14): this
-  page said `rand-bridge-gov pq-rotate-pq` / `pq-rotate-pause` (bridge repo) do, but
-  `rand-bridge-gov`'s subcommands are `rotate` (the ECDSA set), `verify`, `cosign`, `pq-list`,
-  `pq-register`, `pq-unpause`, `pause`, `pq-public-key` and the submit commands (bridge repo
-  `d9cde20`, `daemons/src/bin/gov.rs`). A post-quantum guardian or pause-key rotation therefore
-  cannot be carried out today without writing that signer first.
+  **The signer is `rand-node bridge-gov` in this repository** (audit v6, BRG-14; this page used
+  to name `rand-bridge-gov pq-rotate-pq` / `pq-rotate-pause`, which do not exist — the bridge
+  repository's `rand-bridge-gov` signs the ECDSA rotation, `cosign`, `pq-list`, `pq-register`,
+  `pq-unpause` and `pause`, not these two): `rand-node bridge-gov rotate-pq message|sign|submit`
+  and `rand-node bridge-gov rotate-pause message|sign|submit` — see §21.5.
 
 Admission order for `RotatePqGuardians`, cheapest first: the `bridge` gate (`Disabled`), the
 `rules_v2` gate (`RulesV2Disabled` — a genesis constant, cached as permanent), the quorum's
@@ -1086,6 +1085,94 @@ response needs to be immediate.
 
 `tx_json` renders them as `rotate_pq_guardians` (`new_pq_guardians` hex, `nonce`, `pq_signers`)
 and `rotate_pause_key` (`new_pause_key` hex, `nonce`, `pq_signers`) — `docs/rpc.md`.
+
+### 21.5 Possession, a delay, and the cancel (audit v6, BRG-14; genesis `bridge.rotation`)
+
+What §21.1 left open: nothing proved the new keys were held by anyone (a typo, or a key nobody
+holds, bricks the PQ quorum for good), a rotation took effect in the block it landed in (no window
+to notice and stop a hostile one), and no tool signed it. A second optional group inside the
+genesis `bridge` section, beside `rules_v2` (which it requires), switches the first two on:
+
+```json
+"bridge": { …, "rules_v2": { … }, "rotation": { "delay_secs": 86400, "needs_possession": true } }
+```
+
+- **`needs_possession: true`** — a rotation must be `Action::RotatePqGuardiansV2 {
+  new_pq_guardians, possession, nonce, pq_signatures }` (wire variant 30) or
+  `RotatePauseKeyV2 { new_pause_key, possession, nonce, pq_signatures }` (31): `possession[i]` is
+  new key `i`'s own Dilithium2 signature over **the very message the quorum signs**
+  (`M_rotate_pq`/`M_rotate_pause`, or their `…-2` forms under `binding_domain: 1`), one per key in
+  key order, 2 420 bytes each. The v1 actions are refused `PossessionRequired`; without the flag
+  the V2 actions are refused `PossessionNotEnabled` (both permanent: genesis constants).
+  `PossessionCountMismatch`/`BadPossessionLength` (the action's own bytes, permanent) come before
+  the quorum's verifies; `BadPossession { index }` after them, last.
+- **`delay_secs: N`** (1 s to 30 days) — an accepted rotation is recorded as **pending** with
+  `effective_at_secs = block time + N` and takes effect at the end of the first block whose
+  timestamp reaches it (`BridgeState::activate_due_rotations`, run in `Ledger::close_block` on the
+  proposer and every replica alike). Until then the old set signs every mint and the old pause key
+  pauses. A rotation spends one `rotation_nonce` when accepted and its activation spends another —
+  so a mint attestation pooled under the old set leaves the pool the moment the set changes (the
+  pool's BRG-12 stamp compares that nonce). One pending rotation per kind (`RotationPending {
+  effective_at_secs }`); a PQ rotation and a pause-key rotation may pend side by side.
+- **`Action::CancelRotation { kind, nonce, signature }`** (variant 32, bundle-less, fee-less,
+  governance in the pool) drops the pending rotation of `kind` (0 = the PQ set, 1 = the pause key)
+  — signed by the **current pause key**, the one key held apart from the quorum, over
+  `M_cancel = b"rand-bridge-cancel-rotation-1" ‖ chain_id u64 ‖ rotation_nonce u64 ‖ kind u8` (or
+  `…-2` behind the genesis hash). It spends the nonce. `NoPendingRotation`, `BadRotationKind`
+  (permanent), `BadCancelSignature`, `RotationRulesDisabled` (permanent: a chain without the group).
+  The incoming pause key cannot cancel its own arrival; a captured quorum cannot cancel the pause
+  holder's cancel.
+
+The group is committed to the genesis hash as `b"bridge_rotation"` ‖ (presence byte ‖ `delay_secs`
+u32 BE) ‖ (presence byte ‖ `needs_possession` u8), appended after every other tag; the rules and
+the pending rotations wrap the bridge root under `rand-bridge-rotation-1` and are stored under
+their own key (`bridge_rotation`), all only when present — chain 18's genesis hash, bridge root and
+stored rows are unchanged (pinned by `a_rotation_chain_persists_its_pending_rotation_and_chain_18s_
+rows_are_unchanged` and `bridge_rotation_rules_are_committed_only_when_present_and_bounded`).
+`rand_getBridgeState` serves `rotation_rules` and `pending_rotations` (`null` without the group).
+`rand-node genesis` writes no bridge section (the cut splices it in), so the group is written into
+the cut's bridge JSON, not by a flag.
+
+**The signer, `rand-node bridge-gov`.** Three steps, each on whatever machine holds the key; every
+step reads the chain id, the binding domain and `rotation_nonce` from `--rpc`:
+
+```sh
+# 1. Everyone compares the message they are about to sign.
+rand-node bridge-gov rotate-pq message --new-key @new0.hex … --new-key @new5.hex --rpc …
+# 2. Five of the current PQ guardians (their index in the current set) sign the quorum…
+rand-node bridge-gov rotate-pq sign --new-key … --key pq-guardian-2.key.json --index 2 --rpc … >> quorum.txt
+#    …and, under needs_possession, every NEW key holder signs (index in the new set).
+rand-node bridge-gov rotate-pq sign --new-key … --key new-3.key.json --index 3 --possession --rpc … >> possession.txt
+# 3. Anyone submits.
+rand-node bridge-gov rotate-pq submit --new-key … --quorum @quorum.txt --possession @possession.txt --rpc …
+```
+
+`rotate-pause` is the same with one `--new-key` (possession index 0); `cancel-rotation sign --kind
+pq|pause --key pause.key.json` prints the line `cancel-rotation submit --kind … --signature @line`
+sends. `sign` refuses a key file that is not the key at `--index`; `submit` re-verifies every
+possession line before anything is sent. A `--new-key` is a hex public key, `@file` holding one, or
+`@key-file` (its public key; the seed is never used).
+
+**Rehearsal checklist** (the audit's ask; run it on a private chain with a full guardian set before
+the first real rotation, and again whenever the holders change — not yet run):
+
+1. Cut a private chain whose bridge section carries `rules_v2` and `rotation: { delay_secs: 600,
+   needs_possession: true }`, the production guardian count, a pause key held by the person who
+   will hold it in production, and `binding_domain: 1`.
+2. Deposit and mint a small amount under the old set; confirm `rand_getBridgeState.rotation_nonce`.
+3. Generate the new PQ keys on the new holders' own machines; collect only their public keys.
+   Run `rotate-pq message` on every signer's machine and compare the hex out of band.
+4. Collect a quorum of current-set `sign` lines and one `--possession` line from every new holder;
+   `submit`. Confirm `pending_rotations` shows the set and `effective_at_secs`.
+5. During the delay: mint once more — it must commit under the old set. Then have the pause holder
+   run `cancel-rotation sign/submit --kind pq` once on a throwaway rotation to prove the brake
+   works, and confirm `pending_rotations` empties and the nonce moved.
+6. Re-submit the real rotation (new nonce, re-signed), wait out the delay; confirm the set changed
+   at the first block past `effective_at_secs`, that a mint co-signed by the old set is refused and
+   one co-signed by the new set commits.
+7. Rotate the pause key the same way (possession by the new holder), then `bridge-pause` with the
+   new key, then `bridge-unpause` with a new-set quorum.
+8. Record the transaction hashes, the holders and the timings in `docs/deploy.md`.
 
 #### BIND-1 (audit v6): the governance messages under genesis `binding_domain: 1`
 
