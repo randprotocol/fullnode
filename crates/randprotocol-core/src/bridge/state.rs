@@ -121,6 +121,91 @@ pub struct BridgeConfig {
     /// `bridge_burn_sequence`) and folded into the bridge root (see [`BridgeState::root`]).
     #[serde(default, skip_serializing_if = "Option::is_none", with = "floor_map")]
     pub min_inbound_sequence: Option<BTreeMap<u16, u64>>,
+    /// The zUSD bridge fees (v0.6.8, chain 20; `docs/bridge.md` §25): a share of every deposit
+    /// and of every redemption taken **in the bridged token, on this chain**, as a chain-made note
+    /// to a treasury address — not in USDT on the source chain, so the fee income is shielded like
+    /// any other note ([`BridgeFees`]). Its own group beside `rotation`, for the reason that group
+    /// gives: absent — chains 14 to 19 — nothing changes; present, it is committed to the genesis
+    /// hash under its own tag (last), folded into the bridge root under its own domain and stored
+    /// under its own key, and a node that came back without it would mint deposits its peers
+    /// split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fees: Option<BridgeFees>,
+}
+
+/// The genesis `bridge.fees` group (v0.6.8; `docs/bridge.md` §25): what the chain keeps of a
+/// bridged token crossing in either direction, in that token.
+///
+/// - `mint_bps`: of a deposit's gross amount `g` (what the guardians signed), the chain mints
+///   `fee = ⌊g·mint_bps/10⁴⌋` rounded **down** to a whole release unit of the backing
+///   (`10^(8 − source decimals)`) as a note to `recipient`, and `g − fee` as the depositor's note.
+///   Both notes count: the backing's `locked` and the token's supply still move by `g`.
+/// - `burn_bps`: of a burn of `amount`, the chain mints `fee` (same rounding) back as a note to
+///   `recipient`, and the outbound message — what the guardians sign and the source contract
+///   releases — carries `amount − fee`, which is also all that leaves `locked` and the supply.
+///
+/// Each at most [`MAX_BRIDGE_FEE_BPS`] (1 %). A fee that rounds to zero makes no note. `recipient`
+/// is a full shielded address (`rand1…`): the fee notes are sealed to nobody — every word of them
+/// is public in the transaction and this genesis — and the treasury wallet rebuilds them, exactly
+/// as a depositor rebuilds a deposit (F1, BRG-11). Committed to the genesis hash as
+/// `b"bridge_fees"` ‖ [`BridgeFees::commit_bytes`], last, only when present.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeFees {
+    pub mint_bps: u16,
+    pub burn_bps: u16,
+    #[serde(with = "address_text")]
+    pub recipient: crate::notes::ShieldedAddress,
+}
+
+/// The largest `bridge.fees.mint_bps` / `burn_bps` a genesis may set: 100 basis points, 1 %.
+pub const MAX_BRIDGE_FEE_BPS: u16 = 100;
+
+impl BridgeFees {
+    /// The fixed-width bytes the genesis hash and the bridge root commit to: `mint_bps` BE ‖
+    /// `burn_bps` BE ‖ the recipient's `pk` (32 bytes) ‖ its `kem_ek`. The address's length is
+    /// held at parse (`ShieldedAddress::parse`), so every field is fixed-width.
+    pub fn commit_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + 32 + self.recipient.kem_ek.len());
+        out.extend_from_slice(&self.mint_bps.to_be_bytes());
+        out.extend_from_slice(&self.burn_bps.to_be_bytes());
+        out.extend_from_slice(&crate::notes::word8_to_bytes(&self.recipient.pk));
+        out.extend_from_slice(&self.recipient.kem_ek);
+        out
+    }
+}
+
+/// A shielded address as its `rand1…` text in JSON and in bincode alike (the stored
+/// `META_BRIDGE_FEES` blob), parsed — and so length-checked — on the way in.
+mod address_text {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(a: &crate::notes::ShieldedAddress, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&a.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<crate::notes::ShieldedAddress, D::Error> {
+        let text = String::deserialize(d)?;
+        crate::notes::ShieldedAddress::parse(&text).map_err(|e| serde::de::Error::custom(format!("bridge.fees.recipient: {e}")))
+    }
+}
+
+/// What a burn on a chain with `bridge.fees` split (v0.6.8): `amount` is what the bundle burned
+/// (`burn_a`), `fee` what the chain minted back to the treasury; the outbound message carries the
+/// rest. Kept beside the [`BridgeBurnRecord`] it belongs to — on disk as bytes appended after the
+/// record's own (`Storage`), never inside the record's bincode — so every row a build through
+/// v0.6.7 wrote still decodes, and a chain without the group writes exactly the rows it did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BurnFeeSplit {
+    pub amount: u64,
+    pub fee: u64,
+}
+
+impl BurnFeeSplit {
+    /// What the source contract releases: `amount − fee`, the figure in the signed body.
+    pub fn release_amount(&self) -> u64 {
+        self.amount - self.fee
+    }
 }
 
 /// Bridge rules v2 (audit v4 BRG-14 / BR-4): the parameters the second rule set adds. Genesis
@@ -270,6 +355,8 @@ impl From<&BridgeConfig> for BridgeCommit {
             min_inbound_sequence: _,
             // The rotation rules (BRG-14) likewise: tagged, last, only when present.
             rotation: _,
+            // The bridge fees (v0.6.8) likewise: tagged, last, only when present.
+            fees: _,
         } = cfg;
         BridgeCommit {
             emitter: *emitter,
@@ -295,6 +382,11 @@ pub struct BridgeBurnRecord {
     /// The transaction that produced this message.
     pub tx: Hash,
     pub height: u64,
+    /// On a chain with `bridge.fees`, what this burn split ([`BurnFeeSplit`]); `None` on a chain
+    /// without the group. Skipped by serde on purpose: the record's bincode is the row every
+    /// build through v0.6.7 wrote, and storage appends the split after it (see `Storage`).
+    #[serde(skip)]
+    pub fee: Option<BurnFeeSplit>,
 }
 
 /// The bridge ledger.
@@ -348,6 +440,10 @@ pub struct BridgeState {
     pub pending_pq: Option<PendingPqRotation>,
     /// BRG-14: the pause-key rotation accepted under the delay and not yet in effect.
     pub pending_pause: Option<PendingPauseRotation>,
+    /// v0.6.8: the genesis `bridge.fees`, `None` on chains 14 to 19 — where every deposit mints
+    /// the gross and every burn releases what it burned. Fixed for the chain's life; stored under
+    /// its own key and folded into the root only when present.
+    pub fees: Option<BridgeFees>,
 }
 
 /// The small, whole-state half of a [`BridgeState`]: everything except the
@@ -695,6 +791,7 @@ impl BridgeState {
             rules_v2: cfg.rules_v2.clone(),
             min_inbound_sequence: cfg.min_inbound_sequence.clone().unwrap_or_default(),
             rotation_rules: cfg.rotation.clone(),
+            fees: cfg.fees.clone(),
             ..Default::default()
         }
     }
@@ -726,6 +823,8 @@ impl BridgeState {
             rotation_rules: _,
             pending_pq: _,
             pending_pause: _,
+            // The bridge fees (v0.6.8): `META_BRIDGE_FEES`'s, under its own key.
+            fees: _,
         } = self;
         BridgeMeta {
             emitter: *emitter,
@@ -827,6 +926,9 @@ impl BridgeState {
             rotation_rules,
             pending_pq,
             pending_pause,
+            // Restored by the caller from its own key (`Storage::load_bridge`): a chain without
+            // `bridge.fees` has none to restore.
+            fees: None,
         }
     }
 
@@ -1142,16 +1244,22 @@ impl BridgeState {
         if matches!(to_chain, 2..=4) && to[..12] != [0u8; 12] {
             return Err(BridgeError::BadRecipient);
         }
-        if relayer_fee > amount {
+        // v0.6.8: under `bridge.fees` the chain keeps `fee` of the burn as a treasury note and
+        // the source contract releases the rest — so every release-side rule below (the relayer's
+        // share, the backing's `locked`, the release unit) is judged on what is released, never
+        // on what was burned. Without the group the fee is zero and this is the old rule exactly.
+        let release = amount - self.burn_fee(tokens, asset_index, to_chain, token, amount);
+        if relayer_fee > release {
             return Err(BridgeError::FeeExceedsAmount);
         }
         if amount == 0 {
             return Err(BridgeError::ZeroAmount);
         }
         // The coin: it must back *this* token, hold what is being redeemed, and release a whole
-        // number of native units of `amount` and of `relayer_fee` (bridge-06/audit O-5) — exactly
-        // what `TokenRegistry::release` would refuse, so the ledger's apply step cannot.
-        tokens.check_release(asset_index, to_chain, token, amount, relayer_fee)?;
+        // number of native units of the release and of `relayer_fee` (bridge-06/audit O-5) —
+        // exactly what `TokenRegistry::release` would refuse, so the ledger's apply step cannot.
+        // The fee is a whole number of units by construction, so a whole release is a whole burn.
+        tokens.check_release(asset_index, to_chain, token, release, relayer_fee)?;
         Ok(())
     }
 
@@ -1184,7 +1292,12 @@ impl BridgeState {
         // The check above resolved exactly this backing, so the message is built from what the
         // burn named rather than from a second lookup that could disagree with it.
         let (token_chain, token_address) = (to_chain, token);
-        let (amount, fee) = (amount as u128, relayer_fee as u128);
+        // v0.6.8: the signed body carries the *release* — the burn less the chain's fee — so the
+        // guardians sign, and the source contract pays out, exactly what leaves `locked`. Without
+        // `bridge.fees` the fee is zero and the body is the one every earlier build wrote.
+        let bridge_fee = self.burn_fee(tokens, asset_index, to_chain, &token, amount);
+        let split = self.fees.as_ref().map(|_| BurnFeeSplit { amount, fee: bridge_fee });
+        let (amount, fee) = ((amount - bridge_fee) as u128, relayer_fee as u128);
         let sequence = self.burn_sequence;
         let body = Body {
             timestamp,
@@ -1210,6 +1323,7 @@ impl BridgeState {
             body,
             tx,
             height,
+            fee: split,
         };
         self.burn_sequence = self.burn_sequence.saturating_add(1);
         self.burns.insert(sequence, record.clone());
@@ -1308,13 +1422,45 @@ impl BridgeState {
         // when the genesis carries `bridge.rotation`: which set signs the next block's mints and
         // when it changes is decided by them, so two nodes disagreeing must disagree at the root.
         // Chains 15 to 18 hash byte-for-byte as above.
-        match self.rotation_meta() {
+        let root = match self.rotation_meta() {
             Some(meta) => {
                 let mut wrapped = root.as_bytes().to_vec();
                 wrapped.extend_from_slice(&bincode::serialize(&meta).expect("the rotation state serializes"));
                 Hash::digest_domain(b"rand-bridge-rotation-1", &wrapped)
             }
             None => root,
+        };
+        // v0.6.8: the bridge fees wrap that, the same way and only when the genesis carries
+        // `bridge.fees`: they decide what every deposit and burn mints, so a node that lost them
+        // (a store written without the key) must disagree at its next state root, not at the
+        // first deposit. Chains 14 to 19 hash byte-for-byte as above.
+        match &self.fees {
+            Some(fees) => {
+                let mut wrapped = root.as_bytes().to_vec();
+                wrapped.extend_from_slice(&fees.commit_bytes());
+                Hash::digest_domain(b"rand-bridge-fees-1", &wrapped)
+            }
+            None => root,
+        }
+    }
+
+    /// v0.6.8: the fee a deposit of `gross` of the backing `(chain, token)` of token `index` pays
+    /// under `bridge.fees` ([`crate::ledger::bridge_notes::bridge_fee`] at `mint_bps` and that
+    /// backing's release unit). `0` on a chain without the group and for a pair that backs
+    /// nothing (which `check_attest` refuses on its own).
+    pub fn mint_fee(&self, tokens: &TokenRegistry, index: u32, chain: u16, token: &[u8; 32], gross: u64) -> u64 {
+        match (&self.fees, tokens.backing(index, chain, token)) {
+            (Some(f), Some(b)) => crate::ledger::bridge_notes::bridge_fee(gross, f.mint_bps, b.release_unit()),
+            _ => 0,
+        }
+    }
+
+    /// v0.6.8: the fee a burn of `amount` releasing `(to_chain, token)` pays under `bridge.fees`,
+    /// at `burn_bps`. `0` without the group and for a pair that is not a backing of `index`.
+    pub fn burn_fee(&self, tokens: &TokenRegistry, index: u32, to_chain: u16, token: &[u8; 32], amount: u64) -> u64 {
+        match (&self.fees, tokens.backing(index, to_chain, token)) {
+            (Some(f), Some(b)) => crate::ledger::bridge_notes::bridge_fee(amount, f.burn_bps, b.release_unit()),
+            _ => 0,
         }
     }
 }
@@ -1519,6 +1665,7 @@ mod tests {
             burn_sequence: None,
             min_inbound_sequence: None,
             rotation: None,
+            fees: None,
         };
         (config, secrets)
     }
@@ -2423,6 +2570,7 @@ mod tests {
             burn_sequence: None,
             min_inbound_sequence: None,
             rotation: None,
+            fees: None,
         });
         st.spent.insert(Hash([0x44; 32]));
         st.burn_sequence = 7;
@@ -2703,6 +2851,7 @@ mod tests {
             burn_sequence: None,
             min_inbound_sequence: None,
             rotation: None,
+            fees: None,
         });
         let now = att["now"].as_u64().unwrap();
         let by_name = |name: &str| {

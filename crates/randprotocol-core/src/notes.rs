@@ -270,6 +270,22 @@ impl ShieldedAddress {
     }
 }
 
+/// Whether `kem_ek` is a valid ML-KEM-768 encapsulation key (FIPS 203 §7.2's input check):
+/// exactly [`KEM_EK_BYTES`] bytes, and the 1 152-byte `ByteEncode12` of its three polynomials
+/// decoding to coefficients below `q = 3329` — the check `ml_kem`'s `EncapsulationKey::new` runs
+/// (the node's `address::to_research`, HB-1), restated here because core does not link the KEM.
+/// The trailing 32 bytes (`ρ`) are any bytes.
+pub fn kem_ek_is_valid(kem_ek: &[u8]) -> bool {
+    const Q: u16 = 3329;
+    if kem_ek.len() != KEM_EK_BYTES {
+        return false;
+    }
+    kem_ek[..KEM_EK_BYTES - 32].as_chunks::<3>().0.iter().all(|c| {
+        let (b0, b1, b2) = (c[0] as u16, c[1] as u16, c[2] as u16);
+        (b0 | ((b1 & 0x0f) << 8)) < Q && ((b1 >> 4) | (b2 << 4)) < Q
+    })
+}
+
 impl std::fmt::Display for ShieldedAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&ShieldedAddress::to_string(self))
@@ -454,6 +470,24 @@ mod tests {
         assert_eq!(EnvelopeFormat::for_chain(None), EnvelopeFormat::Legacy);
         assert_eq!(EnvelopeFormat::for_chain(Some(1860)), EnvelopeFormat::Memo);
         assert_eq!(EnvelopeFormat::for_chain(Some(2048)), EnvelopeFormat::Legacy);
+    }
+
+    /// v0.6.8 (`bridge.fees.recipient`): core's ML-KEM-768 key check is FIPS 203's modulus
+    /// check — every 12-bit coefficient below 3 329 — and the length; `ρ` is free.
+    #[test]
+    fn the_kem_key_check_is_the_modulus_check() {
+        assert!(kem_ek_is_valid(&[0; KEM_EK_BYTES]));
+        let mut top = vec![0u8; KEM_EK_BYTES];
+        // 3 328 (q − 1) in both lanes of the first triple: 0x0d00 | 0xd00 << 12.
+        top[..3].copy_from_slice(&[0x00, 0x0d, 0xd0]);
+        assert!(kem_ek_is_valid(&top));
+        top[0] = 0x01; // 3 329 = q in the first lane
+        assert!(!kem_ek_is_valid(&top));
+        let mut rho = vec![0u8; KEM_EK_BYTES];
+        rho[KEM_EK_BYTES - 32..].fill(0xff);
+        assert!(kem_ek_is_valid(&rho), "the seed ρ is any 32 bytes");
+        assert!(!kem_ek_is_valid(&[0xff; KEM_EK_BYTES]));
+        assert!(!kem_ek_is_valid(&[0; KEM_EK_BYTES - 1]));
     }
 
     #[test]

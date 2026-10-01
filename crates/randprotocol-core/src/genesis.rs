@@ -1449,6 +1449,13 @@ impl Genesis {
             commit.extend_from_slice(b"program_state");
             commit.extend_from_slice(&p.cell_fee.to_be_bytes());
         }
+        // The bridge fees (v0.6.8), after `program_state` — last — tagged, and only when the
+        // bridge section carries the group, so chain 18 (`a7cb020c…`), chain 19 and every genesis
+        // cut before them hash byte-for-byte as before. Fixed width (`BridgeFees::commit_bytes`).
+        if let Some(f) = self.bridge.as_ref().and_then(|b| b.fees.as_ref()) {
+            commit.extend_from_slice(b"bridge_fees");
+            commit.extend_from_slice(&f.commit_bytes());
+        }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
             height: 0,
@@ -1589,6 +1596,20 @@ fn check_bridge(cfg: &BridgeConfig) -> Result<(), GenesisError> {
             if d == 0 || d > crate::bridge::MAX_ROTATION_DELAY_SECS {
                 return bad(format!("rotation.delay_secs {d} is out of bounds (1..={})", crate::bridge::MAX_ROTATION_DELAY_SECS));
             }
+        }
+    }
+    // v0.6.8: the bridge fees. At most 1 % each way, and a recipient whose ML-KEM key is one —
+    // the fee notes are sealed to nobody, but a treasury address whose key no wallet could hold
+    // is a typo, and every fee would go to a key nobody can derive a viewing key for. The pk is
+    // any 32 bytes, as every shielded address's is.
+    if let Some(f) = &cfg.fees {
+        for (name, bps) in [("mint_bps", f.mint_bps), ("burn_bps", f.burn_bps)] {
+            if bps > crate::bridge::MAX_BRIDGE_FEE_BPS {
+                return bad(format!("fees.{name} {bps} is out of bounds (0..={}, 1 %)", crate::bridge::MAX_BRIDGE_FEE_BPS));
+            }
+        }
+        if !crate::notes::kem_ek_is_valid(&f.recipient.kem_ek) {
+            return bad("fees.recipient's kem_ek is not a valid ML-KEM-768 encapsulation key".into());
         }
     }
     if cfg.emitter == [0u8; 32] {
@@ -2286,6 +2307,7 @@ mod tests {
             burn_sequence: None,
             min_inbound_sequence: None,
             rotation: None,
+            fees: None,
         }
     }
 
@@ -2566,6 +2588,64 @@ mod tests {
         // An unknown key inside the group is refused, as everywhere in the bridge section.
         let json = with.to_json().replace("\"needs_possession\"", "\"needs_possesion\"");
         assert!(Genesis::from_json(&json).is_err());
+    }
+
+    /// v0.6.8: the `bridge.fees` group is committed under its own tag only when present (a
+    /// chain-18/19-shaped file hashes and roots as before), reaches the bridge state, round-trips
+    /// through the file with the recipient as `rand1…` text, and refuses a share over 1 % and a
+    /// recipient whose ML-KEM key is not one — or whose text is not an address at all.
+    #[test]
+    fn bridge_fees_are_committed_only_when_present_and_bounded() {
+        use crate::bridge::{BridgeFees, MAX_BRIDGE_FEE_BPS};
+        let mut bridged = genesis(1);
+        bridged.bridge = Some(bridge_cfg());
+        bridged.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None });
+        bridged.alloc = opened_alloc();
+        let base = build(&bridged);
+        assert_eq!(base.ledger.bridge().unwrap().fees, None);
+        assert!(!bridged.to_json().contains("\"fees\""), "absent from the file when absent");
+
+        let treasury = ShieldedAddress { pk: [3; 8], kem_ek: vec![0x11; crate::notes::KEM_EK_BYTES] };
+        let fees = BridgeFees { mint_bps: 10, burn_bps: 10, recipient: treasury.clone() };
+        let mut with = bridged.clone();
+        with.bridge.as_mut().unwrap().fees = Some(fees.clone());
+        with.validate().expect("a valid group");
+        let built = build(&with);
+        assert_ne!(built.block.header.parent, base.block.header.parent, "the group is in the genesis commitment");
+        assert_ne!(built.ledger.state_root(), base.ledger.state_root(), "and in the bridge root");
+        assert_eq!(built.ledger.bridge().unwrap().fees, Some(fees.clone()));
+        let json = with.to_json();
+        assert!(json.contains(&format!("\"recipient\": \"{}\"", treasury)), "the recipient is its rand1… text");
+        let back: Genesis = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with);
+        // Each field moves the hash.
+        let hash_of = |f: BridgeFees| {
+            let mut g = bridged.clone();
+            g.bridge.as_mut().unwrap().fees = Some(f);
+            build(&g).hash()
+        };
+        assert_ne!(hash_of(BridgeFees { mint_bps: 11, ..fees.clone() }), built.hash());
+        assert_ne!(hash_of(BridgeFees { burn_bps: 11, ..fees.clone() }), built.hash());
+        assert_ne!(hash_of(BridgeFees { recipient: ShieldedAddress { pk: [4; 8], ..treasury.clone() }, ..fees.clone() }), built.hash());
+
+        let bad = |f: &dyn Fn(&mut BridgeFees)| {
+            let mut g = with.clone();
+            f(g.bridge.as_mut().unwrap().fees.as_mut().unwrap());
+            match g.validate() {
+                Err(GenesisError::BadBridgeConfig(m)) => m,
+                other => panic!("expected BadBridgeConfig, got {other:?}"),
+            }
+        };
+        assert!(bad(&|f| f.mint_bps = MAX_BRIDGE_FEE_BPS + 1).contains("mint_bps"));
+        assert!(bad(&|f| f.burn_bps = MAX_BRIDGE_FEE_BPS + 1).contains("burn_bps"));
+        // A coefficient of 0xfff ≥ q: not an ML-KEM-768 key, whatever its length.
+        assert!(bad(&|f| f.recipient.kem_ek = vec![0xff; crate::notes::KEM_EK_BYTES]).contains("kem_ek"));
+        let mut edge = with.clone();
+        edge.bridge.as_mut().unwrap().fees = Some(BridgeFees { mint_bps: MAX_BRIDGE_FEE_BPS, burn_bps: 0, recipient: treasury });
+        assert!(edge.validate().is_ok());
+        // Text that is not an address, and an unknown key in the group, are refused at parse.
+        assert!(Genesis::from_json(&json.replace(&with.bridge.as_ref().unwrap().fees.as_ref().unwrap().recipient.to_string(), "rand1nonsense")).is_err());
+        assert!(Genesis::from_json(&json.replace("\"burn_bps\"", "\"burn_bp\"")).is_err());
     }
 
     /// A `bridge` section a chain could not safely run is refused at build time rather than at

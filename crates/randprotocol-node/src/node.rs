@@ -213,6 +213,13 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // refusing each transaction its peers apply, and admitting ones made for any other chain
     // that shares the chain id. A fork at the first transaction after its restart.
     ledger.set_binding_domain(*gs.ledger.binding_domain());
+    // And the bridge fees (v0.6.8, genesis `bridge.fees`): stored with the bridge, but a genesis
+    // parameter, so the file is the authority — a node that came back without them would mint
+    // every deposit whole and release every burn whole while its peers split them, and compute a
+    // different bridge root besides: a fork at its first block.
+    if let Some(bridge) = ledger.bridge_mut() {
+        bridge.fees = gs.ledger.bridge().and_then(|b| b.fees.clone());
+    }
     // The vesting register is state, not a switch: storage holds it (claims move it), so it is
     // never re-seeded from the file — but the two must agree that the chain has one, or this
     // node would compute a different state-root domain from its peers at its first block.
@@ -5281,6 +5288,27 @@ mod tests {
         assert_eq!(storage.load_ledger(&StubExecutor).unwrap().hc_auth(), None);
         let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
         assert_eq!(reloaded.hc_auth(), Some([21; 8]), "restored from the genesis state");
+    }
+
+    /// v0.6.8: core's `kem_ek_is_valid` (genesis `bridge.fees.recipient`) agrees with the KEM the
+    /// node seals with (`address::to_research`, `ml_kem`'s own check) on a real wallet's key, on
+    /// the zero key, and on keys with one coefficient at and past the modulus.
+    #[test]
+    fn the_core_kem_check_agrees_with_ml_kem() {
+        use randprotocol_core::notes::{kem_ek_is_valid, ShieldedAddress, KEM_EK_BYTES};
+        let real = randprotocol_zkvm::address::address_of(&randprotocol_zkvm::notes::SpendKey::random().viewing_key());
+        let mut cases = vec![real.kem_ek.clone(), vec![0; KEM_EK_BYTES], vec![0xff; KEM_EK_BYTES]];
+        for (i, triple) in [[0x01, 0x0d, 0x00], [0x00, 0x10, 0xd0], [0x00, 0x0d, 0xd0]].into_iter().enumerate() {
+            let mut k = real.kem_ek.clone();
+            k[3 * (i + 7)..3 * (i + 7) + 3].copy_from_slice(&triple);
+            cases.push(k);
+        }
+        for kem_ek in cases {
+            let ours = kem_ek_is_valid(&kem_ek);
+            let theirs = randprotocol_zkvm::address::to_research(&ShieldedAddress { pk: [1; 8], kem_ek }).is_ok();
+            assert_eq!(ours, theirs);
+        }
+        assert!(kem_ek_is_valid(&real.kem_ek));
     }
 
     /// The gas section (design 2026-09-28 §4.2, §4.3, §7.1) survives a restart the same way:

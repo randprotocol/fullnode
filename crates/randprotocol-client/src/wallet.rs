@@ -771,15 +771,78 @@ const PUBLIC_NOTE_KINDS: [&str; 4] = ["bridge_attest", "token_mint", "register_t
 /// deposits nothing). A rebuilt note is only a candidate: [`scan`] records it at the leaf whose
 /// commitment it hashes to, so the chain's own tree is the authority on what was appended.
 pub fn rebuilt_notes(w: &Wallet, tx: &Transaction) -> Vec<Note> {
+    rebuilt_notes_with(w, tx, None, None)
+}
+
+/// A chain's `bridge.fees` (v0.6.8) as a wallet needs it to rebuild bridge notes: the group, and
+/// the release unit of every backing (`10^(8 − decimals)`, from `rand_getBridgeState.assets`).
+/// Read from the node and never trusted: a rebuilt note is placed only at a leaf whose commitment
+/// it hashes to, so a node lying about either only makes a note go unfound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BridgeFeeCtx {
+    pub fees: randprotocol_core::bridge::BridgeFees,
+    pub units: BTreeMap<(u16, [u8; 32]), u64>,
+}
+
+impl BridgeFeeCtx {
+    /// From a `rand_getBridgeState` reply: `None` without a bridge, without `fees` (a chain
+    /// without the group, or a node older than v0.6.8) or with a field that does not parse.
+    pub fn from_bridge_state(state: &Value) -> Option<BridgeFeeCtx> {
+        let f = state.get("fees").filter(|f| !f.is_null())?;
+        let fees = randprotocol_core::bridge::BridgeFees {
+            mint_bps: u16::try_from(f["mint_bps"].as_u64()?).ok()?,
+            burn_bps: u16::try_from(f["burn_bps"].as_u64()?).ok()?,
+            recipient: ShieldedAddress::parse(f["recipient"].as_str()?).ok()?,
+        };
+        let mut units = BTreeMap::new();
+        for row in state["assets"].as_array()? {
+            let (Some(chain), Some(token), Some(decimals)) = (row["chain"].as_u64(), row["token"].as_str(), row["decimals"].as_u64()) else {
+                continue;
+            };
+            let (Ok(chain), Some(token), Ok(decimals)) = (u16::try_from(chain), crate::hex32(token).ok(), u8::try_from(decimals)) else {
+                continue;
+            };
+            units.insert((chain, token), randprotocol_core::ledger::tokens::release_unit(decimals));
+        }
+        Some(BridgeFeeCtx { fees, units })
+    }
+
+    fn unit(&self, chain: u16, token: &[u8; 32]) -> Option<u64> {
+        self.units.get(&(chain, *token)).copied()
+    }
+}
+
+/// [`rebuilt_notes`] on a chain with `bridge.fees` (v0.6.8, `ctx`): a deposit to this wallet is
+/// the gross less the chain's fee, and when this wallet **is** the fee recipient it also rebuilds
+/// the treasury's fee notes — a deposit's (blinding over the attestation's `mu`) and a burn's
+/// (blinding over the burn's transaction id; `tx_hash` is that id when `tx` is a proof-stripped
+/// copy, which hashes differently — the header's `public_notes` carries burns that way). `ctx`
+/// `None` is [`rebuilt_notes`] exactly.
+pub fn rebuilt_notes_with(w: &Wallet, tx: &Transaction, tx_hash: Option<&Hash>, ctx: Option<&BridgeFeeCtx>) -> Vec<Note> {
     let me = w.vk.pk();
+    let fees = ctx.map(|c| &c.fees);
+    let treasury = fees.is_some_and(|f| f.recipient.pk == me);
+    let unit = |c: u16, t: &[u8; 32]| ctx.and_then(|x| x.unit(c, t));
+    let fee_note = |n: bridge_notes::BridgeFeeNote| Note { pk: me, from: [0; 8], amount: n.amount, asset: n.asset, time: n.time, r: n.r };
     match &tx.action {
-        Action::BridgeAttest { attestation, recipient, r, time, asset, .. } if recipient.pk == me => {
+        Action::BridgeAttest { attestation, recipient, r, time, asset, .. } if recipient.pk == me || treasury => {
             // The ledger's own reading of the wire, so the amount cannot disagree with the one the
             // chain deposited. `None` is a rotation, which deposits nothing.
-            bridge_notes::attested_transfer(attestation)
-                .map(|(_, _, amount)| Note { pk: me, from: [0; 8], amount, asset: *asset, time: *time, r: *r })
-                .into_iter()
-                .collect()
+            let Some(split) = bridge_notes::attest_split_with(fees, attestation, *asset, *time, unit) else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            if recipient.pk == me {
+                out.push(Note { pk: me, from: [0; 8], amount: split.net, asset: *asset, time: *time, r: *r });
+            }
+            if treasury {
+                out.extend(split.fee.map(fee_note));
+            }
+            out
+        }
+        Action::BridgeBurn { .. } if treasury => {
+            let hash = tx_hash.copied().unwrap_or_else(|| tx.hash());
+            bridge_notes::burn_fee_note_with(fees, tx, &hash, unit).map(fee_note).into_iter().collect()
         }
         Action::TokenMint { asset, amount, recipient, r, time, .. } if recipient.pk == me => {
             vec![Note { pk: me, from: MINT_FROM, amount: *amount, asset: *asset, time: *time, r: *r }]
@@ -826,6 +889,14 @@ pub fn rebuilt_notes(w: &Wallet, tx: &Transaction) -> Vec<Note> {
 /// passes it, because asking again would only be refused again.
 async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result<BTreeMap<Word8, Note>> {
     let head = rpc.head().await?["height"].as_u64().context("getHead did not return a height")?;
+    // v0.6.8: the chain's `bridge.fees`, once per walk — what values this wallet's deposits and,
+    // if it is the treasury, finds its fee notes. Any failure (no bridge, an older node) is a
+    // chain without the group: deposits are the gross, as before.
+    let fee_ctx = match rpc.bridge_state().await {
+        Ok(state) => BridgeFeeCtx::from_bridge_state(&state),
+        Err(_) => None,
+    };
+    let treasury = fee_ctx.as_ref().is_some_and(|c| c.fees.recipient.pk == w.vk.pk());
     let mut from = store.scanned_attest_height;
     // The highest floor a refusal named, if any page was refused.
     let mut pruned: Option<u64> = None;
@@ -852,7 +923,9 @@ async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -
                     let raw = hex::decode(entry["raw"].as_str().unwrap_or_default())
                         .map_err(|e| anyhow!("block {height} carries a public-note transaction that is not hex: {e}"))?;
                     let tx = Transaction::decode(&raw).map_err(|e| anyhow!("block {height} carries a public-note transaction that does not decode: {e}"))?;
-                    found.extend(rebuilt_notes(w, &tx));
+                    // A proof-stripped burn (v0.6.8) hashes differently: the entry names its id.
+                    let hash = entry["hash"].as_str().and_then(|h| Hash::from_hex(h).ok());
+                    found.extend(rebuilt_notes_with(w, &tx, hash.as_ref(), fee_ctx.as_ref()));
                 }
                 continue;
             }
@@ -870,7 +943,9 @@ async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -
             let Some(txs) = block["transactions"].as_array() else { continue };
             for tx in txs {
                 let kind = tx["action"]["kind"].as_str().unwrap_or_default();
-                if !PUBLIC_NOTE_KINDS.contains(&kind) {
+                // A burn appends a public note only on a chain with `bridge.fees`, and only for
+                // the treasury: nobody else fetches burns (they are megabytes of proof).
+                if !PUBLIC_NOTE_KINDS.contains(&kind) && !(treasury && kind == "bridge_burn") {
                     continue;
                 }
                 let hash = Hash::from_hex(tx["hash"].as_str().unwrap_or_default())
@@ -879,7 +954,7 @@ async fn rebuildable_notes(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -
                     .raw_transaction(&hash)
                     .await?
                     .with_context(|| format!("the node serves no raw transaction for {hash}, committed in block {height}"))?;
-                found.extend(rebuilt_notes(w, &raw));
+                found.extend(rebuilt_notes_with(w, &raw, Some(&hash), fee_ctx.as_ref()));
             }
         }
         // The page is read whole: keep what it held and move the cursor past it together, so a
@@ -2899,12 +2974,28 @@ fn burn_is_possible(
     // `amount_field`, not `as_u64`: the node renders every amount as a decimal string since
     // chain 14 (node I3), and an older one as a number. Both are read here.
     let locked = crate::amount_field(&backing["locked"]).context("an asset row without a locked amount")?;
-    if amount > locked {
+    // v0.6.8: under `bridge.fees` the release — what is checked against `locked` and what the
+    // relayer is paid out of — is the burn less the chain's fee.
+    let release = amount - burn_fee_quote(bridge_state, to_chain, token, amount);
+    if relayer_fee > release {
+        return Err(anyhow!("the relayer fee {relayer_fee} is more than the {release} this burn releases"));
+    }
+    if release > locked {
         return Err(anyhow!(
             "only {locked} is locked in that coin on chain {to_chain}; choose another backing or a smaller amount"
         ));
     }
     Ok(())
+}
+
+/// The chain's fee on a burn of `amount` releasing `(to_chain, token)` (v0.6.8, `bridge.fees`):
+/// `⌊amount·burn_bps/10⁴⌋` down to a whole release unit — the ledger's own `bridge_fee` — read
+/// off a `rand_getBridgeState` reply. `0` on a chain without the group (or a node that does not
+/// serve it), which is then exactly what the chain charges. `release = amount − this`.
+pub fn burn_fee_quote(bridge_state: &Value, to_chain: u16, token: &[u8; 32], amount: u64) -> u64 {
+    BridgeFeeCtx::from_bridge_state(bridge_state)
+        .and_then(|c| Some(bridge_notes::bridge_fee(amount, c.fees.burn_bps, c.unit(to_chain, token)?)))
+        .unwrap_or(0)
 }
 
 /// Burn `amount` of a bridged asset to `to_chain`/`to` (spec §10): one hidden-asset bundle that
@@ -5672,6 +5763,73 @@ mod tests {
             Note { pk, from: MINT_FROM, amount: 90, asset: 6, time: 3, r: [11; 8] },
         ];
         (vec![deposit, mint, register], notes)
+    }
+
+    /// v0.6.8, `bridge.fees`: the depositor rebuilds its deposit at the net amount, and the
+    /// treasury — the wallet named `fees.recipient` — rebuilds both of its fee notes, the deposit's
+    /// and a burn's, from the transactions' public fields alone (the burn's from a proof-stripped
+    /// copy, given its real id), each word for word the note the ledger appended. A stranger gets
+    /// nothing; with no fee context the deposit is the gross, as on every earlier chain.
+    #[test]
+    fn the_treasury_rebuilds_both_fee_notes_and_the_depositor_its_net_deposit() {
+        let me = Wallet::from_spend_key(SpendKey([41; 8]));
+        let treasury = Wallet::from_spend_key(SpendKey([43; 8]));
+        let stranger = Wallet::from_spend_key(SpendKey([42; 8]));
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let state = serde_json::json!({
+            "enabled": true,
+            "fees": { "mint_bps": 10, "burn_bps": 10, "recipient": treasury.address.to_string() },
+            "assets": [{ "index": 3, "chain": TOKEN_CHAIN, "token": hex::encode(TOKEN), "decimals": 6, "locked": "0" }],
+        });
+        let ctx = BridgeFeeCtx::from_bridge_state(&state).expect("a fee context");
+        assert_eq!(ctx.units.get(&(TOKEN_CHAIN, TOKEN)), Some(&100));
+        assert_eq!(BridgeFeeCtx::from_bridge_state(&serde_json::json!({ "enabled": true, "fees": null, "assets": [] })), None);
+
+        // 1 USDT in: 0.999 to me, 0.001 to the treasury.
+        let attestation = transfer_attestation(100_000_000, me.address.recipient_hash());
+        let r = bridge_notes::deposit_r(&attestation).unwrap();
+        let deposit = Transaction::shielded(
+            7,
+            unread_bundle(),
+            Action::BridgeAttest { attestation: attestation.clone(), recipient: me.address.clone(), r, time: 4, asset: 3, envelope: garbage(), pq_signatures: vec![] },
+        );
+        let mine = rebuilt_notes_with(&me, &deposit, None, Some(&ctx));
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].amount, 99_900_000);
+        assert_eq!(mine[0].commitment(), bridge_notes::deposit_commitment(&me.address, 99_900_000, 3, 4, &r, &ex));
+        assert_eq!(rebuilt_notes(&me, &deposit)[0].amount, 100_000_000, "no fee context: the gross, as before");
+        let fee = rebuilt_notes_with(&treasury, &deposit, None, Some(&ctx));
+        assert_eq!(fee.len(), 1, "the treasury's fee note, and not the deposit");
+        let mu = randprotocol_core::bridge::digest(Attestation::body_bytes(&attestation).unwrap());
+        let ledger_fee = bridge_notes::BridgeFeeNote { amount: 100_000, asset: 3, time: 4, r: bridge_notes::derive_mint_fee_r(&mu) };
+        assert_eq!(fee[0].commitment(), ledger_fee.commitment(&treasury.address, &ex), "the ledger's own fee note");
+        assert!(rebuilt_notes_with(&stranger, &deposit, None, Some(&ctx)).is_empty());
+
+        // 0.5 zUSD out: the treasury's 0.0005, blinded over the burn's real id.
+        let mut bundle = unread_bundle();
+        bundle.burn_asset = 3;
+        bundle.burn_a = 50_000_000;
+        bundle.time = 9;
+        bundle.proof = vec![7; 64];
+        let burn = Transaction::shielded(
+            7,
+            bundle,
+            Action::BridgeBurn { asset: 3, amount: 50_000_000, relayer_fee: 0, to_chain: TOKEN_CHAIN, token: TOKEN, to: [1; 32] },
+        );
+        let ledger_fee = bridge_notes::BridgeFeeNote { amount: 50_000, asset: 3, time: 9, r: bridge_notes::derive_burn_fee_r(&burn.hash()) };
+        let fee = rebuilt_notes_with(&treasury, &burn, None, Some(&ctx));
+        assert_eq!(fee.len(), 1);
+        assert_eq!(fee[0].commitment(), ledger_fee.commitment(&treasury.address, &ex));
+        let mut stripped = burn.clone();
+        stripped.bundle.as_mut().unwrap().proof = Vec::new();
+        assert_ne!(stripped.hash(), burn.hash());
+        assert_eq!(rebuilt_notes_with(&treasury, &stripped, Some(&burn.hash()), Some(&ctx)), fee, "the header's stripped copy, under the real id");
+        assert!(rebuilt_notes_with(&me, &burn, None, Some(&ctx)).is_empty(), "only the treasury rebuilds a burn");
+        assert!(rebuilt_notes(&treasury, &burn).is_empty(), "and only on a chain with the group");
+
+        // The quote a burner sees before confirming.
+        assert_eq!(burn_fee_quote(&state, TOKEN_CHAIN, &TOKEN, 50_000_000), 50_000);
+        assert_eq!(burn_fee_quote(&serde_json::json!({ "enabled": true, "assets": [] }), TOKEN_CHAIN, &TOKEN, 50_000_000), 0);
     }
 
     /// The three notes a deposit and two mints append are rebuilt, word for word, as the notes the

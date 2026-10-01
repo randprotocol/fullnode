@@ -358,6 +358,10 @@ enum Cmd {
         /// Prove the bundle on an attached NVIDIA GPU.
         #[arg(long)]
         cuda: bool,
+        /// Burn without asking, on a chain with a bridge fee (`rand_getBridgeState.fees`), after
+        /// printing the fee and the amount that will be released.
+        #[arg(long)]
+        yes: bool,
     },
     /// RPL tokens: burn one this wallet holds; register a bridged token and list its backings
     /// after genesis (bridge hardening B4).
@@ -2235,8 +2239,19 @@ async fn main() -> Result<()> {
             // The chain id this transaction is built for, read once: it also decides the envelope
             // format, so a node's memo claim on a pre-`envelope_bytes` chain is not believed (#64).
             let chain_id = rpc.chain_id().await?;
+            // v0.6.8: under `bridge.fees` the deposit note is the gross less the chain's fee (the
+            // fee is a second, chain-made note to the treasury), so the envelope is sealed for the
+            // net — sealed for the gross it would open to a note the chain never appended.
+            let fee_ctx = wallet::BridgeFeeCtx::from_bridge_state(&bridge);
+            let deposit_amount = randprotocol_core::ledger::bridge_notes::attest_split_with(fee_ctx.as_ref().map(|c| &c.fees), &bytes, index, time, |c, t| {
+                fee_ctx.as_ref().and_then(|x| x.units.get(&(c, *t)).copied())
+            })
+            .map_or(d.amount, |split| split.net);
+            if deposit_amount != d.amount {
+                eprintln!("bridge fee: {} of the {} deposited goes to the treasury; this note is {}", d.amount - deposit_amount, d.amount, deposit_amount);
+            }
             let (note, envelope) =
-                wallet::deposit_note_for(&w, &recipient, &bytes, d.amount, index, time, rpc.envelope_format(chain_id).await?)?;
+                wallet::deposit_note_for(&w, &recipient, &bytes, deposit_amount, index, time, rpc.envelope_format(chain_id).await?)?;
             let owner = recipient.to_string();
             // The action names the index this envelope was sealed for, and admission refuses a
             // mismatch (`Action::BridgeAttest`) — which nothing on a listed token can now cause,
@@ -2356,11 +2371,25 @@ async fn main() -> Result<()> {
                 println!("guardian_set_index: {}", after["guardian_set_index"]);
             }
         }
-        Cmd::BridgeBurn { asset, amount, to_chain, token, to, relayer_fee, fee, no_wait, cuda } => {
-            let (w, path, mut store) = open_wallet(&cli.key)?;
+        Cmd::BridgeBurn { asset, amount, to_chain, token, to, relayer_fee, fee, no_wait, cuda, yes } => {
             let to = randprotocol_client::hex32(&to).context("the destination address must be 32 bytes of hex")?;
             let token = randprotocol_client::hex32(&token)
                 .context("the source-chain token address must be 32 bytes of hex")?;
+            // v0.6.8: on a chain with `bridge.fees` the chain keeps a share of the burn as a
+            // treasury note and releases the rest — said before anything is proved, and confirmed.
+            let state = rpc.bridge_state().await?;
+            let bridge_fee = wallet::burn_fee_quote(&state, to_chain, &token, amount);
+            let release = amount.saturating_sub(bridge_fee);
+            if !state["fees"].is_null() {
+                eprintln!(
+                    "burning {amount} units of asset {asset}: the bridge fee is {bridge_fee}, so {release} will be released on chain {to_chain} ({}), of which {relayer_fee} pays the relayer there",
+                    hex::encode(to)
+                );
+                if !yes {
+                    confirm("Burn?", "burn", "burn cancelled")?;
+                }
+            }
+            let (w, path, mut store) = open_wallet(&cli.key)?;
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
                 None => wallet::burn_fee_default(),
@@ -2388,7 +2417,7 @@ async fn main() -> Result<()> {
             let s = s?;
             report(&s, "bridge burn");
             println!(
-                "burned {amount} units of asset {asset} to chain {to_chain} ({}), of which {relayer_fee} pays the relayer there, change {}",
+                "burned {amount} units of asset {asset} to chain {to_chain} ({}): {release} released (bridge fee {bridge_fee}), of which {relayer_fee} pays the relayer there, change {}",
                 hex::encode(to),
                 s.change
             );

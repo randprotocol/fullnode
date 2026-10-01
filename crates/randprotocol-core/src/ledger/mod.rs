@@ -5126,6 +5126,7 @@ mod tests {
                 burn_sequence: None,
                 min_inbound_sequence: None,
                 rotation: None,
+                fees: None,
             };
         let mut bridged = plain.clone();
         bridged.set_bridge(Some(BridgeState::from_config(&config)));
@@ -5183,6 +5184,7 @@ mod tests {
                 burn_sequence: None,
                 min_inbound_sequence: None,
                 rotation: None,
+                fees: None,
             };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));
@@ -5246,6 +5248,7 @@ mod tests {
                 burn_sequence: None,
                 min_inbound_sequence: None,
                 rotation: None,
+                fees: None,
             };
         let mut l = ledger();
         l.set_bridge(Some(BridgeState::from_config(&config)));

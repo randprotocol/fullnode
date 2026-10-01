@@ -919,9 +919,16 @@ Params: `[]`. Result on a chain without a `bridge` section: `{ "enabled": false 
   "min_inbound_sequence": null,          // C15-1: { "2": 7, "4": 3 } — per source chain the lowest
                                          // sequence a transfer may carry, from the genesis replay floor;
                                          // null on a chain without one (chain 15 and earlier)
-  "assets": [ …the rows of `rand_getAssets`… ]
+  "assets": [ …the rows of `rand_getAssets`… ],
+  "fees": null                           // v0.6.8: { "mint_bps": 10, "burn_bps": 10, "recipient": "rand1…" }
+                                         // — the genesis `bridge.fees`; null on a chain without it (14–19)
 }
 ```
+`fees` (v0.6.8, `docs/bridge.md` §25): the share of every deposit (`mint_bps`) and every burn
+(`burn_bps`), in basis points, that the chain mints as a zUSD note to `recipient`, rounded down to
+a whole release unit of the backing. A wallet reads it to value its own deposit (the gross less
+the fee) and, when it is `recipient`, to rebuild its fee notes; a burner reads it to see what will
+be released.
 No balances: bridged value is notes, not accounts. **No `next_index` any more** (RPL, B4): a
 bridged token is listed — under an index the registration already fixed — before it can ever be
 deposited, so there is no index left to predict; a wallet reads a listed token's index off
@@ -957,11 +964,20 @@ it answers on any chain, bridged or not.
 ### `rand_getBridgeBurn`
 Params: `[sequence]` (integer). Result: `null` if this chain has emitted no such message, else
 ```json
-{ "sequence": 0, "body_hex": "…", "digest": "…", "tx": "…", "height": 2 }
+{ "sequence": 0, "body_hex": "…", "digest": "…", "tx": "…", "height": 2,
+  "amount": "500000", "release_amount": "499500", "fee": "500" }
 ```
 `body_hex` is the outbound message as guardians must hash and sign it; `digest` is its hash.
 `tx` is the burn transaction that emitted it — a burn is funded by notes, so the transaction
 hash stands in for the sender identity the message has no room for.
+
+v0.6.8, every burn on every chain: **`release_amount`** is the amount the signed body carries —
+what the source contract releases (out of which it pays the body's relayer `fee`) and what left
+the backing's `locked`; it is read off `body_hex` itself, so it cannot disagree with what the
+guardians sign. **`fee`** is the bridge fee the chain kept as a treasury note (`docs/bridge.md`
+§25) and **`amount`** is what the bundle burned, `release_amount + fee`. On a chain with
+`bridge.fees` every burn carries its split; on a chain without it (14–19) `fee` is `"0"` and
+`amount == release_amount`. All three are decimal strings in the token's eight-decimal units.
 
 ### `rand_getTokens`
 Params: `[from_index, limit]`, both optional (`0` and `1000`; `limit` is clamped to 1000). Result:
@@ -1605,6 +1621,30 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### 2026-10-01 — v0.6.8: zUSD bridge fees, `bridge.fees` (genesis-gated; chain 20 at the earliest)
+
+`docs/bridge.md` §25. Inert on every chain whose genesis bridge section has no `fees` group (chains
+14 to 19): every field below then reads as the old rule.
+
+- **`rand_getBridgeState` gains `fees`**: `{ "mint_bps", "burn_bps", "recipient" }` (bps numbers,
+  the recipient a `rand1…` address) or `null`.
+- **`rand_getBridgeBurn` gains `release_amount`, `fee` and `amount`** (decimal strings) on every
+  chain. `release_amount` is the body's own amount — what guardians sign and the source contract
+  releases. Under `bridge.fees` it is the burn less the chain's fee; without it `fee` is `"0"` and
+  `release_amount == amount`. Relayers and guardians sign the body as before: under the group the
+  body already carries `release_amount`.
+- **`rand_getTransaction`'s `bridge_attest`** gains `deposit_amount` (the depositor's note value:
+  `amount`, the gross the guardians signed, less the fee) and `fee_note` (`{ amount, asset, time,
+  r, commitment }` — the treasury's note, every word but its owner — or `null`); `commitment` is
+  now the net deposit's leaf. **`bridge_burn`** gains `release_amount` and `fee_note`.
+- **`rand_getBlocks` headers carry `bridge_burn` transactions in `public_notes`** on a chain with
+  the group, with their proofs emptied and `"proofs_stripped": true`; `hash` is the real
+  transaction id (the stripped copy hashes differently, and the fee note's blinding is over the
+  real one).
+- **`rand_getCompactBlocks` / `rand_getCommitments`**: an attest owns its fee note after its
+  deposit, a burn after its bundle's four; a fee note's envelope is empty (sealed to nobody —
+  the treasury rebuilds it). `rand_checkTransaction` opens the net deposit.
 
 ### 2026-10-01 — RPL-2: program state, program vaults and the `invoke` (genesis-gated; on no chain yet)
 

@@ -1182,6 +1182,32 @@ rehearsal checklist in `docs/bridge.md` §21.5 on a private chain; the signer is
 relayers holding attestations co-signed by the old set must re-collect co-signatures from the new
 set after `effective_at_secs`.
 
+## The next cut: `bridge.fees` (zUSD bridge fees, v0.6.8; chain 20)
+
+The user's decision (2026-10-01): take the bridge fee in zUSD on Rand, both ways, not in USDT on the
+host chain — the fee income is then shielded. `docs/bridge.md` §25 is the rule. The cut splices into
+the genesis `bridge` section (there is no `rand-node genesis` flag — the cut script writes the bridge
+section):
+
+```json
+"fees": { "mint_bps": 10, "burn_bps": 10, "recipient": "rand1…" }
+```
+
+- **Recommended: `mint_bps: 10, burn_bps: 10`** (0.1 % each way, the endpoints' old skim moved on
+  chain). At most 100 each.
+- **`recipient`: a dedicated treasury key**, generated off the laptop for this purpose
+  (`rand keygen`), never a validator's, guardian's or relayer's wallet — every fee note is visible
+  to whoever holds its viewing key, and the address is fixed for the chain's life. Back it up
+  before the cut; `rand-node init` refuses an address whose ML-KEM key is not one.
+- **Before or with the cut:** the guardians and relayer sign the burn body as before — under the
+  group it already carries `release_amount` (`rand_getBridgeBurn.release_amount`); a relayer
+  that recomputes the release from the burn transaction's `amount` must switch to the body's.
+  Decide whether the endpoints keep their own 10 bps skim on top (the chain's fee does not
+  replace it by itself). Rebuild the wallet apps against v0.6.8, or deposits on the new chain show
+  the gross until their envelope opens (the relayer's `rand bridge-mint` seals for the net).
+- After launch: `rand_getBridgeState.fees` reads the group; a 1 USDT deposit leaves 0.999 zUSD with
+  the depositor and the treasury's `rand balance` shows 0.001 after a sync.
+
 ## The next cut: `program_state` (RPL-2, v0.6.8; chain 20 at the earliest)
 
 RPL-2's program cells, program vaults and `Invoke` (variant 33) switch on with a top-level

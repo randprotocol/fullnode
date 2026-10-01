@@ -7,7 +7,7 @@
 //! and the head.
 
 use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB};
-use randprotocol_core::bridge::{BridgeBurnRecord, BridgeMeta, BridgeRotationMeta, BridgeState, BridgeMetaV2};
+use randprotocol_core::bridge::{BridgeBurnRecord, BridgeFees, BridgeMeta, BridgeRotationMeta, BridgeState, BridgeMetaV2, BurnFeeSplit};
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::consensus::{CommittedBlock, EpochSets, SafetyState};
 use randprotocol_core::genesis::GenesisState;
@@ -285,6 +285,9 @@ const META_BRIDGE_REPLAY_FLOOR: &str = "bridge_replay_floor";
 /// the pending rotations — written only on a chain whose genesis has the group (never on chain
 /// 18, whose key set and blobs stay what they are), deleted otherwise.
 const META_BRIDGE_ROTATION: &str = "bridge_rotation";
+/// v0.6.8: the genesis `bridge.fees` group (`BridgeFees`, bincode, strictly decoded) — written
+/// only on a chain whose genesis carries it, so chains 14 to 19 keep the key set they have.
+const META_BRIDGE_FEES: &str = "bridge_fees";
 /// `bincode(Option<TokenRegistry>)`: the RPL token registry as of the head, whole — `by_index`,
 /// `index_of`, `next_index` and `registration_fee` all together, the same shape `Ledger::tokens`
 /// holds and `TokenRegistry::root` hashes into the state root. `META_AGGREGATORS`'s twin, not
@@ -495,6 +498,31 @@ fn sync_opts() -> WriteOptions {
     w
 }
 
+/// A burn row (`CF_BRIDGE_BURNS`): the record's own bincode — byte for byte the row every build
+/// through v0.6.7 wrote — then, on a chain with `bridge.fees` (v0.6.8), the [`BurnFeeSplit`]'s
+/// bincode appended after it. An older build reads such a row too: plain `bincode::deserialize`
+/// ignores trailing bytes. Chains 14 to 19 never carry a split, so their rows are unchanged.
+fn encode_burn(rec: &BridgeBurnRecord) -> Result<Vec<u8>> {
+    let mut out = bincode::serialize(rec)?;
+    if let Some(split) = &rec.fee {
+        out.extend_from_slice(&bincode::serialize(split)?);
+    }
+    Ok(out)
+}
+
+/// The inverse of [`encode_burn`]: the record, then a split from whatever follows it — none for
+/// every row a build through v0.6.7 wrote. A tail that is not exactly one split is corruption.
+fn decode_burn(bytes: &[u8]) -> Result<BridgeBurnRecord> {
+    let mut rec: BridgeBurnRecord = bincode::deserialize(bytes)?;
+    let used = bincode::serialized_size(&rec)? as usize;
+    let tail = bytes.get(used..).unwrap_or_default();
+    if !tail.is_empty() {
+        use bincode::Options as _;
+        rec.fee = Some(bincode::DefaultOptions::new().with_fixint_encoding().deserialize::<BurnFeeSplit>(tail)?);
+    }
+    Ok(rec)
+}
+
 /// Every note a transaction creates, paired with the envelope that opens it: the bundle's four
 /// output slots in slot order — dummies included, every one of them is a leaf — then a mint's
 /// single note, a bridge deposit, or the notes an RPL-2 `Invoke` pays out (up to four, pays then
@@ -507,9 +535,15 @@ fn sync_opts() -> WriteOptions {
 /// own function. `tokens` is that registry (the RPL token standard — the bridge keeps none of
 /// its own) — absent only on a chain without a `tokens` section, which is a chain without a
 /// bridge, where a `BridgeAttest` is inadmissible.
+///
+/// `fees` is the chain's `bridge.fees` (v0.6.8): under it an attest's deposit is the net amount
+/// and a fee note follows it, and a burn's fee note follows the bundle's four — each with an
+/// **empty envelope**: a fee note is sealed to nobody, and its owner rebuilds it from the
+/// transaction's public fields ([`randprotocol_core::ledger::bridge_notes::bridge_fee_notes`]).
 fn created_notes(
     tx: &randprotocol_core::Transaction,
     tokens: Option<&TokenRegistry>,
+    fees: Option<&BridgeFees>,
     executor: &dyn ConfidentialExecutor,
 ) -> Result<Vec<(Word8, Envelope)>> {
     let mut out = Vec::new();
@@ -529,13 +563,20 @@ fn created_notes(
             // note here is a torn block, and leaving the leaf out would put the notes family one
             // short of the tree the ledger committed to.
             if randprotocol_core::ledger::bridge_notes::attested_transfer(attestation).is_some() {
-                let note = randprotocol_core::ledger::bridge_notes::deposit_note(tx, tokens, executor)
+                let note = randprotocol_core::ledger::bridge_notes::deposit_note(tx, tokens, fees, executor)
                     .ok_or_else(|| {
                         StorageError::Corrupt(
                             "committed attestation deposits an asset the registry does not hold".into(),
                         )
                     })?;
                 out.push(note);
+                out.extend(fee_note_rows(tx, tokens, fees, executor));
+            }
+        }
+        // v0.6.8: a burn's fee note, after the bundle's four written above.
+        Action::BridgeBurn { .. } => {
+            if let Some(tokens) = tokens {
+                out.extend(fee_note_rows(tx, tokens, fees, executor));
             }
         }
         // RPL (spec §4): a minted note is chain-computed exactly as a bridge deposit is, so it is
@@ -577,6 +618,35 @@ fn created_notes(
         _ => {}
     }
     Ok(out)
+}
+
+/// The fee notes `tx` made the chain append under `fees`, as note rows: each with the empty
+/// envelope (sealed to nobody — see [`created_notes`]).
+fn fee_note_rows(
+    tx: &randprotocol_core::Transaction,
+    tokens: &TokenRegistry,
+    fees: Option<&BridgeFees>,
+    executor: &dyn ConfidentialExecutor,
+) -> Vec<(Word8, Envelope)> {
+    randprotocol_core::ledger::bridge_notes::bridge_fee_notes(tx, tokens, fees, executor)
+        .into_iter()
+        .map(|(cm, _)| (cm, Envelope { kem_ct: Vec::new(), to_receiver: Vec::new(), to_sender: Vec::new(), body: Vec::new() }))
+        .collect()
+}
+
+/// [`derived_note_count`] on a chain with `bridge.fees` (v0.6.8): plus one for each fee note `tx`
+/// made the chain append — an attest's whose fee did not round to zero, a burn's likewise. `fees`
+/// `None` is [`derived_note_count`] exactly.
+pub fn derived_note_count_with(tx: &randprotocol_core::Transaction, fees: Option<(&BridgeFees, &TokenRegistry)>) -> usize {
+    let base = derived_note_count(tx);
+    match fees {
+        // The size cap first, as `derived_note_count` applies it: an unvalidated oversized
+        // attestation derives nothing here either.
+        Some((f, tokens)) if !matches!(&tx.action, Action::BridgeAttest { attestation, .. } if attestation.len() > randprotocol_core::gas::MAX_ATTESTATION_BYTES) => {
+            base + randprotocol_core::ledger::bridge_notes::bridge_fee_notes(tx, tokens, Some(f), &randprotocol_core::confidential::StubExecutor).len()
+        }
+        _ => base,
+    }
 }
 
 /// How many notes of a block's slice belong to `tx` beyond the ones it carries on the wire: the
@@ -929,7 +999,7 @@ impl Storage {
             batch.put_cf(self.cf(CF_BRIDGE_SPENT), digest.as_bytes(), []);
         }
         for (sequence, rec) in &bridge.burns {
-            batch.put_cf(self.cf(CF_BRIDGE_BURNS), height_key(*sequence), bincode::serialize(rec)?);
+            batch.put_cf(self.cf(CF_BRIDGE_BURNS), height_key(*sequence), encode_burn(rec)?);
         }
         Ok(())
     }
@@ -950,6 +1020,10 @@ impl Storage {
         match bridge.rotation_meta() {
             Some(rotation) => batch.put_cf(self.cf(CF_META), META_BRIDGE_ROTATION, bincode::serialize(&rotation)?),
             None => batch.delete_cf(self.cf(CF_META), META_BRIDGE_ROTATION),
+        }
+        match &bridge.fees {
+            Some(fees) => batch.put_cf(self.cf(CF_META), META_BRIDGE_FEES, bincode::serialize(fees)?),
+            None => batch.delete_cf(self.cf(CF_META), META_BRIDGE_FEES),
         }
         Ok(())
     }
@@ -984,6 +1058,7 @@ impl Storage {
         batch.delete_cf(self.cf(CF_META), META_BRIDGE_STATE_V2);
         batch.delete_cf(self.cf(CF_META), META_BRIDGE_REPLAY_FLOOR);
         batch.delete_cf(self.cf(CF_META), META_BRIDGE_ROTATION);
+        batch.delete_cf(self.cf(CF_META), META_BRIDGE_FEES);
         Ok(())
     }
 
@@ -1044,9 +1119,23 @@ impl Storage {
         }
     }
 
-    /// The outbound burn message with this sequence, for guardians to sign.
+    /// The genesis `bridge.fees` group (v0.6.8), `None` on a chain without it — chains 14 to 19 —
+    /// where the key is never written. Decoded strictly like [`Self::bridge_meta`].
+    pub fn bridge_fees(&self) -> Result<Option<BridgeFees>> {
+        use bincode::Options as _;
+        match self.get_meta_raw(META_BRIDGE_FEES)? {
+            Some(bytes) => Ok(Some(bincode::DefaultOptions::new().with_fixint_encoding().deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The outbound burn message with this sequence, for guardians to sign — with its fee split
+    /// on a chain with `bridge.fees` ([`decode_burn`]).
     pub fn bridge_burn(&self, sequence: u64) -> Result<Option<BridgeBurnRecord>> {
-        self.get(CF_BRIDGE_BURNS, &height_key(sequence))
+        match self.db.get_cf(self.cf(CF_BRIDGE_BURNS), height_key(sequence))? {
+            Some(bytes) => Ok(Some(decode_burn(&bytes)?)),
+            None => Ok(None),
+        }
     }
 
     /// Rebuild the bridge from the `meta` blob plus the two families. `None` when the blob is
@@ -1066,17 +1155,21 @@ impl Storage {
         let mut burns = BTreeMap::new();
         for item in self.db.iterator_cf(self.cf(CF_BRIDGE_BURNS), IteratorMode::Start) {
             let (_, v) = item?;
-            let rec: BridgeBurnRecord = bincode::deserialize(&v)?;
+            let rec = decode_burn(&v)?;
             burns.insert(rec.sequence, rec);
         }
-        Ok(Some(BridgeState::from_parts_with_rotation(
+        let mut bridge = BridgeState::from_parts_with_rotation(
             meta,
             self.bridge_meta_v2()?,
             self.bridge_replay_floor()?,
             spent,
             burns,
             self.bridge_rotation_meta()?,
-        )))
+        );
+        // v0.6.8: the fee group, from its own key (and re-applied from the genesis file by
+        // `node::reload_ledger`, the file being the authority for a genesis parameter).
+        bridge.fees = self.bridge_fees()?;
+        Ok(Some(bridge))
     }
 
     // ---- the shielded pool ----------------------------------------------
@@ -2479,7 +2572,7 @@ impl Storage {
                 for nf in tx.nullifiers() {
                     batch.put_cf(self.cf(CF_NULLIFIERS), word8_to_bytes(&nf), hk);
                 }
-                for (cm, envelope) in created_notes(tx, ledger_after.tokens(), executor)? {
+                for (cm, envelope) in created_notes(tx, ledger_after.tokens(), ledger_after.bridge().and_then(|b| b.fees.as_ref()), executor)? {
                     let row = NoteRow { cm, envelope, height: block.height() };
                     batch.put_cf(self.cf(CF_NOTES), height_key(next_index), bincode::serialize(&row)?);
                     next_index += 1;
@@ -2623,7 +2716,7 @@ impl Storage {
                 batch.put_cf(self.cf(CF_BRIDGE_SPENT), digest.as_bytes(), []);
             }
             for (sequence, rec) in bridge.burns.range(first_burn_sequence..) {
-                batch.put_cf(self.cf(CF_BRIDGE_BURNS), height_key(*sequence), bincode::serialize(rec)?);
+                batch.put_cf(self.cf(CF_BRIDGE_BURNS), height_key(*sequence), encode_burn(rec)?);
             }
             self.put_bridge_meta(&mut batch, bridge)?;
         }
@@ -3633,6 +3726,7 @@ pub(crate) mod fixtures {
             burn_sequence: None,
             min_inbound_sequence: None,
             rotation: None,
+            fees: None,
         };
         (config, secrets)
     }
@@ -3682,10 +3776,22 @@ pub(crate) mod fixtures {
         min_inbound_sequence: Option<BTreeMap<u16, u64>>,
         rotation: Option<randprotocol_core::bridge::RotationRules>,
     ) -> (GenesisState, Vec<[u8; 32]>) {
+        bridged_genesis_with_fees(chain_id, rules_v2, min_inbound_sequence, rotation, None)
+    }
+
+    /// [`bridged_genesis_with_rotation`] plus the v0.6.8 `bridge.fees` group.
+    pub(crate) fn bridged_genesis_with_fees(
+        chain_id: u64,
+        rules_v2: Option<randprotocol_core::bridge::BridgeRulesV2>,
+        min_inbound_sequence: Option<BTreeMap<u16, u64>>,
+        rotation: Option<randprotocol_core::bridge::RotationRules>,
+        fees: Option<randprotocol_core::bridge::BridgeFees>,
+    ) -> (GenesisState, Vec<[u8; 32]>) {
         let (mut config, secrets) = bridge_config();
         config.rules_v2 = rules_v2;
         config.min_inbound_sequence = min_inbound_sequence;
         config.rotation = rotation;
+        config.fees = fees;
         let k = key(1);
         let gs = Genesis {
             chain_id,
@@ -3764,6 +3870,11 @@ pub(crate) mod fixtures {
     /// The shielded address every fixture deposit is addressed to.
     pub(crate) fn recipient() -> ShieldedAddress {
         ShieldedAddress { pk: [4; 8], kem_ek: vec![6; randprotocol_core::notes::KEM_EK_BYTES] }
+    }
+
+    /// The treasury the v0.6.8 fee fixtures pay: a full-length address with a valid ML-KEM key.
+    pub(crate) fn fee_treasury() -> randprotocol_core::notes::ShieldedAddress {
+        randprotocol_core::notes::ShieldedAddress { pk: [9; 8], kem_ek: vec![0; randprotocol_core::notes::KEM_EK_BYTES] }
     }
 
     /// An attestation of `amount` units of [`TOKEN`] to `to`, emitted by chain 2's registered
@@ -4990,7 +5101,7 @@ mod tests {
         // The deposit note is leaf 4 — after the bundle's four — and is served like any
         // other, so a wallet scanning the tree finds its bridged deposit.
         let deposit =
-            randprotocol_core::ledger::bridge_notes::deposit_note(&att, reloaded.tokens().unwrap(), &StubExecutor)
+            randprotocol_core::ledger::bridge_notes::deposit_note(&att, reloaded.tokens().unwrap(), None, &StubExecutor)
                 .unwrap();
         let row = s.note(4).unwrap().expect("the deposit note is indexed");
         assert_eq!((row.cm, row.envelope), deposit);
@@ -5171,6 +5282,92 @@ mod tests {
         assert_eq!(check.problem, None);
         assert_eq!(check.ledger.bridge(), ledger.bridge());
         assert_eq!(check.ledger.tokens(), ledger.tokens());
+    }
+
+    /// v0.6.8, `bridge.fees` on disk. A chain without the group writes no `META_BRIDGE_FEES` key
+    /// and its burn rows are the record's bincode byte for byte (what every build through v0.6.7
+    /// wrote, and still decodes); a chain with it stores the group, indexes the fee notes beside
+    /// the deposit and the burn (empty envelopes — sealed to nobody), appends each burn's split to
+    /// its row, and `load_ledger`, `reload_ledger` and the replay audit all rebuild the same
+    /// bridge, registry and root — `reload_ledger` even from a store that lost the key.
+    #[test]
+    fn a_fee_chain_persists_its_fees_and_fee_notes_and_a_chain_without_writes_old_rows() {
+        use randprotocol_core::bridge::{BridgeFees, BurnFeeSplit};
+        // Without the group: no key, legacy burn rows, one deposit leaf.
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let (gs, secrets) = bridged_genesis(9);
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let att = attest_tx(&ledger, attestation(&secrets, &recipient(), 1_000_000, 1), 20);
+        let b1 = make_block(&gs.block, &mut ledger, vec![att], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let burn = burn_tx(&ledger, 1, 500_000, 0, 40);
+        let b2 = make_block(&b1, &mut ledger, vec![burn], &key(1));
+        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.get_meta_raw(META_BRIDGE_FEES).unwrap(), None, "no fees key without the group");
+        let rec = ledger.bridge().unwrap().burns[&0].clone();
+        assert_eq!(rec.fee, None);
+        assert_eq!(
+            s.db.get_cf(s.cf(CF_BRIDGE_BURNS), height_key(0)).unwrap().unwrap(),
+            bincode::serialize(&rec).unwrap(),
+            "the burn row is the v0.6.7 row byte for byte"
+        );
+        assert_eq!(s.notes_count().unwrap(), 4 + 1 + 4, "the bundle, the deposit; the burn's bundle — no fee notes");
+        assert_restart_round_trips(&s, &gs, &ledger, "a deposit and a burn, no fees");
+
+        // With the group: mint 10 bps, burn 10 bps, an 8-decimal coin (release unit 1).
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let fees = BridgeFees { mint_bps: 10, burn_bps: 10, recipient: fixtures::fee_treasury() };
+        let (gs, secrets) = bridged_genesis_with_fees(9, None, None, None, Some(fees.clone()));
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.bridge_fees().unwrap(), Some(fees.clone()), "the group is stored at genesis");
+        let mut ledger = gs.ledger.clone();
+        let att = attest_tx(&ledger, attestation(&secrets, &recipient(), 1_000_000, 1), 20);
+        let b1 = make_block(&gs.block, &mut ledger, vec![att.clone()], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let rows = s.notes_from(0, 100).unwrap();
+        assert_eq!(rows.len(), 6, "the bundle's four, the deposit, the fee note");
+        let Action::BridgeAttest { attestation: bytes, r, time, .. } = &att.action else { unreachable!() };
+        let net = randprotocol_core::ledger::bridge_notes::deposit_commitment(&recipient(), 999_000, 1, *time, r, &StubExecutor);
+        assert_eq!(rows[4].1.cm, net, "the depositor's note is the net");
+        let mu = randprotocol_core::bridge::digest(randprotocol_core::bridge::Attestation::body_bytes(bytes).unwrap());
+        let fee_cm = randprotocol_core::ledger::bridge_notes::deposit_commitment(
+            &fixtures::fee_treasury(), 1_000, 1, *time, &randprotocol_core::ledger::bridge_notes::derive_mint_fee_r(&mu), &StubExecutor,
+        );
+        assert_eq!(rows[5].1.cm, fee_cm, "then the treasury's fee note");
+        assert!(rows[5].1.envelope.kem_ct.is_empty() && rows[5].1.envelope.body.is_empty(), "sealed to nobody");
+        assert_eq!(derived_note_count_with(&att, Some((&fees, ledger.tokens().unwrap()))), 2);
+        assert_eq!(derived_note_count(&att), 1, "the fee-blind count is the old one");
+
+        let burn = burn_tx(&ledger, 1, 500_000, 0, 40);
+        let b2 = make_block(&b1, &mut ledger, vec![burn.clone()], &key(1));
+        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.notes_count().unwrap(), 6 + 4 + 1, "the burn's bundle, then its fee note");
+        assert_eq!(derived_note_count_with(&burn, Some((&fees, ledger.tokens().unwrap()))), 1);
+        let rec = s.bridge_burn(0).unwrap().unwrap();
+        assert_eq!(rec.fee, Some(BurnFeeSplit { amount: 500_000, fee: 500 }), "the split survives the row");
+        assert_eq!(rec, ledger.bridge().unwrap().burns[&0]);
+        let t = ledger.tokens().unwrap();
+        assert_eq!(t.backing(1, 2, &TOKEN).unwrap().locked, 1_000_000 - 499_500);
+        assert!(t.backing_invariant_holds());
+        assert_restart_round_trips(&s, &gs, &ledger, "a deposit and a burn under bridge.fees");
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!(check.problem, None);
+        assert_eq!(check.ledger.bridge(), ledger.bridge());
+        assert_eq!(check.ledger.tokens(), ledger.tokens());
+        // A store that lost the key: `load_ledger` comes back without the group (a different
+        // root), `reload_ledger` restores it from the genesis file.
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(s.cf(CF_META), META_BRIDGE_FEES);
+        s.db.write(batch).unwrap();
+        let loaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(loaded.bridge().unwrap().fees, None);
+        assert_ne!(loaded.state_root(), ledger.state_root(), "the fees are in the bridge root");
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.bridge().unwrap().fees, Some(fees));
+        assert_eq!(reloaded.state_root(), ledger.state_root(), "restart restores the field");
     }
 
     /// Audit v6, BRG-14 on disk. A chain without `bridge.rotation` (chain 18) writes no
@@ -5521,7 +5718,7 @@ mod tests {
             assert_eq!(ledger.next_index(), before + 4, "one bundle, four leaves: {:?}", t.action);
             assert_eq!(t.commitments().len(), 4, "and the wire carries all four");
             assert_eq!(derived_note_count(&t), 0, "so the ledger derives none of them");
-            let notes = created_notes(&t, ledger.tokens(), &StubExecutor).unwrap();
+            let notes = created_notes(&t, ledger.tokens(), None, &StubExecutor).unwrap();
             assert_eq!(
                 notes.iter().map(|(cm, _)| *cm).collect::<Vec<_>>(),
                 t.commitments(),
@@ -5586,7 +5783,7 @@ mod tests {
             assert_eq!(derived_note_count(&t), derived, "{kind}");
             assert_eq!(ledger.next_index(), before + 4 + derived as u64, "{kind}: four slots, then {derived} derived");
 
-            let notes = created_notes(&t, ledger.tokens(), &StubExecutor).unwrap();
+            let notes = created_notes(&t, ledger.tokens(), None, &StubExecutor).unwrap();
             assert_eq!(notes.len(), 4 + derived, "{kind}");
             let expected_slots: Vec<(Word8, Envelope)> =
                 bundle.commitments.iter().copied().zip(bundle.envelopes.iter().cloned()).collect();
@@ -6065,7 +6262,7 @@ mod tests {
 
             let _bridge = ledger.bridge().expect("bridged genesis");
             let expected_deposit =
-                randprotocol_core::ledger::bridge_notes::deposit_note(&att, ledger.tokens().unwrap(), &StubExecutor)
+                randprotocol_core::ledger::bridge_notes::deposit_note(&att, ledger.tokens().unwrap(), None, &StubExecutor)
                 .expect("the attestation registered an asset and deposits into it");
             let deposit_leaf = (base..base + 6)
                 .find(|&i| s.note(i).unwrap().expect("leaf in range").cm == expected_deposit.0)

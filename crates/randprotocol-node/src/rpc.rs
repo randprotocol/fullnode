@@ -1094,11 +1094,12 @@ async fn dispatch_one(st: &RpcState, v: Value) -> Value {
 fn block_headers_page(storage: &Storage, from: u64, to: u64, max_read_bytes: usize) -> crate::storage::Result<Vec<Value>> {
     let mut out = Vec::new();
     let mut read = 0usize;
+    let fees = storage.bridge_fees()?;
     for h in from..=to {
         if let Some(b) = storage.block_by_height(h)? {
             read = read.saturating_add(b.transactions.iter().map(|t| t.encoded_len()).sum::<usize>());
             let sealed = storage.block_sealed(&b.hash())?;
-            out.push(header_json(&b, sealed));
+            out.push(header_json(&b, sealed, fees.as_ref()));
             if read > max_read_bytes {
                 break;
             }
@@ -1679,15 +1680,29 @@ fn find_token<'a>(tokens: &'a TokenRegistry, key: &Result<u64, randprotocol_core
 /// `storage::created_notes` appended them. Empty for every other action, for a rotation, for a
 /// registration without an initial mint, and for an attestation whose asset the registry does
 /// not hold. `rand_checkTransaction` opens the action's envelopes against them.
+#[cfg(test)]
 fn derived_note_cms(
     tx: &Transaction,
     tokens: Option<&TokenRegistry>,
     executor: &dyn ConfidentialExecutor,
 ) -> Vec<randprotocol_core::Word8> {
+    derived_note_cms_with(tx, tokens, None, executor)
+}
+
+/// [`derived_note_cms`] on a chain with `bridge.fees` (v0.6.8): an attest's deposit is the net
+/// amount. The fee note is not listed — no envelope of the action is sealed for it, and these are
+/// the notes an envelope opens.
+fn derived_note_cms_with(
+    tx: &Transaction,
+    tokens: Option<&TokenRegistry>,
+    fees: Option<&randprotocol_core::bridge::BridgeFees>,
+    executor: &dyn ConfidentialExecutor,
+) -> Vec<randprotocol_core::Word8> {
     use randprotocol_core::ledger::{bridge_notes, program_state::payout_commitment, tokens::mint_commitment};
     match (&tx.action, &tx.bundle) {
-        (Action::BridgeAttest { attestation, recipient, r, time, .. }, _) => attest_deposit(attestation, tokens)
-            .map(|(index, amount)| bridge_notes::deposit_commitment(recipient, amount, index, *time, r, executor))
+        (Action::BridgeAttest { attestation, recipient, r, time, .. }, _) => tokens
+            .and_then(|t| bridge_notes::attest_split(fees, t, attestation, *time))
+            .map(|split| bridge_notes::deposit_commitment(recipient, split.net, split.index, *time, r, executor))
             .into_iter()
             .collect(),
         (Action::TokenMint { asset, amount, recipient, r, time, .. }, _) => {
@@ -1741,14 +1756,21 @@ fn parse_cell_key(v: &Value, name: &str) -> Result<randprotocol_core::Word8, Rpc
 /// them; anything left over goes into the block-level `commitments`, which is where genesis
 /// deposits live and where a future note the attribution does not know about would still surface
 /// rather than disappear.
-fn compact_block_json(b: &randprotocol_core::Block, notes: &[(u64, crate::storage::NoteRow)]) -> Value {
+///
+/// `fee_ctx` is the chain's `bridge.fees` and registry (v0.6.8), under which a bridge action owns
+/// its fee note too ([`crate::storage::derived_note_count_with`]); `None` on every other chain.
+fn compact_block_json(
+    b: &randprotocol_core::Block,
+    notes: &[(u64, crate::storage::NoteRow)],
+    fee_ctx: Option<(&randprotocol_core::bridge::BridgeFees, &TokenRegistry)>,
+) -> Value {
     let row = |(index, r): &(u64, crate::storage::NoteRow)| {
         json!({ "index": index, "cm": word8_to_hex(&r.cm), "envelope": envelope_json(&r.envelope) })
     };
     let mut at = 0usize;
     let mut txs = Vec::with_capacity(b.transactions.len());
     for tx in &b.transactions {
-        let want = tx.commitments().len() + crate::storage::derived_note_count(tx);
+        let want = tx.commitments().len() + crate::storage::derived_note_count_with(tx, fee_ctx);
         let end = (at + want).min(notes.len());
         txs.push(json!({
             "hash": tx.hash().to_hex(),
@@ -1786,7 +1808,14 @@ pub(crate) fn receipt_json(r: &CallReceipt) -> Value {
 
 /// A block's header fields alone — everything `block_json` reports except `transactions`, and
 /// what `rand_getBlocks` pages over instead of the full block.
-fn header_json(b: &randprotocol_core::Block, sealed: bool) -> Value {
+///
+/// v0.6.8: on a chain with `bridge.fees` (`fees`), a `BridgeBurn` is carried too — the one other
+/// action whose chain-made note (the treasury's fee note) is public in full — **with its two
+/// proofs emptied** (they are megabytes, and nothing in a note's rebuild reads them), under its
+/// real `hash`: a stripped copy hashes differently, and the fee note's blinding is over the real
+/// one. A wallet that trusts a lying `hash` only fails to find the note: it is matched against
+/// the leaf, never believed.
+fn header_json(b: &randprotocol_core::Block, sealed: bool, fees: Option<&randprotocol_core::bridge::BridgeFees>) -> Value {
     // The three actions that append a note whose every word is on the wire — a bridge deposit, a
     // token mint, a registration's initial mint — carried raw beside the header (issue #117). A
     // wallet's first sync used to read the header page and then fetch, one call each, every
@@ -1797,8 +1826,21 @@ fn header_json(b: &randprotocol_core::Block, sealed: bool) -> Value {
     let public_notes: Vec<Value> = b
         .transactions
         .iter()
-        .filter(|t| matches!(t.action, Action::BridgeAttest { .. } | Action::TokenMint { .. } | Action::RegisterToken { .. }))
-        .map(|t| json!({ "hash": t.hash().to_hex(), "raw": hex::encode(t.encode()) }))
+        .filter(|t| {
+            matches!(t.action, Action::BridgeAttest { .. } | Action::TokenMint { .. } | Action::RegisterToken { .. })
+                || (fees.is_some() && matches!(t.action, Action::BridgeBurn { .. }))
+        })
+        .map(|t| match &t.action {
+            Action::BridgeBurn { .. } => {
+                let mut stripped = t.clone();
+                if let Some(bundle) = stripped.bundle.as_mut() {
+                    bundle.proof = Vec::new();
+                    bundle.auth_proof = Vec::new();
+                }
+                json!({ "hash": t.hash().to_hex(), "raw": hex::encode(stripped.encode()), "proofs_stripped": true })
+            }
+            _ => json!({ "hash": t.hash().to_hex(), "raw": hex::encode(t.encode()) }),
+        })
         .collect();
     json!({
         "hash": b.hash().to_hex(), "height": b.height(), "view": b.view(), "parent": b.parent().to_hex(),
@@ -1824,11 +1866,12 @@ fn finality_json(f: &Finality) -> Value {
 
 fn block_json(b: &randprotocol_core::Block, tokens: Option<&TokenRegistry>, executor: &dyn ConfidentialExecutor, storage: &crate::storage::Storage) -> Value {
     let sealed = storage.block_sealed(&b.hash()).unwrap_or(false);
+    let fees = storage.bridge_fees().unwrap_or(None);
     let txs: Vec<Value> = b
         .transactions
         .iter()
         .map(|t| {
-            let mut j = tx_json(t, tokens, executor);
+            let mut j = tx_json_with(t, tokens, fees.as_ref(), executor);
             // Per-bundle `sealed_by` (spec §8): the aggregate that covered it, `null` while it
             // is coverable — and for a bundle-less transaction, `null` by construction.
             let sealed_by = match &t.bundle {
@@ -1842,7 +1885,7 @@ fn block_json(b: &randprotocol_core::Block, tokens: Option<&TokenRegistry>, exec
             j
         })
         .collect();
-    let mut j = header_json(b, sealed);
+    let mut j = header_json(b, sealed, fees.as_ref());
     j["transactions"] = Value::Array(txs);
     j
 }
@@ -1987,7 +2030,37 @@ fn vesting_locked(reg: &randprotocol_core::ledger::vesting::VestingRegister, t_m
 /// The most points `rand_getVestingSchedule` answers in one call.
 pub const MAX_VESTING_SCHEDULE_POINTS: u64 = 1_000;
 
+#[cfg(test)]
 fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn ConfidentialExecutor) -> Value {
+    tx_json_with(t, tokens, None, executor)
+}
+
+/// One fee note (v0.6.8, `bridge.fees`) as `tx_json` renders it: every word but the owner's —
+/// the treasury, `rand_getBridgeState.fees.recipient` — and the leaf the chain appended for it.
+fn fee_note_json(
+    n: &randprotocol_core::ledger::bridge_notes::BridgeFeeNote,
+    fees: &randprotocol_core::bridge::BridgeFees,
+    executor: &dyn ConfidentialExecutor,
+) -> Value {
+    json!({
+        "amount": n.amount.to_string(),
+        "asset": n.asset,
+        "time": n.time,
+        "r": word8_to_hex(&n.r),
+        "commitment": word8_to_hex(&n.commitment(&fees.recipient, executor)),
+    })
+}
+
+/// [`tx_json`] with the chain's `bridge.fees` (v0.6.8): a `bridge_attest` gains `deposit_amount`
+/// (the depositor's note, the gross `amount` less the fee) and `fee_note`; a `bridge_burn` gains
+/// `release_amount` and `fee_note`. `fees` `None` renders `deposit_amount == amount`,
+/// `release_amount == amount` and `fee_note: null` — the chain's own rule then.
+fn tx_json_with(
+    t: &Transaction,
+    tokens: Option<&TokenRegistry>,
+    fees: Option<&randprotocol_core::bridge::BridgeFees>,
+    executor: &dyn ConfidentialExecutor,
+) -> Value {
     let bundle = t.bundle.as_ref().map(bundle_json);
     let action = match &t.action {
         Action::None => json!({ "kind": "none" }),
@@ -2028,6 +2101,9 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
         // is public in this transaction only — the note's later spend is not.
         Action::BridgeAttest { attestation, recipient, r, time, asset, pq_signatures, .. } => {
             let deposit = attest_deposit(attestation, tokens);
+            // v0.6.8: what the deposit split into under `bridge.fees` — the depositor's note is
+            // `split.net`, the treasury's `split.fee`. Without the group `net` is the gross.
+            let split = tokens.and_then(|tk| randprotocol_core::ledger::bridge_notes::attest_split(fees, tk, attestation, *time));
             json!({
                 "kind": "bridge_attest",
                 "attestation_len": attestation.len(),
@@ -2039,6 +2115,13 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
                 "asset": asset,
                 "asset_index": deposit.map(|(index, _)| index),
                 "amount": deposit.map(|(_, amount)| amount.to_string()),
+                // v0.6.8: the depositor's note — `amount` (the gross the guardians signed) less
+                // the chain's fee under `bridge.fees`; equal to `amount` on a chain without it.
+                // This, not `amount`, is the note's value word.
+                "deposit_amount": split.map(|sp| sp.net.to_string()),
+                // v0.6.8: the treasury's fee note, every word but its owner (the genesis
+                // `bridge.fees.recipient`); `null` without the group or when the fee rounds to 0.
+                "fee_note": split.and_then(|sp| sp.fee).zip(fees).map(|(n, f)| fee_note_json(&n, f, executor)),
                 // The deposit note's own `time` word, which is what a recipient rebuilding that
                 // note needs and the window rule this action was admitted under.
                 "time": time,
@@ -2052,9 +2135,9 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
                 // The leaf the chain appended for this deposit — the one note commitment the wire
                 // does not carry, since the chain computes it rather than the submitter. `null`
                 // for a rotation, which deposits nothing.
-                "commitment": deposit.map(|(index, amount)| {
+                "commitment": split.map(|sp| {
                     let cm = randprotocol_core::ledger::bridge_notes::deposit_commitment(
-                        recipient, amount, index, *time, r, executor,
+                        recipient, sp.net, sp.index, *time, r, executor,
                     );
                     word8_to_hex(&cm)
                 }),
@@ -2064,12 +2147,24 @@ fn tx_json(t: &Transaction, tokens: Option<&TokenRegistry>, executor: &dyn Confi
                 "pq_signers": pq_signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
             })
         }
-        Action::BridgeBurn { asset, amount, relayer_fee, to_chain, token, to } => json!({
-            "kind": "bridge_burn", "asset": asset, "amount": amount.to_string(), "relayer_fee": relayer_fee.to_string(),
-            // The coin being redeemed, which is a field of the action since one bridged token has
-            // many backings (spec §12) — the outbound message names this pair.
-            "to_chain": to_chain, "token": hex::encode(token), "to": hex::encode(to),
-        }),
+        Action::BridgeBurn { asset, amount, relayer_fee, to_chain, token, to } => {
+            // v0.6.8: the treasury's share under `bridge.fees`, rebuilt from this transaction.
+            let fee_note = tokens.and_then(|tk| {
+                randprotocol_core::ledger::bridge_notes::burn_fee_note_with(fees, t, &t.hash(), |c, tok| {
+                    tk.backing(*asset, c, tok).map(|b| b.release_unit())
+                })
+            });
+            json!({
+                "kind": "bridge_burn", "asset": asset, "amount": amount.to_string(), "relayer_fee": relayer_fee.to_string(),
+                // The coin being redeemed, which is a field of the action since one bridged token has
+                // many backings (spec §12) — the outbound message names this pair.
+                "to_chain": to_chain, "token": hex::encode(token), "to": hex::encode(to),
+                // v0.6.8: what the source contract releases — `amount` less the chain's fee under
+                // `bridge.fees`, `amount` itself on a chain without it.
+                "release_amount": (*amount - fee_note.map_or(0, |n| n.amount)).to_string(),
+                "fee_note": fee_note.zip(fees).map(|(n, f)| fee_note_json(&n, f, executor)),
+            })
+        }
         // Block aggregation: the register is public by design (spec §2), so its inputs are too —
         // the staking actions' rule, one register over. The aggregate itself reports the cover
         // count and the proof size; the covered bundles are named by hash anyway.
@@ -2377,6 +2472,9 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 let to = to.min(head);
                 let mut rows: Vec<Value> = Vec::new();
                 let mut emitted = 0usize;
+                // v0.6.8: a fee note belongs to the bridge action that made it.
+                let (fees, tokens) = (storage.bridge_fees()?, storage.tokens()?);
+                let fee_ctx = fees.as_ref().zip(tokens.as_ref());
                 for h in from..=to {
                     let Some(b) = storage.block_by_height(h)? else { break };
                     // Always emit the first block whole, however many notes it holds, so a client
@@ -2386,7 +2484,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     }
                     let notes = storage.notes_in_heights(h, h, usize::MAX)?;
                     emitted += notes.len();
-                    rows.push(compact_block_json(&b, &notes));
+                    rows.push(compact_block_json(&b, &notes, fee_ctx));
                 }
                 Ok(rows)
             })
@@ -2848,7 +2946,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                         "height": height,
                         "index": index,
                         "block_hash": b.hash().to_hex(),
-                        "tx": tx_json(tx, tokens.as_ref(), st.executor.as_ref()),
+                        "tx": tx_json_with(tx, tokens.as_ref(), st.storage.bridge_fees().map_err(RpcError::internal)?.as_ref(), st.executor.as_ref()),
                     }))
                 }
             }
@@ -2876,7 +2974,11 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 Action::BridgeAttest { .. } => st.storage.tokens().map_err(RpcError::internal)?,
                 _ => None,
             };
-            let derived = derived_note_cms(tx, tokens.as_ref(), st.executor.as_ref());
+            let fees = match &tx.action {
+                Action::BridgeAttest { .. } => st.storage.bridge_fees().map_err(RpcError::internal)?,
+                _ => None,
+            };
+            let derived = derived_note_cms_with(tx, tokens.as_ref(), fees.as_ref(), st.executor.as_ref());
             let opened = crate::viewing::disclosed(tx, &derived, &randprotocol_zkvm::viewing::TxKey(key));
             if opened.is_empty() {
                 return Ok(json!({ "tx": h.to_hex(), "height": height, "disclosed": [] }));
@@ -3100,6 +3202,16 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // predict any more, because a bridged token is listed before it can be deposited
                 // and its index is a fact a wallet reads off `assets` (`rand_getAssets`).
                 "assets": tokens.as_ref().map(|t| assets_json(t, now)).unwrap_or_default(),
+                // v0.6.8: the genesis `bridge.fees` (`null` on a chain without the group — chains
+                // 14 to 19): the share of every deposit (`mint_bps`) and every burn (`burn_bps`)
+                // the chain mints to `recipient` in the bridged token. A wallet reads it to value
+                // its own deposit note (the gross less the fee), the treasury to find its fee
+                // notes, and a burner to see what will be released.
+                "fees": st.storage.bridge_fees().map_err(RpcError::internal)?.map(|f| json!({
+                    "mint_bps": f.mint_bps,
+                    "burn_bps": f.burn_bps,
+                    "recipient": f.recipient.to_string(),
+                })),
             }))
         }
         // ---- the token registry (RPL spec §6) ----
@@ -3181,9 +3293,24 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 .bridge_burn(sequence)
                 .map_err(RpcError::internal)?
                 .map(|r| {
+                    // v0.6.8: what the message releases, read off the signed body itself — the
+                    // figure guardians sign and the source contract pays out — beside what the
+                    // bundle burned and the chain's fee (`bridge.fees`). On a chain without the
+                    // group the record carries no split: `fee` is "0" and `amount` equals
+                    // `release_amount`. Every burn of a chain with the group carries one.
+                    let release = randprotocol_core::bridge::Body::decode(&r.body).ok().and_then(|b| {
+                        match randprotocol_core::bridge::Payload::decode(&b.payload) {
+                            Ok(randprotocol_core::bridge::Payload::Transfer(t)) => t.amount_u128().and_then(|a| u64::try_from(a).ok()),
+                            _ => None,
+                        }
+                    });
+                    let fee = r.fee.map_or(0, |f| f.fee);
                     json!({
                         "sequence": r.sequence, "body_hex": hex::encode(&r.body), "digest": hex::encode(r.digest),
                         "tx": r.tx.to_hex(), "height": r.height,
+                        "release_amount": release.map(|a| a.to_string()),
+                        "fee": fee.to_string(),
+                        "amount": r.fee.map(|f| f.amount).or(release).map(|a| a.to_string()),
                     })
                 })
                 .unwrap_or(Value::Null))
@@ -6266,6 +6393,71 @@ mod tests {
         assert_eq!(ok(&st, "rand_getBridgeBurn", json!([1])).await, Value::Null);
     }
 
+    /// v0.6.8, `bridge.fees` over RPC. Without the group: `fees` is null, a burn's
+    /// `release_amount` equals its `amount` and `fee` is "0", and a header carries no burn. With
+    /// it: `fees` names the group, `rand_getBridgeBurn` serves the release the signed body carries
+    /// beside the burned amount and the fee, `tx_json` renders `deposit_amount`, `release_amount`
+    /// and each `fee_note` (whose commitment is a leaf), a header carries the burn with its proofs
+    /// stripped under its real hash, and the compact blocks attribute every fee leaf to its
+    /// transaction.
+    #[tokio::test]
+    async fn bridge_fees_are_served_on_the_state_the_burn_the_transaction_and_the_headers() {
+        // Without the group.
+        let (_d, st, _gs, _) = bridged_chain();
+        let v = ok(&st, "rand_getBridgeState", json!([])).await;
+        assert_eq!(v["fees"], Value::Null);
+        let b = ok(&st, "rand_getBridgeBurn", json!([0])).await;
+        assert_eq!((&b["amount"], &b["release_amount"], &b["fee"]), (&json!("400"), &json!("400"), &json!("0")));
+        let headers = ok(&st, "rand_getBlocks", json!([2, 2])).await;
+        assert_eq!(headers[0]["public_notes"], json!([]), "no burn carried without the group");
+
+        // With it.
+        let fees = randprotocol_core::bridge::BridgeFees { mint_bps: 10, burn_bps: 10, recipient: fixtures::fee_treasury() };
+        let (gs, secrets) = fixtures::bridged_genesis_with_fees(1, None, None, None, Some(fees.clone()));
+        let (_d, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let att = fixtures::attest_tx(&ledger, fixtures::attestation(&secrets, &fixtures::recipient(), 1_000_000, 0), 20);
+        let b1 = make_block(&gs.block, &mut ledger, vec![att.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let burn = fixtures::burn_tx(&ledger, 1, 500_000, 100, 30);
+        let b2 = make_block(&b1, &mut ledger, vec![burn.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+
+        let v = ok(&st, "rand_getBridgeState", json!([])).await;
+        assert_eq!(v["fees"], json!({ "mint_bps": 10, "burn_bps": 10, "recipient": fixtures::fee_treasury().to_string() }));
+        let b = ok(&st, "rand_getBridgeBurn", json!([0])).await;
+        assert_eq!((&b["amount"], &b["release_amount"], &b["fee"]), (&json!("500000"), &json!("499500"), &json!("500")));
+        let body = randprotocol_core::bridge::Body::decode(&hex::decode(b["body_hex"].as_str().unwrap()).unwrap()).unwrap();
+        let Ok(randprotocol_core::bridge::Payload::Transfer(t)) = randprotocol_core::bridge::Payload::decode(&body.payload) else { panic!() };
+        assert_eq!(t.amount_u128(), Some(499_500), "release_amount is what the guardians sign");
+
+        let leaves: Vec<String> =
+            st.storage.notes_from(0, 100).unwrap().iter().map(|(_, r)| word8_to_hex(&r.cm)).collect();
+        let a = ok(&st, "rand_getTransaction", json!([att.hash().to_hex()])).await["tx"]["action"].clone();
+        assert_eq!((&a["amount"], &a["deposit_amount"]), (&json!("1000000"), &json!("999000")));
+        assert_eq!(a["fee_note"]["amount"], "1000");
+        assert!(leaves.contains(&a["commitment"].as_str().unwrap().to_string()), "the net deposit is a leaf");
+        assert!(leaves.contains(&a["fee_note"]["commitment"].as_str().unwrap().to_string()), "and so is the fee note");
+        let k = ok(&st, "rand_getTransaction", json!([burn.hash().to_hex()])).await["tx"]["action"].clone();
+        assert_eq!((&k["amount"], &k["release_amount"], &k["fee_note"]["amount"]), (&json!("500000"), &json!("499500"), &json!("500")));
+        assert!(leaves.contains(&k["fee_note"]["commitment"].as_str().unwrap().to_string()));
+
+        let headers = ok(&st, "rand_getBlocks", json!([2, 2])).await;
+        let carried = &headers[0]["public_notes"][0];
+        assert_eq!(carried["hash"], burn.hash().to_hex(), "under its real id");
+        assert_eq!(carried["proofs_stripped"], true);
+        let stripped = Transaction::decode(&hex::decode(carried["raw"].as_str().unwrap()).unwrap()).unwrap();
+        let bundle = stripped.bundle.as_ref().unwrap();
+        assert!(bundle.proof.is_empty() && bundle.auth_proof.is_empty());
+        assert_eq!(stripped.action, burn.action);
+
+        let compact = ok(&st, "rand_getCompactBlocks", json!([1, 2])).await;
+        assert_eq!(compact[0]["transactions"][0]["commitments"].as_array().unwrap().len(), 6, "bundle, deposit, fee note");
+        assert_eq!(compact[1]["transactions"][0]["commitments"].as_array().unwrap().len(), 5, "bundle, fee note");
+        assert_eq!(compact[0]["commitments"], json!([]), "nothing left unattributed");
+        assert_eq!(compact[1]["commitments"], json!([]));
+    }
+
     /// A chain whose genesis has no `bridge` section answers every bridge read rather than
     /// erroring: disabled, and empty.
     #[tokio::test]
@@ -7249,6 +7441,7 @@ mod tests {
             let expected_deposit = randprotocol_core::ledger::bridge_notes::deposit_note(
                 &att,
                 ledger.tokens().expect("a bridged genesis lists its tokens"),
+                None,
                 &StubExecutor,
             )
             .expect("the attestation deposits into a registered asset");

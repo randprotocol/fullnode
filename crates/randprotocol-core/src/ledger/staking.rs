@@ -640,13 +640,15 @@ impl Ledger {
                 if attestation.len() > gas::MAX_ATTESTATION_BYTES {
                     return None;
                 }
-                let (chain, token, amount) = bridge_notes::attested_transfer(attestation)?;
                 // A bridged holding's index is the token registry's, and an attestation naming a
                 // coin nobody listed as a backing deposits nothing — `validate` refuses it
                 // outright (`BridgeError::UnlistedToken`), which is what makes a missing claim
-                // safe.
-                let index = self.bridge().and(self.tokens())?.bridged(chain, &token)?.index;
-                Some(bridge_notes::deposit_commitment(recipient, amount, index, *time, r, executor))
+                // safe. v0.6.8: under `bridge.fees` the deposit note is the gross less the fee
+                // (`attest_split`); the fee note is not claimed — its blinding is over the same
+                // `mu`, so two attests that would collide on it collide on this note first.
+                let fees = self.bridge()?.fees.as_ref();
+                let split = bridge_notes::attest_split(fees, self.tokens()?, attestation, *time)?;
+                Some(bridge_notes::deposit_commitment(recipient, split.net, split.index, *time, r, executor))
             }
             // RPL's two minting actions (spec §4), which derive their note the same way and from
             // the action alone: the recipient, the amount, the index and the blinding are all on

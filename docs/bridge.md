@@ -1391,3 +1391,56 @@ guardians stop serving `mu` before a mint is submitted (the audit's first fix), 
 envelope (or its digest) and `time` are fixed by what the source-chain lock commits to, so the
 guardians' signature binds them and a copier cannot choose them. Both change what the guardians
 publish or sign; neither is half-implemented here.
+
+## 25. zUSD bridge fees, taken in zUSD (v0.6.8; genesis `bridge.fees`)
+
+Until v0.6.8 the only bridge fee on a bridged token was the source endpoints' 10 bps skim of USDT on
+release — public, on the host chain. Under the genesis group
+
+```json
+"bridge": { …, "fees": { "mint_bps": 10, "burn_bps": 10, "recipient": "rand1…" } }
+```
+
+the chain takes its fee **in the bridged token, on Rand, as a shielded note**, both ways:
+
+- **Deposit (`BridgeAttest`).** Of the gross `g` the guardians signed, `fee = ⌊g·mint_bps/10⁴⌋`
+  rounded **down** to a whole release unit of the backing (`10^(8 − source decimals)`: 100 for a
+  6-decimal USDT). The chain appends two notes: the depositor's, `g − fee`, under today's derived
+  blinding `blake3("rand-deposit-r-1" ‖ mu)` (F1, §8), then the treasury's, `fee`, to `recipient`
+  under `blake3("rand-bridge-fee-r-1" ‖ mu)`, at the deposit's `time` and asset with `from = 0`.
+  A fee that rounds to zero makes no note. The backing's `locked` and the supply still move by `g`:
+  both notes are issued and backed, and `supply == Σ locked` holds. 1 USDT in → 0.999 zUSD to the
+  depositor, 0.001 zUSD to the treasury.
+- **Burn (`BridgeBurn`).** The bundle still proves `burn_a == amount` (no guest change). The chain
+  keeps `fee = ⌊amount·burn_bps/10⁴⌋`, rounded down the same way, as a note to `recipient` under
+  `blake3("rand-bridge-burn-fee-r-1" ‖ txid)` at the bundle's `time` — the transaction id is unique
+  per burn and computable from the transaction alone; the burn's sequence adds nothing and is not
+  in it. **The outbound body carries `release_amount = amount − fee`**, so the guardians sign and
+  the endpoint releases exactly that, and its own relayer `fee` must fit inside it
+  (`FeeExceedsAmount`). `locked` and the supply fall by `release_amount` only (the fee stays issued
+  and backed); `InsufficientBacking` and `NotReleasable` are judged on `release_amount`.
+  `BRIDGE_BURN_FEE` (0.01 RAND) is unchanged. `rand_getBridgeBurn` serves `amount`,
+  `release_amount` and `fee`.
+
+**How the treasury finds its notes.** A fee note has no envelope: storage indexes it with an empty
+one, sealed to nobody, because every word of it is public — the amount from the transaction and
+the genesis bps, the asset and `time` from the transaction, the blinding derived, the owner the
+genesis `recipient`. The wallet whose address is `recipient` rebuilds both kinds in the same public
+pass that rebuilds deposits (`wallet::rebuilt_notes_with`): it reads `rand_getBridgeState.fees` and
+the backings' decimals once per sync, and walks the headers' `public_notes` — which carry burns too
+on a fee chain, with their proofs stripped, under their real id — matching each rebuilt note against
+the leaf it hashes to. A node lying about the fees or a hash only makes a note go unfound, never
+credits one. A depositor's wallet values its own deposit the same way (the gross less the fee), and
+`rand bridge-mint` seals the depositor's envelope for the net amount.
+
+**What §24 still says.** The only notes with `from = 0` and a non-zero asset are now a deposit and
+a fee note; a fee note's blinding is under its own domain, so it collides with no deposit, and the
+front-running argument of §24 is unchanged.
+
+**Validation and encoding.** Each bps at most 100 (1 %); the recipient must parse as an address and
+its ML-KEM-768 key must pass FIPS 203's modulus check (`notes::kem_ek_is_valid`). Committed to the
+genesis hash as `b"bridge_fees"` ‖ mint_bps BE ‖ burn_bps BE ‖ pk ‖ kem_ek, after every other tag,
+only when present; folded into the bridge root under `rand-bridge-fees-1`; stored under
+`META_BRIDGE_FEES` and re-applied from the file by `reload_ledger`. A burn's split is appended
+after its record's bytes in `bridge_burns` — rows without one (every chain before) decode as
+before. Absent, nothing changes: chains 14 to 19 run byte for byte.

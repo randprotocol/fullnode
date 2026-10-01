@@ -20,7 +20,7 @@
 
 use super::tokens::{TokenError, TokenRegistry};
 use super::{Ledger, TxError};
-use crate::bridge::{Attestation, AttestOutcome, AttestPlan, BridgeError, CheckedAttestation, Payload};
+use crate::bridge::{Attestation, AttestOutcome, AttestPlan, BridgeError, BridgeFees, CheckedAttestation, Payload};
 use crate::confidential::ConfidentialExecutor;
 use crate::notes::{Envelope, ShieldedAddress, Word8};
 use crate::types::{Action, Transaction};
@@ -124,10 +124,20 @@ pub(super) fn validate(
                 // bundle keeps `validate` and `apply` in agreement — the mempool admits on
                 // `validate`, so a gap here would be a transaction that is accepted and then
                 // fails the block it lands in.
-                let cm = deposit_commitment(recipient, t.amount, t.index, *time, r, executor);
-                let in_fee_bundle = tx.bundle.as_ref().is_some_and(|b| b.commitments.contains(&cm));
-                if ledger.has_commitment(&cm) || in_fee_bundle {
+                //
+                // v0.6.8: under `bridge.fees` the depositor's note is the gross less the fee, and
+                // the fee is a sixth commitment, appended right after it — checked the same way.
+                let split = mint_split(bridge.fees.as_ref(), t.amount, bridge.mint_fee(tokens, t.index, t.chain, &t.token, t.amount), t.index, *time, &checked.digest());
+                let in_fee_bundle = |cm: &Word8| tx.bundle.as_ref().is_some_and(|b| b.commitments.contains(cm));
+                let cm = deposit_commitment(recipient, split.net, t.index, *time, r, executor);
+                if ledger.has_commitment(&cm) || in_fee_bundle(&cm) {
                     return Err(TxError::CommitmentExists(cm));
+                }
+                if let (Some(note), Some(fees)) = (&split.fee, &bridge.fees) {
+                    let fee_cm = note.commitment(&fees.recipient, executor);
+                    if ledger.has_commitment(&fee_cm) || in_fee_bundle(&fee_cm) || fee_cm == cm {
+                        return Err(TxError::CommitmentExists(fee_cm));
+                    }
                 }
             }
             Ok(Some(checked))
@@ -166,6 +176,14 @@ pub(super) fn validate(
             bridge
                 .check_burn(tokens, *asset, *amount, *to_chain, token, to, *relayer_fee)
                 .map_err(TxError::Bridge)?;
+            // v0.6.8: the treasury's note this burn would append after the bundle's four, checked
+            // against the tree and the bundle as a deposit's is — so `apply` cannot fail on it.
+            if let Some((fees, note)) = burn_fee_note_of(bridge, tokens, tx) {
+                let cm = note.commitment(&fees.recipient, executor);
+                if ledger.has_commitment(&cm) || tx.bundle.as_ref().is_some_and(|b| b.commitments.contains(&cm)) {
+                    return Err(TxError::CommitmentExists(cm));
+                }
+            }
             // The bundle's proof is not verified here: `validate_inner`'s steps 8-9 verify it,
             // after every cheap check, against the transaction binding.
             Ok(None)
@@ -192,14 +210,31 @@ pub(super) fn apply(
     match action {
         Action::BridgeAttest { recipient, r, time, .. } => {
             let checked = checked.expect("validate returns the checked attestation for an attest");
+            let mu = checked.digest();
+            let fees = ledger.bridge().ok_or(TxError::Bridge(BridgeError::Disabled))?.fees.clone();
+            let mint_fee = match checked.plan() {
+                AttestPlan::Transfer(t) => ledger
+                    .bridge()
+                    .zip(ledger.tokens())
+                    .map_or(0, |(b, tokens)| b.mint_fee(tokens, t.index, t.chain, &t.token, t.amount)),
+                _ => 0,
+            };
             let bridge = ledger.bridge_mut().ok_or(TxError::Bridge(BridgeError::Disabled))?;
             // Consumes the digest. It registers nothing — a bridged token is listed before any
             // attestation of it is admissible — and does no signature work: the quorum was
             // verified once, in `validate`, and this is the token that proves it.
             match bridge.apply_attest(checked) {
                 AttestOutcome::Minted(t) => {
-                    let cm = deposit_commitment(recipient, t.amount, t.index, *time, r, executor);
+                    // v0.6.8: under `bridge.fees`, the depositor's note is the gross less the fee
+                    // and the treasury's note follows it — two chain-made notes, both counting
+                    // against the gross `lock` below. Without the group `split.net` is the gross
+                    // and there is no fee note: today's one deposit, byte for byte.
+                    let split = mint_split(fees.as_ref(), t.amount, mint_fee, t.index, *time, &mu);
+                    let cm = deposit_commitment(recipient, split.net, t.index, *time, r, executor);
                     ledger.deposit(cm, executor)?;
+                    if let (Some(note), Some(fees)) = (&split.fee, &fees) {
+                        ledger.deposit(note.commitment(&fees.recipient, executor), executor)?;
+                    }
                     // The deposited note is new supply of that token, and the coin the
                     // attestation named is what now backs it: `lock` moves the backing's
                     // `locked` and the token's `total_supply` together, which is what keeps
@@ -228,6 +263,13 @@ pub(super) fn apply(
             // common path, like every bundle's.
             let (height, timestamp) = (ledger.height(), ledger.now_secs() as u32);
             let tx_hash = tx.hash();
+            // v0.6.8: the treasury's share, decided before anything moves — `None` without
+            // `bridge.fees` or when it rounds to zero.
+            let fee_note = ledger
+                .bridge()
+                .zip(ledger.tokens())
+                .and_then(|(b, tokens)| burn_fee_note_of(b, tokens, tx))
+                .map(|(fees, note)| (note.amount, note.commitment(&fees.recipient, executor)));
             // The bridge to write and the registry to read in one borrow: the outbound message's
             // `(chain, token)` is the burned token's own mint authority.
             let (bridge, tokens) = ledger.bridge_and_tokens_mut()?;
@@ -243,11 +285,18 @@ pub(super) fn apply(
             // transaction that was admitted — and if it somehow did, it says so in the shape
             // `validate` would have said it in (`BridgeError::Token`, through `check_burn`'s
             // `check_release`) rather than in a second shape for the same refusal.
+            //
+            // v0.6.8: under `bridge.fees` only the release leaves `locked` and the supply — the fee
+            // stays issued and backed, as the treasury's note appended here.
+            let fee = fee_note.map_or(0, |(fee, _)| fee);
             ledger
                 .tokens_mut()
                 .ok_or(TxError::Token(TokenError::Disabled))?
-                .release(*asset, *to_chain, token, *amount, *relayer_fee)
+                .release(*asset, *to_chain, token, *amount - fee, *relayer_fee)
                 .map_err(|e| TxError::Bridge(BridgeError::Token(e)))?;
+            if let Some((_, cm)) = fee_note {
+                ledger.deposit(cm, executor)?;
+            }
             Ok(())
         }
         _ => Err(TxError::UnsupportedAction("bridge")),
@@ -355,17 +404,177 @@ pub fn attested_transfer(attestation: &[u8]) -> Option<(u16, [u8; 32], u64)> {
 /// `None` for any other action, and for an attestation that deposits nothing (a rotation) or
 /// that does not decode — the latter being a torn block, not a live possibility, for a
 /// transaction that was committed.
+///
+/// `fees` is the chain's `bridge.fees` (v0.6.8): under it the deposit note carries the gross less
+/// the fee ([`attest_split`]); `None` — chains 14 to 19 — is the gross, as before.
 pub fn deposit_note(
     tx: &Transaction,
     tokens: &TokenRegistry,
+    fees: Option<&BridgeFees>,
     executor: &dyn ConfidentialExecutor,
 ) -> Option<(Word8, Envelope)> {
     let Action::BridgeAttest { attestation, recipient, r, time, asset: _, envelope, pq_signatures: _ } = &tx.action else {
         return None;
     };
-    let (chain, token, amount) = attested_transfer(attestation)?;
+    let split = attest_split(fees, tokens, attestation, *time)?;
+    Some((deposit_commitment(recipient, split.net, split.index, *time, r, executor), envelope.clone()))
+}
+
+/// The hash domain of a deposit's **fee** note blinding (v0.6.8, `bridge.fees`):
+/// `r = blake3("rand-bridge-fee-r-1" ‖ mu)`, beside [`DEPOSIT_R_DOMAIN`] over the same `mu`, so
+/// the two notes one attestation mints never share a blinding and anyone holding the attestation
+/// derives both.
+pub const BRIDGE_FEE_R_DOMAIN: &[u8] = b"rand-bridge-fee-r-1";
+
+/// The hash domain of a burn's fee note blinding (v0.6.8): `r = blake3("rand-bridge-burn-fee-r-1"
+/// ‖ txid)`. The transaction id is unique per burn — a committed burn's nullifiers make it
+/// unrepeatable — and is computed from the transaction alone, so the treasury rebuilds the note
+/// from the raw transaction; the burn's `sequence` adds no uniqueness and is not in it.
+pub const BRIDGE_BURN_FEE_R_DOMAIN: &[u8] = b"rand-bridge-burn-fee-r-1";
+
+/// The bridge fee on `amount` at `bps` basis points, rounded **down** to a whole `unit` (the
+/// backing's release unit, `10^(8 − source decimals)`): `⌊⌊amount·bps/10⁴⌋ / unit⌋·unit`. So the
+/// fee and `amount − fee` are both whole units whenever `amount` is, and a fee below one unit is
+/// zero (no note). `u128` inside: `amount·bps` cannot wrap. `unit == 0` is treated as 1.
+pub fn bridge_fee(amount: u64, bps: u16, unit: u64) -> u64 {
+    let raw = (amount as u128 * bps as u128 / 10_000) as u64;
+    raw - raw % unit.max(1)
+}
+
+/// The blinding of a deposit's fee note: `word8_from_bytes(blake3("rand-bridge-fee-r-1" ‖ mu))`.
+pub fn derive_mint_fee_r(mu: &[u8; 32]) -> Word8 {
+    crate::notes::word8_from_bytes(&crate::crypto::Hash::digest_domain(BRIDGE_FEE_R_DOMAIN, mu).0)
+        .expect("a blake3 hash is 32 bytes")
+}
+
+/// The blinding of a burn's fee note: `word8_from_bytes(blake3("rand-bridge-burn-fee-r-1" ‖
+/// txid))`.
+pub fn derive_burn_fee_r(tx_hash: &crate::crypto::Hash) -> Word8 {
+    crate::notes::word8_from_bytes(&crate::crypto::Hash::digest_domain(BRIDGE_BURN_FEE_R_DOMAIN, tx_hash.as_bytes()).0)
+        .expect("a blake3 hash is 32 bytes")
+}
+
+/// A chain-made fee note's opening, less its owner (`bridge.fees.recipient`, the genesis's) and
+/// its `from` word (zero, a deposit's): every word public — the amount from the transaction and
+/// the genesis bps, the asset and `time` the transaction's, `r` derived. What the treasury wallet
+/// rebuilds and checks against the leaf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BridgeFeeNote {
+    pub amount: u64,
+    pub asset: u32,
+    pub time: u32,
+    pub r: Word8,
+}
+
+impl BridgeFeeNote {
+    /// The commitment the chain appends for this note, owned by `recipient` — a deposit-shaped
+    /// note (`from` zero), so [`deposit_commitment`] is the one function.
+    pub fn commitment(&self, recipient: &ShieldedAddress, executor: &dyn ConfidentialExecutor) -> Word8 {
+        deposit_commitment(recipient, self.amount, self.asset, self.time, &self.r, executor)
+    }
+}
+
+/// How a deposit of `gross` splits (v0.6.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MintSplit {
+    /// The token index both notes carry.
+    pub index: u32,
+    /// The depositor's note: `gross − fee`.
+    pub net: u64,
+    /// The treasury's note, `None` without `bridge.fees` or when the fee rounds to zero.
+    pub fee: Option<BridgeFeeNote>,
+}
+
+/// The split of a deposit of `gross` whose fee is `fee` (already rounded; `0` without the group),
+/// stamped at `time` with the deposit's `asset`, the fee note's blinding derived from `mu`.
+pub fn mint_split(fees: Option<&BridgeFees>, gross: u64, fee: u64, asset: u32, time: u32, mu: &[u8; 32]) -> MintSplit {
+    let fee = if fees.is_some() { fee } else { 0 };
+    MintSplit {
+        index: asset,
+        net: gross - fee,
+        fee: (fee > 0).then(|| BridgeFeeNote { amount: fee, asset, time, r: derive_mint_fee_r(mu) }),
+    }
+}
+
+/// [`mint_split`] from an attestation's wire bytes and a release-unit lookup — what a wallet,
+/// which has the registry's `decimals` per `(chain, token)` and not the registry, calls; the
+/// ledger side is [`attest_split`]. `index` is the token index the deposit carries. `None` for a
+/// rotation and for bytes that do not decode.
+pub fn attest_split_with(
+    fees: Option<&BridgeFees>,
+    attestation: &[u8],
+    index: u32,
+    time: u32,
+    unit: impl Fn(u16, &[u8; 32]) -> Option<u64>,
+) -> Option<MintSplit> {
+    let (chain, token, gross) = attested_transfer(attestation)?;
+    let mu = crate::bridge::digest(Attestation::body_bytes(attestation).ok()?);
+    let fee = match fees {
+        Some(f) => bridge_fee(gross, f.mint_bps, unit(chain, &token)?),
+        None => 0,
+    };
+    Some(mint_split(fees, gross, fee, index, time, &mu))
+}
+
+/// [`attest_split_with`] against the registry: the index the registry lists the attested coin
+/// under, and its backing's release unit. `None` for a rotation, undecodable bytes or an unlisted
+/// coin — none of which a committed attestation can be.
+pub fn attest_split(fees: Option<&BridgeFees>, tokens: &TokenRegistry, attestation: &[u8], time: u32) -> Option<MintSplit> {
+    let (chain, token, _) = attested_transfer(attestation)?;
     let index = tokens.bridged(chain, &token)?.index;
-    Some((deposit_commitment(recipient, amount, index, *time, r, executor), envelope.clone()))
+    attest_split_with(fees, attestation, index, time, |c, t| tokens.backing(index, c, t).map(|b| b.release_unit()))
+}
+
+/// The treasury's note a `BridgeBurn` makes the chain append (v0.6.8), from the transaction and a
+/// release-unit lookup: `fee = bridge_fee(amount, burn_bps, unit)` of the action's asset, stamped
+/// with the bundle's `time`, blinding [`derive_burn_fee_r`] of `tx_hash`. `None` without
+/// `bridge.fees`, for any other action, for a burn without a bundle, and when the fee rounds to
+/// zero. `tx_hash` is a parameter because a proof-stripped copy (what a header carries) does not
+/// hash to the transaction's id.
+pub fn burn_fee_note_with(
+    fees: Option<&BridgeFees>,
+    tx: &Transaction,
+    tx_hash: &crate::crypto::Hash,
+    unit: impl Fn(u16, &[u8; 32]) -> Option<u64>,
+) -> Option<BridgeFeeNote> {
+    let fees = fees?;
+    let Action::BridgeBurn { asset, amount, to_chain, token, .. } = &tx.action else { return None };
+    let fee = bridge_fee(*amount, fees.burn_bps, unit(*to_chain, token)?);
+    let time = tx.bundle.as_ref()?.time;
+    (fee > 0).then(|| BridgeFeeNote { amount: fee, asset: *asset, time, r: derive_burn_fee_r(tx_hash) })
+}
+
+/// [`burn_fee_note_with`] against a bridge and its registry, with the fees it was judged under.
+pub fn burn_fee_note_of<'a>(
+    bridge: &'a crate::bridge::BridgeState,
+    tokens: &TokenRegistry,
+    tx: &Transaction,
+) -> Option<(&'a BridgeFees, BridgeFeeNote)> {
+    let fees = bridge.fees.as_ref()?;
+    let Action::BridgeBurn { asset, .. } = &tx.action else { return None };
+    let note = burn_fee_note_with(Some(fees), tx, &tx.hash(), |c, t| tokens.backing(*asset, c, t).map(|b| b.release_unit()))?;
+    Some((fees, note))
+}
+
+/// Every fee note `tx` made the chain append under `fees` (v0.6.8), with its commitment, in the
+/// order the ledger appended them — after the deposit note for an attest, after the bundle's four
+/// for a burn. Empty without the group, for any other action and when a fee rounds to zero. What
+/// the node's note index (`storage::created_notes`) and its leaf attribution read.
+pub fn bridge_fee_notes(
+    tx: &Transaction,
+    tokens: &TokenRegistry,
+    fees: Option<&BridgeFees>,
+    executor: &dyn ConfidentialExecutor,
+) -> Vec<(Word8, BridgeFeeNote)> {
+    let Some(f) = fees else { return Vec::new() };
+    let note = match &tx.action {
+        Action::BridgeAttest { attestation, time, .. } => attest_split(fees, tokens, attestation, *time).and_then(|s| s.fee),
+        Action::BridgeBurn { asset, .. } => {
+            burn_fee_note_with(fees, tx, &tx.hash(), |c, t| tokens.backing(*asset, c, t).map(|b| b.release_unit()))
+        }
+        _ => None,
+    };
+    note.map(|n| (n.commitment(&f.recipient, executor), n)).into_iter().collect()
 }
 
 #[cfg(test)]
@@ -423,6 +632,7 @@ mod tests {
             burn_sequence: None,
             min_inbound_sequence: None,
             rotation: None,
+            fees: None,
         };
         (config, secrets)
     }
@@ -705,7 +915,7 @@ mod tests {
         assert!(!l.has_commitment(&expected_cm(&tx, 9, 1_000, 1)), "and not the one the apply height would");
         // The recompute-after-the-fact path reads the same word off the committed action, so a
         // node's note index agrees with the tree whatever height it asks about.
-        let (cm, _) = deposit_note(&tx, l.tokens().unwrap(), &StubExecutor).expect("a transfer deposits a note");
+        let (cm, _) = deposit_note(&tx, l.tokens().unwrap(), None, &StubExecutor).expect("a transfer deposits a note");
         assert_eq!(cm, expected_cm(&tx, 5, 1_000, 1));
     }
 
@@ -985,7 +1195,7 @@ mod tests {
         let (mut l, secrets) = ledger();
         let tx = deposit(&mut l, &secrets, 1_000, 0, 20);
         let tokens = l.tokens().unwrap();
-        let (cm, envelope) = deposit_note(&tx, tokens, &StubExecutor).expect("a transfer deposits a note");
+        let (cm, envelope) = deposit_note(&tx, tokens, None, &StubExecutor).expect("a transfer deposits a note");
         assert_eq!(cm, expected_cm(&tx, 1, 1_000, 1));
         assert!(l.has_commitment(&cm));
         assert_eq!(envelope, env(), "paired with the envelope that opens it");
@@ -1005,9 +1215,9 @@ mod tests {
             .encode(),
         };
         let upgrade = attest_tx(&l, attest(&secrets, rotation), recipient(), 30);
-        assert_eq!(deposit_note(&upgrade, tokens, &StubExecutor), None);
+        assert_eq!(deposit_note(&upgrade, tokens, None, &StubExecutor), None);
         let plain = Transaction { chain_id: 7, bundle: None, action: Action::None };
-        assert_eq!(deposit_note(&plain, tokens, &StubExecutor), None);
+        assert_eq!(deposit_note(&plain, tokens, None, &StubExecutor), None);
     }
 
     /// The 32-byte `to` field binds the deposit to one shielded address. A submitter who swaps
@@ -2163,5 +2373,220 @@ mod tests {
         let b = l.tokens().unwrap().backing(1, 2, &TOKEN).unwrap().clone();
         assert_eq!((b.minted_today, b.mint_day, b.locked), (1, day(&l), 1_001));
         assert!(l.tokens().unwrap().backing_invariant_holds());
+    }
+
+    // ---- v0.6.8: the zUSD bridge fees (`bridge.fees`, docs/bridge.md §25) ----
+
+    /// Ethereum USDT's wire address in these tests, at its real 6 decimals: a release unit of 100.
+    const USDT6: [u8; 32] = [0xd7; 32];
+
+    /// The treasury the fee tests pay: a full-length address, as genesis requires.
+    fn treasury() -> ShieldedAddress {
+        ShieldedAddress { pk: [9; 8], kem_ek: vec![0; crate::notes::KEM_EK_BYTES] }
+    }
+
+    /// [`ledger`] with zUSD backed by a 6-decimal USDT (index 1) and, when `bps` is `Some`, the
+    /// bridge fees `(mint_bps, burn_bps)` to [`treasury`].
+    fn fee_ledger(bps: Option<(u16, u16)>) -> (Ledger, Vec<[u8; 32]>, u32) {
+        let (mut l, secrets) = ledger();
+        let mut registry = TokenRegistry::new(1_000_000_000);
+        let zusd = registry
+            .register(
+                crate::ledger::tokens::bridged_asset_id("Rand USD", "zUSD", &[0x5a; 32]),
+                "Rand USD".into(),
+                "zUSD".into(),
+                8,
+                crate::ledger::tokens::MintAuthority::Bridge {
+                    backings: vec![crate::ledger::tokens::Backing { chain: 2, token: USDT6, decimals: 6, locked: 0, minted_today: 0, mint_day: 0 }],
+                },
+                0,
+            )
+            .unwrap();
+        l.set_tokens(Some(registry));
+        l.bridge_mut().unwrap().fees =
+            bps.map(|(mint_bps, burn_bps)| crate::bridge::BridgeFees { mint_bps, burn_bps, recipient: treasury() });
+        (l, secrets, zusd)
+    }
+
+    /// A USDT deposit of `amount` wire units to [`recipient`], applied.
+    fn deposit_usdt(l: &mut Ledger, secrets: &[[u8; 32]], amount: u128, sequence: u64, seed: u32) -> Transaction {
+        let tx = attest_tx(l, attest(secrets, transfer_of(USDT6, amount, 0, recipient().recipient_hash(), sequence)), recipient(), seed);
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()));
+        l.apply_tx(&tx, &proposer().address(), &StubExecutor).unwrap();
+        tx
+    }
+
+    /// The fee note the ledger must have appended for `tx`'s deposit: `fee` to the treasury,
+    /// under the attestation's `mu` and the new domain, at the deposit's `time` and asset.
+    fn expected_mint_fee_cm(tx: &Transaction, fee: u64, asset: u32) -> Word8 {
+        let Action::BridgeAttest { attestation, time, .. } = &tx.action else { panic!("an attest") };
+        let mu = digest(Attestation::body_bytes(attestation).unwrap());
+        deposit_commitment(&treasury(), fee, asset, *time, &derive_mint_fee_r(&mu), &StubExecutor)
+    }
+
+    /// The fee rule's arithmetic: ⌊amount·bps/10⁴⌋, then down to a whole release unit.
+    #[test]
+    fn the_bridge_fee_rounds_down_to_a_whole_release_unit() {
+        assert_eq!(bridge_fee(100_000_000, 10, 100), 100_000, "1 USDT at 10 bps is 0.001");
+        assert_eq!(bridge_fee(1_234_500, 10, 100), 1_200, "1 234.5 → 1 200: down to the unit");
+        assert_eq!(bridge_fee(99_900, 10, 100), 0, "99.9 rounds to nothing");
+        assert_eq!(bridge_fee(u64::MAX, 100, 1), u64::MAX / 100, "no overflow inside");
+        assert_eq!(bridge_fee(5, 0, 1), 0);
+        assert_ne!(derive_mint_fee_r(&[1; 32]), derive_deposit_r(&[1; 32]), "the fee note never shares the deposit's blinding");
+    }
+
+    /// Under `bridge.fees`, a deposit of 1 USDT (6 decimals) mints two chain-made notes: 0.999
+    /// zUSD to the depositor under today's derived blinding, and 0.001 to the treasury under the
+    /// fee domain — both whole release units. The backing and the supply take the gross, so
+    /// `supply == Σ locked` and both notes are backed.
+    #[test]
+    fn a_fee_deposit_mints_the_net_to_the_depositor_and_the_fee_to_the_treasury() {
+        let (mut l, secrets, zusd) = fee_ledger(Some((10, 10)));
+        let before = l.next_index();
+        let tx = deposit_usdt(&mut l, &secrets, 100_000_000, 0, 20);
+        let time = l.height() as u32;
+        assert!(l.has_commitment(&expected_cm(&tx, time, 99_900_000, zusd)), "the depositor's note is the gross less the fee");
+        assert!(!l.has_commitment(&expected_cm(&tx, time, 100_000_000, zusd)), "and not the gross");
+        assert!(l.has_commitment(&expected_mint_fee_cm(&tx, 100_000, zusd)), "the treasury's 0.001 zUSD note");
+        assert_eq!(l.next_index(), before + 6, "the fee bundle's four, the deposit, the fee note");
+        let t = l.tokens().unwrap();
+        assert_eq!(t.backing(zusd, 2, &USDT6).unwrap().locked, 100_000_000, "the backing takes the gross");
+        assert_eq!(t.get(zusd).unwrap().total_supply, 100_000_000, "and so does the supply: both notes count");
+        assert!(t.backing_invariant_holds());
+
+        // A ragged amount: the fee rounds down to a whole unit, so both parts stay whole.
+        let tx = deposit_usdt(&mut l, &secrets, 1_234_500, 1, 30);
+        assert!(l.has_commitment(&expected_cm(&tx, time, 1_233_300, zusd)));
+        assert!(l.has_commitment(&expected_mint_fee_cm(&tx, 1_200, zusd)));
+
+        // `validate` checks both chain-made notes against the fee bundle, so `apply` cannot fail
+        // on either: a bundle that already makes the net deposit, or the fee note, is refused.
+        let a = attest(&secrets, transfer_of(USDT6, 100_000_000, 0, recipient().recipient_hash(), 7));
+        let tx = attest_tx(&l, a, recipient(), 50);
+        let net = expected_cm(&tx, time, 99_900_000, zusd);
+        let fee = expected_mint_fee_cm(&tx, 100_000, zusd);
+        for cm in [net, fee] {
+            let mut clash = tx.clone();
+            clash.bundle.as_mut().unwrap().commitments[1] = cm;
+            assert_eq!(l.validate(&clash, &StubExecutor), Err(TxError::CommitmentExists(cm)));
+        }
+
+        // A deposit whose fee rounds to zero makes no fee note, and the depositor gets it all.
+        let before = l.next_index();
+        let tx = deposit_usdt(&mut l, &secrets, 99_900, 2, 40);
+        assert!(l.has_commitment(&expected_cm(&tx, time, 99_900, zusd)));
+        assert!(!l.has_commitment(&expected_mint_fee_cm(&tx, 0, zusd)));
+        assert_eq!(l.next_index(), before + 5, "no fee note");
+        assert_eq!(attest_split(l.bridge().unwrap().fees.as_ref(), l.tokens().unwrap(), match &tx.action {
+            Action::BridgeAttest { attestation, .. } => attestation,
+            _ => unreachable!(),
+        }, time).unwrap().fee, None);
+    }
+
+    /// Without `bridge.fees` — chains 14 to 19 — a deposit is one note of the gross and a burn
+    /// releases everything it burned: the old rules, byte for byte, through the same code.
+    #[test]
+    fn without_bridge_fees_deposits_and_burns_are_unchanged() {
+        let (mut l, secrets, zusd) = fee_ledger(None);
+        let before = l.next_index();
+        let tx = deposit_usdt(&mut l, &secrets, 100_000_000, 0, 20);
+        assert!(l.has_commitment(&expected_cm(&tx, l.height() as u32, 100_000_000, zusd)));
+        assert_eq!(l.next_index(), before + 5);
+        let root = l.bridge().unwrap().root();
+        let burn = burn_tx_to(&l, zusd, 50_000_000, 0, 2, USDT6, EVM_TO, 30, |_| {});
+        assert_eq!(l.validate(&burn, &StubExecutor), Ok(()));
+        let before = l.next_index();
+        l.apply_tx(&burn, &proposer().address(), &StubExecutor).unwrap();
+        assert_eq!(l.next_index(), before + 4, "no fee note");
+        let rec = &l.bridge().unwrap().burns[&0];
+        assert_eq!(rec.fee, None, "no split recorded");
+        let body = Body::decode(&rec.body).unwrap();
+        let Ok(Payload::Transfer(sent)) = Payload::decode(&body.payload) else { panic!("a transfer") };
+        assert_eq!(sent.amount_u128(), Some(50_000_000));
+        assert_eq!(l.tokens().unwrap().backing(zusd, 2, &USDT6).unwrap().locked, 50_000_000);
+        // And the bridge root without the group is the one every earlier build computed: the fee
+        // wrap only enters with the group.
+        let mut with = l.bridge().unwrap().clone();
+        assert_ne!(root, with.root(), "the burn moved the sequence");
+        let plain = with.root();
+        with.fees = Some(crate::bridge::BridgeFees { mint_bps: 10, burn_bps: 10, recipient: treasury() });
+        assert_ne!(with.root(), plain, "present, the fees are in the root");
+    }
+
+    /// Under `bridge.fees`, a burn of 0.5 zUSD keeps 0.0005 as a treasury note and the outbound
+    /// message — what the guardians sign and the source contract releases — carries 0.4995. The
+    /// record names both; `locked` and the supply fall by the release only, because the fee
+    /// stays issued and backed.
+    #[test]
+    fn a_fee_burn_releases_the_amount_less_the_fee_and_mints_the_fee_to_the_treasury() {
+        let (mut l, secrets, zusd) = fee_ledger(Some((10, 10)));
+        deposit_usdt(&mut l, &secrets, 100_000_000, 0, 20);
+        let burn = burn_tx_to(&l, zusd, 50_000_000, 100, 2, USDT6, EVM_TO, 30, |_| {});
+        assert_eq!(l.validate(&burn, &StubExecutor), Ok(()));
+        let before = l.next_index();
+        l.apply_tx(&burn, &proposer().address(), &StubExecutor).unwrap();
+        assert_eq!(l.next_index(), before + 5, "the bundle's four, then the fee note");
+        let fee_cm = deposit_commitment(&treasury(), 50_000, zusd, l.height() as u32, &derive_burn_fee_r(&burn.hash()), &StubExecutor);
+        assert!(l.has_commitment(&fee_cm), "the treasury's note: the bundle's time, the burn fee domain over the txid");
+        let rec = &l.bridge().unwrap().burns[&0];
+        assert_eq!(rec.fee, Some(crate::bridge::BurnFeeSplit { amount: 50_000_000, fee: 50_000 }));
+        assert_eq!(rec.fee.unwrap().release_amount(), 49_950_000);
+        let body = Body::decode(&rec.body).unwrap();
+        let Ok(Payload::Transfer(sent)) = Payload::decode(&body.payload) else { panic!("a transfer") };
+        assert_eq!(sent.amount_u128(), Some(49_950_000), "the guardians sign the release, not the burn");
+        assert_eq!(sent.fee_u128(), Some(100), "the relayer's share is out of the release");
+        let t = l.tokens().unwrap();
+        assert_eq!(t.backing(zusd, 2, &USDT6).unwrap().locked, 100_000_000 - 49_950_000);
+        assert_eq!(t.get(zusd).unwrap().total_supply, 100_000_000 - 49_950_000);
+        assert!(t.backing_invariant_holds());
+    }
+
+    /// The release-side rules read the release, not the burn: a burn past `locked` whose release
+    /// fits is admitted, a relayer share above the release is `FeeExceedsAmount`, and a burn
+    /// whose release is not a whole unit is `NotReleasable` naming the release.
+    #[test]
+    fn a_fee_burn_is_judged_on_its_release() {
+        let (mut l, secrets, zusd) = fee_ledger(Some((0, 100)));
+        deposit_usdt(&mut l, &secrets, 100_000_000, 0, 20);
+        // 1.001 zUSD burned, 1 % kept (1 001 000 → whole units), 0.99099 released: under 1 locked.
+        let past = burn_tx_to(&l, zusd, 100_100_000, 0, 2, USDT6, EVM_TO, 30, |_| {});
+        assert_eq!(l.validate(&past, &StubExecutor), Ok(()), "the release fits the backing");
+        let mut plain = l.clone();
+        plain.bridge_mut().unwrap().fees = None;
+        assert!(matches!(
+            plain.validate(&past, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Token(TokenError::InsufficientBacking { .. })))
+        ), "without the fee the same burn outruns the backing");
+        // 10 000 burned, 100 kept, 9 900 released: a relayer share of 10 000 is more than released.
+        let greedy = burn_tx_to(&l, zusd, 10_000, 10_000, 2, USDT6, EVM_TO, 40, |_| {});
+        assert_eq!(l.validate(&greedy, &StubExecutor), Err(TxError::Bridge(BridgeError::FeeExceedsAmount)));
+        // 150 burned: the fee rounds to 0 (1.5 → 0 units), so 150 is released — not whole.
+        let ragged = burn_tx_to(&l, zusd, 150, 0, 2, USDT6, EVM_TO, 50, |_| {});
+        assert_eq!(
+            l.validate(&ragged, &StubExecutor),
+            Err(TxError::Bridge(BridgeError::Token(TokenError::NotReleasable { amount: 150, unit: 100 })))
+        );
+    }
+
+    /// The audit across a mint and a burn under `bridge.fees`: every zUSD note the chain made
+    /// less every zUSD a bundle burned equals `Σ locked` equals the supply — the fee notes are
+    /// issued supply, backed like any other.
+    #[test]
+    fn supply_equals_locked_and_the_fee_notes_are_backed_across_a_mint_and_a_burn() {
+        let (mut l, secrets, zusd) = fee_ledger(Some((10, 10)));
+        // Pool zUSD by construction: what the chain appended, less what bundles burned.
+        let mut pool: u128 = 0;
+        deposit_usdt(&mut l, &secrets, 100_000_000, 0, 20);
+        pool += 99_900_000 + 100_000;
+        deposit_usdt(&mut l, &secrets, 2_500_000, 1, 30);
+        pool += 2_497_500 + 2_500;
+        let burn = burn_tx_to(&l, zusd, 40_000_000, 0, 2, USDT6, EVM_TO, 40, |_| {});
+        l.apply_tx(&burn, &proposer().address(), &StubExecutor).unwrap();
+        pool = pool - 40_000_000 + 40_000;
+        let t = l.tokens().unwrap();
+        let locked = t.backing(zusd, 2, &USDT6).unwrap().locked as u128;
+        assert_eq!(pool, locked, "the pool's zUSD — fee notes included — is exactly what custody holds");
+        assert_eq!(t.get(zusd).unwrap().total_supply as u128, locked);
+        assert!(t.backing_invariant_holds());
     }
 }

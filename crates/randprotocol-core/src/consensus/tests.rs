@@ -141,6 +141,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
             burn_sequence: None,
             min_inbound_sequence: None,
             rotation: None,
+            fees: None,
         }),
         tokens: bridged.then(|| crate::genesis::TokensConfig {
             registration_fee: crate::genesis::MIN_REGISTRATION_FEE,
