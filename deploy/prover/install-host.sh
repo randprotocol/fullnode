@@ -14,10 +14,11 @@ TARGET=${1:?usage: install-host.sh root@<ip> [ssh options]}; shift
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 "$@" "$TARGET")
 SCP=(scp -q -o BatchMode=yes "$@")
 
-# v0.6.7-prover.2 is v0.6.7 with the prover built on every core and the vendored p3-fri lock fix
-# (rand-prover only). Never prover.1: it can deadlock (AGENTS.md, the prover pool entry).
-TAG=${TAG:-v0.6.7-prover.2}
-WANT_SHA_PROVER=${WANT_SHA_PROVER:-c07cecd091874e34ef55c5eb49566764047f364fc4f11bbe3dfe7863794db4cc}
+# v0.6.7-prover.3 is v0.6.7 with the prover built on every core and the vendored p3-fri +
+# p3-merkle-tree lock fixes (Plonky3 #2363)
+# (rand-prover only). Never prover.1 or .2: they can deadlock (AGENTS.md, the prover pool entry).
+TAG=${TAG:-v0.6.7-prover.3}
+WANT_SHA_PROVER=${WANT_SHA_PROVER:-e030831d59ee6a3781de6fe58220caf0a5f93fa126554fec24d1cb066659c1db}
 POOL_HOME=${POOL_HOME:?POOL_HOME: the directory holding the pool\'s prover.key.json and pairings.json}
 TUNNEL_PUBKEY=${TUNNEL_PUBKEY:?TUNNEL_PUBKEY: the web droplet\'s tunnel public key file}
 HERE=$(cd "$(dirname "$0")" && pwd)

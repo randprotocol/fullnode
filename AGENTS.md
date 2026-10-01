@@ -165,9 +165,12 @@ push to origin/main often"): five current validators become delegated provers be
   `WorkerThread::wait_until_cold`; backtrace kept at
   `~/rand-prover-trusted/incidents/2026-10-01-g1-spinlock-bt.txt`). Unreachable on the single-core
   build. Fixed by vendoring p3-fri (`vendor/p3-fri`, `[patch.crates-io]`, main `4d5b039`; release line
-  `6430299`, tag **`v0.6.7-prover.2`**, `rand-prover` sha256 `c07cecd0…94cc` — prover.1 is marked
-  superseded): the lock only forks a child RNG. Plus `prover-watchdog.timer` on every member
-  (restart after 10 min proving or 2 min silent). Report upstream to Plonky3; never enable
+  `6430299`, tag `v0.6.7-prover.2`) fixed only `HidingFriPcs`; `MerkleTreeHidingMmcs::commit` holds the
+  same lock across the parallel tree build — upstream Plonky3 #2363 (reproduced 5/5) and fix PR #2368 —
+  so main `0e70ddc` also vendors `p3-merkle-tree` with that PR's change; release line `c8232c23`, tag
+  **`v0.6.7-prover.3`**, `rand-prover` sha256 `e030831d…c1db`, on both pool members (prover.1/.2 can
+  deadlock). Drop both vendored crates once a Plonky3 release carries #2368. Plus `prover-watchdog.timer` on every member
+  (restart after 10 min proving or 2 min silent). Our occurrence is commented on Plonky3 #2363; never enable
   `parallel` in any build without the patch.
 - **Traps from the night.** The web droplet's certbot Cloudflare credential does not see this
   zone (`Unable to determine zone_id`) — `install-web.sh` gets the certificate over HTTP-01 through
