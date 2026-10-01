@@ -67,9 +67,23 @@ this line must keep (`/private/tmp/auditv6/GATED-RULES.md` was the brief; the pi
   than a third makes a replica join; a timeout no longer enters the next view; a proposal no
   longer moves the view). An old replica still follows one NewView and a new one does not; a
   mixed fleet was not tested.
-- **Genesis-gated, dormant on chain 18** — see the entries that follow this one as they land
-  (staking admission and slashing, vesting treasury/threshold/nonces, the gas ceilings and
-  paying-bytes load, the genesis-hash binding, rotation possession and delay).
+- **Genesis-gated, dormant on chains 18 and 19** (all on `main` 2026-10-01; each a field hashed
+  only when present, each with its "The next cut" section in `docs/deploy.md`): `testnet` (a
+  faucet beside a bridge needs it past chain 19; 14–19 grandfathered by id), `binding_domain: 1`
+  (BIND-1: proofs and signed messages over the genesis hash; wallets keep the chain-id form on
+  14–19), `proof_window_blocks` (#118, both 256-block windows), `gas.dynamic`'s
+  `max_gas_price`/`max_byte_price`/`byte_load: "paying"` (POOL-2), `staking.admission_by_vote`,
+  `max_stake_entry_bps_per_epoch` and `slashing` (STAKE-1/2), vesting `revokers`/`threshold`/
+  `treasury` and `revoke_nonce` (STAKE-3/4), `bridge.rotation` (BRG-14), plus RPL-2's
+  `program_state` section. New `Action`s, appended last: 28 `AdmitValidator`, 29
+  `SlashEquivocation`, 30/31 `RotatePqGuardiansV2`/`RotatePauseKeyV2`, 32 `CancelRotation`, 33
+  RPL-2's `Invoke`; mempool claim roles 6 (revoke), 7 (admit), 8 (slash). **Chain 19 was cut on
+  v0.6.7 without any of them (user's ruling, 2026-10-01); chain 20 is the first chain that can
+  carry them** — `deploy/cut-chain20-genesis.sh` sets the recommended values (not slashing: one
+  operator holds every key). Node-only halves that ship with the build: `SafetyState::
+  last_proposed_view` persisted before every proposal (a restarted leader never signs a second
+  header for its view); the pool reserves a quarter of a block for pooled Calls/Invokes; a release
+  `rand-node` refuses a `test`-profile genesis (ZK-5a).
 
 **Suite on the laptop at the network-edge head (release):** core lib 572; node lib 416 passed,
 21 failed (all the `RECURSION_FIXTURES` gap); `cluster` 25 passed, 1 ignored, 3 filtered out by
@@ -91,13 +105,22 @@ ignored); client lib 171, `rand` bin 17; the prover crate whole. Not run: `walle
   and `a_token_transfer_reveals…`). They are per-state now (`ReadSlots`).
 - The laptop's disk filled (98%): clippy's debug tree and four worktrees' build dirs. Use
   `CARGO_INCREMENTAL=0` and `cargo clippy --release`; delete `target/debug` before a long run.
+- PROC-8 (#108) had four shapes on CI, all fixed: a height read before the stop, a stop racing
+  the store, by-hash fetches spending a peer's sync allowance while batch-syncing (6472645), and a
+  restarted node that had heard no peer's Status (b677708: the proposals' height counts until one
+  is heard; an over-limit batch is answered `Busy`, never an empty "miss"). In `cluster.rs` every
+  node dials only the bootstrap node, so a relayed Status (ignored, SYNC-1) is no help there.
+- A rebased branch can carry a test that no longer compiles against main (HB-4's
+  `tx.binding()` after BIND-1 gave it a domain argument): `cargo check --workspace --tests` after
+  every rebase, not only `--lib`.
 
 **Open after this work** (issues left open say why): PROC-2 (#109, blocked: cargo reads every
 path dependency's manifest; needs the circuits crates vendored or git deps on a protected tag),
 PROC-4/5 (#110: `release.yml` and `deploy/lib/verify-release.sh` exist; the release key is not in
 `deploy/release-signers`, `main` is unprotected), OPS-7/OPS-6 (#112: the cut policy and
-`deploy/lib/cut-policy.sh` exist; the key-separation schedule is the operators'), PROC-8 (#108:
-one CI failure mode left), and everything outside this repository — the website and sale service
+`deploy/lib/cut-policy.sh` exist; the key-separation schedule is the operators'), the three
+deferred Lows (#86 TOK-1, #95 ZKV-5, #97 CS6-2), #119 (aggregation's memory and a targeted rVM
+forgery, before any genesis enables aggregation), and everything outside this repository — the website and sale service
 (WEB-*, due before 2026-10-07), randscan (SCAN-2), the clients (CLI-6/7, PRIV-1), the bridge
 repositories (BR-*), the papers (PA-*, DOC-*), and custody (OPS-6, BR-4, BR-7).
 
