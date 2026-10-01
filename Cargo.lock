@@ -4559,8 +4559,6 @@ dependencies = [
 [[package]]
 name = "p3-merkle-tree"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1508ed6e0211a8375ffdcd08746d81841526fe36140d985acd81b4bfe4103649"
 dependencies = [
  "itertools 0.15.0",
  "p3-commit",
