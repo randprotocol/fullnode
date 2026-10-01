@@ -406,11 +406,13 @@ with the reason on stderr:
 | `require_cut_record <file>` | the record is missing, or has no non-empty `reason:`, `carries:`, `drops:`, `clients:`, `second-operator:` or `rollback:` line (an unfilled `<placeholder>` counts as empty) |
 | `refuse_reused_chain_id <id>` | any `deploy/genesis*.json` in the repository already has that `chain_id`, the id is not a positive integer, or no genesis file can be read |
 | `require_second_rebuild <file> <hash>` | the record's `second-hash:` line is absent or differs from the author's genesis hash |
+| `require_key_separation_or_testnet <genesis.json> [status]` | `deploy/key-separation` (or `status`) says `met: no` and the genesis does not set `"testnet": true`; the status file is missing or has no `met:` line (audit v6, OPS-6: no mainnet genesis by one key holder) |
 
 `deploy/cut-record.template` is the form; a filled record is committed and published before the
-cut. `SELFTEST=1 bash deploy/lib/cut-policy.sh` exercises all three on temp files (33 checks). The
+cut. `SELFTEST=1 bash deploy/lib/cut-policy.sh` exercises all four on temp files (44 checks). The
 scripts that cut chains 15 to 18 do not source it — they predate it and are history; **the next
-cut script must**, calling `require_cut_record` and `refuse_reused_chain_id` before its first
+cut script must**, calling `require_cut_record`, `refuse_reused_chain_id` and (on the finished
+file) `require_key_separation_or_testnet` before its first
 step and `require_second_rebuild` before it pushes a genesis. The library checks that a record
 exists and is complete. It cannot check that the record is true, that it was published
 beforehand, or that the second operator is a second person: the record is the evidence for
@@ -429,8 +431,17 @@ keys (`AGENTS.md`, "Chain 15": the eight validators added on 2026-09-27 include 
 hosts). One compromise of that operator's control plane is a quorum. Where the validator keys
 generated on the laptop for chain 14 are backed up, and whether a live copy remains there, is not
 recorded in this repository. This is carried as a dated exception, recorded here so that it is a
-decision and not an oversight. **Schedule: to be set by the operators** — none exists yet. Until
-it is met, the network is a testnet run by its authors, and the bridge caps stay where they are.
+decision and not an oversight. **Schedule, set 2026-10-01 by the operator: by 2026-11-01, and
+before any mainnet genesis**, 18 of the 26 validator keys and 6 of the 8 guardian keys of each set
+go to three other operators, each on their own hosting account (names recorded here when they take
+delivery), so no person or account holds more than 8 validator keys or 2 guardian keys. The
+status is `deploy/key-separation` (`met: no`, `deadline: 2026-11-01`) and the mechanism is
+`require_key_separation_or_testnet` in `deploy/lib/cut-policy.sh`: **while `met: no`, a cut
+refuses any genesis that does not set `"testnet": true`** — a mainnet genesis cannot be cut by one
+key holder by mistake; a passed deadline is warned about on every cut until a new date is set.
+Until it is met, the network is a testnet run by its authors, and the bridge caps stay where they
+are. When the keys are handed over: flip `met:` to `yes`, record the holders here, and only then
+can a genesis without the testnet marker be cut.
 
 ## The chain-14 cut (v0.5, 2026-09-20)
 

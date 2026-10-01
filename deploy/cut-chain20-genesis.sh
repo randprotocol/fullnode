@@ -1355,10 +1355,13 @@ PY
   bash_refuses "a floor file with chain 3 at 0" "is below 1" MIN_INBOUND_FILE="$ST/floors-zero" --
   bash_refuses "a floor given in env and in the file" "given twice" MIN_INBOUND_FILE="$ST/floors-ok" MIN_INBOUND_2=1 --
   bash_refuses "a floor file naming chain 6" "must be 2, 3, 4 or 5" MIN_INBOUND_FILE="$ST/floors-chain" --
-  bash_refuses "a valid floor file parses (and the cut then stops at its missing record)" "no cut record" MIN_INBOUND_FILE="$ST/floors-ok" CUT_RECORD="$ST/no-such-record" --
+  # A genesis dir without chain 20's committed file: since the launch record landed, the real
+  # deploy/ holds genesis-chain20.json and `refuse_reused_chain_id 20` would fire first.
+  mkdir -p "$ST/gendir-19"; cp "$CHAIN19_GENESIS" "$ST/gendir-19/genesis-chain19.json"
+  bash_refuses "a valid floor file parses (and the cut then stops at its missing record)" "no cut record" CUT_POLICY_GENESIS_DIR="$ST/gendir-19" MIN_INBOUND_FILE="$ST/floors-ok" CUT_RECORD="$ST/no-such-record" --
   fresh
   if MIN_INBOUND_2=1 MIN_INBOUND_FILE= bash -c 'py_validators >/dev/null && py_splice' >"$ST/log" 2>&1; then ok "an explicit floor equal to the next sequence is accepted"; else bad "explicit floor 1: $(tail -1 "$ST/log")"; fi
-  bash_refuses "the cut without a cut record (OPS-7)" "no cut record" CUT_RECORD="$ST/no-such-record" CHAIN19_SNAPSHOT="$ST/snap" NODE=/usr/bin/true WALLET=/usr/bin/true --
+  bash_refuses "the cut without a cut record (OPS-7)" "no cut record" CUT_POLICY_GENESIS_DIR="$ST/gendir-19" CUT_RECORD="$ST/no-such-record" CHAIN19_SNAPSHOT="$ST/snap" NODE=/usr/bin/true WALLET=/usr/bin/true --
   python3 -c 'import json,sys; json.dump({"chain_id": 20}, open(sys.argv[1] + "/genesis-chain20.json", "w"))' "$ST" 2>/dev/null
   mkdir -p "$ST/gendir"; cp "$ST/genesis-chain20.json" "$ST/gendir/"; cp "$CHAIN19_GENESIS" "$ST/gendir/genesis-chain19.json"
   bash_refuses "a chain id a committed genesis already has (OPS-7)" "already used by genesis-chain20.json" CUT_POLICY_GENESIS_DIR="$ST/gendir" CUT_RECORD="$ST/cut-record.txt" CHAIN19_SNAPSHOT="$ST/snap" NODE=/usr/bin/true WALLET=/usr/bin/true --
