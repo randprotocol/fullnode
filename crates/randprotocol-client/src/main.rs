@@ -2155,6 +2155,7 @@ async fn main() -> Result<()> {
                 &symbol,
                 decimals,
                 authority,
+                None,
                 initial_amount.map(|amount| (amount, recipient.clone().expect("checked above"))),
                 salt,
                 fee,
@@ -2407,6 +2408,7 @@ mod tests {
             bundle_gas_limit: Some(gas::gas_max(14, 0, 0)),
             adjust_bps: None,
             proof_window_blocks: None,
+            program_state: None,
         }
     }
 
