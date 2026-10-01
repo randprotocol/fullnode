@@ -49,8 +49,21 @@ the ledger's schedule, never a block rule: the pool refuses `FeeTooLow` (not per
 that carries a cheaper call is still valid. One gas is one cpu row; a `KECCAK` row is 192, a
 `SHA256` row 64 (§3.1 of the spec). The `2^(t−2)` term is the Poseidon2 absorb surcharge: the
 zkVM charges `+2` gas on every absorb row beyond its cycle, and a tier holds up to `2^(t−3)`
-permutation slots, so a run can exceed the plain cycle budget by up to `2·2^(t−3)`. What this
-changes, for a ~1.2–1.3 MB production proof: a tier-14 call — the highest tier a chain admits a
+permutation slots, so a run can exceed the plain cycle budget by up to `2·2^(t−3)`. **Known
+under-count (audit v6 ZKV-5, issue #95, constraint set 8):** the digest-prefix rows — one per
+four program words for `hc`, the salt row plus one per four private-input words for `H_IN`, one
+per four public words (at least one) for `H_PUB` — each pull a Poseidon2 permutation exactly as
+an absorb row does, but the meter weighs them at 1, not 3. A Call's metered gas is therefore
+`2 · (⌈words/4⌉ + 1 + ⌈n_in/4⌉ + max(1, ⌈n_pub/4⌉))` below its permutation-weighted figure
+(the tier-14 bundle guest: 1 019 prefix rows, 2 038 gas of its 20 479 pin; the auth guest 46
+rows, 92 gas — both pay a flat pinned limit, so only a Call's price is affected: ~0.0001 RAND on
+a 2 854-word program at `gas_price` 100). The ceiling is unaffected — the `2^(t−2)` term already
+counts every permutation slot a tier holds, prefix rows included. It is not priced chain-side:
+the input-digest rows depend on the private input's length, which the salted `H_IN` keeps
+private, and a chain-side surcharge would double-charge once the meter is fixed. The fix is in
+the AIR and moves every verifier key — constraint set 9; `tests/executor.rs`'s
+`zkv5_digest_row_gas_pin` pins the under-count so the re-vendor that fixes it is noticed. What
+this changes, for a ~1.2–1.3 MB production proof: a tier-14 call — the highest tier a chain admits a
 call at (`MAX_CALL_TIER`) — goes from ~0.0022 to ~0.0041 RAND (`20 479·100 +
 800·⌈1 350 000/1024⌉ + 1 000 000`), and a tier-10 call pays ~0.0021 (was 0.0020). The schedule
 would charge a tier-20 header ~0.133 RAND, but no such call is admitted today.

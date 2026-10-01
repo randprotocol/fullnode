@@ -1,3 +1,4 @@
+mod common;
 use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor};
 use randprotocol_core::program::{program_id, ProgramRecord};
 use randprotocol_zkvm::executor::{prove, ZkExecutor};
@@ -556,4 +557,129 @@ fn a_call_proved_with_a_declared_limit_publishes_exactly_it() {
     assert_eq!(proof.public_values[pv::GAS], run.gas + 5);
     let out = ZkExecutor::new(FriProfile::Test).verify_call(&record(&p), &bytes).unwrap();
     assert_eq!(out.gas_limit, run.gas + 5, "the chain charges the declared limit");
+}
+
+// ──────── Audit v6 ZKV-5 (issue #95): the digest-prefix rows are metered at 1, not at 3 ────────
+//
+// Constraint set 8's meter (`tables/cpu.rs`'s `GAS` column, `gas::gas_of`) weighs every cpu row
+// at 1 and adds `+2` on a `POSEIDON2` absorb row (`IS_HASH`) for the permutation it pulls into
+// the poseidon2 table. The digest-prefix rows — `IS_DIGEST` (the program's `hc`), `IS_INDIGEST`
+// (the salt row and `H_IN`) and `IS_PUBDIGEST` (`H_PUB`) — each pull one permutation too (they
+// are in the AIR's `is_hash_or_digest`, which gates the `POSEIDON2` lookup, and
+// `build_traces_inner` counts them against `Tier::poseidon2_height`), yet the first-row pin is
+// `GAS = 1` and `w_next` adds the surcharge on `n(IS_HASH)` alone. So a run's metered gas is
+// `2 · prefix_rows` below its permutation-weighted figure. Pricing accuracy only: a Call pays
+// `gas_price · GAS_LIMIT`, and `gas_max`'s `2^(t−2)` term bounds every permutation a tier can
+// hold, prefix or absorb, so the ceiling still holds. The fix is in the AIR (`w_next` and the
+// first-row pin) and in `gas_of`, which moves every verifier key — constraint set 9. The chain
+// cannot price it in the meantime: the input-digest rows depend on the private input's length,
+// which the salted `H_IN` keeps private by design. These tests pin the under-count so the
+// re-vendor that fixes it goes red here and the pin is updated knowingly, never silently.
+mod zkv5_digest_row_gas_pin {
+    use randprotocol_zkvm::emulator::{execute, HashRow};
+    use randprotocol_zkvm::gas::{gas_max, gas_of, POSEIDON2_ABSORB_GAS};
+    use randprotocol_zkvm::guests;
+    use randprotocol_zkvm::hash::{input_digest_row_count, public_digest_row_count};
+    use randprotocol_zkvm::isa::Program;
+    use randprotocol_zkvm::machine::{build_traces_salted, FriProfile, Machine, Tier};
+    use randprotocol_zkvm::tables::cpu::{col, pv};
+    use randprotocol_zkvm::tables::F;
+    use p3_field::PrimeCharacteristicRing;
+
+    /// The three digest regions' rows, in trace order: the program's, the salt row plus the
+    /// private input's, the public segment's — every one a permutation (`hash::program_digest`,
+    /// `input_digest`, `public_digest` each run the sponge once per row).
+    fn prefix_rows(p: &Program, n_in: usize, n_pub: usize) -> usize {
+        p.digest_rows() + input_digest_row_count(n_in) + public_digest_row_count(n_pub)
+    }
+
+    /// What the meter leaves off: `POSEIDON2_ABSORB_GAS − 1 = 2` per prefix row.
+    fn under_count(p: &Program, n_in: usize, n_pub: usize) -> u64 {
+        (POSEIDON2_ABSORB_GAS - 1) * prefix_rows(p, n_in, n_pub) as u64
+    }
+
+    fn private_payment_run() -> (Program, Vec<u32>, randprotocol_zkvm::emulator::Execution) {
+        let p = guests::private_payment(1000);
+        let inputs = vec![400, 250, 300, 75];
+        let e = execute(&p, &inputs, &[], 10_000).unwrap();
+        (p, inputs, e)
+    }
+
+    /// `gas_of` charges the prefix at one per row: its total is the prefix count plus one per
+    /// cycle plus `+2` per absorb row — and nothing for the prefix's own permutations. The
+    /// permutation-weighted figure (what constraint set 9's meter reads) is `2 · prefix` more
+    /// and still under the header's ceiling.
+    #[test]
+    fn gas_of_weighs_the_digest_prefix_at_one_per_row() {
+        let (p, inputs, e) = private_payment_run();
+        let prefix = prefix_rows(&p, inputs.len(), 0);
+        assert_eq!(prefix, p.digest_rows() + 2 + 1, "4 input words: the salt row and one block; an empty public segment: its header block");
+        let absorbs = e.events.iter().filter(|ev| matches!(ev.hash_row, Some(HashRow::Absorb { .. }))).count() as u64;
+        let gas = gas_of(&p, &inputs, &[], &e.events);
+        assert_eq!(gas, (prefix + e.events.len()) as u64 + absorbs * (POSEIDON2_ABSORB_GAS - 1), "ZKV-5: the prefix rows weigh 1 each");
+        let corrected = gas + under_count(&p, inputs.len(), 0);
+        assert_eq!(corrected - gas, 2 * prefix as u64);
+        assert!(corrected <= gas_max(Tier(10), 0, 0), "the ceiling's 2^(t−2) term covers every permutation a tier holds, prefix rows included");
+    }
+
+    /// The shipped guests' numbers, so the size of the under-count is on record: bundle guest v3
+    /// (2 854 words, 1 212 private words, no public segment) pays 1 019 prefix rows and so is
+    /// metered 2 038 gas under its permutation-weighted figure; the auth guest (159 words, 16
+    /// private words) pays `40 + (1 + 4) + 1 = 46` prefix rows, 92 gas. Both pay a flat, pinned
+    /// `GAS_LIMIT` (`bundle_gas_limit`, `auth_gas_limit_pin`), so neither is priced by this at
+    /// all — only a Call is.
+    #[test]
+    fn the_shipped_guests_under_count_is_on_record() {
+        let b = guests::bundle_hidden_v3();
+        assert_eq!(b.len(), 2_854);
+        assert_eq!(prefix_rows(&b, randprotocol_zkvm::hidden::hidden_input_v3::COUNT, 0), 714 + (1 + 303) + 1);
+        assert_eq!(under_count(&b, randprotocol_zkvm::hidden::hidden_input_v3::COUNT, 0), 2_038);
+        let a = guests::auth();
+        let a_prefix = a.digest_rows() + (1 + 4) + 1;
+        assert_eq!(prefix_rows(&a, randprotocol_zkvm::auth::auth_input::COUNT, 0), a_prefix);
+        assert_eq!(under_count(&a, randprotocol_zkvm::auth::auth_input::COUNT, 0), 2 * a_prefix as u64);
+        assert_eq!((a.len(), a_prefix, under_count(&a, randprotocol_zkvm::auth::auth_input::COUNT, 0)), (159, 46, 92), "the auth guest's size moved: re-pin");
+    }
+
+    /// The AIR agrees with `gas_of`, row for row: the honest trace's `GAS` column reads `i + 1`
+    /// on prefix row `i`; a trace that weighs each prefix row at its permutation (`3 · (i + 1)`
+    /// on prefix row `i`, every later row `2 · prefix` higher, the halt limbs moved to match) is
+    /// what constraint set 9's meter produces — and constraint set 8's AIR refuses it. When the
+    /// re-vendor lands this test goes red at `rejects`: that is the pin firing.
+    #[test]
+    fn the_air_refuses_a_trace_that_weighs_its_digest_rows_at_their_permutation() {
+        let m = Machine::new(FriProfile::Test);
+        let (p, inputs, e) = private_payment_run();
+        let prefix = prefix_rows(&p, inputs.len(), 0);
+        let gas = gas_of(&p, &inputs, &[], &e.events);
+        let bump = under_count(&p, inputs.len(), 0);
+        let limit = gas + bump;
+        let w = col::WIDTH;
+
+        // Honest under constraint set 8: the limit carries `2 · prefix` of slack, and verifies.
+        let honest = build_traces_salted(&p, &inputs, &[], [0; 4], &e, Tier(10), limit).unwrap();
+        for r in 0..=prefix {
+            let row = &honest.cpu.values[r * w..(r + 1) * w];
+            let is_prefix = row[col::IS_DIGEST] + row[col::IS_INDIGEST] + row[col::IS_PUBDIGEST];
+            assert_eq!(is_prefix, if r < prefix { F::ONE } else { F::ZERO }, "the prefix is exactly the first `prefix` rows");
+            if r < prefix { assert_eq!(row[col::GAS], F::from_u64(r as u64 + 1), "ZKV-5: prefix row {r} metered at 1"); }
+        }
+        assert!(m.verify(&p.digest(), &m.prove_traces(&p, &honest, Tier(10))).is_ok());
+
+        // The permutation-weighted meter, written over the honest trace.
+        let mut forged = build_traces_salted(&p, &inputs, &[], [0; 4], &e, Tier(10), limit).unwrap();
+        let rows = forged.cpu.values.len() / w;
+        for r in 0..rows {
+            let add = if r < prefix { 2 * (r as u64 + 1) } else { bump };
+            forged.cpu.values[r * w + col::GAS] += F::from_u64(add);
+        }
+        let halt = (0..rows).find(|&r| forged.cpu.values[r * w + col::SYS_HALT] == F::ONE).unwrap();
+        assert_eq!(forged.cpu.values[halt * w + col::GAS], F::from_u64(limit), "GAS == GAS_LIMIT on the halt row: the limbs are zero");
+        for k in 0..4 { forged.cpu.values[halt * w + col::GD0 + k] = F::ZERO; }
+        assert_eq!(forged.public_values[pv::GAS], F::from_u64(limit));
+        assert!(
+            super::common::rejects(|| m.verify(&p.digest(), &m.prove_traces(&p, &forged, Tier(10)))),
+            "constraint set 8's AIR accepted a digest prefix weighed at 3 per row: the ZKV-5 fix has landed — update this pin and `gas_of`'s callers"
+        );
+    }
 }
