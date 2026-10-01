@@ -965,6 +965,8 @@ struct Node {
     fetch_inflight: HashMap<libp2p::request_response::OutboundRequestId, (Hash, Instant)>,
     /// Block hash -> (attempts so far, peers already asked) for by-hash fetches.
     fetch_attempts: HashMap<Hash, (usize, Vec<PeerId>)>,
+    /// When each block's by-hash fetch was first deferred to batch sync ([`fetch_deferred`]).
+    fetch_deferred_since: HashMap<Hash, Instant>,
     /// History-retention passes that deleted at least one block (history pruning spec §1),
     /// counted to space out the compaction pass.
     prune_passes: u64,
@@ -1608,6 +1610,25 @@ fn fetch_deferred_to_batch_sync(best_peer_height: u64, committed_height: u64) ->
     best_peer_height > committed_height.saturating_add(1)
 }
 
+/// How long one block's by-hash fetch may wait on [`fetch_deferred_to_batch_sync`] (audit v7
+/// addendum, SYNC-5 / CON-6, #120). The deferral reads the largest Status any peer claims, and a
+/// Status is unsigned: without a bound, one connection claiming a height it does not have held
+/// every by-hash fetch back — the locked block's (CON-1b) and the attempts behind the ghost-QC
+/// fall-back (CON-6) — for as long as it kept claiming. An honest batch sync brings a block well
+/// inside this (a round trip and an apply); a block still missing after it is fetched anyway.
+pub const FETCH_DEFER_GRACE: Duration = Duration::from_secs(10);
+
+/// Whether a by-hash fetch of a block first deferred at `first_deferred` (`None`: not yet) still
+/// waits for batch sync at `now`.
+fn fetch_deferred(best_peer_height: u64, committed_height: u64, first_deferred: Option<Instant>, now: Instant) -> bool {
+    fetch_deferred_to_batch_sync(best_peer_height, committed_height)
+        && first_deferred.is_none_or(|t| now.duration_since(t) < FETCH_DEFER_GRACE)
+}
+
+/// The most blocks [`Node::fetch_deferred_since`] remembers; past it the record starts over (a
+/// fresh grace for each — bounded memory over a perfect bound).
+const MAX_FETCH_DEFERRALS: usize = 4096;
+
 fn fetch_blocked<K>(inflight: &HashMap<K, (Hash, Instant)>, h: &Hash) -> bool {
     inflight.values().any(|(x, _)| x == h)
 }
@@ -2223,6 +2244,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         sync_late_batches: 0,
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
+        fetch_deferred_since: HashMap::new(),
         prune_passes: 0,
         compacting: Arc::new(AtomicBool::new(false)),
         no_peer_warned_at: None,
@@ -2829,6 +2851,7 @@ impl Node {
         self.publish_heads(&blocks);
         self.warm_new_programs(&blocks);
         self.fetch_attempts.clear();
+        self.fetch_deferred_since.clear();
         Ok(())
     }
 
@@ -3301,8 +3324,16 @@ impl Node {
             return Vec::new();
         }
         if fetch_deferred_to_batch_sync(self.best_peer_height(), self.hs.committed_height()) {
-            tracing::debug!("not fetching block {h:?} by hash while {} blocks behind: batch sync brings it", self.best_peer_height() - self.hs.committed_height());
-            return Vec::new();
+            let now = Instant::now();
+            if self.fetch_deferred_since.len() >= MAX_FETCH_DEFERRALS && !self.fetch_deferred_since.contains_key(&h) {
+                self.fetch_deferred_since.clear();
+            }
+            let first = *self.fetch_deferred_since.entry(h).or_insert(now);
+            if fetch_deferred(self.best_peer_height(), self.hs.committed_height(), Some(first), now) {
+                tracing::debug!("not fetching block {h:?} by hash while {} blocks behind: batch sync brings it", self.best_peer_height() - self.hs.committed_height());
+                return Vec::new();
+            }
+            tracing::debug!("block {h:?} not brought by batch sync within {FETCH_DEFER_GRACE:?}; fetching it by hash");
         }
         let entry = self.fetch_attempts.entry(h).or_insert((0, Vec::new()));
         if entry.0 >= MAX_FETCH_ATTEMPTS {
@@ -3466,6 +3497,7 @@ impl Node {
             SyncResponse::Block(Some(b)) => {
                 if let Some((h, _)) = self.fetch_inflight.remove(&request_id) {
                     self.fetch_attempts.remove(&h);
+                    self.fetch_deferred_since.remove(&h);
                 }
                 self.on_consensus(ConsensusMessage::Proposal(b)).await?;
             }
@@ -5525,6 +5557,25 @@ mod tests {
         assert!(!admission::is_permanent(&verdict.unwrap_err()), "never cached");
         assert_eq!(guard_verify(|| Ok(())), Ok(()), "a verdict passes through");
         assert_eq!(guard_verify(|| Err(randprotocol_core::TxError::BadDigest)), Err(randprotocol_core::TxError::BadDigest));
+    }
+
+    /// Audit v7 addendum, SYNC-5 / CON-6 (#120): the deferral rests on the largest *unsigned*
+    /// Status any peer claims, so one connection claiming a huge height stopped every by-hash
+    /// fetch — the locked-block fetch and the attempt counter behind CON-6's fall-back included —
+    /// for as long as it kept claiming. The deferral is bounded per block: once a block has waited
+    /// [`FETCH_DEFER_GRACE`] for the batch sync to bring it, it is fetched anyway, and the attempts
+    /// and the fall-back run as they did before the gate.
+    #[test]
+    fn a_claimed_height_defers_a_fetch_only_for_the_grace_period() {
+        let t0 = Instant::now();
+        assert!(!fetch_deferred(100, 100, None, t0), "not behind: fetch");
+        assert!(fetch_deferred(1_000_000, 100, None, t0), "a first deferral, on a peer's claim");
+        assert!(fetch_deferred(1_000_000, 100, Some(t0), t0 + FETCH_DEFER_GRACE / 2), "still inside the grace");
+        assert!(
+            !fetch_deferred(1_000_000, 100, Some(t0), t0 + FETCH_DEFER_GRACE),
+            "a claim that has not brought the block in the grace period no longer holds the fetch back"
+        );
+        assert!(!fetch_deferred(101, 100, Some(t0), t0), "one behind is a live parent, as before");
     }
 
     /// Audit v6, PROC-8: a node more than one block behind defers by-hash fetches to batch sync;
