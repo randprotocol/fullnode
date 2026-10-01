@@ -422,6 +422,14 @@ pub struct NetworkHandle {
 }
 
 impl NetworkHandle {
+    /// A handle with no swarm behind it, for tests of the node loop's own methods: every command
+    /// the node sends arrives on the returned receiver instead.
+    #[cfg(test)]
+    pub(crate) fn detached_for_test(local_peer_id: PeerId) -> (NetworkHandle, mpsc::Receiver<NetworkCommand>) {
+        let (cmd, rx) = mpsc::channel(64);
+        (NetworkHandle { cmd, local_peer_id }, rx)
+    }
+
     pub async fn broadcast(&self, msg: GossipMessage) {
         let _ = self.cmd.send(NetworkCommand::Broadcast(msg)).await;
     }

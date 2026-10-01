@@ -1595,7 +1595,6 @@ fn expire_stale_fetches<K: std::hash::Hash + Eq + Clone>(
     stale.iter().filter_map(|k| inflight.remove(k)).map(|(h, _)| h).collect()
 }
 
-/// Whether a by-hash fetch for `h` is still outstanding, after [`expire_stale_fetches`].
 /// Whether a by-hash fetch should wait for batch sync instead (audit v6, PROC-8's third failure
 /// mode, seen three times in four CI runs at `restart_cycles_keep_all_nodes_in_sync`). A node
 /// that is behind hears a certificate — through every NewView and every proposal's justify — for
@@ -1629,6 +1628,7 @@ fn fetch_deferred(best_peer_height: u64, committed_height: u64, first_deferred: 
 /// fresh grace for each — bounded memory over a perfect bound).
 const MAX_FETCH_DEFERRALS: usize = 4096;
 
+/// Whether a by-hash fetch for `h` is still outstanding, after [`expire_stale_fetches`].
 fn fetch_blocked<K>(inflight: &HashMap<K, (Hash, Instant)>, h: &Hash) -> bool {
     inflight.values().any(|(x, _)| x == h)
 }
@@ -3323,14 +3323,15 @@ impl Node {
         if self.hs.has_block(&h) || fetch_blocked(&self.fetch_inflight, &h) {
             return Vec::new();
         }
-        if fetch_deferred_to_batch_sync(self.best_peer_height(), self.hs.committed_height()) {
+        let (best, held) = (self.best_peer_height(), self.hs.committed_height());
+        if fetch_deferred_to_batch_sync(best, held) {
             let now = Instant::now();
             if self.fetch_deferred_since.len() >= MAX_FETCH_DEFERRALS && !self.fetch_deferred_since.contains_key(&h) {
                 self.fetch_deferred_since.clear();
             }
             let first = *self.fetch_deferred_since.entry(h).or_insert(now);
-            if fetch_deferred(self.best_peer_height(), self.hs.committed_height(), Some(first), now) {
-                tracing::debug!("not fetching block {h:?} by hash while {} blocks behind: batch sync brings it", self.best_peer_height() - self.hs.committed_height());
+            if fetch_deferred(best, held, Some(first), now) {
+                tracing::debug!("not fetching block {h:?} by hash while {} blocks behind: batch sync brings it", best - held);
                 return Vec::new();
             }
             tracing::debug!("block {h:?} not brought by batch sync within {FETCH_DEFER_GRACE:?}; fetching it by hash");
@@ -5576,6 +5577,161 @@ mod tests {
             "a claim that has not brought the block in the grace period no longer holds the fetch back"
         );
         assert!(!fetch_deferred(101, 100, Some(t0), t0), "one behind is a live parent, as before");
+    }
+
+    /// A `Node` over `storage` and `hs` with no swarm, RPC or loop behind it, for tests that call
+    /// its methods directly. Every network command the node sends is forwarded, reply dropped, to
+    /// the returned receiver (a dropped reply is a send that got no request id, which the node
+    /// already handles), so a test reads exactly what the node asked the network to do.
+    fn bare_node(storage: Storage, gs: GenesisState, hs: HotStuff) -> (Node, mpsc::UnboundedReceiver<(PeerId, SyncRequest)>) {
+        let local = PeerId::random();
+        let (net, mut cmds) = network::NetworkHandle::detached_for_test(local);
+        let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmds.recv().await {
+                if let network::NetworkCommand::SendSyncRequest { peer, request, reply } = cmd {
+                    drop(reply);
+                    let _ = seen_tx.send((peer, request));
+                }
+            }
+        });
+        let cfg = NodeConfig {
+            viewing_open: false,
+            datadir: PathBuf::new(),
+            seed: *key(1).seed(),
+            listen: Vec::new(),
+            bootstrap: Vec::new(),
+            rpc_addr: "127.0.0.1:0".parse().unwrap(),
+            enable_mdns: false,
+            validator: true,
+            block_interval: Duration::from_secs(1),
+            base_timeout: Duration::from_secs(1),
+            max_timeout: Duration::from_secs(8),
+            verify: VerifyMode::Off,
+            keep_raw_proofs: false,
+            min_free_disk_bytes: 0,
+            prune_history: None,
+            gas_policy: None,
+        };
+        let wire = network::WireLimits::for_ledger(&gs.ledger);
+        let max_block_bytes = gs.ledger.max_block_bytes();
+        let (verdicts_tx, _verdicts_rx) = mpsc::channel(MAX_VERIFY_IN_FLIGHT);
+        let peer_bindings = crate::peer_bindings::PeerBindings::load(gs.hash(), Default::default(), Default::default());
+        let node = Node {
+            cfg,
+            address: key(1).address(),
+            executor: Arc::new(StubExecutor),
+            storage: Arc::new(storage),
+            gs,
+            hs,
+            mempool: Mempool::new(16),
+            net,
+            status: Arc::new(RwLock::new(NodeStatus::default())),
+            viewing_count: Arc::new(AtomicUsize::new(0)),
+            heads: broadcast::channel(4).0,
+            commits: broadcast::channel(4).0,
+            refusals: broadcast::channel(4).0,
+            ws_conns: Arc::new(AtomicUsize::new(0)),
+            peers: HashMap::new(),
+            wire,
+            timeout: None,
+            propose_at: None,
+            last_block_at: Instant::now(),
+            sync_inflight: None,
+            sync_batch: SYNC_BATCH,
+            sync_from_committed: false,
+            sync_failures: 0,
+            sync_late_batches: 0,
+            fetch_inflight: HashMap::new(),
+            fetch_attempts: HashMap::new(),
+            fetch_deferred_since: HashMap::new(),
+            prune_passes: 0,
+            compacting: Arc::new(AtomicBool::new(false)),
+            no_peer_warned_at: None,
+            highest_proposal_seen: 0,
+            disk_free_bytes: u64::MAX,
+            refused: admission::RefusedCache::new(16),
+            verified: Arc::new(RwLock::new(admission::VerifiedSet::new(16))),
+            limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
+            status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
+            consensus_limiter: admission::PeerLimiter::new(CONSENSUS_GOSSIP_BURST, CONSENSUS_GOSSIP_PER_SEC),
+            consensus_byte_limiter: consensus_byte_limiter(max_block_bytes),
+            binding_limiter: admission::PeerLimiter::new(
+                crate::peer_bindings::BINDING_GOSSIP_BURST,
+                crate::peer_bindings::BINDING_GOSSIP_PER_SEC,
+            ),
+            peer_bindings,
+            binding_signer: None,
+            binding_announced_at: None,
+            binding_announce_wanted: false,
+            sync_limiter: admission::PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC),
+            not_held_signed: NotHeldCache::default(),
+            peer_memory: PeerMemory::default(),
+            sync_serve_budget: SyncServeBudget::new(),
+            sync_serving: Arc::new(tokio::sync::Semaphore::new(MAX_SYNC_SERVES_IN_FLIGHT)),
+            faucet_limiter: admission::PeerLimiter::new(admission::FAUCET_MINT_BURST, admission::FAUCET_MINT_PER_SEC),
+            faucet_bucket: admission::TokenBucket::default(),
+            snapshot: None,
+            verify_in_flight: 0,
+            verify_queue: VecDeque::new(),
+            verdicts_tx,
+        };
+        (node, seen_rx)
+    }
+
+    /// One connected peer claiming `height`.
+    fn claiming_peer(node: &mut Node, height: u64) -> PeerId {
+        let p = PeerId::random();
+        node.peers.insert(
+            p,
+            Peer { connected: true, status: Some(Status { height, head_hash: Hash::ZERO, view: 0, floor: 0 }), ..Default::default() },
+        );
+        p
+    }
+
+    /// The by-hash requests the node has sent so far (its network commands are forwarded on a
+    /// spawned task, so give it a turn first).
+    async fn sent_by_hash(seen: &mut mpsc::UnboundedReceiver<(PeerId, SyncRequest)>) -> Vec<(PeerId, Hash)> {
+        tokio::task::yield_now().await;
+        let mut out = Vec::new();
+        while let Ok((p, req)) = seen.try_recv() {
+            if let SyncRequest::BlockByHash(h) = req {
+                out.push((p, h));
+            }
+        }
+        out
+    }
+
+    /// Audit v7 addendum, PROC-11 (#128): PROC-8's gate and SYNC-5's bound pinned where they act,
+    /// in [`Node::fetch_block`], not only as predicates (deleting the call left every test green).
+    /// A node at height 2 with a peer claiming 1 000 does not fetch a missing block by hash — the
+    /// batch sync brings it — and once that block has waited [`FETCH_DEFER_GRACE`] it is fetched
+    /// anyway, from the claiming peer.
+    #[tokio::test]
+    async fn fetch_block_defers_to_batch_sync_on_a_claimed_height_for_the_grace_only() {
+        let (_d, storage, gs, _ledger) = chain_past_a_boundary();
+        let hs = resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), Arc::new(StubExecutor)).unwrap();
+        assert_eq!((hs.committed_height(), hs.pending_tip_height()), (2, 2));
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let claimer = claiming_peer(&mut node, 1_000);
+        let missing = Hash::digest(b"a block the batch sync will bring");
+
+        assert!(node.fetch_block(missing).await.is_empty());
+        assert_eq!(sent_by_hash(&mut seen).await, vec![], "998 blocks behind on a peer's claim: the batch sync brings it");
+        assert!(!node.fetch_attempts.contains_key(&missing), "a deferral is not an attempt");
+        assert!(node.fetch_deferred_since.contains_key(&missing), "the deferral is timed");
+
+        assert!(node.fetch_block(missing).await.is_empty());
+        assert_eq!(sent_by_hash(&mut seen).await, vec![], "still inside the grace");
+
+        let long_ago = Instant::now().checked_sub(FETCH_DEFER_GRACE + Duration::from_secs(1)).expect("a monotonic clock past 11 s");
+        node.fetch_deferred_since.insert(missing, long_ago);
+        assert!(node.fetch_block(missing).await.is_empty());
+        assert_eq!(
+            sent_by_hash(&mut seen).await,
+            vec![(claimer, missing)],
+            "a claim that has not brought the block within the grace no longer holds the fetch back"
+        );
     }
 
     /// Audit v6, PROC-8: a node more than one block behind defers by-hash fetches to batch sync;
