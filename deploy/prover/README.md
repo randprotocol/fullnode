@@ -24,7 +24,10 @@ out and the owner decides the cut-over; then `retire-shared.sh` on nyc3/sfo3 and
 `~/rand-prover-trusted/home`. Every instance runs the hardened unit (loopback only, a syscall filter;
 `systemd-analyze security` 1.5, VK-13), installed only from a release whose SHA256SUMS verified against
 the release key (OPS-9), with a 600 s proving timeout coming in the next release (VK-12) and the
-watchdog meanwhile. The router meters submits per address across the pool (VK-10). Window: #118.
+watchdog meanwhile. The router meters submits per address across the pool (VK-10). Verified end to end through the
+router on 2026-10-01, one real chain-20 transfer per member, each committed: a `e89e2cc4…` (73.4 s,
+height 15238), archive2 `7c404236…` (75.3 s, 15316), nyc3 `bdc88a53…` (76.3 s, 15492), sfo3
+`f925b4cd…` (76.4 s, 15571). Window: #118.
 
 ## What the pool is
 
