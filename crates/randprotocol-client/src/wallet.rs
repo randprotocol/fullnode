@@ -1240,12 +1240,20 @@ async fn scan_pass(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result
     while !rebuilt.is_empty() {
         let rows = rpc.commitments(from, PAGE).await?;
         if rows.is_empty() {
-            // Every leaf there is has been offered and some deposit still has no leaf: the node
-            // rendered an attestation whose commitment its own tree does not hold.
-            return Err(anyhow!(
-                "{} rebuilt deposit or mint note(s) match no leaf of the tree; the node's blocks and notes disagree",
-                rebuilt.len()
-            ));
+            // Every leaf there is has been offered and some rebuilt note still has no leaf: the
+            // node rendered a public-note transaction whose commitment its own tree does not hold.
+            // The note is not credited — only a leaf makes a rebuilt note owned — and it is not
+            // kept pending either: one planted transaction would otherwise fail every later scan,
+            // against an honest node too, until `rand sync --rescan` (audit v7, CLI-19).
+            for cm in rebuilt.keys() {
+                eprintln!(
+                    "warning: dropping a rebuilt deposit or mint note with commitment {}: it matches no leaf of the tree, \
+                     so the node's blocks and leaves disagree; it is not credited",
+                    word8_to_hex(cm)
+                );
+            }
+            rebuilt.clear();
+            break;
         }
         let before = from;
         for row in &rows {
@@ -1266,10 +1274,10 @@ async fn scan_pass(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result
         }
     }
 
-    // Every rebuilt note is at its leaf now; the walk's cursor already passed the blocks they came
-    // from, and what it kept for the leaf pass is placed, so nothing is pending any more. Any
-    // error above returns before this line and leaves the pending set in the store, for the next
-    // scan to place without re-reading a block (issue #117).
+    // Every rebuilt note is at its leaf now, or was dropped above for having none; the walk's
+    // cursor already passed the blocks they came from, so nothing is pending any more. Any error
+    // above returns before this line and leaves the pending set in the store, for the next scan
+    // to place without re-reading a block (issue #117).
     debug_assert!(rebuilt.is_empty());
     store.pending_public_notes.clear();
 
@@ -6302,6 +6310,36 @@ mod tests {
         );
         assert_eq!(store.scanned_attest_height, chain.lock().unwrap().head() + 1);
         assert!(store.pending_public_notes.is_empty());
+    }
+
+    /// CLI-19 (audit v7): a lying node serves a public-note transaction for this wallet with no
+    /// leaf behind it. The rebuilt note is never credited, and it is not kept pending either: a
+    /// pending note that no leaf matches made every later scan fail "match no leaf" — against an
+    /// honest node too — until `rand sync --rescan`. It is dropped with a warning instead.
+    #[tokio::test]
+    async fn a_planted_public_note_with_no_leaf_does_not_fail_every_later_scan() {
+        let me = Wallet::from_spend_key(SpendKey([65; 8]));
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        let (txs, _) = public_notes_for(&me);
+        {
+            let mut c = chain.lock().unwrap();
+            c.fund(&me, 5, 0); // block 1: a real note
+            // Block 2, as the lying node serves it: a deposit to me whose leaf it never appended.
+            c.commit(vec![txs.into_iter().next().unwrap()], Vec::new());
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        // Whatever the first scan says, `rand` saves the store it leaves.
+        let _ = scan(&rpc, &me, &mut store).await;
+        let mut store = saved(&store);
+        assert_eq!(store.asset_balances(), vec![(0, 5)], "the planted note is never credited");
+
+        // The honest node: the same chain, without the planted transaction.
+        chain.lock().unwrap().blocks[2].clear();
+        chain.lock().unwrap().fund(&me, 7, 0);
+        scan(&rpc, &me, &mut store).await.expect("a scan against an honest node succeeds");
+        assert_eq!(store.asset_balances(), vec![(0, 12)]);
+        assert!(store.pending_public_notes.is_empty(), "nothing unplaceable is kept");
     }
 
     /// A store scanned against one chain is a cache of that chain alone. Carried to a node on
