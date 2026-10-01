@@ -134,6 +134,12 @@
 # ledger refuses, and a seeded mutation fuzz over every private-input word against a host model of
 # spec §3.3. Upstream has no such file; without the exclusion `--delete` would remove it.
 #
+# Audit v6 HB-4 (issue #100) adds `tests/hidden_trace_forgery.rs` (excluded below, same reason):
+# real proofs of an honest v3 bundle run whose traces are edited after emulation — the Merkle
+# read-index redirect, a leaf-index bit, a nullifier, an output amount, the derived `pk` — which the
+# verifier must refuse, and a real v3 proof in a real `Ledger` under another binding, anchor or
+# `auth_commit`. Upstream has no such file.
+#
 # Delegated proving, Phase 2 (spec `docs/superpowers/specs/2026-09-28-delegated-proving-design.md`
 # §4) adds `src/auth.rs` (the auth guest's input layout and `c = H(AUTH, nk, salt)`, node-local tag
 # 65) and `tests/auth*.rs` (the P2-0 spike and what follows it), both excluded below for the same
@@ -193,7 +199,7 @@ rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude
       --exclude lib.rs --exclude main.rs "$SRC/src/" "$DST/src/"
 rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_envelope.rs \
       --exclude viewing.rs --exclude bundle.rs --exclude hidden_bundle.rs \
-      --exclude hidden_cheating.rs --exclude guest_provenance.rs --exclude 'auth*.rs' --exclude evm_rt.rs --exclude sbpf_rt.rs \
+      --exclude hidden_cheating.rs --exclude hidden_trace_forgery.rs --exclude guest_provenance.rs --exclude 'auth*.rs' --exclude evm_rt.rs --exclude sbpf_rt.rs \
       "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
 # M4.1/M4.2: vendor the compiled guest binaries the vendored `tests/e2e.rs` and the local
