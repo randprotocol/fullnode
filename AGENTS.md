@@ -4,7 +4,35 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-10-01)
+## Project memory (state as of 2026-10-02)
+
+### v0.7.0 — released and ROLLED onto chain 20 (2026-10-02 ~00:15 UTC; node-only)
+
+Tag `806ed349` (workspace 0.7.0; `CHANGELOG.md` has v0.6.9 and v0.7.0): the audit v7 addendum
+(every row but #119) and the last audit v6 rows (PROC-2 #109, CS6-2 #97, TOK-1 #86, ZKV-5 #95,
+OPS-6 #112 dated by 2026-11-01). **The first release built by `release.yml`** (CI-gated,
+`--locked`, attested) and signed by the release key (`SHA256SUMS.sig`, the user signs; verify with
+`bash -c 'source deploy/lib/verify-release.sh; verify_release_sums SHA256SUMS SHA256SUMS.sig'`),
+which closed #110. Rolled one host at a time over the signed path: each host downloads from the
+release and checks the signed shas before stopping; C and D last. The prover pool runs the signed
+v0.7.0 `rand-prover`. Open: #119 only.
+
+- **Traps from the release:** (1) never create the GitHub release by hand before `release.yml`
+  runs — the workflow creates it, and a hand-made one made v0.6.8/v0.6.9's runs fail. (2) Pushing a
+  `v*` tag starts a SECOND `ci` run on the same sha, and the `ci-gate` reads the NEWEST run, so a
+  flake there blocks the release; `gh run rerun <ci-run> --failed`, then `gh run rerun
+  <release-run>`. (3) sshd's `MaxStartups` (10:30:100) resets connections when more than ~10 ssh
+  sessions fan out at once — probe the fleet serially during a roll. macOS has no `timeout`; use
+  `ConnectTimeout` / `curl -m`. (4) A circuits commit that CI pins must be pushed to the
+  `randprotocol` remote, not the fork `origin` (guest-provenance: "not our ref").
+
+**Faucet → one large payment (2026-10-02, 1 000 RAND to the user's wallet, tx `9b3f85aa…5d09`).**
+The faucet mints at most 100 RAND, and a send spends at most two notes, so a big payment needs
+merges first. **The wallet spends its largest notes first**: size each self-send as the two LARGEST
+notes minus the 0.001 fee, so it leaves no change and the big note grows each round. Sizing from the
+two smallest gives a payment plus change, merges nothing and still costs the fee each time. The
+laptop's SSH tunnel to node A drops; the public `https://rpc.randprotocol.org` serves the wallet
+end to end.
 
 ### Proving defaults: `--threads`, `--cpu`, the GPU by default (2026-10-01, after v0.7.0; node-only, any chain)
 
