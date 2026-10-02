@@ -10,6 +10,19 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 `git tag` and the GitHub release list (audit v6, DOC-6). There is no tag v0.5.2, v0.5.3 or v0.6.5.
 "Assets" says what the GitHub release carries, as read on 2026-09-30.
 
+## v0.7.1 — 2026-10-07 (chain 20, node-only)
+
+Node-only: no consensus rule, wire format, verifier key or genesis change. From this release on,
+every RandProtocol repository is tagged `v0.7.1` together (the monorepo's version line), so one
+version names the fleet, the explorer, the bridge, the circuits and the sites. Beyond v0.7.0:
+
+- **Proving threads** (185cda96): `--threads` with an efficiency-based default (the wallet uses
+  every core; the prover service cores−1, capped at 8), `--cpu`, and the GPU by default when a
+  CUDA build sees one, one module for `rand`, `rand-prover` and the hosted prover; the measured
+  curve in `docs/node-hardware.md` §6.
+- **Tests** (c0138892): the corruption test verifies the repaired store with the node stopped.
+- **Docs** (56ac2d6d): `AGENTS.md` records the v0.7.0 roll on chain 20 over the signed path.
+
 ## v0.7.0 — 2026-10-01 (chain 20, node-only)
 
 Tag `TAG_SHA`. Node-only: no consensus rule, wire format, verifier key or genesis change; rolled
