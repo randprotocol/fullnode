@@ -21,6 +21,8 @@ version names the fleet, the explorer, the bridge, the circuits and the sites. B
   CUDA build sees one, one module for `rand`, `rand-prover` and the hosted prover; the measured
   curve in `docs/node-hardware.md` §6.
 - **Tests** (c0138892): the corruption test verifies the repaired store with the node stopped.
+- **Spikes** (49a0710f): the browser-prover feasibility spike, moved from randprotocol.org and
+  ported to the hidden-asset bundle.
 - **Docs** (56ac2d6d): `AGENTS.md` records the v0.7.0 roll on chain 20 over the signed path.
 
 ## v0.7.0 — 2026-10-01 (chain 20, node-only)
