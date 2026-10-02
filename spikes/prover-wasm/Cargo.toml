@@ -1,0 +1,46 @@
+[package]
+name = "rand-prover-wasm-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "THROWAWAY feasibility spike: can the fullnode's bundle prover run in a browser? Not shipped."
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "spike-native"
+path = "src/main.rs"
+
+[dependencies]
+randprotocol-core = { path = "../../crates/randprotocol-core" }
+randprotocol-zkvm = { path = "../../crates/randprotocol-zkvm" }
+wasm-bindgen = "=0.2.128"
+serde_json = "1"
+# randprotocol-core draws through rand 0.8 / getrandom 0.2 (needs `js`); the zkvm through rand 0.10 /
+# getrandom 0.3 (needs the `wasm_js` feature plus RUSTFLAGS --cfg getrandom_backend="wasm_js").
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+# Plonky3's own multi-threading, off in the fullnode (no rayon in its lockfile). Turned on here
+# to measure the multi-core ceiling; in a browser it needs wasm threads (wasm-bindgen-rayon).
+p3-maybe-rayon = { version = "=0.7.0", optional = true, features = ["parallel"] }
+
+[features]
+default = []
+parallel = ["dep:p3-maybe-rayon"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Performance", "Window", "WorkerGlobalScope"] }
+js-sys = "0.3"
+
+[profile.release]
+# No LTO and parallel codegen: with lto=true / codegen-units=1 the zkvm crate alone compiled for
+# wasm32 for close to three hours without finishing. opt-level 3 is kept for the arithmetic.
+opt-level = 3
+lto = false
+codegen-units = 16
+panic = "abort"

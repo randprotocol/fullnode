@@ -21,3 +21,6 @@ bin-*/
 *.notes.json.*
 /run-a.log
 **/target/
+# The prover feasibility spike's build output: several GB per target directory.
+/spikes/*/target*/
+/spikes/*/pkg*/
