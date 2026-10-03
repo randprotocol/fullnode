@@ -1474,6 +1474,13 @@ impl Ledger {
         self.perps.as_mut().and_then(|p| p.take_block_words())
     }
 
+    /// [`Self::take_perp_block_words`] without taking them: a copy of the last closed block's
+    /// height and words, for a reader behind a shared reference (the consensus replica fills
+    /// each committed block's [`crate::consensus::CommittedBlock::perp_words`] with it).
+    pub fn perp_block_words(&self) -> Option<(u64, Vec<u32>)> {
+        self.perps.as_ref().and_then(|p| p.last_block_words().cloned())
+    }
+
     /// Whether block time is consensus input on this chain, and so bounded: no rewind past the
     /// parent and no step past [`MAX_TIMESTAMP_STEP_MS`] (`apply_block_for_sync`), and the
     /// proposer's clamp and B2's drift vote rule (`HotStuff`). A bridge reads it (guardian-set

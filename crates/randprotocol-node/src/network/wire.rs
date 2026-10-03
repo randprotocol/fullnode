@@ -333,7 +333,7 @@ mod tests {
     fn committed(height: u64, ks: &[Keypair]) -> CommittedBlock {
         let b = block(height, ks);
         let h = b.hash();
-        CommittedBlock { block: b, pruned: Vec::new(), qc: qc(ks, height, h), receipts: Vec::new(), deposits: Vec::new(), aggregates: Vec::new() }
+        CommittedBlock { block: b, pruned: Vec::new(), qc: qc(ks, height, h), receipts: Vec::new(), deposits: Vec::new(), aggregates: Vec::new(), perp_words: None }
     }
 
     fn keys(n: u8) -> Vec<Keypair> {

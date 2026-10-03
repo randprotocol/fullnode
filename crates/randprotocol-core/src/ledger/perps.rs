@@ -531,6 +531,22 @@ impl Perps {
     pub fn take_block_words(&mut self) -> Option<(u64, Vec<u32>)> {
         self.last_block_words.take()
     }
+
+    /// The last closed block's height and input words, without taking them: for a reader that
+    /// holds the ledger behind a shared reference (the consensus replica's per-block ledgers).
+    pub fn last_block_words(&self) -> Option<&(u64, Vec<u32>)> {
+        self.last_block_words.as_ref()
+    }
+
+    /// How many trading accounts the ledger holds.
+    pub fn account_count(&self) -> usize {
+        self.accounts.len()
+    }
+
+    /// Every pending withdrawal, by request id.
+    pub fn withdrawals(&self) -> impl Iterator<Item = (&Word8, &PendingWithdrawal)> {
+        self.withdrawals.iter()
+    }
 }
 
 /// The most trading accounts the ledger opens: the engine has 16 slots and keeps one for the

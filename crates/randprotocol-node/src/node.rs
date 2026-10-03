@@ -264,6 +264,25 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
             if ledger.program_state().is_some() { "holds" } else { "holds no" },
         );
     }
+    // Perps (RPL-3) likewise: state that moves with every perp action, and a state-root domain
+    // (`rand-state-9`) only a chain with the section hashes under.
+    if gs.ledger.perps().is_some() != ledger.perps().is_some() {
+        anyhow::bail!(
+            "the genesis file {} perps section but the database {} perps state",
+            if gs.ledger.perps().is_some() { "has a" } else { "has no" },
+            if ledger.perps().is_some() { "holds" } else { "holds no" },
+        );
+    }
+    // And its genesis section rides in the blob as `cell_fee` does — outside the root, bound by
+    // the genesis hash — so the file's copy is what this node runs on (`verify_chain` names a
+    // blob that differs, and the repair rewrites it).
+    if let (Some(genesis), Some(stored)) = (gs.ledger.perps(), ledger.perps()) {
+        if stored.config != genesis.config {
+            let mut fixed = stored.clone();
+            fixed.config = genesis.config.clone();
+            ledger.set_perps(Some(fixed));
+        }
+    }
     // One field of the blob is not state: `cell_fee` is the genesis parameter, bound into the
     // genesis hash and outside the state root. The file's value is the authority, as for every
     // other genesis parameter this function restores — a stored fee that differed (a damaged
@@ -463,8 +482,14 @@ pub fn check_and_repair_chain(storage: &Storage, gs: &GenesisState, mode: Verify
                 check.head,
                 resume
             );
-            let ledger = if check.genesis_ok { check.ledger } else { gs.ledger.clone() };
+            let (ledger, perp_inputs) =
+                if check.genesis_ok { (check.ledger, check.perp_inputs) } else { (gs.ledger.clone(), Vec::new()) };
             storage.truncate_to(gs, resume, &ledger)?;
+            // RPL-3: the input words of every height no proof covers, as the replay closed them
+            // — a proof above `resume` may have pruned them, and a prover needs them again now.
+            for (height, words) in perp_inputs.iter().filter(|(h, _)| *h <= resume) {
+                storage.put_perp_inputs(*height, words)?;
+            }
             let again = storage.verify_chain(gs, mode, executor)?;
             if let Some(p) = again.problem {
                 anyhow::bail!("chain still corrupt after truncation: {p}");
@@ -3849,7 +3874,9 @@ impl Node {
             // from the peer's copy (which the wire does not carry).
             let deposits = ledger.take_deposits();
             let aggregates = ledger.take_paid_aggregates();
-            accepted.push(CommittedBlock { receipts, deposits, aggregates, ..cb });
+            // RPL-3: and its perp input words, ours too, which `commit` stores beside it.
+            let perp_words = ledger.take_perp_block_words();
+            accepted.push(CommittedBlock { receipts, deposits, aggregates, perp_words, ..cb });
             // The state that belongs with the committed prefix. Verification runs past it — the
             // blocks above are this prefix's own proof — but only what the three-chain rule
             // commits is written, so the ledger written beside it is the one that describes it.
@@ -7314,7 +7341,15 @@ mod tests {
         };
         let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, txs, &ks[0]);
         let hash = block.hash();
-        CommittedBlock { block, pruned: Vec::new(), qc: votes_of(height, hash, ks, votes), receipts: Vec::new(), deposits: Vec::new(), aggregates: Vec::new() }
+        CommittedBlock {
+            block,
+            pruned: Vec::new(),
+            qc: votes_of(height, hash, ks, votes),
+            receipts: Vec::new(),
+            deposits: Vec::new(),
+            aggregates: Vec::new(),
+            perp_words: None,
+        }
     }
 
     fn validators(n: u8) -> Vec<Keypair> {

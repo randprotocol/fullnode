@@ -175,7 +175,15 @@ mod tests {
         };
         let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, vec![], &ks[0]);
         let hash = block.hash();
-        CommittedBlock { block, pruned: Vec::new(), qc: qc(height, hash), receipts: Vec::new(), deposits: Vec::new(), aggregates: Vec::new() }
+        CommittedBlock {
+            block,
+            pruned: Vec::new(),
+            qc: qc(height, hash),
+            receipts: Vec::new(),
+            deposits: Vec::new(),
+            aggregates: Vec::new(),
+            perp_words: None,
+        }
     }
 
     fn chain_8_batch(n: u64) -> SyncResponse {

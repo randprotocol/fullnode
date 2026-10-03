@@ -1618,6 +1618,8 @@ impl HotStuff {
                 // `apply_transactions` clears the list when a block starts.
                 deposits: e.ledger_after.deposits().to_vec(),
                 aggregates: e.ledger_after.paid_aggregates().to_vec(),
+                // And this block's perp input words, which its close left on the same ledger.
+                perp_words: e.ledger_after.perp_block_words(),
             });
         }
         // The first block of an epoch fixes that epoch's set for good: record it while its

@@ -238,6 +238,13 @@ pub struct CommittedBlock {
     /// writes `rand_getAggregate`'s payment facts from it.
     #[serde(skip)]
     pub aggregates: Vec<crate::ledger::aggregation::PaidAggregate>,
+    /// RPL-3: the block's perp input words as the ledger closed them — `(height, words)`, the
+    /// string whose digest `D_height` the next state proof covers — `None` on a chain without
+    /// the `perps` section. `deposits`' twin: never on the wire, filled by whoever executed the
+    /// block, and stored with it in one batch so a provers' word is never missing for a block
+    /// the node holds.
+    #[serde(skip)]
+    pub perp_words: Option<(u64, Vec<u32>)>,
 }
 
 /// The validator sets of the epochs this replica has seen start, keyed by epoch (spec §8).

@@ -186,6 +186,128 @@ fn the_genesis_command_writes_the_program_state_section_when_asked() {
     assert!(!over.exists());
 }
 
+/// RPL-3 from the command line: `--perps <PATH>` reads a `PerpsConfig` JSON file into the
+/// genesis `perps` section, the chain it builds has the perps state at the section's root, and
+/// the section is part of the genesis hash — the default writes none. It stands on the same four
+/// flags RPL-2's does, each refused by name before any file is written; an unreadable or
+/// out-of-bounds config is refused too.
+#[test]
+fn the_genesis_command_writes_the_perps_section_when_asked() {
+    use randprotocol_core::ledger::perps::{MarketSpec, PerpsConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = TokensConfig {
+        registration_fee: 1_000_000_000,
+        tokens: Vec::new(),
+        mint_cap_per_day: 100_000 * 100_000_000,
+        max_tokens: None,
+        burn_registration_fee: None,
+        bound_note_value: None,
+        incremental_root: None,
+    };
+    let cfg_path = dir.path().join("tokens.json");
+    std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
+    let tokens = cfg_path.to_str().unwrap();
+    let section = PerpsConfig {
+        collateral_asset: 0,
+        max_tier: 16,
+        max_window_blocks: 8,
+        engine_hc: [9; 8],
+        genesis_root: [8; 8],
+        markets: vec![MarketSpec {
+            id: 0,
+            symbol: "BTC-PERP".into(),
+            lot: 1_000_000,
+            tick: 1_000,
+            max_leverage: 10,
+            maintenance_bps: 500,
+            taker_fee_bps: 5,
+            maker_fee_bps: 2,
+        }],
+    };
+    let perps_path = dir.path().join("perps.json");
+    std::fs::write(&perps_path, serde_json::to_string_pretty(&section).unwrap()).unwrap();
+    let perps = perps_path.to_str().unwrap();
+    let all = [
+        "--tokens",
+        tokens,
+        "--gas-price",
+        "100",
+        "--bundle-guest",
+        "v3",
+        "--auth-guest",
+        "--hardening-v6",
+        "--max-block-bytes",
+        "8388608",
+    ];
+
+    let plain = dir.path().join("plain.json");
+    let run = genesis(&plain, &all);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let p = read(&plain);
+    assert_eq!(p.perps, None, "no flag, no section");
+    assert!(!std::fs::read_to_string(&plain).unwrap().contains("perps"));
+
+    let with = dir.path().join("with.json");
+    let run = genesis(&with, &[all.as_slice(), &["--perps", perps]].concat());
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let w = read(&with);
+    assert_eq!(w.perps.as_ref(), Some(&section));
+    let executor = randprotocol_node::node::executor_for_profile(&w.fri_profile).unwrap();
+    let state = w.build(executor.as_ref()).unwrap();
+    let p_state = state.ledger.perps().expect("the chain has the perps state");
+    assert_eq!((p_state.proved_root, p_state.proved_height), ([8; 8], 0));
+    randprotocol_node::node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).unwrap();
+    assert_ne!(state.hash(), p.build(executor.as_ref()).unwrap().hash(), "the section is bound by the genesis hash");
+    assert_eq!(printed_hash(&run, "genesis hash "), state.hash().to_hex());
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("perps: 1 market"), "{stdout}");
+
+    // Each flag it stands on, missing one at a time, refused by name; nothing is written.
+    let without = |skip: &str| -> Vec<&str> {
+        let mut args = Vec::new();
+        let mut i = 0;
+        while i < all.len() {
+            if all[i] == skip {
+                i += if all[i].starts_with("--") && i + 1 < all.len() && !all[i + 1].starts_with("--") { 2 } else { 1 };
+                continue;
+            }
+            args.push(all[i]);
+            i += 1;
+        }
+        args
+    };
+    for flag in ["--tokens", "--gas-price", "--hardening-v6", "--auth-guest"] {
+        let mut args = without(flag);
+        if flag == "--auth-guest" {
+            // v3 without the auth guest is refused for its own reason first; drop the guest too.
+            args = without("--auth-guest").into_iter().filter(|a| *a != "--bundle-guest" && *a != "v3").collect();
+        }
+        args.extend(["--perps", perps]);
+        let bad = dir.path().join(format!("bad{}.json", flag.trim_start_matches('-')));
+        let run = genesis(&bad, &args);
+        assert!(!run.status.success(), "{flag}");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(stderr.contains(&format!("--perps needs {flag}")), "{flag}: {stderr}");
+        assert!(!bad.exists(), "{flag}: nothing is written");
+    }
+    // A config the section's own bounds refuse, and one that is not a config at all.
+    let mut over = section.clone();
+    over.max_tier = 11;
+    let over_path = dir.path().join("over-perps.json");
+    std::fs::write(&over_path, serde_json::to_string(&over).unwrap()).unwrap();
+    let out = dir.path().join("over.json");
+    let run = genesis(&out, &[all.as_slice(), &["--perps", over_path.to_str().unwrap()]].concat());
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("max_tier"), "{}", String::from_utf8_lossy(&run.stderr));
+    assert!(!out.exists());
+    let junk_path = dir.path().join("junk.json");
+    std::fs::write(&junk_path, "{\"markets\": 3}").unwrap();
+    let run = genesis(&out, &[all.as_slice(), &["--perps", junk_path.to_str().unwrap()]].concat());
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("--perps"), "{}", String::from_utf8_lossy(&run.stderr));
+    assert!(!out.exists());
+}
+
 /// The genesis hash a `rand-node` run printed (`genesis hash <hex>` or `at genesis <hex>`).
 fn printed_hash(out: &Output, after: &str) -> String {
     let stdout = String::from_utf8_lossy(&out.stdout);

@@ -2157,7 +2157,7 @@ fn certified_chain(
         };
         parent = block.clone();
         parent_view = view;
-        out.push(CommittedBlock { block, pruned: vec![], qc, receipts: vec![], deposits: vec![], aggregates: vec![] });
+        out.push(CommittedBlock { block, pruned: vec![], qc, receipts: vec![], deposits: vec![], aggregates: vec![], perp_words: None });
     }
     out
 }

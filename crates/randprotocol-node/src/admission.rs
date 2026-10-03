@@ -352,6 +352,49 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | T::AmountTooLarge { .. }
         );
     }
+    // RPL-3's verdicts, every variant placed by name (no catch-all: a new one must be placed).
+    // Cacheable are the ones the bytes decide against genesis constants: the section's presence
+    // (`Disabled`, a statement about the chain fixed at genesis), a market id and the tier cap
+    // (`UnknownMarket`, `TierTooHigh`), the action's own fields and lists (`BadOrder`,
+    // `ZeroAmount`, `BadPrice`, `UnorderedPrices`, `UnorderedPayouts`, `TooManyPayouts`,
+    // `AmountTooLarge`, `CollateralAssetMismatch` — the bundle's burn asset against the
+    // section's), `ReservedAccount` (a key whose id is the insurance fund's, forever),
+    // `KeyMismatch` (an account id is its key's hash) and `BadSignature` (over the action's own
+    // message, under the account's key or the oracle's — neither rotates). Everything else reads
+    // state that moves: the nonce windows, the accounts and their cap, the pending withdrawals
+    // and their cap, the validator set, the proved height and its digests — and the proof's
+    // verdict, which is over a segment built from them.
+    if let TxError::Perps(p) = e {
+        use randprotocol_core::ledger::perps::PerpError as P;
+        return match p {
+            P::Disabled
+            | P::UnknownMarket(_)
+            | P::BadOrder(_)
+            | P::BadSignature
+            | P::TooManyPayouts(_)
+            | P::TierTooHigh { .. }
+            | P::UnorderedPayouts
+            | P::BadPrice
+            | P::AmountTooLarge(_)
+            | P::ReservedAccount
+            | P::UnorderedPrices
+            | P::CollateralAssetMismatch
+            | P::KeyMismatch
+            | P::ZeroAmount => true,
+            P::NonceUsed
+            | P::WindowMismatch { .. }
+            | P::MissingDigest(_)
+            | P::UnknownRequest
+            | P::UnknownAccount
+            | P::TooManyWithdrawals
+            | P::TooManyAccounts
+            | P::NotValidator
+            | P::OracleNonce
+            | P::PayoutTooLarge { .. }
+            | P::ProofRefused(_)
+            | P::Overflow => false,
+        };
+    }
     // The Dilithium2 co-signature's verdicts (bridge hardening B3). Every other bridge verdict
     // stays out: a digest's `Replay`, a guardian set's expiry and the registry's listings all move
     // with this node's state. Of the five PQ refusals only the two that are about the list's own
@@ -1100,6 +1143,51 @@ mod tests {
         // Re-inserting a hash already held keeps its place and does not grow the queue.
         s.insert(h(3));
         assert_eq!(s.len(), 3);
+    }
+
+    /// RPL-3: a perp refusal is cached only when it is about the bytes against genesis
+    /// constants — the section's presence, its markets and tier cap, the action's own lists and
+    /// amounts, a signature under a key no action rotates (an account id is its key's hash, an
+    /// oracle's key its address). The nonces, the accounts, the pending withdrawals, the proved
+    /// height and its digests, the validator set and the proof's verdict on a segment built from
+    /// them move with the chain.
+    #[test]
+    fn a_perp_refusal_is_cached_only_when_it_is_about_the_bytes() {
+        use randprotocol_core::ledger::perps::PerpError as P;
+        for e in [
+            P::Disabled,
+            P::UnknownMarket(3),
+            P::BadOrder("size"),
+            P::BadSignature,
+            P::TooManyPayouts(9),
+            P::TierTooHigh { tier: 18, max: 16 },
+            P::UnorderedPayouts,
+            P::BadPrice,
+            P::AmountTooLarge(1 << 63),
+            P::ReservedAccount,
+            P::UnorderedPrices,
+            P::CollateralAssetMismatch,
+            P::KeyMismatch,
+            P::ZeroAmount,
+        ] {
+            assert!(is_permanent(&TxError::Perps(e.clone())), "{e} is a statement about the bytes");
+        }
+        for e in [
+            P::NonceUsed,
+            P::WindowMismatch { from: 0, to: 3, proved: 2, max: 8 },
+            P::MissingDigest(4),
+            P::UnknownRequest,
+            P::UnknownAccount,
+            P::TooManyWithdrawals,
+            P::TooManyAccounts,
+            P::NotValidator,
+            P::OracleNonce,
+            P::PayoutTooLarge { request: "ab".into(), want: 2, have: 1 },
+            P::ProofRefused("outputs".into()),
+            P::Overflow,
+        ] {
+            assert!(!is_permanent(&TxError::Perps(e.clone())), "{e} moves with the chain");
+        }
     }
 
     #[test]

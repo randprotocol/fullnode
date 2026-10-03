@@ -81,7 +81,13 @@ const CF_BRIDGE_SPENT: &str = "bridge_spent";
 /// Burn sequence (big-endian u64) -> `bincode(BridgeBurnRecord)`: the outbound messages
 /// guardians read back, oldest first.
 const CF_BRIDGE_BURNS: &str = "bridge_burns";
-const ALL_CFS: [&str; 17] = [
+/// RPL-3: block height (big-endian u64) -> `bincode(Vec<u32>)`: the perp input words the ledger
+/// closed that block with (`Perps::take_block_words`), whose digest `D_height` the next state
+/// proof covers — what `rand_getPerpInputs` serves a prover. Written in the block's own commit
+/// batch; the rows at or under the proved height go in the batch that commits the proof. Empty
+/// on every chain without a `perps` section.
+const CF_PERP_INPUTS: &str = "perp_inputs";
+const ALL_CFS: [&str; 18] = [
     CF_BLOCKS,
     CF_QCS,
     CF_BLOCK_INDEX,
@@ -99,6 +105,7 @@ const ALL_CFS: [&str; 17] = [
     CF_EPOCH_SETS,
     CF_BRIDGE_SPENT,
     CF_BRIDGE_BURNS,
+    CF_PERP_INPUTS,
 ];
 /// The bridge families, which (unlike notes and anchors) have no per-height key and so are
 /// rewritten wholesale wherever the state is installed rather than appended to.
@@ -265,6 +272,13 @@ const META_VESTING: &str = "vesting";
 /// the register: its maps are keyed by tuples, which JSON cannot hold as object keys. Absent on
 /// every chain without a `program_state` section.
 const META_PROGRAM_STATE: &str = "program_state";
+/// `bincode(Perps)`: the perps state as of the head (RPL-3, `ledger::perps::Perps`) — trading
+/// accounts, the oracle, the proved engine root and the digests no proof has covered yet, with
+/// the two RAND audit counters. `META_PROGRAM_STATE`'s twin in every respect: consensus state
+/// (hashed into the state root under `rand-state-9`), written at the same three sites,
+/// replay-audited, bincode (the transient per-block fields are `#[serde(skip)]`). Absent on
+/// every chain without a `perps` section.
+const META_PERPS: &str = "perps";
 /// `bincode(BTreeMap<Address, AggregatorEntry>)`: the aggregator register as of the head.
 /// `META_SUPPLY`'s twin in kind — derived, replay-audited — but unlike the bucket this one is
 /// hashed into the state root, so a restarted node that lost it would fork at the next block.
@@ -761,6 +775,18 @@ pub fn derived_note_count(tx: &randprotocol_core::Transaction) -> usize {
         // RPL-2: one note per payout, which `created_notes` rebuilds above — the one action that
         // derives more than one. A count of the transition's own lists, nothing decoded.
         Action::Invoke { transition, .. } => transition.pays.len() + transition.mints.len(),
+        // RPL-3: one note per payout of a positive amount, which the ledger appends as a
+        // `Deposit` right after the (bundle-less) proof — every payout's request is pending on
+        // a committed proof, so each such payout is a note. A list over the cap derives nothing
+        // (`validate` refuses it), as `payout_commitments` caps it. One edge is not counted: a
+        // payout whose note the tree already holds (identical recipient, amount, time and `r`
+        // to an earlier payout's) is skipped by the ledger, and attribution then slides by one.
+        Action::PerpStateProof { payouts, .. }
+            if payouts.len() > randprotocol_core::ledger::perps::MAX_PERP_PAYOUTS =>
+        {
+            0
+        }
+        Action::PerpStateProof { payouts, .. } => payouts.iter().filter(|p| p.amount > 0).count(),
         _ => 0,
     }
 }
@@ -1062,6 +1088,7 @@ impl Storage {
         }
         self.put_vesting(&mut batch, gs.ledger.vesting())?;
         self.put_program_state(&mut batch, gs.ledger.program_state())?;
+        self.put_perps(&mut batch, gs.ledger.perps())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
@@ -1658,6 +1685,87 @@ impl Storage {
         Ok(())
     }
 
+    /// The perps state as of the head (RPL-3), `None` on a chain without the section.
+    pub fn perps(&self) -> Result<Option<randprotocol_core::ledger::perps::Perps>> {
+        self.get_meta_raw(META_PERPS)?
+            .map(|b| bincode::deserialize(&b).map_err(|e| StorageError::Corrupt(format!("perps state: {e}"))))
+            .transpose()
+    }
+
+    /// Write it beside the rest of the head's state — present when the chain has the section,
+    /// deleted otherwise (`put_program_state`'s rule).
+    fn put_perps(&self, batch: &mut WriteBatch, p: Option<&randprotocol_core::ledger::perps::Perps>) -> Result<()> {
+        match p {
+            Some(p) => batch.put_cf(self.cf(CF_META), META_PERPS, bincode::serialize(p)?),
+            None => batch.delete_cf(self.cf(CF_META), META_PERPS),
+        }
+        Ok(())
+    }
+
+    /// The perp input words block `height` closed with (RPL-3), `None` for a height this store
+    /// holds no row for: one a state proof has covered (pruned), one above the head, or any
+    /// height of a chain without the section.
+    pub fn perp_inputs(&self, height: u64) -> Result<Option<Vec<u32>>> {
+        self.db
+            .get_cf(self.cf(CF_PERP_INPUTS), height_key(height))?
+            .map(|b| {
+                bincode::deserialize(&b).map_err(|e| StorageError::Corrupt(format!("perp inputs at {height}: {e}")))
+            })
+            .transpose()
+    }
+
+    /// Store block `height`'s words on their own, fsynced — the repair's path
+    /// (`check_and_repair_chain` putting back what the replay re-derived). A committed block's
+    /// words go in its own commit batch instead.
+    pub fn put_perp_inputs(&self, height: u64, words: &[u32]) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        batch.put_cf(self.cf(CF_PERP_INPUTS), height_key(height), bincode::serialize(words)?);
+        self.db.write_opt(batch, &sync_opts())?;
+        Ok(())
+    }
+
+    /// Delete every row at or under `upto`, fsynced: the heights a state proof has covered,
+    /// which no prover needs again.
+    pub fn prune_perp_inputs(&self, upto: u64) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        self.stage_prune_perp_inputs(&mut batch, upto)?;
+        self.db.write_opt(batch, &sync_opts())?;
+        Ok(())
+    }
+
+    /// [`Self::prune_perp_inputs`] into `batch`. The family holds only the heights above the
+    /// proved one (at most a few windows), so the scan from the start is short.
+    fn stage_prune_perp_inputs(&self, batch: &mut WriteBatch, upto: u64) -> Result<()> {
+        for item in self.db.iterator_cf(self.cf(CF_PERP_INPUTS), IteratorMode::Start) {
+            let (k, _) = item?;
+            if be_u64(k.as_ref(), "perp inputs key")? > upto {
+                break;
+            }
+            batch.delete_cf(self.cf(CF_PERP_INPUTS), k);
+        }
+        Ok(())
+    }
+
+    /// The first replayed height whose stored row is missing or differs from `replayed`'s words
+    /// (`verify_chain`), as the problem to report.
+    fn perp_inputs_problem(&self, replayed: &[(u64, Vec<u32>)]) -> Option<String> {
+        for (h, words) in replayed {
+            match self.perp_inputs(*h) {
+                Ok(Some(stored)) if stored == *words => {}
+                Ok(Some(_)) => {
+                    return Some(format!("stored perp input words at height {h} do not match the replayed chain's"))
+                }
+                Ok(None) => {
+                    return Some(format!(
+                        "stored perp input words at height {h} are missing; the replayed chain has them"
+                    ))
+                }
+                Err(e) => return Some(format!("perp input words at height {h} unreadable: {e}")),
+            }
+        }
+        None
+    }
+
     /// Σ of the registration fees burned under `tokens.burn_registration_fee` as of the head
     /// (audit v5, TOK-2) — `supply()`'s twin, with the same rule for a database written before
     /// the key existed: 0, which on a chain without the gate is also the only value it holds.
@@ -1923,7 +2031,7 @@ impl Storage {
         }
         // `deposits` stays empty: this is how a block is served to a peer, and the peer
         // recomputes them by applying the block itself.
-        Ok(Some(CommittedBlock { block, pruned: Vec::new(), qc, receipts, deposits: Vec::new(), aggregates: Vec::new() }))
+        Ok(Some(CommittedBlock { block, pruned: Vec::new(), qc, receipts, deposits: Vec::new(), aggregates: Vec::new(), perp_words: None }))
     }
 
     pub fn height_by_hash(&self, h: &Hash) -> Result<Option<u64>> {
@@ -2630,6 +2738,7 @@ impl Storage {
         }
         ledger.set_vesting(self.vesting()?);
         ledger.set_program_state(self.program_state()?);
+        ledger.set_perps(self.perps()?);
         ledger.set_unsealed_fees(self.unsealed_fees()?);
         ledger.set_aggregators(self.aggregators()?);
         ledger.set_retired_aggregator_nonces(self.retired_aggregator_nonces()?);
@@ -2870,6 +2979,24 @@ impl Storage {
                 batch.put_cf(self.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(r)?);
                 batch.put_cf(self.cf(CF_RECEIPTS_BY_PROGRAM), receipt_index_key(&r.program, r.height, r.index), r.tx.as_bytes());
             }
+            // RPL-3: the block's perp input words, in the same batch as the block — a crash
+            // cannot leave a perps block stored without the words a prover needs for it. On a
+            // perps chain every block closes its inputs, so a block without them (or with another
+            // height's) is not the block this ledger describes.
+            match (&cb.perp_words, ledger_after.perps()) {
+                (Some((h, words)), Some(_)) if *h == block.height() => {
+                    batch.put_cf(self.cf(CF_PERP_INPUTS), hk, bincode::serialize(words)?);
+                }
+                (None, None) => {}
+                (words, _) => {
+                    return Err(StorageError::Corrupt(format!(
+                        "block {} carries perp input words for height {:?} on a chain {} the perps section",
+                        block.height(),
+                        words.as_ref().map(|(h, _)| *h),
+                        if ledger_after.perps().is_some() { "with" } else { "without" }
+                    )));
+                }
+            }
             touched.insert(block.proposer());
             for tx in &block.transactions {
                 match &tx.action {
@@ -2992,6 +3119,18 @@ impl Storage {
         }
         self.put_vesting(&mut batch, ledger_after.vesting())?;
         self.put_program_state(&mut batch, ledger_after.program_state())?;
+        self.put_perps(&mut batch, ledger_after.perps())?;
+        // A state proof among these blocks moved the proved height: the rows it covered go in
+        // the same batch (after the puts above, so a covered block of this very commit goes too).
+        if let Some(p) = ledger_after.perps() {
+            if blocks
+                .iter()
+                .flat_map(|cb| cb.block.transactions.iter())
+                .any(|tx| matches!(tx.action, Action::PerpStateProof { .. }))
+            {
+                self.stage_prune_perp_inputs(&mut batch, p.proved_height)?;
+            }
+        }
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
         self.stage_retired_aggregator_nonces(&mut batch, ledger_after)?;
@@ -3225,6 +3364,11 @@ pub struct ChainCheck {
     /// The store's retention floor (history pruning spec §3): 0 on an archive. Above 0 the
     /// check was structural from this height and `ledger` is the trusted snapshot.
     pub floor: u64,
+    /// RPL-3: the perp input words the replay re-derived for every height of `0..=last_good`
+    /// no state proof has covered, ascending — what the repair puts back after `truncate_to`
+    /// (a proof above the new head may have pruned them). Empty without the section and on a
+    /// pruned store, which replays nothing.
+    pub perp_inputs: Vec<(u64, Vec<u32>)>,
 }
 
 impl ChainCheck {
@@ -3251,7 +3395,15 @@ impl Storage {
             _ => 0,
         };
         let mut ledger = gs.ledger.clone();
-        let mut check = ChainCheck { head, last_good: 0, problem: None, ledger: ledger.clone(), genesis_ok: true, floor: 0 };
+        let mut check = ChainCheck {
+            head,
+            last_good: 0,
+            problem: None,
+            ledger: ledger.clone(),
+            genesis_ok: true,
+            floor: 0,
+            perp_inputs: Vec::new(),
+        };
         let floor = self.prune_floor()?;
         check.floor = floor;
 
@@ -3309,6 +3461,8 @@ impl Storage {
         // A block's certificate is its child's `justify` (audit v5, OPS-4), so the child is read
         // one height early and carried into the next iteration: one decode per block, not two.
         let mut carried: Option<Block> = None;
+        // RPL-3: the words each replayed block closed with, kept while no proof covers them.
+        let mut perp_inputs: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
         for h in 1..=head {
             let problem = (|| -> std::result::Result<(), String> {
                 // A block at the first height of an epoch fixes that epoch's set, from the
@@ -3468,6 +3622,13 @@ impl Storage {
                     }
                 }
                 ledger = next;
+                if let Some((closed, words)) = ledger.take_perp_block_words() {
+                    perp_inputs.insert(closed, words);
+                }
+                if let Some(p) = ledger.perps() {
+                    let proved = p.proved_height;
+                    perp_inputs.retain(|h, _| *h > proved);
+                }
                 prev_hash = hash;
                 Ok(())
             })();
@@ -3475,10 +3636,13 @@ impl Storage {
                 check.problem = Some(p);
                 check.last_good = h - 1;
                 check.ledger = ledger;
+                check.perp_inputs = perp_inputs.into_iter().collect();
                 return Ok(check);
             }
         }
         check.last_good = head;
+        let perp_inputs: Vec<(u64, Vec<u32>)> = perp_inputs.into_iter().collect();
+        let inputs_problem = self.perp_inputs_problem(&perp_inputs);
         // The snapshot families must match the replayed chain. `Ledger`'s equality covers the
         // tree, the commitment and nullifier sets, the anchors, the validators and the programs
         // — everything these families hold.
@@ -3559,6 +3723,12 @@ impl Storage {
             Ok(stored) if stored.program_state() != ledger.program_state() => {
                 check.problem = Some("stored program state does not match the replayed chain's".into())
             }
+            // Perps (RPL-3) likewise: inside the equality, hashed under its section
+            // (`rand-state-9`), named so the repair knows the key. The genesis section rides in
+            // the blob and is compared with it, as `cell_fee` is.
+            Ok(stored) if stored.perps() != ledger.perps() => {
+                check.problem = Some("stored perps state does not match the replayed chain's".into())
+            }
             // The supply counters are outside `Ledger`'s equality (nothing hashes them), so they
             // are audited here explicitly: this is the replay the RPC's numbers are worth.
             Ok(stored) if same && stored.supply() != ledger.supply() => {
@@ -3596,11 +3766,15 @@ impl Storage {
                     ledger.unsealed_fees()
                 ))
             }
+            // RPL-3: every height no proof covers has its input row, as the replay closed it —
+            // not state, but what a prover cannot do without. The repair puts them back.
+            Ok(_) if same && inputs_problem.is_some() => check.problem = inputs_problem,
             Ok(_) if same => {}
             Ok(_) => check.problem = Some("state snapshot does not match replayed chain".into()),
             Err(e) => check.problem = Some(format!("state snapshot unreadable: {e}")),
         }
         check.ledger = ledger;
+        check.perp_inputs = perp_inputs;
         Ok(check)
     }
 
@@ -3831,6 +4005,17 @@ impl Storage {
         }
         self.put_vesting(&mut batch, ledger.vesting())?;
         self.put_program_state(&mut batch, ledger.program_state())?;
+        // RPL-3: the section as replayed, and no input row above the new head. The rows at or
+        // under it stay; any a proof above `height` had pruned are the repair's to put back
+        // (`ChainCheck::perp_inputs`).
+        self.put_perps(&mut batch, ledger.perps())?;
+        for item in self.db.iterator_cf(
+            self.cf(CF_PERP_INPUTS),
+            IteratorMode::From(&height_key(height.saturating_add(1)), rocksdb::Direction::Forward),
+        ) {
+            let (k, _) = item?;
+            batch.delete_cf(self.cf(CF_PERP_INPUTS), k);
+        }
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
         self.stage_retired_aggregator_nonces(&mut batch, ledger)?;
@@ -4738,6 +4923,144 @@ pub(crate) mod fixtures {
         (dir, s, gs, ledger, b1)
     }
 
+    // ---- RPL-3: a chain with the `perps` section, and the transactions it admits ----
+
+    /// The RPL-3 fixture chain's genesis section: one market, the stub's engine commitment
+    /// [`PERPS_ENGINE`], an arbitrary genesis root.
+    pub(crate) const PERPS_ENGINE: Word8 = [31; 8];
+    pub(crate) fn perps_config() -> randprotocol_core::ledger::perps::PerpsConfig {
+        randprotocol_core::ledger::perps::PerpsConfig {
+            collateral_asset: 0,
+            max_tier: 16,
+            max_window_blocks: 8,
+            engine_hc: PERPS_ENGINE,
+            genesis_root: [32; 8],
+            markets: vec![randprotocol_core::ledger::perps::MarketSpec {
+                id: 0,
+                symbol: "BTC-PERP".into(),
+                lot: 1_000_000,
+                tick: 1_000,
+                max_leverage: 10,
+                maintenance_bps: 500,
+                taker_fee_bps: 5,
+                maker_fee_bps: 2,
+            }],
+        }
+    }
+
+    /// [`rpl2_genesis_file`] with the `perps` section in place of `program_state`: everything
+    /// the section stands on (`tokens`, `gas`, `hardening_v6`, `hc_auth`) is already there.
+    pub(crate) fn perps_genesis_file(chain_id: u64) -> Genesis {
+        let mut g = rpl2_genesis_file(chain_id);
+        g.program_state = None;
+        g.perps = Some(perps_config());
+        g
+    }
+
+    pub(crate) fn perps_genesis(chain_id: u64) -> GenesisState {
+        perps_genesis_file(chain_id).build(&StubExecutor).unwrap()
+    }
+
+    /// [`make_block`] with the block-end steps `apply_block` runs (`Ledger::close_block`), which
+    /// a perps chain needs: the close records the block's digest and leaves its input words on
+    /// the ledger, where [`make_block_unchecked`] picks them up as the block's `perp_words`.
+    pub(crate) fn make_perps_block(
+        parent: &impl FixtureParent,
+        ledger: &mut Ledger,
+        txs: Vec<Transaction>,
+        k: &Keypair,
+    ) -> CommittedBlock {
+        let height = parent.parent_block().height() + 1;
+        ledger.set_height(height);
+        ledger.set_timestamp_ms(height);
+        ledger.apply_transactions(&txs, &k.address(), &StubExecutor).unwrap();
+        ledger.close_block(height, &k.address(), 0, 0, &StubExecutor);
+        make_block_unchecked(parent, ledger, txs, k)
+    }
+
+    /// A `PerpDeposit` of `amount` RAND units for `k`'s account, burned through a v3 bundle.
+    pub(crate) fn perp_deposit_tx(ledger: &Ledger, k: &Keypair, seed: u32, amount: u64) -> Transaction {
+        let action = Action::PerpDeposit { trading_key: k.public_key().clone() };
+        StubExecutor::bound(Transaction::shielded(
+            ledger.chain_id(),
+            v3_bundle(ledger, seed, RPL2_FEE, (amount, 0, 0)),
+            action,
+        ))
+    }
+
+    /// A signed perp action, bundle-less: `k` signs [`Transaction::perp_sign_message`].
+    pub(crate) fn perp_signed(chain_id: u64, k: &Keypair, mut action: Action) -> Transaction {
+        let msg = Transaction::perp_sign_message(chain_id, &action).expect("a signed perp action");
+        let sig = k.sign(msg.as_bytes());
+        match &mut action {
+            Action::PerpOrder { signature, .. }
+            | Action::PerpCancel { signature, .. }
+            | Action::PerpWithdraw { signature, .. }
+            | Action::PerpOracle { signature, .. } => *signature = sig,
+            other => panic!("not a signed perp action: {other:?}"),
+        }
+        Transaction { chain_id, bundle: None, action }
+    }
+
+    /// A withdrawal request of `amount` from `k`'s account to [`recipient`], at `time`.
+    pub(crate) fn perp_withdraw_tx(chain_id: u64, k: &Keypair, nonce: u64, amount: u64, time: u32) -> Transaction {
+        let account = randprotocol_core::ledger::perps::account_id(k.public_key());
+        let action = Action::PerpWithdraw {
+            account,
+            nonce,
+            amount,
+            recipient: recipient(),
+            r: [5; 8],
+            time,
+            envelope: env(0x55),
+            signature: randprotocol_core::Signature::empty(),
+        };
+        perp_signed(chain_id, k, action)
+    }
+
+    /// Validator `k`'s oracle price for market 0.
+    pub(crate) fn perp_oracle_tx(chain_id: u64, k: &Keypair, price: u64, nonce: u64) -> Transaction {
+        let prices = vec![randprotocol_core::ledger::perps::PerpPrice { market: 0, price }];
+        let action = Action::PerpOracle {
+            validator: k.public_key().clone(),
+            prices,
+            nonce,
+            signature: randprotocol_core::Signature::empty(),
+        };
+        perp_signed(chain_id, k, action)
+    }
+
+    /// A state proof of `proved_height ..= to` on `ledger` the stub accepts: tier 16, the
+    /// engine's honest outputs, `payouts` and `fees` as given.
+    pub(crate) fn perp_state_proof_tx(
+        ledger: &Ledger,
+        to: u64,
+        new_root: Word8,
+        payouts: Vec<randprotocol_core::ledger::perps::PerpPayout>,
+        fees: u64,
+    ) -> Transaction {
+        use randprotocol_core::ledger::perps::{payouts_digest, state_proof_segment, PERP_VERSION};
+        let p = ledger.perps().expect("a perps chain");
+        let from = p.proved_height;
+        let digests: Vec<Word8> = (from + 1..=to).map(|h| p.digest(h).expect("a closed height")).collect();
+        let seg = state_proof_segment(
+            from,
+            to,
+            &p.proved_root,
+            &new_root,
+            &payouts_digest(&StubExecutor, &payouts),
+            fees,
+            &digests,
+        );
+        let outs = [PERP_VERSION, (to - from) as u32, 0, 0, 0, payouts.len() as u32, 0, 0];
+        let proof = StubExecutor::make_perp_proof(&p.config.engine_hc, 16, outs, &seg);
+        Transaction {
+            chain_id: ledger.chain_id(),
+            bundle: None,
+            action: Action::PerpStateProof { from_height: from, to_height: to, new_root, payouts, fees, proof },
+        }
+    }
+
     /// A bundle-less `Withdraw` signed by `v` (ruling B of S2 task 3): it pays a note worth
     /// `amount - BUNDLE_BASE` to the register's payout address at `time`, and the base to the
     /// proposer of whichever block applies it.
@@ -4973,7 +5296,15 @@ pub(crate) mod fixtures {
         };
         let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, txs, k);
         let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![] };
-        CommittedBlock { block, pruned: Vec::new(), qc, receipts: Vec::new(), deposits: ledger.deposits().to_vec(), aggregates: ledger.paid_aggregates().to_vec() }
+        CommittedBlock {
+            block,
+            pruned: Vec::new(),
+            qc,
+            receipts: Vec::new(),
+            deposits: ledger.deposits().to_vec(),
+            aggregates: ledger.paid_aggregates().to_vec(),
+            perp_words: ledger.perp_block_words(),
+        }
     }
 
     /// `n` blocks, each carrying one bundle that spends a fresh pair of nullifiers.
@@ -5931,7 +6262,15 @@ mod tests {
             ledger.close_block(height, &key(1).address(), 0, 0, &StubExecutor);
             make_block_unchecked_at(parent, ledger, txs, &key(1), at_ms)
         };
-        let genesis_block = CommittedBlock { block: gs.block.clone(), pruned: Vec::new(), qc: QuorumCertificate::genesis(gs.block.hash()), receipts: Vec::new(), deposits: Vec::new(), aggregates: Vec::new() };
+        let genesis_block = CommittedBlock {
+            block: gs.block.clone(),
+            pruned: Vec::new(),
+            qc: QuorumCertificate::genesis(gs.block.hash()),
+            receipts: Vec::new(),
+            deposits: Vec::new(),
+            aggregates: Vec::new(),
+            perp_words: None,
+        };
         // Block 1 at 50 s (a bridged chain steps at most 60 s a block): the rotation lands,
         // pending until 150 s.
         let m = randprotocol_core::bridge::gov::rotate_pq_message(ledger.chain_id(), 0, &new_pks);
@@ -7736,11 +8075,15 @@ mod tests {
 
     /// The column families a pre-v0.3 build opens with: `ALL_CFS` without
     /// `receipts_by_program` — and without `program_public`, which arrived later still (the call
-    /// limits, on a fresh chain, so no database ever needs rolling back across it). Exactly the
-    /// list the build the fleet rolls back to passes RocksDB.
+    /// limits, on a fresh chain, so no database ever needs rolling back across it), nor RPL-3's
+    /// `perp_inputs` (the perps chain is a fresh chain too). Exactly the list the build the fleet
+    /// rolls back to passes RocksDB.
     fn pre_v03_cfs() -> Vec<&'static str> {
-        let cfs: Vec<&str> =
-            ALL_CFS.iter().copied().filter(|c| *c != CF_RECEIPTS_BY_PROGRAM && *c != CF_PROGRAM_PUBLIC).collect();
+        let cfs: Vec<&str> = ALL_CFS
+            .iter()
+            .copied()
+            .filter(|c| *c != CF_RECEIPTS_BY_PROGRAM && *c != CF_PROGRAM_PUBLIC && *c != CF_PERP_INPUTS)
+            .collect();
         assert_eq!(cfs.len(), 15);
         cfs
     }
@@ -7800,13 +8143,14 @@ mod tests {
         {
             // A v0.3 database, as `Storage::open` wrote it before `program_public` existed: the
             // rollback this command serves is v0.3 to pre-v0.3, and a database with the call
-            // limits' family belongs to a later chain no pre-v0.3 build could follow anyway.
+            // limits' family belongs to a later chain no pre-v0.3 build could follow anyway (as
+            // does one with RPL-3's `perp_inputs`).
             let mut opts = Options::default();
             opts.create_if_missing(true);
             opts.create_missing_column_families(true);
             let cfs = ALL_CFS
                 .iter()
-                .filter(|c| **c != CF_PROGRAM_PUBLIC)
+                .filter(|c| **c != CF_PROGRAM_PUBLIC && **c != CF_PERP_INPUTS)
                 .map(|n| ColumnFamilyDescriptor::new(*n, Options::default()));
             let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX), seal_rows_examined: Default::default(), token_rows: Default::default(), token_rows_written: Default::default() };
             st.backfill_receipts_index().unwrap();
@@ -8518,6 +8862,146 @@ mod tests {
         plain.init_genesis(&plain_gs).unwrap();
         assert_eq!(plain.program_state().unwrap(), None);
         assert!(plain.get_meta_raw(META_PROGRAM_STATE).unwrap().is_none());
+    }
+
+    /// RPL-3: the perps state is consensus state like RPL-2's, so it is committed beside the
+    /// rest of the head's state, restored by `load_ledger`, named by `verify_chain` when stale and
+    /// rewritten by the repair; a node whose database and genesis file disagree about having it
+    /// refuses to start. Each block's perp input words are stored in the same batch as the block
+    /// (`perp_inputs`, keyed by height), their digest the one the ledger recorded; a committed
+    /// state proof prunes every row at or under its height; `truncate_to` drops the rows above
+    /// its height; and the repair puts back what the replay can re-derive — the words of every
+    /// height no proof covers — so a truncation below a proof leaves no prover without its input.
+    #[test]
+    fn perps_are_persisted_restored_and_truncated() {
+        use randprotocol_core::ledger::perps::{self, PerpPayout};
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = perps_genesis(7);
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.perps().unwrap().as_ref(), gs.ledger.perps(), "written with genesis");
+        assert!(s.perps().unwrap().is_some());
+
+        // Block 1: a deposit and an oracle price. Blocks 2 and 3, committed together: a
+        // withdrawal request, then nothing (a block closes its inputs whatever it holds).
+        let trader = key(50);
+        let mut ledger = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&ledger, &trader, 300, 5_000_000);
+        let oracle = perp_oracle_tx(7, &key(1), 1_000_000, 1);
+        let b1 = make_perps_block(&gs.block, &mut ledger, vec![deposit, oracle], &key(1));
+        let (h1, w1) = b1.perp_words.clone().expect("a perps block carries its words");
+        assert_eq!(h1, 1);
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.perp_inputs(1).unwrap().as_ref(), Some(&w1));
+        assert_eq!(
+            perps::perp_digest(&StubExecutor, perps::domain::BLOCK, &w1),
+            ledger.perps().unwrap().digest(1).unwrap()
+        );
+        assert_eq!(s.perps().unwrap().as_ref(), ledger.perps());
+
+        let withdraw = perp_withdraw_tx(7, &trader, 1, 2_000_000, 1);
+        let request = word8_from_bytes(withdraw.hash().as_bytes()).unwrap();
+        let b2 = make_perps_block(&b1, &mut ledger, vec![withdraw], &key(1));
+        let at2 = ledger.clone();
+        let b3 = make_perps_block(&b2, &mut ledger, vec![], &key(1));
+        let (w2, w3) = (b2.perp_words.clone().unwrap().1, b3.perp_words.clone().unwrap().1);
+        s.commit(&[b2.clone(), b3.clone()], &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.perp_inputs(2).unwrap().as_ref(), Some(&w2));
+        assert_eq!(s.perp_inputs(3).unwrap().as_ref(), Some(&w3));
+        assert_eq!(s.perp_inputs(4).unwrap(), None);
+        assert!(s.perps().unwrap().unwrap().withdrawal(&request).is_some());
+
+        // A block of a perps chain without its words, or with another height's, is refused.
+        let mut probe = ledger.clone();
+        let mut torn = make_perps_block(&b3, &mut probe, vec![], &key(1));
+        torn.perp_words = None;
+        assert!(s.commit(std::slice::from_ref(&torn), &probe, &[], &StubExecutor).is_err());
+        torn.perp_words = Some((3, w3.clone()));
+        assert!(s.commit(std::slice::from_ref(&torn), &probe, &[], &StubExecutor).is_err());
+
+        // Block 4: a state proof of 0..=3 that pays the request in part. Its rows at or under 3
+        // go; block 4's own stays, the one height a next proof covers.
+        let proof = perp_state_proof_tx(&ledger, 3, [77; 8], vec![PerpPayout { request, amount: 1_500_000 }], 10);
+        let first = ledger.next_index();
+        let b4 = make_perps_block(&b3, &mut ledger, vec![proof], &key(1));
+        assert_eq!(b4.deposits.len(), 1, "the payout note is a ledger deposit");
+        let w4 = b4.perp_words.clone().unwrap().1;
+        s.commit(std::slice::from_ref(&b4), &ledger, &[], &StubExecutor).unwrap();
+        let stored = s.perps().unwrap().unwrap();
+        assert_eq!((stored.proved_height, stored.proved_root, stored.pending_heights()), (3, [77; 8], vec![4]));
+        assert_eq!(stored.withdrawal(&request), None, "paid");
+        for h in 1..=3 {
+            assert_eq!(s.perp_inputs(h).unwrap(), None, "height {h} is proved: pruned");
+        }
+        assert_eq!(s.perp_inputs(4).unwrap().as_ref(), Some(&w4));
+        let rows = s.notes_in_heights(4, 4, usize::MAX).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].0, rows[0].1.cm), (first, b4.deposits[0].cm));
+
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.perps(), ledger.perps());
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(reloaded, ledger);
+        assert!(reloaded.audit().invariant_holds(), "{:?}", reloaded.audit());
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A lost row of a height no proof covers is named, and the repair puts it back.
+        s.db.delete_cf(s.cf(CF_PERP_INPUTS), height_key(4)).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(check.problem.expect("a lost input row is a problem").contains("perp input"));
+        assert_eq!(crate::node::check_and_repair_chain(&s, &gs, VerifyMode::Quick, &StubExecutor).unwrap(), 4);
+        assert_eq!(s.perp_inputs(4).unwrap().as_ref(), Some(&w4));
+
+        // A stale blob (the genesis one) is named, and repaired from replay.
+        let put = |p: &perps::Perps| s.db.put_cf(s.cf(CF_META), META_PERPS, bincode::serialize(p).unwrap()).unwrap();
+        put(gs.ledger.perps().unwrap());
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(check.problem.as_deref().unwrap().contains("perps"), "{:?}", check.problem);
+        assert_eq!(check.last_good, 4, "the blocks themselves are fine");
+        s.truncate_to(&gs, 4, &check.ledger).unwrap();
+        assert_eq!(s.perps().unwrap().as_ref(), ledger.perps());
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // Truncating to 2 rewinds the section and drops the rows above 2. Rows 1 and 2 went with
+        // the proof, so the store now lacks words the replay has: named, and the repair (which
+        // truncates to the same height) restores them.
+        s.truncate_to(&gs, 2, &at2).unwrap();
+        assert_eq!(s.perps().unwrap().as_ref(), at2.perps());
+        assert_eq!(s.perp_inputs(3).unwrap(), None);
+        assert_eq!(s.perp_inputs(4).unwrap(), None);
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(check.problem.expect("the proved rows are gone").contains("perp input"));
+        assert_eq!(crate::node::check_and_repair_chain(&s, &gs, VerifyMode::Quick, &StubExecutor).unwrap(), 2);
+        assert_eq!(s.perp_inputs(1).unwrap().as_ref(), Some(&w1));
+        assert_eq!(s.perp_inputs(2).unwrap().as_ref(), Some(&w2));
+        assert_eq!(s.perps().unwrap().as_ref(), at2.perps());
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // `prune_perp_inputs` on its own: every row at or under the height goes.
+        s.prune_perp_inputs(1).unwrap();
+        assert_eq!((s.perp_inputs(1).unwrap(), s.perp_inputs(2).unwrap().as_ref()), (None, Some(&w2)));
+        s.put_perp_inputs(1, &w1).unwrap();
+        assert_eq!(s.perp_inputs(1).unwrap().as_ref(), Some(&w1));
+
+        // A database without the blob under a genesis with the section: refuse to start. And the
+        // other way round.
+        s.db.delete_cf(s.cf(CF_META), META_PERPS).unwrap();
+        let err = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap_err().to_string();
+        assert!(err.contains("has a perps section but the database holds no perps state"), "{err}");
+        put(at2.perps().unwrap());
+        let mut without = perps_genesis_file(7);
+        without.perps = None;
+        let err = crate::node::reload_ledger(&s, &without.build(&StubExecutor).unwrap(), &StubExecutor)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no perps section but the database holds perps state"), "{err}");
+
+        // A chain without the section never gains the key or a row.
+        let (_d2, plain, plain_gs) = genesis_with_two_notes();
+        plain.init_genesis(&plain_gs).unwrap();
+        assert_eq!(plain.perps().unwrap(), None);
+        assert!(plain.get_meta_raw(META_PERPS).unwrap().is_none());
+        assert_eq!(plain.db.iterator_cf(plain.cf(CF_PERP_INPUTS), IteratorMode::Start).count(), 0);
     }
 
     /// The v4 re-review's bond queue is consensus state under a `staking` section, so — like

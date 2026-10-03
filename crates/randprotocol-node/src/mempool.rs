@@ -1050,6 +1050,12 @@ impl Mempool {
         // than be offered to, and fail, every block until its anchor scrolls out. The ledger's
         // own rules, asked through its own function: map lookups and compares, no hash.
         randprotocol_core::ledger::program_state::still_applies(ledger, tx)?;
+        // RPL-3: a perp action goes stale the same way — its nonce used by a sibling that
+        // committed first, its account's or validator's slot moved, a withdrawal's time out of
+        // the window, a state proof's window no longer starting at the proved height or a
+        // payout's request already paid. The ledger's own rules again, minus the signature and
+        // the proof: map lookups and compares.
+        randprotocol_core::ledger::perps::still_applies(ledger, tx)?;
         let nullifiers = tx.nullifiers();
         if let Some(nf) = nullifiers.iter().find(|nf| ledger.is_spent(nf)) {
             return Err(TxError::Spent(*nf));
@@ -3485,6 +3491,38 @@ mod tests {
         assert_eq!(m.candidates(&after, 10), vec![], "never offered again");
         m.prune(&after);
         assert!(m.is_empty(), "the stale invoke left the pool at the tip that made it stale");
+    }
+
+    // ---------------------------------- RPL-3: perp actions
+
+    /// Two withdrawal requests on one nonce of one account are both valid at the tip, so both
+    /// are held; once one is mined the other's nonce is used, and it leaves at the prune with the
+    /// ledger's own verdict — not cached, since the nonce is state.
+    #[test]
+    fn a_perp_action_whose_nonce_a_sibling_used_is_pruned() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx, perp_withdraw_tx};
+        use randprotocol_core::ledger::perps::PerpError;
+        let gs = fixtures::perps_genesis(7);
+        let mut l = gs.ledger.clone();
+        let trader = key(50);
+        let deposit = perp_deposit_tx(&l, &trader, 300, 5_000_000);
+        make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
+        let a = perp_withdraw_tx(7, &trader, 1, 1_000, 1);
+        let b = perp_withdraw_tx(7, &trader, 1, 2_000, 1);
+        let mut m = Mempool::new(100);
+        for tx in [&a, &b] {
+            m.insert(tx.clone(), &l, &StubExecutor).unwrap();
+        }
+        assert_eq!(m.len(), 2);
+        let mut after = l.clone();
+        after.apply_transactions(std::slice::from_ref(&a), &key(1).address(), &StubExecutor).unwrap();
+        m.remove(&[a.hash()]);
+        let used = TxError::Perps(PerpError::NonceUsed);
+        assert_eq!(Mempool::applies(&b, &b.commitments(), None, &after).unwrap_err(), used);
+        assert!(!crate::admission::is_permanent(&used));
+        assert_eq!(m.candidates(&after, 10), vec![], "never offered again");
+        m.prune(&after);
+        assert!(m.is_empty(), "the stale request left the pool at the tip that made it stale");
     }
 
     /// An invoke's payout notes are leaves like any other: the pool claims them (through
