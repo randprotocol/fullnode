@@ -115,6 +115,7 @@ Signature lines are `index:hex`, whitespace- or newline-separated, `#` comments 
 | `--binding-domain <0\|1>` | none — no field | audit v6, BIND-1: `1` binds the genesis hash into every transaction binding (`rand-tx-bind-2`, `rand-call-bind-2`) and every signed action message (a faucet mint, unbond, withdraw, the RPL token messages, the aggregator actions, the bridge governance messages), so a proof or a signature for this chain verifies on no other chain that shares its chain id. Tagged and appended to the genesis hash after the `gas` section, only when present; omitted, the file has no field — chains 14 to 19's rules, byte for byte — and the command warns: a wallet proves only the genesis-bound form on a chain id outside 14–19, so **every new chain from chain 20 on is cut with `--binding-domain 1`** (chain 19, the v0.6.7 re-genesis, is cut without it) (`docs/deploy.md`, "The next cut: `binding_domain`") |
 | `--proof-window-blocks <N>` | none — no field (256) | issue #118: one window, `256..=4096` blocks, for how old a bundle's anchor and its `time` may be (it replaces both 256-block windows). Tagged and appended to the genesis hash after `bridge_rotation`, only when present; out of range is refused and nothing is written. Served as `rand_getLimits.proof_window_blocks`. Recommended `1024` from chain 20 (`docs/deploy.md`, "The next cut: `proof_window_blocks`") |
 | `--program-state-cell-fee <UNITS>` | none — no `program_state` section | RPL-2 (`docs/superpowers/specs/2026-09-30-rpl2-program-state-design.md`): turns on program state — program cells, program vaults and the `Invoke` action — with this cell fee in RAND units (at most 1 000 RAND), added to an invoke's fee floor per cell it creates. Bound into the genesis hash last; absent, the file has no section and the hash is what it was. Needs `--tokens`, `--gas-price`, `--hardening-v6` and `--auth-guest` (so `--bundle-guest v3`), each refused by name before any file is written. Prints `program_state: cell fee N RAND` beside the gas line |
+| `--perps <PERPS.JSON>` | none — no `perps` section | RPL-3 (`docs/perps.md`): turns on perpetual futures from a `PerpsConfig` JSON file (`collateral_asset`, `max_tier`, `max_window_blocks`, `engine_hc`, `genesis_root` as 64 hex each, and `markets`). Bound into the genesis hash last, after the tokens' incremental-root word; absent, the file has no section and the hash is what it was. The section's bounds are checked by `Genesis::validate` (a proof tier, a window of 1 to 64 blocks, 1 to 16 markets with ids 0, 1, … in order, a collateral that is RAND or a token the file lists). Needs `--tokens`, `--gas-price`, `--hardening-v6` and `--auth-guest` (so `--bundle-guest v3`), each refused by name before any file is written. Prints a `perps:` line with the markets, collateral, tier, window and the two commitments |
 | `--tokens-incremental-root` | none — the tokens file's own word (no field) | audit v6, TOK-1 (issue #86): sets `"incremental_root": true` on the `--tokens` section — the registry's root an incremental merkle commitment over `rand-token-leaf-2` leaves (`rand-token-registry-4`, the state root re-domained `rand-state-tokens-1`) and the node storing one row per token, rewriting only what a block changed (`docs/tokens.md` §17). Tagged `tokens_incremental_root` and appended to the genesis hash after `bridge_fees`, only when set; omitted, every chain through 20 hashes as before. Needs `--tokens`, refused by name without it. Served as `rand_getTokens.incremental_root`. Recommended on for the next cut (`docs/deploy.md`, "The next cut: `tokens.incremental_root`") |
 
 `rand-node genesis`/`init` print `gas: price P/gas, B/KiB, bundle limit N, dynamic: target … / …
@@ -393,6 +394,20 @@ rand-node bench apply --blocks 10000 --report-every 500 --incremental-nullifier-
 Exit code 0 if the chain is consistent, 2 if a problem was found and `--repair` was not given.
 Replay re-verifies every bundle proof, so a build whose zkVM constraints differ from the one that
 made the chain will stop at the first bundle (`docs/confidential.md`).
+
+### `rand-node db drop-perp-inputs`
+
+| argument | default | meaning |
+|---|---|---|
+| `--datadir <DATADIR>` | required | data directory (node must not be running) |
+
+For rolling back to a build from before RPL-3 (v0.7.1 or earlier). This build creates the
+`perp_inputs` column family on every database at first open, perps chain or not; the older build
+lists seventeen families and RocksDB refuses to open a database with an eighteenth. The command
+drops the empty family and prints `dropped column family perp_inputs from …`, or `no perp_inputs
+column family in …` on a rerun. It is refused, touching nothing, on a database that holds perps
+state or any input row: no older build can follow a perps chain, and the rows cannot be rebuilt
+from anything else on disk (`docs/perps.md`).
 
 ### `rand-node safety status` / `clear-halt` / `release-lock`
 
