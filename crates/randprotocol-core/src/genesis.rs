@@ -4209,6 +4209,8 @@ mod tests {
             collateral_asset: 0,
             max_tier: 16,
             max_window_blocks: 8,
+            max_block_inputs: 64,
+            min_deposit: 0,
             engine_hc: [9; 8],
             genesis_root: [8; 8],
             markets: vec![MarketSpec {

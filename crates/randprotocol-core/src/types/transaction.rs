@@ -916,7 +916,14 @@ impl Transaction {
     /// ([`Action::perp_unsigned`]), under its own domain. The tag keeps one variant's signature
     /// from verifying as another's and the chain id keeps it off other chains. `None` for any
     /// other action, which has no such message.
-    pub fn perp_sign_message(chain_id: u64, action: &Action) -> Option<Hash> {
+    ///
+    /// BIND-1: over the chain's [`BindingDomain`], as every other signed action message is. Under
+    /// `ChainId` it is `blake3("rand-perp-sign-1", bincode(chain_id, tag, unsigned))`; under
+    /// `Genesis(g)` the genesis hash leads the preimage under the next tag,
+    /// `blake3("rand-perp-sign-2", bincode(g, (chain_id, tag, unsigned)))` — the construction
+    /// `BindingDomain::token_mint_message` and the other genesis-bound messages use — so a
+    /// signature made for one chain verifies on no other that shares its chain id.
+    pub fn perp_sign_message(domain: &BindingDomain, chain_id: u64, action: &Action) -> Option<Hash> {
         let tag: u8 = match action {
             Action::PerpOrder { .. } => 35,
             Action::PerpCancel { .. } => 36,
@@ -960,8 +967,15 @@ impl Transaction {
             | Action::PerpDeposit { .. }
             | Action::PerpStateProof { .. } => return None,
         };
-        let bytes = bincode::serialize(&(chain_id, tag, action.perp_unsigned())).expect("serializes");
-        Some(Hash::digest_domain(b"rand-perp-sign-1", &bytes))
+        let body = (chain_id, tag, action.perp_unsigned());
+        Some(match domain {
+            BindingDomain::ChainId => {
+                Hash::digest_domain(b"rand-perp-sign-1", &bincode::serialize(&body).expect("serializes"))
+            }
+            BindingDomain::Genesis(g) => {
+                Hash::digest_domain(b"rand-perp-sign-2", &bincode::serialize(&(g, body)).expect("serializes"))
+            }
+        })
     }
 
     /// A bundle-carrying transaction; `Action::None` for a plain transfer.
@@ -2169,14 +2183,22 @@ mod tests {
     #[test]
     fn perp_sign_message_ignores_the_signature_and_binds_the_chain_and_tag() {
         let kp = Keypair::generate();
+        let d = BindingDomain::ChainId;
         let mut messages = Vec::new();
         for i in 35..=38 {
             let empty = with_signature(&sample(i, Vec::new()), Signature::empty());
-            let m = Transaction::perp_sign_message(7, &empty).unwrap();
+            let m = Transaction::perp_sign_message(&d, 7, &empty).unwrap();
             let signed = with_signature(&empty, kp.sign(m.as_bytes()));
             assert_ne!(signed, empty, "variant {i}: the signature was replaced");
-            assert_eq!(Transaction::perp_sign_message(7, &signed).unwrap(), m, "variant {i}: the signature is not signed over");
-            assert_ne!(Transaction::perp_sign_message(8, &signed).unwrap(), m, "variant {i}: the chain is bound");
+            assert_eq!(Transaction::perp_sign_message(&d, 7, &signed).unwrap(), m, "variant {i}: the signature is not signed over");
+            assert_ne!(Transaction::perp_sign_message(&d, 8, &signed).unwrap(), m, "variant {i}: the chain is bound");
+            // BIND-1: the genesis hash is bound under `binding_domain: 1`, and the chain id with it.
+            let (ga, gb) = (BindingDomain::Genesis(Hash([0xa; 32])), BindingDomain::Genesis(Hash([0xb; 32])));
+            let msg = |d: &BindingDomain, chain| Transaction::perp_sign_message(d, chain, &signed).unwrap();
+            let on_a = msg(&ga, 7);
+            assert_ne!(on_a, m, "variant {i}: never the chain-id form");
+            assert_ne!(on_a, msg(&gb, 7), "variant {i}: two genesis hashes");
+            assert_ne!(on_a, msg(&ga, 8), "variant {i}: the chain is still bound");
             messages.push(m);
         }
         for a in 0..messages.len() {
@@ -2186,7 +2208,7 @@ mod tests {
         }
         // Only the four signed variants have a message.
         for i in [34, 39] {
-            assert!(Transaction::perp_sign_message(7, &sample(i, Vec::new())).is_none());
+            assert!(Transaction::perp_sign_message(&d, 7, &sample(i, Vec::new())).is_none());
         }
     }
 

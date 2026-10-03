@@ -64,6 +64,17 @@ const _: () = assert!(MAX_PERP_PAYOUTS as u64 <= super::MAX_LEAVES_PER_TX);
 pub const MAX_WINDOW_BLOCKS: u64 = 64;
 /// The widest a nonce window reaches below its highest nonce: the 64 bits of `used`.
 const NONCE_WINDOW: u64 = 64;
+/// The most `max_block_inputs` may let one block record: the genesis bound on the perp inputs
+/// (deposits, orders, cancels, withdrawals — not the `Close`) a block carries, which is what
+/// bounds the engine's work per block and so a window's cycles.
+pub const MAX_BLOCK_INPUTS: u32 = 1024;
+/// The most perp inputs one account may have recorded in one block (a deposit counts towards the
+/// account it credits), so one trader cannot take a block's whole `max_block_inputs`.
+pub const MAX_ACCOUNT_INPUTS_PER_BLOCK: u32 = 8;
+/// The most markets a genesis may name: the pinned engine's capacity (`perp-core`'s
+/// `MAX_MARKETS`); a new engine image may raise it. A market the engine cannot hold would make
+/// every window unprovable.
+pub const MAX_MARKETS: u32 = 2;
 
 /// A trader's account on the exchange: the eight words of its trading key's address. Words
 /// rather than an [`Address`] because the engine, which only sees words, keys accounts by it.
@@ -102,6 +113,14 @@ pub struct PerpsConfig {
     pub max_tier: u8,
     /// The most blocks one state proof may cover.
     pub max_window_blocks: u64,
+    /// The most perp inputs (deposits, orders, cancels, withdrawals; not the `Close`) one block
+    /// may record, `1..=MAX_BLOCK_INPUTS`. With `max_window_blocks` it bounds a window's engine
+    /// work, so an operator sizes the two against the engine's cycle budget at `max_tier`.
+    pub max_block_inputs: u32,
+    /// The smallest deposit, in collateral units; 0 (the default) is no floor. Below
+    /// `MAX_NOTE_VALUE`.
+    #[serde(default)]
+    pub min_deposit: u64,
     /// The engine guest's program commitment: a state proof of any other program is refused.
     #[serde(with = "crate::notes::word8_hex")]
     pub engine_hc: Word8,
@@ -122,8 +141,17 @@ impl PerpsConfig {
                 self.max_window_blocks
             ));
         }
-        if !(1..=16).contains(&self.markets.len()) {
-            return Err(format!("perps.markets has {} markets; a chain has 1 to 16", self.markets.len()));
+        if !(1..=MAX_BLOCK_INPUTS).contains(&self.max_block_inputs) {
+            return Err(format!("perps.max_block_inputs {} is outside 1..={MAX_BLOCK_INPUTS}", self.max_block_inputs));
+        }
+        if self.min_deposit >= MAX_NOTE_VALUE {
+            return Err(format!("perps.min_deposit {} is not below the note bound 2^63", self.min_deposit));
+        }
+        if !(1..=MAX_MARKETS as usize).contains(&self.markets.len()) {
+            return Err(format!(
+                "perps.markets has {} markets; a chain has 1 to {MAX_MARKETS}, the engine's capacity",
+                self.markets.len()
+            ));
         }
         for (i, m) in self.markets.iter().enumerate() {
             if m.id as usize != i {
@@ -134,6 +162,10 @@ impl PerpsConfig {
             }
             if !(1..=100).contains(&m.max_leverage) {
                 return Err(format!("perps market {i}: max_leverage {} is outside 1..=100", m.max_leverage));
+            }
+            // The engine divides by it: a market without a maintenance margin cannot be run.
+            if m.maintenance_bps == 0 {
+                return Err(format!("perps market {i}: maintenance_bps must be at least 1"));
             }
             for (name, bps) in [
                 ("maintenance_bps", m.maintenance_bps),
@@ -195,6 +227,18 @@ fn push_u64(out: &mut Vec<u32>, v: u64) {
 }
 
 impl PerpInput {
+    /// The account an input is from — a deposit's is the account it credits; `None` for the
+    /// `Close`.
+    pub fn account(&self) -> Option<&AccountId> {
+        match self {
+            PerpInput::Deposit { account, .. }
+            | PerpInput::Order { account, .. }
+            | PerpInput::Cancel { account, .. }
+            | PerpInput::Withdraw { account, .. } => Some(account),
+            PerpInput::Close { .. } => None,
+        }
+    }
+
     /// Append this input's words: its tag (1–5), then its fields, every `u64` as two words low
     /// first and every `Word8` as its eight words. The layout is the guest's, word for word.
     pub fn words(&self, out: &mut Vec<u32>) {
@@ -518,7 +562,8 @@ impl Perps {
         self.digests.keys().copied().collect()
     }
 
-    /// The market's last median; 0 before any block has closed with a fresh price for it.
+    /// The market's median as the last block close computed it; 0 ("no price") before any close
+    /// had a quorum of fresh stake behind a price, and after one that had none.
     pub fn median(&self, market: u32) -> u64 {
         self.oracle.get(&market).map_or(0, |o| o.median)
     }
@@ -580,6 +625,9 @@ fn deposit_amount(p: &Perps, tx: &Transaction) -> Result<u64, TxError> {
     if amount == 0 {
         return Err(PerpError::ZeroAmount.into());
     }
+    if amount < p.config.min_deposit {
+        return Err(PerpError::DepositTooSmall(amount).into());
+    }
     Ok(amount)
 }
 
@@ -621,6 +669,31 @@ fn check_account_nonce<'a>(p: &'a Perps, account: &AccountId, nonce: u64) -> Res
 fn check_withdrawal_room(p: &Perps) -> Result<(), PerpError> {
     if p.withdrawals.len() >= MAX_PERP_PAYOUTS {
         return Err(PerpError::TooManyWithdrawals);
+    }
+    Ok(())
+}
+
+/// Whether `account` may ask for another withdrawal: it has none pending. With the global cap of
+/// [`MAX_PERP_PAYOUTS`] this keeps one account from holding every slot.
+fn check_no_pending_withdrawal(p: &Perps, account: &AccountId) -> Result<(), PerpError> {
+    if p.withdrawals.values().any(|w| w.account == *account) {
+        return Err(PerpError::WithdrawalPending);
+    }
+    Ok(())
+}
+
+/// Whether this block may record one more input from `account`: fewer than `max_block_inputs`
+/// are recorded (`BlockFull`), and fewer than [`MAX_ACCOUNT_INPUTS_PER_BLOCK`] of them are the
+/// account's (`AccountBlockFull`). Read against the transient `block_inputs`, which every block
+/// close empties — so at the pool, whose ledger is the tip's, it never refuses, and in a block it
+/// refuses exactly the inputs past the caps, which stay pooled for the next one.
+fn check_block_room(p: &Perps, account: &AccountId) -> Result<(), PerpError> {
+    if p.block_inputs.len() >= p.config.max_block_inputs as usize {
+        return Err(PerpError::BlockFull);
+    }
+    let mine = p.block_inputs.iter().filter(|i| i.account() == Some(account)).count();
+    if mine >= MAX_ACCOUNT_INPUTS_PER_BLOCK as usize {
+        return Err(PerpError::AccountBlockFull);
     }
     Ok(())
 }
@@ -750,6 +823,18 @@ impl<'a> PerpAction<'a> {
         }
     }
 
+    /// The account this action records an input for (a deposit's: the account it credits);
+    /// `None` for an oracle and a state proof, which are no input of a block.
+    fn input_account(&self) -> Option<AccountId> {
+        match self {
+            PerpAction::Deposit { trading_key } => Some(account_id(trading_key)),
+            PerpAction::Order { account, .. }
+            | PerpAction::Cancel { account, .. }
+            | PerpAction::Withdraw { account, .. } => Some(**account),
+            PerpAction::Oracle { .. } | PerpAction::StateProof { .. } => None,
+        }
+    }
+
     /// The signature over [`Transaction::perp_sign_message`]; `None` for a deposit and a state
     /// proof, which the bundle and the STARK authorise.
     fn signature(&self) -> Option<&'a Signature> {
@@ -816,6 +901,8 @@ fn check<'a>(ledger: &'a Ledger, tx: &Transaction, action: &PerpAction<'a>) -> R
             }
             // After the replay checks, so a replay hears `NonceUsed`, not its own opening.
             check_opening(p, recipient, r)?;
+            // One pending request per account: the next waits for a proof to settle this one.
+            check_no_pending_withdrawal(p, account)?;
             Ok(Some(&a.trading_key))
         }
         PerpAction::Oracle { validator, prices, nonce, .. } => {
@@ -825,7 +912,7 @@ fn check<'a>(ledger: &'a Ledger, tx: &Transaction, action: &PerpAction<'a>) -> R
             if !ledger.validators().contains_key(&address) || ledger.jailed_until(&address).is_some() {
                 return Err(PerpError::NotValidator.into());
             }
-            // At least one price; strictly ascending and known markets, so at most 16; every
+            // At least one price; strictly ascending and known markets, so at most MAX_MARKETS; every
             // price positive (the engine reads a median of 0 as "no price").
             if prices.is_empty() {
                 return Err(PerpError::BadPrice.into());
@@ -863,9 +950,14 @@ fn check<'a>(ledger: &'a Ledger, tx: &Transaction, action: &PerpAction<'a>) -> R
 /// 3. every block in it has its digest recorded — so every one of them is closed, which is the
 ///    whole bound on `to`: a proof ending at the tip is admissible at the pool (whose ledger is
 ///    the tip's) and in the next block alike;
-/// 4. every payout names a pending request, at most its amount, each request at most once and
-///    in whatever order the proof lists them (the payouts digest binds that order, and the engine
-///    emits payouts in the order the withdrawals were input, unsorted).
+/// 4. every payout names a pending request, each request at most once and in whatever order the
+///    proof lists them (the payouts digest binds that order, and the engine emits payouts in the
+///    order the withdrawals were input, unsorted);
+/// 5. every such request was input inside the window, `from < height <= to` — the engine sees a
+///    request only in the window over its block, so no other window can pay it;
+/// 6. every payout is the full request or nothing: at most its amount (`PayoutTooLarge`), and a
+///    positive amount below it is `PartialPayout` — the note the request sealed carries the
+///    requested amount, and a partial payout's note would not be the one its owner can open.
 fn check_state_proof(p: &Perps, from: u64, to: u64, payouts: &[PerpPayout]) -> Result<(), PerpError> {
     if payouts.len() > MAX_PERP_PAYOUTS {
         return Err(PerpError::TooManyPayouts(payouts.len()));
@@ -883,12 +975,18 @@ fn check_state_proof(p: &Perps, from: u64, to: u64, payouts: &[PerpPayout]) -> R
             return Err(PerpError::DuplicatePayout);
         }
         let w = p.withdrawals.get(&po.request).ok_or(PerpError::UnknownRequest)?;
+        if w.height <= from || w.height > to {
+            return Err(PerpError::RequestOutsideWindow { height: w.height, from, to });
+        }
         if po.amount > w.amount {
             return Err(PerpError::PayoutTooLarge {
                 request: crate::notes::word8_to_hex(&po.request),
                 want: po.amount,
                 have: w.amount,
             });
+        }
+        if po.amount != 0 && po.amount != w.amount {
+            return Err(PerpError::PartialPayout { want: po.amount, have: w.amount });
         }
     }
     Ok(())
@@ -963,6 +1061,24 @@ fn state_segment(
     Ok(state_proof_segment(from, to, &p.proved_root, new_root, &payouts_digest(executor, payouts), fees, &digests))
 }
 
+/// The public segment a `PerpStateProof`'s STARK is verified against on `ledger` — after
+/// [`validate`]'s cheap rules, which refuse first exactly as `validate` does. The proof's verdict
+/// is a function of its own bytes, the genesis section and this segment, so a node may remember a
+/// refusal by it (the node's `ProofRefusedCache`). Nothing is verified and nothing written.
+pub fn state_proof_segment_on(
+    ledger: &Ledger,
+    tx: &Transaction,
+    executor: &dyn ConfidentialExecutor,
+) -> Result<Vec<u32>, TxError> {
+    let a = PerpAction::of(&tx.action).ok_or(NOT_PERP)?;
+    check(ledger, tx, &a)?;
+    let PerpAction::StateProof { from, to, new_root, payouts, fees } = a else {
+        return Err(NOT_PERP);
+    };
+    let p = ledger.perps().ok_or(PerpError::Disabled)?;
+    Ok(state_segment(p, from, to, new_root, payouts, fees, executor)?)
+}
+
 /// Step 10 of admission for a `PerpStateProof`, after every cheap check: the STARK against the
 /// engine commitment and the tier cap of the genesis section, over `segment` ([`validate`]'s);
 /// `admitted` (the verified set vouches for these bytes, B5) decodes instead of verifying, the
@@ -1002,6 +1118,10 @@ pub(super) fn verify_state_proof(
 /// withdrawal's time still in the window; for a state proof, the window still starts at the
 /// proved height, its digests are recorded and its payouts' requests are still pending. For a
 /// node's pool, which asks after every block. No hash, no proof. `Ok` for every other action.
+///
+/// Not the per-block input caps ([`check_block_room`]): they read the block being built, and the
+/// pool's ledger is the tip's, whose block inputs every close empties. An input a full block
+/// refused is not stale; it stays pooled for the next block.
 pub fn still_applies(ledger: &Ledger, tx: &Transaction) -> Result<(), TxError> {
     match PerpAction::of(&tx.action) {
         Some(a) => check(ledger, tx, &a).map(|_| ()),
@@ -1026,14 +1146,21 @@ pub(super) fn validate(
 ) -> Result<Option<Vec<u32>>, TxError> {
     let a = PerpAction::of(action).ok_or(NOT_PERP)?;
     let key = check(ledger, tx, &a)?;
+    let p = ledger.perps().ok_or(PerpError::Disabled)?;
     if let PerpAction::StateProof { from, to, new_root, payouts, fees } = a {
-        let p = ledger.perps().ok_or(PerpError::Disabled)?;
         return Ok(Some(state_segment(p, from, to, new_root, payouts, fees, executor)?));
+    }
+    // The block's input caps, against the inputs this block has recorded so far (C1); after the
+    // action's own rules, before the signature.
+    if let Some(account) = a.input_account() {
+        check_block_room(p, &account)?;
     }
     let (Some(key), Some(signature)) = (key, a.signature()) else {
         return Ok(None); // a deposit: the bundle authorises it
     };
-    let msg = Transaction::perp_sign_message(tx.chain_id, action).ok_or(PerpError::BadSignature)?;
+    // BIND-1: the message is over this chain's binding domain, as every signed action's is.
+    let msg =
+        Transaction::perp_sign_message(ledger.binding_domain(), tx.chain_id, action).ok_or(PerpError::BadSignature)?;
     if !key.verify(msg.as_bytes(), signature) {
         return Err(PerpError::BadSignature.into());
     }
@@ -1062,6 +1189,10 @@ pub(super) fn apply(
     let a = PerpAction::of(action).ok_or(NOT_PERP)?;
     let height = ledger.height();
     let p = ledger.perps().ok_or(PerpError::Disabled)?;
+    // The block's input caps before any write, as `validate` holds them.
+    if let Some(account) = a.input_account() {
+        check_block_room(p, &account)?;
+    }
     match a {
         PerpAction::Deposit { trading_key } => {
             let amount = deposit_amount(p, tx)?;
@@ -1108,6 +1239,7 @@ pub(super) fn apply(
             }
             check_withdrawal_room(p)?;
             check_opening(p, recipient, r)?;
+            check_no_pending_withdrawal(p, account)?;
             let pending = PendingWithdrawal {
                 account: *account,
                 amount,
@@ -1149,6 +1281,9 @@ pub(super) fn apply(
             for po in payouts {
                 p.withdrawals.remove(&po.request);
             }
+            // Every request input in a covered block is settled, paid or not (M1): the engine saw
+            // it in this window, and a request it skipped can never be paid by a later one.
+            p.withdrawals.retain(|_, w| w.height > to);
             p.rand_out = rand_out;
             for n in notes {
                 ledger.append_deposit(n.cm, n.envelope, executor)?;
@@ -1161,9 +1296,13 @@ pub(super) fn apply(
 /// The stake-weighted median of one market's fresh submissions at `height`: the submissions
 /// given at `height - ORACLE_STALE_BLOCKS` or later, each weighted by `stake` of its validator
 /// now (one that has left the set or is jailed weighs 0 and is dropped), sorted by price; the median is
-/// the first price at which the running stake reaches ⌈total / 2⌉. `None` when nothing fresh
-/// and staked remains, and the caller keeps the last median.
-fn stake_median(o: &OracleState, stake: &dyn Fn(&Address) -> u64, height: u64) -> Option<u64> {
+/// the first price at which the running stake reaches ⌈total / 2⌉.
+///
+/// Only with a quorum (I6): the fresh stake must be at least half of `active`, the stake of every
+/// validator in the register and not jailed. `None` without one — nothing fresh, or too little of
+/// the set behind it — and the caller publishes 0, the engine's "no price", rather than the last
+/// median: a stale price is not carried forward by a minority, nor by nobody.
+fn stake_median(o: &OracleState, stake: &dyn Fn(&Address) -> u64, active: u128, height: u64) -> Option<u64> {
     let mut fresh: Vec<(u64, u128)> = o
         .submissions
         .iter()
@@ -1174,6 +1313,9 @@ fn stake_median(o: &OracleState, stake: &dyn Fn(&Address) -> u64, height: u64) -
     // Ties in price are interchangeable, so an unstable sort on the price alone is deterministic.
     fresh.sort_unstable_by_key(|(price, _)| *price);
     let total: u128 = fresh.iter().map(|(_, s)| s).sum();
+    if total == 0 || total.saturating_mul(2) < active {
+        return None;
+    }
     let half = total.div_ceil(2);
     let mut running = 0u128;
     for (price, stake) in fresh {
@@ -1186,7 +1328,8 @@ fn stake_median(o: &OracleState, stake: &dyn Fn(&Address) -> u64, height: u64) -
 }
 
 /// The block-end step under the section (`Ledger::close_block`, before the anchor): each
-/// market's median is recomputed from the fresh submissions (kept when none is fresh), the
+/// market's median is recomputed from the fresh submissions (0, "no price", without a quorum
+/// of fresh stake — [`stake_median`]), the
 /// block's `Close` input is appended to its inputs, and the digest `D_height` of the whole word
 /// string is recorded for the next state proof to cover. The words themselves are left for the
 /// node to take ([`Perps::take_block_words`]); the inputs are emptied for the next block. Every
@@ -1222,14 +1365,16 @@ pub(super) fn close_block(ledger: &mut Ledger, height: u64, executor: &dyn Confi
         }
         ledger.validators().get(a).map_or(0, |v| v.stake)
     };
+    // The quorum's denominator: every registered validator's stake, the jailed ones' excepted.
+    let active: u128 = ledger.validators().keys().map(|a| stake(a) as u128).sum();
     let Some(p) = ledger.perps() else { return };
     let medians: Vec<PerpPrice> = p
         .config
         .markets
         .iter()
         .map(|m| {
-            let fresh = p.oracle.get(&m.id).and_then(|o| stake_median(o, &stake, height));
-            PerpPrice { market: m.id, price: fresh.unwrap_or_else(|| p.median(m.id)) }
+            let fresh = p.oracle.get(&m.id).and_then(|o| stake_median(o, &stake, active, height));
+            PerpPrice { market: m.id, price: fresh.unwrap_or(0) }
         })
         .collect();
     let Some(p) = ledger.perps_mut() else { return };
@@ -1305,6 +1450,20 @@ pub enum PerpError {
     BadPrice,
     #[error("a withdrawal of {0} is at or above the note bound 2^63")]
     AmountTooLarge(u64),
+    #[error("this block already records the most perp inputs the chain allows; it waits for the next block")]
+    BlockFull,
+    #[error(
+        "this block already records {MAX_ACCOUNT_INPUTS_PER_BLOCK} perp inputs from this account; it waits for the next block"
+    )]
+    AccountBlockFull,
+    #[error("this account already has a withdrawal waiting on a proof")]
+    WithdrawalPending,
+    #[error("a deposit of {0} is below this chain's min_deposit")]
+    DepositTooSmall(u64),
+    #[error("a payout is the full request or nothing: the request asked for {have}, the payout is {want}")]
+    PartialPayout { want: u64, have: u64 },
+    #[error("the request was input at height {height}, outside the proof's window {from}+1..={to}")]
+    RequestOutsideWindow { height: u64, from: u64, to: u64 },
 }
 
 #[cfg(test)]
@@ -1399,11 +1558,20 @@ mod tests {
         assert!(refused(&|b| b.max_tier = 22), "above the highest tier");
         assert!(refused(&|b| b.max_window_blocks = 0), "an empty window");
         assert!(refused(&|b| b.max_window_blocks = MAX_WINDOW_BLOCKS + 1), "a 65-block window");
+        assert!(refused(&|b| b.max_block_inputs = 0), "a block that records nothing");
+        assert!(refused(&|b| b.max_block_inputs = MAX_BLOCK_INPUTS + 1), "past the input bound");
+        assert!(refused(&|b| b.min_deposit = MAX_NOTE_VALUE), "a floor no note can meet");
         assert!(refused(&|b| b.markets[0].id = 1), "a market id out of order");
         assert!(refused(&|b| b.markets[0].maintenance_bps = 10_001), "more than 100%");
         assert!(refused(&|b| b.markets.clear()), "no market");
+        assert!(refused(&|b| b.markets[0].maintenance_bps = 0), "the engine needs a maintenance margin");
+        let market = |id: u32| MarketSpec { id, ..c.markets[0].clone() };
+        assert!(!refused(&|b| b.markets = vec![market(0), market(1)]), "the engine's two markets");
+        assert!(refused(&|b| b.markets = vec![market(0), market(1), market(2)]), "past the engine's capacity");
         let mut ok = c.clone();
         ok.max_window_blocks = MAX_WINDOW_BLOCKS;
+        ok.max_block_inputs = MAX_BLOCK_INPUTS;
+        ok.min_deposit = MAX_NOTE_VALUE - 1;
         assert!(ok.check().is_ok(), "the bound itself is allowed");
 
         // Each consensus field moves the root; each step keeps the earlier ones' changes.
@@ -1463,6 +1631,8 @@ mod tests {
             collateral_asset: 0,
             max_tier: 16,
             max_window_blocks: 8,
+            max_block_inputs: 64,
+            min_deposit: 0,
             engine_hc: [9; 8],
             genesis_root: [8; 8],
             markets: vec![MarketSpec {
@@ -1480,6 +1650,9 @@ mod tests {
 
     /// Writes the golden vectors perp-core's `tests/vectors.rs` reads; run with
     /// `PERPS_WRITE_VECTORS=1 cargo test -p randprotocol-core perps::tests::golden_vectors`.
+    /// This test owns `block_words` and `segment`; the Poseidon2 digests beside them
+    /// (`digest_4000`, `digest_4001`, `digest_8001`) are `randprotocol-zkvm`'s
+    /// `tests/perps_vectors.rs`, which has the real executor. Each writes only its own keys.
     #[test]
     fn golden_vectors() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/perps-v1.json");
@@ -1516,13 +1689,23 @@ mod tests {
             "segment".into(),
             serde_json::json!(state_proof_segment(0, 1, &[1; 8], &[2; 8], &[3; 8], 0, &[[4; 8]])),
         );
-        let json = serde_json::to_string_pretty(&serde_json::Value::Object(cases)).unwrap();
+        let read = || -> serde_json::Map<String, serde_json::Value> {
+            let text =
+                std::fs::read_to_string(path).expect("vectors file exists; regenerate with PERPS_WRITE_VECTORS=1");
+            let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).unwrap();
+            let pretty = serde_json::to_string_pretty(&serde_json::Value::Object(map.clone())).unwrap();
+            assert_eq!(text.trim(), pretty.trim(), "perps-v1.json is serde_json's pretty form");
+            map
+        };
         if std::env::var("PERPS_WRITE_VECTORS").is_ok() {
-            std::fs::write(path, &json).unwrap();
+            let mut map = read();
+            map.extend(cases.clone());
+            std::fs::write(path, serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap()).unwrap();
         }
-        let on_disk =
-            std::fs::read_to_string(path).expect("vectors file exists; regenerate with PERPS_WRITE_VECTORS=1");
-        assert_eq!(on_disk.trim(), json.trim(), "perps-v1.json is stale");
+        let on_disk = read();
+        for (k, v) in &cases {
+            assert_eq!(on_disk.get(k), Some(v), "perps-v1.json's {k} is stale");
+        }
     }
 
     // ---- Task 3: the ledger rules, the block close and the root ----
@@ -1620,9 +1803,15 @@ mod tests {
         l.close_block(height, &kp(1).address(), 0, 0, &StubExecutor);
     }
 
-    /// `a` with its signature made by `k` over `perp_sign_message(chain, a)`.
+    /// `a` with its signature made by `k` over `perp_sign_message(chain, a)`, under the chain-id
+    /// binding domain `ledger_with` keeps.
     fn signed(chain: u64, k: &Keypair, a: Action) -> Action {
-        let msg = Transaction::perp_sign_message(chain, &a).expect("a signed perp action");
+        signed_in(&crate::types::BindingDomain::ChainId, chain, k, a)
+    }
+
+    /// [`signed`] under `domain`.
+    fn signed_in(domain: &crate::types::BindingDomain, chain: u64, k: &Keypair, a: Action) -> Action {
+        let msg = Transaction::perp_sign_message(domain, chain, &a).expect("a signed perp action");
         let sig = k.sign(msg.as_bytes());
         let mut a = a;
         match &mut a {
@@ -1896,18 +2085,55 @@ mod tests {
         assert_eq!(words, close_words(&l, 1, 300), "an oracle submission is no input; the Close carries the median");
 
         // Still fresh 30 blocks on; the two light validators resubmit at 32, and at 32 the heavy
-        // one's height-1 price is 31 blocks old and drops: stakes 1 and 1 at 100 and 200.
+        // one's height-1 price is 31 blocks old and drops: stakes 1 and 1 at 100 and 200 — 2 of
+        // the set's 12, short of the half the quorum needs (I6), so the close publishes 0, the
+        // engine's "no price", not the old 300.
         close(&mut l, 31);
         assert_eq!(l.perps().unwrap().median(0), 300);
         l.set_height(32);
         apply(&mut l, &oracle(&kp(1), &[(0, 100)], 8)).unwrap();
         apply(&mut l, &oracle(&kp(2), &[(0, 200)], 2)).unwrap();
         close(&mut l, 32);
-        assert_eq!(l.perps().unwrap().median(0), 100, "the first price reaching half the fresh stake");
-        // Every price stale: the median stays.
-        close(&mut l, 63);
+        assert_eq!(l.perps().unwrap().median(0), 0, "two light validators are no quorum");
+        assert_eq!(l.take_perp_block_words().map(|(_, w)| w), Some(close_words(&l, 32, 0)));
+        // The heavy validator back: 12 of 12 fresh, and the median is the first price reaching
+        // half of it.
+        apply(&mut l, &oracle(&kp(3), &[(0, 300)], 2)).unwrap();
+        close(&mut l, 33);
+        assert_eq!(l.perps().unwrap().median(0), 300);
+        // Every price stale: no price, not the last one.
+        close(&mut l, 64);
+        assert_eq!(l.perps().unwrap().median(0), 0);
+        assert_eq!(l.take_perp_block_words().map(|(_, w)| w), Some(close_words(&l, 64, 0)));
+    }
+
+    /// I6: the quorum is half of the *active* stake — a jailed validator's is outside it, and a
+    /// lone validator (a devnet) is its own quorum.
+    #[test]
+    fn the_median_needs_half_the_active_stake_fresh() {
+        let mut l = ledger_with(true);
+        // Keys 1 and 2 (stake 1 each) of 12: no quorum.
+        apply(&mut l, &oracle(&kp(1), &[(0, 100)], 1)).unwrap();
+        apply(&mut l, &oracle(&kp(2), &[(0, 200)], 1)).unwrap();
+        close(&mut l, 1);
+        assert_eq!(l.perps().unwrap().median(0), 0);
+        // Key 3 jailed: the active stake is 2, both fresh — a quorum.
+        l.set_jailed([(kp(3).address(), u64::MAX)].into_iter().collect());
+        close(&mut l, 2);
         assert_eq!(l.perps().unwrap().median(0), 100);
-        assert_eq!(l.take_perp_block_words().map(|(_, w)| w), Some(close_words(&l, 63, 100)));
+        // A chain of one validator: its own price is the median.
+        let mut solo = ledger_with(true);
+        solo.validators.retain(|a, _| *a == kp(3).address());
+        apply(&mut solo, &oracle(&kp(3), &[(0, 700)], 1)).unwrap();
+        close(&mut solo, 1);
+        assert_eq!(solo.perps().unwrap().median(0), 700);
+        // Exactly half is enough: stakes 1 + 1 fresh of an active 4.
+        let (mut o, mut vals) = (OracleState::default(), BTreeMap::new());
+        add(&mut o, &mut vals, 1, 1, 100, 10);
+        add(&mut o, &mut vals, 2, 1, 200, 10);
+        let stake = |a: &Address| vals.get(a).map_or(0, |v| v.stake);
+        assert_eq!(stake_median(&o, &stake, 4, 10), Some(100));
+        assert_eq!(stake_median(&o, &stake, 5, 10), None, "2 of 5 is under half");
     }
 
     fn add(
@@ -1939,20 +2165,20 @@ mod tests {
         add(&mut o, &mut vals, 2, 2, 300, 10);
         add(&mut o, &mut vals, 3, 0, 50, 10);
         // Stake 4: half is 2, which 100 already reaches; the stake-0 validator counts for nothing.
-        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 10), Some(100));
+        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 4, 10), Some(100));
         add(&mut o, &mut vals, 4, 1, 200, 10);
         // Stake 5: ⌈5/2⌉ = 3, reached at 200.
-        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 10), Some(200));
+        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 5, 10), Some(200));
         // A submitter that has left the set is dropped.
         o.submissions.insert(Address([0xee; 32]), (1, 10));
-        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 10), Some(200));
+        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 5, 10), Some(200));
         assert_eq!(
-            stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 40),
+            stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 5, 40),
             Some(200),
             "30 blocks on, still fresh"
         );
-        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 41), None, "everything is stale");
-        assert_eq!(stake_median(&OracleState::default(), &|a| vals.get(a).map_or(0, |v| v.stake), 10), None);
+        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 5, 41), None, "everything is stale");
+        assert_eq!(stake_median(&OracleState::default(), &|a| vals.get(a).map_or(0, |v| v.stake), 5, 10), None);
     }
 
     #[test]
@@ -2014,6 +2240,9 @@ mod tests {
             still_applies(&l, &w(withdraw(&k, 2, 1, oldest - 1))),
             Err(TxError::TimeOutOfWindow { time: oldest - 1, height: window + 10, window })
         );
+        // The request at nonce 1 still waits on a proof: one pending per account (I2).
+        assert_eq!(refusal(&l, &w(withdraw(&k, 2, 1, oldest))), pe(PerpError::WithdrawalPending));
+        l.perps_mut().unwrap().withdrawals.clear(); // a proof settles it (simulated)
         apply(&mut l, &w(withdraw(&k, 2, 1, oldest))).expect("the window's oldest time");
     }
 
@@ -2098,25 +2327,29 @@ mod tests {
     #[test]
     fn a_ninth_pending_withdrawal_is_refused_until_one_is_paid() {
         let mut l = ledger_with(true);
-        let k = kp(50);
-        dep(&mut l, &k, 10, RAND).unwrap();
-        let w = |n: u64| bare(signed(CHAIN, &k, withdraw(&k, n, 1, 1)));
-        for n in 1..=MAX_PERP_PAYOUTS as u64 {
-            apply(&mut l, &w(n)).unwrap();
+        // Nine accounts, one request each (an account holds one at a time, I2).
+        let keys: Vec<Keypair> = (0..9u8).map(|n| kp(60 + n)).collect();
+        for (n, k) in keys.iter().enumerate() {
+            dep(&mut l, k, 10 + 10 * n as u32, RAND).unwrap();
         }
-        assert_eq!(refusal(&l, &w(9)), pe(PerpError::TooManyWithdrawals));
-        assert_eq!(still_applies(&l, &w(9)), Err(pe(PerpError::TooManyWithdrawals)));
+        let w = |k: &Keypair, n: u64| bare(signed(CHAIN, k, withdraw(k, n, 1, 1)));
+        for (n, k) in keys[..MAX_PERP_PAYOUTS].iter().enumerate() {
+            apply(&mut l, &w(k, n as u64 + 1)).unwrap();
+        }
+        let ninth = w(&keys[8], 9);
+        assert_eq!(refusal(&l, &ninth), pe(PerpError::TooManyWithdrawals));
+        assert_eq!(still_applies(&l, &ninth), Err(pe(PerpError::TooManyWithdrawals)));
         // `apply` holds the cap too, before any write.
         let before = l.clone();
         assert_eq!(
-            l.apply_tx(&w(9), &kp(1).address(), &StubExecutor).map(|_| ()),
+            l.apply_tx(&ninth, &kp(1).address(), &StubExecutor).map(|_| ()),
             Err(pe(PerpError::TooManyWithdrawals))
         );
         assert!(l == before);
         // A proof pays one (simulated): a slot is free again.
         let paid = *l.perps().unwrap().withdrawals.keys().next().unwrap();
         l.perps_mut().unwrap().withdrawals.remove(&paid);
-        apply(&mut l, &w(9)).expect("a slot is free");
+        apply(&mut l, &ninth).expect("a slot is free");
     }
 
     #[test]
@@ -2295,7 +2528,7 @@ mod tests {
             refusal(&l, &junk(vec![PerpPayout { request, amount: 6 }])),
             pe(PerpError::PayoutTooLarge { request: crate::notes::word8_to_hex(&request), want: 6, have: 5 })
         );
-        let twice = vec![PerpPayout { request, amount: 1 }, PerpPayout { request, amount: 1 }];
+        let twice = vec![PerpPayout { request, amount: 5 }, PerpPayout { request, amount: 5 }];
         assert_eq!(refusal(&l, &junk(twice)), pe(PerpError::DuplicatePayout), "each request at most once");
         let nine = vec![PerpPayout { request, amount: 1 }; MAX_PERP_PAYOUTS + 1];
         assert_eq!(refusal(&l, &junk(nine)), pe(PerpError::TooManyPayouts(MAX_PERP_PAYOUTS + 1)));
@@ -2392,7 +2625,13 @@ mod tests {
         };
         let refused = |tx: &Transaction| matches!(refusal(&l, tx), TxError::Perps(PerpError::ProofRefused(_)));
         assert!(refused(&with([7; 8], paid.clone(), 4)), "the fees");
-        assert!(refused(&with([7; 8], vec![PerpPayout { request, amount: 4 }], 3)), "a payout's amount");
+        // A payout's amount: anything but the full request or nothing is refused before the
+        // proof is looked at (I4); a zero payout reaches the proof, whose digest binds it.
+        assert_eq!(
+            refusal(&l, &with([7; 8], vec![PerpPayout { request, amount: 4 }], 3)),
+            pe(PerpError::PartialPayout { want: 4, have: 5 })
+        );
+        assert!(refused(&with([7; 8], vec![PerpPayout { request, amount: 0 }], 3)), "a payout's amount");
         assert!(refused(&with([7; 8], vec![], 3)), "the payouts list");
         assert!(refused(&with([8; 8], paid.clone(), 3)), "the new root");
         // Another engine's proof, and an engine run that is not this version or this window.
@@ -2518,6 +2757,236 @@ mod tests {
         let mut on = ledger_with(true);
         on.set_max_proof_bytes(16);
         assert_eq!(refusal(&on, &big), TxError::ProofTooLarge, "with the section the cap applies");
+    }
+
+    // ---- Final fix wave ----
+
+    /// C1: one account records at most `MAX_ACCOUNT_INPUTS_PER_BLOCK` inputs in a block (its
+    /// deposit included), refused by `validate` and by `apply` before any write; the pool's
+    /// `still_applies` does not refuse it, and the next block takes it.
+    #[test]
+    fn an_account_records_at_most_eight_inputs_a_block() {
+        let mut l = ledger_with(true);
+        let k = kp(50);
+        dep(&mut l, &k, 10, RAND).unwrap();
+        for n in 1..MAX_ACCOUNT_INPUTS_PER_BLOCK as u64 {
+            apply(&mut l, &order(&k, body(n))).unwrap();
+        }
+        let ninth = order(&k, body(8));
+        assert_eq!(refusal(&l, &ninth), pe(PerpError::AccountBlockFull));
+        assert_eq!(refusal(&l, &deposit(&l, &k, 20, RAND)), pe(PerpError::AccountBlockFull), "a deposit counts");
+        assert_eq!(still_applies(&l, &ninth), Ok(()), "not stale: the pool keeps it");
+        let before = l.clone();
+        assert_eq!(
+            l.apply_tx(&ninth, &kp(1).address(), &StubExecutor).map(|_| ()),
+            Err(pe(PerpError::AccountBlockFull))
+        );
+        assert!(l == before, "nothing written");
+        // Another account is not held to this one's count, and an oracle is no input.
+        let other = kp(51);
+        dep(&mut l, &other, 30, RAND).unwrap();
+        apply(&mut l, &oracle(&kp(1), &[(0, 100)], 1)).unwrap();
+        close(&mut l, 1);
+        l.set_height(2);
+        apply(&mut l, &ninth).expect("the next block has room");
+    }
+
+    /// C1: a block records at most `max_block_inputs` inputs. `apply_block` refuses a block
+    /// carrying one more as a whole; the proposer's trial apply (`HotStuff::propose`'s loop: a
+    /// candidate kept only when it applies on a clone) packs the first `max_block_inputs` and
+    /// leaves the next, which still applies at the tip and goes in the block after.
+    #[test]
+    fn a_block_records_at_most_max_block_inputs_and_the_overflow_waits() {
+        use crate::ledger::BlockError;
+        use crate::types::{Block, BlockHeader, QuorumCertificate};
+        let mut l = ledger_with(true);
+        let keys: Vec<Keypair> = (0..5u8).map(|n| kp(70 + n)).collect();
+        for (n, k) in keys.iter().enumerate() {
+            dep(&mut l, k, 10 + 10 * n as u32, RAND).unwrap();
+        }
+        close(&mut l, 1);
+        l.perps_mut().unwrap().config.max_block_inputs = 4;
+        let orders: Vec<Transaction> = keys.iter().map(|k| order(k, body(1))).collect();
+        for tx in &orders {
+            assert_eq!(l.validate(tx, &StubExecutor), Ok(()), "every order is admissible at the tip");
+        }
+
+        // A block of five: refused at its fifth transaction, nothing applied.
+        let proposer = kp(1);
+        let header = BlockHeader {
+            height: 2,
+            view: 2,
+            parent: Hash::ZERO,
+            proposer: proposer.public_key().clone(),
+            timestamp_ms: l.timestamp_ms(),
+            tx_root: Block::tx_root(&orders),
+            state_root: Hash::ZERO,
+            justify: QuorumCertificate::genesis(Hash::ZERO),
+        };
+        let block = Block::sign(l.signing_domain(), header, orders.clone(), &proposer);
+        let before = l.clone();
+        assert_eq!(
+            l.apply_block(&block, &StubExecutor).map(|_| ()),
+            Err(BlockError::InvalidTx { index: 4, error: pe(PerpError::BlockFull) })
+        );
+        assert!(l == before, "a refused block leaves the ledger as it was");
+
+        // The proposer's build: trial-apply each candidate, keep what applies.
+        let mut building = l.clone();
+        building.set_height(2);
+        let mut packed = Vec::new();
+        for tx in &orders {
+            let mut trial = building.clone();
+            if trial.apply_tx(tx, &proposer.address(), &StubExecutor).is_ok() {
+                building = trial;
+                packed.push(tx.clone());
+            }
+        }
+        assert_eq!(packed, orders[..4].to_vec(), "the first four");
+        assert_eq!(refusal(&building, &orders[4]), pe(PerpError::BlockFull));
+        assert_eq!(still_applies(&building, &orders[4]), Ok(()), "still applies: the pool keeps it");
+        close(&mut building, 2);
+        assert_eq!(still_applies(&building, &orders[4]), Ok(()));
+        building.set_height(3);
+        apply(&mut building, &orders[4]).expect("the next block takes it");
+    }
+
+    /// C1: the guest reads a block's words into an 8 192-word buffer. The ledger keeps every
+    /// block inside it whatever `max_block_inputs` says: at most `MAX_ACCOUNTS` accounts, each at
+    /// most `MAX_ACCOUNT_INPUTS_PER_BLOCK` inputs — a deposit counting towards the account it
+    /// credits — of at most 21 words (a withdrawal's), and one `Close` over `MAX_MARKETS` markets:
+    /// 15 × 8 × 21 + 12 = 2 532 words. And a real maximal block: fifteen accounts opened in it,
+    /// each filled to its eight inputs, under the widest `max_block_inputs`.
+    #[test]
+    fn a_maximal_block_fits_the_guests_word_buffer() {
+        const GUEST_BLOCK_WORDS: usize = 8192;
+        let widest = 21; // `Withdraw`, the longest input
+        let close_words = 6 + 3 * MAX_MARKETS as usize;
+        let bound = MAX_ACCOUNTS * MAX_ACCOUNT_INPUTS_PER_BLOCK as usize * widest + close_words;
+        assert_eq!(bound, 2_532);
+        assert!(bound <= GUEST_BLOCK_WORDS);
+
+        let mut l = ledger_with(true);
+        l.perps_mut().unwrap().config.max_block_inputs = MAX_BLOCK_INPUTS;
+        let keys: Vec<Keypair> = (0..MAX_ACCOUNTS as u8).map(|n| kp(100 + n)).collect();
+        for (n, k) in keys.iter().enumerate() {
+            dep(&mut l, k, 1000 + 10 * n as u32, RAND).unwrap();
+            for nonce in 1..MAX_ACCOUNT_INPUTS_PER_BLOCK as u64 {
+                apply(&mut l, &order(k, body(nonce))).unwrap();
+            }
+            assert_eq!(refusal(&l, &order(k, body(99))), pe(PerpError::AccountBlockFull), "the deposit counted");
+        }
+        // No sixteenth account can add an input: a new key cannot open one.
+        assert_eq!(refusal(&l, &deposit(&l, &kp(200), 5000, RAND)), pe(PerpError::TooManyAccounts));
+        close(&mut l, 1);
+        let (_, words) = l.take_perp_block_words().unwrap();
+        assert_eq!(words.len(), MAX_ACCOUNTS * (11 + 7 * 20) + 6 + 3);
+        assert!(words.len() <= bound && words.len() <= GUEST_BLOCK_WORDS, "{} words", words.len());
+    }
+
+    /// I2: an account holds one pending withdrawal at a time.
+    #[test]
+    fn an_account_holds_one_pending_withdrawal() {
+        let (mut l, request) = withdrawn(5);
+        let k = kp(50);
+        let second = bare(signed(CHAIN, &k, withdraw(&k, 2, 3, 1)));
+        assert_eq!(refusal(&l, &second), pe(PerpError::WithdrawalPending));
+        assert_eq!(still_applies(&l, &second), Err(pe(PerpError::WithdrawalPending)));
+        let before = l.clone();
+        assert_eq!(
+            l.apply_tx(&second, &kp(1).address(), &StubExecutor).map(|_| ()),
+            Err(pe(PerpError::WithdrawalPending))
+        );
+        assert!(l == before);
+        // Another account is not held to it.
+        let b = kp(51);
+        dep(&mut l, &b, 20, RAND).unwrap();
+        apply(&mut l, &bare(signed(CHAIN, &b, withdraw(&b, 3, 3, 1)))).unwrap();
+        // Paid, the account may ask again.
+        l.set_height(3);
+        let paid = state_proof(&l, 0, 2, [7; 8], vec![PerpPayout { request, amount: 5 }], 0);
+        apply(&mut l, &paid).unwrap();
+        apply(&mut l, &second).expect("the first request is settled");
+    }
+
+    /// I3: a deposit below the genesis `min_deposit` is refused; 0 is no floor.
+    #[test]
+    fn a_deposit_below_the_floor_is_refused() {
+        let mut l = ledger_with(true);
+        let k = kp(50);
+        l.perps_mut().unwrap().config.min_deposit = 1_000;
+        assert_eq!(refusal(&l, &deposit(&l, &k, 10, 999)), pe(PerpError::DepositTooSmall(999)));
+        assert_eq!(still_applies(&l, &deposit(&l, &k, 10, 999)), Err(pe(PerpError::DepositTooSmall(999))));
+        dep(&mut l, &k, 20, 1_000).expect("at the floor");
+        // `min_deposit` is optional in the genesis JSON: absent is 0.
+        let mut json = serde_json::to_value(sample_config()).unwrap();
+        json.as_object_mut().unwrap().remove("min_deposit");
+        let c: PerpsConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(c.min_deposit, 0);
+        let mut json = serde_json::to_value(sample_config()).unwrap();
+        json.as_object_mut().unwrap().remove("max_block_inputs");
+        assert!(serde_json::from_value::<PerpsConfig>(json).is_err(), "max_block_inputs is required");
+    }
+
+    /// M1: a payout names a request input inside the window, and a proof settles every request
+    /// input in a block it covers, paid or not — one the engine skipped no later window can pay.
+    #[test]
+    fn a_proof_settles_every_request_it_covers_and_pays_none_outside_it() {
+        let (mut l, early) = withdrawn(5);
+        // A second request at height 3, after the window 0..=2.
+        let b = kp(51);
+        l.set_height(3);
+        dep(&mut l, &b, 20, RAND).unwrap();
+        let tb = bare(signed(CHAIN, &b, withdraw(&b, 2, 4, 3)));
+        apply(&mut l, &tb).unwrap();
+        close(&mut l, 3);
+        let late = word8_from_bytes(tb.hash().as_bytes()).unwrap();
+        let outside = proof_tx(0, 2, [7; 8], vec![PerpPayout { request: late, amount: 4 }], 0, b"junk".to_vec());
+        assert_eq!(refusal(&l, &outside), pe(PerpError::RequestOutsideWindow { height: 3, from: 0, to: 2 }));
+        // A proof of 0..=2 that pays nothing settles the height-1 request anyway, and keeps the
+        // height-3 one for the window that covers it.
+        l.set_height(4);
+        let skipped = state_proof(&l, 0, 2, [7; 8], vec![], 0);
+        apply(&mut l, &skipped).unwrap();
+        let p = l.perps().unwrap();
+        assert!(p.withdrawal(&early).is_none(), "covered and skipped: settled");
+        assert!(p.withdrawal(&late).is_some(), "not yet covered");
+        assert_eq!(
+            refusal(&l, &proof_tx(2, 3, [8; 8], vec![PerpPayout { request: early, amount: 5 }], 0, vec![])),
+            pe(PerpError::UnknownRequest)
+        );
+        let paid = state_proof(&l, 2, 3, [8; 8], vec![PerpPayout { request: late, amount: 4 }], 0);
+        apply(&mut l, &paid).unwrap();
+        assert!(l.perps().unwrap().withdrawal(&late).is_none());
+    }
+
+    /// I5: a perp signature is over the chain's binding domain — one made for `ChainId` is
+    /// refused on a chain whose genesis binds its hash, and one made for that genesis verifies.
+    #[test]
+    fn a_perp_signature_binds_the_binding_domain() {
+        use crate::types::BindingDomain;
+        let mut l = ledger_with(true);
+        let k = kp(50);
+        dep(&mut l, &k, 10, RAND).unwrap();
+        let unsigned = Action::PerpOrder { account: id(&k), body: body(1), signature: Signature::empty() };
+        let v0 = bare(signed_in(&BindingDomain::ChainId, CHAIN, &k, unsigned.clone()));
+        assert_eq!(l.validate(&v0, &StubExecutor), Ok(()), "the chain-id domain, as before");
+        let g = BindingDomain::Genesis(Hash([0x5a; 32]));
+        l.set_binding_domain(g);
+        assert_eq!(refusal(&l, &v0), pe(PerpError::BadSignature), "a domain-0 signature on a domain-1 chain");
+        let v1 = bare(signed_in(&g, CHAIN, &k, unsigned.clone()));
+        assert_eq!(l.validate(&v1, &StubExecutor), Ok(()));
+        let other = bare(signed_in(&BindingDomain::Genesis(Hash([0x5b; 32])), CHAIN, &k, unsigned));
+        assert_eq!(refusal(&l, &other), pe(PerpError::BadSignature), "another genesis");
+        // An oracle's too.
+        let o = Action::PerpOracle {
+            validator: kp(1).public_key().clone(),
+            prices: vec![PerpPrice { market: 0, price: 100 }],
+            nonce: 1,
+            signature: Signature::empty(),
+        };
+        assert_eq!(refusal(&l, &bare(signed(CHAIN, &kp(1), o.clone()))), pe(PerpError::BadSignature));
+        assert_eq!(l.validate(&bare(signed_in(&g, CHAIN, &kp(1), o)), &StubExecutor), Ok(()));
     }
 
     #[test]
