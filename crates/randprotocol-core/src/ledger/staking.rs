@@ -667,10 +667,12 @@ impl Ledger {
 
     /// Every note `tx` would make the ledger create beyond the ones it carries on the wire, in
     /// the order the ledger appends them: [`Self::derived_commitment`]'s one for the actions it
-    /// answers, and for an RPL-2 `Invoke` one per payout of its transition, pays then mints
-    /// ([`super::program_state::payout_commitment`]). An invoke's notes are stamped with its
-    /// bundle's `time`, which is why this takes the transaction and the singular form, which
-    /// sees only the action, cannot answer for it.
+    /// answers, for an RPL-2 `Invoke` one per payout of its transition, pays then mints
+    /// ([`super::program_state::payout_commitment`]), and for an RPL-3 `PerpStateProof` one per
+    /// note its payouts mint ([`super::perps::payout_commitments`]). An invoke's notes are
+    /// stamped with its bundle's `time`, and a payout's opening is its pending request's, which
+    /// is why this takes the transaction and the ledger, and the singular form, which sees only
+    /// the action, cannot answer for either.
     ///
     /// Like the singular form this runs before validation — the mempool claims what a
     /// transaction would create in order to decide whether to validate it at all — so the payout
@@ -686,6 +688,9 @@ impl Ledger {
                 transition.payouts().map(|p| super::program_state::payout_commitment(p, b.time, executor)).collect()
             }
             (Action::Invoke { .. }, None) => Vec::new(),
+            // RPL-3: a state proof's payout notes, each computed from its pending request
+            // (`perps::payout_commitments`, capped before anything is hashed).
+            (Action::PerpStateProof { .. }, None) => super::perps::payout_commitments(self, tx, executor),
             (action, _) => self.derived_commitment(action, executor).into_iter().collect(),
         }
     }

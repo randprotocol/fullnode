@@ -19,7 +19,7 @@
 //! The gate is the genesis `perps` section: without it the chain has no [`Perps`] at all.
 
 use super::{Ledger, TxError};
-use crate::confidential::ConfidentialExecutor;
+use crate::confidential::{ConfidentialError, ConfidentialExecutor};
 use crate::crypto::{merkle_root, Address, Hash, PublicKey, Signature};
 use crate::notes::{word8_from_bytes, word8_to_bytes, Envelope, ShieldedAddress, Word8, MAX_NOTE_VALUE};
 use crate::types::transaction::{Action, Transaction};
@@ -53,6 +53,13 @@ pub mod domain {
 /// The tiers a zkVM proof can be made at (`randprotocol-zkvm`'s `machine::TIERS`), restated
 /// because core cannot import it; a test in the zkvm crate pins the two.
 pub const TIERS: [u8; 6] = [10, 12, 14, 16, 18, 20];
+/// The `from` field of every withdrawal note a state proof pays: `"rpl3-pay"` in two
+/// little-endian words, then zeros. Fixed, so the note's commitment is the chain's to compute
+/// from the request alone, and no note made any other way can share one with a payout.
+pub const PERP_FROM: Word8 = [u32::from_le_bytes(*b"rpl3"), u32::from_le_bytes(*b"-pay"), 0, 0, 0, 0, 0, 0];
+// Every payout is a leaf the ledger appends itself, and a `PerpStateProof` carries no bundle:
+// the per-transaction leaf budget the tree-room check reserves must hold all of them.
+const _: () = assert!(MAX_PERP_PAYOUTS as u64 <= super::MAX_LEAVES_PER_TX);
 /// The most blocks `max_window_blocks` may set one state proof to cover.
 pub const MAX_WINDOW_BLOCKS: u64 = 64;
 /// The widest a nonce window reaches below its highest nonce: the 64 bits of `used`.
@@ -360,6 +367,12 @@ pub struct Perps {
     digests: BTreeMap<u64, Word8>,
     /// Pending withdrawals by request id.
     withdrawals: BTreeMap<Word8, PendingWithdrawal>,
+    /// Σ RAND ever deposited into the exchange (a RAND `PerpDeposit`'s `burn_r`), and Σ RAND
+    /// ever paid out of it by state proofs: audit state for the supply identity
+    /// ([`super::Ledger::audit`]), as `ProgramState`'s two counters are — derived from the
+    /// chain, outside the root. Both 0 on a chain whose collateral is a token.
+    pub rand_in: u64,
+    pub rand_out: u64,
     /// The current block's inputs so far. Transient: emptied at every block close.
     #[serde(skip)]
     block_inputs: Vec<PerpInput>,
@@ -369,8 +382,9 @@ pub struct Perps {
     last_block_words: Option<(u64, Vec<u32>)>,
 }
 
-/// Consensus fields only — exactly what the root commits, plus the genesis section: two ledgers
-/// that agree on them are equal whatever their in-flight transient fields hold.
+/// Consensus fields only — exactly what the root commits, plus the genesis section and the two
+/// audit counters (derived from the chain, as `ProgramState`'s are): two ledgers that agree on
+/// them are equal whatever their in-flight transient fields hold.
 impl PartialEq for Perps {
     fn eq(&self, other: &Perps) -> bool {
         self.config == other.config
@@ -381,6 +395,8 @@ impl PartialEq for Perps {
             && self.proved_height == other.proved_height
             && self.digests == other.digests
             && self.withdrawals == other.withdrawals
+            && self.rand_in == other.rand_in
+            && self.rand_out == other.rand_out
     }
 }
 
@@ -396,6 +412,8 @@ impl Perps {
             proved_height: 0,
             digests: BTreeMap::new(),
             withdrawals: BTreeMap::new(),
+            rand_in: 0,
+            rand_out: 0,
             block_inputs: Vec::new(),
             last_block_words: None,
         }
@@ -596,7 +614,7 @@ fn request_id(tx: &Transaction) -> Word8 {
     word8_from_bytes(tx.hash().as_bytes()).expect("a hash is 32 bytes")
 }
 
-/// One of the five perp actions this module's rules cover (34–38), its fields borrowed. The
+/// One of the six perp actions (34–39), its fields borrowed. The
 /// one place an [`Action`] is classified here: every variant is spelled out in [`PerpAction::of`],
 /// so a new variant does not compile until it is placed.
 enum PerpAction<'a> {
@@ -630,6 +648,13 @@ enum PerpAction<'a> {
         nonce: u64,
         signature: &'a Signature,
     },
+    StateProof {
+        from: u64,
+        to: u64,
+        new_root: &'a Word8,
+        payouts: &'a [PerpPayout],
+        fees: u64,
+    },
 }
 
 impl<'a> PerpAction<'a> {
@@ -654,6 +679,10 @@ impl<'a> PerpAction<'a> {
             }
             Action::PerpOracle { validator, prices, nonce, signature } => {
                 Some(PerpAction::Oracle { validator, prices, nonce: *nonce, signature })
+            }
+            // The proof itself is read by `verify_state_proof`, last.
+            Action::PerpStateProof { from_height, to_height, new_root, payouts, fees, proof: _ } => {
+                Some(PerpAction::StateProof { from: *from_height, to: *to_height, new_root, payouts, fees: *fees })
             }
             Action::None
             | Action::Mint { .. }
@@ -688,16 +717,15 @@ impl<'a> PerpAction<'a> {
             | Action::RotatePqGuardiansV2 { .. }
             | Action::RotatePauseKeyV2 { .. }
             | Action::CancelRotation { .. }
-            | Action::Invoke { .. }
-            // Task 4's: its admission is not this module's yet.
-            | Action::PerpStateProof { .. } => None,
+            | Action::Invoke { .. } => None,
         }
     }
 
-    /// The signature over [`Transaction::perp_sign_message`]; `None` for a deposit.
+    /// The signature over [`Transaction::perp_sign_message`]; `None` for a deposit and a state
+    /// proof, which the bundle and the STARK authorise.
     fn signature(&self) -> Option<&'a Signature> {
         match self {
-            PerpAction::Deposit { .. } => None,
+            PerpAction::Deposit { .. } | PerpAction::StateProof { .. } => None,
             PerpAction::Order { signature, .. }
             | PerpAction::Cancel { signature, .. }
             | PerpAction::Withdraw { signature, .. }
@@ -707,7 +735,7 @@ impl<'a> PerpAction<'a> {
 }
 
 /// The refusal for an action this module's rules do not cover — unreachable through
-/// `validate_inner` and `apply_tx_with`, which route only the five here.
+/// `validate_inner` and `apply_tx_with`, which route only the six here.
 const NOT_PERP: TxError = TxError::UnsupportedAction("not a perp action");
 
 /// Every rule of a perp action but its signature, in `validate`'s order, against this ledger's
@@ -789,15 +817,139 @@ fn check<'a>(ledger: &'a Ledger, tx: &Transaction, action: &PerpAction<'a>) -> R
             }
             Ok(Some(validator))
         }
+        PerpAction::StateProof { from, to, payouts, .. } => {
+            check_state_proof(p, from, to, payouts)?;
+            Ok(None)
+        }
     }
+}
+
+/// A state proof's rules against the ledger's state, before its segment is built or its STARK
+/// looked at — compares and map lookups only:
+///
+/// 1. at most [`MAX_PERP_PAYOUTS`] payouts;
+/// 2. the window starts at the proved height and covers `1..=max_window_blocks` blocks;
+/// 3. every block in it has its digest recorded — so every one of them is closed, which is the
+///    whole bound on `to`: a proof ending at the tip is admissible at the pool (whose ledger is
+///    the tip's) and in the next block alike;
+/// 4. every payout names a pending request, at most its amount, each request once and in
+///    ascending order (so a list has one encoding).
+fn check_state_proof(p: &Perps, from: u64, to: u64, payouts: &[PerpPayout]) -> Result<(), PerpError> {
+    if payouts.len() > MAX_PERP_PAYOUTS {
+        return Err(PerpError::TooManyPayouts(payouts.len()));
+    }
+    let max = p.config.max_window_blocks;
+    if from != p.proved_height || to <= from || to - from > max {
+        return Err(PerpError::WindowMismatch { from, to, proved: p.proved_height, max });
+    }
+    if let Some(h) = (from + 1..=to).find(|h| !p.digests.contains_key(h)) {
+        return Err(PerpError::MissingDigest(h));
+    }
+    let mut last: Option<&Word8> = None;
+    for po in payouts {
+        if last.is_some_and(|l| po.request <= *l) {
+            return Err(PerpError::UnorderedPayouts);
+        }
+        let w = p.withdrawals.get(&po.request).ok_or(PerpError::UnknownRequest)?;
+        if po.amount > w.amount {
+            return Err(PerpError::PayoutTooLarge {
+                request: crate::notes::word8_to_hex(&po.request),
+                want: po.amount,
+                have: w.amount,
+            });
+        }
+        last = Some(&po.request);
+    }
+    Ok(())
+}
+
+/// The note a payout of `amount` against `w` becomes: the request's recipient, blinding and
+/// time, [`PERP_FROM`], the collateral asset — every field fixed by the request but the amount,
+/// which the proof decides.
+fn payout_commitment(executor: &dyn ConfidentialExecutor, w: &PendingWithdrawal, amount: u64, asset: u32) -> Word8 {
+    executor.note_commitment(&w.recipient.pk, &PERP_FROM, amount, asset, w.time, &w.r)
+}
+
+/// The notes a `PerpStateProof` would make the ledger append, in order — one per payout of a
+/// positive amount against a pending request, a note the tree (or an earlier payout of the same
+/// proof) already holds left out, as [`apply`] leaves it out. For the pool's conflict index
+/// (`Ledger::derived_commitments`); empty for any other transaction, on a chain without the
+/// section, and for a list over [`MAX_PERP_PAYOUTS`] (which `validate` refuses) — capped before
+/// anything is hashed.
+pub fn payout_commitments(ledger: &Ledger, tx: &Transaction, executor: &dyn ConfidentialExecutor) -> Vec<Word8> {
+    let (Action::PerpStateProof { payouts, .. }, Some(p)) = (&tx.action, ledger.perps()) else {
+        return Vec::new();
+    };
+    if payouts.len() > MAX_PERP_PAYOUTS {
+        return Vec::new();
+    }
+    let mut out: Vec<Word8> = Vec::with_capacity(payouts.len());
+    for po in payouts.iter().filter(|po| po.amount > 0) {
+        let Some(w) = p.withdrawals.get(&po.request) else { continue };
+        let cm = payout_commitment(executor, w, po.amount, p.config.collateral_asset);
+        if !ledger.has_commitment(&cm) && !out.contains(&cm) {
+            out.push(cm);
+        }
+    }
+    out
+}
+
+/// The public segment a state proof that [`check_state_proof`] accepted must verify against,
+/// built from the ledger's own proved root and recorded digests and the transaction's claims.
+fn state_segment(
+    p: &Perps,
+    from: u64,
+    to: u64,
+    new_root: &Word8,
+    payouts: &[PerpPayout],
+    fees: u64,
+    executor: &dyn ConfidentialExecutor,
+) -> Result<Vec<u32>, PerpError> {
+    let digests = (from + 1..=to)
+        .map(|h| p.digests.get(&h).copied().ok_or(PerpError::MissingDigest(h)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(state_proof_segment(from, to, &p.proved_root, new_root, &payouts_digest(executor, payouts), fees, &digests))
+}
+
+/// Step 10 of admission for a `PerpStateProof`, after every cheap check: the STARK against the
+/// engine commitment and the tier cap of the genesis section, over `segment` ([`validate`]'s);
+/// `admitted` (the verified set vouches for these bytes, B5) decodes instead of verifying, the
+/// segment's digest still compared. Then the engine's own two words: the version it ran and the
+/// number of blocks it ran over. A tier refusal keeps its name; any other is `ProofRefused`.
+pub(super) fn verify_state_proof(
+    ledger: &Ledger,
+    action: &Action,
+    segment: &[u32],
+    executor: &dyn ConfidentialExecutor,
+    admitted: bool,
+) -> Result<(), TxError> {
+    let p = ledger.perps().ok_or(PerpError::Disabled)?;
+    let Action::PerpStateProof { from_height, to_height, proof, .. } = action else {
+        return Err(NOT_PERP);
+    };
+    let c = &p.config;
+    let outcome = if admitted {
+        executor.decode_perp(&c.engine_hc, c.max_tier, segment, proof)
+    } else {
+        executor.verify_perp(&c.engine_hc, c.max_tier, segment, proof)
+    }
+    .map_err(|e| match e {
+        ConfidentialError::CallTierTooHigh { tier, max } => PerpError::TierTooHigh { tier, max },
+        e => PerpError::ProofRefused(e.to_string()),
+    })?;
+    if outcome.outputs[0] != PERP_VERSION || u64::from(outcome.outputs[1]) != to_height - from_height {
+        return Err(PerpError::ProofRefused("outputs".into()).into());
+    }
+    Ok(())
 }
 
 /// Whether `tx`, a perp action [`validate`] accepted on an earlier state, can still apply on
 /// `ledger`: [`validate`] without the signature, with the verdict [`validate`] would give — the
 /// account still exists, the nonce is still free, the request is not already pending, the
 /// oracle nonce is still above the validator's last and the validator still in the set, the
-/// withdrawal's time still in the window. For a node's pool, which asks after every block.
-/// `Ok` for every other action (and, until Task 4, for a state proof).
+/// withdrawal's time still in the window; for a state proof, the window still starts at the
+/// proved height, its digests are recorded and its payouts' requests are still pending. For a
+/// node's pool, which asks after every block. No hash, no proof. `Ok` for every other action.
 pub fn still_applies(ledger: &Ledger, tx: &Transaction) -> Result<(), TxError> {
     match PerpAction::of(&tx.action) {
         Some(a) => check(ledger, tx, &a).map(|_| ()),
@@ -805,23 +957,35 @@ pub fn still_applies(ledger: &Ledger, tx: &Transaction) -> Result<(), TxError> {
     }
 }
 
-/// The action step of admission for a perp action (34–38): the section's gate, the action's
+/// The action step of admission for a perp action (34–39): the section's gate, the action's
 /// own rules against the ledger, then — last, the one expensive check — the signature over
 /// [`Transaction::perp_sign_message`]. A deposit has no signature: its bundle, whose proof the
-/// common path verifies after this, authorises it.
+/// common path verifies after this, authorises it. A state proof has none either: its rules
+/// here are the cheap ones ([`check_state_proof`]), and this returns the segment its STARK must
+/// verify against, which the common path's step 10 hands to [`verify_state_proof`] — after
+/// every other check of the transaction, as a call's proof is.
 ///
 /// Nothing is written: every refusal [`apply`] could make is made here.
-pub(super) fn validate(ledger: &Ledger, tx: &Transaction, action: &Action) -> Result<(), TxError> {
+pub(super) fn validate(
+    ledger: &Ledger,
+    tx: &Transaction,
+    action: &Action,
+    executor: &dyn ConfidentialExecutor,
+) -> Result<Option<Vec<u32>>, TxError> {
     let a = PerpAction::of(action).ok_or(NOT_PERP)?;
     let key = check(ledger, tx, &a)?;
+    if let PerpAction::StateProof { from, to, new_root, payouts, fees } = a {
+        let p = ledger.perps().ok_or(PerpError::Disabled)?;
+        return Ok(Some(state_segment(p, from, to, new_root, payouts, fees, executor)?));
+    }
     let (Some(key), Some(signature)) = (key, a.signature()) else {
-        return Ok(()); // a deposit: the bundle authorises it
+        return Ok(None); // a deposit: the bundle authorises it
     };
     let msg = Transaction::perp_sign_message(tx.chain_id, action).ok_or(PerpError::BadSignature)?;
     if !key.verify(msg.as_bytes(), signature) {
         return Err(PerpError::BadSignature.into());
     }
-    Ok(())
+    Ok(None)
 }
 
 /// The apply step, in lockstep with [`validate`]: everything fallible is decided before the
@@ -829,8 +993,18 @@ pub(super) fn validate(ledger: &Ledger, tx: &Transaction, action: &Action) -> Re
 /// account, an order, a cancel and a withdrawal take their nonce, a withdrawal is held under its
 /// request id, and each of those four is recorded as the block's next input; an oracle records
 /// its prices at this height and its nonce, and is no input of its own — its prices reach the
-/// engine through the block's `Close`.
-pub(super) fn apply(ledger: &mut Ledger, tx: &Transaction, action: &Action) -> Result<(), TxError> {
+/// engine through the block's `Close`. A state proof advances the proved root and height, drops
+/// the digests it covered and settles each payout's request: a positive amount becomes the
+/// chain-computed note ([`payout_commitment`]), appended with the request's envelope for its
+/// owner's wallet — unless the tree already holds that very note (a requester chose an opening
+/// another note has: that payout mints nothing, rather than the proof, and every withdrawal
+/// behind it, being refused); a zero amount mints nothing.
+pub(super) fn apply(
+    ledger: &mut Ledger,
+    tx: &Transaction,
+    action: &Action,
+    executor: &dyn ConfidentialExecutor,
+) -> Result<(), TxError> {
     let a = PerpAction::of(action).ok_or(NOT_PERP)?;
     let height = ledger.height();
     let p = ledger.perps().ok_or(PerpError::Disabled)?;
@@ -841,7 +1015,15 @@ pub(super) fn apply(ledger: &mut Ledger, tx: &Transaction, action: &Action) -> R
             if !p.accounts.contains_key(&id) {
                 check_new_account(p, &id)?;
             }
+            // RAND collateral came in through `burn_r`, which the common path counted burned:
+            // the audit counts it back as the exchange's (`Ledger::audit`). A token's supply does
+            // not move on the way in or out, as a program vault's does not.
+            let rand_in = match p.config.collateral_asset {
+                0 => p.rand_in.checked_add(amount).ok_or(PerpError::Overflow)?,
+                _ => p.rand_in,
+            };
             let p = ledger.perps_mut().ok_or(PerpError::Disabled)?;
+            p.rand_in = rand_in;
             p.accounts.entry(id).or_insert_with(|| PerpAccount {
                 trading_key: trading_key.clone(),
                 nonce_high: 0,
@@ -892,6 +1074,37 @@ pub(super) fn apply(ledger: &mut Ledger, tx: &Transaction, action: &Action) -> R
                 p.oracle.entry(price.market).or_default().submissions.insert(address, (price.price, height));
             }
             p.oracle_nonces.insert(address, nonce);
+        }
+        PerpAction::StateProof { from, to, new_root, payouts, .. } => {
+            // Everything fallible first: the rules again, each note, the counter.
+            check_state_proof(p, from, to, payouts)?;
+            let asset = p.config.collateral_asset;
+            let mut notes: Vec<(Word8, Envelope)> = Vec::with_capacity(payouts.len());
+            let mut paid = 0u64;
+            for po in payouts.iter().filter(|po| po.amount > 0) {
+                let w = p.withdrawals.get(&po.request).ok_or(PerpError::UnknownRequest)?;
+                notes.push((payout_commitment(executor, w, po.amount, asset), w.envelope.clone()));
+                paid = paid.checked_add(po.amount).ok_or(PerpError::Overflow)?;
+            }
+            // A payout whose note already exists left the exchange all the same, so the counter
+            // takes every positive payout, minted or not: the identity holds either way.
+            let rand_out = match asset {
+                0 => p.rand_out.checked_add(paid).ok_or(PerpError::Overflow)?,
+                _ => p.rand_out,
+            };
+            let p = ledger.perps_mut().ok_or(PerpError::Disabled)?;
+            p.proved_root = *new_root;
+            p.proved_height = to;
+            p.digests.retain(|h, _| *h > to);
+            for po in payouts {
+                p.withdrawals.remove(&po.request);
+            }
+            p.rand_out = rand_out;
+            for (cm, envelope) in notes {
+                if !ledger.has_commitment(&cm) {
+                    ledger.append_deposit(cm, envelope, executor)?;
+                }
+            }
         }
     }
     Ok(())
@@ -1018,6 +1231,8 @@ pub enum PerpError {
     MissingDigest(u64),
     #[error("no pending withdrawal has this request id")]
     UnknownRequest,
+    #[error("a state proof's payouts name each request once, in ascending order")]
+    UnorderedPayouts,
     #[error("withdrawal {request} asked for {have}; the payout is {want}")]
     PayoutTooLarge { request: String, want: u64, have: u64 },
     #[error("the proof is at tier {tier}; this chain allows at most {max}")]
@@ -1677,7 +1892,11 @@ mod tests {
         // A submitter that has left the set is dropped.
         o.submissions.insert(Address([0xee; 32]), (1, 10));
         assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 10), Some(200));
-        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 40), Some(200), "30 blocks on, still fresh");
+        assert_eq!(
+            stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 40),
+            Some(200),
+            "30 blocks on, still fresh"
+        );
         assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 41), None, "everything is stale");
         assert_eq!(stake_median(&OracleState::default(), &|a| vals.get(a).map_or(0, |v| v.stake), 10), None);
     }
@@ -1771,7 +1990,8 @@ mod tests {
             fees: 0,
             proof: vec![],
         });
-        assert_eq!(refusal(&l, &proof), TxError::UnsupportedAction("perp"), "Task 4's");
+        assert_eq!(refusal(&l, &proof), pe(PerpError::Disabled));
+        assert_eq!(still_applies(&l, &proof), Err(pe(PerpError::Disabled)));
         // The root is the parent commit's, byte for byte, with and without RPL-2's section.
         assert_eq!(hex::encode(l.state_root().as_bytes()), ROOT_BEFORE);
         close(&mut l, 1);
@@ -1834,7 +2054,10 @@ mod tests {
         assert_eq!(still_applies(&l, &w(9)), Err(pe(PerpError::TooManyWithdrawals)));
         // `apply` holds the cap too, before any write.
         let before = l.clone();
-        assert_eq!(l.apply_tx(&w(9), &kp(1).address(), &StubExecutor).map(|_| ()), Err(pe(PerpError::TooManyWithdrawals)));
+        assert_eq!(
+            l.apply_tx(&w(9), &kp(1).address(), &StubExecutor).map(|_| ()),
+            Err(pe(PerpError::TooManyWithdrawals))
+        );
         assert!(l == before);
         // A proof pays one (simulated): a slot is free again.
         let paid = *l.perps().unwrap().withdrawals.keys().next().unwrap();
@@ -1858,7 +2081,10 @@ mod tests {
         dep(&mut l, &k, 10, RAND).unwrap();
         let max = crate::notes::MAX_NOTE_VALUE;
         assert_eq!(refusal(&l, &bare(signed(CHAIN, &k, withdraw(&k, 1, max, 1)))), pe(PerpError::AmountTooLarge(max)));
-        assert_eq!(refusal(&l, &bare(signed(CHAIN, &k, withdraw(&k, 1, u64::MAX, 1)))), pe(PerpError::AmountTooLarge(u64::MAX)));
+        assert_eq!(
+            refusal(&l, &bare(signed(CHAIN, &k, withdraw(&k, 1, u64::MAX, 1)))),
+            pe(PerpError::AmountTooLarge(u64::MAX))
+        );
         apply(&mut l, &bare(signed(CHAIN, &k, withdraw(&k, 1, max - 1, 1)))).expect("just under the bound");
     }
 
@@ -1884,5 +2110,266 @@ mod tests {
         assert_eq!(o.submissions.len(), 2);
         assert_eq!(o.median, 200);
         assert_ne!(l.perps().unwrap().root(), root);
+    }
+
+    // ---- Task 4: the state proof ----
+
+    /// The engine commitment `sample_config` pins.
+    const ENGINE: Word8 = [9; 8];
+
+    /// The stub outputs an honest engine run over `n` blocks publishes.
+    fn outs(n: u32) -> [u32; 8] {
+        [PERP_VERSION, n, 0, 0, 0, 1, 0, 0]
+    }
+
+    /// The segment `l` holds a proof of `from..=to` to, as the ledger builds it (missing digests
+    /// read as zeros, so a test can make a proof over a window the ledger does not have).
+    fn segment_on(l: &Ledger, from: u64, to: u64, new_root: &Word8, payouts: &[PerpPayout], fees: u64) -> Vec<u32> {
+        let p = l.perps().unwrap();
+        let digests: Vec<Word8> = (from + 1..=to).map(|h| p.digest(h).unwrap_or([0; 8])).collect();
+        state_proof_segment(from, to, &p.proved_root, new_root, &payouts_digest(&StubExecutor, payouts), fees, &digests)
+    }
+
+    fn proof_tx(
+        from: u64,
+        to: u64,
+        new_root: Word8,
+        payouts: Vec<PerpPayout>,
+        fees: u64,
+        proof: Vec<u8>,
+    ) -> Transaction {
+        bare(Action::PerpStateProof { from_height: from, to_height: to, new_root, payouts, fees, proof })
+    }
+
+    /// A state proof of `from..=to` the stub accepts on `l`: tier 16, honest outputs.
+    fn state_proof(
+        l: &Ledger,
+        from: u64,
+        to: u64,
+        new_root: Word8,
+        payouts: Vec<PerpPayout>,
+        fees: u64,
+    ) -> Transaction {
+        let seg = segment_on(l, from, to, &new_root, &payouts, fees);
+        let proof = StubExecutor::make_perp_proof(&ENGINE, 16, outs((to - from) as u32), &seg);
+        proof_tx(from, to, new_root, payouts, fees, proof)
+    }
+
+    /// The note a payout of `amount` against the `withdraw(..)` request makes.
+    fn payout_cm(amount: u64, time: u32) -> Word8 {
+        StubExecutor.note_commitment(&recipient().pk, &PERP_FROM, amount, 0, time, &[5; 8])
+    }
+
+    /// A ledger with key 50's deposit of `RAND` and its withdrawal request of `amount` (nonce 1,
+    /// time 1) at height 1, blocks 1 and 2 closed. Returns the request id.
+    fn withdrawn(amount: u64) -> (Ledger, Word8) {
+        let mut l = ledger_with(true);
+        let k = kp(50);
+        dep(&mut l, &k, 10, RAND).unwrap();
+        let tx = bare(signed(CHAIN, &k, withdraw(&k, 1, amount, 1)));
+        apply(&mut l, &tx).unwrap();
+        close(&mut l, 1);
+        close(&mut l, 2);
+        (l, word8_from_bytes(tx.hash().as_bytes()).unwrap())
+    }
+
+    #[test]
+    fn a_state_proof_advances_the_root_and_pays_a_withdrawal() {
+        let (mut l, request) = withdrawn(5);
+        let payouts = vec![PerpPayout { request, amount: 5 }];
+        let tx = state_proof(&l, 0, 2, [7; 8], payouts, 0);
+        // The window ends at the tip: the pool (on the tip ledger, height 2) admits it …
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()), "a proof over the tip block is admissible at the pool");
+        // … and the next block (height 3) applies it.
+        l.set_height(3);
+        let leaves = l.tree.remaining();
+        apply(&mut l, &tx).unwrap();
+        let p = l.perps().unwrap();
+        assert_eq!((p.proved_height, p.proved_root), (2, [7; 8]));
+        assert_eq!(p.pending_heights(), Vec::<u64>::new(), "the covered digests are dropped");
+        assert!(p.withdrawal(&request).is_none(), "the request is paid");
+        assert_eq!(leaves - l.tree.remaining(), 1, "one note");
+        let cm = payout_cm(5, 1);
+        assert!(l.has_commitment(&cm), "the chain-computed note");
+        let d = l.deposits().last().expect("recorded for storage");
+        assert_eq!((d.cm, &d.envelope), (cm, &env()), "with the request's envelope, which the wallet opens");
+        // The supply audit: the deposit burned RAND into the exchange, the payout brought 5 back.
+        let a = l.audit();
+        assert!(a.invariant_holds(), "{a:?}");
+        assert_eq!((a.perps_rand_out, a.perps_rand_held), (5, RAND - 5));
+        // A replay is stale.
+        assert!(matches!(refusal(&l, &tx), TxError::Perps(PerpError::WindowMismatch { .. })));
+    }
+
+    #[test]
+    fn a_state_proof_from_the_wrong_height_or_with_a_gap_is_refused() {
+        let (l, _) = withdrawn(5);
+        let window = |from, to| pe(PerpError::WindowMismatch { from, to, proved: 0, max: 8 });
+        assert_eq!(refusal(&l, &state_proof(&l, 1, 2, [7; 8], vec![], 0)), window(1, 2), "not the proved height");
+        assert_eq!(refusal(&l, &state_proof(&l, 0, 0, [7; 8], vec![], 0)), window(0, 0), "an empty window");
+        assert_eq!(
+            refusal(&l, &proof_tx(0, 9, [7; 8], vec![], 0, b"junk".to_vec())),
+            window(0, 9),
+            "past max_window_blocks"
+        );
+        assert_eq!(
+            refusal(&l, &state_proof(&l, 0, 3, [7; 8], vec![], 0)),
+            pe(PerpError::MissingDigest(3)),
+            "block 3 is not closed"
+        );
+        // A proof that covers nothing pays nothing but still advances: 0..=1, then 1..=2.
+        let mut l = l;
+        l.set_height(3);
+        let first = state_proof(&l, 0, 1, [6; 8], vec![], 0);
+        apply(&mut l, &first).unwrap();
+        assert_eq!(l.perps().unwrap().pending_heights(), vec![2]);
+        assert_eq!(
+            refusal(&l, &state_proof(&l, 0, 2, [7; 8], vec![], 0)),
+            pe(PerpError::WindowMismatch { from: 0, to: 2, proved: 1, max: 8 })
+        );
+        let second = state_proof(&l, 1, 2, [7; 8], vec![], 0);
+        apply(&mut l, &second).unwrap();
+        assert_eq!(l.perps().unwrap().proved_root, [7; 8]);
+    }
+
+    #[test]
+    fn a_payout_for_an_unknown_request_or_above_the_request_is_refused_before_verification() {
+        let (l, request) = withdrawn(5);
+        let junk = |payouts: Vec<PerpPayout>| proof_tx(0, 2, [7; 8], payouts, 0, b"junk".to_vec());
+        assert_eq!(refusal(&l, &junk(vec![PerpPayout { request: [3; 8], amount: 1 }])), pe(PerpError::UnknownRequest));
+        assert_eq!(
+            refusal(&l, &junk(vec![PerpPayout { request, amount: 6 }])),
+            pe(PerpError::PayoutTooLarge { request: crate::notes::word8_to_hex(&request), want: 6, have: 5 })
+        );
+        let twice = vec![PerpPayout { request, amount: 1 }, PerpPayout { request, amount: 1 }];
+        assert_eq!(refusal(&l, &junk(twice)), pe(PerpError::UnorderedPayouts), "each request once, ascending");
+        let nine = vec![PerpPayout { request, amount: 1 }; MAX_PERP_PAYOUTS + 1];
+        assert_eq!(refusal(&l, &junk(nine)), pe(PerpError::TooManyPayouts(MAX_PERP_PAYOUTS + 1)));
+        // The same transaction with a good payout reaches the proof, and the junk is refused there.
+        assert!(matches!(
+            refusal(&l, &junk(vec![PerpPayout { request, amount: 5 }])),
+            TxError::Perps(PerpError::ProofRefused(_))
+        ));
+        // `still_applies` asks the same cheap questions.
+        assert_eq!(
+            still_applies(&l, &junk(vec![PerpPayout { request: [3; 8], amount: 1 }])),
+            Err(pe(PerpError::UnknownRequest))
+        );
+        assert_eq!(still_applies(&l, &junk(vec![PerpPayout { request, amount: 5 }])), Ok(()));
+    }
+
+    #[test]
+    fn a_tier_above_the_cap_is_refused_by_the_executor() {
+        let (l, _) = withdrawn(5);
+        let seg = segment_on(&l, 0, 2, &[7; 8], &[], 0);
+        for (tier, ok) in [(16, true), (14, true), (20, false), (11, false)] {
+            let tx = proof_tx(0, 2, [7; 8], vec![], 0, StubExecutor::make_perp_proof(&ENGINE, tier, outs(2), &seg));
+            let got = l.validate(&tx, &StubExecutor);
+            if ok {
+                assert_eq!(got, Ok(()), "tier {tier}");
+            } else {
+                assert_eq!(got, Err(pe(PerpError::TierTooHigh { tier, max: 16 })), "tier {tier}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_segment_binds_the_payouts_and_fees() {
+        let (l, request) = withdrawn(5);
+        let paid = vec![PerpPayout { request, amount: 5 }];
+        let good = state_proof(&l, 0, 2, [7; 8], paid.clone(), 3);
+        assert_eq!(l.validate(&good, &StubExecutor), Ok(()));
+        let Action::PerpStateProof { proof, .. } = &good.action else { unreachable!() };
+        let with = |new_root: Word8, payouts: Vec<PerpPayout>, fees: u64| {
+            proof_tx(0, 2, new_root, payouts, fees, proof.clone())
+        };
+        let refused = |tx: &Transaction| matches!(refusal(&l, tx), TxError::Perps(PerpError::ProofRefused(_)));
+        assert!(refused(&with([7; 8], paid.clone(), 4)), "the fees");
+        assert!(refused(&with([7; 8], vec![PerpPayout { request, amount: 4 }], 3)), "a payout's amount");
+        assert!(refused(&with([7; 8], vec![], 3)), "the payouts list");
+        assert!(refused(&with([8; 8], paid.clone(), 3)), "the new root");
+        // Another engine's proof, and an engine run that is not this version or this window.
+        let seg = segment_on(&l, 0, 2, &[7; 8], &paid, 3);
+        let other = StubExecutor::make_perp_proof(&[1; 8], 16, outs(2), &seg);
+        assert!(refused(&proof_tx(0, 2, [7; 8], paid.clone(), 3, other)));
+        for o in [[2, 2, 0, 0, 0, 1, 0, 0], [PERP_VERSION, 1, 0, 0, 0, 1, 0, 0]] {
+            let p = StubExecutor::make_perp_proof(&ENGINE, 16, o, &seg);
+            assert_eq!(
+                refusal(&l, &proof_tx(0, 2, [7; 8], paid.clone(), 3, p)),
+                pe(PerpError::ProofRefused("outputs".into()))
+            );
+        }
+        // The ledger's own state is in the segment: a different recorded digest refuses the proof.
+        let mut moved = l.clone();
+        moved.perps_mut().unwrap().digests.insert(2, [0xd; 8]);
+        assert!(matches!(refusal(&moved, &good), TxError::Perps(PerpError::ProofRefused(_))));
+    }
+
+    #[test]
+    fn a_zero_payout_drops_the_request_and_mints_nothing_and_a_refusal_writes_nothing() {
+        let (mut l, request) = withdrawn(5);
+        l.set_height(3);
+        // Refused: the ledger is untouched, and apply refuses with validate's words.
+        let bad = state_proof(&l, 0, 2, [7; 8], vec![PerpPayout { request, amount: 6 }], 0);
+        let before = l.clone();
+        assert_eq!(l.apply_tx(&bad, &kp(1).address(), &StubExecutor).map(|_| ()), Err(refusal(&l, &bad)));
+        assert!(l == before);
+        let leaves = l.tree.remaining();
+        let zero = state_proof(&l, 0, 2, [7; 8], vec![PerpPayout { request, amount: 0 }], 0);
+        apply(&mut l, &zero).unwrap();
+        assert!(l.perps().unwrap().withdrawal(&request).is_none());
+        assert_eq!(l.tree.remaining(), leaves, "no note");
+        assert!(l.deposits().is_empty());
+        let a = l.audit();
+        assert!(a.invariant_holds());
+        assert_eq!((a.perps_rand_out, a.perps_rand_held), (0, RAND));
+    }
+
+    #[test]
+    fn the_pool_claims_a_state_proofs_payout_notes() {
+        let (l, request) = withdrawn(5);
+        let tx = state_proof(&l, 0, 2, [7; 8], vec![PerpPayout { request, amount: 5 }], 0);
+        assert_eq!(l.derived_commitments(&tx, &StubExecutor), vec![payout_cm(5, 1)]);
+        let zero = state_proof(&l, 0, 2, [7; 8], vec![PerpPayout { request, amount: 0 }], 0);
+        assert_eq!(l.derived_commitments(&zero, &StubExecutor), Vec::<Word8>::new(), "a zero payout makes no note");
+        let unknown = state_proof(&l, 0, 2, [7; 8], vec![PerpPayout { request: [3; 8], amount: 5 }], 0);
+        assert_eq!(l.derived_commitments(&unknown, &StubExecutor), Vec::<Word8>::new());
+        assert_eq!(ledger_with(false).derived_commitments(&tx, &StubExecutor), Vec::<Word8>::new());
+    }
+
+    /// A requester chooses its note's opening, so two requests can name one note — a copy of
+    /// another's paid or pending opening. The second payout of it mints nothing (the note exists)
+    /// rather than refusing the proof, which would stall every withdrawal behind it.
+    #[test]
+    fn a_payout_whose_note_already_exists_is_dropped_not_refused() {
+        let mut l = ledger_with(true);
+        let (a, b) = (kp(50), kp(51));
+        dep(&mut l, &a, 10, RAND).unwrap();
+        dep(&mut l, &b, 20, RAND).unwrap();
+        let wa = bare(signed(CHAIN, &a, withdraw(&a, 1, 5, 1)));
+        let wb = bare(signed(CHAIN, &b, withdraw(&b, 1, 5, 1)));
+        apply(&mut l, &wa).unwrap();
+        apply(&mut l, &wb).unwrap();
+        close(&mut l, 1);
+        let mut ids =
+            [word8_from_bytes(wa.hash().as_bytes()).unwrap(), word8_from_bytes(wb.hash().as_bytes()).unwrap()];
+        ids.sort();
+        let payouts: Vec<PerpPayout> = ids.iter().map(|&request| PerpPayout { request, amount: 5 }).collect();
+        let tx = state_proof(&l, 0, 1, [7; 8], payouts, 0);
+        assert_eq!(l.derived_commitments(&tx, &StubExecutor), vec![payout_cm(5, 1)], "claimed once");
+        l.set_height(2);
+        let leaves = l.tree.remaining();
+        apply(&mut l, &tx).unwrap();
+        assert_eq!(leaves - l.tree.remaining(), 1);
+        assert_eq!(l.perps().unwrap().pending_heights(), Vec::<u64>::new());
+        assert!(ids.iter().all(|r| l.perps().unwrap().withdrawal(r).is_none()), "both requests are settled");
+        let a = l.audit();
+        assert!(a.invariant_holds(), "{a:?}");
+        assert_eq!(a.perps_rand_held, 2 * RAND - 10, "both left the exchange");
+    }
+
+    #[test]
+    fn eight_payouts_fit_the_per_transaction_leaf_budget() {
+        assert!(MAX_PERP_PAYOUTS as u64 <= crate::ledger::MAX_LEAVES_PER_TX);
     }
 }

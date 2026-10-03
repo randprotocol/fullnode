@@ -591,6 +591,13 @@ pub fn non_canonical_proofs(tx: &Transaction, check: &dyn Fn(&[u8]) -> Option<St
             return Some(TxError::NonCanonicalProof(format!("call proof: {why}")));
         }
     }
+    // RPL-3: a `PerpStateProof`'s STARK is a zkVM proof like a call's, kept in the binding the
+    // same way, so the same re-encoding rules hold for it.
+    if let Action::PerpStateProof { proof, .. } = &tx.action {
+        if let Some(why) = check(proof) {
+            return Some(TxError::NonCanonicalProof(format!("state proof: {why}")));
+        }
+    }
     None
 }
 
@@ -598,7 +605,9 @@ pub fn non_canonical_proofs(tx: &Transaction, check: &dyn Fn(&[u8]) -> Option<St
 /// at most one note the ledger derives itself (a `Withdraw` or `BridgeAttest` deposit, a faucet
 /// `Mint`, a `TokenMint` or `RegisterToken` initial mint, a vesting claim or revoke, an aggregate
 /// payout) — or, for an RPL-2 `Invoke`, the up to [`program_state::MAX_PAYOUTS`] notes its
-/// transition pays out. `validate_inner` refuses a transaction when the tree has fewer left.
+/// transition pays out, or for an RPL-3 `PerpStateProof` (no bundle) its up to
+/// [`perps::MAX_PERP_PAYOUTS`] payout notes. `validate_inner` refuses a transaction when the
+/// tree has fewer left.
 pub const MAX_LEAVES_PER_TX: u64 = crate::notes::BUNDLE_SLOTS as u64 + program_state::MAX_PAYOUTS as u64;
 
 fn has_duplicate(words: &[Word8]) -> bool {
@@ -1418,8 +1427,15 @@ impl Ledger {
             Some(v) => audit.with_vesting(v.issued(), v.released, v.in_register()),
             None => audit,
         };
-        match &self.program_state {
+        let audit = match &self.program_state {
             Some(p) => audit.with_program_vaults(p.rand_in, p.rand_out),
+            None => audit,
+        };
+        // RPL-3: the exchange's RAND is the identity's fifth term — a RAND `PerpDeposit`'s
+        // `burn_r` is counted burned by the common bundle path, so what the exchange holds has
+        // to be counted back here, and what state proofs paid out is pool value again.
+        match &self.perps {
+            Some(p) => audit.with_perps(p.rand_in, p.rand_out),
             None => audit,
         }
     }
@@ -2466,7 +2482,10 @@ impl Ledger {
             Action::Deploy { public, .. } if public.len() > self.max_program_public_words => {
                 return Err(TxError::ProgramPublicTooLarge)
             }
-            Action::Call { proof, .. } | Action::Invoke { proof, .. } if proof.len() > self.max_proof_bytes => {
+            // RPL-3: a state proof's STARK is held to the same cap as a call's.
+            Action::Call { proof, .. } | Action::Invoke { proof, .. } | Action::PerpStateProof { proof, .. }
+                if proof.len() > self.max_proof_bytes =>
+            {
                 return Err(TxError::ProofTooLarge)
             }
             Action::BridgeAttest { attestation, .. } if attestation.len() > gas::MAX_ATTESTATION_BYTES => {
@@ -2539,6 +2558,8 @@ impl Ledger {
         // 7. action-specific cheap checks
         let mut verified = Verified::default();
         let mut call_record = None;
+        // RPL-3: the segment a `PerpStateProof`'s STARK must verify against (step 10).
+        let mut perp_segment: Option<Vec<u32>> = None;
         match &tx.action {
             Action::None => {}
             Action::Mint { cm, pk, time, r, envelope, amount, minter, signature } => {
@@ -2703,16 +2724,16 @@ impl Ledger {
             }
             // RPL-3. Gated absolutely on the `perps` genesis section, which `perps::validate`
             // checks before anything else it does; the signature is the last thing it looks at.
-            // A deposit's bundle proof is the common path's, after this.
+            // A deposit's bundle proof is the common path's, after this; a state proof's STARK
+            // is step 10's, over the segment returned here.
             a @ (Action::PerpDeposit { .. }
             | Action::PerpOrder { .. }
             | Action::PerpCancel { .. }
             | Action::PerpWithdraw { .. }
-            | Action::PerpOracle { .. }) => {
-                perps::validate(self, tx, a)?;
+            | Action::PerpOracle { .. }
+            | Action::PerpStateProof { .. }) => {
+                perp_segment = perps::validate(self, tx, a, executor)?;
             }
-            // RPL-3: the state proof's admission is Task 4's; until it lands, it is refused.
-            Action::PerpStateProof { .. } => return Err(TxError::UnsupportedAction("perp")),
         }
         // 7b. under genesis `hardening_v6`, the canonical-proof rules (INT-5, VERIFIER-1/-2): a
         // header or transcript field the honest prover would not write — one the verifier accepts
@@ -2780,6 +2801,12 @@ impl Ledger {
                 return Err(TxError::FeeTooLow { min, fee });
             }
             verified.call = Some(outcome);
+        }
+        // RPL-3: a state proof's STARK, last — decoded on a verified-set hit, as a call's is. Its
+        // segment holds this ledger's proved root and digests, and the decode path still compares
+        // the proof's `H_PUB` with it, so the verdict stands only for the state it is applied on.
+        if let Some(segment) = &perp_segment {
+            perps::verify_state_proof(self, &tx.action, segment, executor, admitted)?;
         }
         Ok(verified)
     }
@@ -3085,16 +3112,17 @@ impl Ledger {
                 // the same so a direct caller hears where aggregates go.
                 return Err(TxError::AggregateNeedsCovered);
             }
-            // RPL-3: record the input (or, for an oracle, the submission). Every refusal was
-            // decided by `validate_inner`.
+            // RPL-3: record the input (or, for an oracle, the submission; for a state proof,
+            // advance the proved root and pay the withdrawals). Every refusal was decided by
+            // `validate_inner`.
             a @ (Action::PerpDeposit { .. }
             | Action::PerpOrder { .. }
             | Action::PerpCancel { .. }
             | Action::PerpWithdraw { .. }
-            | Action::PerpOracle { .. }) => {
-                perps::apply(self, tx, a)?;
+            | Action::PerpOracle { .. }
+            | Action::PerpStateProof { .. }) => {
+                perps::apply(self, tx, a, executor)?;
             }
-            Action::PerpStateProof { .. } => return Err(TxError::UnsupportedAction("perp")),
         }
         Ok(receipt)
     }

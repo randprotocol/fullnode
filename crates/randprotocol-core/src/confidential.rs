@@ -134,6 +134,34 @@ pub trait ConfidentialExecutor: Send + Sync {
     ) -> Result<CallOutcome, ConfidentialError> {
         self.verify_invoke(program, proof, segment)
     }
+    /// RPL-3 (`ledger::perps`): verify a `PerpStateProof`'s STARK — a proof of the engine guest
+    /// `engine_hc` (the genesis section's pin; there is no deployed record) made over exactly
+    /// `segment`, the public segment the ledger rebuilt from its own state
+    /// (`perps::state_proof_segment`). A proof at a tier outside `perps::TIERS` or above
+    /// `max_tier` (the section's) is refused as [`ConfidentialError::CallTierTooHigh`] before
+    /// anything is verified. The outcome is a call's: the ledger reads the outputs. The default
+    /// refuses: an executor that has not implemented the rules must not pass them by default.
+    fn verify_perp(
+        &self,
+        _engine_hc: &Word8,
+        _max_tier: u8,
+        _segment: &[u32],
+        _proof: &[u8],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        Err(ConfidentialError::InvalidProof("this executor does not implement the RPL-3 state-proof rules".into()))
+    }
+    /// [`Self::decode_invoke`]'s twin for [`Self::verify_perp`]: everything but the STARK
+    /// verification — the segment's digest is still compared, so the verified set's verdict
+    /// stands only for the segment this ledger builds now. Defaults to the full verify.
+    fn decode_perp(
+        &self,
+        engine_hc: &Word8,
+        max_tier: u8,
+        segment: &[u32],
+        proof: &[u8],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.verify_perp(engine_hc, max_tier, segment, proof)
+    }
     /// Precompute whatever makes `verify_call` fast for `program` (the zkVM verifier key,
     /// ~2 s). Called from a background task after a deploy commits and at startup; may be a no-op.
     fn warm(&self, _program: &ProgramRecord) {}
@@ -344,6 +372,26 @@ impl StubExecutor {
         v
     }
 
+    /// A stub `PerpStateProof` proof (RPL-3): [`Self::make_proof_with_public`]'s layout, with the
+    /// engine commitment `engine_hc` bound under its own domain (`rand-stub-perp`) where a call
+    /// binds its program id, and `H_PUB` the digest of `segment`.
+    pub fn make_perp_proof(engine_hc: &Word8, tier: u8, outputs: [u32; 8], segment: &[u32]) -> Vec<u8> {
+        let mut v = STUB_MARKER.to_vec();
+        v.push(tier);
+        for o in outputs {
+            v.extend_from_slice(&o.to_le_bytes());
+        }
+        v.extend_from_slice(&word8_to_bytes(&[0; 8]));
+        v.extend_from_slice(&word8_to_bytes(&StubExecutor.public_digest(segment)));
+        v.extend_from_slice(&Self::perp_binding(engine_hc));
+        v.extend_from_slice(&crate::gas::gas_max(tier, 0, 0).to_le_bytes());
+        v
+    }
+
+    fn perp_binding(engine_hc: &Word8) -> [u8; 8] {
+        Hash::digest_domain(b"rand-stub-perp", &word8_to_bytes(engine_hc)).0[..8].try_into().expect("8 bytes")
+    }
+
     /// Build a stub aggregate proof made under `binding` — the
     /// [`crate::types::actions::aggregate_binding`] of the `(chain, aggregator, nonce)` it was
     /// proved for (audit v3, AGG-2). The stub refuses it under any other binding, as the rVM
@@ -532,6 +580,33 @@ impl ConfidentialExecutor for StubExecutor {
         segment: &[u32],
     ) -> Result<CallOutcome, ConfidentialError> {
         self.verify_stub_call(program, proof, Some(segment), true)
+    }
+
+    /// The stub's RPL-3 rule, in the zkVM's order: the shape, the tier (in `perps::TIERS` and at
+    /// most `max_tier`), the engine binding, then the segment's digest.
+    fn verify_perp(
+        &self,
+        engine_hc: &Word8,
+        max_tier: u8,
+        segment: &[u32],
+        proof: &[u8],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        if proof.len() != STUB_LEN || &proof[..4] != STUB_MARKER {
+            return Err(ConfidentialError::MalformedProof);
+        }
+        let tier = proof[4];
+        if !crate::ledger::perps::TIERS.contains(&tier) || tier > max_tier {
+            return Err(ConfidentialError::CallTierTooHigh { tier, max: max_tier });
+        }
+        if proof[STUB_PROGRAM_BINDING..STUB_LEN - 8] != Self::perp_binding(engine_hc) {
+            return Err(ConfidentialError::WrongProgram);
+        }
+        if word8_from_bytes(&proof[69..101]).expect("32 bytes") != self.public_digest(segment) {
+            return Err(ConfidentialError::InvalidProof("PublicValues".into()));
+        }
+        let outputs = std::array::from_fn(|i| u32::from_le_bytes(proof[5 + 4 * i..9 + 4 * i].try_into().unwrap()));
+        let gas_limit = u64::from_le_bytes(proof[STUB_LEN - 8..].try_into().expect("8 bytes"));
+        Ok(CallOutcome { tier, outputs, h_in: [0; 8], keccak_log_height: 0, sha256_log_height: 0, gas_limit })
     }
 
     /// A blake3 stand-in for `H_PUB`, length-prefixed like the real one's header, so the empty
