@@ -162,6 +162,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         program_state: None,
         fees: None,
         incremental_nullifier_root: None,
+        perps: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -982,7 +983,7 @@ fn a_resumed_validator_keeps_its_lock() {
     after.set_height(height);
     after.set_timestamp_ms(sim.now);
     after.apply_transactions(&[], &proposer_addr, &StubExecutor).expect("an empty block applies");
-    after.close_block(height, &proposer_addr, 0, 0);
+    after.close_block(height, &proposer_addr, 0, 0, &StubExecutor);
     let header = crate::types::BlockHeader {
         height,
         view,
@@ -1347,7 +1348,7 @@ fn block_on_high_qc(sim: &Sim, node: usize, view: u64, key: &Keypair) -> Block {
     after.set_height(height);
     after.set_timestamp_ms(sim.now);
     after.apply_transactions(&[], &proposer.address(), &StubExecutor).expect("an empty block applies");
-    after.close_block(height, &proposer.address(), 0, 0);
+    after.close_block(height, &proposer.address(), 0, 0, &StubExecutor);
     let header = crate::types::BlockHeader {
         height,
         view,
@@ -1592,6 +1593,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         program_state: None,
         fees: None,
         incremental_nullifier_root: None,
+        perps: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -2217,6 +2219,7 @@ fn aggregation_node_with(
         program_state: None,
         fees: None,
         incremental_nullifier_root: None,
+        perps: None,
     };
     let mut gs = genesis.build(&StubExecutor).unwrap();
     // Register the aggregator directly on the genesis ledger the node builds on (the register
@@ -2485,7 +2488,7 @@ fn block_on_head(sim: &Sim, node: usize, view: u64, timestamp_ms: u64) -> Block 
     after.set_height(height);
     after.set_timestamp_ms(timestamp_ms);
     after.apply_transactions(&[], &proposer_addr, &StubExecutor).expect("an empty block applies");
-    after.close_block(height, &proposer_addr, 0, 0);
+    after.close_block(height, &proposer_addr, 0, 0, &StubExecutor);
     let justify = match sim.committed[node].last() {
         Some(cb) => cb.qc.clone(),
         None => QuorumCertificate::genesis(parent_hash),
@@ -2992,7 +2995,7 @@ fn a_resumed_validator_finds_its_locked_block_without_a_fetch() {
     after.set_height(header.height);
     after.set_timestamp_ms(header.timestamp_ms);
     after.apply_transactions(&[], &header.proposer.address(), &StubExecutor).unwrap();
-    after.close_block(header.height, &header.proposer.address(), 0, 0);
+    after.close_block(header.height, &header.proposer.address(), 0, 0, &StubExecutor);
     header.state_root = after.state_root();
     header.tx_root = Block::tx_root(&[]);
     header.justify = qc.clone();

@@ -5016,7 +5016,7 @@ pub(crate) mod tests {
         ledger.set_height(1);
         ledger.set_timestamp_ms(1);
         ledger.apply_transactions(&[], &key(1).address(), &StubExecutor).unwrap();
-        ledger.close_block(1, &key(1).address(), 8_192, 20_000);
+        ledger.close_block(1, &key(1).address(), 8_192, 20_000, &StubExecutor);
         let moved = ledger.gas_prices();
         assert!(moved.byte_price > 800, "an over-target block raises byte_price: {moved:?}");
         assert_eq!(moved.gas_price, 100, "an at-target block leaves gas_price alone");

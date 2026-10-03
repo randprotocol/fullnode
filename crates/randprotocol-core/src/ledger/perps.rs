@@ -18,9 +18,11 @@
 //!
 //! The gate is the genesis `perps` section: without it the chain has no [`Perps`] at all.
 
+use super::{Ledger, TxError, ValidatorEntry};
 use crate::confidential::ConfidentialExecutor;
-use crate::crypto::{merkle_root, Address, Hash, PublicKey};
+use crate::crypto::{merkle_root, Address, Hash, PublicKey, Signature};
 use crate::notes::{word8_from_bytes, word8_to_bytes, Envelope, ShieldedAddress, Word8};
+use crate::types::transaction::{Action, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -360,7 +362,6 @@ pub struct Perps {
     withdrawals: BTreeMap<Word8, PendingWithdrawal>,
     /// The current block's inputs so far. Transient: emptied at every block close.
     #[serde(skip)]
-    #[allow(dead_code)] // filled by the action rules and drained at block close
     block_inputs: Vec<PerpInput>,
     /// The last closed block's height and input words, for the node to store and serve to
     /// provers. Transient: the node takes them right after the block applies.
@@ -514,6 +515,421 @@ impl Perps {
     }
 }
 
+/// The most trading accounts the ledger opens: the engine has 16 slots and keeps one for the
+/// insurance fund ([`INSURANCE_ACCOUNT`]).
+pub const MAX_ACCOUNTS: usize = 15;
+/// The engine's insurance fund. No trading key owns it, so no deposit may open it.
+pub const INSURANCE_ACCOUNT: AccountId = [0; 8];
+
+/// Whether a deposit may open account `id`: not the insurance fund's, and a slot is free.
+fn check_new_account(p: &Perps, id: &AccountId) -> Result<(), PerpError> {
+    if *id == INSURANCE_ACCOUNT {
+        return Err(PerpError::ReservedAccount);
+    }
+    if p.accounts.len() >= MAX_ACCOUNTS {
+        return Err(PerpError::TooManyAccounts);
+    }
+    Ok(())
+}
+
+/// What a `PerpDeposit`'s bundle brings in: the collateral asset's burn — RAND through `burn_r`
+/// with nothing through `burn_a` and `burn_asset`, or the collateral token through `burn_a`
+/// with nothing through `burn_r` — and nothing else.
+fn deposit_amount(p: &Perps, tx: &Transaction) -> Result<u64, TxError> {
+    let b = tx.bundle.as_ref().ok_or(TxError::MissingBundle)?;
+    let c = p.config.collateral_asset;
+    let amount = match c {
+        0 if b.burn_a == 0 && b.burn_asset == 0 => b.burn_r,
+        _ if c != 0 && b.burn_asset == c && b.burn_r == 0 => b.burn_a,
+        _ => return Err(PerpError::CollateralAssetMismatch.into()),
+    };
+    if amount == 0 {
+        return Err(PerpError::ZeroAmount.into());
+    }
+    Ok(amount)
+}
+
+/// The rules of an order's body the chain holds it to: a known market, the side / kind / tif
+/// codes, a size in whole lots, a limit price in whole ticks and a market order without one.
+/// Whether the order is any good is the engine's business.
+fn check_order(p: &Perps, b: &PerpOrderBody) -> Result<(), PerpError> {
+    let m = p.config.markets.get(b.market as usize).ok_or(PerpError::UnknownMarket(b.market))?;
+    if b.side > 1 {
+        return Err(PerpError::BadOrder("side is 0 (buy) or 1 (sell)"));
+    }
+    if b.kind > 1 {
+        return Err(PerpError::BadOrder("kind is 0 (limit) or 1 (market)"));
+    }
+    if b.tif > 2 {
+        return Err(PerpError::BadOrder("tif is 0, 1 or 2"));
+    }
+    if b.size == 0 || !b.size.is_multiple_of(m.lot) {
+        return Err(PerpError::BadOrder("size is a positive multiple of the market's lot"));
+    }
+    if b.kind == 0 && (b.price == 0 || !b.price.is_multiple_of(m.tick)) {
+        return Err(PerpError::BadOrder("a limit price is a positive multiple of the market's tick"));
+    }
+    if b.kind == 1 && b.price != 0 {
+        return Err(PerpError::BadOrder("a market order carries no price"));
+    }
+    Ok(())
+}
+
+/// The account a signed action names, and that `nonce` is still free in its window (tried on
+/// a copy: nothing is written).
+fn check_account_nonce<'a>(p: &'a Perps, account: &AccountId, nonce: u64) -> Result<&'a PerpAccount, PerpError> {
+    let a = p.accounts.get(account).ok_or(PerpError::UnknownAccount)?;
+    a.clone().accept_nonce(nonce)?;
+    Ok(a)
+}
+
+/// The request id a `PerpWithdraw` is held and paid under: its transaction's hash as words.
+fn request_id(tx: &Transaction) -> Word8 {
+    word8_from_bytes(tx.hash().as_bytes()).expect("a hash is 32 bytes")
+}
+
+/// One of the five perp actions this module's rules cover (34–38), its fields borrowed. The
+/// one place an [`Action`] is classified here: every variant is spelled out in [`PerpAction::of`],
+/// so a new variant does not compile until it is placed.
+enum PerpAction<'a> {
+    Deposit {
+        trading_key: &'a PublicKey,
+    },
+    Order {
+        account: &'a AccountId,
+        body: &'a PerpOrderBody,
+        signature: &'a Signature,
+    },
+    Cancel {
+        account: &'a AccountId,
+        nonce: u64,
+        target: u64,
+        signature: &'a Signature,
+    },
+    Withdraw {
+        account: &'a AccountId,
+        nonce: u64,
+        amount: u64,
+        recipient: &'a ShieldedAddress,
+        r: &'a Word8,
+        time: u32,
+        envelope: &'a Envelope,
+        signature: &'a Signature,
+    },
+    Oracle {
+        validator: &'a PublicKey,
+        prices: &'a [PerpPrice],
+        nonce: u64,
+        signature: &'a Signature,
+    },
+}
+
+impl<'a> PerpAction<'a> {
+    fn of(action: &'a Action) -> Option<PerpAction<'a>> {
+        match action {
+            Action::PerpDeposit { trading_key } => Some(PerpAction::Deposit { trading_key }),
+            Action::PerpOrder { account, body, signature } => Some(PerpAction::Order { account, body, signature }),
+            Action::PerpCancel { account, nonce, target, signature } => {
+                Some(PerpAction::Cancel { account, nonce: *nonce, target: *target, signature })
+            }
+            Action::PerpWithdraw { account, nonce, amount, recipient, r, time, envelope, signature } => {
+                Some(PerpAction::Withdraw {
+                    account,
+                    nonce: *nonce,
+                    amount: *amount,
+                    recipient,
+                    r,
+                    time: *time,
+                    envelope,
+                    signature,
+                })
+            }
+            Action::PerpOracle { validator, prices, nonce, signature } => {
+                Some(PerpAction::Oracle { validator, prices, nonce: *nonce, signature })
+            }
+            Action::None
+            | Action::Mint { .. }
+            | Action::Deploy { .. }
+            | Action::Call { .. }
+            | Action::Bond { .. }
+            | Action::Unbond { .. }
+            | Action::Withdraw { .. }
+            | Action::BridgeAttest { .. }
+            | Action::BridgeBurn { .. }
+            | Action::RegisterAggregator { .. }
+            | Action::UnbondAggregator { .. }
+            | Action::WithdrawAggregator { .. }
+            | Action::SlashAggregator { .. }
+            | Action::Aggregate { .. }
+            | Action::RegisterToken { .. }
+            | Action::TokenMint { .. }
+            | Action::SetAuthority { .. }
+            | Action::TokenBurn { .. }
+            | Action::PauseMints { .. }
+            | Action::UnpauseMints { .. }
+            | Action::RegisterBridgedToken { .. }
+            | Action::ListBacking { .. }
+            | Action::RotatePqGuardians { .. }
+            | Action::RotatePauseKey { .. }
+            | Action::ClaimVested { .. }
+            | Action::RevokeVesting { .. }
+            | Action::BondVested { .. }
+            | Action::UnbondVested { .. }
+            | Action::AdmitValidator { .. }
+            | Action::SlashEquivocation { .. }
+            | Action::RotatePqGuardiansV2 { .. }
+            | Action::RotatePauseKeyV2 { .. }
+            | Action::CancelRotation { .. }
+            | Action::Invoke { .. }
+            // Task 4's: its admission is not this module's yet.
+            | Action::PerpStateProof { .. } => None,
+        }
+    }
+
+    /// The signature over [`Transaction::perp_sign_message`]; `None` for a deposit.
+    fn signature(&self) -> Option<&'a Signature> {
+        match self {
+            PerpAction::Deposit { .. } => None,
+            PerpAction::Order { signature, .. }
+            | PerpAction::Cancel { signature, .. }
+            | PerpAction::Withdraw { signature, .. }
+            | PerpAction::Oracle { signature, .. } => Some(signature),
+        }
+    }
+}
+
+/// The refusal for an action this module's rules do not cover — unreachable through
+/// `validate_inner` and `apply_tx_with`, which route only the five here.
+const NOT_PERP: TxError = TxError::UnsupportedAction("not a perp action");
+
+/// Every rule of a perp action but its signature, in `validate`'s order, against this ledger's
+/// state: map lookups and compares, no hash but a withdrawal's transaction id. Returns the key
+/// the signature must verify under (`None` for a deposit, which the bundle authorises).
+fn check<'a>(ledger: &'a Ledger, tx: &Transaction, action: &PerpAction<'a>) -> Result<Option<&'a PublicKey>, TxError> {
+    // The gate is absolute: on a chain without the section nothing about a perp action is read.
+    let p = ledger.perps().ok_or(PerpError::Disabled)?;
+    match *action {
+        PerpAction::Deposit { trading_key } => {
+            deposit_amount(p, tx)?;
+            let id = account_id(trading_key);
+            match p.accounts.get(&id) {
+                Some(a) if a.trading_key != *trading_key => return Err(PerpError::KeyMismatch.into()),
+                Some(_) => {}
+                None => check_new_account(p, &id)?,
+            }
+            Ok(None)
+        }
+        PerpAction::Order { account, body, .. } => {
+            let a = p.accounts.get(account).ok_or(PerpError::UnknownAccount)?;
+            check_order(p, body)?;
+            a.clone().accept_nonce(body.nonce)?;
+            Ok(Some(&a.trading_key))
+        }
+        PerpAction::Cancel { account, nonce, .. } => Ok(Some(&check_account_nonce(p, account, nonce)?.trading_key)),
+        PerpAction::Withdraw { account, nonce, amount, recipient, time, envelope, .. } => {
+            let a = p.accounts.get(account).ok_or(PerpError::UnknownAccount)?;
+            if amount == 0 {
+                return Err(PerpError::ZeroAmount.into());
+            }
+            // The RPL-2 payout checks (the note this becomes is the chain's to append), and the
+            // time window a bundle's `time` is held to, by the same function.
+            ledger.check_note_envelope(envelope)?;
+            super::tokens::check_recipient(recipient)?;
+            ledger.check_time(time)?;
+            a.clone().accept_nonce(nonce)?;
+            if p.withdrawals.contains_key(&request_id(tx)) {
+                return Err(PerpError::NonceUsed.into());
+            }
+            Ok(Some(&a.trading_key))
+        }
+        PerpAction::Oracle { validator, prices, nonce, .. } => {
+            let address = validator.address();
+            if !ledger.validators().contains_key(&address) {
+                return Err(PerpError::NotValidator.into());
+            }
+            // Strictly ascending and known: at most one price per market, so at most 16.
+            let mut last: Option<u32> = None;
+            for price in prices {
+                if price.market as usize >= p.config.markets.len() {
+                    return Err(PerpError::UnknownMarket(price.market).into());
+                }
+                if last.is_some_and(|l| price.market <= l) {
+                    return Err(PerpError::UnorderedPrices.into());
+                }
+                last = Some(price.market);
+            }
+            if nonce <= p.oracle_nonces.get(&address).copied().unwrap_or(0) {
+                return Err(PerpError::OracleNonce.into());
+            }
+            Ok(Some(validator))
+        }
+    }
+}
+
+/// Whether `tx`, a perp action [`validate`] accepted on an earlier state, can still apply on
+/// `ledger`: [`validate`] without the signature, with the verdict [`validate`] would give — the
+/// account still exists, the nonce is still free, the request is not already pending, the
+/// oracle nonce is still above the validator's last and the validator still in the set, the
+/// withdrawal's time still in the window. For a node's pool, which asks after every block.
+/// `Ok` for every other action (and, until Task 4, for a state proof).
+pub fn still_applies(ledger: &Ledger, tx: &Transaction) -> Result<(), TxError> {
+    match PerpAction::of(&tx.action) {
+        Some(a) => check(ledger, tx, &a).map(|_| ()),
+        None => Ok(()),
+    }
+}
+
+/// The action step of admission for a perp action (34–38): the section's gate, the action's
+/// own rules against the ledger, then — last, the one expensive check — the signature over
+/// [`Transaction::perp_sign_message`]. A deposit has no signature: its bundle, whose proof the
+/// common path verifies after this, authorises it.
+///
+/// Nothing is written: every refusal [`apply`] could make is made here.
+pub(super) fn validate(ledger: &Ledger, tx: &Transaction, action: &Action) -> Result<(), TxError> {
+    let a = PerpAction::of(action).ok_or(NOT_PERP)?;
+    let key = check(ledger, tx, &a)?;
+    let (Some(key), Some(signature)) = (key, a.signature()) else {
+        return Ok(()); // a deposit: the bundle authorises it
+    };
+    let msg = Transaction::perp_sign_message(tx.chain_id, action).ok_or(PerpError::BadSignature)?;
+    if !key.verify(msg.as_bytes(), signature) {
+        return Err(PerpError::BadSignature.into());
+    }
+    Ok(())
+}
+
+/// The apply step, in lockstep with [`validate`]: everything fallible is decided before the
+/// first write, so a refusal here leaves the ledger as it was. A deposit opens or tops up the
+/// account, an order, a cancel and a withdrawal take their nonce, a withdrawal is held under its
+/// request id, and each of those four is recorded as the block's next input; an oracle records
+/// its prices at this height and its nonce, and is no input of its own — its prices reach the
+/// engine through the block's `Close`.
+pub(super) fn apply(ledger: &mut Ledger, tx: &Transaction, action: &Action) -> Result<(), TxError> {
+    let a = PerpAction::of(action).ok_or(NOT_PERP)?;
+    let height = ledger.height();
+    let p = ledger.perps().ok_or(PerpError::Disabled)?;
+    match a {
+        PerpAction::Deposit { trading_key } => {
+            let amount = deposit_amount(p, tx)?;
+            let id = account_id(trading_key);
+            if !p.accounts.contains_key(&id) {
+                check_new_account(p, &id)?;
+            }
+            let p = ledger.perps_mut().ok_or(PerpError::Disabled)?;
+            p.accounts.entry(id).or_insert_with(|| PerpAccount {
+                trading_key: trading_key.clone(),
+                nonce_high: 0,
+                used: 0,
+            });
+            p.block_inputs.push(PerpInput::Deposit { account: id, amount });
+        }
+        PerpAction::Order { account, body, .. } => {
+            let mut a = p.accounts.get(account).ok_or(PerpError::UnknownAccount)?.clone();
+            a.accept_nonce(body.nonce)?;
+            let p = ledger.perps_mut().ok_or(PerpError::Disabled)?;
+            p.accounts.insert(*account, a);
+            p.block_inputs.push(PerpInput::Order { account: *account, body: body.clone() });
+        }
+        PerpAction::Cancel { account, nonce, target, .. } => {
+            let mut a = p.accounts.get(account).ok_or(PerpError::UnknownAccount)?.clone();
+            a.accept_nonce(nonce)?;
+            let p = ledger.perps_mut().ok_or(PerpError::Disabled)?;
+            p.accounts.insert(*account, a);
+            p.block_inputs.push(PerpInput::Cancel { account: *account, nonce, target });
+        }
+        PerpAction::Withdraw { account, nonce, amount, recipient, r, time, envelope, .. } => {
+            let mut a = p.accounts.get(account).ok_or(PerpError::UnknownAccount)?.clone();
+            a.accept_nonce(nonce)?;
+            let request = request_id(tx);
+            if p.withdrawals.contains_key(&request) {
+                return Err(PerpError::NonceUsed.into());
+            }
+            let pending = PendingWithdrawal {
+                account: *account,
+                amount,
+                recipient: recipient.clone(),
+                r: *r,
+                envelope: envelope.clone(),
+                time,
+                height,
+            };
+            let p = ledger.perps_mut().ok_or(PerpError::Disabled)?;
+            p.accounts.insert(*account, a);
+            p.withdrawals.insert(request, pending);
+            p.block_inputs.push(PerpInput::Withdraw { account: *account, nonce, amount, request });
+        }
+        PerpAction::Oracle { validator, prices, nonce, .. } => {
+            let address = validator.address();
+            let p = ledger.perps_mut().ok_or(PerpError::Disabled)?;
+            for price in prices {
+                p.oracle.entry(price.market).or_default().submissions.insert(address, (price.price, height));
+            }
+            p.oracle_nonces.insert(address, nonce);
+        }
+    }
+    Ok(())
+}
+
+/// The stake-weighted median of one market's fresh submissions at `height`: the submissions
+/// given at `height - ORACLE_STALE_BLOCKS` or later, each weighted by its validator's stake now
+/// (a submitter that has left the set weighs 0 and is dropped), sorted by price; the median is
+/// the first price at which the running stake reaches ⌈total / 2⌉. `None` when nothing fresh
+/// and staked remains, and the caller keeps the last median.
+fn stake_median(o: &OracleState, validators: &BTreeMap<Address, ValidatorEntry>, height: u64) -> Option<u64> {
+    let mut fresh: Vec<(u64, u128)> = o
+        .submissions
+        .iter()
+        .filter(|(_, (_, at))| at.saturating_add(ORACLE_STALE_BLOCKS) >= height)
+        .map(|(address, (price, _))| (*price, validators.get(address).map_or(0, |v| v.stake) as u128))
+        .filter(|(_, stake)| *stake > 0)
+        .collect();
+    // Ties in price are interchangeable, so an unstable sort on the price alone is deterministic.
+    fresh.sort_unstable_by_key(|(price, _)| *price);
+    let total: u128 = fresh.iter().map(|(_, s)| s).sum();
+    let half = total.div_ceil(2);
+    let mut running = 0u128;
+    for (price, stake) in fresh {
+        running += stake;
+        if running >= half {
+            return Some(price);
+        }
+    }
+    None
+}
+
+/// The block-end step under the section (`Ledger::close_block`, before the anchor): each
+/// market's median is recomputed from the fresh submissions (kept when none is fresh), the
+/// block's `Close` input is appended to its inputs, and the digest `D_height` of the whole word
+/// string is recorded for the next state proof to cover. The words themselves are left for the
+/// node to take ([`Perps::take_block_words`]); the inputs are emptied for the next block. Every
+/// step reads only consensus state, the block's height and its timestamp.
+pub(super) fn close_block(ledger: &mut Ledger, height: u64, executor: &dyn ConfidentialExecutor) {
+    let time_ms = ledger.timestamp_ms();
+    let Some(p) = ledger.perps() else { return };
+    let medians: Vec<PerpPrice> = p
+        .config
+        .markets
+        .iter()
+        .map(|m| {
+            let fresh = p.oracle.get(&m.id).and_then(|o| stake_median(o, ledger.validators(), height));
+            PerpPrice { market: m.id, price: fresh.unwrap_or_else(|| p.median(m.id)) }
+        })
+        .collect();
+    let Some(p) = ledger.perps_mut() else { return };
+    for m in &medians {
+        if let Some(o) = p.oracle.get_mut(&m.market) {
+            o.median = m.price;
+        }
+    }
+    let mut words = Vec::new();
+    for input in p.block_inputs.drain(..) {
+        input.words(&mut words);
+    }
+    PerpInput::Close { height, time_ms, medians }.words(&mut words);
+    p.digests.insert(height, perp_digest(executor, domain::BLOCK, &words));
+    p.last_block_words = Some((height, words));
+}
+
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum PerpError {
     #[error("perps are disabled on this chain")]
@@ -556,6 +972,12 @@ pub enum PerpError {
     CollateralAssetMismatch,
     #[error("an amount overflows")]
     Overflow,
+    #[error("an oracle's prices must name each market once, in ascending order")]
+    UnorderedPrices,
+    #[error("the exchange holds at most 15 trading accounts; this deposit would open a 16th")]
+    TooManyAccounts,
+    #[error("account id 0 is the engine's insurance fund and no key may own it")]
+    ReservedAccount,
 }
 
 #[cfg(test)]
@@ -774,5 +1196,564 @@ mod tests {
         let on_disk =
             std::fs::read_to_string(path).expect("vectors file exists; regenerate with PERPS_WRITE_VECTORS=1");
         assert_eq!(on_disk.trim(), json.trim(), "perps-v1.json is stale");
+    }
+
+    // ---- Task 3: the ledger rules, the block close and the root ----
+
+    use crate::crypto::{Keypair, Signature};
+    use crate::gas;
+    use crate::ledger::tokens::{TokenError, TokenRegistry};
+    use crate::ledger::{Ledger, TxError, ValidatorEntry};
+    use crate::notes::{Bundle, KEM_EK_BYTES};
+    use crate::types::transaction::{Action, Transaction};
+
+    const HC: Word8 = [11; 8];
+    const CHAIN: u64 = 7;
+    const RAND: u64 = 1_000_000_000;
+    /// `state_root()` of `ledger_with(false)`, and of it with an RPL-2 `program_state` section,
+    /// computed on the parent commit (f942259c) before this task touched the root: a chain
+    /// without the `perps` section keeps its root byte for byte.
+    const ROOT_BEFORE: &str = "167a98459b148598751726f1a50bb0d096dcbedf879cd8dac71f7422f52c251a";
+    const ROOT_BEFORE_PSTATE: &str = "ebe3c658a3678fb43943b5577932ace50f53af66980d1988b3503a88a5060050";
+
+    fn kp(n: u8) -> Keypair {
+        Keypair::from_seed([n; 32]).unwrap()
+    }
+
+    fn env() -> Envelope {
+        Envelope { kem_ct: vec![1; 8], to_receiver: vec![], to_sender: vec![], body: vec![2; 8] }
+    }
+
+    fn recipient() -> ShieldedAddress {
+        ShieldedAddress { pk: [4; 8], kem_ek: vec![6; KEM_EK_BYTES] }
+    }
+
+    /// Three validators — keys 1, 2 and 3 at stakes 1, 1 and 10 — the token registry, and the
+    /// `perps` section (one market, lot 1 000 000, tick 1 000) when `section`.
+    fn ledger_with(section: bool) -> Ledger {
+        let entry = |n: u8, stake: u64| {
+            let k = kp(n);
+            let e = ValidatorEntry {
+                public_key: k.public_key().clone(),
+                stake,
+                pending: Vec::new(),
+                rewards: 0,
+                payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+                nonce: 0,
+                activation_epoch: 0,
+            };
+            (k.address(), e)
+        };
+        let validators = [entry(1, 1), entry(2, 1), entry(3, 10)].into_iter().collect();
+        let mut l = Ledger::new(CHAIN, HC, validators, &StubExecutor);
+        l.set_tokens(Some(TokenRegistry::new(1_000_000_000)));
+        if section {
+            l.set_perps(Some(Perps::from_config(&sample_config())));
+        }
+        l.set_genesis_supply(1_000_000_000_000, 12);
+        l.set_height(1);
+        l.set_timestamp_ms(1_700_000_000_000);
+        l
+    }
+
+    fn bundle(l: &Ledger, seed: u32, fee: u64, burns: (u64, u32, u64)) -> Bundle {
+        let mut b = Bundle {
+            anchor: l.anchors().back().expect("the genesis anchor").1,
+            nullifiers: crate::notes::pad4([[seed; 8], [seed + 1; 8]]),
+            commitments: crate::notes::pad4([[seed + 2; 8], [seed + 3; 8]]),
+            fee,
+            burn_r: burns.0,
+            burn_asset: burns.1,
+            burn_a: burns.2,
+            time: l.height() as u32,
+            envelopes: [env(), env(), env(), env()],
+            proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
+        };
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
+        b
+    }
+
+    fn apply(l: &mut Ledger, tx: &Transaction) -> Result<(), TxError> {
+        l.apply_tx(tx, &kp(1).address(), &StubExecutor).map(|_| ())
+    }
+
+    fn refusal(l: &Ledger, tx: &Transaction) -> TxError {
+        l.validate(tx, &StubExecutor).expect_err("refused")
+    }
+
+    fn pe(e: PerpError) -> TxError {
+        TxError::Perps(e)
+    }
+
+    fn close(l: &mut Ledger, height: u64) {
+        l.set_height(height);
+        l.close_block(height, &kp(1).address(), 0, 0, &StubExecutor);
+    }
+
+    /// `a` with its signature made by `k` over `perp_sign_message(chain, a)`.
+    fn signed(chain: u64, k: &Keypair, a: Action) -> Action {
+        let msg = Transaction::perp_sign_message(chain, &a).expect("a signed perp action");
+        let sig = k.sign(msg.as_bytes());
+        let mut a = a;
+        match &mut a {
+            Action::PerpOrder { signature, .. }
+            | Action::PerpCancel { signature, .. }
+            | Action::PerpWithdraw { signature, .. }
+            | Action::PerpOracle { signature, .. } => *signature = sig,
+            _ => panic!("not a signed perp action"),
+        }
+        a
+    }
+
+    fn bare(a: Action) -> Transaction {
+        Transaction { chain_id: CHAIN, bundle: None, action: a }
+    }
+
+    fn deposit_with(l: &Ledger, k: &Keypair, seed: u32, burns: (u64, u32, u64)) -> Transaction {
+        let a = Action::PerpDeposit { trading_key: k.public_key().clone() };
+        let fee = gas::fee_floor(&a);
+        StubExecutor::bound(Transaction::shielded(CHAIN, bundle(l, seed, fee, burns), a))
+    }
+
+    fn deposit(l: &Ledger, k: &Keypair, seed: u32, amount: u64) -> Transaction {
+        deposit_with(l, k, seed, (amount, 0, 0))
+    }
+
+    fn dep_with(l: &mut Ledger, k: &Keypair, seed: u32, burns: (u64, u32, u64)) -> Result<(), TxError> {
+        let tx = deposit_with(l, k, seed, burns);
+        apply(l, &tx)
+    }
+
+    fn dep(l: &mut Ledger, k: &Keypair, seed: u32, amount: u64) -> Result<(), TxError> {
+        dep_with(l, k, seed, (amount, 0, 0))
+    }
+
+    fn id(k: &Keypair) -> AccountId {
+        account_id(k.public_key())
+    }
+
+    fn body(nonce: u64) -> PerpOrderBody {
+        PerpOrderBody {
+            nonce,
+            market: 0,
+            side: 0,
+            kind: 0,
+            tif: 0,
+            reduce_only: false,
+            price: 2_000_000,
+            size: 1_000_000,
+        }
+    }
+
+    fn order_by(signer: &Keypair, account: AccountId, b: PerpOrderBody) -> Transaction {
+        bare(signed(CHAIN, signer, Action::PerpOrder { account, body: b, signature: Signature::empty() }))
+    }
+
+    fn order(k: &Keypair, b: PerpOrderBody) -> Transaction {
+        order_by(k, id(k), b)
+    }
+
+    fn withdraw(k: &Keypair, nonce: u64, amount: u64, time: u32) -> Action {
+        Action::PerpWithdraw {
+            account: id(k),
+            nonce,
+            amount,
+            recipient: recipient(),
+            r: [5; 8],
+            time,
+            envelope: env(),
+            signature: Signature::empty(),
+        }
+    }
+
+    fn oracle(k: &Keypair, prices: &[(u32, u64)], nonce: u64) -> Transaction {
+        let prices = prices.iter().map(|&(market, price)| PerpPrice { market, price }).collect();
+        bare(signed(
+            CHAIN,
+            k,
+            Action::PerpOracle { validator: k.public_key().clone(), prices, nonce, signature: Signature::empty() },
+        ))
+    }
+
+    fn close_words(l: &Ledger, height: u64, median: u64) -> Vec<u32> {
+        let mut w = Vec::new();
+        PerpInput::Close { height, time_ms: l.timestamp_ms(), medians: vec![PerpPrice { market: 0, price: median }] }
+            .words(&mut w);
+        w
+    }
+
+    #[test]
+    fn a_deposit_creates_the_account_and_records_an_input() {
+        let mut l = ledger_with(true);
+        let k = kp(50);
+        dep(&mut l, &k, 10, RAND).unwrap();
+        let p = l.perps().unwrap();
+        assert_eq!(p.account(&id(&k)).map(|a| (&a.trading_key, a.nonce_high, a.used)), Some((k.public_key(), 0, 0)));
+        assert_eq!(p.digest(1), None, "nothing is digested before the block closes");
+        close(&mut l, 1);
+        let d = l.perps().unwrap().digest(1).expect("the block's digest");
+        let (h, words) = l.take_perp_block_words().expect("the block's words");
+        assert_eq!(h, 1);
+        let mut want = vec![1];
+        want.extend_from_slice(&id(&k));
+        want.extend([RAND as u32, 0]);
+        assert_eq!(&words[..11], &want[..], "the deposit's words first");
+        assert_eq!(words, [want, close_words(&l, 1, 0)].concat(), "then the Close record, and nothing else");
+        assert_eq!(d, perp_digest(&StubExecutor, domain::BLOCK, &words));
+        assert_eq!(l.take_perp_block_words(), None, "taken once");
+        assert_eq!(l.perps().unwrap().pending_heights(), vec![1]);
+        // An empty block still closes with its Close record, and a top-up keeps the account.
+        close(&mut l, 2);
+        assert_eq!(l.take_perp_block_words(), Some((2, close_words(&l, 2, 0))));
+        dep(&mut l, &k, 20, 5).unwrap();
+        assert_eq!(l.perps().unwrap().accounts(None, 10).len(), 1);
+
+        // The collateral rule: RAND through `burn_r` only; a zero burn; a token burn on a RAND chain.
+        assert_eq!(refusal(&l, &deposit(&l, &k, 30, 0)), pe(PerpError::ZeroAmount));
+        assert_eq!(refusal(&l, &deposit_with(&l, &k, 40, (0, 1, 5))), pe(PerpError::CollateralAssetMismatch));
+        assert_eq!(refusal(&l, &deposit_with(&l, &k, 50, (5, 1, 5))), pe(PerpError::CollateralAssetMismatch));
+        // A chain whose collateral is token 1: `burn_a` of token 1, nothing through `burn_r`.
+        let mut tok = ledger_with(false);
+        let mut c = sample_config();
+        c.collateral_asset = 1;
+        tok.set_perps(Some(Perps::from_config(&c)));
+        assert_eq!(refusal(&tok, &deposit(&tok, &k, 60, RAND)), pe(PerpError::CollateralAssetMismatch));
+        assert_eq!(refusal(&tok, &deposit_with(&tok, &k, 70, (1, 1, 5))), pe(PerpError::CollateralAssetMismatch));
+        assert_eq!(refusal(&tok, &deposit_with(&tok, &k, 80, (0, 2, 5))), pe(PerpError::CollateralAssetMismatch));
+        dep_with(&mut tok, &k, 90, (0, 1, 5)).unwrap();
+        close(&mut tok, 1);
+        let (_, words) = tok.take_perp_block_words().unwrap();
+        assert_eq!(&words[9..11], &[5, 0], "the amount is the token burn");
+    }
+
+    #[test]
+    fn deposits_stop_at_fifteen_accounts_and_the_insurance_id_is_reserved() {
+        let mut l = ledger_with(true);
+        for n in 0..15u8 {
+            dep(&mut l, &kp(100 + n), 1000 + 10 * n as u32, RAND).unwrap();
+        }
+        assert_eq!(refusal(&l, &deposit(&l, &kp(200), 2000, RAND)), pe(PerpError::TooManyAccounts));
+        dep(&mut l, &kp(100), 2010, RAND).expect("an existing account still tops up");
+        // `[0; 8]` is the engine's insurance fund: no key may own it, and nothing addresses it.
+        assert_eq!(check_new_account(l.perps().unwrap(), &[0; 8]), Err(PerpError::ReservedAccount));
+        assert_eq!(check_new_account(l.perps().unwrap(), &id(&kp(200))), Err(PerpError::TooManyAccounts));
+        assert_eq!(refusal(&l, &order_by(&kp(100), [0; 8], body(1))), pe(PerpError::UnknownAccount));
+    }
+
+    #[test]
+    fn an_order_from_an_unknown_account_is_refused() {
+        let mut l = ledger_with(true);
+        let k = kp(50);
+        assert_eq!(refusal(&l, &order(&k, body(1))), pe(PerpError::UnknownAccount));
+        let cancel = bare(signed(
+            CHAIN,
+            &k,
+            Action::PerpCancel { account: id(&k), nonce: 2, target: 1, signature: Signature::empty() },
+        ));
+        assert_eq!(refusal(&l, &cancel), pe(PerpError::UnknownAccount));
+        assert_eq!(refusal(&l, &bare(signed(CHAIN, &k, withdraw(&k, 1, 5, 1)))), pe(PerpError::UnknownAccount));
+        assert_eq!(still_applies(&l, &order(&k, body(1))), Err(pe(PerpError::UnknownAccount)));
+        dep(&mut l, &k, 10, RAND).unwrap();
+        apply(&mut l, &order(&k, body(1))).unwrap();
+        apply(&mut l, &cancel).unwrap();
+        assert_eq!(refusal(&l, &order(&k, PerpOrderBody { market: 1, ..body(3) })), pe(PerpError::UnknownMarket(1)));
+        close(&mut l, 1);
+        let (_, words) = l.take_perp_block_words().unwrap();
+        let mut want = Vec::new();
+        PerpInput::Deposit { account: id(&k), amount: RAND }.words(&mut want);
+        PerpInput::Order { account: id(&k), body: body(1) }.words(&mut want);
+        PerpInput::Cancel { account: id(&k), nonce: 2, target: 1 }.words(&mut want);
+        assert_eq!(words, [want, close_words(&l, 1, 0)].concat(), "every input in block order");
+    }
+
+    #[test]
+    fn an_order_with_a_bad_signature_or_reused_nonce_is_refused() {
+        let mut l = ledger_with(true);
+        let k = kp(50);
+        dep(&mut l, &k, 10, RAND).unwrap();
+        let forged = order_by(&kp(51), id(&k), body(1));
+        assert_eq!(refusal(&l, &forged), pe(PerpError::BadSignature));
+        let other_chain = bare(signed(
+            CHAIN + 1,
+            &k,
+            Action::PerpOrder { account: id(&k), body: body(1), signature: Signature::empty() },
+        ));
+        assert_eq!(refusal(&l, &other_chain), pe(PerpError::BadSignature));
+        let mut tampered = order(&k, body(1));
+        let Action::PerpOrder { body: b, .. } = &mut tampered.action else { unreachable!() };
+        b.size = 2_000_000;
+        assert_eq!(refusal(&l, &tampered), pe(PerpError::BadSignature), "the signature covers the body");
+        // `still_applies` is `validate` without the signature.
+        assert_eq!(still_applies(&l, &forged), Ok(()));
+        let first = order(&k, body(5));
+        apply(&mut l, &first).unwrap();
+        assert_eq!(l.perps().unwrap().account(&id(&k)).map(|a| a.nonce_high), Some(5));
+        assert_eq!(refusal(&l, &first), pe(PerpError::NonceUsed), "a replay");
+        assert_eq!(refusal(&l, &order(&k, PerpOrderBody { side: 1, ..body(5) })), pe(PerpError::NonceUsed));
+        assert_eq!(still_applies(&l, &first), Err(pe(PerpError::NonceUsed)));
+        assert_eq!(still_applies(&l, &forged), Ok(()), "nonce 1 is still free");
+        apply(&mut l, &order(&k, body(3))).expect("out of order, inside the window");
+        // A cancel's nonce shares the window.
+        let cancel = |n| {
+            bare(signed(
+                CHAIN,
+                &k,
+                Action::PerpCancel { account: id(&k), nonce: n, target: 5, signature: Signature::empty() },
+            ))
+        };
+        assert_eq!(refusal(&l, &cancel(3)), pe(PerpError::NonceUsed));
+        apply(&mut l, &cancel(4)).unwrap();
+        // A refusal leaves the ledger as it was.
+        let before = l.clone();
+        assert!(l.apply_transactions(&[order(&k, body(6)), first.clone()], &kp(1).address(), &StubExecutor).is_err());
+        assert!(l == before && l.state_root() == before.state_root());
+        assert_eq!(still_applies(&l, &deposit(&l, &k, 20, 0)), Err(pe(PerpError::ZeroAmount)));
+        // Not a perp action: nothing to ask.
+        assert_eq!(still_applies(&l, &bare(Action::None)), Ok(()));
+    }
+
+    #[test]
+    fn an_order_off_tick_or_off_lot_is_refused() {
+        let mut l = ledger_with(true);
+        let k = kp(50);
+        dep(&mut l, &k, 10, RAND).unwrap();
+        let bad = |b: PerpOrderBody| matches!(refusal(&l, &order(&k, b)), TxError::Perps(PerpError::BadOrder(_)));
+        assert!(bad(PerpOrderBody { price: 2_000_500, ..body(1) }), "off tick");
+        assert!(bad(PerpOrderBody { size: 1_500_000, ..body(1) }), "off lot");
+        assert!(bad(PerpOrderBody { size: 0, ..body(1) }), "no size");
+        assert!(bad(PerpOrderBody { price: 0, ..body(1) }), "a limit order without a price");
+        assert!(bad(PerpOrderBody { kind: 1, ..body(1) }), "a market order with a price");
+        assert!(bad(PerpOrderBody { side: 2, ..body(1) }));
+        assert!(bad(PerpOrderBody { kind: 2, ..body(1) }));
+        assert!(bad(PerpOrderBody { tif: 3, ..body(1) }));
+        assert_eq!(
+            still_applies(&l, &order(&k, PerpOrderBody { tif: 3, ..body(1) })),
+            Err(pe(PerpError::BadOrder("tif is 0, 1 or 2")))
+        );
+        apply(&mut l, &order(&k, PerpOrderBody { kind: 1, price: 0, tif: 1, ..body(1) })).expect("a market order");
+        apply(&mut l, &order(&k, PerpOrderBody { side: 1, tif: 2, reduce_only: true, size: 3_000_000, ..body(2) }))
+            .unwrap();
+    }
+
+    #[test]
+    fn an_oracle_from_a_non_validator_or_old_nonce_is_refused_and_the_median_is_stake_weighted() {
+        let mut l = ledger_with(true);
+        assert_eq!(refusal(&l, &oracle(&kp(9), &[(0, 100)], 1)), pe(PerpError::NotValidator));
+        assert_eq!(refusal(&l, &oracle(&kp(1), &[(0, 100)], 0)), pe(PerpError::OracleNonce), "nonces start above 0");
+        assert_eq!(refusal(&l, &oracle(&kp(1), &[(1, 100)], 1)), pe(PerpError::UnknownMarket(1)));
+        assert_eq!(refusal(&l, &oracle(&kp(1), &[(0, 100), (0, 101)], 1)), pe(PerpError::UnorderedPrices));
+        let mut forged = oracle(&kp(2), &[(0, 100)], 1);
+        let Action::PerpOracle { validator, .. } = &mut forged.action else { unreachable!() };
+        *validator = kp(1).public_key().clone();
+        assert_eq!(refusal(&l, &forged), pe(PerpError::BadSignature));
+        assert_eq!(still_applies(&l, &forged), Ok(()));
+
+        // Stakes 1, 1, 10 at prices 100, 200, 300: the heavy validator is the median.
+        apply(&mut l, &oracle(&kp(1), &[(0, 100)], 7)).unwrap();
+        apply(&mut l, &oracle(&kp(2), &[(0, 200)], 1)).unwrap();
+        apply(&mut l, &oracle(&kp(3), &[(0, 300)], 1)).unwrap();
+        assert_eq!(refusal(&l, &oracle(&kp(1), &[(0, 100)], 7)), pe(PerpError::OracleNonce), "a replay");
+        assert_eq!(refusal(&l, &oracle(&kp(1), &[(0, 100)], 6)), pe(PerpError::OracleNonce));
+        assert_eq!(still_applies(&l, &oracle(&kp(1), &[(0, 100)], 7)), Err(pe(PerpError::OracleNonce)));
+        assert_eq!(l.perps().unwrap().median(0), 0, "the median moves at the close");
+        close(&mut l, 1);
+        assert_eq!(l.perps().unwrap().median(0), 300);
+        let (_, words) = l.take_perp_block_words().unwrap();
+        assert_eq!(words, close_words(&l, 1, 300), "an oracle submission is no input; the Close carries the median");
+
+        // Still fresh 30 blocks on; the two light validators resubmit at 32, and at 32 the heavy
+        // one's height-1 price is 31 blocks old and drops: stakes 1 and 1 at 100 and 200.
+        close(&mut l, 31);
+        assert_eq!(l.perps().unwrap().median(0), 300);
+        l.set_height(32);
+        apply(&mut l, &oracle(&kp(1), &[(0, 100)], 8)).unwrap();
+        apply(&mut l, &oracle(&kp(2), &[(0, 200)], 2)).unwrap();
+        close(&mut l, 32);
+        assert_eq!(l.perps().unwrap().median(0), 100, "the first price reaching half the fresh stake");
+        // Every price stale: the median stays.
+        close(&mut l, 63);
+        assert_eq!(l.perps().unwrap().median(0), 100);
+        assert_eq!(l.take_perp_block_words().map(|(_, w)| w), Some(close_words(&l, 63, 100)));
+    }
+
+    fn add(
+        o: &mut OracleState,
+        vals: &mut BTreeMap<Address, ValidatorEntry>,
+        n: u8,
+        stake: u64,
+        price: u64,
+        height: u64,
+    ) {
+        let k = kp(n);
+        let e = ValidatorEntry {
+            public_key: k.public_key().clone(),
+            stake,
+            pending: Vec::new(),
+            rewards: 0,
+            payout: ShieldedAddress { pk: [1; 8], kem_ek: vec![2; 32] },
+            nonce: 0,
+            activation_epoch: 0,
+        };
+        vals.insert(k.address(), e);
+        o.submissions.insert(k.address(), (price, height));
+    }
+
+    #[test]
+    fn the_median_is_the_first_price_reaching_half_the_stake() {
+        let (mut o, mut vals) = (OracleState::default(), BTreeMap::new());
+        add(&mut o, &mut vals, 1, 2, 100, 10);
+        add(&mut o, &mut vals, 2, 2, 300, 10);
+        add(&mut o, &mut vals, 3, 0, 50, 10);
+        // Stake 4: half is 2, which 100 already reaches; the stake-0 validator counts for nothing.
+        assert_eq!(stake_median(&o, &vals, 10), Some(100));
+        add(&mut o, &mut vals, 4, 1, 200, 10);
+        // Stake 5: ⌈5/2⌉ = 3, reached at 200.
+        assert_eq!(stake_median(&o, &vals, 10), Some(200));
+        // A submitter that has left the set is dropped.
+        o.submissions.insert(Address([0xee; 32]), (1, 10));
+        assert_eq!(stake_median(&o, &vals, 10), Some(200));
+        assert_eq!(stake_median(&o, &vals, 40), Some(200), "30 blocks on, still fresh");
+        assert_eq!(stake_median(&o, &vals, 41), None, "everything is stale");
+        assert_eq!(stake_median(&OracleState::default(), &vals, 10), None);
+    }
+
+    #[test]
+    fn a_withdraw_request_is_held_until_a_proof() {
+        let mut l = ledger_with(true);
+        let k = kp(50);
+        dep(&mut l, &k, 10, RAND).unwrap();
+        l.set_height(5);
+        let tx = bare(signed(CHAIN, &k, withdraw(&k, 1, 400, 4)));
+        apply(&mut l, &tx).unwrap();
+        let request = word8_from_bytes(tx.hash().as_bytes()).unwrap();
+        let w = l.perps().unwrap().withdrawal(&request).expect("pending").clone();
+        assert_eq!(
+            w,
+            PendingWithdrawal {
+                account: id(&k),
+                amount: 400,
+                recipient: recipient(),
+                r: [5; 8],
+                envelope: env(),
+                time: 4,
+                height: 5
+            },
+            "the note's opening as the request fixed it, and its own time"
+        );
+        assert_eq!(refusal(&l, &tx), pe(PerpError::NonceUsed), "a replay");
+        close(&mut l, 5);
+        let (_, words) = l.take_perp_block_words().unwrap();
+        let mut want = Vec::new();
+        PerpInput::Deposit { account: id(&k), amount: RAND }.words(&mut want);
+        PerpInput::Withdraw { account: id(&k), nonce: 1, amount: 400, request }.words(&mut want);
+        assert_eq!(words, [want, close_words(&l, 5, 0)].concat());
+        assert!(l.perps().unwrap().withdrawal(&request).is_some(), "a close pays nothing");
+
+        // Its own rules: an amount, a note envelope, a recipient key, a time in the window.
+        let w = |a: Action| bare(signed(CHAIN, &k, a));
+        assert_eq!(refusal(&l, &w(withdraw(&k, 2, 0, 5))), pe(PerpError::ZeroAmount));
+        let mut long = withdraw(&k, 2, 1, 5);
+        let Action::PerpWithdraw { envelope, .. } = &mut long else { unreachable!() };
+        envelope.body = vec![0; crate::notes::MAX_ENVELOPE_BYTES + 1];
+        assert_eq!(refusal(&l, &w(long)), TxError::EnvelopeTooLarge);
+        let mut short_key = withdraw(&k, 2, 1, 5);
+        let Action::PerpWithdraw { recipient, .. } = &mut short_key else { unreachable!() };
+        recipient.kem_ek.pop();
+        assert_eq!(
+            refusal(&l, &w(short_key)),
+            TxError::Token(TokenError::BadRecipientKey { expected: KEM_EK_BYTES, got: KEM_EK_BYTES - 1 })
+        );
+        // The bundle's window, exactly: `height - window ..= height`.
+        let window = l.proof_window();
+        assert_eq!(refusal(&l, &w(withdraw(&k, 2, 1, 6))), TxError::TimeOutOfWindow { time: 6, height: 5, window });
+        l.set_height(window + 10);
+        let oldest = 10u32;
+        assert_eq!(
+            refusal(&l, &w(withdraw(&k, 2, 1, oldest - 1))),
+            TxError::TimeOutOfWindow { time: oldest - 1, height: window + 10, window }
+        );
+        assert_eq!(
+            still_applies(&l, &w(withdraw(&k, 2, 1, oldest - 1))),
+            Err(TxError::TimeOutOfWindow { time: oldest - 1, height: window + 10, window })
+        );
+        apply(&mut l, &w(withdraw(&k, 2, 1, oldest))).expect("the window's oldest time");
+    }
+
+    #[test]
+    fn without_the_section_every_perp_action_is_unsupported_and_the_root_is_unchanged() {
+        let mut l = ledger_with(false);
+        let k = kp(1);
+        let txs = [
+            deposit(&l, &k, 10, RAND),
+            order(&k, body(1)),
+            bare(signed(
+                CHAIN,
+                &k,
+                Action::PerpCancel { account: id(&k), nonce: 1, target: 0, signature: Signature::empty() },
+            )),
+            bare(signed(CHAIN, &k, withdraw(&k, 1, 5, 1))),
+            oracle(&k, &[(0, 100)], 1),
+        ];
+        for tx in &txs {
+            assert_eq!(refusal(&l, tx), pe(PerpError::Disabled));
+            assert_eq!(still_applies(&l, tx), Err(pe(PerpError::Disabled)));
+        }
+        let proof = bare(Action::PerpStateProof {
+            from_height: 0,
+            to_height: 1,
+            new_root: [0; 8],
+            payouts: vec![],
+            fees: 0,
+            proof: vec![],
+        });
+        assert_eq!(refusal(&l, &proof), TxError::UnsupportedAction("perp"), "Task 4's");
+        // The root is the parent commit's, byte for byte, with and without RPL-2's section.
+        assert_eq!(hex::encode(l.state_root().as_bytes()), ROOT_BEFORE);
+        close(&mut l, 1);
+        assert_eq!(l.take_perp_block_words(), None);
+        let mut ps = ledger_with(false);
+        ps.set_program_state(Some(crate::ledger::program_state::ProgramState::from_config(
+            &crate::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000 },
+        )));
+        assert_eq!(hex::encode(ps.state_root().as_bytes()), ROOT_BEFORE_PSTATE);
+    }
+
+    #[test]
+    fn the_root_carries_rand_state_9_only_with_the_section() {
+        let bare_l = ledger_with(false);
+        let with = ledger_with(true);
+        let p = with.perps().unwrap();
+        // The section wraps exactly the bytes the chain without it commits, under `rand-state-9`.
+        let (d0, b0) = bare_l.state_root_preimage();
+        let (d1, b1) = with.state_root_preimage();
+        assert_eq!(d0, b"rand-state-4".as_slice(), "tokens on, nothing later");
+        assert_eq!(d1, b"rand-state-9".as_slice());
+        assert_eq!(b1, [b0.clone(), p.root().as_bytes().to_vec()].concat());
+        assert_eq!(with.state_root(), Hash::digest_domain(b"rand-state-9", &b1));
+        // And beside RPL-2's: the program-state root, then the perps root.
+        let pstate = || {
+            Some(crate::ledger::program_state::ProgramState::from_config(
+                &crate::ledger::program_state::ProgramStateConfig { cell_fee: 1 },
+            ))
+        };
+        let (mut bare_ps, mut with_ps) = (bare_l.clone(), with.clone());
+        bare_ps.set_program_state(pstate());
+        with_ps.set_program_state(pstate());
+        let (d0, b0) = bare_ps.state_root_preimage();
+        let (d1, b1) = with_ps.state_root_preimage();
+        assert_eq!((d0, d1), (b"rand-state-8".as_slice(), b"rand-state-9".as_slice()));
+        assert_eq!(b1, [b0, p.root().as_bytes().to_vec()].concat());
+        // The perps state moves the root; a refused-and-cleared section is the old chain again.
+        let mut moved = with.clone();
+        dep(&mut moved, &kp(50), 10, RAND).unwrap();
+        assert_ne!(moved.perps().unwrap().root(), p.root());
+        let mut cleared = with.clone();
+        cleared.set_perps(None);
+        assert_eq!(cleared.state_root(), bare_l.state_root());
+        assert_eq!(hex::encode(cleared.state_root().as_bytes()), ROOT_BEFORE);
+        assert!(cleared != with, "the section is inside the ledger's equality");
     }
 }

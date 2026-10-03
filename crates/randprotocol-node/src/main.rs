@@ -1832,6 +1832,8 @@ async fn main() -> Result<()> {
                     None => None,
                 },
                 incremental_nullifier_root: incremental_nullifier_root.then_some(true),
+                // RPL-3: `rand-node genesis` does not cut a perps chain yet.
+                perps: None,
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -3894,6 +3896,7 @@ mod tests {
             program_state: None,
             fees: None,
             incremental_nullifier_root: None,
+            perps: None,
         }
     }
 

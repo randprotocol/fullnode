@@ -3990,6 +3990,7 @@ pub(crate) mod fixtures {
             proof_window_blocks: None,
             program_state: None,
             incremental_nullifier_root: None,
+            perps: None,
             hardening_v6: None,
             hc_auth: None,
             fees: None,
@@ -4148,6 +4149,7 @@ pub(crate) mod fixtures {
             proof_window_blocks: None,
             program_state: None,
             incremental_nullifier_root: None,
+            perps: None,
             hardening_v6: None,
             hc_auth: None,
             fees: None,
@@ -5926,7 +5928,7 @@ mod tests {
             ledger.set_height(height);
             ledger.set_timestamp_ms(at_ms);
             ledger.apply_transactions(&txs, &key(1).address(), &StubExecutor).unwrap();
-            ledger.close_block(height, &key(1).address(), 0, 0);
+            ledger.close_block(height, &key(1).address(), 0, 0, &StubExecutor);
             make_block_unchecked_at(parent, ledger, txs, &key(1), at_ms)
         };
         let genesis_block = CommittedBlock { block: gs.block.clone(), pruned: Vec::new(), qc: QuorumCertificate::genesis(gs.block.hash()), receipts: Vec::new(), deposits: Vec::new(), aggregates: Vec::new() };
@@ -6115,7 +6117,7 @@ mod tests {
         ledger.set_height(1);
         ledger.set_timestamp_ms(1);
         ledger.apply_transactions(std::slice::from_ref(&tx), &key(1).address(), &StubExecutor).unwrap();
-        ledger.close_block(1, &key(1).address(), 0, 0);
+        ledger.close_block(1, &key(1).address(), 0, 0, &StubExecutor);
         let b1 = make_block_unchecked(&gs.block, &ledger, vec![tx], &key(1));
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         let before = ledger.validators()[&key(1).address()].rewards;
@@ -6125,7 +6127,7 @@ mod tests {
         ledger.set_height(2);
         ledger.set_timestamp_ms(2);
         ledger.apply_transactions(&[], &key(2).address(), &StubExecutor).unwrap();
-        ledger.close_block(2, &key(2).address(), 0, 0);
+        ledger.close_block(2, &key(2).address(), 0, 0, &StubExecutor);
         assert_eq!(ledger.validators()[&key(1).address()].rewards, before + 60, "the sweep credited key 1");
         let b2 = make_block_unchecked(&b1, &ledger, vec![], &key(2));
         s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
@@ -7976,7 +7978,7 @@ mod tests {
         ledger.set_height(1);
         ledger.set_timestamp_ms(1);
         ledger.apply_transactions(&[], &key(1).address(), &StubExecutor).unwrap();
-        ledger.close_block(1, &key(1).address(), 0, 0);
+        ledger.close_block(1, &key(1).address(), 0, 0, &StubExecutor);
         let moved = ledger.gas_prices();
         assert_eq!(moved, GasPrices { gas_price: 175, byte_price: 1_400 });
         let b1 = make_block_unchecked(&gs.block, &ledger, vec![], &key(1));

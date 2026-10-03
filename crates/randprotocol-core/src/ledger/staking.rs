@@ -2179,7 +2179,7 @@ mod tests {
     /// epoch's set is derived from this very ledger.
     fn close_epoch(l: &mut Ledger, height: u64, proposer: &Address) {
         l.set_height(height);
-        l.close_block(height, proposer, 0, 0);
+        l.close_block(height, proposer, 0, 0, &StubExecutor);
     }
 
     fn weight(set: &ValidatorSet, k: &Keypair) -> Option<u128> {

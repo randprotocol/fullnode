@@ -90,6 +90,7 @@ fn genesis(key: &Keypair, incremental_nullifier_root: bool) -> anyhow::Result<Ge
         program_state: None,
         fees: None,
         incremental_nullifier_root: incremental_nullifier_root.then_some(true),
+        perps: None,
     };
     g.build(&StubExecutor).context("building the harness genesis")
 }

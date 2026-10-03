@@ -1443,7 +1443,7 @@ impl HotStuff {
         }
         // The same block-end steps `apply_block_for_sync` runs before it recomputes the root.
         let (bytes_used, gas_used) = ledger.block_usage(&txs, call_gas);
-        ledger.close_block(height, &me, bytes_used, gas_used);
+        ledger.close_block(height, &me, bytes_used, gas_used, self.executor.as_ref());
         let header = BlockHeader {
             height: parent.block.height() + 1,
             view,
