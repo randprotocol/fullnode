@@ -1024,7 +1024,8 @@ impl HotStuff {
         // leap past the parent with `BlockError::TimestampLeap` (B2's step rule), which reach
         // this function's caller as `ConsensusError::Execution` like any other block rule. B2's
         // drift rule is a vote rule, applied at `try_vote` below: never a validity rule.
-        let bridged = parent.ledger_after.bridge().is_some();
+        // RPL-3: a perps chain's block time is consensus input too (`Ledger::bounds_block_time`).
+        let bridged = parent.ledger_after.bounds_block_time();
 
         // Execute on top of the parent's state. A full tree first sheds what is not on the
         // certified chain (audit v4, CON-3), so a leader's siblings can never crowd out the
@@ -1348,7 +1349,7 @@ impl HotStuff {
         // stall the chain's time catches up a step per block instead of leaping.
         let parent_ms = parent.block.header.timestamp_ms;
         let mut timestamp_ms = now_ms.max(parent_ms);
-        if parent.ledger_after.bridge().is_some() {
+        if parent.ledger_after.bounds_block_time() {
             timestamp_ms = timestamp_ms.min(parent_ms.saturating_add(crate::ledger::MAX_TIMESTAMP_STEP_MS));
         }
         let mut ledger = parent.ledger_after.clone();

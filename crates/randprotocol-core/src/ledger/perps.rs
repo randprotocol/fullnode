@@ -18,10 +18,10 @@
 //!
 //! The gate is the genesis `perps` section: without it the chain has no [`Perps`] at all.
 
-use super::{Ledger, TxError, ValidatorEntry};
+use super::{Ledger, TxError};
 use crate::confidential::ConfidentialExecutor;
 use crate::crypto::{merkle_root, Address, Hash, PublicKey, Signature};
-use crate::notes::{word8_from_bytes, word8_to_bytes, Envelope, ShieldedAddress, Word8};
+use crate::notes::{word8_from_bytes, word8_to_bytes, Envelope, ShieldedAddress, Word8, MAX_NOTE_VALUE};
 use crate::types::transaction::{Action, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -583,6 +583,14 @@ fn check_account_nonce<'a>(p: &'a Perps, account: &AccountId, nonce: u64) -> Res
     Ok(a)
 }
 
+/// Whether another withdrawal may wait: fewer than [`MAX_PERP_PAYOUTS`] are pending.
+fn check_withdrawal_room(p: &Perps) -> Result<(), PerpError> {
+    if p.withdrawals.len() >= MAX_PERP_PAYOUTS {
+        return Err(PerpError::TooManyWithdrawals);
+    }
+    Ok(())
+}
+
 /// The request id a `PerpWithdraw` is held and paid under: its transaction's hash as words.
 fn request_id(tx: &Transaction) -> Word8 {
     word8_from_bytes(tx.hash().as_bytes()).expect("a hash is 32 bytes")
@@ -731,6 +739,15 @@ fn check<'a>(ledger: &'a Ledger, tx: &Transaction, action: &PerpAction<'a>) -> R
             if amount == 0 {
                 return Err(PerpError::ZeroAmount.into());
             }
+            // A note at or above 2^63 is unspendable (the bundle guest range-checks every amount),
+            // so a request for one could only fail at payout, holding a slot: refused now, as an
+            // RPL-2 payout is.
+            if amount >= MAX_NOTE_VALUE {
+                return Err(PerpError::AmountTooLarge(amount).into());
+            }
+            // A state proof pays at most `MAX_PERP_PAYOUTS` withdrawals, so no more may wait:
+            // past that, one holder could queue requests no proof can ever pay.
+            check_withdrawal_room(p)?;
             // The RPL-2 payout checks (the note this becomes is the chain's to append), and the
             // time window a bundle's `time` is held to, by the same function.
             ledger.check_note_envelope(envelope)?;
@@ -744,10 +761,16 @@ fn check<'a>(ledger: &'a Ledger, tx: &Transaction, action: &PerpAction<'a>) -> R
         }
         PerpAction::Oracle { validator, prices, nonce, .. } => {
             let address = validator.address();
-            if !ledger.validators().contains_key(&address) {
+            // In the register and not jailed (STAKE-1): a jailed key's price would not count
+            // towards a median, so it is not taken either.
+            if !ledger.validators().contains_key(&address) || ledger.jailed_until(&address).is_some() {
                 return Err(PerpError::NotValidator.into());
             }
-            // Strictly ascending and known: at most one price per market, so at most 16.
+            // At least one price; strictly ascending and known markets, so at most 16; every
+            // price positive (the engine reads a median of 0 as "no price").
+            if prices.is_empty() {
+                return Err(PerpError::BadPrice.into());
+            }
             let mut last: Option<u32> = None;
             for price in prices {
                 if price.market as usize >= p.config.markets.len() {
@@ -755,6 +778,9 @@ fn check<'a>(ledger: &'a Ledger, tx: &Transaction, action: &PerpAction<'a>) -> R
                 }
                 if last.is_some_and(|l| price.market <= l) {
                     return Err(PerpError::UnorderedPrices.into());
+                }
+                if price.price == 0 {
+                    return Err(PerpError::BadPrice.into());
                 }
                 last = Some(price.market);
             }
@@ -844,6 +870,7 @@ pub(super) fn apply(ledger: &mut Ledger, tx: &Transaction, action: &Action) -> R
             if p.withdrawals.contains_key(&request) {
                 return Err(PerpError::NonceUsed.into());
             }
+            check_withdrawal_room(p)?;
             let pending = PendingWithdrawal {
                 account: *account,
                 amount,
@@ -871,16 +898,16 @@ pub(super) fn apply(ledger: &mut Ledger, tx: &Transaction, action: &Action) -> R
 }
 
 /// The stake-weighted median of one market's fresh submissions at `height`: the submissions
-/// given at `height - ORACLE_STALE_BLOCKS` or later, each weighted by its validator's stake now
-/// (a submitter that has left the set weighs 0 and is dropped), sorted by price; the median is
+/// given at `height - ORACLE_STALE_BLOCKS` or later, each weighted by `stake` of its validator
+/// now (one that has left the set or is jailed weighs 0 and is dropped), sorted by price; the median is
 /// the first price at which the running stake reaches ⌈total / 2⌉. `None` when nothing fresh
 /// and staked remains, and the caller keeps the last median.
-fn stake_median(o: &OracleState, validators: &BTreeMap<Address, ValidatorEntry>, height: u64) -> Option<u64> {
+fn stake_median(o: &OracleState, stake: &dyn Fn(&Address) -> u64, height: u64) -> Option<u64> {
     let mut fresh: Vec<(u64, u128)> = o
         .submissions
         .iter()
         .filter(|(_, (_, at))| at.saturating_add(ORACLE_STALE_BLOCKS) >= height)
-        .map(|(address, (price, _))| (*price, validators.get(address).map_or(0, |v| v.stake) as u128))
+        .map(|(address, (price, _))| (*price, stake(address) as u128))
         .filter(|(_, stake)| *stake > 0)
         .collect();
     // Ties in price are interchangeable, so an unstable sort on the price alone is deterministic.
@@ -905,13 +932,42 @@ fn stake_median(o: &OracleState, validators: &BTreeMap<Address, ValidatorEntry>,
 /// step reads only consensus state, the block's height and its timestamp.
 pub(super) fn close_block(ledger: &mut Ledger, height: u64, executor: &dyn ConfidentialExecutor) {
     let time_ms = ledger.timestamp_ms();
+    // A submission whose validator has left the register is dropped here, so a departed key
+    // does not sit in the root for good; a jailed one stays (it may serve again) and weighs 0.
+    let departed: Vec<Address> = match ledger.perps() {
+        Some(p) => {
+            let mut v: Vec<Address> = p
+                .oracle
+                .values()
+                .flat_map(|o| o.submissions.keys())
+                .filter(|a| !ledger.validators().contains_key(a))
+                .copied()
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+        None => return,
+    };
+    if !departed.is_empty() {
+        let Some(p) = ledger.perps_mut() else { return };
+        for o in p.oracle.values_mut() {
+            o.submissions.retain(|a, _| departed.binary_search(a).is_err());
+        }
+    }
+    let stake = |a: &Address| -> u64 {
+        if ledger.jailed_until(a).is_some() {
+            return 0;
+        }
+        ledger.validators().get(a).map_or(0, |v| v.stake)
+    };
     let Some(p) = ledger.perps() else { return };
     let medians: Vec<PerpPrice> = p
         .config
         .markets
         .iter()
         .map(|m| {
-            let fresh = p.oracle.get(&m.id).and_then(|o| stake_median(o, ledger.validators(), height));
+            let fresh = p.oracle.get(&m.id).and_then(|o| stake_median(o, &stake, height));
             PerpPrice { market: m.id, price: fresh.unwrap_or_else(|| p.median(m.id)) }
         })
         .collect();
@@ -978,6 +1034,12 @@ pub enum PerpError {
     TooManyAccounts,
     #[error("account id 0 is the engine's insurance fund and no key may own it")]
     ReservedAccount,
+    #[error("{MAX_PERP_PAYOUTS} withdrawals are already waiting on a proof; a state proof pays at most that many")]
+    TooManyWithdrawals,
+    #[error("an oracle submission carries at least one price, and every price is positive")]
+    BadPrice,
+    #[error("a withdrawal of {0} is at or above the note bound 2^63")]
+    AmountTooLarge(u64),
 }
 
 #[cfg(test)]
@@ -1608,16 +1670,16 @@ mod tests {
         add(&mut o, &mut vals, 2, 2, 300, 10);
         add(&mut o, &mut vals, 3, 0, 50, 10);
         // Stake 4: half is 2, which 100 already reaches; the stake-0 validator counts for nothing.
-        assert_eq!(stake_median(&o, &vals, 10), Some(100));
+        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 10), Some(100));
         add(&mut o, &mut vals, 4, 1, 200, 10);
         // Stake 5: ⌈5/2⌉ = 3, reached at 200.
-        assert_eq!(stake_median(&o, &vals, 10), Some(200));
+        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 10), Some(200));
         // A submitter that has left the set is dropped.
         o.submissions.insert(Address([0xee; 32]), (1, 10));
-        assert_eq!(stake_median(&o, &vals, 10), Some(200));
-        assert_eq!(stake_median(&o, &vals, 40), Some(200), "30 blocks on, still fresh");
-        assert_eq!(stake_median(&o, &vals, 41), None, "everything is stale");
-        assert_eq!(stake_median(&OracleState::default(), &vals, 10), None);
+        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 10), Some(200));
+        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 40), Some(200), "30 blocks on, still fresh");
+        assert_eq!(stake_median(&o, &|a| vals.get(a).map_or(0, |v| v.stake), 41), None, "everything is stale");
+        assert_eq!(stake_median(&OracleState::default(), &|a| vals.get(a).map_or(0, |v| v.stake), 10), None);
     }
 
     #[test]
@@ -1755,5 +1817,72 @@ mod tests {
         assert_eq!(cleared.state_root(), bare_l.state_root());
         assert_eq!(hex::encode(cleared.state_root().as_bytes()), ROOT_BEFORE);
         assert!(cleared != with, "the section is inside the ledger's equality");
+    }
+
+    // ---- Task 3 review, fix round 1 ----
+
+    #[test]
+    fn a_ninth_pending_withdrawal_is_refused_until_one_is_paid() {
+        let mut l = ledger_with(true);
+        let k = kp(50);
+        dep(&mut l, &k, 10, RAND).unwrap();
+        let w = |n: u64| bare(signed(CHAIN, &k, withdraw(&k, n, 1, 1)));
+        for n in 1..=MAX_PERP_PAYOUTS as u64 {
+            apply(&mut l, &w(n)).unwrap();
+        }
+        assert_eq!(refusal(&l, &w(9)), pe(PerpError::TooManyWithdrawals));
+        assert_eq!(still_applies(&l, &w(9)), Err(pe(PerpError::TooManyWithdrawals)));
+        // `apply` holds the cap too, before any write.
+        let before = l.clone();
+        assert_eq!(l.apply_tx(&w(9), &kp(1).address(), &StubExecutor).map(|_| ()), Err(pe(PerpError::TooManyWithdrawals)));
+        assert!(l == before);
+        // A proof pays one (simulated): a slot is free again.
+        let paid = *l.perps().unwrap().withdrawals.keys().next().unwrap();
+        l.perps_mut().unwrap().withdrawals.remove(&paid);
+        apply(&mut l, &w(9)).expect("a slot is free");
+    }
+
+    #[test]
+    fn an_oracle_needs_a_price_and_every_price_positive() {
+        let l = ledger_with(true);
+        assert_eq!(refusal(&l, &oracle(&kp(1), &[], 1)), pe(PerpError::BadPrice));
+        assert_eq!(refusal(&l, &oracle(&kp(1), &[(0, 0)], 1)), pe(PerpError::BadPrice));
+        assert_eq!(still_applies(&l, &oracle(&kp(1), &[(0, 0)], 1)), Err(pe(PerpError::BadPrice)));
+        assert_eq!(l.validate(&oracle(&kp(1), &[(0, 1)], 1), &StubExecutor), Ok(()));
+    }
+
+    #[test]
+    fn a_withdrawal_at_or_above_the_note_bound_is_refused() {
+        let mut l = ledger_with(true);
+        let k = kp(50);
+        dep(&mut l, &k, 10, RAND).unwrap();
+        let max = crate::notes::MAX_NOTE_VALUE;
+        assert_eq!(refusal(&l, &bare(signed(CHAIN, &k, withdraw(&k, 1, max, 1)))), pe(PerpError::AmountTooLarge(max)));
+        assert_eq!(refusal(&l, &bare(signed(CHAIN, &k, withdraw(&k, 1, u64::MAX, 1)))), pe(PerpError::AmountTooLarge(u64::MAX)));
+        apply(&mut l, &bare(signed(CHAIN, &k, withdraw(&k, 1, max - 1, 1)))).expect("just under the bound");
+    }
+
+    #[test]
+    fn a_departed_validators_price_is_pruned_and_a_jailed_one_is_ignored() {
+        let mut l = ledger_with(true);
+        apply(&mut l, &oracle(&kp(1), &[(0, 100)], 1)).unwrap();
+        apply(&mut l, &oracle(&kp(2), &[(0, 200)], 1)).unwrap();
+        apply(&mut l, &oracle(&kp(3), &[(0, 300)], 1)).unwrap();
+        // Key 3 (stake 10) is jailed: refused as an oracle, and its price does not count.
+        l.set_jailed([(kp(3).address(), u64::MAX)].into_iter().collect());
+        assert_eq!(refusal(&l, &oracle(&kp(3), &[(0, 300)], 2)), pe(PerpError::NotValidator));
+        assert_eq!(still_applies(&l, &oracle(&kp(3), &[(0, 300)], 2)), Err(pe(PerpError::NotValidator)));
+        close(&mut l, 1);
+        assert_eq!(l.perps().unwrap().median(0), 100, "stakes 1 and 1 at 100 and 200");
+        assert!(l.perps().unwrap().oracle[&0].submissions.contains_key(&kp(3).address()), "jailed, not gone");
+        // Key 1 leaves the register: its submission is dropped at the next close.
+        l.validators.remove(&kp(1).address());
+        let root = l.perps().unwrap().root();
+        close(&mut l, 2);
+        let o = &l.perps().unwrap().oracle[&0];
+        assert!(!o.submissions.contains_key(&kp(1).address()));
+        assert_eq!(o.submissions.len(), 2);
+        assert_eq!(o.median, 200);
+        assert_ne!(l.perps().unwrap().root(), root);
     }
 }

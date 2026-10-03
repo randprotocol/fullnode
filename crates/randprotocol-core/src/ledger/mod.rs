@@ -1458,6 +1458,15 @@ impl Ledger {
         self.perps.as_mut().and_then(|p| p.take_block_words())
     }
 
+    /// Whether block time is consensus input on this chain, and so bounded: no rewind past the
+    /// parent and no step past [`MAX_TIMESTAMP_STEP_MS`] (`apply_block_for_sync`), and the
+    /// proposer's clamp and B2's drift vote rule (`HotStuff`). A bridge reads it (guardian-set
+    /// expiry, the mint-cap day); so does perps (each block's `Close` carries it and the engine's
+    /// funding runs on it). Neither section: block time constrains nothing, as before.
+    pub fn bounds_block_time(&self) -> bool {
+        self.bridge.is_some() || self.perps.is_some()
+    }
+
     /// The public segment an `Invoke`'s call proof is made over and verified against (RPL-2,
     /// spec §5): the program's deploy-time public words, this transaction's
     /// [`Transaction::call_binding`], then the transition's context with the bundle's three burn
@@ -3282,19 +3291,20 @@ impl Ledger {
         if !self.validators.contains_key(&proposer) {
             return Err(BlockError::UnknownProposer(proposer));
         }
+        // (`bounds_block_time`: a bridge, or RPL-3's perps, whose `Close` records carry it.)
         // Time bounds validity only where it is consensus input, so a chain without a bridge
         // keeps byte-identical validity rules. With one, block time decides guardian-set expiry
         // (`bridge_notes::validate` → `check_attest(.., self.now_secs())`) and stamps outbound
         // burn messages, so a leader that could rewind it could keep a superseded — possibly
         // compromised — set admissible past its grace window. `HotStuff::propose` already emits
         // `max(now_ms, parent.timestamp_ms)`, so no honest leader builds a block this refuses.
-        if self.bridge.is_some() && block.header.timestamp_ms < self.timestamp_ms {
+        if self.bounds_block_time() && block.header.timestamp_ms < self.timestamp_ms {
             return Err(BlockError::TimestampRewind { parent: self.timestamp_ms, block: block.header.timestamp_ms });
         }
         // B2, the forward bound: a leader cannot leap the clock either (to expire a rotated
         // guardian set's grace window, or skip a mint-cap day). `HotStuff::propose` clamps to
         // `parent + MAX_TIMESTAMP_STEP_MS`, so no honest leader builds a block this refuses.
-        if self.bridge.is_some() && block.header.timestamp_ms > self.timestamp_ms.saturating_add(MAX_TIMESTAMP_STEP_MS) {
+        if self.bounds_block_time() && block.header.timestamp_ms > self.timestamp_ms.saturating_add(MAX_TIMESTAMP_STEP_MS) {
             return Err(BlockError::TimestampLeap {
                 parent: self.timestamp_ms,
                 block: block.header.timestamp_ms,
@@ -5863,6 +5873,72 @@ pub(crate) mod tests {
         plain.set_timestamp_ms(1_000_000);
         plain.apply_block(&empty(&plain, 2, 999_999), &StubExecutor).unwrap();
         assert_eq!(plain.timestamp_ms(), 999_999);
+    }
+
+    /// Task 3 review (ruled): a perps chain's block time is consensus input too — the `Close`
+    /// record carries it and the engine's funding runs on it — so a perps ledger refuses a
+    /// rewind and a leap exactly as a bridged one does. `bounds_block_time` is the one switch.
+    #[test]
+    fn a_perps_chain_bounds_block_time_like_a_bridged_one() {
+        let (a, _) = keys();
+        let empty = |l: &Ledger, height: u64, timestamp_ms: u64| {
+            let header = BlockHeader {
+                height,
+                view: height,
+                parent: Hash::ZERO,
+                proposer: a.public_key().clone(),
+                timestamp_ms,
+                tx_root: Block::tx_root(&[]),
+                // The block-end steps `apply_block` runs, the perps close among them.
+                state_root: {
+                    let mut scratch = l.clone();
+                    scratch.set_height(height);
+                    scratch.set_timestamp_ms(timestamp_ms);
+                    scratch.close_block(height, &a.address(), 0, 0, &StubExecutor);
+                    scratch.state_root()
+                },
+                justify: QuorumCertificate::genesis(Hash::ZERO),
+            };
+            Block::sign(&crate::types::SigningDomain::v0(Hash::ZERO), header, Vec::new(), &a)
+        };
+        let config = perps::PerpsConfig {
+            collateral_asset: 0,
+            max_tier: 16,
+            max_window_blocks: 8,
+            engine_hc: [9; 8],
+            genesis_root: [8; 8],
+            markets: vec![perps::MarketSpec {
+                id: 0,
+                symbol: "X-PERP".into(),
+                lot: 1,
+                tick: 1,
+                max_leverage: 10,
+                maintenance_bps: 500,
+                taker_fee_bps: 5,
+                maker_fee_bps: 2,
+            }],
+        };
+        assert!(!ledger().bounds_block_time());
+        let mut l = ledger();
+        l.set_perps(Some(perps::Perps::from_config(&config)));
+        assert!(l.bounds_block_time());
+        l.set_timestamp_ms(1_000_000);
+        assert_eq!(
+            l.apply_block(&empty(&l, 2, 999_999), &StubExecutor),
+            Err(BlockError::TimestampRewind { parent: 1_000_000, block: 999_999 })
+        );
+        assert_eq!(
+            l.apply_block(&empty(&l, 2, 1_060_001), &StubExecutor),
+            Err(BlockError::TimestampLeap { parent: 1_000_000, block: 1_060_001, max_step: MAX_TIMESTAMP_STEP_MS })
+        );
+        assert_eq!(l.timestamp_ms(), 1_000_000, "refused blocks leave the ledger where it was");
+        l.apply_block(&empty(&l, 2, 1_060_000), &StubExecutor).unwrap();
+        assert_eq!(l.perps().unwrap().pending_heights(), vec![2], "the block closed its perp inputs");
+        // Neither section: both blocks apply, as they always did.
+        let mut plain = ledger();
+        plain.set_timestamp_ms(1_000_000);
+        plain.apply_block(&empty(&plain, 2, 999_999), &StubExecutor).unwrap();
+        plain.apply_block(&empty(&plain, 3, 1_100_000), &StubExecutor).unwrap();
     }
 
     /// B2 (bridge hardening spec §3): on a bridged chain a block may run at most
