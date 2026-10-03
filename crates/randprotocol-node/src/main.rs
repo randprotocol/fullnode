@@ -925,6 +925,15 @@ enum DbCmd {
         #[arg(long)]
         datadir: PathBuf,
     },
+    /// Before rolling back to a build from before RPL-3 (v0.7.1 or earlier): drop the
+    /// `perp_inputs` column family, which this build creates on every database at first open.
+    /// The old build lists seventeen families and RocksDB refuses to open a database with an
+    /// eighteenth. Refused, untouched, on a perps chain's database (no older build can follow
+    /// that chain) or when the family holds rows.
+    DropPerpInputs {
+        #[arg(long)]
+        datadir: PathBuf,
+    },
 }
 
 /// `rand-node safety …` (audit v6, CON-4 and CON-5).
@@ -1576,7 +1585,7 @@ struct StakingArgs {
 /// before it does (issue #60).
 ///
 /// #41 raised the limit only inside `node::start`, so `run` was covered and nothing else was:
-/// `verify` (and `verify --repair`), `db drop-receipts-index` and `init` open the same database —
+/// `verify` (and `verify --repair`), `db drop-receipts-index` (and `db drop-perp-inputs`) and `init` open the same database —
 /// ~1000 table files on chain 15's archives — under whatever soft limit the operator's shell has
 /// (1024 on a droplet's login shell, 256 on macOS). The fleet's systemd drop-in covers the unit,
 /// not a hand-run command, and a hand-run command is exactly what an operator repairing a node
@@ -2179,6 +2188,14 @@ async fn main() -> Result<()> {
                 false => println!("no meta key receipts_by_program_built"),
             }
             println!("a pre-v0.3 build can open this database; a v0.3 start rebuilds the index");
+        }
+        Cmd::Db { cmd: DbCmd::DropPerpInputs { datadir } } => {
+            let db = datadir.join("db");
+            match Storage::drop_perp_inputs(&datadir)? {
+                true => println!("dropped column family perp_inputs from {}", db.display()),
+                false => println!("no perp_inputs column family in {}", db.display()),
+            }
+            println!("a build from before RPL-3 can open this database; a later start re-creates the family, empty");
         }
         Cmd::Status { rpc } => {
             let v = RpcClient::new(rpc).status().await?;

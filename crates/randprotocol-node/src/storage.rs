@@ -1005,6 +1005,41 @@ impl Storage {
         Ok(DroppedReceiptsIndex { family, marker })
     }
 
+    /// Undo RPL-3's one on-disk addition so a build from before it (v0.7.1 and earlier) can open
+    /// the database again (`rand-node db drop-perp-inputs`): drop the `perp_inputs` family, which
+    /// [`Storage::open`] creates on every database at first open, perps chain or not.
+    ///
+    /// [`Storage::drop_receipts_index`]'s twin: it opens raw with whatever families are on disk
+    /// and never through `open`, which would re-create the family. Unlike that index, these rows
+    /// cannot be rebuilt from anything else on disk, and a perps chain is one no older build can
+    /// follow anyway — so a database holding perps state (`META_PERPS`) or any input row is
+    /// refused, and nothing is touched. Returns whether the family was there to drop; a rerun
+    /// finds none and says so. Fails while a node holds the database's lock.
+    pub fn drop_perp_inputs(path: &Path) -> Result<bool> {
+        let db_path = path.join("db");
+        if !db_path.join("CURRENT").exists() {
+            return Err(StorageError::Corrupt(format!("no database at {}", db_path.display())));
+        }
+        let names = DB::list_cf(&Options::default(), &db_path)?;
+        let mut db = DB::open_cf(&Options::default(), &db_path, &names)?;
+        let meta = db.cf_handle(CF_META).ok_or_else(|| StorageError::Corrupt("database has no meta family".into()))?;
+        if db.get_cf(meta, META_PERPS.as_bytes())?.is_some() {
+            return Err(StorageError::Corrupt(
+                "this database holds a perps chain (RPL-3), which no build before it can follow; nothing dropped"
+                    .into(),
+            ));
+        }
+        if !names.iter().any(|n| n == CF_PERP_INPUTS) {
+            return Ok(false);
+        }
+        let family = db.cf_handle(CF_PERP_INPUTS).expect("listed and opened");
+        if db.iterator_cf(family, IteratorMode::Start).next().is_some() {
+            return Err(StorageError::Corrupt("the perp_inputs family holds rows; nothing dropped".into()));
+        }
+        db.drop_cf(CF_PERP_INPUTS)?;
+        Ok(true)
+    }
+
     fn cf(&self, name: &str) -> &rocksdb::ColumnFamily {
         self.db.cf_handle(name).expect("column family opened at startup")
     }
@@ -2982,10 +3017,14 @@ impl Storage {
             // RPL-3: the block's perp input words, in the same batch as the block — a crash
             // cannot leave a perps block stored without the words a prover needs for it. On a
             // perps chain every block closes its inputs, so a block without them (or with another
-            // height's) is not the block this ledger describes.
+            // height's) is not the block this ledger describes. A block a state proof of this
+            // same commit already covers (at or under `ledger_after`'s proved height) gets no row:
+            // the prune below scans the stored family, which does not see this batch's puts.
             match (&cb.perp_words, ledger_after.perps()) {
-                (Some((h, words)), Some(_)) if *h == block.height() => {
-                    batch.put_cf(self.cf(CF_PERP_INPUTS), hk, bincode::serialize(words)?);
+                (Some((h, words)), Some(p)) if *h == block.height() => {
+                    if *h > p.proved_height {
+                        batch.put_cf(self.cf(CF_PERP_INPUTS), hk, bincode::serialize(words)?);
+                    }
                 }
                 (None, None) => {}
                 (words, _) => {
@@ -3120,8 +3159,9 @@ impl Storage {
         self.put_vesting(&mut batch, ledger_after.vesting())?;
         self.put_program_state(&mut batch, ledger_after.program_state())?;
         self.put_perps(&mut batch, ledger_after.perps())?;
-        // A state proof among these blocks moved the proved height: the rows it covered go in
-        // the same batch (after the puts above, so a covered block of this very commit goes too).
+        // A state proof among these blocks moved the proved height: the stored rows it covered
+        // (from earlier commits) go in the same batch. The scan reads the family as stored, not
+        // this batch — a covered block of this very commit was never given a row (above).
         if let Some(p) = ledger_after.perps() {
             if blocks
                 .iter()
@@ -8076,8 +8116,10 @@ mod tests {
     /// The column families a pre-v0.3 build opens with: `ALL_CFS` without
     /// `receipts_by_program` — and without `program_public`, which arrived later still (the call
     /// limits, on a fresh chain, so no database ever needs rolling back across it), nor RPL-3's
-    /// `perp_inputs` (the perps chain is a fresh chain too). Exactly the list the build the fleet
-    /// rolls back to passes RocksDB.
+    /// `perp_inputs` (created on every database at first open, so it does need rolling back
+    /// across — `rand-node db drop-perp-inputs`, [`Storage::drop_perp_inputs`] — but that is its
+    /// own rollback, tested on its own). Exactly the list the build the fleet rolls back to
+    /// passes RocksDB.
     fn pre_v03_cfs() -> Vec<&'static str> {
         let cfs: Vec<&str> = ALL_CFS
             .iter()
@@ -9002,6 +9044,87 @@ mod tests {
         assert_eq!(plain.perps().unwrap(), None);
         assert!(plain.get_meta_raw(META_PERPS).unwrap().is_none());
         assert_eq!(plain.db.iterator_cf(plain.cf(CF_PERP_INPUTS), IteratorMode::Start).count(), 0);
+    }
+
+    /// Task 5 review: `perp_inputs` is created on every database at first open, so a build from
+    /// before RPL-3 (v0.7.1 lists seventeen families) can no longer open one this build has
+    /// opened. `drop_perp_inputs` drops the empty family so it can; a rerun finds nothing; a later
+    /// open re-creates it. A perps chain's database, or one with rows, is refused untouched.
+    #[test]
+    fn dropping_perp_inputs_lets_the_pre_rpl3_build_open_and_refuses_a_perps_chain() {
+        let pre_rpl3: Vec<&str> = ALL_CFS.iter().copied().filter(|c| *c != CF_PERP_INPUTS).collect();
+        assert_eq!(pre_rpl3.len(), 17);
+        let open_as_pre_rpl3 = |dir: &Path| {
+            let cfs = pre_rpl3.iter().map(|n| ColumnFamilyDescriptor::new(*n, Options::default()));
+            DB::open_cf_descriptors(&Options::default(), dir.join("db"), cfs)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let st = Storage::open(dir.path()).unwrap();
+            st.init_genesis(&genesis_with_two_notes_state()).unwrap();
+        }
+        assert!(open_as_pre_rpl3(dir.path()).is_err(), "eighteen families on disk, seventeen listed");
+        assert!(Storage::drop_perp_inputs(dir.path()).unwrap(), "dropped");
+        drop(open_as_pre_rpl3(dir.path()).expect("the pre-RPL-3 build opens it again"));
+        assert!(!Storage::drop_perp_inputs(dir.path()).unwrap(), "a rerun finds nothing to drop");
+        let st = Storage::open(dir.path()).unwrap();
+        assert_eq!(st.perp_inputs(1).unwrap(), None, "a later open re-creates the family, empty");
+        drop(st);
+
+        // A perps chain: refused, and the family stays.
+        let perps_dir = tempfile::tempdir().unwrap();
+        {
+            let st = Storage::open(perps_dir.path()).unwrap();
+            st.init_genesis(&perps_genesis(7)).unwrap();
+        }
+        let err = Storage::drop_perp_inputs(perps_dir.path()).unwrap_err().to_string();
+        assert!(err.contains("perps chain"), "{err}");
+        assert!(open_as_pre_rpl3(perps_dir.path()).is_err(), "untouched");
+        // Rows without the blob (a damaged store): refused too.
+        {
+            let st = Storage::open(perps_dir.path()).unwrap();
+            st.db.delete_cf(st.cf(CF_META), META_PERPS).unwrap();
+            st.put_perp_inputs(3, &[1, 2, 3]).unwrap();
+        }
+        let err = Storage::drop_perp_inputs(perps_dir.path()).unwrap_err().to_string();
+        assert!(err.contains("holds rows"), "{err}");
+        assert!(Storage::drop_perp_inputs(&perps_dir.path().join("nowhere")).is_err(), "no database");
+    }
+
+    /// Task 5 review: a state proof committed in the same batch as blocks it covers (a sync
+    /// batch, or HotStuff committing several blocks after a view change) leaves no row for them —
+    /// the prune scans the stored family, which does not see the batch's own puts, so the covered
+    /// blocks are given no row at all. Rows of earlier commits go by the scan; the proof's own
+    /// block keeps its row; and the replay agrees.
+    #[test]
+    fn a_proof_committed_with_the_blocks_it_covers_leaves_no_row_for_them() {
+        use randprotocol_core::ledger::perps::PerpPayout;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = perps_genesis(7);
+        s.init_genesis(&gs).unwrap();
+        let trader = key(50);
+        let mut ledger = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&ledger, &trader, 300, 5_000_000);
+        let b1 = make_perps_block(&gs.block, &mut ledger, vec![deposit], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert!(s.perp_inputs(1).unwrap().is_some());
+
+        let withdraw = perp_withdraw_tx(7, &trader, 1, 2_000_000, 1);
+        let request = word8_from_bytes(withdraw.hash().as_bytes()).unwrap();
+        let b2 = make_perps_block(&b1, &mut ledger, vec![withdraw], &key(1));
+        let b3 = make_perps_block(&b2, &mut ledger, vec![], &key(1));
+        let proof = perp_state_proof_tx(&ledger, 3, [77; 8], vec![PerpPayout { request, amount: 1_000_000 }], 0);
+        let b4 = make_perps_block(&b3, &mut ledger, vec![proof], &key(1));
+        let w4 = b4.perp_words.clone().unwrap().1;
+        s.commit(&[b2, b3, b4], &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.perps().unwrap().unwrap().proved_height, 3);
+        for h in 1..=3 {
+            assert_eq!(s.perp_inputs(h).unwrap(), None, "height {h} is proved: no row");
+        }
+        assert_eq!(s.perp_inputs(4).unwrap().as_ref(), Some(&w4));
+        assert_eq!(s.db.iterator_cf(s.cf(CF_PERP_INPUTS), IteratorMode::Start).count(), 1);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
     }
 
     /// The v4 re-review's bond queue is consensus state under a `staking` section, so — like

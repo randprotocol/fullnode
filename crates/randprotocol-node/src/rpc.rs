@@ -2948,18 +2948,20 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             }))
         }
         // One trading account by id (`[hex64]`): its key, its nonce window and the withdrawals
-        // it has pending; `null` for an id the exchange does not hold.
+        // it has pending; `null` for an id the exchange does not hold — and on a chain without
+        // the section, which holds none.
         "rand_getPerpAccount" => {
             let id =
                 parse_cell_key(p.get(0).ok_or_else(|| RpcError::invalid_params("missing param account"))?, "account")?;
             let storage = st.storage.clone();
             let Some(perps) = blocking(st, move || storage.perps()).await? else {
-                return Ok(json!({ "enabled": false }));
+                return Ok(Value::Null);
             };
             Ok(perps.account(&id).map(|a| perp_account_json(&perps, &id, a)).unwrap_or(Value::Null))
         }
         // The accounts in id order: `[{"after": hex64 | null, "limit": n}]`, both optional, at
         // most `MAX_PERP_ACCOUNTS_PAGE` a page; `next` is the last id served when more follow.
+        // A chain without the section has no account: an empty last page.
         "rand_getPerpAccounts" => {
             let (after, limit) = match p.get(0) {
                 None | Some(Value::Null) => (None, MAX_PERP_ACCOUNTS_PAGE),
@@ -2985,7 +2987,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             };
             let storage = st.storage.clone();
             let Some(perps) = blocking(st, move || storage.perps()).await? else {
-                return Ok(json!({ "enabled": false }));
+                return Ok(json!({ "accounts": [], "next": null }));
             };
             // One past the page, to know whether anything follows it.
             let mut page = perps.accounts(after.as_ref(), limit + 1);
@@ -7713,15 +7715,16 @@ pub(crate) mod tests {
         ledger
     }
 
-    /// `rand_getPerps` on a chain without the section is `{"enabled": false}` and nothing else,
-    /// as are the account reads; there is no input row to serve; `rand_getLimits.perps` is null
+    /// `rand_getPerps` on a chain without the section is `{"enabled": false}` and nothing else;
+    /// the account reads answer in their own shapes (no account: `null`, an empty last page);
+    /// there is no input row to serve; `rand_getLimits.perps` is null
     /// and the supply's perps terms are zero. All four methods are on the public listener.
     #[tokio::test]
     async fn the_perp_methods_on_a_chain_without_the_section() {
         let (_p, plain) = state_for(&fixtures::genesis_with(1, vec![]));
         assert_eq!(ok(&plain, "rand_getPerps", json!([])).await, json!({ "enabled": false }));
-        assert_eq!(ok(&plain, "rand_getPerpAccount", json!(["ab".repeat(32)])).await, json!({ "enabled": false }));
-        assert_eq!(ok(&plain, "rand_getPerpAccounts", json!([])).await, json!({ "enabled": false }));
+        assert_eq!(ok(&plain, "rand_getPerpAccount", json!(["ab".repeat(32)])).await, Value::Null);
+        assert_eq!(ok(&plain, "rand_getPerpAccounts", json!([])).await, json!({ "accounts": [], "next": null }));
         assert_eq!(ok(&plain, "rand_getPerpInputs", json!([0])).await, Value::Null);
         assert_eq!(ok(&plain, "rand_getLimits", json!([])).await["perps"], Value::Null);
         let supply = ok(&plain, "rand_getSupply", json!([])).await;
