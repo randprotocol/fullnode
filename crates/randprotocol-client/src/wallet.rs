@@ -2725,7 +2725,7 @@ async fn settle(
 /// ([`bind_call`]). `None` everywhere else, and for a call on a chain without the flag, whose proof
 /// the caller made beforehand.
 #[allow(clippy::too_many_arguments)]
-async fn submit_spend(
+pub(crate) async fn submit_spend(
     rpc: &RpcClient,
     w: &Wallet,
     store: &mut NoteStore,
@@ -8322,6 +8322,7 @@ mod tests {
             gas_price: None, byte_price: None, gas_circuit: false, bundle_gas_limit: None, adjust_bps: None, proof_window_blocks: None,
             program_state: None,
             prove_base: 0,
+            perps: None,
         };
         let priced = ChainLimits { gas_price: Some(100), byte_price: Some(800), ..raised };
         assert_eq!(hardened_call_quote_bytes(Some(&raised), 1_000), 1_000, "no policy: the envelope, as before");
@@ -8379,6 +8380,7 @@ mod tests {
             gas_price: Some(100), byte_price: Some(800), gas_circuit: false, bundle_gas_limit: None, adjust_bps: None, proof_window_blocks: None,
             program_state: None,
             prove_base: 0,
+            perps: None,
         };
         let old = ChainLimits { gas_price: None, byte_price: None, ..policy };
         for tier in [10u8, 12, 14, 20] {
@@ -8764,6 +8766,7 @@ mod tests {
             proof_window_blocks: None,
             program_state: None,
             prove_base: 0,
+            perps: None,
         }
     }
 
@@ -9041,6 +9044,7 @@ mod tests {
             proof_window_blocks: None,
             program_state: None,
             prove_base: 0,
+            perps: None,
         };
         let want = GasPolicy::DEFAULT.call_floor(tier, 0, 0, bytes);
         assert!(want > ledger_floor, "the policy floor must exceed the ledger floor for this test to say anything");

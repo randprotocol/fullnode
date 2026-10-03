@@ -648,6 +648,31 @@ rand program invoke <id> --transition step.json          # exit 3 if cell 01… 
 rand program vault <id>                                  # [{"asset": 0, "amount": "300000000"}]
 ```
 
+### `rand perp` (RPL-3 perpetual futures)
+
+On a chain whose genesis has the `perps` section (`rand-node genesis --perps …`); every command
+is refused elsewhere. A trading key — like a validator's oracle key — is a Dilithium2 key file
+in `rand-node keygen`'s `{seed, address, public_key}` shape; the account it owns is the eight
+words of its address (`perps::account_id`), printed as 64 hex. Orders, cancels, withdrawal
+requests and oracle prices are bundle-less: signed over `perp_sign_message`, fee-less, sent as
+is. A deposit is the one action that rides a bundle. Every command takes the global `--rpc`; the
+signed ones fetch the account first and default `--nonce` to one past its `nonce_high` (1 for a
+new account). Each waits for the commit unless `--no-wait`.
+
+| command | arguments | behaviour |
+|---|---|---|
+| `perp keygen` | `--out <FILE>` | write a fresh Dilithium2 trading key (mode 0600, refuses to overwrite); prints the account id |
+| `perp deposit` | `--trading-key <FILE>`, `--amount <A>`, `--fee <RAND>` (default: the action's floor), `--no-wait`, `--cuda` | credit the account the key owns: one bundle from this wallet (`--key`) burns `A` of the collateral (`rand_getPerps.collateral_asset`) and pays the RAND fee — through `burn_r` for RAND, as `bond`; through `burn_a`/`burn_asset` for a token, as `token burn`. `A` is decimal RAND (as `bond`) for RAND collateral, the token's display units (as `token burn`) for a token. Only the key file's `public_key` is read |
+| `perp order` | `--trading-key <FILE>`, `--market <ID>`, `--side buy\|sell`, `--size <UNITS>`, `--price <UNITS>` (limit orders only), `--kind limit\|market` (default `limit`), `--tif gtc\|ioc\|post` (default `gtc`), `--reduce-only`, `--nonce <N>`, `--no-wait` | sign and send an order; size in whole lots and price in whole ticks of the market (the ledger refuses otherwise); a market order takes no `--price`. Prints the transaction hash, account and nonce |
+| `perp cancel` | `--trading-key <FILE>`, `--target <NONCE>`, `--nonce <N>`, `--no-wait` | cancel the order whose nonce is `--target`; the cancel takes its own nonce |
+| `perp withdraw` | `--trading-key <FILE>`, `--amount <UNITS>` (collateral units, atomic), `--nonce <N>`, `--no-wait` | request a withdrawal to this wallet's address (`--key`). The request carries the note the chain will pay — `PERP_FROM`, the collateral asset, a fresh blinding `r` and `time` = the head height (held to the bundle time window) — and an envelope sealed to this wallet, which the ledger emits beside the note when a state proof pays it (the engine pays a request in full or not at all). Prints the request id (the transaction hash as 64 hex), the amount, `time`, `r` and the note's commitment; `rand sync` finds the note once paid |
+| `perp oracle` | `--node-key <FILE>`, `--price <MARKET>=<UNITS>[,…]`, `--every <SECS>`, `--no-wait` | a validator's prices, signed with its `rand-node keygen` key, sorted by market, nonce = the wall clock in ms. Without `--every`: one submission, waited for, and a refusal exits non-zero. With `--every`: for ever, one line per submission (`oracle <hash> nonce <n>`), a refusal logged on stderr and the loop carried on |
+| `perp prove` | `--image <FILE>`, `--job <FILE>`, `--tier <N>`, `--fri production\|test` (default: the node's `fri_profile`), `--no-submit`, `--no-wait` | prove a `perp-prover` job (`{from_height, to_height, state_before, state_after, blocks: [{height, words}], payouts: [{request: <64 hex>, amount}], fees}`) with the engine image and submit the `PerpStateProof`. Before any proving: the job's blocks must be the consecutive heights `from+1..=to` (at most `max_window_blocks`, at most 8 payouts in ascending request order); `R_from = perp_digest(22, state_before)` must be `rand_getPerps.proved_root` and `from_height` its `proved_height`; every `D_h = perp_digest(21, words)` must be the digest `rand_getPerpInputs h` serves; and a dry run of the engine must report the window's block count. Then it proves (`--tier`, else the smallest tier the run fits), refuses a tier over `max_tier` or a proof over `max_proof_bytes`, submits and waits for the commit. Prints the dry run's cycles and the proving time on stderr, then `tier`, `proof … bytes` and `committed <hash>` (`submitted` with `--no-wait`, `not submitted (would be …)` with `--no-submit`). **Exits non-zero on any refusal** — `perp-prover` reads status 0 as proved and included |
+| `perp genesis-root` | `--state <FILE.json>` | print the engine state root (`perp_digest(22, words)`, 64 hex) of a JSON array of u32 words — `perp-prover genesis-state`'s output, for the genesis `perps.genesis_root` |
+| `perp state` | | `rand_getPerps` verbatim |
+| `perp account [ID]` | `--trading-key <FILE>` (instead of `ID`) | `rand_getPerpAccount`: key, `nonce_high`, `used`, pending withdrawals |
+| `perp inputs <HEIGHT>` | | `rand_getPerpInputs`: the block's perp input words and digest |
+
 ### Key file formats
 
 Node key (both binaries' `keygen` used to share this; only `rand-node` writes it now):
