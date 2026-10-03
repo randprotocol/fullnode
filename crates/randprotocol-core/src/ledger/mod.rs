@@ -2653,6 +2653,13 @@ impl Ledger {
                 // `apply_block`.
                 return Err(TxError::AggregateNeedsCovered);
             }
+            // RPL-3: the perp rules are Task 3's; until they land, the six actions are refused.
+            Action::PerpDeposit { .. }
+            | Action::PerpOrder { .. }
+            | Action::PerpCancel { .. }
+            | Action::PerpWithdraw { .. }
+            | Action::PerpOracle { .. }
+            | Action::PerpStateProof { .. } => return Err(TxError::UnsupportedAction("perp")),
         }
         // 7b. under genesis `hardening_v6`, the canonical-proof rules (INT-5, VERIFIER-1/-2): a
         // header or transcript field the honest prover would not write — one the verifier accepts
@@ -3025,6 +3032,13 @@ impl Ledger {
                 // the same so a direct caller hears where aggregates go.
                 return Err(TxError::AggregateNeedsCovered);
             }
+            // RPL-3: the perp rules are Task 3's; until they land, the six actions are refused.
+            Action::PerpDeposit { .. }
+            | Action::PerpOrder { .. }
+            | Action::PerpCancel { .. }
+            | Action::PerpWithdraw { .. }
+            | Action::PerpOracle { .. }
+            | Action::PerpStateProof { .. } => return Err(TxError::UnsupportedAction("perp")),
         }
         Ok(receipt)
     }

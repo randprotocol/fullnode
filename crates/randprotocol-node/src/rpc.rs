@@ -2372,6 +2372,13 @@ fn tx_json_with(
             "rotation_kind": match kind { 0 => "pq_guardians", 1 => "pause_key", _ => "unknown" },
             "nonce": nonce,
         }),
+        // RPL-3: placeholders, only the kind; the fields are rendered with the perp RPC.
+        Action::PerpDeposit { .. } => json!({ "kind": "perp_deposit" }),
+        Action::PerpOrder { .. } => json!({ "kind": "perp_order" }),
+        Action::PerpCancel { .. } => json!({ "kind": "perp_cancel" }),
+        Action::PerpWithdraw { .. } => json!({ "kind": "perp_withdraw" }),
+        Action::PerpOracle { .. } => json!({ "kind": "perp_oracle" }),
+        Action::PerpStateProof { .. } => json!({ "kind": "perp_state_proof" }),
         // Genesis vesting: the entry and the amounts are public register facts, like a
         // `Withdraw`'s; the note a claim or a revoke pays is rendered no further.
         Action::ClaimVested { entry, amount, nonce, time, .. } => json!({
