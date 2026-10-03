@@ -333,6 +333,30 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.decode_invoke(program, proof, segment)
     }
 
+    /// RPL-3's state-proof rules, forwarded for the same reason as the invoke rules: the trait's
+    /// default refuses every `PerpStateProof` ("does not implement the RPL-3 state-proof
+    /// rules"), and this wrapper is what every node runs. No metering or caching sits around
+    /// the invoke path here, so none is added: a straight forward.
+    fn verify_perp(
+        &self,
+        engine_hc: &Word8,
+        max_tier: u8,
+        segment: &[u32],
+        proof: &[u8],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.inner.verify_perp(engine_hc, max_tier, segment, proof)
+    }
+
+    fn decode_perp(
+        &self,
+        engine_hc: &Word8,
+        max_tier: u8,
+        segment: &[u32],
+        proof: &[u8],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.inner.decode_perp(engine_hc, max_tier, segment, proof)
+    }
+
     /// The keys an `Invoke` verifies under are these too: its segment sits in the hardened
     /// call's public table (`program_state::segment_fits`), so it declares no shape a call to
     /// the same program does not.
@@ -536,6 +560,7 @@ pub(crate) fn fixture_proof(k: usize) -> randprotocol_zkvm::machine::Proof {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::types::FriProfile as CoreProfile;
 
     /// The covered-bundle record admission would assemble for fixture `k`: its declared shape
@@ -741,6 +766,23 @@ mod tests {
         assert_eq!(w.verify_invoke(&record, b"junk", &[0; 19]), zk.verify_invoke(&record, b"junk", &[0; 19]));
         assert_eq!(w.verify_invoke(&record, b"junk", &[0; 19]), Err(ConfidentialError::MalformedProof), "not the trait default");
         assert_eq!(w.decode_invoke(&record, b"junk", &[0; 19]), Err(ConfidentialError::MalformedProof));
+        // RPL-3's state-proof rules: the trait default refuses every `PerpStateProof` with an
+        // `InvalidProof("… does not implement …")`; the zkVM decodes the bytes (junk: malformed).
+        let (hc, seg) = ([3u32; 8], [0u32; 40]);
+        let junk = b"junk".as_slice();
+        let v = w.verify_perp(&hc, 20, &seg, junk);
+        let d = w.decode_perp(&hc, 20, &seg, junk);
+        assert_eq!(v, zk.verify_perp(&hc, 20, &seg, junk));
+        assert_eq!(v, Err(ConfidentialError::MalformedProof), "not the trait default");
+        assert_eq!(d, Err(ConfidentialError::MalformedProof), "not the trait default");
+        // A stub-built proof is not a valid STARK: the refusal must be the zkVM's, never the
+        // trait default's "does not implement" message.
+        let stub = StubExecutor::make_perp_proof(&hc, 16, [1; 8], &seg);
+        let v = w.verify_perp(&hc, 20, &seg, &stub);
+        let d = w.decode_perp(&hc, 20, &seg, &stub);
+        assert_eq!(v, zk.verify_perp(&hc, 20, &seg, &stub));
+        assert_eq!(d, zk.decode_perp(&hc, 20, &seg, &stub));
+        assert!(!format!("{v:?}{d:?}").contains("does not implement"));
         // Constraint set 8's decodes: the trait defaults answer `Ok(None)` ("no limit"), which
         // under a gas section refuses every honest proof — the zkVM decodes the bytes.
         assert_eq!(w.bundle_gas_limit(b"junk"), zk.bundle_gas_limit(b"junk"));
