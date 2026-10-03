@@ -4973,6 +4973,9 @@ pub(crate) mod fixtures {
             collateral_asset: 0,
             max_tier: 16,
             max_window_blocks: 8,
+            // The devnet's sizing (docs/perps.md): 8 inputs a block, a floor of 1 000 units.
+            max_block_inputs: 8,
+            min_deposit: 1_000,
             engine_hc: PERPS_ENGINE,
             genesis_root: [32; 8],
             markets: vec![randprotocol_core::ledger::perps::MarketSpec {
@@ -5028,9 +5031,11 @@ pub(crate) mod fixtures {
         ))
     }
 
-    /// A signed perp action, bundle-less: `k` signs [`Transaction::perp_sign_message`].
+    /// A signed perp action, bundle-less: `k` signs [`Transaction::perp_sign_message`] under the
+    /// chain-id binding domain, the fixture genesis's (it sets no `binding_domain`).
     pub(crate) fn perp_signed(chain_id: u64, k: &Keypair, mut action: Action) -> Transaction {
-        let msg = Transaction::perp_sign_message(chain_id, &action).expect("a signed perp action");
+        let domain = randprotocol_core::BindingDomain::ChainId;
+        let msg = Transaction::perp_sign_message(&domain, chain_id, &action).expect("a signed perp action");
         let sig = k.sign(msg.as_bytes());
         match &mut action {
             Action::PerpOrder { signature, .. }
@@ -8941,7 +8946,7 @@ mod tests {
         );
         assert_eq!(s.perps().unwrap().as_ref(), ledger.perps());
 
-        let withdraw = perp_withdraw_tx(7, &trader, 1, 2_000_000, 1);
+        let withdraw = perp_withdraw_tx(7, &trader, 1, 1_500_000, 1);
         let request = word8_from_bytes(withdraw.hash().as_bytes()).unwrap();
         let b2 = make_perps_block(&b1, &mut ledger, vec![withdraw], &key(1));
         let at2 = ledger.clone();
@@ -8961,7 +8966,7 @@ mod tests {
         torn.perp_words = Some((3, w3.clone()));
         assert!(s.commit(std::slice::from_ref(&torn), &probe, &[], &StubExecutor).is_err());
 
-        // Block 4: a state proof of 0..=3 that pays the request in part. Its rows at or under 3
+        // Block 4: a state proof of 0..=3 that pays the request in full. Its rows at or under 3
         // go; block 4's own stays, the one height a next proof covers.
         let proof = perp_state_proof_tx(&ledger, 3, [77; 8], vec![PerpPayout { request, amount: 1_500_000 }], 10);
         let first = ledger.next_index();
@@ -9110,7 +9115,7 @@ mod tests {
         s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         assert!(s.perp_inputs(1).unwrap().is_some());
 
-        let withdraw = perp_withdraw_tx(7, &trader, 1, 2_000_000, 1);
+        let withdraw = perp_withdraw_tx(7, &trader, 1, 1_000_000, 1);
         let request = word8_from_bytes(withdraw.hash().as_bytes()).unwrap();
         let b2 = make_perps_block(&b1, &mut ledger, vec![withdraw], &key(1));
         let b3 = make_perps_block(&b2, &mut ledger, vec![], &key(1));

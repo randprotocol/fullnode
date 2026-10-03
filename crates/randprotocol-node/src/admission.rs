@@ -9,6 +9,7 @@
 
 use crate::mempool::MempoolError;
 use crate::network::{GossipId, MessageAcceptance};
+use randprotocol_core::notes::Word8;
 use randprotocol_core::{Hash, Transaction, TxError};
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
@@ -360,10 +361,16 @@ pub fn is_permanent(e: &TxError) -> bool {
     // `AmountTooLarge`, `CollateralAssetMismatch` — the bundle's burn asset against the
     // section's), `ReservedAccount` (a key whose id is the insurance fund's, forever),
     // `KeyMismatch` (an account id is its key's hash) and `BadSignature` (over the action's own
-    // message, under the account's key or the oracle's — neither rotates). Everything else reads
-    // state that moves: the nonce windows, the accounts and their cap, the pending withdrawals
-    // and their cap, the validator set, the proved height and its digests — and the proof's
-    // verdict, which is over a segment built from them.
+    // message, under the account's key or the oracle's — neither rotates; the message's binding
+    // domain is a genesis constant). The final fix wave adds two more: `DepositTooSmall` (the
+    // bundle's burn against the genesis `min_deposit`) and `PartialPayout` (a payout against its
+    // request's amount, which the request id — the request's own hash — fixes: no state makes
+    // a partial payout of that request whole). Everything else reads state that moves: the nonce
+    // windows, the accounts and their cap, the pending withdrawals and their cap, the validator
+    // set, the proved height and its digests — and the proof's verdict, which is over a segment
+    // built from them. The block's input caps (`BlockFull`, `AccountBlockFull`) are about the
+    // block being built — the next has room; `WithdrawalPending` clears when a proof settles the
+    // account's request; `RequestOutsideWindow` reads the height the request was recorded at.
     if let TxError::Perps(p) = e {
         use randprotocol_core::ledger::perps::PerpError as P;
         return match p {
@@ -380,7 +387,9 @@ pub fn is_permanent(e: &TxError) -> bool {
             | P::UnorderedPrices
             | P::CollateralAssetMismatch
             | P::KeyMismatch
-            | P::ZeroAmount => true,
+            | P::ZeroAmount
+            | P::DepositTooSmall(_)
+            | P::PartialPayout { .. } => true,
             P::NonceUsed
             | P::WindowMismatch { .. }
             | P::MissingDigest(_)
@@ -394,7 +403,11 @@ pub fn is_permanent(e: &TxError) -> bool {
             | P::ProofRefused(_)
             // The pending request holding the opening is paid by a later proof, freeing it.
             | P::DuplicateOpening
-            | P::Overflow => false,
+            | P::Overflow
+            | P::BlockFull
+            | P::AccountBlockFull
+            | P::WithdrawalPending
+            | P::RequestOutsideWindow { .. } => false,
         };
     }
     // The Dilithium2 co-signature's verdicts (bridge hardening B3). Every other bridge verdict
@@ -666,6 +679,106 @@ pub struct Verdict {
     pub tx: Transaction,
     pub result: Result<(), TxError>,
     pub source: VerifySource,
+    /// For a `PerpStateProof`, the proved root of the snapshot it was verified on and the digest
+    /// of the segment it was verified over ([`state_proof_key`]) — what a `ProofRefused` verdict
+    /// is keyed by in the [`ProofRefusedCache`]; `None` for every other transaction.
+    pub proof_key: Option<StateProofKey>,
+}
+
+/// How many refused state proofs to remember (RPL-3 final fix wave, I1). Only proofs against the
+/// current proved root are held, and a window's proofs are few; this bounds a flood of distinct
+/// junk proofs, which then costs one verification each, as any uncached refusal does.
+pub const PROOF_REFUSED_ENTRIES: usize = 256;
+
+/// What a state proof's verdict on one ledger is a function of, beside its own bytes: the proved
+/// root the ledger holds and the digest (`blake3` of the little-endian words) of the public
+/// segment the ledger builds for it — `R_from` (that root), the window's recorded digests and the
+/// transaction's own claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StateProofKey {
+    pub proved_root: Word8,
+    pub segment: Hash,
+}
+
+/// The [`StateProofKey`] of a `PerpStateProof` on `ledger`: `None` for any other transaction, on
+/// a chain without the section, and for a proof whose cheap rules `ledger` refuses (which the
+/// ledger answers without looking at the STARK, so there is nothing to cache).
+pub fn state_proof_key(
+    tx: &Transaction,
+    ledger: &randprotocol_core::Ledger,
+    executor: &dyn randprotocol_core::confidential::ConfidentialExecutor,
+) -> Option<StateProofKey> {
+    let randprotocol_core::Action::PerpStateProof { .. } = tx.action else { return None };
+    let proved_root = ledger.perps()?.proved_root;
+    let words = randprotocol_core::ledger::perps::state_proof_segment_on(ledger, tx, executor).ok()?;
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    Some(StateProofKey { proved_root, segment: Hash::digest_domain(b"rand-node-perp-segment-1", &bytes) })
+}
+
+/// RPL-3 (final fix wave, I1): state proofs whose STARK this node refused (`ProofRefused`),
+/// keyed by the transaction hash and its [`StateProofKey`] — the proved root and the segment.
+///
+/// `ProofRefused` is not [`is_permanent`] — the segment a proof is verified over is built from
+/// the chain's proved root and recorded digests, which move — so the [`RefusedCache`] never holds
+/// it, and the same junk proof re-sent was verified afresh each time: a state proof is
+/// bundle-less and fee-less, and its STARK is the most expensive verification a node runs. The
+/// verdict is a function of the proof's bytes (in the hash), the genesis constants and the
+/// segment, so the same hash over the same segment is refused again without verifying. Every
+/// entry is dropped the moment the proved root moves, since no segment of the old root can be
+/// built again. Bounded and FIFO like the refused cache.
+pub struct ProofRefusedCache {
+    root: Option<Word8>,
+    seen: HashMap<(Hash, Hash), TxError>,
+    order: VecDeque<(Hash, Hash)>,
+    cap: usize,
+}
+
+impl ProofRefusedCache {
+    pub fn new(cap: usize) -> ProofRefusedCache {
+        ProofRefusedCache { root: None, seen: HashMap::new(), order: VecDeque::new(), cap }
+    }
+
+    /// The refusal of `h` over `key`, if this node made one — never one made against an earlier
+    /// root or over another segment.
+    pub fn get(&self, h: &Hash, key: &StateProofKey) -> Option<&TxError> {
+        if self.root != Some(key.proved_root) {
+            return None;
+        }
+        self.seen.get(&(*h, key.segment))
+    }
+
+    /// Remember `e` for `h` over `key` — only a `ProofRefused`, so no other verdict (a window or
+    /// a digest refusal, which a later block may answer) is held. A new root empties the cache
+    /// first.
+    pub fn insert(&mut self, h: Hash, key: StateProofKey, e: TxError) {
+        use randprotocol_core::ledger::perps::PerpError;
+        if !matches!(e, TxError::Perps(PerpError::ProofRefused(_))) || self.cap == 0 {
+            return;
+        }
+        if self.root != Some(key.proved_root) {
+            self.seen.clear();
+            self.order.clear();
+            self.root = Some(key.proved_root);
+        }
+        let k = (h, key.segment);
+        if self.seen.insert(k, e).is_some() {
+            return;
+        }
+        self.order.push_back(k);
+        while self.order.len() > self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
 }
 
 /// What to do with one gossip message, decided without touching the pool or a proof.
@@ -1147,6 +1260,33 @@ mod tests {
         assert_eq!(s.len(), 3);
     }
 
+    /// I1: a `ProofRefused` is held per proved root — only that verdict, never past a root change,
+    /// and bounded.
+    #[test]
+    fn the_proof_refused_cache_holds_one_roots_refusals() {
+        use randprotocol_core::ledger::perps::PerpError as P;
+        let refused = TxError::Perps(P::ProofRefused("outputs".into()));
+        let key = |root: u32, seg: u8| StateProofKey { proved_root: [root; 8], segment: h(100 + seg) };
+        let mut c = ProofRefusedCache::new(2);
+        c.insert(h(1), key(1, 0), refused.clone());
+        assert_eq!(c.get(&h(1), &key(1, 0)), Some(&refused));
+        assert_eq!(c.get(&h(1), &key(2, 0)), None, "not against another root");
+        assert_eq!(c.get(&h(1), &key(1, 1)), None, "not over another segment (another window's digests)");
+        // Only `ProofRefused`: a window or digest refusal may be answered by the next block.
+        c.insert(h(2), key(1, 0), TxError::Perps(P::MissingDigest(4)));
+        c.insert(h(3), key(1, 0), TxError::Perps(P::WindowMismatch { from: 0, to: 1, proved: 1, max: 8 }));
+        assert_eq!(c.len(), 1);
+        // Bounded, oldest first.
+        c.insert(h(4), key(1, 0), refused.clone());
+        c.insert(h(5), key(1, 0), refused.clone());
+        assert_eq!((c.len(), c.get(&h(1), &key(1, 0))), (2, None));
+        // The root moves: every entry goes.
+        c.insert(h(6), key(2, 0), refused.clone());
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.get(&h(4), &key(1, 0)), None);
+        assert_eq!(c.get(&h(6), &key(2, 0)), Some(&refused));
+    }
+
     /// RPL-3: a perp refusal is cached only when it is about the bytes against genesis
     /// constants — the section's presence, its markets and tier cap, the action's own lists and
     /// amounts, a signature under a key no action rotates (an account id is its key's hash, an
@@ -1171,6 +1311,8 @@ mod tests {
             P::CollateralAssetMismatch,
             P::KeyMismatch,
             P::ZeroAmount,
+            P::DepositTooSmall(5),
+            P::PartialPayout { want: 1, have: 2 },
         ] {
             assert!(is_permanent(&TxError::Perps(e.clone())), "{e} is a statement about the bytes");
         }
@@ -1188,6 +1330,12 @@ mod tests {
             P::ProofRefused("outputs".into()),
             P::DuplicateOpening,
             P::Overflow,
+            // The final fix wave's: the next block has room, a proof settles the pending
+            // request, and a request's recorded height is state.
+            P::BlockFull,
+            P::AccountBlockFull,
+            P::WithdrawalPending,
+            P::RequestOutsideWindow { height: 3, from: 0, to: 2 },
         ] {
             assert!(!is_permanent(&TxError::Perps(e.clone())), "{e} moves with the chain");
         }

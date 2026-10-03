@@ -593,7 +593,8 @@ enum Cmd {
         fees: Option<PathBuf>,
         /// RPL-3: the `perps` section — perpetual futures, proved off chain by the engine guest —
         /// as a `PerpsConfig` JSON file (`{"collateral_asset", "max_tier", "max_window_blocks",
-        /// "engine_hc", "genesis_root", "markets": [...]}`, the two commitments as 64 hex
+        /// "max_block_inputs", "min_deposit" (optional, 0), "engine_hc", "genesis_root",
+        /// "markets": [...]}`, the two commitments as 64 hex
         /// characters). Given, the section is part of the genesis hash; omitted, the file has
         /// none and hashes byte-for-byte as before. It needs `--tokens`, `--gas-price`,
         /// `--hardening-v6` and `--auth-guest` (with `--bundle-guest v3`), each refused by name
@@ -1931,12 +1932,14 @@ async fn main() -> Result<()> {
             if let Some(p) = state.ledger.perps() {
                 let c = &p.config;
                 println!(
-                    "perps: {} market{}, collateral asset {}, max tier {}, at most {} blocks a proof, engine {}, genesis root {}",
+                    "perps: {} market{}, collateral asset {}, max tier {}, at most {} blocks a proof, at most {} inputs a block, min deposit {}, engine {}, genesis root {}",
                     c.markets.len(),
                     if c.markets.len() == 1 { "" } else { "s" },
                     c.collateral_asset,
                     c.max_tier,
                     c.max_window_blocks,
+                    c.max_block_inputs,
+                    c.min_deposit,
                     word8_to_hex(&c.engine_hc),
                     word8_to_hex(&c.genesis_root),
                 );

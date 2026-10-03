@@ -793,13 +793,17 @@ pub struct FeeRules {
 }
 
 /// `rand_getLimits`' `perps` object: the collateral asset (0 is RAND), the highest proof tier
-/// and the most blocks one state proof may cover, and the most withdrawals one proof pays.
+/// and the most blocks one state proof may cover, and the most withdrawals one proof pays; the
+/// most perp inputs one block records and the smallest deposit (a decimal string, 0 no floor).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PerpsLimits {
     pub collateral_asset: u32,
     pub max_tier: u8,
     pub max_window_blocks: u64,
     pub max_payouts: usize,
+    pub max_block_inputs: u32,
+    #[serde(serialize_with = "u64_as_decimal_string")]
+    pub min_deposit: u64,
 }
 
 /// `rand_getLimits`' `program_state` object: what a wallet needs to size and price an `Invoke`.
@@ -856,6 +860,8 @@ impl ChainLimits {
                 max_tier: p.config.max_tier,
                 max_window_blocks: p.config.max_window_blocks,
                 max_payouts: randprotocol_core::ledger::perps::MAX_PERP_PAYOUTS,
+                max_block_inputs: p.config.max_block_inputs,
+                min_deposit: p.config.min_deposit,
             }),
         };
         if let Some(g) = ledger.gas() {
@@ -2931,6 +2937,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "collateral_asset": c.collateral_asset,
                 "max_tier": c.max_tier,
                 "max_window_blocks": c.max_window_blocks,
+                "max_block_inputs": c.max_block_inputs,
+                "min_deposit": c.min_deposit.to_string(),
                 "engine_hc": word8_to_hex(&c.engine_hc),
                 "genesis_root": word8_to_hex(&c.genesis_root),
                 "markets": c.markets,
@@ -7692,7 +7700,8 @@ pub(crate) mod tests {
         let deposit = perp_deposit_tx(&ledger, &trader, 300, 5_000_000);
         let oracle = perp_oracle_tx(7, &key(1), 1_000_000, 1);
         let b1 = make_perps_block(&gs.block, &mut ledger, vec![deposit.clone(), oracle.clone()], &key(1));
-        let withdraw = perp_withdraw_tx(7, &trader, 1, 2_000_000, 1);
+        // The engine pays a request in full or not at all (I4): the proof below pays all of it.
+        let withdraw = perp_withdraw_tx(7, &trader, 1, 1_500_000, 1);
         let request = randprotocol_core::notes::word8_from_bytes(withdraw.hash().as_bytes()).unwrap();
         let b2 = make_perps_block(&b1, &mut ledger, vec![withdraw.clone()], &key(1));
         let b3 = make_perps_block(&b2, &mut ledger, vec![], &key(1));
@@ -7753,6 +7762,8 @@ pub(crate) mod tests {
                 "collateral_asset": 0,
                 "max_tier": 16,
                 "max_window_blocks": 8,
+                "max_block_inputs": 8,
+                "min_deposit": "1000",
                 "engine_hc": word8_to_hex(&cfg.engine_hc),
                 "genesis_root": word8_to_hex(&cfg.genesis_root),
                 "markets": [{
@@ -7819,7 +7830,10 @@ pub(crate) mod tests {
         let limits = ok(&st, "rand_getLimits", json!([])).await;
         assert_eq!(
             limits["perps"],
-            json!({ "collateral_asset": 0, "max_tier": 16, "max_window_blocks": 8, "max_payouts": 8 })
+            json!({
+                "collateral_asset": 0, "max_tier": 16, "max_window_blocks": 8, "max_payouts": 8,
+                "max_block_inputs": 8, "min_deposit": "1000",
+            })
         );
     }
 
@@ -7838,7 +7852,7 @@ pub(crate) mod tests {
             "trading_key": trader.public_key().to_hex(),
             "nonce_high": 1,
             "used": "1",
-            "withdrawals": [{ "request": request, "amount": "2000000", "height": 2 }],
+            "withdrawals": [{ "request": request, "amount": "1500000", "height": 2 }],
         });
         assert_eq!(ok(&st, "rand_getPerpAccount", json!([id])).await, want);
         assert_eq!(ok(&st, "rand_getPerpAccount", json!([format!("0x{id}")])).await, want, "0x is accepted");
@@ -7888,7 +7902,7 @@ pub(crate) mod tests {
         assert_eq!(
             action(&txs[2]),
             json!({
-                "kind": "perp_withdraw", "account": id, "nonce": 1, "amount": "2000000",
+                "kind": "perp_withdraw", "account": id, "nonce": 1, "amount": "1500000",
                 "recipient": fixtures::recipient().to_string(), "time": 1,
             })
         );
