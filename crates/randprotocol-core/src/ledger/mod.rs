@@ -18,6 +18,7 @@ pub mod bridge_notes;
 pub mod call_envelope;
 pub mod fees;
 pub mod nullifier_mmr;
+pub mod perps;
 pub mod program_state;
 pub mod staking;
 pub mod supply;
@@ -4171,6 +4172,9 @@ pub(crate) mod tests {
         fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
             StubExecutor.node_hash(left, right)
         }
+        fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+            StubExecutor.hash_domain(domain, msg)
+        }
         fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
             StubExecutor.note_commitment(pk, from, amount, asset, time, r)
         }
@@ -4987,6 +4991,9 @@ pub(crate) mod tests {
         fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
             StubExecutor.node_hash(left, right)
         }
+        fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+            StubExecutor.hash_domain(domain, msg)
+        }
         fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
             StubExecutor.note_commitment(pk, from, amount, asset, time, r)
         }
@@ -5299,6 +5306,9 @@ pub(crate) mod tests {
         }
         fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
             StubExecutor.node_hash(left, right)
+        }
+        fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+            StubExecutor.hash_domain(domain, msg)
         }
         fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
             StubExecutor.note_commitment(pk, from, amount, asset, time, r)
@@ -6334,6 +6344,9 @@ pub(crate) mod tests {
             fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
                 StubExecutor.node_hash(left, right)
             }
+            fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+                StubExecutor.hash_domain(domain, msg)
+            }
             fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
                 StubExecutor.note_commitment(pk, from, amount, asset, time, r)
             }
@@ -6883,6 +6896,9 @@ pub(crate) mod tests {
             }
             fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
                 StubExecutor.node_hash(left, right)
+            }
+            fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+                StubExecutor.hash_domain(domain, msg)
             }
             fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
                 StubExecutor.note_commitment(pk, from, amount, asset, time, r)
@@ -7549,6 +7565,9 @@ pub(crate) mod tests {
         }
         fn public_digest(&self, words: &[u32]) -> crate::notes::Word8 {
             StubExecutor.public_digest(words)
+        }
+        fn hash_domain(&self, domain: u32, msg: &[u32]) -> crate::notes::Word8 {
+            StubExecutor.hash_domain(domain, msg)
         }
         fn node_hash(&self, left: &crate::notes::Word8, right: &crate::notes::Word8) -> crate::notes::Word8 {
             StubExecutor.node_hash(left, right)

@@ -1345,6 +1345,10 @@ impl ConfidentialExecutor for ZkExecutor {
         crate::notes::hash(crate::notes::domain::NODE, &msg)
     }
 
+    fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+        crate::notes::hash(domain, msg)
+    }
+
     /// The vendored `Note`'s own commitment, built by fields rather than by `Note::new` (which
     /// draws `r` itself): the ledger is handed `r` on the wire precisely so it can recompute a
     /// deposit note it did not create. `tests/shielded.rs` pins the two against each other.

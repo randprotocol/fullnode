@@ -348,6 +348,10 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.node_hash(left, right)
     }
 
+    fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+        self.inner.hash_domain(domain, msg)
+    }
+
     fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
         self.inner.note_commitment(pk, from, amount, asset, time, r)
     }

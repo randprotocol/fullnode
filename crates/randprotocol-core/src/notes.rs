@@ -70,6 +70,31 @@ pub fn word8_from_hex(s: &str) -> Option<Word8> {
     word8_from_bytes(&hex::decode(s).ok()?)
 }
 
+/// A `Word8` field as [`word8_to_hex`] text in a human-readable format (a genesis file, an RPC
+/// answer) and as its eight words otherwise, so bincode encodes it exactly as a plain `Word8`:
+/// `#[serde(with = "crate::notes::word8_hex")]`.
+pub mod word8_hex {
+    use super::{word8_from_hex, word8_to_hex, Word8};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(w: &Word8, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.serialize_str(&word8_to_hex(w))
+        } else {
+            w.serialize(s)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Word8, D::Error> {
+        if d.is_human_readable() {
+            let text = String::deserialize(d)?;
+            word8_from_hex(&text).ok_or_else(|| serde::de::Error::custom("expected 64 hex characters"))
+        } else {
+            Word8::deserialize(d)
+        }
+    }
+}
+
 /// What travels with a created note besides its commitment. The chain checks nothing about it;
 /// it exists so the right keys can open the note later (`randprotocol-zkvm`'s vendored `viewing.rs`
 /// seals and opens it; this is the same four-part layout).

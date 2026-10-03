@@ -149,6 +149,9 @@ pub trait ConfidentialExecutor: Send + Sync {
     fn public_digest(&self, words: &[u32]) -> Word8;
     /// Poseidon2 tree-node hash `H(NODE, left || right)` — the hash `MERKLE_VERIFY` checks against.
     fn node_hash(&self, left: &Word8, right: &Word8) -> Word8;
+    /// RPL-3: the domain-tagged Poseidon2 sponge the perp module and its guest share:
+    /// `sponge_hash([domain, msg…])`. The stub is a blake3 stand-in, injective in the same fields.
+    fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8;
     /// The note commitment `H(CM, pk(8) from(8) amount_lo amount_hi asset time r(8))` — the
     /// 28-word note layout of the vendored `randprotocol_zkvm::notes::Note`.
     ///
@@ -543,6 +546,11 @@ impl ConfidentialExecutor for StubExecutor {
 
     fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
         Self::hash_words(b"rand-stub-node", &[&word8_to_bytes(left), &word8_to_bytes(right)])
+    }
+
+    fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+        let words: Vec<u8> = msg.iter().flat_map(|w| w.to_le_bytes()).collect();
+        Self::hash_words(b"rand-stub-domain", &[&domain.to_le_bytes(), &words])
     }
 
     /// A blake3 stand-in over the same six fields. It is not the real note commitment and no

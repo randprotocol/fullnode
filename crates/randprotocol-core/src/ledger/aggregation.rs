@@ -1944,6 +1944,9 @@ mod admission_tests {
             fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
                 StubExecutor.node_hash(left, right)
             }
+            fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+                StubExecutor.hash_domain(domain, msg)
+            }
             fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
                 StubExecutor.note_commitment(pk, from, amount, asset, time, r)
             }
