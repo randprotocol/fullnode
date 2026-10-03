@@ -793,6 +793,12 @@ enum PerpCmd {
         #[arg(long)]
         state: PathBuf,
     },
+    /// Print an engine image's program commitment in the chain's hex format (each u32 word as 8
+    /// little-endian hex characters), for the genesis `perps.engine_hc`.
+    ImageHc {
+        #[arg(long)]
+        image: PathBuf,
+    },
     /// The exchange's public state (`rand_getPerps`).
     State,
     /// One trading account (`rand_getPerpAccount`), by id or by `--trading-key`.
@@ -1672,6 +1678,13 @@ async fn perp(
             "{}",
             word8_to_hex(&perps::genesis_root(&perps::read_words(&state)?))
         ),
+        PerpCmd::ImageHc { image } => {
+            let bytes = std::fs::read(&image)
+                .with_context(|| format!("reading the engine image {}", image.display()))?;
+            let program = randprotocol_zkvm::codec::program_from_bytes(&bytes)
+                .map_err(|e| anyhow!("{} is not a program image: {e}", image.display()))?;
+            println!("{}", word8_to_hex(&perps::image_hc(&program)));
+        }
         PerpCmd::State => println!("{}", pretty(&rpc.get_perps().await?)),
         PerpCmd::Account {
             account,
@@ -3338,6 +3351,7 @@ mod tests {
                 "2",
             ],
             &["perp", "genesis-root", "--state", "s.json"],
+            &["perp", "image-hc", "--image", "e.bin"],
             &["perp", "state"],
             &["perp", "account", "--trading-key", "t.json"],
             &["perp", "inputs", "7"],

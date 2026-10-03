@@ -83,6 +83,26 @@ pub fn sign_perp(
 
 // ---------------------------------------------------------------- the node's answers
 
+/// The image's program commitment `hc` (what `verify_public` keys on and what the genesis pins
+/// as `engine_hc`), in the chain's hex format: each u32 word as 8 little-endian hex characters.
+pub fn image_hc(program: &randprotocol_zkvm::isa::Program) -> Word8 {
+    program.digest()
+}
+
+/// Refuse an image whose `hc` is not the chain's `engine_hc`, before any proving.
+pub fn check_image_hc(program: &randprotocol_zkvm::isa::Program, engine_hc: &Word8) -> Result<()> {
+    let hc = image_hc(program);
+    if hc != *engine_hc {
+        bail!(
+            "the image's engine hash {} is not the chain's engine_hc {}; the genesis pins another \
+             engine (or the .hc file is in another byte order)",
+            randprotocol_core::notes::word8_to_hex(&hc),
+            randprotocol_core::notes::word8_to_hex(engine_hc)
+        );
+    }
+    Ok(())
+}
+
 /// A u64 off an RPC answer, a JSON number or a decimal string.
 fn u64_of(v: &Value, what: &str) -> Result<u64> {
     crate::amount_field(v).ok_or_else(|| anyhow!("rand_getPerps: {what} is not a u64 ({v})"))
@@ -100,6 +120,7 @@ pub struct PerpsState {
     pub collateral_asset: u32,
     pub max_tier: u8,
     pub max_window_blocks: u64,
+    pub engine_hc: Word8,
     pub proved_root: Word8,
     pub proved_height: u64,
 }
@@ -115,6 +136,7 @@ impl PerpsState {
             collateral_asset: u32::try_from(u64_of(&v["collateral_asset"], "collateral_asset")?)?,
             max_tier: u8::try_from(u64_of(&v["max_tier"], "max_tier")?)?,
             max_window_blocks: u64_of(&v["max_window_blocks"], "max_window_blocks")?,
+            engine_hc: word8_of(&v["engine_hc"], "rand_getPerps.engine_hc")?,
             proved_root: word8_of(&v["proved_root"], "rand_getPerps.proved_root")?,
             proved_height: u64_of(&v["proved_height"], "proved_height")?,
         })
@@ -528,6 +550,7 @@ pub fn job_witness(job: &ProveJob) -> Vec<u32> {
 /// start at the chain's `proved_height` or its `R_from` is not the chain's `proved_root` (the
 /// prover rolls back on this); when it spans more than `max_window_blocks`; when any block's
 /// recomputed digest differs from the one `rand_getPerpInputs` serves, or the node serves none;
+/// when the image's `hc` is not the chain's `engine_hc`;
 /// and when the engine's dry run does not report the window's block count. After proving,
 /// refused when the tier is over the chain's `max_tier` or the proof over `max_proof_bytes`.
 #[allow(clippy::too_many_arguments)]
@@ -593,6 +616,7 @@ pub async fn prove_and_submit_state_proof(
         .with_context(|| format!("reading the engine image {}", image.display()))?;
     let program = randprotocol_zkvm::codec::program_from_bytes(&bytes)
         .map_err(|e| anyhow!("{} is not a program image: {e}", image.display()))?;
+    check_image_hc(&program, &state.engine_hc)?;
     let witness = job_witness(job);
     // A dry run first: seconds against a proof's minutes, and the engine's own verdict on the
     // window before anything is spent on it.
@@ -962,6 +986,62 @@ mod tests {
         .await
         .unwrap_err();
         assert!(e.to_string().contains("proved_root"), "{e:#}");
+        assert!(!sent.load(Ordering::SeqCst), "nothing submitted");
+    }
+
+    fn tiny_program() -> randprotocol_zkvm::isa::Program {
+        randprotocol_zkvm::isa::Program::new(0, vec![0x13, 0x13, 0x13, 0x13, 0x13])
+    }
+
+    #[test]
+    fn an_image_hc_is_compared_in_the_chains_hex_format() {
+        let p = tiny_program();
+        let hc = image_hc(&p);
+        check_image_hc(&p, &hc).unwrap();
+        let e = check_image_hc(&p, &[9; 8]).unwrap_err().to_string();
+        assert!(
+            e.contains(&word8_to_hex(&hc))
+                && e.contains(&word8_to_hex(&[9; 8]))
+                && e.contains("engine_hc"),
+            "{e}"
+        );
+        // The same words in the other byte order are a different hc.
+        let swapped: Word8 = hc.map(u32::swap_bytes);
+        assert_ne!(hc, swapped);
+        assert!(check_image_hc(&p, &swapped).is_err());
+    }
+
+    /// The chain's engine_hc ([9; 8] in the test node) is not the image's: refused after
+    /// the cheap chain checks and before the dry run or any proving.
+    #[tokio::test]
+    async fn an_image_of_another_engine_is_refused_before_proving() {
+        let job = job();
+        let r_from = perp_digest(&hasher(), domain::STATE, &job.state_before);
+        let (url, sent) = node(&job, r_from, 5, None).await;
+        let dir = std::env::temp_dir().join(format!("rand-perp-hc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("engine.image.bin");
+        std::fs::write(
+            &image,
+            randprotocol_zkvm::codec::program_to_bytes(&tiny_program()),
+        )
+        .unwrap();
+        let e = prove_and_submit_state_proof(
+            &RpcClient::new(url),
+            1,
+            &image,
+            &job,
+            None,
+            FriProfile::Test,
+            true,
+            true,
+        )
+        .await
+        .unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        let e = format!("{e:#}");
+        assert!(e.contains("is not the chain's engine_hc"), "{e}");
+        assert!(!e.contains("dry run") && !e.contains("does not run"), "{e}");
         assert!(!sent.load(Ordering::SeqCst), "nothing submitted");
     }
 

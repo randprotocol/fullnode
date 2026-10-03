@@ -56,7 +56,7 @@ proved root and height, the digests not yet proved, and the withdrawals waiting 
 | `max_window_blocks` | the most blocks one state proof may cover, 1 to 64 |
 | `max_block_inputs` | **required.** The most perp inputs (deposits, orders, cancels, withdrawals; not the `Close`) one block records, 1 to `MAX_BLOCK_INPUTS` = 1024. With `max_window_blocks` it bounds a window's engine work (below) |
 | `min_deposit` | optional, default 0 (no floor): the smallest deposit, in collateral units; below 2^63 |
-| `engine_hc` | the engine guest's program commitment; a state proof of any other program is refused |
+| `engine_hc` | the engine guest's program commitment; a state proof of any other program is refused. Hex byte order: each u32 word of `hc` as 8 little-endian hex characters (`word8_to_hex`); `rand perp image-hc --image <FILE>` prints an image's hc in that format, and `rand perp prove` refuses an image that does not match before proving |
 | `genesis_root` | the engine's state root at height 0: `perp_digest(PERP_STATE, State::genesis(markets).encode())`. `perp-prover genesis-state` writes the words and `rand perp genesis-root --state` hashes them |
 | `markets` | the `MarketSpec` list below |
 
@@ -421,7 +421,7 @@ bridged one.
 
 ## The CLI
 
-`rand perp keygen | deposit | order | cancel | withdraw | oracle | prove | genesis-root | state |
+`rand perp keygen | deposit | order | cancel | withdraw | oracle | prove | genesis-root | image-hc | state |
 account | inputs`, in `docs/cli.md`. `rand perp prove` is the command `perp-prover` runs: it
 submits and waits for inclusion, and exits non-zero on any refusal, including a `R_from` that is
 not the chain's `proved_root`, which is how the prover learns to roll back.
