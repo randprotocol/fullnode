@@ -356,7 +356,7 @@ pub fn is_permanent(e: &TxError) -> bool {
     // Cacheable are the ones the bytes decide against genesis constants: the section's presence
     // (`Disabled`, a statement about the chain fixed at genesis), a market id and the tier cap
     // (`UnknownMarket`, `TierTooHigh`), the action's own fields and lists (`BadOrder`,
-    // `ZeroAmount`, `BadPrice`, `UnorderedPrices`, `UnorderedPayouts`, `TooManyPayouts`,
+    // `ZeroAmount`, `BadPrice`, `UnorderedPrices`, `DuplicatePayout`, `TooManyPayouts`,
     // `AmountTooLarge`, `CollateralAssetMismatch` — the bundle's burn asset against the
     // section's), `ReservedAccount` (a key whose id is the insurance fund's, forever),
     // `KeyMismatch` (an account id is its key's hash) and `BadSignature` (over the action's own
@@ -373,7 +373,7 @@ pub fn is_permanent(e: &TxError) -> bool {
             | P::BadSignature
             | P::TooManyPayouts(_)
             | P::TierTooHigh { .. }
-            | P::UnorderedPayouts
+            | P::DuplicatePayout
             | P::BadPrice
             | P::AmountTooLarge(_)
             | P::ReservedAccount
@@ -1163,7 +1163,7 @@ mod tests {
             P::BadSignature,
             P::TooManyPayouts(9),
             P::TierTooHigh { tier: 18, max: 16 },
-            P::UnorderedPayouts,
+            P::DuplicatePayout,
             P::BadPrice,
             P::AmountTooLarge(1 << 63),
             P::ReservedAccount,

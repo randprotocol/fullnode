@@ -414,8 +414,8 @@ impl ProveJob {
     }
 
     /// The job's own consistency: a non-empty window of consecutive heights `from + 1 ..= to`,
-    /// at most [`MAX_PERP_PAYOUTS`] payouts in strictly ascending request order (the ledger's
-    /// rules for a state proof's list).
+    /// at most [`MAX_PERP_PAYOUTS`] payouts, each request at most once, in the engine's order (the
+    /// ledger's rules for a state proof's list: the digest binds the order, nothing sorts it).
     pub fn check(&self) -> Result<()> {
         if self.to_height <= self.from_height || self.blocks.is_empty() {
             bail!(
@@ -440,12 +440,9 @@ impl ProveJob {
                 self.payouts.len()
             );
         }
-        if self
-            .payouts
-            .windows(2)
-            .any(|w| w[0].request >= w[1].request)
-        {
-            bail!("the job's payouts are not in strictly ascending request order");
+        let mut seen = std::collections::BTreeSet::new();
+        if !self.payouts.iter().all(|p| seen.insert(p.request)) {
+            bail!("the job's payouts name a request more than once");
         }
         Ok(())
     }
@@ -688,6 +685,29 @@ mod tests {
             }],
             fees: 11,
         }
+    }
+
+    #[test]
+    fn a_jobs_payouts_may_be_in_any_order_but_name_a_request_once() {
+        let mut j = job();
+        j.payouts = vec![
+            PerpPayout {
+                request: [5; 8],
+                amount: 1,
+            },
+            PerpPayout {
+                request: [3; 8],
+                amount: 2,
+            },
+        ];
+        j.check()
+            .expect("descending request ids are the engine's order");
+        j.payouts.push(PerpPayout {
+            request: [5; 8],
+            amount: 1,
+        });
+        let e = j.check().unwrap_err().to_string();
+        assert!(e.contains("more than once"), "{e}");
     }
 
     /// A node serving `job`'s blocks the way `rand_getPerpInputs` does (the digest is the

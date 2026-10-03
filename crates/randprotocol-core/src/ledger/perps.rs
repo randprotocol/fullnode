@@ -863,8 +863,9 @@ fn check<'a>(ledger: &'a Ledger, tx: &Transaction, action: &PerpAction<'a>) -> R
 /// 3. every block in it has its digest recorded — so every one of them is closed, which is the
 ///    whole bound on `to`: a proof ending at the tip is admissible at the pool (whose ledger is
 ///    the tip's) and in the next block alike;
-/// 4. every payout names a pending request, at most its amount, each request once and in
-///    ascending order (so a list has one encoding).
+/// 4. every payout names a pending request, at most its amount, each request at most once and
+///    in whatever order the proof lists them (the payouts digest binds that order, and the engine
+///    emits payouts in the order the withdrawals were input, unsorted).
 fn check_state_proof(p: &Perps, from: u64, to: u64, payouts: &[PerpPayout]) -> Result<(), PerpError> {
     if payouts.len() > MAX_PERP_PAYOUTS {
         return Err(PerpError::TooManyPayouts(payouts.len()));
@@ -876,10 +877,10 @@ fn check_state_proof(p: &Perps, from: u64, to: u64, payouts: &[PerpPayout]) -> R
     if let Some(h) = (from + 1..=to).find(|h| !p.digests.contains_key(h)) {
         return Err(PerpError::MissingDigest(h));
     }
-    let mut last: Option<&Word8> = None;
+    let mut seen = std::collections::BTreeSet::<&Word8>::new();
     for po in payouts {
-        if last.is_some_and(|l| po.request <= *l) {
-            return Err(PerpError::UnorderedPayouts);
+        if !seen.insert(&po.request) {
+            return Err(PerpError::DuplicatePayout);
         }
         let w = p.withdrawals.get(&po.request).ok_or(PerpError::UnknownRequest)?;
         if po.amount > w.amount {
@@ -889,7 +890,6 @@ fn check_state_proof(p: &Perps, from: u64, to: u64, payouts: &[PerpPayout]) -> R
                 have: w.amount,
             });
         }
-        last = Some(&po.request);
     }
     Ok(())
 }
@@ -1279,8 +1279,8 @@ pub enum PerpError {
     MissingDigest(u64),
     #[error("no pending withdrawal has this request id")]
     UnknownRequest,
-    #[error("a state proof's payouts name each request once, in ascending order")]
-    UnorderedPayouts,
+    #[error("a state proof's payouts name each request at most once")]
+    DuplicatePayout,
     #[error("a pending withdrawal already names this recipient key and blinding r; choose a fresh r")]
     DuplicateOpening,
     #[error("withdrawal {request} asked for {have}; the payout is {want}")]
@@ -2296,7 +2296,7 @@ mod tests {
             pe(PerpError::PayoutTooLarge { request: crate::notes::word8_to_hex(&request), want: 6, have: 5 })
         );
         let twice = vec![PerpPayout { request, amount: 1 }, PerpPayout { request, amount: 1 }];
-        assert_eq!(refusal(&l, &junk(twice)), pe(PerpError::UnorderedPayouts), "each request once, ascending");
+        assert_eq!(refusal(&l, &junk(twice)), pe(PerpError::DuplicatePayout), "each request at most once");
         let nine = vec![PerpPayout { request, amount: 1 }; MAX_PERP_PAYOUTS + 1];
         assert_eq!(refusal(&l, &junk(nine)), pe(PerpError::TooManyPayouts(MAX_PERP_PAYOUTS + 1)));
         // The same transaction with a good payout reaches the proof, and the junk is refused there.
@@ -2310,6 +2310,59 @@ mod tests {
             Err(pe(PerpError::UnknownRequest))
         );
         assert_eq!(still_applies(&l, &junk(vec![PerpPayout { request, amount: 5 }])), Ok(()));
+    }
+
+    /// The engine emits payouts in the order the withdrawals were input and the digest binds that
+    /// order, so a list in descending request order must be admitted and pay both requests.
+    #[test]
+    fn a_state_proof_pays_requests_in_the_order_it_lists_them() {
+        let mut l = ledger_with(true);
+        let (a, b) = (kp(50), kp(51));
+        dep(&mut l, &a, 10, RAND).unwrap();
+        dep(&mut l, &b, 20, RAND).unwrap();
+        let ta = bare(signed(CHAIN, &a, withdraw(&a, 1, 5, 1)));
+        let tb = bare(signed(CHAIN, &b, withdraw(&b, 2, 4, 1)));
+        apply(&mut l, &ta).unwrap();
+        apply(&mut l, &tb).unwrap();
+        close(&mut l, 1);
+        close(&mut l, 2);
+        let (ra, rb) = (
+            word8_from_bytes(ta.hash().as_bytes()).unwrap(),
+            word8_from_bytes(tb.hash().as_bytes()).unwrap(),
+        );
+        // Descending by request id, whichever of the two is larger.
+        let (hi, lo) = if ra > rb {
+            ((ra, 5), (rb, 4))
+        } else {
+            ((rb, 4), (ra, 5))
+        };
+        assert!(hi.0 > lo.0);
+        let payouts = vec![
+            PerpPayout {
+                request: hi.0,
+                amount: hi.1,
+            },
+            PerpPayout {
+                request: lo.0,
+                amount: lo.1,
+            },
+        ];
+        let tx = state_proof(&l, 0, 2, [7; 8], payouts, 0);
+        assert_eq!(l.validate(&tx, &StubExecutor), Ok(()));
+        l.set_height(3);
+        let leaves = l.tree.remaining();
+        apply(&mut l, &tx).unwrap();
+        assert_eq!(leaves - l.tree.remaining(), 2, "both notes mint");
+        assert!(l.has_commitment(&payout_cm(5, 1)));
+        let mut r = [5u32; 8];
+        r[7] = 6;
+        let cm_b = StubExecutor.note_commitment(&recipient().pk, &PERP_FROM, 4, 0, 1, &r);
+        assert!(l.has_commitment(&cm_b));
+        let p = l.perps().unwrap();
+        assert!(
+            p.withdrawal(&ra).is_none() && p.withdrawal(&rb).is_none(),
+            "both requests are paid"
+        );
     }
 
     #[test]
