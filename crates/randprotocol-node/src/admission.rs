@@ -392,6 +392,8 @@ pub fn is_permanent(e: &TxError) -> bool {
             | P::OracleNonce
             | P::PayoutTooLarge { .. }
             | P::ProofRefused(_)
+            // The pending request holding the opening is paid by a later proof, freeing it.
+            | P::DuplicateOpening
             | P::Overflow => false,
         };
     }
@@ -1184,6 +1186,7 @@ mod tests {
             P::OracleNonce,
             P::PayoutTooLarge { request: "ab".into(), want: 2, have: 1 },
             P::ProofRefused("outputs".into()),
+            P::DuplicateOpening,
             P::Overflow,
         ] {
             assert!(!is_permanent(&TxError::Perps(e.clone())), "{e} moves with the chain");

@@ -625,6 +625,19 @@ fn check_withdrawal_room(p: &Perps) -> Result<(), PerpError> {
     Ok(())
 }
 
+/// Whether a withdrawal may name this note opening: no pending request has the same recipient
+/// key and blinding. A payout's note is `H(pk, PERP_FROM, amount, asset, time, r)`, and `r` is
+/// public on the wire, so a copy of a pending request's `(pk, r)` (with its time and amount) would
+/// commit to the same note — and whichever request id sorted first, a grindable hash, would mint
+/// it with its own envelope, leaving the victim's never recorded. At most
+/// [`MAX_PERP_PAYOUTS`] are pending, so a linear scan.
+fn check_opening(p: &Perps, recipient: &ShieldedAddress, r: &Word8) -> Result<(), PerpError> {
+    if p.withdrawals.values().any(|w| w.recipient.pk == recipient.pk && w.r == *r) {
+        return Err(PerpError::DuplicateOpening);
+    }
+    Ok(())
+}
+
 /// The request id a `PerpWithdraw` is held and paid under: its transaction's hash as words.
 fn request_id(tx: &Transaction) -> Word8 {
     word8_from_bytes(tx.hash().as_bytes()).expect("a hash is 32 bytes")
@@ -778,7 +791,7 @@ fn check<'a>(ledger: &'a Ledger, tx: &Transaction, action: &PerpAction<'a>) -> R
             Ok(Some(&a.trading_key))
         }
         PerpAction::Cancel { account, nonce, .. } => Ok(Some(&check_account_nonce(p, account, nonce)?.trading_key)),
-        PerpAction::Withdraw { account, nonce, amount, recipient, time, envelope, .. } => {
+        PerpAction::Withdraw { account, nonce, amount, recipient, r, time, envelope, .. } => {
             let a = p.accounts.get(account).ok_or(PerpError::UnknownAccount)?;
             if amount == 0 {
                 return Err(PerpError::ZeroAmount.into());
@@ -801,6 +814,8 @@ fn check<'a>(ledger: &'a Ledger, tx: &Transaction, action: &PerpAction<'a>) -> R
             if p.withdrawals.contains_key(&request_id(tx)) {
                 return Err(PerpError::NonceUsed.into());
             }
+            // After the replay checks, so a replay hears `NonceUsed`, not its own opening.
+            check_opening(p, recipient, r)?;
             Ok(Some(&a.trading_key))
         }
         PerpAction::Oracle { validator, prices, nonce, .. } => {
@@ -886,12 +901,41 @@ fn payout_commitment(executor: &dyn ConfidentialExecutor, w: &PendingWithdrawal,
     executor.note_commitment(&w.recipient.pk, &PERP_FROM, amount, asset, w.time, &w.r)
 }
 
-/// The notes a `PerpStateProof` would make the ledger append, in order — one per payout of a
+/// One note a state proof mints: its commitment, the envelope its owner opens it with, and the
+/// amount it carries.
+struct PayoutNote {
+    cm: Word8,
+    envelope: Envelope,
+    amount: u64,
+}
+
+/// The notes `payouts` mint on `ledger`, in append order — the one list both [`apply`] and the
+/// pool's claims ([`payout_commitments`]) read, so they cannot drift: one per payout of a
 /// positive amount against a pending request, a note the tree (or an earlier payout of the same
-/// proof) already holds left out, as [`apply`] leaves it out. For the pool's conflict index
-/// (`Ledger::derived_commitments`); empty for any other transaction, on a chain without the
-/// section, and for a list over [`MAX_PERP_PAYOUTS`] (which `validate` refuses) — capped before
-/// anything is hashed.
+/// list) already holds left out. A payout against no pending request mints nothing here;
+/// [`check_state_proof`] refuses it first on the paths that apply.
+fn payout_notes(
+    ledger: &Ledger,
+    p: &Perps,
+    payouts: &[PerpPayout],
+    executor: &dyn ConfidentialExecutor,
+) -> Vec<PayoutNote> {
+    let mut out: Vec<PayoutNote> = Vec::with_capacity(payouts.len());
+    for po in payouts.iter().filter(|po| po.amount > 0) {
+        let Some(w) = p.withdrawals.get(&po.request) else { continue };
+        let cm = payout_commitment(executor, w, po.amount, p.config.collateral_asset);
+        if !ledger.has_commitment(&cm) && !out.iter().any(|n| n.cm == cm) {
+            out.push(PayoutNote { cm, envelope: w.envelope.clone(), amount: po.amount });
+        }
+    }
+    out
+}
+
+/// The notes a `PerpStateProof` would make the ledger append, in order ([`payout_notes`],
+/// exactly what [`apply`] mints on this ledger). For the pool's conflict index and the node's
+/// per-transaction note attribution (`Ledger::derived_commitments`); empty for any other
+/// transaction, on a chain without the section, and for a list over [`MAX_PERP_PAYOUTS`]
+/// (which `validate` refuses) — capped before anything is hashed.
 pub fn payout_commitments(ledger: &Ledger, tx: &Transaction, executor: &dyn ConfidentialExecutor) -> Vec<Word8> {
     let (Action::PerpStateProof { payouts, .. }, Some(p)) = (&tx.action, ledger.perps()) else {
         return Vec::new();
@@ -899,15 +943,7 @@ pub fn payout_commitments(ledger: &Ledger, tx: &Transaction, executor: &dyn Conf
     if payouts.len() > MAX_PERP_PAYOUTS {
         return Vec::new();
     }
-    let mut out: Vec<Word8> = Vec::with_capacity(payouts.len());
-    for po in payouts.iter().filter(|po| po.amount > 0) {
-        let Some(w) = p.withdrawals.get(&po.request) else { continue };
-        let cm = payout_commitment(executor, w, po.amount, p.config.collateral_asset);
-        if !ledger.has_commitment(&cm) && !out.contains(&cm) {
-            out.push(cm);
-        }
-    }
-    out
+    payout_notes(ledger, p, payouts, executor).into_iter().map(|n| n.cm).collect()
 }
 
 /// The public segment a state proof that [`check_state_proof`] accepted must verify against,
@@ -1013,8 +1049,10 @@ pub(super) fn validate(
 /// the digests it covered and settles each payout's request: a positive amount becomes the
 /// chain-computed note ([`payout_commitment`]), appended with the request's envelope for its
 /// owner's wallet — unless the tree already holds that very note (a requester chose an opening
-/// another note has: that payout mints nothing, rather than the proof, and every withdrawal
-/// behind it, being refused); a zero amount mints nothing.
+/// another note has — a copy of an already paid request's: that payout mints nothing and adds
+/// nothing to the audit's `rand_out`, rather than the proof, and every withdrawal behind it,
+/// being refused); a zero amount mints nothing. Two pending requests never share an opening
+/// ([`check_opening`]).
 pub(super) fn apply(
     ledger: &mut Ledger,
     tx: &Transaction,
@@ -1069,6 +1107,7 @@ pub(super) fn apply(
                 return Err(PerpError::NonceUsed.into());
             }
             check_withdrawal_room(p)?;
+            check_opening(p, recipient, r)?;
             let pending = PendingWithdrawal {
                 account: *account,
                 amount,
@@ -1095,15 +1134,10 @@ pub(super) fn apply(
             // Everything fallible first: the rules again, each note, the counter.
             check_state_proof(p, from, to, payouts)?;
             let asset = p.config.collateral_asset;
-            let mut notes: Vec<(Word8, Envelope)> = Vec::with_capacity(payouts.len());
-            let mut paid = 0u64;
-            for po in payouts.iter().filter(|po| po.amount > 0) {
-                let w = p.withdrawals.get(&po.request).ok_or(PerpError::UnknownRequest)?;
-                notes.push((payout_commitment(executor, w, po.amount, asset), w.envelope.clone()));
-                paid = paid.checked_add(po.amount).ok_or(PerpError::Overflow)?;
-            }
-            // A payout whose note already exists left the exchange all the same, so the counter
-            // takes every positive payout, minted or not: the identity holds either way.
+            let notes = payout_notes(ledger, p, payouts, executor);
+            // Only what was minted re-enters the pool: a payout whose note already exists adds
+            // nothing to it, so it adds nothing to the counter either.
+            let paid = notes.iter().try_fold(0u64, |acc, n| acc.checked_add(n.amount)).ok_or(PerpError::Overflow)?;
             let rand_out = match asset {
                 0 => p.rand_out.checked_add(paid).ok_or(PerpError::Overflow)?,
                 _ => p.rand_out,
@@ -1116,10 +1150,8 @@ pub(super) fn apply(
                 p.withdrawals.remove(&po.request);
             }
             p.rand_out = rand_out;
-            for (cm, envelope) in notes {
-                if !ledger.has_commitment(&cm) {
-                    ledger.append_deposit(cm, envelope, executor)?;
-                }
+            for n in notes {
+                ledger.append_deposit(n.cm, n.envelope, executor)?;
             }
         }
     }
@@ -1249,6 +1281,8 @@ pub enum PerpError {
     UnknownRequest,
     #[error("a state proof's payouts name each request once, in ascending order")]
     UnorderedPayouts,
+    #[error("a pending withdrawal already names this recipient key and blinding r; choose a fresh r")]
+    DuplicateOpening,
     #[error("withdrawal {request} asked for {have}; the payout is {want}")]
     PayoutTooLarge { request: String, want: u64, have: u64 },
     #[error("the proof is at tier {tier}; this chain allows at most {max}")]
@@ -1649,13 +1683,17 @@ mod tests {
         order_by(k, id(k), b)
     }
 
+    /// A withdrawal request to `recipient()`, blinding `[5; 8]` at nonce 1 and one fresh per nonce
+    /// after it (a pending request's opening cannot be reused).
     fn withdraw(k: &Keypair, nonce: u64, amount: u64, time: u32) -> Action {
+        let mut r = [5u32; 8];
+        r[7] = 4 + nonce as u32;
         Action::PerpWithdraw {
             account: id(k),
             nonce,
             amount,
             recipient: recipient(),
-            r: [5; 8],
+            r,
             time,
             envelope: env(),
             signature: Signature::empty(),
@@ -2353,35 +2391,80 @@ mod tests {
         assert_eq!(ledger_with(false).derived_commitments(&tx, &StubExecutor), Vec::<Word8>::new());
     }
 
-    /// A requester chooses its note's opening, so two requests can name one note — a copy of
-    /// another's paid or pending opening. The second payout of it mints nothing (the note exists)
-    /// rather than refusing the proof, which would stall every withdrawal behind it.
+    /// A requester chooses its note's opening and `r` is public, so a request can copy one already
+    /// paid. Its payout mints nothing (the note exists) rather than the proof being refused,
+    /// which would stall every withdrawal behind it; the pool's claims list exactly what apply
+    /// mints, and the audit counts only what was minted.
     #[test]
-    fn a_payout_whose_note_already_exists_is_dropped_not_refused() {
-        let mut l = ledger_with(true);
-        let (a, b) = (kp(50), kp(51));
-        dep(&mut l, &a, 10, RAND).unwrap();
+    fn a_payout_whose_note_already_exists_mints_nothing_and_is_not_claimed() {
+        let (mut l, paid) = withdrawn(5);
+        l.set_height(3);
+        let first = state_proof(&l, 0, 2, [7; 8], vec![PerpPayout { request: paid, amount: 5 }], 0);
+        apply(&mut l, &first).unwrap();
+        // Key 51 copies the paid request's opening — no pending request holds it any more.
+        let b = kp(51);
         dep(&mut l, &b, 20, RAND).unwrap();
-        let wa = bare(signed(CHAIN, &a, withdraw(&a, 1, 5, 1)));
         let wb = bare(signed(CHAIN, &b, withdraw(&b, 1, 5, 1)));
-        apply(&mut l, &wa).unwrap();
         apply(&mut l, &wb).unwrap();
-        close(&mut l, 1);
-        let mut ids =
-            [word8_from_bytes(wa.hash().as_bytes()).unwrap(), word8_from_bytes(wb.hash().as_bytes()).unwrap()];
-        ids.sort();
-        let payouts: Vec<PerpPayout> = ids.iter().map(|&request| PerpPayout { request, amount: 5 }).collect();
-        let tx = state_proof(&l, 0, 1, [7; 8], payouts, 0);
-        assert_eq!(l.derived_commitments(&tx, &StubExecutor), vec![payout_cm(5, 1)], "claimed once");
-        l.set_height(2);
+        close(&mut l, 3);
+        let copy = word8_from_bytes(wb.hash().as_bytes()).unwrap();
+        let tx = state_proof(&l, 2, 3, [8; 8], vec![PerpPayout { request: copy, amount: 5 }], 0);
+        assert!(l.has_commitment(&payout_cm(5, 1)), "the note is already in the tree");
+        assert_eq!(
+            l.derived_commitments(&tx, &StubExecutor),
+            Vec::<Word8>::new(),
+            "nothing to claim: apply mints nothing"
+        );
+        l.set_height(4);
         let leaves = l.tree.remaining();
+        let deposits = l.deposits().len();
         apply(&mut l, &tx).unwrap();
-        assert_eq!(leaves - l.tree.remaining(), 1);
-        assert_eq!(l.perps().unwrap().pending_heights(), Vec::<u64>::new());
-        assert!(ids.iter().all(|r| l.perps().unwrap().withdrawal(r).is_none()), "both requests are settled");
+        assert_eq!(l.tree.remaining(), leaves, "no note");
+        assert_eq!(l.deposits().len(), deposits, "nothing recorded for storage");
+        assert!(l.perps().unwrap().withdrawal(&copy).is_none(), "the request is settled");
         let a = l.audit();
         assert!(a.invariant_holds(), "{a:?}");
-        assert_eq!(a.perps_rand_held, 2 * RAND - 10, "both left the exchange");
+        assert_eq!(a.perps_rand_out, 5, "only the minted payout re-entered the pool");
+        assert_eq!(a.perps_rand_held, 2 * RAND - 5);
+    }
+
+    /// Two pending requests never share an opening: otherwise the one whose (grindable) request
+    /// id sorts first would mint the shared note with its envelope, and the other's would never
+    /// be recorded.
+    #[test]
+    fn a_pending_requests_opening_cannot_be_copied() {
+        let (mut l, _) = withdrawn(5);
+        let b = kp(51);
+        dep(&mut l, &b, 20, RAND).unwrap();
+        let copy = bare(signed(CHAIN, &b, withdraw(&b, 1, 5, 1)));
+        assert_eq!(refusal(&l, &copy), pe(PerpError::DuplicateOpening));
+        assert_eq!(still_applies(&l, &copy), Err(pe(PerpError::DuplicateOpening)));
+        let before = l.clone();
+        assert_eq!(
+            l.apply_tx(&copy, &kp(1).address(), &StubExecutor).map(|_| ()),
+            Err(pe(PerpError::DuplicateOpening))
+        );
+        assert!(l == before, "nothing written");
+        // Another amount or time does not help: the key and the blinding decide.
+        let other_amount = bare(signed(CHAIN, &b, withdraw(&b, 1, 7, 2)));
+        assert_eq!(refusal(&l, &other_amount), pe(PerpError::DuplicateOpening));
+        // A fresh r is accepted.
+        let mut fresh = withdraw(&b, 1, 5, 1);
+        let Action::PerpWithdraw { r, .. } = &mut fresh else { unreachable!() };
+        *r = [6; 8];
+        apply(&mut l, &bare(signed(CHAIN, &b, fresh))).expect("a fresh blinding");
+    }
+
+    /// The gate comes before every other check of a state proof, the proof-size cap included.
+    #[test]
+    fn an_oversized_state_proof_without_the_section_is_disabled() {
+        let big = proof_tx(0, 1, [7; 8], vec![], 0, vec![0; 64]);
+        let mut off = ledger_with(false);
+        off.set_max_proof_bytes(16);
+        assert_eq!(refusal(&off, &big), pe(PerpError::Disabled));
+        let mut on = ledger_with(true);
+        on.set_max_proof_bytes(16);
+        assert_eq!(refusal(&on, &big), TxError::ProofTooLarge, "with the section the cap applies");
     }
 
     #[test]

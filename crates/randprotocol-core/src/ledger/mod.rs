@@ -2415,6 +2415,12 @@ impl Ledger {
         executor: &dyn ConfidentialExecutor,
         verified_proofs: &dyn VerifiedProofs,
     ) -> Result<Verified, TxError> {
+        // RPL-3: the `perps` gate comes before any other check of a state proof — every size cap
+        // included — so a chain without the section refuses each one as `Disabled`, whatever it
+        // carries. (Its other rules are `perps::validate`'s, at step 7.)
+        if matches!(tx.action, Action::PerpStateProof { .. }) && self.perps.is_none() {
+            return Err(perps::PerpError::Disabled.into());
+        }
         // 1. size caps
         //
         // The whole transaction first: a transaction bigger than a block can never be mined, and
