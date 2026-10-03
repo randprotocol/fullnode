@@ -398,6 +398,7 @@ without a `perps` section:
 ```json
 { "enabled": true,
   "collateral_asset": 0, "max_tier": 18, "max_window_blocks": 64,
+  "max_block_inputs": 8, "min_deposit": "1000000",
   "engine_hc": "<64 hex>", "genesis_root": "<64 hex>",
   "markets": [{ "id": 0, "symbol": "BTC-PERP", "lot": 1000000, "tick": 1000000,
                 "max_leverage": 20, "maintenance_bps": 500, "taker_fee_bps": 5, "maker_fee_bps": 2 }],
@@ -409,8 +410,10 @@ without a `perps` section:
 
 The three commitments are 64 lowercase hex characters (a `Word8`, its eight words little-endian).
 `pending_heights` are the closed heights no state proof has covered, ascending: the digests the
-next proof's window is drawn from. A median is a decimal string, `"0"` before a block has closed
-with a fresh price. This is what `perp-prover` and the trading site poll. On the public listener.
+next proof's window is drawn from. A median is a decimal string, `"0"` when the last close had no
+quorum of fresh oracle stake behind a price (`docs/perps.md`). `max_block_inputs` is the most perp
+inputs one block records and `min_deposit` (a decimal string, `"0"` for no floor) the smallest
+deposit. This is what `perp-prover` and the trading site poll. On the public listener.
 
 ### `rand_getPerpAccount`
 Params: `[account]`, the id as 64 hex (with or without `0x`). Result, one trading account:
@@ -599,14 +602,18 @@ which a wallet reads as `null`.
 without it — where every perp action is refused:
 
 ```json
-"perps": { "collateral_asset": 0, "max_tier": 18, "max_window_blocks": 64, "max_payouts": 8 }
+"perps": { "collateral_asset": 0, "max_tier": 18, "max_window_blocks": 64, "max_payouts": 8,
+           "max_block_inputs": 8, "min_deposit": "1000000" }
 ```
 
 `collateral_asset` is the asset a deposit burns and a payout pays (0 is RAND), `max_tier` the
 highest tier a state proof may be made at, `max_window_blocks` the most blocks one proof may
 cover, and `max_payouts` the most withdrawals one proof pays, which is also the most that may be
-pending at once. A node that predates the field answers without it, which a wallet reads as
-`null`.
+pending at once. `max_block_inputs` is the most perp inputs one block records (a deposit, an
+order, a cancel, a withdrawal; an account at most 8 of them a block) and `min_deposit` the
+smallest deposit in collateral units, a decimal string (`"0"`: no floor). A node that predates the
+field answers without it, which a wallet reads as `null` (and a node that predates the last two,
+without them: 0).
 
 ### `rand_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
@@ -1845,7 +1852,8 @@ genesis has no `perps` section: every perp action is refused, `rand_getPerps` an
   exchange's state, an account, a page of accounts and a closed block's input words. All four are
   on the public listener.
 - **`rand_getLimits` gains `perps`** (`{ collateral_asset, max_tier, max_window_blocks,
-  max_payouts }` or `null`).
+  max_payouts, max_block_inputs, min_deposit }` or `null`); `rand_getPerps` carries
+  `max_block_inputs` and `min_deposit` too.
 - **`rand_getSupply` gains `perps_rand_out` and `perps_rand_held`** (both `"0"` without the
   section); `invariant_holds` covers them.
 - **A payout is a note the chain computes**, appended with the withdrawal request's envelope, so a

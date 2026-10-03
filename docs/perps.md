@@ -40,6 +40,8 @@ proved root and height, the digests not yet proved, and the withdrawals waiting 
 { "collateral_asset": 0,
   "max_tier": 18,
   "max_window_blocks": 64,
+  "max_block_inputs": 8,
+  "min_deposit": 1000000,
   "engine_hc": "<64 hex>",
   "genesis_root": "<64 hex>",
   "markets": [
@@ -52,6 +54,8 @@ proved root and height, the digests not yet proved, and the withdrawals waiting 
 | `collateral_asset` | the asset deposits are made in and withdrawals paid in: `0` is RAND, otherwise a token the same genesis lists |
 | `max_tier` | the highest zkVM tier (10, 12, 14, 16, 18 or 20) a state proof may be made at; it bounds what a proof costs to verify |
 | `max_window_blocks` | the most blocks one state proof may cover, 1 to 64 |
+| `max_block_inputs` | **required.** The most perp inputs (deposits, orders, cancels, withdrawals; not the `Close`) one block records, 1 to `MAX_BLOCK_INPUTS` = 1024. With `max_window_blocks` it bounds a window's engine work (below) |
+| `min_deposit` | optional, default 0 (no floor): the smallest deposit, in collateral units; below 2^63 |
 | `engine_hc` | the engine guest's program commitment; a state proof of any other program is refused |
 | `genesis_root` | the engine's state root at height 0: `perp_digest(PERP_STATE, State::genesis(markets).encode())`. `perp-prover genesis-state` writes the words and `rand perp genesis-root --state` hashes them |
 | `markets` | the `MarketSpec` list below |
@@ -64,11 +68,12 @@ market that does not exist or is off the lot and tick grid.
 
 **Requirements**, each refused by name at `genesis` (`Genesis::validate`, `PerpsConfig::check`):
 
-- `max_tier` is one of the six tiers; `max_window_blocks` is in `1..=64`;
-- 1 to 16 markets, ids `0, 1, …` in order, `lot` and `tick` positive, `max_leverage` in
-  `1..=100`, each `*_bps` at most 10 000. The engine's own capacity is smaller (2 markets, 16
-  accounts, 32 resting orders; see the constants below), so a chain should name no more markets
-  than the engine holds;
+- `max_tier` is one of the six tiers; `max_window_blocks` is in `1..=64`; `max_block_inputs` in
+  `1..=1024`; `min_deposit` below 2^63;
+- 1 to `MAX_MARKETS` = 2 markets — **the ledger pins 2**, the pinned engine's capacity (a new
+  engine image may raise it) — ids `0, 1, …` in order, `lot` and `tick` positive,
+  `max_leverage` in `1..=100`, `maintenance_bps` at least 1 (the engine requires a maintenance
+  margin), each `*_bps` at most 10 000;
 - the chain has `confidential`, `tokens`, `gas`, `hardening_v6` and `hc_auth` (the CLI says them
   as `--tokens`, `--gas-price`, `--hardening-v6`, `--auth-guest`);
 - a non-zero `collateral_asset` is a token the file lists.
@@ -77,12 +82,43 @@ The section is bound into the genesis hash last, and into the state root under `
 (below). The genesis fixes it for the chain's life: there is no action that adds a market or
 changes a bound.
 
+**Sizing a window.** The engine's work per window grows with the inputs it reads, so
+`max_block_inputs × max_window_blocks` must fit the engine's cycle budget at `max_tier`. At tier
+16 the pinned engine has about 65 000 cycles, some 20 000 of them fixed per window; an operator
+sizes the two bounds to fit what is left. The devnet runs `max_block_inputs = 8` with
+`max_window_blocks = 4`.
+
+### Per-block input caps
+
+Every block records at most `max_block_inputs` perp inputs (`BlockFull`) and at most
+`MAX_ACCOUNT_INPUTS_PER_BLOCK` = 8 from one account (`AccountBlockFull`) — **a deposit counts
+towards the account it credits**. Both are refused by `validate` and by `apply` before any write,
+against the inputs the block has recorded so far; neither is permanent (the next block has room).
+A pool does not refuse on them: its ledger is the tip's, whose block inputs every close empties,
+so `still_applies` never reads them and an input a full block left out stays pooled for the next.
+A block carrying more is refused whole; the proposer's trial apply packs exactly the first
+`max_block_inputs` that apply.
+
+With at most 15 accounts, the per-account cap also bounds a block's words whatever
+`max_block_inputs` says: 15 × 8 inputs × 21 words (a withdrawal's, the longest) + one `Close`
+over 2 markets (12) = 2 532 words, inside the guest's 8 192-word block buffer.
+
 ## The six actions
 
 Tags 34 to 39, appended after `Invoke` (33). The four signed ones are bundle-less and carry a
-signature over `Transaction::perp_sign_message`: `blake3("rand-perp-sign-1", chain_id ‖ tag ‖
-the action with an empty signature)`. The tag keeps one variant's signature from verifying as
-another's; the chain id keeps it off other chains.
+signature over `Transaction::perp_sign_message(binding_domain, chain_id, action)`.
+
+**Signed messages.** Over the chain's binding domain (BIND-1), as every other signed action
+message is:
+
+- `binding_domain` 0 (absent): `blake3("rand-perp-sign-1", bincode(chain_id, tag, unsigned))`;
+- `binding_domain` 1: `blake3("rand-perp-sign-2", bincode(genesis_hash, (chain_id, tag,
+  unsigned)))` — the genesis hash leads, as in `BindingDomain::token_mint_message`.
+
+`unsigned` is the action with an empty signature. The tag keeps one variant's signature from
+verifying as another's, the chain id and (under domain 1) the genesis hash keep it off other
+chains: a signature made for domain 0 is `BadSignature` on a domain-1 chain. The `rand perp`
+commands learn the domain from the node (`RpcClient::binding_domain`, as a mint does).
 
 An **account id** is `word8_from_bytes(Address::from_public_key(trading_key))`, the eight words of
 the trading key's address; `rand perp keygen` prints it. A trading key is a Dilithium2 key, and it
@@ -97,9 +133,17 @@ is not the owner's spend key: it signs orders and nothing else.
 | 38 | `PerpOracle { validator, prices, nonce, signature }` | a validator's key | 0 |
 | 39 | `PerpStateProof { from_height, to_height, new_root, payouts, fees, proof }` | none: the STARK is the authority | 0 |
 
-Every rule below is checked by `validate`, in this order, and again in `apply` before the first
-write, so a refusal leaves the ledger as it was. The signature is checked last: it is the one
-expensive check, and the cheap rules come first.
+Every rule below is checked by `validate`, in this order; the per-block caps come after the
+action's own rules, and the signature last: it is the one expensive check. `apply` is only ever
+reached through `apply_tx`, which runs `validate` on the same state first, and then re-checks,
+before its first write, exactly the rules a write depends on: the section gate and the per-block
+caps; for a deposit the collateral shape, the amount and floor and (for a new account) the
+account cap and the reserved id; for an order and a cancel the account and the nonce; for a
+withdrawal the account, the nonce, the request id, the pending cap, the opening and the
+one-per-account rule; for a state proof every rule of `check_state_proof` (window, digests,
+payouts) and the counters' overflow. It does not re-check an order's shape, a withdrawal's
+envelope, recipient or time, an oracle's validator and prices, or any signature or STARK — those
+`validate` decided on the same state a moment before. So a refusal leaves the ledger as it was.
 
 ### Deposit (34)
 
@@ -108,6 +152,7 @@ The bundle burns the collateral and nothing else: RAND through `burn_r` with `bu
 `CollateralAssetMismatch`; a zero amount is `ZeroAmount`. The account is the one the trading key
 owns: a deposit by a new key opens it, a deposit by a key that already owns it tops it up.
 
+- At least the genesis **`min_deposit`** (`DepositTooSmall`), when one is set.
 - At most **15 trader accounts** (`TooManyAccounts`): the engine has 16 slots and keeps one for its
   insurance fund. The id `[0; 8]` is that fund's and no key may own it (`ReservedAccount`).
 - An account id whose recorded key differs from the deposit's is `KeyMismatch`.
@@ -147,6 +192,9 @@ A request to move collateral out of the engine to a note the chain will compute.
   value.
 - The nonce is taken from the window, and the request is held under its **request id**, the
   transaction hash as eight words.
+- **One pending withdrawal per account** (`WithdrawalPending`, not permanent): the next request
+  waits until a proof settles this one. With the cap of 8 it keeps one account from holding every
+  slot.
 - **No two pending withdrawals share `(recipient.pk, r)`** (`DuplicateOpening`). The payout note is
   `H(pk, PERP_FROM, amount, asset, time, r)` and `r` is public on the wire: a copy of a pending
   request's `(pk, r)` could commit to the same note, and the request whose id sorted first would
@@ -173,7 +221,11 @@ At the end of every block on a perps chain (`Ledger::close_block`, before the an
 2. Each market's **median** is the stake-weighted median of its fresh submissions: those given at
    `height - 30` or later (`ORACLE_STALE_BLOCKS`), each weighted by its validator's stake now,
    sorted by price; the median is the first price at which the running stake reaches half the
-   total, rounded up. With nothing fresh and staked the last median is kept (0 before the first).
+   total, rounded up. **Only with a quorum:** the fresh stake (non-stale, non-jailed, in the
+   register) must be at least half of the active stake (every registered, non-jailed
+   validator's). Without one — nothing fresh, or too little of the set behind it — the close
+   carries **0**, the engine's "no price", and the old median is **not** kept. A chain of one
+   validator is its own quorum.
 3. The block's inputs, in block order, then exactly one `Close`, make the block's words;
    `D_h = perp_digest(PERP_BLOCK, words)` is recorded for every closed height above the proved
    height. The words are left for the node to store; the inputs are emptied.
@@ -191,9 +243,11 @@ all:
   `from+1 ..= to` has a recorded digest** (`MissingDigest`), which is the whole bound on `to`: it
   must be a closed block.
 - **Payouts.** At most 8 (`TooManyPayouts`). Each names a pending request (`UnknownRequest`), each
-  request at most once (`DuplicatePayout`), and each amount is at most the amount requested
-  (`PayoutTooLarge`). They are listed **in the order the engine emits them**, which is the order the
-  withdrawals were input, not sorted; the payouts digest binds that order.
+  request at most once (`DuplicatePayout`), each request **recorded inside the window**,
+  `from < height <= to` (`RequestOutsideWindow`), and each amount is **the full request or
+  nothing**: above it is `PayoutTooLarge`, a positive amount below it `PartialPayout`. They are
+  listed **in the order the engine emits them**, which is the order the withdrawals were input,
+  not sorted; the payouts digest binds that order.
 - **The segment.** The ledger builds the public segment itself from its own proved root and
   recorded digests and the transaction's claims, so a prover cannot choose which block inputs the
   proof ran over:
@@ -215,10 +269,12 @@ all:
   request's recipient, `r` and `time`, and `PERP_FROM = "rpl3-pay"` as two little-endian words then
   zeros. The request's envelope is appended beside the commitment, so the owner's wallet finds the
   note by trial decryption as it finds any other. A payout of zero mints nothing. A payout whose
-  note the tree already holds mints nothing and adds nothing to the audit. The engine pays a
-  request in full or not at all, so the amount sealed in the envelope is the amount paid.
+  note the tree already holds mints nothing and adds nothing to the audit. A payout is the full
+  request or nothing — a consensus rule (`PartialPayout`), not only the engine's behaviour — so
+  the amount sealed in the envelope is the amount paid.
 - **Settlement.** The proved root and height advance, the digests the proof covered are dropped,
-  and each listed request is removed.
+  and **every pending request recorded at or below `to` is settled**, paid or not: the engine saw
+  it in this window, and a request it skipped can never be paid by a later one.
 
 The proof is not a bundle's: `proof` is kept inside the transaction's binding, as a call's is, and
 `proof_bytes` is capped by `max_proof_bytes`.
@@ -254,7 +310,8 @@ admissible, because the version must equal 1.
 | `PERP_BLOCK` = 21 | a block's input digest `D_h` | Poseidon2 domain, ledger and guest |
 | `PERP_STATE` = 22 | the engine's state root `R` | Poseidon2 domain |
 | `PERP_PAYOUTS` = 23 | a state proof's payouts digest | Poseidon2 domain |
-| `rand-perp-sign-1` | what a signed perp action signs | blake3 |
+| `rand-perp-sign-1` | what a signed perp action signs, `binding_domain` 0 | blake3 |
+| `rand-perp-sign-2` | what a signed perp action signs, `binding_domain` 1 (genesis hash first) | blake3 |
 | `rand-perps-1` | the perps root, over proved root and height and five merkle roots | blake3 |
 | `rand-perp-account-1`, `-oracle-1`, `-oracle-nonce-1`, `-digest-1`, `-withdrawal-1` | the leaves of those five roots | blake3 |
 | `rand-state-9` | the chain's state root on a chain with the section | blake3 |
@@ -296,7 +353,11 @@ The length word keeps `[a]` and `[a, 0]` apart; the chunk size keeps `1 + 8 + 40
 `side`: 0 buy, 1 sell. `kind`: 0 limit, 1 market. `tif`: 0 GTC, 1 IOC, 2 post-only.
 `reduce_only`: 0 or 1. A block's words are its inputs concatenated in block order, then exactly one
 `Close`. `tests/vectors/perps-v1.json` pins the encodings, the digest and the segment so the
-engine's crate, which cannot depend on this one, can check that it agrees.
+engine's crate, which cannot depend on this one, can check that it agrees. It also pins the
+multi-chunk digest with the real Poseidon2: `digest_4000`, `digest_4001` and `digest_8001` are
+`perp_digest(PERP_BLOCK, w)` over `w[i] = (i as u32).wrapping_mul(2654435761)` of 4 000, 4 001
+and 8 001 words (one chunk, the chunk boundary, the three-chunk boundary), written by
+`randprotocol-zkvm`'s `tests/perps_vectors.rs`.
 
 The engine's state encoding (`State::encode`, hashed under `PERP_STATE` to give `R`):
 
@@ -310,7 +371,8 @@ Position = [size(2, i64), entry_notional(2), funding_index(2, i64)]             
 Order    = [seq(2), account_index, market, side, nonce(2), price(2), remaining(2), reduce_only]  12 words
 ```
 
-The engine's constants (`perp-core`): `MAX_MARKETS = 2`, `MAX_ACCOUNTS = 16`, `MAX_ORDERS = 32`
+The engine's constants (`perp-core`): `MAX_MARKETS = 2` (which the ledger pins, `perps::MAX_MARKETS`),
+`MAX_ACCOUNTS = 16`, `MAX_ORDERS = 32`
 (resting orders, all markets), `MAX_WITHDRAWS_PER_WINDOW = 8`, `BASE_UNIT = 10^9`,
 `FUNDING_PERIOD_MS = 8 h`, `FUNDING_CLAMP_BPS = 50`. The genesis state is
 `State::genesis(markets)`: counters 0, no accounts, no orders.
@@ -342,6 +404,15 @@ bridged one.
   nothing, on a database that holds perps state or any input row.
 - **Genesis.** `rand-node genesis --perps perps.json` (`docs/cli.md`); the node refuses to start when its
   database and its genesis disagree on the section.
+- **State-proof admission.** A state proof is bundle-less and fee-less, and its STARK is the most
+  expensive check a node runs, so two node policies (never validity rules) protect it. A
+  `ProofRefused` verdict is cached keyed by the transaction hash and the segment the tip builds
+  for it (with the proved root it was made against), bounded, and emptied when the proved root
+  moves: the same junk bytes re-sent are refused without verifying again. And the pool keeps
+  **one reserved slot** for a state proof: it is admitted past the count and byte caps, never
+  evicted to make room, and offered to a block after governance and ahead of fee order, so a pool
+  full of free orders cannot keep out the proof that settles them. A second proof while the slot
+  is held is pooled like anything else.
 - **Transport.** `rand_getPerps`, `rand_getPerpAccount`, `rand_getPerpAccounts` and
   `rand_getPerpInputs` are on the public listener; `rand_getLimits` gains `perps`; `rand_getSupply`
   gains `perps_rand_out` and `perps_rand_held` (`docs/rpc.md`). Every perp action renders in
@@ -354,6 +425,26 @@ bridged one.
 account | inputs`, in `docs/cli.md`. `rand perp prove` is the command `perp-prover` runs: it
 submits and waits for inclusion, and exits non-zero on any refusal, including a `R_from` that is
 not the chain's `proved_root`, which is how the prover learns to roll back.
+
+## v0 limits
+
+- **No prover bond (I1).** A state proof is not bound to a bonded prover register; the refusal
+  cache and the reserved pool slot above are the minimum. A prover register with a bond, so junk
+  proofs cost their sender, is a follow-up.
+- **No withdrawal fee (I2).** The spec's bundled withdrawal is deferred: a request is bundle-less
+  and fee-less, bounded only by one pending per account and 8 in all.
+- **Provers versus 1 s blocks (I7).** `MAX_WINDOW_BLOCKS` is 64, and a tier-16 proof takes 76 to
+  400 s, so on 1 s blocks a single prover falls behind the digests it must cover. A demo chain
+  runs 2 s blocks; back-pressure on inputs while proofs lag, and eliding empty blocks from a
+  window, are follow-ups.
+- **The gate's error (M3).** `PerpError::Disabled` is the section gate's refusal. The five
+  bundle-less actions are gated at the action step; a state proof is gated before the size caps
+  (so a chain without the section answers `Disabled`, not `ProofTooLarge`).
+- **Token collateral (M6).** A token's supply is not audited by the perps term: the audit cannot
+  detect a token deposit and payout imbalance.
+- **Engine capacities.** The ledger pins `MAX_MARKETS` = 2, the pinned engine's capacity, and
+  nothing else of the engine's: `MAX_ACCOUNTS` (15) and `MAX_PERP_PAYOUTS` (8) are ledger rules
+  chosen to fit it, not engine constants read from it.
 
 ## What v0 does not do
 

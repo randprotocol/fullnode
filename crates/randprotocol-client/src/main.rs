@@ -1520,10 +1520,12 @@ async fn perp(
             let body =
                 perps::order_body(nonce, market, &side, &kind, &tif, reduce_only, price, size)?;
             let chain_id = rpc.chain_id().await?;
+            // BIND-1: signed over the chain's binding domain, as the node verifies it.
+            let domain = rpc.binding_domain(chain_id).await?;
             let hash = perps::submit_perp_signed(
                 rpc,
                 chain_id,
-                perps::order_action(chain_id, &kp, body),
+                perps::order_action(&domain, chain_id, &kp, body),
                 !no_wait,
             )
             .await?;
@@ -1542,10 +1544,11 @@ async fn perp(
             let account = account_id(kp.public_key());
             let nonce = perps::resolve_nonce(rpc, &account, nonce).await?;
             let chain_id = rpc.chain_id().await?;
+            let domain = rpc.binding_domain(chain_id).await?;
             let hash = perps::submit_perp_signed(
                 rpc,
                 chain_id,
-                perps::cancel_action(chain_id, &kp, nonce, target),
+                perps::cancel_action(&domain, chain_id, &kp, nonce, target),
                 !no_wait,
             )
             .await?;
@@ -1574,9 +1577,11 @@ async fn perp(
             )
             .context("chain height does not fit a note's time field")?;
             let format = rpc.envelope_format(chain_id).await?;
+            let domain = rpc.binding_domain(chain_id).await?;
             let (action, note) = perps::withdraw_action(
                 &w,
                 &kp,
+                &domain,
                 chain_id,
                 nonce,
                 amount,
@@ -1614,13 +1619,14 @@ async fn perp(
             let kp = perps::load_dilithium_key(&node_key)?;
             let prices = perps::parse_prices(&price)?;
             let chain_id = rpc.chain_id().await?;
+            let domain = rpc.binding_domain(chain_id).await?;
             loop {
                 let nonce = u64::try_from(
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)?
                         .as_millis(),
                 )?;
-                let action = perps::oracle_action(chain_id, &kp, prices.clone(), nonce);
+                let action = perps::oracle_action(&domain, chain_id, &kp, prices.clone(), nonce);
                 match (
                     perps::submit_perp_signed(rpc, chain_id, action, every.is_none() && !no_wait)
                         .await,

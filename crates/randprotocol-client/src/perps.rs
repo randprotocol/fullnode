@@ -29,7 +29,7 @@ use randprotocol_core::ledger::perps::{
     PerpPayout, PerpPrice, MAX_PERP_PAYOUTS, PERP_FROM,
 };
 use randprotocol_core::notes::{word8_from_hex, EnvelopeFormat, Word8};
-use randprotocol_core::{Action, Hash, Keypair, PublicKey, Signature, Transaction};
+use randprotocol_core::{Action, BindingDomain, Hash, Keypair, PublicKey, Signature, Transaction};
 use randprotocol_zkvm::address::seal_note_as;
 use randprotocol_zkvm::executor::ZkExecutor;
 use randprotocol_zkvm::machine::{FriProfile, Tier, TIERS};
@@ -56,10 +56,16 @@ pub fn write_dilithium_key(path: &Path) -> Result<Keypair> {
 }
 
 /// `action` with its signature made by `kp` over [`Transaction::perp_sign_message`] — the
-/// message the ledger verifies. An action that is not one of the four signed perp variants is
-/// returned unchanged.
-pub fn sign_perp(chain_id: u64, kp: &Keypair, mut action: Action) -> Action {
-    let Some(msg) = Transaction::perp_sign_message(chain_id, &action) else {
+/// message the ledger verifies, over the chain's binding domain (BIND-1: `domain` is what
+/// [`RpcClient::binding_domain`] answers for the chain). An action that is not one of the four
+/// signed perp variants is returned unchanged.
+pub fn sign_perp(
+    domain: &BindingDomain,
+    chain_id: u64,
+    kp: &Keypair,
+    mut action: Action,
+) -> Action {
+    let Some(msg) = Transaction::perp_sign_message(domain, chain_id, &action) else {
         return action;
     };
     // `perp_sign_message` answers `Some` for exactly these four variants (its own match is
@@ -204,8 +210,14 @@ pub fn order_body(
 }
 
 /// A signed order of the account `kp` owns.
-pub fn order_action(chain_id: u64, kp: &Keypair, body: PerpOrderBody) -> Action {
+pub fn order_action(
+    domain: &BindingDomain,
+    chain_id: u64,
+    kp: &Keypair,
+    body: PerpOrderBody,
+) -> Action {
     sign_perp(
+        domain,
         chain_id,
         kp,
         Action::PerpOrder {
@@ -217,8 +229,15 @@ pub fn order_action(chain_id: u64, kp: &Keypair, body: PerpOrderBody) -> Action 
 }
 
 /// A signed cancel of the order with nonce `target`, in the cancel's own slot `nonce`.
-pub fn cancel_action(chain_id: u64, kp: &Keypair, nonce: u64, target: u64) -> Action {
+pub fn cancel_action(
+    domain: &BindingDomain,
+    chain_id: u64,
+    kp: &Keypair,
+    nonce: u64,
+    target: u64,
+) -> Action {
     sign_perp(
+        domain,
         chain_id,
         kp,
         Action::PerpCancel {
@@ -239,6 +258,7 @@ pub fn cancel_action(chain_id: u64, kp: &Keypair, nonce: u64, target: u64) -> Ac
 pub fn withdraw_action(
     w: &Wallet,
     kp: &Keypair,
+    domain: &BindingDomain,
     chain_id: u64,
     nonce: u64,
     amount: u64,
@@ -263,7 +283,7 @@ pub fn withdraw_action(
         envelope,
         signature: Signature::empty(),
     };
-    Ok((sign_perp(chain_id, kp, action), note))
+    Ok((sign_perp(domain, chain_id, kp, action), note))
 }
 
 /// `--price <market>=<units>[,…]`: one price per market, positive, sorted ascending by market
@@ -298,8 +318,15 @@ pub fn parse_prices(text: &str) -> Result<Vec<PerpPrice>> {
 }
 
 /// A validator's signed oracle submission.
-pub fn oracle_action(chain_id: u64, kp: &Keypair, prices: Vec<PerpPrice>, nonce: u64) -> Action {
+pub fn oracle_action(
+    domain: &BindingDomain,
+    chain_id: u64,
+    kp: &Keypair,
+    prices: Vec<PerpPrice>,
+    nonce: u64,
+) -> Action {
     sign_perp(
+        domain,
         chain_id,
         kp,
         Action::PerpOracle {
@@ -590,9 +617,15 @@ pub async fn prove_and_submit_state_proof(
         exec.outputs
     );
     drop(exec);
+    // M2: the tier the run needs, from the dry run's workload (the prover's own choice), held to
+    // the chain's max_tier before minutes are spent proving a window the chain would refuse.
+    let needed = randprotocol_zkvm::executor::dry_run_call(&program, &witness, &segment)
+        .map_err(|e| anyhow!("sizing the window: {e}"))?
+        .tier;
+    let tier = pick_tier(tier, needed, state.max_tier)?;
     let started = Instant::now();
     let (proof, _, proved_tier) =
-        randprotocol_zkvm::executor::prove_perp(profile, &program, &witness, &segment, tier)
+        randprotocol_zkvm::executor::prove_perp(profile, &program, &witness, &segment, Some(tier))
             .map_err(|e| anyhow!("proving the window: {e}"))?;
     let secs = started.elapsed().as_secs_f64();
     eprintln!(
@@ -628,6 +661,23 @@ pub async fn prove_and_submit_state_proof(
         .hash()
     };
     Ok((hash, proved_tier, proof_bytes))
+}
+
+/// The tier `rand perp prove` proves at: `--tier` when given, else `needed`, the smallest tier
+/// the dry run fits. Refused, before anything is proved, when that is below `needed` (the run
+/// does not fit it) or above the chain's `max_tier` (the chain would refuse the proof).
+pub fn pick_tier(explicit: Option<u8>, needed: u8, max_tier: u8) -> Result<u8> {
+    let tier = explicit.unwrap_or(needed);
+    if tier < needed {
+        bail!("--tier {tier}: the window needs tier {needed}");
+    }
+    if tier > max_tier {
+        bail!(
+            "the window needs tier {tier}, over this chain's max_tier {max_tier}: nothing proved \
+             (prove a shorter window)"
+        );
+    }
+    Ok(tier)
 }
 
 /// `rand perp genesis-root`: the engine state root of `words` (`perp_digest(STATE, words)`), the
@@ -757,6 +807,23 @@ mod tests {
         (url, sent)
     }
 
+    /// M2: the tier is the dry run's unless `--tier` raises it, and a window that needs more than
+    /// the chain's `max_tier` is refused before proving.
+    #[test]
+    fn the_tier_comes_from_the_dry_run_and_is_held_to_max_tier() {
+        assert_eq!(pick_tier(None, 14, 16).unwrap(), 14);
+        assert_eq!(pick_tier(Some(16), 14, 16).unwrap(), 16);
+        assert!(pick_tier(Some(12), 14, 16)
+            .unwrap_err()
+            .to_string()
+            .contains("needs tier 14"));
+        let e = pick_tier(None, 18, 16).unwrap_err().to_string();
+        assert!(
+            e.contains("max_tier 16") && e.contains("nothing proved"),
+            "{e}"
+        );
+    }
+
     #[test]
     fn sign_perp_signs_exactly_the_perp_sign_message() {
         let kp = Keypair::generate();
@@ -776,7 +843,8 @@ mod tests {
             body,
             signature: Signature::empty(),
         };
-        let signed = sign_perp(7, &kp, unsigned.clone());
+        let d = BindingDomain::ChainId;
+        let signed = sign_perp(&d, 7, &kp, unsigned.clone());
         assert_eq!(
             signed.perp_unsigned(),
             unsigned.perp_unsigned(),
@@ -785,16 +853,33 @@ mod tests {
         let Action::PerpOrder { signature, .. } = &signed else {
             panic!("still an order")
         };
-        let msg = Transaction::perp_sign_message(7, &signed).unwrap();
+        let msg = Transaction::perp_sign_message(&d, 7, &signed).unwrap();
         assert!(
             kp.public_key().verify(msg.as_bytes(), signature),
             "verifies as the ledger checks it"
+        );
+        // BIND-1: on a chain whose genesis binds its hash the signature is over that domain, and
+        // a chain-id signature is not one there.
+        let g = BindingDomain::Genesis(Hash([0x5a; 32]));
+        let bound = sign_perp(&g, 7, &kp, unsigned.clone());
+        let Action::PerpOrder {
+            signature: bound_sig,
+            ..
+        } = &bound
+        else {
+            panic!("still an order")
+        };
+        let bound_msg = Transaction::perp_sign_message(&g, 7, &bound).unwrap();
+        assert!(kp.public_key().verify(bound_msg.as_bytes(), bound_sig));
+        assert!(
+            !kp.public_key().verify(bound_msg.as_bytes(), signature),
+            "a domain-0 signature does not verify under domain 1"
         );
         // The two unsigned perp actions come back exactly as they went in.
         let deposit = Action::PerpDeposit {
             trading_key: kp.public_key().clone(),
         };
-        assert_eq!(sign_perp(7, &kp, deposit.clone()), deposit);
+        assert_eq!(sign_perp(&d, 7, &kp, deposit.clone()), deposit);
         let proof = Action::PerpStateProof {
             from_height: 1,
             to_height: 2,
@@ -806,8 +891,8 @@ mod tests {
             fees: 3,
             proof: vec![1, 2, 3],
         };
-        assert_eq!(sign_perp(7, &kp, proof.clone()), proof);
-        let other = Transaction::perp_sign_message(8, &signed).unwrap();
+        assert_eq!(sign_perp(&d, 7, &kp, proof.clone()), proof);
+        let other = Transaction::perp_sign_message(&d, 8, &signed).unwrap();
         assert!(
             !kp.public_key().verify(other.as_bytes(), signature),
             "bound to the chain"
@@ -1025,8 +1110,18 @@ mod tests {
     fn a_paid_withdrawal_is_found_by_the_ordinary_scan() {
         let w = Wallet::generate();
         let kp = Keypair::generate();
-        let (action, note) =
-            withdraw_action(&w, &kp, 7, 4, 1_500, 0, 33, EnvelopeFormat::Legacy).unwrap();
+        let (action, note) = withdraw_action(
+            &w,
+            &kp,
+            &BindingDomain::ChainId,
+            7,
+            4,
+            1_500,
+            0,
+            33,
+            EnvelopeFormat::Legacy,
+        )
+        .unwrap();
         let Action::PerpWithdraw {
             account,
             nonce,
@@ -1044,7 +1139,7 @@ mod tests {
             (*account, *nonce, *amount, *time, &recipient.pk),
             (account_id(kp.public_key()), 4, 1_500, 33, &w.address.pk)
         );
-        let msg = Transaction::perp_sign_message(7, &action).unwrap();
+        let msg = Transaction::perp_sign_message(&BindingDomain::ChainId, 7, &action).unwrap();
         assert!(kp.public_key().verify(msg.as_bytes(), signature));
         let cm = hasher().note_commitment(&recipient.pk, &PERP_FROM, *amount, 0, *time, r);
         assert_eq!(cm, note.commitment());

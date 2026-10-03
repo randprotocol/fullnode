@@ -222,6 +222,14 @@ pub struct PerpsLimits {
     #[serde(deserialize_with = "u64_string_or_number")]
     pub max_window_blocks: u64,
     pub max_payouts: usize,
+    /// The most perp inputs one block records (genesis `max_block_inputs`); 0 from a node that
+    /// predates the field.
+    #[serde(default)]
+    pub max_block_inputs: u32,
+    /// The smallest deposit in collateral units, 0 no floor (genesis `min_deposit`); a decimal
+    /// string on the wire, 0 from a node that predates the field.
+    #[serde(default, deserialize_with = "u64_string_or_number")]
+    pub min_deposit: u64,
 }
 
 /// `rand_getLimits.program_state` (RPL-2): what an invoke is sized and priced by.
