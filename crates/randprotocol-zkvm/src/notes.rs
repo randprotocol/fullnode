@@ -512,11 +512,14 @@ mod tests {
     use randprotocol_core::ledger::perps;
 
     /// The ledger computes `D_h`, `R` and the payouts digest through the executor under its own
-    /// copies of the three domains; a guest uses these. They must be the same words.
+    /// copies of the three domains; a guest uses these. They must be the same words. Likewise the
+    /// tier list `PerpsConfig::check` holds `max_tier` to.
     #[test]
     fn perp_domains_match_core() {
         assert_eq!(domain::PERP_BLOCK, perps::domain::BLOCK);
         assert_eq!(domain::PERP_STATE, perps::domain::STATE);
         assert_eq!(domain::PERP_PAYOUTS, perps::domain::PAYOUTS);
+        let tiers: Vec<usize> = perps::TIERS.iter().map(|&t| t as usize).collect();
+        assert_eq!(tiers, crate::machine::TIERS, "PerpsConfig::check's tier list is the machine's");
     }
 }

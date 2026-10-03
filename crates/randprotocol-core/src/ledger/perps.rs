@@ -11,7 +11,10 @@
 //!   so the engine's crate, which cannot depend on this one, can check it agrees.
 //! - **The ledger's own state.** Trading keys and their nonce windows, the oracle, the proved
 //!   root and height, the digests of the blocks not yet proved, and the withdrawals waiting on a
-//!   proof to pay them. All of it is in the state root ([`Perps::root`]).
+//!   proof to pay them. The state root ([`Perps::root`]) commits every field of it — the oracle
+//!   submissions and nonces too, since they decide whether the next oracle transaction is valid —
+//!   except the two per-block transient fields, which are emptied before a block's root is taken.
+//!   The genesis section itself is fixed for the chain's life and committed by the genesis.
 //!
 //! The gate is the genesis `perps` section: without it the chain has no [`Perps`] at all.
 
@@ -46,8 +49,10 @@ pub mod domain {
 }
 
 /// The tiers a zkVM proof can be made at (`randprotocol-zkvm`'s `machine::TIERS`), restated
-/// because core cannot import it.
-const TIERS: [u8; 6] = [10, 12, 14, 16, 18, 20];
+/// because core cannot import it; a test in the zkvm crate pins the two.
+pub const TIERS: [u8; 6] = [10, 12, 14, 16, 18, 20];
+/// The most blocks `max_window_blocks` may set one state proof to cover.
+pub const MAX_WINDOW_BLOCKS: u64 = 64;
 /// The widest a nonce window reaches below its highest nonce: the 64 bits of `used`.
 const NONCE_WINDOW: u64 = 64;
 
@@ -102,8 +107,11 @@ impl PerpsConfig {
         if !TIERS.contains(&self.max_tier) {
             return Err(format!("perps.max_tier {} is not a proof tier ({TIERS:?})", self.max_tier));
         }
-        if !(1..=NONCE_WINDOW).contains(&self.max_window_blocks) {
-            return Err(format!("perps.max_window_blocks {} is outside 1..=64", self.max_window_blocks));
+        if !(1..=MAX_WINDOW_BLOCKS).contains(&self.max_window_blocks) {
+            return Err(format!(
+                "perps.max_window_blocks {} is outside 1..={MAX_WINDOW_BLOCKS}",
+                self.max_window_blocks
+            ));
         }
         if !(1..=16).contains(&self.markets.len()) {
             return Err(format!("perps.markets has {} markets; a chain has 1 to 16", self.markets.len()));
@@ -360,8 +368,8 @@ pub struct Perps {
     last_block_words: Option<(u64, Vec<u32>)>,
 }
 
-/// Consensus fields only: two ledgers that agree on everything in the root (and on the oracle
-/// submissions and nonces behind it) are equal whatever their in-flight transient fields hold.
+/// Consensus fields only — exactly what the root commits, plus the genesis section: two ledgers
+/// that agree on them are equal whatever their in-flight transient fields hold.
 impl PartialEq for Perps {
     fn eq(&self, other: &Perps) -> bool {
         self.config == other.config
@@ -392,10 +400,13 @@ impl Perps {
         }
     }
 
-    /// `blake3("rand-perps-1", proved_root ‖ proved_height ‖ accounts_root ‖ medians_root ‖
-    /// digests_root ‖ withdrawals_root)`, each a merkle root over its map's leaves in map order.
+    /// `blake3("rand-perps-1", proved_root ‖ proved_height ‖ accounts_root ‖ oracle_root ‖
+    /// oracle_nonces_root ‖ digests_root ‖ withdrawals_root)`, each a merkle root over its map's
+    /// leaves in map order. An oracle leaf is the market's median and every submission behind it
+    /// (in validator address order), because the submissions and the nonces decide whether the
+    /// next oracle transaction is valid: two nodes that differ in them must differ in root.
     /// Integers are big-endian; a withdrawal's leaf is its bincode, which is length-prefixed
-    /// wherever a field is variable.
+    /// wherever a field is variable. Everything but the two transient per-block fields is here.
     pub fn root(&self) -> Hash {
         let accounts: Vec<Hash> = self
             .accounts
@@ -409,14 +420,30 @@ impl Perps {
                 Hash::digest_domain(b"rand-perp-account-1", &buf)
             })
             .collect();
-        let medians: Vec<Hash> = self
+        let oracle: Vec<Hash> = self
             .oracle
             .iter()
             .map(|(market, o)| {
-                let mut buf = Vec::with_capacity(12);
+                let mut buf = Vec::with_capacity(16 + 48 * o.submissions.len());
                 buf.extend_from_slice(&market.to_be_bytes());
                 buf.extend_from_slice(&o.median.to_be_bytes());
-                Hash::digest_domain(b"rand-perp-median-1", &buf)
+                buf.extend_from_slice(&(o.submissions.len() as u32).to_be_bytes());
+                for (validator, (price, height)) in &o.submissions {
+                    buf.extend_from_slice(validator.as_bytes());
+                    buf.extend_from_slice(&price.to_be_bytes());
+                    buf.extend_from_slice(&height.to_be_bytes());
+                }
+                Hash::digest_domain(b"rand-perp-oracle-1", &buf)
+            })
+            .collect();
+        let oracle_nonces: Vec<Hash> = self
+            .oracle_nonces
+            .iter()
+            .map(|(validator, nonce)| {
+                let mut buf = Vec::with_capacity(40);
+                buf.extend_from_slice(validator.as_bytes());
+                buf.extend_from_slice(&nonce.to_be_bytes());
+                Hash::digest_domain(b"rand-perp-oracle-nonce-1", &buf)
             })
             .collect();
         let digests: Vec<Hash> = self
@@ -437,11 +464,12 @@ impl Perps {
                 Hash::digest_domain(b"rand-perp-withdrawal-1", &buf)
             })
             .collect();
-        let mut buf = Vec::with_capacity(32 + 8 + 4 * 32);
+        let mut buf = Vec::with_capacity(32 + 8 + 5 * 32);
         buf.extend_from_slice(&word8_to_bytes(&self.proved_root));
         buf.extend_from_slice(&self.proved_height.to_be_bytes());
         buf.extend_from_slice(merkle_root(&accounts).as_bytes());
-        buf.extend_from_slice(merkle_root(&medians).as_bytes());
+        buf.extend_from_slice(merkle_root(&oracle).as_bytes());
+        buf.extend_from_slice(merkle_root(&oracle_nonces).as_bytes());
         buf.extend_from_slice(merkle_root(&digests).as_bytes());
         buf.extend_from_slice(merkle_root(&withdrawals).as_bytes());
         Hash::digest_domain(b"rand-perps-1", &buf)
@@ -564,6 +592,14 @@ mod tests {
         w.clear();
         PerpInput::Close { height: 3, time_ms: 4, medians: vec![PerpPrice { market: 0, price: 11 }] }.words(&mut w);
         assert_eq!(w, vec![5, 3, 0, 4, 0, 1, 0, 11, 0]);
+        w.clear();
+        PerpInput::Cancel { account: acct(3), nonce: 9, target: 4 }.words(&mut w);
+        assert_eq!(w.len(), 13);
+        assert_eq!(w, [vec![3], vec![3; 8], vec![9, 0, 4, 0]].concat());
+        w.clear();
+        PerpInput::Withdraw { account: acct(4), nonce: 5, amount: (1u64 << 32) | 6, request: [7; 8] }.words(&mut w);
+        assert_eq!(w.len(), 21);
+        assert_eq!(w, [vec![4], vec![4; 8], vec![5, 0, 6, 1], vec![7; 8]].concat());
     }
 
     #[test]
@@ -605,13 +641,72 @@ mod tests {
     fn root_changes_with_every_component_and_config_check_bounds() {
         let c = sample_config();
         assert!(c.check().is_ok());
-        let mut bad = c.clone();
-        bad.max_tier = 11;
-        assert!(bad.check().is_err());
+        let refused = |f: &dyn Fn(&mut PerpsConfig)| {
+            let mut bad = c.clone();
+            f(&mut bad);
+            bad.check().is_err()
+        };
+        assert!(refused(&|b| b.max_tier = 11), "not a tier");
+        assert!(refused(&|b| b.max_tier = 22), "above the highest tier");
+        assert!(refused(&|b| b.max_window_blocks = 0), "an empty window");
+        assert!(refused(&|b| b.max_window_blocks = MAX_WINDOW_BLOCKS + 1), "a 65-block window");
+        assert!(refused(&|b| b.markets[0].id = 1), "a market id out of order");
+        assert!(refused(&|b| b.markets[0].maintenance_bps = 10_001), "more than 100%");
+        assert!(refused(&|b| b.markets.clear()), "no market");
+        let mut ok = c.clone();
+        ok.max_window_blocks = MAX_WINDOW_BLOCKS;
+        assert!(ok.check().is_ok(), "the bound itself is allowed");
+
+        // Each consensus field moves the root; each step keeps the earlier ones' changes.
         let mut p = Perps::from_config(&c);
-        let r0 = p.root();
+        let mut seen = vec![p.root()];
+        let mut moved = |p: &Perps, what: &str| {
+            let r = p.root();
+            assert!(!seen.contains(&r), "{what} does not change the root");
+            seen.push(r);
+        };
+        p.proved_root = [1; 8];
+        moved(&p, "proved_root");
         p.proved_height = 1;
-        assert_ne!(p.root(), r0);
+        moved(&p, "proved_height");
+        let key = crate::Keypair::from_seed([3; 32]).unwrap().public_key().clone();
+        p.accounts.insert(account_id(&key), PerpAccount { trading_key: key.clone(), nonce_high: 0, used: 0 });
+        moved(&p, "a new account");
+        p.accounts.get_mut(&account_id(&key)).unwrap().accept_nonce(4).unwrap();
+        moved(&p, "an account's nonce window");
+        let validator = Address([5; 32]);
+        p.oracle.entry(0).or_default().submissions.insert(validator, (100, 1));
+        moved(&p, "an oracle submission");
+        p.oracle.get_mut(&0).unwrap().submissions.insert(validator, (101, 1));
+        moved(&p, "an oracle submission's price");
+        p.oracle.get_mut(&0).unwrap().median = 100;
+        moved(&p, "a median");
+        p.oracle_nonces.insert(validator, 1);
+        moved(&p, "an oracle nonce");
+        p.oracle_nonces.insert(validator, 2);
+        moved(&p, "an oracle nonce's value");
+        p.digests.insert(2, [6; 8]);
+        moved(&p, "a digest");
+        let pending = PendingWithdrawal {
+            account: account_id(&key),
+            amount: 5,
+            recipient: ShieldedAddress { pk: [8; 8], kem_ek: vec![1; 4] },
+            r: [9; 8],
+            envelope: Envelope { kem_ct: vec![1], to_receiver: vec![], to_sender: vec![], body: vec![2] },
+            time: 7,
+            height: 2,
+        };
+        p.withdrawals.insert([7; 8], pending);
+        moved(&p, "a withdrawal");
+        p.withdrawals.get_mut(&[7; 8]).unwrap().amount = 6;
+        moved(&p, "a withdrawal's amount");
+
+        // The transient fields are outside both the root and equality.
+        let before = (p.root(), p.clone());
+        p.block_inputs.push(PerpInput::Deposit { account: acct(1), amount: 1 });
+        p.last_block_words = Some((3, vec![1]));
+        assert_eq!(p.root(), before.0);
+        assert_eq!(p, before.1);
     }
 
     fn sample_config() -> PerpsConfig {
