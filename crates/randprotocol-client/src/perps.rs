@@ -62,14 +62,16 @@ pub fn sign_perp(chain_id: u64, kp: &Keypair, mut action: Action) -> Action {
     let Some(msg) = Transaction::perp_sign_message(chain_id, &action) else {
         return action;
     };
-    let sig = kp.sign(msg.as_bytes());
-    match &mut action {
-        Action::PerpOrder { signature, .. }
-        | Action::PerpCancel { signature, .. }
-        | Action::PerpWithdraw { signature, .. }
-        | Action::PerpOracle { signature, .. } => *signature = sig,
-        _ => {}
-    }
+    // `perp_sign_message` answers `Some` for exactly these four variants (its own match is
+    // exhaustive over `Action`), so the `else` is unreachable for a message that was made.
+    let (Action::PerpOrder { signature, .. }
+    | Action::PerpCancel { signature, .. }
+    | Action::PerpWithdraw { signature, .. }
+    | Action::PerpOracle { signature, .. }) = &mut action
+    else {
+        return action;
+    };
+    *signature = kp.sign(msg.as_bytes());
     action
 }
 
@@ -788,6 +790,23 @@ mod tests {
             kp.public_key().verify(msg.as_bytes(), signature),
             "verifies as the ledger checks it"
         );
+        // The two unsigned perp actions come back exactly as they went in.
+        let deposit = Action::PerpDeposit {
+            trading_key: kp.public_key().clone(),
+        };
+        assert_eq!(sign_perp(7, &kp, deposit.clone()), deposit);
+        let proof = Action::PerpStateProof {
+            from_height: 1,
+            to_height: 2,
+            new_root: [5; 8],
+            payouts: vec![PerpPayout {
+                request: [1; 8],
+                amount: 2,
+            }],
+            fees: 3,
+            proof: vec![1, 2, 3],
+        };
+        assert_eq!(sign_perp(7, &kp, proof.clone()), proof);
         let other = Transaction::perp_sign_message(8, &signed).unwrap();
         assert!(
             !kp.public_key().verify(other.as_bytes(), signature),

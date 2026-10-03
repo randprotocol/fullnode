@@ -6924,6 +6924,85 @@ mod tests {
         assert!(slots_for(&me, &tx).iter().all(opens_to_nobody));
     }
 
+    /// RPL-3: `perps::submit_perp_deposit`'s bundle burns the collateral where the ledger's
+    /// `PerpDeposit` rule reads it — RAND through `burn_r` (the `Bond` shape), a token through
+    /// `burn_a`/`burn_asset` (the `TokenBurn` shape) — and carries the deposit action.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_perp_deposit_burns_the_collateral_through_the_slot_the_ledger_reads() {
+        let me = Wallet::from_spend_key(SpendKey([53; 8]));
+        let trading_key = Keypair::generate().public_key().clone();
+        let chain = Arc::new(Mutex::new(ChainState::new()));
+        {
+            let mut c = chain.lock().unwrap();
+            c.fund(&me, 300, 5);
+            c.fund(&me, 500 + gas::BUNDLE_BASE, 0);
+            c.fund(&me, gas::BUNDLE_BASE, 0);
+        }
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        let deposit = crate::perps::submit_perp_deposit;
+        let (fee, p) = (gas::BUNDLE_BASE, FriProfile::Test);
+        deposit(
+            &rpc,
+            &me,
+            &mut store,
+            &trading_key,
+            500,
+            0,
+            fee,
+            p,
+            &Proving::Emulated,
+            7,
+            false,
+        )
+        .await
+        .unwrap();
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        let b = tx.bundle.as_ref().unwrap();
+        assert_eq!(
+            (b.burn_r, b.burn_a, b.burn_asset),
+            (500, 0, 0),
+            "RAND through burn_r"
+        );
+        assert_eq!(
+            tx.action,
+            Action::PerpDeposit {
+                trading_key: trading_key.clone()
+            }
+        );
+
+        deposit(
+            &rpc,
+            &me,
+            &mut store,
+            &trading_key,
+            300,
+            5,
+            fee,
+            p,
+            &Proving::Emulated,
+            7,
+            false,
+        )
+        .await
+        .unwrap();
+        let tx = chain.lock().unwrap().sent.pop().unwrap();
+        assert_admissible_shape(&tx);
+        let b = tx.bundle.as_ref().unwrap();
+        assert_eq!(
+            (b.burn_r, b.burn_a, b.burn_asset),
+            (0, 300, 5),
+            "a token through burn_a/burn_asset"
+        );
+        assert_eq!(
+            tx.action,
+            Action::PerpDeposit {
+                trading_key: trading_key.clone()
+            }
+        );
+    }
+
     /// `build_register_token` refuses bad metadata (`check_metadata`, the same rule
     /// `register_bridged_action` already runs first) before any network read — T8b review round
     /// 1: a bad name, symbol or decimals count would otherwise burn a real proof before the chain
