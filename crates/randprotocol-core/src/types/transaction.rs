@@ -805,7 +805,43 @@ impl Action {
             | Action::PerpCancel { signature, .. }
             | Action::PerpWithdraw { signature, .. }
             | Action::PerpOracle { signature, .. } => *signature = Signature::empty(),
-            _ => {}
+            // Every other variant is spelled out: a new signed variant must be classified here.
+            Action::None
+            | Action::Mint { .. }
+            | Action::Deploy { .. }
+            | Action::Call { .. }
+            | Action::Bond { .. }
+            | Action::Unbond { .. }
+            | Action::Withdraw { .. }
+            | Action::BridgeAttest { .. }
+            | Action::BridgeBurn { .. }
+            | Action::RegisterAggregator { .. }
+            | Action::UnbondAggregator { .. }
+            | Action::WithdrawAggregator { .. }
+            | Action::SlashAggregator { .. }
+            | Action::Aggregate { .. }
+            | Action::RegisterToken { .. }
+            | Action::TokenMint { .. }
+            | Action::SetAuthority { .. }
+            | Action::TokenBurn { .. }
+            | Action::PauseMints { .. }
+            | Action::UnpauseMints { .. }
+            | Action::RegisterBridgedToken { .. }
+            | Action::ListBacking { .. }
+            | Action::RotatePqGuardians { .. }
+            | Action::RotatePauseKey { .. }
+            | Action::ClaimVested { .. }
+            | Action::RevokeVesting { .. }
+            | Action::BondVested { .. }
+            | Action::UnbondVested { .. }
+            | Action::AdmitValidator { .. }
+            | Action::SlashEquivocation { .. }
+            | Action::RotatePqGuardiansV2 { .. }
+            | Action::RotatePauseKeyV2 { .. }
+            | Action::CancelRotation { .. }
+            | Action::Invoke { .. }
+            | Action::PerpDeposit { .. }
+            | Action::PerpStateProof { .. } => {}
         }
         a
     }
@@ -886,7 +922,43 @@ impl Transaction {
             Action::PerpCancel { .. } => 36,
             Action::PerpWithdraw { .. } => 37,
             Action::PerpOracle { .. } => 38,
-            _ => return None,
+            // Every other variant is spelled out: a new signed variant must be given a tag here.
+            Action::None
+            | Action::Mint { .. }
+            | Action::Deploy { .. }
+            | Action::Call { .. }
+            | Action::Bond { .. }
+            | Action::Unbond { .. }
+            | Action::Withdraw { .. }
+            | Action::BridgeAttest { .. }
+            | Action::BridgeBurn { .. }
+            | Action::RegisterAggregator { .. }
+            | Action::UnbondAggregator { .. }
+            | Action::WithdrawAggregator { .. }
+            | Action::SlashAggregator { .. }
+            | Action::Aggregate { .. }
+            | Action::RegisterToken { .. }
+            | Action::TokenMint { .. }
+            | Action::SetAuthority { .. }
+            | Action::TokenBurn { .. }
+            | Action::PauseMints { .. }
+            | Action::UnpauseMints { .. }
+            | Action::RegisterBridgedToken { .. }
+            | Action::ListBacking { .. }
+            | Action::RotatePqGuardians { .. }
+            | Action::RotatePauseKey { .. }
+            | Action::ClaimVested { .. }
+            | Action::RevokeVesting { .. }
+            | Action::BondVested { .. }
+            | Action::UnbondVested { .. }
+            | Action::AdmitValidator { .. }
+            | Action::SlashEquivocation { .. }
+            | Action::RotatePqGuardiansV2 { .. }
+            | Action::RotatePauseKeyV2 { .. }
+            | Action::CancelRotation { .. }
+            | Action::Invoke { .. }
+            | Action::PerpDeposit { .. }
+            | Action::PerpStateProof { .. } => return None,
         };
         let bytes = bincode::serialize(&(chain_id, tag, action.perp_unsigned())).expect("serializes");
         Some(Hash::digest_domain(b"rand-perp-sign-1", &bytes))
@@ -2081,30 +2153,53 @@ mod tests {
         assert!(seen.iter().all(|s| *s), "every variant has a row");
     }
 
-    #[test]
-    fn perp_sign_message_ignores_the_signature_and_binds_the_chain() {
-        let kp = Keypair::generate();
-        let body = crate::ledger::perps::PerpOrderBody {
-            nonce: 1,
-            market: 0,
-            side: 0,
-            kind: 0,
-            tif: 0,
-            reduce_only: false,
-            price: 1,
-            size: 1,
-        };
-        let a = Action::PerpOrder { account: [1; 8], body: body.clone(), signature: Signature::empty() };
-        let m = Transaction::perp_sign_message(7, &a).unwrap();
-        let signed = Action::PerpOrder { account: [1; 8], body, signature: kp.sign(m.as_bytes()) };
-        assert_eq!(Transaction::perp_sign_message(7, &signed).unwrap(), m);
-        assert_ne!(Transaction::perp_sign_message(8, &signed).unwrap(), m);
-        // Only the four signed variants have a message.
-        assert!(Transaction::perp_sign_message(7, &sample(34, Vec::new())).is_none());
-        assert!(Transaction::perp_sign_message(7, &sample(39, Vec::new())).is_none());
-        for i in 35..=38 {
-            assert!(Transaction::perp_sign_message(7, &sample(i, Vec::new())).is_some());
+    /// Rebuild the signed perp action `a` with `signature` in place of its own.
+    fn with_signature(a: &Action, signature: Signature) -> Action {
+        let mut a = a.clone();
+        match &mut a {
+            Action::PerpOrder { signature: s, .. }
+            | Action::PerpCancel { signature: s, .. }
+            | Action::PerpWithdraw { signature: s, .. }
+            | Action::PerpOracle { signature: s, .. } => *s = signature,
+            _ => panic!("not a signed perp action"),
         }
+        a
+    }
+
+    #[test]
+    fn perp_sign_message_ignores_the_signature_and_binds_the_chain_and_tag() {
+        let kp = Keypair::generate();
+        let mut messages = Vec::new();
+        for i in 35..=38 {
+            let empty = with_signature(&sample(i, Vec::new()), Signature::empty());
+            let m = Transaction::perp_sign_message(7, &empty).unwrap();
+            let signed = with_signature(&empty, kp.sign(m.as_bytes()));
+            assert_ne!(signed, empty, "variant {i}: the signature was replaced");
+            assert_eq!(Transaction::perp_sign_message(7, &signed).unwrap(), m, "variant {i}: the signature is not signed over");
+            assert_ne!(Transaction::perp_sign_message(8, &signed).unwrap(), m, "variant {i}: the chain is bound");
+            messages.push(m);
+        }
+        for a in 0..messages.len() {
+            for b in a + 1..messages.len() {
+                assert_ne!(messages[a], messages[b], "variants {} and {} sign different messages", 35 + a, 35 + b);
+            }
+        }
+        // Only the four signed variants have a message.
+        for i in [34, 39] {
+            assert!(Transaction::perp_sign_message(7, &sample(i, Vec::new())).is_none());
+        }
+    }
+
+    #[test]
+    fn perp_variants_are_bundle_less_and_fee_floored_as_ruled() {
+        assert_eq!(sample(34, Vec::new()).bundle_less(), None, "a deposit rides a bundle");
+        let names = ["perp_order", "perp_cancel", "perp_withdraw", "perp_oracle", "perp_state_proof"];
+        for (k, name) in names.iter().enumerate() {
+            let a = sample(35 + k, Vec::new());
+            assert_eq!(a.bundle_less(), Some(*name), "variant {}", 35 + k);
+            assert_eq!(crate::gas::fee_floor(&a), 0, "variant {}: bundle-less, no floor", 35 + k);
+        }
+        assert_eq!(crate::gas::fee_floor(&sample(34, Vec::new())), crate::gas::BUNDLE_BASE);
     }
 
     /// The binding ignores every blanked proof byte — the bundle's, an aggregate's, and a pruned
