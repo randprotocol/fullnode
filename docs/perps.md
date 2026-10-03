@@ -467,3 +467,15 @@ not the chain's `proved_root`, which is how the prover learns to roll back.
 The engine (`perp-core`), the guest (`perp-guest`), the prover (`perp-prover`) and the site are in
 `../durian.market`; its README is the runbook. The wire shapes a prover reads are in
 `docs/rpc.md`; the job file `rand perp prove` takes is in `docs/cli.md`.
+
+## Recorded devnet run
+
+`../durian.market/scripts/devnet-perps.sh` on 2026-10-04: fullnode `feat/rpl3` 8840fe51,
+durian.market `feat/perps` ac0bd09, one validator, 2 s blocks, genesis `perps` with `max_tier`
+16, `max_block_inputs` 8, `--binding-domain 1`, engine_hc `15e24915…580bb4`. Two traders deposit
+500 RAND, cross 1 unit at 2000 RAND (fill at height 32), A withdraws 1 RAND (request at 36).
+
+| fri | window | withdraw at | proved | windows (all tier 16) | cycles per window | prove s (total, max) | proof bytes (max, total) | peak RSS | deposit s A/B | engine (proved) | fills (view) | A's 1 RAND paid |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| test | 4 | 36 | 36 | 9 | 18 521–24 828 | 663.5, 78.9 | 357 286, 3 186 104 | — | 28 / 26 | 2 orders, 1 fill, 1 payout | 1 | yes, note at height 405 |
+| production | 8 | 36 | 40 | 5 | 28 973–36 631 | 356.2, 71.8 | 1 556 425, 7 762 669 | 22.2 GB | 27 / 26 | 2 orders, 1 fill, 1 payout | 1 | yes, note at height 237 |
