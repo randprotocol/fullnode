@@ -88,6 +88,14 @@ changes a bound.
 sizes the two bounds to fit what is left. The devnet runs `max_block_inputs = 8` with
 `max_window_blocks = 4`.
 
+The bound is the worst single block, and that is a mass liquidation: one counterparty against
+the 14 other traders, whose close liquidates all 14. Measured on the pinned engine (durian.market
+`scripts/check-perp-guest.sh`, case `block-14liq`; README "Perps" has the table): 153 845 cycles
+with no inputs before the close, 212 018 with 24, 292 773 with 120. So `max_block_inputs` = 120
+needs `max_tier` 20; tier 18 with 15 % headroom holds about 24 inputs; tier 16 holds no close
+that liquidates more than a few accounts at any input count (7 liquidations alone are 76 493
+cycles), so the devnet's tier-16 genesis proves its fill blocks but not a mass liquidation.
+
 ### Per-block input caps
 
 Every block records at most `max_block_inputs` perp inputs (`BlockFull`) and at most
@@ -475,7 +483,13 @@ durian.market `feat/perps` ac0bd09, one validator, 2 s blocks, genesis `perps` w
 16, `max_block_inputs` 8, `--binding-domain 1`, engine_hc `15e24915…580bb4`. Two traders deposit
 500 RAND, cross 1 unit at 2000 RAND (fill at height 32), A withdraws 1 RAND (request at 36).
 
+Re-run with test FRI after the liquidation-scoping fix re-pinned the engine: durian.market
+27493ef, engine_hc `f286a611…1d1573`, fullnode binaries of 8840fe51 (c69a0b0f is docs only), the
+same genesis shape (row "test, re-pin" below; fill at height 49, request at 53). The production
+row is still the `15e24915…580bb4` engine's.
+
 | fri | window | withdraw at | proved | windows (all tier 16) | cycles per window | prove s (total, max) | proof bytes (max, total) | peak RSS | deposit s A/B | engine (proved) | fills (view) | A's 1 RAND paid |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | test | 4 | 36 | 36 | 9 | 18 521–24 828 | 663.5, 78.9 | 357 286, 3 186 104 | — | 28 / 26 | 2 orders, 1 fill, 1 payout | 1 | yes, note at height 405 |
+| test, re-pin | 4 | 53 | 56 | 14 | — | 1 042.4, 105.1 | 356 487, 4 937 279 | — | 52 / 36 | 2 orders, 1 fill, 1 payout | 1 | yes, A 9 499.999 → 9 500.999 RAND |
 | production | 8 | 36 | 40 | 5 | 28 973–36 631 | 356.2, 71.8 | 1 556 425, 7 762 669 | 22.2 GB | 27 / 26 | 2 orders, 1 fill, 1 payout | 1 | yes, note at height 237 |
