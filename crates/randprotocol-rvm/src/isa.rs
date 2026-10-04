@@ -29,11 +29,14 @@ pub const MEM_LIMIT: u64 = 1 << 24;
 /// (`SBPF_OUT`) and both digests share one permutation, so this must not collide with it.
 pub const RVM_PROGRAM_DOMAIN: u64 = 15;
 
-/// The twenty-four opcodes, in the spec table's reading order.
+/// The twenty-eight opcodes: the spec table's twenty-four in its reading order, then the
+/// appended ones (`REDUCE`, `SPONGE`, `HINTN`, `COMPRESS`), each at the next free number so no earlier
+/// opcode — and so no earlier program's digest — ever moves.
 ///
 /// Deliberately absent: `FRIFOLD`, `EXPBITS`, `MERKLE` precompiles — the verifier's fold and
 /// Merkle-path steps are compiled sequences of these, and a precompile is added only if the
-/// measurement in M5.1 Task 6 asks for one.
+/// measurement asks for one. `COMPRESS` is that case for one Merkle *level* (Cut C, measured at
+/// 33 rows a level); the walk itself stays a compiled loop of them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Op {
@@ -97,10 +100,19 @@ pub enum Op {
     /// poseidon2 chip's second row kind; one cpu row per block. M5.2 Task 9, appended —
     /// opcode 25.
     Sponge,
+    /// `mem[ra + imm .. ra + imm + 8] = the next eight witness words` — eight `HINT; STORE` pairs
+    /// in one row (Cut B, 2026-10-03). The words ride on the cpu row's `W0..W7`, free witness
+    /// exactly as `HINT`'s `D0` is; `rd` is unused. Opcode 26, appended; 0–25 never move.
+    Hintn,
+    /// one Merkle level: `bit = rd`, the running digest at `ra` (4 cells), the sibling at `rb`
+    /// (4 cells); `mem[ra..ra+4] = permute(bit == 0 ? [digest ‖ sib] : [sib ‖ digest])[0..4]`.
+    /// The work is the poseidon2 chip's third row kind; a non-boolean bit is an emulator error.
+    /// Cut C, opcode 27, appended; 0–26 never move.
+    Compress,
 }
 
 impl Op {
-    pub const COUNT: usize = 26;
+    pub const COUNT: usize = 28;
 
     /// Every opcode, at the index of its own discriminant (pinned by `tests/isa.rs`).
     pub const ALL: [Op; Self::COUNT] = [
@@ -130,6 +142,8 @@ impl Op {
         Op::Halt,
         Op::Reduce,
         Op::Sponge,
+        Op::Hintn,
+        Op::Compress,
     ];
 
     pub fn from_u8(x: u8) -> Option<Self> {
@@ -164,6 +178,8 @@ impl Op {
             Op::Halt => "HALT",
             Op::Reduce => "REDUCE",
             Op::Sponge => "SPONGE",
+            Op::Hintn => "HINTN",
+            Op::Compress => "COMPRESS",
         }
     }
 
@@ -175,7 +191,7 @@ impl Op {
     pub fn b_is_register(self) -> bool {
         matches!(
             self,
-            Op::Fadd | Op::Fsub | Op::Fmul | Op::Eadd | Op::Esub | Op::Emul | Op::Emulf | Op::Sponge
+            Op::Fadd | Op::Fsub | Op::Fmul | Op::Eadd | Op::Esub | Op::Emul | Op::Emulf | Op::Sponge | Op::Compress
         )
     }
 }

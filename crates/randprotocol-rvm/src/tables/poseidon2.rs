@@ -16,10 +16,14 @@
 //! permuted in place — 8 reads + 8 writes on `RAM`. `IS_SPONGE` (Task 9's `SPONGE`
 //! instruction): the input is `[src(4) ‖ state(4..8)]` — four cells at `SRC_PTR` in lanes 0–3,
 //! the state's own lanes 4–7 at `PTR + 4` — and the output is written to all eight cells at
-//! `PTR` (4 + 4 + 8 `RAM` messages). The round arithmetic is identical for both; the kinds
-//! differ only in the input's provenance, which is what the two buses distinguish.
+//! `PTR` (4 + 4 + 8 `RAM` messages). `IS_COMPRESS` (Cut C's `COMPRESS`, one Merkle level): the
+//! running digest at `PTR` and the sibling at `SRC_PTR`, ordered by `BIT` into the input
+//! (`[digest ‖ sib]` when clear, `[sib ‖ digest]` when set — `MerkleTreeMmcs::verify_batch`'s
+//! rule), and lanes 0–3 of the output written back to `PTR` (4 + 4 + 4 `RAM` messages). The
+//! round arithmetic is identical for all three; the kinds differ only in the input's provenance
+//! and how much of the output is kept, which is what the three dispatch buses distinguish.
 use super::{bus, F};
-use crate::emulator::PermEvent;
+use crate::emulator::{PermEvent, PermKind};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
 use p3_lookup::{Count, InteractionBuilder};
@@ -49,7 +53,11 @@ pub mod col {
     /// 8 full rounds × 8 lanes + 22 partial rounds × 1 lane = 86 S-box intermediates
     /// (`x³ = (s + rc)³`; `x⁷` is `x3·x3·(s + rc)` in the output expression, degree 3).
     pub const X3_0: usize = OUT0 + 8;
-    pub const WIDTH: usize = X3_0 + 86;
+    /// Cut C: the third row kind's flag, and its index bit — the order of the children in the
+    /// input. `SRC_PTR` is reused as the sibling pointer.
+    pub const IS_COMPRESS: usize = X3_0 + 86;
+    pub const BIT: usize = IS_COMPRESS + 1;
+    pub const WIDTH: usize = BIT + 1;
 }
 use col::*;
 
@@ -79,10 +87,14 @@ where
         let (is_perm, is_sponge) = (v(IS_PERM), v(IS_SPONGE));
         b.assert_bool(is_perm.clone());
         b.assert_bool(is_sponge.clone());
-        b.assert_eq(is_perm.clone() + is_sponge.clone(), is_real.clone());
-        // AGENTS.md invariant 1: the SPONGE message's source pointer is constrained on every row
-        // kind that does not send it — zero there.
-        b.assert_zero((one.clone() - is_sponge.clone()) * v(SRC_PTR));
+        let is_compress = v(IS_COMPRESS);
+        b.assert_bool(is_compress.clone());
+        b.assert_eq(is_perm.clone() + is_sponge.clone() + is_compress.clone(), is_real.clone());
+        // AGENTS.md invariant 1: SRC_PTR is a message column of SPONGE and COMPRESS; zero
+        // elsewhere. BIT is COMPRESS's alone, boolean there and zero elsewhere.
+        b.assert_zero((one.clone() - is_sponge.clone() - is_compress.clone()) * v(SRC_PTR));
+        b.assert_bool(v(BIT));
+        b.assert_zero((one.clone() - is_compress.clone()) * v(BIT));
 
         // ── the permutation, 30 rounds, every row (padding included: the M3.1 discipline — a
         // row that is not a genuine chained permutation does not exist in this table) ──
@@ -156,6 +168,23 @@ where
             let addr = ptr.clone() + AB::Expr::from_u32(k as u32);
             bus::RAM.send(b, [addr, ts_w, v(OUT0 + k), one.clone()], Count::bounded(is_sponge.clone(), 1));
         }
+
+        // ── COMPRESS (Cut C): the ordered pair is the permutation input; the RAM reads carry the
+        // unordered children as degree-2 expressions of IN and BIT, so no extra value columns ──
+        bus::COMPRESS.table_entry(b, [clk.clone(), ptr.clone(), v(SRC_PTR), v(BIT)], is_compress.clone());
+        let bit = v(BIT);
+        for k in 0..4 {
+            // d_k = IN[k] + bit·(IN[4+k] − IN[k]);  s_k = IN[4+k] + bit·(IN[k] − IN[4+k]).
+            let d_k = v(IN0 + k) + bit.clone() * (v(IN0 + 4 + k) - v(IN0 + k));
+            let s_k = v(IN0 + 4 + k) + bit.clone() * (v(IN0 + k) - v(IN0 + 4 + k));
+            // The emulator's slots: state reads 0..3, sibling reads 4..7, write-backs 8..11.
+            let ts_d = sixteen.clone() * clk.clone() + AB::Expr::from_u32(k as u32);
+            let ts_s = sixteen.clone() * clk.clone() + AB::Expr::from_u32(4 + k as u32);
+            let ts_w = sixteen.clone() * clk.clone() + AB::Expr::from_u32(8 + k as u32);
+            bus::RAM.send(b, [ptr.clone() + AB::Expr::from_u32(k as u32), ts_d, d_k, AB::Expr::ZERO], Count::bounded(is_compress.clone(), 1));
+            bus::RAM.send(b, [v(SRC_PTR) + AB::Expr::from_u32(k as u32), ts_s, s_k, AB::Expr::ZERO], Count::bounded(is_compress.clone(), 1));
+            bus::RAM.send(b, [ptr.clone() + AB::Expr::from_u32(k as u32), ts_w, v(OUT0 + k), one.clone()], Count::bounded(is_compress.clone(), 1));
+        }
     }
 }
 
@@ -185,11 +214,16 @@ pub fn poseidon2_trace(events: &[(u32, PermEvent)], height: usize) -> RowMajorMa
                 r[IS_REAL] = F::ONE;
                 r[MULT] = F::ONE;
                 r[PTR] = F::from_u64(ev.ptr);
-                match ev.src {
-                    None => r[IS_PERM] = F::ONE,
-                    Some(src) => {
+                match ev.kind {
+                    PermKind::Perm => r[IS_PERM] = F::ONE,
+                    PermKind::Sponge { src } => {
                         r[IS_SPONGE] = F::ONE;
                         r[SRC_PTR] = F::from_u64(src);
+                    }
+                    PermKind::Compress { sib, bit } => {
+                        r[IS_COMPRESS] = F::ONE;
+                        r[SRC_PTR] = F::from_u64(sib);
+                        r[BIT] = F::from_bool(bit);
                     }
                 }
                 debug_assert_eq!(

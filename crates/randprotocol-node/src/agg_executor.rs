@@ -191,19 +191,22 @@ fn zkvm_profile(profile: randprotocol_core::types::FriProfile) -> FriProfile {
 
 /// The rVM tiers an aggregate proof may land at, per FRI profile (spec §3.3: "the register
 /// admits the rVM tiers {21, 22, 23} for the one registered inner shape; a proof at any other
-/// tier is invalid").
+/// tier is invalid" — the constraint-set-8 rungs). The phase-2 row cuts (circuits `75b7893`,
+/// `recursion/docs/04-phase2-row-cuts.md`) moved every rung one tier down: production N=1 lands
+/// at tier 20 (893 880 rows), N=2 at 21, N=3 and N=4 at 22; the test profile's N=1/2/3 at
+/// 18/19/20. The sets below are those rungs — three a profile, as the spec sized them.
 ///
 /// Nothing enforced this before (audit v3, AGG-3). `Machine::verify` accepts any tier on the
 /// ladder and builds the verifier key for whatever the proof declares *before* verifying it — so
 /// a proposer could put an invalid aggregate at an unwarmed tier in a block and every replica
 /// would pay a 30–70 s key build, on the consensus loop at block apply, before refusing it.
 ///
-/// Production is the spec's three; test is the one the fixtures and the warm path use, plus its
-/// two neighbours for the same N=2/N=3 reason.
+/// Production is the spec's three, one tier down; test is the one the fixtures and the warm path
+/// use, plus its two neighbours for the same N=2/N=3 reason.
 pub fn admitted_tiers(profile: FriProfile) -> &'static [u8] {
     match profile {
-        FriProfile::Test => &[19, 20, 21],
-        FriProfile::Production => &[21, 22, 23],
+        FriProfile::Test => &[18, 19, 20],
+        FriProfile::Production => &[20, 21, 22],
     }
 }
 
@@ -673,20 +676,21 @@ mod tests {
     }
 
     /// The rescan's ZKQ-2: the tier gate read the proof's `usize` tier `as u8`, which wraps — a
-    /// header declaring tier 277 was gated as 21, an admitted test tier (and 533 as 21, …). The
-    /// rVM's own `check_declared_heights` refuses such a tier later, but the gate is the one
-    /// admission runs first and it must say what the proof says.
+    /// header declaring tier 276 is gated as 20, an admitted test tier (and 532 as 20, …; at
+    /// constraint set 8 the case was 277 as 21). The rVM's own `check_declared_heights` refuses
+    /// such a tier later, but the gate is the one admission runs first and it must say what the
+    /// proof says.
     #[test]
     fn a_tier_past_u8_is_refused_not_wrapped_into_an_admitted_one() {
         let ex = AggExecutor::new(FriProfile::Test);
         let shape = fixture_free_shape();
         let covered = vec![CoveredBundle { public_values: [7; randprotocol_core::types::pv::NUM], shape }];
         let binding = [3u32; 8];
-        assert!(admitted_tiers(FriProfile::Test).contains(&((277usize) as u8)), "277 wraps to an admitted tier");
-        let proof = crafted_proof(&shape, &covered, &binding, 277, 0);
+        assert!(admitted_tiers(FriProfile::Test).contains(&((276usize) as u8)), "276 wraps to an admitted tier");
+        let proof = crafted_proof(&shape, &covered, &binding, 276, 0);
         match ex.check_aggregate_header(&proof) {
-            Err(ConfidentialError::InvalidAggregateProof(m)) => assert!(m.contains("277"), "{m}"),
-            other => panic!("tier 277 must be refused as itself, got {other:?}"),
+            Err(ConfidentialError::InvalidAggregateProof(m)) => assert!(m.contains("276"), "{m}"),
+            other => panic!("tier 276 must be refused as itself, got {other:?}"),
         }
         assert_eq!(ex.program_builds(), 0);
     }
@@ -754,8 +758,8 @@ mod tests {
         );
     }
 
-    /// Audit v3, AGG-3: the spec admits rVM tiers {21, 22, 23} (production) and nothing checked
-    /// it. `Machine::verify` builds the verifier key for whatever tier the proof declares *before*
+    /// Audit v3, AGG-3: the spec admits three rVM tiers (production {21, 22, 23} at constraint
+    /// set 8, {20, 21, 22} since the phase-2 row cuts) and nothing checked it. `Machine::verify` builds the verifier key for whatever tier the proof declares *before*
     /// verifying the proof, so a proposer could put an invalid aggregate at an unwarmed tier in a
     /// block and every replica would pay a 30–70 s key build — on the consensus loop, at block
     /// apply — before refusing it.
@@ -764,7 +768,7 @@ mod tests {
         for t in admitted_tiers(FriProfile::Production) {
             assert!(check_tier(FriProfile::Production, *t).is_ok(), "tier {t} is admitted");
         }
-        for t in [8u8, 18, 20, 24, 255] {
+        for t in [8u8, 18, 19, 23, 255] {
             match check_tier(FriProfile::Production, t) {
                 Err(ConfidentialError::InvalidAggregateProof(m)) => {
                     assert!(m.contains(&t.to_string()), "the refusal names the tier: {m}")
@@ -773,8 +777,11 @@ mod tests {
             }
         }
         // The profiles admit different sets: a test-profile proof's tier is not a production one.
+        assert!(check_tier(FriProfile::Test, 18).is_ok());
         assert!(check_tier(FriProfile::Test, 19).is_ok());
+        assert!(check_tier(FriProfile::Production, 18).is_err());
         assert!(check_tier(FriProfile::Production, 19).is_err());
+        assert!(check_tier(FriProfile::Test, 21).is_err());
         assert!(check_tier(FriProfile::Test, 23).is_err());
     }
 
@@ -809,7 +816,11 @@ mod tests {
     /// `6d4f124`'s `docs/02-aggregate.md`, measured on a fresh cs8 fixture cache. The final
     /// review's `gas_max` absorb term (circuits `09b032f`) moved each fixture proof's default
     /// `GAS` 16383 → 20479, so the cache was regenerated and the list and its digest moved again
-    /// (`36b414c0…` → `5e3d7fb2…`, circuits `6b18928`); the vk digest did not.
+    /// (`36b414c0…` → `5e3d7fb2…`, circuits `6b18928`); the vk digest did not. The phase-2 re-vendor
+    /// (circuits `75b7893`, 2026-10-04) runs against the cache re-proved on 2026-10-03
+    /// (`~/rand-agg-512-results/out/fixtures`; the droplet sync had brought only the logs), so the
+    /// list and its digest moved once more with the notes (`5e3d7fb2…` → `3534960f…`) — data, not
+    /// program: the vk digest is unchanged, as `recursion/docs/04` says of the inner machine.
     #[test]
     fn the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte() {
         use p3_field::PrimeField64;
@@ -836,7 +847,7 @@ mod tests {
         assert_eq!(hex_words(&list), INTERFACE_LIST_HEX, "the pinned 118-word interface list");
         assert_eq!(
             hex_words(&randprotocol_rvm::public_values::public_digest(&list)),
-            "5e3d7fb2bd1f5342e49577650a281996b656d1fa4e8f3eff7ee82adefe9d1ed6",
+            "3534960f6757e6e034518a5a1926f6107c9cda7c9d5d96296b6d4ed5c3984629",
             "the pinned interface digest"
         );
     }
@@ -852,31 +863,31 @@ mod tests {
         "346ee1841980e46a3501f5b04cdf40dd3208e5b1c67360285353cf7a0b735fb9",
         "000000000000000300000000a662000000000000a662000100000000a6620002",
         "00000000a662000300000000a662000400000000a662000500000000a6620006",
-        "00000000a66200070000000000000000000000000000000e00000000fcf4c2ca",
-        "00000000a634a055000000009279293b00000000ee8d851600000000c5717852",
-        "000000006d0561ed000000008dd81da70000000018e0b601000000006f35274a",
+        "00000000a66200070000000000000000000000000000000e00000000b6c9c0dc",
+        "000000009750a10a00000000c111097f00000000686c450c00000000a31856a0",
+        "00000000724c667300000000a6cf2e6a00000000c22612ba000000006f35274a",
         "000000000371953700000000a8a42560000000004b291c6600000000b7c2de0e",
-        "00000000d6bf7fcf00000000182b470b00000000fb4abd6c000000007bbf5012",
-        "000000006c808b59000000006aea0597000000002d75974e00000000b566bfb9",
-        "00000000aba9b10300000000c8df477b00000000bf85ec8f00000000934a2759",
+        "00000000d6bf7fcf00000000182b470b00000000fb4abd6c000000001db4f72d",
+        "000000004852186000000000351c3f410000000001a6c33700000000f692eaf4",
+        "00000000fbf5508d00000000ae3d9c4d000000009d7a3bc200000000934a2759",
         "00000000d5389ac8000000002e612784000000008639ed090000000085f58a21",
         "000000004448d889000000006bb9c915000000000671dc2c0000000000004fff",
-        "0000000000000000000000000000000e00000000436464ca00000000167c06a6",
-        "00000000528b45b200000000474c4ebf00000000aba47cca00000000d89d7ea3",
-        "00000000e4cf09c4000000006dbb25fc000000006f35274a0000000003719537",
+        "0000000000000000000000000000000e00000000d89b0c4e000000000c79315f",
+        "0000000054d269dd000000002d93469600000000373d607000000000efe6b09b",
+        "00000000c8a1f6da000000008f300cc6000000006f35274a0000000003719537",
         "00000000a8a42560000000004b291c6600000000b7c2de0e00000000d6bf7fcf",
-        "00000000182b470b00000000fb4abd6c000000007d2198900000000032ef87b1",
-        "000000005cbf60c5000000005369151400000000f796dfdc000000006d341cea",
-        "00000000ee65f7c10000000083ad87a500000000934a275900000000d5389ac8",
+        "00000000182b470b00000000fb4abd6c00000000bf4eccca00000000930235f1",
+        "0000000039c139bf000000007ffa79d900000000276ab59900000000b260698b",
+        "000000009bf06006000000008ed2b5ea00000000934a275900000000d5389ac8",
         "000000002e612784000000008639ed090000000085f58a21000000004448d889",
         "000000006bb9c915000000000671dc2c0000000000004fff0000000000000000",
-        "000000000000000e00000000d5e68c3200000000b1bfa0e60000000054a9fa70",
-        "000000006db05c83000000008c8a8cfc000000007d9a619100000000834acb63",
-        "00000000b4292759000000006f35274a000000000371953700000000a8a42560",
+        "000000000000000e0000000084b7fba400000000917c878a0000000054d35f8f",
+        "00000000e901961100000000e6cb99f80000000088b794b10000000098fcab7f",
+        "00000000d61a1159000000006f35274a000000000371953700000000a8a42560",
         "000000004b291c6600000000b7c2de0e00000000d6bf7fcf00000000182b470b",
-        "00000000fb4abd6c0000000073dc4e1e00000000bf53608900000000ccde0969",
-        "0000000022e6fe7a00000000ac6bcac10000000078ea8c8c0000000018e98906",
-        "000000005840b1cf00000000934a275900000000d5389ac8000000002e612784",
+        "00000000fb4abd6c00000000101f1f09000000001820409400000000f239b1a0",
+        "00000000d2e4449100000000db29d5cc000000000a2fab2700000000ae681b7e",
+        "00000000bdb2470100000000934a275900000000d5389ac8000000002e612784",
         "000000008639ed090000000085f58a21000000004448d889000000006bb9c915",
         "000000000671dc2c0000000000004fff",
     );
@@ -905,11 +916,11 @@ mod tests {
 
     /// The real round-trip: one fixture bundle proof aggregated by the rVM, the proof bytes
     /// verified through the wrapper, the covered bundle's `OUT0..7` back. `#[ignore]`d out of
-    /// the gates: the tier-19 prove peaks around 30 GB and takes tens of minutes contended —
-    /// the runbook's job, run alone:
+    /// the gates: the tier-18 prove (tier 19 before the phase-2 row cuts) holds tens of GB live and
+    /// takes tens of minutes contended — the runbook's job, run alone:
     /// `RECURSION_FIXTURES=... cargo test --release -p randprotocol-node --lib agg_executor -- --ignored --nocapture`
     #[test]
-    #[ignore = "a real tier-19 rVM aggregate prove (~30 GB peak, tens of minutes contended); run alone"]
+    #[ignore = "a real tier-18 rVM aggregate prove (projected ≈ 50 GB live, tens of minutes contended); run alone"]
     fn an_aggregate_of_one_fixture_bundle_round_trips_through_the_wrapper() {
         let (shape, cov) = covered(0);
         let inner = fixture_proof(0);

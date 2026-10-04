@@ -5,12 +5,12 @@ mod common;
 use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_matrix::Matrix;
 use rand::SeedableRng;
-use randprotocol_rvm::emulator::PermEvent;
+use randprotocol_rvm::emulator::{PermEvent, PermKind};
 use randprotocol_rvm::isa::F;
 use randprotocol_rvm::tables::poseidon2::{col, poseidon2_log_height, poseidon2_trace, ROUNDS_F, ROUNDS_P};
 
 fn event(ptr: u64, input: [F; 8]) -> PermEvent {
-    PermEvent { ptr, input, output: randprotocol_zkvm::hash::permute_state(input), src: None }
+    PermEvent { ptr, input, output: randprotocol_zkvm::hash::permute_state(input), kind: PermKind::Perm }
 }
 
 fn random_state(rng: &mut impl rand::Rng) -> [F; 8] {
@@ -77,8 +77,8 @@ fn the_round_constants_are_the_machines_own_draw() {
 
 #[test]
 fn the_width_and_height_rules_are_pinned() {
-    assert_eq!(col::WIDTH, 341, "the plan's designed width, pinned");
-    assert_eq!(col::OUT0 + 8 + 86, col::WIDTH);
+    assert_eq!(col::WIDTH, 343, "the plan's designed width + Cut C's IS_COMPRESS and BIT, pinned");
+    assert_eq!(col::OUT0 + 8 + 86 + 2, col::WIDTH);
     assert_eq!(poseidon2_log_height(0), 4, "the floor");
     assert_eq!(poseidon2_log_height(51_595), 16, "the measured production count fits 2^16");
     assert_eq!(poseidon2_log_height(51_606), 16);
@@ -123,4 +123,18 @@ fn the_permutation_matches_its_known_answers() {
         assert_eq!(host, scalar, "input {k}: the host permutation and the AIR's scalar reference disagree on this machine");
         assert_eq!(host, want[k].to_vec(), "input {k}: the permutation's known answer");
     }
+}
+
+/// Cut C: a `COMPRESS` row (bit set, so the children swap) is the chip's third row kind — the
+/// cpu's dispatch on `COMPRESS`, the chip's 4 + 4 reads and 4 writes on `RAM`, all balanced in a
+/// real proof.
+#[test]
+fn a_compress_row_proves_and_verifies() {
+    use randprotocol_rvm::machine::{build_traces, FriProfile, Machine, Tier};
+    let p = common::compress_program(1);
+    let exec = randprotocol_rvm::emulator::execute(&p, &[], 1000).unwrap();
+    let t = build_traces(&p, &exec, Tier(8)).unwrap();
+    let m = Machine::new(FriProfile::Test);
+    let proof = m.prove_traces(&p, &t, Tier(8));
+    m.verify(&p, &proof).unwrap();
 }

@@ -121,8 +121,13 @@ fn the_self_program_digest_is_deterministic_and_distinct() {
     // Pinned at the toy fixture's shape (2026-09-28), constraint set 7: VERIFIER-1's per-round
     // assertion and HCS-1's rVM key salts (the program embeds the key) both moved it —
     // `c18fa9eadf161ab625fc23048a6bcd4020eea8eaac33720d34e17f7148cd4804` before either.
+    // Phase 2's row cuts (2026-10-03) moved it again: the shared pipeline hints input openings
+    // into height-group buffers (Cut A), `hint_array` emits `HINTN` (Cut B) and the Merkle walks
+    // emit `COMPRESS` (Cut C), and the self-verifier compiles the rVM's wider cpu (82) and
+    // poseidon2 (343) tables — `6b2f058e60ffdf6a77091b932710513191688e4bdc59b2ecdc65b0dd5039033b`
+    // in constraint set 7/8 before them.
     let hex: String = d1.iter().map(|w| format!("{:016x}", p3_field::PrimeField64::as_canonical_u64(w))).collect();
-    assert_eq!(hex, "6b2f058e60ffdf6a77091b932710513191688e4bdc59b2ecdc65b0dd5039033b",
+    assert_eq!(hex, "18514c2aa0ad8d6a5aa7ea8baa65754f9137db5f1ad1d60943930add0becde67",
                "the self-verifier's digest at the toy fixture shape");
 
     // And it is not the single-proof RV32-machine verifier's digest for the same profile: build
@@ -329,14 +334,19 @@ fn the_self_verifiers_measured_cost_at_two_fixture_shapes() {
     // against the zero register over its trap, so +1 row and +2 instructions per round, nothing
     // else: toy +5 rows / +10 instructions (five rounds), busy +9 / +18 (nine rounds) (was
     // (276555, 7498, 405853, 278398, 29575) and (368761, 9132, 481628, 370864, 35407)).
+    // Phase 2's row cuts (2026-10-03, `docs/04-phase2-row-cuts.md`): the shared pipeline's three
+    // cuts (height-group hint buffers, `HINTN`, `COMPRESS`) and the rVM's own wider tables, which
+    // the self-verifier opens and evaluates (cpu 72 → 82 columns, poseidon2 341 → 343, the
+    // `COMPRESS` bus): toy 276 560 → 152 527 rows, busy 368 770 → 188 390 (was
+    // (276560, 7498, 405853, 278408, 29575) and (368770, 9132, 481628, 370882, 35407)).
     assert_eq!(
         (r.cpu_rows, r.permutations, r.mem_accesses, r.program_instrs, r.witness_words),
-        (276560, 7498, 405853, 278408, 29575),
+        (152527, 7660, 345333, 154375, 30255),
         "the tier-8 toy fixture's CycleReport, pinned"
     );
     assert_eq!(
         (rb.cpu_rows, rb.permutations, rb.mem_accesses, rb.program_instrs, rb.witness_words),
-        (368770, 9132, 481628, 370882, 35407),
+        (188390, 9310, 388321, 190502, 36087),
         "the busy fixture's CycleReport, pinned"
     );
 
@@ -349,9 +359,12 @@ fn the_self_verifiers_measured_cost_at_two_fixture_shapes() {
     // measured only the CycleReport deltas above (its run stopped at the first failing pin);
     // this one was measured here. OPCODES-4 and ZKQ-3 added 102 more to both (7 263 / 7 543
     // after RVM-1): the public table's two new constraints and the cpu's two limb groups.
+    // Phase 2's row cuts (2026-10-03) added 480 more to both (7 365 / 7 645 before): `HINTN`'s
+    // eight RAM writes and `COMPRESS`'s lookup on the cpu row, two more decode selectors, and the
+    // poseidon2 chip's third row kind (`IS_COMPRESS`, `BIT`, its twelve RAM messages).
     let p5a: usize = vp.phase5.iter().map(|c| c.instrs).sum();
     let p5b: usize = vp_b.phase5.iter().map(|c| c.instrs).sum();
-    assert_eq!((p5a, p5b), (7365, 7645), "phase 5 varies with the degree bits, measured");
+    assert_eq!((p5a, p5b), (7845, 8125), "phase 5 varies with the degree bits, measured");
 }
 
 /// VERIFIER-1 for the rVM's own proofs: the rVM machine grinds zero commit-phase bits too

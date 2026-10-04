@@ -375,6 +375,70 @@ fn a_sponge_row_claiming_the_plain_poseidon2_kind_is_rejected() {
     assert!(rejects(|| prove_and_verify(&m, &p, &t)));
 }
 
+// ── Cut B: HINTN, eight tape words into eight cells in one cpu row ────────────────────────────
+
+fn hintn_setup() -> (Machine, Program, Traces) {
+    let p = Program { instrs: vec![
+        i(Op::Faddi, 1, 0, 100),
+        i(Op::Hintn, 0, 1, 0),
+        i(Op::Load, 2, 1, 7),
+        // R5's four published words: the eighth tape word, then three zeros.
+        i(Op::Public, 0, 2, 0),
+        i(Op::Public, 0, 0, 0),
+        i(Op::Public, 0, 0, 0),
+        i(Op::Public, 0, 0, 0),
+        i(Op::Halt, 0, 0, 0),
+    ], checkpoints: vec![] };
+    let tape: Vec<F> = (1..=8).map(F::from_u64).collect();
+    let m = Machine::new(FriProfile::Test);
+    let exec = execute(&p, &tape, 100).unwrap();
+    let t = build_traces(&p, &exec, Tier(8)).unwrap();
+    (m, p, t)
+}
+
+#[test]
+fn honest_hintn_traces_pass() {
+    let (m, p, t) = hintn_setup();
+    prove_and_verify(&m, &p, &t).unwrap();
+}
+
+/// The HINTN row's base moved to `p − 1` (so `A0 + B + 7 = 6`, in range by the top alone) with the
+/// group-3 base limbs forged to spell 0: refused by `Machine::verify`. What refuses it first is
+/// not the range groups but the row's `REG` read of `ra` — the edited `A0` no longer matches the
+/// `r1` the register table holds — so this is a whole-machine forgery test, not a test of the
+/// range gating. The range gating on HINTN's base and top is tested at the AIR, with the operand
+/// left free, by `tests/cpu.rs`'s ZKQ-3 cases (`a_multi_cell_access_whose_base_wraps_below_zero_is_refused`,
+/// its "HINTN at A0 + B = p − 1" case and its `2^24` top-end control).
+#[test]
+fn a_hintn_base_just_below_zero_with_forged_limbs_is_rejected() {
+    let (m, p, mut t) = hintn_setup();
+    let w = cpu::col::WIDTH;
+    let row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::SEL0 + Op::Hintn as usize] == F::ONE).unwrap();
+    t.cpu.values[row * w + cpu::col::A0] = -F::ONE; // p − 1, with B = 0
+    for c in [cpu::col::G3LIMB0, cpu::col::G3LIMB1, cpu::col::G3LIMB2] {
+        t.cpu.values[row * w + c] = F::ZERO;
+    }
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)));
+}
+
+/// The top cell at `2^24`: base `2^24 − 7` with the group-1 limbs forged to spell `2^24 − 1`:
+/// refused by `Machine::verify`, first by the row's `REG` read of `ra` (the edited `A0` no longer
+/// matches `r1`), not by the range groups — as the test above. The range gating at HINTN's top end
+/// is `tests/cpu.rs`'s `a_multi_cell_access_whose_base_wraps_below_zero_is_refused` (its HINTN
+/// `2^24` control).
+#[test]
+fn a_hintn_run_ending_at_two_to_the_twentyfour_with_forged_limbs_is_rejected() {
+    let (m, p, mut t) = hintn_setup();
+    let w = cpu::col::WIDTH;
+    let row = (0..t.cpu.height()).find(|r| t.cpu.values[r * w + cpu::col::SEL0 + Op::Hintn as usize] == F::ONE).unwrap();
+    t.cpu.values[row * w + cpu::col::A0] = F::from_u64((1 << 24) - 7);
+    let top = (1u64 << 24) - 1;
+    for (k, c) in [cpu::col::LIMB0, cpu::col::LIMB1, cpu::col::LIMB2].iter().enumerate() {
+        t.cpu.values[row * w + c] = F::from_u64((top >> (8 * k)) & 0xff);
+    }
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)));
+}
+
 // ── Task 10: the full-suite pass — the remaining per-table tamper vectors ─────────────────────
 
 #[test]
@@ -1028,4 +1092,234 @@ fn an_extension_pair_starting_at_r31_is_rejected() {
     let ram = cpu::ram_accesses(&exec.events);
     let t = traces_from_parts(&p, &exec, Tier(8), &reg, &ram, None);
     assert!(rejects(|| prove_and_verify(&m, &p, &t)), "ZKQ-3: a proof of LOADE r31 (a pair reaching register 32) VERIFIED");
+}
+
+// ── issue #45 B1: the end-to-end forged-aggregate exercise against the fixed rVM ───────────────
+//
+// The toy RVM-1 vectors above (`a_forged_storee_high_lane_is_rejected` and the spill twin) isolate
+// the freedom: a stored extension high lane the constraints did not bind, surfaced to a published
+// word so nothing else could catch it. #45 asks the same question at the scale that matters — the
+// *aggregate verifier* over a real inner proof, which stores ~14 370 such lanes per inner proof
+// (the REDUCE descriptors and the register allocator's extension spills). Two legs:
+//
+//  1. the malicious inner proof: a tampered bundle proof that does not verify natively cannot be
+//     aggregated at all — the tape's transcript replay is the native verifier's own checks, so a
+//     bad proof never reaches the prover (in-suite, no proving);
+//  2. the forged stored lane inside the aggregate verifier's own execution: forge one STOREE high
+//     lane the way RVM-1 describes and show the *fixed* rVM refuses the aggregate proof. This is a
+//     tier-19 rVM prove (tier 18 since phase 2's row cuts), so it is `#[ignore]`d for the big machine
+//     (95.5 GB measured on Linux at tier 19; `docs/04-phase2-row-cuts.md` has the live heap).
+//
+// What the red-first run found (the 512 GB box, 2026-10-01, `EXT_READ_RD` emptied in a scratch copy
+// — RVM-1's fix alone reverted, never committed):
+//
+//  - the toy vectors above go red: "the forged run VERIFIED ... publishing [12648430, 11, 11, 22]"
+//    (and the spill twin's [1378, 2678, 11, 12648430]) — the forgery is accepted;
+//  - leg 2 below stays green on the reverted rVM. Its teeth are the RAM table's read-after-write,
+//    not RVM-1: the forged lane is written but the spill's reload (a LOADE 493 rows later) still
+//    reads the honest value, so the RAM log disagrees with itself ("read does not match last write
+//    at addr 0x3"). It is kept as the fixed rVM's refusal of the un-propagated forgery and does
+//    not by itself test RVM-1;
+//  - letting the program carry the forged lane forward (the emulator's STOREE storing 0xC0FFEE at
+//    one clock — the fully propagated forgery) at 41 of the run's 14 788 STOREE rows traps every
+//    time in the verifier's own checks: `commit phase root[*]`, `quotient identity[*]`,
+//    `sample_bits decomposition`, `lookup terminal sum`. A random lane value is caught by the
+//    arithmetic that consumes it; a lane value *chosen* to cancel a failing check (the report's
+//    §6 path) was not constructed, so that the reverted rVM cannot be forged at this scale is not
+//    claimed — what RVM-1's fix removes is exactly that choice, and the toy vectors are its red.
+
+use randprotocol_rvm::programs::verify_rv32n;
+use randprotocol_rvm::shape::{InnerKey as ZkInnerKey, InnerShape as ZkInnerShape};
+use randprotocol_rvm::witness::WitnessTape;
+
+fn agg_shape_and_key(p: &randprotocol_zkvm::machine::Proof) -> (ZkInnerShape, ZkInnerKey) {
+    let shape = ZkInnerShape::of(
+        FriProfile::Test,
+        p.tier,
+        p.program_log_height,
+        p.input_log_height,
+        p.keccak_log_height,
+        p.sha256_log_height,
+        p.public_log_height,
+        p.mem_log_height,
+    );
+    let key = ZkInnerKey::of(FriProfile::Test, &shape);
+    (shape, key)
+}
+
+/// Leg 1: a bundle proof tampered so it no longer verifies natively cannot be aggregated — the
+/// aggregate tape's transcript replay refuses it before any rVM proving. (In-suite, emulation only.)
+#[test]
+fn a_malicious_inner_proof_cannot_be_aggregated() {
+    use randprotocol_rvm::aggregate::{aggregate, AggregateError, InnerVerifierKey};
+    let mut bp = common::bundle_proofs(FriProfile::Test, 1).pop().unwrap();
+    let zk = randprotocol_zkvm::machine::Machine::new(FriProfile::Test);
+    zk.verify(&bp.hc, &bp.proof).expect("the honest inner proof verifies natively");
+
+    // Tamper one published output word: still 35 canonical values (the shape check passes), but no
+    // longer the proof's own transcript.
+    bp.proof.public_values[randprotocol_zkvm::tables::cpu::pv::OUT0] += 1;
+    assert!(zk.verify(&bp.hc, &bp.proof).is_err(), "the tampered inner proof does not verify natively");
+
+    let (shape, key) = agg_shape_and_key(&bp.proof);
+    let vk = InnerVerifierKey { shape, key };
+    let m = Machine::new(FriProfile::Test);
+    match aggregate(&m, &vk, std::slice::from_ref(&bp.proof), &common::TEST_BINDING, None) {
+        Err(AggregateError::Tape(_)) => {}
+        Err(e) => panic!("a malicious inner proof must be refused at the tape replay, got {e:?}"),
+        Ok(_) => panic!("a malicious inner proof must never yield an aggregate"),
+    }
+}
+
+/// Forge a STOREE's stored high lane in an aggregate-verifier execution, keeping the RAM store side
+/// consistent (the high cell's write carries the forged value). `rd + 1`'s register value is left
+/// honest, so the fix's `REG.read(rd+1)` disagrees with it; the unfixed register table omits that
+/// read entirely. Returns the forged execution and the index of the STOREE spill it hit.
+fn forge_a_stored_spill(exec: &mut Execution) -> usize {
+    // A register-allocator spill of an extension value: STOREE with `ra == r0` (the absolute-address
+    // form) writing two cells. The aggregate verifier makes thousands.
+    let idx = exec
+        .events
+        .iter()
+        .position(|e| e.instr.op == Op::Storee && e.instr.ra == 0 && e.mem.len() == 2 && e.mem[1].is_write)
+        .expect("the aggregate verifier spills extension values with STOREE");
+    let e = &mut exec.events[idx];
+    e.d[1] = F::from_u64(FORGED);
+    e.mem[1].value = F::from_u64(FORGED);
+    idx
+}
+
+/// Leg 2: the forged stored lane inside the real aggregate verifier, refused by the fixed rVM with
+/// the unfixed builder's register table (no `rd + 1` read) and with the fixed table carrying the
+/// forged read. A tier-19 rVM prove per variant, so `#[ignore]`d. On the fixed rVM the REG read the
+/// fix adds is unmatched; the un-propagated reload also breaks the RAM table's read-after-write,
+/// which is why this test stays green with RVM-1 reverted (the block comment above).
+#[test]
+#[ignore = "issue45 B1: the forged-aggregate exercise, tier 18 rVM prove since phase 2 (tier 19 before: 95.5 GB measured on Linux), ~30 min/variant. Run: \
+            cargo test --release -p recursion --test cheating a_forged_stored_high_lane_in_the_aggregate_verifier_is_refused -- --ignored --nocapture"]
+fn a_forged_stored_high_lane_in_the_aggregate_verifier_is_refused() {
+    let bp = common::bundle_proofs(FriProfile::Test, 1).pop().unwrap();
+    let (shape, key) = agg_shape_and_key(&bp.proof);
+    let program = verify_rv32n(&shape, &key, randprotocol_rvm::dsl::Checkpoints::Off).program;
+    let tape = WitnessTape::build_n(FriProfile::Test, &shape, &key, std::slice::from_ref(&bp.proof), &common::TEST_BINDING).unwrap();
+    let m = Machine::new(FriProfile::Test);
+
+    let honest = execute(&program, &tape.words, 1 << 24).expect("the honest aggregate accepts");
+    let tier = Tier::for_cycles(honest.cpu_rows()).expect("the N=1 aggregate has a tier");
+    assert_eq!(tier, Tier(18), "the test-profile N=1 aggregate is tier 18 (231 224 rows since phase 2's row cuts; tier 19 before)");
+    // The reduce trace depends only on REDUCE events, which the STOREE forgery does not touch, so
+    // the honest build's reduce table is the one the forged trace uses.
+    let honest_traces = build_traces(&program, &honest, tier).unwrap();
+    let reduce = (honest_traces.reduce.clone().unwrap(), honest_traces.reduce_log_height);
+
+    let mut forged = honest.clone();
+    let storee = forge_a_stored_spill(&mut forged);
+    eprintln!(
+        "forged the stored high lane of STOREE event {storee} (of {} events) to {FORGED:#x}",
+        forged.events.len()
+    );
+    let ram = cpu::ram_accesses(&forged.events);
+    let reg_fixed = cpu::register_accesses(&forged.events);
+
+    // Variant (2): the unfixed builder's register table — no `rd + 1` read on any STOREE row.
+    let reg_unfixed: Vec<randprotocol_rvm::emulator::MemAccess> = reg_fixed
+        .iter()
+        .copied()
+        .filter(|a| !(a.ts % 16 == TS_RD1_READ && forged.events[(a.ts / 16) as usize].instr.op == Op::Storee))
+        .collect();
+    let t = traces_from_parts(&program, &forged, tier, &reg_unfixed, &ram, Some(reduce.clone()));
+    assert!(
+        rejects(|| prove_and_verify_at(&m, &program, &t, tier)),
+        "the forged aggregate VERIFIED with the unfixed register table"
+    );
+
+    // Variant (3): the fixed register table, carrying the forged `rd + 1` read.
+    let t = traces_from_parts(&program, &forged, tier, &reg_fixed, &ram, Some(reduce));
+    assert!(
+        rejects(|| prove_and_verify_at(&m, &program, &t, tier)),
+        "the forged aggregate VERIFIED with the register table carrying its forged read"
+    );
+}
+
+// ── Cut C: COMPRESS, the poseidon2 chip's third row kind — one forgery per new invariant ──────
+//
+// Each test below establishes that `Machine::verify` refuses its edit; the constraint each one
+// targets is named in its comment, but which check fires first is not pinned. The spec's §5 case
+// "an output lane written to the sibling instead of the state" has no test: it is not expressible
+// by a trace edit, since the chip's write address is the expression `PTR + k`, never a free column.
+
+/// `tests/emulator.rs`'s `bit = 1` program (`common::compress_program`): one `COMPRESS` whose
+/// children swap, so a forgery that un-swaps them is visible.
+fn compress_setup() -> (Machine, Program, Traces) {
+    let p = common::compress_program(1);
+    let exec = execute(&p, &[], 10_000).unwrap();
+    let t = build_traces(&p, &exec, Tier(8)).unwrap();
+    (Machine::new(FriProfile::Test), p, t)
+}
+
+fn compress_row(t: &Traces) -> usize {
+    let w = poseidon2::col::WIDTH;
+    (0..t.poseidon2.height()).find(|r| t.poseidon2.values[r * w + poseidon2::col::IS_COMPRESS] == F::ONE).unwrap()
+}
+
+#[test]
+fn honest_compress_traces_pass() {
+    let (m, p, t) = compress_setup();
+    prove_and_verify(&m, &p, &t).unwrap();
+}
+
+/// BIT = 2 on the chip row: refused by `Machine::verify` (the target is `assert_bool(BIT)`).
+#[test]
+fn a_compress_row_with_a_non_boolean_bit_is_rejected() {
+    let (m, p, mut t) = compress_setup();
+    let w = poseidon2::col::WIDTH;
+    let row = compress_row(&t);
+    t.poseidon2.values[row * w + poseidon2::col::BIT] = F::from_u64(2);
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)));
+}
+
+/// The chip row's BIT flipped against the cpu row's D0: refused by `Machine::verify` (the targets
+/// are the COMPRESS bus message, which no longer matches, and the RAM reads, now claiming swapped
+/// children).
+#[test]
+fn a_compress_row_whose_bit_disagrees_with_the_dispatch_is_rejected() {
+    let (m, p, mut t) = compress_setup();
+    let w = poseidon2::col::WIDTH;
+    let row = compress_row(&t);
+    t.poseidon2.values[row * w + poseidon2::col::BIT] = F::ZERO;
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)));
+}
+
+/// The row claims the plain kind with BIT still set: refused by `Machine::verify` (the target is
+/// `(1 − IS_COMPRESS)·BIT = 0`).
+#[test]
+fn a_compress_row_claiming_the_plain_kind_is_rejected() {
+    let (m, p, mut t) = compress_setup();
+    let w = poseidon2::col::WIDTH;
+    let row = compress_row(&t);
+    t.poseidon2.values[row * w + poseidon2::col::IS_COMPRESS] = F::ZERO;
+    t.poseidon2.values[row * w + poseidon2::col::IS_PERM] = F::ONE;
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)));
+}
+
+/// The sibling pointer moved by one cell: refused by `Machine::verify` (the target is the four
+/// sibling reads, which find no matching writes).
+#[test]
+fn a_compress_row_reading_the_sibling_from_the_wrong_address_is_rejected() {
+    let (m, p, mut t) = compress_setup();
+    let w = poseidon2::col::WIDTH;
+    let row = compress_row(&t);
+    t.poseidon2.values[row * w + poseidon2::col::SRC_PTR] += F::ONE;
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)));
+}
+
+/// A padding row with IS_COMPRESS set: refused by `Machine::verify` (the targets are
+/// `MULT = IS_REAL` and the kind sum).
+#[test]
+fn a_padding_row_claiming_compress_is_rejected() {
+    let (m, p, mut t) = compress_setup();
+    let w = poseidon2::col::WIDTH;
+    let row = (0..t.poseidon2.height()).rev().find(|r| t.poseidon2.values[r * w + poseidon2::col::IS_REAL] == F::ZERO).unwrap();
+    t.poseidon2.values[row * w + poseidon2::col::IS_COMPRESS] = F::ONE;
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)));
 }

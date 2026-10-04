@@ -281,14 +281,17 @@ fn the_committed_program_digest_is_reproducible() {
 // ── M5.2 Task 10: the test-profile exit twin ──────────────────────────────────────────────────
 
 /// The Task-10 twin: **the post-cut verifier program over one real test-profile bundle proof,
-/// proved and verified natively** — 441 643 rows, tier 19, with the exact shape of Task 10's
-/// production exit (tier 21, ~2 M rows). `#[ignore]`d for its cost (~11–14 GB peak per the
-/// sizing derivation in `recursion/docs/01-rvm-machine.md`, ~2–5 min). The sibling
+/// proved and verified natively** — 230 950 rows, tier 18 since phase 2's row cuts (461 988 rows
+/// at tier 19 in constraint set 8, 441 643 in constraint set 6), with the exact shape of Task 10's
+/// production exit (tier 20, 893 606 rows). `#[ignore]`d for its cost: the tier-19 twin was
+/// killed at 78.7 GB live on a 48 GB box (`recursion/docs/04-phase2-row-cuts.md` §"The prover's
+/// live heap", against a 94.2 GB Linux peak); one height shorter (all but the poseidon2 and reduce tables), the tier-18 twin is
+/// ≈ 47–50 GB by the measured terms — still above this box. The sibling
 /// `cheating.rs`'s `a_proof_of_one_program_does_not_verify_another` covers the small-scale case;
 /// here the R1 binding is checked at full scale: a proof of the verifier program never verifies
 /// against a *different* program's key.
 #[test]
-#[ignore = "the M5.2 Task-10 twin: post-cut program, tier 19, ~11-14 GB peak, ~2-5 min; run: cargo +1.98.1 test -p recursion --test exit twin -- --ignored --nocapture"]
+#[ignore = "the M5.2 Task-10 twin: post-cut program, tier 18, ~47-50 GB projected from the tier-19 94 GB Linux peak (tier 19 was killed at 78.7 GB live on 48 GB, docs/04); run alone: cargo +1.98.1 test -p recursion --release --test exit twin -- --ignored --nocapture"]
 fn twin_the_post_cut_verifier_program_over_one_test_profile_proof_proves_and_verifies_natively() {
     let p = common::bundle_proofs(FriProfile::Test, 1).pop().unwrap();
     let shape = InnerShape::of(FriProfile::Test, p.proof.tier, p.proof.program_log_height,
@@ -301,8 +304,8 @@ fn twin_the_post_cut_verifier_program_over_one_test_profile_proof_proves_and_ver
     let t0 = std::time::Instant::now();
     let (rvm_proof, exec) = m.prove(&vp.program, &tape.words, None).unwrap();
     let prove_s = t0.elapsed().as_secs_f64();
-    assert_eq!(exec.cpu_rows(), 461_082, "the twin proves the post-cut program as measured (constraint set 7 with VERIFIER-1; was 441 643 in constraint set 6)");
-    assert_eq!(rvm_proof.tier, randprotocol_rvm::machine::Tier(19));
+    assert_eq!(exec.cpu_rows(), 230_950, "the twin proves the post-cut program as measured (phase 2's row cuts: the N=1 aggregate pin 231 224 less the 274-row loop overhead; 461 988 at tier 19 in constraint set 8, 461 082 in constraint set 7 with VERIFIER-1, 441 643 in constraint set 6)");
+    assert_eq!(rvm_proof.tier, randprotocol_rvm::machine::Tier(18));
     let t1 = std::time::Instant::now();
     m.verify(&vp.program, &rvm_proof).unwrap();
     println!("twin: prove {prove_s:.1}s, verify {:.2}s, proof {} bytes, public values {:?}",
@@ -319,14 +322,16 @@ fn twin_the_post_cut_verifier_program_over_one_test_profile_proof_proves_and_ver
 
 /// The M5.2 exit (spec §7, verbatim): an rVM proof of the post-cut verifier program's execution
 /// over **one real cs6 production-profile bundle proof** verifies natively. Written and measured
-/// in Task 10 against the derived requirement in `recursion/docs/01-rvm-machine.md`: the
-/// committed oracle is 48.6 GB by the calibrated formula, so the exit runs on a **≥ 64 GB**
-/// machine (`research/docs/04-guests.md`'s big-proof class) — this 48 GB box cannot hold it, and
-/// it is not attempted here.
+/// in Task 10 against the derived requirement in `recursion/docs/01-rvm-machine.md`. That
+/// requirement (a 48.6 GB committed oracle, a ≥ 64 GB machine) counted one of the prover's four
+/// memory terms and is withdrawn: the tier-21 proof measured 376.9 GB on the 503 GB box, and the
+/// measured live-heap model (`recursion/docs/04-phase2-row-cuts.md` §"The prover's live heap")
+/// puts this tier-20 proof at ≈ 190–240 GB (the production RAM table stays at 2^22) — a
+/// ≥ 256 GB host. Not attempted on this 48 GB box.
 #[test]
-#[ignore = "the M5.2 exit: production profile, post-cut program, tier 21, ~1 968 619 rows; \
-            needs >= 64 GB (committed oracle 48.6 GB derived in recursion/docs/01-rvm-machine.md; \
-            est. 43-61 GB peak, est. 20-40 min). Run on the big machine: \
+#[ignore = "the M5.2 exit: production profile, post-cut program, tier 20, 893 606 rows; \
+            ~190-240 GB projected (docs/04 §live heap; tier 21 measured 376.9 GB), a >= 256 GB host. \
+            Run on the big machine: \
             cargo +1.98.1 test -p recursion --release --test exit -- --ignored --nocapture"]
 fn exit_the_verifier_program_over_one_real_cs6_bundle_proof_proves_and_verifies_natively() {
     let p = common::bundle_proofs(FriProfile::Production, 1).pop().unwrap();
@@ -342,8 +347,8 @@ fn exit_the_verifier_program_over_one_real_cs6_bundle_proof_proves_and_verifies_
     let t0 = std::time::Instant::now();
     let (rvm_proof, exec) = m.prove(&vp.program, &tape.words, None).unwrap();
     let prove_s = t0.elapsed().as_secs_f64();
-    assert_eq!(exec.cpu_rows(), 2_044_506, "the exit proves the post-cut program as measured (constraint set 7 with VERIFIER-1; was 1 968 619 in constraint set 6)");
-    assert_eq!(rvm_proof.tier, randprotocol_rvm::machine::Tier(21));
+    assert_eq!(exec.cpu_rows(), 893_606, "the exit proves the post-cut program as measured (phase 2's row cuts, `tests/pins.json`; 2 047 268 at tier 21 in constraint set 8, 2 044 506 in constraint set 7 with VERIFIER-1, 1 968 619 in constraint set 6)");
+    assert_eq!(rvm_proof.tier, randprotocol_rvm::machine::Tier(20));
     let t1 = std::time::Instant::now();
     m.verify(&vp.program, &rvm_proof).unwrap();
     let verify_s = t1.elapsed().as_secs_f64();

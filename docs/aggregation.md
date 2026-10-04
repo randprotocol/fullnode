@@ -207,6 +207,11 @@ both have to clear before a genesis may switch it on.
    N ≥ 2 needs a design change first (#119). Production N = 2 and N = 3 emulation (no proving)
    is within the memory and timestamp bounds (`2^27`), and register pressure does not grow with N.
    The full table is `docs/node-hardware.md` §4.
+   **Phase 2 row cuts (circuits `75b7893`, 2026-10-04):** the production inner proof is 893 606
+   cpu rows, so N = 1 lands at tier 20 (N = 2 at 21, N = 3/4 at 22) and projects to ≈ 240 GB — a
+   ≥ 256 GB host, tight, and a projection until proved. On that tree
+   `admitted_shapes[].aggregate_program_digest` is `c90b3f0a…74d8` and the node admits tiers
+   {20, 21, 22} (`recursion/docs/04-phase2-row-cuts.md`, `docs/node-hardware.md` §4).
 
 ## 4. Fallback
 

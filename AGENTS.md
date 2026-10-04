@@ -6,6 +6,25 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-10-02)
 
+### rVM phase 2 re-vendored (2026-10-04; branch `feat/rvm-phase2-vendor`)
+
+Circuits `75b7893` (main, the merge of `fix/cs6-2` = `feat/rvm-phase2`): the phase-2 row cuts
+(`recursion/docs/04-phase2-row-cuts.md`) — hint rows into the sponge buffers, `HINTN` = 26,
+`COMPRESS` = 27; the production inner proof 2 047 268 → **893 606 cpu rows, tier 21 → 20**; the
+aggregate program digest `1831f036…` →
+**`c90b3f0a7758c7e306042f27a94cc1f123441b0284c7352cb3f426048c7a74d8`** (`inner_vk_digest`
+`346ee184…` unchanged — the inner machine did not move; the admission stub's pinned interface list
+and digest moved with the fixture cache re-proved 2026-10-03, `5e3d7fb2…` → `3534960f…`, data not
+program); `admitted_tiers` {21, 22, 23} →
+**{20, 21, 22}** production, {19, 20, 21} → **{18, 19, 20}** test. `CIRCUITS_PIN` and
+`rand-zkvm-cuda`'s `rev` are both `75b78938…` (the LICENSE commit `bf15bbb` touched the backend's
+manifest, so the two cannot differ). **Trap (4) below applies: `75b7893` is on the fork `origin`
+only — push it to the `randprotocol` remote before CI, a clean clone or a cut can use this tree**
+(`git -C circuits push org main`; until then `cargo` cannot fetch the backend's revision). Memory:
+the tier-19 rVM proof holds 78.7 GB *live*; the tier-20 production N=1 projects to ≈ 240 GB
+(≥ 256 GB host) until proved — never quote macOS RSS as a memory number. `sync-zkvm.sh` rewrites
+upstream's new `license` line to the workspace form.
+
 ### v0.7.0 — released and ROLLED onto chain 20 (2026-10-02 ~00:15 UTC; node-only)
 
 Tag `806ed349` (workspace 0.7.0; `CHANGELOG.md` has v0.6.9 and v0.7.0): the audit v7 addendum

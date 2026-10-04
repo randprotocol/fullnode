@@ -9,7 +9,14 @@ fn instr(op: Op, rd: u8, ra: u8, b: u64) -> Instr {
 
 #[test]
 fn every_opcode_round_trips_through_encode_and_decode() {
-    assert_eq!(Op::ALL.len(), 26, "the ISA is twenty-six instructions (Task 8 appended REDUCE = 24, Task 9 SPONGE = 25)");
+    assert_eq!(Op::ALL.len(), 28, "the ISA is twenty-eight instructions (Task 8 appended REDUCE = 24, Task 9 SPONGE = 25, Cut B HINTN = 26, Cut C COMPRESS = 27)");
+    assert_eq!(Op::COUNT, 28);
+    assert_eq!(Op::from_u8(26), Some(Op::Hintn));
+    assert_eq!(Op::Hintn.mnemonic(), "HINTN");
+    assert!(!Op::Hintn.b_is_register(), "HINTN's fourth word is an immediate offset");
+    assert_eq!(Op::from_u8(27), Some(Op::Compress));
+    assert_eq!(Op::Compress.mnemonic(), "COMPRESS");
+    assert!(Op::Compress.b_is_register(), "COMPRESS's fourth word is the sibling's register");
     for (i, op) in Op::ALL.iter().enumerate() {
         assert_eq!(*op as u8 as usize, i, "opcode numbering is the spec table's order, new opcodes appended");
         let b = if op.b_is_register() { 17 } else { 0xdead_beef_dead };
@@ -23,8 +30,8 @@ fn every_opcode_round_trips_through_encode_and_decode() {
 #[test]
 fn decode_rejects_an_unknown_opcode_and_an_out_of_range_register() {
     let mut w = instr(Op::Fadd, 1, 2, 3).encode();
-    w[0] = F::from_u64(26);
-    assert_eq!(Instr::decode(w), Err(DecodeError::Opcode(26)));
+    w[0] = F::from_u64(28);
+    assert_eq!(Instr::decode(w), Err(DecodeError::Opcode(28)));
     let mut w = instr(Op::Fadd, 1, 2, 3).encode();
     w[1] = F::from_u64(32);
     assert_eq!(Instr::decode(w), Err(DecodeError::Register { slot: "rd", value: 32 }));

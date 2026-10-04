@@ -185,6 +185,10 @@
 # `2^(t−2)` (tier-14 hash-free ceiling 16 383 → 20 479, tier 10 1 023 → 1 279), the tier is clamped
 # and `check_public_values` refuses a tier outside `TIERS`; sister GAS cheating tests. The rVM is
 # unchanged; only its fixture cache's GAS values (so the stub interface list and digest) moved.
+# Then at `75b7893` (circuits main, the merge of `fix/cs6-2` = `feat/rvm-phase2`, 2026-10-04): research
+# is byte-identical to `aeacf31`'s apart from `license = "GPL-3.0-only"` in its manifest (the LICENSE
+# commit `bf15bbb`, also in `rand-zkvm-cuda/Cargo.toml` — which is why `CUDA_REV` has to move to
+# `75b7893` with it) and its AGENTS.md; the rVM is what moved (the recursion section below).
 #
 # Audit v6 PROC-2 (issue #109, 2026-10-01): a clone of this repository alone has to build, so no
 # manifest here may name a path outside the repository — cargo loads every path dependency's
@@ -445,7 +449,17 @@ echo "reminder: --features cuda / mock-cuda / reference-backend fetch rand-zkvm-
 # `6d4f124` (constraint set 8: the interface carries 35 public values a proof, `pv::GAS` the 35th;
 # `dsl::hash::absorb_staged` defers each permutation so a list ending on a block boundary digests
 # right; aggregate program digest `66a8094f…` → `1831f036…`), then at `18c2627` (byte-identical;
-# the regenerated cache moves the interface digest `36b414c0…` → `5e3d7fb2…`). Re-vendoring the rVM alone is this section alone: the research
+# the regenerated cache moves the interface digest `36b414c0…` → `5e3d7fb2…`), then at `75b7893`
+# (phase 2 row cuts, 2026-10-04, `recursion/docs/04-phase2-row-cuts.md`: hint rows straight into
+# the height-group sponge buffers, `HINTN` = 26 (eight tape words a row), `COMPRESS` = 27 (a Merkle
+# level as one cpu row and one Poseidon2-chip row); cpu width 72 → 82, poseidon2 341 → 343, a ninth
+# bus; the production inner proof 2 047 268 → 893 606 cpu rows, tier 21 → 20; the aggregate program
+# digest `1831f036…` → `c90b3f0a…`, `inner_vk_digest` unchanged (the admission stub's interface
+# vectors were re-pinned on the fixture cache re-proved 2026-10-03 — data, not program); a
+# `parallel` feature (optional `p3-maybe-rayon`/`rayon`, Plonky3's rayon for the prover) and the two
+# patched Plonky3 crates as a `[patch.crates-io]` in upstream's manifest — cut here with the
+# profiles, since this workspace's root carries the identical patch on `vendor/`; and upstream's
+# own `license` line, rewritten to the workspace form below). Re-vendoring the rVM alone is this section alone: the research
 # section above rewrites `guests-compiled/PROVENANCE.md` and would carry research's older drift. Two vendored files carry hand fixes this
 # section does not reproduce — keep them when re-syncing: `Cargo.toml`'s `license.workspace`
 # line and `tests/backend.rs`'s doc comment (`randprotocol-zkvm`, not the old crate name). What the
@@ -521,6 +535,10 @@ s = s.replace(anchor, want, 1)
 open(p, 'w').write(s)
 PY
 grep -rl "recursion::" "$RVM_DST/tests" | xargs -I{} sed -i '' 's/recursion::/randprotocol_rvm::/g' {} 2>/dev/null || true
+# Since `75b7893` upstream's manifest carries `license = "GPL-3.0-only"` itself (`bf15bbb`); this
+# workspace's licence is the same one, so the line takes the workspace form (the insert-if-absent
+# step below then has nothing to add; two `license` keys would be a duplicate-key manifest error).
+sed -i '' 's|^license = "GPL-3.0-only"$|license.workspace = true|' "$RVM_DST/Cargo.toml"
 # Recursion's two hand fixes, done here instead of by hand after every sync (2026-10-01): the
 # manifest's `license.workspace = true` (the workspace licence, which upstream's own-root manifest
 # has no reason to carry) and `tests/backend.rs`'s doc comment naming this crate's sibling by its
@@ -537,4 +555,4 @@ if "license.workspace = true" not in s:
 PY
 sed -i '' 's|crates/shrugg-zkvm/tests/backend.rs|crates/randprotocol-zkvm/tests/backend.rs|' "$RVM_DST/tests/backend.rs"
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 18c2627) into $RVM_DST"
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 75b7893) into $RVM_DST"

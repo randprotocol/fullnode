@@ -5237,7 +5237,7 @@ dependencies = [
 [[package]]
 name = "rand-zkvm-cuda"
 version = "0.1.0"
-source = "git+https://github.com/randprotocol/zkp-circuits?rev=aeacf31974fc409ed852017a4107ffa63df32182#aeacf31974fc409ed852017a4107ffa63df32182"
+source = "git+https://github.com/randprotocol/zkp-circuits?rev=75b78938c5b81851cad3fe2d21de1f8378360bc1#75b78938c5b81851cad3fe2d21de1f8378360bc1"
 dependencies = [
  "chacha20 0.10.2",
  "cuda-core",
@@ -5448,6 +5448,7 @@ dependencies = [
  "p3-goldilocks",
  "p3-lookup",
  "p3-matrix",
+ "p3-maybe-rayon",
  "p3-merkle-tree",
  "p3-poseidon2",
  "p3-symmetric",
@@ -5458,7 +5459,9 @@ dependencies = [
  "rand-zkvm-cuda",
  "rand_core 0.10.1",
  "randprotocol-zkvm",
+ "rayon",
  "serde",
+ "tracing",
 ]
 
 [[package]]

@@ -246,3 +246,78 @@ fn the_sponge_contract_holds_in_a_proof_over_one_hundred_random_buffers() {
     let (proof, _) = m.prove(&p, &tape, None).unwrap();
     m.verify(&p, &proof).unwrap();
 }
+
+/// Cut B: `hint_array(n)` under `Precompiles::On` (HINTN blocks + a compiled tail) reads exactly
+/// `n` words into the same cells the compiled form does, for every tail length.
+#[test]
+fn hint_array_via_hintn_matches_the_compiled_pairs() {
+    use randprotocol_rvm::dsl::{Builder, Checkpoints, Liveness};
+    use randprotocol_rvm::programs::Precompiles;
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(26);
+    for n in [1usize, 7, 8, 9, 16, 17, 121] {
+        let tape: Vec<F> = (0..n + 3).map(|_| common::random_felt(&mut rng)).collect(); // 3 spare words
+        let run = |pc: Precompiles| {
+            let mut b = Builder::with_opts(Checkpoints::Off, Liveness::On, pc);
+            let arr = b.hint_array(n);
+            for k in 0..n {
+                let v = b.get(arr, k);
+                b.public(v);
+            }
+            let p = b.finish();
+            let exec = execute(&p, &tape, 1_000_000).unwrap();
+            let rows = exec.cpu_rows();
+            (exec.public, exec.hints_read, rows)
+        };
+        let (off, off_read, off_rows) = run(Precompiles::Off);
+        let (on, on_read, on_rows) = run(Precompiles::On);
+        assert_eq!(on, off, "n = {n}");
+        assert_eq!(on, tape[..n].to_vec(), "n = {n}: the first n words, in order");
+        assert_eq!((off_read, on_read), (n, n), "exactly n words consumed either way");
+        assert_eq!(on_rows, off_rows - (n / 8) * 16 + (n / 8), "n = {n}: 16 rows per full block become 1");
+    }
+}
+
+/// Cut C: the walk with injections under `Precompiles::On` (one COMPRESS per level) computes the
+/// compiled walk's digest, for random leaves, siblings and index bits, 1..=12 levels, with and
+/// without an injection — and dispatches one `COMPRESS` per level and per injection. (A level's cpu
+/// cost is two rows, not one: `compress_step` also emits the `FADDI` that folds the sibling
+/// `Ptr`'s offset into a register; `merkle_walk`'s doc has the measured `2·levels + 15`.)
+#[test]
+fn merkle_walk_via_compress_matches_the_compiled_walk() {
+    use randprotocol_rvm::dsl::{hash, Builder, Checkpoints, Digest, Liveness};
+    use randprotocol_rvm::isa::Op;
+    use randprotocol_rvm::programs::Precompiles;
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(27);
+    for levels in 1..=12usize {
+        for with_injection in [false, true] {
+            let leaf: Vec<F> = (0..4).map(|_| common::random_felt(&mut rng)).collect();
+            let sibs: Vec<F> = (0..4 * levels).map(|_| common::random_felt(&mut rng)).collect();
+            let bits: Vec<bool> = (0..levels).map(|_| rand::RngExt::random(&mut rng)).collect();
+            let inj: Vec<F> = (0..9).map(|_| common::random_felt(&mut rng)).collect();
+            let run = |pc: Precompiles| {
+                let mut b = Builder::with_opts(Checkpoints::Off, Liveness::On, pc);
+                let leaf_p = b.alloc(4);
+                for (k, v) in leaf.iter().enumerate() { let c = b.constant(*v); b.store(leaf_p, k as i64, c); }
+                let sib_p = b.alloc(4 * levels as u64);
+                for (k, v) in sibs.iter().enumerate() { let c = b.constant(*v); b.store(sib_p, k as i64, c); }
+                let bit_f: Vec<_> = bits.iter().map(|&t| b.constant(F::from_bool(t))).collect();
+                let inj_p = b.alloc(9);
+                for (k, v) in inj.iter().enumerate() { let c = b.constant(*v); b.store(inj_p, k as i64, c); }
+                let injections = if with_injection && levels >= 2 {
+                    vec![hash::Injection { after_level: levels / 2, rows: inj_p, n_cells: 9 }]
+                } else { vec![] };
+                let out = Digest(b.alloc(4));
+                hash::merkle_walk_with_injections(&mut b, Digest(leaf_p), &bit_f, sib_p, levels, &injections, out);
+                for k in 0..4 { let v = b.load(out.0, k); b.public(v); }
+                let exec = execute(&b.finish(), &[], 1_000_000).unwrap();
+                let compress_rows = exec.histogram()[Op::Compress as usize];
+                (exec.public, compress_rows)
+            };
+            let (off, _) = run(Precompiles::Off);
+            let (on, compress_rows) = run(Precompiles::On);
+            assert_eq!(on, off, "levels {levels}, injection {with_injection}");
+            let expected_compress = levels + usize::from(with_injection && levels >= 2);
+            assert_eq!(compress_rows, expected_compress, "one COMPRESS per level and per injection");
+        }
+    }
+}

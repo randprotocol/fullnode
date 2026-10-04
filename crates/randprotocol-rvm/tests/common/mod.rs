@@ -569,6 +569,32 @@ pub fn every_chip_program() -> randprotocol_rvm::isa::Program {
     Program { instrs: v, checkpoints: vec![] }
 }
 
+/// Cut C's smallest honest `COMPRESS` program (`tests/emulator.rs`'s, reproduced for the chip and
+/// soundness tests): the digest `1..=4` at cell 64, the sibling `11..=14` at cell 80, one
+/// `COMPRESS` with the given bit, the four parent lanes published.
+#[allow(dead_code)]
+pub fn compress_program(bit: u64) -> randprotocol_rvm::isa::Program {
+    use p3_field::PrimeCharacteristicRing;
+    use randprotocol_rvm::isa::{Instr, Op, Program, F};
+    let i = |op: Op, rd: u8, ra: u8, b: u64| Instr { op, rd, ra, b: F::from_u64(b) };
+    let mut instrs = vec![i(Op::Faddi, 1, 0, 64), i(Op::Faddi, 2, 0, 80), i(Op::Faddi, 3, 0, bit)];
+    for k in 0..4 {
+        instrs.push(i(Op::Faddi, 4, 0, 1 + k));
+        instrs.push(i(Op::Store, 4, 1, k));
+    }
+    for k in 0..4 {
+        instrs.push(i(Op::Faddi, 4, 0, 11 + k));
+        instrs.push(i(Op::Store, 4, 2, k));
+    }
+    instrs.push(i(Op::Compress, 3, 1, 2));
+    for k in 0..4 {
+        instrs.push(i(Op::Load, 5, 1, k));
+        instrs.push(i(Op::Public, 0, 5, 0));
+    }
+    instrs.push(i(Op::Halt, 0, 0, 0));
+    Program { instrs, checkpoints: vec![] }
+}
+
 /// The main columns a table range-checks: the single-column fields of its `RANGE8` lookups.
 #[allow(dead_code)]
 pub fn range_checked_columns(interactions: &[p3_lookup::SymbolicInteraction<randprotocol_rvm::isa::F>]) -> Vec<usize> {

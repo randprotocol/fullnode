@@ -10,7 +10,7 @@ use p3_challenger::{CanObserve, CanSample, CanSampleBits, FieldChallenger, Grind
 use p3_field::{BasedVectorSpace, PrimeCharacteristicRing, PrimeField64};
 use p3_symmetric::{CryptographicHasher, PaddingFreeSponge, PseudoCompressionFunction, TruncatedPermutation};
 use rand::{RngExt, SeedableRng};
-use randprotocol_rvm::dsl::{hash, transcript::DslChallenger, Builder, Checkpoints};
+use randprotocol_rvm::dsl::{hash, transcript::DslChallenger, Builder, Checkpoints, Liveness, Precompiles};
 use randprotocol_rvm::emulator::execute;
 use randprotocol_rvm::isa::{EF, F};
 
@@ -345,12 +345,13 @@ fn the_dsl_leaf_sponge_matches_padding_free_sponge_8_4_4() {
 fn the_dsl_compression_matches_truncated_permutation_2_4_8() {
     let c = TruncatedPermutation::<Perm, 2, 4, 8>::new(perm());
     let mut rng = rand::rngs::StdRng::seed_from_u64(4);
-    for _ in 0..20 {
+    // Under both switches: `Off` is the compiled 25-row form, `On` one `COMPRESS` (Cut C).
+    for pc in [Precompiles::Off, Precompiles::On].into_iter().cycle().take(40) {
         let l: [F; 4] = core::array::from_fn(|_| F::from_u64(rng.random::<u64>() % F::ORDER_U64));
         let r: [F; 4] = core::array::from_fn(|_| F::from_u64(rng.random::<u64>() % F::ORDER_U64));
         let want = c.compress([l, r]);
 
-        let mut b = Builder::new(Checkpoints::Off);
+        let mut b = Builder::with_opts(Checkpoints::Off, Liveness::On, pc);
         let (lp, rp, op) = (b.alloc(4), b.alloc(4), b.alloc(4));
         for k in 0..4 {
             let a = b.constant(l[k]);
@@ -368,7 +369,7 @@ fn the_dsl_compression_matches_truncated_permutation_2_4_8() {
             let v = b.load(op, k);
             b.public(v);
         }
-        assert_eq!(run(b, &[]), want.to_vec());
+        assert_eq!(run(b, &[]), want.to_vec(), "{pc:?}");
     }
 }
 
@@ -391,8 +392,11 @@ fn a_restored_merkle_path_verifies_in_the_dsl_exactly_where_p3_verifies_it() {
     mmcs.verify_multi_batch(&commit, &dims, &indices, &opened, &multi).unwrap();
     let paths = randprotocol_zkvm::machine::restore_paths_for_tests(&mmcs, &dims, &indices, &opened, &multi);
 
+    // Under both switches: the compiled `select_children` walk (`Off`, the differential
+    // reference) and one `COMPRESS` per level (`On`, Cut C).
+    for pc in [Precompiles::Off, Precompiles::On] {
     for (q, idx) in indices.iter().enumerate() {
-        let mut b = Builder::new(Checkpoints::Off);
+        let mut b = Builder::with_opts(Checkpoints::Off, Liveness::On, pc);
         // leaf = sponge(row ‖ salts): the hiding MMCS widens the row by SALT_ELEMS = 4.
         let row: Vec<F> = opened[q][0].iter().copied().chain(multi.0[q][0].iter().copied()).collect();
         let src = b.alloc(row.len() as u64);
@@ -423,7 +427,8 @@ fn a_restored_merkle_path_verifies_in_the_dsl_exactly_where_p3_verifies_it() {
         // `cap_height = 2`, so the walk stops two levels below the root and the surviving digest
         // is compared with `commit[index >> levels]` (`mmcs/batch.rs:267`).
         assert_eq!(levels, 6 - 2, "log2(64) - cap_height");
-        assert_eq!(run(b, &[]), commit.roots()[*idx >> levels].to_vec(), "query {q}");
+        assert_eq!(run(b, &[]), commit.roots()[*idx >> levels].to_vec(), "query {q}, {pc:?}");
+    }
     }
 }
 
@@ -472,6 +477,7 @@ fn an_injected_shorter_matrix_group_verifies_in_the_dsl_exactly_where_p3_verifie
     mmcs.verify_multi_batch(&commit, &dims, &indices, &opened, &multi).unwrap();
     let paths = randprotocol_zkvm::machine::restore_paths_for_tests(&mmcs, &dims, &indices, &opened, &multi);
 
+    for pc in [Precompiles::Off, Precompiles::On] {
     for (q, idx) in indices.iter().enumerate() {
         // The injected rows are not siblings: they are the shorter matrix's own opened row, salted
         // and sponged, then compressed into the running digest.
@@ -480,7 +486,7 @@ fn an_injected_shorter_matrix_group_verifies_in_the_dsl_exactly_where_p3_verifie
         let inj_row: Vec<F> =
             opened[q][1].iter().copied().chain(multi.0[q][1].iter().copied()).collect();
 
-        let mut b = Builder::new(Checkpoints::Off);
+        let mut b = Builder::with_opts(Checkpoints::Off, Liveness::On, pc);
         let src = b.alloc(leaf_row.len() as u64);
         for (k, v) in leaf_row.iter().enumerate() {
             let hv = b.constant(*v);
@@ -513,6 +519,7 @@ fn an_injected_shorter_matrix_group_verifies_in_the_dsl_exactly_where_p3_verifie
             let v = b.load(root.0, k);
             b.public(v);
         }
-        assert_eq!(run(b, &[]), commit.roots()[*idx >> levels].to_vec(), "query {q}");
+        assert_eq!(run(b, &[]), commit.roots()[*idx >> levels].to_vec(), "query {q}, {pc:?}");
+    }
     }
 }

@@ -353,7 +353,7 @@ lines in their test files.
 
 1. **The ≥ 64 GB batch** (runbook rows 1–6; one machine, one session, sequential with an RSS
    watchdog — the 48 GB laptop jetsams these at ~33 GB): the ERC-20 transfer proof, the SPL token
-   proof (`research/tests/e2e.rs`, both `#[ignore]`d), the rVM tier-21 exit (`recursion/tests/exit.rs`),
+   proof (`research/tests/e2e.rs`, both `#[ignore]`d), the rVM tier-20 exit (tier 21 before the phase-2 row cuts; `recursion/tests/exit.rs`),
    the M5.3 N=2/N=3 test-profile aggregates (`recursion/tests/aggregate.rs`), the production N=1
    aggregate. Record per run: wall time, peak RSS, proof size. **Then fill chain-9's
    `genesis.aggregation.admitted_shapes[0]`** (the production bundle guest's declared heights +
@@ -1278,11 +1278,12 @@ from the same commit.
 3. **Distribute the file byte-identically** (re-cutting re-randomises the deposit notes, so the
    hash differs every run — cut once, copy everywhere).
 4. **Bring the fleet up as usual**; each node logs the startup key-build's wall time once
-   (`aggregation: aggregate program built and the tier-21 verifier key warmed`).
+   (`aggregation: aggregate program built and the verifier keys for tiers [20, 21, 22] warmed`).
 5. **Aggregators register** (`rand-node aggregator register --bond --payout` prints the
    signed registration; the bond burns through the wallet's `submit` as the register bundle's
-   burn) and run **`rand-node aggregate --watch`** on a proof machine (≥ 64 GB at N=1, the
-   GPU node for N≥2 — see `docs/aggregation.md`'s machine classes), pointed at any fleet RPC.
+   burn) and run **`rand-node aggregate --watch`** on a proof machine (≥ 256 GB at N=1 after the
+   phase-2 row cuts, a projection until the tier-20 proof runs — `docs/node-hardware.md` §4; the GPU
+   node for N≥2 — see `docs/aggregation.md`'s machine classes), pointed at any fleet RPC.
 6. **Ops checks**: `rand_status`'s `aggregation` section (registered, unsealed, the schedule
    index), `rand_getUnsealed` for the work list, `rand_getSupply` for the four counters
    (`subsidised` against `sealed_blocks` is the schedule audit). Archive nodes run with

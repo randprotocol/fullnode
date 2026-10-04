@@ -10,8 +10,8 @@ pub mod reduce;
 pub type F = p3_goldilocks::Goldilocks;
 
 /// Bus catalogue. A bus is a name; the batch verifier checks every bus balances.
-/// Eight buses (plan R7), not spec §5's four: the public table, the sponge row kind and the
-/// reduce chip each need their own channel, and `MEMORY` splits into `REG`/`RAM` (R4).
+/// Nine buses (plan R7), not spec §5's four: the public table, the sponge and compress row kinds
+/// and the reduce chip each need their own channel, and `MEMORY` splits into `REG`/`RAM` (R4).
 pub mod bus {
     use p3_lookup::{LookupBus, PermutationCheckBus};
     /// cpu/chips ↔ register memory: (addr, ts, value, is_write), addr = 2^24 + idx, idx < 32.
@@ -36,6 +36,8 @@ pub mod bus {
     pub const PUBLIC: LookupBus<'static> = LookupBus::new("PUBLIC");
     /// cpu (REDUCE rows) → reduce: (clk, descr_ptr). Task 8.
     pub const REDUCE: LookupBus<'static> = LookupBus::new("REDUCE");
+    /// cpu (COMPRESS rows) → poseidon2: (clk, state_ptr, sib_ptr, bit). Cut C: one Merkle level.
+    pub const COMPRESS: LookupBus<'static> = LookupBus::new("COMPRESS");
 }
 
 /// Next power of two ≥ n, at least `min` — `research/src/tables/mod.rs`'s helper, verbatim.

@@ -224,16 +224,43 @@ derived from the trace sizes.
 
 What it means for hardware:
 
-- **A production aggregator needs a ≥ 512 GB host** for N = 1, the smallest useful aggregate.
+- **A production aggregator needs a ≥ 512 GB host** for N = 1 at constraint set 8, the smallest
+  useful aggregate (≈ 240 GB projected after the phase-2 row cuts, below).
   The earlier "≥ 64 GB" class came from a 48.6 GB oracle that the measurement disproved.
 - **N ≥ 2 at production does not fit any single CPU host** on offer, and the GPU backend does not
   change that: the traces live in host memory. Aggregating more than one proof needs a design
   change (smaller inner proofs, a different recursion layout, or trace streaming), tracked in
   issue #119 with the remaining soundness item.
-- These runs proved single-threaded (the recursion crate is built without Plonky3's `parallel` feature), so the 64 vCPUs ran several proofs side by side; the walls above are single-core walls.
+- These runs proved single-threaded (the recursion crate had no `parallel` feature before circuits `75b7893`), so the 64 vCPUs ran several proofs side by side; the walls above are single-core walls.
 
 Sources: `circuits/recursion/docs/02-aggregate.md` ("Constraint set 8, proved"), the #45 closing
 comment, `~/rand-agg-512-results/` on the operator's laptop (all 24 step logs).
+
+**Phase 2 row cuts (circuits `75b7893`, 2026-10-04; `recursion/docs/04-phase2-row-cuts.md`).**
+Three cuts to the inner verifier (hint rows into the sponge buffers, `HINTN`, `COMPRESS`) take the
+production inner proof from 2 047 268 to 893 606 cpu rows, so every rung above lands one tier
+lower. Nothing in this table is a measured proof yet: the memory column weights the
+constraint-set-8 peaks by committed cells, calibrated on a tier-19 live-heap trace
+(`tests/memprofile.rs`, 78.7 GB live when the 48 GB laptop killed it), and the tier-20 production
+proof has not run on a big host.
+
+| aggregate | tier (was) | cpu rows | projected peak | measured anchor (constraint set 8) |
+|---|---|---|---|---|
+| test profile, N=1 | 18 (19) | 231 224 | ≈ 50 GB | 94.5 GB at tier 19 |
+| test profile, N=2 | 19 (20) | 462 039 | — | 183.7 GB at tier 20 |
+| test profile, N=3 | 20 (21) | 692 854 | — | 221.0 GB at tier 21 |
+| production, N=1 | **20** (21) | 893 880 | **≈ 240 GB** | 376.9 GB at tier 21 |
+| production, N=2 | 21 (22) | 1 787 351 | ≈ 475 GB | — |
+| production, N=4 | 22 (23) | 3 574 293 | ≈ 950 GB | — |
+
+So the production N = 1 aggregator is a **≥ 256 GB host, tight** (`m-32vcpu-256gb` is
+DigitalOcean's largest memory droplet), down from ≥ 512 GB; N ≥ 2 still fits no single host. The
+rest is structural — the quotient's salts, the register table, the blowup — and is listed in
+`docs/compute-optimization.md` §4.1. The rVM also has Plonky3's `parallel` feature now (the same
+two patched crates the prover uses): 4.7× on 16 threads at tier 16 with the peak heap unchanged,
+so threads are a wall-time lever only. The macOS RSS figures the September docs quoted (15–30 GB)
+measured compressed memory, not the working set; only Linux peaks count here. The node admits
+tiers {20, 21, 22} production and {18, 19, 20} test (`agg_executor.rs`).
 
 Setup, on a chain with an `aggregation` section (`docs/cli.md`, `docs/deploy.md`):
 
@@ -258,9 +285,9 @@ figures below were measured on the single-core build.
 | 14 | 16 383 | the bundle (wallet, test profile) | 5.74 GB whole `rand call` | 97.0 s | production: 92.2–96.0 s and 1 418 406–1 420 423-byte proofs (chain 13, laptop); memory of the bundle alone not measured yet |
 | 16 | 65 535 | ERC-20 `approve`, translated | test profile, DigitalOcean: 21.7 GB. Production, laptop: 22.9 GB peak RSS for the whole `rand call` | test profile: 786.7 s (13.1 min). Production: 388.7 s | production: proved and committed on chain 13, 3 412 405-byte proof |
 | 18 | 262 143 | ERC-20, about 66 k–162 k cycles | OOM-killed on a 48 GB laptop at 24.7 GB. On a 64 GB droplet: above 47 GB at 25 min, still running | killed after 1 016 s on the laptop | translated `transfer`: 85.0 GB, 3 230.5 s (53.8 min), 811 600 B proof. Interpreter `evm.bin`: 85.5 GB, 3 143.3 s (52.4 min), 805 108 B proof. Verify: 101.4 s (droplet), 50.2 s at 3.66 GB RSS (laptop). Measured on m-16vcpu-128gb, 2026-09-19 |
-| 19 (rVM) | — | rVM aggregate, N=1, test profile | about 30 GB peak | 1568.2 s | — |
+| 19 (rVM) | — | rVM aggregate, N=1, test profile (constraint set 8) | **94.5 GB peak RSS** (Linux, 503 GB droplet). The "about 30 GB" quoted before was macOS RSS, which excludes compressed pages | 1568.2 s (loaded shared box); 2 034.6 s (droplet, whole test binary) | after the phase-2 row cuts the same proof is tier 18, projected ≈ 50 GB (§4) |
 | 20 | 1 048 575 | SPL Token, about 700 k–770 k cycles | stopped on a 48 GB laptop at about 31 GB (30.77 GB peak footprint); OOM-killed on a 64 GB droplet at 65.1 GB | 10 m 41 s on the droplet before the kill | not yet proven. Extrapolated from the measured tier-16/18 scaling (memory about ×3.9, time about ×4.1 per +2 tiers): about 330 GB and about 3.6 h, more than DigitalOcean's largest memory droplet (m-32vcpu-256gb, 256 GB) |
-| 21 (rVM) | — | rVM aggregate, N=1, production | 48.6 GB oracle | not run | not measured yet; bound: a ≥ 64 GB host |
+| 21 (rVM) | — | rVM aggregate, N=1, production (constraint set 8) | **376.9 GB peak RSS** (the 48.6 GB oracle counted one of four memory terms) | 8 131.3 s | §4; after the phase-2 row cuts the same proof is tier 20, projected ≈ 240 GB, not yet run |
 
 The cycle column is `2^t − 1` for the RV32 zkVM (`docs/confidential.md`). The rVM (the
 recursion machine) has its own tiers, sized in rows (`docs/zkvm-m4-m5-progress.md`). The tier-18 and tier-20 laptop runs used
@@ -273,7 +300,7 @@ recursion machine) has its own tiers, sized in rows (`docs/zkvm-m4-m5-progress.m
 | a tier-14 bundle (any wallet) | any machine with more than 5.74 GB free (test profile) | measured |
 | tier 18 | a 128 GB droplet (size slug `m-16vcpu-128gb`, Memory-Optimized, 16 vCPU). OOM-killed on a 64 GB droplet (`g-16vcpu-64gb`) at 65.1 GB after 32 min | measured: 85.0 GB (translated) / 85.5 GB (interpreted) peak RSS, 3 230.5 s / 3 143.3 s |
 | tier 20 | more than 64 GB. OOM-killed on a 64 GB droplet (`g-16vcpu-64gb`) at 65.1 GB after 10 m 41 s | not yet proven; extrapolated at about 330 GB and about 3.6 h (see §5), more than DigitalOcean's largest memory droplet (m-32vcpu-256gb, 256 GB) |
-| aggregate N=1, production | ≥ 64 GB | not run |
+| aggregate N=1, production | a 503 GB droplet at constraint set 8 (376.9 GB peak); ≥ 256 GB projected after the phase-2 row cuts (`m-32vcpu-256gb`, tight) | measured at constraint set 8 (§4); the tier-20 proof not yet run |
 
 No proof above tier 14 is part of normal chain operation today. Tier 18 and 20 matter for calls to
 the translated ERC-20 and SPL Token programs ([`translators.md`](translators.md#7-what-works-on-chain-today)).
@@ -292,7 +319,9 @@ on an Apple M4 Max, the `parallel` build, threads set with `RAYON_NUM_THREADS`.
 
 About 80 % of the time is Poseidon2 Merkle hashing (170 million permutations a proof); the FFTs
 are most of the rest. The CUDA backend (`rand-zkvm-cuda`) moves the Merkle hashing and the FFTs,
-87.4 % of the CPU time, to the device.
+87.4 % of the CPU time, to the device. The rVM (the aggregate prover) has the same `parallel`
+feature since circuits `75b7893`: 4.7× on 16 threads at tier 16 (171 s → 36 s), peak heap
+unchanged (§4).
 
 **What the binaries do with it** (`randprotocol_prover::proving`, the one place all three
 decide):

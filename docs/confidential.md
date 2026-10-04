@@ -455,7 +455,10 @@ table (`docs/superpowers/specs/2026-09-28-gas-model-design.md` §4.2, `docs/fees
   the word that opens the *next* block arrives, so one block is always left pending for the final
   permutation. It failed closed before the fix (`DigestMismatch`), never wrongly accepted. The
   production `aggregate_program_digest` moved for both reasons (the wider interface and the sponge
-  fix): `1831f036a2d3524249df17a66a220457878f8aeed669c77db08d58026461ddd7`.
+  fix): `1831f036a2d3524249df17a66a220457878f8aeed669c77db08d58026461ddd7`. The phase-2 row
+  cuts (circuits `75b7893`, 2026-10-04) moved it again, to
+  `c90b3f0a7758c7e306042f27a94cc1f123441b0284c7352cb3f426048c7a74d8`; the inner machine, its
+  verifier key and the interface digest did not move (`recursion/docs/04-phase2-row-cuts.md`).
 
 Every verifier key changes (the cpu AIR changes), so constraint set 8 rides only a chain cut —
 chain 18, which also carries `hardening_v6` and the genesis `gas` section (`docs/fees.md` §1.1,

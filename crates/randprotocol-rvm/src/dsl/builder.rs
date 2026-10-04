@@ -66,9 +66,10 @@ pub enum Liveness {
     Off,
 }
 
-/// Should the build use the Task 8/9 precompiles? `Off` compiles the reduction and the leaf
-/// sponges as ordinary instruction sequences — the differential references — `On` emits
-/// `REDUCE`/`SPONGE`. The shipped program is always `On`.
+/// Should the build use the Task 8/9 precompiles and Cut B's `HINTN`? `Off` compiles the
+/// reduction, the leaf sponges and the tape reads as ordinary instruction sequences — the
+/// differential references — `On` emits `REDUCE`/`SPONGE`/`HINTN`. The shipped program is always
+/// `On`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Precompiles {
     Off,
@@ -409,14 +410,21 @@ impl Builder {
         Ext(id)
     }
 
-    /// `n` witness words, read in order into `n` fresh cells, through one scratch register.
+    /// `n` witness words, read in order into `n` fresh cells. `Precompiles::On` (Cut B): one
+    /// `HINTN` per full block of eight at immediate offset `8·j`, then `HINT; STORE` pairs for the
+    /// `n mod 8` tail — the tail stays compiled because a block always consumes eight words, and
+    /// the tape has exactly `n`. `Precompiles::Off`: the pairs throughout (the reference).
     pub fn hint_array(&mut self, n: usize) -> Array<Felt> {
         let base = self.alloc(n as u64);
         let holder = self.ptrs[base.0 as usize].holder;
         self.begin();
         let rp = self.materialise(holder);
         let s = self.take_scratch(1);
-        for k in 0..n {
+        let blocks = if self.precompiles() == Precompiles::On { n / 8 } else { 0 };
+        for j in 0..blocks {
+            self.emit(Op::Hintn, RRef::Raw(0), rp, BRef::Imm(imm(8 * j as i64)));
+        }
+        for k in 8 * blocks..n {
             self.emit(Op::Hint, RRef::scratch(s), RRef::Raw(0), BRef::Imm(F::ZERO));
             self.emit(Op::Store, RRef::scratch(s), rp, BRef::Imm(imm(k as i64)));
         }
@@ -641,6 +649,20 @@ impl Builder {
         let ra = self.ptr_reg(state);
         let rb = self.ptr_reg(src);
         self.emit(Op::Sponge, RRef::Raw(0), ra, bref_of(rb));
+        self.stats.perms += 1;
+    }
+
+    /// One `COMPRESS` instruction (Cut C): the four-cell digest at `state` and the four-cell
+    /// sibling at `sib`, ordered by `bit`, permuted by the poseidon2 chip, lanes 0–3 written back
+    /// over `state`. `bit` must be boolean — the emulator refuses anything else as a build error.
+    /// `bit` rides in the `rd` slot as a read, exactly as `STORE`'s value does: the handle's home
+    /// register, or a reload into scratch if it was spilled (`r0` for [`Builder::zero`]).
+    pub fn compress_step(&mut self, state: Ptr, sib: Ptr, bit: Felt) {
+        self.begin();
+        let ra = self.ptr_reg(state);
+        let rb = self.ptr_reg(sib);
+        let rd = self.materialise(bit.0);
+        self.emit(Op::Compress, rd, ra, bref_of(rb));
         self.stats.perms += 1;
     }
 

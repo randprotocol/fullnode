@@ -42,15 +42,27 @@ pub struct MemAccess {
     pub is_write: bool,
 }
 
-/// The width-8 permutation a `POSEIDON2` row dispatches, over the eight cells at `ptr`.
+/// The width-8 permutation a `POSEIDON2`, `SPONGE` or `COMPRESS` row dispatches. `ptr` is the
+/// state the output is written back to; `input` is the permutation's input as the chip sees it
+/// (for `COMPRESS`, already ordered by the bit).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct PermEvent {
     pub ptr: u64,
     pub input: [F; 8],
     pub output: [F; 8],
-    /// `Some(src)` for a `SPONGE` absorb (the four source cells at `src` feeding rate lanes 0–3),
-    /// `None` for a plain `POSEIDON2` (all eight cells from `ptr`).
-    pub src: Option<u64>,
+    pub kind: PermKind,
+}
+
+/// Which row kind of the Poseidon2 chip a permutation event is.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PermKind {
+    /// `POSEIDON2`: the eight cells at `ptr`, in place.
+    Perm,
+    /// `SPONGE`: four cells at `src` into lanes 0–3, the state's lanes 4–7 kept, eight written.
+    Sponge { src: u64 },
+    /// `COMPRESS` (Cut C): `[state(4) ‖ sib(4)]` when `bit` is clear, `[sib ‖ state]` when set;
+    /// lanes 0–3 of the output written back to `ptr`.
+    Compress { sib: u64, bit: bool },
 }
 
 /// One run of the batch-opening reduction a `REDUCE` row dispatches (Task 8): the descriptor
@@ -105,7 +117,8 @@ impl Execution {
         self.events.len()
     }
 
-    /// The `poseidon2` chip's height: one permutation per `POSEIDON2` row, nothing else.
+    /// The `poseidon2` chip's height: one permutation per `POSEIDON2`, `SPONGE` or `COMPRESS`
+    /// row — every row whose event carries a permutation — and nothing else.
     pub fn permutations(&self) -> usize {
         self.events.iter().filter(|e| e.perm.is_some()).count()
     }
@@ -139,6 +152,10 @@ pub enum ExecError {
     /// A `REDUCE` descriptor declared a zero-length run: there is nothing to reduce, and a
     /// `REDUCE` of zero columns is a build-time mistake (the program must not emit it).
     ReduceZeroLength { pc: u32 },
+    /// A `COMPRESS` whose `rd` is neither 0 nor 1: the index bit of a Merkle level is a bit, and
+    /// a program that hands it anything else is a build-time mistake (the chip's `BIT` is
+    /// boolean, so the row would be unprovable anyway).
+    NonBooleanBit { pc: u32 },
 }
 
 /// Run `p` against `witness` for at most `max_cycles` instructions.
@@ -317,7 +334,7 @@ pub fn execute(p: &Program, witness: &[F], max_cycles: usize) -> Result<Executio
                 for (k, value) in output.iter().enumerate() {
                     write(&mut mem, &mut mems, clk, ptr + k as u64, *value);
                 }
-                perm = Some(PermEvent { ptr, input, output, src: None });
+                perm = Some(PermEvent { ptr, input, output, kind: PermKind::Perm });
             }
             Op::Reduce => {
                 a[0] = regs[ra];
@@ -384,7 +401,56 @@ pub fn execute(p: &Program, witness: &[F], max_cycles: usize) -> Result<Executio
                 for (k, value) in output.iter().enumerate() {
                     write(&mut mem, &mut mems, clk, ptr + k as u64, *value);
                 }
-                perm = Some(PermEvent { ptr, input, output, src: Some(src) });
+                perm = Some(PermEvent { ptr, input, output, kind: PermKind::Sponge { src } });
+            }
+            Op::Hintn => {
+                a[0] = regs[ra];
+                let base = (a[0] + instr.b).as_canonical_u64();
+                // The top cell bounds the whole run: `base` is canonical (below `p < 2^64 − 7`),
+                // so `base + 7` cannot wrap, and `base + 7 < 2^24` puts every cell below it too.
+                bounded(pc, base + 7)?;
+                if run.hints_read + 8 > witness.len() {
+                    return Err(ExecError::HintExhausted { pc });
+                }
+                // `write` takes its slot from the position in `mems`, empty until now: the eight
+                // writes land at slots 0..7, which is what the cpu AIR's `ts(k)` sends.
+                for k in 0..8u64 {
+                    let w = witness[run.hints_read + k as usize];
+                    write(&mut mem, &mut mems, clk, base + k, w);
+                }
+                run.hints_read += 8;
+            }
+            Op::Compress => {
+                let rb = reg_b(&instr, pc)? as usize;
+                a[0] = regs[ra];
+                b_val[0] = regs[rb];
+                d[0] = regs[rd];
+                let bit = if d[0] == F::ZERO {
+                    false
+                } else if d[0] == F::ONE {
+                    true
+                } else {
+                    return Err(ExecError::NonBooleanBit { pc });
+                };
+                let (ptr, sib) = (a[0].as_canonical_u64(), b_val[0].as_canonical_u64());
+                bounded(pc, ptr + 3)?;
+                bounded(pc, sib + 3)?;
+                // `read`/`write` take their slot from the position in `mems`, empty until now: the
+                // state reads land at slots 0..3, the sibling reads at 4..7, the write-backs at
+                // 8..11 — the chip's `IS_COMPRESS` timestamps exactly.
+                let dg: [F; 4] = core::array::from_fn(|k| read(&mem, &mut mems, clk, ptr + k as u64));
+                let sb: [F; 4] = core::array::from_fn(|k| read(&mem, &mut mems, clk, sib + k as u64));
+                let input: [F; 8] = core::array::from_fn(|k| match (bit, k < 4) {
+                    (false, true) => dg[k],
+                    (false, false) => sb[k - 4],
+                    (true, true) => sb[k],
+                    (true, false) => dg[k - 4],
+                });
+                let output = randprotocol_zkvm::hash::permute_state(input);
+                for k in 0..4 {
+                    write(&mut mem, &mut mems, clk, ptr + k as u64, output[k]);
+                }
+                perm = Some(PermEvent { ptr, input, output, kind: PermKind::Compress { sib, bit } });
             }
             Op::Halt => next_pc = pc,
         }

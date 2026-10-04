@@ -266,6 +266,9 @@ included it (§5.2), not to any aggregator.
   production N=1 is provable on the ≥ 64 GB batch machine, N=2/N=3 arrive with M5.4's GPU
   numbers (≥ 128/160 GB host, the tier-23 rung M5.4 adds). The register admits the rVM tiers
   `{21, 22, 23}` for the one registered inner shape; a proof at any other tier is invalid.
+  *(Amended 2026-10-04: the phase-2 row cuts, circuits `75b7893`, moved every rung one tier
+  down; the register admits `{20, 21, 22}` production and `{18, 19, 20}` test —
+  `agg_executor::admitted_tiers`.)*
 - Raising `MAX_COVERS` later is a chain cut with a new `AggregationConfig`, not a spec change.
 
 ### 3.4 Selection

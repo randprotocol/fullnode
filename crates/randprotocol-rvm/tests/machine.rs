@@ -129,3 +129,20 @@ fn rejects_only_counts_a_constraint_failure_or_a_verify_error() {
     assert!(!common::rejects(|| panic!("memory table needs a padding row: 5 accesses, height 4")));
     assert!(!common::rejects(|| Ok(())));
 }
+
+/// The toy proves and verifies end to end. With `--features parallel` this is the rayon prover
+/// (and the vendored hiding-RNG patch, `../vendor/PROVENANCE.md`) against the same verifier: the
+/// config, transcript and FRI parameters do not change with the feature.
+#[test]
+fn the_toy_proves_and_verifies() {
+    // The interface digest is always four words (R5): the toy's one `PUBLIC` plus three more.
+    let mut p = toy_program();
+    let halt = p.instrs.pop().unwrap();
+    for r in [1, 2, 3] {
+        p.instrs.push(instr(Op::Public, 0, r, 0));
+    }
+    p.instrs.push(halt);
+    let m = Machine::new(randprotocol_zkvm::machine::FriProfile::Test);
+    let (proof, _) = m.prove(&p, &[], None).unwrap();
+    m.verify(&p, &proof).unwrap();
+}

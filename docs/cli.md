@@ -283,8 +283,8 @@ endpoint and the registered aggregator key.
 
 One pass polls `rand_getUnsealed`, fetches up to `max_covers` raw bundles with
 `rand_getRawTransaction`, proves one rVM aggregate over them (CPU; the test profile lands at
-tier 19, production at 21 — minutes and tens of GB on this tree, so run it on the proof batch
-machine), seals the payment note (subsidy at the current schedule index plus the covered
+tier 18, production at 20 since the phase-2 row cuts — minutes and tens to hundreds of GB on
+this tree, `docs/node-hardware.md` §4 — so run it on the proof batch machine), seals the payment note (subsidy at the current schedule index plus the covered
 bundles' proving shares) to the register's payout address, signs and submits. `rand_status`'s
 `aggregation` section carries the chain parameters the payment is computed from.
 

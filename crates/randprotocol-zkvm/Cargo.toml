@@ -66,7 +66,7 @@ postcard = { version = "1", features = ["alloc"] }
 # `research/src/poseidon2_constants.rs` it `#[path]`-includes are identical between this
 # revision and `CIRCUITS_PIN`, which may be ahead of it when the pin moved for a change outside
 # the backend. It must be a commit reachable from the public repository.
-rand-zkvm-cuda = { git = "https://github.com/randprotocol/zkp-circuits", rev = "aeacf31974fc409ed852017a4107ffa63df32182", optional = true }
+rand-zkvm-cuda = { git = "https://github.com/randprotocol/zkp-circuits", rev = "75b78938c5b81851cad3fe2d21de1f8378360bc1", optional = true }
 # M4.3/M4.4 (arrived with the constraint-set-6 re-vendor): the EVM and sBPF interpreter cores —
 # no_std libraries with no dependencies, compiled into the `evm`/`sbpf` guests on riscv32im and
 # run natively here. Normal dependencies, not dev-dependencies, because `src/evm.rs`/`src/sbpf.rs`

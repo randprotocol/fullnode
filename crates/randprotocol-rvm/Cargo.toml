@@ -2,8 +2,8 @@
 name = "randprotocol-rvm"
 version = "0.1.0"
 edition = "2021"
-license.workspace = true
 description = "Rand recursion VM (rVM): a field-native machine whose programs verify Rand zkVM proofs"
+license.workspace = true
 
 [lib]
 name = "randprotocol_rvm"
@@ -42,10 +42,17 @@ postcard = { version = "1", features = ["alloc"] }
 randprotocol-zkvm = { path = "../randprotocol-zkvm" }
 # The GPU (CUDA) and CPU-twin NTT/Poseidon2-Merkle engines the proving backends run on —
 # research's dependency, consumed as-is (M5.4 R1: the rVM's shapes need no new kernels).
-rand-zkvm-cuda = { git = "https://github.com/randprotocol/zkp-circuits", rev = "aeacf31974fc409ed852017a4107ffa63df32182", optional = true }
+rand-zkvm-cuda = { git = "https://github.com/randprotocol/zkp-circuits", rev = "75b78938c5b81851cad3fe2d21de1f8378360bc1", optional = true }
+# The `parallel` feature's rayon: Plonky3's maybe-rayon shim (its `parallel` feature turns rayon on in
+# every p3 crate that uses it) and rayon itself, for `RAYON_NUM_THREADS`'s pool.
+p3-maybe-rayon = { version = "=0.7.0", optional = true }
+rayon = { version = "1", optional = true }
 
 [dev-dependencies]
 hex = "0.4"
+# `tests/memprofile.rs`: a span-boundary heap logger over Plonky3's own `tracing` spans (the
+# version is the one the p3 crates already lock).
+tracing = "0.1"
 
 [features]
 # `rand-zkvm-cuda`'s CPU-twin engines (the reference backend). Research's feature, mirrored.
@@ -59,3 +66,8 @@ cuda = ["dep:rand-zkvm-cuda", "rand-zkvm-cuda/cuda"]
 # enabling it would put a CUDA toolkit back in the way of a no-GPU test run. The two features
 # exercise the identical `Backend::Cuda` path.
 mock-cuda = ["dep:rand-zkvm-cuda", "rand-zkvm-cuda/mock-driver"]
+# Plonky3's own `parallel` feature (rayon) for the prover, off by default: the proofs it makes are
+# the same proofs (same config, transcript and FRI parameters — `docs/03`'s retype discipline),
+# made on every core. Needs the two patched crates under `../vendor/` (hiding RNG lock forked,
+# never held across rayon work — upstream Plonky3 #2363; the fullnode's patch, copied verbatim).
+parallel = ["dep:p3-maybe-rayon", "p3-maybe-rayon/parallel", "dep:rayon"]

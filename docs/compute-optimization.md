@@ -35,7 +35,7 @@ prices block space and proving as two separate goods.
 | validator RAM | ~650 MiB resident | `docs/node-hardware.md` §2.1 |
 | mempool admission | 4 blocking verification workers, queue 64 deep | `docs/architecture.md` §8 |
 | wallet proof, tier 14 | 107.5 s on 1 thread, 13.9 s on 16 (M4 Max); 5.74 GB | `docs/node-hardware.md` §6 |
-| recursion, N = 1, production | **376.9 GB host memory, 8 131 s**; N = 2 ≈ 750 GB (estimate) | `docs/aggregation.md` item 3 |
+| recursion, N = 1, production | **376.9 GB host memory, 8 131 s** at constraint set 8 (tier 21); N = 2 ≈ 750 GB (estimate). After the phase-2 row cuts (circuits `75b7893`, 2026-10-04): tier 20, projected ≈ 240 GB, not yet proved | `docs/aggregation.md` item 3; `circuits/recursion/docs/04-phase2-row-cuts.md` |
 | aggregate proof | 1 563 226 bytes (N = 1, constraint set 8) | `docs/aggregation.md` §6 |
 | aggregate verify, warm, test profile | ~1–2 s | `docs/aggregation.md` §6 |
 | state root | nullifier root recomputed `O(n)` per block | `docs/architecture.md` §5 |
@@ -48,8 +48,9 @@ prices block space and proving as two separate goods.
    simply rise: at 100 transfers a block every validator would ingest 285 MB every 1.2 s.
 2. **Recursion is not yet buyable.** Aggregation (`docs/aggregation.md`) is the designed remedy:
    the block carries one recursive proof over N bundles and ~3 KB of public fields per transfer.
-   But one production aggregate of a *single* bundle needs 377 GB of host memory and 2¼ hours,
-   and N = 2 does not fit on any single host. No market forms around that machine.
+   But one production aggregate of a *single* bundle needed 377 GB of host memory and 2¼ hours
+   at constraint set 8, and N = 2 did not fit on any single host. The phase-2 row cuts (§4.1)
+   take N = 1 to tier 20, projected near 240 GB; still no market forms around that machine.
 3. **Then the node's own hot path.** None of these binds at 7 tx/s; all of them bind before
    1 000: the `O(n)` nullifier root, the per-block ledger clone, one Dilithium2 vote (2 420 bytes)
    per validator per block, the leader pushing a whole block body to every peer, and the four
@@ -194,23 +195,60 @@ A one-validator local chain with the `StubExecutor`, 4 096 synthetic records a b
 
 This is the critical path. Phase 3 is impossible without it, and §6's market cannot form around
 a 377 GB machine. Three changes, each independently measurable, in the recursion crate
-(`circuits/recursion`, vendored as `randprotocol-rvm`).
+(`circuits/recursion`, vendored as `randprotocol-rvm`). The first landed on 2026-10-04 as the
+phase-2 row cuts (circuits `75b7893`, `recursion/docs/04-phase2-row-cuts.md`); §4.1 records what
+it measured and what it left.
 
 ### 4.1 Precompile chips in the recursion VM
 
-The inner verifier's work is Poseidon2 Merkle paths and FRI folding
-(`docs/aggregation.md` §5). Today the rVM runs them as ordinary instructions, which is why one
-inner proof is a tier-21 trace. Add two dedicated chips with their own AIRs, connected to the
-CPU table by LogUp lookups as the existing reduce chip is:
+The inner verifier's work is Poseidon2 Merkle paths and FRI folding (`docs/aggregation.md` §5).
+The rVM has had dedicated Poseidon2, sponge and reduce chips since M5.2, connected to the CPU
+table by LogUp lookups; what made one inner proof a tier-21 trace was the CPU rows *around* them:
+54 % of the 2 047 268 rows were LOAD/STORE, 10 % hint reads, and every Merkle level ran as an
+instruction sequence (`recursion/tests/profile.rs`, constraint set 8).
 
-- **Poseidon2 chip**: one permutation per row (today: hundreds of CPU rows). Verifying one
-  80-query tier-14 proof is on the order of 10⁴ permutations; this chip puts that at 10⁴ rows.
-- **FRI fold chip**: one fold step per row over the degree-k extension, with the
-  challenge-derivation sponge on the Poseidon2 chip.
+**Landed (phase 2 row cuts, circuits `75b7893`, 2026-10-04).** Three cuts to the shared verifier
+pipeline, each measured on the production shape:
 
-Target: one inner bundle proof verified in **≤ 2²⁰ total rows** across all tables (today:
-tier 21 for the CPU table alone), so an aggregate of N = 16 lands around 2²⁴ rows — the size of
-one ordinary GPU-proved shard in comparable systems.
+| cut | what | production cpu rows after |
+|---|---|---:|
+| — | constraint set 8 baseline | 2 047 268 (tier 21) |
+| A | hint rows written straight into the height-group sponge buffers | 1 787 805 |
+| B | `HINTN` (opcode 26): eight tape words a row | 1 427 355 |
+| C | `COMPRESS` (opcode 27): one Merkle level as one cpu row and one Poseidon2-chip row | **893 606 (tier 20)** |
+
+The aggregate's N-ladder moved with it: production N = 1 lands at tier 20 (893 880 rows), N = 2
+at 21, N = 3 and N = 4 at 22; the test profile's N = 1/2/3 at 18/19/20. The permutation count
+(54 515 a proof) and the poseidon2 and reduce table heights did not change; the cpu, register and
+program tables are one height shorter at every N, and the production RAM table stays at 2²²
+(2 213 181 accesses). The aggregate program digest moved to `c90b3f0a…74d8`; the interface
+digest, the inner verifier key and the chain's consensus rules did not. The node admits tiers
+{20, 21, 22} production and {18, 19, 20} test (`agg_executor.rs`).
+
+**Measured, not assumed, on memory.** The prover's live heap at tier 19 (the test twin,
+constraint set 8) was 78.7 GB when the 48 GB laptop's kernel killed it: main LDE and tree
+17.6 GB, LogUp permutation 11.3 GB, quotient LDEs 29.7 GB, the quotient tree and FRI the rest.
+The quotient is a third of it because the hiding MMCS salts every 2-column quotient chunk (6
+columns committed for 2 of data). Weighting the measured 376.9 GB peak by committed cells, the
+tier-20 production N = 1 projects to **≈ 240 GB** and the tier-18 test twin to ≈ 50 GB. Those are
+projections until the tier-20 production proof runs on a ≥ 256 GB host. macOS RSS figures are
+never memory numbers (they exclude compressed pages); the Linux `/usr/bin/time -v` peaks are.
+
+**Still ahead, in order of leverage** (`recursion/docs/04`, "Still ahead"):
+
+- the quotient's share: commit one instance's chunks as one matrix (−20 % of the peak at tier 19,
+  and 16 Merkle paths a query become one); a degree-2 memory AIR as a second lever on the term;
+- the register table's height (4× the cpu table, ~2.5 `REG` messages a cpu row): a wider cpu row
+  that reads fewer registers;
+- a REDUCE descriptor table (~240 k rows) and the FADDI per COMPRESS level (~16 k);
+- `log_blowup 3 → 2` for the rVM's own profile: halves every LDE for ~1.5× the queries (the
+  inner-profile decision §4.4 names, applied to the recursion);
+- the GPU backend as built changes none of this, because traces live on the host; a
+  device-resident LDE and tree would, and that is the reason to want the 80 GB device class.
+
+Target: one inner bundle proof verified in **≤ 2²⁰ total rows** across all tables (today: the cpu
+table is 2²⁰, the register and RAM tables 2²²), so an aggregate of N = 16 lands around 2²⁴ rows —
+the size of one ordinary GPU-proved shard in comparable systems.
 
 ### 4.2 Tree aggregation, bounded steps
 
@@ -244,9 +282,10 @@ leaf, which is the number the §4.4 targets are set against.
 
 | measurement | today | target | why this number |
 |---|---|---|---|
-| leaf step, B = 16 (32 inner proofs), one 80 GB GPU | not possible (377 GB for N = 1 on CPU) | ≤ 64 GB host, ≤ 60 s | fits one commodity GPU host; 16 bundles a minute a GPU |
+| leaf step, B = 16 (32 inner proofs), one 80 GB GPU | not possible (377 GB for N = 1 on CPU at constraint set 8; ≈ 240 GB projected after the row cuts) | ≤ 64 GB host, ≤ 60 s | fits one commodity GPU host; 16 bundles a minute a GPU |
 | 2-to-1 step | — | ≤ 64 GB host, ≤ 30 s | same host; tree depth 4 adds ≤ 2 min |
 | **GPU-seconds per covered transaction, amortised** | ~8 000 s CPU | **≤ 0.5 GPU-s** | §6.6 sizes the market on it |
+| rVM prover threads | 4.7× on 16 threads (`parallel` feature, tier 16, peak heap unchanged) | — | a wall-time lever only; the heap model holds under threads |
 | aggregate verify, warm, production | ~1–2 s (test profile) | ≤ 150 ms | ≤ 4 aggregates inside a 1.2 s slot with margin |
 | aggregate proof size | 1.56 MB | ≤ 1.5 MB | 8 per block within 128 MiB leaves room for records |
 | inner profile | 80 queries, rate ½ | decided by measurement (below) | — |
@@ -434,7 +473,7 @@ for which hardware, and attaches the conditions.
 
 The sale gates in the draft stand, and this page adds one: **the validator and prover sale does
 not open until the §4.4 leaf-step target is measured on an 80 GB GPU.** Selling aggregator seats
-against a 377 GB machine would be selling hardware nobody can run.
+against a 377 GB machine (≈ 240 GB projected after the row cuts) would be selling hardware nobody can run.
 
 ### 6.6 Does it pay? Worked numbers
 
@@ -502,7 +541,7 @@ Phases are sequential where an arrow says so and parallel otherwise. Each ends w
 | phase | work | depends on | done when |
 |---|---|---|---|
 | **1. Validator hot path** | §3.1 MMR, §3.2 overlays, §3.3 verify cache and pool, §3.4 compact blocks, §3.5 batched QC verify | — | §3.6: 4 096 stub records a block, ≤ 300 ms apply at block 10 000 |
-| **2. Recursion** | §4.1 Poseidon2 and FRI chips, §4.2 tree steps, §4.3 auth proof covered, ZKQ-5 binding, inner-profile measurement | — | §4.4 targets measured on one 80 GB GPU; aggregate verify ≤ 150 ms warm |
+| **2. Recursion** | §4.1 row cuts (A/B/C landed 2026-10-04: tier 21 → 20), then the quotient, register and blowup levers; §4.2 tree steps, §4.3 auth proof covered, ZKQ-5 binding, inner-profile measurement | — | §4.4 targets measured on one 80 GB GPU; aggregate verify ≤ 150 ms warm |
 | **3a. Forward path, node side** | aggregator ingress and `rand-bundles` topic, `k` aggregates a block, selection by covered fee, pro-rata subsidy, two-lane fees and `prove_base`, bond quota, prover registry and rebate, `MIN_STAKE` | 1 | cluster test: 64 validators (simulated), 4 aggregators, 1 000 tx/s sustained for an hour with the stub rVM; every fee and subsidy lands where §6 says, supply audit holds |
 | **3b. Envelope slimming** | spec amendment, bundle guest, wallet | — (parallel) | ~7 KB covered record measured; privacy review signed off |
 | **3. Cut** | genesis with the §7 parameters; Tour de RAND stage for aggregators on it | 2, 3a, 3b | 1 000 tx/s on the public testnet for a week, measured by `rand_getSupply` and the explorer; the validator and prover sale opens |
