@@ -99,12 +99,6 @@ pub mod domain {
     /// with, or be confused for, the address every already-sealed envelope and every existing
     /// wallet was built against.
     pub const KEM_SEED_VERSION: u32 = 16;
-    /// RPL-3 perps (fullnode `ledger::perps::domain`, which mirrors these): a block's input
-    /// digest `D_h`, the engine's state root `R`, and a state proof's payouts digest — each
-    /// `perps::perp_digest` over a length-prefixed, chunked word string. 17–20 are left free.
-    pub const PERP_BLOCK: u32 = 21;
-    pub const PERP_STATE: u32 = 22;
-    pub const PERP_PAYOUTS: u32 = 23;
     pub const TEST: u32 = 0xff;
 }
 
@@ -504,22 +498,4 @@ pub fn bundle_inputs(
     v[BURN_LO] = burn as u32; v[BURN_HI] = (burn >> 32) as u32;
     v[ASSET] = asset; v[TIME] = time;
     v
-}
-
-#[cfg(test)]
-mod tests {
-    use super::domain;
-    use randprotocol_core::ledger::perps;
-
-    /// The ledger computes `D_h`, `R` and the payouts digest through the executor under its own
-    /// copies of the three domains; a guest uses these. They must be the same words. Likewise the
-    /// tier list `PerpsConfig::check` holds `max_tier` to.
-    #[test]
-    fn perp_domains_match_core() {
-        assert_eq!(domain::PERP_BLOCK, perps::domain::BLOCK);
-        assert_eq!(domain::PERP_STATE, perps::domain::STATE);
-        assert_eq!(domain::PERP_PAYOUTS, perps::domain::PAYOUTS);
-        let tiers: Vec<usize> = perps::TIERS.iter().map(|&t| t as usize).collect();
-        assert_eq!(tiers, crate::machine::TIERS, "PerpsConfig::check's tier list is the machine's");
-    }
 }

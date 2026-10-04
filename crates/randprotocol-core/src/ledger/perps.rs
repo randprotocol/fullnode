@@ -39,8 +39,8 @@ pub const ORACLE_STALE_BLOCKS: u64 = 30;
 pub const DIGEST_CHUNK_WORDS: usize = 4000;
 
 /// The Poseidon2 domains of the perp words, mirrored from `randprotocol-zkvm`'s
-/// `notes::domain::{PERP_BLOCK, PERP_STATE, PERP_PAYOUTS}` (core cannot name the zkvm crate; a
-/// test there pins the two).
+/// `perps::{PERP_BLOCK, PERP_STATE, PERP_PAYOUTS}` (core cannot name the zkvm crate; a test
+/// there pins the two).
 pub mod domain {
     /// A block's input digest `D_h`.
     pub const BLOCK: u32 = 21;
