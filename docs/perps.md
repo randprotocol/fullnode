@@ -92,7 +92,11 @@ The bound is the worst single block, and that is a mass liquidation: one counter
 the 14 other traders, whose close liquidates all 14. Measured on the pinned engine (durian.market
 `scripts/check-perp-guest.sh`, case `block-14liq`; README "Perps" has the table): 153 845 cycles
 with no inputs before the close, 212 018 with 24, 292 773 with 120. So `max_block_inputs` = 120
-needs `max_tier` 20; tier 18 with 15 % headroom holds about 24 inputs; tier 16 holds no close
+needs `max_tier` 20; tier 18 with 15 % headroom holds about 24 inputs. **The production sizing is
+`max_tier` 18 with `max_block_inputs` ≤ 24**; the check's gate protects it (case
+`block-24-14liq`, 212 018 cycles, must fit tier 18 with 15 % headroom), while `block-14liq`, the
+120-input ceiling, is reported but not gated. A per-close liquidation cap that would let more
+inputs fit is a later engine milestone. Tier 16 holds no close
 that liquidates more than a few accounts at any input count (7 liquidations alone are 76 493
 cycles), so the devnet's tier-16 genesis proves its fill blocks but not a mass liquidation.
 
