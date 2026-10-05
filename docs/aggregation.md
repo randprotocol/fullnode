@@ -104,9 +104,12 @@ state: the rule lives in that one function.
 derives the commitment from its own `max(subsidy(n), shares)`, admits the aggregate and appends
 that note whatever the envelope says. An envelope sealed at `subsidy(n) + shares` therefore opens
 to a commitment matching no leaf, and the payout is lost to the wallet that holds it. The flag is
-read off `rand_getLimits.fee_rules.subsidy_net_of_fees` (`null` — no rule on, or a node that
-predates the section — is the old sum); `rand-node aggregate` reads it there beside
-`rand_status.aggregation`'s schedule and seals at
+read off `rand_getLimits.fee_rules.subsidy_net_of_fees` (`null` — no rule on — a reply that
+predates the section and a node with no `rand_getLimits` at all are the old sum).
+`rand-node aggregate` reads it through its client's cached limits (`RpcClient::fee_rules`, the
+same one `rand_getLimits` read the envelope format comes from: the section is fixed at genesis,
+so one read per daemon, never one per pass that a transient RPC failure could abort — issue
+#132), takes `rand_status.aggregation`'s schedule beside it, and seals at
 `aggregation::minted_subsidy(subsidy(n), shares, &fees) + shares`, the ledger's own function
 (pinned by `the_aggregate_pass_seals_the_ledgers_payout_under_subsidy_net_of_fees`). A third-party
 aggregator must do the same.
