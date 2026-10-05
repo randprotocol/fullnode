@@ -9,6 +9,24 @@ are **out of scope** here and stay on the §3 list.
 
 Branch `feat/hot-path`, worktree `~/rand-worktrees/fullnode-hot-path`, from `main` at `4c03dcb1`.
 
+## 0. Amendments from planning (2026-10-05)
+
+The implementation plan (`docs/superpowers/plans/2026-10-05-validator-hot-path.md`, "Spec
+corrections") amends this spec where the code differed from what it assumed:
+
+1. §3: the covered path adds no nullifiers today (an aggregate covers bundles already applied
+   raw), so the harness has one shape — raw bundles at the 2 000 cap, two nullifiers and four
+   commitments each, 40 M nullifiers at 10 000 blocks. `--bundles` replaces `--records`;
+   `--shape` is dropped. A `propose_ms` column is added.
+2. §5 gains a fifth change: `HotStuff::propose` clones the ledger once per candidate; it now
+   applies candidates directly and replays the accepted set on a failure, at most eight times a
+   block.
+3. §4.1: this branch has no perps section; the new tag follows `tokens_incremental_root`, the
+   last tag today. The slot swap happens in `state_root_leaves`.
+4. §5.1: `SharedSet` implements `PartialEq` (the ledger's hand-written equality uses it);
+   `len()` is exact always. `HotStuff::new` detaches the base; `HotStuff::resume` folds the delta.
+5. §8: no `proptest` in the workspace; randomised tests use seeded `rand::rngs::StdRng`.
+
 ## 1. Goal and success criteria
 
 The validator applies a 4 096-record block inside a slot at the 10 000th block as fast as at the
