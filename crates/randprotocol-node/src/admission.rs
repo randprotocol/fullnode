@@ -570,11 +570,14 @@ impl VerifyLimits {
     }
 
     /// `--verify-workers N`: exactly N, `0` refused — never defaulted, as `--threads 0` is not.
+    /// A count whose queue (`N × QUEUE_PER_WORKER`) does not fit a `usize` is refused by name
+    /// rather than wrapped into a small queue.
     pub fn fixed(workers: usize) -> Result<VerifyLimits, String> {
         if workers == 0 {
             return Err("--verify-workers must be at least 1".into());
         }
-        Ok(VerifyLimits { in_flight: workers, queue: workers * Self::QUEUE_PER_WORKER })
+        let queue = workers.checked_mul(Self::QUEUE_PER_WORKER).ok_or_else(|| format!("--verify-workers too large: {workers}"))?;
+        Ok(VerifyLimits { in_flight: workers, queue })
     }
 }
 
@@ -1051,6 +1054,10 @@ mod tests {
         assert_eq!(VerifyLimits::for_cores(16), VerifyLimits { in_flight: 14, queue: 224 });
         assert_eq!(VerifyLimits::fixed(3).unwrap(), VerifyLimits { in_flight: 3, queue: 48 });
         assert!(VerifyLimits::fixed(0).unwrap_err().contains("at least 1"));
+        // The queue is `workers × QUEUE_PER_WORKER`: a count whose queue overflows is refused,
+        // not wrapped (final review M4).
+        assert!(VerifyLimits::fixed(usize::MAX).unwrap_err().contains("too large"));
+        assert!(VerifyLimits::fixed(usize::MAX / VerifyLimits::QUEUE_PER_WORKER).is_ok());
         assert!(VerifyLimits::for_host().in_flight >= 4);
     }
 
