@@ -2401,7 +2401,10 @@ see:
   `subsidy + proving_share` is always the payout note's amount. All three numbers are the
   payment the ledger made while applying the aggregate, stored as it committed — not recomputed
   from the database, which on a node syncing several blocks in one commit missed a cover
-  committed in the same batch (fee feedback, 2026-10-05).
+  committed in the same batch (fee feedback, 2026-10-05). Because the record has no fallback,
+  storage refuses to commit a block whose aggregates do not each carry exactly one such payment
+  record (an error naming the height and the aggregate's hash) rather than land a sealed block
+  `rand_getAggregate` could only answer without them (#133).
 - **`rand_getAggregators`** lists the register (public by design): `address`, `bond`,
   `payout`, `nonce`, `unbonding` per row.
 - **`rand_getUnsealed(from, limit)`** pages the bundles an aggregator may still cover —
