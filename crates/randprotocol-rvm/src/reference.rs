@@ -3,7 +3,7 @@
 //!
 //! **Nothing here is a second implementation of anything.** Every step runs the very code
 //! `randprotocol_zkvm::machine::verify` runs: `p3_batch_stark::BatchTranscript` for the eight observe/sample
-//! steps, `p3_batch_stark::verifier::commitments_with_opening_points` for the opening argument,
+//! steps, `p3_batch_stark::verifier::commitments_with_opening_points_with_layout` for the opening argument,
 //! `p3_uni_stark::recompose_quotient_from_chunks` and `p3_uni_stark`'s own
 //! `VerifierConstraintFolder` (through `p3_lookup`'s `eval_air_and_lookups`) for the per-instance
 //! accumulator, and `p3_fri::verifier::{open_inputs, fold_query}` plus the MMCS's own
@@ -23,7 +23,7 @@ use crate::shape::{
 };
 use p3_air::BaseAir;
 use p3_batch_stark::BatchTranscript;
-use p3_batch_stark::verifier::commitments_with_opening_points;
+use p3_batch_stark::verifier::commitments_with_opening_points_with_layout;
 use p3_challenger::{CanObserve, CanSample, FieldChallenger, GrindingChallenger};
 use p3_commit::{ExtensionMmcs, LagrangeSelectors, Mmcs, PolynomialSpace};
 use p3_field::{
@@ -120,7 +120,7 @@ pub enum ReplayError {
     Key,
     /// One of the ZK commitments the config requires is absent.
     Randomization,
-    /// `commitments_with_opening_points` refused the opening argument's shape.
+    /// `commitments_with_opening_points_with_layout` refused the opening argument's shape.
     OpeningArgument(String),
     /// `accumulator · inv_vanishing != quotient` for this instance.
     Constraints(usize),
@@ -274,7 +274,23 @@ where
     let zeta = transcript.sample_zeta();
 
     // ── the opening argument ────────────────────────────────────────────────────────────────────
-    let (mut rounds, quotient_domains) = commitments_with_opening_points::<Config, ShapeAir>(
+    // Every instance's quotient chunks: the committed count, each exactly `DIMENSION` values —
+    // `verify_batch`'s own shape check, which it makes before building the argument. Under
+    // `QuotientLayout::PerInstance` the builder concatenates the chunks into one claimed row and
+    // relies on it: a short chunk would otherwise make a shorter row, not a refusal.
+    let d = <EF as BasedVectorSpace<Val>>::DIMENSION;
+    if batch.opened_values.instances.len() != n {
+        return Err(ReplayError::Shape);
+    }
+    for i in 0..n {
+        let qcs = &batch.opened_values.instances[i].base_opened_values.quotient_chunks;
+        if qcs.len() != (1usize << shape.log_num_quotient_chunks()[i]) << is_zk
+            || qcs.iter().any(|c| c.len() != d)
+        {
+            return Err(ReplayError::Shape);
+        }
+    }
+    let (mut rounds, quotient_domains) = commitments_with_opening_points_with_layout::<Config, ShapeAir>(
         cfg,
         &airs,
         zeta,
@@ -284,6 +300,7 @@ where
         &batch.degree_bits,
         shape.preprocessed_widths(),
         shape.log_num_quotient_chunks(),
+        shape.quotient_layout(),
     )
     .map_err(|e| ReplayError::OpeningArgument(format!("{e:?}")))?;
 

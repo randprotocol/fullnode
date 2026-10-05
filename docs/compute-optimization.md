@@ -234,10 +234,18 @@ tier-20 production N = 1 projects to **≈ 240 GB** and the tier-18 test twin to
 projections until the tier-20 production proof runs on a ≥ 256 GB host. macOS RSS figures are
 never memory numbers (they exclude compressed pages); the Linux `/usr/bin/time -v` peaks are.
 
+**Landed 2026-10-05 (quotient layout, circuits `5ff7676`, `recursion/docs/05-quotient-layout.md`):**
+one committed quotient matrix per instance (the rVM pins `PerInstance` in a vendored
+`p3-batch-stark` fork; the RV32 wallet machine keeps upstream's `PerChunk`). At tier 16 the peak
+live heap fell 9.09 → 6.41 GB (−29 %), prove 40.7 → 32.9 s, proof −19 %; the tier-18 test twin
+proved on the 48 GB laptop at 33.27 GB peak live in 185 s on 16 threads, so a 64 GB host runs the
+test-profile N = 1 aggregate with margin (measured). Production N = 1 projected ≈ 240 →
+**≈ 170–175 GB** — a projection until the tier-20 production proof runs on a ≥ 256 GB host.
+
 **Still ahead, in order of leverage** (`recursion/docs/04`, "Still ahead"):
 
-- the quotient's share: commit one instance's chunks as one matrix (−20 % of the peak at tier 19,
-  and 16 Merkle paths a query become one); a degree-2 memory AIR as a second lever on the term;
+- the quotient's share: ~~commit one instance's chunks as one matrix~~ (landed 2026-10-05, above);
+  a degree-2 memory AIR as the remaining lever on the term;
 - the register table's height (4× the cpu table, ~2.5 `REG` messages a cpu row): a wider cpu row
   that reads fewer registers;
 - a REDUCE descriptor table (~240 k rows) and the FADDI per COMPRESS level (~16 k);

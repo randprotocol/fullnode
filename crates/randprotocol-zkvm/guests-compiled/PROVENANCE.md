@@ -5,7 +5,7 @@ same path under `guests-compiled/` in the public circuits repository
 (<https://github.com/randprotocol/zkp-circuits>). Nothing here is built or edited in this
 repository. The copies are byte-identical to this circuits commit:
 
-circuits: 75b78938c5b81851cad3fe2d21de1f8378360bc1
+circuits: 5ff7676a6da6ddf22ebf581efa09557696799a95
 
 That is the commit `.github/workflows/ci.yml` checks out as `CIRCUITS_PIN`; `tests/guest_provenance.rs`
 refuses a manifest whose commit differs from it.

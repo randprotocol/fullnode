@@ -285,13 +285,16 @@ fn the_committed_program_digest_is_reproducible() {
 /// at tier 19 in constraint set 8, 441 643 in constraint set 6), with the exact shape of Task 10's
 /// production exit (tier 20, 893 606 rows). `#[ignore]`d for its cost: the tier-19 twin was
 /// killed at 78.7 GB live on a 48 GB box (`recursion/docs/04-phase2-row-cuts.md` §"The prover's
-/// live heap", against a 94.2 GB Linux peak); one height shorter (all but the poseidon2 and reduce tables), the tier-18 twin is
-/// ≈ 47–50 GB by the measured terms — still above this box. The sibling
+/// live heap", against a 94.2 GB Linux peak); one height shorter (all but the poseidon2 and reduce
+/// tables), the tier-18 twin was projected at ≈ 47–50 GB. Since the quotient-layout fork the same
+/// shape proves on this 48 GB box at 33.27 GB peak live (2026-10-05,
+/// `tests/memprofile.rs::tier19_exit_twin`, 16 threads; `recursion/docs/05-quotient-layout.md`).
+/// The sibling
 /// `cheating.rs`'s `a_proof_of_one_program_does_not_verify_another` covers the small-scale case;
 /// here the R1 binding is checked at full scale: a proof of the verifier program never verifies
 /// against a *different* program's key.
 #[test]
-#[ignore = "the M5.2 Task-10 twin: post-cut program, tier 18, ~47-50 GB projected from the tier-19 94 GB Linux peak (tier 19 was killed at 78.7 GB live on 48 GB, docs/04); run alone: cargo +1.98.1 test -p recursion --release --test exit twin -- --ignored --nocapture"]
+#[ignore = "the M5.2 Task-10 twin: post-cut program, tier 18; the same shape proved on this 48 GB box at 33.27 GB live, 2026-10-05, since the quotient-layout fork (docs/05; tier 19 was killed at 78.7 GB live, docs/04); run alone: cargo +1.98.1 test -p recursion --release --test exit twin -- --ignored --nocapture"]
 fn twin_the_post_cut_verifier_program_over_one_test_profile_proof_proves_and_verifies_natively() {
     let p = common::bundle_proofs(FriProfile::Test, 1).pop().unwrap();
     let shape = InnerShape::of(FriProfile::Test, p.proof.tier, p.proof.program_log_height,

@@ -23,7 +23,13 @@ only — push it to the `randprotocol` remote before CI, a clean clone or a cut 
 (`git -C circuits push org main`; until then `cargo` cannot fetch the backend's revision). Memory:
 the tier-19 rVM proof holds 78.7 GB *live*; the tier-20 production N=1 projects to ≈ 240 GB
 (≥ 256 GB host) until proved — never quote macOS RSS as a memory number. `sync-zkvm.sh` rewrites
-upstream's new `license` line to the workspace form.
+upstream's new `license` line to the workspace form. Re-vendored again at `5ff7676` (the
+quotient-layout fork, `vendor/p3-batch-stark` here too): rVM proofs one quotient matrix per
+instance, the aggregate program digest unchanged. `CIRCUITS_PIN` = `5ff7676…` while both
+manifests' `rand-zkvm-cuda` `rev` stays `75b78938…` (backend sources identical; synced with
+`CUDA_REV=75b7893…` before `5ff7676` was pushed — push it to `randprotocol` before CI, trap 4).
+Memory, measured: the tier-18 test twin proves at 33.27 GB peak live (a 64 GB host suffices);
+production N=1 projected ≈ 170–175 GB.
 
 ### v0.7.0 — released and ROLLED onto chain 20 (2026-10-02 ~00:15 UTC; node-only)
 

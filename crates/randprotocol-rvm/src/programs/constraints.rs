@@ -97,6 +97,9 @@ pub struct RawInstance {
     /// One entry per *committed* chunk (`(1 << log_num_quotient_chunks) << is_zk`), each `DIMENSION`
     /// extension values wide.
     pub quotient_chunks: Vec<Array<Ext>>,
+    /// The same values as one contiguous run — the per-instance quotient matrix's claimed row under
+    /// `QuotientLayout::PerInstance` (`docs/05`). `quotient_chunks` are slices of it.
+    pub quotient_run: Array<Ext>,
     /// The ZK `random` round's `DIMENSION` opened values.
     pub random: Array<Ext>,
     /// `aux_width · DIMENSION` base-flattened permutation values, at `zeta` and at `zeta·g`.
@@ -194,6 +197,7 @@ pub fn read_openings<S: VerifierShape>(
             pre_local,
             pre_next,
             quotient_chunks,
+            quotient_run: chunk_run,
             random,
             perm_local,
             perm_next,

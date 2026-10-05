@@ -486,13 +486,25 @@ fn observe_claimed<S: VerifierShape>(
     rounds.push(mats);
     metas.push(RoundMeta { name: "main", cap: caps.main });
 
-    // `quotient_chunks`: one matrix per committed chunk, instance-major (`verifier/mod.rs:203-212`).
+    // `quotient_chunks`: under the RV32 machine's `PerChunk` layout one matrix per committed chunk,
+    // instance-major (`verifier/mod.rs:203-212`); under the rVM's own `PerInstance` layout
+    // (`docs/05-quotient-layout.md`, the fork) one matrix per instance whose claimed row is every
+    // chunk's `DIMENSION` values in order, with the four hidden values once. The aggregate programs
+    // verify RV32 proofs and take the first branch, so their emitted code does not move.
     let mut mats = Vec::new();
     for i in 0..n {
-        for c in 0..committed_chunks(shape, i) {
-            let pts =
-                vec![point(b, ch, zeta, o.raw[i].quotient_chunks[c], NUM_RANDOM_CODEWORDS)];
-            mats.push(MatrixOpening { log_height: h_of(i), points: pts });
+        match shape.quotient_layout() {
+            p3_batch_stark::QuotientLayout::PerChunk => {
+                for c in 0..committed_chunks(shape, i) {
+                    let pts =
+                        vec![point(b, ch, zeta, o.raw[i].quotient_chunks[c], NUM_RANDOM_CODEWORDS)];
+                    mats.push(MatrixOpening { log_height: h_of(i), points: pts });
+                }
+            }
+            p3_batch_stark::QuotientLayout::PerInstance => {
+                let pts = vec![point(b, ch, zeta, o.raw[i].quotient_run, NUM_RANDOM_CODEWORDS)];
+                mats.push(MatrixOpening { log_height: h_of(i), points: pts });
+            }
         }
     }
     rounds.push(mats);

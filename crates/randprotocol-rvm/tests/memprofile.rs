@@ -21,7 +21,8 @@
 //!    how far RSS is from the live count, not as a measurement).
 //!
 //! Run (the exit twin's shape — tier 19 at constraint set 8, tier 18 since phase 2's row cuts;
-//! single-threaded; does not fit a 48 GB box, run on ≥ 128 GB):
+//! since the quotient-layout fork it proves on a 48 GB box at 33.27 GB peak live, 2026-10-05,
+//! `docs/05-quotient-layout.md`; add `--features parallel` and `RAYON_NUM_THREADS=16` for threads):
 //! `cargo test --release -p recursion --test memprofile tier19 -- --ignored --nocapture`
 //! The toy (`tier8`) is the harness's own smoke test.
 mod common;
@@ -271,10 +272,13 @@ fn tier16_synthetic_threads() {
 /// The exit twin's shape (`tests/exit.rs`): the verifier program over one real test-profile
 /// bundle proof — tier 19 at constraint set 8, the shape the 503 GB box measured at 94.2 GB RSS
 /// and this harness at 78.7 GB live when killed (2026-10-03, `docs/04-phase2-row-cuts.md`).
-/// Since phase 2's row cuts the same proof is 230 950 rows, tier 18 (≈ 47–50 GB by the measured
-/// terms); the name is kept for the record it produced.
+/// Since phase 2's row cuts the same proof is 230 950 rows, tier 18 (≈ 47–50 GB projected by the
+/// measured terms). Since the quotient-layout fork it proves on this 48 GB box: 33.27 GB peak
+/// live, prove 185.4 s on 16 threads, verify 5.46 s, 268 417 B (2026-10-05,
+/// `docs/05-quotient-layout.md`, `docs/measurements/2026-10-05-tier18-twin-memprofile.log`). The
+/// name is kept for the record it produced.
 #[test]
-#[ignore = "one exit-twin rVM proof under the heap profiler (tier 18 since phase 2; 78.7 GB live when killed at tier 19): does not fit a 48 GB box; run on >= 128 GB"]
+#[ignore = "one exit-twin rVM proof under the heap profiler (tier 18 since phase 2): proved on this 48 GB box at 33.27 GB live, 2026-10-05, since the quotient-layout fork (78.7 GB live when killed at tier 19 before it); ~3 min on 16 threads with --features parallel"]
 fn tier19_exit_twin() {
     use randprotocol_zkvm::machine::FriProfile;
     use randprotocol_rvm::dsl::Checkpoints;
@@ -298,5 +302,5 @@ fn tier19_exit_twin() {
     let tv = Instant::now();
     m.verify(&vp.program, &proof).unwrap();
     println!("verify {:.2} s", tv.elapsed().as_secs_f64());
-    report("tier19 exit twin", t0, exec.cpu_rows(), proof.tier, proof.size(), prove_s);
+    report("exit twin (tier 18)", t0, exec.cpu_rows(), proof.tier, proof.size(), prove_s);
 }

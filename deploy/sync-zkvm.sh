@@ -189,6 +189,13 @@
 # is byte-identical to `aeacf31`'s apart from `license = "GPL-3.0-only"` in its manifest (the LICENSE
 # commit `bf15bbb`, also in `rand-zkvm-cuda/Cargo.toml` — which is why `CUDA_REV` has to move to
 # `75b7893` with it) and its AGENTS.md; the rVM is what moved (the recursion section below).
+# Then at `5ff7676` (circuits main, the merge of `feat/rvm-quotient-layout`, 2026-10-05): research
+# is byte-identical to `75b7893`'s apart from its AGENTS.md; the rVM is what moved (the recursion
+# section below). `5ff7676` was synced before it was pushed to zkp-circuits, with
+# `CUDA_REV=75b78938c5b81851cad3fe2d21de1f8378360bc1` (the pushed commit; `rand-zkvm-cuda/` and
+# `research/src/poseidon2_constants.rs` are identical between the two), so `CIRCUITS_PIN` names
+# `5ff7676` while both manifests' `rand-zkvm-cuda` rev stays `75b7893` — the split CI's provenance
+# job allows, since it checks the backend is the same at both.
 #
 # Audit v6 PROC-2 (issue #109, 2026-10-01): a clone of this repository alone has to build, so no
 # manifest here may name a path outside the repository — cargo loads every path dependency's
@@ -459,7 +466,12 @@ echo "reminder: --features cuda / mock-cuda / reference-backend fetch rand-zkvm-
 # `parallel` feature (optional `p3-maybe-rayon`/`rayon`, Plonky3's rayon for the prover) and the two
 # patched Plonky3 crates as a `[patch.crates-io]` in upstream's manifest — cut here with the
 # profiles, since this workspace's root carries the identical patch on `vendor/`; and upstream's
-# own `license` line, rewritten to the workspace form below). Re-vendoring the rVM alone is this section alone: the research
+# own `license` line, rewritten to the workspace form below), then at `5ff7676` (the quotient-layout
+# fork, 2026-10-05, `recursion/docs/05-quotient-layout.md`: `machine::QUOTIENT_LAYOUT = PerInstance`,
+# `VerifierShape::quotient_layout`, `tests/quotient_layout.rs`; the aggregate program digest and the
+# admission vectors unchanged; upstream's `[patch.crates-io]` now names three crates — the third
+# circuits' `vendor/p3-batch-stark` fork — and is cut with the profiles as before; the workspace
+# root carries the same three). Re-vendoring the rVM alone is this section alone: the research
 # section above rewrites `guests-compiled/PROVENANCE.md` and would carry research's older drift. Two vendored files carry hand fixes this
 # section does not reproduce — keep them when re-syncing: `Cargo.toml`'s `license.workspace`
 # line and `tests/backend.rs`'s doc comment (`randprotocol-zkvm`, not the old crate name). What the
@@ -555,4 +567,4 @@ if "license.workspace = true" not in s:
 PY
 sed -i '' 's|crates/shrugg-zkvm/tests/backend.rs|crates/randprotocol-zkvm/tests/backend.rs|' "$RVM_DST/tests/backend.rs"
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 75b7893) into $RVM_DST"
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 5ff7676, the quotient-layout fork) into $RVM_DST"

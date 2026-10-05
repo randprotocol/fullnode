@@ -662,6 +662,12 @@ pub trait VerifierShape: Clone + PartialEq + Eq + std::fmt::Debug {
     fn preprocessed_matrix_to_instance(&self) -> &[usize];
     fn degree_bits(&self) -> &[usize];
     fn log_num_quotient_chunks(&self) -> &[usize];
+    /// How the proofs of this shape commit their quotient chunks (`docs/05-quotient-layout.md`):
+    /// the RV32 machine's proofs one matrix per chunk (Plonky3's layout, which the aggregate
+    /// program's emitted code — and digest — is pinned to); the rVM's own proofs one matrix per
+    /// instance (`machine::QUOTIENT_LAYOUT`). The replay, the tape and the program's quotient
+    /// round all follow this one answer.
+    fn quotient_layout(&self) -> p3_batch_stark::QuotientLayout;
     fn num_lookups(&self) -> &[usize];
     fn num_queries(&self) -> usize;
     fn query_pow_bits(&self) -> usize;
@@ -720,6 +726,9 @@ impl VerifierShape for InnerShape {
     }
     fn log_num_quotient_chunks(&self) -> &[usize] {
         &self.log_num_quotient_chunks
+    }
+    fn quotient_layout(&self) -> p3_batch_stark::QuotientLayout {
+        p3_batch_stark::QuotientLayout::PerChunk
     }
     fn num_lookups(&self) -> &[usize] {
         &self.num_lookups
@@ -1138,6 +1147,9 @@ impl VerifierShape for RvmShape {
     }
     fn log_num_quotient_chunks(&self) -> &[usize] {
         &self.log_num_quotient_chunks
+    }
+    fn quotient_layout(&self) -> p3_batch_stark::QuotientLayout {
+        crate::machine::QUOTIENT_LAYOUT
     }
     fn num_lookups(&self) -> &[usize] {
         &self.num_lookups

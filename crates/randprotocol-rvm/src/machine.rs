@@ -6,8 +6,10 @@
 //! same field, extension, Poseidon2 permutation, hiding FRI profile and batch machinery. What is
 //! new is the chip set and that the verifier key is **program-dependent** (plan R1/R6): the
 //! program table is preprocessed, so the preprocessed cap binds every program word and there is
-//! no in-circuit `hc` digest.
-use p3_batch_stark::{prove_batch, verify_batch, BatchProof, CommonData, ProverData, StarkInstance};
+//! no in-circuit `hc` digest. Since the quotient-layout fork (`docs/05`) the rVM's own proofs
+//! commit their quotient chunks one matrix per instance (`QUOTIENT_LAYOUT`); the inner RV32 proofs
+//! it verifies do not.
+use p3_batch_stark::{prove_batch_with_layout, verify_batch_with_layout, BatchProof, CommonData, ProverData, QuotientLayout, StarkInstance};
 use p3_commit::ExtensionMmcs;
 use p3_dft::Radix2DitParallel;
 use p3_field::{PrimeCharacteristicRing, PrimeField64};
@@ -31,6 +33,15 @@ type Dft = Radix2DitParallel<Val>;
 pub type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, SaltRng>;
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
+
+/// How this machine commits each instance's quotient chunks (`docs/05-quotient-layout.md`): one
+/// matrix per instance, salted once, instead of Plonky3's one matrix per chunk — the prover's
+/// largest memory term cut by about 60 % of itself. A property of the machine, pinned here like the
+/// FRI profile and the degree pins, and deliberately *not* a field of [`Proof`]: a verifier must
+/// not let a proof choose how it is checked. A proof made under the other layout is refused by
+/// `verify` (the PCS's matrix-count or row-width check), never accepted. The RV32 machine
+/// (`research/`) keeps upstream's `PerChunk`; flipping it is a constraint-set cut.
+pub const QUOTIENT_LAYOUT: QuotientLayout = QuotientLayout::PerInstance;
 
 use crate::emulator::{execute, ExecError, Execution};
 use crate::isa::{DecodeError, Instr, Op, Program, NUM_REGS};
@@ -473,6 +484,13 @@ impl Machine {
     /// the RV32 `prove_traces`'s role: a tampered trace goes in, and `prove_batch`'s debug
     /// constraint checker (or the batch verifier on the produced proof) is what must catch it.
     pub fn prove_traces(&self, program: &Program, traces: &Traces, tier: Tier) -> Proof {
+        self.prove_traces_with_layout(program, traces, tier, QUOTIENT_LAYOUT)
+    }
+
+    /// [`prove_traces`](Self::prove_traces) under an explicit quotient layout — the layout tests'
+    /// entry point, so a proof under upstream's `PerChunk` layout can be built and shown refused.
+    /// Every proof this machine publishes is `QUOTIENT_LAYOUT`'s.
+    pub fn prove_traces_with_layout(&self, program: &Program, traces: &Traces, tier: Tier, layout: QuotientLayout) -> Proof {
         let arc = Arc::new(program.clone());
         let airs = chips(&arc, tier, traces.reduce_log_height);
         let mats = traces.as_slice();
@@ -485,7 +503,7 @@ impl Machine {
         // `self.config` (fresh entropy) for the main/quotient/permutation commitments.
         let key_cfg = key_config(self.profile);
         let prover_data = ProverData::from_airs_and_degrees(&key_cfg, &airs, &log_ext_degrees(program, tier, traces.reg_log_height, traces.ram_log_height, traces.poseidon2_log_height, traces.reduce_log_height));
-        let batch = prove_batch(&self.config, &instances, &prover_data);
+        let batch = prove_batch_with_layout(&self.config, &instances, &prover_data, layout);
         Proof {
             tier,
             reg_log_height: traces.reg_log_height,
@@ -571,7 +589,7 @@ impl Machine {
         let prover_data = ProverData::from_airs_and_degrees(key_cfg, &airs, &log_ext_degrees(program, tier, traces.reg_log_height, traces.ram_log_height, traces.poseidon2_log_height, traces.reduce_log_height));
         // The engines panic (rather than return) on a device failure — `CudaHashEngine::ok`
         // and friends — so a backend fault must not take the caller's process down with it.
-        let batch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prove_batch(cfg, &instances, &prover_data)))
+        let batch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prove_batch_with_layout(cfg, &instances, &prover_data, QUOTIENT_LAYOUT)))
             .map_err(|p| ProveError::Backend(panic_message(p)))?;
         let bytes = postcard::to_allocvec(&batch).map_err(|e| ProveError::Backend(format!("proof serialise: {e}")))?;
         let batch: BatchProof<Config> = postcard::from_bytes(&bytes).map_err(|e| ProveError::Backend(format!("proof convert: {e}")))?;
@@ -589,6 +607,13 @@ impl Machine {
     /// R6: the verifier holds the registered program; the preprocessed cap is the binding (there
     /// is no `hc` public value to check — that is what a preprocessed program table means).
     pub fn verify(&self, program: &Program, proof: &Proof) -> Result<(), VerifyError> {
+        self.verify_with_layout(program, proof, QUOTIENT_LAYOUT)
+    }
+
+    /// [`verify`](Self::verify) under an explicit quotient layout — the layout tests' entry
+    /// point, so a `PerInstance` proof can be shown refused by a `PerChunk` verifier. Every proof
+    /// this machine accepts is checked under `QUOTIENT_LAYOUT`.
+    pub fn verify_with_layout(&self, program: &Program, proof: &Proof, layout: QuotientLayout) -> Result<(), VerifyError> {
         if proof.public_values.len() != NUM_PUBLIC_VALUES { return Err(VerifyError::PublicValues); }
         // `public_values` is deserialized from untrusted bytes as raw `u64`s, and
         // `Val::from_u64` does not reduce: insist on the canonical representative so a proof has
@@ -615,7 +640,7 @@ impl Machine {
         let pv_vals: Vec<Val> = proof.public_values.iter().map(|x| Val::from_u64(*x)).collect();
         let pvs: Vec<Vec<Val>> = (0..airs.len()).map(|i| if i == PUBLIC_VALUES_INDEX { pv_vals.clone() } else { vec![] }).collect();
         let common = self.verifier_key(program, proof.tier, proof.reduce_log_height != 0);
-        verify_batch(&self.config, &airs, &proof.batch, &pvs, &common).map_err(|e| VerifyError::Batch(format!("{e:?}")))
+        verify_batch_with_layout(&self.config, &airs, &proof.batch, &pvs, &common, layout).map_err(|e| VerifyError::Batch(format!("{e:?}")))
     }
 }
 

@@ -94,6 +94,13 @@ opt-level = 2
 # MerkleTreeHidingMmcs held a spin lock around their RNG across rayon work, and a
 # worker waiting on a stolen job could steal another `commit` and spin on its own lock for ever
 # (vendor/p3-fri/src/hiding_pcs.rs, "RandProtocol patch"). Everything else is the crates.io source.
+# `vendor/p3-batch-stark` is a third: p3-batch-stark 0.7.0 with a quotient-layout switch
+# (`QuotientLayout`), the circuits fork copied verbatim from circuits 5ff7676; circuits'
+# `vendor/PROVENANCE.md` and `recursion/docs/05-quotient-layout.md` are its record.
 [patch.crates-io]
 p3-fri = { path = "vendor/p3-fri" }
 p3-merkle-tree = { path = "vendor/p3-merkle-tree" }
+# The quotient-layout fork (circuits `vendor/PROVENANCE.md`, `recursion/docs/05-quotient-layout.md`):
+# `QuotientLayout::PerChunk` is crates.io's behaviour byte for byte and is what `randprotocol-zkvm`
+# (the RV32 machine, every wallet proof) gets; `randprotocol-rvm` pins `PerInstance`.
+p3-batch-stark = { path = "vendor/p3-batch-stark" }

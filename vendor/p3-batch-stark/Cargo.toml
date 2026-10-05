@@ -1,0 +1,47 @@
+# RandProtocol fork of Plonky3's p3-batch-stark 0.7.0 — see ../PROVENANCE.md. The crates.io manifest
+# inherits from Plonky3's workspace; this one spells the same values out. Upstream's integration tests and
+# benches are not carried (they need ten sibling crates as dev-dependencies). The fork's tests are
+# its in-crate `layout_tests` (src/prover.rs) and ../../recursion/tests/quotient_layout.rs, against
+# the machine that uses the patch. The marked [dev-dependencies] block below is what upstream's own
+# #[cfg(test)] modules need to compile. vendor/ has no toolchain file, so run them with the pinned
+# toolchain: `cargo +1.98.1 test --release` (the Cargo.lock that creates is ignored, never committed).
+[package]
+name = "p3-batch-stark"
+version = "0.7.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Batched STARK wrapper atop p3-uni-stark that reuses FRI openings across instances. RandProtocol fork: a quotient-layout switch."
+repository = "https://github.com/Plonky3/Plonky3"
+
+[lib]
+name = "p3_batch_stark"
+path = "src/lib.rs"
+
+[features]
+parallel = ["p3-maybe-rayon/parallel"]
+
+[dependencies]
+p3-air = "=0.7.0"
+p3-challenger = "=0.7.0"
+p3-commit = "=0.7.0"
+p3-field = "=0.7.0"
+p3-lookup = "=0.7.0"
+p3-matrix = "=0.7.0"
+p3-maybe-rayon = "=0.7.0"
+p3-uni-stark = "=0.7.0"
+p3-util = "=0.7.0"
+hashbrown = "0.17.1"
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+thiserror = { version = "2.0", default-features = false }
+tracing = { version = "0.1.44", default-features = false, features = ["attributes"] }
+
+# RandProtocol patch (2026-10-04): quotient layout. The dev-dependencies upstream's in-crate unit
+# tests (`check_constraints.rs`, `verifier/data.rs`) import — crates.io's manifest drops them as
+# workspace path dependencies — so `cargo test` compiles here and runs the fork's `layout_tests`.
+[dev-dependencies]
+p3-baby-bear = "=0.7.0"
+p3-dft = "=0.7.0"
+p3-fri = "=0.7.0"
+p3-merkle-tree = "=0.7.0"
+p3-symmetric = "=0.7.0"
+rand = { version = "=0.10.2", default-features = false, features = ["std_rng"] }  # the recursion crate's pin
