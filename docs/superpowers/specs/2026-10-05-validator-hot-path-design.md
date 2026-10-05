@@ -19,8 +19,9 @@ corrections") amends this spec where the code differed from what it assumed:
    commitments each, 40 M nullifiers at 10 000 blocks. `--bundles` replaces `--records`;
    `--shape` is dropped. A `propose_ms` column is added.
 2. §5 gains a fifth change: `HotStuff::propose` clones the ledger once per candidate; it now
-   applies candidates directly and replays the accepted set on a failure, at most eight times a
-   block.
+   applies candidates directly; a candidate refused by validation (nothing written) is skipped
+   for free, and only a candidate that fails after its notes were written triggers a replay of
+   the accepted set, at most eight times a block (the final review's correction of this item).
 3. §4.1: this branch has no perps section; the new tag follows `tokens_incremental_root`, the
    last tag today. The slot swap happens in `state_root_leaves`.
 4. §5.1: `SharedSet` implements `PartialEq` (the ledger's hand-written equality uses it);

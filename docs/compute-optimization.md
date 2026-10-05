@@ -196,8 +196,9 @@ validators (3.6 GB a day was measured at 18), pruned with history on validators
 ### 3.6 Acceptance
 
 A one-validator local chain with the `StubExecutor`, 4 096 synthetic records a block for
-10 000 blocks: block apply ≤ 300 ms at the 10 000th block, resident memory flat, nullifier set at
-40 M entries. Measured and recorded in `docs/node-hardware.md` before phase 3 is cut.
+10 000 blocks: block apply ≤ 300 ms at the 10 000th block, resident memory linear in the entries
+only (a constant bytes-per-nullifier, no term in height or in the speculative tree), nullifier set
+at 40 M entries or more. Measured and recorded in `docs/node-hardware.md` before phase 3 is cut.
 
 **Measured 2026-10-05** (`/tmp/bench-final-10000.txt`, `docs/node-hardware.md` §7): 56.1 ms replica apply at block 10 000, 8 954 MB resident, 80 M nullifiers (2 000 bundles a block at four nullifier slots each, so twice the 40 M counted here), with `incremental_nullifier_root` on. Resident memory grows at a constant 117 to 121 bytes per nullifier (both sets together), with no term in height.
 
