@@ -1,0 +1,85 @@
+# Line coverage of the Rust test suite, measured with cargo-llvm-cov (LLVM source-based coverage)
+# and uploaded to Codecov, which draws the badge in README.md.
+#
+# What is measured: ci.yml's `check-and-test` run, instrumented — every library and binary suite
+# in the workspace in the release profile, less the fixture-backed and long-proving tests that
+# scripts/ci-fixture-skips.sh names (the one skip list every job shares), then the same cheap
+# integration suites that job names one by one. The two proving suites and the cluster's proving
+# tests are nightly work and are not measured. The vendored Plonky3 forks under `vendor/` are left
+# out of the report; the vendored `randprotocol-zkvm` and `randprotocol-rvm` crates are in it,
+# because the node proves and verifies through them.
+#
+# The upload needs `CODECOV_TOKEN` (an organisation secret on randprotocol, or this repository's):
+# Codecov refuses a push upload without it, so until the secret exists the job runs the suite under
+# instrumentation and fails at the upload step. Every `uses:` is pinned by commit sha with its
+# tag in the trailing comment, as fullnode's ci.yml does.
+name: coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read the repository, nothing else: the job writes to Codecov, not to GitHub.
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: fullnode
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable (branch head, 2026-10-05)
+      # llvm-tools for the toolchain the checkout pins (rust-toolchain.toml, where there is one),
+      # not for the action's: rustup resolves the toolchain from the working directory.
+      - name: llvm-tools for the pinned toolchain
+        working-directory: fullnode
+        run: rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fullnode
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: Library suites
+        working-directory: fullnode
+        run: cargo llvm-cov --no-report --workspace --lib --bins --release -- $(scripts/ci-fixture-skips.sh)
+      - name: Integration suites that do not prove
+        working-directory: fullnode
+        # The same list as ci.yml's check-and-test, named one by one for the same reason: the
+        # cluster suite's proving tests are not distinguishable by name.
+        run: |
+          cargo llvm-cov --no-report -p randprotocol-node --release --test submit --test ws
+          cargo llvm-cov --no-report -p randprotocol-zkvm --release --test guest_provenance --test verifier_key
+          cargo llvm-cov --no-report -p randprotocol-rvm --release --test verifier_key
+          cargo llvm-cov --no-report -p randprotocol-node --release --test cluster -- --exact \
+            a_synced_certified_but_uncommitted_chain_is_not_committed \
+            a_batch_whose_evidence_blocks_are_junk_commits_nothing \
+            a_node_served_one_block_at_a_time_still_reaches_the_tip \
+            four_validators_plus_late_observer_syncs \
+            validator_restarts_from_disk_and_resumes \
+            restart_cycles_keep_all_nodes_in_sync \
+            two_of_four_down_halts_and_recovers_without_fork \
+            node_behind_by_more_than_one_sync_batch_catches_up \
+            corrupted_rocksdb_is_detected_truncated_and_resynced \
+            faucet_mint_via_rpc_reaches_every_node \
+            faucet_is_rejected_when_genesis_disables_it \
+            a_refused_transaction_is_not_verified_twice
+      - name: Report
+        working-directory: fullnode
+        run: cargo llvm-cov report --release --lcov --output-path lcov.info --ignore-filename-regex '(^|/)vendor/'
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: fullnode/lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true

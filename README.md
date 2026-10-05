@@ -1,5 +1,9 @@
 # Randprotocol Full Node and RPC Client
 
+[![coverage](https://codecov.io/gh/randprotocol/fullnode/graph/badge.svg)](https://codecov.io/gh/randprotocol/fullnode)
+
+Line coverage of the Rust test suite, measured by `.github/workflows/coverage.yml` (cargo-llvm-cov, the same suites ci.yml's `check-and-test` runs) on every push to `main` and published to Codecov.
+
 The reference full node for the Rand Protocol chain and its command-line wallet, written in Rust.
 The chain's native token is **RAND**, and it lives in a **fully shielded pool**: there are no
 accounts and no balances, only note commitments and nullifiers, and a transfer is a zero-knowledge
