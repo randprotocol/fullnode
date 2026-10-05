@@ -6,6 +6,21 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-10-02)
 
+### Test push + coverage (2026-10-06; node-only, no chain change)
+
+circuits re-vendored at `5f69747` — research's source is byte-identical to the `5ff7676` pin, the
+commit adds research's seven new test files (155 tests: ISA/emulator edges, hash domain
+separation, `check_declared_heights` bounds, note-layer properties, proof binding, assembler
+edges), which `deploy/sync-zkvm.sh` carries into `crates/randprotocol-zkvm/tests/` — so they run
+here too (nightly-zkvm). `crates/randprotocol-node` gained 54 network tests (40 unit in
+`src/network/*.rs`, 14 real-swarm tests in `tests/network.rs`: topic isolation per chain, a
+rejected message is not forwarded, sync over-limit and timeout paths, reserved-peer caps). Trap
+from the swarm tests: a dialer's `PeerConnected` can arrive **before** its own `Listening` event,
+so a helper that consumes events until `Listening` drops it. `.github/workflows/coverage.yml`
+(cargo-llvm-cov over check-and-test's suites, uploaded to Codecov; the badge in README.md) needs
+the `CODECOV_TOKEN` org secret, set 2026-10-06. circuits' own `main` has moved on to the rVM
+phase 3 merge (`ed67809`); re-vendoring that is a separate job and NOT done here.
+
 ### Validator hot path (2026-10-05, `feat/hot-path`)
 
 Spec `docs/superpowers/specs/2026-10-05-validator-hot-path-design.md`, plan beside it in `plans/`; not merged. Five changes, each in `docs/compute-optimization.md` §3: `rand-node bench apply` (the harness); `SharedSet` for the ledger's commitments and nullifiers, so `Ledger::clone()` is O(delta), with the HotStuff commit step draining deltas into the shared base; `propose` applying candidates in place and replaying the block on a failure (`MAX_PROPOSE_REPLAYS` = 8); the genesis flag `incremental_nullifier_root` (range root `rand-nullifier-mmr-1` in the nullifier slot, composite `rand-state-nf-mmr-1`, `rand-node genesis --incremental-nullifier-root`) with the peaks persisted as `meta/nullifier_mmr` on every commit; `VerifyLimits` sized to the host (`rand-node run --verify-workers`) and QC verification parallel above eight votes, once per (certificate, set). The commit step is sound because at commit every set still held either descends from the committed block (a tree entry after the prune, whose delta already holds the committed entries) or is a read-only membership snapshot, which gaining them cannot hurt. Traps: the `meta/nullifier_mmr` row is the only record of insertion order, so never delete it (a flag-on store missing it refuses to start; nothing rebuilds it); `Ledger::set_incremental_nullifier_root(true)` panics over existing nullifiers, because the flag is a genesis cut, not a switch; a `Ledger` is not a value type across commits under `SharedSet`, read the module doc of `ledger/shared_set.rs` before holding a clone across one; the clippy gate uses `--no-deps` (the untouched zkvm/rvm crates do not pass it); 21 node tests fail as before, the `RECURSION_FIXTURES` gap. Harness: `rand-node bench apply --blocks 10000 --report-every 500 --incremental-nullifier-root`. Measured on an M4 Max (16 cores, 48 GB): 56.1 ms replica apply at block 10 000 with 80 M nullifiers (a bundle inserts all four slots, so 8 000 a block), 8 954 MB resident, `root_ms` 0.00; the same code without the flag was 495 ms at block 300. Nothing is on chain 20: it needs a genesis cut with the flag. Tables in `docs/node-hardware.md` §7.

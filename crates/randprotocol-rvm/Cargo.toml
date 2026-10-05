@@ -42,7 +42,7 @@ postcard = { version = "1", features = ["alloc"] }
 randprotocol-zkvm = { path = "../randprotocol-zkvm" }
 # The GPU (CUDA) and CPU-twin NTT/Poseidon2-Merkle engines the proving backends run on —
 # research's dependency, consumed as-is (M5.4 R1: the rVM's shapes need no new kernels).
-rand-zkvm-cuda = { git = "https://github.com/randprotocol/zkp-circuits", rev = "75b78938c5b81851cad3fe2d21de1f8378360bc1", optional = true }
+rand-zkvm-cuda = { git = "https://github.com/randprotocol/zkp-circuits", rev = "5f69747487c9826af8a4c164d786f420597b375f", optional = true }
 # The `parallel` feature's rayon: Plonky3's maybe-rayon shim (its `parallel` feature turns rayon on in
 # every p3 crate that uses it) and rayon itself, for `RAYON_NUM_THREADS`'s pool.
 p3-maybe-rayon = { version = "=0.7.0", optional = true }
