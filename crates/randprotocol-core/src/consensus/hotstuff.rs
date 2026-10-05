@@ -1328,7 +1328,7 @@ impl HotStuff {
         let mut call_gas = 0u64;
         // Candidates apply to the running ledger directly (spec 2026-10-05, plan correction 2):
         // a clone per candidate was 2 000 clones a block. `apply_tx_with` is not atomic on its
-        // own (its comment), so a failing candidate is undone by rebuilding from the parent and
+        // own (its comment), so a failing candidate is undone by rebuilding from the pre-loop ledger and
         // replaying the accepted ones in order. Deterministic, so the replay cannot fail; if it
         // ever did, the block closes with no ordinary transactions rather than a wrong root.
         // B5: with the admission cache along, a candidate's proofs are not verified a second
@@ -1360,6 +1360,7 @@ impl HotStuff {
                         ledger = base.clone();
                         call_gas = 0;
                         txs.clear();
+                        break;
                     }
                     if replays >= MAX_PROPOSE_REPLAYS {
                         break;
