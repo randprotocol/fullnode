@@ -463,9 +463,11 @@ unauthenticated — it moves only the wallet's own bookkeeping, never what the c
 node that predates the field answers without it, which a wallet reads as `null`.
 
 `fee_rules` is the genesis `fees` section (`docs/fees.md` §1.3), `{ "burn_base": bool,
-"subsidy_net_of_fees": bool }`, or `null` on a chain without one — and on one whose section sets
-no flag `true`, which hashes and runs as no section at all. Informational: under `burn_base` a
-bundle's `BUNDLE_BASE` is destroyed rather than paid to the proposer, but what a sender pays is
+"subsidy_net_of_fees": bool, "burn_floor": bool }`, or `null` on a chain without one — and on one
+whose section sets no flag `true`, which hashes and runs as no section at all. Informational: under
+`burn_base` a bundle's `BUNDLE_BASE` is destroyed rather than paid to the proposer, and under
+`burn_floor` (issue #135; only ever `true` beside `burn_base`) its whole settled floor — the base
+plus a Deploy's per-word term, or a Call's tier-exact gas and byte terms — but what a sender pays is
 unchanged — every floor is the same number — so a wallet changes nothing. A node that predates
 the field answers without it, which a wallet reads as `null`.
 
@@ -1113,7 +1115,9 @@ side and in no register entry, so the identity below subtracts it on its right b
 A decimal string; `"0"` on chain 14, which has no gate.
 
 `base_fees_burned` (fee feedback, unreleased) is Σ of the bundle bases (`BUNDLE_BASE` each)
-burned under the genesis `fees.burn_base` (`docs/fees.md` §1.3): inside `burned` on the pool side,
+burned under the genesis `fees.burn_base` (`docs/fees.md` §1.3) — under `fees.burn_floor` beside
+it, each bundle's whole burned floor (`min(fee, floor)`), one counter for the whole burn under
+either flag: inside `burned` on the pool side,
 in no register entry, subtracted on the identity's right beside `registration_fees_burned`. Under
 the flag `fees_paid` counts only what proposers kept — the tip. A decimal string; `"0"` on every
 chain without the flag.
@@ -1663,10 +1667,11 @@ What changed for clients, in one place. Newest first.
 Additive. `rand_getSupply` gains `base_fees_burned` (a decimal string, `"0"` on every chain
 without the flag): the bundle bases destroyed under the genesis `fees.burn_base`
 (`docs/fees.md` §1.3), on the right of the supply identity beside `registration_fees_burned`.
-`rand_getLimits` gains `fee_rules` (`{ "burn_base", "subsidy_net_of_fees" }`, booleans), `null`
+`rand_getLimits` gains `fee_rules` (`{ "burn_base", "subsidy_net_of_fees", "burn_floor" }`, booleans), `null`
 on a chain whose genesis has no `fees` section with a `true` flag. Under `burn_base` a proposer's
 `rewards` grow by the tip (`fee − BUNDLE_BASE`), or by nothing at inclusion on an aggregating
-chain; no fee a wallet pays changes. Under `subsidy_net_of_fees` `rand_getAggregate`'s `subsidy`
+chain — under `burn_floor` (issue #135) by `fee − floor`, the whole settled floor burned and counted
+in `base_fees_burned`; no fee a wallet pays changes. Under `subsidy_net_of_fees` `rand_getAggregate`'s `subsidy`
 (and `rand_getSupply`'s `subsidised`) carry only the minted part, the schedule's shortfall over
 `proving_share`. Every existing field keeps its value on every chain without the section.
 One fix applies on every chain: `rand_getAggregate`'s `subsidy`, `proving_share` and `n` are now

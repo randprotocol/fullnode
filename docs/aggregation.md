@@ -60,6 +60,9 @@ Under the genesis `fees.burn_base` (`docs/fees.md` §1.3) the verification share
 instead of paid: the proposer keeps nothing at inclusion, `BUNDLE_BASE` joins `burned` and
 `base_fees_burned`, and the proving share — `fee − BUNDLE_BASE`, bucketed exactly as without the
 flag — reaches the covering aggregator, or the recorded proposer at the sweep, as it always has.
+Under `fees.burn_floor` beside it (issue #135) the whole floor is destroyed instead — a Deploy's
+per-word term and a Call's tier-exact gas and byte terms with the base — and the proving share is
+`fee − floor`, so an aggregator is never paid a priced term the chain burned.
 
 ### 3.2 A block subsidy in new RAND
 

@@ -229,8 +229,8 @@ const META_JAILED: &str = "jailed";
 /// audit subtracts it on the right of its identity: the fee left the pool into no register
 /// entry.
 const META_REGISTRATION_FEES_BURNED: &str = "registration_fees_burned";
-/// `bincode(u64)`: Σ of the bundle bases burned under the genesis `fees.burn_base` as of the head
-/// (`Ledger::base_fees_burned`, `docs/fees.md` §1.3). `META_REGISTRATION_FEES_BURNED`'s twin in
+/// `bincode(u64)`: Σ of the bundle bases burned under the genesis `fees.burn_base` (the whole
+/// floors under `fees.burn_floor`) as of the head (`Ledger::base_fees_burned`, `docs/fees.md` §1.3). `META_REGISTRATION_FEES_BURNED`'s twin in
 /// every respect — derived, outside the root and `Ledger`'s equality, written at the same three
 /// sites, replayed by `verify_chain`, on the right of the supply identity — and absent on a
 /// database written before the key existed, where it reads 0: what the ledger holds on every chain
@@ -1640,7 +1640,8 @@ impl Storage {
         Ok(self.get_meta_raw(META_REGISTRATION_FEES_BURNED)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
     }
 
-    /// Σ of the bundle bases burned under `fees.burn_base` as of the head (`META_BASE_FEES_BURNED`)
+    /// Σ of the bundle bases (whole floors under `fees.burn_floor`) burned under `fees.burn_base`
+    /// as of the head (`META_BASE_FEES_BURNED`)
     /// — `registration_fees_burned()`'s twin, with the same rule for a database written before the
     /// key existed: 0, which on a chain without the flag is also the only value it holds.
     pub fn base_fees_burned(&self) -> Result<u64> {
@@ -7882,7 +7883,7 @@ mod tests {
         use randprotocol_core::gas::BUNDLE_BASE;
         use randprotocol_core::ledger::FeesConfig;
         let (_d, s, mut gs) = genesis_with_two_notes();
-        let burn = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None };
+        let burn = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None };
         gs.ledger.set_fees(burn.clone());
         // The fixture's notes are tiny; tell the audit what genesis issued so its identity holds
         // after a fee is paid out of the pool.

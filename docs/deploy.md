@@ -1364,14 +1364,17 @@ same rule as every genesis field before it.
 
 ## The next cut: the `fees` section (fee feedback, unreleased)
 
-**What it is.** A top-level genesis section, `"fees": { "burn_base": true }`, with two optional
+**What it is.** A top-level genesis section, `"fees": { "burn_base": true }`, with three optional
 booleans (`docs/fees.md` §1.3). `burn_base` destroys every bundle's `BUNDLE_BASE` instead of paying
 it to the proposer: the proposer keeps the tip (`fee − BUNDLE_BASE`), or nothing at inclusion on
 an aggregating chain, whose excess is bucketed as before; the base joins `rand_getSupply`'s
 `burned` and `base_fees_burned`. `subsidy_net_of_fees` pays an aggregate's subsidy from its
 proving shares first and mints only the shortfall (the note is `max(schedule, shares)`); it needs
 an `aggregation` section, or `rand-node init` refuses the file
-(`SubsidyNetOfFeesWithoutAggregation`). Absent, or present with no `true` flag, is every chain's
+(`SubsidyNetOfFeesWithoutAggregation`). `burn_floor` (issue #135) widens `burn_base`'s burn to
+the bundle's whole settled floor — the base plus a Deploy's per-word term, or a Call's tier-exact
+gas and byte terms — so the proposer keeps only `fee − floor`; it needs `burn_base: true`, or
+`rand-node init` refuses the file (`BurnFloorWithoutBurnBase`). Absent, or present with no `true` flag, is every chain's
 rule so far and commits nothing; a `true` flag is hashed after the `tokens` section's bytes under
 `fees` and its own tag, so it ships with a chain cut, never as a same-chain update. Never in the
 state root: stored at genesis under `META_FEES` (JSON; written on every new database, the default
@@ -1384,7 +1387,9 @@ genesis carries it — an older node does not refuse the file: `Genesis` has no
 `deny_unknown_fields`, so it silently ignores the section, derives a different genesis hash and
 so cannot join the chain.
 After launch: `rand_getLimits.fee_rules.burn_base == true`, and `rand_getSupply.base_fees_burned`
-grows by `BUNDLE_BASE` per included bundle with `invariant_holds` still `true`.
+grows by `BUNDLE_BASE` per included bundle with `invariant_holds` still `true` — under
+`fee_rules.burn_floor == true`, by each bundle's whole floor (`docs/fees.md` §1.3's worked Deploy
+and Call).
 
 ## The next cut: audit v6's staking fields (STAKE-2)
 

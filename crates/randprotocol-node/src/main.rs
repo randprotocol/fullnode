@@ -2560,6 +2560,10 @@ async fn aggregate_pass(
     let fees = randprotocol_core::ledger::FeesConfig {
         burn_base: limits["fee_rules"]["burn_base"].as_bool(),
         subsidy_net_of_fees: limits["fee_rules"]["subsidy_net_of_fees"].as_bool(),
+        // Issue #135: read for completeness — the daemon's note does not depend on it (the shares
+        // it nets are the ledger's own bucket entries, already `fee − floor` under the flag), but
+        // the struct mirrors the chain's rules whole.
+        burn_floor: limits["fee_rules"]["burn_floor"].as_bool(),
     };
     // `subsidy_base` is a decimal string since node N-3 (2026-09-20); `amount_field` reads
     // either encoding, so this daemon works against an older node too.
@@ -3877,7 +3881,7 @@ mod tests {
                 window: 256,
                 admitted_shapes: vec![],
             }));
-            l.set_fees(FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true) });
+            l.set_fees(FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None });
             l.set_aggregators(
                 [(
                     kp.address(),

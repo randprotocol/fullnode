@@ -20,8 +20,8 @@ Eight counters, all in units (1 RAND = 10⁹ units), all monotonic:
 | `genesis_staked` | the stakes genesis seeded the register with | never after block 0 |
 | `faucet_minted` | every accepted `Mint` (the testnet faucet) | a mint commits |
 | `withdraw_deposited` | the notes accepted `Withdraw`s created | a withdraw commits |
-| `fees_paid` | every bundle fee a proposer kept, i.e. value that left the pool into its `rewards` — under the genesis `fees.burn_base` only the tip, `fee − BUNDLE_BASE` | any bundle commits |
-| `burned` | every bundle `burn` — a `Bond`, burning into `stake`; under the genesis gates below also a registration fee or a bundle's `BUNDLE_BASE`, burning into nothing | a bond commits; under a gate, a registration or any bundle |
+| `fees_paid` | every bundle fee a proposer kept, i.e. value that left the pool into its `rewards` — under the genesis `fees.burn_base` only the tip, `fee − BUNDLE_BASE`, and under `fees.burn_floor` as well `fee − floor` | any bundle commits |
+| `burned` | every bundle `burn` — a `Bond`, burning into `stake`; under the genesis gates below also a registration fee or a bundle's `BUNDLE_BASE` (its whole floor under `fees.burn_floor`), burning into nothing | a bond commits; under a gate, a registration or any bundle |
 | `subsidised` | the aggregation subsidy every accepted `Aggregate` minted into its payout note — under the genesis `fees.subsidy_net_of_fees` only the schedule's shortfall over the covered proving shares (`docs/fees.md` §1.3) | an aggregate commits |
 | `slashed` | what slashing destroyed: a slashed aggregator bond, and under `staking.slashing` an equivocating leader's slashed stake | a slash commits |
 
@@ -33,7 +33,10 @@ or slashed, and it is counted in `register_total` below).
 Two more counters break part of `burned` down, because what they count enters no register entry
 and so sits on the right of the identity below: `registration_fees_burned` (the registration fees
 burned under `tokens.burn_registration_fee`, audit v5 TOK-2) and `base_fees_burned` (every
-bundle's `BUNDLE_BASE` burned under `fees.burn_base`, `docs/fees.md` §1.3). Both are kept beside
+bundle's `BUNDLE_BASE` burned under `fees.burn_base`, `docs/fees.md` §1.3 — or, under
+`fees.burn_floor` beside it, every bundle's whole burned floor, `min(fee, floor)`: the base plus a
+Deploy's per-word term or a Call's tier-exact gas and byte terms; one counter holds the whole burn
+under either flag, so the identity below reads the same). Both are kept beside
 the supply blob rather than in it, so chain 14's stored layout never moved, and both read 0
 without their gate.
 
@@ -74,7 +77,8 @@ is a consensus bug or a damaged database, never a legitimate chain state. Three 
 issuance and sit on the right of the identity as `issued − slashed − registration_fees_burned −
 base_fees_burned`: a slashed aggregator bond (block aggregation); under the genesis
 `tokens.burn_registration_fee` (v0.5.5, audit v5 TOK-2, `docs/tokens.md` §15), a registration's
-fee; and under the genesis `fees.burn_base` (`docs/fees.md` §1.3), every bundle's `BUNDLE_BASE` —
+fee; and under the genesis `fees.burn_base` (`docs/fees.md` §1.3), every bundle's `BUNDLE_BASE`
+(its whole floor under `fees.burn_floor`) —
 the last two leave the pool through `burned` and enter no register entry, which is why they are
 the two counters beside the table above. All three read 0 on chain 14, and the last on every chain
 cut so far.
