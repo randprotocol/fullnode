@@ -9,6 +9,8 @@
 //! parallel: each phase owns its own file.
 
 pub mod aggregation;
+mod shared_set;
+pub use shared_set::SharedSet;
 #[cfg(test)]
 mod bind_tests;
 pub mod bridge_gov;
@@ -560,13 +562,13 @@ fn has_duplicate(words: &[Word8]) -> bool {
 
 /// In-memory chain state: the note commitment tree, the nullifier set, the validator register
 /// and the deployed programs. It is cloned for speculative execution (one clone per block in the
-/// consensus tree, and per trial-apply), and a clone is **not** cheap: the tree is a frontier
-/// (constant size), but `commitments` and `nullifiers` are ordinary `BTreeSet`s, so a clone
-/// copies every commitment and nullifier the chain has — O(state). The audit-v6 review measured
-/// 1.6 ms at 100 000 leaves and nullifiers and 28 ms at 1 000 000 (its own private run; not
-/// re-measured here). This comment said "Cheap to clone" until 2026-09-30. A persistent
-/// (structurally shared) set is the fix when state grows; `AGENTS.md`, "Speculative state is
-/// capped".
+/// consensus tree, and per trial-apply). The tree is a frontier (constant size), and
+/// `commitments` and `nullifiers` are [`SharedSet`]s — a committed base shared by every clone
+/// plus an owned delta — so a clone is O(delta), and the base moves only at `HotStuff` commit
+/// (`docs/superpowers/specs/2026-10-05-validator-hot-path-design.md` §5). As history: when both
+/// were plain `BTreeSet`s a clone copied every entry the chain had, which the audit-v6 review
+/// measured at 1.6 ms for 100 000 leaves and nullifiers and 28 ms for 1 000 000 (its own private
+/// run; not re-measured here). `AGENTS.md`, "Speculative state is capped".
 #[derive(Clone, Debug)]
 pub struct Ledger {
     chain_id: u64,
@@ -576,8 +578,8 @@ pub struct Ledger {
     confidential: bool,
     tree: CommitmentTree,
     /// Every leaf ever appended — spec §7 item 6 needs membership the frontier cannot answer.
-    commitments: BTreeSet<Word8>,
-    nullifiers: BTreeSet<Word8>,
+    commitments: SharedSet,
+    nullifiers: SharedSet,
     /// Block-end roots, oldest first, at most [`Ledger::proof_window`] (ANCHOR_WINDOW without a
     /// genesis `proof_window_blocks`).
     anchors: VecDeque<(u64, Word8)>,
@@ -845,8 +847,8 @@ impl Ledger {
             faucet: false,
             confidential: true,
             tree,
-            commitments: BTreeSet::new(),
-            nullifiers: BTreeSet::new(),
+            commitments: SharedSet::new(),
+            nullifiers: SharedSet::new(),
             anchors,
             validators,
             programs: BTreeMap::new(),
@@ -909,8 +911,8 @@ impl Ledger {
             faucet: false,
             confidential: true,
             tree,
-            commitments,
-            nullifiers,
+            commitments: SharedSet::from_set(commitments),
+            nullifiers: SharedSet::from_set(nullifiers),
             anchors: anchors.into_iter().collect(),
             validators,
             programs,
@@ -1345,6 +1347,26 @@ impl Ledger {
         }
     }
 
+    /// The commit step of the shared sets (spec 2026-10-05 §5.2): the committed ledger's deltas
+    /// become base. `HotStuff` calls it once per commit, on the committed ledger only.
+    pub fn commit_shared_sets(&mut self) {
+        self.commitments.commit();
+        self.nullifiers.commit();
+    }
+
+    /// Drop delta entries the base gained: every surviving speculative ledger, after a commit.
+    pub fn absorb_shared_sets(&mut self) {
+        self.commitments.absorb();
+        self.nullifiers.absorb();
+    }
+
+    /// A private base for this ledger's lineage (`HotStuff::new`): a replica must not share a
+    /// base with the genesis state or with another replica in the same process.
+    pub fn detach_shared_sets(&mut self) {
+        self.commitments.detach();
+        self.nullifiers.detach();
+    }
+
     /// The registry to write: a bridged deposit credits a token's supply and a burn debits it
     /// (`bridge_notes::apply`), and a later task's `Action::RegisterToken` and friends mint
     /// through the same handle.
@@ -1695,7 +1717,7 @@ impl Ledger {
         Ok(())
     }
 
-    pub fn nullifiers(&self) -> &BTreeSet<Word8> {
+    pub fn nullifiers(&self) -> &SharedSet {
         &self.nullifiers
     }
 
@@ -1704,7 +1726,7 @@ impl Ledger {
     }
 
     /// Every commitment ever appended, which the frontier tree cannot answer on its own.
-    pub fn commitments_set(&self) -> &BTreeSet<Word8> {
+    pub fn commitments_set(&self) -> &SharedSet {
         &self.commitments
     }
 
@@ -2967,11 +2989,8 @@ impl Ledger {
     /// The three merkle roots `state_root` binds, in order: nullifiers, validators, programs.
     /// Split out so a state-root mismatch can name the component it diverges in.
     fn state_root_leaves(&self) -> (Hash, Hash, Hash) {
-        let nf_leaves: Vec<Hash> = self
-            .nullifiers
-            .iter()
-            .map(|nf| Hash::digest_domain(b"rand-nullifier-leaf", &word8_to_bytes(nf)))
-            .collect();
+        let mut nf_leaves: Vec<Hash> = Vec::with_capacity(self.nullifiers.len());
+        self.nullifiers.for_each_sorted(|nf| nf_leaves.push(Hash::digest_domain(b"rand-nullifier-leaf", &word8_to_bytes(nf))));
         let val_leaves: Vec<Hash> = self
             .validators
             .iter()
@@ -5054,6 +5073,27 @@ mod tests {
         assert_eq!(le.validate(&t, &PaddedStub), Err(TxError::FeeTooLow { min: today + gas::CALL_PER_KIB, fee: today }));
     }
 
+    /// Spec 2026-10-05 §5.3: a clone taken before a commit keeps answering, and the committed
+    /// ledger's delta is empty after the commit step. A bundle writes all four nullifier slots,
+    /// the two dummies included.
+    #[test]
+    fn shared_sets_commit_and_a_pre_commit_clone_still_answers() {
+        let (a, _) = keys();
+        let mut l = ledger();
+        let t1 = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let good = signed_block(vec![t1], &a, 1, root_after(&l, &[tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]])], &a.address(), 1));
+        let snapshot = l.clone();
+        l.apply_block(&good, &StubExecutor).unwrap();
+        assert_eq!(l.nullifiers().added_len(), 4);
+        l.commit_shared_sets();
+        assert_eq!((l.nullifiers().added_len(), l.nullifiers().len()), (0, 4));
+        assert!(l.is_spent(&[1; 8]));
+        // The snapshot shares the base and now sees the committed spends — by design, since every
+        // live clone descends from the committed head; its len() is exact.
+        assert!(snapshot.is_spent(&[1; 8]));
+        assert_eq!(snapshot.nullifiers().len(), 4);
+    }
+
     #[test]
     fn state_root_covers_tree_nullifiers_validators_and_programs() {
         let mut l = ledger();
@@ -5069,8 +5109,8 @@ mod tests {
             7,
             HC,
             l.tree().clone(),
-            l.commitments_set().clone(),
-            l.nullifiers().clone(),
+            l.commitments_set().snapshot(),
+            l.nullifiers().snapshot(),
             l.anchors().iter().copied().collect(),
             l.validators().clone(),
             l.programs().clone(),
