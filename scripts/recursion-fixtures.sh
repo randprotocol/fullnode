@@ -67,6 +67,8 @@ usage() {
   echo "       $0 --check [<cache dir>]               (check only)" >&2
   echo "<cache dir> defaults to \$RECURSION_FIXTURES, else crates/randprotocol-node/fixtures/recursion" >&2
   echo "(fixture_proof's default too); exit 3 = complete but not the pinned bytes" >&2
+  echo "warning: a prove run without <cache dir> writes into the committed fixtures/recursion set" >&2
+  echo "(the re-pin flow); otherwise pass a scratch cache dir" >&2
   exit 2
 }
 
@@ -152,7 +154,9 @@ for f in "${REQUIRED[@]}"; do
 done
 failed=0
 for p in "${pids[@]}"; do wait "$p" || failed=1; done
-# Said before the check, which may exit on its own.
-[ "$failed" = 0 ] || echo "recursion fixtures: a generator process failed (output above)" >&2
+# A generator failure is exit 1, never the check's verdict on a half-written set.
+if [ "$failed" != 0 ]; then
+  echo "recursion fixtures: a generator process failed (output above)" >&2
+  exit 1
+fi
 check
-[ "$failed" = 0 ] || exit 1
