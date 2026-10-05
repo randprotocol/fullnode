@@ -91,9 +91,10 @@ pub struct Supply {
     pub sealed_blocks: u64,
     /// Σ of every `subsidy(n)` minted at an `Aggregate`'s apply (spec §5.1) — under the genesis
     /// `fees.subsidy_net_of_fees` only its shortfall over the covered proving shares
-    /// (`aggregation::minted_subsidy`, `docs/fees.md` §1.3). This is new issuance, and it is the *whole* of what the payout note adds to these counters: the
-    /// note's other part, the covered bundles' proving shares, is value that never left the
-    /// pool in this accounting (see `fees_paid`), so it touches no counter when it lands.
+    /// (`aggregation::minted_subsidy`, `docs/fees.md` §1.3). This is new issuance, and it is
+    /// the *whole* of what the payout note adds to these counters: the note's other part, the
+    /// covered bundles' proving shares, is value that never left the pool in this accounting
+    /// (see `fees_paid`), so it touches no counter when it lands.
     pub subsidised: u64,
 }
 

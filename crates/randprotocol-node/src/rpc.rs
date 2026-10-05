@@ -3773,10 +3773,13 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // genesis allocation, the testnet faucet, or the bounded aggregation subsidy below — so
         // the field is constant rather than computed. `subsidy` is `null` without an aggregation
         // section (there is then no schedule to report), otherwise the current per-block amount
-        // and the halving math `sealed_blocks` indexes into. Two meta reads, never a
-        // `load_ledger` (spec §1: no second way to trigger a commitment-tree rebuild): the config
-        // is genesis truth and never changes after `init_genesis`, so a commit landing between
-        // the two reads can only move `sealed_blocks`, and the answer is then as of that commit.
+        // and the halving math `sealed_blocks` indexes into. `current` is the schedule: under the
+        // genesis `fees.subsidy_net_of_fees` (`docs/fees.md` §1.3) it is a ceiling on what an
+        // aggregate mints, not the mint itself (`rand_getAggregate`'s `subsidy` is). Two meta
+        // reads, never a `load_ledger` (spec §1: no second way to trigger a commitment-tree
+        // rebuild): the config is genesis truth and never changes after `init_genesis`, so a
+        // commit landing between the two reads can only move `sealed_blocks`, and the answer is
+        // then as of that commit.
         "rand_getEmission" => {
             let faucet = st.status.read().unwrap_or_else(|e| e.into_inner()).faucet;
             let storage = st.storage.clone();
@@ -4334,6 +4337,10 @@ mod tests {
         assert_eq!(v["subsidy"], (100 * randprotocol_core::UNITS_PER_RAND - 60).to_string(), "only the shortfall");
         assert_eq!(v["proving_share"], "60");
         assert_eq!(v["n"], 0);
+        // The record and the supply counter agree: the one aggregate on this chain is everything
+        // `subsidised` has counted.
+        let supply = ok(&st, "rand_getSupply", json!([])).await;
+        assert_eq!(supply["subsidised"], v["subsidy"], "rand_getSupply.subsidised is the minted part too");
     }
 
     /// The aggregation surface (spec §8): the block's `sealed` flag and the per-bundle

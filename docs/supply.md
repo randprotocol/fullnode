@@ -12,7 +12,7 @@ it against a full replay of its own chain.
 
 ## What is counted
 
-Seven counters, all in units (1 RAND = 10⁹ units), all monotonic:
+Six counters, all in units (1 RAND = 10⁹ units), all monotonic:
 
 | counter | what it sums | when it moves |
 |---|---|---|
@@ -20,9 +20,15 @@ Seven counters, all in units (1 RAND = 10⁹ units), all monotonic:
 | `genesis_staked` | the stakes genesis seeded the register with | never after block 0 |
 | `faucet_minted` | every accepted `Mint` (the testnet faucet) | a mint commits |
 | `withdraw_deposited` | the notes accepted `Withdraw`s created | a withdraw commits |
-| `fees_paid` | every bundle fee, i.e. value that left the pool into a proposer's `rewards` | any bundle commits |
-| `burned` | every bundle `burn` — today only a `Bond`, burning into `stake` | a bond commits |
-| `base_fees_burned` | every bundle's `BUNDLE_BASE` destroyed under the genesis `fees.burn_base` (`docs/fees.md` §1.3); inside `burned`, in no register entry; kept beside the blob like `registration_fees_burned`; 0 without the flag | any bundle commits, under the flag |
+| `fees_paid` | every bundle fee a proposer kept, i.e. value that left the pool into its `rewards` — under the genesis `fees.burn_base` only the tip, `fee − BUNDLE_BASE` | any bundle commits |
+| `burned` | every bundle `burn` — a `Bond`, burning into `stake`; under the genesis gates below also a registration fee or a bundle's `BUNDLE_BASE`, burning into nothing | a bond commits; under a gate, a registration or any bundle |
+
+Two more counters break part of `burned` down, because what they count enters no register entry
+and so sits on the right of the identity below: `registration_fees_burned` (the registration fees
+burned under `tokens.burn_registration_fee`, audit v5 TOK-2) and `base_fees_burned` (every
+bundle's `BUNDLE_BASE` burned under `fees.burn_base`, `docs/fees.md` §1.3). Both are kept beside
+the supply blob rather than in it, so chain 14's stored layout never moved, and both read 0
+without their gate.
 
 Value **enters** the pool as a genesis deposit, a faucet mint, or a validator's withdraw. It
 **leaves** as a bundle fee or a burn. There is no other movement across the boundary, which is what
@@ -47,7 +53,8 @@ register_total = Σ over the register of (stake + pending + rewards)
 total_supply   = pool_value + register_total
 issued         = genesis_deposited + genesis_staked + faucet_minted
 
-invariant:       total_supply == issued − slashed − registration_fees_burned − base_fees_burned
+invariant:       total_supply == issued − slashed − registration_fees_burned
+                                        − base_fees_burned
 ```
 
 `pool_value` is value the pool holds; it is not the sum of the notes in it, which nobody can compute
@@ -57,8 +64,9 @@ issuance and sit on the right of the identity as `issued − slashed − registr
 base_fees_burned`: a slashed aggregator bond (block aggregation); under the genesis
 `tokens.burn_registration_fee` (v0.5.5, audit v5 TOK-2, `docs/tokens.md` §15), a registration's
 fee; and under the genesis `fees.burn_base` (`docs/fees.md` §1.3), every bundle's `BUNDLE_BASE` —
-the last two leave the pool through `burned` and enter no register entry. All three read 0 on
-chain 14, and the last on every chain cut so far.
+the last two leave the pool through `burned` and enter no register entry, which is why they are
+the two counters beside the table above. All three read 0 on chain 14, and the last on every chain
+cut so far.
 
 Follow one bond and one withdraw of 1000 RAND through it, on a chain that deposited 2000 at genesis
 and staked 4000:

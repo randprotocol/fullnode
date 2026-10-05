@@ -1373,8 +1373,10 @@ proving shares first and mints only the shortfall (the note is `max(schedule, sh
 an `aggregation` section, or `rand-node init` refuses the file
 (`SubsidyNetOfFeesWithoutAggregation`). Absent, or present with no `true` flag, is every chain's
 rule so far and commits nothing; a `true` flag is hashed after the `tokens` section's bytes under
-`fees` and its own tag, so it ships with a chain cut, never as a same-chain update. Never in the state root; `reload_ledger` restores the section
-from the file on every restart; served as `rand_getLimits.fee_rules`.
+`fees` and its own tag, so it ships with a chain cut, never as a same-chain update. Never in the
+state root: stored at genesis under `META_FEES` (JSON; written on every new database, the default
+`{}` without a section), and `reload_ledger` sets it again from the file on every restart; served
+as `rand_getLimits.fee_rules`.
 
 **Rolling it out.** `rand-node genesis` writes no `fees` section; the cut script splices it in
 the way it splices `bridge`. Every validator must run a build that knows the section before a

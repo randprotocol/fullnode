@@ -466,8 +466,8 @@ node that predates the field answers without it, which a wallet reads as `null`.
 "subsidy_net_of_fees": bool }`, or `null` on a chain without one — and on one whose section sets
 no flag `true`, which hashes and runs as no section at all. Informational: under `burn_base` a
 bundle's `BUNDLE_BASE` is destroyed rather than paid to the proposer, but what a sender pays is
-unchanged — every floor is the same number — so a wallet changes nothing. A node that predates the
-field answers without it, which a wallet reads as `null`.
+unchanged — every floor is the same number — so a wallet changes nothing. A node that predates
+the field answers without it, which a wallet reads as `null`.
 
 `gas_price`, `byte_price` and `gas_metering` are this **node's** own gas policy (spec
 `2026-09-28-gas-model-design.md` §4.1, Phase 0) *or* the chain's own `gas` section (§4.2, §7.1,
@@ -1134,7 +1134,8 @@ created (`amount` less the base), and the base moves from one register entry to 
 burned`; `register_total` is Σ `stake + pending + rewards` over the register; `total_supply` is the
 two together, and `invariant_holds` is whether it still equals everything the chain issued
 (`genesis_deposited + genesis_staked + faucet_minted`) less what was destroyed (`slashed`,
-`registration_fees_burned` and `base_fees_burned`). A false there is a bug, never a legitimate chain state. The counters are not in the state root — `rand-node verify --mode quick` recomputes
+`registration_fees_burned` and `base_fees_burned`). A false there is a bug, never a legitimate
+chain state. The counters are not in the state root — `rand-node verify --mode quick` recomputes
 every one of them by replaying the chain, which is what makes them auditable. `docs/supply.md`
 works the identity through a bond and a withdraw and says where it rests on a claim (the genesis
 file's own amounts) rather than on a check.
@@ -1394,8 +1395,11 @@ Params: `[]`. Result:
 testnet faucet, or the bounded aggregation subsidy, so a client expecting Solana's
 `getInflationRate` gets a number instead of a missing method. `subsidy` is the block-aggregation
 schedule (`gas::subsidy`, the 2026-09-15 changelog entry below); it is `null` on a chain whose
-genesis carries no `aggregation` section, which chain 12 does not. `faucet` mirrors `rand_status`'s
-field of the same name.
+genesis carries no `aggregation` section, which chain 12 does not. `subsidy.current` is the
+schedule's `subsidy(sealed_blocks)`: what the next aggregate mints, except under the genesis
+`fees.subsidy_net_of_fees` (`docs/fees.md` §1.3), where it is a ceiling on the mint — the
+aggregate mints only its shortfall over the covered proving shares, which `rand_getAggregate`'s
+`subsidy` reports per aggregate. `faucet` mirrors `rand_status`'s field of the same name.
 
 ## Subscriptions (WebSocket)
 

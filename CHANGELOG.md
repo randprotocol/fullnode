@@ -26,6 +26,9 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
   shortfall is minted — the payout note is `max(subsidy(n), shares)`, `subsidised` and
   `rand_getAggregate.subsidy` move by the minted part, `sealed_blocks` advances as before
   (`docs/fees.md` §1.3, `docs/aggregation.md` §3.3).
+- **Storage:** `META_FEES` (JSON, `{}` without a section) and `META_BASE_FEES_BURNED` (bincode `0`
+  without the flag) are written on every new database; an existing database without them opens
+  unchanged, both reading as their defaults.
 
 ## v0.7.1 — 2026-10-07 (chain 20, node-only)
 
