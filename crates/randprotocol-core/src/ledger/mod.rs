@@ -14,6 +14,7 @@ mod bind_tests;
 pub mod bridge_gov;
 pub mod bridge_notes;
 pub mod call_envelope;
+pub mod fees;
 pub mod program_state;
 pub mod staking;
 pub mod supply;
@@ -27,6 +28,7 @@ use crate::gas;
 use crate::notes::{word8_to_bytes, Bundle, CommitmentTree, Envelope, Word8, MAX_ENVELOPE_BYTES};
 use crate::program::{program_id_with_public, CallOutcome, CallReceipt, ProgramId, ProgramRecord};
 use crate::types::{Action, Block, Transaction, ValidatorSet, FAUCET_MAX_UNITS};
+pub use fees::FeesConfig;
 pub use staking::{FaucetMinter, FaucetRecipient, SlashingConfig, StakingConfig};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -651,6 +653,15 @@ pub struct Ledger {
     /// on the right of its identity: the fee left the pool (`supply.burned`) and entered no
     /// register entry, so it is destroyed issuance like a slashed bond.
     registration_fees_burned: u64,
+    /// Σ of every `BUNDLE_BASE` burned under `fees.burn_base` (`fees.rs`, `docs/fees.md` §1.3):
+    /// `registration_fees_burned`'s sibling in every respect — derived, outside the state root
+    /// and this ledger's equality, persisted beside `META_SUPPLY`, replay-audited, on the right of
+    /// the audit's identity — and always 0 without the flag.
+    base_fees_burned: u64,
+    /// The genesis `fees` section (`fees.rs`), the default (both rules off) on a chain whose file
+    /// has none. A genesis parameter like `aggregation`: outside the state root and this ledger's
+    /// equality, restored by `reload_ledger` on every restart.
+    fees: fees::FeesConfig,
     /// The largest program a `Deploy` may carry, in words: genesis's `max_program_words`, or
     /// [`gas::MAX_PROGRAM_WORDS`] on a chain whose file does not set it. A genesis parameter like
     /// `epoch_blocks` — not state, outside the state root and `Ledger`'s equality — so a
@@ -864,6 +875,8 @@ impl Ledger {
             vesting: None,
             program_state: None,
             registration_fees_burned: 0,
+            base_fees_burned: 0,
+            fees: fees::FeesConfig::default(),
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
             max_block_bytes: gas::MAX_BLOCK_BYTES,
@@ -928,6 +941,8 @@ impl Ledger {
             vesting: None,
             program_state: None,
             registration_fees_burned: 0,
+            base_fees_burned: 0,
+            fees: fees::FeesConfig::default(),
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
             max_block_bytes: gas::MAX_BLOCK_BYTES,
@@ -1195,13 +1210,37 @@ impl Ledger {
         self.registration_fees_burned = n;
     }
 
+    /// Σ of the `BUNDLE_BASE`s burned under `fees.burn_base` (`docs/fees.md` §1.3): for the
+    /// node's persistence beside `META_SUPPLY`, the replay audit and `rand_getSupply`. 0 without
+    /// the flag.
+    pub fn base_fees_burned(&self) -> u64 {
+        self.base_fees_burned
+    }
+
+    /// Restore the counter a node persisted beside the state — `set_registration_fees_burned`'s
+    /// twin.
+    pub fn set_base_fees_burned(&mut self, n: u64) {
+        self.base_fees_burned = n;
+    }
+
+    /// The genesis `fees` section (both rules off on a chain without one).
+    pub fn fees(&self) -> &fees::FeesConfig {
+        &self.fees
+    }
+
+    /// Install the `fees` section: genesis from its file, a reloading node from the same file.
+    pub fn set_fees(&mut self, fees: fees::FeesConfig) {
+        self.fees = fees;
+    }
+
     /// The supply audit against this ledger's own register.
     pub fn audit(&self) -> Audit {
         let audit = Audit::new(
             self.supply,
             register_total(&self.validators).saturating_add(supply::aggregators_total(&self.aggregators)),
             self.registration_fees_burned,
-        );
+        )
+        .with_base_fees_burned(self.base_fees_burned);
         let audit = match &self.vesting {
             Some(v) => audit.with_vesting(v.issued(), v.released, v.in_register()),
             None => audit,
@@ -2502,7 +2541,28 @@ impl Ledger {
             // keeps the whole fee to the proposer, byte-for-byte today's accounting. The
             // counter moves with what the proposer actually keeps: the floor now, an expired
             // excess at the sweep (`sweep_expired_excesses`), never the bucketed part.
-            let kept = if self.aggregation.is_some() { gas::BUNDLE_BASE.min(fee) } else { fee };
+            //
+            // Fee feedback (`fees.burn_base`, `docs/fees.md` §1.3): the base is destroyed instead
+            // of kept — `burned` and `base_fees_burned` move by it below — so the proposer keeps
+            // `fee − BUNDLE_BASE`, the tip, on an ungated chain and nothing at inclusion on an
+            // aggregating one, whose excess is bucketed exactly as without the flag. Only the base
+            // burns, never a Call's priced terms: it is the one part every bundle pays and no
+            // proposer can steer. The floor (`validate_inner`) already held `fee` to at least
+            // `BUNDLE_BASE`; refused by name rather than wrapped if it ever did not.
+            let base_burn = if self.fees.burn_base() {
+                if fee < gas::BUNDLE_BASE {
+                    return Err(TxError::FeeTooLow { min: gas::BUNDLE_BASE, fee });
+                }
+                gas::BUNDLE_BASE
+            } else {
+                0
+            };
+            let kept = match (self.aggregation.is_some(), base_burn > 0) {
+                (false, false) => fee,
+                (true, false) => gas::BUNDLE_BASE.min(fee),
+                (false, true) => fee - base_burn,
+                (true, true) => 0,
+            };
             let rewards = entry.rewards.checked_add(kept).ok_or(TxError::Overflow)?;
             // Both RAND halves of what this bundle takes out of the pool (see [`supply`]): the
             // fee becomes the proposer's `rewards` below, and `burn_r` becomes `stake` in the
@@ -2510,17 +2570,19 @@ impl Ledger {
             // every bundle passes, rather than in the arms that receive them. `burn_a` is never
             // RAND (`check_burn_shape` refuses a RAND `burn_a`): it leaves a token's own
             // `total_supply` in the burn's arm and has no place in the RAND audit. The burned
-            // registration fee (TOK-2) is the one other RAND exit: destroyed, so it joins
-            // `burned` beside `burn_r`.
+            // registration fee (TOK-2) and, under `fees.burn_base`, the bundle base are the other
+            // RAND exits: destroyed, so they join `burned` beside `burn_r`.
             self.supply.fees_paid = self.supply.fees_paid.checked_add(kept).ok_or(TxError::Overflow)?;
             self.supply.burned = self
                 .supply
                 .burned
                 .checked_add(b.burn_r)
                 .and_then(|n| n.checked_add(registration_burn))
+                .and_then(|n| n.checked_add(base_burn))
                 .ok_or(TxError::Overflow)?;
             self.registration_fees_burned =
                 self.registration_fees_burned.checked_add(registration_burn).ok_or(TxError::Overflow)?;
+            self.base_fees_burned = self.base_fees_burned.checked_add(base_burn).ok_or(TxError::Overflow)?;
             self.apply_bundle_notes(b, executor)?;
             self.validators.get_mut(proposer).expect("looked up above").rewards = rewards;
             if self.aggregation.is_some() {
@@ -3322,6 +3384,46 @@ mod tests {
         assert_eq!(l.validators()[&a.address()].rewards, gas::BUNDLE_BASE);
         // replay: both nullifiers now spent
         assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::Spent([1; 8])));
+    }
+
+    /// Fee feedback, `fees.burn_base` (`docs/fees.md` §1.3): a transfer paying `BUNDLE_BASE + 5`
+    /// burns the base — `burned` and `base_fees_burned` up by it — and tips the proposer the 5,
+    /// which is all `fees_paid` moves by; the audit holds with the burn on its right. The same
+    /// transaction without the flag pays the proposer the whole fee and burns nothing (today's
+    /// rule, side by side).
+    #[test]
+    fn burn_base_destroys_the_base_and_tips_the_proposer() {
+        let (a, _) = keys();
+        let p = a.address();
+        let fee = gas::BUNDLE_BASE + 5;
+        let seeded = |burn: bool| {
+            let mut l = ledger();
+            let staked = register_total(l.validators());
+            l.set_genesis_supply(1_000 * fee, staked);
+            if burn {
+                l.set_fees(fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None });
+            }
+            l
+        };
+        let transfer = |l: &Ledger| {
+            StubExecutor::bound(Transaction::shielded(7, bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee), Action::None))
+        };
+
+        let mut plain = seeded(false);
+        plain.apply_tx(&transfer(&plain), &p, &StubExecutor).unwrap();
+        assert_eq!(plain.validators()[&p].rewards, fee, "without the flag the proposer keeps the whole fee");
+        assert_eq!((plain.supply().fees_paid, plain.supply().burned, plain.base_fees_burned()), (fee, 0, 0));
+        assert!(plain.audit().invariant_holds(), "{:?}", plain.audit());
+
+        let mut burning = seeded(true);
+        burning.apply_tx(&transfer(&burning), &p, &StubExecutor).unwrap();
+        assert_eq!(burning.validators()[&p].rewards, 5, "the proposer keeps the tip");
+        assert_eq!(burning.supply().fees_paid, 5, "fees_paid moves by what the proposer keeps");
+        assert_eq!(burning.supply().burned, gas::BUNDLE_BASE, "the base is destroyed");
+        assert_eq!(burning.base_fees_burned(), gas::BUNDLE_BASE);
+        assert_eq!(burning.audit().base_fees_burned, gas::BUNDLE_BASE);
+        assert!(burning.audit().invariant_holds(), "{:?}", burning.audit());
+        assert_ne!(burning, plain, "the proposer's rewards differ, and the register is state");
     }
 
     // ---- The hidden-asset bundle (spec §3.6–§3.10): four slots, the burn shape ----------------

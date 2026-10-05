@@ -143,6 +143,56 @@ block's bytes in `Mempool::candidates_within`, and what the Calls leave of the l
 filled with the transfers held back — no block space is wasted, and with no Call pooled nothing
 changes. A hostile proposer can ignore it; an honest one on chain 18 runs it today.
 
+### 1.3 The `fees` section: a burned base and a fee-first subsidy (genesis-gated, on no chain yet)
+
+Every fee above goes to the block's proposer today, in full (or, on an aggregating chain, the
+floor to the proposer and the excess to the proof bucket, `docs/aggregation.md`). The prices of
+§1.2 float, but nothing is destroyed, so a busy chain pays its proposers more and its holders
+nothing. The agent-driven fee study (plan `superpowers/plans/2026-10-05-fee-feedback.md`) found
+the EIP-1559 shape — burn the base, tip the rest — the variant worth having, and a genesis `fees`
+section switches it on:
+
+```json
+"fees": { "burn_base": true }
+```
+
+Both flags are optional booleans and **off by default**, following `tokens.burn_registration_fee`
+(audit v5 TOK-2) exactly: absent, or present with no `true` flag, the chain is byte for byte what
+it was — the genesis hash, the state root, every stored value and every RPC value. A `true` flag
+is committed to the genesis hash right after the `tokens` section's bytes: `b"fees"`, then
+`b"burn_base"` ‖ `1` if `burn_base`, then `b"subsidy_net_of_fees"` ‖ `1` if `subsidy_net_of_fees`,
+in that order (pinned by `the_fees_sections_hash_contribution_is_pinned`). It is a genesis
+parameter, never state: on the ledger as `Ledger::fees`, stored at genesis under `META_FEES`
+(JSON) and set again from the genesis file by `reload_ledger` on every restart. `rand_getLimits`
+serves it as `fee_rules`, `null` on a chain without a `true` flag.
+
+**`burn_base`.** In the bundle fee split (`Ledger::apply_tx_with`) every bundle's
+`gas::BUNDLE_BASE` is destroyed instead of paid: `supply.burned` and the new supply counter
+`base_fees_burned` move by it (`docs/supply.md`). With `fee` the bundle's fee after a TOK-2
+registration burn:
+
+| chain | proposer keeps at inclusion | bucketed for the aggregator | destroyed |
+| --- | --- | --- | --- |
+| no `aggregation` | `fee − BUNDLE_BASE` (the tip) | — | `BUNDLE_BASE` |
+| `aggregation` | `0` | `fee − BUNDLE_BASE`, exactly as without the flag | `BUNDLE_BASE` |
+
+`fees_paid` moves by what the proposer keeps. The bucketed excess resolves as it always has — in
+a covering aggregate's payout note, or to the recorded proposer at the sweep. The floor already
+holds every bundle's fee to at least `BUNDLE_BASE`, so nothing a sender pays changes: the wallet
+defaults and every floor are the same numbers, only where the base goes differs.
+
+Only the base burns, not a Call's gas and byte terms (§1.1) nor a Deploy's per-word term. The
+base is the one component every bundle pays and no proposer can steer; the priced terms stay the
+proposer's, so including Calls stays worth its while. Burning the whole floor is a possible
+follow-up, not this rule. A `Withdraw`'s, a claim's and a revoke's base is untouched too: it is
+paid register-side, out of the amount withdrawn, and never passes the bundle fee split.
+
+Beside TOK-2 the two burns add: a registration under both flags destroys `registration_fee +
+BUNDLE_BASE`, each counter moving by its own part.
+
+**`subsidy_net_of_fees`.** The fee-first subsidy (fills in with the plan's Task 2). It needs an
+`aggregation` section (`GenesisError::SubsidyNetOfFeesWithoutAggregation`).
+
 ## 2. What the sender pays with its own machine: proving
 
 The one cost that varies is producing the STARK proof, and only the sender's machine pays it.

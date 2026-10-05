@@ -114,6 +114,7 @@ fn genesis_full(
         program_state: None,
         hardening_v6: None,
         hc_auth: None,
+        fees: None,
     }
 }
 

@@ -156,6 +156,11 @@ pub struct Audit {
     /// register entry: destroyed issuance, on the right of the identity beside `slashed`. Kept
     /// off [`Supply`] so chain 14's stored blob keeps its layout; 0 without the gate.
     pub registration_fees_burned: u64,
+    /// Σ of the `BUNDLE_BASE`s burned under `fees.burn_base` (`docs/fees.md` §1.3;
+    /// `Ledger::base_fees_burned`). `registration_fees_burned`'s sibling: inside `burned` on the
+    /// pool side, in no register entry, on the right of the identity, kept off [`Supply`] for the
+    /// same layout reason; 0 without the flag.
+    pub base_fees_burned: u64,
     /// Genesis vesting (spec §7), all 0 without a `vesting` section and kept off [`Supply`] for
     /// the same layout reason: what genesis issued into the vesting register (issuance, like
     /// `genesis_staked`) …
@@ -182,12 +187,20 @@ impl Audit {
             pool_value: supply.pool_value(),
             register_total,
             registration_fees_burned,
+            base_fees_burned: 0,
             vesting_issued: 0,
             vesting_released: 0,
             vesting_in_register: 0,
             program_rand_out: 0,
             program_rand_held: 0,
         }
+    }
+
+    /// The same audit with the bases burned under `fees.burn_base` on the right of its identity.
+    /// A builder rather than a fourth `new` argument, so every caller from before the flag keeps
+    /// its call as it was.
+    pub fn with_base_fees_burned(self, base_fees_burned: u64) -> Audit {
+        Audit { base_fees_burned, ..self }
     }
 
     /// The same audit with the program vaults' RAND in it: `rand_in` is every `burn_r` an
@@ -225,10 +238,16 @@ impl Audit {
     }
 
     /// Everything the chain issued is either in the pool or in the register, less what was
-    /// destroyed: a slashed bond, or a registration fee burned under the gate. A false here is a
-    /// consensus bug or a damaged counter, never a legitimate chain state.
+    /// destroyed: a slashed bond, a registration fee burned under the TOK-2 gate, or a bundle base
+    /// burned under `fees.burn_base`. A false here is a consensus bug or a damaged counter, never
+    /// a legitimate chain state.
     pub fn invariant_holds(&self) -> bool {
-        self.total_supply() == self.issued().saturating_sub(self.supply.slashed).saturating_sub(self.registration_fees_burned)
+        self.total_supply()
+            == self
+                .issued()
+                .saturating_sub(self.supply.slashed)
+                .saturating_sub(self.registration_fees_burned)
+                .saturating_sub(self.base_fees_burned)
     }
 }
 

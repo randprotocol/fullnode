@@ -164,6 +164,11 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // The aggregation gate lives in the genesis file too: without this a restarted chain-9 node
     // would compute state-2 roots and refuse every aggregation action by name.
     ledger.set_aggregation(gs.ledger.aggregation().cloned());
+    // And the fee-feedback rules (genesis `fees`, `docs/fees.md` §1.3): `load_ledger` restores the
+    // stored copy, but the file is the authority — a node that came back without `burn_base`
+    // would pay the base its peers burn and compute a different register: a fork at its first
+    // bundle after the restart.
+    ledger.set_fees(gs.ledger.fees().clone());
     // The staking gate (audit v4, STAKE-2) lives there too: without this a restarted node would
     // compute `rand-state-2` roots against peers on `rand-state-5`, refuse nothing the faucet
     // budget refuses and seat a bond an epoch early — a fork at its first restart.

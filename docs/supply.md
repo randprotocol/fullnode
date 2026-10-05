@@ -12,7 +12,7 @@ it against a full replay of its own chain.
 
 ## What is counted
 
-Six counters, all in units (1 RAND = 10⁹ units), all monotonic:
+Seven counters, all in units (1 RAND = 10⁹ units), all monotonic:
 
 | counter | what it sums | when it moves |
 |---|---|---|
@@ -22,6 +22,7 @@ Six counters, all in units (1 RAND = 10⁹ units), all monotonic:
 | `withdraw_deposited` | the notes accepted `Withdraw`s created | a withdraw commits |
 | `fees_paid` | every bundle fee, i.e. value that left the pool into a proposer's `rewards` | any bundle commits |
 | `burned` | every bundle `burn` — today only a `Bond`, burning into `stake` | a bond commits |
+| `base_fees_burned` | every bundle's `BUNDLE_BASE` destroyed under the genesis `fees.burn_base` (`docs/fees.md` §1.3); inside `burned`, in no register entry; kept beside the blob like `registration_fees_burned`; 0 without the flag | any bundle commits, under the flag |
 
 Value **enters** the pool as a genesis deposit, a faucet mint, or a validator's withdraw. It
 **leaves** as a bundle fee or a burn. There is no other movement across the boundary, which is what
@@ -46,16 +47,18 @@ register_total = Σ over the register of (stake + pending + rewards)
 total_supply   = pool_value + register_total
 issued         = genesis_deposited + genesis_staked + faucet_minted
 
-invariant:       total_supply == issued
+invariant:       total_supply == issued − slashed − registration_fees_burned − base_fees_burned
 ```
 
 `pool_value` is value the pool holds; it is not the sum of the notes in it, which nobody can compute
 — it is what entered minus what left, which comes to the same number. `invariant_holds` being false
-is a consensus bug or a damaged database, never a legitimate chain state. Two things destroy
-issuance and sit on the right of the identity as `issued − slashed − registration_fees_burned`:
-a slashed aggregator bond (block aggregation) and, under the genesis `tokens.burn_registration_fee`
-(v0.5.5, audit v5 TOK-2, `docs/tokens.md` §15), a registration's fee — it leaves the pool through
-`burned` and enters no register entry. Both read 0 on chain 14.
+is a consensus bug or a damaged database, never a legitimate chain state. Three things destroy
+issuance and sit on the right of the identity as `issued − slashed − registration_fees_burned −
+base_fees_burned`: a slashed aggregator bond (block aggregation); under the genesis
+`tokens.burn_registration_fee` (v0.5.5, audit v5 TOK-2, `docs/tokens.md` §15), a registration's
+fee; and under the genesis `fees.burn_base` (`docs/fees.md` §1.3), every bundle's `BUNDLE_BASE` —
+the last two leave the pool through `burned` and enter no register entry. All three read 0 on
+chain 14, and the last on every chain cut so far.
 
 Follow one bond and one withdraw of 1000 RAND through it, on a chain that deposited 2000 at genesis
 and staked 4000:

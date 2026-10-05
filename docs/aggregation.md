@@ -56,6 +56,11 @@ aggregator it prices proving too. The fee splits into a **verification share** (
 more than the floor is aggregated first; that is the fee-ordered mempool the block-space doc
 asks for, with GPU operators doing the ordering.
 
+Under the genesis `fees.burn_base` (`docs/fees.md` §1.3) the verification share is destroyed
+instead of paid: the proposer keeps nothing at inclusion, `BUNDLE_BASE` joins `burned` and
+`base_fees_burned`, and the proving share — `fee − BUNDLE_BASE`, bucketed exactly as without the
+flag — reaches the covering aggregator, or the recorded proposer at the sweep, as it always has.
+
 ### 3.2 A block subsidy in new RAND
 
 At launch fee volume is near zero and nobody runs a GPU for it. So the sealing block mints a

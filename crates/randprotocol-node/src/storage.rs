@@ -229,6 +229,13 @@ const META_JAILED: &str = "jailed";
 /// audit subtracts it on the right of its identity: the fee left the pool into no register
 /// entry.
 const META_REGISTRATION_FEES_BURNED: &str = "registration_fees_burned";
+/// `bincode(u64)`: Σ of the bundle bases burned under the genesis `fees.burn_base` as of the head
+/// (`Ledger::base_fees_burned`, `docs/fees.md` §1.3). `META_REGISTRATION_FEES_BURNED`'s twin in
+/// every respect — derived, outside the root and `Ledger`'s equality, written at the same three
+/// sites, replayed by `verify_chain`, on the right of the supply identity — and absent on a
+/// database written before the key existed, where it reads 0: what the ledger holds on every chain
+/// without the flag.
+const META_BASE_FEES_BURNED: &str = "base_fees_burned";
 /// `bincode(GasPrices)`: the live gas prices as of the head (Phase 2, spec §7.1,
 /// `Ledger::gas_prices`). Consensus state under `gas.dynamic` — in the state root under
 /// `rand-state-7` and `Ledger`'s equality — written at the same sites as
@@ -267,6 +274,15 @@ const META_RETIRED_AGGREGATOR_NONCES: &str = "retired_aggregator_nonces";
 /// it from here so every reader of the store (RPC included, which has no genesis file to hand)
 /// sees the same gate the node sees.
 const META_AGGREGATION: &str = "aggregation";
+/// JSON of the genesis `fees` section (`ledger::fees::FeesConfig`), the default (both rules off)
+/// on a chain without one. Genesis truth like `META_AGGREGATION`, written once at genesis and
+/// restored by `load_ledger` so every reader of the store sees the gate the node sees
+/// (`node::reload_ledger` sets it from the genesis file again, the authority). JSON, as
+/// `META_VESTING` is, and not the plan's bincode: the struct's `skip_serializing_if` fields make a
+/// bincode blob undecodable, and JSON reads an absent flag as its default. Absent on a database
+/// written before the key existed, which reads as the default — so such a database opens
+/// unchanged.
+const META_FEES: &str = "fees";
 /// `bincode(BridgeMeta)`: the whole-state half of the bridge — emitter, source emitters,
 /// guardian sets, the asset registry with its indices and `next_index`, and the burn sequence.
 /// Its presence is what makes a chain "bridged" on disk; the two collections it leaves out live
@@ -1014,6 +1030,7 @@ impl Storage {
         self.put_admitted(&mut batch, gs.ledger.admitted())?;
         self.put_jailed(&mut batch, gs.ledger.jailed())?;
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&gs.ledger.registration_fees_burned())?);
+        batch.put_cf(self.cf(CF_META), META_BASE_FEES_BURNED, bincode::serialize(&gs.ledger.base_fees_burned())?);
         // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
         // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
         if gs.ledger.gas().is_some() {
@@ -1024,6 +1041,11 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
+        batch.put_cf(
+            self.cf(CF_META),
+            META_FEES,
+            serde_json::to_vec(gs.ledger.fees()).map_err(|e| StorageError::Corrupt(format!("fees: {e}")))?,
+        );
         let tokens_staged = self.stage_tokens(&mut batch, gs.ledger.tokens())?;
         self.put_tokens_ext(&mut batch, gs.ledger.tokens())?;
         batch.put_cf(self.cf(CF_ANCHORS), height_key(0), word8_to_bytes(&gs.ledger.root()));
@@ -1616,6 +1638,23 @@ impl Storage {
     /// the key existed: 0, which on a chain without the gate is also the only value it holds.
     pub fn registration_fees_burned(&self) -> Result<u64> {
         Ok(self.get_meta_raw(META_REGISTRATION_FEES_BURNED)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
+    /// Σ of the bundle bases burned under `fees.burn_base` as of the head (`META_BASE_FEES_BURNED`)
+    /// — `registration_fees_burned()`'s twin, with the same rule for a database written before the
+    /// key existed: 0, which on a chain without the flag is also the only value it holds.
+    pub fn base_fees_burned(&self) -> Result<u64> {
+        Ok(self.get_meta_raw(META_BASE_FEES_BURNED)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
+    /// The chain's genesis `fees` section (`META_FEES`), the default — both rules off — on a chain
+    /// without one and on a database written before the key existed.
+    pub fn fees_config(&self) -> Result<randprotocol_core::ledger::FeesConfig> {
+        Ok(self
+            .get_meta_raw(META_FEES)?
+            .map(|b| serde_json::from_slice(&b).map_err(|e| StorageError::Corrupt(format!("fees: {e}"))))
+            .transpose()?
+            .unwrap_or_default())
     }
 
     /// The live gas prices as of the head (Phase 2, `META_GAS_PRICES`), or `None` on a database
@@ -2559,6 +2598,7 @@ impl Storage {
         ledger.set_admitted(self.admitted()?);
         ledger.set_jailed(self.jailed()?);
         ledger.set_registration_fees_burned(self.registration_fees_burned()?);
+        ledger.set_base_fees_burned(self.base_fees_burned()?);
         if let Some(p) = self.gas_prices()? {
             ledger.set_gas_prices(p);
         }
@@ -2568,6 +2608,7 @@ impl Storage {
         ledger.set_aggregators(self.aggregators()?);
         ledger.set_retired_aggregator_nonces(self.retired_aggregator_nonces()?);
         ledger.set_aggregation(self.aggregation_config()?);
+        ledger.set_fees(self.fees_config()?);
         ledger.set_bridge(self.load_bridge()?);
         ledger.set_tokens(self.tokens()?);
         Ok(ledger)
@@ -2890,6 +2931,7 @@ impl Storage {
         self.put_admitted(&mut batch, ledger_after.admitted())?;
         self.put_jailed(&mut batch, ledger_after.jailed())?;
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger_after.registration_fees_burned())?);
+        batch.put_cf(self.cf(CF_META), META_BASE_FEES_BURNED, bincode::serialize(&ledger_after.base_fees_burned())?);
         // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
         // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
         if ledger_after.gas().is_some() {
@@ -3469,6 +3511,15 @@ impl Storage {
                     ledger.registration_fees_burned()
                 ))
             }
+            // The burned bases (`fees.burn_base`) likewise: a supply counter beside the blob,
+            // outside the equality, on the right of the identity `rand_getSupply` reports.
+            Ok(stored) if stored == ledger && stored.base_fees_burned() != ledger.base_fees_burned() => {
+                check.problem = Some(format!(
+                    "stored base fees burned {} do not match the replayed chain's {}",
+                    stored.base_fees_burned(),
+                    ledger.base_fees_burned()
+                ))
+            }
             // The bucket is outside `Ledger`'s equality for the same reason, so it is audited
             // beside the counters: the next aggregate's payout is computed from it.
             Ok(stored) if stored == ledger && stored.unsealed_fees() != ledger.unsealed_fees() => {
@@ -3704,6 +3755,7 @@ impl Storage {
         self.put_admitted(&mut batch, ledger.admitted())?;
         self.put_jailed(&mut batch, ledger.jailed())?;
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger.registration_fees_burned())?);
+        batch.put_cf(self.cf(CF_META), META_BASE_FEES_BURNED, bincode::serialize(&ledger.base_fees_burned())?);
         // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
         // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
         if ledger.gas().is_some() {
@@ -3871,6 +3923,7 @@ pub(crate) mod fixtures {
             program_state: None,
             hardening_v6: None,
             hc_auth: None,
+            fees: None,
         }
     }
 
@@ -4027,6 +4080,7 @@ pub(crate) mod fixtures {
             program_state: None,
             hardening_v6: None,
             hc_auth: None,
+            fees: None,
         };
         (gs, secrets)
     }
@@ -7824,6 +7878,68 @@ mod tests {
         // A database written before the key existed reads 0, like the supply.
         s.db.delete_cf(s.cf(CF_META), META_REGISTRATION_FEES_BURNED).unwrap();
         assert_eq!(s.registration_fees_burned().unwrap(), 0);
+    }
+
+    /// Fee feedback (`fees.burn_base`, `docs/fees.md` §1.3): the burned bases are a supply counter
+    /// beside `META_SUPPLY` — committed with the state, restored by `load_ledger`, audited by
+    /// `verify_chain`'s replay — and the `fees` section is stored at genesis and restored by both
+    /// `load_ledger` and `reload_ledger`. A database written before either key existed opens with
+    /// the defaults: no rule, nothing burned.
+    #[test]
+    fn reload_ledger_restores_the_fees_section_and_the_burned_bases() {
+        use randprotocol_core::gas::BUNDLE_BASE;
+        use randprotocol_core::ledger::FeesConfig;
+        let (_d, s, mut gs) = genesis_with_two_notes();
+        let burn = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None };
+        gs.ledger.set_fees(burn.clone());
+        // The fixture's notes are tiny; tell the audit what genesis issued so its identity holds
+        // after a fee is paid out of the pool.
+        gs.ledger.set_genesis_supply(1_000 * BUNDLE_BASE, gs.ledger.supply().genesis_staked);
+        s.init_genesis(&gs).unwrap();
+        assert_eq!((s.fees_config().unwrap(), s.base_fees_burned().unwrap()), (burn.clone(), 0));
+
+        let mut ledger = gs.ledger.clone();
+        let tx = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], BUNDLE_BASE + 5);
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!((ledger.base_fees_burned(), ledger.supply().burned, ledger.supply().fees_paid), (BUNDLE_BASE, BUNDLE_BASE, 5));
+        assert!(ledger.audit().invariant_holds(), "{:?}", ledger.audit());
+        assert_eq!(s.base_fees_burned().unwrap(), BUNDLE_BASE, "committed with the state");
+        let loaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!((loaded.fees(), loaded.base_fees_burned()), (&burn, BUNDLE_BASE), "restored by load_ledger");
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!((reloaded.fees(), reloaded.base_fees_burned()), (&burn, BUNDLE_BASE), "and by reload_ledger");
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A stale counter is named by the audit, and the repair rewrites it from the replay.
+        s.db.put_cf(s.cf(CF_META), META_BASE_FEES_BURNED, bincode::serialize(&0u64).unwrap()).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.expect("a stale counter is a problem");
+        assert!(problem.contains("base fees burned"), "{problem}");
+        s.truncate_to(&gs, 1, &check.ledger).unwrap();
+        assert_eq!(s.base_fees_burned().unwrap(), BUNDLE_BASE);
+
+        // A database from before the keys: both absent, both read as the defaults, and the
+        // ledger opens without the rule (the genesis file, through `reload_ledger`, still has it).
+        s.db.delete_cf(s.cf(CF_META), META_FEES).unwrap();
+        s.db.delete_cf(s.cf(CF_META), META_BASE_FEES_BURNED).unwrap();
+        assert_eq!((s.fees_config().unwrap(), s.base_fees_burned().unwrap()), (FeesConfig::default(), 0));
+        let old = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!((old.fees(), old.base_fees_burned()), (&FeesConfig::default(), 0));
+        assert_eq!(crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap().fees(), &burn, "the file is the authority");
+    }
+
+    /// Fee feedback: a chain without a `fees` section stores the default section and a zero
+    /// counter, and reads them back as such.
+    #[test]
+    fn a_chain_without_a_fees_section_stores_the_defaults() {
+        let (_d, s, gs) = genesis_with_two_notes();
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.fees_config().unwrap(), randprotocol_core::ledger::FeesConfig::default());
+        assert_eq!(s.base_fees_burned().unwrap(), 0);
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert!(!reloaded.fees().any());
+        assert_eq!(reloaded, gs.ledger);
     }
 
     /// Audit v4, STAKE-2 rule 2: the faucet's two epoch counters are consensus state on a

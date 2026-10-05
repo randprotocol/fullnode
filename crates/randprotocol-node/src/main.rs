@@ -1763,6 +1763,9 @@ async fn main() -> Result<()> {
                 // without it hashes byte-for-byte as before.
                 program_state: program_state_cell_fee
                     .map(|cell_fee| randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee }),
+                // Fee feedback (`docs/fees.md` §1.3): no flag here; a chain that wants the rules
+                // adds the `fees` section to the file before it is cut.
+                fees: None,
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -3651,6 +3654,7 @@ mod tests {
             binding_domain: None,
             proof_window_blocks: None,
             program_state: None,
+            fees: None,
         }
     }
 

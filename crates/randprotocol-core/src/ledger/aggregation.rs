@@ -1183,6 +1183,7 @@ mod tests {
             program_state: None,
             hardening_v6: None,
             hc_auth: None,
+            fees: None,
         }
     }
 
@@ -2695,6 +2696,70 @@ mod payment_tests {
         assert!(l.unsealed_fees().is_empty(), "the window passed: the entry resolved");
         assert_eq!(l.validators()[&p].rewards, gas::BUNDLE_BASE + 60, "the recorded proposer takes the excess");
         assert_eq!(l.supply().fees_paid, fee, "and only now has the whole fee left the pool");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
+    /// Fee feedback, `fees.burn_base` on an aggregating chain (`docs/fees.md` §1.3): the base is
+    /// destroyed, so the proposer keeps nothing at inclusion; the excess `fee − BUNDLE_BASE` is
+    /// bucketed exactly as without the flag and resolves exactly as before — a covering aggregate
+    /// pays it in its note, the sweep pays it to the recorded proposer. The audit holds throughout,
+    /// with the burned bases on the right of its identity.
+    #[test]
+    fn burn_base_on_an_aggregating_chain_buckets_the_excess_and_pays_the_proposer_nothing() {
+        let burning = |window: u64| {
+            let mut l = gated(window);
+            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None });
+            // The fixture issues nothing to the pool; tell the audit what genesis deposited so its
+            // identity is checkable (the fees below are paid out of it).
+            let staked = l.supply().genesis_staked;
+            l.set_genesis_supply(1_000 * crate::types::UNITS_PER_RAND, staked);
+            l
+        };
+        let fee = gas::BUNDLE_BASE + 60;
+
+        // Inclusion: nothing to the proposer, the base burned, the excess bucketed.
+        let mut l = burning(256);
+        let (kp, _) = keys();
+        register(&mut l, &kp, 10);
+        l.record_anchor(1);
+        let p = proposer(&l);
+        let (rewards, before) = (l.validators()[&p].rewards, l.supply());
+        let burned_before = l.base_fees_burned();
+        let covered_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), Action::None));
+        l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&p].rewards, rewards, "the proposer keeps nothing at inclusion");
+        assert_eq!(l.supply().fees_paid, before.fees_paid, "so nothing is paid out of the pool to it");
+        assert_eq!(l.supply().burned, before.burned + gas::BUNDLE_BASE, "the base is destroyed");
+        assert_eq!(l.base_fees_burned(), burned_before + gas::BUNDLE_BASE);
+        assert_eq!(l.unsealed_fees()[&covered_tx.hash()].0, 60, "the bucket holds fee − BUNDLE_BASE, as without the flag");
+        assert_eq!(l.bucketed_excess(&covered_tx), 60);
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+
+        // The covered exit: the aggregate's note pays subsidy(n) plus the excess, as before.
+        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let covered = covered_records(&[1]);
+        let v = l.validate_aggregate(&tx, &covered, &StubExecutor).unwrap();
+        let subsidy = gas::subsidy(0, &cfg_with_window(256));
+        let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], subsidy + 60, 0, 1, &[9; 8]);
+        assert_eq!(v.payout_cm, want_cm, "the aggregator is paid the excess the bucket held");
+        l.apply_aggregate(&tx, &covered, &StubExecutor).unwrap();
+        assert!(l.has_commitment(&want_cm));
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+
+        // The expiry exit: the sweep pays the recorded proposer the excess, and only the excess.
+        let mut l = burning(2);
+        let (a, _) = keys();
+        let p = proposer(&l);
+        let tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee, 0), Action::None));
+        l.apply_block(&signed_block(&l, vec![tx.clone()], &a, 1), &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&p].rewards, 0);
+        assert_eq!(l.unsealed_fees().get(&tx.hash()), Some(&(60, p, 3)));
+        l.apply_block(&signed_block(&l, vec![], &a, 2), &StubExecutor).unwrap();
+        l.apply_block(&signed_block(&l, vec![], &a, 3), &StubExecutor).unwrap();
+        assert!(l.unsealed_fees().is_empty());
+        assert_eq!(l.validators()[&p].rewards, 60, "the recorded proposer takes the excess");
+        assert_eq!(l.supply().fees_paid, 60);
+        assert_eq!((l.supply().burned, l.base_fees_burned()), (gas::BUNDLE_BASE, gas::BUNDLE_BASE));
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
     }
 

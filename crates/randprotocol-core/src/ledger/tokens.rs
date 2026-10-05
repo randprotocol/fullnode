@@ -3506,6 +3506,27 @@ mod action_tests {
         assert!(agg.audit().invariant_holds(), "{:?}", agg.audit());
     }
 
+    /// Fee feedback beside TOK-2: under both `tokens.burn_registration_fee` and `fees.burn_base`
+    /// a registration paying `BUNDLE_BASE + registration_fee + 5` burns the registration fee and
+    /// then the base — `registration_fee + BUNDLE_BASE` destroyed, each counter moved by its own
+    /// part — and tips the proposer the 5. The audit holds with both on its right.
+    #[test]
+    fn a_registration_under_both_burns_burns_the_registration_fee_and_the_base() {
+        let p = proposer().address();
+        let fee = gas::BUNDLE_BASE + REG_FEE + 5;
+        let mut l = ledger();
+        l.set_genesis_supply(10 * fee, 10);
+        l.set_tokens(Some(TokenRegistry::new(REG_FEE).with_burn_registration_fee(true)));
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None });
+        let tx = register_tx_at(&l, MintAuthority::None, Some(initial(&l, 5)), 10, l.tokens().unwrap().next_index(), fee);
+        l.apply_tx(&tx, &p, &StubExecutor).unwrap();
+        assert_eq!(l.supply().burned, REG_FEE + gas::BUNDLE_BASE, "both are destroyed");
+        assert_eq!((l.registration_fees_burned(), l.base_fees_burned()), (REG_FEE, gas::BUNDLE_BASE));
+        assert_eq!(l.validators()[&p].rewards, 5, "the proposer keeps the tip");
+        assert_eq!(l.supply().fees_paid, 5);
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
     /// The initial note's `time` is the creator's, sealed against before the transaction was
     /// submitted, so it gets the window every note-stamping `time` gets.
     #[test]

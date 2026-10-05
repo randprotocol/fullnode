@@ -761,6 +761,18 @@ pub struct ChainLimits {
     /// RPL-2: the genesis `program_state` section and the `Invoke` limits that come with it,
     /// `null` on a chain without the section (where every invoke is refused).
     pub program_state: Option<ProgramStateLimits>,
+    /// Fee feedback (`docs/fees.md` §1.3): the genesis `fees` section's two rules, `null` on a
+    /// chain without one — and on one whose section sets no flag `true`, which is the section's
+    /// absence in every respect (it hashes as absent too). Wallet fees do not change with it: the
+    /// floors are the same numbers, only where the base goes differs.
+    pub fee_rules: Option<FeeRules>,
+}
+
+/// `rand_getLimits`' `fee_rules` object: both flags, each `true` only where the genesis says so.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FeeRules {
+    pub burn_base: bool,
+    pub subsidy_net_of_fees: bool,
 }
 
 /// `rand_getLimits`' `program_state` object: what a wallet needs to size and price an `Invoke`.
@@ -804,6 +816,10 @@ impl ChainLimits {
             program_state: ledger.program_state().map(|p| {
                 use randprotocol_core::ledger::program_state::{MAX_PAYOUTS, MAX_READS, MAX_WRITES};
                 ProgramStateLimits { cell_fee: p.cell_fee, max_reads: MAX_READS, max_writes: MAX_WRITES, max_payouts: MAX_PAYOUTS }
+            }),
+            fee_rules: Some(ledger.fees()).filter(|f| f.any()).map(|f| FeeRules {
+                burn_base: f.burn_base(),
+                subsidy_net_of_fees: f.subsidy_net_of_fees(),
             }),
         };
         if let Some(g) = ledger.gas() {
@@ -3679,6 +3695,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             let supply = st.storage.supply().map_err(RpcError::internal)?;
             let (faucet_epoch, faucet_minted_in_epoch) = st.storage.faucet_epoch_counters().map_err(RpcError::internal)?;
             let registration_fees_burned = st.storage.registration_fees_burned().map_err(RpcError::internal)?;
+            let base_fees_burned = st.storage.base_fees_burned().map_err(RpcError::internal)?;
             let register = st.storage.register().map_err(RpcError::internal)?;
             let aggregators = st.storage.aggregators().map_err(RpcError::internal)?;
             // The register's two halves, exactly `Ledger::audit`'s: the aggregator register's
@@ -3686,7 +3703,8 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
             // read false on any chain with a live registration.
             let register_total = randprotocol_core::ledger::register_total(&register)
                 .saturating_add(randprotocol_core::ledger::supply::aggregators_total(&aggregators));
-            let audit = randprotocol_core::ledger::Audit::new(supply, register_total, registration_fees_burned);
+            let audit = randprotocol_core::ledger::Audit::new(supply, register_total, registration_fees_burned)
+                .with_base_fees_burned(base_fees_burned);
             // Genesis vesting: the register is the identity's third half (`Ledger::audit`).
             let vesting = st.storage.vesting().map_err(RpcError::internal)?;
             let audit = match &vesting {
@@ -3741,6 +3759,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // `burned`, in no register entry, so on the right of the identity like `slashed`.
                 // `"0"` on chain 14.
                 "registration_fees_burned": registration_fees_burned.to_string(),
+                // Fee feedback (`fees.burn_base`, `docs/fees.md` §1.3): the bundle bases burned —
+                // inside `burned`, in no register entry, on the right of the identity beside
+                // `registration_fees_burned`. `"0"` on every chain without the flag.
+                "base_fees_burned": base_fees_burned.to_string(),
                 "pool_value": audit.pool_value.to_string(),
                 "register_total": audit.register_total.to_string(),
                 "total_supply": audit.total_supply().to_string(),
@@ -4679,6 +4701,7 @@ mod tests {
                 "binding_domain": 0,
                 "proof_window_blocks": null,
                 "program_state": null,
+                "fee_rules": null,
             })
         );
         let gs = raised_genesis();
@@ -4708,6 +4731,7 @@ mod tests {
                 "binding_domain": 0,
                 "proof_window_blocks": null,
                 "program_state": null,
+                "fee_rules": null,
             })
         );
         // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
@@ -4739,6 +4763,7 @@ mod tests {
                 "binding_domain": 0,
                 "proof_window_blocks": null,
                 "program_state": null,
+                "fee_rules": null,
             })
         );
         // The v0.6 switch: what a wallet reads to prove its calls over the call binding (INT-4).
@@ -5710,6 +5735,51 @@ mod tests {
         assert_eq!(v["registration_fees_burned"], Value::String(fee.to_string()));
         assert_eq!(v["fees_paid"], Value::String(randprotocol_core::gas::BUNDLE_BASE.to_string()), "the proposer got the base only");
         assert_eq!(v["invariant_holds"], true, "{v}");
+    }
+
+    /// Fee feedback (`fees.burn_base`, `docs/fees.md` §1.3): `rand_getSupply` serves the burned
+    /// bases as `base_fees_burned` — `"0"` on a plain chain — and the identity holds with them on
+    /// its right; the proposer's `fees_paid` is the tip only.
+    #[tokio::test]
+    async fn get_supply_reports_the_burned_bases() {
+        use randprotocol_core::gas::BUNDLE_BASE;
+        let (_d, st, _) = chain();
+        assert_eq!(ok(&st, "rand_getSupply", json!([])).await["base_fees_burned"], Value::String("0".into()), "a plain chain");
+
+        let mut gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+        gs.ledger.set_fees(randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None });
+        gs.ledger.set_genesis_supply(1_000 * BUNDLE_BASE, gs.ledger.supply().genesis_staked);
+        let (_d, st) = state_for(&gs);
+        let mut ledger = st.storage.load_ledger(&StubExecutor).unwrap();
+        let tx = bundle_tx(&ledger, [nf(1), nf(2)], [cm(1), cm(2)], BUNDLE_BASE + 5);
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let v = ok(&st, "rand_getSupply", json!([])).await;
+        assert_eq!(v["base_fees_burned"], Value::String(BUNDLE_BASE.to_string()));
+        assert_eq!(v["burned"], Value::String(BUNDLE_BASE.to_string()));
+        assert_eq!(v["fees_paid"], Value::String("5".into()), "the proposer got the tip only");
+        assert_eq!(v["invariant_holds"], true, "{v}");
+    }
+
+    /// Fee feedback: `rand_getLimits.fee_rules` is served only on a chain whose genesis `fees`
+    /// section sets a flag `true` — `null` without the section and with one that sets none.
+    #[tokio::test]
+    async fn get_limits_serves_the_fee_rules_only_under_a_fees_section() {
+        use randprotocol_core::ledger::FeesConfig;
+        let (_d, st, _) = chain();
+        assert_eq!(ok(&st, "rand_getLimits", json!([])).await["fee_rules"], Value::Null);
+        let limits_with = |fees: FeesConfig| async move {
+            let mut g = fixtures::genesis_file_of(7, &[&key(1)], vec![], 2);
+            g.fees = Some(fees);
+            let gs = g.build(&StubExecutor).unwrap();
+            let (_d, st) = state_for(&gs);
+            ok(&st, "rand_getLimits", json!([])).await
+        };
+        let off = limits_with(FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None }).await;
+        assert_eq!(off["fee_rules"], Value::Null, "a section with no true flag is no section");
+        let on = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None }).await;
+        assert_eq!(on["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false }));
+        assert_eq!(on["gas_metering"], Value::Null, "nothing else moves");
     }
 
     /// The interface review's IFACE-7: under `tokens.burn_registration_fee` the ledger buckets a

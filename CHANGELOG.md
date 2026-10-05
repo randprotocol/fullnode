@@ -10,6 +10,19 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 `git tag` and the GitHub release list (audit v6, DOC-6). There is no tag v0.5.2, v0.5.3 or v0.6.5.
 "Assets" says what the GitHub release carries, as read on 2026-09-30.
 
+## Unreleased
+
+- **Fee feedback, the burned base** (genesis-gated: a hard fork on a chain whose genesis sets a
+  flag, node-only on every other chain — no existing chain carries the section): a new genesis
+  `fees` section (`docs/fees.md` §1.3). Under `fees.burn_base` every bundle's `BUNDLE_BASE` is
+  destroyed instead of paid to the proposer, who keeps the tip (`fee − BUNDLE_BASE`; nothing at
+  inclusion on an aggregating chain, whose excess is bucketed as before). A new supply counter
+  `base_fees_burned` sits on the right of the supply identity, persisted under
+  `META_BASE_FEES_BURNED` and replay-audited; the section is stored under `META_FEES` and restored
+  from the genesis file by `reload_ledger`. RPC: `rand_getSupply.base_fees_burned`,
+  `rand_getLimits.fee_rules` (`docs/rpc.md` changelog). `fees.subsidy_net_of_fees` is parsed,
+  hashed and validated (it needs `aggregation`); its payment rule lands with the plan's Task 2.
+
 ## v0.7.1 — 2026-10-07 (chain 20, node-only)
 
 Node-only: no consensus rule, wire format, verifier key or genesis change. From this release on,

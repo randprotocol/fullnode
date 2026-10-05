@@ -402,7 +402,7 @@ gas policy:
   "gas_metering": "header", "bundle_gas_limit": null, "adjust_bps": null,
   "max_gas_price": null, "max_byte_price": null, "byte_load": null,
   "admission_by_vote": false, "testnet": false, "slashing": null, "binding_domain": 0,
-  "proof_window_blocks": null, "program_state": null }
+  "proof_window_blocks": null, "program_state": null, "fee_rules": null }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -461,6 +461,13 @@ for how long a proof may take; the `rand` wallet also uses it to decide when a `
 that never appeared can no longer commit (clamped to 256..4 096, since this reply is
 unauthenticated — it moves only the wallet's own bookkeeping, never what the chain admits). A
 node that predates the field answers without it, which a wallet reads as `null`.
+
+`fee_rules` is the genesis `fees` section (`docs/fees.md` §1.3), `{ "burn_base": bool,
+"subsidy_net_of_fees": bool }`, or `null` on a chain without one — and on one whose section sets
+no flag `true`, which hashes and runs as no section at all. Informational: under `burn_base` a
+bundle's `BUNDLE_BASE` is destroyed rather than paid to the proposer, but what a sender pays is
+unchanged — every floor is the same number — so a wallet changes nothing. A node that predates the
+field answers without it, which a wallet reads as `null`.
 
 `gas_price`, `byte_price` and `gas_metering` are this **node's** own gas policy (spec
 `2026-09-28-gas-model-design.md` §4.1, Phase 0) *or* the chain's own `gas` section (§4.2, §7.1,
@@ -1088,7 +1095,7 @@ Params: `[]`. Result:
   "faucet_epoch": "…", "faucet_minted_in_epoch": "…",
   "withdraw_deposited": "…", "fees_paid": "…", "burned": "…",
   "subsidised": "…", "sealed_blocks": "…", "aggregator_bonds": "…", "slashed": "…",
-  "registration_fees_burned": "…",
+  "registration_fees_burned": "…", "base_fees_burned": "…",
   "vesting_issued": "…", "vesting_released": "…", "vesting_in_register": "…", "vesting_locked": "…",
   "program_rand_out": "…", "program_rand_held": "…",
   "pool_value": "…", "register_total": "…", "total_supply": "…", "invariant_holds": true }
@@ -1105,6 +1112,12 @@ the genesis `tokens.burn_registration_fee` (`docs/tokens.md` §15): inside `burn
 side and in no register entry, so the identity below subtracts it on its right beside `slashed`.
 A decimal string; `"0"` on chain 14, which has no gate.
 
+`base_fees_burned` (fee feedback, unreleased) is Σ of the bundle bases (`BUNDLE_BASE` each)
+burned under the genesis `fees.burn_base` (`docs/fees.md` §1.3): inside `burned` on the pool side,
+in no register entry, subtracted on the identity's right beside `registration_fees_burned`. Under
+the flag `fees_paid` counts only what proposers kept — the tip. A decimal string; `"0"` on every
+chain without the flag.
+
 `faucet_epoch` and `faucet_minted_in_epoch` (v0.5.4, audit v4 STAKE-2) are the faucet's per-epoch
 pair: the epoch the counter is for and what the faucet minted in it, against the genesis
 `staking.faucet_budget_per_epoch`. Both are decimal strings like the rest of this object, and both
@@ -1120,8 +1133,8 @@ created (`amount` less the base), and the base moves from one register entry to 
 `pool_value = genesis_deposited + faucet_minted + withdraw_deposited − fees_paid −
 burned`; `register_total` is Σ `stake + pending + rewards` over the register; `total_supply` is the
 two together, and `invariant_holds` is whether it still equals everything the chain issued
-(`genesis_deposited + genesis_staked + faucet_minted`) less what was destroyed (`slashed` and
-`registration_fees_burned`). A false there is a bug, never a legitimate chain state. The counters are not in the state root — `rand-node verify --mode quick` recomputes
+(`genesis_deposited + genesis_staked + faucet_minted`) less what was destroyed (`slashed`,
+`registration_fees_burned` and `base_fees_burned`). A false there is a bug, never a legitimate chain state. The counters are not in the state root — `rand-node verify --mode quick` recomputes
 every one of them by replaying the chain, which is what makes them auditable. `docs/supply.md`
 works the identity through a bond and a withdraw and says where it rests on a claim (the genesis
 file's own amounts) rather than on a check.
@@ -1640,6 +1653,16 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### Unreleased — fee feedback: the genesis `fees` section and the burned base (genesis-gated; no chain carries it yet)
+
+Additive. `rand_getSupply` gains `base_fees_burned` (a decimal string, `"0"` on every chain
+without the flag): the bundle bases destroyed under the genesis `fees.burn_base`
+(`docs/fees.md` §1.3), on the right of the supply identity beside `registration_fees_burned`.
+`rand_getLimits` gains `fee_rules` (`{ "burn_base", "subsidy_net_of_fees" }`, booleans), `null`
+on a chain whose genesis has no `fees` section with a `true` flag. Under `burn_base` a proposer's
+`rewards` grow by the tip (`fee − BUNDLE_BASE`), or by nothing at inclusion on an aggregating
+chain; no fee a wallet pays changes. Every existing field keeps its value on every chain.
 
 ### 2026-10-01 — audit v6, TOK-1: `tokens.incremental_root` (genesis-gated; no chain carries it yet)
 
