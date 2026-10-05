@@ -26,6 +26,13 @@ corrections") amends this spec where the code differed from what it assumed:
 4. §5.1: `SharedSet` implements `PartialEq` (the ledger's hand-written equality uses it);
    `len()` is exact always. `HotStuff::new` detaches the base; `HotStuff::resume` folds the delta.
 5. §8: no `proptest` in the workspace; randomised tests use seeded `rand::rngs::StdRng`.
+6. §1, the resident-memory row (amended at the final review, 2026-10-05). It read "flat after
+   warm-up (the last 1 000 blocks within 5 % of the first 1 000 after block 1 000)", which no
+   run can meet while the commitment and nullifier sets live in memory: the measured run went
+   from 961 MB at block 1 000 to 8 954 MB at block 10 000 because the sets grew tenfold (8 M to 80 M nullifiers), not
+   because of the speculative tree. The criterion is now what this spec's changes can promise
+   and the run shows (`docs/node-hardware.md` §7): resident memory linear in the entries, 117 to
+   121 bytes per nullifier across the run, with no term in the speculative tree or in height.
 
 ## 1. Goal and success criteria
 
@@ -40,7 +47,7 @@ Acceptance (§3.6 of the compute page, unchanged): a one-validator chain on the 
 | quantity | bound |
 |---|---|
 | block apply at the 10 000th block | ≤ 300 ms |
-| resident memory | flat after warm-up (the last 1 000 blocks within 5 % of the first 1 000 after block 1 000) |
+| resident memory | grows only with the entries (bytes per nullifier constant across the run); no term in the speculative tree or in height (amended, §0 item 6) |
 | nullifier set | ≥ 40 M entries at the end |
 
 The run's table is recorded in `docs/node-hardware.md` with the date and host.

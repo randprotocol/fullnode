@@ -457,7 +457,13 @@ and `apply_ms` to 54.4 ms at height 50 and 55.5 ms at height 300, flat, and held
 block 10 000 with 80 M nullifiers; `propose_ms` rises slowly, 132.7 ms at block 500 to 162.4 ms at
 block 10 000, which is the leader's own apply, root and the replay bookkeeping, not a root term.
 
-Memory is flat in the sense the acceptance asks for. From the `rss_mb` and `nullifiers` columns,
+Memory does not meet the spec's original criterion, and cannot while the sets live in memory.
+That criterion (the last 1 000 blocks within 5 % of the first 1 000 after block 1 000) asks for
+a flat resident size, and the run went from 961 MB at block 1 000 to 8 954 MB at block 10 000,
+because every block adds 8 000 nullifiers and 16 000 commitments that the validator keeps. The
+criterion met is the amended one (spec 2026-10-05 §1, amendment 6 in §0): resident memory linear
+in the entries, at a constant 117 to 121 bytes per nullifier, with no term in the speculative
+tree or in height. From the `rss_mb` and `nullifiers` columns,
 taking `rss_mb` as MiB, the resident size per nullifier is 121.2 bytes at row 2 000 (1 849 MB,
 16 000 000), 118.3 bytes at row 5 000 (4 514 MB, 40 000 000) and 117.4 bytes at row 10 000
 (8 954 MB, 80 000 000). That figure carries both sets (each block also adds twice as many
@@ -465,5 +471,6 @@ commitments as nullifiers), the tree's leaf set and the range peaks, and it fall
 height as fixed costs amortise; there is no term in height beyond the entries themselves. The
 sets are in memory by design: 80 M nullifiers cost about 9 GB here, which a validator must budget.
 
-Acceptance (`docs/compute-optimization.md` §3.6): passed. Exit 0, `apply_ms` 56.1 against the
-300 ms bound at block 10 000, 80 000 000 nullifiers.
+Acceptance (`docs/compute-optimization.md` §3.6): passed on apply time and set size, and on
+memory under the amended criterion above. Exit 0, `apply_ms` 56.1 against the 300 ms bound at
+block 10 000, 80 000 000 nullifiers.
