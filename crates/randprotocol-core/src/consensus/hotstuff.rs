@@ -33,6 +33,10 @@ const MAX_PROPOSED_KEYS: usize = 4096;
 /// Cap on cached epoch-set derivations. Every key is a block in the tree, so this only bites if
 /// the tree cap is raised far past it.
 const MAX_DERIVED_SETS: usize = 1024;
+/// How many failing candidates one proposal tolerates before it closes the block with the
+/// candidates it has (spec 2026-10-05): each failure replays the accepted set, O(accepted), so
+/// a mempool that admitted many mutually conflicting candidates cannot make a proposal quadratic.
+pub const MAX_PROPOSE_REPLAYS: usize = 8;
 /// The most equivocation evidence pairs held for the node to collect (audit v6, STAKE-1): each is
 /// two headers with their certificates, and the node drains them after every message.
 const MAX_EVIDENCE_HELD: usize = 16;
@@ -1322,16 +1326,45 @@ impl HotStuff {
         // Phase 2 (spec §7.1): the calls' gas, for the controller at the block's end — summed
         // exactly as `apply_block_for_sync` sums its receipts.
         let mut call_gas = 0u64;
+        // Candidates apply to the running ledger directly (spec 2026-10-05, plan correction 2):
+        // a clone per candidate was 2 000 clones a block. `apply_tx_with` is not atomic on its
+        // own (its comment), so a failing candidate is undone by rebuilding from the parent and
+        // replaying the accepted ones in order. Deterministic, so the replay cannot fail; if it
+        // ever did, the block closes with no ordinary transactions rather than a wrong root.
+        // B5: with the admission cache along, a candidate's proofs are not verified a second
+        // time here. Replays are bounded: after MAX_PROPOSE_REPLAYS the block closes with what
+        // it has.
+        let base = ledger.clone();
+        let mut replays = 0usize;
         for tx in ordinary {
-            // Apply on a trial clone: a transaction that fails part-way through
-            // must not leave the cumulative ledger dirty for the next candidate
-            // or for the state root committed to the header. B5: with the admission
-            // cache along, a candidate's proofs are not verified a second time here.
-            let mut trial = ledger.clone();
-            if let Ok(receipt) = trial.apply_tx_with(&tx, &me, self.executor.as_ref(), self.verified.as_ref()) {
-                call_gas = call_gas.saturating_add(receipt.map_or(0, |r| r.gas_used));
-                ledger = trial;
-                txs.push(tx);
+            match ledger.apply_tx_with(&tx, &me, self.executor.as_ref(), self.verified.as_ref()) {
+                Ok(receipt) => {
+                    call_gas = call_gas.saturating_add(receipt.map_or(0, |r| r.gas_used));
+                    txs.push(tx);
+                }
+                Err(_) => {
+                    replays += 1;
+                    ledger = base.clone();
+                    call_gas = 0;
+                    let mut replayed = true;
+                    for t in &txs {
+                        match ledger.apply_tx_with(t, &me, self.executor.as_ref(), self.verified.as_ref()) {
+                            Ok(r) => call_gas = call_gas.saturating_add(r.map_or(0, |r| r.gas_used)),
+                            Err(_) => {
+                                replayed = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !replayed {
+                        ledger = base.clone();
+                        call_gas = 0;
+                        txs.clear();
+                    }
+                    if replays >= MAX_PROPOSE_REPLAYS {
+                        break;
+                    }
+                }
             }
         }
         // The aggregate's trial apply runs where its place in the block is: after the ordinary

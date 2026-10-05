@@ -1,6 +1,7 @@
 //! Deterministic multi-replica simulation of the HotStuff state machine.
 
 use super::*;
+use super::MAX_PROPOSE_REPLAYS;
 use crate::confidential::{ConfidentialExecutor, StubExecutor};
 use crate::genesis::{Genesis, GenesisValidator};
 use crate::notes::{word8_to_hex, Envelope};
@@ -1621,6 +1622,66 @@ fn commit_drains_the_shared_sets_and_survivors_absorb() {
     let above_head = n.node.tip_ledger().height() - n.node.committed_height();
     assert_eq!(n.node.tip_ledger().nullifiers().added_len() as u64, 4 * above_head, "the tip holds exactly the blocks above the head");
     assert!(n.node.committed_ledger().is_spent(&[10; 8]), "the first block's spend is in the base");
+}
+
+/// A valid shielded transaction at `l` whose nullifiers are distinct per `n`.
+fn tx_at(l: &Ledger, n: u32) -> Transaction {
+    staking_tx(l, 10 * n, 0, crate::types::Action::None)
+}
+
+/// Re-make the stub proof over an edited bundle's digest (what `ledger`'s `restub` does), then
+/// re-bind: `bind` alone only rewrites the binding, not the digest the proof publishes.
+fn restub_and_bind(l: &Ledger, mut tx: Transaction) -> Transaction {
+    use crate::confidential::ConfidentialExecutor;
+    if let Some(b) = tx.bundle.as_mut() {
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&l.hc_bundle(), &d, &[0; 8]);
+    }
+    StubExecutor::bound(tx)
+}
+
+/// Spec 2026-10-05 (plan correction 2): the proposer no longer clones the ledger per candidate.
+/// A candidate that fails after accepted ones changed state (the second spends the first's
+/// nullifier) is dropped, the accepted set is replayed, and the header's state root is the one a
+/// replica recomputes from the block, with the failing candidate absent and the third present.
+#[test]
+fn a_failing_candidate_is_dropped_and_the_block_still_verifies() {
+    let mut n = one_node();
+    n.node.start();
+    n.now += 1;
+    let tip = n.node.tip_ledger().clone();
+    let ok1 = tx_at(&tip, 1);
+    let mut dup = tx_at(&tip, 2);
+    // The double spend: dup's first nullifier is ok1's first nullifier.
+    dup.bundle.as_mut().unwrap().nullifiers[0] = ok1.bundle.as_ref().unwrap().nullifiers[0];
+    let dup = restub_and_bind(&tip, dup);
+    let ok3 = tx_at(&tip, 3);
+    let actions = n.node.propose(1, vec![ok1.clone(), dup, ok3.clone()], n.now).expect("propose");
+    let block = actions.iter().find_map(|a| match a { Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b.clone()), _ => None }).unwrap();
+    assert_eq!(block.transactions, vec![ok1, ok3], "the double spend is dropped, the third candidate kept");
+    let mut replica = tip.clone();
+    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor, &crate::ledger::NoVerified).expect("the header's root is what a replica computes");
+}
+
+/// A proposal tolerates `MAX_PROPOSE_REPLAYS` failing candidates, then closes the block.
+#[test]
+fn a_proposal_closes_after_max_replays() {
+    let mut n = one_node();
+    n.node.start();
+    n.now += 1;
+    let tip = n.node.tip_ledger().clone();
+    let ok = tx_at(&tip, 1);
+    let mut cands = vec![ok.clone()];
+    // MAX_PROPOSE_REPLAYS + 1 double spends of `ok`, then one good candidate that is never reached.
+    for k in 0..=MAX_PROPOSE_REPLAYS {
+        let mut d = tx_at(&tip, 100 + k as u32);
+        d.bundle.as_mut().unwrap().nullifiers[0] = ok.bundle.as_ref().unwrap().nullifiers[0];
+        cands.push(restub_and_bind(&tip, d));
+    }
+    cands.push(tx_at(&tip, 50));
+    let actions = n.node.propose(1, cands, n.now).unwrap();
+    let block = actions.iter().find_map(|a| match a { Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b.clone()), _ => None }).unwrap();
+    assert_eq!(block.transactions.len(), 1, "closed after the bound; the trailing good candidate waits for the next block");
 }
 
 #[test]
