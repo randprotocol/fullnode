@@ -6,7 +6,21 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-10-02)
 
-### Fee feedback — a burned base and a fee-first subsidy (2026-10-05; branch `feat/fee-feedback`, NOT merged, NOT pushed; genesis-gated, on no chain)
+### Fee feedback — a burned base and a fee-first subsidy (2026-10-05; branch `feat/fee-feedback`, PUSHED, NOT merged; genesis-gated, on no chain)
+
+**2026-10-06, issues #131–#135 closed on this branch** (each a `fix/*` branch, reviewed, merged
+`--no-ff`, pushed): #135 `fees.burn_floor` (the whole floor burned; one helper
+`Ledger::settled_floor` is both the post-decode check and the burn; `bucketed_excess` deleted),
+#132 the daemon's `fee_rules` through the client's cached limits read before the prove, #133 storage
+refuses a block whose aggregates lack their `PaidAggregate` records, #134 the live proposer/peer
+root-agreement tests under both flags and across a restart, #131 the pinned recursion fixtures
+`Test-0..2` committed at `crates/randprotocol-node/fixtures/recursion/` (the node suite passes
+plain; `scripts/recursion-fixtures.sh --check`; CI's `ci-fixture-skips.sh` can now be revisited).
+Merged tree at `c13ea5d9`: core 674, node lib 494, node bin 37, client lib 189, all passing. Two
+semantic merge fixes were needed (`FeesConfig` literals gained `burn_floor`: `aa7b04e6`, and the
+#132 merge). Open follow-ups: CI running the fixture-backed tests; log-and-continue in the daemon's
+`--watch` loop (a pass error still stops the daemon); the admission cache is not attached in the
+live-path tests.
 
 Worktree `~/rand-worktrees/fullnode-fee-feedback`, off main `2b5490d5`: the plan `c77ad185`
 (`docs/superpowers/plans/2026-10-05-fee-feedback.md`), Task 1 `97a54811` (the section and the
