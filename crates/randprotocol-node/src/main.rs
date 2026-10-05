@@ -2498,7 +2498,9 @@ fn prove_aggregate(profile: FriProfile, raw_proofs: &[Vec<u8>], binding: &[u32; 
 /// arrived with a `time` long out of window. Under the genesis `fees.subsidy_net_of_fees` the
 /// subsidy is netted against the shares by the ledger's own rule (`minted_subsidy`, the flag read
 /// off `rand_getLimits.fee_rules` through the client's cached limits, `AggregateNode::fee_rules`),
-/// or the note is sealed at an amount the ledger never pays.
+/// or the note is sealed at an amount the ledger never pays. That flag and the envelope format
+/// are fixed at genesis, so they are read before the prove: a failed first read then costs
+/// seconds, not a prove.
 /// The nonce is the one thing the proof binds (audit
 /// v3, AGG-2), so it is read before; it is read again after, and a pass whose nonce moved
 /// meanwhile (another of this key's aggregates, or its unbond, committed) is abandoned rather
@@ -2547,6 +2549,18 @@ async fn aggregate_pass(
     // proof made for one nonce verifies at no other.
     let nonce = aggregator_row(rpc, &kp.address()).await?.0;
     let domain = rpc.binding_domain(chain_id).await?;
+    // The chain's fee rules (`rand_getLimits.fee_rules`, `docs/fees.md` §1.3): under
+    // `subsidy_net_of_fees` the ledger pays `max(schedule, shares)`, not their sum, and derives
+    // the note from that — a note sealed at the sum is admitted and applied all the same, but
+    // its envelope opens to a commitment that matches no leaf and the wallet drops it. `null`
+    // (no flag true), a reply that predates the section and a node with no `rand_getLimits` at
+    // all are the default rules. Both these and the envelope format are fixed at genesis, so
+    // they come from the client's cached limits — one round trip per daemon, not one per pass
+    // (#132) — and are read here, before the prove, so that a first read that fails
+    // transiently costs seconds rather than a prove of tens of minutes. Neither is one of the
+    // IFACE-8 values that must be read after it.
+    let fees = rpc.fee_rules().await?;
+    let format = rpc.envelope_format(chain_id).await?;
     let binding = domain.aggregate_binding(chain_id, &kp.address(), nonce);
     let proof_bytes = prove(profile, &raw_proofs, &binding)?;
 
@@ -2561,14 +2575,6 @@ async fn aggregate_pass(
     }
     let status = rpc.call("rand_status", serde_json::json!([])).await?;
     let agg = &status["aggregation"];
-    // The chain's fee rules (`rand_getLimits.fee_rules`, `docs/fees.md` §1.3): under
-    // `subsidy_net_of_fees` the ledger pays `max(schedule, shares)`, not their sum, and derives
-    // the note from that — a note sealed at the sum is admitted and applied all the same, but
-    // its envelope opens to a commitment that matches no leaf and the wallet drops it. `null`
-    // (no flag true), a reply that predates the section and a node with no `rand_getLimits` at
-    // all are the default rules. Fixed at genesis, so read through the client's cached limits —
-    // one round trip per daemon, not one per pass that a transient failure could abort (#132).
-    let fees = rpc.fee_rules().await?;
     // `subsidy_base` is a decimal string since node N-3 (2026-09-20); `amount_field` reads
     // either encoding, so this daemon works against an older node too.
     let subsidy_base = randprotocol_client::amount_field(&agg["subsidy_base"]).unwrap_or(0);
@@ -2582,7 +2588,7 @@ async fn aggregate_pass(
     let schedule = subsidy_base.checked_shr((n / halving) as u32).unwrap_or(0);
     let subsidy = randprotocol_core::ledger::aggregation::minted_subsidy(schedule, shares, &fees);
     let time = height as u32 + 1;
-    let (note, envelope) = sealed_withdraw_note(&payout, subsidy.saturating_add(shares), time, rpc.envelope_format(chain_id).await?)?;
+    let (note, envelope) = sealed_withdraw_note(&payout, subsidy.saturating_add(shares), time, format)?;
     let signature = kp.sign(
         domain
             .aggregate_signing_hash(chain_id, nonce, time, &note.r, &covers, &randprotocol_core::Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&envelope))

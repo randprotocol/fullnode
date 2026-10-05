@@ -1772,6 +1772,23 @@ mod tests {
 
         let broken = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Err(-32603, "db closed"))]).await);
         assert!(broken.fee_rules().await.is_err(), "a transient failure is not the default rules");
+
+        // And it is not cached: the next ask reads again and gets the node's real answer.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let flaky = RpcClient::new(
+            rpc_fn(move |m, _p| {
+                assert_eq!(m, "rand_getLimits");
+                match c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => Reply::Err(-32603, "db closed"),
+                    _ => Reply::Ok(base()),
+                }
+            })
+            .await,
+        );
+        assert!(flaky.fee_rules().await.is_err(), "the first read fails");
+        assert_eq!(flaky.fee_rules().await.unwrap(), FeesConfig::default(), "the failure was not cached");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "one failed read, one good one");
     }
 
     /// Issue #64: every committed genesis file (`deploy/genesis-chain*.json`) of a chain that
