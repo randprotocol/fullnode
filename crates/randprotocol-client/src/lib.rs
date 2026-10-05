@@ -14,6 +14,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
+use randprotocol_core::ledger::FeesConfig;
 use randprotocol_core::notes::{word8_from_hex, Envelope, EnvelopeFormat, Word8, DEPTH};
 use randprotocol_core::program::ProgramId;
 use randprotocol_core::types::CallEnvelope;
@@ -347,6 +348,39 @@ pub fn binding_domain_for(chain_id: u64, genesis: Hash) -> BindingDomain {
     BindingDomain::Genesis(genesis)
 }
 
+/// What [`RpcClient`] keeps of its one `rand_getLimits` read: the fields that are fixed at genesis
+/// and asked for repeatedly — per output a wallet seals, per pass the aggregate daemon runs — so
+/// paying a round trip for each would buy nothing. Every field reads as the chain-without-it value
+/// on a node too old for the method or for that field.
+#[derive(Clone, Debug, Default)]
+struct CachedLimits {
+    /// `envelope_bytes`, `None` when absent ([`envelope_format_for`] then answers `Legacy`).
+    envelope_bytes: Option<u32>,
+    /// `binding_domain`, `0` when absent (BIND-1).
+    binding_domain: u32,
+    /// `fee_rules`, the default (no rule on) when absent or `null` ([`fee_rules_of`]).
+    fee_rules: FeesConfig,
+}
+
+/// The chain's fee rules (the genesis `fees` section, `docs/fees.md` §1.3) out of a
+/// `rand_getLimits` reply: `fee_rules.burn_base` and `fee_rules.subsidy_net_of_fees`, each read
+/// as a boolean or not at all. A reply without `fee_rules` (a node that predates the section) or
+/// with `null` there (no flag `true`) is [`FeesConfig::default`], which is exactly what such a
+/// chain runs. Read field by field rather than decoded into [`FeesConfig`], whose
+/// `deny_unknown_fields` guards the genesis file: a later node adding a third flag must not make
+/// this read fail — an older client simply does not know that rule.
+pub fn fee_rules_of(limits: &Value) -> FeesConfig {
+    let rules = &limits["fee_rules"];
+    FeesConfig {
+        burn_base: rules["burn_base"].as_bool(),
+        subsidy_net_of_fees: rules["subsidy_net_of_fees"].as_bool(),
+        // #135: the daemon's note does not depend on it (the shares it nets are the ledger's own
+        // bucket entries, already `fee − floor` under the flag), but the struct mirrors the
+        // chain's rules whole.
+        burn_floor: rules["burn_floor"].as_bool(),
+    }
+}
+
 #[derive(Clone)]
 pub struct RpcClient {
     url: String,
@@ -361,8 +395,9 @@ pub struct RpcClient {
     /// not one per bundle a wallet builds.
     ///
     /// BIND-1: the same one read carries the node's `binding_domain` claim beside it
-    /// ([`RpcClient::claimed_binding_domain`]) — `(envelope_bytes, binding_domain)`.
-    envelope_format: std::sync::Arc<tokio::sync::OnceCell<(Option<u32>, u32)>>,
+    /// ([`RpcClient::claimed_binding_domain`]), and the chain's fee rules
+    /// ([`RpcClient::fee_rules`], issue #132).
+    envelope_format: std::sync::Arc<tokio::sync::OnceCell<CachedLimits>>,
     /// The first wait after a rate-limit refusal (issue #117); doubled per retry up to
     /// [`RATE_LIMIT_RETRIES`] retries. A second in production; tests shorten it.
     rate_limit_wait: Duration,
@@ -821,31 +856,45 @@ impl RpcClient {
     /// never cached (`get_or_try_init` only stores the `Ok` arm), so a transient RPC failure does
     /// not wrongly pin this client to `Legacy` for the rest of its life.
     pub async fn envelope_format(&self, chain_id: u64) -> Result<EnvelopeFormat> {
-        let (envelope_bytes, _) = self.cached_limits().await?;
-        Ok(envelope_format_for(chain_id, envelope_bytes))
+        Ok(envelope_format_for(chain_id, self.cached_limits().await?.envelope_bytes))
     }
 
-    /// The one cached `rand_getLimits` read behind [`RpcClient::envelope_format`] and
-    /// [`RpcClient::claimed_binding_domain`]: `(envelope_bytes, binding_domain)`, `(None, 0)` from
-    /// a node too old for the method or for either field. A failed read is never cached.
-    async fn cached_limits(&self) -> Result<(Option<u32>, u32)> {
+    /// The chain's fee rules (`rand_getLimits.fee_rules`, the genesis `fees` section), through
+    /// the same one cached read as [`RpcClient::envelope_format`]: the section is fixed at genesis,
+    /// so the aggregate daemon, which nets its payout by it on every pass, pays one round trip per
+    /// life of its client rather than one per pass (issue #132). A node too old for
+    /// `rand_getLimits`, a reply that predates the field and `null` (no flag `true`) all read as
+    /// [`FeesConfig::default`] — the rules such a chain runs. A failed read is an error and is
+    /// not cached, as for `envelope_format`: defaulting it would seal a payout the ledger of a
+    /// `subsidy_net_of_fees` chain never pays.
+    pub async fn fee_rules(&self) -> Result<FeesConfig> {
+        Ok(self.cached_limits().await?.fee_rules.clone())
+    }
+
+    /// The one cached `rand_getLimits` read behind [`RpcClient::envelope_format`],
+    /// [`RpcClient::claimed_binding_domain`] and [`RpcClient::fee_rules`]; every field at its
+    /// default from a node too old for the method or for that field. A failed read is never cached.
+    async fn cached_limits(&self) -> Result<&CachedLimits> {
         let cached = self
             .envelope_format
             .get_or_try_init(|| async {
                 let v = match self.call("rand_getLimits", json!([])).await {
                     Ok(v) => v,
-                    Err(e) if is_method_not_found(&e) => return Ok((None, 0)),
+                    Err(e) if is_method_not_found(&e) => return Ok(CachedLimits::default()),
                     Err(e) => return Err(e),
                 };
                 // The envelope size through the typed reply, exactly as before; the binding
-                // domain off the same JSON, absent (an older node) read as 0.
+                // domain and the fee rules off the same JSON, absent (an older node) read as
+                // their defaults.
                 let limits: ChainLimits = serde_json::from_value(v.clone()).context("decoding rand_getLimits")?;
-                let bytes = limits.envelope_bytes.and_then(|n| u32::try_from(n).ok());
-                let binding = v.get("binding_domain").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
-                Ok::<_, anyhow::Error>((bytes, binding))
+                Ok::<_, anyhow::Error>(CachedLimits {
+                    envelope_bytes: limits.envelope_bytes.and_then(|n| u32::try_from(n).ok()),
+                    binding_domain: v.get("binding_domain").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(0),
+                    fee_rules: fee_rules_of(&v),
+                })
             })
             .await?;
-        Ok(*cached)
+        Ok(cached)
     }
 
     /// What this node says the chain's genesis `binding_domain` is (BIND-1): `0` or `1`, `0` from
@@ -854,7 +903,7 @@ impl RpcClient {
     /// only to refuse early, with a reason, what the chain would refuse after a proof
     /// ([`RpcClient::binding_domain`], `wallet::binding_domain`).
     pub async fn claimed_binding_domain(&self) -> Result<u32> {
-        Ok(self.cached_limits().await?.1)
+        Ok(self.cached_limits().await?.binding_domain)
     }
 
     /// Refuse, before anything is proved or signed, a chain this wallet could not transact on
@@ -1684,6 +1733,69 @@ mod tests {
         });
         let no_field = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(reply))]).await);
         assert_eq!(no_field.envelope_format(7).await.unwrap(), EnvelopeFormat::Legacy, "a reply that predates the field");
+    }
+
+    /// [`RpcClient::fee_rules`] (issue #132) rides the same one cached `rand_getLimits` read as
+    /// [`RpcClient::envelope_format`] — the aggregate daemon asks it once a pass, for a value fixed
+    /// at genesis — and every shape of "this chain has no fee rule" is the default
+    /// [`FeesConfig`]: a node too old for the method, a reply that predates the field, and the
+    /// `null` a node serves when no flag is `true`. A transient failure is an error, not a
+    /// default, and is not cached.
+    #[tokio::test]
+    async fn fee_rules_ride_the_cached_limits_and_default_on_an_old_node() {
+        use test_rpc::{rpc_fn, scripted_rpc, Reply};
+        let base = || {
+            json!({
+                "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+                "max_call_envelope_bytes": 18432, "max_program_public_words": 64
+            })
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let rpc = RpcClient::new(
+            rpc_fn(move |m, _p| {
+                assert_eq!(m, "rand_getLimits", "fee_rules asks nothing else");
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut v = base();
+                v["fee_rules"] = json!({ "burn_base": false, "subsidy_net_of_fees": true });
+                Reply::Ok(v)
+            })
+            .await,
+        );
+        let on = FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(true), burn_floor: None };
+        assert_eq!(rpc.fee_rules().await.unwrap(), on);
+        assert_eq!(rpc.fee_rules().await.unwrap(), on);
+        assert_eq!(rpc.envelope_format(7).await.unwrap(), EnvelopeFormat::Legacy);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "one read for fee_rules and envelope_format alike");
+
+        let old = RpcClient::new(scripted_rpc(vec![]).await);
+        assert_eq!(old.fee_rules().await.unwrap(), FeesConfig::default(), "a node with no rand_getLimits at all");
+        let no_field = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(base()))]).await);
+        assert_eq!(no_field.fee_rules().await.unwrap(), FeesConfig::default(), "a reply that predates the field");
+        let mut null = base();
+        null["fee_rules"] = Value::Null;
+        let null = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(null))]).await);
+        assert_eq!(null.fee_rules().await.unwrap(), FeesConfig::default(), "no flag true");
+
+        let broken = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Err(-32603, "db closed"))]).await);
+        assert!(broken.fee_rules().await.is_err(), "a transient failure is not the default rules");
+
+        // And it is not cached: the next ask reads again and gets the node's real answer.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let flaky = RpcClient::new(
+            rpc_fn(move |m, _p| {
+                assert_eq!(m, "rand_getLimits");
+                match c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => Reply::Err(-32603, "db closed"),
+                    _ => Reply::Ok(base()),
+                }
+            })
+            .await,
+        );
+        assert!(flaky.fee_rules().await.is_err(), "the first read fails");
+        assert_eq!(flaky.fee_rules().await.unwrap(), FeesConfig::default(), "the failure was not cached");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "one failed read, one good one");
     }
 
     /// Issue #64: every committed genesis file (`deploy/genesis-chain*.json`) of a chain that
