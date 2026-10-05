@@ -3420,14 +3420,18 @@ impl Storage {
         // wider genesis window keeps rows `load_ledger` alone does not read.
         // And the incremental token root (audit v6 TOK-1): a genesis parameter the stored
         // registry's layout implies; the file is the authority, as at a restart.
-        match self.load_ledger(executor).and_then(|mut stored| {
+        let loaded = self.load_ledger(executor).and_then(|mut stored| {
             stored.set_gas(gs.ledger.gas().cloned());
             self.restore_proof_window(&mut stored, gs)?;
             stored.set_tokens_incremental_root(gs.ledger.tokens().is_some_and(|t| t.incremental_root()));
             // The nullifier range needs no line here: its row loaded it, and the replayed ledger
             // started from `gs.ledger`, which carries the flag, so `stored == ledger` compares ranges.
             Ok(stored)
-        }) {
+        });
+        // The full equality walks every commitment and nullifier (O(state), final review F2), so
+        // it is evaluated once here and the arms below read `same`.
+        let same = matches!(&loaded, Ok(stored) if *stored == ledger);
+        match loaded {
             // The live gas prices (Phase 2): inside the equality, hashed under `gas.dynamic`,
             // named first so the repair knows the key.
             Ok(stored) if stored.gas_prices() != ledger.gas_prices() => {
@@ -3489,7 +3493,7 @@ impl Storage {
             }
             // The supply counters are outside `Ledger`'s equality (nothing hashes them), so they
             // are audited here explicitly: this is the replay the RPC's numbers are worth.
-            Ok(stored) if stored == ledger && stored.supply() != ledger.supply() => {
+            Ok(stored) if same && stored.supply() != ledger.supply() => {
                 check.problem = Some(format!(
                     "stored supply {:?} does not match the replayed chain's {:?}",
                     stored.supply(),
@@ -3499,7 +3503,7 @@ impl Storage {
             // The burned registration fees (audit v5, TOK-2) are a supply counter kept beside
             // the blob, outside the equality like it, and audited the same way: the supply
             // identity `rand_getSupply` reports is computed with them on its right.
-            Ok(stored) if stored == ledger && stored.registration_fees_burned() != ledger.registration_fees_burned() => {
+            Ok(stored) if same && stored.registration_fees_burned() != ledger.registration_fees_burned() => {
                 check.problem = Some(format!(
                     "stored registration fees burned {} do not match the replayed chain's {}",
                     stored.registration_fees_burned(),
@@ -3508,14 +3512,14 @@ impl Storage {
             }
             // The bucket is outside `Ledger`'s equality for the same reason, so it is audited
             // beside the counters: the next aggregate's payout is computed from it.
-            Ok(stored) if stored == ledger && stored.unsealed_fees() != ledger.unsealed_fees() => {
+            Ok(stored) if same && stored.unsealed_fees() != ledger.unsealed_fees() => {
                 check.problem = Some(format!(
                     "stored unsealed fees {:?} do not match the replayed chain's {:?}",
                     stored.unsealed_fees(),
                     ledger.unsealed_fees()
                 ))
             }
-            Ok(stored) if stored == ledger => {}
+            Ok(_) if same => {}
             Ok(_) => check.problem = Some("state snapshot does not match replayed chain".into()),
             Err(e) => check.problem = Some(format!("state snapshot unreadable: {e}")),
         }

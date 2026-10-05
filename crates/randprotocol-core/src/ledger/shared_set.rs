@@ -59,8 +59,7 @@ impl SharedSet {
     /// Exact: the base plus the delta entries the base does not hold. Between a lineage's
     /// `commit` and this clone's `absorb` the two can overlap; the count does not double.
     pub fn len(&self) -> usize {
-        let base = self.base();
-        base.len() + self.added.iter().filter(|x| !base.contains(*x)).count()
+        len_of(&self.base(), &self.added)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -82,38 +81,9 @@ impl SharedSet {
     /// Every entry once, ascending: a merge of the two sorted halves. `f` must not touch this
     /// set: the base's read guard is held while it runs, and a recursive read with a queued
     /// writer can deadlock under std's `RwLock`.
-    pub fn for_each_sorted(&self, mut f: impl FnMut(&Word8)) {
+    pub fn for_each_sorted(&self, f: impl FnMut(&Word8)) {
         let base = self.base();
-        let mut a = base.iter().peekable();
-        let mut b = self.added.iter().peekable();
-        loop {
-            match (a.peek(), b.peek()) {
-                (Some(x), Some(y)) => match x.cmp(y) {
-                    std::cmp::Ordering::Less => {
-                        f(x);
-                        a.next();
-                    }
-                    std::cmp::Ordering::Greater => {
-                        f(y);
-                        b.next();
-                    }
-                    std::cmp::Ordering::Equal => {
-                        f(x);
-                        a.next();
-                        b.next();
-                    }
-                },
-                (Some(x), None) => {
-                    f(x);
-                    a.next();
-                }
-                (None, Some(y)) => {
-                    f(y);
-                    b.next();
-                }
-                (None, None) => return,
-            }
-        }
+        merged(&base, &self.added).for_each(f);
     }
 
     /// Drain the delta into the shared base: the commit step. O(delta); the base is not copied.
@@ -143,12 +113,58 @@ impl SharedSet {
     }
 }
 
+/// [`SharedSet::len`] under a guard the caller already holds.
+fn len_of(base: &BTreeSet<Word8>, added: &BTreeSet<Word8>) -> usize {
+    base.len() + added.iter().filter(|x| !base.contains(*x)).count()
+}
+
+/// Every entry of `base ∪ added` once, ascending: a merge of the two sorted halves, an entry in
+/// both yielded once. Lazy and allocation-free; [`SharedSet::for_each_sorted`] and the
+/// [`PartialEq`] walk both read the set through it.
+fn merged<'a>(base: &'a BTreeSet<Word8>, added: &'a BTreeSet<Word8>) -> impl Iterator<Item = &'a Word8> + 'a {
+    let mut a = base.iter().peekable();
+    let mut b = added.iter().peekable();
+    std::iter::from_fn(move || match (a.peek(), b.peek()) {
+        (Some(x), Some(y)) => match x.cmp(y) {
+            std::cmp::Ordering::Less => a.next(),
+            std::cmp::Ordering::Greater => b.next(),
+            std::cmp::Ordering::Equal => {
+                b.next();
+                a.next()
+            }
+        },
+        (Some(_), None) => a.next(),
+        (None, Some(_)) => b.next(),
+        (None, None) => None,
+    })
+}
+
+/// Logical equality: the same entries, however they are split between base and delta.
+///
+/// No-allocation contract (final review F2): this runs on the startup path (`verify_chain`
+/// compares the stored ledger with the replayed one) over sets of 10⁷–10⁸ entries, so it never
+/// copies either set. It takes each base's read guard once — one guard when the two share a
+/// base, else both, in `Arc::as_ptr` address order so two concurrent comparisons cannot lock in
+/// opposite orders — holds them for the walk, compares the exact lengths, then walks the two
+/// merged sorted streams in lockstep.
 impl PartialEq for SharedSet {
     fn eq(&self, other: &SharedSet) -> bool {
-        if Arc::ptr_eq(&self.base, &other.base) && self.added == other.added {
+        let same_base = Arc::ptr_eq(&self.base, &other.base);
+        if same_base && self.added == other.added {
             return true;
         }
-        self.len() == other.len() && self.snapshot() == other.snapshot()
+        if same_base {
+            let base = self.base();
+            return len_of(&base, &self.added) == len_of(&base, &other.added)
+                && merged(&base, &self.added).eq(merged(&base, &other.added));
+        }
+        let self_first = Arc::as_ptr(&self.base) < Arc::as_ptr(&other.base);
+        let (first, second) = if self_first { (self, other) } else { (other, self) };
+        let first_guard = first.base();
+        let second_guard = second.base();
+        let (mine, theirs) = if self_first { (&first_guard, &second_guard) } else { (&second_guard, &first_guard) };
+        len_of(mine, &self.added) == len_of(theirs, &other.added)
+            && merged(mine, &self.added).eq(merged(theirs, &other.added))
     }
 }
 
@@ -217,6 +233,44 @@ mod tests {
         assert_eq!(s.snapshot(), flat.snapshot());
     }
 
+    /// Equality is the allocation-free merge walk (final review F2): the same entries split
+    /// differently between base and delta compare equal, in either argument order, both across
+    /// bases and over one shared base; a one-entry difference compares unequal.
+    #[test]
+    fn equality_walks_the_merged_halves_however_they_are_split() {
+        // Base {1,2}, delta {3,4} against base {1}, delta {2,3,4}: different bases.
+        let mut a = SharedSet::from_set([w(1), w(2)].into_iter().collect());
+        a.insert(w(3));
+        a.insert(w(4));
+        let mut b = SharedSet::from_set([w(1)].into_iter().collect());
+        for n in [2, 3, 4] {
+            b.insert(w(n));
+        }
+        assert!(a == b && b == a, "equal across bases");
+        // One shared base, different deltas holding the same entries: a clone that committed
+        // part of its delta, seen against an earlier clone that still holds it in its delta.
+        let mut c = SharedSet::from_set([w(1)].into_iter().collect());
+        let mut d = c.clone();
+        d.insert(w(2));
+        c.insert(w(2));
+        c.commit();
+        // `d` shares `c`'s base, which now holds 2, and still carries 2 in its delta.
+        assert!(Arc::ptr_eq(&c.base, &d.base) && c.added != d.added);
+        assert!(c == d && d == c, "equal over one shared base");
+        // One entry apart: unequal across bases (same length, different entry, and length).
+        let mut e = SharedSet::from_set([w(1), w(2)].into_iter().collect());
+        e.insert(w(3));
+        e.insert(w(5));
+        assert!(a != e && e != a, "same length, one entry different");
+        let mut f = b.clone();
+        f.insert(w(6));
+        assert!(a != f && f != a, "one entry more");
+        // And over one shared base.
+        let mut g = d.clone();
+        g.insert(w(7));
+        assert!(d != g && g != d, "one entry more over a shared base");
+    }
+
     /// Random insert/clone/commit/absorb programs across a family of clones, against a plain
     /// `BTreeSet` oracle per clone. Seeded, so a failure reproduces.
     #[test]
@@ -272,6 +326,12 @@ mod tests {
                 for (s, o, _) in &sets {
                     assert_eq!(s.len(), o.len(), "seed {seed}: len");
                     assert_eq!(s.snapshot(), *o, "seed {seed}: contents");
+                }
+                // The merge-walk equality agrees with the oracles' pairwise.
+                for (s, o, _) in &sets {
+                    for (t, p, _) in &sets {
+                        assert_eq!(s == t, o == p, "seed {seed}: equality");
+                    }
                 }
             }
         }
