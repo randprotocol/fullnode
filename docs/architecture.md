@@ -176,12 +176,19 @@ The ledger is the shielded pool plus the two public registers:
 
 ```
 tree          CommitmentTree — depth 32, Poseidon2, append-only, stored as a frontier
-commitments   BTreeSet<Word8> — every leaf ever appended (the frontier cannot answer membership)
-nullifiers    BTreeSet<Word8> — every note ever spent
+commitments   SharedSet — every leaf ever appended (the frontier cannot answer membership)
+nullifiers    SharedSet — every note ever spent
 anchors       VecDeque<(height, root)> — the last ANCHOR_WINDOW = 256 block-end roots
 validators    BTreeMap<Address, ValidatorEntry { public_key, stake, rewards }>
 programs      BTreeMap<ProgramId, ProgramRecord>
 ```
+
+A `SharedSet` is a committed base behind an `Arc<RwLock<BTreeSet>>` that every clone of a lineage
+shares, plus a delta that each clone owns; a clone copies the delta and nothing else, so cloning
+the ledger for a speculative block, a trial apply or a block apply costs `O(delta)` where it was
+`O(state)`. The base is written only at the commit step (§6) and by `detach`, and only from
+`HotStuff`; the module doc of `ledger/shared_set.rs` states why a `Ledger` is therefore not a
+value type across commits.
 
 The tree is a *frontier*: `O(DEPTH)` state and `O(DEPTH)` per append, so consensus state never
 materializes the leaf set. The leaves live in RocksDB (§7), and a Merkle witness is folded by
@@ -200,6 +207,14 @@ rejected transaction leaves the ledger byte-identical.
    `blake3("rand-nullifier-leaf" || nf(32))` for every nullifier, in sorted (BTreeSet) order.
    It is recomputed per block: `O(n)`, which is fine until the set passes about 10^6 entries and
    wants an incremental accumulator.
+   Under the genesis flag `incremental_nullifier_root` (spec 2026-10-05 §4) the slot instead holds
+   the root of an append-only range, `rand-nullifier-mmr-1`, over `blake3("rand-nullifier-leaf"
+   || nf(32))` leaves joined by `rand-nullifier-mmr-node` nodes, **in insertion order**, so the
+   per-block cost is `O(log n)` per insert and no sort, and the composite is re-domained
+   `rand-state-nf-mmr-1` after the tokens wrapper. The range's peaks ride the `meta/nullifier_mmr`
+   row, written with every commit and restored at load; it is the only record of insertion order,
+   so a flag-on store whose row is missing refuses to start rather than rebuild. Flag off, the
+   ledger, its roots and every genesis hash are byte-identical to before.
 2. `validators_root` = the same construction over
    `blake3("rand-validator-leaf-2" || address(32) || stake_be(8) || rewards_be(8) ||
    nonce_be(8) || pending_len_be(8) || (release_epoch_be(8) || amount_be(8))* ||
@@ -284,10 +299,16 @@ currently implemented in `crates/randprotocol-core/src/consensus/hotstuff.rs`:
   `Ledger::apply_block` rejects an over-limit block outright (`gas::MAX_BLOCK_BYTES` /
   `gas::MAX_BLOCK_TXS`), so a Byzantine leader cannot stuff one and force every honest replica to
   execute it.
-- **Speculative state.** Every entry in the in-memory block tree clones the full ledger. The tree,
+- **Commit step.** When a block commits, `HotStuff` prunes the tree to the committed block's
+  descendants and then drains the committed ledger's deltas into the shared base; every surviving
+  entry descends from the committed block, so its own delta already holds the committed entries
+  and absorbs them as redundant, and a read-only snapshot (the node's verify snapshot) merely
+  gains entries it could derive anyway.
+- **Speculative state.** Every entry in the in-memory block tree holds a ledger whose sets share
+  the committed base, so an entry costs its delta rather than the full ledger. The tree,
   the pending-vote map, the NewView map, and the view counter are all bounded against a misbehaving
   or diverging peer (`max_tree_blocks` = 512, 4096 pending-vote keys, 2048 NewView views,
-  `MAX_VIEW_AHEAD`); the per-entry ledger clone is a known design cost to revisit as state grows.
+  `MAX_VIEW_AHEAD`); the per-entry cost is now the block's delta (`docs/compute-optimization.md` §3.2).
 
 ## 7. Storage, startup verification, hard forks
 

@@ -10,6 +10,25 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 `git tag` and the GitHub release list (audit v6, DOC-6). There is no tag v0.5.2, v0.5.3 or v0.6.5.
 "Assets" says what the GitHub release carries, as read on 2026-09-30.
 
+## Unreleased — the validator hot path (`feat/hot-path`)
+
+Not rolled onto chain 20: the consensus-visible change is genesis-gated and needs a new cut.
+
+- **`incremental_nullifier_root`** (genesis flag, `rand-node genesis --incremental-nullifier-root`):
+  the nullifier slot of the state root holds an append-only range root in insertion order, the
+  composite re-domained `rand-state-nf-mmr-1`; the peaks persist as `meta/nullifier_mmr`. No
+  existing chain's hash or state root changes, and nothing rolls onto chain 20 without a genesis cut.
+- **`SharedSet`**: the ledger's commitment and nullifier sets share a committed base between
+  clones, so `Ledger::clone()` is `O(delta)`; the HotStuff commit step drains the deltas into it.
+  Node-only.
+- **Propose without a clone per candidate**: the leader applies candidates in place and replays the
+  block on a failure, at most `MAX_PROPOSE_REPLAYS` = 8 times a block. Node-only.
+- **`rand-node run --verify-workers`**: verification limits sized to the host (the cores minus two,
+  at least four), and QC signatures verified in parallel, once per (certificate, validator set).
+  Node-only.
+- **`rand-node bench apply`**: the synthetic-load harness; the measured tables are in
+  `docs/node-hardware.md` §7.
+
 ## v0.7.1 — 2026-10-07 (chain 20, node-only)
 
 Node-only: no consensus rule, wire format, verifier key or genesis change. From this release on,
