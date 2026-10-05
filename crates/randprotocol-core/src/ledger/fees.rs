@@ -1,7 +1,7 @@
 //! The genesis `fees` section: the fee-feedback rules (`docs/fees.md` §1.3, plan
 //! `docs/superpowers/plans/2026-10-05-fee-feedback.md`).
 //!
-//! Two genesis-gated consensus rules, each off by default and each following the pattern of
+//! Three genesis-gated consensus rules, each off by default and each following the pattern of
 //! `tokens.burn_registration_fee` (audit v5, TOK-2) exactly: absent — or present and `false` —
 //! the chain is byte for byte what it was (genesis hash, state root, stored values, RPC values);
 //! `true`, the rule applies from block 1.
@@ -12,7 +12,13 @@
 //!   excess is bucketed for the aggregator exactly as before. Only the base burns: it is the one
 //!   component every bundle pays and no proposer can steer, while a Call's gas and byte terms and
 //!   a Deploy's per-word term stay the proposer's, so including priced work stays worth its while.
-//!   Burning the whole floor is a follow-up, not this rule.
+//!   Burning the whole floor is the third flag's rule, below.
+//! - `burn_floor` (issue #135; needs `burn_base`, `GenesisError::BurnFloorWithoutBurnBase`): the
+//!   full EIP-1559 form — the whole of the ledger's own floor for the bundle is destroyed, not only
+//!   its base ([`crate::ledger::Ledger::settled_floor`]: `BUNDLE_BASE` for a transfer, base plus
+//!   per-word for a Deploy, the tier-exact floor `validate_inner` held a Call to after decoding).
+//!   A proposer then gains nothing from a block that lifts a price, which is what the burn is for;
+//!   it keeps only the tip above the floor.
 //! - `subsidy_net_of_fees`: an aggregate's subsidy is paid out of its covered proving shares
 //!   first and minted only for the shortfall. It needs an `aggregation` section
 //!   (`GenesisError::SubsidyNetOfFeesWithoutAggregation`).
@@ -22,9 +28,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The genesis `fees` section. Both flags are `Option<bool>` so a file that leaves one out
-/// round-trips without it; [`FeesConfig::burn_base`] and [`FeesConfig::subsidy_net_of_fees`]
-/// read `None` and `Some(false)` alike, as the genesis hash does.
+/// The genesis `fees` section. Every flag is an `Option<bool>` so a file that leaves one out
+/// round-trips without it; [`FeesConfig::burn_base`], [`FeesConfig::subsidy_net_of_fees`] and
+/// [`FeesConfig::burn_floor`] read `None` and `Some(false)` alike, as the genesis hash does.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FeesConfig {
@@ -34,6 +40,10 @@ pub struct FeesConfig {
     /// Pay an aggregate's subsidy from its proving shares first, minting only the shortfall.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subsidy_net_of_fees: Option<bool>,
+    /// Under `burn_base`, burn the bundle's whole settled floor rather than its base alone
+    /// (issue #135). Meaningless without `burn_base`, so genesis refuses it alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burn_floor: Option<bool>,
 }
 
 impl FeesConfig {
@@ -47,10 +57,17 @@ impl FeesConfig {
         self.subsidy_net_of_fees == Some(true)
     }
 
+    /// Whether the full-floor burn is on: `true` only when the file says `true`. The ledger reads
+    /// it only beside [`Self::burn_base`] — genesis refuses it alone, and a ledger handed it alone
+    /// by a test burns nothing.
+    pub fn burn_floor(&self) -> bool {
+        self.burn_floor == Some(true)
+    }
+
     /// Whether any rule is on. A section with no true flag is the section's absence in every
     /// respect — the genesis hash, the ledger's behaviour and `rand_getLimits`' `fee_rules`.
     pub fn any(&self) -> bool {
-        self.burn_base() || self.subsidy_net_of_fees()
+        self.burn_base() || self.subsidy_net_of_fees() || self.burn_floor()
     }
 }
 
@@ -61,10 +78,14 @@ mod tests {
     #[test]
     fn a_flag_is_on_only_when_the_file_says_true() {
         assert!(!FeesConfig::default().any());
-        let off = FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(false) };
+        let off = FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(false), burn_floor: None };
         assert!(!off.burn_base() && !off.subsidy_net_of_fees() && !off.any());
-        let on = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None };
+        let on = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None };
         assert!(on.burn_base() && !on.subsidy_net_of_fees() && on.any());
+        assert!(!on.burn_floor(), "an absent burn_floor is off");
+        let floor = FeesConfig { burn_floor: Some(true), ..on };
+        assert!(floor.burn_floor() && floor.any());
+        assert!(!FeesConfig { burn_floor: Some(false), ..FeesConfig::default() }.any());
     }
 
     /// Unknown keys are refused: a misspelt consensus flag must not read as "off".

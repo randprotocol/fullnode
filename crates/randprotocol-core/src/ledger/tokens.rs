@@ -3517,7 +3517,7 @@ mod action_tests {
         let mut l = ledger();
         l.set_genesis_supply(10 * fee, 10);
         l.set_tokens(Some(TokenRegistry::new(REG_FEE).with_burn_registration_fee(true)));
-        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None });
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None });
         let tx = register_tx_at(&l, MintAuthority::None, Some(initial(&l, 5)), 10, l.tokens().unwrap().next_index(), fee);
         l.apply_tx(&tx, &p, &StubExecutor).unwrap();
         assert_eq!(l.supply().burned, REG_FEE + gas::BUNDLE_BASE, "both are destroyed");

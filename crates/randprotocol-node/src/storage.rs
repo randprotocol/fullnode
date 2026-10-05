@@ -229,12 +229,12 @@ const META_JAILED: &str = "jailed";
 /// audit subtracts it on the right of its identity: the fee left the pool into no register
 /// entry.
 const META_REGISTRATION_FEES_BURNED: &str = "registration_fees_burned";
-/// `bincode(u64)`: Σ of the bundle bases burned under the genesis `fees.burn_base` as of the head
-/// (`Ledger::base_fees_burned`, `docs/fees.md` §1.3). `META_REGISTRATION_FEES_BURNED`'s twin in
-/// every respect — derived, outside the root and `Ledger`'s equality, written at the same three
-/// sites, replayed by `verify_chain`, on the right of the supply identity — and absent on a
-/// database written before the key existed, where it reads 0: what the ledger holds on every chain
-/// without the flag.
+/// `bincode(u64)`: Σ of the bundle bases burned under the genesis `fees.burn_base` (the whole
+/// floors under `fees.burn_floor`) as of the head (`Ledger::base_fees_burned`, `docs/fees.md`
+/// §1.3). `META_REGISTRATION_FEES_BURNED`'s twin in every respect — derived, outside the root and
+/// `Ledger`'s equality, written at the same three sites, replayed by `verify_chain`, on the right
+/// of the supply identity — and absent on a database written before the key existed, where it reads
+/// 0: what the ledger holds on every chain without the flag.
 const META_BASE_FEES_BURNED: &str = "base_fees_burned";
 /// `bincode(GasPrices)`: the live gas prices as of the head (Phase 2, spec §7.1,
 /// `Ledger::gas_prices`). Consensus state under `gas.dynamic` — in the state root under
@@ -274,7 +274,7 @@ const META_RETIRED_AGGREGATOR_NONCES: &str = "retired_aggregator_nonces";
 /// it from here so every reader of the store (RPC included, which has no genesis file to hand)
 /// sees the same gate the node sees.
 const META_AGGREGATION: &str = "aggregation";
-/// JSON of the genesis `fees` section (`ledger::fees::FeesConfig`), the default (both rules off)
+/// JSON of the genesis `fees` section (`ledger::fees::FeesConfig`), the default (every rule off)
 /// on a chain without one. Genesis truth like `META_AGGREGATION`, written once at genesis and
 /// restored by `load_ledger` so every reader of the store sees the gate the node sees
 /// (`node::reload_ledger` sets it from the genesis file again, the authority). JSON, as
@@ -1640,14 +1640,15 @@ impl Storage {
         Ok(self.get_meta_raw(META_REGISTRATION_FEES_BURNED)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
     }
 
-    /// Σ of the bundle bases burned under `fees.burn_base` as of the head (`META_BASE_FEES_BURNED`)
+    /// Σ of the bundle bases (whole floors under `fees.burn_floor`) burned under `fees.burn_base`
+    /// as of the head (`META_BASE_FEES_BURNED`)
     /// — `registration_fees_burned()`'s twin, with the same rule for a database written before the
     /// key existed: 0, which on a chain without the flag is also the only value it holds.
     pub fn base_fees_burned(&self) -> Result<u64> {
         Ok(self.get_meta_raw(META_BASE_FEES_BURNED)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
     }
 
-    /// The chain's genesis `fees` section (`META_FEES`), the default — both rules off — on a chain
+    /// The chain's genesis `fees` section (`META_FEES`), the default — every rule off — on a chain
     /// without one and on a database written before the key existed.
     pub fn fees_config(&self) -> Result<randprotocol_core::ledger::FeesConfig> {
         Ok(self
@@ -7935,7 +7936,7 @@ mod tests {
         use randprotocol_core::gas::BUNDLE_BASE;
         use randprotocol_core::ledger::FeesConfig;
         let (_d, s, mut gs) = genesis_with_two_notes();
-        let burn = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None };
+        let burn = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None };
         gs.ledger.set_fees(burn.clone());
         // The fixture's notes are tiny; tell the audit what genesis issued so its identity holds
         // after a fee is paid out of the pool.

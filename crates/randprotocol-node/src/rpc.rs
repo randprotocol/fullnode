@@ -761,18 +761,21 @@ pub struct ChainLimits {
     /// RPL-2: the genesis `program_state` section and the `Invoke` limits that come with it,
     /// `null` on a chain without the section (where every invoke is refused).
     pub program_state: Option<ProgramStateLimits>,
-    /// Fee feedback (`docs/fees.md` §1.3): the genesis `fees` section's two rules, `null` on a
+    /// Fee feedback (`docs/fees.md` §1.3): the genesis `fees` section's three rules, `null` on a
     /// chain without one — and on one whose section sets no flag `true`, which is the section's
     /// absence in every respect (it hashes as absent too). Wallet fees do not change with it: the
-    /// floors are the same numbers, only where the base goes differs.
+    /// floors are the same numbers, only where the base (or, under `burn_floor`, the whole
+    /// floor) goes differs.
     pub fee_rules: Option<FeeRules>,
 }
 
-/// `rand_getLimits`' `fee_rules` object: both flags, each `true` only where the genesis says so.
+/// `rand_getLimits`' `fee_rules` object: every flag, each `true` only where the genesis says so.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct FeeRules {
     pub burn_base: bool,
     pub subsidy_net_of_fees: bool,
+    /// Issue #135: under `burn_base`, the bundle's whole settled floor burns, not its base alone.
+    pub burn_floor: bool,
 }
 
 /// `rand_getLimits`' `program_state` object: what a wallet needs to size and price an `Invoke`.
@@ -820,6 +823,7 @@ impl ChainLimits {
             fee_rules: Some(ledger.fees()).filter(|f| f.any()).map(|f| FeeRules {
                 burn_base: f.burn_base(),
                 subsidy_net_of_fees: f.subsidy_net_of_fees(),
+                burn_floor: f.burn_floor(),
             }),
         };
         if let Some(g) = ledger.gas() {
@@ -4341,7 +4345,7 @@ mod tests {
     /// so `subsidy + proving_share` is still the payout note's amount, `max(schedule, shares)`.
     #[tokio::test]
     async fn get_aggregate_reports_the_minted_subsidy_under_subsidy_net_of_fees() {
-        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true) };
+        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None };
         let (_d, st, _gs, _covered_tx, aggregate) = gated_chain_with(fees);
         let v = ok(&st, "rand_getAggregate", json!([aggregate.hash().to_hex()])).await;
         assert_eq!(v["subsidy"], (100 * randprotocol_core::UNITS_PER_RAND - 60).to_string(), "only the shortfall");
@@ -4362,7 +4366,7 @@ mod tests {
     /// one committed block by block.
     #[tokio::test]
     async fn the_aggregate_record_is_the_ledgers_payment_when_cover_and_aggregate_commit_together() {
-        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true) };
+        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None };
         let (_d, live, gs, _covered_tx, aggregate, blocks, l2) = gated_chain_blocks(fees);
         let (_d2, synced) = state_for(&gs);
         synced.storage.commit(&blocks, &l2, &[], &StubExecutor).unwrap();
@@ -5849,7 +5853,7 @@ mod tests {
         assert_eq!(ok(&st, "rand_getSupply", json!([])).await["base_fees_burned"], Value::String("0".into()), "a plain chain");
 
         let mut gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
-        gs.ledger.set_fees(randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None });
+        gs.ledger.set_fees(randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None });
         gs.ledger.set_genesis_supply(1_000 * BUNDLE_BASE, gs.ledger.supply().genesis_staked);
         let (_d, st) = state_for(&gs);
         let mut ledger = st.storage.load_ledger(&StubExecutor).unwrap();
@@ -5877,11 +5881,14 @@ mod tests {
             let (_d, st) = state_for(&gs);
             ok(&st, "rand_getLimits", json!([])).await
         };
-        let off = limits_with(FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None }).await;
+        let off = limits_with(FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: None }).await;
         assert_eq!(off["fee_rules"], Value::Null, "a section with no true flag is no section");
-        let on = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None }).await;
-        assert_eq!(on["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false }));
+        let on = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None }).await;
+        assert_eq!(on["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": false }));
         assert_eq!(on["gas_metering"], Value::Null, "nothing else moves");
+        // Issue #135: the full-floor burn is served beside the base it widens.
+        let floor = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) }).await;
+        assert_eq!(floor["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true }));
     }
 
     /// The interface review's IFACE-7: under `tokens.burn_registration_fee` the ledger buckets a

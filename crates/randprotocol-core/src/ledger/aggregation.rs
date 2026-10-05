@@ -2750,7 +2750,7 @@ mod payment_tests {
     fn burn_base_on_an_aggregating_chain_buckets_the_excess_and_pays_the_proposer_nothing() {
         let burning = |window: u64| {
             let mut l = gated(window);
-            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None });
+            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None });
             // The fixture issues nothing to the pool; tell the audit what genesis deposited so its
             // identity is checkable (the fees below are paid out of it).
             let staked = l.supply().genesis_staked;
@@ -2774,7 +2774,6 @@ mod payment_tests {
         assert_eq!(l.supply().burned, before.burned + gas::BUNDLE_BASE, "the base is destroyed");
         assert_eq!(l.base_fees_burned(), burned_before + gas::BUNDLE_BASE);
         assert_eq!(l.unsealed_fees()[&covered_tx.hash()].0, 60, "the bucket holds fee − BUNDLE_BASE, as without the flag");
-        assert_eq!(l.bucketed_excess(&covered_tx), 60);
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
 
         // The covered exit: the aggregate's note pays subsidy(n) plus the excess, as before.
@@ -2805,11 +2804,75 @@ mod payment_tests {
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
     }
 
+    /// Issue #135, `fees.burn_floor` on an aggregating chain: a Deploy's whole floor,
+    /// `BUNDLE_BASE + deploy_fee(words)`, is destroyed at inclusion, the proposer keeps nothing, and
+    /// the bucket holds `fee − floor` — not `fee − BUNDLE_BASE`, which would pay the aggregator the per-word
+    /// term the chain just burned. The covering aggregate's note and the sweep each pay exactly
+    /// that excess, and the audit holds throughout.
+    #[test]
+    fn burn_floor_on_an_aggregating_chain_buckets_fee_less_the_floor() {
+        let burning = |window: u64| {
+            let mut l = gated(window);
+            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+            let staked = l.supply().genesis_staked;
+            l.set_genesis_supply(1_000 * crate::types::UNITS_PER_RAND, staked);
+            l
+        };
+        let deploy = |w: u32| Action::Deploy { base_pc: 0, words: vec![w; 6], public: vec![] };
+        let floor = gas::fee_floor(&deploy(0x13));
+        assert_eq!(floor, gas::BUNDLE_BASE + gas::deploy_fee(6));
+        let fee = floor + 60;
+
+        // Inclusion: the floor burned, nothing to the proposer, `fee − floor` bucketed.
+        let mut l = burning(256);
+        let (kp, _) = keys();
+        register(&mut l, &kp, 10);
+        l.record_anchor(1);
+        let p = proposer(&l);
+        let (rewards, before, burned_before) = (l.validators()[&p].rewards, l.supply(), l.base_fees_burned());
+        let covered_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), deploy(0x13)));
+        assert_eq!(l.settled_floor(&covered_tx, None), floor);
+        l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&p].rewards, rewards, "the proposer keeps nothing at inclusion");
+        assert_eq!(l.supply().fees_paid, before.fees_paid);
+        assert_eq!(l.supply().burned, before.burned + floor, "the whole floor is destroyed");
+        assert_eq!(l.base_fees_burned(), burned_before + floor);
+        assert_eq!(l.unsealed_fees()[&covered_tx.hash()].0, 60, "the bucket holds fee − floor");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+
+        // The covered exit: subsidy(n) plus the 60, nothing of the burned per-word term.
+        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let covered = covered_records(&[1]);
+        let v = l.validate_aggregate(&tx, &covered, &StubExecutor).unwrap();
+        let subsidy = gas::subsidy(0, &cfg_with_window(256));
+        let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], subsidy + 60, 0, 1, &[9; 8]);
+        assert_eq!(v.payout_cm, want_cm, "the aggregator is paid fee − floor");
+        l.apply_aggregate(&tx, &covered, &StubExecutor).unwrap();
+        assert!(l.has_commitment(&want_cm));
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+
+        // The expiry exit: the sweep pays the recorded proposer the 60, and only the 60.
+        let mut l = burning(2);
+        let (a, _) = keys();
+        let p = proposer(&l);
+        let tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee, 0), deploy(0x17)));
+        l.apply_block(&signed_block(&l, vec![tx.clone()], &a, 1), &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&p].rewards, 0);
+        assert_eq!(l.unsealed_fees().get(&tx.hash()), Some(&(60, p, 3)));
+        l.apply_block(&signed_block(&l, vec![], &a, 2), &StubExecutor).unwrap();
+        l.apply_block(&signed_block(&l, vec![], &a, 3), &StubExecutor).unwrap();
+        assert!(l.unsealed_fees().is_empty());
+        assert_eq!(l.validators()[&p].rewards, 60, "the recorded proposer takes the excess");
+        assert_eq!(l.supply().fees_paid, 60);
+        assert_eq!((l.supply().burned, l.base_fees_burned()), (floor, floor));
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
     /// A gated chain under `fees.subsidy_net_of_fees` whose schedule starts at `subsidy_base`.
     fn net_of_fees(window: u64, subsidy_base: u64) -> Ledger {
         let mut l = gated(window);
         l.set_aggregation(Some(AggregationConfig { subsidy_base, ..cfg_with_window(window) }));
-        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true) });
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None });
         l
     }
 
@@ -2927,7 +2990,7 @@ mod payment_tests {
     /// audit holds after every step with `subsidised` carrying the minted part alone.
     #[test]
     fn the_supply_invariant_holds_across_the_lifecycle_under_subsidy_net_of_fees() {
-        let l = lifecycle(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true) });
+        let l = lifecycle(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None });
         assert_eq!(l.supply().subsidised, gas::subsidy(0, &cfg_with_window(2)) - 60, "only the shortfall is minted");
         assert_eq!(l.supply().sealed_blocks, 1);
     }

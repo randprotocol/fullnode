@@ -158,7 +158,8 @@ pub struct Audit {
     /// register entry: destroyed issuance, on the right of the identity beside `slashed`. Kept
     /// off [`Supply`] so chain 14's stored blob keeps its layout; 0 without the gate.
     pub registration_fees_burned: u64,
-    /// Σ of the `BUNDLE_BASE`s burned under `fees.burn_base` (`docs/fees.md` §1.3;
+    /// Σ of the `BUNDLE_BASE`s burned under `fees.burn_base` — each bundle's whole floor under
+    /// `fees.burn_floor` (`docs/fees.md` §1.3;
     /// `Ledger::base_fees_burned`). `registration_fees_burned`'s sibling: inside `burned` on the
     /// pool side, in no register entry, on the right of the identity, kept off [`Supply`] for the
     /// same layout reason; 0 without the flag.

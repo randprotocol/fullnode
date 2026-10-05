@@ -1129,6 +1129,38 @@ mod tests {
         apply(&mut l, &tx).unwrap();
     }
 
+    /// Issue #135: under `fees.burn_floor` an invoke's settled floor is the call floor plus the
+    /// cell fee for each cell it creates, all burned. A second invoke in the same block writing
+    /// the same cell creates nothing and burns no cell fee — and pays no cell fee either, which it
+    /// could not, were the first's burn taken after its write (the floor would have read the cell
+    /// as existing and burned only the call floor) or the second judged against the block's
+    /// parent (where the cell is still absent).
+    #[test]
+    fn burn_floor_burns_an_invokes_cell_fee_once() {
+        let mut l = ledger();
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+        let p = proposer().address();
+        let floor = gas::BUNDLE_BASE + gas::call_fee(10, 0);
+        let create = invoke_with(&l, 10, floor + CELL_FEE + 7, (0, 0, 0), Transition { writes: vec![cell(1, 5)], ..empty() });
+        let rewrite = invoke_with(&l, 20, floor + 3, (0, 0, 0), Transition { writes: vec![cell(1, 6)], ..empty() });
+        assert_eq!(l.settled_floor(&rewrite, None), gas::fee_floor(&rewrite.action), "None is the pre-verify floor");
+        // Judged alone against the parent, the rewrite would create the cell and be short of it
+        // (refused at the invoke's pre-verify step, which charges the base and the cell fee).
+        assert_eq!(refusal(&l, &rewrite), TxError::FeeTooLow { min: gas::BUNDLE_BASE + CELL_FEE, fee: floor + 3 });
+
+        let mut one = l.clone();
+        apply(&mut one, &create).unwrap();
+        assert_eq!(one.base_fees_burned() - l.base_fees_burned(), floor + CELL_FEE, "the call floor and the cell fee");
+        assert_eq!(one.validators()[&p].rewards - l.validators()[&p].rewards, 7);
+
+        let mut both = l.clone();
+        both.apply_transactions(&[create, rewrite], &p, &StubExecutor).unwrap();
+        assert_eq!(both.base_fees_burned() - one.base_fees_burned(), floor, "the rewrite burns the call floor alone");
+        assert_eq!(both.validators()[&p].rewards - one.validators()[&p].rewards, 3);
+        assert_eq!(both.program_state().unwrap().cell(&pid(), &key(1)), cell(1, 6).value);
+        assert!(both.audit().invariant_holds(), "{:?}", both.audit());
+    }
+
     #[test]
     fn a_payout_note_must_be_new() {
         let mut l = ledger();
