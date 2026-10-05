@@ -3869,6 +3869,7 @@ pub(crate) mod fixtures {
             binding_domain: None,
             proof_window_blocks: None,
             program_state: None,
+            incremental_nullifier_root: None,
             hardening_v6: None,
             hc_auth: None,
         }
@@ -4025,6 +4026,7 @@ pub(crate) mod fixtures {
             binding_domain: None,
             proof_window_blocks: None,
             program_state: None,
+            incremental_nullifier_root: None,
             hardening_v6: None,
             hc_auth: None,
         };

@@ -581,6 +581,10 @@ pub struct Ledger {
     /// Every leaf ever appended — spec §7 item 6 needs membership the frontier cannot answer.
     commitments: SharedSet,
     nullifiers: SharedSet,
+    /// The incremental nullifier root (spec 2026-10-05 §4) under genesis
+    /// `incremental_nullifier_root`: a range over the nullifiers in insertion order, whose root
+    /// takes the sorted root's slot. `None` on every chain through 20.
+    nullifier_mmr: Option<nullifier_mmr::NullifierMmr>,
     /// Block-end roots, oldest first, at most [`Ledger::proof_window`] (ANCHOR_WINDOW without a
     /// genesis `proof_window_blocks`).
     anchors: VecDeque<(u64, Word8)>,
@@ -792,6 +796,7 @@ impl PartialEq for Ledger {
             && self.tree == o.tree
             && self.commitments == o.commitments
             && self.nullifiers == o.nullifiers
+            && self.nullifier_mmr == o.nullifier_mmr
             && self.anchors == o.anchors
             && self.validators == o.validators
             && self.programs == o.programs
@@ -850,6 +855,7 @@ impl Ledger {
             tree,
             commitments: SharedSet::new(),
             nullifiers: SharedSet::new(),
+            nullifier_mmr: None,
             anchors,
             validators,
             programs: BTreeMap::new(),
@@ -914,6 +920,7 @@ impl Ledger {
             tree,
             commitments: SharedSet::from_set(commitments),
             nullifiers: SharedSet::from_set(nullifiers),
+            nullifier_mmr: None,
             anchors: anchors.into_iter().collect(),
             validators,
             programs,
@@ -1346,6 +1353,40 @@ impl Ledger {
         if let Some(t) = &mut self.tokens {
             t.set_incremental_root(on);
         }
+    }
+
+    /// Switch the incremental nullifier root on or off. On is only ever set on an empty set —
+    /// genesis — because the range needs insertion order, which the set does not have; a loaded
+    /// chain restores its range with [`Self::set_nullifier_mmr`].
+    pub fn set_incremental_nullifier_root(&mut self, on: bool) {
+        match (on, &self.nullifier_mmr) {
+            (true, None) => {
+                assert!(
+                    self.nullifiers.is_empty(),
+                    "the incremental nullifier root needs insertion order; it can only be switched on at genesis, not over {} existing nullifiers",
+                    self.nullifiers.len()
+                );
+                self.nullifier_mmr = Some(nullifier_mmr::NullifierMmr::new());
+            }
+            (false, Some(_)) => self.nullifier_mmr = None,
+            _ => {}
+        }
+    }
+
+    /// Install a range a store loaded (spec 2026-10-05 §4): the restore path for a chain whose
+    /// genesis set `incremental_nullifier_root`.
+    pub fn set_nullifier_mmr(&mut self, mmr: Option<nullifier_mmr::NullifierMmr>) {
+        self.nullifier_mmr = mmr;
+    }
+
+    /// The nullifier range, when the chain keeps one.
+    pub fn nullifier_mmr(&self) -> Option<&nullifier_mmr::NullifierMmr> {
+        self.nullifier_mmr.as_ref()
+    }
+
+    /// Whether the nullifier slot of the state root holds the incremental range root.
+    pub fn incremental_nullifier_root(&self) -> bool {
+        self.nullifier_mmr.is_some()
     }
 
     /// The commit step of the shared sets (spec 2026-10-05 §5.2): the committed ledger's deltas
@@ -1822,7 +1863,11 @@ impl Ledger {
     /// `validate_inner` that the tree has room (HB-3); the tree-full error is the belt to that.
     fn apply_bundle_notes(&mut self, b: &Bundle, executor: &dyn ConfidentialExecutor) -> Result<(), TxError> {
         for nf in &b.nullifiers {
-            self.nullifiers.insert(*nf);
+            if self.nullifiers.insert(*nf) {
+                if let Some(m) = &mut self.nullifier_mmr {
+                    m.append(nf);
+                }
+            }
         }
         for cm in &b.commitments {
             self.commitments.insert(*cm);
@@ -2995,11 +3040,18 @@ impl Ledger {
     /// commits exactly what phase S1 committed and a chain without aggregation exactly what the
     /// bridge commit added — turning either on is a hard fork for the chains that take it and a
     /// no-op for the ones that do not.
-    /// The three merkle roots `state_root` binds, in order: nullifiers, validators, programs.
+    /// The three roots `state_root` binds, in order: nullifiers, validators, programs. Under the
+    /// incremental nullifier root the first is the range root, not a sorted merkle root.
     /// Split out so a state-root mismatch can name the component it diverges in.
     fn state_root_leaves(&self) -> (Hash, Hash, Hash) {
-        let mut nf_leaves: Vec<Hash> = Vec::with_capacity(self.nullifiers.len());
-        self.nullifiers.for_each_sorted(|nf| nf_leaves.push(Hash::digest_domain(b"rand-nullifier-leaf", &word8_to_bytes(nf))));
+        let nf_root = match &self.nullifier_mmr {
+            Some(m) => m.root(),
+            None => {
+                let mut nf_leaves: Vec<Hash> = Vec::with_capacity(self.nullifiers.len());
+                self.nullifiers.for_each_sorted(|nf| nf_leaves.push(nullifier_mmr::leaf(nf)));
+                merkle_root(&nf_leaves)
+            }
+        };
         let val_leaves: Vec<Hash> = self
             .validators
             .iter()
@@ -3033,7 +3085,7 @@ impl Ledger {
             .collect();
         let prog_leaves: Vec<Hash> =
             self.programs.keys().map(|id| Hash::digest_domain(b"rand-program-leaf", id.as_bytes())).collect();
-        (merkle_root(&nf_leaves), merkle_root(&val_leaves), merkle_root(&prog_leaves))
+        (nf_root, merkle_root(&val_leaves), merkle_root(&prog_leaves))
     }
 
     /// The component roots of [`Ledger::state_root`], for logging a mismatch: tree, nullifiers,
@@ -3064,6 +3116,13 @@ impl Ledger {
             self.gas_prices(),
             self.admitted_root()
         ) + &format!(" jailed {:?}", self.jailed_root())
+            + &format!(
+                " nullifier range {}",
+                match &self.nullifier_mmr {
+                    Some(m) => format!("{} leaves", m.count()),
+                    None => "off".into(),
+                }
+            )
     }
 
     /// `blake3("rand-state-2" || tree || nullifiers || validators || programs)`, with
@@ -3137,6 +3196,13 @@ impl Ledger {
         let mut root = self.state_root_base();
         if self.tokens.as_ref().is_some_and(|t| t.incremental_root()) {
             root = Hash::digest_domain(b"rand-state-tokens-1", root.as_bytes());
+        }
+        // The incremental nullifier root (spec 2026-10-05 §4.3): the range root already sits in the
+        // nullifier slot of the base; the wrapper keeps a flag-on chain from ever colliding with a
+        // flag-off chain whose sorted root happened to equal it. After the tokens wrapper, before the
+        // staking wrappers — the order is fixed here.
+        if self.nullifier_mmr.is_some() {
+            root = Hash::digest_domain(b"rand-state-nf-mmr-1", root.as_bytes());
         }
         if self.staking.as_ref().is_some_and(|s| s.admission_by_vote()) {
             let mut buf = Vec::with_capacity(64);
@@ -3260,6 +3326,58 @@ mod tests {
                 activation_epoch: 0,
             },
         )
+    }
+
+    /// Spec 2026-10-05 §4.3: without the flag the state root is byte-identical to before (a
+    /// chain-20-shaped ledger); with it the nullifier slot holds the range root and the whole is
+    /// re-domained `rand-state-nf-mmr-1` once.
+    #[test]
+    fn the_incremental_nullifier_root_is_gated_and_wrapped_once() {
+        let (a, _) = keys();
+        let mut off = ledger();
+        let mut on = ledger();
+        on.set_incremental_nullifier_root(true);
+        assert_eq!(off.state_root(), ledger().state_root(), "the flag is off by default");
+        let before_on = on.state_root();
+        assert_ne!(before_on, off.state_root(), "the wrapper changes an empty ledger's root");
+        for l in [&mut off, &mut on] {
+            let t = tx(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+            let root = root_after(l, &[tx(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]])], &a.address(), 1);
+            l.apply_block(&signed_block(vec![t], &a, 1, root), &StubExecutor).unwrap();
+        }
+        // A bundle inserts all four nullifier slots, the two dummies included.
+        assert_eq!(on.nullifier_mmr().unwrap().count(), 4);
+        assert_ne!(on.state_root(), off.state_root(), "the slot swap and the wrapper both move the root");
+        assert_eq!(off.state_root(), ledger_after_same_block_flag_off(&a), "the flag-off root is what it was");
+        // Determinism: the same blocks on a fresh flag-on ledger give the same root.
+        let mut again = ledger();
+        again.set_incremental_nullifier_root(true);
+        let t = tx(&again, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let root = root_after(&again, &[tx(&again, [[1; 8], [2; 8]], [[3; 8], [4; 8]])], &a.address(), 1);
+        again.apply_block(&signed_block(vec![t], &a, 1, root), &StubExecutor).unwrap();
+        assert_eq!(again.state_root(), on.state_root());
+        assert_eq!(again, on, "equality covers the range");
+    }
+
+    /// The flag-off root for the same block, computed on a fresh ledger with no reference to the
+    /// new code paths: pins "byte-identical to before" without a hard-coded hash.
+    fn ledger_after_same_block_flag_off(a: &Keypair) -> Hash {
+        let mut l = ledger();
+        let t = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let root = root_after(&l, &[tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]])], &a.address(), 1);
+        l.apply_block(&signed_block(vec![t], a, 1, root), &StubExecutor).unwrap();
+        l.state_root()
+    }
+
+    #[test]
+    #[should_panic(expected = "insertion order")]
+    fn the_flag_cannot_be_switched_on_over_existing_nullifiers() {
+        let (a, _) = keys();
+        let mut l = ledger();
+        let t = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let root = root_after(&l, &[tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]])], &a.address(), 1);
+        l.apply_block(&signed_block(vec![t], &a, 1, root), &StubExecutor).unwrap();
+        l.set_incremental_nullifier_root(true);
     }
 
     fn ledger() -> Ledger {

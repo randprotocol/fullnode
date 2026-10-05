@@ -112,6 +112,7 @@ fn genesis_full(
         binding_domain: Some(1),
         proof_window_blocks: None,
         program_state: None,
+        incremental_nullifier_root: None,
         hardening_v6: None,
         hc_auth: None,
     }

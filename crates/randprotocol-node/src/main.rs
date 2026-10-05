@@ -470,6 +470,9 @@ enum Cmd {
         /// command line. Needs `--tokens`, refused by name without it.
         #[arg(long)]
         tokens_incremental_root: bool,
+        /// Cut the genesis with incremental_nullifier_root: true (spec 2026-10-05 §4).
+        #[arg(long)]
+        incremental_nullifier_root: bool,
         /// The exact note-envelope size (spec 2026-09-26 §2.4): every note envelope — a bundle
         /// output, a faucet mint, a withdraw, a bridge deposit, a genesis alloc — must be exactly
         /// this many bytes, which lets every one of them carry a memo. Only `notes::
@@ -1606,6 +1609,7 @@ async fn main() -> Result<()> {
             admitted_shapes,
             tokens,
             tokens_incremental_root,
+            incremental_nullifier_root,
             envelope_bytes,
             vesting,
             bundle_guest,
@@ -1796,6 +1800,7 @@ async fn main() -> Result<()> {
                 // without it hashes byte-for-byte as before.
                 program_state: program_state_cell_fee
                     .map(|cell_fee| randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee }),
+                incremental_nullifier_root: incremental_nullifier_root.then_some(true),
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -3684,6 +3689,7 @@ mod tests {
             binding_domain: None,
             proof_window_blocks: None,
             program_state: None,
+            incremental_nullifier_root: None,
         }
     }
 
