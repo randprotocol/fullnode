@@ -11,6 +11,7 @@ use randprotocol_core::bridge::{BridgeBurnRecord, BridgeFees, BridgeMeta, Bridge
 use randprotocol_core::confidential::ConfidentialExecutor;
 use randprotocol_core::consensus::{CommittedBlock, EpochSets, SafetyState};
 use randprotocol_core::genesis::GenesisState;
+use randprotocol_core::ledger::nullifier_mmr::NullifierMmr;
 use randprotocol_core::ledger::tokens::TokenRegistry;
 use randprotocol_core::ledger::{Supply, ValidatorEntry};
 use randprotocol_core::notes::{word8_from_bytes, word8_to_bytes, CommitmentTree, Envelope, FullTree, Word8, DEPTH};
@@ -177,6 +178,11 @@ const META_QCS_PRUNED: &str = "qcs_pruned";
 /// `bincode(CommitmentTree)`: the depth-32 frontier, the only form of the note tree consensus
 /// state keeps. The leaves themselves live in `notes` and rebuild a `FullTree` for witnesses.
 const META_TREE: &str = "tree";
+/// `bincode(NullifierMmr)`: the incremental nullifier root's peaks and count (spec 2026-10-05
+/// §4.4), written with every commit beside the frontier. Insertion order is not in
+/// `nullifiers` (keyed by value), so this row is the only copy; a flag-on chain without it
+/// cannot start.
+const META_NULLIFIER_MMR: &str = "nullifier_mmr";
 /// The genesis `hc_bundle` (32 bytes): the bundle guest commitment every bundle proof on this
 /// chain is verified against.
 const META_HC_BUNDLE: &str = "hc_bundle";
@@ -968,6 +974,24 @@ impl Storage {
         }
     }
 
+    /// Add the incremental nullifier range (spec 2026-10-05 §4.4) to `batch` when `ledger` has
+    /// one: the peaks and count are the only record of insertion order, so they travel in the
+    /// same atomic write as the block and the frontier. A flag-off ledger writes nothing.
+    fn put_nullifier_mmr(&self, batch: &mut WriteBatch, ledger: &Ledger) -> Result<()> {
+        if let Some(m) = ledger.nullifier_mmr() {
+            batch.put_cf(self.cf(CF_META), META_NULLIFIER_MMR, bincode::serialize(m)?);
+        }
+        Ok(())
+    }
+
+    /// The stored incremental nullifier range, if the chain has one (spec 2026-10-05 §4.4).
+    pub fn nullifier_mmr(&self) -> Result<Option<NullifierMmr>> {
+        match self.get_meta_raw(META_NULLIFIER_MMR)? {
+            Some(v) => Ok(Some(bincode::deserialize(&v)?)),
+            None => Ok(None),
+        }
+    }
+
     fn get_meta_raw(&self, key: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.db.get_cf(self.cf(CF_META), key.as_bytes())?)
     }
@@ -1028,6 +1052,7 @@ impl Storage {
         self.put_tokens_ext(&mut batch, gs.ledger.tokens())?;
         batch.put_cf(self.cf(CF_ANCHORS), height_key(0), word8_to_bytes(&gs.ledger.root()));
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(gs.ledger.tree())?);
+        self.put_nullifier_mmr(&mut batch, &gs.ledger)?;
         batch.put_cf(self.cf(CF_META), META_HC_BUNDLE, word8_to_bytes(&gs.hc_bundle));
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(0));
         batch.put_cf(self.cf(CF_META), META_GENESIS_HASH, genesis_hash.as_bytes());
@@ -2570,6 +2595,7 @@ impl Storage {
         ledger.set_aggregation(self.aggregation_config()?);
         ledger.set_bridge(self.load_bridge()?);
         ledger.set_tokens(self.tokens()?);
+        ledger.set_nullifier_mmr(self.nullifier_mmr()?);
         Ok(ledger)
     }
 
@@ -2884,6 +2910,7 @@ impl Storage {
             self.put_bridge_meta(&mut batch, bridge)?;
         }
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger_after.tree())?);
+        self.put_nullifier_mmr(&mut batch, ledger_after)?;
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger_after.supply())?);
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger_after.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger_after.bond_queue())?);
@@ -3069,6 +3096,14 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn plant_nullifier_for_testing(&self, nf: &Word8) -> Result<()> {
         self.db.put_cf_opt(self.cf(CF_NULLIFIERS), word8_to_bytes(nf), 1u64.to_be_bytes(), &sync_opts())?;
+        Ok(())
+    }
+
+    /// Test hook: remove a metadata row, to exercise the startup checks that refuse a store
+    /// missing one.
+    #[cfg(test)]
+    pub(crate) fn delete_meta_for_testing(&self, key: &str) -> Result<()> {
+        self.db.delete_cf_opt(self.cf(CF_META), key, &sync_opts())?;
         Ok(())
     }
 
@@ -3389,6 +3424,8 @@ impl Storage {
             stored.set_gas(gs.ledger.gas().cloned());
             self.restore_proof_window(&mut stored, gs)?;
             stored.set_tokens_incremental_root(gs.ledger.tokens().is_some_and(|t| t.incremental_root()));
+            // The nullifier range needs no line here: its row loaded it, and the replayed ledger
+            // started from `gs.ledger`, which carries the flag, so `stored == ledger` compares ranges.
             Ok(stored)
         }) {
             // The live gas prices (Phase 2): inside the equality, hashed under `gas.dynamic`,
@@ -3698,6 +3735,7 @@ impl Storage {
             batch.put_cf(self.cf(CF_EPOCH_SETS), height_key(0), bincode::serialize(&gs.validators)?);
         }
         batch.put_cf(self.cf(CF_META), META_TREE, bincode::serialize(ledger.tree())?);
+        self.put_nullifier_mmr(&mut batch, ledger)?;
         batch.put_cf(self.cf(CF_META), META_SUPPLY, bincode::serialize(&ledger.supply())?);
         batch.put_cf(self.cf(CF_META), META_FAUCET_EPOCH, bincode::serialize(&ledger.faucet_epoch_counters())?);
         batch.put_cf(self.cf(CF_META), META_BOND_QUEUE, bincode::serialize(ledger.bond_queue())?);
@@ -5519,6 +5557,57 @@ mod tests {
         assert_eq!(s.token_rows_on_disk().unwrap().len(), 1, "the second token's row is gone");
         assert_eq!(s.tokens().unwrap().as_ref(), gs.ledger.tokens());
         assert_eq!(s.load_ledger(&StubExecutor).unwrap().state_root(), gs.ledger.state_root());
+    }
+
+    /// A chain with one block holding one bundle, over a genesis with the incremental nullifier
+    /// root `flag` (spec 2026-10-05 §4.1): the tempdir, the genesis, the store and the proposer.
+    fn chain_with_one_spend(flag: Option<bool>) -> (tempfile::TempDir, GenesisState, Storage, randprotocol_core::Keypair) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let mut file = genesis_file_of(7, &[&key(1)], vec![], 1_000);
+        file.incremental_nullifier_root = flag;
+        let gs = file.build(&StubExecutor).unwrap();
+        s.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let tx = bundle_tx(&ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee());
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        (dir, gs, s, key(1))
+    }
+
+    /// Spec 2026-10-05 §4.4: the range rides the commit batch beside the frontier, a reload
+    /// restores it, and the reloaded ledger is the head state. A bundle inserts all four of its
+    /// nullifier slots.
+    #[test]
+    fn reload_ledger_restores_the_nullifier_range_from_the_store() {
+        let (dir, gs, s, _key) = chain_with_one_spend(Some(true));
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.nullifier_mmr().unwrap().count(), 4);
+        let head = s.block_by_height(1).unwrap().unwrap();
+        crate::node::snapshot_is_the_head_state(&head, &reloaded).unwrap();
+        drop(dir);
+    }
+
+    /// Review focus 4: a flag-on store without the row refuses to start, naming the row.
+    #[test]
+    fn a_flag_on_store_without_the_range_row_is_refused() {
+        let (dir, gs, s, _key) = chain_with_one_spend(Some(true));
+        s.delete_meta_for_testing(META_NULLIFIER_MMR).unwrap();
+        let err = crate::node::reload_ledger(&s, &gs, &StubExecutor).err().unwrap().to_string();
+        assert!(err.contains("nullifier_mmr") && err.contains("re-sync"), "{err}");
+        drop(dir);
+    }
+
+    /// A flag-off genesis ignores a stray row (a store copied from a flag-on chain is refused
+    /// earlier by the genesis-hash check; this is belt and braces).
+    #[test]
+    fn a_flag_off_genesis_loads_without_a_range() {
+        let (dir, gs, s, _key) = chain_with_one_spend(None);
+        let stray = randprotocol_core::ledger::nullifier_mmr::NullifierMmr::new();
+        s.db.put_cf(s.cf(CF_META), META_NULLIFIER_MMR, bincode::serialize(&stray).unwrap()).unwrap();
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert!(reloaded.nullifier_mmr().is_none());
+        drop(dir);
     }
 
     /// Audit v6 (TOK-1, issue #86): the flag is a genesis parameter, and `node::reload_ledger`

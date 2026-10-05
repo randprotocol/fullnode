@@ -226,6 +226,16 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // and the state under `rand-state-4` against peers on `rand-token-registry-4` and
     // `rand-state-tokens-1`: a fork at its first block.
     ledger.set_tokens_incremental_root(gs.ledger.tokens().is_some_and(|t| t.incremental_root()));
+    // The incremental nullifier root (spec 2026-10-05 §4.4) rides the store's own row; the
+    // genesis says whether there must be one. Missing on a flag-on chain is not rebuildable —
+    // the row is the only record of insertion order.
+    match (gs.ledger.incremental_nullifier_root(), ledger.nullifier_mmr().is_some()) {
+        (true, false) => anyhow::bail!(
+            "the genesis says incremental_nullifier_root but the database holds no nullifier_mmr row; the store is damaged or predates the flag — re-sync it (from an archive if it is pruned)"
+        ),
+        (false, true) => ledger.set_nullifier_mmr(None),
+        _ => {}
+    }
     // The vesting register is state, not a switch: storage holds it (claims move it), so it is
     // never re-seeded from the file — but the two must agree that the chain has one, or this
     // node would compute a different state-root domain from its peers at its first block.
