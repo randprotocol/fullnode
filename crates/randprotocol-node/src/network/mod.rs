@@ -1742,7 +1742,7 @@ mod tests {
         assert_eq!(peer_id_of(&addr("/dns4/node.example/tcp/30303")), None);
 
         // The derivation `start_with` makes of the bootstrap list.
-        let bootstrap = vec![
+        let bootstrap = [
             addr(&format!("/ip4/203.0.113.7/tcp/30303/p2p/{id}")),
             addr(&format!("/ip4/203.0.113.8/tcp/30303/p2p/{id}")),
             addr("/ip4/203.0.113.9/tcp/30303"),
