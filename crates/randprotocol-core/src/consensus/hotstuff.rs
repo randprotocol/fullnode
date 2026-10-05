@@ -33,6 +33,13 @@ const MAX_PROPOSED_KEYS: usize = 4096;
 /// Cap on cached epoch-set derivations. Every key is a block in the tree, so this only bites if
 /// the tree cap is raised far past it.
 const MAX_DERIVED_SETS: usize = 1024;
+/// How many half-applied candidates one proposal tolerates before it closes the block with the
+/// candidates it has (spec 2026-10-05): each half-apply ([`crate::ledger::ApplyFailure::HalfApplied`])
+/// replays the accepted set, O(accepted), so a mempool that admitted many candidates failing
+/// after their first write cannot make a proposal quadratic. A clean refusal
+/// ([`crate::ledger::ApplyFailure::Refused`] — a double spend, a stale read, a contending RPL-2
+/// invoke the trial apply decides against) wrote nothing, costs no replay and is not counted.
+pub const MAX_PROPOSE_REPLAYS: usize = 8;
 /// The most equivocation evidence pairs held for the node to collect (audit v6, STAKE-1): each is
 /// two headers with their certificates, and the node drains them after every message.
 const MAX_EVIDENCE_HELD: usize = 16;
@@ -69,6 +76,54 @@ pub trait CoveredSource: Send + Sync {
     fn covered(&self, covers: &[Hash]) -> Option<Vec<CoveredBundle>>;
 }
 
+/// Certificates this replica has verified, by the hash of their bytes and the set they passed
+/// under (spec 2026-10-05 §7.2), FIFO, oldest first. A QC that arrives as a proposal's justify
+/// and again as a NewView's high QC is verified once; an invalid one is never kept.
+pub const VERIFIED_QCS_KEPT: usize = 1024;
+
+pub(crate) struct VerifiedQcs {
+    seen: std::collections::HashSet<Hash>,
+    order: std::collections::VecDeque<Hash>,
+    cap: usize,
+}
+
+impl VerifiedQcs {
+    pub(crate) fn new(cap: usize) -> VerifiedQcs {
+        VerifiedQcs { seen: Default::default(), order: Default::default(), cap }
+    }
+
+    /// The key covers the validator set as well as the certificate, so a certificate that passed
+    /// under one set is never vouched for under another.
+    fn key(qc: &QuorumCertificate, set: &ValidatorSet) -> Hash {
+        let mut b = bincode::serialize(qc).expect("a certificate serializes");
+        b.extend_from_slice(&bincode::serialize(set).expect("a validator set serializes"));
+        Hash::digest_domain(b"rand-verified-qc-1", &b)
+    }
+
+    pub(crate) fn check(&mut self, domain: &SigningDomain, qc: &QuorumCertificate, set: &ValidatorSet) -> bool {
+        let k = Self::key(qc, set);
+        if self.seen.contains(&k) {
+            return true;
+        }
+        if !qc.verify(domain, set) {
+            return false;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        self.seen.insert(k);
+        self.order.push_back(k);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
 pub struct HotStuff {
     cfg: ConsensusConfig,
     signer: Option<Keypair>,
@@ -84,6 +139,10 @@ pub struct HotStuff {
     /// verification. [`NoVerified`] until the node sets its shared set — tests, and any replay
     /// path, verify every proof, exactly as before.
     verified: Arc<dyn VerifiedProofs>,
+    /// Certificates already verified, keyed by their bytes and the set they passed under, so a QC
+    /// seen as a proposal's justify and again as a NewView's high QC is checked once (spec
+    /// 2026-10-05 §7.2).
+    verified_qcs: VerifiedQcs,
 
     view: u64,
     high_qc: QuorumCertificate,
@@ -191,6 +250,10 @@ impl HotStuff {
         genesis_ledger: Ledger,
         executor: Arc<dyn ConfidentialExecutor>,
     ) -> HotStuff {
+        // A replica's lineage owns its base (spec 2026-10-05 §5): the genesis ledger the caller
+        // keeps, and any other replica built from it, must not see this one's commits.
+        let mut genesis_ledger = genesis_ledger;
+        genesis_ledger.detach_shared_sets();
         let genesis_hash = genesis_block.hash();
         assert_eq!(genesis_hash, cfg.genesis_hash, "genesis mismatch");
         let qc = QuorumCertificate::genesis(genesis_hash);
@@ -225,6 +288,11 @@ impl HotStuff {
         epoch_sets: EpochSets,
         executor: Arc<dyn ConfidentialExecutor>,
     ) -> HotStuff {
+        // A synced ledger arrives as the old replica's committed ledger plus the synced blocks in
+        // its delta; fold them in — the old replica is being replaced, and its tree is dropped
+        // with it.
+        let mut head_ledger = head_ledger;
+        head_ledger.commit_shared_sets();
         let mut epoch_sets = epoch_sets;
         if epoch_sets.get(0).is_none() {
             epoch_sets.insert(0, cfg.genesis_set.clone());
@@ -237,7 +305,6 @@ impl HotStuff {
         // restart and the second new block is refused with `time N is outside [0, 0]`.
         let head_hash = head.hash();
         let head_height = head.height();
-        let mut head_ledger = head_ledger;
         head_ledger.set_height(head_height);
         head_ledger.set_timestamp_ms(head.header.timestamp_ms);
         let mut tree = HashMap::new();
@@ -266,6 +333,7 @@ impl HotStuff {
             executor,
             covered: None,
             verified: Arc::new(NoVerified),
+            verified_qcs: VerifiedQcs::new(VERIFIED_QCS_KEPT),
             view,
             high_qc,
             locked_qc,
@@ -941,7 +1009,7 @@ impl HotStuff {
         let Some(parent_set) = self.shared_set_for_height(parent_height, &grandparent) else {
             return Err(ConsensusError::UnknownEpochSet(self.epoch(parent_height)));
         };
-        if !block.header.justify.verify(&self.cfg.domain, &parent_set) {
+        if !self.verified_qcs.check(&self.cfg.domain, &block.header.justify, &parent_set) {
             return Err(ConsensusError::BadJustify);
         }
         if block.header.justify.view != parent_view && !block.header.justify.is_genesis() {
@@ -1146,7 +1214,8 @@ impl HotStuff {
         if !nv.verify(&self.cfg.domain) {
             return Err(ConsensusError::BadNewView);
         }
-        if !nv.high_qc.verify(&self.cfg.domain, &self.set_for_qc(&nv.high_qc)) {
+        let high_qc_set = self.set_for_qc(&nv.high_qc);
+        if !self.verified_qcs.check(&self.cfg.domain, &nv.high_qc, &high_qc_set) {
             return Err(ConsensusError::BadJustify);
         }
         self.update_high_qc(&nv.high_qc.clone(), &mut out);
@@ -1313,16 +1382,50 @@ impl HotStuff {
         // Phase 2 (spec §7.1): the calls' gas, for the controller at the block's end — summed
         // exactly as `apply_block_for_sync` sums its receipts.
         let mut call_gas = 0u64;
+        // Candidates apply to the running ledger directly (spec 2026-10-05, plan correction 2):
+        // a clone per candidate was 2 000 clones a block. `apply_tx_checked` says how a candidate
+        // failed (final review F1). A refusal by validation wrote nothing, so the candidate is
+        // skipped for free — the mempool offers contending RPL-2 invokes together and lets this
+        // trial apply decide, so refusals are routine. A half-apply (the action step failed
+        // after the bundle was written) is undone by rebuilding from the pre-loop ledger and
+        // replaying the accepted ones in order. Deterministic, so the replay cannot fail; if it
+        // ever did, the block closes with no ordinary transactions rather than a wrong root.
+        // B5: with the admission cache along, a candidate's proofs are not verified a second
+        // time here. Only half-applies count against MAX_PROPOSE_REPLAYS; past it the block
+        // closes with what it has.
+        let base = ledger.clone();
+        let mut replays = 0usize;
         for tx in ordinary {
-            // Apply on a trial clone: a transaction that fails part-way through
-            // must not leave the cumulative ledger dirty for the next candidate
-            // or for the state root committed to the header. B5: with the admission
-            // cache along, a candidate's proofs are not verified a second time here.
-            let mut trial = ledger.clone();
-            if let Ok(receipt) = trial.apply_tx_with(&tx, &me, self.executor.as_ref(), self.verified.as_ref()) {
-                call_gas = call_gas.saturating_add(receipt.map_or(0, |r| r.gas_used));
-                ledger = trial;
-                txs.push(tx);
+            match ledger.apply_tx_checked(&tx, &me, self.executor.as_ref(), self.verified.as_ref()) {
+                Ok(receipt) => {
+                    call_gas = call_gas.saturating_add(receipt.map_or(0, |r| r.gas_used));
+                    txs.push(tx);
+                }
+                Err(crate::ledger::ApplyFailure::Refused(_)) => continue,
+                Err(crate::ledger::ApplyFailure::HalfApplied(_)) => {
+                    replays += 1;
+                    ledger = base.clone();
+                    call_gas = 0;
+                    let mut replayed = true;
+                    for t in &txs {
+                        match ledger.apply_tx_with(t, &me, self.executor.as_ref(), self.verified.as_ref()) {
+                            Ok(r) => call_gas = call_gas.saturating_add(r.map_or(0, |r| r.gas_used)),
+                            Err(_) => {
+                                replayed = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !replayed {
+                        ledger = base.clone();
+                        call_gas = 0;
+                        txs.clear();
+                        break;
+                    }
+                    if replays >= MAX_PROPOSE_REPLAYS {
+                        break;
+                    }
+                }
             }
         }
         // The aggregate's trial apply runs where its place in the block is: after the ordinary
@@ -1543,6 +1646,13 @@ impl HotStuff {
         self.committed_ledger = self.tree[&self.committed_hash].ledger_after.clone();
         self.epoch_sets.forget_before(self.epoch(self.committed_height).saturating_sub(EPOCH_SETS_KEPT));
         self.prune();
+        // The shared sets' commit step (spec 2026-10-05 §5.2), after `prune` so every entry left
+        // in the tree descends from the new head and already holds this delta: the committed
+        // ledger's delta becomes base, and each survivor drops what the base now has.
+        self.committed_ledger.commit_shared_sets();
+        for e in self.tree.values_mut() {
+            e.ledger_after.absorb_shared_sets();
+        }
         self.not_held.clear();
         self.unobtainable.clear();
         self.refresh_current_set();

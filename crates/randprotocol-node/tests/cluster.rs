@@ -215,6 +215,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         binding_domain: None,
         proof_window_blocks: None,
         program_state: None,
+        incremental_nullifier_root: None,
     }
 }
 
@@ -701,6 +702,7 @@ async fn a_build_whose_bundle_guest_differs_from_genesis_refuses_to_start() {
         verify: randprotocol_node::storage::VerifyMode::Full,
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
+        verify_workers: None,
         prune_history: None,
         gas_policy: None,
     })

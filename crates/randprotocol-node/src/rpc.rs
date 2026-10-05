@@ -250,7 +250,7 @@ pub struct NodeStatus {
     /// refusal was about their bytes (`admission::REFUSED_CACHE_ENTRIES` is the cap). Rising fast
     /// means someone is re-sending known-bad proofs — which now cost a hash lookup, not 20 ms.
     pub refused_cache: usize,
-    /// Transactions waiting for a proof verification slot, against `admission::MAX_VERIFY_QUEUE`.
+    /// Transactions waiting for a proof verification slot, against `admission::VerifyLimits::queue`.
     /// Normally 0: a queue that sits near the cap means this node is shedding gossiped
     /// transactions, and it is unrelated to the sync counters above.
     pub verify_queue: usize,

@@ -1,11 +1,13 @@
 //! Deterministic multi-replica simulation of the HotStuff state machine.
 
 use super::*;
+use super::MAX_PROPOSE_REPLAYS;
 use crate::confidential::{ConfidentialExecutor, StubExecutor};
 use crate::genesis::{Genesis, GenesisValidator};
 use crate::notes::{word8_to_hex, Envelope};
 use crate::types::actions::SignedHeader;
 use crate::types::Transaction;
+use crate::ledger::tests::FlakyDeploy;
 use std::collections::{BTreeMap, VecDeque};
 
 struct Sim {
@@ -158,6 +160,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         binding_domain: None,
         proof_window_blocks: None,
         program_state: None,
+        incremental_nullifier_root: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -1586,6 +1589,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         binding_domain: None,
         proof_window_blocks: None,
         program_state: None,
+        incremental_nullifier_root: None,
     };
     let gs = genesis.build(&StubExecutor).unwrap();
     let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());
@@ -1602,6 +1606,146 @@ impl OneNode {
 
 fn commits(acts: &[Action]) -> bool {
     acts.iter().any(|a| matches!(a, Action::Commit(_)))
+}
+
+/// Spec 2026-10-05 §5.2: after a commit the committed ledger's delta is empty and the surviving
+/// speculative entries hold only the blocks above the head — the tree's memory is O(block), not
+/// O(state). A bundle inserts all four nullifier slots (two real, two dummies), hence the 4×.
+#[test]
+fn commit_drains_the_shared_sets_and_survivors_absorb() {
+    let mut n = one_node();
+    n.node.start();
+    for view in 1..=8u64 {
+        n.now += 1;
+        let tx = staking_tx(n.node.tip_ledger(), 10 * view as u32, 0, crate::types::Action::None);
+        n.node.propose(view, vec![tx], n.now).expect("propose");
+    }
+    assert!(n.node.committed_height() >= 4, "three-chain commits happened");
+    assert_eq!(n.node.committed_ledger().nullifiers().added_len(), 0, "the committed ledger's delta was drained");
+    let above_head = n.node.tip_ledger().height() - n.node.committed_height();
+    assert_eq!(n.node.tip_ledger().nullifiers().added_len() as u64, 4 * above_head, "the tip holds exactly the blocks above the head");
+    assert!(n.node.committed_ledger().is_spent(&[10; 8]), "the first block's spend is in the base");
+}
+
+/// A valid shielded transaction at `l` whose nullifiers are distinct per `n`.
+fn tx_at(l: &Ledger, n: u32) -> Transaction {
+    staking_tx(l, 10 * n, 0, crate::types::Action::None)
+}
+
+/// Re-make the stub proof over an edited bundle's digest (what `ledger`'s `restub` does), then
+/// re-bind: `bind` alone only rewrites the binding, not the digest the proof publishes.
+fn restub_and_bind(l: &Ledger, mut tx: Transaction) -> Transaction {
+    use crate::confidential::ConfidentialExecutor;
+    if let Some(b) = tx.bundle.as_mut() {
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&l.hc_bundle(), &d, &[0; 8]);
+    }
+    StubExecutor::bound(tx)
+}
+
+/// Spec 2026-10-05 (plan correction 2): the proposer no longer clones the ledger per candidate.
+/// A candidate that fails after accepted ones changed state (the second spends the first's
+/// nullifier) is dropped, the accepted set is replayed, and the header's state root is the one a
+/// replica recomputes from the block, with the failing candidate absent and the third present.
+#[test]
+fn a_failing_candidate_is_dropped_and_the_block_still_verifies() {
+    let mut n = one_node();
+    n.node.start();
+    n.now += 1;
+    let tip = n.node.tip_ledger().clone();
+    let ok1 = tx_at(&tip, 1);
+    let mut dup = tx_at(&tip, 2);
+    // The double spend: dup's first nullifier is ok1's first nullifier.
+    dup.bundle.as_mut().unwrap().nullifiers[0] = ok1.bundle.as_ref().unwrap().nullifiers[0];
+    let dup = restub_and_bind(&tip, dup);
+    let ok3 = tx_at(&tip, 3);
+    let actions = n.node.propose(1, vec![ok1.clone(), dup, ok3.clone()], n.now).expect("propose");
+    let block = actions.iter().find_map(|a| match a { Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b.clone()), _ => None }).unwrap();
+    assert_eq!(block.transactions, vec![ok1, ok3], "the double spend is dropped, the third candidate kept");
+    let mut replica = tip.clone();
+    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor, &crate::ledger::NoVerified).expect("the header's root is what a replica computes");
+}
+
+/// The replay is what undoes a half-applied candidate. A `Deploy` passes `validate_inner`, its
+/// bundle's nullifiers and commitments are written, and then the action step refuses it
+/// (`FlakyDeploy`). Without the replay the running ledger keeps those writes: the header's root
+/// would not match a replica's recomputation and the deploy's nullifiers would be spent in the
+/// tip although the block does not carry it.
+#[test]
+fn a_half_applied_candidate_is_undone_by_the_replay() {
+    let (cfg, gs, key) = one_node_parts();
+    let node = HotStuff::new(cfg, Some(key), gs.block.clone(), gs.ledger.clone(), std::sync::Arc::new(FlakyDeploy { asked: Default::default() }));
+    let mut n = OneNode { node, now: 1 };
+    n.node.start();
+    n.now += 1;
+    let tip = n.node.tip_ledger().clone();
+    let ok1 = tx_at(&tip, 1);
+    let deploy = crate::types::Action::Deploy { base_pc: 0, words: vec![0x13; 7], public: vec![] };
+    let mut bad = staking_tx(&tip, 20, 0, deploy.clone());
+    bad.bundle.as_mut().unwrap().fee = crate::gas::fee_floor(&deploy);
+    let bad = restub_and_bind(&tip, bad);
+    let bad_nf = bad.bundle.as_ref().unwrap().nullifiers[0];
+    let ok3 = tx_at(&tip, 3);
+    let actions = n.node.propose(1, vec![ok1.clone(), bad, ok3.clone()], n.now).expect("propose");
+    let block = actions.iter().find_map(|a| match a { Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b.clone()), _ => None }).unwrap();
+    assert_eq!(block.transactions, vec![ok1, ok3], "the half-applied deploy is dropped, its neighbours kept");
+    let mut replica = tip.clone();
+    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor, &crate::ledger::NoVerified).expect("the header's root is what a replica computes");
+    assert!(!n.node.tip_ledger().is_spent(&bad_nf), "the dropped candidate's nullifiers are not in the tip");
+}
+
+/// A refusal is free (final review F1): a candidate `validate_inner` refuses has written nothing,
+/// so the proposer skips it without a replay and without counting it. More than
+/// `MAX_PROPOSE_REPLAYS` double spends of one accepted candidate — the shape the mempool offers
+/// when RPL-2 invokes contend for a cell — are all skipped and the trailing good candidate is
+/// still carried, as the per-candidate-clone loop carried it.
+#[test]
+fn refused_candidates_are_skipped_without_counting_a_replay() {
+    let mut n = one_node();
+    n.node.start();
+    n.now += 1;
+    let tip = n.node.tip_ledger().clone();
+    let ok = tx_at(&tip, 1);
+    let mut cands = vec![ok.clone()];
+    for k in 0..=MAX_PROPOSE_REPLAYS {
+        let mut d = tx_at(&tip, 100 + k as u32);
+        d.bundle.as_mut().unwrap().nullifiers[0] = ok.bundle.as_ref().unwrap().nullifiers[0];
+        cands.push(restub_and_bind(&tip, d));
+    }
+    let trailing = tx_at(&tip, 50);
+    cands.push(trailing.clone());
+    let actions = n.node.propose(1, cands, n.now).unwrap();
+    let block = actions.iter().find_map(|a| match a { Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b.clone()), _ => None }).unwrap();
+    assert_eq!(block.transactions, vec![ok, trailing], "every refusal skipped, none counted; the trailing candidate is carried");
+    let mut replica = tip.clone();
+    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor, &crate::ledger::NoVerified).expect("the header's root is what a replica computes");
+}
+
+/// A proposal tolerates `MAX_PROPOSE_REPLAYS` half-applied candidates (each replays the accepted
+/// set), then closes the block: the bound is on the half-apply path, the only one that replays.
+#[test]
+fn a_proposal_closes_after_max_replays() {
+    let (cfg, gs, key) = one_node_parts();
+    let node = HotStuff::new(cfg, Some(key), gs.block.clone(), gs.ledger.clone(), std::sync::Arc::new(FlakyDeploy { asked: Default::default() }));
+    let mut n = OneNode { node, now: 1 };
+    n.node.start();
+    n.now += 1;
+    let tip = n.node.tip_ledger().clone();
+    let ok = tx_at(&tip, 1);
+    let deploy = crate::types::Action::Deploy { base_pc: 0, words: vec![0x13; 7], public: vec![] };
+    let mut cands = vec![ok.clone()];
+    // MAX_PROPOSE_REPLAYS + 1 half-applying deploys, then one good candidate that is never reached.
+    for k in 0..=MAX_PROPOSE_REPLAYS {
+        let mut bad = staking_tx(&tip, 2_000 + 10 * k as u32, 0, deploy.clone());
+        bad.bundle.as_mut().unwrap().fee = crate::gas::fee_floor(&deploy);
+        cands.push(restub_and_bind(&tip, bad));
+    }
+    cands.push(tx_at(&tip, 50));
+    let actions = n.node.propose(1, cands, n.now).unwrap();
+    let block = actions.iter().find_map(|a| match a { Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b.clone()), _ => None }).unwrap();
+    assert_eq!(block.transactions, vec![ok], "closed after the bound; the trailing good candidate waits for the next block");
+    let mut replica = tip.clone();
+    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor, &crate::ledger::NoVerified).expect("the header's root is what a replica computes");
 }
 
 #[test]
@@ -2069,6 +2213,7 @@ fn aggregation_node_with(
         binding_domain: None,
         proof_window_blocks: None,
         program_state: None,
+        incremental_nullifier_root: None,
     };
     let mut gs = genesis.build(&StubExecutor).unwrap();
     // Register the aggregator directly on the genesis ledger the node builds on (the register
@@ -3423,3 +3568,25 @@ fn one_validators_votes_cannot_fill_the_vote_map() {
 
 /// `hotstuff::MAX_PENDING_VOTE_KEYS`, which the flood above aims at.
 const MAX_PENDING_VOTE_KEYS_FOR_TESTS: usize = 4096;
+
+/// Spec 2026-10-05 §7.2 and review focus 5: a certificate is verified once per (bytes, set); the
+/// same certificate under another set is verified afresh and may fail.
+#[test]
+fn a_certificate_is_verified_once_and_the_key_covers_the_set() {
+    use crate::types::validator::Validator;
+    let mut sim = setup(4, 4);
+    for _ in 0..6 {
+        sim.step(vec![]);
+    }
+    let n = &mut sim.nodes[0];
+    let qc = n.high_qc().clone();
+    let set = n.current_set().clone();
+    let mut cache = crate::consensus::hotstuff::VerifiedQcs::new(8);
+    assert!(cache.check(n.domain(), &qc, &set));
+    assert_eq!(cache.len(), 1);
+    assert!(cache.check(n.domain(), &qc, &set), "cached");
+    assert_eq!(cache.len(), 1);
+    let other = ValidatorSet::new(vec![Validator { public_key: Keypair::from_seed([77; 32]).unwrap().public_key().clone(), stake: 1 }]);
+    assert!(!cache.check(n.domain(), &qc, &other), "voters outside the set: not a quorum, not cached");
+    assert_eq!(cache.len(), 1);
+}

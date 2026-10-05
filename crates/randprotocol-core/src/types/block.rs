@@ -109,6 +109,10 @@ pub struct QuorumCertificate {
     pub votes: Vec<Vote>,
 }
 
+/// Below this many votes the signatures are checked on the calling thread; a test chain or a
+/// small validator set pays no thread cost. Above it they are split across the cores.
+pub const PARALLEL_VERIFY_MIN: usize = 8;
+
 impl QuorumCertificate {
     /// The certificate that justifies the genesis block.
     pub fn genesis(genesis_hash: Hash) -> QuorumCertificate {
@@ -120,8 +124,20 @@ impl QuorumCertificate {
     }
 
     /// Verify every vote under `domain` and that the signers reach quorum stake. The domain's
-    /// genesis hash admits the empty genesis QC.
+    /// genesis hash admits the empty genesis QC. The structural checks run first and in order;
+    /// the signature checks run across scoped threads when there are enough of them
+    /// (spec 2026-10-05 §7.1) — the result is the conjunction either way.
     pub fn verify(&self, domain: &SigningDomain, validators: &ValidatorSet) -> bool {
+        self.verify_with(domain, validators, true)
+    }
+
+    /// The single-threaded path, kept callable so a test can hold the parallel one to it.
+    #[doc(hidden)]
+    pub fn verify_sequential_for_tests(&self, domain: &SigningDomain, validators: &ValidatorSet) -> bool {
+        self.verify_with(domain, validators, false)
+    }
+
+    fn verify_with(&self, domain: &SigningDomain, validators: &ValidatorSet, parallel: bool) -> bool {
         if self.is_genesis() {
             return self.block_hash == domain.genesis;
         }
@@ -136,12 +152,33 @@ impl QuorumCertificate {
             if !seen.insert(addr) {
                 return false;
             }
-            if !v.verify(domain) {
-                return false;
-            }
             stake += val.stake;
         }
-        validators.has_quorum(stake)
+        if !validators.has_quorum(stake) {
+            return false;
+        }
+        if !parallel || self.votes.len() < PARALLEL_VERIFY_MIN {
+            return self.votes.iter().all(|v| v.verify(domain));
+        }
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, self.votes.len());
+        let chunk = self.votes.len().div_ceil(threads);
+        std::thread::scope(|s| {
+            // A refused thread degrades that chunk to the calling thread, never to a refusal of a
+            // valid certificate; every handle is joined before the results are combined, so no
+            // worker panic reaches `scope` unjoined and a panic is only a failed check.
+            let handles: Vec<_> = self
+                .votes
+                .chunks(chunk)
+                .map(|c| match std::thread::Builder::new().spawn_scoped(s, move || c.iter().all(|v| v.verify(domain))) {
+                    Ok(h) => Ok(h),
+                    Err(_) => Err(c.iter().all(|v| v.verify(domain))),
+                })
+                .collect();
+            handles.into_iter().map(|h| match h {
+                Ok(h) => h.join().unwrap_or(false),
+                Err(done) => done,
+            }).fold(true, |a, b| a & b)
+        })
     }
 }
 
@@ -292,6 +329,53 @@ mod tests {
         let qc = QuorumCertificate { view: 7, block_hash: Hash([3; 32]), votes: vec![v] };
         assert!(qc.verify(&a, &vs));
         assert!(!qc.verify(&b, &vs));
+    }
+
+    /// Spec 2026-10-05 §7.1: the parallel path (≥ PARALLEL_VERIFY_MIN votes) agrees with the
+    /// sequential one on a valid certificate and on each kind of invalid one.
+    #[test]
+    fn parallel_and_sequential_verification_agree() {
+        let keys: Vec<Keypair> = (1..=12u8).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect();
+        let vs = ValidatorSet::new(keys.iter().map(|k| Validator { public_key: k.public_key().clone(), stake: 10 }).collect());
+        let domain = SigningDomain::v0(Hash([7; 32]));
+        let hash = Hash([9; 32]);
+        let votes: Vec<Vote> = keys.iter().map(|k| Vote::sign(&domain, 5, hash, k)).collect();
+        let good = QuorumCertificate { view: 5, block_hash: hash, votes: votes.clone() };
+        assert!(good.verify(&domain, &vs));
+        assert!(good.verify_sequential_for_tests(&domain, &vs));
+        let mut bad_sig = good.clone();
+        bad_sig.votes[11].signature = bad_sig.votes[3].signature.clone();
+        let mut wrong_view = good.clone();
+        wrong_view.votes[0].view = 6;
+        let mut dup = good.clone();
+        dup.votes[1] = dup.votes[0].clone();
+        let short = QuorumCertificate { view: 5, block_hash: hash, votes: votes[..9].to_vec() };
+        let below = QuorumCertificate { view: 5, block_hash: hash, votes: votes[..8].to_vec() };
+        let outsider = {
+            let k = Keypair::from_seed([99; 32]).unwrap();
+            let mut q = good.clone();
+            q.votes[2] = Vote::sign(&domain, 5, hash, &k);
+            q
+        };
+        for (name, qc, expect) in [("bad sig", &bad_sig, false), ("wrong view", &wrong_view, false), ("duplicate", &dup, false), ("9 of 12 = quorum", &short, true), ("8 of 12 = below quorum", &below, false), ("outsider", &outsider, false)] {
+            assert_eq!(qc.verify(&domain, &vs), expect, "{name}");
+            assert_eq!(qc.verify_sequential_for_tests(&domain, &vs), expect, "{name} sequential");
+        }
+    }
+
+    /// Spec 2026-10-05 §7.1: a bad signature in the first chunk fails the certificate with every
+    /// later worker still joined — the result is false, never a panic out of the scope.
+    #[test]
+    fn a_bad_first_vote_fails_the_parallel_path() {
+        let keys: Vec<Keypair> = (1..=12u8).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect();
+        let vs = ValidatorSet::new(keys.iter().map(|k| Validator { public_key: k.public_key().clone(), stake: 10 }).collect());
+        let domain = SigningDomain::v0(Hash([7; 32]));
+        let hash = Hash([9; 32]);
+        let votes: Vec<Vote> = keys.iter().map(|k| Vote::sign(&domain, 5, hash, k)).collect();
+        let mut qc = QuorumCertificate { view: 5, block_hash: hash, votes };
+        qc.votes[0].signature = qc.votes[1].signature.clone();
+        assert!(!qc.verify(&domain, &vs));
+        assert!(!qc.verify_sequential_for_tests(&domain, &vs));
     }
 
     /// Domain 0 is chain 14: the bytes signed are exactly the pre-v0.5.4 ones, no genesis, and

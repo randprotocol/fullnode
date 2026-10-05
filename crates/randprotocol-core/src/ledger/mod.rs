@@ -9,11 +9,14 @@
 //! parallel: each phase owns its own file.
 
 pub mod aggregation;
+mod shared_set;
+pub use shared_set::SharedSet;
 #[cfg(test)]
 mod bind_tests;
 pub mod bridge_gov;
 pub mod bridge_notes;
 pub mod call_envelope;
+pub mod nullifier_mmr;
 pub mod program_state;
 pub mod staking;
 pub mod supply;
@@ -369,6 +372,27 @@ pub enum TxError {
     Overflow,
 }
 
+/// Why a candidate did not apply, for the proposer: refused by validation before any write
+/// (the ledger is byte-identical; skip it), or failed in the action step after
+/// `apply_bundle_notes` wrote (the ledger is dirty; rebuild from the pre-loop state). Returned by
+/// [`Ledger::apply_tx_checked`] (final review F1 of the validator hot path, spec 2026-10-05).
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum ApplyFailure {
+    /// Refused before the first write: the ledger is unchanged.
+    Refused(TxError),
+    /// Failed after the first write: the ledger holds part of the transaction.
+    HalfApplied(TxError),
+}
+
+impl ApplyFailure {
+    /// The error itself, whichever stage raised it.
+    pub fn into_inner(self) -> TxError {
+        match self {
+            ApplyFailure::Refused(e) | ApplyFailure::HalfApplied(e) => e,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
 pub enum BlockError {
     #[error("tx {index} invalid: {error}")]
@@ -560,13 +584,13 @@ fn has_duplicate(words: &[Word8]) -> bool {
 
 /// In-memory chain state: the note commitment tree, the nullifier set, the validator register
 /// and the deployed programs. It is cloned for speculative execution (one clone per block in the
-/// consensus tree, and per trial-apply), and a clone is **not** cheap: the tree is a frontier
-/// (constant size), but `commitments` and `nullifiers` are ordinary `BTreeSet`s, so a clone
-/// copies every commitment and nullifier the chain has — O(state). The audit-v6 review measured
-/// 1.6 ms at 100 000 leaves and nullifiers and 28 ms at 1 000 000 (its own private run; not
-/// re-measured here). This comment said "Cheap to clone" until 2026-09-30. A persistent
-/// (structurally shared) set is the fix when state grows; `AGENTS.md`, "Speculative state is
-/// capped".
+/// consensus tree, and per trial-apply). The tree is a frontier (constant size), and
+/// `commitments` and `nullifiers` are [`SharedSet`]s — a committed base shared by every clone
+/// plus an owned delta — so a clone is O(delta), and the base moves only at `HotStuff` commit
+/// (`docs/superpowers/specs/2026-10-05-validator-hot-path-design.md` §5). As history: when both
+/// were plain `BTreeSet`s a clone copied every entry the chain had, which the audit-v6 review
+/// measured at 1.6 ms for 100 000 leaves and nullifiers and 28 ms for 1 000 000 (its own private
+/// run; not re-measured here). `AGENTS.md`, "Speculative state is capped".
 #[derive(Clone, Debug)]
 pub struct Ledger {
     chain_id: u64,
@@ -576,8 +600,12 @@ pub struct Ledger {
     confidential: bool,
     tree: CommitmentTree,
     /// Every leaf ever appended — spec §7 item 6 needs membership the frontier cannot answer.
-    commitments: BTreeSet<Word8>,
-    nullifiers: BTreeSet<Word8>,
+    commitments: SharedSet,
+    nullifiers: SharedSet,
+    /// The incremental nullifier root (spec 2026-10-05 §4) under genesis
+    /// `incremental_nullifier_root`: a range over the nullifiers in insertion order, whose root
+    /// takes the sorted root's slot. `None` on every chain through 20.
+    nullifier_mmr: Option<nullifier_mmr::NullifierMmr>,
     /// Block-end roots, oldest first, at most [`Ledger::proof_window`] (ANCHOR_WINDOW without a
     /// genesis `proof_window_blocks`).
     anchors: VecDeque<(u64, Word8)>,
@@ -789,6 +817,7 @@ impl PartialEq for Ledger {
             && self.tree == o.tree
             && self.commitments == o.commitments
             && self.nullifiers == o.nullifiers
+            && self.nullifier_mmr == o.nullifier_mmr
             && self.anchors == o.anchors
             && self.validators == o.validators
             && self.programs == o.programs
@@ -845,8 +874,9 @@ impl Ledger {
             faucet: false,
             confidential: true,
             tree,
-            commitments: BTreeSet::new(),
-            nullifiers: BTreeSet::new(),
+            commitments: SharedSet::new(),
+            nullifiers: SharedSet::new(),
+            nullifier_mmr: None,
             anchors,
             validators,
             programs: BTreeMap::new(),
@@ -909,8 +939,9 @@ impl Ledger {
             faucet: false,
             confidential: true,
             tree,
-            commitments,
-            nullifiers,
+            commitments: SharedSet::from_set(commitments),
+            nullifiers: SharedSet::from_set(nullifiers),
+            nullifier_mmr: None,
             anchors: anchors.into_iter().collect(),
             validators,
             programs,
@@ -1345,6 +1376,68 @@ impl Ledger {
         }
     }
 
+    /// Switch the incremental nullifier root on or off. On is only ever set on an empty set —
+    /// genesis — because the range needs insertion order, which the set does not have; a loaded
+    /// chain restores its range with [`Self::set_nullifier_mmr`].
+    pub fn set_incremental_nullifier_root(&mut self, on: bool) {
+        match (on, &self.nullifier_mmr) {
+            (true, None) => {
+                assert!(
+                    self.nullifiers.is_empty(),
+                    "the incremental nullifier root needs insertion order; it can only be switched on at genesis, not over {} existing nullifiers",
+                    self.nullifiers.len()
+                );
+                self.nullifier_mmr = Some(nullifier_mmr::NullifierMmr::new());
+            }
+            (false, Some(_)) => self.nullifier_mmr = None,
+            _ => {}
+        }
+    }
+
+    /// Install a range a store loaded (spec 2026-10-05 §4): the restore path for a chain whose
+    /// genesis set `incremental_nullifier_root`.
+    pub fn set_nullifier_mmr(&mut self, mmr: Option<nullifier_mmr::NullifierMmr>) {
+        self.nullifier_mmr = mmr;
+    }
+
+    /// The nullifier range, when the chain keeps one.
+    pub fn nullifier_mmr(&self) -> Option<&nullifier_mmr::NullifierMmr> {
+        self.nullifier_mmr.as_ref()
+    }
+
+    /// Whether the nullifier slot of the state root holds the incremental range root.
+    pub fn incremental_nullifier_root(&self) -> bool {
+        self.nullifier_mmr.is_some()
+    }
+
+    /// The commit step of the shared sets (spec 2026-10-05 §5.2): the committed ledger's deltas
+    /// become base. `HotStuff` calls it once per commit, on the committed ledger only.
+    ///
+    /// `Ledger` is no longer a value type across commits: a clone that shares the base sees the
+    /// entries committed afterwards. Soundness needs that at commit every ledger still held
+    /// either descends from the committed block or is a read-only snapshot used for membership
+    /// only (admission), for which gaining the committed spends is harmless. The two bases'
+    /// write locks are taken one after the other, so a reader on another thread can observe the
+    /// commitments committed and the nullifiers not yet; that is harmless under the same
+    /// precondition.
+    pub fn commit_shared_sets(&mut self) {
+        self.commitments.commit();
+        self.nullifiers.commit();
+    }
+
+    /// Drop delta entries the base gained: every surviving speculative ledger, after a commit.
+    pub fn absorb_shared_sets(&mut self) {
+        self.commitments.absorb();
+        self.nullifiers.absorb();
+    }
+
+    /// A private base for this ledger's lineage (`HotStuff::new`): a replica must not share a
+    /// base with the genesis state or with another replica in the same process.
+    pub fn detach_shared_sets(&mut self) {
+        self.commitments.detach();
+        self.nullifiers.detach();
+    }
+
     /// The registry to write: a bridged deposit credits a token's supply and a burn debits it
     /// (`bridge_notes::apply`), and a later task's `Action::RegisterToken` and friends mint
     /// through the same handle.
@@ -1695,7 +1788,7 @@ impl Ledger {
         Ok(())
     }
 
-    pub fn nullifiers(&self) -> &BTreeSet<Word8> {
+    pub fn nullifiers(&self) -> &SharedSet {
         &self.nullifiers
     }
 
@@ -1704,7 +1797,7 @@ impl Ledger {
     }
 
     /// Every commitment ever appended, which the frontier tree cannot answer on its own.
-    pub fn commitments_set(&self) -> &BTreeSet<Word8> {
+    pub fn commitments_set(&self) -> &SharedSet {
         &self.commitments
     }
 
@@ -1791,7 +1884,11 @@ impl Ledger {
     /// `validate_inner` that the tree has room (HB-3); the tree-full error is the belt to that.
     fn apply_bundle_notes(&mut self, b: &Bundle, executor: &dyn ConfidentialExecutor) -> Result<(), TxError> {
         for nf in &b.nullifiers {
-            self.nullifiers.insert(*nf);
+            if self.nullifiers.insert(*nf) {
+                if let Some(m) = &mut self.nullifier_mmr {
+                    m.append(nf);
+                }
+            }
         }
         for cm in &b.commitments {
             self.commitments.insert(*cm);
@@ -2465,7 +2562,8 @@ impl Ledger {
 
     /// `apply_tx` against a [`VerifiedProofs`] set (audit v3, B5): the proposer's trial apply
     /// and the consensus apply path carry the node's admission cache; everything else takes
-    /// `apply_tx` and verifies every proof, exactly as before.
+    /// `apply_tx` and verifies every proof, exactly as before. The same path as
+    /// [`Ledger::apply_tx_checked`], with the refused / half-applied distinction dropped.
     pub fn apply_tx_with(
         &mut self,
         tx: &Transaction,
@@ -2473,37 +2571,81 @@ impl Ledger {
         executor: &dyn ConfidentialExecutor,
         verified_proofs: &dyn VerifiedProofs,
     ) -> Result<Option<CallReceiptData>, TxError> {
-        let verified = self.validate_inner(tx, executor, verified_proofs)?;
-        if let Some(b) = &tx.bundle {
+        self.apply_tx_checked(tx, proposer, executor, verified_proofs).map_err(ApplyFailure::into_inner)
+    }
+
+    /// The one apply path, telling the proposer how a candidate failed (final review F1).
+    /// Everything up to the first write — `validate_inner`, then the proposer lookup and the
+    /// fee arithmetic the bundle step computes before it touches the supply — fails as
+    /// [`ApplyFailure::Refused`] and leaves the ledger byte-identical; every error after the
+    /// first write is [`ApplyFailure::HalfApplied`]. `HotStuff::propose` skips a refusal for
+    /// free and rebuilds only after a half-apply (spec 2026-10-05, plan correction 2).
+    pub fn apply_tx_checked(
+        &mut self,
+        tx: &Transaction,
+        proposer: &Address,
+        executor: &dyn ConfidentialExecutor,
+        verified_proofs: &dyn VerifiedProofs,
+    ) -> Result<Option<CallReceiptData>, ApplyFailure> {
+        let verified = self.validate_inner(tx, executor, verified_proofs).map_err(ApplyFailure::Refused)?;
+        let split = match &tx.bundle {
+            Some(b) => Some(self.bundle_fee_split(&tx.action, b, proposer).map_err(ApplyFailure::Refused)?),
+            None => None,
+        };
+        self.apply_validated(tx, proposer, executor, verified, split).map_err(ApplyFailure::HalfApplied)
+    }
+
+    /// The bundle step's arithmetic, computed before any write so that its errors are clean
+    /// refusals: `(registration_burn, fee, kept, rewards)` — the burned registration fee
+    /// (TOK-2), the fee left after it, the part the proposer keeps now, and the proposer's
+    /// `rewards` once it is credited.
+    fn bundle_fee_split(&self, action: &Action, b: &Bundle, proposer: &Address) -> Result<(u64, u64, u64, u64), TxError> {
+        // In practice the proposer is always in the register — `apply_block` rejects a
+        // block whose proposer is not, and `HotStuff::propose` runs only when this node
+        // is the leader.
+        let entry = self.validators.get(proposer).ok_or(TxError::UnknownProposer(*proposer))?;
+        // TOK-2 (audit v5): under `tokens.burn_registration_fee` a registration's
+        // `registration_fee` is burned rather than paid, so the proposer pays it like anyone
+        // else — the fee the split below divides is what is left after it. Zero without the
+        // gate (chain 14) and for every action that registers no token. The floor
+        // (`tokens::validate`'s `RegistrationFeeTooLow`) already held `fee` to at least
+        // `BUNDLE_BASE + registration_fee`, so the subtraction cannot fail after
+        // `validate_inner`; refused by name rather than as an overflow if it ever did.
+        let registration_burn = self.registration_burn(action);
+        let fee = b.fee.checked_sub(registration_burn).ok_or_else(|| {
+            tokens::TokenError::RegistrationFeeTooLow { min: gas::BUNDLE_BASE.saturating_add(registration_burn), fee: b.fee }
+        })?;
+        // The fee split (block aggregation, spec §5.2): on an aggregating chain the
+        // proposer keeps exactly the floor and the excess is bucketed against this
+        // transaction's hash — an `Aggregate` may still cover it — where an ungated chain
+        // keeps the whole fee to the proposer, byte-for-byte today's accounting. The
+        // counter moves with what the proposer actually keeps: the floor now, an expired
+        // excess at the sweep (`sweep_expired_excesses`), never the bucketed part.
+        let kept = if self.aggregation.is_some() { gas::BUNDLE_BASE.min(fee) } else { fee };
+        let rewards = entry.rewards.checked_add(kept).ok_or(TxError::Overflow)?;
+        Ok((registration_burn, fee, kept, rewards))
+    }
+
+    /// Everything after the first write: the bundle's supply counters and notes, then the
+    /// action step. `split` is [`Ledger::bundle_fee_split`]'s result, present exactly when the
+    /// transaction carries a bundle.
+    fn apply_validated(
+        &mut self,
+        tx: &Transaction,
+        proposer: &Address,
+        executor: &dyn ConfidentialExecutor,
+        verified: Verified,
+        split: Option<(u64, u64, u64, u64)>,
+    ) -> Result<Option<CallReceiptData>, TxError> {
+        if let (Some(b), Some((registration_burn, fee, kept, rewards))) = (&tx.bundle, split) {
             // This method is not atomic on its own: the action step below runs after these
             // writes and can still fail (S2's `staking::apply`, S3's `bridge_notes::apply`),
             // which would leave a half-applied bundle behind. What makes a rejected
             // transaction leave the ledger byte-identical is the caller: `apply_transactions`
             // applies every transaction to a scratch clone and only assigns it back once the
-            // whole block succeeded. Call `apply_tx` on a ledger you are willing to discard.
-            // In practice the proposer is always in the register — `apply_block` rejects a
-            // block whose proposer is not, and `HotStuff::propose` runs only when this node
-            // is the leader.
-            let entry = self.validators.get(proposer).ok_or(TxError::UnknownProposer(*proposer))?;
-            // TOK-2 (audit v5): under `tokens.burn_registration_fee` a registration's
-            // `registration_fee` is burned rather than paid, so the proposer pays it like anyone
-            // else — the fee the split below divides is what is left after it. Zero without the
-            // gate (chain 14) and for every action that registers no token. The floor
-            // (`tokens::validate`'s `RegistrationFeeTooLow`) already held `fee` to at least
-            // `BUNDLE_BASE + registration_fee`, so the subtraction cannot fail after
-            // `validate_inner`; refused by name rather than as an overflow if it ever did.
-            let registration_burn = self.registration_burn(&tx.action);
-            let fee = b.fee.checked_sub(registration_burn).ok_or_else(|| {
-                tokens::TokenError::RegistrationFeeTooLow { min: gas::BUNDLE_BASE.saturating_add(registration_burn), fee: b.fee }
-            })?;
-            // The fee split (block aggregation, spec §5.2): on an aggregating chain the
-            // proposer keeps exactly the floor and the excess is bucketed against this
-            // transaction's hash — an `Aggregate` may still cover it — where an ungated chain
-            // keeps the whole fee to the proposer, byte-for-byte today's accounting. The
-            // counter moves with what the proposer actually keeps: the floor now, an expired
-            // excess at the sweep (`sweep_expired_excesses`), never the bucketed part.
-            let kept = if self.aggregation.is_some() { gas::BUNDLE_BASE.min(fee) } else { fee };
-            let rewards = entry.rewards.checked_add(kept).ok_or(TxError::Overflow)?;
+            // whole block succeeded. Call `apply_tx` on a ledger you are willing to discard;
+            // the proposer, which applies in place, learns which case it hit through
+            // `apply_tx_checked`'s [`ApplyFailure`].
             // Both RAND halves of what this bundle takes out of the pool (see [`supply`]): the
             // fee becomes the proposer's `rewards` below, and `burn_r` becomes `stake` in the
             // `Bond` arm (or an aggregator's bond) — which is why they are counted here, where
@@ -2522,7 +2664,7 @@ impl Ledger {
             self.registration_fees_burned =
                 self.registration_fees_burned.checked_add(registration_burn).ok_or(TxError::Overflow)?;
             self.apply_bundle_notes(b, executor)?;
-            self.validators.get_mut(proposer).expect("looked up above").rewards = rewards;
+            self.validators.get_mut(proposer).expect("looked up in bundle_fee_split").rewards = rewards;
             if self.aggregation.is_some() {
                 let until = self.height.checked_add(self.aggregation().expect("just checked").window).ok_or(TxError::Overflow)?;
                 // Every bundle is recorded, excess or not: the bucket doubles as the ledger's
@@ -2964,14 +3106,18 @@ impl Ledger {
     /// commits exactly what phase S1 committed and a chain without aggregation exactly what the
     /// bridge commit added — turning either on is a hard fork for the chains that take it and a
     /// no-op for the ones that do not.
-    /// The three merkle roots `state_root` binds, in order: nullifiers, validators, programs.
+    /// The three roots `state_root` binds, in order: nullifiers, validators, programs. Under the
+    /// incremental nullifier root the first is the range root, not a sorted merkle root.
     /// Split out so a state-root mismatch can name the component it diverges in.
     fn state_root_leaves(&self) -> (Hash, Hash, Hash) {
-        let nf_leaves: Vec<Hash> = self
-            .nullifiers
-            .iter()
-            .map(|nf| Hash::digest_domain(b"rand-nullifier-leaf", &word8_to_bytes(nf)))
-            .collect();
+        let nf_root = match &self.nullifier_mmr {
+            Some(m) => m.root(),
+            None => {
+                let mut nf_leaves: Vec<Hash> = Vec::with_capacity(self.nullifiers.len());
+                self.nullifiers.for_each_sorted(|nf| nf_leaves.push(nullifier_mmr::leaf(nf)));
+                merkle_root(&nf_leaves)
+            }
+        };
         let val_leaves: Vec<Hash> = self
             .validators
             .iter()
@@ -3005,7 +3151,7 @@ impl Ledger {
             .collect();
         let prog_leaves: Vec<Hash> =
             self.programs.keys().map(|id| Hash::digest_domain(b"rand-program-leaf", id.as_bytes())).collect();
-        (merkle_root(&nf_leaves), merkle_root(&val_leaves), merkle_root(&prog_leaves))
+        (nf_root, merkle_root(&val_leaves), merkle_root(&prog_leaves))
     }
 
     /// The component roots of [`Ledger::state_root`], for logging a mismatch: tree, nullifiers,
@@ -3036,6 +3182,13 @@ impl Ledger {
             self.gas_prices(),
             self.admitted_root()
         ) + &format!(" jailed {:?}", self.jailed_root())
+            + &format!(
+                " nullifier range {}",
+                match &self.nullifier_mmr {
+                    Some(m) => format!("{} leaves", m.count()),
+                    None => "off".into(),
+                }
+            )
     }
 
     /// `blake3("rand-state-2" || tree || nullifiers || validators || programs)`, with
@@ -3109,6 +3262,13 @@ impl Ledger {
         let mut root = self.state_root_base();
         if self.tokens.as_ref().is_some_and(|t| t.incremental_root()) {
             root = Hash::digest_domain(b"rand-state-tokens-1", root.as_bytes());
+        }
+        // The incremental nullifier root (spec 2026-10-05 §4.3): the range root already sits in the
+        // nullifier slot of the base; the wrapper keeps a flag-on chain from ever colliding with a
+        // flag-off chain whose sorted root happened to equal it. After the tokens wrapper, before the
+        // staking wrappers — the order is fixed here.
+        if self.nullifier_mmr.is_some() {
+            root = Hash::digest_domain(b"rand-state-nf-mmr-1", root.as_bytes());
         }
         if self.staking.as_ref().is_some_and(|s| s.admission_by_vote()) {
             let mut buf = Vec::with_capacity(64);
@@ -3200,7 +3360,7 @@ pub fn default_executor() -> StubExecutor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::confidential::StubExecutor;
     use crate::program::program_id;
@@ -3232,6 +3392,74 @@ mod tests {
                 activation_epoch: 0,
             },
         )
+    }
+
+    /// Spec 2026-10-05 §4.3: without the flag the state root is byte-identical to before (a
+    /// chain-20-shaped ledger); with it the nullifier slot holds the range root and the whole is
+    /// re-domained `rand-state-nf-mmr-1` once.
+    #[test]
+    fn the_incremental_nullifier_root_is_gated_and_wrapped_once() {
+        let (a, _) = keys();
+        let mut off = ledger();
+        let mut on = ledger();
+        on.set_incremental_nullifier_root(true);
+        assert_eq!(off.state_root(), ledger().state_root(), "the flag is off by default");
+        let before_on = on.state_root();
+        assert_ne!(before_on, off.state_root(), "the wrapper changes an empty ledger's root");
+        for l in [&mut off, &mut on] {
+            let t = tx(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+            let root = root_after(l, &[tx(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]])], &a.address(), 1);
+            l.apply_block(&signed_block(vec![t], &a, 1, root), &StubExecutor).unwrap();
+        }
+        // A bundle inserts all four nullifier slots, the two dummies included.
+        assert_eq!(on.nullifier_mmr().unwrap().count(), 4);
+        assert_ne!(on.state_root(), off.state_root(), "a flag-on root differs from the flag-off root of the same blocks");
+        // The composition, pinned: the range root in the slot, then exactly one wrapper.
+        assert_eq!(on.state_root_leaves().0, on.nullifier_mmr().unwrap().root(), "the range root takes the nullifier slot");
+        assert_eq!(on.state_root(), Hash::digest_domain(b"rand-state-nf-mmr-1", on.state_root_base().as_bytes()), "exactly one wrapper");
+        // The `rand-state-nf-mmr-1` encoding pinned on 2026-10-05; it must never change without a new domain.
+        const GOLDEN_ONE_BLOCK_ROOT: &str = "befcd5659aa22337044ed24005d7a62d3e1ed90bead112a223295f58472105b3";
+        assert_eq!(on.state_root().to_hex(), GOLDEN_ONE_BLOCK_ROOT);
+        assert_eq!(off.state_root(), ledger_after_same_block_flag_off(&a), "the flag-off root is what it was");
+        // Determinism: the same blocks on a fresh flag-on ledger give the same root.
+        let mut again = ledger();
+        again.set_incremental_nullifier_root(true);
+        let t = tx(&again, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let root = root_after(&again, &[tx(&again, [[1; 8], [2; 8]], [[3; 8], [4; 8]])], &a.address(), 1);
+        again.apply_block(&signed_block(vec![t], &a, 1, root), &StubExecutor).unwrap();
+        assert_eq!(again.state_root(), on.state_root());
+        assert_eq!(again, on, "equality covers the range");
+    }
+
+    /// The wrapper order (spec 2026-10-05 §4.3): after `rand-state-tokens-1`, not before it.
+    #[test]
+    fn the_nullifier_wrapper_follows_the_tokens_wrapper() {
+        let mut l = ledger();
+        l.set_tokens(Some(tokens::TokenRegistry::new(1_000_000_000).with_incremental_root(true)));
+        l.set_incremental_nullifier_root(true);
+        let tokens_wrapped = Hash::digest_domain(b"rand-state-tokens-1", l.state_root_base().as_bytes());
+        assert_eq!(l.state_root(), Hash::digest_domain(b"rand-state-nf-mmr-1", tokens_wrapped.as_bytes()));
+    }
+
+    /// The flag-off root for the same block, computed on a fresh ledger with no reference to the
+    /// new code paths: pins "byte-identical to before" without a hard-coded hash.
+    fn ledger_after_same_block_flag_off(a: &Keypair) -> Hash {
+        let mut l = ledger();
+        let t = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let root = root_after(&l, &[tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]])], &a.address(), 1);
+        l.apply_block(&signed_block(vec![t], a, 1, root), &StubExecutor).unwrap();
+        l.state_root()
+    }
+
+    #[test]
+    #[should_panic(expected = "insertion order")]
+    fn the_flag_cannot_be_switched_on_over_existing_nullifiers() {
+        let (a, _) = keys();
+        let mut l = ledger();
+        let t = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let root = root_after(&l, &[tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]])], &a.address(), 1);
+        l.apply_block(&signed_block(vec![t], &a, 1, root), &StubExecutor).unwrap();
+        l.set_incremental_nullifier_root(true);
     }
 
     fn ledger() -> Ledger {
@@ -5054,6 +5282,27 @@ mod tests {
         assert_eq!(le.validate(&t, &PaddedStub), Err(TxError::FeeTooLow { min: today + gas::CALL_PER_KIB, fee: today }));
     }
 
+    /// Spec 2026-10-05 §5.3: a clone taken before a commit keeps answering, and the committed
+    /// ledger's delta is empty after the commit step. A bundle writes all four nullifier slots,
+    /// the two dummies included.
+    #[test]
+    fn shared_sets_commit_and_a_pre_commit_clone_still_answers() {
+        let (a, _) = keys();
+        let mut l = ledger();
+        let t1 = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let good = signed_block(vec![t1], &a, 1, root_after(&l, &[tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]])], &a.address(), 1));
+        let snapshot = l.clone();
+        l.apply_block(&good, &StubExecutor).unwrap();
+        assert_eq!(l.nullifiers().added_len(), 4);
+        l.commit_shared_sets();
+        assert_eq!((l.nullifiers().added_len(), l.nullifiers().len()), (0, 4));
+        assert!(l.is_spent(&[1; 8]));
+        // The snapshot shares the base and now sees the committed spends — by design, since every
+        // live clone descends from the committed head; its len() is exact.
+        assert!(snapshot.is_spent(&[1; 8]));
+        assert_eq!(snapshot.nullifiers().len(), 4);
+    }
+
     #[test]
     fn state_root_covers_tree_nullifiers_validators_and_programs() {
         let mut l = ledger();
@@ -5069,8 +5318,8 @@ mod tests {
             7,
             HC,
             l.tree().clone(),
-            l.commitments_set().clone(),
-            l.nullifiers().clone(),
+            l.commitments_set().snapshot(),
+            l.nullifiers().snapshot(),
             l.anchors().iter().copied().collect(),
             l.validators().clone(),
             l.programs().clone(),
@@ -6462,5 +6711,102 @@ mod tests {
         replica.apply_block(&block, &StubExecutor).unwrap();
         assert_eq!(replica.gas_prices(), expect.gas_prices());
         assert!(replica.gas_prices().gas_price > 100, "60 479 gas against a 20 000 target raised the price");
+    }
+
+    /// A `StubExecutor` whose `check_program` accepts a seven-word program on every even-numbered
+    /// ask and refuses it on every odd one. A `Deploy` asks twice, once in `validate_inner` and once
+    /// in the action step after `apply_bundle_notes` has written the bundle, so every such deploy
+    /// passes validation and then fails mid-application: the half-applied case
+    /// ([`ApplyFailure::HalfApplied`]) that `apply_tx_with`'s comment names, which the double spend
+    /// (refused before any write, [`ApplyFailure::Refused`]) is not. Shared with the consensus
+    /// tests, whose proposer replays exactly on this case.
+    pub(crate) struct FlakyDeploy {
+        pub(crate) asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ConfidentialExecutor for FlakyDeploy {
+        fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, crate::confidential::ConfidentialError> {
+            if words.len() == 7 && self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % 2 == 1 {
+                return Err(crate::confidential::ConfidentialError::Disabled);
+            }
+            StubExecutor.check_program(base_pc, words)
+        }
+        fn verify_call(&self, program: &crate::program::ProgramRecord, proof: &[u8]) -> Result<crate::program::CallOutcome, crate::confidential::ConfidentialError> {
+            StubExecutor.verify_call(program, proof)
+        }
+        fn public_digest(&self, words: &[u32]) -> crate::notes::Word8 {
+            StubExecutor.public_digest(words)
+        }
+        fn node_hash(&self, left: &crate::notes::Word8, right: &crate::notes::Word8) -> crate::notes::Word8 {
+            StubExecutor.node_hash(left, right)
+        }
+        fn note_commitment(&self, pk: &crate::notes::Word8, from: &crate::notes::Word8, amount: u64, asset: u32, time: u32, r: &crate::notes::Word8) -> crate::notes::Word8 {
+            StubExecutor.note_commitment(pk, from, amount, asset, time, r)
+        }
+        fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> crate::notes::Word8 {
+            StubExecutor.bundle_digest(input)
+        }
+        fn bundle_digest_v3(&self, input: &crate::notes::BundleDigestInput) -> crate::notes::Word8 {
+            StubExecutor.bundle_digest_v3(input)
+        }
+        fn bundle_proof_digest(&self, hc_bundle: &crate::notes::Word8, proof: &[u8]) -> Result<crate::notes::Word8, crate::confidential::ConfidentialError> {
+            StubExecutor.bundle_proof_digest(hc_bundle, proof)
+        }
+        fn auth_proof_digest(&self, proof: &[u8]) -> Result<crate::notes::Word8, crate::confidential::ConfidentialError> {
+            StubExecutor.auth_proof_digest(proof)
+        }
+        fn verify_auth(&self, hc_auth: &crate::notes::Word8, proof: &[u8], binding: &[u32; 8]) -> Result<crate::notes::Word8, crate::confidential::ConfidentialError> {
+            StubExecutor.verify_auth(hc_auth, proof, binding)
+        }
+        fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, crate::confidential::ConfidentialError> {
+            StubExecutor.bundle_gas_limit(proof)
+        }
+        fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, crate::confidential::ConfidentialError> {
+            StubExecutor.auth_gas_limit(proof)
+        }
+        fn verify_bundle(&self, hc_bundle: &crate::notes::Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), crate::confidential::ConfidentialError> {
+            StubExecutor.verify_bundle(hc_bundle, proof, binding)
+        }
+        fn aggregate_program_digest(&self, shape: &crate::types::DeclaredShape) -> Result<[u64; 4], crate::confidential::ConfidentialError> {
+            StubExecutor.aggregate_program_digest(shape)
+        }
+        fn verify_aggregate(
+            &self,
+            shape: &crate::types::DeclaredShape,
+            covered: &[crate::types::CoveredBundle],
+            proof: &[u8],
+            binding: &[u32; 8],
+        ) -> Result<Vec<[u32; 8]>, crate::confidential::ConfidentialError> {
+            StubExecutor.verify_aggregate(shape, covered, proof, binding)
+        }
+    }
+
+    /// The proposer's split (final review F1): a candidate refused by validation leaves the
+    /// ledger byte-identical, so `HotStuff::propose` skips it without a replay; one that passed
+    /// validation and failed in the action step has written its bundle, so the proposer must
+    /// rebuild. `apply_tx_checked` names which, and `apply_tx_with` is the same path with the
+    /// distinction dropped.
+    #[test]
+    fn apply_tx_checked_names_a_refusal_apart_from_a_half_apply() {
+        let (a, _) = keys();
+        let mut l = ledger();
+        // Built against the same anchor as the first, which the apply below does not record.
+        let first = tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]]);
+        let dup = tx(&l, [[1; 8], [9; 8]], [[5; 8], [6; 8]]);
+        let deploy = Action::Deploy { base_pc: 0, words: vec![0x13; 7], public: vec![] };
+        let t = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[20; 8], [21; 8]], [[22; 8], [23; 8]], gas::fee_floor(&deploy)), deploy));
+        l.apply_tx(&first, &a.address(), &StubExecutor).unwrap();
+        let before = l.clone();
+        // The double spend: refused before any write.
+        let err = l.apply_tx_checked(&dup, &a.address(), &StubExecutor, &NoVerified).unwrap_err();
+        assert_eq!(err, ApplyFailure::Refused(TxError::Spent([1; 8])));
+        assert!(l == before, "a refusal leaves the ledger equal to its pre-call clone");
+        assert_eq!(l.apply_tx_with(&dup, &a.address(), &StubExecutor, &NoVerified), Err(TxError::Spent([1; 8])), "the same error through apply_tx_with");
+        // The half-apply: validation passes, the action step refuses after the bundle was written.
+        let flaky = FlakyDeploy { asked: Default::default() };
+        let err = l.apply_tx_checked(&t, &a.address(), &flaky, &NoVerified).unwrap_err();
+        assert!(matches!(err, ApplyFailure::HalfApplied(TxError::BadProgram(_))), "{err:?}");
+        assert!(l.is_spent(&[20; 8]) && l.is_spent(&[21; 8]), "the bundle's nullifiers were written before the refusal");
+        assert!(l != before, "a half-apply leaves the ledger dirty");
     }
 }

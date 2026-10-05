@@ -470,6 +470,9 @@ enum Cmd {
         /// command line. Needs `--tokens`, refused by name without it.
         #[arg(long)]
         tokens_incremental_root: bool,
+        /// Cut the genesis with incremental_nullifier_root: true (spec 2026-10-05 §4).
+        #[arg(long)]
+        incremental_nullifier_root: bool,
         /// The exact note-envelope size (spec 2026-09-26 §2.4): every note envelope — a bundle
         /// output, a faucet mint, a withdraw, a bridge deposit, a genesis alloc — must be exactly
         /// this many bytes, which lets every one of them carry a memo. Only `notes::
@@ -720,6 +723,9 @@ enum Cmd {
         /// `docs/node-hardware.md` §6; `RAYON_NUM_THREADS` when set).
         #[arg(long, value_name = "N")]
         prover_threads: Option<usize>,
+        /// Proof-verification workers (default: the cores minus two, at least four — spec 2026-10-05 §6).
+        #[arg(long, value_name = "N")]
+        verify_workers: Option<usize>,
         /// Skip the free-memory gate that refuses a prover the machine cannot hold.
         #[arg(long)]
         prover_skip_memory_check: bool,
@@ -854,6 +860,33 @@ enum Cmd {
         /// Return once the node accepts the aggregate instead of waiting for it to commit.
         #[arg(long)]
         no_wait: bool,
+    },
+    /// Benchmarks of the node's own paths; no network, no database.
+    Bench {
+        #[command(subcommand)]
+        cmd: BenchCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BenchCmd {
+    /// The validator hot path at synthetic load: one validator on the StubExecutor, `--bundles`
+    /// bundles a block (four nullifier and four commitment slots each: two real, two dummy) for `--blocks` blocks through the
+    /// real HotStuff propose/apply/commit path. Prints one timing row every `--report-every`
+    /// blocks and exits non-zero if the last block's apply time is over `--fail-over-ms`
+    /// (`docs/compute-optimization.md` §3.6).
+    Apply {
+        #[arg(long, default_value_t = randprotocol_core::gas::MAX_BLOCK_TXS)]
+        bundles: usize,
+        #[arg(long, default_value_t = 10_000)]
+        blocks: u64,
+        #[arg(long, default_value_t = 500)]
+        report_every: u64,
+        /// Cut the harness genesis with `incremental_nullifier_root: true`.
+        #[arg(long)]
+        incremental_nullifier_root: bool,
+        #[arg(long, default_value_t = 300)]
+        fail_over_ms: u64,
     },
 }
 
@@ -1544,6 +1577,12 @@ async fn main() -> Result<()> {
         }
     }
     match cli.cmd {
+        Cmd::Bench { cmd: BenchCmd::Apply { bundles, blocks, report_every, incremental_nullifier_root, fail_over_ms } } => {
+            let v = randprotocol_node::bench::run(&randprotocol_node::bench::BenchArgs { bundles, blocks, report_every, incremental_nullifier_root, fail_over_ms })?;
+            if !v.passed {
+                std::process::exit(2);
+            }
+        }
         Cmd::Keygen { out } => {
             let kp = Keypair::generate();
             // Never over an existing file (VK-7): the key at `out` may be the only copy of a seed.
@@ -1573,6 +1612,7 @@ async fn main() -> Result<()> {
             admitted_shapes,
             tokens,
             tokens_incremental_root,
+            incremental_nullifier_root,
             envelope_bytes,
             vesting,
             bundle_guest,
@@ -1763,6 +1803,7 @@ async fn main() -> Result<()> {
                 // without it hashes byte-for-byte as before.
                 program_state: program_state_cell_fee
                     .map(|cell_fee| randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee }),
+                incremental_nullifier_root: incremental_nullifier_root.then_some(true),
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -1893,6 +1934,7 @@ async fn main() -> Result<()> {
             prover_cuda,
             prover_cpu,
             prover_threads,
+            verify_workers,
             prover_skip_memory_check,
             prover_allow_origin,
             prover_fee,
@@ -1958,6 +2000,7 @@ async fn main() -> Result<()> {
                 verify: verify_chain.parse().map_err(|e: String| anyhow::anyhow!(e))?,
                 keep_raw_proofs,
                 min_free_disk_bytes: min_free_disk_mb << 20,
+                verify_workers,
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
             }, rpc_options, node::NetOptions { reserved_peers: reserved_peer, strict_gossip })
@@ -3651,6 +3694,7 @@ mod tests {
             binding_domain: None,
             proof_window_blocks: None,
             program_state: None,
+            incremental_nullifier_root: None,
         }
     }
 

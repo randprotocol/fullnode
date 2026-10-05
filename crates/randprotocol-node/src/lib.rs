@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod agg_executor;
+pub mod bench;
 pub mod bridge_gov_tool;
 pub mod disk;
 pub mod hosted_prover;

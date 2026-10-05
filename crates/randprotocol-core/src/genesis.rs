@@ -487,6 +487,13 @@ pub struct Genesis {
     /// genesis hashes byte-for-byte as before and every `Invoke` is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_state: Option<crate::ledger::program_state::ProgramStateConfig>,
+    /// Spec 2026-10-05 §4: the nullifier root as an incremental range in insertion order
+    /// (`rand-state-nf-mmr-1`) instead of a sorted root recomputed over every nullifier each
+    /// block. Absent or `false` (every chain through 20) changes nothing; `true` is committed
+    /// under its own tag (`b"incremental_nullifier_root"` ‖ `1`), after `tokens_incremental_root`
+    /// — last — and switches the ledger at `build`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_nullifier_root: Option<bool>,
 }
 
 /// The chains whose committed genesis file (`deploy/genesis-chain<N>.json`) carries both
@@ -1169,6 +1176,11 @@ impl Genesis {
         if let Some(p) = &self.program_state {
             ledger.set_program_state(Some(crate::ledger::program_state::ProgramState::from_config(p)));
         }
+        // The incremental nullifier root (spec 2026-10-05 §4.1): the genesis ledger holds no
+        // nullifiers, so the range starts empty and the header's state root already carries it.
+        if self.incremental_nullifier_root == Some(true) {
+            ledger.set_incremental_nullifier_root(true);
+        }
         // Replaces the empty-tree root `Ledger::new` recorded, so the only anchor a chain
         // starts with is the root the deposit notes leave behind.
         ledger.record_anchor(0);
@@ -1481,6 +1493,12 @@ impl Genesis {
         // 20's hash.
         if self.tokens.as_ref().is_some_and(|t| t.incremental_root == Some(true)) {
             commit.extend_from_slice(b"tokens_incremental_root");
+            commit.push(1);
+        }
+        // The incremental nullifier root (spec 2026-10-05 §4.1), after `tokens_incremental_root`:
+        // tagged only when `true`, so every genesis cut before it hashes as before.
+        if self.incremental_nullifier_root == Some(true) {
+            commit.extend_from_slice(b"incremental_nullifier_root");
             commit.push(1);
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
@@ -1930,6 +1948,7 @@ mod tests {
             binding_domain: None,
             proof_window_blocks: None,
             program_state: None,
+            incremental_nullifier_root: None,
         }
     }
 
@@ -2522,6 +2541,25 @@ mod tests {
         let (both_state, fees_state) = (build(&both), build(&fees_only));
         assert_ne!(binding(&both_state), binding(&on_state));
         assert_ne!(binding(&both_state), binding(&fees_state), "the flag's tag follows the fees' in the binding");
+    }
+
+    /// Spec 2026-10-05 §4.1: `incremental_nullifier_root: true` is tagged after
+    /// `tokens_incremental_root` and switches the ledger; absent or `false` changes no hash.
+    #[test]
+    fn incremental_nullifier_root_is_tagged_last_and_switches_the_ledger() {
+        let base = base_genesis();
+        let mut off = base.clone();
+        off.incremental_nullifier_root = Some(false);
+        assert_eq!(build(&off).hash(), build(&base).hash(), "false commits nothing");
+        let mut on = base.clone();
+        on.incremental_nullifier_root = Some(true);
+        let gs = build(&on);
+        assert_ne!(gs.hash(), build(&base).hash());
+        assert!(gs.ledger.incremental_nullifier_root());
+        assert_eq!(gs.ledger.nullifier_mmr().unwrap().count(), 0);
+        let json = serde_json::to_string(&on).unwrap();
+        let back: Genesis = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, on);
     }
 
     /// Deep scan 2026-09-24 (ledger arithmetic): `tokens.bound_note_value` refuses a mint or

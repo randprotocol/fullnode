@@ -924,11 +924,8 @@ mod tests {
     fn manual_state_root(l: &Ledger, domain: &'static [u8], with_aggregators: bool) -> Hash {
         use crate::crypto::merkle_root;
         use crate::notes::word8_to_bytes;
-        let nf_leaves: Vec<Hash> = l
-            .nullifiers()
-            .iter()
-            .map(|nf| Hash::digest_domain(b"rand-nullifier-leaf", &word8_to_bytes(nf)))
-            .collect();
+        let mut nf_leaves: Vec<Hash> = Vec::new();
+        l.nullifiers().for_each_sorted(|nf| nf_leaves.push(Hash::digest_domain(b"rand-nullifier-leaf", &word8_to_bytes(nf))));
         let val_leaves: Vec<Hash> = l
             .validators()
             .iter()
@@ -1181,6 +1178,7 @@ mod tests {
             binding_domain: None,
             proof_window_blocks: None,
             program_state: None,
+            incremental_nullifier_root: None,
             hardening_v6: None,
             hc_auth: None,
         }

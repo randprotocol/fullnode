@@ -71,6 +71,7 @@ fn genesis_v3(validator: &Keypair) -> Genesis {
         binding_domain: Some(1),
         proof_window_blocks: None,
         program_state: None,
+        incremental_nullifier_root: None,
     }
 }
 
@@ -107,6 +108,7 @@ async fn a_v3_chain_admits_a_real_auth_proof_and_refuses_a_swapped_one() {
         verify: randprotocol_node::storage::VerifyMode::Full,
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
+        verify_workers: None,
         prune_history: None,
         gas_policy: None,
     })
