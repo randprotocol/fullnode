@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# Builds (or checks) the recursion fixture cache the node suite reads (issue #131).
+# Checks (or re-proves) the recursion fixture set the node suite reads (issue #131).
 #
-#   scripts/recursion-fixtures.sh <circuits checkout> [<cache dir>]   prove what is missing, then check
 #   scripts/recursion-fixtures.sh --check [<cache dir>]               check only
+#   scripts/recursion-fixtures.sh <circuits checkout> [<cache dir>]   prove what is missing or
+#                                                                     stale, then check
 #
-# <cache dir> defaults to $RECURSION_FIXTURES. Then run the suite against it:
-#   RECURSION_FIXTURES=<cache dir> cargo test -p randprotocol-node --lib
+# <cache dir> defaults to $RECURSION_FIXTURES, else the in-repo set
+# crates/randprotocol-node/fixtures/recursion — the same default `fixture_proof` uses, so a plain
+# `cargo test -p randprotocol-node --lib` reads the directory a plain `--check` checks.
+#
+# Exit codes: 0 the set is complete and is the pinned bytes; 1 a file is missing, the checkout
+# was refused, or a generator process failed; 2 usage; 3 the set is complete but not the pinned
+# bytes (a fresh proving run ends here: see "The pinned set").
 #
 # The set is exactly what `fixture_proof(k)` (crates/randprotocol-node/src/agg_executor.rs) is
-# called with — `$RECURSION_FIXTURES/Test-{k}.proof`, a 32-byte `hc` then the postcard proof:
+# called with — `<dir>/Test-{k}.proof`, a 32-byte `hc` then the postcard proof:
 #
 #   Test-0  every literal `fixture_proof(0)`: agg_executor::'s admission and executor tests, the
 #           covered-assembly tests in node::, the aggregation tests in rpc::, storage::seal_tests::
@@ -19,29 +25,33 @@
 #
 # A test that calls `fixture_proof` with a new k adds it to REQUIRED here, once.
 #
-# The fixtures prove circuits' inner bundle machine, so they come from a circuits checkout whose
-# zkVM (`research/`, `guests-compiled/`) is the one this repo vendors: .github/workflows/ci.yml's
-# CIRCUITS_PIN. A checkout ahead of the pin is fine when those trees match it (docs and `license`
-# lines aside); the script refuses otherwise. A cache proved by another zkVM is what issue #131
-# found: the suite panics with "cs8 proofs carry pv::NUM public values".
-#
-# Proving is circuits' `recursion/tests/fixtures.rs` generator (`#[ignore]`d), one process per k,
-# in parallel: ~8 minutes a Test proof on an M4 Max. The generator skips a fixture that is cached
-# and still verifies, and re-proves one that does not (a stale cache), so every required k is
-# handed to it; a current cache costs one verification per k.
-#
-# --check checks that every required file is present (and longer than its 32-byte hc), not that
-# it verifies: a stale cache passes that and fails the suite. Re-run with a checkout to re-prove.
-#
 # The pinned set. A fixture's notes are random, and the pinned-vectors test pins the 118-word
 # interface list and its digest (`3534960f…`) that those notes produce, so it passes on exactly
-# one set of bytes: the cache re-proved 2026-10-03 that the phase-2 re-vendor measured
-# (`~/rand-agg-512-results/out/fixtures` on the machine that ran it). A freshly proved set
-# satisfies every other fixture-backed test and fails that one at "the pinned 118-word interface
-# list" (measured 2026-10-06, #131). So --check (and the proving run's final check) also compares
-# the three files against PINNED_SHA256 and fails on a difference: copy the pinned files in, or
-# re-pin the vectors (the test's constants and circuits' recursion/docs/02-aggregate.md) together
-# with the new cache. Re-pinning moves PINNED_SHA256 with them.
+# one set of bytes: the cache re-proved 2026-10-03 that the phase-2 re-vendor measured, committed
+# as crates/randprotocol-node/fixtures/recursion (#131). A freshly proved set satisfies every
+# other fixture-backed test and fails that one at "the pinned 118-word interface list" (measured
+# 2026-10-06). So the check compares the three files against PINNED_SHA256 and exits 3 on a
+# difference. Proving is for a re-pin, when the vendored zkVM moves: prove into the in-repo
+# directory, then re-measure the test's constants and circuits' recursion/docs/02-aggregate.md on
+# the new files, and move PINNED_SHA256 with them, in one commit.
+#
+# The checkout. The fixtures are proofs by circuits' zkVM — `research/` (the prover and the inner
+# bundle machine) running the bundle guest from `guests-compiled/` — so those two trees must be
+# the ones this repo vendors: .github/workflows/ci.yml's CIRCUITS_PIN (docs and `license` lines
+# aside); the script refuses otherwise. A cache proved by another zkVM is what issue #131 found:
+# the suite panics with "cs8 proofs carry pv::NUM public values". `recursion/` may drift from the
+# pin: it is the rVM, the outer machine (vendored separately into crates/randprotocol-rvm), and
+# only hosts the generator, whose harness chooses the witness — random notes either way — and
+# writes the file; it does not change what the inner proof proves.
+#
+# Proving is circuits' `recursion/tests/fixtures.rs` generator (`#[ignore]`d), one process per k,
+# in parallel: ~4.6 min a Test proof on an M4 Max (2026-10-06, two in parallel). The generator
+# skips a fixture that is cached and still verifies, and re-proves one that does not (stale), so
+# every required k is handed to it; a current set costs one verification per k (~5 s).
+#
+# --check checks that every required file is present (longer than its 32-byte hc) and is the
+# pinned bytes; it does not run the verifier. A file from another zkVM cannot be the pinned bytes,
+# so a stale cache fails --check with exit 3.
 set -euo pipefail
 
 REQUIRED=(Test-0 Test-1 Test-2)
@@ -55,7 +65,8 @@ PINNED_SHA256=(
 usage() {
   echo "usage: $0 <circuits checkout> [<cache dir>]   (prove the missing fixtures, then check)" >&2
   echo "       $0 --check [<cache dir>]               (check only)" >&2
-  echo "<cache dir> defaults to \$RECURSION_FIXTURES" >&2
+  echo "<cache dir> defaults to \$RECURSION_FIXTURES, else crates/randprotocol-node/fixtures/recursion" >&2
+  echo "(fixture_proof's default too); exit 3 = complete but not the pinned bytes" >&2
   exit 2
 }
 
@@ -71,8 +82,8 @@ else
   usage
 fi
 [ $# -le 1 ] || usage
-cache=${1:-${RECURSION_FIXTURES:-}}
-[ -n "$cache" ] || { echo "no cache dir: pass one or set RECURSION_FIXTURES" >&2; usage; }
+repo=$(cd "$(dirname "$0")/.." && pwd)
+cache=${1:-${RECURSION_FIXTURES:-$repo/crates/randprotocol-node/fixtures/recursion}}
 
 check() {
   missing=()
@@ -98,8 +109,8 @@ check() {
   if [ ${#unpinned[@]} -ne 0 ]; then
     echo "recursion fixtures: $cache has the set, but ${unpinned[*]} are not the pinned bytes:" >&2
     echo "the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte will fail" >&2
-    echo "(the fixtures' notes are random); copy in the pinned cache or re-pin (see this script's header)" >&2
-    exit 1
+    echo "(the fixtures' notes are random); use the in-repo set, or re-pin (see this script's header)" >&2
+    exit 3
   fi
   echo "recursion fixtures: $cache holds the node suite's set, the pinned bytes"
 }
@@ -109,7 +120,6 @@ if [ "$check_only" = 1 ]; then
   exit 0
 fi
 
-repo=$(cd "$(dirname "$0")/.." && pwd)
 [ -f "$circuits/recursion/tests/fixtures.rs" ] || {
   echo "$circuits: not a circuits checkout (no recursion/tests/fixtures.rs)" >&2
   exit 1
@@ -135,15 +145,14 @@ cargo test --release --test fixtures --no-run
 pids=()
 for f in "${REQUIRED[@]}"; do
   k=${f#Test-}
-  echo "recursion fixtures: $f (proving unless cached and verifying; ~8 min a proof on an M4 Max)"
+  echo "recursion fixtures: $f (proving unless cached and verifying; ~4.6 min a proof on an M4 Max)"
   FIXTURE_PROFILE=Test FIXTURE_KS=$k RECURSION_FIXTURES=$cache \
     cargo test --release --test fixtures -- --ignored --nocapture &
   pids+=($!)
 done
 failed=0
 for p in "${pids[@]}"; do wait "$p" || failed=1; done
+# Said before the check, which may exit on its own.
+[ "$failed" = 0 ] || echo "recursion fixtures: a generator process failed (output above)" >&2
 check
-if [ "$failed" != 0 ]; then
-  echo "recursion fixtures: a generator process failed (output above)" >&2
-  exit 1
-fi
+[ "$failed" = 0 ] || exit 1
