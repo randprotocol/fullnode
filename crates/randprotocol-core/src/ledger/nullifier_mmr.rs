@@ -74,6 +74,17 @@ impl NullifierMmr {
 mod tests {
     use super::*;
 
+    /// The range's encoding pinned on 2026-10-05 (leaves `[1,0,..]`, `[2,0,..]`, `[3,0,..]`); it
+    /// must never change without a new domain.
+    #[test]
+    fn three_leaves_have_a_pinned_root() {
+        let mut m = NullifierMmr::new();
+        for n in 1..=3u32 {
+            m.append(&[n, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        assert_eq!(m.root().to_hex(), "42b5ff7f228089ac1ba898af04b324abc677f31afb120dc8347adc981466d132");
+    }
+
     fn nf(n: u32) -> Word8 { [n, n, 0, 0, 0, 0, 0, 1] }
 
     /// The root computed from scratch: the leaves split into perfect trees by the binary

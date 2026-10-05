@@ -3347,7 +3347,13 @@ mod tests {
         }
         // A bundle inserts all four nullifier slots, the two dummies included.
         assert_eq!(on.nullifier_mmr().unwrap().count(), 4);
-        assert_ne!(on.state_root(), off.state_root(), "the slot swap and the wrapper both move the root");
+        assert_ne!(on.state_root(), off.state_root(), "a flag-on root differs from the flag-off root of the same blocks");
+        // The composition, pinned: the range root in the slot, then exactly one wrapper.
+        assert_eq!(on.state_root_leaves().0, on.nullifier_mmr().unwrap().root(), "the range root takes the nullifier slot");
+        assert_eq!(on.state_root(), Hash::digest_domain(b"rand-state-nf-mmr-1", on.state_root_base().as_bytes()), "exactly one wrapper");
+        // The `rand-state-nf-mmr-1` encoding pinned on 2026-10-05; it must never change without a new domain.
+        const GOLDEN_ONE_BLOCK_ROOT: &str = "befcd5659aa22337044ed24005d7a62d3e1ed90bead112a223295f58472105b3";
+        assert_eq!(on.state_root().to_hex(), GOLDEN_ONE_BLOCK_ROOT);
         assert_eq!(off.state_root(), ledger_after_same_block_flag_off(&a), "the flag-off root is what it was");
         // Determinism: the same blocks on a fresh flag-on ledger give the same root.
         let mut again = ledger();
@@ -3357,6 +3363,16 @@ mod tests {
         again.apply_block(&signed_block(vec![t], &a, 1, root), &StubExecutor).unwrap();
         assert_eq!(again.state_root(), on.state_root());
         assert_eq!(again, on, "equality covers the range");
+    }
+
+    /// The wrapper order (spec 2026-10-05 §4.3): after `rand-state-tokens-1`, not before it.
+    #[test]
+    fn the_nullifier_wrapper_follows_the_tokens_wrapper() {
+        let mut l = ledger();
+        l.set_tokens(Some(tokens::TokenRegistry::new(1_000_000_000).with_incremental_root(true)));
+        l.set_incremental_nullifier_root(true);
+        let tokens_wrapped = Hash::digest_domain(b"rand-state-tokens-1", l.state_root_base().as_bytes());
+        assert_eq!(l.state_root(), Hash::digest_domain(b"rand-state-nf-mmr-1", tokens_wrapped.as_bytes()));
     }
 
     /// The flag-off root for the same block, computed on a fresh ledger with no reference to the
