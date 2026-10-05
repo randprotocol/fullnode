@@ -4376,6 +4376,47 @@ mod tests {
         assert_eq!(ok(&synced, "rand_getAggregate", json!([aggregate.hash().to_hex()])).await, want, "synced and live agree");
     }
 
+    /// A block's aggregates must carry their paid records (#133): `rand_getAggregate`'s
+    /// `subsidy`, `proving_share` and `n` are written only from `CommittedBlock::aggregates`, so a
+    /// block carrying an `Aggregate` it was never executed against (an empty list) would commit
+    /// with no record at all, silently. Storage refuses it by name — the height and the
+    /// aggregate's hash — and refuses a stale record (one naming no aggregate in the block) the
+    /// same way; nothing of the refused block lands, and the block with its record still commits.
+    #[tokio::test]
+    async fn a_block_whose_aggregate_has_no_paid_record_is_refused_by_name() {
+        let (_d, _live, gs, covered_tx, aggregate, blocks, l2) = gated_chain_blocks(Default::default());
+        // The two blocks commit as one batch, as a sync would — `l2` describes exactly them.
+        let (_d2, st) = state_for(&gs);
+        let good = blocks[1].clone();
+        assert_eq!(good.aggregates.len(), 1, "the fixture's block 2 carries its record");
+        let commit = |b2: randprotocol_core::consensus::CommittedBlock| {
+            st.storage.commit(&[blocks[0].clone(), b2], &l2, &[], &StubExecutor)
+        };
+
+        let missing = randprotocol_core::consensus::CommittedBlock { aggregates: Vec::new(), ..good.clone() };
+        let err = commit(missing).unwrap_err().to_string();
+        assert!(err.contains("block 2") && err.contains(&aggregate.hash().to_string()), "refused by name: {err}");
+
+        let mut stale = good.clone();
+        stale.aggregates[0].tx = covered_tx.hash();
+        let err = commit(stale).unwrap_err().to_string();
+        assert!(err.contains("block 2") && err.contains(&covered_tx.hash().to_string()), "a stale record is refused by name: {err}");
+
+        let mut doubled = good.clone();
+        doubled.aggregates.push(doubled.aggregates[0]);
+        let err = commit(doubled).unwrap_err().to_string();
+        assert!(err.contains("block 2"), "a duplicated record is refused: {err}");
+
+        assert_eq!(st.storage.head().unwrap().height, 0, "nothing of a refused batch lands");
+        assert_eq!(st.storage.aggregate_payment(&aggregate.hash()).unwrap(), None);
+        commit(good).unwrap();
+        assert_eq!(
+            st.storage.aggregate_payment(&aggregate.hash()).unwrap(),
+            Some((100 * randprotocol_core::UNITS_PER_RAND, 60, 0)),
+            "the block with its record commits as before"
+        );
+    }
+
     /// The aggregation surface (spec §8): the block's `sealed` flag and the per-bundle
     /// `sealed_by`, `rand_getAggregate`'s public fields, the register, the work list, and the
     /// status section — all against a committed aggregate.

@@ -2757,6 +2757,39 @@ impl Storage {
             // them at (IFACE-7). Never recomputed here: a recomputation read each cover back from
             // the database, which misses one committed earlier in this same batch, and read `n`
             // off the batch's last ledger. So `subsidy + proving_share` is the payout note.
+            // The record has no fallback, so its absence is refused rather than committed (#133):
+            // a block carrying an `Aggregate` it was never executed against (an empty
+            // `cb.aggregates`) would otherwise land with no `a` row, and `rand_getAggregate` would
+            // answer for a sealed block without `subsidy`, `proving_share` or `n` — silently. Each
+            // aggregate in the block must have exactly one record and each record must name an
+            // aggregate in the block, which together make the counts equal and refuse a stale or
+            // duplicated record as well as a missing one. Every production path fills the list —
+            // the consensus commit from `ledger_after` (`hotstuff.rs`), the syncer from
+            // `take_paid_aggregates` (`node.rs`) — so this fires only on a block assembled without
+            // the ledger that applied it. `docs/rpc.md`'s `rand_getAggregate` entry says so too.
+            let aggregate_txs: Vec<Hash> = block
+                .transactions
+                .iter()
+                .filter(|tx| matches!(tx.action, Action::Aggregate { .. }))
+                .map(|tx| tx.hash())
+                .collect();
+            if let Some(paid) = cb.aggregates.iter().find(|p| !aggregate_txs.contains(&p.tx)) {
+                return Err(StorageError::Corrupt(format!(
+                    "block {} has a paid-aggregate record for {}, which is no aggregate in the block",
+                    block.height(),
+                    paid.tx
+                )));
+            }
+            for tx in &aggregate_txs {
+                let records = cb.aggregates.iter().filter(|p| p.tx == *tx).count();
+                if records != 1 {
+                    return Err(StorageError::Corrupt(format!(
+                        "block {} carries aggregate {tx} with {records} paid-aggregate records, not 1; \
+                         the block was not committed with the ledger that applied it",
+                        block.height()
+                    )));
+                }
+            }
             for paid in &cb.aggregates {
                 batch.put_cf(
                     self.cf(CF_SEALS),
@@ -4769,7 +4802,7 @@ pub(crate) mod fixtures {
         ledger.set_timestamp_ms(height);
         ledger.apply_transactions(&txs, &k.address(), &StubExecutor).unwrap();
         ledger.record_anchor(height);
-        make_block_unchecked(parent, ledger, txs, k)
+        signed_block(parent, ledger, txs, k, height)
     }
 
     /// Which of `keys` leads `view` in `set`. A block proposed by anyone else is rejected as
@@ -4809,10 +4842,30 @@ pub(crate) mod fixtures {
         ledger.set_timestamp_ms(timestamp_ms);
         ledger.apply_transactions(&txs, &k.address(), &StubExecutor).unwrap();
         ledger.record_anchor(height);
-        make_block_unchecked_at(parent, ledger, txs, k, timestamp_ms)
+        signed_block(parent, ledger, txs, k, timestamp_ms)
     }
 
+    /// `make_block_unchecked`, stamped `timestamp_ms`. The ledger's own aggregate records, plus a
+    /// zero placeholder for every aggregate it did not pay: a block stored *unchecked* (the
+    /// seal-row tests write an aggregate the ledger never applied) must still carry one record
+    /// per aggregate, or `commit` refuses it (#133). Only the unchecked builders add them — an
+    /// executed block (`make_block`, `make_block_at`) carries the ledger's list as-is, so a
+    /// ledger that stopped recording a payment is refused in a fixture exactly as in production.
     pub(crate) fn make_block_unchecked_at(parent: &impl FixtureParent, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair, timestamp_ms: u64) -> CommittedBlock {
+        let mut cb = signed_block(parent, ledger, txs, k, timestamp_ms);
+        for tx in cb.block.transactions.iter().filter(|tx| matches!(tx.action, Action::Aggregate { .. })) {
+            let tx = tx.hash();
+            if !cb.aggregates.iter().any(|p| p.tx == tx) {
+                let payment = randprotocol_core::ledger::aggregation::Payment { subsidy: 0, proving_shares: 0, total: 0, note: [0; 8] };
+                cb.aggregates.push(randprotocol_core::ledger::aggregation::PaidAggregate { tx, n: 0, payment });
+            }
+        }
+        cb
+    }
+
+    /// The block over `txs`, signed by `k`, carrying exactly what `ledger` recorded for it — its
+    /// deposits and its paid aggregates — with nothing added.
+    fn signed_block(parent: &impl FixtureParent, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair, timestamp_ms: u64) -> CommittedBlock {
         let justify = parent.parent_qc();
         let parent = parent.parent_block();
         let height = parent.height() + 1;
@@ -8733,13 +8786,9 @@ mod seal_tests {
             .unwrap();
         assert!(storage.sealed_by(&covered.hash()).unwrap().is_some(), "the aggregate's commit sealed it");
         assert!(storage.block_sealed(&b1.block.hash()).unwrap(), "and flagged its block");
-        // The payment facts `commit` writes off the ledger's own count (this aggregate is stored
-        // unchecked, so the ledger paid nothing), written by hand so their removal shows.
-        storage
-            .db
-            .put_cf(storage.cf(CF_SEALS), [b"a".as_slice(), aggregate.hash().as_bytes()].concat(), bincode::serialize(&(5u64, 0u64, 0u64)).unwrap())
-            .unwrap();
-        assert!(storage.aggregate_payment(&aggregate.hash()).unwrap().is_some());
+        // The payment facts: the aggregate is stored unchecked, so its record is the fixture's
+        // zero placeholder (`make_block_unchecked_at`) — present, which is what lets its removal show.
+        assert!(storage.aggregate_payment(&aggregate.hash()).unwrap().is_some(), "commit wrote the aggregate's record");
         assert!(storage.block_sealed(&b4.block.hash()).unwrap(), "the later block is flagged too");
         // The corruption: neither the aggregate's block nor the later one decodes any more.
         for h in [3u64, 4] {
