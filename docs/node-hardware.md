@@ -358,8 +358,8 @@ is what §3.6 bounds; `propose_ms` is the leader's whole `propose` call, which i
 apply and a state root; `root_ms` is one `state_root`; `clone_ms` is one ledger clone. The host is
 an Apple M4 Max, 16 cores, 48 GB (`sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize`).
 
-Baseline, unmodified code, 100 blocks (`/tmp/bench-baseline-100.txt`). The 300-block baseline was
-killed at 20 minutes with only the height-50 row printed (propose 12.7 s, apply 133.7 ms).
+Baseline, unmodified code, 100 blocks (`/tmp/bench-baseline-100.txt`). The 300-block baseline run
+was killed after 20 minutes without a usable row, so the 100-block table is the baseline.
 
 ```
  height  propose_ms  apply_ms  root_ms  clone_ms  nullifiers   rss_mb  peak_rss_mb
@@ -447,7 +447,8 @@ exit 0
 ```
 
 Which change moved which column. The shared set took `clone_ms` from 1.21 ms at 160 000
-nullifiers and 6.37 ms at 800 000, growing with the set, to a flat 0.25 to 0.29 ms, and with the
+nullifiers and 6.37 ms at 800 000, growing with the set, to a flat 0.39 to 0.48 ms (0.25 to 0.29 ms
+with the incremental root on), and with the
 proposer change took `propose_ms` from 4 276 ms at height 20 and 27 077 ms at height 100 to
 275.4 ms at height 50 and 1 026.4 ms at height 300. What it left was the sorted-order nullifier
 root: `root_ms` 73.90 ms at height 50 and 441.53 ms at height 300, and `apply_ms` 129.5 to 495.0 ms

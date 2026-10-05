@@ -147,8 +147,8 @@ the set grows by 4 000 a second and passes 10⁶ in four minutes.
 Replace it with an **append-only Merkle Mountain Range in insertion order**: `O(log n)` per
 insert, a root that commits to every nullifier ever published, and no sort. Membership (the
 double-spend check) stays in the `BTreeSet` and RocksDB as now; the accumulator is only the
-state-root commitment. The domain becomes `rand-state-6` with the MMR root in the nullifier
-root's slot. The same construction serves `validators_root` and `programs_root` if they ever
+state-root commitment. The composite is re-domained `rand-state-nf-mmr-1` (as shipped) with the MMR root in the
+nullifier root's slot. The same construction serves `validators_root` and `programs_root` if they ever
 grow, but they do not at this scale.
 
 ### 3.2 Copy-on-write speculative state
