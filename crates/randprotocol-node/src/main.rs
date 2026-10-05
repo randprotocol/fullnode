@@ -855,6 +855,33 @@ enum Cmd {
         #[arg(long)]
         no_wait: bool,
     },
+    /// Benchmarks of the node's own paths; no network, no database.
+    Bench {
+        #[command(subcommand)]
+        cmd: BenchCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BenchCmd {
+    /// The validator hot path at synthetic load: one validator on the StubExecutor, `--bundles`
+    /// bundles a block (four nullifier and four commitment slots each: two real, two dummy) for `--blocks` blocks through the
+    /// real HotStuff propose/apply/commit path. Prints one timing row every `--report-every`
+    /// blocks and exits non-zero if the last block's apply time is over `--fail-over-ms`
+    /// (`docs/compute-optimization.md` §3.6).
+    Apply {
+        #[arg(long, default_value_t = randprotocol_core::gas::MAX_BLOCK_TXS)]
+        bundles: usize,
+        #[arg(long, default_value_t = 10_000)]
+        blocks: u64,
+        #[arg(long, default_value_t = 500)]
+        report_every: u64,
+        /// Cut the harness genesis with `incremental_nullifier_root: true`.
+        #[arg(long)]
+        incremental_nullifier_root: bool,
+        #[arg(long, default_value_t = 300)]
+        fail_over_ms: u64,
+    },
 }
 
 /// `rand-node db …`: offline maintenance, run with the node stopped (RocksDB's lock refuses a
@@ -1544,6 +1571,12 @@ async fn main() -> Result<()> {
         }
     }
     match cli.cmd {
+        Cmd::Bench { cmd: BenchCmd::Apply { bundles, blocks, report_every, incremental_nullifier_root, fail_over_ms } } => {
+            let v = randprotocol_node::bench::run(&randprotocol_node::bench::BenchArgs { bundles, blocks, report_every, incremental_nullifier_root, fail_over_ms })?;
+            if !v.passed {
+                std::process::exit(2);
+            }
+        }
         Cmd::Keygen { out } => {
             let kp = Keypair::generate();
             // Never over an existing file (VK-7): the key at `out` may be the only copy of a seed.
