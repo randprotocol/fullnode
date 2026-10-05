@@ -305,7 +305,6 @@ impl HotStuff {
         // restart and the second new block is refused with `time N is outside [0, 0]`.
         let head_hash = head.hash();
         let head_height = head.height();
-        let mut head_ledger = head_ledger;
         head_ledger.set_height(head_height);
         head_ledger.set_timestamp_ms(head.header.timestamp_ms);
         let mut tree = HashMap::new();
