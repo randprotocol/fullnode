@@ -517,8 +517,11 @@ pub(crate) fn fixture_proof(k: usize) -> randprotocol_zkvm::machine::Proof {
     let path = dir.join(format!("Test-{k}.proof"));
     let bytes = std::fs::read(&path).unwrap_or_else(|e| {
         panic!(
-            "{}: {e} — the aggregation tests need a recursion fixture cache; \
-             set RECURSION_FIXTURES (docs/aggregation.md)",
+            "{}: {e} — the aggregation tests need a recursion fixture cache holding \
+             Test-0, Test-1 and Test-2 at CIRCUITS_PIN (the pinned-vectors test: the pinned \
+             cache's bytes); build or check one with \
+             scripts/recursion-fixtures.sh <circuits checkout> <dir>, then set \
+             RECURSION_FIXTURES=<dir> (docs/aggregation.md)",
             path.display()
         )
     });

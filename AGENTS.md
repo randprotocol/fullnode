@@ -45,7 +45,11 @@ node lib 489 passed, 1 failed (the known pre-existing
 `the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte`). **Trap:** the node's
 aggregation RPC tests need `RECURSION_FIXTURES` at a current cache
 (`~/rand-worktrees/circuits-phase2/recursion/target/recursion-fixtures`); the
-`~/Github/randprotocol/circuits` cache is stale ("public values are not pv::NUM words").
+`~/Github/randprotocol/circuits` cache is stale ("public values are not pv::NUM words"). The set
+the suite reads is `Test-0..2`; `scripts/recursion-fixtures.sh <circuits checkout> <dir>` proves
+it at `CIRCUITS_PIN` and `--check <dir>` checks it, including that the files are the pinned
+cache's bytes the pinned-vectors test needs (#131, `docs/aggregation.md` "Testing: the recursion
+fixture cache").
 
 ### rVM phase 2 re-vendored (2026-10-04; branch `feat/rvm-phase2-vendor`)
 

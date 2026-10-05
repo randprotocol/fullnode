@@ -236,6 +236,45 @@ both have to clear before a genesis may switch it on.
    `admitted_shapes[].aggregate_program_digest` is `c90b3f0a…74d8` and the node admits tiers
    {20, 21, 22} (`recursion/docs/04-phase2-row-cuts.md`, `docs/node-hardware.md` §4).
 
+### Testing: the recursion fixture cache (issue #131)
+
+The node's fixture-backed tests (the list is `scripts/ci-fixture-skips.sh`'s: `agg_executor::`,
+the covered-assembly tests in `node::`, the aggregation tests in `rpc::`, `storage::seal_tests::`)
+read real bundle proofs through `fixture_proof(k)`, `$RECURSION_FIXTURES/Test-{k}.proof`
+(default `crates/randprotocol-node/target/recursion-fixtures`). The set is exactly **`Test-0`,
+`Test-1`, `Test-2`**, at the pinned bytes (below): every literal caller uses `k = 0`, and
+`the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte` reads `Test-1` and `Test-2`.
+A missing file is a panic, not a skip, by design. One command builds or checks the set:
+
+```sh
+scripts/recursion-fixtures.sh <circuits checkout> <cache dir>   # prove what is missing, then check
+scripts/recursion-fixtures.sh --check <cache dir>               # check only
+RECURSION_FIXTURES=<cache dir> cargo test -p randprotocol-node --lib
+```
+
+The fixtures prove circuits' inner bundle machine, so the checkout's zkVM (`research/`,
+`guests-compiled/`) must be the vendored one, `CIRCUITS_PIN` in `.github/workflows/ci.yml`; the
+script refuses a checkout whose trees differ from it. A cache from another constraint set fails
+the suite with "cs8 proofs carry pv::NUM public values" (the pre-cs8 cache under
+`circuits/recursion/target/recursion-fixtures` does). The script runs circuits'
+`recursion/tests/fixtures.rs` generator once per k in parallel (`FIXTURE_PROFILE=Test
+FIXTURE_KS=k`), which skips a cached fixture that still verifies and re-proves one that does not.
+**Measured (2026-10-06, M4 Max, circuits at the pin's zkVM):** `Test-1` and `Test-2` proved in
+parallel in 4 min 36 s wall, one process each, so ~4.6 min a proof (issue #131 had estimated
+~8 min).
+
+**A freshly proved set does not pass the whole suite.** A fixture's notes are random, and the
+pinned-vectors test pins the 118-word interface list and digest (`3534960f…`) that one set of
+notes produces: the cache re-proved 2026-10-03 for the phase-2 re-vendor
+(`~/rand-agg-512-results/out/fixtures` on the machine that measured it). Against that cache the
+suite passes whole (2026-10-06: `491 passed; 0 failed; 1 ignored`); against the set freshly proved
+the same day every other fixture-backed test passes and the pinned-vectors test fails at "the
+pinned 118-word interface list" (`490 passed; 1 failed`; its `inner_vk_digest` assertion, the
+data-independent half, passes). So the script's check also compares the three files with the
+pinned cache's sha256 (`PINNED_SHA256`) and fails on a difference, naming that test. Two ways
+out: copy the pinned cache's `Test-0..2` in, or re-pin — the test's constants and circuits'
+`recursion/docs/02-aggregate.md` re-measured on the new cache, and `PINNED_SHA256` with them.
+
 ## 4. Fallback
 
 A block whose bundles no aggregate ever covers stays valid: its raw bundle proofs are kept and
