@@ -25,8 +25,10 @@ at inclusion on an aggregating one (excess bucketed as before). Ruling: **only t
 — a Call's gas/byte terms and a Deploy's per-word term stay the proposer's; the full-floor burn is
 a named follow-up. Withdraw/claim bases are untouched (register-side). **`subsidy_net_of_fees`**
 (needs `aggregation`, else `GenesisError::SubsidyNetOfFeesWithoutAggregation`): one function,
-`aggregation::minted_subsidy`, used by `aggregate_payment` and by the node's sealed-aggregate
-record — mint `schedule − shares` (0 once shares cover it), note `max(schedule, shares)`;
+`aggregation::minted_subsidy`, used by `aggregate_payment` and by the aggregate daemon
+(`aggregate_pass` reads `rand_getLimits.fee_rules`; final-review fix) — the sealed-aggregate
+record stores the ledger's own `PaidAggregate` (`Ledger::paid_aggregates`, drained on
+`CommittedBlock::aggregates` like `deposits`), never a recomputation — mint `schedule − shares` (0 once shares cover it), note `max(schedule, shares)`;
 `subsidised` and `rand_getAggregate.subsidy` carry the minted part; `sealed_blocks` still +1;
 `rand_getEmission.subsidy.current` is the schedule, a ceiling on the mint under the flag. Ruling:
 **dollar-indexed prover pay is out of scope** (no oracle). **Storage:** `META_FEES = "fees"` is

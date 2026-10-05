@@ -160,7 +160,10 @@ first and mint only the shortfall — and a genesis `fees` section switches each
 
 Both flags are optional booleans and **off by default**, following `tokens.burn_registration_fee`
 (audit v5 TOK-2) exactly: absent, or present with no `true` flag, the chain is byte for byte what
-it was — the genesis hash, the state root, every stored value and every RPC value. A `true` flag
+it was — the genesis hash, the state root, every RPC value and every stored value but two: a
+database created by a build that knows the section writes `META_FEES` (`{}`) and
+`META_BASE_FEES_BURNED` (0) at genesis whether or not the file has one, and an older database
+without them opens unchanged, reading both as their defaults. A `true` flag
 is committed to the genesis hash right after the `tokens` section's bytes: `b"fees"`, then
 `b"burn_base"` ‖ `1` if `burn_base`, then `b"subsidy_net_of_fees"` ‖ `1` if
 `subsidy_net_of_fees`, in that order, and nothing at all when neither is `true` (pinned by

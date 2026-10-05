@@ -4212,6 +4212,16 @@ mod tests {
     fn gated_chain_with(
         fees: randprotocol_core::ledger::fees::FeesConfig,
     ) -> (tempfile::TempDir, RpcState, GenesisState, Transaction, Transaction) {
+        let (dir, st, gs, covered_tx, aggregate, _, _) = gated_chain_blocks(fees);
+        (dir, st, gs, covered_tx, aggregate)
+    }
+
+    /// [`gated_chain_with`], also handing back its two blocks and the ledger after the second,
+    /// for a test that commits them again elsewhere.
+    #[allow(clippy::type_complexity)]
+    fn gated_chain_blocks(
+        fees: randprotocol_core::ledger::fees::FeesConfig,
+    ) -> (tempfile::TempDir, RpcState, GenesisState, Transaction, Transaction, Vec<randprotocol_core::consensus::CommittedBlock>, randprotocol_core::ledger::Ledger) {
         use randprotocol_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
         use randprotocol_core::types::actions::{aggregate_signing_hash, aggregator_register_message, AggregatorRegistration};
         use randprotocol_core::types::{CoveredBundle, DeclaredShape, FriProfile};
@@ -4313,7 +4323,7 @@ mod tests {
         l2.record_anchor(2);
         let b2 = make_block_unchecked(&b1, &l2, vec![aggregate.clone()], &key(1));
         st.storage.commit(std::slice::from_ref(&b2), &l2, &[], &StubExecutor).unwrap();
-        (dir, st, gs, covered_tx, aggregate)
+        (dir, st, gs, covered_tx, aggregate, vec![b1, b2], l2)
     }
 
     fn chain() -> (tempfile::TempDir, RpcState, GenesisState) {
@@ -4341,6 +4351,29 @@ mod tests {
         // `subsidised` has counted.
         let supply = ok(&st, "rand_getSupply", json!([])).await;
         assert_eq!(supply["subsidised"], v["subsidy"], "rand_getSupply.subsidised is the minted part too");
+    }
+
+    /// The sealed-aggregate record follows the ledger's payment, not a recomputation from the
+    /// database: a sync commits a prefix of several blocks in one write batch, and a cover
+    /// committed earlier in that batch is not yet readable — the recomputation then counted its
+    /// share as 0 and, under `subsidy_net_of_fees`, stored the full schedule as the subsidy, so
+    /// a synced node and a live one disagreed. Here the bundle (block 1) and the aggregate
+    /// covering it (block 2) land in one commit on a fresh database, and the record matches the
+    /// one committed block by block.
+    #[tokio::test]
+    async fn the_aggregate_record_is_the_ledgers_payment_when_cover_and_aggregate_commit_together() {
+        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true) };
+        let (_d, live, gs, _covered_tx, aggregate, blocks, l2) = gated_chain_blocks(fees);
+        let (_d2, synced) = state_for(&gs);
+        synced.storage.commit(&blocks, &l2, &[], &StubExecutor).unwrap();
+        let schedule = 100 * randprotocol_core::UNITS_PER_RAND;
+        assert_eq!(
+            synced.storage.aggregate_payment(&aggregate.hash()).unwrap(),
+            Some((schedule - 60, 60, 0)),
+            "the share of a cover in the same batch, and only the shortfall minted"
+        );
+        let want = ok(&live, "rand_getAggregate", json!([aggregate.hash().to_hex()])).await;
+        assert_eq!(ok(&synced, "rand_getAggregate", json!([aggregate.hash().to_hex()])).await, want, "synced and live agree");
     }
 
     /// The aggregation surface (spec §8): the block's `sealed` flag and the per-bundle

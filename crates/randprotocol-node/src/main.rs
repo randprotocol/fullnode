@@ -2486,7 +2486,10 @@ fn prove_aggregate(profile: FriProfile, raw_proofs: &[Vec<u8>], binding: &[u32; 
 /// `TIME_WINDOW` (256 blocks, ~6 min) of the head *at submission*, and its subsidy is the
 /// schedule at the `sealed_blocks` of that moment — so both are read after the prove,
 /// immediately before the transaction is built; read before it (as they were), every aggregate
-/// arrived with a `time` long out of window. The nonce is the one thing the proof binds (audit
+/// arrived with a `time` long out of window. Under the genesis `fees.subsidy_net_of_fees` the
+/// subsidy is netted against the shares by the ledger's own rule (`minted_subsidy`, the flag read
+/// off `rand_getLimits.fee_rules`), or the note is sealed at an amount the ledger never pays.
+/// The nonce is the one thing the proof binds (audit
 /// v3, AGG-2), so it is read before; it is read again after, and a pass whose nonce moved
 /// meanwhile (another of this key's aggregates, or its unbond, committed) is abandoned rather
 /// than submitted to certain refusal. The shares are each cover's bucketed excess, fixed at the
@@ -2548,15 +2551,28 @@ async fn aggregate_pass(
     }
     let status = rpc.call("rand_status", serde_json::json!([])).await?;
     let agg = &status["aggregation"];
+    // The chain's fee rules (`rand_getLimits.fee_rules`, `docs/fees.md` §1.3): under
+    // `subsidy_net_of_fees` the ledger pays `max(schedule, shares)`, not their sum, and derives
+    // the note from that — a note sealed at the sum is admitted and applied all the same, but
+    // its envelope opens to a commitment that matches no leaf and the wallet drops it. `null`
+    // (no flag true, or a node that predates the section) is the default rules.
+    let limits = rpc.call("rand_getLimits", serde_json::json!([])).await?;
+    let fees = randprotocol_core::ledger::FeesConfig {
+        burn_base: limits["fee_rules"]["burn_base"].as_bool(),
+        subsidy_net_of_fees: limits["fee_rules"]["subsidy_net_of_fees"].as_bool(),
+    };
     // `subsidy_base` is a decimal string since node N-3 (2026-09-20); `amount_field` reads
     // either encoding, so this daemon works against an older node too.
     let subsidy_base = randprotocol_client::amount_field(&agg["subsidy_base"]).unwrap_or(0);
     let halving = agg["halving_blocks"].as_u64().unwrap_or(1).max(1);
     let n = agg["sealed_blocks"].as_u64().unwrap_or(0);
     let height = status["height"].as_u64().context("the node's status has no height")?;
-    // The payment note: the subsidy at the schedule's current index plus the proving shares,
-    // sealed to the register's payout address (spec §5.4).
-    let subsidy = subsidy_base.checked_shr((n / halving) as u32).unwrap_or(0);
+    // The payment note: the subsidy at the schedule's current index — the part the ledger
+    // mints, by its own rule (`minted_subsidy`: the schedule, or under `subsidy_net_of_fees` its
+    // shortfall over the shares) — plus the proving shares, sealed to the register's payout
+    // address (spec §5.4).
+    let schedule = subsidy_base.checked_shr((n / halving) as u32).unwrap_or(0);
+    let subsidy = randprotocol_core::ledger::aggregation::minted_subsidy(schedule, shares, &fees);
     let time = height as u32 + 1;
     let (note, envelope) = sealed_withdraw_note(&payout, subsidy.saturating_add(shares), time, rpc.envelope_format(chain_id).await?)?;
     let signature = kp.sign(
@@ -3703,6 +3719,10 @@ mod tests {
         height: std::cell::Cell<u64>,
         sealed_blocks: std::cell::Cell<u64>,
         nonce: std::cell::Cell<u64>,
+        /// The covered bundle's bucketed excess, as `rand_getUnsealed` serves it.
+        excess: std::cell::Cell<u64>,
+        /// `rand_getLimits.fee_rules`: `null` (no fee rule on) unless a test sets it.
+        fee_rules: serde_json::Value,
         me: randprotocol_core::Address,
         payout: ShieldedAddress,
         raw: randprotocol_core::Transaction,
@@ -3723,10 +3743,11 @@ mod tests {
                     },
                 }),
                 "rand_getUnsealed" => json!({
-                    "bundles": [{ "hash": self.raw.hash().to_hex(), "height": 1, "excess": "25" }],
+                    "bundles": [{ "hash": self.raw.hash().to_hex(), "height": 1, "excess": self.excess.get().to_string() }],
                     "next_from": null,
                 }),
                 "rand_getRawTransaction" => json!(hex::encode(bincode::serialize(&self.raw).unwrap())),
+                "rand_getLimits" => json!({ "fee_rules": self.fee_rules.clone() }),
                 "rand_getAggregators" => json!([{
                     "address": self.me.to_base58(),
                     "nonce": self.nonce.get(),
@@ -3767,6 +3788,8 @@ mod tests {
             height: std::cell::Cell::new(100),
             sealed_blocks: std::cell::Cell::new(0),
             nonce: std::cell::Cell::new(0),
+            excess: std::cell::Cell::new(25),
+            fee_rules: serde_json::Value::Null,
             me,
             payout,
             raw: randprotocol_core::Transaction::shielded(7, bundle, randprotocol_core::Action::None),
@@ -3817,6 +3840,60 @@ mod tests {
             .open_as_receiver(cm, &payee.viewing_key())
             .expect("the payout note opens at the post-prove amount and time");
         assert_eq!(opened.amount, amount);
+    }
+
+    /// Fee feedback, `fees.subsidy_net_of_fees` (`docs/fees.md` §1.3): the ledger pays
+    /// `max(schedule, shares)` and derives the payout note from that, never from the envelope —
+    /// so a pass that sealed `schedule + shares` (as it did) had its aggregate admitted and
+    /// applied, and its envelope opened to a note matching no leaf: the payout was lost to the
+    /// wallet. The pass reads the rule off `rand_getLimits.fee_rules` and seals the ledger's own
+    /// payout: checked here against `Ledger::derived_commitment` — the commitment admission and
+    /// apply derive — on a ledger in the same state, for shares below, at and above the
+    /// 1000-unit schedule.
+    #[tokio::test]
+    async fn the_aggregate_pass_seals_the_ledgers_payout_under_subsidy_net_of_fees() {
+        use randprotocol_core::ledger::aggregation::{AggregationConfig, AggregatorEntry};
+        use randprotocol_core::ledger::{FeesConfig, Ledger};
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payee = SpendKey([7; 8]);
+        let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
+        let ex = ZkExecutor::new(FriProfile::Test);
+        for (shares, paid) in [(25u64, 1000u64), (999, 1000), (1000, 1000), (1500, 1500)] {
+            let mut node = moving_node(kp.address(), payout.clone());
+            node.excess.set(shares);
+            node.fee_rules = serde_json::json!({ "burn_base": false, "subsidy_net_of_fees": true });
+            let tx = aggregate_pass(&node, &kp, 7, |_, _, _| Ok(b"the aggregate proof".to_vec()))
+                .await
+                .unwrap()
+                .expect("one bundle to cover");
+
+            // The ledger in the node's state: the schedule at n = 0, the register row, the bucket.
+            let mut l = Ledger::new(7, [0; 8], Default::default(), &ex);
+            l.set_aggregation(Some(AggregationConfig {
+                bond: 100,
+                max_covers: 3,
+                subsidy_base: 1000,
+                halving_blocks: 1,
+                window: 256,
+                admitted_shapes: vec![],
+            }));
+            l.set_fees(FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true) });
+            l.set_aggregators(
+                [(
+                    kp.address(),
+                    AggregatorEntry { public_key: kp.public_key().clone(), bond: 100, payout: payout.clone(), nonce: 0, unbonding: None },
+                )]
+                .into(),
+            );
+            l.set_unsealed_fees([(node.raw.hash(), (shares, kp.address(), u64::MAX))].into());
+            let cm = l.derived_commitment(&tx.action, &ex).expect("the ledger derives the payout note");
+
+            let randprotocol_core::Action::Aggregate { envelope, .. } = &tx.action else { panic!("not an aggregate: {tx:?}") };
+            let (_, opened) = randprotocol_zkvm::address::envelope_from_core(envelope)
+                .open_as_receiver(cm, &payee.viewing_key())
+                .unwrap_or_else(|| panic!("shares {shares}: the envelope opens to the ledger's note"));
+            assert_eq!(opened.amount, paid, "shares {shares}: max(schedule, shares)");
+        }
     }
 
     /// And a pass whose nonce moved while proving is abandoned: the proof is bound to the old

@@ -2622,6 +2622,23 @@ mod tests {
         }
     }
 
+    /// And its *position*: `fees_commit`'s bytes sit after the `tokens` bytes and before the
+    /// `aggregation` bytes in the genesis commitment. The byte pin above cannot see a reorder —
+    /// moving the `fees` block anywhere else in `build` keeps its bytes and makes a new chain —
+    /// so this pins the hash of a genesis carrying all three sections (and the `bridge` the
+    /// `tokens` section needs). A move of this hex is consensus-breaking: regenerate it only
+    /// together with a deliberate change of the commitment's layout.
+    #[test]
+    fn the_fees_section_sits_between_tokens_and_aggregation_in_the_genesis_hash() {
+        use crate::ledger::fees::FeesConfig;
+        let mut g = aggregating_genesis();
+        g.bridge = Some(bridge_cfg());
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None, incremental_root: None });
+        g.alloc = opened_alloc();
+        g.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true) });
+        assert_eq!(build(&g).hash().to_hex(), "de93090f45fefa36f131e934849bf188aea7782ed47c07e77f653d32354ebc06");
+    }
+
     /// Fee feedback: the fee-first subsidy nets the aggregation subsidy, so a chain without an
     /// `aggregation` section cannot ask for it; `burn_base` needs nothing.
     #[test]

@@ -1897,7 +1897,7 @@ impl Storage {
         }
         // `deposits` stays empty: this is how a block is served to a peer, and the peer
         // recomputes them by applying the block itself.
-        Ok(Some(CommittedBlock { block, pruned: Vec::new(), qc, receipts, deposits: Vec::new() }))
+        Ok(Some(CommittedBlock { block, pruned: Vec::new(), qc, receipts, deposits: Vec::new(), aggregates: Vec::new() }))
     }
 
     pub fn height_by_hash(&self, h: &Hash) -> Result<Option<u64>> {
@@ -2737,11 +2737,7 @@ impl Storage {
                 }
             }
             // The sealing marks land in the same batch (spec §6.1): atomically with the block
-            // that carries the aggregate — their per-block flags refresh after it lands. The
-            // aggregate's payment facts land too (spec §5.4): the schedule index is the
-            // post-block counter less the one this aggregate minted (at most one per block,
-            // spec §3.4), and the proving share is the covered bundles' excess over the floor,
-            // read off their own public fee fields.
+            // that carries the aggregate — their per-block flags refresh after it lands.
             for tx in &block.transactions {
                 if let randprotocol_core::types::Action::Aggregate { covers, .. } = &tx.action {
                     for cover in covers {
@@ -2752,32 +2748,21 @@ impl Storage {
                         );
                         batch.put_cf(self.cf(CF_SEALS), seal_height_key(block.height(), cover), []);
                     }
-                    if let Some(cfg) = ledger_after.aggregation() {
-                        let n = ledger_after.supply().sealed_blocks.saturating_sub(1);
-                        // Each cover at the excess the ledger bucketed it at — net of a burned
-                        // registration fee (IFACE-7), not `fee − BUNDLE_BASE` — so
-                        // `rand_getAggregate`'s `proving_share` is what the payout note paid.
-                        let mut shares = 0u64;
-                        for cover in covers {
-                            if let Some(covered_tx) = self.tx_by_hash(cover)? {
-                                shares = shares.saturating_add(ledger_after.bucketed_excess(&covered_tx));
-                            }
-                        }
-                        // What the aggregate minted, by the ledger's own rule: the schedule, or
-                        // under `fees.subsidy_net_of_fees` its shortfall over the shares
-                        // (`docs/fees.md` §1.3) — so `subsidy + proving_share` stays the note.
-                        let subsidy = randprotocol_core::ledger::aggregation::minted_subsidy(
-                            randprotocol_core::gas::subsidy(n, cfg),
-                            shares,
-                            ledger_after.fees(),
-                        );
-                        batch.put_cf(
-                            self.cf(CF_SEALS),
-                            [b"a".as_slice(), tx.hash().as_bytes()].concat(),
-                            bincode::serialize(&(subsidy, shares, n))?,
-                        );
-                    }
                 }
+            }
+            // The aggregates' payment facts (spec §5.4), as the ledger paid them while applying
+            // this very block (`cb.aggregates`, `Ledger::paid_aggregates`): the schedule index,
+            // the minted subsidy — under `fees.subsidy_net_of_fees` the shortfall only
+            // (`docs/fees.md` §1.3) — and the covered shares at the excess the ledger bucketed
+            // them at (IFACE-7). Never recomputed here: a recomputation read each cover back from
+            // the database, which misses one committed earlier in this same batch, and read `n`
+            // off the batch's last ledger. So `subsidy + proving_share` is the payout note.
+            for paid in &cb.aggregates {
+                batch.put_cf(
+                    self.cf(CF_SEALS),
+                    [b"a".as_slice(), paid.tx.as_bytes()].concat(),
+                    bincode::serialize(&(paid.payment.subsidy, paid.payment.proving_shares, paid.n))?,
+                );
             }
             for tx in &block.transactions {
                 for nf in tx.nullifiers() {
@@ -4843,7 +4828,7 @@ pub(crate) mod fixtures {
         };
         let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, txs, k);
         let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![] };
-        CommittedBlock { block, pruned: Vec::new(), qc, receipts: Vec::new(), deposits: ledger.deposits().to_vec() }
+        CommittedBlock { block, pruned: Vec::new(), qc, receipts: Vec::new(), deposits: ledger.deposits().to_vec(), aggregates: ledger.paid_aggregates().to_vec() }
     }
 
     /// `n` blocks, each carrying one bundle that spends a fresh pair of nullifiers.
@@ -5750,7 +5735,7 @@ mod tests {
             ledger.close_block(height, &key(1).address(), 0, 0);
             make_block_unchecked_at(parent, ledger, txs, &key(1), at_ms)
         };
-        let genesis_block = CommittedBlock { block: gs.block.clone(), pruned: Vec::new(), qc: QuorumCertificate::genesis(gs.block.hash()), receipts: Vec::new(), deposits: Vec::new() };
+        let genesis_block = CommittedBlock { block: gs.block.clone(), pruned: Vec::new(), qc: QuorumCertificate::genesis(gs.block.hash()), receipts: Vec::new(), deposits: Vec::new(), aggregates: Vec::new() };
         // Block 1 at 50 s (a bridged chain steps at most 60 s a block): the rotation lands,
         // pending until 150 s.
         let m = randprotocol_core::bridge::gov::rotate_pq_message(ledger.chain_id(), 0, &new_pks);

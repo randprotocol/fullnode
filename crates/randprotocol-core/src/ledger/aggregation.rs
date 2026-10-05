@@ -340,6 +340,22 @@ pub struct Payment {
     pub note: Word8,
 }
 
+/// One aggregate as the ledger paid it (spec §5.4): the aggregate transaction's hash, the
+/// schedule index `n` it was paid at (`sealed_blocks` before its own increment) and its
+/// [`Payment`]. Transient output exactly like [`super::Deposit`]: recorded by
+/// [`Ledger::apply_aggregate`], cleared when a block starts, carried to storage on
+/// `CommittedBlock::aggregates`, never hashed and never compared. Storage writes
+/// `rand_getAggregate`'s `subsidy`, `proving_share` and `n` from it, so the record is the
+/// ledger's own payment by construction rather than a recomputation from the database — which
+/// missed a cover committed earlier in the same write batch (a sync commits several blocks at
+/// once) and read `n` off the batch's last ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaidAggregate {
+    pub tx: Hash,
+    pub n: u64,
+    pub payment: Payment,
+}
+
 impl Ledger {
     /// At bundle inclusion: the proposer keeps `gas::BUNDLE_BASE`; the excess is bucketed
     /// against the bundle transaction's hash (spec §5.2) with its coverable-until height —
@@ -413,8 +429,9 @@ impl Ledger {
 /// covered proving shares — `schedule − shares`, nothing once the shares reach it. Fee-first: the
 /// fees already collected for this proving count toward the schedule, so a busy chain mints less
 /// and a chain whose fees cover the schedule mints nothing. The one statement of the rule:
-/// [`Ledger::aggregate_payment`] derives the note from it, and the node's sealed-aggregate record
-/// (`rand_getAggregate`'s `subsidy`) reports it, so the two cannot disagree.
+/// [`Ledger::aggregate_payment`] derives the note from it — and the node's sealed-aggregate record
+/// (`rand_getAggregate`'s `subsidy`) stores that payment ([`PaidAggregate`]) — and the aggregate
+/// daemon seals its payout note at the amount it gives, so none of the three can disagree.
 pub fn minted_subsidy(schedule: u64, proving_shares: u64, fees: &FeesConfig) -> u64 {
     if fees.subsidy_net_of_fees() {
         schedule.saturating_sub(proving_shares)
@@ -697,10 +714,12 @@ impl Ledger {
         for c in &covers {
             self.unsealed_fees.remove(c);
         }
+        let n = self.supply.sealed_blocks;
         self.supply.subsidised = self.supply.subsidised.checked_add(payment.subsidy).ok_or(TxError::Overflow)?;
         self.supply.sealed_blocks = self.supply.sealed_blocks.checked_add(1).ok_or(TxError::Overflow)?;
         let e = self.aggregators.get_mut(&aggregator).expect("validated above");
         e.nonce += 1;
+        self.paid_aggregates.push(PaidAggregate { tx: tx.hash(), n, payment });
         Ok(())
     }
 }

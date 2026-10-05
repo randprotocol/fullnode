@@ -100,6 +100,17 @@ schedule — is minted. `subsidised` and `rand_getAggregate`'s `subsidy` carry t
 `sealed_blocks` advances by one either way. Admission and apply still derive one note from one
 state: the rule lives in that one function.
 
+**An aggregator must net the subsidy too.** The ledger never reads the envelope's amount: it
+derives the commitment from its own `max(subsidy(n), shares)`, admits the aggregate and appends
+that note whatever the envelope says. An envelope sealed at `subsidy(n) + shares` therefore opens
+to a commitment matching no leaf, and the payout is lost to the wallet that holds it. The flag is
+read off `rand_getLimits.fee_rules.subsidy_net_of_fees` (`null` — no rule on, or a node that
+predates the section — is the old sum); `rand-node aggregate` reads it there beside
+`rand_status.aggregation`'s schedule and seals at
+`aggregation::minted_subsidy(subsidy(n), shares, &fees) + shares`, the ledger's own function
+(pinned by `the_aggregate_pass_seals_the_ledgers_payout_under_subsidy_net_of_fees`). A third-party
+aggregator must do the same.
+
 ### 3.4 Supply accounting
 
 `docs/supply.md`'s value-balance invariant gains a term:

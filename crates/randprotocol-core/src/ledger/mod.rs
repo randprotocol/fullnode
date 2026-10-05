@@ -756,6 +756,9 @@ pub struct Ledger {
     timestamp_ms: u64,
     /// Deposit notes this block's transactions made the ledger create (see [`Deposit`]).
     deposits: Vec<Deposit>,
+    /// The aggregates this block's transactions paid (see [`aggregation::PaidAggregate`]).
+    /// Scratch, like `deposits`, and cleared with them.
+    paid_aggregates: Vec<aggregation::PaidAggregate>,
     /// The sealed form's side table for the block being applied (spec §7), keyed by proof
     /// hash: the raw transaction hash and the `pv::NUM` (35) public values per pruned bundle. Scratch,
     /// like `deposits` — set by `apply_transactions_for_sync`, cleared with the deposits,
@@ -894,6 +897,7 @@ impl Ledger {
             height: 0,
             timestamp_ms: 0,
             deposits: Vec::new(),
+            paid_aggregates: Vec::new(),
             pruned_side: BTreeMap::new(),
             supply: Supply::default(),
             unsealed_fees: BTreeMap::new(),
@@ -960,6 +964,7 @@ impl Ledger {
             height: 0,
             timestamp_ms: 0,
             deposits: Vec::new(),
+            paid_aggregates: Vec::new(),
             pruned_side: BTreeMap::new(),
             supply: Supply::default(),
             unsealed_fees: BTreeMap::new(),
@@ -1303,6 +1308,17 @@ impl Ledger {
     /// Take the deposits, leaving the list empty.
     pub fn take_deposits(&mut self) -> Vec<Deposit> {
         std::mem::take(&mut self.deposits)
+    }
+
+    /// The aggregates this ledger paid while applying the current block, in transaction order
+    /// (see [`aggregation::PaidAggregate`]).
+    pub fn paid_aggregates(&self) -> &[aggregation::PaidAggregate] {
+        &self.paid_aggregates
+    }
+
+    /// Take the paid aggregates, leaving the list empty.
+    pub fn take_paid_aggregates(&mut self) -> Vec<aggregation::PaidAggregate> {
+        std::mem::take(&mut self.paid_aggregates)
     }
 
     /// Append a note the ledger computed itself and record it for storage. Fails — before any
@@ -2756,6 +2772,7 @@ impl Ledger {
         let mut scratch = self.clone();
         // The deposits reported after a block are exactly that block's (see `Deposit`).
         scratch.deposits.clear();
+        scratch.paid_aggregates.clear();
         // A side table is a peer's wire input: every record must be the `pv::NUM`-word list the
         // covering aggregate's admission and the digest check below index into, checked here
         // once, before any transaction is read.

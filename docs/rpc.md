@@ -1669,6 +1669,11 @@ on a chain whose genesis has no `fees` section with a `true` flag. Under `burn_b
 chain; no fee a wallet pays changes. Under `subsidy_net_of_fees` `rand_getAggregate`'s `subsidy`
 (and `rand_getSupply`'s `subsidised`) carry only the minted part, the schedule's shortfall over
 `proving_share`. Every existing field keeps its value on every chain without the section.
+One fix applies on every chain: `rand_getAggregate`'s `subsidy`, `proving_share` and `n` are now
+stored from the ledger's own payment, so a node that synced the covered bundle and its aggregate
+in one commit no longer reports a `proving_share` of 0 (and, under the flag, the full schedule as
+`subsidy`) where a live node reports the paid amounts. Records written before the fix keep their
+stored values.
 
 ### 2026-10-01 — audit v6, TOK-1: `tokens.incremental_root` (genesis-gated; no chain carries it yet)
 
@@ -2393,7 +2398,10 @@ see:
   schedule's index the block minted at — plus its `height`. `null` for any other transaction.
   `subsidy` is what the aggregate minted: `subsidy(n)`, or under the genesis
   `fees.subsidy_net_of_fees` its shortfall over `proving_share` (`docs/fees.md` §1.3), so
-  `subsidy + proving_share` is always the payout note's amount.
+  `subsidy + proving_share` is always the payout note's amount. All three numbers are the
+  payment the ledger made while applying the aggregate, stored as it committed — not recomputed
+  from the database, which on a node syncing several blocks in one commit missed a cover
+  committed in the same batch (fee feedback, 2026-10-05).
 - **`rand_getAggregators`** lists the register (public by design): `address`, `bond`,
   `payout`, `nonce`, `unbonding` per row.
 - **`rand_getUnsealed(from, limit)`** pages the bundles an aggregator may still cover —

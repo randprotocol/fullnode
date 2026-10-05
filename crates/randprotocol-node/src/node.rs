@@ -3822,7 +3822,8 @@ impl Node {
             // The notes this block made the ledger create, from our own execution rather than
             // from the peer's copy (which the wire does not carry).
             let deposits = ledger.take_deposits();
-            accepted.push(CommittedBlock { receipts, deposits, ..cb });
+            let aggregates = ledger.take_paid_aggregates();
+            accepted.push(CommittedBlock { receipts, deposits, aggregates, ..cb });
             // The state that belongs with the committed prefix. Verification runs past it — the
             // blocks above are this prefix's own proof — but only what the three-chain rule
             // commits is written, so the ledger written beside it is the one that describes it.
@@ -6836,7 +6837,7 @@ mod tests {
         };
         let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, txs, &ks[0]);
         let hash = block.hash();
-        CommittedBlock { block, pruned: Vec::new(), qc: votes_of(height, hash, ks, votes), receipts: Vec::new(), deposits: Vec::new() }
+        CommittedBlock { block, pruned: Vec::new(), qc: votes_of(height, hash, ks, votes), receipts: Vec::new(), deposits: Vec::new(), aggregates: Vec::new() }
     }
 
     fn validators(n: u8) -> Vec<Keypair> {

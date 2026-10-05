@@ -4,7 +4,7 @@ A shielded chain cannot add up its own money. A note's value lives inside its co
 pool's contents are not summable by anyone — not by a node, not by the operator, not by a holder of
 every viewing key but one.
 
-What *is* public is every crossing of the pool's boundary, and on this chain there are only five
+What *is* public is every crossing of the pool's boundary, and on this chain there are only six
 kinds. Count those, add the validator register — which holds its amounts in the clear because
 consensus weight must be public (`docs/staking.md`) — and the total is exactly what the chain has
 ever issued. That identity is the supply audit: `rand_getSupply` reports it, and every node checks
@@ -12,7 +12,7 @@ it against a full replay of its own chain.
 
 ## What is counted
 
-Six counters, all in units (1 RAND = 10⁹ units), all monotonic:
+Eight counters, all in units (1 RAND = 10⁹ units), all monotonic:
 
 | counter | what it sums | when it moves |
 |---|---|---|
@@ -22,6 +22,13 @@ Six counters, all in units (1 RAND = 10⁹ units), all monotonic:
 | `withdraw_deposited` | the notes accepted `Withdraw`s created | a withdraw commits |
 | `fees_paid` | every bundle fee a proposer kept, i.e. value that left the pool into its `rewards` — under the genesis `fees.burn_base` only the tip, `fee − BUNDLE_BASE` | any bundle commits |
 | `burned` | every bundle `burn` — a `Bond`, burning into `stake`; under the genesis gates below also a registration fee or a bundle's `BUNDLE_BASE`, burning into nothing | a bond commits; under a gate, a registration or any bundle |
+| `subsidised` | the aggregation subsidy every accepted `Aggregate` minted into its payout note — under the genesis `fees.subsidy_net_of_fees` only the schedule's shortfall over the covered proving shares (`docs/fees.md` §1.3) | an aggregate commits |
+| `slashed` | what slashing destroyed: a slashed aggregator bond, and under `staking.slashing` an equivocating leader's slashed stake | a slash commits |
+
+`rand_getSupply` serves two more fields of the same blob that are not value crossings:
+`sealed_blocks`, the count of included aggregates (the subsidy schedule's index), and
+`aggregator_bonds`, the bonds the aggregator register holds now (it falls as bonds are paid out
+or slashed, and it is counted in `register_total` below).
 
 Two more counters break part of `burned` down, because what they count enters no register entry
 and so sits on the right of the identity below: `registration_fees_burned` (the registration fees
@@ -30,7 +37,9 @@ bundle's `BUNDLE_BASE` burned under `fees.burn_base`, `docs/fees.md` §1.3). Bot
 the supply blob rather than in it, so chain 14's stored layout never moved, and both read 0
 without their gate.
 
-Value **enters** the pool as a genesis deposit, a faucet mint, or a validator's withdraw. It
+Value **enters** the pool as a genesis deposit, a faucet mint, a validator's withdraw, or an
+aggregate's payout note — of which only the minted subsidy (`subsidised`) is new: the note's
+proving-share part is bucketed fee excess that never left the pool in this accounting. It
 **leaves** as a bundle fee or a burn. There is no other movement across the boundary, which is what
 makes the arithmetic below closed rather than approximate.
 
@@ -48,10 +57,12 @@ Two of those rows are easy to get subtly wrong, so they are worth stating twice:
 ## The identity a node checks
 
 ```
-pool_value     = genesis_deposited + faucet_minted + withdraw_deposited − fees_paid − burned
-register_total = Σ over the register of (stake + pending + rewards)
+pool_value     = genesis_deposited + faucet_minted + withdraw_deposited + subsidised
+                 − fees_paid − burned
+register_total = Σ over the validator register of (stake + pending + rewards)
+                 + Σ over the aggregator register of bond
 total_supply   = pool_value + register_total
-issued         = genesis_deposited + genesis_staked + faucet_minted
+issued         = genesis_deposited + genesis_staked + faucet_minted + subsidised
 
 invariant:       total_supply == issued − slashed − registration_fees_burned
                                         − base_fees_burned
@@ -79,7 +90,8 @@ and staked 4000:
 | its withdraw of 1000 | 1000 | 999.999 | 0.001 | 1999.998 | 4000.002 | 6000 |
 
 `issued` is 6000 throughout: a bond, an unbond, a withdraw and a fee move value between the two
-halves and never create or destroy any. Only a faucet mint moves `issued` at all.
+halves and never create or destroy any. Only a faucet mint (or, on an aggregating chain, an
+aggregate's minted subsidy) moves `issued` at all.
 
 ## Genesis vesting: the third half
 

@@ -1380,7 +1380,9 @@ as `rand_getLimits.fee_rules`.
 
 **Rolling it out.** `rand-node genesis` writes no `fees` section; the cut script splices it in
 the way it splices `bridge`. Every validator must run a build that knows the section before a
-genesis carries it — an older node does not parse it and would compute a different genesis hash.
+genesis carries it — an older node does not refuse the file: `Genesis` has no
+`deny_unknown_fields`, so it silently ignores the section, derives a different genesis hash and
+so cannot join the chain.
 After launch: `rand_getLimits.fee_rules.burn_base == true`, and `rand_getSupply.base_fees_burned`
 grows by `BUNDLE_BASE` per included bundle with `invariant_holds` still `true`.
 
