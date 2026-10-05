@@ -413,4 +413,273 @@ mod tests {
         assert_eq!(e.established(&stranger), 0);
         assert!(!e.by_peer.contains_key(&stranger), "no entry outlives a peer's last connection");
     }
+
+    // ------------------------------------------- the behaviour itself, through libp2p's hooks
+    //
+    // What the swarm calls, in the order it calls it, with synthetic ids and addresses: the
+    // verdicts must be the right `ConnectionDenied` causes, and every `FromSwarm` event that
+    // ends a handshake or a connection must give its slot back.
+
+    use libp2p::core::ConnectedPoint;
+    use libp2p::swarm::ListenError;
+
+    const PER_PEER: u32 = 2;
+
+    fn guard() -> Guard {
+        Guard::new(GuardLimits {
+            max_pending_incoming_per_addr: MAX_PENDING_INCOMING_PER_ADDR,
+            max_established_per_peer: PER_PEER,
+            max_established_per_reserved_peer: MAX_ESTABLISHED_PER_RESERVED_PEER,
+        })
+    }
+
+    fn local() -> Multiaddr {
+        addr("/ip4/127.0.0.1/tcp/30303")
+    }
+
+    fn pending(g: &mut Guard, id: usize, remote: &str) -> Result<(), ConnectionDenied> {
+        g.handle_pending_inbound_connection(conn(id), &local(), &addr(remote))
+    }
+
+    fn established_inbound(g: &mut Guard, id: usize, peer: PeerId, remote: &str) -> Result<(), ConnectionDenied> {
+        g.handle_established_inbound_connection(conn(id), peer, &local(), &addr(remote)).map(|_| ())
+    }
+
+    fn established_outbound(g: &mut Guard, id: usize, peer: PeerId) -> Result<(), ConnectionDenied> {
+        g.handle_established_outbound_connection(conn(id), peer, &addr("/ip4/203.0.113.9/tcp/1"), Endpoint::Dialer, PortUse::Reuse).map(|_| ())
+    }
+
+    fn listener_point(remote: &str) -> ConnectedPoint {
+        ConnectedPoint::Listener { local_addr: local(), send_back_addr: addr(remote) }
+    }
+
+    fn connection_established(g: &mut Guard, id: usize, peer: PeerId, point: &ConnectedPoint, other: usize) {
+        g.on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+            peer_id: peer,
+            connection_id: conn(id),
+            endpoint: point,
+            failed_addresses: &[],
+            other_established: other,
+        }));
+    }
+
+    fn connection_closed(g: &mut Guard, id: usize, peer: PeerId, point: &ConnectedPoint, remaining: usize) {
+        g.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+            peer_id: peer,
+            connection_id: conn(id),
+            endpoint: point,
+            cause: None,
+            remaining_established: remaining,
+        }));
+    }
+
+    fn listen_failure(g: &mut Guard, id: usize, remote: &str) {
+        let error = ListenError::Aborted;
+        g.on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
+            local_addr: &local(),
+            send_back_addr: &addr(remote),
+            error: &error,
+            connection_id: conn(id),
+            peer_id: None,
+        }));
+    }
+
+    /// The cause a refusal carries, as the swarm's `IncomingConnectionError` would downcast it.
+    fn denied(r: Result<(), ConnectionDenied>) -> Denied {
+        match r {
+            Ok(()) => panic!("admitted"),
+            Err(e) => e.downcast::<Denied>().expect("the guard's own cause, not another behaviour's"),
+        }
+    }
+
+    /// Audit v6, NET-1 through the swarm's own hook: the fifth handshake from one host is a
+    /// `ConnectionDenied` whose cause is the guard's `PendingIncomingPerAddr` verdict at the cap,
+    /// another host is unaffected, and the refused connection holds nothing.
+    #[test]
+    fn the_fifth_pending_handshake_from_one_host_is_denied_with_the_pending_cause() {
+        let mut g = guard();
+        for i in 0..MAX_PENDING_INCOMING_PER_ADDR as usize {
+            pending(&mut g, i, "/ip4/203.0.113.7/tcp/40001").unwrap_or_else(|e| panic!("handshake {i}: {e}"));
+        }
+        let verdict = denied(pending(&mut g, 100, "/ip4/203.0.113.7/tcp/40002"));
+        assert_eq!(verdict, Denied { limit: MAX_PENDING_INCOMING_PER_ADDR, kind: Kind::PendingIncomingPerAddr });
+        assert_eq!(verdict.to_string(), "connection guard: at most 4 pending incoming connections from one source address are allowed");
+        assert_eq!(g.pending.len(), MAX_PENDING_INCOMING_PER_ADDR as usize, "the refused one is not recorded");
+        pending(&mut g, 101, "/ip4/203.0.113.8/tcp/40001").expect("another host is admitted");
+        // A `ListenFailure` for the refused id — which the swarm does send, since libp2p's own
+        // limiter counted it — releases nothing that was never held.
+        listen_failure(&mut g, 100, "/ip4/203.0.113.7/tcp/40002");
+        assert_eq!(g.pending.pending_from(&Source::V4("203.0.113.7".parse().unwrap())), MAX_PENDING_INCOMING_PER_ADDR);
+    }
+
+    /// Each way a handshake ends gives its slot back: a `ListenFailure` (refused by another
+    /// behaviour, failed, or timed out), an established inbound connection (the hook, then the
+    /// event), and a `ConnectionEstablished` for an id this behaviour was never asked about.
+    #[test]
+    fn every_end_of_a_handshake_releases_its_pending_slot() {
+        let host = "/ip4/203.0.113.7/tcp/40001";
+        let source = Source::V4("203.0.113.7".parse().unwrap());
+        let mut g = guard();
+        for i in 0..4 {
+            pending(&mut g, i, host).unwrap();
+        }
+        assert!(pending(&mut g, 9, host).is_err());
+
+        listen_failure(&mut g, 0, host);
+        assert_eq!(g.pending.pending_from(&source), 3, "a failed handshake gives its slot back");
+        pending(&mut g, 10, host).expect("one more fits");
+
+        let peer = PeerId::random();
+        established_inbound(&mut g, 1, peer, host).expect("the handshake finished");
+        assert_eq!(g.pending.pending_from(&source), 3, "an established connection is no longer pending");
+        connection_established(&mut g, 1, peer, &listener_point(host), 0);
+        assert_eq!(g.pending.pending_from(&source), 3, "the event for the same id releases nothing twice");
+        assert_eq!(g.established.established(&peer), 1, "and it is counted against its peer");
+
+        // A dial's connection was never pending here; its event must not disturb the count.
+        let dialed = PeerId::random();
+        connection_established(&mut g, 50, dialed, &ConnectedPoint::Dialer { address: addr("/ip4/203.0.113.7/tcp/1"), role_override: Endpoint::Dialer, port_use: PortUse::Reuse }, 0);
+        assert_eq!(g.pending.pending_from(&source), 3);
+        assert_eq!(g.established.established(&dialed), 1);
+    }
+
+    /// A stranger is held to the per-peer cap in both directions: with two connections up, a
+    /// third — inbound or outbound — is a `ConnectionDenied` with the `EstablishedPerPeer`
+    /// cause at the chain's cap, and the pending slot an inbound attempt took is still released
+    /// when it is refused.
+    #[test]
+    fn a_stranger_is_held_to_the_per_peer_cap_in_both_directions() {
+        let host = "/ip4/203.0.113.7/tcp/40001";
+        let source = Source::V4("203.0.113.7".parse().unwrap());
+        let mut g = guard();
+        let peer = PeerId::random();
+        // One inbound, one outbound: both sides dialed at once.
+        pending(&mut g, 0, host).unwrap();
+        established_inbound(&mut g, 0, peer, host).unwrap();
+        connection_established(&mut g, 0, peer, &listener_point(host), 0);
+        established_outbound(&mut g, 1, peer).unwrap();
+        connection_established(&mut g, 1, peer, &ConnectedPoint::Dialer { address: addr(host), role_override: Endpoint::Dialer, port_use: PortUse::Reuse }, 1);
+        assert_eq!(g.established.established(&peer), PER_PEER);
+
+        assert_eq!(denied(established_outbound(&mut g, 2, peer)), Denied { limit: PER_PEER, kind: Kind::EstablishedPerPeer });
+        pending(&mut g, 3, host).expect("the handshake itself is admitted: the identity is unknown until it finishes");
+        assert_eq!(g.pending.pending_from(&source), 1);
+        assert_eq!(denied(established_inbound(&mut g, 3, peer, host)), Denied { limit: PER_PEER, kind: Kind::EstablishedPerPeer });
+        assert_eq!(g.pending.pending_from(&source), 0, "refused at the identity check, the handshake slot is released all the same");
+
+        // A close frees a slot. A connection the hook admitted counts nothing until the swarm
+        // reports it established — the hook is a check, the event is the count — so after both
+        // closes the peer is at zero, and at one once the admitted dial's event arrives.
+        connection_closed(&mut g, 0, peer, &listener_point(host), 1);
+        established_outbound(&mut g, 4, peer).expect("a closed connection gives its place back");
+        connection_closed(&mut g, 1, peer, &listener_point(host), 0);
+        assert_eq!(g.established.established(&peer), 0, "admitted at the hook is not yet established");
+        connection_established(&mut g, 4, peer, &listener_point(host), 0);
+        assert_eq!(g.established.established(&peer), 1);
+    }
+
+    /// A reserved peer is not exempt from the guard: it bypasses libp2p's caps, so this is the
+    /// only bound on it — `MAX_ESTABLISHED_PER_RESERVED_PEER`, with its own cause — and when it
+    /// stops being reserved it is a stranger again, held to the chain's cap at once.
+    #[test]
+    fn a_reserved_peer_is_denied_at_its_own_cap_with_the_reserved_cause() {
+        let host = "/ip4/203.0.113.7/tcp/40001";
+        let mut g = guard();
+        let validator = PeerId::random();
+        g.reserve(validator);
+        for i in 0..MAX_ESTABLISHED_PER_RESERVED_PEER as usize {
+            established_outbound(&mut g, i, validator).unwrap_or_else(|e| panic!("connection {i} of a reserved peer: {e}"));
+            connection_established(&mut g, i, validator, &listener_point(host), i);
+        }
+        let verdict = denied(established_outbound(&mut g, 10, validator));
+        assert_eq!(verdict, Denied { limit: MAX_ESTABLISHED_PER_RESERVED_PEER, kind: Kind::EstablishedPerReservedPeer });
+        assert!(verdict.to_string().contains("reserved peer"), "{verdict}");
+        pending(&mut g, 11, host).unwrap();
+        assert_eq!(denied(established_inbound(&mut g, 11, validator, host)).kind, Kind::EstablishedPerReservedPeer);
+
+        g.unreserve(&validator);
+        assert_eq!(denied(established_outbound(&mut g, 12, validator)), Denied { limit: PER_PEER, kind: Kind::EstablishedPerPeer }, "a stranger again, and over the stranger's cap");
+        for i in 0..3 {
+            connection_closed(&mut g, i, validator, &listener_point(host), 3 - i);
+        }
+        established_outbound(&mut g, 13, validator).expect("down to one, a second fits the stranger's cap");
+        g.reserve(validator);
+        connection_established(&mut g, 13, validator, &listener_point(host), 1);
+        established_outbound(&mut g, 14, validator).expect("reserved again: the wider cap applies");
+    }
+
+    /// The pending cap counts hosts, not sockets or spellings: an IPv4-mapped IPv6 address
+    /// shares its IPv4 host's allowance, a /64 is one IPv6 host, and the two addresses that
+    /// name no host at all share the one `Unknown` bucket — all through the swarm's hook.
+    #[test]
+    fn the_pending_cap_is_per_host_through_the_hook() {
+        let mut g = guard();
+        pending(&mut g, 0, "/ip4/203.0.113.7/tcp/1").unwrap();
+        pending(&mut g, 1, "/ip4/203.0.113.7/tcp/2").unwrap();
+        pending(&mut g, 2, "/ip6/::ffff:203.0.113.7/tcp/3").unwrap();
+        pending(&mut g, 3, "/ip6/::ffff:203.0.113.7/tcp/4").unwrap();
+        assert_eq!(denied(pending(&mut g, 4, "/ip4/203.0.113.7/tcp/5")).kind, Kind::PendingIncomingPerAddr, "four spellings of one host");
+        assert_eq!(denied(pending(&mut g, 5, "/ip6/::ffff:203.0.113.7/tcp/6")).kind, Kind::PendingIncomingPerAddr);
+
+        for i in 10..14 {
+            pending(&mut g, i, &format!("/ip6/2001:db8:1:2::{}/tcp/1", i)).unwrap();
+        }
+        assert!(pending(&mut g, 14, "/ip6/2001:db8:1:2:dead:beef::1/tcp/1").is_err(), "one /64 is one host");
+        pending(&mut g, 15, "/ip6/2001:db8:1:3::1/tcp/1").expect("the next /64 is another host");
+
+        pending(&mut g, 20, "/dns4/a.example/tcp/1").unwrap();
+        pending(&mut g, 21, "/dns4/b.example/tcp/1").unwrap();
+        pending(&mut g, 22, "/memory/1").unwrap();
+        pending(&mut g, 23, "/p2p-circuit").unwrap();
+        assert!(pending(&mut g, 24, "/dns6/c.example/tcp/1").is_err(), "addresses naming no host share one bucket");
+        assert_eq!(g.pending.pending_from(&Source::Unknown), 4);
+    }
+
+    /// A cap of zero refuses every handshake and keeps no counter for the refused source: the
+    /// branch that removes a fresh zero entry on refusal, so a refused-only source leaves no
+    /// trace in the map.
+    #[test]
+    fn a_zero_pending_cap_refuses_everything_and_records_nothing() {
+        let mut g = Guard::new(GuardLimits { max_pending_incoming_per_addr: 0, max_established_per_peer: PER_PEER, max_established_per_reserved_peer: 4 });
+        assert_eq!(denied(pending(&mut g, 0, "/ip4/203.0.113.7/tcp/1")), Denied { limit: 0, kind: Kind::PendingIncomingPerAddr });
+        assert!(g.pending.is_empty());
+        assert!(g.pending.count.is_empty(), "a refused-only source leaves no counter behind");
+        let mut p = PendingBySource::default();
+        assert!(!p.admit(conn(1), Source::Unknown, 0));
+        assert!(p.count.is_empty());
+    }
+
+    /// The guard's handler is the dummy that does nothing, and it never asks the swarm for
+    /// anything: its `poll` is always `Pending`.
+    #[test]
+    fn the_guard_never_emits_to_the_swarm() {
+        let mut g = guard();
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(g.poll(&mut cx), Poll::Pending));
+        let peer = PeerId::random();
+        established_outbound(&mut g, 0, peer).unwrap();
+        connection_established(&mut g, 0, peer, &listener_point("/ip4/203.0.113.7/tcp/1"), 0);
+        assert!(matches!(g.poll(&mut cx), Poll::Pending));
+    }
+
+    /// Every `Denied` displays its limit and the thing it limits, so a log line about a refused
+    /// connection says which cap and at what number.
+    #[test]
+    fn a_denial_names_its_limit_and_kind() {
+        let cases = [
+            (Kind::PendingIncomingPerAddr, 4, "at most 4 pending incoming connections from one source address"),
+            (Kind::EstablishedPerPeer, 2, "at most 2 established connections per peer"),
+            (Kind::EstablishedPerReservedPeer, 4, "at most 4 established connections per reserved peer"),
+        ];
+        for (kind, limit, text) in cases {
+            let d = Denied { limit, kind };
+            assert!(d.to_string().contains(text), "{d}");
+            // Through libp2p's wrapper and back: the cause survives the trip, and is not confused
+            // with another error type.
+            let wrapped = ConnectionDenied::new(d);
+            assert!(wrapped.downcast_ref::<std::io::Error>().is_none());
+            assert_eq!(wrapped.downcast::<Denied>().unwrap(), d);
+        }
+    }
 }
