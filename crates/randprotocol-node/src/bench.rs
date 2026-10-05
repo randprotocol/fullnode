@@ -89,7 +89,11 @@ fn genesis(key: &Keypair, incremental_nullifier_root: bool) -> anyhow::Result<Ge
         proof_window_blocks: None,
         program_state: None,
     };
-    let _ = incremental_nullifier_root; // Task 6 sets `g.incremental_nullifier_root`.
+    // Task 6 sets `g.incremental_nullifier_root`; until then the flag changes nothing, and a run
+    // that asked for it must not read as accumulator numbers.
+    if incremental_nullifier_root {
+        eprintln!("note: --incremental-nullifier-root is accepted but not yet wired; the baseline genesis is used");
+    }
     g.build(&StubExecutor).context("building the harness genesis")
 }
 
