@@ -2404,7 +2404,8 @@ see:
   committed in the same batch (fee feedback, 2026-10-05). Because the record has no fallback,
   storage refuses to commit a block whose aggregates do not each carry exactly one such payment
   record (an error naming the height and the aggregate's hash) rather than land a sealed block
-  `rand_getAggregate` could only answer without them (#133).
+  for which `rand_getAggregate` would have answered `subsidy`, `proving_share` and `n` as zero
+  (#133).
 - **`rand_getAggregators`** lists the register (public by design): `address`, `bond`,
   `payout`, `nonce`, `unbonding` per row.
 - **`rand_getUnsealed(from, limit)`** pages the bundles an aggregator may still cover —
