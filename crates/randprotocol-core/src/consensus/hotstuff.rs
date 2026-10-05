@@ -191,6 +191,10 @@ impl HotStuff {
         genesis_ledger: Ledger,
         executor: Arc<dyn ConfidentialExecutor>,
     ) -> HotStuff {
+        // A replica's lineage owns its base (spec 2026-10-05 §5): the genesis ledger the caller
+        // keeps, and any other replica built from it, must not see this one's commits.
+        let mut genesis_ledger = genesis_ledger;
+        genesis_ledger.detach_shared_sets();
         let genesis_hash = genesis_block.hash();
         assert_eq!(genesis_hash, cfg.genesis_hash, "genesis mismatch");
         let qc = QuorumCertificate::genesis(genesis_hash);
@@ -225,6 +229,11 @@ impl HotStuff {
         epoch_sets: EpochSets,
         executor: Arc<dyn ConfidentialExecutor>,
     ) -> HotStuff {
+        // A synced ledger arrives as the old replica's committed ledger plus the synced blocks in
+        // its delta; fold them in — the old replica is being replaced, and its tree is dropped
+        // with it.
+        let mut head_ledger = head_ledger;
+        head_ledger.commit_shared_sets();
         let mut epoch_sets = epoch_sets;
         if epoch_sets.get(0).is_none() {
             epoch_sets.insert(0, cfg.genesis_set.clone());
@@ -1543,6 +1552,13 @@ impl HotStuff {
         self.committed_ledger = self.tree[&self.committed_hash].ledger_after.clone();
         self.epoch_sets.forget_before(self.epoch(self.committed_height).saturating_sub(EPOCH_SETS_KEPT));
         self.prune();
+        // The shared sets' commit step (spec 2026-10-05 §5.2), after `prune` so every entry left
+        // in the tree descends from the new head and already holds this delta: the committed
+        // ledger's delta becomes base, and each survivor drops what the base now has.
+        self.committed_ledger.commit_shared_sets();
+        for e in self.tree.values_mut() {
+            e.ledger_after.absorb_shared_sets();
+        }
         self.not_held.clear();
         self.unobtainable.clear();
         self.refresh_current_set();

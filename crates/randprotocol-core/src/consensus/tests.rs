@@ -1604,6 +1604,25 @@ fn commits(acts: &[Action]) -> bool {
     acts.iter().any(|a| matches!(a, Action::Commit(_)))
 }
 
+/// Spec 2026-10-05 §5.2: after a commit the committed ledger's delta is empty and the surviving
+/// speculative entries hold only the blocks above the head — the tree's memory is O(block), not
+/// O(state). A bundle inserts all four nullifier slots (two real, two dummies), hence the 4×.
+#[test]
+fn commit_drains_the_shared_sets_and_survivors_absorb() {
+    let mut n = one_node();
+    n.node.start();
+    for view in 1..=8u64 {
+        n.now += 1;
+        let tx = staking_tx(n.node.tip_ledger(), 10 * view as u32, 0, crate::types::Action::None);
+        n.node.propose(view, vec![tx], n.now).expect("propose");
+    }
+    assert!(n.node.committed_height() >= 4, "three-chain commits happened");
+    assert_eq!(n.node.committed_ledger().nullifiers().added_len(), 0, "the committed ledger's delta was drained");
+    let above_head = n.node.tip_ledger().height() - n.node.committed_height();
+    assert_eq!(n.node.tip_ledger().nullifiers().added_len() as u64, 4 * above_head, "the tip holds exactly the blocks above the head");
+    assert!(n.node.committed_ledger().is_spent(&[10; 8]), "the first block's spend is in the base");
+}
+
 #[test]
 fn commit_rule_requires_three_consecutive_views() {
     let mut n = one_node();
