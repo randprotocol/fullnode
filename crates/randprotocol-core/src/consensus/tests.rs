@@ -3600,3 +3600,25 @@ fn one_validators_votes_cannot_fill_the_vote_map() {
 
 /// `hotstuff::MAX_PENDING_VOTE_KEYS`, which the flood above aims at.
 const MAX_PENDING_VOTE_KEYS_FOR_TESTS: usize = 4096;
+
+/// Spec 2026-10-05 §7.2 and review focus 5: a certificate is verified once per (bytes, set); the
+/// same certificate under another set is verified afresh and may fail.
+#[test]
+fn a_certificate_is_verified_once_and_the_key_covers_the_set() {
+    use crate::types::validator::Validator;
+    let mut sim = setup(4, 4);
+    for _ in 0..6 {
+        sim.step(vec![]);
+    }
+    let n = &mut sim.nodes[0];
+    let qc = n.high_qc().clone();
+    let set = n.current_set().clone();
+    let mut cache = crate::consensus::hotstuff::VerifiedQcs::new(8);
+    assert!(cache.check(n.domain(), &qc, &set));
+    assert_eq!(cache.len(), 1);
+    assert!(cache.check(n.domain(), &qc, &set), "cached");
+    assert_eq!(cache.len(), 1);
+    let other = ValidatorSet::new(vec![Validator { public_key: Keypair::from_seed([77; 32]).unwrap().public_key().clone(), stake: 1 }]);
+    assert!(!cache.check(n.domain(), &qc, &other), "voters outside the set: not a quorum, not cached");
+    assert_eq!(cache.len(), 1);
+}

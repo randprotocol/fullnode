@@ -73,6 +73,54 @@ pub trait CoveredSource: Send + Sync {
     fn covered(&self, covers: &[Hash]) -> Option<Vec<CoveredBundle>>;
 }
 
+/// Certificates this replica has verified, by the hash of their bytes and the set they passed
+/// under (spec 2026-10-05 §7.2), FIFO, oldest first. A QC that arrives as a proposal's justify
+/// and again as a NewView's high QC is verified once; an invalid one is never kept.
+pub const VERIFIED_QCS_KEPT: usize = 1024;
+
+pub(crate) struct VerifiedQcs {
+    seen: std::collections::HashSet<Hash>,
+    order: std::collections::VecDeque<Hash>,
+    cap: usize,
+}
+
+impl VerifiedQcs {
+    pub(crate) fn new(cap: usize) -> VerifiedQcs {
+        VerifiedQcs { seen: Default::default(), order: Default::default(), cap }
+    }
+
+    /// The key covers the validator set as well as the certificate, so a certificate that passed
+    /// under one set is never vouched for under another.
+    fn key(qc: &QuorumCertificate, set: &ValidatorSet) -> Hash {
+        let mut b = bincode::serialize(qc).expect("a certificate serializes");
+        b.extend_from_slice(&bincode::serialize(set).expect("a validator set serializes"));
+        Hash::digest_domain(b"rand-verified-qc-1", &b)
+    }
+
+    pub(crate) fn check(&mut self, domain: &SigningDomain, qc: &QuorumCertificate, set: &ValidatorSet) -> bool {
+        let k = Self::key(qc, set);
+        if self.seen.contains(&k) {
+            return true;
+        }
+        if !qc.verify(domain, set) {
+            return false;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        self.seen.insert(k);
+        self.order.push_back(k);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
 pub struct HotStuff {
     cfg: ConsensusConfig,
     signer: Option<Keypair>,
@@ -88,6 +136,10 @@ pub struct HotStuff {
     /// verification. [`NoVerified`] until the node sets its shared set — tests, and any replay
     /// path, verify every proof, exactly as before.
     verified: Arc<dyn VerifiedProofs>,
+    /// Certificates already verified, keyed by their bytes and the set they passed under, so a QC
+    /// seen as a proposal's justify and again as a NewView's high QC is checked once (spec
+    /// 2026-10-05 §7.2).
+    verified_qcs: VerifiedQcs,
 
     view: u64,
     high_qc: QuorumCertificate,
@@ -279,6 +331,7 @@ impl HotStuff {
             executor,
             covered: None,
             verified: Arc::new(NoVerified),
+            verified_qcs: VerifiedQcs::new(VERIFIED_QCS_KEPT),
             view,
             high_qc,
             locked_qc,
@@ -954,7 +1007,7 @@ impl HotStuff {
         let Some(parent_set) = self.shared_set_for_height(parent_height, &grandparent) else {
             return Err(ConsensusError::UnknownEpochSet(self.epoch(parent_height)));
         };
-        if !block.header.justify.verify(&self.cfg.domain, &parent_set) {
+        if !self.verified_qcs.check(&self.cfg.domain, &block.header.justify, &parent_set) {
             return Err(ConsensusError::BadJustify);
         }
         if block.header.justify.view != parent_view && !block.header.justify.is_genesis() {
@@ -1159,7 +1212,8 @@ impl HotStuff {
         if !nv.verify(&self.cfg.domain) {
             return Err(ConsensusError::BadNewView);
         }
-        if !nv.high_qc.verify(&self.cfg.domain, &self.set_for_qc(&nv.high_qc)) {
+        let high_qc_set = self.set_for_qc(&nv.high_qc);
+        if !self.verified_qcs.check(&self.cfg.domain, &nv.high_qc, &high_qc_set) {
             return Err(ConsensusError::BadJustify);
         }
         self.update_high_qc(&nv.high_qc.clone(), &mut out);
