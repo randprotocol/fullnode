@@ -2774,7 +2774,6 @@ mod payment_tests {
         assert_eq!(l.supply().burned, before.burned + gas::BUNDLE_BASE, "the base is destroyed");
         assert_eq!(l.base_fees_burned(), burned_before + gas::BUNDLE_BASE);
         assert_eq!(l.unsealed_fees()[&covered_tx.hash()].0, 60, "the bucket holds fee − BUNDLE_BASE, as without the flag");
-        assert_eq!(l.bucketed_excess(&covered_tx, None), 60);
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
 
         // The covered exit: the aggregate's note pays subsidy(n) plus the excess, as before.
@@ -2805,12 +2804,11 @@ mod payment_tests {
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
     }
 
-    /// Issue #135, `fees.burn_floor` on an aggregating chain: a Deploy's whole floor
-    /// (`BUNDLE_BASE + deploy_fee(words)`) is destroyed at inclusion, the proposer keeps nothing,
-    /// and the bucket holds `fee − floor` — not `fee − BUNDLE_BASE`, which would pay the
-    /// aggregator the per-word term the chain just burned. `bucketed_excess` agrees with the
-    /// bucket; the covering aggregate's note and the sweep each pay exactly that excess, and the
-    /// audit holds throughout.
+    /// Issue #135, `fees.burn_floor` on an aggregating chain: a Deploy's whole floor,
+    /// `BUNDLE_BASE + deploy_fee(words)`, is destroyed at inclusion, the proposer keeps nothing, and
+    /// the bucket holds `fee − floor` — not `fee − BUNDLE_BASE`, which would pay the aggregator the per-word
+    /// term the chain just burned. The covering aggregate's note and the sweep each pay exactly
+    /// that excess, and the audit holds throughout.
     #[test]
     fn burn_floor_on_an_aggregating_chain_buckets_fee_less_the_floor() {
         let burning = |window: u64| {
@@ -2834,7 +2832,6 @@ mod payment_tests {
         let (rewards, before, burned_before) = (l.validators()[&p].rewards, l.supply(), l.base_fees_burned());
         let covered_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), deploy(0x13)));
         assert_eq!(l.settled_floor(&covered_tx, None), floor);
-        assert_eq!(l.bucketed_excess(&covered_tx, None), 60, "what the split below will bucket");
         l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
         assert_eq!(l.validators()[&p].rewards, rewards, "the proposer keeps nothing at inclusion");
         assert_eq!(l.supply().fees_paid, before.fees_paid);

@@ -655,9 +655,10 @@ pub struct Ledger {
     registration_fees_burned: u64,
     /// Σ of every `BUNDLE_BASE` burned under `fees.burn_base` (`fees.rs`, `docs/fees.md` §1.3) —
     /// under `fees.burn_floor` beside it, every bundle's whole burned floor (issue #135; one
-    /// counter for the whole fee burn under either flag): `registration_fees_burned`'s sibling in every respect — derived, outside the state root
-    /// and this ledger's equality, persisted beside `META_SUPPLY`, replay-audited, on the right of
-    /// the audit's identity — and always 0 without the flag.
+    /// counter for the whole fee burn under either flag): `registration_fees_burned`'s sibling in
+    /// every respect — derived, outside the state root and this ledger's equality, persisted beside
+    /// `META_SUPPLY`, replay-audited, on the right of the audit's identity — and always 0 without
+    /// the flag.
     base_fees_burned: u64,
     /// The genesis `fees` section (`fees.rs`), the default (every rule off) on a chain whose file
     /// has none. A genesis parameter like `aggregation`: outside the state root and this ledger's
@@ -1184,12 +1185,16 @@ impl Ledger {
     /// call_fee(tier, bytes)`, and an invoke's cell fee on top.
     ///
     /// One function for the check and the burn: `validate_inner` holds a call's fee to it after
-    /// decoding, and under `fees.burn_floor` `apply_tx_with` burns `min(fee, settled_floor)` —
-    /// so the burned amount can never be a figure the fee was not checked against. `call` is the
+    /// decoding, and under `fees.burn_floor` `apply_tx_with` burns `min(fee, settled_floor)` — so
+    /// the burned amount can never be a figure the fee was not checked against. `call` is the
     /// decoded outcome (`Verified::call`); a call passed `None` gets its pre-verify `fee_floor`,
-    /// which is not its settled floor. It reads the gas prices and the program cells *now*, so it
-    /// is exact only against the ledger the transaction is being validated or applied on: the
-    /// prices move at `close_block` under `gas.dynamic`, and an applied invoke's cells exist.
+    /// which is not its settled floor. A registration's `registration_fee` is not part of this
+    /// floor (`fee_floor` is the plain base for `RegisterToken` and `RegisterBridgedToken`): it is
+    /// checked by `tokens::validate` / `bridge_gov::validate` and, under TOK-2, burned separately
+    /// (`registration_burn`) before the split sees the fee. It reads the gas prices and the program
+    /// cells *now*, so it is exact only against the ledger the transaction is being validated or
+    /// applied on: the prices move at `close_block` under `gas.dynamic`, and an applied invoke's
+    /// cells exist.
     pub fn settled_floor(&self, tx: &Transaction, call: Option<&crate::program::CallOutcome>) -> u64 {
         match (&tx.action, call) {
             (Action::Call { proof, input_envelope, .. } | Action::Invoke { proof, input_envelope, .. }, Some(outcome)) => {
@@ -1219,25 +1224,13 @@ impl Ledger {
         }
     }
 
-    /// What an included bundle is bucketed at (block aggregation, spec §5.2): its fee less the
-    /// burned registration fee (TOK-2) less `BUNDLE_BASE` — or, under `fees.burn_floor`, less
-    /// the whole burned floor ([`Self::settled_floor`], issue #135) — never below zero. The fee
-    /// split's own arithmetic (`apply_tx_with` buckets exactly this), for a caller that has the
-    /// transaction but no longer the bucket entry. A call needs its decoded outcome (`call`) for
-    /// its tier-exact floor, and the figure is exact only against the ledger it was applied on
-    /// (see `settled_floor`), which is why the node never recomputes a share from it: the
-    /// bucket entry (`unsealed_fees`, served by `rand_getUnsealed`) and the ledger's own
-    /// `PaidAggregate` are the authorities (IFACE-7).
-    pub fn bucketed_excess(&self, tx: &Transaction, call: Option<&crate::program::CallOutcome>) -> u64 {
-        tx.bundle.as_ref().map_or(0, |b| {
-            let fee = b.fee.saturating_sub(self.registration_burn(&tx.action));
-            fee.saturating_sub(self.bucket_floor(tx, fee, call))
-        })
-    }
-
     /// The part of `fee` that never reaches the bucket: the burn when the `fees` section burns
     /// (the base, or the whole floor), else the `BUNDLE_BASE` the proposer keeps at inclusion.
-    /// `fee − bucket_floor` is the bucketed excess under every rule.
+    /// `fee − bucket_floor` is the bucketed excess under every rule. There is deliberately no
+    /// public recomputation of that excess from a transaction: a call's floor needs its decoded
+    /// proof, and the prices and cells it reads move after the block, so the bucket entry
+    /// (`unsealed_fees`, served by `rand_getUnsealed`) and the ledger's own `PaidAggregate` are
+    /// the only authorities (IFACE-7).
     fn bucket_floor(&self, tx: &Transaction, fee: u64, call: Option<&crate::program::CallOutcome>) -> u64 {
         if self.fees.burn_base() {
             self.fee_burn(tx, fee, call)
@@ -1279,8 +1272,8 @@ impl Ledger {
     }
 
     /// Σ of the `BUNDLE_BASE`s burned under `fees.burn_base` — the whole floors under
-    /// `fees.burn_floor` (`docs/fees.md` §1.3) — for the node's persistence beside `META_SUPPLY`, the replay audit and `rand_getSupply`. 0 without
-    /// the flag.
+    /// `fees.burn_floor` (`docs/fees.md` §1.3) — for the node's persistence beside `META_SUPPLY`,
+    /// the replay audit and `rand_getSupply`. 0 without the flag.
     pub fn base_fees_burned(&self) -> u64 {
         self.base_fees_burned
     }
@@ -2633,11 +2626,11 @@ impl Ledger {
             if self.fees.burn_base() && fee < gas::BUNDLE_BASE {
                 return Err(TxError::FeeTooLow { min: gas::BUNDLE_BASE, fee });
             }
-            let base_burn = self.fee_burn(tx, fee, verified.call.as_ref());
+            let fee_burned = self.fee_burn(tx, fee, verified.call.as_ref());
             let kept = match (self.aggregation.is_some(), self.fees.burn_base()) {
                 (false, false) => fee,
                 (true, false) => gas::BUNDLE_BASE.min(fee),
-                (false, true) => fee.saturating_sub(base_burn),
+                (false, true) => fee.saturating_sub(fee_burned),
                 (true, true) => 0,
             };
             let rewards = entry.rewards.checked_add(kept).ok_or(TxError::Overflow)?;
@@ -2655,11 +2648,11 @@ impl Ledger {
                 .burned
                 .checked_add(b.burn_r)
                 .and_then(|n| n.checked_add(registration_burn))
-                .and_then(|n| n.checked_add(base_burn))
+                .and_then(|n| n.checked_add(fee_burned))
                 .ok_or(TxError::Overflow)?;
             self.registration_fees_burned =
                 self.registration_fees_burned.checked_add(registration_burn).ok_or(TxError::Overflow)?;
-            self.base_fees_burned = self.base_fees_burned.checked_add(base_burn).ok_or(TxError::Overflow)?;
+            self.base_fees_burned = self.base_fees_burned.checked_add(fee_burned).ok_or(TxError::Overflow)?;
             self.apply_bundle_notes(b, executor)?;
             self.validators.get_mut(proposer).expect("looked up above").rewards = rewards;
             if self.aggregation.is_some() {
@@ -2675,7 +2668,7 @@ impl Ledger {
                 // `fee − registration_fee − BUNDLE_BASE`, never below zero — and under
                 // `fees.burn_floor` over the whole burned floor, `fee − burn` (issue #135), so the
                 // aggregator is never paid a priced term the chain just destroyed.
-                // `bucket_floor` is `bucketed_excess`'s own, so the two cannot disagree.
+                // `bucket_floor` is the one place that figure is computed.
                 let excess = fee.saturating_sub(self.bucket_floor(tx, fee, verified.call.as_ref()));
                 self.bucket_excess(tx.hash(), excess, *proposer, until);
             }
@@ -6787,37 +6780,68 @@ mod tests {
         assert_eq!(root(alone), root(fees::FeesConfig::default()), "burn_floor alone is no rule at all");
     }
 
-    /// Issue #135: a block under `burn_floor` — a transfer, a Deploy and a tier-14 Call under a
-    /// `gas` section — replays to the same state root on a replica: `apply_block` on two ledgers,
-    /// both against the root the block commits to.
+    /// Issue #135 under moving prices (`gas.dynamic`): the proposer builds each block its own way
+    /// — `apply_tx` per transaction, then `close_block` with `block_usage`'s figures — and a
+    /// replica runs `apply_block` on the signed result. Block 2's call (40 000 gas against a
+    /// 20 000 target) raises the gas price; block 3 carries a transfer, a Deploy and a tier-14
+    /// Call priced at the block-2 prices, and the call burns `circuit_call_floor` at *those*
+    /// prices, not the genesis ones. Both sides reach the same root, counters and prices.
     #[test]
-    fn a_replica_replays_a_burn_floor_block_to_the_same_root() {
+    fn a_replica_replays_burn_floor_blocks_at_the_prices_in_force() {
         let (a, _) = keys();
-        let (l, id) = ledger_with_program(|l| l.set_gas(Some(fixed_gas())));
+        let p = a.address();
+        let (l, id) = ledger_with_program(|l| l.set_gas(Some(dynamic_gas())));
         let l = with_rules(l, burn_rules(Some(true)));
+        let genesis_prices = l.gas_prices();
+        // The proposer's path: each transaction applied on its own, the controller fed the
+        // block's usage, the root read off the result and signed into the block.
+        let propose = |parent: &Ledger, txs: Vec<Transaction>, h: u64| -> (Ledger, Block) {
+            let mut next = parent.clone();
+            next.set_height(h);
+            let mut call_gas = 0u64;
+            for tx in &txs {
+                if let Some(r) = next.apply_tx(tx, &p, &StubExecutor).unwrap() {
+                    call_gas += r.gas_used;
+                }
+            }
+            let (bytes, gas_used) = next.block_usage(&txs, call_gas);
+            next.close_block(h, &p, bytes, gas_used);
+            let block = signed_block(txs, &a, h, next.state_root());
+            (next, block)
+        };
+
+        // Block 2: one call declaring 40 000 gas, paid at the genesis prices.
+        let raise = StubExecutor::make_proof_with_gas(&id, 12, [7; 8], 40_000);
+        let raise_fee = gas::circuit_call_floor(genesis_prices.gas_price, genesis_prices.byte_price, 40_000, raise.len());
+        let (p2_ledger, b2) = propose(&l, vec![call_tx(&l, 20, id, raise, raise_fee)], 2);
+        let p2 = p2_ledger.gas_prices();
+        assert!(p2.gas_price > genesis_prices.gas_price, "block 2 raised the gas price: {p2:?}");
+
+        // Block 3: a transfer, a Deploy and a tier-14 call, each paying its floor plus a tip.
         let limit = gas::gas_max(14, 0, 0);
         let proof = StubExecutor::make_proof_with_gas(&id, 14, [7; 8], limit);
-        let call = call_tx(&l, 20, id, proof.clone(), gas::circuit_call_floor(100, 800, limit, proof.len()) + 11);
-        let transfer = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[40; 8], [41; 8]], [[42; 8], [43; 8]], gas::BUNDLE_BASE + 5), Action::None));
+        let floor = gas::circuit_call_floor(p2.gas_price, p2.byte_price, limit, proof.len());
+        assert_ne!(floor, gas::circuit_call_floor(genesis_prices.gas_price, genesis_prices.byte_price, limit, proof.len()));
         let deploy = Action::Deploy { base_pc: 0, words: vec![0x17; 5], public: vec![] };
-        let deploy = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[50; 8], [51; 8]], [[52; 8], [53; 8]], gas::fee_floor(&deploy) + 7), deploy));
-        let txs = vec![transfer, deploy, call];
-        // The root the block must commit to: the one a trial apply computes (it names it in the
-        // mismatch against a zero root).
-        let computed = match l.clone().apply_block(&signed_block(txs.clone(), &a, 2, Hash::ZERO), &StubExecutor) {
-            Err(BlockError::StateRootMismatch { computed, .. }) => computed,
-            other => panic!("{other:?}"),
-        };
-        let block = signed_block(txs, &a, 2, computed);
-        let (mut proposer, mut replica) = (l.clone(), l.clone());
-        proposer.apply_block(&block, &StubExecutor).unwrap();
-        replica.apply_block(&block, &StubExecutor).unwrap();
+        let deploy_floor = gas::fee_floor(&deploy);
+        let txs = vec![
+            StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[40; 8], [41; 8]], [[42; 8], [43; 8]], gas::BUNDLE_BASE + 5), Action::None)),
+            StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[50; 8], [51; 8]], [[52; 8], [53; 8]], deploy_floor + 7), deploy)),
+            call_tx(&l, 30, id, proof, floor + 11),
+        ];
+        let (proposer, b3) = propose(&p2_ledger, txs, 3);
+        assert_eq!(proposer.base_fees_burned() - p2_ledger.base_fees_burned(), gas::BUNDLE_BASE + deploy_floor + floor);
+        assert_eq!(proposer.validators()[&p].rewards - p2_ledger.validators()[&p].rewards, 5 + 7 + 11);
+        assert!(proposer.audit().invariant_holds(), "{:?}", proposer.audit());
+
+        let mut replica = l.clone();
+        replica.apply_block(&b2, &StubExecutor).unwrap();
+        replica.apply_block(&b3, &StubExecutor).unwrap();
         assert_eq!(replica.state_root(), proposer.state_root());
-        assert_eq!(replica, proposer);
-        let burned = gas::BUNDLE_BASE + gas::fee_floor(&Action::Deploy { base_pc: 0, words: vec![0x17; 5], public: vec![] })
-            + gas::circuit_call_floor(100, 800, limit, proof.len());
-        assert_eq!(replica.base_fees_burned() - l.base_fees_burned(), burned);
-        assert_eq!(replica.validators()[&a.address()].rewards - l.validators()[&a.address()].rewards, 5 + 7 + 11);
-        assert!(replica.audit().invariant_holds(), "{:?}", replica.audit());
+        assert_eq!(replica.gas_prices(), proposer.gas_prices());
+        assert_eq!(replica.base_fees_burned(), proposer.base_fees_burned());
+        assert_eq!(replica.supply(), proposer.supply());
+        assert_eq!(replica.validators()[&p].rewards, proposer.validators()[&p].rewards);
+        assert_eq!(replica.audit(), proposer.audit());
     }
 }

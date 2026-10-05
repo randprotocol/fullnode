@@ -737,9 +737,10 @@ fn gas_commit(g: &gas::GasConfig) -> Vec<u8> {
 /// The bytes a `fees` section appends to the genesis commitment, right after the `tokens`
 /// contribution: `"fees"`, then `"burn_base" ‖ 1` if `burn_base` is `true`, then
 /// `"subsidy_net_of_fees" ‖ 1` if `subsidy_net_of_fees` is `true`, then `"burn_floor" ‖ 1` if
-/// `burn_floor` is `true` (issue #135; appended last so the two older flags' bytes, and every
-/// hash pinned over them, stay put), in that order — and nothing at all when no flag is `true`, so a file that spells the defaults out hashes as one without
-/// the section (TOK-2's rule for `burn_registration_fee`). Pinned byte for byte by
+/// `burn_floor` is `true` (issue #135; appended last so the two older flags' bytes, and every hash
+/// pinned over them, stay put), in that order — and nothing at all when no flag is `true`, so a
+/// file that spells the defaults out hashes as one without the section (TOK-2's rule for
+/// `burn_registration_fee`). Pinned byte for byte by
 /// `the_fees_sections_hash_contribution_is_pinned`.
 fn fees_commit(f: &crate::ledger::fees::FeesConfig) -> Vec<u8> {
     let mut commit = Vec::new();
