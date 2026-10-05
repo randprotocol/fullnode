@@ -723,6 +723,9 @@ enum Cmd {
         /// `docs/node-hardware.md` §6; `RAYON_NUM_THREADS` when set).
         #[arg(long, value_name = "N")]
         prover_threads: Option<usize>,
+        /// Proof-verification workers (default: the cores minus two, at least four — spec 2026-10-05 §6).
+        #[arg(long, value_name = "N")]
+        verify_workers: Option<usize>,
         /// Skip the free-memory gate that refuses a prover the machine cannot hold.
         #[arg(long)]
         prover_skip_memory_check: bool,
@@ -1931,6 +1934,7 @@ async fn main() -> Result<()> {
             prover_cuda,
             prover_cpu,
             prover_threads,
+            verify_workers,
             prover_skip_memory_check,
             prover_allow_origin,
             prover_fee,
@@ -1996,6 +2000,7 @@ async fn main() -> Result<()> {
                 verify: verify_chain.parse().map_err(|e: String| anyhow::anyhow!(e))?,
                 keep_raw_proofs,
                 min_free_disk_bytes: min_free_disk_mb << 20,
+                verify_workers,
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
             }, rpc_options, node::NetOptions { reserved_peers: reserved_peer, strict_gossip })

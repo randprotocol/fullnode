@@ -540,23 +540,43 @@ impl PeerLimiter {
     }
 }
 
-/// How many proof verifications may run on blocking workers at once.
-///
-/// Four, against a machine that also runs the consensus loop, RocksDB and the RPC server: a warm
-/// bundle verification is ~20 ms of pure CPU, so four of them saturate four cores and no more. The
-/// number is a *concurrency* bound, not a throughput target — the queue below is what absorbs a
-/// burst.
-pub const MAX_VERIFY_IN_FLIGHT: usize = 4;
+/// How many proof verifications run on blocking workers at once, and how many wait for a slot
+/// (spec 2026-10-05 §6). The floor is today's four: a warm bundle verification is ~20 ms of
+/// pure CPU, and a machine that also runs the consensus loop, RocksDB and the RPC server keeps
+/// two cores for them. The queue is sixteen per worker (today's 64 for 4): sized against
+/// gossipsub's 2.5 s validation window (`history_length` 5 x 500 ms) — at ~20 ms a verification,
+/// sixteen deep is ~320 ms of work per worker, inside the window even cold. A transaction past
+/// the queue is shed with an `Ignore`, which an honest peer re-gossips on its next heartbeat.
+/// The in-flight number is a concurrency bound, not a throughput target; the queue absorbs bursts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifyLimits {
+    pub in_flight: usize,
+    pub queue: usize,
+}
 
-/// How many transactions may be waiting for one of those slots.
-///
-/// Sized against gossipsub's validation window rather than against memory: a message stays in
-/// gossipsub's cache for `history_length` heartbeats (5 × 500 ms = 2.5 s), and a verdict later than
-/// that reports into nothing. At ~20 ms a verification and four at a time, 64 queued is ~320 ms of
-/// work — comfortably inside the window even when every proof is cold. Deeper would only buy
-/// verdicts nobody can act on; the 65th transaction is shed with an `Ignore`, which an honest peer
-/// re-gossips on its next heartbeat.
-pub const MAX_VERIFY_QUEUE: usize = 64;
+impl VerifyLimits {
+    pub const FLOOR: usize = 4;
+    pub const QUEUE_PER_WORKER: usize = 16;
+
+    /// The cores minus two (consensus loop, RocksDB and RPC keep those), never under the floor.
+    pub fn for_cores(cores: usize) -> VerifyLimits {
+        let in_flight = cores.saturating_sub(2).max(Self::FLOOR);
+        VerifyLimits { in_flight, queue: in_flight * Self::QUEUE_PER_WORKER }
+    }
+
+    /// [`VerifyLimits::for_cores`] of this host's available parallelism.
+    pub fn for_host() -> VerifyLimits {
+        Self::for_cores(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(Self::FLOOR))
+    }
+
+    /// `--verify-workers N`: exactly N, `0` refused — never defaulted, as `--threads 0` is not.
+    pub fn fixed(workers: usize) -> Result<VerifyLimits, String> {
+        if workers == 0 {
+            return Err("--verify-workers must be at least 1".into());
+        }
+        Ok(VerifyLimits { in_flight: workers, queue: workers * Self::QUEUE_PER_WORKER })
+    }
+}
 
 /// What this node has decided to tell gossipsub about one delivered message.
 ///
@@ -617,7 +637,8 @@ impl GossipOutcome {
 
     /// `bucket` is the **forwarding** peer's allowance (`node::Peer::tx_bucket`, looked up by
     /// `GossipId.propagation_source`), and `None` for an RPC submission, which is not metered.
-    /// `queued` is the current verification queue depth.
+    /// `queued` is the current verification queue depth and `queue_cap` its limit
+    /// ([`VerifyLimits::queue`]): at or past it the transaction is shed with an `Ignore`.
     ///
     /// The order is the point. The bucket first (audit v6, GOSSIP-1): the transaction id hashes
     /// the whole transaction, proofs included — up to a block's worth of bytes — so nothing that
@@ -633,13 +654,15 @@ impl GossipOutcome {
         refused: &mut RefusedCache,
         limiter: &PeerLimiter,
         queued: usize,
+        queue_cap: usize,
         now: Instant,
     ) -> GossipOutcome {
-        Self::for_transaction_hashed(tx, || tx.hash(), bucket, refused, limiter, queued, now)
+        Self::for_transaction_hashed(tx, || tx.hash(), bucket, refused, limiter, queued, queue_cap, now)
     }
 
     /// [`GossipOutcome::for_transaction`] with the transaction id computed by `hash`, called at
     /// most once — the seam a test counts the hashing through.
+    #[allow(clippy::too_many_arguments)] // `for_transaction`'s seven plus the hash closure the test counts through.
     pub(crate) fn for_transaction_hashed(
         tx: &Transaction,
         hash: impl FnOnce() -> Hash,
@@ -647,6 +670,7 @@ impl GossipOutcome {
         refused: &mut RefusedCache,
         limiter: &PeerLimiter,
         queued: usize,
+        queue_cap: usize,
         now: Instant,
     ) -> GossipOutcome {
         if let Some(b) = bucket {
@@ -671,7 +695,7 @@ impl GossipOutcome {
             refused.insert(h, e);
             return GossipOutcome::Report(Acceptance::Reject);
         }
-        if queued >= MAX_VERIFY_QUEUE {
+        if queued >= queue_cap {
             return GossipOutcome::Report(Acceptance::Ignore);
         }
         GossipOutcome::Verify
@@ -1018,6 +1042,17 @@ mod tests {
     use randprotocol_core::confidential::ConfidentialError;
     use randprotocol_core::Address;
     use std::time::Duration;
+
+    #[test]
+    fn verify_limits_follow_the_cores_with_a_floor_of_four() {
+        assert_eq!(VerifyLimits::for_cores(1), VerifyLimits { in_flight: 4, queue: 64 }, "a two-core droplet is today's 4/64");
+        assert_eq!(VerifyLimits::for_cores(6), VerifyLimits { in_flight: 4, queue: 64 });
+        assert_eq!(VerifyLimits::for_cores(8), VerifyLimits { in_flight: 6, queue: 96 });
+        assert_eq!(VerifyLimits::for_cores(16), VerifyLimits { in_flight: 14, queue: 224 });
+        assert_eq!(VerifyLimits::fixed(3).unwrap(), VerifyLimits { in_flight: 3, queue: 48 });
+        assert!(VerifyLimits::fixed(0).unwrap_err().contains("at least 1"));
+        assert!(VerifyLimits::for_host().in_flight >= 4);
+    }
 
     fn h(n: u8) -> Hash {
         Hash::digest(&[n])
@@ -1399,7 +1434,7 @@ mod tests {
         assert_eq!(oversized_note(&payer), None);
         let mut refused = RefusedCache::new(4);
         assert_eq!(
-            GossipOutcome::for_transaction(&huge, None, &mut refused, &PeerLimiter::new(16, 4.0), 0, Instant::now()),
+            GossipOutcome::for_transaction(&huge, None, &mut refused, &PeerLimiter::new(16, 4.0),  0, VerifyLimits::for_cores(1).queue, Instant::now()),
             GossipOutcome::Report(Acceptance::Reject)
         );
         assert!(refused.get(&huge.hash()).is_some());
@@ -1556,7 +1591,7 @@ mod tests {
         let limiter = PeerLimiter::new(16, 4.0);
         let now = Instant::now();
         assert_eq!(
-            GossipOutcome::for_transaction(&mint, None, &mut refused, &limiter, 0, now),
+            GossipOutcome::for_transaction(&mint, None, &mut refused, &limiter,  0, VerifyLimits::for_cores(1).queue, now),
             GossipOutcome::Report(Acceptance::Reject)
         );
         assert_eq!(
@@ -1565,13 +1600,13 @@ mod tests {
         );
         let mut bucket = TokenBucket::default();
         assert_eq!(
-            GossipOutcome::for_transaction(&deposit(MAX_NOTE_VALUE as u128, 4), Some(&mut bucket), &mut refused, &limiter, 0, now),
+            GossipOutcome::for_transaction(&deposit(MAX_NOTE_VALUE as u128, 4), Some(&mut bucket), &mut refused, &limiter,  0, VerifyLimits::for_cores(1).queue, now),
             GossipOutcome::Report(Acceptance::Reject)
         );
         // A byte verdict needs the hash, which is paid for only within the forwarder's allowance
         // (audit v6, GOSSIP-1): the refusal spent one token.
         assert_eq!(bucket.tokens, Some(15.0), "the refusal was reached within the peer's allowance");
-        assert_eq!(GossipOutcome::for_transaction(&fits, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
+        assert_eq!(GossipOutcome::for_transaction(&fits, None, &mut refused, &limiter,  0, VerifyLimits::for_cores(1).queue, now), GossipOutcome::Verify);
     }
 
     /// COV-2: a call proof whose input table is 2^3 rows (a four-word call, what every wallet's
@@ -1679,7 +1714,7 @@ mod tests {
         let limiter = PeerLimiter::new(16, 4.0);
         let now = Instant::now();
         assert_eq!(
-            GossipOutcome::for_transaction(&wraps, None, &mut refused, &limiter, 0, now),
+            GossipOutcome::for_transaction(&wraps, None, &mut refused, &limiter,  0, VerifyLimits::for_cores(1).queue, now),
             GossipOutcome::Report(Acceptance::Reject),
             "a program no call can prove is refused at the door"
         );
@@ -1687,12 +1722,12 @@ mod tests {
         assert_eq!(refused.get(&wraps.hash()), Some(&verdict), "cached as the byte verdict it is");
         assert!(is_permanent(&verdict));
         assert_eq!(
-            GossipOutcome::for_transaction(&floored_wraps, None, &mut refused, &limiter, 0, now),
+            GossipOutcome::for_transaction(&floored_wraps, None, &mut refused, &limiter,  0, VerifyLimits::for_cores(1).queue, now),
             GossipOutcome::Report(Acceptance::Reject),
             "PCW-FLOOR: its 16 rows end at 2^32, the 128 a hardened call declares do not"
         );
-        assert_eq!(GossipOutcome::for_transaction(&fits, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
-        assert_eq!(GossipOutcome::for_transaction(&deploy(0), None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
+        assert_eq!(GossipOutcome::for_transaction(&fits, None, &mut refused, &limiter,  0, VerifyLimits::for_cores(1).queue, now), GossipOutcome::Verify);
+        assert_eq!(GossipOutcome::for_transaction(&deploy(0), None, &mut refused, &limiter,  0, VerifyLimits::for_cores(1).queue, now), GossipOutcome::Verify);
     }
 
     /// CPU-1: a deploy past the most program words a tier-14 call can hold (8 184 with an empty

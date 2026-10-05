@@ -112,6 +112,7 @@ async fn the_hosted_prover_answers_beside_the_node_and_its_exit_stops_the_node()
         verify: randprotocol_node::storage::VerifyMode::Full,
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
+        verify_workers: None,
         prune_history: None,
         gas_policy: None,
     })
@@ -184,6 +185,7 @@ async fn the_node_stops_cleanly_on_shutdown_with_its_prover() {
         verify: randprotocol_node::storage::VerifyMode::Full,
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
+        verify_workers: None,
         prune_history: None,
         gas_policy: None,
     })

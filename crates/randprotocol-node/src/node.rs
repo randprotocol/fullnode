@@ -2,7 +2,7 @@
 //! network handle; turns consensus `Action`s into I/O and network events into
 //! consensus input.
 
-use crate::admission::{self, GossipOutcome, Verdict, VerifySource, MAX_VERIFY_IN_FLIGHT};
+use crate::admission::{self, GossipOutcome, Verdict, VerifySource, VerifyLimits};
 use crate::mempool::{Mempool, MempoolError};
 use crate::network::{
     self, GossipId, GossipMessage, NetworkConfig, NetworkEvent, NetworkHandle, Status, SyncRequest, SyncResponse,
@@ -76,6 +76,9 @@ pub struct NodeConfig {
     /// `disk_low` in `rand_getHealth` under [`disk::DISK_LOW_FACTOR`] times it (audit v4 OPS-3).
     /// `--min-free-disk-mb`, default 1 GB; zero disables the guard.
     pub min_free_disk_bytes: u64,
+    /// Proof-verification workers (`--verify-workers`); `None` sizes them to the host
+    /// ([`VerifyLimits::for_host`], spec 2026-10-05 §6).
+    pub verify_workers: Option<usize>,
     /// Keep only this much block history (history pruning spec §1); `None` keeps everything.
     pub prune_history: Option<Duration>,
     /// Spec 2026-09-28 §4.1: price calls by their proof header; None = no policy.
@@ -514,7 +517,7 @@ fn validate_for_pool(
 ///
 /// Why here and not around each `Machine::verify`: the worker is where a panic does lasting
 /// harm. It is a `spawn_blocking` task that sends its verdict at the end, so a panicking verify
-/// killed it silently — no verdict, the in-flight slot (`MAX_VERIFY_IN_FLIGHT`) never returned,
+/// killed it silently — no verdict, the in-flight slot (`VerifyLimits::in_flight`) never returned,
 /// the gossip message never reported (gossipsub then stops forwarding it) — and four such proofs
 /// left the node admitting nothing. On the consensus path (block apply) a panic is left to crash
 /// the node, as before: every honest node panics on the same bytes, so swallowing it there would
@@ -1045,11 +1048,14 @@ struct Node {
     /// per consensus message would cost one per vote, so it is taken only when a transaction is
     /// waiting and the tip's `(height, root)` has moved since the last one.
     snapshot: Option<(u64, Word8, Arc<Ledger>)>,
-    /// Verifications on blocking workers right now, capped at [`MAX_VERIFY_IN_FLIGHT`].
+    /// Verifications on blocking workers right now, capped at `verify_limits.in_flight`.
     verify_in_flight: usize,
-    /// Transactions waiting for one of those slots, capped at `admission::MAX_VERIFY_QUEUE` by
+    /// Transactions waiting for one of those slots, capped at `verify_limits.queue` by
     /// [`GossipOutcome::for_transaction`].
     verify_queue: VecDeque<(Transaction, VerifySource)>,
+    /// The verification concurrency and queue bounds, sized to the host once at startup
+    /// (spec 2026-10-05 §6; `--verify-workers` overrides).
+    verify_limits: VerifyLimits,
     /// The sender every verification task answers on; its receiver is an arm of the loop's
     /// `select!`.
     verdicts_tx: mpsc::Sender<Verdict>,
@@ -2229,9 +2235,16 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     }
 
     let address = key.address();
-    // At most `MAX_VERIFY_IN_FLIGHT` verdicts can be outstanding — a worker only exists because the
-    // loop counted it in — so the channel never has to hold more than that.
-    let (verdicts_tx, verdicts_rx) = mpsc::channel(MAX_VERIFY_IN_FLIGHT);
+    let verify_limits = cfg
+        .verify_workers
+        .map(VerifyLimits::fixed)
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or_else(VerifyLimits::for_host);
+    tracing::info!("verify workers: {} in flight, {} queued", verify_limits.in_flight, verify_limits.queue);
+    // At most `verify_limits.in_flight` verdicts can be outstanding — a worker only exists because
+    // the loop counted it in — so the channel never has to hold more than that.
+    let (verdicts_tx, verdicts_rx) = mpsc::channel(verify_limits.in_flight);
     // RESCAN-LEDGER-1: this pool admits faucet mints from the genesis's minters only.
     let mut mempool = Mempool::new(10_000);
     mempool.set_faucet_minters(admission::faucet_minters(&gs));
@@ -2295,6 +2308,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         faucet_bucket: admission::TokenBucket::default(),
         snapshot: None,
         verify_in_flight: 0,
+        verify_limits,
         verify_queue: VecDeque::new(),
         verdicts_tx,
     };
@@ -2512,7 +2526,7 @@ impl Node {
     /// Nothing here blocks: `spawn_blocking` puts the proof work on a worker thread and the loop
     /// goes straight back to the `select!`. The verdict returns on its own arm.
     fn pump_verify(&mut self) {
-        while self.verify_in_flight < MAX_VERIFY_IN_FLIGHT {
+        while self.verify_in_flight < self.verify_limits.in_flight {
             let Some((tx, source)) = self.verify_queue.pop_front() else { break };
             let ledger = self.snapshot();
             let storage = self.storage.clone();
@@ -2592,6 +2606,7 @@ impl Node {
                 &mut self.refused,
                 &self.limiter,
                 self.verify_queue.len(),
+                self.verify_limits.queue,
                 Instant::now(),
             )
         };
@@ -2624,6 +2639,7 @@ impl Node {
             &mut self.refused,
             &self.limiter,
             self.verify_queue.len(),
+            self.verify_limits.queue,
             Instant::now(),
         );
         if let GossipOutcome::Report(a) = outcome {
@@ -5632,12 +5648,13 @@ mod tests {
             verify: VerifyMode::Off,
             keep_raw_proofs: false,
             min_free_disk_bytes: 0,
+            verify_workers: None,
             prune_history: None,
             gas_policy: None,
         };
         let wire = network::WireLimits::for_ledger(&gs.ledger);
         let max_block_bytes = gs.ledger.max_block_bytes();
-        let (verdicts_tx, _verdicts_rx) = mpsc::channel(MAX_VERIFY_IN_FLIGHT);
+        let (verdicts_tx, _verdicts_rx) = mpsc::channel(VerifyLimits::for_cores(1).in_flight);
         let peer_bindings = crate::peer_bindings::PeerBindings::load(gs.hash(), Default::default(), Default::default());
         let node = Node {
             cfg,
@@ -5695,6 +5712,7 @@ mod tests {
             faucet_bucket: admission::TokenBucket::default(),
             snapshot: None,
             verify_in_flight: 0,
+            verify_limits: VerifyLimits::for_cores(1),
             verify_queue: VecDeque::new(),
             verdicts_tx,
         };
@@ -7393,7 +7411,7 @@ mod tests {
 
     #[test]
     fn every_gossip_outcome_names_exactly_one_acceptance() {
-        use crate::admission::{Acceptance, GossipOutcome, PeerLimiter, RefusedCache, TokenBucket, MAX_VERIFY_QUEUE};
+        use crate::admission::{Acceptance, GossipOutcome, PeerLimiter, RefusedCache, TokenBucket, VerifyLimits};
         let mut refused = RefusedCache::new(4);
         let limiter = PeerLimiter::new(1, 1.0);
         // One forwarding peer's bucket, as it is held on `node::Peer::tx_bucket`.
@@ -7409,41 +7427,41 @@ mod tests {
         // its forwarder's allowance, which the hash that finds it in the cache is paid from
         // (audit v6, GOSSIP-1).
         assert_eq!(
-            GossipOutcome::for_transaction(&tx, Some(&mut TokenBucket::default()), &mut refused, &limiter, 0, t),
+            GossipOutcome::for_transaction(&tx, Some(&mut TokenBucket::default()), &mut refused, &limiter, 0, VerifyLimits::for_cores(1).queue, t),
             GossipOutcome::Report(Acceptance::Reject)
         );
         // A fresh one is queued (and the caller must report when the verdict lands).
         let fresh = transfer(2);
         assert_eq!(
-            GossipOutcome::for_transaction(&fresh, Some(&mut bucket), &mut refused, &limiter, 0, t),
+            GossipOutcome::for_transaction(&fresh, Some(&mut bucket), &mut refused, &limiter, 0, VerifyLimits::for_cores(1).queue, t),
             GossipOutcome::Verify
         );
         // The same *forwarder's* next one is over the rate limit: ignored, not rejected — an honest
         // peer in a burst must not be penalised.
         assert_eq!(
-            GossipOutcome::for_transaction(&fresh, Some(&mut bucket), &mut refused, &limiter, 0, t),
+            GossipOutcome::for_transaction(&fresh, Some(&mut bucket), &mut refused, &limiter, 0, VerifyLimits::for_cores(1).queue, t),
             GossipOutcome::Report(Acceptance::Ignore)
         );
         // A different forwarder has its own bucket, because it has its own `node::Peer`.
         let mut other = TokenBucket::default();
         assert_eq!(
-            GossipOutcome::for_transaction(&fresh, Some(&mut other), &mut refused, &limiter, 0, t),
+            GossipOutcome::for_transaction(&fresh, Some(&mut other), &mut refused, &limiter, 0, VerifyLimits::for_cores(1).queue, t),
             GossipOutcome::Verify
         );
         // And a full queue sheds the same way (no bucket: this is the RPC path).
         assert_eq!(
-            GossipOutcome::for_transaction(&fresh, None, &mut refused, &limiter, MAX_VERIFY_QUEUE, t),
+            GossipOutcome::for_transaction(&fresh, None, &mut refused, &limiter, VerifyLimits::for_cores(1).queue, VerifyLimits::for_cores(1).queue, t),
             GossipOutcome::Report(Acceptance::Ignore)
         );
         // The refused cache is consulted before the queue depth, so a full queue does not mask a
         // refusal — but after the bucket (GOSSIP-1): a forwarder over its allowance is ignored
         // before its transaction is hashed, known-bad or not.
         assert_eq!(
-            GossipOutcome::for_transaction(&tx, Some(&mut TokenBucket::default()), &mut refused, &limiter, MAX_VERIFY_QUEUE, t),
+            GossipOutcome::for_transaction(&tx, Some(&mut TokenBucket::default()), &mut refused, &limiter, VerifyLimits::for_cores(1).queue, VerifyLimits::for_cores(1).queue, t),
             GossipOutcome::Report(Acceptance::Reject)
         );
         assert_eq!(
-            GossipOutcome::for_transaction(&tx, Some(&mut bucket), &mut refused, &limiter, 0, t),
+            GossipOutcome::for_transaction(&tx, Some(&mut bucket), &mut refused, &limiter, 0, VerifyLimits::for_cores(1).queue, t),
             GossipOutcome::Report(Acceptance::Ignore)
         );
     }
@@ -7465,7 +7483,7 @@ mod tests {
         let mut spent = TokenBucket::default();
         assert!(limiter.allow(&mut spent, t));
         assert_eq!(
-            GossipOutcome::for_transaction_hashed(&tx, counted, Some(&mut spent), &mut refused, &limiter, 0, t),
+            GossipOutcome::for_transaction_hashed(&tx, counted, Some(&mut spent), &mut refused, &limiter, 0, VerifyLimits::for_cores(1).queue, t),
             GossipOutcome::Report(Acceptance::Ignore)
         );
         assert_eq!(hashes.get(), 0, "a forwarder over its allowance cost no hash");
@@ -7474,7 +7492,7 @@ mod tests {
             tx.hash()
         };
         assert_eq!(
-            GossipOutcome::for_transaction_hashed(&tx, counted, Some(&mut TokenBucket::default()), &mut refused, &limiter, 0, t),
+            GossipOutcome::for_transaction_hashed(&tx, counted, Some(&mut TokenBucket::default()), &mut refused, &limiter, 0, VerifyLimits::for_cores(1).queue, t),
             GossipOutcome::Verify
         );
         assert_eq!(hashes.get(), 1, "within it, the transaction is hashed once");
@@ -7502,13 +7520,13 @@ mod tests {
         let limiter = PeerLimiter::new(16, 4.0);
         let now = std::time::Instant::now();
         // The copy arrives first and is verified — and refused, but not as a statement about the id.
-        assert_eq!(GossipOutcome::for_transaction(&marker, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
+        assert_eq!(GossipOutcome::for_transaction(&marker, None, &mut refused, &limiter, 0, VerifyLimits::for_cores(1).queue, now), GossipOutcome::Verify);
         let verdict = validate_for_pool(&marker, &gs.ledger, &storage, profile, &StubExecutor);
         assert!(verdict.is_err(), "the marker form is not admissible outside sync");
         assert_ne!(acceptance_for(&verdict, marker.hash(), &mut refused), Acceptance::Reject);
         assert!(refused.is_empty(), "nothing cached under the shared id: {:?}", refused.get(&raw.hash()));
         // The honest transaction is then verified, not answered from the cache, and admitted.
-        assert_eq!(GossipOutcome::for_transaction(&raw, None, &mut refused, &limiter, 0, now), GossipOutcome::Verify);
+        assert_eq!(GossipOutcome::for_transaction(&raw, None, &mut refused, &limiter, 0, VerifyLimits::for_cores(1).queue, now), GossipOutcome::Verify);
         assert_eq!(validate_for_pool(&raw, &gs.ledger, &storage, profile, &StubExecutor), Ok(()));
     }
 
