@@ -224,9 +224,9 @@ derived from the trace sizes.
 
 What it means for hardware:
 
-- **A production aggregator needs a ≥ 512 GB host** for N = 1 at constraint set 8, the smallest
-  useful aggregate (≈ 240 GB projected after the phase-2 row cuts, ≈ 170–175 GB after the
-  quotient layout, below).
+- **A production aggregator needed a ≥ 512 GB host** for N = 1 at constraint set 8, the smallest
+  useful aggregate (measured); ≈ 240 GB projected after the phase-2 row cuts and ≈ 170–175 GB
+  after the quotient layout, so a ≥ 256 GB host (below), a projection until the tier-20 proof runs.
   The earlier "≥ 64 GB" class came from a 48.6 GB oracle that the measurement disproved.
 - **N ≥ 2 at production does not fit any single CPU host** on offer, and the GPU backend does not
   change that: the traces live in host memory. Aggregating more than one proof needs a design

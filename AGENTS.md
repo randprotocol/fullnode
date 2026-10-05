@@ -27,7 +27,8 @@ upstream's new `license` line to the workspace form. Re-vendored again at `5ff76
 quotient-layout fork, `vendor/p3-batch-stark` here too): rVM proofs one quotient matrix per
 instance, the aggregate program digest unchanged. `CIRCUITS_PIN` = `5ff7676…` while both
 manifests' `rand-zkvm-cuda` `rev` stays `75b78938…` (backend sources identical; synced with
-`CUDA_REV=75b7893…` before `5ff7676` was pushed — push it to `randprotocol` before CI, trap 4).
+`CUDA_REV=75b7893…` before `5ff7676` was pushed; it was pushed to both `org` and `origin` on
+2026-10-05, so trap 4 is satisfied for this pin).
 Memory, measured: the tier-18 test twin proves at 33.27 GB peak live (a 64 GB host suffices);
 production N=1 projected ≈ 170–175 GB.
 
