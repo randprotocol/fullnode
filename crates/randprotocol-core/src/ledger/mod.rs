@@ -1349,6 +1349,14 @@ impl Ledger {
 
     /// The commit step of the shared sets (spec 2026-10-05 §5.2): the committed ledger's deltas
     /// become base. `HotStuff` calls it once per commit, on the committed ledger only.
+    ///
+    /// `Ledger` is no longer a value type across commits: a clone that shares the base sees the
+    /// entries committed afterwards. Soundness needs that at commit every ledger still held
+    /// either descends from the committed block or is a read-only snapshot used for membership
+    /// only (admission), for which gaining the committed spends is harmless. The two bases'
+    /// write locks are taken one after the other, so a reader on another thread can observe the
+    /// commitments committed and the nullifiers not yet; that is harmless under the same
+    /// precondition.
     pub fn commit_shared_sets(&mut self) {
         self.commitments.commit();
         self.nullifiers.commit();

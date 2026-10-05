@@ -5,10 +5,17 @@
 //! clone copied both sets (28 ms at 10⁶ entries, audit v6). Now a clone copies the delta.
 //!
 //! The base is written by `commit` (drain the delta in) and `detach` (a private copy) only, and
-//! `HotStuff` is the only caller of either: at commit, after the tree keeps only descendants of
-//! the new head, so every surviving clone already holds the committed delta and `absorb` drops
-//! it as redundant. Sound because consensus state is `base ∪ delta` and a commit moves entries
-//! between the two halves of the chain's own ancestors, never adds one.
+//! `HotStuff` is the only caller of either.
+//!
+//! Invariant: a `SharedSet` is not a value type across commits. A clone that shares the base
+//! sees every entry its lineage commits later, so the logical set of a live clone can grow
+//! without the clone being touched. That is sound only under a precondition `HotStuff` enforces:
+//! at commit, every set still held either descends from the committed block (a tree entry after
+//! the prune, which already holds the committed delta, so `absorb` drops it as redundant) or is a
+//! read-only snapshot used for membership only (the node's verify snapshot, a clone of the tip),
+//! for which gaining the committed entries is harmless. Under that precondition a commit moves
+//! entries between the two halves of the chain's own ancestors and never adds one a holder
+//! could not already derive.
 
 use crate::notes::Word8;
 use std::collections::BTreeSet;
@@ -72,7 +79,9 @@ impl SharedSet {
         out
     }
 
-    /// Every entry once, ascending: a merge of the two sorted halves.
+    /// Every entry once, ascending: a merge of the two sorted halves. `f` must not touch this
+    /// set: the base's read guard is held while it runs, and a recursive read with a queued
+    /// writer can deadlock under std's `RwLock`.
     pub fn for_each_sorted(&self, mut f: impl FnMut(&Word8)) {
         let base = self.base();
         let mut a = base.iter().peekable();
@@ -214,13 +223,15 @@ mod tests {
     fn random_programs_agree_with_a_btreeset_oracle() {
         for seed in 0..32u64 {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            let mut sets: Vec<(SharedSet, std::collections::BTreeSet<Word8>)> = vec![(SharedSet::new(), Default::default())];
+            // (set, oracle, sharing group): `.clone()` keeps the group, `detach` starts a new one.
+            let mut sets: Vec<(SharedSet, std::collections::BTreeSet<Word8>, u32)> = vec![(SharedSet::new(), Default::default(), 0)];
+            let mut next_group = 1u32;
             for _ in 0..400 {
                 let i = rng.gen_range(0..sets.len());
-                match rng.gen_range(0..10) {
+                match rng.gen_range(0..11) {
                     0..=5 => {
                         let x = w(rng.gen_range(0..64));
-                        let (s, o) = &mut sets[i];
+                        let (s, o, _) = &mut sets[i];
                         assert_eq!(s.insert(x), o.insert(x), "seed {seed}");
                     }
                     6 => {
@@ -231,20 +242,34 @@ mod tests {
                         // Commit i, then absorb every clone (what HotStuff does): only clones
                         // that are supersets of i stay consistent, so make them so first.
                         let committed = sets[i].1.clone();
-                        for (s, o) in sets.iter_mut() {
+                        for (s, o, _) in sets.iter_mut() {
                             for x in &committed { if o.insert(*x) { s.insert(*x); } }
                         }
                         sets[i].0.commit();
-                        for (s, _) in sets.iter_mut() { s.absorb(); }
+                        for (s, _, _) in sets.iter_mut() { s.absorb(); }
                     }
-                    8 => sets[i].0.detach(),
+                    8 => {
+                        // Commit i without pre-inserting: every clone sharing i's base now sees
+                        // the committed entries, so its oracle gains them (not a superset case).
+                        let delta = sets[i].0.added.clone();
+                        let group = sets[i].2;
+                        sets[i].0.commit();
+                        for (_, o, g) in sets.iter_mut() {
+                            if *g == group { o.extend(delta.iter().copied()); }
+                        }
+                    }
+                    9 => {
+                        sets[i].0.detach();
+                        sets[i].2 = next_group;
+                        next_group += 1;
+                    }
                     _ => {
                         let x = w(rng.gen_range(0..64));
-                        let (s, o) = &sets[i];
+                        let (s, o, _) = &sets[i];
                         assert_eq!(s.contains(&x), o.contains(&x), "seed {seed}");
                     }
                 }
-                for (s, o) in &sets {
+                for (s, o, _) in &sets {
                     assert_eq!(s.len(), o.len(), "seed {seed}: len");
                     assert_eq!(s.snapshot(), *o, "seed {seed}: contents");
                 }
