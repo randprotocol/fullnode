@@ -20,8 +20,12 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
   `base_fees_burned` sits on the right of the supply identity, persisted under
   `META_BASE_FEES_BURNED` and replay-audited; the section is stored under `META_FEES` and restored
   from the genesis file by `reload_ledger`. RPC: `rand_getSupply.base_fees_burned`,
-  `rand_getLimits.fee_rules` (`docs/rpc.md` changelog). `fees.subsidy_net_of_fees` is parsed,
-  hashed and validated (it needs `aggregation`); its payment rule lands with the plan's Task 2.
+  `rand_getLimits.fee_rules` (`docs/rpc.md` changelog).
+- **Fee feedback, the fee-first subsidy** (same gating): under `fees.subsidy_net_of_fees` (it
+  needs `aggregation`) an aggregate's proving shares pay the subsidy schedule first and only the
+  shortfall is minted — the payout note is `max(subsidy(n), shares)`, `subsidised` and
+  `rand_getAggregate.subsidy` move by the minted part, `sealed_blocks` advances as before
+  (`docs/fees.md` §1.3, `docs/aggregation.md` §3.3).
 
 ## v0.7.1 — 2026-10-07 (chain 20, node-only)
 

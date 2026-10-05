@@ -4202,6 +4202,13 @@ mod tests {
     /// the seal tests' chain — the applied sets use the stub twins where the stored bytes are a
     /// real proof.
     fn gated_chain() -> (tempfile::TempDir, RpcState, GenesisState, Transaction, Transaction) {
+        gated_chain_with(randprotocol_core::ledger::fees::FeesConfig::default())
+    }
+
+    /// [`gated_chain`] on a chain with the given genesis `fees` section.
+    fn gated_chain_with(
+        fees: randprotocol_core::ledger::fees::FeesConfig,
+    ) -> (tempfile::TempDir, RpcState, GenesisState, Transaction, Transaction) {
         use randprotocol_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
         use randprotocol_core::types::actions::{aggregate_signing_hash, aggregator_register_message, AggregatorRegistration};
         use randprotocol_core::types::{CoveredBundle, DeclaredShape, FriProfile};
@@ -4231,6 +4238,7 @@ mod tests {
             window: 256,
             admitted_shapes: vec![AdmittedShape { shape, hc, aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap() }],
         }));
+        gs.ledger.set_fees(fees);
         let (dir, st) = state_for(&gs);
 
         let fee = bundle_fee() + 60;
@@ -4313,6 +4321,19 @@ mod tests {
         let b1 = make_block(&gs.block, &mut ledger, vec![tx], &key(1));
         st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
         (dir, st, gs)
+    }
+
+    /// Fee feedback, `fees.subsidy_net_of_fees` (`docs/fees.md` §1.3): `rand_getAggregate`'s
+    /// `subsidy` is what the aggregate minted — the schedule's shortfall over the proving share —
+    /// so `subsidy + proving_share` is still the payout note's amount, `max(schedule, shares)`.
+    #[tokio::test]
+    async fn get_aggregate_reports_the_minted_subsidy_under_subsidy_net_of_fees() {
+        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true) };
+        let (_d, st, _gs, _covered_tx, aggregate) = gated_chain_with(fees);
+        let v = ok(&st, "rand_getAggregate", json!([aggregate.hash().to_hex()])).await;
+        assert_eq!(v["subsidy"], (100 * randprotocol_core::UNITS_PER_RAND - 60).to_string(), "only the shortfall");
+        assert_eq!(v["proving_share"], "60");
+        assert_eq!(v["n"], 0);
     }
 
     /// The aggregation surface (spec §8): the block's `sealed` flag and the per-bundle

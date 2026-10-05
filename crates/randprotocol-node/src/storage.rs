@@ -2754,7 +2754,6 @@ impl Storage {
                     }
                     if let Some(cfg) = ledger_after.aggregation() {
                         let n = ledger_after.supply().sealed_blocks.saturating_sub(1);
-                        let subsidy = randprotocol_core::gas::subsidy(n, cfg);
                         // Each cover at the excess the ledger bucketed it at — net of a burned
                         // registration fee (IFACE-7), not `fee − BUNDLE_BASE` — so
                         // `rand_getAggregate`'s `proving_share` is what the payout note paid.
@@ -2764,6 +2763,14 @@ impl Storage {
                                 shares = shares.saturating_add(ledger_after.bucketed_excess(&covered_tx));
                             }
                         }
+                        // What the aggregate minted, by the ledger's own rule: the schedule, or
+                        // under `fees.subsidy_net_of_fees` its shortfall over the shares
+                        // (`docs/fees.md` §1.3) — so `subsidy + proving_share` stays the note.
+                        let subsidy = randprotocol_core::ledger::aggregation::minted_subsidy(
+                            randprotocol_core::gas::subsidy(n, cfg),
+                            shares,
+                            ledger_after.fees(),
+                        );
                         batch.put_cf(
                             self.cf(CF_SEALS),
                             [b"a".as_slice(), tx.hash().as_bytes()].concat(),

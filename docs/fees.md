@@ -190,8 +190,31 @@ paid register-side, out of the amount withdrawn, and never passes the bundle fee
 Beside TOK-2 the two burns add: a registration under both flags destroys `registration_fee +
 BUNDLE_BASE`, each counter moving by its own part.
 
-**`subsidy_net_of_fees`.** The fee-first subsidy (fills in with the plan's Task 2). It needs an
-`aggregation` section (`GenesisError::SubsidyNetOfFeesWithoutAggregation`).
+**`subsidy_net_of_fees`.** The fee-first subsidy: an aggregate's prover pay is funded from the
+fees it collected first and minted only for the shortfall. Without the flag a covering aggregate's
+payout note carries `subsidy(n) + shares` — the schedule (`docs/aggregation.md` §3.2) minted on top
+of the covered bundles' proving shares, however large those are. Under it, in
+`Ledger::aggregate_payment` (spec §5.4, the one function admission and apply both derive the note
+from):
+
+```
+schedule = subsidy(sealed_blocks)
+minted   = schedule − shares, or 0 once shares ≥ schedule
+note     = minted + shares = max(schedule, shares)
+```
+
+With a schedule of 0.6 RAND an aggregate whose covers bucketed 0.4 RAND of proving share
+mints 0.2 RAND and pays 0.6; one whose covers bucketed 0.9 RAND mints nothing and pays 0.9. The
+aggregator is never paid less than the schedule, a busy chain mints less, and a chain whose fees
+cover the schedule mints nothing. `supply.subsidised` — and `rand_getAggregate`'s `subsidy` — move
+by the minted part alone; the shares were already in the pool, so the supply identity holds
+unchanged. `sealed_blocks` still advances by one per aggregate, minted or not: the schedule's
+index counts sealed blocks, not mints, so the halving clock does not stop while fees carry the pay.
+The rule needs an `aggregation` section (`GenesisError::SubsidyNetOfFeesWithoutAggregation`): on a
+chain without one there is no subsidy to net.
+
+Beside `burn_base` the two compose without touching: the base is burned at inclusion, the bucketed
+excess `fee − BUNDLE_BASE` is the share this rule nets against.
 
 ## 2. What the sender pays with its own machine: proving
 

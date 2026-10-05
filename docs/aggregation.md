@@ -93,6 +93,13 @@ aggregate carries the note's blinding `r`, and the ledger derives the commitment
 aggregator cannot mint more than the schedule says. The note's later spend is unlinkable as any
 other.
 
+Under the genesis `fees.subsidy_net_of_fees` (`docs/fees.md` §1.3) the shares pay the schedule
+first (spec §5.4's derivation, `Ledger::aggregate_payment`): the note carries
+`max(subsidy(n), shares)`, and only `subsidy(n) − shares` — nothing once the shares reach the
+schedule — is minted. `subsidised` and `rand_getAggregate`'s `subsidy` carry that minted part;
+`sealed_blocks` advances by one either way. Admission and apply still derive one note from one
+state: the rule lives in that one function.
+
 ### 3.4 Supply accounting
 
 `docs/supply.md`'s value-balance invariant gains a term:

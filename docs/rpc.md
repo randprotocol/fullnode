@@ -1662,7 +1662,9 @@ without the flag): the bundle bases destroyed under the genesis `fees.burn_base`
 `rand_getLimits` gains `fee_rules` (`{ "burn_base", "subsidy_net_of_fees" }`, booleans), `null`
 on a chain whose genesis has no `fees` section with a `true` flag. Under `burn_base` a proposer's
 `rewards` grow by the tip (`fee − BUNDLE_BASE`), or by nothing at inclusion on an aggregating
-chain; no fee a wallet pays changes. Every existing field keeps its value on every chain.
+chain; no fee a wallet pays changes. Under `subsidy_net_of_fees` `rand_getAggregate`'s `subsidy`
+(and `rand_getSupply`'s `subsidised`) carry only the minted part, the schedule's shortfall over
+`proving_share`. Every existing field keeps its value on every chain without the section.
 
 ### 2026-10-01 — audit v6, TOK-1: `tokens.incremental_root` (genesis-gated; no chain carries it yet)
 
@@ -2385,6 +2387,9 @@ see:
 - **`rand_getAggregate(hash)`** returns the sealing aggregate's public fields: `covers`
   (hashes, in proof order), `aggregator`, `subsidy`, `proving_share`, and `n` — the subsidy
   schedule's index the block minted at — plus its `height`. `null` for any other transaction.
+  `subsidy` is what the aggregate minted: `subsidy(n)`, or under the genesis
+  `fees.subsidy_net_of_fees` its shortfall over `proving_share` (`docs/fees.md` §1.3), so
+  `subsidy + proving_share` is always the payout note's amount.
 - **`rand_getAggregators`** lists the register (public by design): `address`, `bond`,
   `payout`, `nonce`, `unbonding` per row.
 - **`rand_getUnsealed(from, limit)`** pages the bundles an aggregator may still cover —

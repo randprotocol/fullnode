@@ -1368,11 +1368,12 @@ same rule as every genesis field before it.
 booleans (`docs/fees.md` §1.3). `burn_base` destroys every bundle's `BUNDLE_BASE` instead of paying
 it to the proposer: the proposer keeps the tip (`fee − BUNDLE_BASE`), or nothing at inclusion on
 an aggregating chain, whose excess is bucketed as before; the base joins `rand_getSupply`'s
-`burned` and `base_fees_burned`. `subsidy_net_of_fees` (the plan's Task 2) needs an `aggregation`
-section, or `rand-node init` refuses the file (`SubsidyNetOfFeesWithoutAggregation`). Absent, or
-present with no `true` flag, is every chain's rule so far and commits nothing; a `true` flag is
-hashed after the `tokens` section's bytes under `fees` and its own tag, so it ships with a chain
-cut, never as a same-chain update. Never in the state root; `reload_ledger` restores the section
+`burned` and `base_fees_burned`. `subsidy_net_of_fees` pays an aggregate's subsidy from its
+proving shares first and mints only the shortfall (the note is `max(schedule, shares)`); it needs
+an `aggregation` section, or `rand-node init` refuses the file
+(`SubsidyNetOfFeesWithoutAggregation`). Absent, or present with no `true` flag, is every chain's
+rule so far and commits nothing; a `true` flag is hashed after the `tokens` section's bytes under
+`fees` and its own tag, so it ships with a chain cut, never as a same-chain update. Never in the state root; `reload_ledger` restores the section
 from the file on every restart; served as `rand_getLimits.fee_rules`.
 
 **Rolling it out.** `rand-node genesis` writes no `fees` section; the cut script splices it in
