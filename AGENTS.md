@@ -42,10 +42,14 @@ served only when at least one flag is `true`, else `null`. Docs: `docs/fees.md` 
 0.2, pays 0.6), `docs/supply.md`, `docs/aggregation.md` §3.1/§3.3, `docs/rpc.md`, `docs/deploy.md`
 "The next cut: the `fees` section", `CHANGELOG.md` Unreleased. Tests at Task 2: core lib 665/0;
 node lib 489 passed, 1 failed (the known pre-existing
-`the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte`). **Trap:** the node's
-aggregation RPC tests need `RECURSION_FIXTURES` at a current cache
-(`~/rand-worktrees/circuits-phase2/recursion/target/recursion-fixtures`); the
-`~/Github/randprotocol/circuits` cache is stale ("public values are not pv::NUM words").
+`the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte`). **Trap (resolved by #131):** the node's
+aggregation tests read the committed pinned set `crates/randprotocol-node/fixtures/recursion`
+(`Test-0..2`, `fixture_proof`'s default; `RECURSION_FIXTURES` overrides) and need no env var.
+`~/rand-worktrees/circuits-phase2/recursion/target/recursion-fixtures` is complete but unpinned
+(fails the pinned-vectors test only); the `~/Github/randprotocol/circuits` cache is stale ("public
+values are not pv::NUM words"). `scripts/recursion-fixtures.sh --check [<dir>]` says which a
+directory is (exit 0 pinned, 3 complete but unpinned); with a circuits checkout it re-proves for a
+re-pin (`docs/aggregation.md` "Testing: the recursion fixtures").
 
 ### rVM phase 2 re-vendored (2026-10-04; branch `feat/rvm-phase2-vendor`)
 

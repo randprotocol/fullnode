@@ -236,6 +236,49 @@ both have to clear before a genesis may switch it on.
    `admitted_shapes[].aggregate_program_digest` is `c90b3f0a…74d8` and the node admits tiers
    {20, 21, 22} (`recursion/docs/04-phase2-row-cuts.md`, `docs/node-hardware.md` §4).
 
+### Testing: the recursion fixtures (issue #131)
+
+The node's fixture-backed tests (the list is `scripts/ci-fixture-skips.sh`'s: `agg_executor::`,
+the covered-assembly tests in `node::`, the aggregation tests in `rpc::`, `storage::seal_tests::`)
+read real bundle proofs through `fixture_proof(k)`, `<dir>/Test-{k}.proof`. The set is exactly
+**`Test-0`, `Test-1`, `Test-2`**: every literal caller uses `k = 0`, and
+`the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte` reads `Test-1` and `Test-2`.
+The pinned set is **committed**, `crates/randprotocol-node/fixtures/recursion` (~1 MB), and is
+`fixture_proof`'s default directory; `RECURSION_FIXTURES` overrides it. So the suite needs no
+setup (2026-10-06, no env var: `491 passed; 0 failed; 1 ignored`). A missing file is a panic,
+not a skip, by design.
+
+```sh
+cargo test -p randprotocol-node --lib                           # reads the in-repo set
+scripts/recursion-fixtures.sh --check [<dir>]                   # check a set (default: the same dir)
+scripts/recursion-fixtures.sh <circuits checkout> [<dir>]       # re-prove (a re-pin), then check
+```
+
+**Why these bytes.** A fixture's notes are random, and the pinned-vectors test pins the 118-word
+interface list and digest (`3534960f…`) that one set of notes produces: the cache re-proved
+2026-10-03 for the phase-2 re-vendor, which is what is committed. A freshly proved set passes
+every other fixture-backed test and fails that one at "the pinned 118-word interface list"
+(measured 2026-10-06: `490 passed; 1 failed`; its `inner_vk_digest` assertion, the
+data-independent half, passes). The script compares each file's sha256 with `PINNED_SHA256` and
+exits 0 when the set is the pinned bytes, 1 when a file is missing (or the checkout is refused,
+or a generator failed), 3 when the set is complete but not the pinned bytes.
+
+**Re-pinning, when the vendored zkVM moves.** The fixtures are proofs by circuits' zkVM
+(`research/` and the bundle guest in `guests-compiled/`), so a re-pin proves from a checkout
+whose two trees are `CIRCUITS_PIN` in `.github/workflows/ci.yml` — the script refuses any other
+(`recursion/`, the outer rVM that only hosts the generator, may drift). A set from another
+constraint set fails the suite with "cs8 proofs carry pv::NUM public values" (the pre-cs8 cache
+under `circuits/recursion/target/recursion-fixtures` does). The script runs circuits'
+`recursion/tests/fixtures.rs` generator once per k in parallel (`FIXTURE_PROFILE=Test
+FIXTURE_KS=k`), which skips a fixture that still verifies and re-proves one that does not;
+**measured (2026-10-06, M4 Max):** `Test-1` and `Test-2` proved in parallel in 4 min 36 s wall,
+~4.6 min a proof. The new files then end at exit 3; in the same commit re-measure the test's
+constants and circuits' `recursion/docs/02-aggregate.md` on them and move `PINNED_SHA256`.
+
+**CI.** `scripts/ci-fixture-skips.sh` still skips these tests on the grounds that a clean runner
+has no cache; with the set committed that no longer holds, and the skip list (PROC-7's open half)
+can be revisited — a follow-up, not changed here.
+
 ## 4. Fallback
 
 A block whose bundles no aggregate ever covers stays valid: its raw bundle proofs are kept and
