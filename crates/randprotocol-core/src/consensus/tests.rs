@@ -7,6 +7,7 @@ use crate::genesis::{Genesis, GenesisValidator};
 use crate::notes::{word8_to_hex, Envelope};
 use crate::types::actions::SignedHeader;
 use crate::types::Transaction;
+use crate::ledger::tests::FlakyDeploy;
 use std::collections::{BTreeMap, VecDeque};
 
 struct Sim {
@@ -1665,72 +1666,6 @@ fn a_failing_candidate_is_dropped_and_the_block_still_verifies() {
     replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor, &crate::ledger::NoVerified).expect("the header's root is what a replica computes");
 }
 
-/// A `StubExecutor` whose `check_program` accepts a seven-word program the first time it is asked
-/// and refuses it every time after. A `Deploy` asks twice, once in `validate_inner` and once in
-/// the action step after `apply_bundle_notes` has written the bundle, so such a deploy is the one
-/// candidate that passes validation and then fails mid-application: the half-applied case
-/// `apply_tx_with`'s comment names, which the double spend (refused before any write) is not.
-struct FlakyDeploy {
-    asked: std::sync::atomic::AtomicUsize,
-}
-
-impl ConfidentialExecutor for FlakyDeploy {
-    fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, crate::confidential::ConfidentialError> {
-        if words.len() == 7 && self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
-            return Err(crate::confidential::ConfidentialError::Disabled);
-        }
-        StubExecutor.check_program(base_pc, words)
-    }
-    fn verify_call(&self, program: &crate::program::ProgramRecord, proof: &[u8]) -> Result<crate::program::CallOutcome, crate::confidential::ConfidentialError> {
-        StubExecutor.verify_call(program, proof)
-    }
-    fn public_digest(&self, words: &[u32]) -> crate::notes::Word8 {
-        StubExecutor.public_digest(words)
-    }
-    fn node_hash(&self, left: &crate::notes::Word8, right: &crate::notes::Word8) -> crate::notes::Word8 {
-        StubExecutor.node_hash(left, right)
-    }
-    fn note_commitment(&self, pk: &crate::notes::Word8, from: &crate::notes::Word8, amount: u64, asset: u32, time: u32, r: &crate::notes::Word8) -> crate::notes::Word8 {
-        StubExecutor.note_commitment(pk, from, amount, asset, time, r)
-    }
-    fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> crate::notes::Word8 {
-        StubExecutor.bundle_digest(input)
-    }
-    fn bundle_digest_v3(&self, input: &crate::notes::BundleDigestInput) -> crate::notes::Word8 {
-        StubExecutor.bundle_digest_v3(input)
-    }
-    fn bundle_proof_digest(&self, hc_bundle: &crate::notes::Word8, proof: &[u8]) -> Result<crate::notes::Word8, crate::confidential::ConfidentialError> {
-        StubExecutor.bundle_proof_digest(hc_bundle, proof)
-    }
-    fn auth_proof_digest(&self, proof: &[u8]) -> Result<crate::notes::Word8, crate::confidential::ConfidentialError> {
-        StubExecutor.auth_proof_digest(proof)
-    }
-    fn verify_auth(&self, hc_auth: &crate::notes::Word8, proof: &[u8], binding: &[u32; 8]) -> Result<crate::notes::Word8, crate::confidential::ConfidentialError> {
-        StubExecutor.verify_auth(hc_auth, proof, binding)
-    }
-    fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, crate::confidential::ConfidentialError> {
-        StubExecutor.bundle_gas_limit(proof)
-    }
-    fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, crate::confidential::ConfidentialError> {
-        StubExecutor.auth_gas_limit(proof)
-    }
-    fn verify_bundle(&self, hc_bundle: &crate::notes::Word8, proof: &[u8], binding: &[u32; 8]) -> Result<(), crate::confidential::ConfidentialError> {
-        StubExecutor.verify_bundle(hc_bundle, proof, binding)
-    }
-    fn aggregate_program_digest(&self, shape: &crate::types::DeclaredShape) -> Result<[u64; 4], crate::confidential::ConfidentialError> {
-        StubExecutor.aggregate_program_digest(shape)
-    }
-    fn verify_aggregate(
-        &self,
-        shape: &crate::types::DeclaredShape,
-        covered: &[crate::types::CoveredBundle],
-        proof: &[u8],
-        binding: &[u32; 8],
-    ) -> Result<Vec<[u32; 8]>, crate::confidential::ConfidentialError> {
-        StubExecutor.verify_aggregate(shape, covered, proof, binding)
-    }
-}
-
 /// The replay is what undoes a half-applied candidate. A `Deploy` passes `validate_inner`, its
 /// bundle's nullifiers and commitments are written, and then the action step refuses it
 /// (`FlakyDeploy`). Without the replay the running ledger keeps those writes: the header's root
@@ -1759,25 +1694,58 @@ fn a_half_applied_candidate_is_undone_by_the_replay() {
     assert!(!n.node.tip_ledger().is_spent(&bad_nf), "the dropped candidate's nullifiers are not in the tip");
 }
 
-/// A proposal tolerates `MAX_PROPOSE_REPLAYS` failing candidates, then closes the block.
+/// A refusal is free (final review F1): a candidate `validate_inner` refuses has written nothing,
+/// so the proposer skips it without a replay and without counting it. More than
+/// `MAX_PROPOSE_REPLAYS` double spends of one accepted candidate — the shape the mempool offers
+/// when RPL-2 invokes contend for a cell — are all skipped and the trailing good candidate is
+/// still carried, as the per-candidate-clone loop carried it.
 #[test]
-fn a_proposal_closes_after_max_replays() {
+fn refused_candidates_are_skipped_without_counting_a_replay() {
     let mut n = one_node();
     n.node.start();
     n.now += 1;
     let tip = n.node.tip_ledger().clone();
     let ok = tx_at(&tip, 1);
     let mut cands = vec![ok.clone()];
-    // MAX_PROPOSE_REPLAYS + 1 double spends of `ok`, then one good candidate that is never reached.
     for k in 0..=MAX_PROPOSE_REPLAYS {
         let mut d = tx_at(&tip, 100 + k as u32);
         d.bundle.as_mut().unwrap().nullifiers[0] = ok.bundle.as_ref().unwrap().nullifiers[0];
         cands.push(restub_and_bind(&tip, d));
     }
+    let trailing = tx_at(&tip, 50);
+    cands.push(trailing.clone());
+    let actions = n.node.propose(1, cands, n.now).unwrap();
+    let block = actions.iter().find_map(|a| match a { Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b.clone()), _ => None }).unwrap();
+    assert_eq!(block.transactions, vec![ok, trailing], "every refusal skipped, none counted; the trailing candidate is carried");
+    let mut replica = tip.clone();
+    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor, &crate::ledger::NoVerified).expect("the header's root is what a replica computes");
+}
+
+/// A proposal tolerates `MAX_PROPOSE_REPLAYS` half-applied candidates (each replays the accepted
+/// set), then closes the block: the bound is on the half-apply path, the only one that replays.
+#[test]
+fn a_proposal_closes_after_max_replays() {
+    let (cfg, gs, key) = one_node_parts();
+    let node = HotStuff::new(cfg, Some(key), gs.block.clone(), gs.ledger.clone(), std::sync::Arc::new(FlakyDeploy { asked: Default::default() }));
+    let mut n = OneNode { node, now: 1 };
+    n.node.start();
+    n.now += 1;
+    let tip = n.node.tip_ledger().clone();
+    let ok = tx_at(&tip, 1);
+    let deploy = crate::types::Action::Deploy { base_pc: 0, words: vec![0x13; 7], public: vec![] };
+    let mut cands = vec![ok.clone()];
+    // MAX_PROPOSE_REPLAYS + 1 half-applying deploys, then one good candidate that is never reached.
+    for k in 0..=MAX_PROPOSE_REPLAYS {
+        let mut bad = staking_tx(&tip, 2_000 + 10 * k as u32, 0, deploy.clone());
+        bad.bundle.as_mut().unwrap().fee = crate::gas::fee_floor(&deploy);
+        cands.push(restub_and_bind(&tip, bad));
+    }
     cands.push(tx_at(&tip, 50));
     let actions = n.node.propose(1, cands, n.now).unwrap();
     let block = actions.iter().find_map(|a| match a { Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b.clone()), _ => None }).unwrap();
-    assert_eq!(block.transactions.len(), 1, "closed after the bound; the trailing good candidate waits for the next block");
+    assert_eq!(block.transactions, vec![ok], "closed after the bound; the trailing good candidate waits for the next block");
+    let mut replica = tip.clone();
+    replica.apply_block_for_sync(&block, &Default::default(), &[], &StubExecutor, &crate::ledger::NoVerified).expect("the header's root is what a replica computes");
 }
 
 #[test]
