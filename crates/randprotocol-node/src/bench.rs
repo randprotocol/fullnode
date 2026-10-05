@@ -144,12 +144,22 @@ fn candidates(tip: &Ledger, height: u64, bundles: usize, counter: &mut u64) -> V
         .collect()
 }
 
+/// The host's page size, which `/proc/self/statm` counts in: `sysconf(_SC_PAGESIZE)`, or 4 096
+/// if it reports none. Not a constant: aarch64 Linux hosts run 16 KiB and 64 KiB pages, where a
+/// fixed 4 096 under-reports `rss_mb` by 4× or 16× (final review M5).
+#[cfg(all(unix, any(target_os = "linux", test)))]
+fn page_size() -> u64 {
+    // SAFETY: sysconf reads a configuration value and has no other effect.
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if n > 0 { n as u64 } else { 4096 }
+}
+
 #[cfg(target_os = "linux")]
 fn current_rss_bytes() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
         .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map(|pages| pages * 4096)
+        .map(|pages| pages.saturating_mul(page_size()))
         .unwrap_or(0)
 }
 
@@ -316,6 +326,17 @@ mod tests {
         // Four nullifier slots a bundle (two spends, two dummies), every candidate carried (the harness aborts otherwise).
         assert_eq!(v.last.nullifiers, 12 * 16 * 4);
         assert!(v.passed, "a 12-block run is under any sane budget: {:?}", v.last);
+    }
+
+    /// The page size is the host's, not an assumed 4 096 (16 384 on Apple silicon).
+    #[cfg(unix)]
+    #[test]
+    fn the_page_size_is_the_hosts() {
+        let p = page_size();
+        assert!(p >= 4096 && p.is_power_of_two(), "{p}");
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(p, 16_384);
+        }
     }
 
     #[test]
