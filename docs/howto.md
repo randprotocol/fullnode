@@ -1,4 +1,4 @@
-# How things work on RAND, in five questions
+# How things work on RAND, in seven questions
 
 Short, end-to-end answers for someone arriving at the shielded chain with a wallet and a
 program. Each one points at the page with the detail. Written 2026-09-12 against phase S1 with
@@ -84,3 +84,53 @@ Two ways today, both producing RV32IM machine code:
 With M4.3 and M4.4, Solidity and Solana-style Rust follow indirectly: an EVM or sBPF interpreter
 compiled from `no_std` Rust becomes one deployed guest, and the contract's bytecode is a private
 input. `docs/zkvm.md` §3–6.
+
+## 7. How do I run the downstream integration tests?
+
+Four repos read this node's JSON-RPC, and each has an integration test that spawns a real
+`rand-node` rather than a mock:
+
+| repo | test | what it reads |
+|---|---|---|
+| randscan | `crates/randscan-api/tests/real_node.rs` | the indexer's ~25 `rand_*` reads (`crates/randscan-indexer/src/rpc.rs`) |
+| randbridge.org | `status/tests/real_node.rs` (planned) | `rand_getHead`, `rand_getBlockByHeight`, `rand_getRawTransaction`, `rand_chainId`, `rand_getBridgeState`, `rand_getBridgeBurn` |
+| randprotocol.org | `server/sale/tests/real_node.rs` (planned) | the sale relay and the balance viewer: `rand_chainId`, `rand_getNullifiers`, `rand_getToken(s)`, `rand_getAssets`, `rand_getLimits`, `rand_getSupply`, `rand_sendTransaction` |
+| zusd.money | `tests/` (planned) | randscan's REST, which is `rand_getBridgeState`, `rand_getAssets`, `rand_getTokens`, `rand_getTokenSupply` |
+
+All of them start the chain the same way, with `scripts/dev-chain.sh`: one validator on loopback,
+a test-profile genesis with the faucet on and `--binding-domain 1` (none on chain ids 14–19,
+where the wallet signs the chain-id form; `DEV_CHAIN_BINDING_DOMAIN` overrides), its RPC polled until
+`rand_chainId` answers (60 s, then it fails with the log's tail). It prints `key=value` lines:
+
+```bash
+$ RAND_NODE_BIN=target/release/rand-node RAND_CLI=target/release/rand scripts/dev-chain.sh
+RPC_URL=http://127.0.0.1:62873
+GENESIS=/tmp/rand-dev-chain.Xa1b2C/genesis.json
+PID=36916
+DIR=/tmp/rand-dev-chain.Xa1b2C
+$ scripts/dev-chain.sh --stop /tmp/rand-dev-chain.Xa1b2C
+stopped pid 36916
+```
+
+`RAND_NODE_BIN` and `RAND_CLI` name the two binaries (defaults `target/release/rand-node` and
+`target/release/rand`); `DEV_CHAIN_DIR`, `DEV_CHAIN_ID` (7), `DEV_CHAIN_RPC_PORT` (a free one),
+`DEV_CHAIN_FEES` (`burn_base,burn_floor`, written through `rand-node genesis --fees`),
+`DEV_CHAIN_FRI_PROFILE`, `DEV_CHAIN_BLOCK_INTERVAL_MS` and `DEV_CHAIN_GENESIS_ARGS` (extra genesis
+flags, e.g. `--gas-price 100`) are the rest; the script's header lists them.
+`subsidy_net_of_fees` needs an aggregation section, which no node starts on today, so a dev chain
+cannot carry it. `--stop` leaves the directory (`node.log`, `setup.log`) for the caller, and a
+second `--stop` on it answers "not running" with exit 0.
+
+The binaries a downstream CI runs are this repo's release assets: `.github/workflows/release.yml`
+builds `rand-node` and `rand` (with `rand-prover` and `SHA256SUMS`) on `ubuntu-24.04` and attaches
+them to the GitHub release, and the downstream jobs download those two and point `RAND_NODE_BIN`
+and `RAND_CLI` at them. They are Linux x86-64 builds; on a Mac, build them here
+(`cargo build --release -p randprotocol-node -p randprotocol-client`).
+
+The fields those repos read are pinned here too, so a rename fails this repo's CI before a release
+reaches theirs: `crates/randprotocol-node/tests/rpc_contract.rs` runs one in-process validator
+(faucet, `gas`, `fees`, a bridge with one listed token), mints once, and checks every field each
+consumer reads for presence and JSON type — amounts as decimal strings — naming the consumer file
+per row; reads the test cannot cheaply set up (a program, a call, a burn) are pinned by their
+empty or refusal shape. It runs in `ci.yml`'s `check-and-test` job. A new downstream read gets a
+row there.

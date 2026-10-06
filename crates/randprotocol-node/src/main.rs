@@ -580,6 +580,13 @@ enum Cmd {
         /// refused by name before any file is written.
         #[arg(long, value_name = "UNITS")]
         program_state_cell_fee: Option<u64>,
+        /// Fee feedback (`docs/fees.md` §1.3): the `fees` section, as a `FeesConfig` JSON file
+        /// (`{"burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true}`, each optional).
+        /// `Genesis::build` validates it — `burn_floor` needs `burn_base`, `subsidy_net_of_fees`
+        /// needs an aggregation section. Omitted entirely when absent; a section with no `true`
+        /// flag contributes nothing to the genesis hash either.
+        #[arg(long, value_name = "FEES.JSON")]
+        fees: Option<PathBuf>,
     },
     /// Print one genesis alloc note as JSON — the object that goes into a genesis file's `alloc`
     /// list — sealed to `--to` exactly as `genesis --alloc` seals one, so the owner's wallet finds
@@ -1591,6 +1598,7 @@ async fn main() -> Result<()> {
             binding_domain,
             proof_window_blocks,
             program_state_cell_fee,
+            fees,
         } => {
             let hc_bundle = match bundle_guest.as_str() {
                 "v3" => ZkExecutor::hc_hidden_bundle_v3(),
@@ -1763,9 +1771,19 @@ async fn main() -> Result<()> {
                 // without it hashes byte-for-byte as before.
                 program_state: program_state_cell_fee
                     .map(|cell_fee| randprotocol_core::ledger::program_state::ProgramStateConfig { cell_fee }),
-                // Fee feedback (`docs/fees.md` §1.3): no flag here; a chain that wants the rules
-                // adds the `fees` section to the file before it is cut.
-                fees: None,
+                // Fee feedback (`docs/fees.md` §1.3): read from a `FeesConfig` JSON file when
+                // `--fees` is given, so `Genesis::build` validates it (`burn_floor` without
+                // `burn_base`, `subsidy_net_of_fees` without aggregation); omitted entirely
+                // otherwise, so a chain without the flag hashes byte-for-byte as before.
+                fees: match &fees {
+                    Some(path) => Some(
+                        serde_json::from_str::<randprotocol_core::ledger::fees::FeesConfig>(
+                            &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
+                        )
+                        .with_context(|| format!("{} is not a valid fees config", path.display()))?,
+                    ),
+                    None => None,
+                },
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(

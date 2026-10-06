@@ -1381,8 +1381,8 @@ at genesis under `META_FEES` (JSON; written on every new database, the default `
 section), and `reload_ledger` sets it again from the file on every restart; served as
 `rand_getLimits.fee_rules`.
 
-**Rolling it out.** `rand-node genesis` writes no `fees` section; the cut script splices it in
-the way it splices `bridge`. Every validator must run a build that knows the section before a
+**Rolling it out.** `rand-node genesis --fees FEES.JSON` writes the section (`docs/cli.md`), or
+the cut script splices it in the way it splices `bridge`. Every validator must run a build that knows the section before a
 genesis carries it — an older node does not refuse the file: `Genesis` has no
 `deny_unknown_fields`, so it silently ignores the section, derives a different genesis hash and
 so cannot join the chain.
