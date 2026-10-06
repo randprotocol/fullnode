@@ -3969,6 +3969,74 @@ mod tests {
         }
     }
 
+    /// Issue #135 in the daemon: under `fees.burn_floor` the ledger buckets a covered bundle's
+    /// `fee − floor` — for a Deploy, the fee less its base *and* per-word term — and pays the
+    /// aggregate `max(schedule, shares)` from those bucket entries. The node serves them as
+    /// `rand_getUnsealed`'s `excess`; the pass must net exactly that and never re-derive a share
+    /// from the raw transaction it fetches (`fee − BUNDLE_BASE` would add the per-word term back).
+    /// Here the node serves all three flags and a covered Deploy whose served share is its
+    /// `fee − floor`; the sealed envelope must open to `Ledger::derived_commitment` on a ledger in
+    /// the same state under the same rules, for shares below and above the 1000-unit schedule. The Deploy's
+    /// per-word term (900 000 units for nine words) dwarfs the schedule, so a share re-derived as
+    /// `fee − BUNDLE_BASE` would seal a different amount in both cases and the payout would be lost.
+    #[tokio::test]
+    async fn the_aggregate_pass_seals_the_ledgers_payout_under_burn_floor_from_the_nodes_shares() {
+        use randprotocol_core::ledger::aggregation::{AggregationConfig, AggregatorEntry};
+        use randprotocol_core::ledger::{FeesConfig, Ledger};
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payee = SpendKey([7; 8]);
+        let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let rules = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true) };
+        let deploy = randprotocol_core::Action::Deploy { base_pc: 0, words: vec![0x13; 9], public: vec![] };
+        let floor = randprotocol_core::gas::fee_floor(&deploy);
+        assert!(floor > randprotocol_core::gas::BUNDLE_BASE, "a Deploy's floor is over the base");
+        for (shares, paid) in [(25u64, 1000u64), (1500, 1500)] {
+            let mut node = moving_node(kp.address(), payout.clone());
+            // The covered bundle: a Deploy paying its floor plus the share the node's bucket holds.
+            node.raw.bundle.as_mut().unwrap().fee = floor + shares;
+            node.raw.action = deploy.clone();
+            node.excess.set(shares);
+            node.limits = Some(serde_json::json!({ "fee_rules": { "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true } }));
+            assert_eq!(node.fee_rules().await.unwrap(), rules, "the node's rules reach the pass whole");
+            let tx = aggregate_pass(&node, &kp, 7, |_, _, _| Ok(b"the aggregate proof".to_vec()))
+                .await
+                .unwrap()
+                .expect("one bundle to cover");
+
+            let mut l = Ledger::new(7, [0; 8], Default::default(), &ex);
+            l.set_aggregation(Some(AggregationConfig {
+                bond: 100,
+                max_covers: 3,
+                subsidy_base: 1000,
+                halving_blocks: 1,
+                window: 256,
+                admitted_shapes: vec![],
+            }));
+            l.set_fees(rules.clone());
+            l.set_aggregators(
+                [(
+                    kp.address(),
+                    AggregatorEntry { public_key: kp.public_key().clone(), bond: 100, payout: payout.clone(), nonce: 0, unbonding: None },
+                )]
+                .into(),
+            );
+            l.set_unsealed_fees([(node.raw.hash(), (shares, kp.address(), u64::MAX))].into());
+            let cm = l.derived_commitment(&tx.action, &ex).expect("the ledger derives the payout note");
+
+            let randprotocol_core::Action::Aggregate { envelope, .. } = &tx.action else { panic!("not an aggregate: {tx:?}") };
+            let (_, opened) = randprotocol_zkvm::address::envelope_from_core(envelope)
+                .open_as_receiver(cm, &payee.viewing_key())
+                .unwrap_or_else(|| panic!("shares {shares}: the envelope opens to the ledger's note"));
+            assert_eq!(opened.amount, paid, "shares {shares}: max(schedule, the node's fee − floor shares)");
+            assert_ne!(
+                opened.amount,
+                1000u64.max(node.raw.fee() - randprotocol_core::gas::BUNDLE_BASE),
+                "shares {shares}: not the amount a share re-derived as fee − BUNDLE_BASE would seal"
+            );
+        }
+    }
+
     /// And a pass whose nonce moved while proving is abandoned: the proof is bound to the old
     /// nonce (AGG-2) and can never verify, so it is not submitted to certain refusal.
     #[tokio::test]

@@ -4756,6 +4756,51 @@ pub(crate) mod fixtures {
         }
     }
 
+    /// The fixed-price `gas` section the burn-floor fixtures run under (chain 18's prices without
+    /// the controller): 100 per gas, 800 per KiB, the tier-14 bundle pin, circuit metering.
+    pub(crate) fn fixed_gas() -> gas::GasConfig {
+        gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: gas::bundle_gas_limit_pin(),
+            metering: gas::GasMetering::Circuit,
+            dynamic: None,
+        }
+    }
+
+    /// The fee-feedback rules with every flag on (`docs/fees.md` §1.3, issue #135), or `burn_base`
+    /// and `burn_floor` alone when `net` is false.
+    pub(crate) fn burn_floor_rules(net: bool) -> randprotocol_core::ledger::FeesConfig {
+        randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: net.then_some(true), burn_floor: Some(true) }
+    }
+
+    /// A four-word program's `Deploy` on a stub bundle keyed at `seed..seed + 3`, paying its floor
+    /// (`gas::fee_floor`: base plus the per-word term) plus `tip`; returns the program's id too.
+    pub(crate) fn deploy_program_tx(ledger: &Ledger, seed: u32, word: u32, tip: u64) -> (ProgramId, Transaction) {
+        let words = vec![word; 4];
+        let id = randprotocol_core::program::program_id(0, &words);
+        let action = Action::Deploy { base_pc: 0, words, public: vec![] };
+        let fee = gas::fee_floor(&action) + tip;
+        let b = bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], fee);
+        (id, StubExecutor::bound(Transaction::shielded(ledger.chain_id(), b, action)))
+    }
+
+    /// A tier-`tier` `Call` of `program` on a stub bundle keyed at `seed..seed + 3`, its stub proof
+    /// declaring `gas_limit` (`pv::GAS`), paying `fee`.
+    pub(crate) fn gas_call_tx(ledger: &Ledger, seed: u32, program: &ProgramId, tier: u8, gas_limit: u64, fee: u64) -> Transaction {
+        let proof = StubExecutor::make_proof_with_gas(program, tier, [7; 8], gas_limit);
+        let b = bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], fee);
+        StubExecutor::bound(Transaction::shielded(ledger.chain_id(), b, Action::Call { program: *program, proof, input_envelope: None }))
+    }
+
+    /// The bytes a `Call`'s floor prices (`gas::call_bytes` over its proof, no input envelope).
+    pub(crate) fn call_tx_bytes(tx: &Transaction) -> usize {
+        match &tx.action {
+            Action::Call { proof, input_envelope, .. } => gas::call_bytes(proof, input_envelope.as_ref()),
+            other => panic!("not a call: {other:?}"),
+        }
+    }
+
     /// A pruning-pass proof reader ([`Storage::prune_sealed_with`]) for stub-proved bundles: the
     /// [`stub_pruned_facts`] of whichever of `txs` the pass asks for, by raw hash.
     pub(crate) fn stub_proof_reader(
@@ -7975,6 +8020,61 @@ mod tests {
         assert_eq!(crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap().fees(), &burn, "the file is the authority");
     }
 
+    /// Issue #135's variant of the repair above: under `fees { burn_base, burn_floor }` and a
+    /// fixed-price `gas` section, `base_fees_burned` is a sum of *whole floors* — a Deploy's base
+    /// plus per-word term, a tier-14 Call's `circuit_call_floor` at its declared limit, a
+    /// transfer's base — that only the replay's own decode of the call proof can recompute. A
+    /// counter corrupted by a few units (not zeroed: the drift a torn write or a stale snapshot
+    /// leaves) is named by `verify_chain`, the served audit reads it (`rand_getSupply.
+    /// invariant_holds` false), and the repair rewrites it from the replay to exactly the three
+    /// floors, after which the served identity holds again and a second check finds nothing.
+    #[test]
+    fn verify_chain_repairs_a_stale_base_fees_burned_under_burn_floor_with_a_call() {
+        use randprotocol_core::gas::{self, BUNDLE_BASE};
+        let (_d, s, mut gs) = genesis_with_two_notes();
+        gs.ledger.set_gas(Some(fixed_gas()));
+        gs.ledger.set_fees(burn_floor_rules(false));
+        gs.ledger.set_genesis_supply(1_000 * randprotocol_core::UNITS_PER_RAND, gs.ledger.supply().genesis_staked);
+        s.init_genesis(&gs).unwrap();
+
+        let mut ledger = gs.ledger.clone();
+        let (program, deploy) = deploy_program_tx(&ledger, 81, 0x13, 3);
+        let deploy_floor = gas::fee_floor(&deploy.action);
+        let b1 = make_block(&gs.block, &mut ledger, vec![deploy], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+
+        let limit = gas::gas_max(14, 0, 0);
+        let prices = ledger.gas_prices();
+        let floor = gas::circuit_call_floor(prices.gas_price, prices.byte_price, limit, call_tx_bytes(&gas_call_tx(&ledger, 91, &program, 14, limit, 0)));
+        let call = gas_call_tx(&ledger, 91, &program, 14, limit, floor + 11);
+        let transfer = bundle_tx(&ledger, [[95; 8], [96; 8]], [[97; 8], [98; 8]], BUNDLE_BASE + 5);
+        let before = ledger.clone();
+        let mut b2 = make_block(&b1, &mut ledger, vec![call, transfer], &key(1));
+        b2.receipts = before.clone().apply_block(&b2.block, &StubExecutor).expect("a replica applies block 2");
+        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+
+        let want = deploy_floor + floor + BUNDLE_BASE;
+        assert_eq!(s.base_fees_burned().unwrap(), want, "the deploy's, the call's and the transfer's whole floors");
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None, "a good store checks clean");
+        let s = std::sync::Arc::new(s);
+        let supply = || crate::rpc::tests::served_now(s.clone(), &gs, "rand_getSupply");
+        assert_eq!(supply()["invariant_holds"], true, "{}", supply());
+
+        // Off by three units: named, visible in the served audit, and repaired from the replay.
+        s.db.put_cf(s.cf(CF_META), META_BASE_FEES_BURNED, bincode::serialize(&(want - 3)).unwrap()).unwrap();
+        assert_eq!(supply()["invariant_holds"], false, "a stale counter breaks the served identity");
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.clone().expect("a counter three units stale is a problem");
+        assert!(problem.contains("base fees burned"), "{problem}");
+        assert_eq!(check.ledger.base_fees_burned(), want, "the replay recomputed the floors from the blocks");
+        s.truncate_to(&gs, 2, &check.ledger).unwrap();
+        assert_eq!(s.base_fees_burned().unwrap(), want, "the repair rewrote the counter");
+        let after = supply();
+        assert_eq!(after["base_fees_burned"], want.to_string());
+        assert_eq!(after["invariant_holds"], true, "{after}");
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None, "and a second check finds nothing");
+    }
+
     /// Fee feedback: a chain without a `fees` section stores the default section and a zero
     /// counter, and reads them back as such.
     #[test]
@@ -8700,6 +8800,120 @@ mod seal_tests {
         let check = storage.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
         assert_eq!(check.last_good, 0);
         assert!(check.problem.as_deref().is_some_and(|p| p.starts_with("block 1 does not apply")), "{:?}", check.problem);
+    }
+
+    /// A committed block as a sealed-form peer serves it (`node::sealed_form_of`, spec §7): every
+    /// transaction whose record is `Pruned` rides as the record's marker form, found by the proof
+    /// hash its marker carries, with a side-table entry in transaction order.
+    fn served_sealed(storage: &Storage, h: u64) -> CommittedBlock {
+        let cb = storage.committed_block(h).unwrap().expect("a committed height");
+        let mut pruned = Vec::new();
+        for tx in &cb.block.transactions {
+            let Some(ph) = tx.bundle.as_ref().and_then(|b| randprotocol_core::notes::pruned_proof_hash(&b.proof)) else { continue };
+            let raw = storage.tx_hash_by_proof_hash(&ph).unwrap().expect("a marker names a stored record");
+            let Some(TxRecord::Pruned { tx_hash, proof_hash, public_values, shape, .. }) = storage.tx_record(&raw).unwrap() else {
+                panic!("block {h}: a marker without its pruned record")
+            };
+            pruned.push(randprotocol_core::consensus::PrunedBundle { tx_hash, proof_hash, public_values, shape });
+        }
+        CommittedBlock { pruned, ..cb }
+    }
+
+    /// The fee-feedback rules through the sealed form (spec §6.2, §7; `docs/fees.md` §1.3). Under
+    /// `fees { burn_base, burn_floor }` on an aggregating chain, block 1 carries two bundles an
+    /// aggregate will cover — a transfer 60 over its floor and a Deploy 7 over its (base plus
+    /// per-word) floor — and the aggregator's registration; block 2 the aggregate. The live store
+    /// prunes both covers to the marker form; a second store syncs the chain as a sealed-form peer
+    /// serves it (the side table rebuilt from the pruned records, the aggregate's sidecar read
+    /// from the records the first block left), exactly as `apply_synced` applies it. The split
+    /// reads the bundle's fee and its settled floor — the action and the fee, both of which the
+    /// marker form keeps (only `bundle.proof` is replaced) — so the synced store must end where
+    /// the live one did: `base_fees_burned`, `fees_paid`, `burned`, `subsidised`, the aggregate's
+    /// `a` record and the state root; and its own startup replay (`verify_chain`) must pass.
+    #[test]
+    fn a_sealed_sync_under_burn_base_and_burn_floor_ends_at_the_live_stores_counters_and_root() {
+        use randprotocol_core::gas::{self, BUNDLE_BASE};
+        let dir = tempfile::tempdir().unwrap();
+        let live = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 100);
+        let probe = bundle_tx(&gs.ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], BUNDLE_BASE);
+        let hc = Hash(randprotocol_core::notes::word8_to_bytes(&HC));
+        gs.ledger.set_aggregation(Some(gated_cfg(stub_pruned_facts(&probe).shape, hc, 4)));
+        gs.ledger.set_fees(burn_floor_rules(false));
+        gs.ledger.set_genesis_supply(1_000 * randprotocol_core::UNITS_PER_RAND, gs.ledger.supply().genesis_staked);
+        live.init_genesis(&gs).unwrap();
+
+        let mut l1 = gs.ledger.clone();
+        let transfer = bundle_tx(&l1, [[21; 8], [22; 8]], [[23; 8], [24; 8]], BUNDLE_BASE + 60);
+        let (_, deploy) = deploy_program_tx(&l1, 31, 0x13, 7);
+        let deploy_floor = gas::fee_floor(&deploy.action);
+        assert!(deploy_floor > BUNDLE_BASE, "a Deploy's floor is more than the base, so the floor rule shows");
+        let register = register_tx(&l1, &key(7), 100 * randprotocol_core::UNITS_PER_RAND);
+        let b1 = make_block(&gs.block, &mut l1, vec![transfer.clone(), deploy.clone(), register], &key(1));
+        assert_eq!(l1.unsealed_fees()[&transfer.hash()].0, 60, "the transfer buckets fee − floor");
+        assert_eq!(l1.unsealed_fees()[&deploy.hash()].0, 7, "the Deploy buckets fee − its whole floor, not fee − BUNDLE_BASE");
+        live.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
+
+        let covers = vec![transfer.hash(), deploy.hash()];
+        let aggregate = aggregate_tx(&key(7), 0, 2, covers, b"ok".to_vec());
+        let sidecar: BTreeMap<usize, Vec<CoveredBundle>> =
+            [(0usize, vec![stub_pruned_facts(&transfer), stub_pruned_facts(&deploy)])].into_iter().collect();
+        let mut l2 = l1.clone();
+        l2.set_height(2);
+        l2.set_timestamp_ms(2);
+        l2.apply_transactions_with_covered(std::slice::from_ref(&aggregate), &key(1).address(), &sidecar, &StubExecutor).unwrap();
+        l2.record_anchor(2);
+        let b2 = make_block_unchecked(&b1, &l2, vec![aggregate.clone()], &key(1));
+        live.commit(std::slice::from_ref(&b2), &l2, &[], &StubExecutor).unwrap();
+
+        // Both covers' windows pass: the live store prunes them to the marker form.
+        assert_eq!(live.prune_sealed_with(6, 4, u64::MAX, &stub_proof_reader(&[transfer.clone(), deploy.clone()])).unwrap(), 2);
+        for tx in [&transfer, &deploy] {
+            assert!(matches!(live.tx_record(&tx.hash()).unwrap(), Some(TxRecord::Pruned { .. })), "pruned");
+        }
+        let check = live.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!((check.problem, check.last_good), (None, 2), "the live store replays its own pruned form");
+        let want_burned = BUNDLE_BASE + deploy_floor + BUNDLE_BASE;
+        assert_eq!(live.base_fees_burned().unwrap(), want_burned, "the transfer's base, the Deploy's floor, the registration's base");
+
+        // The sync: a fresh store, the chain as a sealed-form peer serves it.
+        let dir2 = tempfile::tempdir().unwrap();
+        let synced = Storage::open(dir2.path()).unwrap();
+        synced.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        for h in 1..=2 {
+            let served = served_sealed(&live, h);
+            assert_eq!(served.pruned.len(), if h == 1 { 2 } else { 0 }, "block {h}'s side table");
+            let mut sidecar = BTreeMap::new();
+            for (i, tx) in served.block.transactions.iter().enumerate() {
+                if let Action::Aggregate { covers, .. } = &tx.action {
+                    let records = covers.iter().map(|c| synced.covered_record(c, FriProfile::Test).unwrap().expect("the cover synced")).collect();
+                    sidecar.insert(i, records);
+                }
+            }
+            let receipts = ledger
+                .apply_block_for_sync(&served.block, &sidecar, &served.pruned, &StubExecutor, &randprotocol_core::ledger::NoVerified)
+                .unwrap_or_else(|e| panic!("the sealed block {h} applies: {e}"));
+            let cb = CommittedBlock { receipts, deposits: ledger.take_deposits(), aggregates: ledger.take_paid_aggregates(), ..served };
+            synced.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
+        }
+
+        assert_eq!(synced.base_fees_burned().unwrap(), want_burned, "base_fees_burned survives the marker form");
+        let (s, l) = (synced.supply().unwrap(), live.supply().unwrap());
+        assert_eq!(s.fees_paid, l.fees_paid, "fees_paid");
+        assert_eq!(s.burned, l.burned, "burned");
+        assert_eq!(s.subsidised, l.subsidised, "subsidised");
+        assert_eq!(s, l, "the whole supply");
+        assert_eq!(synced.aggregate_payment(&aggregate.hash()).unwrap(), live.aggregate_payment(&aggregate.hash()).unwrap(), "the a record");
+        assert_eq!(
+            synced.aggregate_payment(&aggregate.hash()).unwrap().map(|(_, share, _)| share),
+            Some(60 + 7),
+            "the covers' shares are fee − floor"
+        );
+        assert_eq!(synced.head_block().unwrap().header.state_root, live.head_block().unwrap().header.state_root, "one state root");
+        let check = synced.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!((check.problem, check.last_good), (None, 2), "the synced store's startup replay passes");
+        assert_eq!(check.ledger.base_fees_burned(), want_burned, "and recomputes the same burn");
     }
 
     /// The interface review's INTERFACE-2: `truncate_to` deleted the dropped blocks' records and

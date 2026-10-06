@@ -3811,7 +3811,7 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage::fixtures::{self, alloc_note, bundle_fee, bundle_tx, genesis_with, key, make_block, make_block_unchecked};
     use std::collections::BTreeMap;
@@ -3833,8 +3833,9 @@ mod tests {
         (dir, state_over(storage, gs))
     }
 
-    /// The same state over a database a storage fixture already opened and initialised.
-    fn state_over(storage: Arc<crate::storage::Storage>, gs: &GenesisState) -> RpcState {
+    /// The same state over a database a storage fixture already opened and initialised. Shared
+    /// with the node and storage tests that read a fixture chain over the RPC.
+    pub(crate) fn state_over(storage: Arc<crate::storage::Storage>, gs: &GenesisState) -> RpcState {
         let limits = ChainLimits::of(&gs.ledger);
         let (tx, mut rx) = mpsc::channel(4);
         let info = EpochInfo {
@@ -3915,8 +3916,19 @@ mod tests {
         dispatch(st, &Request { jsonrpc: None, method: method.into(), params, id: Some(Value::Null) }).await
     }
 
-    async fn ok(st: &RpcState, method: &str, params: Value) -> Value {
+    pub(crate) async fn ok(st: &RpcState, method: &str, params: Value) -> Value {
         call(st, method, params).await.unwrap_or_else(|e| panic!("{method}: {}", e.message))
+    }
+
+    /// One parameterless RPC read of a fixture store from a synchronous test (the node and
+    /// storage suites): a current-thread runtime, an [`RpcState`] over `storage` ([`state_over`]),
+    /// and `method` answered exactly as the node's dispatch answers it.
+    pub(crate) fn served_now(storage: Arc<crate::storage::Storage>, gs: &GenesisState, method: &str) -> Value {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a test runtime");
+        rt.block_on(async {
+            let st = state_over(storage, gs);
+            ok(&st, method, json!([])).await
+        })
     }
 
     /// The handler's own answer when a client is over its allowance: HTTP 429, and a body a
@@ -5889,6 +5901,139 @@ mod tests {
         // Issue #135: the full-floor burn is served beside the base it widens.
         let floor = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) }).await;
         assert_eq!(floor["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true }));
+    }
+
+    /// Issue #135 over the whole RPC surface, every flag on: `fees { burn_base,
+    /// subsidy_net_of_fees, burn_floor }` on an aggregating chain. `rand_getLimits.fee_rules`
+    /// serves all three `true`. Block 1 mixes a transfer, a Deploy (the bundle an aggregate
+    /// covers, its stored proof a real fixture proof, 60 over its base-plus-per-word floor), a
+    /// tier-12 Call (the tier schedule's floor, no `gas` section) and the aggregator's
+    /// registration; block 2 the aggregate. `rand_getSupply.base_fees_burned` is the three
+    /// floors plus the registration's base and `invariant_holds` is true; and `rand_getAggregate`'s
+    /// `proving_share` is the covered Deploy's `fee − floor` (60), never `fee − BUNDLE_BASE` (which
+    /// would add the per-word term back), with `subsidy` the schedule net of it and `subsidy +
+    /// proving_share` the payout note's amount.
+    #[tokio::test]
+    async fn under_all_three_fee_rules_the_rpc_serves_the_rules_the_floors_burned_and_a_fee_minus_floor_share() {
+        use randprotocol_core::gas::{self, BUNDLE_BASE};
+        use randprotocol_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
+        use randprotocol_core::types::actions::{aggregate_signing_hash, aggregator_register_message, AggregatorRegistration};
+        use randprotocol_core::types::{CoveredBundle, DeclaredShape, FriProfile};
+
+        let proof = crate::agg_executor::fixture_proof(0);
+        let shape = DeclaredShape {
+            profile: FriProfile::Test,
+            tier: proof.tier.0 as u8,
+            program_log_height: proof.program_log_height,
+            input_log_height: proof.input_log_height,
+            keccak_log_height: proof.keccak_log_height,
+            sha256_log_height: proof.sha256_log_height,
+            public_log_height: proof.public_log_height,
+            mem_log_height: proof.mem_log_height,
+        };
+        let hc_words: [u32; 8] = std::array::from_fn(|k| u32::try_from(proof.public_values[randprotocol_core::types::pv::HC0 + k]).unwrap());
+        let hc = Hash(randprotocol_core::notes::word8_to_bytes(&hc_words));
+        let bond = 100 * randprotocol_core::UNITS_PER_RAND;
+        let schedule = 100 * randprotocol_core::UNITS_PER_RAND;
+        let mut gs = genesis_with(7, vec![alloc_note(20, 200 * randprotocol_core::UNITS_PER_RAND)]);
+        gs.ledger.set_aggregation(Some(AggregationConfig {
+            bond,
+            max_covers: 3,
+            subsidy_base: schedule,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![AdmittedShape { shape, hc, aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap() }],
+        }));
+        gs.ledger.set_fees(fixtures::burn_floor_rules(true));
+        let (_d, st) = state_for(&gs);
+        assert_eq!(
+            ok(&st, "rand_getLimits", json!([])).await["fee_rules"],
+            json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true }),
+            "all three flags served"
+        );
+
+        // Block 1. The Deploy's stub twin is what the ledger applies; the stored one carries the
+        // real fixture proof the aggregate's record is read from.
+        let transfer = bundle_tx(&gs.ledger, [nf(1), nf(2)], [cm(1), cm(2)], BUNDLE_BASE + 5);
+        let (pid, deploy_twin) = fixtures::deploy_program_tx(&gs.ledger, 31, 0x13, 60);
+        let deploy_floor = gas::fee_floor(&deploy_twin.action);
+        let mut deploy = deploy_twin.clone();
+        deploy.bundle.as_mut().unwrap().proof = proof.to_bytes();
+        let call_proof = StubExecutor::make_proof(&pid, 12, [7; 8]);
+        let call_floor = BUNDLE_BASE + gas::call_fee(12, gas::call_bytes(&call_proof, None));
+        let call = StubExecutor::bound(Transaction::shielded(
+            7,
+            fixtures::bundle(&gs.ledger, [nf(5), nf(6)], [cm(5), cm(6)], call_floor + 9),
+            Action::Call { program: pid, proof: call_proof, input_envelope: None },
+        ));
+        let kp = key(7);
+        let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
+        let registration = AggregatorRegistration {
+            public_key: kp.public_key().clone(),
+            payout: payout.clone(),
+            signature: kp.sign(aggregator_register_message(7, &payout).as_bytes()),
+        };
+        let mut b = fixtures::bundle(&gs.ledger, [nf(3), nf(4)], [cm(3), cm(4)], BUNDLE_BASE);
+        b.burn_r = bond;
+        b.proof = StubExecutor::make_bundle_proof(&fixtures::HC, &StubExecutor.bundle_digest(&b.digest_input()), &[0; 8]);
+        let register = StubExecutor::bound(Transaction::shielded(7, b, Action::RegisterAggregator { registration }));
+
+        let twins = vec![transfer.clone(), deploy_twin.clone(), call.clone(), register.clone()];
+        let mut l1 = gs.ledger.clone();
+        let twin_block = make_block(&gs.block, &mut l1, twins, &key(1));
+        let receipts = gs.ledger.clone().apply_block(&twin_block.block, &StubExecutor).expect("the twin block applies");
+        assert_eq!(l1.unsealed_fees()[&deploy_twin.hash()].0, 60, "the covered Deploy buckets fee − its whole floor");
+        let mut bucket = l1.unsealed_fees().clone();
+        let entry = bucket.remove(&deploy_twin.hash()).unwrap();
+        bucket.insert(deploy.hash(), entry);
+        l1.set_unsealed_fees(bucket);
+        let mut b1 = make_block_unchecked(&gs.block, &l1, vec![transfer, deploy.clone(), call, register], &key(1));
+        b1.receipts = receipts;
+        st.storage.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
+
+        // Block 2: the aggregate over the Deploy.
+        let r = [9u32; 8];
+        let covers = vec![deploy.hash()];
+        let proof_bytes = b"ok".to_vec();
+        let signature = kp.sign(
+            aggregate_signing_hash(7, 0, 2, &r, &covers, &Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&fixtures::env(9)))
+                .as_bytes(),
+        );
+        let aggregate = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::Aggregate { covers, proof: proof_bytes, aggregator: kp.public_key().address(), nonce: 0, time: 2, r, envelope: fixtures::env(9), signature },
+        };
+        let record = st.storage.covered_record(&deploy.hash(), FriProfile::Test).unwrap().unwrap();
+        let sidecar: BTreeMap<usize, Vec<CoveredBundle>> = [(0usize, vec![record])].into_iter().collect();
+        let mut l2 = l1.clone();
+        l2.set_height(2);
+        l2.set_timestamp_ms(2);
+        l2.apply_transactions_with_covered(std::slice::from_ref(&aggregate), &key(1).address(), &sidecar, &StubExecutor).unwrap();
+        l2.record_anchor(2);
+        let b2 = make_block_unchecked(&b1, &l2, vec![aggregate.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b2), &l2, &[], &StubExecutor).unwrap();
+
+        let supply = ok(&st, "rand_getSupply", json!([])).await;
+        assert_eq!(
+            supply["base_fees_burned"],
+            (BUNDLE_BASE + deploy_floor + call_floor + BUNDLE_BASE).to_string(),
+            "the transfer's, the Deploy's and the Call's floors, and the registration's base: {supply}"
+        );
+        assert_eq!(supply["invariant_holds"], true, "{supply}");
+
+        let v = ok(&st, "rand_getAggregate", json!([aggregate.hash().to_hex()])).await;
+        let (subsidy, share): (u64, u64) = (v["subsidy"].as_str().unwrap().parse().unwrap(), v["proving_share"].as_str().unwrap().parse().unwrap());
+        assert_eq!(share, deploy.fee() - deploy_floor, "proving_share is the covered bundle's fee − floor");
+        assert_ne!(share, deploy.fee() - BUNDLE_BASE, "not fee − BUNDLE_BASE");
+        assert_eq!(subsidy, schedule - share, "subsidy_net_of_fees: only the shortfall is minted");
+        assert_eq!(supply["subsidised"], v["subsidy"], "rand_getSupply.subsidised is the minted part");
+        let [deposit] = b2.deposits.as_slice() else { panic!("the aggregate appends one note: {:?}", b2.deposits) };
+        assert_eq!(
+            deposit.cm,
+            StubExecutor.note_commitment(&payout.pk, &[0; 8], subsidy + share, 0, 2, &r),
+            "subsidy + proving_share is the payout note's amount"
+        );
     }
 
     /// The interface review's IFACE-7: under `tokens.burn_registration_fee` the ledger buckets a
