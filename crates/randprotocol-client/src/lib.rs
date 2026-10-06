@@ -1798,6 +1798,50 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "one failed read, one good one");
     }
 
+    /// [`fee_rules_of`] reads `fee_rules` field by field, never through [`FeesConfig`]'s
+    /// `deny_unknown_fields` (which guards the genesis file), so a reply this client was not
+    /// written for still decodes — the aggregate daemon must not stop on a newer or an odd node:
+    /// - an unknown fourth key (a rule added after this client) is ignored, the three it knows
+    ///   read as served;
+    /// - a reply carrying only `burn_floor` reads it, the two absent flags `None`;
+    /// - a non-bool value — the string `"true"`, the number `1`, `null` — reads as `None` (off,
+    ///   exactly as the genesis hash and the ledger read an absent flag), never as `true` and
+    ///   never as an error.
+    ///
+    /// And [`RpcClient::fee_rules`] hands back the same value off a live reply with the extra key.
+    #[tokio::test]
+    async fn fee_rules_of_tolerates_an_unknown_key_a_missing_key_and_a_non_bool_value() {
+        use test_rpc::{scripted_rpc, Reply};
+        let rules = |v: Value| fee_rules_of(&json!({ "max_proof_bytes": 2097152, "fee_rules": v }));
+        let all = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true) };
+        let fourth = json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true, "burn_tip": true });
+        assert_eq!(rules(fourth.clone()), all, "an unknown fourth key is ignored");
+        assert_eq!(
+            rules(json!({ "burn_floor": true })),
+            FeesConfig { burn_base: None, subsidy_net_of_fees: None, burn_floor: Some(true) },
+            "only burn_floor: the absent flags read None"
+        );
+        assert_eq!(
+            rules(json!({ "burn_base": "true", "subsidy_net_of_fees": 1, "burn_floor": null })),
+            FeesConfig::default(),
+            "\"true\", 1 and null are not booleans: each reads None"
+        );
+        assert_eq!(
+            rules(json!({ "burn_base": false, "subsidy_net_of_fees": "yes", "burn_floor": true })),
+            FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: Some(true) },
+            "a real false is kept as Some(false), a stray string beside it is None"
+        );
+        assert!(!rules(json!({ "burn_base": "true" })).burn_base(), "a string \"true\" never switches a rule on");
+
+        let mut reply = json!({
+            "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+            "max_call_envelope_bytes": 18432, "max_program_public_words": 64
+        });
+        reply["fee_rules"] = fourth;
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(reply))]).await);
+        assert_eq!(rpc.fee_rules().await.expect("an extra key is no error"), all, "the client path reads it the same");
+    }
+
     /// Issue #64: every committed genesis file (`deploy/genesis-chain*.json`) of a chain that
     /// could still run — chain 14 on — and carries no `envelope_bytes` has its chain id in
     /// [`LEGACY_ENVELOPE_CHAIN_IDS`], so a node claiming the memo form there is never believed.
