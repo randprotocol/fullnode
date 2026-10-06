@@ -1852,6 +1852,32 @@ mod tests {
         assert_eq!(a.total_supply(), issued);
     }
 
+    /// Register-side bases are never burned (`docs/fees.md` §1.3, "register-side bases are
+    /// untouched"): under `fees.burn_base` and `fees.burn_floor` a validator `Withdraw` still pays
+    /// its `BUNDLE_BASE` out of the withdrawn amount into the proposer's `rewards` — it carries no
+    /// bundle, so the fee split never sees it — and neither `base_fees_burned` nor `burned`
+    /// moves. The audit holds. A rule that widened the burn to every base would fail here first.
+    #[test]
+    fn a_withdraw_under_both_burn_flags_still_pays_its_base_to_the_proposer() {
+        let v = key(1);
+        let p = key(2);
+        let mut e = entry(&v, MIN_STAKE, payout(1));
+        e.pending = vec![(0, 100 * BASE)];
+        let mut l = ledger(vec![e, entry(&p, MIN_STAKE, payout(2))]);
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+        l.set_genesis_supply(0, 2 * MIN_STAKE + 100 * BASE);
+        let before = l.clone();
+
+        let amount = 100 * BASE;
+        l.apply_tx(&withdraw_tx(&v, amount, 0, 5, [3; 8]), &p.address(), &StubExecutor).unwrap();
+        assert!(l.has_commitment(&withdrawn_note(1, amount, 5, [3; 8])), "the note is worth the amount less the base");
+        assert_eq!(l.validators()[&p.address()].rewards - before.validators()[&p.address()].rewards, BASE, "the base is the proposer's under both burn flags");
+        assert_eq!(l.base_fees_burned(), before.base_fees_burned(), "a withdraw's base is not a burned bundle base");
+        assert_eq!(l.supply().burned, before.supply().burned, "nothing is destroyed");
+        assert_eq!(l.supply().withdraw_deposited, amount - BASE);
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
     #[test]
     fn withdraw_rejects_unreleased_pending() {
         let v = key(1);

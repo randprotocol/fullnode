@@ -2953,6 +2953,49 @@ mod payment_tests {
         assert_eq!((payment.subsidy, payment.proving_shares, payment.total), (0, schedule, schedule));
     }
 
+    /// `fees.subsidy_net_of_fees` at the end of the schedule: with `sealed_blocks` at the 64th
+    /// halving (`gas::subsidy` is 0 from there on) a covering aggregate is paid exactly its
+    /// shares, mints nothing (`subsidised` stays put), still advances `sealed_blocks`, and the
+    /// audit holds. Schedule 0 makes the flag a no-op, so the same aggregate with the flag off
+    /// pays the same note and leaves the same root — pins `minted_subsidy`'s saturating
+    /// subtraction at its floor and the halving's 64-shift cut-off together.
+    #[test]
+    fn subsidy_net_of_fees_past_the_last_halving_pays_the_shares_alone_flag_or_not() {
+        let run = |net: bool| {
+            let mut l = gated(256);
+            if net {
+                l.set_fees(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None });
+            }
+            let (kp, _) = keys();
+            register(&mut l, &kp, 10);
+            l.record_anchor(1);
+            let p = proposer(&l);
+            let covered_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE + 60, 0), Action::None));
+            l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
+            let cfg = l.aggregation().unwrap().clone();
+            let mut s = l.supply();
+            s.sealed_blocks = 64 * cfg.halving_blocks;
+            l.set_supply(s);
+            assert_eq!(gas::subsidy(l.supply().sealed_blocks, &cfg), 0, "the schedule has ended");
+            assert!(gas::subsidy(0, &cfg) > 60, "at its start the schedule would have outpaid the shares");
+            let before = l.supply();
+
+            let payment = l.aggregate_payment(&[covered_tx.hash()], &cfg, 1, &[9; 8], &payout_addr(), &StubExecutor).unwrap();
+            assert_eq!((payment.subsidy, payment.proving_shares, payment.total), (0, 60, 60), "net {net}: the shares alone");
+            let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+            l.apply_aggregate(&tx, &covered_records(&[1]), &StubExecutor).unwrap();
+            assert!(l.has_commitment(&payment.note), "net {net}: the note is appended");
+            assert_eq!(l.supply().subsidised, before.subsidised, "net {net}: nothing is minted");
+            assert_eq!(l.supply().sealed_blocks, before.sealed_blocks + 1, "net {net}: the index still advances");
+            assert!(l.audit().invariant_holds(), "net {net}: {:?}", l.audit());
+            (payment.note, l.state_root())
+        };
+        let (net_note, net_root) = run(true);
+        let (plain_note, plain_root) = run(false);
+        assert_eq!(net_note, plain_note, "schedule 0 makes the flag a no-op: one note");
+        assert_eq!(net_root, plain_root, "and one root");
+    }
+
     /// `sealed_blocks` is the subsidy schedule's index: it counts included aggregates, never
     /// blocks — an idle chain consumes nothing of the schedule (spec §5.1).
     #[test]
@@ -3437,6 +3480,98 @@ mod payment_tests {
         }
         // (A side-table raw hash that lies is not the ledger's check: the *coverage* rule is
         // the caller's, and the digest binding above is what anchors the content.)
+    }
+
+    /// The sealed form under the burn flags (spec §7, `docs/fees.md` §1.3): a block whose
+    /// bundles — a transfer, a Deploy and a tier-14 Call under a `gas` section, each over its
+    /// floor — are served in marker form with the side table replays under `burn_base +
+    /// burn_floor` to exactly the raw block's `base_fees_burned`, `fees_paid`, `burned`, bucket
+    /// and root. The Call is the leg that matters: its floor is `circuit_call_floor` at the
+    /// proof's declared limit, which `settled_floor` reads only off the decoded `CallOutcome` —
+    /// on `None` it falls back to the pre-verify `fee_floor`, which is smaller. So both paths
+    /// must burn the tier-exact floor; a sync path that stopped handing the outcome to the burn
+    /// would burn less than the raw block and fail here. (Only `bundle.proof` is pruned; a call's
+    /// own proof is in the action.)
+    #[test]
+    fn a_pruned_block_replays_the_burn_floor_split_of_the_raw_block() {
+        use crate::consensus::PrunedBundle;
+        let (a, _) = keys();
+        let mut l = gated(256);
+        let p = proposer(&l);
+        let prices = pruned_gas();
+        l.set_gas(Some(prices.clone()));
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+        let staked = l.supply().genesis_staked;
+        l.set_genesis_supply(1_000 * crate::types::UNITS_PER_RAND, staked);
+        // The program the Call runs, deployed before the block.
+        let words = vec![0x17u32; 4];
+        let program_deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
+        let d = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[90; 8], [91; 8]], [[92; 8], [93; 8]], gas::fee_floor(&program_deploy), 0), program_deploy));
+        l.apply_tx(&d, &p, &StubExecutor).unwrap();
+        l.record_anchor(1);
+        let id = crate::program::program_id(0, &words);
+
+        let deploy = Action::Deploy { base_pc: 0, words: vec![0x13; 6], public: vec![] };
+        let deploy_floor = gas::fee_floor(&deploy);
+        let limit = gas::gas_max(14, 0, 0);
+        let call_proof = StubExecutor::make_proof_with_gas(&id, 14, [7; 8], limit);
+        let call = Action::Call { program: id, proof: call_proof.clone(), input_envelope: None };
+        let call_floor = gas::circuit_call_floor(prices.gas_price, prices.byte_price, limit, call_proof.len());
+        assert!(call_floor > gas::fee_floor(&call), "the tier-exact floor exceeds the pre-verify fallback");
+        let raw = vec![
+            StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE + 40, 0), Action::None)),
+            StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], deploy_floor + 60, 0), deploy)),
+            StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[9; 8], [10; 8]], [[11; 8], [12; 8]], call_floor + 80, 0), call)),
+        ];
+        // Each bundle's marker form and its side-table entry, exactly as the pruned-bundle test
+        // builds them.
+        let (pruned, sides): (Vec<Transaction>, Vec<PrunedBundle>) = raw
+            .iter()
+            .map(|tx| {
+                let digest = StubExecutor.bundle_digest(&tx.bundle.as_ref().unwrap().digest_input());
+                let hpub = StubExecutor.public_digest(&tx.binding(&crate::types::BindingDomain::ChainId));
+                let mut pv = [0u64; crate::types::pv::NUM];
+                for k in 0..8 {
+                    pv[pv::OUT0 + k] = digest[k] as u64;
+                    pv[pv::PUB0 + k] = hpub[k] as u64;
+                }
+                let proof_hash = Hash::digest(&tx.bundle.as_ref().unwrap().proof);
+                let mut marker = crate::notes::PRUNED_PROOF_MARKER.to_vec();
+                marker.extend_from_slice(proof_hash.as_bytes());
+                let mut m = tx.clone();
+                m.bundle.as_mut().unwrap().proof = marker;
+                assert_eq!(m.hash(), tx.hash(), "the marker form hashes to the raw hash");
+                (m, PrunedBundle { tx_hash: tx.hash(), proof_hash, public_values: pv.to_vec(), shape: shape() })
+            })
+            .unzip();
+
+        let raw_block = signed_block(&l, raw.clone(), &a, 1);
+        let marker_block = Block::sign(&crate::types::SigningDomain::v0(Hash::ZERO), raw_block.header.clone(), pruned, &a);
+        let mut from_raw = l.clone();
+        from_raw.apply_block(&raw_block, &StubExecutor).expect("the raw block applies");
+        let mut from_marker = l.clone();
+        from_marker
+            .apply_block_for_sync(&marker_block, &BTreeMap::new(), &sides, &StubExecutor, &NoVerified)
+            .expect("the marker block applies on the side table at the raw block's root");
+
+        let floors = gas::BUNDLE_BASE + deploy_floor + call_floor;
+        for (path, after) in [("raw", &from_raw), ("pruned", &from_marker)] {
+            assert_eq!(after.base_fees_burned() - l.base_fees_burned(), floors, "{path}: the base, the Deploy's floor and the Call's circuit_call_floor burn");
+            assert_eq!(after.supply().burned - l.supply().burned, floors, "{path}: burned moves by the floors alone");
+            assert_eq!(after.supply().fees_paid, l.supply().fees_paid, "{path}: an aggregating chain under burn_floor pays the proposer nothing at inclusion");
+            assert_eq!(after.validators()[&a.address()].rewards, l.validators()[&a.address()].rewards, "{path}: the proposer keeps nothing");
+            let tips: u64 = raw.iter().map(|t| after.unsealed_fees()[&t.hash()].0).sum();
+            assert_eq!(tips, 40 + 60 + 80, "{path}: each bundle's tip is bucketed");
+            assert!(after.audit().invariant_holds(), "{path}: {:?}", after.audit());
+        }
+        assert_eq!(from_marker.unsealed_fees(), from_raw.unsealed_fees(), "the bucket");
+        assert_eq!(from_marker.state_root(), from_raw.state_root(), "the root");
+    }
+
+    /// A `gas` section at chain 18's fixed prices (100 per gas, 800 per KiB, the tier-14 bundle
+    /// pin), for the pruned-replay test's Call.
+    fn pruned_gas() -> gas::GasConfig {
+        gas::GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: gas::gas_max(14, 0, 0), metering: gas::GasMetering::Circuit, dynamic: None }
     }
 
     /// The proposer–validator invariant for an aggregate-carrying block: the root a proposer

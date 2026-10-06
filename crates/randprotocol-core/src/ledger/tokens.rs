@@ -3527,6 +3527,49 @@ mod action_tests {
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
     }
 
+    /// TOK-2 beside `fees.burn_floor` (issue #135): a registration under
+    /// `tokens.burn_registration_fee` + `fees.burn_base` + `fees.burn_floor` burns
+    /// `registration_fee + BUNDLE_BASE` exactly — the registration fee is not part of the settled
+    /// floor (`settled_floor` is the plain base for a `RegisterToken`), so it is counted once, in
+    /// `registration_fees_burned`, and the floor's burn is the base, in `base_fees_burned`. The
+    /// proposer keeps the tip; on an aggregating chain it keeps nothing and the bucket holds the
+    /// tip. A floor that swallowed the registration fee would double-burn it and fail here.
+    #[test]
+    fn a_registration_under_burn_floor_burns_the_registration_fee_and_the_base_exactly() {
+        let p = proposer().address();
+        let tip = 5;
+        let fee = gas::BUNDLE_BASE + REG_FEE + tip;
+        for aggregating in [false, true] {
+            let what = if aggregating { "aggregating chain" } else { "non-aggregating chain" };
+            let mut l = ledger();
+            l.set_genesis_supply(10 * fee, 10);
+            l.set_tokens(Some(TokenRegistry::new(REG_FEE).with_burn_registration_fee(true)));
+            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+            if aggregating {
+                l.set_aggregation(Some(crate::ledger::aggregation::AggregationConfig {
+                    bond: 100,
+                    max_covers: 3,
+                    subsidy_base: 100,
+                    halving_blocks: 210_000,
+                    window: 256,
+                    admitted_shapes: vec![],
+                }));
+            }
+            let tx = register_tx_at(&l, MintAuthority::None, Some(initial(&l, 5)), 10, l.tokens().unwrap().next_index(), fee);
+            assert_eq!(l.settled_floor(&tx, None), gas::BUNDLE_BASE, "{what}: the registration fee is outside the floor");
+            let before = l.clone();
+            l.apply_tx(&tx, &p, &StubExecutor).unwrap();
+            assert_eq!(l.supply().burned - before.supply().burned, REG_FEE + gas::BUNDLE_BASE, "{what}: exactly both are destroyed");
+            assert_eq!(l.registration_fees_burned(), REG_FEE, "{what}: the registration fee in its own counter");
+            assert_eq!(l.base_fees_burned(), gas::BUNDLE_BASE, "{what}: the floor's burn is the base alone");
+            let kept = l.validators()[&p].rewards - before.validators()[&p].rewards;
+            let bucketed = l.unsealed_fees().get(&tx.hash()).map_or(0, |e| e.0);
+            assert_eq!((kept, bucketed), if aggregating { (0, tip) } else { (tip, 0) }, "{what}: the tip goes to the proposer or the bucket");
+            assert_eq!(l.supply().fees_paid - before.supply().fees_paid, kept, "{what}: fees_paid moves by what is kept");
+            assert!(l.audit().invariant_holds(), "{what}: {:?}", l.audit());
+        }
+    }
+
     /// The initial note's `time` is the creator's, sealed against before the transaction was
     /// submitted, so it gets the window every note-stamping `time` gets.
     #[test]

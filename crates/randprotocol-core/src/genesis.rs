@@ -2723,6 +2723,43 @@ mod tests {
         assert!(g.validate().is_ok(), "a false flag asks for nothing");
     }
 
+    /// Issue #135, the third flag through the file and the hash: `burn_floor: true` survives
+    /// `to_json` → `from_json` and reaches the ledger; a misspelt `burn_flor` is refused by
+    /// `deny_unknown_fields` (a typo must not read as "off" on a consensus rule); `burn_floor:
+    /// false` beside `burn_base: true` builds the very genesis hash of `burn_base` alone (the byte
+    /// pin covers `fees_commit`, this covers `build`); and the floor beside
+    /// `subsidy_net_of_fees` without the base is refused like the floor alone.
+    #[test]
+    fn the_burn_floor_flag_round_trips_hashes_as_written_and_refuses_a_misspelling() {
+        use crate::ledger::fees::FeesConfig;
+        let mut on = aggregating_genesis();
+        on.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+        let json = on.to_json();
+        assert!(json.contains("\"burn_floor\": true"), "the flag is written: {json}");
+        let back = Genesis::from_json(&json).expect("the file parses back");
+        assert_eq!(back, on, "burn_floor: true round-trips");
+        assert_eq!(build(&back).hash(), build(&on).hash(), "and hashes as before the trip");
+        assert!(build(&back).ledger.fees().burn_floor(), "and reaches the ledger");
+
+        let typo = json.replace("\"burn_floor\"", "\"burn_flor\"");
+        assert_ne!(typo, json);
+        let e = Genesis::from_json(&typo).expect_err("a misspelt flag is refused");
+        assert!(e.to_string().contains("burn_flor"), "the refusal names the key: {e}");
+
+        let hash_of = |f: FeesConfig| {
+            let mut g = aggregating_genesis();
+            g.fees = Some(f);
+            build(&g).hash()
+        };
+        let base = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None };
+        assert_eq!(hash_of(FeesConfig { burn_floor: Some(false), ..base.clone() }), hash_of(base.clone()), "false beside burn_base is burn_base alone");
+        assert_ne!(hash_of(FeesConfig { burn_floor: Some(true), ..base }), hash_of(FeesConfig { burn_floor: Some(false), burn_base: Some(true), subsidy_net_of_fees: None }), "true is another chain");
+
+        let mut g = aggregating_genesis();
+        g.fees = Some(FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: Some(true) });
+        assert!(matches!(g.validate(), Err(GenesisError::BurnFloorWithoutBurnBase)), "the net subsidy does not stand in for the base");
+    }
+
     /// Fee feedback: the section round-trips through the file — kept as written when present,
     /// omitted entirely when absent, so every existing file serialises byte for byte as before.
     #[test]

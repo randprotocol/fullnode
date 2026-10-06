@@ -6844,4 +6844,173 @@ mod tests {
         assert_eq!(replica.validators()[&p].rewards, proposer.validators()[&p].rewards);
         assert_eq!(replica.audit(), proposer.audit());
     }
+
+    // ---- The fee split across every flag (test/fees-core) ---------------------------------
+
+    /// An aggregation section for the split tests: the proving-share bucket on, a `window`-block
+    /// coverable window, no admitted shapes (no aggregate is applied here).
+    fn split_aggregation(window: u64) -> aggregation::AggregationConfig {
+        aggregation::AggregationConfig {
+            bond: 100 * UNITS_PER_RAND,
+            max_covers: 3,
+            subsidy_base: 100 * UNITS_PER_RAND,
+            halving_blocks: 210_000,
+            window,
+            admitted_shapes: vec![],
+        }
+    }
+
+    /// The split invariant, exhaustively (`docs/fees.md` §1.3, issue #135): for every `fees`
+    /// section the ledger can run — none, `burn_base`, `burn_base + burn_floor` — on a chain with
+    /// and without aggregation, for a transfer, a Deploy and a tier-14 Call under a `gas` section,
+    /// at tips 0, 1, 999 and 1 000 000 over the action's floor, one block's bundle divides its fee
+    /// exactly: `kept + fee_burned + bucketed == fee`, with `kept` the proposer's `rewards` delta,
+    /// `fee_burned` the `base_fees_burned` delta, `bucketed` the bundle's bucket entry. `fees_paid`
+    /// moves by `kept` and `burned` by `fee_burned`, each cell gets the figure its rule says, the
+    /// audit holds, and a replica applying the signed block reaches the proposer's root. Pins the
+    /// four-cell `kept` match and `bucket_floor` against each other, so no rule can leak or mint
+    /// a unit of a fee in any corner.
+    #[test]
+    fn the_fee_split_divides_every_fee_exactly_under_every_rule() {
+        let (a, _) = keys();
+        let p = a.address();
+        let rules = [
+            ("no fees section", fees::FeesConfig::default()),
+            ("burn_base", burn_rules(None)),
+            ("burn_base+burn_floor", burn_rules(Some(true))),
+        ];
+        let limit = gas::gas_max(14, 0, 0);
+        let mut cells = 0;
+        for (rule_name, rule) in &rules {
+            for aggregating in [false, true] {
+                // The program is deployed at height 1 under the `gas` section; the bundle under
+                // test is block 2.
+                let (base, id) = ledger_with_program(|l| l.set_gas(Some(fixed_gas())));
+                let mut l = with_rules(base, rule.clone());
+                if aggregating {
+                    l.set_aggregation(Some(split_aggregation(256)));
+                }
+                let chain = if aggregating { "aggregating" } else { "non-aggregating" };
+                let call_proof = StubExecutor::make_proof_with_gas(&id, 14, [7; 8], limit);
+                let deploy = Action::Deploy { base_pc: 0, words: vec![0x17; 5], public: vec![] };
+                let actions: [(&str, u64); 3] = [
+                    ("transfer", gas::BUNDLE_BASE),
+                    ("Deploy of 5 words", gas::fee_floor(&deploy)),
+                    ("tier-14 Call", gas::circuit_call_floor(fixed_gas().gas_price, fixed_gas().byte_price, limit, call_proof.len())),
+                ];
+                for (action_name, floor) in actions {
+                    for tip in [0u64, 1, 999, 1_000_000] {
+                        let what = format!("{rule_name}, {chain} chain, {action_name}, tip {tip}");
+                        let fee = floor + tip;
+                        let t = match action_name {
+                            "transfer" => StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], fee), Action::None)),
+                            "tier-14 Call" => call_tx(&l, 70, id, call_proof.clone(), fee),
+                            _ => StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], fee), deploy.clone())),
+                        };
+                        // The proposer's path, exactly as `a_replica_replays_burn_floor_blocks_…`.
+                        let mut after = l.clone();
+                        after.set_height(2);
+                        let mut call_gas = 0u64;
+                        if let Some(r) = after.apply_tx(&t, &p, &StubExecutor).unwrap_or_else(|e| panic!("{what}: {e:?}")) {
+                            call_gas += r.gas_used;
+                        }
+                        let (bytes, gas_used) = after.block_usage(std::slice::from_ref(&t), call_gas);
+                        after.close_block(2, &p, bytes, gas_used);
+
+                        let kept = after.validators()[&p].rewards - l.validators()[&p].rewards;
+                        let fee_burned = after.base_fees_burned() - l.base_fees_burned();
+                        let bucketed = after.unsealed_fees().get(&t.hash()).map_or(0, |e| e.0);
+                        assert_eq!(kept + fee_burned + bucketed, fee, "{what}: kept {kept} + burned {fee_burned} + bucketed {bucketed} ≠ fee {fee}");
+                        assert_eq!(after.supply().fees_paid - l.supply().fees_paid, kept, "{what}: fees_paid moves by what the proposer keeps");
+                        assert_eq!(after.supply().burned - l.supply().burned, fee_burned, "{what}: burned moves by the fee burn alone");
+                        // Each cell's own figure (the four-cell `kept` match and `fee_burn`).
+                        let want_burn = match *rule_name {
+                            "no fees section" => 0,
+                            "burn_base" => gas::BUNDLE_BASE,
+                            _ => floor,
+                        };
+                        let want_kept = match (aggregating, want_burn > 0) {
+                            (false, false) => fee,
+                            (true, false) => gas::BUNDLE_BASE,
+                            (false, true) => fee - want_burn,
+                            (true, true) => 0,
+                        };
+                        assert_eq!((kept, fee_burned), (want_kept, want_burn), "{what}: (kept, burned)");
+                        assert_eq!(after.unsealed_fees().contains_key(&t.hash()), aggregating, "{what}: a bucket entry exactly on an aggregating chain");
+                        assert!(after.audit().invariant_holds(), "{what}: {:?}", after.audit());
+
+                        // Determinism: a replica applying the signed block reaches the same root,
+                        // twice over.
+                        let block = signed_block(vec![t.clone()], &a, 2, after.state_root());
+                        for replica_run in 0..2 {
+                            let mut replica = l.clone();
+                            replica.apply_block(&block, &StubExecutor).unwrap_or_else(|e| panic!("{what}, replica {replica_run}: {e:?}"));
+                            assert_eq!(replica.state_root(), after.state_root(), "{what}: replica {replica_run}'s root");
+                            assert_eq!(replica.base_fees_burned(), after.base_fees_burned(), "{what}: replica {replica_run}'s burn");
+                        }
+                        cells += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 3 * 2 * 3 * 4, "every combination ran");
+    }
+
+    /// The sweep under `burn_floor` when the recording proposer is gone (`sweep_expired_excesses`,
+    /// spec §5.2): on an aggregating chain under `burn_base + burn_floor` a tier-14 Call's
+    /// excess `fee − floor` is bucketed against the proposer that included it; that entry then
+    /// leaves the register; when the window expires the *committing* proposer takes exactly
+    /// `fee − floor` — never the burned floor — and `fees_paid` moves by it. The ledger has no
+    /// action that deletes a register entry today (a full `Withdraw` leaves an empty entry), so
+    /// the test removes the emptied entry directly to reach the sweep's fallback arm.
+    #[test]
+    fn the_sweep_pays_the_committing_proposer_fee_less_the_floor_when_the_recorder_is_gone() {
+        let (a, _) = keys();
+        let committing = a.address();
+        let (base, id) = ledger_with_program(|l| l.set_gas(Some(fixed_gas())));
+        let mut l = base;
+        l.set_aggregation(Some(split_aggregation(2)));
+        // The recorder: a register entry with nothing in it, so removing it moves no value.
+        let recorder_key = Keypair::from_seed([3; 32]).unwrap();
+        let (recorder, recorder_entry) = entry(&recorder_key, 0);
+        l.validators.insert(recorder, recorder_entry);
+        let mut l = with_rules(l, burn_rules(Some(true)));
+        l.set_height(2);
+
+        let limit = gas::gas_max(14, 0, 0);
+        let proof = StubExecutor::make_proof_with_gas(&id, 14, [7; 8], limit);
+        let floor = gas::circuit_call_floor(100, 800, limit, proof.len());
+        let tip = 4_321;
+        let t = call_tx(&l, 20, id, proof, floor + tip);
+        l.apply_tx(&t, &recorder, &StubExecutor).unwrap();
+        l.close_block(2, &recorder, 0, 0);
+        assert_eq!(l.unsealed_fees().get(&t.hash()), Some(&(tip, recorder, 4)), "fee − floor bucketed to the recorder, until 2 + 2");
+        assert_eq!(l.validators()[&recorder].rewards, 0, "the recorder kept nothing at inclusion");
+        assert_eq!(l.base_fees_burned(), floor, "the whole floor burned");
+
+        // The recorder leaves the register (empty, so the register total does not move).
+        assert_eq!(l.validators.remove(&recorder).map(|e| (e.stake, e.rewards, e.pending.len())), Some((0, 0, 0)));
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+
+        let before = l.clone();
+        for h in [3u64, 4] {
+            let mut next = l.clone();
+            next.set_height(h);
+            next.close_block(h, &committing, 0, 0);
+            let block = signed_block(vec![], &a, h, next.state_root());
+            l.apply_block(&block, &StubExecutor).unwrap();
+            if h == 3 {
+                assert!(l.unsealed_fees().contains_key(&t.hash()), "still coverable at 3");
+            }
+        }
+        assert!(l.unsealed_fees().is_empty(), "the window passed at 4");
+        assert_eq!(
+            l.validators()[&committing].rewards - before.validators()[&committing].rewards,
+            tip,
+            "the committing proposer takes exactly fee − floor"
+        );
+        assert_eq!(l.supply().fees_paid - before.supply().fees_paid, tip, "fees_paid moves by the swept excess");
+        assert_eq!(l.base_fees_burned(), before.base_fees_burned(), "the sweep burns nothing more");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
 }
