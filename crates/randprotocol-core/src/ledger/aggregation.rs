@@ -3483,23 +3483,45 @@ mod payment_tests {
     }
 
     /// The sealed form under the burn flags (spec §7, `docs/fees.md` §1.3): a block whose
-    /// bundles — a transfer and a Deploy, each over its floor — are served in marker form with
-    /// the side table replays under `burn_base + burn_floor` to exactly the raw block's
-    /// `base_fees_burned`, `fees_paid`, `burned`, bucket and root. The split reads only the
-    /// bundle's `fee` and the action (the floor is `settled_floor` over the action, and a call's
-    /// proof is in the action, never pruned), all of which the marker form keeps byte for byte.
+    /// bundles — a transfer, a Deploy and a tier-14 Call under a `gas` section, each over its
+    /// floor — are served in marker form with the side table replays under `burn_base +
+    /// burn_floor` to exactly the raw block's `base_fees_burned`, `fees_paid`, `burned`, bucket
+    /// and root. The Call is the leg that matters: its floor is `circuit_call_floor` at the
+    /// proof's declared limit, which `settled_floor` reads only off the decoded `CallOutcome` —
+    /// on `None` it falls back to the pre-verify `fee_floor`, which is smaller. So both paths
+    /// must burn the tier-exact floor; a sync path that stopped handing the outcome to the burn
+    /// would burn less than the raw block and fail here. (Only `bundle.proof` is pruned; a call's
+    /// own proof is in the action.)
     #[test]
     fn a_pruned_block_replays_the_burn_floor_split_of_the_raw_block() {
         use crate::consensus::PrunedBundle;
         let (a, _) = keys();
         let mut l = gated(256);
+        let p = proposer(&l);
+        let prices = pruned_gas();
+        l.set_gas(Some(prices.clone()));
         l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
         let staked = l.supply().genesis_staked;
         l.set_genesis_supply(1_000 * crate::types::UNITS_PER_RAND, staked);
+        // The program the Call runs, deployed before the block.
+        let words = vec![0x17u32; 4];
+        let program_deploy = Action::Deploy { base_pc: 0, words: words.clone(), public: vec![] };
+        let d = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[90; 8], [91; 8]], [[92; 8], [93; 8]], gas::fee_floor(&program_deploy), 0), program_deploy));
+        l.apply_tx(&d, &p, &StubExecutor).unwrap();
+        l.record_anchor(1);
+        let id = crate::program::program_id(0, &words);
+
         let deploy = Action::Deploy { base_pc: 0, words: vec![0x13; 6], public: vec![] };
+        let deploy_floor = gas::fee_floor(&deploy);
+        let limit = gas::gas_max(14, 0, 0);
+        let call_proof = StubExecutor::make_proof_with_gas(&id, 14, [7; 8], limit);
+        let call = Action::Call { program: id, proof: call_proof.clone(), input_envelope: None };
+        let call_floor = gas::circuit_call_floor(prices.gas_price, prices.byte_price, limit, call_proof.len());
+        assert!(call_floor > gas::fee_floor(&call), "the tier-exact floor exceeds the pre-verify fallback");
         let raw = vec![
             StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE + 40, 0), Action::None)),
-            StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], gas::fee_floor(&deploy) + 60, 0), deploy)),
+            StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[5; 8], [6; 8]], [[7; 8], [8; 8]], deploy_floor + 60, 0), deploy)),
+            StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[9; 8], [10; 8]], [[11; 8], [12; 8]], call_floor + 80, 0), call)),
         ];
         // Each bundle's marker form and its side-table entry, exactly as the pruned-bundle test
         // builds them.
@@ -3532,15 +3554,24 @@ mod payment_tests {
             .apply_block_for_sync(&marker_block, &BTreeMap::new(), &sides, &StubExecutor, &NoVerified)
             .expect("the marker block applies on the side table at the raw block's root");
 
-        let floors = gas::BUNDLE_BASE + gas::fee_floor(&Action::Deploy { base_pc: 0, words: vec![0x13; 6], public: vec![] });
-        assert_eq!(from_raw.base_fees_burned(), floors, "the raw block burns both floors");
-        assert_eq!(from_marker.base_fees_burned(), from_raw.base_fees_burned(), "base_fees_burned");
-        assert_eq!(from_marker.supply().fees_paid, from_raw.supply().fees_paid, "fees_paid");
-        assert_eq!(from_marker.supply().burned, from_raw.supply().burned, "burned");
+        let floors = gas::BUNDLE_BASE + deploy_floor + call_floor;
+        for (path, after) in [("raw", &from_raw), ("pruned", &from_marker)] {
+            assert_eq!(after.base_fees_burned() - l.base_fees_burned(), floors, "{path}: the base, the Deploy's floor and the Call's circuit_call_floor burn");
+            assert_eq!(after.supply().burned - l.supply().burned, floors, "{path}: burned moves by the floors alone");
+            assert_eq!(after.supply().fees_paid, l.supply().fees_paid, "{path}: an aggregating chain under burn_floor pays the proposer nothing at inclusion");
+            assert_eq!(after.validators()[&a.address()].rewards, l.validators()[&a.address()].rewards, "{path}: the proposer keeps nothing");
+            let tips: u64 = raw.iter().map(|t| after.unsealed_fees()[&t.hash()].0).sum();
+            assert_eq!(tips, 40 + 60 + 80, "{path}: each bundle's tip is bucketed");
+            assert!(after.audit().invariant_holds(), "{path}: {:?}", after.audit());
+        }
         assert_eq!(from_marker.unsealed_fees(), from_raw.unsealed_fees(), "the bucket");
-        assert_eq!(from_raw.unsealed_fees().values().map(|e| e.0).collect::<Vec<_>>().iter().sum::<u64>(), 40 + 60, "the tips are bucketed");
         assert_eq!(from_marker.state_root(), from_raw.state_root(), "the root");
-        assert!(from_marker.audit().invariant_holds(), "{:?}", from_marker.audit());
+    }
+
+    /// A `gas` section at chain 18's fixed prices (100 per gas, 800 per KiB, the tier-14 bundle
+    /// pin), for the pruned-replay test's Call.
+    fn pruned_gas() -> gas::GasConfig {
+        gas::GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: gas::gas_max(14, 0, 0), metering: gas::GasMetering::Circuit, dynamic: None }
     }
 
     /// The proposer–validator invariant for an aggregate-carrying block: the root a proposer

@@ -6896,7 +6896,7 @@ mod tests {
                 let actions: [(&str, u64); 3] = [
                     ("transfer", gas::BUNDLE_BASE),
                     ("Deploy of 5 words", gas::fee_floor(&deploy)),
-                    ("tier-14 Call", gas::circuit_call_floor(100, 800, limit, call_proof.len())),
+                    ("tier-14 Call", gas::circuit_call_floor(fixed_gas().gas_price, fixed_gas().byte_price, limit, call_proof.len())),
                 ];
                 for (action_name, floor) in actions {
                     for tip in [0u64, 1, 999, 1_000_000] {
