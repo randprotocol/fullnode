@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A throwaway single-validator RAND chain from built binaries, for the downstream integration
-# tests (randscan, randbridge.org, randprotocol.org, zusd.money — `docs/howto.md`, "Running the
-# downstream integration tests"). It cuts a genesis with the faucet on, starts one validator on
+# tests (randscan, randbridge.org, randprotocol.org, zusd.money — `docs/howto.md` §7, "How do I
+# run the downstream integration tests?"). It cuts a genesis with the faucet on, starts one validator on
 # loopback, waits for its RPC to answer, and prints what a test needs as `key=value` lines:
 #
 #   RPC_URL=http://127.0.0.1:<port>
@@ -10,7 +10,7 @@
 #   DIR=<dir>
 #
 # Stop it with `scripts/dev-chain.sh --stop <dir>`; the directory is left for the caller to read
-# (`node.log`) or delete.
+# (`node.log`) or delete. Stopping twice is fine: a directory whose node is gone says so, exit 0.
 #
 # Inputs, all optional:
 #   RAND_NODE_BIN       the node binary (default target/release/rand-node)
@@ -25,9 +25,12 @@
 #   DEV_CHAIN_FRI_PROFILE        test (default; fast, insecure) or production
 #   DEV_CHAIN_BLOCK_INTERVAL_MS  block spacing (default 1000)
 #   DEV_CHAIN_GENESIS_ARGS       extra `rand-node genesis` flags, word-split (e.g. "--gas-price 100")
+#   DEV_CHAIN_BINDING_DOMAIN     the genesis `binding_domain`: 1, or 0 for none (default: 1, except
+#                                0 for chain ids 14–19)
 #
 # The chain is cut with `--binding-domain 1`, as every chain since 20 is: a wallet signs nothing
-# for a chain id outside 14–19 without it (BIND-1, `docs/deploy.md`).
+# for a chain id outside 14–19 without it (BIND-1, `docs/deploy.md`). On 14–19 the wallet signs the
+# chain-id form (`binding_domain_for`), so there the default is no binding domain.
 set -euo pipefail
 
 die() {
@@ -39,10 +42,15 @@ die() {
 if [ "${1:-}" = "--stop" ]; then
     dir=${2:-}
     [ -n "$dir" ] || die "usage: $0 --stop <dir>"
-    [ -f "$dir/node.pid" ] || die "$dir/node.pid not found: is $dir a dev chain directory?"
+    [ -d "$dir" ] || die "$dir is not a directory"
+    if [ ! -f "$dir/node.pid" ]; then
+        echo "not running (no $dir/node.pid)"
+        exit 0
+    fi
     pid=$(cat "$dir/node.pid")
     if kill -0 "$pid" 2>/dev/null; then
-        kill "$pid"
+        # It may exit between the probe and the signal; that is a stop too.
+        kill "$pid" 2>/dev/null || true
         for _ in $(seq 1 50); do
             kill -0 "$pid" 2>/dev/null || break
             sleep 0.2
@@ -64,25 +72,44 @@ RAND_NODE_BIN=${RAND_NODE_BIN:-target/release/rand-node}
 RAND_CLI=${RAND_CLI:-target/release/rand}
 DEV_CHAIN_ID=${DEV_CHAIN_ID:-7}
 case "$DEV_CHAIN_ID" in "" | *[!0-9]*) die "DEV_CHAIN_ID must be a number, got $DEV_CHAIN_ID" ;; esac
+case "${DEV_CHAIN_RPC_PORT-0}" in "" | *[!0-9]*) die "DEV_CHAIN_RPC_PORT must be a number, got $DEV_CHAIN_RPC_PORT" ;; esac
 DEV_CHAIN_FRI_PROFILE=${DEV_CHAIN_FRI_PROFILE:-test}
 DEV_CHAIN_BLOCK_INTERVAL_MS=${DEV_CHAIN_BLOCK_INTERVAL_MS:-1000}
+if [ "$DEV_CHAIN_ID" -ge 14 ] && [ "$DEV_CHAIN_ID" -le 19 ]; then
+    DEV_CHAIN_BINDING_DOMAIN=${DEV_CHAIN_BINDING_DOMAIN:-0}
+else
+    DEV_CHAIN_BINDING_DOMAIN=${DEV_CHAIN_BINDING_DOMAIN:-1}
+fi
+case "$DEV_CHAIN_BINDING_DOMAIN" in
+    0) binding_args=() ;;
+    1) binding_args=(--binding-domain 1) ;;
+    *) die "DEV_CHAIN_BINDING_DOMAIN must be 0 or 1, got $DEV_CHAIN_BINDING_DOMAIN" ;;
+esac
 [ -x "$RAND_NODE_BIN" ] || die "RAND_NODE_BIN=$RAND_NODE_BIN is not an executable (build it, or download the release asset)"
 [ -x "$RAND_CLI" ] || die "RAND_CLI=$RAND_CLI is not an executable (build it, or download the release asset)"
 command -v python3 >/dev/null || die "python3 is needed to find a free port"
 command -v curl >/dev/null || die "curl is needed to poll the RPC"
 
-# A port the kernel says is free right now. The node binds it a moment later; the race is the
-# same one every test harness takes, and the poll below fails loudly if it is lost.
-free_port() {
-    python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+# Two ports the kernel says are free right now, distinct (both sockets are held while the second
+# is asked for). The node binds them a moment later; the race is the same one every test harness
+# takes, and the poll below fails loudly if it is lost.
+free_ports() {
+    python3 -c 'import socket
+a, b = socket.socket(), socket.socket()
+a.bind(("127.0.0.1", 0)); b.bind(("127.0.0.1", 0))
+print(a.getsockname()[1], b.getsockname()[1])
+a.close(); b.close()'
 }
 
 DIR=${DEV_CHAIN_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/rand-dev-chain.XXXXXX")}
 mkdir -p "$DIR"
 DIR=$(cd "$DIR" && pwd)
 [ ! -e "$DIR/genesis.json" ] || die "$DIR already holds a chain; pick an empty DEV_CHAIN_DIR"
-RPC_PORT=${DEV_CHAIN_RPC_PORT:-$(free_port)}
-P2P_PORT=$(free_port)
+read -r port_a port_b <<<"$(free_ports)"
+RPC_PORT=${DEV_CHAIN_RPC_PORT:-$port_a}
+# The second probe is never the first, so it is the P2P port unless the caller chose that number.
+P2P_PORT=$port_b
+[ "$P2P_PORT" != "$RPC_PORT" ] || P2P_PORT=$port_a
 
 # The genesis `fees` section, as the `--fees` file the genesis command reads.
 fees_args=()
@@ -107,15 +134,15 @@ fi
 export RAND_ALLOW_TEST_FRI_PROFILE=1
 
 {
-    "$RAND_NODE_BIN" keygen --out "$DIR/validator.key.json"
-    "$RAND_CLI" --key "$DIR/payout.key.json" keygen
+    "$RAND_NODE_BIN" keygen --out "$DIR/validator.key.json" &&
+        "$RAND_CLI" --key "$DIR/payout.key.json" keygen
 } >"$DIR/setup.log" 2>&1 || die "keygen failed: $(tail -2 "$DIR/setup.log")"
 PAYOUT=$("$RAND_CLI" --key "$DIR/payout.key.json" address 2>>"$DIR/setup.log" | tail -1)
 case "$PAYOUT" in rand1*) ;; *) die "the wallet printed no rand1 address: $PAYOUT" ;; esac
 
 "$RAND_NODE_BIN" genesis --chain-id "$DEV_CHAIN_ID" --fri-profile "$DEV_CHAIN_FRI_PROFILE" \
-    --validator "$DIR/validator.key.json,1000,$PAYOUT" --faucet --binding-domain 1 \
-    ${fees_args[@]+"${fees_args[@]}"} ${extra_args[@]+"${extra_args[@]}"} \
+    --validator "$DIR/validator.key.json,1000,$PAYOUT" --faucet \
+    ${binding_args[@]+"${binding_args[@]}"} ${fees_args[@]+"${fees_args[@]}"} ${extra_args[@]+"${extra_args[@]}"} \
     --out "$DIR/genesis.json" >>"$DIR/setup.log" 2>&1 || die "genesis failed: $(tail -2 "$DIR/setup.log")"
 "$RAND_NODE_BIN" init --datadir "$DIR/data" --genesis "$DIR/genesis.json" >>"$DIR/setup.log" 2>&1 ||
     die "init failed: $(tail -2 "$DIR/setup.log")"

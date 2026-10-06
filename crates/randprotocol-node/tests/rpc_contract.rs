@@ -3,8 +3,8 @@
 //! Four repos consume this node's JSON-RPC: randscan (its indexer), randbridge.org (the status
 //! service), randprotocol.org (the sale relay and the balance viewer) and zusd.money (through
 //! randscan's REST, which is these same reads). Their own integration tests spawn a real
-//! `rand-node` (`scripts/dev-chain.sh`, `docs/howto.md` "Running the downstream integration
-//! tests"), but those run in their CI, after a release. This file fails here first: a field one of
+//! `rand-node` (`scripts/dev-chain.sh`, `docs/howto.md` §7, "How do I run the downstream
+//! integration tests?"), but those run in their CI, after a release. This file fails here first: a field one of
 //! them reads that is renamed, dropped or changes JSON type is a red `check-and-test` in this repo
 //! before any of them sees the release.
 //!
@@ -135,7 +135,7 @@ async fn check(addr: SocketAddr, rows: &[Row]) -> usize {
     for r in rows {
         let reply = call(addr, r.method, r.params.clone()).await;
         let Some(result) = reply.get("result") else {
-            broken.push(format!("{} {} ({}): an error, not a result: {}", short(&reply), r.method, r.params, r.consumer));
+            broken.push(format!("{} {} ({}): an error, not a result: {}", r.method, short(&r.params), r.consumer, short(&reply)));
             continue;
         };
         match &r.expect {
@@ -154,7 +154,7 @@ async fn check(addr: SocketAddr, rows: &[Row]) -> usize {
             Expect::Exactly(want) => {
                 checked += 1;
                 if result != want {
-                    broken.push(format!("{} {} ({}): {}, pinned {want}", r.method, r.params, r.consumer, short(result)));
+                    broken.push(format!("{} {} ({}): {}, pinned {want}", r.method, short(&r.params), r.consumer, short(result)));
                 }
             }
         }
@@ -234,6 +234,19 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let block_hash = call(addr, "rand_getBlockByHeight", json!([height])).await["result"]["hash"].as_str().unwrap().to_string();
+
+    // `rand_sendTransaction`'s success shape (randprotocol.org server/sale/src/rpc.rs relays it;
+    // the wallet reads the hash): the cheapest valid transaction is a mint the chain's one
+    // validator signs, as `submit.rs` sends it — no proof. The answer is the hash, hex.
+    let validator = randprotocol_core::Keypair::from_seed([101; 32]).unwrap();
+    let executor = randprotocol_zkvm::executor::ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test);
+    let mint = |tag: u8| {
+        let envelope = randprotocol_core::notes::Envelope { kem_ct: vec![tag; 8], to_receiver: vec![tag; 4], to_sender: vec![], body: vec![tag; 16] };
+        randprotocol_core::Transaction::mint(7, [tag as u32; 8], 0, [tag as u32; 8], envelope, 1000, &validator, &executor)
+    };
+    let signed = mint(9);
+    let sent = call(addr, "rand_sendTransaction", json!([hex::encode(signed.encode())])).await;
+    assert_eq!(sent["result"], json!(signed.hash().to_hex()), "rand_sendTransaction: {}", short(&sent));
     let unknown = "ab".repeat(32);
 
     // The block fields randscan's `RpcBlock` and randbridge.org's scan read.
@@ -384,6 +397,10 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
             json!({ "enabled": false }),
         ),
     ];
+    let mut rows = rows;
+    // randprotocol.org server/sale/src/rpc.rs (the relay forwards the answer to the wallet).
+    // A second, distinct mint: the first one is in the pool, and a resubmission is refused.
+    rows.push(row("rand_sendTransaction", json!([hex::encode(mint(10).encode())]), "randprotocol.org server/sale/src/rpc.rs", &[("", Hex)]));
     let checked = check(addr, &rows).await;
     assert!(checked > 150, "the table shrank to {checked} checks");
 
@@ -435,6 +452,12 @@ async fn the_refusal_shapes_the_consumers_branch_on_are_pinned() {
 /// randprotocol.org's relay). `subsidy_net_of_fees` needs an aggregation section and
 /// `node::start` refuses one today, so this chain is served without a node behind it — both reads
 /// are genesis and store state, which is all it needs.
+///
+/// TODO: this is a serialization check against an RPC server with no node behind it, not the live
+/// path. Move it onto the live chain of
+/// [`every_field_the_downstream_repos_read_is_served_with_its_type`] (`subsidy_net_of_fees: true`
+/// beside an `aggregation` section) once `node::start` admits aggregation
+/// (`check_build_runs_genesis`, `docs/aggregation.md` "Before enabling aggregation").
 #[tokio::test]
 async fn fee_rules_under_all_three_flags() {
     use randprotocol_core::confidential::StubExecutor;
@@ -488,9 +511,11 @@ async fn fee_rules_under_all_three_flags() {
     assert_eq!(call(addr, "rand_getSupply", json!([])).await["result"]["base_fees_burned"], json!("0"));
 }
 
-/// randprotocol.org's sale relay (server/sale/src/rpc.rs `ALLOWED`) forwards exactly the node's
-/// public listener's set, by name: a method dropped from [`PUBLIC_METHODS`] is a method the relay
-/// forwards to a node that refuses it. This is the relay's list as of fullnode v0.6.8.
+/// randprotocol.org's sale relay (server/sale/src/rpc.rs `RPC_ALLOWED`) forwards exactly the
+/// node's public listener's set, by name: a method dropped from [`PUBLIC_METHODS`] is a method the
+/// relay forwards to a node that refuses it. A copy of the relay's list as of randprotocol.org
+/// `e77ec7a` (2026-10-01), so it goes stale when the relay adds a method; the authoritative check
+/// is randprotocol.org's own `server/sale/tests/real_node.rs` against a real node.
 ///
 /// [`PUBLIC_METHODS`]: randprotocol_node::rpc::PUBLIC_METHODS
 #[test]

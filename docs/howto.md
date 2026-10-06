@@ -93,12 +93,13 @@ Four repos read this node's JSON-RPC, and each has an integration test that spaw
 | repo | test | what it reads |
 |---|---|---|
 | randscan | `crates/randscan-api/tests/real_node.rs` | the indexer's ~25 `rand_*` reads (`crates/randscan-indexer/src/rpc.rs`) |
-| randbridge.org | `status/tests/real_node.rs` | `rand_getHead`, `rand_getBlockByHeight`, `rand_getRawTransaction`, `rand_chainId`, `rand_getBridgeState`, `rand_getBridgeBurn` |
-| randprotocol.org | `server/sale/tests/real_node.rs` | the sale relay and the balance viewer: `rand_chainId`, `rand_getNullifiers`, `rand_getToken(s)`, `rand_getAssets`, `rand_getLimits`, `rand_getSupply`, `rand_sendTransaction` |
-| zusd.money | `tests/` | randscan's REST, which is `rand_getBridgeState`, `rand_getAssets`, `rand_getTokens`, `rand_getTokenSupply` |
+| randbridge.org | `status/tests/real_node.rs` (planned) | `rand_getHead`, `rand_getBlockByHeight`, `rand_getRawTransaction`, `rand_chainId`, `rand_getBridgeState`, `rand_getBridgeBurn` |
+| randprotocol.org | `server/sale/tests/real_node.rs` (planned) | the sale relay and the balance viewer: `rand_chainId`, `rand_getNullifiers`, `rand_getToken(s)`, `rand_getAssets`, `rand_getLimits`, `rand_getSupply`, `rand_sendTransaction` |
+| zusd.money | `tests/` (planned) | randscan's REST, which is `rand_getBridgeState`, `rand_getAssets`, `rand_getTokens`, `rand_getTokenSupply` |
 
 All of them start the chain the same way, with `scripts/dev-chain.sh`: one validator on loopback,
-a test-profile genesis with the faucet on and `--binding-domain 1`, its RPC polled until
+a test-profile genesis with the faucet on and `--binding-domain 1` (none on chain ids 14–19,
+where the wallet signs the chain-id form; `DEV_CHAIN_BINDING_DOMAIN` overrides), its RPC polled until
 `rand_chainId` answers (60 s, then it fails with the log's tail). It prints `key=value` lines:
 
 ```bash
@@ -117,7 +118,8 @@ stopped pid 36916
 `DEV_CHAIN_FRI_PROFILE`, `DEV_CHAIN_BLOCK_INTERVAL_MS` and `DEV_CHAIN_GENESIS_ARGS` (extra genesis
 flags, e.g. `--gas-price 100`) are the rest; the script's header lists them.
 `subsidy_net_of_fees` needs an aggregation section, which no node starts on today, so a dev chain
-cannot carry it. `--stop` leaves the directory (`node.log`, `setup.log`) for the caller.
+cannot carry it. `--stop` leaves the directory (`node.log`, `setup.log`) for the caller, and a
+second `--stop` on it answers "not running" with exit 0.
 
 The binaries a downstream CI runs are this repo's release assets: `.github/workflows/release.yml`
 builds `rand-node` and `rand` (with `rand-prover` and `SHA256SUMS`) on `ubuntu-24.04` and attaches
