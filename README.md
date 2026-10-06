@@ -110,6 +110,10 @@ scripts/local-testnet.sh
 target/release/rand --rpc http://127.0.0.1:8545 status
 ```
 
+For a throwaway single-validator chain on a free port — what the downstream repos' integration
+tests start — `scripts/dev-chain.sh` prints `RPC_URL=…` and `--stop <dir>` ends it
+(`docs/howto.md` §7).
+
 ### Several machines
 
 Each machine creates a key:
