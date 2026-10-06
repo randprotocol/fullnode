@@ -101,6 +101,10 @@ jobs:
         # into the fast job. A new cheap test has to be added here on purpose — that is the trade.
         run: |
           cargo test -p randprotocol-node --release --test submit --test ws
+          # The downstream repos' RPC contract (randscan, randbridge.org, randprotocol.org,
+          # zusd.money): every field they read, by presence and JSON type. One validator, one
+          # faucet mint, no proof.
+          cargo test -p randprotocol-node --release --test rpc_contract
           cargo test -p randprotocol-zkvm --release --test guest_provenance
           # HCS-1's tripwire: the verifier keys' known answers. Every key is salted from StdRng's
           # stream, so a dependency bump that moves it (rand, rand_core, chacha20) refuses every
