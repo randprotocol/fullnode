@@ -114,6 +114,13 @@ impl PeerBindings {
         self.by_validator.get(validator).copied()
     }
 
+    /// Record `validator`'s peer directly, for tests that need a binding without a signed
+    /// announcement behind it.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, validator: Address, peer: PeerId) {
+        self.by_validator.insert(validator, Bound { peer, issued_ms: 0 });
+    }
+
     pub fn len(&self) -> usize {
         self.by_validator.len()
     }
