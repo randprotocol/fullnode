@@ -91,6 +91,23 @@ impl RecentTxs {
     }
 }
 
+/// The answer to a transaction fetch (spec 2026-10-08 §3.2, §6): the bodies `lookup` finds for
+/// `hashes`, in the order asked, stopping at the first that would take the answer's serialized
+/// bytes past `limit` (final review I4). A cut answer is still an answer: the asker places what
+/// came and asks the next peer for the rest.
+pub fn bounded_answer<'a>(hashes: &[Hash], lookup: impl Fn(&Hash) -> Option<&'a Transaction>, limit: usize) -> Vec<Transaction> {
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    for tx in hashes.iter().filter_map(lookup) {
+        bytes = bytes.saturating_add(bincode::serialized_size(tx).map_or(usize::MAX, |n| n as usize));
+        if bytes > limit {
+            break;
+        }
+        out.push(tx.clone());
+    }
+    out
+}
+
 /// What a rebuild found: the block, or the hashes still missing in block order.
 pub enum Rebuilt {
     Block(Block),
@@ -391,6 +408,21 @@ pub(crate) mod tests {
         assert!(p.wants(&txs[0].hash()));
         p.accept(vec![txs[0].clone()]);
         assert!(!p.wants(&txs[0].hash()), "a filled position is not wanted");
+    }
+
+    /// Final review I4: an answer stops before the body that would take it past the bound, so
+    /// it is a prefix of what was found, within the bound; under the bound it is everything.
+    #[test]
+    fn an_answer_is_a_prefix_within_the_byte_bound() {
+        let txs: Vec<Transaction> = (1..=4u8).map(mint).collect();
+        let hashes: Vec<Hash> = txs.iter().map(Transaction::hash).collect();
+        let lookup = |h: &Hash| txs.iter().find(|t| t.hash() == *h);
+        let one = bincode::serialized_size(&txs[0]).unwrap() as usize;
+        let cut = bounded_answer(&hashes, lookup, 2 * one + one / 2);
+        assert_eq!(cut, txs[..2].to_vec(), "a prefix, cut before the third");
+        assert!(cut.iter().map(|t| bincode::serialized_size(t).unwrap() as usize).sum::<usize>() <= 2 * one + one / 2);
+        assert_eq!(bounded_answer(&hashes, lookup, usize::MAX), txs, "under the bound: all of it");
+        assert!(bounded_answer(&hashes, lookup, one - 1).is_empty(), "not even the first fits");
     }
 
     /// `tx` with its bundle proof in the pruned marker form: the same id, different bytes.

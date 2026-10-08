@@ -3466,18 +3466,19 @@ impl Node {
     /// `BlockByHash` is: at most TX_FETCH_BATCH map reads (plan amendment 3). Over the batch
     /// size it is `Busy`, never a partial answer — the asker's batches are bounded, so an
     /// oversize request is not an honest one ([`admit_sync_request`] refuses it first; this is
-    /// the same rule for any other caller).
+    /// the same rule for any other caller). The answer stops at `max_block_bytes +
+    /// max_aggregate_bytes` of the tip ledger (spec §3.2, final review I4) — a block's bodies
+    /// plus one transaction's slack, under the response wire limit — so a request naming 512
+    /// large bodies is answered with the prefix that fits, and the asker takes the rest elsewhere.
     fn serve_transactions(&self, hashes: &[Hash]) -> SyncResponse {
         if hashes.len() > network::TX_FETCH_BATCH {
             return SyncResponse::Busy;
         }
+        let ledger = self.hs.tip_ledger();
+        let limit = ledger.max_block_bytes().saturating_add(ledger.max_aggregate_bytes());
         let real = |t: &&Transaction| !compact::is_marker_form(t);
-        let txs = hashes
-            .iter()
-            .filter_map(|h| self.mempool.get(h).filter(real).or_else(|| self.recent_txs.get(h).filter(real)))
-            .cloned()
-            .collect();
-        SyncResponse::Transactions(txs)
+        let lookup = |h: &Hash| self.mempool.get(h).filter(real).or_else(|| self.recent_txs.get(h).filter(real));
+        SyncResponse::Transactions(compact::bounded_answer(hashes, lookup, limit))
     }
 
     /// Ask a peer for a block by hash. Peers are tried in turn: first those that have
