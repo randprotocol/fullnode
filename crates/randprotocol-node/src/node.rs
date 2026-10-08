@@ -7813,7 +7813,7 @@ mod tests {
 
     /// Both rules on (`docs/fees.md` §1.3).
     fn both_fee_rules() -> randprotocol_core::ledger::FeesConfig {
-        randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None }
+        randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None }
     }
 
     /// A tip-paying stub bundle anchored to `ledger`'s newest root.

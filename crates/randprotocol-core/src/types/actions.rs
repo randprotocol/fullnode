@@ -215,6 +215,19 @@ pub fn admit_validator_message(genesis: &Hash, candidate: &Address) -> Hash {
     Hash::digest_domain(b"rand-admit-validator-1", &m)
 }
 
+/// What a validator signs to set the chain's RAND/USD price (`Action::SetRandPrice` under the
+/// genesis `fees.usd_subsidy`, `docs/fees.md` §1.3): the genesis hash, the price in micro-dollars
+/// per RAND and the update's nonce, big-endian, under their own tag. The genesis hash binds the
+/// vote to one chain, the nonce to one update — a vote for update `n` can never be replayed as
+/// update `n + 1`, even at the same price.
+pub fn set_rand_price_message(genesis: &Hash, price_micros_per_rand: u64, nonce: u64) -> Hash {
+    let mut m = Vec::with_capacity(48);
+    m.extend_from_slice(genesis.as_bytes());
+    m.extend_from_slice(&price_micros_per_rand.to_be_bytes());
+    m.extend_from_slice(&nonce.to_be_bytes());
+    Hash::digest_domain(b"rand-set-price-1", &m)
+}
+
 /// What a validator signs to move stake into unbonding. The register's `nonce` is the replay
 /// protection: there are no accounts on this chain to carry one.
 pub fn unbond_message(chain_id: u64, validator: &Address, amount: u64, nonce: u64) -> Hash {

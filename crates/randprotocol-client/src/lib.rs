@@ -449,7 +449,24 @@ pub fn fee_rules_of(limits: &Value) -> FeesConfig {
         // which already carry `prove_base` and the base part — but the struct mirrors the rules.
         proposer_share_bps: rules["proposer_share_bps"].as_u64().and_then(|n| u32::try_from(n).ok()),
         prove_base: amount_field(&rules["prove_base"]),
+        // The dollar-indexed subsidy (`docs/fees.md` §1.3): the aggregate daemon converts the
+        // dollar target at the node's voted price (`rand_getRandPrice`) with these numbers, so a
+        // section missing any of them reads as no section rather than a wrong schedule.
+        usd_subsidy: usd_subsidy_of(&rules["usd_subsidy"]),
     }
+}
+
+/// `fee_rules.usd_subsidy` out of a `rand_getLimits` reply: the three numbers (amounts as decimal
+/// strings or numbers), `None` for `null`, an absent field, or an object missing any of them.
+/// The initial price is a genesis value the daemon never needs (it reads the live price), so it is
+/// not served and reads as `None`.
+pub fn usd_subsidy_of(v: &Value) -> Option<randprotocol_core::ledger::fees::UsdSubsidy> {
+    Some(randprotocol_core::ledger::fees::UsdSubsidy {
+        usd_micros_per_sealed_block: amount_field(&v["usd_micros_per_sealed_block"])?,
+        max_subsidy_per_block: amount_field(&v["max_subsidy_per_block"])?,
+        price_max_age_blocks: v["price_max_age_blocks"].as_u64()?,
+        initial_price_micros: None,
+    })
 }
 
 #[derive(Clone)]
@@ -1947,7 +1964,7 @@ mod tests {
             })
             .await,
         );
-        let on = FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None };
+        let on = FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None };
         assert_eq!(rpc.fee_rules().await.unwrap(), on);
         assert_eq!(rpc.fee_rules().await.unwrap(), on);
         assert_eq!(rpc.envelope_format(7).await.unwrap(), EnvelopeFormat::Legacy);
@@ -1998,12 +2015,12 @@ mod tests {
     async fn fee_rules_of_tolerates_an_unknown_key_a_missing_key_and_a_non_bool_value() {
         use test_rpc::{scripted_rpc, Reply};
         let rules = |v: Value| fee_rules_of(&json!({ "max_proof_bytes": 2097152, "fee_rules": v }));
-        let all = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true), proposer_share_bps: None, prove_base: None };
+        let all = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true), proposer_share_bps: None, prove_base: None, usd_subsidy: None };
         let fourth = json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true, "burn_tip": true });
         assert_eq!(rules(fourth.clone()), all, "an unknown fourth key is ignored");
         assert_eq!(
             rules(json!({ "burn_floor": true })),
-            FeesConfig { burn_base: None, subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None },
+            FeesConfig { burn_base: None, subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None, usd_subsidy: None },
             "only burn_floor: the absent flags read None"
         );
         assert_eq!(
@@ -2013,7 +2030,7 @@ mod tests {
         );
         assert_eq!(
             rules(json!({ "burn_base": false, "subsidy_net_of_fees": "yes", "burn_floor": true })),
-            FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None },
+            FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None, usd_subsidy: None },
             "a real false is kept as Some(false), a stray string beside it is None"
         );
         assert!(!rules(json!({ "burn_base": "true" })).burn_base(), "a string \"true\" never switches a rule on");

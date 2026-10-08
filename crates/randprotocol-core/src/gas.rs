@@ -362,6 +362,9 @@ pub fn fee_floor(action: &Action) -> u64 {
         // governance actions, and unspammable for their reason: it needs a quorum of the voting
         // set's signatures, and the admission it writes is one row of at most 256.
         Action::AdmitValidator { .. } => 0,
+        // The RAND price vote (`fees.usd_subsidy`): `AdmitValidator`'s shape and reason — a
+        // quorum of the voting set's signatures over the next nonce, which it spends.
+        Action::SetRandPrice { .. } => 0,
         // Audit v6, STAKE-1: equivocation evidence. Bundle-less and fee-less — anyone may carry
         // it, and it needs no wallet — and unspammable: it is admissible only with two of a
         // registered validator's own signatures over one view, and once per offender per jail.

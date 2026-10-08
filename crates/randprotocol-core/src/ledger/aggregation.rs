@@ -316,7 +316,7 @@ pub(super) fn apply(
 // ── the `Aggregate` itself: admission (spec §4) and apply (spec §5) ──────────────────────────
 
 use crate::confidential::ConfidentialExecutor;
-use crate::ledger::fees::FeesConfig;
+use crate::ledger::fees::{FeesConfig, UsdSubsidy};
 use crate::types::{pv, CoveredBundle};
 
 /// What a valid aggregate carries past admission (spec §4): the covered-bundle records the
@@ -410,7 +410,7 @@ impl Ledger {
         payout: &ShieldedAddress,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Payment, TxError> {
-        let schedule = gas::subsidy(self.supply.sealed_blocks, cfg);
+        let schedule = self.schedule_subsidy(self.supply.sealed_blocks, cfg);
         let proving_shares = covers.iter().try_fold(0u64, |acc, c| {
             // Validation already required the entry; a missing one here is the same refusal,
             // never a silent zero share.
@@ -421,6 +421,23 @@ impl Ledger {
         let total = subsidy.checked_add(proving_shares).ok_or(TxError::Overflow)?;
         let note = executor.note_commitment(&payout.pk, &[0; 8], total, 0, time, r);
         Ok(Payment { subsidy, proving_shares, total, note })
+    }
+}
+
+/// The sealing subsidy's schedule for the `n`-th sealed block — the one statement of which
+/// schedule applies. Under the genesis `fees.usd_subsidy` with a fresh voted price
+/// (`fresh_price_micros`: the caller has already applied `price_max_age_blocks`, as
+/// [`Ledger::fresh_rand_price`] does) it is the dollar target converted at that price and capped,
+/// [`UsdSubsidy::amount_at`]: `min(⌊usd_micros_per_sealed_block · 10⁹ / price⌋,
+/// max_subsidy_per_block)`, computed in u128, rounded down. Otherwise — no section, no price, or
+/// a stale one — the RAND schedule [`gas::subsidy`]. [`Ledger::aggregate_payment`] (through
+/// [`Ledger::schedule_subsidy`]), `rand_getEmission.current` and the aggregate daemon all call it,
+/// so none of them can disagree; [`minted_subsidy`] then nets it against the shares exactly as it
+/// nets the RAND schedule.
+pub fn schedule_subsidy(n: u64, cfg: &AggregationConfig, usd: Option<&UsdSubsidy>, fresh_price_micros: Option<u64>) -> u64 {
+    match (usd, fresh_price_micros) {
+        (Some(usd), Some(price)) => usd.amount_at(price),
+        _ => gas::subsidy(n, cfg),
     }
 }
 
@@ -2753,7 +2770,7 @@ mod payment_tests {
     fn burn_base_on_an_aggregating_chain_buckets_the_excess_and_pays_the_proposer_nothing() {
         let burning = |window: u64| {
             let mut l = gated(window);
-            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None });
+            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None });
             // The fixture issues nothing to the pool; tell the audit what genesis deposited so its
             // identity is checkable (the fees below are paid out of it).
             let staked = l.supply().genesis_staked;
@@ -2816,7 +2833,7 @@ mod payment_tests {
     fn burn_floor_on_an_aggregating_chain_buckets_fee_less_the_floor() {
         let burning = |window: u64| {
             let mut l = gated(window);
-            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None });
+            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None, usd_subsidy: None });
             let staked = l.supply().genesis_staked;
             l.set_genesis_supply(1_000 * crate::types::UNITS_PER_RAND, staked);
             l
@@ -2875,7 +2892,7 @@ mod payment_tests {
     fn net_of_fees(window: u64, subsidy_base: u64) -> Ledger {
         let mut l = gated(window);
         l.set_aggregation(Some(AggregationConfig { subsidy_base, ..cfg_with_window(window) }));
-        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None });
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None });
         l
     }
 
@@ -2967,7 +2984,7 @@ mod payment_tests {
         let run = |net: bool| {
             let mut l = gated(256);
             if net {
-                l.set_fees(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None });
+                l.set_fees(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None });
             }
             let (kp, _) = keys();
             register(&mut l, &kp, 10);
@@ -2999,6 +3016,112 @@ mod payment_tests {
         assert_eq!(net_root, plain_root, "and one root");
     }
 
+    /// The dollar-indexed subsidy's section for these tests: $0.004791 a sealed block, a
+    /// 0.3 RAND cap, prices usable for 10 blocks.
+    fn usd_section() -> crate::ledger::fees::UsdSubsidy {
+        crate::ledger::fees::UsdSubsidy { usd_micros_per_sealed_block: 4_791, max_subsidy_per_block: 300_000_000, price_max_age_blocks: 10, initial_price_micros: None }
+    }
+
+    /// An aggregating ledger under `fees.usd_subsidy` (and `subsidy_net_of_fees` when `net`), at
+    /// height 1, holding `price` set at `set_at`, with a registered aggregator and one covered
+    /// bundle whose proving share is 60. Returns the ledger, the aggregator key and the cover.
+    fn usd_chain(net: bool, price: Option<(u64, u64)>) -> (Ledger, Keypair, Hash) {
+        let mut l = gated(256);
+        l.set_fees(crate::ledger::fees::FeesConfig {
+            subsidy_net_of_fees: net.then_some(true),
+            usd_subsidy: Some(usd_section()),
+            ..Default::default()
+        });
+        l.set_rand_price(price.map(|(p, at)| crate::ledger::rand_price::RandPrice { price_micros_per_rand: p, set_at_height: at, nonce: 0 }));
+        let (kp, _) = keys();
+        register(&mut l, &kp, 10);
+        l.record_anchor(1);
+        let p = proposer(&l);
+        let covered_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE + 60, 0), Action::None));
+        l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
+        (l, kp, covered_tx.hash())
+    }
+
+    /// Admit and apply one aggregate over `cover` and return `(subsidy, total)` of its payment,
+    /// checking admission's note is apply's, `subsidised` moves by the minted part and the audit
+    /// holds.
+    fn seal(l: &mut Ledger, kp: &Keypair, cover: Hash) -> (u64, u64) {
+        let cfg = l.aggregation().unwrap().clone();
+        let payment = l.aggregate_payment(&[cover], &cfg, 1, &[9; 8], &payout_addr(), &StubExecutor).unwrap();
+        let before = l.supply();
+        let tx = aggregate_tx(kp, 0, 1, vec![cover], b"ok".to_vec());
+        let covered = covered_records(&[1]);
+        let v = l.validate_aggregate(&tx, &covered, &StubExecutor).unwrap();
+        assert_eq!(v.payout_cm, payment.note, "admission derives the payment's note");
+        l.apply_aggregate(&tx, &covered, &StubExecutor).unwrap();
+        assert!(l.has_commitment(&payment.note), "apply appends the same note");
+        assert_eq!(l.supply().subsidised, before.subsidised + payment.subsidy);
+        assert_eq!(l.supply().sealed_blocks, before.sealed_blocks + 1);
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+        (payment.subsidy, payment.total)
+    }
+
+    /// `fees.usd_subsidy` with a fresh price: the schedule is the dollar target at that price,
+    /// `⌊4 791 · 10⁹ / 150 000⌋ = 31 940 000` units, not `gas::subsidy(n)`; the note pays it plus
+    /// the shares, and the mint is the schedule.
+    #[test]
+    fn a_fresh_price_pays_the_dollar_target_converted() {
+        let (mut l, kp, cover) = usd_chain(false, Some((150_000, 0)));
+        let cfg = l.aggregation().unwrap().clone();
+        assert_ne!(gas::subsidy(0, &cfg), 31_940_000, "the RAND schedule is another number");
+        assert_eq!(l.schedule_subsidy(0, &cfg), 31_940_000);
+        assert_eq!(seal(&mut l, &kp, cover), (31_940_000, 31_940_000 + 60));
+    }
+
+    /// At $0.01 the target is 0.4791 RAND a block, over the 0.3 RAND cap: the cap binds.
+    #[test]
+    fn the_cap_binds_at_a_low_price() {
+        let (mut l, kp, cover) = usd_chain(false, Some((10_000, 0)));
+        assert_eq!(usd_section().amount_at(10_000), 300_000_000);
+        assert_eq!(seal(&mut l, &kp, cover), (300_000_000, 300_000_060));
+    }
+
+    /// A stale price (older than `price_max_age_blocks`) and no price at all both fall back to the
+    /// RAND schedule — exactly the aggregate the chain without the section pays.
+    #[test]
+    fn a_stale_or_absent_price_falls_back_to_the_rand_schedule() {
+        let cfg = gated(256).aggregation().unwrap().clone();
+        let schedule = gas::subsidy(0, &cfg);
+        // Fresh at the edge: set at 0, height 10 is age 10 = max age.
+        let (mut edge, _, _) = usd_chain(false, Some((150_000, 0)));
+        edge.set_height(10);
+        assert_eq!(edge.schedule_subsidy(0, &cfg), 31_940_000, "age == max age is fresh");
+        edge.set_height(11);
+        assert_eq!(edge.schedule_subsidy(0, &cfg), schedule, "age max + 1 is stale");
+        let (mut stale, kp, cover) = usd_chain(false, Some((150_000, 0)));
+        stale.set_height(11);
+        assert_eq!(seal(&mut stale, &kp, cover), (schedule, schedule + 60));
+        let (mut absent, kp, cover) = usd_chain(false, None);
+        assert_eq!(seal(&mut absent, &kp, cover), (schedule, schedule + 60));
+        let mut plain = gated(256);
+        let (kp2, _) = keys();
+        register(&mut plain, &kp2, 10);
+        assert_eq!(plain.schedule_subsidy(0, &cfg), schedule, "no section: the RAND schedule");
+        plain.set_rand_price(Some(crate::ledger::rand_price::RandPrice { price_micros_per_rand: 1, set_at_height: 1, nonce: 0 }));
+        assert_eq!(plain.schedule_subsidy(0, &cfg), schedule, "a stray price without the section is never read");
+    }
+
+    /// With `subsidy_net_of_fees` the dollar schedule is netted exactly as the RAND one: the note
+    /// is `max(schedule, shares)` and only the shortfall is minted.
+    #[test]
+    fn under_subsidy_net_of_fees_the_dollar_schedule_mints_only_the_shortfall() {
+        let (mut l, kp, cover) = usd_chain(true, Some((150_000, 0)));
+        assert_eq!(seal(&mut l, &kp, cover), (31_940_000 - 60, 31_940_000), "shares pay first");
+        // Shares above a tiny dollar schedule: nothing minted, the shares paid alone.
+        let (mut big, kp, cover) = usd_chain(true, Some((150_000, 0)));
+        big.set_fees(crate::ledger::fees::FeesConfig {
+            subsidy_net_of_fees: Some(true),
+            usd_subsidy: Some(crate::ledger::fees::UsdSubsidy { max_subsidy_per_block: 50, ..usd_section() }),
+            ..Default::default()
+        });
+        assert_eq!(seal(&mut big, &kp, cover), (0, 60));
+    }
+
     // ---- The proposer/aggregator split and `prove_base` (docs/compute-optimization.md §6.2–§6.3) --
 
     /// A gated chain with the audit's genesis deposit set, an aggregator registered (at the old
@@ -3021,6 +3144,7 @@ mod payment_tests {
             burn_floor: burn_floor.then_some(true),
             proposer_share_bps: Some(4000),
             prove_base,
+            usd_subsidy: None,
         }
     }
 
@@ -3202,7 +3326,7 @@ mod payment_tests {
     /// audit holds after every step with `subsidised` carrying the minted part alone.
     #[test]
     fn the_supply_invariant_holds_across_the_lifecycle_under_subsidy_net_of_fees() {
-        let l = lifecycle(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None });
+        let l = lifecycle(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None });
         assert_eq!(l.supply().subsidised, gas::subsidy(0, &cfg_with_window(2)) - 60, "only the shortfall is minted");
         assert_eq!(l.supply().sealed_blocks, 1);
     }
@@ -3669,7 +3793,7 @@ mod payment_tests {
         let p = proposer(&l);
         let prices = pruned_gas();
         l.set_gas(Some(prices.clone()));
-        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None });
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None, usd_subsidy: None });
         let staked = l.supply().genesis_staked;
         l.set_genesis_supply(1_000 * crate::types::UNITS_PER_RAND, staked);
         // The program the Call runs, deployed before the block.

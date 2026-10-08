@@ -1138,7 +1138,7 @@ mod tests {
     #[test]
     fn burn_floor_burns_an_invokes_cell_fee_once() {
         let mut l = ledger();
-        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None });
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None, usd_subsidy: None });
         let p = proposer().address();
         let floor = gas::BUNDLE_BASE + gas::call_fee(10, 0);
         let create = invoke_with(&l, 10, floor + CELL_FEE + 7, (0, 0, 0), Transition { writes: vec![cell(1, 5)], ..empty() });

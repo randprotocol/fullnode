@@ -823,7 +823,8 @@ impl<'a> PerpAction<'a> {
             | Action::CreateMultisig { .. }
             | Action::MultisigDeposit { .. }
             | Action::MultisigPay { .. }
-            | Action::MultisigRotate { .. } => None,
+            | Action::MultisigRotate { .. }
+            | Action::SetRandPrice { .. } => None,
         }
     }
 

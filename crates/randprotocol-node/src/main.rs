@@ -5082,7 +5082,7 @@ mod tests {
                 window: 256,
                 admitted_shapes: vec![],
             }));
-            l.set_fees(FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None });
+            l.set_fees(FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None });
             l.set_aggregators(
                 [(
                     kp.address(),
@@ -5168,7 +5168,7 @@ mod tests {
         let payee = SpendKey([7; 8]);
         let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
         let ex = ZkExecutor::new(FriProfile::Test);
-        let rules = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true), proposer_share_bps: None, prove_base: None };
+        let rules = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true), proposer_share_bps: None, prove_base: None, usd_subsidy: None };
         let deploy = randprotocol_core::Action::Deploy { base_pc: 0, words: vec![0x13; 9], public: vec![] };
         let floor = randprotocol_core::gas::fee_floor(&deploy);
         assert!(floor > randprotocol_core::gas::BUNDLE_BASE, "a Deploy's floor is over the base");
@@ -5243,6 +5243,7 @@ mod tests {
                 burn_floor: None,
                 proposer_share_bps: Some(4000),
                 prove_base: Some(prove_base),
+                usd_subsidy: None,
             };
             let mut node = moving_node(kp.address(), payout.clone());
             node.raw.bundle.as_mut().unwrap().fee = BUNDLE_BASE + prove_base + tip;

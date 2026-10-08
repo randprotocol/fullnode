@@ -191,6 +191,7 @@ async fn start() -> common::TestNode {
             burn_floor: Some(true),
             proposer_share_bps: None,
             prove_base: None,
+            usd_subsidy: None,
         });
         g.bridge = Some(common::bridge::bridge_config_for([0xaa; 32], &[TOKEN_CHAIN]));
         g.tokens = Some(TokensConfig {
@@ -510,6 +511,7 @@ async fn fee_rules_under_all_three_flags() {
             burn_floor: Some(true),
             proposer_share_bps: None,
             prove_base: None,
+            usd_subsidy: None,
         });
     })
     .await;
@@ -567,6 +569,7 @@ async fn fee_rules_serve_prove_base_as_a_decimal_string() {
         g.fees = Some(randprotocol_core::ledger::fees::FeesConfig {
             proposer_share_bps: Some(4000),
             prove_base: Some(600_000),
+            usd_subsidy: None,
             ..Default::default()
         });
     })

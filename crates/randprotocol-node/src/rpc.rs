@@ -2584,6 +2584,15 @@ fn tx_json_with(
             "kind": "multisig_rotate", "account": hex::encode(account), "nonce": nonce, "threshold": threshold,
             "signer_count": signers.len(), "signed_by": signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
         }),
+        // The validator set's vote on the RAND/USD price (`fees.usd_subsidy`): the price as a
+        // decimal string of micro-dollars per RAND, the nonce, and the voters by address in the
+        // order the action lists them — `AdmitValidator`'s rendering.
+        Action::SetRandPrice { price_micros_per_rand, nonce, votes } => json!({
+            "kind": "set_rand_price",
+            "price_micros_per_rand": price_micros_per_rand.to_string(),
+            "nonce": nonce,
+            "voters": votes.iter().map(|(key, _)| key.address().to_base58()).collect::<Vec<_>>(),
+        }),
     };
     json!({
         "hash": t.hash().to_hex(),
@@ -4669,7 +4678,7 @@ pub(crate) mod tests {
     /// so `subsidy + proving_share` is still the payout note's amount, `max(schedule, shares)`.
     #[tokio::test]
     async fn get_aggregate_reports_the_minted_subsidy_under_subsidy_net_of_fees() {
-        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None };
+        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None };
         let (_d, st, _gs, _covered_tx, aggregate) = gated_chain_with(fees);
         let v = ok(&st, "rand_getAggregate", json!([aggregate.hash().to_hex()])).await;
         assert_eq!(v["subsidy"], (100 * randprotocol_core::UNITS_PER_RAND - 60).to_string(), "only the shortfall");
@@ -4690,7 +4699,7 @@ pub(crate) mod tests {
     /// one committed block by block.
     #[tokio::test]
     async fn the_aggregate_record_is_the_ledgers_payment_when_cover_and_aggregate_commit_together() {
-        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None };
+        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None };
         let (_d, live, gs, _covered_tx, aggregate, blocks, l2) = gated_chain_blocks(fees);
         let (_d2, synced) = state_for(&gs);
         synced.storage.commit(&blocks, &l2, &[], &StubExecutor).unwrap();
@@ -6183,7 +6192,7 @@ pub(crate) mod tests {
         assert_eq!(ok(&st, "rand_getSupply", json!([])).await["base_fees_burned"], Value::String("0".into()), "a plain chain");
 
         let mut gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
-        gs.ledger.set_fees(randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None });
+        gs.ledger.set_fees(randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None });
         gs.ledger.set_genesis_supply(1_000 * BUNDLE_BASE, gs.ledger.supply().genesis_staked);
         let (_d, st) = state_for(&gs);
         let mut ledger = st.storage.load_ledger(&StubExecutor).unwrap();
@@ -6211,13 +6220,13 @@ pub(crate) mod tests {
             let (_d, st) = state_for(&gs);
             ok(&st, "rand_getLimits", json!([])).await
         };
-        let off = limits_with(FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None }).await;
+        let off = limits_with(FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None }).await;
         assert_eq!(off["fee_rules"], Value::Null, "a section with no true flag is no section");
-        let on = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None }).await;
+        let on = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None }).await;
         assert_eq!(on["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": null, "prove_base": null }));
         assert_eq!(on["gas_metering"], Value::Null, "nothing else moves");
         // Issue #135: the full-floor burn is served beside the base it widens.
-        let floor = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None }).await;
+        let floor = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None, usd_subsidy: None }).await;
         assert_eq!(floor["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true, "proposer_share_bps": null, "prove_base": null }));
     }
 
