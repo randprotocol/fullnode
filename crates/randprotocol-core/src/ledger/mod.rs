@@ -21,6 +21,7 @@ pub mod multisig;
 pub mod nullifier_mmr;
 pub mod perps;
 pub mod program_state;
+pub mod rand_price;
 pub mod staking;
 pub mod supply;
 pub mod tokens;
@@ -361,6 +362,10 @@ pub enum TxError {
     Multisig(#[from] multisig::MultisigError),
     #[error("staking: {0}")]
     Staking(#[from] StakingError),
+    /// The RAND price vote (`fees.usd_subsidy`): a `SetRandPrice` the module refused (see
+    /// [`rand_price::PriceError`]).
+    #[error("rand price: {0}")]
+    Price(#[from] rand_price::PriceError),
     /// Block aggregation: a register action or aggregate the aggregation module refused (see
     /// [`aggregation::AggregationError`]).
     #[error("aggregation: {0}")]
@@ -717,6 +722,11 @@ pub struct Ledger {
     /// Multisig accounts (`multisig.rs`): the register a genesis `multisig` section seeds,
     /// `None` without one. Consensus state, in the state root (`rand-state-multisig-1`).
     multisig: Option<multisig::MultisigRegister>,
+    /// The governance-set RAND/USD price (`rand_price.rs`; genesis `fees.usd_subsidy`): seeded
+    /// from `initial_price_micros` at genesis, moved by `SetRandPrice`. Consensus state under the
+    /// section — the `rand-state-price-1` wrapper, inside equality, `META_RAND_PRICE` — and `None`
+    /// (outside the root) without it.
+    rand_price: Option<rand_price::RandPrice>,
     /// Σ of every registration fee burned under `tokens.burn_registration_fee` (audit v5,
     /// TOK-2). A supply counter in kind — derived, outside the state root and this ledger's
     /// equality, persisted beside `META_SUPPLY` and replay-audited — kept off [`Supply`] so
@@ -911,6 +921,9 @@ impl PartialEq for Ledger {
             // one. `Perps`'s own equality leaves out the per-block transient fields.
             && self.perps == o.perps
             && self.multisig == o.multisig
+            // The voted RAND price (`fees.usd_subsidy`): consensus state under the section,
+            // `None` on both sides without it.
+            && self.rand_price == o.rand_price
             // The live gas prices (Phase 2): consensus state under `gas.dynamic`, compared by
             // effective value so a restored `Some(section prices)` equals an unmoved `None`.
             && self.gas_prices() == o.gas_prices()
@@ -961,6 +974,7 @@ impl Ledger {
             registration_fees_burned: 0,
             base_fees_burned: 0,
             fees: fees::FeesConfig::default(),
+            rand_price: None,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
             max_block_bytes: gas::MAX_BLOCK_BYTES,
@@ -1031,6 +1045,7 @@ impl Ledger {
             registration_fees_burned: 0,
             base_fees_burned: 0,
             fees: fees::FeesConfig::default(),
+            rand_price: None,
             max_program_words: gas::MAX_PROGRAM_WORDS,
             max_proof_bytes: gas::MAX_PROOF_BYTES,
             max_block_bytes: gas::MAX_BLOCK_BYTES,
@@ -1424,6 +1439,33 @@ impl Ledger {
     /// Install the `fees` section: genesis from its file, a reloading node from the same file.
     pub fn set_fees(&mut self, fees: fees::FeesConfig) {
         self.fees = fees;
+    }
+
+    /// The governance-set RAND/USD price (`fees.usd_subsidy`), `None` before the first one and on
+    /// every chain without the section.
+    pub fn rand_price(&self) -> Option<&rand_price::RandPrice> {
+        self.rand_price.as_ref()
+    }
+
+    /// Restore the price a node persisted beside the state (`META_RAND_PRICE`), or seed the
+    /// genesis price — `set_admitted`'s twin: hashed into the root under the section.
+    pub fn set_rand_price(&mut self, price: Option<rand_price::RandPrice>) {
+        self.rand_price = price;
+    }
+
+    /// The price, when it is usable at this ledger's height: the section is set, a price exists,
+    /// and `height − set_at_height ≤ price_max_age_blocks`.
+    pub fn fresh_rand_price(&self) -> Option<u64> {
+        let usd = self.fees.usd_subsidy()?;
+        self.rand_price
+            .filter(|p| p.fresh_at(self.height, usd.price_max_age_blocks))
+            .map(|p| p.price_micros_per_rand)
+    }
+
+    /// The sealing subsidy's schedule for an aggregate sealed now ([`aggregation::schedule_subsidy`]
+    /// over this ledger's section, price and height).
+    pub fn schedule_subsidy(&self, n: u64, cfg: &aggregation::AggregationConfig) -> u64 {
+        aggregation::schedule_subsidy(n, cfg, self.fees.usd_subsidy(), self.fresh_rand_price())
     }
 
     /// The supply audit against this ledger's own register.
@@ -2736,6 +2778,10 @@ impl Ledger {
             | Action::MultisigDeposit { .. }
             | Action::MultisigPay { .. }
             | Action::MultisigRotate { .. }) => multisig::validate(self, tx, a, executor)?,
+            // The RAND price vote: gated on `fees.usd_subsidy`, which the module checks first.
+            Action::SetRandPrice { price_micros_per_rand, nonce, votes } => {
+                rand_price::check_set_price(self, *price_micros_per_rand, *nonce, votes)?
+            }
             // `AdmitValidator` (audit v6, STAKE-2) is the register's too: gated on
             // `staking.admission_by_vote`, which `staking::validate` checks before anything else.
             a @ (Action::Bond { .. }
@@ -3118,6 +3164,9 @@ impl Ledger {
             | Action::MultisigDeposit { .. }
             | Action::MultisigPay { .. }
             | Action::MultisigRotate { .. }) => multisig::apply(self, tx, a, proposer, executor)?,
+            Action::SetRandPrice { price_micros_per_rand, nonce, votes } => {
+                rand_price::apply_set_price(self, *price_micros_per_rand, *nonce, votes)?
+            }
             Action::Call { program, input_envelope, .. } | Action::Invoke { program, input_envelope, .. } => {
                 // RPL-2: the transition first — vault, supplies, cells, payout notes — then the
                 // receipt, which is a call's. Every refusal was decided by `validate_inner`.
@@ -3615,6 +3664,10 @@ impl Ledger {
             self.admitted_root()
         ) + &format!(" jailed {:?} perps {perps}", self.jailed_root())
             + &format!(
+                " rand price {}",
+                if self.fees.usd_subsidy().is_some() { format!("{:?}", self.rand_price) } else { "off".into() }
+            )
+            + &format!(
                 " nullifier range {}",
                 match &self.nullifier_mmr {
                     Some(m) => format!("{} leaves", m.count()),
@@ -3719,6 +3772,14 @@ impl Ledger {
             buf.extend_from_slice(root.as_bytes());
             buf.extend_from_slice(m.root().as_bytes());
             root = Hash::digest_domain(b"rand-state-multisig-1", &buf);
+        }
+        // The voted RAND price (genesis `fees.usd_subsidy`), outermost: only under the section,
+        // so every chain without it keeps its root byte for byte.
+        if self.fees.usd_subsidy().is_some() {
+            let mut buf = Vec::with_capacity(64);
+            buf.extend_from_slice(root.as_bytes());
+            buf.extend_from_slice(rand_price::price_root(self.rand_price.as_ref()).as_bytes());
+            root = Hash::digest_domain(b"rand-state-price-1", &buf);
         }
         root
     }
@@ -4020,7 +4081,7 @@ pub(crate) mod tests {
             let staked = register_total(l.validators());
             l.set_genesis_supply(1_000 * fee, staked);
             if burn {
-                l.set_fees(fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None });
+                l.set_fees(fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None });
             }
             l
         };
@@ -7306,7 +7367,7 @@ pub(crate) mod tests {
     /// The three `fees` sections the burn-floor tests compare: the base alone, the base with the
     /// floor, and the floor spelt out `false` (which must be the base alone, byte for byte).
     fn burn_rules(floor: Option<bool>) -> fees::FeesConfig {
-        fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: floor, proposer_share_bps: None, prove_base: None }
+        fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: floor, proposer_share_bps: None, prove_base: None, usd_subsidy: None }
     }
 
     /// `l` with `rules` installed and a genesis supply its audit can check against: a large
@@ -7430,7 +7491,7 @@ pub(crate) mod tests {
         let base = root(burn_rules(None));
         assert_eq!(root(burn_rules(Some(false))), base, "false is the flag's absence");
         assert_ne!(root(burn_rules(Some(true))), base, "true moves the split, and so the root");
-        let alone = fees::FeesConfig { burn_base: None, subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None };
+        let alone = fees::FeesConfig { burn_base: None, subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None, usd_subsidy: None };
         assert_eq!(root(alone), root(fees::FeesConfig::default()), "burn_floor alone is no rule at all");
     }
 
@@ -7681,6 +7742,7 @@ pub(crate) mod tests {
             burn_floor: burn_floor.then_some(true),
             proposer_share_bps: bps,
             prove_base,
+            usd_subsidy: None,
         }
     }
 

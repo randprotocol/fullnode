@@ -217,6 +217,12 @@ pub enum Action {
         r: Word8,
         envelope: Envelope,
         signature: Signature,
+        /// The payout note's amount the aggregator sealed its envelope for — subsidy plus covered
+        /// proving shares. Signed, and checked against the ledger's own payment at admission and
+        /// apply (`AggregationError::PayoutMismatch`): an aggregate whose amount the chain no
+        /// longer pays (a price vote, the price going stale, a halving, between sealing and
+        /// inclusion) is refused rather than paid into a note its envelope cannot open.
+        payout_total: u64,
     },
     /// RPL (spec §4): create a token. Permissionless — anyone who pays the bundle base plus the
     /// registry's `registration_fee` gets the next dense index — and content-addressed: the
@@ -520,6 +526,16 @@ pub enum Action {
         threshold: u8,
         signatures: Vec<crate::types::actions::SignerSignature>,
     },
+    /// The validator set's vote on the chain's RAND/USD price (44; genesis `fees.usd_subsidy`,
+    /// `docs/fees.md` §1.3) — the price the dollar-indexed sealing subsidy converts at. Governance,
+    /// not a market oracle: `AdmitValidator`'s shape exactly — one `(validator key, signature)`
+    /// per voter over [`crate::types::actions::set_rand_price_message`]`(genesis hash, price,
+    /// nonce)`, strictly ascending by voter address, the voters holding strictly more than two
+    /// thirds of the voting set's weight (`ValidatorSet::has_quorum`). `nonce` is the ledger's
+    /// plus one; the price moves by at most a factor of two per update. Bundle-less and
+    /// fee-less. Refused `UnsupportedAction` on a chain without the section, before anything
+    /// else is read. Appended last: bincode is positional.
+    SetRandPrice { price_micros_per_rand: u64, nonce: u64, votes: Vec<(PublicKey, Signature)> },
 }
 
 impl Action {
@@ -560,6 +576,7 @@ impl Action {
             Action::PerpStateProof { .. } => Some("perp_state_proof"),
             Action::MultisigPay { .. } => Some("multisig_pay"),
             Action::MultisigRotate { .. } => Some("multisig_rotate"),
+            Action::SetRandPrice { .. } => Some("set_rand_price"),
             _ => None,
         }
     }
@@ -629,6 +646,10 @@ impl Action {
                 threshold: *threshold,
                 signatures: signatures.clone(),
             },
+            // The price vote: no proof field; every field is kept so the binding moves with each.
+            Action::SetRandPrice { price_micros_per_rand, nonce, votes } => {
+                Action::SetRandPrice { price_micros_per_rand: *price_micros_per_rand, nonce: *nonce, votes: votes.clone() }
+            }
             Action::Bond { validator, amount, registration } => {
                 Action::Bond { validator: *validator, amount: *amount, registration: registration.clone() }
             }
@@ -689,7 +710,7 @@ impl Action {
                 }
             }
             Action::SlashAggregator { a, b } => Action::SlashAggregator { a: a.clone(), b: b.clone() },
-            Action::Aggregate { covers, proof: _, aggregator, nonce, time, r, envelope, signature } => {
+            Action::Aggregate { covers, proof: _, aggregator, nonce, time, r, envelope, signature, payout_total } => {
                 Action::Aggregate {
                     covers: covers.clone(),
                     proof: Vec::new(),
@@ -699,6 +720,7 @@ impl Action {
                     r: *r,
                     envelope: envelope.clone(),
                     signature: signature.clone(),
+                    payout_total: *payout_total,
                 }
             }
             Action::RegisterToken { name, symbol, decimals, authority, initial, salt, index } => {
@@ -888,7 +910,8 @@ impl Action {
             | Action::CreateMultisig { .. }
             | Action::MultisigDeposit { .. }
             | Action::MultisigPay { .. }
-            | Action::MultisigRotate { .. } => {}
+            | Action::MultisigRotate { .. }
+            | Action::SetRandPrice { .. } => {}
         }
         a
     }
@@ -1016,7 +1039,8 @@ impl Transaction {
             | Action::CreateMultisig { .. }
             | Action::MultisigDeposit { .. }
             | Action::MultisigPay { .. }
-            | Action::MultisigRotate { .. } => return None,
+            | Action::MultisigRotate { .. }
+            | Action::SetRandPrice { .. } => return None,
         };
         let body = (chain_id, tag, action.perp_unsigned());
         Some(match domain {
@@ -1456,6 +1480,31 @@ mod tests {
         assert_eq!(got, MULTISIG_PINS.iter().map(|(d, i)| (d.to_string(), i.to_string())).collect::<Vec<_>>());
     }
 
+    /// `(blake3(encoding), txid)` of `the_set_rand_price_encoding_and_txid_are_pinned`'s
+    /// transaction, tag 44. A consensus encoding: a change here is a wire change.
+    const SET_RAND_PRICE_PIN: (&str, &str) =
+        ("d7106f4fc2d50c9d93fb10697a695ec70aa74c6d32aee3fb9c75e343a84bac19", "eb670930d5001c5d1b2d3594698e6567ebdc1f98e74587784534a0fd5ef626ca");
+
+    /// `SetRandPrice` on the wire (genesis `fees.usd_subsidy`): tag 44, after multisig's 40–43,
+    /// read straight off the encoding — chain id (8 bytes), the bundle's `Option` tag (0: it is
+    /// bundle-less), then the variant as a u32 — and the encoding digest and txid pinned with
+    /// fixed signature bytes (a Dilithium signature is not deterministic).
+    #[test]
+    fn the_set_rand_price_encoding_and_txid_are_pinned() {
+        let key = Keypair::from_seed([3; 32]).unwrap().public_key().clone();
+        let fixed = Signature::from_bytes(&[7u8; crate::crypto::SIGNATURE_LEN]).unwrap();
+        let tx = Transaction {
+            chain_id: 13,
+            bundle: None,
+            action: Action::SetRandPrice { price_micros_per_rand: 150_000, nonce: 1, votes: vec![(key, fixed)] },
+        };
+        assert_eq!(&tx.encode()[8..13], &[&[0u8][..], &44u32.to_le_bytes()[..]].concat()[..], "bundle-less 44");
+        assert_eq!(variant_index(&tx.action), 44, "the enum position is the tag");
+        assert_eq!(Transaction::decode(&tx.encode()).unwrap(), tx);
+        let got = (hex::encode(blake3::hash(&tx.encode()).as_bytes()), hex::encode(tx.hash().0));
+        assert_eq!(got, (SET_RAND_PRICE_PIN.0.to_string(), SET_RAND_PRICE_PIN.1.to_string()));
+    }
+
     #[test]
     fn the_consensus_encoding_and_txid_are_pinned() {
         let call = Transaction::shielded(
@@ -1497,6 +1546,7 @@ mod tests {
                 r: [6; 8],
                 envelope: env(),
                 signature: Signature::empty(),
+                payout_total: 7,
             },
         };
         let got = |tx: &Transaction| {
@@ -1548,8 +1598,13 @@ mod tests {
     /// move.
     const ATTEST_ENCODING_BLAKE3: &str = "1de4200cee6184eec917fcf13ec968f926157cecaf1fe7c4b249fe00ee561836";
     const ATTEST_ID: &str = "2234de2343de1cb0ae0b758bc3765fce6b3d49e74ec7b8fd7abc6f0da87c2ef6";
-    const AGGREGATE_ENCODING_BLAKE3: &str = "c5f06333b3d6f2e744f6edeb66b612723c1bc4fcf7f98fd8249b40226af64d64";
-    const AGGREGATE_ID: &str = "da7be1091cabf0cc0489eb619aab0ad5801970c965ecef6e2912a3168845afb2";
+    /// Moved by dollar-indexed prover pay (2026-10-09), deliberately: `Aggregate` gained its last
+    /// field, `payout_total` (here 7), so its encoding grows by eight bytes and its id moves. No
+    /// chain has ever carried an aggregate. Before: encoding
+    /// `c5f06333b3d6f2e744f6edeb66b612723c1bc4fcf7f98fd8249b40226af64d64`, id
+    /// `da7be1091cabf0cc0489eb619aab0ad5801970c965ecef6e2912a3168845afb2`.
+    const AGGREGATE_ENCODING_BLAKE3: &str = "63ed7180e0defbb91de02fea939a270d19ba91f3bc3fa5927ed772b0add16c45";
+    const AGGREGATE_ID: &str = "838707beb61a7c84d159e0873b8a74b184ba6054ce3d3b78e594cc3e5a7ac8f2";
 
     #[test]
     fn transactions_roundtrip_and_hash_their_full_encoding() {
@@ -1609,6 +1664,7 @@ mod tests {
                 "multisig_rotate",
             ),
             (Action::AdmitValidator { candidate: minter.clone(), signatures: Vec::new() }, "admit_validator"),
+            (Action::SetRandPrice { price_micros_per_rand: 1, nonce: 1, votes: Vec::new() }, "set_rand_price"),
             (
                 {
                     let h = SignedHeader {
@@ -1884,7 +1940,7 @@ mod tests {
     /// The number of `Action` variants, and each one's position — an exhaustive match with no
     /// wildcard, so a new variant fails to compile here until [`sample`] has a row for it (and
     /// [`Action::blanked`] has an arm).
-    const VARIANTS: usize = 44;
+    const VARIANTS: usize = 45;
     fn variant_index(a: &Action) -> usize {
         match a {
             Action::None => 0,
@@ -1931,6 +1987,7 @@ mod tests {
             Action::MultisigDeposit { .. } => 41,
             Action::MultisigPay { .. } => 42,
             Action::MultisigRotate { .. } => 43,
+            Action::SetRandPrice { .. } => 44,
         }
     }
 
@@ -2018,6 +2075,7 @@ mod tests {
                 r: [3; 8],
                 envelope: env(),
                 signature: sig(),
+                payout_total: 9,
             },
             14 => Action::RegisterToken {
                 name: "Test Coin".into(),
@@ -2249,6 +2307,7 @@ mod tests {
                 threshold: 1,
                 signatures: vec![crate::types::actions::SignerSignature { index: 0, signature: sig() }],
             },
+            44 => Action::SetRandPrice { price_micros_per_rand: 150_000, nonce: 1, votes: vec![(pk(), sig())] },
             _ => panic!("no variant {i}"),
         }
     }
@@ -2445,6 +2504,22 @@ mod tests {
             (43, "rotate threshold", |t| {
                 let Action::MultisigRotate { threshold, .. } = &mut t.action else { panic!() };
                 *threshold += 1;
+            }),
+            (13, "aggregate payout total", |t| {
+                let Action::Aggregate { payout_total, .. } = &mut t.action else { panic!() };
+                *payout_total += 1;
+            }),
+            (44, "price", |t| {
+                let Action::SetRandPrice { price_micros_per_rand, .. } = &mut t.action else { panic!() };
+                *price_micros_per_rand += 1;
+            }),
+            (44, "price nonce", |t| {
+                let Action::SetRandPrice { nonce, .. } = &mut t.action else { panic!() };
+                *nonce += 1;
+            }),
+            (44, "price votes", |t| {
+                let Action::SetRandPrice { votes, .. } = &mut t.action else { panic!() };
+                votes.clear();
             }),
             (3, "call program", |t| {
                 let Action::Call { program, .. } = &mut t.action else { panic!() };

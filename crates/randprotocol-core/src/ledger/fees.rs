@@ -35,6 +35,13 @@
 //!   the pre-verify floor), and it is bucketed whole: proving share, never the proposer's at
 //!   inclusion and never burned — `burn_floor` burns the floor *without* it.
 //!
+//! - `usd_subsidy` (needs `aggregation`, `GenesisError::UsdSubsidyWithoutAggregation`): the
+//!   dollar-indexed sealing subsidy. While the ledger holds a fresh RAND/USD price — set by the
+//!   validator set's vote, `Action::SetRandPrice` (`ledger::rand_price`), never a market oracle —
+//!   an aggregate's schedule is `min(usd_micros_per_sealed_block · 10⁹ / price_micros,
+//!   max_subsidy_per_block)` RAND units instead of `gas::subsidy(n)`; with a stale price, the
+//!   RAND schedule clamped to the same cap. `subsidy_net_of_fees` nets either schedule the same way.
+//!
 //! A genesis parameter like `aggregation`: outside the state root and `Ledger`'s equality, set by
 //! genesis, persisted by the node at genesis and restored from the genesis file on every restart.
 
@@ -64,6 +71,46 @@ pub struct FeesConfig {
     /// proposal's 0.0006 RAND is 600 000). Aggregating chains only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prove_base: Option<u64>,
+    /// The dollar-indexed sealing subsidy (`docs/fees.md` §1.3): the schedule an aggregate is
+    /// paid while a governance-set RAND/USD price is fresh. Aggregating chains only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_subsidy: Option<UsdSubsidy>,
+}
+
+/// The genesis `fees.usd_subsidy` sub-section: the dollar target of one sealed block, the hard
+/// cap in RAND units, how long a voted price stays usable, and optionally the price the chain
+/// starts with. All four numbers are required and non-zero (`Genesis::validate`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsdSubsidy {
+    /// The target pay of one sealed block, in micro-dollars (10⁻⁶ USD).
+    pub usd_micros_per_sealed_block: u64,
+    /// The most RAND units one sealed block's schedule may be, whatever the price: the cap that
+    /// binds when the price is low.
+    pub max_subsidy_per_block: u64,
+    /// A price set at height `h` is fresh at heights `h ..= h + price_max_age_blocks`; past that
+    /// the schedule falls back to `gas::subsidy(n)`.
+    pub price_max_age_blocks: u64,
+    /// The RAND/USD price at genesis in micro-dollars per RAND, set at height 0 with nonce 0 —
+    /// required, so a chain with the section always has a price to start from.
+    pub initial_price_micros: u64,
+}
+
+/// RAND units per RAND: the `10⁹` of the dollar conversion.
+pub const UNITS_PER_RAND: u128 = 1_000_000_000;
+
+impl UsdSubsidy {
+    /// The dollar target converted at `price_micros` (micro-dollars per RAND), capped:
+    /// `min(⌊usd_micros_per_sealed_block · 10⁹ / price_micros⌋, max_subsidy_per_block)`, in u128
+    /// so the product cannot wrap; the quotient rounds down (floor). A zero price — which neither
+    /// genesis nor `SetRandPrice` can produce — reads as the cap.
+    pub fn amount_at(&self, price_micros: u64) -> u64 {
+        if price_micros == 0 {
+            return self.max_subsidy_per_block;
+        }
+        let units = u128::from(self.usd_micros_per_sealed_block).saturating_mul(UNITS_PER_RAND) / u128::from(price_micros);
+        u64::try_from(units).unwrap_or(u64::MAX).min(self.max_subsidy_per_block)
+    }
 }
 
 impl FeesConfig {
@@ -97,6 +144,12 @@ impl FeesConfig {
         self.prove_base.unwrap_or(0)
     }
 
+    /// The dollar-indexed subsidy, when the file sets it. The ledger reads it only on an
+    /// aggregating chain — genesis refuses it on any other.
+    pub fn usd_subsidy(&self) -> Option<&UsdSubsidy> {
+        self.usd_subsidy.as_ref()
+    }
+
     /// Whether any rule is on. A section with no true flag and neither numeric field set is the
     /// section's absence in every respect — the genesis hash, the ledger's behaviour and
     /// `rand_getLimits`' `fee_rules`.
@@ -106,6 +159,7 @@ impl FeesConfig {
             || self.burn_floor()
             || self.proposer_share_bps.is_some()
             || self.prove_base.is_some()
+            || self.usd_subsidy.is_some()
     }
 }
 
@@ -116,9 +170,9 @@ mod tests {
     #[test]
     fn a_flag_is_on_only_when_the_file_says_true() {
         assert!(!FeesConfig::default().any());
-        let off = FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(false), burn_floor: None, proposer_share_bps: None, prove_base: None };
+        let off = FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(false), burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None };
         assert!(!off.burn_base() && !off.subsidy_net_of_fees() && !off.any());
-        let on = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None };
+        let on = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None };
         assert!(on.burn_base() && !on.subsidy_net_of_fees() && on.any());
         assert!(!on.burn_floor(), "an absent burn_floor is off");
         let floor = FeesConfig { burn_floor: Some(true), ..on };
@@ -140,6 +194,32 @@ mod tests {
         let text = serde_json::to_string(&both).unwrap();
         assert_eq!(text, r#"{"proposer_share_bps":4000,"prove_base":600000}"#);
         assert_eq!(serde_json::from_str::<FeesConfig>(&text).unwrap(), both);
+    }
+
+    /// The dollar subsidy: a rule once set, round-trips as written, refuses unknown keys, and
+    /// converts with floor rounding under its cap.
+    #[test]
+    fn the_usd_subsidy_round_trips_refuses_unknown_keys_and_converts_under_its_cap() {
+        let usd = UsdSubsidy { usd_micros_per_sealed_block: 4_791, max_subsidy_per_block: 300_000_000, price_max_age_blocks: 72_000, initial_price_micros: 150_000 };
+        let f = FeesConfig { usd_subsidy: Some(usd.clone()), ..FeesConfig::default() };
+        assert!(f.any() && f.usd_subsidy() == Some(&usd));
+        let text = serde_json::to_string(&f).unwrap();
+        assert_eq!(text, r#"{"usd_subsidy":{"usd_micros_per_sealed_block":4791,"max_subsidy_per_block":300000000,"price_max_age_blocks":72000,"initial_price_micros":150000}}"#);
+        assert_eq!(serde_json::from_str::<FeesConfig>(&text).unwrap(), f);
+        let bare = r#"{"usd_subsidy":{"usd_micros_per_sealed_block":1,"max_subsidy_per_block":2,"price_max_age_blocks":3}}"#;
+        assert!(serde_json::from_str::<FeesConfig>(bare).is_err(), "initial_price_micros is required");
+        assert!(serde_json::from_str::<FeesConfig>(r#"{"usd_subsidy":{"usd_micros_per_sealed_block":1,"max_subsidy_per_block":2,"price_max_age_blocks":3,"initial_price_micros":4,"oracle":1}}"#).is_err());
+        // $0.004791 a block at $0.15: ⌊4 791 · 10⁹ / 150 000⌋ = 31 940 000 units (0.03194 RAND).
+        assert_eq!(usd.amount_at(150_000), 31_940_000);
+        // Floor: 1 µ$ at 3 µ$/RAND is 333 333 333.3… units.
+        let one = UsdSubsidy { usd_micros_per_sealed_block: 1, max_subsidy_per_block: u64::MAX, price_max_age_blocks: 1, initial_price_micros: 1 };
+        assert_eq!(one.amount_at(3), 333_333_333);
+        // At $0.01 the target is 0.4791 RAND, over the 0.3 RAND cap: the cap binds.
+        assert_eq!(usd.amount_at(10_000), 300_000_000);
+        // No overflow at the extremes: u64::MAX µ$ at 1 µ$/RAND saturates, then the cap.
+        let max = UsdSubsidy { usd_micros_per_sealed_block: u64::MAX, max_subsidy_per_block: u64::MAX, price_max_age_blocks: 1, initial_price_micros: 1 };
+        assert_eq!(max.amount_at(1), u64::MAX);
+        assert_eq!(usd.amount_at(0), 300_000_000, "a zero price reads as the cap");
     }
 
     /// Unknown keys are refused: a misspelt consensus flag must not read as "off".

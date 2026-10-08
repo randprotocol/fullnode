@@ -286,6 +286,14 @@ const META_PERPS: &str = "perps";
 /// program state and replay-audited. Bincode like program state: its accounts are keyed by
 /// 32-byte ids. Absent on every chain without a `multisig` section.
 const META_MULTISIG: &str = "multisig";
+/// `bincode(RandPrice)`: the validator set's voted RAND/USD price as of the head (genesis
+/// `fees.usd_subsidy`, `ledger::rand_price::RandPrice`) — the genesis price at height 0 / nonce 0,
+/// or the last `SetRandPrice`. Consensus state under the section — hashed into the state root
+/// under `rand-state-price-1`, inside `Ledger`'s equality — written at the same three sites as
+/// the multisig register, restored by `load_ledger` and replay-audited (named in the self-check
+/// like the burned bases). Present only while the ledger holds a price: absent on every chain
+/// without the section and on one whose genesis gives no initial price before its first update.
+const META_RAND_PRICE: &str = "rand_price";
 /// `bincode(BTreeMap<Address, AggregatorEntry>)`: the aggregator register as of the head.
 /// `META_SUPPLY`'s twin in kind — derived, replay-audited — but unlike the bucket this one is
 /// hashed into the state root, so a restarted node that lost it would fork at the next block.
@@ -1142,6 +1150,7 @@ impl Storage {
         self.put_program_state(&mut batch, gs.ledger.program_state())?;
         self.put_perps(&mut batch, gs.ledger.perps())?;
         self.put_multisig(&mut batch, gs.ledger.multisig())?;
+        self.put_rand_price(&mut batch, gs.ledger.rand_price())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
@@ -1836,6 +1845,25 @@ impl Storage {
         Ok(())
     }
 
+    /// The voted RAND/USD price as of the head (`fees.usd_subsidy`, `META_RAND_PRICE`), `None` on
+    /// a chain without the section, before its first price, and on a database written before the
+    /// key existed.
+    pub fn rand_price(&self) -> Result<Option<randprotocol_core::ledger::rand_price::RandPrice>> {
+        self.get_meta_raw(META_RAND_PRICE)?
+            .map(|b| bincode::deserialize(&b).map_err(|e| StorageError::Corrupt(format!("rand price: {e}"))))
+            .transpose()
+    }
+
+    /// The price beside the rest of the head's state — present while the ledger holds one,
+    /// deleted otherwise (`put_multisig`'s rule).
+    fn put_rand_price(&self, batch: &mut WriteBatch, p: Option<&randprotocol_core::ledger::rand_price::RandPrice>) -> Result<()> {
+        match p {
+            Some(p) => batch.put_cf(self.cf(CF_META), META_RAND_PRICE, bincode::serialize(p)?),
+            None => batch.delete_cf(self.cf(CF_META), META_RAND_PRICE),
+        }
+        Ok(())
+    }
+
     /// Σ of the registration fees burned under `tokens.burn_registration_fee` as of the head
     /// (audit v5, TOK-2) — `supply()`'s twin, with the same rule for a database written before
     /// the key existed: 0, which on a chain without the gate is also the only value it holds.
@@ -2026,7 +2054,7 @@ impl Storage {
     }
 
     /// The head height alone, without decoding the head block; `None` before `init_genesis`.
-    fn head_height(&self) -> Result<Option<u64>> {
+    pub fn head_height(&self) -> Result<Option<u64>> {
         match self.get_meta_raw(META_HEAD_HEIGHT)? {
             Some(bytes) => Ok(Some(be_u64(&bytes, "head_height meta")?)),
             None => Ok(None),
@@ -2810,6 +2838,7 @@ impl Storage {
         ledger.set_program_state(self.program_state()?);
         ledger.set_perps(self.perps()?);
         ledger.set_multisig(self.multisig()?);
+        ledger.set_rand_price(self.rand_price()?);
         ledger.set_unsealed_fees(self.unsealed_fees()?);
         ledger.set_aggregators(self.aggregators()?);
         ledger.set_retired_aggregator_nonces(self.retired_aggregator_nonces()?);
@@ -3208,6 +3237,7 @@ impl Storage {
             }
         }
         self.put_multisig(&mut batch, ledger_after.multisig())?;
+        self.put_rand_price(&mut batch, ledger_after.rand_price())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
         self.stage_retired_aggregator_nonces(&mut batch, ledger_after)?;
@@ -3812,6 +3842,16 @@ impl Storage {
             Ok(stored) if stored.multisig() != ledger.multisig() => {
                 check.problem = Some("stored multisig register does not match the replayed chain's".into())
             }
+            // The voted RAND price (`fees.usd_subsidy`) likewise: inside the equality, hashed
+            // under its section (`rand-state-price-1`), named so the repair knows the key — the
+            // way the burned bases are named below.
+            Ok(stored) if stored.rand_price() != ledger.rand_price() => {
+                check.problem = Some(format!(
+                    "stored rand price {:?} does not match the replayed chain's {:?}",
+                    stored.rand_price(),
+                    ledger.rand_price()
+                ))
+            }
             // The supply counters are outside `Ledger`'s equality (nothing hashes them), so they
             // are audited here explicitly: this is the replay the RPC's numbers are worth.
             Ok(stored) if same && stored.supply() != ledger.supply() => {
@@ -4100,6 +4140,7 @@ impl Storage {
             batch.delete_cf(self.cf(CF_PERP_INPUTS), k);
         }
         self.put_multisig(&mut batch, ledger.multisig())?;
+        self.put_rand_price(&mut batch, ledger.rand_price())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
         self.stage_retired_aggregator_nonces(&mut batch, ledger)?;
@@ -4761,6 +4802,38 @@ pub(crate) mod fixtures {
         }
     }
 
+    /// The dollar-indexed subsidy's section for the node's tests: $0.004791 a sealed block, a
+    /// 0.3 RAND cap, prices usable for 100 blocks, the genesis price $0.15.
+    pub(crate) fn usd_section() -> randprotocol_core::ledger::fees::UsdSubsidy {
+        randprotocol_core::ledger::fees::UsdSubsidy {
+            usd_micros_per_sealed_block: 4_791,
+            max_subsidy_per_block: 300_000_000,
+            price_max_age_blocks: 100,
+            initial_price_micros: 150_000,
+        }
+    }
+
+    /// A chain of `validators` under `fees.usd_subsidy`, its genesis price seeded at height 0 /
+    /// nonce 0 as `Genesis::build` seeds it. The section is installed on the built state (the way
+    /// these fixtures install `aggregation`), so no admitted shape is needed: the price, its vote
+    /// and its storage do not read the aggregation section — only the schedule does.
+    pub(crate) fn usd_genesis(validators: &[&Keypair]) -> GenesisState {
+        let mut gs = genesis_of(7, validators, vec![], 10);
+        gs.ledger.set_fees(randprotocol_core::ledger::fees::FeesConfig { usd_subsidy: Some(usd_section()), ..Default::default() });
+        gs.ledger.set_rand_price(Some(randprotocol_core::ledger::rand_price::RandPrice { price_micros_per_rand: 150_000, set_at_height: 0, nonce: 0 }));
+        gs
+    }
+
+    /// A bundle-less `SetRandPrice` on `ledger`'s chain, voted by `voters` in canonical
+    /// (ascending address) order over this chain's price message.
+    pub(crate) fn set_price_tx(ledger: &Ledger, price: u64, nonce: u64, voters: &[&Keypair]) -> Transaction {
+        let message = randprotocol_core::types::actions::set_rand_price_message(&ledger.signing_domain().genesis, price, nonce);
+        let mut votes: Vec<(randprotocol_core::PublicKey, randprotocol_core::Signature)> =
+            voters.iter().map(|k| (k.public_key().clone(), k.sign(message.as_bytes()))).collect();
+        votes.sort_by_key(|(key, _)| key.address());
+        Transaction { chain_id: ledger.chain_id(), bundle: None, action: Action::SetRandPrice { price_micros_per_rand: price, nonce, votes } }
+    }
+
     /// A chain of `validators` whose genesis sets `staking.slashing` (audit v6, STAKE-1): 10% a
     /// slash, a four-epoch jail, ten-block epochs, signing domain v1.
     pub(crate) fn slashing_genesis(validators: &[&Keypair]) -> GenesisState {
@@ -5304,7 +5377,7 @@ pub(crate) mod fixtures {
     /// The fee-feedback rules with every flag on (`docs/fees.md` §1.3, issue #135), or `burn_base`
     /// and `burn_floor` alone when `net` is false.
     pub(crate) fn burn_floor_rules(net: bool) -> randprotocol_core::ledger::FeesConfig {
-        randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: net.then_some(true), burn_floor: Some(true), proposer_share_bps: None, prove_base: None }
+        randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: net.then_some(true), burn_floor: Some(true), proposer_share_bps: None, prove_base: None, usd_subsidy: None }
     }
 
     /// A four-word program's `Deploy` on a stub bundle keyed at `seed..seed + 3`, paying its floor
@@ -8588,7 +8661,7 @@ mod tests {
         use randprotocol_core::gas::BUNDLE_BASE;
         use randprotocol_core::ledger::FeesConfig;
         let (_d, s, mut gs) = genesis_with_two_notes();
-        let burn = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None };
+        let burn = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None };
         gs.ledger.set_fees(burn.clone());
         // The fixture's notes are tiny; tell the audit what genesis issued so its identity holds
         // after a fee is paid out of the pool.
@@ -9347,6 +9420,59 @@ mod tests {
         assert!(plain.get_meta_raw(META_MULTISIG).unwrap().is_none());
     }
 
+    /// The voted RAND price (`fees.usd_subsidy`) is consensus state under the section: written
+    /// with genesis (the genesis price), committed with the state after a `SetRandPrice`,
+    /// restored by `reload_ledger` (state root and all), replayed by `verify_chain` — a replica
+    /// replaying the block computes the same root — named when stale and repaired from the
+    /// replay; a chain without the section never gains the key.
+    #[test]
+    fn the_rand_price_is_persisted_restored_replayed_and_audited() {
+        use randprotocol_core::ledger::rand_price::RandPrice;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = usd_genesis(&[&key(1)]);
+        s.init_genesis(&gs).unwrap();
+        let genesis_price = RandPrice { price_micros_per_rand: 150_000, set_at_height: 0, nonce: 0 };
+        assert_eq!(s.rand_price().unwrap(), Some(genesis_price), "written with genesis");
+
+        let mut ledger = gs.ledger.clone();
+        let replica = gs.ledger.clone();
+        let tx = set_price_tx(&ledger, 200_000, 1, &[&key(1)]);
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx], &key(1));
+        let set = RandPrice { price_micros_per_rand: 200_000, set_at_height: 1, nonce: 1 };
+        assert_eq!(ledger.rand_price(), Some(&set));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(s.rand_price().unwrap(), Some(set), "committed with the state");
+
+        // A replica applying the same block lands on the same price and root.
+        let mut replica = replica;
+        replica.apply_block(&b1.block, &StubExecutor).unwrap();
+        assert_eq!(replica.rand_price(), ledger.rand_price());
+        assert_eq!(replica.state_root(), ledger.state_root());
+
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.rand_price(), Some(&set));
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(reloaded, ledger);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A stale row (the genesis price: the update lost) is named, and repaired from replay.
+        s.db.put_cf(s.cf(CF_META), META_RAND_PRICE, bincode::serialize(&genesis_price).unwrap()).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.expect("a stale price is a problem");
+        assert!(problem.contains("rand price"), "{problem}");
+        assert_eq!(check.last_good, 1, "the blocks themselves are fine");
+        s.truncate_to(&gs, 1, &check.ledger).unwrap();
+        assert_eq!(s.rand_price().unwrap(), Some(set));
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A chain without the section never gains the key.
+        let (_d2, plain, plain_gs) = genesis_with_two_notes();
+        plain.init_genesis(&plain_gs).unwrap();
+        assert_eq!(plain.rand_price().unwrap(), None);
+        assert!(plain.get_meta_raw(META_RAND_PRICE).unwrap().is_none());
+    }
+
     /// The v4 re-review's bond queue is consensus state under a `staking` section, so — like
     /// the faucet's counters — it is persisted beside `META_SUPPLY` on every commit, restored by
     /// `load_ledger`, audited by `verify_chain`'s replay and rewritten by the repair: a node that
@@ -9491,14 +9617,19 @@ mod seal_tests {
         }
     }
 
-    fn aggregate_tx(kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
+    /// An aggregate signed for the payout `l` pays now (`Ledger::payout_total_for`).
+    fn aggregate_tx(l: &Ledger, kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
         let aggregator = kp.public_key().address();
         let r = [9; 8];
-        let signature = kp.sign(aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof), &randprotocol_core::types::actions::envelope_digest(&env(9))).as_bytes());
+        let payout_total = l.payout_total_for(&covers).unwrap_or(0);
+        let signature = kp.sign(
+            aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof), &randprotocol_core::types::actions::envelope_digest(&env(9)), payout_total)
+                .as_bytes(),
+        );
         Transaction {
             chain_id: 7,
             bundle: None,
-            action: Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope: env(9), signature },
+            action: Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope: env(9), signature, payout_total },
         }
     }
 
@@ -9560,7 +9691,7 @@ mod seal_tests {
         let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), register], &key(1));
         storage.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
 
-        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
+        let aggregate = aggregate_tx(&l1, &key(7), 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
         let record = storage.covered_record(&covered_tx.hash(), FriProfile::Test).unwrap().unwrap();
         let sidecar: BTreeMap<usize, Vec<CoveredBundle>> = [(0usize, vec![record])].into_iter().collect();
         let mut l2 = l1.clone();
@@ -9588,7 +9719,7 @@ mod seal_tests {
         assert!(!storage.block_sealed(&block1.hash()).unwrap(), "a bundle short of full coverage keeps the flag down");
         // ...until a second aggregate covers the register's bundle as well.
         let register_tx = &block1.transactions[1];
-        let second = aggregate_tx(&key(7), 1, 3, vec![register_tx.hash()], b"ok".to_vec());
+        let second = aggregate_tx(&storage.load_ledger(&StubExecutor).unwrap(), &key(7), 1, 3, vec![register_tx.hash()], b"ok".to_vec());
         let l3 = {
             let mut l = storage.load_ledger(&StubExecutor).unwrap();
             l.set_height(3);
@@ -9779,7 +9910,7 @@ mod seal_tests {
         live.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
 
         let covers = vec![transfer.hash(), deploy.hash()];
-        let aggregate = aggregate_tx(&key(7), 0, 2, covers, b"ok".to_vec());
+        let aggregate = aggregate_tx(&l1, &key(7), 0, 2, covers, b"ok".to_vec());
         let sidecar: BTreeMap<usize, Vec<CoveredBundle>> =
             [(0usize, vec![stub_pruned_facts(&transfer), stub_pruned_facts(&deploy)])].into_iter().collect();
         let mut l2 = l1.clone();
@@ -9860,7 +9991,7 @@ mod seal_tests {
         // Block 2 carries the aggregate over it (stored unchecked: the seal rows are storage's,
         // written by `commit` off the transaction, whatever the ledger made of it); block 3 a
         // second bundle, sealed and pruned by hand so it owns every row a bundle can own.
-        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
+        let aggregate = aggregate_tx(&ledger, &key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
         let b2 = make_block_unchecked(&b1, &ledger, vec![aggregate.clone()], &key(1));
         storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
         let later = bundle_tx(&ledger, [[31; 8], [32; 8]], [[33; 8], [34; 8]], bundle_fee());
@@ -9911,7 +10042,7 @@ mod seal_tests {
         let second = bundle_tx(&ledger, [[25; 8], [26; 8]], [[27; 8], [28; 8]], bundle_fee());
         let b2 = make_block(&b1, &mut ledger, vec![second], &key(1));
         storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
-        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
+        let aggregate = aggregate_tx(&ledger, &key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
         let b3 = make_block_unchecked(&b2, &ledger, vec![aggregate.clone()], &key(1));
         storage.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
         let later = bundle_tx(&ledger, [[31; 8], [32; 8]], [[33; 8], [34; 8]], bundle_fee());
@@ -10058,7 +10189,7 @@ mod seal_tests {
         let covered = CoveredBundle { public_values: pv, shape };
 
         // Block 2: the aggregate, applied against that record.
-        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
+        let aggregate = aggregate_tx(&l1, &key(7), 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
         let sidecar: BTreeMap<usize, Vec<CoveredBundle>> = [(0usize, vec![covered.clone()])].into_iter().collect();
         let mut l2 = l1.clone();
         l2.set_height(2);
@@ -10222,7 +10353,7 @@ mod seal_tests {
         let covered = bundle_tx(&ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee());
         let b1 = make_block(&gs.block, &mut ledger, vec![covered.clone()], &key(1));
         storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
-        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
+        let aggregate = aggregate_tx(&ledger, &key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
         let b2 = make_block_unchecked(&b1, &ledger, vec![], &key(1));
         storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
         let b3 = make_block_unchecked(&b2, &ledger, vec![aggregate], &key(1));

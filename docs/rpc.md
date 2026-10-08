@@ -565,6 +565,19 @@ call floor, `gas::fee_floor`) adds it — `randprotocol-client`'s `ChainLimits::
 A node that predates the field answers without it, which a wallet reads as `null`; one that
 predates the two split keys answers without them, read as `null` (no split, no `prove_base`).
 
+One more key carries the dollar-indexed sealing subsidy (`docs/fees.md` §1.3), `null` when the
+genesis leaves it out — and set, it makes `fee_rules` non-`null` on its own:
+
+```json
+"usd_subsidy": { "usd_micros_per_sealed_block": "4791", "max_subsidy_per_block": "300000000",
+                 "price_max_age_blocks": 72000 }
+```
+
+The two amounts are decimal strings (micro-dollars, RAND units), the age a number of blocks.
+Informational for a wallet — nothing a sender pays moves — but an aggregator seals its payout at
+the schedule it implies: the dollar target converted at the voted price (`rand_getRandPrice`) and
+capped, while that price is fresh. The genesis price is not served here; the live one is.
+
 `gas_price`, `byte_price` and `gas_metering` are this **node's** own gas policy (spec
 `2026-09-28-gas-model-design.md` §4.1, Phase 0) *or* the chain's own `gas` section (§4.2, §7.1,
 Phase 1) when its genesis carries one — a chain's section always wins, and a node's
@@ -1233,6 +1246,24 @@ what a `Bond` that registers a new key must be among on a chain whose genesis se
 chain without the flag `admission_by_vote` is `false`, the list is always empty and a
 registration needs no vote. Served from storage, as of the committed head.
 
+### `rand_getRandPrice`
+Params: `[]`. Result:
+
+```json
+{ "price_micros_per_rand": "150000", "set_at_height": 4210, "nonce": 3, "fresh": true,
+  "max_age_blocks": 72000 }
+```
+
+The validator set's voted RAND/USD price (`docs/fees.md` §1.3, `docs/staking.md` "The RAND price
+vote"): micro-dollars per RAND as a decimal string, the height of the block that set it (0 for the
+genesis `initial_price_micros`), and the update's nonce — the next `SetRandPrice` must carry
+`nonce + 1`. `fresh` is judged **for the next block**, `(head + 1) − set_at_height ≤
+max_age_blocks`: the earliest an aggregate submitted now can land, and so the schedule it is paid
+at — `rand-node aggregate` seals at the dollar target while it is `true` and at the RAND schedule
+while it is `false`. `null` on a chain whose genesis has no `fees.usd_subsidy` (a chain with it
+always has a price: `initial_price_micros` is required). Served from storage, as of the committed head (the head is read before the
+price, so a commit between the two reads can only make the price newer than the height). Public.
+
 ### `rand_getEpoch`
 Params: `[]`. Result: `{ "epoch": 41, "epoch_blocks": 1000, "next_set": ["…", "…"] }`. `epoch` is
 `height / epoch_blocks`. `next_set` is what the register would derive for the next epoch if this
@@ -1574,7 +1605,12 @@ genesis carries no `aggregation` section, which chain 12 does not. `subsidy.curr
 schedule's `subsidy(sealed_blocks)`: what the next aggregate mints, except under the genesis
 `fees.subsidy_net_of_fees` (`docs/fees.md` §1.3), where it is a ceiling on the mint — the
 aggregate mints only its shortfall over the covered proving shares, which `rand_getAggregate`'s
-`subsidy` reports per aggregate. `faucet` mirrors `rand_status`'s field of the same name.
+`subsidy` reports per aggregate. Under the genesis `fees.usd_subsidy` `current` is the schedule an
+aggregate in the next block is paid at — the dollar target converted at a price fresh for that
+block and capped, or `subsidy(sealed_blocks)` clamped to the same cap when the price is stale
+(`aggregation::schedule_subsidy`, the one function the ledger and the daemon use); `base`,
+`halving_blocks` and `next_halving_at` still describe the RAND schedule it falls back to. `faucet`
+mirrors `rand_status`'s field of the same name.
 
 ## Subscriptions (WebSocket)
 
@@ -1853,6 +1889,24 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### Unreleased — dollar-indexed prover pay: `rand_getRandPrice`, `fee_rules.usd_subsidy`, `SetRandPrice` (tag 44) (genesis-gated; no chain carries it yet)
+
+Additive. A genesis `fees.usd_subsidy` section (`docs/fees.md` §1.3; aggregating chains only)
+pays a sealed aggregate a dollar target converted at a RAND/USD price the validator set votes —
+not an oracle. New: `rand_getRandPrice` (`{price_micros_per_rand, set_at_height, nonce, fresh,
+max_age_blocks}` or `null`; public); `rand_getLimits.fee_rules.usd_subsidy` (`null`, or the three
+numbers, the two amounts as decimal strings) — every existing `fee_rules` object gains the key as
+`null`; `rand_getEmission.subsidy.current` is the dollar schedule while the price is fresh for the
+next block. `tx_json` renders `set_rand_price` (`price_micros_per_rand` decimal string, `nonce`,
+`voters` by address in listed order). **Wire change for aggregates (on every chain, though none has
+carried one):** `Action::Aggregate` gains a last field, `payout_total` (the amount its payout note
+was sealed for, signed under `rand-aggregate-4`), so its encoding and txid move; `tx_json`'s
+`aggregate` gains `payout_total` (a decimal string); an aggregate whose `payout_total` is not what
+the ledger pays now is refused `PayoutMismatch` (a state verdict, not cached) and evicted from the
+pool at the next tip. The action is tag 44, after multisig's 40–43, bundle-less
+and fee-less; refused `UnsupportedAction` on a chain without the section. `rand_getAggregate`'s
+`subsidy` and `rand_getSupply`'s `subsidised` move by what the ledger minted, as before.
 
 ### Unreleased — multisig accounts: `rand_getMultisig`, four actions (tags 40–43) (genesis-gated; no chain carries it yet)
 

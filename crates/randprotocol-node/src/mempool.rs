@@ -205,6 +205,10 @@ fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
         Action::MultisigPay { account, nonce, .. } | Action::MultisigRotate { account, nonce, .. } => {
             Some((Address(*account), *nonce))
         }
+        // The RAND price vote (`fees.usd_subsidy`): the ledger's one price nonce, which every
+        // update spends — a register of one, so the zero address under role 10, like the
+        // bridge's counters under theirs.
+        Action::SetRandPrice { nonce, .. } => Some((Address([0; 32]), *nonce)),
         _ => None,
     }
 }
@@ -233,7 +237,8 @@ fn claim_conflict_key(validator: &Address) -> Word8 {
 /// the ledger refuses the next. STAKE-1's `SlashEquivocation` is the same kind of thing — fee-less
 /// evidence that must reach a block while the offender still leads — bounded by one pooled pair
 /// per `(offender, view)` (role 8), each admitted only with two of a registered validator's own
-/// signatures.
+/// signatures. The RAND price vote, `SetRandPrice`, is the same vote over the next price nonce:
+/// one pooled update per nonce (role 10), each admitted only with a quorum of the voting set.
 fn is_governance(action: &Action) -> bool {
     matches!(
         action,
@@ -248,6 +253,7 @@ fn is_governance(action: &Action) -> bool {
             | Action::RotatePqGuardiansV2 { .. }
             | Action::RotatePauseKeyV2 { .. }
             | Action::CancelRotation { .. }
+            | Action::SetRandPrice { .. }
     )
 }
 
@@ -279,6 +285,7 @@ fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
         Action::AdmitValidator { .. } => 7,
         Action::SlashEquivocation { .. } => 8,
         Action::MultisigPay { .. } | Action::MultisigRotate { .. } => 9,
+        Action::SetRandPrice { .. } => 10,
         _ => 0,
     };
     (role, claim.0, claim.1)
@@ -871,6 +878,11 @@ impl Mempool {
         // running in this pre-screen at all.
         if matches!(tx.action, Action::Aggregate { .. }) {
             ledger.preflight_aggregate(tx)?;
+            // Review 2026-10-09, Important 1: the signed `payout_total` against the ledger's own
+            // payment on this tip — a pooled aggregate whose schedule moved (a price vote, the
+            // price going stale, a halving) is evicted at the next tip rather than offered to,
+            // and refused by, every block; the daemon re-seals. State, never cached.
+            ledger.check_aggregate_payout(tx)?;
         }
         // A pooled attestation whose guardian set the chain has retired can never be admitted
         // again, and nothing else in this function looks at the bridge's sets — so before this it
@@ -1016,6 +1028,11 @@ impl Mempool {
                 // without the two signature verifications. Once the offender is jailed (by
                 // this pair or another) or the window has passed, it can never apply and leaves.
                 randprotocol_core::ledger::staking::check_slash_open(ledger, &addr, [first.header.height, second.header.height])?;
+            } else if matches!(tx.action, Action::SetRandPrice { .. }) {
+                // The RAND price vote: it stands while its nonce is the next one — the ledger's
+                // gate and nonce check, without the signature work. Once another update has
+                // spent the nonce it can never apply and leaves here.
+                randprotocol_core::ledger::rand_price::check_price_open(ledger, nonce)?;
             } else if matches!(tx.action, Action::AdmitValidator { .. }) {
                 // Audit v6, STAKE-2: an admission stands while its candidate is neither
                 // registered nor admitted (and the set has room) — the ledger's own state
@@ -1112,6 +1129,10 @@ impl Mempool {
         // a row down, and it moves the nonce too, so the nonce arm above usually answers first;
         // this is the ledger's own rule asked directly, so the pool cannot drift from it.
         randprotocol_core::ledger::multisig::still_applies(ledger, tx)?;
+        // The RAND price vote (review 2026-10-09, Important 2): a pooled update whose voters no
+        // longer carry the current voting set — membership and quorum, no signatures — or whose
+        // band moved can never apply; it leaves, freeing the price-nonce slot for a replacement.
+        randprotocol_core::ledger::rand_price::still_applies(ledger, tx)?;
         let nullifiers = tx.nullifiers();
         if let Some(nf) = nullifiers.iter().find(|nf| ledger.is_spent(nf)) {
             return Err(TxError::Spent(*nf));
@@ -2086,6 +2107,75 @@ mod tests {
         assert!(m.is_empty());
     }
 
+    /// The RAND price vote (`SetRandPrice`, `fees.usd_subsidy`) is pooled like an admission —
+    /// past a full pool, ahead of fee order — and claims the price nonce: two updates at one
+    /// nonce do not both pool, and once one commits the other can never apply and leaves.
+    #[test]
+    fn two_price_updates_at_one_nonce_do_not_both_pool() {
+        let vals: Vec<randprotocol_core::Keypair> = (1..=4u8).map(fixtures::key).collect();
+        let gs = fixtures::usd_genesis(&vals.iter().collect::<Vec<_>>());
+        let l = gs.ledger.clone();
+        let first = fixtures::set_price_tx(&l, 200_000, 1, &[&vals[0], &vals[1], &vals[2]]);
+        let second = fixtures::set_price_tx(&l, 100_000, 1, &[&vals[0], &vals[1], &vals[2]]);
+
+        let mut m = Mempool::new(1);
+        let paid = fixtures::bundle_tx(&l, [nf(1), nf(2)], [cm(1), cm(2)], fixtures::bundle_fee() * 5);
+        m.insert(paid.clone(), &l, &StubExecutor).unwrap();
+        m.insert(first.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.len(), 2, "one past the cap");
+        assert_eq!(m.candidates(&l, 10).iter().map(|t| t.hash()).collect::<Vec<_>>(), vec![first.hash(), paid.hash()]);
+        assert_eq!(m.insert(second, &l, &StubExecutor), Err(MempoolError::Conflict(claim_conflict_key(&Address([0; 32])))));
+        // Short of a quorum: the ledger's refusal, not pooled (asked of an empty pool, where the
+        // nonce is not already claimed).
+        let short = fixtures::set_price_tx(&l, 200_000, 1, &[&vals[0]]);
+        assert!(matches!(
+            Mempool::new(10).insert(short, &l, &StubExecutor),
+            Err(MempoolError::Invalid(TxError::Price(randprotocol_core::ledger::rand_price::PriceError::NoQuorum { .. })))
+        ));
+        // Once the update commits the price nonce is 1, and the pooled entry leaves.
+        let mut after = l.clone();
+        after.apply_tx(&first, &vals[0].address(), &StubExecutor).unwrap();
+        m.prune(&after);
+        assert_eq!(m.candidates(&after, 10).iter().map(|t| t.hash()).collect::<Vec<_>>(), vec![paid.hash()]);
+    }
+
+    /// Review 2026-10-09, Important 2: a pooled `SetRandPrice` whose voters lost the quorum after
+    /// pooling — here one of its three voters unbonds, leaving the voting set at once — is evicted
+    /// at the next tip (membership and quorum re-checked without signatures), freeing the one
+    /// price-nonce slot: a replacement vote at the same nonce by voters who carry the new set pools.
+    #[test]
+    fn a_pooled_price_update_leaves_once_its_quorum_is_lost() {
+        let vals: Vec<randprotocol_core::Keypair> = (1..=4u8).map(fixtures::key).collect();
+        let gs = fixtures::usd_genesis(&vals.iter().collect::<Vec<_>>());
+        let l = gs.ledger.clone();
+        let first = fixtures::set_price_tx(&l, 200_000, 1, &[&vals[0], &vals[1], &vals[2]]);
+        let mut m = Mempool::new(10);
+        m.insert(first.clone(), &l, &StubExecutor).unwrap();
+
+        // Validator 3 unbonds its whole stake: out of the voting set from this state on.
+        let leaving = &vals[2];
+        let amount = randprotocol_core::ledger::staking::MIN_STAKE;
+        let unbond = Transaction {
+            chain_id: l.chain_id(),
+            bundle: None,
+            action: Action::Unbond {
+                validator: leaving.address(),
+                amount,
+                nonce: 0,
+                signature: leaving.sign(randprotocol_core::types::unbond_message(l.chain_id(), &leaving.address(), amount, 0).as_bytes()),
+            },
+        };
+        let mut moved = l.clone();
+        moved.set_height(1);
+        moved.apply_tx(&unbond, &vals[0].address(), &StubExecutor).unwrap();
+        let replacement = fixtures::set_price_tx(&moved, 200_000, 1, &[&vals[0], &vals[1], &vals[3]]);
+        assert!(matches!(m.insert(replacement.clone(), &moved, &StubExecutor), Err(MempoolError::Conflict(_))), "the slot is held");
+        m.prune(&moved);
+        assert!(!m.contains(&first.hash()), "a vote that no longer carries the set leaves");
+        m.insert(replacement.clone(), &moved, &StubExecutor).unwrap();
+        assert!(m.contains(&replacement.hash()));
+    }
+
     /// Audit v6, STAKE-2: the validator set's vote (`AdmitValidator`) is pooled like a governance
     /// action — past a full pool, ahead of fee order — and claims its candidate: the ledger
     /// admits a key once, so a second vote for the same candidate (another voter set, another
@@ -2973,6 +3063,8 @@ mod tests {
         let register = randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(1, b, Action::RegisterAggregator { registration }));
         l.apply_tx(&register, &fixtures::key(1).address(), &StubExecutor).unwrap();
 
+        // The covers below are excess-free, so every aggregate here is paid the schedule alone.
+        let payout_total = l.payout_total_for(&[]).unwrap();
         let aggregate = |covers: Vec<Hash>, nonce: u64, r: Word8| {
             let proof = b"ok".to_vec();
             Transaction {
@@ -2987,8 +3079,10 @@ mod tests {
                     r,
                     envelope: fixtures::env(3),
                     signature: kp.sign(
-                        aggregate_signing_hash(1, nonce, 0, &r, &covers, &Hash::digest(&proof), &randprotocol_core::types::actions::envelope_digest(&fixtures::env(3))).as_bytes(),
+                        aggregate_signing_hash(1, nonce, 0, &r, &covers, &Hash::digest(&proof), &randprotocol_core::types::actions::envelope_digest(&fixtures::env(3)), payout_total)
+                            .as_bytes(),
                     ),
+                    payout_total,
                 },
             }
         };
@@ -3069,6 +3163,31 @@ mod tests {
             m.precheck(&agg_withdraw, &l, &StubExecutor),
             Err(MempoolError::Conflict(claim_conflict_key(&addr)))
         );
+
+        // Review 2026-10-09, Important 1: the schedule moving under the pooled aggregate (here a
+        // halving: another aggregate sealed `halving_blocks` blocks' worth) means the signed
+        // `payout_total` is no longer what the ledger pays. The pool re-asks at the tip and evicts
+        // it — never offered to, and refused by, every block — and refuses it outright on the
+        // moved state; re-sealed for the moved state it is admitted.
+        let mut moved = l.clone();
+        let mut supply = moved.supply();
+        supply.sealed_blocks = moved.aggregation().unwrap().halving_blocks;
+        moved.set_supply(supply);
+        assert!(matches!(
+            moved.check_aggregate_payout(&tx1),
+            Err(TxError::Aggregation(randprotocol_core::ledger::aggregation::AggregationError::PayoutMismatch { .. }))
+        ));
+        assert!(m.contains(&tx1.hash()));
+        m.prune(&l);
+        assert!(m.contains(&tx1.hash()), "still paid as signed on the unmoved tip");
+        m.prune(&moved);
+        assert!(!m.contains(&tx1.hash()), "evicted at the tip where its payout moved");
+        assert!(matches!(
+            Mempool::new(10).precheck(&tx1, &moved, &StubExecutor),
+            Err(MempoolError::Invalid(TxError::Aggregation(randprotocol_core::ledger::aggregation::AggregationError::PayoutMismatch { .. })))
+        ), "and refused outright on the moved state");
+        let half = moved.payout_total_for(&[Hash::digest(b"cover a")]).unwrap();
+        assert_eq!(half, payout_total / 2);
     }
 
     /// A `WithdrawAggregator`'s note time goes stale by the same rule as a `Withdraw`'s: out of

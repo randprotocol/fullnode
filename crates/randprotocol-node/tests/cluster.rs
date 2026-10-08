@@ -2132,9 +2132,32 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
         let proof_bytes = aggregate_proof.proof.to_bytes();
         let time = head as u32 + 1;
         let envelope = Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] };
+        // The payout the chain pays now (no `fees` section: the schedule plus the share), read
+        // off the node as the daemon reads it; signed beside the rest.
+        let schedule = n0.rpc.call("rand_getEmission", serde_json::json!([])).await.unwrap()["subsidy"]["current"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("an aggregating chain reports its schedule");
+        let unsealed = n0.rpc.call("rand_getUnsealed", serde_json::json!([0, 64])).await.unwrap();
+        let share = unsealed["bundles"]
+            .as_array()
+            .and_then(|b| b.iter().find(|row| row["hash"].as_str() == Some(register.hash.to_hex().as_str())))
+            .and_then(|row| row["excess"].as_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("the register's bundle is in the bucket");
+        let payout_total = schedule + share;
         let signature = aggregator.sign(
-            randprotocol_core::types::actions::aggregate_signing_hash(CHAIN_ID, 0, time, &r, &covers, &Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&envelope))
-                .as_bytes(),
+            randprotocol_core::types::actions::aggregate_signing_hash(
+                CHAIN_ID,
+                0,
+                time,
+                &r,
+                &covers,
+                &Hash::digest(&proof_bytes),
+                &randprotocol_core::types::actions::envelope_digest(&envelope),
+                payout_total,
+            )
+            .as_bytes(),
         );
         Transaction {
             chain_id: CHAIN_ID,
@@ -2148,6 +2171,7 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
                 r,
                 envelope,
                 signature,
+                payout_total,
             },
         }
     };

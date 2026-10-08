@@ -2287,13 +2287,25 @@ fn aggregation_node_with(
     (hs, key, cfg)
 }
 
-fn aggregate_tx(key: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
+/// An aggregate signed for the payout `ledger` pays now (`Ledger::payout_total_for`; 0 for
+/// covers it does not hold).
+fn aggregate_tx(ledger: &crate::ledger::Ledger, key: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
     let aggregator = key.public_key().address();
     let r = [9; 8];
     let envelope = crate::notes::Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] };
+    let payout_total = ledger.payout_total_for(&covers).unwrap_or(0);
     let signature = key.sign(
-        crate::types::actions::aggregate_signing_hash(1, nonce, time, &r, &covers, &Hash::digest(&proof), &crate::types::actions::envelope_digest(&envelope))
-            .as_bytes(),
+        crate::types::actions::aggregate_signing_hash(
+            1,
+            nonce,
+            time,
+            &r,
+            &covers,
+            &Hash::digest(&proof),
+            &crate::types::actions::envelope_digest(&envelope),
+            payout_total,
+        )
+        .as_bytes(),
     );
     Transaction {
         chain_id: 1,
@@ -2307,6 +2319,7 @@ fn aggregate_tx(key: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: 
             r,
             envelope,
             signature,
+            payout_total,
         },
     }
 }
@@ -2318,8 +2331,8 @@ fn a_proposal_carries_at_most_one_aggregate_the_largest_valid_cover_set() {
     let (mut hs, key, _cfg) = aggregation_node();
     hs.start();
     let covers = |n: usize| (0..n).map(|i| Hash::digest(&[i as u8 + 40])).collect::<Vec<_>>();
-    let big = aggregate_tx(&key, 0, 1, covers(3), b"ok".to_vec());
-    let small = aggregate_tx(&key, 0, 1, covers(1), b"ok-2".to_vec());
+    let big = aggregate_tx(hs.tip_ledger(), &key, 0, 1, covers(3), b"ok".to_vec());
+    let small = aggregate_tx(hs.tip_ledger(), &key, 0, 1, covers(1), b"ok-2".to_vec());
     let acts = hs.propose(1, vec![small.clone(), big.clone()], 1).expect("propose");
     let proposal = acts.iter().find_map(|a| match a {
         Action::Broadcast(ConsensusMessage::Proposal(b)) => Some(b),
@@ -2342,8 +2355,8 @@ fn a_proposal_carries_at_most_one_aggregate_the_largest_valid_cover_set() {
         let (a, b) = (vec![1u8; 4], vec![2u8; 4]);
         if Hash::digest(&a) < Hash::digest(&b) { (a, b) } else { (b, a) }
     };
-    let a_high = aggregate_tx(&key, 0, 1, covers(2), p_high.clone());
-    let a_low = aggregate_tx(&key, 0, 1, covers(2), p_low.clone());
+    let a_high = aggregate_tx(hs2.tip_ledger(), &key, 0, 1, covers(2), p_high.clone());
+    let a_low = aggregate_tx(hs2.tip_ledger(), &key, 0, 1, covers(2), p_low.clone());
     assert!(Hash::digest(&p_low) < Hash::digest(&p_high), "the fixture's own order");
     // Candidates in the losing order: the higher proof hash first.
     let acts = hs2.propose(1, vec![a_high.clone(), a_low.clone()], 1).expect("propose");
@@ -2409,7 +2422,7 @@ fn a_proposal_carrying_an_aggregate_applies_identically_on_proposer_and_peer() {
     peer.set_covered_source(covered_source);
     leader.start();
     peer.start();
-    let tx = aggregate_tx(&key, 0, 1, vec![Hash::digest(b"cover a")], b"ok".to_vec());
+    let tx = aggregate_tx(leader.tip_ledger(), &key, 0, 1, vec![Hash::digest(b"cover a")], b"ok".to_vec());
     let acts = leader.propose(1, vec![tx.clone()], 1).expect("the leader's own block must apply");
     let block = acts
         .iter()
@@ -2456,7 +2469,7 @@ fn a_proposal_skips_an_aggregate_whose_covers_are_unavailable() {
         NoneCovered
     }));
     hs.start();
-    let agg = aggregate_tx(&key, 0, 1, vec![Hash::digest(b"cover")], b"ok".to_vec());
+    let agg = aggregate_tx(hs.tip_ledger(), &key, 0, 1, vec![Hash::digest(b"cover")], b"ok".to_vec());
     let acts = hs.propose(1, vec![agg], 1).expect("propose");
     let block = acts
         .iter()

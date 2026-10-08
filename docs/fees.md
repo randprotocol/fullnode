@@ -143,7 +143,7 @@ block's bytes in `Mempool::candidates_within`, and what the Calls leave of the l
 filled with the transfers held back — no block space is wasted, and with no Call pooled nothing
 changes. A hostile proposer can ignore it; an honest one on chain 18 runs it today.
 
-### 1.3 The `fees` section: the burns, a fee-first subsidy and the proposer/aggregator split (genesis-gated, on no chain yet)
+### 1.3 The `fees` section: the burns, a fee-first subsidy, the proposer/aggregator split and dollar-indexed prover pay (genesis-gated, on no chain yet)
 
 Every fee above goes to the block's proposer today, in full (or, on an aggregating chain, the
 floor to the proposer and the excess to the proof bucket, `docs/aggregation.md`), and an
@@ -155,11 +155,14 @@ shape, burn the base and tip the rest, and the proving-auction shape, pay the pr
 first and mint only the shortfall — and a genesis `fees` section switches each on, with a third
 flag, `burn_floor`, for the faithful EIP-1559 form (issue #135). Two numeric fields carry the
 compute-optimization proposal's proposer/aggregator split (`docs/compute-optimization.md` §6.2–§6.3),
-below:
+and a sub-section, `usd_subsidy`, the study's best prover-retention variant — prover pay indexed to
+a dollar target at a price the validator set votes (below):
 
 ```json
 "fees": { "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true,
-          "proposer_share_bps": 4000, "prove_base": 600000 }
+          "proposer_share_bps": 4000, "prove_base": 600000,
+          "usd_subsidy": { "usd_micros_per_sealed_block": 4791, "max_subsidy_per_block": 300000000,
+                           "price_max_age_blocks": 72000, "initial_price_micros": 150000 } }
 ```
 
 All three flags are optional booleans and **off by default**, following
@@ -171,14 +174,17 @@ without them opens unchanged, reading both as their defaults. A `true` flag is c
 genesis hash right after the `tokens` section's bytes: `b"fees"`, then `b"burn_base"` ‖ `1` if
 `burn_base`, then `b"subsidy_net_of_fees"` ‖ `1` if `subsidy_net_of_fees`, then `b"burn_floor"` ‖
 `1` if `burn_floor`, then `b"proposer_share_bps"` ‖ be32 and `b"prove_base"` ‖ be64, each only when
-set, in that order, and nothing at all when no flag is `true` and neither number is set (pinned by
-`the_fees_sections_hash_contribution_is_pinned` and `the_fee_split_fields_hash_contributions_are_pinned`;
+set, in that order, then `b"usd_subsidy"` ‖ be64 ×4 (target, cap, age, initial price) when
+`usd_subsidy` is, and nothing at all when no flag is `true` and no number is set (pinned by
+`the_fees_sections_hash_contribution_is_pinned`, `the_fee_split_fields_hash_contributions_are_pinned`
+and `the_usd_subsidy_hash_contribution_is_pinned`;
 each newer field comes after the older ones so every hash pinned over them stays put). An unknown key in the section is refused, so a misspelt flag cannot
 read as "off". It is a genesis parameter, never state: on the ledger as `Ledger::fees`, stored under
 `META_FEES` (JSON, written on every new database — `{}` without a section) and set again from the
 genesis file by `reload_ledger` on every restart, the file being the authority. `rand_getLimits`
 serves it as `fee_rules`, `null` on a chain without a `true` flag or a set number. Dollar-indexed prover pay (the
-study's per-prover-day target) is out of scope: it needs a price oracle the chain does not have.
+study's per-prover-day target) needs a RAND/USD price; the chain takes it from the validator set's
+vote, not from a market oracle (`usd_subsidy`, the end of this section).
 
 **`burn_base`.** In the bundle fee split (`Ledger::apply_tx_with`) every bundle's
 `gas::BUNDLE_BASE` is destroyed instead of paid: `supply.burned` and the supply counter
@@ -340,6 +346,94 @@ so the same 0.0002 tip is a 0.0018 RAND fee: 0.0004 to the proposer and 0.0014 b
 of base, 0.0006 `prove_base`, 0.0002 tip). Under `burn_base` the share has nothing to split: the
 0.001 base burns and the bucket holds the tip (and `prove_base`). Under `subsidy_net_of_fees` the
 shares the schedule is netted against carry `prove_base` and the aggregator's part of the base.
+
+**`usd_subsidy`** (decision 2026-10-09; needs `aggregation`,
+`GenesisError::UsdSubsidyWithoutAggregation`). The agent-driven fee study found prover retention
+is what its agents react to, and its best variant paid provers a dollar-indexed amount "from fees
+first, then minted". A RAND schedule cannot do that: at a falling price `subsidy(n)` buys less
+GPU time and provers leave, at a rising one it overpays. The sub-section makes the sealing
+subsidy's **schedule** a dollar target converted at a RAND/USD price, while that price is fresh:
+
+```
+usd_subsidy = { usd_micros_per_sealed_block, max_subsidy_per_block, price_max_age_blocks,
+                initial_price_micros }                      -- all four required, all > 0
+schedule(n) = min(⌊usd_micros_per_sealed_block · 10⁹ / price⌋, max_subsidy_per_block)
+                                                            -- a fresh voted price, u128, floor
+            = min(subsidy(n), max_subsidy_per_block)        -- a stale price (or none)
+fresh       ⇔ height − set_at_height ≤ price_max_age_blocks -- height: the block sealing it
+```
+
+`aggregation::schedule_subsidy` is the one statement of it: `Ledger::aggregate_payment` (admission's
+note and apply's), `rand_getEmission.subsidy.current` and the aggregate daemon all call it, and
+`minted_subsidy` then nets it against the covered shares exactly as it nets `subsidy(n)` — so
+under `subsidy_net_of_fees` this **is** the study's "from fees first, then minted": the aggregator
+is paid `max(schedule, shares)` and only the shortfall is new RAND. The quotient rounds down; the
+product is computed in u128 and the result saturates before the cap. The cap binds in **every**
+branch (ruling 2026-10-09): the fallback is the RAND schedule clamped to `max_subsidy_per_block`,
+so a quorum that lapses can never leave the chain minting above the cap either. `sealed_blocks`
+still advances per aggregate, so the RAND schedule the chain falls back to keeps halving
+underneath.
+
+**The price is governance, not an oracle.** `price` is micro-dollars per RAND, held by the ledger
+as `RandPrice { price_micros_per_rand, set_at_height, nonce }` — seeded from the required
+`initial_price_micros` at height 0, nonce 0, so a chain with the section always has one — and
+moved only by `SetRandPrice { price_micros_per_rand, nonce, votes }`, the validator set's vote in
+`AdmitValidator`'s shape (`docs/staking.md` "The RAND price vote"): one action, bundle-less and
+fee-less, each vote a Dilithium2 signature over `blake3("rand-set-price-1" ‖ genesis hash ‖
+be64(price) ‖ be64(nonce))`, the voters strictly ascending, members of the voting set, and holding
+strictly more than two thirds of its weight — the admission's own quorum. Each update carries the
+ledger's nonce plus one and may move the price by **at most a factor of two** either way
+(`2·new ≥ old` and `new ≤ 2·old`, exact). The price is consensus state under the section: folded
+into the state root as `H("rand-state-price-1", root ‖ price_root)`, persisted (`META_RAND_PRICE`),
+replay-audited. Without the section the root is byte for byte what it was and the action is
+refused by name.
+
+The trust trade, stated: a market oracle can be manipulated by whoever moves the market; a voted
+price can be set by whoever holds two thirds of the stake — who can already halt or rewrite the
+chain. The band bounds one vote's damage to a factor of two, and `max_subsidy_per_block` (genesis,
+not votable) bounds the mint whatever the vote says, and whatever it fails to say: a quorum voting
+the price to one micro-dollar mints at most the cap a block, and so does a stale price, whose
+fallback is clamped to the same cap. `docs/compute-optimization.md` §6.1's "governance can only
+lower issuance" holds against the cap, not against the RAND schedule — under a low price the dollar
+schedule may exceed `subsidy(n)`, up to the cap the genesis fixed. There is **no minimum gap
+between updates**: the per-update ×2 band and the quorum are the governance bound — a quorum can
+step the price by two every block, but each step is a fresh two-thirds signature over the next
+nonce, and no step moves the mint past the cap.
+
+**Freshness, and the aggregator's payout.** A price older than `price_max_age_blocks` reverts the
+schedule to the capped `subsidy(n)` — a set that stops voting cannot leave a stale price paying
+forever. The age is judged at the height of the block that applies the aggregate, and the price can
+move under an aggregate between its sealing and its inclusion (a `SetRandPrice` in any block before
+it — and in its own block, since a proposer applies ordinary transactions before aggregates), as can
+`sealed_blocks` across a halving. **That can no longer cost an aggregator its payout** (review
+2026-10-09): an `Aggregate` carries the amount its envelope was sealed for, `payout_total`, signed
+(`rand-aggregate-4`), and the ledger refuses one whose `payout_total` is not what it pays now —
+`AggregationError::PayoutMismatch`, at admission and at apply — instead of paying its own amount
+into a note the envelope cannot open. Nothing leaves the bucket; the pool evicts such an aggregate
+at the next tip; `rand-node aggregate` re-seals the same proof at the current schedule (the proof
+binds the aggregator, its nonce and the covers, never the payout) and resubmits. `rand_getRandPrice
+.fresh` is judged for the next block, which is what the daemon seals at (`time = height + 1`), so
+a re-seal is the exception at the staleness edge, not the rule.
+
+Worked, with the study's $345 a day for the sealing prover at 1.2 s blocks (72 000 blocks a day):
+
+- `usd_micros_per_sealed_block = ⌊345 000 000 / 72 000⌋ = 4 791` µ$ ($0.004791 a block,
+  $344.95 a day).
+- **At $0.15** (`price = 150 000`): `⌊4 791 · 10⁹ / 150 000⌋ = 31 940 000` units — 0.03194 RAND a
+  block, 2 299.68 RAND a day — against today's RAND schedule of 0.6 RAND a block (43 200 RAND,
+  $6 480 a day at that price). Under the cap, so the dollar target binds.
+- **At $0.01** (`price = 10 000`): the target is `⌊4 791 · 10⁹ / 10 000⌋ = 479 100 000` units
+  (0.4791 RAND), over a `max_subsidy_per_block` of 300 000 000 (0.3 RAND): **the cap binds**, the
+  aggregate's schedule is 0.3 RAND ($0.003, $216 a day) and the prover is under-paid rather than
+  the supply over-minted. The cap starts binding below `4 791 / 0.3 = 15 970` µ$ ($0.01597).
+- With `subsidy_net_of_fees` beside it, an aggregate at $0.15 whose covers bucketed 0.01 RAND of
+  shares mints 0.02194 RAND and pays 0.03194; one whose covers bucketed 0.05 RAND mints nothing
+  and pays 0.05.
+- If the set stops voting, 72 000 blocks after the last update the schedule is `subsidy(n)` again,
+  clamped to the cap: with today's 0.6 RAND schedule and a 0.3 RAND cap, 0.3 RAND.
+
+`rand_getLimits.fee_rules.usd_subsidy` serves the three numbers and `rand_getRandPrice` the live
+price; the operator tooling is `rand-node price status|sign|submit` (`docs/cli.md`).
 
 ## 2. What the sender pays with its own machine: proving
 

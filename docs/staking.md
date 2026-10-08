@@ -269,6 +269,41 @@ Under it:
   checks each vote against the node's genesis hash, orders them and sends the action. Then the
   bond as before: `rand bond <validator> 1000 --registration <hex>`.
 
+### The RAND price vote (`fees.usd_subsidy`, decision 2026-10-09)
+
+The dollar-indexed sealing subsidy (`docs/fees.md` §1.3) converts a dollar target at a RAND/USD
+price, and the chain takes that price from the validator set, not from a market oracle. The vote
+is `AdmitValidator`'s shape with a nonce:
+
+- **The action**, `SetRandPrice { price_micros_per_rand, nonce, votes }` (wire tag 44) —
+  bundle-less and fee-less, pooled past a full pool and offered first, one pooled update per nonce.
+  `votes` is one `(validator key, Dilithium2 signature)` per voter over `blake3("rand-set-price-1"
+  ‖ genesis hash ‖ be64(price) ‖ be64(nonce))`, strictly ascending by voter address.
+- **The quorum is the admission's**: the same voting set (`staking::voting_set`, the register's own
+  derivation for the current epoch), every listed vote counting, the voters holding strictly more
+  than two thirds of the weight (`ValidatorSet::has_quorum`). The check is one function,
+  `staking::check_votes`, shared by both actions. `SetRandPrice` votes over the **current**
+  validator set and does **not** need `staking.admission_by_vote` (or any `staking` section): it is
+  gated on `fees.usd_subsidy` alone.
+- **A pooled vote is re-judged at every tip** without signatures — membership and quorum in the
+  current voting set (`staking::check_vote_weight`), the nonce and the band — so a vote whose
+  quorum was lost after pooling (a voter unbonded, an epoch moved the weights) leaves the pool and
+  frees the price-nonce slot for a replacement.
+- **The nonce** is the ledger's plus one (the genesis price is nonce 0, so the first update is 1),
+  so a vote for update `n` never counts for `n + 1`, even at the same price; a pooled update leaves
+  once another spends its nonce.
+- **The band**: a positive price within a factor of two of the current one (`2·new ≥ old`,
+  `new ≤ 2·old`). Moving further takes several updates, each a fresh quorum. There is no minimum
+  gap between updates: the band and the quorum are the governance bound, and the genesis
+  `max_subsidy_per_block` caps what any price, voted or stale, can mint.
+- **The state** is `RandPrice { price_micros_per_rand, set_at_height, nonce }`, consensus state
+  under the section (`rand-state-price-1`, `META_RAND_PRICE`), served by `rand_getRandPrice`.
+  Refused `UnsupportedAction` on a chain without `fees.usd_subsidy`.
+- **The commands.** `rand-node price status` prints the price and the next nonce; each voter runs
+  `rand-node price sign --price 0.15 --nonce <n> --key <its validator key> --genesis-hash <hash>`
+  (offline) and hands back the line as a vote file; whoever collects them runs `rand-node price
+  submit --price 0.15 --nonce <n> --signature <file or line>… --rpc …` (`docs/cli.md`).
+
 ### Slashing leader equivocation (audit v6, STAKE-1: `staking.slashing`)
 
 Until audit v6 an equivocating leader's second block was refused and logged with both hashes and

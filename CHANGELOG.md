@@ -12,6 +12,23 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+- **Dollar-indexed prover pay** (genesis-gated, off by default: no existing chain carries it;
+  aggregating chains only): a genesis `fees.usd_subsidy { usd_micros_per_sealed_block,
+  max_subsidy_per_block, price_max_age_blocks, initial_price_micros }` (all four required) makes
+  the sealing subsidy's schedule `min(⌊usd · 10⁹ / price⌋, cap)` while a RAND/USD price is fresh,
+  and `min(subsidy(n), cap)` otherwise (`docs/fees.md` §1.3); `subsidy_net_of_fees` nets it
+  unchanged. The price
+  is the validator set's vote, not an oracle: `SetRandPrice` (wire tag 44), bundle-less and
+  fee-less, `AdmitValidator`'s quorum (`staking::check_votes`, now shared), the next nonce, at most
+  a factor of two per update. State root wrapper `rand-state-price-1`, persisted under
+  `META_RAND_PRICE`, mempool claim role 10. RPC: `rand_getRandPrice`,
+  `rand_getLimits.fee_rules.usd_subsidy`, `rand_getEmission.subsidy.current` follows the price.
+  The aggregate daemon seals at the node's price; CLI `rand-node price status|sign|submit`.
+  **Aggregate wire change** (every chain; none has carried an aggregate): `Action::Aggregate` gains
+  `payout_total`, signed (`rand-aggregate-4` / genesis-bound `-5`); the ledger refuses one it does
+  not pay exactly (`PayoutMismatch`) instead of paying a note its envelope cannot open — a price
+  vote, a stale price or a halving between seal and inclusion no longer loses the payout; the pool
+  evicts such an aggregate and the daemon re-seals the same proof.
 - **Multisig accounts** (genesis-gated: no existing chain carries the section; node-safe on
   chain 20, where all four actions are refused `UnsupportedAction("multisig")`): a new genesis
   `multisig` section (`docs/multisig.md`) with M-of-N controlled public balances, seeded with

@@ -215,6 +215,19 @@ pub fn admit_validator_message(genesis: &Hash, candidate: &Address) -> Hash {
     Hash::digest_domain(b"rand-admit-validator-1", &m)
 }
 
+/// What a validator signs to set the chain's RAND/USD price (`Action::SetRandPrice` under the
+/// genesis `fees.usd_subsidy`, `docs/fees.md` §1.3): the genesis hash, the price in micro-dollars
+/// per RAND and the update's nonce, big-endian, under their own tag. The genesis hash binds the
+/// vote to one chain, the nonce to one update — a vote for update `n` can never be replayed as
+/// update `n + 1`, even at the same price.
+pub fn set_rand_price_message(genesis: &Hash, price_micros_per_rand: u64, nonce: u64) -> Hash {
+    let mut m = Vec::with_capacity(48);
+    m.extend_from_slice(genesis.as_bytes());
+    m.extend_from_slice(&price_micros_per_rand.to_be_bytes());
+    m.extend_from_slice(&nonce.to_be_bytes());
+    Hash::digest_domain(b"rand-set-price-1", &m)
+}
+
 /// What a validator signs to move stake into unbonding. The register's `nonce` is the replay
 /// protection: there are no accounts on this chain to carry one.
 pub fn unbond_message(chain_id: u64, validator: &Address, amount: u64, nonce: u64) -> Hash {
@@ -623,6 +636,12 @@ pub fn aggregate_binding(chain_id: u64, aggregator: &crate::crypto::Address, non
 /// read as one over the new; no chain has ever carried an aggregate, so nothing signed under the
 /// old domain exists. `SignedAggregateHeader` (the retired slashing evidence) carries no envelope
 /// and is never verified any more; its signers pass the digest of whatever envelope they paid to.
+///
+/// Dollar-indexed prover pay (2026-10-09; dormant — aggregation is on no chain): the payout
+/// note's amount, `payout_total`, joined the preimage, and the domain moved with it,
+/// `rand-aggregate-2` → `rand-aggregate-4` (`rand-aggregate-3` is the genesis-bound form's,
+/// `BindingDomain::aggregate_signing_hash`, which moved to `rand-aggregate-5`).
+#[allow(clippy::too_many_arguments)]
 pub fn aggregate_signing_hash(
     chain_id: u64,
     nonce: u64,
@@ -631,7 +650,9 @@ pub fn aggregate_signing_hash(
     covers: &[crate::crypto::Hash],
     proof_hash: &crate::crypto::Hash,
     envelope_digest: &crate::crypto::Hash,
+    payout_total: u64,
 ) -> crate::crypto::Hash {
-    let bytes = bincode::serialize(&(chain_id, nonce, time, r, covers, proof_hash, envelope_digest)).expect("serializes");
-    crate::crypto::Hash::digest_domain(b"rand-aggregate-2", &bytes)
+    let bytes =
+        bincode::serialize(&(chain_id, nonce, time, r, covers, proof_hash, envelope_digest, payout_total)).expect("serializes");
+    crate::crypto::Hash::digest_domain(b"rand-aggregate-4", &bytes)
 }

@@ -5,7 +5,9 @@ use randprotocol_client::wallet;
 use randprotocol_client::RpcClient;
 use randprotocol_core::genesis::{EnvelopeHex, Genesis, GenesisNote, GenesisOpening, GenesisValidator, TokensConfig};
 use randprotocol_core::notes::{word8_to_hex, Envelope, EnvelopeFormat, ShieldedAddress};
-use randprotocol_core::types::actions::{admit_validator_message, registration_message_v2, AggregatorRegistration, Registration};
+use randprotocol_core::types::actions::{
+    admit_validator_message, registration_message_v2, set_rand_price_message, AggregatorRegistration, Registration,
+};
 use randprotocol_zkvm::machine::FriProfile;
 use randprotocol_core::{format_amount, parse_amount};
 use randprotocol_core::{Keypair, PublicKey, UNITS_PER_RAND};
@@ -334,6 +336,80 @@ fn admit_action(genesis: &randprotocol_core::Hash, candidate: &PublicKey, lines:
         anyhow::bail!("validator {} votes twice; list each vote once", w[0].0.address());
     }
     Ok(randprotocol_core::Action::AdmitValidator { candidate: candidate.clone(), signatures })
+}
+
+/// A RAND/USD price in dollars (`0.15`, `2`, `0.000001`) as micro-dollars per RAND — at most six
+/// decimals, never 0. `--price` of the `price` commands.
+fn parse_usd_micros(spec: &str) -> Result<u64> {
+    let spec = spec.trim().trim_start_matches('$');
+    let (whole, frac) = spec.split_once('.').unwrap_or((spec, ""));
+    anyhow::ensure!(
+        !(whole.is_empty() && frac.is_empty()) && whole.bytes().all(|b| b.is_ascii_digit()) && frac.bytes().all(|b| b.is_ascii_digit()),
+        "--price {spec:?} is not a dollar amount like 0.15"
+    );
+    anyhow::ensure!(frac.len() <= 6, "--price {spec:?} has more than six decimals (the price is in micro-dollars)");
+    let whole: u64 = if whole.is_empty() { 0 } else { whole.parse().context("--price: the dollars do not fit")? };
+    let frac: u64 = format!("{frac:0<6}").parse().unwrap_or(0);
+    let micros = whole.checked_mul(1_000_000).and_then(|w| w.checked_add(frac)).context("--price does not fit in micro-dollars")?;
+    anyhow::ensure!(micros > 0, "--price must be greater than 0");
+    Ok(micros)
+}
+
+/// Micro-dollars as dollars, for what the `price` commands print: `150000` → `0.15`.
+fn format_usd_micros(micros: u64) -> String {
+    let frac = format!("{:06}", micros % 1_000_000);
+    let frac = frac.trim_end_matches('0');
+    if frac.is_empty() { format!("{}", micros / 1_000_000) } else { format!("{}.{frac}", micros / 1_000_000) }
+}
+
+/// One validator's vote to set the chain's RAND price to `price` micro-dollars at update `nonce`
+/// (`fees.usd_subsidy`), as the line `price sign` prints and `price submit --signature` reads:
+/// `<voter public key hex>:<signature hex>` — the admission vote's line.
+fn price_vote_line(voter: &Keypair, genesis: &randprotocol_core::Hash, price: u64, nonce: u64) -> String {
+    let signature = voter.sign(set_rand_price_message(genesis, price, nonce).as_bytes());
+    format!("{}:{}", voter.public_key().to_hex(), hex::encode(signature.as_bytes()))
+}
+
+/// The vote lines `--signature` names: each argument is one line as `price sign` printed it, or a
+/// file holding such lines (one vote per non-empty line) — so each validator can hand back a vote
+/// file and the collector pass the files as they are.
+fn vote_lines(args: &[String]) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for arg in args {
+        match std::fs::read_to_string(arg) {
+            Ok(text) => lines.extend(text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from)),
+            Err(_) => lines.push(arg.trim().to_string()),
+        }
+    }
+    anyhow::ensure!(!lines.is_empty(), "no vote: pass at least one --signature line or vote file");
+    Ok(lines)
+}
+
+/// The `SetRandPrice` action over `lines` (each a [`price_vote_line`]): every vote checked against
+/// this chain's message for `(price, nonce)` before anything is sent — a vote for another genesis,
+/// price or nonce is named here rather than refused by the node — each voter once, and the votes
+/// in the ascending voter order the ledger requires. [`admit_action`]'s rules for the price vote.
+fn price_action(genesis: &randprotocol_core::Hash, price: u64, nonce: u64, lines: &[String]) -> Result<randprotocol_core::Action> {
+    let message = set_rand_price_message(genesis, price, nonce);
+    let mut votes = Vec::with_capacity(lines.len());
+    for line in lines {
+        let (key, sig) = line.trim().split_once(':').context("a vote is `<voter public key hex>:<signature hex>`, as `price sign` prints it")?;
+        let key = PublicKey::from_hex(key).map_err(|e| anyhow::anyhow!("a vote's voter key: {e}"))?;
+        let sig = randprotocol_core::Signature::from_bytes(&hex::decode(sig).context("a vote's signature is not hex")?)
+            .map_err(|e| anyhow::anyhow!("the vote by {}: {e}", key.address()))?;
+        anyhow::ensure!(
+            key.verify(message.as_bytes(), &sig),
+            "the vote by {} is not a signature over this chain's price update to ${} at nonce {nonce} (another genesis hash, price or nonce?)",
+            key.address(),
+            format_usd_micros(price)
+        );
+        votes.push((key, sig));
+    }
+    votes.sort_by_key(|(key, _)| key.address());
+    if let Some(w) = votes.windows(2).find(|w| w[0].0.address() == w[1].0.address()) {
+        anyhow::bail!("validator {} votes twice; list each vote once", w[0].0.address());
+    }
+    Ok(randprotocol_core::Action::SetRandPrice { price_micros_per_rand: price, nonce, votes })
 }
 
 #[derive(Parser)]
@@ -845,6 +921,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AdmitCmd,
     },
+    /// The validator set's RAND/USD price (genesis `fees.usd_subsidy`, `docs/fees.md` §1.3): the
+    /// price the dollar-indexed sealing subsidy converts at, set by vote, not by an oracle.
+    /// `status` reads it; `sign` is each validator's vote (offline); `submit` assembles the votes
+    /// and sends the fee-less `SetRandPrice` — `admit`'s shape for the price.
+    Price {
+        #[command(subcommand)]
+        cmd: PriceCmd,
+    },
     /// Genesis vesting (`docs/vesting.md`): a timelocked allocation's holder and revoker side —
     /// status, claim, revoke, and bonding locked RAND. The key is made with `keygen` and its
     /// public key read with `address`; `--key` below is the entry's beneficiary (or revoker) key.
@@ -1265,6 +1349,55 @@ enum AdmitCmd {
         candidate: String,
         /// One vote, as `admit sign` printed it; repeat for each voter.
         #[arg(long = "signature", required = true, value_name = "KEY:SIGNATURE")]
+        signatures: Vec<String>,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Return once the node accepts the transaction instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+    },
+}
+
+/// `rand-node price …` (`fees.usd_subsidy`).
+#[derive(Subcommand)]
+enum PriceCmd {
+    /// Show the chain's voted price, when it was set, its nonce, and whether it is fresh for the
+    /// next block (`rand_getRandPrice`), with the next nonce a vote must carry.
+    Status {
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+    /// Sign this validator's vote to set the price to `--price` dollars per RAND at update
+    /// `--nonce`, and print it as one line, `<voter public key hex>:<signature hex>` — save it as
+    /// a vote file for whoever runs `price submit`. Reads no node.
+    Sign {
+        /// The price in dollars per RAND, e.g. 0.15 (at most six decimals).
+        #[arg(long)]
+        price: String,
+        /// The update's nonce: the chain's current nonce plus one (`price status` prints it).
+        #[arg(long)]
+        nonce: u64,
+        /// This validator's key file — a key in the chain's voting set.
+        #[arg(long)]
+        key: PathBuf,
+        /// The chain's genesis hash, 64 hex characters (`rand_getGenesisHash`). A vote is good on
+        /// exactly this chain, for exactly this price and nonce.
+        #[arg(long)]
+        genesis_hash: String,
+    },
+    /// Assemble validators' votes into one `SetRandPrice` and submit it. Each vote is checked here
+    /// against the node's genesis hash and the nonce against the node's next one; the chain then
+    /// needs the voters to hold more than two thirds of the voting set's weight and the price to
+    /// be within a factor of two of the current one. Bundle-less and fee-less: no wallet needed.
+    Submit {
+        /// The price in dollars per RAND, exactly as the votes signed it.
+        #[arg(long)]
+        price: String,
+        /// The update's nonce, as the votes signed it.
+        #[arg(long)]
+        nonce: u64,
+        /// One vote line as `price sign` printed it, or a file of such lines; repeat for each.
+        #[arg(long = "signature", required = true, value_name = "KEY:SIGNATURE|FILE")]
         signatures: Vec<String>,
         #[arg(long, default_value = "http://127.0.0.1:8545")]
         rpc: String,
@@ -3021,6 +3154,53 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Cmd::Price { cmd } => match cmd {
+            PriceCmd::Status { rpc } => {
+                let client = RpcClient::new(rpc);
+                let p = client.call("rand_getRandPrice", serde_json::json!([])).await?;
+                if p.is_null() {
+                    println!("no voted price (a chain without fees.usd_subsidy, or none set yet); the next update's nonce is 1 where the section exists");
+                } else {
+                    let micros = randprotocol_client::amount_field(&p["price_micros_per_rand"]).context("rand_getRandPrice has no price")?;
+                    let nonce = p["nonce"].as_u64().context("rand_getRandPrice has no nonce")?;
+                    println!(
+                        "price ${} per RAND ({micros} µ$), set at height {}, nonce {nonce}; {} for the next block (max age {} blocks); next update's nonce {}",
+                        format_usd_micros(micros),
+                        p["set_at_height"],
+                        if p["fresh"].as_bool() == Some(true) { "fresh" } else { "stale" },
+                        p["max_age_blocks"],
+                        nonce + 1
+                    );
+                }
+            }
+            PriceCmd::Sign { price, nonce, key, genesis_hash } => {
+                let micros = parse_usd_micros(&price)?;
+                let kp = load_keypair(&key)?;
+                let genesis = randprotocol_core::Hash::from_hex(&genesis_hash).map_err(|e| anyhow::anyhow!("--genesis-hash: {e}"))?;
+                eprintln!("validator {} votes the RAND price to ${} at nonce {nonce} on the chain of genesis {genesis}", kp.address(), format_usd_micros(micros));
+                println!("{}", price_vote_line(&kp, &genesis, micros, nonce));
+            }
+            PriceCmd::Submit { price, nonce, signatures, rpc, no_wait } => {
+                let micros = parse_usd_micros(&price)?;
+                let client = RpcClient::new(rpc);
+                let chain_id = client.chain_id().await?;
+                let genesis = client.genesis_hash().await?;
+                let current = client.call("rand_getRandPrice", serde_json::json!([])).await?;
+                let expected = current["nonce"].as_u64().map_or(1, |n| n + 1);
+                anyhow::ensure!(nonce == expected, "--nonce {nonce}: the node's next price update is nonce {expected}");
+                let lines = vote_lines(&signatures)?;
+                let action = price_action(&genesis, micros, nonce, &lines)?;
+                let tx = randprotocol_core::Transaction { chain_id, bundle: None, action };
+                let hash = client.send_transaction(&tx).await?;
+                let what = format!("RAND price ${} at nonce {nonce} by {} vote(s)", format_usd_micros(micros), lines.len());
+                if no_wait {
+                    println!("submitted {what} {hash}");
+                } else {
+                    let receipt = client.wait_for_transaction(&hash, wallet::COMMIT_TIMEOUT).await?;
+                    println!("submitted {what} {hash}\n  committed in block {}", receipt.height);
+                }
+            }
+        },
         Cmd::BridgeGov { cmd } => bridge_gov(cmd).await?,
         Cmd::Multisig { cmd } => multisig_cmd(cmd).await?,
         Cmd::Vesting { cmd } => match cmd {
@@ -3277,8 +3457,30 @@ trait AggregateNode {
     async fn binding_domain(&self, chain_id: u64) -> Result<randprotocol_core::BindingDomain>;
     /// Submit a signed transaction (`rand_sendTransaction`); its hash.
     async fn send_transaction(&self, tx: &randprotocol_core::Transaction) -> Result<randprotocol_core::Hash>;
-    /// Wait for `hash` to commit; the block height it committed in.
-    async fn wait_for_transaction(&self, hash: &randprotocol_core::Hash, timeout: Duration) -> Result<u64>;
+    /// Where `hash` stands (`rand_getTransactionStatus`): committed at a height, pending,
+    /// rejected with the node's reason, or unknown — evicted from the pool.
+    async fn transaction_state(&self, hash: &randprotocol_core::Hash) -> Result<TxState>;
+}
+
+/// One transaction's standing, as `rand_getTransactionStatus` reports it — what the aggregate
+/// daemon's wait reads to tell a commit from an eviction it must re-seal after.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TxState {
+    Committed(u64),
+    Pending,
+    Rejected(String),
+    Unknown,
+}
+
+impl TxState {
+    fn of(status: &serde_json::Value) -> TxState {
+        match status["status"].as_str() {
+            Some("committed") => TxState::Committed(status["height"].as_u64().unwrap_or(0)),
+            Some("pending") => TxState::Pending,
+            Some("rejected") => TxState::Rejected(status["reason"].as_str().unwrap_or("refused").to_string()),
+            _ => TxState::Unknown,
+        }
+    }
 }
 
 impl AggregateNode for RpcClient {
@@ -3303,8 +3505,9 @@ impl AggregateNode for RpcClient {
     async fn send_transaction(&self, tx: &randprotocol_core::Transaction) -> Result<randprotocol_core::Hash> {
         RpcClient::send_transaction(self, tx).await
     }
-    async fn wait_for_transaction(&self, hash: &randprotocol_core::Hash, timeout: Duration) -> Result<u64> {
-        Ok(RpcClient::wait_for_transaction(self, hash, timeout).await?.height)
+    async fn transaction_state(&self, hash: &randprotocol_core::Hash) -> Result<TxState> {
+        let reply = RpcClient::call(self, "rand_getTransactionStatus", serde_json::json!([[hash.to_hex()]])).await?;
+        Ok(reply.as_array().and_then(|a| a.first()).map(TxState::of).unwrap_or(TxState::Unknown))
     }
 }
 
@@ -3421,12 +3624,41 @@ fn prove_aggregate(profile: FriProfile, raw_proofs: &[Vec<u8>], binding: &[u32; 
 /// than submitted to certain refusal. The shares are each cover's bucketed excess, fixed at the
 /// bundle's inclusion (IFACE-7) — a cover that left the bucket in the meantime makes the
 /// aggregate invalid whatever it pays, and admission names it.
+#[cfg(test)]
 async fn aggregate_pass(
     rpc: &impl AggregateNode,
     kp: &Keypair,
     chain_id: u64,
     prove: impl FnOnce(FriProfile, &[Vec<u8>], &[u32; 8]) -> Result<Vec<u8>>,
 ) -> Result<Option<randprotocol_core::Transaction>> {
+    let Some(proved) = prove_pass(rpc, kp, chain_id, prove).await? else {
+        return Ok(None);
+    };
+    Ok(Some(seal_aggregate(rpc, kp, chain_id, &proved).await?))
+}
+
+/// A pass's work up to the proof: what [`seal_aggregate`] needs to build — and, after a
+/// `PayoutMismatch` or an eviction, re-build — the signed aggregate without proving again. The
+/// proof commits to `(chain, aggregator, nonce)` and the covers, never to the payout, so a re-seal
+/// at a moved schedule reuses it.
+struct ProvedAggregate {
+    covers: Vec<randprotocol_core::Hash>,
+    proof: Vec<u8>,
+    nonce: u64,
+    shares: u64,
+    fees: randprotocol_core::ledger::FeesConfig,
+    format: EnvelopeFormat,
+    domain: randprotocol_core::BindingDomain,
+}
+
+/// [`aggregate_pass`]'s first half (`prove_pass`): the work list, the raw bundles, the reads fixed at genesis
+/// and the prove.
+async fn prove_pass(
+    rpc: &impl AggregateNode,
+    kp: &Keypair,
+    chain_id: u64,
+    prove: impl FnOnce(FriProfile, &[Vec<u8>], &[u32; 8]) -> Result<Vec<u8>>,
+) -> Result<Option<ProvedAggregate>> {
     let status = rpc.call("rand_status", serde_json::json!([])).await?;
     let profile = match status["fri_profile"].as_str().unwrap_or("production") {
         "test" => FriProfile::Test,
@@ -3477,9 +3709,20 @@ async fn aggregate_pass(
     let format = rpc.envelope_format(chain_id).await?;
     let binding = domain.aggregate_binding(chain_id, &kp.address(), nonce);
     let proof_bytes = prove(profile, &raw_proofs, &binding)?;
+    Ok(Some(ProvedAggregate { covers, proof: proof_bytes, nonce, shares, fees, format, domain }))
+}
 
-    // After the prove, immediately before the transaction: the head, the schedule, the payout
-    // and the nonce as they are *now* (IFACE-8).
+/// [`aggregate_pass`]'s second half, re-run on a re-seal: after the prove, immediately before the
+/// transaction, the head, the schedule, the payout and the nonce as they are *now* (IFACE-8);
+/// the note sealed at the ledger's own amount and that amount signed as `payout_total`.
+async fn seal_aggregate(
+    rpc: &impl AggregateNode,
+    kp: &Keypair,
+    chain_id: u64,
+    proved: &ProvedAggregate,
+) -> Result<randprotocol_core::Transaction> {
+    let ProvedAggregate { covers, proof: proof_bytes, nonce, shares, fees, format, domain } = proved;
+    let (nonce, shares) = (*nonce, *shares);
     let (nonce_now, payout, _) = aggregator_row(rpc, &kp.address()).await?;
     if nonce_now != nonce {
         anyhow::bail!(
@@ -3499,29 +3742,139 @@ async fn aggregate_pass(
     // mints, by its own rule (`minted_subsidy`: the schedule, or under `subsidy_net_of_fees` its
     // shortfall over the shares) — plus the proving shares, sealed to the register's payout
     // address (spec §5.4).
-    let schedule = subsidy_base.checked_shr((n / halving) as u32).unwrap_or(0);
-    let subsidy = randprotocol_core::ledger::aggregation::minted_subsidy(schedule, shares, &fees);
+    // Under `fees.usd_subsidy` the schedule is the dollar target at the validator set's voted
+    // price while that price is fresh — `rand_getRandPrice`'s `fresh`, judged for the next block,
+    // the earliest this aggregate lands — and the RAND schedule otherwise. The node says which;
+    // the pass never re-derives the price. One function with the ledger's
+    // (`aggregation::schedule_subsidy`), so the note is the one the ledger derives.
+    //
+    // The two reads (`rand_status`'s height and schedule index, `rand_getRandPrice`) are not one
+    // snapshot: a commit can land between them, and the aggregate can land later than the next
+    // block. Either way the ledger refuses a `payout_total` it does not pay
+    // (`AggregationError::PayoutMismatch`) instead of paying it into a note this envelope cannot
+    // open, and `aggregate_round` re-seals — never a lost payout (review 2026-10-09).
+    let fresh_price = match fees.usd_subsidy() {
+        Some(_) => {
+            let p = rpc.call("rand_getRandPrice", serde_json::json!([])).await?;
+            if p["fresh"].as_bool() == Some(true) {
+                Some(randprotocol_client::amount_field(&p["price_micros_per_rand"]).context("rand_getRandPrice has no price")?)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    let schedule_cfg = randprotocol_core::ledger::aggregation::AggregationConfig {
+        bond: 0,
+        max_covers: 0,
+        subsidy_base,
+        halving_blocks: halving,
+        window: 0,
+        admitted_shapes: Vec::new(),
+    };
+    let schedule = randprotocol_core::ledger::aggregation::schedule_subsidy(n, &schedule_cfg, fees.usd_subsidy(), fresh_price);
+    let subsidy = randprotocol_core::ledger::aggregation::minted_subsidy(schedule, shares, fees);
     let time = height as u32 + 1;
-    let (note, envelope) = sealed_withdraw_note(&payout, subsidy.saturating_add(shares), time, format)?;
+    let payout_total = subsidy.saturating_add(shares);
+    let (note, envelope) = sealed_withdraw_note(&payout, payout_total, time, *format)?;
     let signature = kp.sign(
         domain
-            .aggregate_signing_hash(chain_id, nonce, time, &note.r, &covers, &randprotocol_core::Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&envelope))
+            .aggregate_signing_hash(
+                chain_id,
+                nonce,
+                time,
+                &note.r,
+                covers,
+                &randprotocol_core::Hash::digest(proof_bytes),
+                &randprotocol_core::types::actions::envelope_digest(&envelope),
+                payout_total,
+            )
             .as_bytes(),
     );
-    Ok(Some(randprotocol_core::Transaction {
+    Ok(randprotocol_core::Transaction {
         chain_id,
         bundle: None,
         action: randprotocol_core::Action::Aggregate {
-            covers,
-            proof: proof_bytes,
+            covers: covers.clone(),
+            proof: proof_bytes.clone(),
             aggregator: kp.address(),
             nonce,
             time,
             r: note.r,
             envelope,
             signature,
+            payout_total,
         },
-    }))
+    })
+}
+
+/// How many times one pass re-seals its proof after a `PayoutMismatch` refusal or an eviction
+/// before the pass fails (and, under `--watch`, the next pass proves afresh).
+const MAX_RESEALS: u32 = 4;
+
+/// Whether a submission was refused because its signed `payout_total` is not what the ledger
+/// pays now (`AggregationError::PayoutMismatch`, whose message names the field).
+fn is_payout_mismatch(reason: &str) -> bool {
+    reason.contains("payout_total is")
+}
+
+/// What became of a submitted aggregate: committed (at a height, when the node says which), or
+/// dropped — refused for its payout, or evicted from the pool and never committed — and to be
+/// re-sealed.
+enum Landing {
+    Committed(Option<u64>),
+    Dropped(String),
+}
+
+/// How many consecutive `unknown` answers, with the committed register nonce unmoved, make an
+/// aggregate evicted rather than in flight. A node prunes its pool against the tip — the
+/// certified, not yet committed, block — so an aggregate inside such a block is out of the pool
+/// and `unknown` until the three-chain rule commits it: on nearly every successful aggregate, for a
+/// few blocks (re-review 2026-10-09). 200 polls is a minute at the 300 ms poll.
+const UNKNOWN_POLLS: u32 = 200;
+
+/// Poll `hash` until it commits, is dropped, or `timeout` passes (an error). `me` and `nonce` are
+/// the aggregator and the register nonce the aggregate signed: while the node answers `unknown`,
+/// the committed nonce having moved past `nonce` means this key's action at `nonce` committed —
+/// confirmed by asking for the transaction once more — and only an `unknown` that persists for
+/// [`UNKNOWN_POLLS`] with the nonce unmoved is an eviction. A rejection is a re-seal only when it
+/// names the payout (`PayoutMismatch`); any other rejection is the pass's error, as before.
+async fn wait_for_aggregate(
+    rpc: &impl AggregateNode,
+    me: &randprotocol_core::Address,
+    nonce: u64,
+    hash: &randprotocol_core::Hash,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<Landing> {
+    let start = std::time::Instant::now();
+    let mut unknown = 0u32;
+    loop {
+        match rpc.transaction_state(hash).await? {
+            TxState::Committed(height) => return Ok(Landing::Committed(Some(height))),
+            TxState::Rejected(reason) if is_payout_mismatch(&reason) => return Ok(Landing::Dropped(reason)),
+            TxState::Rejected(reason) => anyhow::bail!("aggregate {hash} rejected: {reason}"),
+            TxState::Pending => unknown = 0,
+            TxState::Unknown => {
+                if aggregator_row(rpc, me).await?.0 > nonce {
+                    // The nonce this aggregate signed is spent on the committed state: it landed
+                    // (a commit between the two reads is why the status is asked again).
+                    return Ok(Landing::Committed(match rpc.transaction_state(hash).await? {
+                        TxState::Committed(height) => Some(height),
+                        _ => None,
+                    }));
+                }
+                unknown += 1;
+                if unknown >= UNKNOWN_POLLS {
+                    return Ok(Landing::Dropped(format!("evicted from the pool ({UNKNOWN_POLLS} polls unknown, nonce {nonce} unspent)")));
+                }
+            }
+        }
+        if start.elapsed() > timeout {
+            anyhow::bail!("aggregate {hash} not committed within {timeout:?}");
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 /// How the aggregate daemon runs: once, or `--watch` on an interval with a cap on consecutive
@@ -3619,21 +3972,57 @@ async fn aggregate_round(
             return Err(StopError::ChainIdMismatch { expected: chain_id, got: now }.into());
         }
     }
-    let Some(tx) = aggregate_pass(rpc, kp, chain_id, prove).await? else {
+    let Some(proved) = prove_pass(rpc, kp, chain_id, prove).await? else {
         return Ok(false);
     };
-    let covered = match &tx.action {
-        randprotocol_core::Action::Aggregate { covers, .. } => covers.len(),
-        _ => 0,
-    };
-    let hash = rpc.send_transaction(&tx).await?;
-    if cfg.no_wait {
-        println!("submitted aggregate {hash} ({covered} covered)");
-    } else {
-        let height = rpc.wait_for_transaction(&hash, wallet::COMMIT_TIMEOUT).await?;
-        println!("submitted aggregate {hash} ({covered} covered)\n  committed in block {height}");
+    let covered = proved.covers.len();
+    // Seal, submit, wait — and re-seal (never re-prove) when the chain refuses the payout or the
+    // pool evicts the aggregate because the schedule moved under it (a price vote, the price going
+    // stale, a halving, another aggregate first): the proof does not commit to the payout, the
+    // ledger refuses a `payout_total` it does not pay (review 2026-10-09), and the next seal
+    // reads the schedule afresh. The pause is a block's worth (the interval, at most 2 s; 0 in
+    // tests), so a node still a block behind the edge has moved on.
+    let pause = cfg.interval.min(Duration::from_secs(2));
+    // The status poll: 300 ms, or the interval when shorter (0 in tests).
+    let poll = cfg.interval.min(Duration::from_millis(300));
+    let mut attempt = 0u32;
+    loop {
+        let tx = seal_aggregate(rpc, kp, chain_id, &proved).await?;
+        let hash = match rpc.send_transaction(&tx).await {
+            Ok(hash) => hash,
+            Err(e) if is_payout_mismatch(&format!("{e:#}")) && attempt < MAX_RESEALS => {
+                attempt += 1;
+                tracing::warn!("aggregate refused for its payout ({e:#}); re-sealing (attempt {attempt} of {MAX_RESEALS})");
+                tokio::time::sleep(pause).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if cfg.no_wait {
+            println!("submitted aggregate {hash} ({covered} covered)");
+            return Ok(true);
+        }
+        let signed_nonce = match &tx.action {
+            randprotocol_core::Action::Aggregate { nonce, .. } => *nonce,
+            _ => unreachable!("seal_aggregate builds an aggregate"),
+        };
+        match wait_for_aggregate(rpc, &kp.address(), signed_nonce, &hash, wallet::COMMIT_TIMEOUT, poll).await? {
+            Landing::Committed(Some(height)) => {
+                println!("submitted aggregate {hash} ({covered} covered)\n  committed in block {height}");
+                return Ok(true);
+            }
+            Landing::Committed(None) => {
+                println!("submitted aggregate {hash} ({covered} covered)\n  committed (its register nonce is spent)");
+                return Ok(true);
+            }
+            Landing::Dropped(reason) if attempt < MAX_RESEALS => {
+                attempt += 1;
+                tracing::warn!("aggregate {hash} dropped ({reason}); re-sealing (attempt {attempt} of {MAX_RESEALS})");
+                tokio::time::sleep(pause).await;
+            }
+            Landing::Dropped(reason) => anyhow::bail!("aggregate {hash} dropped ({reason}) after {MAX_RESEALS} re-seals"),
+        }
     }
-    Ok(true)
 }
 
 /// The shortest history a node may keep: shorter than an hour and a node that restarts on the
@@ -3934,6 +4323,64 @@ mod tests {
         let e = admit_action(&genesis, candidate.public_key(), &[lines[0].clone(), lines[0].clone()]).unwrap_err().to_string();
         assert!(e.contains("votes twice"), "{e}");
         assert!(admit_action(&genesis, candidate.public_key(), &["nocolon".to_string()]).is_err());
+    }
+
+    /// The `price` commands (`fees.usd_subsidy`): `sign` prints one vote line over `(genesis,
+    /// price, nonce)`; `submit` reads lines or vote files, checks every vote against this chain's
+    /// message for that price and nonce before anything is sent — another genesis, price or nonce
+    /// is named, a voter listed twice refused — and orders the votes ascending. Prices are dollars
+    /// with at most six decimals.
+    #[test]
+    fn the_price_commands_parse_sign_check_and_order_the_votes() {
+        let cli = Cli::try_parse_from([
+            "rand-node", "price", "sign", "--price", "0.15", "--nonce", "1", "--key", "k.json", "--genesis-hash", "00",
+        ])
+        .unwrap();
+        assert!(matches!(cli.cmd, Cmd::Price { cmd: PriceCmd::Sign { nonce: 1, .. } }));
+        let cli = Cli::try_parse_from(["rand-node", "price", "submit", "--price", "0.15", "--nonce", "2", "--signature", "a:b", "--signature", "votes.txt"]).unwrap();
+        let Cmd::Price { cmd: PriceCmd::Submit { signatures, rpc, no_wait, nonce, .. } } = cli.cmd else { panic!("price submit") };
+        assert_eq!((signatures.len(), rpc.as_str(), no_wait, nonce), (2, "http://127.0.0.1:8545", false, 2));
+        assert!(Cli::try_parse_from(["rand-node", "price", "submit", "--price", "1", "--nonce", "1"]).is_err(), "at least one vote");
+        assert!(matches!(Cli::try_parse_from(["rand-node", "price", "status"]).unwrap().cmd, Cmd::Price { cmd: PriceCmd::Status { .. } }));
+
+        assert_eq!(parse_usd_micros("0.15").unwrap(), 150_000);
+        assert_eq!(parse_usd_micros("$2").unwrap(), 2_000_000);
+        assert_eq!(parse_usd_micros(".000001").unwrap(), 1);
+        assert_eq!(parse_usd_micros("12.5").unwrap(), 12_500_000);
+        for bad in ["0", "0.0000001", "abc", "", "1.2.3", "-1"] {
+            assert!(parse_usd_micros(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!((format_usd_micros(150_000), format_usd_micros(2_000_000), format_usd_micros(1)), ("0.15".into(), "2".into(), "0.000001".into()));
+
+        let key = |n: u8| Keypair::from_seed([n; 32]).unwrap();
+        let genesis = randprotocol_core::Hash::digest(b"this chain");
+        let lines: Vec<String> = [3u8, 1, 2].iter().map(|n| price_vote_line(&key(*n), &genesis, 150_000, 1)).collect();
+        // Two lines on the command line, one in a vote file.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("votes.txt");
+        std::fs::write(&file, format!("{}\n\n", lines[2])).unwrap();
+        let read = vote_lines(&[lines[0].clone(), lines[1].clone(), file.to_str().unwrap().to_string()]).unwrap();
+        assert_eq!(read, lines);
+        let randprotocol_core::Action::SetRandPrice { price_micros_per_rand, nonce, votes } = price_action(&genesis, 150_000, 1, &read).unwrap() else {
+            panic!("a price update")
+        };
+        assert_eq!((price_micros_per_rand, nonce, votes.len()), (150_000, 1, 3));
+        let voters: Vec<_> = votes.iter().map(|(k, _)| k.address()).collect();
+        let mut sorted = voters.clone();
+        sorted.sort();
+        assert_eq!(voters, sorted, "ascending voter order");
+        let message = set_rand_price_message(&genesis, 150_000, 1);
+        assert!(votes.iter().all(|(k, s)| k.verify(message.as_bytes(), s)));
+        // Another genesis, price or nonce: named before anything is sent.
+        for (g, p, n) in [(randprotocol_core::Hash::digest(b"another chain"), 150_000, 1), (genesis, 150_001, 1), (genesis, 150_000, 2)] {
+            let foreign = price_vote_line(&key(1), &g, p, n);
+            let e = price_action(&genesis, 150_000, 1, &[foreign]).unwrap_err().to_string();
+            assert!(e.contains(&key(1).address().to_string()) && e.contains("another genesis hash, price or nonce"), "{e}");
+        }
+        let e = price_action(&genesis, 150_000, 1, &[lines[0].clone(), lines[0].clone()]).unwrap_err().to_string();
+        assert!(e.contains("votes twice"), "{e}");
+        assert!(price_action(&genesis, 150_000, 1, &["nocolon".to_string()]).is_err());
+        assert!(vote_lines(&[]).is_err());
     }
 
     #[test]
@@ -4754,6 +5201,18 @@ mod tests {
         /// The node reports no `binding_domain` for the chain (`require_binding_domain`'s refusal),
         /// as `RpcClient`'s `AggregateNode::binding_domain` raises it.
         binding_refused: bool,
+        /// `rand_getRandPrice`'s reply (`fees.usd_subsidy`): `null` unless a test sets it.
+        rand_price: serde_json::Value,
+        /// Refuse this many submissions for their payout (`PayoutMismatch`), keeping them here.
+        refuse_payout: std::cell::Cell<u32>,
+        refused: std::cell::RefCell<Vec<randprotocol_core::Transaction>>,
+        /// Report this many of the first sent aggregates as evicted (status `unknown`).
+        evict: std::cell::Cell<u32>,
+        /// The certified-but-uncommitted window: a sent aggregate answers `unknown` for this many
+        /// status polls (out of the pool, pruned against the tip, not yet committed) and only
+        /// then commits — the register nonce moving at that commit, not at the send.
+        uncommitted_polls: std::cell::Cell<u32>,
+        status_polls: std::cell::Cell<u32>,
     }
 
     impl AggregateNode for MovingNode {
@@ -4786,6 +5245,7 @@ mod tests {
                     "next_from": null,
                 }),
                 "rand_getRawTransaction" => json!(hex::encode(bincode::serialize(&self.raw).unwrap())),
+                "rand_getRandPrice" => self.rand_price.clone(),
                 "rand_getLimits" => {
                     anyhow::bail!("the pass reads rand_getLimits only through the cached limits (AggregateNode::fee_rules), never once a pass")
                 }
@@ -4820,12 +5280,42 @@ mod tests {
             Ok(randprotocol_core::BindingDomain::ChainId)
         }
         async fn send_transaction(&self, tx: &randprotocol_core::Transaction) -> Result<randprotocol_core::Hash> {
+            // The next `refuse_payout` submissions are refused as the node refuses a payout the
+            // ledger no longer pays — after each, the "chain" moves the schedule on by one sealed
+            // block, as a competing aggregate would.
+            if self.refuse_payout.get() > 0 {
+                self.refuse_payout.set(self.refuse_payout.get() - 1);
+                self.refused.borrow_mut().push(tx.clone());
+                self.sealed_blocks.set(self.sealed_blocks.get() + 1);
+                anyhow::bail!("rand_sendTransaction: aggregation: the aggregate's payout_total is 0, the ledger pays 1: re-seal at the current schedule");
+            }
+            // An aggregate the stand-in will report evicted never committed: the nonce stays.
+            let evicted = (self.sent.borrow().len() as u32) < self.evict.get();
             self.sent.borrow_mut().push(tx.clone());
-            self.nonce.set(self.nonce.get() + 1);
+            // In the certified window the nonce moves when the block commits (`transaction_state`).
+            if !evicted && self.uncommitted_polls.get() == 0 {
+                self.nonce.set(self.nonce.get() + 1);
+            }
             Ok(tx.hash())
         }
-        async fn wait_for_transaction(&self, _hash: &randprotocol_core::Hash, _timeout: Duration) -> Result<u64> {
-            Ok(self.height.get() + 1)
+        async fn transaction_state(&self, hash: &randprotocol_core::Hash) -> Result<TxState> {
+            // The first `evict` sent aggregates are evicted (the node no longer knows them); every
+            // other one committed at once, as `send_transaction` says.
+            self.status_polls.set(self.status_polls.get() + 1);
+            let index = self.sent.borrow().iter().position(|t| &t.hash() == hash);
+            if index.is_some() && self.uncommitted_polls.get() > 0 {
+                self.uncommitted_polls.set(self.uncommitted_polls.get() - 1);
+                if self.uncommitted_polls.get() == 0 {
+                    // The block carrying it commits now: the register nonce moves with it.
+                    self.nonce.set(self.nonce.get() + 1);
+                }
+                return Ok(TxState::Unknown);
+            }
+            Ok(match index {
+                Some(i) if (i as u32) < self.evict.get() => TxState::Unknown,
+                Some(_) => TxState::Committed(self.height.get() + 1),
+                None => TxState::Unknown,
+            })
         }
     }
 
@@ -4860,6 +5350,12 @@ mod tests {
             chain_moves_after: None,
             unregistered_reads: std::cell::Cell::new(0),
             binding_refused: false,
+            rand_price: serde_json::Value::Null,
+            refuse_payout: std::cell::Cell::new(0),
+            refused: std::cell::RefCell::new(Vec::new()),
+            evict: std::cell::Cell::new(0),
+            uncommitted_polls: std::cell::Cell::new(0),
+            status_polls: std::cell::Cell::new(0),
         }
     }
 
@@ -5082,7 +5578,7 @@ mod tests {
                 window: 256,
                 admitted_shapes: vec![],
             }));
-            l.set_fees(FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None });
+            l.set_fees(FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None });
             l.set_aggregators(
                 [(
                     kp.address(),
@@ -5099,6 +5595,158 @@ mod tests {
                 .unwrap_or_else(|| panic!("shares {shares}: the envelope opens to the ledger's note"));
             assert_eq!(opened.amount, paid, "shares {shares}: max(schedule, shares)");
         }
+    }
+
+    /// The dollar-indexed subsidy in the daemon: under `fees.usd_subsidy` the pass reads the
+    /// voted price off `rand_getRandPrice` and, while the node says it is `fresh`, seals the
+    /// dollar target converted at it (capped) plus the shares; a stale price seals the RAND
+    /// schedule. Each sealed envelope must open to `Ledger::derived_commitment` on a ledger in the
+    /// same state — the price fresh, or stale, at the height the aggregate lands (`height + 1`).
+    /// With `subsidy_net_of_fees` beside it the dollar schedule is netted like the RAND one.
+    #[tokio::test]
+    async fn the_aggregate_pass_seals_the_ledgers_payout_under_a_voted_price() {
+        use randprotocol_core::ledger::aggregation::{AggregationConfig, AggregatorEntry};
+        use randprotocol_core::ledger::fees::UsdSubsidy;
+        use randprotocol_core::ledger::rand_price::RandPrice;
+        use randprotocol_core::ledger::{FeesConfig, Ledger};
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payee = SpendKey([7; 8]);
+        let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
+        let ex = ZkExecutor::new(FriProfile::Test);
+        // $0.000005 a block, capped at 600 units: at 0.01 $/RAND (10 000 µ$) the target is
+        // ⌊5 · 10⁹ / 10 000⌋ = 500 000 units, so the cap binds; at 10 $/RAND it is 500.
+        let usd = UsdSubsidy { usd_micros_per_sealed_block: 5, max_subsidy_per_block: 600, price_max_age_blocks: 10, initial_price_micros: 150_000 };
+        // (price, set at, net, shares, paid). The node's head is 100, so the aggregate lands at
+        // 101: a price set at 91 is fresh there, one set at 90 is stale (age 11).
+        for (price, set_at, net, shares, paid) in [
+            (10_000_000u64, 91u64, false, 25u64, 500 + 25),
+            (10_000, 91, false, 25, 600 + 25),
+            // Stale: the RAND schedule (1000) clamped to the 600 cap (ruling 2026-10-09).
+            (10_000_000, 90, false, 25, 600 + 25),
+            (10_000_000, 91, true, 25, 500),
+            (10_000_000, 91, true, 700, 700),
+        ] {
+            let what = format!("price {price} set at {set_at}, net {net}, shares {shares}");
+            let mut node = moving_node(kp.address(), payout.clone());
+            node.excess.set(shares);
+            node.limits = Some(serde_json::json!({ "fee_rules": {
+                "burn_base": false, "subsidy_net_of_fees": net,
+                "usd_subsidy": { "usd_micros_per_sealed_block": "5", "max_subsidy_per_block": "600", "price_max_age_blocks": 10 },
+            } }));
+            node.rand_price = serde_json::json!({
+                "price_micros_per_rand": price.to_string(), "set_at_height": set_at, "nonce": 1,
+                "fresh": 101 - set_at <= 10, "max_age_blocks": 10,
+            });
+            let tx = aggregate_pass(&node, &kp, 7, |_, _, _| Ok(b"the aggregate proof".to_vec()))
+                .await
+                .unwrap()
+                .expect("one bundle to cover");
+
+            let mut l = Ledger::new(7, [0; 8], Default::default(), &ex);
+            l.set_height(101);
+            l.set_aggregation(Some(AggregationConfig { bond: 100, max_covers: 3, subsidy_base: 1000, halving_blocks: 1, window: 256, admitted_shapes: vec![] }));
+            l.set_fees(FeesConfig { subsidy_net_of_fees: net.then_some(true), usd_subsidy: Some(usd.clone()), ..Default::default() });
+            l.set_rand_price(Some(RandPrice { price_micros_per_rand: price, set_at_height: set_at, nonce: 1 }));
+            l.set_aggregators(
+                [(
+                    kp.address(),
+                    AggregatorEntry { public_key: kp.public_key().clone(), bond: 100, payout: payout.clone(), nonce: 0, unbonding: None },
+                )]
+                .into(),
+            );
+            l.set_unsealed_fees([(node.raw.hash(), (shares, kp.address(), u64::MAX))].into());
+            let cm = l.derived_commitment(&tx.action, &ex).expect("the ledger derives the payout note");
+            let randprotocol_core::Action::Aggregate { envelope, .. } = &tx.action else { panic!("not an aggregate: {tx:?}") };
+            let (_, opened) = randprotocol_zkvm::address::envelope_from_core(envelope)
+                .open_as_receiver(cm, &payee.viewing_key())
+                .unwrap_or_else(|| panic!("{what}: the envelope opens to the ledger's note"));
+            assert_eq!(opened.amount, paid, "{what}");
+        }
+    }
+
+    /// Review 2026-10-09, Important 1, in the daemon: a submission refused for its payout
+    /// (`PayoutMismatch` — here the stand-in moves the schedule index on by one, a halving at
+    /// `halving_blocks: 1`, as a competing aggregate would) and an aggregate the pool evicted are
+    /// each **re-sealed**, not re-proved: one prove, then a second seal at the moved schedule whose
+    /// `payout_total` is what the ledger now pays, signed, and the same proof bytes.
+    #[tokio::test]
+    async fn the_daemon_reseals_after_a_payout_refusal_and_after_an_eviction() {
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payee = SpendKey([7; 8]);
+        let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
+        let cfg = DaemonConfig { watch: false, interval: Duration::ZERO, no_wait: false, max_failures: 1 };
+        let proves = std::cell::Cell::new(0u32);
+        let prove = |_: FriProfile, _: &[Vec<u8>], _: &[u32; 8]| {
+            proves.set(proves.get() + 1);
+            Ok(b"the aggregate proof".to_vec())
+        };
+
+        // Refused once for its payout: re-sealed at the halved schedule.
+        let node = moving_node(kp.address(), payout.clone());
+        node.refuse_payout.set(1);
+        assert!(aggregate_round(&node, &kp, 7, &cfg, false, prove).await.unwrap(), "an aggregate was sealed");
+        assert_eq!(proves.get(), 1, "one prove");
+        let total = |tx: &randprotocol_core::Transaction| match &tx.action {
+            randprotocol_core::Action::Aggregate { payout_total, proof, .. } => (*payout_total, proof.clone()),
+            _ => panic!("not an aggregate"),
+        };
+        let (refused, refused_proof) = total(&node.refused.borrow()[0]);
+        let (sent, sent_proof) = total(&node.sent.borrow()[0]);
+        assert_eq!((refused, sent), (1000 + 25, 500 + 25), "sealed at n = 0, re-sealed at n = 1");
+        assert_eq!(refused_proof, sent_proof, "the proof is reused");
+        assert_eq!(node.sent.borrow().len(), 1);
+
+        // Evicted once from the pool: re-sealed and submitted again, still one prove.
+        proves.set(0);
+        let node = moving_node(kp.address(), payout.clone());
+        node.evict.set(1);
+        let prove = |_: FriProfile, _: &[Vec<u8>], _: &[u32; 8]| {
+            proves.set(proves.get() + 1);
+            Ok(b"the aggregate proof".to_vec())
+        };
+        assert!(aggregate_round(&node, &kp, 7, &cfg, false, prove).await.unwrap());
+        assert_eq!(proves.get(), 1, "one prove");
+        assert_eq!(node.sent.borrow().len(), 2, "the evicted aggregate, then its re-seal");
+
+        // Past MAX_RESEALS refusals the pass fails (a watch loop proves afresh next pass).
+        let node = moving_node(kp.address(), payout);
+        node.refuse_payout.set(MAX_RESEALS + 1);
+        let e = aggregate_round(&node, &kp, 7, &cfg, false, |_, _, _| Ok(b"p".to_vec())).await.unwrap_err();
+        assert!(format!("{e:#}").contains("payout_total is"), "{e:#}");
+        assert_eq!(node.refused.borrow().len() as u32, MAX_RESEALS + 1);
+    }
+
+    /// Re-review 2026-10-09: an aggregate inside a certified-but-uncommitted block is out of the
+    /// pool and `unknown` for a few polls before it commits. The daemon keeps polling and reports
+    /// success without re-sealing — including when the commit shows first as the spent register
+    /// nonce. A genuine eviction (unknown past `UNKNOWN_POLLS`, the nonce unspent) still re-seals.
+    #[tokio::test]
+    async fn the_daemon_waits_out_the_certified_window_and_reseals_only_a_real_eviction() {
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payee = SpendKey([7; 8]);
+        let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
+        let cfg = DaemonConfig { watch: false, interval: Duration::ZERO, no_wait: false, max_failures: 1 };
+
+        // Unknown for 5 polls, then committed: one submission, success. The fifth `unknown` is
+        // answered as the commit lands (the nonce moves), so the pass sees the spent nonce first.
+        let node = moving_node(kp.address(), payout.clone());
+        node.uncommitted_polls.set(5);
+        assert!(aggregate_round(&node, &kp, 7, &cfg, false, |_, _, _| Ok(b"p".to_vec())).await.unwrap());
+        assert_eq!(node.sent.borrow().len(), 1, "no re-seal in the certified window");
+        assert_eq!(node.nonce.get(), 1, "it committed");
+
+        // Unknown for longer than a handful of polls but well under the bound: still one submission.
+        let node = moving_node(kp.address(), payout.clone());
+        node.uncommitted_polls.set(UNKNOWN_POLLS - 1);
+        assert!(aggregate_round(&node, &kp, 7, &cfg, false, |_, _, _| Ok(b"p".to_vec())).await.unwrap());
+        assert_eq!(node.sent.borrow().len(), 1);
+
+        // A real eviction: unknown for good, the nonce unspent — re-sealed after the bound.
+        let node = moving_node(kp.address(), payout);
+        node.evict.set(1);
+        assert!(aggregate_round(&node, &kp, 7, &cfg, false, |_, _, _| Ok(b"p".to_vec())).await.unwrap());
+        assert_eq!(node.sent.borrow().len(), 2, "the evicted aggregate, then its re-seal");
+        assert!(node.status_polls.get() >= UNKNOWN_POLLS, "only after the bound");
     }
 
     /// Issue #132: the pass reads the fee rules through the node's cached limits
@@ -5168,7 +5816,7 @@ mod tests {
         let payee = SpendKey([7; 8]);
         let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
         let ex = ZkExecutor::new(FriProfile::Test);
-        let rules = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true), proposer_share_bps: None, prove_base: None };
+        let rules = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true), proposer_share_bps: None, prove_base: None, usd_subsidy: None };
         let deploy = randprotocol_core::Action::Deploy { base_pc: 0, words: vec![0x13; 9], public: vec![] };
         let floor = randprotocol_core::gas::fee_floor(&deploy);
         assert!(floor > randprotocol_core::gas::BUNDLE_BASE, "a Deploy's floor is over the base");
@@ -5243,6 +5891,7 @@ mod tests {
                 burn_floor: None,
                 proposer_share_bps: Some(4000),
                 prove_base: Some(prove_base),
+                usd_subsidy: None,
             };
             let mut node = moving_node(kp.address(), payout.clone());
             node.raw.bundle.as_mut().unwrap().fee = BUNDLE_BASE + prove_base + tip;

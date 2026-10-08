@@ -24,6 +24,7 @@ rand-node <COMMAND>
   register  Print this node's Registration, for the wallet that bonds it in
   unbond    Move bonded stake into unbonding
   withdraw  Pay released stake and rewards into a note at the payout address
+  price     Read, sign and submit the validator set's RAND/USD price vote (fees.usd_subsidy)
 ```
 
 There is no `balance` and no `transfer` subcommand: this chain has no accounts to query and a
@@ -241,6 +242,23 @@ registration `rand-node register` printed holds it, so either can be handed to `
 the admission commits, the bond is as before (`rand bond … --registration`), and it consumes the
 admission. `rand_getAdmitted` lists what is admitted and waiting.
 
+### `rand-node price status` / `sign` / `submit`
+
+The RAND price vote (genesis `fees.usd_subsidy`; `docs/fees.md` §1.3, `docs/staking.md` "The RAND
+price vote"): the RAND/USD price the dollar-indexed sealing subsidy converts at is set by the
+validator set's vote, not an oracle — `admit`'s shape, with a nonce.
+
+| command | arguments | meaning |
+|---|---|---|
+| `price status` | `--rpc` | the voted price (`rand_getRandPrice`) in dollars and micro-dollars, the height that set it, its nonce, whether it is fresh for the next block, and the nonce the next update must carry |
+| `price sign` | `--price <dollars, e.g. 0.15>`, `--nonce <N>`, `--key <validator key>`, `--genesis-hash <hex>` | print this validator's vote as one line, `<voter key hex>:<signature hex>`, over `(genesis hash, price in µ$, nonce)` — good on exactly one chain, for exactly that price and update. Save it as a vote file. Offline: reads no node. At most six decimals; 0 is refused |
+| `price submit` | `--price …`, `--nonce <N>`, `--signature <line or vote file>` (repeatable), `--rpc`, `--no-wait` | read the votes (each argument a line, or a file of lines), check `--nonce` is the node's next and every vote against the node's genesis hash, this price and nonce (another genesis, price or nonce, or a voter twice, is named here), order them and submit the fee-less `SetRandPrice`; the chain then needs the voters' weight to be a quorum and the price within a factor of two of the current one |
+
+A round: the operator announces `(price, nonce)` (`price status` prints the next nonce), each
+validator runs `price sign` and hands back its vote file, and whoever collects them runs `price
+submit --signature v1.txt --signature v2.txt …`. A vote for update `n` never counts for `n + 1`,
+even at the same price, so a stale round is simply re-signed.
+
 ### `rand-node vesting status` / `claim` / `revoke` / `bond` / `unbond`
 
 Genesis vesting (`docs/vesting.md`) — a timelocked allocation's holder and revoker side, on a chain
@@ -313,7 +331,17 @@ One pass polls `rand_getUnsealed`, fetches up to `max_covers` raw bundles with
 tier 18, production at 20 since the phase-2 row cuts — minutes and tens to hundreds of GB on
 this tree, `docs/node-hardware.md` §4 — so run it on the proof batch machine), seals the payment note (subsidy at the current schedule index plus the covered
 bundles' proving shares) to the register's payout address, signs and submits. `rand_status`'s
-`aggregation` section carries the chain parameters the payment is computed from.
+`aggregation` section carries the chain parameters the payment is computed from. Under the
+genesis `fees.usd_subsidy` the schedule is read from the node, not derived here: while
+`rand_getRandPrice` says the voted price is `fresh` (for the next block) the pass seals the dollar
+target converted at it and capped (`fee_rules.usd_subsidy`), otherwise the RAND schedule clamped
+to the same cap — the ledger's own `aggregation::schedule_subsidy`. The sealed amount is signed as
+the aggregate's `payout_total`; when the chain refuses it (`PayoutMismatch`: the schedule moved —
+a price vote, a stale price, a halving — between the seal and the block) or the pool evicts the
+aggregate, the pass **re-seals the same proof** at the current schedule and resubmits, up to four
+times, without proving again. An eviction is an `unknown` status for 200 polls (a minute) with the
+aggregator's committed nonce unspent; a shorter `unknown` is an aggregate in a certified block not
+yet committed, and the nonce moving past the signed one counts as its commit.
 
 In `--watch` mode a failed pass does not stop the daemon: it is logged at `warn` with its error
 chain and the next pass runs after the interval — an RPC failure, a register nonce that moved

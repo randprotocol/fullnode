@@ -98,6 +98,16 @@ What the subsidy is **not**, and why the design differs from proof-of-work:
 - **Security is not what the subsidy buys.** Consensus security comes from bonded stake; the
   subsidy buys throughput and bootstraps the prover set. It can be small and can decay to zero.
 
+**A dollar-indexed schedule (genesis `fees.usd_subsidy`, `docs/fees.md` §1.3).** A RAND amount buys
+a different number of GPU-hours at every price; the fee study's provers stayed for dollars. Under
+the sub-section the schedule of a sealed block is `min(⌊usd_micros_per_sealed_block · 10⁹ /
+price⌋, max_subsidy_per_block)` while the validator set's voted RAND/USD price is fresh (at most
+`price_max_age_blocks` old at the sealing block), and `subsidy(n)` otherwise —
+`aggregation::schedule_subsidy`, the one function admission, apply, `rand_getEmission` and the
+daemon share. The price is a vote (`SetRandPrice`, `docs/staking.md` "The RAND price vote"), not an
+oracle; the cap is genesis, not votable. Everything below — how the payment lands, the netting,
+supply accounting — reads "the schedule" and is unchanged.
+
 ### 3.3 How the payment lands
 
 The subsidy and the proving share are paid as **one deposit note** to the aggregator's shielded
@@ -109,7 +119,8 @@ other.
 Under the genesis `fees.subsidy_net_of_fees` (`docs/fees.md` §1.3) the shares pay the schedule
 first (spec §5.4's derivation, `Ledger::aggregate_payment`): the note carries
 `max(subsidy(n), shares)`, and only `subsidy(n) − shares` — nothing once the shares reach the
-schedule — is minted. `subsidised` and `rand_getAggregate`'s `subsidy` carry that minted part;
+schedule — is minted. Under `fees.usd_subsidy` read the dollar schedule for `subsidy(n)` wherever
+it appears here (§3.2): the netting is the same function over whichever schedule applies. `subsidised` and `rand_getAggregate`'s `subsidy` carry that minted part;
 `sealed_blocks` advances by one either way. Admission and apply still derive one note from one
 state: the rule lives in that one function.
 
@@ -126,6 +137,34 @@ so one read per daemon, never one per pass that a transient RPC failure could ab
 `aggregation::minted_subsidy(subsidy(n), shares, &fees) + shares`, the ledger's own function
 (pinned by `the_aggregate_pass_seals_the_ledgers_payout_under_subsidy_net_of_fees`). A third-party
 aggregator must do the same.
+
+**And the dollar schedule.** Under `fees.usd_subsidy` the daemon reads the voted price off
+`rand_getRandPrice` after the prove, beside `rand_status`, and seals at
+`aggregation::schedule_subsidy` over `fee_rules.usd_subsidy` and that price when the node reports
+it `fresh` — judged for the next block, the height the note's `time` names and the earliest the
+aggregate lands — and at `subsidy(n)` clamped to `max_subsidy_per_block` when it does not (pinned
+by `the_aggregate_pass_seals_the_ledgers_payout_under_a_voted_price`).
+
+**The payout is signed, and a moved schedule is refused, not underpaid** (review 2026-10-09).
+`Action::Aggregate` carries `payout_total`, the amount the envelope was sealed for, inside the
+aggregator's signature (`aggregate_signing_hash`, domain `rand-aggregate-4`; genesis-bound
+`rand-aggregate-5`). `validate_aggregate` — admission and apply alike — refuses an aggregate whose
+`payout_total` is not `aggregate_payment(..).total` on its state, `AggregationError::PayoutMismatch
+{ expected, got }`: a state verdict, never in the admission cache. So the schedule moving between
+sealing and inclusion — a `SetRandPrice` (in any earlier block, or in the aggregate's own: a
+proposer applies ordinary transactions before aggregates), the price going stale, `sealed_blocks`
+crossing a halving (the case that predates the dollar subsidy) — refuses the aggregate; nothing
+leaves the bucket and nothing is minted. The pool re-asks at every tip (`check_aggregate_payout`)
+and evicts a pooled aggregate whose payout moved. `rand-node aggregate` re-seals — the proof binds
+`(chain, aggregator, nonce)` and the covers, never the payout, so it is reused — and resubmits, up
+to four times a pass, after a `PayoutMismatch` refusal or an eviction. An `unknown` status alone
+is not an eviction: the node prunes its pool against the tip, the certified but uncommitted block,
+so an aggregate inside such a block answers `unknown` until the three-chain rule commits it — the
+daemon keeps polling, takes the committed register nonce moving past the one it signed as the
+commit, and re-seals only after 200 `unknown` polls (a minute) with that nonce unspent. Before
+this an aggregate landing across such an edge was paid the ledger's amount into a note its envelope
+could not open: subsidy and covered shares lost. (`payout_total` moved the `Aggregate` encoding and
+every aggregate txid; no chain has carried one.)
 
 The shares are always the node's bucket entries, `rand_getUnsealed`'s `excess` — never recomputed
 from a raw transaction. Under `fees.proposer_share_bps` and `fees.prove_base` an entry already
@@ -380,6 +419,9 @@ chain never depends on a GPU being online.
 ## 5. Open questions for the spec
 
 - The subsidy amount, the halving interval, and whether issuance has a hard cap.
+  *Built, genesis-gated:* `fees.usd_subsidy` indexes the amount to a dollar target at a voted
+  RAND/USD price, bounded per block by a genesis cap (`docs/fees.md` §1.3); the halving schedule
+  remains the fallback.
 - The proving share: a fixed fraction of the bundle fee, or the whole fee above the floor.
   *Built, genesis-gated:* `fees.proposer_share_bps` buckets a fraction of the base beside the
   whole excess, and `fees.prove_base` floors it (`docs/fees.md` §1.3; the proposal's values are

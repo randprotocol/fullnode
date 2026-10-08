@@ -1150,7 +1150,7 @@ other's proofs and signatures; that chain ids 14–19 never repeated was the onl
 `binding_domain: 1` puts the genesis hash first in every one of those preimages under a fresh tag
 (`rand-tx-bind-2`, `rand-call-bind-2`, `rand-mint-3`, `rand-unbond-2`, `rand-withdraw-2`,
 `rand-rpl-mint-2`, `rand-rpl-authority-2`, `rand-aggregator-{register,unbond,withdraw}-2`,
-`rand-aggregate-3`, `rand-aggregate-bind-2`, and the bridge's `…-2` fixed layouts with the 32-byte
+`rand-aggregate-5` (it was `rand-aggregate-3` until the aggregate signed its `payout_total`, 2026-10-09; the chain-id form is `rand-aggregate-4`), `rand-aggregate-bind-2`, and the bridge's `…-2` fixed layouts with the 32-byte
 hash between the tag and the chain id — `crates/randprotocol-core/src/types/binding.rs`,
 `bridge/gov.rs`). The binding is a *public input* of the proofs — the wallet, a prover service
 and the ledger compute it and hand it to the circuit — so nothing in any guest or verifier key
@@ -1541,6 +1541,34 @@ section, which waits on the production-proof measurement (`docs/aggregation.md`,
 aggregation"). After launch: `fee_rules` serves both, `rand_estimateFee {"kind":"bundle"}` answers
 `1600000`, a proposer's `rewards` grow by 400 000 per included transfer, and `invariant_holds`
 stays `true` through covers and sweeps.
+
+## The next cut: dollar-indexed prover pay (`fees.usd_subsidy`; unreleased)
+
+**What it is.** An optional sub-section of the same `fees` section (`docs/fees.md` §1.3), only on
+a chain with an `aggregation` section (`rand-node init` refuses it without one:
+`UsdSubsidyWithoutAggregation`; a zero `usd_micros_per_sealed_block`, `max_subsidy_per_block`,
+`price_max_age_blocks` or `initial_price_micros` — all four required — is `UsdSubsidyZero` naming
+the field). While the
+validator set's voted RAND/USD price is fresh the sealing subsidy's schedule is the dollar target
+converted at it, capped at `max_subsidy_per_block`; otherwise `subsidy(n)`. The price is set by
+`SetRandPrice` (wire tag 44 — every node must be on a build that decodes it before the chain's
+first vote), quorum-checked like `AdmitValidator`, at most a factor of two per update. Hashed only
+when set, after `prove_base`'s bytes, so it ships with a chain cut; the state root gains the
+`rand-state-price-1` wrapper on such a chain only. The same build changes the `Aggregate` wire
+encoding on every chain (`payout_total`, signed under `rand-aggregate-4`): no chain has carried an
+aggregate, but every node and aggregate daemon on a chain cut with `aggregation` must be on it. Served as `rand_getLimits.fee_rules.usd_subsidy`
+and `rand_getRandPrice`; the operators' tooling is `rand-node price status|sign|submit`.
+
+**Recommended values, deferred.** For the fee study's $345 a day at 1.2 s blocks:
+`"usd_subsidy": { "usd_micros_per_sealed_block": 4791, "max_subsidy_per_block": 300000000,
+"price_max_age_blocks": 72000, "initial_price_micros": <the cut-day price> }` — 0.03194 RAND a
+block at $0.15, the 0.3 RAND cap binding below $0.016, a day's grace before a lapsed vote reverts to
+the RAND schedule. Like the split, once aggregation is admitted on the chain being cut: no cut
+should carry it before the `aggregation` section, which waits on the production-proof measurement
+(`docs/aggregation.md`, "Before enabling aggregation"). After launch: `rand_getRandPrice` answers
+the genesis price at height 0, nonce 0; `rand_getEmission.subsidy.current` is `"31940000"` at that
+price; a first `rand-node price submit … --nonce 1` signed by more than two thirds of the weight
+moves it, and `invariant_holds` stays `true` through the aggregates that follow.
 
 ## The next cut: audit v6's staking fields (STAKE-2)
 

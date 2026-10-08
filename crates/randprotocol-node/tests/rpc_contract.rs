@@ -191,6 +191,7 @@ async fn start() -> common::TestNode {
             burn_floor: Some(true),
             proposer_share_bps: None,
             prove_base: None,
+            usd_subsidy: None,
         });
         g.bridge = Some(common::bridge::bridge_config_for([0xaa; 32], &[TOKEN_CHAIN]));
         g.tokens = Some(TokensConfig {
@@ -398,6 +399,9 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         // Multisig accounts: without a `multisig` section `{"enabled": false}`, `rand_getVesting`'s
         // and `rand_getProgramVault`'s shape (no consumer yet; the CLI's `multisig status` reads it).
         exactly("rand_getMultisig", json!([unknown]), "rand-node `multisig status`", json!({ "enabled": false })),
+        // The voted RAND price on a chain without `fees.usd_subsidy`: `null`, which the aggregate
+        // daemon reads as "the RAND schedule".
+        exactly("rand_getRandPrice", json!([]), "rand-node `aggregate` (`aggregate_pass`), `price status`", Value::Null),
         exactly(
             "rand_getProgramCells",
             json!([unknown, { "after": null, "limit": 10 }]),
@@ -422,7 +426,7 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
 
     // The exact values the fee rows above only type-check: this chain's two live rules.
     let limits = call(addr, "rand_getLimits", json!([])).await;
-    assert_eq!(limits["result"]["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true, "proposer_share_bps": null, "prove_base": null }));
+    assert_eq!(limits["result"]["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true, "proposer_share_bps": null, "prove_base": null, "usd_subsidy": null }));
 
     node.shutdown().await;
 }
@@ -510,6 +514,7 @@ async fn fee_rules_under_all_three_flags() {
             burn_floor: Some(true),
             proposer_share_bps: None,
             prove_base: None,
+            usd_subsidy: None,
         });
     })
     .await;
@@ -526,7 +531,7 @@ async fn fee_rules_under_all_three_flags() {
     check(addr, &rows).await;
     assert_eq!(
         call(addr, "rand_getLimits", json!([])).await["result"]["fee_rules"],
-        json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true, "proposer_share_bps": null, "prove_base": null })
+        json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true, "proposer_share_bps": null, "prove_base": null, "usd_subsidy": null })
     );
     assert_eq!(call(addr, "rand_getSupply", json!([])).await["result"]["base_fees_burned"], json!("0"));
 }
@@ -567,6 +572,7 @@ async fn fee_rules_serve_prove_base_as_a_decimal_string() {
         g.fees = Some(randprotocol_core::ledger::fees::FeesConfig {
             proposer_share_bps: Some(4000),
             prove_base: Some(600_000),
+            usd_subsidy: None,
             ..Default::default()
         });
     })
@@ -579,6 +585,79 @@ async fn fee_rules_serve_prove_base_as_a_decimal_string() {
     assert_eq!(rules["prove_base"], json!("600000"), "an amount: a decimal string");
     assert_eq!(rules["proposer_share_bps"], json!(4000), "a share: a number");
     assert_eq!(call(addr, "rand_estimateFee", json!([{"kind": "bundle"}])).await["result"], json!("1600000"));
+}
+
+/// The dollar-indexed subsidy (`docs/fees.md` §1.3) on the wire: `fee_rules.usd_subsidy`'s three
+/// numbers (the two amounts decimal strings, the age a number) and `rand_getRandPrice`'s shape,
+/// read by the aggregate daemon (`aggregate_pass`) and `rand-node price`; `rand_getEmission`'s
+/// `current` is the dollar target at the genesis price, `⌊4 791 · 10⁹ / 150 000⌋`. Served without
+/// a node behind it, for the reason `fee_rules_under_all_three_flags` gives (an aggregating
+/// genesis).
+#[tokio::test]
+async fn usd_subsidy_rules_and_the_rand_price_on_the_wire() {
+    use randprotocol_core::confidential::{ConfidentialExecutor, StubExecutor};
+    use randprotocol_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
+    use randprotocol_core::types::{DeclaredShape, FriProfile};
+
+    let (addr, _served) = common::serve_genesis(|g| {
+        let shape = DeclaredShape {
+            profile: FriProfile::Test,
+            tier: randprotocol_core::types::BUNDLE_PROOF_TIER,
+            program_log_height: 12,
+            input_log_height: 10,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: randprotocol_core::types::BUNDLE_PUBLIC_LOG_HEIGHT,
+            mem_log_height: 16,
+        };
+        g.aggregation = Some(AggregationConfig {
+            bond: 100 * randprotocol_core::UNITS_PER_RAND,
+            max_covers: 3,
+            subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![AdmittedShape {
+                shape,
+                hc: randprotocol_core::Hash(randprotocol_core::notes::word8_to_bytes(&randprotocol_zkvm::executor::ZkExecutor::hc_bundle())),
+                aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap(),
+            }],
+        });
+        g.fees = Some(randprotocol_core::ledger::fees::FeesConfig {
+            usd_subsidy: Some(randprotocol_core::ledger::fees::UsdSubsidy {
+                usd_micros_per_sealed_block: 4_791,
+                max_subsidy_per_block: 300_000_000,
+                price_max_age_blocks: 72_000,
+                initial_price_micros: 150_000,
+            }),
+            ..Default::default()
+        });
+    })
+    .await;
+    let rows = [
+        row("rand_getLimits", json!([]), "randprotocol-client src/lib.rs `fee_rules_of` (`usd_subsidy_of`)", &[
+            ("fee_rules.usd_subsidy.usd_micros_per_sealed_block", Dec),
+            ("fee_rules.usd_subsidy.max_subsidy_per_block", Dec),
+            ("fee_rules.usd_subsidy.price_max_age_blocks", Int),
+        ]),
+        row("rand_getRandPrice", json!([]), "rand-node `aggregate` (`aggregate_pass`), `price status`", &[
+            ("price_micros_per_rand", Dec),
+            ("set_at_height", Int),
+            ("nonce", Int),
+            ("fresh", Bool),
+            ("max_age_blocks", Int),
+        ]),
+        row("rand_getEmission", json!([]), "randscan emission panel", &[("subsidy.current", Dec)]),
+    ];
+    check(addr, &rows).await;
+    assert_eq!(
+        call(addr, "rand_getRandPrice", json!([])).await["result"],
+        json!({ "price_micros_per_rand": "150000", "set_at_height": 0, "nonce": 0, "fresh": true, "max_age_blocks": 72_000 })
+    );
+    assert_eq!(
+        call(addr, "rand_getLimits", json!([])).await["result"]["fee_rules"]["usd_subsidy"],
+        json!({ "usd_micros_per_sealed_block": "4791", "max_subsidy_per_block": "300000000", "price_max_age_blocks": 72_000 })
+    );
+    assert_eq!(call(addr, "rand_getEmission", json!([])).await["result"]["subsidy"]["current"], json!("31940000"));
 }
 
 /// randprotocol.org's sale relay (server/sale/src/rpc.rs `RPC_ALLOWED`) forwards exactly the

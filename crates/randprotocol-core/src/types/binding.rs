@@ -222,8 +222,8 @@ impl BindingDomain {
         }
     }
 
-    /// [`actions::aggregate_signing_hash`] (`rand-aggregate-2`); genesis-bound under
-    /// `rand-aggregate-3`.
+    /// [`actions::aggregate_signing_hash`] (`rand-aggregate-4`, with `payout_total`);
+    /// genesis-bound under `rand-aggregate-5` (was `rand-aggregate-3` before `payout_total`).
     #[allow(clippy::too_many_arguments)]
     pub fn aggregate_signing_hash(
         &self,
@@ -234,14 +234,17 @@ impl BindingDomain {
         covers: &[Hash],
         proof_hash: &Hash,
         envelope_digest: &Hash,
+        payout_total: u64,
     ) -> Hash {
         match self {
             BindingDomain::ChainId => {
-                actions::aggregate_signing_hash(chain_id, nonce, time, r, covers, proof_hash, envelope_digest)
+                actions::aggregate_signing_hash(chain_id, nonce, time, r, covers, proof_hash, envelope_digest, payout_total)
             }
-            BindingDomain::Genesis(g) => {
-                Self::bound(b"rand-aggregate-3", g, &(chain_id, nonce, time, r, covers, proof_hash, envelope_digest))
-            }
+            BindingDomain::Genesis(g) => Self::bound(
+                b"rand-aggregate-5",
+                g,
+                &(chain_id, nonce, time, r, covers, proof_hash, envelope_digest, payout_total),
+            ),
         }
     }
 }
@@ -306,8 +309,10 @@ mod tests {
             (d.aggregator_unbond_message(13, &a, 1), "60cc13845a51baa6befe119044e2bb13eee608a75e6c2762f392a8d0d9c2ed90"),
             (d.aggregator_withdraw_message(13, &a, 1, 9, &[3; 8], &env()), "258f3dfcad893de8c234bb9b4cd9d38b6801b4eabcda2155a4b1d864bde66a18"),
             (
-                d.aggregate_signing_hash(13, 1, 9, &[3; 8], &[Hash([7; 32])], &Hash([8; 32]), &Hash([9; 32])),
-                "9856f97b61bfabad548524c8a8c3cd55b3aea4b66588ae5cb6818ab74058b112",
+                // Moved 2026-10-09 with `payout_total` (`rand-aggregate-2` → `-4`); was
+                // `9856f97b61bfabad548524c8a8c3cd55b3aea4b66588ae5cb6818ab74058b112`.
+                d.aggregate_signing_hash(13, 1, 9, &[3; 8], &[Hash([7; 32])], &Hash([8; 32]), &Hash([9; 32]), 1_000),
+                "6b7b7645f0db32b29351ed37f81f3657c4a2a9f33e8742bf003945829b84b7c7",
             ),
         ];
         for (i, (got, want)) in pins.iter().enumerate() {
@@ -341,7 +346,7 @@ mod tests {
                 d.aggregator_register_message(13, &a, &addr).to_hex(),
                 d.aggregator_unbond_message(13, &a, 1).to_hex(),
                 d.aggregator_withdraw_message(13, &a, 1, 9, &[3; 8], &env()).to_hex(),
-                d.aggregate_signing_hash(13, 1, 9, &[3; 8], &[Hash([7; 32])], &Hash([8; 32]), &Hash([9; 32])).to_hex(),
+                d.aggregate_signing_hash(13, 1, 9, &[3; 8], &[Hash([7; 32])], &Hash([8; 32]), &Hash([9; 32]), 1_000).to_hex(),
                 words(d.aggregate_binding(13, &a, 1)),
             ]
         };

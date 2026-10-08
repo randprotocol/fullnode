@@ -250,6 +250,15 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | S::BadEvidenceSignature(_)
         );
     }
+    // The RAND price vote's byte-verdicts (`fees.usd_subsidy`), `Staking`'s three for the same
+    // vote shape: a zero price, votes out of strict voter order, and a vote that does not verify
+    // under the key the action lists beside it over the genesis hash, price and nonce the action
+    // itself names. The nonce, the band against the current price, membership and the quorum
+    // move with the chain and stay out.
+    if let TxError::Price(p) = e {
+        use randprotocol_core::ledger::rand_price::PriceError as P;
+        return matches!(p, P::ZeroPrice | P::VoteOrder | P::BadVote(_));
+    }
     // The aggregation register's verdicts, split like `Staking`'s: the byte-verdicts (and the
     // ones against genesis-pinned constants) are cacheable, the register's state is not. A
     // signature is over the transaction's own fields against the entry's key — and an address
@@ -258,7 +267,9 @@ pub fn is_permanent(e: &TxError) -> bool {
     // bundles against the admitted shapes, which are genesis constants. `CoverNotABundle` is a
     // statement about a *committed* — finalised, immutable — transaction's shape, and
     // `CoverSealed` one about committed history, which only ever accumulates. Everything
-    // else (`UnknownAggregator`, `Unbonding`, `BadNonce`, the payout's `CommitmentExists`,
+    // else (`UnknownAggregator`, `Unbonding`, `BadNonce`, `PayoutMismatch` — the schedule moves
+    // with a price vote, staleness and halvings, and a re-sealed aggregate is new bytes anyway —
+    // the payout's `CommitmentExists`,
     // `UnknownCover`, `CoverOutsideWindow`, `CoverStoreCorrupt`, the register actions' own
     // verdicts) moves with this node's state and stays out.
     if let TxError::Aggregation(a) = e {

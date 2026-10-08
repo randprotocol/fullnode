@@ -1080,28 +1080,75 @@ fn check_admit(
     }
     let address = candidate.address();
     check_admission_open(ledger, &address)?;
+    let message = admit_validator_message(&ledger.signing_domain().genesis, &address);
+    check_votes(ledger, &message, signatures).map_err(|fault| {
+        TxError::from(match fault {
+            VoteFault::Count { got, max } => StakingError::AdmissionVoteCount { got, max },
+            VoteFault::Order => StakingError::AdmissionVoteOrder,
+            VoteFault::NotInSet(voter) => StakingError::AdmissionVoterNotInSet(voter),
+            VoteFault::NoQuorum { weight, total } => StakingError::AdmissionNoQuorum { weight, total },
+            VoteFault::BadSignature(voter) => StakingError::BadAdmissionVote(voter),
+        })
+    })
+}
+
+/// Why a list of validator votes does not carry the set ([`check_votes`]). Each governance action
+/// that is a vote of the set (`AdmitValidator`, `SetRandPrice`) maps it onto its own error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VoteFault {
+    /// No vote, or more votes than the voting set has members.
+    Count { got: usize, max: usize },
+    /// Not in strictly ascending voter order (which is also what a voter listed twice is).
+    Order,
+    /// A voter that is not in the voting set.
+    NotInSet(Address),
+    /// The voters' weight is not strictly more than two thirds of the set's.
+    NoQuorum { weight: u128, total: u128 },
+    /// A signature that does not verify over the message under its own key.
+    BadSignature(Address),
+}
+
+/// The validator set's vote over `message`, cheap before expensive (audit v6, STAKE-2's rule, the
+/// one every vote of the set is judged by): the count against the voting set ([`voting_set`]),
+/// strict ascending voter order, membership, the quorum weight — strictly more than two thirds,
+/// `ValidatorSet::has_quorum`, the arithmetic of a quorum certificate — and only then one
+/// Dilithium2 verification per vote. Every listed vote must count: one voter set has exactly one
+/// admissible encoding.
+pub fn check_votes(
+    ledger: &Ledger,
+    message: &crate::crypto::Hash,
+    signatures: &[(crate::crypto::PublicKey, Signature)],
+) -> Result<(), VoteFault> {
+    check_vote_weight(ledger, signatures)?;
+    for (key, signature) in signatures {
+        if !key.verify(message.as_bytes(), signature) {
+            return Err(VoteFault::BadSignature(key.address()));
+        }
+    }
+    Ok(())
+}
+
+/// [`check_votes`] without the signatures: the count, the order, membership of the current
+/// voting set and the quorum weight — everything about a vote list that moves with the register.
+/// What the mempool re-asks of a pooled vote at every tip, so one whose voters lost the quorum
+/// (an unbond, an epoch boundary) leaves rather than holding its slot.
+pub fn check_vote_weight(ledger: &Ledger, signatures: &[(crate::crypto::PublicKey, Signature)]) -> Result<(), VoteFault> {
     let set = voting_set(ledger);
     if signatures.is_empty() || signatures.len() > set.len() {
-        return Err(StakingError::AdmissionVoteCount { got: signatures.len(), max: set.len() }.into());
+        return Err(VoteFault::Count { got: signatures.len(), max: set.len() });
     }
     let voters: Vec<Address> = signatures.iter().map(|(key, _)| key.address()).collect();
     if voters.windows(2).any(|w| w[0] >= w[1]) {
-        return Err(StakingError::AdmissionVoteOrder.into());
+        return Err(VoteFault::Order);
     }
     let mut weight = 0u128;
     for voter in &voters {
-        let v = set.get(voter).ok_or(StakingError::AdmissionVoterNotInSet(*voter))?;
+        let v = set.get(voter).ok_or(VoteFault::NotInSet(*voter))?;
         weight = weight.saturating_add(v.stake);
     }
     // Strictly more than two thirds, by the arithmetic a quorum certificate is judged with.
     if !set.has_quorum(weight) {
-        return Err(StakingError::AdmissionNoQuorum { weight, total: set.total_stake() }.into());
-    }
-    let message = admit_validator_message(&ledger.signing_domain().genesis, &address);
-    for ((key, signature), voter) in signatures.iter().zip(&voters) {
-        if !key.verify(message.as_bytes(), signature) {
-            return Err(StakingError::BadAdmissionVote(*voter).into());
-        }
+        return Err(VoteFault::NoQuorum { weight, total: set.total_stake() });
     }
     Ok(())
 }
@@ -1881,7 +1928,7 @@ mod tests {
         let mut e = entry(&v, MIN_STAKE, payout(1));
         e.pending = vec![(0, 100 * BASE)];
         let mut l = ledger(vec![e, entry(&p, MIN_STAKE, payout(2))]);
-        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None });
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None, usd_subsidy: None });
         l.set_genesis_supply(0, 2 * MIN_STAKE + 100 * BASE);
         let before = l.clone();
 
