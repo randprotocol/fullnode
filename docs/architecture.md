@@ -398,7 +398,8 @@ are missing the proposal is parked — two slots by view, the band from the repl
 past the highest parked view, a park never displaced by its own child — and the missing hashes
 are fetched in batches of 512 from the leader's bound peer, then the forwarder, then peers at or
 above our height, then any, at most 8 distinct peers (a `Busy` answer not counted). A proposal
-the pre-screen `Ignore`s is still rebuilt and handed to HotStuff when every body is held. Pruned (marker-form)
+the pre-screen `Ignore`s is dropped, never rebuilt: its signature is checked only after the
+`Ignore` rules, so a rebuild would be work a keyless peer could order. Pruned (marker-form)
 bodies share the real transaction's id and are never cached, rebuilt from or accepted from a
 fetch. Serving a `Transactions` request is answered on the consensus loop from the pool and the
 cache only, cut at `max_block_bytes + max_aggregate_bytes`.

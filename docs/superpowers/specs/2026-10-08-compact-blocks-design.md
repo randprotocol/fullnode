@@ -43,18 +43,27 @@ round 1 park band (`hs.view()` and `hs.view() + 1`, one park):
   same key and a different hash — a leader equivocating — is reported `Ignore` and neither
   rebuilt nor parked, so a leader cannot make every node rebuild and hash many headers for its
   view. The same hash again proceeds (a redelivery may now rebuild). The record is pruned under
-  the committed view and capped at 1 024 entries, oldest view first. An `Ignore`d header is
-  checked against the record but never recorded: its signature was not verified.
+  the committed view and capped at 1 024 entries, oldest view first. Only a header the
+  pre-screen `Accept`s is checked against the record or recorded; an `Ignore`d one was dropped
+  before its signature was verified.
 - **Two park slots, keyed by view** (I2). The band is `hs.view()` to `max(hs.view(), highest
   parked view) + 1`, so a replica one view behind can park its successor's block beside the one
   it is still fetching. A view already parked keeps its park; with both slots taken, a new view
   in the band replaces the lowest-view park unless that park is the new block's parent. Every
   slot is held by a view's scheduled leader, so a junk park for the next view leaves the other
-  slot to the honest current view. `highest_proposal_seen` counts every pre-screened compact
-  proposal, parked or not.
-- **An `Ignore`d compact proposal is handed on** (I3), as the full path hands an `Ignore`d
-  proposal to the replica: rebuilt and handled when every body is held, never parked or fetched
-  for. The equivocation `Ignore` above is the exception: not handed on.
+  slot to the honest current view. `highest_proposal_seen` counts every compact proposal the
+  pre-screen `Accept`s, parked or not, and no `Ignore`d one (its signature was never verified).
+- **An `Ignore`d compact proposal is dropped** (I3, reverted after the fix-wave re-review). The
+  final review ruled that one be rebuilt and handed on when every body is held; that was wrong.
+  `precheck_compact` reaches every `Ignore` verdict (at or under the committed height, a view
+  too far ahead, a proposer leading no known set) before the signature check, so the hand-on
+  let any connected peer, holding no key, make a node clone and hash up to a block's bodies on
+  the consensus loop for each distinct ~64 KB header naming bodies it holds. An `Ignore` is
+  reported and the delivery dropped — no rebuild, park or fetch — as before the ruling. The
+  replica loses nothing in the first two cases, which it refuses anyway (`Stale`,
+  `ViewTooFarAhead`); the third is the one case a hand-on could help, but its signature cannot
+  be checked against a set this replica lacks, so handing it on would re-open the
+  amplification.
 - **The serve bound** (I4). A `Transactions` answer stops at the first body that would take it
   past `max_block_bytes + max_aggregate_bytes` of the tip ledger (§3.2); the cut answer is a
   prefix, and the asker takes the rest elsewhere.

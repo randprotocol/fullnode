@@ -3592,11 +3592,17 @@ impl Node {
     /// is decided before the rebuild, so a proposal that would not be parked is rebuilt only when
     /// every body is already here.
     ///
-    /// A proposal the pre-screen `Ignore`s is not forwarded, but it is handed on as the full
-    /// path hands an `Ignore`d proposal on (final review I3; the replica is the authority, and a
-    /// stale-looking proposal may be the one it needs): rebuilt and handled when every body is
-    /// held, never parked or fetched for. The one exception is a second header from a view's
-    /// leader (final review C1), which is neither.
+    /// A proposal the pre-screen `Ignore`s is reported `Ignore` and dropped: not rebuilt, not
+    /// parked, not fetched for, not counted in `highest_proposal_seen` (spec 2026-10-08 §0, the
+    /// final review's I3 ruling reverted). The pre-screen reaches every `Ignore` verdict — at or
+    /// under the committed height, a view too far ahead, a proposer that leads the view in no
+    /// set this replica knows — before it checks the signature, so a rebuild on `Ignore` would
+    /// let any connected peer, holding no key, make this node clone and hash up to a block's
+    /// bodies on the consensus loop for each distinct ~64 KB header naming bodies it holds. The
+    /// replica gains nothing in the first two cases, which it refuses anyway (`Stale`,
+    /// `ViewTooFarAhead`); the third is the one where a hand-on could help, but its signature
+    /// cannot be checked against a set this replica lacks, so handing it on would re-open the
+    /// amplification. Such a block reaches the replica by sync once the set is known.
     async fn on_compact_proposal(&mut self, c: CompactBlock, id: GossipId) -> Result<()> {
         use admission::Acceptance;
         use randprotocol_core::consensus::GossipPrecheck;
@@ -3615,36 +3621,36 @@ impl Node {
             return Ok(());
         }
         let verdict = self.hs.precheck_compact(&c.header, &c.signature, &c.tx_hashes);
-        // Final review C1: one header per (view, proposer). A different header from the same
-        // leader for the same view, after one passed the pre-screen, is an equivocation: not
-        // forwarded, not rebuilt, not parked. Only a header that passed in full (its signature
-        // verified) is recorded, so a forged one cannot pre-empt the leader's.
-        let key = (c.header.view, c.header.proposer.address());
-        let hash = c.hash();
-        if !matches!(verdict, GossipPrecheck::Reject(_)) && self.first_compact.get(&key).is_some_and(|first| *first != hash) {
-            tracing::warn!(%forwarder, view = key.0, "a second compact proposal from the view's leader; ignored, not rebuilt");
-            self.report(id, GossipOutcome::Report(Acceptance::Ignore)).await;
-            return Ok(());
-        }
-        let accepted = match verdict {
-            GossipPrecheck::Accept => {
-                self.note_first_compact(key, hash);
-                self.report(id, GossipOutcome::Report(Acceptance::Accept)).await;
-                true
-            }
+        match verdict {
+            GossipPrecheck::Accept => {}
             GossipPrecheck::Ignore(why) => {
                 tracing::debug!(%forwarder, "compact proposal not forwarded: {why}");
                 self.report(id, GossipOutcome::Report(Acceptance::Ignore)).await;
-                false
+                return Ok(());
             }
             GossipPrecheck::Reject(why) => {
                 tracing::debug!(%forwarder, "compact proposal rejected: {why}");
                 self.report(id, GossipOutcome::Report(Acceptance::Reject)).await;
                 return Ok(());
             }
-        };
-        // Every pre-screened proposal, parked or not, rebuilt or not (final review I2), as the
-        // full path counts every proposal it hands on.
+        }
+        // Final review C1: one header per (view, proposer). A different header from the same
+        // leader for the same view, after one passed the pre-screen, is an equivocation: not
+        // forwarded, not rebuilt, not parked. Only a header that passed in full (its signature
+        // verified) reaches this point, so a forged one can neither be recorded nor pre-empt the
+        // leader's.
+        let key = (c.header.view, c.header.proposer.address());
+        let hash = c.hash();
+        if self.first_compact.get(&key).is_some_and(|first| *first != hash) {
+            tracing::warn!(%forwarder, view = key.0, "a second compact proposal from the view's leader; ignored, not rebuilt");
+            self.report(id, GossipOutcome::Report(Acceptance::Ignore)).await;
+            return Ok(());
+        }
+        self.note_first_compact(key, hash);
+        self.report(id, GossipOutcome::Report(Acceptance::Accept)).await;
+        // Every proposal that passed the pre-screen, parked or not, rebuilt or not (final review
+        // I2), as the full path counts every proposal it hands on; only these, since an
+        // `Ignore`d header's signature was never verified.
         self.highest_proposal_seen = self.highest_proposal_seen.max(c.header.height);
         if self.hs.has_block(&hash) {
             return Ok(());
@@ -3655,9 +3661,6 @@ impl Node {
         let body = |h: &Hash| pool.get(h).filter(real).or_else(|| recent.get(h).filter(real));
         let slot = if c.tx_hashes.iter().all(|h| body(h).is_some()) {
             None
-        } else if !accepted {
-            tracing::debug!("compact proposal view {view}: not forwarded and bodies missing; not parked");
-            return Ok(());
         } else {
             match park_slot(&self.parked, self.hs.view(), &c.header) {
                 ParkSlot::No(why) => {
@@ -7081,35 +7084,37 @@ mod tests {
         assert_eq!(reports(&sent), vec![libp2p::gossipsub::MessageAcceptance::Reject]);
     }
 
-    /// Final review I3: a compact proposal the pre-screen `Ignore`s (here, at the committed
-    /// height) is reported `Ignore` and, with every body held, rebuilt and handed on as the full
-    /// path hands an `Ignore`d proposal on — its bodies remembered on the way to the replica;
-    /// with a body missing it is neither parked nor fetched for.
+    /// Final review I3, reverted (open-findings fix 1): a compact proposal the pre-screen
+    /// `Ignore`s (here, at the committed height) is reported `Ignore` and dropped, though every
+    /// body it names is in the pool — not rebuilt (no body enters the recent cache, the replica
+    /// is not handed the block), not parked, not fetched for, and not counted in
+    /// `highest_proposal_seen`. The `Ignore` verdicts come before the signature check, so a
+    /// rebuild here would be work any keyless peer could order.
     #[tokio::test]
-    async fn an_ignored_compact_proposal_is_handed_on_only_when_every_body_is_held() {
+    async fn a_stale_compact_proposal_with_every_body_held_is_ignored_and_not_rebuilt() {
         use libp2p::gossipsub::MessageAcceptance::Ignore;
         let (_d, storage, gs, hs) = replica_past_a_boundary();
         let head = storage.head_block().unwrap();
         let (mut node, mut seen) = bare_node(storage, gs, hs);
         let ledger = node.hs.tip_ledger().clone();
-        let (pooled, absent) = (next_tx(&ledger, 1), next_tx(&ledger, 2));
+        let pooled = next_tx(&ledger, 1);
         node.mempool.insert_verified(pooled.clone(), &ledger, &StubExecutor).unwrap();
-        let stale = |txs: Vec<Transaction>| {
-            let b = block_on(&head, &ledger, &key(1), node.hs.view(), txs.clone());
-            let mut header = b.header;
-            header.height = node.hs.committed_height();
-            Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, txs, &key(1))
-        };
-        let (held, missing) = (stale(vec![pooled.clone()]), stale(vec![absent]));
+        let b = block_on(&head, &ledger, &key(1), node.hs.view(), vec![pooled.clone()]);
+        let mut header = b.header;
+        header.height = node.hs.committed_height();
+        let stale = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, vec![pooled.clone()], &key(1));
         claiming_peer(&mut node, 4);
+        assert!(node.recent_txs.get(&pooled.hash()).is_none(), "the body is in the pool only");
+        let seen_before = node.highest_proposal_seen;
 
-        node.on_compact_proposal(CompactBlock::of(&held), gossip_id()).await.unwrap();
-        assert!(node.recent_txs.get(&pooled.hash()).is_some(), "rebuilt and handed on");
-        node.on_compact_proposal(CompactBlock::of(&missing), gossip_id()).await.unwrap();
+        node.on_compact_proposal(CompactBlock::of(&stale), gossip_id()).await.unwrap();
+        assert!(node.recent_txs.get(&pooled.hash()).is_none(), "not rebuilt: nothing was remembered");
+        assert!(!node.hs.has_block(&stale.hash()), "the replica was not handed the block");
         assert!(node.parked.is_empty(), "not parked");
+        assert_eq!(node.highest_proposal_seen, seen_before, "an unverified header is not counted");
         let sent = drain(&mut seen).await;
-        assert_eq!(tx_fetches(&sent), vec![], "not fetched for");
-        assert_eq!(reports(&sent), vec![Ignore, Ignore], "reported once each, not forwarded");
+        assert_eq!(reports(&sent), vec![Ignore], "reported once, not forwarded");
+        assert_eq!(sent.len(), 1, "and nothing else: no fetch, no broadcast");
     }
 
     /// Final review C1: a leader that signs a second, different header for its own view gets it
