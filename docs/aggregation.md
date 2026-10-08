@@ -170,23 +170,31 @@ bincode index is part of every txid); `slashed` stays in the supply identity at 
 
 ### 3.7 The daemon: a failed pass is retried
 
-`rand-node aggregate` runs one pass — the chain check, `aggregate_pass` (the work list, the raw
-bundles, the prove, the signed aggregate) and the submission — and exits; with `--watch` it loops
-the pass on `--interval-secs` (15). Each pass first re-reads `rand_chainId` and compares it with
-the chain id read at start.
+`rand-node aggregate` runs one pass — `aggregate_pass` (the work list, the raw bundles, the
+prove, the signed aggregate) and the submission — and exits; with `--watch` it loops the pass on
+`--interval-secs` (15). The chain id is read once at start; from the second pass on, each pass
+first re-reads `rand_chainId` and compares. A node restarted onto another chain during a prove
+therefore surfaces one pass later: that pass's aggregate is refused at the mempool (a retryable
+failure), and the next pass's check stops the daemon.
 
 In `--watch` mode a failed pass is logged at `warn` with its error chain and the daemon sleeps its
-interval and tries again: an RPC failure or malformed reply, the register nonce moving while
+interval and tries again: an RPC failure or malformed reply, a key not yet in the aggregator
+register (logged as "not registered yet (pending `register`?)": a daemon started right after
+`aggregator register` was submitted recovers once it commits), the register nonce moving while
 proving (§3.5: the pass is abandoned, since its proof can never verify), a failed prove, a
 refusal at the mempool, a commit that does not arrive within the wait. A sealed or empty pass
-resets the count of consecutive failures; at `--watch-max-failures` (default 20, five minutes of a
-silent node at the default interval) the daemon exits non-zero with an error naming the cap and
-the last failure, so a permanently broken setup does not spin. The **stop class** — errors no
-retry cures, one enum (`StopError` in `crates/randprotocol-node/src/main.rs`) — exits on the pass
-it occurs in: the node now serves another chain id than the daemon started on (a chain restart
-behind the same RPC; the key must be registered on the new chain), and the key is not in the
-aggregator register. A bad key file is read once, before the first pass. Without `--watch` a
-failed pass is the command's error, exactly as before.
+resets the count of consecutive failures; at `--watch-max-failures` — default 20 consecutive
+failed passes, at least five minutes at the default interval (a hanging node also costs the read
+timeout per call) — the daemon exits non-zero with an error naming the cap and the last failure,
+so a permanently broken setup (a key that never registers among them) does not spin. An idle
+chain never reads the register, so an unregistered key on it fails nothing until work appears.
+The **stop class** — errors no retry cures, one enum (`StopError` in
+`crates/randprotocol-node/src/main.rs`) — exits on the pass it occurs in: the node now serves
+another chain id than the daemon started on (a chain restart behind the same RPC; the key must be
+registered on the new chain), and the node reports no `binding_domain` for a chain cut after it
+(BIND-1, `require_binding_domain`; a genesis cannot change while the daemon runs). A bad key file
+is read once, before the first pass. Without `--watch` a failed pass is the command's error,
+exactly as before.
 
 ## Before enabling aggregation
 
