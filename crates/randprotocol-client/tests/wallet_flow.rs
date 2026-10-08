@@ -112,6 +112,7 @@ fn genesis_full(
         binding_domain: Some(1),
         proof_window_blocks: None,
         program_state: None,
+        multisig: None,
         incremental_nullifier_root: None,
         hardening_v6: None,
         hc_auth: None,
@@ -877,6 +878,7 @@ fn genesis_rpl2(validator: &Keypair) -> Genesis {
         }),
         hardening_v6: Some(true),
         program_state: Some(ProgramStateConfig { cell_fee: RPL2_CELL_FEE }),
+        multisig: None,
         // BIND-1, pinned here rather than inherited: chain 20, the first that can carry RPL-2, is
         // cut with `binding_domain: 1`, so the real-proof invoke is proved and verified in the
         // genesis-bound form.

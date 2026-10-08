@@ -181,6 +181,16 @@ pub struct Audit {
     /// … and what the vaults still hold. It got there through a bundle's `burn_r`, so it is
     /// already inside [`Supply::burned`] on the pool side; this is its register-side twin.
     pub program_rand_held: u64,
+    /// Multisig accounts, all 0 without a `multisig` section and kept off [`Supply`] for the
+    /// same layout reason: what genesis seeded into the accounts (issuance, like
+    /// `genesis_staked`) …
+    pub multisig_issued: u64,
+    /// … what payouts (and their bases) have put into the pool as notes (value entering the
+    /// pool, like `withdraw_deposited`) …
+    pub multisig_rand_out: u64,
+    /// … and what the accounts still hold. Deposits reached them through a bundle's `burn_r`,
+    /// already inside [`Supply::burned`] on the pool side; this is the register-side twin.
+    pub multisig_rand_held: u64,
 }
 
 impl Audit {
@@ -196,6 +206,9 @@ impl Audit {
             vesting_in_register: 0,
             program_rand_out: 0,
             program_rand_held: 0,
+            multisig_issued: 0,
+            multisig_rand_out: 0,
+            multisig_rand_held: 0,
         }
     }
 
@@ -217,6 +230,20 @@ impl Audit {
         }
     }
 
+    /// The same audit with the multisig register's RAND in it: `issued` is what genesis seeded,
+    /// `rand_in` every `burn_r` a deposit put in, `rand_out` every RAND note a payout made, and
+    /// `base_out` the bases the accounts paid to proposers (register-side, so not held). Chain
+    /// it after `with_vesting`, which rebuilds `pool_value` from the supply.
+    pub fn with_multisig(self, issued: u64, rand_in: u64, rand_out: u64, base_out: u64) -> Audit {
+        Audit {
+            pool_value: self.pool_value.saturating_add(rand_out),
+            multisig_issued: issued,
+            multisig_rand_out: rand_out,
+            multisig_rand_held: issued.saturating_add(rand_in).saturating_sub(rand_out).saturating_sub(base_out),
+            ..self
+        }
+    }
+
     /// The same audit with the vesting register's three numbers in it.
     pub fn with_vesting(self, issued: u64, released: u64, in_register: u64) -> Audit {
         Audit {
@@ -230,7 +257,7 @@ impl Audit {
 
     /// What was issued: [`Supply::issued`] plus the vesting register's genesis issuance.
     pub fn issued(&self) -> u64 {
-        self.supply.issued().saturating_add(self.vesting_issued)
+        self.supply.issued().saturating_add(self.vesting_issued).saturating_add(self.multisig_issued)
     }
 
     pub fn total_supply(&self) -> u64 {
@@ -238,6 +265,7 @@ impl Audit {
             .saturating_add(self.register_total)
             .saturating_add(self.vesting_in_register)
             .saturating_add(self.program_rand_held)
+            .saturating_add(self.multisig_rand_held)
     }
 
     /// Everything the chain issued is either in the pool or in the register, less what was
@@ -336,5 +364,25 @@ mod tests {
         // Counting the claim twice — or not at all — breaks it.
         assert!(!Audit::new(s, 4_001, 0).with_vesting(600, 99, 600).invariant_holds());
         assert!(!Audit::new(s, 4_001, 0).with_vesting(600, 0, 500).invariant_holds());
+    }
+
+    #[test]
+    fn the_multisig_register_is_on_the_register_side_of_the_identity() {
+        let s = Supply { genesis_deposited: 4_000, genesis_staked: 1_000, ..Default::default() };
+        // Seeded 600: issued 5_600, held by the register.
+        let a = Audit::new(s, 1_000, 0).with_multisig(600, 0, 0, 0);
+        assert_eq!((a.issued(), a.total_supply(), a.multisig_rand_held), (5_600, 5_600, 600));
+        assert!(a.invariant_holds());
+        // A deposit of 100 burned from the pool (burned 100): held 700, identity holds.
+        let s2 = Supply { burned: 100, ..s };
+        assert!(Audit::new(s2, 1_000, 0).with_multisig(600, 100, 0, 0).invariant_holds());
+        // A payout of 50 and its base 1 to a proposer (register_total +1): pool +50, held 649.
+        let a = Audit::new(s2, 1_001, 0).with_multisig(600, 100, 50, 1);
+        assert_eq!((a.pool_value, a.multisig_rand_held), (3_950, 649));
+        assert!(a.invariant_holds());
+        // Chained after vesting and program vaults, nothing is lost.
+        let a = Audit::new(s2, 1_001, 0).with_vesting(10, 0, 10).with_program_vaults(0, 0).with_multisig(600, 100, 50, 1);
+        assert!(a.invariant_holds(), "{a:?}");
+        assert!(!Audit::new(s2, 1_001, 0).with_multisig(600, 100, 50, 0).invariant_holds(), "an uncounted base breaks it");
     }
 }

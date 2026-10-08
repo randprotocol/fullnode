@@ -350,6 +350,10 @@ pub enum TxError {
     /// that is no longer what the transition read, a vault that cannot pay.
     #[error("program state: {0}")]
     ProgramState(#[from] program_state::ProgramStateError),
+    /// Multisig accounts: a transaction the multisig module refused (see
+    /// [`multisig::MultisigError`]).
+    #[error("multisig: {0}")]
+    Multisig(#[from] multisig::MultisigError),
     #[error("staking: {0}")]
     Staking(#[from] StakingError),
     /// Block aggregation: a register action or aggregate the aggregation module refused (see
@@ -688,6 +692,9 @@ pub struct Ledger {
     /// whose genesis has no `program_state` section. Consensus state, in the state root
     /// (`rand-state-8`), persisted whole.
     program_state: Option<program_state::ProgramState>,
+    /// Multisig accounts (`multisig.rs`): the register a genesis `multisig` section seeds,
+    /// `None` without one. Consensus state, in the state root (`rand-state-multisig-1`).
+    multisig: Option<multisig::MultisigRegister>,
     /// Σ of every registration fee burned under `tokens.burn_registration_fee` (audit v5,
     /// TOK-2). A supply counter in kind — derived, outside the state root and this ledger's
     /// equality, persisted beside `META_SUPPLY` and replay-audited — kept off [`Supply`] so
@@ -878,6 +885,7 @@ impl PartialEq for Ledger {
             // without one. Its two RAND counters are audit state and compared with it; a
             // rebuilt ledger restores the whole blob, counters included.
             && self.program_state == o.program_state
+            && self.multisig == o.multisig
             // The live gas prices (Phase 2): consensus state under `gas.dynamic`, compared by
             // effective value so a restored `Some(section prices)` equals an unmoved `None`.
             && self.gas_prices() == o.gas_prices()
@@ -923,6 +931,7 @@ impl Ledger {
             jailed: BTreeMap::new(),
             vesting: None,
             program_state: None,
+            multisig: None,
             registration_fees_burned: 0,
             base_fees_burned: 0,
             fees: fees::FeesConfig::default(),
@@ -991,6 +1000,7 @@ impl Ledger {
             jailed: BTreeMap::new(),
             vesting: None,
             program_state: None,
+            multisig: None,
             registration_fees_burned: 0,
             base_fees_burned: 0,
             fees: fees::FeesConfig::default(),
@@ -1351,8 +1361,14 @@ impl Ledger {
             Some(v) => audit.with_vesting(v.issued(), v.released, v.in_register()),
             None => audit,
         };
-        match &self.program_state {
+        let audit = match &self.program_state {
             Some(p) => audit.with_program_vaults(p.rand_in, p.rand_out),
+            None => audit,
+        };
+        // Last: `with_vesting` rebuilds `pool_value` from the supply, so anything chained
+        // before it would be lost.
+        match &self.multisig {
+            Some(m) => audit.with_multisig(m.issued, m.rand_in, m.rand_out, m.base_out),
             None => audit,
         }
     }
@@ -1399,6 +1415,20 @@ impl Ledger {
 
     pub(crate) fn vesting_mut(&mut self) -> Option<&mut vesting::VestingRegister> {
         self.vesting.as_mut()
+    }
+
+    /// The multisig register, `None` on a chain without the section.
+    pub fn multisig(&self) -> Option<&multisig::MultisigRegister> {
+        self.multisig.as_ref()
+    }
+
+    /// Install it: genesis from its section, a reloading node from what it persisted.
+    pub fn set_multisig(&mut self, m: Option<multisig::MultisigRegister>) {
+        self.multisig = m;
+    }
+
+    pub(crate) fn multisig_mut(&mut self) -> Option<&mut multisig::MultisigRegister> {
+        self.multisig.as_mut()
     }
 
     /// Deposit notes this ledger created while applying the current block (see [`Deposit`]).
@@ -3335,8 +3365,12 @@ impl Ledger {
             Some(p) => format!("{:?}", p.root()),
             None => "none".into(),
         };
+        let msig = match &self.multisig {
+            Some(m) => format!("{:?}", m.root()),
+            None => "none".into(),
+        };
         format!(
-            "tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} tokens {tok} aggregators {agg} vesting {vest} gas prices {:?} admitted {:?} program state {pstate}",
+            "tree {:?} nullifiers {nf:?} validators {val:?} programs {prog:?} tokens {tok} aggregators {agg} vesting {vest} gas prices {:?} admitted {:?} program state {pstate} multisig {msig}",
             self.tree.root(),
             self.gas_prices(),
             self.admitted_root()
@@ -3440,6 +3474,12 @@ impl Ledger {
             buf.extend_from_slice(root.as_bytes());
             buf.extend_from_slice(self.jailed_root().as_bytes());
             root = Hash::digest_domain(b"rand-state-slashing-1", &buf);
+        }
+        if let Some(m) = &self.multisig {
+            let mut buf = Vec::with_capacity(64);
+            buf.extend_from_slice(root.as_bytes());
+            buf.extend_from_slice(m.root().as_bytes());
+            root = Hash::digest_domain(b"rand-state-multisig-1", &buf);
         }
         root
     }

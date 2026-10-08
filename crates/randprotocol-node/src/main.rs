@@ -1831,6 +1831,8 @@ async fn main() -> Result<()> {
                     None => None,
                 },
                 incremental_nullifier_root: incremental_nullifier_root.then_some(true),
+                // Multisig accounts are cut by adding a `multisig` section to the file by hand.
+                multisig: None,
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -3891,6 +3893,7 @@ mod tests {
             binding_domain: None,
             proof_window_blocks: None,
             program_state: None,
+            multisig: None,
             fees: None,
             incremental_nullifier_root: None,
         }

@@ -487,6 +487,12 @@ pub struct Genesis {
     /// genesis hashes byte-for-byte as before and every `Invoke` is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_state: Option<crate::ledger::program_state::ProgramStateConfig>,
+    /// Multisig accounts (`docs/superpowers/specs/2026-10-08-multisig-design.md`): the fee to
+    /// create one and the accounts the register starts with. Part of the genesis hash (the
+    /// last tag) and of the state root (`rand-state-multisig-1`) when present; omitted entirely
+    /// when absent, so every chain without one hashes and commits byte-for-byte as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multisig: Option<crate::ledger::multisig::MultisigConfig>,
     /// The fee-feedback rules (`ledger::fees`, `docs/fees.md` §1.3): `burn_base` destroys every
     /// bundle's `BUNDLE_BASE` instead of paying it, `subsidy_net_of_fees` pays an aggregate's
     /// subsidy from its proving shares first (it needs `aggregation`,
@@ -607,6 +613,9 @@ pub enum GenesisError {
     /// The `program_state` section is out of bounds, or a section it depends on is missing.
     #[error("bad program_state config: {0}")]
     BadProgramState(String),
+    /// The `multisig` section breaks one of `MultisigConfig::check`'s rules.
+    #[error("bad multisig config: {0}")]
+    BadMultisig(String),
     /// Controller ruling (task B6): the byte price is driven by Σ `encoded_len` over a block as
     /// served, and a pruned bundle's marker form encodes shorter than its raw form, so a sealed-form
     /// sync would compute another price and fail the state root.
@@ -1001,6 +1010,9 @@ impl Genesis {
                 }
             }
         }
+        if let Some(m) = &self.multisig {
+            m.check(self.chain_id).map_err(GenesisError::BadMultisig)?;
+        }
         if let Some(g) = &self.gas {
             let max_block_bytes = self.max_block_bytes.map_or(gas::MAX_BLOCK_BYTES, |n| n as usize);
             g.check(max_block_bytes).map_err(GenesisError::Gas)?;
@@ -1237,6 +1249,14 @@ impl Genesis {
         // only through an `Invoke`'s bundle — so the supply check above is unaffected.
         if let Some(p) = &self.program_state {
             ledger.set_program_state(Some(crate::ledger::program_state::ProgramState::from_config(p)));
+        }
+        // Multisig accounts are issuance too: seeded balances sit in the register, beside the
+        // notes, the stakes and the vesting entries, and all of them must fit a u64.
+        if let Some(m) = &self.multisig {
+            let seeded = m.check(self.chain_id).map_err(GenesisError::BadMultisig)?;
+            let vested = self.vesting.as_ref().map(|v| v.check().unwrap_or(0)).unwrap_or(0);
+            deposited.checked_add(staked).and_then(|t| t.checked_add(vested)).and_then(|t| t.checked_add(seeded)).ok_or(GenesisError::SupplyOverflow)?;
+            ledger.set_multisig(Some(crate::ledger::multisig::MultisigRegister::from_config(m, self.chain_id)));
         }
         // The incremental nullifier root (spec 2026-10-05 §4.1): the genesis ledger holds no
         // nullifiers, so the range starts empty and the header's state root already carries it.
@@ -1568,6 +1588,23 @@ impl Genesis {
         if self.incremental_nullifier_root == Some(true) {
             commit.extend_from_slice(b"incremental_nullifier_root");
             commit.push(1);
+        }
+        // Multisig accounts, after `incremental_nullifier_root` — the last tag — tagged and
+        // present-only like the others; accounts in id order, so the file's order is free.
+        if let Some(m) = &self.multisig {
+            let mut accounts: Vec<_> = m.accounts.iter().map(|a| (a.id(self.chain_id), a)).collect();
+            accounts.sort_by_key(|(id, _)| *id);
+            commit.extend_from_slice(b"multisig");
+            commit.extend_from_slice(&m.create_fee.to_be_bytes());
+            commit.extend_from_slice(&(accounts.len() as u32).to_be_bytes());
+            for (id, a) in accounts {
+                commit.extend_from_slice(&id);
+                commit.extend_from_slice(&a.salt);
+                commit.push(a.threshold);
+                commit.push(a.signers.len() as u8);
+                for k in &a.signers { commit.extend_from_slice(k.as_bytes()); }
+                commit.extend_from_slice(&a.balance.to_be_bytes());
+            }
         }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
@@ -2018,6 +2055,7 @@ mod tests {
             program_state: None,
             fees: None,
             incremental_nullifier_root: None,
+            multisig: None,
         }
     }
 
@@ -5019,6 +5057,70 @@ mod tests {
     }
 
     // ------------------------------------------------------------------ genesis vesting
+
+    fn multisig_account(seed: u8, balance: u64) -> crate::ledger::multisig::MultisigAccountConfig {
+        crate::ledger::multisig::MultisigAccountConfig {
+            salt: [seed; 32],
+            signers: (1..=3u8).map(|i| Keypair::from_seed([seed ^ i; 32]).unwrap().public_key().clone()).collect(),
+            threshold: 2, balance,
+        }
+    }
+
+    #[test]
+    fn a_multisig_section_seeds_the_register_and_is_committed_only_when_present() {
+        use crate::ledger::multisig::MultisigConfig;
+        let plain = build(&base_genesis());
+        assert!(plain.ledger.multisig().is_none());
+        assert!(!base_genesis().to_json().contains("multisig"), "absent from the file when absent");
+        let mut g = base_genesis();
+        g.multisig = Some(MultisigConfig { create_fee: 1_000_000_000, accounts: vec![multisig_account(2, 300 * UNITS_PER_RAND), multisig_account(1, 700 * UNITS_PER_RAND)] });
+        let on = build(&g);
+        let reg = on.ledger.multisig().expect("seeded");
+        assert_eq!((reg.len(), reg.issued, reg.create_fee), (2, 1_000 * UNITS_PER_RAND, 1_000_000_000));
+        let id = g.multisig.as_ref().unwrap().accounts[0].id(g.chain_id);
+        assert_eq!(reg.get(&id).unwrap().balance(0), 300 * UNITS_PER_RAND);
+        let audit = on.ledger.audit();
+        assert!(audit.invariant_holds(), "{audit:?}");
+        assert_eq!(audit.multisig_rand_held, 1_000 * UNITS_PER_RAND);
+        assert_eq!(audit.issued(), plain.ledger.audit().issued() + 1_000 * UNITS_PER_RAND);
+        assert_ne!(on.hash(), plain.hash());
+        assert_ne!(on.ledger.state_root(), plain.ledger.state_root());
+        assert!(plain.ledger.debug_state_root_components().contains("multisig none"));
+        assert!(!on.ledger.debug_state_root_components().contains("multisig none"));
+        assert!(g.to_json().contains("\"balance\": \"300000000000\""), "amounts are decimal strings");
+        assert_eq!(Genesis::from_json(&g.to_json()).unwrap(), g, "round-trips");
+        // Reordered accounts, same hash: the commit is in id order.
+        let mut swapped = g.clone(); swapped.multisig.as_mut().unwrap().accounts.swap(0, 1);
+        assert_eq!(build(&swapped).hash(), on.hash());
+        // Every committed field moves the hash.
+        let with = |f: &dyn Fn(&mut MultisigConfig)| { let mut h = g.clone(); f(h.multisig.as_mut().unwrap()); build(&h).hash() };
+        assert_ne!(with(&|m| m.create_fee += 1), on.hash());
+        assert_ne!(with(&|m| m.accounts[0].salt = [9; 32]), on.hash());
+        assert_ne!(with(&|m| m.accounts[0].threshold = 3), on.hash());
+        assert_ne!(with(&|m| m.accounts[0].signers.swap(0, 1)), on.hash());
+        assert_ne!(with(&|m| m.accounts[0].balance += 1), on.hash());
+        // An empty section is a switch with nothing seeded.
+        let mut empty = base_genesis(); empty.multisig = Some(MultisigConfig::default());
+        let e = build(&empty);
+        assert_eq!(e.ledger.multisig().unwrap().len(), 0);
+        assert_ne!(e.hash(), plain.hash());
+    }
+
+    #[test]
+    fn a_bad_multisig_section_is_refused_at_the_file() {
+        use crate::ledger::multisig::MultisigConfig;
+        let bad = |f: &dyn Fn(&mut MultisigConfig)| {
+            let mut g = base_genesis();
+            let mut m = MultisigConfig { create_fee: 0, accounts: vec![multisig_account(1, 5)] };
+            f(&mut m); g.multisig = Some(m); g.build(&StubExecutor).err()
+        };
+        assert!(matches!(bad(&|m| m.accounts[0].threshold = 0), Some(GenesisError::BadMultisig(_))));
+        assert!(matches!(bad(&|m| m.accounts[0].signers.clear()), Some(GenesisError::BadMultisig(_))));
+        assert!(matches!(bad(&|m| m.create_fee = u64::MAX), Some(GenesisError::BadMultisig(_))));
+        assert!(matches!(bad(&|m| m.accounts[0].balance = u64::MAX - 1), Some(GenesisError::SupplyOverflow)));
+        let json = base_genesis().to_json().replace("\"chain_id\"", "\"multisig\": {\"accounts\": [], \"nonsense\": 1}, \"chain_id\"");
+        assert!(Genesis::from_json(&json).is_err(), "a stray key is refused");
+    }
 
     fn vesting_entry(id: u8, amount: u64) -> crate::ledger::vesting::VestingEntryConfig {
         crate::ledger::vesting::VestingEntryConfig {

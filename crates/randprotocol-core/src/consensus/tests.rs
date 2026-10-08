@@ -160,6 +160,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         binding_domain: None,
         proof_window_blocks: None,
         program_state: None,
+        multisig: None,
         fees: None,
         incremental_nullifier_root: None,
     };
@@ -1590,6 +1591,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         binding_domain: None,
         proof_window_blocks: None,
         program_state: None,
+        multisig: None,
         fees: None,
         incremental_nullifier_root: None,
     };
@@ -2215,6 +2217,7 @@ fn aggregation_node_with(
         binding_domain: None,
         proof_window_blocks: None,
         program_state: None,
+        multisig: None,
         fees: None,
         incremental_nullifier_root: None,
     };

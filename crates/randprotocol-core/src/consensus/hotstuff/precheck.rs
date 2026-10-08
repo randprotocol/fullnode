@@ -281,6 +281,7 @@ mod tests {
             binding_domain: None,
             proof_window_blocks: None,
             program_state: None,
+            multisig: None,
             fees: None,
             incremental_nullifier_root: None,
         };
