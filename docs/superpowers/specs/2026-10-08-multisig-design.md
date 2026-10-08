@@ -127,7 +127,8 @@ every bundle-less signature on this chain.
   proposer with the rest of the fee — it is not burned, so the supply identity does not move.
 - The bundle may fund the account in the same transaction: `burn_r` lands in row 0; `burn_a` of
   `burn_asset` lands in that asset's row if the token is registered (any authority, as a program
-  vault accepts a bridged token). The existing burn-shape rule still refuses RAND through `burn_a`.
+  vault accepts a bridged token). The existing burn-shape rule still refuses RAND through `burn_a`,
+  and a `burn_asset` named with `burn_a == 0` is refused `UnsupportedAsset` (the non-canonical shape).
   Both zero = an unfunded account.
 - Rules: `MultisigConfig`'s signer and threshold bounds; the derived id must not exist
   (`AccountExists`).

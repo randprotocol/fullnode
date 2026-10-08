@@ -420,8 +420,13 @@ fn check_signatures(a: &Account, msg: &crate::crypto::Hash, signatures: &[Signer
 /// The rows a create's or a deposit's bundle credits: `burn_r` into row 0, `burn_a` into the
 /// `burn_asset` row, which must be a registered token (any authority, as a program vault
 /// accepts a bridged token). RAND never arrives through `burn_a` — `check_burn_shape` refuses
-/// it (`NonCanonicalRandBurn`). Returns the rows after the credit.
+/// it (`NonCanonicalRandBurn`), and a token named with no `burn_a` is refused here
+/// (`UnsupportedAsset`) — the non-canonical shape every other burn rule refuses, so a bundle's
+/// `burn_asset` always means a token it burns. Returns the rows after the credit.
 fn credit(ledger: &Ledger, current: Option<&Account>, b: &Bundle) -> Result<Vec<(u32, u64)>, TxError> {
+    if b.burn_asset != 0 && b.burn_a == 0 {
+        return Err(TxError::UnsupportedAsset(b.burn_asset));
+    }
     let have = |asset: u32| current.map_or(0, |a| a.balance(asset));
     let mut rows = Vec::with_capacity(2);
     if b.burn_r != 0 {
@@ -863,6 +868,19 @@ mod rule_tests {
         // A row at the top of u64 cannot take more.
         l.multisig_mut().unwrap().get_mut(&id).unwrap().set_balance(TOKEN, u64::MAX);
         assert_eq!(refusal(&l, &deposit(&l, 30, &id, (0, TOKEN, 1))), ms(MultisigError::Overflow));
+    }
+
+    /// A bundle naming a token it burns none of is the non-canonical shape every other burn rule
+    /// refuses: a create or deposit takes `burn_asset` only with a non-zero `burn_a`.
+    #[test]
+    fn a_create_or_deposit_naming_a_token_it_burns_none_of_is_refused() {
+        let (l, id) = account_with(U, &[]);
+        let fee = BASE + CREATE_FEE;
+        assert_eq!(refusal(&l, &create(&l, 10, fee, 4, &SIGNERS, 2, (U, TOKEN, 0))), TxError::UnsupportedAsset(TOKEN));
+        assert_eq!(refusal(&l, &create(&l, 10, fee, 4, &SIGNERS, 2, (0, 9, 0))), TxError::UnsupportedAsset(9));
+        assert_eq!(refusal(&l, &deposit(&l, 10, &id, (U, TOKEN, 0))), TxError::UnsupportedAsset(TOKEN));
+        // Naming a token and burning nothing at all is still the empty deposit, checked first.
+        assert_eq!(refusal(&l, &deposit(&l, 10, &id, (0, TOKEN, 0))), ms(MultisigError::EmptyDeposit));
     }
 
     #[test]
