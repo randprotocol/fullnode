@@ -46,17 +46,26 @@ impl RecentTxs {
     }
 
     /// Remember a transaction; a held one is left where it is, and a marker-form one
-    /// ([`is_marker_form`]) is not taken. Evicts the oldest entries past either cap (a single
-    /// body larger than the byte cap is evicted at once).
+    /// ([`is_marker_form`]) is not taken. Evicts the oldest entries past either cap.
     pub fn remember(&mut self, tx: Transaction) {
-        if is_marker_form(&tx) {
-            return;
-        }
         let h = tx.hash();
-        if self.by_hash.contains_key(&h) {
+        self.remember_hashed(h, tx);
+    }
+
+    /// [`RecentTxs::remember`] with the hash already computed — the leader's path has it from
+    /// the compact proposal it just published; `h` must be `tx.hash()`. A hash already held is
+    /// a no-op, the first copy staying where it is: that is also what a list naming one
+    /// transaction twice would do, though the pre-screen refuses such a list before any body
+    /// is remembered. A single body larger than the byte cap is refused up front, so it cannot
+    /// empty the cache on its way through.
+    pub fn remember_hashed(&mut self, h: Hash, tx: Transaction) {
+        if is_marker_form(&tx) || self.by_hash.contains_key(&h) {
             return;
         }
-        let len = bincode::serialized_size(&tx).map_or(0, |n| n as usize);
+        let len = bincode::serialized_size(&tx).map_or(usize::MAX, |n| n as usize);
+        if len > self.max_bytes {
+            return;
+        }
         self.by_hash.insert(h, tx);
         self.order.push_back((h, len));
         self.bytes = self.bytes.saturating_add(len);
@@ -68,6 +77,8 @@ impl RecentTxs {
     }
 
     /// Remember every transaction of a block: the next leader's proposal often repeats them.
+    /// Its list holds no hash twice (the precheck refuses one that does); a repeat would be a
+    /// no-op ([`RecentTxs::remember_hashed`]).
     pub fn remember_block(&mut self, block: &Block) {
         for tx in &block.transactions {
             self.remember(tx.clone());
@@ -303,6 +314,15 @@ pub(crate) mod tests {
         assert!(b.bytes() <= one * 2);
         b.remember(txs[1].clone());
         assert_eq!(b.len(), 2, "remembering a held transaction is a no-op");
+
+        // A body over the whole byte cap is refused up front: the cache keeps what it held.
+        let mut small = RecentTxs::new(usize::MAX, one * 2);
+        small.remember(txs[0].clone());
+        let envelope = randprotocol_core::notes::Envelope { kem_ct: vec![9; one * 3], to_receiver: vec![], to_sender: vec![], body: vec![] };
+        let big = Transaction::mint(7, [1; 8], 0, [99; 8], envelope, 1, &key(1), &StubExecutor);
+        small.remember(big.clone());
+        assert!(small.get(&big.hash()).is_none(), "the oversize body is not taken");
+        assert_eq!((small.len(), small.bytes()), (1, one), "and nothing was evicted for it");
     }
 
     #[test]
