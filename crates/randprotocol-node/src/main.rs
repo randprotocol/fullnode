@@ -3818,27 +3818,62 @@ fn is_payout_mismatch(reason: &str) -> bool {
     reason.contains("payout_total is")
 }
 
-/// What became of a submitted aggregate: committed at a height, or dropped — refused for its
-/// payout, or evicted from the pool (the node no longer knows it) — and to be re-sealed.
+/// What became of a submitted aggregate: committed (at a height, when the node says which), or
+/// dropped — refused for its payout, or evicted from the pool and never committed — and to be
+/// re-sealed.
 enum Landing {
-    Committed(u64),
+    Committed(Option<u64>),
     Dropped(String),
 }
 
-/// Poll `hash` until it commits, is dropped, or `timeout` passes (an error).
-async fn wait_for_aggregate(rpc: &impl AggregateNode, hash: &randprotocol_core::Hash, timeout: Duration) -> Result<Landing> {
+/// How many consecutive `unknown` answers, with the committed register nonce unmoved, make an
+/// aggregate evicted rather than in flight. A node prunes its pool against the tip — the
+/// certified, not yet committed, block — so an aggregate inside such a block is out of the pool
+/// and `unknown` until the three-chain rule commits it: on nearly every successful aggregate, for a
+/// few blocks (re-review 2026-10-09). 200 polls is a minute at the 300 ms poll.
+const UNKNOWN_POLLS: u32 = 200;
+
+/// Poll `hash` until it commits, is dropped, or `timeout` passes (an error). `me` and `nonce` are
+/// the aggregator and the register nonce the aggregate signed: while the node answers `unknown`,
+/// the committed nonce having moved past `nonce` means this key's action at `nonce` committed —
+/// confirmed by asking for the transaction once more — and only an `unknown` that persists for
+/// [`UNKNOWN_POLLS`] with the nonce unmoved is an eviction. A rejection is a re-seal only when it
+/// names the payout (`PayoutMismatch`); any other rejection is the pass's error, as before.
+async fn wait_for_aggregate(
+    rpc: &impl AggregateNode,
+    me: &randprotocol_core::Address,
+    nonce: u64,
+    hash: &randprotocol_core::Hash,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<Landing> {
     let start = std::time::Instant::now();
+    let mut unknown = 0u32;
     loop {
         match rpc.transaction_state(hash).await? {
-            TxState::Committed(height) => return Ok(Landing::Committed(height)),
-            TxState::Rejected(reason) => return Ok(Landing::Dropped(reason)),
-            TxState::Unknown => return Ok(Landing::Dropped("evicted from the pool".into())),
-            TxState::Pending => {}
+            TxState::Committed(height) => return Ok(Landing::Committed(Some(height))),
+            TxState::Rejected(reason) if is_payout_mismatch(&reason) => return Ok(Landing::Dropped(reason)),
+            TxState::Rejected(reason) => anyhow::bail!("aggregate {hash} rejected: {reason}"),
+            TxState::Pending => unknown = 0,
+            TxState::Unknown => {
+                if aggregator_row(rpc, me).await?.0 > nonce {
+                    // The nonce this aggregate signed is spent on the committed state: it landed
+                    // (a commit between the two reads is why the status is asked again).
+                    return Ok(Landing::Committed(match rpc.transaction_state(hash).await? {
+                        TxState::Committed(height) => Some(height),
+                        _ => None,
+                    }));
+                }
+                unknown += 1;
+                if unknown >= UNKNOWN_POLLS {
+                    return Ok(Landing::Dropped(format!("evicted from the pool ({UNKNOWN_POLLS} polls unknown, nonce {nonce} unspent)")));
+                }
+            }
         }
         if start.elapsed() > timeout {
             anyhow::bail!("aggregate {hash} not committed within {timeout:?}");
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(poll).await;
     }
 }
 
@@ -3948,6 +3983,8 @@ async fn aggregate_round(
     // reads the schedule afresh. The pause is a block's worth (the interval, at most 2 s; 0 in
     // tests), so a node still a block behind the edge has moved on.
     let pause = cfg.interval.min(Duration::from_secs(2));
+    // The status poll: 300 ms, or the interval when shorter (0 in tests).
+    let poll = cfg.interval.min(Duration::from_millis(300));
     let mut attempt = 0u32;
     loop {
         let tx = seal_aggregate(rpc, kp, chain_id, &proved).await?;
@@ -3965,9 +4002,17 @@ async fn aggregate_round(
             println!("submitted aggregate {hash} ({covered} covered)");
             return Ok(true);
         }
-        match wait_for_aggregate(rpc, &hash, wallet::COMMIT_TIMEOUT).await? {
-            Landing::Committed(height) => {
+        let signed_nonce = match &tx.action {
+            randprotocol_core::Action::Aggregate { nonce, .. } => *nonce,
+            _ => unreachable!("seal_aggregate builds an aggregate"),
+        };
+        match wait_for_aggregate(rpc, &kp.address(), signed_nonce, &hash, wallet::COMMIT_TIMEOUT, poll).await? {
+            Landing::Committed(Some(height)) => {
                 println!("submitted aggregate {hash} ({covered} covered)\n  committed in block {height}");
+                return Ok(true);
+            }
+            Landing::Committed(None) => {
+                println!("submitted aggregate {hash} ({covered} covered)\n  committed (its register nonce is spent)");
                 return Ok(true);
             }
             Landing::Dropped(reason) if attempt < MAX_RESEALS => {
@@ -5163,6 +5208,11 @@ mod tests {
         refused: std::cell::RefCell<Vec<randprotocol_core::Transaction>>,
         /// Report this many of the first sent aggregates as evicted (status `unknown`).
         evict: std::cell::Cell<u32>,
+        /// The certified-but-uncommitted window: a sent aggregate answers `unknown` for this many
+        /// status polls (out of the pool, pruned against the tip, not yet committed) and only
+        /// then commits — the register nonce moving at that commit, not at the send.
+        uncommitted_polls: std::cell::Cell<u32>,
+        status_polls: std::cell::Cell<u32>,
     }
 
     impl AggregateNode for MovingNode {
@@ -5242,7 +5292,8 @@ mod tests {
             // An aggregate the stand-in will report evicted never committed: the nonce stays.
             let evicted = (self.sent.borrow().len() as u32) < self.evict.get();
             self.sent.borrow_mut().push(tx.clone());
-            if !evicted {
+            // In the certified window the nonce moves when the block commits (`transaction_state`).
+            if !evicted && self.uncommitted_polls.get() == 0 {
                 self.nonce.set(self.nonce.get() + 1);
             }
             Ok(tx.hash())
@@ -5250,7 +5301,16 @@ mod tests {
         async fn transaction_state(&self, hash: &randprotocol_core::Hash) -> Result<TxState> {
             // The first `evict` sent aggregates are evicted (the node no longer knows them); every
             // other one committed at once, as `send_transaction` says.
+            self.status_polls.set(self.status_polls.get() + 1);
             let index = self.sent.borrow().iter().position(|t| &t.hash() == hash);
+            if index.is_some() && self.uncommitted_polls.get() > 0 {
+                self.uncommitted_polls.set(self.uncommitted_polls.get() - 1);
+                if self.uncommitted_polls.get() == 0 {
+                    // The block carrying it commits now: the register nonce moves with it.
+                    self.nonce.set(self.nonce.get() + 1);
+                }
+                return Ok(TxState::Unknown);
+            }
             Ok(match index {
                 Some(i) if (i as u32) < self.evict.get() => TxState::Unknown,
                 Some(_) => TxState::Committed(self.height.get() + 1),
@@ -5294,6 +5354,8 @@ mod tests {
             refuse_payout: std::cell::Cell::new(0),
             refused: std::cell::RefCell::new(Vec::new()),
             evict: std::cell::Cell::new(0),
+            uncommitted_polls: std::cell::Cell::new(0),
+            status_polls: std::cell::Cell::new(0),
         }
     }
 
@@ -5652,6 +5714,39 @@ mod tests {
         let e = aggregate_round(&node, &kp, 7, &cfg, false, |_, _, _| Ok(b"p".to_vec())).await.unwrap_err();
         assert!(format!("{e:#}").contains("payout_total is"), "{e:#}");
         assert_eq!(node.refused.borrow().len() as u32, MAX_RESEALS + 1);
+    }
+
+    /// Re-review 2026-10-09: an aggregate inside a certified-but-uncommitted block is out of the
+    /// pool and `unknown` for a few polls before it commits. The daemon keeps polling and reports
+    /// success without re-sealing — including when the commit shows first as the spent register
+    /// nonce. A genuine eviction (unknown past `UNKNOWN_POLLS`, the nonce unspent) still re-seals.
+    #[tokio::test]
+    async fn the_daemon_waits_out_the_certified_window_and_reseals_only_a_real_eviction() {
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payee = SpendKey([7; 8]);
+        let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
+        let cfg = DaemonConfig { watch: false, interval: Duration::ZERO, no_wait: false, max_failures: 1 };
+
+        // Unknown for 5 polls, then committed: one submission, success. The fifth `unknown` is
+        // answered as the commit lands (the nonce moves), so the pass sees the spent nonce first.
+        let node = moving_node(kp.address(), payout.clone());
+        node.uncommitted_polls.set(5);
+        assert!(aggregate_round(&node, &kp, 7, &cfg, false, |_, _, _| Ok(b"p".to_vec())).await.unwrap());
+        assert_eq!(node.sent.borrow().len(), 1, "no re-seal in the certified window");
+        assert_eq!(node.nonce.get(), 1, "it committed");
+
+        // Unknown for longer than a handful of polls but well under the bound: still one submission.
+        let node = moving_node(kp.address(), payout.clone());
+        node.uncommitted_polls.set(UNKNOWN_POLLS - 1);
+        assert!(aggregate_round(&node, &kp, 7, &cfg, false, |_, _, _| Ok(b"p".to_vec())).await.unwrap());
+        assert_eq!(node.sent.borrow().len(), 1);
+
+        // A real eviction: unknown for good, the nonce unspent — re-sealed after the bound.
+        let node = moving_node(kp.address(), payout);
+        node.evict.set(1);
+        assert!(aggregate_round(&node, &kp, 7, &cfg, false, |_, _, _| Ok(b"p".to_vec())).await.unwrap());
+        assert_eq!(node.sent.borrow().len(), 2, "the evicted aggregate, then its re-seal");
+        assert!(node.status_polls.get() >= UNKNOWN_POLLS, "only after the bound");
     }
 
     /// Issue #132: the pass reads the fee rules through the node's cached limits

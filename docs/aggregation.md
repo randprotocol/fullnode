@@ -157,7 +157,11 @@ crossing a halving (the case that predates the dollar subsidy) — refuses the a
 leaves the bucket and nothing is minted. The pool re-asks at every tip (`check_aggregate_payout`)
 and evicts a pooled aggregate whose payout moved. `rand-node aggregate` re-seals — the proof binds
 `(chain, aggregator, nonce)` and the covers, never the payout, so it is reused — and resubmits, up
-to four times a pass, after a `PayoutMismatch` refusal or an eviction (status `unknown`). Before
+to four times a pass, after a `PayoutMismatch` refusal or an eviction. An `unknown` status alone
+is not an eviction: the node prunes its pool against the tip, the certified but uncommitted block,
+so an aggregate inside such a block answers `unknown` until the three-chain rule commits it — the
+daemon keeps polling, takes the committed register nonce moving past the one it signed as the
+commit, and re-seals only after 200 `unknown` polls (a minute) with that nonce unspent. Before
 this an aggregate landing across such an edge was paid the ledger's amount into a note its envelope
 could not open: subsidy and covered shares lost. (`payout_total` moved the `Aggregate` encoding and
 every aggregate txid; no chain has carried one.)

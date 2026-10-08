@@ -1150,7 +1150,7 @@ other's proofs and signatures; that chain ids 14–19 never repeated was the onl
 `binding_domain: 1` puts the genesis hash first in every one of those preimages under a fresh tag
 (`rand-tx-bind-2`, `rand-call-bind-2`, `rand-mint-3`, `rand-unbond-2`, `rand-withdraw-2`,
 `rand-rpl-mint-2`, `rand-rpl-authority-2`, `rand-aggregator-{register,unbond,withdraw}-2`,
-`rand-aggregate-3`, `rand-aggregate-bind-2`, and the bridge's `…-2` fixed layouts with the 32-byte
+`rand-aggregate-5` (it was `rand-aggregate-3` until the aggregate signed its `payout_total`, 2026-10-09; the chain-id form is `rand-aggregate-4`), `rand-aggregate-bind-2`, and the bridge's `…-2` fixed layouts with the 32-byte
 hash between the tag and the chain id — `crates/randprotocol-core/src/types/binding.rs`,
 `bridge/gov.rs`). The binding is a *public input* of the proofs — the wallet, a prover service
 and the ledger compute it and hand it to the circuit — so nothing in any guest or verifier key

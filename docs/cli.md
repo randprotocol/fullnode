@@ -339,7 +339,9 @@ to the same cap — the ledger's own `aggregation::schedule_subsidy`. The sealed
 the aggregate's `payout_total`; when the chain refuses it (`PayoutMismatch`: the schedule moved —
 a price vote, a stale price, a halving — between the seal and the block) or the pool evicts the
 aggregate, the pass **re-seals the same proof** at the current schedule and resubmits, up to four
-times, without proving again.
+times, without proving again. An eviction is an `unknown` status for 200 polls (a minute) with the
+aggregator's committed nonce unspent; a shorter `unknown` is an aggregate in a certified block not
+yet committed, and the nonce moving past the signed one counts as its commit.
 
 In `--watch` mode a failed pass does not stop the daemon: it is logged at `warn` with its error
 chain and the next pass runs after the interval — an RPC failure, a register nonce that moved
