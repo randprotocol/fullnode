@@ -433,6 +433,10 @@ consensus state at `O(depth)` regardless.
    slashed for losing a race (`docs/aggregation.md` §3.6); it meters how much of the validators'
    verification time one identity may claim. Sybil resistance comes from the quota, not a jury.
 4. **Governance can only lower issuance.** Inherited from the tokenomics draft §Governance.
+   The dollar-indexed subsidy (`fees.usd_subsidy`, §6.3) is the one place a vote moves a mint:
+   the validator set's RAND/USD price can raise a sealed block's schedule above `subsidy(n)` at a
+   low price, but never above the genesis `max_subsidy_per_block`, which no vote moves — the
+   principle holds against that cap.
 
 ### 6.2 Fees: a two-lane market
 
@@ -475,6 +479,7 @@ step times, which the aggregator advertises in its `rand_getLimits.aggregation`)
 | bond return | unbond, 2 epochs, as a validator's | refundable; never slashed for a lost race or a retry |
 | invalid submission | refused at admission, counted; a key over 8 refusals an epoch loses its quota for the epoch | the "submission spam" question of `docs/aggregation.md` §5, answered by quota not slashing |
 | `subsidy_base` | **0.6 RAND per sealed block**, halving every 52 560 000 sealed blocks, 64 halvings, cap 63.1 M | the tokenomics draft's mainnet parameters, unchanged |
+| subsidy, dollar-indexed | `min(⌊usd_micros_per_sealed_block · 10⁹ / price⌋, max_subsidy_per_block)` while the validator set's voted price is fresh, `subsidy_base` schedule otherwise — *implemented, genesis-gated: `fees.usd_subsidy`, price by `SetRandPrice` vote* | `docs/fees.md` §1.3; the study's $345/day ≈ 4 791 µ$ a block at 1.2 s, 0.03194 RAND at $0.15 |
 | subsidy split | pro rata by covered bundles among the block's aggregates | §5.2 |
 | self-fill invariant | `subsidy_base / MAX_BLOCK_TXS < BUNDLE_BASE × 40 %` | 0.6 / 4 096 = 0.000146 < 0.0004 RAND: filling a block with one's own transfers to win more subsidy costs more in verification share than it earns; checked by `Genesis::validate` |
 | proving share | `BUNDLE_BASE × 60 % + prove_base + tip` per covered bundle | §6.2 |
@@ -577,6 +582,7 @@ weighs explicitly.
 | nullifier commitment | sorted BLAKE3 Merkle | **insertion-order MMR**, `rand-state-6` | state root | hard fork |
 | envelopes | 4 × 1 860 B | **2 full + 2 self (~120 B)** | bundle guest, `hc_bundle` | hard fork |
 | `subsidy_base`, `halving_blocks` | 100 / 210 000 (cut-script defaults) | **0.6 RAND / 52 560 000** | genesis `aggregation` | governance, downward only |
+| dollar-indexed subsidy (`usd_micros_per_sealed_block`, `max_subsidy_per_block`, `price_max_age_blocks`) | — | **4 791 µ$ / 0.3 RAND / 72 000 blocks** — *implemented, genesis-gated: `fees.usd_subsidy`* | genesis `fees` | the three numbers: hard fork; the RAND/USD price: the validator set's vote (`SetRandPrice`, quorum as `AdmitValidator`, ≤ ×2 per update) |
 
 ## 8. Plan
 

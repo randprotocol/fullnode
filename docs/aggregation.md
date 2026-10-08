@@ -98,6 +98,16 @@ What the subsidy is **not**, and why the design differs from proof-of-work:
 - **Security is not what the subsidy buys.** Consensus security comes from bonded stake; the
   subsidy buys throughput and bootstraps the prover set. It can be small and can decay to zero.
 
+**A dollar-indexed schedule (genesis `fees.usd_subsidy`, `docs/fees.md` §1.3).** A RAND amount buys
+a different number of GPU-hours at every price; the fee study's provers stayed for dollars. Under
+the sub-section the schedule of a sealed block is `min(⌊usd_micros_per_sealed_block · 10⁹ /
+price⌋, max_subsidy_per_block)` while the validator set's voted RAND/USD price is fresh (at most
+`price_max_age_blocks` old at the sealing block), and `subsidy(n)` otherwise —
+`aggregation::schedule_subsidy`, the one function admission, apply, `rand_getEmission` and the
+daemon share. The price is a vote (`SetRandPrice`, `docs/staking.md` "The RAND price vote"), not an
+oracle; the cap is genesis, not votable. Everything below — how the payment lands, the netting,
+supply accounting — reads "the schedule" and is unchanged.
+
 ### 3.3 How the payment lands
 
 The subsidy and the proving share are paid as **one deposit note** to the aggregator's shielded
@@ -109,7 +119,8 @@ other.
 Under the genesis `fees.subsidy_net_of_fees` (`docs/fees.md` §1.3) the shares pay the schedule
 first (spec §5.4's derivation, `Ledger::aggregate_payment`): the note carries
 `max(subsidy(n), shares)`, and only `subsidy(n) − shares` — nothing once the shares reach the
-schedule — is minted. `subsidised` and `rand_getAggregate`'s `subsidy` carry that minted part;
+schedule — is minted. Under `fees.usd_subsidy` read the dollar schedule for `subsidy(n)` wherever
+it appears here (§3.2): the netting is the same function over whichever schedule applies. `subsidised` and `rand_getAggregate`'s `subsidy` carry that minted part;
 `sealed_blocks` advances by one either way. Admission and apply still derive one note from one
 state: the rule lives in that one function.
 
@@ -126,6 +137,16 @@ so one read per daemon, never one per pass that a transient RPC failure could ab
 `aggregation::minted_subsidy(subsidy(n), shares, &fees) + shares`, the ledger's own function
 (pinned by `the_aggregate_pass_seals_the_ledgers_payout_under_subsidy_net_of_fees`). A third-party
 aggregator must do the same.
+
+**And the dollar schedule.** Under `fees.usd_subsidy` the daemon reads the voted price off
+`rand_getRandPrice` after the prove, beside `rand_status`, and seals at
+`aggregation::schedule_subsidy` over `fee_rules.usd_subsidy` and that price when the node reports
+it `fresh` — judged for the next block, the height the note's `time` names and the earliest the
+aggregate lands — and at `subsidy(n)` when it does not (pinned by
+`the_aggregate_pass_seals_the_ledgers_payout_under_a_voted_price`). The ledger judges freshness at
+the block that applies the aggregate, so an aggregate that lands later than the next block across
+the staleness edge, or after a `SetRandPrice` moved the price, is paid the ledger's amount into an
+envelope sealed for another: keep `price_max_age_blocks` long and vote before it lapses.
 
 The shares are always the node's bucket entries, `rand_getUnsealed`'s `excess` — never recomputed
 from a raw transaction. Under `fees.proposer_share_bps` and `fees.prove_base` an entry already
@@ -380,6 +401,9 @@ chain never depends on a GPU being online.
 ## 5. Open questions for the spec
 
 - The subsidy amount, the halving interval, and whether issuance has a hard cap.
+  *Built, genesis-gated:* `fees.usd_subsidy` indexes the amount to a dollar target at a voted
+  RAND/USD price, bounded per block by a genesis cap (`docs/fees.md` §1.3); the halving schedule
+  remains the fallback.
 - The proving share: a fixed fraction of the bundle fee, or the whole fee above the floor.
   *Built, genesis-gated:* `fees.proposer_share_bps` buckets a fraction of the base beside the
   whole excess, and `fees.prove_base` floors it (`docs/fees.md` §1.3; the proposal's values are

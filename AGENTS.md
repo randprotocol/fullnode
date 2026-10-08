@@ -4,7 +4,35 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-10-08)
+## Project memory (state as of 2026-10-09)
+
+### Dollar-indexed prover pay (2026-10-09; branch `feat/usd-prover-pay` off main `3119a29a`, NOT pushed; genesis-gated, on no chain)
+
+The fee study's best prover-retention variant ("dollar-indexed, from fees first, then minted") as
+`fees.usd_subsidy { usd_micros_per_sealed_block, max_subsidy_per_block, price_max_age_blocks,
+initial_price_micros? }` (`ledger/fees.rs`; needs `aggregation`, `UsdSubsidyWithoutAggregation`;
+zeros `UsdSubsidyZero(name)`). Hash: `"usd_subsidy"` ‖ be64 ×3 ‖ (`"initial_price"` ‖ be64), only
+when set, after `prove_base` (`the_usd_subsidy_hash_contribution_is_pinned`). **Decision: the price
+is governance** — `Action::SetRandPrice { price_micros_per_rand, nonce, votes }`, wire tag 44 (pinned
+in `the_set_rand_price_encoding_and_txid_are_pinned`), `AdmitValidator`'s shape: the vote check is
+now `staking::check_votes` (voting_set + `has_quorum`), shared, admission errors unchanged; message
+`blake3("rand-set-price-1" ‖ genesis ‖ be64 price ‖ be64 nonce)`; nonce = current + 1; band
+`2·new ≥ old ∧ new ≤ 2·old`. State `Ledger::rand_price: Option<RandPrice { price, set_at_height,
+nonce }>` (`ledger/rand_price.rs`), genesis-seeded at 0/0, `H("rand-state-price-1", root ‖
+price_root)` outermost **only under the section**, inside equality, `META_RAND_PRICE` (bincode,
+present only while a price exists), named in the self-check. One schedule function:
+`aggregation::schedule_subsidy(n, cfg, usd, fresh_price)` (`min(⌊usd·10⁹/price⌋, cap)` in u128,
+floor; else `gas::subsidy`), via `Ledger::schedule_subsidy` in `aggregate_payment`, in
+`rand_getEmission.current` and in the daemon (`aggregate_pass` reads `rand_getRandPrice` under the
+section). Freshness `height − set_at ≤ max_age` at the **applying block's** height;
+`rand_getRandPrice.fresh` is judged for head + 1. Mempool claim role 10 (zero address), governance
+(past a full pool). CLI `rand-node price status|sign|submit` (submit takes lines or vote files).
+**Trap:** freshness and a price change are judged at the block that applies the aggregate, so an
+aggregate landing later than the next block across the staleness edge (or after a price vote) is
+paid the ledger's amount into an envelope sealed for another — the same class as a
+`sealed_blocks` move; keep `price_max_age_blocks` long. Suites at the branch: core lib 805, node lib
+622 (1 ignored), node bin 54, rpc_contract 7, genesis_cli 14, client lib 210, clippy clean for the
+three crates. Recommended values deferred until aggregation is admitted (`docs/deploy.md`).
 
 ### rVM phase 3 + rate ¼ re-vendored (2026-10-08; branch `feat/rvm-rate-quarter-vendor`, NOT pushed)
 
