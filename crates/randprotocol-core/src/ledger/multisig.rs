@@ -188,6 +188,12 @@ impl MultisigRegister {
         self.accounts.len()
     }
 
+    /// Every account with its id, in id order (the order the root and the genesis commit use;
+    /// `rand-node genesis` prints the seeded accounts this way).
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8; 32], &Account)> {
+        self.accounts.iter()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.accounts.is_empty()
     }

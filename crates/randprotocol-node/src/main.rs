@@ -487,6 +487,12 @@ enum Cmd {
         /// "start_ms", "cliff_ms", "linear_ms", "step_ms"?}]}`). Omitted entirely when absent.
         #[arg(long, value_name = "VESTING.JSON")]
         vesting: Option<PathBuf>,
+        /// Multisig accounts (`docs/multisig.md`): the `multisig` section, as a `MultisigConfig`
+        /// JSON file (`{"create_fee", "accounts": [{"salt", "signers", "threshold", "balance"}]}`),
+        /// checked against `--chain-id`. Every seeded account's derived id is printed with its
+        /// balance — the id the treasury's signers spend from. Omitted entirely when absent.
+        #[arg(long, value_name = "MULTISIG.JSON")]
+        multisig: Option<PathBuf>,
         /// The bundle guest the chain pins as `hc_bundle`: `v1` (the hidden-asset guest chains 14
         /// and 15 run) or `v2`, the branch-free guest whose instruction and lookup counts do not
         /// depend on which input slots are real or on the spent leaves' indices (INT-2 / GV-1).
@@ -834,6 +840,14 @@ enum Cmd {
     Vesting {
         #[command(subcommand)]
         cmd: VestingCmd,
+    },
+    /// Multisig accounts (`docs/multisig.md`): derive an id offline, read an account, and the
+    /// signers' side of a payment out of it and of a signer-set rotation — each three steps
+    /// (`prepare` → `sign` per signer → `submit`), like `vesting revoke`. Creating and funding an
+    /// account need a shielded spend, so they are the wallet's (`rand multisig create|deposit`).
+    Multisig {
+        #[command(subcommand)]
+        cmd: MultisigCmd,
     },
     /// Audit v6, BRG-14: sign and submit the bridge's post-quantum rotations (`docs/bridge.md`
     /// §21.1, §21.5) — the PQ guardian set, the pause key, and a cancel of a pending rotation.
@@ -1530,6 +1544,612 @@ fn parse_entry_id(s: &str) -> Result<[u8; 32]> {
         .with_context(|| format!("{s} is not a vesting entry id (64 hex characters)"))
 }
 
+/// `rand-node multisig …` (spec 2026-10-08 §7): the bundle-less half of multisig accounts.
+#[derive(Subcommand)]
+enum MultisigCmd {
+    /// Derive an account id offline: `blake3("rand-multisig-id-1", chain_id ‖ salt ‖ threshold ‖
+    /// n ‖ keys)`, the id `rand-node genesis --multisig` prints and `rand multisig create` names.
+    /// The signers' order is part of it (a signature names its signer by position).
+    Id {
+        /// 32 bytes, 64 hex characters.
+        #[arg(long)]
+        salt: String,
+        #[arg(long)]
+        threshold: u8,
+        /// A Dilithium2 public key, hex; repeatable, in the account's order.
+        #[arg(long = "signer", required = true, value_name = "PUBKEY_HEX")]
+        signers: Vec<String>,
+        /// The chain the account lives on: the same inputs name another account on another chain.
+        #[arg(long)]
+        chain_id: u64,
+    },
+    /// The account as the node serves it (`rand_getMultisig`): signers, threshold, nonce, vault.
+    Status {
+        /// The account id, 64 hex characters.
+        account: String,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+    /// Pay out of an account into shielded notes: `prepare`, `sign` (per signer), `submit`.
+    Pay {
+        #[command(subcommand)]
+        cmd: PayCmd,
+    },
+    /// Replace an account's signer set and threshold (the id does not change): `prepare`,
+    /// `sign` (per current signer), `submit`.
+    Rotate {
+        #[command(subcommand)]
+        cmd: RotateCmd,
+    },
+}
+
+/// `rand-node multisig pay …`: a payment's message holds every payout's sealed note (blinding and
+/// envelope), so it is written once (`prepare`) and every signer signs that file (`sign`).
+#[derive(Subcommand)]
+enum PayCmd {
+    /// Write the payment every signer signs: the account, its nonce, the head height as the
+    /// notes' `time`, and each payout's note sealed to its recipient. Needs no key. The account
+    /// also pays the bundle base in RAND out of its vault. The signatures must be gathered and
+    /// submitted within the chain's time window (256 blocks) — prepare again if that passes.
+    Prepare {
+        /// The account id, 64 hex characters.
+        #[arg(long)]
+        account: String,
+        /// A recipient (`rand1…`); repeatable, one per payout, paired in order with `--amount`
+        /// (and `--asset`, when given).
+        #[arg(long = "to", required = true, value_name = "RAND1_ADDRESS")]
+        to: Vec<String>,
+        /// The payout's amount, in whole units with decimals (as every amount: `1.5` is 1.5 RAND); one per `--to`.
+        #[arg(long = "amount", required = true)]
+        amount: Vec<String>,
+        /// The payout's asset (0 is RAND). Omitted: every payout is RAND; given, once per `--to`.
+        #[arg(long = "asset")]
+        asset: Vec<u32>,
+        /// Where the payment is written (an existing file is refused).
+        #[arg(long, default_value = "pay.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+    /// Sign a prepared payment with one signer key and print `<index>:<signature hex>` — what
+    /// `submit --signature` takes. Offline: it reads only the file and the key. It prints what is
+    /// being signed on stderr; check every recipient before trusting it.
+    Sign {
+        #[arg(long)]
+        proposal: PathBuf,
+        /// One of the account's signer keys (a `rand-node keygen` file).
+        #[arg(long)]
+        key: PathBuf,
+        /// This key's position in the account's `signers`. Default: looked up in the list the
+        /// prepared file carries.
+        #[arg(long)]
+        index: Option<u8>,
+    },
+    /// Send a prepared payment with at least the account's threshold of signatures.
+    Submit {
+        #[arg(long)]
+        proposal: PathBuf,
+        /// A `sign` step's output; repeatable, one per signer.
+        #[arg(long = "signature", required = true, value_name = "INDEX:HEX")]
+        signatures: Vec<String>,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Return once the node accepts the transaction instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+    },
+}
+
+/// `rand-node multisig rotate …`: the payment's three steps for a new signer set. The current
+/// set signs its own replacement; fee-less.
+#[derive(Subcommand)]
+enum RotateCmd {
+    /// Write the rotation every current signer signs: the account, its nonce, the new set and
+    /// threshold (checked as at creation). Needs no key.
+    Prepare {
+        /// The account id, 64 hex characters.
+        #[arg(long)]
+        account: String,
+        /// A new signer's Dilithium2 public key, hex; repeatable, in the new order.
+        #[arg(long = "signer", required = true, value_name = "PUBKEY_HEX")]
+        signers: Vec<String>,
+        /// The new threshold.
+        #[arg(long)]
+        threshold: u8,
+        /// Where the rotation is written (an existing file is refused).
+        #[arg(long, default_value = "rotate.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+    /// Sign a prepared rotation with one current signer key; prints `<index>:<signature hex>`.
+    Sign {
+        #[arg(long)]
+        proposal: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        index: Option<u8>,
+    },
+    /// Send a prepared rotation with at least the account's current threshold of signatures.
+    Submit {
+        #[arg(long)]
+        proposal: PathBuf,
+        #[arg(long = "signature", required = true, value_name = "INDEX:HEX")]
+        signatures: Vec<String>,
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        #[arg(long)]
+        no_wait: bool,
+    },
+}
+
+/// One payout of a [`PayProposal`], as text.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PayoutText {
+    asset: u32,
+    /// In units, a decimal string.
+    amount: String,
+    /// The recipient, `rand1…`.
+    to: String,
+    /// The note's blinding, hex.
+    r: String,
+    /// `bincode(Envelope)`, hex.
+    envelope: String,
+}
+
+/// A prepared payment (`rand-node multisig pay prepare`): every field of the message the signers
+/// sign, as text, so the file can be read before it is signed. `signers` (public keys, hex) and
+/// `threshold` are the node's word at `prepare` — a convenience for `sign`'s index lookup, not
+/// part of what is signed (a wrong list yields a signature the chain refuses, nothing worse).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PayProposal {
+    chain_id: u64,
+    /// The genesis hash, hex.
+    genesis: String,
+    /// The account id, hex.
+    account: String,
+    nonce: u64,
+    time: u32,
+    pays: Vec<PayoutText>,
+    #[serde(default)]
+    signers: Vec<String>,
+    #[serde(default)]
+    threshold: u8,
+}
+
+/// A [`PayProposal`]'s fields as the types the ledger reads.
+struct PayParts {
+    chain_id: u64,
+    genesis: randprotocol_core::Hash,
+    account: [u8; 32],
+    nonce: u64,
+    time: u32,
+    pays: Vec<randprotocol_core::ledger::program_state::Payout>,
+}
+
+impl PayProposal {
+    /// Seal each payout's note (`(recipient, amount, asset)`) and write the payment down.
+    fn new(
+        chain_id: u64,
+        genesis: &randprotocol_core::Hash,
+        account: &[u8; 32],
+        nonce: u64,
+        time: u32,
+        payouts: &[(ShieldedAddress, u64, u32)],
+        format: EnvelopeFormat,
+    ) -> Result<PayProposal> {
+        use randprotocol_core::ledger::multisig::MAX_PAYOUTS;
+        anyhow::ensure!(
+            (1..=MAX_PAYOUTS).contains(&payouts.len()),
+            "a payment has 1 to {MAX_PAYOUTS} payouts, not {}",
+            payouts.len()
+        );
+        let mut pays = Vec::with_capacity(payouts.len());
+        for (to, amount, asset) in payouts {
+            anyhow::ensure!(*amount > 0, "a payout of zero to {to}");
+            let (note, envelope) = sealed_payout_note(to, *amount, *asset, time, format)?;
+            pays.push(PayoutText {
+                asset: *asset,
+                amount: amount.to_string(),
+                to: to.to_string(),
+                r: word8_to_hex(&note.r),
+                envelope: hex::encode(bincode::serialize(&envelope).context("encoding the envelope")?),
+            });
+        }
+        Ok(PayProposal {
+            chain_id,
+            genesis: genesis.to_hex(),
+            account: hex::encode(account),
+            nonce,
+            time,
+            pays,
+            signers: Vec::new(),
+            threshold: 0,
+        })
+    }
+
+    fn read(path: &std::path::Path) -> Result<PayProposal> {
+        serde_json::from_str(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?)
+            .with_context(|| format!("{} is not a prepared multisig payment", path.display()))
+    }
+
+    fn parts(&self) -> Result<PayParts> {
+        use randprotocol_core::ledger::program_state::Payout;
+        let mut pays = Vec::with_capacity(self.pays.len());
+        for (i, p) in self.pays.iter().enumerate() {
+            pays.push(Payout {
+                asset: p.asset,
+                amount: p.amount.parse().with_context(|| format!("payout {i}: {} is not an amount in units", p.amount))?,
+                recipient: ShieldedAddress::parse(&p.to).map_err(|e| anyhow::anyhow!("payout {i}: to: {e}"))?,
+                r: randprotocol_core::notes::word8_from_hex(&p.r).with_context(|| format!("payout {i}: r: not a 32-byte hex blinding"))?,
+                envelope: bincode::deserialize(&hex::decode(&p.envelope).with_context(|| format!("payout {i}: envelope: not hex"))?)
+                    .with_context(|| format!("payout {i}: envelope: not an envelope"))?,
+            });
+        }
+        Ok(PayParts {
+            chain_id: self.chain_id,
+            genesis: randprotocol_core::Hash::from_hex(&self.genesis).map_err(|e| anyhow::anyhow!("genesis: {e}"))?,
+            account: parse_multisig_account(&self.account)?,
+            nonce: self.nonce,
+            time: self.time,
+            pays,
+        })
+    }
+
+    /// One signer's signature over this payment, as `<index>:<signature hex>`.
+    fn sign(&self, kp: &Keypair, index: Option<u8>) -> Result<String> {
+        sign_as_signer(kp, index, &self.signers, &self.parts()?.message())
+    }
+
+    /// The transaction's action with `signatures` (each a `sign` step's output), in index order.
+    fn action(&self, signatures: &[String]) -> Result<randprotocol_core::Action> {
+        let signatures = parse_signer_signatures(signatures)?;
+        let p = self.parts()?;
+        Ok(randprotocol_core::Action::MultisigPay { account: p.account, nonce: p.nonce, time: p.time, pays: p.pays, signatures })
+    }
+}
+
+impl PayParts {
+    fn message(&self) -> randprotocol_core::Hash {
+        randprotocol_core::types::actions::multisig_pay_message(&self.genesis, self.chain_id, &self.account, self.nonce, self.time, &self.pays)
+    }
+}
+
+/// A prepared rotation (`rand-node multisig rotate prepare`). `new_signers` / `new_threshold`
+/// are what is signed; `signers` / `threshold` are the current set at `prepare`, for `sign`'s
+/// index lookup only.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotateProposal {
+    chain_id: u64,
+    /// The genesis hash, hex.
+    genesis: String,
+    /// The account id, hex.
+    account: String,
+    nonce: u64,
+    /// The new set, Dilithium2 public keys, hex, in order.
+    new_signers: Vec<String>,
+    new_threshold: u8,
+    #[serde(default)]
+    signers: Vec<String>,
+    #[serde(default)]
+    threshold: u8,
+}
+
+impl RotateProposal {
+    /// Write the rotation down, refusing a new set the chain would refuse.
+    fn new(chain_id: u64, genesis: &randprotocol_core::Hash, account: &[u8; 32], nonce: u64, signers: &[PublicKey], threshold: u8) -> Result<RotateProposal> {
+        randprotocol_core::ledger::multisig::check_signers(signers, threshold).map_err(|e| anyhow::anyhow!("the new signer set: {e}"))?;
+        Ok(RotateProposal {
+            chain_id,
+            genesis: genesis.to_hex(),
+            account: hex::encode(account),
+            nonce,
+            new_signers: signers.iter().map(|k| k.to_hex()).collect(),
+            new_threshold: threshold,
+            signers: Vec::new(),
+            threshold: 0,
+        })
+    }
+
+    fn read(path: &std::path::Path) -> Result<RotateProposal> {
+        serde_json::from_str(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?)
+            .with_context(|| format!("{} is not a prepared multisig rotation", path.display()))
+    }
+
+    fn new_keys(&self) -> Result<Vec<PublicKey>> {
+        parse_public_keys(&self.new_signers)
+    }
+
+    fn message(&self) -> Result<randprotocol_core::Hash> {
+        Ok(randprotocol_core::types::actions::multisig_rotate_message(
+            &randprotocol_core::Hash::from_hex(&self.genesis).map_err(|e| anyhow::anyhow!("genesis: {e}"))?,
+            self.chain_id,
+            &parse_multisig_account(&self.account)?,
+            self.nonce,
+            &self.new_keys()?,
+            self.new_threshold,
+        ))
+    }
+
+    fn sign(&self, kp: &Keypair, index: Option<u8>) -> Result<String> {
+        sign_as_signer(kp, index, &self.signers, &self.message()?)
+    }
+
+    fn action(&self, signatures: &[String]) -> Result<randprotocol_core::Action> {
+        let signatures = parse_signer_signatures(signatures)?;
+        Ok(randprotocol_core::Action::MultisigRotate {
+            account: parse_multisig_account(&self.account)?,
+            nonce: self.nonce,
+            signers: self.new_keys()?,
+            threshold: self.new_threshold,
+            signatures,
+        })
+    }
+}
+
+/// `kp`'s signature over `message` as `<index>:<hex>`; `index` absent, the key is looked up in
+/// `signers` (public keys, hex, the prepared file's copy of the account's list).
+fn sign_as_signer(kp: &Keypair, index: Option<u8>, signers: &[String], message: &randprotocol_core::Hash) -> Result<String> {
+    let index = match index {
+        Some(i) => i,
+        None => {
+            let me = kp.public_key().to_hex();
+            let at = signers.iter().position(|s| s.eq_ignore_ascii_case(&me)).with_context(|| {
+                format!("this key ({}) is not among the signers the prepared file lists; pass --index if the file's list is wrong", kp.address().to_base58())
+            })?;
+            at as u8
+        }
+    };
+    Ok(format!("{index}:{}", hex::encode(kp.sign(message.as_bytes()).as_bytes())))
+}
+
+/// `submit --signature` values (`<index>:<hex>`) as the action's list, in index order. Refuses
+/// what the chain would: a position named twice.
+fn parse_signer_signatures(signatures: &[String]) -> Result<Vec<randprotocol_core::types::actions::SignerSignature>> {
+    use randprotocol_core::types::actions::SignerSignature;
+    let mut list: Vec<SignerSignature> = Vec::with_capacity(signatures.len());
+    for s in signatures {
+        let (index, sig) = s.trim().split_once(':').with_context(|| format!("--signature takes <index>:<hex>, got {s}"))?;
+        let index: u8 = index.parse().with_context(|| format!("--signature index: {index}"))?;
+        let signature = randprotocol_core::crypto::Signature::from_bytes(&hex::decode(sig).context("--signature: not hex")?)
+            .map_err(|e| anyhow::anyhow!("--signature {index}: {e}"))?;
+        anyhow::ensure!(list.iter().all(|x| x.index != index), "signer {index} is given twice");
+        list.push(SignerSignature { index, signature });
+    }
+    list.sort_by_key(|x| x.index);
+    Ok(list)
+}
+
+fn parse_public_keys(keys: &[String]) -> Result<Vec<PublicKey>> {
+    keys.iter()
+        .enumerate()
+        .map(|(i, k)| PublicKey::from_hex(k.strip_prefix("0x").unwrap_or(k)).map_err(|e| anyhow::anyhow!("signer {i}: not a Dilithium2 public key: {e}")))
+        .collect()
+}
+
+/// 32 bytes from 64 hex characters (an optional `0x`), `what` naming the field in the error.
+fn parse_hex32(s: &str, what: &str) -> Result<[u8; 32]> {
+    hex::decode(s.strip_prefix("0x").unwrap_or(s))
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .with_context(|| format!("{s} is not a {what} (64 hex characters)"))
+}
+
+fn parse_multisig_account(s: &str) -> Result<[u8; 32]> {
+    parse_hex32(s, "multisig account id")
+}
+
+/// `rand-node multisig id`: the id from the command line's text, refusing a set the chain would.
+fn multisig_id(chain_id: u64, salt: &str, threshold: u8, signers: &[String]) -> Result<[u8; 32]> {
+    let salt = parse_hex32(salt, "salt")?;
+    let keys = parse_public_keys(signers)?;
+    randprotocol_core::ledger::multisig::check_signers(&keys, threshold).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(randprotocol_core::ledger::multisig::account_id(chain_id, &salt, threshold, &keys))
+}
+
+/// The note a multisig payout pays and the envelope that opens it: `to`, `PROGRAM_FROM`, the
+/// amount, the asset, `time` — the five fields `program_state::payout_commitment` hashes, so the
+/// chain's leaf is this note (`the_cli_payout_note_is_the_note_the_ledger_derives`). Sealed under
+/// a throwaway sender key, as [`sealed_withdraw_note`]; no memo.
+fn sealed_payout_note(to: &ShieldedAddress, amount: u64, asset: u32, time: u32, format: EnvelopeFormat) -> Result<(Note, Envelope)> {
+    let note = Note::new(to.pk, randprotocol_core::ledger::program_state::PROGRAM_FROM, amount, asset, time);
+    let throwaway = SpendKey::random().viewing_key();
+    let envelope = randprotocol_zkvm::address::seal_note_as(format, &throwaway, to, &note, &TxKey::random(), "")
+        .map_err(|e| anyhow::anyhow!("sealing the payout note to {to}: {e}"))?;
+    Ok((note, envelope))
+}
+
+/// The `--multisig` file: the section and its rules (`MultisigConfig::check`) on this chain id —
+/// the ids, and so the duplicate check, depend on it.
+fn read_multisig_config(path: &std::path::Path, chain_id: u64) -> Result<randprotocol_core::ledger::multisig::MultisigConfig> {
+    let cfg: randprotocol_core::ledger::multisig::MultisigConfig =
+        serde_json::from_str(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?)
+            .with_context(|| format!("{} is not a valid multisig config", path.display()))?;
+    cfg.check(chain_id).map_err(|e| anyhow::anyhow!("{} is not a valid multisig config: {e}", path.display()))?;
+    Ok(cfg)
+}
+
+/// The account as the node serves it (`rand_getMultisig`), refusing a chain without the section
+/// and an id the register does not hold.
+async fn multisig_account(rpc: &RpcClient, id: &[u8; 32]) -> Result<serde_json::Value> {
+    let v = rpc.call("rand_getMultisig", serde_json::json!([hex::encode(id)])).await?;
+    anyhow::ensure!(!v.is_null(), "no multisig account {} on this chain", hex::encode(id));
+    anyhow::ensure!(v["enabled"] != serde_json::json!(false), "this chain has no multisig section");
+    Ok(v)
+}
+
+/// The account's current signers (hex) and threshold from a `rand_getMultisig` reply.
+fn multisig_signers(v: &serde_json::Value) -> (Vec<String>, u8) {
+    let signers = v["signers"].as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    (signers, v["threshold"].as_u64().unwrap_or(0) as u8)
+}
+
+/// Send a multisig transaction (bundle-less) after checking the node serves the chain it was
+/// prepared for; wait for it to commit unless `no_wait`.
+async fn submit_multisig(rpc: String, prepared_chain: u64, action: randprotocol_core::Action, what: &str, no_wait: bool) -> Result<()> {
+    let rpc = RpcClient::new(rpc);
+    let chain_id = rpc.chain_id().await?;
+    anyhow::ensure!(chain_id == prepared_chain, "the {what} was prepared for chain {prepared_chain}, this node serves chain {chain_id}");
+    let tx = randprotocol_core::Transaction { chain_id, bundle: None, action };
+    let hash = rpc.send_transaction(&tx).await?;
+    if no_wait {
+        println!("submitted {what} {hash}");
+    } else {
+        let receipt = rpc.wait_for_transaction(&hash, wallet::COMMIT_TIMEOUT).await?;
+        println!("submitted {what} {hash}\n  committed in block {}", receipt.height);
+    }
+    Ok(())
+}
+
+async fn multisig_cmd(cmd: MultisigCmd) -> Result<()> {
+    match cmd {
+        MultisigCmd::Id { salt, threshold, signers, chain_id } => {
+            println!("{}", hex::encode(multisig_id(chain_id, &salt, threshold, &signers)?));
+        }
+        MultisigCmd::Status { account, rpc } => {
+            let v = multisig_account(&RpcClient::new(rpc), &parse_multisig_account(&account)?).await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        MultisigCmd::Pay { cmd } => match cmd {
+            PayCmd::Prepare { account, to, amount, asset, out, rpc } => {
+                anyhow::ensure!(!out.exists(), "{} exists: a prepared payment is never overwritten", out.display());
+                anyhow::ensure!(to.len() == amount.len(), "{} --to and {} --amount: one amount per recipient", to.len(), amount.len());
+                anyhow::ensure!(asset.is_empty() || asset.len() == to.len(), "{} --asset for {} --to: give it once per recipient, or not at all for RAND", asset.len(), to.len());
+                let mut payouts = Vec::with_capacity(to.len());
+                for (i, (t, a)) in to.iter().zip(&amount).enumerate() {
+                    let addr = ShieldedAddress::parse(t).map_err(|e| anyhow::anyhow!("{t} is not a shielded address: {e}"))?;
+                    payouts.push((addr, parse_amount(a)?, asset.get(i).copied().unwrap_or(0)));
+                }
+                let id = parse_multisig_account(&account)?;
+                let rpc = RpcClient::new(rpc);
+                let now = multisig_account(&rpc, &id).await?;
+                // The vault rows the chain will check (spec §5): RAND covers the base and every
+                // RAND payout, each token row its own payouts. Refused here rather than after
+                // every signer has signed.
+                let mut want: std::collections::BTreeMap<u32, u64> = [(0, randprotocol_core::gas::BUNDLE_BASE)].into();
+                for (_, a, asset) in &payouts {
+                    let w = want.entry(*asset).or_insert(0);
+                    *w = w.checked_add(*a).context("the payouts overflow")?;
+                }
+                let have = |asset: u32| -> u64 {
+                    now["vault"].as_array().into_iter().flatten()
+                        .find(|r| r["asset"].as_u64() == Some(asset as u64))
+                        .and_then(|r| r["amount"].as_str()?.parse().ok())
+                        .unwrap_or(0)
+                };
+                for (asset, want) in &want {
+                    anyhow::ensure!(
+                        have(*asset) >= *want,
+                        "account {account} holds {} of asset {asset}, the payment needs {} (the RAND row also pays the {} RAND bundle base)",
+                        format_amount(have(*asset)),
+                        format_amount(*want),
+                        format_amount(randprotocol_core::gas::BUNDLE_BASE)
+                    );
+                }
+                let nonce = now["nonce"].as_u64().context("the node's multisig reply has no nonce")?;
+                let chain_id = rpc.chain_id().await?;
+                let genesis = rpc.genesis_hash().await?;
+                let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
+                let mut proposal = PayProposal::new(chain_id, &genesis, &id, nonce, time, &payouts, envelope_format(&rpc, chain_id).await?)?;
+                (proposal.signers, proposal.threshold) = multisig_signers(&now);
+                std::fs::write(&out, serde_json::to_string_pretty(&proposal)?).with_context(|| format!("writing {}", out.display()))?;
+                let lines: Vec<String> = payouts
+                    .iter()
+                    .map(|(t, a, asset)| format!("  {} of asset {asset} to {} (fingerprint {})", format_amount(*a), t, t.fingerprint()))
+                    .collect();
+                println!(
+                    "prepared a payment from account {account}: {} payout(s), the {} RAND base from its RAND row\n{}\n  written to {}: {} of {} signers sign it (`multisig pay sign`), then `multisig pay submit`, within 256 blocks of height {time}",
+                    payouts.len(),
+                    format_amount(randprotocol_core::gas::BUNDLE_BASE),
+                    lines.join("\n"),
+                    out.display(),
+                    proposal.threshold,
+                    proposal.signers.len(),
+                );
+            }
+            PayCmd::Sign { proposal, key, index } => {
+                let kp = load_keypair(&key)?;
+                let proposal = PayProposal::read(&proposal)?;
+                let p = proposal.parts()?;
+                // stderr, so stdout is exactly the signature line a script passes on.
+                eprintln!(
+                    "signing a payment from multisig account {} on chain {} (genesis {}):\n  nonce {}, note time {}",
+                    proposal.account, p.chain_id, proposal.genesis, p.nonce, p.time
+                );
+                for pay in &p.pays {
+                    eprintln!(
+                        "  {} of asset {} to {} (fingerprint {})",
+                        format_amount(pay.amount),
+                        pay.asset,
+                        pay.recipient,
+                        pay.recipient.fingerprint()
+                    );
+                }
+                eprintln!("  plus the {} RAND bundle base from the account's RAND row\n  check every recipient before signing", format_amount(randprotocol_core::gas::BUNDLE_BASE));
+                println!("{}", proposal.sign(&kp, index)?);
+            }
+            PayCmd::Submit { proposal, signatures, rpc, no_wait } => {
+                let proposal = PayProposal::read(&proposal)?;
+                let action = proposal.action(&signatures)?;
+                let what = format!("payment of {} payout(s) from account {}", proposal.pays.len(), proposal.account);
+                submit_multisig(rpc, proposal.chain_id, action, &what, no_wait).await?;
+            }
+        },
+        MultisigCmd::Rotate { cmd } => match cmd {
+            RotateCmd::Prepare { account, signers, threshold, out, rpc } => {
+                anyhow::ensure!(!out.exists(), "{} exists: a prepared rotation is never overwritten", out.display());
+                let id = parse_multisig_account(&account)?;
+                let keys = parse_public_keys(&signers)?;
+                let rpc = RpcClient::new(rpc);
+                let now = multisig_account(&rpc, &id).await?;
+                let nonce = now["nonce"].as_u64().context("the node's multisig reply has no nonce")?;
+                let chain_id = rpc.chain_id().await?;
+                let genesis = rpc.genesis_hash().await?;
+                let mut proposal = RotateProposal::new(chain_id, &genesis, &id, nonce, &keys, threshold)?;
+                (proposal.signers, proposal.threshold) = multisig_signers(&now);
+                std::fs::write(&out, serde_json::to_string_pretty(&proposal)?).with_context(|| format!("writing {}", out.display()))?;
+                println!(
+                    "prepared a rotation of account {account} to {threshold} of {} new signers\n  written to {}: {} of {} current signers sign it (`multisig rotate sign`), then `multisig rotate submit`",
+                    keys.len(),
+                    out.display(),
+                    proposal.threshold,
+                    proposal.signers.len(),
+                );
+            }
+            RotateCmd::Sign { proposal, key, index } => {
+                let kp = load_keypair(&key)?;
+                let proposal = RotateProposal::read(&proposal)?;
+                let keys = proposal.new_keys()?;
+                eprintln!(
+                    "signing a rotation of multisig account {} on chain {} (genesis {}):\n  nonce {}, the new set {} of {}:",
+                    proposal.account,
+                    proposal.chain_id,
+                    proposal.genesis,
+                    proposal.nonce,
+                    proposal.new_threshold,
+                    keys.len()
+                );
+                for (i, k) in keys.iter().enumerate() {
+                    eprintln!("  {i}: {} ({})", randprotocol_core::Address::from_public_key(k).to_base58(), &proposal.new_signers[i][..16]);
+                }
+                eprintln!("  check every new key with its holder before signing");
+                println!("{}", proposal.sign(&kp, index)?);
+            }
+            RotateCmd::Submit { proposal, signatures, rpc, no_wait } => {
+                let proposal = RotateProposal::read(&proposal)?;
+                let action = proposal.action(&signatures)?;
+                let what = format!("rotation of account {} to {} of {}", proposal.account, proposal.new_threshold, proposal.new_signers.len());
+                submit_multisig(rpc, proposal.chain_id, action, &what, no_wait).await?;
+            }
+        },
+    }
+    Ok(())
+}
+
 /// The entry as the node serves it (`rand_getVesting`), refusing a chain without the section
 /// and an id the register does not hold. `at_ms` asks for the schedule at another time.
 async fn vesting_entry(rpc: &RpcClient, id: &[u8; 32], at_ms: Option<u64>) -> Result<serde_json::Value> {
@@ -1628,6 +2248,7 @@ async fn main() -> Result<()> {
             incremental_nullifier_root,
             envelope_bytes,
             vesting,
+            multisig,
             bundle_guest,
             auth_guest,
             hardening_v6,
@@ -1831,8 +2452,14 @@ async fn main() -> Result<()> {
                     None => None,
                 },
                 incremental_nullifier_root: incremental_nullifier_root.then_some(true),
-                // Multisig accounts are cut by adding a `multisig` section to the file by hand.
-                multisig: None,
+                // Multisig accounts: read from a `MultisigConfig` JSON file when `--multisig` is
+                // given (checked here against this chain id, and again by `Genesis::build`);
+                // omitted entirely otherwise, so a chain without the flag hashes byte-for-byte as
+                // before.
+                multisig: match &multisig {
+                    Some(path) => Some(read_multisig_config(path, chain_id)?),
+                    None => None,
+                },
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -1884,6 +2511,14 @@ async fn main() -> Result<()> {
             println!("{}", gas_summary(state.ledger.gas()));
             if let Some(p) = state.ledger.program_state() {
                 println!("program_state: cell fee {} RAND", format_amount(p.cell_fee));
+            }
+            // Spec §3: every seeded account by the id the chain keys it by — what its signers
+            // need to spend the RAND genesis put there — in id order.
+            if let Some(m) = state.ledger.multisig() {
+                println!("multisig: create fee {} RAND, {} account(s)", format_amount(m.create_fee), m.len());
+                for (id, a) in m.iter() {
+                    println!("  multisig {} {} RAND, {} of {} signers", hex::encode(id), format_amount(a.balance(0)), a.threshold, a.signers.len());
+                }
             }
         }
         Cmd::AllocNote { to, amount, asset, envelope_bytes } => {
@@ -2240,6 +2875,7 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::BridgeGov { cmd } => bridge_gov(cmd).await?,
+        Cmd::Multisig { cmd } => multisig_cmd(cmd).await?,
         Cmd::Vesting { cmd } => match cmd {
             VestingCmd::Status { entry, rpc } => {
                 let v = vesting_entry(&RpcClient::new(rpc), &parse_entry_id(&entry)?, None).await?;
@@ -4648,6 +5284,155 @@ mod tests {
         let mut edited = p.clone();
         edited.unvested = (unvested - 1).to_string();
         assert_eq!(verdict(&tx(edited.action(&sigs[..2]).unwrap())), Err(VestingError::BadSignature));
+    }
+
+    /// Multisig (spec §5): the note `rand-node multisig pay prepare` seals for a payout is the
+    /// note the ledger derives for it (`payout_commitment`: the recipient's `pk`, `PROGRAM_FROM`,
+    /// the amount, the asset, the action's `time`, the sealed blinding) — and the recipient's
+    /// wallet opens it.
+    #[test]
+    fn the_cli_payout_note_is_the_note_the_ledger_derives() {
+        use randprotocol_core::ledger::program_state::{payout_commitment, Payout};
+        let payee = SpendKey([9; 8]);
+        let to = randprotocol_zkvm::address::address_of(&payee.viewing_key());
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let (amount, asset, time) = (3 * UNITS_PER_RAND, 0, 77);
+        let (note, envelope) = sealed_payout_note(&to, amount, asset, time, EnvelopeFormat::Legacy).unwrap();
+        let payout = Payout { asset, amount, recipient: to.clone(), r: note.r, envelope: envelope.clone() };
+        let cm = payout_commitment(&payout, time, &ex);
+        assert_eq!(cm, note.commitment(), "the CLI's note is the chain's");
+        assert_ne!(payout_commitment(&payout, time + 1, &ex), cm, "stamped with the action's time");
+        let (_, opened) = randprotocol_zkvm::address::envelope_from_core(&envelope)
+            .open_as_receiver(cm, &payee.viewing_key())
+            .expect("the recipient's wallet opens its payout");
+        assert_eq!(opened, note);
+        assert_eq!((opened.amount, opened.asset), (amount, asset));
+        // A token payout is the same note at its asset.
+        let (tnote, tenv) = sealed_payout_note(&to, 5, 7, time, EnvelopeFormat::Legacy).unwrap();
+        let tpay = Payout { asset: 7, amount: 5, recipient: to.clone(), r: tnote.r, envelope: tenv };
+        assert_eq!(payout_commitment(&tpay, time, &ex), tnote.commitment());
+    }
+
+    /// `rand-node multisig id` derives exactly the id the ledger keys the account by, and refuses
+    /// a signer set the chain would refuse.
+    #[test]
+    fn multisig_id_derives_what_the_ledger_derives() {
+        use randprotocol_core::ledger::multisig::account_id;
+        let keys: Vec<PublicKey> = (1..=3u8).map(|i| Keypair::from_seed([i; 32]).unwrap().public_key().clone()).collect();
+        let hexes: Vec<String> = keys.iter().map(|k| k.to_hex()).collect();
+        let salt = hex::encode([7u8; 32]);
+        assert_eq!(multisig_id(20, &salt, 2, &hexes).unwrap(), account_id(20, &[7; 32], 2, &keys));
+        // The core crate's known-answer vector, through the CLI's parsing.
+        assert_eq!(hex::encode(multisig_id(20, &salt, 2, &hexes).unwrap()), "fedc03921236f89e18ffe73a692892e18fb1d7198db3d19e2d9ce31828f4da7c");
+        assert_ne!(multisig_id(21, &salt, 2, &hexes).unwrap(), multisig_id(20, &salt, 2, &hexes).unwrap(), "the chain is in the id");
+        assert!(multisig_id(20, &salt, 4, &hexes).unwrap_err().to_string().contains("threshold"));
+        assert!(multisig_id(20, "abcd", 2, &hexes).unwrap_err().to_string().contains("salt"));
+        assert!(multisig_id(20, &salt, 1, &["zz".to_string()]).is_err());
+    }
+
+    /// A ledger from the pinned genesis with a `multisig` section: one 2-of-3 account over the
+    /// keys seeded 20..23, holding 10 RAND.
+    fn multisig_ledger(ex: &ZkExecutor) -> (randprotocol_core::ledger::Ledger, [u8; 32], Vec<Keypair>) {
+        use randprotocol_core::ledger::multisig::{MultisigAccountConfig, MultisigConfig, MultisigRegister};
+        let signers: Vec<Keypair> = (20..23u8).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect();
+        let mut ledger = pinned_genesis().build(ex).unwrap().ledger;
+        let account = MultisigAccountConfig {
+            salt: [5; 32],
+            signers: signers.iter().map(|k| k.public_key().clone()).collect(),
+            threshold: 2,
+            balance: 10 * UNITS_PER_RAND,
+        };
+        let id = account.id(ledger.chain_id());
+        ledger.set_multisig(Some(MultisigRegister::from_config(&MultisigConfig { create_fee: 0, accounts: vec![account] }, ledger.chain_id())));
+        (ledger, id, signers)
+    }
+
+    /// Multisig (spec §7): `multisig pay prepare` → `sign` (per signer) → `submit` builds the
+    /// action the ledger accepts — the payout notes sealed by the first step, one message for
+    /// every signer, the signatures in index order — and the recipient's wallet opens the note.
+    #[test]
+    fn a_prepared_pay_signed_by_a_threshold_is_the_pay_the_ledger_accepts() {
+        use randprotocol_core::ledger::multisig::MultisigError;
+        use randprotocol_core::ledger::TxError;
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let (ledger, id, signers) = multisig_ledger(&ex);
+        let payee = SpendKey([9; 8]);
+        let to = randprotocol_zkvm::address::address_of(&payee.viewing_key());
+        let (chain_id, genesis, time) = (ledger.chain_id(), ledger.signing_domain().genesis, ledger.height() as u32);
+        let amount = 4 * UNITS_PER_RAND;
+        let mut p = PayProposal::new(chain_id, &genesis, &id, 0, time, &[(to.clone(), amount, 0)], EnvelopeFormat::Legacy).unwrap();
+        p.signers = signers.iter().map(|k| k.public_key().to_hex()).collect();
+        p.threshold = 2;
+        let p: PayProposal = serde_json::from_str(&serde_json::to_string_pretty(&p).unwrap()).unwrap();
+        let sigs: Vec<String> = signers.iter().map(|k| p.sign(k, None).unwrap()).collect();
+        assert!(sigs[2].starts_with("2:"), "{}", &sigs[2][..8]);
+        assert!(p.sign(&Keypair::from_seed([99; 32]).unwrap(), None).unwrap_err().to_string().contains("not among the signers"));
+        let tx = |action| randprotocol_core::Transaction { chain_id, bundle: None, action };
+        let verdict = |t: &randprotocol_core::Transaction| match ledger.validate(t, &ex) {
+            Err(TxError::Multisig(m)) => Err(m),
+            Err(other) => panic!("only a multisig refusal is expected here, got {other:?}"),
+            Ok(_) => Ok(()),
+        };
+        // 2 of 3, out of order: accepted, the list in index order.
+        let pay = tx(p.action(&[sigs[2].clone(), sigs[0].clone()]).unwrap());
+        let randprotocol_core::Action::MultisigPay { signatures, pays, .. } = &pay.action else { panic!("a pay") };
+        assert_eq!(signatures.iter().map(|s| s.index).collect::<Vec<_>>(), [0, 2]);
+        assert_eq!(verdict(&pay), Ok(()));
+        let cm = ledger.derived_commitment(&pay.action, &ex).expect("a pay creates a note");
+        let (_, opened) = randprotocol_zkvm::address::envelope_from_core(&pays[0].envelope)
+            .open_as_receiver(cm, &payee.viewing_key())
+            .expect("the recipient's wallet opens the payout");
+        assert_eq!((opened.amount, opened.r), (amount, pays[0].r));
+        // 1 of 3 is refused by the chain; the same signer twice, by `submit` itself.
+        assert_eq!(verdict(&tx(p.action(&sigs[..1]).unwrap())), Err(MultisigError::BelowThreshold { have: 1, need: 2 }));
+        assert!(p.action(&[sigs[0].clone(), sigs[0].clone()]).unwrap_err().to_string().contains("given twice"));
+        // A key signing under a position that is not its own.
+        let misplaced = p.sign(&signers[0], Some(1)).unwrap();
+        assert_eq!(verdict(&tx(p.action(&[sigs[0].clone(), misplaced]).unwrap())), Err(MultisigError::BadSignature(1)));
+        // A file edited after it was signed is another message.
+        let mut edited = p.clone();
+        edited.pays[0].amount = (amount - 1).to_string();
+        assert_eq!(verdict(&tx(edited.action(&sigs[..2]).unwrap())), Err(MultisigError::BadSignature(0)));
+    }
+
+    /// The rotate's three steps: the current set signs the new set and threshold; the ledger
+    /// accepts a threshold of them, refuses fewer, and refuses a signature by a new key or an
+    /// edited file.
+    #[test]
+    fn a_prepared_rotate_signed_by_a_threshold_is_the_rotate_the_ledger_accepts() {
+        use randprotocol_core::ledger::multisig::MultisigError;
+        use randprotocol_core::ledger::TxError;
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let (ledger, id, signers) = multisig_ledger(&ex);
+        let (chain_id, genesis) = (ledger.chain_id(), ledger.signing_domain().genesis);
+        let new: Vec<Keypair> = (30..32u8).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect();
+        let new_keys: Vec<PublicKey> = new.iter().map(|k| k.public_key().clone()).collect();
+        let mut p = RotateProposal::new(chain_id, &genesis, &id, 0, &new_keys, 2).unwrap();
+        p.signers = signers.iter().map(|k| k.public_key().to_hex()).collect();
+        p.threshold = 2;
+        let p: RotateProposal = serde_json::from_str(&serde_json::to_string_pretty(&p).unwrap()).unwrap();
+        assert!(RotateProposal::new(chain_id, &genesis, &id, 0, &new_keys, 3).unwrap_err().to_string().contains("threshold"), "a set the chain refuses is refused at prepare");
+        let sigs: Vec<String> = signers.iter().map(|k| p.sign(k, None).unwrap()).collect();
+        assert!(p.sign(&new[0], None).unwrap_err().to_string().contains("not among the signers"));
+        let tx = |action| randprotocol_core::Transaction { chain_id, bundle: None, action };
+        let verdict = |t: &randprotocol_core::Transaction| match ledger.validate(t, &ex) {
+            Err(TxError::Multisig(m)) => Err(m),
+            Err(other) => panic!("only a multisig refusal is expected here, got {other:?}"),
+            Ok(_) => Ok(()),
+        };
+        let rotate = tx(p.action(&[sigs[1].clone(), sigs[0].clone()]).unwrap());
+        let randprotocol_core::Action::MultisigRotate { signatures, signers: set, threshold, .. } = &rotate.action else { panic!("a rotate") };
+        assert_eq!(signatures.iter().map(|s| s.index).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!((set, *threshold), (&new_keys, 2));
+        assert_eq!(verdict(&rotate), Ok(()));
+        assert_eq!(verdict(&tx(p.action(&sigs[2..]).unwrap())), Err(MultisigError::BelowThreshold { have: 1, need: 2 }));
+        assert!(p.action(&[sigs[1].clone(), sigs[1].clone()]).unwrap_err().to_string().contains("given twice"));
+        // A new key cannot sign its own admission in an old key's place.
+        let by_new = p.sign(&new[0], Some(1)).unwrap();
+        assert_eq!(verdict(&tx(p.action(&[sigs[0].clone(), by_new]).unwrap())), Err(MultisigError::BadSignature(1)));
+        let mut edited = p.clone();
+        edited.new_threshold = 1;
+        assert_eq!(verdict(&tx(edited.action(&sigs[..2]).unwrap())), Err(MultisigError::BadSignature(0)));
     }
 
     /// Two allocations of the same amount to the same address are two different notes. A

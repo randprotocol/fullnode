@@ -508,3 +508,71 @@ fn the_genesis_command_refuses_a_fees_section_the_genesis_checks_refuse() {
         assert!(!refused.exists(), "{cfg}: and nothing is written");
     }
 }
+
+/// Multisig (spec §3, §7): `--multisig` writes a `MultisigConfig` file into the genesis, the chain
+/// it builds holds the seeded accounts at their balances, and the command prints each account's
+/// derived id — the id a treasury's signers need to find the RAND genesis put there — with its
+/// balance, threshold and signer count, in id order. The section is part of the genesis hash; a
+/// file that is not a valid section is refused and nothing is written.
+#[test]
+fn the_genesis_command_writes_the_multisig_section_and_prints_the_derived_ids() {
+    use randprotocol_core::ledger::multisig::{MultisigAccountConfig, MultisigConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let key = |i: u8| randprotocol_core::Keypair::from_seed([i; 32]).unwrap().public_key().clone();
+    let treasury = MultisigAccountConfig { salt: [3; 32], signers: vec![key(20), key(21), key(22)], threshold: 2, balance: 500_000 * randprotocol_core::UNITS_PER_RAND };
+    let unfunded = MultisigAccountConfig { salt: [4; 32], signers: vec![key(23)], threshold: 1, balance: 0 };
+    let cfg = MultisigConfig { create_fee: 1_000_000_000, accounts: vec![treasury.clone(), unfunded.clone()] };
+    let cfg_path = dir.path().join("multisig.json");
+    std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+
+    let out = dir.path().join("genesis.json");
+    let run = genesis(&out, &["--multisig", cfg_path.to_str().unwrap()]);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let gen = read(&out);
+    assert_eq!(gen.multisig.as_ref(), Some(&cfg), "the section is in the file unchanged");
+    let executor = ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test);
+    let state = gen.build(&executor).unwrap();
+    let reg = state.ledger.multisig().expect("the chain has the register");
+    let (tid, uid) = (treasury.id(14), unfunded.id(14));
+    assert_eq!(reg.get(&tid).unwrap().balance(0), treasury.balance, "the treasury's RAND is in its vault");
+
+    // What the operator is told: the hash, then the section and every account by its id.
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert_eq!(printed_hash(&run, "genesis hash "), state.hash().to_hex());
+    assert!(stdout.contains("multisig: create fee 1 RAND, 2 account(s)"), "{stdout}");
+    let line_t = format!("  multisig {} 500000 RAND, 2 of 3 signers", hex::encode(tid));
+    let line_u = format!("  multisig {} 0 RAND, 1 of 1 signers", hex::encode(uid));
+    assert!(stdout.contains(&line_t), "{stdout}");
+    assert!(stdout.contains(&line_u), "{stdout}");
+    let (at_t, at_u) = (stdout.find(&line_t).unwrap(), stdout.find(&line_u).unwrap());
+    assert_eq!(at_t < at_u, tid < uid, "the accounts are listed in id order: {stdout}");
+    assert!(stdout.find("genesis hash").unwrap() < at_t.min(at_u), "after the genesis hash: {stdout}");
+
+    // Without the flag: no section, nothing printed, another hash.
+    let plain = dir.path().join("plain.json");
+    let run_plain = genesis(&plain, &[]);
+    assert!(run_plain.status.success());
+    assert!(read(&plain).multisig.is_none());
+    assert!(!String::from_utf8_lossy(&run_plain.stdout).contains("multisig"));
+    assert_ne!(printed_hash(&run_plain, "genesis hash "), printed_hash(&run, "genesis hash "), "the section is bound by the genesis hash");
+
+    // Not a section (a misspelled key), or one `check` refuses (threshold above the signers):
+    // refused, and nothing is written.
+    for (name, body) in [
+        ("misspelled.json", r#"{"create_fee":"0","acounts":[]}"#.to_string()),
+        ("threshold.json", {
+            let mut bad = cfg.clone();
+            bad.accounts[1].threshold = 2;
+            serde_json::to_string(&bad).unwrap()
+        }),
+    ] {
+        let bad_path = dir.path().join(name);
+        std::fs::write(&bad_path, body).unwrap();
+        let refused = dir.path().join(format!("refused-{name}"));
+        let run = genesis(&refused, &["--multisig", bad_path.to_str().unwrap()]);
+        assert!(!run.status.success(), "{name}");
+        let err = String::from_utf8_lossy(&run.stderr);
+        assert!(err.contains("not a valid multisig config"), "{name}: {err}");
+        assert!(!refused.exists(), "{name}");
+    }
+}
