@@ -110,7 +110,18 @@ pub fn rebuild(compact: CompactBlock, mut lookup: impl FnMut(&Hash) -> Option<Tr
     Rebuilt::Missing { compact, have, missing }
 }
 
-/// A compact proposal waiting for its bodies (spec §5.3): one per node, the newest view wins.
+/// One of a park's outstanding transaction fetches.
+#[derive(Clone, Debug)]
+pub struct InFlight {
+    pub id: OutboundRequestId,
+    /// The peer it went to.
+    pub peer: PeerId,
+    /// The hashes it asked for.
+    pub hashes: Vec<Hash>,
+    pub sent: Instant,
+}
+
+/// A compact proposal waiting for its bodies (spec §5.3; the node keeps up to two, by view).
 pub struct Parked {
     /// Header, signature and hashes.
     pub compact: CompactBlock,
@@ -118,17 +129,53 @@ pub struct Parked {
     pub have: Vec<Option<Transaction>>,
     /// The forwarder.
     pub from: PeerId,
-    /// Peers asked so far (bounded by the node's fetch-attempt limit).
-    pub attempts: usize,
+    /// The distinct peers asked so far, each counted once however many batches it was sent
+    /// (final review I7); [`Parked::attempts`] is their number, bounded by the node's
+    /// fetch-attempt limit.
     pub asked: Vec<PeerId>,
-    /// Outstanding requests, each with the hashes it asked for.
-    pub inflight: Vec<(OutboundRequestId, Vec<Hash>, Instant)>,
+    /// Peers that answered `Busy` and have nothing else of this park's in flight: not counted
+    /// as asked, and tried again only after every other candidate (final review I7).
+    pub busy: Vec<PeerId>,
+    /// Outstanding requests.
+    pub inflight: Vec<InFlight>,
     pub since: Instant,
 }
 
 impl Parked {
     pub fn new(compact: CompactBlock, have: Vec<Option<Transaction>>, from: PeerId, now: Instant) -> Parked {
-        Parked { compact, have, from, attempts: 0, asked: Vec::new(), inflight: Vec::new(), since: now }
+        Parked { compact, have, from, asked: Vec::new(), busy: Vec::new(), inflight: Vec::new(), since: now }
+    }
+
+    /// Fetch attempts so far: the distinct peers asked, a `Busy` answer not counted (final
+    /// review I7).
+    pub fn attempts(&self) -> usize {
+        self.asked.len()
+    }
+
+    /// Count `peer` as asked: once, however many batches it is sent, and no longer busy.
+    pub fn note_asked(&mut self, peer: PeerId) {
+        self.busy.retain(|p| *p != peer);
+        if !self.asked.contains(&peer) {
+            self.asked.push(peer);
+        }
+    }
+
+    /// `peer` answered a request `Busy` (final review I7): with nothing else of this park's
+    /// out to it, it is no longer counted as asked and goes to the back of the line — tried
+    /// again after every other candidate.
+    pub fn note_busy(&mut self, peer: PeerId) {
+        if self.inflight.iter().any(|f| f.peer == peer) {
+            return;
+        }
+        self.asked.retain(|p| *p != peer);
+        if !self.busy.contains(&peer) {
+            self.busy.push(peer);
+        }
+    }
+
+    /// Whether `h` names a position still empty.
+    pub fn wants(&self, h: &Hash) -> bool {
+        self.compact.tx_hashes.iter().zip(&self.have).any(|(x, t)| x == h && t.is_none())
     }
 
     pub fn view(&self) -> u64 {
@@ -141,10 +188,9 @@ impl Parked {
     }
 
     /// The hashes still to ask for, in block order, chunked by [`TX_FETCH_BATCH`], minus those
-    /// a request already in flight asked for. The caller passes the in-flight hashes (they live
-    /// in `inflight`, beside each request's id).
-    pub fn next_batches(&self, in_flight: &[Vec<Hash>]) -> Vec<Vec<Hash>> {
-        let pending: HashSet<Hash> = in_flight.iter().flatten().copied().collect();
+    /// a request in `inflight` already asked for.
+    pub fn next_batches(&self) -> Vec<Vec<Hash>> {
+        let pending: HashSet<Hash> = self.inflight.iter().flat_map(|f| f.hashes.iter()).copied().collect();
         let wanted: Vec<Hash> = self.missing().into_iter().filter(|h| !pending.contains(h)).collect();
         wanted.chunks(TX_FETCH_BATCH).map(<[Hash]>::to_vec).collect()
     }
@@ -174,7 +220,7 @@ impl Parked {
     /// were dropped; each was counted as an attempt when sent, and its peer stays asked.
     pub fn expire(&mut self, timeout: Duration, now: Instant) -> usize {
         let before = self.inflight.len();
-        self.inflight.retain(|(_, _, sent)| now.saturating_duration_since(*sent) <= timeout);
+        self.inflight.retain(|f| now.saturating_duration_since(f.sent) <= timeout);
         before - self.inflight.len()
     }
 
@@ -273,7 +319,7 @@ pub(crate) mod tests {
         let have = vec![Some(txs[0].clone()), None, None];
         let mut p = Parked::new(compact, have, PeerId::random(), Instant::now());
         assert_eq!(p.missing(), vec![txs[1].hash(), txs[2].hash()]);
-        assert_eq!(p.next_batches(&[]), vec![vec![txs[1].hash(), txs[2].hash()]]);
+        assert_eq!(p.next_batches(), vec![vec![txs[1].hash(), txs[2].hash()]]);
         let stranger = mint(9);
         assert_eq!(p.accept(vec![stranger, txs[2].clone()]), 1, "the stranger is discarded");
         assert!(!p.complete());
@@ -287,10 +333,11 @@ pub(crate) mod tests {
         let txs: Vec<Transaction> = (1..=5u8).map(mint).collect();
         let block = block_of(txs.clone());
         let compact = CompactBlock::of(&block);
-        let p = Parked::new(compact, vec![None; 5], PeerId::random(), Instant::now());
-        assert_eq!(p.next_batches(&[]).len(), 1, "five hashes are one batch of the real size");
-        let asked = vec![vec![txs[0].hash(), txs[1].hash()]];
-        assert_eq!(p.next_batches(&asked), vec![txs[2..].iter().map(|t| t.hash()).collect::<Vec<_>>()]);
+        let mut p = Parked::new(compact, vec![None; 5], PeerId::random(), Instant::now());
+        assert_eq!(p.next_batches().len(), 1, "five hashes are one batch of the real size");
+        let id = test_request_ids(1)[0];
+        p.inflight.push(InFlight { id, peer: PeerId::random(), hashes: vec![txs[0].hash(), txs[1].hash()], sent: Instant::now() });
+        assert_eq!(p.next_batches(), vec![txs[2..].iter().map(|t| t.hash()).collect::<Vec<_>>()]);
     }
 
     #[test]
@@ -299,7 +346,7 @@ pub(crate) mod tests {
         let txs: Vec<Transaction> = (0..n).map(|i| mint_n(i as u32)).collect();
         let block = block_of(txs);
         let p = Parked::new(CompactBlock::of(&block), vec![None; n], PeerId::random(), Instant::now());
-        let b = p.next_batches(&[]);
+        let b = p.next_batches();
         assert_eq!(b.iter().map(Vec::len).collect::<Vec<_>>(), vec![TX_FETCH_BATCH, 3]);
     }
 
@@ -311,11 +358,39 @@ pub(crate) mod tests {
         let mut p = Parked::new(CompactBlock::of(&block), vec![None; 2], PeerId::random(), Instant::now());
         let ids = test_request_ids(2);
         let now = Instant::now() + Duration::from_secs(60);
-        p.inflight.push((ids[0], vec![txs[0].hash()], now - Duration::from_secs(31)));
-        p.inflight.push((ids[1], vec![txs[1].hash()], now - Duration::from_secs(5)));
+        let peer = PeerId::random();
+        p.inflight.push(InFlight { id: ids[0], peer, hashes: vec![txs[0].hash()], sent: now - Duration::from_secs(31) });
+        p.inflight.push(InFlight { id: ids[1], peer, hashes: vec![txs[1].hash()], sent: now - Duration::from_secs(5) });
         assert_eq!(p.expire(Duration::from_secs(30), now), 1);
-        assert_eq!(p.inflight.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(), vec![ids[1]]);
+        assert_eq!(p.inflight.iter().map(|f| f.id).collect::<Vec<_>>(), vec![ids[1]]);
         assert_eq!(p.expire(Duration::from_secs(30), now), 0);
+    }
+
+    /// Final review I7: a peer counts once however many batches it is sent; a `Busy` peer with
+    /// nothing else out is uncounted and queued behind the others; asked again, it counts once.
+    #[test]
+    fn attempts_count_distinct_peers_and_not_busy_answers() {
+        let txs: Vec<Transaction> = (1..=2u8).map(mint).collect();
+        let mut p = Parked::new(CompactBlock::of(&block_of(txs.clone())), vec![None; 2], PeerId::random(), Instant::now());
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let ids = test_request_ids(2);
+        p.note_asked(a);
+        p.note_asked(a);
+        assert_eq!(p.attempts(), 1, "two batches to one peer are one attempt");
+        p.inflight.push(InFlight { id: ids[0], peer: a, hashes: vec![txs[0].hash()], sent: Instant::now() });
+        p.inflight.push(InFlight { id: ids[1], peer: a, hashes: vec![txs[1].hash()], sent: Instant::now() });
+        p.inflight.retain(|f| f.id != ids[0]);
+        p.note_busy(a);
+        assert_eq!((p.attempts(), p.busy.len()), (1, 0), "a busy answer with another request out to the peer changes nothing");
+        p.inflight.clear();
+        p.note_busy(a);
+        assert_eq!((p.attempts(), p.busy.clone()), (0, vec![a]), "busy: not counted, queued");
+        p.note_asked(b);
+        p.note_asked(a);
+        assert_eq!((p.attempts(), p.busy.len()), (2, 0), "asked again, it counts once");
+        assert!(p.wants(&txs[0].hash()));
+        p.accept(vec![txs[0].clone()]);
+        assert!(!p.wants(&txs[0].hash()), "a filled position is not wanted");
     }
 
     /// `tx` with its bundle proof in the pruned marker form: the same id, different bytes.

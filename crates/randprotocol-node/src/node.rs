@@ -3390,7 +3390,7 @@ impl Node {
                     tracing::info!(%peer, ?request_id, "sync request failed: {error}");
                 }
                 self.retry_fetch(request_id).await?;
-                self.retry_parked_request(request_id).await?;
+                self.retry_parked_request(peer, request_id, false).await?;
                 if was_batch {
                     // Straight to another peer rather than waiting out the 2 s tick.
                     self.sync_from(Some(peer)).await;
@@ -3659,7 +3659,7 @@ impl Node {
                     self.parked.remove(&old);
                 }
                 self.parked.insert(view, compact::Parked::new(compact, have, forwarder, now));
-                self.request_parked_bodies(view).await;
+                self.request_parked_bodies(view, false).await;
                 Ok(())
             }
         }
@@ -3705,43 +3705,50 @@ impl Node {
 
     /// The view of the park that sent `request_id`, if any park did.
     fn park_of_request(&self, request_id: libp2p::request_response::OutboundRequestId) -> Option<u64> {
-        self.parked.iter().find(|(_, p)| p.inflight.iter().any(|(rid, _, _)| *rid == request_id)).map(|(v, _)| *v)
+        self.parked.iter().find(|(_, p)| p.inflight.iter().any(|f| f.id == request_id)).map(|(v, _)| *v)
     }
 
     /// Ask the next peer for the missing bodies of the park at `view` (spec 2026-10-08 §5.3), in
     /// batches of at most [`crate::network::TX_FETCH_BATCH`] hashes not already in flight: the
     /// leader's bound peer first (the forwarder when the leader is unbound), then
-    /// [`Node::fetch_candidates`]'s order, under the same [`MAX_FETCH_ATTEMPTS`] cap as a block
-    /// fetch. With no peer left to ask and nothing in flight, the park is dropped and the view
-    /// times out as it does on a parent nobody can supply.
-    async fn request_parked_bodies(&mut self, view: u64) {
+    /// [`Node::fetch_candidates`]'s order, and peers that answered `Busy` only after every other
+    /// candidate and only when `retry_busy` (the status tick), so a busy peer is not asked again
+    /// at round-trip speed. Attempts are distinct peers asked, a `Busy` answer not counted
+    /// (final review I7), under the same [`MAX_FETCH_ATTEMPTS`] cap as a block fetch. With no
+    /// peer left to ask, nothing in flight and no busy peer to come back to, the park is dropped
+    /// and the view times out as it does on a parent nobody can supply.
+    async fn request_parked_bodies(&mut self, view: u64, retry_busy: bool) {
         let Some(p) = self.parked.get(&view) else { return };
-        let in_flight: Vec<Vec<Hash>> = p.inflight.iter().map(|(_, h, _)| h.clone()).collect();
-        let batches = p.next_batches(&in_flight);
+        let batches = p.next_batches();
         if batches.is_empty() {
             return;
         }
-        if p.attempts >= MAX_FETCH_ATTEMPTS {
-            tracing::warn!("compact proposal view {view}: no peer supplied its bodies in {} attempts; dropped", p.attempts);
+        if p.attempts() >= MAX_FETCH_ATTEMPTS {
+            tracing::warn!("compact proposal view {view}: no peer supplied its bodies in {} attempts; dropped", p.attempts());
             self.parked.remove(&view);
             return;
         }
         // The leader's peer when its binding is known, else the forwarder: the one peer known to
         // have had the proposal (§5.3).
         let first = self.peer_bindings.get(&p.compact.header.proposer.address()).map_or(p.from, |b| b.peer);
-        let Some(peer) = self.fetch_candidates(&p.asked, Some(first)).first().copied() else {
-            tracing::warn!("compact proposal view {view}: no peer left to ask for its bodies; dropped");
-            self.parked.remove(&view);
+        let skip: Vec<PeerId> = p.asked.iter().chain(&p.busy).copied().collect();
+        let fresh = self.fetch_candidates(&skip, Some(first)).first().copied();
+        let connected = |q: &PeerId| self.peers.get(q).is_some_and(|peer| peer.connected);
+        let again = if retry_busy { p.busy.iter().find(|q| connected(q)).copied() } else { None };
+        let Some(peer) = fresh.or(again) else {
+            if p.inflight.is_empty() && !p.busy.iter().any(connected) {
+                tracing::warn!("compact proposal view {view}: no peer left to ask for its bodies; dropped");
+                self.parked.remove(&view);
+            }
             return;
         };
         if let Some(p) = self.parked.get_mut(&view) {
-            p.attempts += 1;
-            p.asked.push(peer);
+            p.note_asked(peer);
         }
         for batch in batches {
-            if let Some(rid) = self.net.send_sync_request(peer, SyncRequest::Transactions(batch.clone())).await {
+            if let Some(id) = self.net.send_sync_request(peer, SyncRequest::Transactions(batch.clone())).await {
                 if let Some(p) = self.parked.get_mut(&view) {
-                    p.inflight.push((rid, batch, Instant::now()));
+                    p.inflight.push(compact::InFlight { id, peer, hashes: batch, sent: Instant::now() });
                 }
             }
         }
@@ -3766,8 +3773,8 @@ impl Node {
             return Ok(());
         };
         let p = self.parked.get_mut(&view).expect("found above");
-        let i = p.inflight.iter().position(|(rid, _, _)| *rid == request_id).expect("found above");
-        let (_, asked, _) = p.inflight.remove(i);
+        let i = p.inflight.iter().position(|f| f.id == request_id).expect("found above");
+        let asked = p.inflight.remove(i).hashes;
         let returned = txs.len();
         let placed = p.accept(txs);
         self.compact_fetched += placed as u64;
@@ -3776,7 +3783,7 @@ impl Node {
             return self.complete_park(view).await;
         }
         if p.inflight.is_empty() {
-            self.request_parked_bodies(view).await;
+            self.request_parked_bodies(view, false).await;
         }
         Ok(())
     }
@@ -3793,14 +3800,19 @@ impl Node {
     }
 
     /// One of a park's transaction fetches failed or was answered `Busy`: it leaves `inflight`
-    /// and its hashes are asked of the next peer (spec 2026-10-08 §5.3). Anything else's request
-    /// id is left alone.
-    async fn retry_parked_request(&mut self, request_id: libp2p::request_response::OutboundRequestId) -> Result<()> {
+    /// and its hashes are asked of the next peer (spec 2026-10-08 §5.3). A failure keeps the
+    /// peer counted as an attempt; a `Busy` answer does not (final review I7) — the peer goes to
+    /// the back of the line ([`compact::Parked::note_busy`]). Anything else's request id is left
+    /// alone.
+    async fn retry_parked_request(&mut self, peer: PeerId, request_id: libp2p::request_response::OutboundRequestId, busy: bool) -> Result<()> {
         let Some(view) = self.park_of_request(request_id) else { return Ok(()) };
         if let Some(p) = self.parked.get_mut(&view) {
-            p.inflight.retain(|(rid, _, _)| *rid != request_id);
+            p.inflight.retain(|f| f.id != request_id);
+            if busy {
+                p.note_busy(peer);
+            }
         }
-        self.request_parked_bodies(view).await;
+        self.request_parked_bodies(view, false).await;
         Ok(())
     }
 
@@ -3817,7 +3829,7 @@ impl Node {
             if expired > 0 {
                 tracing::debug!(view, expired, "parked proposal's transaction fetches got no answer within the wire timeout; asking again");
             }
-            self.request_parked_bodies(view).await;
+            self.request_parked_bodies(view, true).await;
         }
     }
 
@@ -3979,7 +3991,7 @@ impl Node {
                     // A batch or a park's transaction fetch is answered busy; a by-hash fetch
                     // that somehow is moves on like a `Block(None)`.
                     self.retry_fetch(request_id).await?;
-                    self.retry_parked_request(request_id).await?;
+                    self.retry_parked_request(peer, request_id, true).await?;
                 }
             }
             SyncResponse::Blocks(blocks) => {
@@ -6355,7 +6367,7 @@ mod tests {
         assert!(!node.hs.has_block(&block.hash()));
         let p = the_park(&node).expect("parked");
         assert_eq!(p.missing(), vec![tx.hash()]);
-        assert_eq!((p.attempts, p.asked.clone()), (1, vec![leader_peer]));
+        assert_eq!((p.attempts(), p.asked.clone()), (1, vec![leader_peer]));
         let sent = drain(&mut seen).await;
         assert_eq!(tx_fetches(&sent), vec![(leader_peer, vec![tx.hash()])], "the leader's peer first");
         assert_eq!(reports(&sent), vec![libp2p::gossipsub::MessageAcceptance::Accept], "reported once");
@@ -6405,7 +6417,7 @@ mod tests {
         node.on_compact_proposal(CompactBlock::of(&at_v2), gossip_id()).await.unwrap();
         assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v + 1, v + 2], "its successor parks in the second slot");
         node.on_compact_proposal(CompactBlock::of(&at_v1), gossip_id()).await.unwrap();
-        assert_eq!(node.parked.get(&(v + 1)).map(|p| (p.compact.hash(), p.attempts)), Some((at_v1.hash(), 1)), "a redelivery keeps the park");
+        assert_eq!(node.parked.get(&(v + 1)).map(|p| (p.compact.hash(), p.attempts())), Some((at_v1.hash(), 1)), "a redelivery keeps the park");
         assert_eq!(node.highest_proposal_seen, at_v2.height(), "every pre-screened proposal counts");
 
         let sent = drain(&mut seen).await;
@@ -6600,7 +6612,7 @@ mod tests {
 
     /// The id of the park's oldest request in flight.
     fn parked_request(node: &Node) -> libp2p::request_response::OutboundRequestId {
-        the_park(&node).expect("parked").inflight[0].0
+        the_park(&node).expect("parked").inflight[0].id
     }
 
     /// Whether `sent` holds this node's vote for `block`.
@@ -6636,7 +6648,7 @@ mod tests {
         node.on_sync_response(first, rid, SyncResponse::Transactions(vec![txs[0].clone()])).await.unwrap();
         let p = the_park(&node).expect("still parked");
         assert_eq!(p.missing(), vec![txs[1].hash()]);
-        assert_eq!((p.inflight.len(), p.attempts), (1, 2));
+        assert_eq!((p.inflight.len(), p.attempts()), (1, 2));
         let asked = tx_fetches(&drain(&mut seen).await);
         assert_eq!(asked.len(), 1);
         assert_ne!(asked[0].0, first, "another peer");
@@ -6695,7 +6707,75 @@ mod tests {
         assert_eq!(asked.len(), 1);
         assert!(asked[0].0 != first && asked[0].0 != second, "a third peer");
         assert_eq!(asked[0].1, vec![txs[0].hash()]);
-        assert_eq!(the_park(&node).map(|p| (p.inflight.len(), p.attempts)), Some((1, 3)));
+        assert_eq!(
+            the_park(&node).map(|p| (p.inflight.len(), p.attempts(), p.busy.clone())),
+            Some((1, 2, vec![second])),
+            "the failure counts, the busy answer does not (final review I7)"
+        );
+    }
+
+    /// Final review I7: a peer sent several batches in one go is one attempt.
+    #[tokio::test]
+    async fn a_peer_asked_several_batches_is_one_attempt() {
+        let n = network::TX_FETCH_BATCH as u32 + 1;
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node_answering(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        // `next_tx`'s words collide past ten; these are distinct for every `i`.
+        let w = |i: u32, k: u32| [1_000_000 + 4 * i + k; 8];
+        let txs: Vec<Transaction> = (0..n).map(|i| bundle_tx(&ledger, [w(i, 0), w(i, 1)], [w(i, 2), w(i, 3)], bundle_fee())).collect();
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), txs);
+        claiming_peer(&mut node, 4);
+        claiming_peer(&mut node, 4);
+        node.on_compact_proposal(CompactBlock::of(&block), gossip_id()).await.unwrap();
+        let asked = tx_fetches(&drain(&mut seen).await);
+        assert_eq!(asked.iter().map(|(_, h)| h.len()).collect::<Vec<_>>(), vec![network::TX_FETCH_BATCH, 1], "two batches");
+        assert_eq!(asked[0].0, asked[1].0, "to one peer");
+        assert_eq!(the_park(&node).map(|p| (p.inflight.len(), p.attempts())), Some((2, 1)), "one attempt");
+    }
+
+    /// Final review I7: `Busy` answers cost no attempt. Every peer busy, the park waits — it is
+    /// neither dropped nor re-asked at round-trip speed — and the status tick asks the first
+    /// busy peer again.
+    #[tokio::test]
+    async fn busy_answers_cost_no_attempt_and_busy_peers_are_retried_on_the_tick() {
+        let (_d, mut node, mut seen, _block, txs, first) = parked_node(1, 2).await;
+        node.on_sync_response(first, parked_request(&node), SyncResponse::Busy).await.unwrap();
+        let asked = tx_fetches(&drain(&mut seen).await);
+        assert_eq!(asked.len(), 1);
+        let second = asked[0].0;
+        assert_ne!(second, first, "the other peer first");
+        assert_eq!(the_park(&node).map(|p| p.attempts()), Some(1), "the busy answer did not count");
+        node.on_sync_response(second, parked_request(&node), SyncResponse::Busy).await.unwrap();
+        assert_eq!(tx_fetches(&drain(&mut seen).await), vec![], "only busy peers left: not asked again at once");
+        assert_eq!(the_park(&node).map(|p| (p.attempts(), p.inflight.len(), p.busy.clone())), Some((0, 0, vec![first, second])), "kept");
+        node.expire_parked_requests().await;
+        assert_eq!(tx_fetches(&drain(&mut seen).await), vec![(first, vec![txs[0].hash()])], "the tick asks the first busy peer again");
+        assert_eq!(the_park(&node).map(|p| (p.attempts(), p.busy.clone())), Some((1, vec![second])));
+    }
+
+    /// Final review I6 (a): peers that answer with nothing usable each cost an attempt, and at
+    /// `MAX_FETCH_ATTEMPTS` distinct peers the park is dropped, with peers still unasked.
+    #[tokio::test]
+    async fn exhausting_the_fetch_attempts_drops_the_park() {
+        let (_d, mut node, mut seen, _block, _txs, first) = parked_node(1, MAX_FETCH_ATTEMPTS + 2).await;
+        let mut peers = vec![first];
+        for i in 0..MAX_FETCH_ATTEMPTS {
+            let peer = *peers.last().unwrap();
+            node.on_sync_response(peer, parked_request(&node), SyncResponse::Transactions(vec![])).await.unwrap();
+            let asked = tx_fetches(&drain(&mut seen).await);
+            if i + 1 < MAX_FETCH_ATTEMPTS {
+                assert_eq!(asked.len(), 1, "answer {i}: the next peer is asked");
+                peers.push(asked[0].0);
+            } else {
+                assert_eq!(asked, vec![], "the cap reached: nobody else is asked");
+            }
+        }
+        peers.sort();
+        peers.dedup();
+        assert_eq!(peers.len(), MAX_FETCH_ATTEMPTS, "distinct peers");
+        assert!(node.parked.is_empty(), "the park is dropped");
     }
 
     /// A response completing a park for a block the replica already holds — it came another
@@ -6727,14 +6807,14 @@ mod tests {
 
         let timeout = node.wire.sync_request_timeout;
         let sent = Instant::now().checked_sub(timeout + Duration::from_secs(1)).expect("a monotonic clock past the timeout");
-        node.parked.values_mut().next().unwrap().inflight[0].2 = sent;
+        node.parked.values_mut().next().unwrap().inflight[0].sent = sent;
         node.expire_parked_requests().await;
         let asked = tx_fetches(&drain(&mut seen).await);
         assert_eq!(asked.len(), 1);
         assert_ne!(asked[0].0, first, "another peer");
         assert_eq!(asked[0].1, vec![txs[0].hash()]);
         let p = the_park(&node).unwrap();
-        assert_eq!((p.inflight.len(), p.attempts), (1, 2));
+        assert_eq!((p.inflight.len(), p.attempts()), (1, 2));
     }
 
     /// The server answers from the pool and the recent cache, in the order asked, never with a
