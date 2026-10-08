@@ -301,6 +301,11 @@ pub fn fee_floor(action: &Action) -> u64 {
         // A bond is the one staking action that rides on a bundle — the bundle is what burns the
         // stake out of the pool — so it pays the plain base like a transfer.
         Action::Bond { .. } => BUNDLE_BASE,
+        // Multisig: a create and a deposit ride a bundle and pay the plain base (a create owes the
+        // genesis `create_fee` on top, a ledger fact charged by `ledger::multisig::validate`); a
+        // pay takes its base out of the vault and a rotate is fee-less, both bundle-less.
+        Action::CreateMultisig { .. } | Action::MultisigDeposit { .. } => BUNDLE_BASE,
+        Action::MultisigPay { .. } | Action::MultisigRotate { .. } => 0,
         // An attestation's decode and guardian signature recovery are cheap next to a STARK
         // verify, and the bundle base already covers the one bundle it carries. No bridge
         // charge on top: the relayer pays this one, for a depositor who has no RAND yet.

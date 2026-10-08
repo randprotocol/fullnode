@@ -2131,6 +2131,9 @@ impl Ledger {
             // vault (or, for the program's own token, what is destroyed), and
             // `program_state::validate` decides which.
             Action::TokenBurn { .. } | Action::BridgeBurn { .. } | Action::Invoke { .. } => {}
+            // Multisig: a create and a deposit may set all three, like an `Invoke`; the module's
+            // own rules decide what the burn funds (`multisig::validate`, after its gate).
+            Action::CreateMultisig { .. } | Action::MultisigDeposit { .. } => {}
             _ => {
                 no_asset_burn(b)?;
                 if b.burn_r != 0 {
@@ -2386,6 +2389,19 @@ impl Ledger {
                     self.check_note_envelope(&p.envelope)?;
                 }
             }
+            // Multisig: the payout count is capped first (bounded envelope checks), then every
+            // payout note carries a note envelope.
+            Action::MultisigPay { pays, .. } => {
+                if pays.is_empty() {
+                    return Err(multisig::MultisigError::NoPayouts.into());
+                }
+                if pays.len() > multisig::MAX_PAYOUTS {
+                    return Err(multisig::MultisigError::TooManyPayouts(pays.len()).into());
+                }
+                for p in pays {
+                    self.check_note_envelope(&p.envelope)?;
+                }
+            }
             _ => {}
         }
         match &tx.action {
@@ -2458,7 +2474,8 @@ impl Ledger {
         | Action::WithdrawAggregator { time, .. }
         | Action::Mint { time, .. }
         | Action::ClaimVested { time, .. }
-        | Action::RevokeVesting { time, .. } = &tx.action
+        | Action::RevokeVesting { time, .. }
+        | Action::MultisigPay { time, .. } = &tx.action
         {
             self.check_time(*time)?;
         }
@@ -2574,6 +2591,12 @@ impl Ledger {
                 }
                 call_record = Some(self.programs.get(program).ok_or(TxError::UnknownProgram(*program))?);
             }
+            // Multisig: gated on the genesis `multisig` section, which `multisig::validate` checks
+            // before anything else (it also owes a create's `create_fee` floor).
+            a @ (Action::CreateMultisig { .. }
+            | Action::MultisigDeposit { .. }
+            | Action::MultisigPay { .. }
+            | Action::MultisigRotate { .. }) => multisig::validate(self, tx, a, executor)?,
             // `AdmitValidator` (audit v6, STAKE-2) is the register's too: gated on
             // `staking.admission_by_vote`, which `staking::validate` checks before anything else.
             a @ (Action::Bond { .. }
@@ -2912,6 +2935,10 @@ impl Ledger {
                     );
                 }
             }
+            a @ (Action::CreateMultisig { .. }
+            | Action::MultisigDeposit { .. }
+            | Action::MultisigPay { .. }
+            | Action::MultisigRotate { .. }) => multisig::apply(self, tx, a, proposer, executor)?,
             Action::Call { program, input_envelope, .. } | Action::Invoke { program, input_envelope, .. } => {
                 // RPL-2: the transition first — vault, supplies, cells, payout notes — then the
                 // receipt, which is a call's. Every refusal was decided by `validate_inner`.
@@ -7420,5 +7447,62 @@ pub(crate) mod tests {
         assert!(matches!(err, ApplyFailure::HalfApplied(TxError::BadProgram(_))), "{err:?}");
         assert!(l.is_spent(&[20; 8]) && l.is_spent(&[21; 8]), "the bundle's nullifiers were written before the refusal");
         assert!(l != before, "a half-apply leaves the ledger dirty");
+    }
+
+    /// Multisig accounts: the four actions are refused on a chain whose genesis has no
+    /// `multisig` section (R1: the gate is `UnsupportedAction("multisig")`, as vesting's is).
+    fn ms_pay(n: usize, time: u32) -> Transaction {
+        let pays = (0..n)
+            .map(|i| crate::ledger::program_state::Payout {
+                asset: 0,
+                amount: 1 + i as u64,
+                recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+                r: [i as u32; 8],
+                envelope: env(),
+            })
+            .collect();
+        Transaction { chain_id: 7, bundle: None, action: Action::MultisigPay { account: [2; 32], nonce: 0, time, pays, signatures: vec![] } }
+    }
+
+    #[test]
+    fn the_multisig_actions_are_refused_on_a_chain_without_the_section() {
+        let l = ledger();
+        assert!(l.multisig().is_none());
+        let signer = Keypair::from_seed([3; 32]).unwrap().public_key().clone();
+        let b = bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE);
+        let txs = [
+            Transaction::shielded(7, b.clone(), Action::CreateMultisig { salt: [1; 32], signers: vec![signer.clone()], threshold: 1 }),
+            Transaction::shielded(7, b, Action::MultisigDeposit { account: [2; 32] }),
+            ms_pay(1, 1),
+            Transaction {
+                chain_id: 7,
+                bundle: None,
+                action: Action::MultisigRotate { account: [2; 32], nonce: 0, signers: vec![signer], threshold: 1, signatures: vec![] },
+            },
+        ];
+        for t in txs {
+            assert_eq!(l.validate(&t, &StubExecutor).unwrap_err(), TxError::UnsupportedAction("multisig"), "{:?}", t.action);
+        }
+    }
+
+    /// R5: a create or a deposit may set `burn_r` / `burn_a` / `burn_asset` — the burn shape lets
+    /// them through to the module's gate, so the first refusal is the gate's, not `UnsupportedBurn`.
+    /// A pay is bundle-less: its payout count and its time window are checked before the gate.
+    #[test]
+    fn a_create_or_a_deposit_may_burn_and_a_pay_has_a_time_and_payouts() {
+        let l = ledger();
+        let signer = Keypair::from_seed([3; 32]).unwrap().public_key().clone();
+        let mut b = bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE);
+        b.burn_r = 5;
+        b.burn_asset = 2;
+        b.burn_a = 3;
+        restub(&mut b);
+        for a in [Action::CreateMultisig { salt: [1; 32], signers: vec![signer], threshold: 1 }, Action::MultisigDeposit { account: [2; 32] }] {
+            assert_eq!(l.validate(&Transaction::shielded(7, b.clone(), a), &StubExecutor).unwrap_err(), TxError::UnsupportedAction("multisig"));
+        }
+        assert_eq!(l.validate(&ms_pay(0, 1), &StubExecutor).unwrap_err(), TxError::Multisig(multisig::MultisigError::NoPayouts));
+        assert_eq!(l.validate(&ms_pay(5, 1), &StubExecutor).unwrap_err(), TxError::Multisig(multisig::MultisigError::TooManyPayouts(5)));
+        assert!(matches!(l.validate(&ms_pay(1, u32::MAX), &StubExecutor).unwrap_err(), TxError::TimeOutOfWindow { .. }));
+        assert_eq!(l.validate(&ms_pay(1, 1), &StubExecutor).unwrap_err(), TxError::UnsupportedAction("multisig"));
     }
 }

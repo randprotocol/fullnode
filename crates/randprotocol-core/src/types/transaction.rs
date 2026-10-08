@@ -453,6 +453,28 @@ pub enum Action {
         input_envelope: Option<CallEnvelope>,
         transition: Transition,
     },
+    /// Multisig (spec 2026-10-08 §5): create an M-of-N account whose id is derived from these
+    /// terms; the bundle's burn funds it. Gated on the genesis `multisig` section.
+    CreateMultisig { salt: [u8; 32], signers: Vec<PublicKey>, threshold: u8 },
+    /// Fund `account` with the bundle's `burn_r` / `burn_a` of `burn_asset`. Anyone, no signatures.
+    MultisigDeposit { account: [u8; 32] },
+    /// Pay `pays` out of `account`'s vault, the base out of its RAND row to the proposer. Signed by
+    /// `threshold` of the account's signers over `multisig_pay_message`. Bundle-less.
+    MultisigPay {
+        account: [u8; 32],
+        nonce: u64,
+        time: u32,
+        pays: Vec<crate::ledger::program_state::Payout>,
+        signatures: Vec<crate::types::actions::SignerSignature>,
+    },
+    /// Replace the signer set and threshold. Signed over `multisig_rotate_message`. Bundle-less, fee-less.
+    MultisigRotate {
+        account: [u8; 32],
+        nonce: u64,
+        signers: Vec<PublicKey>,
+        threshold: u8,
+        signatures: Vec<crate::types::actions::SignerSignature>,
+    },
 }
 
 impl Action {
@@ -486,6 +508,8 @@ impl Action {
             Action::RotatePqGuardiansV2 { .. } => Some("rotate_pq_guardians_v2"),
             Action::RotatePauseKeyV2 { .. } => Some("rotate_pause_key_v2"),
             Action::CancelRotation { .. } => Some("cancel_rotation"),
+            Action::MultisigPay { .. } => Some("multisig_pay"),
+            Action::MultisigRotate { .. } => Some("multisig_rotate"),
             _ => None,
         }
     }
@@ -535,6 +559,25 @@ impl Action {
                 proof: proof.clone(),
                 input_envelope: input_envelope.clone(),
                 transition: transition.clone(),
+            },
+            // Multisig: no proof field; every field is kept so the binding moves with each.
+            Action::CreateMultisig { salt, signers, threshold } => {
+                Action::CreateMultisig { salt: *salt, signers: signers.clone(), threshold: *threshold }
+            }
+            Action::MultisigDeposit { account } => Action::MultisigDeposit { account: *account },
+            Action::MultisigPay { account, nonce, time, pays, signatures } => Action::MultisigPay {
+                account: *account,
+                nonce: *nonce,
+                time: *time,
+                pays: pays.clone(),
+                signatures: signatures.clone(),
+            },
+            Action::MultisigRotate { account, nonce, signers, threshold, signatures } => Action::MultisigRotate {
+                account: *account,
+                nonce: *nonce,
+                signers: signers.clone(),
+                threshold: *threshold,
+                signatures: signatures.clone(),
             },
             Action::Bond { validator, amount, registration } => {
                 Action::Bond { validator: *validator, amount: *amount, registration: registration.clone() }
@@ -1334,6 +1377,11 @@ mod tests {
             (Action::RotatePqGuardians { new_pq_guardians: Vec::new(), nonce: 0, pq_signatures: Vec::new() }, "rotate_pq_guardians"),
             (Action::RotatePauseKey { new_pause_key: minter.clone(), nonce: 0, pq_signatures: Vec::new() }, "rotate_pause_key"),
             (Action::UnbondVested { entry: [0; 32], amount: 1, nonce: 0, signature: Signature::empty() }, "unbond_vested"),
+            (Action::MultisigPay { account: [0; 32], nonce: 0, time: 0, pays: Vec::new(), signatures: Vec::new() }, "multisig_pay"),
+            (
+                Action::MultisigRotate { account: [0; 32], nonce: 0, signers: Vec::new(), threshold: 1, signatures: Vec::new() },
+                "multisig_rotate",
+            ),
             (Action::AdmitValidator { candidate: minter.clone(), signatures: Vec::new() }, "admit_validator"),
             (
                 {
@@ -1610,7 +1658,7 @@ mod tests {
     /// The number of `Action` variants, and each one's position — an exhaustive match with no
     /// wildcard, so a new variant fails to compile here until [`sample`] has a row for it (and
     /// [`Action::blanked`] has an arm).
-    const VARIANTS: usize = 34;
+    const VARIANTS: usize = 38;
     fn variant_index(a: &Action) -> usize {
         match a {
             Action::None => 0,
@@ -1647,6 +1695,10 @@ mod tests {
             Action::RotatePauseKeyV2 { .. } => 31,
             Action::CancelRotation { .. } => 32,
             Action::Invoke { .. } => 33,
+            Action::CreateMultisig { .. } => 34,
+            Action::MultisigDeposit { .. } => 35,
+            Action::MultisigPay { .. } => 36,
+            Action::MultisigRotate { .. } => 37,
         }
     }
 
@@ -1903,6 +1955,28 @@ mod tests {
                     },
                 }
             }
+            34 => Action::CreateMultisig { salt: [1; 32], signers: vec![pk()], threshold: 1 },
+            35 => Action::MultisigDeposit { account: [2; 32] },
+            36 => Action::MultisigPay {
+                account: [2; 32],
+                nonce: 3,
+                time: 4,
+                pays: vec![crate::ledger::program_state::Payout {
+                    asset: 0,
+                    amount: 5,
+                    recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+                    r: [5; 8],
+                    envelope: env(),
+                }],
+                signatures: vec![crate::types::actions::SignerSignature { index: 0, signature: sig() }],
+            },
+            37 => Action::MultisigRotate {
+                account: [2; 32],
+                nonce: 3,
+                signers: vec![pk()],
+                threshold: 1,
+                signatures: vec![crate::types::actions::SignerSignature { index: 0, signature: sig() }],
+            },
             _ => panic!("no variant {i}"),
         }
     }
@@ -2027,6 +2101,22 @@ mod tests {
         }
         // Every other action's fields, variant by variant: each row edits one field of `sample(i)`.
         let action_cases: Vec<(usize, &str, Change)> = vec![
+            (34, "create salt", |t| {
+                let Action::CreateMultisig { salt, .. } = &mut t.action else { panic!() };
+                salt[0] ^= 1;
+            }),
+            (35, "deposit account", |t| {
+                let Action::MultisigDeposit { account } = &mut t.action else { panic!() };
+                account[0] ^= 1;
+            }),
+            (36, "pay nonce", |t| {
+                let Action::MultisigPay { nonce, .. } = &mut t.action else { panic!() };
+                *nonce += 1;
+            }),
+            (37, "rotate threshold", |t| {
+                let Action::MultisigRotate { threshold, .. } = &mut t.action else { panic!() };
+                *threshold += 1;
+            }),
             (3, "call program", |t| {
                 let Action::Call { program, .. } = &mut t.action else { panic!() };
                 program.0[0] ^= 1;

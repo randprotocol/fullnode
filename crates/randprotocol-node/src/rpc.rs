@@ -2429,6 +2429,11 @@ fn tx_json_with(
                 },
             })
         }
+        // Multisig: the kind only for now; Task 5 renders the fields.
+        Action::CreateMultisig { .. } => json!({ "kind": "create_multisig" }),
+        Action::MultisigDeposit { .. } => json!({ "kind": "multisig_deposit" }),
+        Action::MultisigPay { .. } => json!({ "kind": "multisig_pay" }),
+        Action::MultisigRotate { .. } => json!({ "kind": "multisig_rotate" }),
     };
     json!({
         "hash": t.hash().to_hex(),

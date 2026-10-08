@@ -619,6 +619,11 @@ impl Ledger {
             }
             // Genesis vesting: a claim's or a revoke's note, derived from the action alone.
             a @ (Action::ClaimVested { .. } | Action::RevokeVesting { .. }) => super::vesting::derived_note(a, executor),
+            // Multisig: a pay's first payout note, stamped with the action's `time`; the plural
+            // form (`derived_commitments`) answers for all of them.
+            Action::MultisigPay { pays, time, .. } => {
+                pays.first().map(|p| super::program_state::payout_commitment(p, *time, executor))
+            }
             Action::WithdrawAggregator { aggregator, time, r, .. } => {
                 // The aggregator's withdraw note derives the same way, one register over: the
                 // bond less the base, at the entry's payout (spec §2.2).
@@ -686,6 +691,13 @@ impl Ledger {
                 transition.payouts().map(|p| super::program_state::payout_commitment(p, b.time, executor)).collect()
             }
             (Action::Invoke { .. }, None) => Vec::new(),
+            // Multisig: every payout of a pay, stamped with the action's own `time` (bundle-less).
+            (Action::MultisigPay { pays, time, .. }, None) => {
+                if pays.len() > super::multisig::MAX_PAYOUTS {
+                    return Vec::new();
+                }
+                pays.iter().map(|p| super::program_state::payout_commitment(p, *time, executor)).collect()
+            }
             (action, _) => self.derived_commitment(action, executor).into_iter().collect(),
         }
     }

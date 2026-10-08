@@ -346,3 +346,33 @@ mod tests {
         assert_ne!(r, multisig_rotate_message(&g2, 20, &[9; 32], 0, &[key(1)], 1), "genesis");
     }
 }
+
+// ------------------------------------------------------------------ the four actions
+
+/// What every multisig action gets on a chain without the section: the gate is absolute
+/// (vesting's `NOT_VESTING`, one register over).
+const NOT_MULTISIG: crate::ledger::TxError = crate::ledger::TxError::UnsupportedAction("multisig");
+
+/// Admission for the four multisig actions. Stub: the gate only; the rules land with Task 4, and
+/// until then a chain that has the section refuses them too.
+pub(super) fn validate(
+    ledger: &super::Ledger,
+    _tx: &crate::types::Transaction,
+    _action: &crate::types::Action,
+    _executor: &dyn crate::confidential::ConfidentialExecutor,
+) -> Result<(), crate::ledger::TxError> {
+    let _ = ledger.multisig().ok_or(NOT_MULTISIG)?;
+    Err(NOT_MULTISIG)
+}
+
+/// Apply for the four multisig actions. Stub, as [`validate`].
+pub(super) fn apply(
+    ledger: &mut super::Ledger,
+    _tx: &crate::types::Transaction,
+    _action: &crate::types::Action,
+    _proposer: &crate::crypto::Address,
+    _executor: &dyn crate::confidential::ConfidentialExecutor,
+) -> Result<(), crate::ledger::TxError> {
+    let _ = ledger.multisig().ok_or(NOT_MULTISIG)?;
+    Err(NOT_MULTISIG)
+}
