@@ -239,7 +239,7 @@ fn committed(height: u64, ks: &[Keypair]) -> CommittedBlock {
     };
     let block = Block::sign(&domain(), header, vec![], &ks[0]);
     let hash = block.hash();
-    CommittedBlock { block, pruned: Vec::new(), qc: qc(ks, height, hash), receipts: Vec::new(), deposits: Vec::new() }
+    CommittedBlock { block, pruned: Vec::new(), qc: qc(ks, height, hash), receipts: Vec::new(), deposits: Vec::new(), aggregates: Vec::new() }
 }
 
 /// `asker` sends `req` to `answerer`, which answers `resp`; what the asker received.

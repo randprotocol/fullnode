@@ -235,6 +235,13 @@ const META_JAILED: &str = "jailed";
 /// audit subtracts it on the right of its identity: the fee left the pool into no register
 /// entry.
 const META_REGISTRATION_FEES_BURNED: &str = "registration_fees_burned";
+/// `bincode(u64)`: Σ of the bundle bases burned under the genesis `fees.burn_base` (the whole
+/// floors under `fees.burn_floor`) as of the head (`Ledger::base_fees_burned`, `docs/fees.md`
+/// §1.3). `META_REGISTRATION_FEES_BURNED`'s twin in every respect — derived, outside the root and
+/// `Ledger`'s equality, written at the same three sites, replayed by `verify_chain`, on the right
+/// of the supply identity — and absent on a database written before the key existed, where it reads
+/// 0: what the ledger holds on every chain without the flag.
+const META_BASE_FEES_BURNED: &str = "base_fees_burned";
 /// `bincode(GasPrices)`: the live gas prices as of the head (Phase 2, spec §7.1,
 /// `Ledger::gas_prices`). Consensus state under `gas.dynamic` — in the state root under
 /// `rand-state-7` and `Ledger`'s equality — written at the same sites as
@@ -273,6 +280,15 @@ const META_RETIRED_AGGREGATOR_NONCES: &str = "retired_aggregator_nonces";
 /// it from here so every reader of the store (RPC included, which has no genesis file to hand)
 /// sees the same gate the node sees.
 const META_AGGREGATION: &str = "aggregation";
+/// JSON of the genesis `fees` section (`ledger::fees::FeesConfig`), the default (every rule off)
+/// on a chain without one. Genesis truth like `META_AGGREGATION`, written once at genesis and
+/// restored by `load_ledger` so every reader of the store sees the gate the node sees
+/// (`node::reload_ledger` sets it from the genesis file again, the authority). JSON, as
+/// `META_VESTING` is, and not the plan's bincode: the struct's `skip_serializing_if` fields make a
+/// bincode blob undecodable, and JSON reads an absent flag as its default. Absent on a database
+/// written before the key existed, which reads as the default — so such a database opens
+/// unchanged.
+const META_FEES: &str = "fees";
 /// `bincode(BridgeMeta)`: the whole-state half of the bridge — emitter, source emitters,
 /// guardian sets, the asset registry with its indices and `next_index`, and the burn sequence.
 /// Its presence is what makes a chain "bridged" on disk; the two collections it leaves out live
@@ -1038,6 +1054,7 @@ impl Storage {
         self.put_admitted(&mut batch, gs.ledger.admitted())?;
         self.put_jailed(&mut batch, gs.ledger.jailed())?;
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&gs.ledger.registration_fees_burned())?);
+        batch.put_cf(self.cf(CF_META), META_BASE_FEES_BURNED, bincode::serialize(&gs.ledger.base_fees_burned())?);
         // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
         // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
         if gs.ledger.gas().is_some() {
@@ -1048,6 +1065,11 @@ impl Storage {
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
+        batch.put_cf(
+            self.cf(CF_META),
+            META_FEES,
+            serde_json::to_vec(gs.ledger.fees()).map_err(|e| StorageError::Corrupt(format!("fees: {e}")))?,
+        );
         let tokens_staged = self.stage_tokens(&mut batch, gs.ledger.tokens())?;
         self.put_tokens_ext(&mut batch, gs.ledger.tokens())?;
         batch.put_cf(self.cf(CF_ANCHORS), height_key(0), word8_to_bytes(&gs.ledger.root()));
@@ -1643,6 +1665,24 @@ impl Storage {
         Ok(self.get_meta_raw(META_REGISTRATION_FEES_BURNED)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
     }
 
+    /// Σ of the bundle bases (whole floors under `fees.burn_floor`) burned under `fees.burn_base`
+    /// as of the head (`META_BASE_FEES_BURNED`)
+    /// — `registration_fees_burned()`'s twin, with the same rule for a database written before the
+    /// key existed: 0, which on a chain without the flag is also the only value it holds.
+    pub fn base_fees_burned(&self) -> Result<u64> {
+        Ok(self.get_meta_raw(META_BASE_FEES_BURNED)?.map(|b| bincode::deserialize(&b)).transpose()?.unwrap_or_default())
+    }
+
+    /// The chain's genesis `fees` section (`META_FEES`), the default — every rule off — on a chain
+    /// without one and on a database written before the key existed.
+    pub fn fees_config(&self) -> Result<randprotocol_core::ledger::FeesConfig> {
+        Ok(self
+            .get_meta_raw(META_FEES)?
+            .map(|b| serde_json::from_slice(&b).map_err(|e| StorageError::Corrupt(format!("fees: {e}"))))
+            .transpose()?
+            .unwrap_or_default())
+    }
+
     /// The live gas prices as of the head (Phase 2, `META_GAS_PRICES`), or `None` on a database
     /// written before the key existed — "the genesis section's prices", which is what the
     /// ledger reads once its section is set.
@@ -1883,7 +1923,7 @@ impl Storage {
         }
         // `deposits` stays empty: this is how a block is served to a peer, and the peer
         // recomputes them by applying the block itself.
-        Ok(Some(CommittedBlock { block, pruned: Vec::new(), qc, receipts, deposits: Vec::new() }))
+        Ok(Some(CommittedBlock { block, pruned: Vec::new(), qc, receipts, deposits: Vec::new(), aggregates: Vec::new() }))
     }
 
     pub fn height_by_hash(&self, h: &Hash) -> Result<Option<u64>> {
@@ -2584,6 +2624,7 @@ impl Storage {
         ledger.set_admitted(self.admitted()?);
         ledger.set_jailed(self.jailed()?);
         ledger.set_registration_fees_burned(self.registration_fees_burned()?);
+        ledger.set_base_fees_burned(self.base_fees_burned()?);
         if let Some(p) = self.gas_prices()? {
             ledger.set_gas_prices(p);
         }
@@ -2593,6 +2634,7 @@ impl Storage {
         ledger.set_aggregators(self.aggregators()?);
         ledger.set_retired_aggregator_nonces(self.retired_aggregator_nonces()?);
         ledger.set_aggregation(self.aggregation_config()?);
+        ledger.set_fees(self.fees_config()?);
         ledger.set_bridge(self.load_bridge()?);
         ledger.set_tokens(self.tokens()?);
         ledger.set_nullifier_mmr(self.nullifier_mmr()?);
@@ -2722,11 +2764,7 @@ impl Storage {
                 }
             }
             // The sealing marks land in the same batch (spec §6.1): atomically with the block
-            // that carries the aggregate — their per-block flags refresh after it lands. The
-            // aggregate's payment facts land too (spec §5.4): the schedule index is the
-            // post-block counter less the one this aggregate minted (at most one per block,
-            // spec §3.4), and the proving share is the covered bundles' excess over the floor,
-            // read off their own public fee fields.
+            // that carries the aggregate — their per-block flags refresh after it lands.
             for tx in &block.transactions {
                 if let randprotocol_core::types::Action::Aggregate { covers, .. } = &tx.action {
                     for cover in covers {
@@ -2737,25 +2775,54 @@ impl Storage {
                         );
                         batch.put_cf(self.cf(CF_SEALS), seal_height_key(block.height(), cover), []);
                     }
-                    if let Some(cfg) = ledger_after.aggregation() {
-                        let n = ledger_after.supply().sealed_blocks.saturating_sub(1);
-                        let subsidy = randprotocol_core::gas::subsidy(n, cfg);
-                        // Each cover at the excess the ledger bucketed it at — net of a burned
-                        // registration fee (IFACE-7), not `fee − BUNDLE_BASE` — so
-                        // `rand_getAggregate`'s `proving_share` is what the payout note paid.
-                        let mut shares = 0u64;
-                        for cover in covers {
-                            if let Some(covered_tx) = self.tx_by_hash(cover)? {
-                                shares = shares.saturating_add(ledger_after.bucketed_excess(&covered_tx));
-                            }
-                        }
-                        batch.put_cf(
-                            self.cf(CF_SEALS),
-                            [b"a".as_slice(), tx.hash().as_bytes()].concat(),
-                            bincode::serialize(&(subsidy, shares, n))?,
-                        );
-                    }
                 }
+            }
+            // The aggregates' payment facts (spec §5.4), as the ledger paid them while applying
+            // this very block (`cb.aggregates`, `Ledger::paid_aggregates`): the schedule index,
+            // the minted subsidy — under `fees.subsidy_net_of_fees` the shortfall only
+            // (`docs/fees.md` §1.3) — and the covered shares at the excess the ledger bucketed
+            // them at (IFACE-7). Never recomputed here: a recomputation read each cover back from
+            // the database, which misses one committed earlier in this same batch, and read `n`
+            // off the batch's last ledger. So `subsidy + proving_share` is the payout note.
+            // The record has no fallback, so its absence is refused rather than committed (#133):
+            // a block carrying an `Aggregate` it was never executed against (an empty
+            // `cb.aggregates`) would otherwise land with no `a` row, and `rand_getAggregate` would
+            // answer for a sealed block without `subsidy`, `proving_share` or `n` — silently. Each
+            // aggregate in the block must have exactly one record and each record must name an
+            // aggregate in the block, which together make the counts equal and refuse a stale or
+            // duplicated record as well as a missing one. Every production path fills the list —
+            // the consensus commit from `ledger_after` (`hotstuff.rs`), the syncer from
+            // `take_paid_aggregates` (`node.rs`) — so this fires only on a block assembled without
+            // the ledger that applied it. `docs/rpc.md`'s `rand_getAggregate` entry says so too.
+            let aggregate_txs: Vec<Hash> = block
+                .transactions
+                .iter()
+                .filter(|tx| matches!(tx.action, Action::Aggregate { .. }))
+                .map(|tx| tx.hash())
+                .collect();
+            if let Some(paid) = cb.aggregates.iter().find(|p| !aggregate_txs.contains(&p.tx)) {
+                return Err(StorageError::Corrupt(format!(
+                    "block {} has a paid-aggregate record for {}, which is no aggregate in the block",
+                    block.height(),
+                    paid.tx
+                )));
+            }
+            for tx in &aggregate_txs {
+                let records = cb.aggregates.iter().filter(|p| p.tx == *tx).count();
+                if records != 1 {
+                    return Err(StorageError::Corrupt(format!(
+                        "block {} carries aggregate {tx} with {records} paid-aggregate records, not 1; \
+                         the block was not committed with the ledger that applied it",
+                        block.height()
+                    )));
+                }
+            }
+            for paid in &cb.aggregates {
+                batch.put_cf(
+                    self.cf(CF_SEALS),
+                    [b"a".as_slice(), paid.tx.as_bytes()].concat(),
+                    bincode::serialize(&(paid.payment.subsidy, paid.payment.proving_shares, paid.n))?,
+                );
             }
             for tx in &block.transactions {
                 for nf in tx.nullifiers() {
@@ -2917,6 +2984,7 @@ impl Storage {
         self.put_admitted(&mut batch, ledger_after.admitted())?;
         self.put_jailed(&mut batch, ledger_after.jailed())?;
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger_after.registration_fees_burned())?);
+        batch.put_cf(self.cf(CF_META), META_BASE_FEES_BURNED, bincode::serialize(&ledger_after.base_fees_burned())?);
         // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
         // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
         if ledger_after.gas().is_some() {
@@ -3510,6 +3578,15 @@ impl Storage {
                     ledger.registration_fees_burned()
                 ))
             }
+            // The burned bases (`fees.burn_base`) likewise: a supply counter beside the blob,
+            // outside the equality, on the right of the identity `rand_getSupply` reports.
+            Ok(stored) if stored == ledger && stored.base_fees_burned() != ledger.base_fees_burned() => {
+                check.problem = Some(format!(
+                    "stored base fees burned {} do not match the replayed chain's {}",
+                    stored.base_fees_burned(),
+                    ledger.base_fees_burned()
+                ))
+            }
             // The bucket is outside `Ledger`'s equality for the same reason, so it is audited
             // beside the counters: the next aggregate's payout is computed from it.
             Ok(stored) if same && stored.unsealed_fees() != ledger.unsealed_fees() => {
@@ -3746,6 +3823,7 @@ impl Storage {
         self.put_admitted(&mut batch, ledger.admitted())?;
         self.put_jailed(&mut batch, ledger.jailed())?;
         batch.put_cf(self.cf(CF_META), META_REGISTRATION_FEES_BURNED, bincode::serialize(&ledger.registration_fees_burned())?);
+        batch.put_cf(self.cf(CF_META), META_BASE_FEES_BURNED, bincode::serialize(&ledger.base_fees_burned())?);
         // Only under a `gas` section: a ledger without one (or one `load_ledger` built before
         // `set_gas`) never stores `(0, 0)`, so the key always holds a section's live prices.
         if ledger.gas().is_some() {
@@ -3914,6 +3992,7 @@ pub(crate) mod fixtures {
             incremental_nullifier_root: None,
             hardening_v6: None,
             hc_auth: None,
+            fees: None,
         }
     }
 
@@ -4071,6 +4150,7 @@ pub(crate) mod fixtures {
             incremental_nullifier_root: None,
             hardening_v6: None,
             hc_auth: None,
+            fees: None,
         };
         (gs, secrets)
     }
@@ -4720,6 +4800,51 @@ pub(crate) mod fixtures {
         }
     }
 
+    /// The fixed-price `gas` section the burn-floor fixtures run under (chain 18's prices without
+    /// the controller): 100 per gas, 800 per KiB, the tier-14 bundle pin, circuit metering.
+    pub(crate) fn fixed_gas() -> gas::GasConfig {
+        gas::GasConfig {
+            gas_price: 100,
+            byte_price: 800,
+            bundle_gas_limit: gas::bundle_gas_limit_pin(),
+            metering: gas::GasMetering::Circuit,
+            dynamic: None,
+        }
+    }
+
+    /// The fee-feedback rules with every flag on (`docs/fees.md` §1.3, issue #135), or `burn_base`
+    /// and `burn_floor` alone when `net` is false.
+    pub(crate) fn burn_floor_rules(net: bool) -> randprotocol_core::ledger::FeesConfig {
+        randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: net.then_some(true), burn_floor: Some(true) }
+    }
+
+    /// A four-word program's `Deploy` on a stub bundle keyed at `seed..seed + 3`, paying its floor
+    /// (`gas::fee_floor`: base plus the per-word term) plus `tip`; returns the program's id too.
+    pub(crate) fn deploy_program_tx(ledger: &Ledger, seed: u32, word: u32, tip: u64) -> (ProgramId, Transaction) {
+        let words = vec![word; 4];
+        let id = randprotocol_core::program::program_id(0, &words);
+        let action = Action::Deploy { base_pc: 0, words, public: vec![] };
+        let fee = gas::fee_floor(&action) + tip;
+        let b = bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], fee);
+        (id, StubExecutor::bound(Transaction::shielded(ledger.chain_id(), b, action)))
+    }
+
+    /// A tier-`tier` `Call` of `program` on a stub bundle keyed at `seed..seed + 3`, its stub proof
+    /// declaring `gas_limit` (`pv::GAS`), paying `fee`.
+    pub(crate) fn gas_call_tx(ledger: &Ledger, seed: u32, program: &ProgramId, tier: u8, gas_limit: u64, fee: u64) -> Transaction {
+        let proof = StubExecutor::make_proof_with_gas(program, tier, [7; 8], gas_limit);
+        let b = bundle(ledger, [[seed; 8], [seed + 1; 8]], [[seed + 2; 8], [seed + 3; 8]], fee);
+        StubExecutor::bound(Transaction::shielded(ledger.chain_id(), b, Action::Call { program: *program, proof, input_envelope: None }))
+    }
+
+    /// The bytes a `Call`'s floor prices (`gas::call_bytes` over its proof, no input envelope).
+    pub(crate) fn call_tx_bytes(tx: &Transaction) -> usize {
+        match &tx.action {
+            Action::Call { proof, input_envelope, .. } => gas::call_bytes(proof, input_envelope.as_ref()),
+            other => panic!("not a call: {other:?}"),
+        }
+    }
+
     /// A pruning-pass proof reader ([`Storage::prune_sealed_with`]) for stub-proved bundles: the
     /// [`stub_pruned_facts`] of whichever of `txs` the pass asks for, by raw hash.
     pub(crate) fn stub_proof_reader(
@@ -4767,7 +4892,7 @@ pub(crate) mod fixtures {
         ledger.set_timestamp_ms(height);
         ledger.apply_transactions(&txs, &k.address(), &StubExecutor).unwrap();
         ledger.record_anchor(height);
-        make_block_unchecked(parent, ledger, txs, k)
+        signed_block(parent, ledger, txs, k, height)
     }
 
     /// Which of `keys` leads `view` in `set`. A block proposed by anyone else is rejected as
@@ -4807,10 +4932,30 @@ pub(crate) mod fixtures {
         ledger.set_timestamp_ms(timestamp_ms);
         ledger.apply_transactions(&txs, &k.address(), &StubExecutor).unwrap();
         ledger.record_anchor(height);
-        make_block_unchecked_at(parent, ledger, txs, k, timestamp_ms)
+        signed_block(parent, ledger, txs, k, timestamp_ms)
     }
 
+    /// `make_block_unchecked`, stamped `timestamp_ms`. The ledger's own aggregate records, plus a
+    /// zero placeholder for every aggregate it did not pay: a block stored *unchecked* (the
+    /// seal-row tests write an aggregate the ledger never applied) must still carry one record
+    /// per aggregate, or `commit` refuses it (#133). Only the unchecked builders add them — an
+    /// executed block (`make_block`, `make_block_at`) carries the ledger's list as-is, so a
+    /// ledger that stopped recording a payment is refused in a fixture exactly as in production.
     pub(crate) fn make_block_unchecked_at(parent: &impl FixtureParent, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair, timestamp_ms: u64) -> CommittedBlock {
+        let mut cb = signed_block(parent, ledger, txs, k, timestamp_ms);
+        for tx in cb.block.transactions.iter().filter(|tx| matches!(tx.action, Action::Aggregate { .. })) {
+            let tx = tx.hash();
+            if !cb.aggregates.iter().any(|p| p.tx == tx) {
+                let payment = randprotocol_core::ledger::aggregation::Payment { subsidy: 0, proving_shares: 0, total: 0, note: [0; 8] };
+                cb.aggregates.push(randprotocol_core::ledger::aggregation::PaidAggregate { tx, n: 0, payment });
+            }
+        }
+        cb
+    }
+
+    /// The block over `txs`, signed by `k`, carrying exactly what `ledger` recorded for it — its
+    /// deposits and its paid aggregates — with nothing added.
+    fn signed_block(parent: &impl FixtureParent, ledger: &Ledger, txs: Vec<Transaction>, k: &Keypair, timestamp_ms: u64) -> CommittedBlock {
         let justify = parent.parent_qc();
         let parent = parent.parent_block();
         let height = parent.height() + 1;
@@ -4826,7 +4971,7 @@ pub(crate) mod fixtures {
         };
         let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, txs, k);
         let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![] };
-        CommittedBlock { block, pruned: Vec::new(), qc, receipts: Vec::new(), deposits: ledger.deposits().to_vec() }
+        CommittedBlock { block, pruned: Vec::new(), qc, receipts: Vec::new(), deposits: ledger.deposits().to_vec(), aggregates: ledger.paid_aggregates().to_vec() }
     }
 
     /// `n` blocks, each carrying one bundle that spends a fresh pair of nullifiers.
@@ -5784,7 +5929,7 @@ mod tests {
             ledger.close_block(height, &key(1).address(), 0, 0);
             make_block_unchecked_at(parent, ledger, txs, &key(1), at_ms)
         };
-        let genesis_block = CommittedBlock { block: gs.block.clone(), pruned: Vec::new(), qc: QuorumCertificate::genesis(gs.block.hash()), receipts: Vec::new(), deposits: Vec::new() };
+        let genesis_block = CommittedBlock { block: gs.block.clone(), pruned: Vec::new(), qc: QuorumCertificate::genesis(gs.block.hash()), receipts: Vec::new(), deposits: Vec::new(), aggregates: Vec::new() };
         // Block 1 at 50 s (a bridged chain steps at most 60 s a block): the rotation lands,
         // pending until 150 s.
         let m = randprotocol_core::bridge::gov::rotate_pq_message(ledger.chain_id(), 0, &new_pks);
@@ -7921,6 +8066,123 @@ mod tests {
         assert_eq!(s.registration_fees_burned().unwrap(), 0);
     }
 
+    /// Fee feedback (`fees.burn_base`, `docs/fees.md` §1.3): the burned bases are a supply counter
+    /// beside `META_SUPPLY` — committed with the state, restored by `load_ledger`, audited by
+    /// `verify_chain`'s replay — and the `fees` section is stored at genesis and restored by both
+    /// `load_ledger` and `reload_ledger`. A database written before either key existed opens with
+    /// the defaults: no rule, nothing burned.
+    #[test]
+    fn reload_ledger_restores_the_fees_section_and_the_burned_bases() {
+        use randprotocol_core::gas::BUNDLE_BASE;
+        use randprotocol_core::ledger::FeesConfig;
+        let (_d, s, mut gs) = genesis_with_two_notes();
+        let burn = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None };
+        gs.ledger.set_fees(burn.clone());
+        // The fixture's notes are tiny; tell the audit what genesis issued so its identity holds
+        // after a fee is paid out of the pool.
+        gs.ledger.set_genesis_supply(1_000 * BUNDLE_BASE, gs.ledger.supply().genesis_staked);
+        s.init_genesis(&gs).unwrap();
+        assert_eq!((s.fees_config().unwrap(), s.base_fees_burned().unwrap()), (burn.clone(), 0));
+
+        let mut ledger = gs.ledger.clone();
+        let tx = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], BUNDLE_BASE + 5);
+        let b1 = make_block(&gs.block, &mut ledger, vec![tx], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!((ledger.base_fees_burned(), ledger.supply().burned, ledger.supply().fees_paid), (BUNDLE_BASE, BUNDLE_BASE, 5));
+        assert!(ledger.audit().invariant_holds(), "{:?}", ledger.audit());
+        assert_eq!(s.base_fees_burned().unwrap(), BUNDLE_BASE, "committed with the state");
+        let loaded = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!((loaded.fees(), loaded.base_fees_burned()), (&burn, BUNDLE_BASE), "restored by load_ledger");
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!((reloaded.fees(), reloaded.base_fees_burned()), (&burn, BUNDLE_BASE), "and by reload_ledger");
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A stale counter is named by the audit, and the repair rewrites it from the replay.
+        s.db.put_cf(s.cf(CF_META), META_BASE_FEES_BURNED, bincode::serialize(&0u64).unwrap()).unwrap();
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.expect("a stale counter is a problem");
+        assert!(problem.contains("base fees burned"), "{problem}");
+        s.truncate_to(&gs, 1, &check.ledger).unwrap();
+        assert_eq!(s.base_fees_burned().unwrap(), BUNDLE_BASE);
+
+        // A database from before the keys: both absent, both read as the defaults, and the
+        // ledger opens without the rule (the genesis file, through `reload_ledger`, still has it).
+        s.db.delete_cf(s.cf(CF_META), META_FEES).unwrap();
+        s.db.delete_cf(s.cf(CF_META), META_BASE_FEES_BURNED).unwrap();
+        assert_eq!((s.fees_config().unwrap(), s.base_fees_burned().unwrap()), (FeesConfig::default(), 0));
+        let old = s.load_ledger(&StubExecutor).unwrap();
+        assert_eq!((old.fees(), old.base_fees_burned()), (&FeesConfig::default(), 0));
+        assert_eq!(crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap().fees(), &burn, "the file is the authority");
+    }
+
+    /// Issue #135's variant of the repair above: under `fees { burn_base, burn_floor }` and a
+    /// fixed-price `gas` section, `base_fees_burned` is a sum of *whole floors* — a Deploy's base
+    /// plus per-word term, a tier-14 Call's `circuit_call_floor` at its declared limit, a
+    /// transfer's base — that only the replay's own decode of the call proof can recompute. A
+    /// counter corrupted by a few units (not zeroed: the drift a torn write or a stale snapshot
+    /// leaves) is named by `verify_chain`, the served audit reads it (`rand_getSupply.
+    /// invariant_holds` false), and the repair rewrites it from the replay to exactly the three
+    /// floors, after which the served identity holds again and a second check finds nothing.
+    #[test]
+    fn verify_chain_repairs_a_stale_base_fees_burned_under_burn_floor_with_a_call() {
+        use randprotocol_core::gas::{self, BUNDLE_BASE};
+        let (_d, s, mut gs) = genesis_with_two_notes();
+        gs.ledger.set_gas(Some(fixed_gas()));
+        gs.ledger.set_fees(burn_floor_rules(false));
+        gs.ledger.set_genesis_supply(1_000 * randprotocol_core::UNITS_PER_RAND, gs.ledger.supply().genesis_staked);
+        s.init_genesis(&gs).unwrap();
+
+        let mut ledger = gs.ledger.clone();
+        let (program, deploy) = deploy_program_tx(&ledger, 81, 0x13, 3);
+        let deploy_floor = gas::fee_floor(&deploy.action);
+        let b1 = make_block(&gs.block, &mut ledger, vec![deploy], &key(1));
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+
+        let limit = gas::gas_max(14, 0, 0);
+        let prices = ledger.gas_prices();
+        let floor = gas::circuit_call_floor(prices.gas_price, prices.byte_price, limit, call_tx_bytes(&gas_call_tx(&ledger, 91, &program, 14, limit, 0)));
+        let call = gas_call_tx(&ledger, 91, &program, 14, limit, floor + 11);
+        let transfer = bundle_tx(&ledger, [[95; 8], [96; 8]], [[97; 8], [98; 8]], BUNDLE_BASE + 5);
+        let before = ledger.clone();
+        let mut b2 = make_block(&b1, &mut ledger, vec![call, transfer], &key(1));
+        b2.receipts = before.clone().apply_block(&b2.block, &StubExecutor).expect("a replica applies block 2");
+        s.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
+
+        let want = deploy_floor + floor + BUNDLE_BASE;
+        assert_eq!(s.base_fees_burned().unwrap(), want, "the deploy's, the call's and the transfer's whole floors");
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None, "a good store checks clean");
+        let s = std::sync::Arc::new(s);
+        let supply = || crate::rpc::tests::served_now(s.clone(), &gs, "rand_getSupply");
+        assert_eq!(supply()["invariant_holds"], true, "{}", supply());
+
+        // Off by three units: named, visible in the served audit, and repaired from the replay.
+        s.db.put_cf(s.cf(CF_META), META_BASE_FEES_BURNED, bincode::serialize(&(want - 3)).unwrap()).unwrap();
+        assert_eq!(supply()["invariant_holds"], false, "a stale counter breaks the served identity");
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.clone().expect("a counter three units stale is a problem");
+        assert!(problem.contains("base fees burned"), "{problem}");
+        assert_eq!(check.ledger.base_fees_burned(), want, "the replay recomputed the floors from the blocks");
+        s.truncate_to(&gs, 2, &check.ledger).unwrap();
+        assert_eq!(s.base_fees_burned().unwrap(), want, "the repair rewrote the counter");
+        let after = supply();
+        assert_eq!(after["base_fees_burned"], want.to_string());
+        assert_eq!(after["invariant_holds"], true, "{after}");
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None, "and a second check finds nothing");
+    }
+
+    /// Fee feedback: a chain without a `fees` section stores the default section and a zero
+    /// counter, and reads them back as such.
+    #[test]
+    fn a_chain_without_a_fees_section_stores_the_defaults() {
+        let (_d, s, gs) = genesis_with_two_notes();
+        s.init_genesis(&gs).unwrap();
+        assert_eq!(s.fees_config().unwrap(), randprotocol_core::ledger::FeesConfig::default());
+        assert_eq!(s.base_fees_burned().unwrap(), 0);
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert!(!reloaded.fees().any());
+        assert_eq!(reloaded, gs.ledger);
+    }
+
     /// Audit v4, STAKE-2 rule 2: the faucet's two epoch counters are consensus state on a
     /// chain with the section, so they are persisted beside `META_SUPPLY` on every commit,
     /// restored by `load_ledger`, and audited by `verify_chain`'s replay — a node that came
@@ -8635,6 +8897,120 @@ mod seal_tests {
         assert!(check.problem.as_deref().is_some_and(|p| p.starts_with("block 1 does not apply")), "{:?}", check.problem);
     }
 
+    /// A committed block as a sealed-form peer serves it (`node::sealed_form_of`, spec §7): every
+    /// transaction whose record is `Pruned` rides as the record's marker form, found by the proof
+    /// hash its marker carries, with a side-table entry in transaction order.
+    fn served_sealed(storage: &Storage, h: u64) -> CommittedBlock {
+        let cb = storage.committed_block(h).unwrap().expect("a committed height");
+        let mut pruned = Vec::new();
+        for tx in &cb.block.transactions {
+            let Some(ph) = tx.bundle.as_ref().and_then(|b| randprotocol_core::notes::pruned_proof_hash(&b.proof)) else { continue };
+            let raw = storage.tx_hash_by_proof_hash(&ph).unwrap().expect("a marker names a stored record");
+            let Some(TxRecord::Pruned { tx_hash, proof_hash, public_values, shape, .. }) = storage.tx_record(&raw).unwrap() else {
+                panic!("block {h}: a marker without its pruned record")
+            };
+            pruned.push(randprotocol_core::consensus::PrunedBundle { tx_hash, proof_hash, public_values, shape });
+        }
+        CommittedBlock { pruned, ..cb }
+    }
+
+    /// The fee-feedback rules through the sealed form (spec §6.2, §7; `docs/fees.md` §1.3). Under
+    /// `fees { burn_base, burn_floor }` on an aggregating chain, block 1 carries two bundles an
+    /// aggregate will cover — a transfer 60 over its floor and a Deploy 7 over its (base plus
+    /// per-word) floor — and the aggregator's registration; block 2 the aggregate. The live store
+    /// prunes both covers to the marker form; a second store syncs the chain as a sealed-form peer
+    /// serves it (the side table rebuilt from the pruned records, the aggregate's sidecar read
+    /// from the records the first block left), exactly as `apply_synced` applies it. The split
+    /// reads the bundle's fee and its settled floor — the action and the fee, both of which the
+    /// marker form keeps (only `bundle.proof` is replaced) — so the synced store must end where
+    /// the live one did: `base_fees_burned`, `fees_paid`, `burned`, `subsidised`, the aggregate's
+    /// `a` record and the state root; and its own startup replay (`verify_chain`) must pass.
+    #[test]
+    fn a_sealed_sync_under_burn_base_and_burn_floor_ends_at_the_live_stores_counters_and_root() {
+        use randprotocol_core::gas::{self, BUNDLE_BASE};
+        let dir = tempfile::tempdir().unwrap();
+        let live = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 100);
+        let probe = bundle_tx(&gs.ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], BUNDLE_BASE);
+        let hc = Hash(randprotocol_core::notes::word8_to_bytes(&HC));
+        gs.ledger.set_aggregation(Some(gated_cfg(stub_pruned_facts(&probe).shape, hc, 4)));
+        gs.ledger.set_fees(burn_floor_rules(false));
+        gs.ledger.set_genesis_supply(1_000 * randprotocol_core::UNITS_PER_RAND, gs.ledger.supply().genesis_staked);
+        live.init_genesis(&gs).unwrap();
+
+        let mut l1 = gs.ledger.clone();
+        let transfer = bundle_tx(&l1, [[21; 8], [22; 8]], [[23; 8], [24; 8]], BUNDLE_BASE + 60);
+        let (_, deploy) = deploy_program_tx(&l1, 31, 0x13, 7);
+        let deploy_floor = gas::fee_floor(&deploy.action);
+        assert!(deploy_floor > BUNDLE_BASE, "a Deploy's floor is more than the base, so the floor rule shows");
+        let register = register_tx(&l1, &key(7), 100 * randprotocol_core::UNITS_PER_RAND);
+        let b1 = make_block(&gs.block, &mut l1, vec![transfer.clone(), deploy.clone(), register], &key(1));
+        assert_eq!(l1.unsealed_fees()[&transfer.hash()].0, 60, "the transfer buckets fee − floor");
+        assert_eq!(l1.unsealed_fees()[&deploy.hash()].0, 7, "the Deploy buckets fee − its whole floor, not fee − BUNDLE_BASE");
+        live.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
+
+        let covers = vec![transfer.hash(), deploy.hash()];
+        let aggregate = aggregate_tx(&key(7), 0, 2, covers, b"ok".to_vec());
+        let sidecar: BTreeMap<usize, Vec<CoveredBundle>> =
+            [(0usize, vec![stub_pruned_facts(&transfer), stub_pruned_facts(&deploy)])].into_iter().collect();
+        let mut l2 = l1.clone();
+        l2.set_height(2);
+        l2.set_timestamp_ms(2);
+        l2.apply_transactions_with_covered(std::slice::from_ref(&aggregate), &key(1).address(), &sidecar, &StubExecutor).unwrap();
+        l2.record_anchor(2);
+        let b2 = make_block_unchecked(&b1, &l2, vec![aggregate.clone()], &key(1));
+        live.commit(std::slice::from_ref(&b2), &l2, &[], &StubExecutor).unwrap();
+
+        // Both covers' windows pass: the live store prunes them to the marker form.
+        assert_eq!(live.prune_sealed_with(6, 4, u64::MAX, &stub_proof_reader(&[transfer.clone(), deploy.clone()])).unwrap(), 2);
+        for tx in [&transfer, &deploy] {
+            assert!(matches!(live.tx_record(&tx.hash()).unwrap(), Some(TxRecord::Pruned { .. })), "pruned");
+        }
+        let check = live.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!((check.problem, check.last_good), (None, 2), "the live store replays its own pruned form");
+        let want_burned = BUNDLE_BASE + deploy_floor + BUNDLE_BASE;
+        assert_eq!(live.base_fees_burned().unwrap(), want_burned, "the transfer's base, the Deploy's floor, the registration's base");
+
+        // The sync: a fresh store, the chain as a sealed-form peer serves it.
+        let dir2 = tempfile::tempdir().unwrap();
+        let synced = Storage::open(dir2.path()).unwrap();
+        synced.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        for h in 1..=2 {
+            let served = served_sealed(&live, h);
+            assert_eq!(served.pruned.len(), if h == 1 { 2 } else { 0 }, "block {h}'s side table");
+            let mut sidecar = BTreeMap::new();
+            for (i, tx) in served.block.transactions.iter().enumerate() {
+                if let Action::Aggregate { covers, .. } = &tx.action {
+                    let records = covers.iter().map(|c| synced.covered_record(c, FriProfile::Test).unwrap().expect("the cover synced")).collect();
+                    sidecar.insert(i, records);
+                }
+            }
+            let receipts = ledger
+                .apply_block_for_sync(&served.block, &sidecar, &served.pruned, &StubExecutor, &randprotocol_core::ledger::NoVerified)
+                .unwrap_or_else(|e| panic!("the sealed block {h} applies: {e}"));
+            let cb = CommittedBlock { receipts, deposits: ledger.take_deposits(), aggregates: ledger.take_paid_aggregates(), ..served };
+            synced.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
+        }
+
+        assert_eq!(synced.base_fees_burned().unwrap(), want_burned, "base_fees_burned survives the marker form");
+        let (s, l) = (synced.supply().unwrap(), live.supply().unwrap());
+        assert_eq!(s.fees_paid, l.fees_paid, "fees_paid");
+        assert_eq!(s.burned, l.burned, "burned");
+        assert_eq!(s.subsidised, l.subsidised, "subsidised");
+        assert_eq!(s, l, "the whole supply");
+        assert_eq!(synced.aggregate_payment(&aggregate.hash()).unwrap(), live.aggregate_payment(&aggregate.hash()).unwrap(), "the a record");
+        assert_eq!(
+            synced.aggregate_payment(&aggregate.hash()).unwrap().map(|(_, share, _)| share),
+            Some(60 + 7),
+            "the covers' shares are fee − floor"
+        );
+        assert_eq!(synced.head_block().unwrap().header.state_root, live.head_block().unwrap().header.state_root, "one state root");
+        let check = synced.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert_eq!((check.problem, check.last_good), (None, 2), "the synced store's startup replay passes");
+        assert_eq!(check.ledger.base_fees_burned(), want_burned, "and recomputes the same burn");
+    }
+
     /// The interface review's INTERFACE-2: `truncate_to` deleted the dropped blocks' records and
     /// rows but not their seal rows. An aggregate's block truncated away left its covers'
     /// `sealed_by` marks (and the covered block's `sealed` flag) behind, and
@@ -8720,13 +9096,9 @@ mod seal_tests {
             .unwrap();
         assert!(storage.sealed_by(&covered.hash()).unwrap().is_some(), "the aggregate's commit sealed it");
         assert!(storage.block_sealed(&b1.block.hash()).unwrap(), "and flagged its block");
-        // The payment facts `commit` writes off the ledger's own count (this aggregate is stored
-        // unchecked, so the ledger paid nothing), written by hand so their removal shows.
-        storage
-            .db
-            .put_cf(storage.cf(CF_SEALS), [b"a".as_slice(), aggregate.hash().as_bytes()].concat(), bincode::serialize(&(5u64, 0u64, 0u64)).unwrap())
-            .unwrap();
-        assert!(storage.aggregate_payment(&aggregate.hash()).unwrap().is_some());
+        // The payment facts: the aggregate is stored unchecked, so its record is the fixture's
+        // zero placeholder (`make_block_unchecked_at`) — present, which is what lets its removal show.
+        assert!(storage.aggregate_payment(&aggregate.hash()).unwrap().is_some(), "commit wrote the aggregate's record");
         assert!(storage.block_sealed(&b4.block.hash()).unwrap(), "the later block is flagged too");
         // The corruption: neither the aggregate's block nor the later one decodes any more.
         for h in [3u64, 4] {

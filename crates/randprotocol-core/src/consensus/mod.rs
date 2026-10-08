@@ -233,6 +233,11 @@ pub struct CommittedBlock {
     /// ledger gave it.
     #[serde(skip)]
     pub deposits: Vec<crate::ledger::Deposit>,
+    /// The aggregates the *ledger* paid while applying this block, with the payment it derived
+    /// (`Ledger::paid_aggregates`). Filled and skipped on the wire exactly as `deposits`: storage
+    /// writes `rand_getAggregate`'s payment facts from it.
+    #[serde(skip)]
+    pub aggregates: Vec<crate::ledger::aggregation::PaidAggregate>,
 }
 
 /// The validator sets of the epochs this replica has seen start, keyed by epoch (spec §8).

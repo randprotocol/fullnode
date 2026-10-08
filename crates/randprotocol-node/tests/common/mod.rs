@@ -57,11 +57,6 @@ impl TestNode {
 /// A one-validator chain. `hc_bundle` must be this build's own guest, or `node::start` refuses to
 /// run at all.
 fn genesis(key: &Keypair) -> Genesis {
-    genesis_with_aggregation(key, None)
-}
-
-/// `genesis`, with an `aggregation` section when the test is about one.
-fn genesis_with_aggregation(key: &Keypair, aggregation: Option<randprotocol_core::ledger::aggregation::AggregationConfig>) -> Genesis {
     Genesis {
         chain_id: 7,
         timestamp_ms: 0,
@@ -82,7 +77,7 @@ fn genesis_with_aggregation(key: &Keypair, aggregation: Option<randprotocol_core
         hc_bundle: word8_to_hex(&ZkExecutor::hc_bundle()),
         bridge: None,
         tokens: None,
-        aggregation,
+        aggregation: None,
         consensus_domain: None,
         epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
         max_program_words: None,
@@ -100,6 +95,7 @@ fn genesis_with_aggregation(key: &Keypair, aggregation: Option<randprotocol_core
         binding_domain: None,
         proof_window_blocks: None,
         program_state: None,
+        fees: None,
         incremental_nullifier_root: None,
     }
 }
@@ -120,6 +116,13 @@ pub async fn start_one_validator_aggregating(
 async fn start_one_validator_with(
     aggregation: Option<randprotocol_core::ledger::aggregation::AggregationConfig>,
 ) -> TestNode {
+    start_one_validator_shaped(move |g| g.aggregation = aggregation).await
+}
+
+/// `start_one_validator`, on the same chain with its genesis edited first — a `gas`, `fees` or
+/// `tokens` section (`rpc_contract.rs`). The validator key is still seed `[101; 32]`, so a test
+/// that signs as the validator signs the same way.
+pub async fn start_one_validator_shaped(edit: impl FnOnce(&mut Genesis)) -> TestNode {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn,randprotocol_node=info".into()),
@@ -128,7 +131,9 @@ async fn start_one_validator_with(
         .try_init();
     let key = Keypair::from_seed([101; 32]).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("genesis.json"), genesis_with_aggregation(&key, aggregation).to_json()).unwrap();
+    let mut file = genesis(&key);
+    edit(&mut file);
+    std::fs::write(dir.path().join("genesis.json"), file.to_json()).unwrap();
     let handle = node::start(NodeConfig {
         viewing_open: false,
         datadir: dir.path().to_path_buf(),
@@ -161,9 +166,28 @@ async fn start_one_validator_with(
 /// minute of waiting to observe a property the channel decides on its own. `RpcState`'s fields are
 /// public, so the test builds one over an empty database and drives the sender itself.
 pub async fn serve_heads(capacity: usize) -> (SocketAddr, broadcast::Sender<HeadSummary>, ServedRpc) {
+    serve_genesis_with(capacity, |_| {}).await
+}
+
+/// An RPC server with no node behind it over the chain [`serve_heads`] serves, its genesis edited
+/// first. For a shape `node::start` refuses to run — an `aggregation` section, which
+/// `check_build_runs_genesis` holds off today — but whose genesis-only reads (`rand_getLimits`,
+/// `rand_getSupply`) a contract test still wants to pin. Built on the stub executor, so an
+/// admitted shape's digest is the stub's.
+pub async fn serve_genesis(edit: impl FnOnce(&mut Genesis)) -> (SocketAddr, ServedRpc) {
+    let (addr, _heads, served) = serve_genesis_with(16, edit).await;
+    (addr, served)
+}
+
+async fn serve_genesis_with(
+    capacity: usize,
+    edit: impl FnOnce(&mut Genesis),
+) -> (SocketAddr, broadcast::Sender<HeadSummary>, ServedRpc) {
     let dir = tempfile::tempdir().unwrap();
     let key = Keypair::from_seed([102; 32]).unwrap();
-    let gs = genesis(&key).build(&StubExecutor).expect("genesis builds");
+    let mut file = genesis(&key);
+    edit(&mut file);
+    let gs = file.build(&StubExecutor).expect("genesis builds");
     let storage = Arc::new(randprotocol_node::storage::Storage::open(dir.path()).unwrap());
     storage.init_genesis(&gs).unwrap();
     let (heads, _) = broadcast::channel(capacity);

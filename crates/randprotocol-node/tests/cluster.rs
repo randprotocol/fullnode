@@ -215,6 +215,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         binding_domain: None,
         proof_window_blocks: None,
         program_state: None,
+        fees: None,
         incremental_nullifier_root: None,
     }
 }
@@ -2155,7 +2156,7 @@ fn certified_chain(
         };
         parent = block.clone();
         parent_view = view;
-        out.push(CommittedBlock { block, pruned: vec![], qc, receipts: vec![], deposits: vec![] });
+        out.push(CommittedBlock { block, pruned: vec![], qc, receipts: vec![], deposits: vec![], aggregates: vec![] });
     }
     out
 }

@@ -1616,6 +1616,7 @@ impl HotStuff {
                 // The ledger *after* this block holds exactly this block's deposits:
                 // `apply_transactions` clears the list when a block starts.
                 deposits: e.ledger_after.deposits().to_vec(),
+                aggregates: e.ledger_after.paid_aggregates().to_vec(),
             });
         }
         // The first block of an epoch fixes that epoch's set for good: record it while its

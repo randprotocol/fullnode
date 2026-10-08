@@ -88,6 +88,7 @@ fn genesis(key: &Keypair, incremental_nullifier_root: bool) -> anyhow::Result<Ge
         binding_domain: None,
         proof_window_blocks: None,
         program_state: None,
+        fees: None,
         incremental_nullifier_root: incremental_nullifier_root.then_some(true),
     };
     g.build(&StubExecutor).context("building the harness genesis")

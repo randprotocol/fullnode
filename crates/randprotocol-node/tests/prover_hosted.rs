@@ -52,6 +52,7 @@ fn genesis(validator: &Keypair) -> Genesis {
         binding_domain: None,
         proof_window_blocks: None,
         program_state: None,
+        fees: None,
         incremental_nullifier_root: None,
     }
 }

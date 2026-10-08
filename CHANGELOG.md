@@ -10,7 +10,59 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 `git tag` and the GitHub release list (audit v6, DOC-6). There is no tag v0.5.2, v0.5.3 or v0.6.5.
 "Assets" says what the GitHub release carries, as read on 2026-09-30.
 
-## Unreleased — the validator hot path (`feat/hot-path`)
+## Unreleased
+
+- **Fee feedback, the burned base** (genesis-gated: a hard fork on a chain whose genesis sets a
+  flag, node-only on every other chain — no existing chain carries the section): a new genesis
+  `fees` section (`docs/fees.md` §1.3). Under `fees.burn_base` every bundle's `BUNDLE_BASE` is
+  destroyed instead of paid to the proposer, who keeps the tip (`fee − BUNDLE_BASE`; nothing at
+  inclusion on an aggregating chain, whose excess is bucketed as before). A new supply counter
+  `base_fees_burned` sits on the right of the supply identity, persisted under
+  `META_BASE_FEES_BURNED` and replay-audited; the section is stored under `META_FEES` and restored
+  from the genesis file by `reload_ledger`. RPC: `rand_getSupply.base_fees_burned`,
+  `rand_getLimits.fee_rules` (`docs/rpc.md` changelog).
+- **Fee feedback, the fee-first subsidy** (same gating): under `fees.subsidy_net_of_fees` (it
+  needs `aggregation`) an aggregate's proving shares pay the subsidy schedule first and only the
+  shortfall is minted — the payout note is `max(subsidy(n), shares)`, `subsidised` and
+  `rand_getAggregate.subsidy` move by the minted part, `sealed_blocks` advances as before
+  (`docs/fees.md` §1.3, `docs/aggregation.md` §3.3).
+- **The aggregate daemon nets the subsidy:** `rand-node aggregate` reads
+  `rand_getLimits.fee_rules` and, under `subsidy_net_of_fees`, seals its payout note at the
+  ledger's own `max(subsidy(n), shares)` (`aggregation::minted_subsidy`) instead of their sum — a
+  note the ledger never pays, whose envelope opened to nothing (`docs/aggregation.md` §3.3).
+- **`rand_getAggregate` follows the ledger's payment:** `Ledger::apply_aggregate` records what it
+  paid (`PaidAggregate`, drained to storage on `CommittedBlock::aggregates` like the deposits), and
+  storage stores that, so a sync that commits a bundle and its covering aggregate in one batch no
+  longer undercounts `proving_share` (pre-existing) or overstates `subsidy` under the flag.
+- **`fees.burn_floor`, the full EIP-1559 form (#135):** a third flag (needs `burn_base`, else
+  `GenesisError::BurnFloorWithoutBurnBase`; hash bytes `b"burn_floor" ‖ 0x01` after
+  `subsidy_net_of_fees`'s) burns `min(fee, floor)` with `floor` the ledger's own floor for the
+  bundle — base for a transfer, base + per-word for a Deploy, the tier-exact Call floor at the
+  block's prices in force, `BRIDGE_BURN_FEE` for a BridgeBurn, an Invoke's cell fee included —
+  from one helper (`Ledger::settled_floor`) that is also the post-decode fee check; the bucketed
+  excess becomes `fee − floor`; `bucketed_excess` is deleted (the bucket entry is the authority);
+  `rand_getLimits.fee_rules.burn_floor` (`docs/fees.md` §1.3).
+- **The aggregate daemon reads `fee_rules` once (#132):** through the client's cached
+  `rand_getLimits` reply (`RpcClient::fee_rules`), before the prove beside the envelope format; a
+  node without the method, a reply without the field, or `null` are the default rules; a transport
+  error is not cached.
+- **Storage refuses a block whose aggregates lack their paid records (#133):** every
+  `Action::Aggregate` must be matched by exactly one `PaidAggregate` on `CommittedBlock::aggregates`
+  (a missing, stale or duplicated record refuses the commit by block height and aggregate hash,
+  nothing written).
+- **Tests (#134):** the live proposer/peer root agreement under `burn_base` + `subsidy_net_of_fees`,
+  and across a restart through `reload_ledger` with a never-restarted peer as the control.
+- **The pinned recursion fixtures ride in the repo (#131):** `Test-0..2.proof` at
+  `crates/randprotocol-node/fixtures/recursion/` are `fixture_proof`'s default, so
+  `cargo test -p randprotocol-node --lib` passes with no `RECURSION_FIXTURES` set (the
+  pinned-vectors test's interface list rides on those exact proofs' random notes — a freshly
+  proved set can never satisfy it); `scripts/recursion-fixtures.sh --check` verifies the sha256
+  pins and its prove path regenerates from a circuits checkout at `CIRCUITS_PIN` for a re-pin.
+- **Storage:** `META_FEES` (JSON, `{}` without a section) and `META_BASE_FEES_BURNED` (bincode `0`
+  without the flag) are written on every new database; an existing database without them opens
+  unchanged, both reading as their defaults.
+
+### The validator hot path (`feat/hot-path`)
 
 Not rolled onto chain 20: the consensus-visible change is genesis-gated and needs a new cut.
 

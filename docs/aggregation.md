@@ -56,6 +56,14 @@ aggregator it prices proving too. The fee splits into a **verification share** (
 more than the floor is aggregated first; that is the fee-ordered mempool the block-space doc
 asks for, with GPU operators doing the ordering.
 
+Under the genesis `fees.burn_base` (`docs/fees.md` §1.3) the verification share is destroyed
+instead of paid: the proposer keeps nothing at inclusion, `BUNDLE_BASE` joins `burned` and
+`base_fees_burned`, and the proving share — `fee − BUNDLE_BASE`, bucketed exactly as without the
+flag — reaches the covering aggregator, or the recorded proposer at the sweep, as it always has.
+Under `fees.burn_floor` beside it (issue #135) the whole floor is destroyed instead — a Deploy's
+per-word term and a Call's tier-exact gas and byte terms with the base — and the proving share is
+`fee − floor`, so an aggregator is never paid a priced term the chain burned.
+
 ### 3.2 A block subsidy in new RAND
 
 At launch fee volume is near zero and nobody runs a GPU for it. So the sealing block mints a
@@ -87,6 +95,27 @@ payout address, exactly like a validator's Withdraw: the amount is public in tha
 aggregate carries the note's blinding `r`, and the ledger derives the commitment itself, so an
 aggregator cannot mint more than the schedule says. The note's later spend is unlinkable as any
 other.
+
+Under the genesis `fees.subsidy_net_of_fees` (`docs/fees.md` §1.3) the shares pay the schedule
+first (spec §5.4's derivation, `Ledger::aggregate_payment`): the note carries
+`max(subsidy(n), shares)`, and only `subsidy(n) − shares` — nothing once the shares reach the
+schedule — is minted. `subsidised` and `rand_getAggregate`'s `subsidy` carry that minted part;
+`sealed_blocks` advances by one either way. Admission and apply still derive one note from one
+state: the rule lives in that one function.
+
+**An aggregator must net the subsidy too.** The ledger never reads the envelope's amount: it
+derives the commitment from its own `max(subsidy(n), shares)`, admits the aggregate and appends
+that note whatever the envelope says. An envelope sealed at `subsidy(n) + shares` therefore opens
+to a commitment matching no leaf, and the payout is lost to the wallet that holds it. The flag is
+read off `rand_getLimits.fee_rules.subsidy_net_of_fees` (`null` — no rule on — a reply that
+predates the section and a node with no `rand_getLimits` at all are the old sum).
+`rand-node aggregate` reads it through its client's cached limits (`RpcClient::fee_rules`, the
+same one `rand_getLimits` read the envelope format comes from: the section is fixed at genesis,
+so one read per daemon, never one per pass that a transient RPC failure could abort — issue
+#132), takes `rand_status.aggregation`'s schedule beside it, and seals at
+`aggregation::minted_subsidy(subsidy(n), shares, &fees) + shares`, the ledger's own function
+(pinned by `the_aggregate_pass_seals_the_ledgers_payout_under_subsidy_net_of_fees`). A third-party
+aggregator must do the same.
 
 ### 3.4 Supply accounting
 
@@ -212,6 +241,49 @@ both have to clear before a genesis may switch it on.
    ≥ 256 GB host, tight, and a projection until proved. On that tree
    `admitted_shapes[].aggregate_program_digest` is `c90b3f0a…74d8` and the node admits tiers
    {20, 21, 22} (`recursion/docs/04-phase2-row-cuts.md`, `docs/node-hardware.md` §4).
+
+### Testing: the recursion fixtures (issue #131)
+
+The node's fixture-backed tests (the list is `scripts/ci-fixture-skips.sh`'s: `agg_executor::`,
+the covered-assembly tests in `node::`, the aggregation tests in `rpc::`, `storage::seal_tests::`)
+read real bundle proofs through `fixture_proof(k)`, `<dir>/Test-{k}.proof`. The set is exactly
+**`Test-0`, `Test-1`, `Test-2`**: every literal caller uses `k = 0`, and
+`the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte` reads `Test-1` and `Test-2`.
+The pinned set is **committed**, `crates/randprotocol-node/fixtures/recursion` (~1 MB), and is
+`fixture_proof`'s default directory; `RECURSION_FIXTURES` overrides it. So the suite needs no
+setup (2026-10-06, no env var: `491 passed; 0 failed; 1 ignored`). A missing file is a panic,
+not a skip, by design.
+
+```sh
+cargo test -p randprotocol-node --lib                           # reads the in-repo set
+scripts/recursion-fixtures.sh --check [<dir>]                   # check a set (default: the same dir)
+scripts/recursion-fixtures.sh <circuits checkout> [<dir>]       # re-prove (a re-pin), then check
+```
+
+**Why these bytes.** A fixture's notes are random, and the pinned-vectors test pins the 118-word
+interface list and digest (`3534960f…`) that one set of notes produces: the cache re-proved
+2026-10-03 for the phase-2 re-vendor, which is what is committed. A freshly proved set passes
+every other fixture-backed test and fails that one at "the pinned 118-word interface list"
+(measured 2026-10-06: `490 passed; 1 failed`; its `inner_vk_digest` assertion, the
+data-independent half, passes). The script compares each file's sha256 with `PINNED_SHA256` and
+exits 0 when the set is the pinned bytes, 1 when a file is missing (or the checkout is refused,
+or a generator failed), 3 when the set is complete but not the pinned bytes.
+
+**Re-pinning, when the vendored zkVM moves.** The fixtures are proofs by circuits' zkVM
+(`research/` and the bundle guest in `guests-compiled/`), so a re-pin proves from a checkout
+whose two trees are `CIRCUITS_PIN` in `.github/workflows/ci.yml` — the script refuses any other
+(`recursion/`, the outer rVM that only hosts the generator, may drift). A set from another
+constraint set fails the suite with "cs8 proofs carry pv::NUM public values" (the pre-cs8 cache
+under `circuits/recursion/target/recursion-fixtures` does). The script runs circuits'
+`recursion/tests/fixtures.rs` generator once per k in parallel (`FIXTURE_PROFILE=Test
+FIXTURE_KS=k`), which skips a fixture that still verifies and re-proves one that does not;
+**measured (2026-10-06, M4 Max):** `Test-1` and `Test-2` proved in parallel in 4 min 36 s wall,
+~4.6 min a proof. The new files then end at exit 3; in the same commit re-measure the test's
+constants and circuits' `recursion/docs/02-aggregate.md` on them and move `PINNED_SHA256`.
+
+**CI.** `scripts/ci-fixture-skips.sh` still skips these tests on the grounds that a clean runner
+has no cache; with the set committed that no longer holds, and the skip list (PROC-7's open half)
+can be revisited — a follow-up, not changed here.
 
 ## 4. Fallback
 

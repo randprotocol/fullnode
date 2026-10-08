@@ -487,6 +487,18 @@ pub struct Genesis {
     /// genesis hashes byte-for-byte as before and every `Invoke` is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_state: Option<crate::ledger::program_state::ProgramStateConfig>,
+    /// The fee-feedback rules (`ledger::fees`, `docs/fees.md` §1.3): `burn_base` destroys every
+    /// bundle's `BUNDLE_BASE` instead of paying it, `subsidy_net_of_fees` pays an aggregate's
+    /// subsidy from its proving shares first (it needs `aggregation`,
+    /// [`GenesisError::SubsidyNetOfFeesWithoutAggregation`]), and `burn_floor` widens the burned
+    /// base to the bundle's whole settled floor (issue #135; it needs `burn_base`,
+    /// [`GenesisError::BurnFloorWithoutBurnBase`]). Absent — every chain cut before it —
+    /// or present with no `true` flag, the genesis hashes and the chain runs byte for byte as
+    /// before; a `true` flag is bound into the genesis hash right after the `tokens` section
+    /// ([`fees_commit`]). Never part of the state root (a genesis parameter `reload_ledger`
+    /// restores).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fees: Option<crate::ledger::fees::FeesConfig>,
     /// Spec 2026-10-05 §4: the nullifier root as an incremental range in insertion order
     /// (`rand-state-nf-mmr-1`) instead of a sorted root recomputed over every nullifier each
     /// block. Absent or `false` (every chain through 20) changes nothing; `true` is committed
@@ -600,6 +612,15 @@ pub enum GenesisError {
     /// sync would compute another price and fail the state root.
     #[error("gas.dynamic cannot be combined with aggregation: a pruned bundle's encoded size differs from its raw size, so sealed-form sync would diverge on the byte price")]
     DynamicGasWithAggregation,
+    /// `fees.subsidy_net_of_fees: true` nets the aggregation subsidy against proving shares, and
+    /// a chain without an `aggregation` section has neither.
+    #[error("fees.subsidy_net_of_fees needs an aggregation section: without one there is no subsidy to net")]
+    SubsidyNetOfFeesWithoutAggregation,
+    /// `fees.burn_floor: true` widens `burn_base`'s burned base to the bundle's whole floor
+    /// (issue #135); without `burn_base: true` there is no burned base to widen, and a flag that
+    /// silently did nothing would read as a rule the chain does not run.
+    #[error("fees.burn_floor needs fees.burn_base: true — it widens the burned base to the whole floor")]
+    BurnFloorWithoutBurnBase,
     #[error("bad hc_bundle {0} (64 hex characters)")]
     BadHcBundle(String),
     #[error("bad hc_auth {0} (64 hex characters)")]
@@ -716,6 +737,35 @@ fn gas_commit(g: &gas::GasConfig) -> Vec<u8> {
             commit.extend_from_slice(b"byte_load");
             commit.extend_from_slice(b"paying");
         }
+    }
+    commit
+}
+
+/// The bytes a `fees` section appends to the genesis commitment, right after the `tokens`
+/// contribution: `"fees"`, then `"burn_base" ‖ 1` if `burn_base` is `true`, then
+/// `"subsidy_net_of_fees" ‖ 1` if `subsidy_net_of_fees` is `true`, then `"burn_floor" ‖ 1` if
+/// `burn_floor` is `true` (issue #135; appended last so the two older flags' bytes, and every hash
+/// pinned over them, stay put), in that order — and nothing at all when no flag is `true`, so a
+/// file that spells the defaults out hashes as one without the section (TOK-2's rule for
+/// `burn_registration_fee`). Pinned byte for byte by
+/// `the_fees_sections_hash_contribution_is_pinned`.
+fn fees_commit(f: &crate::ledger::fees::FeesConfig) -> Vec<u8> {
+    let mut commit = Vec::new();
+    if !f.any() {
+        return commit;
+    }
+    commit.extend_from_slice(b"fees");
+    if f.burn_base() {
+        commit.extend_from_slice(b"burn_base");
+        commit.push(1);
+    }
+    if f.subsidy_net_of_fees() {
+        commit.extend_from_slice(b"subsidy_net_of_fees");
+        commit.push(1);
+    }
+    if f.burn_floor() {
+        commit.extend_from_slice(b"burn_floor");
+        commit.push(1);
     }
     commit
 }
@@ -958,6 +1008,17 @@ impl Genesis {
                 return Err(GenesisError::DynamicGasWithAggregation);
             }
         }
+        // Fee feedback: the fee-first subsidy nets the aggregation subsidy against proving
+        // shares, and a chain without `aggregation` has neither to net.
+        if self.fees.as_ref().is_some_and(|f| f.subsidy_net_of_fees()) && self.aggregation.is_none() {
+            return Err(GenesisError::SubsidyNetOfFeesWithoutAggregation);
+        }
+        // Issue #135: the full-floor burn widens the burned base, so it needs one to widen. A
+        // `burn_floor` alone would hash into the genesis and change nothing the ledger does —
+        // a rule in the binding the chain does not run.
+        if self.fees.as_ref().is_some_and(|f| f.burn_floor() && !f.burn_base()) {
+            return Err(GenesisError::BurnFloorWithoutBurnBase);
+        }
         Ok(())
     }
 
@@ -1083,6 +1144,7 @@ impl Genesis {
             ledger.set_tokens(Some(registry));
         }
         ledger.set_aggregation(self.aggregation.clone());
+        ledger.set_fees(self.fees.clone().unwrap_or_default());
         ledger.set_staking(self.staking.clone());
         ledger.set_max_program_words(self.max_program_words.map_or(gas::MAX_PROGRAM_WORDS, |n| n as usize));
         ledger.set_max_proof_bytes(self.max_proof_bytes.map_or(gas::MAX_PROOF_BYTES, |n| n as usize));
@@ -1272,6 +1334,12 @@ impl Genesis {
                 commit.extend_from_slice(b"bound_note_value");
                 commit.push(1);
             }
+        }
+        // Fee feedback (`docs/fees.md` §1.3), right after the tokens bytes: the `fees` section's
+        // `true` flags, tagged — nothing at all for an absent section or one with no `true` flag,
+        // so every file cut before it hashes byte for byte as before.
+        if let Some(fees) = &self.fees {
+            commit.extend_from_slice(&fees_commit(fees));
         }
         // Block aggregation, likewise: appended only when the section is configured, so an
         // aggregation-less chain's genesis hash is byte-for-byte today's.
@@ -1948,6 +2016,7 @@ mod tests {
             binding_domain: None,
             proof_window_blocks: None,
             program_state: None,
+            fees: None,
             incremental_nullifier_root: None,
         }
     }
@@ -2485,6 +2554,246 @@ mod tests {
         assert!(on.to_json().contains("burn_registration_fee"));
         let back: Genesis = serde_json::from_str(&on.to_json()).unwrap();
         assert_eq!(back, on);
+    }
+
+    /// A genesis whose `aggregation` section validates: the production shape and profile the
+    /// `dynamic_gas_is_refused_beside_aggregation` fixture uses.
+    fn aggregating_genesis() -> Genesis {
+        use crate::ledger::aggregation::{AdmittedShape, AggregationConfig};
+        use crate::types::{DeclaredShape, FriProfile};
+        let shape = DeclaredShape {
+            profile: FriProfile::Production,
+            tier: crate::types::BUNDLE_PROOF_TIER,
+            program_log_height: 12,
+            input_log_height: 10,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: crate::types::BUNDLE_PUBLIC_LOG_HEIGHT,
+            mem_log_height: 16,
+        };
+        let mut g = base_genesis();
+        g.fri_profile = "production".into();
+        g.aggregation = Some(AggregationConfig {
+            bond: 1_000,
+            max_covers: 3,
+            subsidy_base: 100,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![AdmittedShape {
+                shape,
+                hc: Hash::digest(b"the bundle guest"),
+                aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap(),
+            }],
+        });
+        g
+    }
+
+    /// Fee feedback (`docs/fees.md` §1.3): a `fees` section with no `true` flag is the section's
+    /// absence — the same genesis hash, the same state root, the rules off on the ledger — exactly
+    /// as TOK-2's `burn_registration_fee: false` is.
+    #[test]
+    fn a_fees_section_with_no_true_flag_hashes_as_absent() {
+        use crate::ledger::fees::FeesConfig;
+        let g = genesis(1);
+        let base = build(&g);
+        assert_eq!(base.ledger.fees(), &FeesConfig::default());
+        for off in [
+            FeesConfig::default(),
+            FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: None },
+            FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(false), burn_floor: None },
+        ] {
+            let mut with = g.clone();
+            with.fees = Some(off.clone());
+            let state = build(&with);
+            assert_eq!(state.hash(), base.hash(), "{off:?} commits nothing");
+            assert_eq!(state.ledger.state_root(), base.ledger.state_root());
+            assert!(!state.ledger.fees().burn_base() && !state.ledger.fees().subsidy_net_of_fees());
+        }
+        // A `true` flag moves the hash, never the state root (a genesis parameter, not state),
+        // and reaches the ledger.
+        let mut on = g.clone();
+        on.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None });
+        let on_state = build(&on);
+        assert_ne!(on_state.hash(), base.hash(), "the flag is in the genesis binding");
+        assert_eq!(on_state.ledger.state_root(), base.ledger.state_root(), "and not in the state root");
+        assert!(on_state.ledger.fees().burn_base());
+    }
+
+    /// Fee feedback: the `fees` section's contribution to the genesis hash, byte for byte —
+    /// `"fees"`, then each `true` flag's tag and a `1`, `burn_base` before `subsidy_net_of_fees` —
+    /// and nothing for a section without a `true` flag. A re-tagged or reordered flag is a new
+    /// chain, so it must fail here first.
+    #[test]
+    fn the_fees_sections_hash_contribution_is_pinned() {
+        use crate::ledger::fees::FeesConfig;
+        let burn = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None };
+        let mut want = b"fees".to_vec();
+        want.extend_from_slice(b"burn_base");
+        want.push(1);
+        assert_eq!(fees_commit(&burn), want);
+
+        let both = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: None };
+        want.extend_from_slice(b"subsidy_net_of_fees");
+        want.push(1);
+        assert_eq!(fees_commit(&both), want);
+
+        let net = FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(true), burn_floor: None };
+        let mut want = b"fees".to_vec();
+        want.extend_from_slice(b"subsidy_net_of_fees");
+        want.push(1);
+        assert_eq!(fees_commit(&net), want);
+
+        // Issue #135: `burn_floor` appends its tag and a `1` after everything above, and only
+        // when `true` — the base with the floor, then all three flags.
+        let floor = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) };
+        let mut want = b"fees".to_vec();
+        want.extend_from_slice(b"burn_base");
+        want.push(1);
+        want.extend_from_slice(b"burn_floor");
+        want.push(1);
+        assert_eq!(fees_commit(&floor), want);
+        let all = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true) };
+        let mut want = b"fees".to_vec();
+        want.extend_from_slice(b"burn_base");
+        want.push(1);
+        want.extend_from_slice(b"subsidy_net_of_fees");
+        want.push(1);
+        want.extend_from_slice(b"burn_floor");
+        want.push(1);
+        assert_eq!(fees_commit(&all), want);
+        // `false` spelt out commits nothing, so the two older sections keep their bytes.
+        assert_eq!(fees_commit(&FeesConfig { burn_floor: Some(false), ..burn.clone() }), fees_commit(&burn));
+        assert_eq!(fees_commit(&FeesConfig { burn_floor: Some(false), ..both.clone() }), fees_commit(&both));
+
+        assert!(fees_commit(&FeesConfig::default()).is_empty());
+        assert!(fees_commit(&FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(false), burn_floor: None }).is_empty());
+
+        // Each flag reaches the hash `build` computes, and the three are three chains.
+        let hash_of = |f: Option<FeesConfig>| {
+            let mut g = aggregating_genesis();
+            g.fees = f;
+            build(&g).hash()
+        };
+        let hashes = [hash_of(None), hash_of(Some(burn)), hash_of(Some(both)), hash_of(Some(net)), hash_of(Some(floor)), hash_of(Some(all))];
+        for i in 0..hashes.len() {
+            for j in i + 1..hashes.len() {
+                assert_ne!(hashes[i], hashes[j], "{i} vs {j}");
+            }
+        }
+    }
+
+    /// And its *position*: `fees_commit`'s bytes sit after the `tokens` bytes and before the
+    /// `aggregation` bytes in the genesis commitment. The byte pin above cannot see a reorder —
+    /// moving the `fees` block anywhere else in `build` keeps its bytes and makes a new chain —
+    /// so this pins the hash of a genesis carrying all three sections (and the `bridge` the
+    /// `tokens` section needs). A move of this hex is consensus-breaking: regenerate it only
+    /// together with a deliberate change of the commitment's layout.
+    #[test]
+    fn the_fees_section_sits_between_tokens_and_aggregation_in_the_genesis_hash() {
+        use crate::ledger::fees::FeesConfig;
+        let mut g = aggregating_genesis();
+        g.bridge = Some(bridge_cfg());
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None, incremental_root: None });
+        g.alloc = opened_alloc();
+        g.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: None });
+        assert_eq!(build(&g).hash().to_hex(), "de93090f45fefa36f131e934849bf188aea7782ed47c07e77f653d32354ebc06");
+    }
+
+    /// Fee feedback: the fee-first subsidy nets the aggregation subsidy, so a chain without an
+    /// `aggregation` section cannot ask for it; `burn_base` needs nothing.
+    #[test]
+    fn subsidy_net_of_fees_requires_an_aggregation_section() {
+        use crate::ledger::fees::FeesConfig;
+        let net = FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None };
+        let mut plain = base_genesis();
+        plain.fees = Some(net.clone());
+        let e = plain.validate().unwrap_err();
+        assert!(matches!(e, GenesisError::SubsidyNetOfFeesWithoutAggregation), "{e}");
+        assert!(e.to_string().contains("aggregation"), "{e}");
+
+        let mut agg = aggregating_genesis();
+        agg.fees = Some(net);
+        assert!(agg.validate().is_ok());
+        assert!(build(&agg).ledger.fees().subsidy_net_of_fees());
+
+        let mut burn_only = base_genesis();
+        burn_only.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(false), burn_floor: None });
+        assert!(burn_only.validate().is_ok(), "burn_base needs no aggregation, and a false flag asks for nothing");
+    }
+
+    /// Issue #135: `burn_floor` widens the burned base to the whole floor, so without `burn_base`
+    /// there is nothing to widen — refused by name rather than read as off. With it, on any
+    /// chain, it validates; spelt `false` it asks for nothing.
+    #[test]
+    fn burn_floor_requires_burn_base() {
+        use crate::ledger::fees::FeesConfig;
+        for base in [None, Some(false)] {
+            let mut g = base_genesis();
+            g.fees = Some(FeesConfig { burn_base: base, subsidy_net_of_fees: None, burn_floor: Some(true) });
+            let e = g.validate().unwrap_err();
+            assert!(matches!(e, GenesisError::BurnFloorWithoutBurnBase), "{e}");
+            assert!(e.to_string().contains("burn_base"), "{e}");
+        }
+        let mut g = base_genesis();
+        g.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+        assert!(g.validate().is_ok());
+        assert!(build(&g).ledger.fees().burn_floor());
+        g.fees = Some(FeesConfig { burn_base: None, subsidy_net_of_fees: None, burn_floor: Some(false) });
+        assert!(g.validate().is_ok(), "a false flag asks for nothing");
+    }
+
+    /// Issue #135, the third flag through the file and the hash: `burn_floor: true` survives
+    /// `to_json` → `from_json` and reaches the ledger; a misspelt `burn_flor` is refused by
+    /// `deny_unknown_fields` (a typo must not read as "off" on a consensus rule); `burn_floor:
+    /// false` beside `burn_base: true` builds the very genesis hash of `burn_base` alone (the byte
+    /// pin covers `fees_commit`, this covers `build`); and the floor beside
+    /// `subsidy_net_of_fees` without the base is refused like the floor alone.
+    #[test]
+    fn the_burn_floor_flag_round_trips_hashes_as_written_and_refuses_a_misspelling() {
+        use crate::ledger::fees::FeesConfig;
+        let mut on = aggregating_genesis();
+        on.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+        let json = on.to_json();
+        assert!(json.contains("\"burn_floor\": true"), "the flag is written: {json}");
+        let back = Genesis::from_json(&json).expect("the file parses back");
+        assert_eq!(back, on, "burn_floor: true round-trips");
+        assert_eq!(build(&back).hash(), build(&on).hash(), "and hashes as before the trip");
+        assert!(build(&back).ledger.fees().burn_floor(), "and reaches the ledger");
+
+        let typo = json.replace("\"burn_floor\"", "\"burn_flor\"");
+        assert_ne!(typo, json);
+        let e = Genesis::from_json(&typo).expect_err("a misspelt flag is refused");
+        assert!(e.to_string().contains("burn_flor"), "the refusal names the key: {e}");
+
+        let hash_of = |f: FeesConfig| {
+            let mut g = aggregating_genesis();
+            g.fees = Some(f);
+            build(&g).hash()
+        };
+        let base = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None };
+        assert_eq!(hash_of(FeesConfig { burn_floor: Some(false), ..base.clone() }), hash_of(base.clone()), "false beside burn_base is burn_base alone");
+        assert_ne!(hash_of(FeesConfig { burn_floor: Some(true), ..base }), hash_of(FeesConfig { burn_floor: Some(false), burn_base: Some(true), subsidy_net_of_fees: None }), "true is another chain");
+
+        let mut g = aggregating_genesis();
+        g.fees = Some(FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: Some(true) });
+        assert!(matches!(g.validate(), Err(GenesisError::BurnFloorWithoutBurnBase)), "the net subsidy does not stand in for the base");
+    }
+
+    /// Fee feedback: the section round-trips through the file — kept as written when present,
+    /// omitted entirely when absent, so every existing file serialises byte for byte as before.
+    #[test]
+    fn the_fees_section_round_trips_and_is_omitted_when_absent() {
+        use crate::ledger::fees::FeesConfig;
+        let g = genesis(1);
+        assert!(!g.to_json().contains("\"fees\""), "absent from the file when absent");
+        assert_eq!(Genesis::from_json(&g.to_json()).unwrap(), g);
+
+        let mut on = g.clone();
+        on.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None });
+        let json = on.to_json();
+        assert!(json.contains("\"fees\"") && json.contains("\"burn_base\": true"), "{json}");
+        assert!(!json.contains("subsidy_net_of_fees"), "an absent flag stays absent: {json}");
+        assert_eq!(Genesis::from_json(&json).unwrap(), on);
     }
 
     /// Audit v6 (TOK-1, issue #86): `tokens.incremental_root` is committed to the genesis hash

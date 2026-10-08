@@ -438,3 +438,73 @@ fn the_genesis_command_writes_the_proof_window_when_asked() {
     assert_eq!(read(&plain).proof_window_blocks, None);
     assert!(!std::fs::read_to_string(&plain).unwrap().contains("proof_window_blocks"));
 }
+
+/// Fee feedback (`docs/fees.md` §1.3): `--fees` writes a `FeesConfig` file into the genesis
+/// unchanged — all three flags, `subsidy_net_of_fees` on an aggregating chain, which it needs —
+/// and the chain it builds runs every rule; the section is part of the genesis hash. Without the
+/// flag the file has no section, as before. A misspelled key is refused by the section's own
+/// `deny_unknown_fields`, and nothing is written.
+#[test]
+fn the_genesis_command_round_trips_a_fees_section_with_all_three_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("fees.json");
+    std::fs::write(&cfg_path, r#"{"burn_base":true,"subsidy_net_of_fees":true,"burn_floor":true}"#).unwrap();
+    // The smallest aggregation section the command accepts: one admitted shape, the bundle
+    // guest's own test-profile shape, under a placeholder (non-zero) program digest.
+    let shape = format!(
+        "test,{},12,10,0,0,{},16,hc_bundle,{}",
+        randprotocol_core::types::BUNDLE_PROOF_TIER,
+        randprotocol_core::types::BUNDLE_PUBLIC_LOG_HEIGHT,
+        "0000000000000001".repeat(4)
+    );
+    let aggregation = ["--aggregation", "100,3,100,210000,256", "--admitted-shape", shape.as_str()];
+
+    let out = dir.path().join("genesis.json");
+    let run = genesis(&out, &[&aggregation[..], &["--fees", cfg_path.to_str().unwrap()]].concat());
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let gen = read(&out);
+    let section = gen.fees.clone().expect("the section is in the file");
+    assert_eq!((section.burn_base, section.subsidy_net_of_fees, section.burn_floor), (Some(true), Some(true), Some(true)));
+    let executor = ZkExecutor::new(randprotocol_zkvm::machine::FriProfile::Test);
+    let state = gen.build(&executor).unwrap();
+    let fees = state.ledger.fees();
+    assert!(fees.burn_base() && fees.subsidy_net_of_fees() && fees.burn_floor(), "the chain runs every rule");
+    let mut without = gen.clone();
+    without.fees = None;
+    assert_ne!(without.build(&executor).unwrap().hash(), state.hash(), "the section is bound by the genesis hash");
+
+    // No flag, no section: the shape this command always wrote.
+    let plain = dir.path().join("plain.json");
+    assert!(genesis(&plain, &[]).status.success());
+    assert!(read(&plain).fees.is_none());
+    assert!(!std::fs::read_to_string(&plain).unwrap().contains("\"fees\""));
+
+    let bad_path = dir.path().join("bad.json");
+    std::fs::write(&bad_path, r#"{"burn_bases":true}"#).unwrap();
+    let refused = dir.path().join("refused.json");
+    let run = genesis(&refused, &["--fees", bad_path.to_str().unwrap()]);
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("not a valid fees config"), "{}", String::from_utf8_lossy(&run.stderr));
+    assert!(!refused.exists());
+}
+
+/// `--fees` is validated by the genesis checks, not only parsed: `burn_floor` widens the burned
+/// base, so without `burn_base` it is refused (issue #135), and `subsidy_net_of_fees` without an
+/// aggregation section has no subsidy to net. Either way nothing is written.
+#[test]
+fn the_genesis_command_refuses_a_fees_section_the_genesis_checks_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    for (cfg, words) in [
+        (r#"{"burn_floor":true}"#, "fees.burn_floor needs fees.burn_base"),
+        (r#"{"burn_base":true,"subsidy_net_of_fees":true}"#, "fees.subsidy_net_of_fees needs an aggregation section"),
+    ] {
+        let cfg_path = dir.path().join("fees.json");
+        std::fs::write(&cfg_path, cfg).unwrap();
+        let refused = dir.path().join("refused.json");
+        let run = genesis(&refused, &["--fees", cfg_path.to_str().unwrap()]);
+        assert!(!run.status.success(), "{cfg} was accepted");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(stderr.contains(words), "{cfg}: {stderr}");
+        assert!(!refused.exists(), "{cfg}: and nothing is written");
+    }
+}

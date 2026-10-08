@@ -143,6 +143,156 @@ block's bytes in `Mempool::candidates_within`, and what the Calls leave of the l
 filled with the transfers held back — no block space is wasted, and with no Call pooled nothing
 changes. A hostile proposer can ignore it; an honest one on chain 18 runs it today.
 
+### 1.3 The `fees` section: the burns and a fee-first subsidy (genesis-gated, on no chain yet)
+
+Every fee above goes to the block's proposer today, in full (or, on an aggregating chain, the
+floor to the proposer and the excess to the proof bucket, `docs/aggregation.md`), and an
+aggregate's subsidy is minted on top of whatever fees it collected. The prices of §1.2 float, but
+nothing is destroyed and nothing is netted: a busy chain pays its proposers more, mints its
+provers as much as an idle one, and gives its holders nothing. The agent-driven fee study (plan
+`superpowers/plans/2026-10-05-fee-feedback.md`) found two variants worth having — the EIP-1559
+shape, burn the base and tip the rest, and the proving-auction shape, pay the prover from fees
+first and mint only the shortfall — and a genesis `fees` section switches each on, with a third
+flag, `burn_floor`, for the faithful EIP-1559 form (issue #135):
+
+```json
+"fees": { "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true }
+```
+
+All three flags are optional booleans and **off by default**, following
+`tokens.burn_registration_fee` (audit v5 TOK-2) exactly: absent, or present with no `true` flag, the
+chain is byte for byte what it was — the genesis hash, the state root, every RPC value and every
+stored value but two: a database created by a build that knows the section writes `META_FEES` (`{}`)
+and `META_BASE_FEES_BURNED` (0) at genesis whether or not the file has one, and an older database
+without them opens unchanged, reading both as their defaults. A `true` flag is committed to the
+genesis hash right after the `tokens` section's bytes: `b"fees"`, then `b"burn_base"` ‖ `1` if
+`burn_base`, then `b"subsidy_net_of_fees"` ‖ `1` if `subsidy_net_of_fees`, then `b"burn_floor"` ‖
+`1` if `burn_floor`, in that order, and nothing at all when none is `true` (pinned by
+`the_fees_sections_hash_contribution_is_pinned`; `burn_floor` comes last so every hash pinned over
+the first two flags stays put). An unknown key in the section is refused, so a misspelt flag cannot
+read as "off". It is a genesis parameter, never state: on the ledger as `Ledger::fees`, stored under
+`META_FEES` (JSON, written on every new database — `{}` without a section) and set again from the
+genesis file by `reload_ledger` on every restart, the file being the authority. `rand_getLimits`
+serves it as `fee_rules`, `null` on a chain without a `true` flag. Dollar-indexed prover pay (the
+study's per-prover-day target) is out of scope: it needs a price oracle the chain does not have.
+
+**`burn_base`.** In the bundle fee split (`Ledger::apply_tx_with`) every bundle's
+`gas::BUNDLE_BASE` is destroyed instead of paid: `supply.burned` and the supply counter
+`base_fees_burned` move by it (`docs/supply.md`). With `fee` the bundle's fee after a TOK-2
+registration burn:
+
+| chain | proposer keeps at inclusion | bucketed for the aggregator | destroyed |
+| --- | --- | --- | --- |
+| no `aggregation` | `fee − BUNDLE_BASE` (the tip) | — | `BUNDLE_BASE` |
+| `aggregation` | `0` | `fee − BUNDLE_BASE`, exactly as without the flag | `BUNDLE_BASE` |
+
+`fees_paid` moves by what the proposer keeps. The bucketed excess resolves as it always has — in
+a covering aggregate's payout note, or to the recorded proposer at the sweep. The floor already
+holds every bundle's fee to at least `BUNDLE_BASE` (a fee under it is refused as `FeeTooLow`, never
+wrapped), so nothing a sender pays changes: the wallet defaults and every floor are the same
+numbers, only where the base goes differs.
+
+A worked transfer: a sender pays 0.0012 RAND (1 200 000 units) on a chain without aggregation.
+Without the flag the proposer keeps all of it. Under `burn_base` 0.001 RAND (`BUNDLE_BASE`) is
+burned — `burned` and `base_fees_burned` each +1 000 000 — and the proposer keeps the 0.0002
+RAND tip, `fees_paid` +200 000. On an aggregating chain the same transfer burns the same 0.001
+and buckets the 0.0002 for the aggregator; the proposer keeps nothing at inclusion.
+
+Under `burn_base` alone only the base burns, not a Call's gas and byte terms (§1.1) nor a Deploy's
+per-word term. The base is the one component every bundle pays and no proposer can steer; the priced
+terms stay the proposer's, so including Calls stays worth its while. Burning the whole floor is the
+next flag's rule. A `Withdraw`'s, a claim's and a revoke's base is untouched too: it is paid
+register-side, out of the amount withdrawn, and never passes the bundle fee split.
+
+**`burn_floor`** (issue #135; needs `burn_base: true`, else
+`GenesisError::BurnFloorWithoutBurnBase` — there is no burned base to widen). The faithful
+EIP-1559 form: the burned amount is the ledger's own floor for the bundle, not its base alone, so
+a proposer gains nothing from a block that lifts a price (§1.2's controller moves exactly the terms
+`burn_base` alone leaves it), which is what a burn is for. With `fee` the bundle's fee after a TOK-2
+registration burn:
+
+```
+burned = min(fee, floor)                       -- base_fees_burned and supply.burned move by it
+tip    = fee − burned                          -- the proposer's, or bucketed when aggregating
+floor  = Ledger::settled_floor(tx, outcome):
+           BUNDLE_BASE                         -- a transfer, a bond, a token action, an attestation
+           BUNDLE_BASE + deploy_fee(words)     -- a Deploy (gas::fee_floor)
+           BRIDGE_BURN_FEE                     -- a BridgeBurn (the base and the bridge's charge)
+           circuit_call_floor(gas_price, byte_price, GAS_LIMIT, bytes)
+                                               -- a Call under a `gas` section, at its GAS_LIMIT
+           BUNDLE_BASE + call_fee(tier, bytes) -- a Call without one (the tier schedule)
+           (+ cell_fee per created cell)       -- an Invoke
+```
+
+`settled_floor` is the one function `validate_inner` holds a call's fee to after its proof is
+decoded and the fee split burns by, so the burned figure is always one the fee was checked against.
+A Call's is the tier-exact floor — the pre-verify floor at `GAS_LIMIT = 1` only buys the verify and
+is never the burned amount. The `min` restates the check (the fee is at least the floor after
+validation); it never binds on a valid transaction. A registration's `registration_fee` is not part
+of the floor (`fee_floor` is the plain base for it): burned under TOK-2, still the proposer's
+without it. `base_fees_burned` counts the whole burn under either flag, so the supply identity is
+unchanged. On an aggregating chain the bucketed excess becomes `fee − floor`, so the aggregator is
+never paid a priced term the chain just burned. The figure lives in one place, the ledger's bucket
+entry (`unsealed_fees`, served by `rand_getUnsealed`), which a covering aggregate's note and the
+sweep both read; nothing recomputes it from the transaction, since a Call's floor needs its decoded
+proof and the prices it was charged at. A `BridgeBurn`'s floor is `BRIDGE_BURN_FEE`, so under
+`burn_floor` the bridge's own charge — the nine bases above `BUNDLE_BASE` that were the proposer's —
+is destroyed with the base. `burn_floor` absent or `false` is `burn_base` alone, byte for byte.
+
+| chain, both flags | proposer keeps at inclusion | bucketed for the aggregator | destroyed |
+| --- | --- | --- | --- |
+| no `aggregation` | `fee − floor` (the tip) | — | `floor` |
+| `aggregation` | `0` | `fee − floor` | `floor` |
+
+Worked, on a plain chain under both flags:
+
+- **A transfer** paying 0.0012 RAND: its floor is `BUNDLE_BASE`, so exactly as under `burn_base`
+  alone — 1 000 000 burned, 200 000 tipped.
+- **A Deploy** of a 4 096-word program paying 0.411 RAND (411 000 000): its floor is
+  `1 000 000 + 100 000 · 4 096 = 410 600 000`, all burned (`base_fees_burned` +410 600 000); the
+  proposer keeps 400 000. Under `burn_base` alone it would burn 1 000 000 and keep 410 000 000.
+- **A tier-14 Call under a `gas` section** at prices 100 / 800, declaring the tier's ceiling
+  `GAS_LIMIT = 20 479` with 1 300 000 bytes of proof and no envelope, paying 0.0041 RAND
+  (4 100 000): its floor is `1 000 000 + 100 · 20 479 + 800 · ⌈1 300 000 / 1024⌉ = 1 000 000 +
+  2 047 900 + 1 016 000 = 4 063 900`, all burned; the proposer keeps 36 100. Under `burn_base`
+  alone it would burn 1 000 000 and keep 3 100 000. The pre-verify floor (`GAS_LIMIT = 1`,
+  2 016 100) is not the burned amount.
+
+Beside TOK-2 the two burns add: a registration under both flags destroys `registration_fee +
+BUNDLE_BASE`, each counter moving by its own part.
+
+**`subsidy_net_of_fees`.** The fee-first subsidy: an aggregate's prover pay is funded from the
+fees it collected first and minted only for the shortfall. Without the flag a covering
+aggregate's payout note carries `subsidy(n) + shares` — the schedule (`docs/aggregation.md` §3.2)
+minted on top of the covered bundles' proving shares, however large those are. Under it, in
+`Ledger::aggregate_payment` (spec §5.4, the one function admission and apply both derive the note
+from, through `aggregation::minted_subsidy`):
+
+```
+schedule = subsidy(sealed_blocks)
+minted   = schedule − shares, or 0 once shares ≥ schedule
+note     = minted + shares = max(schedule, shares)
+```
+
+A worked aggregate: with a schedule of 0.6 RAND, an aggregate whose covers bucketed 0.4 RAND of
+proving share mints 0.2 RAND and pays 0.6 (`subsidised` +0.2); one whose covers bucketed 0.9 RAND
+mints nothing and pays 0.9. Without the flag the first would mint 0.6 and pay 1.0. The aggregator
+is never paid less than the schedule, a busy chain mints less, and a chain whose fees cover the
+schedule mints nothing. `supply.subsidised` — and `rand_getAggregate`'s `subsidy` — move by the
+minted part alone; the shares were already in the pool, so the supply identity holds unchanged.
+`rand_getEmission`'s `subsidy.current` is still the schedule, so under the flag it is a ceiling
+on what an aggregate mints, not the mint. `sealed_blocks` still advances by one per aggregate,
+minted or not: the schedule's index counts sealed blocks, not mints, so the halving clock does not
+stop while fees carry the pay. The rule needs an `aggregation` section
+(`GenesisError::SubsidyNetOfFeesWithoutAggregation`): on a chain without one there is no subsidy
+to net.
+
+The two compose without touching: under both flags the base is burned at inclusion, and the
+bucketed excess `fee − BUNDLE_BASE` is the share this rule nets against (`fee − floor` under
+`burn_floor` too). The 0.0012 RAND transfer
+above burns 0.001 and contributes its 0.0002 to the shares a covering aggregate nets against the
+schedule.
+
 ## 2. What the sender pays with its own machine: proving
 
 The one cost that varies is producing the STARK proof, and only the sender's machine pays it.

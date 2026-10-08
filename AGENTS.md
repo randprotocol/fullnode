@@ -6,6 +6,65 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-10-02)
 
+### Fee feedback — a burned base and a fee-first subsidy (2026-10-05; branch `feat/fee-feedback`, PUSHED, NOT merged; genesis-gated, on no chain)
+
+**2026-10-06, issues #131–#135 closed on this branch** (each a `fix/*` branch, reviewed, merged
+`--no-ff`, pushed): #135 `fees.burn_floor` (the whole floor burned; one helper
+`Ledger::settled_floor` is both the post-decode check and the burn; `bucketed_excess` deleted),
+#132 the daemon's `fee_rules` through the client's cached limits read before the prove, #133 storage
+refuses a block whose aggregates lack their `PaidAggregate` records, #134 the live proposer/peer
+root-agreement tests under both flags and across a restart, #131 the pinned recursion fixtures
+`Test-0..2` committed at `crates/randprotocol-node/fixtures/recursion/` (the node suite passes
+plain; `scripts/recursion-fixtures.sh --check`; CI's `ci-fixture-skips.sh` can now be revisited).
+Merged tree at `c13ea5d9`: core 674, node lib 494, node bin 37, client lib 189, all passing. Two
+semantic merge fixes were needed (`FeesConfig` literals gained `burn_floor`: `aa7b04e6`, and the
+#132 merge). Open follow-ups: CI running the fixture-backed tests; log-and-continue in the daemon's
+`--watch` loop (a pass error still stops the daemon); the admission cache is not attached in the
+live-path tests.
+
+Worktree `~/rand-worktrees/fullnode-fee-feedback`, off main `2b5490d5`: the plan `c77ad185`
+(`docs/superpowers/plans/2026-10-05-fee-feedback.md`), Task 1 `97a54811` (the section and the
+burned base), Task 2 `2e793128` (the fee-first subsidy), then the docs pass. The agent-driven fee
+study's two recommendations as **genesis-gated consensus rules, off by default**, in TOK-2's exact
+pattern: a new genesis section `Genesis.fees` = `FeesConfig { burn_base, subsidy_net_of_fees }`
+(`crates/randprotocol-core/src/ledger/fees.rs`; both `Option<bool>`, `deny_unknown_fields`).
+**Genesis hash:** only when a flag is `true`, appended right after the `tokens` contribution —
+`b"fees"`, then `b"burn_base" ‖ 0x01` if set, then `b"subsidy_net_of_fees" ‖ 0x01` if set, in
+that order; a section with no `true` flag (or `false` spelt out) contributes **nothing**
+(`fees_commit`, pinned by `the_fees_sections_hash_contribution_is_pinned`). **`burn_base`**: in
+`apply_tx_with` every bundle's `BUNDLE_BASE` (0.001 RAND) joins `burned` and the new counter
+`base_fees_burned` (on the identity's right beside `registration_fees_burned`;
+`Audit::with_base_fees_burned`); the proposer keeps `fee − BUNDLE_BASE` on an ungated chain, `0`
+at inclusion on an aggregating one (excess bucketed as before). Ruling: **only the base burns**
+— a Call's gas/byte terms and a Deploy's per-word term stay the proposer's; the full-floor burn is
+a named follow-up. Withdraw/claim bases are untouched (register-side). **`subsidy_net_of_fees`**
+(needs `aggregation`, else `GenesisError::SubsidyNetOfFeesWithoutAggregation`): one function,
+`aggregation::minted_subsidy`, used by `aggregate_payment` and by the aggregate daemon
+(`aggregate_pass` reads `rand_getLimits.fee_rules`; final-review fix) — the sealed-aggregate
+record stores the ledger's own `PaidAggregate` (`Ledger::paid_aggregates`, drained on
+`CommittedBlock::aggregates` like `deposits`), never a recomputation — mint `schedule − shares` (0 once shares cover it), note `max(schedule, shares)`;
+`subsidised` and `rand_getAggregate.subsidy` carry the minted part; `sealed_blocks` still +1;
+`rand_getEmission.subsidy.current` is the schedule, a ceiling on the mint under the flag. Ruling:
+**dollar-indexed prover pay is out of scope** (no oracle). **Storage:** `META_FEES = "fees"` is
+**JSON** (like `META_VESTING`; `{}` without a section), `META_BASE_FEES_BURNED =
+"base_fees_burned"` is **bincode** u64 (like `META_REGISTRATION_FEES_BURNED`); both written on
+every new database, both default when absent (old databases open unchanged); `reload_ledger`
+re-sets `fees` from the genesis file (the file is the authority). **RPC:**
+`rand_getSupply.base_fees_burned`; `rand_getLimits.fee_rules` `{burn_base, subsidy_net_of_fees}`
+served only when at least one flag is `true`, else `null`. Docs: `docs/fees.md` §1.3 (worked: a
+0.0012 RAND transfer burns 0.001, tips 0.0002; 0.4 RAND of shares against a 0.6 schedule mints
+0.2, pays 0.6), `docs/supply.md`, `docs/aggregation.md` §3.1/§3.3, `docs/rpc.md`, `docs/deploy.md`
+"The next cut: the `fees` section", `CHANGELOG.md` Unreleased. Tests at Task 2: core lib 665/0;
+node lib 489 passed, 1 failed (the known pre-existing
+`the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte`). **Trap (resolved by #131):** the node's
+aggregation tests read the committed pinned set `crates/randprotocol-node/fixtures/recursion`
+(`Test-0..2`, `fixture_proof`'s default; `RECURSION_FIXTURES` overrides) and need no env var.
+`~/rand-worktrees/circuits-phase2/recursion/target/recursion-fixtures` is complete but unpinned
+(fails the pinned-vectors test only); the `~/Github/randprotocol/circuits` cache is stale ("public
+values are not pv::NUM words"). `scripts/recursion-fixtures.sh --check [<dir>]` says which a
+directory is (exit 0 pinned, 3 complete but unpinned); with a circuits checkout it re-proves for a
+re-pin (`docs/aggregation.md` "Testing: the recursion fixtures").
+
 ### Test push + coverage (2026-10-06; node-only, no chain change)
 
 circuits re-vendored at `5f69747` — research's source is byte-identical to the `5ff7676` pin, the

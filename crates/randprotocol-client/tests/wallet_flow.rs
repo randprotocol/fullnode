@@ -115,6 +115,7 @@ fn genesis_full(
         incremental_nullifier_root: None,
         hardening_v6: None,
         hc_auth: None,
+        fees: None,
     }
 }
 

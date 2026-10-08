@@ -1231,6 +1231,24 @@ mod ledger_tests {
         assert!(matches!(verr(ap!(l, claim(&l, 1, 2 * BASE, 1, HOLDER, 2)).unwrap_err()), VestingError::NotYetVested { .. }));
     }
 
+    /// Register-side bases are never burned (`docs/fees.md` §1.3): under `fees.burn_base` and
+    /// `fees.burn_floor` a `ClaimVested` still pays the proposer the `BUNDLE_BASE` out of the
+    /// claimed amount — it carries no bundle — and `base_fees_burned` and `burned` stay put. The
+    /// audit holds.
+    #[test]
+    fn a_claim_under_both_burn_flags_still_pays_its_base_to_the_proposer() {
+        let mut l = ledger(vec![cfg(1, false)], 4_000);
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+        let before = l.clone();
+        ap!(l, claim(&l, 1, 2 * U, 0, HOLDER, 1)).unwrap();
+        let rewards = |l: &Ledger| l.validators()[&kp(PROPOSER).address()].rewards;
+        assert_eq!(rewards(&l) - rewards(&before), BASE, "the claim's base is the proposer's under both burn flags");
+        assert_eq!(l.base_fees_burned(), before.base_fees_burned(), "a claim's base is not a burned bundle base");
+        assert_eq!(l.supply().burned, before.supply().burned, "nothing is destroyed");
+        assert_eq!(l.vesting().unwrap().released, 2 * U - BASE);
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
     #[test]
     fn a_claim_is_refused_for_every_bad_field() {
         let l = ledger(vec![cfg(1, false)], 20_000);

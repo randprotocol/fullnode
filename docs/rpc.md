@@ -402,7 +402,7 @@ gas policy:
   "gas_metering": "header", "bundle_gas_limit": null, "adjust_bps": null,
   "max_gas_price": null, "max_byte_price": null, "byte_load": null,
   "admission_by_vote": false, "testnet": false, "slashing": null, "binding_domain": 0,
-  "proof_window_blocks": null, "program_state": null }
+  "proof_window_blocks": null, "program_state": null, "fee_rules": null }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -461,6 +461,15 @@ for how long a proof may take; the `rand` wallet also uses it to decide when a `
 that never appeared can no longer commit (clamped to 256..4 096, since this reply is
 unauthenticated — it moves only the wallet's own bookkeeping, never what the chain admits). A
 node that predates the field answers without it, which a wallet reads as `null`.
+
+`fee_rules` is the genesis `fees` section (`docs/fees.md` §1.3), `{ "burn_base": bool,
+"subsidy_net_of_fees": bool, "burn_floor": bool }`, or `null` on a chain without one — and on one
+whose section sets no flag `true`, which hashes and runs as no section at all. Informational: under
+`burn_base` a bundle's `BUNDLE_BASE` is destroyed rather than paid to the proposer, and under
+`burn_floor` (issue #135; only ever `true` beside `burn_base`) its whole settled floor — the base
+plus a Deploy's per-word term, or a Call's tier-exact gas and byte terms — but what a sender pays is
+unchanged — every floor is the same number — so a wallet changes nothing. A node that predates the
+field answers without it, which a wallet reads as `null`.
 
 `gas_price`, `byte_price` and `gas_metering` are this **node's** own gas policy (spec
 `2026-09-28-gas-model-design.md` §4.1, Phase 0) *or* the chain's own `gas` section (§4.2, §7.1,
@@ -1088,7 +1097,7 @@ Params: `[]`. Result:
   "faucet_epoch": "…", "faucet_minted_in_epoch": "…",
   "withdraw_deposited": "…", "fees_paid": "…", "burned": "…",
   "subsidised": "…", "sealed_blocks": "…", "aggregator_bonds": "…", "slashed": "…",
-  "registration_fees_burned": "…",
+  "registration_fees_burned": "…", "base_fees_burned": "…",
   "vesting_issued": "…", "vesting_released": "…", "vesting_in_register": "…", "vesting_locked": "…",
   "program_rand_out": "…", "program_rand_held": "…",
   "pool_value": "…", "register_total": "…", "total_supply": "…", "invariant_holds": true }
@@ -1105,6 +1114,13 @@ the genesis `tokens.burn_registration_fee` (`docs/tokens.md` §15): inside `burn
 side and in no register entry, so the identity below subtracts it on its right beside `slashed`.
 A decimal string; `"0"` on chain 14, which has no gate.
 
+`base_fees_burned` (fee feedback, unreleased) is Σ of the bundle bases (`BUNDLE_BASE` each) burned
+under the genesis `fees.burn_base` (`docs/fees.md` §1.3) — under `fees.burn_floor` beside it, each
+bundle's whole burned floor (`min(fee, floor)`), one counter for the whole burn under either flag:
+inside `burned` on the pool side, in no register entry, subtracted on the identity's right beside
+`registration_fees_burned`. Under the flag `fees_paid` counts only what proposers kept — the tip. A
+decimal string; `"0"` on every chain without the flag.
+
 `faucet_epoch` and `faucet_minted_in_epoch` (v0.5.4, audit v4 STAKE-2) are the faucet's per-epoch
 pair: the epoch the counter is for and what the faucet minted in it, against the genesis
 `staking.faucet_budget_per_epoch`. Both are decimal strings like the rest of this object, and both
@@ -1120,8 +1136,9 @@ created (`amount` less the base), and the base moves from one register entry to 
 `pool_value = genesis_deposited + faucet_minted + withdraw_deposited − fees_paid −
 burned`; `register_total` is Σ `stake + pending + rewards` over the register; `total_supply` is the
 two together, and `invariant_holds` is whether it still equals everything the chain issued
-(`genesis_deposited + genesis_staked + faucet_minted`) less what was destroyed (`slashed` and
-`registration_fees_burned`). A false there is a bug, never a legitimate chain state. The counters are not in the state root — `rand-node verify --mode quick` recomputes
+(`genesis_deposited + genesis_staked + faucet_minted`) less what was destroyed (`slashed`,
+`registration_fees_burned` and `base_fees_burned`). A false there is a bug, never a legitimate
+chain state. The counters are not in the state root — `rand-node verify --mode quick` recomputes
 every one of them by replaying the chain, which is what makes them auditable. `docs/supply.md`
 works the identity through a bond and a withdraw and says where it rests on a claim (the genesis
 file's own amounts) rather than on a check.
@@ -1381,8 +1398,11 @@ Params: `[]`. Result:
 testnet faucet, or the bounded aggregation subsidy, so a client expecting Solana's
 `getInflationRate` gets a number instead of a missing method. `subsidy` is the block-aggregation
 schedule (`gas::subsidy`, the 2026-09-15 changelog entry below); it is `null` on a chain whose
-genesis carries no `aggregation` section, which chain 12 does not. `faucet` mirrors `rand_status`'s
-field of the same name.
+genesis carries no `aggregation` section, which chain 12 does not. `subsidy.current` is the
+schedule's `subsidy(sealed_blocks)`: what the next aggregate mints, except under the genesis
+`fees.subsidy_net_of_fees` (`docs/fees.md` §1.3), where it is a ceiling on the mint — the
+aggregate mints only its shortfall over the covered proving shares, which `rand_getAggregate`'s
+`subsidy` reports per aggregate. `faucet` mirrors `rand_status`'s field of the same name.
 
 ## Subscriptions (WebSocket)
 
@@ -1640,6 +1660,24 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### Unreleased — fee feedback: the genesis `fees` section and the burned base (genesis-gated; no chain carries it yet)
+
+Additive. `rand_getSupply` gains `base_fees_burned` (a decimal string, `"0"` on every chain without
+the flag): the bundle bases destroyed under the genesis `fees.burn_base` (`docs/fees.md` §1.3), on
+the right of the supply identity beside `registration_fees_burned`. `rand_getLimits` gains
+`fee_rules` (`{ "burn_base", "subsidy_net_of_fees", "burn_floor" }`, booleans), `null` on a chain
+whose genesis has no `fees` section with a `true` flag. Under `burn_base` a proposer's `rewards`
+grow by the tip (`fee − BUNDLE_BASE`), or by nothing at inclusion on an aggregating chain — under
+`burn_floor` (issue #135) by `fee − floor`, the whole settled floor burned and counted in
+`base_fees_burned`; no fee a wallet pays changes. Under `subsidy_net_of_fees` `rand_getAggregate`'s
+`subsidy` (and `rand_getSupply`'s `subsidised`) carry only the minted part, the schedule's shortfall
+over `proving_share`. Every existing field keeps its value on every chain without the section. One
+fix applies on every chain: `rand_getAggregate`'s `subsidy`, `proving_share` and `n` are now stored
+from the ledger's own payment, so a node that synced the covered bundle and its aggregate in one
+commit no longer reports a `proving_share` of 0 (and, under the flag, the full schedule as
+`subsidy`) where a live node reports the paid amounts. Records written before the fix keep their
+stored values.
 
 ### 2026-10-01 — audit v6, TOK-1: `tokens.incremental_root` (genesis-gated; no chain carries it yet)
 
@@ -2362,6 +2400,16 @@ see:
 - **`rand_getAggregate(hash)`** returns the sealing aggregate's public fields: `covers`
   (hashes, in proof order), `aggregator`, `subsidy`, `proving_share`, and `n` — the subsidy
   schedule's index the block minted at — plus its `height`. `null` for any other transaction.
+  `subsidy` is what the aggregate minted: `subsidy(n)`, or under the genesis
+  `fees.subsidy_net_of_fees` its shortfall over `proving_share` (`docs/fees.md` §1.3), so
+  `subsidy + proving_share` is always the payout note's amount. All three numbers are the
+  payment the ledger made while applying the aggregate, stored as it committed — not recomputed
+  from the database, which on a node syncing several blocks in one commit missed a cover
+  committed in the same batch (fee feedback, 2026-10-05). Because the record has no fallback,
+  storage refuses to commit a block whose aggregates do not each carry exactly one such payment
+  record (an error naming the height and the aggregate's hash) rather than land a sealed block
+  for which `rand_getAggregate` would have answered `subsidy`, `proving_share` and `n` as zero
+  (#133).
 - **`rand_getAggregators`** lists the register (public by design): `address`, `bond`,
   `payout`, `nonce`, `unbonding` per row.
 - **`rand_getUnsealed(from, limit)`** pages the bundles an aggregator may still cover —

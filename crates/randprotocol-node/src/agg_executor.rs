@@ -503,22 +503,26 @@ impl ConfidentialExecutor for AggExecutor {
     }
 }
 
-/// A recursion fixture cache proof (`$RECURSION_FIXTURES/{profile}-{k}.proof`: a 32-byte `hc`
-/// then the postcard `randprotocol_zkvm::machine::Proof`). The conformance discipline needs the
-/// *doc's* fixtures — the 107-word interface list rides on their random notes — so a missing
-/// cache is a loud failure, not a skip: set `RECURSION_FIXTURES` to a checkout's
-/// `recursion/target/recursion-fixtures`. `pub(crate)` so `node`'s covered-assembly tests can
-/// store a bundle carrying a real proof.
+/// A recursion fixture proof (`<dir>/Test-{k}.proof`: a 32-byte `hc` then the postcard
+/// `randprotocol_zkvm::machine::Proof`), `<dir>` being `$RECURSION_FIXTURES` or, by default, the
+/// in-repo set `fixtures/recursion` (Test-0..2, issue #131). The conformance discipline needs the
+/// *doc's* fixtures — the 118-word interface list rides on their random notes, so the
+/// pinned-vectors test passes on those exact bytes and on no freshly proved set — and a missing
+/// file is a loud failure, not a skip. `scripts/recursion-fixtures.sh --check` checks a
+/// directory against the pinned bytes. `pub(crate)` so `node`'s covered-assembly tests can store
+/// a bundle carrying a real proof.
 #[cfg(test)]
 pub(crate) fn fixture_proof(k: usize) -> randprotocol_zkvm::machine::Proof {
     let dir = std::env::var_os("RECURSION_FIXTURES")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/recursion-fixtures"));
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/recursion"));
     let path = dir.join(format!("Test-{k}.proof"));
     let bytes = std::fs::read(&path).unwrap_or_else(|e| {
         panic!(
-            "{}: {e} — the aggregation tests need a recursion fixture cache; \
-             set RECURSION_FIXTURES (docs/aggregation.md)",
+            "{}: {e} — the aggregation tests read the pinned recursion fixtures Test-0, Test-1 and \
+             Test-2, committed in crates/randprotocol-node/fixtures/recursion (the default; \
+             RECURSION_FIXTURES overrides it). Check a directory with \
+             scripts/recursion-fixtures.sh --check <dir> (docs/aggregation.md)",
             path.display()
         )
     });

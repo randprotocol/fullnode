@@ -167,6 +167,11 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // The aggregation gate lives in the genesis file too: without this a restarted chain-9 node
     // would compute state-2 roots and refuse every aggregation action by name.
     ledger.set_aggregation(gs.ledger.aggregation().cloned());
+    // And the fee-feedback rules (genesis `fees`, `docs/fees.md` §1.3): `load_ledger` restores the
+    // stored copy, but the file is the authority — a node that came back without `burn_base`
+    // would pay the base its peers burn and compute a different register: a fork at its first
+    // bundle after the restart.
+    ledger.set_fees(gs.ledger.fees().clone());
     // The staking gate (audit v4, STAKE-2) lives there too: without this a restarted node would
     // compute `rand-state-2` roots against peers on `rand-state-5`, refuse nothing the faucet
     // budget refuses and seat a bond an epoch early — a fork at its first restart.
@@ -3843,7 +3848,8 @@ impl Node {
             // The notes this block made the ledger create, from our own execution rather than
             // from the peer's copy (which the wire does not carry).
             let deposits = ledger.take_deposits();
-            accepted.push(CommittedBlock { receipts, deposits, ..cb });
+            let aggregates = ledger.take_paid_aggregates();
+            accepted.push(CommittedBlock { receipts, deposits, aggregates, ..cb });
             // The state that belongs with the committed prefix. Verification runs past it — the
             // blocks above are this prefix's own proof — but only what the three-chain rule
             // commits is written, so the ledger written beside it is the one that describes it.
@@ -6148,6 +6154,455 @@ mod tests {
         );
     }
 
+    // ---------------------------------- the fee-feedback rules on the live path (issue #134)
+
+    /// The tip the fee-rule chain's bundles pay over `BUNDLE_BASE`: what each one's bucket holds
+    /// and, for the covered one, the proving share its aggregate pays out.
+    const FEE_RULES_TIP: u64 = 7_000;
+
+    /// Both rules on (`docs/fees.md` §1.3).
+    fn both_fee_rules() -> randprotocol_core::ledger::FeesConfig {
+        randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: None }
+    }
+
+    /// A tip-paying stub bundle anchored to `ledger`'s newest root.
+    fn tipping_bundle(ledger: &Ledger, tag: u32) -> Transaction {
+        bundle_tx(ledger, [[tag; 8], [tag + 1; 8]], [[tag + 2; 8], [tag + 3; 8]], gas::BUNDLE_BASE + FEE_RULES_TIP)
+    }
+
+    /// The registration [`register_aggregator`] applies, as a transaction a block carries: the
+    /// bundle burns the bond and pays the bare base, and the payout is `pk = [7; 8]`.
+    fn aggregator_registration(l: &Ledger, kp: &Keypair, bond: u64) -> Transaction {
+        let mut b = randprotocol_core::notes::Bundle {
+            anchor: l.anchors().back().expect("a ledger always has an anchor").1,
+            nullifiers: crate::storage::fixtures::pad4([[61; 8], [62; 8]]),
+            commitments: crate::storage::fixtures::pad4([[63; 8], [64; 8]]),
+            fee: gas::BUNDLE_BASE,
+            burn_a: 0,
+            burn_r: bond,
+            burn_asset: 0,
+            time: l.height() as u32,
+            envelopes: [env(1), env(2), env(1), env(2)],
+            proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
+        };
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
+        let registration = AggregatorRegistration {
+            public_key: kp.public_key().clone(),
+            payout: fee_rules_payout(),
+            signature: kp.sign(aggregator_register_message(l.chain_id(), &fee_rules_payout()).as_bytes()),
+        };
+        randprotocol_core::confidential::StubExecutor::bound(Transaction::shielded(l.chain_id(), b, randprotocol_core::types::Action::RegisterAggregator { registration }))
+    }
+
+    fn fee_rules_payout() -> ShieldedAddress {
+        ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] }
+    }
+
+    /// A store on a chain with `aggregation` (the fixture proof's shape admitted) and both `fees`
+    /// rules, whose block 1 — certified by a signed QC, so a replica resumes on it — carries a
+    /// tip-paying bundle with a real fixture proof (the cover) and key(7)'s aggregator
+    /// registration. Built `unchecked` as [`chain_with_a_real_proof`] is: the ledger applies the
+    /// stub twin of the covered bundle, whose hash differs by the proof's, so its bucket entry is
+    /// moved to the stored transaction's hash — the entry a real-proof apply would have made —
+    /// before the root is taken. Both bundles' bases burn here, under `burn_base`.
+    fn fee_rules_chain() -> (tempfile::TempDir, Arc<Storage>, GenesisState, Transaction, Ledger) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        let proof = crate::agg_executor::fixture_proof(0);
+        let cfg = agg_cfg(fixture_shape(&proof), fixture_hc(&proof));
+        gs.ledger.set_aggregation(Some(cfg.clone()));
+        gs.ledger.set_fees(both_fee_rules());
+        storage.init_genesis(&gs).unwrap();
+
+        let mut ledger = gs.ledger.clone();
+        ledger.set_height(1);
+        ledger.set_timestamp_ms(1);
+        let stub_tx = tipping_bundle(&ledger, 21);
+        let mut covered_tx = stub_tx.clone();
+        covered_tx.bundle.as_mut().unwrap().proof = proof.to_bytes();
+        let register_tx = aggregator_registration(&ledger, &key(7), cfg.bond);
+        ledger.apply_transactions(&[stub_tx.clone(), register_tx.clone()], &key(1).address(), &StubExecutor).unwrap();
+        let mut bucket = ledger.unsealed_fees().clone();
+        let entry = bucket.remove(&stub_tx.hash()).expect("the gated apply buckets the covered bundle's tip");
+        assert_eq!(entry.0, FEE_RULES_TIP, "an aggregating chain buckets the whole tip: the base burned, the proposer kept nothing");
+        bucket.insert(covered_tx.hash(), entry);
+        ledger.set_unsealed_fees(bucket);
+        ledger.record_anchor(1);
+        assert_eq!(ledger.base_fees_burned(), 2 * gas::BUNDLE_BASE, "block 1's two bundles each burn their base");
+
+        let mut b1 = make_block_unchecked(&gs.block, &ledger, vec![covered_tx.clone(), register_tx], &key(1));
+        b1.qc.votes = vec![Vote::sign(&gs.signing_domain(), b1.qc.view, b1.qc.block_hash, &key(1))];
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        (dir, Arc::new(storage), gs, covered_tx, ledger)
+    }
+
+    /// A replica as the node builds one at start (`resume_consensus`: the head, its certificate,
+    /// `reload_ledger`, the safety state, the pending set, the epoch sets), with the store as its
+    /// covered source.
+    fn resume_over(storage: &Arc<Storage>, gs: &GenesisState) -> HotStuff {
+        let executor: Arc<dyn ConfidentialExecutor> = Arc::new(StubExecutor);
+        let mut hs = resume_consensus(storage, gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), executor).unwrap();
+        hs.set_covered_source(Arc::new(StoreCovered { storage: storage.clone(), profile: randprotocol_core::types::FriProfile::Test }));
+        hs.start();
+        hs
+    }
+
+    /// One batch of a replica's actions, executed against `storage` as `Node::handle_actions`
+    /// and `Node::commit` execute them: the safety state and the pending set persisted, the
+    /// commits gathered and written in one `Storage::commit` with the committed ledger and the
+    /// epoch sets recorded beside them, a pending set that follows a commit written after it.
+    /// Returns the committed blocks.
+    fn persist_actions(hs: &HotStuff, storage: &Storage, acts: Vec<randprotocol_core::consensus::Action>) -> Vec<CommittedBlock> {
+        use randprotocol_core::consensus::Action as A;
+        let (mut to_commit, mut to_record, mut pending) = (Vec::new(), Vec::new(), None);
+        for a in acts {
+            match a {
+                A::PersistSafety(s) => storage.save_safety(&s).unwrap(),
+                A::PersistPending(blocks) if to_commit.is_empty() => storage.save_pending_blocks(&blocks).unwrap(),
+                A::PersistPending(blocks) => pending = Some(blocks),
+                A::Commit(blocks) => to_commit.extend(blocks),
+                A::RecordEpochSet(epoch, set) => to_record.push((epoch, set)),
+                A::SafetyViolation { .. } => panic!("one honest leader never conflicts with itself"),
+                _ => {}
+            }
+        }
+        if !to_commit.is_empty() || !to_record.is_empty() {
+            storage.commit(&to_commit, hs.committed_ledger(), &to_record, &StubExecutor).unwrap();
+        }
+        if let Some(blocks) = pending {
+            storage.save_pending_blocks(&blocks).unwrap();
+        }
+        to_commit
+    }
+
+    /// The leader proposes `txs` in its current view and every peer applies the proposal: the
+    /// proposer's trial-apply root (the header's) is the root each peer's own apply reaches —
+    /// a peer that computed another refuses the block as `ConsensusError::Execution`. The
+    /// leader's actions run against the store; the blocks they commit come back.
+    fn propose_to_all(leader: &mut HotStuff, peers: &mut [&mut HotStuff], storage: &Storage, txs: Vec<Transaction>, now_ms: u64) -> (Block, Vec<CommittedBlock>) {
+        let view = leader.view();
+        let acts = leader.propose(view, txs, now_ms).expect("the leader's own block applies on its own tree");
+        let block = acts
+            .iter()
+            .find_map(|a| match a {
+                randprotocol_core::consensus::Action::Broadcast(randprotocol_core::consensus::ConsensusMessage::Proposal(b)) => Some(b.clone()),
+                _ => None,
+            })
+            .expect("a proposal was built");
+        let committed = persist_actions(leader, storage, acts);
+        assert_eq!(leader.tip_ledger().state_root(), block.header.state_root, "the leader's speculative apply is the header's root");
+        for peer in peers.iter_mut() {
+            // `apply_block_for_sync` refuses a header root its own apply does not reach
+            // (`BlockError::StateRootMismatch`), so acceptance is the agreement.
+            peer.on_proposal(block.clone(), now_ms).expect("the peer applies the same block to the same root");
+            assert!(peer.has_block(&block.hash()), "the block is in the peer's tree, not held as an orphan");
+        }
+        (block, committed)
+    }
+
+    /// Issue #134, the live half. Under `fees.burn_base` and `fees.subsidy_net_of_fees`, a block
+    /// carrying a tip-paying bundle and an aggregate that covers block 1's tip-paying bundle is
+    /// built by the leader's trial apply (a ledger clone in the 512-block tree) and applied by a
+    /// peer to the same root — the fork a side that lost its `fees` section would show. Driven on
+    /// (empty blocks, the single validator certifying each) until the three-chain commits it, the
+    /// store the node writes answers: `rand_getSupply.base_fees_burned` (`Storage::
+    /// base_fees_burned`, read as is) is one base per bundle, the live block's one included; and
+    /// the aggregate's record (`CF_SEALS` `a‖tx`, what `rand_getAggregate` serves) is the netted
+    /// subsidy plus the covered tip, which is exactly the amount of the payout note the ledger
+    /// appended.
+    #[test]
+    fn under_both_fee_rules_the_proposer_and_the_peer_agree_and_the_store_records_the_burn_and_the_payout() {
+        let (_d, storage, gs, covered_tx, _b1_ledger) = fee_rules_chain();
+        let (mut leader, mut peer) = (resume_over(&storage, &gs), resume_over(&storage, &gs));
+        assert_eq!(leader.committed_ledger().fees(), &both_fee_rules(), "the resumed replica runs the genesis rules");
+        let cfg = leader.committed_ledger().aggregation().cloned().unwrap();
+
+        let bundle = tipping_bundle(leader.tip_ledger(), 31);
+        let (time, r) = (1, [9; 8]);
+        let aggregate = aggregate_tx(7, &key(7), 0, time, vec![covered_tx.hash()], b"ok".to_vec());
+        let (b2, _) = propose_to_all(&mut leader, &mut [&mut peer], &storage, vec![bundle.clone(), aggregate.clone()], 2);
+        assert_eq!(
+            b2.transactions.iter().map(|t| t.hash()).collect::<Vec<_>>(),
+            vec![bundle.hash(), aggregate.hash()],
+            "both made the block: the trial apply refused neither"
+        );
+
+        // Empty blocks until block 2 commits (three consecutive certified views above it).
+        let mut committed = Vec::new();
+        for now in 3..8 {
+            let (_, c) = propose_to_all(&mut leader, &mut [&mut peer], &storage, vec![], now);
+            committed.extend(c);
+            if storage.head().unwrap().height >= 2 {
+                break;
+            }
+        }
+        let cb2 = committed.iter().find(|cb| cb.block.height() == 2).expect("the three-chain committed block 2");
+        assert_eq!(cb2.block.hash(), b2.hash());
+        assert_eq!(peer.committed_ledger().state_root(), leader.committed_ledger().state_root(), "the committed heads agree");
+        assert_eq!(leader.committed_ledger().state_root(), storage.head_block().unwrap().header.state_root);
+
+        // `burn_base`, live: block 1's two bundles and block 2's one each burned their base.
+        assert_eq!(storage.base_fees_burned().unwrap(), 3 * gas::BUNDLE_BASE, "one base per bundle, the live block's included");
+        assert_eq!(peer.committed_ledger().base_fees_burned(), 3 * gas::BUNDLE_BASE, "and the peer counted the same");
+
+        // `subsidy_net_of_fees`, live: the covered tip pays the schedule first; only the rest is
+        // minted, and the note is the schedule in full.
+        let schedule = gas::subsidy(0, &cfg);
+        assert!(schedule > FEE_RULES_TIP, "the shares fall short of the schedule, so the netting shows");
+        let (subsidy, share, n) = storage.aggregate_payment(&aggregate.hash()).unwrap().expect("the aggregate's record is written with its block");
+        assert_eq!((subsidy, share, n), (schedule - FEE_RULES_TIP, FEE_RULES_TIP, 0), "minted is the schedule net of the covered tip");
+        let [deposit] = cb2.deposits.as_slice() else { panic!("the aggregate appends one note: {:?}", cb2.deposits) };
+        assert_eq!(
+            deposit.cm,
+            StubExecutor.note_commitment(&fee_rules_payout().pk, &[0; 8], subsidy + share, 0, time, &r),
+            "the record's subsidy + proving_share is the payout note's amount"
+        );
+        assert_eq!(leader.committed_ledger().supply().subsidised, schedule - FEE_RULES_TIP, "and `subsidised` moved by the minted part only");
+    }
+
+    /// Issue #134, the restart half. The same chain, then the store reopened the way a node
+    /// restarts — `resume_consensus`, through `reload_ledger` — for the leader and for a second
+    /// replica, while the first peer keeps running untouched. The restarted replicas come back
+    /// with the rules and the counter; the restarted leader's next block, another tip-paying
+    /// bundle, is applied to its root by both the restarted replica and the one that never
+    /// stopped; and once it commits the store's counter holds the fourth base. A restart path
+    /// that dropped `fees` would pay the base it should burn and fork right here.
+    #[test]
+    fn under_both_fee_rules_the_roots_still_agree_after_a_restart_and_the_counters_persist() {
+        let (_d, storage, gs, covered_tx, _b1_ledger) = fee_rules_chain();
+        let (mut leader, mut peer) = (resume_over(&storage, &gs), resume_over(&storage, &gs));
+        let aggregate = aggregate_tx(7, &key(7), 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let bundle = tipping_bundle(leader.tip_ledger(), 31);
+        propose_to_all(&mut leader, &mut [&mut peer], &storage, vec![bundle, aggregate.clone()], 2);
+        let mut now = 3;
+        while storage.head().unwrap().height < 2 {
+            assert!(now < 10, "three certified views commit block 2");
+            propose_to_all(&mut leader, &mut [&mut peer], &storage, vec![], now);
+            now += 1;
+        }
+        let record = storage.aggregate_payment(&aggregate.hash()).unwrap();
+        assert!(record.is_some());
+        drop(leader);
+
+        // The restart: the leader, and a second replica, from the store alone.
+        let mut leader = resume_over(&storage, &gs);
+        let mut restarted_peer = resume_over(&storage, &gs);
+        for hs in [&leader, &restarted_peer] {
+            assert_eq!(hs.committed_ledger().fees(), &both_fee_rules(), "`reload_ledger` restores the rules from the genesis file");
+            assert_eq!(hs.committed_ledger().base_fees_burned(), 3 * gas::BUNDLE_BASE, "and the counter from the store");
+            assert_eq!(hs.tip_ledger().state_root(), peer.tip_ledger().state_root(), "the pending blocks re-execute to the running peer's tip");
+        }
+
+        // The restarted leader is back in the view it proposed in, which it never proposes in
+        // twice (audit v6, STAKE-1): its first timer moves it on, as it would on a node.
+        let acts = leader.on_timeout(leader.view());
+        persist_actions(&leader, &storage, acts);
+        let bundle = tipping_bundle(leader.tip_ledger(), 41);
+        let (b, _) = propose_to_all(&mut leader, &mut [&mut restarted_peer, &mut peer], &storage, vec![bundle.clone()], now);
+        assert_eq!(b.transactions.iter().map(|t| t.hash()).collect::<Vec<_>>(), vec![bundle.hash()], "the restarted leader includes the bundle");
+        assert_eq!(leader.tip_ledger().base_fees_burned(), 4 * gas::BUNDLE_BASE, "the restarted leader burns the fourth base");
+        while storage.head().unwrap().height < b.height() {
+            now += 1;
+            assert!(now < 20, "three certified views commit the post-restart block");
+            propose_to_all(&mut leader, &mut [&mut restarted_peer, &mut peer], &storage, vec![], now);
+        }
+        assert_eq!(storage.base_fees_burned().unwrap(), 4 * gas::BUNDLE_BASE, "the counter persisted across the restart and moved by one base");
+        assert_eq!(storage.aggregate_payment(&aggregate.hash()).unwrap(), record, "the aggregate's record is untouched by the restart");
+        assert_eq!(peer.committed_ledger().state_root(), leader.committed_ledger().state_root(), "the peer that never stopped agrees");
+        assert_eq!(restarted_peer.committed_ledger().state_root(), leader.committed_ledger().state_root());
+    }
+
+    /// An admission cache that counts its hits: the node's own [`admission::VerifiedSet`] behind
+    /// the lock the node shares it through, and the number of `contains` queries it answered
+    /// `true` — the times the ledger took the decode-not-verify path.
+    struct CountingVerified {
+        set: RwLock<admission::VerifiedSet>,
+        hits: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingVerified {
+        fn of(hashes: &[Hash]) -> CountingVerified {
+            let mut set = admission::VerifiedSet::new(admission::VERIFIED_SET_ENTRIES);
+            for h in hashes {
+                set.insert(*h);
+            }
+            CountingVerified { set: RwLock::new(set), hits: std::sync::atomic::AtomicUsize::new(0) }
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl randprotocol_core::VerifiedProofs for CountingVerified {
+        fn contains(&self, tx: &Hash) -> bool {
+            let hit = self.set.read().expect("the test's lock is never poisoned").contains(tx);
+            if hit {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            hit
+        }
+        fn is_empty(&self) -> bool {
+            self.set.read().expect("the test's lock is never poisoned").is_empty()
+        }
+    }
+
+    /// What one live run of the fee-rule chain leaves behind: the committed root, the store's
+    /// `base_fees_burned`, the aggregate's `a` record, the store's supply counters, and the
+    /// cache's hit count (0 without one).
+    type LiveRun = (Hash, u64, Option<(u64, u64, u64)>, randprotocol_core::ledger::supply::Supply, usize);
+
+    /// The #134 live run — a tip-paying bundle and an aggregate over block 1's cover, proposed by
+    /// the leader and applied by a peer, driven until it commits — with the leader's replica
+    /// handed the admission cache when `cached`: the block's bundle and aggregate already marked
+    /// verified, as the mempool's verification workers mark a transaction they admitted. The
+    /// peer never gets one: it verifies every proof cold.
+    fn fee_rules_live_run(cached: bool) -> LiveRun {
+        let (_d, storage, gs, covered_tx, _b1_ledger) = fee_rules_chain();
+        let (mut leader, mut peer) = (resume_over(&storage, &gs), resume_over(&storage, &gs));
+        let bundle = tipping_bundle(leader.tip_ledger(), 31);
+        let aggregate = aggregate_tx(7, &key(7), 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let cache = Arc::new(CountingVerified::of(&[bundle.hash(), aggregate.hash()]));
+        if cached {
+            leader.set_verified_proofs(cache.clone());
+        }
+        let (b2, _) = propose_to_all(&mut leader, &mut [&mut peer], &storage, vec![bundle.clone(), aggregate.clone()], 2);
+        assert_eq!(
+            b2.transactions.iter().map(|t| t.hash()).collect::<Vec<_>>(),
+            vec![bundle.hash(), aggregate.hash()],
+            "cached {cached}: both made the block"
+        );
+        let mut now = 3;
+        while storage.head().unwrap().height < 2 {
+            assert!(now < 10, "cached {cached}: three certified views commit block 2");
+            propose_to_all(&mut leader, &mut [&mut peer], &storage, vec![], now);
+            now += 1;
+        }
+        let root = storage.head_block().unwrap().header.state_root;
+        assert_eq!(peer.committed_ledger().state_root(), root, "cached {cached}: the cold peer's committed root is the store's");
+        assert_eq!(leader.committed_ledger().state_root(), root, "cached {cached}: and the leader's");
+        assert_eq!(
+            peer.committed_ledger().base_fees_burned(),
+            leader.committed_ledger().base_fees_burned(),
+            "cached {cached}: the cold peer burned what the leader burned"
+        );
+        (
+            root,
+            storage.base_fees_burned().unwrap(),
+            storage.aggregate_payment(&aggregate.hash()).unwrap(),
+            storage.supply().unwrap(),
+            cache.hits(),
+        )
+    }
+
+    /// The #134 live path with the admission cache attached (the open follow-up AGENTS.md names).
+    /// On a node the leader's replica holds the `VerifiedSet` its mempool fills
+    /// (`set_verified_proofs`), so its trial apply (`apply_tx_with`) of a transaction admission
+    /// already verified skips exactly one thing: the STARK verification of the bundle (and auth
+    /// and call) proof, which it decodes instead. A peer that never saw the transaction verifies
+    /// it cold. The fee split under `burn_base` + `subsidy_net_of_fees` — the base burned, the
+    /// tip bucketed, the aggregate's netted subsidy — is computed from the fee and the ledger's
+    /// state, never from which proof path ran; were it to read anything off the verify path, the
+    /// cached leader's header root would differ from the cold peer's and the block would fork.
+    /// So: the cache is really hit, the cold peer still applies the leader's block to its root,
+    /// and every counter — the committed root, `base_fees_burned`, the `a` record, the supply —
+    /// is byte for byte the no-cache run's.
+    #[test]
+    fn under_both_fee_rules_the_admission_cache_on_the_leader_changes_no_root_and_no_counter() {
+        let cold = fee_rules_live_run(false);
+        let cached = fee_rules_live_run(true);
+        assert_eq!(cold.4, 0, "the cold run consults no cache");
+        assert!(cached.4 >= 1, "the leader's trial apply took the cache path: {} hit(s)", cached.4);
+        assert_eq!(cached.0, cold.0, "the committed root does not depend on the leader's cache");
+        assert_eq!(cached.1, cold.1, "nor does base_fees_burned");
+        assert_eq!(cold.1, 3 * gas::BUNDLE_BASE, "one base per bundle in either run");
+        assert_eq!(cached.2, cold.2, "nor the aggregate's a record");
+        assert!(cold.2.is_some(), "the record was written");
+        assert_eq!(cached.3, cold.3, "nor the supply counters");
+    }
+
+    /// A store on a chain with a fixed-price `gas` section and `fees { burn_base, burn_floor }`
+    /// (no aggregation: the proposer keeps the tip at inclusion), whose block 1 — certified by a
+    /// signed QC so a replica resumes on it — deploys the program the live block calls. Returns the
+    /// program's id and the deploy's settled floor, which block 1 burned.
+    fn burn_floor_gas_chain() -> (tempfile::TempDir, Arc<Storage>, GenesisState, randprotocol_core::ProgramId, u64) {
+        use crate::storage::fixtures::{burn_floor_rules, deploy_program_tx, fixed_gas, make_block};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        gs.ledger.set_gas(Some(fixed_gas()));
+        gs.ledger.set_fees(burn_floor_rules(false));
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let (program, deploy) = deploy_program_tx(&ledger, 81, 0x13, 3);
+        let deploy_floor = gas::fee_floor(&deploy.action);
+        let mut b1 = make_block(&gs.block, &mut ledger, vec![deploy], &key(1));
+        b1.qc.votes = vec![Vote::sign(&gs.signing_domain(), b1.qc.view, b1.qc.block_hash, &key(1))];
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(storage.base_fees_burned().unwrap(), deploy_floor, "block 1's deploy burned its whole floor");
+        (dir, Arc::new(storage), gs, program, deploy_floor)
+    }
+
+    /// Issue #135 on the live path. Under a `gas` section and `fees { burn_base, burn_floor }`, the
+    /// leader's trial apply and a peer's apply of a block carrying a tier-14 `Call` (its stub
+    /// proof declaring the tier's ceiling, `gas_max(14, 0, 0)`) and a transfer reach one root, and
+    /// once it commits the store's `base_fees_burned` has grown by exactly the transfer's
+    /// `BUNDLE_BASE` plus the call's tier-exact floor, `circuit_call_floor(gas_price, byte_price,
+    /// limit, bytes)` — with the prices read off the chain's own `rand_getLimits`, so a floor
+    /// priced at anything but the prices the chain serves (or the pre-verify floor at a limit of
+    /// 1) would miss. The proposer keeps only the two tips.
+    #[test]
+    fn under_burn_floor_and_a_gas_section_the_live_block_burns_the_calls_tier_exact_floor() {
+        use crate::storage::fixtures::{call_tx_bytes, gas_call_tx};
+        let (_d, storage, gs, program, deploy_floor) = burn_floor_gas_chain();
+        let limits = crate::rpc::tests::served_now(storage.clone(), &gs, "rand_getLimits");
+        let price = |k: &str| -> u64 { limits[k].as_str().unwrap_or_else(|| panic!("{k} is served: {limits}")).parse().unwrap() };
+        let (gas_price, byte_price) = (price("gas_price"), price("byte_price"));
+        assert_eq!(
+            limits["fee_rules"],
+            serde_json::json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true }),
+            "the chain serves the burn-floor rules"
+        );
+
+        let (mut leader, mut peer) = (resume_over(&storage, &gs), resume_over(&storage, &gs));
+        let limit = gas::gas_max(14, 0, 0);
+        let probe = gas_call_tx(leader.tip_ledger(), 91, &program, 14, limit, 0);
+        let floor = gas::circuit_call_floor(gas_price, byte_price, limit, call_tx_bytes(&probe));
+        assert!(floor > gas::BUNDLE_BASE + gas_price, "the tier-exact floor, well above the pre-verify one at a limit of 1");
+        let call = gas_call_tx(leader.tip_ledger(), 91, &program, 14, limit, floor + 11);
+        let transfer = bundle_tx(leader.tip_ledger(), [[95; 8], [96; 8]], [[97; 8], [98; 8]], gas::BUNDLE_BASE + 5);
+        let rewards_before = leader.committed_ledger().validators()[&key(1).address()].rewards;
+        let (b2, _) = propose_to_all(&mut leader, &mut [&mut peer], &storage, vec![call.clone(), transfer.clone()], 2);
+        assert_eq!(
+            b2.transactions.iter().map(|t| t.hash()).collect::<Vec<_>>(),
+            vec![call.hash(), transfer.hash()],
+            "both made the block: the trial apply refused neither"
+        );
+        let mut now = 3;
+        while storage.head().unwrap().height < 2 {
+            assert!(now < 10, "three certified views commit block 2");
+            propose_to_all(&mut leader, &mut [&mut peer], &storage, vec![], now);
+            now += 1;
+        }
+        assert_eq!(peer.committed_ledger().state_root(), leader.committed_ledger().state_root(), "leader and peer agree");
+        assert_eq!(leader.committed_ledger().state_root(), storage.head_block().unwrap().header.state_root);
+        assert_eq!(
+            storage.base_fees_burned().unwrap() - deploy_floor,
+            gas::BUNDLE_BASE + floor,
+            "the live block burned the transfer's base and the call's whole tier-exact floor"
+        );
+        assert_eq!(peer.committed_ledger().base_fees_burned(), storage.base_fees_burned().unwrap(), "and the peer counted the same");
+        assert_eq!(
+            leader.committed_ledger().validators()[&key(1).address()].rewards - rewards_before,
+            11 + 5,
+            "the proposer kept the two tips and nothing of either floor"
+        );
+    }
+
     /// RPL-2, the pool and the proposer together. Three invokes are pooled: two on disjoint
     /// cells and a third that reads and writes the first one's cell. The proposer is offered all
     /// three, packs the two that do not touch each other into one block and skips the third
@@ -6859,7 +7314,7 @@ mod tests {
         };
         let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, txs, &ks[0]);
         let hash = block.hash();
-        CommittedBlock { block, pruned: Vec::new(), qc: votes_of(height, hash, ks, votes), receipts: Vec::new(), deposits: Vec::new() }
+        CommittedBlock { block, pruned: Vec::new(), qc: votes_of(height, hash, ks, votes), receipts: Vec::new(), deposits: Vec::new(), aggregates: Vec::new() }
     }
 
     fn validators(n: u8) -> Vec<Keypair> {
