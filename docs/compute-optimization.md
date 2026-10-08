@@ -282,7 +282,7 @@ and 7 no longer verify inside tier 22; the node admits N ≤ 5 (`docs/aggregatio
   device-resident LDE and tree would, and that is the reason to want the 80 GB device class.
 
 Target: one inner bundle proof verified in **≤ 2²⁰ total rows** across all tables (today: the cpu
-table is 2²⁰, the register and RAM tables 2²²), so an aggregate of N = 16 lands around 2²⁴ rows —
+table is 2²⁰, the register and RAM tables 2²¹ since phase 3), so an aggregate of N = 16 lands around 2²⁴ rows —
 the size of one ordinary GPU-proved shard in comparable systems.
 
 ### 4.2 Tree aggregation, bounded steps

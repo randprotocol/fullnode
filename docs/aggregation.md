@@ -308,7 +308,7 @@ both have to clear before a genesis may switch it on.
      height but `canonical_reduce_log_height(program, N)` is refused before a key is built (the
      key-cache DoS guard; it replaces the node's own reduce-flag check). `warm_aggregation` warms
      one key per admitted tier and canonical height for N = 1..=`max_covers` — production heights
-     `2^18` / `2^19` / `2^20` at N = 1 / 2 / 3–5, so a `max_covers` of 3 is 3 tiers × 3 heights.
+     `2^18` / `2^19` / `2^20` at N = 1 / 2 / 3–5, so a `max_covers` of 3 is 3 tiers × 3 heights. At rate ¼ the production startup warm therefore grows from 3 to up to 9 verifier-key builds, off the consensus thread; its timing is not yet measured at rate ¼.
    - **`fri_profile` binds two parameter sets.** A chain's `fri_profile` name fixes the inner
      RV32 proofs' FRI parameters (80 queries, rate ⅛, 20 grinding bits) *and* the rVM's own
      (92 queries, rate ¼, 24 grinding bits at production), both constants of the vendored

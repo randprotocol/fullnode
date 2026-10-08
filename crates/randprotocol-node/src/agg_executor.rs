@@ -538,8 +538,10 @@ impl ConfidentialExecutor for AggExecutor {
         // *Every* admitted tier, not just the N=1 landing tier (audit v3, AGG-3): an aggregate
         // covering two or three bundles lands higher, and paying its key build inside admission —
         // on the consensus loop — is what this warm exists to avoid. The tiers above N=1 are rarer,
-        // not cheaper. A prover may also choose a tier above its landing one, so every admitted
-        // (tier, height) pair is warmed, not only each N's landing tier.
+        // not cheaper. The full admitted tier × canonical height cross product is warmed because the
+        // verifier admits any such pair, including ones no valid proof can have (production tier 20
+        // at height 2^19): an unwarmed pair is a key build an attacker could make every replica pay
+        // on the consensus path.
         for tier in admitted_tiers(self.rvm.profile) {
             for h in &heights {
                 let _ = self.rvm.verifier_key(program, randprotocol_rvm::machine::Tier(*tier as usize), *h);
@@ -1004,6 +1006,34 @@ mod tests {
         assert_eq!(warm_reduce_heights(&program, 1000).last(), Some(&randprotocol_rvm::machine::REDUCE_MAX_LOG_HEIGHT), "capped at the ceiling");
         w.warm_aggregation(&shape, 3);
         assert_eq!(w.rvm.cached_keys(), 2 * admitted_tiers(FriProfile::Test).len(), "one key per (tier, canonical height)");
+    }
+
+    /// The production warm heights: N = 1 / 2 / 3 at the production bundle shape are the
+    /// canonical `2^18` / `2^19` / `2^20`. DSL emission only (`aggregate_program`, no verifier
+    /// key build); the shape is read off the production fixture proof, which is not committed, so
+    /// without `Production-0.proof` in `RECURSION_FIXTURES` this skips.
+    #[test]
+    fn the_production_warm_heights_are_the_canonical_three() {
+        let dir = std::env::var_os("RECURSION_FIXTURES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/recursion"));
+        let Ok(bytes) = std::fs::read(dir.join("Production-0.proof")) else {
+            eprintln!("skipped: no Production-0.proof in {}", dir.display());
+            return;
+        };
+        let p: randprotocol_zkvm::machine::Proof = postcard::from_bytes(&bytes[32..]).expect("a production fixture proof decodes");
+        let shape = DeclaredShape {
+            profile: CoreProfile::Production,
+            tier: p.tier.0 as u8,
+            program_log_height: p.program_log_height,
+            input_log_height: p.input_log_height,
+            keccak_log_height: p.keccak_log_height,
+            sha256_log_height: p.sha256_log_height,
+            public_log_height: p.public_log_height,
+            mem_log_height: p.mem_log_height,
+        };
+        let program = aggregate_program(&AggExecutor::inner_key(&shape).unwrap());
+        assert_eq!(warm_reduce_heights(&program, 3), vec![18, 19, 20]);
     }
 
     /// The real round-trip: one fixture bundle proof aggregated by the rVM, the proof bytes
