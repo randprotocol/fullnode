@@ -379,6 +379,10 @@ enum Cmd {
     /// after genesis (bridge hardening B4).
     #[command(subcommand)]
     Token(TokenCmd),
+    /// RPL-3 perpetual futures: trading keys, deposits, orders, cancels, withdrawals, a
+    /// validator's oracle prices, and a prover's state proofs (`docs/cli.md`, `rand perp`).
+    #[command(subcommand)]
+    Perp(PerpCmd),
     /// The bridge's public state: guardians, emitters, the asset registry, the burn sequence.
     Bridge,
     /// The outbound burn message with this sequence, for a guardian to sign.
@@ -673,6 +677,144 @@ enum TokenCmd {
         #[arg(long, default_value_t = 1000)]
         limit: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum PerpCmd {
+    /// Write a fresh Dilithium2 trading key (`rand-node keygen`'s shape, mode 0600; refuses to
+    /// overwrite) and print the account id it owns.
+    Keygen {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Credit the account a trading key owns: one bundle burns AMOUNT of the collateral and pays
+    /// the RAND fee.
+    Deposit {
+        /// The trading key file (only its public key is read).
+        #[arg(long)]
+        trading_key: PathBuf,
+        /// Decimal RAND (as `rand bond`) when the collateral is RAND; the token's display units
+        /// (as `rand token burn`) when it is a token.
+        #[arg(long)]
+        amount: String,
+        /// Fee in RAND; the floor is 0.001.
+        #[arg(long)]
+        fee: Option<String>,
+        #[arg(long)]
+        no_wait: bool,
+        #[arg(long)]
+        cuda: bool,
+    },
+    /// Sign and send an order.
+    Order {
+        #[arg(long)]
+        trading_key: PathBuf,
+        #[arg(long)]
+        market: u32,
+        /// buy or sell.
+        #[arg(long)]
+        side: String,
+        /// Size in units (a whole number of the market's lots).
+        #[arg(long)]
+        size: u64,
+        /// Limit price in units (a whole number of ticks); none for a market order.
+        #[arg(long)]
+        price: Option<u64>,
+        /// limit or market.
+        #[arg(long, default_value = "limit")]
+        kind: String,
+        /// gtc, ioc or post.
+        #[arg(long, default_value = "gtc")]
+        tif: String,
+        #[arg(long)]
+        reduce_only: bool,
+        /// The order's nonce (default: one past the account's highest).
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Cancel the order whose nonce is TARGET.
+    Cancel {
+        #[arg(long)]
+        trading_key: PathBuf,
+        #[arg(long)]
+        target: u64,
+        /// The cancel's own nonce (default: one past the account's highest).
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Request a withdrawal of collateral to this wallet (`--key`); paid as a note once a state
+    /// proof covers it.
+    Withdraw {
+        #[arg(long)]
+        trading_key: PathBuf,
+        /// Amount in collateral units (atomic).
+        #[arg(long)]
+        amount: u64,
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// A validator's oracle prices, signed with its node key; `--every` repeats for ever.
+    Oracle {
+        /// The validator's `rand-node keygen` key file.
+        #[arg(long)]
+        node_key: PathBuf,
+        /// `<market>=<units>[,…]`.
+        #[arg(long)]
+        price: String,
+        /// Submit every this many seconds, logging each and continuing past a refusal.
+        #[arg(long)]
+        every: Option<u64>,
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Prove a `perp-prover` job with the engine image and submit the state proof. Exits
+    /// non-zero on any refusal.
+    Prove {
+        #[arg(long)]
+        image: PathBuf,
+        #[arg(long)]
+        job: PathBuf,
+        /// Prove at this tier (default: the smallest the run fits).
+        #[arg(long)]
+        tier: Option<u8>,
+        /// production or test (default: the node's `rand_status.fri_profile`).
+        #[arg(long)]
+        fri: Option<String>,
+        /// Prove and print, submit nothing.
+        #[arg(long)]
+        no_submit: bool,
+        /// Return once the node accepts the proof instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Print the engine state root (hex) of a JSON array of u32 state words.
+    GenesisRoot {
+        #[arg(long)]
+        state: PathBuf,
+    },
+    /// Print an engine image's program commitment in the chain's hex format (each u32 word as 8
+    /// little-endian hex characters), for the genesis `perps.engine_hc`.
+    ImageHc {
+        #[arg(long)]
+        image: PathBuf,
+    },
+    /// The exchange's public state (`rand_getPerps`).
+    State,
+    /// One trading account (`rand_getPerpAccount`), by id or by `--trading-key`.
+    Account {
+        /// The account id, 64 hex.
+        account: Option<String>,
+        #[arg(long)]
+        trading_key: Option<PathBuf>,
+    },
+    /// A closed block's perp input words and digest (`rand_getPerpInputs`).
+    Inputs { height: u64 },
 }
 
 #[derive(Subcommand)]
@@ -1367,6 +1509,265 @@ fn read_hex_arg(arg: &str) -> Result<Vec<u8>> {
     let compact: String = text.split_whitespace().collect();
     let compact = compact.strip_prefix("0x").unwrap_or(&compact);
     hex::decode(compact).context("expected hex, or @path to a file of hex")
+}
+
+/// `rand perp …` (RPL-3): each subcommand is a call into `randprotocol_client::perps`.
+async fn perp(
+    rpc: &RpcClient,
+    key: &Path,
+    op: PerpCmd,
+    use_prover: bool,
+    cpu: bool,
+    max_prover_fee: &str,
+) -> Result<()> {
+    use randprotocol_client::perps;
+    use randprotocol_core::ledger::perps::account_id;
+    match op {
+        PerpCmd::Keygen { out } => {
+            let kp = perps::write_dilithium_key(&out)?;
+            println!(
+                "wrote {}\naccount: {}",
+                out.display(),
+                word8_to_hex(&account_id(kp.public_key()))
+            );
+        }
+        PerpCmd::Deposit {
+            trading_key,
+            amount,
+            fee,
+            no_wait,
+            cuda,
+        } => {
+            let state = perps::PerpsState::fetch(rpc).await?;
+            let pk = wallet::load_authority_public_key(&trading_key)?;
+            let asset = state.collateral_asset;
+            let amount = if asset == 0 {
+                parse_amount(&amount)?
+            } else {
+                let (decimals, _) = wallet::asset_units(rpc, asset).await?;
+                wallet::parse_decimal(&amount, decimals)?
+            };
+            let action = Action::PerpDeposit {
+                trading_key: pk.clone(),
+            };
+            let fee = match fee {
+                Some(f) => parse_amount(&f)?,
+                // The schedule floor plus the chain's `fees.prove_base`, as every default fee.
+                None => wallet::schedule_floor(rpc, &action).await?,
+            };
+            let (w, path, mut store) = open_wallet(key)?;
+            let chain_id = rpc.chain_id().await?;
+            let profile = profile_of(rpc).await?;
+            eprintln!(
+                "depositing {amount} units of asset {asset} into account {}",
+                word8_to_hex(&account_id(&pk))
+            );
+            let proving = proving_for(use_prover, cuda, cpu, key, max_prover_fee)?;
+            let s = perps::submit_perp_deposit(
+                rpc, &w, &mut store, &pk, amount, asset, fee, profile, &proving, chain_id, !no_wait,
+            )
+            .await;
+            store.save(&path)?;
+            report(&s?, "perp deposit");
+        }
+        PerpCmd::Order {
+            trading_key,
+            market,
+            side,
+            size,
+            price,
+            kind,
+            tif,
+            reduce_only,
+            nonce,
+            no_wait,
+        } => {
+            let kp = perps::load_dilithium_key(&trading_key)?;
+            let account = account_id(kp.public_key());
+            let nonce = perps::resolve_nonce(rpc, &account, nonce).await?;
+            let body =
+                perps::order_body(nonce, market, &side, &kind, &tif, reduce_only, price, size)?;
+            let chain_id = rpc.chain_id().await?;
+            // BIND-1: signed over the chain's binding domain, as the node verifies it.
+            let domain = rpc.binding_domain(chain_id).await?;
+            let hash = perps::submit_perp_signed(
+                rpc,
+                chain_id,
+                perps::order_action(&domain, chain_id, &kp, body),
+                !no_wait,
+            )
+            .await?;
+            println!(
+                "order {hash}\naccount {} nonce {nonce}",
+                word8_to_hex(&account)
+            );
+        }
+        PerpCmd::Cancel {
+            trading_key,
+            target,
+            nonce,
+            no_wait,
+        } => {
+            let kp = perps::load_dilithium_key(&trading_key)?;
+            let account = account_id(kp.public_key());
+            let nonce = perps::resolve_nonce(rpc, &account, nonce).await?;
+            let chain_id = rpc.chain_id().await?;
+            let domain = rpc.binding_domain(chain_id).await?;
+            let hash = perps::submit_perp_signed(
+                rpc,
+                chain_id,
+                perps::cancel_action(&domain, chain_id, &kp, nonce, target),
+                !no_wait,
+            )
+            .await?;
+            println!(
+                "cancel {hash}\naccount {} nonce {nonce} target {target}",
+                word8_to_hex(&account)
+            );
+        }
+        PerpCmd::Withdraw {
+            trading_key,
+            amount,
+            nonce,
+            no_wait,
+        } => {
+            let w = Wallet::load(key)?;
+            let kp = perps::load_dilithium_key(&trading_key)?;
+            let account = account_id(kp.public_key());
+            let state = perps::PerpsState::fetch(rpc).await?;
+            let nonce = perps::resolve_nonce(rpc, &account, nonce).await?;
+            let chain_id = rpc.chain_id().await?;
+            // The note's `time` is a chain height in the bundle time window, as `TokenMint`'s.
+            let time = u32::try_from(
+                rpc.head().await?["height"]
+                    .as_u64()
+                    .context("head height")?,
+            )
+            .context("chain height does not fit a note's time field")?;
+            let format = rpc.envelope_format(chain_id).await?;
+            let domain = rpc.binding_domain(chain_id).await?;
+            let (action, note) = perps::withdraw_action(
+                &w,
+                &kp,
+                &domain,
+                chain_id,
+                nonce,
+                amount,
+                state.collateral_asset,
+                time,
+                format,
+            )?;
+            let hash = perps::submit_perp_signed(rpc, chain_id, action, !no_wait).await?;
+            println!(
+                "request {}",
+                word8_to_hex(
+                    &randprotocol_core::notes::word8_from_bytes(hash.as_bytes())
+                        .context("a hash is 32 bytes")?
+                )
+            );
+            println!(
+                "amount {amount} units of asset {} to {}",
+                state.collateral_asset, w.address
+            );
+            println!(
+                "time {time}\nr {}\nnote {}",
+                word8_to_hex(&note.r),
+                word8_to_hex(&note.commitment())
+            );
+            println!(
+                "paid as that note when a state proof covers the request; `rand sync` finds it"
+            );
+        }
+        PerpCmd::Oracle {
+            node_key,
+            price,
+            every,
+            no_wait,
+        } => {
+            let kp = perps::load_dilithium_key(&node_key)?;
+            let prices = perps::parse_prices(&price)?;
+            let chain_id = rpc.chain_id().await?;
+            let domain = rpc.binding_domain(chain_id).await?;
+            loop {
+                let nonce = u64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_millis(),
+                )?;
+                let action = perps::oracle_action(&domain, chain_id, &kp, prices.clone(), nonce);
+                match (
+                    perps::submit_perp_signed(rpc, chain_id, action, every.is_none() && !no_wait)
+                        .await,
+                    every,
+                ) {
+                    (Ok(hash), _) => println!("oracle {hash} nonce {nonce}"),
+                    (Err(e), None) => return Err(e),
+                    (Err(e), Some(_)) => eprintln!("oracle nonce {nonce} refused: {e:#}"),
+                }
+                match every {
+                    Some(secs) => tokio::time::sleep(Duration::from_secs(secs.max(1))).await,
+                    None => break,
+                }
+            }
+        }
+        PerpCmd::Prove {
+            image,
+            job,
+            tier,
+            fri,
+            no_submit,
+            no_wait,
+        } => {
+            let job = perps::ProveJob::load(&job)?;
+            let profile = match fri {
+                Some(f) => executor::ZkExecutor::profile_from_str(&f)
+                    .ok_or_else(|| anyhow!("--fri {f}: production or test"))?,
+                None => profile_of(rpc).await?,
+            };
+            let chain_id = rpc.chain_id().await?;
+            let (hash, tier, bytes) = perps::prove_and_submit_state_proof(
+                rpc, chain_id, &image, &job, tier, profile, !no_submit, !no_wait,
+            )
+            .await?;
+            println!("tier {tier}\nproof {bytes} bytes");
+            match (no_submit, no_wait) {
+                (true, _) => println!("not submitted (would be {hash})"),
+                (false, true) => println!("submitted {hash}"),
+                (false, false) => println!("committed {hash}"),
+            }
+        }
+        PerpCmd::GenesisRoot { state } => println!(
+            "{}",
+            word8_to_hex(&perps::genesis_root(&perps::read_words(&state)?))
+        ),
+        PerpCmd::ImageHc { image } => {
+            let bytes = std::fs::read(&image)
+                .with_context(|| format!("reading the engine image {}", image.display()))?;
+            let program = randprotocol_zkvm::codec::program_from_bytes(&bytes)
+                .map_err(|e| anyhow!("{} is not a program image: {e}", image.display()))?;
+            println!("{}", word8_to_hex(&perps::image_hc(&program)));
+        }
+        PerpCmd::State => println!("{}", pretty(&rpc.get_perps().await?)),
+        PerpCmd::Account {
+            account,
+            trading_key,
+        } => {
+            let id = match (account, trading_key) {
+                (Some(hex), None) => parse_word8(&hex, "account")?,
+                (None, Some(path)) => account_id(&wallet::load_authority_public_key(&path)?),
+                _ => anyhow::bail!("name the account: its 64-hex id, or --trading-key <file>"),
+            };
+            match rpc.get_perp_account(&id).await? {
+                Some(v) => println!("{}", pretty(&v)),
+                None => println!("no account {}", word8_to_hex(&id)),
+            }
+        }
+        PerpCmd::Inputs { height } => match rpc.get_perp_inputs(height).await? {
+            Some(v) => println!("{}", pretty(&v)),
+            None => println!("no perp inputs at height {height}"),
+        },
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -2972,6 +3373,7 @@ async fn main() -> Result<()> {
         Cmd::Status => println!("{}", pretty(&rpc.status().await?)),
         Cmd::Peers => println!("{}", pretty(&rpc.peers().await?)),
         Cmd::Validators => println!("{}", pretty(&rpc.validators().await?)),
+        Cmd::Perp(op) => perp(&rpc, &cli.key, op, cli.prover, cli.cpu, &cli.max_prover_fee).await?,
     }
     Ok(())
 }
@@ -2980,6 +3382,121 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The `rand perp` surface as `perp-prover` spawns it and the devnet runbook types it.
+    #[test]
+    fn the_perp_commands_parse_as_documented() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("rand").chain(args.iter().copied()))
+        };
+        // Exactly the prover daemon's argv (`perp-prover/src/daemon.rs`).
+        let argv = [
+            "--rpc",
+            "http://127.0.0.1:8545",
+            "perp",
+            "prove",
+            "--image",
+            "e.bin",
+            "--job",
+            "j.json",
+            "--fri",
+            "production",
+        ];
+        let cli = parse(&argv).unwrap();
+        assert_eq!(cli.rpc, "http://127.0.0.1:8545");
+        let Cmd::Perp(PerpCmd::Prove {
+            image,
+            job,
+            tier,
+            fri,
+            no_submit,
+            no_wait,
+        }) = cli.cmd
+        else {
+            panic!("perp prove")
+        };
+        assert_eq!(
+            (image, job),
+            (PathBuf::from("e.bin"), PathBuf::from("j.json"))
+        );
+        assert_eq!((tier, fri.as_deref()), (None, Some("production")));
+        assert!(!no_submit && !no_wait, "submits and waits by default");
+        let argv = [
+            "perp",
+            "order",
+            "--trading-key",
+            "t.json",
+            "--market",
+            "0",
+            "--side",
+            "buy",
+            "--size",
+            "10",
+            "--price",
+            "500",
+        ];
+        let Ok(Cmd::Perp(PerpCmd::Order {
+            market,
+            side,
+            size,
+            price,
+            kind,
+            tif,
+            ..
+        })) = parse(&argv).map(|c| c.cmd)
+        else {
+            panic!("perp order")
+        };
+        assert_eq!(
+            (market, side.as_str(), size, price),
+            (0, "buy", 10, Some(500))
+        );
+        assert_eq!(
+            (kind.as_str(), tif.as_str()),
+            ("limit", "gtc"),
+            "the defaults"
+        );
+        for args in [
+            &["perp", "keygen", "--out", "t.json"][..],
+            &[
+                "perp",
+                "deposit",
+                "--trading-key",
+                "t.json",
+                "--amount",
+                "100",
+            ],
+            &["perp", "cancel", "--trading-key", "t.json", "--target", "3"],
+            &[
+                "perp",
+                "withdraw",
+                "--trading-key",
+                "t.json",
+                "--amount",
+                "5000",
+            ],
+            &[
+                "perp",
+                "oracle",
+                "--node-key",
+                "n.json",
+                "--price",
+                "0=100,1=200",
+                "--every",
+                "2",
+            ],
+            &["perp", "genesis-root", "--state", "s.json"],
+            &["perp", "image-hc", "--image", "e.bin"],
+            &["perp", "state"],
+            &["perp", "account", "--trading-key", "t.json"],
+            &["perp", "inputs", "7"],
+        ] {
+            assert!(
+                matches!(parse(args).map(|c| c.cmd), Ok(Cmd::Perp(_))),
+                "{args:?}"
+            );
+        }
+    }
 
     fn section_limits() -> randprotocol_client::ChainLimits {
         randprotocol_client::ChainLimits {
@@ -2998,6 +3515,7 @@ mod tests {
             proof_window_blocks: None,
             program_state: None, multisig: None,
             prove_base: 0,
+            perps: None,
         }
     }
 

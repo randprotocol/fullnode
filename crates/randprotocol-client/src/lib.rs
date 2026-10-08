@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 pub mod contacts;
 pub mod governance;
 pub mod memo_display;
+pub mod perps;
 pub mod prover;
 pub mod qr;
 pub mod tree;
@@ -204,6 +205,10 @@ pub struct ChainLimits {
     /// to every default fee it computes itself ([`RpcClient::prove_base`]).
     #[serde(default, rename = "fee_rules", deserialize_with = "prove_base_of_fee_rules")]
     pub prove_base: u64,
+    /// RPL-3 (perps): the genesis `perps` section's limits, `None` on a chain without the
+    /// section — where every perp action is refused — and from a node that predates the field.
+    #[serde(default)]
+    pub perps: Option<PerpsLimits>,
 }
 
 /// [`ChainLimits::prove_base`] out of the `fee_rules` object: its `prove_base` amount, `0` for
@@ -211,6 +216,25 @@ pub struct ChainLimits {
 fn prove_base_of_fee_rules<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
     let rules = <Option<Value> as serde::Deserialize>::deserialize(d)?.unwrap_or(Value::Null);
     Ok(amount_field(&rules["prove_base"]).unwrap_or(0))
+}
+
+/// `rand_getLimits.perps` (RPL-3): the collateral asset (0 is RAND), the highest tier a state
+/// proof may declare, the most blocks one proof may cover and the most withdrawals it may pay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct PerpsLimits {
+    pub collateral_asset: u32,
+    pub max_tier: u8,
+    #[serde(deserialize_with = "u64_string_or_number")]
+    pub max_window_blocks: u64,
+    pub max_payouts: usize,
+    /// The most perp inputs one block records (genesis `max_block_inputs`); 0 from a node that
+    /// predates the field.
+    #[serde(default)]
+    pub max_block_inputs: u32,
+    /// The smallest deposit in collateral units, 0 no floor (genesis `min_deposit`); a decimal
+    /// string on the wire, 0 from a node that predates the field.
+    #[serde(default, deserialize_with = "u64_string_or_number")]
+    pub min_deposit: u64,
 }
 
 /// `rand_getLimits.multisig`: what a `CreateMultisig` costs on top of the bundle's base, and the
@@ -1256,6 +1280,27 @@ impl RpcClient {
         let v = self.call("rand_bridgeAssetId", json!([token_chain, hex::encode(token_address)])).await?;
         Ok(v.as_str().context("bridgeAssetId did not return a hash")?.to_string())
     }
+
+    /// RPL-3: `rand_getPerps`, the exchange's public state — `{"enabled": false}` on a chain
+    /// without the `perps` section. Decoded by [`perps::PerpsState::from_json`].
+    pub async fn get_perps(&self) -> Result<Value> {
+        self.call("rand_getPerps", json!([])).await
+    }
+
+    /// RPL-3: `rand_getPerpAccount [hex64]`, one trading account; `None` for an id the exchange
+    /// does not hold (and on a chain without the section).
+    pub async fn get_perp_account(&self, account: &Word8) -> Result<Option<Value>> {
+        let id = randprotocol_core::notes::word8_to_hex(account);
+        let v = self.call("rand_getPerpAccount", json!([id])).await?;
+        Ok(if v.is_null() { None } else { Some(v) })
+    }
+
+    /// RPL-3: `rand_getPerpInputs [height]`, a closed block's perp input words and digest;
+    /// `None` for a height the node holds no row for (proved, above the head, or no section).
+    pub async fn get_perp_inputs(&self, height: u64) -> Result<Option<Value>> {
+        let v = self.call("rand_getPerpInputs", json!([height])).await?;
+        Ok(if v.is_null() { None } else { Some(v) })
+    }
 }
 
 /// One row of the bridge's asset registry as `rand_getAssets` reports it: the `asset` word that
@@ -1749,6 +1794,8 @@ mod tests {
                 program_state: None,
                 multisig: None,
                 prove_base: 0,
+                // Nor a perps section.
+                perps: None,
             })
         );
         let older = RpcClient::new(scripted_rpc(vec![]).await);

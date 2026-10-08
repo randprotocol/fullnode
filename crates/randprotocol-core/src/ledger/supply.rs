@@ -181,6 +181,14 @@ pub struct Audit {
     /// … and what the vaults still hold. It got there through a bundle's `burn_r`, so it is
     /// already inside [`Supply::burned`] on the pool side; this is its register-side twin.
     pub program_rand_held: u64,
+    /// RPL-3, both 0 without a `perps` section and kept off [`Supply`] for the same layout
+    /// reason — [`Self::program_rand_out`]'s and [`Self::program_rand_held`]'s twins for the
+    /// exchange: RAND that state proofs have paid out of it as withdrawal notes (value entering
+    /// the pool) …
+    pub perps_rand_out: u64,
+    /// … and what the exchange still holds: every RAND `PerpDeposit`'s `burn_r` (inside
+    /// [`Supply::burned`] on the pool side) less what was paid out.
+    pub perps_rand_held: u64,
     /// Multisig accounts, all 0 without a `multisig` section and kept off [`Supply`] for the
     /// same layout reason: what genesis seeded into the accounts (issuance, like
     /// `genesis_staked`) …
@@ -206,6 +214,8 @@ impl Audit {
             vesting_in_register: 0,
             program_rand_out: 0,
             program_rand_held: 0,
+            perps_rand_out: 0,
+            perps_rand_held: 0,
             multisig_issued: 0,
             multisig_rand_out: 0,
             multisig_rand_held: 0,
@@ -226,6 +236,19 @@ impl Audit {
             pool_value: self.pool_value.saturating_add(rand_out),
             program_rand_out: rand_out,
             program_rand_held: rand_in.saturating_sub(rand_out),
+            ..self
+        }
+    }
+
+    /// The same audit with the perps exchange's RAND in it (RPL-3): `rand_in` is every RAND
+    /// `PerpDeposit`'s `burn_r`, `rand_out` every RAND withdrawal a state proof paid. Composes
+    /// with [`Self::with_program_vaults`] (each adds its own `rand_out` to the pool); like it,
+    /// it must come after [`Self::with_vesting`], which recomputes the pool from the counters.
+    pub fn with_perps(self, rand_in: u64, rand_out: u64) -> Audit {
+        Audit {
+            pool_value: self.pool_value.saturating_add(rand_out),
+            perps_rand_out: rand_out,
+            perps_rand_held: rand_in.saturating_sub(rand_out),
             ..self
         }
     }
@@ -265,6 +288,7 @@ impl Audit {
             .saturating_add(self.register_total)
             .saturating_add(self.vesting_in_register)
             .saturating_add(self.program_rand_held)
+            .saturating_add(self.perps_rand_held)
             .saturating_add(self.multisig_rand_held)
     }
 

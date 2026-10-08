@@ -100,6 +100,7 @@ fn genesis(key: &Keypair) -> Genesis {
         multisig: None,
         fees: None,
         incremental_nullifier_root: None,
+        perps: None,
     }
 }
 
@@ -182,9 +183,27 @@ pub async fn serve_genesis(edit: impl FnOnce(&mut Genesis)) -> (SocketAddr, Serv
     (addr, served)
 }
 
+/// [`serve_genesis`], with `seed` run over the initialised store before the server starts: for a
+/// stored row no block of a node-less chain writes (RPL-3's `perp_inputs`).
+pub async fn serve_genesis_seeded(
+    edit: impl FnOnce(&mut Genesis),
+    seed: impl FnOnce(&randprotocol_node::storage::Storage),
+) -> (SocketAddr, ServedRpc) {
+    let (addr, _heads, served) = serve_genesis_seeded_with(16, edit, seed).await;
+    (addr, served)
+}
+
 async fn serve_genesis_with(
     capacity: usize,
     edit: impl FnOnce(&mut Genesis),
+) -> (SocketAddr, broadcast::Sender<HeadSummary>, ServedRpc) {
+    serve_genesis_seeded_with(capacity, edit, |_| {}).await
+}
+
+async fn serve_genesis_seeded_with(
+    capacity: usize,
+    edit: impl FnOnce(&mut Genesis),
+    seed: impl FnOnce(&randprotocol_node::storage::Storage),
 ) -> (SocketAddr, broadcast::Sender<HeadSummary>, ServedRpc) {
     let dir = tempfile::tempdir().unwrap();
     let key = Keypair::from_seed([102; 32]).unwrap();
@@ -193,6 +212,7 @@ async fn serve_genesis_with(
     let gs = file.build(&StubExecutor).expect("genesis builds");
     let storage = Arc::new(randprotocol_node::storage::Storage::open(dir.path()).unwrap());
     storage.init_genesis(&gs).unwrap();
+    seed(&storage);
     let (heads, _) = broadcast::channel(capacity);
     // Nothing here sends a `NodeCommand`; the receiver is kept only so the sender stays open.
     let (node_tx, node_rx) = tokio::sync::mpsc::channel(1);

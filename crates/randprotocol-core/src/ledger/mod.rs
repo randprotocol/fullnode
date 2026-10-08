@@ -19,6 +19,7 @@ pub mod call_envelope;
 pub mod fees;
 pub mod multisig;
 pub mod nullifier_mmr;
+pub mod perps;
 pub mod program_state;
 pub mod staking;
 pub mod supply;
@@ -350,6 +351,10 @@ pub enum TxError {
     /// that is no longer what the transition read, a vault that cannot pay.
     #[error("program state: {0}")]
     ProgramState(#[from] program_state::ProgramStateError),
+    /// RPL-3: a perp action the perps module refused (see [`perps::PerpError`]) — the gate
+    /// itself, an unknown account or market, a used nonce, a bad signature, a stale oracle nonce.
+    #[error("perps: {0}")]
+    Perps(#[from] perps::PerpError),
     /// Multisig accounts: a transaction the multisig module refused (see
     /// [`multisig::MultisigError`]).
     #[error("multisig: {0}")]
@@ -591,6 +596,13 @@ pub fn non_canonical_proofs(tx: &Transaction, check: &dyn Fn(&[u8]) -> Option<St
             return Some(TxError::NonCanonicalProof(format!("call proof: {why}")));
         }
     }
+    // RPL-3: a `PerpStateProof`'s STARK is a zkVM proof like a call's, kept in the binding the
+    // same way, so the same re-encoding rules hold for it.
+    if let Action::PerpStateProof { proof, .. } = &tx.action {
+        if let Some(why) = check(proof) {
+            return Some(TxError::NonCanonicalProof(format!("state proof: {why}")));
+        }
+    }
     None
 }
 
@@ -598,7 +610,9 @@ pub fn non_canonical_proofs(tx: &Transaction, check: &dyn Fn(&[u8]) -> Option<St
 /// at most one note the ledger derives itself (a `Withdraw` or `BridgeAttest` deposit, a faucet
 /// `Mint`, a `TokenMint` or `RegisterToken` initial mint, a vesting claim or revoke, an aggregate
 /// payout) — or, for an RPL-2 `Invoke`, the up to [`program_state::MAX_PAYOUTS`] notes its
-/// transition pays out. `validate_inner` refuses a transaction when the tree has fewer left.
+/// transition pays out, or for an RPL-3 `PerpStateProof` (no bundle) its up to
+/// [`perps::MAX_PERP_PAYOUTS`] payout notes. `validate_inner` refuses a transaction when the
+/// tree has fewer left.
 pub const MAX_LEAVES_PER_TX: u64 = crate::notes::BUNDLE_SLOTS as u64 + program_state::MAX_PAYOUTS as u64;
 
 fn has_duplicate(words: &[Word8]) -> bool {
@@ -695,6 +709,11 @@ pub struct Ledger {
     /// whose genesis has no `program_state` section. Consensus state, in the state root
     /// (`rand-state-8`), persisted whole.
     program_state: Option<program_state::ProgramState>,
+    /// RPL-3 (`perps.rs`): trading accounts, the oracle, the proved engine root and the block
+    /// digests no state proof has covered yet, `None` on a chain whose genesis has no `perps`
+    /// section. Consensus state, in the state root (`rand-state-9`); its two per-block transient
+    /// fields are outside both the root and equality.
+    perps: Option<perps::Perps>,
     /// Multisig accounts (`multisig.rs`): the register a genesis `multisig` section seeds,
     /// `None` without one. Consensus state, in the state root (`rand-state-multisig-1`).
     multisig: Option<multisig::MultisigRegister>,
@@ -888,6 +907,9 @@ impl PartialEq for Ledger {
             // without one. Its two RAND counters are audit state and compared with it; a
             // rebuilt ledger restores the whole blob, counters included.
             && self.program_state == o.program_state
+            // Perps (RPL-3): consensus state under its section, `None` on both sides without
+            // one. `Perps`'s own equality leaves out the per-block transient fields.
+            && self.perps == o.perps
             && self.multisig == o.multisig
             // The live gas prices (Phase 2): consensus state under `gas.dynamic`, compared by
             // effective value so a restored `Some(section prices)` equals an unmoved `None`.
@@ -934,6 +956,7 @@ impl Ledger {
             jailed: BTreeMap::new(),
             vesting: None,
             program_state: None,
+            perps: None,
             multisig: None,
             registration_fees_burned: 0,
             base_fees_burned: 0,
@@ -1003,6 +1026,7 @@ impl Ledger {
             jailed: BTreeMap::new(),
             vesting: None,
             program_state: None,
+            perps: None,
             multisig: None,
             registration_fees_burned: 0,
             base_fees_burned: 0,
@@ -1418,6 +1442,13 @@ impl Ledger {
             Some(p) => audit.with_program_vaults(p.rand_in, p.rand_out),
             None => audit,
         };
+        // RPL-3: the exchange's RAND is the identity's fifth term — a RAND `PerpDeposit`'s
+        // `burn_r` is counted burned by the common bundle path, so what the exchange holds has
+        // to be counted back here, and what state proofs paid out is pool value again.
+        let audit = match &self.perps {
+            Some(p) => audit.with_perps(p.rand_in, p.rand_out),
+            None => audit,
+        };
         // Last: `with_vesting` rebuilds `pool_value` from the supply, so anything chained
         // before it would be lost.
         match &self.multisig {
@@ -1438,6 +1469,42 @@ impl Ledger {
 
     pub(crate) fn program_state_mut(&mut self) -> Option<&mut program_state::ProgramState> {
         self.program_state.as_mut()
+    }
+
+    /// Perps (RPL-3), `None` on a chain without the section.
+    pub fn perps(&self) -> Option<&perps::Perps> {
+        self.perps.as_ref()
+    }
+
+    /// Install it: genesis from its section, a reloading node from what it persisted.
+    pub fn set_perps(&mut self, p: Option<perps::Perps>) {
+        self.perps = p;
+    }
+
+    pub(crate) fn perps_mut(&mut self) -> Option<&mut perps::Perps> {
+        self.perps.as_mut()
+    }
+
+    /// The last closed block's height and perp input words, once — for the node to store and
+    /// serve to provers. `None` without the section, or when already taken.
+    pub fn take_perp_block_words(&mut self) -> Option<(u64, Vec<u32>)> {
+        self.perps.as_mut().and_then(|p| p.take_block_words())
+    }
+
+    /// [`Self::take_perp_block_words`] without taking them: a copy of the last closed block's
+    /// height and words, for a reader behind a shared reference (the consensus replica fills
+    /// each committed block's [`crate::consensus::CommittedBlock::perp_words`] with it).
+    pub fn perp_block_words(&self) -> Option<(u64, Vec<u32>)> {
+        self.perps.as_ref().and_then(|p| p.last_block_words().cloned())
+    }
+
+    /// Whether block time is consensus input on this chain, and so bounded: no rewind past the
+    /// parent and no step past [`MAX_TIMESTAMP_STEP_MS`] (`apply_block_for_sync`), and the
+    /// proposer's clamp and B2's drift vote rule (`HotStuff`). A bridge reads it (guardian-set
+    /// expiry, the mint-cap day); so does perps (each block's `Close` carries it and the engine's
+    /// funding runs on it). Neither section: block time constrains nothing, as before.
+    pub fn bounds_block_time(&self) -> bool {
+        self.bridge.is_some() || self.perps.is_some()
     }
 
     /// The public segment an `Invoke`'s call proof is made over and verified against (RPL-2,
@@ -2183,7 +2250,12 @@ impl Ledger {
             // `Invoke` may set all three: `burn_r` and `burn_a` are what comes into the program's
             // vault (or, for the program's own token, what is destroyed), and
             // `program_state::validate` decides which.
-            Action::TokenBurn { .. } | Action::BridgeBurn { .. } | Action::Invoke { .. } => {}
+            // RPL-3: a `PerpDeposit` burns the perps collateral — RAND through `burn_r`, or a
+            // token through `burn_a` — which `perps::validate` holds to the section's asset.
+            Action::TokenBurn { .. }
+            | Action::BridgeBurn { .. }
+            | Action::Invoke { .. }
+            | Action::PerpDeposit { .. } => {}
             // Multisig: a create and a deposit may set all three, like an `Invoke`; the module's
             // own rules decide what the burn funds (`multisig::validate`, after its gate).
             Action::CreateMultisig { .. } | Action::MultisigDeposit { .. } => {}
@@ -2377,6 +2449,12 @@ impl Ledger {
         executor: &dyn ConfidentialExecutor,
         verified_proofs: &dyn VerifiedProofs,
     ) -> Result<Verified, TxError> {
+        // RPL-3: the `perps` gate comes before any other check of a state proof — every size cap
+        // included — so a chain without the section refuses each one as `Disabled`, whatever it
+        // carries. (Its other rules are `perps::validate`'s, at step 7.)
+        if matches!(tx.action, Action::PerpStateProof { .. }) && self.perps.is_none() {
+            return Err(perps::PerpError::Disabled.into());
+        }
         // 1. size caps
         //
         // The whole transaction first: a transaction bigger than a block can never be mined, and
@@ -2464,7 +2542,10 @@ impl Ledger {
             Action::Deploy { public, .. } if public.len() > self.max_program_public_words => {
                 return Err(TxError::ProgramPublicTooLarge)
             }
-            Action::Call { proof, .. } | Action::Invoke { proof, .. } if proof.len() > self.max_proof_bytes => {
+            // RPL-3: a state proof's STARK is held to the same cap as a call's.
+            Action::Call { proof, .. } | Action::Invoke { proof, .. } | Action::PerpStateProof { proof, .. }
+                if proof.len() > self.max_proof_bytes =>
+            {
                 return Err(TxError::ProofTooLarge)
             }
             Action::BridgeAttest { attestation, .. } if attestation.len() > gas::MAX_ATTESTATION_BYTES => {
@@ -2538,6 +2619,8 @@ impl Ledger {
         // 7. action-specific cheap checks
         let mut verified = Verified::default();
         let mut call_record = None;
+        // RPL-3: the segment a `PerpStateProof`'s STARK must verify against (step 10).
+        let mut perp_segment: Option<Vec<u32>> = None;
         match &tx.action {
             Action::None => {}
             Action::Mint { cm, pk, time, r, envelope, amount, minter, signature } => {
@@ -2706,6 +2789,18 @@ impl Ledger {
                 // `apply_block`.
                 return Err(TxError::AggregateNeedsCovered);
             }
+            // RPL-3. Gated absolutely on the `perps` genesis section, which `perps::validate`
+            // checks before anything else it does; the signature is the last thing it looks at.
+            // A deposit's bundle proof is the common path's, after this; a state proof's STARK
+            // is step 10's, over the segment returned here.
+            a @ (Action::PerpDeposit { .. }
+            | Action::PerpOrder { .. }
+            | Action::PerpCancel { .. }
+            | Action::PerpWithdraw { .. }
+            | Action::PerpOracle { .. }
+            | Action::PerpStateProof { .. }) => {
+                perp_segment = perps::validate(self, tx, a, executor)?;
+            }
         }
         // 7b. under genesis `hardening_v6`, the canonical-proof rules (INT-5, VERIFIER-1/-2): a
         // header or transcript field the honest prover would not write — one the verifier accepts
@@ -2773,6 +2868,12 @@ impl Ledger {
                 return Err(TxError::FeeTooLow { min, fee });
             }
             verified.call = Some(outcome);
+        }
+        // RPL-3: a state proof's STARK, last — decoded on a verified-set hit, as a call's is. Its
+        // segment holds this ledger's proved root and digests, and the decode path still compares
+        // the proof's `H_PUB` with it, so the verdict stands only for the state it is applied on.
+        if let Some(segment) = &perp_segment {
+            perps::verify_state_proof(self, &tx.action, segment, executor, admitted)?;
         }
         Ok(verified)
     }
@@ -3082,6 +3183,17 @@ impl Ledger {
                 // the same so a direct caller hears where aggregates go.
                 return Err(TxError::AggregateNeedsCovered);
             }
+            // RPL-3: record the input (or, for an oracle, the submission; for a state proof,
+            // advance the proved root and pay the withdrawals). Every refusal was decided by
+            // `validate_inner`.
+            a @ (Action::PerpDeposit { .. }
+            | Action::PerpOrder { .. }
+            | Action::PerpCancel { .. }
+            | Action::PerpWithdraw { .. }
+            | Action::PerpOracle { .. }
+            | Action::PerpStateProof { .. }) => {
+                perps::apply(self, tx, a, executor)?;
+            }
         }
         Ok(receipt)
     }
@@ -3130,6 +3242,9 @@ impl Ledger {
         // The deposits reported after a block are exactly that block's (see `Deposit`).
         scratch.deposits.clear();
         scratch.paid_aggregates.clear();
+        // RPL-3: and the perp input words reported after a block are that block's too
+        // (`close_block` sets them; a scratch must not carry the parent's).
+        scratch.take_perp_block_words();
         // A side table is a peer's wire input: every record must be the `pv::NUM`-word list the
         // covering aggregate's admission and the digest check below index into, checked here
         // once, before any transaction is read.
@@ -3275,19 +3390,20 @@ impl Ledger {
         if !self.validators.contains_key(&proposer) {
             return Err(BlockError::UnknownProposer(proposer));
         }
+        // (`bounds_block_time`: a bridge, or RPL-3's perps, whose `Close` records carry it.)
         // Time bounds validity only where it is consensus input, so a chain without a bridge
         // keeps byte-identical validity rules. With one, block time decides guardian-set expiry
         // (`bridge_notes::validate` → `check_attest(.., self.now_secs())`) and stamps outbound
         // burn messages, so a leader that could rewind it could keep a superseded — possibly
         // compromised — set admissible past its grace window. `HotStuff::propose` already emits
         // `max(now_ms, parent.timestamp_ms)`, so no honest leader builds a block this refuses.
-        if self.bridge.is_some() && block.header.timestamp_ms < self.timestamp_ms {
+        if self.bounds_block_time() && block.header.timestamp_ms < self.timestamp_ms {
             return Err(BlockError::TimestampRewind { parent: self.timestamp_ms, block: block.header.timestamp_ms });
         }
         // B2, the forward bound: a leader cannot leap the clock either (to expire a rotated
         // guardian set's grace window, or skip a mint-cap day). `HotStuff::propose` clamps to
         // `parent + MAX_TIMESTAMP_STEP_MS`, so no honest leader builds a block this refuses.
-        if self.bridge.is_some() && block.header.timestamp_ms > self.timestamp_ms.saturating_add(MAX_TIMESTAMP_STEP_MS) {
+        if self.bounds_block_time() && block.header.timestamp_ms > self.timestamp_ms.saturating_add(MAX_TIMESTAMP_STEP_MS) {
             return Err(BlockError::TimestampLeap {
                 parent: self.timestamp_ms,
                 block: block.header.timestamp_ms,
@@ -3300,7 +3416,7 @@ impl Ledger {
         let data = scratch.apply_transactions_for_sync(&block.transactions, &proposer, covered, pruned, executor, verified_proofs)?;
         let call_gas = data.iter().fold(0u64, |a, (_, r)| a.saturating_add(r.gas_used));
         let (bytes_used, gas_used) = scratch.block_usage(&block.transactions, call_gas);
-        scratch.close_block(block.height(), &proposer, bytes_used, gas_used);
+        scratch.close_block(block.height(), &proposer, bytes_used, gas_used, executor);
         let computed = scratch.state_root();
         if computed != block.header.state_root {
             // Components, not just the composite: the divergence names the ledger half it
@@ -3342,7 +3458,18 @@ impl Ledger {
     /// price by this block's fullness — `gas_price` by `gas_used` against `target_block_gas`,
     /// `byte_price` by `bytes_used` against `target_block_bytes` ([`gas::next_price`]) — before
     /// the root, so the header commits to the prices the next block pays. A no-op without it.
-    pub fn close_block(&mut self, height: u64, proposer: &Address, bytes_used: u64, gas_used: u64) {
+    ///
+    /// RPL-3: under the `perps` section the block's perp inputs are closed — the oracle medians
+    /// computed, the `Close` record appended and the digest `D_h` recorded — before the anchor
+    /// (`perps::close_block`; the executor hashes the digest). A no-op without it.
+    pub fn close_block(
+        &mut self,
+        height: u64,
+        proposer: &Address,
+        bytes_used: u64,
+        gas_used: u64,
+        executor: &dyn ConfidentialExecutor,
+    ) {
         self.sweep_expired_excesses(height, proposer);
         if let Some(d) = self.gas.as_ref().and_then(|g| g.dynamic.as_ref()) {
             let p = self.gas_prices();
@@ -3372,6 +3499,9 @@ impl Ledger {
         let now = self.now_secs();
         if let Some(bridge) = self.bridge.as_mut() {
             bridge.activate_due_rotations(now);
+        }
+        if self.perps.is_some() {
+            perps::close_block(self, height, executor);
         }
         self.record_anchor(height);
         // Spec §12's invariant, checked once per block in a debug build: every bridged token's
@@ -3470,6 +3600,10 @@ impl Ledger {
             Some(p) => format!("{:?}", p.root()),
             None => "none".into(),
         };
+        let perps = match &self.perps {
+            Some(p) => format!("{:?}", p.root()),
+            None => "none".into(),
+        };
         let msig = match &self.multisig {
             Some(m) => format!("{:?}", m.root()),
             None => "none".into(),
@@ -3479,7 +3613,7 @@ impl Ledger {
             self.tree.root(),
             self.gas_prices(),
             self.admitted_root()
-        ) + &format!(" jailed {:?}", self.jailed_root())
+        ) + &format!(" jailed {:?} perps {perps}", self.jailed_root())
             + &format!(
                 " nullifier range {}",
                 match &self.nullifier_mmr {
@@ -3592,8 +3726,17 @@ impl Ledger {
     /// [`Ledger::state_root`] before audit v6's wrappers: the `rand-state-2` … `rand-state-7`
     /// layouts, exactly as every chain through 18 commits them, and RPL-2's `rand-state-8` (the
     /// program-state root appended last) under a `program_state` section, which no chain through
-    /// 19 carries.
+    /// 19 carries. RPL-3's `rand-state-9` appends the perps root after that, under a `perps`
+    /// section.
     fn state_root_base(&self) -> Hash {
+        let (domain, buf) = self.state_root_preimage();
+        Hash::digest_domain(domain, &buf)
+    }
+
+    /// The domain and the bytes [`Ledger::state_root_base`] hashes, split out so a test can hold
+    /// one layout to another (RPL-3: `rand-state-9` is exactly the bytes the chain without the
+    /// section commits, then the perps root).
+    fn state_root_preimage(&self) -> (&'static [u8], Vec<u8>) {
         let (nf_root, val_root, prog_root) = self.state_root_leaves();
         let mut buf = Vec::with_capacity(128);
         buf.extend_from_slice(&word8_to_bytes(&self.tree.root()));
@@ -3637,24 +3780,30 @@ impl Ledger {
         // without one keeps its domain and bytes.
         if let Some(p) = &self.program_state {
             buf.extend_from_slice(p.root().as_bytes());
-            return Hash::digest_domain(b"rand-state-8", &buf);
         }
-        if dynamic {
-            return Hash::digest_domain(b"rand-state-7", &buf);
+        // RPL-3: the perps root after everything else, the program-state root included,
+        // re-domained `rand-state-9`. Only under the `perps` section, so every chain without one
+        // keeps its domain and bytes.
+        if let Some(p) = &self.perps {
+            buf.extend_from_slice(p.root().as_bytes());
+            return (b"rand-state-9", buf);
         }
-        if self.vesting.is_some() {
-            return Hash::digest_domain(b"rand-state-6", &buf);
-        }
-        if self.staking.is_some() {
-            return Hash::digest_domain(b"rand-state-5", &buf);
-        }
-        if self.tokens.is_some() {
-            return Hash::digest_domain(b"rand-state-4", &buf);
-        }
-        if self.aggregation.is_some() {
-            return Hash::digest_domain(b"rand-state-3", &buf);
-        }
-        Hash::digest_domain(b"rand-state-2", &buf)
+        let domain: &'static [u8] = if self.program_state.is_some() {
+            b"rand-state-8"
+        } else if dynamic {
+            b"rand-state-7"
+        } else if self.vesting.is_some() {
+            b"rand-state-6"
+        } else if self.staking.is_some() {
+            b"rand-state-5"
+        } else if self.tokens.is_some() {
+            b"rand-state-4"
+        } else if self.aggregation.is_some() {
+            b"rand-state-3"
+        } else {
+            b"rand-state-2"
+        };
+        (domain, buf)
     }
 }
 
@@ -4238,6 +4387,9 @@ pub(crate) mod tests {
         }
         fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
             StubExecutor.node_hash(left, right)
+        }
+        fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+            StubExecutor.hash_domain(domain, msg)
         }
         fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
             StubExecutor.note_commitment(pk, from, amount, asset, time, r)
@@ -5055,6 +5207,9 @@ pub(crate) mod tests {
         fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
             StubExecutor.node_hash(left, right)
         }
+        fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+            StubExecutor.hash_domain(domain, msg)
+        }
         fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
             StubExecutor.note_commitment(pk, from, amount, asset, time, r)
         }
@@ -5367,6 +5522,9 @@ pub(crate) mod tests {
         }
         fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
             StubExecutor.node_hash(left, right)
+        }
+        fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+            StubExecutor.hash_domain(domain, msg)
         }
         fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
             StubExecutor.note_commitment(pk, from, amount, asset, time, r)
@@ -5824,6 +5982,74 @@ pub(crate) mod tests {
         plain.set_timestamp_ms(1_000_000);
         plain.apply_block(&empty(&plain, 2, 999_999), &StubExecutor).unwrap();
         assert_eq!(plain.timestamp_ms(), 999_999);
+    }
+
+    /// Task 3 review (ruled): a perps chain's block time is consensus input too — the `Close`
+    /// record carries it and the engine's funding runs on it — so a perps ledger refuses a
+    /// rewind and a leap exactly as a bridged one does. `bounds_block_time` is the one switch.
+    #[test]
+    fn a_perps_chain_bounds_block_time_like_a_bridged_one() {
+        let (a, _) = keys();
+        let empty = |l: &Ledger, height: u64, timestamp_ms: u64| {
+            let header = BlockHeader {
+                height,
+                view: height,
+                parent: Hash::ZERO,
+                proposer: a.public_key().clone(),
+                timestamp_ms,
+                tx_root: Block::tx_root(&[]),
+                // The block-end steps `apply_block` runs, the perps close among them.
+                state_root: {
+                    let mut scratch = l.clone();
+                    scratch.set_height(height);
+                    scratch.set_timestamp_ms(timestamp_ms);
+                    scratch.close_block(height, &a.address(), 0, 0, &StubExecutor);
+                    scratch.state_root()
+                },
+                justify: QuorumCertificate::genesis(Hash::ZERO),
+            };
+            Block::sign(&crate::types::SigningDomain::v0(Hash::ZERO), header, Vec::new(), &a)
+        };
+        let config = perps::PerpsConfig {
+            collateral_asset: 0,
+            max_tier: 16,
+            max_window_blocks: 8,
+            max_block_inputs: 64,
+            min_deposit: 0,
+            engine_hc: [9; 8],
+            genesis_root: [8; 8],
+            markets: vec![perps::MarketSpec {
+                id: 0,
+                symbol: "X-PERP".into(),
+                lot: 1,
+                tick: 1,
+                max_leverage: 10,
+                maintenance_bps: 500,
+                taker_fee_bps: 5,
+                maker_fee_bps: 2,
+            }],
+        };
+        assert!(!ledger().bounds_block_time());
+        let mut l = ledger();
+        l.set_perps(Some(perps::Perps::from_config(&config)));
+        assert!(l.bounds_block_time());
+        l.set_timestamp_ms(1_000_000);
+        assert_eq!(
+            l.apply_block(&empty(&l, 2, 999_999), &StubExecutor),
+            Err(BlockError::TimestampRewind { parent: 1_000_000, block: 999_999 })
+        );
+        assert_eq!(
+            l.apply_block(&empty(&l, 2, 1_060_001), &StubExecutor),
+            Err(BlockError::TimestampLeap { parent: 1_000_000, block: 1_060_001, max_step: MAX_TIMESTAMP_STEP_MS })
+        );
+        assert_eq!(l.timestamp_ms(), 1_000_000, "refused blocks leave the ledger where it was");
+        l.apply_block(&empty(&l, 2, 1_060_000), &StubExecutor).unwrap();
+        assert_eq!(l.perps().unwrap().pending_heights(), vec![2], "the block closed its perp inputs");
+        // Neither section: both blocks apply, as they always did.
+        let mut plain = ledger();
+        plain.set_timestamp_ms(1_000_000);
+        plain.apply_block(&empty(&plain, 2, 999_999), &StubExecutor).unwrap();
+        plain.apply_block(&empty(&plain, 3, 1_100_000), &StubExecutor).unwrap();
     }
 
     /// B2 (bridge hardening spec §3): on a bridged chain a block may run at most
@@ -6402,6 +6628,9 @@ pub(crate) mod tests {
             fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
                 StubExecutor.node_hash(left, right)
             }
+            fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+                StubExecutor.hash_domain(domain, msg)
+            }
             fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
                 StubExecutor.note_commitment(pk, from, amount, asset, time, r)
             }
@@ -6591,7 +6820,7 @@ pub(crate) mod tests {
         all.set_gas(Some(cfg.clone()));
         let (bytes, _) = all.block_usage(&transfers, 0);
         assert_eq!(bytes as usize, total);
-        all.close_block(1, &proposer, bytes, 0);
+        all.close_block(1, &proposer, bytes, 0, &StubExecutor);
         assert_eq!(all.gas_prices().byte_price, gas::next_price(800, 800, bytes, 10_485_760, 1250));
         assert_eq!(all.gas_prices().byte_price, 890, "chain 18: 1.9× the target, +11.25 % on a block of transfers");
         // `paying`: the same block is zero bytes to the controller, and the price falls instead.
@@ -6601,7 +6830,7 @@ pub(crate) mod tests {
         paying.set_gas_prices(gas::GasPrices { gas_price: 100, byte_price: 1_000 });
         let (bytes, gas_used) = paying.block_usage(&transfers, 0);
         assert_eq!((bytes, gas_used), (0, 7 * gas::gas_max(14, 0, 0)), "no call bytes; the bundles' flat gas as before");
-        paying.close_block(1, &proposer, bytes, gas_used);
+        paying.close_block(1, &proposer, bytes, gas_used, &StubExecutor);
         assert_eq!(paying.gas_prices().byte_price, 875, "an empty block to the byte meter: −12.5 %");
         // A call's proof and envelope are what count: exactly `call_bytes`, whatever rides beside it.
         let (mut with_call, id) = ledger_with_program(|l| l.set_gas(Some(cfg.clone())));
@@ -6613,7 +6842,7 @@ pub(crate) mod tests {
         assert_eq!(bytes as usize, gas::call_bytes(&proof, None));
         assert!(bytes < call.encoded_len() as u64, "the call's own fee bundle is not charged either");
         with_call.set_gas_prices(gas::GasPrices { gas_price: 100, byte_price: 1_000 });
-        with_call.close_block(1, &proposer, bytes, 0);
+        with_call.close_block(1, &proposer, bytes, 0, &StubExecutor);
         let expected = gas::next_price(1_000, 800, bytes, 10_485_760, 1250);
         assert!(expected < 1_000, "6 MiB of call bytes is under the 10 MiB target");
         assert_eq!(with_call.gas_prices().byte_price, expected);
@@ -6648,14 +6877,14 @@ pub(crate) mod tests {
             for h in 1..=12 {
                 let (bytes, gas_used) = a.block_usage(&block, 40_000);
                 assert_eq!((bytes, gas_used), b.block_usage(&block, 40_000), "{byte_load:?}");
-                a.close_block(h, &proposer, bytes, gas_used);
-                b.close_block(h, &proposer, bytes, gas_used);
+                a.close_block(h, &proposer, bytes, gas_used, &StubExecutor);
+                b.close_block(h, &proposer, bytes, gas_used, &StubExecutor);
                 assert_eq!(a.gas_prices(), b.gas_prices(), "{byte_load:?} block {h}");
                 assert_eq!(a.state_root(), b.state_root(), "{byte_load:?} block {h}");
             }
             assert_eq!(a.gas_prices(), gas::GasPrices { gas_price: 150, byte_price: 1_000 }, "{byte_load:?}: at both ceilings");
             // And falls from the ceiling on an empty block.
-            a.close_block(13, &proposer, 0, 0);
+            a.close_block(13, &proposer, 0, 0, &StubExecutor);
             assert_eq!(a.gas_prices(), gas::GasPrices { gas_price: 131, byte_price: 875 }, "{byte_load:?}: −12.5 %, floor division");
         }
     }
@@ -6677,7 +6906,7 @@ pub(crate) mod tests {
         for l in [&mut a, &mut b] {
             l.apply_tx(&tx, &proposer, &StubExecutor).unwrap();
             // B1/B3 have not landed: the call's own gas is driven directly here.
-            l.close_block(1, &proposer, tx.encoded_len() as u64, 40_000 + gas::gas_max(14, 0, 0));
+            l.close_block(1, &proposer, tx.encoded_len() as u64, 40_000 + gas::gas_max(14, 0, 0), &StubExecutor);
         }
         assert_eq!(a.gas_prices(), b.gas_prices());
         assert_eq!(a.state_root(), b.state_root());
@@ -6685,14 +6914,14 @@ pub(crate) mod tests {
         assert!(a.gas_prices().gas_price > 100, "gas above target raised the gas price");
         // An empty block lowers each price toward its floor and never below.
         for h in 2..40 {
-            a.close_block(h, &proposer, 0, 0);
+            a.close_block(h, &proposer, 0, 0, &StubExecutor);
         }
         assert_eq!(a.gas_prices(), gas::GasPrices { gas_price: 100, byte_price: 800 });
         // A chain without `dynamic` never moves and keeps rand-state-6's root shape.
         let (fixed, _) = ledger_with_program(|l| l.set_gas(Some(gas::GasConfig { dynamic: None, ..dynamic_gas() })));
         let r = fixed.state_root();
         let mut f = fixed.clone();
-        f.close_block(1, &proposer, 1 << 30, 1 << 30);
+        f.close_block(1, &proposer, 1 << 30, 1 << 30, &StubExecutor);
         assert_eq!(f.gas_prices(), gas::GasPrices { gas_price: 100, byte_price: 800 });
         assert_eq!(f.state_root(), r, "without `dynamic` the prices are not in the root and never move");
     }
@@ -6714,8 +6943,8 @@ pub(crate) mod tests {
         // At the target on both meters: the prices hold, and so does the root (the anchor aside).
         let mut held = dynamic.clone();
         let mut moved = dynamic.clone();
-        held.close_block(1, &proposer, 4096, 20_000);
-        moved.close_block(1, &proposer, 4096, 40_000);
+        held.close_block(1, &proposer, 4096, 20_000, &StubExecutor);
+        moved.close_block(1, &proposer, 4096, 40_000, &StubExecutor);
         assert_eq!(held.gas_prices(), dynamic.gas_prices());
         assert_ne!(moved.gas_prices(), dynamic.gas_prices());
         assert_ne!(moved.state_root(), held.state_root(), "moved prices move the root");
@@ -6835,7 +7064,13 @@ pub(crate) mod tests {
         expect.apply_tx(&tx, &a0.address(), &StubExecutor).unwrap();
         // The call's declared limit (a stub tier-12 proof declares `gas_max(12, 0, 0)`) plus the
         // one bundle's `bundle_gas_limit`.
-        expect.close_block(2, &a0.address(), tx.encoded_len() as u64, gas::gas_max(12, 0, 0) + gas::gas_max(14, 0, 0));
+        expect.close_block(
+            2,
+            &a0.address(),
+            tx.encoded_len() as u64,
+            gas::gas_max(12, 0, 0) + gas::gas_max(14, 0, 0),
+            &StubExecutor,
+        );
         let block = signed_block(vec![tx], &a0, 2, expect.state_root());
         let mut replica = l.clone();
         replica.apply_block(&block, &StubExecutor).unwrap();
@@ -6952,6 +7187,9 @@ pub(crate) mod tests {
             fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
                 StubExecutor.node_hash(left, right)
             }
+            fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+                StubExecutor.hash_domain(domain, msg)
+            }
             fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
                 StubExecutor.note_commitment(pk, from, amount, asset, time, r)
             }
@@ -7049,7 +7287,7 @@ pub(crate) mod tests {
         let mut expect = l.clone();
         expect.set_height(2);
         expect.apply_tx(&tx, &a0.address(), &StubExecutor).unwrap();
-        expect.close_block(2, &a0.address(), tx.encoded_len() as u64, 40_000 + gas::gas_max(14, 0, 0));
+        expect.close_block(2, &a0.address(), tx.encoded_len() as u64, 40_000 + gas::gas_max(14, 0, 0), &StubExecutor);
         let block = signed_block(vec![tx], &a0, 2, expect.state_root());
         let mut replica = l.clone();
         replica.apply_block(&block, &StubExecutor).unwrap();
@@ -7221,7 +7459,7 @@ pub(crate) mod tests {
                 }
             }
             let (bytes, gas_used) = next.block_usage(&txs, call_gas);
-            next.close_block(h, &p, bytes, gas_used);
+            next.close_block(h, &p, bytes, gas_used, &StubExecutor);
             let block = signed_block(txs, &a, h, next.state_root());
             (next, block)
         };
@@ -7331,7 +7569,7 @@ pub(crate) mod tests {
                             call_gas += r.gas_used;
                         }
                         let (bytes, gas_used) = after.block_usage(std::slice::from_ref(&t), call_gas);
-                        after.close_block(2, &p, bytes, gas_used);
+                        after.close_block(2, &p, bytes, gas_used, &StubExecutor);
 
                         let kept = after.validators()[&p].rewards - l.validators()[&p].rewards;
                         let fee_burned = after.base_fees_burned() - l.base_fees_burned();
@@ -7399,7 +7637,7 @@ pub(crate) mod tests {
         let tip = 4_321;
         let t = call_tx(&l, 20, id, proof, floor + tip);
         l.apply_tx(&t, &recorder, &StubExecutor).unwrap();
-        l.close_block(2, &recorder, 0, 0);
+        l.close_block(2, &recorder, 0, 0, &StubExecutor);
         assert_eq!(l.unsealed_fees().get(&t.hash()), Some(&(tip, recorder, 4)), "fee − floor bucketed to the recorder, until 2 + 2");
         assert_eq!(l.validators()[&recorder].rewards, 0, "the recorder kept nothing at inclusion");
         assert_eq!(l.base_fees_burned(), floor, "the whole floor burned");
@@ -7412,7 +7650,7 @@ pub(crate) mod tests {
         for h in [3u64, 4] {
             let mut next = l.clone();
             next.set_height(h);
-            next.close_block(h, &committing, 0, 0);
+            next.close_block(h, &committing, 0, 0, &StubExecutor);
             let block = signed_block(vec![], &a, h, next.state_root());
             l.apply_block(&block, &StubExecutor).unwrap();
             if h == 3 {
@@ -7512,7 +7750,7 @@ pub(crate) mod tests {
                                 call_gas += r.gas_used;
                             }
                             let (bytes, gas_used) = after.block_usage(std::slice::from_ref(&t), call_gas);
-                            after.close_block(2, &p, bytes, gas_used);
+                            after.close_block(2, &p, bytes, gas_used, &StubExecutor);
 
                             let kept = after.validators()[&p].rewards - l.validators()[&p].rewards;
                             let burned = after.base_fees_burned() - l.base_fees_burned();
@@ -7617,6 +7855,9 @@ pub(crate) mod tests {
         }
         fn public_digest(&self, words: &[u32]) -> crate::notes::Word8 {
             StubExecutor.public_digest(words)
+        }
+        fn hash_domain(&self, domain: u32, msg: &[u32]) -> crate::notes::Word8 {
+            StubExecutor.hash_domain(domain, msg)
         }
         fn node_hash(&self, left: &crate::notes::Word8, right: &crate::notes::Word8) -> crate::notes::Word8 {
             StubExecutor.node_hash(left, right)

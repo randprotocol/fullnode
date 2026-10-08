@@ -55,6 +55,7 @@ fn genesis(validator: &Keypair) -> Genesis {
         multisig: None,
         fees: None,
         incremental_nullifier_root: None,
+        perps: None,
     }
 }
 

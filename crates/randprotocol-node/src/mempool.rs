@@ -314,6 +314,9 @@ pub struct Mempool {
     /// `--gas-price`/`--byte-price`. `None` — a pool nobody configured, every unit test's — is no
     /// policy, the ledger's own `fee_floor` alone.
     gas_policy: Option<randprotocol_core::gas::GasPolicy>,
+    /// RPL-3 (final fix wave, I1): the pooled `PerpStateProof` holding the pool's one reserved
+    /// slot ([`Mempool::takes_reserved_slot`]), if any.
+    reserved_proof: Option<Hash>,
 }
 
 /// Every commitment `tx` claims: the ones it carries, plus the deposit `ledger` would derive for
@@ -353,7 +356,19 @@ impl Mempool {
             max_size,
             faucet_minters: None,
             gas_policy: None,
+            reserved_proof: None,
         }
+    }
+
+    /// Whether `tx` is admitted into the pool's reserved slot (RPL-3 final fix wave, I1): a
+    /// `PerpStateProof` while no other holds it. A state proof is bundle-less and fee-less, as an
+    /// order is, so under the caps it tied with every free order — a pool full of them refused
+    /// the one transaction that settles the exchange (and pays its withdrawals). The slot's
+    /// proof is outside the count and byte caps, as a governance action is, and never evicted to
+    /// make room; it is one entry, and it verified before it was pooled. A second proof while
+    /// the slot is held is pooled like anything else.
+    fn takes_reserved_slot(&self, tx: &Transaction) -> bool {
+        matches!(tx.action, Action::PerpStateProof { .. }) && self.reserved_proof.is_none()
     }
 
     /// Admit faucet `Mint`s only from `minters` (`admission::faucet_minters`). The node calls this
@@ -485,7 +500,7 @@ impl Mempool {
     /// exempt from the cap as from the count cap — admitted past it and never taken to make room
     /// — and their bytes still count, as their entries count towards the count cap.
     fn make_room(&self, tx: &Transaction, floor: u64, ledger: &Ledger) -> Result<Vec<Hash>, MempoolError> {
-        if is_governance(&tx.action) {
+        if is_governance(&tx.action) || self.takes_reserved_slot(tx) {
             return Ok(Vec::new());
         }
         let cap = ledger.max_block_bytes().saturating_mul(MAX_POOL_BLOCKS);
@@ -498,7 +513,7 @@ impl Mempool {
         let mut below: Vec<((u128, u64), &Hash, usize)> = self
             .txs
             .iter()
-            .filter(|(_, p)| !is_governance(&p.tx.action))
+            .filter(|(h, p)| !is_governance(&p.tx.action) && self.reserved_proof != Some(**h))
             .map(|(h, p)| ((surplus_per_kib(p.tx.fee(), Self::current_floor(p, ledger), p.len), p.tx.fee()), h, p.len))
             .filter(|(k, _, _)| *k < key)
             .collect();
@@ -573,7 +588,9 @@ impl Mempool {
         // safe because their nonce claims, checked above, already bound each of the two roles to
         // **one** pooled transaction at a time: the exemption can add at most two entries past
         // the cap, not an unbounded flood.
-        if !is_governance(&tx.action) && self.txs.len() >= self.max_size {
+        // RPL-3's reserved slot is outside it too (I1, [`Mempool::takes_reserved_slot`]): one
+        // state proof, so a pool full of free orders cannot keep out the proof that settles them.
+        if !is_governance(&tx.action) && !self.takes_reserved_slot(tx) && self.txs.len() >= self.max_size {
             return Err(MempoolError::Full);
         }
         let bridge_rotation = match &tx.action {
@@ -698,6 +715,9 @@ impl Mempool {
         for mu in tx.bridge_digests() {
             self.digests.insert(mu, hash);
         }
+        if self.takes_reserved_slot(&tx) {
+            self.reserved_proof = Some(hash);
+        }
         let len = tx.encoded_len();
         self.bytes += len;
         // `pool_conflicts` refuses a hash already pooled, so nothing is replaced here; if that
@@ -766,9 +786,20 @@ impl Mempool {
         let priced = self.gas_policy.is_some() || ledger.gas().is_some();
         // The surplus is over the floor on this tip, not the one the entry was admitted at.
         let surplus_per_kib = |p: &Pooled, floor: u64| if priced { surplus_per_kib(p.tx.fee(), floor, p.len) } else { 0 };
+        // RPL-3 (I1): a state proof ranks after governance and ahead of fee order — fee-less, it
+        // would otherwise sort behind every paying transaction and tie with every free order.
+        let rank = |a: &Action| {
+            if is_governance(a) {
+                2u8
+            } else if matches!(a, Action::PerpStateProof { .. }) {
+                1
+            } else {
+                0
+            }
+        };
         ready.sort_by(|a, b| {
-            is_governance(&b.1.tx.action)
-                .cmp(&is_governance(&a.1.tx.action))
+            rank(&b.1.tx.action)
+                .cmp(&rank(&a.1.tx.action))
                 .then_with(|| surplus_per_kib(b.1, b.2).cmp(&surplus_per_kib(a.1, a.2)))
                 .then_with(|| b.1.tx.fee().cmp(&a.1.tx.fee()))
                 .then_with(|| a.0.cmp(b.0))
@@ -1069,6 +1100,12 @@ impl Mempool {
         // than be offered to, and fail, every block until its anchor scrolls out. The ledger's
         // own rules, asked through its own function: map lookups and compares, no hash.
         randprotocol_core::ledger::program_state::still_applies(ledger, tx)?;
+        // RPL-3: a perp action goes stale the same way — its nonce used by a sibling that
+        // committed first, its account's or validator's slot moved, a withdrawal's time out of
+        // the window, a state proof's window no longer starting at the proved height or a
+        // payout's request already paid. The ledger's own rules again, minus the signature and
+        // the proof: map lookups and compares.
+        randprotocol_core::ledger::perps::still_applies(ledger, tx)?;
         // Multisig, the same rule one register over: a pooled pay was checked against its
         // account's rows at admission, and a pay those rows no longer cover must leave here
         // rather than be offered to, and fail, every block (`VaultShort`). Today only a pay moves
@@ -1112,6 +1149,9 @@ impl Mempool {
     fn remove_one(&mut self, hash: &Hash) -> Option<Transaction> {
         let p = self.txs.remove(hash)?;
         self.bytes -= p.len;
+        if self.reserved_proof == Some(*hash) {
+            self.reserved_proof = None;
+        }
         for nf in p.tx.nullifiers() {
             // Only withdraw the index entries this transaction owns: a conflicting one was never
             // admitted, so an entry pointing elsewhere cannot exist, but checking keeps the two
@@ -3618,6 +3658,124 @@ mod tests {
         assert_eq!(m.candidates(&after, 10), vec![], "never offered again");
         m.prune(&after);
         assert!(m.is_empty(), "the stale invoke left the pool at the tip that made it stale");
+    }
+
+    // ---------------------------------- RPL-3: perp actions
+
+    /// Two withdrawal requests on one nonce of one account are both valid at the tip, so both
+    /// are held; once one is mined the other's nonce is used, and it leaves at the prune with the
+    /// ledger's own verdict — not cached, since the nonce is state.
+    #[test]
+    fn a_perp_action_whose_nonce_a_sibling_used_is_pruned() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx, perp_withdraw_tx};
+        use randprotocol_core::ledger::perps::PerpError;
+        let gs = fixtures::perps_genesis(7);
+        let mut l = gs.ledger.clone();
+        let trader = key(50);
+        let deposit = perp_deposit_tx(&l, &trader, 300, 5_000_000);
+        make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
+        let a = perp_withdraw_tx(7, &trader, 1, 1_000, 1);
+        let b = perp_withdraw_tx(7, &trader, 1, 2_000, 1);
+        let mut m = Mempool::new(100);
+        for tx in [&a, &b] {
+            m.insert(tx.clone(), &l, &StubExecutor).unwrap();
+        }
+        assert_eq!(m.len(), 2);
+        let mut after = l.clone();
+        after.apply_transactions(std::slice::from_ref(&a), &key(1).address(), &StubExecutor).unwrap();
+        m.remove(&[a.hash()]);
+        let used = TxError::Perps(PerpError::NonceUsed);
+        assert_eq!(Mempool::applies(&b, &b.commitments(), None, &after).unwrap_err(), used);
+        assert!(!crate::admission::is_permanent(&used));
+        assert_eq!(m.candidates(&after, 10), vec![], "never offered again");
+        m.prune(&after);
+        assert!(m.is_empty(), "the stale request left the pool at the tip that made it stale");
+    }
+
+    /// A trader's signed order at `nonce` (fee 0, bundle-less), for the RPL-3 pool tests.
+    fn perp_order_tx(k: &randprotocol_core::Keypair, nonce: u64) -> Transaction {
+        use randprotocol_core::ledger::perps::{account_id, PerpOrderBody};
+        let body =
+            PerpOrderBody { nonce, market: 0, side: 0, kind: 0, tif: 0, reduce_only: false, price: 2_000_000, size: 1_000_000 };
+        fixtures::perp_signed(
+            7,
+            k,
+            Action::PerpOrder { account: account_id(k.public_key()), body, signature: randprotocol_core::Signature::empty() },
+        )
+    }
+
+    /// RPL-3 final fix wave, I1: a state proof has one reserved slot. A pool full of free orders
+    /// admits it past the count cap, never evicts it to make room, and offers it ahead of them;
+    /// a second proof while the slot is held is pooled like anything else (here: `Full`), and the
+    /// slot is free again once its proof leaves.
+    #[test]
+    fn a_state_proof_has_a_reserved_slot_above_free_orders() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx, perp_state_proof_tx};
+        let gs = fixtures::perps_genesis(7);
+        let mut l = gs.ledger.clone();
+        let trader = key(50);
+        let deposit = perp_deposit_tx(&l, &trader, 300, 5_000_000);
+        let b1 = make_perps_block(&gs.block, &mut l, vec![deposit], &key(1));
+        make_perps_block(&b1, &mut l, vec![], &key(1));
+        let mut m = Mempool::new(3);
+        for n in 1..=3 {
+            m.insert(perp_order_tx(&trader, n), &l, &StubExecutor).unwrap();
+        }
+        assert_eq!(m.insert(perp_order_tx(&trader, 4), &l, &StubExecutor), Err(MempoolError::Full), "the pool is full");
+        let proof = perp_state_proof_tx(&l, 2, [7; 8], vec![], 0);
+        assert_eq!(proof.fee(), 0, "as free as the orders it would tie with");
+        let claims = m.precheck(&proof, &l, &StubExecutor).expect("the reserved slot");
+        assert!(claims.evict.is_empty(), "it takes no order's place");
+        m.insert(proof.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.len(), 4, "past the count cap, by one");
+        assert_eq!(m.candidates(&l, 10).first(), Some(&proof), "offered ahead of fee order");
+        // A second proof is not reserved: the pool is full for it.
+        let other = perp_state_proof_tx(&l, 1, [8; 8], vec![], 0);
+        assert_eq!(m.insert(other.clone(), &l, &StubExecutor), Err(MempoolError::Full));
+        // The slot's proof is never taken to make room, whatever pays more.
+        assert!(m.make_room(&perp_order_tx(&trader, 5), u64::MAX, &l).map_or(true, |e| !e.contains(&proof.hash())));
+        // Mined (or stale), it leaves, and the slot is free for the next proof.
+        m.remove(&[proof.hash()]);
+        m.insert(other, &l, &StubExecutor).expect("the slot is free again");
+    }
+
+    /// RPL-3 final fix wave, C1: a block records at most `max_block_inputs` perp inputs (8 on the
+    /// fixture chain). The pool admits more than a block's worth — its ledger is the tip's, whose
+    /// block inputs are empty — the proposer's trial apply packs eight, and the ninth is not
+    /// stale: it survives the prune and is offered to the next block.
+    #[test]
+    fn perp_inputs_past_a_blocks_cap_stay_pooled_for_the_next_block() {
+        use fixtures::{key, make_perps_block, perp_deposit_tx};
+        let gs = fixtures::perps_genesis(7);
+        let mut l = gs.ledger.clone();
+        let (a, b) = (key(50), key(51));
+        let deposits = vec![perp_deposit_tx(&l, &a, 300, 5_000_000), perp_deposit_tx(&l, &b, 400, 5_000_000)];
+        make_perps_block(&gs.block, &mut l, deposits, &key(1));
+        let orders: Vec<Transaction> =
+            (1..=5).map(|n| perp_order_tx(&a, n)).chain((1..=4).map(|n| perp_order_tx(&b, n))).collect();
+        let mut m = Mempool::new(100);
+        for tx in &orders {
+            m.insert(tx.clone(), &l, &StubExecutor).unwrap();
+        }
+        let offered = m.block_candidates(&l);
+        assert_eq!(offered.len(), 9, "all nine offered: the trial apply decides");
+        // `HotStuff::propose`'s loop: keep a candidate only when it applies on a clone.
+        let mut building = l.clone();
+        building.set_height(2);
+        let mut mined = Vec::new();
+        for tx in &offered {
+            let mut trial = building.clone();
+            if trial.apply_tx(tx, &key(1).address(), &StubExecutor).is_ok() {
+                building = trial;
+                mined.push(tx.hash());
+            }
+        }
+        assert_eq!(mined.len(), 8, "the block's cap");
+        building.close_block(2, &key(1).address(), 0, 0, &StubExecutor);
+        m.remove(&mined);
+        m.prune(&building);
+        assert_eq!(m.len(), 1, "the ninth is not stale");
+        assert_eq!(m.block_candidates(&building).len(), 1, "and goes to the next block");
     }
 
     /// An invoke's payout notes are leaves like any other: the pool claims them (through

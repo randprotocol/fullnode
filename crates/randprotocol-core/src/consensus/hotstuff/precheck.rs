@@ -331,6 +331,7 @@ mod tests {
             multisig: None,
             fees: None,
             incremental_nullifier_root: None,
+            perps: None,
         };
         let gs = genesis.build(&StubExecutor).unwrap();
         let mut cfg = ConsensusConfig::new(1, gs.validators.clone(), gs.hash());

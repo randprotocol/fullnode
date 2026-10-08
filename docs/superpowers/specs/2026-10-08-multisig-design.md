@@ -31,8 +31,8 @@ is `threshold` of `n` Dilithium2 keys. The treasury is its first account, seeded
 | D5 | how signatures are gathered | **Off chain, one transaction**: the vesting revoke's `prepare` / `sign` / `submit`. No pending proposals on chain. |
 | D6 | who pays a payout's base | **The account**, from its RAND row, to the proposer's rewards — a Withdraw's shape. A rotation is fee-less (an Unbond's shape). |
 | D7 | account id | **Derived**, never chosen, from the creation terms and a salt — the same rule for genesis and later accounts, so the genesis command can print the treasury's id before the cut. |
-| D8 | state-root placement | A **wrapper** over the state root (`rand-state-multisig-1`, like `rand-state-tokens-1`), not the next positional domain: `feat/rpl3` (unmerged) takes `rand-state-9`, and a wrapper is independent of merge order. |
-| D9 | action tags | **34–37**, appended after `Invoke` (33). A tag is the variant's bincode position, so nothing can be reserved: `feat/rpl3` (unmerged, on no chain) also appends at 34. Both are genesis-gated, so whichever branch merges second renumbers its variants before any cut carries them; this spec's numbers assume multisig merges first. |
+| D8 | state-root placement | A **wrapper** over the state root (`rand-state-multisig-1`, like `rand-state-tokens-1`), not the next positional domain: RPL-3 perps takes `rand-state-9`, and a wrapper is independent of merge order (it stays the last wrapper). |
+| D9 | action tags | **40–43**, after the perps actions. A tag is the variant's bincode position; RPL-3 perps merged first and holds 34–39 (`PerpDeposit` … `PerpStateProof`), so the multisig tags follow the perps actions. |
 
 Out of scope, recorded: on-chain proposals with approvals over several blocks; a vesting revoke
 paying into a multisig id (a revoke's `treasury` stays a `rand1…` address); per-signer weights;

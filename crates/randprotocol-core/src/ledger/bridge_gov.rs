@@ -1283,12 +1283,12 @@ mod tests {
         // One second short: nothing moves at the block's end.
         l.set_timestamp_ms(4_599_999);
         let root = l.state_root();
-        l.close_block(2, &p, 0, 0);
+        l.close_block(2, &p, 0, 0, &StubExecutor);
         assert_eq!(l.bridge().unwrap().pq_guardians, pks(&old));
         assert!(l.bridge().unwrap().pending_pq.is_some());
         // At its time: both take effect, each spending a nonce, and the root moves.
         l.set_timestamp_ms(4_600_000);
-        l.close_block(3, &p, 0, 0);
+        l.close_block(3, &p, 0, 0, &StubExecutor);
         let b = l.bridge().unwrap();
         assert_eq!(b.pq_guardians, pks(&new), "the new set signs from the next block");
         assert_eq!(b.pause_key.as_ref(), Some(new_pause.public_key()));
@@ -1329,7 +1329,7 @@ mod tests {
         assert_eq!(b.pq_guardians, pks(&old));
         // The old time comes and goes: the cancelled set never takes effect.
         l.set_timestamp_ms(4_600_000);
-        l.close_block(2, &p, 0, 0);
+        l.close_block(2, &p, 0, 0, &StubExecutor);
         assert_eq!(l.bridge().unwrap().pq_guardians, pks(&old));
         assert_eq!(l.bridge().unwrap().rotation_nonce, 2);
         // The nonce having moved, the next rotation signs at 2 — and a cancel of a pending

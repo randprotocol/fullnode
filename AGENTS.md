@@ -58,12 +58,11 @@ Known issue, pre-existing, not fixed here: a gossiped marker-form copy of a tran
 
 M-of-N controlled public per-asset balances (a fourth register beside validators, vesting and program
 vaults); the foundation treasury is its first account, seeded in the genesis `multisig` section.
-**Actions 34-37**: `CreateMultisig`, `MultisigDeposit` (bundle-carried), `MultisigPay`, `MultisigRotate`
-(bundle-less). A tag is the variant's bincode position, and **`feat/rpl3` (perps) also appends at 34**:
-whichever of the two merges second renumbers its variants (and the pinned encoding/txid tests, the
-`docs/rpc.md` wire list) before any cut carries them. Without the section all four are refused
+**Actions 40-43**: `CreateMultisig`, `MultisigDeposit` (bundle-carried), `MultisigPay`, `MultisigRotate`
+(bundle-less). A tag is the variant's bincode position: RPL-3 perps merged first and holds 34–39
+(`PerpDeposit` … `PerpStateProof`), so the multisig tags follow the perps actions. Without the section all four are refused
 `UnsupportedAction("multisig")` at admission and at apply (so chain 20 is untouched). State root:
-wrapper `rand-state-multisig-1` (not a positional domain, so independent of rpl3's `rand-state-9`);
+wrapper `rand-state-multisig-1` (not a positional domain, so independent of perps' `rand-state-9`; it stays the last wrapper);
 persisted as bincode under `META_MULTISIG`; `reload_ledger` refuses a genesis file and database that
 disagree about the section. Mempool claim role 9 (account id + nonce): one pooled Pay-or-Rotate per
 account; a pooled Pay is re-checked at selection (`multisig::still_applies`). BadSignerIndex /

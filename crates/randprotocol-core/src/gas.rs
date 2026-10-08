@@ -293,6 +293,14 @@ pub fn fee_floor(action: &Action) -> u64 {
     match action {
         Action::Mint { .. } | Action::Unbond { .. } | Action::Withdraw { .. } => 0,
         Action::None => BUNDLE_BASE,
+        // RPL-3: a deposit rides the bundle whose burn funds the account, so it pays the plain
+        // base; the five other perp actions are bundle-less and have nothing to pay from.
+        Action::PerpDeposit { .. } => BUNDLE_BASE,
+        Action::PerpOrder { .. }
+        | Action::PerpCancel { .. }
+        | Action::PerpWithdraw { .. }
+        | Action::PerpOracle { .. }
+        | Action::PerpStateProof { .. } => 0,
         // Public words are charged like code words (spec §5): the chain stores both.
         Action::Deploy { words, public, .. } => BUNDLE_BASE + deploy_fee(words.len() + public.len()),
         // RPL-2: an invoke carries a call proof and pays a call's floor. Its cell fee is a

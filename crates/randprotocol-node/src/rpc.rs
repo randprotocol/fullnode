@@ -59,6 +59,9 @@ pub const MAX_RECEIPTS_PAGE: usize = 256;
 /// Most cells one `rand_getProgramCells` page returns (RPL-2). A cell is 64 bytes, so a full
 /// page is 128 KB of hex.
 pub const MAX_PROGRAM_CELLS_PAGE: usize = 1000;
+/// Most accounts one `rand_getPerpAccounts` page returns (RPL-3) — the other pages' cap; the
+/// exchange holds at most 15 (`perps::MAX_ACCOUNTS`), so today one page is all of them.
+pub const MAX_PERP_ACCOUNTS_PAGE: usize = 1000;
 
 /// The most leaf indices one `rand_getWitnesses` call may fold into a single tree build.
 pub const MAX_WITNESSES: usize = 32;
@@ -593,6 +596,7 @@ pub const PUBLIC_METHODS: &[&str] = &[
     "rand_getBridgeState", "rand_getAssets", "rand_getBridgeBurn", "rand_bridgeAssetId",
     "rand_getAggregate", "rand_getAggregators", "rand_getUnsealed",
     "rand_getVesting", "rand_getVestingSchedule", "rand_getVestingSummary",
+    "rand_getPerps", "rand_getPerpAccount", "rand_getPerpAccounts", "rand_getPerpInputs",
     "rand_getMultisig",
 ];
 
@@ -767,16 +771,19 @@ pub struct ChainLimits {
     /// RPL-2: the genesis `program_state` section and the `Invoke` limits that come with it,
     /// `null` on a chain without the section (where every invoke is refused).
     pub program_state: Option<ProgramStateLimits>,
-    /// Multisig accounts: the genesis `multisig` section's `create_fee` and the two bounds a
-    /// wallet sizes a create and a pay by, `null` on a chain without the section (where every
-    /// multisig action is refused).
-    pub multisig: Option<MultisigLimits>,
     /// Fee feedback (`docs/fees.md` §1.3): the genesis `fees` section's three rules, `null` on a
     /// chain without one — and on one whose section sets no flag `true`, which is the section's
     /// absence in every respect (it hashes as absent too). The three flags leave wallet fees
     /// alone (the floors are the same numbers, only where the base, or under `burn_floor` the
     /// whole floor, goes differs); `prove_base` raises every floor, and `rand_estimateFee` adds it.
     pub fee_rules: Option<FeeRules>,
+    /// RPL-3: the genesis `perps` section's limits a prover and a wallet size by, `null` on a
+    /// chain without the section (where every perp action is refused).
+    pub perps: Option<PerpsLimits>,
+    /// Multisig accounts: the genesis `multisig` section's `create_fee` and the two bounds a
+    /// wallet sizes a create and a pay by, `null` on a chain without the section (where every
+    /// multisig action is refused).
+    pub multisig: Option<MultisigLimits>,
 }
 
 /// `rand_getLimits`' `fee_rules` object: every flag, each `true` only where the genesis says so.
@@ -793,6 +800,20 @@ pub struct FeeRules {
     /// string like every amount, `null` when unset. `rand_estimateFee` already includes it.
     #[serde(serialize_with = "opt_u64_as_decimal_string")]
     pub prove_base: Option<u64>,
+}
+
+/// `rand_getLimits`' `perps` object: the collateral asset (0 is RAND), the highest proof tier
+/// and the most blocks one state proof may cover, and the most withdrawals one proof pays; the
+/// most perp inputs one block records and the smallest deposit (a decimal string, 0 no floor).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PerpsLimits {
+    pub collateral_asset: u32,
+    pub max_tier: u8,
+    pub max_window_blocks: u64,
+    pub max_payouts: usize,
+    pub max_block_inputs: u32,
+    #[serde(serialize_with = "u64_as_decimal_string")]
+    pub min_deposit: u64,
 }
 
 /// `rand_getLimits`' `program_state` object: what a wallet needs to size and price an `Invoke`.
@@ -859,6 +880,14 @@ impl ChainLimits {
                 burn_floor: f.burn_floor(),
                 proposer_share_bps: f.proposer_share_bps(),
                 prove_base: f.prove_base,
+            }),
+            perps: ledger.perps().map(|p| PerpsLimits {
+                collateral_asset: p.config.collateral_asset,
+                max_tier: p.config.max_tier,
+                max_window_blocks: p.config.max_window_blocks,
+                max_payouts: randprotocol_core::ledger::perps::MAX_PERP_PAYOUTS,
+                max_block_inputs: p.config.max_block_inputs,
+                min_deposit: p.config.min_deposit,
             }),
         };
         if let Some(g) = ledger.gas() {
@@ -1843,6 +1872,27 @@ fn cell_json(c: &randprotocol_core::ledger::program_state::Cell) -> Value {
     json!({ "key": word8_to_hex(&c.key), "value": word8_to_hex(&c.value) })
 }
 
+/// One perps trading account as `rand_getPerpAccount(s)` serve it: the id and trading key
+/// (hex), the nonce window (`nonce_high`, and the `used` bitmap as a decimal string), and the
+/// account's pending withdrawals in request order.
+fn perp_account_json(
+    perps: &randprotocol_core::ledger::perps::Perps,
+    id: &randprotocol_core::Word8,
+    a: &randprotocol_core::ledger::perps::PerpAccount,
+) -> Value {
+    json!({
+        "account": word8_to_hex(id),
+        "trading_key": a.trading_key.to_hex(),
+        "nonce_high": a.nonce_high,
+        "used": a.used.to_string(),
+        "withdrawals": perps
+            .withdrawals()
+            .filter(|(_, w)| w.account == *id)
+            .map(|(request, w)| json!({ "request": word8_to_hex(request), "amount": w.amount.to_string(), "height": w.height }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// A cell key from a JSON string: 64 hex characters, with or without `0x`.
 fn parse_cell_key(v: &Value, name: &str) -> Result<randprotocol_core::Word8, RpcError> {
     let s = v.as_str().ok_or_else(|| RpcError::invalid_params(format!("{name} must be 64 hex characters")))?;
@@ -2406,6 +2456,47 @@ fn tx_json_with(
             "rotation_kind": match kind { 0 => "pq_guardians", 1 => "pause_key", _ => "unknown" },
             "nonce": nonce,
         }),
+        // RPL-3. Public by design, like the register's actions: the exchange's inputs are what
+        // its prover replays. A deposit names its trading key and the account it opens or tops
+        // up (the key's id); the amount is the bundle's `burn_r` / `burn_a` above.
+        Action::PerpDeposit { trading_key } => json!({
+            "kind": "perp_deposit", "trading_key": trading_key.to_hex(),
+            "account": word8_to_hex(&randprotocol_core::ledger::perps::account_id(trading_key)),
+        }),
+        // The order as signed, nested under `body`: its own `kind` (0 limit, 1 market) would
+        // collide with the action's. Price and size are u64 amounts, so decimal strings.
+        Action::PerpOrder { account, body, .. } => json!({
+            "kind": "perp_order", "account": word8_to_hex(account),
+            "body": {
+                "nonce": body.nonce, "market": body.market, "side": body.side, "kind": body.kind, "tif": body.tif,
+                "reduce_only": body.reduce_only, "price": body.price.to_string(), "size": body.size.to_string(),
+            },
+        }),
+        Action::PerpCancel { account, nonce, target, .. } => json!({
+            "kind": "perp_cancel", "account": word8_to_hex(account), "nonce": nonce, "target": target
+        }),
+        // The recipient, amount and the note's `time` are public — the payout is the chain's to
+        // compute — but the envelope is the recipient's, and is not rendered.
+        Action::PerpWithdraw { account, nonce, amount, recipient, time, .. } => json!({
+            "kind": "perp_withdraw", "account": word8_to_hex(account), "nonce": nonce, "amount": amount.to_string(),
+            "recipient": recipient.to_string(), "time": time
+        }),
+        Action::PerpOracle { validator, prices, nonce, .. } => json!({
+            "kind": "perp_oracle", "validator": validator.address().to_base58(),
+            "prices": prices.iter().map(|p| json!({ "market": p.market, "price": p.price.to_string() })).collect::<Vec<_>>(),
+            "nonce": nonce
+        }),
+        // The window, the engine's claims and the proof's length (the bytes are on the raw
+        // transaction); each payout by request id and amount.
+        Action::PerpStateProof { from_height, to_height, new_root, payouts, fees, proof } => json!({
+            "kind": "perp_state_proof", "from_height": from_height, "to_height": to_height,
+            "new_root": word8_to_hex(new_root),
+            "payouts": payouts
+                .iter()
+                .map(|p| json!({ "request": word8_to_hex(&p.request), "amount": p.amount.to_string() }))
+                .collect::<Vec<_>>(),
+            "fees": fees.to_string(), "proof_bytes": proof.len()
+        }),
         // Genesis vesting: the entry and the amounts are public register facts, like a
         // `Withdraw`'s; the note a claim or a revoke pays is rendered no further.
         Action::ClaimVested { entry, amount, nonce, time, .. } => json!({
@@ -2882,6 +2973,114 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 .into_iter()
                 .map(|(asset, amount)| json!({ "asset": asset, "amount": amount.to_string() }))
                 .collect::<Vec<_>>()))
+        }
+        // ---- perps (RPL-3) ----
+        // The exchange's public state, read from the head's stored section; `{"enabled": false}`
+        // on a chain without it. What a prover (`perp-prover`) and the web page poll: the
+        // genesis section, the proved root and height, the heights a next proof must cover,
+        // each market's median and the two counts. Hex64 roots, decimal-string prices.
+        "rand_getPerps" => {
+            let storage = st.storage.clone();
+            let (perps, head) =
+                blocking(st, move || crate::storage::Result::Ok((storage.perps()?, storage.head()?.height))).await?;
+            let Some(p) = perps else {
+                return Ok(json!({ "enabled": false }));
+            };
+            let c = &p.config;
+            Ok(json!({
+                "enabled": true,
+                "collateral_asset": c.collateral_asset,
+                "max_tier": c.max_tier,
+                "max_window_blocks": c.max_window_blocks,
+                "max_block_inputs": c.max_block_inputs,
+                "min_deposit": c.min_deposit.to_string(),
+                "engine_hc": word8_to_hex(&c.engine_hc),
+                "genesis_root": word8_to_hex(&c.genesis_root),
+                "markets": c.markets,
+                "proved_root": word8_to_hex(&p.proved_root),
+                "proved_height": p.proved_height,
+                "head_height": head,
+                "pending_heights": p.pending_heights(),
+                "medians": c
+                    .markets
+                    .iter()
+                    .map(|m| json!({ "market": m.id, "price": p.median(m.id).to_string() }))
+                    .collect::<Vec<_>>(),
+                "accounts": p.account_count(),
+                "pending_withdrawals": p.withdrawals().count(),
+            }))
+        }
+        // One trading account by id (`[hex64]`): its key, its nonce window and the withdrawals
+        // it has pending; `null` for an id the exchange does not hold — and on a chain without
+        // the section, which holds none.
+        "rand_getPerpAccount" => {
+            let id =
+                parse_cell_key(p.get(0).ok_or_else(|| RpcError::invalid_params("missing param account"))?, "account")?;
+            let storage = st.storage.clone();
+            let Some(perps) = blocking(st, move || storage.perps()).await? else {
+                return Ok(Value::Null);
+            };
+            Ok(perps.account(&id).map(|a| perp_account_json(&perps, &id, a)).unwrap_or(Value::Null))
+        }
+        // The accounts in id order: `[{"after": hex64 | null, "limit": n}]`, both optional, at
+        // most `MAX_PERP_ACCOUNTS_PAGE` a page; `next` is the last id served when more follow.
+        // A chain without the section has no account: an empty last page.
+        "rand_getPerpAccounts" => {
+            let (after, limit) = match p.get(0) {
+                None | Some(Value::Null) => (None, MAX_PERP_ACCOUNTS_PAGE),
+                Some(Value::Object(o)) => {
+                    let after = match o.get("after") {
+                        None | Some(Value::Null) => None,
+                        Some(k) => Some(parse_cell_key(k, "after")?),
+                    };
+                    let limit = match o.get("limit") {
+                        None | Some(Value::Null) => MAX_PERP_ACCOUNTS_PAGE,
+                        Some(n) => n
+                            .as_u64()
+                            .map(|n| (n.min(MAX_PERP_ACCOUNTS_PAGE as u64) as usize).max(1))
+                            .ok_or_else(|| RpcError::invalid_params("limit must be a non-negative integer"))?,
+                    };
+                    (after, limit)
+                }
+                Some(_) => {
+                    return Err(RpcError::invalid_params(
+                        "the param is an object: {\"after\": account | null, \"limit\": n}",
+                    ))
+                }
+            };
+            let storage = st.storage.clone();
+            let Some(perps) = blocking(st, move || storage.perps()).await? else {
+                return Ok(json!({ "accounts": [], "next": null }));
+            };
+            // One past the page, to know whether anything follows it.
+            let mut page = perps.accounts(after.as_ref(), limit + 1);
+            let more = page.len() > limit;
+            page.truncate(limit);
+            let next = if more { page.last().map(|(id, _)| word8_to_hex(id)) } else { None };
+            Ok(json!({
+                "accounts": page.iter().map(|(id, a)| perp_account_json(&perps, id, a)).collect::<Vec<_>>(),
+                "next": next,
+            }))
+        }
+        // A closed block's perp input words (`[height]`), what a prover runs the engine over:
+        // `{"height", "digest", "words"}` — the digest the ledger recorded while the height is
+        // pending, else recomputed over the stored words (the same `perp_digest`, domain 21).
+        // `null` for a height this node holds no row for: a proof covered it, it is above the
+        // head, or the chain has no `perps` section.
+        "rand_getPerpInputs" => {
+            let height: u64 = param(p, 0, "height")?;
+            let storage = st.storage.clone();
+            let (words, perps) =
+                blocking(st, move || crate::storage::Result::Ok((storage.perp_inputs(height)?, storage.perps()?)))
+                    .await?;
+            let Some(words) = words else {
+                return Ok(Value::Null);
+            };
+            let digest = perps.and_then(|p| p.digest(height)).unwrap_or_else(|| {
+                use randprotocol_core::ledger::perps::{domain, perp_digest};
+                perp_digest(st.executor.as_ref(), domain::BLOCK, &words)
+            });
+            Ok(json!({ "height": height, "digest": word8_to_hex(&digest), "words": words }))
         }
         // A multisig account: `[id]` (64 hex) → its signers (hex public keys, in list order — a
         // signature names its signer by position), threshold, nonce and vault (ascending by
@@ -3810,6 +4009,12 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 Some(p) => audit.with_program_vaults(p.rand_in, p.rand_out),
                 None => audit,
             };
+            // RPL-3: the exchange's RAND is the identity's fifth term (`Ledger::audit`): a RAND
+            // deposit's `burn_r` is inside `burned`, and what proofs paid back out is in the pool.
+            let audit = match st.storage.perps().map_err(RpcError::internal)? {
+                Some(p) => audit.with_perps(p.rand_in, p.rand_out),
+                None => audit,
+            };
             // Multisig: the register's RAND, chained last as `Ledger::audit` chains it.
             let multisig = st.storage.multisig().map_err(RpcError::internal)?;
             let (multisig_rand_in, multisig_base_out) = multisig.as_ref().map_or((0, 0), |m| (m.rand_in, m.base_out));
@@ -3825,6 +4030,11 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // `burned` too). Both "0" without the `program_state` section.
                 "program_rand_out": audit.program_rand_out.to_string(),
                 "program_rand_held": audit.program_rand_held.to_string(),
+                // RPL-3: RAND that state proofs have paid out of the exchange as notes (inside
+                // `pool_value`), and what it still holds (deposited through `burn_r`, so inside
+                // `burned`). Both "0" without the `perps` section or on a token-collateral one.
+                "perps_rand_out": audit.perps_rand_out.to_string(),
+                "perps_rand_held": audit.perps_rand_held.to_string(),
                 // Multisig accounts: what genesis seeded the vaults with (issuance), every
                 // `burn_r` a create or deposit put in (already inside `burned`), the RAND payout
                 // notes (inside `pool_value`), the bases pays paid to proposers' `rewards`, and
@@ -4923,6 +5133,7 @@ pub(crate) mod tests {
                 "program_state": null,
                 "multisig": null,
                 "fee_rules": null,
+                "perps": null,
             })
         );
         let gs = raised_genesis();
@@ -4954,6 +5165,7 @@ pub(crate) mod tests {
                 "program_state": null,
                 "multisig": null,
                 "fee_rules": null,
+                "perps": null,
             })
         );
         // Spec 2026-09-26 §2.4: a memo chain reports its exact envelope size.
@@ -4987,6 +5199,7 @@ pub(crate) mod tests {
                 "program_state": null,
                 "multisig": null,
                 "fee_rules": null,
+                "perps": null,
             })
         );
         // The v0.6 switch: what a wallet reads to prove its calls over the call binding (INT-4).
@@ -5102,7 +5315,7 @@ pub(crate) mod tests {
         ledger.set_height(1);
         ledger.set_timestamp_ms(1);
         ledger.apply_transactions(&[], &key(1).address(), &StubExecutor).unwrap();
-        ledger.close_block(1, &key(1).address(), 8_192, 20_000);
+        ledger.close_block(1, &key(1).address(), 8_192, 20_000, &StubExecutor);
         let moved = ledger.gas_prices();
         assert!(moved.byte_price > 800, "an over-target block raises byte_price: {moved:?}");
         assert_eq!(moved.gas_price, 100, "an at-target block leaves gas_price alone");
@@ -7583,6 +7796,296 @@ pub(crate) mod tests {
         for method in ["rand_getProgramCell", "rand_getProgramCells", "rand_getProgramVault"] {
             assert!(PUBLIC_METHODS.contains(&method), "{method}");
         }
+    }
+
+    // ---- RPL-3: perps ----
+
+    /// A perps chain (the storage fixtures' section) four blocks in: block 1 a deposit by key
+    /// 50 and validator 1's oracle price, block 2 a withdrawal request, block 3 empty, block 4 a
+    /// state proof of `0..=3` paying the request in part. Returns the state, the ledger after
+    /// block 3 and after block 4, and the five transactions in order.
+    fn perps_state(
+    ) -> (tempfile::TempDir, RpcState, randprotocol_core::Ledger, randprotocol_core::Ledger, Vec<Transaction>) {
+        use fixtures::{make_perps_block, perp_deposit_tx, perp_oracle_tx, perp_state_proof_tx, perp_withdraw_tx};
+        use randprotocol_core::ledger::perps::PerpPayout;
+        let gs = fixtures::perps_genesis(7);
+        let (dir, st) = state_for(&gs);
+        let trader = key(50);
+        let mut ledger = gs.ledger.clone();
+        let deposit = perp_deposit_tx(&ledger, &trader, 300, 5_000_000);
+        let oracle = perp_oracle_tx(7, &key(1), 1_000_000, 1);
+        let b1 = make_perps_block(&gs.block, &mut ledger, vec![deposit.clone(), oracle.clone()], &key(1));
+        // The engine pays a request in full or not at all (I4): the proof below pays all of it.
+        let withdraw = perp_withdraw_tx(7, &trader, 1, 1_500_000, 1);
+        let request = randprotocol_core::notes::word8_from_bytes(withdraw.hash().as_bytes()).unwrap();
+        let b2 = make_perps_block(&b1, &mut ledger, vec![withdraw.clone()], &key(1));
+        let b3 = make_perps_block(&b2, &mut ledger, vec![], &key(1));
+        st.storage.commit(&[b1, b2, b3.clone()], &ledger, &[], &StubExecutor).unwrap();
+        let at3 = ledger.clone();
+        let proof = perp_state_proof_tx(&ledger, 3, [77; 8], vec![PerpPayout { request, amount: 1_500_000 }], 10);
+        (dir, st, at3, ledger, vec![deposit, oracle, withdraw, proof])
+    }
+
+    /// Commit `perps_state`'s block 4 (the state proof) on top of `at3`.
+    fn commit_perps_proof(
+        st: &RpcState,
+        at3: &randprotocol_core::Ledger,
+        proof: &Transaction,
+    ) -> randprotocol_core::Ledger {
+        let mut ledger = at3.clone();
+        let b3 = st.storage.committed_block(3).unwrap().unwrap();
+        let b4 = fixtures::make_perps_block(&b3, &mut ledger, vec![proof.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b4), &ledger, &[], &StubExecutor).unwrap();
+        ledger
+    }
+
+    /// `rand_getPerps` on a chain without the section is `{"enabled": false}` and nothing else;
+    /// the account reads answer in their own shapes (no account: `null`, an empty last page);
+    /// there is no input row to serve; `rand_getLimits.perps` is null
+    /// and the supply's perps terms are zero. All four methods are on the public listener.
+    #[tokio::test]
+    async fn the_perp_methods_on_a_chain_without_the_section() {
+        let (_p, plain) = state_for(&fixtures::genesis_with(1, vec![]));
+        assert_eq!(ok(&plain, "rand_getPerps", json!([])).await, json!({ "enabled": false }));
+        assert_eq!(ok(&plain, "rand_getPerpAccount", json!(["ab".repeat(32)])).await, Value::Null);
+        assert_eq!(ok(&plain, "rand_getPerpAccounts", json!([])).await, json!({ "accounts": [], "next": null }));
+        assert_eq!(ok(&plain, "rand_getPerpInputs", json!([0])).await, Value::Null);
+        assert_eq!(ok(&plain, "rand_getLimits", json!([])).await["perps"], Value::Null);
+        let supply = ok(&plain, "rand_getSupply", json!([])).await;
+        assert_eq!((supply["perps_rand_out"].clone(), supply["perps_rand_held"].clone()), (json!("0"), json!("0")));
+        for method in ["rand_getPerps", "rand_getPerpAccount", "rand_getPerpAccounts", "rand_getPerpInputs"] {
+            assert!(PUBLIC_METHODS.contains(&method), "{method}");
+        }
+    }
+
+    /// `rand_getPerps` on a perps chain: the genesis section's fields under the names the prover
+    /// and the web page parse (hex64 roots and commitment, the markets as the genesis lists
+    /// them), the proved root and height, the head, the heights a next proof must cover, each
+    /// market's median as a decimal string, and the two counts. Then the inputs a prover reads
+    /// per height — the words and their digest, the ledger's `D_h` — and `null` once a proof has
+    /// covered the height.
+    #[tokio::test]
+    async fn rand_get_perps_and_inputs_on_a_perps_chain() {
+        use randprotocol_core::ledger::perps::{domain, perp_digest};
+        let (_d, st, at3, _, txs) = perps_state();
+        let cfg = fixtures::perps_config();
+        let v = ok(&st, "rand_getPerps", json!([])).await;
+        assert_eq!(
+            v,
+            json!({
+                "enabled": true,
+                "collateral_asset": 0,
+                "max_tier": 16,
+                "max_window_blocks": 8,
+                "max_block_inputs": 8,
+                "min_deposit": "1000",
+                "engine_hc": word8_to_hex(&cfg.engine_hc),
+                "genesis_root": word8_to_hex(&cfg.genesis_root),
+                "markets": [{
+                    "id": 0, "symbol": "BTC-PERP", "lot": 1_000_000, "tick": 1_000, "max_leverage": 10,
+                    "maintenance_bps": 500, "taker_fee_bps": 5, "maker_fee_bps": 2,
+                }],
+                "proved_root": word8_to_hex(&cfg.genesis_root),
+                "proved_height": 0,
+                "head_height": 3,
+                "pending_heights": [1, 2, 3],
+                "medians": [{ "market": 0, "price": "1000000" }],
+                "accounts": 1,
+                "pending_withdrawals": 1,
+            })
+        );
+        assert_eq!(v["engine_hc"].as_str().unwrap().len(), 64);
+
+        for h in 1..=3u64 {
+            let inputs = ok(&st, "rand_getPerpInputs", json!([h])).await;
+            let words: Vec<u32> = serde_json::from_value(inputs["words"].clone()).unwrap();
+            assert_eq!(Some(&words), st.storage.perp_inputs(h).unwrap().as_ref(), "height {h}");
+            assert_eq!(inputs["height"], h);
+            assert_eq!(
+                inputs["digest"],
+                word8_to_hex(&at3.perps().unwrap().digest(h).unwrap()),
+                "height {h}: the ledger's D_h"
+            );
+            assert_eq!(inputs["digest"], word8_to_hex(&perp_digest(&StubExecutor, domain::BLOCK, &words)));
+        }
+        assert_eq!(ok(&st, "rand_getPerpInputs", json!([4])).await, Value::Null, "above the head");
+        for bad in [json!([]), json!(["one"]), json!([-1])] {
+            assert_eq!(call(&st, "rand_getPerpInputs", bad.clone()).await.unwrap_err().code, -32602, "{bad}");
+        }
+
+        // The proof lands: the window moves, the request is paid, the covered rows are gone.
+        let after = commit_perps_proof(&st, &at3, &txs[3]);
+        let v = ok(&st, "rand_getPerps", json!([])).await;
+        assert_eq!((v["proved_root"].clone(), v["proved_height"].clone()), (json!(word8_to_hex(&[77; 8])), json!(3)));
+        assert_eq!((v["head_height"].clone(), v["pending_heights"].clone()), (json!(4), json!([4])));
+        assert_eq!(v["pending_withdrawals"], 0);
+        for h in 1..=3u64 {
+            assert_eq!(ok(&st, "rand_getPerpInputs", json!([h])).await, Value::Null, "height {h} is proved");
+        }
+        let inputs = ok(&st, "rand_getPerpInputs", json!([4])).await;
+        assert_eq!(inputs["digest"], word8_to_hex(&after.perps().unwrap().digest(4).unwrap()));
+
+        // A row whose digest the ledger no longer holds (a read racing the proof's commit) is
+        // served with the digest recomputed over its words.
+        let words = st.storage.perp_inputs(4).unwrap().unwrap();
+        st.storage.put_perp_inputs(2, &words).unwrap();
+        let raced = ok(&st, "rand_getPerpInputs", json!([2])).await;
+        assert_eq!(raced["digest"], word8_to_hex(&perp_digest(&StubExecutor, domain::BLOCK, &words)));
+
+        // The supply identity holds with the exchange's RAND in it: 5 000 000 in, 1 500 000 out.
+        let supply = ok(&st, "rand_getSupply", json!([])).await;
+        assert_eq!(
+            (supply["perps_rand_out"].clone(), supply["perps_rand_held"].clone()),
+            (json!("1500000"), json!("3500000"))
+        );
+        assert_eq!(supply["invariant_holds"], true, "{supply}");
+        assert_eq!(supply["total_supply"], after.audit().total_supply().to_string());
+
+        // The limits a wallet sizes a proof by.
+        let limits = ok(&st, "rand_getLimits", json!([])).await;
+        assert_eq!(
+            limits["perps"],
+            json!({
+                "collateral_asset": 0, "max_tier": 16, "max_window_blocks": 8, "max_payouts": 8,
+                "max_block_inputs": 8, "min_deposit": "1000",
+            })
+        );
+    }
+
+    /// One account by id and the pages of all of them: the trading key, the nonce window (the
+    /// high-water mark and the bitmap as a decimal string) and the account's pending
+    /// withdrawals; an unknown id is `null`, a malformed one refused.
+    #[tokio::test]
+    async fn rand_get_perp_account_and_accounts() {
+        use randprotocol_core::ledger::perps::account_id;
+        let (_d, st, at3, _, txs) = perps_state();
+        let trader = key(50);
+        let id = word8_to_hex(&account_id(trader.public_key()));
+        let request = word8_to_hex(&randprotocol_core::notes::word8_from_bytes(txs[2].hash().as_bytes()).unwrap());
+        let want = json!({
+            "account": id,
+            "trading_key": trader.public_key().to_hex(),
+            "nonce_high": 1,
+            "used": "1",
+            "withdrawals": [{ "request": request, "amount": "1500000", "height": 2 }],
+        });
+        assert_eq!(ok(&st, "rand_getPerpAccount", json!([id])).await, want);
+        assert_eq!(ok(&st, "rand_getPerpAccount", json!([format!("0x{id}")])).await, want, "0x is accepted");
+        assert_eq!(ok(&st, "rand_getPerpAccount", json!(["ab".repeat(32)])).await, Value::Null);
+        for bad in [json!([]), json!(["abc"]), json!([7])] {
+            assert_eq!(call(&st, "rand_getPerpAccount", bad.clone()).await.unwrap_err().code, -32602, "{bad}");
+        }
+        assert_eq!(
+            ok(&st, "rand_getPerpAccounts", json!([])).await,
+            json!({ "accounts": [want.clone()], "next": null })
+        );
+        let page = ok(&st, "rand_getPerpAccounts", json!([{ "after": null, "limit": 1 }])).await;
+        assert_eq!(page, json!({ "accounts": [want.clone()], "next": null }), "nothing follows the one account");
+        let past = ok(&st, "rand_getPerpAccounts", json!([{ "after": id, "limit": 5 }])).await;
+        assert_eq!(past, json!({ "accounts": [], "next": null }));
+        assert_eq!(call(&st, "rand_getPerpAccounts", json!([{ "after": "zz" }])).await.unwrap_err().code, -32602);
+        assert_eq!(call(&st, "rand_getPerpAccounts", json!([3])).await.unwrap_err().code, -32602);
+        // Paid: the account no longer lists the request.
+        commit_perps_proof(&st, &at3, &txs[3]);
+        assert_eq!(ok(&st, "rand_getPerpAccount", json!([id])).await["withdrawals"], json!([]));
+    }
+
+    /// `tx_json` renders each perp action with its public fields — never the withdrawal's
+    /// envelope — and a compact block attributes a state proof's payout note to it.
+    #[tokio::test]
+    async fn tx_json_renders_the_perp_actions_and_compact_blocks_attribute_payouts() {
+        use randprotocol_core::ledger::perps::account_id;
+        let (_d, st, at3, _, txs) = perps_state();
+        let after = commit_perps_proof(&st, &at3, &txs[3]);
+        let trader = key(50);
+        let action = |tx: &Transaction| {
+            let tokens = st.storage.tokens().unwrap();
+            tx_json(tx, tokens.as_ref(), &StubExecutor)["action"].clone()
+        };
+        let id = word8_to_hex(&account_id(trader.public_key()));
+        assert_eq!(
+            action(&txs[0]),
+            json!({ "kind": "perp_deposit", "trading_key": trader.public_key().to_hex(), "account": id })
+        );
+        assert_eq!(
+            action(&txs[1]),
+            json!({
+                "kind": "perp_oracle", "validator": key(1).public_key().address().to_base58(),
+                "prices": [{ "market": 0, "price": "1000000" }], "nonce": 1,
+            })
+        );
+        assert_eq!(
+            action(&txs[2]),
+            json!({
+                "kind": "perp_withdraw", "account": id, "nonce": 1, "amount": "1500000",
+                "recipient": fixtures::recipient().to_string(), "time": 1,
+            })
+        );
+        let request = word8_to_hex(&randprotocol_core::notes::word8_from_bytes(txs[2].hash().as_bytes()).unwrap());
+        let Action::PerpStateProof { proof, .. } = &txs[3].action else { unreachable!() };
+        assert_eq!(
+            action(&txs[3]),
+            json!({
+                "kind": "perp_state_proof", "from_height": 0, "to_height": 3, "new_root": word8_to_hex(&[77; 8]),
+                "payouts": [{ "request": request, "amount": "1500000" }], "fees": "10", "proof_bytes": proof.len(),
+            })
+        );
+        let order = fixtures::perp_signed(
+            7,
+            &trader,
+            Action::PerpOrder {
+                account: account_id(trader.public_key()),
+                body: randprotocol_core::ledger::perps::PerpOrderBody {
+                    nonce: 4,
+                    market: 0,
+                    side: 1,
+                    kind: 0,
+                    tif: 2,
+                    reduce_only: true,
+                    price: 1_234_000,
+                    size: 5_000_000,
+                },
+                signature: randprotocol_core::Signature::empty(),
+            },
+        );
+        assert_eq!(
+            action(&order),
+            json!({
+                "kind": "perp_order", "account": id,
+                // The order as signed, under its own field names — nested, since its `kind`
+                // (limit or market) would collide with the action's.
+                "body": {
+                    "nonce": 4, "market": 0, "side": 1, "kind": 0, "tif": 2, "reduce_only": true,
+                    "price": "1234000", "size": "5000000",
+                },
+            })
+        );
+        let cancel = fixtures::perp_signed(
+            7,
+            &trader,
+            Action::PerpCancel {
+                account: account_id(trader.public_key()),
+                nonce: 5,
+                target: 4,
+                signature: randprotocol_core::Signature::empty(),
+            },
+        );
+        assert_eq!(action(&cancel), json!({ "kind": "perp_cancel", "account": id, "nonce": 5, "target": 4 }));
+        // The served block renders the same.
+        let block = ok(&st, "rand_getBlockByHeight", json!([2])).await;
+        assert_eq!(block["transactions"][0]["action"]["kind"], "perp_withdraw");
+        assert!(block["transactions"][0]["action"].get("envelope").is_none());
+
+        // The compact block: the proof (no bundle) owns exactly its one payout note.
+        assert_eq!(crate::storage::derived_note_count(&txs[3]), 1);
+        let v = ok(&st, "rand_getCompactBlocks", json!([4, 4])).await;
+        let b = &v.as_array().unwrap()[0];
+        assert_eq!(b["commitments"], json!([]));
+        let leaves = b["transactions"][0]["commitments"].as_array().unwrap();
+        assert_eq!(leaves.len(), 1);
+        let rows = st.storage.notes_in_heights(4, 4, 10).unwrap();
+        assert_eq!(leaves[0]["cm"], word8_to_hex(&rows[0].1.cm));
+        assert!(after.has_commitment(&rows[0].1.cm));
     }
 
     /// Multisig accounts: `rand_getMultisig` (known, unknown, and a chain without the section),

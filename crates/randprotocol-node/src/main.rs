@@ -597,6 +597,16 @@ enum Cmd {
         /// flag contributes nothing to the genesis hash either.
         #[arg(long, value_name = "FEES.JSON")]
         fees: Option<PathBuf>,
+        /// RPL-3: the `perps` section — perpetual futures, proved off chain by the engine guest —
+        /// as a `PerpsConfig` JSON file (`{"collateral_asset", "max_tier", "max_window_blocks",
+        /// "max_block_inputs", "min_deposit" (optional, 0), "engine_hc", "genesis_root",
+        /// "markets": [...]}`, the two commitments as 64 hex
+        /// characters). Given, the section is part of the genesis hash; omitted, the file has
+        /// none and hashes byte-for-byte as before. It needs `--tokens`, `--gas-price`,
+        /// `--hardening-v6` and `--auth-guest` (with `--bundle-guest v3`), each refused by name
+        /// before any file is written; the section's own bounds are the build's to refuse.
+        #[arg(long, value_name = "PERPS.JSON")]
+        perps: Option<PathBuf>,
     },
     /// Print one genesis alloc note as JSON — the object that goes into a genesis file's `alloc`
     /// list — sealed to `--to` exactly as `genesis --alloc` seals one, so the owner's wallet finds
@@ -927,6 +937,15 @@ enum DbCmd {
     /// database with a sixteenth, so without this the downgraded node never starts. A later
     /// v0.3 start rebuilds the index from the receipts.
     DropReceiptsIndex {
+        #[arg(long)]
+        datadir: PathBuf,
+    },
+    /// Before rolling back to a build from before RPL-3 (v0.7.1 or earlier): drop the
+    /// `perp_inputs` column family, which this build creates on every database at first open.
+    /// The old build lists seventeen families and RocksDB refuses to open a database with an
+    /// eighteenth. Refused, untouched, on a perps chain's database (no older build can follow
+    /// that chain) or when the family holds rows.
+    DropPerpInputs {
         #[arg(long)]
         datadir: PathBuf,
     },
@@ -2260,7 +2279,7 @@ struct StakingArgs {
 /// before it does (issue #60).
 ///
 /// #41 raised the limit only inside `node::start`, so `run` was covered and nothing else was:
-/// `verify` (and `verify --repair`), `db drop-receipts-index` and `init` open the same database —
+/// `verify` (and `verify --repair`), `db drop-receipts-index` (and `db drop-perp-inputs`) and `init` open the same database —
 /// ~1000 table files on chain 15's archives — under whatever soft limit the operator's shell has
 /// (1024 on a droplet's login shell, 256 on macOS). The fleet's systemd drop-in covers the unit,
 /// not a hand-run command, and a hand-run command is exactly what an operator repairing a node
@@ -2340,6 +2359,7 @@ async fn main() -> Result<()> {
             proof_window_blocks,
             program_state_cell_fee,
             fees,
+            perps,
         } => {
             let hc_bundle = match bundle_guest.as_str() {
                 "v3" => ZkExecutor::hc_hidden_bundle_v3(),
@@ -2383,6 +2403,28 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // RPL-3: the same four (`Genesis::validate` enforces them with the rest), said here by
+            // flag name before a file is written; then the section itself, read whole.
+            let perps = match &perps {
+                Some(path) => {
+                    for (on, flag) in [
+                        (tokens.is_some(), "--tokens"),
+                        (gas_price.is_some(), "--gas-price"),
+                        (hardening_v6, "--hardening-v6"),
+                        (auth_guest, "--auth-guest"),
+                    ] {
+                        if !on {
+                            anyhow::bail!("--perps needs {flag}: the perps section requires the section it writes");
+                        }
+                    }
+                    let text = std::fs::read_to_string(path)
+                        .with_context(|| format!("--perps: reading {}", path.display()))?;
+                    let cfg = serde_json::from_str::<randprotocol_core::ledger::perps::PerpsConfig>(&text)
+                        .with_context(|| format!("--perps: {} is not a valid perps config", path.display()))?;
+                    Some(cfg)
+                }
+                None => None,
+            };
             // Audit v6 TOK-1 (issue #86): the flag sets a field of the tokens section, so it
             // needs one — said here, by flag name, before a file is written.
             if tokens_incremental_root && tokens.is_none() {
@@ -2531,6 +2573,9 @@ async fn main() -> Result<()> {
                     None => None,
                 },
                 incremental_nullifier_root: incremental_nullifier_root.then_some(true),
+                // RPL-3: absent unless `--perps` is given, so a genesis cut without it hashes
+                // byte-for-byte as before.
+                perps,
                 // Multisig accounts: read from a `MultisigConfig` JSON file when `--multisig` is
                 // given (checked here against this chain id, and again by `Genesis::build`);
                 // omitted entirely otherwise, so a chain without the flag hashes byte-for-byte as
@@ -2590,6 +2635,21 @@ async fn main() -> Result<()> {
             println!("{}", gas_summary(state.ledger.gas()));
             if let Some(p) = state.ledger.program_state() {
                 println!("program_state: cell fee {} RAND", format_amount(p.cell_fee));
+            }
+            if let Some(p) = state.ledger.perps() {
+                let c = &p.config;
+                println!(
+                    "perps: {} market{}, collateral asset {}, max tier {}, at most {} blocks a proof, at most {} inputs a block, min deposit {}, engine {}, genesis root {}",
+                    c.markets.len(),
+                    if c.markets.len() == 1 { "" } else { "s" },
+                    c.collateral_asset,
+                    c.max_tier,
+                    c.max_window_blocks,
+                    c.max_block_inputs,
+                    c.min_deposit,
+                    word8_to_hex(&c.engine_hc),
+                    word8_to_hex(&c.genesis_root),
+                );
             }
             // Spec §3: every seeded account by the id the chain keys it by — what its signers
             // need to spend the RAND genesis put there — in id order.
@@ -2846,6 +2906,14 @@ async fn main() -> Result<()> {
                 false => println!("no meta key receipts_by_program_built"),
             }
             println!("a pre-v0.3 build can open this database; a v0.3 start rebuilds the index");
+        }
+        Cmd::Db { cmd: DbCmd::DropPerpInputs { datadir } } => {
+            let db = datadir.join("db");
+            match Storage::drop_perp_inputs(&datadir)? {
+                true => println!("dropped column family perp_inputs from {}", db.display()),
+                false => println!("no perp_inputs column family in {}", db.display()),
+            }
+            println!("a build from before RPL-3 can open this database; a later start re-creates the family, empty");
         }
         Cmd::Status { rpc } => {
             let v = RpcClient::new(rpc).status().await?;
@@ -4611,6 +4679,7 @@ mod tests {
             multisig: None,
             fees: None,
             incremental_nullifier_root: None,
+            perps: None,
         }
     }
 

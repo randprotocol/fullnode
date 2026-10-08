@@ -487,12 +487,6 @@ pub struct Genesis {
     /// genesis hashes byte-for-byte as before and every `Invoke` is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_state: Option<crate::ledger::program_state::ProgramStateConfig>,
-    /// Multisig accounts (`docs/superpowers/specs/2026-10-08-multisig-design.md`): the fee to
-    /// create one and the accounts the register starts with. Part of the genesis hash (the
-    /// last tag) and of the state root (`rand-state-multisig-1`) when present; omitted entirely
-    /// when absent, so every chain without one hashes and commits byte-for-byte as before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub multisig: Option<crate::ledger::multisig::MultisigConfig>,
     /// The fee-feedback rules (`ledger::fees`, `docs/fees.md` §1.3): `burn_base` destroys every
     /// bundle's `BUNDLE_BASE` instead of paying it, `subsidy_net_of_fees` pays an aggregate's
     /// subsidy from its proving shares first (it needs `aggregation`,
@@ -516,9 +510,24 @@ pub struct Genesis {
     /// (`rand-state-nf-mmr-1`) instead of a sorted root recomputed over every nullifier each
     /// block. Absent or `false` (every chain through 20) changes nothing; `true` is committed
     /// under its own tag (`b"incremental_nullifier_root"` ‖ `1`), after `tokens_incremental_root`
-    /// — last — and switches the ledger at `build`.
+    /// — before RPL-3's `perps` — and switches the ledger at `build`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incremental_nullifier_root: Option<bool>,
+    /// RPL-3 (plan 2026-10-03): perpetual futures. Present, it switches on the `perps` ledger
+    /// module — trading accounts, oracle, the per-block input digests and the proved engine root,
+    /// starting at the section's `genesis_root` — appends the perps root to the state root
+    /// (`rand-state-9`) and is bound into the genesis hash last, after `incremental_nullifier_root`.
+    /// It requires `confidential`, `tokens`, `gas`, `hardening_v6` and `hc_auth`, and a non-RAND
+    /// `collateral_asset` must be a token this file lists. Absent — every chain cut before it —
+    /// the genesis hashes byte-for-byte as before and every perp action is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perps: Option<crate::ledger::perps::PerpsConfig>,
+    /// Multisig accounts (`docs/superpowers/specs/2026-10-08-multisig-design.md`): the fee to
+    /// create one and the accounts the register starts with. Part of the genesis hash (the
+    /// last tag, after RPL-3's `perps`) and of the state root (`rand-state-multisig-1`) when present; omitted entirely
+    /// when absent, so every chain without one hashes and commits byte-for-byte as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multisig: Option<crate::ledger::multisig::MultisigConfig>,
 }
 
 /// The chains whose committed genesis file (`deploy/genesis-chain<N>.json`) carries both
@@ -620,6 +629,10 @@ pub enum GenesisError {
     /// The `program_state` section is out of bounds, or a section it depends on is missing.
     #[error("bad program_state config: {0}")]
     BadProgramState(String),
+    /// The `perps` section is out of bounds, names a collateral token this file does not list,
+    /// or a section it depends on is missing.
+    #[error("bad perps config: {0}")]
+    BadPerps(String),
     /// The `multisig` section breaks one of `MultisigConfig::check`'s rules.
     #[error("bad multisig config: {0}")]
     BadMultisig(String),
@@ -1044,6 +1057,34 @@ impl Genesis {
                 }
             }
         }
+        // RPL-3: the section's own bounds, then what it stands on — RPL-2's list, since a deposit
+        // rides the token-aware bundle and a state proof is a call-style proof under the
+        // hardened rules — and then its collateral: RAND (0), or a token this file registers at
+        // genesis (indices `FIRST_TOKEN_INDEX ..` in listing order).
+        if let Some(p) = &self.perps {
+            p.check().map_err(GenesisError::BadPerps)?;
+            for (on, name) in [
+                (self.confidential, "confidential"),
+                (self.tokens.is_some(), "tokens"),
+                (self.gas.is_some(), "gas"),
+                (self.hardening_v6 == Some(true), "hardening_v6"),
+                (self.hc_auth.is_some(), "hc_auth"),
+            ] {
+                if !on {
+                    return Err(GenesisError::BadPerps(format!("perps needs `{name}`")));
+                }
+            }
+            if p.collateral_asset != 0 {
+                let listed = self.tokens.as_ref().map_or(0, |t| t.tokens.len()) as u64;
+                let first = crate::ledger::tokens::FIRST_TOKEN_INDEX as u64;
+                let c = p.collateral_asset as u64;
+                if c < first || c >= first + listed {
+                    return Err(GenesisError::BadPerps(format!(
+                        "perps.collateral_asset {c} is not a token this genesis lists"
+                    )));
+                }
+            }
+        }
         if let Some(m) = &self.multisig {
             m.check(self.chain_id).map_err(GenesisError::BadMultisig)?;
         }
@@ -1300,6 +1341,16 @@ impl Genesis {
         if let Some(p) = &self.program_state {
             ledger.set_program_state(Some(crate::ledger::program_state::ProgramState::from_config(p)));
         }
+        // The incremental nullifier root (spec 2026-10-05 §4.1): the genesis ledger holds no
+        // nullifiers, so the range starts empty and the header's state root already carries it.
+        if self.incremental_nullifier_root == Some(true) {
+            ledger.set_incremental_nullifier_root(true);
+        }
+        // RPL-3: the perps state at genesis — no account, no price, the section's engine root at
+        // height 0. No value is seeded.
+        if let Some(p) = &self.perps {
+            ledger.set_perps(Some(crate::ledger::perps::Perps::from_config(p)));
+        }
         // Multisig accounts are issuance too: seeded balances sit in the register, beside the
         // notes, the stakes and the vesting entries, and all of them must fit a u64.
         if let Some(m) = &self.multisig {
@@ -1307,11 +1358,6 @@ impl Genesis {
             let vested = self.vesting.as_ref().map(|v| v.check().unwrap_or(0)).unwrap_or(0);
             deposited.checked_add(staked).and_then(|t| t.checked_add(vested)).and_then(|t| t.checked_add(seeded)).ok_or(GenesisError::SupplyOverflow)?;
             ledger.set_multisig(Some(crate::ledger::multisig::MultisigRegister::from_config(m, self.chain_id)));
-        }
-        // The incremental nullifier root (spec 2026-10-05 §4.1): the genesis ledger holds no
-        // nullifiers, so the range starts empty and the header's state root already carries it.
-        if self.incremental_nullifier_root == Some(true) {
-            ledger.set_incremental_nullifier_root(true);
         }
         // Replaces the empty-tree root `Ledger::new` recorded, so the only anchor a chain
         // starts with is the root the deposit notes leave behind.
@@ -1639,8 +1685,15 @@ impl Genesis {
             commit.extend_from_slice(b"incremental_nullifier_root");
             commit.push(1);
         }
-        // Multisig accounts, after `incremental_nullifier_root` — the last tag — tagged and
-        // present-only like the others; accounts in id order, so the file's order is free.
+        // RPL-3, after `incremental_nullifier_root` — last — tagged, and only when the file has the
+        // section, so every genesis cut before it hashes byte-for-byte as before. The whole
+        // section, bincode (length-prefixed wherever it is variable: the symbols, the markets).
+        if let Some(p) = &self.perps {
+            commit.extend_from_slice(b"perps");
+            commit.extend_from_slice(&bincode::serialize(p).expect("serializes"));
+        }
+        // Multisig accounts, after `perps` — the last tag — tagged and present-only like the
+        // others; accounts in id order, so the file's order is free.
         if let Some(m) = &self.multisig {
             let mut accounts: Vec<_> = m.accounts.iter().map(|a| (a.id(self.chain_id), a)).collect();
             accounts.sort_by_key(|(id, _)| *id);
@@ -2105,6 +2158,7 @@ mod tests {
             program_state: None,
             fees: None,
             incremental_nullifier_root: None,
+            perps: None,
             multisig: None,
         }
     }
@@ -4176,6 +4230,84 @@ mod tests {
         let mut edge = on;
         edge.program_state = Some(ProgramStateConfig { cell_fee: MAX_CELL_FEE });
         edge.build(&StubExecutor).unwrap();
+    }
+
+    /// RPL-3: the `perps` section switches the ledger's perps state on at its genesis root, and
+    /// is bound into the hash (last, the whole section) and the state root only when present. It
+    /// needs the five sections it stands on, and a non-RAND collateral must be a listed token.
+    #[test]
+    fn a_perps_section_is_committed_only_when_present_and_needs_what_it_stands_on() {
+        use crate::ledger::perps::{MarketSpec, PerpsConfig};
+        let plain = rpl2_ready();
+        assert!(!plain.to_json().contains("perps"), "an absent section is absent from the file");
+        let bare = build(&plain);
+        assert!(bare.ledger.perps().is_none());
+
+        let section = PerpsConfig {
+            collateral_asset: 0,
+            max_tier: 16,
+            max_window_blocks: 8,
+            max_block_inputs: 64,
+            min_deposit: 0,
+            engine_hc: [9; 8],
+            genesis_root: [8; 8],
+            markets: vec![MarketSpec {
+                id: 0,
+                symbol: "BTC-PERP".into(),
+                lot: 1_000_000,
+                tick: 1_000,
+                max_leverage: 10,
+                maintenance_bps: 500,
+                taker_fee_bps: 5,
+                maker_fee_bps: 2,
+            }],
+        };
+        let mut on = plain.clone();
+        on.perps = Some(section.clone());
+        let g = build(&on);
+        let p = g.ledger.perps().expect("the section seeds the perps state");
+        assert_eq!((p.proved_root, p.proved_height, p.accounts(None, 1).len()), ([8; 8], 0, 0));
+        assert_eq!(p.config, section);
+        assert_ne!(g.hash(), bare.hash(), "the section is a different chain");
+        assert_ne!(g.ledger.state_root(), bare.ledger.state_root(), "and its root is in the state root");
+        let mut other = on.clone();
+        other.perps.as_mut().unwrap().markets[0].taker_fee_bps = 6;
+        assert_ne!(build(&other).hash(), g.hash(), "every field of the section is bound");
+        assert_eq!(Genesis::from_json(&on.to_json()).unwrap(), on, "it round-trips");
+        let stray = on.to_json().replace("\"max_tier\"", "\"max_tiers\"");
+        assert!(Genesis::from_json(&stray).is_err(), "a stray key is refused");
+        // Beside RPL-2's section too.
+        let mut both = on.clone();
+        both.program_state = Some(crate::ledger::program_state::ProgramStateConfig { cell_fee: 10_000_000 });
+        assert!(build(&both).ledger.perps().is_some() && build(&both).ledger.program_state().is_some());
+
+        // What it stands on, one missing at a time.
+        type Drop = fn(&mut Genesis);
+        let drops: [(&str, Drop); 5] = [
+            ("confidential", |g| g.confidential = false),
+            ("tokens", |g| g.tokens = None),
+            ("gas", |g| g.gas = None),
+            ("hardening_v6", |g| g.hardening_v6 = None),
+            ("hc_auth", |g| g.hc_auth = None),
+        ];
+        for (name, drop) in drops {
+            let mut g = on.clone();
+            drop(&mut g);
+            match g.build(&StubExecutor) {
+                Err(GenesisError::BadPerps(why)) => assert!(why.contains(name), "{name}: {why}"),
+                other => panic!("{name}: {:?}", other.map(|s| s.hash())),
+            }
+        }
+        // Its own bounds, and a collateral token the file does not list.
+        let mut bad = on.clone();
+        bad.perps.as_mut().unwrap().max_tier = 11;
+        assert!(matches!(bad.build(&StubExecutor), Err(GenesisError::BadPerps(_))));
+        let mut unlisted = on;
+        unlisted.perps.as_mut().unwrap().collateral_asset = 1;
+        match unlisted.build(&StubExecutor) {
+            Err(GenesisError::BadPerps(why)) => assert!(why.contains("collateral_asset 1"), "{why}"),
+            other => panic!("{:?}", other.map(|s| s.hash())),
+        }
     }
 
     /// Split authorisation (review I-1): a v3 `Call` carries three proofs — bundle, auth, call —

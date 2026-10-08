@@ -401,6 +401,7 @@ all hard forks together as chain 14:
 | [docs/vesting.md](docs/vesting.md) | timelocked genesis allocations: claims, revocation, bonding locked RAND |
 | [docs/consensus.md](docs/consensus.md) | the consensus rules added since the architecture write-up (the not-held quorum, durable pending blocks, recovery rules) |
 | [docs/program-state.md](docs/program-state.md) | RPL-2 (v0.6.8): program cells and vaults, the `Invoke` action and its declared transition, the context ABI a program reads, the two rules a program must keep, fees, the genesis section |
+| [docs/perps.md](docs/perps.md) | RPL-3 (unreleased): the perpetual-futures exchange the chain records and a proof settles: the genesis section, the six actions (34–39), the oracle, the state proof and its public segment, payouts, the word encodings, the node's `perp_inputs` family and rollback, what v0 leaves out |
 | [docs/tokens.md](docs/tokens.md) | RPL, the token standard (v0.5): a token as a registry entry, asset ids and `rpl1…`, mint authorities, creation, hidden-asset transfers, burning, the CLI and RPC, ERC-20/SPL comparison |
 | [docs/guests.md](docs/guests.md) | writing and deploying a RISC-V program: the Rand ISA, the syscall ABI, the image container, `rand-guest` build/check/run/pack, `hc` versus program id, the program-size cap |
 | [docs/translators.md](docs/translators.md) | the Solana (`sbpf2rv`) and Ethereum (`evm2rv`) translators: trust model, parity, the ERC-20 and SPL Token walkthroughs, measured cycles, limits |
@@ -420,7 +421,9 @@ Done: the shielded pool, staking and the bridge as notes (phases S1–S3), RPL t
 pruning, address sharing and the memo, genesis vesting, delegated proving with split
 authorisation, gas, RPL-2 (program state, program vaults, `Invoke` — live on chain 20), the
 zUSD bridge fees, the bridge endpoint redeploy (chains 19 and 20 name the new Ethereum, BNB and
-Tron contracts), and the audit v6 and v7 fixes (`CHANGELOG.md`).
+Tron contracts), the audit v6 and v7 fixes (`CHANGELOG.md`), and RPL-3 perps (a proved
+perpetual-futures exchange behind the `perps` genesis section, unreleased and on no chain yet;
+`docs/perps.md`).
 
 Next:
 - **Mainnet (v1.0)**, with a fresh genesis and a network marker that makes archive rules into

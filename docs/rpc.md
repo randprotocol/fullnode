@@ -389,6 +389,70 @@ own units. A row at zero does not exist, so an empty vault — and a program nob
 (`burn_r`, and `burn_a` of `burn_asset` when the transition's `inflow` is `deposit`) and leaves
 it as the notes the transition's `pays` name.
 
+### `rand_getPerps`
+RPL-3 (perps; genesis-gated, `docs/perps.md`). Params: `[]`. Result, the exchange's public state as
+of the head — the genesis section, the proved root and height, the heights a next proof must
+cover, each market's median, and two counts; `{"enabled": false}` and nothing else on a chain
+without a `perps` section:
+
+```json
+{ "enabled": true,
+  "collateral_asset": 0, "max_tier": 18, "max_window_blocks": 64,
+  "max_block_inputs": 8, "min_deposit": "1000000",
+  "engine_hc": "<64 hex>", "genesis_root": "<64 hex>",
+  "markets": [{ "id": 0, "symbol": "BTC-PERP", "lot": 1000000, "tick": 1000000,
+                "max_leverage": 20, "maintenance_bps": 500, "taker_fee_bps": 5, "maker_fee_bps": 2 }],
+  "proved_root": "<64 hex>", "proved_height": 120, "head_height": 131,
+  "pending_heights": [121, 122, …, 131],
+  "medians": [{ "market": 0, "price": "64250000000" }],
+  "accounts": 3, "pending_withdrawals": 1 }
+```
+
+The three commitments are 64 lowercase hex characters (a `Word8`, its eight words little-endian).
+`pending_heights` are the closed heights no state proof has covered, ascending: the digests the
+next proof's window is drawn from. A median is a decimal string, `"0"` when the last close had no
+quorum of fresh oracle stake behind a price (`docs/perps.md`). `max_block_inputs` is the most perp
+inputs one block records and `min_deposit` (a decimal string, `"0"` for no floor) the smallest
+deposit. This is what `perp-prover` and the trading site poll. On the public listener.
+
+### `rand_getPerpAccount`
+Params: `[account]`, the id as 64 hex (with or without `0x`). Result, one trading account:
+
+```json
+{ "account": "<64 hex>", "trading_key": "<hex of the Dilithium2 public key>",
+  "nonce_high": 7, "used": "9223372036854775809",
+  "withdrawals": [{ "request": "<64 hex>", "amount": "2000000", "height": 2 }] }
+```
+
+`nonce_high` and `used` are the nonce window (`docs/perps.md`; `used` is the 64-bit bitmap, a
+decimal string); a wallet's next nonce is `nonce_high + 1`. `withdrawals` are the account's pending
+requests in request order, `height` the block each was admitted in. The account's collateral and
+positions are the engine's state, not the ledger's, and are not served. `null` for an id the
+exchange does not hold, and on a chain without the section. On the public listener.
+
+### `rand_getPerpAccounts`
+Params: `[{ "after": "<64 hex>" | null, "limit": n }]`, the object optional. Result:
+`{ "accounts": [<as rand_getPerpAccount>, …], "next": "<64 hex>" | null }` — the accounts in id
+order, starting after `after`, at most `limit` of them (clamped to 1 000, at least 1). `next` is
+the last id served when more follow. The exchange holds at most 15 accounts, so one page is all of
+them. `{ "accounts": [], "next": null }` without the section. A non-object param is
+`invalid params`. On the public listener.
+
+### `rand_getPerpInputs`
+Params: `[height]`. Result, a closed block's perp input words — what a prover runs the engine
+over:
+
+```json
+{ "height": 121, "digest": "<64 hex>", "words": [1, 4294967295, …] }
+```
+
+`digest` is `D_height`, the digest the ledger recorded while the height is pending, else
+recomputed over the stored words (`perp_digest`, domain 21); a prover refuses a window whose
+digests do not match its own. `words` are the block's inputs in block order and the closing
+`Close` (`docs/perps.md`, "The word encodings"), each a `u32`. `null` for a height this node holds
+no row for: a state proof has covered it (the row is pruned with the proof), it is above the head,
+or the chain has no `perps` section. On the public listener.
+
 ### `rand_getMultisig`
 Params: `[id]` — the account's 64-hex id (`docs/multisig.md`). Result:
 
@@ -552,6 +616,23 @@ rule — the transition's context words (11 + 16 per read or write + 3 per payou
 the program's public input and the 8 binding words in a 128-row public table, so 119 context
 words for a program without a public input. A node that predates the field answers without it,
 which a wallet reads as `null`.
+
+`perps` (RPL-3, `docs/perps.md`) is the genesis `perps` section's limits, or `null` on a chain
+without it — where every perp action is refused:
+
+```json
+"perps": { "collateral_asset": 0, "max_tier": 18, "max_window_blocks": 64, "max_payouts": 8,
+           "max_block_inputs": 8, "min_deposit": "1000000" }
+```
+
+`collateral_asset` is the asset a deposit burns and a payout pays (0 is RAND), `max_tier` the
+highest tier a state proof may be made at, `max_window_blocks` the most blocks one proof may
+cover, and `max_payouts` the most withdrawals one proof pays, which is also the most that may be
+pending at once. `max_block_inputs` is the most perp inputs one block records (a deposit, an
+order, a cancel, a withdrawal; an account at most 8 of them a block) and `min_deposit` the
+smallest deposit in collateral units, a decimal string (`"0"`: no floor). A node that predates the
+field answers without it, which a wallet reads as `null` (and a node that predates the last two,
+without them: 0).
 
 ### `rand_getProgramCode`
 Params: `[program_id]`. Result: `null` or `{ "base_pc": 0, "words": [u32, ...] }` (what the wallet
@@ -787,6 +868,30 @@ the chain appended, and the `from` word is the chain's fixed `PROGRAM_FROM` — 
 rebuilds it from these fields with nothing decrypted, as it rebuilds a mint. **The kind string
 `invoke` is what the wallet's scan keys on and is pinned by a test.** The program's eight output
 words are on the receipt (`rand_getReceipt`), as a call's are.
+
+The RPL-3 perp actions (`docs/perps.md`) render as six kinds. Everything in them is public by
+design; the engine's inputs are what its prover replays:
+
+```json
+{ "kind": "perp_deposit", "trading_key": "<hex>", "account": "<64 hex>" }
+{ "kind": "perp_order", "account": "<64 hex>",
+  "body": { "nonce": 5, "market": 0, "side": 0, "kind": 0, "tif": 0, "reduce_only": false,
+            "price": "64250000000", "size": "1000000" } }
+{ "kind": "perp_cancel", "account": "<64 hex>", "nonce": 6, "target": 5 }
+{ "kind": "perp_withdraw", "account": "<64 hex>", "nonce": 7, "amount": "2000000",
+  "recipient": "<shielded address>", "time": 41 }
+{ "kind": "perp_oracle", "validator": "<base58 address>",
+  "prices": [{ "market": 0, "price": "64250000000" }], "nonce": 1759500000000 }
+{ "kind": "perp_state_proof", "from_height": 120, "to_height": 131, "new_root": "<64 hex>",
+  "payouts": [{ "request": "<64 hex>", "amount": "1500000" }], "fees": "10", "proof_bytes": 268123 }
+```
+
+A deposit's amount is the bundle's `burn_r` (RAND collateral) or `burn_a` of `burn_asset` (token
+collateral), rendered with the bundle. An order's `body` is nested because its own `kind`
+(0 limit, 1 market) would collide with the action's; `side` is 0 buy, 1 sell, `tif` 0 GTC, 1 IOC,
+2 post-only. A withdrawal's `envelope` is the recipient's and is not rendered; the request id a
+state proof's payouts name is the withdrawal's transaction hash. Prices, sizes, amounts and `fees`
+are decimal strings.
 
 No reply from this method carries the sender, recipient, nonce or amount of a *transfer*: no such
 field exists in a stored transfer. The staking and bridge actions above are the deliberate
@@ -1197,6 +1302,13 @@ entering the pool, inside `pool_value` beside `withdraw_deposited`), and what th
 hold — register-side value, inside `total_supply`. It entered through an invoke's bundle
 `burn_r`, so it is inside `burned` on the pool side; this is its register-side twin, and a
 token in a vault is still in that token's `total_supply`.
+
+`perps_rand_out` and `perps_rand_held` (RPL-3, perps; `"0"` without a `perps` section and on a
+chain whose collateral is a token): RAND that state proofs have paid out of the exchange as notes
+(value entering the pool, inside `pool_value`), and what it still holds, `deposited - paid`. A RAND
+deposit entered through a bundle's `burn_r`, so it is inside `burned` on the pool side, and this is
+its twin, as the program vaults' pair is; `invariant_holds` covers it. A token collateral's supply
+does not move on the way in or out, so nothing is counted for it.
 
 `multisig_issued`, `multisig_rand_in`, `multisig_rand_out`, `multisig_base_out` and
 `multisig_rand_held` (multisig accounts, `docs/multisig.md`; `"0"` without a `multisig` section):
@@ -1639,12 +1751,26 @@ Action::ListBacking { token_index: u32, chain: u16, token: [u8; 32], decimals: u
                       pq_signatures: Vec<PqSignature> }               // B4
 Action::Invoke { program: Hash, proof: Vec<u8>, input_envelope: Option<CallEnvelope>,
                  transition: Transition }                             // RPL-2, tag 33 (after the vesting actions and audit v6's AdmitValidator … CancelRotation, 28–32)
-Action::CreateMultisig { salt: [u8; 32], signers: Vec<PublicKey>, threshold: u8 }   // tag 34, bundle-carried
-Action::MultisigDeposit { account: [u8; 32] }                         // tag 35, bundle-carried
+Action::PerpDeposit { trading_key: PublicKey }                         // RPL-3, tag 34: rides a bundle
+Action::PerpOrder { account: Word8, body: PerpOrderBody, signature: Signature }        // 35, bundle-less, fee-less
+Action::PerpCancel { account: Word8, nonce: u64, target: u64, signature: Signature }   // 36
+Action::PerpWithdraw { account: Word8, nonce: u64, amount: u64, recipient: ShieldedAddress,
+                       r: Word8, time: u32, envelope: Envelope, signature: Signature } // 37
+Action::PerpOracle { validator: PublicKey, prices: Vec<PerpPrice>, nonce: u64,
+                     signature: Signature }                                             // 38
+Action::PerpStateProof { from_height: u64, to_height: u64, new_root: Word8,
+                         payouts: Vec<PerpPayout>, fees: u64, proof: Vec<u8> }          // 39, unsigned
+
+PerpOrderBody { nonce: u64, market: u32, side: u8, kind: u8, tif: u8, reduce_only: bool, price: u64, size: u64 }
+PerpPrice { market: u32, price: u64 }
+PerpPayout { request: Word8, amount: u64 }
+
+Action::CreateMultisig { salt: [u8; 32], signers: Vec<PublicKey>, threshold: u8 }   // tag 40, bundle-carried
+Action::MultisigDeposit { account: [u8; 32] }                         // tag 41, bundle-carried
 Action::MultisigPay { account: [u8; 32], nonce: u64, time: u32, pays: Vec<Payout>,
-                      signatures: Vec<SignerSignature> }              // tag 36, bundle-less
+                      signatures: Vec<SignerSignature> }              // tag 42, bundle-less
 Action::MultisigRotate { account: [u8; 32], nonce: u64, signers: Vec<PublicKey>, threshold: u8,
-                         signatures: Vec<SignerSignature> }           // tag 37, bundle-less, fee-less
+                         signatures: Vec<SignerSignature> }           // tag 43, bundle-less, fee-less
 SignerSignature { index: u8, signature: Signature }                  // by position in the account's signers
 
 MintAuthority = None | Key(PublicKey) | Bridge { backings: Vec<Backing> } | Program(Hash)
@@ -1728,7 +1854,7 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
-### Unreleased — multisig accounts: `rand_getMultisig`, four actions (tags 34–37) (genesis-gated; no chain carries it yet)
+### Unreleased — multisig accounts: `rand_getMultisig`, four actions (tags 40–43) (genesis-gated; no chain carries it yet)
 
 Additive. A genesis `multisig` section (`docs/multisig.md`) switches on M-of-N accounts: public
 per-asset balances spent by `threshold` of `n` Dilithium2 keys. New: `rand_getMultisig [id]`
@@ -1740,8 +1866,7 @@ renders four kinds: `create_multisig` (`salt`, `threshold`, `signer_count`), `mu
 (`account`), `multisig_pay` (`account`, `nonce`, `time`, `pays` with each note's `cm` as an invoke's,
 `signers` = the **indices** that signed) and `multisig_rotate` (`account`, `nonce`, `threshold`,
 `signer_count`, `signed_by` = the indices that signed). A block header carries a `MultisigPay`'s
-notes in `public_notes`. The four actions are tags 34–37, appended after `Invoke`; **if `feat/rpl3`
-(perps), which also appends at 34, merges first, these renumber** — an encoder must derive tags
+notes in `public_notes`. The four actions are tags 40–43, after the perps actions (34–39) — an encoder must derive tags
 from the enum. All four are refused (`UnsupportedAction("multisig")`) on a chain without the section.
 
 ### Unreleased — the proposer/aggregator split: `fee_rules.proposer_share_bps` and `prove_base` (genesis-gated; no chain carries it yet)
@@ -1774,6 +1899,29 @@ from the ledger's own payment, so a node that synced the covered bundle and its 
 commit no longer reports a `proving_share` of 0 (and, under the flag, the full schedule as
 `subsidy`) where a live node reports the paid amounts. Records written before the fix keep their
 stored values.
+
+### 2026-10-03 — RPL-3: perps (genesis-gated; on no chain yet)
+
+`docs/perps.md`, `docs/superpowers/plans/2026-10-03-rpl3-perps.md`. Inert on every chain whose
+genesis has no `perps` section: every perp action is refused, `rand_getPerps` answers
+`{"enabled": false}` and the state root is what it was.
+
+- **Six new actions** (`Action` 34–39, appended after `Invoke`): `perp_deposit` (a bundle's burn
+  funds a trading account), `perp_order`, `perp_cancel`, `perp_withdraw` and `perp_oracle` (signed,
+  bundle-less, fee-less), and `perp_state_proof` (a STARK of the engine over a window of blocks;
+  unsigned, so anyone may prove). `rand_getTransaction` renders each; the kind strings are above.
+- **`rand_getPerps`, `rand_getPerpAccount`, `rand_getPerpAccounts`, `rand_getPerpInputs`**: the
+  exchange's state, an account, a page of accounts and a closed block's input words. All four are
+  on the public listener.
+- **`rand_getLimits` gains `perps`** (`{ collateral_asset, max_tier, max_window_blocks,
+  max_payouts, max_block_inputs, min_deposit }` or `null`); `rand_getPerps` carries
+  `max_block_inputs` and `min_deposit` too.
+- **`rand_getSupply` gains `perps_rand_out` and `perps_rand_held`** (both `"0"` without the
+  section); `invariant_holds` covers them.
+- **A payout is a note the chain computes**, appended with the withdrawal request's envelope, so a
+  wallet finds it by trial decryption as it finds a mint; `from` is the fixed `PERP_FROM`.
+- The state root is `rand-state-9` on a chain with the section, and block time is bounded there as
+  on a bridged chain.
 
 ### 2026-10-01 — audit v6, TOK-1: `tokens.incremental_root` (genesis-gated; no chain carries it yet)
 

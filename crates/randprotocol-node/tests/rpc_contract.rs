@@ -2,7 +2,8 @@
 //!
 //! Four repos consume this node's JSON-RPC: randscan (its indexer), randbridge.org (the status
 //! service), randprotocol.org (the sale relay and the balance viewer) and zusd.money (through
-//! randscan's REST, which is these same reads). Their own integration tests spawn a real
+//! randscan's REST, which is these same reads), and durian.market's perps frontend and its
+//! `perp-prover` read the RPL-3 perps methods ([`perps_reads_under_a_perps_section`]). Their own integration tests spawn a real
 //! `rand-node` (`scripts/dev-chain.sh`, `docs/howto.md` §7, "How do I run the downstream
 //! integration tests?"), but those run in their CI, after a release. This file fails here first: a field one of
 //! them reads that is renamed, dropped or changes JSON type is a red `check-and-test` in this repo
@@ -403,6 +404,14 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
             "randscan crates/randscan-indexer/src/rpc.rs `program_cells`",
             json!({ "enabled": false }),
         ),
+        // ---- perps (RPL-3; no `perps` section here: the disabled shapes the consumers branch on) ----
+        // durian.market web/lib/perps/client.ts `parsePerps` and crates/perp-prover/src/rpc.rs
+        // `parse_perps`: `{"enabled": false}` is "perps are off on this chain".
+        exactly("rand_getPerps", json!([]), "durian.market web/lib/perps/client.ts `parsePerps`, crates/perp-prover/src/rpc.rs `parse_perps`", json!({ "enabled": false })),
+        // durian.market crates/perp-prover/src/rpc.rs `parse_perp_inputs`: `null` is "no record".
+        exactly("rand_getPerpInputs", json!([height]), "durian.market crates/perp-prover/src/rpc.rs `parse_perp_inputs`", Value::Null),
+        // randprotocol-client src/lib.rs `ChainLimits::perps` (`rand perp`): `null` without the section.
+        row("rand_getLimits", json!([]), "randprotocol-client src/lib.rs `ChainLimits::perps`", &[("perps", Null)]),
     ];
     let mut rows = rows;
     // randprotocol.org server/sale/src/rpc.rs (the relay forwards the answer to the wallet).
@@ -599,4 +608,86 @@ fn the_sale_relays_allowlist_is_inside_the_public_listeners_set() {
     ];
     let missing: Vec<_> = RELAY.iter().filter(|m| !randprotocol_node::rpc::PUBLIC_METHODS.contains(m)).collect();
     assert!(missing.is_empty(), "the sale relay forwards methods the public listener refuses: {missing:?}");
+}
+
+/// RPL-3: the reads durian.market's perps frontend and its `perp-prover` make on a chain with a
+/// `perps` section, field by field (durian.market web/lib/perps/client.ts `parsePerps`,
+/// crates/perp-prover/src/rpc.rs `PerpsInfo`/`parse_perp_inputs`), and `rand_getLimits.perps`
+/// (randprotocol-client src/lib.rs `PerpsLimits`). Served without a node behind it: these are
+/// genesis and store reads, and one block's input row is seeded into the store directly, as a
+/// committed block would have written it.
+#[tokio::test]
+async fn perps_reads_under_a_perps_section() {
+    let (addr, _served) = common::serve_genesis_seeded(
+        |g| {
+            g.tokens = Some(TokensConfig {
+                registration_fee: 1_000_000_000,
+                tokens: vec![],
+                mint_cap_per_day: 100_000 * 100_000_000,
+                max_tokens: None,
+                burn_registration_fee: None,
+                bound_note_value: None,
+                incremental_root: None,
+            });
+            g.gas = Some(randprotocol_core::gas::GasConfig {
+                gas_price: 100,
+                byte_price: randprotocol_core::gas::BYTE_PRICE_DEFAULT,
+                bundle_gas_limit: randprotocol_core::gas::bundle_gas_limit_pin(),
+                metering: randprotocol_core::gas::GasMetering::Circuit,
+                dynamic: None,
+            });
+            g.hardening_v6 = Some(true);
+            g.hc_auth = Some("11".repeat(32));
+            g.max_block_bytes = Some(20 << 20);
+            g.perps = Some(randprotocol_core::ledger::perps::PerpsConfig {
+                collateral_asset: 0,
+                max_tier: 16,
+                max_window_blocks: 8,
+                max_block_inputs: 8,
+                min_deposit: 1_000,
+                engine_hc: [31; 8],
+                genesis_root: [32; 8],
+                markets: vec![randprotocol_core::ledger::perps::MarketSpec {
+                    id: 0,
+                    symbol: "BTC-PERP".into(),
+                    lot: 1_000_000,
+                    tick: 1_000,
+                    max_leverage: 10,
+                    maintenance_bps: 500,
+                    taker_fee_bps: 5,
+                    maker_fee_bps: 2,
+                }],
+            });
+        },
+        |storage| storage.put_perp_inputs(1, &[1, 2, 3]).unwrap(),
+    )
+    .await;
+    let rows = [
+        // durian.market web/lib/perps/client.ts `parsePerps` / `decodeMarket`; crates/perp-prover
+        // src/rpc.rs `PerpsInfo` / `ChainMarket` / `Median` (each u64 a number or a decimal string).
+        row("rand_getPerps", json!([]), "durian.market web/lib/perps/client.ts `parsePerps`, crates/perp-prover/src/rpc.rs `PerpsInfo`", &[
+            ("enabled", Bool), ("collateral_asset", Int), ("max_tier", Int), ("max_window_blocks", Int),
+            ("engine_hc", Hex), ("genesis_root", Hex), ("markets", Arr),
+            ("markets.0.id", Int), ("markets.0.symbol", Str), ("markets.0.lot", Int), ("markets.0.tick", Int),
+            ("markets.0.max_leverage", Int), ("markets.0.maintenance_bps", Int), ("markets.0.taker_fee_bps", Int),
+            ("markets.0.maker_fee_bps", Int),
+            ("proved_root", Hex), ("proved_height", Int), ("head_height", Int), ("pending_heights", Arr),
+            ("medians", Arr), ("medians.0.market", Int), ("medians.0.price", Dec),
+            ("accounts", Int), ("pending_withdrawals", Int),
+        ]),
+        // durian.market crates/perp-prover/src/rpc.rs `parse_perp_inputs` (`{height, words}`).
+        row("rand_getPerpInputs", json!([1]), "durian.market crates/perp-prover/src/rpc.rs `parse_perp_inputs`", &[
+            ("height", Int), ("words", Arr), ("words.0", Int),
+        ]),
+        exactly("rand_getPerpInputs", json!([2]), "durian.market crates/perp-prover/src/rpc.rs `parse_perp_inputs`", Value::Null),
+        // randprotocol-client src/lib.rs `PerpsLimits`.
+        row("rand_getLimits", json!([]), "randprotocol-client src/lib.rs `PerpsLimits`", &[
+            ("perps.collateral_asset", Int), ("perps.max_tier", Int), ("perps.max_window_blocks", Int), ("perps.max_payouts", Int),
+        ]),
+    ];
+    check(addr, &rows).await;
+    // The engine commitments are exactly the section's, as the prover compares them.
+    let perps = call(addr, "rand_getPerps", json!([])).await;
+    assert_eq!(perps["result"]["enabled"], json!(true));
+    assert_eq!(perps["result"]["engine_hc"], json!(randprotocol_core::notes::word8_to_hex(&[31; 8])));
 }

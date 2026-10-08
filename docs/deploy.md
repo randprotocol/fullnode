@@ -1299,9 +1299,8 @@ Multisig accounts (`docs/multisig.md`, spec `docs/superpowers/specs/2026-10-08-m
 switch on with a top-level `"multisig": { "create_fee": "<units>", "accounts": [ … ] }`. Hashed
 after every other section, folded into the state root as the wrapper `rand-state-multisig-1` and
 persisted under `META_MULTISIG`, all only when present — chain 20's file builds chain 20's hash
-unchanged. Until a cut carries the section, a node refuses all four actions (tags 34–37) with
-`UnsupportedAction("multisig")`: **dormant on chain 20**. If `feat/rpl3` (which also appends at tag
-34) merges first, one of the two renumbers its variants before any cut carries them.
+unchanged. Until a cut carries the section, a node refuses all four actions (tags 40–43, after the perps actions' 34–39) with
+`UnsupportedAction("multisig")`: **dormant on chain 20**.
 
 **What the cut passes:** `rand-node genesis … --multisig multisig.json --chain-id <N>`. The id is
 derived from the chain id, so write the file for the chain being cut. **What to record:** the
