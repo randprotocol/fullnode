@@ -145,6 +145,12 @@ is not the owner's spend key: it signs orders and nothing else.
 | 38 | `PerpOracle { validator, prices, nonce, signature }` | a validator's key | 0 |
 | 39 | `PerpStateProof { from_height, to_height, new_root, payouts, fees, proof }` | none: the STARK is the authority | 0 |
 
+A `PerpDeposit`'s bundle is an ordinary bundle to the fee split (`Ledger::bundle_fee_split`): the
+floor it pays is the schedule's, plus the genesis `fees.prove_base` where a chain sets it, and the
+`fees` rules apply to it as to any bundle — under `burn_base` its base burns, under `burn_floor`
+its whole floor, counted in `base_fees_burned`; the collateral burn beside it is the deposit, not a
+fee. `rand perp deposit`'s default fee is that floor (`wallet::schedule_floor`).
+
 Every rule below is checked by `validate`, in this order; the per-block caps come after the
 action's own rules, and the signature last: it is the one expensive check. `apply` is only ever
 reached through `apply_tx`, which runs `validate` on the same state first, and then re-checks,

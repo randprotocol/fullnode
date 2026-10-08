@@ -1949,6 +1949,28 @@ mod tests {
         assert_eq!(&words[9..11], &[5, 0], "the amount is the token burn");
     }
 
+    /// A `PerpDeposit`'s bundle goes through the ledger's fee split (`bundle_fee_split`) like any
+    /// other: at the floor the proposer keeps it all without a `fees` section, the tip (nothing,
+    /// here) under `burn_base`, and nothing under `burn_floor`, the burned part counted in
+    /// `base_fees_burned` — the collateral burn (`burn_r`) beside it untouched.
+    #[test]
+    fn a_deposits_bundle_pays_the_floor_through_the_fee_split() {
+        let floor = gas::fee_floor(&Action::PerpDeposit { trading_key: kp(50).public_key().clone() });
+        let rewards = |l: &Ledger| l.validators()[&kp(1).address()].rewards;
+        for (fees, burned) in [
+            (crate::ledger::fees::FeesConfig::default(), 0),
+            (crate::ledger::fees::FeesConfig { burn_base: Some(true), ..Default::default() }, gas::BUNDLE_BASE),
+            (crate::ledger::fees::FeesConfig { burn_base: Some(true), burn_floor: Some(true), ..Default::default() }, floor),
+        ] {
+            let mut l = ledger_with(true);
+            l.set_fees(fees.clone());
+            dep(&mut l, &kp(50), 10, RAND).unwrap();
+            assert_eq!(l.base_fees_burned(), burned, "{fees:?}");
+            assert_eq!(rewards(&l), floor - burned, "{fees:?}: the proposer keeps what is not burned");
+            assert!(l.perps().unwrap().account(&id(&kp(50))).is_some(), "{fees:?}: the deposit applied");
+        }
+    }
+
     #[test]
     fn deposits_stop_at_fifteen_accounts_and_the_insurance_id_is_reserved() {
         let mut l = ledger_with(true);
