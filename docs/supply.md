@@ -62,14 +62,22 @@ Two of those rows are easy to get subtly wrong, so they are worth stating twice:
 ```
 pool_value     = genesis_deposited + faucet_minted + withdraw_deposited + subsidised
                  − fees_paid − burned
+                 + vesting_released + program_rand_out + multisig_rand_out
 register_total = Σ over the validator register of (stake + pending + rewards)
                  + Σ over the aggregator register of bond
 total_supply   = pool_value + register_total
+                 + vesting_in_register + program_rand_held + multisig_rand_held
 issued         = genesis_deposited + genesis_staked + faucet_minted + subsidised
+                 + vesting_issued + multisig_issued
 
 invariant:       total_supply == issued − slashed − registration_fees_burned
                                         − base_fees_burned
 ```
+
+The `vesting_*`, `program_*` and `multisig_*` terms are 0 on a chain without the `vesting`,
+`program_state` or `multisig` section; the sections below say what each one counts
+(`program_rand_out` is the RAND notes program vaults paid out, `program_rand_held` what the vaults
+still hold — `docs/rpc.md`, `rand_getSupply`).
 
 `pool_value` is value the pool holds; it is not the sum of the notes in it, which nobody can compute
 — it is what entered minus what left, which comes to the same number. `invariant_holds` being false
@@ -132,8 +140,10 @@ in a fourth public register. Like the vesting rows, its counters are kept off th
 So `pool_value` gains `rand_out`, `total_supply` gains `multisig_rand_held` as its own term and `issued` gains
 `multisig_issued`; the identity `total_supply == issued` still holds. A payment of 100 RAND
 takes 100.001 out of the account: a 100 note into the pool and the 0.001 base into a proposer's
-`rewards` (a Withdraw's shape, with the account paying the base). A `create_fee` goes to the
-proposer with the rest of the fee and is not burned, so the identity does not move. Tokens in a
+`rewards` (a Withdraw's shape, with the account paying the base). A `create_fee` is part of the
+bundle's fee — to the proposer, or, on a chain with the `aggregation` section, through the fee
+split (the proposer keeps `BUNDLE_BASE`, the rest is bucketed) — and is not burned, so the
+identity does not move. Tokens in a
 vault leave the token's `total_supply` untouched, as in a program vault.
 
 ## Reading it

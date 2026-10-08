@@ -15,10 +15,11 @@ RAND is held as shielded notes, and a note is spent by one key: there is no thre
 inside the spend proof, and adding one would be a guest change and a tier re-measure. A treasury
 that one key controls is a treasury one stolen laptop empties.
 
-The chain already solves this twice with a public register instead of a note: the validator
-register and the vesting register, whose revoke (`docs/vesting.md`) is authorised by a threshold of
-positional Dilithium2 keys. A **multisig account** is the fourth such register (validators, vesting, program vaults, multisig): a public, per-asset
-balance whose spending authority is `threshold` of `n` Dilithium2 keys.
+The chain already solves this three times with a public register instead of a note: the validator
+register, the vesting register — whose revoke (`docs/vesting.md`) is authorised by a threshold of
+positional Dilithium2 keys — and the program vaults. A **multisig account** is the fourth such
+register: a public, per-asset balance whose spending authority is `threshold` of `n` Dilithium2
+keys.
 
 ```
  genesis ──► multisig account (public balance, per asset) ◄── create / deposit (a bundle's burn)
@@ -54,7 +55,7 @@ number of them with RAND, in its `multisig` section:
 
 | field | meaning |
 |---|---|
-| `create_fee` | units of RAND a later `CreateMultisig` must pay **above** the bundle base (0.001 RAND), to the proposer with the rest of its fee — not burned. `0` to 1 000 RAND. Spam on a permanent register is what it prices. |
+| `create_fee` | units of RAND a later `CreateMultisig` must pay **above** the bundle base (0.001 RAND) — not burned: it is part of the bundle's fee, which goes to the proposer, or, on a chain with the `aggregation` section, follows the fee split (the proposer keeps the 0.001 RAND `BUNDLE_BASE`, the rest is bucketed). `0` to 1 000 RAND. Spam on a permanent register is what it prices. |
 | `accounts` | may be empty: a section with no accounts switches the module on with an empty register. |
 | `salt` | 32 bytes (64 hex characters), the creator's randomness in the id. The chain never learns a name. |
 | `signers` | 1 to 10 distinct Dilithium2 public keys. **The order matters**: a signature names its signer by position (`0:<hex>`). |
@@ -149,7 +150,8 @@ A payment is three steps — the keys never have to be on one machine:
 # 1. anyone (no key): write the payment down; each --to pairs with an --amount (and an --asset)
 rand-node multisig pay prepare --account <id> --to rand1… --amount 250000 --out pay.json --rpc https://…
 #    several payouts (at most 4): repeat the pair; --asset is all or nothing: omit it (every payout
-#    is RAND) or give one --asset N per --to, in order (a count that differs is refused)
+#    is RAND) or give one --asset N per --to, in order (a count that differs is refused); an
+#    --amount is in its asset's display units (RAND at 9 decimals, a token at its own decimals)
 rand-node multisig pay prepare --account <id> --to rand1… --amount 10 --asset 0 \
                                                 --to rand1… --amount 500 --asset 2 --out pay.json
 # 2. each signer, on its own machine (offline is fine): read it, sign it
