@@ -1416,6 +1416,46 @@ mod tests {
     /// attest encoding `a6ec2084406fa08c02c05bd50142daf06a723fdbdda856d68cd41a34e02772c6` and id
     /// `a6fe97af73dda142415401c7e755f8532f081bd3fcacfae3fc833e057be1ea23`, aggregate id
     /// `a25cb696d9d92cecb09c0b4d4c818ae30c6e29ecda1d73944395843e3f350e0f`.
+    /// `(blake3(encoding), txid)` of `the_multisig_actions_encodings_and_txids_are_pinned`'s four
+    /// transactions, tags 40–43 in order. Consensus encodings: a change here is a wire change.
+    const MULTISIG_PINS: [(&str, &str); 4] = [
+        ("4ddfd74bfdf37f95183dc76b092338b379db0ec653bcb7d22a66822673e6e3db", "5ba6639cc70c9654bf480004b61bc13530239cb720fb73659fec466049af9a1e"),
+        ("216fa72b0872c77ffcdfef2baf1f8283dacd253a1faab0b99296ddc95098846a", "73a4b309dfd86482f53698283b215818c2f3c6e0a43aa34839354ea91a3ba226"),
+        ("d1489b5207d4ddb2b9cb9d0b3c9144fcc5b3cfb7ac8191d0212727641275cbd7", "3a02e0b74b96460fa183300b05a4cd720dab05c527b3ee1add2c2d30d6f936ac"),
+        ("319ae9e5e0a25014e0c620634dc65478aa70b19da9fb430b2a12a5e641d98b90", "2b8dc4b1a2493aa291d4be6526c386d6b2a35184f9a712c475ca9c40823f915a"),
+    ];
+
+    /// The four multisig actions on the wire (spec 2026-10-08 §5): their tags are 40–43, after the
+    /// perps actions (34–39), and each one's encoding and txid are pinned — fixtures with fixed
+    /// signature bytes, since a Dilithium signature is not deterministic. A tag is the bincode
+    /// position, read straight off the encoding: chain id (8 bytes), the bundle's `Option` tag
+    /// (1 byte, 0 for a bundle-less pay or rotate), then the variant as a u32.
+    #[test]
+    fn the_multisig_actions_encodings_and_txids_are_pinned() {
+        use crate::ledger::program_state::Payout;
+        use crate::types::actions::SignerSignature;
+        let key = || Keypair::from_seed([3; 32]).unwrap().public_key().clone();
+        let fixed = || Signature::from_bytes(&[7u8; crate::crypto::SIGNATURE_LEN]).unwrap();
+        let signed = |index| SignerSignature { index, signature: fixed() };
+        let payout = Payout { asset: 2, amount: 5, recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] }, r: [5; 8], envelope: env() };
+        let txs = [
+            Transaction::shielded(13, bundle(), Action::CreateMultisig { salt: [1; 32], signers: vec![key()], threshold: 1 }),
+            Transaction::shielded(13, bundle(), Action::MultisigDeposit { account: [2; 32] }),
+            Transaction { chain_id: 13, bundle: None, action: Action::MultisigPay { account: [2; 32], nonce: 3, time: 9, pays: vec![payout], signatures: vec![signed(0), signed(2)] } },
+            Transaction { chain_id: 13, bundle: None, action: Action::MultisigRotate { account: [2; 32], nonce: 4, signers: vec![key()], threshold: 1, signatures: vec![signed(1)] } },
+        ];
+        for (tx, tag) in txs[2..].iter().zip([42u32, 43]) {
+            assert_eq!(&tx.encode()[8..13], &[&[0u8][..], &tag.to_le_bytes()[..]].concat()[..], "bundle-less {tag}");
+        }
+        for (tx, tag) in txs.iter().zip(40u32..) {
+            assert_eq!(variant_index(&tx.action), tag as usize, "the enum position is the tag");
+            assert_eq!(&Transaction::decode(&tx.encode()).unwrap(), tx);
+        }
+        let got: Vec<(String, String)> =
+            txs.iter().map(|tx| (hex::encode(blake3::hash(&tx.encode()).as_bytes()), hex::encode(tx.hash().0))).collect();
+        assert_eq!(got, MULTISIG_PINS.iter().map(|(d, i)| (d.to_string(), i.to_string())).collect::<Vec<_>>());
+    }
+
     #[test]
     fn the_consensus_encoding_and_txid_are_pinned() {
         let call = Transaction::shielded(
