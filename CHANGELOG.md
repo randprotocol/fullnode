@@ -19,6 +19,15 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
   consecutive failures, and a stop-class error — the node serving another chain id, or reporting
   no `binding_domain` for the chain — still exits at once. A
   one-shot run is unchanged (`docs/aggregation.md` §3.7, `docs/cli.md`).
+- **The proposer/aggregator split** (genesis-gated, aggregating chains only; no chain carries it):
+  two optional numbers in the `fees` section (`docs/fees.md` §1.3, `docs/compute-optimization.md`
+  §6.2–§6.3). `fees.proposer_share_bps` keeps that share of the base to the proposer at inclusion
+  and buckets the rest beside the excess — paid to a covering aggregate, swept back to the proposer
+  otherwise; `fees.prove_base` raises every bundle's floor by a proving share bucketed whole and
+  never burned (under `burn_floor` the burn is the floor without it). Hashed only when set, after
+  `burn_floor`. RPC: `rand_getLimits.fee_rules.proposer_share_bps` / `.prove_base`;
+  `rand_estimateFee` and the wallet's default fees include `prove_base`. Recommended 4000 / 600000
+  once aggregation is admitted (`docs/deploy.md`).
 - **Fee feedback, the burned base** (genesis-gated: a hard fork on a chain whose genesis sets a
   flag, node-only on every other chain — no existing chain carries the section): a new genesis
   `fees` section (`docs/fees.md` §1.3). Under `fees.burn_base` every bundle's `BUNDLE_BASE` is

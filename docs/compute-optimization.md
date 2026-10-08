@@ -542,8 +542,8 @@ weighs explicitly.
 | `aggregator_bond` | 1 000 (cut-script default) | **25 000 RAND per quota unit, ≤ 4 units** | genesis `aggregation` | governance |
 | aggregates per block `k` | 1 (sealing) | **4**, then 8 | genesis | hard fork |
 | `MAX_BLOCK_BYTES` / `MAX_BLOCK_TXS` | 20 MiB / 2 000 | **40 MiB / 4 096**, then 128 MiB / 16 384 | genesis | hard fork |
-| fee split of `BUNDLE_BASE` | 100 % proposer | **40 % proposer / 60 % covering aggregator** | ledger rule, genesis-gated | governance |
-| `prove_base` | — | **0.0006 RAND** | genesis `gas` | governance |
+| fee split of `BUNDLE_BASE` | 100 % proposer | **40 % proposer / 60 % covering aggregator** — *implemented, genesis-gated: `fees.proposer_share_bps` (4000), `96c30242`* | ledger rule, genesis `fees` | governance |
+| `prove_base` | — | **0.0006 RAND** — *implemented, genesis-gated: `fees.prove_base` (600000), `96c30242`* | genesis `fees` | governance |
 | `byte_price_raw` / `byte_price_agg` | one `byte_price` | **two prices, targets 25 % / 75 %** | genesis `gas.dynamic` | governance (targets), market (prices) |
 | subsidy selection | most coverage wins | **pro rata by cover among the block's aggregates** | ledger rule | hard fork |
 | self-fill invariant | — | `subsidy_base / MAX_BLOCK_TXS < 0.4 × BUNDLE_BASE` | `Genesis::validate` | — |

@@ -2748,7 +2748,7 @@ mod payment_tests {
     fn burn_base_on_an_aggregating_chain_buckets_the_excess_and_pays_the_proposer_nothing() {
         let burning = |window: u64| {
             let mut l = gated(window);
-            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None });
+            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None });
             // The fixture issues nothing to the pool; tell the audit what genesis deposited so its
             // identity is checkable (the fees below are paid out of it).
             let staked = l.supply().genesis_staked;
@@ -2811,7 +2811,7 @@ mod payment_tests {
     fn burn_floor_on_an_aggregating_chain_buckets_fee_less_the_floor() {
         let burning = |window: u64| {
             let mut l = gated(window);
-            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None });
             let staked = l.supply().genesis_staked;
             l.set_genesis_supply(1_000 * crate::types::UNITS_PER_RAND, staked);
             l
@@ -2870,7 +2870,7 @@ mod payment_tests {
     fn net_of_fees(window: u64, subsidy_base: u64) -> Ledger {
         let mut l = gated(window);
         l.set_aggregation(Some(AggregationConfig { subsidy_base, ..cfg_with_window(window) }));
-        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None });
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None });
         l
     }
 
@@ -2962,7 +2962,7 @@ mod payment_tests {
         let run = |net: bool| {
             let mut l = gated(256);
             if net {
-                l.set_fees(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None });
+                l.set_fees(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None });
             }
             let (kp, _) = keys();
             register(&mut l, &kp, 10);
@@ -2992,6 +2992,172 @@ mod payment_tests {
         let (plain_note, plain_root) = run(false);
         assert_eq!(net_note, plain_note, "schedule 0 makes the flag a no-op: one note");
         assert_eq!(net_root, plain_root, "and one root");
+    }
+
+    // ---- The proposer/aggregator split and `prove_base` (docs/compute-optimization.md §6.2–§6.3) --
+
+    /// A gated chain with the audit's genesis deposit set, an aggregator registered (at the old
+    /// floor, before the rules), then `fees` installed — the split tests' fixture.
+    fn split_chain(window: u64, fees: crate::ledger::fees::FeesConfig) -> (Ledger, Keypair) {
+        let mut l = gated(window);
+        let staked = l.supply().genesis_staked;
+        l.set_genesis_supply(1_000 * crate::types::UNITS_PER_RAND, staked);
+        let (kp, _) = keys();
+        register(&mut l, &kp, 10);
+        l.record_anchor(1);
+        l.set_fees(fees);
+        (l, kp)
+    }
+
+    fn share_rules(burn_base: bool, burn_floor: bool, prove_base: Option<u64>) -> crate::ledger::fees::FeesConfig {
+        crate::ledger::fees::FeesConfig {
+            burn_base: burn_base.then_some(true),
+            subsidy_net_of_fees: None,
+            burn_floor: burn_floor.then_some(true),
+            proposer_share_bps: Some(4000),
+            prove_base,
+        }
+    }
+
+    /// `proposer_share_bps = 4000` (§6.2): a transfer paying the base plus a 200 000 tip pays
+    /// the proposer 40 % of the base at inclusion (`fees_paid` moves by it alone) and buckets the
+    /// tip plus the other 60 %; the covering aggregate's proving share is that whole entry.
+    #[test]
+    fn under_a_proposer_share_the_cover_is_paid_the_tip_and_sixty_percent_of_the_base() {
+        let (mut l, kp) = split_chain(256, share_rules(false, false, None));
+        let p = proposer(&l);
+        let tip = 200_000;
+        let fee = gas::BUNDLE_BASE + tip;
+        let (rewards, before) = (l.validators()[&p].rewards, l.supply());
+        let covered_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), Action::None));
+        l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&p].rewards - rewards, 400_000, "40 % of the base to the proposer");
+        assert_eq!(l.supply().fees_paid - before.fees_paid, 400_000, "fees_paid moves by the proposer part");
+        assert_eq!(l.unsealed_fees()[&covered_tx.hash()].0, tip + 600_000, "the tip and 60 % of the base bucketed");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+
+        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let covered = covered_records(&[1]);
+        let cfg = l.aggregation().unwrap().clone();
+        let payment = l.aggregate_payment(&[covered_tx.hash()], &cfg, 1, &[9; 8], &payout_addr(), &StubExecutor).unwrap();
+        assert_eq!(payment.proving_shares, tip + 600_000, "the proving share is the tip plus 60 % of the base");
+        let v = l.validate_aggregate(&tx, &covered, &StubExecutor).unwrap();
+        let subsidy = gas::subsidy(0, &cfg);
+        let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], subsidy + tip + 600_000, 0, 1, &[9; 8]);
+        assert_eq!(v.payout_cm, want_cm);
+        let fees_paid = l.supply().fees_paid;
+        l.apply_aggregate(&tx, &covered, &StubExecutor).unwrap();
+        assert!(l.has_commitment(&want_cm));
+        assert!(!l.unsealed_fees().contains_key(&covered_tx.hash()), "the entry left the bucket whole");
+        assert_eq!(l.supply().fees_paid, fees_paid, "the cover is not a fee movement");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
+    /// The uncovered exit under the share: the sweep pays the recorded proposer the bucketed 60 %
+    /// and the tip, so in the end it has the whole fee and `fees_paid` has caught up with it —
+    /// through the block path, so every step is a replica's apply of a signed block (the root is
+    /// checked against the proposer's), and the audit holds after each.
+    #[test]
+    fn under_a_proposer_share_the_sweep_pays_the_proposer_the_rest_of_the_base() {
+        let (mut l, _) = split_chain(2, share_rules(false, false, Some(600_000)));
+        let (a, _) = keys();
+        let p = a.address();
+        let tip = 200_000;
+        let fee = gas::BUNDLE_BASE + 600_000 + tip;
+        let (rewards, fees_paid) = (l.validators()[&p].rewards, l.supply().fees_paid);
+        let tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee, 0), Action::None));
+        l.apply_block(&signed_block(&l, vec![tx.clone()], &a, 2), &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&p].rewards - rewards, 400_000);
+        assert_eq!(l.unsealed_fees().get(&tx.hash()), Some(&(600_000 + 600_000 + tip, p, 4)), "prove_base, 60 % of the base and the tip");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+        l.apply_block(&signed_block(&l, vec![], &a, 3), &StubExecutor).unwrap();
+        assert_eq!(l.unsealed_fees().len(), 1, "still coverable at 3");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+        l.apply_block(&signed_block(&l, vec![], &a, 4), &StubExecutor).unwrap();
+        assert!(l.unsealed_fees().is_empty(), "the window passed at 4");
+        assert_eq!(l.validators()[&p].rewards - rewards, fee, "an uncovered bundle pays the proposer the whole fee in the end");
+        assert_eq!(l.supply().fees_paid - fees_paid, fee, "fees_paid catches up at the sweep");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
+    /// Under `burn_base` the base is burned, so there is no base to split: the share changes
+    /// nothing, the proposer keeps nothing at inclusion and the bucket holds the tip alone.
+    #[test]
+    fn under_burn_base_the_proposer_share_has_nothing_to_split() {
+        let (mut l, _) = split_chain(256, share_rules(true, false, None));
+        let p = proposer(&l);
+        let tip = 200_000;
+        let (rewards, before, burned) = (l.validators()[&p].rewards, l.supply(), l.base_fees_burned());
+        let tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE + tip, 0), Action::None));
+        l.apply_tx(&tx, &p, &StubExecutor).unwrap();
+        assert_eq!(l.validators()[&p].rewards, rewards, "nothing to the proposer");
+        assert_eq!(l.supply().fees_paid, before.fees_paid);
+        assert_eq!(l.base_fees_burned() - burned, gas::BUNDLE_BASE, "the base burned");
+        assert_eq!(l.unsealed_fees()[&tx.hash()].0, tip, "the bucket holds the tip alone");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
+    /// `burn_floor` with `prove_base` (§6.3): the burned amount is the floor *without*
+    /// `prove_base` — for a Deploy, `BUNDLE_BASE + deploy_fee(words)` — and the bucket holds the
+    /// tip plus `prove_base` whole, which the covering aggregate is paid. The bundle's floor is
+    /// the old one plus `prove_base`: paying the old floor is `FeeTooLow` naming the new minimum.
+    #[test]
+    fn under_burn_floor_prove_base_is_bucketed_whole_and_never_burned() {
+        let (mut l, kp) = split_chain(256, share_rules(true, true, Some(600_000)));
+        let p = proposer(&l);
+        let deploy = Action::Deploy { base_pc: 0, words: vec![0x13; 6], public: vec![] };
+        let old_floor = gas::fee_floor(&deploy);
+        let floor = old_floor + 600_000;
+        let tip = 200_000;
+        let old = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], old_floor, 0), deploy.clone()));
+        assert_eq!(l.validate(&old, &StubExecutor), Err(TxError::FeeTooLow { min: floor, fee: old_floor }));
+        let covered_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], floor + tip, 0), deploy));
+        assert_eq!(l.settled_floor(&covered_tx, None), floor, "settled_floor includes prove_base");
+        let (rewards, burned) = (l.validators()[&p].rewards, l.base_fees_burned());
+        l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
+        assert_eq!(l.base_fees_burned() - burned, old_floor, "the floor without prove_base burns");
+        assert_eq!(l.validators()[&p].rewards, rewards, "the proposer keeps nothing at inclusion");
+        assert_eq!(l.unsealed_fees()[&covered_tx.hash()].0, tip + 600_000, "the tip and prove_base bucketed");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+
+        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let covered = covered_records(&[1]);
+        let subsidy = gas::subsidy(0, l.aggregation().unwrap());
+        let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], subsidy + tip + 600_000, 0, 1, &[9; 8]);
+        assert_eq!(l.validate_aggregate(&tx, &covered, &StubExecutor).unwrap().payout_cm, want_cm);
+        l.apply_aggregate(&tx, &covered, &StubExecutor).unwrap();
+        assert!(l.has_commitment(&want_cm));
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
+    /// The 64th halving under `subsidy_net_of_fees` with both split fields: the schedule is 0, so
+    /// the aggregate is paid its shares alone — and the shares now carry `prove_base` and the
+    /// aggregator's 60 % of the base beside the tip. Nothing is minted; the audit holds.
+    #[test]
+    fn past_the_last_halving_the_net_subsidy_pays_shares_that_include_prove_base_and_the_base_part() {
+        let mut rules = share_rules(false, false, Some(600_000));
+        rules.subsidy_net_of_fees = Some(true);
+        let (mut l, kp) = split_chain(256, rules);
+        let p = proposer(&l);
+        let tip = 60;
+        let covered_tx =
+            StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE + 600_000 + tip, 0), Action::None));
+        l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
+        let cfg = l.aggregation().unwrap().clone();
+        let mut s = l.supply();
+        s.sealed_blocks = 64 * cfg.halving_blocks;
+        l.set_supply(s);
+        let before = l.supply();
+        let shares = tip + 600_000 + 600_000;
+        let payment = l.aggregate_payment(&[covered_tx.hash()], &cfg, 1, &[9; 8], &payout_addr(), &StubExecutor).unwrap();
+        assert_eq!((payment.subsidy, payment.proving_shares, payment.total), (0, shares, shares));
+        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        l.apply_aggregate(&tx, &covered_records(&[1]), &StubExecutor).unwrap();
+        assert!(l.has_commitment(&payment.note));
+        assert_eq!(l.supply().subsidised, before.subsidised, "nothing minted");
+        assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+        // And at the schedule's start, the shares net against it: the mint is the shortfall.
+        assert_eq!(minted_subsidy(gas::subsidy(0, &cfg), shares, l.fees()), gas::subsidy(0, &cfg) - shares);
     }
 
     /// `sealed_blocks` is the subsidy schedule's index: it counts included aggregates, never
@@ -3031,7 +3197,7 @@ mod payment_tests {
     /// audit holds after every step with `subsidised` carrying the minted part alone.
     #[test]
     fn the_supply_invariant_holds_across_the_lifecycle_under_subsidy_net_of_fees() {
-        let l = lifecycle(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None });
+        let l = lifecycle(crate::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None });
         assert_eq!(l.supply().subsidised, gas::subsidy(0, &cfg_with_window(2)) - 60, "only the shortfall is minted");
         assert_eq!(l.supply().sealed_blocks, 1);
     }
@@ -3498,7 +3664,7 @@ mod payment_tests {
         let p = proposer(&l);
         let prices = pruned_gas();
         l.set_gas(Some(prices.clone()));
-        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None });
         let staked = l.supply().genesis_staked;
         l.set_genesis_supply(1_000 * crate::types::UNITS_PER_RAND, staked);
         // The program the Call runs, deployed before the block.

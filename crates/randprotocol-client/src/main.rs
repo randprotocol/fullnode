@@ -1633,7 +1633,7 @@ async fn main() -> Result<()> {
             if !yes {
                 confirm("send?", "send", "not sent")?;
             }
-            let fee = match fee { Some(f) => parse_amount(&f)?, None => gas::BUNDLE_BASE };
+            let fee = match fee { Some(f) => parse_amount(&f)?, None => wallet::schedule_floor(&rpc, &Action::None).await? };
             if is_rand {
                 eprintln!("sending {} RAND (asset 0), fee {} RAND", format_amount(amount), format_amount(fee));
             } else {
@@ -1689,7 +1689,7 @@ async fn main() -> Result<()> {
             let action = Action::Bond { validator, amount, registration };
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&action),
+                None => wallet::schedule_floor(&rpc, &action).await?,
             };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
@@ -1775,7 +1775,7 @@ async fn main() -> Result<()> {
                 eprintln!("a call over {} input words proves at tier {tier}", inputs.len());
             }
             let action = Action::Deploy { base_pc: p.base_pc, words: p.words.clone(), public };
-            let fee = wallet::deploy_fee_default(&action);
+            let fee = wallet::deploy_fee_default(&action) + rpc.prove_base().await?;
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
             let s = wallet::submit(&rpc, &w, &mut store, None, action, fee, Burn::None, profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, true).await;
@@ -2311,7 +2311,7 @@ async fn main() -> Result<()> {
             };
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&action),
+                None => wallet::schedule_floor(&rpc, &action).await?,
             };
             let profile = profile_of(&rpc).await?;
             let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
@@ -2400,7 +2400,7 @@ async fn main() -> Result<()> {
             };
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&action),
+                None => wallet::schedule_floor(&rpc, &action).await?,
             };
             let profile = profile_of(&rpc).await?;
             let s = wallet::submit_bridge_action(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
@@ -2436,7 +2436,7 @@ async fn main() -> Result<()> {
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
-                None => wallet::burn_fee_default(),
+                None => wallet::burn_fee_default() + rpc.prove_base().await?,
             };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
@@ -2477,7 +2477,7 @@ async fn main() -> Result<()> {
             eprintln!("burning {}", memo_display::sanitize(&wallet::display_amount(amount, decimals, &symbol)));
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&Action::TokenBurn { asset, amount }),
+                None => wallet::schedule_floor(&rpc, &Action::TokenBurn { asset, amount }).await?,
             };
             let chain_id = rpc.chain_id().await?;
             let profile = profile_of(&rpc).await?;
@@ -2503,7 +2503,7 @@ async fn main() -> Result<()> {
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
                 None => wallet::default_registration_fee(
-                    gas::fee_floor(&action),
+                    wallet::schedule_floor(&rpc, &action).await?,
                     state.registration_fee.context("the node serves no registration_fee: pass --fee")?,
                 )?,
             };
@@ -2528,7 +2528,7 @@ async fn main() -> Result<()> {
             let action = governance::list_backing_action(&state, chain_id, asset, chain, token, decimals, pq_signatures)?;
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&action),
+                None => wallet::schedule_floor(&rpc, &action).await?,
             };
             let (w, path, mut store) = open_wallet(&cli.key)?;
             let profile = profile_of(&rpc).await?;
@@ -2664,7 +2664,7 @@ async fn main() -> Result<()> {
             let action = wallet::build_token_mint(&rpc, &w, &domain, chain_id, asset, &row, &recipient, amount, &authority).await?;
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&action),
+                None => wallet::schedule_floor(&rpc, &action).await?,
             };
             let profile = profile_of(&rpc).await?;
             let s = wallet::submit_token_mint(&rpc, &w, &mut store, action, fee, profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait).await;
@@ -2694,7 +2694,7 @@ async fn main() -> Result<()> {
             let action = wallet::build_token_set_authority(&domain, chain_id, asset, &row, &authority, new.clone())?;
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&action),
+                None => wallet::schedule_floor(&rpc, &action).await?,
             };
             let profile = profile_of(&rpc).await?;
             let s =
@@ -2862,6 +2862,7 @@ mod tests {
             adjust_bps: None,
             proof_window_blocks: None,
             program_state: None,
+            prove_base: 0,
         }
     }
 

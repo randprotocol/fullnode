@@ -326,7 +326,7 @@ pub(super) fn validate(ledger: &Ledger, tx: &Transaction, action: &Action) -> Re
             }
             // The fee: the base `fee_floor` took at step 3, plus the registry's registration fee —
             // what any registration owes, whoever authorises it. Saturating, as `RegisterToken`'s.
-            let min = gas::BUNDLE_BASE.saturating_add(registry.registration_fee);
+            let min = gas::BUNDLE_BASE.saturating_add(registry.registration_fee).saturating_add(ledger.prove_base());
             if tx.fee() < min {
                 return Err(token(TokenError::RegistrationFeeTooLow { min, fee: tx.fee() }));
             }

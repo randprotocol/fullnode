@@ -42,7 +42,10 @@ without their gate.
 
 Value **enters** the pool as a genesis deposit, a faucet mint, a validator's withdraw, or an
 aggregate's payout note — of which only the minted subsidy (`subsidised`) is new: the note's
-proving-share part is bucketed fee excess that never left the pool in this accounting. It
+proving-share part is bucketed fee excess that never left the pool in this accounting (under the
+genesis `fees.proposer_share_bps` the bucket also holds the aggregator's part of the base, and under
+`fees.prove_base` the `prove_base` every fee now carries — both part of the fee, so the boundary is
+the same: `fees_paid` moves by the proposer's part at inclusion and by the rest at the sweep). It
 **leaves** as a bundle fee or a burn. There is no other movement across the boundary, which is what
 makes the arithmetic below closed rather than approximate.
 

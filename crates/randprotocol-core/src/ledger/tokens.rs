@@ -1620,7 +1620,8 @@ pub(super) fn validate(
             // `registration_fee`, which genesis sets — and `fee_floor` has no ledger to read.
             // Saturating: a registry whose fee is near `u64::MAX` makes registration unpayable
             // rather than wrapping to something cheap.
-            let min = gas::BUNDLE_BASE.saturating_add(registry.registration_fee);
+            // Plus `fees.prove_base` on an aggregating chain (§6.3), which raises every floor.
+            let min = gas::BUNDLE_BASE.saturating_add(registry.registration_fee).saturating_add(ledger.prove_base());
             if tx.fee() < min {
                 return Err(TokenError::RegistrationFeeTooLow { min, fee: tx.fee() }.into());
             }
@@ -3389,6 +3390,21 @@ mod action_tests {
         );
     }
 
+    /// `fees.prove_base` (`docs/compute-optimization.md` §6.3) raises every bundle's floor, a
+    /// registration's too: on an aggregating chain the registration floor is `BUNDLE_BASE +
+    /// registration_fee + prove_base`, refused by name one unit under it.
+    #[test]
+    fn under_prove_base_a_registration_pays_it_on_top() {
+        let mut l = ledger();
+        l.set_aggregation(Some(crate::ledger::tests::split_aggregation(256)));
+        l.set_fees(crate::ledger::fees::FeesConfig { prove_base: Some(600_000), ..Default::default() });
+        let min = gas::BUNDLE_BASE + REG_FEE + 600_000;
+        let short = register_tx_at(&l, MintAuthority::None, Some(initial(&l, 5)), 20, 1, min - 1);
+        assert_eq!(l.validate(&short, &StubExecutor), Err(tok(TokenError::RegistrationFeeTooLow { min, fee: min - 1 })));
+        let exact = register_tx_at(&l, MintAuthority::None, Some(initial(&l, 5)), 30, 1, min);
+        assert_eq!(l.validate(&exact, &StubExecutor), Ok(()));
+    }
+
     /// Deep scan 2026-09-24 (ledger arithmetic): the hidden-asset guest range-checks every note
     /// value to u63, so a note worth 2^63 or more can never be spent, and nothing bounded what
     /// the ledger itself would mint. Under `tokens.bound_note_value` a `TokenMint` or an initial
@@ -3517,7 +3533,7 @@ mod action_tests {
         let mut l = ledger();
         l.set_genesis_supply(10 * fee, 10);
         l.set_tokens(Some(TokenRegistry::new(REG_FEE).with_burn_registration_fee(true)));
-        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None });
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None });
         let tx = register_tx_at(&l, MintAuthority::None, Some(initial(&l, 5)), 10, l.tokens().unwrap().next_index(), fee);
         l.apply_tx(&tx, &p, &StubExecutor).unwrap();
         assert_eq!(l.supply().burned, REG_FEE + gas::BUNDLE_BASE, "both are destroyed");
@@ -3544,7 +3560,7 @@ mod action_tests {
             let mut l = ledger();
             l.set_genesis_supply(10 * fee, 10);
             l.set_tokens(Some(TokenRegistry::new(REG_FEE).with_burn_registration_fee(true)));
-            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+            l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None });
             if aggregating {
                 l.set_aggregation(Some(crate::ledger::aggregation::AggregationConfig {
                     bond: 100,

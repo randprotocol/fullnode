@@ -468,8 +468,24 @@ whose section sets no flag `true`, which hashes and runs as no section at all. I
 `burn_base` a bundle's `BUNDLE_BASE` is destroyed rather than paid to the proposer, and under
 `burn_floor` (issue #135; only ever `true` beside `burn_base`) its whole settled floor — the base
 plus a Deploy's per-word term, or a Call's tier-exact gas and byte terms — but what a sender pays is
-unchanged — every floor is the same number — so a wallet changes nothing. A node that predates the
-field answers without it, which a wallet reads as `null`.
+unchanged — every floor is the same number — so a wallet changes nothing for those three flags.
+
+Two more keys carry the proposer/aggregator split (`docs/compute-optimization.md` §6.2–§6.3), each
+`null` when the genesis leaves it out: `proposer_share_bps` (a number, 0..=10 000: the proposer's
+part of the base it keeps at inclusion, the rest bucketed as proving share — informational, nothing
+a sender pays moves) and `prove_base` (a decimal string like every amount: units every bundle's
+floor rises by on an aggregating chain). **`prove_base` does move what a sender pays**:
+`rand_estimateFee` already includes it, and a wallet computing a floor itself (the `gas` section's
+call floor, `gas::fee_floor`) adds it — `randprotocol-client`'s `ChainLimits::prove_base` and
+`RpcClient::prove_base` read it. Either key set makes `fee_rules` non-`null`:
+
+```json
+"fee_rules": { "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false,
+               "proposer_share_bps": 4000, "prove_base": "600000" }
+```
+
+A node that predates the field answers without it, which a wallet reads as `null`; one that
+predates the two split keys answers without them, read as `null` (no split, no `prove_base`).
 
 `gas_price`, `byte_price` and `gas_metering` are this **node's** own gas policy (spec
 `2026-09-28-gas-model-design.md` §4.1, Phase 0) *or* the chain's own `gas` section (§4.2, §7.1,
@@ -570,6 +586,11 @@ Params: `[spec]`, one of `{"kind":"bundle"}`, `{"kind":"deploy","words":n,"publi
 for a plain transfer: `1000000`. A deploy of more words than the chain's program cap (4096, or the
 genesis file's `max_program_words`) is an invalid-params error (`-32602`) naming the cap — the same
 program admission would refuse, so a wallet can ask before it proves.
+
+On an aggregating chain whose genesis sets `fees.prove_base` (`docs/fees.md` §1.3,
+`rand_getLimits.fee_rules.prove_base`) every kind's answer below includes it: every bundle's floor
+rises by `prove_base`, so `{"kind":"bundle"}` is `1000000 + prove_base` (`1600000` at the
+proposal's 600 000).
 
 `public_words` (optional, default 0) is the deploy's public input length. Public words are paid for
 per word like code, so the fee is the deploy fee of `n + m` words. More than the chain's
@@ -1660,6 +1681,19 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### Unreleased — the proposer/aggregator split: `fee_rules.proposer_share_bps` and `prove_base` (genesis-gated; no chain carries it yet)
+
+Additive. `rand_getLimits.fee_rules` gains `proposer_share_bps` (a number) and `prove_base` (a
+decimal string), each `null` when the genesis `fees` section leaves it out; either set makes
+`fee_rules` non-`null`, so on such a chain the three older flags appear too (as `false` where
+unset). Every existing `fee_rules` object gains the two keys as `null`. Under `prove_base`
+(aggregating chains only, `docs/fees.md` §1.3) every bundle's floor rises by it and
+`rand_estimateFee` includes it in every kind's answer; a fee at the old floor is refused
+`FeeTooLow` naming the new minimum. Under `proposer_share_bps` a proposer's `rewards` grow at
+inclusion by its share of the base only, and `rand_getUnsealed`'s `excess` (and so
+`rand_getAggregate`'s `proving_share`) carries the rest of the base beside the tip and
+`prove_base`. `rand_getSupply` is unchanged: nothing new crosses the pool boundary.
 
 ### Unreleased — fee feedback: the genesis `fees` section and the burned base (genesis-gated; no chain carries it yet)
 

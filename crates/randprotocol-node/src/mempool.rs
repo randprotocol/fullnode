@@ -376,7 +376,10 @@ impl Mempool {
             (Some(p), _) => call_pricing(tx, ledger, executor, p)?,
             // `call_pricing` answers the ledger rule under the section whatever policy it is handed.
             (None, Some(_)) => call_pricing(tx, ledger, executor, &randprotocol_core::gas::GasPolicy::DEFAULT)?,
-            (None, None) => CallPricing { floor: randprotocol_core::gas::fee_floor(&tx.action), gas_limit: None },
+            (None, None) => CallPricing {
+                floor: randprotocol_core::gas::fee_floor(&tx.action).saturating_add(ledger.prove_base_for(tx)),
+                gas_limit: None,
+            },
         };
         match crate::admission::fee_below_floor(tx, pricing.floor) {
             Some(e) => Err(e),
@@ -394,14 +397,19 @@ impl Mempool {
     /// per cell the transition *creates*, which another transaction creating (or deleting) one
     /// of those cells first changes. So it is re-read here against this tip, as the ledger's own
     /// floor reads it.
+    ///
+    /// Both re-priced floors add the genesis `fees.prove_base` (`Ledger::prove_base_for`), as the
+    /// ledger's own does, so it is never counted as surplus; `p.floor` already carries it.
     fn current_floor(p: &Pooled, ledger: &Ledger) -> u64 {
+        let prove_base = ledger.prove_base_for(&p.tx);
         match (&p.tx.action, p.gas_limit) {
             (Action::Call { proof, input_envelope, .. }, Some(limit)) => ledger
                 .gas_call_floor(limit, randprotocol_core::gas::call_bytes(proof, input_envelope.as_ref()))
+                .map(|f| f.saturating_add(prove_base))
                 .unwrap_or(p.floor),
             (a @ Action::Invoke { proof, input_envelope, .. }, Some(limit)) => ledger
                 .gas_call_floor(limit, randprotocol_core::gas::call_bytes(proof, input_envelope.as_ref()))
-                .map(|f| f.saturating_add(randprotocol_core::ledger::program_state::cell_fee_of(ledger, a)))
+                .map(|f| f.saturating_add(randprotocol_core::ledger::program_state::cell_fee_of(ledger, a)).saturating_add(prove_base))
                 .unwrap_or(p.floor),
             _ => p.floor,
         }
@@ -566,7 +574,8 @@ impl Mempool {
             Action::BridgeAttest { .. } => ledger.bridge().map(|b| b.rotation_nonce),
             _ => None,
         };
-        Ok(Claims { commitments, claim, token, floor: randprotocol_core::gas::fee_floor(&tx.action), gas_limit: None, evict: Vec::new(), bridge_rotation })
+        let floor = randprotocol_core::gas::fee_floor(&tx.action).saturating_add(ledger.prove_base_for(tx));
+        Ok(Claims { commitments, claim, token, floor, gas_limit: None, evict: Vec::new(), bridge_rotation })
     }
 
     /// Everything the pool can decide about a transaction without verifying a proof: the pool
@@ -3150,6 +3159,58 @@ mod tests {
         assert_eq!(now, vec![transfer_hash, keeps_hash], "and the rank is the surplus over the current floor (1 000 against 10)");
         assert_eq!(m.len(), 3, "nothing is evicted: the price falls again");
         assert_eq!(picked(&ledger).len(), 3, "and at the old prices all three are offered once more");
+    }
+
+    /// The genesis `fees.prove_base` (`docs/compute-optimization.md` §6.3) in the pool's floors:
+    /// the ledger adds it to every bundle's floor, so the pool's must too — at admission
+    /// (`Pooled.floor`) and at selection (`current_floor`). A call that pays the re-priced gas
+    /// floor after a rise but not `prove_base` on top is priced out and not offered (left out,
+    /// it would pass the CH-9 filter, take a candidate slot and fail the trial apply), while one
+    /// paying both is offered; and a transfer's floor is the base plus `prove_base`, so
+    /// `prove_base` is never surplus.
+    #[test]
+    fn the_pools_floors_include_prove_base_so_a_priced_out_call_is_not_offered() {
+        use randprotocol_core::gas::{self, GasConfig, GasMetering, GasPrices};
+        let prove_base = 600_000;
+        let section = GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: 20_479, metering: GasMetering::Circuit, dynamic: None };
+        let stub_len = StubExecutor::make_proof_with_public(&Hash::ZERO, 12, [0; 8], &[]).len();
+        let limit = gas::gas_max(12, 0, 0);
+        let at_triple = gas::circuit_call_floor(300, 900, limit, stub_len);
+        // `short` pays the risen gas floor and half of `prove_base`; `paid` pays both, plus 10.
+        let (mut ledger, pid, short) = program_and_call(12, at_triple + prove_base / 2, 50);
+        ledger.set_gas(Some(section));
+        ledger.set_aggregation(Some(randprotocol_core::ledger::aggregation::AggregationConfig {
+            bond: 100 * randprotocol_core::UNITS_PER_RAND,
+            max_covers: 3,
+            subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![],
+        }));
+        ledger.set_fees(randprotocol_core::ledger::FeesConfig { prove_base: Some(prove_base), ..Default::default() });
+        assert_eq!(ledger.prove_base(), prove_base);
+        let b = fixtures::bundle_tx(&ledger, [[60; 8], [61; 8]], [[62; 8], [63; 8]], at_triple + prove_base + 10).bundle.expect("bundle");
+        let paid = StubExecutor::bound(Transaction::shielded(
+            ledger.chain_id(),
+            b,
+            Action::Call { program: pid, proof: StubExecutor::make_proof_with_public(&pid, 12, [8; 8], &[]), input_envelope: None },
+        ));
+        let mut m = Mempool::new(64);
+        let short_hash = m.insert(short, &ledger, &StubExecutor).unwrap();
+        let paid_hash = m.insert(paid, &ledger, &StubExecutor).unwrap();
+        // A transfer at the old base is refused at the pool's floor, the base plus prove_base.
+        let cheap = fixtures::bundle_tx(&ledger, [[80; 8], [81; 8]], [[82; 8], [83; 8]], gas::BUNDLE_BASE);
+        assert!(m.insert(cheap, &ledger, &StubExecutor).is_err(), "the pool's floor includes prove_base");
+        let transfer = fixtures::bundle_tx(&ledger, [[84; 8], [85; 8]], [[86; 8], [87; 8]], gas::BUNDLE_BASE + prove_base);
+        let transfer_hash = m.insert(transfer, &ledger, &StubExecutor).unwrap();
+        assert_eq!(m.txs[&transfer_hash].floor, gas::BUNDLE_BASE + prove_base, "Pooled.floor carries prove_base");
+
+        let mut risen = ledger.clone();
+        risen.set_gas_prices(GasPrices { gas_price: 300, byte_price: 900 });
+        let now: Vec<Hash> = m.candidates(&risen, 10).iter().map(|t| t.hash()).collect();
+        assert!(!now.contains(&short_hash), "a call short of gas floor + prove_base is not offered: {now:?}");
+        assert!(now.contains(&paid_hash) && now.contains(&transfer_hash), "{now:?}");
+        assert_eq!(Mempool::current_floor(&m.txs[&paid_hash], &risen), at_triple + prove_base);
     }
 
     /// Audit v6, POOL-2 (option 4, a proposer policy): while a Call is pooled and ready, flat-fee
