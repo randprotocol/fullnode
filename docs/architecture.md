@@ -390,7 +390,8 @@ count cap, no duplicate hash, the hash list against the signed `tx_root`, justif
 parent, the QC, the height and view window, the leader of the view, the header signature — and
 the verdict is reported to gossipsub once. A second, different header from a view's leader for
 that view is reported `Ignore` and neither rebuilt nor parked (one header per view and
-proposer). The node then rebuilds the block from its mempool and
+proposer); on a chain that slashes, the two signed headers are pooled and gossiped as one
+`SlashEquivocation`, as the replica pools its own evidence. The node then rebuilds the block from its mempool and
 its recent-transactions cache (4 096 entries, `4 × max_block_bytes` bytes; it holds gossiped
 bodies once they pass the bytes-only refusal and every proposal body this node sends or
 handles) and hands HotStuff the same full `Proposal` it receives from an old leader. If bodies

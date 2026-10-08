@@ -38,11 +38,21 @@ below differs:
 The final whole-branch review (2026-10-08) amended it again; these rulings replace the review
 round 1 park band (`hs.view()` and `hs.view() + 1`, one park):
 
-- **One header per (view, proposer)** (C1). The node records the hash of the first compact
-  proposal that passes the pre-screen in full for each (view, proposer); a later one with the
-  same key and a different hash — a leader equivocating — is reported `Ignore` and neither
-  rebuilt nor parked, so a leader cannot make every node rebuild and hash many headers for its
-  view. The same hash again proceeds (a redelivery may now rebuild). The record is pruned under
+- **One header per (view, proposer)** (C1). The node records the signed header (header and
+  signature) of the first compact proposal that passes the pre-screen in full for each
+  (view, proposer); a later one with the same key and a different hash — a leader
+  equivocating — is reported `Ignore` and neither rebuilt nor parked, so a leader cannot make
+  every node rebuild and hash many headers for its view. It is still evidence (audit v6,
+  STAKE-1; added after the fix-wave re-review found the compact path dropped it): both headers
+  passed the pre-screen, so both signatures are verified, and on a chain whose committed ledger
+  has `staking.slashing` the node builds `Action::Equivocation` from
+  `SignedHeader::ordered(first, second)` — the replica's construction — and handles it as the
+  replica's evidence is handled, through `pool_equivocation` into the pool and onto gossip. At
+  most one per (view, proposer): a third header, or the second redelivered, builds none; a
+  pair the replica also sees (one block arrived in full) is the same transaction id and the
+  pool's `Duplicate`. The replica's `MAX_EVIDENCE_HELD` bounds evidence held between drains;
+  this evidence is handed on as it is built, so at most one is ever held. The same hash again
+  proceeds (a redelivery may now rebuild). The record is pruned under
   the committed view and capped at 1 024 entries, oldest view first. Only a header the
   pre-screen `Accept`s is checked against the record or recorded; an `Ignore`d one was dropped
   before its signature was verified.
@@ -267,7 +277,7 @@ the previous release's binaries (kept on each host as `/root/rand-node.prev`). `
 |---|---|---|
 | `TX_FETCH_BATCH` | 512 hashes | 16 KB request under the 64 KiB request limit; ≤ 4 round-trips for a full block |
 | parked compact proposals | 2, by view (§0) | the replica's view and the next, or a lagging replica's next two |
-| first-header record | 1 024 (view, proposer) entries, pruned under the committed view | one header per view's leader (§0, C1) |
+| first-header record | 1 024 (view, proposer) entries, pruned under the committed view; each holds a signed header, whose size is dominated by its justify QC (~100 KB at 26 votes) | one header per view's leader, kept as equivocation evidence (§0, C1) |
 | `RECENT_TXS_MAX`, `RECENT_TXS_BYTES` | 4 096 entries, `2 × max_block_bytes` | two blocks of gossip in flight |
 | tree index | `O(transactions in the tree)` | ≤ 3 blocks in steady state, 512 under stalls (`max_tree_blocks`) |
 | fetch attempts | `MAX_FETCH_ATTEMPTS` (8) distinct peers per parked proposal; `Busy` not counted | as `fetch_block` |

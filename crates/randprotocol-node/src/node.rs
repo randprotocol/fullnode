@@ -1003,13 +1003,14 @@ struct Node {
     /// §5.3; final review I2): at most [`PARK_SLOTS`], placed by [`park_slot`], and dropped when
     /// the replica schedules a later view's timeout or holds the block.
     parked: BTreeMap<u64, compact::Parked>,
-    /// The header hash of the first compact proposal that passed the pre-screen for each
+    /// The first compact proposal's signed header that passed the pre-screen for each
     /// (view, proposer) (final review C1, spec 2026-10-08 §0): a leader that signs a second,
     /// different header for its own view gets it reported `Ignore` and neither rebuilt nor
-    /// parked, so equivocating costs each node one signature check rather than a rebuild. Entries
-    /// under the committed view are pruned on insert, and the map holds at most
-    /// [`FIRST_COMPACT_MAX`] entries, the oldest view first out.
-    first_compact: BTreeMap<(u64, randprotocol_core::Address), Hash>,
+    /// parked, so equivocating costs each node one signature check rather than a rebuild, and
+    /// on a chain that slashes the two headers become a `SlashEquivocation` (audit v6, STAKE-1;
+    /// [`FirstCompact`]). Entries under the committed view are pruned on insert, and the map
+    /// holds at most [`FIRST_COMPACT_MAX`] entries, the oldest view first out.
+    first_compact: BTreeMap<(u64, randprotocol_core::Address), FirstCompact>,
     /// When each block's by-hash fetch was first deferred to batch sync ([`fetch_deferred`]).
     fetch_deferred_since: HashMap<Hash, Instant>,
     /// History-retention passes that deleted at least one block (history pruning spec §1),
@@ -1131,6 +1132,22 @@ fn park_slot(parked: &BTreeMap<u64, compact::Parked>, replica_view: u64, header:
         Some((&low, _)) => ParkSlot::Replace(low),
         None => ParkSlot::Free,
     }
+}
+
+/// The first compact header recorded for one (view, proposer) ([`Node::first_compact`]; final
+/// review C1, spec 2026-10-08 §0). The header and its signature are kept, not only the hash, so
+/// a second header from the same leader for the same view is slashing evidence without the
+/// replica having seen either block (audit v6, STAKE-1): both signatures were verified by the
+/// pre-screen, which is all `SlashEquivocation` needs.
+struct FirstCompact {
+    /// The header as the leader signed it, with its signature.
+    signed: randprotocol_core::types::actions::SignedHeader,
+    /// `signed.hash()`, kept so a redelivery is compared without hashing the header again.
+    hash: Hash,
+    /// Whether this leader's equivocation for this view has already been handed to
+    /// [`Node::pool_equivocation`]: one piece of evidence per (view, proposer) slashes the
+    /// offence, so a third header, or the second again, costs no further pool admission.
+    evidence_sent: bool,
 }
 
 /// The most (view, proposer) entries [`Node::first_compact`] keeps (final review C1). Entries
@@ -3638,15 +3655,19 @@ impl Node {
         // leader for the same view, after one passed the pre-screen, is an equivocation: not
         // forwarded, not rebuilt, not parked. Only a header that passed in full (its signature
         // verified) reaches this point, so a forged one can neither be recorded nor pre-empt the
-        // leader's.
+        // leader's — and both headers of a pair are the leader's own, which makes them evidence.
         let key = (c.header.view, c.header.proposer.address());
         let hash = c.hash();
-        if self.first_compact.get(&key).is_some_and(|first| *first != hash) {
-            tracing::warn!(%forwarder, view = key.0, "a second compact proposal from the view's leader; ignored, not rebuilt");
+        if self.first_compact.get(&key).is_some_and(|first| first.hash != hash) {
+            tracing::warn!(%forwarder, view = key.0, first = ?self.first_compact[&key].hash, second = ?hash, "a second compact proposal from the view's leader; ignored, not rebuilt");
             self.report(id, GossipOutcome::Report(Acceptance::Ignore)).await;
+            let second = randprotocol_core::types::actions::SignedHeader { header: c.header, signature: c.signature };
+            if let Some(evidence) = self.compact_equivocation(key, second) {
+                self.handle_actions(vec![evidence]).await?;
+            }
             return Ok(());
         }
-        self.note_first_compact(key, hash);
+        self.note_first_compact(key, &c, hash);
         self.report(id, GossipOutcome::Report(Acceptance::Accept)).await;
         // Every proposal that passed the pre-screen, parked or not, rebuilt or not (final review
         // I2), as the full path counts every proposal it hands on; only these, since an
@@ -3698,10 +3719,11 @@ impl Node {
         }
     }
 
-    /// Record the first pre-screened header for `key` (final review C1): entries under the
-    /// committed view go first, then the oldest views while the map is at
-    /// [`FIRST_COMPACT_MAX`].
-    fn note_first_compact(&mut self, key: (u64, randprotocol_core::Address), hash: Hash) {
+    /// Record the first pre-screened header for `key`, `c`'s, whose hash is `hash` (final review
+    /// C1): entries under the committed view go first, then the oldest views while the map is
+    /// at [`FIRST_COMPACT_MAX`]. A key already recorded keeps its first header, and the header is
+    /// cloned only when it is the first.
+    fn note_first_compact(&mut self, key: (u64, randprotocol_core::Address), c: &CompactBlock, hash: Hash) {
         let floor = self.hs.committed_qc_view();
         if self.first_compact.first_key_value().is_some_and(|((v, _), _)| *v < floor) {
             self.first_compact = self.first_compact.split_off(&(floor, randprotocol_core::Address::default()));
@@ -3709,7 +3731,38 @@ impl Node {
         while self.first_compact.len() >= FIRST_COMPACT_MAX && !self.first_compact.contains_key(&key) {
             self.first_compact.pop_first();
         }
-        self.first_compact.entry(key).or_insert(hash);
+        self.first_compact.entry(key).or_insert_with(|| FirstCompact {
+            signed: randprotocol_core::types::actions::SignedHeader { header: c.header.clone(), signature: c.signature.clone() },
+            hash,
+            evidence_sent: false,
+        });
+    }
+
+    /// The equivocation evidence a second compact header for `key` makes (open-findings fix 2;
+    /// audit v6, STAKE-1): `Action::Equivocation` over the recorded first header and `second`,
+    /// in `SignedHeader::ordered`'s canonical order, as the replica builds it in `on_proposal`
+    /// (`HotStuff`'s one-block-per-(view, leader) check) — so a pair the replica also sees, one
+    /// of the blocks having come in full, is one transaction id and the pool's `Duplicate`.
+    /// Gated as the replica gates it: only on a chain whose committed ledger has
+    /// `staking.slashing`, elsewhere the pair would be held for nothing. The replica's other
+    /// gate, `MAX_EVIDENCE_HELD`, bounds evidence held between two drains; this evidence is
+    /// handed to [`Node::pool_equivocation`] the moment it is built, so at most one is ever
+    /// held, and at most one is built per (view, proposer) — a third header from the same
+    /// leader, or the second redelivered, builds none. Both signatures were verified by the
+    /// pre-screen; the pool's admission checks them again with the ledger's rules.
+    fn compact_equivocation(
+        &mut self,
+        key: (u64, randprotocol_core::Address),
+        second: randprotocol_core::types::actions::SignedHeader,
+    ) -> Option<Action> {
+        let slashes = self.hs.committed_ledger().staking().is_some_and(|s| s.slashing.is_some());
+        let first = self.first_compact.get_mut(&key)?;
+        if !slashes || first.evidence_sent {
+            return None;
+        }
+        first.evidence_sent = true;
+        let (first, second) = randprotocol_core::types::actions::SignedHeader::ordered(first.signed.clone(), second);
+        Some(Action::Equivocation { first, second })
     }
 
     /// A block rebuilt from a compact proposal goes through the full proposal precheck — the
@@ -7151,6 +7204,84 @@ mod tests {
         let sent = drain(&mut seen).await;
         assert_eq!(tx_fetches(&sent), vec![], "nothing fetched for the second header");
         assert_eq!(reports(&sent), vec![Accept, Ignore, Ignore, Accept], "each reported once; the first again proceeds");
+        assert_eq!(slash_broadcasts(&sent), vec![], "a chain without slashing gets no evidence");
+    }
+
+    /// The slashing transactions among `seen` — what [`Node::pool_equivocation`] gossips once
+    /// it has pooled a piece of evidence.
+    fn slash_broadcasts(seen: &[Seen]) -> Vec<Transaction> {
+        seen.iter()
+            .filter_map(|s| match s {
+                Seen::Broadcast(GossipMessage::Transaction(tx)) if matches!(tx.action, randprotocol_core::types::Action::SlashEquivocation { .. }) => Some(tx.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Open-findings fix 2 (audit v6, STAKE-1): on a chain that slashes, a leader that signs a
+    /// second header for its view through compact proposals is caught. The second header is
+    /// still reported `Ignore` and neither rebuilt (its pooled body is not remembered) nor
+    /// parked, but the pair — both signatures verified by the pre-screen — becomes one
+    /// `SlashEquivocation`, pooled and gossiped exactly as the replica's own evidence is. A third
+    /// header, or the second again, adds none; the same pair from the replica is the pool's
+    /// duplicate.
+    #[tokio::test]
+    async fn a_second_compact_header_on_a_slashing_chain_is_pooled_as_evidence_once() {
+        use crate::storage::fixtures::slashing_genesis;
+        use libp2p::gossipsub::MessageAcceptance::{Accept, Ignore};
+        use randprotocol_core::types::actions::SignedHeader;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let keys = [key(1), key(2), key(3), key(4)];
+        let gs = slashing_genesis(&keys.iter().collect::<Vec<_>>());
+        storage.init_genesis(&gs).unwrap();
+        let hs = resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), Arc::new(StubExecutor)).unwrap();
+        let genesis = gs.block.clone();
+        let view = hs.view();
+        let leader = keys.iter().find(|k| k.address() == gs.validators.leader(view)).unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let pooled = next_tx(&ledger, 1);
+        node.mempool.insert_verified(pooled.clone(), &ledger, &StubExecutor).unwrap();
+        let signed = |ts: u64, txs: Vec<Transaction>| {
+            let header = BlockHeader {
+                height: 1,
+                view,
+                parent: genesis.hash(),
+                proposer: leader.public_key().clone(),
+                timestamp_ms: ts,
+                tx_root: Block::tx_root(&txs),
+                state_root: Hash::ZERO,
+                justify: QuorumCertificate::genesis(genesis.hash()),
+            };
+            Block::sign(node.hs.domain(), header, txs, leader)
+        };
+        let (first, second, third) = (signed(1, Vec::new()), signed(2, vec![pooled.clone()]), signed(3, Vec::new()));
+        claiming_peer(&mut node, 4);
+
+        node.on_compact_proposal(CompactBlock::of(&first), gossip_id()).await.unwrap();
+        node.on_compact_proposal(CompactBlock::of(&second), gossip_id()).await.unwrap();
+        assert!(node.recent_txs.get(&pooled.hash()).is_none(), "the second header is not rebuilt");
+        assert!(node.parked.is_empty(), "nor parked");
+        node.on_compact_proposal(CompactBlock::of(&third), gossip_id()).await.unwrap();
+        node.on_compact_proposal(CompactBlock::of(&second), gossip_id()).await.unwrap();
+        let sent = drain(&mut seen).await;
+        assert_eq!(reports(&sent), vec![Accept, Ignore, Ignore, Ignore], "each delivery reported once");
+        assert_eq!(tx_fetches(&sent), vec![], "nothing fetched");
+        let evidence = slash_broadcasts(&sent);
+        assert_eq!(evidence.len(), 1, "one piece of evidence for the view's leader");
+        let sh = |b: &Block| SignedHeader { header: b.header.clone(), signature: b.signature.clone() };
+        let (lo, hi) = SignedHeader::ordered(sh(&first), sh(&second));
+        assert!(
+            matches!(&evidence[0].action, randprotocol_core::types::Action::SlashEquivocation { first, second } if *first == lo && *second == hi),
+            "the first header and the second, in the canonical order"
+        );
+        assert!(node.mempool.contains(&evidence[0].hash()), "pooled for the next leader");
+
+        // The replica's copy of the same pair (one of the two arrived in full) is the pool's
+        // duplicate: nothing is gossiped twice.
+        node.handle_actions(vec![Action::Equivocation { first: lo, second: hi }]).await.unwrap();
+        assert_eq!(slash_broadcasts(&drain(&mut seen).await), vec![], "the same pair from the replica adds nothing");
     }
 
     /// The equivocation record is pruned under the committed view and capped, oldest view first
@@ -7158,20 +7289,22 @@ mod tests {
     #[tokio::test]
     async fn the_first_header_record_is_pruned_and_capped() {
         let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let storage_head = storage.head_block().unwrap();
         let (mut node, _seen) = bare_node(storage, gs, hs);
         let floor = node.hs.committed_qc_view();
         assert!(floor > 0, "the fixture has committed past view 0");
         let who = key(1).address();
-        node.first_compact.insert((floor - 1, who), Hash::ZERO);
-        node.note_first_compact((floor, who), Hash::ZERO);
+        let c = CompactBlock::of(&storage_head);
+        node.note_first_compact((floor - 1, who), &c, Hash::ZERO);
+        node.note_first_compact((floor, who), &c, Hash::ZERO);
         assert_eq!(node.first_compact.keys().map(|k| k.0).collect::<Vec<_>>(), vec![floor], "under the committed view: pruned");
         for v in 1..=FIRST_COMPACT_MAX as u64 {
-            node.note_first_compact((floor + v, who), Hash::ZERO);
+            node.note_first_compact((floor + v, who), &c, Hash::ZERO);
         }
         assert_eq!(node.first_compact.len(), FIRST_COMPACT_MAX);
         assert!(!node.first_compact.contains_key(&(floor, who)), "the oldest view went first");
-        node.note_first_compact((floor + 5, who), Hash::digest(b"later"));
-        assert_eq!(node.first_compact.get(&(floor + 5, who)), Some(&Hash::ZERO), "the first record stands");
+        node.note_first_compact((floor + 5, who), &c, Hash::digest(b"later"));
+        assert_eq!(node.first_compact.get(&(floor + 5, who)).map(|f| f.hash), Some(Hash::ZERO), "the first record stands");
     }
 
     /// Audit v6, PROC-8: a node more than one block behind defers by-hash fetches to batch sync;
