@@ -278,11 +278,22 @@ mesh is unaffected. Restarting a node onto the new build is the whole cure.
 
 **Roll order and why.** Observers and archives first: they relay consensus gossip and serve
 fetches, and while old they would drop (and Reject) compact proposals; rolling them early costs
-nothing, because a new node still accepts full proposals from old leaders. Then all validators
-together and quickly, not staggered as in step 3 above: while more than a third of the stake runs
-the old build, views led by a new leader time out (the old nodes do not vote its proposal),
-though the chain still advances on the old leaders' views, so a long mixed window is a slow
-chain, not a stopped one. There is no genesis field and no chain cut.
+nothing, because a new node still accepts full proposals from old leaders. Then every validator
+at once, with `deploy/roll-all.sh` — not staggered as in step 3 above, and not in batches.
+
+**A mixed validator set is a stopped chain, not a slow one.** A commit needs three consecutive
+certified views: chained HotStuff finalises a block only when it, its child and its grandchild are
+certified in views `v`, `v + 1`, `v + 2` (`consensus/commit_rule.rs:28-40`, and the live path's
+`consecutive_views` check at `consensus/hotstuff.rs:51-53, :1564-1573`). Leaders rotate by view
+over the validator list, `validators[view % n]` (`types/validator.rs:87-93`). An old-build
+validator cannot decode a compact proposal, so while more than a third of the stake is on the old
+build, every view led by a new-build validator gets no quorum and times out. Views led by
+old-build validators still certify (a new node accepts a full proposal), but a block commits only
+when three consecutive views are all led by old-build validators — with the two builds' leaders
+interleaved in the rotation that need never happen. **Commits can stop entirely**: blocks certify
+on the old leaders' views, none commit, and the uncommitted tree grows toward `max_tree_blocks`
+(512, `consensus/mod.rs:389`). Once more than two thirds of the stake runs the new build, both
+builds' leaders' views certify again. There is no genesis field and no chain cut.
 
 **Procedure.** Observers and archives with `deploy/update-droplet.sh` (one at a time). For the
 validators, `deploy/roll-all.sh <rand-node> <rand> <sha256 of rand-node> [<sha256 of rand>]`
@@ -290,15 +301,16 @@ validators, `deploy/roll-all.sh <rand-node> <rand> <sha256 of rand-node> [<sha25
 on every host in `deploy/nodes.env` with no restart, then stops every node together and starts
 every node together, node A last, each stop and start run in parallel over ssh. It is an
 all-stop all-start, not a sequential roll: the chain commits nothing for the startup verify (its
-header comment says about 15 minutes) whatever the fleet size, so it trades a short mixed window
-for a full stop. It has no observers-first mode; run `update-droplet.sh` on those beforehand. If
-a staggered roll is preferred instead, restart the validators in parallel batches by hand rather
-than one at a time, since each node on the old build while a third of the stake is old costs the
-new leaders' views.
+header comment says about 15 minutes) whatever the fleet size, and no mixed validator set ever
+runs. It is the only validator procedure for this release: any staggered or batched restart is
+the mixed window above. It has no observers-first mode; run `update-droplet.sh` on those
+beforehand.
 
-**Rollback.** Reverting to the old build is safe: the old build rejects only compact proposals,
-and a new leader's view that nobody votes simply times out. `roll-all.sh` keeps the previous
-binary as `/root/rand-node.prev` on each host.
+**Rollback.** All together as well, by the same script: `deploy/roll-all.sh` with the previous
+release's `rand-node` and `rand` and their shas — the bytes `roll-all.sh` kept on each host as
+`/root/rand-node.prev`. A partial rollback is the same mixed window: while more than a third of
+the stake is on the old build, the new leaders' views time out and commits can stop. Nothing is
+written to disk that the old build cannot read, so the rollback needs no resync.
 
 ## Release trust
 

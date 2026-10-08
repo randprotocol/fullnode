@@ -501,8 +501,9 @@ two are derived from printed sizes and one is quoted from another page.
 
 | quantity | value | source |
 |---|---|---|
-| largest compact frame, four validators | 15 708 bytes carrying 13 transactions (a second run: 15 804 bytes carrying 16) | `tests/cluster.rs` `a_proposal_frame_carries_hashes_not_bodies`, raw gossipsub frames read by an observer swarm |
-| what those bodies cost on the tx topic | 32 mints, 32 frames, 168 096 bytes (5 253 bytes a mint) — so the 13 the largest frame named were about 68 KB of bodies (13 × 5 253, derived) the frame did not carry | the same test |
+| largest compact frame, four validators | 15 420 bytes carrying 4 transactions, mints paced one per node every 500 ms (before the pacing, a burst of all 32: 15 708 bytes carrying 13, and 15 804 carrying 16) | `tests/cluster.rs` `a_proposal_frame_carries_hashes_not_bodies`, raw gossipsub frames read by an observer swarm |
+| bodies fetched in that test | 0 on all four validators, paced (four runs); unpaced, 8 on each of three (24), the bodies n0 relayed past each receiver's per-forwarder limit (`PEER_TX_BURST` 16) | the same test, `compact_fetched` |
+| what those bodies cost on the tx topic | 32 mints, 32 frames, 168 096 bytes (5 253 bytes a mint) — so the 13 the unpaced run's largest frame named were about 68 KB of bodies (13 × 5 253, derived) the frame did not carry | the same test |
 | fixed part of a compact frame, four justify votes, no hashes | 19 080 bytes | `network::wire::tests::a_compact_proposal_at_26_validators_and_2000_hashes_is_its_header_plus_32_bytes_a_hash` |
 | compact frame at 26 justify votes, no hashes | 102 416 bytes | the same unit test |
 | compact frame at 26 justify votes and 2 000 hashes (the block cap) | **166 416 bytes** (printed) — exactly 2 000 × 32 more than with none | the same unit test (`bincode::serialized_size`) |
@@ -512,7 +513,8 @@ two are derived from printed sizes and one is quoted from another page.
 Reading the table. The figures below are derived from the printed sizes, not printed
 themselves. One vote is (102 416 − 19 080) / 22 = 3 788 bytes, the difference between the
 26-vote and four-vote frames over their 22 extra votes. In the four-validator cluster the
-observed fixed part is 15 708 − 13 × 32 = 15 292 bytes, which is 19 080 − 3 788: consistent
+observed fixed part is 15 420 − 4 × 32 = 15 292 bytes (and 15 708 − 13 × 32 before the
+pacing), which is 19 080 − 3 788: consistent
 with three votes in the justify (a quorum) against the unit test's four. At 26 validators a
 quorum is 18, so a QC that carries exactly a quorum makes the cap-size frame about
 166 416 − 8 × 3 788 = 136 112 bytes (derived); the 166 416 in the table is the bound with every
@@ -523,5 +525,5 @@ The late-validator test is the fetch path end to end: two of a four-validator ge
 quorum, so nothing commits), eight faucet mints are pooled and gossiped between them, and a third
 validator joins only after gossipsub's 2.5 s history window has passed, so it never sees the
 bodies. Its arrival makes the quorum; the first proposal that names the mints parks on it, the
-eight bodies are fetched from the leader's peer by hash (`SyncRequest::Transactions`), and it
-votes and commits the same chain (`assert_chains_equal`). Fetch latency was not timed.
+eight bodies are fetched by hash (`SyncRequest::Transactions`), and it votes and commits the
+same chain (`assert_chains_equal`). Fetch latency was not timed.

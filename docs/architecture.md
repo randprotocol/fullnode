@@ -388,16 +388,20 @@ full `Consensus(Proposal)` is still accepted on receipt. A compact proposal is m
 forwarder (count and bytes), then `HotStuff::precheck_compact` runs on the header alone — key,
 count cap, no duplicate hash, the hash list against the signed `tx_root`, justify certifies the
 parent, the QC, the height and view window, the leader of the view, the header signature — and
-the verdict is reported to gossipsub once. The node then rebuilds the block from its mempool and
+the verdict is reported to gossipsub once. A second, different header from a view's leader for
+that view is reported `Ignore` and neither rebuilt nor parked (one header per view and
+proposer). The node then rebuilds the block from its mempool and
 its recent-transactions cache (4 096 entries, `4 × max_block_bytes` bytes; it holds gossiped
 bodies once they pass the bytes-only refusal and every proposal body this node sends or
 handles) and hands HotStuff the same full `Proposal` it receives from an old leader. If bodies
-are missing the proposal is parked — only for views `view` and `view + 1`, one park at a time —
-and the missing hashes are fetched in batches of 512 from the leader's bound peer, then the
-forwarder, then peers at or above our height, then any, at most 8 peers. Pruned (marker-form)
+are missing the proposal is parked — two slots by view, the band from the replica's view to one
+past the highest parked view, a park never displaced by its own child — and the missing hashes
+are fetched in batches of 512 from the leader's bound peer, then the forwarder, then peers at or
+above our height, then any, at most 8 distinct peers (a `Busy` answer not counted). A proposal
+the pre-screen `Ignore`s is still rebuilt and handed to HotStuff when every body is held. Pruned (marker-form)
 bodies share the real transaction's id and are never cached, rebuilt from or accepted from a
 fetch. Serving a `Transactions` request is answered on the consensus loop from the pool and the
-cache only.
+cache only, cut at `max_block_bytes + max_aggregate_bytes`.
 
 **Mempool.** Transactions are validated against the ledger at the tip of the consensus tree (not
 necessarily the last committed block — the tip a proposer would actually build on). A redacted

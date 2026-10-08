@@ -28,16 +28,48 @@ below differs:
 - **Marker forms are excluded.** A pruned (marker-form) body shares the real transaction's id. It
   is never cached, never used in a rebuild and never accepted from a fetch response; the fetch
   then finds the real body.
-- **The park band is `hs.view()` and `hs.view() + 1`.** One park at a time; a newer view replaces
-  it, a same or older view does not (a same-view proposal keeps the park). A proposal for any
-  other view is not parked, so a future-view leader cannot take the park over; a node that lags
-  by more than one view gets the block by `BlockByHash` or batch sync as before.
 - **Fetch order** is the leader's bound peer, then the forwarder, then peers at or above our
   height, then any, at most 8 peers; when the leader is unbound the forwarder is asked first.
   Expiry runs from the 3 s status tick. A completed park whose block the replica already holds
   is dropped.
 - **Serving** is from the pool and the recent cache only, never a marker form, on the consensus
   loop (§6). A request over `TX_FETCH_BATCH` is `Busy` without spending a node-wide token.
+
+The final whole-branch review (2026-10-08) amended it again; these rulings replace the review
+round 1 park band (`hs.view()` and `hs.view() + 1`, one park):
+
+- **One header per (view, proposer)** (C1). The node records the hash of the first compact
+  proposal that passes the pre-screen in full for each (view, proposer); a later one with the
+  same key and a different hash — a leader equivocating — is reported `Ignore` and neither
+  rebuilt nor parked, so a leader cannot make every node rebuild and hash many headers for its
+  view. The same hash again proceeds (a redelivery may now rebuild). The record is pruned under
+  the committed view and capped at 1 024 entries, oldest view first. An `Ignore`d header is
+  checked against the record but never recorded: its signature was not verified.
+- **Two park slots, keyed by view** (I2). The band is `hs.view()` to `max(hs.view(), highest
+  parked view) + 1`, so a replica one view behind can park its successor's block beside the one
+  it is still fetching. A view already parked keeps its park; with both slots taken, a new view
+  in the band replaces the lowest-view park unless that park is the new block's parent. Every
+  slot is held by a view's scheduled leader, so a junk park for the next view leaves the other
+  slot to the honest current view. `highest_proposal_seen` counts every pre-screened compact
+  proposal, parked or not.
+- **An `Ignore`d compact proposal is handed on** (I3), as the full path hands an `Ignore`d
+  proposal to the replica: rebuilt and handled when every body is held, never parked or fetched
+  for. The equivocation `Ignore` above is the exception: not handed on.
+- **The serve bound** (I4). A `Transactions` answer stops at the first body that would take it
+  past `max_block_bytes + max_aggregate_bytes` of the tip ledger (§3.2); the cut answer is a
+  prefix, and the asker takes the rest elsewhere.
+- **Attempts are distinct peers** (I7). A peer sent several batches in one go is one attempt; a
+  `Busy` answer costs none — its peer goes behind every other candidate and is asked again only
+  from the status tick — while a failure, a timeout or an answer with nothing usable counts.
+  `MAX_FETCH_ATTEMPTS` (8) caps the distinct peers; a park with only busy peers left waits for
+  the tick rather than being dropped.
+- **Smaller rulings.** A body gossiped while its proposal is parked fills the slot (and
+  completes the park); a park whose block reaches the tree any other way is dropped; an answer
+  is cut to the number of hashes its request named before any is placed; the recent cache
+  refuses a single body larger than its byte cap; the leader publishes its compact proposal
+  before remembering the bodies, hashing them once.
+- **The roll** (I5, §7): a mixed validator set can stop commits entirely, so `deploy/roll-all.sh`
+  is the only validator procedure, rollback included.
 
 ## 1. Goal and success criteria
 
@@ -163,9 +195,9 @@ reported `Reject` against the forwarder, like a malformed full proposal.
 
 ### 5.3 Park and fetch
 
-If hashes are missing, the compact proposal is parked in `pending_compact: Option<Parked>` —
-**one per node**, the newest view wins, dropped on `on_timeout` for its view and when the view
-advances past it — and the missing hashes are requested in batches of `TX_FETCH_BATCH` from the
+If hashes are missing, the compact proposal is parked — **two slots, by view**, placed by the
+§0 rule (final review I2), dropped when the replica schedules a later view's timeout or holds
+the block — and the missing hashes are requested in batches of `TX_FETCH_BATCH` from the
 proposer's peer id first (the gossip source is the forwarder, not necessarily the leader; the
 leader's peer id is known from the peer-binding table when bound, else the forwarder), then from
 connected peers at or above our height, in the order `fetch_block` uses, with the same
@@ -195,7 +227,8 @@ bytes-only reason (`RefusedCache`) is not cached.
 `SyncRequest::Transactions(hashes)` is admitted by the per-peer `sync_bucket`, then, if it is
 served, one node-wide sync-serve token. It is answered on the consensus loop, like `BlockByHash`,
 from the pool and the recent-transactions cache only; storage is not consulted, and a marker
-form is never served. Over the limit it answers `Busy`. A request over `TX_FETCH_BATCH` hashes
+form is never served. The answer stops at `max_block_bytes + max_aggregate_bytes` (§3.2, §0).
+Over the limit it answers `Busy`. A request over `TX_FETCH_BATCH` hashes
 is answered `Busy` without spending a node-wide token. The response carries only transactions
 found, so a peer missing some lets the client move to the next peer for the rest.
 
@@ -203,21 +236,33 @@ found, so a peer missing some lets the client move to the next peer for the rest
 
 Flag day. An old node receiving `CompactProposal` cannot decode it and reports `Reject`, so it
 never votes on or relays a new leader's proposal (the node configures no gossipsub peer scoring,
-so a Reject only drops the message; old nodes between new ones are relay holes); a new node receiving an old leader's full `Proposal`
-handles it as today. The fleet is therefore rolled in one pass, validators last, exactly as
-v0.7.0 was rolled; during the pass the chain keeps liveness while more than two thirds of the
-stake runs the same format, so the roll order is: observers and archives first, then the
-validators quickly. `CHANGELOG` and `docs/deploy.md` say so. No genesis field, no chain cut.
+so a Reject only drops the message; old nodes between new ones are relay holes); a new node
+receiving an old leader's full `Proposal` handles it as today.
+
+A mixed validator set is a stopped chain, not a slow one (final review I5). A commit needs three
+consecutive certified views (`consensus/commit_rule.rs:28-40`; `consecutive_views`,
+`consensus/hotstuff.rs:51-53, :1564-1573`) and leaders rotate `validators[view % n]`
+(`types/validator.rs:87-93`). While more than a third of the stake is on the old build, every
+view a new-build validator leads times out; views old-build validators lead still certify, but
+a block commits only when three consecutive views are old-led, which with the builds' leaders
+interleaved need never happen — blocks certify, none commit, and the tree grows toward
+`max_tree_blocks`. So the roll is: observers and archives first (they relay and serve), then
+every validator at once with `deploy/roll-all.sh` (all-stop, all-start) — the only validator
+procedure; no staggered or batched restart. Rollback is all-together too, `roll-all.sh` with
+the previous release's binaries (kept on each host as `/root/rand-node.prev`). `CHANGELOG` and
+`docs/deploy.md` say so. No genesis field, no chain cut.
 
 ## 8. Bounds and limits
 
 | item | value | why |
 |---|---|---|
 | `TX_FETCH_BATCH` | 512 hashes | 16 KB request under the 64 KiB request limit; ≤ 4 round-trips for a full block |
-| parked compact proposals | 1, newest view | a view has one leader; an older one is moot |
+| parked compact proposals | 2, by view (§0) | the replica's view and the next, or a lagging replica's next two |
+| first-header record | 1 024 (view, proposer) entries, pruned under the committed view | one header per view's leader (§0, C1) |
 | `RECENT_TXS_MAX`, `RECENT_TXS_BYTES` | 4 096 entries, `2 × max_block_bytes` | two blocks of gossip in flight |
 | tree index | `O(transactions in the tree)` | ≤ 3 blocks in steady state, 512 under stalls (`max_tree_blocks`) |
-| fetch attempts | `MAX_FETCH_ATTEMPTS` (8) per parked proposal | as `fetch_block` |
+| fetch attempts | `MAX_FETCH_ATTEMPTS` (8) distinct peers per parked proposal; `Busy` not counted | as `fetch_block` |
+| a `Transactions` answer | `max_block_bytes + max_aggregate_bytes` serialized | §3.2 |
 | serve budget | shared with `Blocks` | a `Transactions` request can be a whole block |
 
 The consensus byte limiter (CN-4) is unchanged: a compact proposal is far under one view's
