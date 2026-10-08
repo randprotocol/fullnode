@@ -2044,6 +2044,24 @@ mod tests {
         assert_eq!(rpc.fee_rules().await.expect("an extra key is no error"), all, "the client path reads it the same");
     }
 
+    /// The dollar-indexed subsidy: [`fee_rules_of`] reads `usd_subsidy`'s three numbers (the
+    /// amounts as decimal strings, as the node sends them, or numbers); `null`, absent, or an
+    /// object missing any number reads `None` — never a schedule built from a partial section.
+    #[test]
+    fn fee_rules_of_reads_the_usd_subsidy() {
+        use randprotocol_core::ledger::fees::UsdSubsidy;
+        let rules = |v: Value| fee_rules_of(&json!({ "fee_rules": v })).usd_subsidy;
+        let want = UsdSubsidy { usd_micros_per_sealed_block: 4_791, max_subsidy_per_block: 300_000_000, price_max_age_blocks: 72_000, initial_price_micros: None };
+        assert_eq!(
+            rules(json!({ "usd_subsidy": { "usd_micros_per_sealed_block": "4791", "max_subsidy_per_block": "300000000", "price_max_age_blocks": 72000 } })),
+            Some(want.clone())
+        );
+        assert_eq!(rules(json!({ "usd_subsidy": { "usd_micros_per_sealed_block": 4791, "max_subsidy_per_block": 300000000, "price_max_age_blocks": 72000 } })), Some(want));
+        assert_eq!(rules(json!({ "usd_subsidy": null })), None);
+        assert_eq!(rules(json!({ "burn_base": true })), None, "a node that predates the field");
+        assert_eq!(rules(json!({ "usd_subsidy": { "usd_micros_per_sealed_block": "4791", "price_max_age_blocks": 72000 } })), None, "a partial section");
+    }
+
     /// The fee split (`docs/compute-optimization.md` §6.2–§6.3): [`fee_rules_of`] reads
     /// `proposer_share_bps` as a number in range and `prove_base` as an amount (a decimal string,
     /// as the node sends it, or a number); `null`, absent or junk reads `None`. The typed

@@ -8215,7 +8215,7 @@ mod tests {
         let (gas_price, byte_price) = (price("gas_price"), price("byte_price"));
         assert_eq!(
             limits["fee_rules"],
-            serde_json::json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true, "proposer_share_bps": null, "prove_base": null }),
+            serde_json::json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true, "proposer_share_bps": null, "prove_base": null, "usd_subsidy": null }),
             "the chain serves the burn-floor rules"
         );
 

@@ -250,6 +250,15 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | S::BadEvidenceSignature(_)
         );
     }
+    // The RAND price vote's byte-verdicts (`fees.usd_subsidy`), `Staking`'s three for the same
+    // vote shape: a zero price, votes out of strict voter order, and a vote that does not verify
+    // under the key the action lists beside it over the genesis hash, price and nonce the action
+    // itself names. The nonce, the band against the current price, membership and the quorum
+    // move with the chain and stay out.
+    if let TxError::Price(p) = e {
+        use randprotocol_core::ledger::rand_price::PriceError as P;
+        return matches!(p, P::ZeroPrice | P::VoteOrder | P::BadVote(_));
+    }
     // The aggregation register's verdicts, split like `Staking`'s: the byte-verdicts (and the
     // ones against genesis-pinned constants) are cacheable, the register's state is not. A
     // signature is over the transaction's own fields against the entry's key — and an address

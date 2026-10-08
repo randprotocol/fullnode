@@ -597,7 +597,7 @@ pub const PUBLIC_METHODS: &[&str] = &[
     "rand_getAggregate", "rand_getAggregators", "rand_getUnsealed",
     "rand_getVesting", "rand_getVestingSchedule", "rand_getVestingSummary",
     "rand_getPerps", "rand_getPerpAccount", "rand_getPerpAccounts", "rand_getPerpInputs",
-    "rand_getMultisig",
+    "rand_getMultisig", "rand_getRandPrice",
 ];
 
 /// The public listener's burst and refill, for **every caller together**: there is one address
@@ -800,6 +800,21 @@ pub struct FeeRules {
     /// string like every amount, `null` when unset. `rand_estimateFee` already includes it.
     #[serde(serialize_with = "opt_u64_as_decimal_string")]
     pub prove_base: Option<u64>,
+    /// The dollar-indexed sealing subsidy (`docs/fees.md` §1.3): its three numbers, `null` when
+    /// unset. The live price it converts at is `rand_getRandPrice`.
+    pub usd_subsidy: Option<UsdSubsidyRules>,
+}
+
+/// `fee_rules.usd_subsidy`: the dollar target of a sealed block and the RAND cap (decimal strings,
+/// like every amount) and how many blocks a voted price stays usable. The genesis price is not
+/// served here — `rand_getRandPrice` serves the live one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UsdSubsidyRules {
+    #[serde(serialize_with = "u64_as_decimal_string")]
+    pub usd_micros_per_sealed_block: u64,
+    #[serde(serialize_with = "u64_as_decimal_string")]
+    pub max_subsidy_per_block: u64,
+    pub price_max_age_blocks: u64,
 }
 
 /// `rand_getLimits`' `perps` object: the collateral asset (0 is RAND), the highest proof tier
@@ -880,6 +895,11 @@ impl ChainLimits {
                 burn_floor: f.burn_floor(),
                 proposer_share_bps: f.proposer_share_bps(),
                 prove_base: f.prove_base,
+                usd_subsidy: f.usd_subsidy().map(|u| UsdSubsidyRules {
+                    usd_micros_per_sealed_block: u.usd_micros_per_sealed_block,
+                    max_subsidy_per_block: u.max_subsidy_per_block,
+                    price_max_age_blocks: u.price_max_age_blocks,
+                }),
             }),
             perps: ledger.perps().map(|p| PerpsLimits {
                 collateral_asset: p.config.collateral_asset,
@@ -3753,6 +3773,28 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 "admitted": admitted.iter().map(|a| a.to_base58()).collect::<Vec<_>>(),
             }))
         }
+        // The voted RAND/USD price (`fees.usd_subsidy`, `docs/fees.md` §1.3): `null` on a chain
+        // without the section and before its first price. `fresh` is judged for the **next**
+        // block — the earliest an aggregate submitted now can land, and the height whose schedule
+        // it is paid at — so an aggregator seals the amount the ledger will derive. The head
+        // height is read before the price: a commit landing between the two can only make the
+        // price newer than the height, never older (age saturates at 0).
+        "rand_getRandPrice" => {
+            let Some(usd) = st.limits.fee_rules.as_ref().and_then(|f| f.usd_subsidy.clone()) else {
+                return Ok(Value::Null);
+            };
+            let storage = st.storage.clone();
+            let (height, price) = blocking(st, move || Ok((storage.head_height()?.unwrap_or(0), storage.rand_price()?))).await?;
+            Ok(price.map_or(Value::Null, |p| {
+                json!({
+                    "price_micros_per_rand": p.price_micros_per_rand.to_string(),
+                    "set_at_height": p.set_at_height,
+                    "nonce": p.nonce,
+                    "fresh": p.fresh_at(height.saturating_add(1), usd.price_max_age_blocks),
+                    "max_age_blocks": usd.price_max_age_blocks,
+                })
+            }))
+        }
         "rand_getEpoch" => {
             let info = epoch_info(st).await?;
             Ok(json!({
@@ -4100,18 +4142,31 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
         // section (there is then no schedule to report), otherwise the current per-block amount
         // and the halving math `sealed_blocks` indexes into. `current` is the schedule: under the
         // genesis `fees.subsidy_net_of_fees` (`docs/fees.md` §1.3) it is a ceiling on what an
-        // aggregate mints, not the mint itself (`rand_getAggregate`'s `subsidy` is). Two meta
-        // reads, never a `load_ledger` (spec §1: no second way to trigger a commitment-tree
-        // rebuild): the config is genesis truth and never changes after `init_genesis`, so a
-        // commit landing between the two reads can only move `sealed_blocks`, and the answer is
-        // then as of that commit.
+        // aggregate mints, not the mint itself (`rand_getAggregate`'s `subsidy` is). Under the
+        // genesis `fees.usd_subsidy` it is the dollar target at a price fresh for the next block,
+        // capped, or the RAND schedule without one (`aggregation::schedule_subsidy`). Meta reads,
+        // never a `load_ledger` (spec §1: no second way to trigger a commitment-tree rebuild):
+        // the config and the fee rules are genesis truth and never change after `init_genesis`,
+        // so a commit landing between the reads can only move `sealed_blocks` and the price, and
+        // the answer is then as of that commit.
         "rand_getEmission" => {
             let faucet = st.status.read().unwrap_or_else(|e| e.into_inner()).faucet;
             let storage = st.storage.clone();
-            let (cfg, sealed) =
-                blocking(st, move || Ok((storage.aggregation_config()?, storage.supply()?.sealed_blocks))).await?;
+            let (cfg, sealed, fees, price, height) = blocking(st, move || {
+                // The height before the price, as `rand_getRandPrice` reads them.
+                let height = storage.head_height()?.unwrap_or(0);
+                Ok((storage.aggregation_config()?, storage.supply()?.sealed_blocks, storage.fees_config()?, storage.rand_price()?, height))
+            })
+            .await?;
             let subsidy = cfg.map(|cfg| {
-                let current = randprotocol_core::gas::subsidy(sealed, &cfg);
+                // The schedule an aggregate landing in the next block is paid at — one function
+                // with the ledger's (`aggregation::schedule_subsidy`): under `fees.usd_subsidy`
+                // with a price fresh for that block, the dollar target converted and capped;
+                // otherwise the RAND schedule.
+                let fresh = fees.usd_subsidy().and_then(|u| {
+                    price.filter(|p| p.fresh_at(height.saturating_add(1), u.price_max_age_blocks)).map(|p| p.price_micros_per_rand)
+                });
+                let current = randprotocol_core::ledger::aggregation::schedule_subsidy(sealed, &cfg, fees.usd_subsidy(), fresh);
                 // Saturating: past the last representable halving the multiply would overflow
                 // (a debug-build panic on the RPC thread); `u64::MAX` reads as "never". Genesis
                 // validation refuses a zero `halving_blocks`, which `subsidy` divides by too.
@@ -6223,11 +6278,51 @@ pub(crate) mod tests {
         let off = limits_with(FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None }).await;
         assert_eq!(off["fee_rules"], Value::Null, "a section with no true flag is no section");
         let on = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None }).await;
-        assert_eq!(on["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": null, "prove_base": null }));
+        assert_eq!(on["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": null, "prove_base": null, "usd_subsidy": null }));
         assert_eq!(on["gas_metering"], Value::Null, "nothing else moves");
         // Issue #135: the full-floor burn is served beside the base it widens.
         let floor = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None, usd_subsidy: None }).await;
-        assert_eq!(floor["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true, "proposer_share_bps": null, "prove_base": null }));
+        assert_eq!(floor["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true, "proposer_share_bps": null, "prove_base": null, "usd_subsidy": null }));
+    }
+
+    /// The dollar-indexed subsidy: `rand_getRandPrice` judges `fresh` for the next block (the
+    /// height an aggregate submitted now is paid at) and `rand_getEmission.current` follows it —
+    /// the dollar target while the price is fresh, the RAND schedule once it is stale; on a chain
+    /// without the section the price is `null`.
+    #[tokio::test]
+    async fn the_rand_price_and_the_emission_follow_freshness_for_the_next_block() {
+        use randprotocol_core::ledger::fees::{FeesConfig, UsdSubsidy};
+        let (_d, plain, _) = chain();
+        assert_eq!(ok(&plain, "rand_getRandPrice", json!([])).await, Value::Null);
+
+        let mut gs = fixtures::usd_genesis(&[&key(1)]);
+        let cfg = randprotocol_core::ledger::aggregation::AggregationConfig {
+            bond: 100 * randprotocol_core::UNITS_PER_RAND,
+            max_covers: 3,
+            subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![],
+        };
+        gs.ledger.set_aggregation(Some(cfg.clone()));
+        // Prices usable for one block: set at 0, fresh for block 1, stale for block 2.
+        gs.ledger.set_fees(FeesConfig { usd_subsidy: Some(UsdSubsidy { price_max_age_blocks: 1, ..fixtures::usd_section() }), ..Default::default() });
+        let (_d, st) = state_for(&gs);
+        assert_eq!(
+            ok(&st, "rand_getRandPrice", json!([])).await,
+            json!({ "price_micros_per_rand": "150000", "set_at_height": 0, "nonce": 0, "fresh": true, "max_age_blocks": 1 })
+        );
+        assert_eq!(ok(&st, "rand_getEmission", json!([])).await["subsidy"]["current"], json!("31940000"));
+
+        let mut ledger = gs.ledger.clone();
+        let b1 = make_block(&gs.block, &mut ledger, vec![], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        assert_eq!(ok(&st, "rand_getRandPrice", json!([])).await["fresh"], json!(false), "age 2 at block 2");
+        assert_eq!(
+            ok(&st, "rand_getEmission", json!([])).await["subsidy"]["current"],
+            json!(randprotocol_core::gas::subsidy(0, &cfg).to_string()),
+            "stale: the RAND schedule"
+        );
     }
 
     /// The fee split (`docs/compute-optimization.md` §6.2–§6.3): on an aggregating chain under
@@ -6256,7 +6351,7 @@ pub(crate) mod tests {
         let (_d, st) = served(FeesConfig { proposer_share_bps: Some(4000), prove_base: Some(600_000), ..FeesConfig::default() }).await;
         assert_eq!(
             ok(&st, "rand_getLimits", json!([])).await["fee_rules"],
-            json!({ "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": 4000, "prove_base": "600000" })
+            json!({ "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": 4000, "prove_base": "600000", "usd_subsidy": null })
         );
         let fee = |spec: Value| {
             let st = &st;
@@ -6269,13 +6364,13 @@ pub(crate) mod tests {
         let (_d, st) = served(FeesConfig { proposer_share_bps: Some(4000), ..FeesConfig::default() }).await;
         assert_eq!(
             ok(&st, "rand_getLimits", json!([])).await["fee_rules"],
-            json!({ "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": 4000, "prove_base": null })
+            json!({ "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": 4000, "prove_base": null, "usd_subsidy": null })
         );
         assert_eq!(ok(&st, "rand_estimateFee", json!([{"kind": "bundle"}])).await, BUNDLE_BASE.to_string(), "no prove_base, no change");
         let (_d, st) = served(FeesConfig { prove_base: Some(600_000), ..FeesConfig::default() }).await;
         assert_eq!(
             ok(&st, "rand_getLimits", json!([])).await["fee_rules"],
-            json!({ "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": null, "prove_base": "600000" })
+            json!({ "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": null, "prove_base": "600000", "usd_subsidy": null })
         );
     }
 
@@ -6324,7 +6419,7 @@ pub(crate) mod tests {
         let (_d, st) = state_for(&gs);
         assert_eq!(
             ok(&st, "rand_getLimits", json!([])).await["fee_rules"],
-            json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true, "proposer_share_bps": null, "prove_base": null }),
+            json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true, "proposer_share_bps": null, "prove_base": null, "usd_subsidy": null }),
             "all three flags served"
         );
 
