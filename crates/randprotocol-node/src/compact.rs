@@ -9,7 +9,7 @@ use libp2p::request_response::OutboundRequestId;
 use libp2p::PeerId;
 use randprotocol_core::{Block, Hash, Transaction};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// How many transaction bodies the node keeps beside its pool, by count. With the byte cap it
 /// is the window between a transaction's arrival on gossip and its verdict, plus the bodies of
@@ -142,7 +142,7 @@ impl Parked {
 
     /// The hashes still to ask for, in block order, chunked by [`TX_FETCH_BATCH`], minus those
     /// a request already in flight asked for. The caller passes the in-flight hashes (they live
-    /// in `inflight`, keyed by a request id that tests cannot construct).
+    /// in `inflight`, beside each request's id).
     pub fn next_batches(&self, in_flight: &[Vec<Hash>]) -> Vec<Vec<Hash>> {
         let pending: HashSet<Hash> = in_flight.iter().flatten().copied().collect();
         let wanted: Vec<Hash> = self.missing().into_iter().filter(|h| !pending.contains(h)).collect();
@@ -168,6 +168,16 @@ impl Parked {
         placed
     }
 
+    /// Drop the requests sent more than `timeout` ago (the wire's own sync timeout): libp2p has
+    /// either failed them already or never will, and left in place their hashes would never be
+    /// asked of another peer (spec §5.3; the by-hash fetch's rule, audit v5). Returns how many
+    /// were dropped; each was counted as an attempt when sent, and its peer stays asked.
+    pub fn expire(&mut self, timeout: Duration, now: Instant) -> usize {
+        let before = self.inflight.len();
+        self.inflight.retain(|(_, _, sent)| now.saturating_duration_since(*sent) <= timeout);
+        before - self.inflight.len()
+    }
+
     pub fn complete(&self) -> bool {
         self.have.iter().all(Option::is_some)
     }
@@ -183,7 +193,7 @@ impl Parked {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage::fixtures::key;
     use randprotocol_core::confidential::StubExecutor;
@@ -293,6 +303,21 @@ mod tests {
         assert_eq!(b.iter().map(Vec::len).collect::<Vec<_>>(), vec![TX_FETCH_BATCH, 3]);
     }
 
+    /// A request older than the timeout is dropped; a fresh one stays.
+    #[test]
+    fn expire_drops_only_requests_past_the_timeout() {
+        let txs: Vec<Transaction> = (1..=2u8).map(mint).collect();
+        let block = block_of(txs.clone());
+        let mut p = Parked::new(CompactBlock::of(&block), vec![None; 2], PeerId::random(), Instant::now());
+        let ids = test_request_ids(2);
+        let now = Instant::now() + Duration::from_secs(60);
+        p.inflight.push((ids[0], vec![txs[0].hash()], now - Duration::from_secs(31)));
+        p.inflight.push((ids[1], vec![txs[1].hash()], now - Duration::from_secs(5)));
+        assert_eq!(p.expire(Duration::from_secs(30), now), 1);
+        assert_eq!(p.inflight.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(), vec![ids[1]]);
+        assert_eq!(p.expire(Duration::from_secs(30), now), 0);
+    }
+
     /// `tx` with its bundle proof in the pruned marker form: the same id, different bytes.
     fn marker_copy(tx: &Transaction) -> Transaction {
         let mut m = tx.clone();
@@ -333,6 +358,22 @@ mod tests {
         assert_eq!(p.missing(), vec![txs[1].hash()]);
         assert_eq!(p.accept(vec![txs[1].clone()]), 1);
         assert_eq!(p.into_block().unwrap(), block);
+    }
+
+    /// `n` distinct request ids, from a real request-response behaviour (they cannot be made
+    /// otherwise).
+    pub(crate) fn test_request_ids(n: usize) -> Vec<OutboundRequestId> {
+        let mut b = test_sync_behaviour();
+        let peer = PeerId::random();
+        (0..n).map(|_| b.send_request(&peer, crate::network::SyncRequest::Transactions(vec![]))).collect()
+    }
+
+    /// A sync behaviour with no swarm behind it: `send_request` only queues, and hands back an id.
+    pub(crate) fn test_sync_behaviour(
+    ) -> libp2p::request_response::Behaviour<crate::network::codec::Codec<crate::network::SyncRequest, crate::network::SyncResponse>> {
+        use libp2p::request_response::{Behaviour, Config, ProtocolSupport};
+        let codec = crate::network::codec::Codec::new(1 << 16, 1 << 20);
+        Behaviour::with_codec(codec, [(libp2p::StreamProtocol::new("/rand/test/sync/1"), ProtocolSupport::Full)], Config::default())
     }
 
     fn mint_n(i: u32) -> Transaction {
