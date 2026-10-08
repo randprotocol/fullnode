@@ -21,6 +21,15 @@ pub fn recent_txs_bytes(max_block_bytes: usize) -> usize {
     max_block_bytes.saturating_mul(4)
 }
 
+/// Whether `tx` carries its bundle proof in the pruned marker form (`PRUNED_PROOF_MARKER` and the
+/// proof's hash). [`Transaction::hash`] gives that form the same id as the transaction with its
+/// proof, so a peer could gossip the marker copy of a transaction a leader is about to propose;
+/// rebuilt into the block, it makes the block fail and this node not vote. A marker-form body
+/// therefore never enters the compact path: not cached, not looked up, not accepted from a fetch.
+pub fn is_marker_form(tx: &Transaction) -> bool {
+    tx.bundle.as_ref().is_some_and(|b| randprotocol_core::notes::pruned_proof_hash(&b.proof).is_some())
+}
+
 /// FIFO of gossiped and proposed transactions by hash, capped by count and by serialized
 /// bytes, so a compact proposal can usually be rebuilt without asking a peer.
 pub struct RecentTxs {
@@ -36,9 +45,13 @@ impl RecentTxs {
         RecentTxs { by_hash: HashMap::new(), order: VecDeque::new(), bytes: 0, max_entries, max_bytes }
     }
 
-    /// Remember a transaction; a held one is left where it is. Evicts the oldest entries past
-    /// either cap (a single body larger than the byte cap is evicted at once).
+    /// Remember a transaction; a held one is left where it is, and a marker-form one
+    /// ([`is_marker_form`]) is not taken. Evicts the oldest entries past either cap (a single
+    /// body larger than the byte cap is evicted at once).
     pub fn remember(&mut self, tx: Transaction) {
+        if is_marker_form(&tx) {
+            return;
+        }
         let h = tx.hash();
         if self.by_hash.contains_key(&h) {
             return;
@@ -137,13 +150,14 @@ impl Parked {
     }
 
     /// Place what a peer returned: a transaction goes in only at a position whose hash is still
-    /// missing and equals `tx.hash()`; a stranger or a duplicate is discarded (spec §5.3). The
+    /// missing and equals `tx.hash()`; a stranger, a duplicate or a marker-form body
+    /// ([`is_marker_form`]) is discarded (spec §5.3). The
     /// position index is built once, so the cost is linear at the proposal cap. Returns how many
     /// were placed.
     pub fn accept(&mut self, txs: Vec<Transaction>) -> usize {
         let at: HashMap<Hash, usize> = self.compact.tx_hashes.iter().enumerate().map(|(i, h)| (*h, i)).collect();
         let mut placed = 0;
-        for tx in txs {
+        for tx in txs.into_iter().filter(|t| !is_marker_form(t)) {
             if let Some(&i) = at.get(&tx.hash()) {
                 if self.have[i].is_none() {
                     self.have[i] = Some(tx);
@@ -277,6 +291,48 @@ mod tests {
         let p = Parked::new(CompactBlock::of(&block), vec![None; n], PeerId::random(), Instant::now());
         let b = p.next_batches(&[]);
         assert_eq!(b.iter().map(Vec::len).collect::<Vec<_>>(), vec![TX_FETCH_BATCH, 3]);
+    }
+
+    /// `tx` with its bundle proof in the pruned marker form: the same id, different bytes.
+    fn marker_copy(tx: &Transaction) -> Transaction {
+        let mut m = tx.clone();
+        let b = m.bundle.as_mut().expect("a bundle transaction");
+        b.proof = [randprotocol_core::notes::PRUNED_PROOF_MARKER, Hash::digest(&b.proof).as_bytes().as_slice()].concat();
+        assert!(is_marker_form(&m) && !is_marker_form(tx));
+        assert_eq!(m.hash(), tx.hash(), "the marker form keeps the id");
+        m
+    }
+
+    /// A shielded transfer: a mint carries no bundle, so no proof to put in marker form.
+    fn bundled(i: u32) -> Transaction {
+        use crate::storage::fixtures::{bundle_fee, bundle_tx, genesis_of};
+        let gs = genesis_of(7, &[&key(1)], Vec::new(), 2);
+        bundle_tx(&gs.ledger, [[i; 8], [i + 100; 8]], [[i + 200; 8], [i + 300; 8]], bundle_fee())
+    }
+
+    /// The cache never holds a marker-form body (review finding I1): the real body, remembered
+    /// after it, is the one a rebuild finds.
+    #[test]
+    fn the_recent_cache_skips_a_marker_form_body() {
+        let tx = bundled(1);
+        let mut c = RecentTxs::new(10, usize::MAX);
+        c.remember(marker_copy(&tx));
+        assert!(c.is_empty(), "not taken");
+        c.remember(tx.clone());
+        assert_eq!(c.get(&tx.hash()), Some(&tx));
+    }
+
+    /// A fetch answer carrying the marker form of a missing transaction does not fill its slot
+    /// (review finding I1); the real body still does.
+    #[test]
+    fn a_park_refuses_a_marker_form_body() {
+        let txs: Vec<Transaction> = (1..=2).map(bundled).collect();
+        let block = block_of(txs.clone());
+        let mut p = Parked::new(CompactBlock::of(&block), vec![Some(txs[0].clone()), None], PeerId::random(), Instant::now());
+        assert_eq!(p.accept(vec![marker_copy(&txs[1])]), 0, "refused");
+        assert_eq!(p.missing(), vec![txs[1].hash()]);
+        assert_eq!(p.accept(vec![txs[1].clone()]), 1);
+        assert_eq!(p.into_block().unwrap(), block);
     }
 
     fn mint_n(i: u32) -> Transaction {
