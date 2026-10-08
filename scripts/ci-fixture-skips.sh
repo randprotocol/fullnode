@@ -13,10 +13,12 @@
 #
 #   a_one_proof_aggregate_round_trips_and_tampered_variants_are_refused and
 #   two_test_profile_bundle_proofs_aggregate_and_verify_natively are the rVM's own long proving
-#     tests (tier 19 and 20, tens of GB), in `crates/randprotocol-rvm/tests/aggregate.rs`. Named
-#     in full: `--skip` is a substring match, and the bare `round_trips` this list used to carry
-#     also skipped every other `…_round_trips…` test in the workspace (nine runnable ones in the
-#     node's lib suite alone, and the zkVM's and rVM's codec/ISA round trips).
+#     tests (the N=1 round trip at tier 18, the N=2 one at tier 19; tens of GB), in
+#     `crates/randprotocol-rvm/tests/aggregate.rs`. The N=2 test is also `#[ignore]`d in source;
+#     it stays listed so the list does not depend on that attribute. Named in full: `--skip` is a
+#     substring match, and the bare `round_trips` this list used to carry also skipped every
+#     other `…_round_trips…` test in the workspace (nine runnable ones in the node's lib suite
+#     alone, and the zkVM's and rVM's codec/ISA round trips).
 #
 # What is no longer skipped (2026-10-08): the node's fixture-backed aggregation tests —
 # `agg_executor::`, `storage::seal_tests::`, the covered-assembly tests in node:: and the

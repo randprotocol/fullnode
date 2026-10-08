@@ -23,7 +23,7 @@
 #   every night (18:00 UTC)
 #     nightly-proving   the wallet flow and the cluster suite, which really prove bundles.
 #     nightly-zkvm      the zkVM's whole suite, then guest v2's real-proof cheats.
-#     nightly-rvm       the rVM's whole suite less its two tier-19/20 round trips.
+#     nightly-rvm       the rVM's whole suite less its two tier-18/19 round trips.
 #     mutation-controls one named edit per Fixed zk finding must turn its named test red (HB-4).
 #
 # Audit v6 (2026-09-30), what this file was and is now:
@@ -98,8 +98,9 @@ jobs:
       - name: Library suites
         working-directory: fullnode
         # The skips are scripts/ci-fixture-skips.sh's, the one list this job and the nightly share:
-        # the rVM's two long round trips, by full name, nothing else. The node's fixture-backed aggregation tests
-        # run here (since 2026-10-08): the fixtures they read are in-repo and checked above. Until
+        # the rVM's two long round trips, by full name, nothing else. The node's fixture-backed
+        # aggregation tests run here (since 2026-10-08): the fixtures they read are in-repo and
+        # checked above. Until
         # then this step skipped them, and for a while its comment claimed the nightly covered
         # them; it did not, as no job had the fixtures.
         run: cargo test --workspace --lib --bins --release -- $(scripts/ci-fixture-skips.sh)
@@ -410,9 +411,10 @@ jobs:
           cargo test -p randprotocol-zkvm --release --test hidden_cheating real_proof_ \
             -- --test-threads=1
 
-  # The rVM's own suite, less its two long round trips (tier 19 and tier 20: tens of GB, the
-  # exit's own runs, not a gate's), skipped by full name from scripts/ci-fixture-skips.sh (a bare
-  # `--skip round_trips` here used to drop the ISA's encode/decode round trip too).
+  # The rVM's own suite, less its two long round trips (tier 18, N=1, and tier 19, N=2: tens of
+  # GB, the exit's own runs, not a gate's; the N=2 one is also `#[ignore]`d in source), skipped
+  # by full name from scripts/ci-fixture-skips.sh (a bare `--skip round_trips` here used to drop
+  # the ISA's encode/decode round trip too).
   # No RECURSION_FIXTURES is set, so the fixture-using tests
   # (aggregate, exit, verifier, tape_n, self_verify) prove their fixtures into
   # `target/recursion-fixtures` on the runner first; whether a hosted runner's memory and the

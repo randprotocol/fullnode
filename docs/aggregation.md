@@ -285,7 +285,8 @@ constants and circuits' `recursion/docs/02-aggregate.md` on them and move `PINNE
 `scripts/recursion-fixtures.sh --check` first, so a missing or edited fixture fails by name before
 the suite, then the library suites read the in-repo set; `scripts/ci-fixture-skips.sh` now skips
 only the rVM's two long proving tests, by full name (`a_one_proof_aggregate_round_trips_…`,
-`two_test_profile_bundle_proofs_…`: tier 19/20, tens of GB).
+`two_test_profile_bundle_proofs_…`: tier 18 at N = 1 and tier 19 at N = 2, tens of GB; the N = 2
+one is also `#[ignore]`d in source).
 That closes PROC-7's open half for the node crate. (Until then the skip list removed these tests
 on the grounds that a clean runner had no cache, which stopped being true when the set was
 committed.)
