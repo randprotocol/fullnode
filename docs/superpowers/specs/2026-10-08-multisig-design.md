@@ -123,7 +123,7 @@ every bundle-less signature on this chain.
 
 ### `CreateMultisig { salt: [u8; 32], signers: Vec<PublicKey>, threshold: u8 }` — tag 34, bundle-carried
 
-- Fee floor `BUNDLE_BASE + create_fee` (`TxError::FeeTooLow` below it). `create_fee` goes to the
+- Fee floor: the bundle's settled floor (`BUNDLE_BASE`, plus `fees.prove_base` on an aggregating chain) plus `create_fee` (`TxError::FeeTooLow` below it). `create_fee` goes to the
   proposer with the rest of the fee — it is not burned, so the supply identity does not move.
 - The bundle may fund the account in the same transaction: `burn_r` lands in row 0; `burn_a` of
   `burn_asset` lands in that asset's row if the token is registered (any authority, as a program

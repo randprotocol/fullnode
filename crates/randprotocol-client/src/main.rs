@@ -1812,7 +1812,9 @@ async fn main() -> Result<()> {
             let action = Action::CreateMultisig { salt, signers, threshold };
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&action) + limits.create_fee,
+                // The settled floor (with `fees.prove_base` on an aggregating chain), then the
+                // create fee on top of it, as the ledger holds a create to.
+                None => wallet::schedule_floor(&rpc, &action).await? + limits.create_fee,
             };
             println!("multisig account {}", hex::encode(id));
             let (w, path, mut store) = open_wallet(&cli.key)?;
@@ -1838,7 +1840,7 @@ async fn main() -> Result<()> {
             let action = Action::MultisigDeposit { account: id };
             let fee = match fee {
                 Some(f) => parse_amount(&f)?,
-                None => gas::fee_floor(&action),
+                None => wallet::schedule_floor(&rpc, &action).await?,
             };
             eprintln!("depositing {} into {}-of-{} account {}", memo_display::sanitize(&wallet::display_amount(units, decimals, &symbol)), acct.threshold, acct.signers.len(), hex::encode(id));
             let (w, path, mut store) = open_wallet(&cli.key)?;

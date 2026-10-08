@@ -55,7 +55,7 @@ number of them with RAND, in its `multisig` section:
 
 | field | meaning |
 |---|---|
-| `create_fee` | units of RAND a later `CreateMultisig` must pay **above** the bundle base (0.001 RAND) — not burned: it is part of the bundle's fee, which goes to the proposer, or, on a chain with the `aggregation` section, follows the fee split (the proposer keeps the 0.001 RAND `BUNDLE_BASE`, the rest is bucketed). `0` to 1 000 RAND. Spam on a permanent register is what it prices. |
+| `create_fee` | units of RAND a later `CreateMultisig` must pay **above** the bundle's settled floor (the 0.001 RAND base, plus `fees.prove_base` on an aggregating chain) — not burned: it is part of the bundle's fee, which goes to the proposer, or, on a chain with the `aggregation` section, follows the fee split (the proposer keeps the 0.001 RAND `BUNDLE_BASE`, the rest is bucketed). `0` to 1 000 RAND. Spam on a permanent register is what it prices. |
 | `accounts` | may be empty: a section with no accounts switches the module on with an empty register. |
 | `salt` | 32 bytes (64 hex characters), the creator's randomness in the id. The chain never learns a name. |
 | `signers` | 1 to 10 distinct Dilithium2 public keys. **The order matters**: a signature names its signer by position (`0:<hex>`). |

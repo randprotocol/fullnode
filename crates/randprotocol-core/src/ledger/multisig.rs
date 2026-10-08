@@ -533,9 +533,11 @@ pub(super) fn validate(
             }
             let b = tx.bundle.as_ref().ok_or(TxError::MissingBundle)?;
             credit(ledger, None, b)?;
-            // The floor beyond the common path's `BUNDLE_BASE` (R2): the create fee is paid to
-            // the proposer with the rest of the fee, so the supply identity does not move.
-            let min = gas::BUNDLE_BASE.saturating_add(create_fee_of(ledger));
+            // The create fee on top of the bundle's settled floor (R2): `BUNDLE_BASE`, plus
+            // `fees.prove_base` on an aggregating chain, plus this — never inside it, or a fee
+            // of `BUNDLE_BASE + max(prove_base, create_fee)` would let the create fee pay for
+            // proving. It is paid with the rest of the fee, so the supply identity does not move.
+            let min = ledger.settled_floor(tx, None).saturating_add(create_fee_of(ledger));
             if tx.fee() < min {
                 return Err(TxError::FeeTooLow { min, fee: tx.fee() });
             }
@@ -837,6 +839,22 @@ mod rule_tests {
         ap!(l, create(&l, 20, fee, 5, &SIGNERS, 2, (0, 0, 0))).unwrap();
         assert!(acct(&l, &account_id(CHAIN, &[5; 32], 2, &keys(&SIGNERS))).vault.is_empty());
         assert_eq!(l.multisig().unwrap().len(), 2);
+    }
+
+    /// Under `fees.prove_base` on an aggregating chain every bundle's floor rises by
+    /// `prove_base`, and a create's `create_fee` comes on top of that floor, never inside it: a
+    /// fee of `BUNDLE_BASE + max(prove_base, create_fee)` must not pass, or the create fee would
+    /// be paying for proving.
+    #[test]
+    fn a_creates_fee_floor_is_the_settled_floor_plus_the_create_fee() {
+        const PB: u64 = 600_000;
+        let mut l = ledger(vec![genesis_account(1, 0)]);
+        l.set_aggregation(Some(crate::ledger::tests::split_aggregation(256)));
+        l.set_fees(crate::ledger::fees::FeesConfig { prove_base: Some(PB), ..Default::default() });
+        assert_eq!(l.prove_base(), PB);
+        let min = BASE + PB + CREATE_FEE;
+        assert_eq!(refusal(&l, &create(&l, 10, min - 1, 4, &SIGNERS, 2, (0, 0, 0))), TxError::FeeTooLow { min, fee: min - 1 });
+        l.validate(&create(&l, 10, min, 4, &SIGNERS, 2, (0, 0, 0)), &StubExecutor).expect("the settled floor plus the create fee is enough");
     }
 
     #[test]

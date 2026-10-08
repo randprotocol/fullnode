@@ -70,7 +70,7 @@ account; a pooled Pay is re-checked at selection (`multisig::still_applies`). Ba
 BelowThreshold / BadSignature / BadNonce / VaultShort are re-checked, never cached as permanent
 rejections (a rotation changes the set). **The base comes from row 0**: a Pay debits `BUNDLE_BASE`
 (0.001 RAND) from the account's RAND row to the proposer, so an account needs RAND even to pay
-tokens; Rotate is fee-less; Create pays `BUNDLE_BASE + create_fee` (the fee goes to the proposer, not
+tokens; Rotate is fee-less; Create pays the settled floor (`BUNDLE_BASE`, + `fees.prove_base` when aggregating) plus `create_fee` (the fee goes to the proposer, not
 burned). One nonce per account, shared by Pay and Rotate. The id is `blake3("rand-multisig-id-1",
 chain_id ‖ salt ‖ threshold ‖ n ‖ keys)`, so `rand-node genesis --multisig` prints it before the cut.
 **Ordering hazard in `Ledger::audit()`**: `Audit::with_multisig` must be chained LAST, because
