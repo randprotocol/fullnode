@@ -495,8 +495,9 @@ Since the compact-blocks change (spec `docs/superpowers/specs/2026-10-08-compact
 §1) a leader publishes a proposal as its header, its signature and its transaction hashes
 (`GossipMessage::CompactProposal`, bincode tag 4); the bodies cross the network once, on the
 transaction topic, and a replica rebuilds the block from its pool and recent cache, fetching by
-hash only what it never saw. Measured on the `feat/compact-blocks` branch, debug build, on an
-Apple M4 Max; every number below is printed by the test named beside it.
+hash only what it never saw. Measured on the `feat/compact-blocks` branch, debug build. The
+source column says where each number comes from: most are printed by the test named beside them,
+two are derived from printed sizes and one is quoted from another page.
 
 | quantity | value | source |
 |---|---|---|
@@ -505,14 +506,15 @@ Apple M4 Max; every number below is printed by the test named beside it.
 | fixed part of a compact frame, four justify votes, no hashes | 19 080 bytes | `network::wire::tests::a_compact_proposal_at_26_validators_and_2000_hashes_is_its_header_plus_32_bytes_a_hash` |
 | compact frame at 26 justify votes, no hashes | 102 416 bytes | the same unit test |
 | compact frame at 26 justify votes and 2 000 hashes (the block cap) | **166 416 bytes** — exactly 2 000 × 32 more than with none | the same unit test (`bincode::serialized_size`) |
-| today's full proposal on chain 20 | up to the 20 MiB block cap: seven transfers at ~2.85 MB each (tier-14 bundle proof ~1.49 MB, tier-10 auth proof ~1.36 MB, envelopes) | `docs/compute-optimization.md` §1.1 |
+| today's full proposal on chain 20 | up to the 20 MiB block cap: seven transfers at ~2.85 MB each (tier-14 bundle proof ~1.49 MB, tier-10 auth proof ~1.36 MB, envelopes) | quoted, not measured here: `docs/compute-optimization.md` §1.1 |
 | bodies a late validator fetched by hash | 8 of 8 (`compact_fetched` = 8 on its `rand_status`; 0 on the two validators that had them) in each of three runs | `tests/cluster.rs` `a_late_validator_fetches_bodies_it_never_saw` |
 
-Reading the table. In the four-validator cluster the justify carried three votes (a quorum), so
-the observed fixed part (15 708 − 13 × 32 = 15 292 bytes) is exactly one vote (3 788 bytes) under the unit test’s
-four-vote 19 080; the two unit-test rows put one vote at (102 416 − 19 080) / 22 = 3 788 bytes.
-At 26 validators a quorum is 18, so a QC that carries exactly a quorum makes the cap-size frame
-about 166 416 − 8 × 3 788 = 136 112 bytes; the 166 416 in the table is the bound with every vote
+Reading the table. The two figures below are derived from the printed sizes, not printed.
+One vote is (102 416 − 19 080) / 22 = 3 788 bytes, the difference between the 26-vote and
+four-vote frames over their 22 extra votes. In the four-validator cluster the observed fixed
+part is 15 708 − 13 × 32 = 15 292 bytes, which is 19 080 − 3 788: consistent with three votes
+in the justify (a quorum) against the unit test's four. At 26 validators a quorum is 18, so a QC that carries exactly a quorum makes the cap-size frame
+about 166 416 − 8 × 3 788 = 136 112 bytes (derived); the 166 416 in the table is the bound with every vote
 in. Either way a proposal on chain 20 falls from up to 20 MiB to under 170 KB on the consensus
 topic.
 
@@ -521,5 +523,4 @@ quorum, so nothing commits), eight faucet mints are pooled and gossiped between 
 validator joins only after gossipsub's 2.5 s history window has passed, so it never sees the
 bodies. Its arrival makes the quorum; the first proposal that names the mints parks on it, the
 eight bodies are fetched from the leader's peer by hash (`SyncRequest::Transactions`), and it
-votes and commits the same chain (`assert_chains_equal`). Fetch latency was not separately
-timed: the whole test, three node starts included, runs in 11 to 14 s.
+votes and commits the same chain (`assert_chains_equal`). Fetch latency was not timed.

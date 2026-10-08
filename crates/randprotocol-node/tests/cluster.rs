@@ -316,7 +316,7 @@ async fn four_validators_plus_late_observer_syncs() {
 /// 8-byte length and 32 bytes a transaction. `wire::tests` measures that frame with four
 /// justify votes and no hashes at 19 080 bytes, so the fixed part is held under 24 KiB and the
 /// whole frame — at most the 32 mints this test sends, 1 KiB of hashes — under 80 KiB.
-/// Each mint's body is on the tx topic, once.
+/// The test asserts at least one tx-topic frame for each of the 32 mints.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_proposal_frame_carries_hashes_not_bodies() {
     init_tracing();

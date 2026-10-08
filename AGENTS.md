@@ -6,6 +6,14 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-10-02)
 
+### Compact blocks (2026-10-08, `feat/compact-blocks`; node-only wire change, flag-day roll)
+
+Spec `docs/superpowers/specs/2026-10-08-compact-blocks-design.md` (§0 lists the amendments), plan beside it in `plans/`; not merged. A leader publishes `GossipMessage::CompactProposal` (bincode tag 4): header, signature, transaction hashes. Receive is per-forwarder metering, `HotStuff::precheck_compact` (header only), one gossipsub report with that verdict, then a rebuild from the mempool and the recent-transactions cache (4 096 entries, `4 × max_block_bytes` bytes) — not committed storage. Missing bodies park the proposal (views `view` and `view + 1` only, one park) and are fetched by `SyncRequest::Transactions` in batches of 512. Serving is on the loop from the pool and the cache. `rand_status.compact_fetched` counts the placed bodies. Measured in `docs/node-hardware.md` §8: 166 416 bytes a frame at 26 votes and 2 000 hashes; late validator fetched 8 of 8.
+
+Traps. **The flag day:** an old node Rejects `CompactProposal` and cannot decode the new sync variants, so while more than a third of the stake is on the old build the new leaders' proposals are not voted and the chain stalls on those views — roll observers and archives first, then all validators together (`docs/deploy.md`); do not stagger. **Report exactly once** applies to the new gossip arm: the pre-screen's verdict is the one report, whether the proposal is rebuilt, parked or dropped. **Test helpers:** `bare_node` captures broadcasts and reports; `bare_node_answering` mints real `OutboundRequestId`s so fetch tests can follow a request to its answer. **Marker forms:** a pruned body shares the real transaction's id, so it is never cached, never used in a rebuild and never accepted from a fetch response.
+
+Known issue, pre-existing, not fixed here: a gossiped marker-form copy of a transaction can, through the admission `RefusedCache`, get the real transaction's id cached as refused for a bytes reason. Compact blocks recover through the fetch path, but the admission behaviour predates this branch; follow up in `admission.rs`.
+
 ### Fee feedback — a burned base and a fee-first subsidy (2026-10-05; branch `feat/fee-feedback`, PUSHED, NOT merged; genesis-gated, on no chain)
 
 **2026-10-06, issues #131–#135 closed on this branch** (each a `fix/*` branch, reviewed, merged

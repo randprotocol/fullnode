@@ -19,6 +19,26 @@ fail the root check; the fetch server stays on the consensus loop like `BlockByH
 proposal is reported `Accept` to gossipsub after the pre-screen; the missing-body test is a node
 unit test, the cluster test measures frames and a late validator's fetches.
 
+The review rounds of the build amended it further, and the code is the authority where the text
+below differs:
+
+- **Rebuild sources are the pool and the recent-transactions cache only** (§5.2), not committed
+  storage: a live block cannot re-include a committed transaction, and storage returns the
+  pruned marker form of a body.
+- **Marker forms are excluded.** A pruned (marker-form) body shares the real transaction's id. It
+  is never cached, never used in a rebuild and never accepted from a fetch response; the fetch
+  then finds the real body.
+- **The park band is `hs.view()` and `hs.view() + 1`.** One park at a time; a newer view replaces
+  it, a same or older view does not (a same-view proposal keeps the park). A proposal for any
+  other view is not parked, so a future-view leader cannot take the park over; a node that lags
+  by more than one view gets the block by `BlockByHash` or batch sync as before.
+- **Fetch order** is the leader's bound peer, then the forwarder, then peers at or above our
+  height, then any, at most 8 peers; when the leader is unbound the forwarder is asked first.
+  Expiry runs from the 3 s status tick. A completed park whose block the replica already holds
+  is dropped.
+- **Serving** is from the pool and the recent cache only, never a marker form, on the consensus
+  loop (§6). A request over `TX_FETCH_BATCH` is `Busy` without spending a node-wide token.
+
 ## 1. Goal and success criteria
 
 The leader's outbound bytes per block fall from the block size to the header plus 32 bytes a
@@ -172,13 +192,12 @@ bytes-only reason (`RefusedCache`) is not cached.
 
 ## 6. Serving
 
-`SyncRequest::Transactions(hashes)` is admitted like `Blocks`: the per-peer `sync_bucket`, then
-the node-wide `SyncServeBudget` and an in-flight slot, served off-loop by `spawn_sync_serve`
-with a snapshot of the lookups: the pool (`Arc` snapshot of the needed entries taken on-loop),
-the tree index, then storage. Over the limit it answers `Busy`. A request over `TX_FETCH_BATCH`
-hashes is answered `Busy` and the peer is counted as it is for an oversize `Blocks` request.
-The response carries only transactions found, so a peer missing some lets the client move to
-the next peer for the rest.
+`SyncRequest::Transactions(hashes)` is admitted by the per-peer `sync_bucket`, then, if it is
+served, one node-wide sync-serve token. It is answered on the consensus loop, like `BlockByHash`,
+from the pool and the recent-transactions cache only; storage is not consulted, and a marker
+form is never served. Over the limit it answers `Busy`. A request over `TX_FETCH_BATCH` hashes
+is answered `Busy` without spending a node-wide token. The response carries only transactions
+found, so a peer missing some lets the client move to the next peer for the rest.
 
 ## 7. Roll-out
 

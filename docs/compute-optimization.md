@@ -174,6 +174,16 @@ budget of §4.4; if the budget is missed the view times out as it does for any s
 
 ### 3.4 Compact blocks
 
+**Shipped** in `feat/compact-blocks` (spec `docs/superpowers/specs/2026-10-08-compact-blocks-design.md`),
+with the scope widened from aggregates to every transaction: a proposal on the wire is the header,
+the leader's signature and the transaction hashes, and a validator rebuilds the block from its
+pool and recent-transactions cache, fetching by hash only what it lacks. Measured (debug build,
+`docs/node-hardware.md` §8): at four validators the largest compact frame was 15 708 bytes
+carrying 13 transactions, against 168 096 bytes of bodies on the transaction topic for the 32
+mints; at 26 justify votes a compact frame is 102 416 bytes with no hashes and 166 416 bytes at
+2 000 hashes, where a chain-20 full proposal is up to the 20 MiB cap; a late validator fetched
+8 of 8 bodies it never saw. The design as first written follows.
+
 Aggregators gossip their aggregate and its covered records before any leader includes them, so
 by the time a block names them most validators hold the bodies. The block body on the wire
 becomes **header + raw transactions + aggregate digests**; a validator that lacks a body pulls

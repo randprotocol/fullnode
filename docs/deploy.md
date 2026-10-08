@@ -260,6 +260,18 @@ tick with a warning in the log — the 2026-09-24 stall was seven full disks and
 said `ok` right up to the crash loop. A roll waits on `ok`, so a droplet near full now stops the
 roll at that node instead of at the next one that fills.
 
+## The compact-blocks flag day
+
+The compact-blocks release changes the consensus-topic wire format and is not backward
+compatible: an old node cannot decode `GossipMessage::CompactProposal` (it reports `Reject`) or
+the new `SyncRequest::Transactions` variants, and a new leader publishes only the compact form.
+While more than a third of the stake still runs the old build, the new leaders' proposals are
+not voted by the old nodes and the chain stalls on those views. So roll the fleet in one pass:
+observers and archives first (they vote on nothing, so they cost no liveness and are ready to
+serve), then all validators together, quickly, rather than staggered as in step 3 above. A new
+node still accepts an old leader's full proposal, so the order within the validators does not
+matter once they go together. There is no genesis field and no chain cut.
+
 ## Release trust
 
 Written 2026-09-30 (audit v6, PROC-4 and PROC-5). Until now every fleet binary was built by hand
