@@ -265,6 +265,25 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
             if ledger.program_state().is_some() { "holds" } else { "holds no" },
         );
     }
+    // Perps (RPL-3) likewise: state that moves with every perp action, and a state-root domain
+    // (`rand-state-9`) only a chain with the section hashes under.
+    if gs.ledger.perps().is_some() != ledger.perps().is_some() {
+        anyhow::bail!(
+            "the genesis file {} perps section but the database {} perps state",
+            if gs.ledger.perps().is_some() { "has a" } else { "has no" },
+            if ledger.perps().is_some() { "holds" } else { "holds no" },
+        );
+    }
+    // And its genesis section rides in the blob as `cell_fee` does — outside the root, bound by
+    // the genesis hash — so the file's copy is what this node runs on (`verify_chain` names a
+    // blob that differs, and the repair rewrites it).
+    if let (Some(genesis), Some(stored)) = (gs.ledger.perps(), ledger.perps()) {
+        if stored.config != genesis.config {
+            let mut fixed = stored.clone();
+            fixed.config = genesis.config.clone();
+            ledger.set_perps(Some(fixed));
+        }
+    }
     // One field of the blob is not state: `cell_fee` is the genesis parameter, bound into the
     // genesis hash and outside the state root. The file's value is the authority, as for every
     // other genesis parameter this function restores — a stored fee that differed (a damaged
@@ -464,8 +483,14 @@ pub fn check_and_repair_chain(storage: &Storage, gs: &GenesisState, mode: Verify
                 check.head,
                 resume
             );
-            let ledger = if check.genesis_ok { check.ledger } else { gs.ledger.clone() };
+            let (ledger, perp_inputs) =
+                if check.genesis_ok { (check.ledger, check.perp_inputs) } else { (gs.ledger.clone(), Vec::new()) };
             storage.truncate_to(gs, resume, &ledger)?;
+            // RPL-3: the input words of every height no proof covers, as the replay closed them
+            // — a proof above `resume` may have pruned them, and a prover needs them again now.
+            for (height, words) in perp_inputs.iter().filter(|(h, _)| *h <= resume) {
+                storage.put_perp_inputs(*height, words)?;
+            }
             let again = storage.verify_chain(gs, mode, executor)?;
             if let Some(p) = again.problem {
                 anyhow::bail!("chain still corrupt after truncation: {p}");
@@ -1035,6 +1060,10 @@ struct Node {
     /// Transaction hashes this node has already refused for a reason about their bytes, so a
     /// re-gossiped copy costs a hash lookup instead of a proof verification.
     refused: admission::RefusedCache,
+    /// RPL-3 (final fix wave, I1): state proofs refused `ProofRefused` over the segment the tip
+    /// builds for them, so the same junk proof re-sent against the same proved root is refused
+    /// without verifying its STARK again ([`admission::ProofRefusedCache`]).
+    proof_refused: admission::ProofRefusedCache,
     /// Transaction hashes whose proofs this node already verified (audit v3, B5), shared with
     /// the consensus replica: the admission workers fill it, and at propose and at a proposal's
     /// apply the ledger decodes a hit's proofs instead of re-verifying them. Behind the lock
@@ -2392,6 +2421,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         highest_proposal_seen: 0,
         disk_free_bytes,
         refused: admission::RefusedCache::new(admission::REFUSED_CACHE_ENTRIES),
+        proof_refused: admission::ProofRefusedCache::new(admission::PROOF_REFUSED_ENTRIES),
         verified,
         limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
         status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
@@ -2644,6 +2674,9 @@ impl Node {
             let out = self.verdicts_tx.clone();
             self.verify_in_flight += 1;
             tokio::task::spawn_blocking(move || {
+                // I1: what a state proof's verdict is keyed by — this snapshot's proved root and
+                // the segment it builds — taken on the ledger the proof is verified against.
+                let proof_key = admission::state_proof_key(&tx, &ledger, executor.as_ref());
                 let result = guard_verify(|| validate_for_pool(&tx, &ledger, &storage, profile, executor.as_ref()));
                 if result.is_ok() {
                     // B5: remember that these exact bytes verified — the hash binds the proofs —
@@ -2654,7 +2687,7 @@ impl Node {
                 }
                 // The loop is the only receiver and outlives every task it spawned, so a send
                 // failure means the node is already shutting down.
-                let _ = out.blocking_send(Verdict { tx, result, source });
+                let _ = out.blocking_send(Verdict { tx, result, source, proof_key });
             });
         }
     }
@@ -2665,6 +2698,9 @@ impl Node {
         self.verify_in_flight = self.verify_in_flight.saturating_sub(1);
         let hash = v.tx.hash();
         let acceptance = admission::acceptance_for(&v.result, hash, &mut self.refused);
+        if let (Some(key), Err(e)) = (v.proof_key, &v.result) {
+            self.proof_refused.insert(hash, key, e.clone());
+        }
         self.note_refusal(hash);
         // A verified transaction is pooled against the *current* tip, not the snapshot it was
         // verified on: `insert_verified` re-runs `precheck` there, so a nullifier spent or an anchor
@@ -2722,6 +2758,12 @@ impl Node {
             self.report(id, outcome).await;
             return Ok(());
         }
+        // I1: a state proof this node already refused over the segment the tip builds for it is
+        // not verified again. Not a byte verdict (the segment is state), so an `Ignore`.
+        if self.cached_proof_refusal(&tx).is_some() {
+            self.report(id, GossipOutcome::Report(admission::Acceptance::Ignore)).await;
+            return Ok(());
+        }
         // Remembered before its verdict (spec 2026-10-08 §5.4): the leader may propose it while it
         // waits for a worker, and a compact proposal naming it then rebuilds without a fetch.
         // After the pre-screen, so bytes the refused cache already answered are not kept.
@@ -2763,6 +2805,14 @@ impl Node {
         Ok(())
     }
 
+    /// The `ProofRefused` this node already gave `tx`, a state proof, over the segment the tip
+    /// builds for it now (I1); `None` for any other transaction and on a miss. Hashes the
+    /// transaction only when it is a state proof the tip would verify.
+    fn cached_proof_refusal(&self, tx: &Transaction) -> Option<randprotocol_core::TxError> {
+        let key = admission::state_proof_key(tx, self.hs.tip_ledger(), self.executor.as_ref())?;
+        self.proof_refused.get(&tx.hash(), &key).cloned()
+    }
+
     /// An RPC submission takes the same queue as a gossiped transaction, with the caller's oneshot
     /// in place of a message id. Not metered: that port is the operator's own, and it is already
     /// bounded by `RpcState::max_body_bytes`.
@@ -2780,6 +2830,10 @@ impl Node {
         if let GossipOutcome::Report(a) = outcome {
             self.note_refusal(hash);
             let _ = reply.send(Err(admission::rpc_refusal(a, &hash, &self.refused)));
+            return;
+        }
+        if let Some(e) = self.cached_proof_refusal(&tx) {
+            let _ = reply.send(Err(MempoolError::Invalid(e)));
             return;
         }
         // A pre-screen refusal is the caller's answer directly, so every error message a submitter
@@ -4371,7 +4425,9 @@ impl Node {
             // from the peer's copy (which the wire does not carry).
             let deposits = ledger.take_deposits();
             let aggregates = ledger.take_paid_aggregates();
-            accepted.push(CommittedBlock { receipts, deposits, aggregates, ..cb });
+            // RPL-3: and its perp input words, ours too, which `commit` stores beside it.
+            let perp_words = ledger.take_perp_block_words();
+            accepted.push(CommittedBlock { receipts, deposits, aggregates, perp_words, ..cb });
             // The state that belongs with the committed prefix. Verification runs past it — the
             // blocks above are this prefix's own proof — but only what the three-chain rule
             // commits is written, so the ledger written beside it is the one that describes it.
@@ -6258,6 +6314,7 @@ mod tests {
             highest_proposal_seen: 0,
             disk_free_bytes: u64::MAX,
             refused: admission::RefusedCache::new(16),
+            proof_refused: admission::ProofRefusedCache::new(16),
             verified: Arc::new(RwLock::new(admission::VerifiedSet::new(16))),
             limiter: admission::PeerLimiter::new(admission::PEER_TX_BURST, admission::PEER_TX_PER_SEC),
             status_limiter: admission::PeerLimiter::new(STATUS_GOSSIP_BURST, STATUS_GOSSIP_PER_SEC),
@@ -6295,6 +6352,50 @@ mod tests {
             Peer { connected: true, status: Some(Status { height, head_hash: Hash::ZERO, view: 0, floor: 0 }), ..Default::default() },
         );
         p
+    }
+
+    /// RPL-3 final fix wave, I1: a state proof refused `ProofRefused` is answered from the proof
+    /// refusal cache when the same bytes come back over the same segment — nothing queued for
+    /// verification — and a different proof is still verified.
+    #[tokio::test]
+    async fn a_refused_state_proof_is_not_verified_twice() {
+        use crate::storage::fixtures::{make_perps_block, perp_state_proof_tx, perps_genesis};
+        use randprotocol_core::ledger::perps::PerpError;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let gs = perps_genesis(7);
+        storage.init_genesis(&gs).unwrap();
+        let mut ledger = gs.ledger.clone();
+        let mut b1 = make_perps_block(&gs.block, &mut ledger, vec![], &key(1));
+        b1.qc.votes = vec![Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), b1.qc.view, b1.qc.block_hash, &key(1))];
+        storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let hs = resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), Arc::new(StubExecutor)).unwrap();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+
+        let mut junk = perp_state_proof_tx(&ledger, 1, [7; 8], vec![], 0);
+        let randprotocol_core::Action::PerpStateProof { proof, .. } = &mut junk.action else { unreachable!() };
+        *proof = b"junk".to_vec();
+        let tip = node.hs.tip_ledger().clone();
+        let refused = tip.validate(&junk, &StubExecutor).unwrap_err();
+        assert!(matches!(refused, randprotocol_core::TxError::Perps(PerpError::ProofRefused(_))), "{refused:?}");
+        let key = admission::state_proof_key(&junk, &tip, &StubExecutor).expect("a state proof over a closed window");
+        let (first, _) = oneshot::channel();
+        node.on_verdict(Verdict { tx: junk.clone(), result: Err(refused.clone()), source: VerifySource::Rpc(first), proof_key: Some(key) })
+            .await
+            .unwrap();
+
+        // The same bytes again: refused from the cache, nothing queued.
+        let (reply, answer) = oneshot::channel();
+        node.submit_tx(junk.clone(), reply).await;
+        assert_eq!(answer.await.unwrap(), Err(MempoolError::Invalid(refused)));
+        assert!(node.verify_queue.is_empty() && node.verify_in_flight == 0, "no verification scheduled");
+        // A different proof of the same window is verified as before.
+        let honest = perp_state_proof_tx(&ledger, 1, [8; 8], vec![], 0);
+        assert!(node.cached_proof_refusal(&honest).is_none());
+        // The proved root moves: the old root's refusals are gone with it.
+        let moved = admission::StateProofKey { proved_root: [9; 8], ..key };
+        node.proof_refused.insert(Hash::digest(b"another"), moved, randprotocol_core::TxError::Perps(PerpError::ProofRefused("x".into())));
+        assert!(node.cached_proof_refusal(&junk).is_none(), "cleared when the root changed");
     }
 
     /// The by-hash requests the node has sent so far (its network commands are forwarded on a
@@ -8811,7 +8912,15 @@ mod tests {
         };
         let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, txs, &ks[0]);
         let hash = block.hash();
-        CommittedBlock { block, pruned: Vec::new(), qc: votes_of(height, hash, ks, votes), receipts: Vec::new(), deposits: Vec::new(), aggregates: Vec::new() }
+        CommittedBlock {
+            block,
+            pruned: Vec::new(),
+            qc: votes_of(height, hash, ks, votes),
+            receipts: Vec::new(),
+            deposits: Vec::new(),
+            aggregates: Vec::new(),
+            perp_words: None,
+        }
     }
 
     fn validators(n: u8) -> Vec<Keypair> {

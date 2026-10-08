@@ -629,7 +629,27 @@ impl ZkExecutor {
         exact: bool,
         pinned_tier: usize,
     ) -> Result<Proof, ConfidentialError> {
-        let proof = decode_canonical(proof)?;
+        self.check_decoded(
+            decode_canonical(proof)?,
+            program_log_height,
+            input_log_height,
+            public_log_height,
+            exact,
+            pinned_tier,
+        )
+    }
+
+    /// [`Self::decode_and_check`] on a proof already decoded (by [`decode_canonical`]): for
+    /// [`Self::check_perp`], which reads the tier off the header before anything else.
+    fn check_decoded(
+        &self,
+        proof: Proof,
+        program_log_height: u8,
+        input_log_height: u8,
+        public_log_height: u8,
+        exact: bool,
+        pinned_tier: usize,
+    ) -> Result<Proof, ConfidentialError> {
         check_declared_heights(
             proof.tier,
             proof.program_log_height,
@@ -1081,6 +1101,76 @@ impl ZkExecutor {
         })
     }
 
+    /// RPL-3: `verify_perp`'s body, and with `verify` false `decode_perp`'s (everything but
+    /// `Machine::verify`). A state proof is of the engine guest the genesis pins by `hc` alone —
+    /// the chain holds no record of its words — over the segment the ledger rebuilt, so:
+    ///
+    /// 1. the canonical decode;
+    /// 2. the tier, first, against `perps::TIERS` and the section's `max_tier` — the verifier key
+    ///    for a high tier is the expensive thing an attacker would buy with a junk header, and the
+    ///    section names the highest one a window may need ([`ConfidentialError::CallTierTooHigh`]);
+    /// 3. `check_declared_heights` and the degree bits ([`Self::check_decoded`]), then the two
+    ///    hash tables under a call's caps, the input height under the tier's, and the public
+    ///    height exactly the segment's — every one before a key is built;
+    /// 4. `Machine::verify_public(engine_hc, segment, proof)`; on the decode path, the
+    ///    `H_PUB` compare alone, so the verified set's verdict stands for this segment only.
+    ///
+    /// The program height is ranged, not pinned: the chain does not hold the engine's words.
+    /// The outcome is a call's (`check_call`'s), the ledger reading the outputs.
+    fn check_perp(
+        &self,
+        engine_hc: &Word8,
+        max_tier: u8,
+        segment: &[u32],
+        bytes: &[u8],
+        verify: bool,
+    ) -> Result<CallOutcome, ConfidentialError> {
+        let proof = decode_canonical(bytes)?;
+        let tier = u8::try_from(proof.tier.0).unwrap_or(u8::MAX);
+        if !TIERS.contains(&proof.tier.0) || tier > max_tier {
+            return Err(ConfidentialError::CallTierTooHigh { tier, max: max_tier });
+        }
+        let proof = self.check_decoded(proof, 0, 0, 0, false, 0)?;
+        if proof.keccak_log_height > MAX_CALL_KECCAK_LOG_HEIGHT {
+            return Err(ConfidentialError::InvalidProof(format!(
+                "keccak height {} past the {} a state proof may declare",
+                proof.keccak_log_height, MAX_CALL_KECCAK_LOG_HEIGHT
+            )));
+        }
+        if proof.sha256_log_height > MAX_CALL_SHA256_LOG_HEIGHT {
+            return Err(ConfidentialError::InvalidProof(format!(
+                "sha256 height {} past the {} a state proof may declare",
+                proof.sha256_log_height, MAX_CALL_SHA256_LOG_HEIGHT
+            )));
+        }
+        if proof.input_log_height > max_input_log_height(proof.tier) {
+            return Err(ConfidentialError::InvalidProof("input height past what the tier can read".into()));
+        }
+        let public_values =
+            || ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues));
+        if proof.public_log_height != public::public_log_height(segment.len()) {
+            return Err(public_values());
+        }
+        if verify {
+            self.machine
+                .verify_public(engine_hc, segment, &proof)
+                .map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
+        } else {
+            let want = crate::hash::public_digest(segment);
+            if (0..8).any(|i| proof.public_values[pv::PUB0 + i] != want[i] as u64) {
+                return Err(public_values());
+            }
+        }
+        Ok(CallOutcome {
+            tier,
+            outputs: std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32),
+            h_in: std::array::from_fn(|i| proof.public_values[pv::IN0 + i] as u32),
+            keccak_log_height: proof.keccak_log_height,
+            sha256_log_height: proof.sha256_log_height,
+            gas_limit: proof.public_values[pv::GAS],
+        })
+    }
+
     /// The body of `warm`/`warm_hardened`: every admissible tier's key for one program height and
     /// one public-segment length, at the input heights a call can still be pooled with.
     fn warm_shape(&self, log_height: u8, public_len: usize) {
@@ -1333,6 +1423,28 @@ impl ConfidentialExecutor for ZkExecutor {
         self.check_call(record, proof, Some(segment), false, true)
     }
 
+    /// RPL-3: a `PerpStateProof`'s STARK ([`ZkExecutor::check_perp`]).
+    fn verify_perp(
+        &self,
+        engine_hc: &Word8,
+        max_tier: u8,
+        segment: &[u32],
+        proof: &[u8],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.check_perp(engine_hc, max_tier, segment, proof, true)
+    }
+
+    /// Every check of [`Self::verify_perp`] but `Machine::verify` itself (B5).
+    fn decode_perp(
+        &self,
+        engine_hc: &Word8,
+        max_tier: u8,
+        segment: &[u32],
+        proof: &[u8],
+    ) -> Result<CallOutcome, ConfidentialError> {
+        self.check_perp(engine_hc, max_tier, segment, proof, false)
+    }
+
     /// `H_PUB` exactly as the circuit publishes it in `pv::PUB0..7`.
     fn public_digest(&self, words: &[u32]) -> Word8 {
         crate::hash::public_digest(words)
@@ -1343,6 +1455,10 @@ impl ConfidentialExecutor for ZkExecutor {
         msg[..8].copy_from_slice(left);
         msg[8..].copy_from_slice(right);
         crate::notes::hash(crate::notes::domain::NODE, &msg)
+    }
+
+    fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+        crate::notes::hash(domain, msg)
     }
 
     /// The vendored `Note`'s own commitment, built by fields rather than by `Note::new` (which
@@ -1695,6 +1811,27 @@ pub fn prove_invoke(
     }
     let segment = randprotocol_core::ledger::program_state::invoke_segment(public, binding, context);
     prove_over_segment(profile, program, inputs, &segment, salt, tier, gas_limit)
+}
+
+/// RPL-3: prove one window of the perps engine — `program` is the engine guest (the genesis
+/// pins its `hc`), `witness` its private input (`[n_state, state…, n_blocks, (n_words,
+/// words…)*]`), `segment` the public segment the ledger will rebuild
+/// (`ledger::perps::state_proof_segment`). `tier` `None` is the smallest tier whose cycle and
+/// permutation budgets fit the emulated run (`Machine::prove`'s choice, as [`prove_invoke`]'s
+/// dry run picks it); the chain refuses one above its section's `max_tier`. Returns (proof
+/// bytes, the eight outputs the proof publishes, tier). For `rand perp prove`.
+pub fn prove_perp(
+    profile: FriProfile,
+    program: &Program,
+    witness: &[u32],
+    segment: &[u32],
+    tier: Option<u8>,
+) -> Result<(Vec<u8>, [u32; 8], u8), String> {
+    let (proof, _) = Machine::new(profile)
+        .prove(program, witness, segment, tier.map(|t| Tier(t as usize)))
+        .map_err(|e| format!("{e:?}"))?;
+    let outputs = std::array::from_fn(|i| proof.public_values[pv::OUT0 + i] as u32);
+    Ok((proof.to_bytes(), outputs, proof.tier.0 as u8))
 }
 
 /// The body [`prove_call_hardened`] and [`prove_invoke`] share: a call proved over `segment`
@@ -2626,5 +2763,50 @@ mod tests {
         // Junk is refused by the cheap reader, never read as a `c`.
         assert_eq!(ex.auth_proof_digest(b"junk"), Err(ConfidentialError::MalformedProof));
         assert_eq!(ex.verify_auth(&ZkExecutor::hc_auth(), b"junk", &[0; 8]), Err(ConfidentialError::MalformedProof));
+    }
+
+    /// RPL-3: `prove_perp` → `verify_perp` round trip on the real executor. The proof verifies
+    /// over its own segment and engine only, the decode path agrees and still compares the
+    /// segment, and a tier above the section's cap is refused by name before any verification.
+    #[test]
+    fn rpl3_a_state_proof_verifies_over_its_own_segment_under_the_tier_cap() {
+        use super::*;
+        use crate::machine::FriProfile;
+        let program = crate::guests::fib(10);
+        let hc = program.digest();
+        let zk = ZkExecutor::new(FriProfile::Test);
+        let segment: Vec<u32> = (0..40).collect();
+        let (bytes, outputs, tier) = prove_perp(FriProfile::Test, &program, &[], &segment, None).unwrap();
+        let outcome = zk.verify_perp(&hc, 20, &segment, &bytes).expect("its own segment");
+        assert_eq!((outcome.outputs, outcome.tier), (outputs, tier));
+        assert_eq!(zk.decode_perp(&hc, 20, &segment, &bytes), Ok(outcome), "the decode path agrees");
+        let public_values = ConfidentialError::InvalidProof(format!("{:?}", crate::machine::VerifyError::PublicValues));
+        let mut other = segment.clone();
+        other[29] ^= 1;
+        assert_eq!(
+            zk.verify_perp(&hc, 20, &other, &bytes),
+            Err(public_values.clone()),
+            "another segment (the fees word)"
+        );
+        assert_eq!(
+            zk.decode_perp(&hc, 20, &other, &bytes),
+            Err(public_values.clone()),
+            "the decode path compares it too"
+        );
+        assert_eq!(zk.verify_perp(&hc, 20, &segment[..39], &bytes), Err(public_values), "a shorter segment");
+        assert!(zk.verify_perp(&[7; 8], 20, &segment, &bytes).is_err(), "another engine");
+        assert_eq!(
+            zk.verify_perp(&hc, tier - 1, &segment, &bytes),
+            Err(ConfidentialError::CallTierTooHigh { tier, max: tier - 1 }),
+            "above the section's cap"
+        );
+        let (high, _, t) = prove_perp(FriProfile::Test, &program, &[], &segment, Some(12)).unwrap();
+        assert_eq!(t, 12, "a pinned tier is the prover's");
+        assert_eq!(
+            zk.verify_perp(&hc, 10, &segment, &high),
+            Err(ConfidentialError::CallTierTooHigh { tier: 12, max: 10 })
+        );
+        assert!(zk.verify_perp(&hc, 12, &segment, &high).is_ok());
+        assert_eq!(zk.verify_perp(&hc, 20, &segment, b"junk"), Err(ConfidentialError::MalformedProof));
     }
 }

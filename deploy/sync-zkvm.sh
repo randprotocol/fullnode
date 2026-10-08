@@ -134,6 +134,14 @@
 # ledger refuses, and a seeded mutation fuzz over every private-input word against a host model of
 # spec §3.3. Upstream has no such file; without the exclusion `--delete` would remove it.
 #
+# RPL-3 (perps) adds two node-local files, both excluded below: `src/perps.rs` (the Poseidon2
+# domain tags `PERP_BLOCK`/`PERP_STATE`/`PERP_PAYOUTS` = 21/22/23 a perps guest hashes under, and
+# the test pinning them to `randprotocol_core::ledger::perps::domain`) and `tests/perps_vectors.rs`
+# (the multi-chunk `perp_digest` vectors in `randprotocol-core/tests/vectors/perps-v1.json`). The
+# tags first sat in the vendored `notes.rs`'s `domain` module, where a resync would erase them —
+# so, like `hidden.rs`, they live in their own module, declared in the hand-maintained `lib.rs`.
+# 17–20 are left free between upstream's last tag (16) and these.
+#
 # Audit v6 HB-4 (issue #100) adds `tests/hidden_trace_forgery.rs` (excluded below, same reason):
 # real proofs of an honest v3 bundle run whose traces are edited after emulation — the Merkle
 # read-index redirect, a leaf-index bit, a nullifier, an output amount, the derived `pk` — which the
@@ -228,10 +236,12 @@ mkdir -p "$DST/src" "$DST/tests"
 rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock --exclude rust-toolchain.toml \
       --exclude executor.rs --exclude codec.rs --exclude guests.rs --exclude asm.rs \
       --exclude address.rs --exclude arx.rs --exclude call_envelope.rs --exclude hidden.rs --exclude auth.rs \
+      --exclude perps.rs \
       --exclude lib.rs --exclude main.rs "$SRC/src/" "$DST/src/"
 rsync -a --delete --exclude executor.rs --exclude shielded.rs --exclude call_envelope.rs \
       --exclude viewing.rs --exclude bundle.rs --exclude hidden_bundle.rs \
       --exclude hidden_cheating.rs --exclude hidden_trace_forgery.rs --exclude guest_provenance.rs --exclude 'auth*.rs' --exclude evm_rt.rs --exclude sbpf_rt.rs \
+      --exclude perps_vectors.rs \
       "$SRC/tests/" "$DST/tests/"
 [ -f "$DST/src/guests.rs" ] || cp "$SRC/src/guests.rs" "$DST/src/guests.rs"
 # M4.1/M4.2: vendor the compiled guest binaries the vendored `tests/e2e.rs` and the local

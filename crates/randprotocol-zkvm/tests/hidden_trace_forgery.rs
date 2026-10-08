@@ -651,7 +651,7 @@ fn ledger_coupling_a_real_v3_proof_is_refused_under_another_binding_anchor_or_au
     let mint = Transaction::mint(CHAIN_ID, pk_self, 1, r, env(), amount, &minter, &ex);
     assert_eq!(l.validate(&mint, &ex), Ok(()));
     l.apply_tx(&mint, &minter.address(), &ex).unwrap();
-    l.close_block(1, &minter.address(), 0, 0);
+    l.close_block(1, &minter.address(), 0, 0, &ex);
     l.set_height(2);
     let note = Note { pk: pk_self, from: [0; 8], amount, asset: 0, time: 1, r };
     let cm = note.commitment();

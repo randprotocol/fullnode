@@ -19,6 +19,8 @@ pub mod notes;
 pub mod hidden;
 /// Node-local (not vendored): delegated proving's auth guest — its input layout and commitment.
 pub mod auth;
+/// Node-local (not vendored): RPL-3 perps' Poseidon2 domain tags.
+pub mod perps;
 pub mod evm;
 pub mod viewing;
 pub mod ledger;

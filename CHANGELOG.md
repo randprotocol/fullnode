@@ -115,6 +115,60 @@ Not rolled onto chain 20: the consensus-visible change is genesis-gated and need
 - **`rand-node bench apply`**: the synthetic-load harness; the measured tables are in
   `docs/node-hardware.md` §7.
 
+### RPL-3: perpetual futures, behind the `perps` genesis section (hard fork for a chain that sets it; on no chain yet)
+
+`docs/perps.md`. A chain whose genesis has no `perps` section is untouched: every perp action is
+refused, the genesis hashes as before and the state root keeps its domain. A chain with one is a
+new chain, so this ships with the next cut rather than as a node-only roll.
+
+- **Six actions, 34–39** (appended after `Invoke`): `PerpDeposit` (rides a bundle that burns the
+  collateral), `PerpOrder`, `PerpCancel`, `PerpWithdraw` and `PerpOracle` (signed over
+  `perp_sign_message`, bundle-less, fee-less), and `PerpStateProof`. Orders enter through
+  consensus unexecuted; each block closes with a digest `D_h` of its inputs and the oracle's
+  stake-weighted median; one STARK of the engine guest, which anyone may make, advances the
+  exchange's state root over a window of blocks and pays withdrawals as chain-computed notes
+  (`PERP_FROM`). Settlement is final at proof.
+- **A `PerpDeposit`'s bundle is an ordinary bundle for the fee split** (`bundle_fee_split`): it
+  pays the schedule floor and the genesis `fees` rules — `burn_base`, `burn_floor`,
+  `proposer_share_bps`, `prove_base` — apply to it as to any other; `rand perp deposit`'s default
+  fee includes the served `prove_base`.
+- **The genesis section** (`rand-node genesis --perps perps.json`): collateral asset, `max_tier`,
+  `max_window_blocks` (1 to 64), `max_block_inputs` (required, 1 to 1024), `min_deposit`
+  (optional, 0), the engine's `engine_hc` and `genesis_root`, and 1 to 2 markets (the pinned
+  engine's capacity; `maintenance_bps` at least 1). It needs the sections RPL-2 needs.
+- **Consensus rules from the final review**: at most `max_block_inputs` perp inputs a block and 8
+  from one account, a deposit counting towards the account it credits (`BlockFull`,
+  `AccountBlockFull`; the overflow stays pooled for the next block); a deposit floor
+  (`DepositTooSmall`); one pending withdrawal per account (`WithdrawalPending`); a payout is the
+  full request or nothing (`PartialPayout`) and names a request recorded inside its window
+  (`RequestOutsideWindow`), and a proof settles every request recorded at or below its end, paid
+  or not; perp signatures bind the chain's `binding_domain` (`rand-perp-sign-2` under domain 1);
+  the oracle median is published only with a quorum of fresh stake (at least half the active,
+  non-jailed stake), else the close carries 0 rather than the old median.
+- **Node policy for state proofs**: a `ProofRefused` verdict is cached by transaction hash and
+  segment until the proved root moves, and the pool keeps one reserved slot for a state proof
+  above fee-0 orders. `rand perp prove` sizes the tier from its dry run and refuses one over
+  `max_tier` before proving.
+- **State root `rand-state-9`** on a chain with the section, and bounded block time there (the
+  bridge's rule), since each `Close` carries it.
+- **RPC**: `rand_getPerps`, `rand_getPerpAccount`, `rand_getPerpAccounts`, `rand_getPerpInputs`
+  (all on the public listener); `rand_getLimits.perps`; `rand_getSupply.perps_rand_out` and
+  `perps_rand_held`, which keep the supply identity whole across a RAND deposit and a payout;
+  `tx_json` kinds `perp_deposit` … `perp_state_proof` (`docs/rpc.md`).
+- **CLI**: `rand perp keygen | deposit | order | cancel | withdraw | oracle | prove |
+  genesis-root | state | account | inputs`; `rand perp prove` is what durian.market's
+  `perp-prover` runs (`docs/cli.md`).
+- **Storage**: a new `perp_inputs` column family (block height to the block's input words,
+  written in the block's own batch, pruned when a proof covers the height) and the perps state
+  under `META_PERPS`. The family is created on every database at first open, so a rollback to
+  v0.7.1 or earlier needs `rand-node db drop-perp-inputs --datadir <dir>` first; it is refused on
+  a perps chain's database, which no older build can follow.
+- **Not in v0**: a prover register or payment, a forced exit, a backstop vault, markets after
+  genesis, sealed orders, a fee on withdrawal requests; a token collateral's supply is not
+  audited (`docs/perps.md`, "v0 limits").
+- **Vectors**: `tests/vectors/perps-v1.json` gains `digest_4000`, `digest_4001` and
+  `digest_8001`, the multi-chunk `perp_digest` with the real Poseidon2.
+
 ## v0.7.1 — 2026-10-07 (chain 20, node-only)
 
 Node-only: no consensus rule, wire format, verifier key or genesis change. From this release on,

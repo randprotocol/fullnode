@@ -453,6 +453,51 @@ pub enum Action {
         input_envelope: Option<CallEnvelope>,
         transition: Transition,
     },
+    /// RPL-3 (34) (genesis `perps`): credit the trading account of `trading_key` with this
+    /// transaction's bundle burn of the collateral asset. Rides a bundle, whose `burn_a` /
+    /// `burn_asset` are the value coming in; the burn is the only thing that funds an account,
+    /// so a deposit is the one perp action that is not bundle-less.
+    PerpDeposit { trading_key: PublicKey },
+    /// RPL-3 (35): an order, signed by the trading key that owns `account` over
+    /// [`Transaction::perp_sign_message`] and recorded in the block for the proved engine to
+    /// match. The chain checks the signature and the nonce window and nothing about the order's
+    /// merit, which the engine decides. Bundle-less and fee-less: an account holds collateral,
+    /// not notes, so there is nothing to pay a fee from.
+    PerpOrder { account: Word8, body: crate::ledger::perps::PerpOrderBody, signature: Signature },
+    /// RPL-3 (36): cancel the order `target` of `account` (signed like [`Action::PerpOrder`]).
+    /// `nonce` is the cancel's own slot in the account's nonce window. Bundle-less.
+    PerpCancel { account: Word8, nonce: u64, target: u64, signature: Signature },
+    /// RPL-3 (37): a request to withdraw `amount` of collateral from `account` (signed like
+    /// [`Action::PerpOrder`]). It is paid as a note to `recipient`, opened by `r`, `time` and
+    /// `envelope` as the wallet chose them (as `TokenMint` carries `time`), when a state proof
+    /// whose payouts cover it lands. Bundle-less.
+    PerpWithdraw {
+        account: Word8,
+        nonce: u64,
+        amount: u64,
+        recipient: ShieldedAddress,
+        r: Word8,
+        time: u32,
+        envelope: Envelope,
+        signature: Signature,
+    },
+    /// RPL-3 (38): a validator's oracle prices, one per market, signed by `validator` over
+    /// [`Transaction::perp_sign_message`] with a per-validator `nonce`. The chain takes the
+    /// median of the fresh submissions as each block's price. Bundle-less.
+    PerpOracle { validator: PublicKey, prices: Vec<crate::ledger::perps::PerpPrice>, nonce: u64, signature: Signature },
+    /// RPL-3 (39): a prover's state transition over blocks `from_height + 1 ..= to_height`: the
+    /// engine's `new_root`, the withdrawal `payouts` it makes and the `fees` it collects, with
+    /// the STARK `proof` of the run. Bundle-less and unsigned — the proof is the authority. The
+    /// proof is kept inside the binding, as a `Call`'s is.
+    PerpStateProof {
+        from_height: u64,
+        to_height: u64,
+        new_root: Word8,
+        payouts: Vec<crate::ledger::perps::PerpPayout>,
+        fees: u64,
+        #[serde(with = "crate::crypto::wire_bytes")]
+        proof: Vec<u8>,
+    },
 }
 
 impl Action {
@@ -486,6 +531,11 @@ impl Action {
             Action::RotatePqGuardiansV2 { .. } => Some("rotate_pq_guardians_v2"),
             Action::RotatePauseKeyV2 { .. } => Some("rotate_pause_key_v2"),
             Action::CancelRotation { .. } => Some("cancel_rotation"),
+            Action::PerpOrder { .. } => Some("perp_order"),
+            Action::PerpCancel { .. } => Some("perp_cancel"),
+            Action::PerpWithdraw { .. } => Some("perp_withdraw"),
+            Action::PerpOracle { .. } => Some("perp_oracle"),
+            Action::PerpStateProof { .. } => Some("perp_state_proof"),
             _ => None,
         }
     }
@@ -733,7 +783,67 @@ impl Action {
             Action::CancelRotation { kind, nonce, signature } => {
                 Action::CancelRotation { kind: *kind, nonce: *nonce, signature: signature.clone() }
             }
+            // RPL-3: no perp action carries a bundle's proof, so each is kept whole. A
+            // `PerpStateProof`'s proof is a call-style proof (checked against the engine's
+            // words, not this transaction's bundle) and is kept for a `Call`'s reason.
+            Action::PerpDeposit { .. }
+            | Action::PerpOrder { .. }
+            | Action::PerpCancel { .. }
+            | Action::PerpWithdraw { .. }
+            | Action::PerpOracle { .. }
+            | Action::PerpStateProof { .. } => self.clone(),
         }
+    }
+
+    /// RPL-3: this action with its signature emptied — what [`Transaction::perp_sign_message`]
+    /// hashes. The four signed perp variants (35–38) carry a signature; every other action is
+    /// returned as it is.
+    pub fn perp_unsigned(&self) -> Action {
+        let mut a = self.clone();
+        match &mut a {
+            Action::PerpOrder { signature, .. }
+            | Action::PerpCancel { signature, .. }
+            | Action::PerpWithdraw { signature, .. }
+            | Action::PerpOracle { signature, .. } => *signature = Signature::empty(),
+            // Every other variant is spelled out: a new signed variant must be classified here.
+            Action::None
+            | Action::Mint { .. }
+            | Action::Deploy { .. }
+            | Action::Call { .. }
+            | Action::Bond { .. }
+            | Action::Unbond { .. }
+            | Action::Withdraw { .. }
+            | Action::BridgeAttest { .. }
+            | Action::BridgeBurn { .. }
+            | Action::RegisterAggregator { .. }
+            | Action::UnbondAggregator { .. }
+            | Action::WithdrawAggregator { .. }
+            | Action::SlashAggregator { .. }
+            | Action::Aggregate { .. }
+            | Action::RegisterToken { .. }
+            | Action::TokenMint { .. }
+            | Action::SetAuthority { .. }
+            | Action::TokenBurn { .. }
+            | Action::PauseMints { .. }
+            | Action::UnpauseMints { .. }
+            | Action::RegisterBridgedToken { .. }
+            | Action::ListBacking { .. }
+            | Action::RotatePqGuardians { .. }
+            | Action::RotatePauseKey { .. }
+            | Action::ClaimVested { .. }
+            | Action::RevokeVesting { .. }
+            | Action::BondVested { .. }
+            | Action::UnbondVested { .. }
+            | Action::AdmitValidator { .. }
+            | Action::SlashEquivocation { .. }
+            | Action::RotatePqGuardiansV2 { .. }
+            | Action::RotatePauseKeyV2 { .. }
+            | Action::CancelRotation { .. }
+            | Action::Invoke { .. }
+            | Action::PerpDeposit { .. }
+            | Action::PerpStateProof { .. } => {}
+        }
+        a
     }
 }
 
@@ -800,6 +910,74 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// RPL-3: what the signer of a [`Action::PerpOrder`] (tag 35), [`Action::PerpCancel`] (36),
+    /// [`Action::PerpWithdraw`] (37) or [`Action::PerpOracle`] (38) signs: the chain, the
+    /// variant's tag and the whole action with an empty signature
+    /// ([`Action::perp_unsigned`]), under its own domain. The tag keeps one variant's signature
+    /// from verifying as another's and the chain id keeps it off other chains. `None` for any
+    /// other action, which has no such message.
+    ///
+    /// BIND-1: over the chain's [`BindingDomain`], as every other signed action message is. Under
+    /// `ChainId` it is `blake3("rand-perp-sign-1", bincode(chain_id, tag, unsigned))`; under
+    /// `Genesis(g)` the genesis hash leads the preimage under the next tag,
+    /// `blake3("rand-perp-sign-2", bincode(g, (chain_id, tag, unsigned)))` — the construction
+    /// `BindingDomain::token_mint_message` and the other genesis-bound messages use — so a
+    /// signature made for one chain verifies on no other that shares its chain id.
+    pub fn perp_sign_message(domain: &BindingDomain, chain_id: u64, action: &Action) -> Option<Hash> {
+        let tag: u8 = match action {
+            Action::PerpOrder { .. } => 35,
+            Action::PerpCancel { .. } => 36,
+            Action::PerpWithdraw { .. } => 37,
+            Action::PerpOracle { .. } => 38,
+            // Every other variant is spelled out: a new signed variant must be given a tag here.
+            Action::None
+            | Action::Mint { .. }
+            | Action::Deploy { .. }
+            | Action::Call { .. }
+            | Action::Bond { .. }
+            | Action::Unbond { .. }
+            | Action::Withdraw { .. }
+            | Action::BridgeAttest { .. }
+            | Action::BridgeBurn { .. }
+            | Action::RegisterAggregator { .. }
+            | Action::UnbondAggregator { .. }
+            | Action::WithdrawAggregator { .. }
+            | Action::SlashAggregator { .. }
+            | Action::Aggregate { .. }
+            | Action::RegisterToken { .. }
+            | Action::TokenMint { .. }
+            | Action::SetAuthority { .. }
+            | Action::TokenBurn { .. }
+            | Action::PauseMints { .. }
+            | Action::UnpauseMints { .. }
+            | Action::RegisterBridgedToken { .. }
+            | Action::ListBacking { .. }
+            | Action::RotatePqGuardians { .. }
+            | Action::RotatePauseKey { .. }
+            | Action::ClaimVested { .. }
+            | Action::RevokeVesting { .. }
+            | Action::BondVested { .. }
+            | Action::UnbondVested { .. }
+            | Action::AdmitValidator { .. }
+            | Action::SlashEquivocation { .. }
+            | Action::RotatePqGuardiansV2 { .. }
+            | Action::RotatePauseKeyV2 { .. }
+            | Action::CancelRotation { .. }
+            | Action::Invoke { .. }
+            | Action::PerpDeposit { .. }
+            | Action::PerpStateProof { .. } => return None,
+        };
+        let body = (chain_id, tag, action.perp_unsigned());
+        Some(match domain {
+            BindingDomain::ChainId => {
+                Hash::digest_domain(b"rand-perp-sign-1", &bincode::serialize(&body).expect("serializes"))
+            }
+            BindingDomain::Genesis(g) => {
+                Hash::digest_domain(b"rand-perp-sign-2", &bincode::serialize(&(g, body)).expect("serializes"))
+            }
+        })
+    }
+
     /// A bundle-carrying transaction; `Action::None` for a plain transfer.
     pub fn shielded(chain_id: u64, bundle: Bundle, action: Action) -> Transaction {
         Transaction { chain_id, bundle: Some(bundle), action }
@@ -1610,7 +1788,7 @@ mod tests {
     /// The number of `Action` variants, and each one's position — an exhaustive match with no
     /// wildcard, so a new variant fails to compile here until [`sample`] has a row for it (and
     /// [`Action::blanked`] has an arm).
-    const VARIANTS: usize = 34;
+    const VARIANTS: usize = 40;
     fn variant_index(a: &Action) -> usize {
         match a {
             Action::None => 0,
@@ -1647,6 +1825,12 @@ mod tests {
             Action::RotatePauseKeyV2 { .. } => 31,
             Action::CancelRotation { .. } => 32,
             Action::Invoke { .. } => 33,
+            Action::PerpDeposit { .. } => 34,
+            Action::PerpOrder { .. } => 35,
+            Action::PerpCancel { .. } => 36,
+            Action::PerpWithdraw { .. } => 37,
+            Action::PerpOracle { .. } => 38,
+            Action::PerpStateProof { .. } => 39,
         }
     }
 
@@ -1903,6 +2087,46 @@ mod tests {
                     },
                 }
             }
+            34 => Action::PerpDeposit { trading_key: pk() },
+            35 => Action::PerpOrder {
+                account: [1; 8],
+                body: crate::ledger::perps::PerpOrderBody {
+                    nonce: 1,
+                    market: 0,
+                    side: 0,
+                    kind: 0,
+                    tif: 0,
+                    reduce_only: false,
+                    price: 1,
+                    size: 1,
+                },
+                signature: sig(),
+            },
+            36 => Action::PerpCancel { account: [1; 8], nonce: 2, target: 1, signature: sig() },
+            37 => Action::PerpWithdraw {
+                account: [1; 8],
+                nonce: 3,
+                amount: 5,
+                recipient: ShieldedAddress { pk: [4; 8], kem_ek: vec![6; 32] },
+                r: [5; 8],
+                time: 9,
+                envelope: env(),
+                signature: sig(),
+            },
+            38 => Action::PerpOracle {
+                validator: pk(),
+                prices: vec![crate::ledger::perps::PerpPrice { market: 0, price: 7 }],
+                nonce: 1,
+                signature: sig(),
+            },
+            39 => Action::PerpStateProof {
+                from_height: 1,
+                to_height: 2,
+                new_root: [9; 8],
+                payouts: vec![crate::ledger::perps::PerpPayout { request: [1; 8], amount: 3 }],
+                fees: 4,
+                proof,
+            },
             _ => panic!("no variant {i}"),
         }
     }
@@ -1920,8 +2144,8 @@ mod tests {
         // Since the hidden-asset bundle (spec §3.7) only an `Aggregate` carries a proof that is
         // blanked: `BridgeBurn` (8) and `TokenBurn` (17) no longer carry a bundle of their own.
         let blanked_proof = [13usize];
-        // A `Call` (3) and an RPL-2 `Invoke` (33) carry a call proof, which is kept.
-        let kept_proof = [3usize, 33];
+        // A `Call` (3), an RPL-2 `Invoke` (33) and an RPL-3 `PerpStateProof` (39) carry a proof that is kept.
+        let kept_proof = [3usize, 33, 39];
         let mut seen = [false; VARIANTS];
         for (i, seen) in seen.iter_mut().enumerate() {
             let with = sample(i, vec![0x99; 7]);
@@ -1941,6 +2165,63 @@ mod tests {
             }
         }
         assert!(seen.iter().all(|s| *s), "every variant has a row");
+    }
+
+    /// Rebuild the signed perp action `a` with `signature` in place of its own.
+    fn with_signature(a: &Action, signature: Signature) -> Action {
+        let mut a = a.clone();
+        match &mut a {
+            Action::PerpOrder { signature: s, .. }
+            | Action::PerpCancel { signature: s, .. }
+            | Action::PerpWithdraw { signature: s, .. }
+            | Action::PerpOracle { signature: s, .. } => *s = signature,
+            _ => panic!("not a signed perp action"),
+        }
+        a
+    }
+
+    #[test]
+    fn perp_sign_message_ignores_the_signature_and_binds_the_chain_and_tag() {
+        let kp = Keypair::generate();
+        let d = BindingDomain::ChainId;
+        let mut messages = Vec::new();
+        for i in 35..=38 {
+            let empty = with_signature(&sample(i, Vec::new()), Signature::empty());
+            let m = Transaction::perp_sign_message(&d, 7, &empty).unwrap();
+            let signed = with_signature(&empty, kp.sign(m.as_bytes()));
+            assert_ne!(signed, empty, "variant {i}: the signature was replaced");
+            assert_eq!(Transaction::perp_sign_message(&d, 7, &signed).unwrap(), m, "variant {i}: the signature is not signed over");
+            assert_ne!(Transaction::perp_sign_message(&d, 8, &signed).unwrap(), m, "variant {i}: the chain is bound");
+            // BIND-1: the genesis hash is bound under `binding_domain: 1`, and the chain id with it.
+            let (ga, gb) = (BindingDomain::Genesis(Hash([0xa; 32])), BindingDomain::Genesis(Hash([0xb; 32])));
+            let msg = |d: &BindingDomain, chain| Transaction::perp_sign_message(d, chain, &signed).unwrap();
+            let on_a = msg(&ga, 7);
+            assert_ne!(on_a, m, "variant {i}: never the chain-id form");
+            assert_ne!(on_a, msg(&gb, 7), "variant {i}: two genesis hashes");
+            assert_ne!(on_a, msg(&ga, 8), "variant {i}: the chain is still bound");
+            messages.push(m);
+        }
+        for a in 0..messages.len() {
+            for b in a + 1..messages.len() {
+                assert_ne!(messages[a], messages[b], "variants {} and {} sign different messages", 35 + a, 35 + b);
+            }
+        }
+        // Only the four signed variants have a message.
+        for i in [34, 39] {
+            assert!(Transaction::perp_sign_message(&d, 7, &sample(i, Vec::new())).is_none());
+        }
+    }
+
+    #[test]
+    fn perp_variants_are_bundle_less_and_fee_floored_as_ruled() {
+        assert_eq!(sample(34, Vec::new()).bundle_less(), None, "a deposit rides a bundle");
+        let names = ["perp_order", "perp_cancel", "perp_withdraw", "perp_oracle", "perp_state_proof"];
+        for (k, name) in names.iter().enumerate() {
+            let a = sample(35 + k, Vec::new());
+            assert_eq!(a.bundle_less(), Some(*name), "variant {}", 35 + k);
+            assert_eq!(crate::gas::fee_floor(&a), 0, "variant {}: bundle-less, no floor", 35 + k);
+        }
+        assert_eq!(crate::gas::fee_floor(&sample(34, Vec::new())), crate::gas::BUNDLE_BASE);
     }
 
     /// The binding ignores every blanked proof byte — the bundle's, an aggregate's, and a pruned
