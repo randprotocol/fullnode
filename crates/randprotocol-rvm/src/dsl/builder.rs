@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
+use p3_field::{BasedVectorSpace, PrimeCharacteristicRing, PrimeField64};
 
 use super::{Array, Ext, Felt, Ptr};
 use crate::isa::{Instr, Op, Program, EF, F, MEM_LIMIT, NUM_REGS};
@@ -76,6 +76,11 @@ pub enum Precompiles {
     On,
 }
 
+/// [`Stats::pc_kind`]'s values.
+pub const PC_INSTR: u8 = 0;
+pub const PC_RELOAD: u8 = 1;
+pub const PC_SPILL: u8 = 2;
+
 /// What a built program cost. `cells` counts the memory cells the program reserves: the spill
 /// arena's peak concurrent usage plus everything [`Builder::alloc`] handed out. `phase_rows` is
 /// the final instruction count per [`Builder::note_phase`] section, spill and reload insertions
@@ -92,6 +97,12 @@ pub struct Stats {
     /// ever creates".
     pub live_max: usize,
     pub phase_rows: Vec<(&'static str, usize)>,
+    /// Phase 3 Task 0: per emitted instruction, the innermost open [`Builder::span`] (an index
+    /// into `span_names`; 0 is `"(none)"`) and the row's kind (`PC_INSTR`, `PC_RELOAD`,
+    /// `PC_SPILL`). What `tests/profile.rs` attributes executed rows with.
+    pub span_names: Vec<&'static str>,
+    pub pc_span: Vec<u16>,
+    pub pc_kind: Vec<u8>,
 }
 
 // ------------------------------------------------------------------ the buffered operations
@@ -157,6 +168,9 @@ enum Op2 {
     /// A phase boundary for `Stats::phase_rows`: the replay counts emitted instructions between
     /// consecutive markers.
     Phase { name: &'static str },
+    /// A [`Builder::span`]'s open and close markers: emit nothing, move no liveness.
+    SpanOpen { name: &'static str },
+    SpanClose,
 }
 
 struct Slot {
@@ -177,7 +191,8 @@ struct PtrSlot {
     delta: i64,
     /// The holder's compile-time value: the `FADDI` immediate `alloc` materialised it with.
     /// Every `Ptr` descends from `alloc` (through `offset`), so every pointer's absolute
-    /// address is a compile-time constant — which is what `reduce` writes into a descriptor.
+    /// address is a compile-time constant — which is what `reduce` registers in a layout entry
+    /// (Cut D: the preprocessed `Program::reduce_layout`, never a runtime descriptor).
     base_value: u64,
 }
 
@@ -202,6 +217,17 @@ pub struct Builder {
     /// Instructions buffered so far — the incremental count `note_phase`'s callers measure with.
     buf_instrs: usize,
     stats: Stats,
+    /// Cut D: the reduce layout entries [`Builder::reduce`] registered, in entry-id order.
+    layout: Vec<crate::isa::ReduceEntry>,
+}
+
+/// One run of a reduction chain (Cut D): `vals.len` opened extension values against the first
+/// `vals.len` cells of `row`, with the inverse key in the two cells at `key`.
+#[derive(Clone, Copy, Debug)]
+pub struct ReduceRun {
+    pub vals: Array<Ext>,
+    pub row: Array<Felt>,
+    pub key: Ptr,
 }
 
 impl Builder {
@@ -229,6 +255,7 @@ impl Builder {
             next_loop: 0,
             buf_instrs: 0,
             stats: Stats::default(),
+            layout: Vec::new(),
         }
     }
 
@@ -241,6 +268,18 @@ impl Builder {
     /// Mark a phase boundary for `Stats::phase_rows`.
     pub fn note_phase(&mut self, name: &'static str) {
         self.ops.push(Op2::Phase { name });
+    }
+
+    /// Attribute every instruction `body` emits, spill and reload insertions included, to
+    /// `name`; the innermost open span wins. Markers emit nothing and wrap whole builder calls, so
+    /// they never sit between a `Def` and its defining instruction: a build with spans is the
+    /// build without them, instruction for instruction. A closure rather than a guard, because the
+    /// body needs the builder and a guard holding `&mut self` would lock it.
+    pub fn span<R>(&mut self, name: &'static str, body: impl FnOnce(&mut Self) -> R) -> R {
+        self.ops.push(Op2::SpanOpen { name });
+        let r = body(self);
+        self.ops.push(Op2::SpanClose);
+        r
     }
 
     /// The precompile policy this builder emits with.
@@ -415,7 +454,13 @@ impl Builder {
     /// `n mod 8` tail — the tail stays compiled because a block always consumes eight words, and
     /// the tape has exactly `n`. `Precompiles::Off`: the pairs throughout (the reference).
     pub fn hint_array(&mut self, n: usize) -> Array<Felt> {
-        let base = self.alloc(n as u64);
+        self.hint_array_padded(n, 0)
+    }
+
+    /// [`Builder::hint_array`] into a buffer `extra` cells longer than the words it hints (Cut E2:
+    /// a committed row's fold-result cells after its salts). The extra cells are allocated only.
+    pub fn hint_array_padded(&mut self, n: usize, extra: usize) -> Array<Felt> {
+        let base = self.alloc((n + extra) as u64);
         let holder = self.ptrs[base.0 as usize].holder;
         self.begin();
         let rp = self.materialise(holder);
@@ -517,6 +562,19 @@ impl Builder {
         Ext(id)
     }
 
+    /// `Ed = mem[addr_of(base) + off .. + 2]` with `off` a *runtime* cell offset (Cut E1: the
+    /// committed row's own slot, `2·index_in_group`): one `LOADE` whose address register is the
+    /// offset and whose immediate is the base's absolute address. The cpu row range-checks the
+    /// sum like any `LOADE`.
+    pub fn load_ext_offset(&mut self, base: Ptr, off: Felt) -> Ext {
+        self.begin();
+        let ro = self.materialise(off.0);
+        let at = F::from_u64(self.addr_of(base));
+        let (id, rd) = self.new_handle(2);
+        self.emit(Op::Loade, rd, ro, BRef::Imm(at));
+        Ext(id)
+    }
+
     pub fn store_ext(&mut self, p: Ptr, off: i64, v: Ext) {
         self.begin();
         let rv = self.materialise(v.0);
@@ -609,36 +667,35 @@ impl Builder {
 
     // ---------------------------------------------------- the REDUCE precompile (Task 8)
 
-    /// One run of the batch-opening reduction over `vals.len == row.len` columns:
-    /// `acc += Σ_k alpha_pow·(vals_k − row_k)·inv` and `alpha_pow ·= alpha`, in one `REDUCE`
-    /// instruction — the precompile form of the compiled loop [`run_reduce_sequence`] replaces,
-    /// and differentially pinned to (`tests/precompiles.rs`). The 11-cell descriptor —
-    /// `[vals_base, row_base, len, inv, acc, alpha_pow, alpha]` — is built fresh per call; the
-    /// accumulator and running power are read back out of it, so a height group's runs chain
-    /// exactly like the compiled loop's.
-    pub fn reduce(&mut self, vals: Array<Ext>, row: Array<Felt>, inv: Ext, acc: Ext, alpha_pow: Ext, alpha: Ext) -> (Ext, Ext) {
-        assert!(
-            vals.len <= row.len,
-            "a reduction run covers `vals.len` columns of the opened row (the rest are salts and              the hiding wrapper's hidden values, hashed by the leaf sponge, not reduced)"
-        );
-        self.begin();
-        let descr = self.alloc(11);
-        let vb = self.constant(F::from_u64(self.addr_of(vals.base)));
-        self.store(descr, 0, vb);
-        let rb = self.constant(F::from_u64(self.addr_of(row.base)));
-        self.store(descr, 1, rb);
-        let ln = self.constant(F::from_u64(vals.len as u64));
-        self.store(descr, 2, ln);
-        self.store_ext(descr, 3, inv);
-        self.store_ext(descr, 5, acc);
-        self.store_ext(descr, 7, alpha_pow);
-        self.store_ext(descr, 9, alpha);
-        let holder = self.ptrs[descr.0 as usize].holder;
-        let ra = self.materialise(holder);
-        self.emit(Op::Reduce, RRef::Raw(0), ra, BRef::Imm(F::ZERO));
-        let acc_out = self.load_ext(descr, 5);
-        let apow_out = self.load_ext(descr, 7);
-        (acc_out, apow_out)
+    /// One height chain of the batch-opening reduction (Cut D): `acc = Σ_runs Σ_k
+    /// alpha^j·(vals_k − row_k)·inv_run` with `j` running across the whole chain, `alpha` read from
+    /// the two cells at `alpha`, the result written to the two cells at `res`. Registers one layout
+    /// entry per run and emits one `REDUCE` per run, **back to back** — no handle is touched, so
+    /// no spill or reload can land between them, which is what the chip's `CLK + 1` carry needs
+    /// (`replay` asserts it). Every address is a compile-time constant (`addr_of`).
+    pub fn reduce(&mut self, runs: &[ReduceRun], alpha: Ptr, res: Ptr) {
+        assert!(!runs.is_empty(), "a reduction chain has at least one run");
+        let (alpha_at, res_at) = (self.addr_of(alpha), self.addr_of(res));
+        for (j, r) in runs.iter().enumerate() {
+            assert!(r.vals.stride == 2 && r.row.stride == 1, "vals are extension cells, the row base cells");
+            assert!(
+                r.vals.len >= 1 && r.vals.len <= r.row.len,
+                "a reduction run covers 1..=row.len columns (the rest are salts and hidden values)"
+            );
+            let id = self.layout.len() as u64;
+            self.layout.push(crate::isa::ReduceEntry {
+                vals: self.addr_of(r.vals.base),
+                row: self.addr_of(r.row.base),
+                len: r.vals.len as u32,
+                key: self.addr_of(r.key),
+                alpha: alpha_at,
+                res: res_at,
+                chain_start: j == 0,
+                carry: j + 1 < runs.len(),
+            });
+            self.begin();
+            self.emit(Op::Reduce, RRef::Raw(0), RRef::Raw(0), BRef::Imm(F::from_u64(id)));
+        }
     }
 
     /// One `SPONGE` instruction (Task 9): absorb the four cells at `src` into rate lanes 0–3 of
@@ -664,6 +721,35 @@ impl Builder {
         let rd = self.materialise(bit.0);
         self.emit(Op::Compress, rd, ra, bref_of(rb));
         self.stats.perms += 1;
+    }
+
+    /// One `FOLD` (Cut E2): the arity-`arity` fold of the committed row at `msg` (2·arity cells,
+    /// then the salts) at `u`, by the reduce chip's fold run; the result is loaded from the two
+    /// cells after the salts. `u` rides in the `rd` pair as a read, as `COMPRESS`'s bit does.
+    pub fn fold_run(&mut self, msg: Ptr, arity: usize, u: Ext) -> Ext {
+        assert!(matches!(arity, 2 | 4 | 8), "FOLD arity {arity}: the coefficient table holds 2, 4 and 8");
+        self.begin();
+        let ru = self.materialise(u.0);
+        let rm = self.ptr_reg(msg);
+        self.emit(Op::Fold, ru, rm, BRef::Imm(F::from_u64(arity as u64)));
+        self.load_ext(msg, 2 * arity as i64 + crate::isa::FOLD_SALT_CELLS as i64)
+    }
+
+    /// One `POW` (Cut F): `base·g^{rev(bits, L)}` from the `len` bits at cells `off..off+len` of
+    /// the 65-cell bits buffer `bits` (`DslChallenger::sample_bits_mem`), by the reduce chip's
+    /// pow run; the result is loaded from cell 64. `(g, base)` ride as one extension pair in `rd`.
+    /// `len` is at least 1: a run has one chip row per bit and its first row is the one that
+    /// receives the dispatch, so an empty run has nothing to receive it — the same shape
+    /// `machine::check_instr` (`DecodeError::PowShape`) and the emulator (`ExecError::PowShape`)
+    /// refuse (`index_power` always asks for `log_rev ≥ 1` bits).
+    pub fn pow_run(&mut self, bits: Ptr, off: usize, len: usize, g: F, base: F) -> Felt {
+        assert!(len >= 1 && off + len <= 64, "POW: {len} bits at {off} leave the 64-bit buffer");
+        let gb = self.ext_constant(EF::from_basis_coefficients_slice(&[g, base]).expect("two coefficients"));
+        self.begin();
+        let rgb = self.materialise(gb.0);
+        let rp = self.ptr_reg(bits);
+        self.emit(Op::Pow, rgb, rp, BRef::Imm(F::from_u64((off + 256 * len) as u64)));
+        self.load(bits, 64)
     }
 
     /// The register a `Ptr`'s address lives in, folding any compile-time delta in first. An
@@ -1056,6 +1142,7 @@ impl Builder {
 
     fn replay(self) -> (Program, Stats) {
         let live = self.liveness == Liveness::On;
+        let layout = self.layout.clone();
         let n = self.ops.len();
 
         // ── pass 1: liveness. last_use[id] is the last buffer index whose instruction or
@@ -1091,7 +1178,13 @@ impl Builder {
                     let top = loop_stack.pop().expect("unbalanced loop markers");
                     loops.push((top, i as u32));
                 }
-                Op2::Group | Op2::TakeScratch { .. } | Op2::Phase { .. } | Op2::BranchTop | Op2::BranchEnd => {}
+                Op2::Group
+                | Op2::TakeScratch { .. }
+                | Op2::Phase { .. }
+                | Op2::BranchTop
+                | Op2::BranchEnd
+                | Op2::SpanOpen { .. }
+                | Op2::SpanClose => {}
             }
         }
         for &(top, end) in &loops {
@@ -1177,6 +1270,10 @@ impl Builder {
         let mut live_max = 0usize;
         let mut phase_rows: Vec<(&'static str, usize)> = Vec::new();
         let mut phase_mark = 0usize;
+        let mut span_names: Vec<&'static str> = vec!["(none)"];
+        let mut span_stack: Vec<u16> = Vec::new();
+        let mut pc_span: Vec<u16> = Vec::new();
+        let mut pc_kind: Vec<u8> = Vec::new();
         let mut stats = self.stats;
         let mut loop_snap: Vec<(u32, Vec<Option<u8>>, Vec<Option<u64>>)> = Vec::new();
         let mut branch_snap: Vec<(Vec<Option<u8>>, Vec<Option<u64>>)> = Vec::new();
@@ -1310,6 +1407,16 @@ impl Builder {
                     phase_rows.push((name, out.len() - phase_mark));
                     phase_mark = out.len();
                 }
+                Op2::SpanOpen { name } => {
+                    let id = span_names.iter().position(|n| *n == *name).unwrap_or_else(|| {
+                        span_names.push(name);
+                        span_names.len() - 1
+                    });
+                    span_stack.push(id as u16);
+                }
+                Op2::SpanClose => {
+                    span_stack.pop().expect("unbalanced span markers");
+                }
                 Op2::LoopEnd { id } => {
                     let (want_id, was_home, was_cells) = loop_snap.pop().expect("unbalanced LoopEnd");
                     assert_eq!(*id, want_id, "unbalanced loop markers");
@@ -1326,6 +1433,16 @@ impl Builder {
                     }
                 }
             }
+            // Phase 3 Task 0: tag what this buffer entry emitted. A `Mat` emits only reloads,
+            // a `Def` only the spills its claim evicts, an `Instr` itself.
+            let kind = match op {
+                Op2::Mat { .. } => PC_RELOAD,
+                Op2::Def { .. } => PC_SPILL,
+                _ => PC_INSTR,
+            };
+            let tag = span_stack.last().copied().unwrap_or(0);
+            pc_span.resize(out.len(), tag);
+            pc_kind.resize(out.len(), kind);
             // Free the handles whose last use this was (liveness only). A handle dies *after* the
             // instruction that last reads it, so eviction candidates see it through this index.
             if live {
@@ -1368,7 +1485,32 @@ impl Builder {
         stats.live_max = live_max;
         stats.cells += arena_peak;
         stats.phase_rows = phase_rows;
-        (Program { instrs: out, checkpoints }, stats)
+        assert!(span_stack.is_empty(), "a span was left open");
+        stats.span_names = span_names;
+        stats.pc_span = pc_span;
+        stats.pc_kind = pc_kind;
+        // Cut D: a carrying entry's REDUCE is followed by its continuation's on the next pc. Only
+        // `Builder::reduce` emits `REDUCE`, with ids it registered, so the two asserts below name
+        // a builder bug, not a program's (Task 5 sweep: they were opaque index panics).
+        let mut reduce_pc = vec![u32::MAX; layout.len()];
+        for (pc, ins) in out.iter().enumerate() {
+            if ins.op == Op::Reduce {
+                let id = ins.b.as_canonical_u64();
+                assert!(
+                    (id as usize) < layout.len(),
+                    "REDUCE at pc {pc} names layout entry {id}, but the builder registered {} entries",
+                    layout.len()
+                );
+                reduce_pc[id as usize] = pc as u32;
+            }
+        }
+        for (k, e) in layout.iter().enumerate() {
+            if e.carry {
+                assert!(k + 1 < layout.len(), "reduce layout entry {k} carries, but it is the last entry");
+                assert_eq!(reduce_pc[k + 1], reduce_pc[k] + 1, "reduce chain entries {k} and {} are not consecutive", k + 1);
+            }
+        }
+        (Program { instrs: out, checkpoints, reduce_layout: layout }, stats)
     }
 }
 

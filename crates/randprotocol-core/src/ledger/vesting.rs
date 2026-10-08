@@ -1238,7 +1238,7 @@ mod ledger_tests {
     #[test]
     fn a_claim_under_both_burn_flags_still_pays_its_base_to_the_proposer() {
         let mut l = ledger(vec![cfg(1, false)], 4_000);
-        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None });
         let before = l.clone();
         ap!(l, claim(&l, 1, 2 * U, 0, HOLDER, 1)).unwrap();
         let rewards = |l: &Ledger| l.validators()[&kp(PROPOSER).address()].rewards;

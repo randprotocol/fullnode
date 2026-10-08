@@ -18,12 +18,12 @@
 
 use crate::dsl::hash;
 use crate::dsl::transcript::DslChallenger;
-use crate::dsl::{Array, Builder, Checkpoints, Digest, Ext, Felt, Ptr, DIGEST_ELEMS};
+use crate::dsl::{Array, Builder, Checkpoints, Digest, Ext, Felt, Ptr, ReduceRun, DIGEST_ELEMS};
 use crate::emulator::Execution;
 use crate::isa::{Program, EF, F};
 use crate::public_values::RVM_PUB_DOMAIN;
 use crate::shape::{
-    natural_domain, InnerKey, InnerShape, ShapeKey, VerifierShape, CAP_HEIGHT, LOG_BLOWUP,
+    natural_domain, InnerKey, InnerShape, ShapeKey, VerifierShape, CAP_HEIGHT,
     NUM_RANDOM_CODEWORDS, RVM_VK_DOMAIN,
 };
 use p3_air::{Air, BaseAir};
@@ -257,10 +257,17 @@ where
     ch.check_witness(b, shape.query_pow_bits(), pow, "query pow");
 
     // 6. The query indices — little-endian bit handles, `sample_bits(log_global_max_height)` each
-    // (`TwoAdicFriFolding::extra_query_index_bits() == 0`).
-    let index_bits: Vec<Vec<Felt>> = (0..shape.num_queries())
-        .map(|_| ch.sample_bits(b, log_global))
-        .collect();
+    // (`TwoAdicFriFolding::extra_query_index_bits() == 0`). `On` (Cut F): the bits are also cells
+    // of a 65-cell buffer, which the index powers' `POW` runs read.
+    let (index_bits, index_cells): (Vec<Vec<Felt>>, Vec<Option<Ptr>>) = (0..shape.num_queries())
+        .map(|_| match b.precompiles() {
+            Precompiles::On => {
+                let (bits, buf) = ch.sample_bits_mem(b, log_global);
+                (bits, Some(buf))
+            }
+            Precompiles::Off => (ch.sample_bits(b, log_global), None),
+        })
+        .unzip();
     mark(b, "phase 6 preamble: claimed evals, betas, final poly, pow, indices");
 
     // 7. Per query, unrolled: the count is a compile-time constant of the shape, and a counted
@@ -289,7 +296,7 @@ where
     mark(b, "query segments: tape reads");
     b.unrolled(shape.num_queries(), |b, q| {
         emit_query(b, shape, &opened, &metas, &fri_caps, &betas, fri_alpha, final_poly,
-                   &index_bits[q], &all_rows[q], &all_groups[q], &all_paths[q], &all_commit_openings[q],
+                   &index_bits[q], index_cells[q], &all_rows[q], &all_groups[q], &all_paths[q], &all_commit_openings[q],
                    &all_commit_paths[q]);
     });
     mark(b, "queries: merkle walks, reduction, folds");
@@ -383,7 +390,7 @@ pub fn verify_rv32_with(
 const SALT_ELEMS: usize = hash::SALT_ELEMS;
 
 /// One committed matrix of the opening argument, already merged with the hiding wrapper's hidden
-/// halves: its log-height (`degree_bits[i] + LOG_BLOWUP`), and per opening point the point itself
+/// halves: its log-height (`degree_bits[i] + log_blowup`), and per opening point the point itself
 /// (`zeta`, or the instance's `zeta_next`) and the claimed values at it — the public prefix, then
 /// the four hidden values (none for the preprocessed round) — the order `open_inputs`'
 /// accumulation consumes them in.
@@ -459,7 +466,7 @@ fn observe_claimed<S: VerifierShape>(
         (z, Array::new(out, public.len + n_hidden, 2))
     };
 
-    let h_of = |i: usize| shape.degree_bits()[i] + LOG_BLOWUP;
+    let h_of = |i: usize| shape.degree_bits()[i] + shape.log_blowup();
     let n = shape.instances();
     let mut rounds = Vec::with_capacity(5);
     let mut metas = Vec::with_capacity(5);
@@ -586,15 +593,17 @@ fn read_input_paths(b: &mut Builder, opened: &QueryOpenings) -> Vec<Array<Felt>>
         .collect()
 }
 
-/// One query's run of `Segment::CommitPhaseOpenings`: per round, the `arity − 1` sibling values
-/// and the row's four salts.
+/// One query's run of `Segment::CommitPhaseOpenings`: per round, the whole committed row (Cut E1)
+/// and its four salts — hinted straight into the buffer the round's leaf sponge reads — and (Cut
+/// E2) two cells after them, allocated only, where `FOLD` writes the round's folded value.
 fn read_commit_openings<S: VerifierShape>(b: &mut Builder, shape: &S) -> Vec<Array<Felt>> {
     shape
         .log_arities()
         .iter()
-        .map(|&la| b.hint_array(((1usize << la) - 1) * 2 + SALT_ELEMS))
+        .map(|&la| b.hint_array_padded((1usize << la) * 2 + SALT_ELEMS, 2))
         .collect()
 }
+const _: () = assert!(crate::isa::FOLD_SALT_CELLS as usize == SALT_ELEMS);
 
 /// One query's run of `Segment::CommitPhasePaths`: per round, the restored path's siblings.
 fn read_commit_paths<S: VerifierShape>(b: &mut Builder, shape: &S) -> Vec<Array<Felt>> {
@@ -609,9 +618,9 @@ fn read_commit_paths<S: VerifierShape>(b: &mut Builder, shape: &S) -> Vec<Array<
         .collect()
 }
 
-/// One query, already-tape-read to final check: the five input rounds' Merkle walks, the
-/// batch-opening reduction, the fold chain with each round's reconstructed row authenticated
-/// against its commitment, and the final-polynomial check.
+/// One query, already-tape-read to final check: the input rounds' Merkle walks, the batch-opening
+/// reduction, the fold chain — each round's committed row checked at the query's own slot, folded,
+/// and authenticated against its commitment — and the final-polynomial check.
 #[allow(clippy::too_many_arguments)]
 fn emit_query<S: VerifierShape>(
     b: &mut Builder,
@@ -623,6 +632,7 @@ fn emit_query<S: VerifierShape>(
     fri_alpha: Ext,
     final_poly: Ext,
     index_bits: &[Felt],
+    index_cells: Option<Ptr>,
     rows: &[Vec<Array<Felt>>],
     groups: &[Vec<(Ptr, usize)>],
     paths: &[Array<Felt>],
@@ -631,89 +641,112 @@ fn emit_query<S: VerifierShape>(
 ) {
     let log_global = shape.log_global_max_height();
 
-    // ── every input round, Merkle-verified against its commitment before any arithmetic reads the
-    // openings (`open_inputs` authenticates first, for the same reason).
+    // ── every input round, Merkle-verified before any arithmetic reads the openings.
     for (ri, mats) in opened.rounds.iter().enumerate() {
-        emit_input_round_root(b, log_global, mats, &groups[ri], paths[ri], index_bits, &metas[ri]);
+        b.span("input_root", |b| emit_input_round_root(b, log_global, mats, &groups[ri], paths[ri], index_bits, &metas[ri]));
     }
 
     // ── the batch-opening reduction.
-    let ros = emit_reduced_openings(b, shape, index_bits, fri_alpha, opened, &rows);
+    let ros = b.span("reduce", |b| emit_reduced_openings(b, shape, index_bits, index_cells, fri_alpha, opened, rows));
 
     // ── the fold chain (`fold_query`, verifier.rs:523-671).
     let mut ros: BTreeMap<usize, Ext> = ros.into_iter().collect();
-    let mut folded = ros
-        .remove(&log_global)
-        .expect("open_inputs' first reduced opening is at the global max height");
+    let mut folded = ros.remove(&log_global).expect("open_inputs' first reduced opening is at the global max height");
     let mut shift = 0usize;
     for (r, &la) in shape.log_arities().iter().enumerate() {
-        let arity = 1usize << la;
         let log_folded = log_global - shift - la;
-        // `index_in_group = index % arity`: the low `log_arity` bits of the current index.
+        // `index_in_group`: the low `log_arity` bits of the current index.
         let own = &index_bits[shift..shift + la];
-
-        // Reconstruct the committed row: the query's own value at `index_in_group`, the
-        // `arity − 1` siblings filling the rest in order — selected arithmetically from the low
-        // bits, so no branching (`fold_query`'s loop, verifier.rs:583-591). The sibling that
-        // lands at position `j` is `siblings[j − (j > index_in_group)]`; the indicators are
-        // one-hot, so `[index_in_group < j]` is a prefix sum.
-        let sibs = commit_openings[r];
-        let ind: Vec<Felt> = (0..arity).map(|v| bit_indicator(b, own, v)).collect();
-        let mut evals = Vec::with_capacity(arity);
-        for j in 0..arity {
-            // `[index_in_group < j]`; empty prefix sums to zero.
-            let mut gt: Option<Felt> = None;
-            for &i in &ind[..j] {
-                gt = Some(match gt {
-                    None => i,
-                    Some(g) => b.add(g, i),
-                });
-            }
-            let gt = gt.unwrap_or_else(|| b.zero());
-            // The two candidates: `siblings[j]` when `j <= index_in_group`, `siblings[j − 1]`
-            // when `j > index_in_group`. For `j == arity − 1 == index_in_group` the first
-            // candidate does not exist — the value read in its place is masked to zero below.
-            let sj = b.load_ext(sibs.base, (2 * j.min(arity - 2)) as i64);
-            let sj1 = if j == 0 { sj } else { b.load_ext(sibs.base, (2 * (j - 1)) as i64) };
-            // `B = sj + gt·(sj1 − sj)`, then `eval = B + ind_j·(folded − B)`.
-            let d = b.ext_sub(sj1, sj);
-            let t = b.ext_mul_base(d, gt);
-            let candidate = b.ext_add(sj, t);
-            let d = b.ext_sub(folded, candidate);
-            let t = b.ext_mul_base(d, ind[j]);
-            evals.push(b.ext_add(candidate, t));
-        }
-
-        // The parent node's index bits, then the fold itself.
+        let msg = commit_openings[r].base;
+        // Cut E1: the row was hinted whole; the query's own value must sit at its slot.
+        b.span("select", |b| own_slot_check(b, msg, own, folded, &format!("commit phase own slot[{r}]")));
         shift += la;
         let group_bits = &index_bits[shift..shift + log_folded];
-        folded = emit_fold_round(b, log_folded, la, group_bits, betas[r], &evals);
-
-        // Authenticate the reconstructed row against the round's commitment.
-        emit_commit_root(b, &evals, sibs, commit_paths[r], &index_bits[shift..], fri_caps[r],
-                         &format!("commit phase root[{r}]"));
-
-        // Roll in a reduced opening landing at the folded height: `beta^(2^log_arity) · ro`
-        // (`verifier.rs:620-626`). The arity schedule is derived to land on every distinct input
-        // height exactly once, which is what makes the map empty at the end.
+        let cells = index_cells.map(|p| (p, shift));
+        folded = b.span("fold_round", |b| fold_eval(b, log_folded, la, group_bits, betas[r], msg, cells));
+        b.span("commit_root", |b| {
+            emit_commit_root(b, la, msg, commit_paths[r], &index_bits[shift..], fri_caps[r], &format!("commit phase root[{r}]"))
+        });
+        // Roll in a reduced opening landing at the folded height: `beta^(2^log_arity) · ro`.
         if let Some(ro) = ros.remove(&log_folded) {
-            let mut beta_pow = betas[r];
-            for _ in 0..la {
-                beta_pow = b.ext_mul(beta_pow, beta_pow);
-            }
-            let t = b.ext_mul(beta_pow, ro);
-            folded = b.ext_add(folded, t);
+            folded = b.span("roll_in", |b| {
+                let mut beta_pow = betas[r];
+                for _ in 0..la {
+                    beta_pow = b.ext_mul(beta_pow, beta_pow);
+                }
+                let t = b.ext_mul(beta_pow, ro);
+                b.ext_add(folded, t)
+            });
         }
     }
     debug_assert!(ros.is_empty(), "the arity schedule rolls every input height in");
 
-    // ── the final check: `final_poly.horner(x_final) == folded_eval` with
-    // `x_final = g_{log_global}^{reverse_bits_len(domain_index, log_global)}` (`verifier.rs:413-423`).
-    // `log_final_poly_len == 0`, so the Horner is the single coefficient itself.
+    // ── the final check (`log_final_poly_len == 0`: the Horner is the single coefficient).
     let (f0, f1) = b.ext_parts(final_poly);
     let (g0, g1) = b.ext_parts(folded);
     b.assert_eq(f0, g0, "final polynomial");
     b.assert_eq(f1, g1, "final polynomial");
+}
+
+/// Cut E1: the query's own folded value is the committed row's entry at `index_in_group = Σ
+/// own_k·2^k`. `On`: the cell offset `2·idx` from the bits, one register-addressed `LOADE`;
+/// `Off` (the reference): the one-hot indicators' dot product with the row. Either way an
+/// extension equality refused at `name`.
+pub fn own_slot_check(b: &mut Builder, msg: Ptr, own: &[Felt], folded: Ext, name: &str) {
+    let got = match b.precompiles() {
+        Precompiles::On => {
+            let mut off = b.mul_const(own[0], F::TWO);
+            for (k, &bit) in own.iter().enumerate().skip(1) {
+                let t = b.mul_const(bit, F::from_u64(2u64 << k));
+                off = b.add(off, t);
+            }
+            b.load_ext_offset(msg, off)
+        }
+        Precompiles::Off => {
+            let mut acc: Option<Ext> = None;
+            for j in 0..1usize << own.len() {
+                let ind = bit_indicator(b, own, j);
+                let e = b.load_ext(msg, 2 * j as i64);
+                let t = b.ext_mul_base(e, ind);
+                acc = Some(match acc {
+                    None => t,
+                    Some(a) => b.ext_add(a, t),
+                });
+            }
+            acc.expect("an arity of at least two")
+        }
+    };
+    let d = b.ext_sub(got, folded);
+    let (d0, d1) = b.ext_parts(d);
+    b.assert_zero(d0, name);
+    b.assert_zero(d1, name);
+}
+
+/// One fold round over the committed row at `msg`. `Off` (the reference): load the row, run the
+/// compiled barycentric fold. `On` (Cut E2): `u = β·s⁻¹` on the cpu — `s` the coset's first point,
+/// one `INV`, one `EMULF` — and the inverse DFT plus Horner in the reduce chip's fold run. With
+/// `cells = Some((bits, off))` (Cut F) `s` is a `POW` run over the index's cells `off..off+log_folded`.
+pub fn fold_eval(
+    b: &mut Builder,
+    log_folded: usize,
+    la: usize,
+    group_bits: &[Felt],
+    beta: Ext,
+    msg: Ptr,
+    cells: Option<(Ptr, usize)>,
+) -> Ext {
+    match b.precompiles() {
+        Precompiles::Off => {
+            let evals: Vec<Ext> = (0..1usize << la).map(|j| b.load_ext(msg, 2 * j as i64)).collect();
+            emit_fold_round(b, log_folded, la, group_bits, beta, &evals)
+        }
+        Precompiles::On => {
+            let s = index_power(b, F::two_adic_generator(log_folded + la), log_folded, group_bits, F::ONE, cells);
+            let s_inv = b.inv(s);
+            let u = b.ext_mul_base(beta, s_inv);
+            b.fold_run(msg, 1usize << la, u)
+        }
+    }
 }
 
 /// One input round's Merkle authentication, `verify_batch`'s loop with the pruned multiproof
@@ -766,28 +799,12 @@ fn emit_input_round_root(
     );
 }
 
-/// The reconstructed commit-phase row, Merkle-verified against the round's cap: the leaf is the
-/// sponge over `flatten_to_base(row) ‖ salt(4)` — the commit-phase tree is over `Challenge`,
-/// flattened to base coefficients by `ExtensionMmcs`, and it is a hiding MMCS, so the row carries
-/// four salts exactly as an input round's does.
-fn emit_commit_root(
-    b: &mut Builder,
-    evals: &[Ext],
-    openings: Array<Felt>,
-    path: Array<Felt>,
-    index_bits: &[Felt],
-    cap: [Digest; 4],
-    name: &str,
-) {
-    let arity = evals.len();
-    let msg = b.alloc((2 * arity + SALT_ELEMS) as u64);
-    for (j, e) in evals.iter().enumerate() {
-        b.store_ext(msg, (2 * j) as i64, *e);
-    }
-    // The salts sit right after the round's `arity − 1` siblings on the tape.
-    b.copy_cells(msg, (2 * arity) as i64, openings.base, (2 * (arity - 1)) as i64, SALT_ELEMS);
+/// The committed row, hinted whole with its four salts into `msg` (Cut E1) — exactly the leaf
+/// message `flatten_to_base(row) ‖ salt(4)` of the round's hiding MMCS — sponged in place, walked,
+/// and compared against the round's cap.
+fn emit_commit_root(b: &mut Builder, log_arity: usize, msg: Ptr, path: Array<Felt>, index_bits: &[Felt], cap: [Digest; 4], name: &str) {
     let leaf = Digest(b.alloc(DIGEST_ELEMS as u64));
-    hash::sponge(b, msg, 2 * arity + SALT_ELEMS, leaf);
+    hash::sponge(b, msg, 2 * (1usize << log_arity) + SALT_ELEMS, leaf);
     let levels = path.len / DIGEST_ELEMS;
     let out = Digest(b.alloc(DIGEST_ELEMS as u64));
     hash::merkle_walk(b, leaf, &index_bits[..levels], path.base, levels, out);
@@ -846,7 +863,7 @@ fn bit_indicator(b: &mut Builder, bits: &[Felt], v: usize) -> Felt {
 /// instances have equal `zeta_next`s), and the reference's per-(batch, matrix, point) inverses
 /// are then the same elements — its `batch_multiplicative_inverse` is an optimisation, not
 /// semantics.
-fn emit_reduced_openings<S: VerifierShape>(
+fn emit_reduced_openings_compiled<S: VerifierShape>(
     b: &mut Builder,
     shape: &S,
     index_bits: &[Felt],
@@ -882,12 +899,9 @@ fn emit_reduced_openings<S: VerifierShape>(
                     .copied()
                     .unwrap_or_else(|| (b.ext_constant(EF::ONE), b.ext_constant(EF::ZERO)));
                 let row = rows[ri][mi];
-                (ro, alpha_pow) = match b.precompiles() {
-                    // The compiled loop, kept as the precompile's differential reference.
-                    Precompiles::Off => reduce_compiled(b, *vals, row, inv, ro, alpha_pow, fri_alpha),
-                    // Task 8: one `REDUCE` instruction for the whole run.
-                    Precompiles::On => b.reduce(*vals, row, inv, ro, alpha_pow, fri_alpha),
-                };
+                // The compiled loop, kept as the precompile's differential reference (`Off`).
+                let (ro2, ap2) = reduce_compiled(b, *vals, row, inv, ro, alpha_pow, fri_alpha);
+                (ro, alpha_pow) = (ro2, ap2);
                 acc.insert(h, (alpha_pow, ro));
             }
         }
@@ -895,13 +909,98 @@ fn emit_reduced_openings<S: VerifierShape>(
     // The blowup-height entry exists only for a constant (height-1) trace; its reduced opening
     // must then be zero (`FinalPolyMismatch`, `verifier.rs:858-864`). No RV32 instance has
     // `degree_bits == 0`, so this never fires for this machine's shapes.
-    if let Some(&(_, ro)) = acc.get(&LOG_BLOWUP) {
+    if let Some(&(_, ro)) = acc.get(&shape.log_blowup()) {
         let (c0, c1) = b.ext_parts(ro);
         let zero = b.zero();
         b.assert_eq(c0, zero, "reduced opening at the blowup height");
         b.assert_eq(c1, zero, "reduced opening at the blowup height");
     }
     acc.into_iter().rev().map(|(h, (_, ro))| (h, ro)).collect()
+}
+
+/// One query's batch-opening reduction: the `Off` reference (the compiled loop, run by run) or
+/// Cut D's chip path. Same value, same order — heights descending.
+fn emit_reduced_openings<S: VerifierShape>(
+    b: &mut Builder,
+    shape: &S,
+    index_bits: &[Felt],
+    index_cells: Option<Ptr>,
+    fri_alpha: Ext,
+    opened: &QueryOpenings,
+    rows: &[Vec<Array<Felt>>],
+) -> Vec<(usize, Ext)> {
+    match b.precompiles() {
+        Precompiles::Off => emit_reduced_openings_compiled(b, shape, index_bits, fri_alpha, opened, rows),
+        Precompiles::On => emit_reduced_openings_layout(b, shape, index_bits, index_cells, fri_alpha, opened, rows),
+    }
+}
+
+/// Cut D: the query points and the `(height, point)` inverse keys are computed exactly as the
+/// compiled form computes them, in first-use order; the keys and alpha are stored once into this
+/// query's key buffer; each height's runs — in `(round, matrix, point)` order, so alpha's powers
+/// run as in `open_inputs` — become one chain of back-to-back `REDUCE` rows whose result lands in
+/// the height's cell of this query's result buffer, read back once.
+fn emit_reduced_openings_layout<S: VerifierShape>(
+    b: &mut Builder,
+    shape: &S,
+    index_bits: &[Felt],
+    index_cells: Option<Ptr>,
+    fri_alpha: Ext,
+    opened: &QueryOpenings,
+    rows: &[Vec<Array<Felt>>],
+) -> Vec<(usize, Ext)> {
+    let log_global = shape.log_global_max_height();
+    let mut xs: BTreeMap<usize, Felt> = BTreeMap::new();
+    let mut slot_of: BTreeMap<(usize, bool), usize> = BTreeMap::new();
+    let mut invs: Vec<Ext> = Vec::new();
+    let mut runs: BTreeMap<usize, Vec<(Array<Ext>, Array<Felt>, usize)>> = BTreeMap::new();
+    for (ri, mats) in opened.rounds.iter().enumerate() {
+        for (mi, m) in mats.iter().enumerate() {
+            let h = m.log_height;
+            if !xs.contains_key(&h) {
+                let cells = index_cells.map(|p| (p, log_global - h));
+                let x = index_power(b, F::two_adic_generator(h), h, &index_bits[log_global - h..], F::GENERATOR, cells);
+                xs.insert(h, x);
+            }
+            let x = xs[&h];
+            for (pi, (z, vals)) in m.points.iter().enumerate() {
+                let key = (h, pi == 1);
+                let slot = match slot_of.get(&key) {
+                    Some(&s) => s,
+                    None => {
+                        let (z0, z1) = b.ext_parts(*z);
+                        let d0 = b.sub(z0, x);
+                        let diff = b.ext_from_parts(d0, z1);
+                        invs.push(b.ext_inv_checked(diff, "opening point matches the query point"));
+                        slot_of.insert(key, invs.len() - 1);
+                        invs.len() - 1
+                    }
+                };
+                runs.entry(h).or_default().push((*vals, rows[ri][mi], slot));
+            }
+        }
+    }
+    // The blowup-height entry exists only for a constant trace (`verifier.rs:858-864`); no RV32
+    // instance has one, and the chip path does not carry its zero check.
+    assert!(!runs.contains_key(&shape.log_blowup()), "a reduced opening at the blowup height");
+    let keys = b.alloc(2 + 2 * invs.len() as u64);
+    b.store_ext(keys, 0, fri_alpha);
+    for (s, inv) in invs.iter().enumerate() {
+        b.store_ext(keys, 2 + 2 * s as i64, *inv);
+    }
+    let res = b.alloc(2 * runs.len() as u64);
+    let mut cells = Vec::with_capacity(runs.len());
+    for (j, (&h, rs)) in runs.iter().rev().enumerate() {
+        let mut chain = Vec::with_capacity(rs.len());
+        for &(vals, row, slot) in rs {
+            let key = b.offset(keys, 2 + 2 * slot as i64);
+            chain.push(ReduceRun { vals, row, key });
+        }
+        let cell = b.offset(res, 2 * j as i64);
+        b.reduce(&chain, keys, cell);
+        cells.push((h, cell));
+    }
+    cells.into_iter().map(|(h, cell)| (h, b.load_ext(cell, 0))).collect()
 }
 
 /// One run of the batch-opening reduction, as a compiled DSL loop: `acc += Σ_k
@@ -1031,6 +1130,18 @@ fn emit_query_point(b: &mut Builder, log_height: usize, index_bits: &[Felt], shi
     )
 }
 
+/// `base·g^{rev(index, log_rev)}`: Cut F's `POW` run when the bits are cells (`On`), the compiled
+/// ladder otherwise (`Off`, the reference).
+fn index_power(b: &mut Builder, g: F, log_rev: usize, bits: &[Felt], base: F, cells: Option<(Ptr, usize)>) -> Felt {
+    match cells {
+        Some((buf, off)) if b.precompiles() == Precompiles::On => {
+            assert_eq!(bits.len(), log_rev, "POW starts its ladder at g itself: the run is the whole index");
+            b.span("bit_selected_power", |b| b.pow_run(buf, off, log_rev, g, base))
+        }
+        _ => bit_selected_power(b, g, log_rev, bits, base),
+    }
+}
+
 /// `base · g^{reverse_bits_len(index, log_rev)}` from the low `index_bits.len()` bits of `index`:
 /// bit `k` selects the compile-time constant `g^{2^{log_rev−1−k}}`.
 fn bit_selected_power(
@@ -1040,15 +1151,17 @@ fn bit_selected_power(
     index_bits: &[Felt],
     base: F,
 ) -> Felt {
-    let mut x = b.constant(base);
-    for (k, &bit) in index_bits.iter().enumerate() {
-        let c = g.exp_u64(1u64 << (log_rev - 1 - k));
-        let cm1 = b.constant(c - F::ONE);
-        let t = b.mul(bit, cm1);
-        let sel = b.add_const(t, F::ONE);
-        x = b.mul(x, sel);
-    }
-    x
+    b.span("bit_selected_power", |b| {
+        let mut x = b.constant(base);
+        for (k, &bit) in index_bits.iter().enumerate() {
+            let c = g.exp_u64(1u64 << (log_rev - 1 - k));
+            let cm1 = b.constant(c - F::ONE);
+            let t = b.mul(bit, cm1);
+            let sel = b.add_const(t, F::ONE);
+            x = b.mul(x, sel);
+        }
+        x
+    })
 }
 
 // ───────────────────────────────────────────────────────────── the measurement

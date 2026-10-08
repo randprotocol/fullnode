@@ -24,6 +24,15 @@ All 26 validator keys are one operator's ("Key separation", below). The release 
 it has been followed are under "Rolling out a new commit"; the rules for the next cut are under
 "Cut policy".
 
+Since this table was written: **chain 19** (v0.6.7, genesis `a3defc93…228a`, 2026-10-01,
+`deploy/cut-chain19-genesis.sh`) and **chain 20** (v0.6.8, genesis `6210cf07…5135`, live since
+2026-10-01 06:17 UTC, `deploy/cut-chain20-genesis.sh`, `deploy/cut-records/chain20.record`; now on
+v0.7.1) — chain 20 is the chain that runs. **Chain 21** is prepared, not cut:
+`deploy/cut-chain21-genesis.sh` carries chain 20's shape and value plus the `fees` section
+(`burn_base`, `burn_floor`; "The next cut: the `fees` section (chain 21)", below) and needs a
+build at d6cc16f5 or later on every node (signers read the genesis hash from the node or take
+`--genesis-hash`, so they need it only to know `fee_rules`).
+
 ## Topology rules
 
 - A chain is defined by its genesis file. Every node needs the identical file; validators are the keys
@@ -259,6 +268,58 @@ filesystem (`--min-free-disk-mb`, default 1024, names the directory and the flag
 tick with a warning in the log — the 2026-09-24 stall was seven full disks and a health check that
 said `ok` right up to the crash loop. A roll waits on `ok`, so a droplet near full now stops the
 roll at that node instead of at the next one that fills.
+
+## The compact-blocks flag day
+
+The compact-blocks release changes the consensus-topic wire format and is not backward
+compatible: an old node cannot decode `GossipMessage::CompactProposal` or the new
+`SyncRequest::Transactions` / `SyncResponse::Transactions` variants, and a new leader publishes
+only the compact form. A new node still accepts an old leader's full proposal.
+
+**What an old node does with a compact proposal.** It reports the undecodable message to
+gossipsub as `Reject` (`network/mod.rs` ~884-891, "this peer's fault"), so it neither votes on it
+nor relays it. This node configures no gossipsub peer scoring: the gossipsub construction at
+`network/mod.rs:539-555` sets none and nothing in `network/` mentions `with_peer_score`, peer
+score parameters, thresholds or a graylist. So a Reject only drops the message at that node and
+does not forward it; it does not penalise the forwarding peer or prune a mesh. The effect is
+that old nodes between new nodes are relay holes for compact proposals, while the new-to-new
+mesh is unaffected. Restarting a node onto the new build is the whole cure.
+
+**Roll order and why.** Observers and archives first: they relay consensus gossip and serve
+fetches, and while old they would drop (and Reject) compact proposals; rolling them early costs
+nothing, because a new node still accepts full proposals from old leaders. Then every validator
+at once, with `deploy/roll-all.sh` — not staggered as in step 3 above, and not in batches.
+
+**A mixed validator set is a stopped chain, not a slow one.** A commit needs three consecutive
+certified views: chained HotStuff finalises a block only when it, its child and its grandchild are
+certified in views `v`, `v + 1`, `v + 2` (`consensus/commit_rule.rs:28-40`, and the live path's
+`consecutive_views` check at `consensus/hotstuff.rs:51-53, :1564-1573`). Leaders rotate by view
+over the validator list, `validators[view % n]` (`types/validator.rs:87-93`). An old-build
+validator cannot decode a compact proposal, so while more than a third of the stake is on the old
+build, every view led by a new-build validator gets no quorum and times out. Views led by
+old-build validators still certify (a new node accepts a full proposal), but a block commits only
+when three consecutive views are all led by old-build validators — with the two builds' leaders
+interleaved in the rotation that need never happen. **Commits can stop entirely**: blocks certify
+on the old leaders' views, none commit, and the uncommitted tree grows toward `max_tree_blocks`
+(512, `consensus/mod.rs:389`). Once more than two thirds of the stake runs the new build, both
+builds' leaders' views certify again. There is no genesis field and no chain cut.
+
+**Procedure.** Observers and archives with `deploy/update-droplet.sh` (one at a time). For the
+validators, `deploy/roll-all.sh <rand-node> <rand> <sha256 of rand-node> [<sha256 of rand>]`
+(with `RELEASE_SUMS` and `RELEASE_SIG`, or `ALLOW_UNSIGNED=1`): it installs the signed binaries
+on every host in `deploy/nodes.env` with no restart, then stops every node together and starts
+every node together, node A last, each stop and start run in parallel over ssh. It is an
+all-stop all-start, not a sequential roll: the chain commits nothing for the startup verify (its
+header comment says about 15 minutes) whatever the fleet size, and no mixed validator set ever
+runs. It is the only validator procedure for this release: any staggered or batched restart is
+the mixed window above. It has no observers-first mode; run `update-droplet.sh` on those
+beforehand.
+
+**Rollback.** All together as well, by the same script: `deploy/roll-all.sh` with the previous
+release's `rand-node` and `rand` and their shas — the bytes `roll-all.sh` kept on each host as
+`/root/rand-node.prev`. A partial rollback is the same mixed window: while more than a third of
+the stake is on the old build, the new leaders' views time out and commits can stop. Nothing is
+written to disk that the old build cannot read, so the rollback needs no resync.
 
 ## Release trust
 
@@ -1386,7 +1447,7 @@ After launch: `rand_getTokens.incremental_root == true`, and a validator's `meta
 to a build before this one on such a chain is not possible (it cannot parse the genesis) — the
 same rule as every genesis field before it.
 
-## The next cut: the `fees` section (fee feedback, unreleased)
+## The next cut: the `fees` section (chain 21)
 
 **What it is.** A top-level genesis section, `"fees": { "burn_base": true }`, with three optional
 booleans (`docs/fees.md` §1.3). `burn_base` destroys every bundle's `BUNDLE_BASE` instead of paying
@@ -1405,15 +1466,82 @@ at genesis under `META_FEES` (JSON; written on every new database, the default `
 section), and `reload_ledger` sets it again from the file on every restart; served as
 `rand_getLimits.fee_rules`.
 
-**Rolling it out.** `rand-node genesis --fees FEES.JSON` writes the section (`docs/cli.md`), or
-the cut script splices it in the way it splices `bridge`. Every validator must run a build that knows the section before a
-genesis carries it — an older node does not refuse the file: `Genesis` has no
-`deny_unknown_fields`, so it silently ignores the section, derives a different genesis hash and
-so cannot join the chain.
-After launch: `rand_getLimits.fee_rules.burn_base == true`, and `rand_getSupply.base_fees_burned`
-grows by `BUNDLE_BASE` per included bundle with `invariant_holds` still `true` — under
-`fee_rules.burn_floor == true`, by each bundle's whole floor (`docs/fees.md` §1.3's worked Deploy
-and Call).
+**Recommended for chain 21: `{"burn_base": true, "burn_floor": true}`** (the user's decision,
+2026-10-08), the faithful EIP-1559 form of `docs/fees.md` §1.3. Under it the whole floor a bundle
+was checked against is destroyed — `BUNDLE_BASE` (0.001 RAND) for a transfer, a bond, a token action
+or an attestation; the base plus 100 000 units a word for a Deploy; the tier-exact
+`1 000 000 + gas_price · GAS_LIMIT + byte_price · ⌈bytes / 1024⌉` for a Call under chain 20's gas
+section; `BRIDGE_BURN_FEE` for a BridgeBurn; an Invoke's cell fee with it — and the proposer keeps
+only the tip above it, `fee − floor` (a 0.0012 RAND transfer burns 0.001 and tips 0.0002; a 0.0041
+RAND tier-14 Call burns 0.0040639 and tips 0.0000361). With chain 20's floating prices (§1.2) that
+is the point: a proposer gains nothing from a block that lifts a price, and a busy chain shrinks the
+supply instead of paying its proposers more. Nothing a sender pays changes — the floors and the
+wallet defaults are the same numbers; only where the floor goes differs. What every client sees:
+`rand_getLimits.fee_rules` = `{"burn_base": true, "subsidy_net_of_fees": false, "burn_floor":
+true}` (`null` on chains 14–20), and `rand_getSupply.base_fees_burned`, a decimal string inside
+`burned` and on the right of the supply identity, `"0"` at launch and growing by each included
+bundle's floor with `invariant_holds` still `true`. The wallets, randscan and the bridge site should
+read both: a wallet's fee preview should say the floor is burned, the explorer and the bridge
+site's supply panel should show `base_fees_burned` beside `registration_fees_burned`; a client that
+does not know either field still decodes the reply (each is an added key).
+
+**Not `subsidy_net_of_fees`.** It needs an `aggregation` section, and this build refuses any
+genesis with one at startup (`check_build_runs_genesis`): the admitted shapes and the recursion
+fixtures were measured for the retired 2-in-2-out guest and must be re-measured against the
+hidden-asset bundle (b053a76) before aggregation is activated. Until then the flag can only be
+refused (`rand-node genesis --fees` errors without `--aggregation`), so chain 21 does not carry it,
+and the cut script refuses a genesis that sets it, naming that reason. It rides with the cut that
+re-activates aggregation.
+
+**Rolling it out.** `rand-node genesis --fees FEES.JSON` writes the section (`docs/cli.md`).
+`deploy/cut-chain21-genesis.sh` — derived from chain 20's script, chain 20's shape and value cut
+from a snapshot of chain 20 — writes `fees.json` itself (`{"burn_base": true, "burn_floor":
+true}`), passes it as `--fees`, asserts the section on the finished file, refuses
+`subsidy_net_of_fees`, and proves the section is part of the genesis hash by re-deriving the hash
+with the section removed, and with `burn_floor` removed, and refusing if either does not move. The
+real cut refuses a `rand-node` without `--fees` (any build before d6cc16f5, v0.7.1 included);
+`DRY_RUN=1` skips the section, loudly, on such a binary. Every validator must run a build that knows
+the section before a genesis carries it — an older node does not refuse the file: `Genesis` has no
+`deny_unknown_fields`, so it silently ignores the section, derives a different genesis hash and so
+cannot join the chain. So **every node** — the 26 validators, both archives, and any RPC node the
+website, randscan or the bridge relayer reads — runs the d6cc16f5+ build from chain 21's first
+block. A signer binds chain 21's genesis hash without re-deriving it from the file: the `rand`
+wallet (and the relayer, which is a `rand`) reads it from the node (`rand_getGenesisHash`, under
+`binding_domain: 1`), and the offline operator commands (`rand-node admit sign`) take it as
+`--genesis-hash`, so a v0.6.8+ `rand` still signs for chain 21 (check any other signer, e.g. the
+bridge repo's `rand-bridge-gov`, for where it takes the hash before the cut).
+Ship them the same build anyway, in the cut's `clients:` line: only it knows `fee_rules`
+(`RpcClient::fee_rules`; no wallet fee preview says yet that the floor is burned — a follow-up),
+and the clients repo apps, randscan and the website WASM vendor their fullnode version as before
+(the chain-20 record's lesson).
+
+**After launch:** `NODE=… deploy/cut-chain21-genesis.sh check-limits <first node's RPC> <genesis
+file>` reads `rand_getLimits.fee_rules.burn_base == true` and `.burn_floor == true` (with
+`subsidy_net_of_fees == false`), `rand_getSupply.base_fees_burned == "0"` and `invariant_holds ==
+true`, beside every value carried from chain 20. Run it before the first bundle lands, or with
+`BASE_FEES_BURNED_ANY=1` once one has.
+
+## The next cut: the proposer/aggregator split (`fees.proposer_share_bps`, `fees.prove_base`; unreleased)
+
+**What it is.** Two optional numbers in the same `fees` section (`docs/fees.md` §1.3,
+`docs/compute-optimization.md` §6.2–§6.3), each only on a chain with an `aggregation` section
+(`rand-node init` refuses either without one: `ProposerShareWithoutAggregation`,
+`ProveBaseWithoutAggregation`; a share over 10000 is `ProposerShareOutOfRange`; `prove_base: 0` is
+`ProveBaseZero` — leave the field out).
+`proposer_share_bps` keeps that share of the base to the proposer at inclusion and buckets the rest
+beside the excess as proving share (swept back to the proposer if no aggregate covers it);
+`prove_base` raises every bundle's floor by a proving share bucketed whole and never burned. Each is
+hashed only when set, after `burn_floor`'s bytes (`proposer_share_bps` ‖ be32, `prove_base` ‖ be64),
+so it ships with a chain cut. Served as `rand_getLimits.fee_rules.proposer_share_bps` and
+`.prove_base`; `rand_estimateFee` includes `prove_base`.
+
+**Recommended values, deferred.** `"proposer_share_bps": 4000, "prove_base": 600000` (40 % of the
+base to the proposer, 0.0006 RAND proving floor) — the proposal's numbers — once aggregation is
+admitted on the chain being cut. Until then no cut should carry either: both need the `aggregation`
+section, which waits on the production-proof measurement (`docs/aggregation.md`, "Before enabling
+aggregation"). After launch: `fee_rules` serves both, `rand_estimateFee {"kind":"bundle"}` answers
+`1600000`, a proposer's `rewards` grow by 400 000 per included transfer, and `invariant_holds`
+stays `true` through covers and sweeps.
 
 ## The next cut: audit v6's staking fields (STAKE-2)
 

@@ -482,8 +482,24 @@ whose section sets no flag `true`, which hashes and runs as no section at all. I
 `burn_base` a bundle's `BUNDLE_BASE` is destroyed rather than paid to the proposer, and under
 `burn_floor` (issue #135; only ever `true` beside `burn_base`) its whole settled floor — the base
 plus a Deploy's per-word term, or a Call's tier-exact gas and byte terms — but what a sender pays is
-unchanged — every floor is the same number — so a wallet changes nothing. A node that predates the
-field answers without it, which a wallet reads as `null`.
+unchanged — every floor is the same number — so a wallet changes nothing for those three flags.
+
+Two more keys carry the proposer/aggregator split (`docs/compute-optimization.md` §6.2–§6.3), each
+`null` when the genesis leaves it out: `proposer_share_bps` (a number, 0..=10 000: the proposer's
+part of the base it keeps at inclusion, the rest bucketed as proving share — informational, nothing
+a sender pays moves) and `prove_base` (a decimal string like every amount: units every bundle's
+floor rises by on an aggregating chain). **`prove_base` does move what a sender pays**:
+`rand_estimateFee` already includes it, and a wallet computing a floor itself (the `gas` section's
+call floor, `gas::fee_floor`) adds it — `randprotocol-client`'s `ChainLimits::prove_base` and
+`RpcClient::prove_base` read it. Either key set makes `fee_rules` non-`null`:
+
+```json
+"fee_rules": { "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false,
+               "proposer_share_bps": 4000, "prove_base": "600000" }
+```
+
+A node that predates the field answers without it, which a wallet reads as `null`; one that
+predates the two split keys answers without them, read as `null` (no split, no `prove_base`).
 
 `gas_price`, `byte_price` and `gas_metering` are this **node's** own gas policy (spec
 `2026-09-28-gas-model-design.md` §4.1, Phase 0) *or* the chain's own `gas` section (§4.2, §7.1,
@@ -589,6 +605,11 @@ Params: `[spec]`, one of `{"kind":"bundle"}`, `{"kind":"deploy","words":n,"publi
 for a plain transfer: `1000000`. A deploy of more words than the chain's program cap (4096, or the
 genesis file's `max_program_words`) is an invalid-params error (`-32602`) naming the cap — the same
 program admission would refuse, so a wallet can ask before it proves.
+
+On an aggregating chain whose genesis sets `fees.prove_base` (`docs/fees.md` §1.3,
+`rand_getLimits.fee_rules.prove_base`) every kind's answer below includes it: every bundle's floor
+rises by `prove_base`, so `{"kind":"bundle"}` is `1000000 + prove_base` (`1600000` at the
+proposal's 600 000).
 
 `public_words` (optional, default 0) is the deploy's public input length. Public words are paid for
 per word like code, so the fee is the deploy fee of `n + m` words. More than the chain's
@@ -856,7 +877,7 @@ Params: `[]`. Result:
 {
   "height": 1998, "head_hash": "…", "view": 2251, "high_qc_view": 2250,
   "syncing": false, "sync_target": 1998,
-  "sync_inflight_age_ms": null, "sync_failures": 0, "sync_late_batches": 0,
+  "sync_inflight_age_ms": null, "sync_failures": 0, "sync_late_batches": 0, "compact_fetched": 0,
   "peer_count": 5, "connected_peers": 5, "reserved_peers": 5, "ws_clients": 3, "refused_cache": 0,
   "verify_queue": 0, "mempool_size": 0,
   "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
@@ -884,6 +905,12 @@ otherwise looks identical to a node that is behind and working:
 - `sync_late_batches` — batches applied *after* their request had been given up on. Progress, not
   failure, but a rising count means the give-up is firing on requests that were still alive, so the
   peers being asked are slower than the timeout.
+- `compact_fetched` — transaction bodies this node fetched by hash for compact proposals and
+  placed since start (compact-blocks spec 2026-10-08 §5.3): what a proposal named that neither
+  its mempool nor its recent-transactions cache held. A validator that joined late or missed a
+  burst of gossip fetches a few and stops; a count that climbs with every block says its
+  transaction gossip is not arriving, and each of those proposals waits a round trip before the
+  node can vote.
 - `connected_peers` — peers with an open connection, which are the only ones sync can ask for
   blocks. `peer_count` counts every entry in this node's peer map. Since 2026-09-24 a gossiped
   `Status` from an author this node holds no connection to no longer creates one (an entry
@@ -1228,7 +1255,10 @@ by `randprotocol-node`'s `build.rs` — `git rev-parse HEAD` in a checkout, else
 `"unknown"` — with `-dirty` appended when tracked files differ from that commit (untracked files do
 not count). This
 is how a caller outside the fleet (an explorer, a survey script) confirms which build a node is
-running without shelling in; the deploy's own sha-compare stays on the binary.
+running without shelling in; the deploy's own sha-compare stays on the binary. `fri_profile` is
+the genesis profile's name, and it binds two parameter sets, both constants of the build: the
+inner RV32 proofs' (80 queries, rate ⅛, 20 grinding bits at production) and the rVM aggregate's
+(92, rate ¼, 24 since circuits `71e1a04`) — `docs/aggregation.md`, "Before enabling aggregation".
 
 ### `rand_getGenesisHash`
 Params: `[]`. Result: the genesis hash as hex, e.g. `"605eb783…"`.
@@ -1713,6 +1743,19 @@ renders four kinds: `create_multisig` (`salt`, `threshold`, `signer_count`), `mu
 notes in `public_notes`. The four actions are tags 34–37, appended after `Invoke`; **if `feat/rpl3`
 (perps), which also appends at 34, merges first, these renumber** — an encoder must derive tags
 from the enum. All four are refused (`UnsupportedAction("multisig")`) on a chain without the section.
+
+### Unreleased — the proposer/aggregator split: `fee_rules.proposer_share_bps` and `prove_base` (genesis-gated; no chain carries it yet)
+
+Additive. `rand_getLimits.fee_rules` gains `proposer_share_bps` (a number) and `prove_base` (a
+decimal string), each `null` when the genesis `fees` section leaves it out; either set makes
+`fee_rules` non-`null`, so on such a chain the three older flags appear too (as `false` where
+unset). Every existing `fee_rules` object gains the two keys as `null`. Under `prove_base`
+(aggregating chains only, `docs/fees.md` §1.3) every bundle's floor rises by it and
+`rand_estimateFee` includes it in every kind's answer; a fee at the old floor is refused
+`FeeTooLow` naming the new minimum. Under `proposer_share_bps` a proposer's `rewards` grow at
+inclusion by its share of the base only, and `rand_getUnsealed`'s `excess` (and so
+`rand_getAggregate`'s `proving_share`) carries the rest of the base beside the tip and
+`prove_base`. `rand_getSupply` is unchanged: nothing new crosses the pool boundary.
 
 ### Unreleased — fee feedback: the genesis `fees` section and the burned base (genesis-gated; no chain carries it yet)
 

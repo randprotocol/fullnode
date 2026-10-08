@@ -64,6 +64,16 @@ Under `fees.burn_floor` beside it (issue #135) the whole floor is destroyed inst
 per-word term and a Call's tier-exact gas and byte terms with the base — and the proving share is
 `fee − floor`, so an aggregator is never paid a priced term the chain burned.
 
+Under the genesis `fees.proposer_share_bps` (`docs/fees.md` §1.3, `docs/compute-optimization.md`
+§6.2; aggregating chains only) the base itself splits: the proposer keeps `proposer_share_bps /
+10 000` of the base it keeps today (`BUNDLE_BASE`, nothing under `burn_base`) and the remainder
+joins the proving share in the bundle's one bucket entry — covered, it pays the aggregator; expired,
+the sweep returns it to the proposer like any excess. Under `fees.prove_base` (§6.3) every bundle's
+floor rises by `prove_base`, which is bucketed whole and never burned — and the node's pool prices
+with it too (`Pooled.floor`, `current_floor`), so it is never read as surplus and a call priced out
+by it is not offered. At 4 000 bps and 0.0006 RAND
+a 0.0018 RAND transfer pays the proposer 0.0004 at inclusion and buckets 0.0014.
+
 ### 3.2 A block subsidy in new RAND
 
 At launch fee volume is near zero and nobody runs a GPU for it. So the sealing block mints a
@@ -116,6 +126,13 @@ so one read per daemon, never one per pass that a transient RPC failure could ab
 `aggregation::minted_subsidy(subsidy(n), shares, &fees) + shares`, the ledger's own function
 (pinned by `the_aggregate_pass_seals_the_ledgers_payout_under_subsidy_net_of_fees`). A third-party
 aggregator must do the same.
+
+The shares are always the node's bucket entries, `rand_getUnsealed`'s `excess` — never recomputed
+from a raw transaction. Under `fees.proposer_share_bps` and `fees.prove_base` an entry already
+carries the aggregator's part of the base and `prove_base` beside the tip, so nothing in what the
+daemon seals changes (pinned by `the_aggregate_pass_seals_shares_that_include_prove_base_and_the_base_part`);
+a share re-derived as `fee − BUNDLE_BASE` would miss the base part and seal a note the ledger never
+appends.
 
 ### 3.4 Supply accounting
 
@@ -269,6 +286,41 @@ both have to clear before a genesis may switch it on.
    ≥ 256 GB host, tight, and a projection until proved. On that tree
    `admitted_shapes[].aggregate_program_digest` is `c90b3f0a…74d8` and the node admits tiers
    {20, 21, 22} (`recursion/docs/04-phase2-row-cuts.md`, `docs/node-hardware.md` §4).
+   **rVM phase 3 and rate ¼ (circuits `71e1a04`, vendored 2026-10-08;
+   `recursion/docs/06-phase3-fold-reduce.md`, `docs/07-rvm-rate-quarter.md`):** the production
+   inner proof is 585 686 cpu rows (still tier 20) and `admitted_shapes[].aggregate_program_digest`
+   at the production bundle shape is
+   **`dc350ecf6b60af74f4bb032bdf607c3fa0fbd6317705f0b1077e71b455e38ba0`** (was `c90b3f0a…74d8`;
+   phase 3 moved it, rate ¼ did not; `inner_vk_digest` and the interface vectors are unchanged).
+   Tiers stay {20, 21, 22} production (N = 1 at 20, N = 2–3 at 21, N = 4–5 at 22) and
+   {18, 19, 20} test.
+   - **The N ceiling: production N ≤ 5.** The reduce chip runs a fixed 196 480 rows a production
+     inner proof (39 296 test) and `REDUCE_MAX_LOG_HEIGHT` is 20, so an aggregate verifies only
+     while `N × rows + 1 ≤ 2^20`: **N ≤ 5 production, N ≤ 26 test**. Tier 22 holds N ≤ 7 by cpu
+     rows, so inside it the ceiling is the reduce chip's. The rVM refuses to prove past it, and the
+     node mirrors the rVM's own `machine::max_reduce_n`: `verify_aggregate` refuses an aggregate
+     over more bundles by name before any key work (`agg_executor::check_n_ceiling`), and
+     `rand-node genesis` refuses an `--aggregation` whose `max_covers` exceeds it for an admitted
+     shape (`check_admitted_covers`). Raising it is a key-shape change (one more rung of the
+     constant doubles the range).
+   - **The reduce height is canonical in (program, N).** The node verifies through the rVM's
+     `verify_aggregate`, which passes the list's N to `Machine::verify_n`; any declared reduce
+     height but `canonical_reduce_log_height(program, N)` is refused before a key is built (the
+     key-cache DoS guard; it replaces the node's own reduce-flag check). `warm_aggregation` warms
+     one key per admitted tier and canonical height for N = 1..=`max_covers` — production heights
+     `2^18` / `2^19` / `2^20` at N = 1 / 2 / 3–5, so a `max_covers` of 3 is 3 tiers × 3 heights. At rate ¼ the production startup warm therefore grows from 3 to up to 9 verifier-key builds, off the consensus thread; its timing is not yet measured at rate ¼.
+   - **`fri_profile` binds two parameter sets.** A chain's `fri_profile` name fixes the inner
+     RV32 proofs' FRI parameters (80 queries, rate ⅛, 20 grinding bits) *and* the rVM's own
+     (92 queries, rate ¼, 24 grinding bits at production), both constants of the vendored
+     constraint set, not genesis fields; the proven floor is the same ≈ 86 bits (over the rVM's
+     real chip shapes, under the whitepaper's unique-decoding bound: 86.41 at 80 / rate ⅛ / 20,
+     86.38 at 92 / rate ¼ / 24 — circuits `docs/07` §1).
+   - **Every node on this build.** A chain with an `aggregation` section needs every node on this
+     build or later: the rVM verifier keys (the reduce chip's preprocessed region, the rate-¼
+     profile) and the aggregate program digest changed, so an older node refuses every aggregate
+     this build accepts and pins a digest no current program produces. No genesis in
+     `deploy/genesis-chain*.json` (chains 6–20, the newest 20) has an `aggregation` section, and
+     `deploy/cut-chain21-genesis.sh` refuses one, so no chain is affected today.
 
 ### Testing: the recursion fixtures (issue #131)
 
@@ -329,6 +381,9 @@ chain never depends on a GPU being online.
 
 - The subsidy amount, the halving interval, and whether issuance has a hard cap.
 - The proving share: a fixed fraction of the bundle fee, or the whole fee above the floor.
+  *Built, genesis-gated:* `fees.proposer_share_bps` buckets a fraction of the base beside the
+  whole excess, and `fees.prove_base` floors it (`docs/fees.md` §1.3; the proposal's values are
+  4 000 bps and 0.0006 RAND).
 - The sealing window `k`: how many blocks an aggregate may lag, and whether a bundle can be
   covered twice (it should not; the first finalised aggregate wins, later ones covering it are
   invalid).

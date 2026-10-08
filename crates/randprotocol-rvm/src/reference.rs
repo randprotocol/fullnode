@@ -19,7 +19,7 @@
 
 use crate::isa::EF;
 use crate::shape::{
-    ProofBatch, ShapeKey, VerifierShape, CAP_HEIGHT, LOG_BLOWUP, LOG_FINAL_POLY_LEN, MAX_LOG_ARITY,
+    ProofBatch, ShapeKey, VerifierShape, CAP_HEIGHT, LOG_FINAL_POLY_LEN, MAX_LOG_ARITY,
 };
 use p3_air::BaseAir;
 use p3_batch_stark::BatchTranscript;
@@ -184,7 +184,7 @@ impl BaseAir<Val> for ShapeAir {
 /// `research`'s `FriParameters`, rebuilt: the `Config`'s PCS owns the only copy and keeps it private.
 fn fri_params<S: VerifierShape>(shape: &S, val_mmcs: &ValMmcs) -> FriParameters<ChallengeMmcs> {
     FriParameters {
-        log_blowup: LOG_BLOWUP,
+        log_blowup: shape.log_blowup(),
         log_final_poly_len: LOG_FINAL_POLY_LEN,
         max_log_arity: MAX_LOG_ARITY,
         num_queries: shape.num_queries(),
@@ -228,6 +228,7 @@ where
     }
 
     let n = shape.instances();
+    let log_blowup = shape.log_blowup();
     let airs: Vec<ShapeAir> = (0..n)
         .map(|i| ShapeAir {
             width: shape.widths()[i],
@@ -432,11 +433,11 @@ where
         .map(|(round, o)| o.checked_log_arity(MAX_LOG_ARITY).ok_or(ReplayError::LogArity(round)))
         .collect::<Result<_, _>>()?;
     let log_global_max_height =
-        log_arities.iter().sum::<usize>() + LOG_BLOWUP + LOG_FINAL_POLY_LEN;
+        log_arities.iter().sum::<usize>() + log_blowup + LOG_FINAL_POLY_LEN;
     let expected = rounds
         .iter()
         .flat_map(|(_, mats)| {
-            mats.iter().map(|(domain, _)| log2_strict_usize(domain.size()) + LOG_BLOWUP)
+            mats.iter().map(|(domain, _)| log2_strict_usize(domain.size()) + log_blowup)
         })
         .max()
         .expect("the batch opens at least one matrix");
@@ -510,7 +511,7 @@ where
                 .map(|(domain, points)| Dimensions {
                     // The claimed-evaluation count, never the proof's row length.
                     width: points[0].1.len(),
-                    height: domain.size() << LOG_BLOWUP,
+                    height: domain.size() << log_blowup,
                 })
                 .collect();
             let bits_reduced = log_global_max_height
@@ -536,7 +537,7 @@ where
     let num_rounds = fri.commit_phase_commits.len();
     let mut commit_group_indices: Vec<Vec<usize>> = vec![Vec::new(); num_rounds];
     let mut commit_rows: Vec<Vec<Vec<Vec<EF>>>> = vec![Vec::new(); num_rounds];
-    let log_final_height = LOG_BLOWUP + LOG_FINAL_POLY_LEN;
+    let log_final_height = log_blowup + LOG_FINAL_POLY_LEN;
     let folding: Folding = TwoAdicFriFolding(PhantomData);
     let mut folded_evals = Vec::with_capacity(indices.len());
     for (query, (&index, ro)) in indices.iter().zip(reduced_openings).enumerate() {

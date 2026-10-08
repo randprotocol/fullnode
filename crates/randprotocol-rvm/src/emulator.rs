@@ -21,17 +21,31 @@ use crate::isa::{DecodeError, Instr, Op, Program, EF, F, MEM_LIMIT, NUM_REGS};
 /// M5.2's `memory` table asks only for strict monotonicity, which `16·clk + k` gives.
 pub const TS_PER_ROW: u32 = 16;
 
-/// The `REDUCE` run's timestamp slots, shared with the `reduce` chip's memory messages (Task 8):
-/// the 11 descriptor cells at slots `0..11`, the per-column reads reusing slots `11..14`
-/// (distinct addresses per column, which is all the memory table's monotonicity asks), and the
-/// four write-backs at slots 14–15 (distinct addresses from the reads).
+/// The `REDUCE` run's timestamp slots, shared with the reduce chip's memory messages (Cut D): the
+/// entry's inverse key at slots 0–1, the chain's alpha at 2–3 (chain starts only), each column's
+/// three reads reusing slots 11–13 (distinct addresses per column, which is all the memory table's
+/// monotonicity asks), and the chain's result at 14–15.
+pub const TS_KEY0: u32 = 0;
+pub const TS_KEY1: u32 = 1;
+pub const TS_ALPHA0: u32 = 2;
+pub const TS_ALPHA1: u32 = 3;
 pub const TS_RUN_PZ0: u32 = 11;
 pub const TS_RUN_PZ1: u32 = 12;
 pub const TS_RUN_PX: u32 = 13;
-pub const TS_WB_ACC0: u32 = 14;
-pub const TS_WB_ACC1: u32 = 15;
-pub const TS_WB_APOW0: u32 = 14;
-pub const TS_WB_APOW1: u32 = 15;
+pub const TS_RES0: u32 = 14;
+pub const TS_RES1: u32 = 15;
+
+/// A `FOLD` run's slots (Cut E2): every phase-1 row reads its value at slots 0–1 (distinct
+/// addresses per row), the last row writes the result at 14–15.
+pub const TS_FOLD_Y0: u32 = 0;
+pub const TS_FOLD_Y1: u32 = 1;
+pub const TS_FOLD_RES0: u32 = 14;
+pub const TS_FOLD_RES1: u32 = 15;
+
+/// A `POW` run's slots (Cut F): every row reads its bit at slot 0 (distinct addresses per row),
+/// the last row writes the output at 15.
+pub const TS_POW_BIT: u32 = 0;
+pub const TS_POW_OUT: u32 = 15;
 
 /// One cell read or written, at the timestamp `16·clk + k` of its slot in the row.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -65,19 +79,49 @@ pub enum PermKind {
     Compress { sib: u64, bit: bool },
 }
 
-/// One run of the batch-opening reduction a `REDUCE` row dispatches (Task 8): the descriptor
-/// the chip's first row reads, its run length, and the run constants. The accumulator and the
-/// running power are chained in and out through the descriptor in memory.
+/// One `REDUCE` dispatch (Cut D): the layout entry, its column count, the key and alpha it ran
+/// with, and the accumulator/running power on entry and on exit (equal at a chain's seam).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ReduceEvent {
-    pub descr_ptr: u64,
-    pub vals_base: u64,
-    pub row_base: u64,
+    pub entry: u32,
     pub len: u32,
     pub inv: [F; 2],
-    pub acc: [F; 2],
-    pub apow: [F; 2],
     pub alpha: [F; 2],
+    pub acc_in: [F; 2],
+    pub apow_in: [F; 2],
+    pub acc_out: [F; 2],
+    pub apow_out: [F; 2],
+}
+
+/// One `FOLD` dispatch (Cut E2): the row it read, the point, the result.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct FoldEvent {
+    pub msg: u64,
+    pub arity: u32,
+    pub u: [F; 2],
+    pub ys: [[F; 2]; 8],
+    pub out: [F; 2],
+}
+
+/// One `POW` dispatch (Cut F).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PowEvent {
+    pub base: u64,
+    pub off: u32,
+    pub len: u32,
+    pub g: F,
+    pub s0: F,
+    pub out: F,
+}
+
+/// The state a carrying entry hands to the next row's `REDUCE`.
+#[derive(Clone, Copy)]
+struct ReduceCarry {
+    entry: u32,
+    clk: u32,
+    acc: [F; 2],
+    apow: [F; 2],
+    alpha: [F; 2],
 }
 
 /// One executed instruction.
@@ -99,6 +143,8 @@ pub struct Event {
     pub mem: Vec<MemAccess>,
     pub perm: Option<PermEvent>,
     pub reduce: Option<ReduceEvent>,
+    pub fold: Option<FoldEvent>,
+    pub pow: Option<PowEvent>,
 }
 
 /// A completed run: the event log, the public values the program appended, the number of witness
@@ -149,13 +195,24 @@ pub enum ExecError {
     InverseOfZero { pc: u32 },
     HintExhausted { pc: u32 },
     OutOfCycles(usize),
-    /// A `REDUCE` descriptor declared a zero-length run: there is nothing to reduce, and a
-    /// `REDUCE` of zero columns is a build-time mistake (the program must not emit it).
+    /// A `REDUCE` layout entry declared a zero-length run: there is nothing to reduce, and a
+    /// `REDUCE` of zero columns is a build-time mistake (the program must not register it;
+    /// `machine::check_layout` refuses it at registration too).
     ReduceZeroLength { pc: u32 },
+    /// A `REDUCE` naming no entry of the program's layout, or an entry naming a cell outside the
+    /// `2^24`-cell address space (`isa::layout_entry_in_bounds`, the registration check's bound).
+    ReduceLayout { pc: u32, entry: u64 },
+    /// A chain's hand-over broken: a carrying entry not followed, on the very next row, by a
+    /// `REDUCE` of the next entry; or a continuation entry dispatched without that carry.
+    ReduceChain { pc: u32, entry: u64 },
     /// A `COMPRESS` whose `rd` is neither 0 nor 1: the index bit of a Merkle level is a bit, and
     /// a program that hands it anything else is a build-time mistake (the chip's `BIT` is
     /// boolean, so the row would be unprovable anyway).
     NonBooleanBit { pc: u32 },
+    /// A FOLD whose immediate is not 2, 4 or 8.
+    FoldArity { pc: u32, arity: u64 },
+    /// A POW immediate whose run is empty or leaves the 64 bits.
+    PowShape { pc: u32, imm: u64 },
 }
 
 /// Run `p` against `witness` for at most `max_cycles` instructions.
@@ -169,6 +226,7 @@ pub fn execute(p: &Program, witness: &[F], max_cycles: usize) -> Result<Executio
     let mut mem: HashMap<u64, F> = HashMap::new();
     let mut run = Execution { events: Vec::new(), public: Vec::new(), hints_read: 0, max_addr: 0 };
     let mut pc: u32 = 0;
+    let mut chain: Option<ReduceCarry> = None;
 
     loop {
         let clk = run.events.len();
@@ -186,10 +244,17 @@ pub fn execute(p: &Program, witness: &[F], max_cycles: usize) -> Result<Executio
         let rd = reg(instr.rd, "rd", pc)? as usize;
         let ra = reg(instr.ra, "ra", pc)? as usize;
         let op = instr.op;
+        if let Some(c) = &chain {
+            if op != Op::Reduce {
+                return Err(ExecError::ReduceChain { pc, entry: c.entry as u64 });
+            }
+        }
 
         let mut mems: Vec<MemAccess> = Vec::new();
         let mut perm = None;
         let mut reduce = None;
+        let mut fold = None;
+        let mut pow = None;
         let mut a = [F::ZERO; 2];
         let mut b_val = if op.b_is_register() { [F::ZERO; 2] } else { [instr.b, F::ZERO] };
         let mut d = [F::ZERO; 2];
@@ -338,49 +403,50 @@ pub fn execute(p: &Program, witness: &[F], max_cycles: usize) -> Result<Executio
             }
             Op::Reduce => {
                 a[0] = regs[ra];
-                let descr = a[0].as_canonical_u64();
-                for k in 0..11u64 {
-                    bounded(pc, descr + k)?;
-                }
-                let mut d = [F::ZERO; 11];
-                for (k, c) in d.iter_mut().enumerate() {
-                    *c = read_at(&mem, &mut mems, clk, k as u32, descr + k as u64);
-                }
-                let vals_base = d[0].as_canonical_u64();
-                let row_base = d[1].as_canonical_u64();
-                let len = d[2].as_canonical_u64() as usize;
-                if len == 0 {
+                let id = instr.b.as_canonical_u64();
+                let le = *p.reduce_layout.get(id as usize).ok_or(ExecError::ReduceLayout { pc, entry: id })?;
+                if le.len == 0 {
                     return Err(ExecError::ReduceZeroLength { pc });
                 }
-                bounded(pc, vals_base + 2 * len as u64 - 1)?;
-                bounded(pc, row_base + len as u64 - 1)?;
-                let (inv, mut acc, mut apow, alpha) = ([d[3], d[4]], [d[5], d[6]], [d[7], d[8]], [d[9], d[10]]);
-                for k in 0..len as u64 {
+                // The layout's own legality, exactly `machine::check_layout`'s: every base and the
+                // length inside the 2^24-cell space before any sum (so no top can wrap), then every
+                // top. An illegal entry is the layout's fault, not a run's: `ReduceLayout`.
+                if !crate::isa::layout_entry_in_bounds(&le) {
+                    return Err(ExecError::ReduceLayout { pc, entry: id });
+                }
+                let len = le.len as u64;
+                let inv = [read_at(&mem, &mut mems, clk, TS_KEY0, le.key), read_at(&mem, &mut mems, clk, TS_KEY1, le.key + 1)];
+                let (mut acc, mut apow, alpha) = if le.chain_start {
+                    if chain.is_some() {
+                        return Err(ExecError::ReduceChain { pc, entry: id });
+                    }
+                    let alpha = [read_at(&mem, &mut mems, clk, TS_ALPHA0, le.alpha), read_at(&mem, &mut mems, clk, TS_ALPHA1, le.alpha + 1)];
+                    ([F::ZERO; 2], [F::ONE, F::ZERO], alpha)
+                } else {
+                    match chain.take() {
+                        Some(c) if c.entry as u64 == id && c.clk + 1 == clk => (c.acc, c.apow, c.alpha),
+                        _ => return Err(ExecError::ReduceChain { pc, entry: id }),
+                    }
+                };
+                let (acc_in, apow_in) = (acc, apow);
+                for k in 0..len {
                     let pz = [
-                        read_at(&mem, &mut mems, clk, TS_RUN_PZ0, vals_base + 2 * k),
-                        read_at(&mem, &mut mems, clk, TS_RUN_PZ1, vals_base + 2 * k + 1),
+                        read_at(&mem, &mut mems, clk, TS_RUN_PZ0, le.vals + 2 * k),
+                        read_at(&mem, &mut mems, clk, TS_RUN_PZ1, le.vals + 2 * k + 1),
                     ];
-                    let px = read_at(&mem, &mut mems, clk, TS_RUN_PX, row_base + k);
-                    let diff = ext([pz[0], pz[1]]) - px;
-                    let t = ext(apow) * diff;
-                    let t = t * ext(inv);
+                    let px = read_at(&mem, &mut mems, clk, TS_RUN_PX, le.row + k);
+                    let diff = ext(pz) - px;
+                    let t = ext(apow) * diff * ext(inv);
                     acc = parts(ext(acc) + t);
                     apow = parts(ext(apow) * ext(alpha));
                 }
-                write_at(&mut mem, &mut mems, clk, TS_WB_ACC0, descr + 5, acc[0]);
-                write_at(&mut mem, &mut mems, clk, TS_WB_ACC1, descr + 6, acc[1]);
-                write_at(&mut mem, &mut mems, clk, TS_WB_APOW0, descr + 7, apow[0]);
-                write_at(&mut mem, &mut mems, clk, TS_WB_APOW1, descr + 8, apow[1]);
-                reduce = Some(ReduceEvent {
-                    descr_ptr: descr,
-                    vals_base,
-                    row_base,
-                    len: len as u32,
-                    inv,
-                    acc: [d[5], d[6]],
-                    apow: [d[7], d[8]],
-                    alpha,
-                });
+                if le.carry {
+                    chain = Some(ReduceCarry { entry: id as u32 + 1, clk, acc, apow, alpha });
+                } else {
+                    write_at(&mut mem, &mut mems, clk, TS_RES0, le.res, acc[0]);
+                    write_at(&mut mem, &mut mems, clk, TS_RES1, le.res + 1, acc[1]);
+                }
+                reduce = Some(ReduceEvent { entry: id as u32, len: le.len, inv, alpha, acc_in, apow_in, acc_out: acc, apow_out: apow });
             }
             Op::Sponge => {
                 a[0] = regs[ra];
@@ -452,13 +518,60 @@ pub fn execute(p: &Program, witness: &[F], max_cycles: usize) -> Result<Executio
                 }
                 perm = Some(PermEvent { ptr, input, output, kind: PermKind::Compress { sib, bit } });
             }
+            Op::Fold => {
+                pair(instr.rd, "rd", pc)?;
+                a[0] = regs[ra];
+                d = [regs[rd], regs[rd + 1]];
+                let arity = instr.b.as_canonical_u64();
+                if !matches!(arity, 2 | 4 | 8) {
+                    return Err(ExecError::FoldArity { pc, arity });
+                }
+                let msg = a[0].as_canonical_u64();
+                let res = msg + 2 * arity + crate::isa::FOLD_SALT_CELLS;
+                bounded(pc, res + 1)?;
+                let mut ys = [[F::ZERO; 2]; 8];
+                for (k, y) in ys.iter_mut().enumerate().take(arity as usize) {
+                    *y = [
+                        read_at(&mem, &mut mems, clk, TS_FOLD_Y0, msg + 2 * k as u64),
+                        read_at(&mem, &mut mems, clk, TS_FOLD_Y1, msg + 2 * k as u64 + 1),
+                    ];
+                }
+                let yse: Vec<EF> = ys[..arity as usize].iter().map(|y| ext(*y)).collect();
+                let out = parts(fold_dft_horner(&yse, ext(d)));
+                write_at(&mut mem, &mut mems, clk, TS_FOLD_RES0, res, out[0]);
+                write_at(&mut mem, &mut mems, clk, TS_FOLD_RES1, res + 1, out[1]);
+                fold = Some(FoldEvent { msg, arity: arity as u32, u: d, ys, out });
+            }
+            Op::Pow => {
+                pair(instr.rd, "rd", pc)?;
+                a[0] = regs[ra];
+                d = [regs[rd], regs[rd + 1]];
+                let imm = instr.b.as_canonical_u64();
+                let (off, len) = (imm % 256, imm / 256);
+                if len == 0 || len >= 256 || off + len > 64 {
+                    return Err(ExecError::PowShape { pc, imm });
+                }
+                let base = a[0].as_canonical_u64();
+                bounded(pc, base + 64)?;
+                let (mut g, mut s) = (d[0], d[1]);
+                for t in 0..len {
+                    let bit = read_at(&mem, &mut mems, clk, TS_POW_BIT, base + off + len - 1 - t);
+                    if bit != F::ZERO && bit != F::ONE {
+                        return Err(ExecError::NonBooleanBit { pc });
+                    }
+                    s *= F::ONE + bit * (g - F::ONE);
+                    g = g.square();
+                }
+                write_at(&mut mem, &mut mems, clk, TS_POW_OUT, base + 64, s);
+                pow = Some(PowEvent { base, off: off as u32, len: len as u32, g: d[0], s0: d[1], out: s });
+            }
             Op::Halt => next_pc = pc,
         }
 
         for access in &mems {
             run.max_addr = run.max_addr.max(access.addr);
         }
-        run.events.push(Event { clk, pc, next_pc, instr, a, b_val, d, mem: mems, perm, reduce });
+        run.events.push(Event { clk, pc, next_pc, instr, a, b_val, d, mem: mems, perm, reduce, fold, pow });
         if op == Op::Halt {
             return Ok(run);
         }
@@ -487,6 +600,31 @@ fn ext(c: [F; 2]) -> EF {
 fn parts(x: EF) -> [F; 2] {
     let c = x.as_basis_coefficients_slice();
     [c[0], c[1]]
+}
+
+/// The fold run's coefficient table for one arity (Cut E2): row `k` (the row reading `y_k`),
+/// column `j` = `(1/a)·c_k^{−(a−1−j)}`, `c_k = g_a^{rev(k)}`, zero for `j ≥ a` — so after the
+/// phase-1 rows, accumulator `j` holds `B_{a−1−j}` (the inverse DFT, spec §2.3) and phase 2's
+/// Horner reads them top coefficient first.
+pub fn fold_coefficients(log_arity: usize) -> Vec<[F; 8]> {
+    use p3_field::TwoAdicField;
+    let a = 1usize << log_arity;
+    let g = F::two_adic_generator(log_arity);
+    let inv_a = F::from_usize(a).inverse();
+    (0..a)
+        .map(|k| {
+            let w = g.exp_u64(p3_util::reverse_bits_len(k, log_arity) as u64).inverse();
+            core::array::from_fn(|j| if j < a { inv_a * w.exp_u64((a - 1 - j) as u64) } else { F::ZERO })
+        })
+        .collect()
+}
+
+/// `Σ_m B_m·u^m` through [`fold_coefficients`] — the emulator's fold, and so the chip's
+/// reference. `tests/fold_identity.rs` pins it to `TwoAdicFriFolding::fold_row`.
+pub fn fold_dft_horner(ys: &[EF], u: EF) -> EF {
+    let c = fold_coefficients(ys.len().trailing_zeros() as usize);
+    let d: Vec<EF> = (0..ys.len()).map(|j| ys.iter().zip(&c).fold(EF::ZERO, |acc, (y, row)| acc + *y * row[j])).collect();
+    d.iter().fold(EF::ZERO, |acc, &dj| acc * u + dj)
 }
 
 fn reg(idx: u8, slot: &'static str, pc: u32) -> Result<u8, ExecError> {

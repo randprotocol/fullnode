@@ -590,9 +590,10 @@ enum Cmd {
         #[arg(long, value_name = "UNITS")]
         program_state_cell_fee: Option<u64>,
         /// Fee feedback (`docs/fees.md` §1.3): the `fees` section, as a `FeesConfig` JSON file
-        /// (`{"burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true}`, each optional).
-        /// `Genesis::build` validates it — `burn_floor` needs `burn_base`, `subsidy_net_of_fees`
-        /// needs an aggregation section. Omitted entirely when absent; a section with no `true`
+        /// (`{"burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true,
+        /// "proposer_share_bps": 4000, "prove_base": 600000}`, each optional).
+        /// `Genesis::build` validates it — `burn_floor` needs `burn_base`; `subsidy_net_of_fees`,
+        /// `proposer_share_bps` (at most 10000) and `prove_base` need an aggregation section. Omitted entirely when absent; a section with no `true`
         /// flag contributes nothing to the genesis hash either.
         #[arg(long, value_name = "FEES.JSON")]
         fees: Option<PathBuf>,
@@ -2449,6 +2450,11 @@ async fn main() -> Result<()> {
                                 // or no aggregate could ever be verified against it.
                                 randprotocol_node::agg_executor::check_admitted_shape(&admitted.shape)
                                     .map_err(|e| anyhow::anyhow!("--admitted-shape {s}: {e}"))?;
+                                // And the rVM's N ceiling (circuits docs/06 §3, production N ≤ 5):
+                                // a `max_covers` past it would admit cover sets no aggregator
+                                // can prove.
+                                randprotocol_node::agg_executor::check_admitted_covers(&admitted.shape, cfg.max_covers)
+                                    .map_err(|e| anyhow::anyhow!("--aggregation {spec} with --admitted-shape {s}: {e}"))?;
                                 Ok(admitted)
                             })
                             .collect::<Result<Vec<_>>>()?;
@@ -5007,7 +5013,7 @@ mod tests {
                 window: 256,
                 admitted_shapes: vec![],
             }));
-            l.set_fees(FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None });
+            l.set_fees(FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None });
             l.set_aggregators(
                 [(
                     kp.address(),
@@ -5093,7 +5099,7 @@ mod tests {
         let payee = SpendKey([7; 8]);
         let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
         let ex = ZkExecutor::new(FriProfile::Test);
-        let rules = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true) };
+        let rules = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true), proposer_share_bps: None, prove_base: None };
         let deploy = randprotocol_core::Action::Deploy { base_pc: 0, words: vec![0x13; 9], public: vec![] };
         let floor = randprotocol_core::gas::fee_floor(&deploy);
         assert!(floor > randprotocol_core::gas::BUNDLE_BASE, "a Deploy's floor is over the base");
@@ -5140,6 +5146,79 @@ mod tests {
                 1000u64.max(node.raw.fee() - randprotocol_core::gas::BUNDLE_BASE),
                 "shares {shares}: not the amount a share re-derived as fee − BUNDLE_BASE would seal"
             );
+        }
+    }
+
+    /// The fee split in the daemon (`docs/compute-optimization.md` §6.2–§6.3): under
+    /// `fees { proposer_share_bps: 4000, prove_base: 600000 }` the ledger buckets a covered
+    /// transfer's tip, its `prove_base` whole and the aggregator's 60 % of the base in one entry,
+    /// which the node serves as `rand_getUnsealed`'s `excess`. The pass seals from that entry —
+    /// nothing in what it seals changes — so its envelope opens to `Ledger::derived_commitment`
+    /// under the same rules, with and without `subsidy_net_of_fees`; a share re-derived from the
+    /// raw transaction (`fee − BUNDLE_BASE`) would miss the base part and be lost.
+    #[tokio::test]
+    async fn the_aggregate_pass_seals_shares_that_include_prove_base_and_the_base_part() {
+        use randprotocol_core::ledger::aggregation::{AggregationConfig, AggregatorEntry};
+        use randprotocol_core::ledger::{FeesConfig, Ledger};
+        use randprotocol_core::gas::BUNDLE_BASE;
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payee = SpendKey([7; 8]);
+        let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let (prove_base, tip) = (600_000u64, 25u64);
+        let shares = tip + prove_base + BUNDLE_BASE * 6_000 / 10_000;
+        for net in [false, true] {
+            let rules = FeesConfig {
+                burn_base: None,
+                subsidy_net_of_fees: net.then_some(true),
+                burn_floor: None,
+                proposer_share_bps: Some(4000),
+                prove_base: Some(prove_base),
+            };
+            let mut node = moving_node(kp.address(), payout.clone());
+            node.raw.bundle.as_mut().unwrap().fee = BUNDLE_BASE + prove_base + tip;
+            node.excess.set(shares);
+            node.limits = Some(serde_json::json!({ "fee_rules": {
+                "burn_base": false, "subsidy_net_of_fees": net, "burn_floor": false,
+                "proposer_share_bps": 4000, "prove_base": prove_base.to_string(),
+            } }));
+            let mut want_rules = rules.clone();
+            want_rules.burn_base = Some(false);
+            want_rules.burn_floor = Some(false);
+            want_rules.subsidy_net_of_fees = Some(net);
+            assert_eq!(node.fee_rules().await.unwrap(), want_rules, "net {net}: the node's rules reach the pass whole");
+            let tx = aggregate_pass(&node, &kp, 7, |_, _, _| Ok(b"the aggregate proof".to_vec()))
+                .await
+                .unwrap()
+                .expect("one bundle to cover");
+
+            let mut l = Ledger::new(7, [0; 8], Default::default(), &ex);
+            l.set_aggregation(Some(AggregationConfig {
+                bond: 100,
+                max_covers: 3,
+                subsidy_base: 1000,
+                halving_blocks: 1,
+                window: 256,
+                admitted_shapes: vec![],
+            }));
+            l.set_fees(rules);
+            l.set_aggregators(
+                [(
+                    kp.address(),
+                    AggregatorEntry { public_key: kp.public_key().clone(), bond: 100, payout: payout.clone(), nonce: 0, unbonding: None },
+                )]
+                .into(),
+            );
+            l.set_unsealed_fees([(node.raw.hash(), (shares, kp.address(), u64::MAX))].into());
+            let cm = l.derived_commitment(&tx.action, &ex).expect("the ledger derives the payout note");
+
+            let randprotocol_core::Action::Aggregate { envelope, .. } = &tx.action else { panic!("not an aggregate: {tx:?}") };
+            let (_, opened) = randprotocol_zkvm::address::envelope_from_core(envelope)
+                .open_as_receiver(cm, &payee.viewing_key())
+                .unwrap_or_else(|| panic!("net {net}: the envelope opens to the ledger's note"));
+            let paid = if net { shares.max(1000) } else { 1000 + shares };
+            assert_eq!(opened.amount, paid, "net {net}: the shares carry prove_base and 60 % of the base");
+            assert_ne!(shares, node.raw.fee() - BUNDLE_BASE, "net {net}: not a share re-derived as fee − BUNDLE_BASE");
         }
     }
 

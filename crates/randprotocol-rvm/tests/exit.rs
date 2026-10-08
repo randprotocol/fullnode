@@ -77,8 +77,9 @@ fn fifty_production_profile_bundle_proofs_are_accepted() {
 ///   `InvalidPowWitness`; the other two are its input-opening `CapMismatch`, caught here one
 ///   binding earlier.
 /// - `Header` and `CommitPhaseOpenings` are not statically nameable at all: the tampered offset
-///   `k % len` lands on different header words / different commit-phase rounds as `k` varies, so
-///   the expected name is computed from the offset (`CommitPhasePaths` and both `Input*` segments
+///   `k % len` lands on different header words / different commit-phase rounds (and, since Cut
+///   E1, on the query's own slot or a sibling) as `k` varies, so the expected name is computed
+///   from the offset and the replay's query index (`CommitPhasePaths` and both `Input*` segments
 ///   stay static: their per-round runs are wide enough that every `k % len` in these tests lands
 ///   in round 0).
 fn tamper_table() -> Vec<(Segment, &'static str)> {
@@ -101,25 +102,33 @@ fn tamper_table() -> Vec<(Segment, &'static str)> {
 
 /// The refusal step expected for a tamper of `seg` at segment offset `off`, given the shape.
 /// The two dynamic cases from the table above.
-fn expected_step(seg: Segment, off: usize, shape: &InnerShape) -> String {
+fn expected_step(seg: Segment, off: usize, shape: &InnerShape, samples: &[u64]) -> String {
     match seg {
         Segment::Header => format!("header word {off}"),
         Segment::CommitPhaseOpenings => {
-            // The segment is query-major; within a query's run, round `r` occupies
-            // `((1 << log_arities[r]) - 1) * 2 + 4` words. The tampered salt or sibling breaks
-            // that round's reconstructed leaf, so the refusal names that round's root.
-            let strides: Vec<usize> = shape
-                .log_arities
+            // The segment is query-major; within a query's run, round `r` occupies the whole row
+            // (`2·arity` words, Cut E1) then its four salts. A tampered word at the query's own
+            // slot (`index_in_group`, the index's bits `shift..shift + la`) is refused by the
+            // own-slot equality; a sibling or a salt breaks the round's leaf, so its root.
+            let strides: Vec<usize> = shape.log_arities
                 .iter()
-                .map(|&la| ((1usize << la) - 1) * 2 + randprotocol_rvm::witness::SALT_ELEMS)
+                .map(|&la| (1usize << la) * 2 + randprotocol_rvm::witness::SALT_ELEMS)
                 .collect();
             let query_stride: usize = strides.iter().sum();
+            let index = samples[off / query_stride] as usize;
             let mut at = off % query_stride;
-            for (r, &s) in strides.iter().enumerate() {
+            let mut shift = 0usize;
+            for (r, (&s, &la)) in strides.iter().zip(shape.log_arities.iter()).enumerate() {
                 if at < s {
-                    return format!("commit phase root[{r}]");
+                    let own = (index >> shift) & ((1usize << la) - 1);
+                    return if at / 2 == own {
+                        format!("commit phase own slot[{r}]")
+                    } else {
+                        format!("commit phase root[{r}]")
+                    };
                 }
                 at -= s;
+                shift += la;
             }
             unreachable!("the offset is inside a query's run");
         }
@@ -142,7 +151,8 @@ fn refuse_all(profile: FriProfile, n: usize) {
         let (_, start, len) = *tape.segments.iter().find(|(s, _, _)| *s == seg).unwrap();
         assert!(len > 0, "{seg:?} is empty");
         let off = k % len;
-        let want_step = expected_step(seg, off, &shape);
+        let samples = randprotocol_rvm::reference::replay(profile, &shape, &key, &p.proof).unwrap().index_samples;
+        let want_step = expected_step(seg, off, &shape, &samples);
         tape.words[start + off] += F::ONE;
         match execute(&vp.program, &tape.words, MAX_CYCLES) {
             Err(ExecError::InverseOfZero { pc }) => assert_eq!(
@@ -191,20 +201,30 @@ fn the_cycle_budget_per_inner_proof_is_pinned() {
     assert_eq!(r.mem_accesses, p.mem_accesses);
     assert_eq!(r.witness_words, p.witness_words);
     assert_eq!(r.program_instrs, p.program_instrs);
+    // Phase 3 (Task 0): the register table's access count — the memory target is under 2^21 after
+    // Cut D, and it is pinned like the RAM count.
+    assert_eq!(randprotocol_rvm::tables::cpu::register_accesses(&exec.events).len(), common::phase3_attribution().reg_accesses,
+               "the REG access count");
     // The spike counted 43 562 permutations for this workload; the program must be in that region
     // (it hashes ~46 extra compressions per query because it walks restored per-query paths).
     assert!(r.permutations >= 43_562 && r.permutations < 60_000, "{r:?}");
-    // Spec §7's decision point, measured: 5 250 623 cpu rows per inner proof — 10× over 2^19.
-    // Task 7's FRIFOLD/EXPBITS precompiles cannot close that gap: the fold rounds and the
-    // bit-selected exponentiations they replace are ~3% of the measured rows (the FRI
-    // batch-opening reduction dominates at ~60%, and the allocator's spill traffic is ~50% of
-    // arithmetic rows — neither precompile touches either), so their own exit assertion
-    // (≤ 2^19 with precompiles) is unreachable and Task 7 is not implemented. The decision and
-    // its arithmetic are recorded in `docs/00-recursion-vm.md`; this assertion pins the regime
-    // the decision was made in, so a future optimization that changes it must update both.
-    assert!(r.cpu_rows > 1 << 19,
-            "under the 2^19 decision point now: Task 7's precompiles must be reconsidered, and \
-             docs/00-recursion-vm.md's decision paragraph updated");
+    // Spec §7's decision point, measured in M5.1: 5 250 623 cpu rows per inner proof — 10× over
+    // 2^19 — where a fold and an exponentiation precompile were ~3 % of the rows and so not built
+    // (`docs/00-recursion-vm.md`, "The precompile decision"). Re-taken in phase 3 (2026-10-05,
+    // `docs/06-phase3-fold-reduce.md`) at 893 606 rows, where the fold, the index powers, the
+    // sibling select and the reduction's descriptor bookkeeping were 37.9 %: Cut D (the reduction
+    // layout preprocessed), E1 (the own slot by one LOADE), E2 (`FOLD` = 28) and F (`POW` = 29)
+    // landed in their bands (E1 below its band, accepted), at 585 686. The phase's gate was one inner verification in
+    // tier 19 (≤ 2^19 − 1 = 524 287 rows); it was **not** reached — 61 399 rows above it, since
+    // even Cut F's band floor (569 942) was above it — and it was not widened (the phase's
+    // ruling 6). The memory tables' 2^22 → 2^21 is the delivered result; what is left is the two
+    // Merkle spans (`input_root` 248 151 + `commit_root` 120 640 rows, 133 827 of them
+    // reloads), docs/06 §7's next lever. This pins the landed count and its tier, so a change to
+    // either — the next lever landing, or a regression — must update docs/06 and docs/00.
+    assert_eq!(r.cpu_rows, 585_686, "phase 3's landing: one production inner verification, 61 399 rows above the 2^19 − 1 gate");
+    assert_eq!(randprotocol_rvm::machine::Tier::for_cycles(r.cpu_rows), Some(randprotocol_rvm::machine::Tier(20)),
+               "tier 20: above the phase-3 gate (2^19 − 1), which was not reached and not widened — docs/06's residual must be re-decided");
+    assert!(r.cpu_rows > (1 << 19) - 1, "under the 2^19 − 1 gate now: docs/06 §7's residual and docs/00's decision paragraph must be updated");
     // The committed digest is the *production* shape's, so it is checked here rather than in the
     // in-suite reproducibility test (which builds the Test shape and would see a different one).
     // `digest_hex` is `[F; 4]` as 32 big-endian hex bytes, the spelling `Program::code_hash` uses.
@@ -281,20 +301,24 @@ fn the_committed_program_digest_is_reproducible() {
 // ── M5.2 Task 10: the test-profile exit twin ──────────────────────────────────────────────────
 
 /// The Task-10 twin: **the post-cut verifier program over one real test-profile bundle proof,
-/// proved and verified natively** — 230 950 rows, tier 18 since phase 2's row cuts (461 988 rows
-/// at tier 19 in constraint set 8, 441 643 in constraint set 6), with the exact shape of Task 10's
-/// production exit (tier 20, 893 606 rows). `#[ignore]`d for its cost: the tier-19 twin was
+/// proved and verified natively** — 169 366 rows at phase 3's end (Cut F; 202 198 after Cut D,
+/// 230 950 after phase 2's row cuts), tier 18 (461 988 rows at tier 19 in constraint set 8, 441 643
+/// in constraint set 6), with the exact shape of Task 10's production exit (tier 20, 585 686
+/// rows). `#[ignore]`d for its cost: the tier-19 twin was
 /// killed at 78.7 GB live on a 48 GB box (`recursion/docs/04-phase2-row-cuts.md` §"The prover's
 /// live heap", against a 94.2 GB Linux peak); one height shorter (all but the poseidon2 and reduce
 /// tables), the tier-18 twin was projected at ≈ 47–50 GB. Since the quotient-layout fork the same
 /// shape proves on this 48 GB box at 33.27 GB peak live (2026-10-05,
-/// `tests/memprofile.rs::tier19_exit_twin`, 16 threads; `recursion/docs/05-quotient-layout.md`).
+/// `tests/memprofile.rs::tier19_exit_twin`, 16 threads; `recursion/docs/05-quotient-layout.md`),
+/// at 24.86 GB after phase 3's Cut D, and at 26.88 GB at phase 3's end (2026-10-06; this test
+/// itself proved then in 92.3 s on 16 threads, verify 6.70 s, 270 760 B —
+/// `recursion/docs/06-phase3-fold-reduce.md` §3, §6).
 /// The sibling
 /// `cheating.rs`'s `a_proof_of_one_program_does_not_verify_another` covers the small-scale case;
 /// here the R1 binding is checked at full scale: a proof of the verifier program never verifies
 /// against a *different* program's key.
 #[test]
-#[ignore = "the M5.2 Task-10 twin: post-cut program, tier 18; the same shape proved on this 48 GB box at 33.27 GB live, 2026-10-05, since the quotient-layout fork (docs/05; tier 19 was killed at 78.7 GB live, docs/04); run alone: cargo +1.98.1 test -p recursion --release --test exit twin -- --ignored --nocapture"]
+#[ignore = "the M5.2 Task-10 twin: post-cut program, 169 366 rows, tier 18; proved on this 48 GB box at 26.88 GB live, 2026-10-06, at phase 3's end (docs/06; 33.27 GB at the quotient-layout fork, docs/05; tier 19 was killed at 78.7 GB live, docs/04); run alone: cargo +1.98.1 test -p recursion --release --features parallel --test exit twin -- --ignored --nocapture"]
 fn twin_the_post_cut_verifier_program_over_one_test_profile_proof_proves_and_verifies_natively() {
     let p = common::bundle_proofs(FriProfile::Test, 1).pop().unwrap();
     let shape = InnerShape::of(FriProfile::Test, p.proof.tier, p.proof.program_log_height,
@@ -307,7 +331,7 @@ fn twin_the_post_cut_verifier_program_over_one_test_profile_proof_proves_and_ver
     let t0 = std::time::Instant::now();
     let (rvm_proof, exec) = m.prove(&vp.program, &tape.words, None).unwrap();
     let prove_s = t0.elapsed().as_secs_f64();
-    assert_eq!(exec.cpu_rows(), 230_950, "the twin proves the post-cut program as measured (phase 2's row cuts: the N=1 aggregate pin 231 224 less the 274-row loop overhead; 461 988 at tier 19 in constraint set 8, 461 082 in constraint set 7 with VERIFIER-1, 441 643 in constraint set 6)");
+    assert_eq!(exec.cpu_rows(), 169_366, "the twin proves the post-cut program as measured (phase 3's Cut F: the N=1 aggregate pin 169 640 less the 274-row loop overhead; 185 206 after Cut E2; 192 982 after Cut E1; 202 198 after Cut D; 230 950 after phase 2's row cuts; 461 988 at tier 19 in constraint set 8, 461 082 in constraint set 7 with VERIFIER-1, 441 643 in constraint set 6)");
     assert_eq!(rvm_proof.tier, randprotocol_rvm::machine::Tier(18));
     let t1 = std::time::Instant::now();
     m.verify(&vp.program, &rvm_proof).unwrap();
@@ -329,11 +353,14 @@ fn twin_the_post_cut_verifier_program_over_one_test_profile_proof_proves_and_ver
 /// requirement (a 48.6 GB committed oracle, a ≥ 64 GB machine) counted one of the prover's four
 /// memory terms and is withdrawn: the tier-21 proof measured 376.9 GB on the 503 GB box, and the
 /// measured live-heap model (`recursion/docs/04-phase2-row-cuts.md` §"The prover's live heap")
-/// puts this tier-20 proof at ≈ 190–240 GB (the production RAM table stays at 2^22) — a
-/// ≥ 256 GB host. Not attempted on this 48 GB box.
+/// put this tier-20 proof at ≈ 190–240 GB with the production REG and RAM tables at 2^22. Since
+/// phase 3 (`recursion/docs/06-phase3-fold-reduce.md` §3) both declare 2^21, and the same
+/// cell-weighted model projects ≈ 110–130 GB (108 GB from the tier-18 twin measured at 26.88 GB,
+/// 123–127 GB from docs/05's 170–175 GB scaled by the cells phase 3 removed) — a ≥ 160 GB host.
+/// A projection until it runs; not attempted on this 48 GB box.
 #[test]
-#[ignore = "the M5.2 exit: production profile, post-cut program, tier 20, 893 606 rows; \
-            ~190-240 GB projected (docs/04 §live heap; tier 21 measured 376.9 GB), a >= 256 GB host. \
+#[ignore = "the M5.2 exit: production profile, post-cut program, tier 20, 585 686 rows; \
+            ~110-130 GB projected (docs/06 §3, cell-weighted; tier 21 measured 376.9 GB), a >= 160 GB host. \
             Run on the big machine: \
             cargo +1.98.1 test -p recursion --release --test exit -- --ignored --nocapture"]
 fn exit_the_verifier_program_over_one_real_cs6_bundle_proof_proves_and_verifies_natively() {
@@ -350,7 +377,7 @@ fn exit_the_verifier_program_over_one_real_cs6_bundle_proof_proves_and_verifies_
     let t0 = std::time::Instant::now();
     let (rvm_proof, exec) = m.prove(&vp.program, &tape.words, None).unwrap();
     let prove_s = t0.elapsed().as_secs_f64();
-    assert_eq!(exec.cpu_rows(), 893_606, "the exit proves the post-cut program as measured (phase 2's row cuts, `tests/pins.json`; 2 047 268 at tier 21 in constraint set 8, 2 044 506 in constraint set 7 with VERIFIER-1, 1 968 619 in constraint set 6)");
+    assert_eq!(exec.cpu_rows(), 585_686, "the exit proves the post-cut program as measured (phase 3's Cut F, `tests/pins.json`; 664 886 after Cut E2; 703 766 after Cut E1; 749 846 after Cut D; 893 606 after phase 2's row cuts; 2 047 268 at tier 21 in constraint set 8, 2 044 506 in constraint set 7 with VERIFIER-1, 1 968 619 in constraint set 6)");
     assert_eq!(rvm_proof.tier, randprotocol_rvm::machine::Tier(20));
     let t1 = std::time::Instant::now();
     m.verify(&vp.program, &rvm_proof).unwrap();
@@ -368,4 +395,50 @@ fn exit_the_verifier_program_over_one_real_cs6_bundle_proof_proves_and_verifies_
         matches!(m.prove(&vp.program, &bad_tape, None), Err(randprotocol_rvm::machine::ProveError::Exec(_))),
         "a tampered inner proof traps the program — no proof exists"
     );
+}
+
+/// Cut E1: the tape hints the committed row whole, and the program refuses a row whose own slot
+/// is not the query's folded value — before the Merkle walk, at its own named step.
+#[test]
+fn a_committed_row_whose_own_slot_differs_is_refused_at_the_own_slot_step() {
+    use randprotocol_rvm::emulator::ExecError;
+    use randprotocol_rvm::witness::Segment;
+    let p = common::bundle_proofs(FriProfile::Test, 1).pop().unwrap();
+    let shape = InnerShape::of(FriProfile::Test, p.proof.tier, p.proof.program_log_height, p.proof.input_log_height,
+        p.proof.keccak_log_height, p.proof.sha256_log_height, p.proof.public_log_height, p.proof.mem_log_height);
+    let key = InnerKey::of(FriProfile::Test, &shape);
+    let r = randprotocol_rvm::reference::replay(FriProfile::Test, &shape, &key, &p.proof).unwrap();
+    let vp = verify_rv32(&shape, &key, Checkpoints::Off);
+    let mut tape = WitnessTape::build(FriProfile::Test, &shape, &key, &p.proof).unwrap();
+    let opens = tape.segments.iter().find(|(s, _, _)| *s == Segment::CommitPhaseOpenings).unwrap().1;
+    // Query 0, round 0: index_in_group is the sampled index's low log_arity bits.
+    let idx = (r.index_samples[0] as usize) & ((1usize << shape.log_arities[0]) - 1);
+    tape.words[opens + 2 * idx] += F::ONE;
+    match execute(&vp.program, &tape.words, MAX_CYCLES) {
+        Err(ExecError::InverseOfZero { pc }) => assert_eq!(vp.program.checkpoint_at(pc), Some("commit phase own slot[0]")),
+        other => panic!("expected the own-slot refusal, got {other:?}"),
+    }
+    // The same tape under `Precompiles::Off` (the indicator dot product): the same named step.
+    let off = randprotocol_rvm::programs::verify_rv32_with(&shape, &key, Checkpoints::Off, randprotocol_rvm::dsl::Liveness::On,
+        randprotocol_rvm::programs::Precompiles::Off);
+    match execute(&off.program, &tape.words, MAX_CYCLES) {
+        Err(ExecError::InverseOfZero { pc }) => assert_eq!(off.program.checkpoint_at(pc), Some("commit phase own slot[0]")),
+        other => panic!("Off: expected the own-slot refusal, got {other:?}"),
+    }
+    // Task 5 sweep (Task 2 review): the same tamper under `Checkpoints::On` (the differential
+    // build, whose checkpoint `PUBLIC`s change the allocator's schedule around the check), and the
+    // own slot's high lane tampered instead of its low one, under every build.
+    let on = verify_rv32(&shape, &key, Checkpoints::On);
+    match execute(&on.program, &tape.words, MAX_CYCLES) {
+        Err(ExecError::InverseOfZero { pc }) => assert_eq!(on.program.checkpoint_at(pc), Some("commit phase own slot[0]")),
+        other => panic!("Checkpoints::On: expected the own-slot refusal, got {other:?}"),
+    }
+    tape.words[opens + 2 * idx] -= F::ONE;
+    tape.words[opens + 2 * idx + 1] += F::ONE;
+    for (what, prog) in [("shipped", &vp.program), ("Precompiles::Off", &off.program), ("Checkpoints::On", &on.program)] {
+        match execute(prog, &tape.words, MAX_CYCLES) {
+            Err(ExecError::InverseOfZero { pc }) => assert_eq!(prog.checkpoint_at(pc), Some("commit phase own slot[0]"), "{what}, lane 1"),
+            other => panic!("{what}, lane 1: expected the own-slot refusal, got {other:?}"),
+        }
+    }
 }

@@ -29,6 +29,24 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
   consecutive failures, and a stop-class error — the node serving another chain id, or reporting
   no `binding_domain` for the chain — still exits at once. A
   one-shot run is unchanged (`docs/aggregation.md` §3.7, `docs/cli.md`).
+- **The proposer/aggregator split** (genesis-gated, aggregating chains only; no chain carries it):
+  two optional numbers in the `fees` section (`docs/fees.md` §1.3, `docs/compute-optimization.md`
+  §6.2–§6.3). `fees.proposer_share_bps` keeps that share of the base to the proposer at inclusion
+  and buckets the rest beside the excess — paid to a covering aggregate, swept back to the proposer
+  otherwise; `fees.prove_base` raises every bundle's floor by a proving share bucketed whole and
+  never burned (under `burn_floor` the burn is the floor without it). Hashed only when set, after
+  `burn_floor`. RPC: `rand_getLimits.fee_rules.proposer_share_bps` / `.prove_base`;
+  `rand_estimateFee` and the wallet's default fees include `prove_base`. Recommended 4000 / 600000
+  once aggregation is admitted (`docs/deploy.md`).
+- **Compact blocks** (node-only wire change; a flag-day roll, no genesis field): a leader
+  publishes `GossipMessage::CompactProposal` (bincode tag 4 on the consensus topic) — the header,
+  the signature and the transaction hashes — instead of the full block. Replicas pre-screen the
+  header, rebuild the block from the mempool and a new recent-transactions cache, and fetch only
+  missing bodies by hash (`SyncRequest::Transactions`, 512 a request). At 26 validators and 2 000
+  hashes a compact frame is 166 416 bytes (`docs/node-hardware.md` §8). RPC:
+  `rand_status.compact_fetched`. An old node rejects the new variant: roll observers and archives
+  first, then every validator at once with `deploy/roll-all.sh`, rollback the same way — a mixed
+  validator set can stop commits entirely (`docs/deploy.md`).
 - **Fee feedback, the burned base** (genesis-gated: a hard fork on a chain whose genesis sets a
   flag, node-only on every other chain — no existing chain carries the section): a new genesis
   `fees` section (`docs/fees.md` §1.3). Under `fees.burn_base` every bundle's `BUNDLE_BASE` is
@@ -78,6 +96,15 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 - **Storage:** `META_FEES` (JSON, `{}` without a section) and `META_BASE_FEES_BURNED` (bincode `0`
   without the flag) are written on every new database; an existing database without them opens
   unchanged, both reading as their defaults.
+- **The chain-21 cut, prepared (not cut):** `deploy/cut-chain21-genesis.sh`, derived from chain
+  20's script — chain 20's shape and value from a snapshot of chain 20, plus the genesis
+  `fees: {burn_base: true, burn_floor: true}` written as `fees.json` and passed as `--fees`,
+  asserted on the finished file, proved part of the genesis hash (the hash re-derived without the
+  section and without `burn_floor` must move) and read back by `check-limits`
+  (`rand_getLimits.fee_rules`, `rand_getSupply.base_fees_burned == "0"`). It refuses
+  `subsidy_net_of_fees` (aggregation stays refused until its admitted shape is re-measured,
+  b053a76) and a `rand-node` without `--fees`; `SELFTEST=1` and `DRY_RUN=1` exercise it with no
+  network (`docs/deploy.md`, "The next cut: the `fees` section (chain 21)").
 
 ### The validator hot path (`feat/hot-path`)
 

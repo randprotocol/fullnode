@@ -13,7 +13,7 @@ use p3_field::PrimeCharacteristicRing;
 use randprotocol_zkvm::machine::{FriProfile, Machine};
 use randprotocol_rvm::dsl::Checkpoints;
 use randprotocol_rvm::emulator::{execute, ExecError};
-use randprotocol_rvm::isa::F;
+use randprotocol_rvm::isa::{Op, F};
 use randprotocol_rvm::programs::verify_rv32;
 use randprotocol_rvm::reference::replay;
 use randprotocol_rvm::shape::{InnerKey, InnerShape};
@@ -83,7 +83,7 @@ fn the_host_transcript_replay_reproduces_machine_verifys_acceptance() {
     assert_eq!(r.betas.len(), shape.log_arities.len());
     assert_eq!(
         r.log_global_max_height,
-        shape.log_arities.iter().sum::<usize>() + randprotocol_rvm::shape::LOG_BLOWUP
+        shape.log_arities.iter().sum::<usize>() + randprotocol_rvm::shape::INNER_LOG_BLOWUP
     );
     // The replay is the transcript, so its zeta must also satisfy the quotient identity the
     // native verifier checked: accumulator * inv_vanishing == quotient, per instance.
@@ -265,8 +265,8 @@ fn the_query_segments_are_sized_by_the_round_geometry() {
     assert_eq!(seg(Segment::InputOpenings), shape.num_queries * rows);
     assert_eq!(seg(Segment::InputPaths), shape.num_queries * levels * DIGEST_ELEMS);
 
-    // The commit phase: `arity − 1` extension siblings (two words each) plus the four salts of the
-    // query's own row, and one path per round.
+    // The commit phase: the whole `arity`-wide row (two words per value, Cut E1) plus its four
+    // salts, and one path per round.
     assert_eq!(
         seg(Segment::CommitPhaseOpenings),
         shape.num_queries * open_stride(&r.log_arities)
@@ -317,11 +317,11 @@ fn a_commit_phase_leaf_and_its_restored_path_recompute_the_rounds_commitment() {
     let mut want: Vec<F> = Vec::new();
     for q in 0..shape.num_queries {
         // The leaf: `ExtensionMmcs` flattens the arity-wide row to base, then the hiding MMCS
-        // appends the four salts the tape carries right after this round's siblings.
+        // appends the four salts the tape carries right after this round's row.
         let row: Vec<EF> = r.commit_rows[0][q][0].clone();
         assert_eq!(row.len(), arity);
         let mut msg: Vec<F> = <EF as BasedVectorSpace<F>>::flatten_to_base(row);
-        let salt_at = opens + q * open_stride + (arity - 1) * <EF as BasedVectorSpace<F>>::DIMENSION;
+        let salt_at = opens + q * open_stride + arity * <EF as BasedVectorSpace<F>>::DIMENSION;
         msg.extend_from_slice(&tape.words[salt_at..salt_at + randprotocol_rvm::witness::SALT_ELEMS]);
 
         let src = b.alloc(msg.len() as u64);
@@ -767,7 +767,12 @@ fn phase_5s_assertions_are_all_named() {
 /// `af772819…8425`. Phase 2's Cut A re-recorded it (2026-10-03: input openings are hinted into
 /// one buffer per height group and the tape's segment 11 follows that order — a change of the
 /// shared pipeline, so the Off replay moves with it; Cuts B and C are `Precompiles::On` only and
-/// leave it where Cut A put it): `af772819…8425` → `39bb6b8d…3352`.
+/// leave it where Cut A put it): `af772819…8425` → `39bb6b8d…3352`. Phase 3's Cut E1 re-recorded it
+/// (2026-10-05: the tape's `CommitPhaseOpenings` carries the whole committed row and the Off build
+/// checks the own slot by the indicator dot product — a change of the shared pipeline):
+/// `39bb6b8d…3352` → `af0c16e8…6c7b`. Phase 3's Cut E2 re-recorded it (2026-10-06: each committed row's
+/// buffer gains the two fold-result cells after its salts, `hint_array_padded`, in both builds, so
+/// every later cell address moves): `af0c16e8…6c7b` → `c580415b…5e6c`.
 #[test]
 fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
     use randprotocol_rvm::dsl::Liveness;
@@ -783,7 +788,7 @@ fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
     let off = verify_rv32_with(&shape, &key, Checkpoints::Off, Liveness::Off, randprotocol_rvm::programs::Precompiles::Off);
     assert_eq!(
         randprotocol_rvm::programs::digest_hex(&off.program),
-        "39bb6b8d94e62dd282001384d0b65294e7f024e6ef9b47381c8c96c6e1fd3352",
+        "c580415bdaccf7888e7602e793198874e39e0bda8951d11ef6e47ed029455e6c",
         "the Off replay must reproduce the pre-Task-7 stream byte for byte (plus VERIFIER-1's \
          per-round assertions, and constraint set 7's and 8's inner changes)"
     );
@@ -822,15 +827,21 @@ fn the_off_replay_reproduces_the_pre_liveness_program_byte_for_byte() {
 /// `dsl::hash::absorb_staged`, is itself a program change): `5e04fba0…2993` → `9eba7380…193d`.
 /// Re-registered for phase 2's row cuts (2026-10-03, `docs/04-phase2-row-cuts.md` — program
 /// changes all three: height-group hint buffers, `HINTN`, `COMPRESS`): `9eba7380…193d` →
-/// `5f1f6901…12df`.
+/// `5f1f6901…12df`. Re-registered for phase 3's Cut D (2026-10-05, `docs/06-phase3-fold-reduce.md` —
+/// the batch-opening reduction becomes one key buffer and one `REDUCE` chain per height per query):
+/// `5f1f6901…12df` → `8a2d166f…8509`. Re-registered for phase 3's Cut E1 (the committed row hinted
+/// whole, its own slot checked by one register-addressed `LOADE`): `8a2d166f…8509` → `9a43596f…4aa9`.
+/// Re-registered for phase 3's Cut E2 (`FOLD`, the fold in the reduce chip): `9a43596f…4aa9` →
+/// `f66aa580…6f63`. Re-registered for phase 3's Cut F (`POW`, the index powers in the reduce chip):
+/// `f66aa580…6f63` → `df3a18b8…1073`.
 #[test]
 fn the_aggregate_program_digest_is_unchanged_by_rvm_constraint_fixes() {
     let (_p, shape, key) = one_test_proof();
     let vp = randprotocol_rvm::programs::verify_rv32n(&shape, &key, Checkpoints::Off);
     assert_eq!(
         randprotocol_rvm::programs::digest_hex(&vp.program),
-        "5f1f69010b8aa4cbb6072ffd8a631fa05897c18ed3663ae2bcd136455d2612df",
-        "the aggregate program's digest at the Test fixture shape, as re-registered for phase 2's row cuts"
+        "df3a18b8d3294a591a2e8fd79f5430550cd9f09afcff6fc8aea89cc1bfaf1073",
+        "the aggregate program's digest at the Test fixture shape, as re-registered for phase 3's Cut F"
     );
 }
 
@@ -999,4 +1010,23 @@ fn breaking_one_air_constraint_on_a_non_first_instance_is_refused_at_that_instan
             other => panic!("instance {i}: expected the quotient identity to fail, got {other:?}"),
         }
     }
+}
+
+/// Cut D: the shipped build reduces through the chip — one REDUCE row per layout entry, the same
+/// chains in every query, one chain per distinct opened height.
+#[test]
+fn the_shipped_build_dispatches_one_reduce_row_per_layout_entry() {
+    let (p, shape, key) = one_test_proof();
+    let vp = verify_rv32(&shape, &key, Checkpoints::Off);
+    let layout = &vp.program.reduce_layout;
+    assert!(!layout.is_empty(), "the On build registers a reduce layout");
+    let tape = WitnessTape::build(FriProfile::Test, &shape, &key, &p.proof).unwrap();
+    let exec = execute(&vp.program, &tape.words, 1 << 24).expect("accepts a real proof");
+    assert_eq!(exec.histogram()[Op::Reduce as usize], layout.len(), "one REDUCE row per entry");
+    assert_eq!(layout.len() % shape.num_queries, 0, "the same entries in every query");
+    let chains = layout.iter().filter(|e| e.chain_start).count();
+    let res: std::collections::BTreeSet<u64> = layout.iter().map(|e| e.res).collect();
+    assert_eq!(res.len(), chains, "one result cell per chain");
+    // `randprotocol_zkvm::machine::Machine` is imported above under that name; the rVM's is qualified.
+    randprotocol_rvm::machine::Machine::check_program(&vp.program).expect("the layout is legal");
 }

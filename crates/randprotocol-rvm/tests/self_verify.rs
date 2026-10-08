@@ -47,6 +47,7 @@ fn toy_program() -> Program {
             i(Op::Halt, 0, 0, 0),
         ],
         checkpoints: vec![],
+        reduce_layout: vec![],
     }
 }
 
@@ -127,8 +128,19 @@ fn the_self_program_digest_is_deterministic_and_distinct() {
     // poseidon2 (343) tables — `6b2f058e60ffdf6a77091b932710513191688e4bdc59b2ecdc65b0dd5039033b`
     // in constraint set 7/8 before them.
     // The quotient-layout fork (2026-10-05, docs/05): the rVM proof's quotient round is one matrix per instance, so the program's round reader changed shape (was 18514c2a…).
+    // Phase 3's Cut D (2026-10-05, docs/06): the shared pipeline reduces through `REDUCE` chains,
+    // and the program opens the reduce chip's preprocessed layout (was 91e50e14…).
+    // Phase 3's Cut E1 (2026-10-05, docs/06): the committed FRI row is hinted whole and its own
+    // slot checked by one register-addressed `LOADE` (was 40eb7077…).
+    // Phase 3's Cut E2 (2026-10-06, docs/06): the fold round is one `FOLD` into the reduce chip's
+    // fold run, and the program compiles the rVM's wider cpu (83) and reduce (70, preprocessed 20)
+    // tables and the `FOLD`/`FOLD_COEFF` buses (was f60f0f5c…).
+    // Phase 3's Cut F (2026-10-06, docs/06): the index powers are `POW` runs over the query's
+    // bits buffer, and the program compiles the rVM's wider cpu (84) and reduce (81) tables and
+    // the `POW` bus (was b475a9f9…).
+    // The rate-¼ profile (2026-10-06, docs/07): one Merkle level fewer per path at every height (was e9c9720d…).
     let hex: String = d1.iter().map(|w| format!("{:016x}", p3_field::PrimeField64::as_canonical_u64(w))).collect();
-    assert_eq!(hex, "91e50e140a8669385902e88bcbb18d5d9e5c270262d3f24bb2b67b4a469fbd13",
+    assert_eq!(hex, "b42ae772c9e0b2cdc5c5e55592a76a7ff823d638c579eaf740af0d508f418efe",
                "the self-verifier's digest at the toy fixture shape");
 
     // And it is not the single-proof RV32-machine verifier's digest for the same profile: build
@@ -174,22 +186,33 @@ fn tamper_table() -> Vec<(Segment, &'static str)> {
 
 /// The refusal step expected for a tamper of `seg` at segment offset `off`, given the rVM
 /// shape — `tests/exit.rs`'s, verbatim, over `RvmShape`'s own arity schedule.
-fn expected_step(seg: Segment, off: usize, shape: &RvmShape) -> String {
+fn expected_step(seg: Segment, off: usize, shape: &RvmShape, samples: &[u64]) -> String {
     match seg {
         Segment::Header => format!("header word {off}"),
         Segment::CommitPhaseOpenings => {
-            let strides: Vec<usize> = shape
-                .log_arities()
+            // The segment is query-major; within a query's run, round `r` occupies the whole row
+            // (`2·arity` words, Cut E1) then its four salts. A tampered word at the query's own
+            // slot (`index_in_group`, the index's bits `shift..shift + la`) is refused by the
+            // own-slot equality; a sibling or a salt breaks the round's leaf, so its root.
+            let strides: Vec<usize> = shape.log_arities()
                 .iter()
-                .map(|&la| ((1usize << la) - 1) * 2 + randprotocol_rvm::witness::SALT_ELEMS)
+                .map(|&la| (1usize << la) * 2 + randprotocol_rvm::witness::SALT_ELEMS)
                 .collect();
             let query_stride: usize = strides.iter().sum();
+            let index = samples[off / query_stride] as usize;
             let mut at = off % query_stride;
-            for (r, &s) in strides.iter().enumerate() {
+            let mut shift = 0usize;
+            for (r, (&s, &la)) in strides.iter().zip(shape.log_arities().iter()).enumerate() {
                 if at < s {
-                    return format!("commit phase root[{r}]");
+                    let own = (index >> shift) & ((1usize << la) - 1);
+                    return if at / 2 == own {
+                        format!("commit phase own slot[{r}]")
+                    } else {
+                        format!("commit phase root[{r}]")
+                    };
                 }
                 at -= s;
+                shift += la;
             }
             unreachable!("the offset is inside a query's run");
         }
@@ -212,7 +235,8 @@ fn thirteen_tampered_rvm_proofs_are_refused_at_the_named_steps() {
             .unwrap_or_else(|| panic!("the tape has a {seg:?} segment"));
         assert!(r.len > 0, "{seg:?} is empty");
         let off = k % r.len;
-        let want_step = expected_step(*seg, off, &shape);
+        let samples = randprotocol_rvm::reference::replay(FriProfile::Test, &shape, &key, &proof).unwrap().index_samples;
+        let want_step = expected_step(*seg, off, &shape, &samples);
         tape.words[r.start + off] += F::ONE;
         match execute(&vp.program, &tape.words, MAX_CYCLES) {
             Err(ExecError::InverseOfZero { pc }) => assert_eq!(
@@ -272,7 +296,7 @@ fn busy_program() -> Program {
     instrs.push(i(Op::Public, 0, 1, 0));
     instrs.push(i(Op::Public, 0, 1, 0));
     instrs.push(i(Op::Halt, 0, 0, 0));
-    Program { instrs, checkpoints: vec![] }
+    Program { instrs, checkpoints: vec![], reduce_layout: vec![] }
 }
 
 fn busy_fixture() -> (Arc<Program>, randprotocol_rvm::machine::Proof, RvmShape, RvmKey) {
@@ -346,14 +370,37 @@ fn the_self_verifiers_measured_cost_at_two_fixture_shapes() {
     // [1, 3, 2, 2, 2, 1, 1], doubled for ZK), so the program hints, absorbs and hashes fewer
     // words at every query: toy 152 527 → 131 739 rows, busy 188 390 → 167 746 (was
     // (152527, 7660, 345333, 154375, 30255) and (188390, 9310, 388321, 190502, 36087)).
+    // Phase 3's Cut D (2026-10-05, `docs/06-phase3-fold-reduce.md`): the shared pipeline's
+    // batch-opening reduction is one key buffer and one `REDUCE` chain per height per query, and
+    // the self-verifier opens the reduce chip's preprocessed layout and its wider trace (Task 1a):
+    // toy 131 739 → 120 955 rows, busy 167 746 → 156 466 (was
+    // (131739, 6130, 276847, 133587, 24135) and (167746, 7780, 320075, 169858, 29967)).
+    // Phase 3's Cut E1 (2026-10-05): the committed FRI row is hinted whole (two more tape words a
+    // round) and its own slot is one register-addressed `LOADE` and an equality, replacing the
+    // arithmetic sibling select: toy 120 955 → 114 955 rows, busy 156 466 → 146 626 (was
+    // (120955, 6130, 254575, 122803, 24135) and (156466, 7780, 297259, 158578, 29967)).
+    // Phase 3's Cut E2 (2026-10-06): each fold round is `u = β·s⁻¹` (one `INV`, one `EMULF`) and
+    // one `FOLD` instead of the compiled barycentric fold, and the self-verifier opens the wider
+    // cpu (83) and reduce (70, preprocessed 20) tables (three more permutations, sixty more tape
+    // words): toy 114 955 → 105 485 rows, busy 146 626 → 139 267 (was
+    // (114955, 6130, 251855, 116963, 24295) and (146626, 7780, 292843, 149026, 30255)).
+    // Phase 3's Cut F (2026-10-06): each index power is one `POW` run over the query's 65-cell
+    // bits buffer instead of the compiled 4-rows-a-bit ladder, and the self-verifier opens the
+    // wider cpu (84) and reduce (81) tables (more permutations and sixty more tape words for the
+    // opened columns): toy 105 485 → 101 460 rows, busy 139 267 → 127 322 (was
+    // (105485, 6133, 246774, 107493, 24355) and (139267, 7783, 292273, 141667, 30315)).
+    // The rate-¼ profile (2026-10-06, docs/07): the rVM proof's Merkle paths are one level shorter
+    // at every opened height and the final polynomial sits at height 2^2: toy 101 460 → 101 209
+    // rows, busy 127 322 → 126 541 (was (101460, 6168, 250619, 103468, 24415) and
+    // (127322, 7802, 296262, 129722, 30375)).
     assert_eq!(
         (r.cpu_rows, r.permutations, r.mem_accesses, r.program_instrs, r.witness_words),
-        (131739, 6130, 276847, 133587, 24135),
+        (101209, 6008, 247568, 103217, 23775),
         "the tier-8 toy fixture's CycleReport, pinned"
     );
     assert_eq!(
         (rb.cpu_rows, rb.permutations, rb.mem_accesses, rb.program_instrs, rb.witness_words),
-        (167746, 7780, 320075, 169858, 29967),
+        (126541, 7578, 291961, 128941, 29479),
         "the busy fixture's CycleReport, pinned"
     );
 
@@ -371,10 +418,16 @@ fn the_self_verifiers_measured_cost_at_two_fixture_shapes() {
     // poseidon2 chip's third row kind (`IS_COMPRESS`, `BIT`, its twelve RAM messages).
     // The quotient-layout fork (2026-10-05) left phase 5 unchanged at 7 845 / 8 125, measured:
     // the constraint evaluation recomposes the quotient from the same per-chunk slices, and only
-    // the opening round's matrix grouping moved.
+    // the opening round's matrix grouping moved. Phase 3's Cuts D and E1 left it there too, measured.
+    // Phase 3's Cut E2 added 44 to both (7 845 / 8 125 before): the cpu's 29th selector, its
+    // FOLD address limbs, and the `FOLD` dispatch, one more lookup term in its constraint DAG.
+    // Phase 3's Cut F added 44 more to both (7 889 / 8 169 before): the cpu's 30th selector, POW's
+    // terms in the address limb groups, and the `POW` dispatch.
+    // The rate-¼ profile (2026-10-06, docs/07) left it at 7 933 / 8 213, measured: the blowup does
+    // not reach the constraint evaluation, which reads only the degree bits and the opened values.
     let p5a: usize = vp.phase5.iter().map(|c| c.instrs).sum();
     let p5b: usize = vp_b.phase5.iter().map(|c| c.instrs).sum();
-    assert_eq!((p5a, p5b), (7845, 8125), "phase 5 varies with the degree bits, measured");
+    assert_eq!((p5a, p5b), (7933, 8213), "phase 5 varies with the degree bits, measured");
 }
 
 /// VERIFIER-1 for the rVM's own proofs: the rVM machine grinds zero commit-phase bits too
@@ -420,4 +473,23 @@ fn a_rewritten_commit_phase_pow_word_in_an_rvm_proof_is_refused() {
             other => panic!("round {round}: expected a refusal, got {:?}", other.map(|e| format!("acceptance, {} cpu rows", e.cpu_rows()))),
         }
     }
+}
+
+/// Review Focus 1 (phase 3, Cut D): no fixture proof carries a reduce table, so the
+/// self-verifier never opened the reduce instance's preprocessed region. Here it does: two
+/// preprocessed matrices of different heights in one round.
+#[test]
+fn the_self_verifier_accepts_a_proof_carrying_the_reduce_layout() {
+    let program = Arc::new(common::reduce_chain_program(true));
+    let m = Machine::new(FriProfile::Test);
+    let (proof, _exec) = m.prove(&program, &[], None).expect("the chain program proves");
+    assert!(proof.reduce_log_height > 0, "the batch declares the reduce instance");
+    let shape = RvmShape::of(FriProfile::Test, &program, proof.tier, proof.reg_log_height, proof.ram_log_height,
+        proof.poseidon2_log_height, proof.reduce_log_height);
+    let key = RvmKey::of(FriProfile::Test, &shape);
+    let vp = verify_rv32r(&shape, &key, Checkpoints::Off);
+    let tape = WitnessTape::build_for_with_binding(FriProfile::Test, &shape, &key, &proof, &common::TEST_BINDING).unwrap();
+    let exec = execute(&vp.program, &tape.words, MAX_CYCLES).expect("the self-verifier accepts a proof carrying the reduce layout");
+    let words = randprotocol_rvm::public_values::interface_words_bound(&shape, &key, &common::TEST_BINDING, &[proof.public_values.clone()]);
+    assert_eq!(exec.public, randprotocol_rvm::public_values::public_digest(&words).to_vec());
 }

@@ -24,6 +24,7 @@ fn toy() -> Program {
             instr(Op::Halt, 0, 0, 0),
         ],
         checkpoints: vec![],
+        reduce_layout: vec![],
     }
 }
 
@@ -39,6 +40,8 @@ fn event(clk: u32, pc: u32) -> Event {
         mem: vec![],
         perm: None,
         reduce: None,
+        fold: None,
+        pow: None,
     }
 }
 
@@ -84,13 +87,13 @@ fn the_verifier_key_binds_the_program() {
     let mut b = toy();
     b.instrs[2] = instr(Op::Fsub, 3, 1, 2);
 
-    let ka = m.verifier_key(&a, Tier(8), false);
-    let kb = m.verifier_key(&b, Tier(8), false);
+    let ka = m.verifier_key(&a, Tier(8), 0);
+    let kb = m.verifier_key(&b, Tier(8), 0);
     let roots = |k: &p3_batch_stark::CommonData<randprotocol_rvm::machine::Config>| {
         k.preprocessed.as_ref().expect("the batch has preprocessed columns").commitment.roots().to_vec()
     };
     assert_ne!(roots(&ka), roots(&kb), "one word differs, so the preprocessed cap differs");
-    let ka2 = m.verifier_key(&a, Tier(8), false);
+    let ka2 = m.verifier_key(&a, Tier(8), 0);
     assert_eq!(roots(&ka), roots(&ka2), "the same program reproduces the same cap");
 }
 
@@ -100,4 +103,59 @@ fn program_log_height_pins_the_measured_sizes() {
     assert_eq!(program_log_height(1_950_000), 21, "the post-cut exit target");
     assert_eq!(program_log_height(5), 3);
     assert_eq!(program_log_height(0), 2, "an empty program still gets the floor");
+}
+
+/// Fix round 1 (Task 1a review): `check_layout` bounds every base and the length before it sums
+/// them — a `u64::MAX` key or vals base would otherwise wrap `+ 1` to 0 and pass, and the chip's
+/// preprocessed `L_KEY` (`F::from_u64(u64::MAX)`) would read cells the emulator never touches.
+#[test]
+fn a_layout_entry_whose_addresses_wrap_is_illegal_at_registration() {
+    use randprotocol_rvm::isa::{DecodeError, ReduceEntry};
+    let mut p = common::reduce_chain_program(false);
+    p.reduce_layout[0] = ReduceEntry { key: u64::MAX, vals: u64::MAX, len: 1, row: 0, alpha: 0, res: 2, chain_start: true, carry: false };
+    assert_eq!(randprotocol_rvm::machine::Machine::check_program(&p), Err(DecodeError::Layout { entry: 0 }));
+    for (field, v) in [("vals", 0), ("row", 1), ("key", 2), ("alpha", 3), ("res", 4)] {
+        let mut q = common::reduce_chain_program(false);
+        let e = &mut q.reduce_layout[0];
+        let slot = [&mut e.vals, &mut e.row, &mut e.key, &mut e.alpha, &mut e.res];
+        *slot.into_iter().nth(v).unwrap() = randprotocol_rvm::isa::MEM_LIMIT;
+        assert_eq!(randprotocol_rvm::machine::Machine::check_program(&q), Err(DecodeError::Layout { entry: 0 }), "{field} at 2^24");
+    }
+}
+
+/// Task 5 sweep (Task 1a review): the legal side of the bound. Each address field of an entry put
+/// so that its top cell is exactly `2^24 − 1` — `vals + 2·len − 1`, `row + len − 1`, `key + 1`,
+/// `alpha + 1`, `res + 1` — is accepted at registration and by the emulator, which reads and
+/// writes those cells; one cell further is refused by both, at the same entry. (The wrap test
+/// above covers the bases at `2^24` and the `u64::MAX` sums.)
+#[test]
+fn a_layout_entry_whose_top_cell_is_the_last_one_is_legal_and_one_more_is_not() {
+    use randprotocol_rvm::emulator::{execute, ExecError};
+    use randprotocol_rvm::isa::{DecodeError, ReduceEntry, MEM_LIMIT};
+    let top = MEM_LIMIT - 1;
+    let at_top = |field: usize, past: u64| -> randprotocol_rvm::isa::Program {
+        let mut q = common::reduce_chain_program(false);
+        let e: &mut ReduceEntry = &mut q.reduce_layout[0];
+        let len = e.len as u64;
+        match field {
+            0 => e.vals = top + 1 - 2 * len + past,
+            1 => e.row = top + 1 - len + past,
+            2 => e.key = top - 1 + past,
+            3 => e.alpha = top - 1 + past,
+            _ => e.res = top - 1 + past,
+        }
+        q
+    };
+    for (field, name) in ["vals", "row", "key", "alpha", "res"].iter().enumerate() {
+        let legal = at_top(field, 0);
+        assert!(randprotocol_rvm::isa::layout_entry_in_bounds(&legal.reduce_layout[0]), "{name}: top cell 2^24 − 1 is in bounds");
+        assert_eq!(randprotocol_rvm::machine::Machine::check_program(&legal), Ok(()), "{name}: top cell 2^24 − 1 registers");
+        assert!(execute(&legal, &[], 10_000).is_ok(), "{name}: top cell 2^24 − 1 runs");
+        let past = at_top(field, 1);
+        assert_eq!(randprotocol_rvm::machine::Machine::check_program(&past), Err(DecodeError::Layout { entry: 0 }), "{name}: top cell 2^24");
+        assert!(
+            matches!(execute(&past, &[], 10_000), Err(ExecError::ReduceLayout { entry: 0, .. })),
+            "{name}: the emulator refuses top cell 2^24 at the same entry"
+        );
+    }
 }

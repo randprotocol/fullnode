@@ -21,8 +21,10 @@
 //!    how far RSS is from the live count, not as a measurement).
 //!
 //! Run (the exit twin's shape — tier 19 at constraint set 8, tier 18 since phase 2's row cuts;
-//! since the quotient-layout fork it proves on a 48 GB box at 33.27 GB peak live, 2026-10-05,
-//! `docs/05-quotient-layout.md`; add `--features parallel` and `RAYON_NUM_THREADS=16` for threads):
+//! since the quotient-layout fork it proves on a 48 GB box: 33.27 GB peak live at 230 950 rows,
+//! 2026-10-05, `docs/05-quotient-layout.md`; 24.86 GB after phase 3's Cut D and 26.88 GB at
+//! 169 366 rows after Cut F, `docs/06-phase3-fold-reduce.md` §3; add `--features parallel` and
+//! `RAYON_NUM_THREADS=16` for threads):
 //! `cargo test --release -p recursion --test memprofile tier19 -- --ignored --nocapture`
 //! The toy (`tier8`) is the harness's own smoke test.
 mod common;
@@ -215,6 +217,7 @@ fn tier8_toy() {
             i(Op::Halt, 0, 0, 0),
         ],
         checkpoints: vec![],
+        reduce_layout: vec![],
     };
     let t0 = install();
     let m = randprotocol_rvm::machine::Machine::new(randprotocol_zkvm::machine::FriProfile::Test);
@@ -272,13 +275,17 @@ fn tier16_synthetic_threads() {
 /// The exit twin's shape (`tests/exit.rs`): the verifier program over one real test-profile
 /// bundle proof — tier 19 at constraint set 8, the shape the 503 GB box measured at 94.2 GB RSS
 /// and this harness at 78.7 GB live when killed (2026-10-03, `docs/04-phase2-row-cuts.md`).
-/// Since phase 2's row cuts the same proof is 230 950 rows, tier 18 (≈ 47–50 GB projected by the
-/// measured terms). Since the quotient-layout fork it proves on this 48 GB box: 33.27 GB peak
+/// Since phase 2's row cuts the same proof is tier 18 (230 950 rows then; ≈ 47–50 GB projected by
+/// the measured terms). Since the quotient-layout fork it proves on this 48 GB box: 33.27 GB peak
 /// live, prove 185.4 s on 16 threads, verify 5.46 s, 268 417 B (2026-10-05,
-/// `docs/05-quotient-layout.md`, `docs/measurements/2026-10-05-tier18-twin-memprofile.log`). The
-/// name is kept for the record it produced.
+/// `docs/05-quotient-layout.md`, `docs/measurements/2026-10-05-tier18-twin-memprofile.log`).
+/// Phase 3 (`docs/06-phase3-fold-reduce.md` §3): 24.86 GB after Cut D (202 198 rows; the register
+/// table 2^20 → 2^19), and **26.88 GB at the phase's end** (169 366 rows, prove 141.3 s, verify
+/// 6.67 s, 268 168 B; 2026-10-06, `docs/measurements/2026-10-06-tier18-twin-memprofile-phase3.log`)
+/// — fewer cpu rows, but the reduce chip is 81 columns wide (was 30) and carries the fold and pow
+/// runs. The name is kept for the record it produced.
 #[test]
-#[ignore = "one exit-twin rVM proof under the heap profiler (tier 18 since phase 2): proved on this 48 GB box at 33.27 GB live, 2026-10-05, since the quotient-layout fork (78.7 GB live when killed at tier 19 before it); ~3 min on 16 threads with --features parallel"]
+#[ignore = "one exit-twin rVM proof under the heap profiler (tier 18 since phase 2): proved on this 48 GB box at 26.88 GB live, 2026-10-06, at phase 3's end (33.27 GB at the quotient-layout fork, 2026-10-05; 78.7 GB live when killed at tier 19 before it); ~2.5 min on 16 threads with --features parallel"]
 fn tier19_exit_twin() {
     use randprotocol_zkvm::machine::FriProfile;
     use randprotocol_rvm::dsl::Checkpoints;

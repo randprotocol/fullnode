@@ -25,59 +25,60 @@ pub mod col {
     pub const RD: usize = 4;
     pub const RA: usize = 5;
     pub const B: usize = 6;
-    /// 28: one-hot opcode selectors, in `Op as u8` order.
+    /// 30: one-hot opcode selectors, in `Op as u8` order.
     pub const SEL0: usize = 7;
     /// The operand values: the `ra` pair, the `rb` pair (or `[imm, 0]`), the result pair.
-    pub const A0: usize = 35;
-    pub const A1: usize = 36;
-    pub const B0: usize = 37;
-    pub const B1: usize = 38;
-    pub const D0: usize = 39;
-    pub const D1: usize = 40;
+    pub const A0: usize = 37;
+    pub const A1: usize = 38;
+    pub const B0: usize = 39;
+    pub const B1: usize = 40;
+    pub const D0: usize = 41;
+    pub const D1: usize = 42;
     /// 5-bit decompositions of the three register indices — the `rd, ra, rb < 32` decode check
     /// the emulator performs, and what makes every `REG` address `2^24 + idx` with `idx < 32`.
-    pub const RD_BIT0: usize = 41; // 5
-    pub const RA_BIT0: usize = 46; // 5
-    pub const RB_BIT0: usize = 51; // 5
+    pub const RD_BIT0: usize = 43; // 5
+    pub const RA_BIT0: usize = 48; // 5
+    pub const RB_BIT0: usize = 53; // 5
     /// The 3 address limbs of the row kind's address subject (a `RANGE8` lookup each).
-    pub const LIMB0: usize = 56;
-    pub const LIMB1: usize = 57;
-    pub const LIMB2: usize = 58;
+    pub const LIMB0: usize = 58;
+    pub const LIMB1: usize = 59;
+    pub const LIMB2: usize = 60;
     /// The `r0` write-drop gadget (the `alu.rs` two-constraint pattern).
-    pub const RD_IS_ZERO: usize = 59;
-    pub const RD_INV: usize = 60;
+    pub const RD_IS_ZERO: usize = 61;
+    pub const RD_INV: usize = 62;
     /// The branch equality gadget on `D0 − A0`.
-    pub const EQ_AUX: usize = 61;
-    pub const EQ_INV: usize = 62;
+    pub const EQ_AUX: usize = 63;
+    pub const EQ_INV: usize = 64;
     /// The running count of `PUBLIC` rows.
-    pub const PUB_IDX: usize = 63;
-    pub const IS_REAL: usize = 64;
+    pub const PUB_IDX: usize = 65;
+    pub const IS_REAL: usize = 66;
     /// Task 9: the second pointer's own three limbs (`B0 + 3 < 2^24`), gated on the two row
     /// kinds with two addresses — `SPONGE`'s source and (Cut C) `COMPRESS`'s sibling.
-    pub const G2LIMB0: usize = 65;
-    pub const G2LIMB1: usize = 66;
-    pub const G2LIMB2: usize = 67;
+    pub const G2LIMB0: usize = 67;
+    pub const G2LIMB1: usize = 68;
+    pub const G2LIMB2: usize = 69;
     /// ZKQ-3 (the 2026-09-27 zk scan): the *base* of a multi-cell access, in three limbs —
-    /// `A0 + B` for LOADE/STOREE/HINTN, `A0` for POSEIDON2/SPONGE/COMPRESS's state. The subject limbs above
-    /// check only the top cell, and an address is a field element: a base of `p − 1` put the top
-    /// at 0, in range, and the access reached a cell outside the `2^24` address space.
-    pub const G3LIMB0: usize = 68;
-    pub const G3LIMB1: usize = 69;
-    pub const G3LIMB2: usize = 70;
+    /// `A0 + B` for LOADE/STOREE/HINTN, `A0` for POSEIDON2/SPONGE/COMPRESS's state and (Cut E2)
+    /// FOLD's row. The subject limbs above check only the top cell, and an address is a field
+    /// element: a base of `p − 1` put the top at 0, in range, and the access reached a cell
+    /// outside the `2^24` address space.
+    pub const G3LIMB0: usize = 70;
+    pub const G3LIMB1: usize = 71;
+    pub const G3LIMB2: usize = 72;
     /// ZKQ-3: the base of SPONGE's source (and COMPRESS's sibling), `B0` (group 2 checks its
     /// top, `B0 + 3`).
-    pub const G4LIMB0: usize = 71;
-    pub const G4LIMB1: usize = 72;
-    pub const G4LIMB2: usize = 73;
+    pub const G4LIMB0: usize = 73;
+    pub const G4LIMB1: usize = 74;
+    pub const G4LIMB2: usize = 75;
     /// Cut B: the eight witness words a `HINTN` row writes to `A0 + B .. A0 + B + 8` — free
     /// witness columns, as `D0` is on a `HINT` row; zero on every other row kind is *not*
     /// required (they are read by nothing else), but the trace builder leaves them zero.
-    pub const W0: usize = 74; // 8
-    pub const WIDTH: usize = 82;
+    pub const W0: usize = 76; // 8
+    pub const WIDTH: usize = 84;
 }
 use col::*;
 
-pub const NUM_SELECTORS: usize = 28;
+pub const NUM_SELECTORS: usize = 30;
 
 /// Timestamp slots of the row's `REG` messages (the `RAM` messages use the emulator's own slots:
 /// 0..1 for the cpu's loads/stores, 0..7 for a `HINTN` row's eight writes, 0..15 for a dispatched
@@ -119,15 +120,18 @@ impl Sels {
     const EXT_READ_RB: &'static [Op] = &[Op::Eadd, Op::Esub, Op::Emul];
     /// Ops whose fourth word names a register (`rb`), mirroring `Op::b_is_register`.
     const B_REG: &'static [Op] = &[Op::Fadd, Op::Fsub, Op::Fmul, Op::Eadd, Op::Esub, Op::Emul, Op::Emulf, Op::Sponge, Op::Compress];
-    /// Read `rd` (the compared or stored value; `COMPRESS`'s index bit).
-    const READ_RD: &'static [Op] = &[Op::Jeq, Op::Jne, Op::Store, Op::Storee, Op::Compress];
+    /// Read `rd` (the compared or stored value; `COMPRESS`'s index bit; `FOLD`'s point, low lane).
+    const READ_RD: &'static [Op] = &[Op::Jeq, Op::Jne, Op::Store, Op::Storee, Op::Compress, Op::Fold, Op::Pow];
     /// Read `rd + 1`, the high lane of the `rd` pair a STOREE writes to memory (RVM-1). LOADE,
     /// the mirror image, is in `EXT_WRITE_RD`: it *writes* the pair, from its two RAM reads, so
     /// both of its lanes were always bound. STOREE's second RAM write carries `D1`, and before
     /// this set existed no message read `rd + 1` into it — `D1` was a free witness column, so
-    /// the high lane of every extension value written to memory (every REDUCE descriptor, every
-    /// register-allocator spill of an extension value) was the prover's choice.
-    const EXT_READ_RD: &'static [Op] = &[Op::Storee];
+    /// the high lane of every extension value written to memory (every runtime REDUCE descriptor
+    /// of the build before phase 3's Cut D made the layout preprocessed, every register-allocator
+    /// spill of an extension value) was the prover's choice. `FOLD` (Cut E2)
+    /// reads the whole `rd` pair: the fold point `u` it dispatches; `POW` (Cut F) likewise its
+    /// `(G, base)`.
+    const EXT_READ_RD: &'static [Op] = &[Op::Storee, Op::Fold, Op::Pow];
     /// Write `rd`.
     const WRITE_RD: &'static [Op] = &[
         Op::Fadd, Op::Fsub, Op::Fmul, Op::Faddi, Op::Fmuli, Op::Eadd, Op::Esub, Op::Emul,
@@ -261,9 +265,19 @@ where
             + (sel(Op::Poseidon2) + sel(Op::Sponge)) * (v(A0) + AB::Expr::from_u32(7))
             + sel(Op::Hintn) * (v(A0) + v(B) + AB::Expr::from_u32(7))
             + sel(Op::Compress) * (v(A0) + AB::Expr::from_u32(3))
+            // Cut E2: the fold result's high cell, `msg + 2a + 4 + 1` (the row, its salts, the pair).
+            + sel(Op::Fold) * (v(A0) + AB::Expr::from_u32(2) * v(B) + AB::Expr::from_u32(5))
+            // Cut F: the pow output cell, `bits + 64` (the buffer's top).
+            + sel(Op::Pow) * (v(A0) + AB::Expr::from_u32(64))
             + taken.clone() * v(B);
-        let needs_check =
-            is_mem.clone() + sel(Op::Poseidon2) + sel(Op::Sponge) + sel(Op::Hintn) + sel(Op::Compress) + taken.clone();
+        let needs_check = is_mem.clone()
+            + sel(Op::Poseidon2)
+            + sel(Op::Sponge)
+            + sel(Op::Hintn)
+            + sel(Op::Compress)
+            + sel(Op::Fold)
+            + sel(Op::Pow)
+            + taken.clone();
         let limbs = v(LIMB0) + v(LIMB1) * AB::Expr::from_u32(1 << 8) + v(LIMB2) * AB::Expr::from_u32(1 << 16);
         b.assert_zero(needs_check.clone() * (subject - limbs));
         for l in [LIMB0, LIMB1, LIMB2] {
@@ -285,10 +299,13 @@ where
         // `B0`. Before these, only the top
         // of each run was checked, and a base just below zero (`p − 1`, `p − 4`, ...) wrapped the
         // top back into range. The emulator refuses every such address; now the AIR does too.
-        let is_multi = sel_sum(Sels::MEM2) + sel(Op::Poseidon2) + sel(Op::Sponge) + sel(Op::Hintn) + sel(Op::Compress);
+        let is_multi =
+            sel_sum(Sels::MEM2) + sel(Op::Poseidon2) + sel(Op::Sponge) + sel(Op::Hintn) + sel(Op::Compress) + sel(Op::Fold) + sel(Op::Pow);
         let base3 = sel_sum(Sels::MEM2) * (v(A0) + v(B))
             + (sel(Op::Poseidon2) + sel(Op::Sponge) + sel(Op::Compress)) * v(A0)
-            + sel(Op::Hintn) * (v(A0) + v(B));
+            + sel(Op::Hintn) * (v(A0) + v(B))
+            + sel(Op::Fold) * v(A0)
+            + sel(Op::Pow) * v(A0);
         let limbs3 = v(G3LIMB0) + v(G3LIMB1) * AB::Expr::from_u32(1 << 8) + v(G3LIMB2) * AB::Expr::from_u32(1 << 16);
         b.assert_zero(is_multi.clone() * (base3 - limbs3));
         for l in [G3LIMB0, G3LIMB1, G3LIMB2] {
@@ -341,10 +358,18 @@ where
         // ── the dispatched chips and the public interface ──
         bus::POSEIDON2.lookup_key(b, [v(CLK), v(A0)], Count::bounded(sel(Op::Poseidon2), 1));
         bus::SPONGE.lookup_key(b, [v(CLK), v(A0), v(B0)], Count::bounded(sel(Op::Sponge), 1));
-        bus::REDUCE.lookup_key(b, [v(CLK), v(A0)], Count::bounded(sel(Op::Reduce), 1));
+        // Cut D: the dispatch names a layout entry by the instruction's immediate (`B`, the fetched
+        // word the `PROGRAM` lookup binds) — no register carries an address.
+        bus::REDUCE.lookup_key(b, [v(CLK), v(B)], Count::bounded(sel(Op::Reduce), 1));
         // Cut C: the bit travels with the dispatch, so the chip's input order is the one `rd` held
         // (`D0`, bound by the `REG` read of `rd` above — `COMPRESS` is in `READ_RD`).
         bus::COMPRESS.lookup_key(b, [v(CLK), v(A0), v(B0), v(D0)], Count::bounded(sel(Op::Compress), 1));
+        // Cut E2: the fold point travels with the dispatch — `D0, D1` are the `rd` pair, bound by
+        // the REG reads `READ_RD`/`EXT_READ_RD` send; the arity is the fetched immediate `B`.
+        bus::FOLD.lookup_key(b, [v(CLK), v(A0), v(D0), v(D1), v(B)], Count::bounded(sel(Op::Fold), 1));
+        // Cut F: `(G, base)` travel with the dispatch — the `rd` pair, bound by the same two REG
+        // reads; the bits buffer is `A0` (both ends range-checked above); `off + 256·L` is `B`.
+        bus::POW.lookup_key(b, [v(CLK), v(A0), v(B), v(D0), v(D1)], Count::bounded(sel(Op::Pow), 1));
         bus::PUBLIC.lookup_key(b, [v(PUB_IDX), v(A0)], Count::bounded(sel(Op::Public), 1));
     }
 }
@@ -473,6 +498,8 @@ fn fill_row(r: &mut [F], e: &Event, pub_idx: &mut u32, counts: &mut RangeCounts)
         Op::Poseidon2 | Op::Sponge => Some(e.a[0].as_canonical_u64() + 7),
         Op::Hintn => Some(e.mem[0].addr + 7),
         Op::Compress => Some(e.a[0].as_canonical_u64() + 3),
+        Op::Fold => Some(e.a[0].as_canonical_u64() + 2 * e.instr.b.as_canonical_u64() + 5),
+        Op::Pow => Some(e.a[0].as_canonical_u64() + 64),
         Op::Jmp | Op::Jeq | Op::Jne if taken => Some(e.instr.b.as_canonical_u64()),
         _ => None,
     };
@@ -500,6 +527,8 @@ fn fill_row(r: &mut [F], e: &Event, pub_idx: &mut u32, counts: &mut RangeCounts)
         Op::Loade | Op::Storee => Some(e.mem[0].addr),
         Op::Poseidon2 | Op::Sponge | Op::Compress => Some(e.a[0].as_canonical_u64()),
         Op::Hintn => Some(e.mem[0].addr),
+        Op::Fold => Some(e.a[0].as_canonical_u64()),
+        Op::Pow => Some(e.a[0].as_canonical_u64()),
         _ => None,
     };
     let base4: Option<u64> = matches!(e.instr.op, Op::Sponge | Op::Compress).then(|| e.b_val[0].as_canonical_u64());

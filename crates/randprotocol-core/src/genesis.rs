@@ -498,9 +498,16 @@ pub struct Genesis {
     /// subsidy from its proving shares first (it needs `aggregation`,
     /// [`GenesisError::SubsidyNetOfFeesWithoutAggregation`]), and `burn_floor` widens the burned
     /// base to the bundle's whole settled floor (issue #135; it needs `burn_base`,
-    /// [`GenesisError::BurnFloorWithoutBurnBase`]). Absent — every chain cut before it —
-    /// or present with no `true` flag, the genesis hashes and the chain runs byte for byte as
-    /// before; a `true` flag is bound into the genesis hash right after the `tokens` section
+    /// [`GenesisError::BurnFloorWithoutBurnBase`]). The fee split's two numeric fields
+    /// (`docs/compute-optimization.md` §6.2–§6.3), each needing `aggregation`:
+    /// `proposer_share_bps` (0..=10 000) keeps that share of the base to the proposer and
+    /// buckets the rest as proving share, `prove_base` raises every bundle's floor by a proving
+    /// share bucketed whole ([`GenesisError::ProposerShareWithoutAggregation`],
+    /// [`GenesisError::ProveBaseWithoutAggregation`], [`GenesisError::ProposerShareOutOfRange`];
+    /// `prove_base: 0` is [`GenesisError::ProveBaseZero`] — it would hash a second chain for no rule).
+    /// Absent — every chain cut before it — or present with no `true` flag and neither numeric
+    /// field set, the genesis hashes and the chain runs byte for byte as before; a `true` flag or
+    /// a set field is bound into the genesis hash right after the `tokens` section
     /// ([`fees_commit`]). Never part of the state root (a genesis parameter `reload_ledger`
     /// restores).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -630,6 +637,22 @@ pub enum GenesisError {
     /// silently did nothing would read as a rule the chain does not run.
     #[error("fees.burn_floor needs fees.burn_base: true — it widens the burned base to the whole floor")]
     BurnFloorWithoutBurnBase,
+    /// `fees.proposer_share_bps` splits the base between the proposer and the covering
+    /// aggregator (`docs/compute-optimization.md` §6.2); a chain without an `aggregation` section
+    /// has no aggregator and no bucket to hold the other part.
+    #[error("fees.proposer_share_bps needs an aggregation section: without one there is no aggregator to share the base with")]
+    ProposerShareWithoutAggregation,
+    /// `fees.prove_base` is the aggregated lane's floor for the proving share (§6.3); a chain
+    /// without an `aggregation` section has no proving share.
+    #[error("fees.prove_base needs an aggregation section: without one there is no proving share to floor")]
+    ProveBaseWithoutAggregation,
+    /// `fees.prove_base: 0` behaves exactly as no `prove_base` but would hash as another chain:
+    /// a second genesis hash for identical rules, so it is refused — leave the field out.
+    #[error("fees.prove_base 0 is no rule at all: leave the field out instead")]
+    ProveBaseZero,
+    /// `fees.proposer_share_bps` is a share of the base in basis points: at most 10000.
+    #[error("fees.proposer_share_bps {0} is out of range (0..=10000)")]
+    ProposerShareOutOfRange(u32),
     #[error("bad hc_bundle {0} (64 hex characters)")]
     BadHcBundle(String),
     #[error("bad hc_auth {0} (64 hex characters)")]
@@ -754,7 +777,8 @@ fn gas_commit(g: &gas::GasConfig) -> Vec<u8> {
 /// contribution: `"fees"`, then `"burn_base" ‖ 1` if `burn_base` is `true`, then
 /// `"subsidy_net_of_fees" ‖ 1` if `subsidy_net_of_fees` is `true`, then `"burn_floor" ‖ 1` if
 /// `burn_floor` is `true` (issue #135; appended last so the two older flags' bytes, and every hash
-/// pinned over them, stay put), in that order — and nothing at all when no flag is `true`, so a
+/// pinned over them, stay put), then `"proposer_share_bps" ‖ be32` and `"prove_base" ‖ be64`, each
+/// only when set (the fee split, `docs/compute-optimization.md` §6.2–§6.3), in that order — and nothing at all when no flag is `true`, so a
 /// file that spells the defaults out hashes as one without the section (TOK-2's rule for
 /// `burn_registration_fee`). Pinned byte for byte by
 /// `the_fees_sections_hash_contribution_is_pinned`.
@@ -775,6 +799,16 @@ fn fees_commit(f: &crate::ledger::fees::FeesConfig) -> Vec<u8> {
     if f.burn_floor() {
         commit.extend_from_slice(b"burn_floor");
         commit.push(1);
+    }
+    // The fee split (`docs/compute-optimization.md` §6.2–§6.3), each only when set, after
+    // `burn_floor` so every older section keeps its bytes.
+    if let Some(bps) = f.proposer_share_bps {
+        commit.extend_from_slice(b"proposer_share_bps");
+        commit.extend_from_slice(&bps.to_be_bytes());
+    }
+    if let Some(units) = f.prove_base {
+        commit.extend_from_slice(b"prove_base");
+        commit.extend_from_slice(&units.to_be_bytes());
     }
     commit
 }
@@ -1030,6 +1064,22 @@ impl Genesis {
         // a rule in the binding the chain does not run.
         if self.fees.as_ref().is_some_and(|f| f.burn_floor() && !f.burn_base()) {
             return Err(GenesisError::BurnFloorWithoutBurnBase);
+        }
+        // The fee split: both fields act on the bucket, so both need an aggregating chain; the
+        // share is a fraction of the base in basis points.
+        if let Some(f) = &self.fees {
+            if f.proposer_share_bps.is_some() && self.aggregation.is_none() {
+                return Err(GenesisError::ProposerShareWithoutAggregation);
+            }
+            if f.prove_base.is_some() && self.aggregation.is_none() {
+                return Err(GenesisError::ProveBaseWithoutAggregation);
+            }
+            if f.prove_base == Some(0) {
+                return Err(GenesisError::ProveBaseZero);
+            }
+            if let Some(bps) = f.proposer_share_bps.filter(|b| *b > 10_000) {
+                return Err(GenesisError::ProposerShareOutOfRange(bps));
+            }
         }
         Ok(())
     }
@@ -2637,8 +2687,8 @@ mod tests {
         assert_eq!(base.ledger.fees(), &FeesConfig::default());
         for off in [
             FeesConfig::default(),
-            FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: None },
-            FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(false), burn_floor: None },
+            FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None },
+            FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(false), burn_floor: None, proposer_share_bps: None, prove_base: None },
         ] {
             let mut with = g.clone();
             with.fees = Some(off.clone());
@@ -2650,7 +2700,7 @@ mod tests {
         // A `true` flag moves the hash, never the state root (a genesis parameter, not state),
         // and reaches the ledger.
         let mut on = g.clone();
-        on.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None });
+        on.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None });
         let on_state = build(&on);
         assert_ne!(on_state.hash(), base.hash(), "the flag is in the genesis binding");
         assert_eq!(on_state.ledger.state_root(), base.ledger.state_root(), "and not in the state root");
@@ -2664,18 +2714,18 @@ mod tests {
     #[test]
     fn the_fees_sections_hash_contribution_is_pinned() {
         use crate::ledger::fees::FeesConfig;
-        let burn = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None };
+        let burn = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None };
         let mut want = b"fees".to_vec();
         want.extend_from_slice(b"burn_base");
         want.push(1);
         assert_eq!(fees_commit(&burn), want);
 
-        let both = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: None };
+        let both = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None };
         want.extend_from_slice(b"subsidy_net_of_fees");
         want.push(1);
         assert_eq!(fees_commit(&both), want);
 
-        let net = FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(true), burn_floor: None };
+        let net = FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None };
         let mut want = b"fees".to_vec();
         want.extend_from_slice(b"subsidy_net_of_fees");
         want.push(1);
@@ -2683,14 +2733,14 @@ mod tests {
 
         // Issue #135: `burn_floor` appends its tag and a `1` after everything above, and only
         // when `true` — the base with the floor, then all three flags.
-        let floor = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) };
+        let floor = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None };
         let mut want = b"fees".to_vec();
         want.extend_from_slice(b"burn_base");
         want.push(1);
         want.extend_from_slice(b"burn_floor");
         want.push(1);
         assert_eq!(fees_commit(&floor), want);
-        let all = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true) };
+        let all = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true), proposer_share_bps: None, prove_base: None };
         let mut want = b"fees".to_vec();
         want.extend_from_slice(b"burn_base");
         want.push(1);
@@ -2704,7 +2754,7 @@ mod tests {
         assert_eq!(fees_commit(&FeesConfig { burn_floor: Some(false), ..both.clone() }), fees_commit(&both));
 
         assert!(fees_commit(&FeesConfig::default()).is_empty());
-        assert!(fees_commit(&FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(false), burn_floor: None }).is_empty());
+        assert!(fees_commit(&FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(false), burn_floor: None, proposer_share_bps: None, prove_base: None }).is_empty());
 
         // Each flag reaches the hash `build` computes, and the three are three chains.
         let hash_of = |f: Option<FeesConfig>| {
@@ -2733,7 +2783,7 @@ mod tests {
         g.bridge = Some(bridge_cfg());
         g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None, incremental_root: None });
         g.alloc = opened_alloc();
-        g.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: None });
+        g.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None });
         assert_eq!(build(&g).hash().to_hex(), "de93090f45fefa36f131e934849bf188aea7782ed47c07e77f653d32354ebc06");
     }
 
@@ -2742,7 +2792,7 @@ mod tests {
     #[test]
     fn subsidy_net_of_fees_requires_an_aggregation_section() {
         use crate::ledger::fees::FeesConfig;
-        let net = FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None };
+        let net = FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None };
         let mut plain = base_genesis();
         plain.fees = Some(net.clone());
         let e = plain.validate().unwrap_err();
@@ -2755,7 +2805,7 @@ mod tests {
         assert!(build(&agg).ledger.fees().subsidy_net_of_fees());
 
         let mut burn_only = base_genesis();
-        burn_only.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(false), burn_floor: None });
+        burn_only.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(false), burn_floor: None, proposer_share_bps: None, prove_base: None });
         assert!(burn_only.validate().is_ok(), "burn_base needs no aggregation, and a false flag asks for nothing");
     }
 
@@ -2767,16 +2817,16 @@ mod tests {
         use crate::ledger::fees::FeesConfig;
         for base in [None, Some(false)] {
             let mut g = base_genesis();
-            g.fees = Some(FeesConfig { burn_base: base, subsidy_net_of_fees: None, burn_floor: Some(true) });
+            g.fees = Some(FeesConfig { burn_base: base, subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None });
             let e = g.validate().unwrap_err();
             assert!(matches!(e, GenesisError::BurnFloorWithoutBurnBase), "{e}");
             assert!(e.to_string().contains("burn_base"), "{e}");
         }
         let mut g = base_genesis();
-        g.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+        g.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None });
         assert!(g.validate().is_ok());
         assert!(build(&g).ledger.fees().burn_floor());
-        g.fees = Some(FeesConfig { burn_base: None, subsidy_net_of_fees: None, burn_floor: Some(false) });
+        g.fees = Some(FeesConfig { burn_base: None, subsidy_net_of_fees: None, burn_floor: Some(false), proposer_share_bps: None, prove_base: None });
         assert!(g.validate().is_ok(), "a false flag asks for nothing");
     }
 
@@ -2790,7 +2840,7 @@ mod tests {
     fn the_burn_floor_flag_round_trips_hashes_as_written_and_refuses_a_misspelling() {
         use crate::ledger::fees::FeesConfig;
         let mut on = aggregating_genesis();
-        on.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+        on.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None });
         let json = on.to_json();
         assert!(json.contains("\"burn_floor\": true"), "the flag is written: {json}");
         let back = Genesis::from_json(&json).expect("the file parses back");
@@ -2808,12 +2858,12 @@ mod tests {
             g.fees = Some(f);
             build(&g).hash()
         };
-        let base = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None };
+        let base = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None };
         assert_eq!(hash_of(FeesConfig { burn_floor: Some(false), ..base.clone() }), hash_of(base.clone()), "false beside burn_base is burn_base alone");
-        assert_ne!(hash_of(FeesConfig { burn_floor: Some(true), ..base }), hash_of(FeesConfig { burn_floor: Some(false), burn_base: Some(true), subsidy_net_of_fees: None }), "true is another chain");
+        assert_ne!(hash_of(FeesConfig { burn_floor: Some(true), ..base }), hash_of(FeesConfig { burn_floor: Some(false), burn_base: Some(true), subsidy_net_of_fees: None, proposer_share_bps: None, prove_base: None }), "true is another chain");
 
         let mut g = aggregating_genesis();
-        g.fees = Some(FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: Some(true) });
+        g.fees = Some(FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: Some(true), proposer_share_bps: None, prove_base: None });
         assert!(matches!(g.validate(), Err(GenesisError::BurnFloorWithoutBurnBase)), "the net subsidy does not stand in for the base");
     }
 
@@ -2827,11 +2877,129 @@ mod tests {
         assert_eq!(Genesis::from_json(&g.to_json()).unwrap(), g);
 
         let mut on = g.clone();
-        on.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None });
+        on.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None });
         let json = on.to_json();
         assert!(json.contains("\"fees\"") && json.contains("\"burn_base\": true"), "{json}");
         assert!(!json.contains("subsidy_net_of_fees"), "an absent flag stays absent: {json}");
         assert_eq!(Genesis::from_json(&json).unwrap(), on);
+    }
+
+    /// The fee split (`docs/compute-optimization.md` §6.2–§6.3): `proposer_share_bps` and
+    /// `prove_base` survive `to_json` → `from_json` as written, reach the ledger, and are omitted
+    /// when absent; each is its own chain.
+    #[test]
+    fn the_fee_split_fields_round_trip_and_reach_the_ledger() {
+        use crate::ledger::fees::FeesConfig;
+        let mut on = aggregating_genesis();
+        on.fees = Some(FeesConfig { proposer_share_bps: Some(4000), prove_base: Some(600_000), ..FeesConfig::default() });
+        let json = on.to_json();
+        assert!(json.contains("\"proposer_share_bps\": 4000") && json.contains("\"prove_base\": 600000"), "{json}");
+        let back = Genesis::from_json(&json).expect("the file parses back");
+        assert_eq!(back, on);
+        assert_eq!(build(&back).hash(), build(&on).hash());
+        let fees = build(&back).ledger.fees().clone();
+        assert_eq!((fees.proposer_share_bps(), fees.prove_base()), (Some(4000), 600_000));
+
+        let mut absent = aggregating_genesis();
+        absent.fees = Some(FeesConfig { burn_base: Some(true), ..FeesConfig::default() });
+        let json = absent.to_json();
+        assert!(!json.contains("proposer_share_bps") && !json.contains("prove_base"), "absent stays absent: {json}");
+
+        let typo = on.to_json().replace("\"prove_base\"", "\"prove_bse\"");
+        assert!(Genesis::from_json(&typo).is_err(), "a misspelt field is refused");
+    }
+
+    /// The fee split's bytes in the genesis commitment: `"proposer_share_bps" ‖ be32` and
+    /// `"prove_base" ‖ be64`, each only when set, after `burn_floor`'s, in that order — the older
+    /// flags' bytes (and every hash pinned over them) unchanged. A field alone still opens the
+    /// section with `"fees"`.
+    #[test]
+    fn the_fee_split_fields_hash_contributions_are_pinned() {
+        use crate::ledger::fees::FeesConfig;
+        let split = FeesConfig { proposer_share_bps: Some(4000), ..FeesConfig::default() };
+        let mut want = b"fees".to_vec();
+        want.extend_from_slice(b"proposer_share_bps");
+        want.extend_from_slice(&4000u32.to_be_bytes());
+        assert_eq!(fees_commit(&split), want);
+
+        let prove = FeesConfig { prove_base: Some(600_000), ..FeesConfig::default() };
+        let mut want = b"fees".to_vec();
+        want.extend_from_slice(b"prove_base");
+        want.extend_from_slice(&600_000u64.to_be_bytes());
+        assert_eq!(fees_commit(&prove), want);
+
+        let all = FeesConfig {
+            burn_base: Some(true),
+            subsidy_net_of_fees: Some(true),
+            burn_floor: Some(true),
+            proposer_share_bps: Some(4000),
+            prove_base: Some(600_000),
+        };
+        let mut want = b"fees".to_vec();
+        for tag in [&b"burn_base"[..], b"subsidy_net_of_fees", b"burn_floor"] {
+            want.extend_from_slice(tag);
+            want.push(1);
+        }
+        want.extend_from_slice(b"proposer_share_bps");
+        want.extend_from_slice(&4000u32.to_be_bytes());
+        want.extend_from_slice(b"prove_base");
+        want.extend_from_slice(&600_000u64.to_be_bytes());
+        assert_eq!(fees_commit(&all), want);
+        // Zero is a value: set, it is committed (a zero `proposer_share_bps` gives the aggregator
+        // the whole base, a different chain from no split).
+        let zero = FeesConfig { proposer_share_bps: Some(0), ..FeesConfig::default() };
+        assert_eq!(fees_commit(&zero), [&b"fees"[..], b"proposer_share_bps", &[0, 0, 0, 0]].concat());
+
+        let hash_of = |f: Option<FeesConfig>| {
+            let mut g = aggregating_genesis();
+            g.fees = f;
+            build(&g).hash()
+        };
+        let both = FeesConfig { proposer_share_bps: Some(4000), prove_base: Some(600_000), ..FeesConfig::default() };
+        let hashes = [
+            hash_of(None),
+            hash_of(Some(split)),
+            hash_of(Some(prove)),
+            hash_of(Some(both)),
+            hash_of(Some(FeesConfig { proposer_share_bps: Some(4001), ..FeesConfig::default() })),
+        ];
+        for i in 0..hashes.len() {
+            for j in i + 1..hashes.len() {
+                assert_ne!(hashes[i], hashes[j], "{i} vs {j}");
+            }
+        }
+    }
+
+    /// The fee split is an aggregating chain's rule: either field without an `aggregation`
+    /// section is refused by name, and a share above 10 000 bps is out of range.
+    #[test]
+    fn the_fee_split_fields_need_aggregation_and_a_share_in_range() {
+        use crate::ledger::fees::FeesConfig;
+        let mut g = base_genesis();
+        g.fees = Some(FeesConfig { proposer_share_bps: Some(4000), ..FeesConfig::default() });
+        let e = g.validate().unwrap_err();
+        assert!(matches!(e, GenesisError::ProposerShareWithoutAggregation), "{e}");
+        assert!(e.to_string().contains("aggregation"), "{e}");
+        g.fees = Some(FeesConfig { prove_base: Some(600_000), ..FeesConfig::default() });
+        let e = g.validate().unwrap_err();
+        assert!(matches!(e, GenesisError::ProveBaseWithoutAggregation), "{e}");
+        assert!(e.to_string().contains("aggregation"), "{e}");
+
+        let mut agg = aggregating_genesis();
+        for bps in [0, 4000, 10_000] {
+            agg.fees = Some(FeesConfig { proposer_share_bps: Some(bps), prove_base: Some(600_000), ..FeesConfig::default() });
+            assert!(agg.validate().is_ok(), "{bps}");
+        }
+        agg.fees = Some(FeesConfig { proposer_share_bps: Some(10_001), ..FeesConfig::default() });
+        let e = agg.validate().unwrap_err();
+        assert!(matches!(e, GenesisError::ProposerShareOutOfRange(10_001)), "{e}");
+        assert!(e.to_string().contains("10000"), "{e}");
+
+        // A zero `prove_base` is no rule but a second hash: refused, naming the fix.
+        agg.fees = Some(FeesConfig { prove_base: Some(0), ..FeesConfig::default() });
+        let e = agg.validate().unwrap_err();
+        assert!(matches!(e, GenesisError::ProveBaseZero), "{e}");
+        assert!(e.to_string().contains("leave the field out"), "{e}");
     }
 
     /// Audit v6 (TOK-1, issue #86): `tokens.incremental_root` is committed to the genesis hash

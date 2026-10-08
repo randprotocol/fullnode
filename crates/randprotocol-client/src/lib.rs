@@ -197,6 +197,20 @@ pub struct ChainLimits {
     /// multisig action is admitted — and from a node that predates the field.
     #[serde(default)]
     pub multisig: Option<MultisigLimits>,
+    /// The genesis `fees.prove_base` (`docs/compute-optimization.md` §6.3), read off
+    /// `fee_rules.prove_base`: RAND units every bundle's floor rises by on an aggregating chain.
+    /// `0` where the node serves none — no `fee_rules`, `null`, or a node that predates the field
+    /// — and for a value that is not an amount (as [`fee_rules_of`] reads it). The wallet adds it
+    /// to every default fee it computes itself ([`RpcClient::prove_base`]).
+    #[serde(default, rename = "fee_rules", deserialize_with = "prove_base_of_fee_rules")]
+    pub prove_base: u64,
+}
+
+/// [`ChainLimits::prove_base`] out of the `fee_rules` object: its `prove_base` amount, `0` for
+/// anything else.
+fn prove_base_of_fee_rules<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    let rules = <Option<Value> as serde::Deserialize>::deserialize(d)?.unwrap_or(Value::Null);
+    Ok(amount_field(&rules["prove_base"]).unwrap_or(0))
 }
 
 /// `rand_getLimits.multisig`: what a `CreateMultisig` costs on top of the bundle's base, and the
@@ -405,6 +419,12 @@ pub fn fee_rules_of(limits: &Value) -> FeesConfig {
         // bucket entries, already `fee − floor` under the flag), but the struct mirrors the
         // chain's rules whole.
         burn_floor: rules["burn_floor"].as_bool(),
+        // The fee split (`docs/compute-optimization.md` §6.2–§6.3): the share a number in u32,
+        // `prove_base` an amount (a decimal string, or a number); anything else `None`. The
+        // daemon's note depends on neither — the shares it nets are the node's bucket entries,
+        // which already carry `prove_base` and the base part — but the struct mirrors the rules.
+        proposer_share_bps: rules["proposer_share_bps"].as_u64().and_then(|n| u32::try_from(n).ok()),
+        prove_base: amount_field(&rules["prove_base"]),
     }
 }
 
@@ -932,6 +952,14 @@ impl RpcClient {
     /// `subsidy_net_of_fees` chain never pays.
     pub async fn fee_rules(&self) -> Result<FeesConfig> {
         Ok(self.cached_limits().await?.fee_rules.clone())
+    }
+
+    /// The chain's `fees.prove_base` (`docs/compute-optimization.md` §6.3) off the same one cached
+    /// limits read: what a wallet adds to every floor it computes itself (`gas::fee_floor`, the
+    /// call floor) so a default fee pays the chain's floor. `0` from a node too old for the method
+    /// or the field, and on every chain without it. `rand_estimateFee` already includes it.
+    pub async fn prove_base(&self) -> Result<u64> {
+        Ok(self.cached_limits().await?.fee_rules.prove_base())
     }
 
     /// The one cached `rand_getLimits` read behind [`RpcClient::envelope_format`],
@@ -1720,6 +1748,7 @@ mod tests {
                 // Nor a program_state section.
                 program_state: None,
                 multisig: None,
+                prove_base: 0,
             })
         );
         let older = RpcClient::new(scripted_rpc(vec![]).await);
@@ -1871,7 +1900,7 @@ mod tests {
             })
             .await,
         );
-        let on = FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(true), burn_floor: None };
+        let on = FeesConfig { burn_base: Some(false), subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None };
         assert_eq!(rpc.fee_rules().await.unwrap(), on);
         assert_eq!(rpc.fee_rules().await.unwrap(), on);
         assert_eq!(rpc.envelope_format(7).await.unwrap(), EnvelopeFormat::Legacy);
@@ -1922,12 +1951,12 @@ mod tests {
     async fn fee_rules_of_tolerates_an_unknown_key_a_missing_key_and_a_non_bool_value() {
         use test_rpc::{scripted_rpc, Reply};
         let rules = |v: Value| fee_rules_of(&json!({ "max_proof_bytes": 2097152, "fee_rules": v }));
-        let all = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true) };
+        let all = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: Some(true), proposer_share_bps: None, prove_base: None };
         let fourth = json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true, "burn_tip": true });
         assert_eq!(rules(fourth.clone()), all, "an unknown fourth key is ignored");
         assert_eq!(
             rules(json!({ "burn_floor": true })),
-            FeesConfig { burn_base: None, subsidy_net_of_fees: None, burn_floor: Some(true) },
+            FeesConfig { burn_base: None, subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None },
             "only burn_floor: the absent flags read None"
         );
         assert_eq!(
@@ -1937,7 +1966,7 @@ mod tests {
         );
         assert_eq!(
             rules(json!({ "burn_base": false, "subsidy_net_of_fees": "yes", "burn_floor": true })),
-            FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: Some(true) },
+            FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None },
             "a real false is kept as Some(false), a stray string beside it is None"
         );
         assert!(!rules(json!({ "burn_base": "true" })).burn_base(), "a string \"true\" never switches a rule on");
@@ -1949,6 +1978,38 @@ mod tests {
         reply["fee_rules"] = fourth;
         let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(reply))]).await);
         assert_eq!(rpc.fee_rules().await.expect("an extra key is no error"), all, "the client path reads it the same");
+    }
+
+    /// The fee split (`docs/compute-optimization.md` §6.2–§6.3): [`fee_rules_of`] reads
+    /// `proposer_share_bps` as a number in range and `prove_base` as an amount (a decimal string,
+    /// as the node sends it, or a number); `null`, absent or junk reads `None`. The typed
+    /// [`ChainLimits`] carries `prove_base` for the wallet's floors, `0` when the node serves none,
+    /// and [`RpcClient::prove_base`] reads it off the one cached limits read.
+    #[tokio::test]
+    async fn fee_rules_of_reads_the_split_fields_and_the_wallet_sees_prove_base() {
+        use test_rpc::{scripted_rpc, Reply};
+        let rules = |v: Value| fee_rules_of(&json!({ "fee_rules": v }));
+        let both = rules(json!({ "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": 4000, "prove_base": "600000" }));
+        assert_eq!((both.proposer_share_bps, both.prove_base), (Some(4000), Some(600_000)));
+        assert_eq!(rules(json!({ "prove_base": 600000 })).prove_base, Some(600_000), "a number is an amount too");
+        let nulls = rules(json!({ "proposer_share_bps": null, "prove_base": null }));
+        assert_eq!((nulls.proposer_share_bps, nulls.prove_base), (None, None));
+        let junk = rules(json!({ "proposer_share_bps": 4294967296u64, "prove_base": "-1" }));
+        assert_eq!((junk.proposer_share_bps, junk.prove_base), (None, None), "out of u32, not an amount");
+
+        let mut reply = json!({
+            "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+            "max_call_envelope_bytes": 18432, "max_program_public_words": 64
+        });
+        let limits: ChainLimits = serde_json::from_value(reply.clone()).unwrap();
+        assert_eq!(limits.prove_base, 0, "no fee_rules: no prove_base");
+        reply["fee_rules"] = json!({ "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": null, "prove_base": "600000" });
+        let limits: ChainLimits = serde_json::from_value(reply.clone()).unwrap();
+        assert_eq!(limits.prove_base, 600_000);
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(reply))]).await);
+        assert_eq!(rpc.prove_base().await.unwrap(), 600_000);
+        let old = RpcClient::new(scripted_rpc(vec![]).await);
+        assert_eq!(old.prove_base().await.unwrap(), 0, "a node with no rand_getLimits: no prove_base");
     }
 
     /// Issue #64: every committed genesis file (`deploy/genesis-chain*.json`) of a chain that

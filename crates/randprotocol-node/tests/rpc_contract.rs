@@ -188,6 +188,8 @@ async fn start() -> common::TestNode {
             burn_base: Some(true),
             subsidy_net_of_fees: None,
             burn_floor: Some(true),
+            proposer_share_bps: None,
+            prove_base: None,
         });
         g.bridge = Some(common::bridge::bridge_config_for([0xaa; 32], &[TOKEN_CHAIN]));
         g.tokens = Some(TokensConfig {
@@ -411,7 +413,7 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
 
     // The exact values the fee rows above only type-check: this chain's two live rules.
     let limits = call(addr, "rand_getLimits", json!([])).await;
-    assert_eq!(limits["result"]["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true }));
+    assert_eq!(limits["result"]["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true, "proposer_share_bps": null, "prove_base": null }));
 
     node.shutdown().await;
 }
@@ -497,6 +499,8 @@ async fn fee_rules_under_all_three_flags() {
             burn_base: Some(true),
             subsidy_net_of_fees: Some(true),
             burn_floor: Some(true),
+            proposer_share_bps: None,
+            prove_base: None,
         });
     })
     .await;
@@ -513,9 +517,59 @@ async fn fee_rules_under_all_three_flags() {
     check(addr, &rows).await;
     assert_eq!(
         call(addr, "rand_getLimits", json!([])).await["result"]["fee_rules"],
-        json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true })
+        json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true, "proposer_share_bps": null, "prove_base": null })
     );
     assert_eq!(call(addr, "rand_getSupply", json!([])).await["result"]["base_fees_burned"], json!("0"));
+}
+
+/// The proposer/aggregator split (`docs/compute-optimization.md` §6.2–§6.3) on the wire:
+/// `fee_rules.prove_base` is a decimal string like every amount, `proposer_share_bps` a number, and
+/// `rand_estimateFee`'s bundle floor includes `prove_base`. Served without a node behind it, for
+/// the reason `fee_rules_under_all_three_flags` gives (an aggregating genesis).
+#[tokio::test]
+async fn fee_rules_serve_prove_base_as_a_decimal_string() {
+    use randprotocol_core::confidential::{ConfidentialExecutor, StubExecutor};
+    use randprotocol_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
+    use randprotocol_core::types::{DeclaredShape, FriProfile};
+
+    let (addr, _served) = common::serve_genesis(|g| {
+        let shape = DeclaredShape {
+            profile: FriProfile::Test,
+            tier: randprotocol_core::types::BUNDLE_PROOF_TIER,
+            program_log_height: 12,
+            input_log_height: 10,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: randprotocol_core::types::BUNDLE_PUBLIC_LOG_HEIGHT,
+            mem_log_height: 16,
+        };
+        g.aggregation = Some(AggregationConfig {
+            bond: 100 * randprotocol_core::UNITS_PER_RAND,
+            max_covers: 3,
+            subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![AdmittedShape {
+                shape,
+                hc: randprotocol_core::Hash(randprotocol_core::notes::word8_to_bytes(&randprotocol_zkvm::executor::ZkExecutor::hc_bundle())),
+                aggregate_program_digest: StubExecutor.aggregate_program_digest(&shape).unwrap(),
+            }],
+        });
+        g.fees = Some(randprotocol_core::ledger::fees::FeesConfig {
+            proposer_share_bps: Some(4000),
+            prove_base: Some(600_000),
+            ..Default::default()
+        });
+    })
+    .await;
+    let rows = [row("rand_getLimits", json!([]), "randprotocol-client src/lib.rs `fee_rules_of`, `ChainLimits::prove_base`", &[
+        ("fee_rules.prove_base", Dec),
+    ])];
+    check(addr, &rows).await;
+    let rules = call(addr, "rand_getLimits", json!([])).await["result"]["fee_rules"].clone();
+    assert_eq!(rules["prove_base"], json!("600000"), "an amount: a decimal string");
+    assert_eq!(rules["proposer_share_bps"], json!(4000), "a share: a number");
+    assert_eq!(call(addr, "rand_estimateFee", json!([{"kind": "bundle"}])).await["result"], json!("1600000"));
 }
 
 /// randprotocol.org's sale relay (server/sale/src/rpc.rs `RPC_ALLOWED`) forwards exactly the

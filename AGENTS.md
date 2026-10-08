@@ -4,7 +4,55 @@ Guidance for agents working in this repository. The README is the user-facing
 overview; this file is the durable project memory: review state, load-bearing
 invariants, and known traps.
 
-## Project memory (state as of 2026-10-02)
+## Project memory (state as of 2026-10-08)
+
+### rVM phase 3 + rate ¼ re-vendored (2026-10-08; branch `feat/rvm-rate-quarter-vendor`, NOT pushed)
+
+Circuits `71e1a04` (main; on the `randprotocol` remote) carries two rVM changes, vendored
+together: **phase 3** (`recursion/docs/06-phase3-fold-reduce.md`: the reduce chip's preprocessed
+layout, FOLD / POW row kinds; production inner proof 893 606 → 585 686 cpu rows, still tier 20)
+and **rate ¼** (`docs/07-rvm-rate-quarter.md`: the rVM's own proofs at log_blowup 2, 92 queries,
+24 grinding bits; 86.38 proven bits against 86.41; the inner RV32 profile stays 80/8/20). Phase 3
+moved the aggregate program digest `c90b3f0a…74d8` →
+**`dc350ecf6b60af74f4bb032bdf607c3fa0fbd6317705f0b1077e71b455e38ba0`** (production bundle shape);
+rate ¼ moved only rVM keys and proofs; `inner_vk_digest` `346ee184…` and the admission vectors
+(`3534960f…`) did not move; `admitted_tiers` unchanged ({20, 21, 22} / {18, 19, 20}). Node API
+follow-through in `agg_executor.rs`: `Machine::verifier_key` takes a reduce log-height (was a
+flag); `warm_aggregation(shape, max_covers)` (the trait gained `max_covers`) warms one key per
+admitted tier × `canonical_reduce_log_height(program, N)` for N ≤ `max_covers`; the node's own
+reduce-flag check is gone (the rVM's `verify_n` refuses a non-canonical height before key work);
+**production N ≤ 5** (`max_reduce_n`) is refused by name at `verify_aggregate`
+(`check_n_ceiling`) and at `rand-node genesis` (`check_admitted_covers`, a `max_covers` past it).
+Measured (test profile): the tier-18 twin 26.88 → 15.64 GB peak live; production N = 1 projected
+≈ 64–75 GB (≥ 96 GB host). `CIRCUITS_PIN` and both `rand-zkvm-cuda` revs are `71e1a04…`. Any
+future chain with an `aggregation` section needs every node on this build (keys and digest moved);
+none has one (chains 6–20; the chain-21 cut script refuses one).
+
+### The proposer/aggregator split (2026-10-08; branch `fix/fee-split`, NOT pushed; genesis-gated, on no chain)
+
+`docs/compute-optimization.md` §6.2–§6.3 as two optional `FeesConfig` fields, aggregating chains
+only (genesis refuses either without `aggregation`; share > 10000 refused): `proposer_share_bps`
+— the proposer keeps `kept_base − ⌊kept_base·(10000−bps)/10000⌋` of the base it keeps today
+(`BUNDLE_BASE`, 0 under `burn_base`); the aggregator's part rides in the bundle's one bucket entry
+(`BundleFeeSplit::base_bucketed`), paid by a cover, swept back to the proposer on expiry.
+`prove_base` — `Ledger::settled_floor` = `burnable_floor + prove_base`; the pre-verify, invoke and
+registration floors add it; bucketed whole (it is above `bucket_floor`), never burned (`fee_burn`
+burns `min(fee, burnable_floor)`, debug-asserted). `Ledger::prove_base()` is 0 off an aggregating
+chain. Hash: `proposer_share_bps` ‖ be32, `prove_base` ‖ be64, each when `Some`, after
+`burn_floor`. RPC `fee_rules` gains both (null when unset; `prove_base` a decimal string; every
+existing `fee_rules` object now carries the two nulls — rpc_contract updated); `rand_estimateFee`
+adds `prove_base`; client `ChainLimits.prove_base`, `RpcClient::prove_base`,
+`wallet::schedule_floor` for the CLI defaults. Recommended 4000 / 600000 once aggregation is
+admitted (`docs/deploy.md`). Trap: a test fixture that registers an aggregator at `BUNDLE_BASE`
+must do so before installing `prove_base`.
+
+### Compact blocks (2026-10-08, `feat/compact-blocks`; node-only wire change, flag-day roll)
+
+Spec `docs/superpowers/specs/2026-10-08-compact-blocks-design.md` (§0 lists the amendments), plan beside it in `plans/`; not merged. A leader publishes `GossipMessage::CompactProposal` (bincode tag 4): header, signature, transaction hashes. Receive is per-forwarder metering, `HotStuff::precheck_compact` (header only), one gossipsub report with that verdict, then a rebuild from the mempool and the recent-transactions cache (4 096 entries, `4 × max_block_bytes` bytes) — not committed storage. Missing bodies park the proposal (two slots by view: the band runs from `hs.view()` to one past the highest parked view; a park is never displaced by its own child) and are fetched by `SyncRequest::Transactions` in batches of 512; attempts are distinct peers (8), a `Busy` answer not counted. One header per (view, proposer): a leader's second header for its view is `Ignore`d, not rebuilt (`first_compact` keeps the first `SignedHeader`), and on a slashing chain the pair goes to `pool_equivocation` as `Action::Equivocation`, once per (view, proposer). A compact proposal the pre-screen `Ignore`s is dropped, never rebuilt (the I3 hand-on was reverted: the `Ignore` rules run before the signature check, so it let a keyless peer order rebuilds). Serving is on the loop from the pool and the cache, cut at `max_block_bytes + max_aggregate_bytes`. `rand_status.compact_fetched` counts the placed bodies. Measured in `docs/node-hardware.md` §8: 166 416 bytes a frame at 26 votes and 2 000 hashes; late validator fetched 8 of 8.
+
+Traps. **The flag day:** an old node Rejects `CompactProposal` and cannot decode the new sync variants, so it neither votes on nor relays them (no gossipsub peer scoring is configured, so a Reject only drops the message; old nodes are relay holes), and while more than a third of the stake is on the old build the new leaders' views time out — and since a commit needs three consecutive certified views (`commit_rule.rs`) and leaders rotate `view % n` (`validator.rs`), commits can stop entirely, not merely slow: blocks certify, none commit, the tree grows toward `max_tree_blocks`. Roll observers and archives first, then every validator at once with `deploy/roll-all.sh` — the only validator procedure, rollback included (`.prev` binaries); never stagger or batch (`docs/deploy.md`). **Tx gossip limit:** a body over the receiver's per-forwarder limit (`PEER_TX_BURST` 16, 4/s) is dropped unremembered and later fetched; the frame cluster test paces its mints for that reason. **Report exactly once** applies to the new gossip arm: the pre-screen's verdict is the one report, whether the proposal is rebuilt, parked or dropped. **Test helpers:** `bare_node` captures broadcasts and reports; `bare_node_answering` mints real `OutboundRequestId`s so fetch tests can follow a request to its answer. **Marker forms:** a pruned body shares the real transaction's id, so it is never cached, never used in a rebuild and never accepted from a fetch response.
+
+Known issue, pre-existing, not fixed here: a gossiped marker-form copy of a transaction can, through the admission `RefusedCache`, get the real transaction's id cached as refused for a bytes reason. Compact blocks recover through the fetch path, but the admission behaviour predates this branch; follow up in `admission.rs`.
 
 ### Multisig accounts (2026-10-08; branch `feat/multisig`, genesis-gated, on no chain; user guide `docs/multisig.md`, spec `docs/superpowers/specs/2026-10-08-multisig-design.md`)
 
@@ -103,7 +151,8 @@ from the swarm tests: a dialer's `PeerConnected` can arrive **before** its own `
 so a helper that consumes events until `Listening` drops it. `.github/workflows/coverage.yml`
 (cargo-llvm-cov over check-and-test's suites, uploaded to Codecov; the badge in README.md) needs
 the `CODECOV_TOKEN` org secret, set 2026-10-06. circuits' own `main` has moved on to the rVM
-phase 3 merge (`ed67809`); re-vendoring that is a separate job and NOT done here.
+phase 3 merge (`ed67809`); re-vendoring that was a separate job — done at `71e1a04` on
+`feat/rvm-rate-quarter-vendor` (2026-10-08, the section at the top).
 
 ### Validator hot path (2026-10-05, `feat/hot-path`)
 

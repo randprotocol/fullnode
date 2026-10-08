@@ -22,13 +22,15 @@ use randprotocol_zkvm::machine::FriProfile;
 static AGGREGATE_VERIFICATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// One admitted shape's aggregate program, built once (the interface review's INTERFACE-5): the
-/// inner verifier key, the program, its digest (step 7b's genesis-pin compare), and whether it
-/// uses the reduce instance (INTERFACE-4's flag check).
+/// inner verifier key, the program, its digest (step 7b's genesis-pin compare), and the rVM's
+/// N ceiling for it (`machine::max_reduce_n`: the most inner proofs whose reduce-chip rows fit
+/// `REDUCE_MAX_LOG_HEIGHT` — circuits `recursion/docs/06-phase3-fold-reduce.md` §3; 5 at the
+/// production bundle shape, 26 at the test fixture shape).
 struct BuiltProgram {
     vk: InnerVerifierKey,
     program: randprotocol_rvm::isa::Program,
     digest: [u64; 4],
-    reduces: bool,
+    max_n: u64,
 }
 
 /// A declared shape as a map key — `DeclaredShape` itself is not `Hash`, and is core's type.
@@ -93,11 +95,10 @@ impl AggExecutor {
         let program = aggregate_program(&vk);
         self.program_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let digest = program.digest().map(|f| f.as_canonical_u64());
-        // The reduce flag tracks the program, not a guess: `Precompiles::On` emits a REDUCE
-        // instruction per query opening, so the batch carries the reduce instance exactly when
-        // the program has such an instruction (`machine::verifier_key`'s third key component).
-        let reduces = program.instrs.iter().any(|i| matches!(i.op, randprotocol_rvm::isa::Op::Reduce));
-        let built = std::sync::Arc::new(BuiltProgram { vk, program, digest, reduces });
+        // The ceiling is the rVM's own function of the program (phase 3's reduce chip runs a fixed
+        // row count per inner proof), not a constant re-derived here.
+        let max_n = randprotocol_rvm::machine::max_reduce_n(&program);
+        let built = std::sync::Arc::new(BuiltProgram { vk, program, digest, max_n });
         let mut memo = self.programs.lock().expect("the program memo");
         if memo.len() < MAX_BUILT_PROGRAMS {
             memo.entry(key).or_insert_with(|| built.clone());
@@ -194,7 +195,12 @@ fn zkvm_profile(profile: randprotocol_core::types::FriProfile) -> FriProfile {
 /// tier is invalid" — the constraint-set-8 rungs). The phase-2 row cuts (circuits `75b7893`,
 /// `recursion/docs/04-phase2-row-cuts.md`) moved every rung one tier down: production N=1 lands
 /// at tier 20 (893 880 rows), N=2 at 21, N=3 and N=4 at 22; the test profile's N=1/2/3 at
-/// 18/19/20. The sets below are those rungs — three a profile, as the spec sized them.
+/// 18/19/20. Phase 3 (circuits `recursion/docs/06-phase3-fold-reduce.md`, docs/02 "The
+/// N-economics at the phase-3 tiers") keeps the sets: production N=1 at 20 (585 960 rows), N=2–3
+/// at 21, N=4–5 at 22 — and stops there, at the reduce chip's N ceiling (production N ≤ 5,
+/// `check_n_ceiling`; tier 22 would hold N ≤ 7 by cpu rows); test N=1 at 18, N=2–3 at 19, N=4–6 at
+/// 20 (by the row model; not measured). The rate-¼ profile (docs/07) moves no tier. The sets below are those rungs — three a
+/// profile, as the spec sized them.
 ///
 /// Nothing enforced this before (audit v3, AGG-3). `Machine::verify` accepts any tier on the
 /// ladder and builds the verifier key for whatever the proof declares *before* verifying it — so
@@ -220,6 +226,43 @@ pub fn check_tier(profile: FriProfile, tier: u8) -> Result<(), ConfidentialError
         "aggregate proof at tier {tier}; this chain admits {:?}",
         admitted_tiers(profile)
     )))
+}
+
+/// The rVM's N ceiling at admission (circuits docs/06 §3): an aggregate over `n` inner proofs is
+/// refused by name when `n` exceeds `max_n` (`machine::max_reduce_n` of the registered program).
+pub fn check_n_ceiling(n: usize, max_n: u64) -> Result<(), ConfidentialError> {
+    if n as u64 > max_n {
+        return Err(ConfidentialError::InvalidAggregateProof(format!(
+            "an aggregate over {n} bundles is past the rVM's N ceiling {max_n} for this shape (the reduce chip's \
+             REDUCE_MAX_LOG_HEIGHT; no verifiable proof exists)"
+        )));
+    }
+    Ok(())
+}
+
+/// The distinct canonical reduce heights for N = 1..=min(max_covers, ceiling), ascending — the
+/// heights `warm_aggregation` builds keys at. `canonical_reduce_log_height` is the rVM's own rule.
+fn warm_reduce_heights(program: &randprotocol_rvm::isa::Program, max_covers: u32) -> Vec<u8> {
+    let top = (max_covers as u64).min(randprotocol_rvm::machine::max_reduce_n(program));
+    let mut heights: Vec<u8> =
+        (1..=top).filter_map(|n| randprotocol_rvm::machine::canonical_reduce_log_height(program, n)).collect();
+    heights.dedup();
+    heights
+}
+
+/// The genesis half of the N ceiling: an `aggregation` section whose `max_covers` exceeds the
+/// rVM's ceiling for an admitted shape would let the ledger admit cover sets no aggregator can
+/// prove (production: N ≤ 5, circuits docs/06 §3). `rand-node genesis` runs it beside
+/// [`check_admitted_shape`]. Builds the aggregate program (seconds of DSL emission).
+pub fn check_admitted_covers(shape: &DeclaredShape, max_covers: u32) -> Result<(), ConfidentialError> {
+    let program = aggregate_program(&AggExecutor::inner_key(shape)?);
+    let max_n = randprotocol_rvm::machine::max_reduce_n(&program);
+    if max_covers as u64 > max_n {
+        return Err(ConfidentialError::BadDeclaredShape(format!(
+            "max_covers {max_covers} is past the rVM's N ceiling {max_n} for this shape (the reduce chip's REDUCE_MAX_LOG_HEIGHT)"
+        )));
+    }
+    Ok(())
 }
 
 impl ConfidentialExecutor for AggExecutor {
@@ -438,26 +481,28 @@ impl ConfidentialExecutor for AggExecutor {
         }
         let rvm_proof = self.aggregate_header(proof)?;
         let built = self.built_program(shape)?;
+        // The rVM's N ceiling (circuits docs/06 §3, phase 3's final fix wave), by name, before any
+        // key work: an aggregate over more inner proofs than the reduce chip holds has no
+        // verifiable reduce height — `prove` and `aggregate` refuse to make one — so no valid
+        // proof exists for it. The ledger's `max_covers` is the chain's own cap; this is the
+        // machine's, and a genesis whose `max_covers` exceeds it would admit Ns nobody can prove
+        // (`rand-node genesis` refuses that, `check_admitted_covers`). Production: N ≤ 5.
+        check_n_ceiling(covered.len(), built.max_n)?;
         let pvs: Vec<Vec<u64>> = covered.iter().map(|c| c.public_values.to_vec()).collect();
         // The list carries the transaction's own binding (audit v3, AGG-2), recomputed by the
         // ledger from `(chain, aggregator, nonce)`: a proof made under another triple digests
         // differently and is refused.
         let public = randprotocol_rvm::public_values::interface_words_bound(&built.vk.shape, &built.vk.key, binding, &pvs);
-        // The reduce flag, before `Machine::verify` builds a key (the interface review's
-        // INTERFACE-4). The rVM keys its verifier-key cache by `(tier, program, reduce)` and reads
-        // `reduce` off the proof's own `reduce_log_height`, so a proof declaring the reduce
-        // instance the registered program never emits — or omitting the one it does — bought a
-        // fresh key build (13 s test, 30–70 s production) and a slot in the 64-entry FIFO before
-        // its batch was ever looked at. The program decides the flag (`warm_aggregation`'s rule),
-        // so a mismatch is invalid by construction and refused here, in the node, without
-        // touching the vendored verifier.
-        if (rvm_proof.reduce_log_height != 0) != built.reduces {
-            return Err(ConfidentialError::InvalidAggregateProof(format!(
-                "the proof declares reduce_log_height {} but the registered aggregate program {} the reduce instance",
-                rvm_proof.reduce_log_height,
-                if built.reduces { "uses" } else { "never uses" }
-            )));
-        }
+        // The reduce height (the interface review's INTERFACE-4, AGG-3). The rVM keys its
+        // verifier-key cache by `(tier, program, reduce_log_height)`, and a proof declaring a
+        // height of its choosing used to buy a fresh key build (13 s test, 30–70 s production)
+        // and a slot in the 64-entry FIFO before its batch was looked at; the node refused the
+        // one case it could see (the reduce flag). Since phase 3 the rVM settles it itself:
+        // `verify_aggregate` passes the list's N (digest-bound, = `covered.len()` here) to
+        // `Machine::verify_n`, which refuses any height but
+        // `canonical_reduce_log_height(program, N)` as `ReduceHeightNotCanonical`, before any
+        // key work (circuits docs/06 §5). So a `(program, tier, N)` admits exactly one key, and
+        // `warm_aggregation` warms exactly those.
         let out = randprotocol_rvm::aggregate::verify_aggregate(
             &self.rvm,
             &built.program,
@@ -470,13 +515,14 @@ impl ConfidentialExecutor for AggExecutor {
     }
 
     /// The startup key-build (spec §2.3, `circuits/recursion/docs/02-aggregate.md` "Startup: the
-    /// key-build story"): build the N-generic program (seconds) and warm the rVM verifier key at
-    /// the N=1 aggregate's landing tier — 2¹⁹ test / 2²¹ production, the measured anchors — so
-    /// the first aggregate to arrive does not pay the ~30–70 s (production) build inside
-    /// admission. Aggregates covering more bundles land at higher tiers and warm their key on
-    /// first verify, once, into the same FIFO. A shape the rVM refuses to build is logged and
+    /// key-build story"): build the N-generic program (seconds) and warm one rVM verifier key per
+    /// admitted tier and per canonical reduce height for N = 1..=min(max_covers, the rVM's N
+    /// ceiling) — `machine::canonical_reduce_log_height(program, N)`, circuits docs/06 §5's
+    /// instruction (production: `2^18` / `2^19` / `2^20` at N = 1 / 2 / 3–5; test: `2^16` /
+    /// `2^17` at N = 1 / 2–3) — so no aggregate an honest prover can make pays the ~30–70 s
+    /// (production) build inside admission. A shape the rVM refuses to build is logged and
     /// skipped, not panicked on: genesis validation is where that refusal belongs.
-    fn warm_aggregation(&self, shape: &DeclaredShape) {
+    fn warm_aggregation(&self, shape: &DeclaredShape, max_covers: u32) {
         let t0 = std::time::Instant::now();
         // The memoised program (INTERFACE-5): the warm builds it once, and admission's step 7b
         // and step 8 reuse it.
@@ -487,17 +533,25 @@ impl ConfidentialExecutor for AggExecutor {
                 return;
             }
         };
-        let (program, reduce) = (&built.program, built.reduces);
+        let program = &built.program;
+        let heights = warm_reduce_heights(program, max_covers);
         // *Every* admitted tier, not just the N=1 landing tier (audit v3, AGG-3): an aggregate
         // covering two or three bundles lands higher, and paying its key build inside admission —
         // on the consensus loop — is what this warm exists to avoid. The tiers above N=1 are rarer,
-        // not cheaper.
+        // not cheaper. The full admitted tier × canonical height cross product is warmed because the
+        // verifier admits any such pair, including ones no valid proof can have (production tier 20
+        // at height 2^19): an unwarmed pair is a key build an attacker could make every replica pay
+        // on the consensus path.
         for tier in admitted_tiers(self.rvm.profile) {
-            let _ = self.rvm.verifier_key(program, randprotocol_rvm::machine::Tier(*tier as usize), reduce);
+            for h in &heights {
+                let _ = self.rvm.verifier_key(program, randprotocol_rvm::machine::Tier(*tier as usize), *h);
+            }
         }
         tracing::info!(
-            "aggregation: aggregate program built and the verifier keys for tiers {:?} warmed ({:.1?})",
+            "aggregation: aggregate program built and the verifier keys for tiers {:?} × reduce heights {:?} (N ≤ {}) warmed ({:.1?})",
             admitted_tiers(self.rvm.profile),
+            heights,
+            (max_covers as u64).min(built.max_n),
             t0.elapsed()
         );
     }
@@ -595,29 +649,59 @@ mod tests {
         proof.to_bytes()
     }
 
-    fn program_reduces(shape: &DeclaredShape) -> bool {
+    /// The canonical reduce height for the shape's aggregate program over `n` proofs.
+    fn canonical_height(shape: &DeclaredShape, n: u64) -> u8 {
         let program = aggregate_program(&AggExecutor::inner_key(shape).unwrap());
-        program.instrs.iter().any(|i| matches!(i.op, randprotocol_rvm::isa::Op::Reduce))
+        randprotocol_rvm::machine::canonical_reduce_log_height(&program, n).expect("n is under the ceiling")
     }
 
-    /// The interface review's INTERFACE-4: the rVM keys its verifier-key cache by `(tier,
-    /// program, reduce)` and takes `reduce` from the proof's own `reduce_log_height`. A proof
-    /// declaring the reduce instance the registered program does not use (or omitting the one it
-    /// does) is invalid by construction — but `Machine::verify` built and cached a verifier key
-    /// for it first: a 13 s (test) to 70 s (production) build, bought with garbage, evicting a
-    /// warm key from the 64-entry FIFO. The node refuses the flag mismatch before any key work.
+    /// The interface review's INTERFACE-4 (and AGG-3): the rVM keys its verifier-key cache by
+    /// `(tier, program, reduce_log_height)` and reads the height off the proof. A proof declaring
+    /// any height but the canonical one for its N — the old flipped flag, or any other rung — is
+    /// invalid by construction, and must not buy a 13 s (test) to 70 s (production) key build or
+    /// evict a warm key from the 64-entry FIFO. Since phase 3 the rVM's `verify_n` (through
+    /// `verify_aggregate`, with the list's N) refuses it before any key work; this pins that the
+    /// node's path reaches that refusal, for every non-canonical height a proof could name.
     #[test]
-    fn a_proof_whose_reduce_flag_is_not_the_programs_is_refused_before_any_key_build() {
+    fn a_proof_whose_reduce_height_is_not_canonical_is_refused_before_any_key_build() {
         let ex = AggExecutor::new(FriProfile::Test);
         let shape = fixture_free_shape();
         let covered = vec![CoveredBundle { public_values: [7; randprotocol_core::types::pv::NUM], shape }];
         let binding = [3u32; 8];
-        let flipped = if program_reduces(&shape) { 0 } else { randprotocol_rvm::machine::MIN_LOG_HEIGHT };
-        let proof = crafted_proof(&shape, &covered, &binding, admitted_tiers(FriProfile::Test)[0] as usize, flipped);
+        let canonical = canonical_height(&shape, 1);
+        for declared in [0, canonical - 1, canonical + 1, randprotocol_rvm::machine::REDUCE_MAX_LOG_HEIGHT] {
+            let proof = crafted_proof(&shape, &covered, &binding, admitted_tiers(FriProfile::Test)[0] as usize, declared);
+            let before = ex.rvm.cached_keys();
+            let err = ex.verify_aggregate(&shape, &covered, &proof, &binding).unwrap_err();
+            assert_eq!(ex.rvm.cached_keys(), before, "no verifier key was built for reduce height {declared}: {err}");
+            assert!(format!("{err}").contains("ReduceHeightNotCanonical"), "refused by name: {err}");
+        }
+    }
+
+    /// The rVM's N ceiling at admission (circuits docs/06 §3): one inner proof past
+    /// `max_reduce_n` is refused by name, before any key build — whatever height the proof
+    /// declares. The test fixture shape's ceiling is 26 (production's is 5).
+    #[test]
+    fn an_aggregate_past_the_rvms_n_ceiling_is_refused_by_name_before_any_key_build() {
+        let ex = AggExecutor::new(FriProfile::Test);
+        let shape = fixture_free_shape();
+        let program = aggregate_program(&AggExecutor::inner_key(&shape).unwrap());
+        let max_n = randprotocol_rvm::machine::max_reduce_n(&program);
+        assert!(max_n < 64, "the shape has a finite N ceiling ({max_n})");
+        let over = vec![CoveredBundle { public_values: [7; randprotocol_core::types::pv::NUM], shape }; max_n as usize + 1];
+        let binding = [3u32; 8];
+        let proof = crafted_proof(&shape, &over, &binding, admitted_tiers(FriProfile::Test)[0] as usize, randprotocol_rvm::machine::REDUCE_MAX_LOG_HEIGHT);
         let before = ex.rvm.cached_keys();
-        let err = ex.verify_aggregate(&shape, &covered, &proof, &binding).unwrap_err();
-        assert_eq!(ex.rvm.cached_keys(), before, "no verifier key was built for a flipped reduce flag: {err}");
-        assert!(format!("{err}").contains("reduce"), "refused by name: {err}");
+        match ex.verify_aggregate(&shape, &over, &proof, &binding) {
+            Err(ConfidentialError::InvalidAggregateProof(m)) => assert!(m.contains("N ceiling") && m.contains(&max_n.to_string()), "{m}"),
+            other => panic!("N = {} must be refused at the ceiling, got {other:?}", max_n + 1),
+        }
+        assert_eq!(ex.rvm.cached_keys(), before, "no verifier key was built past the ceiling");
+        // At the ceiling the gate passes (the proof is then refused later, as garbage).
+        assert!(check_n_ceiling(max_n as usize, max_n).is_ok());
+        // And the genesis half: a `max_covers` past the ceiling is refused, at it accepted.
+        assert!(check_admitted_covers(&shape, max_n as u32).is_ok());
+        assert!(matches!(check_admitted_covers(&shape, max_n as u32 + 1), Err(ConfidentialError::BadDeclaredShape(m)) if m.contains("N ceiling")));
     }
 
     /// The interface review's INTERFACE-5: step 7b's digest and step 8's verify each rebuilt the
@@ -644,9 +728,9 @@ mod tests {
             randprotocol_rvm::programs::aggregate_program_digest(&vk.shape, &vk.key).map(|f| p3_field::PrimeField64::as_canonical_u64(&f)),
             "the memoised digest is the rVM's own"
         );
-        // A verify at the same shape (refused at the reduce check, after the program is in hand).
-        let flipped = if program_reduces(&shape) { 0 } else { randprotocol_rvm::machine::MIN_LOG_HEIGHT };
-        let proof = crafted_proof(&shape, &covered, &binding, admitted_tiers(FriProfile::Test)[0] as usize, flipped);
+        // A verify at the same shape (refused at the reduce-height check, after the program is in hand).
+        let off_canonical = canonical_height(&shape, 1) + 1;
+        let proof = crafted_proof(&shape, &covered, &binding, admitted_tiers(FriProfile::Test)[0] as usize, off_canonical);
         assert!(ex.verify_aggregate(&shape, &covered, &proof, &binding).is_err());
         assert_eq!(ex.program_builds(), 1, "two digests and a verify: one build");
     }
@@ -909,13 +993,47 @@ mod tests {
         }
     }
 
-    /// The startup obligation (spec §2.3): one call builds the N-generic program and warms the
-    /// N=1 landing tier's verifier key into the FIFO. Smoke, not timing: it must simply run.
+    /// The startup obligation (spec §2.3): one call builds the N-generic program and warms one
+    /// verifier key per admitted tier and canonical reduce height for N = 1..=max_covers (circuits
+    /// docs/06 §5). At the test fixture shape and the chains' `max_covers` 3 that is heights
+    /// `2^16` (N=1) and `2^17` (N=2–3) — two heights × three tiers.
     #[test]
     fn warm_aggregation_builds_the_program_and_key() {
         let (shape, _) = covered(0);
         let w = AggExecutor::new(FriProfile::Test);
-        w.warm_aggregation(&shape);
+        let program = aggregate_program(&AggExecutor::inner_key(&shape).unwrap());
+        assert_eq!(warm_reduce_heights(&program, 3), vec![16, 17], "the canonical heights for N = 1..=3");
+        assert_eq!(warm_reduce_heights(&program, 1000).last(), Some(&randprotocol_rvm::machine::REDUCE_MAX_LOG_HEIGHT), "capped at the ceiling");
+        w.warm_aggregation(&shape, 3);
+        assert_eq!(w.rvm.cached_keys(), 2 * admitted_tiers(FriProfile::Test).len(), "one key per (tier, canonical height)");
+    }
+
+    /// The production warm heights: N = 1 / 2 / 3 at the production bundle shape are the
+    /// canonical `2^18` / `2^19` / `2^20`. DSL emission only (`aggregate_program`, no verifier
+    /// key build); the shape is read off the production fixture proof, which is not committed, so
+    /// without `Production-0.proof` in `RECURSION_FIXTURES` this skips.
+    #[test]
+    fn the_production_warm_heights_are_the_canonical_three() {
+        let dir = std::env::var_os("RECURSION_FIXTURES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/recursion"));
+        let Ok(bytes) = std::fs::read(dir.join("Production-0.proof")) else {
+            eprintln!("skipped: no Production-0.proof in {}", dir.display());
+            return;
+        };
+        let p: randprotocol_zkvm::machine::Proof = postcard::from_bytes(&bytes[32..]).expect("a production fixture proof decodes");
+        let shape = DeclaredShape {
+            profile: CoreProfile::Production,
+            tier: p.tier.0 as u8,
+            program_log_height: p.program_log_height,
+            input_log_height: p.input_log_height,
+            keccak_log_height: p.keccak_log_height,
+            sha256_log_height: p.sha256_log_height,
+            public_log_height: p.public_log_height,
+            mem_log_height: p.mem_log_height,
+        };
+        let program = aggregate_program(&AggExecutor::inner_key(&shape).unwrap());
+        assert_eq!(warm_reduce_heights(&program, 3), vec![18, 19, 20]);
     }
 
     /// The real round-trip: one fixture bundle proof aggregated by the rVM, the proof bytes

@@ -229,7 +229,19 @@ What it means for hardware:
   useful aggregate (measured); ≈ 240 GB projected after the phase-2 row cuts and ≈ 170–175 GB
   after the quotient layout, so a ≥ 256 GB host (below), a projection until the tier-20 proof runs.
   The earlier "≥ 64 GB" class came from a 48.6 GB oracle that the measurement disproved.
-- **N ≥ 2 at production does not fit any single CPU host** on offer, and the GPU backend does not
+- **rVM phase 3 and rate ¼ (circuits `71e1a04`, vendored 2026-10-08).** Measured on the
+  test profile (48 GB laptop, 16 threads, circuits `recursion/docs/06` §3 and `docs/07` §2): the
+  tier-18 exit twin (169 366 cpu rows, the test N = 1 aggregate's shape) peaks at **26.88 GB**
+  live after phase 3 and **15.64 GB** at rate ¼ (×0.58), verify 7.07 → 3.53 s; the test N = 2
+  aggregate (tier 19) **proved and verified** on that 48 GB host. Projected from the twin's ratio
+  (projections, nothing at production measured): production N = 1 (tier 20) ≈ 110–130 GB at
+  phase 3 → **≈ 64–75 GB at rate ¼, a ≥ 96 GB host**; N = 2 (tier 21) ≈ 122–142 GB (≥ 192 GB);
+  N = 3 (tier 21) ≈ 168–197 GB (≥ 256 GB); N = 4 (tier 22) ≈ 238–284 GB (≥ 384 GB). The ≤ 64 GB
+  class is at the edge, not met. **Production N ≤ 5** is the rVM's ceiling at this tree (the
+  reduce chip, `docs/aggregation.md`): no aggregate over more than five production bundle proofs
+  can be proved or verified, and the node refuses one by name.
+- **N ≥ 2 at production did not fit any single CPU host** on offer at constraint set 8 (the
+  projections above bring N = 2 under 192 GB; unproved), and the GPU backend does not
   change that: the traces live in host memory. Aggregating more than one proof needs a design
   change (smaller inner proofs, a different recursion layout, or trace streaming), tracked in
   issue #119 with the remaining soundness item.
@@ -488,3 +500,42 @@ sets are in memory by design: 80 M nullifiers cost about 9 GB here, which a vali
 Acceptance (`docs/compute-optimization.md` §3.6): passed on apply time and set size, and on
 memory under the amended criterion above. Exit 0, `apply_ms` 56.1 against the 300 ms bound at
 block 10 000, 80 000 000 nullifiers.
+
+## 8. Compact proposals on the wire (2026-10-08)
+
+Since the compact-blocks change (spec `docs/superpowers/specs/2026-10-08-compact-blocks-design.md`
+§1) a leader publishes a proposal as its header, its signature and its transaction hashes
+(`GossipMessage::CompactProposal`, bincode tag 4); the bodies cross the network once, on the
+transaction topic, and a replica rebuilds the block from its pool and recent cache, fetching by
+hash only what it never saw. Measured on the `feat/compact-blocks` branch, debug build. The
+source column says where each number comes from: most are printed by the test named beside them,
+two are derived from printed sizes and one is quoted from another page.
+
+| quantity | value | source |
+|---|---|---|
+| largest compact frame, four validators | 15 420 bytes carrying 4 transactions, mints paced one per node every 500 ms (before the pacing, a burst of all 32: 15 708 bytes carrying 13, and 15 804 carrying 16) | `tests/cluster.rs` `a_proposal_frame_carries_hashes_not_bodies`, raw gossipsub frames read by an observer swarm |
+| bodies fetched in that test | 0 on all four validators, paced (four runs); unpaced, 8 on each of three (24), the bodies n0 relayed past each receiver's per-forwarder limit (`PEER_TX_BURST` 16) | the same test, `compact_fetched` |
+| what those bodies cost on the tx topic | 32 mints, 32 frames, 168 096 bytes (5 253 bytes a mint) — so the 13 the unpaced run's largest frame named were about 68 KB of bodies (13 × 5 253, derived) the frame did not carry | the same test |
+| fixed part of a compact frame, four justify votes, no hashes | 19 080 bytes | `network::wire::tests::a_compact_proposal_at_26_validators_and_2000_hashes_is_its_header_plus_32_bytes_a_hash` |
+| compact frame at 26 justify votes, no hashes | 102 416 bytes | the same unit test |
+| compact frame at 26 justify votes and 2 000 hashes (the block cap) | **166 416 bytes** (printed) — exactly 2 000 × 32 more than with none | the same unit test (`bincode::serialized_size`) |
+| today's full proposal on chain 20 | up to the 20 MiB block cap: seven transfers at ~2.85 MB each (tier-14 bundle proof ~1.49 MB, tier-10 auth proof ~1.36 MB, envelopes) | quoted, not measured here: `docs/compute-optimization.md` §1.1 |
+| bodies a late validator fetched by hash | 8 of 8 (`compact_fetched` = 8 on its `rand_status`; 0 on the two validators that had them) in each of three runs | `tests/cluster.rs` `a_late_validator_fetches_bodies_it_never_saw` |
+
+Reading the table. The figures below are derived from the printed sizes, not printed
+themselves. One vote is (102 416 − 19 080) / 22 = 3 788 bytes, the difference between the
+26-vote and four-vote frames over their 22 extra votes. In the four-validator cluster the
+observed fixed part is 15 420 − 4 × 32 = 15 292 bytes (and 15 708 − 13 × 32 before the
+pacing), which is 19 080 − 3 788: consistent
+with three votes in the justify (a quorum) against the unit test's four. At 26 validators a
+quorum is 18, so a QC that carries exactly a quorum makes the cap-size frame about
+166 416 − 8 × 3 788 = 136 112 bytes (derived); the 166 416 in the table is the bound with every
+vote in. Either way a proposal on chain 20 falls from up to 20 MiB to under 170 KB on the
+consensus topic.
+
+The late-validator test is the fetch path end to end: two of a four-validator genesis run (no
+quorum, so nothing commits), eight faucet mints are pooled and gossiped between them, and a third
+validator joins only after gossipsub's 2.5 s history window has passed, so it never sees the
+bodies. Its arrival makes the quorum; the first proposal that names the mints parks on it, the
+eight bodies are fetched by hash (`SyncRequest::Transactions`), and it votes and commits the
+same chain (`assert_chains_equal`). Fetch latency was not timed.

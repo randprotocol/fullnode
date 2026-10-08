@@ -143,7 +143,7 @@ block's bytes in `Mempool::candidates_within`, and what the Calls leave of the l
 filled with the transfers held back — no block space is wasted, and with no Call pooled nothing
 changes. A hostile proposer can ignore it; an honest one on chain 18 runs it today.
 
-### 1.3 The `fees` section: the burns and a fee-first subsidy (genesis-gated, on no chain yet)
+### 1.3 The `fees` section: the burns, a fee-first subsidy and the proposer/aggregator split (genesis-gated, on no chain yet)
 
 Every fee above goes to the block's proposer today, in full (or, on an aggregating chain, the
 floor to the proposer and the excess to the proof bucket, `docs/aggregation.md`), and an
@@ -153,10 +153,13 @@ provers as much as an idle one, and gives its holders nothing. The agent-driven 
 `superpowers/plans/2026-10-05-fee-feedback.md`) found two variants worth having — the EIP-1559
 shape, burn the base and tip the rest, and the proving-auction shape, pay the prover from fees
 first and mint only the shortfall — and a genesis `fees` section switches each on, with a third
-flag, `burn_floor`, for the faithful EIP-1559 form (issue #135):
+flag, `burn_floor`, for the faithful EIP-1559 form (issue #135). Two numeric fields carry the
+compute-optimization proposal's proposer/aggregator split (`docs/compute-optimization.md` §6.2–§6.3),
+below:
 
 ```json
-"fees": { "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true }
+"fees": { "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true,
+          "proposer_share_bps": 4000, "prove_base": 600000 }
 ```
 
 All three flags are optional booleans and **off by default**, following
@@ -167,13 +170,14 @@ and `META_BASE_FEES_BURNED` (0) at genesis whether or not the file has one, and 
 without them opens unchanged, reading both as their defaults. A `true` flag is committed to the
 genesis hash right after the `tokens` section's bytes: `b"fees"`, then `b"burn_base"` ‖ `1` if
 `burn_base`, then `b"subsidy_net_of_fees"` ‖ `1` if `subsidy_net_of_fees`, then `b"burn_floor"` ‖
-`1` if `burn_floor`, in that order, and nothing at all when none is `true` (pinned by
-`the_fees_sections_hash_contribution_is_pinned`; `burn_floor` comes last so every hash pinned over
-the first two flags stays put). An unknown key in the section is refused, so a misspelt flag cannot
+`1` if `burn_floor`, then `b"proposer_share_bps"` ‖ be32 and `b"prove_base"` ‖ be64, each only when
+set, in that order, and nothing at all when no flag is `true` and neither number is set (pinned by
+`the_fees_sections_hash_contribution_is_pinned` and `the_fee_split_fields_hash_contributions_are_pinned`;
+each newer field comes after the older ones so every hash pinned over them stays put). An unknown key in the section is refused, so a misspelt flag cannot
 read as "off". It is a genesis parameter, never state: on the ledger as `Ledger::fees`, stored under
 `META_FEES` (JSON, written on every new database — `{}` without a section) and set again from the
 genesis file by `reload_ledger` on every restart, the file being the authority. `rand_getLimits`
-serves it as `fee_rules`, `null` on a chain without a `true` flag. Dollar-indexed prover pay (the
+serves it as `fee_rules`, `null` on a chain without a `true` flag or a set number. Dollar-indexed prover pay (the
 study's per-prover-day target) is out of scope: it needs a price oracle the chain does not have.
 
 **`burn_base`.** In the bundle fee split (`Ledger::apply_tx_with`) every bundle's
@@ -292,6 +296,50 @@ bucketed excess `fee − BUNDLE_BASE` is the share this rule nets against (`fee 
 `burn_floor` too). The 0.0012 RAND transfer
 above burns 0.001 and contributes its 0.0002 to the shares a covering aggregate nets against the
 schedule.
+
+**`proposer_share_bps` and `prove_base`** (`docs/compute-optimization.md` §6.2–§6.3). The
+compute-optimization proposal splits every covered bundle's fee between the two kinds of work it
+buys: verification, the proposer's, and proving, the covering aggregator's. Both fields need an
+`aggregation` section (`GenesisError::ProposerShareWithoutAggregation`,
+`GenesisError::ProveBaseWithoutAggregation`) — there is no aggregator and no bucket without one —
+and `proposer_share_bps` is at most 10 000 (`GenesisError::ProposerShareOutOfRange`). Each is
+absent by default, and absent is the chain without it, byte for byte. `prove_base: 0` is refused
+(`GenesisError::ProveBaseZero`): it runs exactly as no `prove_base` but would hash as a second
+chain, so leave the field out instead.
+
+- **`proposer_share_bps`** (0..=10 000; the proposal's value is 4 000; 0 and 10 000 are real
+  rules — the whole base to the aggregator, or to the proposer — and both hash). Of the base the proposer
+  keeps at inclusion today — `BUNDLE_BASE`, or `0` under `burn_base` (and so under `burn_floor`),
+  where the base is burned and there is no share to split — it keeps `proposer_share_bps / 10 000`.
+  The rest is **bucketed beside the excess**, in the bundle's one bucket entry
+  (`excess + aggregator part`): a covering aggregate is paid it as proving share, and an entry
+  that expires uncovered is swept back to the recorded proposer exactly as an excess is — so an
+  uncovered bundle pays the proposer the whole base in the end, nothing is lost, and `fees_paid`
+  moves at inclusion by the proposer's part and at the sweep by the rest. The aggregator's part
+  rounds down, so the proposer's is the remainder-free one:
+  `aggregator part = ⌊kept_base · (10 000 − bps) / 10 000⌋`, `proposer part = kept_base − aggregator part`.
+- **`prove_base`** (RAND units; the proposal's 0.0006 RAND is 600 000) — the aggregated lane's floor
+  for the proving share. Every bundle's ledger floor rises by it: `Ledger::settled_floor`, the
+  pre-verify floor, an invoke's and a registration's floor alike, so a bundle paying the old floor
+  is `FeeTooLow` naming the new minimum. It is bucketed whole: proving share, never the proposer's
+  at inclusion and **never burned** — under `burn_floor` the burned amount is the floor *without*
+  `prove_base` (asserted in the fee split). `rand_estimateFee` includes it, and the wallet adds the
+  served `fee_rules.prove_base` to every default it computes itself.
+
+| chain, rules | proposer keeps at inclusion | bucketed for the aggregator | destroyed |
+| --- | --- | --- | --- |
+| `aggregation`, `proposer_share_bps` | `BUNDLE_BASE · bps / 10 000` (rounded up) | `fee − proposer part` (tip, `prove_base`, the rest of the base) | — |
+| `aggregation`, `burn_base` + share | `0` | `fee − BUNDLE_BASE` | `BUNDLE_BASE` |
+| `aggregation`, `burn_floor` + `prove_base` | `0` | `fee − (floor − prove_base)` | `floor − prove_base` |
+
+Worked, on an aggregating chain under `proposer_share_bps: 4000`: a 0.0012 RAND transfer pays
+0.0004 to the proposer at inclusion (`fees_paid` +400 000) and buckets 0.0008 — 0.0006 of base
+and the 0.0002 tip; a covering aggregate's proving share is the 0.0008, and an uncovered one's
+sweep pays the proposer the 0.0008. With `prove_base: 600000` as well, the floor is 0.0016 RAND,
+so the same 0.0002 tip is a 0.0018 RAND fee: 0.0004 to the proposer and 0.0014 bucketed (0.0006
+of base, 0.0006 `prove_base`, 0.0002 tip). Under `burn_base` the share has nothing to split: the
+0.001 base burns and the bucket holds the tip (and `prove_base`). Under `subsidy_net_of_fees` the
+shares the schedule is netted against carry `prove_base` and the aggregator's part of the base.
 
 ## 2. What the sender pays with its own machine: proving
 

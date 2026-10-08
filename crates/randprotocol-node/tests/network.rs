@@ -7,11 +7,9 @@
 //! swarm's policy — which topic, which id, which verdict forwards, which failure comes back and
 //! how fast — and not the consensus logic above it (`cluster.rs` has that).
 
-use libp2p::futures::StreamExt;
-use libp2p::gossipsub::{self, IdentTopic, MessageAuthenticity, TopicHash, ValidationMode};
+use libp2p::gossipsub::MessageAuthenticity;
 use libp2p::multiaddr::Protocol;
-use libp2p::swarm::SwarmEvent;
-use libp2p::{identity, noise, tcp, yamux, Multiaddr, PeerId, Swarm};
+use libp2p::{identity, Multiaddr, PeerId};
 use randprotocol_core::consensus::{CommittedBlock, NotHeld, SigningDomain};
 use randprotocol_core::types::block::{Block, BlockHeader, QuorumCertificate, Vote};
 use randprotocol_core::{Hash, Keypair};
@@ -21,6 +19,9 @@ use randprotocol_node::network::{
 };
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+mod common;
+use common::observer::Observer;
 
 const CHAIN: u64 = 7;
 
@@ -128,87 +129,6 @@ async fn gossip_until_delivered(from: &NetworkHandle, to: &mut Peer, status: Sta
         }
     }
     panic!("status {height} was never delivered");
-}
-
-// ------------------------------------------- an observer: a bare gossipsub swarm
-
-/// A gossipsub swarm of its own, subscribed to the chain's four topics, with no node behind it:
-/// it sees which topic a message arrives on and can publish raw bytes.
-struct Observer {
-    swarm: Swarm<gossipsub::Behaviour>,
-    topics: Vec<IdentTopic>,
-}
-
-struct Seen {
-    topic: TopicHash,
-    source: Option<PeerId>,
-    data: Vec<u8>,
-}
-
-impl Observer {
-    fn new(chain_id: u64, authenticity: MessageAuthenticity) -> Observer {
-        let gcfg = gossipsub::ConfigBuilder::default()
-            .validation_mode(ValidationMode::Permissive)
-            .heartbeat_interval(Duration::from_millis(200))
-            .build()
-            .unwrap();
-        let gs = gossipsub::Behaviour::new(authenticity, gcfg).unwrap();
-        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity::Keypair::generate_ed25519())
-            .with_tokio()
-            .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
-            .unwrap()
-            .with_behaviour(|_| gs)
-            .unwrap()
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-            .build();
-        let topics: Vec<IdentTopic> =
-            ["consensus", "tx", "status", "peers"].iter().map(|t| IdentTopic::new(format!("rand/{chain_id}/{t}"))).collect();
-        for t in &topics {
-            swarm.behaviour_mut().subscribe(t).unwrap();
-        }
-        Observer { swarm, topics }
-    }
-
-    fn topic(&self, name: &str) -> IdentTopic {
-        self.topics.iter().find(|t| t.to_string().ends_with(&format!("/{name}"))).cloned().unwrap()
-    }
-
-    /// Dial `target` and pump the swarm until the connection is up.
-    async fn connect(&mut self, target: &Multiaddr) {
-        self.swarm.dial(target.clone()).unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            tokio::select! {
-                ev = self.swarm.select_next_some() => {
-                    if let SwarmEvent::ConnectionEstablished { .. } = ev { return; }
-                }
-                _ = tokio::time::sleep_until(deadline) => panic!("the observer never connected"),
-            }
-        }
-    }
-
-    /// Pump the swarm for `dur`, keeping the messages it delivered.
-    async fn pump(&mut self, dur: Duration) -> Vec<Seen> {
-        let deadline = tokio::time::Instant::now() + dur;
-        let mut seen = Vec::new();
-        loop {
-            tokio::select! {
-                ev = self.swarm.select_next_some() => {
-                    if let SwarmEvent::Behaviour(gossipsub::Event::Message { message, .. }) = ev {
-                        seen.push(Seen { topic: message.topic, source: message.source, data: message.data });
-                    }
-                }
-                _ = tokio::time::sleep_until(deadline) => return seen,
-            }
-        }
-    }
-
-    /// Publish `data` on `topic` (a duplicate or a mesh not yet formed is not an error here;
-    /// the caller retries) and pump briefly so it goes out.
-    async fn publish(&mut self, topic: &IdentTopic, data: Vec<u8>) {
-        let _ = self.swarm.behaviour_mut().publish(topic.clone(), data);
-        let _ = self.pump(Duration::from_millis(100)).await;
-    }
 }
 
 // ------------------------------------------- blocks for the sync wire

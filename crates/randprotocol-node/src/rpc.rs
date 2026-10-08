@@ -222,6 +222,11 @@ pub struct NodeStatus {
     /// Batches applied after their request had been given up on. Progress rather than failure, but
     /// a rising count means the give-up is firing on requests that were still alive.
     pub sync_late_batches: u64,
+    /// Transaction bodies fetched by hash for compact proposals and placed (spec 2026-10-08
+    /// §5.3): what this node's mempool and recent cache did not already hold when a proposal
+    /// named it. Near zero on a well-connected validator; a steady climb says its transaction
+    /// gossip is not arriving.
+    pub compact_fetched: u64,
     /// Free bytes on the data directory's filesystem, measured at startup and every status tick
     /// (audit v4 OPS-3).
     pub disk_free_bytes: u64,
@@ -768,9 +773,9 @@ pub struct ChainLimits {
     pub multisig: Option<MultisigLimits>,
     /// Fee feedback (`docs/fees.md` §1.3): the genesis `fees` section's three rules, `null` on a
     /// chain without one — and on one whose section sets no flag `true`, which is the section's
-    /// absence in every respect (it hashes as absent too). Wallet fees do not change with it: the
-    /// floors are the same numbers, only where the base (or, under `burn_floor`, the whole
-    /// floor) goes differs.
+    /// absence in every respect (it hashes as absent too). The three flags leave wallet fees
+    /// alone (the floors are the same numbers, only where the base, or under `burn_floor` the
+    /// whole floor, goes differs); `prove_base` raises every floor, and `rand_estimateFee` adds it.
     pub fee_rules: Option<FeeRules>,
 }
 
@@ -781,6 +786,13 @@ pub struct FeeRules {
     pub subsidy_net_of_fees: bool,
     /// Issue #135: under `burn_base`, the bundle's whole settled floor burns, not its base alone.
     pub burn_floor: bool,
+    /// The proposer/aggregator split of the base (`docs/compute-optimization.md` §6.2): the
+    /// proposer's part in basis points, the rest bucketed as proving share; `null` when unset.
+    pub proposer_share_bps: Option<u32>,
+    /// The proving-share floor (§6.3), RAND units added to every bundle's floor — a decimal
+    /// string like every amount, `null` when unset. `rand_estimateFee` already includes it.
+    #[serde(serialize_with = "opt_u64_as_decimal_string")]
+    pub prove_base: Option<u64>,
 }
 
 /// `rand_getLimits`' `program_state` object: what a wallet needs to size and price an `Invoke`.
@@ -845,6 +857,8 @@ impl ChainLimits {
                 burn_base: f.burn_base(),
                 subsidy_net_of_fees: f.subsidy_net_of_fees(),
                 burn_floor: f.burn_floor(),
+                proposer_share_bps: f.proposer_share_bps(),
+                prove_base: f.prove_base,
             }),
         };
         if let Some(g) = ledger.gas() {
@@ -3083,7 +3097,10 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 }
                 _ => return Err(RpcError::invalid_params("kind must be bundle, deploy, call or invoke")),
             };
-            Ok(json!(fee.to_string()))
+            // `fees.prove_base` (`docs/compute-optimization.md` §6.3) raises every bundle's floor
+            // on an aggregating chain, every kind alike; 0 elsewhere.
+            let prove_base = st.limits.fee_rules.as_ref().and_then(|f| f.prove_base).unwrap_or(0);
+            Ok(json!(fee.saturating_add(prove_base).to_string()))
         }
         "rand_getTransaction" => {
             let h = parse_hash(p, 0)?;
@@ -4442,7 +4459,7 @@ pub(crate) mod tests {
     /// so `subsidy + proving_share` is still the payout note's amount, `max(schedule, shares)`.
     #[tokio::test]
     async fn get_aggregate_reports_the_minted_subsidy_under_subsidy_net_of_fees() {
-        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None };
+        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None };
         let (_d, st, _gs, _covered_tx, aggregate) = gated_chain_with(fees);
         let v = ok(&st, "rand_getAggregate", json!([aggregate.hash().to_hex()])).await;
         assert_eq!(v["subsidy"], (100 * randprotocol_core::UNITS_PER_RAND - 60).to_string(), "only the shortfall");
@@ -4463,7 +4480,7 @@ pub(crate) mod tests {
     /// one committed block by block.
     #[tokio::test]
     async fn the_aggregate_record_is_the_ledgers_payment_when_cover_and_aggregate_commit_together() {
-        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None };
+        let fees = randprotocol_core::ledger::fees::FeesConfig { burn_base: None, subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None };
         let (_d, live, gs, _covered_tx, aggregate, blocks, l2) = gated_chain_blocks(fees);
         let (_d2, synced) = state_for(&gs);
         synced.storage.commit(&blocks, &l2, &[], &StubExecutor).unwrap();
@@ -5953,7 +5970,7 @@ pub(crate) mod tests {
         assert_eq!(ok(&st, "rand_getSupply", json!([])).await["base_fees_burned"], Value::String("0".into()), "a plain chain");
 
         let mut gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
-        gs.ledger.set_fees(randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None });
+        gs.ledger.set_fees(randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None });
         gs.ledger.set_genesis_supply(1_000 * BUNDLE_BASE, gs.ledger.supply().genesis_staked);
         let (_d, st) = state_for(&gs);
         let mut ledger = st.storage.load_ledger(&StubExecutor).unwrap();
@@ -5981,14 +5998,63 @@ pub(crate) mod tests {
             let (_d, st) = state_for(&gs);
             ok(&st, "rand_getLimits", json!([])).await
         };
-        let off = limits_with(FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: None }).await;
+        let off = limits_with(FeesConfig { burn_base: Some(false), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None }).await;
         assert_eq!(off["fee_rules"], Value::Null, "a section with no true flag is no section");
-        let on = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None }).await;
-        assert_eq!(on["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": false }));
+        let on = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None }).await;
+        assert_eq!(on["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": null, "prove_base": null }));
         assert_eq!(on["gas_metering"], Value::Null, "nothing else moves");
         // Issue #135: the full-floor burn is served beside the base it widens.
-        let floor = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) }).await;
-        assert_eq!(floor["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true }));
+        let floor = limits_with(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None }).await;
+        assert_eq!(floor["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true, "proposer_share_bps": null, "prove_base": null }));
+    }
+
+    /// The fee split (`docs/compute-optimization.md` §6.2–§6.3): on an aggregating chain under
+    /// `fees { proposer_share_bps: 4000, prove_base: 600000 }`, `rand_getLimits.fee_rules` serves
+    /// both — the share as a number, `prove_base` as a decimal string like every amount — and
+    /// `rand_estimateFee` adds `prove_base` to every kind's floor, so a wallet's default pays the
+    /// chain's floor. Each field alone serves the other as `null`.
+    #[tokio::test]
+    async fn fee_rules_serve_the_split_and_estimate_fee_adds_prove_base() {
+        use randprotocol_core::gas::{self, BUNDLE_BASE};
+        use randprotocol_core::ledger::FeesConfig;
+        let served = |fees: FeesConfig| async move {
+            let mut gs = genesis_with(7, vec![alloc_note(20, 1_000)]);
+            gs.ledger.set_aggregation(Some(randprotocol_core::ledger::aggregation::AggregationConfig {
+                bond: 100 * randprotocol_core::UNITS_PER_RAND,
+                max_covers: 3,
+                subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
+                halving_blocks: 210_000,
+                window: 256,
+                admitted_shapes: vec![],
+            }));
+            gs.ledger.set_fees(fees);
+            let (d, st) = state_for(&gs);
+            (d, st)
+        };
+        let (_d, st) = served(FeesConfig { proposer_share_bps: Some(4000), prove_base: Some(600_000), ..FeesConfig::default() }).await;
+        assert_eq!(
+            ok(&st, "rand_getLimits", json!([])).await["fee_rules"],
+            json!({ "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": 4000, "prove_base": "600000" })
+        );
+        let fee = |spec: Value| {
+            let st = &st;
+            async move { ok(st, "rand_estimateFee", json!([spec])).await.as_str().unwrap().parse::<u64>().unwrap() }
+        };
+        assert_eq!(fee(json!({"kind": "bundle"})).await, BUNDLE_BASE + 600_000);
+        assert_eq!(fee(json!({"kind": "deploy", "words": 10})).await, BUNDLE_BASE + gas::deploy_fee(10) + 600_000);
+        assert_eq!(fee(json!({"kind": "call", "tier": 12})).await, BUNDLE_BASE + gas::call_fee(12, 0) + 600_000);
+
+        let (_d, st) = served(FeesConfig { proposer_share_bps: Some(4000), ..FeesConfig::default() }).await;
+        assert_eq!(
+            ok(&st, "rand_getLimits", json!([])).await["fee_rules"],
+            json!({ "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": 4000, "prove_base": null })
+        );
+        assert_eq!(ok(&st, "rand_estimateFee", json!([{"kind": "bundle"}])).await, BUNDLE_BASE.to_string(), "no prove_base, no change");
+        let (_d, st) = served(FeesConfig { prove_base: Some(600_000), ..FeesConfig::default() }).await;
+        assert_eq!(
+            ok(&st, "rand_getLimits", json!([])).await["fee_rules"],
+            json!({ "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": null, "prove_base": "600000" })
+        );
     }
 
     /// Issue #135 over the whole RPC surface, every flag on: `fees { burn_base,
@@ -6036,7 +6102,7 @@ pub(crate) mod tests {
         let (_d, st) = state_for(&gs);
         assert_eq!(
             ok(&st, "rand_getLimits", json!([])).await["fee_rules"],
-            json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true }),
+            json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true, "proposer_share_bps": null, "prove_base": null }),
             "all three flags served"
         );
 

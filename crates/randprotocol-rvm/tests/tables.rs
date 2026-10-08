@@ -170,7 +170,7 @@ use randprotocol_rvm::tables::{cpu, memory, poseidon2, program as program_table,
 
 #[test]
 fn the_table_widths_and_constraint_degrees_are_pinned() {
-    assert_eq!(cpu::col::WIDTH, 82, "72 + the HINTN selector + its eight word columns (Cut B) + the COMPRESS selector (Cut C)");
+    assert_eq!(cpu::col::WIDTH, 84, "72 + the HINTN selector + its eight word columns (Cut B) + the COMPRESS selector (Cut C) + the FOLD and POW selectors (phase 3)");
     assert_eq!(memory::col::WIDTH, 11);
     assert_eq!(program_table::col::WIDTH, 3);
     assert_eq!(program_table::pre::WIDTH, 4);
@@ -183,6 +183,7 @@ fn the_table_widths_and_constraint_degrees_are_pinned() {
             Instr { op: Op::Halt, rd: 0, ra: 0, b: F::ZERO },
         ],
         checkpoints: vec![],
+        reduce_layout: vec![],
     };
     // In `chips()` order: program, cpu, reg_memory, ram_memory, poseidon2, public, range.
     let degs = randprotocol_rvm::machine::max_constraint_degrees(&p, Tier(8));
@@ -202,212 +203,209 @@ fn the_table_widths_and_constraint_degrees_are_pinned() {
 /// last, and the other seven unchanged by its presence.
 #[test]
 fn the_reduce_chip_width_and_constraint_degree_are_pinned() {
-    assert_eq!(reduce_table::col::WIDTH, 39, "the reduce chip's designed width (Task 8's run row, ZKQ-3's range limbs)");
-    let p = Program {
-        instrs: vec![
-            Instr { op: Op::Faddi, rd: 2, ra: 0, b: F::from_u64(200) },
-            Instr { op: Op::Reduce, rd: 0, ra: 2, b: F::ZERO },
-            Instr { op: Op::Halt, rd: 0, ra: 0, b: F::ZERO },
-        ],
-        checkpoints: vec![],
-    };
+    assert_eq!(reduce_table::col::WIDTH, 81, "Cut D's 30 + the fold kind's 40 (Cut E2) + the pow kind's 11 (Cut F)");
+    assert_eq!(reduce_table::pre::WIDTH, 20, "preprocessed 9 + the 11-column coefficient table (Cut E2)");
+    let p = common::reduce_chain_program(true);
     let degs = randprotocol_rvm::machine::max_constraint_degrees_declaring(&p, Tier(8), true);
     assert_eq!(degs.len(), 8, "program, cpu, reg, ram, poseidon2, public, range, reduce");
     assert_eq!(&degs[..7], &[2, 8, 4, 4, 4, 2, 2], "declaring the reduce chip moves no other table's degree");
     // Measured: 8 — like the cpu's, this config's budget ceiling (`log2_ceil(degree − 1) ≤
     // log_blowup = 3`), so the reduce chip has no degree headroom left: one more degree-2 factor on
     // any of its lookups or constraints and the batch needs a larger blowup. That is what a pin is
-    // for.
-    assert_eq!(degs[7], 8);
+    // for. Cut D made every message degree 1 (counts and values are columns); the measured value
+    // did not move: 8 → 8. Cut E2's fold kind (two buses, four more RAM sends, every constraint
+    // degree 2 before gating) measured 8 → 8 as well, and so did Cut F's pow kind (one more
+    // lookup bus, two RAM sends, two RANGE8 lookups; its product step is degree 5 after gating).
+    assert!(degs[7] <= 8, "the reduce chip's degree must stay within log_blowup = 3");
+    assert_eq!(degs[7], 8, "Cut D, Cut E2, Cut F: the reduce chip's degree, measured (≤ 8)");
 }
 
-// ── The reduce chip's run rules, read off `ReduceAir::eval` (the 2026-09-27 zk scan) ──────────
+// ── The reduce chip's run rules after Cut D (read off `ReduceAir::eval`) ─────────────────────
 use randprotocol_rvm::tables::{bus, reduce as reduce_table};
+
+fn reduce_air() -> reduce_table::ReduceAir {
+    reduce_table::ReduceAir::new(std::sync::Arc::new(vec![]), 16)
+}
+
+/// The run row kind's own columns (Cut D's 30); the fold and pow kinds (Tasks 3–4) append theirs
+/// after it, and these rule tests hold them at zero — they are about run rows.
+const REDUCE_KIND_COLS: usize = 30;
 
 fn reduce_row(real: bool, first: bool, rng: &mut impl rand::Rng) -> Vec<F> {
     use reduce_table::col::*;
-    let mut r: Vec<F> = (0..WIDTH).map(|_| common::random_felt(rng)).collect();
+    let mut r: Vec<F> = (0..WIDTH).map(|c| if c < REDUCE_KIND_COLS { common::random_felt(rng) } else { F::ZERO }).collect();
     r[IS_REAL] = F::from_bool(real);
     r[IS_FIRST] = F::from_bool(first);
     r
 }
 
-/// OPCODES-1 / TABLES-1, as a rule: every column a run row's RAM messages use as an *address* or
-/// a *timestamp* must be carried from the row before by a transition constraint — one that, with
-/// the next row inside the same run, depends on the next row's copy of the column, and with the
-/// next row starting a new run does not (a run's first row is bound by the cpu's dispatch
-/// instead). Only then is a later row's memory traffic at the address and the clock the dispatch
-/// named, rather than wherever the prover put it.
-#[test]
-fn every_reduce_run_row_carries_its_addresses_and_clock_from_the_row_before() {
-    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x0bc0_de01);
-    let (interactions, constraints) = common::symbolic_air(&reduce_table::ReduceAir);
-    let (cur, next_in_run, next_first) = (reduce_row(true, false, &mut rng), reduce_row(true, false, &mut rng), reduce_row(true, true, &mut rng));
-    // The columns the RAM messages' address and timestamp fields read.
-    let mut used = std::collections::BTreeSet::new();
-    for i in interactions.iter().filter(|i| i.bus_name == bus::RAM.name()) {
-        for field in &i.fields[0..2] {
-            for c in 0..reduce_table::col::WIDTH {
-                if common::depends(field, &cur, &next_in_run, c, false, &mut rng) {
-                    used.insert(c);
-                }
-            }
-        }
+/// A row of the fold kind (Cut E2) or the pow kind (Cut F): that kind's own columns and the shared
+/// `CLK` random, its kind flag set, `first` its start flag, and every other column zero — the
+/// carry rule below is about one kind's rows at a time.
+fn kind_row(kind: std::ops::Range<usize>, flag: usize, start: usize, first: bool, rng: &mut impl rand::Rng) -> Vec<F> {
+    use reduce_table::col::*;
+    let mut r = vec![F::ZERO; WIDTH];
+    for c in kind.chain([CLK]) {
+        r[c] = common::random_felt(rng);
     }
-    assert!(used.contains(&reduce_table::col::CLK) && used.contains(&reduce_table::col::DESCR_PTR), "sanity: {used:?}");
-    let unchained: Vec<usize> = used
-        .iter()
-        .copied()
-        .filter(|&c| {
-            !constraints.iter().any(|k| {
-                common::depends(k, &cur, &next_in_run, c, true, &mut rng) && !common::depends(k, &cur, &next_first, c, true, &mut rng)
-            })
-        })
-        .collect();
-    assert!(
-        unchained.is_empty(),
-        "the reduce chip's RAM messages use columns {unchained:?} (CLK = {}) as an address or timestamp, and nothing carries them from one run row to the next",
-        reduce_table::col::CLK
-    );
+    r[flag] = F::ONE;
+    r[start] = F::from_bool(first);
+    r
 }
 
-/// V-OPCODES-1, as a rule: no padding row the chip's constraints admit sends anything. Every
-/// assignment of the row-kind witnesses (`IS_FIRST`, `IS_LAST`, `LEN1`, `LEN` ∈ {0, 1, 2}, the
-/// gadget's inverse solved where it can be) to a padding row followed by ordinary padding is
-/// tried; each one every constraint accepts must have a zero count on every message the chip
-/// sends or provides (`RAM`, `REDUCE`, `RANGE8`).
+/// OPCODES-1 / TABLES-1, as a rule, for each of the chip's three row kinds: every column a row's
+/// RAM messages use as an address or a timestamp is carried from the row before when the next row
+/// is the same run's — and so is every column in that kind's `must` list, which holds the carried
+/// columns that are not RAM fields but would free a run if uncarried. The final fix wave (the
+/// whole-branch review, Important 1) widened this from the reduce kind's 30 columns to the fold
+/// kind (`CLK`, `F_MSG`, `F_A`, `F_K`, `U0`, `U1`: the addresses, the arity the end rule and the
+/// result address read, the index, and `u`) and the pow kind (`CLK`, `P_BASE`, `P_OFF`, `P_L`,
+/// `P_K`), and added the reduce kind's `ROW_END` (R5's end marker: uncarried, a run can end early
+/// and skip columns — `tests/cheating.rs`'s `a_reduce_run_ending_early_is_rejected_by_the_row_end_carry`).
+/// A column is carried when some constraint depends on its next-row value along a run and no
+/// longer does when the next row starts a new run.
 #[test]
-fn no_admissible_padding_reduce_row_sends_a_message() {
-    use p3_field::Field;
+fn every_reduce_run_row_carries_its_addresses_and_clock_from_the_row_before() {
     use reduce_table::col::*;
-    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x0bc0_de02);
-    let (interactions, constraints) = common::symbolic_air(&reduce_table::ReduceAir);
-    let mut next = vec![F::ZERO; WIDTH];
-    next[LEN1_INV] = F::NEG_ONE; // ordinary padding (`reduce_trace`'s own)
-    let mut sends = Vec::new();
-    for first in [false, true] {
-        for last in [false, true] {
-            for len1 in [false, true] {
-                for len in 0u64..3 {
-                    let mut cur: Vec<F> = (0..WIDTH).map(|_| common::random_felt(&mut rng)).collect();
-                    cur[IS_REAL] = F::ZERO;
-                    cur[IS_FIRST] = F::from_bool(first);
-                    cur[IS_LAST] = F::from_bool(last);
-                    cur[LEN1] = F::from_bool(len1);
-                    cur[LEN] = F::from_u64(len);
-                    cur[LEN1_INV] = if len == 1 { F::ZERO } else { (F::ONE - cur[LEN1]) * (cur[LEN] - F::ONE).inverse() };
-                    if constraints.iter().any(|c| common::eval_at(c, &cur, &next) != F::ZERO) {
-                        continue; // not an admissible padding row
-                    }
-                    for i in &interactions {
-                        if common::eval_at(&i.count, &cur, &next) != F::ZERO {
-                            sends.push(format!("IS_FIRST={first} IS_LAST={last} LEN1={len1} LEN={len}: sends on {}", i.bus_name));
-                        }
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x0bc0_de01);
+    let (interactions, constraints) = common::symbolic_air(&reduce_air());
+    type RowFn = Box<dyn Fn(bool, &mut rand::rngs::StdRng) -> Vec<F>>;
+    let kinds: [(&str, std::ops::Range<usize>, RowFn, Vec<usize>); 3] = [
+        ("reduce", 0..REDUCE_KIND_COLS, Box::new(|first, rng| reduce_row(true, first, rng)), vec![CLK, ADDR_V, ADDR_R, KEY, ALPHA_ADDR, RES, ROW_END]),
+        // Phase-2 rows that are not last: the phase switch, which reads `n(F_K)` too, is off there,
+        // so the K step is the one rule on `n(F_K)` (on phase-1 rows the switch masked its
+        // deletion — mutation-checked, final fix wave).
+        ("fold", IS_FOLD..IS_POW, Box::new(|first, rng| {
+            let mut r = kind_row(IS_FOLD..IS_POW, IS_FOLD, F_FIRST, first, rng);
+            r[F_PH1] = F::ZERO;
+            r[F_LAST] = F::ZERO;
+            r
+        }), vec![CLK, F_MSG, F_A, F_K, U0, U1]),
+        ("pow", IS_POW..WIDTH, Box::new(|first, rng| kind_row(IS_POW..WIDTH, IS_POW, P_FIRST, first, rng)), vec![CLK, P_BASE, P_OFF, P_L, P_K]),
+    ];
+    for (name, cols, row, must) in kinds {
+        let (cur, next_in_run, next_first) = (row(false, &mut rng), row(false, &mut rng), row(true, &mut rng));
+        let mut used = std::collections::BTreeSet::new();
+        for i in interactions.iter().filter(|i| i.bus_name == bus::RAM.name()) {
+            for field in &i.fields[0..2] {
+                for c in cols.clone().chain([CLK]) {
+                    if common::depends(field, &cur, &next_in_run, c, false, &mut rng) {
+                        used.insert(c);
                     }
                 }
             }
         }
+        assert!(used.iter().all(|c| must.contains(c)), "{name}: a RAM address/timestamp column outside the pinned list: {used:?} against {must:?}");
+        assert!(used.contains(&CLK) && used.len() >= 3, "sanity, {name}: {used:?}");
+        let unchained: Vec<usize> = must
+            .iter()
+            .copied()
+            .filter(|&c| {
+                !constraints.iter().any(|k| common::depends(k, &cur, &next_in_run, c, true, &mut rng) && !common::depends(k, &cur, &next_first, c, true, &mut rng))
+            })
+            .collect();
+        assert!(unchained.is_empty(), "{name} kind: columns {unchained:?} are not carried along a run");
     }
-    sends.dedup();
+}
+
+/// V-OPCODES-1, as a rule: no admissible padding row sends or provides anything, whatever its
+/// row-kind witnesses — off the provider region (the preprocessed columns are zero there). Every
+/// column is random except the three kind columns (zero: it is padding) and the witnesses that are
+/// enumerated: the run kind's `IS_FIRST`, `IS_LAST`, `CHAIN_START`, `CARRY`, the fold kind's
+/// `F_FIRST`, `F_PH1`, `F_LAST`, the pow kind's `P_FIRST`, `P_LAST`, `P_BIT`, and the two provider
+/// multiplicities `MULT` and `MULT_C` (each zero or random). Task 5 sweep (Task 3 review): the
+/// fold and pow kinds' columns are random here too — they were held at zero, so a padding row's
+/// fold or pow message was never tried — and a random `MULT`/`MULT_C` off the provider region is
+/// tried, which the provider rules alone refuse (`a_multiplicity_off_the_layout_is_refused_by_the_provider_rule`).
+#[test]
+fn no_admissible_padding_reduce_row_sends_a_message() {
+    use reduce_table::col::*;
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x0bc0_de02);
+    let (interactions, constraints) = common::symbolic_air(&reduce_air());
+    let next = vec![F::ZERO; WIDTH];
+    let flags = [IS_FIRST, IS_LAST, CHAIN_START, CARRY, F_FIRST, F_PH1, F_LAST, P_FIRST, P_LAST, P_BIT];
+    let mut sends = Vec::new();
+    let mut admitted = 0;
+    for bits in 0u32..1 << (flags.len() + 2) {
+        let mut cur: Vec<F> = (0..WIDTH).map(|_| common::random_felt(&mut rng)).collect();
+        for c in [IS_REAL, IS_FOLD, IS_POW] {
+            cur[c] = F::ZERO;
+        }
+        for (k, &c) in flags.iter().enumerate() {
+            cur[c] = F::from_bool(bits >> k & 1 != 0);
+        }
+        cur[WRITES] = cur[IS_LAST] * (F::ONE - cur[CARRY]);
+        cur[READ_ALPHA] = cur[IS_FIRST] * cur[CHAIN_START];
+        if bits >> flags.len() & 1 == 0 {
+            cur[MULT] = F::ZERO;
+        }
+        if bits >> (flags.len() + 1) & 1 == 0 {
+            cur[MULT_C] = F::ZERO;
+        }
+        if constraints.iter().any(|c| common::eval_at(c, &cur, &next) != F::ZERO) {
+            continue;
+        }
+        admitted += 1;
+        for i in &interactions {
+            if common::eval_at(&i.count, &cur, &next) != F::ZERO {
+                sends.push(format!("kinds {bits:012b}: sends on {}", i.bus_name));
+            }
+        }
+    }
+    assert!(admitted >= 1, "the all-zero kind assignment is admissible padding");
     assert!(sends.is_empty(), "admissible padding rows of the reduce chip send messages:\n  {}", sends.join("\n  "));
 }
 
-/// ZKR-4, as a rule: a run ends on its `IS_LAST` row. A real row that is not a last row must be
-/// followed by a row of the same run — so the constraints must refuse it followed by padding, or
-/// by a new run's first row, and must refuse it as the table's final row. Checked on the honest
-/// run's own first row (`reduce_run_program`'s three columns, from `build_traces`), so every
-/// row-local constraint holds and only a run-structure rule can refuse the pair.
+/// Task 5 sweep (Task 1a review): `MULT·(1 − L_IS_ENTRY) = 0`, pinned on its own. A row past the
+/// layout with `MULT = 1` would provide the all-zero `REDUCE_LAYOUT` entry. No run can consume that
+/// entry — its flags are 0, so its first row must be a continuation entered by a carry from entry
+/// `ENTRY − 1 = −1`, and every real row's `ENTRY` is a layout index (looked up on a first row,
+/// carried on the rest), never `−1` — so an end-to-end forgery is refused by the bus imbalance as
+/// well (`tests/cheating.rs`'s `a_multiplicity_off_the_layout_is_rejected`), and the provider rule
+/// is defence in depth that no proof-level forgery can isolate. Here it is isolated at the AIR: on
+/// an honest padding row off the provider region, setting `MULT` (or, for the coefficient table's
+/// rule, `MULT_C`) violates exactly one constraint, and it is that rule — the row with the
+/// multiplicity cleared satisfies every constraint.
 #[test]
-fn a_reduce_run_must_end_on_its_last_row() {
+fn a_multiplicity_off_the_layout_is_refused_by_the_provider_rule() {
     use reduce_table::col::*;
-    let p = {
-        let mut v = vec![];
-        let st = |v: &mut Vec<Instr>, addr: u64, val: u64| {
-            v.push(Instr { op: Op::Faddi, rd: 1, ra: 0, b: F::from_u64(val) });
-            v.push(Instr { op: Op::Store, rd: 1, ra: 0, b: F::from_u64(addr) });
-        };
-        for (k, val) in [100u64, 120, 3, 1, 0, 0, 0, 1, 0, 3, 0].iter().enumerate() {
-            st(&mut v, 200 + k as u64, *val);
-        }
-        v.push(Instr { op: Op::Faddi, rd: 2, ra: 0, b: F::from_u64(200) });
-        v.push(Instr { op: Op::Reduce, rd: 0, ra: 2, b: F::ZERO });
-        for _ in 0..4 {
-            v.push(Instr { op: Op::Public, rd: 0, ra: 0, b: F::ZERO });
-        }
-        v.push(Instr { op: Op::Halt, rd: 0, ra: 0, b: F::ZERO });
-        Program { instrs: v, checkpoints: vec![] }
-    };
-    let exec = randprotocol_rvm::emulator::execute(&p, &[], 1000).unwrap();
-    let t = randprotocol_rvm::machine::build_traces(&p, &exec, Tier(8)).unwrap();
-    let red = t.reduce.unwrap();
-    let row = |k: usize| red.values[k * WIDTH..(k + 1) * WIDTH].to_vec();
-    let (first, padding) = (row(0), row(3));
-    assert_eq!((first[IS_REAL], first[IS_FIRST], first[IS_LAST]), (F::ONE, F::ONE, F::ZERO), "row 0 opens a three-row run");
-    assert_eq!(padding[IS_REAL], F::ZERO);
-    let (_, constraints) = common::symbolic_air(&reduce_table::ReduceAir);
-    // The honest pair holds, so the harness is not refusing it for an unrelated reason.
-    assert!(constraints.iter().all(|c| common::eval_at(c, &first, &row(1)) == F::ZERO), "the honest pair holds");
-    let refused = |cur: &[F], next: &[F], last: bool| constraints.iter().any(|c| common::eval_at_boundary(c, cur, next, false, last) != F::ZERO);
-    let mut open = Vec::new();
-    if !refused(&first, &padding, false) {
-        open.push("a non-last run row followed by padding");
+    let (_, constraints) = common::symbolic_air(&reduce_air());
+    let zero = vec![F::ZERO; WIDTH];
+    assert!(constraints.iter().all(|c| common::eval_at(c, &zero, &zero) == F::ZERO), "an all-zero padding row is admissible");
+    for (name, c) in [("MULT", MULT), ("MULT_C", MULT_C)] {
+        let mut cur = zero.clone();
+        cur[c] = F::ONE;
+        let violated: Vec<usize> = (0..constraints.len()).filter(|&k| common::eval_at(&constraints[k], &cur, &zero) != F::ZERO).collect();
+        assert_eq!(violated.len(), 1, "{name} = 1 off the provider region violates exactly one constraint: {violated:?}");
+        assert_eq!(common::eval_at(&constraints[violated[0]], &cur, &zero), F::ONE, "{name}: the violated rule is `{name}·(1 − provider flag)`");
     }
-    if !refused(&first, &first, false) {
-        open.push("a non-last run row followed by a new run's first row");
-    }
-    if !refused(&first, &padding, true) {
-        open.push("a non-last run row as the table's final row");
-    }
-    assert!(open.is_empty(), "the reduce chip lets a run stop short of its IS_LAST row: {open:?}");
 }
 
-/// ZKQ-3 on the reduce chip: the cpu's REDUCE row range-checks nothing (REDUCE is not among its
-/// subjects), so the chip must: the descriptor's eleven cells and both arrays' first and last
-/// cells. Each case moves one of them below zero on the honest run's first row (and its chained
-/// copies on the next row), with the run's last cell back inside the range, and asks whether any
-/// choice of byte limbs completes the pair.
+/// ZKR-4 and R5, as a rule: a run ends exactly on the row where ADDR_R = ROW_END. Checked on
+/// the honest split chain's rows with their real preprocessed rows.
 #[test]
-fn a_reduce_run_touching_a_cell_outside_the_address_space_is_refused() {
+fn a_reduce_run_must_end_where_its_row_ends() {
+    use p3_air::BaseAir;
     use reduce_table::col::*;
-    let p = {
-        let mut v = vec![];
-        for (k, val) in [100u64, 120, 3, 1, 0, 0, 0, 1, 0, 3, 0].iter().enumerate() {
-            v.push(Instr { op: Op::Faddi, rd: 1, ra: 0, b: F::from_u64(*val) });
-            v.push(Instr { op: Op::Store, rd: 1, ra: 0, b: F::from_u64(200 + k as u64) });
-        }
-        v.push(Instr { op: Op::Faddi, rd: 2, ra: 0, b: F::from_u64(200) });
-        v.push(Instr { op: Op::Reduce, rd: 0, ra: 2, b: F::ZERO });
-        for _ in 0..4 {
-            v.push(Instr { op: Op::Public, rd: 0, ra: 0, b: F::ZERO });
-        }
-        v.push(Instr { op: Op::Halt, rd: 0, ra: 0, b: F::ZERO });
-        Program { instrs: v, checkpoints: vec![] }
-    };
+    let p = common::reduce_chain_program(true);
     let exec = randprotocol_rvm::emulator::execute(&p, &[], 1000).unwrap();
     let t = randprotocol_rvm::machine::build_traces(&p, &exec, Tier(8)).unwrap();
+    let air = reduce_table::ReduceAir::new(std::sync::Arc::new(p.reduce_layout.clone()), 1 << t.reduce_log_height);
+    let pre = BaseAir::<F>::preprocessed_trace(&air).unwrap();
     let red = t.reduce.unwrap();
     let row = |k: usize| red.values[k * WIDTH..(k + 1) * WIDTH].to_vec();
-    let (interactions, constraints) = common::symbolic_air(&reduce_table::ReduceAir);
-    let limbs = common::range_checked_columns(&interactions);
-    let minus = |k: u64| F::ZERO - F::from_u64(k);
-    // The run is three columns: vals are cells ADDR_V .. ADDR_V + 5, row cells ADDR_R .. ADDR_R + 2.
-    let cases: [(&str, usize, F); 3] = [
-        ("the descriptor at p − 5 (its last cell, + 10, is 5)", DESCR_PTR, minus(5)),
-        ("the vals array at p − 2 (its last cell, + 5, is 3)", ADDR_V, minus(2)),
-        ("the row array at p − 1 (its last cell, + 2, is 1)", ADDR_R, minus(1)),
-    ];
-    assert!(common::admits_byte_limbs(&constraints, &row(0), &row(1), &limbs).is_ok(), "the honest pair is admitted");
-    let mut admitted = Vec::new();
-    for (what, col, value) in cases {
-        let (mut cur, mut next) = (row(0), row(1));
-        let shift = value - cur[col];
-        cur[col] += shift;
-        next[col] += shift; // the chained copy on the run's next row
-        if common::admits_byte_limbs(&constraints, &cur, &next, &limbs).is_ok() {
-            admitted.push(what);
-        }
-    }
-    assert!(admitted.is_empty(), "ZKQ-3: the reduce chip admits runs outside the address space: {admitted:?}");
+    let prow = |k: usize| pre.values[k * reduce_table::pre::WIDTH..(k + 1) * reduce_table::pre::WIDTH].to_vec();
+    let (_, constraints) = common::symbolic_air(&air);
+    let holds = |cur: &[F], next: &[F], k: usize| constraints.iter().all(|c| common::eval_full(c, cur, next, (&prow(k), &prow(k + 1)), &[]) == F::ZERO);
+    assert!((0..3).all(|k| holds(&row(k), &row(k + 1), k)), "the honest rows hold");
+    let mut early = row(0);
+    early[IS_LAST] = F::ONE; // row 0 is ADDR_R = 120, ROW_END = 121
+    early[WRITES] = F::ZERO; // CARRY = 1
+    assert!(!holds(&early, &row(1), 0), "IS_LAST before ADDR_R reaches ROW_END is refused");
+    let mut late = row(1);
+    late[IS_LAST] = F::ZERO;
+    late[END_INV] = F::ONE;
+    assert!(!holds(&late, &row(2), 1), "a run running past ROW_END is refused");
 }
 
 // ── R6 / RVMv2 R5: no admissible padding row of any chip sends a message ─────────────────────

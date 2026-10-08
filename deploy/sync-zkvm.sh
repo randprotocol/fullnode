@@ -471,7 +471,17 @@ echo "reminder: --features cuda / mock-cuda / reference-backend fetch rand-zkvm-
 # `VerifierShape::quotient_layout`, `tests/quotient_layout.rs`; the aggregate program digest and the
 # admission vectors unchanged; upstream's `[patch.crates-io]` now names three crates — the third
 # circuits' `vendor/p3-batch-stark` fork — and is cut with the profiles as before; the workspace
-# root carries the same three). Re-vendoring the rVM alone is this section alone: the research
+# root carries the same three), then at `71e1a04` (2026-10-08; two circuits changes at once:
+# **rVM phase 3**, `recursion/docs/06-phase3-fold-reduce.md` — the reduce chip's preprocessed
+# layout and its FOLD / POW row kinds, thirteen buses, `tests/fold_identity.rs`; the aggregate
+# program digest `c90b3f0a…74d8` → `dc350ecf…8ba0` at the production bundle shape,
+# `inner_vk_digest` and the admission vectors unchanged; `Machine::verifier_key` takes a reduce
+# log-height instead of a reduce flag, the height is canonical in (program, N)
+# (`machine::canonical_reduce_log_height`, `Machine::verify_n`), and N has a ceiling
+# (`machine::max_reduce_n`: production N ≤ 5, test N ≤ 26) — the node's `agg_executor` follows
+# all three — and **the rate-¼ rVM profile**, `recursion/docs/07-rvm-rate-quarter.md` —
+# `RvmFri` (log_blowup 2, 92 queries, 24 grinding bits), `tests/security.rs`, a `p3-security`
+# dev-dependency; rVM keys and proofs move, no digest and no tier does). Re-vendoring the rVM alone is this section alone: the research
 # section above rewrites `guests-compiled/PROVENANCE.md` and would carry research's older drift. Two vendored files carry hand fixes this
 # section does not reproduce — keep them when re-syncing: `Cargo.toml`'s `license.workspace`
 # line and `tests/backend.rs`'s doc comment (`randprotocol-zkvm`, not the old crate name). What the
@@ -567,4 +577,4 @@ if "license.workspace = true" not in s:
 PY
 sed -i '' 's|crates/shrugg-zkvm/tests/backend.rs|crates/randprotocol-zkvm/tests/backend.rs|' "$RVM_DST/tests/backend.rs"
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 5ff7676, the quotient-layout fork) into $RVM_DST"
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 71e1a04, rVM phase 3 and the rate-¼ profile) into $RVM_DST"

@@ -2,13 +2,32 @@
 //! verifier-key cache (plan Task 1; the chip set and `prove`/`verify` grow per task through
 //! Task 6, mirroring `research/src/machine.rs`'s structure).
 //!
-//! The rVM reuses the RV32 machine's exact proof-system configuration (spec §5's reuse ruling):
-//! same field, extension, Poseidon2 permutation, hiding FRI profile and batch machinery. What is
+//! The rVM reuses the RV32 machine's field, permutation and proof system; its FRI parameters are
+//! its own (`RvmFri`, rate ¼ since `docs/07`) (spec §5's reuse ruling):
+//! same field, extension, Poseidon2 permutation, hiding FRI machinery and batch machinery. What is
 //! new is the chip set and that the verifier key is **program-dependent** (plan R1/R6): the
 //! program table is preprocessed, so the preprocessed cap binds every program word and there is
 //! no in-circuit `hc` digest. Since the quotient-layout fork (`docs/05`) the rVM's own proofs
 //! commit their quotient chunks one matrix per instance (`QUOTIENT_LAYOUT`); the inner RV32 proofs
 //! it verifies do not.
+//!
+//! **The reduce table's height is canonical, not declared** (the final fix wave of phase 3,
+//! 2026-10-06; the whole-branch review's Important 2, INTERFACE-4 / AGG-3). The verifier key is
+//! built at the reduce table's height, because its preprocessed region is committed there, so a
+//! proof free to declare any height in `4..=20` could make a node build a fresh key — 30–70 s at
+//! production — for every value, each taking a slot in the 64-entry cache. The reduce rows are a
+//! compile-time function of the program ([`crate::tables::reduce::program_rows`]: a layout entry's
+//! length a `REDUCE`, `2a` a `FOLD`, `L` a `POW`) times the number of inner proofs `N`, so
+//! [`Machine::verify_n`] recomputes the one honest height ([`canonical_reduce_log_height`]) and
+//! refuses any other before any key work (`VerifyError::ReduceHeightNotCanonical`). [`Machine::verify`]
+//! is `N = 1` (the single-proof program, an aggregate of one, every test program);
+//! `aggregate::verify_aggregate` passes the `N` of its digest-bound list. **What the node must
+//! do:** call `verify_aggregate` (or `verify_n` with the proof's `N`) — its key-cache DoS guard
+//! reduces to that signature: at most one reduce height per `(program, tier, N)`, and with
+//! production `N ≤ 5` three heights (`2^18` at N=1, `2^19` at N=2, `2^20` at N=3–5); its warm
+//! loop warms `canonical_reduce_log_height(program, N)` for each admitted `N`. `prove` refuses a
+//! run whose reduce rows exceed `2^REDUCE_MAX_LOG_HEIGHT − 1` (`ProveError::ReduceRows`) before
+//! any trace is built: such a proof could never verify (production `N ≥ 6` today, docs/06 §3).
 use p3_batch_stark::{prove_batch_with_layout, verify_batch_with_layout, BatchProof, CommonData, ProverData, QuotientLayout, StarkInstance};
 use p3_commit::ExtensionMmcs;
 use p3_dft::Radix2DitParallel;
@@ -34,6 +53,31 @@ pub type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, SaltRng>;
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
 
+/// The rVM's own FRI parameters — not the inner RV32 machine's. The inner profile (research's
+/// `FriProfile`: 80 queries, rate ⅛, 20 grinding bits) sizes the proofs this machine *verifies*;
+/// these size the proofs it *makes*. Rate ¼ halves every LDE and tree the prover holds; twelve
+/// more queries and four more grinding bits keep the proven floor where the paper's 80/8/20 put
+/// it — under the paper's own unique-decoding theorem (92 × 0.678 + 24 = 86.38 bits against 86.41)
+/// and under `p3-security`'s best proven bound over the real chip shapes (86.38 too: the low-degree
+/// test binds in both regimes); `tests/security.rs` pins both (docs/07).
+/// Consensus-facing like the inner profile: the chain's `fri_profile` name binds both parameter
+/// sets, and a proof made under another regime is refused by `verify` (`tests/machine.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RvmFri {
+    pub log_blowup: usize,
+    pub num_queries: usize,
+    pub query_pow_bits: usize,
+}
+
+impl RvmFri {
+    pub const fn of(profile: FriProfile) -> RvmFri {
+        match profile {
+            FriProfile::Test => RvmFri { log_blowup: 2, num_queries: 16, query_pow_bits: 4 },
+            FriProfile::Production => RvmFri { log_blowup: 2, num_queries: 92, query_pow_bits: 24 },
+        }
+    }
+}
+
 /// How this machine commits each instance's quotient chunks (`docs/05-quotient-layout.md`): one
 /// matrix per instance, salted once, instead of Plonky3's one matrix per chunk — the prover's
 /// largest memory term cut by about 60 % of itself. A property of the machine, pinned here like the
@@ -52,7 +96,7 @@ use crate::tables::poseidon2::{poseidon2_log_height, poseidon2_trace, Poseidon2A
 use crate::tables::program::{program_trace, ProgramAir};
 use crate::tables::public::{public_trace, PublicAir, NUM_PUBLIC_VALUES};
 use crate::tables::range::{range_trace, RangeAir, RangeCounts};
-use crate::tables::reduce::{reduce_events, reduce_log_height, reduce_trace, ReduceAir};
+use crate::tables::reduce::{fold_events, fold_rows, pow_events, pow_rows, provider_rows, reduce_events, reduce_log_height, reduce_rows, reduce_trace, ReduceAir};
 
 /// The labels of the rVM's `key_config` salt streams (HCS-1, constraint set 7) — `research`'s
 /// `key_derivation_v2::MMCS_LABEL`/`PCS_LABEL` role over a different artifact family, so different
@@ -73,12 +117,12 @@ pub mod backend;
 /// seeds the PCS's own random codewords/quotient blinding. Kept private: callers pick a seeding
 /// strategy through `make_config` (fresh OS entropy, for proving) or `key_config`
 /// (deterministic, for a preprocessed commitment any verifier can recompute).
-fn build_config(profile: FriProfile, mmcs_rng: SaltRng, pcs_rng: SaltRng) -> Config {
+fn build_config(fri: RvmFri, mmcs_rng: SaltRng, pcs_rng: SaltRng) -> Config {
     let perm = permutation();
     let hash = Hash::new(perm.clone());
     let compress = Compress::new(perm);
     let val_mmcs = ValMmcs::new(hash, compress, 2, mmcs_rng);
-    generic_config(profile, Dft::default(), val_mmcs, pcs_rng)
+    generic_config(fri, Dft::default(), val_mmcs, pcs_rng)
 }
 
 /// The FRI/PCS setup, written once over any value-MMCS and DFT. Every backend goes through
@@ -87,7 +131,7 @@ fn build_config(profile: FriProfile, mmcs_rng: SaltRng, pcs_rng: SaltRng) -> Con
 /// `ValMmcs`/`Radix2DitParallel` pair, and `backend`'s `reference_config`/`cuda_config` call it
 /// with theirs (`research/src/machine.rs`'s `generic_config`, mirrored).
 fn generic_config<D, M>(
-    profile: FriProfile,
+    fri: RvmFri,
     dft: D,
     val_mmcs: M,
     pcs_rng: SaltRng,
@@ -97,24 +141,24 @@ where
     M: p3_commit::Mmcs<Val, MultiProof: Sync, Error: Sync> + Clone,
 {
     let challenge_mmcs = ExtensionMmcs::new(val_mmcs.clone());
-    let fri = p3_fri::FriParameters {
-        log_blowup: 3,
+    let p = p3_fri::FriParameters {
+        log_blowup: fri.log_blowup,
         log_final_poly_len: 0,
         max_log_arity: 3,
-        num_queries: profile.num_queries(),
+        num_queries: fri.num_queries,
         commit_proof_of_work_bits: 0,
-        query_proof_of_work_bits: profile.pow_bits(),
+        query_proof_of_work_bits: fri.query_pow_bits,
         mmcs: challenge_mmcs,
     };
-    let pcs = HidingFriPcs::new(dft, val_mmcs, fri, 4, pcs_rng);
+    let pcs = HidingFriPcs::new(dft, val_mmcs, p, 4, pcs_rng);
     StarkConfig::new(pcs, Challenger::new(permutation()))
 }
 
 /// The deterministic config behind `verifier_key`: any verifier recomputes the same preprocessed
 /// commitment from `(program, tier, reduce)` alone — `research`'s `key_config`, verbatim in role.
-fn key_config(profile: FriProfile) -> Config {
+fn key_config(fri: RvmFri) -> Config {
     let (mmcs_rng, pcs_rng) = key_rngs();
-    build_config(profile, mmcs_rng, pcs_rng)
+    build_config(fri, mmcs_rng, pcs_rng)
 }
 
 fn key_rngs() -> (SaltRng, SaltRng) {
@@ -122,7 +166,7 @@ fn key_rngs() -> (SaltRng, SaltRng) {
 }
 
 pub fn make_config(profile: FriProfile) -> Config {
-    build_config(profile, SaltRng::fresh(), SaltRng::fresh())
+    build_config(RvmFri::of(profile), SaltRng::fresh(), SaltRng::fresh())
 }
 
 /// The rVM tier ladder (plan R2): stride 2 through the cheap-test sizes, then every rung near the
@@ -205,6 +249,30 @@ pub fn check_declared_heights(tier: Tier, reg_log_height: u8, ram_log_height: u8
     Ok(())
 }
 
+/// The reduce table's one honest declared log-height for `program` run over `n` inner proofs
+/// (the module doc's "canonical, not declared"): `build_traces`' own rule,
+/// `reduce_log_height(rows, provider_rows(layout))`, at `rows = n × program_rows(program)` — `0`
+/// (no reduce table) when the program has no `REDUCE`/`FOLD`/`POW`. `None` when no verifiable
+/// height exists: the rows plus the padding row exceed `2^REDUCE_MAX_LOG_HEIGHT` (or the
+/// provider region does) — that `n` is past the ceiling, and `prove` refuses it.
+pub fn canonical_reduce_log_height(program: &Program, n: u64) -> Option<u8> {
+    let rows = crate::tables::reduce::program_rows(program).checked_mul(n)?;
+    let max = 1u64 << REDUCE_MAX_LOG_HEIGHT;
+    if rows >= max || provider_rows(&program.reduce_layout) as u64 > max {
+        return None;
+    }
+    Some(reduce_log_height(rows as usize, provider_rows(&program.reduce_layout)))
+}
+
+/// The largest `n` whose reduce rows fit `REDUCE_MAX_LOG_HEIGHT` for `program` (`u64::MAX` for a
+/// program with no reduce-chip rows) — the N ceiling docs/06 §3 records.
+pub fn max_reduce_n(program: &Program) -> u64 {
+    match crate::tables::reduce::program_rows(program) {
+        0 => u64::MAX,
+        per => ((1u64 << REDUCE_MAX_LOG_HEIGHT) - 1) / per,
+    }
+}
+
 #[derive(Debug)]
 pub enum ProveError {
     Exec(ExecError),
@@ -217,6 +285,11 @@ pub enum ProveError {
     /// legality — the preprocessed table commits to the program, so its words are checked at the
     /// one place they enter the machine).
     Decode(DecodeError),
+    /// The run's reduce-chip rows (`rows`, the padding row not counted) exceed `max`
+    /// (`2^REDUCE_MAX_LOG_HEIGHT − 1`): a proof of it could never verify. Refused after the
+    /// emulation and before any trace is built (the final fix wave; for an aggregate, an `N` past
+    /// the ceiling — production `N ≥ 6` at the current constant).
+    ReduceRows { rows: usize, max: usize },
     /// An alternative proving backend failed: the device path (`Backend::Cuda`) or an engine
     /// panic inside `prove_batch` — `research`'s `ProveError::Backend`, mirrored (M5.4).
     #[cfg(any(feature = "reference-backend", feature = "cuda", feature = "mock-cuda"))]
@@ -252,7 +325,14 @@ pub enum VerifyError {
     Batch(String),
     RegHeight,
     RamHeight,
-    Poseidon2Height,    ReduceHeight,
+    Poseidon2Height,
+    /// The declared reduce height is outside `MIN_LOG_HEIGHT..=REDUCE_MAX_LOG_HEIGHT` (and not
+    /// the "no table" `0`) — the shape-only range check, `check_declared_heights`.
+    ReduceHeight,
+    /// The declared reduce height is not the canonical one for the program and the proof's `N`
+    /// (`canonical_reduce_log_height`; `None`: no verifiable height exists for that `N`). Refused
+    /// before any key is built — the key-cache DoS guard (the module doc).
+    ReduceHeightNotCanonical { declared: u8, canonical: Option<u8> },
     /// A program word the emulator could never execute (`Machine::check_program`): ZKQ-3.
     Program(DecodeError),
     /// VERIFIER-1: FRI's commit-phase proof-of-work word for folding round `round` is not the
@@ -294,20 +374,20 @@ impl Proof {
     pub fn size(&self) -> usize { self.to_bytes().len() }
 }
 
-/// Bound on the number of `(program, tier, reduce)` verifier keys kept in memory at once — the
+/// Bound on the number of `(program, tier, reduce_log_height)` verifier keys kept in memory at once — the
 /// RV32 cache's FIFO policy, over a program-keyed space instead (R6).
 const KEY_CACHE_CAPACITY: usize = 64;
 
 #[derive(Default)]
 struct KeyCache {
-    map: HashMap<(usize, [u64; 4], bool), Arc<CommonData<Config>>>,
-    order: VecDeque<(usize, [u64; 4], bool)>,
+    map: HashMap<(usize, [u64; 4], u8), Arc<CommonData<Config>>>,
+    order: VecDeque<(usize, [u64; 4], u8)>,
 }
 impl KeyCache {
-    fn get(&self, key: &(usize, [u64; 4], bool)) -> Option<Arc<CommonData<Config>>> {
+    fn get(&self, key: &(usize, [u64; 4], u8)) -> Option<Arc<CommonData<Config>>> {
         self.map.get(key).cloned()
     }
-    fn insert(&mut self, key: (usize, [u64; 4], bool), value: Arc<CommonData<Config>>) {
+    fn insert(&mut self, key: (usize, [u64; 4], u8), value: Arc<CommonData<Config>>) {
         if self.map.contains_key(&key) { return; }
         if self.map.len() >= KEY_CACHE_CAPACITY {
             if let Some(oldest) = self.order.pop_front() { self.map.remove(&oldest); }
@@ -317,32 +397,40 @@ impl KeyCache {
     }
 }
 
-pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache> }
+pub struct Machine { pub config: Config, pub profile: FriProfile, pub fri: RvmFri, keys: Mutex<KeyCache> }
 
 impl Machine {
     pub fn new(profile: FriProfile) -> Self {
-        Self { config: make_config(profile), profile, keys: Mutex::new(KeyCache::default()) }
+        Self::with_fri(profile, RvmFri::of(profile))
     }
 
-    /// The preprocessed commitment for `(program, tier, reduce)` (R6), cached. The chip set
+    /// A machine under an explicit regime — the tests' entry (a rate-⅛ proof to show refused;
+    /// `docs/07`). Every machine a node or an aggregator runs is `new(profile)`'s.
+    // test entry; not for production machines
+    #[doc(hidden)]
+    pub fn with_fri(profile: FriProfile, fri: RvmFri) -> Self {
+        Self { config: build_config(fri, SaltRng::fresh(), SaltRng::fresh()), profile, fri, keys: Mutex::new(KeyCache::default()) }
+    }
+
+    /// The preprocessed commitment for `(program, tier, reduce_log_height)` (R6), cached. The chip set
     /// grows per task toward the final eight-instance batch (Task 6); the cache key is already
     /// the final one, so no caller changes.
-    pub fn verifier_key(&self, program: &Program, tier: Tier, reduce: bool) -> Arc<CommonData<Config>> {
+    pub fn verifier_key(&self, program: &Program, tier: Tier, reduce_log_height: u8) -> Arc<CommonData<Config>> {
         let digest = program.digest();
-        let key = (tier.0, std::array::from_fn(|i| digest[i].as_canonical_u64()), reduce);
+        let key = (tier.0, std::array::from_fn(|i| digest[i].as_canonical_u64()), reduce_log_height);
         if let Some(hit) = self.keys.lock().unwrap().get(&key) { return hit; }
         let arc = Arc::new(program.clone());
-        let airs = chips(&arc, tier, if reduce { MIN_LOG_HEIGHT } else { 0 });
-        // The declared heights the key is built with are the *floors*: no table here but
-        // `program` and `range` has preprocessed columns, so `CommonData` is invariant to the
-        // declared heights — the RV32 `mem_log_height` argument, verbatim (R6).
-        let degrees = log_ext_degrees(program, tier, MIN_LOG_HEIGHT, MIN_LOG_HEIGHT, MIN_LOG_HEIGHT, if reduce { MIN_LOG_HEIGHT } else { 0 });
-        let common = Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &airs, &degrees).common);
+        let airs = chips(&arc, tier, reduce_log_height);
+        // The declared heights are the floors for every table without preprocessed columns; the
+        // reduce table is built at its own declared height, because its preprocessed region (Cut D:
+        // the program's reduce layout) is committed at that height.
+        let degrees = log_ext_degrees(program, tier, MIN_LOG_HEIGHT, MIN_LOG_HEIGHT, MIN_LOG_HEIGHT, reduce_log_height);
+        let common = Arc::new(ProverData::from_airs_and_degrees(&key_config(self.fri), &airs, &degrees).common);
         self.keys.lock().unwrap().insert(key, common.clone());
         common
     }
 
-    /// Number of `(program, tier, reduce)` verifier keys currently cached.
+    /// Number of `(program, tier, reduce_log_height)` verifier keys currently cached.
     pub fn cached_keys(&self) -> usize { self.keys.lock().unwrap().map.len() }
 
     /// Registration-time legality (R1): the preprocessed program table commits to every word, so
@@ -354,8 +442,34 @@ impl Machine {
         for instr in &program.instrs {
             check_instr(instr)?;
         }
+        check_layout(&program.reduce_layout)?;
         Ok(())
     }
+}
+
+/// Cut D, registration-time legality of the reduce layout: every run non-empty and inside the
+/// `2^24`-cell address space (the chip range-checks nothing — the key commits these constants, so
+/// they are checked once, here), entry 0 a chain start, and every hand-over well formed.
+fn check_layout(layout: &[crate::isa::ReduceEntry]) -> Result<(), DecodeError> {
+    for (k, e) in layout.iter().enumerate() {
+        let bad = Err(DecodeError::Layout { entry: k as u32 });
+        if e.len == 0 {
+            return bad;
+        }
+        // Bases and length bounded before any sum (`isa::layout_entry_in_bounds`): a wrapped top
+        // must not pass for an in-range one.
+        if !crate::isa::layout_entry_in_bounds(e) {
+            return bad;
+        }
+        let continues = k > 0 && layout[k - 1].carry;
+        if e.chain_start == continues {
+            return bad;
+        }
+        if e.carry && (k + 1 == layout.len() || layout[k + 1].alpha != e.alpha || layout[k + 1].res != e.res) {
+            return bad;
+        }
+    }
+    Ok(())
 }
 
 fn check_instr(instr: &Instr) -> Result<(), DecodeError> {
@@ -375,7 +489,17 @@ fn check_instr(instr: &Instr) -> Result<(), DecodeError> {
     match instr.op {
         Op::Eadd | Op::Esub | Op::Emul => { pair(instr.rd, "rd")?; pair(instr.ra, "ra")?; pair(instr.rb(), "rb")?; }
         Op::Emulf | Op::Einv => { pair(instr.rd, "rd")?; pair(instr.ra, "ra")?; }
-        Op::Loade | Op::Storee | Op::Hinte => { pair(instr.rd, "rd")?; }
+        Op::Loade | Op::Storee | Op::Hinte | Op::Fold => { pair(instr.rd, "rd")?; }
+        Op::Pow => {
+            pair(instr.rd, "rd")?;
+            // Cut F: the emulator's `PowShape` rule, at registration (the AIR checks the two bytes
+            // only; see `DecodeError::PowShape`).
+            let imm = instr.b.as_canonical_u64();
+            let (off, len) = (imm % 256, imm / 256);
+            if len == 0 || len >= 256 || off + len > 64 {
+                return Err(DecodeError::PowShape { imm });
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -437,11 +561,15 @@ pub fn build_traces(program: &Program, exec: &Execution, tier: Tier) -> Result<T
     let program_t = program_trace(program, &exec.events, 1 << program_log_height(program.instrs.len()));
     let public = public_trace(&exec.public, crate::tables::public::HEIGHT);
     let reduce_evs = reduce_events(&exec.events);
-    let reduce_rows: usize = reduce_evs.iter().map(|e| e.reduce.unwrap().len as usize).sum();
-    let reduce_lh = reduce_log_height(reduce_rows);
-    // Before the range table: since ZKQ-3 the reduce chip range-checks its run's addresses, so
-    // its lookups are counted into the same `RangeCounts` as every other table's.
-    let reduce = if reduce_lh == 0 { None } else { Some(reduce_trace(&reduce_evs, 1 << reduce_lh, &mut counts)) };
+    let fold_evs = fold_events(&exec.events);
+    let pow_evs = pow_events(&exec.events);
+    let reduce_lh =
+        reduce_log_height(reduce_rows(&reduce_evs) + fold_rows(&fold_evs) + pow_rows(&pow_evs), provider_rows(&program.reduce_layout));
+    let reduce = if reduce_lh == 0 {
+        None
+    } else {
+        Some(reduce_trace(&program.reduce_layout, &reduce_evs, &fold_evs, &pow_evs, 1 << reduce_lh, &mut counts))
+    };
     let range = range_trace(&counts);
     Ok(Traces {
         program: program_t,
@@ -460,6 +588,18 @@ pub fn build_traces(program: &Program, exec: &Execution, tier: Tier) -> Result<T
     })
 }
 
+/// `prove`'s ceiling check (the final fix wave, Important 3): the run's reduce-chip rows must fit
+/// `REDUCE_MAX_LOG_HEIGHT` with their padding row, or `verify` could never accept the proof. Over
+/// the events, before any trace is built.
+pub fn check_reduce_rows(exec: &Execution) -> Result<(), ProveError> {
+    let rows = reduce_rows(&reduce_events(&exec.events)) + fold_rows(&fold_events(&exec.events)) + pow_rows(&pow_events(&exec.events));
+    let max = (1usize << REDUCE_MAX_LOG_HEIGHT) - 1;
+    if rows > max {
+        return Err(ProveError::ReduceRows { rows, max });
+    }
+    Ok(())
+}
+
 impl Machine {
     /// Run the program and prove the run (plan Task 6). No salt, no input commitment (spec §2):
     /// the witness is a public tape — the only entropy drawn is the hiding PCS's own, inside
@@ -476,6 +616,7 @@ impl Machine {
             Some(t) => return Err(ProveError::BadTier(t.0)),
             None => Tier::for_cycles(exec.cpu_rows()).ok_or(ProveError::NoTier(exec.cpu_rows()))?,
         };
+        check_reduce_rows(&exec)?;
         let traces = build_traces(program, &exec, tier)?;
         Ok((self.prove_traces(program, &traces, tier), exec))
     }
@@ -501,7 +642,7 @@ impl Machine {
         // Built with `key_config` so the preprocessed tree's commitment matches exactly what a
         // verifier recomputes via `verifier_key`; `prove_batch` itself runs against
         // `self.config` (fresh entropy) for the main/quotient/permutation commitments.
-        let key_cfg = key_config(self.profile);
+        let key_cfg = key_config(self.fri);
         let prover_data = ProverData::from_airs_and_degrees(&key_cfg, &airs, &log_ext_degrees(program, tier, traces.reg_log_height, traces.ram_log_height, traces.poseidon2_log_height, traces.reduce_log_height));
         let batch = prove_batch_with_layout(&self.config, &instances, &prover_data, layout);
         Proof {
@@ -527,17 +668,17 @@ impl Machine {
             Backend::Reference => {
                 // Fresh entropy for the proving config (hiding), deterministic for the key
                 // config — the same split `make_config`/`key_config` make on the CPU.
-                let cfg = backend::reference_config(self.profile, SaltRng::fresh(), SaltRng::fresh());
+                let cfg = backend::reference_config(self.fri, SaltRng::fresh(), SaltRng::fresh());
                 let (mmcs_rng, pcs_rng) = key_rngs();
-                let key = backend::reference_config(self.profile, mmcs_rng, pcs_rng);
+                let key = backend::reference_config(self.fri, mmcs_rng, pcs_rng);
                 self.prove_on(&cfg, &key, program, witness, tier)
             }
             #[cfg(any(feature = "cuda", feature = "mock-cuda"))]
             Backend::Cuda => {
                 let gpu = rand_zkvm_cuda::gpu::GpuProver::probe(backend::PERM_SEED).map_err(|e| ProveError::Backend(e.to_string()))?;
-                let cfg = backend::cuda_config(self.profile, gpu.clone(), SaltRng::fresh(), SaltRng::fresh());
+                let cfg = backend::cuda_config(self.fri, gpu.clone(), SaltRng::fresh(), SaltRng::fresh());
                 let (mmcs_rng, pcs_rng) = key_rngs();
-                let key = backend::cuda_config(self.profile, gpu, mmcs_rng, pcs_rng);
+                let key = backend::cuda_config(self.fri, gpu, mmcs_rng, pcs_rng);
                 self.prove_on(&cfg, &key, program, witness, tier)
             }
         }
@@ -578,6 +719,7 @@ impl Machine {
             Some(t) => return Err(ProveError::BadTier(t.0)),
             None => Tier::for_cycles(exec.cpu_rows()).ok_or(ProveError::NoTier(exec.cpu_rows()))?,
         };
+        check_reduce_rows(&exec)?;
         let traces = build_traces(program, &exec, tier)?;
         let arc = Arc::new(program.clone());
         let airs = chips(&arc, tier, traces.reduce_log_height);
@@ -606,14 +748,30 @@ impl Machine {
 
     /// R6: the verifier holds the registered program; the preprocessed cap is the binding (there
     /// is no `hc` public value to check — that is what a preprocessed program table means).
+    ///
+    /// `N = 1`: the reduce height must be the program's canonical one for a single pass
+    /// ([`verify_n`](Self::verify_n)) — right for the single-proof program, an aggregate of one
+    /// and every straight-line program; an aggregate of `N` proofs is verified through
+    /// `aggregate::verify_aggregate` (or `verify_n`).
     pub fn verify(&self, program: &Program, proof: &Proof) -> Result<(), VerifyError> {
-        self.verify_with_layout(program, proof, QUOTIENT_LAYOUT)
+        self.verify_n(program, proof, 1)
+    }
+
+    /// [`verify`](Self::verify) for a proof of `program` over `n` inner proofs: the declared
+    /// reduce height must be `canonical_reduce_log_height(program, n)`, checked before any key is
+    /// built (the module doc: the node's key-cache DoS guard).
+    pub fn verify_n(&self, program: &Program, proof: &Proof, n: u64) -> Result<(), VerifyError> {
+        self.verify_inner(program, proof, n, QUOTIENT_LAYOUT)
     }
 
     /// [`verify`](Self::verify) under an explicit quotient layout — the layout tests' entry
     /// point, so a `PerInstance` proof can be shown refused by a `PerChunk` verifier. Every proof
     /// this machine accepts is checked under `QUOTIENT_LAYOUT`.
     pub fn verify_with_layout(&self, program: &Program, proof: &Proof, layout: QuotientLayout) -> Result<(), VerifyError> {
+        self.verify_inner(program, proof, 1, layout)
+    }
+
+    fn verify_inner(&self, program: &Program, proof: &Proof, n: u64, layout: QuotientLayout) -> Result<(), VerifyError> {
         if proof.public_values.len() != NUM_PUBLIC_VALUES { return Err(VerifyError::PublicValues); }
         // `public_values` is deserialized from untrusted bytes as raw `u64`s, and
         // `Val::from_u64` does not reduce: insist on the canonical representative so a proof has
@@ -629,6 +787,14 @@ impl Machine {
         Self::check_program(program).map_err(VerifyError::Program)?;
         // Every range check on the proof's declared shape, before anything is sized from it.
         check_declared_heights(proof.tier, proof.reg_log_height, proof.ram_log_height, proof.poseidon2_log_height, proof.reduce_log_height)?;
+        // The final fix wave (Important 2): the reduce height is the program's canonical one for
+        // `n` proofs — the only height an honest prover produces — so a proof cannot pick the
+        // height its verifier key is built at. This subsumes Cut D's "the declared height holds
+        // the provider region" (the canonical height always does).
+        let canonical = canonical_reduce_log_height(program, n);
+        if canonical != Some(proof.reduce_log_height) {
+            return Err(VerifyError::ReduceHeightNotCanonical { declared: proof.reduce_log_height, canonical });
+        }
         // VERIFIER-1: the commit-phase PoW words, unobserved at zero bits, must be the honest
         // zero — a comparison per round, with the other cheap checks, before any key is built.
         check_commit_pow_witnesses(proof)?;
@@ -639,7 +805,7 @@ impl Machine {
         let airs = chips(&arc, proof.tier, proof.reduce_log_height);
         let pv_vals: Vec<Val> = proof.public_values.iter().map(|x| Val::from_u64(*x)).collect();
         let pvs: Vec<Vec<Val>> = (0..airs.len()).map(|i| if i == PUBLIC_VALUES_INDEX { pv_vals.clone() } else { vec![] }).collect();
-        let common = self.verifier_key(program, proof.tier, proof.reduce_log_height != 0);
+        let common = self.verifier_key(program, proof.tier, proof.reduce_log_height);
         verify_batch_with_layout(&self.config, &airs, &proof.batch, &pvs, &common, layout).map_err(|e| VerifyError::Batch(format!("{e:?}")))
     }
 }
@@ -656,12 +822,14 @@ pub fn max_constraint_degrees(program: &Program, tier: Tier) -> Vec<usize> {
 /// batch, reduce last) or not. R4's width/degree pin (the 2026-09-27 rVM review) found the pinned
 /// test never built the reduce chip — `max_constraint_degrees` always passed a reduce height of
 /// `0` — so the chip's degree, and with it its quotient-chunk count, was pinned by nothing. The
-/// declared height is the floor, as everywhere else here: the symbolic degree is height-invariant.
+/// declared height is the smallest that holds one run and the provider region (the program's
+/// layout and, since Cut E2, the 14-row fold coefficient table: `reduce_log_height(1,
+/// provider_rows(..))`), not the bare floor; the symbolic degree is height-invariant either way.
 pub fn max_constraint_degrees_declaring(program: &Program, tier: Tier, reduce: bool) -> Vec<usize> {
     let machine = Machine::new(FriProfile::Test);
-    let key_cfg = key_config(machine.profile);
+    let key_cfg = key_config(machine.fri);
     let arc = Arc::new(program.clone());
-    let reduce_log_height = if reduce { MIN_LOG_HEIGHT } else { 0 };
+    let reduce_log_height = if reduce { crate::tables::reduce::reduce_log_height(1, provider_rows(&program.reduce_layout)) } else { 0 };
     let airs = chips(&arc, tier, reduce_log_height);
     let is_zk = machine.config.is_zk();
     let ext_degrees = log_ext_degrees(program, tier, MIN_LOG_HEIGHT, MIN_LOG_HEIGHT, MIN_LOG_HEIGHT, reduce_log_height);
@@ -701,7 +869,7 @@ pub fn chips(program: &Arc<Program>, _tier: Tier, reduce_log_height: u8) -> Vec<
     // instance at all, and the REDUCE bus then has no provider, so a `REDUCE` row cannot be
     // proved absent the table. Appended last, so it cannot disturb `PUBLIC_VALUES_INDEX`.
     if reduce_log_height != 0 {
-        v.push(Chip::Reduce(ReduceAir));
+        v.push(Chip::Reduce(ReduceAir::new(Arc::new(program.reduce_layout.clone()), 1 << reduce_log_height)));
     }
     v
 }

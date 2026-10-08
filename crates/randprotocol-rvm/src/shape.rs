@@ -28,10 +28,13 @@ use randprotocol_zkvm::machine::{
     chips, Challenge, Chip, Config, FriProfile, Machine, Perm, Proof, Tier, Val,
 };
 
-/// `log_blowup`, from `research`'s `generic_config` (`research/src/machine.rs`). A literal there and
-/// a literal here; `InnerShape::of` cannot read it back off a `FriParameters` because the `Config`'s
-/// PCS keeps them private.
-pub const LOG_BLOWUP: usize = 3;
+/// The inner RV32 machine's `log_blowup`, from `research`'s `generic_config`
+/// (`research/src/machine.rs`): a literal there and a literal here — `InnerShape::of` cannot read it
+/// back off a `FriParameters` because the `Config`'s PCS keeps them private. Cross-checked against a
+/// real inner proof by `tests/verifier.rs` (`Σ log_arities + INNER_LOG_BLOWUP == log_global_max_height`).
+/// The rVM's own proofs are at `machine::RvmFri::of(profile).log_blowup` (rate ¼ since `docs/07`);
+/// every reader takes the value from the shape it is reading, `VerifierShape::log_blowup`.
+pub const INNER_LOG_BLOWUP: usize = 3;
 /// `log_final_poly_len`, same source: the final polynomial is a single coefficient.
 pub const LOG_FINAL_POLY_LEN: usize = 0;
 /// `max_log_arity`, same source: FRI folds by at most 8 per round.
@@ -109,7 +112,7 @@ pub struct InnerShape {
     /// It is **derived, not read off a proof**: `p3_fri::compute_log_arity_for_round` is a pure
     /// function of the current height, the next input height, the final height and
     /// `max_log_arity`, and every matrix in the opening argument has log-height
-    /// `degree_bits[i] + LOG_BLOWUP` (the quotient-chunk domains split down to `ext_db - is_zk`
+    /// `degree_bits[i] + log_blowup` (the quotient-chunk domains split down to `ext_db - is_zk`
     /// and the ZK doubling puts them back, and the preprocessed matrices carry the instance's own
     /// `degree_bits`). So the schedule is a function of the distinct degree bits alone — which is
     /// what makes it part of the shape rather than of the witness.
@@ -247,7 +250,7 @@ impl InnerShape {
         }
 
         let lookup_gadget = LogUpGadget::new();
-        let log_arities = fri_schedule(&degree_bits)?;
+        let log_arities = fri_schedule(&degree_bits, INNER_LOG_BLOWUP)?;
 
         let mut shape = InnerShape {
             tier: tier.0,
@@ -349,10 +352,10 @@ impl InnerShape {
         )
     }
 
-    /// `max(degree_bits) + LOG_BLOWUP`, the height every query index is sampled from — and, by the
-    /// cross-check `verify_fri` performs, also `Σ log_arities + LOG_BLOWUP + LOG_FINAL_POLY_LEN`.
+    /// `max(degree_bits) + INNER_LOG_BLOWUP`, the height every query index is sampled from — and, by the
+    /// cross-check `verify_fri` performs, also `Σ log_arities + INNER_LOG_BLOWUP + LOG_FINAL_POLY_LEN`.
     pub fn log_global_max_height(&self) -> usize {
-        self.degree_bits.iter().copied().max().expect("a batch has instances") + LOG_BLOWUP
+        self.degree_bits.iter().copied().max().expect("a batch has instances") + INNER_LOG_BLOWUP
     }
 
     /// The canonical flattening hashed into the vk digest. Every number the program is specialised
@@ -448,15 +451,15 @@ pub(crate) fn proof_log_arities(proof: &Proof) -> Vec<usize> {
 /// The commit-phase arity schedule implied by a set of extended degree bits.
 ///
 /// `p3_fri::prover::commit_phase`'s loop, with the heights it folds over: the reduced openings live
-/// at the distinct input log-heights `degree_bits[i] + LOG_BLOWUP`, descending, and each round folds
+/// at the distinct input log-heights `degree_bits[i] + log_blowup`, descending, and each round folds
 /// by `compute_log_arity_for_round(current, next_input, final, max)` — the very function the prover
 /// calls, so this is the reference schedule and not a second guess at it.
-fn fri_schedule(degree_bits: &[usize]) -> Result<Vec<usize>, ShapeError> {
-    let mut heights: Vec<usize> = degree_bits.iter().map(|d| d + LOG_BLOWUP).collect();
+fn fri_schedule(degree_bits: &[usize], log_blowup: usize) -> Result<Vec<usize>, ShapeError> {
+    let mut heights: Vec<usize> = degree_bits.iter().map(|d| d + log_blowup).collect();
     heights.sort_unstable_by(|a, b| b.cmp(a));
     heights.dedup();
 
-    let log_final_height = LOG_BLOWUP + LOG_FINAL_POLY_LEN;
+    let log_final_height = log_blowup + LOG_FINAL_POLY_LEN;
     let mut log_current = heights[0];
     let mut next = 1usize; // the next *unconsumed* input height
     let mut out = Vec::new();
@@ -477,6 +480,14 @@ fn fri_schedule(degree_bits: &[usize]) -> Result<Vec<usize>, ShapeError> {
         return Err(ShapeError::FriSchedule { rolled_in: next, heights: heights.len() });
     }
     Ok(out)
+}
+
+/// [`fri_schedule`] for the tests (`tests/shape.rs`). The schedule is invariant under the blowup:
+/// the arities depend only on height differences, which the blowup shifts uniformly.
+// test entry; not for production machines
+#[doc(hidden)]
+pub fn fri_schedule_for_tests(degree_bits: &[usize], log_blowup: usize) -> Result<Vec<usize>, ShapeError> {
+    fri_schedule(degree_bits, log_blowup)
 }
 
 impl InnerKey {
@@ -662,6 +673,11 @@ pub trait VerifierShape: Clone + PartialEq + Eq + std::fmt::Debug {
     fn preprocessed_matrix_to_instance(&self) -> &[usize];
     fn degree_bits(&self) -> &[usize];
     fn log_num_quotient_chunks(&self) -> &[usize];
+    /// The FRI blowup of the proofs this shape reads (`docs/07`): the inner RV32 machine's
+    /// `INNER_LOG_BLOWUP` (3) for inner proofs, `machine::RvmFri::of(profile).log_blowup` (2) for
+    /// the rVM's own. Every height the replay, the tape and the program derive from a degree bit
+    /// adds this and nothing else.
+    fn log_blowup(&self) -> usize;
     /// How the proofs of this shape commit their quotient chunks (`docs/05-quotient-layout.md`):
     /// the RV32 machine's proofs one matrix per chunk (Plonky3's layout, which the aggregate
     /// program's emitted code — and digest — is pinned to); the rVM's own proofs one matrix per
@@ -726,6 +742,9 @@ impl VerifierShape for InnerShape {
     }
     fn log_num_quotient_chunks(&self) -> &[usize] {
         &self.log_num_quotient_chunks
+    }
+    fn log_blowup(&self) -> usize {
+        INNER_LOG_BLOWUP
     }
     fn quotient_layout(&self) -> p3_batch_stark::QuotientLayout {
         p3_batch_stark::QuotientLayout::PerChunk
@@ -918,7 +937,7 @@ impl RvmShape {
             poseidon2_log_height,
             reduce_log_height,
         );
-        let common = m.verifier_key(program, tier, reduce_log_height != 0);
+        let common = m.verifier_key(program, tier, reduce_log_height);
 
         let widths: Vec<usize> = airs.iter().map(BaseAir::<Val>::width).collect();
         let num_public_values: Vec<usize> =
@@ -954,7 +973,7 @@ impl RvmShape {
         }
 
         let lookup_gadget = LogUpGadget::new();
-        let log_arities = fri_schedule(&degree_bits)?;
+        let log_arities = fri_schedule(&degree_bits, crate::machine::RvmFri::of(profile).log_blowup)?;
 
         let mut shape = RvmShape {
             profile,
@@ -965,8 +984,8 @@ impl RvmShape {
             reduce_log_height,
             program: program.clone(),
             program_log_height: crate::machine::program_log_height(program.instrs.len()),
-            num_queries: profile.num_queries(),
-            query_pow_bits: profile.pow_bits(),
+            num_queries: crate::machine::RvmFri::of(profile).num_queries,
+            query_pow_bits: crate::machine::RvmFri::of(profile).query_pow_bits,
             degree_bits,
             widths,
             preprocessed_widths,
@@ -1008,19 +1027,20 @@ impl RvmShape {
     }
 
     /// The batch's `CommonData` (the lookup contexts and the preprocessed commitment), a pure
-    /// function of `(program, tier, reduce)` — `InnerShape::common_data`'s role.
+    /// function of `(program, tier, reduce_log_height)` — `InnerShape::common_data`'s role.
     #[doc(hidden)]
     pub fn common_data(&self) -> std::sync::Arc<p3_batch_stark::CommonData<Config>> {
         rvm_machine(self.profile).verifier_key(
             &self.program,
             crate::machine::Tier(self.tier),
-            self.reduce_log_height != 0,
+            self.reduce_log_height,
         )
     }
 
-    /// `max(degree_bits) + LOG_BLOWUP`.
+    /// `max(degree_bits) + RvmFri::of(profile).log_blowup`.
     pub fn log_global_max_height(&self) -> usize {
-        self.degree_bits.iter().copied().max().expect("a batch has instances") + LOG_BLOWUP
+        self.degree_bits.iter().copied().max().expect("a batch has instances")
+            + crate::machine::RvmFri::of(self.profile).log_blowup
     }
 
     /// The canonical flattening hashed into the vk digest: the rVM prefix
@@ -1147,6 +1167,9 @@ impl VerifierShape for RvmShape {
     }
     fn log_num_quotient_chunks(&self) -> &[usize] {
         &self.log_num_quotient_chunks
+    }
+    fn log_blowup(&self) -> usize {
+        crate::machine::RvmFri::of(self.profile).log_blowup
     }
     fn quotient_layout(&self) -> p3_batch_stark::QuotientLayout {
         crate::machine::QUOTIENT_LAYOUT
