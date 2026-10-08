@@ -46,6 +46,7 @@ mod proving_slot;
 mod common;
 use common::cluster::*;
 use common::observer::Observer;
+use randprotocol_core::consensus::ConsensusMessage;
 use randprotocol_node::network::GossipMessage;
 use proving_slot::proving_slot;
 
@@ -308,15 +309,20 @@ async fn four_validators_plus_late_observer_syncs() {
 }
 
 /// Spec 2026-10-08 §1: a proposal is on the consensus topic as its header, signature and
-/// transaction hashes, and the bodies cross the network once, on the transaction topic. An
-/// observer — a bare gossipsub swarm beside the cluster — reads the raw frames.
+/// transaction hashes — never as a full `Consensus(Proposal)` — and the bodies cross on the
+/// transaction topic, not inside the proposal. An observer — a bare gossipsub swarm beside the
+/// cluster — reads the raw frames; it may receive a frame from more than one mesh peer, so the
+/// test asserts at least one tx-topic frame a mint rather than exactly one.
 ///
 /// The bound, derived: a compact frame is the 4-byte variant tag, the header (whose justify
 /// carries at most four votes here, ~3.8 KB each), the leader's signature, the hash list's
 /// 8-byte length and 32 bytes a transaction. `wire::tests` measures that frame with four
 /// justify votes and no hashes at 19 080 bytes, so the fixed part is held under 24 KiB and the
 /// whole frame — at most the 32 mints this test sends, 1 KiB of hashes — under 80 KiB.
-/// The test asserts at least one tx-topic frame for each of the 32 mints.
+///
+/// In this common case every validator has every mint from gossip before the proposal naming
+/// it arrives, so the four nodes' `compact_fetched` sum to (nearly) nothing; the tolerance is
+/// stated at the assertion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_proposal_frame_carries_hashes_not_bodies() {
     init_tracing();
@@ -333,20 +339,27 @@ async fn a_proposal_frame_carries_hashes_not_bodies() {
     // A couple of heartbeats for the observer to be grafted into n0's mesh.
     let _ = obs.pump(Duration::from_secs(2)).await;
 
-    // Eight mints through each node — the faucet's burst (`admission::FAUCET_MINT_BURST`) — so
-    // the 32 land in a block or two, while the observer collects every frame.
+    // Eight mints through each node — the faucet's burst (`admission::FAUCET_MINT_BURST`) —
+    // while the observer collects every frame. Round-robin, one mint per node a round, rounds
+    // 500 ms apart: every node bootstraps from n0, so n0 relays the other three nodes' mints to
+    // each peer, and all 32 at once would put 24 through n0 to each receiver in well under a
+    // second — past the receiver's per-forwarder transaction limit (`admission::PEER_TX_BURST`
+    // 16, refilling at `PEER_TX_PER_SEC` 4). A body over that limit is dropped unremembered and
+    // later fetched by hash: the fetch path, measured by the late-validator test, not the common
+    // case this one measures. Paced, n0 forwards three mints a round to each peer.
     const PER_NODE: u8 = 8;
     let submit = async {
         let mut hashes = Vec::new();
-        for (i, n) in nodes.iter().enumerate() {
-            for j in 0..PER_NODE {
+        for j in 0..PER_NODE {
+            for (i, n) in nodes.iter().enumerate() {
                 let seed = 1 + i as u8 * PER_NODE + j;
                 hashes.push(n.rpc.mint_shielded(&payee(seed), Some(1_000)).await.expect("mint accepted"));
             }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
         hashes
     };
-    let (hashes, seen) = tokio::join!(submit, obs.pump(Duration::from_secs(10)));
+    let (hashes, seen) = tokio::join!(submit, obs.pump(Duration::from_secs(12)));
     let mints = hashes.len();
 
     let compact: Vec<(usize, usize)> = seen
@@ -366,6 +379,13 @@ async fn a_proposal_frame_carries_hashes_not_bodies() {
     let in_frames: usize = compact.iter().map(|(_, t)| *t).sum();
     assert!(with_txs > 0, "no compact proposal carried a mint");
     assert!(biggest < 80 * 1024, "a compact proposal frame is {biggest} bytes");
+    // No proposal went out in the old full form (GossipMessage tag 0, ConsensusMessage tag 0).
+    let full = seen
+        .iter()
+        .filter(|s| s.topic.as_str().ends_with("/consensus"))
+        .filter(|s| matches!(bincode::deserialize::<GossipMessage>(&s.data), Ok(GossipMessage::Consensus(ConsensusMessage::Proposal(_)))))
+        .count();
+    assert_eq!(full, 0, "{full} full proposal frames on the consensus topic");
 
     // The bodies crossed the tx topic: one frame a mint.
     let tx_frames: Vec<usize> = seen.iter().filter(|s| s.topic.as_str().ends_with("/tx")).map(|s| s.data.len()).collect();
@@ -391,6 +411,18 @@ async fn a_proposal_frame_carries_hashes_not_bodies() {
         assert!(cms.iter().all(|cm| n.holds(cm)), "a node is missing a minted note");
     }
     assert_chains_equal(&nodes);
+
+    // The common case fetches nothing: each mint reached every validator on the tx topic before
+    // the proposal naming it (0 on all four in each of three runs of this shape). The tolerance
+    // is for one race only — a mint the leader itself took over RPC can be proposed within the
+    // block interval of its own gossip, so a validator a hop further along the mesh may see the
+    // compact proposal a few milliseconds before the body — and is one such body per
+    // validator. Unpaced, the per-forwarder limit dropped 8 bodies on each of three validators
+    // (24 fetched), which this bound fails.
+    let fetched: Vec<u64> = nodes.iter().map(|n| n.handle.status.read().unwrap().compact_fetched).collect();
+    let total: u64 = fetched.iter().sum();
+    eprintln!("compact_fetched on the four validators: {fetched:?} (sum {total}) for {mints} mints");
+    assert!(total <= nodes.len() as u64, "the validators fetched {total} bodies ({fetched:?}) that gossip should have brought");
     for n in [n0, n1, n2, n3] {
         stop(n).await;
     }

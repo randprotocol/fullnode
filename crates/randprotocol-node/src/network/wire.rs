@@ -366,7 +366,9 @@ mod tests {
         let frame = bincode::serialized_size(&GossipMessage::CompactProposal(compact)).unwrap();
         assert_eq!(frame - empty, 2_000 * 32, "each hash is 32 bytes on the wire");
         assert_eq!(b.header.justify.votes.len(), 26);
-        let four = bincode::serialized_size(&GossipMessage::CompactProposal(CompactBlock::of(&block(9, &keys(4))))).unwrap();
+        let four_block = block(9, &keys(4));
+        assert_eq!(four_block.header.justify.votes.len(), 4, "the four-validator frame carries four justify votes");
+        let four = bincode::serialized_size(&GossipMessage::CompactProposal(CompactBlock::of(&four_block))).unwrap();
         println!("compact proposal, 26 justify votes: {empty} bytes with no hashes, {frame} bytes with 2000 hashes; 4 justify votes, no hashes: {four} bytes");
         assert!(frame < 256 * 1024, "a 2 000-transaction compact proposal is {frame} bytes");
     }
