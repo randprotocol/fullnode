@@ -290,6 +290,31 @@ pub fn revoke_vesting_message(
     Hash::digest_domain(b"rand-vest-revoke-2", &bytes)
 }
 
+/// One signer's signature on a `MultisigPay` or `MultisigRotate`: `index` is the signer's
+/// position in the account's signer list, `signature` its Dilithium2 signature over
+/// [`multisig_pay_message`] or [`multisig_rotate_message`] — the same message for every signer.
+/// The shape is [`RevokerSignature`]'s, but its own type: the two lists mean different things.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignerSignature {
+    pub index: u8,
+    pub signature: Signature,
+}
+
+/// What each signer of a multisig account signs to pay out of it (`MultisigPay`): the account,
+/// its nonce (replay), the block timestamp the notes are stamped with, and every payout —
+/// recipient, blinding and envelope included, so a relayer cannot redirect or re-seal a payment.
+pub fn multisig_pay_message(genesis: &Hash, chain_id: u64, account: &[u8; 32], nonce: u64, time: u32, pays: &[crate::ledger::program_state::Payout]) -> Hash {
+    let bytes = bincode::serialize(&(genesis, chain_id, account, nonce, time, pays)).expect("serializes");
+    Hash::digest_domain(b"rand-multisig-pay-1", &bytes)
+}
+
+/// What each signer signs to replace an account's signer set and threshold (`MultisigRotate`).
+/// The account id does not change; the new set is checked as at creation.
+pub fn multisig_rotate_message(genesis: &Hash, chain_id: u64, account: &[u8; 32], nonce: u64, signers: &[PublicKey], threshold: u8) -> Hash {
+    let bytes = bincode::serialize(&(genesis, chain_id, account, nonce, signers, threshold)).expect("serializes");
+    Hash::digest_domain(b"rand-multisig-rotate-1", &bytes)
+}
+
 /// What a beneficiary signs to bond locked RAND to a validator (`BondVested`): the entry, the
 /// validator, the amount, the entry's nonce, and the registration it carries when the validator
 /// is new (its own signature covers the rest of it).

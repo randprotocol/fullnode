@@ -17,6 +17,7 @@ pub mod bridge_gov;
 pub mod bridge_notes;
 pub mod call_envelope;
 pub mod fees;
+pub mod multisig;
 pub mod nullifier_mmr;
 pub mod program_state;
 pub mod staking;
