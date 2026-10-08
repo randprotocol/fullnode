@@ -18,7 +18,7 @@
 #
 #   Test-0  every literal `fixture_proof(0)`: agg_executor::'s admission and executor tests, the
 #           covered-assembly tests in node::, the aggregation tests in rpc::, storage::seal_tests::
-#           (the fixture-backed list is scripts/ci-fixture-skips.sh's).
+#           (all run in CI on the in-repo set; ci.yml runs `--check` before them).
 #   Test-1, Test-2
 #           agg_executor::tests::the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte
 #           (`for k in 1..3`).

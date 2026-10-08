@@ -8,8 +8,10 @@
 #   every push (branches and tags) and pull request
 #     check-and-test    minutes. `cargo check --workspace --tests` (a `--lib`-only gate has
 #                       silently broken `main.rs` and `tests/` here before) and every library
-#                       suite. The proving suites and the fixture-backed aggregation tests are
-#                       skipped by name: scripts/ci-fixture-skips.sh is the one list.
+#                       suite, the node's fixture-backed aggregation tests included (their
+#                       pinned fixtures are in-repo, checked first by recursion-fixtures.sh
+#                       --check). The rVM's long proving tests are skipped by name:
+#                       scripts/ci-fixture-skips.sh is the one list.
 #     lint              clippy, warnings denied, on the hand-maintained crates.
 #     supply-chain      `cargo audit` and `cargo deny check` (deny.toml).
 #     guest-provenance  the vendored guests are circuits' files at the pin and rebuild from source.
@@ -29,7 +31,9 @@
 #           and set no RECURSION_FIXTURES, so it died at `randprotocol-node --lib` on the
 #           fixture-backed aggregation tests on every run: 0 of 6 nightlies were green and the
 #           zkVM and rVM suites had never run in CI. Now: --no-fail-fast, the same skip list as
-#           the fast job, and the two proof suites in jobs of their own.
+#           the fast job, and the two proof suites in jobs of their own. Its open half (no job
+#           had the fixtures the node's aggregation tests read) closed 2026-10-08: the pinned
+#           set is committed (#131) and both jobs run those tests.
 #   PROC-6  no permissions block, actions pinned by tag, no dependency gate. Now: read-only
 #           token, every action pinned by commit, `supply-chain`.
 #   PROC-2  see `clean-clone`.
@@ -85,13 +89,19 @@ jobs:
       - name: Check every target
         working-directory: fullnode
         run: cargo check --workspace --tests
+      # The node's aggregation tests read the pinned recursion fixtures committed at
+      # crates/randprotocol-node/fixtures/recursion (#131). A missing, truncated or edited file
+      # fails here, by name, rather than as a panic or a wrong digest in the middle of the suite.
+      - name: The recursion fixtures are the pinned bytes
+        working-directory: fullnode
+        run: bash scripts/recursion-fixtures.sh --check
       - name: Library suites
         working-directory: fullnode
         # The skips are scripts/ci-fixture-skips.sh's, the one list this job and the nightly share:
-        # the fixture-backed aggregation tests (no RECURSION_FIXTURES cache on a clean runner) and
-        # the rVM's two long round trips. This comment used to say the fixture-backed tests were
-        # "covered by the nightly job". They were not, and are not: no CI job has a fixture cache,
-        # so they run only on a machine that holds one. The script's header says so.
+        # the rVM's two long round trips, by full name, nothing else. The node's fixture-backed aggregation tests
+        # run here (since 2026-10-08): the fixtures they read are in-repo and checked above. Until
+        # then this step skipped them, and for a while its comment claimed the nightly covered
+        # them; it did not, as no job had the fixtures.
         run: cargo test --workspace --lib --bins --release -- $(scripts/ci-fixture-skips.sh)
       - name: Integration suites that do not prove
         working-directory: fullnode
@@ -340,7 +350,8 @@ jobs:
   #
   # `--no-fail-fast`: cargo runs every test binary and reports every failure, where it used to
   # stop at the first red binary (PROC-7). The skips are the fast job's, from the one script; the
-  # zkVM and rVM crates are excluded here because they have jobs of their own below.
+  # zkVM and rVM crates are excluded here because they have jobs of their own below. The node's
+  # fixture-backed tests run here too, on the in-repo fixtures, checked first.
   nightly-proving:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
@@ -355,6 +366,9 @@ jobs:
           workspaces: fullnode
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: The recursion fixtures are the pinned bytes
+        working-directory: fullnode
+        run: bash scripts/recursion-fixtures.sh --check
       - name: The node, wallet, prover and core suites
         working-directory: fullnode
         run: |
@@ -397,12 +411,14 @@ jobs:
             -- --test-threads=1
 
   # The rVM's own suite, less its two long round trips (tier 19 and tier 20: tens of GB, the
-  # exit's own runs, not a gate's). No RECURSION_FIXTURES is set, so the fixture-using tests
+  # exit's own runs, not a gate's), skipped by full name from scripts/ci-fixture-skips.sh (a bare
+  # `--skip round_trips` here used to drop the ISA's encode/decode round trip too).
+  # No RECURSION_FIXTURES is set, so the fixture-using tests
   # (aggregate, exit, verifier, tape_n, self_verify) prove their fixtures into
   # `target/recursion-fixtures` on the runner first; whether a hosted runner's memory and the
   # time limit carry that is untested (audit v6 says as much). If they do not, this is the job to
-  # move to a self-hosted runner with a provisioned cache — the same cache the node's
-  # fixture-backed aggregation tests need (scripts/ci-fixture-skips.sh).
+  # move to a self-hosted runner with a provisioned cache. (The node's fixture-backed aggregation
+  # tests need no such cache: they read the pinned set committed in-repo, #131.)
   nightly-rvm:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
@@ -421,7 +437,7 @@ jobs:
         working-directory: fullnode
         run: |
           cargo test -p randprotocol-rvm --release --no-fail-fast \
-            -- --skip round_trips --skip two_test_profile
+            -- $(scripts/ci-fixture-skips.sh)
 
   # HB-4 (audit v6 §8.28, option 2; issue #100): a mutation control per Fixed zkVM finding — one
   # named one-line edit that removes the fix, and the named test that must go red under it,
