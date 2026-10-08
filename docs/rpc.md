@@ -1219,7 +1219,10 @@ by `randprotocol-node`'s `build.rs` — `git rev-parse HEAD` in a checkout, else
 `"unknown"` — with `-dirty` appended when tracked files differ from that commit (untracked files do
 not count). This
 is how a caller outside the fleet (an explorer, a survey script) confirms which build a node is
-running without shelling in; the deploy's own sha-compare stays on the binary.
+running without shelling in; the deploy's own sha-compare stays on the binary. `fri_profile` is
+the genesis profile's name, and it binds two parameter sets, both constants of the build: the
+inner RV32 proofs' (80 queries, rate ⅛, 20 grinding bits at production) and the rVM aggregate's
+(92, rate ¼, 24 since circuits `71e1a04`) — `docs/aggregation.md`, "Before enabling aggregation".
 
 ### `rand_getGenesisHash`
 Params: `[]`. Result: the genesis hash as hex, e.g. `"605eb783…"`.

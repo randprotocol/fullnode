@@ -232,7 +232,8 @@ The aggregate's N-ladder moved with it: production N = 1 lands at tier 20 (893 8
 at 21, N = 3 and N = 4 at 22; the test profile's N = 1/2/3 at 18/19/20. The permutation count
 (54 515 a proof) and the poseidon2 and reduce table heights did not change; the cpu, register and
 program tables are one height shorter at every N, and the production RAM table stays at 2²²
-(2 213 181 accesses). The aggregate program digest moved to `c90b3f0a…74d8`; the interface
+(2 213 181 accesses). The aggregate program digest moved to `c90b3f0a…74d8` (and, with phase 3
+below, to `dc350ecf…8ba0`); the interface
 digest, the inner verifier key and the chain's consensus rules did not. The node admits tiers
 {20, 21, 22} production and {18, 19, 20} test (`agg_executor.rs`).
 
@@ -253,15 +254,30 @@ proved on the 48 GB laptop at 33.27 GB peak live in 185 s on 16 threads, so a 64
 test-profile N = 1 aggregate with margin (measured). Production N = 1 projected ≈ 240 →
 **≈ 170–175 GB** — a projection until the tier-20 production proof runs on a ≥ 256 GB host.
 
+**Landed 2026-10-08 (rVM phase 3 and rate ¼, circuits `71e1a04`, `recursion/docs/06-phase3-fold-reduce.md`
+and `docs/07-rvm-rate-quarter.md`):** phase 3 moves the reduce chip's descriptor into a
+preprocessed layout and adds FOLD / POW row kinds (production inner proof 893 606 → 585 686 cpu
+rows, still tier 20; the register and RAM tables `2^22` → `2^21`; the aggregate program digest
+`c90b3f0a…74d8` → `dc350ecf…8ba0`). The rVM's own proofs then move from rate ⅛ to rate ¼
+(`log_blowup 3 → 2`, 92 queries and 24 grinding bits in place of 80 and 20; 86.38 proven bits
+against 86.41, the inner RV32 profile untouched). Measured on the tier-18 test twin: peak live
+heap 33.27 GB (quotient layout) → 26.88 GB (phase 3) → **15.64 GB** (rate ¼), verify 7.07 →
+3.53 s; the test N = 2 aggregate (tier 19) proved on the 48 GB laptop. Production N = 1 projected
+**≈ 64–75 GB** (a ≥ 96 GB host) — a projection until a production proof runs. New at phase 3:
+the reduce chip caps an aggregate at **production N ≤ 5** (`REDUCE_MAX_LOG_HEIGHT = 20`), so N = 6
+and 7 no longer verify inside tier 22; the node admits N ≤ 5 (`docs/aggregation.md`).
+
 **Still ahead, in order of leverage** (`recursion/docs/04`, "Still ahead"):
 
 - the quotient's share: ~~commit one instance's chunks as one matrix~~ (landed 2026-10-05, above);
   a degree-2 memory AIR as the remaining lever on the term;
 - the register table's height (4× the cpu table, ~2.5 `REG` messages a cpu row): a wider cpu row
   that reads fewer registers;
-- a REDUCE descriptor table (~240 k rows) and the FADDI per COMPRESS level (~16 k);
-- `log_blowup 3 → 2` for the rVM's own profile: halves every LDE for ~1.5× the queries (the
-  inner-profile decision §4.4 names, applied to the recursion);
+- ~~a REDUCE descriptor table (~240 k rows)~~ (phase 3, above) and the FADDI per COMPRESS level (~16 k);
+- ~~`log_blowup 3 → 2` for the rVM's own profile~~ (landed 2026-10-08, above: ×0.58 on the twin's
+  heap for 92 rather than 80 queries);
+- raising `REDUCE_MAX_LOG_HEIGHT` (one rung doubles the production N ceiling of 5; a key-shape
+  change);
 - the GPU backend as built changes none of this, because traces live on the host; a
   device-resident LDE and tree would, and that is the reason to want the 80 GB device class.
 
@@ -301,13 +317,13 @@ leaf, which is the number the §4.4 targets are set against.
 
 | measurement | today | target | why this number |
 |---|---|---|---|
-| leaf step, B = 16 (32 inner proofs), one 80 GB GPU | not possible (377 GB for N = 1 on CPU at constraint set 8; ≈ 240 GB projected after the row cuts) | ≤ 64 GB host, ≤ 60 s | fits one commodity GPU host; 16 bundles a minute a GPU |
+| leaf step, B = 16 (32 inner proofs), one 80 GB GPU | not possible (377 GB for N = 1 on CPU at constraint set 8; ≈ 240 GB projected after the row cuts; production N = 1 projected ≈ 64–75 GB at rate ¼, the ≤ 64 GB class at the edge, not met; N ≤ 5 is the rVM's ceiling) | ≤ 64 GB host, ≤ 60 s | fits one commodity GPU host; 16 bundles a minute a GPU |
 | 2-to-1 step | — | ≤ 64 GB host, ≤ 30 s | same host; tree depth 4 adds ≤ 2 min |
 | **GPU-seconds per covered transaction, amortised** | ~8 000 s CPU | **≤ 0.5 GPU-s** | §6.6 sizes the market on it |
 | rVM prover threads | 4.7× on 16 threads (`parallel` feature, tier 16, peak heap unchanged) | — | a wall-time lever only; the heap model holds under threads |
 | aggregate verify, warm, production | ~1–2 s (test profile) | ≤ 150 ms | ≤ 4 aggregates inside a 1.2 s slot with margin |
 | aggregate proof size | 1.56 MB | ≤ 1.5 MB | 8 per block within 128 MiB leaves room for records |
-| inner profile | 80 queries, rate ½ | decided by measurement (below) | — |
+| inner profile | 80 queries, rate ⅛, 20 grinding bits (the rVM's own proofs: 92 / rate ¼ / 24 since 2026-10-08) | decided by measurement (below) | — |
 
 **The inner profile is a measured decision, not a given.** Fewer FRI queries make every Merkle
 path in the recursion cheaper: a rate-¼ profile with 20 bits of grinding reaches the same

@@ -229,7 +229,19 @@ What it means for hardware:
   useful aggregate (measured); ≈ 240 GB projected after the phase-2 row cuts and ≈ 170–175 GB
   after the quotient layout, so a ≥ 256 GB host (below), a projection until the tier-20 proof runs.
   The earlier "≥ 64 GB" class came from a 48.6 GB oracle that the measurement disproved.
-- **N ≥ 2 at production does not fit any single CPU host** on offer, and the GPU backend does not
+- **rVM phase 3 and rate ¼ (circuits `71e1a04`, vendored 2026-10-08).** Measured on the
+  test profile (48 GB laptop, 16 threads, circuits `recursion/docs/06` §3 and `docs/07` §2): the
+  tier-18 exit twin (169 366 cpu rows, the test N = 1 aggregate's shape) peaks at **26.88 GB**
+  live after phase 3 and **15.64 GB** at rate ¼ (×0.58), verify 7.07 → 3.53 s; the test N = 2
+  aggregate (tier 19) **proved and verified** on that 48 GB host. Projected from the twin's ratio
+  (projections, nothing at production measured): production N = 1 (tier 20) ≈ 110–130 GB at
+  phase 3 → **≈ 64–75 GB at rate ¼, a ≥ 96 GB host**; N = 2 (tier 21) ≈ 122–142 GB (≥ 192 GB);
+  N = 3 (tier 21) ≈ 168–197 GB (≥ 256 GB); N = 4 (tier 22) ≈ 238–284 GB (≥ 384 GB). The ≤ 64 GB
+  class is at the edge, not met. **Production N ≤ 5** is the rVM's ceiling at this tree (the
+  reduce chip, `docs/aggregation.md`): no aggregate over more than five production bundle proofs
+  can be proved or verified, and the node refuses one by name.
+- **N ≥ 2 at production did not fit any single CPU host** on offer at constraint set 8 (the
+  projections above bring N = 2 under 192 GB; unproved), and the GPU backend does not
   change that: the traces live in host memory. Aggregating more than one proof needs a design
   change (smaller inner proofs, a different recursion layout, or trace streaming), tracked in
   issue #119 with the remaining soundness item.

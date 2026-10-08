@@ -259,10 +259,12 @@ pub trait ConfidentialExecutor: Send + Sync {
         proof: &[u8],
         binding: &[u32; 8],
     ) -> Result<Vec<[u32; 8]>, ConfidentialError>;
-    /// Precompute the aggregate program and the rVM verifier key for an admitted shape (the
-    /// startup key-build, ~30–70 s at production). Called once at node startup on a chain whose
-    /// genesis has an `aggregation` section; may be a no-op.
-    fn warm_aggregation(&self, _shape: &crate::types::DeclaredShape) {}
+    /// Precompute the aggregate program and the rVM verifier keys for an admitted shape (the
+    /// startup key-build, ~30–70 s a key at production). Called once at node startup on a chain
+    /// whose genesis has an `aggregation` section, with that section's `max_covers` — the chain's
+    /// largest admitted N, since an rVM verifier key is per (tier, reduce height) and the reduce
+    /// height is canonical in (program, N); may be a no-op.
+    fn warm_aggregation(&self, _shape: &crate::types::DeclaredShape, _max_covers: u32) {}
 }
 
 /// Test executor. A "proof" is `STUB` || tier (1 byte) || 8 outputs (LE u32) || `H_IN`

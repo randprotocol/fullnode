@@ -286,6 +286,41 @@ both have to clear before a genesis may switch it on.
    ≥ 256 GB host, tight, and a projection until proved. On that tree
    `admitted_shapes[].aggregate_program_digest` is `c90b3f0a…74d8` and the node admits tiers
    {20, 21, 22} (`recursion/docs/04-phase2-row-cuts.md`, `docs/node-hardware.md` §4).
+   **rVM phase 3 and rate ¼ (circuits `71e1a04`, vendored 2026-10-08;
+   `recursion/docs/06-phase3-fold-reduce.md`, `docs/07-rvm-rate-quarter.md`):** the production
+   inner proof is 585 686 cpu rows (still tier 20) and `admitted_shapes[].aggregate_program_digest`
+   at the production bundle shape is
+   **`dc350ecf6b60af74f4bb032bdf607c3fa0fbd6317705f0b1077e71b455e38ba0`** (was `c90b3f0a…74d8`;
+   phase 3 moved it, rate ¼ did not; `inner_vk_digest` and the interface vectors are unchanged).
+   Tiers stay {20, 21, 22} production (N = 1 at 20, N = 2–3 at 21, N = 4–5 at 22) and
+   {18, 19, 20} test.
+   - **The N ceiling: production N ≤ 5.** The reduce chip runs a fixed 196 480 rows a production
+     inner proof (39 296 test) and `REDUCE_MAX_LOG_HEIGHT` is 20, so an aggregate verifies only
+     while `N × rows + 1 ≤ 2^20`: **N ≤ 5 production, N ≤ 26 test**. Tier 22 holds N ≤ 7 by cpu
+     rows, so inside it the ceiling is the reduce chip's. The rVM refuses to prove past it, and the
+     node mirrors the rVM's own `machine::max_reduce_n`: `verify_aggregate` refuses an aggregate
+     over more bundles by name before any key work (`agg_executor::check_n_ceiling`), and
+     `rand-node genesis` refuses an `--aggregation` whose `max_covers` exceeds it for an admitted
+     shape (`check_admitted_covers`). Raising it is a key-shape change (one more rung of the
+     constant doubles the range).
+   - **The reduce height is canonical in (program, N).** The node verifies through the rVM's
+     `verify_aggregate`, which passes the list's N to `Machine::verify_n`; any declared reduce
+     height but `canonical_reduce_log_height(program, N)` is refused before a key is built (the
+     key-cache DoS guard; it replaces the node's own reduce-flag check). `warm_aggregation` warms
+     one key per admitted tier and canonical height for N = 1..=`max_covers` — production heights
+     `2^18` / `2^19` / `2^20` at N = 1 / 2 / 3–5, so a `max_covers` of 3 is 3 tiers × 3 heights.
+   - **`fri_profile` binds two parameter sets.** A chain's `fri_profile` name fixes the inner
+     RV32 proofs' FRI parameters (80 queries, rate ⅛, 20 grinding bits) *and* the rVM's own
+     (92 queries, rate ¼, 24 grinding bits at production), both constants of the vendored
+     constraint set, not genesis fields; the proven floor is the same ≈ 86 bits (over the rVM's
+     real chip shapes, under the whitepaper's unique-decoding bound: 86.41 at 80 / rate ⅛ / 20,
+     86.38 at 92 / rate ¼ / 24 — circuits `docs/07` §1).
+   - **Every node on this build.** A chain with an `aggregation` section needs every node on this
+     build or later: the rVM verifier keys (the reduce chip's preprocessed region, the rate-¼
+     profile) and the aggregate program digest changed, so an older node refuses every aggregate
+     this build accepts and pins a digest no current program produces. No genesis in
+     `deploy/genesis-chain*.json` (chains 6–20, the newest 20) has an `aggregation` section, and
+     `deploy/cut-chain21-genesis.sh` refuses one, so no chain is affected today.
 
 ### Testing: the recursion fixtures (issue #131)
 

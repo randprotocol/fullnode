@@ -2201,15 +2201,16 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
 
     // Warm verifier keys off the consensus thread: the bundle guest's always (every block can
     // carry bundles, so the first one must not pay for the key), every program already on
-    // chain, and — on a chain with an aggregation section — the aggregate program and its N=1
-    // landing tier's rVM verifier key per admitted shape (spec §2.3's startup obligation; the
-    // ~30–70 s production key-build happens here, not inside the first aggregate's admission).
+    // chain, and — on a chain with an aggregation section — the aggregate program and its rVM
+    // verifier keys per admitted shape, one per admitted tier and canonical reduce height for
+    // N = 1..=max_covers (spec §2.3's startup obligation; the ~30–70 s production key-builds
+    // happen here, not inside the first aggregate's admission).
     {
         let programs: Vec<_> = hs.committed_ledger().programs().values().cloned().collect();
         let agg_shapes: Vec<_> = hs
             .committed_ledger()
             .aggregation()
-            .map(|c| c.admitted_shapes.iter().map(|a| a.shape).collect())
+            .map(|c| c.admitted_shapes.iter().map(|a| (a.shape, c.max_covers)).collect())
             .unwrap_or_default();
         // Under genesis `hardening_v6` a call proves over other shapes (the call binding, INT-4),
         // so its keys are the hardened ones.
@@ -2233,8 +2234,8 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
                 }
             }
             tracing::info!("verifier keys warmed");
-            for shape in &agg_shapes {
-                ex.warm_aggregation(shape);
+            for (shape, max_covers) in &agg_shapes {
+                ex.warm_aggregation(shape, *max_covers);
             }
         });
     }

@@ -31,7 +31,9 @@ transfer needs a shielded spend key, which only the wallet holds. Use `rand` for
 
 One global flag, `--allow-test-fri-profile` (or `RAND_ALLOW_TEST_FRI_PROFILE=1` in the
 environment), lets `init`, `run` and `verify` accept a genesis whose `fri_profile` is `test`
-(audit v6, ZK-5a). That profile is 16 FRI queries and 4 grinding bits — about 17 bits of
+(audit v6, ZK-5a). The name binds both the inner proofs' FRI parameters and the rVM aggregate's
+(at production 80 queries / rate ⅛ / 20 bits and 92 / rate ¼ / 24, ≈ 86 proven bits each;
+`docs/aggregation.md`). The test profile is 16 FRI queries and 4 grinding bits — about 17 bits of
 soundness, a forged proof in a few thousand attempts — and whoever writes a genesis file can name
 it, so a release node refuses such a genesis and says what the profile is worth. The test suites
 set the variable; nothing else should. A production-profile genesis (every chain ever cut) needs

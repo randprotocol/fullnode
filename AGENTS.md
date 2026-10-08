@@ -6,6 +6,28 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-10-02)
 
+### rVM phase 3 + rate ¼ re-vendored (2026-10-08; branch `feat/rvm-rate-quarter-vendor`, NOT pushed)
+
+Circuits `71e1a04` (main; on the `randprotocol` remote) carries two rVM changes, vendored
+together: **phase 3** (`recursion/docs/06-phase3-fold-reduce.md`: the reduce chip's preprocessed
+layout, FOLD / POW row kinds; production inner proof 893 606 → 585 686 cpu rows, still tier 20)
+and **rate ¼** (`docs/07-rvm-rate-quarter.md`: the rVM's own proofs at log_blowup 2, 92 queries,
+24 grinding bits; 86.38 proven bits against 86.41; the inner RV32 profile stays 80/8/20). Phase 3
+moved the aggregate program digest `c90b3f0a…74d8` →
+**`dc350ecf6b60af74f4bb032bdf607c3fa0fbd6317705f0b1077e71b455e38ba0`** (production bundle shape);
+rate ¼ moved only rVM keys and proofs; `inner_vk_digest` `346ee184…` and the admission vectors
+(`3534960f…`) did not move; `admitted_tiers` unchanged ({20, 21, 22} / {18, 19, 20}). Node API
+follow-through in `agg_executor.rs`: `Machine::verifier_key` takes a reduce log-height (was a
+flag); `warm_aggregation(shape, max_covers)` (the trait gained `max_covers`) warms one key per
+admitted tier × `canonical_reduce_log_height(program, N)` for N ≤ `max_covers`; the node's own
+reduce-flag check is gone (the rVM's `verify_n` refuses a non-canonical height before key work);
+**production N ≤ 5** (`max_reduce_n`) is refused by name at `verify_aggregate`
+(`check_n_ceiling`) and at `rand-node genesis` (`check_admitted_covers`, a `max_covers` past it).
+Measured (test profile): the tier-18 twin 26.88 → 15.64 GB peak live; production N = 1 projected
+≈ 64–75 GB (≥ 96 GB host). `CIRCUITS_PIN` and both `rand-zkvm-cuda` revs are `71e1a04…`. Any
+future chain with an `aggregation` section needs every node on this build (keys and digest moved);
+none has one (chains 6–20; the chain-21 cut script refuses one).
+
 ### The proposer/aggregator split (2026-10-08; branch `fix/fee-split`, NOT pushed; genesis-gated, on no chain)
 
 `docs/compute-optimization.md` §6.2–§6.3 as two optional `FeesConfig` fields, aggregating chains
@@ -96,7 +118,8 @@ from the swarm tests: a dialer's `PeerConnected` can arrive **before** its own `
 so a helper that consumes events until `Listening` drops it. `.github/workflows/coverage.yml`
 (cargo-llvm-cov over check-and-test's suites, uploaded to Codecov; the badge in README.md) needs
 the `CODECOV_TOKEN` org secret, set 2026-10-06. circuits' own `main` has moved on to the rVM
-phase 3 merge (`ed67809`); re-vendoring that is a separate job and NOT done here.
+phase 3 merge (`ed67809`); re-vendoring that was a separate job — done at `71e1a04` on
+`feat/rvm-rate-quarter-vendor` (2026-10-08, the section at the top).
 
 ### Validator hot path (2026-10-05, `feat/hot-path`)
 

@@ -1756,6 +1756,11 @@ async fn main() -> Result<()> {
                                 // or no aggregate could ever be verified against it.
                                 randprotocol_node::agg_executor::check_admitted_shape(&admitted.shape)
                                     .map_err(|e| anyhow::anyhow!("--admitted-shape {s}: {e}"))?;
+                                // And the rVM's N ceiling (circuits docs/06 §3, production N ≤ 5):
+                                // a `max_covers` past it would admit cover sets no aggregator
+                                // can prove.
+                                randprotocol_node::agg_executor::check_admitted_covers(&admitted.shape, cfg.max_covers)
+                                    .map_err(|e| anyhow::anyhow!("--aggregation {spec} with --admitted-shape {s}: {e}"))?;
                                 Ok(admitted)
                             })
                             .collect::<Result<Vec<_>>>()?;

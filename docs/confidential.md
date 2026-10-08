@@ -459,6 +459,10 @@ table (`docs/superpowers/specs/2026-09-28-gas-model-design.md` §4.2, `docs/fees
   cuts (circuits `75b7893`, 2026-10-04) moved it again, to
   `c90b3f0a7758c7e306042f27a94cc1f123441b0284c7352cb3f426048c7a74d8`; the inner machine, its
   verifier key and the interface digest did not move (`recursion/docs/04-phase2-row-cuts.md`).
+  rVM phase 3 (circuits `71e1a04`, 2026-10-08, `recursion/docs/06-phase3-fold-reduce.md`) moved
+  it once more, `c90b3f0a…74d8` →
+  `dc350ecf6b60af74f4bb032bdf607c3fa0fbd6317705f0b1077e71b455e38ba0`; the rate-¼ rVM profile
+  vendored with it (`docs/07-rvm-rate-quarter.md`) moves rVM keys and proofs, not the digest.
 
 Every verifier key changes (the cpu AIR changes), so constraint set 8 rides only a chain cut —
 chain 18, which also carries `hardening_v6` and the genesis `gas` section (`docs/fees.md` §1.1,
