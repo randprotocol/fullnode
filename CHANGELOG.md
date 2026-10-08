@@ -61,6 +61,15 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 - **Storage:** `META_FEES` (JSON, `{}` without a section) and `META_BASE_FEES_BURNED` (bincode `0`
   without the flag) are written on every new database; an existing database without them opens
   unchanged, both reading as their defaults.
+- **The chain-21 cut, prepared (not cut):** `deploy/cut-chain21-genesis.sh`, derived from chain
+  20's script — chain 20's shape and value from a snapshot of chain 20, plus the genesis
+  `fees: {burn_base: true, burn_floor: true}` written as `fees.json` and passed as `--fees`,
+  asserted on the finished file, proved part of the genesis hash (the hash re-derived without the
+  section and without `burn_floor` must move) and read back by `check-limits`
+  (`rand_getLimits.fee_rules`, `rand_getSupply.base_fees_burned == "0"`). It refuses
+  `subsidy_net_of_fees` (aggregation stays refused until its admitted shape is re-measured,
+  b053a76) and a `rand-node` without `--fees`; `SELFTEST=1` and `DRY_RUN=1` exercise it with no
+  network (`docs/deploy.md`, "The next cut: the `fees` section (chain 21)").
 
 ### The validator hot path (`feat/hot-path`)
 

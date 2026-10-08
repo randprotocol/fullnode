@@ -24,6 +24,14 @@ All 26 validator keys are one operator's ("Key separation", below). The release 
 it has been followed are under "Rolling out a new commit"; the rules for the next cut are under
 "Cut policy".
 
+Since this table was read: **chain 19** (v0.6.7, genesis `a3defc93…228a`, 2026-10-01,
+`deploy/cut-chain19-genesis.sh`) and **chain 20** (v0.6.8, genesis `6210cf07…5135`, live since
+2026-10-01 06:17 UTC, `deploy/cut-chain20-genesis.sh`, `deploy/cut-records/chain20.record`; now on
+v0.7.1) — chain 20 is the chain that runs. **Chain 21** is prepared, not cut:
+`deploy/cut-chain21-genesis.sh` carries chain 20's shape and value plus the `fees` section
+(`burn_base`, `burn_floor`; "The next cut: the `fees` section (chain 21)", below) and needs a
+build at d6cc16f5 or later on every node and every signer.
+
 ## Topology rules
 
 - A chain is defined by its genesis file. Every node needs the identical file; validators are the keys
@@ -1362,7 +1370,7 @@ After launch: `rand_getTokens.incremental_root == true`, and a validator's `meta
 to a build before this one on such a chain is not possible (it cannot parse the genesis) — the
 same rule as every genesis field before it.
 
-## The next cut: the `fees` section (fee feedback, unreleased)
+## The next cut: the `fees` section (chain 21)
 
 **What it is.** A top-level genesis section, `"fees": { "burn_base": true }`, with three optional
 booleans (`docs/fees.md` §1.3). `burn_base` destroys every bundle's `BUNDLE_BASE` instead of paying
@@ -1381,15 +1389,60 @@ at genesis under `META_FEES` (JSON; written on every new database, the default `
 section), and `reload_ledger` sets it again from the file on every restart; served as
 `rand_getLimits.fee_rules`.
 
-**Rolling it out.** `rand-node genesis --fees FEES.JSON` writes the section (`docs/cli.md`), or
-the cut script splices it in the way it splices `bridge`. Every validator must run a build that knows the section before a
-genesis carries it — an older node does not refuse the file: `Genesis` has no
-`deny_unknown_fields`, so it silently ignores the section, derives a different genesis hash and
-so cannot join the chain.
-After launch: `rand_getLimits.fee_rules.burn_base == true`, and `rand_getSupply.base_fees_burned`
-grows by `BUNDLE_BASE` per included bundle with `invariant_holds` still `true` — under
-`fee_rules.burn_floor == true`, by each bundle's whole floor (`docs/fees.md` §1.3's worked Deploy
-and Call).
+**Recommended for chain 21: `{"burn_base": true, "burn_floor": true}`** (the user's decision,
+2026-10-08), the faithful EIP-1559 form of `docs/fees.md` §1.3. Under it the whole floor a bundle
+was checked against is destroyed — `BUNDLE_BASE` (0.001 RAND) for a transfer, a bond, a token action
+or an attestation; the base plus 100 000 units a word for a Deploy; the tier-exact
+`1 000 000 + gas_price · GAS_LIMIT + byte_price · ⌈bytes / 1024⌉` for a Call under chain 20's gas
+section; `BRIDGE_BURN_FEE` for a BridgeBurn; an Invoke's cell fee with it — and the proposer keeps
+only the tip above it, `fee − floor` (a 0.0012 RAND transfer burns 0.001 and tips 0.0002; a 0.0041
+RAND tier-14 Call burns 0.0040639 and tips 0.0000361). With chain 20's floating prices (§1.2) that
+is the point: a proposer gains nothing from a block that lifts a price, and a busy chain shrinks the
+supply instead of paying its proposers more. Nothing a sender pays changes — the floors and the
+wallet defaults are the same numbers; only where the floor goes differs. What every client sees:
+`rand_getLimits.fee_rules` = `{"burn_base": true, "subsidy_net_of_fees": false, "burn_floor":
+true}` (`null` on chains 14–20), and `rand_getSupply.base_fees_burned`, a decimal string inside
+`burned` and on the right of the supply identity, `"0"` at launch and growing by each included
+bundle's floor with `invariant_holds` still `true`. The wallets, randscan and the bridge site should
+read both: a wallet's fee preview should say the floor is burned, the explorer and the bridge
+site's supply panel should show `base_fees_burned` beside `registration_fees_burned`; a client that
+does not know either field still decodes the reply (each is an added key).
+
+**Not `subsidy_net_of_fees`.** It needs an `aggregation` section, and this build refuses any
+genesis with one at startup (`check_build_runs_genesis`): the admitted shapes and the recursion
+fixtures were measured for the retired 2-in-2-out guest and must be re-measured against the
+hidden-asset bundle (b053a76) before aggregation is activated. Until then the flag can only be
+refused (`rand-node genesis --fees` errors without `--aggregation`), so chain 21 does not carry it,
+and the cut script refuses a genesis that sets it, naming that reason. It rides with the cut that
+re-activates aggregation.
+
+**Rolling it out.** `rand-node genesis --fees FEES.JSON` writes the section (`docs/cli.md`).
+`deploy/cut-chain21-genesis.sh` — derived from chain 20's script, chain 20's shape and value cut
+from a snapshot of chain 20 — writes `fees.json` itself (`{"burn_base": true, "burn_floor":
+true}`), passes it as `--fees`, asserts the section on the finished file, refuses
+`subsidy_net_of_fees`, and proves the section is part of the genesis hash by re-deriving the hash
+with the section removed, and with `burn_floor` removed, and refusing if either does not move. The
+real cut refuses a `rand-node` without `--fees` (any build before d6cc16f5, v0.7.1 included);
+`DRY_RUN=1` skips the section, loudly, on such a binary. Every validator must run a build that knows
+the section before a genesis carries it — an older node does not refuse the file: `Genesis` has no
+`deny_unknown_fields`, so it silently ignores the section, derives a different genesis hash and so
+cannot join the chain. So **every node** — the 26 validators, both archives, and any RPC node the
+website, randscan or the bridge relayer reads — runs the d6cc16f5+ build from chain 21's first
+block. A signer binds chain 21's genesis hash without re-deriving it from the file: the `rand`
+wallet (and the relayer, which is a `rand`) reads it from the node (`rand_getGenesisHash`, under
+`binding_domain: 1`), and the offline operator commands (`rand-node admit sign`) take it as
+`--genesis-hash`, so a v0.6.8+ `rand` still signs for chain 21 (check any other signer, e.g. the
+bridge repo's `rand-bridge-gov`, for where it takes the hash before the cut).
+Ship them the same build anyway, in the cut's `clients:` line: only it knows `fee_rules`
+(`RpcClient::fee_rules`; no wallet fee preview says yet that the floor is burned — a follow-up),
+and the clients repo apps, randscan and the website WASM vendor their fullnode version as before
+(the chain-20 record's lesson).
+
+**After launch:** `NODE=… deploy/cut-chain21-genesis.sh check-limits <first node's RPC> <genesis
+file>` reads `rand_getLimits.fee_rules.burn_base == true` and `.burn_floor == true` (with
+`subsidy_net_of_fees == false`), `rand_getSupply.base_fees_burned == "0"` and `invariant_holds ==
+true`, beside every value carried from chain 20. Run it before the first bundle lands, or with
+`BASE_FEES_BURNED_ANY=1` once one has.
 
 ## The next cut: audit v6's staking fields (STAKE-2)
 
