@@ -598,6 +598,18 @@ mod tests {
             GossipPrecheck::Reject("proposal whose justify does not certify its parent")
         );
 
+        // A malformed certificate in the justify, through `precheck_qc`: a vote for another
+        // view than the certificate's is refused on every replica, so it is Reject.
+        let mut bad_qc = h.clone();
+        bad_qc.justify.votes.push(Vote::sign(&hs.cfg.domain, bad_qc.justify.view + 9, bad_qc.justify.block_hash, &leader));
+        let resigned = Block::sign(&hs.cfg.domain, bad_qc, Vec::new(), &leader);
+        let (qh, qs, qx) = compact_of(&resigned);
+        assert_eq!(
+            hs.precheck_compact(&qh, &qs, &qx),
+            GossipPrecheck::Reject("certificate vote for another view or block"),
+            "a malformed justify is refused before the signature"
+        );
+
         let forged = leader.sign(b"another message");
         assert_eq!(
             hs.precheck_compact(&h, &forged, &hashes),
