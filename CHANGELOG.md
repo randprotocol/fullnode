@@ -12,6 +12,12 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+- **The aggregate daemon survives a failed pass** (node-only): in `rand-node aggregate --watch` a
+  failed pass (an RPC failure, a nonce that moved while proving, a failed prove, a mempool
+  refusal) is logged at `warn` and retried on the interval instead of stopping the daemon; a new
+  `--watch-max-failures <N>` (default 20) caps consecutive failures, and a stop-class error — the
+  node serving another chain id, the key missing from the register — still exits at once. A
+  one-shot run is unchanged (`docs/aggregation.md` §3.7, `docs/cli.md`).
 - **Fee feedback, the burned base** (genesis-gated: a hard fork on a chain whose genesis sets a
   flag, node-only on every other chain — no existing chain carries the section): a new genesis
   `fees` section (`docs/fees.md` §1.3). Under `fees.burn_base` every bundle's `BUNDLE_BASE` is

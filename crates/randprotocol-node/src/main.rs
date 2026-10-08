@@ -867,6 +867,11 @@ enum Cmd {
         /// Return once the node accepts the aggregate instead of waiting for it to commit.
         #[arg(long)]
         no_wait: bool,
+        /// In `--watch` mode, exit non-zero after this many consecutive failed passes (a failed
+        /// pass is otherwise logged and retried on the interval). 20 passes is five minutes of a
+        /// node that answers nothing at the default interval.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
+        watch_max_failures: u32,
     },
     /// Benchmarks of the node's own paths; no network, no database.
     Bench {
@@ -2458,8 +2463,9 @@ async fn main() -> Result<()> {
                 submit_staking(&staking, chain_id, action, "aggregator withdraw").await?;
             }
         },
-        Cmd::Aggregate { key, rpc, watch, interval_secs, no_wait } => {
-            aggregate_daemon(&key, &rpc, watch, interval_secs, no_wait).await?;
+        Cmd::Aggregate { key, rpc, watch, interval_secs, no_wait, watch_max_failures } => {
+            let cfg = DaemonConfig { watch, interval: Duration::from_secs(interval_secs), no_wait, max_failures: watch_max_failures };
+            aggregate_daemon(&key, &rpc, &cfg).await?;
         }
     }
     let _ = UNITS_PER_RAND;
@@ -2483,6 +2489,10 @@ trait AggregateNode {
     /// The chain's binding domain for `chain_id` (BIND-1, `RpcClient::binding_domain`): what
     /// the aggregate binding the proof commits to and the signing hash carry.
     async fn binding_domain(&self, chain_id: u64) -> Result<randprotocol_core::BindingDomain>;
+    /// Submit a signed transaction (`rand_sendTransaction`); its hash.
+    async fn send_transaction(&self, tx: &randprotocol_core::Transaction) -> Result<randprotocol_core::Hash>;
+    /// Wait for `hash` to commit; the block height it committed in.
+    async fn wait_for_transaction(&self, hash: &randprotocol_core::Hash, timeout: Duration) -> Result<u64>;
 }
 
 impl AggregateNode for RpcClient {
@@ -2498,6 +2508,37 @@ impl AggregateNode for RpcClient {
     async fn binding_domain(&self, chain_id: u64) -> Result<randprotocol_core::BindingDomain> {
         RpcClient::binding_domain(self, chain_id).await
     }
+    async fn send_transaction(&self, tx: &randprotocol_core::Transaction) -> Result<randprotocol_core::Hash> {
+        RpcClient::send_transaction(self, tx).await
+    }
+    async fn wait_for_transaction(&self, hash: &randprotocol_core::Hash, timeout: Duration) -> Result<u64> {
+        Ok(RpcClient::wait_for_transaction(self, hash, timeout).await?.height)
+    }
+}
+
+/// The aggregate daemon's stop class: the errors no retry can cure, which end a `--watch` loop on
+/// the pass they occur in. Every other pass error — an RPC failure or a malformed reply, the
+/// register nonce moving while proving (the pass is abandoned), a failed prove, a refusal at the
+/// mempool or a commit that does not arrive in time — is retried on the interval, up to
+/// `--watch-max-failures` in a row. A bad key file needs no variant: it is read once, before the
+/// first pass, and is the command's error. Raised as the root of an `anyhow` chain and found by
+/// [`stop_reason`], so context added on the way up does not hide it.
+#[derive(Debug, thiserror::Error)]
+enum StopError {
+    /// The node now serves another chain than the one the daemon started on (a chain restart
+    /// behind the same RPC): every signature and binding this daemon makes is for the old chain,
+    /// and the key must be registered on the new one.
+    #[error("the node now serves chain {got}, not chain {expected} this daemon started on; restart it against the right node")]
+    ChainIdMismatch { expected: u64, got: u64 },
+    /// This key has no row in the aggregator register (never registered, or its bond withdrawn):
+    /// no aggregate it signs is admitted until an operator registers it.
+    #[error("{address} is not in the aggregator register; register it first (`rand-node aggregator register`)")]
+    NotRegistered { address: String },
+}
+
+/// The [`StopError`] anywhere in `err`'s chain, if there is one; `None` is a retryable error.
+fn stop_reason(err: &anyhow::Error) -> Option<&StopError> {
+    err.chain().find_map(|e| e.downcast_ref::<StopError>())
 }
 
 /// The aggregator register row for `me`: nonce, payout and bond, from `rand_getAggregators`.
@@ -2507,7 +2548,7 @@ async fn aggregator_row(rpc: &impl AggregateNode, me: &randprotocol_core::Addres
     let row = rows
         .as_array()
         .and_then(|rows| rows.iter().find(|r| r["address"].as_str() == Some(want.as_str())))
-        .with_context(|| format!("{want} is not in the aggregator register; register it first (`rand-node aggregator register`)"))?;
+        .ok_or_else(|| StopError::NotRegistered { address: want.clone() })?;
     let nonce = row["nonce"].as_u64().context("the node's getAggregators reply has no nonce")?;
     let payout = row["payout"].as_str().context("the node's getAggregators reply has no payout address")?;
     let payout = ShieldedAddress::parse(payout).map_err(|e| anyhow::anyhow!("register payout address: {e}"))?;
@@ -2671,38 +2712,106 @@ async fn aggregate_pass(
     }))
 }
 
+/// How the aggregate daemon runs: once, or `--watch` on an interval with a cap on consecutive
+/// failed passes.
+struct DaemonConfig {
+    watch: bool,
+    /// The sleep between passes in `--watch` mode, after a sealed, an empty and a failed pass
+    /// alike (zero in tests).
+    interval: Duration,
+    no_wait: bool,
+    /// `--watch-max-failures`: this many failed passes in a row end the loop with an error. A
+    /// pass that seals or finds nothing to cover resets the count. At least 1.
+    max_failures: u32,
+}
+
 /// The aggregate daemon: [`aggregate_pass`], submitted, and `--watch` loops it on the interval;
 /// every pass is one proving job.
-async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, watch: bool, interval_secs: u64, no_wait: bool) -> Result<()> {
+async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, cfg: &DaemonConfig) -> Result<()> {
     let kp = load_keypair(key)?;
     let rpc = RpcClient::new(rpc_url.to_string());
     let chain_id = rpc.chain_id().await?;
+    aggregate_loop(&rpc, &kp, chain_id, cfg, prove_aggregate).await
+}
+
+/// The daemon's loop over a node, apart from the key file and the RPC client so a test can drive
+/// it. Without `--watch` one pass runs and its error is the command's. With it, a failed pass is
+/// logged at `warn` with its error chain and retried after the interval — unless it is of the
+/// [`StopError`] class, which ends the loop at once, or it is the `max_failures`-th failure in a
+/// row, which ends it with an error naming the cap.
+async fn aggregate_loop(
+    rpc: &impl AggregateNode,
+    kp: &Keypair,
+    chain_id: u64,
+    cfg: &DaemonConfig,
+    prove: impl Fn(FriProfile, &[Vec<u8>], &[u32; 8]) -> Result<Vec<u8>>,
+) -> Result<()> {
+    let mut failures = 0u32;
     loop {
-        match aggregate_pass(&rpc, &kp, chain_id, prove_aggregate).await? {
-            Some(tx) => {
-                let covered = match &tx.action {
-                    randprotocol_core::Action::Aggregate { covers, .. } => covers.len(),
-                    _ => 0,
-                };
-                let hash = rpc.send_transaction(&tx).await?;
-                if no_wait {
-                    println!("submitted aggregate {hash} ({covered} covered)");
-                } else {
-                    let receipt = rpc.wait_for_transaction(&hash, wallet::COMMIT_TIMEOUT).await?;
-                    println!("submitted aggregate {hash} ({covered} covered)\n  committed in block {}", receipt.height);
-                }
-                if !watch {
+        match aggregate_round(rpc, kp, chain_id, cfg, &prove).await {
+            Ok(sealed) => {
+                failures = 0;
+                if !cfg.watch {
+                    if !sealed {
+                        println!("nothing to cover right now");
+                    }
                     return Ok(());
                 }
             }
-            None if !watch => {
-                println!("nothing to cover right now");
-                return Ok(());
+            Err(e) if !cfg.watch => return Err(e),
+            Err(e) if stop_reason(&e).is_some() => {
+                tracing::error!("aggregate pass failed with an error no retry can cure; stopping: {e:#}");
+                return Err(e);
             }
-            None => {}
+            Err(e) => {
+                failures += 1;
+                if failures >= cfg.max_failures {
+                    return Err(e.context(format!(
+                        "{failures} consecutive aggregate passes failed (--watch-max-failures {}); giving up",
+                        cfg.max_failures
+                    )));
+                }
+                tracing::warn!(
+                    "aggregate pass failed ({failures} of {} in a row allowed); retrying in {:?}: {e:#}",
+                    cfg.max_failures,
+                    cfg.interval
+                );
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+        tokio::time::sleep(cfg.interval).await;
     }
+}
+
+/// One round of the daemon: the chain check, the pass and the submission. `true` when an
+/// aggregate was submitted, `false` when there was nothing to cover.
+async fn aggregate_round(
+    rpc: &impl AggregateNode,
+    kp: &Keypair,
+    chain_id: u64,
+    cfg: &DaemonConfig,
+    prove: impl FnOnce(FriProfile, &[Vec<u8>], &[u32; 8]) -> Result<Vec<u8>>,
+) -> Result<bool> {
+    // The node behind the URL can be restarted onto another chain while the daemon runs; the
+    // chain id it signs for is the one read at start, so a change is a stop, not a retry.
+    let now = rpc.call("rand_chainId", serde_json::json!([])).await?.as_u64().context("the node's chain id is not a number")?;
+    if now != chain_id {
+        return Err(StopError::ChainIdMismatch { expected: chain_id, got: now }.into());
+    }
+    let Some(tx) = aggregate_pass(rpc, kp, chain_id, prove).await? else {
+        return Ok(false);
+    };
+    let covered = match &tx.action {
+        randprotocol_core::Action::Aggregate { covers, .. } => covers.len(),
+        _ => 0,
+    };
+    let hash = rpc.send_transaction(&tx).await?;
+    if cfg.no_wait {
+        println!("submitted aggregate {hash} ({covered} covered)");
+    } else {
+        let height = rpc.wait_for_transaction(&hash, wallet::COMMIT_TIMEOUT).await?;
+        println!("submitted aggregate {hash} ({covered} covered)\n  committed in block {height}");
+    }
+    Ok(true)
 }
 
 /// The shortest history a node may keep: shorter than an hour and a node that restarts on the
@@ -3805,13 +3914,33 @@ mod tests {
         me: randprotocol_core::Address,
         payout: ShieldedAddress,
         raw: randprotocol_core::Transaction,
+        /// The watch loop's knobs: `rand_status` calls so far, and which of them (by index from
+        /// 0) fail as an RPC hiccup would.
+        status_calls: std::cell::Cell<u32>,
+        fail_status: fn(u32) -> bool,
+        /// Every aggregate submitted; each one commits at once and moves the register nonce on,
+        /// as a sealed aggregate does.
+        sent: std::cell::RefCell<Vec<randprotocol_core::Transaction>>,
+        /// `rand_chainId` answers 7 until this many aggregates are sent, and 8 from then on —
+        /// the node restarted onto another chain, the stop-class error that ends a watch test.
+        chain_moves_after: Option<usize>,
     }
 
     impl AggregateNode for MovingNode {
         async fn call(&self, method: &str, _params: serde_json::Value) -> Result<serde_json::Value> {
             use serde_json::json;
             Ok(match method {
-                "rand_status" => json!({
+                "rand_chainId" => {
+                    let moved = self.chain_moves_after.is_some_and(|k| self.sent.borrow().len() >= k);
+                    json!(if moved { 8 } else { 7 })
+                }
+                "rand_status" => {
+                    let i = self.status_calls.get();
+                    self.status_calls.set(i + 1);
+                    if (self.fail_status)(i) {
+                        anyhow::bail!("rand_status: connection reset by peer (call {i})");
+                    }
+                    json!({
                     "fri_profile": "test",
                     "height": self.height.get(),
                     "aggregation": {
@@ -3820,7 +3949,8 @@ mod tests {
                         "halving_blocks": 1,
                         "sealed_blocks": self.sealed_blocks.get(),
                     },
-                }),
+                    })
+                }
                 "rand_getUnsealed" => json!({
                     "bundles": [{ "hash": self.raw.hash().to_hex(), "height": 1, "excess": self.excess.get().to_string() }],
                     "next_from": null,
@@ -3852,6 +3982,14 @@ mod tests {
             // A chain without `binding_domain`, as chains 14 to 19.
             Ok(randprotocol_core::BindingDomain::ChainId)
         }
+        async fn send_transaction(&self, tx: &randprotocol_core::Transaction) -> Result<randprotocol_core::Hash> {
+            self.sent.borrow_mut().push(tx.clone());
+            self.nonce.set(self.nonce.get() + 1);
+            Ok(tx.hash())
+        }
+        async fn wait_for_transaction(&self, _hash: &randprotocol_core::Hash, _timeout: Duration) -> Result<u64> {
+            Ok(self.height.get() + 1)
+        }
     }
 
     fn moving_node(me: randprotocol_core::Address, payout: ShieldedAddress) -> MovingNode {
@@ -3879,7 +4017,106 @@ mod tests {
             me,
             payout,
             raw: randprotocol_core::Transaction::shielded(7, bundle, randprotocol_core::Action::None),
+            status_calls: std::cell::Cell::new(0),
+            fail_status: |_| false,
+            sent: std::cell::RefCell::new(Vec::new()),
+            chain_moves_after: None,
         }
+    }
+
+    /// The watch loop under test: zero interval, so no test sleeps.
+    fn watch_config(max_failures: u32) -> DaemonConfig {
+        DaemonConfig { watch: true, interval: Duration::ZERO, no_wait: false, max_failures }
+    }
+
+    fn fake_prove(_: FriProfile, _: &[Vec<u8>], _: &[u32; 8]) -> Result<Vec<u8>> {
+        Ok(b"the aggregate proof".to_vec())
+    }
+
+    /// A failed pass in `--watch` is logged and retried, not the end of the daemon: the first
+    /// `rand_status` fails as a dropped connection would, the next pass seals. (The run ends when
+    /// the stub's node moves to another chain — a stop-class error, below.)
+    #[tokio::test]
+    async fn the_watch_loop_retries_a_failed_pass_and_seals_on_the_next() {
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payout = randprotocol_zkvm::address::address_of(&SpendKey([7; 8]).viewing_key());
+        let mut node = moving_node(kp.address(), payout);
+        node.fail_status = |i| i == 0;
+        node.chain_moves_after = Some(1);
+        let err = aggregate_loop(&node, &kp, 7, &watch_config(5), fake_prove).await.unwrap_err();
+        assert_eq!(node.sent.borrow().len(), 1, "the second pass sealed one aggregate");
+        assert!(matches!(stop_reason(&err), Some(StopError::ChainIdMismatch { expected: 7, got: 8 })), "{err:#}");
+    }
+
+    /// The cap counts *consecutive* failures: a sealed pass resets it. Fail, seal, fail, seal
+    /// under a cap of 2 never reaches it.
+    #[tokio::test]
+    async fn the_watch_loops_failure_count_resets_on_a_sealed_pass() {
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payout = randprotocol_zkvm::address::address_of(&SpendKey([7; 8]).viewing_key());
+        let mut node = moving_node(kp.address(), payout);
+        // Calls 0 and 3 are the first of passes 1 and 3; a sealed pass makes two (before and after
+        // the prove).
+        node.fail_status = |i| i == 0 || i == 3;
+        node.chain_moves_after = Some(2);
+        let err = aggregate_loop(&node, &kp, 7, &watch_config(2), fake_prove).await.unwrap_err();
+        assert_eq!(node.sent.borrow().len(), 2, "both retries sealed: {err:#}");
+        assert!(matches!(stop_reason(&err), Some(StopError::ChainIdMismatch { .. })), "{err:#}");
+    }
+
+    /// A permanently broken setup does not spin forever: after `--watch-max-failures` consecutive
+    /// failed passes the loop exits with an error naming the cap and carrying the last failure.
+    #[tokio::test]
+    async fn the_watch_loop_gives_up_after_the_failure_cap() {
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payout = randprotocol_zkvm::address::address_of(&SpendKey([7; 8]).viewing_key());
+        let mut node = moving_node(kp.address(), payout);
+        node.fail_status = |_| true;
+        let err = aggregate_loop(&node, &kp, 7, &watch_config(3), fake_prove).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert_eq!(node.status_calls.get(), 3, "three passes, then stop");
+        assert!(msg.contains("3 consecutive"), "{msg}");
+        assert!(msg.contains("connection reset by peer (call 2)"), "the last error is carried: {msg}");
+        assert!(stop_reason(&err).is_none(), "a retryable error, capped — not a stop-class one");
+        assert!(node.sent.borrow().is_empty());
+    }
+
+    /// Stop-class errors end the watch loop on the first pass: the node now serves another chain
+    /// (every signature this daemon makes is for the old one), or this key is not in the register.
+    #[tokio::test]
+    async fn the_watch_loop_stops_at_once_on_a_stop_class_error() {
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payout = randprotocol_zkvm::address::address_of(&SpendKey([7; 8]).viewing_key());
+
+        let mut node = moving_node(kp.address(), payout.clone());
+        node.chain_moves_after = Some(0);
+        let err = aggregate_loop(&node, &kp, 7, &watch_config(5), fake_prove).await.unwrap_err();
+        assert!(matches!(stop_reason(&err), Some(StopError::ChainIdMismatch { expected: 7, got: 8 })), "{err:#}");
+        assert_eq!(node.status_calls.get(), 0, "no pass is started against the wrong chain");
+
+        let stranger = Keypair::from_seed([10; 32]).unwrap().address();
+        let node = moving_node(stranger, payout);
+        let err = aggregate_loop(&node, &kp, 7, &watch_config(5), fake_prove).await.unwrap_err();
+        assert!(matches!(stop_reason(&err), Some(StopError::NotRegistered { .. })), "{err:#}");
+        assert!(format!("{err:#}").contains("aggregator register"), "{err:#}");
+        assert_eq!(node.status_calls.get(), 1, "one pass, not five");
+    }
+
+    /// Without `--watch` nothing changes: a failed pass is the command's error, at once.
+    #[tokio::test]
+    async fn a_one_shot_run_fails_on_a_failed_pass() {
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payout = randprotocol_zkvm::address::address_of(&SpendKey([7; 8]).viewing_key());
+        let mut node = moving_node(kp.address(), payout);
+        node.fail_status = |i| i == 0;
+        let cfg = DaemonConfig { watch: false, ..watch_config(5) };
+        let err = aggregate_loop(&node, &kp, 7, &cfg, fake_prove).await.unwrap_err();
+        assert!(format!("{err:#}").contains("connection reset by peer"), "{err:#}");
+        assert_eq!(node.status_calls.get(), 1, "no retry");
+        // And a pass that seals returns Ok once.
+        let node = moving_node(kp.address(), randprotocol_zkvm::address::address_of(&SpendKey([7; 8]).viewing_key()));
+        aggregate_loop(&node, &kp, 7, &cfg, fake_prove).await.unwrap();
+        assert_eq!(node.sent.borrow().len(), 1);
     }
 
     /// The interface review's IFACE-8: the prove takes ~26 minutes and the payout note's `time`
