@@ -32,7 +32,7 @@ is `threshold` of `n` Dilithium2 keys. The treasury is its first account, seeded
 | D6 | who pays a payout's base | **The account**, from its RAND row, to the proposer's rewards — a Withdraw's shape. A rotation is fee-less (an Unbond's shape). |
 | D7 | account id | **Derived**, never chosen, from the creation terms and a salt — the same rule for genesis and later accounts, so the genesis command can print the treasury's id before the cut. |
 | D8 | state-root placement | A **wrapper** over the state root (`rand-state-multisig-1`, like `rand-state-tokens-1`), not the next positional domain: `feat/rpl3` (unmerged) takes `rand-state-9`, and a wrapper is independent of merge order. |
-| D9 | action tags | **40–43**. `feat/rpl3` uses 34–39 for the perps actions; leaving them free lets either branch merge first. |
+| D9 | action tags | **34–37**, appended after `Invoke` (33). A tag is the variant's bincode position, so nothing can be reserved: `feat/rpl3` (unmerged, on no chain) also appends at 34. Both are genesis-gated, so whichever branch merges second renumbers its variants before any cut carries them; this spec's numbers assume multisig merges first. |
 
 Out of scope, recorded: on-chain proposals with approvals over several blocks; a vesting revoke
 paying into a multisig id (a revoke's `treasury` stays a `rand1…` address); per-signer weights;
@@ -115,13 +115,13 @@ names it. **Persistence**: JSON under `META_MULTISIG` at the state-write sites t
 `META_VESTING`; `reload_ledger` refuses a genesis file and a database that disagree about having the
 section, and the snapshot-is-the-head-state check covers it through the root.
 
-## 5. Actions (`Action` 40–43)
+## 5. Actions (`Action` 34–37)
 
 All four are refused `UnsupportedAction("multisig")` on a chain without the section, at admission
 and again at apply before any write. Signed messages carry the genesis hash and the chain id, like
 every bundle-less signature on this chain.
 
-### `CreateMultisig { salt: [u8; 32], signers: Vec<PublicKey>, threshold: u8 }` — tag 40, bundle-carried
+### `CreateMultisig { salt: [u8; 32], signers: Vec<PublicKey>, threshold: u8 }` — tag 34, bundle-carried
 
 - Fee floor `BUNDLE_BASE + create_fee` (`TxError::FeeTooLow` below it). `create_fee` goes to the
   proposer with the rest of the fee — it is not burned, so the supply identity does not move.
@@ -133,13 +133,13 @@ every bundle-less signature on this chain.
   (`AccountExists`).
 - Mempool: a plain bundle transaction; its nullifiers are its claim.
 
-### `MultisigDeposit { account: [u8; 32] }` — tag 41, bundle-carried
+### `MultisigDeposit { account: [u8; 32] }` — tag 35, bundle-carried
 
 - Anyone, no signatures. `burn_r` and `burn_a` credit the rows as above; at least one of them
   non-zero (`EmptyDeposit`). Unknown account or unregistered token refused. Fee floor
   `BUNDLE_BASE`.
 
-### `MultisigPay { account, nonce, time: u32, pays: Vec<Payout>, signatures: Vec<SignerSignature> }` — tag 42, bundle-less
+### `MultisigPay { account, nonce, time: u32, pays: Vec<Payout>, signatures: Vec<SignerSignature> }` — tag 36, bundle-less
 
 - `Payout { asset, amount, recipient, r, envelope }` is RPL-2's type; `1..=MAX_PAYOUTS` (4) of
   them. Each is debited from its asset row (`VaultShort { asset, have, want }`) and becomes the
@@ -157,7 +157,7 @@ every bundle-less signature on this chain.
   commitment so the pool's duplicate-commitment check sees it; every payout commitment is checked
   against the tree at apply through `Ledger::deposit` as a program payout is.
 
-### `MultisigRotate { account, nonce, signers: Vec<PublicKey>, threshold: u8, signatures }` — tag 43, bundle-less, fee-less
+### `MultisigRotate { account, nonce, signers: Vec<PublicKey>, threshold: u8, signatures }` — tag 37, bundle-less, fee-less
 
 - Replaces `signers` and `threshold` atomically under the creation bounds. The id, the nonce
   counter and the vault are untouched. Message:
