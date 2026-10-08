@@ -235,7 +235,11 @@ FEE_RECIPIENT=${FEE_RECIPIENT:-}                             # set by load_fee_r
 # rules edits this script and docs/deploy.md together. NOT subsidy_net_of_fees (needs aggregation).
 # shellcheck disable=SC2089  # JSON text in a string, exported whole, never word-split
 FEES_JSON='{"burn_base": true, "burn_floor": true}'
-FEES_SKIPPED=${FEES_SKIPPED:-}                               # set by DRY_RUN only, when the binary has no --fees
+# FEES_SKIPPED is the script's own word, never the operator's: whatever the environment says is
+# captured and cleared here; the cut refuses it below (DRY_RUN ignores it, loudly), and only the
+# DRY_RUN gate on a binary without --fees sets it. check-limits reads skipped-ness from the file.
+FEES_SKIPPED_FROM_ENV=${FEES_SKIPPED:-}
+FEES_SKIPPED=
 
 # shellcheck disable=SC2090
 export CHAIN_ID CHAIN20_GENESIS CHAIN20_HASH CHAIN20_GENESIS_SHA256 CHAIN20_RPC VALIDATORS_TSV REGISTRATIONS BONDED GENESIS_NAMES \
@@ -843,13 +847,14 @@ need(not (fees_section or {}).get("subsidy_net_of_fees"),
      "at startup until the admitted shape is re-measured against the hidden-asset bundle (b053a76); chain 21 "
      "carries burn_base and burn_floor only (docs/deploy.md, \"The next cut: the `fees` section (chain 21)\")")
 want_fees = json.loads(E["FEES_JSON"])
-need(want_fees == {"burn_base": True, "burn_floor": True}, f"FEES_JSON is {want_fees!r}, not the decided {{burn_base: true, burn_floor: true}}")
+same_json = lambda a, b: json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)   # 1 is not true
+need(same_json(want_fees, {"burn_base": True, "burn_floor": True}), f"FEES_JSON is {want_fees!r}, not the decided {{burn_base: true, burn_floor: true}}")
 if E.get("FEES_SKIPPED"):
     need(fees_section is None, "FEES_SKIPPED yet a fees section is present")
     warnings.append("FEES SKIPPED — this rand-node has no --fees (it predates d6cc16f5); the real cut refuses "
                     "such a binary; this file is NOT what chain 21 will be")
 else:
-    need(fees_section == want_fees,
+    need(same_json(fees_section, want_fees),
          f"fees is {fees_section!r}, not {{'burn_base': True, 'burn_floor': True}} — --fees did not take")
 # chain 20's top-level fields, each still asserted at its value
 need(g.get("testnet") is True, f"testnet is {g.get('testnet')!r}, not true — --testnet did not take (a faucet beside a bridge on chain 21 needs it)")
@@ -985,12 +990,12 @@ probe_fields() {   # <finished genesis> <its hash>
   for f in "$TMP"/variants/*.json; do
     name=$(basename "$f" .json)
     rm -rf "$TMP/vprobe"
-    if h=$("$NODE" init --datadir "$TMP/vprobe" --genesis "$f" 2>"$TMP/vprobe.err" | sed -n 's/.*genesis \([0-9a-f]\{64\}\).*/\1/p'); [ -n "$h" ]; then
-      [ "$h" != "$2" ] || { echo "cut-chain21: without $name this rand-node derives the SAME genesis hash — it does not hash that field (a build before d6cc16f5?)" >&2; exit 1; }
-      echo "cut-chain21:   field probe: without $name → genesis ${h:0:12}… (≠ ${2:0:12}…)"
-    else
-      echo "cut-chain21:   field probe: without $name → refused by init ($(tail -1 "$TMP/vprobe.err" | cut -c1-90))"
-    fi
+    # Both variants are valid genesis files (no section; burn_base alone), so init must accept
+    # each and derive another hash — a refusal proves nothing about the hash and is refused here.
+    h=$("$NODE" init --datadir "$TMP/vprobe" --genesis "$f" 2>"$TMP/vprobe.err" | sed -n 's/.*genesis \([0-9a-f]\{64\}\).*/\1/p' || true)
+    [ -n "$h" ] || { echo "cut-chain21: without $name init refused the file or printed no hash ($(tail -1 "$TMP/vprobe.err" | cut -c1-90)) — the probe needs a hash" >&2; exit 1; }
+    [ "$h" != "$2" ] || { echo "cut-chain21: without $name this rand-node derives the SAME genesis hash — it does not hash that field (a build before d6cc16f5?)" >&2; exit 1; }
+    echo "cut-chain21:   field probe: without $name → genesis ${h:0:12}… (≠ ${2:0:12}…)"
     ok=$((ok + 1))
   done
   [ "$ok" -ge 2 ] || { echo "cut-chain21: the field probe ran $ok variant(s), expected 2 (fees, fees.burn_floor)" >&2; exit 1; }
@@ -1013,20 +1018,25 @@ def rpc(method, params=None):
     return out["result"]
 bad = []
 def want(what, got, exp):
-    print(f"check-limits:   {what:<34} {json.dumps(got)}{'' if got == exp else '   ✗ expected ' + json.dumps(exp)}")
-    if got != exp:
+    # JSON-typed comparison: Python's == would take 1 for true and 1.0 for 1
+    same = json.dumps(got, sort_keys=True) == json.dumps(exp, sort_keys=True)
+    print(f"check-limits:   {what:<34} {json.dumps(got)}{'' if same else '   ✗ expected ' + json.dumps(exp)}")
+    if not same:
         bad.append(what)
 want("rand_getGenesisHash", rpc("rand_getGenesisHash"), E["EXPECT_GENESIS_HASH"])
 L = rpc("rand_getLimits")
 S = rpc("rand_getSupply")
-# the new field: the fee rules, and nothing burned yet (BASE_FEES_BURNED_ANY=1 once bundles landed)
-if E.get("FEES_SKIPPED"):
+# the new field: the fee rules, and nothing burned yet (BASE_FEES_BURNED_ANY=1 once bundles landed).
+# Skipped only when the genesis file itself has no fees section (a DRY_RUN on a binary without
+# --fees) — never on the environment's word.
+fees_skipped = "fees" not in gen
+if fees_skipped:
     want("fee_rules (SKIPPED: absent)", L.get("fee_rules"), None)
     print("check-limits:   ⚠ FEES SKIPPED — a real chain-21 node must serve fee_rules {burn_base: true, subsidy_net_of_fees: false, burn_floor: true}")
 else:
     want("fee_rules", L.get("fee_rules"), {"burn_base": True, "subsidy_net_of_fees": False, "burn_floor": True})
 bfb = S.get("base_fees_burned")
-if E.get("FEES_SKIPPED") and bfb is None:
+if fees_skipped and bfb is None:
     print("check-limits:   base_fees_burned (SKIPPED: absent)  null — a build before d6cc16f5 has no such counter")
 elif E.get("BASE_FEES_BURNED_ANY") == "1":
     want("base_fees_burned (a decimal string)", isinstance(bfb, str) and bfb.isdigit(), True)
@@ -1272,6 +1282,8 @@ PY
   refuse "no fees section"                   "$B" 'del d["fees"]' "--fees did not take"
   refuse "fees without burn_floor"           "$B" 'del d["fees"]["burn_floor"]' "--fees did not take"
   refuse "fees.burn_base false"              "$B" 'd["fees"]["burn_base"] = False' "--fees did not take"
+  refuse "fees.burn_base as 1, not true"     "$B" 'd["fees"]["burn_base"] = 1' "--fees did not take"
+  refuse "fees.burn_floor as 1, not true"    "$B" 'd["fees"]["burn_floor"] = 1' "--fees did not take"
   refuse "fees.subsidy_net_of_fees set"      "$B" 'd["fees"]["subsidy_net_of_fees"] = True' "re-measured against the hidden-asset bundle (b053a76)"
   refuse "subsidy_net_of_fees alone"         "$B" 'd["fees"] = {"subsidy_net_of_fees": True}' "b053a76"
   refuse "a FEES_JSON off the decision"      "$S" 'pass' "not the decided" FEES_JSON='{"burn_base": true}'
@@ -1392,7 +1404,8 @@ PY
   for m in 'L["proof_window_blocks"] = 256' 'L["binding_domain"] = 0' 'L["testnet"] = False' 'L["admission_by_vote"] = False' \
            'L["byte_load"] = None' 'L["max_gas_price"] = None' 'L["program_state"] = None' 'B["rotation_rules"] = None' 'B["min_inbound_sequence"]["2"] = 0' 'B["fees"] = None' 'B["fees"]["burn_bps"] = 20' \
            'L["fee_rules"] = None' 'L["fee_rules"]["burn_floor"] = False' 'L["fee_rules"]["burn_base"] = False' 'L["fee_rules"]["subsidy_net_of_fees"] = True' \
-           'S["base_fees_burned"] = "1000000"' 'del S["base_fees_burned"]' 'S["invariant_holds"] = False'; do
+           'L["fee_rules"]["burn_base"] = 1' 'L["fee_rules"]["burn_floor"] = 1' 'L["proof_window_blocks"] = 1024.0' \
+           'S["base_fees_burned"] = "1000000"' 'S["base_fees_burned"] = 0' 'del S["base_fees_burned"]' 'S["invariant_holds"] = False' 'S["invariant_holds"] = 1'; do
     cp "$ST/answers.json" "$ST/answers.keep"
     python3 -c "import json,sys; p=sys.argv[1]; a=json.load(open(p)); L=a['rand_getLimits']; B=a['rand_getBridgeState']; S=a['rand_getSupply']; $m; json.dump(a, open(p,'w'))" "$ST/answers.json"
     if CHECK_RPC=$RPC CHECK_GENESIS=$ST/good.json EXPECT_GENESIS_HASH=$(printf 'ab%.0s' $(seq 32)) py_check_limits >"$ST/log" 2>&1; then bad "check-limits accepted a node with $m"
@@ -1400,6 +1413,13 @@ PY
     else bad "check-limits, $m: $(tail -1 "$ST/log")"; fi
     mv "$ST/answers.keep" "$ST/answers.json"
   done
+  # FEES_SKIPPED in the environment cannot loosen check-limits: skipped-ness is the file's
+  cp "$ST/answers.json" "$ST/answers.keep"
+  python3 -c "import json,sys; p=sys.argv[1]; a=json.load(open(p)); a['rand_getLimits']['fee_rules'] = None; json.dump(a, open(p,'w'))" "$ST/answers.json"
+  if FEES_SKIPPED=1 CHECK_RPC=$RPC CHECK_GENESIS=$ST/good.json EXPECT_GENESIS_HASH=$(printf 'ab%.0s' $(seq 32)) py_check_limits >"$ST/log" 2>&1; then bad "check-limits with FEES_SKIPPED=1 in the env accepted fee_rules null on a genesis with fees"
+  elif grep -q 'does NOT serve chain 21 as cut: fee_rules' "$ST/log"; then ok "check-limits with FEES_SKIPPED=1 in the env still refuses fee_rules null when the genesis has fees"
+  else bad "check-limits, env FEES_SKIPPED: $(tail -1 "$ST/log")"; fi
+  mv "$ST/answers.keep" "$ST/answers.json"
   if CHECK_RPC=$RPC CHECK_GENESIS=$ST/good.json EXPECT_GENESIS_HASH=$(printf 'cd%.0s' $(seq 32)) py_check_limits >"$ST/log" 2>&1; then bad "check-limits accepted another genesis hash"
   else ok "check-limits refuses a node serving another genesis hash"; fi
   kill "$FAKE_RPC_PID" 2>/dev/null || true; FAKE_RPC_PID=
@@ -1425,7 +1445,7 @@ PY
   bash_refuses "a floor given in env and in the file" "given twice" MIN_INBOUND_FILE="$ST/floors-ok" MIN_INBOUND_2=1 --
   bash_refuses "a floor file naming chain 6" "must be 2, 3, 4 or 5" MIN_INBOUND_FILE="$ST/floors-chain" --
   # A genesis dir without chain 21's committed file: since the launch record landed, the real
-  # deploy/ holds genesis-chain21.json and `refuse_reused_chain_id 20` would fire first.
+  # deploy/ holds genesis-chain21.json and `refuse_reused_chain_id 21` would fire first.
   mkdir -p "$ST/gendir-20"; cp "$CHAIN20_GENESIS" "$ST/gendir-20/genesis-chain20.json"
   bash_refuses "a valid floor file parses (and the cut then stops at its missing record)" "no cut record" CUT_POLICY_GENESIS_DIR="$ST/gendir-20" MIN_INBOUND_FILE="$ST/floors-ok" CUT_RECORD="$ST/no-such-record" --
   fresh
@@ -1465,6 +1485,8 @@ PY
   real_cut=(CUT_POLICY_GENESIS_DIR="$ST/gendir-20" CUT_RECORD="$ST/cut-record.txt" CHAIN20_SNAPSHOT="$ST/snap" CHAIN20_GENESIS=deploy/genesis-chain20.json
             OUT="$ST/not-yet.json" NODE="$ST/fake-node" WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-c20.txt")
   bash_refuses "the real cut on a rand-node without --fees (before d6cc16f5)" "has no --fees — a build before d6cc16f5" "${real_cut[@]}" --
+  bash_refuses "the real cut on a rand-node with only --fees-like flags (--feesless)" "has no --fees — a build before d6cc16f5" "${real_cut[@]}" FAKE_FEES_FLAG=--feesless --
+  bash_refuses "FEES_SKIPPED=1 from the environment on the real cut" "is set in the environment — refusing" "${real_cut[@]}" FAKE_FEES_FLAG=--fees FEES_SKIPPED=1 --
   bash_refuses "the real cut with no EXPECT_NODE_VERSION" "EXPECT_NODE_VERSION is unset" "${real_cut[@]}" FAKE_FEES_FLAG=--fees --
   bash_refuses "the real cut on a version other than EXPECT_NODE_VERSION" "not rand-node 0.7.2" "${real_cut[@]}" FAKE_FEES_FLAG=--fees EXPECT_NODE_VERSION=0.7.2 --
   bash_refuses "a rand-node that does not re-derive chain 20's hash" "not chain 20's 6210cf07" "${real_cut[@]}" FAKE_FEES_FLAG=--fees NODE_VERSION_OK=1 --
@@ -1473,6 +1495,11 @@ PY
        NODE="$ST/fake-node" WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-c20.txt" bash "$0" >"$ST/log" 2>&1; then bad "DRY_RUN on a fake rand-node finished"
   elif grep -q 'FEES SKIPPED ⚠⚠⚠' "$ST/log" && grep -q "cutting with rand-node 0.7.1" "$ST/log"; then ok "DRY_RUN on a rand-node without --fees says FEES SKIPPED loudly and goes on past the gate"
   else bad "DRY_RUN without --fees: $(tail -2 "$ST/log")"; fi
+  # DRY_RUN with FEES_SKIPPED=1 in the env on a binary that HAS --fees: ignored, the section is cut
+  if env -u MIN_INBOUND_2 -u MIN_INBOUND_3 -u MIN_INBOUND_4 -u MIN_INBOUND_5 SELFTEST=0 DRY_RUN=1 FEES_SKIPPED=1 FAKE_FEES_FLAG=--fees \
+       CHAIN20_GENESIS=deploy/genesis-chain20.json NODE="$ST/fake-node" WALLET="$ST/fake-rand" FEE_RECIPIENT_FILE="$ST/fee-c20.txt" bash "$0" >"$ST/log" 2>&1; then bad "DRY_RUN on a fake rand-node finished"
+  elif grep -q 'FEES_SKIPPED=1 in the environment is IGNORED' "$ST/log" && ! grep -q 'FEES SKIPPED ⚠⚠⚠' "$ST/log"; then ok "DRY_RUN ignores FEES_SKIPPED=1 from the environment (loudly) on a binary with --fees"
+  else bad "DRY_RUN with env FEES_SKIPPED: $(tail -2 "$ST/log")"; fi
   echo "selftest: $pass passed, $fail failed"
   [ "$fail" = 0 ]; exit
 fi
@@ -1526,6 +1553,15 @@ if [ "${1:-}" = balances ]; then
 fi
 
 # ══ the cut ══════════════════════════════════════════════════════════════════════════════════
+# FEES_SKIPPED from the environment: refused on the real cut, ignored (loudly) by DRY_RUN, which
+# decides it from the binary in hand.
+if [ -n "$FEES_SKIPPED_FROM_ENV" ]; then
+  if [ "${DRY_RUN:-}" = 1 ]; then
+    echo "cut-chain21: ⚠ FEES_SKIPPED=$FEES_SKIPPED_FROM_ENV in the environment is IGNORED — the dry run decides it from the binary (--fees or not)" >&2
+  else
+    echo "cut-chain21: FEES_SKIPPED=$FEES_SKIPPED_FROM_ENV is set in the environment — refusing: the fees section is never skipped on the real cut (only DRY_RUN sets it, on a binary without --fees)" >&2; exit 1
+  fi
+fi
 # OPS-7 first: a reused chain id and a missing cut record are refused before anything else.
 refuse_reused_chain_id "$CHAIN_ID"
 require_cut_record "$CUT_RECORD"
@@ -1552,7 +1588,7 @@ for flag in --hardening-v6 --bundle-guest --auth-guest --gas-price --gas-dynamic
   grep -q -- "$flag" <<<"$HELP" || { echo "cut-chain21: $NODE genesis has no $flag (not a build that can cut chain 20's shape)" >&2; exit 1; }
 done
 # The fees section: the one flag a build before d6cc16f5 (v0.7.1 and earlier) does not have.
-if ! grep -q -- '--fees' <<<"$HELP"; then
+if ! grep -qE -- '(^|[[:space:]])--fees([[:space:]=<]|$)' <<<"$HELP"; then
   if [ "${DRY_RUN:-}" = 1 ]; then
     FEES_SKIPPED=1; export FEES_SKIPPED
     cat >&2 <<EOF

@@ -24,13 +24,14 @@ All 26 validator keys are one operator's ("Key separation", below). The release 
 it has been followed are under "Rolling out a new commit"; the rules for the next cut are under
 "Cut policy".
 
-Since this table was read: **chain 19** (v0.6.7, genesis `a3defc93…228a`, 2026-10-01,
+Since this table was written: **chain 19** (v0.6.7, genesis `a3defc93…228a`, 2026-10-01,
 `deploy/cut-chain19-genesis.sh`) and **chain 20** (v0.6.8, genesis `6210cf07…5135`, live since
 2026-10-01 06:17 UTC, `deploy/cut-chain20-genesis.sh`, `deploy/cut-records/chain20.record`; now on
 v0.7.1) — chain 20 is the chain that runs. **Chain 21** is prepared, not cut:
 `deploy/cut-chain21-genesis.sh` carries chain 20's shape and value plus the `fees` section
 (`burn_base`, `burn_floor`; "The next cut: the `fees` section (chain 21)", below) and needs a
-build at d6cc16f5 or later on every node and every signer.
+build at d6cc16f5 or later on every node (signers read the genesis hash from the node or take
+`--genesis-hash`, so they need it only to know `fee_rules`).
 
 ## Topology rules
 
