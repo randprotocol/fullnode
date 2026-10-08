@@ -2795,6 +2795,13 @@ impl Node {
                     // rejected" and carries on (review M2): this one must not be swallowed there.
                     return Err(anyhow::Error::new(FatalSafety { committed, attempted }));
                 }
+                Action::Broadcast(ConsensusMessage::Proposal(b)) | Action::SendTo(_, ConsensusMessage::Proposal(b)) => {
+                    // Spec 2026-10-08 §4: the body stays here (the pool until commit, the tree,
+                    // the recent cache) and the wire carries the hashes; validators that lack a
+                    // body fetch it by hash.
+                    self.recent_txs.remember_block(&b);
+                    self.net.broadcast(GossipMessage::CompactProposal(CompactBlock::of(&b))).await;
+                }
                 Action::Broadcast(m) | Action::SendTo(_, m) => {
                     self.net.broadcast(GossipMessage::Consensus(m)).await;
                 }
@@ -6576,6 +6583,29 @@ mod tests {
             SyncAdmission::OverPeerLimit,
             "an oversize request still costs the peer its own token"
         );
+    }
+
+    /// The leader publishes its proposal in compact form and remembers the bodies to serve them
+    /// (spec 2026-10-08 §4); votes and NewViews go out as before.
+    #[tokio::test]
+    async fn a_proposal_is_broadcast_compact_and_remembered() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let tx = next_tx(&ledger, 1);
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![tx.clone()]);
+        node.handle_actions(vec![Action::Broadcast(ConsensusMessage::Proposal(block.clone()))]).await.unwrap();
+        let out = drain(&mut seen).await;
+        assert!(
+            matches!(&out[..], [Seen::Broadcast(GossipMessage::CompactProposal(c))] if c.tx_hashes == vec![tx.hash()] && c.header == block.header),
+            "a compact proposal and nothing else"
+        );
+        assert!(node.recent_txs.get(&tx.hash()).is_some(), "the bodies are remembered to serve");
+
+        let vote = randprotocol_core::types::Vote::sign(node.hs.domain(), 1, block.hash(), &key(1));
+        node.handle_actions(vec![Action::Broadcast(ConsensusMessage::Vote(vote))]).await.unwrap();
+        assert!(matches!(&drain(&mut seen).await[..], [Seen::Broadcast(GossipMessage::Consensus(ConsensusMessage::Vote(_)))]));
     }
 
     /// The park is dropped when the replica schedules a later view's timeout, and kept while the
