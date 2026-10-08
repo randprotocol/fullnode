@@ -2541,10 +2541,14 @@ enum StopError {
     /// The node reports no `binding_domain` for a chain cut after `binding_domain` existed
     /// (`RpcClient::require_binding_domain`, BIND-1): this daemon signs only genesis-bound
     /// aggregates there, which that chain refuses, and a node's genesis cannot change while the
-    /// daemon runs.
+    /// daemon runs. The text is the client's (`require_binding_domain` returns an untyped error, so
+    /// it cannot be mapped), advice included.
     #[error(
-        "this node reports no binding_domain for chain {chain_id}, which is not one of the chains cut before it: \
-         this daemon signs only genesis-bound aggregates there (BIND-1), which the chain refuses"
+        "this node reports no binding_domain for chain {chain_id}, and chain {chain_id} is not one of the chains cut before it \
+         ({:?}): this daemon signs only genesis-bound aggregates there (BIND-1), which a chain without binding_domain \
+         refuses. Cut the genesis with `rand-node genesis --binding-domain 1`, or use a node on a build that serves \
+         rand_getLimits.binding_domain",
+        randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS
     )]
     NoBindingDomain { chain_id: u64 },
 }
@@ -4144,6 +4148,8 @@ mod tests {
         node.binding_refused = true;
         let err = aggregate_loop(&node, &kp, 7, &watch_config(5), fake_prove).await.unwrap_err();
         assert!(matches!(stop_reason(&err), Some(StopError::NoBindingDomain { chain_id: 7 })), "{err:#}");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("[14, 15, 16, 17, 18, 19]") && msg.contains("rand-node genesis --binding-domain 1"), "the client's advice: {msg}");
         assert_eq!(node.status_calls.get(), 1, "one pass, not five");
 
         let mut node = moving_node(kp.address(), payout);
