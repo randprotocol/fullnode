@@ -283,6 +283,7 @@ endpoint and the registered aggregator key.
 | `--watch` | off | keep polling instead of submitting once and exiting |
 | `--interval-secs <N>` | 15 | poll interval in `--watch` mode |
 | `--no-wait` | off | return once the node accepts the aggregate |
+| `--watch-max-failures <N>` | 20 | in `--watch` mode, exit non-zero after `N` consecutive failed passes (at least 1; 20 consecutive failed passes is at least five minutes at the default interval) |
 
 One pass polls `rand_getUnsealed`, fetches up to `max_covers` raw bundles with
 `rand_getRawTransaction`, proves one rVM aggregate over them (CPU; the test profile lands at
@@ -290,6 +291,15 @@ tier 18, production at 20 since the phase-2 row cuts — minutes and tens to hun
 this tree, `docs/node-hardware.md` §4 — so run it on the proof batch machine), seals the payment note (subsidy at the current schedule index plus the covered
 bundles' proving shares) to the register's payout address, signs and submits. `rand_status`'s
 `aggregation` section carries the chain parameters the payment is computed from.
+
+In `--watch` mode a failed pass does not stop the daemon: it is logged at `warn` with its error
+chain and the next pass runs after the interval — an RPC failure, a register nonce that moved
+while proving (the pass is abandoned), a failed prove, a mempool refusal, a commit timeout, or a
+key not yet in the aggregator register (a pending `register`; logged as "not registered yet").
+A sealed or empty pass resets the count; `--watch-max-failures` failures in a row end it with an
+error naming the cap. Two errors stop it at once, since no retry cures them: the node now serves
+another chain id than the daemon started on, and the node reports no `binding_domain` for the
+chain (`docs/aggregation.md` §3.7). Without `--watch` a failed pass is the command's error, as before.
 
 `rand-node run` gains **`--keep-raw-proofs`**: an archive node keeps sealed bundles' raw
 proofs; by default the pruning pass rewrites their records (`pv::NUM` = 35 public values + the 7 declared
