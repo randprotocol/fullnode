@@ -142,11 +142,25 @@ aggregator must do the same.
 `rand_getRandPrice` after the prove, beside `rand_status`, and seals at
 `aggregation::schedule_subsidy` over `fee_rules.usd_subsidy` and that price when the node reports
 it `fresh` — judged for the next block, the height the note's `time` names and the earliest the
-aggregate lands — and at `subsidy(n)` when it does not (pinned by
-`the_aggregate_pass_seals_the_ledgers_payout_under_a_voted_price`). The ledger judges freshness at
-the block that applies the aggregate, so an aggregate that lands later than the next block across
-the staleness edge, or after a `SetRandPrice` moved the price, is paid the ledger's amount into an
-envelope sealed for another: keep `price_max_age_blocks` long and vote before it lapses.
+aggregate lands — and at `subsidy(n)` clamped to `max_subsidy_per_block` when it does not (pinned
+by `the_aggregate_pass_seals_the_ledgers_payout_under_a_voted_price`).
+
+**The payout is signed, and a moved schedule is refused, not underpaid** (review 2026-10-09).
+`Action::Aggregate` carries `payout_total`, the amount the envelope was sealed for, inside the
+aggregator's signature (`aggregate_signing_hash`, domain `rand-aggregate-4`; genesis-bound
+`rand-aggregate-5`). `validate_aggregate` — admission and apply alike — refuses an aggregate whose
+`payout_total` is not `aggregate_payment(..).total` on its state, `AggregationError::PayoutMismatch
+{ expected, got }`: a state verdict, never in the admission cache. So the schedule moving between
+sealing and inclusion — a `SetRandPrice` (in any earlier block, or in the aggregate's own: a
+proposer applies ordinary transactions before aggregates), the price going stale, `sealed_blocks`
+crossing a halving (the case that predates the dollar subsidy) — refuses the aggregate; nothing
+leaves the bucket and nothing is minted. The pool re-asks at every tip (`check_aggregate_payout`)
+and evicts a pooled aggregate whose payout moved. `rand-node aggregate` re-seals — the proof binds
+`(chain, aggregator, nonce)` and the covers, never the payout, so it is reused — and resubmits, up
+to four times a pass, after a `PayoutMismatch` refusal or an eviction (status `unknown`). Before
+this an aggregate landing across such an edge was paid the ledger's amount into a note its envelope
+could not open: subsidy and covered shares lost. (`payout_total` moved the `Aggregate` encoding and
+every aggregate txid; no chain has carried one.)
 
 The shares are always the node's bucket entries, `rand_getUnsealed`'s `excess` — never recomputed
 from a raw transaction. Under `fees.proposer_share_bps` and `fees.prove_base` an entry already

@@ -1260,8 +1260,8 @@ genesis `initial_price_micros`), and the update's nonce — the next `SetRandPri
 `nonce + 1`. `fresh` is judged **for the next block**, `(head + 1) − set_at_height ≤
 max_age_blocks`: the earliest an aggregate submitted now can land, and so the schedule it is paid
 at — `rand-node aggregate` seals at the dollar target while it is `true` and at the RAND schedule
-while it is `false`. `null` on a chain whose genesis has no `fees.usd_subsidy` and before such a
-chain's first price. Served from storage, as of the committed head (the head is read before the
+while it is `false`. `null` on a chain whose genesis has no `fees.usd_subsidy` (a chain with it
+always has a price: `initial_price_micros` is required). Served from storage, as of the committed head (the head is read before the
 price, so a commit between the two reads can only make the price newer than the height). Public.
 
 ### `rand_getEpoch`
@@ -1607,7 +1607,7 @@ schedule's `subsidy(sealed_blocks)`: what the next aggregate mints, except under
 aggregate mints only its shortfall over the covered proving shares, which `rand_getAggregate`'s
 `subsidy` reports per aggregate. Under the genesis `fees.usd_subsidy` `current` is the schedule an
 aggregate in the next block is paid at — the dollar target converted at a price fresh for that
-block and capped, or `subsidy(sealed_blocks)` when the price is stale or there is none
+block and capped, or `subsidy(sealed_blocks)` clamped to the same cap when the price is stale
 (`aggregation::schedule_subsidy`, the one function the ledger and the daemon use); `base`,
 `halving_blocks` and `next_halving_at` still describe the RAND schedule it falls back to. `faucet`
 mirrors `rand_status`'s field of the same name.
@@ -1899,7 +1899,12 @@ max_age_blocks}` or `null`; public); `rand_getLimits.fee_rules.usd_subsidy` (`nu
 numbers, the two amounts as decimal strings) — every existing `fee_rules` object gains the key as
 `null`; `rand_getEmission.subsidy.current` is the dollar schedule while the price is fresh for the
 next block. `tx_json` renders `set_rand_price` (`price_micros_per_rand` decimal string, `nonce`,
-`voters` by address in listed order). The action is tag 44, after multisig's 40–43, bundle-less
+`voters` by address in listed order). **Wire change for aggregates (on every chain, though none has
+carried one):** `Action::Aggregate` gains a last field, `payout_total` (the amount its payout note
+was sealed for, signed under `rand-aggregate-4`), so its encoding and txid move; `tx_json`'s
+`aggregate` gains `payout_total` (a decimal string); an aggregate whose `payout_total` is not what
+the ledger pays now is refused `PayoutMismatch` (a state verdict, not cached) and evicted from the
+pool at the next tip. The action is tag 44, after multisig's 40–43, bundle-less
 and fee-less; refused `UnsupportedAction` on a chain without the section. `rand_getAggregate`'s
 `subsidy` and `rand_getSupply`'s `subsidised` move by what the ledger minted, as before.
 

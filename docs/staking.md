@@ -282,13 +282,20 @@ is `AdmitValidator`'s shape with a nonce:
 - **The quorum is the admission's**: the same voting set (`staking::voting_set`, the register's own
   derivation for the current epoch), every listed vote counting, the voters holding strictly more
   than two thirds of the weight (`ValidatorSet::has_quorum`). The check is one function,
-  `staking::check_votes`, shared by both actions. Unlike an admission it works on a chain with no
-  `staking` section too — the set is then the genesis register's.
-- **The nonce** is the ledger's plus one (1 for the first update when the genesis gives no price),
+  `staking::check_votes`, shared by both actions. `SetRandPrice` votes over the **current**
+  validator set and does **not** need `staking.admission_by_vote` (or any `staking` section): it is
+  gated on `fees.usd_subsidy` alone.
+- **A pooled vote is re-judged at every tip** without signatures — membership and quorum in the
+  current voting set (`staking::check_vote_weight`), the nonce and the band — so a vote whose
+  quorum was lost after pooling (a voter unbonded, an epoch moved the weights) leaves the pool and
+  frees the price-nonce slot for a replacement.
+- **The nonce** is the ledger's plus one (the genesis price is nonce 0, so the first update is 1),
   so a vote for update `n` never counts for `n + 1`, even at the same price; a pooled update leaves
   once another spends its nonce.
 - **The band**: a positive price within a factor of two of the current one (`2·new ≥ old`,
-  `new ≤ 2·old`). Moving further takes several updates, each a fresh quorum.
+  `new ≤ 2·old`). Moving further takes several updates, each a fresh quorum. There is no minimum
+  gap between updates: the band and the quorum are the governance bound, and the genesis
+  `max_subsidy_per_block` caps what any price, voted or stale, can mint.
 - **The state** is `RandPrice { price_micros_per_rand, set_at_height, nonce }`, consensus state
   under the section (`rand-state-price-1`, `META_RAND_PRICE`), served by `rand_getRandPrice`.
   Refused `UnsupportedAction` on a chain without `fees.usd_subsidy`.

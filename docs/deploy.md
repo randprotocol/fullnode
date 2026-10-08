@@ -1547,13 +1547,16 @@ stays `true` through covers and sweeps.
 **What it is.** An optional sub-section of the same `fees` section (`docs/fees.md` §1.3), only on
 a chain with an `aggregation` section (`rand-node init` refuses it without one:
 `UsdSubsidyWithoutAggregation`; a zero `usd_micros_per_sealed_block`, `max_subsidy_per_block`,
-`price_max_age_blocks` or `initial_price_micros` is `UsdSubsidyZero` naming the field). While the
+`price_max_age_blocks` or `initial_price_micros` — all four required — is `UsdSubsidyZero` naming
+the field). While the
 validator set's voted RAND/USD price is fresh the sealing subsidy's schedule is the dollar target
 converted at it, capped at `max_subsidy_per_block`; otherwise `subsidy(n)`. The price is set by
 `SetRandPrice` (wire tag 44 — every node must be on a build that decodes it before the chain's
 first vote), quorum-checked like `AdmitValidator`, at most a factor of two per update. Hashed only
 when set, after `prove_base`'s bytes, so it ships with a chain cut; the state root gains the
-`rand-state-price-1` wrapper on such a chain only. Served as `rand_getLimits.fee_rules.usd_subsidy`
+`rand-state-price-1` wrapper on such a chain only. The same build changes the `Aggregate` wire
+encoding on every chain (`payout_total`, signed under `rand-aggregate-4`): no chain has carried an
+aggregate, but every node and aggregate daemon on a chain cut with `aggregation` must be on it. Served as `rand_getLimits.fee_rules.usd_subsidy`
 and `rand_getRandPrice`; the operators' tooling is `rand-node price status|sign|submit`.
 
 **Recommended values, deferred.** For the fee study's $345 a day at 1.2 s blocks:

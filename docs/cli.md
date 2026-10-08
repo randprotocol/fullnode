@@ -334,8 +334,12 @@ bundles' proving shares) to the register's payout address, signs and submits. `r
 `aggregation` section carries the chain parameters the payment is computed from. Under the
 genesis `fees.usd_subsidy` the schedule is read from the node, not derived here: while
 `rand_getRandPrice` says the voted price is `fresh` (for the next block) the pass seals the dollar
-target converted at it and capped (`fee_rules.usd_subsidy`), otherwise the RAND schedule — the
-ledger's own `aggregation::schedule_subsidy`.
+target converted at it and capped (`fee_rules.usd_subsidy`), otherwise the RAND schedule clamped
+to the same cap — the ledger's own `aggregation::schedule_subsidy`. The sealed amount is signed as
+the aggregate's `payout_total`; when the chain refuses it (`PayoutMismatch`: the schedule moved —
+a price vote, a stale price, a halving — between the seal and the block) or the pool evicts the
+aggregate, the pass **re-seals the same proof** at the current schedule and resubmits, up to four
+times, without proving again.
 
 In `--watch` mode a failed pass does not stop the daemon: it is logged at `warn` with its error
 chain and the next pass runs after the interval — an RPC failure, a register nonce that moved
