@@ -45,6 +45,9 @@ mod proving_slot;
 /// The node harness and the test bridge guardians, shared with `zusd_e2e.rs`.
 mod common;
 use common::cluster::*;
+use common::observer::Observer;
+use randprotocol_core::consensus::ConsensusMessage;
+use randprotocol_node::network::GossipMessage;
 use proving_slot::proving_slot;
 
 /// 18, not 7, since BIND-1: this suite signs its staking, aggregator and governance messages by
@@ -303,6 +306,180 @@ async fn four_validators_plus_late_observer_syncs() {
     wait_height(&[&obs], target + 3, Duration::from_secs(30)).await;
     let peers = obs.rpc.call("rand_getPeers", serde_json::json!([])).await.unwrap();
     assert!(!peers.as_array().unwrap().is_empty());
+}
+
+/// Spec 2026-10-08 §1: a proposal is on the consensus topic as its header, signature and
+/// transaction hashes — never as a full `Consensus(Proposal)` — and the bodies cross on the
+/// transaction topic, not inside the proposal. An observer — a bare gossipsub swarm beside the
+/// cluster — reads the raw frames; it may receive a frame from more than one mesh peer, so the
+/// test asserts at least one tx-topic frame a mint rather than exactly one.
+///
+/// The bound, derived: a compact frame is the 4-byte variant tag, the header (whose justify
+/// carries at most four votes here, ~3.8 KB each), the leader's signature, the hash list's
+/// 8-byte length and 32 bytes a transaction. `wire::tests` measures that frame with four
+/// justify votes and no hashes at 19 080 bytes, so the fixed part is held under 24 KiB and the
+/// whole frame — at most the 32 mints this test sends, 1 KiB of hashes — under 80 KiB.
+///
+/// In this common case every validator has every mint from gossip before the proposal naming
+/// it arrives, so the four nodes' `compact_fetched` sum to (nearly) nothing; the tolerance is
+/// stated at the assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proposal_frame_carries_hashes_not_bodies() {
+    init_tracing();
+    let ks = keys(4);
+    let gen = genesis(&ks);
+    let n0 = start_node(&ks[0], &gen, vec![], true).await;
+    let boot = vec![bootstrap_addr(&n0)];
+    let n1 = start_node(&ks[1], &gen, boot.clone(), true).await;
+    let n2 = start_node(&ks[2], &gen, boot.clone(), true).await;
+    let n3 = start_node(&ks[3], &gen, boot.clone(), true).await;
+    let nodes = [&n0, &n1, &n2, &n3];
+    wait_height(&nodes, 3, Duration::from_secs(60)).await;
+    let mut obs = Observer::start(CHAIN_ID, boot.clone()).await;
+    // A couple of heartbeats for the observer to be grafted into n0's mesh.
+    let _ = obs.pump(Duration::from_secs(2)).await;
+
+    // Eight mints through each node — the faucet's burst (`admission::FAUCET_MINT_BURST`) —
+    // while the observer collects every frame. Round-robin, one mint per node a round, rounds
+    // 500 ms apart: every node bootstraps from n0, so n0 relays the other three nodes' mints to
+    // each peer, and all 32 at once would put 24 through n0 to each receiver in well under a
+    // second — past the receiver's per-forwarder transaction limit (`admission::PEER_TX_BURST`
+    // 16, refilling at `PEER_TX_PER_SEC` 4). A body over that limit is dropped unremembered and
+    // later fetched by hash: the fetch path, measured by the late-validator test, not the common
+    // case this one measures. Paced, n0 forwards three mints a round to each peer.
+    const PER_NODE: u8 = 8;
+    let submit = async {
+        let mut hashes = Vec::new();
+        for j in 0..PER_NODE {
+            for (i, n) in nodes.iter().enumerate() {
+                let seed = 1 + i as u8 * PER_NODE + j;
+                hashes.push(n.rpc.mint_shielded(&payee(seed), Some(1_000)).await.expect("mint accepted"));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        hashes
+    };
+    let (hashes, seen) = tokio::join!(submit, obs.pump(Duration::from_secs(12)));
+    let mints = hashes.len();
+
+    let compact: Vec<(usize, usize)> = seen
+        .iter()
+        .filter(|s| s.topic.as_str().ends_with("/consensus") && s.data.starts_with(&[4, 0, 0, 0]))
+        .map(|s| match bincode::deserialize::<GossipMessage>(&s.data) {
+            Ok(GossipMessage::CompactProposal(c)) => (s.data.len(), c.tx_hashes.len()),
+            _ => panic!("a tag-4 frame that is not a compact proposal"),
+        })
+        .collect();
+    assert!(!compact.is_empty(), "the observer saw no compact proposals");
+    for &(len, txs) in &compact {
+        assert!(len - 32 * txs < 24 * 1024, "a compact frame's fixed part is {} bytes", len - 32 * txs);
+    }
+    let &(biggest, carried) = compact.iter().max_by_key(|(len, _)| *len).unwrap();
+    let with_txs = compact.iter().filter(|(_, t)| *t > 0).count();
+    let in_frames: usize = compact.iter().map(|(_, t)| *t).sum();
+    assert!(with_txs > 0, "no compact proposal carried a mint");
+    assert!(biggest < 80 * 1024, "a compact proposal frame is {biggest} bytes");
+    // No proposal went out in the old full form (GossipMessage tag 0, ConsensusMessage tag 0).
+    let full = seen
+        .iter()
+        .filter(|s| s.topic.as_str().ends_with("/consensus"))
+        .filter(|s| matches!(bincode::deserialize::<GossipMessage>(&s.data), Ok(GossipMessage::Consensus(ConsensusMessage::Proposal(_)))))
+        .count();
+    assert_eq!(full, 0, "{full} full proposal frames on the consensus topic");
+
+    // The bodies crossed the tx topic: one frame a mint.
+    let tx_frames: Vec<usize> = seen.iter().filter(|s| s.topic.as_str().ends_with("/tx")).map(|s| s.data.len()).collect();
+    assert!(tx_frames.len() >= mints, "{} tx frames for {mints} mints", tx_frames.len());
+    let body_bytes: usize = tx_frames.iter().sum();
+    eprintln!(
+        "compact frames: {} seen, {with_txs} carrying transactions ({in_frames} hashes in all); largest {biggest} bytes carrying {carried} transactions; \
+         tx topic: {} frames, {body_bytes} bytes ({} bytes a mint on average)",
+        compact.len(),
+        tx_frames.len(),
+        body_bytes / tx_frames.len().max(1)
+    );
+
+    // And every node committed every mint.
+    for h in &hashes {
+        wait_for("every node commits the mint", Duration::from_secs(60), || {
+            nodes.iter().all(|n| n.handle.storage.tx_location(h).unwrap().is_some())
+        })
+        .await;
+    }
+    let cms: Vec<Word8> = hashes.iter().map(|h| n0.note_of(h).expect("a committed mint has a note")).collect();
+    for n in nodes {
+        assert!(cms.iter().all(|cm| n.holds(cm)), "a node is missing a minted note");
+    }
+    assert_chains_equal(&nodes);
+
+    // The common case fetches nothing: each mint reached every validator on the tx topic before
+    // the proposal naming it (0 on all four in each of three runs of this shape). The tolerance
+    // is for one race only — a mint the leader itself took over RPC can be proposed within the
+    // block interval of its own gossip, so a validator a hop further along the mesh may see the
+    // compact proposal a few milliseconds before the body — and is one such body per
+    // validator. Unpaced, the per-forwarder limit dropped 8 bodies on each of three validators
+    // (24 fetched), which this bound fails.
+    let fetched: Vec<u64> = nodes.iter().map(|n| n.handle.status.read().unwrap().compact_fetched).collect();
+    let total: u64 = fetched.iter().sum();
+    eprintln!("compact_fetched on the four validators: {fetched:?} (sum {total}) for {mints} mints");
+    assert!(total <= nodes.len() as u64, "the validators fetched {total} bodies ({fetched:?}) that gossip should have brought");
+    for n in [n0, n1, n2, n3] {
+        stop(n).await;
+    }
+}
+
+/// Spec 2026-10-08 §5.3: a validator that joins after transactions were gossiped still votes on
+/// the proposals that carry them, by fetching the bodies by hash.
+///
+/// The shape matters. Had three of the four validators been running when the mints went out,
+/// the mints would have committed before the fourth joined, and it would have taken them as
+/// committed blocks through batch sync — the compact path never involved. Here only two of the
+/// four run (two of four is no quorum, so the chain cannot commit), the mints are submitted and
+/// gossiped between those two, and the fourth joins only after gossipsub's history window
+/// (5 × 500 ms heartbeats) has passed, so not even an IHAVE for them reaches it. Its arrival
+/// makes the quorum, and the first proposals it must vote on name bodies it never saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_validator_fetches_bodies_it_never_saw() {
+    init_tracing();
+    let ks = keys(4);
+    let gen = genesis(&ks);
+    let n0 = start_node(&ks[0], &gen, vec![], true).await;
+    let boot = vec![bootstrap_addr(&n0)];
+    let n1 = start_node(&ks[1], &gen, boot.clone(), true).await;
+    wait_for("n0 and n1 connected", Duration::from_secs(30), || {
+        n0.handle.status.read().unwrap().connected_peers >= 1 && n1.handle.status.read().unwrap().connected_peers >= 1
+    })
+    .await;
+
+    // Eight mints through n0 (the faucet's burst): pooled on n0, gossiped to n1, uncommittable.
+    let mut hashes = Vec::new();
+    for seed in 1..=8u8 {
+        hashes.push(n0.rpc.mint_shielded(&payee(seed), Some(1_000)).await.expect("mint accepted"));
+    }
+    wait_for("n1 pools the mints", Duration::from_secs(30), || n1.handle.status.read().unwrap().mempool_size >= hashes.len()).await;
+    // Past the gossip history window, and the chain has not moved.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(n0.height(), 0, "two of four validators committed a block");
+
+    let n3 = start_node(&ks[3], &gen, boot.clone(), true).await;
+    for h in &hashes {
+        wait_for("the late validator commits the mint", Duration::from_secs(90), || {
+            [&n0, &n1, &n3].iter().all(|n| n.handle.storage.tx_location(h).unwrap().is_some())
+        })
+        .await;
+    }
+    let h = n0.height();
+    wait_height(&[&n0, &n1, &n3], h + 3, Duration::from_secs(60)).await;
+    assert_chains_equal(&[&n0, &n1, &n3]);
+
+    let status = n3.rpc.call("rand_status", json!([])).await.expect("status answers");
+    let fetched = status["compact_fetched"].as_u64().expect("compact_fetched is a number");
+    let peers_fetched: Vec<u64> = [&n0, &n1].iter().map(|n| n.handle.status.read().unwrap().compact_fetched).collect();
+    eprintln!("late validator: compact_fetched = {fetched} for {} mints it never saw; n0, n1 fetched {peers_fetched:?}", hashes.len());
+    assert!(fetched > 0, "the late validator fetched no bodies");
+    for n in [n0, n1, n3] {
+        stop(n).await;
+    }
 }
 
 /// A pruned validator (n2, 2 s of retained history at 150 ms blocks) stays in consensus after its
@@ -2223,6 +2400,7 @@ async fn an_epoch_set_from_a_batchs_tail_is_recorded_when_its_block_commits() {
                             SyncRequest::BlockByHash(h) => SyncResponse::Block(
                                 chain.iter().find(|cb| cb.block.hash() == h).map(|cb| cb.block.clone()),
                             ),
+                            SyncRequest::Transactions(_) => SyncResponse::Transactions(vec![]),
                         };
                         peer.send_sync_response(channel, response).await;
                     }
@@ -2323,6 +2501,7 @@ async fn a_node_holding_an_abandoned_block_rejoins_the_real_chain() {
                             SyncRequest::BlockByHash(h) => SyncResponse::Block(
                                 real.iter().find(|cb| cb.block.hash() == h).map(|cb| cb.block.clone()),
                             ),
+                            SyncRequest::Transactions(_) => SyncResponse::Transactions(vec![]),
                         };
                         peer.send_sync_response(channel, response).await;
                     }

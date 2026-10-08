@@ -858,7 +858,7 @@ Params: `[]`. Result:
 {
   "height": 1998, "head_hash": "…", "view": 2251, "high_qc_view": 2250,
   "syncing": false, "sync_target": 1998,
-  "sync_inflight_age_ms": null, "sync_failures": 0, "sync_late_batches": 0,
+  "sync_inflight_age_ms": null, "sync_failures": 0, "sync_late_batches": 0, "compact_fetched": 0,
   "peer_count": 5, "connected_peers": 5, "reserved_peers": 5, "ws_clients": 3, "refused_cache": 0,
   "verify_queue": 0, "mempool_size": 0,
   "is_validator": true, "active_validator": true, "faucet": true, "confidential": true,
@@ -886,6 +886,12 @@ otherwise looks identical to a node that is behind and working:
 - `sync_late_batches` — batches applied *after* their request had been given up on. Progress, not
   failure, but a rising count means the give-up is firing on requests that were still alive, so the
   peers being asked are slower than the timeout.
+- `compact_fetched` — transaction bodies this node fetched by hash for compact proposals and
+  placed since start (compact-blocks spec 2026-10-08 §5.3): what a proposal named that neither
+  its mempool nor its recent-transactions cache held. A validator that joined late or missed a
+  burst of gossip fetches a few and stops; a count that climbs with every block says its
+  transaction gossip is not arriving, and each of those proposals waits a round trip before the
+  node can vote.
 - `connected_peers` — peers with an open connection, which are the only ones sync can ask for
   blocks. `peer_count` counts every entry in this node's peer map. Since 2026-09-24 a gossiped
   `Status` from an author this node holds no connection to no longer creates one (an entry

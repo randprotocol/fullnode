@@ -11,6 +11,8 @@
 pub mod cluster;
 /// Test bridge guardians and what they sign (`cluster.rs`, `zusd_e2e.rs`).
 pub mod bridge;
+/// A bare gossipsub swarm that sees the raw frames on a chain's topics (`network.rs`, `cluster.rs`).
+pub mod observer;
 
 use randprotocol_core::confidential::StubExecutor;
 use randprotocol_core::genesis::{Genesis, GenesisValidator};

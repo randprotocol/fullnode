@@ -2,7 +2,7 @@
 
 use libp2p::PeerId;
 use randprotocol_core::consensus::{CommittedBlock, ConsensusMessage, NotHeld};
-use randprotocol_core::{Block, Hash, Keypair, PublicKey, Signature, Transaction};
+use randprotocol_core::{Block, BlockHeader, Hash, Keypair, PublicKey, Signature, Transaction};
 use serde::{Deserialize, Serialize};
 
 /// Periodic advertisement of a node's committed head.
@@ -27,6 +27,46 @@ pub enum GossipMessage {
     /// three above encode exactly as before, and a build without this variant is not subscribed
     /// to the topic that carries it.
     PeerBinding(PeerBinding),
+    /// A proposal with its body elided (spec 2026-10-08 §3.1): the header and the leader's
+    /// signature — everything `Block::hash` and `Block::verify_signature` need — and the
+    /// transaction hashes in block order. The receiver rebuilds the block from transactions it
+    /// already holds and fetches the rest by hash (`SyncRequest::Transactions`). Appended last,
+    /// so the four variants above encode as before; a build without it cannot decode it, which
+    /// is why the roll is a flag day (§7).
+    CompactProposal(CompactBlock),
+}
+
+/// The wire form of a proposal (spec 2026-10-08 §3.1). `tx_hashes` is in block order; the
+/// signed header's `tx_root` commits to it, so the list is checked before anything is fetched.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactBlock {
+    pub header: BlockHeader,
+    pub signature: Signature,
+    pub tx_hashes: Vec<Hash>,
+}
+
+/// The most hashes one `SyncRequest::Transactions` carries: 16 KB, under the request limit, and
+/// at most four requests for a block at the transaction cap.
+pub const TX_FETCH_BATCH: usize = 512;
+
+impl CompactBlock {
+    pub fn of(block: &Block) -> CompactBlock {
+        CompactBlock {
+            header: block.header.clone(),
+            signature: block.signature.clone(),
+            tx_hashes: block.transactions.iter().map(|t| t.hash()).collect(),
+        }
+    }
+
+    /// The block this compact form elided, given its transactions in order. The caller has
+    /// checked that each transaction hashes to the hash at its position (`compact::rebuild`).
+    pub fn into_block(self, transactions: Vec<Transaction>) -> Block {
+        Block { header: self.header, transactions, signature: self.signature }
+    }
+
+    pub fn hash(&self) -> Hash {
+        self.header.hash()
+    }
 }
 
 /// The longest peer id a binding may carry. An Ed25519 identity — every node's — is 38 bytes;
@@ -98,6 +138,10 @@ pub enum SyncRequest {
     Blocks { from_height: u64, max: u32 },
     /// A single block (committed or still in the consensus tree) by hash.
     BlockByHash(Hash),
+    /// Transactions by hash (spec 2026-10-08 §3.2), at most [`TX_FETCH_BATCH`]: what a compact
+    /// proposal named that this node does not hold. Appended last; an older node cannot decode
+    /// it and reports an inbound failure.
+    Transactions(Vec<Hash>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,6 +160,9 @@ pub enum SyncResponse {
     /// The asker takes it elsewhere without a back-off. Appended last; a build without it cannot
     /// decode it and counts the request as failed (the decode test below pins it).
     Busy,
+    /// The transactions this node holds of the hashes asked (any order; absent ones omitted, so
+    /// the asker moves to the next peer for the rest). Appended last.
+    Transactions(Vec<Transaction>),
 }
 
 #[cfg(test)]
@@ -271,6 +318,82 @@ mod tests {
         assert!(busy.len() < 16, "a few bytes on the wire");
     }
 
+    /// The pre-compact `SyncRequest`, variant for variant.
+    #[derive(Serialize, Deserialize)]
+    #[allow(dead_code)]
+    enum OldSyncRequest {
+        Blocks { from_height: u64, max: u32 },
+        BlockByHash(Hash),
+    }
+
+    /// Spec 2026-10-08 §3.1: `CompactProposal` is appended, so the four existing variants
+    /// encode as before and the new one is tag 4; a build without it cannot decode it (the
+    /// flag-day roll, §7).
+    #[test]
+    fn the_compact_proposal_variant_is_appended_as_the_fifth() {
+        let ks = keys(4);
+        let b = block(3, &ks);
+        let compact = CompactBlock::of(&b);
+        assert_eq!(compact.tx_hashes.len(), b.transactions.len());
+        assert_eq!(compact.hash(), b.hash());
+        let bytes = bincode::serialize(&GossipMessage::CompactProposal(compact.clone())).unwrap();
+        assert_eq!(&bytes[..4], &[4, 0, 0, 0], "the new variant is the fifth");
+        assert!(bincode::deserialize::<OldGossipMessage>(&bytes).is_err(), "an old node cannot read it");
+        let GossipMessage::CompactProposal(read) = bincode::deserialize::<GossipMessage>(&bytes).unwrap() else { panic!("another variant") };
+        assert_eq!(read.header, compact.header);
+        assert_eq!(read.tx_hashes, compact.tx_hashes);
+        // The rebuild is the block, byte for byte.
+        assert_eq!(read.into_block(b.transactions.clone()), b);
+        // A status still encodes as before (the shared variants did not move).
+        let status = Status { height: 7, head_hash: Hash::digest(b"h"), view: 9, floor: 1 };
+        assert_eq!(
+            bincode::serialize(&GossipMessage::Status(status.clone())).unwrap(),
+            bincode::serialize(&OldGossipMessage::Status(status)).unwrap()
+        );
+    }
+
+    /// Spec 2026-10-08 §1, §9: the size of a compact proposal at the shape the spec sizes
+    /// against — a 26-validator set whose justify carries every vote, and 2 000 transaction
+    /// hashes. Bounded and printed so `docs/node-hardware.md` can quote the number: the header
+    /// and justify are fixed cost, each transaction adds exactly its 32-byte hash.
+    #[test]
+    fn a_compact_proposal_at_26_validators_and_2000_hashes_is_its_header_plus_32_bytes_a_hash() {
+        let ks = keys(26);
+        let b = block(9, &ks);
+        let empty = bincode::serialized_size(&GossipMessage::CompactProposal(CompactBlock::of(&b))).unwrap();
+        let mut compact = CompactBlock::of(&b);
+        compact.tx_hashes = (0..2_000u32).map(|i| Hash::digest(&i.to_be_bytes())).collect();
+        let frame = bincode::serialized_size(&GossipMessage::CompactProposal(compact)).unwrap();
+        assert_eq!(frame - empty, 2_000 * 32, "each hash is 32 bytes on the wire");
+        assert_eq!(b.header.justify.votes.len(), 26);
+        let four_block = block(9, &keys(4));
+        assert_eq!(four_block.header.justify.votes.len(), 4, "the four-validator frame carries four justify votes");
+        let four = bincode::serialized_size(&GossipMessage::CompactProposal(CompactBlock::of(&four_block))).unwrap();
+        println!("compact proposal, 26 justify votes: {empty} bytes with no hashes, {frame} bytes with 2000 hashes; 4 justify votes, no hashes: {four} bytes");
+        assert!(frame < 256 * 1024, "a 2 000-transaction compact proposal is {frame} bytes");
+    }
+
+    /// Spec 2026-10-08 §3.2: the transaction fetch is appended on both CBOR enums; the
+    /// existing variants encode as before, and an old node fails to decode the new ones.
+    #[test]
+    fn the_transaction_fetch_variants_are_appended() {
+        let req = SyncRequest::Transactions(vec![Hash::digest(b"a"), Hash::digest(b"b")]);
+        let bytes = cbor4ii::serde::to_vec(Vec::new(), &req).unwrap();
+        assert!(matches!(cbor4ii::serde::from_slice::<SyncRequest>(&bytes).unwrap(), SyncRequest::Transactions(v) if v.len() == 2));
+        assert!(cbor4ii::serde::from_slice::<OldSyncRequest>(&bytes).is_err(), "an old node cannot decode it");
+        let resp = SyncResponse::Transactions(vec![]);
+        let bytes = cbor4ii::serde::to_vec(Vec::new(), &resp).unwrap();
+        assert!(matches!(cbor4ii::serde::from_slice::<SyncResponse>(&bytes).unwrap(), SyncResponse::Transactions(v) if v.is_empty()));
+        assert!(cbor4ii::serde::from_slice::<OldSyncResponse>(&bytes).is_err());
+        assert_eq!(
+            cbor4ii::serde::to_vec(Vec::new(), &SyncRequest::BlockByHash(Hash::ZERO)).unwrap(),
+            cbor4ii::serde::to_vec(Vec::new(), &OldSyncRequest::BlockByHash(Hash::ZERO)).unwrap()
+        );
+        // 512 hashes fit the 64 KiB request limit with room.
+        let big = SyncRequest::Transactions(vec![Hash::ZERO; TX_FETCH_BATCH]);
+        assert!((cbor4ii::serde::to_vec(Vec::new(), &big).unwrap().len() as u64) < super::super::SYNC_REQUEST_WIRE_LIMIT / 2);
+    }
+
     /// The CN-3 roll, pinned (scan 2026-09-27): the sync wire is CBOR (`cbor4ii::serde`, what the
     /// codec reads and writes), whose structs are maps of named fields. A v0.5.8 node decodes a
     /// new `NotHeld` — the unknown `view` is skipped — and its `rand-not-held-1` check fails, so
@@ -398,11 +521,19 @@ mod tests {
             }
             other => panic!("decoded as {other:?}"),
         }
+        let compact = CompactBlock::of(&b);
+        match gossip_round_trip(&GossipMessage::CompactProposal(compact.clone())) {
+            GossipMessage::CompactProposal(c) => {
+                assert_eq!(c, compact);
+                assert_eq!(c.hash(), b.hash(), "the hash is over the same header");
+            }
+            other => panic!("decoded as {other:?}"),
+        }
     }
 
     /// Every `SyncRequest` and `SyncResponse` variant survives the CBOR sync wire: the empty
     /// batch, a batch of real blocks, a hash, `Block(None)`, `Block(Some)`, a `NotHeld` that
-    /// still verifies, and `Busy`.
+    /// still verifies, `Busy`, and the transaction fetch.
     #[test]
     fn every_sync_variant_round_trips_through_cbor() {
         let ks = keys(2);
@@ -451,6 +582,16 @@ mod tests {
             other => panic!("decoded as {other:?}"),
         }
         assert!(matches!(sync_response_round_trip(&SyncResponse::Busy), SyncResponse::Busy));
+        let hashes = vec![Hash::digest(b"x"), Hash::digest(b"y")];
+        match sync_request_round_trip(&SyncRequest::Transactions(hashes.clone())) {
+            SyncRequest::Transactions(got) => assert_eq!(got, hashes),
+            other => panic!("decoded as {other:?}"),
+        }
+        let txs = vec![Transaction { chain_id: 7, bundle: None, action: Action::None }];
+        match sync_response_round_trip(&SyncResponse::Transactions(txs.clone())) {
+            SyncResponse::Transactions(got) => assert_eq!(got, txs),
+            other => panic!("decoded as {other:?}"),
+        }
     }
 
     /// A `CommittedBlock`'s `deposits` are `#[serde(skip)]`: a block that carried some encodes
@@ -523,16 +664,16 @@ mod tests {
     }
 
     /// bincode numbers variants by position, so a tag past the last variant is a decode error:
-    /// a message from a build that appended a fifth variant is refused, not misread as another.
+    /// a message from a build that appended a sixth variant is refused, not misread as another.
     #[test]
     fn an_unknown_gossip_variant_tag_is_rejected() {
         let status = bincode::serialize(&Status { height: 7, head_hash: Hash::ZERO, view: 9, floor: 0 }).unwrap();
-        for tag in [4u32, 5, 100, u32::MAX] {
+        for tag in [5u32, 6, 100, u32::MAX] {
             let mut framed = bincode::serialize(&tag).unwrap();
             framed.extend_from_slice(&status);
             assert!(bincode::deserialize::<GossipMessage>(&framed).is_err(), "tag {tag}");
         }
-        // The four known tags, for contrast: tag 2 over that payload is a `Status`.
+        // The five known tags, for contrast: tag 2 over that payload is a `Status`.
         let mut framed = bincode::serialize(&2u32).unwrap();
         framed.extend_from_slice(&status);
         assert!(matches!(bincode::deserialize::<GossipMessage>(&framed), Ok(GossipMessage::Status(s)) if s.height == 7));
@@ -549,6 +690,7 @@ mod tests {
             Block(Option<Block>),
             NotHeld(NotHeld),
             Busy,
+            Transactions(Vec<Transaction>),
             Throttled { retry_ms: u64 },
             Gone,
         }
@@ -561,6 +703,7 @@ mod tests {
         enum FutureRequest {
             Blocks { from_height: u64, max: u32 },
             BlockByHash(Hash),
+            Transactions(Vec<Hash>),
             Headers { from_height: u64 },
         }
         let bytes = cbor4ii::serde::to_vec(Vec::new(), &FutureRequest::Headers { from_height: 1 }).unwrap();

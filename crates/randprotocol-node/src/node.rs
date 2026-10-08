@@ -3,9 +3,10 @@
 //! consensus input.
 
 use crate::admission::{self, GossipOutcome, Verdict, VerifySource, VerifyLimits};
+use crate::compact;
 use crate::mempool::{Mempool, MempoolError};
 use crate::network::{
-    self, GossipId, GossipMessage, NetworkConfig, NetworkEvent, NetworkHandle, Status, SyncRequest, SyncResponse,
+    self, CompactBlock, GossipId, GossipMessage, NetworkConfig, NetworkEvent, NetworkHandle, Status, SyncRequest, SyncResponse,
 };
 use crate::rpc::{self, NodeCommand, NodeStatus, RpcState};
 use crate::storage::{Storage, VerifyMode};
@@ -984,11 +985,32 @@ struct Node {
     /// Batches that arrived after their request had been given up on and were applied anyway.
     /// Progress, not failure — but a rising count means the give-up is firing on live requests.
     sync_late_batches: u64,
+    /// Transaction bodies this node has fetched by hash for parked compact proposals and placed
+    /// (spec 2026-10-08 §5.3): the count of bodies a peer supplied that the mempool and the
+    /// recent cache did not. Surfaced in `rand_status` as `compact_fetched`; a value that climbs
+    /// with every block says this node is missing the transaction gossip, not just a late one.
+    compact_fetched: u64,
     /// By-hash fetches outstanding, with when each was sent: one older than the wire timeout is
     /// abandoned by `fetch_block` (audit v5) — libp2p neither answered nor reported it.
     fetch_inflight: HashMap<libp2p::request_response::OutboundRequestId, (Hash, Instant)>,
     /// Block hash -> (attempts so far, peers already asked) for by-hash fetches.
     fetch_attempts: HashMap<Hash, (usize, Vec<PeerId>)>,
+    /// Transaction bodies seen on gossip or in a proposal, beside the pool, so a compact
+    /// proposal naming one still waiting for its verdict, or already proposed, is rebuilt
+    /// without a fetch (spec 2026-10-08 §5.2, §5.4).
+    recent_txs: compact::RecentTxs,
+    /// The compact proposals waiting for bodies a peer is asked for, by view (spec 2026-10-08
+    /// §5.3; final review I2): at most [`PARK_SLOTS`], placed by [`park_slot`], and dropped when
+    /// the replica schedules a later view's timeout or holds the block.
+    parked: BTreeMap<u64, compact::Parked>,
+    /// The first compact proposal's signed header that passed the pre-screen for each
+    /// (view, proposer) (final review C1, spec 2026-10-08 §0): a leader that signs a second,
+    /// different header for its own view gets it reported `Ignore` and neither rebuilt nor
+    /// parked, so equivocating costs each node one signature check rather than a rebuild, and
+    /// on a chain that slashes the two headers become a `SlashEquivocation` (audit v6, STAKE-1;
+    /// [`FirstCompact`]). Entries under the committed view are pruned on insert, and the map
+    /// holds at most [`FIRST_COMPACT_MAX`] entries, the oldest view first out.
+    first_compact: BTreeMap<(u64, randprotocol_core::Address), FirstCompact>,
     /// When each block's by-hash fetch was first deferred to batch sync ([`fetch_deferred`]).
     fetch_deferred_since: HashMap<Hash, Instant>,
     /// History-retention passes that deleted at least one block (history pruning spec §1),
@@ -1067,6 +1089,71 @@ struct Node {
 }
 
 const MAX_FETCH_ATTEMPTS: usize = 8;
+
+/// How many compact proposals may wait for their bodies at once (final review I2, spec
+/// 2026-10-08 §0): the replica's own view and the next, or — for a replica a view behind — the
+/// next two, so a lagging validator can fetch its successor's block while the one before it is
+/// still arriving.
+const PARK_SLOTS: usize = 2;
+
+/// Where [`park_slot`] puts a compact proposal that is missing bodies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParkSlot {
+    /// Not parked, for the reason given.
+    No(&'static str),
+    /// A slot is free.
+    Free,
+    /// Both slots are taken: the park at this view, the lowest, makes room.
+    Replace(u64),
+}
+
+/// The park rule (final review I2, spec 2026-10-08 §0, overriding the one-park band of review
+/// round 1). The band is the replica's view to one past the highest parked view (or past the
+/// replica's view when that is higher), so a replica one view behind can park its successor's
+/// block beside the one it is still fetching. A view already parked keeps its park (a second
+/// proposal for it is a redelivery or, from another leader, not this view's). With a slot free
+/// the proposal parks; with both taken it replaces the lowest-view park — never one that is its
+/// own parent, whose block it needs. Every parked proposal passed the pre-screen, so each
+/// slot is held by a view's scheduled leader: a junk park for the next view leaves the other
+/// slot to the honest current view.
+fn park_slot(parked: &BTreeMap<u64, compact::Parked>, replica_view: u64, header: &randprotocol_core::BlockHeader) -> ParkSlot {
+    let top = parked.keys().next_back().copied().unwrap_or(replica_view).max(replica_view).saturating_add(1);
+    if header.view < replica_view || header.view > top {
+        return ParkSlot::No("outside the park band");
+    }
+    if parked.contains_key(&header.view) {
+        return ParkSlot::No("its view is parked already");
+    }
+    if parked.len() < PARK_SLOTS {
+        return ParkSlot::Free;
+    }
+    match parked.first_key_value() {
+        Some((_, p)) if p.compact.hash() == header.parent => ParkSlot::No("both slots are taken, the lowest by its parent"),
+        Some((&low, _)) => ParkSlot::Replace(low),
+        None => ParkSlot::Free,
+    }
+}
+
+/// The first compact header recorded for one (view, proposer) ([`Node::first_compact`]; final
+/// review C1, spec 2026-10-08 §0). The header and its signature are kept, not only the hash, so
+/// a second header from the same leader for the same view is slashing evidence without the
+/// replica having seen either block (audit v6, STAKE-1): both signatures were verified by the
+/// pre-screen, which is all `SlashEquivocation` needs.
+struct FirstCompact {
+    /// The header as the leader signed it, with its signature.
+    signed: randprotocol_core::types::actions::SignedHeader,
+    /// `signed.hash()`, kept so a redelivery is compared without hashing the header again.
+    hash: Hash,
+    /// Whether this leader's equivocation for this view has already been handed to
+    /// [`Node::pool_equivocation`]: one piece of evidence per (view, proposer) slashes the
+    /// offence, so a third header, or the second again, costs no further pool admission.
+    evidence_sent: bool,
+}
+
+/// The most (view, proposer) entries [`Node::first_compact`] keeps (final review C1). Entries
+/// below the committed view are pruned on every insert, so in steady state it holds a handful;
+/// the cap bounds a chain that certifies without committing for a long stretch.
+const FIRST_COMPACT_MAX: usize = 1_024;
 
 /// What the node knows about one peer.
 ///
@@ -1274,6 +1361,9 @@ enum SyncAdmission {
     /// Over the node-wide budget (audit v6, SYNC-3): `SyncResponse::Busy`, which the asker
     /// counts as nothing and takes elsewhere — someone else spent the budget.
     NodeBusy,
+    /// A `Transactions` request naming more than [`network::TX_FETCH_BATCH`] hashes: `Busy`,
+    /// with the peer's own token spent and no node-wide one (spec 2026-10-08 §6).
+    Oversize,
 }
 
 impl SyncAdmission {
@@ -1290,6 +1380,11 @@ impl SyncAdmission {
 /// own budget too ([`SyncServeBudget`]) — to the validators' share first when `validator` says
 /// the peer is one (audit v6, SYNC-3: `PeerBindings::is_validator_peer`), so a handful of
 /// strangers spending the general share cannot starve a lagging validator's batch.
+///
+/// A `Transactions` request is charged like `Blocks` (spec 2026-10-08 §6): it can name a whole
+/// block's bodies. One naming more than [`network::TX_FETCH_BATCH`] hashes is `Oversize` before
+/// the node-wide budget is touched — an honest asker's batches are bounded, so it will not be
+/// served and must not spend a token another peer's served request needs.
 #[allow(clippy::too_many_arguments)]
 fn admit_sync_request(
     peers: &mut HashMap<PeerId, Peer>,
@@ -1307,8 +1402,9 @@ fn admit_sync_request(
         return SyncAdmission::OverPeerLimit;
     }
     match req {
-        SyncRequest::Blocks { .. } if global.allow(validator, now) => SyncAdmission::Serve,
-        SyncRequest::Blocks { .. } => SyncAdmission::NodeBusy,
+        SyncRequest::Transactions(h) if h.len() > network::TX_FETCH_BATCH => SyncAdmission::Oversize,
+        SyncRequest::Blocks { .. } | SyncRequest::Transactions(_) if global.allow(validator, now) => SyncAdmission::Serve,
+        SyncRequest::Blocks { .. } | SyncRequest::Transactions(_) => SyncAdmission::NodeBusy,
         // One block, per-peer metered; see [`SYNC_SERVE_BURST`] for why it is not charged here.
         SyncRequest::BlockByHash(_) => SyncAdmission::Serve,
     }
@@ -1344,7 +1440,7 @@ fn on_sync_busy(peers: &mut HashMap<PeerId, Peer>, peer: PeerId, now: Instant) {
 /// what an over-limit request should cost — the bucket still bounds what it is served.
 fn refused_sync_response(req: &SyncRequest) -> SyncResponse {
     match req {
-        SyncRequest::Blocks { .. } => SyncResponse::Busy,
+        SyncRequest::Blocks { .. } | SyncRequest::Transactions(_) => SyncResponse::Busy,
         SyncRequest::BlockByHash(_) => SyncResponse::Block(None),
     }
 }
@@ -2283,8 +2379,12 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         sync_from_committed: false,
         sync_failures: 0,
         sync_late_batches: 0,
+        compact_fetched: 0,
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
+        recent_txs: compact::RecentTxs::new(compact::RECENT_TXS_MAX, compact::recent_txs_bytes(max_block_bytes)),
+        parked: BTreeMap::new(),
+        first_compact: BTreeMap::new(),
         fetch_deferred_since: HashMap::new(),
         prune_passes: 0,
         compacting: Arc::new(AtomicBool::new(false)),
@@ -2390,6 +2490,7 @@ impl Node {
                     self.check_disk();
                     self.broadcast_status().await;
                     self.announce_binding().await;
+                    self.expire_parked_requests().await;
                 }
                 _ = sync_tick.tick() => self.maybe_sync().await,
             }
@@ -2500,6 +2601,7 @@ impl Node {
         s.sync_inflight_age_ms = self.sync_inflight.map(|(_, _, at, _)| at.elapsed().as_millis() as u64);
         s.sync_failures = self.sync_failures;
         s.sync_late_batches = self.sync_late_batches;
+        s.compact_fetched = self.compact_fetched;
         s.ws_clients = self.ws_conns.load(SeqCst);
         // Admission's two numbers, beside the sync ones and never mixed with them: a verification
         // that was shed or refused is not a sync failure, and the two sets answer different
@@ -2620,17 +2722,44 @@ impl Node {
             self.report(id, outcome).await;
             return Ok(());
         }
+        // Remembered before its verdict (spec 2026-10-08 §5.4): the leader may propose it while it
+        // waits for a worker, and a compact proposal naming it then rebuilds without a fetch.
+        // After the pre-screen, so bytes the refused cache already answered are not kept.
+        let hash = tx.hash();
+        self.recent_txs.remember_hashed(hash, tx.clone());
+        // A body an open park is waiting for fills its slot (final review fold-in), whatever
+        // the pool makes of it below: the rebuilt block is verified in full, as from the cache.
+        let for_park = self.parked.values().any(|p| p.wants(&hash)).then(|| tx.clone());
         // Everything the pool can answer for free, before a ~20 ms proof is scheduled for it. A
         // duplicate or a conflict never reaches the queue.
         if let Err(e) = guard_precheck(|| self.mempool.precheck(&tx, self.hs.tip_ledger(), self.executor.as_ref())) {
-            let hash = tx.hash();
             let a = admission::acceptance_for_pool(&e, hash, &mut self.refused);
             self.note_refusal(hash);
             self.report(id, GossipOutcome::Report(a)).await;
-            return Ok(());
+        } else {
+            self.verify_queue.push_back((tx, VerifySource::Gossip(id)));
+            self.pump_verify();
         }
-        self.verify_queue.push_back((tx, VerifySource::Gossip(id)));
-        self.pump_verify();
+        match for_park {
+            Some(tx) => self.fill_parks(tx).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Place a gossiped body in every open park that is waiting for it, and hand on a park it
+    /// completes (final review fold-in): a body that reaches this node on the transaction topic
+    /// while its proposal is parked need not also be fetched. Not counted in `compact_fetched`,
+    /// which counts what a peer supplied by hash.
+    async fn fill_parks(&mut self, tx: Transaction) -> Result<()> {
+        let mut complete = Vec::new();
+        for (view, p) in self.parked.iter_mut() {
+            if p.accept(vec![tx.clone()]) > 0 && p.complete() {
+                complete.push(*view);
+            }
+        }
+        for view in complete {
+            self.complete_park(view).await?;
+        }
         Ok(())
     }
 
@@ -2772,6 +2901,19 @@ impl Node {
                     // rejected" and carries on (review M2): this one must not be swallowed there.
                     return Err(anyhow::Error::new(FatalSafety { committed, attempted }));
                 }
+                Action::Broadcast(ConsensusMessage::Proposal(b)) | Action::SendTo(_, ConsensusMessage::Proposal(b)) => {
+                    // Spec 2026-10-08 §4: the body stays here (the pool until commit, the tree,
+                    // the recent cache) and the wire carries the hashes; validators that lack a
+                    // body fetch it by hash. Published first, so the frame does not wait on the
+                    // cache; the bodies are remembered under the hashes the compact form already
+                    // computed, each hashed once.
+                    let compact = CompactBlock::of(&b);
+                    let hashes = compact.tx_hashes.clone();
+                    self.net.broadcast(GossipMessage::CompactProposal(compact)).await;
+                    for (h, tx) in hashes.into_iter().zip(b.transactions) {
+                        self.recent_txs.remember_hashed(h, tx);
+                    }
+                }
                 Action::Broadcast(m) | Action::SendTo(_, m) => {
                     self.net.broadcast(GossipMessage::Consensus(m)).await;
                 }
@@ -2782,6 +2924,9 @@ impl Node {
                 }
                 Action::ScheduleTimeout { view, duration } => {
                     self.timeout = Some((view, Instant::now() + duration));
+                    // The replica has moved past the parked proposal's view, so its block can no
+                    // longer be voted for: stop fetching for it (spec 2026-10-08 §5.3).
+                    self.parked.retain(|v, _| *v >= view);
                 }
                 Action::ReadyToPropose { view } => {
                     let at = (self.last_block_at + self.cfg.block_interval).max(Instant::now());
@@ -3170,6 +3315,8 @@ impl Node {
                     }
                 }
                 GossipMessage::Transaction(tx) => self.on_gossiped_tx(tx, id).await?,
+                // Reported once, on the pre-screen's verdict, inside (spec 2026-10-08 §5).
+                GossipMessage::CompactProposal(c) => self.on_compact_proposal(c, id).await?,
                 GossipMessage::Status(s) => {
                     let ahead = s.height > self.hs.committed_height() + 1;
                     let outcome = on_status_gossip(
@@ -3240,9 +3387,15 @@ impl Node {
                         // One block and a kept signature: cheap enough to stay here, and it needs
                         // the replica's tree.
                         SyncRequest::BlockByHash(_) => self.serve_sync(request),
+                        // At most TX_FETCH_BATCH map reads, on the loop as `BlockByHash` is (plan
+                        // amendment 3).
+                        SyncRequest::Transactions(h) => self.serve_transactions(&h),
                     }
                 } else if admission == SyncAdmission::NodeBusy {
                     tracing::debug!(%peer, "sync request over the node-wide budget; answered busy");
+                    SyncResponse::Busy
+                } else if admission == SyncAdmission::Oversize {
+                    tracing::debug!(%peer, "transactions request over the batch size; answered busy");
                     SyncResponse::Busy
                 } else {
                     tracing::debug!(%peer, "sync request over the peer's own limit; answered busy or Block(None)");
@@ -3284,6 +3437,7 @@ impl Node {
                     tracing::info!(%peer, ?request_id, "sync request failed: {error}");
                 }
                 self.retry_fetch(request_id).await?;
+                self.retry_parked_request(peer, request_id, false).await;
                 if was_batch {
                     // Straight to another peer rather than waiting out the 2 s tick.
                     self.sync_from(Some(peer)).await;
@@ -3347,7 +3501,31 @@ impl Node {
                 // this node does not hold gets a validator's signed not-held (audit v4, CON-4).
                 block_by_hash_response(&self.hs, &self.storage, &h, &mut self.not_held_signed)
             }
+            SyncRequest::Transactions(h) => self.serve_transactions(&h),
         }
+    }
+
+    /// The bodies of `hashes` this node holds (spec 2026-10-08 §6 as amended), in the order
+    /// asked: from the pool, then the recent cache — the two sources a rebuild uses. Not from
+    /// committed storage: a block being fetched for cannot carry a committed transaction again,
+    /// and storage may hold its marker form. A marker-form body ([`compact::is_marker_form`]) is
+    /// never sent, whatever holds it; the asker would refuse it anyway. On the loop, as
+    /// `BlockByHash` is: at most TX_FETCH_BATCH map reads (plan amendment 3). Over the batch
+    /// size it is `Busy`, never a partial answer — the asker's batches are bounded, so an
+    /// oversize request is not an honest one ([`admit_sync_request`] refuses it first; this is
+    /// the same rule for any other caller). The answer stops at `max_block_bytes +
+    /// max_aggregate_bytes` of the tip ledger (spec §3.2, final review I4) — a block's bodies
+    /// plus one transaction's slack, under the response wire limit — so a request naming 512
+    /// large bodies is answered with the prefix that fits, and the asker takes the rest elsewhere.
+    fn serve_transactions(&self, hashes: &[Hash]) -> SyncResponse {
+        if hashes.len() > network::TX_FETCH_BATCH {
+            return SyncResponse::Busy;
+        }
+        let ledger = self.hs.tip_ledger();
+        let limit = ledger.max_block_bytes().saturating_add(ledger.max_aggregate_bytes());
+        let real = |t: &&Transaction| !compact::is_marker_form(t);
+        let lookup = |h: &Hash| self.mempool.get(h).filter(real).or_else(|| self.recent_txs.get(h).filter(real));
+        SyncResponse::Transactions(compact::bounded_answer(hashes, lookup, limit))
     }
 
     /// Ask a peer for a block by hash. Peers are tried in turn: first those that have
@@ -3385,29 +3563,7 @@ impl Node {
             return self.unobtainable(h);
         }
         let asked = entry.1.clone();
-        let my_height = self.hs.committed_height();
-        let mut candidates: Vec<PeerId> = self
-            .peers
-            .iter()
-            // Connected, not yet asked, and on our chain at or past our height. A by-hash fetch
-            // goes over a connection for the same reason a batch request does (see [`Peer`]).
-            .filter(|(p, peer)| {
-                peer.connected
-                    && !asked.contains(p)
-                    && peer.status.as_ref().map(|s| s.height >= my_height).unwrap_or(false)
-            })
-            .map(|(p, _)| *p)
-            .collect();
-        if candidates.is_empty() {
-            // Any connected peer, even one that has not told us its height.
-            candidates = self
-                .peers
-                .iter()
-                .filter(|(p, peer)| peer.connected && !asked.contains(p))
-                .map(|(p, _)| *p)
-                .collect();
-        }
-        let Some(peer) = candidates.first().copied() else {
+        let Some(peer) = self.fetch_candidates(&asked, None).first().copied() else {
             tracing::debug!("no peer left to fetch block {h:?} from");
             return self.unobtainable(h);
         };
@@ -3418,6 +3574,369 @@ impl Node {
             e.1.push(peer);
         }
         Vec::new()
+    }
+
+    /// Peers to ask for something by hash, best first: `prefer` (a compact proposal's leader's
+    /// bound peer or its forwarder, spec 2026-10-08 §5.3) when it is connected and not yet
+    /// asked; then connected peers not yet asked whose status is at or past our committed
+    /// height — on our chain and current; then every other connected peer not yet asked, even
+    /// one that has not told us its height. A fetch goes over a connection for the same reason
+    /// a batch request does (see [`Peer`]). One policy for blocks and for transaction bodies.
+    fn fetch_candidates(&self, asked: &[PeerId], prefer: Option<PeerId>) -> Vec<PeerId> {
+        let open = |p: &PeerId| self.peers.get(p).is_some_and(|peer| peer.connected) && !asked.contains(p);
+        let my_height = self.hs.committed_height();
+        let current = |p: &PeerId| self.peers.get(p).and_then(|peer| peer.status.as_ref()).is_some_and(|s| s.height >= my_height);
+        let mut out: Vec<PeerId> = prefer.filter(|p| open(p)).into_iter().collect();
+        let others: Vec<PeerId> = self.peers.keys().filter(|p| open(p) && Some(**p) != prefer).copied().collect();
+        out.extend(others.iter().filter(|p| current(p)));
+        out.extend(others.iter().filter(|p| !current(p)));
+        out
+    }
+
+    /// A compact proposal (spec 2026-10-08 §5): metered like any consensus message — by count,
+    /// then by its own encoded bytes — then prechecked on its header and hash list
+    /// ([`HotStuff::precheck_compact`]) and reported once on that verdict, never on the
+    /// rebuild's (plan amendment 4): what passes is provably the scheduled leader's proposal,
+    /// so it is forwarded before its bodies are found. Then rebuilt from the pool and the recent
+    /// cache, never from a marker-form body ([`compact::is_marker_form`]); what is missing is
+    /// fetched by hash (§5.3), with the proposal parked meanwhile. A block the replica already
+    /// holds is neither rebuilt nor fetched.
+    ///
+    /// Committed storage is not a source (spec amendment, review fix round 1): a new block cannot
+    /// carry a committed transaction again, and storage may hold its marker form. Where a
+    /// proposal missing bodies may park is [`park_slot`]'s rule (final review I2): two slots, a
+    /// band from the replica's view to one past the highest parked view, a parked view kept
+    /// against a second proposal for it, and a park never displaced by its own child. The rule
+    /// is decided before the rebuild, so a proposal that would not be parked is rebuilt only when
+    /// every body is already here.
+    ///
+    /// A proposal the pre-screen `Ignore`s is reported `Ignore` and dropped: not rebuilt, not
+    /// parked, not fetched for, not counted in `highest_proposal_seen` (spec 2026-10-08 §0, the
+    /// final review's I3 ruling reverted). The pre-screen reaches every `Ignore` verdict — at or
+    /// under the committed height, a view too far ahead, a proposer that leads the view in no
+    /// set this replica knows — before it checks the signature, so a rebuild on `Ignore` would
+    /// let any connected peer, holding no key, make this node clone and hash up to a block's
+    /// bodies on the consensus loop for each distinct ~64 KB header naming bodies it holds. The
+    /// replica gains nothing in the first two cases, which it refuses anyway (`Stale`,
+    /// `ViewTooFarAhead`); the third is the one where a hand-on could help, but its signature
+    /// cannot be checked against a set this replica lacks, so handing it on would re-open the
+    /// amplification. Such a block reaches the replica by sync once the set is known.
+    async fn on_compact_proposal(&mut self, c: CompactBlock, id: GossipId) -> Result<()> {
+        use admission::Acceptance;
+        use randprotocol_core::consensus::GossipPrecheck;
+        let now = Instant::now();
+        let forwarder = id.propagation_source;
+        if on_consensus_gossip(&mut self.peers, &self.consensus_limiter, forwarder, now) != GossipOutcome::for_consensus() {
+            self.report(id, GossipOutcome::Report(Acceptance::Ignore)).await;
+            return Ok(());
+        }
+        let bytes = bincode::serialized_size(&c).unwrap_or(u64::MAX) as f64;
+        // Spent in place: `TokenBucket` is `Copy`. The entry exists: `on_consensus_gossip` made it.
+        let bucket = &mut self.peers.entry(forwarder).or_default().consensus_byte_bucket;
+        if !self.consensus_byte_limiter.allow_n(bucket, bytes, now) {
+            tracing::debug!(%forwarder, bytes, "compact proposal over the forwarder's byte budget; ignored");
+            self.report(id, GossipOutcome::Report(Acceptance::Ignore)).await;
+            return Ok(());
+        }
+        let verdict = self.hs.precheck_compact(&c.header, &c.signature, &c.tx_hashes);
+        match verdict {
+            GossipPrecheck::Accept => {}
+            GossipPrecheck::Ignore(why) => {
+                tracing::debug!(%forwarder, "compact proposal not forwarded: {why}");
+                self.report(id, GossipOutcome::Report(Acceptance::Ignore)).await;
+                return Ok(());
+            }
+            GossipPrecheck::Reject(why) => {
+                tracing::debug!(%forwarder, "compact proposal rejected: {why}");
+                self.report(id, GossipOutcome::Report(Acceptance::Reject)).await;
+                return Ok(());
+            }
+        }
+        // Final review C1: one header per (view, proposer). A different header from the same
+        // leader for the same view, after one passed the pre-screen, is an equivocation: not
+        // forwarded, not rebuilt, not parked. Only a header that passed in full (its signature
+        // verified) reaches this point, so a forged one can neither be recorded nor pre-empt the
+        // leader's — and both headers of a pair are the leader's own, which makes them evidence.
+        let key = (c.header.view, c.header.proposer.address());
+        let hash = c.hash();
+        if self.first_compact.get(&key).is_some_and(|first| first.hash != hash) {
+            tracing::warn!(%forwarder, view = key.0, first = ?self.first_compact[&key].hash, second = ?hash, "a second compact proposal from the view's leader; ignored, not rebuilt");
+            self.report(id, GossipOutcome::Report(Acceptance::Ignore)).await;
+            let second = randprotocol_core::types::actions::SignedHeader { header: c.header, signature: c.signature };
+            if let Some(evidence) = self.compact_equivocation(key, second) {
+                self.handle_actions(vec![evidence]).await?;
+            }
+            return Ok(());
+        }
+        self.note_first_compact(key, &c, hash);
+        self.report(id, GossipOutcome::Report(Acceptance::Accept)).await;
+        // Every proposal that passed the pre-screen, parked or not, rebuilt or not (final review
+        // I2), as the full path counts every proposal it hands on; only these, since an
+        // `Ignore`d header's signature was never verified.
+        self.highest_proposal_seen = self.highest_proposal_seen.max(c.header.height);
+        if self.hs.has_block(&hash) {
+            return Ok(());
+        }
+        let view = c.header.view;
+        let (pool, recent) = (&self.mempool, &self.recent_txs);
+        let real = |t: &&Transaction| !compact::is_marker_form(t);
+        let body = |h: &Hash| pool.get(h).filter(real).or_else(|| recent.get(h).filter(real));
+        let slot = if c.tx_hashes.iter().all(|h| body(h).is_some()) {
+            None
+        } else {
+            match park_slot(&self.parked, self.hs.view(), &c.header) {
+                ParkSlot::No(why) => {
+                    tracing::debug!("compact proposal view {view}: bodies missing and not parked: {why} (replica view {})", self.hs.view());
+                    return Ok(());
+                }
+                slot => Some(slot),
+            }
+        };
+        let total = c.tx_hashes.len();
+        let mut held = 0usize;
+        let rebuilt = compact::rebuild(c, |h| {
+            let found = body(h).cloned();
+            held += usize::from(found.is_some());
+            found
+        });
+        match rebuilt {
+            compact::Rebuilt::Block(block) => {
+                tracing::info!("compact proposal height {} view {}: {total} transactions, {held} held, 0 to fetch", block.height(), block.view());
+                // A park of this very block (its bodies since arrived another way) is moot.
+                self.parked.retain(|_, p| p.compact.hash() != hash);
+                self.handle_rebuilt(block).await
+            }
+            // `slot` is a park by construction: the rebuild found what the check above found.
+            compact::Rebuilt::Missing { compact, have, missing } => {
+                tracing::info!("compact proposal height {} view {view}: {total} transactions, {held} held, {} to fetch", compact.header.height, missing.len());
+                if let Some(ParkSlot::Replace(old)) = slot {
+                    tracing::debug!("compact proposal view {view} replaces the park of view {old}");
+                    self.parked.remove(&old);
+                }
+                self.parked.insert(view, compact::Parked::new(compact, have, forwarder, now));
+                self.request_parked_bodies(view, false).await;
+                Ok(())
+            }
+        }
+    }
+
+    /// Record the first pre-screened header for `key`, `c`'s, whose hash is `hash` (final review
+    /// C1): entries under the committed view go first, then the oldest views while the map is
+    /// at [`FIRST_COMPACT_MAX`]. A key already recorded keeps its first header, and the header is
+    /// cloned only when it is the first.
+    fn note_first_compact(&mut self, key: (u64, randprotocol_core::Address), c: &CompactBlock, hash: Hash) {
+        let floor = self.hs.committed_qc_view();
+        if self.first_compact.first_key_value().is_some_and(|((v, _), _)| *v < floor) {
+            self.first_compact = self.first_compact.split_off(&(floor, randprotocol_core::Address::default()));
+        }
+        while self.first_compact.len() >= FIRST_COMPACT_MAX && !self.first_compact.contains_key(&key) {
+            self.first_compact.pop_first();
+        }
+        self.first_compact.entry(key).or_insert_with(|| FirstCompact {
+            signed: randprotocol_core::types::actions::SignedHeader { header: c.header.clone(), signature: c.signature.clone() },
+            hash,
+            evidence_sent: false,
+        });
+    }
+
+    /// The equivocation evidence a second compact header for `key` makes (open-findings fix 2;
+    /// audit v6, STAKE-1): `Action::Equivocation` over the recorded first header and `second`,
+    /// in `SignedHeader::ordered`'s canonical order, as the replica builds it in `on_proposal`
+    /// (`HotStuff`'s one-block-per-(view, leader) check) — so a pair the replica also sees, one
+    /// of the blocks having come in full, is one transaction id and the pool's `Duplicate`.
+    /// Gated as the replica gates it: only on a chain whose committed ledger has
+    /// `staking.slashing`, elsewhere the pair would be held for nothing. The replica's other
+    /// gate, `MAX_EVIDENCE_HELD`, bounds evidence held between two drains; this evidence is
+    /// handed to [`Node::pool_equivocation`] the moment it is built, so at most one is ever
+    /// held, and at most one is built per (view, proposer) — a third header from the same
+    /// leader, or the second redelivered, builds none. Both signatures were verified by the
+    /// pre-screen; the pool's admission checks them again with the ledger's rules.
+    fn compact_equivocation(
+        &mut self,
+        key: (u64, randprotocol_core::Address),
+        second: randprotocol_core::types::actions::SignedHeader,
+    ) -> Option<Action> {
+        let slashes = self.hs.committed_ledger().staking().is_some_and(|s| s.slashing.is_some());
+        let first = self.first_compact.get_mut(&key)?;
+        if !slashes || first.evidence_sent {
+            return None;
+        }
+        first.evidence_sent = true;
+        let (first, second) = randprotocol_core::types::actions::SignedHeader::ordered(first.signed.clone(), second);
+        Some(Action::Equivocation { first, second })
+    }
+
+    /// A block rebuilt from a compact proposal goes through the full proposal precheck — the
+    /// byte cap needs the bodies — and then to the replica exactly as a gossiped full proposal
+    /// does (spec 2026-10-08 §5.2). Its delivery was reported on the compact pre-screen, so a
+    /// refusal here is only logged; `Ignore` is handed on as the full path hands it on, the
+    /// replica being the authority.
+    ///
+    /// Its bodies are remembered before the replica validates the block: the next leader's
+    /// proposal often repeats them, and they are safe to keep whatever the verdict — each one's
+    /// hash is in a list whose root the leader signed, so they are the bodies a validator will
+    /// be asked for, and a remembered body is only ever a rebuild source for a block that is
+    /// itself validated in full.
+    async fn handle_rebuilt(&mut self, block: Block) -> Result<()> {
+        use randprotocol_core::consensus::GossipPrecheck;
+        let m = ConsensusMessage::Proposal(block);
+        if let GossipPrecheck::Reject(why) = self.hs.precheck_gossip(&m) {
+            tracing::warn!("rebuilt proposal refused: {why}");
+            return Ok(());
+        }
+        if let ConsensusMessage::Proposal(b) = &m {
+            self.recent_txs.remember_block(b);
+        }
+        self.on_consensus(m).await
+    }
+
+    /// Drop every park whose block the replica now holds, however it came — a full proposal, a
+    /// by-hash fetch of a parent, a batch (final review fold-in): there is nothing left to fetch
+    /// for it.
+    fn drop_held_parks(&mut self) {
+        let hs = &self.hs;
+        self.parked.retain(|view, p| {
+            let held = hs.has_block(&p.compact.hash());
+            if held {
+                tracing::debug!(view, "parked proposal's block is held; the park is dropped");
+            }
+            !held
+        });
+    }
+
+    /// The view of the park that sent `request_id`, if any park did.
+    fn park_of_request(&self, request_id: libp2p::request_response::OutboundRequestId) -> Option<u64> {
+        self.parked.iter().find(|(_, p)| p.inflight.iter().any(|f| f.id == request_id)).map(|(v, _)| *v)
+    }
+
+    /// Ask the next peer for the missing bodies of the park at `view` (spec 2026-10-08 §5.3), in
+    /// batches of at most [`crate::network::TX_FETCH_BATCH`] hashes not already in flight: the
+    /// leader's bound peer first (the forwarder when the leader is unbound), then
+    /// [`Node::fetch_candidates`]'s order, and peers that answered `Busy` only after every other
+    /// candidate and only when `retry_busy` (the status tick), so a busy peer is not asked again
+    /// at round-trip speed. Attempts are distinct peers asked, a `Busy` answer not counted
+    /// (final review I7), under the same [`MAX_FETCH_ATTEMPTS`] cap as a block fetch. With no
+    /// peer left to ask, nothing in flight and no busy peer to come back to, the park is dropped
+    /// and the view times out as it does on a parent nobody can supply.
+    async fn request_parked_bodies(&mut self, view: u64, retry_busy: bool) {
+        self.drop_held_parks();
+        let Some(p) = self.parked.get(&view) else { return };
+        let batches = p.next_batches();
+        if batches.is_empty() {
+            return;
+        }
+        if p.attempts() >= MAX_FETCH_ATTEMPTS {
+            tracing::warn!("compact proposal view {view}: no peer supplied its bodies in {} attempts; dropped", p.attempts());
+            self.parked.remove(&view);
+            return;
+        }
+        // The leader's peer when its binding is known, else the forwarder: the one peer known to
+        // have had the proposal (§5.3).
+        let first = self.peer_bindings.get(&p.compact.header.proposer.address()).map_or(p.from, |b| b.peer);
+        let skip: Vec<PeerId> = p.asked.iter().chain(&p.busy).copied().collect();
+        let fresh = self.fetch_candidates(&skip, Some(first)).first().copied();
+        let connected = |q: &PeerId| self.peers.get(q).is_some_and(|peer| peer.connected);
+        let again = if retry_busy { p.busy.iter().find(|q| connected(q)).copied() } else { None };
+        let Some(peer) = fresh.or(again) else {
+            if p.inflight.is_empty() && !p.busy.iter().any(connected) {
+                tracing::warn!("compact proposal view {view}: no peer left to ask for its bodies; dropped");
+                self.parked.remove(&view);
+            }
+            return;
+        };
+        if let Some(p) = self.parked.get_mut(&view) {
+            p.note_asked(peer);
+        }
+        for batch in batches {
+            if let Some(id) = self.net.send_sync_request(peer, SyncRequest::Transactions(batch.clone())).await {
+                if let Some(p) = self.parked.get_mut(&view) {
+                    p.inflight.push(compact::InFlight { id, peer, hashes: batch, sent: Instant::now() });
+                }
+            }
+        }
+    }
+
+    /// A peer's answer to one of a park's transaction fetches (spec 2026-10-08 §5.3). An
+    /// answer to a request no park has in flight — no park, or a request already expired or
+    /// answered — is ignored. Otherwise the request leaves `inflight` and its bodies are placed
+    /// by [`compact::Parked::accept`], which keeps only bodies whose hash fills a missing
+    /// position; what the peer did not send, or sent wrong, counts as not held. A complete park
+    /// is handled as a rebuilt proposal — unless the replica already holds the block (it came
+    /// another way, as a full proposal or a fetched parent), in which case the park is dropped.
+    /// An incomplete park with nothing left in flight asks the next peer for the rest.
+    async fn on_transactions_response(
+        &mut self,
+        peer: PeerId,
+        request_id: libp2p::request_response::OutboundRequestId,
+        txs: Vec<Transaction>,
+    ) -> Result<()> {
+        let Some(view) = self.park_of_request(request_id) else {
+            tracing::debug!(%peer, "transactions for a request no park has in flight; ignored");
+            return Ok(());
+        };
+        let p = self.parked.get_mut(&view).expect("found above");
+        let i = p.inflight.iter().position(|f| f.id == request_id).expect("found above");
+        let asked = p.inflight.remove(i).hashes;
+        let returned = txs.len();
+        // No honest answer holds more bodies than its request named: what is past that is not
+        // hashed at all (final review fold-in).
+        let mut txs = txs;
+        txs.truncate(asked.len());
+        let placed = p.accept(txs);
+        self.compact_fetched += placed as u64;
+        tracing::debug!(%peer, asked = asked.len(), returned, placed, view, "transactions for a parked proposal");
+        if p.complete() {
+            return self.complete_park(view).await;
+        }
+        if p.inflight.is_empty() {
+            self.request_parked_bodies(view, false).await;
+        }
+        Ok(())
+    }
+
+    /// Take the complete park at `view` and hand its block on, unless the replica already holds
+    /// it (it came another way), in which case the park is only dropped.
+    async fn complete_park(&mut self, view: u64) -> Result<()> {
+        let Some(block) = self.parked.remove(&view).and_then(compact::Parked::into_block) else { return Ok(()) };
+        if self.hs.has_block(&block.hash()) {
+            tracing::debug!("parked proposal view {view} completed for a block already held; dropped");
+            return Ok(());
+        }
+        self.handle_rebuilt(block).await
+    }
+
+    /// One of a park's transaction fetches failed or was answered `Busy`: it leaves `inflight`
+    /// and its hashes are asked of the next peer (spec 2026-10-08 §5.3). A failure keeps the
+    /// peer counted as an attempt; a `Busy` answer does not (final review I7) — the peer goes to
+    /// the back of the line ([`compact::Parked::note_busy`]). Anything else's request id is left
+    /// alone.
+    async fn retry_parked_request(&mut self, peer: PeerId, request_id: libp2p::request_response::OutboundRequestId, busy: bool) {
+        let Some(view) = self.park_of_request(request_id) else { return };
+        if let Some(p) = self.parked.get_mut(&view) {
+            p.inflight.retain(|f| f.id != request_id);
+            if busy {
+                p.note_busy(peer);
+            }
+        }
+        self.request_parked_bodies(view, false).await;
+    }
+
+    /// Drop every park's fetches older than the wire's timeout and ask again for whatever is not
+    /// in flight (spec 2026-10-08 §5.3): a request libp2p neither answers nor reports would
+    /// otherwise hold its hashes for good, as for a by-hash block fetch (audit v5). Driven from
+    /// the status tick, so a park is never stranded longer than the timeout plus a tick.
+    async fn expire_parked_requests(&mut self) {
+        self.drop_held_parks();
+        let (timeout, now) = (self.wire.sync_request_timeout, Instant::now());
+        let views: Vec<u64> = self.parked.keys().copied().collect();
+        for view in views {
+            let Some(p) = self.parked.get_mut(&view) else { continue };
+            let expired = p.expire(timeout, now);
+            if expired > 0 {
+                tracing::debug!(view, expired, "parked proposal's transaction fetches got no answer within the wire timeout; asking again");
+            }
+            self.request_parked_bodies(view, true).await;
+        }
     }
 
     /// No peer can supply block `h`. If consensus is waiting on it as the high QC's block,
@@ -3546,6 +4065,7 @@ impl Node {
                 }
                 self.on_consensus(ConsensusMessage::Proposal(b)).await?;
             }
+            SyncResponse::Transactions(txs) => self.on_transactions_response(peer, request_id, txs).await?,
             SyncResponse::Block(None) => {
                 tracing::debug!("peer {peer} does not have a requested block; trying another");
                 self.retry_fetch(request_id).await?;
@@ -3574,9 +4094,10 @@ impl Node {
                     tracing::debug!(%peer, "sync peer busy; asking another");
                     self.sync_from(Some(peer)).await;
                 } else {
-                    // Only a batch is ever answered busy; a by-hash fetch that somehow is moves on
-                    // like a `Block(None)`.
+                    // A batch or a park's transaction fetch is answered busy; a by-hash fetch
+                    // that somehow is moves on like a `Block(None)`.
                     self.retry_fetch(request_id).await?;
+                    self.retry_parked_request(peer, request_id, true).await;
                 }
             }
             SyncResponse::Blocks(blocks) => {
@@ -4039,19 +4560,25 @@ mod tests {
     /// The next block of the epoch the chain is in, as a peer would propose it: certified parent,
     /// increasing view, and the state root the ledger really produces.
     fn next_block(head: &Block, ledger: &Ledger, k: &randprotocol_core::Keypair) -> Block {
+        block_on(head, ledger, k, head.view() + 1, Vec::new())
+    }
+
+    /// `next_block` at a chosen `view`, carrying `txs`: the state root is the one the ledger
+    /// produces by applying them, so the replica accepts the block as proposed.
+    fn block_on(head: &Block, ledger: &Ledger, k: &randprotocol_core::Keypair, view: u64, txs: Vec<Transaction>) -> Block {
         let height = head.height() + 1;
         let mut after = ledger.clone();
         after.set_height(height);
         after.set_timestamp_ms(height);
-        after.apply_transactions(&[], &k.address(), &StubExecutor).unwrap();
+        after.apply_transactions(&txs, &k.address(), &StubExecutor).unwrap();
         after.record_anchor(height);
         let header = BlockHeader {
             height,
-            view: head.view() + 1,
+            view,
             parent: head.hash(),
             proposer: k.public_key().clone(),
             timestamp_ms: height,
-            tx_root: Block::tx_root(&[]),
+            tx_root: Block::tx_root(&txs),
             state_root: after.state_root(),
             justify: QuorumCertificate {
                 view: head.view(),
@@ -4059,7 +4586,7 @@ mod tests {
                 votes: vec![Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), head.view(), head.hash(), k)],
             },
         };
-        Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, Vec::new(), k)
+        Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, txs, k)
     }
 
     /// A by-hash fetch that libp2p neither answers nor reports (audit v5, node A on 2026-09-24:
@@ -5624,20 +6151,50 @@ mod tests {
         assert!(!fetch_deferred(101, 100, Some(t0), t0), "one behind is a live parent, as before");
     }
 
+    /// One network command a [`bare_node`] sent: a gossip publish, a sync request, or a gossip
+    /// validation report.
+    #[allow(clippy::large_enum_variant)] // a test's handful of commands: boxing buys nothing
+    enum Seen {
+        Broadcast(GossipMessage),
+        Sync(PeerId, SyncRequest),
+        Report(libp2p::gossipsub::MessageAcceptance),
+    }
+
     /// A `Node` over `storage` and `hs` with no swarm, RPC or loop behind it, for tests that call
-    /// its methods directly. Every network command the node sends is forwarded, reply dropped, to
-    /// the returned receiver (a dropped reply is a send that got no request id, which the node
-    /// already handles), so a test reads exactly what the node asked the network to do.
-    fn bare_node(storage: Storage, gs: GenesisState, hs: HotStuff) -> (Node, mpsc::UnboundedReceiver<(PeerId, SyncRequest)>) {
+    /// its methods directly. The broadcasts, sync requests (reply dropped) and validation reports
+    /// the node sends are forwarded to the returned receiver (a dropped reply is a send that got
+    /// no request id, which the node already handles), so a test reads exactly what the node
+    /// asked the network to do.
+    fn bare_node(storage: Storage, gs: GenesisState, hs: HotStuff) -> (Node, mpsc::UnboundedReceiver<Seen>) {
+        bare_node_with(storage, gs, hs, false)
+    }
+
+    /// [`bare_node`] whose network answers each sync request with a real request id (from a
+    /// request-response behaviour with no swarm behind it, which only queues the request), so a
+    /// test can answer the request through [`Node::on_sync_response`] as the swarm would.
+    fn bare_node_answering(storage: Storage, gs: GenesisState, hs: HotStuff) -> (Node, mpsc::UnboundedReceiver<Seen>) {
+        bare_node_with(storage, gs, hs, true)
+    }
+
+    fn bare_node_with(storage: Storage, gs: GenesisState, hs: HotStuff, answer: bool) -> (Node, mpsc::UnboundedReceiver<Seen>) {
         let local = PeerId::random();
         let (net, mut cmds) = network::NetworkHandle::detached_for_test(local);
         let (seen_tx, seen_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
+            let mut sync = compact::tests::test_sync_behaviour();
             while let Some(cmd) = cmds.recv().await {
-                if let network::NetworkCommand::SendSyncRequest { peer, request, reply } = cmd {
-                    drop(reply);
-                    let _ = seen_tx.send((peer, request));
-                }
+                let seen = match cmd {
+                    network::NetworkCommand::SendSyncRequest { peer, request, reply } => {
+                        if answer {
+                            let _ = reply.send(sync.send_request(&peer, request.clone()));
+                        }
+                        Seen::Sync(peer, request)
+                    }
+                    network::NetworkCommand::Broadcast(m) => Seen::Broadcast(m),
+                    network::NetworkCommand::ReportValidation { acceptance, .. } => Seen::Report(acceptance),
+                    _ => continue,
+                };
+                let _ = seen_tx.send(seen);
             }
         });
         let cfg = NodeConfig {
@@ -5688,8 +6245,12 @@ mod tests {
             sync_from_committed: false,
             sync_failures: 0,
             sync_late_batches: 0,
+            compact_fetched: 0,
             fetch_inflight: HashMap::new(),
             fetch_attempts: HashMap::new(),
+            recent_txs: compact::RecentTxs::new(compact::RECENT_TXS_MAX, compact::recent_txs_bytes(max_block_bytes)),
+            parked: BTreeMap::new(),
+            first_compact: BTreeMap::new(),
             fetch_deferred_since: HashMap::new(),
             prune_passes: 0,
             compacting: Arc::new(AtomicBool::new(false)),
@@ -5738,15 +6299,47 @@ mod tests {
 
     /// The by-hash requests the node has sent so far (its network commands are forwarded on a
     /// spawned task, so give it a turn first).
-    async fn sent_by_hash(seen: &mut mpsc::UnboundedReceiver<(PeerId, SyncRequest)>) -> Vec<(PeerId, Hash)> {
-        tokio::task::yield_now().await;
+    async fn sent_by_hash(seen: &mut mpsc::UnboundedReceiver<Seen>) -> Vec<(PeerId, Hash)> {
+        drain(seen)
+            .await
+            .into_iter()
+            .filter_map(|s| match s {
+                Seen::Sync(p, SyncRequest::BlockByHash(h)) => Some((p, h)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Everything the node has sent so far, after giving the forwarding task a few turns.
+    async fn drain(seen: &mut mpsc::UnboundedReceiver<Seen>) -> Vec<Seen> {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
         let mut out = Vec::new();
-        while let Ok((p, req)) = seen.try_recv() {
-            if let SyncRequest::BlockByHash(h) = req {
-                out.push((p, h));
-            }
+        while let Ok(s) = seen.try_recv() {
+            out.push(s);
         }
         out
+    }
+
+    /// The transaction fetches among `seen`, as (peer, hashes asked for).
+    fn tx_fetches(seen: &[Seen]) -> Vec<(PeerId, Vec<Hash>)> {
+        seen.iter()
+            .filter_map(|s| match s {
+                Seen::Sync(p, SyncRequest::Transactions(hs)) => Some((*p, hs.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The gossip validation reports among `seen`, in order.
+    fn reports(seen: &[Seen]) -> Vec<libp2p::gossipsub::MessageAcceptance> {
+        seen.iter()
+            .filter_map(|s| match s {
+                Seen::Report(a) => Some(*a),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Audit v7 addendum, PROC-11 (#128): PROC-8's gate and SYNC-5's bound pinned where they act,
@@ -5810,6 +6403,909 @@ mod tests {
         let far = Hash::digest(b"a block a batch brings");
         assert!(node.fetch_block(far).await.is_empty());
         assert_eq!(sent_by_hash(&mut seen).await, vec![], "two past what it holds: the batch sync brings it");
+    }
+
+    /// [`chain_past_a_boundary`] with its replica resumed: committed and pending at height 2.
+    fn replica_past_a_boundary() -> (tempfile::TempDir, Storage, GenesisState, HotStuff) {
+        let (d, storage, gs, _ledger) = chain_past_a_boundary();
+        let hs = resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), Arc::new(StubExecutor)).unwrap();
+        assert_eq!((hs.committed_height(), hs.pending_tip_height()), (2, 2));
+        assert!(hs.view() > storage.head_block().unwrap().view(), "a proposal at the replica's view extends the head");
+        (d, storage, gs, hs)
+    }
+
+    /// A bundle the pool and the next block over `ledger` accept, its nullifiers and
+    /// commitments drawn from `i` so distinct `i` never conflict with each other or with the
+    /// fixture chain's.
+    fn next_tx(ledger: &Ledger, i: u32) -> Transaction {
+        bundle_tx(ledger, [[40 + i; 8], [50 + i; 8]], [[60 + i; 8], [70 + i; 8]], bundle_fee())
+    }
+
+    /// A delivery id from a fresh forwarder.
+    fn gossip_id() -> GossipId {
+        GossipId { message_id: libp2p::gossipsub::MessageId::new(b"compact"), propagation_source: PeerId::random() }
+    }
+
+    /// A compact proposal naming only transactions in the pool rebuilds and is handled as a
+    /// full proposal: the replica holds the block, nothing is parked and no request goes out
+    /// although a peer is there to ask (spec 2026-10-08 §5.2); the delivery is reported once,
+    /// with the pre-screen's `Accept`.
+    #[tokio::test]
+    async fn a_compact_proposal_rebuilds_from_the_pool() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let tx = next_tx(&ledger, 1);
+        node.mempool.insert_verified(tx.clone(), &ledger, &StubExecutor).unwrap();
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![tx]);
+        claiming_peer(&mut node, 4);
+
+        node.on_compact_proposal(CompactBlock::of(&block), gossip_id()).await.unwrap();
+        assert!(node.hs.has_block(&block.hash()), "handled as a proposal");
+        assert!(node.parked.is_empty());
+        let sent = drain(&mut seen).await;
+        assert!(
+            sent.iter().any(|s| matches!(s, Seen::Broadcast(GossipMessage::Consensus(ConsensusMessage::Vote(v))) if v.block_hash == block.hash())),
+            "the replica voted for the rebuilt block"
+        );
+        assert_eq!(tx_fetches(&sent), vec![], "nothing fetched");
+        assert_eq!(reports(&sent), vec![libp2p::gossipsub::MessageAcceptance::Accept], "reported once");
+    }
+
+    /// Final review I6 (c): a compact proposal naming a body only the recent cache holds — not
+    /// the pool — rebuilds from the cache alone and is handled with no fetch (spec 2026-10-08
+    /// §5.2, §5.4).
+    #[tokio::test]
+    async fn a_compact_proposal_rebuilds_from_the_recent_cache_alone() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let tx = next_tx(&ledger, 1);
+        node.recent_txs.remember(tx.clone());
+        assert!(!node.mempool.contains(&tx.hash()), "not in the pool");
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![tx]);
+        claiming_peer(&mut node, 4);
+
+        node.on_compact_proposal(CompactBlock::of(&block), gossip_id()).await.unwrap();
+        assert!(node.hs.has_block(&block.hash()), "handled as a proposal");
+        assert!(node.parked.is_empty());
+        let sent = drain(&mut seen).await;
+        assert!(voted_for(&sent, &block), "the replica voted for the rebuilt block");
+        assert_eq!(tx_fetches(&sent), vec![], "nothing fetched");
+    }
+
+    /// A missing body parks the proposal and asks the proposer's bound peer first, ahead of
+    /// every other peer at our height (spec 2026-10-08 §5.3).
+    #[tokio::test]
+    async fn a_missing_body_parks_and_asks_the_leader_first() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let tx = next_tx(&ledger, 1);
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![tx.clone()]);
+        let leader_peer = claiming_peer(&mut node, 4);
+        node.peer_bindings.insert_for_test(key(1).address(), leader_peer);
+        for _ in 0..16 {
+            claiming_peer(&mut node, 4);
+        }
+
+        node.on_compact_proposal(CompactBlock::of(&block), gossip_id()).await.unwrap();
+        assert!(!node.hs.has_block(&block.hash()));
+        let p = the_park(&node).expect("parked");
+        assert_eq!(p.missing(), vec![tx.hash()]);
+        assert_eq!((p.attempts(), p.asked.clone()), (1, vec![leader_peer]));
+        let sent = drain(&mut seen).await;
+        assert_eq!(tx_fetches(&sent), vec![(leader_peer, vec![tx.hash()])], "the leader's peer first");
+        assert_eq!(reports(&sent), vec![libp2p::gossipsub::MessageAcceptance::Accept], "reported once");
+    }
+
+    /// With no binding for the leader, the forwarder is asked first: it is the one peer known to
+    /// have had the proposal (spec 2026-10-08 §5.3).
+    #[tokio::test]
+    async fn an_unbound_leaders_missing_body_is_asked_of_the_forwarder_first() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let tx = next_tx(&ledger, 1);
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![tx.clone()]);
+        let forwarder = claiming_peer(&mut node, 4);
+        for _ in 0..16 {
+            claiming_peer(&mut node, 4);
+        }
+        let id = GossipId { propagation_source: forwarder, ..gossip_id() };
+
+        node.on_compact_proposal(CompactBlock::of(&block), id).await.unwrap();
+        assert_eq!(the_park(&node).map(|p| p.from), Some(forwarder));
+        assert_eq!(tx_fetches(&drain(&mut seen).await), vec![(forwarder, vec![tx.hash()])], "the forwarder first");
+    }
+
+    /// Final review I2, the lagging replica: at view `v` with the park for `v + 1` fetching, a
+    /// proposal for `v + 2` (its justify certifying `v + 1`) that is missing a body parks in the
+    /// second slot and is fetched for; a second delivery of a parked proposal keeps its park,
+    /// attempts and all.
+    #[tokio::test]
+    async fn a_lagging_replica_parks_the_successor_beside_the_park_it_is_fetching() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let v = node.hs.view();
+        let (tx_a, tx_b, tx_c) = (next_tx(&ledger, 1), next_tx(&ledger, 2), next_tx(&ledger, 3));
+        node.mempool.insert_verified(tx_a.clone(), &ledger, &StubExecutor).unwrap();
+        let at_v = block_on(&head, &ledger, &key(1), v, vec![tx_a]);
+        let at_v1 = block_on(&at_v, &ledger, &key(1), v + 1, vec![tx_b.clone()]);
+        let at_v2 = block_on(&at_v1, &ledger, &key(1), v + 2, vec![tx_c.clone()]);
+        claiming_peer(&mut node, 4);
+
+        node.on_compact_proposal(CompactBlock::of(&at_v1), gossip_id()).await.unwrap();
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v + 1], "the next view parks");
+        node.on_compact_proposal(CompactBlock::of(&at_v2), gossip_id()).await.unwrap();
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v + 1, v + 2], "its successor parks in the second slot");
+        node.on_compact_proposal(CompactBlock::of(&at_v1), gossip_id()).await.unwrap();
+        assert_eq!(node.parked.get(&(v + 1)).map(|p| (p.compact.hash(), p.attempts())), Some((at_v1.hash(), 1)), "a redelivery keeps the park");
+        assert_eq!(node.highest_proposal_seen, at_v2.height(), "every pre-screened proposal counts");
+
+        let sent = drain(&mut seen).await;
+        let asked: Vec<Vec<Hash>> = tx_fetches(&sent).into_iter().map(|(_, h)| h).collect();
+        assert_eq!(asked, vec![vec![tx_b.hash()], vec![tx_c.hash()]], "each park asked once");
+        assert_eq!(reports(&sent).len(), 3, "each delivery reported once");
+    }
+
+    /// Final review I2: a junk park for the next view — its leader names a body nobody holds —
+    /// leaves the second slot to the honest proposal for the replica's own view.
+    #[tokio::test]
+    async fn a_junk_park_for_the_next_view_does_not_keep_the_current_view_out() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let v = node.hs.view();
+        let (junk_tx, honest_tx) = (next_tx(&ledger, 1), next_tx(&ledger, 2));
+        let junk = block_on(&head, &ledger, &key(1), v + 1, vec![junk_tx.clone()]);
+        let honest = block_on(&head, &ledger, &key(1), v, vec![honest_tx.clone()]);
+        claiming_peer(&mut node, 4);
+
+        node.on_compact_proposal(CompactBlock::of(&junk), gossip_id()).await.unwrap();
+        node.on_compact_proposal(CompactBlock::of(&honest), gossip_id()).await.unwrap();
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v, v + 1], "both parked");
+        let asked: Vec<Vec<Hash>> = tx_fetches(&drain(&mut seen).await).into_iter().map(|(_, h)| h).collect();
+        assert_eq!(asked, vec![vec![junk_tx.hash()], vec![honest_tx.hash()]], "the current view is fetched for");
+    }
+
+    /// Final review I2: with both slots taken, a new view in the band replaces the lowest-view
+    /// park, but never the park that is its own parent.
+    #[tokio::test]
+    async fn with_both_slots_taken_the_lowest_makes_room_unless_it_is_the_parent() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let v = node.hs.view();
+        let txs: Vec<Transaction> = (1..=4).map(|i| next_tx(&ledger, i)).collect();
+        let at_v = block_on(&head, &ledger, &key(1), v, vec![txs[0].clone()]);
+        let at_v1 = block_on(&at_v, &ledger, &key(1), v + 1, vec![txs[1].clone()]);
+        let at_v2 = block_on(&at_v1, &ledger, &key(1), v + 2, vec![txs[2].clone()]);
+        // A view change past `v + 2`: the leader of `v + 3` extends `v + 1`.
+        let fork_v3 = block_on(&at_v1, &ledger, &key(1), v + 3, vec![txs[3].clone()]);
+        claiming_peer(&mut node, 4);
+
+        for b in [&at_v, &at_v1] {
+            node.on_compact_proposal(CompactBlock::of(b), gossip_id()).await.unwrap();
+        }
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v, v + 1]);
+        node.on_compact_proposal(CompactBlock::of(&at_v2), gossip_id()).await.unwrap();
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v + 1, v + 2], "the lowest, not its parent, made room");
+        node.on_compact_proposal(CompactBlock::of(&fork_v3), gossip_id()).await.unwrap();
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v + 1, v + 2], "the lowest is its parent: kept");
+        let asked = tx_fetches(&drain(&mut seen).await);
+        assert_eq!(asked.len(), 3, "nothing fetched for the proposal that did not park");
+    }
+
+    /// [`park_slot`]'s band runs from the replica's view to one past the highest parked view.
+    #[test]
+    fn the_park_band_runs_from_the_replica_view_to_one_past_the_highest_park() {
+        let (_d, storage, _gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let ledger = hs.tip_ledger().clone();
+        let v = hs.view();
+        let header = |view: u64| block_on(&head, &ledger, &key(1), view, vec![]).header;
+        let mut parked = BTreeMap::new();
+        assert_eq!(park_slot(&parked, v, &header(v - 1)), ParkSlot::No("outside the park band"));
+        assert_eq!(park_slot(&parked, v, &header(v)), ParkSlot::Free);
+        assert_eq!(park_slot(&parked, v, &header(v + 1)), ParkSlot::Free);
+        assert_eq!(park_slot(&parked, v, &header(v + 2)), ParkSlot::No("outside the park band"));
+        let b = block_on(&head, &ledger, &key(1), v + 1, vec![]);
+        parked.insert(v + 1, compact::Parked::new(CompactBlock::of(&b), Vec::new(), PeerId::random(), Instant::now()));
+        assert_eq!(park_slot(&parked, v, &header(v + 1)), ParkSlot::No("its view is parked already"));
+        assert_eq!(park_slot(&parked, v, &header(v + 2)), ParkSlot::Free, "one past the highest park");
+        assert_eq!(park_slot(&parked, v, &header(v + 3)), ParkSlot::No("outside the park band"));
+    }
+
+    /// A proposal for a view past the park band is neither parked nor fetched for, and does not
+    /// displace a park of the replica's own view, although the pre-screen admits it (final
+    /// review I2: the band ends one past the highest parked view, here `hs.view() + 1`).
+    #[tokio::test]
+    async fn a_far_ahead_compact_proposal_is_not_parked() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let (tx_a, tx_b) = (next_tx(&ledger, 1), next_tx(&ledger, 2));
+        let current = block_on(&head, &ledger, &key(1), node.hs.view(), vec![tx_a.clone()]);
+        let far = block_on(&head, &ledger, &key(1), node.hs.view() + 3, vec![tx_b]);
+        claiming_peer(&mut node, 4);
+
+        node.on_compact_proposal(CompactBlock::of(&far), gossip_id()).await.unwrap();
+        assert!(node.parked.is_empty(), "not parked on its own");
+        node.on_compact_proposal(CompactBlock::of(&current), gossip_id()).await.unwrap();
+        node.on_compact_proposal(CompactBlock::of(&far), gossip_id()).await.unwrap();
+        assert_eq!(the_park(&node).map(|p| p.compact.hash()), Some(current.hash()), "the current view's park stands");
+
+        let sent = drain(&mut seen).await;
+        let asked: Vec<Vec<Hash>> = tx_fetches(&sent).into_iter().map(|(_, h)| h).collect();
+        assert_eq!(asked, vec![vec![tx_a.hash()]], "nothing fetched for the far view");
+        assert_eq!(reports(&sent), vec![libp2p::gossipsub::MessageAcceptance::Accept; 3], "admitted and reported once each");
+    }
+
+    /// The marker form of a transaction has the transaction's id (review finding I1). Gossiped
+    /// ahead of a proposal naming the transaction, or even pooled, it is not what the proposal
+    /// is rebuilt from,
+    /// and a fetch answer carrying it does not fill the slot: the real body completes the park
+    /// and the block is handled.
+    #[tokio::test]
+    async fn a_marker_form_copy_does_not_poison_the_rebuild() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let tx = next_tx(&ledger, 1);
+        let mut marker = tx.clone();
+        let b = marker.bundle.as_mut().unwrap();
+        b.proof = [randprotocol_core::notes::PRUNED_PROOF_MARKER, Hash::digest(&b.proof).as_bytes().as_slice()].concat();
+        assert_eq!(marker.hash(), tx.hash(), "the marker form keeps the id");
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![tx.clone()]);
+        claiming_peer(&mut node, 4);
+
+        node.on_gossiped_tx(marker.clone(), gossip_id()).await.unwrap();
+        assert!(node.recent_txs.get(&tx.hash()).is_none(), "the marker copy is not cached");
+        // The pool's admission verifies proofs first, so it never pools a marker copy; the
+        // rebuild's lookup refuses one from any source all the same.
+        node.mempool.insert_verified(marker.clone(), &ledger, &StubExecutor).unwrap();
+        node.on_compact_proposal(CompactBlock::of(&block), gossip_id()).await.unwrap();
+        let mut p = std::mem::take(&mut node.parked).into_values().next().expect("parked: the marker copy is not a body");
+        assert_eq!(p.missing(), vec![tx.hash()]);
+        assert_eq!(p.accept(vec![marker]), 0, "a fetch answer's marker copy is refused");
+        assert_eq!(p.accept(vec![tx]), 1);
+        node.handle_rebuilt(p.into_block().expect("complete")).await.unwrap();
+        assert!(node.hs.has_block(&block.hash()), "the real body's block is handled");
+    }
+
+    /// A compact proposal for a block the replica already holds makes no fetch, even when its
+    /// bodies have since left the pool and the cache (spec 2026-10-08 §5.2).
+    #[tokio::test]
+    async fn a_held_block_is_not_fetched_again() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let tx = next_tx(&ledger, 1);
+        node.mempool.insert_verified(tx.clone(), &ledger, &StubExecutor).unwrap();
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![tx]);
+        claiming_peer(&mut node, 4);
+        node.on_compact_proposal(CompactBlock::of(&block), gossip_id()).await.unwrap();
+        assert!(node.hs.has_block(&block.hash()));
+
+        node.mempool = Mempool::new(16);
+        node.recent_txs = compact::RecentTxs::new(compact::RECENT_TXS_MAX, compact::RECENT_TXS_MAX);
+        drain(&mut seen).await;
+        node.on_compact_proposal(CompactBlock::of(&block), gossip_id()).await.unwrap();
+        assert!(node.parked.is_empty(), "no park for a held block");
+        let sent = drain(&mut seen).await;
+        assert_eq!(tx_fetches(&sent), vec![], "no request for a held block");
+        assert_eq!(reports(&sent).len(), 1, "still reported once");
+    }
+
+    /// A replica with a compact proposal at its view parked, naming `n` bundles it holds none
+    /// of, and `peers` connected peers at its height. The park's first request is in flight
+    /// under a real id ([`bare_node_answering`]); returned with the peer it went to, and
+    /// drained from the receiver.
+    async fn parked_node(
+        n: u32,
+        peers: usize,
+    ) -> (tempfile::TempDir, Node, mpsc::UnboundedReceiver<Seen>, Block, Vec<Transaction>, PeerId) {
+        let (d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node_answering(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let txs: Vec<Transaction> = (1..=n).map(|i| next_tx(&ledger, i)).collect();
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), txs.clone());
+        for _ in 0..peers {
+            claiming_peer(&mut node, 4);
+        }
+        node.on_compact_proposal(CompactBlock::of(&block), gossip_id()).await.unwrap();
+        let asked = tx_fetches(&drain(&mut seen).await);
+        assert_eq!(asked.len(), 1, "one request");
+        assert_eq!(the_park(&node).expect("parked").inflight.len(), 1, "in flight under a real id");
+        (d, node, seen, block, txs, asked[0].0)
+    }
+
+    /// The node's one park, if it has one (a test with two looks at `parked` itself).
+    fn the_park(node: &Node) -> Option<&compact::Parked> {
+        assert!(node.parked.len() <= 1, "more than one park: {:?}", node.parked.keys().collect::<Vec<_>>());
+        node.parked.values().next()
+    }
+
+    /// The id of the park's oldest request in flight.
+    fn parked_request(node: &Node) -> libp2p::request_response::OutboundRequestId {
+        the_park(node).expect("parked").inflight[0].id
+    }
+
+    /// Whether `sent` holds this node's vote for `block`.
+    fn voted_for(sent: &[Seen], block: &Block) -> bool {
+        sent.iter().any(|s| matches!(s, Seen::Broadcast(GossipMessage::Consensus(ConsensusMessage::Vote(v))) if v.block_hash == block.hash()))
+    }
+
+    /// The bodies a peer returns complete the park; the proposal is handled and the replica
+    /// votes (spec 2026-10-08 §5.3). A stranger in the response is discarded, and an answer
+    /// under an id the park did not send is ignored.
+    #[tokio::test]
+    async fn a_transactions_response_completes_the_park() {
+        let (_d, mut node, mut seen, block, txs, peer) = parked_node(1, 3).await;
+        let rid = parked_request(&node);
+        let other = compact::tests::test_request_ids(2).into_iter().find(|id| *id != rid).expect("two distinct ids");
+        node.on_sync_response(peer, other, SyncResponse::Transactions(vec![txs[0].clone()])).await.unwrap();
+        assert_eq!(the_park(&node).map(|p| p.missing()), Some(vec![txs[0].hash()]), "an unknown id is ignored");
+
+        let stranger = next_tx(node.hs.tip_ledger(), 9);
+        // The stranger is past the one hash asked for, so it is cut before it is even hashed.
+        node.on_sync_response(peer, rid, SyncResponse::Transactions(vec![txs[0].clone(), stranger])).await.unwrap();
+        assert!(node.hs.has_block(&block.hash()), "handled as a proposal");
+        assert!(node.parked.is_empty());
+        let sent = drain(&mut seen).await;
+        assert!(voted_for(&sent, &block), "the replica voted for the rebuilt block");
+        assert_eq!(tx_fetches(&sent), vec![], "nothing more fetched");
+    }
+
+    /// An answer holding more bodies than its request named is cut to that many before any is
+    /// placed (final review fold-in): a body past the cut is not placed even when it is wanted.
+    #[tokio::test]
+    async fn an_answer_is_cut_to_the_number_of_hashes_asked() {
+        let (_d, mut node, mut seen, _block, txs, first) = parked_node(1, 3).await;
+        let stranger = next_tx(node.hs.tip_ledger(), 9);
+        node.on_sync_response(first, parked_request(&node), SyncResponse::Transactions(vec![stranger, txs[0].clone()])).await.unwrap();
+        assert_eq!(the_park(&node).map(|p| p.missing()), Some(vec![txs[0].hash()]), "the wanted body past the cut is not placed");
+        assert_eq!(node.compact_fetched, 0);
+        let asked = tx_fetches(&drain(&mut seen).await);
+        assert_eq!(asked.len(), 1, "the next peer is asked");
+        assert_ne!(asked[0].0, first);
+    }
+
+    /// A body gossiped on the transaction topic while its proposal is parked fills the slot and,
+    /// the last one missing, completes the park: the block is handled and voted for with no
+    /// fetch answer (final review fold-in). It is not counted as fetched.
+    #[tokio::test]
+    async fn a_gossiped_body_completes_an_open_park() {
+        let (_d, mut node, mut seen, block, txs, _first) = parked_node(1, 3).await;
+        node.on_gossiped_tx(txs[0].clone(), gossip_id()).await.unwrap();
+        assert!(node.parked.is_empty(), "the park completed");
+        assert!(node.hs.has_block(&block.hash()), "handled as a proposal");
+        assert!(voted_for(&drain(&mut seen).await, &block), "and voted for");
+        assert_eq!(node.compact_fetched, 0, "nothing was fetched");
+    }
+
+    /// A park whose block reaches the replica another way — here a full proposal — is dropped on
+    /// the next status tick without asking anyone again (final review fold-in). The park is put
+    /// back by hand after the block is handled: the replica's own view change drops it too, and
+    /// this is the rule for a block that arrives without one (a fetched parent, a batch).
+    #[tokio::test]
+    async fn a_park_is_dropped_when_its_block_arrives_another_way() {
+        let (_d, mut node, mut seen, block, _txs, _first) = parked_node(1, 3).await;
+        let park = std::mem::take(&mut node.parked);
+        node.on_consensus(ConsensusMessage::Proposal(block.clone())).await.unwrap();
+        assert!(node.hs.has_block(&block.hash()));
+        node.parked = park;
+        drain(&mut seen).await;
+        let timeout = node.wire.sync_request_timeout;
+        node.parked.values_mut().next().unwrap().inflight[0].sent =
+            Instant::now().checked_sub(timeout + Duration::from_secs(1)).expect("a monotonic clock past the timeout");
+        node.expire_parked_requests().await;
+        assert!(node.parked.is_empty(), "dropped");
+        assert_eq!(tx_fetches(&drain(&mut seen).await), vec![], "its expired request is not asked again");
+    }
+
+    /// A response missing some hashes keeps the park and asks the next peer for the rest.
+    #[tokio::test]
+    async fn a_partial_response_moves_to_the_next_peer() {
+        let (_d, mut node, mut seen, _block, txs, first) = parked_node(2, 3).await;
+        let rid = parked_request(&node);
+        node.on_sync_response(first, rid, SyncResponse::Transactions(vec![txs[0].clone()])).await.unwrap();
+        let p = the_park(&node).expect("still parked");
+        assert_eq!(p.missing(), vec![txs[1].hash()]);
+        assert_eq!((p.inflight.len(), p.attempts()), (1, 2));
+        let asked = tx_fetches(&drain(&mut seen).await);
+        assert_eq!(asked.len(), 1);
+        assert_ne!(asked[0].0, first, "another peer");
+        assert_eq!(asked[0].1, vec![txs[1].hash()], "for the rest only");
+    }
+
+    /// `compact_fetched` counts the bodies a fetch placed, and only those (spec 2026-10-08
+    /// §5.3): a stranger in the response adds nothing, and the count reaches `rand_status`.
+    #[tokio::test]
+    async fn placed_bodies_count_toward_compact_fetched() {
+        let (_d, mut node, _seen, _block, txs, first) = parked_node(2, 3).await;
+        assert_eq!(node.compact_fetched, 0);
+        let rid = parked_request(&node);
+        let stranger = next_tx(node.hs.tip_ledger(), 9);
+        node.on_sync_response(first, rid, SyncResponse::Transactions(vec![stranger, txs[0].clone()])).await.unwrap();
+        assert_eq!(node.compact_fetched, 1, "one body placed, the stranger not counted");
+        let rid = parked_request(&node);
+        node.on_sync_response(first, rid, SyncResponse::Transactions(vec![txs[1].clone()])).await.unwrap();
+        assert_eq!(node.compact_fetched, 2, "the second body placed");
+        node.publish_status();
+        assert_eq!(node.status.read().unwrap().compact_fetched, 2, "published in the status");
+    }
+
+    /// A body whose hash differs from what was asked is not placed, and the peer counts as not
+    /// holding it: the next peer is asked (spec 2026-10-08 §5.3). The first request's answer,
+    /// arriving after that, is no longer in flight and is ignored.
+    #[tokio::test]
+    async fn a_wrong_body_is_discarded() {
+        let (_d, mut node, mut seen, _block, txs, first) = parked_node(1, 3).await;
+        let rid = parked_request(&node);
+        let wrong = next_tx(node.hs.tip_ledger(), 7);
+        node.on_sync_response(first, rid, SyncResponse::Transactions(vec![wrong])).await.unwrap();
+        assert_eq!(the_park(&node).map(|p| p.missing()), Some(vec![txs[0].hash()]), "park unchanged");
+        let asked = tx_fetches(&drain(&mut seen).await);
+        assert_eq!(asked.len(), 1);
+        assert_ne!(asked[0].0, first, "another peer");
+        assert_eq!(asked[0].1, vec![txs[0].hash()]);
+
+        node.on_sync_response(first, rid, SyncResponse::Transactions(vec![txs[0].clone()])).await.unwrap();
+        assert_eq!(the_park(&node).map(|p| p.missing()), Some(vec![txs[0].hash()]), "a request no longer in flight places nothing");
+    }
+
+    /// A park's request that fails, or is answered `Busy`, is taken to the next peer.
+    #[tokio::test]
+    async fn a_failed_or_busy_park_request_moves_to_the_next_peer() {
+        let (_d, mut node, mut seen, _block, txs, first) = parked_node(1, 3).await;
+        let rid = parked_request(&node);
+        node.on_network_event(NetworkEvent::SyncFailed { peer: first, request_id: rid, error: "timeout".into() }).await.unwrap();
+        let asked = tx_fetches(&drain(&mut seen).await);
+        assert_eq!(asked.len(), 1);
+        let second = asked[0].0;
+        assert_ne!(second, first);
+        let rid = parked_request(&node);
+        node.on_sync_response(second, rid, SyncResponse::Busy).await.unwrap();
+        let asked = tx_fetches(&drain(&mut seen).await);
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].0 != first && asked[0].0 != second, "a third peer");
+        assert_eq!(asked[0].1, vec![txs[0].hash()]);
+        assert_eq!(
+            the_park(&node).map(|p| (p.inflight.len(), p.attempts(), p.busy.clone())),
+            Some((1, 2, vec![second])),
+            "the failure counts, the busy answer does not (final review I7)"
+        );
+    }
+
+    /// Final review I7: a peer sent several batches in one go is one attempt.
+    #[tokio::test]
+    async fn a_peer_asked_several_batches_is_one_attempt() {
+        let n = network::TX_FETCH_BATCH as u32 + 1;
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node_answering(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        // `next_tx`'s words collide past ten; these are distinct for every `i`.
+        let w = |i: u32, k: u32| [1_000_000 + 4 * i + k; 8];
+        let txs: Vec<Transaction> = (0..n).map(|i| bundle_tx(&ledger, [w(i, 0), w(i, 1)], [w(i, 2), w(i, 3)], bundle_fee())).collect();
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), txs);
+        claiming_peer(&mut node, 4);
+        claiming_peer(&mut node, 4);
+        node.on_compact_proposal(CompactBlock::of(&block), gossip_id()).await.unwrap();
+        let asked = tx_fetches(&drain(&mut seen).await);
+        assert_eq!(asked.iter().map(|(_, h)| h.len()).collect::<Vec<_>>(), vec![network::TX_FETCH_BATCH, 1], "two batches");
+        assert_eq!(asked[0].0, asked[1].0, "to one peer");
+        assert_eq!(the_park(&node).map(|p| (p.inflight.len(), p.attempts())), Some((2, 1)), "one attempt");
+    }
+
+    /// Final review I7: `Busy` answers cost no attempt. Every peer busy, the park waits — it is
+    /// neither dropped nor re-asked at round-trip speed — and the status tick asks the first
+    /// busy peer again.
+    #[tokio::test]
+    async fn busy_answers_cost_no_attempt_and_busy_peers_are_retried_on_the_tick() {
+        let (_d, mut node, mut seen, _block, txs, first) = parked_node(1, 2).await;
+        node.on_sync_response(first, parked_request(&node), SyncResponse::Busy).await.unwrap();
+        let asked = tx_fetches(&drain(&mut seen).await);
+        assert_eq!(asked.len(), 1);
+        let second = asked[0].0;
+        assert_ne!(second, first, "the other peer first");
+        assert_eq!(the_park(&node).map(|p| p.attempts()), Some(1), "the busy answer did not count");
+        node.on_sync_response(second, parked_request(&node), SyncResponse::Busy).await.unwrap();
+        assert_eq!(tx_fetches(&drain(&mut seen).await), vec![], "only busy peers left: not asked again at once");
+        assert_eq!(the_park(&node).map(|p| (p.attempts(), p.inflight.len(), p.busy.clone())), Some((0, 0, vec![first, second])), "kept");
+        node.expire_parked_requests().await;
+        assert_eq!(tx_fetches(&drain(&mut seen).await), vec![(first, vec![txs[0].hash()])], "the tick asks the first busy peer again");
+        assert_eq!(the_park(&node).map(|p| (p.attempts(), p.busy.clone())), Some((1, vec![second])));
+    }
+
+    /// Final review I6 (a): peers that answer with nothing usable each cost an attempt, and at
+    /// `MAX_FETCH_ATTEMPTS` distinct peers the park is dropped, with peers still unasked.
+    #[tokio::test]
+    async fn exhausting_the_fetch_attempts_drops_the_park() {
+        let (_d, mut node, mut seen, _block, _txs, first) = parked_node(1, MAX_FETCH_ATTEMPTS + 2).await;
+        let mut peers = vec![first];
+        for i in 0..MAX_FETCH_ATTEMPTS {
+            let peer = *peers.last().unwrap();
+            node.on_sync_response(peer, parked_request(&node), SyncResponse::Transactions(vec![])).await.unwrap();
+            let asked = tx_fetches(&drain(&mut seen).await);
+            if i + 1 < MAX_FETCH_ATTEMPTS {
+                assert_eq!(asked.len(), 1, "answer {i}: the next peer is asked");
+                peers.push(asked[0].0);
+            } else {
+                assert_eq!(asked, vec![], "the cap reached: nobody else is asked");
+            }
+        }
+        peers.sort();
+        peers.dedup();
+        assert_eq!(peers.len(), MAX_FETCH_ATTEMPTS, "distinct peers");
+        assert!(node.parked.is_empty(), "the park is dropped");
+    }
+
+    /// A response completing a park for a block the replica already holds — it came another
+    /// way — drops the park without handling the block again. The park is put back by hand:
+    /// the replica's own view change would have dropped it.
+    #[tokio::test]
+    async fn a_response_for_a_held_block_does_not_handle_it_again() {
+        let (_d, mut node, mut seen, block, txs, peer) = parked_node(1, 3).await;
+        let rid = parked_request(&node);
+        let park = std::mem::take(&mut node.parked);
+        node.on_consensus(ConsensusMessage::Proposal(block.clone())).await.unwrap();
+        assert!(node.hs.has_block(&block.hash()));
+        assert!(voted_for(&drain(&mut seen).await, &block));
+        node.parked = park;
+
+        node.on_sync_response(peer, rid, SyncResponse::Transactions(vec![txs[0].clone()])).await.unwrap();
+        assert!(node.parked.is_empty(), "the park is dropped");
+        assert!(node.recent_txs.get(&txs[0].hash()).is_none(), "not handled as a rebuilt block (which remembers its bodies)");
+        assert!(drain(&mut seen).await.is_empty(), "nothing sent: no second vote");
+    }
+
+    /// A park's request with no answer past the wire's timeout is dropped and its hashes asked
+    /// of the next peer; a fresh one is left alone.
+    #[tokio::test]
+    async fn an_expired_park_request_is_asked_again() {
+        let (_d, mut node, mut seen, _block, txs, first) = parked_node(1, 3).await;
+        node.expire_parked_requests().await;
+        assert_eq!(tx_fetches(&drain(&mut seen).await), vec![], "a fresh request is left alone");
+
+        let timeout = node.wire.sync_request_timeout;
+        let sent = Instant::now().checked_sub(timeout + Duration::from_secs(1)).expect("a monotonic clock past the timeout");
+        node.parked.values_mut().next().unwrap().inflight[0].sent = sent;
+        node.expire_parked_requests().await;
+        let asked = tx_fetches(&drain(&mut seen).await);
+        assert_eq!(asked.len(), 1);
+        assert_ne!(asked[0].0, first, "another peer");
+        assert_eq!(asked[0].1, vec![txs[0].hash()]);
+        let p = the_park(&node).unwrap();
+        assert_eq!((p.inflight.len(), p.attempts()), (1, 2));
+    }
+
+    /// The server answers from the pool and the recent cache, in the order asked, never with a
+    /// marker-form body and never from committed storage (spec 2026-10-08 §6 as amended); over
+    /// the batch size it is `Busy`.
+    #[tokio::test]
+    async fn the_server_answers_from_pool_and_cache_and_refuses_oversize() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let committed = storage.head_block().unwrap().transactions[0].clone();
+        assert!(storage.tx_by_hash(&committed.hash()).unwrap().is_some(), "storage holds it");
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let (pooled, cached, marked) = (next_tx(&ledger, 1), next_tx(&ledger, 2), next_tx(&ledger, 3));
+        node.mempool.insert_verified(pooled.clone(), &ledger, &StubExecutor).unwrap();
+        node.recent_txs.remember(cached.clone());
+        let mut marker = marked.clone();
+        let b = marker.bundle.as_mut().unwrap();
+        b.proof = [randprotocol_core::notes::PRUNED_PROOF_MARKER, Hash::digest(&b.proof).as_bytes().as_slice()].concat();
+        node.mempool.insert_verified(marker, &ledger, &StubExecutor).unwrap();
+
+        let asked = [cached.hash(), Hash::digest(b"unknown"), marked.hash(), committed.hash(), pooled.hash()];
+        let SyncResponse::Transactions(got) = node.serve_transactions(&asked) else { panic!("served") };
+        assert_eq!(got, vec![cached.clone(), pooled.clone()], "the pool and the cache, in the order asked; no marker form, no storage");
+        let SyncResponse::Transactions(via) = node.serve_sync(SyncRequest::Transactions(asked.to_vec())) else { panic!("served") };
+        assert_eq!(via, got, "serve_sync answers the same");
+
+        let oversize = vec![pooled.hash(); network::TX_FETCH_BATCH + 1];
+        assert!(matches!(node.serve_transactions(&oversize), SyncResponse::Busy));
+        assert!(matches!(node.serve_transactions(&oversize[1..]), SyncResponse::Transactions(_)), "the batch size itself is served");
+    }
+
+    /// Admission of a `Transactions` request (spec 2026-10-08 §6): within the batch size it is
+    /// charged per peer and node-wide, like `Blocks`; over it, `Oversize` (answered `Busy`)
+    /// with the peer's own token spent and no node-wide one; past the peer's own limit, `Busy`.
+    #[test]
+    fn a_transactions_request_is_charged_node_wide_only_when_it_will_be_served() {
+        let limiter = admission::PeerLimiter::new(SYNC_REQUEST_BURST, SYNC_REQUEST_PER_SEC);
+        let (mut peers, mut memory, mut global) = (HashMap::new(), PeerMemory::default(), SyncServeBudget::new());
+        let now = Instant::now();
+        let oversize = SyncRequest::Transactions(vec![Hash::ZERO; network::TX_FETCH_BATCH + 1]);
+        let full = SyncRequest::Transactions(vec![Hash::ZERO; network::TX_FETCH_BATCH]);
+        let mut admit = |peer: PeerId, req: &SyncRequest| admit_sync_request(&mut peers, &mut memory, &limiter, &mut global, peer, false, req, now);
+        for _ in 0..2 * SYNC_SERVE_BURST {
+            assert_eq!(admit(PeerId::random(), &oversize), SyncAdmission::Oversize);
+        }
+        for i in 0..SYNC_SERVE_BURST {
+            assert_eq!(admit(PeerId::random(), &full), SyncAdmission::Serve, "request {i}: no oversize one spent the node's budget");
+        }
+        assert_eq!(admit(PeerId::random(), &full), SyncAdmission::NodeBusy, "charged node-wide, like Blocks");
+        assert!(matches!(refused_sync_response(&full), SyncResponse::Busy));
+
+        let mut global = SyncServeBudget::new();
+        let (mut peers, mut memory) = (HashMap::new(), PeerMemory::default());
+        let p = PeerId::random();
+        for _ in 0..SYNC_REQUEST_BURST {
+            assert_eq!(admit_sync_request(&mut peers, &mut memory, &limiter, &mut global, p, false, &oversize, now), SyncAdmission::Oversize);
+        }
+        assert_eq!(
+            admit_sync_request(&mut peers, &mut memory, &limiter, &mut global, p, false, &full, now),
+            SyncAdmission::OverPeerLimit,
+            "an oversize request still costs the peer its own token"
+        );
+    }
+
+    /// The leader publishes its proposal in compact form and remembers the bodies to serve them
+    /// (spec 2026-10-08 §4); votes and NewViews go out as before.
+    #[tokio::test]
+    async fn a_proposal_is_broadcast_compact_and_remembered() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let tx = next_tx(&ledger, 1);
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![tx.clone()]);
+        node.handle_actions(vec![Action::Broadcast(ConsensusMessage::Proposal(block.clone()))]).await.unwrap();
+        let out = drain(&mut seen).await;
+        assert!(
+            matches!(&out[..], [Seen::Broadcast(GossipMessage::CompactProposal(c))] if c.tx_hashes == vec![tx.hash()] && c.header == block.header),
+            "a compact proposal and nothing else"
+        );
+        assert!(node.recent_txs.get(&tx.hash()).is_some(), "the bodies are remembered to serve");
+
+        let vote = randprotocol_core::types::Vote::sign(node.hs.domain(), 1, block.hash(), &key(1));
+        node.handle_actions(vec![Action::Broadcast(ConsensusMessage::Vote(vote))]).await.unwrap();
+        assert!(matches!(&drain(&mut seen).await[..], [Seen::Broadcast(GossipMessage::Consensus(ConsensusMessage::Vote(_)))]));
+    }
+
+    /// The park is dropped when the replica schedules a later view's timeout, and kept while the
+    /// view is its own (spec 2026-10-08 §5.3).
+    #[tokio::test]
+    async fn a_park_is_dropped_on_view_change() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![next_tx(&ledger, 1)]);
+        claiming_peer(&mut node, 4);
+        node.on_compact_proposal(CompactBlock::of(&block), gossip_id()).await.unwrap();
+        let view = the_park(&node).expect("parked").view();
+
+        node.handle_actions(vec![Action::ScheduleTimeout { view, duration: Duration::from_secs(1) }]).await.unwrap();
+        assert!(!node.parked.is_empty(), "the park's own view keeps it");
+        node.handle_actions(vec![Action::ScheduleTimeout { view: view + 1, duration: Duration::from_secs(1) }]).await.unwrap();
+        assert!(node.parked.is_empty(), "a later view drops it");
+    }
+
+    /// A gossiped transaction is remembered as soon as it is queued for verification, so a
+    /// proposal that names it rebuilds while it is still waiting for its verdict; one the
+    /// refused cache answers is not (spec 2026-10-08 §5.4).
+    #[tokio::test]
+    async fn a_gossiped_transaction_is_remembered_before_its_verdict() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let tx = next_tx(&ledger, 1);
+        node.on_gossiped_tx(tx.clone(), gossip_id()).await.unwrap();
+        assert!(node.recent_txs.get(&tx.hash()).is_some(), "remembered");
+        assert!(!node.mempool.contains(&tx.hash()), "before its verdict");
+
+        let junk = next_tx(&ledger, 2);
+        node.refused.insert(junk.hash(), randprotocol_core::TxError::BadDigest);
+        node.on_gossiped_tx(junk.clone(), gossip_id()).await.unwrap();
+        assert!(node.recent_txs.get(&junk.hash()).is_none(), "bytes already refused are not cached");
+        assert_eq!(reports(&drain(&mut seen).await).len(), 1, "the refused one reported now, the queued one on its verdict");
+    }
+
+    /// A compact proposal whose hash list does not match its signed root is rejected by the
+    /// pre-screen: one `Reject` report, no park, no fetch (spec 2026-10-08 §5.1).
+    #[tokio::test]
+    async fn a_tampered_compact_proposal_is_rejected_once_and_not_fetched() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![next_tx(&ledger, 1)]);
+        claiming_peer(&mut node, 4);
+        let mut c = CompactBlock::of(&block);
+        c.tx_hashes[0] = Hash::digest(b"not the signed transaction");
+
+        node.on_compact_proposal(c, gossip_id()).await.unwrap();
+        assert!(node.parked.is_empty());
+        let sent = drain(&mut seen).await;
+        assert_eq!(tx_fetches(&sent), vec![]);
+        assert_eq!(reports(&sent), vec![libp2p::gossipsub::MessageAcceptance::Reject]);
+    }
+
+    /// Final review I3, reverted (open-findings fix 1): a compact proposal the pre-screen
+    /// `Ignore`s (here, at the committed height) is reported `Ignore` and dropped, though every
+    /// body it names is in the pool — not rebuilt (no body enters the recent cache, the replica
+    /// is not handed the block), not parked, not fetched for, and not counted in
+    /// `highest_proposal_seen`. The `Ignore` verdicts come before the signature check, so a
+    /// rebuild here would be work any keyless peer could order.
+    #[tokio::test]
+    async fn a_stale_compact_proposal_with_every_body_held_is_ignored_and_not_rebuilt() {
+        use libp2p::gossipsub::MessageAcceptance::Ignore;
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let pooled = next_tx(&ledger, 1);
+        node.mempool.insert_verified(pooled.clone(), &ledger, &StubExecutor).unwrap();
+        let b = block_on(&head, &ledger, &key(1), node.hs.view(), vec![pooled.clone()]);
+        let mut header = b.header;
+        header.height = node.hs.committed_height();
+        let stale = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, vec![pooled.clone()], &key(1));
+        claiming_peer(&mut node, 4);
+        assert!(node.recent_txs.get(&pooled.hash()).is_none(), "the body is in the pool only");
+        let seen_before = node.highest_proposal_seen;
+
+        node.on_compact_proposal(CompactBlock::of(&stale), gossip_id()).await.unwrap();
+        assert!(node.recent_txs.get(&pooled.hash()).is_none(), "not rebuilt: nothing was remembered");
+        assert!(!node.hs.has_block(&stale.hash()), "the replica was not handed the block");
+        assert!(node.parked.is_empty(), "not parked");
+        assert_eq!(node.highest_proposal_seen, seen_before, "an unverified header is not counted");
+        let sent = drain(&mut seen).await;
+        assert_eq!(reports(&sent), vec![Ignore], "reported once, not forwarded");
+        assert_eq!(sent.len(), 1, "and nothing else: no fetch, no broadcast");
+    }
+
+    /// Final review C1: a leader that signs a second, different header for its own view gets it
+    /// reported `Ignore`, and it is neither rebuilt (its body, though pooled, is not remembered
+    /// and the block is not handled) nor parked (its missing body is not fetched); the first
+    /// header delivered again proceeds as before.
+    #[tokio::test]
+    async fn a_second_header_for_the_same_view_is_ignored_and_not_rebuilt() {
+        use libp2p::gossipsub::MessageAcceptance::{Accept, Ignore};
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let (a, b, c) = (next_tx(&ledger, 1), next_tx(&ledger, 2), next_tx(&ledger, 3));
+        node.mempool.insert_verified(a.clone(), &ledger, &StubExecutor).unwrap();
+        node.mempool.insert_verified(c.clone(), &ledger, &StubExecutor).unwrap();
+        let view = node.hs.view();
+        let first = block_on(&head, &ledger, &key(1), view, vec![a]);
+        let missing = block_on(&head, &ledger, &key(1), view, vec![b]);
+        let held = block_on(&head, &ledger, &key(1), view, vec![c.clone()]);
+        claiming_peer(&mut node, 4);
+
+        node.on_compact_proposal(CompactBlock::of(&first), gossip_id()).await.unwrap();
+        assert!(node.hs.has_block(&first.hash()), "the first header is handled");
+        let cached = node.recent_txs.len();
+        node.on_compact_proposal(CompactBlock::of(&missing), gossip_id()).await.unwrap();
+        assert!(node.parked.is_empty(), "the second header is not parked");
+        node.on_compact_proposal(CompactBlock::of(&held), gossip_id()).await.unwrap();
+        assert!(!node.hs.has_block(&held.hash()), "a third header is not handled");
+        assert_eq!(node.recent_txs.len(), cached, "nor rebuilt: nothing was remembered");
+        assert!(node.recent_txs.get(&c.hash()).is_none());
+        node.on_compact_proposal(CompactBlock::of(&first), gossip_id()).await.unwrap();
+
+        let sent = drain(&mut seen).await;
+        assert_eq!(tx_fetches(&sent), vec![], "nothing fetched for the second header");
+        assert_eq!(reports(&sent), vec![Accept, Ignore, Ignore, Accept], "each reported once; the first again proceeds");
+        assert_eq!(slash_broadcasts(&sent), vec![], "a chain without slashing gets no evidence");
+    }
+
+    /// The slashing transactions among `seen` — what [`Node::pool_equivocation`] gossips once
+    /// it has pooled a piece of evidence.
+    fn slash_broadcasts(seen: &[Seen]) -> Vec<Transaction> {
+        seen.iter()
+            .filter_map(|s| match s {
+                Seen::Broadcast(GossipMessage::Transaction(tx)) if matches!(tx.action, randprotocol_core::types::Action::SlashEquivocation { .. }) => Some(tx.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Open-findings fix 2 (audit v6, STAKE-1): on a chain that slashes, a leader that signs a
+    /// second header for its view through compact proposals is caught. The second header is
+    /// still reported `Ignore` and neither rebuilt (its pooled body is not remembered) nor
+    /// parked, but the pair — both signatures verified by the pre-screen — becomes one
+    /// `SlashEquivocation`, pooled and gossiped exactly as the replica's own evidence is. A third
+    /// header, or the second again, adds none; the same pair from the replica is the pool's
+    /// duplicate.
+    #[tokio::test]
+    async fn a_second_compact_header_on_a_slashing_chain_is_pooled_as_evidence_once() {
+        use crate::storage::fixtures::slashing_genesis;
+        use libp2p::gossipsub::MessageAcceptance::{Accept, Ignore};
+        use randprotocol_core::types::actions::SignedHeader;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let keys = [key(1), key(2), key(3), key(4)];
+        let gs = slashing_genesis(&keys.iter().collect::<Vec<_>>());
+        storage.init_genesis(&gs).unwrap();
+        let hs = resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), Arc::new(StubExecutor)).unwrap();
+        let genesis = gs.block.clone();
+        let view = hs.view();
+        let leader = keys.iter().find(|k| k.address() == gs.validators.leader(view)).unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let pooled = next_tx(&ledger, 1);
+        node.mempool.insert_verified(pooled.clone(), &ledger, &StubExecutor).unwrap();
+        let signed = |ts: u64, txs: Vec<Transaction>| {
+            let header = BlockHeader {
+                height: 1,
+                view,
+                parent: genesis.hash(),
+                proposer: leader.public_key().clone(),
+                timestamp_ms: ts,
+                tx_root: Block::tx_root(&txs),
+                state_root: Hash::ZERO,
+                justify: QuorumCertificate::genesis(genesis.hash()),
+            };
+            Block::sign(node.hs.domain(), header, txs, leader)
+        };
+        let (first, second, third) = (signed(1, Vec::new()), signed(2, vec![pooled.clone()]), signed(3, Vec::new()));
+        claiming_peer(&mut node, 4);
+
+        node.on_compact_proposal(CompactBlock::of(&first), gossip_id()).await.unwrap();
+        node.on_compact_proposal(CompactBlock::of(&second), gossip_id()).await.unwrap();
+        assert!(node.recent_txs.get(&pooled.hash()).is_none(), "the second header is not rebuilt");
+        assert!(node.parked.is_empty(), "nor parked");
+        node.on_compact_proposal(CompactBlock::of(&third), gossip_id()).await.unwrap();
+        node.on_compact_proposal(CompactBlock::of(&second), gossip_id()).await.unwrap();
+        let sent = drain(&mut seen).await;
+        assert_eq!(reports(&sent), vec![Accept, Ignore, Ignore, Ignore], "each delivery reported once");
+        assert_eq!(tx_fetches(&sent), vec![], "nothing fetched");
+        let evidence = slash_broadcasts(&sent);
+        assert_eq!(evidence.len(), 1, "one piece of evidence for the view's leader");
+        let sh = |b: &Block| SignedHeader { header: b.header.clone(), signature: b.signature.clone() };
+        let (lo, hi) = SignedHeader::ordered(sh(&first), sh(&second));
+        assert!(
+            matches!(&evidence[0].action, randprotocol_core::types::Action::SlashEquivocation { first, second } if *first == lo && *second == hi),
+            "the first header and the second, in the canonical order"
+        );
+        assert!(node.mempool.contains(&evidence[0].hash()), "pooled for the next leader");
+
+        // The replica's copy of the same pair (one of the two arrived in full) is the pool's
+        // duplicate: nothing is gossiped twice.
+        node.handle_actions(vec![Action::Equivocation { first: lo, second: hi }]).await.unwrap();
+        assert_eq!(slash_broadcasts(&drain(&mut seen).await), vec![], "the same pair from the replica adds nothing");
+    }
+
+    /// The equivocation record is pruned under the committed view and capped, oldest view first
+    /// (final review C1).
+    #[tokio::test]
+    async fn the_first_header_record_is_pruned_and_capped() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let storage_head = storage.head_block().unwrap();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        let floor = node.hs.committed_qc_view();
+        assert!(floor > 0, "the fixture has committed past view 0");
+        let who = key(1).address();
+        let c = CompactBlock::of(&storage_head);
+        node.note_first_compact((floor - 1, who), &c, Hash::ZERO);
+        node.note_first_compact((floor, who), &c, Hash::ZERO);
+        assert_eq!(node.first_compact.keys().map(|k| k.0).collect::<Vec<_>>(), vec![floor], "under the committed view: pruned");
+        for v in 1..=FIRST_COMPACT_MAX as u64 {
+            node.note_first_compact((floor + v, who), &c, Hash::ZERO);
+        }
+        assert_eq!(node.first_compact.len(), FIRST_COMPACT_MAX);
+        assert!(!node.first_compact.contains_key(&(floor, who)), "the oldest view went first");
+        node.note_first_compact((floor + 5, who), &c, Hash::digest(b"later"));
+        assert_eq!(node.first_compact.get(&(floor + 5, who)).map(|f| f.hash), Some(Hash::ZERO), "the first record stands");
     }
 
     /// Audit v6, PROC-8: a node more than one block behind defers by-hash fetches to batch sync;

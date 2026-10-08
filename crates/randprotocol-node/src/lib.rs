@@ -4,6 +4,7 @@ pub mod admission;
 pub mod agg_executor;
 pub mod bench;
 pub mod bridge_gov_tool;
+pub mod compact;
 pub mod disk;
 pub mod hosted_prover;
 pub mod rlimit;

@@ -31,8 +31,8 @@
 //! replica is the authority, and a stale-looking message may still be the one it needs.
 use super::{HotStuff, PROPOSAL_VIEW_WINDOW};
 use crate::consensus::ConsensusMessage;
-use crate::crypto::{Address, PublicKey, Signature, PUBLIC_KEY_LEN};
-use crate::types::{QuorumCertificate, Vote};
+use crate::crypto::{Address, Hash, PublicKey, Signature, PUBLIC_KEY_LEN};
+use crate::types::{BlockHeader, QuorumCertificate, Vote};
 
 /// What the gossip layer should do with a consensus message before the replica sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,6 +198,53 @@ impl HotStuff {
                 GossipPrecheck::Accept
             }
         }
+    }
+
+    /// The header-only precheck of a compact proposal (spec 2026-10-08 §5.1; plan amendment
+    /// 2): every rule of [`Self::precheck_gossip`]'s proposal arm that needs no body, in the
+    /// same order and with the same verdicts, plus the one the compact form makes possible
+    /// before any fetch — the hash list is what the signed `tx_root` commits to. What passes
+    /// here is provably the scheduled leader's proposal; only then may a node fetch bodies for
+    /// it, which is no more than a leader can make it download today by sending a full block.
+    /// The byte cap waits for the rebuilt block, which goes through `precheck_gossip` in full.
+    /// The hash-list checks run before the state-dependent Ignore rules, so a tampered list on a
+    /// stale proposal is Reject in compact form where the full form would say Ignore — by design:
+    /// a list that does not match its own signed header is malformed whatever the replica's state.
+    pub fn precheck_compact(&self, header: &BlockHeader, signature: &Signature, tx_hashes: &[Hash]) -> GossipPrecheck {
+        if !well_formed(&header.proposer, signature) {
+            return GossipPrecheck::Reject("proposal with a malformed key or signature");
+        }
+        if tx_hashes.len() > crate::gas::MAX_BLOCK_TXS {
+            return GossipPrecheck::Reject("proposal over the block's transaction cap");
+        }
+        let mut seen = std::collections::HashSet::with_capacity(tx_hashes.len());
+        if !tx_hashes.iter().all(|h| seen.insert(*h)) {
+            return GossipPrecheck::Reject("a transaction appears twice in the block");
+        }
+        if crate::crypto::merkle_root(tx_hashes) != header.tx_root {
+            return GossipPrecheck::Reject("the hashes are not the ones the header's root commits to");
+        }
+        if header.justify.block_hash != header.parent {
+            return GossipPrecheck::Reject("proposal whose justify does not certify its parent");
+        }
+        let qc = self.precheck_qc(&header.justify);
+        if qc != GossipPrecheck::Accept {
+            return qc;
+        }
+        if header.height <= self.committed_height {
+            return GossipPrecheck::Ignore("proposal at or under the committed head");
+        }
+        if header.view > self.view.saturating_add(PROPOSAL_VIEW_WINDOW) {
+            return GossipPrecheck::Ignore("proposal too far ahead of this replica's view");
+        }
+        let proposer = header.proposer.address();
+        if !self.any_known_set(|s| s.leader(header.view) == proposer) {
+            return GossipPrecheck::Ignore("proposer leads the view in no validator set this replica knows");
+        }
+        if !header.proposer.verify(self.cfg.domain.block_message(header).as_bytes(), signature) {
+            return GossipPrecheck::Reject("proposal signature does not verify");
+        }
+        GossipPrecheck::Accept
     }
 
     fn precheck_vote(&self, v: &Vote) -> GossipPrecheck {
@@ -502,5 +549,96 @@ mod tests {
         header.justify = QuorumCertificate { view: VIEW - 1, block_hash: Hash([4; 32]), votes: Vec::new() };
         let block = Block::sign(&hs.cfg.domain, header, Vec::new(), &leader);
         assert_eq!(hs.precheck_gossip(&ConsensusMessage::Proposal(block)), GossipPrecheck::Accept);
+    }
+
+    fn compact_of(b: &Block) -> (BlockHeader, Signature, Vec<Hash>) {
+        (b.header.clone(), b.signature.clone(), b.transactions.iter().map(|t| t.hash()).collect())
+    }
+
+    /// Spec 2026-10-08 §5.1 and plan amendment 2: the header-only precheck admits the leader's
+    /// signed proposal and refuses, before any fetch, what a full proposal's precheck refuses
+    /// without a body: too many hashes, a duplicate, a hash list the root does not commit to, a
+    /// forged signature; and ignores what is stale, too far ahead, or from no known leader.
+    #[test]
+    fn the_compact_precheck_mirrors_the_full_one() {
+        let hs = replica();
+        let leader = leader_key(&hs, VIEW);
+        let good = proposal(&hs, VIEW, &leader);
+        let (h, s, hashes) = compact_of(&good);
+        assert_eq!(hs.precheck_compact(&h, &s, &hashes), GossipPrecheck::Accept);
+
+        let mut too_many = hashes.clone();
+        too_many.extend((0u32..).map(|i| Hash::digest(&i.to_le_bytes())).take(crate::gas::MAX_BLOCK_TXS + 1 - too_many.len()));
+        assert_eq!(
+            hs.precheck_compact(&h, &s, &too_many),
+            GossipPrecheck::Reject("proposal over the block's transaction cap")
+        );
+
+        let mut dup = hashes.clone();
+        dup.push(Hash::digest(b"x"));
+        dup.push(Hash::digest(b"x"));
+        assert_eq!(
+            hs.precheck_compact(&h, &s, &dup),
+            GossipPrecheck::Reject("a transaction appears twice in the block"),
+            "a duplicate is rejected before the root"
+        );
+
+        let mut swapped = hashes.clone();
+        swapped.push(Hash::digest(b"not in the root"));
+        assert_eq!(
+            hs.precheck_compact(&h, &s, &swapped),
+            GossipPrecheck::Reject("the hashes are not the ones the header's root commits to"),
+            "a list the signed root does not commit to"
+        );
+
+        let mut loose = h.clone();
+        loose.justify.block_hash = Hash::digest(b"not the parent");
+        assert_eq!(
+            hs.precheck_compact(&loose, &s, &hashes),
+            GossipPrecheck::Reject("proposal whose justify does not certify its parent")
+        );
+
+        // A malformed certificate in the justify, through `precheck_qc`: a vote for another
+        // view than the certificate's is refused on every replica, so it is Reject.
+        let mut bad_qc = h.clone();
+        bad_qc.justify.votes.push(Vote::sign(&hs.cfg.domain, bad_qc.justify.view + 9, bad_qc.justify.block_hash, &leader));
+        let resigned = Block::sign(&hs.cfg.domain, bad_qc, Vec::new(), &leader);
+        let (qh, qs, qx) = compact_of(&resigned);
+        assert_eq!(
+            hs.precheck_compact(&qh, &qs, &qx),
+            GossipPrecheck::Reject("certificate vote for another view or block"),
+            "a malformed justify is refused before the signature"
+        );
+
+        let forged = leader.sign(b"another message");
+        assert_eq!(
+            hs.precheck_compact(&h, &forged, &hashes),
+            GossipPrecheck::Reject("proposal signature does not verify")
+        );
+
+        let mut sh = good.header.clone();
+        sh.height = hs.committed_height();
+        assert_eq!(
+            hs.precheck_compact(&sh, &s, &hashes),
+            GossipPrecheck::Ignore("proposal at or under the committed head"),
+            "at or under the head: ignored"
+        );
+
+        let far_view = VIEW + PROPOSAL_VIEW_WINDOW + 1;
+        let far = proposal(&hs, far_view, &leader_key(&hs, far_view));
+        let (fh, fs, fx) = compact_of(&far);
+        assert_eq!(
+            hs.precheck_compact(&fh, &fs, &fx),
+            GossipPrecheck::Ignore("proposal too far ahead of this replica's view")
+        );
+
+        let outsider = key(77);
+        let nobody = proposal(&hs, VIEW, &outsider);
+        let (nh, ns, nx) = compact_of(&nobody);
+        assert_eq!(
+            hs.precheck_compact(&nh, &ns, &nx),
+            GossipPrecheck::Ignore("proposer leads the view in no validator set this replica knows"),
+            "leads no known set"
+        );
     }
 }

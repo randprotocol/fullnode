@@ -28,6 +28,15 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
   `burn_floor`. RPC: `rand_getLimits.fee_rules.proposer_share_bps` / `.prove_base`;
   `rand_estimateFee` and the wallet's default fees include `prove_base`. Recommended 4000 / 600000
   once aggregation is admitted (`docs/deploy.md`).
+- **Compact blocks** (node-only wire change; a flag-day roll, no genesis field): a leader
+  publishes `GossipMessage::CompactProposal` (bincode tag 4 on the consensus topic) — the header,
+  the signature and the transaction hashes — instead of the full block. Replicas pre-screen the
+  header, rebuild the block from the mempool and a new recent-transactions cache, and fetch only
+  missing bodies by hash (`SyncRequest::Transactions`, 512 a request). At 26 validators and 2 000
+  hashes a compact frame is 166 416 bytes (`docs/node-hardware.md` §8). RPC:
+  `rand_status.compact_fetched`. An old node rejects the new variant: roll observers and archives
+  first, then every validator at once with `deploy/roll-all.sh`, rollback the same way — a mixed
+  validator set can stop commits entirely (`docs/deploy.md`).
 - **Fee feedback, the burned base** (genesis-gated: a hard fork on a chain whose genesis sets a
   flag, node-only on every other chain — no existing chain carries the section): a new genesis
   `fees` section (`docs/fees.md` §1.3). Under `fees.burn_base` every bundle's `BUNDLE_BASE` is

@@ -11,7 +11,7 @@ pub mod edge;
 pub mod wire;
 
 pub use edge::{MAX_ESTABLISHED_PER_RESERVED_PEER, MAX_PENDING_INCOMING_PER_ADDR};
-pub use wire::{GossipMessage, PeerBinding, Status, SyncRequest, SyncResponse};
+pub use wire::{CompactBlock, GossipMessage, PeerBinding, Status, SyncRequest, SyncResponse, TX_FETCH_BATCH};
 
 /// Re-exported so the node can name a verdict without depending on libp2p directly. It derives
 /// `Debug` and nothing else — see `admission::Acceptance` for the comparable copy the decision path
@@ -504,6 +504,7 @@ impl Topics {
     fn for_message(&self, msg: &GossipMessage) -> &IdentTopic {
         match msg {
             GossipMessage::Consensus(_) => &self.consensus,
+            GossipMessage::CompactProposal(_) => &self.consensus,
             GossipMessage::Transaction(_) => &self.tx,
             GossipMessage::Status(_) => &self.status,
             GossipMessage::PeerBinding(_) => &self.peers,
@@ -1716,11 +1717,23 @@ mod tests {
         let t = Topics::new(7);
         let key = randprotocol_core::Keypair::from_seed([5; 32]).unwrap();
         let vote = randprotocol_core::Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), 1, Hash::ZERO, &key);
+        let header = randprotocol_core::BlockHeader {
+            height: 1,
+            view: 1,
+            parent: Hash::ZERO,
+            proposer: key.public_key().clone(),
+            timestamp_ms: 1,
+            tx_root: randprotocol_core::Block::tx_root(&[]),
+            state_root: Hash::ZERO,
+            justify: randprotocol_core::QuorumCertificate::genesis(Hash::ZERO),
+        };
+        let block = randprotocol_core::Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, Vec::new(), &key);
         let cases = [
             (GossipMessage::Consensus(randprotocol_core::consensus::ConsensusMessage::Vote(vote)), "rand/7/consensus"),
             (GossipMessage::Transaction(randprotocol_core::Transaction { chain_id: 7, bundle: None, action: randprotocol_core::Action::None }), "rand/7/tx"),
             (GossipMessage::Status(Status { height: 1, head_hash: Hash::ZERO, view: 1, floor: 0 }), "rand/7/status"),
             (GossipMessage::PeerBinding(PeerBinding::sign(&key, &Hash::ZERO, &PeerId::random(), 1)), "rand/7/peers"),
+            (GossipMessage::CompactProposal(CompactBlock::of(&block)), "rand/7/consensus"),
         ];
         for (msg, topic) in cases {
             assert_eq!(t.for_message(&msg).to_string(), topic);

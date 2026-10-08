@@ -222,6 +222,11 @@ pub struct NodeStatus {
     /// Batches applied after their request had been given up on. Progress rather than failure, but
     /// a rising count means the give-up is firing on requests that were still alive.
     pub sync_late_batches: u64,
+    /// Transaction bodies fetched by hash for compact proposals and placed (spec 2026-10-08
+    /// §5.3): what this node's mempool and recent cache did not already hold when a proposal
+    /// named it. Near zero on a well-connected validator; a steady climb says its transaction
+    /// gossip is not arriving.
+    pub compact_fetched: u64,
     /// Free bytes on the data directory's filesystem, measured at startup and every status tick
     /// (audit v4 OPS-3).
     pub disk_free_bytes: u64,
