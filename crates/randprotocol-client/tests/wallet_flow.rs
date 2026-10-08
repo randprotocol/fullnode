@@ -1082,3 +1082,166 @@ async fn an_invoke_moves_a_cell_fills_a_vault_pays_out_and_mints_end_to_end() {
     eprintln!("rpl2 flow in {:.1?}", started.elapsed());
     handle.shutdown().await;
 }
+
+/// The chain the multisig end to end runs on: the plain test chain with a token registry (the
+/// token deposit needs a registered `burn_asset`) and an empty `multisig` section — no account at
+/// genesis, so the one this test uses is the one `rand multisig create` makes.
+fn genesis_multisig(validator: &Keypair) -> Genesis {
+    use randprotocol_core::genesis::{TokensConfig, MIN_REGISTRATION_FEE};
+    let tokens = TokensConfig { registration_fee: MIN_REGISTRATION_FEE, mint_cap_per_day: 0, max_tokens: None, burn_registration_fee: None, bound_note_value: None, incremental_root: None, tokens: vec![] };
+    Genesis {
+        multisig: Some(randprotocol_core::ledger::multisig::MultisigConfig { create_fee: MULTISIG_CREATE_FEE, accounts: vec![] }),
+        ..genesis_full(validator, None, None, Some(tokens))
+    }
+}
+
+const MULTISIG_CREATE_FEE: u64 = 5 * gas::BUNDLE_BASE;
+
+/// A `MultisigPay` of `pays` out of `account` at `nonce`, stamped `time` and signed by `keys` at
+/// list positions `indices` — what `rand-node multisig pay prepare|sign|submit` assembles.
+fn multisig_pay_tx(
+    genesis: &randprotocol_core::Hash,
+    account: [u8; 32],
+    nonce: u64,
+    time: u32,
+    pays: Vec<randprotocol_core::ledger::program_state::Payout>,
+    keys: &[(u8, &Keypair)],
+) -> randprotocol_core::Transaction {
+    use randprotocol_core::types::actions::{multisig_pay_message, SignerSignature};
+    let msg = multisig_pay_message(genesis, CHAIN_ID, &account, nonce, time, &pays);
+    let signatures = keys.iter().map(|(i, k)| SignerSignature { index: *i, signature: k.sign(msg.as_bytes()) }).collect();
+    randprotocol_core::Transaction { chain_id: CHAIN_ID, bundle: None, action: Action::MultisigPay { account, nonce, time, pays, signatures } }
+}
+
+/// Multisig end to end, with real proofs (spec 2026-10-08): A creates a 2-of-3 account funded by
+/// the create bundle's own burn (`rand multisig create --fund`), registers a token and deposits
+/// some of it (`rand multisig deposit --asset 1`), then two of the three signers pay RAND and the
+/// token to B — a bundle-less transaction whose notes B finds by its ordinary scan, from the
+/// transaction alone. The set is rotated to two new keys; a pay signed by the old set is refused,
+/// and one signed by the new set commits.
+///
+/// Four bundle proofs on the test profile — run on a c-16 (`cargo test -p randprotocol-client
+/// --test wallet_flow -- --ignored a_multisig`); it is `#[ignore]`d for that reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real proofs: run on a c-16"]
+async fn a_multisig_is_created_funded_paid_and_rotated_end_to_end() {
+    use randprotocol_core::genesis::MIN_REGISTRATION_FEE;
+    use randprotocol_core::ledger::multisig::account_id;
+    use randprotocol_core::ledger::program_state::{Payout, PROGRAM_FROM};
+    use randprotocol_core::types::actions::multisig_rotate_message;
+
+    init_tracing();
+    let started = Instant::now();
+    let dir = tempfile::tempdir().unwrap();
+    let key = Keypair::from_seed([111; 32]).unwrap();
+    let handle = start_with(&dir, &key, genesis_multisig(&key)).await;
+    let rpc = RpcClient::new(format!("http://{}", handle.rpc_addr));
+    let a = Wallet::from_spend_key(SpendKey([41; 8]));
+    let b = Wallet::from_spend_key(SpendKey([42; 8]));
+    let (mut a_store, mut b_store) = (NoteStore::default(), NoteStore::default());
+    let mint = 100 * UNITS_PER_RAND;
+    let hash = rpc.mint_shielded(&a.address.to_string(), Some(mint)).await.expect("mint accepted");
+    rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("mint commits");
+    let limits = rpc.limits().await.unwrap().expect("this node reports its limits");
+    let ms = limits.multisig.expect("the chain has the multisig section");
+    assert_eq!((ms.create_fee, ms.max_signers, ms.max_payouts), (MULTISIG_CREATE_FEE, 10, 4));
+    let cpu = Proving::local(Backend::Cpu);
+    let genesis = rpc.genesis_hash().await.unwrap();
+
+    // ---- token 1: a fixed supply A holds ----
+    let supply = 1_000_000u64;
+    let slot = proving_slot().await;
+    let held = wallet::create_token(&rpc, &a, &mut a_store, "Treasury Coin", "TRS", 0, None, None, Some((supply, a.address.clone())), [10; 32], None, FriProfile::Test, &cpu, CHAIN_ID, true)
+        .await
+        .expect("token 1 registers with its supply");
+    drop(slot);
+    assert_eq!(held.index, 1);
+
+    // ---- `rand multisig create --fund 10`: the create bundle's burn funds the account ----
+    let old: Vec<Keypair> = [71u8, 72, 73].iter().map(|s| Keypair::from_seed([*s; 32]).unwrap()).collect();
+    let signers: Vec<_> = old.iter().map(|k| k.public_key().clone()).collect();
+    let salt = [12u8; 32];
+    let id = account_id(CHAIN_ID, &salt, 2, &signers);
+    assert_eq!(rpc.multisig(&id).await.unwrap(), None, "no account before the create");
+    let fund = 10 * UNITS_PER_RAND;
+    let create = Action::CreateMultisig { salt, signers: signers.clone(), threshold: 2 };
+    let create_fee = gas::fee_floor(&create) + ms.create_fee;
+    let slot = proving_slot().await;
+    let created = wallet::submit_multisig(&rpc, &a, &mut a_store, create, create_fee, Burn::Rand(fund), FriProfile::Test, &cpu, CHAIN_ID, true)
+        .await
+        .expect("the create commits");
+    drop(slot);
+    assert_eq!(created.burn, Burn::Rand(fund));
+    let acct = rpc.multisig(&id).await.unwrap().expect("the account exists");
+    assert_eq!((acct.id, acct.signers.clone(), acct.threshold, acct.nonce, acct.vault.clone()), (id, signers.clone(), 2, 0, vec![(0, fund)]));
+
+    // ---- `rand multisig deposit <id> 300 --asset 1` ----
+    let deposit = 300u64;
+    let action = Action::MultisigDeposit { account: id };
+    let fee = gas::fee_floor(&action);
+    let slot = proving_slot().await;
+    let deposited = wallet::submit_multisig(&rpc, &a, &mut a_store, action, fee, Burn::Asset { index: 1, amount: deposit }, FriProfile::Test, &cpu, CHAIN_ID, true)
+        .await
+        .expect("the token deposit commits");
+    drop(slot);
+    assert_eq!((deposited.asset, deposited.amount, deposited.change), (1, deposit, supply - deposit));
+    assert_eq!(rpc.multisig(&id).await.unwrap().unwrap().vault, vec![(0, fund), (1, deposit)]);
+    assert_eq!(a_store.balance(), mint - (gas::BUNDLE_BASE + MIN_REGISTRATION_FEE) - create_fee - fund - fee);
+
+    // ---- a 2-of-3 pay to B: no bundle, B finds both notes from the transaction alone ----
+    let format = rpc.envelope_format(CHAIN_ID).await.unwrap();
+    let pays_to_b = |amounts: &[(u32, u64)], time: u32| -> Vec<Payout> {
+        amounts
+            .iter()
+            .map(|(asset, amount)| {
+                let (note, envelope) = wallet::payout_note_for(&a, &b.address, *amount, *asset, time, format).unwrap();
+                Payout { asset: *asset, amount: *amount, recipient: b.address.clone(), r: note.r, envelope }
+            })
+            .collect()
+    };
+    let now = || async { rpc.head().await.unwrap()["height"].as_u64().unwrap() as u32 };
+    let pay_r = 2 * UNITS_PER_RAND;
+    let time = now().await;
+    let pay = multisig_pay_tx(&genesis, id, 0, time, pays_to_b(&[(0, pay_r), (1, 100)], time), &[(0, &old[0]), (2, &old[2])]);
+    let hash = rpc.send_transaction(&pay).await.expect("the 2-of-3 pay is admitted");
+    rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("the pay commits");
+    wallet::scan(&rpc, &b, &mut b_store).await.unwrap();
+    assert_eq!((b_store.balance(), b_store.balance_of(1)), (pay_r, 100), "B was paid out of the account");
+    assert!(b_store.notes.iter().all(|n| n.note.from == PROGRAM_FROM && n.note.time == time), "stamped with the pay's own time");
+    let acct = rpc.multisig(&id).await.unwrap().unwrap();
+    assert_eq!((acct.nonce, acct.vault.clone()), (1, vec![(0, fund - pay_r - gas::BUNDLE_BASE), (1, deposit - 100)]), "the base paid the proposer");
+
+    // ---- rotate to two new keys, 2-of-2, signed by two of the old three ----
+    let new: Vec<Keypair> = [74u8, 75].iter().map(|s| Keypair::from_seed([*s; 32]).unwrap()).collect();
+    let new_signers: Vec<_> = new.iter().map(|k| k.public_key().clone()).collect();
+    let msg = multisig_rotate_message(&genesis, CHAIN_ID, &id, 1, &new_signers, 2);
+    let signatures = [0u8, 1]
+        .iter()
+        .map(|i| randprotocol_core::types::actions::SignerSignature { index: *i, signature: old[*i as usize].sign(msg.as_bytes()) })
+        .collect();
+    let rotate = randprotocol_core::Transaction {
+        chain_id: CHAIN_ID,
+        bundle: None,
+        action: Action::MultisigRotate { account: id, nonce: 1, signers: new_signers.clone(), threshold: 2, signatures },
+    };
+    let hash = rpc.send_transaction(&rotate).await.expect("the rotate is admitted");
+    rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("the rotate commits");
+    let acct = rpc.multisig(&id).await.unwrap().unwrap();
+    assert_eq!((acct.id, acct.signers.clone(), acct.threshold, acct.nonce), (id, new_signers, 2, 2), "the id does not move");
+
+    // ---- the old set can no longer pay; the new one can ----
+    let time = now().await;
+    let stale = multisig_pay_tx(&genesis, id, 2, time, pays_to_b(&[(0, UNITS_PER_RAND)], time), &[(0, &old[0]), (1, &old[1])]);
+    let e = rpc.send_transaction(&stale).await.expect_err("the old set's pay is refused").to_string();
+    assert!(e.contains("does not verify"), "{e}");
+    let fresh = multisig_pay_tx(&genesis, id, 2, time, pays_to_b(&[(0, UNITS_PER_RAND)], time), &[(0, &new[0]), (1, &new[1])]);
+    let hash = rpc.send_transaction(&fresh).await.expect("the new set's pay is admitted");
+    rpc.wait_for_transaction(&hash, Duration::from_secs(60)).await.expect("the new set's pay commits");
+    wallet::scan(&rpc, &b, &mut b_store).await.unwrap();
+    assert_eq!(b_store.balance(), pay_r + UNITS_PER_RAND);
+    let supply_json = rpc.call("rand_getSupply", serde_json::json!([])).await.unwrap();
+    assert_eq!(supply_json["multisig_rand_in"], fund.to_string());
+    assert_eq!(supply_json["invariant_holds"], true, "{supply_json}");
+    eprintln!("multisig flow in {:.1?}", started.elapsed());
+    handle.shutdown().await;
+}

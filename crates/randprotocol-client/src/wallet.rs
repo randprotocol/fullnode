@@ -753,7 +753,7 @@ pub fn classify(w: &Wallet, cm: Word8, envelope: &Envelope) -> Found {
 
 /// Transaction kinds (`tx_json`'s `kind`) whose chain-computed notes are public in full: one each
 /// for the first three, up to four (an invoke's payouts) for the last.
-const PUBLIC_NOTE_KINDS: [&str; 4] = ["bridge_attest", "token_mint", "register_token", "invoke"];
+const PUBLIC_NOTE_KINDS: [&str; 5] = ["bridge_attest", "token_mint", "register_token", "invoke", "multisig_pay"];
 
 /// The notes a committed transaction appended for `w` from its **public** fields alone: a bridge
 /// deposit (`BridgeAttest`), a token mint (`TokenMint`) and a registration's initial mint
@@ -861,6 +861,15 @@ pub fn rebuilt_notes_with(w: &Wallet, tx: &Transaction, tx_hash: Option<&Hash>, 
                 .map(|p| Note { pk: me, from: randprotocol_core::ledger::program_state::PROGRAM_FROM, amount: p.amount, asset: p.asset, time: b.time, r: p.r })
                 .collect()
         }
+        // Multisig: a pay's notes are the invoke payout's shape (`program_state::payout_commitment`,
+        // `PROGRAM_FROM`), but a pay carries no bundle — they are stamped with the *action's* own
+        // `time`, the one its signers signed. This is the one place a payout to this wallet is
+        // found: the transaction, carried beside its header in `public_notes`.
+        Action::MultisigPay { pays, time, .. } => pays
+            .iter()
+            .filter(|p| p.recipient.pk == me)
+            .map(|p| Note { pk: me, from: randprotocol_core::ledger::program_state::PROGRAM_FROM, amount: p.amount, asset: p.asset, time: *time, r: p.r })
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -3158,6 +3167,46 @@ async fn submit_token_burn_with(
     let action = Action::TokenBurn { asset, amount };
     let spend = Spend { asset, to: None, memo: "", fee, burn_a: amount, burn_r: 0, prover_fee: None };
     submit_spend(rpc, w, store, spend, action, Burn::Asset { index: asset, amount }, profile, proving, None, chain_id, wait).await
+}
+
+/// Multisig (spec 2026-10-08 §5, §7): a bundle-carried `CreateMultisig` or `MultisigDeposit`,
+/// whose bundle's burn is what funds the account — `burn_r` credits its RAND row, `burn_a` of a
+/// registered token (`burn_asset`) that token's row. Any of [`Burn::Rand`], [`Burn::Asset`] and
+/// [`Burn::Both`] is a deposit; [`Burn::None`] is a create that funds nothing (the ledger refuses a
+/// deposit of nothing, `EmptyDeposit`). The shape is [`submit_token_burn`]'s without its RAND
+/// refusal: RAND is a multisig's first row, and it goes in through `burn_r`, never `burn_a`.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_multisig(
+    rpc: &RpcClient,
+    w: &Wallet,
+    store: &mut NoteStore,
+    action: Action,
+    fee: u64,
+    burn: Burn,
+    profile: FriProfile,
+    proving: &Proving,
+    chain_id: u64,
+    wait: bool,
+) -> Result<Submission> {
+    if !matches!(action, Action::CreateMultisig { .. } | Action::MultisigDeposit { .. }) {
+        return Err(anyhow!("submit_multisig carries a multisig create or deposit, not {action:?} (wallet bug)"));
+    }
+    let (asset, burn_r, burn_a) = match burn {
+        Burn::None => (0, 0, 0),
+        Burn::Rand(r) => (0, r, 0),
+        Burn::Asset { index, amount } => (index, 0, amount),
+        Burn::Both { rand, index, amount } => (index, rand, amount),
+    };
+    if burn_a != 0 && asset == 0 {
+        return Err(anyhow!("RAND goes into a multisig through burn_r, never burn_a"));
+    }
+    if matches!(action, Action::MultisigDeposit { .. }) && burn_r == 0 && burn_a == 0 {
+        return Err(anyhow!("a deposit that moves nothing into the account still pays a fee and a proof"));
+    }
+    // Collapsed as an invoke's is, so the summary names one event.
+    let burn = Burn::invoke(burn_r, asset, burn_a);
+    let spend = Spend { asset: if burn_a != 0 { asset } else { 0 }, to: None, memo: "", fee, burn_a, burn_r, prover_fee: None };
+    submit_spend(rpc, w, store, spend, action, burn, profile, proving, None, chain_id, wait).await
 }
 
 /// The facts a deploy needs from the chain before any proving: whether `words` code words fit this
@@ -7472,6 +7521,46 @@ mod tests {
         assert!(matches!(classify(&me, minted[0].commitment(), &transition.mints[0].envelope), Found::Received(n, None) if n == minted[0]));
     }
 
+    /// Multisig (Review Focus 5): a `MultisigPay` carries no bundle, so the only time its payout
+    /// notes can be stamped with is the action's own `time` — and the only place a payout to this
+    /// wallet is found is the transaction itself (the header page carries it in `public_notes`).
+    /// Each recipient rebuilds exactly its own note at the commitment the chain appends
+    /// (`program_state::payout_commitment`), from the public fields alone; the envelope opens for
+    /// it; a stranger rebuilds nothing; and an older node's walk fetches the kind too.
+    #[test]
+    fn a_multisig_payout_to_this_wallet_is_found_from_the_transaction_alone() {
+        use randprotocol_core::ledger::program_state::{payout_commitment, Payout, PROGRAM_FROM};
+        let me = Wallet::from_spend_key(SpendKey([57; 8]));
+        let you = Wallet::from_spend_key(SpendKey([58; 8]));
+        let signer = Wallet::from_spend_key(SpendKey([59; 8]));
+        let time = 1_234u32;
+        let payout = |to: &Wallet, amount: u64, asset: u32| {
+            let (note, envelope) = payout_note_for(&signer, &to.address, amount, asset, time, EnvelopeFormat::Legacy).unwrap();
+            Payout { asset, amount, recipient: to.address.clone(), r: note.r, envelope }
+        };
+        let pays = vec![payout(&me, 700, 0), payout(&you, 40, 3), payout(&me, 9, 3)];
+        let tx = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::MultisigPay { account: [5; 32], nonce: 0, time, pays: pays.clone(), signatures: Vec::new() },
+        };
+        let zk = ZkExecutor::new(FriProfile::Test);
+        let mine = rebuilt_notes(&me, &tx);
+        assert_eq!(mine.len(), 2, "both of this wallet's payouts, and not the other's");
+        for (n, p) in mine.iter().zip([&pays[0], &pays[2]]) {
+            assert_eq!((n.pk, n.from, n.amount, n.asset, n.time, n.r), (me.vk.pk(), PROGRAM_FROM, p.amount, p.asset, time, p.r));
+            assert_eq!(n.commitment(), payout_commitment(p, time, &zk), "at the leaf the chain appends");
+            assert!(matches!(classify(&me, n.commitment(), &p.envelope), Found::Received(got, None) if got == *n));
+        }
+        let yours = rebuilt_notes(&you, &tx);
+        assert_eq!(yours.len(), 1);
+        assert_eq!((yours[0].amount, yours[0].asset, yours[0].time), (40, 3, time));
+        assert_eq!(yours[0].commitment(), payout_commitment(&pays[1], time, &zk));
+        assert!(rebuilt_notes(&Wallet::from_spend_key(SpendKey([60; 8])), &tx).is_empty(), "a stranger rebuilds nothing");
+        // A node that predates `public_notes` is walked block by block, by kind.
+        assert!(PUBLIC_NOTE_KINDS.contains(&"multisig_pay"), "the older node's walk fetches a pay too");
+    }
+
     /// `Burn::invoke` collapses to the one-sided variants, and the summary line names the RAND
     /// that left the pool beside a token deposit.
     #[test]
@@ -8293,7 +8382,7 @@ mod tests {
             max_program_words: 4096, max_proof_bytes: 20 << 20, max_block_bytes: 24 << 20, max_call_envelope_bytes: 18_432,
             max_program_public_words: 0, envelope_bytes: None, hardening_v6: true,
             gas_price: None, byte_price: None, gas_circuit: false, bundle_gas_limit: None, adjust_bps: None, proof_window_blocks: None,
-            program_state: None,
+            program_state: None, multisig: None,
         };
         let priced = ChainLimits { gas_price: Some(100), byte_price: Some(800), ..raised };
         assert_eq!(hardened_call_quote_bytes(Some(&raised), 1_000), 1_000, "no policy: the envelope, as before");
@@ -8313,7 +8402,7 @@ mod tests {
             max_program_words: 4096, max_proof_bytes: 2 << 20, max_block_bytes: 4 << 20, max_call_envelope_bytes: 18_432,
             max_program_public_words: 0, envelope_bytes: None, hardening_v6: false,
             gas_price: Some(100), byte_price: Some(800), gas_circuit: false, bundle_gas_limit: None, adjust_bps: None, proof_window_blocks: None,
-            program_state: None,
+            program_state: None, multisig: None,
         };
         let old = ChainLimits { gas_price: None, byte_price: None, ..policy };
         for tier in [10u8, 12, 14, 20] {
@@ -8697,7 +8786,7 @@ mod tests {
             bundle_gas_limit: None,
             adjust_bps: None,
             proof_window_blocks: None,
-            program_state: None,
+            program_state: None, multisig: None,
         }
     }
 
@@ -8973,7 +9062,7 @@ mod tests {
             bundle_gas_limit: None,
             adjust_bps: None,
             proof_window_blocks: None,
-            program_state: None,
+            program_state: None, multisig: None,
         };
         let want = GasPolicy::DEFAULT.call_floor(tier, 0, 0, bytes);
         assert!(want > ledger_floor, "the policy floor must exceed the ledger floor for this test to say anything");

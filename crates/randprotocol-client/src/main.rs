@@ -25,7 +25,7 @@ use randprotocol_core::ledger::staking::MIN_STAKE;
 use randprotocol_core::notes::{word8_to_hex, ShieldedAddress, Word8};
 use randprotocol_core::payment_uri::PaymentUri;
 use randprotocol_core::types::actions::Registration;
-use randprotocol_core::{format_amount, gas, parse_amount, Action, Address, Hash, Keypair};
+use randprotocol_core::{format_amount, gas, parse_amount, Action, Address, Hash, Keypair, PublicKey};
 use randprotocol_zkvm::machine::{Backend, FriProfile, Tier, TIERS};
 use randprotocol_zkvm::{call_envelope, codec, emulator, executor, guests, hash, isa::Program};
 use std::io::Write;
@@ -214,6 +214,11 @@ enum Cmd {
     /// Confidential programs: build, deploy, show.
     #[command(subcommand)]
     Program(ProgramCmd),
+    /// Multisig accounts (M-of-N shared custody): create one, or deposit into one. Both are this
+    /// wallet's because their bundle's burn is what funds the account; paying out of an account
+    /// and rotating its signers are signed, bundle-less actions — `rand-node multisig pay|rotate`.
+    #[command(subcommand)]
+    Multisig(MultisigCmd),
     /// Run a confidential call: prove locally, pay from a bundle, wait for the receipt.
     ///
     /// By default the call also publishes a sealed transcript of its private inputs (spec §6.1),
@@ -667,6 +672,63 @@ enum TokenCmd {
         from: u64,
         #[arg(long, default_value_t = 1000)]
         limit: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum MultisigCmd {
+    /// Create an M-of-N account; the bundle's burn is its opening balance.
+    ///
+    /// The account id is derived from the chain id, the salt, the threshold and the signers in
+    /// order, and is printed before anything is proved. The fee is the bundle's base plus the
+    /// chain's `create_fee` (`rand_getLimits`).
+    Create {
+        /// A signer's public key (hex, as `rand-node keygen` prints it). Repeat for each, in the
+        /// order the account lists them: signatures name signers by that position.
+        #[arg(long = "signer", required = true)]
+        signer: Vec<String>,
+        /// How many signers a pay or a rotate needs (1..=signers).
+        #[arg(long)]
+        threshold: u8,
+        /// 32 bytes of hex; a fresh random salt when omitted. The same salt, threshold and
+        /// signers give the same id, so a second create of them is refused.
+        #[arg(long)]
+        salt: Option<String>,
+        /// RAND to fund the account with, burned by the create bundle into its RAND row.
+        #[arg(long, value_name = "RAND")]
+        fund: Option<String>,
+        /// A token to fund it with too: its registry index or id, and an amount in its own units.
+        #[arg(long, num_args = 2, value_names = ["ASSET", "AMOUNT"])]
+        fund_token: Option<Vec<String>>,
+        /// Fee in RAND; default: the bundle's base plus the chain's create fee.
+        #[arg(long)]
+        fee: Option<String>,
+        /// Return once the node accepts the bundle instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+        /// Prove on an attached NVIDIA GPU (requires a build with `--features cuda`).
+        #[arg(long)]
+        cuda: bool,
+    },
+    /// Deposit into an existing account: the bundle burns AMOUNT out of this wallet into it.
+    /// Anyone may deposit; nothing is signed.
+    Deposit {
+        /// The account id (64 hex, as `create` and `rand-node multisig id` print it).
+        account: String,
+        /// Amount, in the asset's display units.
+        amount: String,
+        /// The asset: a registry index or a token id (`rpl1…` or 64 hex); RAND when omitted.
+        #[arg(long)]
+        asset: Option<String>,
+        /// Fee in RAND; the floor is 0.001.
+        #[arg(long)]
+        fee: Option<String>,
+        /// Return once the node accepts the bundle instead of waiting for it to commit.
+        #[arg(long)]
+        no_wait: bool,
+        /// Prove on an attached NVIDIA GPU (requires a build with `--features cuda`).
+        #[arg(long)]
+        cuda: bool,
     },
 }
 
@@ -1715,6 +1777,77 @@ async fn main() -> Result<()> {
                 }
                 println!("balance: {} RAND", format_amount(store.balance()));
             }
+        }
+        Cmd::Multisig(MultisigCmd::Create { signer, threshold, salt, fund, fund_token, fee, no_wait, cuda }) => {
+            use randprotocol_core::ledger::multisig::{account_id, check_signers};
+            let signers = signer
+                .iter()
+                .map(|k| PublicKey::from_hex(k.trim()).map_err(|e| anyhow!("--signer {k} is not a public key: {e}")))
+                .collect::<Result<Vec<_>>>()?;
+            // The ledger's own rule (`check_signers`), so a bad set is refused before a proof.
+            check_signers(&signers, threshold).map_err(|e| anyhow!("{e}"))?;
+            let salt = match salt {
+                Some(s) => randprotocol_client::hex32(&s).context("--salt must be 32 bytes of hex")?,
+                None => random_salt(),
+            };
+            // Every refusal the chain can answer before proving, asked first.
+            let limits = rpc.limits().await?.and_then(|l| l.multisig).context("this chain has no multisig section")?;
+            anyhow::ensure!(signers.len() <= limits.max_signers, "{} signers, this chain allows at most {}", signers.len(), limits.max_signers);
+            let chain_id = rpc.chain_id().await?;
+            let id = account_id(chain_id, &salt, threshold, &signers);
+            anyhow::ensure!(rpc.multisig(&id).await?.is_none(), "multisig account {} already exists", hex::encode(id));
+            let rand = fund.as_deref().map(parse_amount).transpose()?.unwrap_or(0);
+            let (index, units) = match &fund_token {
+                Some(pair) => {
+                    let [asset, amount] = pair.as_slice() else { anyhow::bail!("--fund-token takes an asset and an amount") };
+                    anyhow::ensure!(!wallet::names_rand(asset), "RAND funds the account through --fund, not --fund-token");
+                    let index = wallet::resolve_asset(&rpc, asset).await?;
+                    let (decimals, _) = wallet::asset_units(&rpc, index).await?;
+                    let units = wallet::parse_decimal(amount, decimals)?;
+                    anyhow::ensure!(units > 0, "--fund-token of zero funds nothing");
+                    (index, units)
+                }
+                None => (0, 0),
+            };
+            let action = Action::CreateMultisig { salt, signers, threshold };
+            let fee = match fee {
+                Some(f) => parse_amount(&f)?,
+                None => gas::fee_floor(&action) + limits.create_fee,
+            };
+            println!("multisig account {}", hex::encode(id));
+            let (w, path, mut store) = open_wallet(&cli.key)?;
+            let profile = profile_of(&rpc).await?;
+            let s = wallet::submit_multisig(&rpc, &w, &mut store, action, fee, Burn::invoke(rand, index, units), profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
+                .await;
+            store.save(&path)?;
+            report(&s?, "multisig create");
+            println!("multisig account {}: {threshold}-of-{} ({} RAND{})", hex::encode(id), signer.len(), format_amount(rand), if units > 0 { format!(", {units} units of asset {index}") } else { String::new() });
+        }
+        Cmd::Multisig(MultisigCmd::Deposit { account, amount, asset, fee, no_wait, cuda }) => {
+            let id = randprotocol_client::hex32(&account).context("the account id must be 32 bytes of hex")?;
+            // An unknown account is refused by the ledger only after a proof; asked first.
+            let acct = rpc.multisig(&id).await?.with_context(|| format!("no multisig account {account}"))?;
+            let index = match &asset {
+                Some(a) => wallet::resolve_asset(&rpc, a).await?,
+                None => 0,
+            };
+            let (decimals, symbol) = wallet::asset_units(&rpc, index).await?;
+            let units = wallet::parse_decimal(&amount, decimals)?;
+            anyhow::ensure!(units > 0, "a deposit of zero moves nothing into the account and still pays a fee and a proof");
+            let burn = if index == 0 { Burn::Rand(units) } else { Burn::Asset { index, amount: units } };
+            let action = Action::MultisigDeposit { account: id };
+            let fee = match fee {
+                Some(f) => parse_amount(&f)?,
+                None => gas::fee_floor(&action),
+            };
+            eprintln!("depositing {} into {}-of-{} account {}", memo_display::sanitize(&wallet::display_amount(units, decimals, &symbol)), acct.threshold, acct.signers.len(), hex::encode(id));
+            let (w, path, mut store) = open_wallet(&cli.key)?;
+            let chain_id = rpc.chain_id().await?;
+            let profile = profile_of(&rpc).await?;
+            let s = wallet::submit_multisig(&rpc, &w, &mut store, action, fee, burn, profile, &proving_for(cli.prover, cuda, cli.cpu, &cli.key, &cli.max_prover_fee)?, chain_id, !no_wait)
+                .await;
+            store.save(&path)?;
+            report(&s?, "multisig deposit");
         }
         Cmd::Faucet { address, amount } => {
             let to = match address {
@@ -2861,7 +2994,7 @@ mod tests {
             bundle_gas_limit: Some(gas::gas_max(14, 0, 0)),
             adjust_bps: None,
             proof_window_blocks: None,
-            program_state: None,
+            program_state: None, multisig: None,
         }
     }
 
@@ -2984,6 +3117,39 @@ mod tests {
             let e = format!("{:#}", read_transition_file(&path, pid, &me.address).unwrap_err());
             assert!(e.contains(why), "{bad}: {e}");
         }
+    }
+
+    /// Multisig: `rand multisig create` and `rand multisig deposit` parse with their documented
+    /// flags (spec 2026-10-08 §7) — `--signer` repeatable and required, `--fund-token` taking its
+    /// asset and amount as one pair, every amount kept as typed for the handler to read in its
+    /// asset's units.
+    #[test]
+    fn the_multisig_commands_parse_with_their_documented_flags() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("rand").chain(args.iter().copied())).map(|c| c.cmd);
+        let (k1, k2, salt, id) = ("aa".repeat(8), "bb".repeat(8), "cd".repeat(32), "ef".repeat(32));
+        let Ok(Cmd::Multisig(MultisigCmd::Create { signer, threshold, salt: s, fund, fund_token, fee, no_wait, cuda })) = parse(&[
+            "multisig", "create", "--signer", &k1, "--signer", &k2, "--threshold", "2", "--salt", &salt, "--fund", "5.5", "--fund-token", "rpl1x", "300",
+            "--fee", "0.2", "--no-wait", "--cuda",
+        ]) else {
+            panic!("create parses")
+        };
+        assert_eq!((signer, threshold, s.as_deref(), fund.as_deref()), (vec![k1.clone(), k2.clone()], 2, Some(salt.as_str()), Some("5.5")));
+        assert_eq!((fund_token, fee.as_deref(), no_wait, cuda), (Some(vec!["rpl1x".to_string(), "300".to_string()]), Some("0.2"), true, true));
+        let Ok(Cmd::Multisig(MultisigCmd::Create { salt: None, fund: None, fund_token: None, fee: None, no_wait: false, .. })) =
+            parse(&["multisig", "create", "--signer", &k1, "--threshold", "1"])
+        else {
+            panic!("create parses with only its required flags")
+        };
+        assert!(parse(&["multisig", "create", "--threshold", "1"]).is_err(), "at least one --signer");
+        assert!(parse(&["multisig", "create", "--signer", &k1]).is_err(), "--threshold is required");
+        assert!(parse(&["multisig", "create", "--signer", &k1, "--threshold", "1", "--fund-token", "2"]).is_err(), "--fund-token takes a pair");
+        let Ok(Cmd::Multisig(MultisigCmd::Deposit { account, amount, asset, fee, no_wait, .. })) =
+            parse(&["multisig", "deposit", &id, "12.5", "--asset", "2", "--fee", "0.01", "--no-wait"])
+        else {
+            panic!("deposit parses")
+        };
+        assert_eq!((account.as_str(), amount.as_str(), asset.as_deref(), fee.as_deref(), no_wait), (id.as_str(), "12.5", Some("2"), Some("0.01"), true));
+        assert!(matches!(parse(&["multisig", "deposit", &id, "1"]), Ok(Cmd::Multisig(MultisigCmd::Deposit { asset: None, .. }))));
     }
 
     /// `rand sync` scans from where the store left off; `--rescan` starts the store over first

@@ -192,6 +192,33 @@ pub struct ChainLimits {
     /// node that predates the field, which runs no chain with it.
     #[serde(default)]
     pub program_state: Option<ProgramStateLimits>,
+    /// Multisig (spec 2026-10-08 §7): the genesis `multisig` section's `create_fee` and the two
+    /// bounds a create and a pay are held to; `None` on a chain without the section — where no
+    /// multisig action is admitted — and from a node that predates the field.
+    #[serde(default)]
+    pub multisig: Option<MultisigLimits>,
+}
+
+/// `rand_getLimits.multisig`: what a `CreateMultisig` costs on top of the bundle's base, and the
+/// most signers an account and payouts a pay may carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct MultisigLimits {
+    /// RAND units, a decimal string on the wire like every amount.
+    #[serde(deserialize_with = "u64_string_or_number")]
+    pub create_fee: u64,
+    pub max_signers: usize,
+    pub max_payouts: usize,
+}
+
+/// A multisig account as `rand_getMultisig` reports it: its signers in list order, the threshold,
+/// the nonce its next pay or rotate signs, and its vault as `(asset, amount)` ascending by asset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultisigAccount {
+    pub id: [u8; 32],
+    pub signers: Vec<randprotocol_core::PublicKey>,
+    pub threshold: u8,
+    pub nonce: u64,
+    pub vault: Vec<(u32, u64)>,
 }
 
 /// `rand_getLimits.program_state` (RPL-2): what an invoke is sized and priced by.
@@ -821,6 +848,42 @@ impl RpcClient {
             })
             .collect::<Result<Vec<_>>>()
             .map(Some)
+    }
+
+    /// Multisig account `id` (`rand_getMultisig`), `None` when no account has that id. A chain
+    /// without the `multisig` section is an error, not `None`: there the question has no answer,
+    /// and a wallet about to prove a deposit should say why rather than "unknown account".
+    pub async fn multisig(&self, id: &[u8; 32]) -> Result<Option<MultisigAccount>> {
+        let v = self.call("rand_getMultisig", json!([hex::encode(id)])).await?;
+        if v.is_null() {
+            return Ok(None);
+        }
+        if v["enabled"] == json!(false) {
+            return Err(anyhow!("this chain has no multisig section"));
+        }
+        let got = hex32(v["id"].as_str().context("rand_getMultisig's account has no id")?).context("rand_getMultisig's id is not 32 bytes of hex")?;
+        if &got != id {
+            return Err(anyhow!("rand_getMultisig answered account {} for {}", hex::encode(got), hex::encode(id)));
+        }
+        let signers = v["signers"]
+            .as_array()
+            .context("rand_getMultisig's account has no signers")?
+            .iter()
+            .map(|k| randprotocol_core::PublicKey::from_hex(k.as_str().unwrap_or_default()).map_err(|e| anyhow!("a signer key that does not parse: {e}")))
+            .collect::<Result<Vec<_>>>()?;
+        let threshold = u8::try_from(v["threshold"].as_u64().context("rand_getMultisig's account has no threshold")?).context("threshold")?;
+        let nonce = v["nonce"].as_u64().context("rand_getMultisig's account has no nonce")?;
+        let vault = v["vault"]
+            .as_array()
+            .context("rand_getMultisig's account has no vault")?
+            .iter()
+            .map(|row| {
+                let asset = u32::try_from(row["asset"].as_u64().context("a vault row without its asset")?).context("asset index")?;
+                let amount = amount_field(&row["amount"]).context("a vault row without its amount")?;
+                Ok((asset, amount))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(MultisigAccount { id: got, signers, threshold, nonce, vault }))
     }
 
     /// The chain's limits (`rand_getLimits`), or `None` from a node that predates the method —
@@ -1577,6 +1640,51 @@ mod tests {
         assert!(is_method_not_found(&e), "{e}");
     }
 
+    /// Multisig: `rand_getLimits.multisig` decodes with its fee as a decimal string (`null` and an
+    /// absent key read `None`), and `rand_getMultisig`'s three answers — an account, `null` for an
+    /// unknown id, `{enabled:false}` without the section — read as `Some`, `None` and an error.
+    #[tokio::test]
+    async fn multisig_limits_and_accounts_are_decoded() {
+        use test_rpc::{rpc_fn, Reply};
+        let base = json!({
+            "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+            "max_call_envelope_bytes": 18432, "max_program_public_words": 64,
+        });
+        let with = |m: Value| {
+            let mut v = base.clone();
+            v["multisig"] = m;
+            serde_json::from_value::<ChainLimits>(v).unwrap().multisig
+        };
+        assert_eq!(with(json!({ "create_fee": "5000000", "max_signers": 10, "max_payouts": 4 })), Some(MultisigLimits { create_fee: 5_000_000, max_signers: 10, max_payouts: 4 }));
+        assert_eq!(with(Value::Null), None);
+        assert_eq!(serde_json::from_value::<ChainLimits>(base.clone()).unwrap().multisig, None, "an older node");
+
+        let key = randprotocol_core::Keypair::from_seed([3; 32]).unwrap().public_key().clone();
+        let (known, unknown, off) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let k = key.to_hex();
+        let rpc = RpcClient::new(
+            rpc_fn(move |method, params| {
+                assert_eq!(method, "rand_getMultisig");
+                match params[0].as_str().unwrap() {
+                    id if id == hex::encode(known) => Reply::Ok(json!({
+                        "enabled": true, "id": id, "signers": [k.clone()], "threshold": 1, "nonce": 3,
+                        "vault": [{ "asset": 0, "amount": "700" }, { "asset": 2, "amount": "9" }],
+                    })),
+                    id if id == hex::encode(unknown) => Reply::Ok(Value::Null),
+                    _ => Reply::Ok(json!({ "enabled": false })),
+                }
+            })
+            .await,
+        );
+        assert_eq!(
+            rpc.multisig(&known).await.unwrap(),
+            Some(MultisigAccount { id: known, signers: vec![key], threshold: 1, nonce: 3, vault: vec![(0, 700), (2, 9)] })
+        );
+        assert_eq!(rpc.multisig(&unknown).await.unwrap(), None);
+        let e = rpc.multisig(&off).await.unwrap_err().to_string();
+        assert!(e.contains("no multisig section"), "{e}");
+    }
+
     /// `rand_getLimits`, decoded; `None` from a node that predates it, and an error for anything
     /// else going wrong (never a silent fallback on a real failure).
     #[tokio::test]
@@ -1611,6 +1719,7 @@ mod tests {
                 proof_window_blocks: None,
                 // Nor a program_state section.
                 program_state: None,
+                multisig: None,
             })
         );
         let older = RpcClient::new(scripted_rpc(vec![]).await);
