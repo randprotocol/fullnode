@@ -377,8 +377,8 @@ verifies each QC against the validator set, checks linkage and leader, re-execut
 (proof verification included, exactly as if it had arrived live), persists, and rebuilds its
 consensus replica on the new head. A proposal whose parent is unknown triggers a targeted fetch of
 that one block by hash, or a full batch sync if the node has fallen more than two blocks behind.
-The sync enums carry a third and fourth shape for compact blocks: `SyncRequest::Transactions`
-asks for transaction bodies by hash (at most 512 a request) and the response carries the ones
+The sync enums gain `SyncRequest::Transactions` and `SyncResponse::Transactions` for compact
+blocks: the request asks for transaction bodies by hash (at most 512 a request) and the response carries the ones
 the peer holds.
 
 **Proposals on the wire.** A leader publishes a proposal as `GossipMessage::CompactProposal`

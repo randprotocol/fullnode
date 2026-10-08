@@ -202,7 +202,8 @@ found, so a peer missing some lets the client move to the next peer for the rest
 ## 7. Roll-out
 
 Flag day. An old node receiving `CompactProposal` cannot decode it and reports `Reject`, so it
-never votes on a new leader's proposal; a new node receiving an old leader's full `Proposal`
+never votes on or relays a new leader's proposal (the node configures no gossipsub peer scoring,
+so a Reject only drops the message; old nodes between new ones are relay holes); a new node receiving an old leader's full `Proposal`
 handles it as today. The fleet is therefore rolled in one pass, validators last, exactly as
 v0.7.0 was rolled; during the pass the chain keeps liveness while more than two thirds of the
 stake runs the same format, so the roll order is: observers and archives first, then the

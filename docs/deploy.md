@@ -263,14 +263,42 @@ roll at that node instead of at the next one that fills.
 ## The compact-blocks flag day
 
 The compact-blocks release changes the consensus-topic wire format and is not backward
-compatible: an old node cannot decode `GossipMessage::CompactProposal` (it reports `Reject`) or
-the new `SyncRequest::Transactions` variants, and a new leader publishes only the compact form.
-While more than a third of the stake still runs the old build, the new leaders' proposals are
-not voted by the old nodes and the chain stalls on those views. So roll the fleet in one pass:
-observers and archives first (they vote on nothing, so they cost no liveness and are ready to
-serve), then all validators together, quickly, rather than staggered as in step 3 above. A new
-node still accepts an old leader's full proposal, so the order within the validators does not
-matter once they go together. There is no genesis field and no chain cut.
+compatible: an old node cannot decode `GossipMessage::CompactProposal` or the new
+`SyncRequest::Transactions` / `SyncResponse::Transactions` variants, and a new leader publishes
+only the compact form. A new node still accepts an old leader's full proposal.
+
+**What an old node does with a compact proposal.** It reports the undecodable message to
+gossipsub as `Reject` (`network/mod.rs` ~884-891, "this peer's fault"), so it neither votes on it
+nor relays it. This node configures no gossipsub peer scoring: the gossipsub construction at
+`network/mod.rs:539-555` sets none and nothing in `network/` mentions `with_peer_score`, peer
+score parameters, thresholds or a graylist. So a Reject only drops the message at that node and
+does not forward it; it does not penalise the forwarding peer or prune a mesh. The effect is
+that old nodes between new nodes are relay holes for compact proposals, while the new-to-new
+mesh is unaffected. Restarting a node onto the new build is the whole cure.
+
+**Roll order and why.** Observers and archives first: they relay consensus gossip and serve
+fetches, and while old they would drop (and Reject) compact proposals; rolling them early costs
+nothing, because a new node still accepts full proposals from old leaders. Then all validators
+together and quickly, not staggered as in step 3 above: while more than a third of the stake runs
+the old build, views led by a new leader time out (the old nodes do not vote its proposal),
+though the chain still advances on the old leaders' views, so a long mixed window is a slow
+chain, not a stopped one. There is no genesis field and no chain cut.
+
+**Procedure.** Observers and archives with `deploy/update-droplet.sh` (one at a time). For the
+validators, `deploy/roll-all.sh <rand-node> <rand> <sha256 of rand-node> [<sha256 of rand>]`
+(with `RELEASE_SUMS` and `RELEASE_SIG`, or `ALLOW_UNSIGNED=1`): it installs the signed binaries
+on every host in `deploy/nodes.env` with no restart, then stops every node together and starts
+every node together, node A last, each stop and start run in parallel over ssh. It is an
+all-stop all-start, not a sequential roll: the chain commits nothing for the startup verify (its
+header comment says about 15 minutes) whatever the fleet size, so it trades a short mixed window
+for a full stop. It has no observers-first mode; run `update-droplet.sh` on those beforehand. If
+a staggered roll is preferred instead, restart the validators in parallel batches by hand rather
+than one at a time, since each node on the old build while a third of the stake is old costs the
+new leaders' views.
+
+**Rollback.** Reverting to the old build is safe: the old build rejects only compact proposals,
+and a new leader's view that nobody votes simply times out. `roll-all.sh` keeps the previous
+binary as `/root/rand-node.prev` on each host.
 
 ## Release trust
 

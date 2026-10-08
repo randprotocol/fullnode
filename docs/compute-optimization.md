@@ -181,7 +181,7 @@ pool and recent-transactions cache, fetching by hash only what it lacks. Measure
 `docs/node-hardware.md` §8): at four validators the largest compact frame was 15 708 bytes
 carrying 13 transactions, against 168 096 bytes of bodies on the transaction topic for the 32
 mints; at 26 justify votes a compact frame is 102 416 bytes with no hashes and 166 416 bytes at
-2 000 hashes, where a chain-20 full proposal is up to the 20 MiB cap; a late validator fetched
+2 000 hashes, where a chain-20 full proposal is up to the 20 MiB cap (quoted from §1.1); a late validator fetched
 8 of 8 bodies it never saw. The design as first written follows.
 
 Aggregators gossip their aggregate and its covered records before any leader includes them, so
