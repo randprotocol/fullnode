@@ -145,7 +145,6 @@ impl Account {
         Hash::digest_domain(b"rand-multisig-leaf-1", &b)
     }
 
-    #[allow(dead_code)] // used from Task 3/4
     pub(super) fn set_balance(&mut self, asset: u32, amount: u64) {
         if amount == 0 {
             self.vault.remove(&asset);
@@ -294,8 +293,9 @@ mod tests {
         let mut swapped = a.clone(); swapped.signers.swap(0, 1);
         assert_ne!(base, swapped.id(20), "signer order");
         assert_eq!(base, account_id(20, &a.salt, a.threshold, &a.signers));
-        // Pinned so the CLI's `multisig id` and the ledger never drift apart.
-        assert_eq!(hex::encode(base), hex::encode(account_id(20, &[7; 32], 2, &a.signers)));
+        // Known-answer vector. A consensus encoding: the CLI's `multisig id` and every node must
+        // reproduce these bytes exactly.
+        assert_eq!(hex::encode(account_id(20, &[7; 32], 2, &[key(1), key(2), key(3)])), "fedc03921236f89e18ffe73a692892e18fb1d7198db3d19e2d9ce31828f4da7c");
     }
 
     #[test]
@@ -317,6 +317,12 @@ mod tests {
         let mut r = reg.clone();
         r.get_mut(&id).unwrap().set_balance(0, 0);
         assert!(r.get(&id).unwrap().vault.is_empty(), "a zero row is removed, so absent has one encoding");
+        // Known-answer vector for the register root: a consensus encoding every node must reproduce.
+        assert_eq!(hex::encode(reg.root().as_bytes()), "d143907c34caa45ea340472dc5a51ef9c45422b2a80e2837743eb6005dff4fb9");
+        let mut full = reg.clone();
+        full.issued = 100; full.rand_in = 50; full.rand_out = 30; full.base_out = 5;
+        assert_eq!(full.rand_held(), 100 + 50 - 30 - 5);
+        m(&|r| r.rand_out = 1);
         assert_eq!(MultisigRegister::default().root(), MultisigRegister::from_config(&MultisigConfig::default(), 20).root());
     }
 
@@ -329,11 +335,14 @@ mod tests {
         assert_ne!(p, multisig_pay_message(&g, 20, &[8; 32], 0, 7, &pays));
         assert_ne!(p, multisig_pay_message(&g, 20, &[9; 32], 1, 7, &pays));
         assert_ne!(p, multisig_pay_message(&g, 20, &[9; 32], 0, 8, &pays));
+        let g2 = Hash::digest_domain(b"t", b"g2");
+        assert_ne!(p, multisig_pay_message(&g2, 20, &[9; 32], 0, 7, &pays), "genesis");
         let mut other = pays.clone(); other[0].amount = 6;
         assert_ne!(p, multisig_pay_message(&g, 20, &[9; 32], 0, 7, &other));
         let r = multisig_rotate_message(&g, 20, &[9; 32], 0, &[key(1)], 1);
         assert_ne!(r, multisig_rotate_message(&g, 20, &[9; 32], 0, &[key(2)], 1));
         assert_ne!(r, multisig_rotate_message(&g, 20, &[9; 32], 0, &[key(1), key(2)], 1));
         assert_ne!(r, multisig_rotate_message(&g, 20, &[9; 32], 0, &[key(1)], 2));
+        assert_ne!(r, multisig_rotate_message(&g2, 20, &[9; 32], 0, &[key(1)], 1), "genesis");
     }
 }
