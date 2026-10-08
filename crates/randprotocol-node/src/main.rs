@@ -1590,7 +1590,8 @@ enum PayCmd {
     /// Write the payment every signer signs: the account, its nonce, the head height as the
     /// notes' `time`, and each payout's note sealed to its recipient. Needs no key. The account
     /// also pays the bundle base in RAND out of its vault. The signatures must be gathered and
-    /// submitted within the chain's time window (256 blocks) — prepare again if that passes.
+    /// submitted within the chain's time window (256 blocks unless the genesis sets
+    /// `proof_window_blocks`; `prepare` prints it) — prepare again if that passes.
     Prepare {
         /// The account id, 64 hex characters.
         #[arg(long)]
@@ -1599,7 +1600,8 @@ enum PayCmd {
         /// (and `--asset`, when given).
         #[arg(long = "to", required = true, value_name = "RAND1_ADDRESS")]
         to: Vec<String>,
-        /// The payout's amount, in whole units with decimals (as every amount: `1.5` is 1.5 RAND); one per `--to`.
+        /// The payout's amount in its asset's display units, one per `--to`: RAND at nine decimals
+        /// (`1.5` is 1.5 RAND), a token at its registry row's own `decimals`, read from the node.
         #[arg(long = "amount", required = true)]
         amount: Vec<String>,
         /// The payout's asset (0 is RAND). Omitted: every payout is RAND; given, once per `--to`.
@@ -1697,6 +1699,41 @@ struct PayoutText {
     r: String,
     /// `bincode(Envelope)`, hex.
     envelope: String,
+    /// The asset's display decimals and symbol, the node's word at `prepare` — so the offline
+    /// `sign` shows a token payout in the token's own units. Not signed: `amount` (units) is what
+    /// the chain checks, and the shown line carries the units too, so a wrong figure here is
+    /// visible next to the right one. Absent in a file written before the fields existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decimals: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    symbol: Option<String>,
+}
+
+impl PayoutText {
+    /// The amount as `prepare` and `sign` show it: `500.000000 zUSD (500000000 units)` at the
+    /// recorded decimals; RAND at its nine whatever the file says; a token without recorded
+    /// decimals in units only, never at RAND's scale.
+    fn shown(&self) -> String {
+        let units: u64 = match self.amount.parse() {
+            Ok(u) => u,
+            Err(_) => return format!("{} (not an amount in units) of asset {}", self.amount, self.asset),
+        };
+        match (self.asset, self.decimals, &self.symbol) {
+            (0, _, _) => wallet::display_amount(units, 9, "RAND"),
+            (_, Some(d), Some(sym)) => wallet::display_amount(units, d, &randprotocol_client::memo_display::sanitize(sym)),
+            (asset, _, _) => format!("{units} units of asset {asset} (no decimals recorded)"),
+        }
+    }
+}
+
+/// A `--amount` in its asset's display units: RAND through [`parse_amount`] (nine decimals), a
+/// token at its registry row's `decimals`.
+fn payout_units(text: &str, asset: u32, decimals: u8) -> Result<u64> {
+    if asset == 0 {
+        Ok(parse_amount(text)?)
+    } else {
+        wallet::parse_decimal(text, decimals)
+    }
 }
 
 /// A prepared payment (`rand-node multisig pay prepare`): every field of the message the signers
@@ -1757,6 +1794,8 @@ impl PayProposal {
                 to: to.to_string(),
                 r: word8_to_hex(&note.r),
                 envelope: hex::encode(bincode::serialize(&envelope).context("encoding the envelope")?),
+                decimals: (*asset == 0).then_some(9),
+                symbol: (*asset == 0).then(|| "RAND".to_string()),
             });
         }
         Ok(PayProposal {
@@ -1774,6 +1813,16 @@ impl PayProposal {
     fn read(path: &std::path::Path) -> Result<PayProposal> {
         serde_json::from_str(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?)
             .with_context(|| format!("{} is not a prepared multisig payment", path.display()))
+    }
+
+    /// Record each token payout's display decimals and symbol (`asset → (decimals, symbol)`,
+    /// [`wallet::asset_units`]); RAND keeps its nine.
+    fn set_units(&mut self, units: &std::collections::BTreeMap<u32, (u8, String)>) -> Result<()> {
+        for p in self.pays.iter_mut().filter(|p| p.asset != 0) {
+            let (d, sym) = units.get(&p.asset).with_context(|| format!("no decimals resolved for asset {}", p.asset))?;
+            (p.decimals, p.symbol) = (Some(*d), Some(sym.clone()));
+        }
+        Ok(())
     }
 
     fn parts(&self) -> Result<PayParts> {
@@ -2019,13 +2068,26 @@ async fn multisig_cmd(cmd: MultisigCmd) -> Result<()> {
                 anyhow::ensure!(!out.exists(), "{} exists: a prepared payment is never overwritten", out.display());
                 anyhow::ensure!(to.len() == amount.len(), "{} --to and {} --amount: one amount per recipient", to.len(), amount.len());
                 anyhow::ensure!(asset.is_empty() || asset.len() == to.len(), "{} --asset for {} --to: give it once per recipient, or not at all for RAND", asset.len(), to.len());
+                let rpc = RpcClient::new(rpc);
+                // Each asset's display decimals and symbol: an amount is typed in its asset's own
+                // units (a 6-decimal token's `500` is 500 000 000 units, not RAND's 500·10^9).
+                let mut units: std::collections::BTreeMap<u32, (u8, String)> = [(0, (9, "RAND".to_string()))].into();
+                for a in &asset {
+                    if !units.contains_key(a) {
+                        units.insert(*a, wallet::asset_units(&rpc, *a).await.with_context(|| format!("resolving asset {a}'s decimals"))?);
+                    }
+                }
                 let mut payouts = Vec::with_capacity(to.len());
                 for (i, (t, a)) in to.iter().zip(&amount).enumerate() {
                     let addr = ShieldedAddress::parse(t).map_err(|e| anyhow::anyhow!("{t} is not a shielded address: {e}"))?;
-                    payouts.push((addr, parse_amount(a)?, asset.get(i).copied().unwrap_or(0)));
+                    let asset = asset.get(i).copied().unwrap_or(0);
+                    payouts.push((addr, payout_units(a, asset, units[&asset].0)?, asset));
                 }
+                let shown = |asset: u32, n: u64| {
+                    let (d, sym) = &units[&asset];
+                    wallet::display_amount(n, *d, &randprotocol_client::memo_display::sanitize(sym))
+                };
                 let id = parse_multisig_account(&account)?;
-                let rpc = RpcClient::new(rpc);
                 let now = multisig_account(&rpc, &id).await?;
                 // The vault rows the chain will check (spec §5): RAND covers the base and every
                 // RAND payout, each token row its own payouts. Refused here rather than after
@@ -2045,8 +2107,8 @@ async fn multisig_cmd(cmd: MultisigCmd) -> Result<()> {
                     anyhow::ensure!(
                         have(*asset) >= *want,
                         "account {account} holds {} of asset {asset}, the payment needs {} (the RAND row also pays the {} RAND bundle base)",
-                        format_amount(have(*asset)),
-                        format_amount(*want),
+                        shown(*asset, have(*asset)),
+                        shown(*asset, *want),
                         format_amount(randprotocol_core::gas::BUNDLE_BASE)
                     );
                 }
@@ -2055,14 +2117,25 @@ async fn multisig_cmd(cmd: MultisigCmd) -> Result<()> {
                 let genesis = rpc.genesis_hash().await?;
                 let time = rpc.head().await?["height"].as_u64().context("head has no height")? as u32;
                 let mut proposal = PayProposal::new(chain_id, &genesis, &id, nonce, time, &payouts, envelope_format(&rpc, chain_id).await?)?;
+                proposal.set_units(&units)?;
                 (proposal.signers, proposal.threshold) = multisig_signers(&now);
+                // The note time's window: genesis `proof_window_blocks` where the chain sets it
+                // (held to the bounds a genesis can carry), else TIME_WINDOW.
+                let window = rpc
+                    .limits()
+                    .await?
+                    .and_then(|l| l.proof_window_blocks)
+                    .map(|w| w.clamp(randprotocol_core::ledger::MIN_PROOF_WINDOW_BLOCKS, randprotocol_core::ledger::MAX_PROOF_WINDOW_BLOCKS))
+                    .unwrap_or(randprotocol_core::ledger::TIME_WINDOW);
                 std::fs::write(&out, serde_json::to_string_pretty(&proposal)?).with_context(|| format!("writing {}", out.display()))?;
-                let lines: Vec<String> = payouts
+                let lines: Vec<String> = proposal
+                    .pays
                     .iter()
-                    .map(|(t, a, asset)| format!("  {} of asset {asset} to {} (fingerprint {})", format_amount(*a), t, t.fingerprint()))
+                    .zip(&payouts)
+                    .map(|(p, (t, _, asset))| format!("  {} of asset {asset} to {} (fingerprint {})", p.shown(), t, t.fingerprint()))
                     .collect();
                 println!(
-                    "prepared a payment from account {account}: {} payout(s), the {} RAND base from its RAND row\n{}\n  written to {}: {} of {} signers sign it (`multisig pay sign`), then `multisig pay submit`, within 256 blocks of height {time}",
+                    "prepared a payment from account {account}: {} payout(s), the {} RAND base from its RAND row\n{}\n  written to {}: {} of {} signers sign it (`multisig pay sign`), then `multisig pay submit`, within {window} blocks of height {time}",
                     payouts.len(),
                     format_amount(randprotocol_core::gas::BUNDLE_BASE),
                     lines.join("\n"),
@@ -2080,10 +2153,10 @@ async fn multisig_cmd(cmd: MultisigCmd) -> Result<()> {
                     "signing a payment from multisig account {} on chain {} (genesis {}):\n  nonce {}, note time {}",
                     proposal.account, p.chain_id, proposal.genesis, p.nonce, p.time
                 );
-                for pay in &p.pays {
+                for (pay, text) in p.pays.iter().zip(&proposal.pays) {
                     eprintln!(
                         "  {} of asset {} to {} (fingerprint {})",
-                        format_amount(pay.amount),
+                        text.shown(),
                         pay.asset,
                         pay.recipient,
                         pay.recipient.fingerprint()
@@ -5375,6 +5448,32 @@ mod tests {
         let id = account.id(ledger.chain_id());
         ledger.set_multisig(Some(MultisigRegister::from_config(&MultisigConfig { create_fee: 0, accounts: vec![account] }, ledger.chain_id())));
         (ledger, id, signers)
+    }
+
+    /// A token payout is typed and shown in the token's own decimals, not RAND's nine: `500` of a
+    /// 6-decimal token is 500 000 000 units, and the proposal file carries the decimals and the
+    /// symbol so the offline `sign` shows the same figure. A file without them (or a RAND payout)
+    /// still reads unambiguously.
+    #[test]
+    fn a_token_payout_is_parsed_and_shown_in_the_tokens_own_decimals() {
+        let units = payout_units("500", 7, 6).unwrap();
+        assert_eq!(units, 500_000_000);
+        assert!(payout_units("1.0000001", 7, 6).is_err(), "more digits than the token carries");
+        assert_eq!(payout_units("2", 0, 6).unwrap(), 2 * UNITS_PER_RAND, "RAND is always nine decimals");
+        let to = randprotocol_zkvm::address::address_of(&SpendKey([9; 8]).viewing_key());
+        let mut p = PayProposal::new(1, &randprotocol_core::Hash([1; 32]), &[2; 32], 0, 0, &[(to.clone(), units, 7), (to, UNITS_PER_RAND, 0)], EnvelopeFormat::Legacy).unwrap();
+        p.set_units(&[(7, (6, "zUSD".to_string()))].into()).unwrap();
+        let p: PayProposal = serde_json::from_str(&serde_json::to_string_pretty(&p).unwrap()).unwrap();
+        assert_eq!(p.pays[0].shown(), "500.000000 zUSD (500000000 units)");
+        assert_eq!(p.pays[1].shown(), "1.000000000 RAND (1000000000 units)");
+        // A file written before the fields existed: RAND is still RAND, a token is shown in units.
+        let mut old = p.clone();
+        for pay in &mut old.pays {
+            (pay.decimals, pay.symbol) = (None, None);
+        }
+        let old: PayProposal = serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        assert_eq!(old.pays[0].shown(), "500000000 units of asset 7 (no decimals recorded)");
+        assert_eq!(old.pays[1].shown(), "1.000000000 RAND (1000000000 units)");
     }
 
     /// Multisig (spec §7): `multisig pay prepare` → `sign` (per signer) → `submit` builds the
