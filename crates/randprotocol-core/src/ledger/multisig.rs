@@ -42,7 +42,7 @@ pub struct MultisigAccountConfig {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MultisigConfig {
-    /// Extra fee a `CreateMultisig` pays on top of the bundle base, burned.
+    /// Extra fee a `CreateMultisig` pays on top of the bundle base; paid to the proposer with the rest of the bundle's fee (not burned).
     #[serde(default, with = "crate::ledger::staking::amount_string")]
     pub create_fee: u64,
     #[serde(default)]

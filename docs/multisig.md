@@ -17,7 +17,7 @@ that one key controls is a treasury one stolen laptop empties.
 
 The chain already solves this twice with a public register instead of a note: the validator
 register and the vesting register, whose revoke (`docs/vesting.md`) is authorised by a threshold of
-positional Dilithium2 keys. A **multisig account** is the third such register: a public, per-asset
+positional Dilithium2 keys. A **multisig account** is the fourth such register (validators, vesting, program vaults, multisig): a public, per-asset
 balance whose spending authority is `threshold` of `n` Dilithium2 keys.
 
 ```
@@ -148,7 +148,8 @@ A payment is three steps — the keys never have to be on one machine:
 ```bash
 # 1. anyone (no key): write the payment down; each --to pairs with an --amount (and an --asset)
 rand-node multisig pay prepare --account <id> --to rand1… --amount 250000 --out pay.json --rpc https://…
-#    several payouts (at most 4): repeat the pair; tokens: one --asset N per payout
+#    several payouts (at most 4): repeat the pair; --asset is all or nothing: omit it (every payout
+#    is RAND) or give one --asset N per --to, in order (a count that differs is refused)
 rand-node multisig pay prepare --account <id> --to rand1… --amount 10 --asset 0 \
                                                 --to rand1… --amount 500 --asset 2 --out pay.json
 # 2. each signer, on its own machine (offline is fine): read it, sign it

@@ -268,7 +268,7 @@ Multisig accounts (`docs/multisig.md`) — the signers' side, on a chain whose g
 |---|---|---|
 | `multisig id` | `--chain-id`, `--salt <64 hex>`, `--threshold`, `--signer <pubkey hex>` (repeat, in order) | derive an account id offline, refusing a set the chain would |
 | `multisig status <id>` | `--rpc` | the account as `rand_getMultisig` serves it |
-| `multisig pay prepare` | `--account <id>`, `--to <rand1…>` (repeat), `--amount <RAND>` (one per `--to`), `--asset <N>` (omitted: all RAND; given: one per `--to`), `--out` (`pay.json`), `--rpc` | no key: write the payment every signer signs — each payout's note sealed to its recipient, the account's nonce, the head height as `time`; the account also pays the 0.001 RAND base from its RAND row |
+| `multisig pay prepare` | `--account <id>`, `--to <rand1…>` (repeat), `--amount <RAND>` (one per `--to`), `--asset <N>` (omitted: every payout is RAND; otherwise exactly one per `--to`, else refused), `--out` (`pay.json`), `--rpc` | no key: write the payment every signer signs — each payout's note sealed to its recipient, the account's nonce, the head height as `time`; the account also pays the 0.001 RAND base from its RAND row |
 | `multisig pay sign` | `--proposal <file>`, `--key`, `--index`? | one signer key, offline: print `<index>:<signature hex>`; what is signed goes to stderr |
 | `multisig pay submit` | `--proposal <file>`, `--signature <index:hex>` (repeat), `--rpc`, `--no-wait` | send the payment with at least the account's `threshold` of signatures, within 256 blocks of `prepare` |
 | `multisig rotate prepare` | `--account <id>`, `--signer <pubkey hex>` (repeat, the new order), `--threshold`, `--out` (`rotate.json`), `--rpc` | no key: write the new signer set every current signer signs |

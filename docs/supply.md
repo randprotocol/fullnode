@@ -129,7 +129,7 @@ in a fourth public register. Like the vesting rows, its counters are kept off th
 | `multisig_base_out` | the 0.001 RAND bases a payment paid into proposers' `rewards` | register to register, not a crossing |
 | `multisig_rand_held` | `issued + rand_in − rand_out − base_out` | the register's half of `total_supply` |
 
-So `pool_value` gains `rand_out`, `register_total` gains `rand_held` and `issued` gains
+So `pool_value` gains `rand_out`, `total_supply` gains `multisig_rand_held` as its own term and `issued` gains
 `multisig_issued`; the identity `total_supply == issued` still holds. A payment of 100 RAND
 takes 100.001 out of the account: a 100 note into the pool and the 0.001 base into a proposer's
 `rewards` (a Withdraw's shape, with the account paying the base). A `create_fee` goes to the

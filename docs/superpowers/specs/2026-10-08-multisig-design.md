@@ -198,7 +198,7 @@ Kept off the positional `Supply` blob, as the vesting and program-vault rows are
 | `multisig_base_out` | the bases Pay paid into proposers' `rewards` | register → register, not a crossing |
 | `multisig_rand_held` | `issued + rand_in − rand_out − base_out` | the register's half of `total_supply` |
 
-`pool_value` gains `rand_out`; `register_total` gains `rand_held`; `issued` gains `multisig_issued`.
+`pool_value` gains `rand_out`; `total_supply` gains `multisig_rand_held` as its own term; `issued` gains `multisig_issued`.
 Tokens in a vault leave the token's `total_supply` untouched, as in a program vault. `rand-node
 verify` replays the four counters and reports a snapshot that disagrees.
 
