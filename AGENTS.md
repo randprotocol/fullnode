@@ -6,6 +6,24 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-10-02)
 
+### The proposer/aggregator split (2026-10-08; branch `fix/fee-split`, NOT pushed; genesis-gated, on no chain)
+
+`docs/compute-optimization.md` §6.2–§6.3 as two optional `FeesConfig` fields, aggregating chains
+only (genesis refuses either without `aggregation`; share > 10000 refused): `proposer_share_bps`
+— the proposer keeps `kept_base − ⌊kept_base·(10000−bps)/10000⌋` of the base it keeps today
+(`BUNDLE_BASE`, 0 under `burn_base`); the aggregator's part rides in the bundle's one bucket entry
+(`BundleFeeSplit::base_bucketed`), paid by a cover, swept back to the proposer on expiry.
+`prove_base` — `Ledger::settled_floor` = `burnable_floor + prove_base`; the pre-verify, invoke and
+registration floors add it; bucketed whole (it is above `bucket_floor`), never burned (`fee_burn`
+burns `min(fee, burnable_floor)`, debug-asserted). `Ledger::prove_base()` is 0 off an aggregating
+chain. Hash: `proposer_share_bps` ‖ be32, `prove_base` ‖ be64, each when `Some`, after
+`burn_floor`. RPC `fee_rules` gains both (null when unset; `prove_base` a decimal string; every
+existing `fee_rules` object now carries the two nulls — rpc_contract updated); `rand_estimateFee`
+adds `prove_base`; client `ChainLimits.prove_base`, `RpcClient::prove_base`,
+`wallet::schedule_floor` for the CLI defaults. Recommended 4000 / 600000 once aggregation is
+admitted (`docs/deploy.md`). Trap: a test fixture that registers an aggregator at `BUNDLE_BASE`
+must do so before installing `prove_base`.
+
 ### Fee feedback — a burned base and a fee-first subsidy (2026-10-05; branch `feat/fee-feedback`, PUSHED, NOT merged; genesis-gated, on no chain)
 
 **2026-10-06, issues #131–#135 closed on this branch** (each a `fix/*` branch, reviewed, merged

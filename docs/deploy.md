@@ -1391,6 +1391,27 @@ grows by `BUNDLE_BASE` per included bundle with `invariant_holds` still `true` �
 `fee_rules.burn_floor == true`, by each bundle's whole floor (`docs/fees.md` §1.3's worked Deploy
 and Call).
 
+## The next cut: the proposer/aggregator split (`fees.proposer_share_bps`, `fees.prove_base`; unreleased)
+
+**What it is.** Two optional numbers in the same `fees` section (`docs/fees.md` §1.3,
+`docs/compute-optimization.md` §6.2–§6.3), each only on a chain with an `aggregation` section
+(`rand-node init` refuses either without one: `ProposerShareWithoutAggregation`,
+`ProveBaseWithoutAggregation`; a share over 10000 is `ProposerShareOutOfRange`).
+`proposer_share_bps` keeps that share of the base to the proposer at inclusion and buckets the rest
+beside the excess as proving share (swept back to the proposer if no aggregate covers it);
+`prove_base` raises every bundle's floor by a proving share bucketed whole and never burned. Each is
+hashed only when set, after `burn_floor`'s bytes (`proposer_share_bps` ‖ be32, `prove_base` ‖ be64),
+so it ships with a chain cut. Served as `rand_getLimits.fee_rules.proposer_share_bps` and
+`.prove_base`; `rand_estimateFee` includes `prove_base`.
+
+**Recommended values, deferred.** `"proposer_share_bps": 4000, "prove_base": 600000` (40 % of the
+base to the proposer, 0.0006 RAND proving floor) — the proposal's numbers — once aggregation is
+admitted on the chain being cut. Until then no cut should carry either: both need the `aggregation`
+section, which waits on the production-proof measurement (`docs/aggregation.md`, "Before enabling
+aggregation"). After launch: `fee_rules` serves both, `rand_estimateFee {"kind":"bundle"}` answers
+`1600000`, a proposer's `rewards` grow by 400 000 per included transfer, and `invariant_holds`
+stays `true` through covers and sweeps.
+
 ## The next cut: audit v6's staking fields (STAKE-2)
 
 Audit v6 (2026-09-30) §8.5. Each is optional, absent from every genesis through chain 18, and

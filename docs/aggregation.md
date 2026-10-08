@@ -64,6 +64,14 @@ Under `fees.burn_floor` beside it (issue #135) the whole floor is destroyed inst
 per-word term and a Call's tier-exact gas and byte terms with the base — and the proving share is
 `fee − floor`, so an aggregator is never paid a priced term the chain burned.
 
+Under the genesis `fees.proposer_share_bps` (`docs/fees.md` §1.3, `docs/compute-optimization.md`
+§6.2; aggregating chains only) the base itself splits: the proposer keeps `proposer_share_bps /
+10 000` of the base it keeps today (`BUNDLE_BASE`, nothing under `burn_base`) and the remainder
+joins the proving share in the bundle's one bucket entry — covered, it pays the aggregator; expired,
+the sweep returns it to the proposer like any excess. Under `fees.prove_base` (§6.3) every bundle's
+floor rises by `prove_base`, which is bucketed whole and never burned. At 4 000 bps and 0.0006 RAND
+a 0.0018 RAND transfer pays the proposer 0.0004 at inclusion and buckets 0.0014.
+
 ### 3.2 A block subsidy in new RAND
 
 At launch fee volume is near zero and nobody runs a GPU for it. So the sealing block mints a
@@ -116,6 +124,13 @@ so one read per daemon, never one per pass that a transient RPC failure could ab
 `aggregation::minted_subsidy(subsidy(n), shares, &fees) + shares`, the ledger's own function
 (pinned by `the_aggregate_pass_seals_the_ledgers_payout_under_subsidy_net_of_fees`). A third-party
 aggregator must do the same.
+
+The shares are always the node's bucket entries, `rand_getUnsealed`'s `excess` — never recomputed
+from a raw transaction. Under `fees.proposer_share_bps` and `fees.prove_base` an entry already
+carries the aggregator's part of the base and `prove_base` beside the tip, so nothing in what the
+daemon seals changes (pinned by `the_aggregate_pass_seals_shares_that_include_prove_base_and_the_base_part`);
+a share re-derived as `fee − BUNDLE_BASE` would miss the base part and seal a note the ledger never
+appends.
 
 ### 3.4 Supply accounting
 
@@ -295,6 +310,9 @@ chain never depends on a GPU being online.
 
 - The subsidy amount, the halving interval, and whether issuance has a hard cap.
 - The proving share: a fixed fraction of the bundle fee, or the whole fee above the floor.
+  *Built, genesis-gated:* `fees.proposer_share_bps` buckets a fraction of the base beside the
+  whole excess, and `fees.prove_base` floors it (`docs/fees.md` §1.3; the proposal's values are
+  4 000 bps and 0.0006 RAND).
 - The sealing window `k`: how many blocks an aggregate may lag, and whether a bundle can be
   covered twice (it should not; the first finalised aggregate wins, later ones covering it are
   invalid).
