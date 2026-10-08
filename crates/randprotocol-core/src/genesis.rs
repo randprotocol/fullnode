@@ -832,16 +832,13 @@ fn fees_commit(f: &crate::ledger::fees::FeesConfig) -> Vec<u8> {
         commit.extend_from_slice(&units.to_be_bytes());
     }
     // The dollar-indexed subsidy, only when set, after `prove_base` so every older field keeps
-    // its bytes: the three required numbers, then the initial price under its own tag if set.
+    // its bytes: the four numbers, big-endian, in declaration order.
     if let Some(u) = &f.usd_subsidy {
         commit.extend_from_slice(b"usd_subsidy");
         commit.extend_from_slice(&u.usd_micros_per_sealed_block.to_be_bytes());
         commit.extend_from_slice(&u.max_subsidy_per_block.to_be_bytes());
         commit.extend_from_slice(&u.price_max_age_blocks.to_be_bytes());
-        if let Some(price) = u.initial_price_micros {
-            commit.extend_from_slice(b"initial_price");
-            commit.extend_from_slice(&price.to_be_bytes());
-        }
+        commit.extend_from_slice(&u.initial_price_micros.to_be_bytes());
     }
     commit
 }
@@ -1151,13 +1148,11 @@ impl Genesis {
                     ("usd_micros_per_sealed_block", u.usd_micros_per_sealed_block),
                     ("max_subsidy_per_block", u.max_subsidy_per_block),
                     ("price_max_age_blocks", u.price_max_age_blocks),
+                    ("initial_price_micros", u.initial_price_micros),
                 ] {
                     if value == 0 {
                         return Err(GenesisError::UsdSubsidyZero(name));
                     }
-                }
-                if u.initial_price_micros == Some(0) {
-                    return Err(GenesisError::UsdSubsidyZero("initial_price_micros"));
                 }
             }
         }
@@ -1289,7 +1284,7 @@ impl Genesis {
         ledger.set_fees(self.fees.clone().unwrap_or_default());
         // The dollar-indexed subsidy's starting price, when the file gives one: set at height 0
         // with nonce 0, so the first `SetRandPrice` carries nonce 1 either way.
-        if let Some(price) = self.fees.as_ref().and_then(|f| f.usd_subsidy.as_ref()).and_then(|u| u.initial_price_micros) {
+        if let Some(price) = self.fees.as_ref().and_then(|f| f.usd_subsidy.as_ref()).map(|u| u.initial_price_micros) {
             ledger.set_rand_price(Some(crate::ledger::rand_price::RandPrice { price_micros_per_rand: price, set_at_height: 0, nonce: 0 }));
         }
         ledger.set_staking(self.staking.clone());
@@ -3102,13 +3097,13 @@ mod tests {
     }
 
     /// The dollar-indexed subsidy (`docs/fees.md` §1.3): round-trips through the file as written,
-    /// reaches the ledger, seeds the ledger's price from `initial_price_micros` at height 0 /
-    /// nonce 0, and leaves no price without one.
+    /// reaches the ledger and seeds the ledger's price from the required `initial_price_micros` at
+    /// height 0 / nonce 0; a section missing the price is refused at parse.
     #[test]
     fn the_usd_subsidy_round_trips_and_seeds_the_initial_price() {
         use crate::ledger::fees::{FeesConfig, UsdSubsidy};
         use crate::ledger::rand_price::RandPrice;
-        let usd = UsdSubsidy { usd_micros_per_sealed_block: 4_791, max_subsidy_per_block: 300_000_000, price_max_age_blocks: 72_000, initial_price_micros: Some(150_000) };
+        let usd = UsdSubsidy { usd_micros_per_sealed_block: 4_791, max_subsidy_per_block: 300_000_000, price_max_age_blocks: 72_000, initial_price_micros: 150_000 };
         let mut on = aggregating_genesis();
         on.fees = Some(FeesConfig { usd_subsidy: Some(usd.clone()), ..FeesConfig::default() });
         let json = on.to_json();
@@ -3118,38 +3113,34 @@ mod tests {
         let gs = build(&back);
         assert_eq!(gs.ledger.fees().usd_subsidy(), Some(&usd));
         assert_eq!(gs.ledger.rand_price(), Some(&RandPrice { price_micros_per_rand: 150_000, set_at_height: 0, nonce: 0 }));
-
-        let mut bare = aggregating_genesis();
-        bare.fees = Some(FeesConfig { usd_subsidy: Some(UsdSubsidy { initial_price_micros: None, ..usd }), ..FeesConfig::default() });
-        let gs = build(&bare);
-        assert_eq!(gs.ledger.rand_price(), None, "no initial price, no price");
-        assert!(!bare.to_json().contains("initial_price_micros"));
         assert_eq!(build(&aggregating_genesis()).ledger.rand_price(), None, "no section, no price");
 
+        let mut unpriced: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(unpriced["fees"]["usd_subsidy"].as_object_mut().unwrap().remove("initial_price_micros").is_some());
+        assert!(Genesis::from_json(&unpriced.to_string()).is_err(), "initial_price_micros is required");
         let typo = on.to_json().replace("\"price_max_age_blocks\"", "\"price_max_age\"");
         assert!(Genesis::from_json(&typo).is_err(), "a misspelt field is refused");
     }
 
-    /// Its bytes in the genesis commitment: `"usd_subsidy" ‖ be64 ×3`, then `"initial_price" ‖
-    /// be64` when set, after `prove_base`'s — every older field's bytes, and every hash pinned
-    /// over them, unchanged. Each number is its own chain.
+    /// Its bytes in the genesis commitment: `"usd_subsidy" ‖ be64 ×4` (target, cap, age, initial
+    /// price), after `prove_base`'s — every older field's bytes, and every hash pinned over them,
+    /// unchanged. Each number is its own chain.
     #[test]
     fn the_usd_subsidy_hash_contribution_is_pinned() {
         use crate::ledger::fees::{FeesConfig, UsdSubsidy};
-        let usd = UsdSubsidy { usd_micros_per_sealed_block: 4_791, max_subsidy_per_block: 300_000_000, price_max_age_blocks: 72_000, initial_price_micros: None };
+        let usd = UsdSubsidy { usd_micros_per_sealed_block: 4_791, max_subsidy_per_block: 300_000_000, price_max_age_blocks: 72_000, initial_price_micros: 150_000 };
         let alone = FeesConfig { usd_subsidy: Some(usd.clone()), ..FeesConfig::default() };
         let mut want = b"fees".to_vec();
         want.extend_from_slice(b"usd_subsidy");
-        for n in [4_791u64, 300_000_000, 72_000] {
+        for n in [4_791u64, 300_000_000, 72_000, 150_000] {
             want.extend_from_slice(&n.to_be_bytes());
         }
         assert_eq!(fees_commit(&alone), want);
-
-        let priced = FeesConfig { usd_subsidy: Some(UsdSubsidy { initial_price_micros: Some(150_000), ..usd.clone() }), ..FeesConfig::default() };
-        let mut want_priced = want.clone();
-        want_priced.extend_from_slice(b"initial_price");
-        want_priced.extend_from_slice(&150_000u64.to_be_bytes());
-        assert_eq!(fees_commit(&priced), want_priced);
+        assert_eq!(
+            hex::encode(&want),
+            "666565737573645f7375627369647900000000000012b70000000011e1a300000000000001194000000000000249f0",
+            "the bytes, pinned"
+        );
 
         // After `prove_base`: the older fields' bytes come first, untouched.
         let with_split = FeesConfig { prove_base: Some(600_000), usd_subsidy: Some(usd.clone()), ..FeesConfig::default() };
@@ -3169,7 +3160,7 @@ mod tests {
             hash_of(Some(UsdSubsidy { usd_micros_per_sealed_block: 4_792, ..usd.clone() })),
             hash_of(Some(UsdSubsidy { max_subsidy_per_block: 300_000_001, ..usd.clone() })),
             hash_of(Some(UsdSubsidy { price_max_age_blocks: 72_001, ..usd.clone() })),
-            hash_of(Some(UsdSubsidy { initial_price_micros: Some(150_000), ..usd.clone() })),
+            hash_of(Some(UsdSubsidy { initial_price_micros: 150_001, ..usd.clone() })),
         ];
         for i in 0..hashes.len() {
             for j in i + 1..hashes.len() {
@@ -3179,12 +3170,36 @@ mod tests {
         assert_eq!(hash_of(None), build(&aggregating_genesis()).hash(), "absent hashes as no section");
     }
 
+    /// Minor 6 (review 2026-10-09): the whole-ledger state root of a chain without
+    /// `fees.usd_subsidy` is pinned — a plain chain and an aggregating one with an older `fees`
+    /// rule — so the price wrapper can never leak into a chain that does not carry the section.
+    /// With the section the same chain's root is another value.
+    #[test]
+    fn the_state_root_without_the_usd_subsidy_is_pinned() {
+        use crate::ledger::fees::{FeesConfig, UsdSubsidy};
+        let plain = build(&genesis(1)).ledger.state_root().to_hex();
+        let mut agg = aggregating_genesis();
+        agg.fees = Some(FeesConfig { subsidy_net_of_fees: Some(true), ..FeesConfig::default() });
+        let aggregating = build(&agg).ledger.state_root().to_hex();
+        assert_eq!(
+            (plain.as_str(), aggregating.as_str()),
+            ("e845c110b5e366acf87806cb7f09cc212ad47008cac7cafbd141c30da4c738d4", "4afdd1f2b8a7d43aab13f0cfbfc8fea200cf7b805f81904e58269ba75a207b09"),
+            "the roots, as every build before the section computed them"
+        );
+        agg.fees = Some(FeesConfig {
+            subsidy_net_of_fees: Some(true),
+            usd_subsidy: Some(UsdSubsidy { usd_micros_per_sealed_block: 1, max_subsidy_per_block: 2, price_max_age_blocks: 3, initial_price_micros: 4 }),
+            ..FeesConfig::default()
+        });
+        assert_ne!(build(&agg).ledger.state_root().to_hex(), aggregating);
+    }
+
     /// Refusals: without `aggregation` by name, and each required number at 0 (and a zero
     /// initial price) named.
     #[test]
     fn the_usd_subsidy_needs_aggregation_and_positive_numbers() {
         use crate::ledger::fees::{FeesConfig, UsdSubsidy};
-        let usd = UsdSubsidy { usd_micros_per_sealed_block: 1, max_subsidy_per_block: 2, price_max_age_blocks: 3, initial_price_micros: Some(4) };
+        let usd = UsdSubsidy { usd_micros_per_sealed_block: 1, max_subsidy_per_block: 2, price_max_age_blocks: 3, initial_price_micros: 4 };
         let mut g = base_genesis();
         g.fees = Some(FeesConfig { usd_subsidy: Some(usd.clone()), ..FeesConfig::default() });
         assert!(matches!(g.validate(), Err(GenesisError::UsdSubsidyWithoutAggregation)));
@@ -3195,7 +3210,7 @@ mod tests {
             ("usd_micros_per_sealed_block", UsdSubsidy { usd_micros_per_sealed_block: 0, ..usd.clone() }),
             ("max_subsidy_per_block", UsdSubsidy { max_subsidy_per_block: 0, ..usd.clone() }),
             ("price_max_age_blocks", UsdSubsidy { price_max_age_blocks: 0, ..usd.clone() }),
-            ("initial_price_micros", UsdSubsidy { initial_price_micros: Some(0), ..usd.clone() }),
+            ("initial_price_micros", UsdSubsidy { initial_price_micros: 0, ..usd.clone() }),
         ] {
             g.fees = Some(FeesConfig { usd_subsidy: Some(bad), ..FeesConfig::default() });
             match g.validate() {

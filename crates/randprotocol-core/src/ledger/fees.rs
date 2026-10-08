@@ -39,8 +39,8 @@
 //!   dollar-indexed sealing subsidy. While the ledger holds a fresh RAND/USD price — set by the
 //!   validator set's vote, `Action::SetRandPrice` (`ledger::rand_price`), never a market oracle —
 //!   an aggregate's schedule is `min(usd_micros_per_sealed_block · 10⁹ / price_micros,
-//!   max_subsidy_per_block)` RAND units instead of `gas::subsidy(n)`; with no price, or a stale
-//!   one, the RAND schedule. `subsidy_net_of_fees` nets either schedule the same way.
+//!   max_subsidy_per_block)` RAND units instead of `gas::subsidy(n)`; with a stale price, the
+//!   RAND schedule clamped to the same cap. `subsidy_net_of_fees` nets either schedule the same way.
 //!
 //! A genesis parameter like `aggregation`: outside the state root and `Ledger`'s equality, set by
 //! genesis, persisted by the node at genesis and restored from the genesis file on every restart.
@@ -79,8 +79,7 @@ pub struct FeesConfig {
 
 /// The genesis `fees.usd_subsidy` sub-section: the dollar target of one sealed block, the hard
 /// cap in RAND units, how long a voted price stays usable, and optionally the price the chain
-/// starts with. Every number but `initial_price_micros` is required and non-zero; a set
-/// `initial_price_micros` is non-zero too (`Genesis::validate`).
+/// starts with. All four numbers are required and non-zero (`Genesis::validate`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsdSubsidy {
@@ -92,10 +91,9 @@ pub struct UsdSubsidy {
     /// A price set at height `h` is fresh at heights `h ..= h + price_max_age_blocks`; past that
     /// the schedule falls back to `gas::subsidy(n)`.
     pub price_max_age_blocks: u64,
-    /// The RAND/USD price at genesis in micro-dollars per RAND (set at height 0, nonce 0); absent,
-    /// the chain has no price until the first `SetRandPrice`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_price_micros: Option<u64>,
+    /// The RAND/USD price at genesis in micro-dollars per RAND, set at height 0 with nonce 0 —
+    /// required, so a chain with the section always has a price to start from.
+    pub initial_price_micros: u64,
 }
 
 /// RAND units per RAND: the `10⁹` of the dollar conversion.
@@ -202,24 +200,24 @@ mod tests {
     /// converts with floor rounding under its cap.
     #[test]
     fn the_usd_subsidy_round_trips_refuses_unknown_keys_and_converts_under_its_cap() {
-        let usd = UsdSubsidy { usd_micros_per_sealed_block: 4_791, max_subsidy_per_block: 300_000_000, price_max_age_blocks: 72_000, initial_price_micros: Some(150_000) };
+        let usd = UsdSubsidy { usd_micros_per_sealed_block: 4_791, max_subsidy_per_block: 300_000_000, price_max_age_blocks: 72_000, initial_price_micros: 150_000 };
         let f = FeesConfig { usd_subsidy: Some(usd.clone()), ..FeesConfig::default() };
         assert!(f.any() && f.usd_subsidy() == Some(&usd));
         let text = serde_json::to_string(&f).unwrap();
         assert_eq!(text, r#"{"usd_subsidy":{"usd_micros_per_sealed_block":4791,"max_subsidy_per_block":300000000,"price_max_age_blocks":72000,"initial_price_micros":150000}}"#);
         assert_eq!(serde_json::from_str::<FeesConfig>(&text).unwrap(), f);
         let bare = r#"{"usd_subsidy":{"usd_micros_per_sealed_block":1,"max_subsidy_per_block":2,"price_max_age_blocks":3}}"#;
-        assert_eq!(serde_json::from_str::<FeesConfig>(bare).unwrap().usd_subsidy.unwrap().initial_price_micros, None);
-        assert!(serde_json::from_str::<FeesConfig>(r#"{"usd_subsidy":{"usd_micros_per_sealed_block":1,"max_subsidy_per_block":2,"price_max_age_blocks":3,"oracle":1}}"#).is_err());
+        assert!(serde_json::from_str::<FeesConfig>(bare).is_err(), "initial_price_micros is required");
+        assert!(serde_json::from_str::<FeesConfig>(r#"{"usd_subsidy":{"usd_micros_per_sealed_block":1,"max_subsidy_per_block":2,"price_max_age_blocks":3,"initial_price_micros":4,"oracle":1}}"#).is_err());
         // $0.004791 a block at $0.15: ⌊4 791 · 10⁹ / 150 000⌋ = 31 940 000 units (0.03194 RAND).
         assert_eq!(usd.amount_at(150_000), 31_940_000);
         // Floor: 1 µ$ at 3 µ$/RAND is 333 333 333.3… units.
-        let one = UsdSubsidy { usd_micros_per_sealed_block: 1, max_subsidy_per_block: u64::MAX, price_max_age_blocks: 1, initial_price_micros: None };
+        let one = UsdSubsidy { usd_micros_per_sealed_block: 1, max_subsidy_per_block: u64::MAX, price_max_age_blocks: 1, initial_price_micros: 1 };
         assert_eq!(one.amount_at(3), 333_333_333);
         // At $0.01 the target is 0.4791 RAND, over the 0.3 RAND cap: the cap binds.
         assert_eq!(usd.amount_at(10_000), 300_000_000);
         // No overflow at the extremes: u64::MAX µ$ at 1 µ$/RAND saturates, then the cap.
-        let max = UsdSubsidy { usd_micros_per_sealed_block: u64::MAX, max_subsidy_per_block: u64::MAX, price_max_age_blocks: 1, initial_price_micros: None };
+        let max = UsdSubsidy { usd_micros_per_sealed_block: u64::MAX, max_subsidy_per_block: u64::MAX, price_max_age_blocks: 1, initial_price_micros: 1 };
         assert_eq!(max.amount_at(1), u64::MAX);
         assert_eq!(usd.amount_at(0), 300_000_000, "a zero price reads as the cap");
     }

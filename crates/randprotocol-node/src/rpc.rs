@@ -2382,9 +2382,10 @@ fn tx_json_with(
             "kind": "slash_aggregator", "aggregator": a.aggregator.to_base58(), "nonce": a.nonce,
             "headers": [a.proof_hash.to_hex(), b.proof_hash.to_hex()]
         }),
-        Action::Aggregate { covers, proof, aggregator, nonce, time, .. } => json!({
+        Action::Aggregate { covers, proof, aggregator, nonce, time, payout_total, .. } => json!({
             "kind": "aggregate", "covers": covers.len(), "proof_len": proof.len(),
-            "aggregator": aggregator.to_base58(), "nonce": nonce, "time": time
+            "aggregator": aggregator.to_base58(), "nonce": nonce, "time": time,
+            "payout_total": payout_total.to_string()
         }),
         // RPL (spec §4). A token's whole registration is public by design — that is what makes
         // its supply auditable — as is every mint's amount and recipient; only the later
@@ -4691,7 +4692,11 @@ pub(crate) mod tests {
         let r = [9u32; 8];
         let covers = vec![covered_tx.hash()];
         let proof_bytes = b"ok".to_vec();
-        let signature = kp.sign(aggregate_signing_hash(7, 0, 2, &r, &covers, &Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&fixtures::env(9))).as_bytes());
+        let payout_total = l1.payout_total_for(&covers).unwrap();
+        let signature = kp.sign(
+            aggregate_signing_hash(7, 0, 2, &r, &covers, &Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&fixtures::env(9)), payout_total)
+                .as_bytes(),
+        );
         let aggregate = Transaction {
             chain_id: 7,
             bundle: None,
@@ -4704,6 +4709,7 @@ pub(crate) mod tests {
                 r,
                 envelope: fixtures::env(9),
                 signature,
+                payout_total,
             },
         };
         let record = st.storage.covered_record(&covered_tx.hash(), FriProfile::Test).unwrap().unwrap();
@@ -4946,6 +4952,7 @@ pub(crate) mod tests {
                     r: [4; 8],
                     envelope,
                     signature: sig,
+                    payout_total: 1_000,
                 }),
                 "aggregate",
                 json!({
@@ -4953,6 +4960,7 @@ pub(crate) mod tests {
                     "aggregator": addr.to_base58(),
                     "nonce": 3,
                     "time": 9,
+                    "payout_total": "1000",
                     "proof_len": 64,
                 }),
             ),
@@ -6287,7 +6295,8 @@ pub(crate) mod tests {
 
     /// The dollar-indexed subsidy: `rand_getRandPrice` judges `fresh` for the next block (the
     /// height an aggregate submitted now is paid at) and `rand_getEmission.current` follows it —
-    /// the dollar target while the price is fresh, the RAND schedule once it is stale; on a chain
+    /// the dollar target while the price is fresh, the RAND schedule clamped to the cap once it is
+    /// stale; on a chain
     /// without the section the price is `null`.
     #[tokio::test]
     async fn the_rand_price_and_the_emission_follow_freshness_for_the_next_block() {
@@ -6320,8 +6329,8 @@ pub(crate) mod tests {
         assert_eq!(ok(&st, "rand_getRandPrice", json!([])).await["fresh"], json!(false), "age 2 at block 2");
         assert_eq!(
             ok(&st, "rand_getEmission", json!([])).await["subsidy"]["current"],
-            json!(randprotocol_core::gas::subsidy(0, &cfg).to_string()),
-            "stale: the RAND schedule"
+            json!(randprotocol_core::gas::subsidy(0, &cfg).min(fixtures::usd_section().max_subsidy_per_block).to_string()),
+            "stale: the RAND schedule, clamped to the cap"
         );
     }
 
@@ -6466,14 +6475,25 @@ pub(crate) mod tests {
         let r = [9u32; 8];
         let covers = vec![deploy.hash()];
         let proof_bytes = b"ok".to_vec();
+        let payout_total = l1.payout_total_for(&covers).unwrap();
         let signature = kp.sign(
-            aggregate_signing_hash(7, 0, 2, &r, &covers, &Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&fixtures::env(9)))
+            aggregate_signing_hash(7, 0, 2, &r, &covers, &Hash::digest(&proof_bytes), &randprotocol_core::types::actions::envelope_digest(&fixtures::env(9)), payout_total)
                 .as_bytes(),
         );
         let aggregate = Transaction {
             chain_id: 7,
             bundle: None,
-            action: Action::Aggregate { covers, proof: proof_bytes, aggregator: kp.public_key().address(), nonce: 0, time: 2, r, envelope: fixtures::env(9), signature },
+            action: Action::Aggregate {
+                covers,
+                proof: proof_bytes,
+                aggregator: kp.public_key().address(),
+                nonce: 0,
+                time: 2,
+                r,
+                envelope: fixtures::env(9),
+                signature,
+                payout_total,
+            },
         };
         let record = st.storage.covered_record(&deploy.hash(), FriProfile::Test).unwrap().unwrap();
         let sidecar: BTreeMap<usize, Vec<CoveredBundle>> = [(0usize, vec![record])].into_iter().collect();

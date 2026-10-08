@@ -458,14 +458,14 @@ pub fn fee_rules_of(limits: &Value) -> FeesConfig {
 
 /// `fee_rules.usd_subsidy` out of a `rand_getLimits` reply: the three numbers (amounts as decimal
 /// strings or numbers), `None` for `null`, an absent field, or an object missing any of them.
-/// The initial price is a genesis value the daemon never needs (it reads the live price), so it is
-/// not served and reads as `None`.
+/// The initial price is a genesis value the daemon never needs (it reads the live price,
+/// `rand_getRandPrice`), so it is not served and reads as 0 — a placeholder nothing reads.
 pub fn usd_subsidy_of(v: &Value) -> Option<randprotocol_core::ledger::fees::UsdSubsidy> {
     Some(randprotocol_core::ledger::fees::UsdSubsidy {
         usd_micros_per_sealed_block: amount_field(&v["usd_micros_per_sealed_block"])?,
         max_subsidy_per_block: amount_field(&v["max_subsidy_per_block"])?,
         price_max_age_blocks: v["price_max_age_blocks"].as_u64()?,
-        initial_price_micros: None,
+        initial_price_micros: 0,
     })
 }
 
@@ -2051,7 +2051,7 @@ mod tests {
     fn fee_rules_of_reads_the_usd_subsidy() {
         use randprotocol_core::ledger::fees::UsdSubsidy;
         let rules = |v: Value| fee_rules_of(&json!({ "fee_rules": v })).usd_subsidy;
-        let want = UsdSubsidy { usd_micros_per_sealed_block: 4_791, max_subsidy_per_block: 300_000_000, price_max_age_blocks: 72_000, initial_price_micros: None };
+        let want = UsdSubsidy { usd_micros_per_sealed_block: 4_791, max_subsidy_per_block: 300_000_000, price_max_age_blocks: 72_000, initial_price_micros: 0 };
         assert_eq!(
             rules(json!({ "usd_subsidy": { "usd_micros_per_sealed_block": "4791", "max_subsidy_per_block": "300000000", "price_max_age_blocks": 72000 } })),
             Some(want.clone())

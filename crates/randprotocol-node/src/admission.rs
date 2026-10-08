@@ -267,7 +267,9 @@ pub fn is_permanent(e: &TxError) -> bool {
     // bundles against the admitted shapes, which are genesis constants. `CoverNotABundle` is a
     // statement about a *committed* — finalised, immutable — transaction's shape, and
     // `CoverSealed` one about committed history, which only ever accumulates. Everything
-    // else (`UnknownAggregator`, `Unbonding`, `BadNonce`, the payout's `CommitmentExists`,
+    // else (`UnknownAggregator`, `Unbonding`, `BadNonce`, `PayoutMismatch` — the schedule moves
+    // with a price vote, staleness and halvings, and a re-sealed aggregate is new bytes anyway —
+    // the payout's `CommitmentExists`,
     // `UnknownCover`, `CoverOutsideWindow`, `CoverStoreCorrupt`, the register actions' own
     // verdicts) moves with this node's state and stays out.
     if let TxError::Aggregation(a) = e {

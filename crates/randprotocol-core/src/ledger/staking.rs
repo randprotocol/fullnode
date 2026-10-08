@@ -1119,6 +1119,20 @@ pub fn check_votes(
     message: &crate::crypto::Hash,
     signatures: &[(crate::crypto::PublicKey, Signature)],
 ) -> Result<(), VoteFault> {
+    check_vote_weight(ledger, signatures)?;
+    for (key, signature) in signatures {
+        if !key.verify(message.as_bytes(), signature) {
+            return Err(VoteFault::BadSignature(key.address()));
+        }
+    }
+    Ok(())
+}
+
+/// [`check_votes`] without the signatures: the count, the order, membership of the current
+/// voting set and the quorum weight — everything about a vote list that moves with the register.
+/// What the mempool re-asks of a pooled vote at every tip, so one whose voters lost the quorum
+/// (an unbond, an epoch boundary) leaves rather than holding its slot.
+pub fn check_vote_weight(ledger: &Ledger, signatures: &[(crate::crypto::PublicKey, Signature)]) -> Result<(), VoteFault> {
     let set = voting_set(ledger);
     if signatures.is_empty() || signatures.len() > set.len() {
         return Err(VoteFault::Count { got: signatures.len(), max: set.len() });
@@ -1135,11 +1149,6 @@ pub fn check_votes(
     // Strictly more than two thirds, by the arithmetic a quorum certificate is judged with.
     if !set.has_quorum(weight) {
         return Err(VoteFault::NoQuorum { weight, total: set.total_stake() });
-    }
-    for ((key, signature), voter) in signatures.iter().zip(&voters) {
-        if !key.verify(message.as_bytes(), signature) {
-            return Err(VoteFault::BadSignature(*voter));
-        }
     }
     Ok(())
 }

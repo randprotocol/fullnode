@@ -189,6 +189,13 @@ pub enum AggregationError {
     /// admission; at apply the ledger only knows the set. Permanent: none of the three un-happens.
     #[error("cover {0} is not coverable: unknown, already covered, or past its window")]
     CoverNotCoverable(Hash),
+    /// The aggregate's signed `payout_total` is not what the ledger pays it now
+    /// ([`Ledger::aggregate_payment`]'s `total`): the schedule moved between sealing and inclusion
+    /// — a `SetRandPrice`, the voted price going stale, a halving — so its envelope would open to
+    /// a commitment matching no leaf. Refused rather than paid; nothing leaves the bucket. State,
+    /// never cached: the aggregator re-seals (the proof does not commit to the payout).
+    #[error("the aggregate's payout_total is {got}, the ledger pays {expected}: re-seal at the current schedule")]
+    PayoutMismatch { expected: u64, got: u64 },
     #[error("arithmetic overflow")]
     Overflow,
 }
@@ -410,6 +417,15 @@ impl Ledger {
         payout: &ShieldedAddress,
         executor: &dyn ConfidentialExecutor,
     ) -> Result<Payment, TxError> {
+        let (subsidy, proving_shares, total) = self.payment_amounts(covers, cfg)?;
+        let note = executor.note_commitment(&payout.pk, &[0; 8], total, 0, time, r);
+        Ok(Payment { subsidy, proving_shares, total, note })
+    }
+
+    /// The amounts of [`Ledger::aggregate_payment`] — `(minted subsidy, proving shares, total)` —
+    /// without the note: the schedule ([`Ledger::schedule_subsidy`]) netted by
+    /// [`minted_subsidy`], plus the covers' bucketed shares.
+    fn payment_amounts(&self, covers: &[Hash], cfg: &AggregationConfig) -> Result<(u64, u64, u64), TxError> {
         let schedule = self.schedule_subsidy(self.supply.sealed_blocks, cfg);
         let proving_shares = covers.iter().try_fold(0u64, |acc, c| {
             // Validation already required the entry; a missing one here is the same refusal,
@@ -419,8 +435,15 @@ impl Ledger {
         })?;
         let subsidy = minted_subsidy(schedule, proving_shares, self.fees());
         let total = subsidy.checked_add(proving_shares).ok_or(TxError::Overflow)?;
-        let note = executor.note_commitment(&payout.pk, &[0; 8], total, 0, time, r);
-        Ok(Payment { subsidy, proving_shares, total, note })
+        Ok((subsidy, proving_shares, total))
+    }
+
+    /// The `payout_total` an aggregate over `covers` must sign on this state — what
+    /// [`Ledger::aggregate_payment`] pays now. For tests and tooling that hold a ledger; the
+    /// daemon derives the same number from the node's RPC.
+    pub fn payout_total_for(&self, covers: &[Hash]) -> Result<u64, TxError> {
+        let Some(cfg) = self.aggregation() else { return Err(NOT_AGGREGATION) };
+        Ok(self.payment_amounts(covers, cfg)?.2)
     }
 }
 
@@ -430,14 +453,19 @@ impl Ledger {
 /// [`Ledger::fresh_rand_price`] does) it is the dollar target converted at that price and capped,
 /// [`UsdSubsidy::amount_at`]: `min(⌊usd_micros_per_sealed_block · 10⁹ / price⌋,
 /// max_subsidy_per_block)`, computed in u128, rounded down. Otherwise — no section, no price, or
-/// a stale one — the RAND schedule [`gas::subsidy`]. [`Ledger::aggregate_payment`] (through
+/// a stale one — the RAND schedule [`gas::subsidy`], capped under the section (below). [`Ledger::aggregate_payment`] (through
 /// [`Ledger::schedule_subsidy`]), `rand_getEmission.current` and the aggregate daemon all call it,
 /// so none of them can disagree; [`minted_subsidy`] then nets it against the shares exactly as it
 /// nets the RAND schedule.
+///
+/// Under the section the cap binds in **every** branch: the stale or absent-price fallback is
+/// `min(gas::subsidy(n), max_subsidy_per_block)`, so a lapsed quorum can never mint above the cap
+/// the genesis fixed (ruling 2026-10-09).
 pub fn schedule_subsidy(n: u64, cfg: &AggregationConfig, usd: Option<&UsdSubsidy>, fresh_price_micros: Option<u64>) -> u64 {
     match (usd, fresh_price_micros) {
         (Some(usd), Some(price)) => usd.amount_at(price),
-        _ => gas::subsidy(n, cfg),
+        (Some(usd), None) => gas::subsidy(n, cfg).min(usd.max_subsidy_per_block),
+        (None, _) => gas::subsidy(n, cfg),
     }
 }
 
@@ -492,6 +520,7 @@ pub(super) fn validate_aggregate(
     envelope: &crate::notes::Envelope,
     signature: &Signature,
     proof: &[u8],
+    payout_total: u64,
     covered: &[CoveredBundle],
     executor: &dyn ConfidentialExecutor,
 ) -> Result<ValidatedAggregate, TxError> {
@@ -512,7 +541,16 @@ pub(super) fn validate_aggregate(
     // 2. The aggregator: registered, not unbonding, the nonce the register expects, and the
     //    signature over the action's signing hash — `signed_by`'s three, plus the bar.
     let entry = signed_by(ledger, aggregator, nonce, signature, || {
-        ledger.binding_domain().aggregate_signing_hash(tx.chain_id, nonce, time, r, covers, &Hash::digest(proof), &envelope_digest(envelope))
+        ledger.binding_domain().aggregate_signing_hash(
+            tx.chain_id,
+            nonce,
+            time,
+            r,
+            covers,
+            &Hash::digest(proof),
+            &envelope_digest(envelope),
+            payout_total,
+        )
     })?;
     if entry.unbonding.is_some() {
         return Err(AggregationError::Unbonding(*aggregator).into());
@@ -547,9 +585,15 @@ pub(super) fn validate_aggregate(
             return Err(AggregationError::CoverNotCoverable(*cover).into());
         }
     }
-    // 5. The payout note's commitment is new — derived as a `BridgeAttest`'s is, claimed in
-    //    the mempool by the same `derived_commitment` arm.
-    let payout_cm = payout_note(ledger, aggregator, covers, time, r, executor)?;
+    // 5. The payment: the amount the aggregator signed is the one the ledger pays now
+    //    (`PayoutMismatch` otherwise — refused, never underpaid into an unopenable note), and the
+    //    payout note's commitment is new — derived as a `BridgeAttest`'s is, claimed in the
+    //    mempool by the same `derived_commitment` arm.
+    let payment = ledger.aggregate_payment(covers, cfg, time, r, &entry.payout, executor)?;
+    if payment.total != payout_total {
+        return Err(AggregationError::PayoutMismatch { expected: payment.total, got: payout_total }.into());
+    }
+    let payout_cm = payment.note;
     if ledger.has_commitment(&payout_cm) {
         return Err(TxError::CommitmentExists(payout_cm));
     }
@@ -643,7 +687,7 @@ impl Ledger {
     /// register's entry, nonce, signature and unbonding bar (ZKQ-1). `validate_aggregate`
     /// re-runs all of it — this is a pre-screen, like the mempool's.
     pub fn preflight_aggregate(&self, tx: &Transaction) -> Result<(), TxError> {
-        let Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope, signature } = &tx.action else {
+        let Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope, signature, payout_total } = &tx.action else {
             return Err(NOT_AGGREGATION);
         };
         let Some(cfg) = self.aggregation() else { return Err(NOT_AGGREGATION) };
@@ -676,7 +720,16 @@ impl Ledger {
             }
         }
         let entry = signed_by(self, aggregator, *nonce, signature, || {
-            self.binding_domain().aggregate_signing_hash(tx.chain_id, *nonce, *time, r, covers, &Hash::digest(proof), &envelope_digest(envelope))
+            self.binding_domain().aggregate_signing_hash(
+                tx.chain_id,
+                *nonce,
+                *time,
+                r,
+                covers,
+                &Hash::digest(proof),
+                &envelope_digest(envelope),
+                *payout_total,
+            )
         })?;
         if entry.unbonding.is_some() {
             return Err(AggregationError::Unbonding(*aggregator).into());
@@ -693,12 +746,34 @@ impl Ledger {
         covered: &[CoveredBundle],
         executor: &dyn ConfidentialExecutor,
     ) -> Result<ValidatedAggregate, TxError> {
-        let Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope, signature } = &tx.action else {
+        let Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope, signature, payout_total } = &tx.action else {
             return Err(NOT_AGGREGATION);
         };
         validate_aggregate(
-            self, tx, covers, aggregator, *nonce, *time, r, envelope, signature, proof, covered, executor,
+            self, tx, covers, aggregator, *nonce, *time, r, envelope, signature, proof, *payout_total, covered, executor,
         )
+    }
+
+    /// The payment half of an `Aggregate`'s admission, with no signature, store or proof work:
+    /// every cover still in the bucket and the signed `payout_total` the ledger's own
+    /// [`Ledger::aggregate_payment`] total on this state. What the mempool asks of a pooled
+    /// aggregate at every tip, so one whose schedule moved (a price vote, a stale price, a
+    /// halving) leaves the pool rather than being offered to, and refused by, every block.
+    pub fn check_aggregate_payout(&self, tx: &Transaction) -> Result<(), TxError> {
+        let Action::Aggregate { covers, payout_total, .. } = &tx.action else {
+            return Ok(());
+        };
+        let Some(cfg) = self.aggregation() else { return Err(NOT_AGGREGATION) };
+        for cover in covers {
+            if !self.unsealed_fees.contains_key(cover) {
+                return Err(AggregationError::CoverNotCoverable(*cover).into());
+            }
+        }
+        let total = self.payment_amounts(covers, cfg)?.2;
+        if total != *payout_total {
+            return Err(AggregationError::PayoutMismatch { expected: total, got: *payout_total }.into());
+        }
+        Ok(())
     }
 
     /// The apply half, in lockstep with [`Ledger::validate_aggregate`] (spec §4 validated, then
@@ -1158,6 +1233,7 @@ mod tests {
                 r: [4; 8],
                 envelope: env(),
                 signature: sig,
+                payout_total: 1_000,
             },
         ];
         for a in &actions {
@@ -1438,7 +1514,7 @@ mod register_tests {
 
     fn signed_header(kp: &Keypair, nonce: u64, covers: Vec<Hash>, proof_hash: Hash) -> Box<SignedAggregateHeader> {
         let aggregator = kp.public_key().address();
-        let signature = kp.sign(aggregate_signing_hash(7, nonce, 9, &[1; 8], &covers, &proof_hash, &Hash::ZERO).as_bytes());
+        let signature = kp.sign(aggregate_signing_hash(7, nonce, 9, &[1; 8], &covers, &proof_hash, &Hash::ZERO, 0).as_bytes());
         Box::new(SignedAggregateHeader { aggregator, nonce, time: 9, r: [1; 8], covers, proof_hash, signature })
     }
 
@@ -1794,10 +1870,15 @@ mod admission_tests {
 
     /// A well-formed aggregate transaction over `covers`; the stub executor accepts any proof
     /// but `b"reject"`.
-    fn aggregate_tx(kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
+    fn aggregate_tx(l: &Ledger, kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
         let aggregator = kp.public_key().address();
         let r = [9; 8];
-        let signature = kp.sign(aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof), &envelope_digest(&env())).as_bytes());
+        // The amount the ledger pays on `l` — what an honest aggregator seals and signs (0 when
+        // the covers are not coverable: a test of a refusal earlier than the payment's).
+        let payout_total = l.payout_total_for(&covers).unwrap_or(0);
+        let signature = kp.sign(
+            aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof), &envelope_digest(&env()), payout_total).as_bytes(),
+        );
         Transaction {
             chain_id: 7,
             bundle: None,
@@ -1810,6 +1891,7 @@ mod admission_tests {
                 r,
                 envelope: env(),
                 signature,
+                payout_total,
             },
         }
     }
@@ -1861,7 +1943,7 @@ mod admission_tests {
         cfg.admitted_shapes[0].aggregate_program_digest = [0xdeadbeef; 4];
         l.set_aggregation(Some(cfg));
 
-        let tx = aggregate_tx(&kp, 0, 100, covers(2), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 100, covers(2), b"ok".to_vec());
         let covered = covered_records(&shape(), &[1, 2]);
         match l.validate_aggregate(&tx, &covered, &StubExecutor) {
             Err(TxError::Aggregation(AggregationError::AggregateProgramMismatch { pinned, built })) => {
@@ -1909,10 +1991,10 @@ mod admission_tests {
 
         let proof = StubExecutor::make_aggregate_proof(&aggregate_binding(7, &a.public_key().address(), 0));
         let covered = covered_records(&shape(), &[1, 2]);
-        let honest = aggregate_tx(&a, 0, 100, covers(2), proof.clone());
+        let honest = aggregate_tx(&l, &a, 0, 100, covers(2), proof.clone());
         assert!(l.validate_aggregate(&honest, &covered, &StubExecutor).is_ok(), "A's own aggregate validates");
 
-        let resigned = aggregate_tx(&b, 0, 100, covers(2), proof);
+        let resigned = aggregate_tx(&l, &b, 0, 100, covers(2), proof);
         match l.validate_aggregate(&resigned, &covered, &StubExecutor) {
             Err(TxError::InvalidAggregateProof(_)) => {}
             other => panic!("A's proof re-signed by B must be refused, got {other:?}"),
@@ -1929,7 +2011,7 @@ mod admission_tests {
     fn a_swapped_payout_envelope_breaks_the_aggregators_signature() {
         let (l, kp) = setup();
         let covered = covered_records(&shape(), &[1, 2]);
-        let honest = aggregate_tx(&kp, 0, 100, covers(2), b"ok".to_vec());
+        let honest = aggregate_tx(&l, &kp, 0, 100, covers(2), b"ok".to_vec());
         assert!(l.validate_aggregate(&honest, &covered, &StubExecutor).is_ok());
         let mut swapped = honest.clone();
         let Action::Aggregate { envelope, .. } = &mut swapped.action else { unreachable!() };
@@ -2012,7 +2094,7 @@ mod admission_tests {
         }
         let (l, kp) = setup();
         let ex = HeaderRefusing(AtomicUsize::new(0));
-        let tx = aggregate_tx(&kp, 0, 100, covers(2), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 100, covers(2), b"ok".to_vec());
         match l.validate_aggregate(&tx, &covered_records(&shape(), &[1, 2]), &ex) {
             Err(TxError::InvalidAggregateProof(ConfidentialError::InvalidAggregateProof(m))) => assert!(m.contains("tier"), "{m}"),
             other => panic!("the header gate must refuse, got {other:?}"),
@@ -2056,14 +2138,14 @@ mod admission_tests {
 
         // V signs nonce 0 over cover c0 — and loses: the rival's aggregate over c0 commits first.
         let v_proof = StubExecutor::make_aggregate_proof(&aggregate_binding(7, &v_addr, 0));
-        let first = aggregate_tx(&v, 0, 100, vec![covers(1)[0]], v_proof.clone());
+        let first = aggregate_tx(&l, &v, 0, 100, vec![covers(1)[0]], v_proof.clone());
         let rival_proof = StubExecutor::make_aggregate_proof(&aggregate_binding(7, &rival.public_key().address(), 0));
-        let rivals = aggregate_tx(&rival, 0, 100, vec![covers(1)[0]], rival_proof);
+        let rivals = aggregate_tx(&l, &rival, 0, 100, vec![covers(1)[0]], rival_proof);
         l.apply_aggregate(&rivals, &covered_records(&shape(), &[1]), &StubExecutor).unwrap();
         assert_eq!(l.aggregators()[&v_addr].nonce, 0, "V's nonce did not move: nothing of V's committed");
 
         // V's retry: the same nonce, new content — and it is a valid aggregate.
-        let retry = aggregate_tx(&v, 0, 99, vec![covers(2)[1]], v_proof);
+        let retry = aggregate_tx(&l, &v, 0, 99, vec![covers(2)[1]], v_proof);
         l.validate_aggregate(&retry, &covered_records(&shape(), &[2]), &StubExecutor)
             .expect("the retry at the uncommitted nonce is valid");
 
@@ -2102,7 +2184,7 @@ mod admission_tests {
     #[test]
     fn a_valid_aggregate_validates_and_applies() {
         let (mut l, kp) = setup();
-        let tx = aggregate_tx(&kp, 0, 100, covers(2), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 100, covers(2), b"ok".to_vec());
         let covered = covered_records(&shape(), &[1, 2]);
         let v = l.validate_aggregate(&tx, &covered, &StubExecutor).expect("a well-formed aggregate validates");
         // The payout note: subsidy(0) = subsidy_base at a chain that has sealed nothing, to the
@@ -2139,7 +2221,7 @@ mod admission_tests {
         l.set_confidential(true);
         l.set_height(100);
         let (kp, _) = keys();
-        let tx = aggregate_tx(&kp, 0, 100, covers(1), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 100, covers(1), b"ok".to_vec());
         assert_eq!(
             l.validate_aggregate(&tx, &covered_records(&shape(), &[1]), &StubExecutor),
             Err(NOT_AGGREGATION)
@@ -2153,23 +2235,23 @@ mod admission_tests {
     #[test]
     fn step_1_refuses_the_oversized_before_any_state_work() {
         let (l, kp) = setup();
-        let big_proof = aggregate_tx(&kp, 0, 100, covers(1), vec![0; gas::MAX_PROOF_BYTES + 1]);
+        let big_proof = aggregate_tx(&l, &kp, 0, 100, covers(1), vec![0; gas::MAX_PROOF_BYTES + 1]);
         assert_eq!(l.preflight_aggregate(&big_proof), Err(TxError::ProofTooLarge));
         assert_eq!(l.validate(&big_proof, &StubExecutor), Err(TxError::ProofTooLarge), "validate_inner's step 1 shares the cap");
-        let mut big_env = aggregate_tx(&kp, 0, 100, covers(1), b"ok".to_vec());
+        let mut big_env = aggregate_tx(&l, &kp, 0, 100, covers(1), b"ok".to_vec());
         if let Action::Aggregate { envelope, .. } = &mut big_env.action {
             envelope.body = vec![0; crate::notes::MAX_ENVELOPE_BYTES + 1];
         }
         assert_eq!(l.preflight_aggregate(&big_env), Err(TxError::EnvelopeTooLarge));
         // The composite cap is over the whole transaction's encoding — a giant cover list is
         // the cheapest way over it without tripping a per-field cap.
-        let giant = aggregate_tx(&kp, 0, 100, vec![Hash::ZERO; gas::MAX_AGGREGATE_BYTES / 32], b"ok".to_vec());
+        let giant = aggregate_tx(&l, &kp, 0, 100, vec![Hash::ZERO; gas::MAX_AGGREGATE_BYTES / 32], b"ok".to_vec());
         match l.preflight_aggregate(&giant) {
             Err(TxError::AggregateTooLarge { .. }) => {}
             other => panic!("expected the composite cap, got {other:?}"),
         }
         // And the wrong chain id is step 1's other half, refused before the aggregator is consulted.
-        let mut wrong_chain = aggregate_tx(&kp, 0, 100, covers(1), b"ok".to_vec());
+        let mut wrong_chain = aggregate_tx(&l, &kp, 0, 100, covers(1), b"ok".to_vec());
         wrong_chain.chain_id = 99;
         match l.preflight_aggregate(&wrong_chain) {
             Err(TxError::WrongChain { expected: 7, actual: 99 }) => {}
@@ -2185,7 +2267,7 @@ mod admission_tests {
         let (mut l, kp) = setup();
         l.set_envelope_bytes(Some(W));
         let sized = |len: usize| {
-            let mut t = aggregate_tx(&kp, 0, 100, covers(1), b"ok".to_vec());
+            let mut t = aggregate_tx(&l, &kp, 0, 100, covers(1), b"ok".to_vec());
             if let Action::Aggregate { envelope, .. } = &mut t.action {
                 *envelope = crate::notes::Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![0; len] };
             }
@@ -2208,7 +2290,7 @@ mod admission_tests {
         raised.set_max_block_bytes(17 << 20);
         assert_eq!(l.max_aggregate_bytes(), gas::MAX_AGGREGATE_BYTES, "the default is today's cap");
         assert_eq!(raised.max_aggregate_bytes(), gas::MAX_AGGREGATE_BYTES + (6 << 20));
-        let over = aggregate_tx(&kp, 0, 100, covers(1), vec![0; gas::MAX_PROOF_BYTES + 1]);
+        let over = aggregate_tx(&l, &kp, 0, 100, covers(1), vec![0; gas::MAX_PROOF_BYTES + 1]);
         let covered = covered_records(&shape(), &[1]);
         assert_eq!(l.preflight_aggregate(&over), Err(TxError::ProofTooLarge));
         assert_eq!(l.validate(&over, &StubExecutor), Err(TxError::ProofTooLarge));
@@ -2219,9 +2301,9 @@ mod admission_tests {
         assert_eq!(raised.preflight_aggregate(&over), Ok(()), "the byte-level pre-screen passes");
         assert!(not_size(raised.validate(&over, &StubExecutor)));
         assert!(not_size(raised.validate_aggregate(&over, &covered, &StubExecutor).map(|_| ())));
-        let at = aggregate_tx(&kp, 0, 100, covers(1), vec![0; 8 << 20]);
+        let at = aggregate_tx(&l, &kp, 0, 100, covers(1), vec![0; 8 << 20]);
         assert_eq!(raised.preflight_aggregate(&at), Ok(()));
-        let past = aggregate_tx(&kp, 0, 100, covers(1), vec![0; (8 << 20) + 1]);
+        let past = aggregate_tx(&l, &kp, 0, 100, covers(1), vec![0; (8 << 20) + 1]);
         assert_eq!(raised.preflight_aggregate(&past), Err(TxError::ProofTooLarge));
     }
 
@@ -2233,7 +2315,7 @@ mod admission_tests {
         let covered = covered_records(&shape(), &[1]);
         // Unknown: never registered.
         let (_, stranger) = keys();
-        let tx = aggregate_tx(&stranger, 0, 100, covers(1), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &stranger, 0, 100, covers(1), b"ok".to_vec());
         match l.validate_aggregate(&tx, &covered, &StubExecutor) {
             Err(TxError::Aggregation(AggregationError::UnknownAggregator(a))) => {
                 assert_eq!(a, stranger.public_key().address())
@@ -2241,13 +2323,13 @@ mod admission_tests {
             other => panic!("expected UnknownAggregator, got {other:?}"),
         }
         // Bad nonce.
-        let tx = aggregate_tx(&kp, 7, 100, covers(1), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 7, 100, covers(1), b"ok".to_vec());
         match l.validate_aggregate(&tx, &covered, &StubExecutor) {
             Err(TxError::Aggregation(AggregationError::BadNonce { expected: 0, actual: 7 })) => {}
             other => panic!("expected BadNonce, got {other:?}"),
         }
         // A signature over something else.
-        let mut tx = aggregate_tx(&kp, 0, 100, covers(1), b"ok".to_vec());
+        let mut tx = aggregate_tx(&l, &kp, 0, 100, covers(1), b"ok".to_vec());
         if let Action::Aggregate { signature, .. } = &mut tx.action {
             *signature = kp.sign(b"not the signing hash");
         }
@@ -2269,7 +2351,7 @@ mod admission_tests {
             },
         };
         l.apply_tx(&unbond, &proposer(&l), &StubExecutor).unwrap();
-        let tx = aggregate_tx(&kp, 1, 100, covers(1), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 1, 100, covers(1), b"ok".to_vec());
         match l.validate_aggregate(&tx, &covered, &StubExecutor) {
             Err(TxError::Aggregation(AggregationError::Unbonding(a))) => assert_eq!(a, aggregator),
             other => panic!("expected Unbonding, got {other:?}"),
@@ -2281,7 +2363,7 @@ mod admission_tests {
     fn step_3_refuses_a_time_outside_the_window() {
         let (l, kp) = setup();
         // A future time: at height 100 every past time is inside the 256-block window.
-        let tx = aggregate_tx(&kp, 0, 101, covers(1), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 101, covers(1), b"ok".to_vec());
         match l.validate_aggregate(&tx, &covered_records(&shape(), &[1]), &StubExecutor) {
             Err(TxError::TimeOutOfWindow { time: 101, height: 100, window: 256 }) => {}
             other => panic!("expected TimeOutOfWindow, got {other:?}"),
@@ -2293,23 +2375,23 @@ mod admission_tests {
     #[test]
     fn step_4_refuses_the_empty_the_too_many_the_duplicated_and_the_mismatched() {
         let (l, kp) = setup();
-        let tx = aggregate_tx(&kp, 0, 100, vec![], b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 100, vec![], b"ok".to_vec());
         assert_eq!(
             l.validate_aggregate(&tx, &[], &StubExecutor),
             Err(TxError::Aggregation(AggregationError::EmptyCoverSet))
         );
-        let tx = aggregate_tx(&kp, 0, 100, covers(4), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 100, covers(4), b"ok".to_vec());
         match l.validate_aggregate(&tx, &covered_records(&shape(), &[1, 2, 3, 4]), &StubExecutor) {
             Err(TxError::Aggregation(AggregationError::TooManyCovers { got: 4, max: 3 })) => {}
             other => panic!("expected TooManyCovers, got {other:?}"),
         }
         let dup = Hash::digest(b"one cover twice");
-        let tx = aggregate_tx(&kp, 0, 100, vec![dup, Hash::digest(b"other"), dup], b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 100, vec![dup, Hash::digest(b"other"), dup], b"ok".to_vec());
         assert_eq!(
             l.validate_aggregate(&tx, &covered_records(&shape(), &[1, 2, 3]), &StubExecutor),
             Err(TxError::Aggregation(AggregationError::DuplicateCover(dup)))
         );
-        let tx = aggregate_tx(&kp, 0, 100, covers(2), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 100, covers(2), b"ok".to_vec());
         match l.validate_aggregate(&tx, &covered_records(&shape(), &[1]), &StubExecutor) {
             Err(TxError::Aggregation(AggregationError::CoverAssemblyMismatch { covers: 2, covered: 1 })) => {}
             other => panic!("expected CoverAssemblyMismatch, got {other:?}"),
@@ -2321,7 +2403,7 @@ mod admission_tests {
     #[test]
     fn step_5_refuses_a_payout_commitment_the_tree_already_holds() {
         let (mut l, kp) = setup();
-        let tx = aggregate_tx(&kp, 0, 100, covers(1), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 100, covers(1), b"ok".to_vec());
         let cm = l.derived_commitment(&tx.action, &StubExecutor).expect("a registered aggregator's note derives");
         l.append_deposit(cm, env(), &StubExecutor).unwrap();
         assert_eq!(
@@ -2335,7 +2417,7 @@ mod admission_tests {
     #[test]
     fn step_6_refuses_the_unregistered_and_the_mixed_shape() {
         let (l, kp) = setup();
-        let tx = aggregate_tx(&kp, 0, 100, covers(2), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 100, covers(2), b"ok".to_vec());
         // covered[0] is not a registered shape at all.
         let mut foreign = shape();
         foreign.mem_log_height += 1;
@@ -2379,7 +2461,7 @@ mod admission_tests {
     #[test]
     fn step_7_refuses_a_proof_of_another_guest() {
         let (l, kp) = setup();
-        let tx = aggregate_tx(&kp, 0, 100, covers(2), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 100, covers(2), b"ok".to_vec());
         let mut bad = covered_records(&shape(), &[1, 2]);
         bad[1].public_values[pv::HC0] += 1;
         assert_eq!(
@@ -2392,7 +2474,7 @@ mod admission_tests {
     #[test]
     fn step_8_refuses_the_proof_the_executor_refuses() {
         let (l, kp) = setup();
-        let tx = aggregate_tx(&kp, 0, 100, covers(1), b"reject".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 100, covers(1), b"reject".to_vec());
         match l.validate_aggregate(&tx, &covered_records(&shape(), &[1]), &StubExecutor) {
             Err(TxError::InvalidAggregateProof(ConfidentialError::InvalidAggregateProof(_))) => {}
             other => panic!("expected InvalidAggregateProof, got {other:?}"),
@@ -2404,7 +2486,7 @@ mod admission_tests {
     #[test]
     fn validate_inner_names_the_covered_carrying_path() {
         let (l, kp) = setup();
-        let tx = aggregate_tx(&kp, 0, 100, covers(1), b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 100, covers(1), b"ok".to_vec());
         assert_eq!(l.validate(&tx, &StubExecutor), Err(TxError::AggregateNeedsCovered));
     }
 
@@ -2477,8 +2559,15 @@ mod admission_tests {
         let aggregate = |signed: &BindingDomain, proved: &BindingDomain| {
             let proof = StubExecutor::make_aggregate_proof(&proved.aggregate_binding(7, &aggregator, 0));
             let (covers, r) = (covers(2), [9; 8]);
-            let signature = kp.sign(signed.aggregate_signing_hash(7, 0, 100, &r, &covers, &Hash::digest(&proof), &envelope_digest(&env())).as_bytes());
-            Transaction { chain_id: 7, bundle: None, action: Action::Aggregate { covers, proof, aggregator, nonce: 0, time: 100, r, envelope: env(), signature } }
+            let payout_total = base.payout_total_for(&covers).unwrap();
+            let signature = kp.sign(
+                signed.aggregate_signing_hash(7, 0, 100, &r, &covers, &Hash::digest(&proof), &envelope_digest(&env()), payout_total).as_bytes(),
+            );
+            Transaction {
+                chain_id: 7,
+                bundle: None,
+                action: Action::Aggregate { covers, proof, aggregator, nonce: 0, time: 100, r, envelope: env(), signature, payout_total },
+            }
         };
         let covered = covered_records(&shape(), &[1, 2]);
         assert!(base.validate_aggregate(&aggregate(&v1, &v1), &covered, &StubExecutor).is_ok(), "today");
@@ -2551,14 +2640,20 @@ mod payment_tests {
     }
 
     fn gated(window: u64) -> Ledger {
+        gated_with_stake(window, 10)
+    }
+
+    /// [`gated`] with both validators staked at `stake` — at `MIN_STAKE` they are a voting set,
+    /// so the RAND price vote can run on this chain.
+    fn gated_with_stake(window: u64, stake: u64) -> Ledger {
         let (a, b) = keys();
-        let register: BTreeMap<Address, ValidatorEntry> = [entry(&a, 10), entry(&b, 10)].into_iter().collect();
+        let register: BTreeMap<Address, ValidatorEntry> = [entry(&a, stake), entry(&b, stake)].into_iter().collect();
         let mut l = Ledger::new(7, HC, register, &StubExecutor);
         l.set_faucet(true);
         l.set_confidential(true);
         l.set_height(1);
         l.set_aggregation(Some(cfg_with_window(window)));
-        l.set_genesis_supply(300 * crate::types::UNITS_PER_RAND - 20, 20);
+        l.set_genesis_supply(300 * crate::types::UNITS_PER_RAND - 20, 2 * stake);
         l
     }
 
@@ -2611,14 +2706,19 @@ mod payment_tests {
         l.record_anchor(l.height());
     }
 
-    fn aggregate_tx(kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
+    fn aggregate_tx(l: &Ledger, kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
         let aggregator = kp.public_key().address();
         let r = [9; 8];
-        let signature = kp.sign(aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof), &envelope_digest(&env())).as_bytes());
+        // The amount the ledger pays on `l` — what an honest aggregator seals and signs (0 when
+        // the covers are not coverable: a test of a refusal earlier than the payment's).
+        let payout_total = l.payout_total_for(&covers).unwrap_or(0);
+        let signature = kp.sign(
+            aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof), &envelope_digest(&env()), payout_total).as_bytes(),
+        );
         Transaction {
             chain_id: 7,
             bundle: None,
-            action: Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope: env(), signature },
+            action: Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope: env(), signature, payout_total },
         }
     }
 
@@ -2718,7 +2818,7 @@ mod payment_tests {
         l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
         let before = l.supply();
 
-        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         let covered = covered_records(&[1]);
         let v = l.validate_aggregate(&tx, &covered, &StubExecutor).unwrap();
         let subsidy = gas::subsidy(0, &cfg_with_window(256));
@@ -2797,7 +2897,7 @@ mod payment_tests {
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
 
         // The covered exit: the aggregate's note pays subsidy(n) plus the excess, as before.
-        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         let covered = covered_records(&[1]);
         let v = l.validate_aggregate(&tx, &covered, &StubExecutor).unwrap();
         let subsidy = gas::subsidy(0, &cfg_with_window(256));
@@ -2861,7 +2961,7 @@ mod payment_tests {
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
 
         // The covered exit: subsidy(n) plus the 60, nothing of the burned per-word term.
-        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         let covered = covered_records(&[1]);
         let v = l.validate_aggregate(&tx, &covered, &StubExecutor).unwrap();
         let subsidy = gas::subsidy(0, &cfg_with_window(256));
@@ -2922,7 +3022,7 @@ mod payment_tests {
             "the shares pay first; the mint is the shortfall; the aggregator receives the schedule"
         );
 
-        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         let covered = covered_records(&[1]);
         let v = l.validate_aggregate(&tx, &covered, &StubExecutor).unwrap();
         let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], schedule, 0, 1, &[9; 8]);
@@ -2954,7 +3054,7 @@ mod payment_tests {
         let payment = l.aggregate_payment(&[covered_tx.hash()], &cfg, 1, &[9; 8], &payout_addr(), &StubExecutor).unwrap();
         assert_eq!((payment.subsidy, payment.proving_shares, payment.total), (0, 60, 60));
 
-        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
         sidecar.insert(0, covered_records(&[1]));
         l.apply_block_with_covered(&signed_block_with_covered(&l, vec![tx], &a, 2, &sidecar), &sidecar, &StubExecutor)
@@ -3002,7 +3102,7 @@ mod payment_tests {
 
             let payment = l.aggregate_payment(&[covered_tx.hash()], &cfg, 1, &[9; 8], &payout_addr(), &StubExecutor).unwrap();
             assert_eq!((payment.subsidy, payment.proving_shares, payment.total), (0, 60, 60), "net {net}: the shares alone");
-            let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+            let tx = aggregate_tx(&l, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
             l.apply_aggregate(&tx, &covered_records(&[1]), &StubExecutor).unwrap();
             assert!(l.has_commitment(&payment.note), "net {net}: the note is appended");
             assert_eq!(l.supply().subsidised, before.subsidised, "net {net}: nothing is minted");
@@ -3019,14 +3119,14 @@ mod payment_tests {
     /// The dollar-indexed subsidy's section for these tests: $0.004791 a sealed block, a
     /// 0.3 RAND cap, prices usable for 10 blocks.
     fn usd_section() -> crate::ledger::fees::UsdSubsidy {
-        crate::ledger::fees::UsdSubsidy { usd_micros_per_sealed_block: 4_791, max_subsidy_per_block: 300_000_000, price_max_age_blocks: 10, initial_price_micros: None }
+        crate::ledger::fees::UsdSubsidy { usd_micros_per_sealed_block: 4_791, max_subsidy_per_block: 300_000_000, price_max_age_blocks: 10, initial_price_micros: 150_000 }
     }
 
     /// An aggregating ledger under `fees.usd_subsidy` (and `subsidy_net_of_fees` when `net`), at
     /// height 1, holding `price` set at `set_at`, with a registered aggregator and one covered
     /// bundle whose proving share is 60. Returns the ledger, the aggregator key and the cover.
     fn usd_chain(net: bool, price: Option<(u64, u64)>) -> (Ledger, Keypair, Hash) {
-        let mut l = gated(256);
+        let mut l = gated_with_stake(256, crate::ledger::staking::MIN_STAKE);
         l.set_fees(crate::ledger::fees::FeesConfig {
             subsidy_net_of_fees: net.then_some(true),
             usd_subsidy: Some(usd_section()),
@@ -3049,7 +3149,7 @@ mod payment_tests {
         let cfg = l.aggregation().unwrap().clone();
         let payment = l.aggregate_payment(&[cover], &cfg, 1, &[9; 8], &payout_addr(), &StubExecutor).unwrap();
         let before = l.supply();
-        let tx = aggregate_tx(kp, 0, 1, vec![cover], b"ok".to_vec());
+        let tx = aggregate_tx(l, kp, 0, 1, vec![cover], b"ok".to_vec());
         let covered = covered_records(&[1]);
         let v = l.validate_aggregate(&tx, &covered, &StubExecutor).unwrap();
         assert_eq!(v.payout_cm, payment.note, "admission derives the payment's note");
@@ -3082,28 +3182,149 @@ mod payment_tests {
     }
 
     /// A stale price (older than `price_max_age_blocks`) and no price at all both fall back to the
-    /// RAND schedule — exactly the aggregate the chain without the section pays.
+    /// RAND schedule **capped** at `max_subsidy_per_block` (ruling 2026-10-09): here the RAND
+    /// schedule is 100 RAND, so the fallback is the 0.3 RAND cap — a lapsed quorum never mints
+    /// above it. Below the cap the fallback is the RAND schedule itself; without the section it is
+    /// never capped.
     #[test]
-    fn a_stale_or_absent_price_falls_back_to_the_rand_schedule() {
+    fn a_stale_or_absent_price_falls_back_to_the_rand_schedule_capped() {
         let cfg = gated(256).aggregation().unwrap().clone();
         let schedule = gas::subsidy(0, &cfg);
+        let cap = usd_section().max_subsidy_per_block;
+        assert!(schedule > cap, "the RAND schedule is above the cap here");
         // Fresh at the edge: set at 0, height 10 is age 10 = max age.
         let (mut edge, _, _) = usd_chain(false, Some((150_000, 0)));
         edge.set_height(10);
         assert_eq!(edge.schedule_subsidy(0, &cfg), 31_940_000, "age == max age is fresh");
         edge.set_height(11);
-        assert_eq!(edge.schedule_subsidy(0, &cfg), schedule, "age max + 1 is stale");
+        assert_eq!(edge.schedule_subsidy(0, &cfg), cap, "age max + 1 is stale: the RAND schedule, clamped to the cap");
         let (mut stale, kp, cover) = usd_chain(false, Some((150_000, 0)));
         stale.set_height(11);
-        assert_eq!(seal(&mut stale, &kp, cover), (schedule, schedule + 60));
+        assert_eq!(seal(&mut stale, &kp, cover), (cap, cap + 60));
         let (mut absent, kp, cover) = usd_chain(false, None);
-        assert_eq!(seal(&mut absent, &kp, cover), (schedule, schedule + 60));
+        assert_eq!(seal(&mut absent, &kp, cover), (cap, cap + 60));
+        // A RAND schedule under the cap is paid as it is.
+        let small = AggregationConfig { subsidy_base: 1_000, ..cfg.clone() };
+        assert_eq!(schedule_subsidy(0, &small, Some(&usd_section()), None), 1_000);
+        // Without the section the RAND schedule is never capped, and a stray price is never read.
         let mut plain = gated(256);
         let (kp2, _) = keys();
         register(&mut plain, &kp2, 10);
-        assert_eq!(plain.schedule_subsidy(0, &cfg), schedule, "no section: the RAND schedule");
+        assert_eq!(plain.schedule_subsidy(0, &cfg), schedule, "no section: the RAND schedule, uncapped");
         plain.set_rand_price(Some(crate::ledger::rand_price::RandPrice { price_micros_per_rand: 1, set_at_height: 1, nonce: 0 }));
         assert_eq!(plain.schedule_subsidy(0, &cfg), schedule, "a stray price without the section is never read");
+    }
+
+    /// A `SetRandPrice` signed by both validators of the usd chain (the whole voting set).
+    fn price_vote(l: &Ledger, price: u64, nonce: u64) -> Transaction {
+        let (a, b) = keys();
+        let m = crate::types::actions::set_rand_price_message(&l.signing_domain().genesis, price, nonce);
+        let mut votes: Vec<(crate::crypto::PublicKey, Signature)> =
+            [&a, &b].iter().map(|k| (k.public_key().clone(), k.sign(m.as_bytes()))).collect();
+        votes.sort_by_key(|(k, _)| k.address());
+        Transaction { chain_id: 7, bundle: None, action: Action::SetRandPrice { price_micros_per_rand: price, nonce, votes } }
+    }
+
+    /// Important 1 (review 2026-10-09): a price vote ahead of an aggregate in one block — the
+    /// proposer applies ordinary transactions before aggregates, so a same-block vote always
+    /// lands first — moves the schedule under an aggregate sealed at the old price. Before the
+    /// fix the aggregate applied and its note carried the ledger's new amount, which its envelope
+    /// could not open: subsidy and shares lost. Now it is refused `PayoutMismatch`, the block
+    /// carrying both is invalid, nothing leaves the bucket; re-sealed at the new amount it applies,
+    /// and a replica replaying the two blocks lands on the same root.
+    #[test]
+    fn a_price_vote_ahead_of_an_aggregate_refuses_it_rather_than_underpaying() {
+        let (l, kp, cover) = usd_chain(false, Some((150_000, 0)));
+        let (a, _) = keys();
+        let sealed = aggregate_tx(&l, &kp, 0, 1, vec![cover], b"ok".to_vec());
+        let Action::Aggregate { payout_total, .. } = sealed.action else { unreachable!() };
+        assert_eq!(payout_total, 31_940_000 + 60, "sealed at $0.15");
+        let vote = price_vote(&l, 300_000, 1);
+        let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
+        sidecar.insert(1, covered_records(&[1]));
+
+        // The vote first, then the aggregate, in one block: the aggregate is refused.
+        let mut after_vote = l.clone();
+        after_vote.set_height(2);
+        after_vote.apply_tx(&vote, &a.address(), &StubExecutor).unwrap();
+        let e = after_vote.validate_aggregate(&sealed, &covered_records(&[1]), &StubExecutor).unwrap_err();
+        assert_eq!(e, TxError::Aggregation(AggregationError::PayoutMismatch { expected: 15_970_000 + 60, got: 31_940_060 }));
+        let before = after_vote.clone();
+        assert!(after_vote.apply_aggregate(&sealed, &covered_records(&[1]), &StubExecutor).is_err());
+        assert_eq!(after_vote, before, "a refused aggregate writes nothing");
+        assert!(after_vote.unsealed_fees().contains_key(&cover), "the share stays in the bucket");
+        assert_eq!(after_vote.supply(), before.supply(), "nothing minted");
+        assert_eq!(after_vote.check_aggregate_payout(&sealed), Err(e.clone()), "the pool's check agrees");
+        let mut replica = l.clone();
+        let mut whole = l.clone();
+        whole.set_height(2);
+        assert!(
+            whole.apply_transactions_with_covered(&[vote.clone(), sealed.clone()], &a.address(), &sidecar, &StubExecutor).is_err(),
+            "a block carrying the vote and the stale aggregate is invalid"
+        );
+
+        // Block 2 carries the vote alone; block 3 the aggregate re-sealed at the new amount.
+        let mut chain = l.clone();
+        let b2 = signed_block(&chain, vec![vote.clone()], &a, 2);
+        chain.apply_block(&b2, &StubExecutor).unwrap();
+        let resealed = aggregate_tx(&chain, &kp, 0, 1, vec![cover], b"ok".to_vec());
+        let Action::Aggregate { payout_total, .. } = resealed.action else { unreachable!() };
+        assert_eq!(payout_total, 15_970_000 + 60, "re-sealed at $0.30");
+        let mut sidecar3: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
+        sidecar3.insert(0, covered_records(&[1]));
+        let b3 = signed_block_with_covered(&chain, vec![resealed.clone()], &a, 3, &sidecar3);
+        chain.apply_block_with_covered(&b3, &sidecar3, &StubExecutor).unwrap();
+        assert!(!chain.unsealed_fees().contains_key(&cover), "covered once paid");
+        assert!(chain.audit().invariant_holds(), "{:?}", chain.audit());
+        replica.apply_block(&b2, &StubExecutor).unwrap();
+        replica.apply_block_with_covered(&b3, &sidecar3, &StubExecutor).unwrap();
+        assert_eq!(replica.state_root(), chain.state_root(), "replica equality across the vote and the aggregate");
+    }
+
+    /// The staleness edge: sealed while the price is fresh (age 10 of 10), applied one block later
+    /// (age 11) — the schedule fell back to the capped RAND schedule, and the aggregate is
+    /// refused, not paid the fallback into its dollar-sealed note.
+    #[test]
+    fn an_aggregate_sealed_fresh_and_applied_stale_is_refused() {
+        let (mut l, kp, cover) = usd_chain(false, Some((150_000, 0)));
+        l.set_height(10);
+        let sealed = aggregate_tx(&l, &kp, 0, 1, vec![cover], b"ok".to_vec());
+        assert_eq!(l.check_aggregate_payout(&sealed), Ok(()));
+        l.set_height(11);
+        let cap = usd_section().max_subsidy_per_block;
+        let e = l.validate_aggregate(&sealed, &covered_records(&[1]), &StubExecutor).unwrap_err();
+        assert_eq!(e, TxError::Aggregation(AggregationError::PayoutMismatch { expected: cap + 60, got: 31_940_060 }));
+        assert!(l.unsealed_fees().contains_key(&cover));
+    }
+
+    /// The halving edge, which predates the dollar subsidy: an aggregate sealed at
+    /// `subsidy(n)` and applied after another aggregate moved `sealed_blocks` across a halving
+    /// was paid half into a note sealed for the whole. Now refused.
+    #[test]
+    fn an_aggregate_sealed_before_a_halving_and_applied_after_it_is_refused() {
+        let mut l = gated(256);
+        let (kp, _) = keys();
+        register(&mut l, &kp, 10);
+        l.record_anchor(1);
+        let p = proposer(&l);
+        let covered_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE + 60, 0), Action::None));
+        l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
+        let cfg = l.aggregation().unwrap().clone();
+        let mut s = l.supply();
+        s.sealed_blocks = cfg.halving_blocks - 1;
+        l.set_supply(s);
+        let sealed = aggregate_tx(&l, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let full = gas::subsidy(cfg.halving_blocks - 1, &cfg);
+        let Action::Aggregate { payout_total, .. } = sealed.action else { unreachable!() };
+        assert_eq!(payout_total, full + 60);
+        let mut s = l.supply();
+        s.sealed_blocks = cfg.halving_blocks;
+        l.set_supply(s);
+        let e = l.validate_aggregate(&sealed, &covered_records(&[1]), &StubExecutor).unwrap_err();
+        assert_eq!(e, TxError::Aggregation(AggregationError::PayoutMismatch { expected: full / 2 + 60, got: full + 60 }));
+        // Re-sealed on the new state it applies, as an aggregate always did.
+        let resealed = aggregate_tx(&l, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        l.apply_aggregate(&resealed, &covered_records(&[1]), &StubExecutor).unwrap();
     }
 
     /// With `subsidy_net_of_fees` the dollar schedule is netted exactly as the RAND one: the note
@@ -3165,7 +3386,7 @@ mod payment_tests {
         assert_eq!(l.unsealed_fees()[&covered_tx.hash()].0, tip + 600_000, "the tip and 60 % of the base bucketed");
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
 
-        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         let covered = covered_records(&[1]);
         let cfg = l.aggregation().unwrap().clone();
         let payment = l.aggregate_payment(&[covered_tx.hash()], &cfg, 1, &[9; 8], &payout_addr(), &StubExecutor).unwrap();
@@ -3249,7 +3470,7 @@ mod payment_tests {
         assert_eq!(l.unsealed_fees()[&covered_tx.hash()].0, tip + 600_000, "the tip and prove_base bucketed");
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
 
-        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         let covered = covered_records(&[1]);
         let subsidy = gas::subsidy(0, l.aggregation().unwrap());
         let want_cm = StubExecutor.note_commitment(&payout_addr().pk, &[0; 8], subsidy + tip + 600_000, 0, 1, &[9; 8]);
@@ -3280,7 +3501,7 @@ mod payment_tests {
         let shares = tip + 600_000 + 600_000;
         let payment = l.aggregate_payment(&[covered_tx.hash()], &cfg, 1, &[9; 8], &payout_addr(), &StubExecutor).unwrap();
         assert_eq!((payment.subsidy, payment.proving_shares, payment.total), (0, shares, shares));
-        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         l.apply_aggregate(&tx, &covered_records(&[1]), &StubExecutor).unwrap();
         assert!(l.has_commitment(&payment.note));
         assert_eq!(l.supply().subsidised, before.subsidised, "nothing minted");
@@ -3303,7 +3524,7 @@ mod payment_tests {
         for (i, tag) in [30u8, 40].iter().enumerate() {
             let p = proposer(&l);
             l.bucket_excess(Hash::digest(&[*tag]), 0, p, u64::MAX);
-            let tx = aggregate_tx(&kp, i as u64, (i + 1) as u32, vec![Hash::digest(&[*tag])], b"ok".to_vec());
+            let tx = aggregate_tx(&l, &kp, i as u64, (i + 1) as u32, vec![Hash::digest(&[*tag])], b"ok".to_vec());
             l.apply_aggregate(&tx, &covered_records(&[1]), &StubExecutor).unwrap();
         }
         assert_eq!(l.supply().sealed_blocks, 2);
@@ -3365,7 +3586,7 @@ mod payment_tests {
         ));
         l.apply_tx(&covered_tx, &p, &StubExecutor).unwrap();
         check(&l, "a fee-paying bundle");
-        let agg_tx = aggregate_tx(&a, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let agg_tx = aggregate_tx(&l, &a, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         l.apply_aggregate(&agg_tx, &covered_records(&[1]), &StubExecutor).unwrap();
         check(&l, "the covering aggregate");
 
@@ -3444,7 +3665,7 @@ mod payment_tests {
         let covered_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], fee, 0), Action::None));
         l.apply_block(&signed_block(&l, vec![covered_tx.clone()], &a, 1), &StubExecutor).unwrap();
 
-        let tx = aggregate_tx(&kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
         sidecar.insert(0, covered_records(&[1]));
         let block = signed_block_with_covered(&l, vec![tx.clone()], &a, 2, &sidecar);
@@ -3496,8 +3717,8 @@ mod payment_tests {
     #[test]
     fn a_block_carrying_two_aggregates_is_refused_at_the_second() {
         let (mut l, a, kp, c1, c2) = two_covered(256);
-        let t1 = aggregate_tx(&kp, 0, 1, vec![c1.hash()], b"ok".to_vec());
-        let t2 = aggregate_tx(&kp, 1, 2, vec![c2.hash()], b"ok2".to_vec());
+        let t1 = aggregate_tx(&l, &kp, 0, 1, vec![c1.hash()], b"ok".to_vec());
+        let t2 = aggregate_tx(&l, &kp, 1, 2, vec![c2.hash()], b"ok2".to_vec());
         let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
         sidecar.insert(0, covered_records(&[1]));
         sidecar.insert(1, covered_records(&[2]));
@@ -3517,12 +3738,12 @@ mod payment_tests {
         let (mut l, a, kp, c1, _) = two_covered(256);
         let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
         sidecar.insert(0, covered_records(&[1]));
-        let first = aggregate_tx(&kp, 0, 1, vec![c1.hash()], b"ok".to_vec());
+        let first = aggregate_tx(&l, &kp, 0, 1, vec![c1.hash()], b"ok".to_vec());
         l.apply_block_with_covered(&signed_block_with_covered(&l, vec![first], &a, 2, &sidecar), &sidecar, &StubExecutor)
             .unwrap();
         assert_eq!(l.supply().sealed_blocks, 1);
         let subsidised = l.supply().subsidised;
-        let replay = aggregate_tx(&kp, 1, 1, vec![c1.hash()], b"ok".to_vec());
+        let replay = aggregate_tx(&l, &kp, 1, 1, vec![c1.hash()], b"ok".to_vec());
         // Admission's half first (audit v6 HB-4): `validate_aggregate` is the pool's entry and
         // must name the sealed cover itself, not only the block apply below. (Step 4's explicit
         // membership check and step 5's payout derivation read the same set and refuse with the
@@ -3554,7 +3775,7 @@ mod payment_tests {
         assert!(l.unsealed_fees().is_empty(), "the window passed: both entries resolved");
         let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
         sidecar.insert(0, covered_records(&[1]));
-        let late = aggregate_tx(&kp, 0, 4, vec![c1.hash()], b"ok".to_vec());
+        let late = aggregate_tx(&l, &kp, 0, 4, vec![c1.hash()], b"ok".to_vec());
         let block = unchecked_block(&l, vec![late], &a, 4);
         match l.apply_block_with_covered(&block, &sidecar, &StubExecutor) {
             Err(crate::ledger::BlockError::InvalidTx {
@@ -3576,7 +3797,7 @@ mod payment_tests {
         let floor = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE, 0), Action::None));
         l.apply_block(&signed_block(&l, vec![floor.clone()], &a, 1), &StubExecutor).unwrap();
         assert_eq!(l.unsealed_fees().get(&floor.hash()).map(|e| e.0), Some(0), "coverable, with no excess");
-        let tx = aggregate_tx(&kp, 0, 1, vec![floor.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 1, vec![floor.hash()], b"ok".to_vec());
         let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
         sidecar.insert(0, covered_records(&[1]));
         l.apply_block_with_covered(&signed_block_with_covered(&l, vec![tx], &a, 2, &sidecar), &sidecar, &StubExecutor)
@@ -3880,7 +4101,7 @@ mod payment_tests {
         let covered_tx = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[21; 8], [22; 8]], [[23; 8], [24; 8]], gas::BUNDLE_BASE + 60, 0), Action::None));
         l.apply_block(&signed_block(&l, vec![covered_tx.clone()], &a, 1), &StubExecutor).unwrap();
 
-        let tx = aggregate_tx(&kp, 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&l, &kp, 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
         let covered = covered_records(&[1]);
         let mut sidecar: BTreeMap<usize, Vec<CoveredBundle>> = BTreeMap::new();
         sidecar.insert(0, covered.clone());
@@ -3905,7 +4126,7 @@ mod payment_tests {
     fn signed_header(kp: &Keypair, nonce: u64, covers: Vec<Hash>) -> crate::types::SignedAggregateHeader {
         let aggregator = kp.public_key().address();
         let proof_hash = Hash::digest(b"p");
-        let signature = kp.sign(aggregate_signing_hash(7, nonce, 9, &[1; 8], &covers, &proof_hash, &Hash::ZERO).as_bytes());
+        let signature = kp.sign(aggregate_signing_hash(7, nonce, 9, &[1; 8], &covers, &proof_hash, &Hash::ZERO, 0).as_bytes());
         crate::types::SignedAggregateHeader { aggregator, nonce, time: 9, r: [1; 8], covers, proof_hash, signature }
     }
 }

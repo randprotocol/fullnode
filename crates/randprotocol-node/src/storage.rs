@@ -4809,7 +4809,7 @@ pub(crate) mod fixtures {
             usd_micros_per_sealed_block: 4_791,
             max_subsidy_per_block: 300_000_000,
             price_max_age_blocks: 100,
-            initial_price_micros: Some(150_000),
+            initial_price_micros: 150_000,
         }
     }
 
@@ -9617,14 +9617,19 @@ mod seal_tests {
         }
     }
 
-    fn aggregate_tx(kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
+    /// An aggregate signed for the payout `l` pays now (`Ledger::payout_total_for`).
+    fn aggregate_tx(l: &Ledger, kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
         let aggregator = kp.public_key().address();
         let r = [9; 8];
-        let signature = kp.sign(aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof), &randprotocol_core::types::actions::envelope_digest(&env(9))).as_bytes());
+        let payout_total = l.payout_total_for(&covers).unwrap_or(0);
+        let signature = kp.sign(
+            aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof), &randprotocol_core::types::actions::envelope_digest(&env(9)), payout_total)
+                .as_bytes(),
+        );
         Transaction {
             chain_id: 7,
             bundle: None,
-            action: Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope: env(9), signature },
+            action: Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope: env(9), signature, payout_total },
         }
     }
 
@@ -9686,7 +9691,7 @@ mod seal_tests {
         let b1 = make_block_unchecked(&gs.block, &l1, vec![covered_tx.clone(), register], &key(1));
         storage.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
 
-        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
+        let aggregate = aggregate_tx(&l1, &key(7), 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
         let record = storage.covered_record(&covered_tx.hash(), FriProfile::Test).unwrap().unwrap();
         let sidecar: BTreeMap<usize, Vec<CoveredBundle>> = [(0usize, vec![record])].into_iter().collect();
         let mut l2 = l1.clone();
@@ -9714,7 +9719,7 @@ mod seal_tests {
         assert!(!storage.block_sealed(&block1.hash()).unwrap(), "a bundle short of full coverage keeps the flag down");
         // ...until a second aggregate covers the register's bundle as well.
         let register_tx = &block1.transactions[1];
-        let second = aggregate_tx(&key(7), 1, 3, vec![register_tx.hash()], b"ok".to_vec());
+        let second = aggregate_tx(&storage.load_ledger(&StubExecutor).unwrap(), &key(7), 1, 3, vec![register_tx.hash()], b"ok".to_vec());
         let l3 = {
             let mut l = storage.load_ledger(&StubExecutor).unwrap();
             l.set_height(3);
@@ -9905,7 +9910,7 @@ mod seal_tests {
         live.commit(std::slice::from_ref(&b1), &l1, &[], &StubExecutor).unwrap();
 
         let covers = vec![transfer.hash(), deploy.hash()];
-        let aggregate = aggregate_tx(&key(7), 0, 2, covers, b"ok".to_vec());
+        let aggregate = aggregate_tx(&l1, &key(7), 0, 2, covers, b"ok".to_vec());
         let sidecar: BTreeMap<usize, Vec<CoveredBundle>> =
             [(0usize, vec![stub_pruned_facts(&transfer), stub_pruned_facts(&deploy)])].into_iter().collect();
         let mut l2 = l1.clone();
@@ -9986,7 +9991,7 @@ mod seal_tests {
         // Block 2 carries the aggregate over it (stored unchecked: the seal rows are storage's,
         // written by `commit` off the transaction, whatever the ledger made of it); block 3 a
         // second bundle, sealed and pruned by hand so it owns every row a bundle can own.
-        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
+        let aggregate = aggregate_tx(&ledger, &key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
         let b2 = make_block_unchecked(&b1, &ledger, vec![aggregate.clone()], &key(1));
         storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
         let later = bundle_tx(&ledger, [[31; 8], [32; 8]], [[33; 8], [34; 8]], bundle_fee());
@@ -10037,7 +10042,7 @@ mod seal_tests {
         let second = bundle_tx(&ledger, [[25; 8], [26; 8]], [[27; 8], [28; 8]], bundle_fee());
         let b2 = make_block(&b1, &mut ledger, vec![second], &key(1));
         storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
-        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
+        let aggregate = aggregate_tx(&ledger, &key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
         let b3 = make_block_unchecked(&b2, &ledger, vec![aggregate.clone()], &key(1));
         storage.commit(std::slice::from_ref(&b3), &ledger, &[], &StubExecutor).unwrap();
         let later = bundle_tx(&ledger, [[31; 8], [32; 8]], [[33; 8], [34; 8]], bundle_fee());
@@ -10184,7 +10189,7 @@ mod seal_tests {
         let covered = CoveredBundle { public_values: pv, shape };
 
         // Block 2: the aggregate, applied against that record.
-        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
+        let aggregate = aggregate_tx(&l1, &key(7), 0, 2, vec![covered_tx.hash()], b"ok".to_vec());
         let sidecar: BTreeMap<usize, Vec<CoveredBundle>> = [(0usize, vec![covered.clone()])].into_iter().collect();
         let mut l2 = l1.clone();
         l2.set_height(2);
@@ -10348,7 +10353,7 @@ mod seal_tests {
         let covered = bundle_tx(&ledger, [[21; 8], [22; 8]], [[23; 8], [24; 8]], bundle_fee());
         let b1 = make_block(&gs.block, &mut ledger, vec![covered.clone()], &key(1));
         storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
-        let aggregate = aggregate_tx(&key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
+        let aggregate = aggregate_tx(&ledger, &key(7), 0, 2, vec![covered.hash()], b"ok".to_vec());
         let b2 = make_block_unchecked(&b1, &ledger, vec![], &key(1));
         storage.commit(std::slice::from_ref(&b2), &ledger, &[], &StubExecutor).unwrap();
         let b3 = make_block_unchecked(&b2, &ledger, vec![aggregate], &key(1));

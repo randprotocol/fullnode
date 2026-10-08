@@ -627,7 +627,7 @@ async fn usd_subsidy_rules_and_the_rand_price_on_the_wire() {
                 usd_micros_per_sealed_block: 4_791,
                 max_subsidy_per_block: 300_000_000,
                 price_max_age_blocks: 72_000,
-                initial_price_micros: Some(150_000),
+                initial_price_micros: 150_000,
             }),
             ..Default::default()
         });

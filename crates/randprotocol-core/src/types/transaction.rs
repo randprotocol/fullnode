@@ -217,6 +217,12 @@ pub enum Action {
         r: Word8,
         envelope: Envelope,
         signature: Signature,
+        /// The payout note's amount the aggregator sealed its envelope for — subsidy plus covered
+        /// proving shares. Signed, and checked against the ledger's own payment at admission and
+        /// apply (`AggregationError::PayoutMismatch`): an aggregate whose amount the chain no
+        /// longer pays (a price vote, the price going stale, a halving, between sealing and
+        /// inclusion) is refused rather than paid into a note its envelope cannot open.
+        payout_total: u64,
     },
     /// RPL (spec §4): create a token. Permissionless — anyone who pays the bundle base plus the
     /// registry's `registration_fee` gets the next dense index — and content-addressed: the
@@ -704,7 +710,7 @@ impl Action {
                 }
             }
             Action::SlashAggregator { a, b } => Action::SlashAggregator { a: a.clone(), b: b.clone() },
-            Action::Aggregate { covers, proof: _, aggregator, nonce, time, r, envelope, signature } => {
+            Action::Aggregate { covers, proof: _, aggregator, nonce, time, r, envelope, signature, payout_total } => {
                 Action::Aggregate {
                     covers: covers.clone(),
                     proof: Vec::new(),
@@ -714,6 +720,7 @@ impl Action {
                     r: *r,
                     envelope: envelope.clone(),
                     signature: signature.clone(),
+                    payout_total: *payout_total,
                 }
             }
             Action::RegisterToken { name, symbol, decimals, authority, initial, salt, index } => {
@@ -1539,6 +1546,7 @@ mod tests {
                 r: [6; 8],
                 envelope: env(),
                 signature: Signature::empty(),
+                payout_total: 7,
             },
         };
         let got = |tx: &Transaction| {
@@ -1590,8 +1598,13 @@ mod tests {
     /// move.
     const ATTEST_ENCODING_BLAKE3: &str = "1de4200cee6184eec917fcf13ec968f926157cecaf1fe7c4b249fe00ee561836";
     const ATTEST_ID: &str = "2234de2343de1cb0ae0b758bc3765fce6b3d49e74ec7b8fd7abc6f0da87c2ef6";
-    const AGGREGATE_ENCODING_BLAKE3: &str = "c5f06333b3d6f2e744f6edeb66b612723c1bc4fcf7f98fd8249b40226af64d64";
-    const AGGREGATE_ID: &str = "da7be1091cabf0cc0489eb619aab0ad5801970c965ecef6e2912a3168845afb2";
+    /// Moved by dollar-indexed prover pay (2026-10-09), deliberately: `Aggregate` gained its last
+    /// field, `payout_total` (here 7), so its encoding grows by eight bytes and its id moves. No
+    /// chain has ever carried an aggregate. Before: encoding
+    /// `c5f06333b3d6f2e744f6edeb66b612723c1bc4fcf7f98fd8249b40226af64d64`, id
+    /// `da7be1091cabf0cc0489eb619aab0ad5801970c965ecef6e2912a3168845afb2`.
+    const AGGREGATE_ENCODING_BLAKE3: &str = "63ed7180e0defbb91de02fea939a270d19ba91f3bc3fa5927ed772b0add16c45";
+    const AGGREGATE_ID: &str = "838707beb61a7c84d159e0873b8a74b184ba6054ce3d3b78e594cc3e5a7ac8f2";
 
     #[test]
     fn transactions_roundtrip_and_hash_their_full_encoding() {
@@ -2062,6 +2075,7 @@ mod tests {
                 r: [3; 8],
                 envelope: env(),
                 signature: sig(),
+                payout_total: 9,
             },
             14 => Action::RegisterToken {
                 name: "Test Coin".into(),
@@ -2490,6 +2504,10 @@ mod tests {
             (43, "rotate threshold", |t| {
                 let Action::MultisigRotate { threshold, .. } = &mut t.action else { panic!() };
                 *threshold += 1;
+            }),
+            (13, "aggregate payout total", |t| {
+                let Action::Aggregate { payout_total, .. } = &mut t.action else { panic!() };
+                *payout_total += 1;
             }),
             (44, "price", |t| {
                 let Action::SetRandPrice { price_micros_per_rand, .. } = &mut t.action else { panic!() };

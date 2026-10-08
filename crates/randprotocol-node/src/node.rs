@@ -7601,11 +7601,16 @@ mod tests {
         }
     }
 
-    fn aggregate_tx(chain_id: u64, kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
+    /// An aggregate signed for the payout `l` pays now (`Ledger::payout_total_for`; 0 for covers
+    /// it does not hold — a test of an earlier refusal).
+    fn aggregate_tx(l: &Ledger, chain_id: u64, kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
         let aggregator = kp.public_key().address();
         let r = [9; 8];
-        let signature =
-            kp.sign(aggregate_signing_hash(chain_id, nonce, time, &r, &covers, &Hash::digest(&proof), &randprotocol_core::types::actions::envelope_digest(&env(9))).as_bytes());
+        let payout_total = l.payout_total_for(&covers).unwrap_or(0);
+        let signature = kp.sign(
+            aggregate_signing_hash(chain_id, nonce, time, &r, &covers, &Hash::digest(&proof), &randprotocol_core::types::actions::envelope_digest(&env(9)), payout_total)
+                .as_bytes(),
+        );
         Transaction {
             chain_id,
             bundle: None,
@@ -7618,6 +7623,7 @@ mod tests {
                 r,
                 envelope: env(9),
                 signature,
+                payout_total,
             },
         }
     }
@@ -7787,7 +7793,7 @@ mod tests {
         leader.start();
         peer.start();
 
-        let tx = aggregate_tx(7, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&ledger, 7, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         let acts = leader.propose(1, vec![tx.clone()], 1).expect("the leader's own block must apply");
         let block = acts
             .iter()
@@ -7974,7 +7980,7 @@ mod tests {
 
         let bundle = tipping_bundle(leader.tip_ledger(), 31);
         let (time, r) = (1, [9; 8]);
-        let aggregate = aggregate_tx(7, &key(7), 0, time, vec![covered_tx.hash()], b"ok".to_vec());
+        let aggregate = aggregate_tx(leader.tip_ledger(), 7, &key(7), 0, time, vec![covered_tx.hash()], b"ok".to_vec());
         let (b2, _) = propose_to_all(&mut leader, &mut [&mut peer], &storage, vec![bundle.clone(), aggregate.clone()], 2);
         assert_eq!(
             b2.transactions.iter().map(|t| t.hash()).collect::<Vec<_>>(),
@@ -8026,7 +8032,7 @@ mod tests {
     fn under_both_fee_rules_the_roots_still_agree_after_a_restart_and_the_counters_persist() {
         let (_d, storage, gs, covered_tx, _b1_ledger) = fee_rules_chain();
         let (mut leader, mut peer) = (resume_over(&storage, &gs), resume_over(&storage, &gs));
-        let aggregate = aggregate_tx(7, &key(7), 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let aggregate = aggregate_tx(leader.tip_ledger(), 7, &key(7), 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         let bundle = tipping_bundle(leader.tip_ledger(), 31);
         propose_to_all(&mut leader, &mut [&mut peer], &storage, vec![bundle, aggregate.clone()], 2);
         let mut now = 3;
@@ -8116,7 +8122,7 @@ mod tests {
         let (_d, storage, gs, covered_tx, _b1_ledger) = fee_rules_chain();
         let (mut leader, mut peer) = (resume_over(&storage, &gs), resume_over(&storage, &gs));
         let bundle = tipping_bundle(leader.tip_ledger(), 31);
-        let aggregate = aggregate_tx(7, &key(7), 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let aggregate = aggregate_tx(leader.tip_ledger(), 7, &key(7), 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         let cache = Arc::new(CountingVerified::of(&[bundle.hash(), aggregate.hash()]));
         if cached {
             leader.set_verified_proofs(cache.clone());
@@ -8617,7 +8623,7 @@ mod tests {
                 covered = Some(tx.clone());
                 vec![tx]
             } else if h == aggregate_at {
-                let tx = aggregate_tx(7, &key(7), 0, 1, vec![covered.as_ref().unwrap().hash()], b"ok".to_vec());
+                let tx = aggregate_tx(&ledger_after, 7, &key(7), 0, 1, vec![covered.as_ref().unwrap().hash()], b"ok".to_vec());
                 agg = Some(tx.clone());
                 vec![tx]
             } else if fat.contains(&h) {
@@ -8772,7 +8778,7 @@ mod tests {
                     covered = Some(tx.clone());
                     vec![tx]
                 }
-                5 => vec![aggregate_tx(7, &key(7), 0, 1, vec![covered.as_ref().unwrap().hash()], b"ok".to_vec())],
+                5 => vec![aggregate_tx(&ledger_after, 7, &key(7), 0, 1, vec![covered.as_ref().unwrap().hash()], b"ok".to_vec())],
                 _ => vec![],
             };
             ledger_after.record_anchor(h);
@@ -8822,13 +8828,13 @@ mod tests {
             fixture_hc(&crate::agg_executor::fixture_proof(0)),
         )));
         // Wrong chain id *and* an unknown cover: the byte verdict must come first.
-        let tx = aggregate_tx(99, &kp, 0, 1, vec![Hash::digest(b"unknown")], b"ok".to_vec());
+        let tx = aggregate_tx(&gated, 99, &kp, 0, 1, vec![Hash::digest(b"unknown")], b"ok".to_vec());
         match validate_for_pool(&tx, &gated, &storage, randprotocol_core::types::FriProfile::Test, &StubExecutor) {
             Err(randprotocol_core::TxError::WrongChain { expected: 7, actual: 99 }) => {}
             other => panic!("the preflight's WrongChain must precede assembly, got {other:?}"),
         }
         // Ungated: the gate is the preflight's first check.
-        let tx = aggregate_tx(7, &kp, 0, 1, vec![], b"ok".to_vec());
+        let tx = aggregate_tx(&gated, 7, &kp, 0, 1, vec![], b"ok".to_vec());
         assert_eq!(
             validate_for_pool(&tx, &gs.ledger, &storage, randprotocol_core::types::FriProfile::Test, &StubExecutor),
             Err(randprotocol_core::TxError::UnsupportedAction("aggregation"))
@@ -8872,15 +8878,15 @@ mod tests {
             })
         };
         let h = |i: u8| Hash::digest(&[i]);
-        let repeated = aggregate_tx(7, &kp, 0, 1, vec![h(1); 1000], b"junk".to_vec());
-        let too_many = aggregate_tx(7, &kp, 0, 1, (0..4).map(h).collect(), b"junk".to_vec());
-        let empty = aggregate_tx(7, &kp, 0, 1, vec![], b"junk".to_vec());
-        let unknown = aggregate_tx(7, &key(8), 0, 1, vec![h(1)], b"junk".to_vec());
-        let mut forged = aggregate_tx(7, &kp, 0, 1, vec![h(1)], b"junk".to_vec());
+        let repeated = aggregate_tx(&ledger, 7, &kp, 0, 1, vec![h(1); 1000], b"junk".to_vec());
+        let too_many = aggregate_tx(&ledger, 7, &kp, 0, 1, (0..4).map(h).collect(), b"junk".to_vec());
+        let empty = aggregate_tx(&ledger, 7, &kp, 0, 1, vec![], b"junk".to_vec());
+        let unknown = aggregate_tx(&ledger, 7, &key(8), 0, 1, vec![h(1)], b"junk".to_vec());
+        let mut forged = aggregate_tx(&ledger, 7, &kp, 0, 1, vec![h(1)], b"junk".to_vec());
         if let randprotocol_core::types::Action::Aggregate { signature, .. } = &mut forged.action {
             *signature = key(8).sign(b"not the aggregate's signing hash");
         }
-        let stale = aggregate_tx(7, &kp, 3, 1, vec![h(1)], b"junk".to_vec());
+        let stale = aggregate_tx(&ledger, 7, &kp, 3, 1, vec![h(1)], b"junk".to_vec());
         for (what, tx) in [
             ("repeated", &repeated),
             ("too many", &too_many),
@@ -8903,7 +8909,7 @@ mod tests {
             assert_eq!(reads.get(), 0, "{what}: no cover was read from the store");
         }
         // A well-formed one does reach the store, once per cover.
-        let fine = aggregate_tx(7, &kp, 0, 1, vec![h(1), h(2)], b"junk".to_vec());
+        let fine = aggregate_tx(&ledger, 7, &kp, 0, 1, vec![h(1), h(2)], b"junk".to_vec());
         assert!(run(&fine).is_err());
         assert_eq!(reads.get(), 2, "the honest set is assembled");
     }
@@ -8923,12 +8929,12 @@ mod tests {
         // As above: the stored bundle into the coverable set the gated apply would have built.
         ledger.set_unsealed_fees([(covered_tx.hash(), (0, key(1).address(), u64::MAX))].into_iter().collect());
 
-        let tx = aggregate_tx(7, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&ledger, 7, &kp, 0, 1, vec![covered_tx.hash()], b"ok".to_vec());
         validate_for_pool(&tx, &ledger, &storage, randprotocol_core::types::FriProfile::Test, &StubExecutor)
             .expect("a well-formed aggregate over a stored bundle validates");
         // And the state-dependent verdicts come off the snapshot: a wrong nonce is the
         // register's answer, not assembly's.
-        let tx = aggregate_tx(7, &kp, 5, 1, vec![covered_tx.hash()], b"ok".to_vec());
+        let tx = aggregate_tx(&ledger, 7, &kp, 5, 1, vec![covered_tx.hash()], b"ok".to_vec());
         match validate_for_pool(&tx, &ledger, &storage, randprotocol_core::types::FriProfile::Test, &StubExecutor) {
             Err(randprotocol_core::TxError::Aggregation(AggregationError::BadNonce { expected: 0, actual: 5 })) => {}
             other => panic!("expected BadNonce, got {other:?}"),

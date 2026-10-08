@@ -636,6 +636,12 @@ pub fn aggregate_binding(chain_id: u64, aggregator: &crate::crypto::Address, non
 /// read as one over the new; no chain has ever carried an aggregate, so nothing signed under the
 /// old domain exists. `SignedAggregateHeader` (the retired slashing evidence) carries no envelope
 /// and is never verified any more; its signers pass the digest of whatever envelope they paid to.
+///
+/// Dollar-indexed prover pay (2026-10-09; dormant — aggregation is on no chain): the payout
+/// note's amount, `payout_total`, joined the preimage, and the domain moved with it,
+/// `rand-aggregate-2` → `rand-aggregate-4` (`rand-aggregate-3` is the genesis-bound form's,
+/// `BindingDomain::aggregate_signing_hash`, which moved to `rand-aggregate-5`).
+#[allow(clippy::too_many_arguments)]
 pub fn aggregate_signing_hash(
     chain_id: u64,
     nonce: u64,
@@ -644,7 +650,9 @@ pub fn aggregate_signing_hash(
     covers: &[crate::crypto::Hash],
     proof_hash: &crate::crypto::Hash,
     envelope_digest: &crate::crypto::Hash,
+    payout_total: u64,
 ) -> crate::crypto::Hash {
-    let bytes = bincode::serialize(&(chain_id, nonce, time, r, covers, proof_hash, envelope_digest)).expect("serializes");
-    crate::crypto::Hash::digest_domain(b"rand-aggregate-2", &bytes)
+    let bytes =
+        bincode::serialize(&(chain_id, nonce, time, r, covers, proof_hash, envelope_digest, payout_total)).expect("serializes");
+    crate::crypto::Hash::digest_domain(b"rand-aggregate-4", &bytes)
 }
