@@ -497,7 +497,8 @@ pub struct Genesis {
     /// `proposer_share_bps` (0..=10 000) keeps that share of the base to the proposer and
     /// buckets the rest as proving share, `prove_base` raises every bundle's floor by a proving
     /// share bucketed whole ([`GenesisError::ProposerShareWithoutAggregation`],
-    /// [`GenesisError::ProveBaseWithoutAggregation`], [`GenesisError::ProposerShareOutOfRange`]).
+    /// [`GenesisError::ProveBaseWithoutAggregation`], [`GenesisError::ProposerShareOutOfRange`];
+    /// `prove_base: 0` is [`GenesisError::ProveBaseZero`] — it would hash a second chain for no rule).
     /// Absent — every chain cut before it — or present with no `true` flag and neither numeric
     /// field set, the genesis hashes and the chain runs byte for byte as before; a `true` flag or
     /// a set field is bound into the genesis hash right after the `tokens` section
@@ -636,6 +637,10 @@ pub enum GenesisError {
     /// without an `aggregation` section has no proving share.
     #[error("fees.prove_base needs an aggregation section: without one there is no proving share to floor")]
     ProveBaseWithoutAggregation,
+    /// `fees.prove_base: 0` behaves exactly as no `prove_base` but would hash as another chain:
+    /// a second genesis hash for identical rules, so it is refused — leave the field out.
+    #[error("fees.prove_base 0 is no rule at all: leave the field out instead")]
+    ProveBaseZero,
     /// `fees.proposer_share_bps` is a share of the base in basis points: at most 10000.
     #[error("fees.proposer_share_bps {0} is out of range (0..=10000)")]
     ProposerShareOutOfRange(u32),
@@ -1056,6 +1061,9 @@ impl Genesis {
             }
             if f.prove_base.is_some() && self.aggregation.is_none() {
                 return Err(GenesisError::ProveBaseWithoutAggregation);
+            }
+            if f.prove_base == Some(0) {
+                return Err(GenesisError::ProveBaseZero);
             }
             if let Some(bps) = f.proposer_share_bps.filter(|b| *b > 10_000) {
                 return Err(GenesisError::ProposerShareOutOfRange(bps));
@@ -2948,6 +2956,12 @@ mod tests {
         let e = agg.validate().unwrap_err();
         assert!(matches!(e, GenesisError::ProposerShareOutOfRange(10_001)), "{e}");
         assert!(e.to_string().contains("10000"), "{e}");
+
+        // A zero `prove_base` is no rule but a second hash: refused, naming the fix.
+        agg.fees = Some(FeesConfig { prove_base: Some(0), ..FeesConfig::default() });
+        let e = agg.validate().unwrap_err();
+        assert!(matches!(e, GenesisError::ProveBaseZero), "{e}");
+        assert!(e.to_string().contains("leave the field out"), "{e}");
     }
 
     /// Audit v6 (TOK-1, issue #86): `tokens.incremental_root` is committed to the genesis hash

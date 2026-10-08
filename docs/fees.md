@@ -303,9 +303,12 @@ buys: verification, the proposer's, and proving, the covering aggregator's. Both
 `aggregation` section (`GenesisError::ProposerShareWithoutAggregation`,
 `GenesisError::ProveBaseWithoutAggregation`) — there is no aggregator and no bucket without one —
 and `proposer_share_bps` is at most 10 000 (`GenesisError::ProposerShareOutOfRange`). Each is
-absent by default, and absent is the chain without it, byte for byte.
+absent by default, and absent is the chain without it, byte for byte. `prove_base: 0` is refused
+(`GenesisError::ProveBaseZero`): it runs exactly as no `prove_base` but would hash as a second
+chain, so leave the field out instead.
 
-- **`proposer_share_bps`** (0..=10 000; the proposal's value is 4 000). Of the base the proposer
+- **`proposer_share_bps`** (0..=10 000; the proposal's value is 4 000; 0 and 10 000 are real
+  rules — the whole base to the aggregator, or to the proposer — and both hash). Of the base the proposer
   keeps at inclusion today — `BUNDLE_BASE`, or `0` under `burn_base` (and so under `burn_floor`),
   where the base is burned and there is no share to split — it keeps `proposer_share_bps / 10 000`.
   The rest is **bucketed beside the excess**, in the bundle's one bucket entry

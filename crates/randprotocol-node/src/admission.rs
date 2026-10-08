@@ -899,7 +899,8 @@ pub fn minter_not_allowed(
 /// `GasPolicy::call_floor` of its proof header — `gas_max(tier, keccak, sha256)` and its bytes —
 /// read by `decode_call` (`decode_call_hardened` under genesis `hardening_v6`, as the ledger
 /// reads it; no verification; the size cap first, so an oversized blob buys no decode).
-/// Every other action's floor is the schedule's `fee_floor`. Admission policy above
+/// Every other action's floor is the schedule's `fee_floor`. Every floor here adds the ledger's
+/// `prove_base_for(tx)` (genesis `fees.prove_base`, 0 on every chain without it). Admission policy above
 /// the ledger's `call_fee` validity rule, the LEDGER-1 pattern: the pool and the proposer
 /// demand it, a block never does.
 ///
@@ -919,7 +920,7 @@ pub fn call_pricing(
     let (Action::Call { program, proof, input_envelope } | Action::Invoke { program, proof, input_envelope, .. }) =
         &tx.action
     else {
-        return Ok(CallPricing { floor: gas::fee_floor(&tx.action), gas_limit: None });
+        return Ok(CallPricing { floor: gas::fee_floor(&tx.action).saturating_add(ledger.prove_base_for(tx)), gas_limit: None });
     };
     if proof.len() > ledger.max_proof_bytes() {
         return Err(TxError::ProofTooLarge);
@@ -959,7 +960,9 @@ pub fn call_pricing(
     .map_err(TxError::InvalidProof)?;
     // An invoke pays a call's floor plus `cell_fee` per cell it creates on this ledger (zero for
     // a call): the ledger's own post-verify floor, so the pool demands what a block does.
-    let cells = program_state::cell_fee_of(ledger, &tx.action);
+    // And `fees.prove_base` (`docs/compute-optimization.md` §6.3), which the ledger adds to every
+    // bundle's floor: a pool that left it out would count it as surplus.
+    let cells = program_state::cell_fee_of(ledger, &tx.action).saturating_add(ledger.prove_base_for(tx));
     if let Some(floor) = ledger.gas_call_floor(outcome.gas_limit, gas::call_bytes(proof, input_envelope.as_ref())) {
         return Ok(CallPricing { floor: floor.saturating_add(cells), gas_limit: Some(outcome.gas_limit) });
     }

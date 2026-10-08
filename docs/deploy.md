@@ -1396,7 +1396,8 @@ and Call).
 **What it is.** Two optional numbers in the same `fees` section (`docs/fees.md` §1.3,
 `docs/compute-optimization.md` §6.2–§6.3), each only on a chain with an `aggregation` section
 (`rand-node init` refuses either without one: `ProposerShareWithoutAggregation`,
-`ProveBaseWithoutAggregation`; a share over 10000 is `ProposerShareOutOfRange`).
+`ProveBaseWithoutAggregation`; a share over 10000 is `ProposerShareOutOfRange`; `prove_base: 0` is
+`ProveBaseZero` — leave the field out).
 `proposer_share_bps` keeps that share of the base to the proposer at inclusion and buckets the rest
 beside the excess as proving share (swept back to the proposer if no aggregate covers it);
 `prove_base` raises every bundle's floor by a proving share bucketed whole and never burned. Each is

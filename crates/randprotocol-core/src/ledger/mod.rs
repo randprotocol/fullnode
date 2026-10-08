@@ -1305,6 +1305,17 @@ impl Ledger {
         }
     }
 
+    /// What `fees.prove_base` adds to `tx`'s floor: [`Ledger::prove_base`] for a bundle-carrying
+    /// transaction, `0` for a bundle-less one (which pays no fee). For the node's pool, whose
+    /// selection floors must match the ledger's so `prove_base` is never read as surplus.
+    pub fn prove_base_for(&self, tx: &Transaction) -> u64 {
+        if tx.bundle.is_some() {
+            self.prove_base()
+        } else {
+            0
+        }
+    }
+
     /// The genesis `fees.proposer_share_bps` in force (§6.2): on an aggregating chain only.
     fn proposer_share_bps(&self) -> Option<u32> {
         self.aggregation.as_ref().and(self.fees.proposer_share_bps())
@@ -7385,7 +7396,10 @@ pub(crate) mod tests {
         let limit = gas::gas_max(14, 0, 0);
         let mut cells = 0;
         for (burn_base, burn_floor) in [(false, false), (true, false), (true, true)] {
-            for bps in [Some(0u32), Some(4000), Some(10_000), None] {
+            // Odd shares (1, 9 999) exercise the rounding rule, though while `BUNDLE_BASE` is a
+            // multiple of 10 000 (1 000 000 = 100 · 10 000) `kept_base · (10 000 − bps)` always
+            // divides exactly and the floor never rounds — the rule only bites if the base moves.
+            for bps in [Some(0u32), Some(1), Some(4000), Some(9_999), Some(10_000), None] {
                 for prove_base in [None, Some(PROVE_BASE)] {
                     if bps.is_none() && prove_base.is_none() {
                         continue; // the older rules alone: `the_fee_split_divides_every_fee_exactly_under_every_rule`
@@ -7463,7 +7477,8 @@ pub(crate) mod tests {
                 }
             }
         }
-        assert_eq!(cells, 3 * 7 * 3 * 4, "every combination ran");
+        assert_eq!(gas::BUNDLE_BASE % 10_000, 0, "the premise of the rounding comment above");
+        assert_eq!(cells, 3 * 11 * 3 * 4, "every combination ran");
     }
 
     /// The proposal's worked arithmetic (`docs/fees.md` §1.3): a 0.0012 RAND transfer under

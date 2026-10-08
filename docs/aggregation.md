@@ -69,7 +69,9 @@ Under the genesis `fees.proposer_share_bps` (`docs/fees.md` §1.3, `docs/compute
 10 000` of the base it keeps today (`BUNDLE_BASE`, nothing under `burn_base`) and the remainder
 joins the proving share in the bundle's one bucket entry — covered, it pays the aggregator; expired,
 the sweep returns it to the proposer like any excess. Under `fees.prove_base` (§6.3) every bundle's
-floor rises by `prove_base`, which is bucketed whole and never burned. At 4 000 bps and 0.0006 RAND
+floor rises by `prove_base`, which is bucketed whole and never burned — and the node's pool prices
+with it too (`Pooled.floor`, `current_floor`), so it is never read as surplus and a call priced out
+by it is not offered. At 4 000 bps and 0.0006 RAND
 a 0.0018 RAND transfer pays the proposer 0.0004 at inclusion and buckets 0.0014.
 
 ### 3.2 A block subsidy in new RAND

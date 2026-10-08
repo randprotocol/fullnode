@@ -3379,7 +3379,8 @@ pub fn deploy_fee_default(action: &Action) -> u64 {
 /// spec §7.1) the default pays two price steps of headroom over that floor — `rand_getLimits`
 /// serves the committed head's prices and a transaction lands two or three certified blocks
 /// later, so two raises before it lands still admit it; `--fee` overrides. `gas_limit` is
-/// ignored everywhere else.
+/// ignored everywhere else. The served `fees.prove_base` is added after the headroom: it is a
+/// fixed term no price controller moves, so the headroom does not scale it.
 pub fn call_fee_default(
     limits: Option<&ChainLimits>,
     tier: u8,
@@ -3388,7 +3389,8 @@ pub fn call_fee_default(
     gas_limit: u64,
     bytes: usize,
 ) -> Result<u64> {
-    Ok(with_headroom(limits, call_floor(limits, tier, keccak_log_height, sha256_log_height, gas_limit, bytes)?))
+    let priced = priced_call_floor(limits, tier, keccak_log_height, sha256_log_height, gas_limit, bytes)?;
+    Ok(with_headroom(limits, priced).saturating_add(limits.map_or(0, |l| l.prove_base)))
 }
 
 /// The floor itself, no headroom: what the chain (or the node's policy) refuses a call under.
@@ -3412,17 +3414,28 @@ pub fn call_floor(
     // `fees.prove_base` (`docs/compute-optimization.md` §6.3) raises every floor on an
     // aggregating chain; `0` wherever the node serves none.
     let prove_base = limits.map_or(0, |l| l.prove_base);
+    Ok(priced_call_floor(limits, tier, keccak_log_height, sha256_log_height, gas_limit, bytes)?.saturating_add(prove_base))
+}
+
+/// [`call_floor`] without `prove_base`: the part the prices (and so the dynamic headroom) move.
+fn priced_call_floor(
+    limits: Option<&ChainLimits>,
+    tier: u8,
+    keccak_log_height: u8,
+    sha256_log_height: u8,
+    gas_limit: u64,
+    bytes: usize,
+) -> Result<u64> {
     if let Some(l) = limits.filter(|l| l.gas_circuit) {
         let missing = |field: &str| anyhow!("the node reports a gas section (gas_metering \"circuit\") but no {field}: refusing to price the call at zero");
         let gas_price = l.gas_price.ok_or_else(|| missing("gas_price"))?;
         let byte_price = l.byte_price.ok_or_else(|| missing("byte_price"))?;
-        return Ok(gas::circuit_call_floor(gas_price, byte_price, gas_limit, bytes).saturating_add(prove_base));
+        return Ok(gas::circuit_call_floor(gas_price, byte_price, gas_limit, bytes));
     }
     Ok(match limits.and_then(|l| l.gas_policy()) {
         Some(p) => p.call_floor(tier, keccak_log_height, sha256_log_height, bytes),
         None => gas::BUNDLE_BASE + gas::call_fee(tier, bytes),
-    }
-    .saturating_add(prove_base))
+    })
 }
 
 /// The default fee for an action priced by the schedule alone (`gas::fee_floor`): that floor plus
@@ -8341,6 +8354,12 @@ mod tests {
             "max_call_envelope_bytes": 18432, "max_program_public_words": 64,
             "fee_rules": { "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": 4000, "prove_base": "600000" }
         });
+        // Under the dynamic controller the headroom scales the priced floor, never prove_base.
+        let dynamic = ChainLimits { adjust_bps: Some(1_250), ..circuit };
+        let priced = gas::circuit_call_floor(100, 800, 3_000, 0);
+        assert_eq!(call_fee_default(Some(&dynamic), 12, 0, 0, 3_000, 0).unwrap(), with_headroom(Some(&dynamic), priced) + 600_000);
+        assert_eq!(call_floor(Some(&dynamic), 12, 0, 0, 3_000, 0).unwrap(), priced + 600_000, "the floor itself, no headroom");
+
         let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(reply))]).await);
         let bond = Action::None;
         assert_eq!(schedule_floor(&rpc, &bond).await.unwrap(), gas::BUNDLE_BASE + 600_000);
