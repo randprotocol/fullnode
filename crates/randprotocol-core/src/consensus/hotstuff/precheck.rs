@@ -207,6 +207,9 @@ impl HotStuff {
     /// here is provably the scheduled leader's proposal; only then may a node fetch bodies for
     /// it, which is no more than a leader can make it download today by sending a full block.
     /// The byte cap waits for the rebuilt block, which goes through `precheck_gossip` in full.
+    /// The hash-list checks run before the state-dependent Ignore rules, so a tampered list on a
+    /// stale proposal is Reject in compact form where the full form would say Ignore — by design:
+    /// a list that does not match its own signed header is malformed whatever the replica's state.
     pub fn precheck_compact(&self, header: &BlockHeader, signature: &Signature, tx_hashes: &[Hash]) -> GossipPrecheck {
         if !well_formed(&header.proposer, signature) {
             return GossipPrecheck::Reject("proposal with a malformed key or signature");
@@ -565,33 +568,65 @@ mod tests {
         assert_eq!(hs.precheck_compact(&h, &s, &hashes), GossipPrecheck::Accept);
 
         let mut too_many = hashes.clone();
-        too_many.resize(crate::gas::MAX_BLOCK_TXS + 1, Hash::ZERO);
-        assert!(is_reject(hs.precheck_compact(&h, &s, &too_many)));
+        too_many.extend((0u32..).map(|i| Hash::digest(&i.to_le_bytes())).take(crate::gas::MAX_BLOCK_TXS + 1 - too_many.len()));
+        assert_eq!(
+            hs.precheck_compact(&h, &s, &too_many),
+            GossipPrecheck::Reject("proposal over the block's transaction cap")
+        );
 
         let mut dup = hashes.clone();
         dup.push(Hash::digest(b"x"));
         dup.push(Hash::digest(b"x"));
-        assert!(is_reject(hs.precheck_compact(&h, &s, &dup)), "a duplicate is rejected before the root");
+        assert_eq!(
+            hs.precheck_compact(&h, &s, &dup),
+            GossipPrecheck::Reject("a transaction appears twice in the block"),
+            "a duplicate is rejected before the root"
+        );
 
         let mut swapped = hashes.clone();
         swapped.push(Hash::digest(b"not in the root"));
-        assert!(is_reject(hs.precheck_compact(&h, &s, &swapped)), "a list the signed root does not commit to");
+        assert_eq!(
+            hs.precheck_compact(&h, &s, &swapped),
+            GossipPrecheck::Reject("the hashes are not the ones the header's root commits to"),
+            "a list the signed root does not commit to"
+        );
+
+        let mut loose = h.clone();
+        loose.justify.block_hash = Hash::digest(b"not the parent");
+        assert_eq!(
+            hs.precheck_compact(&loose, &s, &hashes),
+            GossipPrecheck::Reject("proposal whose justify does not certify its parent")
+        );
 
         let forged = leader.sign(b"another message");
-        assert!(is_reject(hs.precheck_compact(&h, &forged, &hashes)));
+        assert_eq!(
+            hs.precheck_compact(&h, &forged, &hashes),
+            GossipPrecheck::Reject("proposal signature does not verify")
+        );
 
         let mut sh = good.header.clone();
         sh.height = hs.committed_height();
-        assert!(is_ignore(hs.precheck_compact(&sh, &s, &hashes)), "at or under the head: ignored");
+        assert_eq!(
+            hs.precheck_compact(&sh, &s, &hashes),
+            GossipPrecheck::Ignore("proposal at or under the committed head"),
+            "at or under the head: ignored"
+        );
 
         let far_view = VIEW + PROPOSAL_VIEW_WINDOW + 1;
         let far = proposal(&hs, far_view, &leader_key(&hs, far_view));
         let (fh, fs, fx) = compact_of(&far);
-        assert!(is_ignore(hs.precheck_compact(&fh, &fs, &fx)));
+        assert_eq!(
+            hs.precheck_compact(&fh, &fs, &fx),
+            GossipPrecheck::Ignore("proposal too far ahead of this replica's view")
+        );
 
         let outsider = key(77);
         let nobody = proposal(&hs, VIEW, &outsider);
         let (nh, ns, nx) = compact_of(&nobody);
-        assert!(is_ignore(hs.precheck_compact(&nh, &ns, &nx)), "leads no known set");
+        assert_eq!(
+            hs.precheck_compact(&nh, &ns, &nx),
+            GossipPrecheck::Ignore("proposer leads the view in no validator set this replica knows"),
+            "leads no known set"
+        );
     }
 }
