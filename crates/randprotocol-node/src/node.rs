@@ -1002,6 +1002,13 @@ struct Node {
     /// The one compact proposal waiting for bodies a peer is asked for (spec 2026-10-08 §5.3):
     /// a newer view replaces it, and a later view's timeout drops it.
     parked: Option<compact::Parked>,
+    /// The header hash of the first compact proposal that passed the pre-screen for each
+    /// (view, proposer) (final review C1, spec 2026-10-08 §0): a leader that signs a second,
+    /// different header for its own view gets it reported `Ignore` and neither rebuilt nor
+    /// parked, so equivocating costs each node one signature check rather than a rebuild. Entries
+    /// under the committed view are pruned on insert, and the map holds at most
+    /// [`FIRST_COMPACT_MAX`] entries, the oldest view first out.
+    first_compact: BTreeMap<(u64, randprotocol_core::Address), Hash>,
     /// When each block's by-hash fetch was first deferred to batch sync ([`fetch_deferred`]).
     fetch_deferred_since: HashMap<Hash, Instant>,
     /// History-retention passes that deleted at least one block (history pruning spec §1),
@@ -1080,6 +1087,11 @@ struct Node {
 }
 
 const MAX_FETCH_ATTEMPTS: usize = 8;
+
+/// The most (view, proposer) entries [`Node::first_compact`] keeps (final review C1). Entries
+/// below the committed view are pruned on every insert, so in steady state it holds a handful;
+/// the cap bounds a chain that certifies without committing for a long stretch.
+const FIRST_COMPACT_MAX: usize = 1_024;
 
 /// What the node knows about one peer.
 ///
@@ -2309,6 +2321,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         fetch_attempts: HashMap::new(),
         recent_txs: compact::RecentTxs::new(compact::RECENT_TXS_MAX, compact::recent_txs_bytes(max_block_bytes)),
         parked: None,
+        first_compact: BTreeMap::new(),
         fetch_deferred_since: HashMap::new(),
         prune_passes: 0,
         compacting: Arc::new(AtomicBool::new(false)),
@@ -3522,7 +3535,22 @@ impl Node {
             self.report(id, GossipOutcome::Report(Acceptance::Ignore)).await;
             return Ok(());
         }
-        match self.hs.precheck_compact(&c.header, &c.signature, &c.tx_hashes) {
+        let verdict = self.hs.precheck_compact(&c.header, &c.signature, &c.tx_hashes);
+        // Final review C1: one header per (view, proposer). A different header from the same
+        // leader for the same view, after one passed the pre-screen, is an equivocation: not
+        // forwarded, not rebuilt, not parked. Only a header that passed in full (its signature
+        // verified) is recorded, so a forged one cannot pre-empt the leader's.
+        let key = (c.header.view, c.header.proposer.address());
+        let hash = c.hash();
+        if !matches!(verdict, GossipPrecheck::Reject(_)) && self.first_compact.get(&key).is_some_and(|first| *first != hash) {
+            tracing::warn!(%forwarder, view = key.0, "a second compact proposal from the view's leader; ignored, not rebuilt");
+            self.report(id, GossipOutcome::Report(Acceptance::Ignore)).await;
+            return Ok(());
+        }
+        if verdict == GossipPrecheck::Accept {
+            self.note_first_compact(key, hash);
+        }
+        match verdict {
             GossipPrecheck::Accept => self.report(id, GossipOutcome::Report(Acceptance::Accept)).await,
             GossipPrecheck::Ignore(why) => {
                 tracing::debug!(%forwarder, "compact proposal not forwarded: {why}");
@@ -3574,6 +3602,20 @@ impl Node {
                 Ok(())
             }
         }
+    }
+
+    /// Record the first pre-screened header for `key` (final review C1): entries under the
+    /// committed view go first, then the oldest views while the map is at
+    /// [`FIRST_COMPACT_MAX`].
+    fn note_first_compact(&mut self, key: (u64, randprotocol_core::Address), hash: Hash) {
+        let floor = self.hs.committed_qc_view();
+        if self.first_compact.first_key_value().is_some_and(|((v, _), _)| *v < floor) {
+            self.first_compact = self.first_compact.split_off(&(floor, randprotocol_core::Address::default()));
+        }
+        while self.first_compact.len() >= FIRST_COMPACT_MAX && !self.first_compact.contains_key(&key) {
+            self.first_compact.pop_first();
+        }
+        self.first_compact.entry(key).or_insert(hash);
     }
 
     /// A block rebuilt from a compact proposal goes through the full proposal precheck — the
@@ -6015,6 +6057,7 @@ mod tests {
             fetch_attempts: HashMap::new(),
             recent_txs: compact::RecentTxs::new(compact::RECENT_TXS_MAX, compact::recent_txs_bytes(max_block_bytes)),
             parked: None,
+            first_compact: BTreeMap::new(),
             fetch_deferred_since: HashMap::new(),
             prune_passes: 0,
             compacting: Arc::new(AtomicBool::new(false)),
@@ -6691,6 +6734,63 @@ mod tests {
         let sent = drain(&mut seen).await;
         assert_eq!(tx_fetches(&sent), vec![]);
         assert_eq!(reports(&sent), vec![libp2p::gossipsub::MessageAcceptance::Reject]);
+    }
+
+    /// Final review C1: a leader that signs a second, different header for its own view gets it
+    /// reported `Ignore`, and it is neither rebuilt (its body, though pooled, is not remembered
+    /// and the block is not handled) nor parked (its missing body is not fetched); the first
+    /// header delivered again proceeds as before.
+    #[tokio::test]
+    async fn a_second_header_for_the_same_view_is_ignored_and_not_rebuilt() {
+        use libp2p::gossipsub::MessageAcceptance::{Accept, Ignore};
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let (a, b, c) = (next_tx(&ledger, 1), next_tx(&ledger, 2), next_tx(&ledger, 3));
+        node.mempool.insert_verified(a.clone(), &ledger, &StubExecutor).unwrap();
+        node.mempool.insert_verified(c.clone(), &ledger, &StubExecutor).unwrap();
+        let view = node.hs.view();
+        let first = block_on(&head, &ledger, &key(1), view, vec![a]);
+        let missing = block_on(&head, &ledger, &key(1), view, vec![b]);
+        let held = block_on(&head, &ledger, &key(1), view, vec![c.clone()]);
+        claiming_peer(&mut node, 4);
+
+        node.on_compact_proposal(CompactBlock::of(&first), gossip_id()).await.unwrap();
+        assert!(node.hs.has_block(&first.hash()), "the first header is handled");
+        let cached = node.recent_txs.len();
+        node.on_compact_proposal(CompactBlock::of(&missing), gossip_id()).await.unwrap();
+        assert!(node.parked.is_none(), "the second header is not parked");
+        node.on_compact_proposal(CompactBlock::of(&held), gossip_id()).await.unwrap();
+        assert!(!node.hs.has_block(&held.hash()), "a third header is not handled");
+        assert_eq!(node.recent_txs.len(), cached, "nor rebuilt: nothing was remembered");
+        assert!(node.recent_txs.get(&c.hash()).is_none());
+        node.on_compact_proposal(CompactBlock::of(&first), gossip_id()).await.unwrap();
+
+        let sent = drain(&mut seen).await;
+        assert_eq!(tx_fetches(&sent), vec![], "nothing fetched for the second header");
+        assert_eq!(reports(&sent), vec![Accept, Ignore, Ignore, Accept], "each reported once; the first again proceeds");
+    }
+
+    /// The equivocation record is pruned under the committed view and capped, oldest view first
+    /// (final review C1).
+    #[tokio::test]
+    async fn the_first_header_record_is_pruned_and_capped() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        let floor = node.hs.committed_qc_view();
+        assert!(floor > 0, "the fixture has committed past view 0");
+        let who = key(1).address();
+        node.first_compact.insert((floor - 1, who), Hash::ZERO);
+        node.note_first_compact((floor, who), Hash::ZERO);
+        assert_eq!(node.first_compact.keys().map(|k| k.0).collect::<Vec<_>>(), vec![floor], "under the committed view: pruned");
+        for v in 1..=FIRST_COMPACT_MAX as u64 {
+            node.note_first_compact((floor + v, who), Hash::ZERO);
+        }
+        assert_eq!(node.first_compact.len(), FIRST_COMPACT_MAX);
+        assert!(!node.first_compact.contains_key(&(floor, who)), "the oldest view went first");
+        node.note_first_compact((floor + 5, who), Hash::digest(b"later"));
+        assert_eq!(node.first_compact.get(&(floor + 5, who)), Some(&Hash::ZERO), "the first record stands");
     }
 
     /// Audit v6, PROC-8: a node more than one block behind defers by-hash fetches to batch sync;
