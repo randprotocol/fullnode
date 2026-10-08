@@ -985,6 +985,11 @@ struct Node {
     /// Batches that arrived after their request had been given up on and were applied anyway.
     /// Progress, not failure — but a rising count means the give-up is firing on live requests.
     sync_late_batches: u64,
+    /// Transaction bodies this node has fetched by hash for parked compact proposals and placed
+    /// (spec 2026-10-08 §5.3): the count of bodies a peer supplied that the mempool and the
+    /// recent cache did not. Surfaced in `rand_status` as `compact_fetched`; a value that climbs
+    /// with every block says this node is missing the transaction gossip, not just a late one.
+    compact_fetched: u64,
     /// By-hash fetches outstanding, with when each was sent: one older than the wire timeout is
     /// abandoned by `fetch_block` (audit v5) — libp2p neither answered nor reported it.
     fetch_inflight: HashMap<libp2p::request_response::OutboundRequestId, (Hash, Instant)>,
@@ -2299,6 +2304,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         sync_from_committed: false,
         sync_failures: 0,
         sync_late_batches: 0,
+        compact_fetched: 0,
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
         recent_txs: compact::RecentTxs::new(compact::RECENT_TXS_MAX, compact::recent_txs_bytes(max_block_bytes)),
@@ -2519,6 +2525,7 @@ impl Node {
         s.sync_inflight_age_ms = self.sync_inflight.map(|(_, _, at, _)| at.elapsed().as_millis() as u64);
         s.sync_failures = self.sync_failures;
         s.sync_late_batches = self.sync_late_batches;
+        s.compact_fetched = self.compact_fetched;
         s.ws_clients = self.ws_conns.load(SeqCst);
         // Admission's two numbers, beside the sync ones and never mixed with them: a verification
         // that was shed or refused is not a sync failure, and the two sets answer different
@@ -3655,6 +3662,7 @@ impl Node {
         let (_, asked, _) = p.inflight.remove(i);
         let returned = txs.len();
         let placed = p.accept(txs);
+        self.compact_fetched += placed as u64;
         tracing::debug!(%peer, asked = asked.len(), returned, placed, view = p.view(), "transactions for the parked proposal");
         if p.complete() {
             let Some(block) = self.parked.take().and_then(compact::Parked::into_block) else { return Ok(()) };
@@ -6002,6 +6010,7 @@ mod tests {
             sync_from_committed: false,
             sync_failures: 0,
             sync_late_batches: 0,
+            compact_fetched: 0,
             fetch_inflight: HashMap::new(),
             fetch_attempts: HashMap::new(),
             recent_txs: compact::RecentTxs::new(compact::RECENT_TXS_MAX, compact::recent_txs_bytes(max_block_bytes)),
@@ -6444,6 +6453,23 @@ mod tests {
         assert_eq!(asked.len(), 1);
         assert_ne!(asked[0].0, first, "another peer");
         assert_eq!(asked[0].1, vec![txs[1].hash()], "for the rest only");
+    }
+
+    /// `compact_fetched` counts the bodies a fetch placed, and only those (spec 2026-10-08
+    /// §5.3): a stranger in the response adds nothing, and the count reaches `rand_status`.
+    #[tokio::test]
+    async fn placed_bodies_count_toward_compact_fetched() {
+        let (_d, mut node, _seen, _block, txs, first) = parked_node(2, 3).await;
+        assert_eq!(node.compact_fetched, 0);
+        let rid = parked_request(&node);
+        let stranger = next_tx(node.hs.tip_ledger(), 9);
+        node.on_sync_response(first, rid, SyncResponse::Transactions(vec![stranger, txs[0].clone()])).await.unwrap();
+        assert_eq!(node.compact_fetched, 1, "one body placed, the stranger not counted");
+        let rid = parked_request(&node);
+        node.on_sync_response(first, rid, SyncResponse::Transactions(vec![txs[1].clone()])).await.unwrap();
+        assert_eq!(node.compact_fetched, 2, "the second body placed");
+        node.publish_status();
+        assert_eq!(node.status.read().unwrap().compact_fetched, 2, "published in the status");
     }
 
     /// A body whose hash differs from what was asked is not placed, and the peer counts as not

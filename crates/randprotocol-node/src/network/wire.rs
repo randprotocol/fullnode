@@ -352,6 +352,25 @@ mod tests {
         );
     }
 
+    /// Spec 2026-10-08 §1, §9: the size of a compact proposal at the shape the spec sizes
+    /// against — a 26-validator set whose justify carries every vote, and 2 000 transaction
+    /// hashes. Bounded and printed so `docs/node-hardware.md` can quote the number: the header
+    /// and justify are fixed cost, each transaction adds exactly its 32-byte hash.
+    #[test]
+    fn a_compact_proposal_at_26_validators_and_2000_hashes_is_its_header_plus_32_bytes_a_hash() {
+        let ks = keys(26);
+        let b = block(9, &ks);
+        let empty = bincode::serialized_size(&GossipMessage::CompactProposal(CompactBlock::of(&b))).unwrap();
+        let mut compact = CompactBlock::of(&b);
+        compact.tx_hashes = (0..2_000u32).map(|i| Hash::digest(&i.to_be_bytes())).collect();
+        let frame = bincode::serialized_size(&GossipMessage::CompactProposal(compact)).unwrap();
+        assert_eq!(frame - empty, 2_000 * 32, "each hash is 32 bytes on the wire");
+        assert_eq!(b.header.justify.votes.len(), 26);
+        let four = bincode::serialized_size(&GossipMessage::CompactProposal(CompactBlock::of(&block(9, &keys(4))))).unwrap();
+        println!("compact proposal, 26 justify votes: {empty} bytes with no hashes, {frame} bytes with 2000 hashes; 4 justify votes, no hashes: {four} bytes");
+        assert!(frame < 256 * 1024, "a 2 000-transaction compact proposal is {frame} bytes");
+    }
+
     /// Spec 2026-10-08 §3.2: the transaction fetch is appended on both CBOR enums; the
     /// existing variants encode as before, and an old node fails to decode the new ones.
     #[test]
