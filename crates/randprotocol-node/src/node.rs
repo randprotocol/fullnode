@@ -1307,8 +1307,8 @@ fn admit_sync_request(
         return SyncAdmission::OverPeerLimit;
     }
     match req {
-        SyncRequest::Blocks { .. } if global.allow(validator, now) => SyncAdmission::Serve,
-        SyncRequest::Blocks { .. } => SyncAdmission::NodeBusy,
+        SyncRequest::Blocks { .. } | SyncRequest::Transactions(_) if global.allow(validator, now) => SyncAdmission::Serve,
+        SyncRequest::Blocks { .. } | SyncRequest::Transactions(_) => SyncAdmission::NodeBusy,
         // One block, per-peer metered; see [`SYNC_SERVE_BURST`] for why it is not charged here.
         SyncRequest::BlockByHash(_) => SyncAdmission::Serve,
     }
@@ -1344,7 +1344,7 @@ fn on_sync_busy(peers: &mut HashMap<PeerId, Peer>, peer: PeerId, now: Instant) {
 /// what an over-limit request should cost — the bucket still bounds what it is served.
 fn refused_sync_response(req: &SyncRequest) -> SyncResponse {
     match req {
-        SyncRequest::Blocks { .. } => SyncResponse::Busy,
+        SyncRequest::Blocks { .. } | SyncRequest::Transactions(_) => SyncResponse::Busy,
         SyncRequest::BlockByHash(_) => SyncResponse::Block(None),
     }
 }
@@ -3169,6 +3169,12 @@ impl Node {
                     }
                 }
                 GossipMessage::Transaction(tx) => self.on_gossiped_tx(tx, id).await?,
+                // Not handled yet (spec 2026-10-08 §3.1): reported `Ignore`, so it is neither
+                // forwarded nor scored against the sender.
+                GossipMessage::CompactProposal(_) => {
+                    tracing::debug!(%from, forwarder = %id.propagation_source, "compact proposal before the compact path is wired; ignored");
+                    self.report(id, GossipOutcome::Report(admission::Acceptance::Ignore)).await;
+                }
                 GossipMessage::Status(s) => {
                     let ahead = s.height > self.hs.committed_height() + 1;
                     let outcome = on_status_gossip(
@@ -3238,7 +3244,7 @@ impl Node {
                         }
                         // One block and a kept signature: cheap enough to stay here, and it needs
                         // the replica's tree.
-                        SyncRequest::BlockByHash(_) => self.serve_sync(request),
+                        SyncRequest::BlockByHash(_) | SyncRequest::Transactions(_) => self.serve_sync(request),
                     }
                 } else if admission == SyncAdmission::NodeBusy {
                     tracing::debug!(%peer, "sync request over the node-wide budget; answered busy");
@@ -3346,6 +3352,9 @@ impl Node {
                 // this node does not hold gets a validator's signed not-held (audit v4, CON-4).
                 block_by_hash_response(&self.hs, &self.storage, &h, &mut self.not_held_signed)
             }
+            // Not served yet (spec 2026-10-08 §3.2): a node that does not serve the fetch says
+            // it is busy, and the asker takes the request to another peer.
+            SyncRequest::Transactions(_) => SyncResponse::Busy,
         }
     }
 
@@ -3544,6 +3553,9 @@ impl Node {
                     self.fetch_deferred_since.remove(&h);
                 }
                 self.on_consensus(ConsensusMessage::Proposal(b)).await?;
+            }
+            SyncResponse::Transactions(_) => {
+                tracing::debug!(%peer, "transactions response before the compact path is wired; ignored");
             }
             SyncResponse::Block(None) => {
                 tracing::debug!("peer {peer} does not have a requested block; trying another");

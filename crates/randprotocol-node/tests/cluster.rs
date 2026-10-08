@@ -2223,6 +2223,7 @@ async fn an_epoch_set_from_a_batchs_tail_is_recorded_when_its_block_commits() {
                             SyncRequest::BlockByHash(h) => SyncResponse::Block(
                                 chain.iter().find(|cb| cb.block.hash() == h).map(|cb| cb.block.clone()),
                             ),
+                            SyncRequest::Transactions(_) => SyncResponse::Transactions(vec![]),
                         };
                         peer.send_sync_response(channel, response).await;
                     }
@@ -2323,6 +2324,7 @@ async fn a_node_holding_an_abandoned_block_rejoins_the_real_chain() {
                             SyncRequest::BlockByHash(h) => SyncResponse::Block(
                                 real.iter().find(|cb| cb.block.hash() == h).map(|cb| cb.block.clone()),
                             ),
+                            SyncRequest::Transactions(_) => SyncResponse::Transactions(vec![]),
                         };
                         peer.send_sync_response(channel, response).await;
                     }

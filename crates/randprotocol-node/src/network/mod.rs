@@ -11,7 +11,7 @@ pub mod edge;
 pub mod wire;
 
 pub use edge::{MAX_ESTABLISHED_PER_RESERVED_PEER, MAX_PENDING_INCOMING_PER_ADDR};
-pub use wire::{GossipMessage, PeerBinding, Status, SyncRequest, SyncResponse};
+pub use wire::{CompactBlock, GossipMessage, PeerBinding, Status, SyncRequest, SyncResponse, TX_FETCH_BATCH};
 
 /// Re-exported so the node can name a verdict without depending on libp2p directly. It derives
 /// `Debug` and nothing else — see `admission::Acceptance` for the comparable copy the decision path
@@ -504,6 +504,7 @@ impl Topics {
     fn for_message(&self, msg: &GossipMessage) -> &IdentTopic {
         match msg {
             GossipMessage::Consensus(_) => &self.consensus,
+            GossipMessage::CompactProposal(_) => &self.consensus,
             GossipMessage::Transaction(_) => &self.tx,
             GossipMessage::Status(_) => &self.status,
             GossipMessage::PeerBinding(_) => &self.peers,
