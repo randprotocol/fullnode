@@ -1232,6 +1232,30 @@ refused by name; `Genesis::validate` also requires `confidential`. Check `rand_g
 after the cut. randscan and the clients render the `invoke` kind and its payout notes before or
 with it (`docs/rpc.md`, changelog).
 
+## The next cut: a `multisig` section (the treasury)
+
+Multisig accounts (`docs/multisig.md`, spec `docs/superpowers/specs/2026-10-08-multisig-design.md`)
+switch on with a top-level `"multisig": { "create_fee": "<units>", "accounts": [ … ] }`. Hashed
+after every other section, folded into the state root as the wrapper `rand-state-multisig-1` and
+persisted under `META_MULTISIG`, all only when present — chain 20's file builds chain 20's hash
+unchanged. Until a cut carries the section, a node refuses all four actions (tags 34–37) with
+`UnsupportedAction("multisig")`: **dormant on chain 20**. If `feat/rpl3` (which also appends at tag
+34) merges first, one of the two renumbers its variants before any cut carries them.
+
+**What the cut passes:** `rand-node genesis … --multisig multisig.json --chain-id <N>`. The id is
+derived from the chain id, so write the file for the chain being cut. **What to record:** the
+command prints `multisig: create fee N RAND, K account(s)` and one
+`  multisig <id> <balance> RAND, T of N signers` line per account — copy every id into the cut
+record, and `rand-node multisig status <id>` after launch must show the same signers (in the
+file's order), threshold, nonce 0 and balance.
+
+**The units trap:** `balance` and `create_fee` are in units (1 RAND = 10⁹), decimal strings. Check
+the printed RAND balance against the signed allocation table; a missed factor of 10⁹ is the
+classic mistake. Multisig balances count toward the supply bound beside notes, stakes and vesting
+(`SupplyOverflow`). Collect each signer's public key from the signer (never generate it for them),
+use `threshold < n`, and check `rand_getLimits.multisig` and `rand_getSupply.multisig_issued`
+after the cut.
+
 ## The `staking` genesis section (v0.5.4)
 
 Audit v4's STAKE-2 (`docs/staking.md` §2): a per-epoch faucet budget, a bond activation delay and

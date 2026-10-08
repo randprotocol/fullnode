@@ -6,6 +6,31 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-10-02)
 
+### Multisig accounts (2026-10-08; branch `feat/multisig`, genesis-gated, on no chain; user guide `docs/multisig.md`, spec `docs/superpowers/specs/2026-10-08-multisig-design.md`)
+
+M-of-N controlled public per-asset balances (a fourth register beside validators, vesting and program
+vaults); the foundation treasury is its first account, seeded in the genesis `multisig` section.
+**Actions 34-37**: `CreateMultisig`, `MultisigDeposit` (bundle-carried), `MultisigPay`, `MultisigRotate`
+(bundle-less). A tag is the variant's bincode position, and **`feat/rpl3` (perps) also appends at 34**:
+whichever of the two merges second renumbers its variants (and the pinned encoding/txid tests, the
+`docs/rpc.md` wire list) before any cut carries them. Without the section all four are refused
+`UnsupportedAction("multisig")` at admission and at apply (so chain 20 is untouched). State root:
+wrapper `rand-state-multisig-1` (not a positional domain, so independent of rpl3's `rand-state-9`);
+persisted as bincode under `META_MULTISIG`; `reload_ledger` refuses a genesis file and database that
+disagree about the section. Mempool claim role 9 (account id + nonce): one pooled Pay-or-Rotate per
+account; a pooled Pay is re-checked at selection (`multisig::still_applies`). BadSignerIndex /
+BelowThreshold / BadSignature / BadNonce / VaultShort are re-checked, never cached as permanent
+rejections (a rotation changes the set). **The base comes from row 0**: a Pay debits `BUNDLE_BASE`
+(0.001 RAND) from the account's RAND row to the proposer, so an account needs RAND even to pay
+tokens; Rotate is fee-less; Create pays `BUNDLE_BASE + create_fee` (the fee goes to the proposer, not
+burned). One nonce per account, shared by Pay and Rotate. The id is `blake3("rand-multisig-id-1",
+chain_id ‖ salt ‖ threshold ‖ n ‖ keys)`, so `rand-node genesis --multisig` prints it before the cut.
+**Ordering hazard in `Ledger::audit()`**: `Audit::with_multisig` must be chained LAST, because
+`with_vesting` rebuilds `pool_value` from the supply and anything chained before it is lost; a fifth
+register goes after multisig the same way. Surface: `rand_getMultisig`, `rand_getSupply.multisig_*`,
+`rand_getLimits.multisig`; `rand-node multisig id|status|pay|rotate`; `rand multisig create|deposit`.
+The real-proof e2e (create, deposit, pay, rotate) is `#[ignore]`d for a c-16.
+
 ### Fee feedback — a burned base and a fee-first subsidy (2026-10-05; branch `feat/fee-feedback`, PUSHED, NOT merged; genesis-gated, on no chain)
 
 **2026-10-06, issues #131–#135 closed on this branch** (each a `fix/*` branch, reviewed, merged

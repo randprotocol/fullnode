@@ -5209,6 +5209,36 @@ mod tests {
         assert!(err.contains("the treasury cannot be sealed to"), "{err}");
     }
 
+    /// `docs/multisig.md` carries an example `multisig` section: it parses, passes
+    /// `MultisigConfig::check`, and `rand-node genesis --multisig` reads it through the same function.
+    /// The signer keys are `"<…>"` placeholders in the doc; a distinct real one stands in for each.
+    #[test]
+    fn the_documented_multisig_file_parses_and_validates() {
+        let doc = include_str!("../../../docs/multisig.md");
+        let start = doc.find("```json\n{\n  \"create_fee\"").expect("docs/multisig.md carries the example file");
+        let body = &doc[start + "```json\n".len()..];
+        let mut json = body[..body.find("```").unwrap()].to_string();
+        let mut n = 0u8;
+        while let Some(a) = json.find("\"<") {
+            let b = a + json[a..].find(">\"").unwrap() + 2;
+            n += 1;
+            let k = Keypair::from_seed([30 + n; 32]).unwrap().public_key().to_hex();
+            json.replace_range(a..b, &format!("\"{k}\""));
+        }
+        let cfg: randprotocol_core::ledger::multisig::MultisigConfig = serde_json::from_str(&json).expect("the example parses");
+        assert_eq!(cfg.create_fee, UNITS_PER_RAND, "a 1 RAND create fee");
+        assert_eq!(cfg.accounts.len(), 1);
+        let total = cfg.check(20).expect("the example is a valid section");
+        assert_eq!(total, 500_000_000 * UNITS_PER_RAND, "the treasury's 500 M RAND");
+        let treasury = &cfg.accounts[0];
+        assert_eq!((treasury.signers.len(), treasury.threshold), (3, 2), "2 of 3");
+        // `rand-node genesis --multisig` reads the file through the same function the test does.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multisig.json");
+        std::fs::write(&path, &json).unwrap();
+        assert_eq!(read_multisig_config(&path, 20).unwrap(), cfg);
+    }
+
     /// Audit v6, STAKE-3: `vesting revoke prepare` → `sign` (per revoker) → `submit` builds the
     /// action the ledger accepts — the treasury's note sealed by the first step, one message
     /// for every signer, the signatures in index order — and the treasury's wallet opens the

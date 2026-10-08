@@ -389,6 +389,20 @@ own units. A row at zero does not exist, so an empty vault — and a program nob
 (`burn_r`, and `burn_a` of `burn_asset` when the transition's `inflow` is `deposit`) and leaves
 it as the notes the transition's `pays` name.
 
+### `rand_getMultisig`
+Params: `[id]` — the account's 64-hex id (`docs/multisig.md`). Result:
+
+```json
+{ "enabled": true, "id": "9b2e…", "signers": ["<Dilithium2 public key, hex>", "…"],
+  "threshold": 2, "nonce": 0, "vault": [{ "asset": 0, "amount": "500000000000000000" }] }
+```
+
+`signers` are in the account's order — a signature names its signer by position. `nonce` is the one
+counter a payment and a rotation share. `vault` is ascending by asset (0 is RAND, every other index
+the token registry's), amounts decimal strings in the asset's own units; a row at zero does not
+exist. `null` for an id the register does not hold; `{"enabled": false}` on a chain without a
+`multisig` section. Public (it is on `PUBLIC_METHODS`).
+
 ### `rand_getLimits`
 Params: `[]`. Result: what a wallet needs from the chain's genesis to build a transaction — the
 call limits (`max_program_words` through `max_program_public_words`), the envelope size, the v0.6
@@ -402,7 +416,7 @@ gas policy:
   "gas_metering": "header", "bundle_gas_limit": null, "adjust_bps": null,
   "max_gas_price": null, "max_byte_price": null, "byte_load": null,
   "admission_by_vote": false, "testnet": false, "slashing": null, "binding_domain": 0,
-  "proof_window_blocks": null, "program_state": null, "fee_rules": null }
+  "proof_window_blocks": null, "program_state": null, "fee_rules": null, "multisig": null }
 ```
 
 Those are the defaults, what a genesis without the fields gets (chain 12). A wallet derives its caps
@@ -500,6 +514,11 @@ refused (`NotAdmitted`) until the validator set has voted the key in — `rand_g
 the keys that may register (`docs/staking.md` §2). `testnet` is the genesis `testnet` marker
 (audit v6, STAKE-2): `true` only where the file says so — what lets a faucet sit beside a bridge
 section — so a wallet or an explorer can label the chain; `false` on every chain through 18.
+
+`multisig` (multisig accounts, `docs/multisig.md`) is `null` on a chain without the section — where
+all four multisig actions are refused — and otherwise `{ "create_fee": "1000000000", "max_signers": 10, "max_payouts": 4 }`:
+the RAND units (a decimal string) a `CreateMultisig` pays above the bundle base, the most signers
+an account lists, and the most payouts one payment carries.
 
 `program_state` (RPL-2, `docs/superpowers/specs/2026-09-30-rpl2-program-state-design.md`) is the
 genesis `program_state` section and the `invoke` limits that come with it, or `null` on a chain
@@ -1100,6 +1119,8 @@ Params: `[]`. Result:
   "registration_fees_burned": "…", "base_fees_burned": "…",
   "vesting_issued": "…", "vesting_released": "…", "vesting_in_register": "…", "vesting_locked": "…",
   "program_rand_out": "…", "program_rand_held": "…",
+  "multisig_issued": "…", "multisig_rand_in": "…", "multisig_rand_out": "…",
+  "multisig_base_out": "…", "multisig_rand_held": "…",
   "pool_value": "…", "register_total": "…", "total_supply": "…", "invariant_holds": true }
 ```
 
@@ -1149,6 +1170,15 @@ entering the pool, inside `pool_value` beside `withdraw_deposited`), and what th
 hold — register-side value, inside `total_supply`. It entered through an invoke's bundle
 `burn_r`, so it is inside `burned` on the pool side; this is its register-side twin, and a
 token in a vault is still in that token's `total_supply`.
+
+`multisig_issued`, `multisig_rand_in`, `multisig_rand_out`, `multisig_base_out` and
+`multisig_rand_held` (multisig accounts, `docs/multisig.md`; `"0"` without a `multisig` section):
+what genesis seeded the accounts with (issuance, beside `genesis_staked` and `vesting_issued`);
+every `burn_r` a create or deposit put in (already inside `burned`: pool to register, not new
+value); the RAND payout notes (value entering the pool, inside `pool_value` beside
+`withdraw_deposited`); the bundle bases a payment paid into proposers' `rewards` (register to
+register, not a crossing); and `issued + rand_in − rand_out − base_out`, what the accounts still
+hold — inside `total_supply`. Tokens in a vault stay in the token's own `total_supply`.
 
 ### `rand_getVesting`
 Params: `[id, at_ms?]` — the entry's 64-hex id, and optionally the time to evaluate the schedule at
@@ -1579,6 +1609,13 @@ Action::ListBacking { token_index: u32, chain: u16, token: [u8; 32], decimals: u
                       pq_signatures: Vec<PqSignature> }               // B4
 Action::Invoke { program: Hash, proof: Vec<u8>, input_envelope: Option<CallEnvelope>,
                  transition: Transition }                             // RPL-2, tag 33 (after the vesting actions and audit v6's AdmitValidator … CancelRotation, 28–32)
+Action::CreateMultisig { salt: [u8; 32], signers: Vec<PublicKey>, threshold: u8 }   // tag 34, bundle-carried
+Action::MultisigDeposit { account: [u8; 32] }                         // tag 35, bundle-carried
+Action::MultisigPay { account: [u8; 32], nonce: u64, time: u32, pays: Vec<Payout>,
+                      signatures: Vec<SignerSignature> }              // tag 36, bundle-less
+Action::MultisigRotate { account: [u8; 32], nonce: u64, signers: Vec<PublicKey>, threshold: u8,
+                         signatures: Vec<SignerSignature> }           // tag 37, bundle-less, fee-less
+SignerSignature { index: u8, signature: Signature }                  // by position in the account's signers
 
 MintAuthority = None | Key(PublicKey) | Bridge { backings: Vec<Backing> } | Program(Hash)
 InitialMint { amount: u64, recipient: ShieldedAddress, r: Word8, time: u32, envelope: Envelope }
@@ -1660,6 +1697,22 @@ the proof's published digest against the one it computed before it submits anyth
 ## Changelog
 
 What changed for clients, in one place. Newest first.
+
+### Unreleased — multisig accounts: `rand_getMultisig`, four actions (tags 34–37) (genesis-gated; no chain carries it yet)
+
+Additive. A genesis `multisig` section (`docs/multisig.md`) switches on M-of-N accounts: public
+per-asset balances spent by `threshold` of `n` Dilithium2 keys. New: `rand_getMultisig [id]`
+(`{enabled, id, signers, threshold, nonce, vault}`, `null`, or `{"enabled": false}`);
+`rand_getSupply` gains `multisig_issued`, `multisig_rand_in`, `multisig_rand_out`,
+`multisig_base_out`, `multisig_rand_held` (decimal strings, `"0"` without the section);
+`rand_getLimits` gains `multisig` (`null`, or `{ create_fee, max_signers, max_payouts }`). `tx_json`
+renders four kinds: `create_multisig` (`salt`, `threshold`, `signer_count`), `multisig_deposit`
+(`account`), `multisig_pay` (`account`, `nonce`, `time`, `pays` with each note's `cm` as an invoke's,
+`signers` = the **indices** that signed) and `multisig_rotate` (`account`, `nonce`, `threshold`,
+`signer_count`, `signed_by` = the indices that signed). A block header carries a `MultisigPay`'s
+notes in `public_notes`. The four actions are tags 34–37, appended after `Invoke`; **if `feat/rpl3`
+(perps), which also appends at 34, merges first, these renumber** — an encoder must derive tags
+from the enum. All four are refused (`UnsupportedAction("multisig")`) on a chain without the section.
 
 ### Unreleased — fee feedback: the genesis `fees` section and the burned base (genesis-gated; no chain carries it yet)
 

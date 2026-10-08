@@ -115,6 +115,27 @@ A claim of 100 takes 100 out of the vesting register, puts a 99.999 note into th
 the vesting register into a validator's `stake` (so into `register_total`), and an unbond moves it
 back; neither crosses the pool's boundary. `issued` moves only at genesis.
 
+## Multisig accounts: the fourth half
+
+A chain whose genesis has a `multisig` section (`docs/multisig.md`) holds M-of-N controlled balances
+in a fourth public register. Like the vesting rows, its counters are kept off the positional
+`Supply` blob and served by `rand_getSupply` as `multisig_*`:
+
+| number | what it is | on the identity |
+|---|---|---|
+| `multisig_issued` | Σ of the accounts' genesis balances | issuance, beside `genesis_staked` and `vesting_issued` |
+| `multisig_rand_in` | every `burn_r` a create or deposit put in | already in `burned` through the common bundle path: pool to register, not new value |
+| `multisig_rand_out` | every RAND payout note a payment created | value **entering** the pool, beside `withdraw_deposited` |
+| `multisig_base_out` | the 0.001 RAND bases a payment paid into proposers' `rewards` | register to register, not a crossing |
+| `multisig_rand_held` | `issued + rand_in − rand_out − base_out` | the register's half of `total_supply` |
+
+So `pool_value` gains `rand_out`, `register_total` gains `rand_held` and `issued` gains
+`multisig_issued`; the identity `total_supply == issued` still holds. A payment of 100 RAND
+takes 100.001 out of the account: a 100 note into the pool and the 0.001 base into a proposer's
+`rewards` (a Withdraw's shape, with the account paying the base). A `create_fee` goes to the
+proposer with the rest of the fee and is not burned, so the identity does not move. Tokens in a
+vault leave the token's `total_supply` untouched, as in a program vault.
+
 ## Reading it
 
 ```bash

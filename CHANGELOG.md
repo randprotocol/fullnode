@@ -12,6 +12,16 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+- **Multisig accounts** (genesis-gated: no existing chain carries the section; node-safe on
+  chain 20, where all four actions are refused `UnsupportedAction("multisig")`): a new genesis
+  `multisig` section (`docs/multisig.md`) with M-of-N controlled public balances, seeded with
+  RAND at genesis (the foundation treasury) or created by anyone. Four actions, tags 34–37
+  (`CreateMultisig`, `MultisigDeposit`, `MultisigPay`, `MultisigRotate`); a payment pays the 0.001
+  RAND base from the account's RAND row, a rotation is fee-less. State root wrapper
+  `rand-state-multisig-1`, persisted under `META_MULTISIG`, mempool claim role 9. RPC:
+  `rand_getMultisig`, `rand_getSupply.multisig_*`, `rand_getLimits.multisig`. CLI:
+  `rand-node genesis --multisig`, `rand-node multisig id|status|pay|rotate`, `rand multisig
+  create|deposit`.
 - **The aggregate daemon survives a failed pass** (node-only): in `rand-node aggregate --watch` a
   failed pass (an RPC failure, a nonce that moved while proving, a failed prove, a mempool
   refusal, a key whose `register` has not committed yet) is logged at `warn` and retried on the
