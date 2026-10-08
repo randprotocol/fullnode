@@ -1864,7 +1864,7 @@ mod tests {
         let mut e = entry(&v, MIN_STAKE, payout(1));
         e.pending = vec![(0, 100 * BASE)];
         let mut l = ledger(vec![e, entry(&p, MIN_STAKE, payout(2))]);
-        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true) });
+        l.set_fees(crate::ledger::fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None });
         l.set_genesis_supply(0, 2 * MIN_STAKE + 100 * BASE);
         let before = l.clone();
 

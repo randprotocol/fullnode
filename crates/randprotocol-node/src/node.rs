@@ -6162,7 +6162,7 @@ mod tests {
 
     /// Both rules on (`docs/fees.md` §1.3).
     fn both_fee_rules() -> randprotocol_core::ledger::FeesConfig {
-        randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: None }
+        randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None }
     }
 
     /// A tip-paying stub bundle anchored to `ledger`'s newest root.
@@ -6564,7 +6564,7 @@ mod tests {
         let (gas_price, byte_price) = (price("gas_price"), price("byte_price"));
         assert_eq!(
             limits["fee_rules"],
-            serde_json::json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true }),
+            serde_json::json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true, "proposer_share_bps": null, "prove_base": null }),
             "the chain serves the burn-floor rules"
         );
 

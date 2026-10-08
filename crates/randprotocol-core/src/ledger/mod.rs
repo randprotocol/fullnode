@@ -398,7 +398,9 @@ impl ApplyFailure {
 /// [`Ledger::bundle_fee_split`]'s result: the bundle step's arithmetic, computed before the
 /// first write. `fee` is what is left after the burned registration fee; `fee_burned` is the
 /// burned base (or, under `fees.burn_floor`, the burned settled floor), zero without
-/// `fees.burn_base`; `kept` is the proposer's share now and `rewards` its entry once credited.
+/// `fees.burn_base`; `kept` is the proposer's share now and `rewards` its entry once credited;
+/// `base_bucketed` is the aggregator's part of the base under `fees.proposer_share_bps`
+/// (`docs/compute-optimization.md` §6.2), bucketed beside the excess, zero without it.
 #[derive(Clone, Copy, Debug)]
 struct BundleFeeSplit {
     registration_burn: u64,
@@ -406,6 +408,7 @@ struct BundleFeeSplit {
     fee_burned: u64,
     kept: u64,
     rewards: u64,
+    base_bucketed: u64,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
@@ -1239,7 +1242,19 @@ impl Ledger {
     /// cells *now*, so it is exact only against the ledger the transaction is being validated or
     /// applied on: the prices move at `close_block` under `gas.dynamic`, and an applied invoke's
     /// cells exist.
+    ///
+    /// On an aggregating chain under `fees.prove_base` (`docs/compute-optimization.md` §6.3) the
+    /// floor is all of the above plus [`Ledger::prove_base`], and the pre-verify floor rises by the
+    /// same amount. `prove_base` is proving share: it is bucketed whole and **never burned** —
+    /// under `fees.burn_floor` the burned amount is this floor *without* `prove_base`
+    /// (`burnable_floor`), which `fee_burn` asserts.
     pub fn settled_floor(&self, tx: &Transaction, call: Option<&crate::program::CallOutcome>) -> u64 {
+        self.burnable_floor(tx, call).saturating_add(self.prove_base())
+    }
+
+    /// [`Ledger::settled_floor`] without `prove_base`: the part of the floor `fees.burn_floor`
+    /// destroys.
+    fn burnable_floor(&self, tx: &Transaction, call: Option<&crate::program::CallOutcome>) -> u64 {
         match (&tx.action, call) {
             (Action::Call { proof, input_envelope, .. } | Action::Invoke { proof, input_envelope, .. }, Some(outcome)) => {
                 let bytes = gas::call_bytes(proof, input_envelope.as_ref());
@@ -1260,12 +1275,39 @@ impl Ledger {
     /// `BUNDLE_BASE` under `burn_base` alone; `min(fee, settled_floor)` under `burn_base` and
     /// `burn_floor` (issue #135). `burn_floor` without `burn_base` burns nothing — genesis refuses
     /// that section, and a ledger handed it anyway runs no rule rather than half of one.
+    ///
+    /// `prove_base` never burns: the full-floor burn is `min(fee, burnable_floor)`, the settled
+    /// floor less `prove_base`, so what is left of the fee after the burn always covers
+    /// `prove_base` for a fee that was checked against the settled floor.
     fn fee_burn(&self, tx: &Transaction, fee: u64, call: Option<&crate::program::CallOutcome>) -> u64 {
         match (self.fees.burn_base(), self.fees.burn_floor()) {
             (false, _) => 0,
             (true, false) => gas::BUNDLE_BASE,
-            (true, true) => fee.min(self.settled_floor(tx, call)),
+            (true, true) => {
+                let burn = fee.min(self.burnable_floor(tx, call));
+                debug_assert!(
+                    fee < self.settled_floor(tx, call) || fee - burn >= self.prove_base(),
+                    "burn_floor must leave prove_base to the bucket"
+                );
+                burn
+            }
         }
+    }
+
+    /// The genesis `fees.prove_base` in force (`docs/compute-optimization.md` §6.3): the units
+    /// every bundle's floor rises by and that are bucketed whole as proving share — on an
+    /// aggregating chain only (genesis refuses the field elsewhere), `0` without it.
+    pub fn prove_base(&self) -> u64 {
+        if self.aggregation.is_some() {
+            self.fees.prove_base()
+        } else {
+            0
+        }
+    }
+
+    /// The genesis `fees.proposer_share_bps` in force (§6.2): on an aggregating chain only.
+    fn proposer_share_bps(&self) -> Option<u32> {
+        self.aggregation.as_ref().and(self.fees.proposer_share_bps())
     }
 
     /// The part of `fee` that never reaches the bucket: the burn when the `fees` section burns
@@ -2412,7 +2454,10 @@ impl Ledger {
                     .gas_call_floor(1, gas::call_bytes(proof, input_envelope.as_ref()))
                     .unwrap_or_else(|| gas::fee_floor(&tx.action)),
                 _ => gas::fee_floor(&tx.action),
-            };
+            }
+            // `fees.prove_base` (§6.3) raises every bundle's floor on an aggregating chain; zero
+            // on every other chain.
+            .saturating_add(self.prove_base());
             if b.fee < min {
                 return Err(TxError::FeeTooLow { min, fee: b.fee });
             }
@@ -2537,7 +2582,7 @@ impl Ledger {
                 }
                 call_envelope::validate(input_envelope, self.max_call_envelope_bytes)?;
                 program_state::validate(self, tx, a, executor)?;
-                let min = gas::BUNDLE_BASE.saturating_add(program_state::cell_fee_of(self, a));
+                let min = gas::BUNDLE_BASE.saturating_add(program_state::cell_fee_of(self, a)).saturating_add(self.prove_base());
                 if tx.fee() < min {
                     return Err(TxError::FeeTooLow { min, fee: tx.fee() });
                 }
@@ -2767,14 +2812,29 @@ impl Ledger {
             return Err(TxError::FeeTooLow { min: gas::BUNDLE_BASE, fee });
         }
         let fee_burned = self.fee_burn(tx, fee, call);
-        let kept = match (self.aggregation.is_some(), self.fees.burn_base()) {
+        let kept_base = match (self.aggregation.is_some(), self.fees.burn_base()) {
             (false, false) => fee,
             (true, false) => gas::BUNDLE_BASE.min(fee),
             (false, true) => fee.saturating_sub(fee_burned),
             (true, true) => 0,
         };
+        // The proposer/aggregator split (`fees.proposer_share_bps`, `docs/compute-optimization.md`
+        // §6.2), an aggregating chain's rule: of the base the proposer keeps above (`BUNDLE_BASE`,
+        // or nothing under `burn_base` — a burned base has no share to split) it keeps
+        // `proposer_share_bps / 10 000`, and the remainder is bucketed beside the excess, where a
+        // covering aggregate is paid it and the sweep returns it to the proposer. The aggregator's
+        // part rounds down, so the proposer's is the remainder-free one: `kept_base −
+        // ⌊kept_base · (10 000 − bps) / 10 000⌋`. Genesis bounds `bps` at 10 000; `min` restates it.
+        let base_bucketed = match self.proposer_share_bps() {
+            Some(bps) => {
+                let bps = u128::from(bps.min(10_000));
+                u64::try_from(u128::from(kept_base) * (10_000 - bps) / 10_000).expect("at most kept_base")
+            }
+            None => 0,
+        };
+        let kept = kept_base - base_bucketed;
         let rewards = entry.rewards.checked_add(kept).ok_or(TxError::Overflow)?;
-        Ok(BundleFeeSplit { registration_burn, fee, fee_burned, kept, rewards })
+        Ok(BundleFeeSplit { registration_burn, fee, fee_burned, kept, rewards, base_bucketed })
     }
 
     /// Everything after the first write: the bundle's supply counters and notes, then the
@@ -2788,7 +2848,7 @@ impl Ledger {
         verified: Verified,
         split: Option<BundleFeeSplit>,
     ) -> Result<Option<CallReceiptData>, TxError> {
-        if let (Some(b), Some(BundleFeeSplit { registration_burn, fee, fee_burned, kept, rewards })) = (&tx.bundle, split) {
+        if let (Some(b), Some(BundleFeeSplit { registration_burn, fee, fee_burned, kept, rewards, base_bucketed })) = (&tx.bundle, split) {
             // This method is not atomic on its own: the action step below runs after these
             // writes and can still fail (S2's `staking::apply`, S3's `bridge_notes::apply`),
             // which would leave a half-applied bundle behind. What makes a rejected
@@ -2832,7 +2892,14 @@ impl Ledger {
                 // `fees.burn_floor` over the whole burned floor, `fee − burn` (issue #135), so the
                 // aggregator is never paid a priced term the chain just destroyed.
                 // `bucket_floor` is the one place that figure is computed.
-                let excess = fee.saturating_sub(self.bucket_floor(tx, fee, verified.call.as_ref()));
+                // Under `fees.proposer_share_bps` the aggregator's part of the base rides in the same
+                // entry (§6.2): one entry per bundle, `excess + base part`, resolved whole by the
+                // cover or the sweep. `fees.prove_base` needs nothing here: it is part of `fee`
+                // above `bucket_floor` (which never includes it), so it is bucketed whole.
+                let excess = fee
+                    .saturating_sub(self.bucket_floor(tx, fee, verified.call.as_ref()))
+                    .checked_add(base_bucketed)
+                    .ok_or(TxError::Overflow)?;
                 self.bucket_excess(tx.hash(), excess, *proposer, until);
             }
         }
@@ -3725,7 +3792,7 @@ pub(crate) mod tests {
             let staked = register_total(l.validators());
             l.set_genesis_supply(1_000 * fee, staked);
             if burn {
-                l.set_fees(fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None });
+                l.set_fees(fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None });
             }
             l
         };
@@ -6922,7 +6989,7 @@ pub(crate) mod tests {
     /// The three `fees` sections the burn-floor tests compare: the base alone, the base with the
     /// floor, and the floor spelt out `false` (which must be the base alone, byte for byte).
     fn burn_rules(floor: Option<bool>) -> fees::FeesConfig {
-        fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: floor }
+        fees::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: floor, proposer_share_bps: None, prove_base: None }
     }
 
     /// `l` with `rules` installed and a genesis supply its audit can check against: a large
@@ -7046,7 +7113,7 @@ pub(crate) mod tests {
         let base = root(burn_rules(None));
         assert_eq!(root(burn_rules(Some(false))), base, "false is the flag's absence");
         assert_ne!(root(burn_rules(Some(true))), base, "true moves the split, and so the root");
-        let alone = fees::FeesConfig { burn_base: None, subsidy_net_of_fees: None, burn_floor: Some(true) };
+        let alone = fees::FeesConfig { burn_base: None, subsidy_net_of_fees: None, burn_floor: Some(true), proposer_share_bps: None, prove_base: None };
         assert_eq!(root(alone), root(fees::FeesConfig::default()), "burn_floor alone is no rule at all");
     }
 
@@ -7119,7 +7186,7 @@ pub(crate) mod tests {
 
     /// An aggregation section for the split tests: the proving-share bucket on, a `window`-block
     /// coverable window, no admitted shapes (no aggregate is applied here).
-    fn split_aggregation(window: u64) -> aggregation::AggregationConfig {
+    pub(crate) fn split_aggregation(window: u64) -> aggregation::AggregationConfig {
         aggregation::AggregationConfig {
             bond: 100 * UNITS_PER_RAND,
             max_covers: 3,
@@ -7282,6 +7349,166 @@ pub(crate) mod tests {
         assert_eq!(l.supply().fees_paid - before.supply().fees_paid, tip, "fees_paid moves by the swept excess");
         assert_eq!(l.base_fees_burned(), before.base_fees_burned(), "the sweep burns nothing more");
         assert!(l.audit().invariant_holds(), "{:?}", l.audit());
+    }
+
+    // ---- The proposer/aggregator split and `prove_base` (docs/compute-optimization.md §6.2–§6.3) --
+
+    /// The proposal's `prove_base`, 0.0006 RAND.
+    const PROVE_BASE: u64 = 600_000;
+
+    /// A `fees` section carrying the split's two fields beside the older flags.
+    fn split_rules(burn_base: bool, burn_floor: bool, bps: Option<u32>, prove_base: Option<u64>) -> fees::FeesConfig {
+        fees::FeesConfig {
+            burn_base: burn_base.then_some(true),
+            subsidy_net_of_fees: None,
+            burn_floor: burn_floor.then_some(true),
+            proposer_share_bps: bps,
+            prove_base,
+        }
+    }
+
+    /// The fee split's two fields, exhaustively, on an aggregating chain: for `proposer_share_bps`
+    /// at 0, 4 000 and 10 000, with and without `prove_base`, alone and under `burn_base` and
+    /// `burn_base + burn_floor`, for a transfer, a Deploy and a tier-14 Call at tips 0, 1, 999 and
+    /// 1 000 000 over the floor: the floor (pre-verify and post-decode alike) is the old floor
+    /// plus `prove_base` — one unit under it is `FeeTooLow` naming it, `settled_floor` reports
+    /// it — and the bundle divides its fee exactly, `kept + burned + bucketed == fee`, with
+    /// `kept` the proposer's part of the base it keeps today (`BUNDLE_BASE`, or nothing under
+    /// `burn_base`), `burned` the floor *without* `prove_base` under `burn_floor`, and the bucket
+    /// the rest (the tip, `prove_base` whole, and the aggregator's part of the base). `fees_paid`
+    /// moves by `kept`, the audit holds, and a replica applying the signed block reaches the
+    /// proposer's root.
+    #[test]
+    fn the_proposer_share_and_prove_base_divide_every_fee_exactly() {
+        let (a, _) = keys();
+        let p = a.address();
+        let limit = gas::gas_max(14, 0, 0);
+        let mut cells = 0;
+        for (burn_base, burn_floor) in [(false, false), (true, false), (true, true)] {
+            for bps in [Some(0u32), Some(4000), Some(10_000), None] {
+                for prove_base in [None, Some(PROVE_BASE)] {
+                    if bps.is_none() && prove_base.is_none() {
+                        continue; // the older rules alone: `the_fee_split_divides_every_fee_exactly_under_every_rule`
+                    }
+                    let rule = split_rules(burn_base, burn_floor, bps, prove_base);
+                    let (base, id) = ledger_with_program(|l| l.set_gas(Some(fixed_gas())));
+                    let mut l = with_rules(base, rule.clone());
+                    l.set_aggregation(Some(split_aggregation(256)));
+                    let pb = prove_base.unwrap_or(0);
+                    let call_proof = StubExecutor::make_proof_with_gas(&id, 14, [7; 8], limit);
+                    let deploy = Action::Deploy { base_pc: 0, words: vec![0x17; 5], public: vec![] };
+                    let actions: [(&str, u64); 3] = [
+                        ("transfer", gas::BUNDLE_BASE),
+                        ("Deploy of 5 words", gas::fee_floor(&deploy)),
+                        ("tier-14 Call", gas::circuit_call_floor(fixed_gas().gas_price, fixed_gas().byte_price, limit, call_proof.len())),
+                    ];
+                    for (action_name, old_floor) in actions {
+                        let floor = old_floor + pb;
+                        let make = |l: &Ledger, fee: u64| match action_name {
+                            "transfer" => StubExecutor::bound(Transaction::shielded(7, bundle(l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], fee), Action::None)),
+                            "tier-14 Call" => call_tx(l, 70, id, call_proof.clone(), fee),
+                            _ => StubExecutor::bound(Transaction::shielded(7, bundle(l, [[60; 8], [61; 8]], [[62; 8], [63; 8]], fee), deploy.clone())),
+                        };
+                        let what = format!("{rule:?}, {action_name}");
+                        // The floor: one unit under it is refused by name, at the new minimum.
+                        assert_eq!(
+                            l.validate(&make(&l, floor - 1), &StubExecutor),
+                            Err(TxError::FeeTooLow { min: floor, fee: floor - 1 }),
+                            "{what}: the floor includes prove_base"
+                        );
+                        if action_name != "tier-14 Call" {
+                            assert_eq!(l.settled_floor(&make(&l, floor), None), floor, "{what}: settled_floor adds prove_base");
+                        }
+                        for tip in [0u64, 1, 999, 1_000_000] {
+                            let what = format!("{what}, tip {tip}");
+                            let fee = floor + tip;
+                            let t = make(&l, fee);
+                            let mut after = l.clone();
+                            after.set_height(2);
+                            let mut call_gas = 0u64;
+                            if let Some(r) = after.apply_tx(&t, &p, &StubExecutor).unwrap_or_else(|e| panic!("{what}: {e:?}")) {
+                                call_gas += r.gas_used;
+                            }
+                            let (bytes, gas_used) = after.block_usage(std::slice::from_ref(&t), call_gas);
+                            after.close_block(2, &p, bytes, gas_used);
+
+                            let kept = after.validators()[&p].rewards - l.validators()[&p].rewards;
+                            let burned = after.base_fees_burned() - l.base_fees_burned();
+                            let bucketed = after.unsealed_fees().get(&t.hash()).map_or(0, |e| e.0);
+                            let want_burn = match (burn_base, burn_floor) {
+                                (false, _) => 0,
+                                (true, false) => gas::BUNDLE_BASE,
+                                (true, true) => old_floor,
+                            };
+                            let kept_base = if burn_base { 0 } else { gas::BUNDLE_BASE };
+                            let aggregator_part = bps.map_or(0, |b| kept_base * (10_000 - b as u64) / 10_000);
+                            let want_kept = kept_base - aggregator_part;
+                            assert_eq!((kept, burned), (want_kept, want_burn), "{what}: (kept, burned)");
+                            assert_eq!(bucketed, fee - want_burn - want_kept, "{what}: the bucket holds the rest");
+                            assert!(bucketed >= tip + pb + aggregator_part, "{what}: prove_base and the base part are bucketed whole");
+                            assert_eq!(kept + burned + bucketed, fee, "{what}: exact");
+                            assert_eq!(after.supply().fees_paid - l.supply().fees_paid, kept, "{what}: fees_paid moves by the proposer part");
+                            assert_eq!(after.supply().burned - l.supply().burned, burned, "{what}: burned moves by the fee burn alone");
+                            assert!(after.audit().invariant_holds(), "{what}: {:?}", after.audit());
+
+                            let block = signed_block(vec![t.clone()], &a, 2, after.state_root());
+                            let mut replica = l.clone();
+                            replica.apply_block(&block, &StubExecutor).unwrap_or_else(|e| panic!("{what}, replica: {e:?}"));
+                            assert_eq!(replica.state_root(), after.state_root(), "{what}: the replica's root");
+                            assert_eq!(replica.unsealed_fees(), after.unsealed_fees(), "{what}: the replica's bucket");
+                            assert_eq!(replica.supply(), after.supply(), "{what}: the replica's counters");
+                            cells += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 3 * 7 * 3 * 4, "every combination ran");
+    }
+
+    /// The proposal's worked arithmetic (`docs/fees.md` §1.3): a 0.0012 RAND transfer under
+    /// 4 000 bps pays 0.0004 to the proposer at inclusion and buckets 0.0008 (0.0006 of base and
+    /// the 0.0002 tip); with `prove_base` 0.0006 the floor is 0.0016, so the same tip is a 0.0018
+    /// RAND fee and the bucket 0.0014. A bundle paying the old 0.001 floor is `FeeTooLow` at the
+    /// new one.
+    #[test]
+    fn the_worked_split_arithmetic_holds() {
+        let (a, _) = keys();
+        let p = a.address();
+        for (prove_base, fee, kept, bucket) in [(None, 1_200_000, 400_000, 800_000), (Some(PROVE_BASE), 1_800_000, 400_000, 1_400_000)] {
+            let mut l = with_rules(ledger(), split_rules(false, false, Some(4000), prove_base));
+            l.set_aggregation(Some(split_aggregation(256)));
+            let t = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], fee), Action::None));
+            if prove_base.is_some() {
+                let old = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE), Action::None));
+                assert_eq!(l.validate(&old, &StubExecutor), Err(TxError::FeeTooLow { min: 1_600_000, fee: gas::BUNDLE_BASE }));
+                assert_eq!(l.prove_base(), PROVE_BASE);
+            }
+            let mut after = l.clone();
+            after.apply_tx(&t, &p, &StubExecutor).unwrap();
+            let (_, k, _, paid) = split_of(&l, &after, &p);
+            assert_eq!((k, paid), (kept, kept), "{prove_base:?}: the proposer's 40 % of the base");
+            assert_eq!(after.unsealed_fees()[&t.hash()].0, bucket, "{prove_base:?}: the bucket");
+            assert!(after.audit().invariant_holds(), "{:?}", after.audit());
+        }
+    }
+
+    /// Both split fields are an aggregating chain's rules: genesis refuses them anywhere else,
+    /// and a ledger handed them without an `aggregation` section (only a test can) runs neither —
+    /// the floor, the split and the root are the plain chain's, byte for byte.
+    #[test]
+    fn without_aggregation_the_split_fields_change_nothing() {
+        let (a, _) = keys();
+        let p = a.address();
+        let run = |rules: fees::FeesConfig| {
+            let mut l = with_rules(ledger(), rules);
+            let t = StubExecutor::bound(Transaction::shielded(7, bundle(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE + 5), Action::None));
+            assert_eq!(l.settled_floor(&t, None), gas::BUNDLE_BASE);
+            assert_eq!(l.prove_base(), 0);
+            l.apply_tx(&t, &p, &StubExecutor).unwrap();
+            (l.validators()[&p].rewards, l.supply(), l.state_root())
+        };
+        assert_eq!(run(split_rules(false, false, Some(4000), Some(PROVE_BASE))), run(fees::FeesConfig::default()));
     }
 
     /// A `StubExecutor` whose `check_program` accepts a seven-word program on every even-numbered

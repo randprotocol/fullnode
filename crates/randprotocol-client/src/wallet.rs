@@ -3398,6 +3398,9 @@ pub fn call_fee_default(
 ///
 /// Fail-closed under a `gas` section: a node that reports the section but leaves out
 /// `gas_price` or `byte_price` is an error naming the field, never a price of zero.
+///
+/// Every rule's floor is raised by the chain's served `fees.prove_base`
+/// ([`ChainLimits::prove_base`], `0` without it), as the ledger's own floor is.
 pub fn call_floor(
     limits: Option<&ChainLimits>,
     tier: u8,
@@ -3406,16 +3409,27 @@ pub fn call_floor(
     gas_limit: u64,
     bytes: usize,
 ) -> Result<u64> {
+    // `fees.prove_base` (`docs/compute-optimization.md` §6.3) raises every floor on an
+    // aggregating chain; `0` wherever the node serves none.
+    let prove_base = limits.map_or(0, |l| l.prove_base);
     if let Some(l) = limits.filter(|l| l.gas_circuit) {
         let missing = |field: &str| anyhow!("the node reports a gas section (gas_metering \"circuit\") but no {field}: refusing to price the call at zero");
         let gas_price = l.gas_price.ok_or_else(|| missing("gas_price"))?;
         let byte_price = l.byte_price.ok_or_else(|| missing("byte_price"))?;
-        return Ok(gas::circuit_call_floor(gas_price, byte_price, gas_limit, bytes));
+        return Ok(gas::circuit_call_floor(gas_price, byte_price, gas_limit, bytes).saturating_add(prove_base));
     }
     Ok(match limits.and_then(|l| l.gas_policy()) {
         Some(p) => p.call_floor(tier, keccak_log_height, sha256_log_height, bytes),
         None => gas::BUNDLE_BASE + gas::call_fee(tier, bytes),
-    })
+    }
+    .saturating_add(prove_base))
+}
+
+/// The default fee for an action priced by the schedule alone (`gas::fee_floor`): that floor plus
+/// the chain's `fees.prove_base` (`docs/compute-optimization.md` §6.3, [`RpcClient::prove_base`],
+/// `0` on every chain without it), so a default fee pays the floor the ledger holds it to.
+pub async fn schedule_floor(rpc: &RpcClient, action: &Action) -> Result<u64> {
+    Ok(gas::fee_floor(action).saturating_add(rpc.prove_base().await?))
 }
 
 /// Spec §7.1: `⌊floor·(10 000 + adjust_bps)²/10 000²⌋` under the dynamic controller — two of the
@@ -4194,7 +4208,7 @@ async fn create_token_with(
     };
     let fee = match fee {
         Some(fee) => fee,
-        None => default_registration_fee(gas::fee_floor(&plan.action), plan.registration_fee)?,
+        None => default_registration_fee(schedule_floor(rpc, &plan.action).await?, plan.registration_fee)?,
     };
     eprintln!(
         "registering {symbol} at index {index}: fee {} RAND (the node reports a registration fee of {} RAND)",
@@ -8294,6 +8308,7 @@ mod tests {
             max_program_public_words: 0, envelope_bytes: None, hardening_v6: true,
             gas_price: None, byte_price: None, gas_circuit: false, bundle_gas_limit: None, adjust_bps: None, proof_window_blocks: None,
             program_state: None,
+            prove_base: 0,
         };
         let priced = ChainLimits { gas_price: Some(100), byte_price: Some(800), ..raised };
         assert_eq!(hardened_call_quote_bytes(Some(&raised), 1_000), 1_000, "no policy: the envelope, as before");
@@ -8301,6 +8316,36 @@ mod tests {
         assert_eq!(hardened_call_quote_bytes(Some(&priced), 1_000), (20 << 20) + 1_000, "a policy: the cap in the proof's place");
         // The overcharge the no-policy rule avoids is real: the cap alone is past the free allowance.
         assert!(call_fee_default(Some(&raised), 14, 0, 0, 0, (20 << 20) + 1_000).unwrap() > call_fee_default(Some(&raised), 14, 0, 0, 0, 1_000).unwrap());
+    }
+
+    /// `fees.prove_base` (`docs/compute-optimization.md` §6.3) in the wallet's own floors: the
+    /// call floor (and so `call_fee_default` and the post-proof guard) adds the served
+    /// `prove_base` under every pricing rule, and `schedule_floor` adds it to `gas::fee_floor` —
+    /// read off the node's cached `rand_getLimits.fee_rules`, `0` from a node that serves none.
+    #[tokio::test]
+    async fn the_wallets_floors_include_the_served_prove_base() {
+        let plain = limits(18_432, 2 << 20);
+        let proving = ChainLimits { prove_base: 600_000, ..plain };
+        assert_eq!(call_floor(Some(&proving), 12, 0, 0, 0, 0).unwrap(), call_floor(Some(&plain), 12, 0, 0, 0, 0).unwrap() + 600_000);
+        let circuit = ChainLimits { gas_circuit: true, gas_price: Some(100), byte_price: Some(800), ..proving };
+        assert_eq!(call_floor(Some(&circuit), 12, 0, 0, 3_000, 0).unwrap(), gas::circuit_call_floor(100, 800, 3_000, 0) + 600_000);
+        let policy = ChainLimits { gas_price: Some(100), byte_price: Some(800), ..proving };
+        assert_eq!(
+            call_fee_default(Some(&policy), 14, 0, 0, 0, 1_000).unwrap(),
+            gas::GasPolicy { gas_price: 100, byte_price: 800 }.call_floor(14, 0, 0, 1_000) + 600_000
+        );
+
+        use crate::test_rpc::{scripted_rpc, Reply};
+        let reply = serde_json::json!({
+            "max_program_words": 4096, "max_proof_bytes": 2097152, "max_block_bytes": 4194304,
+            "max_call_envelope_bytes": 18432, "max_program_public_words": 64,
+            "fee_rules": { "burn_base": false, "subsidy_net_of_fees": false, "burn_floor": false, "proposer_share_bps": 4000, "prove_base": "600000" }
+        });
+        let rpc = RpcClient::new(scripted_rpc(vec![("rand_getLimits", Reply::Ok(reply))]).await);
+        let bond = Action::None;
+        assert_eq!(schedule_floor(&rpc, &bond).await.unwrap(), gas::BUNDLE_BASE + 600_000);
+        let old = RpcClient::new(scripted_rpc(vec![]).await);
+        assert_eq!(schedule_floor(&old, &bond).await.unwrap(), gas::BUNDLE_BASE, "no prove_base served, the schedule alone");
     }
 
     #[test]
@@ -8314,6 +8359,7 @@ mod tests {
             max_program_public_words: 0, envelope_bytes: None, hardening_v6: false,
             gas_price: Some(100), byte_price: Some(800), gas_circuit: false, bundle_gas_limit: None, adjust_bps: None, proof_window_blocks: None,
             program_state: None,
+            prove_base: 0,
         };
         let old = ChainLimits { gas_price: None, byte_price: None, ..policy };
         for tier in [10u8, 12, 14, 20] {
@@ -8698,6 +8744,7 @@ mod tests {
             adjust_bps: None,
             proof_window_blocks: None,
             program_state: None,
+            prove_base: 0,
         }
     }
 
@@ -8974,6 +9021,7 @@ mod tests {
             adjust_bps: None,
             proof_window_blocks: None,
             program_state: None,
+            prove_base: 0,
         };
         let want = GasPolicy::DEFAULT.call_floor(tier, 0, 0, bytes);
         assert!(want > ledger_floor, "the policy floor must exceed the ledger floor for this test to say anything");

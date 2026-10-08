@@ -188,6 +188,8 @@ async fn start() -> common::TestNode {
             burn_base: Some(true),
             subsidy_net_of_fees: None,
             burn_floor: Some(true),
+            proposer_share_bps: None,
+            prove_base: None,
         });
         g.bridge = Some(common::bridge::bridge_config_for([0xaa; 32], &[TOKEN_CHAIN]));
         g.tokens = Some(TokensConfig {
@@ -406,7 +408,7 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
 
     // The exact values the fee rows above only type-check: this chain's two live rules.
     let limits = call(addr, "rand_getLimits", json!([])).await;
-    assert_eq!(limits["result"]["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true }));
+    assert_eq!(limits["result"]["fee_rules"], json!({ "burn_base": true, "subsidy_net_of_fees": false, "burn_floor": true, "proposer_share_bps": null, "prove_base": null }));
 
     node.shutdown().await;
 }
@@ -492,6 +494,8 @@ async fn fee_rules_under_all_three_flags() {
             burn_base: Some(true),
             subsidy_net_of_fees: Some(true),
             burn_floor: Some(true),
+            proposer_share_bps: None,
+            prove_base: None,
         });
     })
     .await;
@@ -506,7 +510,7 @@ async fn fee_rules_under_all_three_flags() {
     check(addr, &rows).await;
     assert_eq!(
         call(addr, "rand_getLimits", json!([])).await["result"]["fee_rules"],
-        json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true })
+        json!({ "burn_base": true, "subsidy_net_of_fees": true, "burn_floor": true, "proposer_share_bps": null, "prove_base": null })
     );
     assert_eq!(call(addr, "rand_getSupply", json!([])).await["result"]["base_fees_burned"], json!("0"));
 }

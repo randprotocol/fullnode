@@ -4815,7 +4815,7 @@ pub(crate) mod fixtures {
     /// The fee-feedback rules with every flag on (`docs/fees.md` §1.3, issue #135), or `burn_base`
     /// and `burn_floor` alone when `net` is false.
     pub(crate) fn burn_floor_rules(net: bool) -> randprotocol_core::ledger::FeesConfig {
-        randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: net.then_some(true), burn_floor: Some(true) }
+        randprotocol_core::ledger::FeesConfig { burn_base: Some(true), subsidy_net_of_fees: net.then_some(true), burn_floor: Some(true), proposer_share_bps: None, prove_base: None }
     }
 
     /// A four-word program's `Deploy` on a stub bundle keyed at `seed..seed + 3`, paying its floor
@@ -8076,7 +8076,7 @@ mod tests {
         use randprotocol_core::gas::BUNDLE_BASE;
         use randprotocol_core::ledger::FeesConfig;
         let (_d, s, mut gs) = genesis_with_two_notes();
-        let burn = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None };
+        let burn = FeesConfig { burn_base: Some(true), subsidy_net_of_fees: None, burn_floor: None, proposer_share_bps: None, prove_base: None };
         gs.ledger.set_fees(burn.clone());
         // The fixture's notes are tiny; tell the audit what genesis issued so its identity holds
         // after a fee is paid out of the pool.
