@@ -1922,8 +1922,12 @@ fn header_json(b: &randprotocol_core::Block, sealed: bool, fees: Option<&randpro
         .filter(|t| {
             // An invoke's payouts and mints are public notes too (RPL-2): without it here a
             // wallet reading this page — and fetching no block — found them only through the
-            // envelope the invoker sealed.
-            matches!(t.action, Action::BridgeAttest { .. } | Action::TokenMint { .. } | Action::RegisterToken { .. } | Action::Invoke { .. })
+            // envelope the invoker sealed. A multisig pay's notes likewise: every word of each is
+            // in the action, stamped with its own `time`.
+            matches!(
+                t.action,
+                Action::BridgeAttest { .. } | Action::TokenMint { .. } | Action::RegisterToken { .. } | Action::Invoke { .. } | Action::MultisigPay { .. }
+            )
                 || (fees.is_some() && matches!(t.action, Action::BridgeBurn { .. }))
         })
         // Every kind is carried stripped (audit v7, RPC-5; burns and invokes already were): the
@@ -1956,6 +1960,8 @@ fn public_rebuild_copy(t: &Transaction) -> Transaction {
     match &mut s.action {
         Action::Invoke { proof, .. } => *proof = Vec::new(),
         Action::BridgeAttest { pq_signatures, .. } => *pq_signatures = Vec::new(),
+        // A multisig pay carries no proof and no bundle: the copy is the transaction itself
+        // (its hash is its real id), signatures and all.
         _ => {}
     }
     s
@@ -2456,7 +2462,7 @@ fn tx_json_with(
         // are on the raw transaction, and `rand_getMultisig` lists them once the account exists);
         // its funding and a deposit's are the bundle's `burn_r` / `burn_a` / `burn_asset` above.
         Action::CreateMultisig { salt, signers, threshold } => json!({
-            "kind": "create_multisig", "salt": hex::encode(salt), "threshold": threshold, "signers": signers.len()
+            "kind": "create_multisig", "salt": hex::encode(salt), "threshold": threshold, "signer_count": signers.len()
         }),
         Action::MultisigDeposit { account } => json!({ "kind": "multisig_deposit", "account": hex::encode(account) }),
         // A pay's notes are public as an invoke's are: each payout with every word of its note
@@ -2467,10 +2473,11 @@ fn tx_json_with(
             "pays": pays.iter().map(|p| payout_json(p, *time, executor)).collect::<Vec<_>>(),
             "signers": signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
         }),
-        // A rotate: the new set by count, and which of the old set signed it, by position.
+        // A rotate: the new set by count (`signer_count`, so `signers` always means indices, as
+        // in a pay), and which of the old set signed it, by position.
         Action::MultisigRotate { account, nonce, signers, threshold, signatures } => json!({
             "kind": "multisig_rotate", "account": hex::encode(account), "nonce": nonce, "threshold": threshold,
-            "signers": signers.len(), "signed_by": signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
+            "signer_count": signers.len(), "signed_by": signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
         }),
     };
     json!({
@@ -7315,6 +7322,28 @@ pub(crate) mod tests {
         assert_eq!(t, &transition);
     }
 
+    /// A multisig pay's notes are public as an invoke's are (every word in the action, stamped
+    /// with its `time`), so a header carries the pay in `public_notes`: the wallet's header-page
+    /// scan reads only carried transactions. It carries no proof, so the carried copy is the
+    /// transaction itself and its raw decodes back to it.
+    #[tokio::test]
+    async fn a_header_carries_a_multisig_pay_in_public_notes() {
+        let gs = fixtures::multisig_genesis(7);
+        let (_d, st) = state_for(&gs);
+        let mut ledger = gs.ledger.clone();
+        let id = fixtures::multisig_id(7);
+        let pay = fixtures::multisig_pay_tx(&ledger, id, 0, vec![fixtures::rpl2_payout(0, randprotocol_core::UNITS_PER_RAND, 1)], &[0, 1]);
+        let b1 = make_block(&gs.block, &mut ledger, vec![pay.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let headers = ok(&st, "rand_getBlocks", json!([1, 1])).await;
+        let carried = headers[0]["public_notes"].as_array().unwrap();
+        assert_eq!(carried.len(), 1, "{carried:?}");
+        assert_eq!(carried[0]["hash"], pay.hash().to_hex(), "under its real id");
+        let raw = Transaction::decode(&hex::decode(carried[0]["raw"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(raw, pay, "nothing to strip: the carried copy is the transaction");
+        assert_eq!(raw.hash(), pay.hash());
+    }
+
     /// `tx_json` renders an invoke as a call plus the transition it declared: cells as 64-hex
     /// pairs, the inflow by name, and each payout with every word of its note — the recipient,
     /// the amount as a decimal string, the *bundle's* `time`, the blinding and the leaf the
@@ -7562,7 +7591,7 @@ pub(crate) mod tests {
         let rotate = multisig_rotate_tx(&ledger, id, 1, &[71, 72, 73], 3, &[1, 2]);
         assert_eq!(
             tx_json(&rotate, None, &StubExecutor)["action"],
-            json!({ "kind": "multisig_rotate", "account": hex::encode(id), "nonce": 1, "threshold": 3, "signers": 3, "signed_by": [1, 2] })
+            json!({ "kind": "multisig_rotate", "account": hex::encode(id), "nonce": 1, "threshold": 3, "signer_count": 3, "signed_by": [1, 2] })
         );
         assert!(derived_note_cms(&rotate, None, &StubExecutor).is_empty());
 
@@ -7575,7 +7604,7 @@ pub(crate) mod tests {
         };
         assert_eq!(
             tx_json(&create, None, &StubExecutor)["action"],
-            json!({ "kind": "create_multisig", "salt": hex::encode([5u8; 32]), "threshold": 1, "signers": 2 })
+            json!({ "kind": "create_multisig", "salt": hex::encode([5u8; 32]), "threshold": 1, "signer_count": 2 })
         );
         let mut deposit = create.clone();
         deposit.action = Action::MultisigDeposit { account: id };
