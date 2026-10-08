@@ -200,6 +200,11 @@ fn claimed_nonce(action: &Action) -> Option<(Address, u64)> {
         // are a block that dies on its second. Role 8 keeps it apart from the offender's own
         // `Unbond` at that nonce.
         Action::SlashEquivocation { first, .. } => Some((first.header.proposer.address(), first.header.view)),
+        // Multisig: the account's one nonce, which a pay and a rotate share — keyed on the
+        // account's 32-byte id, kept apart from every address and entry id by `claim_key`'s role.
+        Action::MultisigPay { account, nonce, .. } | Action::MultisigRotate { account, nonce, .. } => {
+            Some((Address(*account), *nonce))
+        }
         _ => None,
     }
 }
@@ -273,6 +278,7 @@ fn claim_key(action: &Action, claim: &(Address, u64)) -> (u8, Address, u64) {
         Action::RevokeVesting { .. } => 6,
         Action::AdmitValidator { .. } => 7,
         Action::SlashEquivocation { .. } => 8,
+        Action::MultisigPay { .. } | Action::MultisigRotate { .. } => 9,
         _ => 0,
     };
     (role, claim.0, claim.1)
@@ -862,7 +868,8 @@ impl Mempool {
         | Action::Aggregate { time, .. }
         | Action::WithdrawAggregator { time, .. }
         | Action::ClaimVested { time, .. }
-        | Action::RevokeVesting { time, .. } = &tx.action
+        | Action::RevokeVesting { time, .. }
+        | Action::MultisigPay { time, .. } = &tx.action
         {
             if !ledger.time_in_window(*time) {
                 return Err(TxError::TimeOutOfWindow { time: *time, height: ledger.height(), window: ledger.proof_window() });
@@ -993,6 +1000,18 @@ impl Mempool {
                     }
                     None => return Err(TxError::Vesting(VestingError::UnknownEntry(hex::encode(addr.0)))),
                 }
+            } else if matches!(tx.action, Action::MultisigPay { .. } | Action::MultisigRotate { .. }) {
+                // Multisig: the account's nonce, which only moves forward. Never the validator
+                // lookup below — an account id is not a validator address.
+                use randprotocol_core::ledger::multisig::MultisigError;
+                let reg = ledger.multisig().ok_or(TxError::UnsupportedAction("multisig"))?;
+                match reg.get(&addr.0).map(|a| a.nonce) {
+                    Some(current) if current == nonce => {}
+                    Some(current) => {
+                        return Err(TxError::Multisig(MultisigError::BadNonce { expected: current, actual: nonce }))
+                    }
+                    None => return Err(TxError::Multisig(MultisigError::UnknownAccount(hex::encode(addr.0)))),
+                }
             } else if matches!(
                 tx.action,
                 Action::Aggregate { .. } | Action::UnbondAggregator { .. } | Action::WithdrawAggregator { .. }
@@ -1041,6 +1060,12 @@ impl Mempool {
         // than be offered to, and fail, every block until its anchor scrolls out. The ledger's
         // own rules, asked through its own function: map lookups and compares, no hash.
         randprotocol_core::ledger::program_state::still_applies(ledger, tx)?;
+        // Multisig, the same rule one register over: a pooled pay was checked against its
+        // account's rows at admission, and a pay those rows no longer cover must leave here
+        // rather than be offered to, and fail, every block (`VaultShort`). Today only a pay moves
+        // a row down, and it moves the nonce too, so the nonce arm above usually answers first;
+        // this is the ledger's own rule asked directly, so the pool cannot drift from it.
+        randprotocol_core::ledger::multisig::still_applies(ledger, tx)?;
         let nullifiers = tx.nullifiers();
         if let Some(nf) = nullifiers.iter().find(|nf| ledger.is_spent(nf)) {
             return Err(TxError::Spent(*nf));
@@ -1742,6 +1767,114 @@ mod tests {
         );
         m.prune(&after);
         assert_eq!(m.len(), 1, "entry 1's claim left, entry 2's stayed");
+    }
+
+    /// The multisig fixture chain's genesis ledger (a 2-of-3 account holding 10 RAND) and the
+    /// account's id.
+    fn multisig_ledger() -> (Ledger, [u8; 32]) {
+        (fixtures::multisig_genesis(1).ledger.clone(), fixtures::multisig_id(1))
+    }
+
+    /// Multisig accounts: a pay and a rotate share the account's one nonce, so they share one
+    /// pool slot (role 9, keyed on the account id) — at most one pooled pay-or-rotate per
+    /// account. Once the account's nonce moves past it, a pooled one leaves at prune with the
+    /// multisig verdict, never falling through to the validator lookup (an account id is not an
+    /// address); on a chain without the section the verdict is the gate's.
+    #[test]
+    fn a_multisig_pay_holds_its_account_nonce_and_a_rotate_cannot_share_the_slot() {
+        use randprotocol_core::ledger::multisig::MultisigError;
+        let (l, id) = multisig_ledger();
+        let u = randprotocol_core::UNITS_PER_RAND;
+        let pay = |amount: u64, n: u32| fixtures::multisig_pay_tx(&l, id, 0, vec![fixtures::rpl2_payout(0, amount, n)], &[0, 1]);
+        let mut m = Mempool::new(100);
+        let first = pay(u, 1);
+        m.insert(first.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.candidates(&l, 10), vec![first.clone()]);
+        let slot = MempoolError::Conflict(claim_conflict_key(&Address(id)));
+        // Another pay at the account's nonce 0 — other notes, other signers — is a conflict.
+        let other = fixtures::multisig_pay_tx(&l, id, 0, vec![fixtures::rpl2_payout(0, 2 * u, 2)], &[1, 2]);
+        assert_eq!(m.insert(other, &l, &StubExecutor), Err(slot.clone()));
+        // So is a rotate at that nonce: only one of them can ever apply.
+        let rotate = fixtures::multisig_rotate_tx(&l, id, 0, &[71, 72], 1, &[0, 2]);
+        assert_eq!(m.insert(rotate.clone(), &l, &StubExecutor), Err(slot.clone()));
+        assert_eq!(m.len(), 1);
+        // And the other way round: a pooled rotate holds the slot against a pay.
+        let mut r = Mempool::new(100);
+        r.insert(rotate.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(r.insert(first.clone(), &l, &StubExecutor), Err(slot));
+        // Nothing has moved, so a prune keeps it.
+        m.prune(&l);
+        assert_eq!(m.len(), 1);
+
+        // The rotate commits elsewhere: the account is at nonce 1 and the pooled pay is stale.
+        let mut after = l.clone();
+        after.apply_tx(&rotate, &fixtures::key(1).address(), &StubExecutor).unwrap();
+        assert_eq!(
+            Mempool::applies(&first, &[], claimed_nonce(&first.action), &after).unwrap_err(),
+            TxError::Multisig(MultisigError::BadNonce { expected: 1, actual: 0 })
+        );
+        m.prune(&after);
+        assert!(m.is_empty(), "a pay whose nonce the account has moved past survived prune");
+        // An account the register does not hold, and a chain without the register.
+        let mut unknown = first.clone();
+        if let Action::MultisigPay { account, .. } = &mut unknown.action {
+            *account = [9; 32];
+        }
+        assert_eq!(
+            Mempool::applies(&unknown, &[], claimed_nonce(&unknown.action), &l).unwrap_err(),
+            TxError::Multisig(MultisigError::UnknownAccount(hex::encode([9u8; 32])))
+        );
+        let mut plain = l.clone();
+        plain.set_multisig(None);
+        assert_eq!(
+            Mempool::applies(&first, &[], claimed_nonce(&first.action), &plain).unwrap_err(),
+            TxError::UnsupportedAction("multisig")
+        );
+    }
+
+    /// Review focus 1: two pooled pays cannot both drain one row because they cannot both be
+    /// pooled (one slot per account) — but the row can still fall under a pooled pay without its
+    /// nonce moving, and such a pay must not be offered to (and fail) every block. Selection
+    /// re-checks it against the vault (`multisig::still_applies`) and prune drops it.
+    #[test]
+    fn a_pooled_pay_whose_row_was_drained_is_pruned_at_selection() {
+        use randprotocol_core::ledger::multisig::{MultisigConfig, MultisigError, MultisigRegister};
+        let (l, id) = multisig_ledger();
+        let u = randprotocol_core::UNITS_PER_RAND;
+        let pay = fixtures::multisig_pay_tx(&l, id, 0, vec![fixtures::rpl2_payout(0, 6 * u, 1)], &[0, 1]);
+        let mut m = Mempool::new(100);
+        m.insert(pay.clone(), &l, &StubExecutor).unwrap();
+        assert_eq!(m.candidates(&l, 10), vec![pay.clone()]);
+
+        // The same account (same id, same nonce 0) now holding 5 RAND.
+        let mut drained = l.clone();
+        let config = MultisigConfig { create_fee: fixtures::MULTISIG_CREATE_FEE, accounts: vec![fixtures::multisig_account_config(5 * u)] };
+        drained.set_multisig(Some(MultisigRegister::from_config(&config, drained.chain_id())));
+        assert_eq!(drained.multisig().unwrap().get(&id).unwrap().nonce, 0, "the nonce did not move");
+        assert!(m.candidates(&drained, 10).is_empty(), "a pay its row cannot cover is not offered");
+        assert_eq!(
+            Mempool::applies(&pay, &[], claimed_nonce(&pay.action), &drained).unwrap_err(),
+            TxError::Multisig(MultisigError::VaultShort { asset: 0, have: 5 * u, want: 6 * u + randprotocol_core::gas::BUNDLE_BASE })
+        );
+        m.prune(&drained);
+        assert!(m.is_empty(), "and it leaves at prune");
+    }
+
+    /// A pay's `time` is the payout notes' timestamp and is held to the window a claim's is: a
+    /// pay whose `time` has aged out is refused by the pre-pool screen, before any of its
+    /// signatures is verified.
+    #[test]
+    fn a_pay_with_a_stale_time_is_refused_before_pooling() {
+        let (mut l, id) = multisig_ledger();
+        let pay = fixtures::multisig_pay_tx(&l, id, 0, vec![fixtures::rpl2_payout(0, 1, 1)], &[0, 1]);
+        let Action::MultisigPay { time, .. } = pay.action else { unreachable!() };
+        assert_eq!(time, 0);
+        l.set_height(300);
+        let pool = Mempool::new(10);
+        assert_eq!(
+            pool.precheck(&pay, &l, &StubExecutor).unwrap_err(),
+            MempoolError::Invalid(TxError::TimeOutOfWindow { time: 0, height: 300, window: 256 })
+        );
     }
 
     /// Audit v6, STAKE-4, the pool's half: a revoke claims the entry's *revoke* nonce, its own

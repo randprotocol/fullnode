@@ -265,6 +265,13 @@ const META_VESTING: &str = "vesting";
 /// the register: its maps are keyed by tuples, which JSON cannot hold as object keys. Absent on
 /// every chain without a `program_state` section.
 const META_PROGRAM_STATE: &str = "program_state";
+/// `bincode(MultisigRegister)`: every multisig account (signers, threshold, nonce, vault) as of
+/// the head, with the genesis `create_fee` and the four RAND audit counters
+/// (`ledger::multisig::MultisigRegister`). Consensus state — hashed into the state root under
+/// `rand-state-multisig-1`, inside `Ledger`'s equality — written at the same three sites as
+/// program state and replay-audited. Bincode like program state: its accounts are keyed by
+/// 32-byte ids. Absent on every chain without a `multisig` section.
+const META_MULTISIG: &str = "multisig";
 /// `bincode(BTreeMap<Address, AggregatorEntry>)`: the aggregator register as of the head.
 /// `META_SUPPLY`'s twin in kind — derived, replay-audited — but unlike the bucket this one is
 /// hashed into the state root, so a restarted node that lost it would fork at the next block.
@@ -689,6 +696,14 @@ fn created_notes(
                 out.push((cm, p.envelope.clone()));
             }
         }
+        // Multisig: a pay's notes the same way, one per payout in order, each with its own
+        // envelope — stamped with the *action's* `time` (a pay rides no bundle).
+        Action::MultisigPay { pays, time, .. } => {
+            for p in pays {
+                let cm = randprotocol_core::ledger::program_state::payout_commitment(p, *time, executor);
+                out.push((cm, p.envelope.clone()));
+            }
+        }
         _ => {}
     }
     Ok(out)
@@ -761,6 +776,8 @@ pub fn derived_note_count(tx: &randprotocol_core::Transaction) -> usize {
         // RPL-2: one note per payout, which `created_notes` rebuilds above — the one action that
         // derives more than one. A count of the transition's own lists, nothing decoded.
         Action::Invoke { transition, .. } => transition.pays.len() + transition.mints.len(),
+        // Multisig: one note per payout, which `created_notes` rebuilds above.
+        Action::MultisigPay { pays, .. } => pays.len(),
         _ => 0,
     }
 }
@@ -1062,6 +1079,7 @@ impl Storage {
         }
         self.put_vesting(&mut batch, gs.ledger.vesting())?;
         self.put_program_state(&mut batch, gs.ledger.program_state())?;
+        self.put_multisig(&mut batch, gs.ledger.multisig())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(gs.ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(gs.ledger.aggregators())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATION, bincode::serialize(&gs.ledger.aggregation().cloned())?);
@@ -1644,6 +1662,13 @@ impl Storage {
             .transpose()
     }
 
+    /// The multisig register as of the head, `None` on a chain without the section.
+    pub fn multisig(&self) -> Result<Option<randprotocol_core::ledger::multisig::MultisigRegister>> {
+        self.get_meta_raw(META_MULTISIG)?
+            .map(|b| bincode::deserialize(&b).map_err(|e| StorageError::Corrupt(format!("multisig register: {e}"))))
+            .transpose()
+    }
+
     /// Write it beside the rest of the head's state — present when the chain has the section,
     /// deleted otherwise (`put_vesting`'s rule).
     fn put_program_state(
@@ -1654,6 +1679,16 @@ impl Storage {
         match p {
             Some(p) => batch.put_cf(self.cf(CF_META), META_PROGRAM_STATE, bincode::serialize(p)?),
             None => batch.delete_cf(self.cf(CF_META), META_PROGRAM_STATE),
+        }
+        Ok(())
+    }
+
+    /// The multisig register beside the rest of the head's state — present when the chain has
+    /// the section, deleted otherwise (`put_program_state`'s rule).
+    fn put_multisig(&self, batch: &mut WriteBatch, m: Option<&randprotocol_core::ledger::multisig::MultisigRegister>) -> Result<()> {
+        match m {
+            Some(m) => batch.put_cf(self.cf(CF_META), META_MULTISIG, bincode::serialize(m)?),
+            None => batch.delete_cf(self.cf(CF_META), META_MULTISIG),
         }
         Ok(())
     }
@@ -2630,6 +2665,7 @@ impl Storage {
         }
         ledger.set_vesting(self.vesting()?);
         ledger.set_program_state(self.program_state()?);
+        ledger.set_multisig(self.multisig()?);
         ledger.set_unsealed_fees(self.unsealed_fees()?);
         ledger.set_aggregators(self.aggregators()?);
         ledger.set_retired_aggregator_nonces(self.retired_aggregator_nonces()?);
@@ -2992,6 +3028,7 @@ impl Storage {
         }
         self.put_vesting(&mut batch, ledger_after.vesting())?;
         self.put_program_state(&mut batch, ledger_after.program_state())?;
+        self.put_multisig(&mut batch, ledger_after.multisig())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger_after.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger_after.aggregators())?);
         self.stage_retired_aggregator_nonces(&mut batch, ledger_after)?;
@@ -3559,6 +3596,12 @@ impl Storage {
             Ok(stored) if stored.program_state() != ledger.program_state() => {
                 check.problem = Some("stored program state does not match the replayed chain's".into())
             }
+            // The multisig register likewise: inside the equality, hashed under its section
+            // (`rand-state-multisig-1`) with its `create_fee` and four RAND counters, named so the
+            // repair knows the key.
+            Ok(stored) if stored.multisig() != ledger.multisig() => {
+                check.problem = Some("stored multisig register does not match the replayed chain's".into())
+            }
             // The supply counters are outside `Ledger`'s equality (nothing hashes them), so they
             // are audited here explicitly: this is the replay the RPC's numbers are worth.
             Ok(stored) if same && stored.supply() != ledger.supply() => {
@@ -3831,6 +3874,7 @@ impl Storage {
         }
         self.put_vesting(&mut batch, ledger.vesting())?;
         self.put_program_state(&mut batch, ledger.program_state())?;
+        self.put_multisig(&mut batch, ledger.multisig())?;
         batch.put_cf(self.cf(CF_META), META_UNSEALED_FEES, bincode::serialize(ledger.unsealed_fees())?);
         batch.put_cf(self.cf(CF_META), META_AGGREGATORS, bincode::serialize(ledger.aggregators())?);
         self.stage_retired_aggregator_nonces(&mut batch, ledger)?;
@@ -4738,6 +4782,79 @@ pub(crate) mod fixtures {
         (dir, s, gs, ledger, b1)
     }
 
+    // ---- Multisig: a chain with the `multisig` section, and the bundle-less actions it admits ----
+
+    /// The multisig fixture account's signers, by key seed, in list order. It is 2-of-3.
+    pub(crate) const MULTISIG_SIGNERS: [u8; 3] = [61, 62, 63];
+    /// The multisig fixture chain's `create_fee`.
+    pub(crate) const MULTISIG_CREATE_FEE: u64 = 5 * gas::BUNDLE_BASE;
+    /// What the fixture account opens with: 10 RAND.
+    pub(crate) const MULTISIG_BALANCE: u64 = 10 * randprotocol_core::UNITS_PER_RAND;
+
+    /// The fixture account as a genesis file lists it: [`MULTISIG_SIGNERS`], threshold 2.
+    pub(crate) fn multisig_account_config(balance: u64) -> randprotocol_core::ledger::multisig::MultisigAccountConfig {
+        randprotocol_core::ledger::multisig::MultisigAccountConfig {
+            salt: [60; 32],
+            signers: MULTISIG_SIGNERS.iter().map(|s| key(*s).public_key().clone()).collect(),
+            threshold: 2,
+            balance,
+        }
+    }
+
+    /// A one-validator genesis file with a `multisig` section holding the fixture account at
+    /// [`MULTISIG_BALANCE`]. Nothing else is needed: a pay and a rotate carry no bundle.
+    pub(crate) fn multisig_genesis_file(chain_id: u64) -> Genesis {
+        let mut g = genesis_file_of(chain_id, &[&key(1)], vec![], randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT);
+        g.multisig = Some(randprotocol_core::ledger::multisig::MultisigConfig {
+            create_fee: MULTISIG_CREATE_FEE,
+            accounts: vec![multisig_account_config(MULTISIG_BALANCE)],
+        });
+        g
+    }
+
+    pub(crate) fn multisig_genesis(chain_id: u64) -> GenesisState {
+        multisig_genesis_file(chain_id).build(&StubExecutor).unwrap()
+    }
+
+    /// The fixture account's id on `chain_id`.
+    pub(crate) fn multisig_id(chain_id: u64) -> [u8; 32] {
+        multisig_account_config(0).id(chain_id)
+    }
+
+    /// The signatures of the fixture signers at `indices` over `msg`.
+    fn multisig_signatures(msg: &Hash, indices: &[u8]) -> Vec<randprotocol_core::types::actions::SignerSignature> {
+        indices
+            .iter()
+            .map(|i| randprotocol_core::types::actions::SignerSignature {
+                index: *i,
+                signature: key(MULTISIG_SIGNERS[*i as usize]).sign(msg.as_bytes()),
+            })
+            .collect()
+    }
+
+    /// A `MultisigPay` of `pays` out of `account` at `nonce`, stamped at `ledger`'s height and
+    /// signed by the fixture signers at `indices`.
+    pub(crate) fn multisig_pay_tx(
+        ledger: &Ledger,
+        account: [u8; 32],
+        nonce: u64,
+        pays: Vec<randprotocol_core::ledger::program_state::Payout>,
+        indices: &[u8],
+    ) -> Transaction {
+        let time = ledger.height() as u32;
+        let msg = randprotocol_core::types::actions::multisig_pay_message(&ledger.signing_domain().genesis, ledger.chain_id(), &account, nonce, time, &pays);
+        let signatures = multisig_signatures(&msg, indices);
+        Transaction { chain_id: ledger.chain_id(), bundle: None, action: Action::MultisigPay { account, nonce, time, pays, signatures } }
+    }
+
+    /// A `MultisigRotate` of `account` at `nonce` to the keys seeded `signers` and `threshold`,
+    /// signed by the fixture signers at `indices`.
+    pub(crate) fn multisig_rotate_tx(ledger: &Ledger, account: [u8; 32], nonce: u64, signers: &[u8], threshold: u8, indices: &[u8]) -> Transaction {
+        let signers: Vec<_> = signers.iter().map(|s| key(*s).public_key().clone()).collect();
+        let msg = randprotocol_core::types::actions::multisig_rotate_message(&ledger.signing_domain().genesis, ledger.chain_id(), &account, nonce, &signers, threshold);
+        let signatures = multisig_signatures(&msg, indices);
+        Transaction { chain_id: ledger.chain_id(), bundle: None, action: Action::MultisigRotate { account, nonce, signers, threshold, signatures } }
+    }
     /// A bundle-less `Withdraw` signed by `v` (ruling B of S2 task 3): it pays a note worth
     /// `amount - BUNDLE_BASE` to the register's payout address at `time`, and the base to the
     /// proposer of whichever block applies it.
@@ -8518,6 +8635,102 @@ mod tests {
         plain.init_genesis(&plain_gs).unwrap();
         assert_eq!(plain.program_state().unwrap(), None);
         assert!(plain.get_meta_raw(META_PROGRAM_STATE).unwrap().is_none());
+    }
+
+    /// Multisig accounts: the register is consensus state (`rand-state-multisig-1` in the state
+    /// root), so it is written with genesis and every block at the three state-write sites,
+    /// restored by `load_ledger`, named by `verify_chain` when stale and rewritten by the repair;
+    /// a node whose database and genesis file disagree about having it refuses to start, and the
+    /// genesis file's `create_fee` is what a restarted node runs on whatever the blob says.
+    ///
+    /// And a pay's notes are leaves the wire does not carry: storage rebuilds them from the
+    /// transaction (stamped with the action's own `time`) and indexes each at the leaf the
+    /// ledger gave it, with the payout's own envelope (`commit` is `Corrupt` if the counts
+    /// disagree).
+    #[test]
+    fn the_multisig_register_is_persisted_restored_and_audited() {
+        use randprotocol_core::ledger::multisig::MultisigRegister;
+        use randprotocol_core::ledger::program_state::payout_commitment;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        let gs = multisig_genesis(7);
+        s.init_genesis(&gs).unwrap();
+        let id = multisig_id(7);
+        assert_eq!(s.multisig().unwrap().as_ref(), gs.ledger.multisig(), "written with genesis");
+        assert_eq!(s.multisig().unwrap().unwrap().get(&id).unwrap().balance(0), MULTISIG_BALANCE);
+
+        // Block 1: a pay of two notes (1 RAND and 2 RAND) out of the account, signed by signers
+        // 0 and 2 of the three.
+        let mut ledger = gs.ledger.clone();
+        let u = randprotocol_core::UNITS_PER_RAND;
+        let pays = vec![rpl2_payout(0, u, 1), rpl2_payout(0, 2 * u, 2)];
+        let pay = multisig_pay_tx(&ledger, id, 0, pays.clone(), &[0, 2]);
+        assert_eq!(derived_note_count(&pay), 2, "one leaf per payout");
+        let first = ledger.next_index();
+        let b1 = make_block(&gs.block, &mut ledger, vec![pay.clone()], &key(1));
+        assert!(b1.deposits.is_empty(), "a payout note is not a ledger `Deposit`: storage rebuilds it from the transaction");
+        s.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let Action::MultisigPay { time, .. } = &pay.action else { unreachable!() };
+        let rows = s.notes_in_heights(1, 1, usize::MAX).unwrap();
+        assert_eq!(rows.len(), 2);
+        for (k, ((index, row), p)) in rows.iter().zip(&pays).enumerate() {
+            assert_eq!(*index, first + k as u64, "leaf {k}");
+            assert_eq!(row.cm, payout_commitment(p, *time, &StubExecutor), "leaf {k}: stamped with the action's time");
+            assert_eq!(row.envelope, p.envelope, "leaf {k}: the payout's own envelope");
+            assert!(ledger.has_commitment(&row.cm));
+        }
+        assert_eq!(ledger.next_index(), first + 2);
+
+        let stored = s.multisig().unwrap().expect("committed with the state");
+        let account = stored.get(&id).unwrap();
+        assert_eq!(account.nonce, 1);
+        assert_eq!(account.balance(0), MULTISIG_BALANCE - 3 * u - randprotocol_core::gas::BUNDLE_BASE, "the payouts and the base");
+        assert_eq!((stored.rand_out, stored.base_out), (3 * u, randprotocol_core::gas::BUNDLE_BASE));
+        assert_eq!(stored.root(), ledger.multisig().unwrap().root());
+        assert!(ledger.audit().invariant_holds(), "{:?}", ledger.audit());
+
+        // Review focus 4: the restarted node is the running one, state root and all.
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.multisig(), ledger.multisig());
+        assert_eq!(reloaded.state_root(), ledger.state_root());
+        assert_eq!(reloaded, ledger);
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A stale blob (the genesis one: the pay lost) is named, and repaired from replay.
+        let put = |m: &MultisigRegister| s.db.put_cf(s.cf(CF_META), META_MULTISIG, bincode::serialize(m).unwrap()).unwrap();
+        put(gs.ledger.multisig().unwrap());
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        let problem = check.problem.expect("a stale multisig register is a problem");
+        assert!(problem.contains("multisig register"), "{problem}");
+        assert_eq!(check.last_good, 1, "the blocks themselves are fine");
+        s.truncate_to(&gs, 1, &check.ledger).unwrap();
+        assert_eq!(s.multisig().unwrap().as_ref(), ledger.multisig());
+        assert_eq!(s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap().problem, None);
+
+        // A blob whose `create_fee` is not the genesis file's: the file wins on reload, and the
+        // audit names the blob (the fee is inside the register's root).
+        let mut cheap = ledger.multisig().unwrap().clone();
+        cheap.create_fee = 1;
+        put(&cheap);
+        let reloaded = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.multisig().unwrap().create_fee, MULTISIG_CREATE_FEE, "the genesis file's fee");
+        assert_eq!(reloaded, ledger);
+        let check = s.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(check.problem.expect("a wrong fee is a wrong blob").contains("multisig register"));
+        s.truncate_to(&gs, 1, &check.ledger).unwrap();
+        assert_eq!(s.multisig().unwrap().unwrap().create_fee, MULTISIG_CREATE_FEE);
+
+        // A database without the blob under a genesis with the section: refuse to start.
+        s.db.delete_cf(s.cf(CF_META), META_MULTISIG).unwrap();
+        let err = crate::node::reload_ledger(&s, &gs, &StubExecutor).unwrap_err().to_string();
+        assert!(err.contains("has a multisig section but the database holds no multisig register"), "{err}");
+        put(ledger.multisig().unwrap());
+
+        // A chain without the section never gains the key.
+        let (_d2, plain, plain_gs) = genesis_with_two_notes();
+        plain.init_genesis(&plain_gs).unwrap();
+        assert_eq!(plain.multisig().unwrap(), None);
+        assert!(plain.get_meta_raw(META_MULTISIG).unwrap().is_none());
     }
 
     /// The v4 re-review's bond queue is consensus state under a `staking` section, so — like

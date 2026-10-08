@@ -277,6 +277,23 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | A::SlashingRetired
         );
     }
+    // Multisig accounts, split the same way. Cacheable are the verdicts on the action's own
+    // bytes: a signer set or threshold outside the creation bounds (`BadSigners`, the new set a
+    // create or a rotate names), one index listed twice, a payout list that is empty, over the
+    // cap or holds a zero amount, and a deposit whose bundle burns nothing. Everything read off
+    // the account is state: whether it exists (a create can land), the nonce, the vault, and the
+    // signer set and threshold, which a rotation replaces — so `BadSignature`, `BadSignerIndex`
+    // (an index against the *current* list's length; bridge v2 made `PqIndexOutOfRange` state
+    // for the same reason) and `BelowThreshold` (against the current threshold) may all be valid
+    // after one rotation. The set's shape is checked before the nonce, so a pay signed for the
+    // nonce after a pending rotation hears one of them until that rotation lands.
+    if let TxError::Multisig(m) = e {
+        use randprotocol_core::ledger::multisig::MultisigError as M;
+        return matches!(
+            m,
+            M::BadSigners(_) | M::DuplicateSigner(_) | M::NoPayouts | M::TooManyPayouts(_) | M::ZeroPayout | M::EmptyDeposit
+        );
+    }
     // RPL-2's verdicts, split the same way. Cacheable are the ones `program_state::check_shape`
     // and the segment rule give — the transition's own lists and amounts against compile-time
     // constants, and its inflow word against its own bundle's `burn_a`:
@@ -1290,6 +1307,43 @@ mod tests {
             let e = TxError::Vesting(v);
             assert!(!is_permanent(&e), "{e} moves with the chain and time");
         }
+    }
+
+    /// Multisig accounts: a verdict on the transaction's own bytes — a signer set or threshold out
+    /// of the creation bounds, a signer named twice, a payout list empty, over the cap or holding
+    /// a zero amount, a deposit that burns nothing — is cached. Everything read off the account
+    /// moves: its existence, its nonce, its vault, and its signer set and threshold, which a
+    /// rotation replaces — so a signature that does not verify, a signer index past the current
+    /// list and a list shorter than the current threshold may all be valid one rotation later.
+    #[test]
+    fn multisig_verdicts_split_into_bytes_and_state() {
+        use randprotocol_core::ledger::multisig::MultisigError as M;
+        for m in [
+            M::BadSigners("0 signers".into()),
+            M::DuplicateSigner(1),
+            M::NoPayouts,
+            M::TooManyPayouts(5),
+            M::ZeroPayout,
+            M::EmptyDeposit,
+        ] {
+            let e = TxError::Multisig(m);
+            assert!(is_permanent(&e), "{e} is a statement about the bytes");
+        }
+        for m in [
+            M::BadSignature(0),
+            M::BelowThreshold { have: 1, need: 2 },
+            M::BadSignerIndex(3),
+            M::UnknownAccount("07".repeat(32)),
+            M::AccountExists("07".repeat(32)),
+            M::BadNonce { expected: 1, actual: 0 },
+            M::VaultShort { asset: 0, have: 0, want: 1 },
+            M::Overflow,
+        ] {
+            let e = TxError::Multisig(m);
+            assert!(!is_permanent(&e), "{e} moves with the chain");
+        }
+        // The section's gate is a statement about the chain, like every `UnsupportedAction`.
+        assert!(!is_permanent(&TxError::UnsupportedAction("multisig")));
     }
 
     /// The aggregate verdicts, split: the byte-verdicts and the genesis-constant ones are

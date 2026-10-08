@@ -588,6 +588,7 @@ pub const PUBLIC_METHODS: &[&str] = &[
     "rand_getBridgeState", "rand_getAssets", "rand_getBridgeBurn", "rand_bridgeAssetId",
     "rand_getAggregate", "rand_getAggregators", "rand_getUnsealed",
     "rand_getVesting", "rand_getVestingSchedule", "rand_getVestingSummary",
+    "rand_getMultisig",
 ];
 
 /// The public listener's burst and refill, for **every caller together**: there is one address
@@ -761,6 +762,10 @@ pub struct ChainLimits {
     /// RPL-2: the genesis `program_state` section and the `Invoke` limits that come with it,
     /// `null` on a chain without the section (where every invoke is refused).
     pub program_state: Option<ProgramStateLimits>,
+    /// Multisig accounts: the genesis `multisig` section's `create_fee` and the two bounds a
+    /// wallet sizes a create and a pay by, `null` on a chain without the section (where every
+    /// multisig action is refused).
+    pub multisig: Option<MultisigLimits>,
     /// Fee feedback (`docs/fees.md` §1.3): the genesis `fees` section's three rules, `null` on a
     /// chain without one — and on one whose section sets no flag `true`, which is the section's
     /// absence in every respect (it hashes as absent too). Wallet fees do not change with it: the
@@ -792,6 +797,18 @@ pub struct ProgramStateLimits {
     pub max_payouts: usize,
 }
 
+/// `rand_getLimits`' `multisig` object.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MultisigLimits {
+    /// RAND units a `CreateMultisig` pays on top of the bundle base (its fee floor is
+    /// `BUNDLE_BASE + create_fee`). A decimal string, like every amount.
+    #[serde(serialize_with = "u64_as_decimal_string")]
+    pub create_fee: u64,
+    /// The most signers an account lists, and the most payouts one `MultisigPay` carries.
+    pub max_signers: usize,
+    pub max_payouts: usize,
+}
+
 impl ChainLimits {
     pub fn of(ledger: &randprotocol_core::Ledger) -> ChainLimits {
         let mut limits = ChainLimits {
@@ -819,6 +836,10 @@ impl ChainLimits {
             program_state: ledger.program_state().map(|p| {
                 use randprotocol_core::ledger::program_state::{MAX_PAYOUTS, MAX_READS, MAX_WRITES};
                 ProgramStateLimits { cell_fee: p.cell_fee, max_reads: MAX_READS, max_writes: MAX_WRITES, max_payouts: MAX_PAYOUTS }
+            }),
+            multisig: ledger.multisig().map(|m| {
+                use randprotocol_core::ledger::multisig::{MAX_PAYOUTS, MAX_SIGNERS};
+                MultisigLimits { create_fee: m.create_fee, max_signers: MAX_SIGNERS, max_payouts: MAX_PAYOUTS }
             }),
             fee_rules: Some(ledger.fees()).filter(|f| f.any()).map(|f| FeeRules {
                 burn_base: f.burn_base(),
@@ -1781,6 +1802,8 @@ fn derived_note_cms_with(
         (Action::Invoke { transition, .. }, Some(b)) => {
             transition.payouts().map(|p| payout_commitment(p, b.time, executor)).collect()
         }
+        // Multisig: a pay's notes, stamped with the action's own `time` (it rides no bundle).
+        (Action::MultisigPay { pays, time, .. }, None) => pays.iter().map(|p| payout_commitment(p, *time, executor)).collect(),
         _ => Vec::new(),
     }
 }
@@ -2429,11 +2452,26 @@ fn tx_json_with(
                 },
             })
         }
-        // Multisig: the kind only for now; Task 5 renders the fields.
-        Action::CreateMultisig { .. } => json!({ "kind": "create_multisig" }),
-        Action::MultisigDeposit { .. } => json!({ "kind": "multisig_deposit" }),
-        Action::MultisigPay { .. } => json!({ "kind": "multisig_pay" }),
-        Action::MultisigRotate { .. } => json!({ "kind": "multisig_rotate" }),
+        // Multisig accounts. A create names its salt, threshold and how many signers (the keys
+        // are on the raw transaction, and `rand_getMultisig` lists them once the account exists);
+        // its funding and a deposit's are the bundle's `burn_r` / `burn_a` / `burn_asset` above.
+        Action::CreateMultisig { salt, signers, threshold } => json!({
+            "kind": "create_multisig", "salt": hex::encode(salt), "threshold": threshold, "signers": signers.len()
+        }),
+        Action::MultisigDeposit { account } => json!({ "kind": "multisig_deposit", "account": hex::encode(account) }),
+        // A pay's notes are public as an invoke's are: each payout with every word of its note
+        // and the leaf the chain appended, stamped with the action's own `time`. The signers by
+        // their position in the account's list.
+        Action::MultisigPay { account, nonce, time, pays, signatures } => json!({
+            "kind": "multisig_pay", "account": hex::encode(account), "nonce": nonce, "time": time,
+            "pays": pays.iter().map(|p| payout_json(p, *time, executor)).collect::<Vec<_>>(),
+            "signers": signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
+        }),
+        // A rotate: the new set by count, and which of the old set signed it, by position.
+        Action::MultisigRotate { account, nonce, signers, threshold, signatures } => json!({
+            "kind": "multisig_rotate", "account": hex::encode(account), "nonce": nonce, "threshold": threshold,
+            "signers": signers.len(), "signed_by": signatures.iter().map(|s| s.index).collect::<Vec<_>>(),
+        }),
     };
     json!({
         "hash": t.hash().to_hex(),
@@ -2823,6 +2861,25 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 .into_iter()
                 .map(|(asset, amount)| json!({ "asset": asset, "amount": amount.to_string() }))
                 .collect::<Vec<_>>()))
+        }
+        // A multisig account: `[id]` (64 hex) → its signers (hex public keys, in list order — a
+        // signature names its signer by position), threshold, nonce and vault (ascending by
+        // asset, amounts as decimal strings), `null` for an id the register does not hold,
+        // `{"enabled": false}` on a chain without the `multisig` section.
+        "rand_getMultisig" => {
+            let id: [u8; 32] = parse_hash(p, 0)?.0;
+            let storage = st.storage.clone();
+            let Some(reg) = blocking(st, move || storage.multisig()).await? else {
+                return Ok(json!({ "enabled": false }));
+            };
+            Ok(reg.get(&id).map_or(Value::Null, |a| {
+                json!({
+                    "enabled": true, "id": hex::encode(id),
+                    "signers": a.signers.iter().map(|k| k.to_hex()).collect::<Vec<_>>(),
+                    "threshold": a.threshold, "nonce": a.nonce,
+                    "vault": a.vault.iter().map(|(asset, amount)| json!({ "asset": asset, "amount": amount.to_string() })).collect::<Vec<_>>(),
+                })
+            }))
         }
         "rand_getLimits" => {
             let mut limits = st.limits.clone();
@@ -3729,6 +3786,13 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 Some(p) => audit.with_program_vaults(p.rand_in, p.rand_out),
                 None => audit,
             };
+            // Multisig: the register's RAND, chained last as `Ledger::audit` chains it.
+            let multisig = st.storage.multisig().map_err(RpcError::internal)?;
+            let (multisig_rand_in, multisig_base_out) = multisig.as_ref().map_or((0, 0), |m| (m.rand_in, m.base_out));
+            let audit = match &multisig {
+                Some(m) => audit.with_multisig(m.issued, m.rand_in, m.rand_out, m.base_out),
+                None => audit,
+            };
             Ok(json!({
                 "height": height,
                 // RPL-2: RAND that invokes have paid out of program vaults as notes (inside
@@ -3737,6 +3801,15 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                 // `burned` too). Both "0" without the `program_state` section.
                 "program_rand_out": audit.program_rand_out.to_string(),
                 "program_rand_held": audit.program_rand_held.to_string(),
+                // Multisig accounts: what genesis seeded the vaults with (issuance), every
+                // `burn_r` a create or deposit put in (already inside `burned`), the RAND payout
+                // notes (inside `pool_value`), the bases pays paid to proposers' `rewards`, and
+                // what the vaults hold (inside `total_supply`). All "0" without the section.
+                "multisig_issued": audit.multisig_issued.to_string(),
+                "multisig_rand_in": multisig_rand_in.to_string(),
+                "multisig_rand_out": audit.multisig_rand_out.to_string(),
+                "multisig_base_out": multisig_base_out.to_string(),
+                "multisig_rand_held": audit.multisig_rand_held.to_string(),
                 // Genesis vesting: what genesis issued into the register, what claims and revokes
                 // released into the pool, what the register still holds (bonded RAND is in
                 // `register_total`), and what of it has not unlocked yet. All "0" without the
@@ -4824,6 +4897,7 @@ pub(crate) mod tests {
                 "binding_domain": 0,
                 "proof_window_blocks": null,
                 "program_state": null,
+                "multisig": null,
                 "fee_rules": null,
             })
         );
@@ -4854,6 +4928,7 @@ pub(crate) mod tests {
                 "binding_domain": 0,
                 "proof_window_blocks": null,
                 "program_state": null,
+                "multisig": null,
                 "fee_rules": null,
             })
         );
@@ -4886,6 +4961,7 @@ pub(crate) mod tests {
                 "binding_domain": 0,
                 "proof_window_blocks": null,
                 "program_state": null,
+                "multisig": null,
                 "fee_rules": null,
             })
         );
@@ -7412,6 +7488,108 @@ pub(crate) mod tests {
         for method in ["rand_getProgramCell", "rand_getProgramCells", "rand_getProgramVault"] {
             assert!(PUBLIC_METHODS.contains(&method), "{method}");
         }
+    }
+
+    /// Multisig accounts: `rand_getMultisig` (known, unknown, and a chain without the section),
+    /// the five `multisig_*` supply rows, the `multisig` limits object, `tx_json` for the four
+    /// actions — a pay's payouts each with the leaf the chain appended — and a pay's derived
+    /// notes.
+    #[tokio::test]
+    async fn the_multisig_register_is_served_priced_and_audited() {
+        use fixtures::{multisig_id, multisig_pay_tx, multisig_rotate_tx, rpl2_payout, MULTISIG_BALANCE, MULTISIG_CREATE_FEE, MULTISIG_SIGNERS};
+        use randprotocol_core::ledger::program_state::payout_commitment;
+        let gs = fixtures::multisig_genesis(7);
+        let (_d, st) = state_for(&gs);
+        let id = multisig_id(7);
+        let u = randprotocol_core::UNITS_PER_RAND;
+        let base = randprotocol_core::gas::BUNDLE_BASE;
+        let mut ledger = gs.ledger.clone();
+        let pays = vec![rpl2_payout(0, u, 1), rpl2_payout(0, 2 * u, 2)];
+        let pay = multisig_pay_tx(&ledger, id, 0, pays.clone(), &[0, 2]);
+        let b1 = make_block(&gs.block, &mut ledger, vec![pay.clone()], &key(1));
+        st.storage.commit(std::slice::from_ref(&b1), &ledger, &[], &StubExecutor).unwrap();
+        let held = MULTISIG_BALANCE - 3 * u - base;
+
+        // The account: its signers in list order, its threshold, the nonce the pay moved, the vault.
+        let signers: Vec<String> = MULTISIG_SIGNERS.iter().map(|s| key(*s).public_key().to_hex()).collect();
+        assert_eq!(
+            ok(&st, "rand_getMultisig", json!([hex::encode(id)])).await,
+            json!({
+                "enabled": true, "id": hex::encode(id), "signers": signers, "threshold": 2, "nonce": 1,
+                "vault": [{ "asset": 0, "amount": held.to_string() }],
+            })
+        );
+        assert_eq!(ok(&st, "rand_getMultisig", json!(["ab".repeat(32)])).await, Value::Null, "an unknown id");
+        for bad in [json!([]), json!(["01"]), json!([1])] {
+            assert_eq!(call(&st, "rand_getMultisig", bad.clone()).await.unwrap_err().code, -32602, "{bad}");
+        }
+
+        // The supply rows: issued at genesis, nothing deposited, 3 RAND paid out as notes (in the
+        // pool), one base paid to the proposer, the rest held.
+        let supply = ok(&st, "rand_getSupply", json!([])).await;
+        let rows = ["multisig_issued", "multisig_rand_in", "multisig_rand_out", "multisig_base_out", "multisig_rand_held"]
+            .map(|k| supply[k].clone());
+        assert_eq!(rows, [MULTISIG_BALANCE, 0, 3 * u, base, held].map(|v| json!(v.to_string())), "{supply}");
+        assert_eq!(supply["invariant_holds"], true, "{supply}");
+        assert_eq!(supply["total_supply"], ledger.audit().total_supply().to_string());
+        assert_eq!(supply["pool_value"], ledger.audit().pool_value.to_string(), "with_multisig chained last");
+
+        // The limits.
+        assert_eq!(
+            ok(&st, "rand_getLimits", json!([])).await["multisig"],
+            json!({ "create_fee": MULTISIG_CREATE_FEE.to_string(), "max_signers": 10, "max_payouts": 4 })
+        );
+
+        // A pay: every payout with every word of its note, stamped with the action's own `time`,
+        // and the signers by index. The rendered leaves are the appended ones.
+        let Action::MultisigPay { time, .. } = &pay.action else { unreachable!() };
+        let want = json!({
+            "kind": "multisig_pay", "account": hex::encode(id), "nonce": 0, "time": time,
+            "pays": pays.iter().map(|p| payout_json(p, *time, &StubExecutor)).collect::<Vec<_>>(),
+            "signers": [0, 2],
+        });
+        assert_eq!(tx_json(&pay, None, &StubExecutor)["action"], want);
+        let served = ok(&st, "rand_getTransaction", json!([pay.hash().to_hex()])).await;
+        assert_eq!(served["tx"]["action"], want);
+        let leaves: Vec<String> = st.storage.notes_in_heights(1, 1, usize::MAX).unwrap().iter().map(|(_, r)| word8_to_hex(&r.cm)).collect();
+        assert_eq!(json!(leaves), json!([want["pays"][0]["cm"], want["pays"][1]["cm"]]));
+        assert_eq!(want["pays"][0]["cm"], word8_to_hex(&payout_commitment(&pays[0], *time, &StubExecutor)));
+        // Its derived notes are those leaves; a rotate derives none.
+        let derived = derived_note_cms(&pay, None, &StubExecutor);
+        assert_eq!(derived.iter().map(word8_to_hex).collect::<Vec<_>>(), leaves);
+
+        // A rotate: the new set by count, the signers of the old set by index.
+        let rotate = multisig_rotate_tx(&ledger, id, 1, &[71, 72, 73], 3, &[1, 2]);
+        assert_eq!(
+            tx_json(&rotate, None, &StubExecutor)["action"],
+            json!({ "kind": "multisig_rotate", "account": hex::encode(id), "nonce": 1, "threshold": 3, "signers": 3, "signed_by": [1, 2] })
+        );
+        assert!(derived_note_cms(&rotate, None, &StubExecutor).is_empty());
+
+        // A create and a deposit ride a bundle (rendered with it); the action is its own fields.
+        let mut create = bundle_tx(&ledger, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
+        create.action = Action::CreateMultisig {
+            salt: [5; 32],
+            signers: vec![key(71).public_key().clone(), key(72).public_key().clone()],
+            threshold: 1,
+        };
+        assert_eq!(
+            tx_json(&create, None, &StubExecutor)["action"],
+            json!({ "kind": "create_multisig", "salt": hex::encode([5u8; 32]), "threshold": 1, "signers": 2 })
+        );
+        let mut deposit = create.clone();
+        deposit.action = Action::MultisigDeposit { account: id };
+        assert_eq!(tx_json(&deposit, None, &StubExecutor)["action"], json!({ "kind": "multisig_deposit", "account": hex::encode(id) }));
+
+        // A chain without the section: `enabled: false`, null limits, zero rows.
+        let (_p, plain) = state_for(&fixtures::genesis_with(1, vec![]));
+        assert_eq!(ok(&plain, "rand_getMultisig", json!([hex::encode(id)])).await, json!({ "enabled": false }));
+        assert_eq!(ok(&plain, "rand_getLimits", json!([])).await["multisig"], Value::Null);
+        let supply = ok(&plain, "rand_getSupply", json!([])).await;
+        for k in ["multisig_issued", "multisig_rand_in", "multisig_rand_out", "multisig_base_out", "multisig_rand_held"] {
+            assert_eq!(supply[k], json!("0"), "{k}");
+        }
+        assert!(PUBLIC_METHODS.contains(&"rand_getMultisig"), "a read a wallet needs is on the public listener");
     }
 
     /// An invoke's receipt is a call's: `rand_getReceipt` and `rand_getReceipts` carry it, the

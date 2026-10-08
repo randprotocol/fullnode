@@ -277,6 +277,28 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
             ledger.set_program_state(Some(fixed));
         }
     }
+    // The multisig register is state too — accounts, nonces and vaults move with every pay,
+    // rotate, create and deposit — under the same presence rule: a node on one side of it would
+    // hash `rand-state-multisig-1` against peers that do not, or refuse every multisig action
+    // they apply.
+    if gs.ledger.multisig().is_some() != ledger.multisig().is_some() {
+        anyhow::bail!(
+            "the genesis file {} multisig section but the database {} multisig register",
+            if gs.ledger.multisig().is_some() { "has a" } else { "has no" },
+            if ledger.multisig().is_some() { "holds a" } else { "holds no" },
+        );
+    }
+    // And `create_fee` is the genesis parameter the blob carries, as `cell_fee` is program
+    // state's: nothing on chain moves it, so a stored fee that differs is a damaged blob, and the
+    // file's value is what this node prices creates at (`verify_chain` names the blob — the fee
+    // is inside the register's root — and the repair rewrites it).
+    if let (Some(genesis), Some(stored)) = (gs.ledger.multisig(), ledger.multisig()) {
+        if stored.create_fee != genesis.create_fee {
+            let mut fixed = stored.clone();
+            fixed.create_fee = genesis.create_fee;
+            ledger.set_multisig(Some(fixed));
+        }
+    }
     Ok(ledger)
 }
 
@@ -5481,6 +5503,37 @@ mod tests {
         let reloaded = reload_ledger(&storage, &plain, &StubExecutor).unwrap();
         assert_eq!(reloaded.binding_domain(), &BindingDomain::ChainId);
         assert_eq!(reloaded.validate(&chain_id, &StubExecutor), Ok(()));
+    }
+
+    /// Multisig accounts: the register is state, never re-seeded from the file, but the file and
+    /// the database must agree that the chain has one — a node on one side of it would hash
+    /// `rand-state-multisig-1` against peers that do not, or refuse every multisig action they
+    /// apply. Each way round is refused by name.
+    #[test]
+    fn a_database_without_a_multisig_register_is_refused_under_a_genesis_with_the_section() {
+        use crate::storage::fixtures::{multisig_genesis, multisig_genesis_file};
+        let with = multisig_genesis(7);
+        let mut without = multisig_genesis_file(7);
+        without.multisig = None;
+        let without = without.build(&StubExecutor).unwrap();
+
+        // Written under a genesis without the section, started under one with it.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        storage.init_genesis(&without).unwrap();
+        let err = reload_ledger(&storage, &with, &StubExecutor).unwrap_err().to_string();
+        assert!(err.contains("has a multisig section but the database holds no multisig register"), "{err}");
+
+        // And the other way round.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        storage.init_genesis(&with).unwrap();
+        let err = reload_ledger(&storage, &without, &StubExecutor).unwrap_err().to_string();
+        assert!(err.contains("has no multisig section but the database holds a multisig register"), "{err}");
+        // Agreeing, it starts with the register it stored.
+        let reloaded = reload_ledger(&storage, &with, &StubExecutor).unwrap();
+        assert_eq!(reloaded.multisig(), with.ledger.multisig());
+        assert_eq!(reloaded, with.ledger);
     }
 
     /// The four call-limits parameters survive a restart the same way: `load_ledger` comes back

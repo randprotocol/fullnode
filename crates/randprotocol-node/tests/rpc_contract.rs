@@ -291,7 +291,7 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
             ("max_program_public_words", Int), ("envelope_bytes", Null), ("hardening_v6", Bool), ("hc_auth", Null),
             ("gas_price", Dec), ("byte_price", Dec), ("gas_metering", Str), ("bundle_gas_limit", Int),
             ("admission_by_vote", Bool), ("testnet", Bool), ("binding_domain", Int), ("proof_window_blocks", Null),
-            ("program_state", Null),
+            ("program_state", Null), ("multisig", Null),
             ("fee_rules.burn_base", Bool), ("fee_rules.subsidy_net_of_fees", Bool), ("fee_rules.burn_floor", Bool),
         ]),
         // randscan crates/randscan-core/src/types/stats.rs `Supply`; randprotocol.org (supply page).
@@ -301,6 +301,8 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
             ("total_supply", Dec), ("invariant_holds", Bool), ("vesting_issued", Dec), ("vesting_released", Dec),
             ("vesting_in_register", Dec), ("vesting_locked", Dec), ("program_rand_out", Dec), ("program_rand_held", Dec),
             ("registration_fees_burned", Dec), ("base_fees_burned", Dec),
+            ("multisig_issued", Dec), ("multisig_rand_in", Dec), ("multisig_rand_out", Dec), ("multisig_base_out", Dec),
+            ("multisig_rand_held", Dec),
         ]),
         // ---- blocks and transactions ----
         // randscan crates/randscan-indexer/src/rpc.rs `RpcBlock`/`RpcTx`/`RpcAction::Mint`;
@@ -390,6 +392,9 @@ async fn every_field_the_downstream_repos_read_is_served_with_its_type() {
         // randscan crates/randscan-indexer/src/rpc.rs `program_vault`/`program_cells`: without a
         // `program_state` section both answer `{"enabled": false}`, which the indexer reads as `None`.
         exactly("rand_getProgramVault", json!([unknown]), "randscan crates/randscan-indexer/src/rpc.rs `program_vault`", json!({ "enabled": false })),
+        // Multisig accounts: without a `multisig` section `{"enabled": false}`, `rand_getVesting`'s
+        // and `rand_getProgramVault`'s shape (no consumer yet; the CLI's `multisig status` reads it).
+        exactly("rand_getMultisig", json!([unknown]), "rand-node `multisig status`", json!({ "enabled": false })),
         exactly(
             "rand_getProgramCells",
             json!([unknown, { "after": null, "limit": 10 }]),
@@ -501,6 +506,8 @@ async fn fee_rules_under_all_three_flags() {
         ]),
         row("rand_getSupply", json!([]), "randscan crates/randscan-core/src/types/stats.rs `Supply`", &[
             ("base_fees_burned", Dec), ("burned", Dec), ("subsidised", Dec), ("sealed_blocks", Dec), ("invariant_holds", Bool),
+            ("multisig_issued", Dec), ("multisig_rand_in", Dec), ("multisig_rand_out", Dec), ("multisig_base_out", Dec),
+            ("multisig_rand_held", Dec),
         ]),
     ];
     check(addr, &rows).await;
