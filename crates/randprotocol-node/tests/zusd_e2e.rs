@@ -141,6 +141,7 @@ fn zusd_genesis(validators: &[randprotocol_core::Keypair]) -> Genesis {
         proof_window_blocks: None,
         program_state: None,
         fees: None,
+        incremental_nullifier_root: None,
     }
 }
 

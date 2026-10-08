@@ -57,6 +57,7 @@ on an aggregation chain, in aggregators.
 | bundle verify | 838 ms cold, about 16 ms warm | `docs/superpowers/specs/2026-09-15-block-aggregation.md` §1 |
 | call verify | about 233 ms first (uncached) verify at tier 10, production profile (constraint set 5) | `docs/confidential.md` |
 | network | TCP 30303 inbound on public nodes | `docs/deploy.md` |
+| block apply, 2 000 bundles, 80 M nullifiers | 56.1 ms at block 10 000 (incremental nullifier root on; the replica's apply on a clone of the tip) | this page §7 |
 
 Between those two disk readings the chain added about 24 000 blocks, most of them empty, and the
 data dir grew by about 4 GB. Plan disk from the chain's age and load, not from the genesis size.
@@ -357,3 +358,133 @@ decide):
   is visible, prints once that it is going unused and how to rebuild. The release binaries are
   built without the backend (a CUDA 13 toolkit is not on the release runner), so a GPU host
   builds its own `rand`/`rand-prover` with `--features cuda`.
+
+## 7. The hot path at synthetic load (2026-10-05)
+
+Measured on the `feat/hot-path` branch with `rand-node bench apply`: one validator on the
+`StubExecutor`, 2 000 bundles a block (the block cap), each bundle four nullifier and four
+commitment slots (two real, two dummy), and a bundle inserts all four, so 8 000 nullifiers and
+16 000 commitments a block, through the real HotStuff propose, apply and commit path. Ten thousand
+blocks therefore hold 80 M nullifiers, twice the 40 M that `docs/compute-optimization.md` §3.6
+counted from two a bundle, so the acceptance is stricter than the page it answers. `apply_ms` is
+the replica's `apply_block_for_sync` of the proposed block on a clone of the pre-block tip, which
+is what §3.6 bounds; `propose_ms` is the leader's whole `propose` call, which itself contains an
+apply and a state root; `root_ms` is one `state_root`; `clone_ms` is one ledger clone. The host is
+an Apple M4 Max, 16 cores, 48 GB (`sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize`).
+
+Baseline, unmodified code, 100 blocks (`/tmp/bench-baseline-100.txt`). The 300-block baseline run
+was killed after 20 minutes without a usable row, so the 100-block table is the baseline.
+
+```
+ height  propose_ms  apply_ms  root_ms  clone_ms  nullifiers   rss_mb  peak_rss_mb
+     20      4276.2      81.2    27.78      1.21      160000      234          234
+     40      9886.1     117.7    56.73      2.45      320000      439          484
+     60     16008.4     152.3    84.84      3.73      480000      646          646
+     80     29776.8     227.4   172.00      5.02      640000      818          818
+    100     27077.2     221.4   143.26      6.37      800000     1002         1002
+verdict: apply 221.4 ms at block 100 (800000 nullifiers) — within the 100000 ms budget
+```
+
+After the shared set, the proposer without a clone per candidate and replay on failure, 300 blocks
+(`/tmp/bench-sharedset-300.txt`):
+
+```
+ height  propose_ms  apply_ms  root_ms  clone_ms  nullifiers   rss_mb  peak_rss_mb
+     50       275.4     129.5    73.90      0.39      400000      619          626
+    100       448.3     207.1   146.01      0.39      800000     1026         1217
+    150       572.6     286.1   225.90      0.42     1200000      928         1707
+    200       730.0     346.2   293.99      0.48     1600000     1954         2004
+    250      1327.8     445.1   375.99      0.44     2000000     1546         2321
+    300      1026.4     495.0   441.53      0.48     2400000     1682         2655
+verdict: apply 495.0 ms at block 300 (2400000 nullifiers) — within the 100000 ms budget
+```
+
+After the incremental nullifier root, `--incremental-nullifier-root`, 300 blocks
+(`/tmp/bench-mmr-300.txt`):
+
+```
+ height  propose_ms  apply_ms  root_ms  clone_ms  nullifiers   rss_mb  peak_rss_mb
+     50       123.0      54.4     0.00      0.25      400000      116          116
+    100       126.2      54.3     0.00      0.26      800000      160          160
+    150       128.8      54.9     0.00      0.25     1200000      205          205
+    200       137.7      56.1     0.00      0.27     1600000      250          250
+    250       132.7      55.5     0.00      0.28     2000000      294          294
+    300       134.8      55.5     0.00      0.29     2400000      339          339
+verdict: apply 55.5 ms at block 300 (2400000 nullifiers) — within the 100000 ms budget
+```
+
+The acceptance run, `rand-node bench apply --blocks 10000 --report-every 500
+--incremental-nullifier-root` (`/tmp/bench-final-10000.txt`):
+
+```
+ height  propose_ms  apply_ms  root_ms  clone_ms  nullifiers   rss_mb  peak_rss_mb
+    500       132.7      54.8     0.00      0.27     4000000      516          516
+   1000       138.8      55.3     0.00      0.27     8000000      961          961
+   1500       144.8      55.4     0.00      0.28    12000000     1405         1405
+   2000       146.9      55.2     0.00      0.25    16000000     1849         1849
+   2500       147.6      55.3     0.00      0.27    20000000     2293         2293
+   3000       151.2      55.9     0.00      0.27    24000000     2737         2737
+   3500       151.4      55.5     0.00      0.27    28000000     3182         3182
+   4000       150.9      55.9     0.00      0.28    32000000     3626         3626
+   4500       154.4      56.3     0.00      0.29    36000000     4071         4071
+   5000       155.1      55.4     0.00      0.27    40000000     4514         4514
+   5500       157.2      56.5     0.00      0.29    44000000     4958         4958
+   6000       156.5      55.5     0.00      0.27    48000000     5403         5403
+   6500       157.6      56.9     0.00      0.29    52000000     5847         5847
+   7000       159.9      56.0     0.00      0.29    56000000     6291         6291
+   7500       160.2      56.0     0.00      0.28    60000000     6736         6736
+   8000       166.3      56.7     0.00      0.27    64000000     7180         7180
+   8500       161.2      56.6     0.00      0.28    68000000     7624         7624
+   9000       161.9      56.8     0.00      0.27    72000000     8067         8067
+   9500       160.8      56.0     0.00      0.28    76000000     8510         8510
+  10000       162.4      56.1     0.00      0.28    80000000     8954         8954
+verdict: apply 56.1 ms at block 10000 (80000000 nullifiers) — within the 300 ms budget
+exit 0
+```
+
+The flag-off comparison, same code, `rand-node bench apply --blocks 600 --report-every 100
+--fail-over-ms 100000` (`/tmp/bench-final-flagoff-600.txt`). It stops at 600 blocks because the
+sorted nullifier root is `O(n)` and runs three times a block, so the run is quadratic in blocks
+and 2 000 blocks would take over two hours; the 300-block shared-set table above is the same code
+and also stands.
+
+```
+ height  propose_ms  apply_ms  root_ms  clone_ms  nullifiers   rss_mb  peak_rss_mb
+    100       404.1     189.5   139.54      0.30      800000     1375         1383
+    200       686.4     330.4   284.87      0.34     1600000     1334         2275
+    300       968.4     469.0   416.30      0.39     2400000     1993         2600
+    400      1251.4     606.7   553.61      0.40     3200000     2670         3188
+    500      1578.3     769.6   722.73      0.36     4000000     1954         3569
+    600      1878.9     915.1   861.71      0.33     4800000     2837         3722
+verdict: apply 915.1 ms at block 600 (4800000 nullifiers) — within the 100000 ms budget
+exit 0
+```
+
+Which change moved which column. The shared set took `clone_ms` from 1.21 ms at 160 000
+nullifiers and 6.37 ms at 800 000, growing with the set, to a flat 0.39 to 0.48 ms (0.25 to 0.29 ms
+with the incremental root on), and with the
+proposer change took `propose_ms` from 4 276 ms at height 20 and 27 077 ms at height 100 to
+275.4 ms at height 50 and 1 026.4 ms at height 300. What it left was the sorted-order nullifier
+root: `root_ms` 73.90 ms at height 50 and 441.53 ms at height 300, and `apply_ms` 129.5 to 495.0 ms
+with it, linear in the set (915.1 ms at 600 blocks in the flag-off table). The incremental root took `root_ms` to 0.00 at every row
+and `apply_ms` to 54.4 ms at height 50 and 55.5 ms at height 300, flat, and held it at 56.1 ms at
+block 10 000 with 80 M nullifiers; `propose_ms` rises slowly, 132.7 ms at block 500 to 162.4 ms at
+block 10 000, which is the leader's own apply, root and the replay bookkeeping, not a root term.
+
+Memory does not meet the spec's original criterion, and cannot while the sets live in memory.
+That criterion (the last 1 000 blocks within 5 % of the first 1 000 after block 1 000) asks for
+a flat resident size, and the run went from 961 MB at block 1 000 to 8 954 MB at block 10 000,
+because every block adds 8 000 nullifiers and 16 000 commitments that the validator keeps. The
+criterion met is the amended one (spec 2026-10-05 §1, amendment 6 in §0): resident memory linear
+in the entries, at a constant 117 to 121 bytes per nullifier, with no term in the speculative
+tree or in height. From the `rss_mb` and `nullifiers` columns,
+taking `rss_mb` as MiB, the resident size per nullifier is 121.2 bytes at row 2 000 (1 849 MB,
+16 000 000), 118.3 bytes at row 5 000 (4 514 MB, 40 000 000) and 117.4 bytes at row 10 000
+(8 954 MB, 80 000 000). That figure carries both sets (each block also adds twice as many
+commitments as nullifiers), the tree's leaf set and the range peaks, and it falls slightly with
+height as fixed costs amortise; there is no term in height beyond the entries themselves. The
+sets are in memory by design: 80 M nullifiers cost about 9 GB here, which a validator must budget.
+
+Acceptance (`docs/compute-optimization.md` §3.6): passed on apply time and set size, and on
+memory under the amended criterion above. Exit 0, `apply_ms` 56.1 against the 300 ms bound at
+block 10 000, 80 000 000 nullifiers.

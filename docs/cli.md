@@ -20,6 +20,7 @@ rand-node <COMMAND>
   run       Run the node
   verify    Verify the chain in a data directory without running the node
   status    Show node status
+  bench     Measure the validator hot path at synthetic load (`bench apply`)
   register  Print this node's Registration, for the wallet that bonds it in
   unbond    Move bonded stake into unbonding
   withdraw  Pay released stake and rewards into a note at the payout address
@@ -92,6 +93,7 @@ Signature lines are `index:hex`, whitespace- or newline-separated, `#` comments 
 | `--max-proof-bytes <N>` | none (2 097 152) | the largest proof a transaction may carry, in bytes, `1048576..=33554432` (1–32 MiB). Every proof cap follows it: the call's, each bundle's, the bridge burn's, and the aggregate's |
 | `--max-block-bytes <N>` | none (4 194 304) | the largest block, and so the largest transaction, in bytes, `4194304..=67108864`, and at least `2 × max_proof_bytes + 1 MiB` (the fee bundle's proof and the call's, plus room). When either this or `--max-proof-bytes` is given, the rule is checked with the default standing in for the other, so a proof cap above 1.5 MiB needs this flag too. The node's sync budget, sync reader limit and gossip transmit size follow it, and `rand_sendTransaction` refuses a transaction over it (the RPC body limit follows the proof and envelope caps) |
 | `--max-call-envelope-bytes <N>` | none (18 432) | the largest call input envelope, in bytes, `18432..=1048576`. `rand call` derives its input-word cap from it: `(N − 1 252) / 4` |
+| `--incremental-nullifier-root` | off | spec 2026-10-05 §4: sets `incremental_nullifier_root: true`, so the state root's nullifier slot holds an append-only range root in insertion order (`rand-nullifier-mmr-1`) and the composite is `rand-state-nf-mmr-1`. Part of the genesis hash, tagged `incremental_nullifier_root` after `tokens_incremental_root`, only when set; omitted, every existing chain hashes as before. Never turn it on for a chain that holds nullifiers: the flag is a genesis cut (`docs/architecture.md` §5) |
 | `--max-program-public-words <N>` | none (0) | the largest public input a `Deploy` may fix (`rand program deploy --public`), in words, `0..=65535`. 0, the default, admits no public input |
 | `--out <OUT>` | `genesis.json` | output path |
 | `--faucet` | off | **testnet only**: enable `Mint` transactions (`rand_mint`, up to 100 RAND per call). Part of the genesis hash. Beside a `bridge` section (spliced in later) it needs `--testnet` |
@@ -337,6 +339,7 @@ one the cut announced; a mismatch on one node is almost always an old binary.
 | `--prover-cuda` | off | prove on the CUDA backend (a build with `--features cuda`); no CPU fallback. Without it or `--prover-cpu`, a CUDA build takes a visible GPU and logs that it did (`docs/node-hardware.md` §6) |
 | `--prover-cpu` | off | prove on the CPU even when a GPU is visible to a CUDA build |
 | `--prover-threads <N>` | the cores minus one, at most 8 | CPU threads the hosted prover's proofs use (`RAYON_NUM_THREADS` when set and no flag) |
+| `--verify-workers <N>` | the cores minus two, at least four | the proof-verification workers of admission and the consensus loop's lookups; the queue and in-flight limits follow it (spec 2026-10-05 §6, `docs/compute-optimization.md` §3.3) |
 | `--prover-skip-memory-check` | off | skip the free-memory gate |
 | `--prover-fee <RAND>` | none | the fee every job sent to the hosted prover must pay, in RAND (display units, up to 9 decimals): one RAND output to `--prover-fee-address` inside the bundle proved; needs `--prover-fee-address`, and only a v3 (split-authorisation) witness can carry it (`docs/prover.md` §3.5) |
 | `--prover-fee-address <ADDRESS>` | none | the `rand1…` address the hosted prover's fee is paid to; needs `--prover-fee` |
@@ -354,6 +357,20 @@ Block spacing matters more on a shielded chain than it did on an account chain: 
 takes about 100 seconds, and its anchor is only valid for 256 blocks. At the default 1000 ms that
 is a little over four minutes of headroom; a chain paced much faster than that will reject honest
 transfers whose anchor expired mid-proof.
+
+### `rand-node bench apply`
+
+The validator hot path at synthetic load: one validator on the `StubExecutor`, `--bundles` bundles
+a block (default 2 000, the block cap; four nullifier and four commitment slots each) for
+`--blocks` blocks (default 10 000) through the real HotStuff propose, apply and commit path. It
+prints one row of timings and memory every `--report-every` blocks (default 500), and exits
+non-zero when the last block's replica apply time is over `--fail-over-ms` (default 300).
+`--incremental-nullifier-root` cuts the harness genesis with the flag. The measured tables are in
+`docs/node-hardware.md` §7.
+
+```
+rand-node bench apply --blocks 10000 --report-every 500 --incremental-nullifier-root
+```
 
 ### `rand-node verify`
 

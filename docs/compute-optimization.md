@@ -138,6 +138,8 @@ genesis-gated cut like `rand-state-5` did.
 
 ### 3.1 Incremental nullifier accumulator (state root; genesis-gated)
 
+**Shipped** in `feat/hot-path` as the genesis flag `incremental_nullifier_root` (on no chain yet; the domain is `rand-state-nf-mmr-1`, not `rand-state-6`). Measured: `root_ms` 74 ms at 400 000 nullifiers and 442 ms at 2 400 000 (`/tmp/bench-sharedset-300.txt`) to 0.00 ms at every height up to 80 M nullifiers (`/tmp/bench-final-10000.txt`).
+
 Today `nullifier_root` is a BLAKE3 Merkle root over the sorted nullifier set, recomputed every
 block: `O(n)`, and `docs/architecture.md` §5 already flags 10⁶ entries as the limit. At 1 000 tx/s
 the set grows by 4 000 a second and passes 10⁶ in four minutes.
@@ -145,11 +147,13 @@ the set grows by 4 000 a second and passes 10⁶ in four minutes.
 Replace it with an **append-only Merkle Mountain Range in insertion order**: `O(log n)` per
 insert, a root that commits to every nullifier ever published, and no sort. Membership (the
 double-spend check) stays in the `BTreeSet` and RocksDB as now; the accumulator is only the
-state-root commitment. The domain becomes `rand-state-6` with the MMR root in the nullifier
-root's slot. The same construction serves `validators_root` and `programs_root` if they ever
+state-root commitment. The composite is re-domained `rand-state-nf-mmr-1` (as shipped) with the MMR root in the
+nullifier root's slot. The same construction serves `validators_root` and `programs_root` if they ever
 grow, but they do not at this scale.
 
 ### 3.2 Copy-on-write speculative state
+
+**Shipped** in `feat/hot-path` as `SharedSet` (a committed base shared by every clone plus an owned delta, drained at the HotStuff commit step), with the proposer no longer cloning the ledger per candidate. Measured: `clone_ms` 1.21 ms at 160 000 nullifiers and 6.37 ms at 800 000 (`/tmp/bench-baseline-100.txt`) to a flat 0.25 to 0.29 ms through 80 M (`/tmp/bench-final-10000.txt`); `propose_ms` 4 276 ms at height 20 and 27 077 ms at height 100 to 132.7 ms at height 500 and 162.4 ms at height 10 000.
 
 Every entry in the 512-block speculative tree clones the whole ledger. Replace the clone with an
 **overlay per block**: a delta of the commitments, nullifiers, register rows and program rows
@@ -157,6 +161,8 @@ the block touched, resolved against the committed base on read. Memory per specu
 becomes `O(block)`, and committing is applying a chain of deltas. No consensus change.
 
 ### 3.3 Verification off the loop, cached by digest
+
+**Partly shipped**: the worker count (`rand-node run --verify-workers`, default the cores minus two, at least four, with the queue and in-flight limits sized from it). The digest-keyed cache for every proof kind is still open.
 
 The admission workers already verify proofs on `spawn_blocking` threads and the proposal path
 re-checks against a verified set. Generalise it: every proof the node will ever verify — bundle,
@@ -178,6 +184,8 @@ it. Wire change, no consensus change: the block hash still covers the full body.
 
 ### 3.5 Batched certificate verification
 
+**Shipped** in `feat/hot-path`: scoped-thread verification of a certificate's signatures above eight votes, once per (certificate, validator set).
+
 A QC at 100 validators is 100 Dilithium2 signatures, 242 KB, and ~15 ms to verify one at a time.
 Verify them on the worker pool in parallel, and verify each validator's signature once per view
 even when the same vote arrives on several paths. Dilithium2 has no aggregate signature, so the
@@ -188,8 +196,11 @@ validators (3.6 GB a day was measured at 18), pruned with history on validators
 ### 3.6 Acceptance
 
 A one-validator local chain with the `StubExecutor`, 4 096 synthetic records a block for
-10 000 blocks: block apply ≤ 300 ms at the 10 000th block, resident memory flat, nullifier set at
-40 M entries. Measured and recorded in `docs/node-hardware.md` before phase 3 is cut.
+10 000 blocks: block apply ≤ 300 ms at the 10 000th block, resident memory linear in the entries
+only (a constant bytes-per-nullifier, no term in height or in the speculative tree), nullifier set
+at 40 M entries or more. Measured and recorded in `docs/node-hardware.md` before phase 3 is cut.
+
+**Measured 2026-10-05** (`/tmp/bench-final-10000.txt`, `docs/node-hardware.md` §7): 56.1 ms replica apply at block 10 000, 8 954 MB resident, 80 M nullifiers (2 000 bundles a block at four nullifier slots each, so twice the 40 M counted here), with `incremental_nullifier_root` on. Resident memory grows at a constant 117 to 121 bytes per nullifier (both sets together), with no term in height.
 
 ## 4. Phase 2 — making recursion buyable
 

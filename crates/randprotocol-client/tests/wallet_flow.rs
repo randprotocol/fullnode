@@ -112,6 +112,7 @@ fn genesis_full(
         binding_domain: Some(1),
         proof_window_blocks: None,
         program_state: None,
+        incremental_nullifier_root: None,
         hardening_v6: None,
         hc_auth: None,
         fees: None,
@@ -162,6 +163,7 @@ async fn start_with(dir: &tempfile::TempDir, key: &Keypair, genesis: Genesis) ->
         verify: randprotocol_node::storage::VerifyMode::Full,
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
+        verify_workers: None,
         prune_history: None,
         // Final review I2: the node runs the default gas policy (what `rand-node run` carries
         // unless told `--gas-price 0 --byte-price 0`), so every real call proof in these flows is

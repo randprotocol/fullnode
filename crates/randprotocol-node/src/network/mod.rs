@@ -1626,4 +1626,301 @@ mod tests {
         a.shutdown().await;
         b.shutdown().await;
     }
+
+    // ------------------------------------------- the pure helpers, edge by edge
+
+    /// The derivations at the bottom of the range and across it: a zero block cap still gets the
+    /// 2 MiB of QC-and-receipt headroom, the 16 MiB gossip floor and the 30 s timeout floor; and
+    /// every figure is monotone in the cap, so a chain with bigger blocks never gets a smaller
+    /// budget, limit, frame or deadline than one with smaller blocks.
+    #[test]
+    fn the_wire_limits_are_monotone_in_the_block_cap_and_floored_at_zero() {
+        let zero = WireLimits::for_block_bytes(0);
+        assert_eq!(zero.sync_max_wire_bytes, 2 << 20);
+        assert_eq!(zero.sync_response_wire_limit, (4 << 20) + (256 << 10));
+        assert_eq!(zero.gossip_max_transmit_size, 16 << 20);
+        assert_eq!(zero.sync_request_timeout, SYNC_REQUEST_TIMEOUT);
+
+        let caps = [0usize, 1, 1 << 20, 4 << 20, 8 << 20, 15 << 20, 16 << 20, 20 << 20, 64 << 20, 256 << 20];
+        let mut prev = zero;
+        for cap in caps {
+            let l = WireLimits::for_block_bytes(cap);
+            assert_eq!(l.sync_max_wire_bytes, cap as u64 + (2 << 20), "budget at {cap}");
+            assert_eq!(l.sync_response_wire_limit, 2 * l.sync_max_wire_bytes + (256 << 10), "limit at {cap}");
+            assert!(l.gossip_max_transmit_size >= cap + (1 << 20), "a full block plus 1 MiB fits a frame at {cap}");
+            assert!(l.gossip_max_transmit_size >= 16 << 20, "the gossip floor at {cap}");
+            assert!(l.sync_max_wire_bytes >= prev.sync_max_wire_bytes);
+            assert!(l.sync_response_wire_limit >= prev.sync_response_wire_limit);
+            assert!(l.gossip_max_transmit_size >= prev.gossip_max_transmit_size);
+            assert!(l.sync_request_timeout >= prev.sync_request_timeout);
+            // The codec invariant: the server's budget is at most half the client's limit.
+            assert!(2 * l.sync_max_wire_bytes <= l.sync_response_wire_limit, "budget over half the limit at {cap}");
+            // The connection caps are not a function of the block cap.
+            assert_eq!(
+                (l.max_established_incoming, l.max_established_per_peer, l.max_pending_incoming, l.max_pending_incoming_per_addr, l.max_established_per_reserved_peer),
+                (MAX_ESTABLISHED_INCOMING, MAX_ESTABLISHED_PER_PEER, MAX_PENDING_INCOMING, MAX_PENDING_INCOMING_PER_ADDR, MAX_ESTABLISHED_PER_RESERVED_PEER)
+            );
+            prev = l;
+        }
+        assert_eq!((MAX_ESTABLISHED_INCOMING, MAX_ESTABLISHED_PER_PEER, MAX_PENDING_INCOMING), (256, 2, 64));
+        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(5));
+    }
+
+    /// The timeout formula at its seams: one second per MiB of reader limit, rounded up, never
+    /// under the 30 s floor — so the floor holds to exactly 30 MiB, a byte over a whole MiB
+    /// rounds to the next second, and the arithmetic does not overflow at `u64::MAX`.
+    #[test]
+    fn the_sync_request_timeout_is_the_floor_or_a_second_per_mib_rounded_up() {
+        let s = Duration::from_secs;
+        assert_eq!(request_timeout_for(0), s(30));
+        assert_eq!(request_timeout_for(1), s(30));
+        assert_eq!(request_timeout_for(1 << 20), s(30));
+        assert_eq!(request_timeout_for(30 << 20), s(30), "exactly 30 MiB keeps the floor");
+        assert_eq!(request_timeout_for((30 << 20) + 1), s(31), "one byte over rounds up");
+        assert_eq!(request_timeout_for(31 << 20), s(31));
+        assert_eq!(request_timeout_for((31 << 20) + 1), s(32));
+        assert_eq!(request_timeout_for(u64::MAX), s(u64::MAX.div_ceil(1 << 20)), "no overflow at the top");
+        // The whole chain: a 64 MiB block cap → 66 MiB budget → 132.25 MiB limit → 133 s.
+        let l = WireLimits::for_block_bytes(64 << 20);
+        assert_eq!(l.sync_response_wire_limit, (132 << 20) + (256 << 10));
+        assert_eq!(l.sync_request_timeout, s(133));
+        assert_eq!(request_timeout_for(l.sync_response_wire_limit), l.sync_request_timeout);
+    }
+
+    /// Every gossip topic carries the chain id, so two chains never share one — a node on chain
+    /// 7 is deaf to chain 8's consensus even over a shared connection — and the four topics of
+    /// one chain are distinct from each other.
+    #[test]
+    fn gossip_topics_are_bound_to_the_chain_id_and_distinct_within_it() {
+        let t7 = Topics::new(7);
+        let t8 = Topics::new(8);
+        assert_eq!(t7.consensus.to_string(), "rand/7/consensus");
+        assert_eq!(t7.tx.to_string(), "rand/7/tx");
+        assert_eq!(t7.status.to_string(), "rand/7/status");
+        assert_eq!(t7.peers.to_string(), "rand/7/peers");
+        let names7: HashSet<String> = [&t7.consensus, &t7.tx, &t7.status, &t7.peers].iter().map(|t| t.to_string()).collect();
+        let names8: HashSet<String> = [&t8.consensus, &t8.tx, &t8.status, &t8.peers].iter().map(|t| t.to_string()).collect();
+        assert_eq!(names7.len(), 4, "four distinct topics on one chain");
+        assert!(names7.is_disjoint(&names8), "no topic is shared between chains");
+        // The hashes gossipsub subscribes by are the names' hashes, so they differ the same way.
+        let hashes: HashSet<_> = [&t7.consensus, &t7.tx, &t7.status, &t7.peers, &t8.consensus, &t8.tx, &t8.status, &t8.peers].iter().map(|t| t.hash()).collect();
+        assert_eq!(hashes.len(), 8);
+        // A chain id at the top of the range is spelled in full, not truncated.
+        assert_eq!(Topics::new(u64::MAX).tx.to_string(), format!("rand/{}/tx", u64::MAX));
+    }
+
+    /// Each `GossipMessage` variant is published on its own topic — the peer binding on
+    /// `peers`, which a build predating it is not subscribed to (audit v6, NET-1).
+    #[test]
+    fn each_gossip_variant_goes_out_on_its_own_topic() {
+        let t = Topics::new(7);
+        let key = randprotocol_core::Keypair::from_seed([5; 32]).unwrap();
+        let vote = randprotocol_core::Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), 1, Hash::ZERO, &key);
+        let cases = [
+            (GossipMessage::Consensus(randprotocol_core::consensus::ConsensusMessage::Vote(vote)), "rand/7/consensus"),
+            (GossipMessage::Transaction(randprotocol_core::Transaction { chain_id: 7, bundle: None, action: randprotocol_core::Action::None }), "rand/7/tx"),
+            (GossipMessage::Status(Status { height: 1, head_hash: Hash::ZERO, view: 1, floor: 0 }), "rand/7/status"),
+            (GossipMessage::PeerBinding(PeerBinding::sign(&key, &Hash::ZERO, &PeerId::random(), 1)), "rand/7/peers"),
+        ];
+        for (msg, topic) in cases {
+            assert_eq!(t.for_message(&msg).to_string(), topic);
+        }
+    }
+
+    /// `peer_id_of` reads the `/p2p/` component wherever it sits and nothing else: this is how
+    /// the bootstrap list's identities become the pinned (never-unreserved) set, so an address
+    /// without one contributes no reservation and two addresses of one peer contribute one.
+    #[test]
+    fn peer_id_of_reads_the_p2p_component_and_the_pinned_set_dedups_it() {
+        let id = PeerId::random();
+        let other = PeerId::random();
+        assert_eq!(peer_id_of(&addr(&format!("/ip4/203.0.113.7/tcp/30303/p2p/{id}"))), Some(id));
+        assert_eq!(peer_id_of(&addr(&format!("/dns4/node.example/tcp/30303/p2p/{id}"))), Some(id));
+        assert_eq!(peer_id_of(&addr(&format!("/p2p/{id}"))), Some(id), "an id alone");
+        assert_eq!(peer_id_of(&addr(&format!("/ip4/203.0.113.7/tcp/1/p2p/{id}/p2p-circuit/p2p/{other}"))), Some(id), "the first one, on a relayed address");
+        assert_eq!(peer_id_of(&addr("/ip4/203.0.113.7/tcp/30303")), None);
+        assert_eq!(peer_id_of(&addr("/dns4/node.example/tcp/30303")), None);
+
+        // The derivation `start_with` makes of the bootstrap list.
+        let bootstrap = [
+            addr(&format!("/ip4/203.0.113.7/tcp/30303/p2p/{id}")),
+            addr(&format!("/ip4/203.0.113.8/tcp/30303/p2p/{id}")),
+            addr("/ip4/203.0.113.9/tcp/30303"),
+            addr(&format!("/ip4/203.0.113.10/tcp/30303/p2p/{other}")),
+        ];
+        let pinned: HashSet<PeerId> = bootstrap.iter().filter_map(peer_id_of).collect();
+        assert_eq!(pinned, HashSet::from([id, other]));
+    }
+
+    /// The dial table keeps plain transport addresses: a trailing `/p2p/<id>` is dropped (the id
+    /// is the key), a repeat is not stored twice, and only the newest eight are kept, oldest out
+    /// first.
+    #[test]
+    fn remember_addr_strips_the_id_dedups_and_keeps_the_newest_eight() {
+        let id = PeerId::random();
+        let mut known: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+        remember_addr(&mut known, id, addr(&format!("/ip4/203.0.113.7/tcp/30303/p2p/{id}")));
+        assert_eq!(known[&id], vec![addr("/ip4/203.0.113.7/tcp/30303")], "the id suffix is dropped");
+        remember_addr(&mut known, id, addr("/ip4/203.0.113.7/tcp/30303"));
+        assert_eq!(known[&id].len(), 1, "the same address, with and without the id, is one entry");
+        // An id in the middle (a relayed address) is not a trailing one and stays.
+        let relayed = addr(&format!("/ip4/203.0.113.7/tcp/1/p2p/{id}/p2p-circuit"));
+        remember_addr(&mut known, id, relayed.clone());
+        assert_eq!(known[&id][1], relayed);
+
+        for port in 1..=10u16 {
+            remember_addr(&mut known, id, addr(&format!("/ip4/198.51.100.1/tcp/{port}")));
+        }
+        let list = &known[&id];
+        assert_eq!(list.len(), 8, "bounded at eight");
+        assert_eq!(list[0], addr("/ip4/198.51.100.1/tcp/3"), "the oldest went first");
+        assert_eq!(list[7], addr("/ip4/198.51.100.1/tcp/10"), "the newest is last");
+        assert!(!list.contains(&addr("/ip4/203.0.113.7/tcp/30303")), "the first address was evicted");
+        // Another peer's table is its own.
+        let other = PeerId::random();
+        remember_addr(&mut known, other, addr("/ip4/203.0.113.7/tcp/30303"));
+        assert_eq!(known[&other].len(), 1);
+        assert_eq!(known[&id].len(), 8);
+    }
+
+    /// The node's own verdict type maps one-to-one onto gossipsub's at the handle boundary:
+    /// Accept forwards, Reject penalises the forwarder, Ignore does neither.
+    #[test]
+    fn the_admission_verdict_maps_one_to_one_onto_libp2ps() {
+        use crate::admission::Acceptance;
+        assert!(matches!(MessageAcceptance::from(Acceptance::Accept), MessageAcceptance::Accept));
+        assert!(matches!(MessageAcceptance::from(Acceptance::Reject), MessageAcceptance::Reject));
+        assert!(matches!(MessageAcceptance::from(Acceptance::Ignore), MessageAcceptance::Ignore));
+    }
+
+    /// The scope classifier's corners: the unspecified addresses are private (a `0.0.0.0` listen
+    /// address advertised as-is names nothing reachable), an address with no IP at all is global
+    /// (a name is resolved, not classified), and the first IP component decides.
+    #[test]
+    fn addr_scope_classifies_the_unspecified_and_the_ip_less_addresses() {
+        assert_eq!(addr_scope(&addr("/ip4/0.0.0.0/tcp/30303")), AddrScope::Private);
+        assert_eq!(addr_scope(&addr("/ip6/::/tcp/30303")), AddrScope::Private);
+        assert!(!is_dialable_advertised_addr(&addr("/ip4/0.0.0.0/tcp/30303"), false));
+        assert!(is_dialable_advertised_addr(&addr("/ip4/0.0.0.0/tcp/30303"), true), "a LAN peer's unspecified address is treated as its private one");
+        let id = PeerId::random();
+        assert_eq!(addr_scope(&addr(&format!("/p2p/{id}"))), AddrScope::Global, "no IP component at all");
+        assert_eq!(addr_scope(&addr("/dns6/node.example/tcp/1")), AddrScope::Global);
+        assert_eq!(addr_scope(&addr("/memory/7")), AddrScope::Global);
+        // The IP component decides even behind a trailing peer id.
+        assert_eq!(addr_scope(&addr(&format!("/ip4/127.0.0.1/tcp/1/p2p/{id}"))), AddrScope::Loopback);
+        assert_eq!(addr_scope(&addr(&format!("/ip4/10.0.0.1/tcp/1/p2p/{id}"))), AddrScope::Private);
+        // An IPv4-mapped IPv6 loopback is spelled as IPv6 and classified by its v6 bits: not
+        // `::1`, so not loopback — pinned as the current behaviour, which the dial filter does
+        // not depend on (nothing advertises a mapped address).
+        assert_eq!(addr_scope(&addr("/ip6/::ffff:127.0.0.1/tcp/1")), AddrScope::Global);
+    }
+
+    /// GOSSIP-1's meter is all-or-nothing: one frame larger than the whole burst is refused and
+    /// charged nothing, so the next ordinary frame still passes; and the burst saturates rather
+    /// than overflowing when a chain's frame is absurdly large.
+    #[test]
+    fn a_frame_over_the_whole_burst_is_refused_and_costs_nothing() {
+        let frame = WireLimits::default().gossip_max_transmit_size;
+        let mut m = FrameMeter::new(frame);
+        let p = PeerId::random();
+        let t = Instant::now();
+        let burst = frame * GOSSIP_FRAME_BURST as usize;
+        assert!(!m.admit(p, burst + 1, t), "larger than the whole burst");
+        assert!(m.admit(p, burst, t), "exactly the burst, and the refusal charged nothing");
+        assert!(!m.admit(p, 1, t), "now spent to the byte");
+        assert_eq!(m.len(), 1);
+        assert!(!m.is_empty());
+
+        // A frame of 2^40 bytes: the burst saturates at u32::MAX instead of overflowing.
+        let mut huge = FrameMeter::new(1 << 40);
+        assert!(huge.admit(p, u32::MAX as usize, t));
+        assert!(!huge.admit(p, 1, t));
+        let mut none = FrameMeter::new(0);
+        assert!(!none.admit(p, 1, t), "a zero frame admits nothing");
+        assert!(none.admit(p, 0, t), "but an empty frame costs nothing");
+    }
+
+    /// `EdgeConfig::default()` is what `start` passes: no reserved or bound peers, permissive
+    /// gossip. The `--strict-gossip` and `--reserved-peer` paths are opt-in.
+    #[test]
+    fn the_default_edge_config_reserves_nobody_and_is_permissive() {
+        let e = EdgeConfig::default();
+        assert!(e.reserved.is_empty());
+        assert!(e.bound.is_empty());
+        assert!(!e.strict_gossip);
+    }
+
+    /// The handle's commands, each one: every method sends the variant the swarm task matches
+    /// on, carrying what it was given, and every method survives the swarm task being gone — a
+    /// query returns empty or `None`, a send is dropped — rather than panicking or hanging.
+    #[tokio::test]
+    async fn the_handle_sends_each_command_and_survives_a_dead_swarm() {
+        let me = PeerId::random();
+        let (h, mut rx) = NetworkHandle::detached_for_test(me);
+        assert_eq!(h.local_peer_id, me);
+        let peer = PeerId::random();
+        let status = Status { height: 3, head_hash: Hash::digest(b"h"), view: 4, floor: 1 };
+
+        h.broadcast(GossipMessage::Status(status.clone())).await;
+        assert!(matches!(rx.recv().await, Some(NetworkCommand::Broadcast(GossipMessage::Status(s))) if s.height == 3 && s.floor == 1));
+
+        h.dial(addr("/ip4/203.0.113.7/tcp/30303")).await;
+        assert!(matches!(rx.recv().await, Some(NetworkCommand::Dial(a)) if a == addr("/ip4/203.0.113.7/tcp/30303")));
+
+        h.reserve_peer(peer).await;
+        assert!(matches!(rx.recv().await, Some(NetworkCommand::Reserve(p)) if p == peer));
+        h.unreserve_peer(peer).await;
+        assert!(matches!(rx.recv().await, Some(NetworkCommand::Unreserve(p)) if p == peer));
+
+        let id = GossipId { message_id: MessageId::from(vec![1, 2, 3]), propagation_source: peer };
+        h.report_validation(id.clone(), MessageAcceptance::Reject).await;
+        match rx.recv().await {
+            Some(NetworkCommand::ReportValidation { id: got, acceptance: MessageAcceptance::Reject }) => {
+                assert_eq!(got.message_id, id.message_id);
+                assert_eq!(got.propagation_source, peer);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // `peers` waits for the swarm's answer and returns it.
+        let answer = tokio::spawn({
+            let h = h.clone();
+            async move { h.peers().await }
+        });
+        match rx.recv().await {
+            Some(NetworkCommand::Peers(reply)) => {
+                reply.send(vec![PeerInfo { peer_id: peer.to_string(), addrs: vec![], connected_secs: 9 }]).unwrap();
+            }
+            other => panic!("{other:?}"),
+        }
+        let list = answer.await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].peer_id.as_str(), list[0].connected_secs), (peer.to_string().as_str(), 9));
+
+        // A sync request whose reply the swarm drops is `None`, not a hang.
+        let asked = tokio::spawn({
+            let h = h.clone();
+            async move { h.send_sync_request(peer, SyncRequest::Blocks { from_height: 1, max: 2 }).await }
+        });
+        match rx.recv().await {
+            Some(NetworkCommand::SendSyncRequest { peer: p, request: SyncRequest::Blocks { from_height: 1, max: 2 }, reply }) => {
+                assert_eq!(p, peer);
+                drop(reply);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(asked.await.unwrap().is_none());
+
+        h.shutdown().await;
+        assert!(matches!(rx.recv().await, Some(NetworkCommand::Shutdown)));
+
+        // The swarm task is gone: nothing panics, queries come back empty.
+        drop(rx);
+        h.broadcast(GossipMessage::Status(status)).await;
+        h.reserve_peer(peer).await;
+        h.report_validation(id, MessageAcceptance::Accept).await;
+        assert!(h.peers().await.is_empty());
+        assert!(h.send_sync_request(peer, SyncRequest::BlockByHash(Hash::ZERO)).await.is_none());
+        h.shutdown().await;
+    }
 }

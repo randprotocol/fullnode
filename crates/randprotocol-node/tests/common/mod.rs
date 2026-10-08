@@ -96,6 +96,7 @@ fn genesis(key: &Keypair) -> Genesis {
         proof_window_blocks: None,
         program_state: None,
         fees: None,
+        incremental_nullifier_root: None,
     }
 }
 
@@ -148,6 +149,7 @@ pub async fn start_one_validator_shaped(edit: impl FnOnce(&mut Genesis)) -> Test
         verify: randprotocol_node::storage::VerifyMode::Full,
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
+        verify_workers: None,
         prune_history: None,
         gas_policy: None,
     })

@@ -130,6 +130,7 @@ pub async fn start_in_pruned(
         verify: randprotocol_node::storage::VerifyMode::Full,
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
+        verify_workers: None,
         prune_history,
         gas_policy: None,
     })

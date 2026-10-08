@@ -275,4 +275,197 @@ mod tests {
             other => panic!("wrong request: {other:?}"),
         }
     }
+
+    // ------------------------------------------- the limits, to the byte
+
+    use crate::network::WireLimits;
+
+    async fn read_response_from(bytes: Vec<u8>, limit: u64) -> io::Result<SyncResponse> {
+        let mut reader: Codec<SyncRequest, SyncResponse> = Codec::new(SYNC_REQUEST_WIRE_LIMIT, limit);
+        reader.read_response(&proto(), &mut futures::io::Cursor::new(bytes)).await
+    }
+
+    async fn read_request_from(bytes: Vec<u8>, limit: u64) -> io::Result<SyncRequest> {
+        let mut reader: Codec<SyncRequest, SyncResponse> = Codec::new(limit, SYNC_RESPONSE_WIRE_LIMIT);
+        reader.read_request(&proto(), &mut futures::io::Cursor::new(bytes)).await
+    }
+
+    fn cbor<T: serde::Serialize>(v: &T) -> Vec<u8> {
+        cbor4ii::serde::to_vec(Vec::new(), v).unwrap()
+    }
+
+    /// The limit is inclusive on both sides of the wire: a response of exactly the limit is
+    /// written and read; one byte over is refused by the writer (nothing written) and, if a
+    /// writer with a looser budget sends it anyway, by the reader — by name.
+    #[tokio::test]
+    async fn a_response_exactly_at_the_limit_passes_and_one_byte_over_is_refused() {
+        let batch = chain_8_batch(3);
+        let size = cbor_size(&batch).unwrap() as u64;
+        assert!(size > 1000, "a real batch, {size} B");
+
+        let (wrote, read) = round_trip(batch.clone(), size, size).await;
+        wrote.expect("written at exactly the limit");
+        assert!(matches!(read.expect("read at exactly the limit"), SyncResponse::Blocks(v) if v.len() == 3));
+
+        let mut writer: Codec<SyncRequest, SyncResponse> = Codec::new(SYNC_REQUEST_WIRE_LIMIT, size - 1);
+        let mut buf: Vec<u8> = Vec::new();
+        let err = writer.write_response(&proto(), &mut buf, batch.clone()).await.expect_err("one byte over the writer's limit");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains(&(size - 1).to_string()), "{err}");
+        assert!(buf.is_empty(), "nothing goes out");
+
+        let err = read_response_from(cbor(&batch), size - 1).await.expect_err("one byte over the reader's limit");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds") && err.to_string().contains(&(size - 1).to_string()), "{err}");
+    }
+
+    /// The same, for a request: at the limit it passes, one byte over it is refused by the
+    /// writer with nothing written and by the reader by name.
+    #[tokio::test]
+    async fn a_request_exactly_at_the_limit_passes_and_one_byte_over_is_refused() {
+        let req = SyncRequest::Blocks { from_height: u64::MAX, max: u32::MAX };
+        let size = cbor_size(&req).unwrap() as u64;
+        assert!(size < SYNC_REQUEST_WIRE_LIMIT, "a request is tiny: {size} B");
+
+        let mut at: Codec<SyncRequest, SyncResponse> = Codec::new(size, SYNC_RESPONSE_WIRE_LIMIT);
+        let mut buf: Vec<u8> = Vec::new();
+        at.write_request(&proto(), &mut buf, req.clone()).await.expect("written at the limit");
+        assert_eq!(buf.len() as u64, size);
+        assert!(matches!(read_request_from(buf.clone(), size).await.expect("read at the limit"), SyncRequest::Blocks { max: u32::MAX, .. }));
+
+        let mut over: Codec<SyncRequest, SyncResponse> = Codec::new(size - 1, SYNC_RESPONSE_WIRE_LIMIT);
+        let mut none: Vec<u8> = Vec::new();
+        let err = over.write_request(&proto(), &mut none, req).await.expect_err("one byte over");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("request"), "{err}");
+        assert!(none.is_empty());
+
+        let err = read_request_from(buf, size - 1).await.expect_err("one byte over the reader's limit");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("request") && err.to_string().contains("exceeds"), "{err}");
+    }
+
+    /// The request and response limits are independent: a codec whose request limit is one byte
+    /// still reads a response of a megabyte, and the other way round.
+    #[tokio::test]
+    async fn the_request_and_response_limits_are_independent() {
+        let batch = chain_8_batch(2);
+        let bytes = cbor(&batch);
+        let mut tiny_request_limit: Codec<SyncRequest, SyncResponse> = Codec::new(1, SYNC_RESPONSE_WIRE_LIMIT);
+        let got = tiny_request_limit.read_response(&proto(), &mut futures::io::Cursor::new(bytes)).await.expect("the response limit governs responses");
+        assert!(matches!(got, SyncResponse::Blocks(v) if v.len() == 2));
+
+        let req = cbor(&SyncRequest::BlockByHash(Hash::ZERO));
+        let mut tiny_response_limit: Codec<SyncRequest, SyncResponse> = Codec::new(SYNC_REQUEST_WIRE_LIMIT, 1);
+        let got = tiny_response_limit.read_request(&proto(), &mut futures::io::Cursor::new(req)).await.expect("the request limit governs requests");
+        assert!(matches!(got, SyncRequest::BlockByHash(h) if h == Hash::ZERO));
+    }
+
+    /// There is no length prefix on this wire, so there is nothing a peer can declare that the
+    /// reader would allocate for: a reader with a `u64::MAX` limit still reads a 20-byte message
+    /// into a 20-byte buffer (`take(limit + 1)` saturates rather than overflowing, too).
+    #[tokio::test]
+    async fn the_reader_never_allocates_for_the_limit_up_front() {
+        let bytes = cbor(&SyncResponse::Busy);
+        assert!(bytes.len() < 20);
+        let got = read_response_from(bytes.clone(), u64::MAX).await.expect("a tiny message under a huge limit");
+        assert!(matches!(got, SyncResponse::Busy));
+        let got = read_response_from(bytes, u64::MAX - 1).await.expect("one under the saturation point");
+        assert!(matches!(got, SyncResponse::Busy));
+        // And the same for a request, read with the request limit.
+        let req = cbor(&SyncRequest::Blocks { from_height: 0, max: 1 });
+        assert!(read_request_from(req, u64::MAX).await.is_ok());
+    }
+
+    /// Bytes inside the limit that are not CBOR of the expected type are an `InvalidData` error
+    /// that does *not* claim the limit was exceeded — the two failures are told apart by their
+    /// message, which is what the log reader has.
+    #[tokio::test]
+    async fn garbage_within_the_limit_is_a_decode_error_not_a_limit_error() {
+        for junk in [vec![], vec![0xffu8; 7], vec![0u8; 100], b"not cbor at all".to_vec()] {
+            let err = read_response_from(junk.clone(), SYNC_RESPONSE_WIRE_LIMIT).await.expect_err("garbage decoded as a response");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{junk:?}");
+            assert!(!err.to_string().contains("exceeds"), "{err}");
+            let err = read_request_from(junk, SYNC_REQUEST_WIRE_LIMIT).await.expect_err("garbage decoded as a request");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(!err.to_string().contains("exceeds"), "{err}");
+        }
+        // A valid *request* handed to the response reader is a decode error, not a limit one.
+        let err = read_response_from(cbor(&SyncRequest::BlockByHash(Hash::ZERO)), SYNC_RESPONSE_WIRE_LIMIT).await.expect_err("a request is not a response");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A message cut mid-way — what a connection dropped during a write produces — is a decode
+    /// error naming neither limit: the reader cannot tell truncation from corruption, which is
+    /// exactly why the *writer* is the side that checks the limit.
+    #[tokio::test]
+    async fn a_truncated_response_is_a_decode_error() {
+        let full = cbor(&chain_8_batch(2));
+        for cut in [1usize, full.len() / 3, full.len() / 2, full.len() - 1] {
+            let err = read_response_from(full[..cut].to_vec(), SYNC_RESPONSE_WIRE_LIMIT).await.expect_err("a truncated batch decoded");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "cut at {cut}");
+            assert!(!err.to_string().contains("exceeds"), "cut at {cut}: {err}");
+        }
+    }
+
+    /// Call limits spec §8: a chain cut with bigger blocks gets a reader limit of
+    /// `2 × (max_block_bytes + 2 MiB) + 256 KiB`. A chain-8 batch of 100 empty blocks — 13.57
+    /// MiB, over the default chain's 12.25 MiB limit — is refused by a default-chain writer and
+    /// reader, and accepted by both sides of a 20 MiB-block chain (44.25 MiB).
+    #[tokio::test]
+    async fn a_chains_reader_limit_follows_its_block_cap() {
+        let batch = chain_8_batch(100);
+        let size = cbor_size(&batch).unwrap() as u64;
+        let default = WireLimits::default();
+        let bigger = WireLimits::for_block_bytes(20 << 20);
+        assert!(size > default.sync_response_wire_limit && size < bigger.sync_response_wire_limit, "{size} B");
+        assert_eq!(bigger.sync_max_wire_bytes, (20 << 20) + (2 << 20));
+        assert_eq!(bigger.sync_response_wire_limit, 2 * bigger.sync_max_wire_bytes + (256 << 10));
+
+        let (wrote, _) = round_trip(batch.clone(), default.sync_response_wire_limit, bigger.sync_response_wire_limit).await;
+        assert_eq!(wrote.expect_err("a default-chain writer refuses it").kind(), io::ErrorKind::InvalidData);
+        let (wrote, read) = round_trip(batch.clone(), bigger.sync_response_wire_limit, default.sync_response_wire_limit).await;
+        wrote.expect("a 20 MiB-chain writer sends it");
+        let err = read.expect_err("a default-chain reader refuses it by name");
+        assert!(err.to_string().contains(&default.sync_response_wire_limit.to_string()), "{err}");
+        let (wrote, read) = round_trip(batch, bigger.sync_response_wire_limit, bigger.sync_response_wire_limit).await;
+        wrote.expect("written on the bigger chain");
+        assert!(matches!(read.expect("read on the bigger chain"), SyncResponse::Blocks(v) if v.len() == 100));
+    }
+
+    /// Cloning a codec — `request_response` clones it per stream — keeps its limits.
+    #[tokio::test]
+    async fn a_cloned_codec_keeps_its_limits() {
+        let original: Codec<SyncRequest, SyncResponse> = Codec::new(3, 5);
+        let mut clone = original.clone();
+        assert_eq!((clone.request_size_maximum, clone.response_size_maximum), (3, 5));
+        let mut buf: Vec<u8> = Vec::new();
+        assert!(clone.write_request(&proto(), &mut buf, SyncRequest::BlockByHash(Hash::ZERO)).await.is_err(), "a 3-byte request limit");
+        assert!(buf.is_empty());
+        let busy = cbor(&SyncResponse::Busy);
+        assert!(busy.len() as u64 <= 5, "{} B", busy.len());
+        assert!(clone.read_response(&proto(), &mut futures::io::Cursor::new(busy)).await.is_ok());
+    }
+
+    /// The writer measures the bytes it is about to send, and the reader reads exactly those:
+    /// `cbor_size` is the wire's unit, to the byte, for every response variant.
+    #[tokio::test]
+    async fn cbor_size_is_exactly_what_the_writer_puts_on_the_wire() {
+        let ks: Vec<Keypair> = (1..=2u8).map(|i| Keypair::from_seed([i; 32]).unwrap()).collect();
+        let cases = vec![
+            SyncResponse::Busy,
+            SyncResponse::Block(None),
+            SyncResponse::Blocks(vec![]),
+            SyncResponse::Block(Some(chain_8_block(3, &ks, 2).block)),
+            SyncResponse::Blocks(vec![chain_8_block(1, &ks, 2), chain_8_block(2, &ks, 2)]),
+            SyncResponse::NotHeld(randprotocol_core::consensus::NotHeld::sign(&ks[0], &Hash::ZERO, &Hash::digest(b"x"), 1)),
+        ];
+        for r in cases {
+            let size = cbor_size(&r).unwrap();
+            let mut codec: Codec<SyncRequest, SyncResponse> = Codec::new(SYNC_REQUEST_WIRE_LIMIT, SYNC_RESPONSE_WIRE_LIMIT);
+            let mut buf: Vec<u8> = Vec::new();
+            codec.write_response(&proto(), &mut buf, r).await.unwrap();
+            assert_eq!(buf.len(), size);
+        }
+    }
 }
