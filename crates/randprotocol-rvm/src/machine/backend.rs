@@ -24,10 +24,10 @@ mod reference_cfg {
     pub type Dft = rand_zkvm_cuda::dft::Dft<rand_zkvm_cuda::ntt::cpu::CpuNttEngine>;
     pub type Pcs = HidingFriPcs<Val, Dft, Mmcs, ExtensionMmcs<Val, Challenge, Mmcs>, SaltRng>;
     pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
-    pub fn config(profile: FriProfile, mmcs_rng: SaltRng, pcs_rng: SaltRng) -> Config {
+    pub fn config(fri: super::RvmFri, mmcs_rng: SaltRng, pcs_rng: SaltRng) -> Config {
         let engine = std::sync::Arc::new(rand_zkvm_cuda::merkle::cpu::CpuHashEngine::new(PERM_SEED));
         let mmcs = Mmcs::new(engine, PERM_SEED, 2, mmcs_rng);
-        super::generic_config(profile, Dft::default(), mmcs, pcs_rng)
+        super::generic_config(fri, Dft::default(), mmcs, pcs_rng)
     }
 }
 
@@ -41,7 +41,7 @@ mod cuda_cfg {
     pub type Pcs = HidingFriPcs<Val, Dft, Mmcs, ExtensionMmcs<Val, Challenge, Mmcs>, SaltRng>;
     pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
     pub fn config(
-        profile: FriProfile,
+        fri: super::RvmFri,
         gpu: std::sync::Arc<rand_zkvm_cuda::gpu::GpuProver>,
         mmcs_rng: SaltRng,
         pcs_rng: SaltRng,
@@ -51,7 +51,7 @@ mod cuda_cfg {
         // The tuple-struct constructor, not the alias: `Dft` here is a `type`, and a type
         // alias cannot be called.
         let dft = rand_zkvm_cuda::dft::Dft(std::sync::Arc::new(rand_zkvm_cuda::gpu::ntt::CudaNttEngine { gpu }));
-        super::generic_config(profile, dft, mmcs, pcs_rng)
+        super::generic_config(fri, dft, mmcs, pcs_rng)
     }
 }
 

@@ -57,6 +57,10 @@ pub enum FriProfile {
     /// exactly this trade and kept q=80/g=20; this profile is consensus-facing (genesis-bound
     /// through the node's chain config, never proof-supplied), so it follows the paper.
     /// Reverted 2026-09-12 on the zk audit's finding ZM1.
+    /// The recursion machine's *own* proofs take `recursion::machine::RvmFri` instead — rate ¼, 92
+    /// queries, 24 grinding bits at Production: the same ~86 proven bits under the same theorem
+    /// (86.38 against 86.41; `recursion/docs/07-rvm-rate-quarter.md`); this profile still sizes
+    /// every inner proof.
     Production,
 }
 

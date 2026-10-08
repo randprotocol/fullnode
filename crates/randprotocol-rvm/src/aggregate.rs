@@ -53,6 +53,11 @@ pub enum AggregateError {
     /// `proofs[index]`'s declared shape is not the key's — checked for the whole set, cheapest
     /// first, before any tape work.
     WrongShape { index: usize },
+    /// `n` proofs put the reduce chip past `REDUCE_MAX_LOG_HEIGHT`: the largest aggregate this
+    /// program can be verified at is `max` proofs (`machine::max_reduce_n`; production 5 at the
+    /// current constant, docs/06 §3). Checked before any tape work — the final fix wave's
+    /// prove-side ceiling (`Machine::prove` refuses the same run as `ProveError::ReduceRows`).
+    TooManyProofs { n: usize, max: u64 },
     /// The N-proof tape could not be built (a proof the transcript replay refuses).
     Tape(TapeError),
     /// The aggregate program's run or proof failed.
@@ -97,9 +102,13 @@ pub fn aggregate(
             return Err(AggregateError::WrongShape { index });
         }
     }
+    let program = aggregate_program(vk);
+    let max = crate::machine::max_reduce_n(&program);
+    if proofs.len() as u64 > max {
+        return Err(AggregateError::TooManyProofs { n: proofs.len(), max });
+    }
     let tape = WitnessTape::build_n(m.profile, &vk.shape, &vk.key, proofs, binding)
         .map_err(AggregateError::Tape)?;
-    let program = aggregate_program(vk);
     let (proof, _exec) = m.prove(&program, &tape.words, tier).map_err(AggregateError::Prove)?;
     // R6: the proof's published digest is the executed program's own output, committed into the
     // batch public values; it must equal the host-computed one, here, at prove time — not at the
@@ -134,10 +143,14 @@ pub fn verify_aggregate(
     if a.proof.public_values != want {
         return Err(VerifyAggregateError::DigestMismatch);
     }
-    m.verify(program, &a.proof).map_err(VerifyAggregateError::Verify)?;
+    // The list's `N` (bound to the proof by the digest just checked) fixes the one reduce height
+    // the proof may declare: `verify_n` refuses any other before building a key (the final fix
+    // wave — the node's key-cache DoS guard, `machine`'s module doc).
+    let n = a.public[4].as_canonical_u64();
+    m.verify_n(program, &a.proof, n).map_err(VerifyAggregateError::Verify)?;
     // The digest committed to the list's length, so a list that passes the check is well-formed:
     // `[vk(4) ‖ N ‖ B(8) ‖ pv::NUM·N]`, and each proof's run is `pv`'s own layout.
-    let n = a.public[4].as_canonical_u64() as usize;
+    let n = n as usize;
     assert_eq!(
         a.public.len(),
         5 + 8 + pv::NUM * n,

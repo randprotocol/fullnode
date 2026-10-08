@@ -246,6 +246,11 @@ pub fn aggregate_pins() -> AggregatePins {
         measure_aggregate(2, FriProfile::Test),
         measure_aggregate(3, FriProfile::Test),
     ];
+    // Phase 3 Task 0: the hand-written `phase3_attribution` block survives a re-measure.
+    let block = s.find("\"phase3_attribution\"").map(|at| {
+        let close = at + s[at..].find('}').expect("the attribution block closes");
+        s[at..=close].to_string()
+    });
     let mut json = format!(
         "{{\n  \"cpu_rows\": {},\n  \"permutations\": {},\n  \"mem_accesses\": {},\n  \
          \"witness_words\": {},\n  \"program_instrs\": {},\n",
@@ -254,12 +259,15 @@ pub fn aggregate_pins() -> AggregatePins {
     );
     for (i, r) in rs.iter().enumerate() {
         let n = i + 1;
-        let comma = if n == 3 { "" } else { "," };
+        let comma = if n == 3 && block.is_none() { "" } else { "," };
         json += &format!(
             "  \"aggregate_test_n{n}_cpu_rows\": {},\n  \"aggregate_test_n{n}_permutations\": {},\n  \
              \"aggregate_test_n{n}_mem_accesses\": {},\n  \"aggregate_test_n{n}_witness_words\": {}{comma}\n",
             r.cpu_rows, r.permutations, r.mem_accesses, r.witness_words
         );
+    }
+    if let Some(b) = &block {
+        json += &format!("  {b}\n");
     }
     json += "}\n";
     std::fs::write(&path, json).expect("the pin file is writable");
@@ -438,6 +446,8 @@ pub fn eval_at(e: &SymbolicExpression<randprotocol_rvm::isa::F>, cur: &[randprot
             BaseLeaf::Variable(v) => match v.entry {
                 BaseEntry::Main { offset: 0 } => cur[v.index],
                 BaseEntry::Main { offset: 1 } => next[v.index],
+                // A row outside every preprocessed region (the reduce chip's per-row rules are checked there).
+                BaseEntry::Preprocessed { .. } => F::ZERO,
                 other => panic!("a main-trace-only AIR read {other:?}"),
             },
             BaseLeaf::IsFirstRow | BaseLeaf::IsLastRow => F::ZERO,
@@ -543,30 +553,87 @@ pub fn eval_row(
 }
 
 /// A program that reaches every chip: registers and RAM (`STORE`, `LOAD`), a `POSEIDON2`
-/// dispatch, a three-row `REDUCE` run over a hand-written descriptor, the four `PUBLIC`s, `HALT`.
+/// dispatch, a three-row `REDUCE` run of layout entry 0 (Cut D), an arity-2 `FOLD` (Cut E2), a
+/// three-bit `POW` (Cut F), the four `PUBLIC`s, `HALT`.
 /// (`tests/tables.rs`' padding-row rule and `tests/binding.rs`' binding rule both run over it.)
 #[allow(dead_code)]
 pub fn every_chip_program() -> randprotocol_rvm::isa::Program {
     use p3_field::PrimeCharacteristicRing;
-    use randprotocol_rvm::isa::{Instr, Op, Program, F};
+    use randprotocol_rvm::isa::{Instr, Op, Program, ReduceEntry, F};
     let mut v = vec![];
+    // `reduce_chain_program(false)`'s thirteen cells. The key's and alpha's zero high lanes (211,
+    // 213) are stored straight from `r0`: 32 instructions (a 64-row program table) and a register
+    // table whose real rows stay clear of the padding row `tests/tables.rs` checks.
     let st = |v: &mut Vec<Instr>, addr: u64, val: u64| {
         v.push(Instr { op: Op::Faddi, rd: 1, ra: 0, b: F::from_u64(val) });
         v.push(Instr { op: Op::Store, rd: 1, ra: 0, b: F::from_u64(addr) });
     };
-    for (k, val) in [100u64, 120, 3, 1, 0, 0, 0, 1, 0, 3, 0].iter().enumerate() {
-        st(&mut v, 200 + k as u64, *val);
+    for (addr, val) in [(100u64, 10u64), (101, 0), (102, 20), (103, 0), (104, 30), (105, 0), (120, 4), (121, 5), (122, 6), (210, 1), (212, 3)] {
+        st(&mut v, addr, val);
     }
-    v.push(Instr { op: Op::Load, rd: 3, ra: 0, b: F::from_u64(201) });
-    v.push(Instr { op: Op::Faddi, rd: 2, ra: 0, b: F::from_u64(200) });
-    v.push(Instr { op: Op::Reduce, rd: 0, ra: 2, b: F::ZERO });
+    for addr in [211u64, 213] {
+        v.push(Instr { op: Op::Store, rd: 0, ra: 0, b: F::from_u64(addr) });
+    }
+    v.push(Instr { op: Op::Load, rd: 3, ra: 0, b: F::from_u64(121) });
+    v.push(Instr { op: Op::Reduce, rd: 0, ra: 0, b: F::ZERO });
     v.push(Instr { op: Op::Faddi, rd: 7, ra: 0, b: F::from_u64(64) });
     v.push(Instr { op: Op::Poseidon2, rd: 0, ra: 7, b: F::ZERO });
+    // Cut E2: one arity-2 fold of the row (1, 0) (2, 0) at cells 300–303, u = 3 — the fold kind's
+    // result write (cells 308–309) is then covered by the write and padding rules too.
+    st(&mut v, 300, 1);
+    v.push(Instr { op: Op::Store, rd: 0, ra: 0, b: F::from_u64(301) });
+    st(&mut v, 302, 2);
+    v.push(Instr { op: Op::Store, rd: 0, ra: 0, b: F::from_u64(303) });
+    v.push(Instr { op: Op::Faddi, rd: 2, ra: 0, b: F::from_u64(3) });
+    v.push(Instr { op: Op::Faddi, rd: 3, ra: 0, b: F::ZERO });
+    v.push(Instr { op: Op::Faddi, rd: 4, ra: 0, b: F::from_u64(300) });
+    v.push(Instr { op: Op::Fold, rd: 2, ra: 4, b: F::from_u64(2) });
+    // Cut F: one three-bit POW over the bits (1, 0, 1) at cells 400–402, G = 7, base = 1 — the pow
+    // kind's bit reads and output write (cell 464) are covered by the binding and padding rules.
+    // Cell 401 is never written (its read is a fresh zero), which keeps the RAM table at 61 real
+    // rows of 64, clear of the padding row `tests/tables.rs` checks.
+    st(&mut v, 400, 1);
+    st(&mut v, 402, 1);
+    v.push(Instr { op: Op::Faddi, rd: 2, ra: 0, b: F::from_u64(7) });
+    v.push(Instr { op: Op::Faddi, rd: 3, ra: 0, b: F::ONE });
+    v.push(Instr { op: Op::Faddi, rd: 4, ra: 0, b: F::from_u64(400) });
+    v.push(Instr { op: Op::Pow, rd: 2, ra: 4, b: F::from_u64(256 * 3) });
     for _ in 0..4 {
         v.push(Instr { op: Op::Public, rd: 0, ra: 0, b: F::ZERO });
     }
     v.push(Instr { op: Op::Halt, rd: 0, ra: 0, b: F::ZERO });
-    Program { instrs: v, checkpoints: vec![] }
+    let reduce_layout = vec![ReduceEntry { vals: 100, row: 120, len: 3, key: 210, alpha: 212, res: 214, chain_start: true, carry: false }];
+    Program { instrs: v, checkpoints: vec![], reduce_layout }
+}
+
+/// Cut D's honest reduce program (`tests/emulator.rs::chain`, shared): one chain over three
+/// columns, as one entry or (`split`) as a carrying two-column entry plus a one-column
+/// continuation. Publishes 267 = (10−4)·1 + (20−5)·3 + (30−6)·9 four times.
+#[allow(dead_code)]
+pub fn reduce_chain_program(split: bool) -> randprotocol_rvm::isa::Program {
+    use p3_field::PrimeCharacteristicRing;
+    use randprotocol_rvm::isa::{Instr, Op, Program, ReduceEntry, F};
+    let i = |op: Op, rd: u8, ra: u8, b: u64| Instr { op, rd, ra, b: F::from_u64(b) };
+    let mut v = vec![];
+    for (addr, val) in [(100u64, 10u64), (101, 0), (102, 20), (103, 0), (104, 30), (105, 0), (120, 4), (121, 5), (122, 6), (210, 1), (211, 0), (212, 3), (213, 0)] {
+        v.push(i(Op::Faddi, 1, 0, val));
+        v.push(i(Op::Store, 1, 0, addr));
+    }
+    let e = ReduceEntry { vals: 100, row: 120, len: 3, key: 210, alpha: 212, res: 214, chain_start: true, carry: false };
+    let layout = if split {
+        vec![ReduceEntry { len: 2, carry: true, ..e }, ReduceEntry { vals: 104, row: 122, len: 1, chain_start: false, ..e }]
+    } else {
+        vec![e]
+    };
+    for id in 0..layout.len() as u64 {
+        v.push(i(Op::Reduce, 0, 0, id));
+    }
+    v.push(i(Op::Load, 3, 0, 214));
+    for _ in 0..4 {
+        v.push(i(Op::Public, 0, 3, 0));
+    }
+    v.push(i(Op::Halt, 0, 0, 0));
+    Program { instrs: v, checkpoints: vec![], reduce_layout: layout }
 }
 
 /// Cut C's smallest honest `COMPRESS` program (`tests/emulator.rs`'s, reproduced for the chip and
@@ -592,7 +659,7 @@ pub fn compress_program(bit: u64) -> randprotocol_rvm::isa::Program {
         instrs.push(i(Op::Public, 0, 5, 0));
     }
     instrs.push(i(Op::Halt, 0, 0, 0));
-    Program { instrs, checkpoints: vec![] }
+    Program { instrs, checkpoints: vec![], reduce_layout: vec![] }
 }
 
 /// The main columns a table range-checks: the single-column fields of its `RANGE8` lookups.
@@ -697,4 +764,82 @@ pub fn eval_full(
         SymbolicExpr::Neg { x, .. } => -eval_full(x, cur, next, pre, public),
         SymbolicExpr::Mul { x, y, .. } => eval_full(x, cur, next, pre, public) * eval_full(y, cur, next, pre, public),
     }
+}
+
+/// Phase 3 Task 0: `tests/pins.json`'s `phase3_attribution` block — the REG access count and
+/// the executed rows per call site, measured by `tests/profile.rs` on the production fixture.
+#[allow(dead_code)]
+pub struct Phase3Attribution {
+    pub reg_accesses: usize,
+    pub rows: Vec<(String, usize)>,
+}
+
+#[allow(dead_code)]
+pub fn phase3_attribution() -> Phase3Attribution {
+    let s = std::fs::read_to_string(pins_path()).expect("tests/pins.json");
+    let at = s.find("\"phase3_attribution\"").expect("Task 0 wrote the phase3_attribution block");
+    let block = &s[at..at + s[at..].find('}').expect("the block closes")];
+    let mut out = Phase3Attribution { reg_accesses: 0, rows: Vec::new() };
+    for line in block.lines().skip(1) {
+        let Some((k, v)) = line.trim().trim_end_matches(',').split_once(": ") else { continue };
+        let (k, v) = (k.trim_matches('"').to_string(), v.parse::<usize>().expect("a numeric field"));
+        if k == "reg_accesses" {
+            out.reg_accesses = v
+        } else {
+            out.rows.push((k, v))
+        }
+    }
+    out
+}
+
+/// Cut E2's honest fold program: each run's row stored at its own base, `u` in r2/r3, the base in
+/// r4, one `FOLD`; the first run's result published twice. Returns the program and every run's
+/// expected value (`emulator::fold_dft_horner`).
+#[allow(dead_code)]
+pub fn fold_program(runs: &[(usize, Vec<randprotocol_rvm::isa::EF>, randprotocol_rvm::isa::EF)]) -> (randprotocol_rvm::isa::Program, Vec<randprotocol_rvm::isa::EF>) {
+    use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
+    use randprotocol_rvm::isa::{Instr, Op, Program, F};
+    let i = |op: Op, rd: u8, ra: u8, b: F| Instr { op, rd, ra, b };
+    let (mut v, mut want, mut base, mut first_res) = (vec![], vec![], 300u64, 0u64);
+    for (la, ys, u) in runs {
+        let a = 1u64 << la;
+        for (k, y) in ys.iter().enumerate() {
+            for (l, w) in y.as_basis_coefficients_slice().iter().enumerate() {
+                v.push(i(Op::Faddi, 1, 0, *w));
+                v.push(i(Op::Store, 1, 0, F::from_u64(base + 2 * k as u64 + l as u64)));
+            }
+        }
+        let uc = u.as_basis_coefficients_slice();
+        v.extend([i(Op::Faddi, 2, 0, uc[0]), i(Op::Faddi, 3, 0, uc[1]), i(Op::Faddi, 4, 0, F::from_u64(base)), i(Op::Fold, 2, 4, F::from_u64(a))]);
+        want.push(randprotocol_rvm::emulator::fold_dft_horner(ys, *u));
+        if first_res == 0 {
+            first_res = base + 2 * a + 4;
+        }
+        base += 2 * a + 4 + 2 + 10;
+    }
+    v.extend([i(Op::Loade, 6, 0, F::from_u64(first_res)), i(Op::Public, 0, 6, F::ZERO), i(Op::Public, 0, 7, F::ZERO)]);
+    v.extend([i(Op::Public, 0, 6, F::ZERO), i(Op::Public, 0, 7, F::ZERO), i(Op::Halt, 0, 0, F::ZERO)]);
+    (Program { instrs: v, checkpoints: vec![], reduce_layout: vec![] }, want)
+}
+
+/// Cut F's honest pow program (`tests/emulator.rs::pow_prog`, shared): the 64 bits stored at cells
+/// 400–463, `(G, base)` in r2/r3, the buffer in r4, one `POW`, its output (cell 464) published four
+/// times.
+#[allow(dead_code)]
+pub fn pow_program(bits: &[u64], off: u64, len: u64, g: randprotocol_rvm::isa::F, base: randprotocol_rvm::isa::F) -> randprotocol_rvm::isa::Program {
+    use p3_field::PrimeCharacteristicRing;
+    use randprotocol_rvm::isa::{Instr, Op, Program, F};
+    let i = |op: Op, rd: u8, ra: u8, b: u64| Instr { op, rd, ra, b: F::from_u64(b) };
+    let mut v = vec![];
+    for (k, &bit) in bits.iter().enumerate() {
+        v.push(i(Op::Faddi, 1, 0, bit));
+        v.push(i(Op::Store, 1, 0, 400 + k as u64));
+    }
+    v.extend([Instr { op: Op::Faddi, rd: 2, ra: 0, b: g }, Instr { op: Op::Faddi, rd: 3, ra: 0, b: base }, i(Op::Faddi, 4, 0, 400)]);
+    v.extend([i(Op::Pow, 2, 4, off + 256 * len), i(Op::Load, 6, 0, 464)]);
+    for _ in 0..4 {
+        v.push(i(Op::Public, 0, 6, 0));
+    }
+    v.push(i(Op::Halt, 0, 0, 0));
+    Program { instrs: v, checkpoints: vec![], reduce_layout: vec![] }
 }

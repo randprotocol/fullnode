@@ -5235,7 +5235,7 @@ dependencies = [
 [[package]]
 name = "rand-zkvm-cuda"
 version = "0.1.0"
-source = "git+https://github.com/randprotocol/zkp-circuits?rev=5f69747487c9826af8a4c164d786f420597b375f#5f69747487c9826af8a4c164d786f420597b375f"
+source = "git+https://github.com/randprotocol/zkp-circuits?rev=71e1a0411748cbb7ba74b204acaafe37587e613a#71e1a0411748cbb7ba74b204acaafe37587e613a"
 dependencies = [
  "chacha20 0.10.2",
  "cuda-core",
@@ -5449,6 +5449,7 @@ dependencies = [
  "p3-maybe-rayon",
  "p3-merkle-tree",
  "p3-poseidon2",
+ "p3-security",
  "p3-symmetric",
  "p3-uni-stark",
  "p3-util",

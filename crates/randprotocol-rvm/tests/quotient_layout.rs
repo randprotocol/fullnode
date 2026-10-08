@@ -30,6 +30,7 @@ fn toy_program() -> Program {
             instr(Op::Halt, 0, 0, 0),
         ],
         checkpoints: vec![],
+        reduce_layout: vec![],
     }
 }
 
@@ -174,8 +175,15 @@ fn a_reduce_carrying_proof_has_one_quotient_matrix_per_instance() {
     vals.iter().for_each(|v| tape.extend_from_slice(v.as_basis_coefficients_slice()));
     let row_a = b.hint_array(4);
     tape.extend_from_slice(&row);
-    let (inv_h, zero, one, alpha_h) = (b.ext_constant(inv), b.ext_constant(EF::ZERO), b.ext_constant(EF::ONE), b.ext_constant(alpha));
-    let (ro, _) = b.reduce(vals_a, row_a, inv_h, zero, one, alpha_h);
+    // Cut D: the key and alpha live at compile-time addresses the layout names.
+    let keys = b.alloc(4);
+    let res = b.alloc(2);
+    let (alpha_h, inv_h) = (b.ext_constant(alpha), b.ext_constant(inv));
+    b.store_ext(keys, 0, alpha_h);
+    b.store_ext(keys, 2, inv_h);
+    let key = b.offset(keys, 2);
+    b.reduce(&[randprotocol_rvm::dsl::ReduceRun { vals: vals_a, row: row_a, key }], keys, res);
+    let ro = b.load_ext(res, 0);
     b.public_ext(ro);
     b.public_ext(ro);
     let p = b.finish();

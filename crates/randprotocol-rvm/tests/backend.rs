@@ -44,6 +44,7 @@ fn table_covering_program() -> Program {
             i(Op::Halt, 0, 0, 0),           // 16
         ],
         checkpoints: vec![],
+        reduce_layout: vec![],
     }
 }
 

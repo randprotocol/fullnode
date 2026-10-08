@@ -5,7 +5,7 @@ use randprotocol_rvm::emulator::{execute, ExecError, PermKind};
 use randprotocol_rvm::isa::{Instr, Op, Program, F, MEM_LIMIT};
 
 fn prog(instrs: Vec<Instr>) -> Program {
-    Program { instrs, checkpoints: vec![] }
+    Program { instrs, checkpoints: vec![], reduce_layout: vec![] }
 }
 fn i(op: Op, rd: u8, ra: u8, b: u64) -> Instr {
     Instr { op, rd, ra, b: F::from_u64(b) }
@@ -236,7 +236,7 @@ fn hintn_writes_eight_witness_words_at_ra_plus_imm() {
         i(Op::Load, 2, 1, 4),               // r2 = mem[104]
         i(Op::Load, 3, 1, 11),              // r3 = mem[111]
         i(Op::Public, 0, 2, 0), i(Op::Public, 0, 3, 0), i(Op::Halt, 0, 0, 0),
-    ], checkpoints: vec![] };
+    ], checkpoints: vec![], reduce_layout: vec![] };
     let tape: Vec<F> = (1..=8).map(F::from_u64).collect();
     let exec = execute(&p, &tape, 100).unwrap();
     assert_eq!(exec.public, vec![F::from_u64(1), F::from_u64(8)]);
@@ -255,18 +255,18 @@ fn hintn_writes_eight_witness_words_at_ra_plus_imm() {
 
 #[test]
 fn hintn_with_seven_words_left_is_hint_exhausted() {
-    let p = Program { instrs: vec![i(Op::Faddi, 1, 0, 100), i(Op::Hintn, 0, 1, 0), i(Op::Halt, 0, 0, 0)], checkpoints: vec![] };
+    let p = Program { instrs: vec![i(Op::Faddi, 1, 0, 100), i(Op::Hintn, 0, 1, 0), i(Op::Halt, 0, 0, 0)], checkpoints: vec![], reduce_layout: vec![] };
     let tape: Vec<F> = (1..=7).map(F::from_u64).collect();
     assert_eq!(execute(&p, &tape, 100), Err(ExecError::HintExhausted { pc: 1 }));
 }
 
 #[test]
 fn hintn_whose_top_cell_is_at_two_to_the_twentyfour_is_refused() {
-    let p = Program { instrs: vec![i(Op::Faddi, 1, 0, (1 << 24) - 7), i(Op::Hintn, 0, 1, 0), i(Op::Halt, 0, 0, 0)], checkpoints: vec![] };
+    let p = Program { instrs: vec![i(Op::Faddi, 1, 0, (1 << 24) - 7), i(Op::Hintn, 0, 1, 0), i(Op::Halt, 0, 0, 0)], checkpoints: vec![], reduce_layout: vec![] };
     let tape: Vec<F> = (1..=8).map(F::from_u64).collect();
     assert_eq!(execute(&p, &tape, 100), Err(ExecError::AddressOutOfRange { pc: 1, addr: 1 << 24 }));
     // One lower is the last legal base.
-    let p = Program { instrs: vec![i(Op::Faddi, 1, 0, (1 << 24) - 8), i(Op::Hintn, 0, 1, 0), i(Op::Halt, 0, 0, 0)], checkpoints: vec![] };
+    let p = Program { instrs: vec![i(Op::Faddi, 1, 0, (1 << 24) - 8), i(Op::Hintn, 0, 1, 0), i(Op::Halt, 0, 0, 0)], checkpoints: vec![], reduce_layout: vec![] };
     assert!(execute(&p, &tape, 100).is_ok());
 }
 
@@ -280,7 +280,7 @@ fn compress_orders_the_children_by_the_bit_and_keeps_four_lanes() {
         instrs.push(ir(Op::Compress, 3, 1, 2));
         for k in 0..4 { instrs.push(i(Op::Load, 5, 1, k)); instrs.push(i(Op::Public, 0, 5, 0)); }
         instrs.push(i(Op::Halt, 0, 0, 0));
-        execute(&Program { instrs, checkpoints: vec![] }, &[], 1000).unwrap()
+        execute(&Program { instrs, checkpoints: vec![], reduce_layout: vec![] }, &[], 1000).unwrap()
     };
     let want = |input: [F; 8]| randprotocol_zkvm::hash::permute_state(input)[..4].to_vec();
     let ds: [F; 8] = core::array::from_fn(|k| if k < 4 { d[k] } else { s[k - 4] });
@@ -295,6 +295,142 @@ fn compress_orders_the_children_by_the_bit_and_keeps_four_lanes() {
 
 #[test]
 fn compress_refuses_a_non_boolean_bit() {
-    let p = Program { instrs: vec![i(Op::Faddi, 1, 0, 64), i(Op::Faddi, 2, 0, 80), i(Op::Faddi, 3, 0, 2), ir(Op::Compress, 3, 1, 2), i(Op::Halt, 0, 0, 0)], checkpoints: vec![] };
+    let p = Program { instrs: vec![i(Op::Faddi, 1, 0, 64), i(Op::Faddi, 2, 0, 80), i(Op::Faddi, 3, 0, 2), ir(Op::Compress, 3, 1, 2), i(Op::Halt, 0, 0, 0)], checkpoints: vec![], reduce_layout: vec![] };
     assert_eq!(execute(&p, &[], 100), Err(ExecError::NonBooleanBit { pc: 3 }));
+}
+
+use randprotocol_rvm::isa::ReduceEntry;
+
+/// Cut D's honest chain over `common`'s 267 fixture, inlined: vals (10,0) (20,0) (30,0) at 100,
+/// row 4 5 6 at 120, inv (1,0) at 210, alpha (3,0) at 212, the result at 214.
+fn chain(split: bool) -> Program {
+    let mut v = vec![];
+    for (addr, val) in [(100u64, 10u64), (101, 0), (102, 20), (103, 0), (104, 30), (105, 0), (120, 4), (121, 5), (122, 6), (210, 1), (211, 0), (212, 3), (213, 0)] {
+        v.push(i(Op::Faddi, 1, 0, val));
+        v.push(i(Op::Store, 1, 0, addr));
+    }
+    let e = ReduceEntry { vals: 100, row: 120, len: 3, key: 210, alpha: 212, res: 214, chain_start: true, carry: false };
+    let layout = if split {
+        vec![ReduceEntry { len: 2, carry: true, ..e }, ReduceEntry { vals: 104, row: 122, len: 1, chain_start: false, ..e }]
+    } else {
+        vec![e]
+    };
+    for id in 0..layout.len() as u64 {
+        v.push(i(Op::Reduce, 0, 0, id));
+    }
+    v.push(i(Op::Load, 3, 0, 214));
+    for _ in 0..4 {
+        v.push(i(Op::Public, 0, 3, 0));
+    }
+    v.push(i(Op::Halt, 0, 0, 0));
+    Program { instrs: v, checkpoints: vec![], reduce_layout: layout }
+}
+
+#[test]
+fn a_reduce_chain_accumulates_across_its_entries_and_writes_once() {
+    for split in [false, true] {
+        let exec = execute(&chain(split), &[], 1000).unwrap();
+        assert_eq!(exec.public[0], F::from_u64(267), "(10−4)·1 + (20−5)·3 + (30−6)·9, split {split}");
+        let writes: usize = exec.events.iter().filter(|e| e.reduce.is_some()).map(|e| e.mem.iter().filter(|m| m.is_write).count()).sum();
+        assert_eq!(writes, 2, "one result write per chain, split {split}");
+    }
+}
+
+#[test]
+fn a_carry_not_consumed_by_the_next_instruction_is_refused() {
+    let mut p = chain(true);
+    let at = p.instrs.iter().position(|x| x.op == Op::Reduce).unwrap();
+    p.instrs.insert(at + 1, i(Op::Faddi, 9, 0, 1));
+    assert!(matches!(execute(&p, &[], 1000), Err(ExecError::ReduceChain { entry: 1, .. })));
+}
+
+#[test]
+fn a_continuation_entry_dispatched_without_its_carry_is_refused() {
+    let mut p = chain(true);
+    let at = p.instrs.iter().position(|x| x.op == Op::Reduce).unwrap();
+    p.instrs.remove(at); // entry 0 never runs
+    assert!(matches!(execute(&p, &[], 1000), Err(ExecError::ReduceChain { entry: 1, .. })));
+}
+
+#[test]
+fn an_entry_id_past_the_layout_is_refused() {
+    let mut p = chain(false);
+    let at = p.instrs.iter().position(|x| x.op == Op::Reduce).unwrap();
+    p.instrs[at] = i(Op::Reduce, 0, 0, 5);
+    assert_eq!(execute(&p, &[], 1000).unwrap_err(), ExecError::ReduceLayout { pc: at as u32, entry: 5 });
+}
+
+/// Fix round 1 (Task 1a review): a hostile entry whose `u64::MAX` bases would wrap `base + 1` back
+/// into range is refused before any cell is read — the same bound `check_program` applies.
+#[test]
+fn a_layout_entry_whose_addresses_wrap_is_refused() {
+    let mut p = chain(false);
+    p.reduce_layout[0] = ReduceEntry { key: u64::MAX, vals: u64::MAX, len: 1, row: 0, alpha: 0, res: 2, chain_start: true, carry: false };
+    let at = p.instrs.iter().position(|x| x.op == Op::Reduce).unwrap();
+    assert_eq!(execute(&p, &[], 1000).unwrap_err(), ExecError::ReduceLayout { pc: at as u32, entry: 0 });
+}
+
+#[test]
+fn fold_reads_the_row_and_writes_the_fold_after_the_salts() {
+    use p3_field::BasedVectorSpace;
+    use randprotocol_rvm::isa::EF;
+    let ys: Vec<EF> = (1..=4u64).map(|k| EF::from_basis_coefficients_slice(&[F::from_u64(k), F::from_u64(10 * k)]).unwrap()).collect();
+    let u = EF::from_basis_coefficients_slice(&[F::from_u64(3), F::from_u64(5)]).unwrap();
+    let mut v = vec![];
+    for (k, y) in ys.iter().enumerate() {
+        for (l, w) in y.as_basis_coefficients_slice().iter().enumerate() {
+            v.push(Instr { op: Op::Faddi, rd: 1, ra: 0, b: *w });
+            v.push(i(Op::Store, 1, 0, 300 + 2 * k as u64 + l as u64));
+        }
+    }
+    v.extend([i(Op::Faddi, 2, 0, 3), i(Op::Faddi, 3, 0, 5), i(Op::Faddi, 4, 0, 300), i(Op::Fold, 2, 4, 4)]);
+    v.extend([i(Op::Loade, 6, 0, 300 + 8 + 4), i(Op::Public, 0, 6, 0), i(Op::Public, 0, 7, 0), i(Op::Halt, 0, 0, 0)]);
+    let exec = execute(&prog(v), &[], 1000).unwrap();
+    let want = randprotocol_rvm::emulator::fold_dft_horner(&ys, u);
+    assert_eq!(exec.public, want.as_basis_coefficients_slice().to_vec());
+    let ev = exec.events.iter().find(|e| e.instr.op == Op::Fold).unwrap();
+    assert_eq!(ev.mem.len(), 2 * 4 + 2, "two reads per value, two result writes");
+    assert_eq!(ev.d, [F::from_u64(3), F::from_u64(5)], "u is read from the rd pair");
+}
+
+#[test]
+fn fold_refuses_an_arity_outside_two_four_eight() {
+    let p = prog(vec![i(Op::Faddi, 4, 0, 300), i(Op::Fold, 2, 4, 3), i(Op::Halt, 0, 0, 0)]);
+    assert_eq!(execute(&p, &[], 100), Err(ExecError::FoldArity { pc: 1, arity: 3 }));
+}
+
+fn pow_prog(bits: &[u64], off: u64, len: u64, g: F, base: F) -> Program {
+    let mut v = vec![];
+    for (k, &bit) in bits.iter().enumerate() {
+        v.push(i(Op::Faddi, 1, 0, bit));
+        v.push(i(Op::Store, 1, 0, 400 + k as u64));
+    }
+    v.extend([Instr { op: Op::Faddi, rd: 2, ra: 0, b: g }, Instr { op: Op::Faddi, rd: 3, ra: 0, b: base }, i(Op::Faddi, 4, 0, 400)]);
+    v.extend([i(Op::Pow, 2, 4, off + 256 * len), i(Op::Load, 6, 0, 464), i(Op::Public, 0, 6, 0), i(Op::Halt, 0, 0, 0)]);
+    prog(v)
+}
+
+#[test]
+fn pow_is_the_bit_selected_power() {
+    use p3_field::TwoAdicField;
+    let bits: Vec<u64> = (0..64).map(|k| (0x9e37_79b9u64 >> (k % 32)) & 1).collect();
+    let (off, len) = (5u64, 11u64);
+    let g = F::two_adic_generator(len as usize);
+    let exec = execute(&pow_prog(&bits, off, len, g, F::GENERATOR), &[], 10_000).unwrap();
+    let mut want = F::GENERATOR;
+    for k in 0..len {
+        if bits[(off + k) as usize] == 1 {
+            want *= g.exp_u64(1 << (len - 1 - k));
+        }
+    }
+    assert_eq!(exec.public, vec![want]);
+}
+
+#[test]
+fn pow_refuses_a_non_boolean_bit_and_a_bad_shape() {
+    let mut bits = vec![0u64; 64];
+    bits[3] = 2;
+    assert_eq!(execute(&pow_prog(&bits, 0, 8, F::TWO, F::ONE), &[], 10_000).unwrap_err(), ExecError::NonBooleanBit { pc: 131 });
+    let bits = vec![0u64; 64];
+    assert!(matches!(execute(&pow_prog(&bits, 60, 8, F::TWO, F::ONE), &[], 10_000), Err(ExecError::PowShape { .. })));
 }

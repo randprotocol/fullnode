@@ -22,7 +22,7 @@ mod builder;
 pub mod hash;
 pub mod transcript;
 
-pub use builder::{Builder, Checkpoints, Liveness, Precompiles, Stats, MEM_BASE};
+pub use builder::{Builder, Checkpoints, Liveness, Precompiles, ReduceRun, Stats, MEM_BASE, PC_INSTR, PC_RELOAD, PC_SPILL};
 
 /// A digest is **four** field elements on this machine, not eight: `DIGEST_ELEMS = 4` in the
 /// `ValMmcs`, `OUT = 4` in the sponge, `CHUNK = 4` in the compressor (spec §12 erratum 1). The

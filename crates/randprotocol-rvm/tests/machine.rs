@@ -22,6 +22,7 @@ fn toy_program() -> Program {
             instr(Op::Halt, 0, 0, 0),
         ],
         checkpoints: vec![],
+        reduce_layout: vec![],
     }
 }
 
@@ -91,17 +92,17 @@ fn the_verifier_key_is_reproducible_and_cached_per_program_tier_reduce() {
     let mut b = toy_program();
     b.instrs[2] = instr(Op::Fsub, 3, 1, 2);
 
-    let ka1 = m.verifier_key(&a, Tier(8), false);
-    let ka2 = m.verifier_key(&a, Tier(8), false);
+    let ka1 = m.verifier_key(&a, Tier(8), 0);
+    let ka2 = m.verifier_key(&a, Tier(8), 0);
     assert!(std::sync::Arc::ptr_eq(&ka1, &ka2), "a cache hit returns the same key");
     assert_eq!(m.cached_keys(), 1);
 
-    let kb = m.verifier_key(&b, Tier(8), false);
+    let kb = m.verifier_key(&b, Tier(8), 0);
     assert_eq!(m.cached_keys(), 2);
     // A different program is a different key (R1/R6: the key binds the program).
     assert!(!std::sync::Arc::ptr_eq(&ka1, &kb));
 
-    let kr = m.verifier_key(&a, Tier(8), true);
+    let kr = m.verifier_key(&a, Tier(8), 4);
     assert_eq!(m.cached_keys(), 3);
     assert!(!std::sync::Arc::ptr_eq(&ka1, &kr));
 }
@@ -145,4 +146,36 @@ fn the_toy_proves_and_verifies() {
     let m = Machine::new(randprotocol_zkvm::machine::FriProfile::Test);
     let (proof, _) = m.prove(&p, &[], None).unwrap();
     m.verify(&p, &proof).unwrap();
+}
+
+#[test]
+fn the_rvm_fri_parameters_are_pinned_per_profile() {
+    use randprotocol_rvm::machine::RvmFri;
+    assert_eq!(RvmFri::of(randprotocol_zkvm::machine::FriProfile::Production), RvmFri { log_blowup: 2, num_queries: 92, query_pow_bits: 24 });
+    assert_eq!(RvmFri::of(randprotocol_zkvm::machine::FriProfile::Test), RvmFri { log_blowup: 2, num_queries: 16, query_pow_bits: 4 });
+}
+
+/// An aggregate made at the old rate ⅛ (the inner profile's numbers) reaching a rate-¼ verifier:
+/// refused by name, never accepted, never a panic. The rate-⅛ machine proves under its own key
+/// config (so its proof is internally consistent); the rate-¼ machine recomputes its own key and
+/// FRI parameters and the proof fails against them.
+#[test]
+fn a_rate_eighth_proof_is_refused_by_name() {
+    use randprotocol_rvm::machine::RvmFri;
+    let mut p = toy_program();
+    let halt = p.instrs.pop().unwrap();
+    for r in [1, 2, 3] {
+        p.instrs.push(instr(Op::Public, 0, r, 0));
+    }
+    p.instrs.push(halt);
+    let profile = randprotocol_zkvm::machine::FriProfile::Test;
+    let old = Machine::with_fri(profile, RvmFri { log_blowup: 3, num_queries: 16, query_pow_bits: 4 });
+    let (proof, _) = old.prove(&p, &[], None).unwrap();
+    old.verify(&p, &proof).expect("consistent under its own regime");
+    let new = Machine::new(profile);
+    match new.verify(&p, &proof) {
+        Err(VerifyError::Batch(msg)) => assert!(!msg.is_empty(), "a named refusal: {msg}"),
+        Err(other) => panic!("refused, but not by the batch verifier: {other:?}"),
+        Ok(()) => panic!("a rate-⅛ proof must not verify at rate ¼"),
+    }
 }
