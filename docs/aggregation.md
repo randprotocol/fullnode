@@ -244,8 +244,8 @@ both have to clear before a genesis may switch it on.
 
 ### Testing: the recursion fixtures (issue #131)
 
-The node's fixture-backed tests (the list is `scripts/ci-fixture-skips.sh`'s: `agg_executor::`,
-the covered-assembly tests in `node::`, the aggregation tests in `rpc::`, `storage::seal_tests::`)
+The node's fixture-backed tests (`agg_executor::`, the covered-assembly tests in `node::`, the
+aggregation tests in `rpc::`, `storage::seal_tests::`)
 read real bundle proofs through `fixture_proof(k)`, `<dir>/Test-{k}.proof`. The set is exactly
 **`Test-0`, `Test-1`, `Test-2`**: every literal caller uses `k = 0`, and
 `the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte` reads `Test-1` and `Test-2`.
@@ -281,9 +281,15 @@ FIXTURE_KS=k`), which skips a fixture that still verifies and re-proves one that
 ~4.6 min a proof. The new files then end at exit 3; in the same commit re-measure the test's
 constants and circuits' `recursion/docs/02-aggregate.md` on them and move `PINNED_SHA256`.
 
-**CI.** `scripts/ci-fixture-skips.sh` still skips these tests on the grounds that a clean runner
-has no cache; with the set committed that no longer holds, and the skip list (PROC-7's open half)
-can be revisited — a follow-up, not changed here.
+**CI.** CI runs these tests (since 2026-10-08). `check-and-test` and `nightly-proving` run
+`scripts/recursion-fixtures.sh --check` first, so a missing or edited fixture fails by name before
+the suite, then the library suites read the in-repo set; `scripts/ci-fixture-skips.sh` now skips
+only the rVM's two long proving tests, by full name (`a_one_proof_aggregate_round_trips_…`,
+`two_test_profile_bundle_proofs_…`: tier 18 at N = 1 and tier 19 at N = 2, tens of GB; the N = 2
+one is also `#[ignore]`d in source).
+That closes PROC-7's open half for the node crate. (Until then the skip list removed these tests
+on the grounds that a clean runner had no cache, which stopped being true when the set was
+committed.)
 
 ## 4. Fallback
 

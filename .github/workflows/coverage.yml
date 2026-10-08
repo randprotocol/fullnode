@@ -2,7 +2,7 @@
 # and uploaded to Codecov, which draws the badge in README.md.
 #
 # What is measured: ci.yml's `check-and-test` run, instrumented — every library and binary suite
-# in the workspace in the release profile, less the fixture-backed and long-proving tests that
+# in the workspace in the release profile, less the rVM's long proving tests that
 # scripts/ci-fixture-skips.sh names (the one skip list every job shares), then the same cheap
 # integration suites that job names one by one. The two proving suites and the cluster's proving
 # tests are nightly work and are not measured. The vendored Plonky3 forks under `vendor/` are left
