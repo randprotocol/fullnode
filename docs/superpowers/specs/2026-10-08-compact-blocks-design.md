@@ -9,6 +9,16 @@ A flag-day roll: every node runs this release at once (decided 2026-10-08; see Â
 Branch `feat/compact-blocks`, worktree `~/rand-worktrees/fullnode-compact-blocks`, from `main`
 at `d6cc16f5`.
 
+## 0. Amendments from planning (2026-10-08)
+
+The implementation plan (`docs/superpowers/plans/2026-10-08-compact-blocks.md`, "Spec
+amendments") amends this spec where the code differed from what it assumed: no tree index (the
+recent-transactions cache also remembers every proposal body, cap `4 Ã— max_block_bytes`); the
+hash list is checked against the signed `tx_root` before any fetch, so a rebuilt block cannot
+fail the root check; the fetch server stays on the consensus loop like `BlockByHash`; a parked
+proposal is reported `Accept` to gossipsub after the pre-screen; the missing-body test is a node
+unit test, the cluster test measures frames and a late validator's fetches.
+
 ## 1. Goal and success criteria
 
 The leader's outbound bytes per block fall from the block size to the header plus 32 bytes a
