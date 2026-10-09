@@ -395,11 +395,14 @@ proposer, the first kept for at most 64 views); on a chain that slashes, the two
 its recent-transactions cache (4 096 entries, `4 × max_block_bytes` bytes; it holds gossiped
 bodies once they pass the bytes-only refusal and every proposal body this node sends or
 handles), then from its overflow cache — bodies a forwarder relayed past its transaction limit,
-held unhashed and unverified (4 096 entries, `max_block_bytes` bytes), never pooled or served —
+held unhashed and unverified (4 096 entries, `max_block_bytes` bytes), never pooled and
+not served directly — a body used in a rebuild enters the recent cache with the block, as fetched bodies do —
 and hands HotStuff the same full `Proposal` it receives from an old leader. If bodies
 are missing the proposal is parked — two slots by view, the band from the replica's view to one
 past the highest parked view, a park never displaced by its own child nor by a header whose
-justify certifies a view under it — and the missing hashes
+justify certifies a view under it or does not verify in full (so a replica at `v` whose `v + 1`
+leader withheld QC(`v`) does not park the honest `v + 2`, which arrives by fetch or sync) — and
+the missing hashes
 are fetched in batches of 512 from the leader's bound peer, then the forwarder, then peers at or
 above our height, then any, at most 8 distinct peers (a `Busy` answer not counted). A proposal
 the pre-screen `Ignore`s is dropped, never rebuilt: its signature is checked only after the

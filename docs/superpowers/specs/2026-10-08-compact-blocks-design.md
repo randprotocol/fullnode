@@ -95,9 +95,9 @@ Follow-ups (2026-10-09, `feat/compact-followups`):
 
 - **The first-header record holds 64 entries** (was 1 024). Each is a signed header dominated by
   its justify QC, ~100 KB at 26 validators, so ~6 MB at worst against ~100 MB; still pruned
-  under the committed view. 64 is many times the eight-view proposal window, past which the
-  pre-screen `Ignore`s a header before its signature is checked, so an equivocation older than
-  that is not reachable on compact gossip.
+  under the committed view. Entries come only from headers whose signature the pre-screen
+  verified (scheduled leaders), and are pruned below the committed view, so an entry inside
+  the eight-view proposal window is dropped only after ~64 views without a commit.
 - **An overflow cache for limiter-dropped bodies.** A gossiped transaction the forwarder's
   limiter refuses (`PEER_TX_BURST` 16, 4/s; now its own outcome, `GossipOutcome::Limited`,
   still reported `Ignore` once) is held in `compact::OverflowTxs`, apart from the recent cache:
@@ -105,13 +105,21 @@ Follow-ups (2026-10-09, `feat/compact-followups`):
   oversize bodies refused. It is held unhashed — the limiter's refusal still costs no hash
   (audit v6, GOSSIP-1) — and hashed when a pre-screened compact proposal misses the pool and
   the recent cache, so at most one block's bytes per such proposal; a body for an open park is
-  hashed on arrival and fills it. Rebuild order: pool, recent cache, overflow. Never verified,
-  pooled or served (`Transactions` answers stay pool and recent cache).
+  hashed on arrival and fills it. Rebuild order: pool, recent cache, overflow. Never verified
+  or pooled, and not served directly — a body used in a rebuild enters the recent cache with the block, as fetched bodies do (`Transactions` answers stay pool and recent cache).
 - **A full park slot is replaced only by a header that extends past it.** With both slots
   taken, the lowest-view park is replaced only when the new header's `justify.view` is at or
-  past that park's view (the parent-protection rule stands). Otherwise two adjacent Byzantine
-  leaders — junk parked in the next view, then a proposal on an older parent — could evict the
-  honest current-view park; an honest successor always certifies the parked view or a later one.
+  past that park's view and that justify verifies in full — quorum stake and every vote
+  signature, against the set `HotStuff::justify_verifies` takes for it (the parent-protection
+  rule stands). Otherwise two adjacent Byzantine leaders — junk parked in the next view, then a
+  proposal on an older parent, or one carrying an empty QC naming a later view, which the
+  pre-screen's shape check passes — could evict the honest current-view park. At most one
+  certificate verification per pre-screened (view, leader) that reaches the replace.
+  Accepted regression: when the leader of `v + 1` withholds QC(`v`), the honest leader of
+  `v + 2` proposes with a justify under `v`, and a replica still at `v` holding parks for `v`
+  and `v + 1` no longer parks it (it used to replace the `v` park). That `v` park is moot then;
+  the `v + 2` block arrives by its parent's fetch or by sync, and the parks are dropped once
+  the replica's view moves on.
 
 ## 1. Goal and success criteria
 
@@ -302,7 +310,7 @@ the previous release's binaries (kept on each host as `/root/rand-node.prev`). `
 | parked compact proposals | 2, by view (§0) | the replica's view and the next, or a lagging replica's next two |
 | first-header record | 64 (view, proposer) entries (§0 follow-ups; was 1 024), pruned under the committed view; each holds a signed header, whose size is dominated by its justify QC (~100 KB at 26 votes) | one header per view's leader, kept as equivocation evidence (§0, C1) |
 | `RECENT_TXS_MAX`, `RECENT_TXS_BYTES` | 4 096 entries, `2 × max_block_bytes` | two blocks of gossip in flight |
-| overflow cache (limiter-dropped bodies) | 4 096 entries, `max_block_bytes` | one block; never verified, pooled or served (§0 follow-ups) |
+| overflow cache (limiter-dropped bodies) | 4 096 entries, `max_block_bytes` | one block; never verified or pooled, not served directly (§0 follow-ups) |
 | tree index | `O(transactions in the tree)` | ≤ 3 blocks in steady state, 512 under stalls (`max_tree_blocks`) |
 | fetch attempts | `MAX_FETCH_ATTEMPTS` (8) distinct peers per parked proposal; `Busy` not counted | as `fetch_block` |
 | a `Transactions` answer | `max_block_bytes + max_aggregate_bytes` serialized | §3.2 |
