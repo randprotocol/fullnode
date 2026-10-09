@@ -45,6 +45,185 @@ pub struct AdmittedShape {
     pub aggregate_program_digest: [u64; 4],
 }
 
+/// The five words an rVM proof declares (`randprotocol_rvm::shape::RvmHeights`, mirrored: core
+/// never names the rVM).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct RvmHeights {
+    pub tier: u8,
+    pub reg_log_height: u8,
+    pub ram_log_height: u8,
+    pub poseidon2_log_height: u8,
+    pub reduce_log_height: u8,
+}
+
+/// One level's pins in a [`TreeConfig`]: `steps[k − 1]` is level `k`'s interior step. The spec's
+/// three parallel lists (circuits spec 2026-10-08 §4 "Genesis pins", R2/R3/R6) as one list of
+/// structs, so they cannot drift in length: `heights` is level `k`'s step program's heights —
+/// its `tier` is the spec's `step_tiers[k − 1]`, the tier a level-`k` root must declare (R6) —
+/// `program_digest` is `step_digests[k − 1]`, and `key` is `step_keys[k − 1]`, the key digest of
+/// level `k`'s step proofs (the `vk_c` level `k + 1` publishes).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct TreeStepPin {
+    pub heights: RvmHeights,
+    pub program_digest: [u64; 4],
+    pub key: [u64; 4],
+}
+
+/// Tree aggregation (circuits spec 2026-10-08 §4, R2–R4, R6): the leaf size, the deepest tree,
+/// the leaf heights and key, and the per-level step list — whose **last entry repeats** for every
+/// deeper level (R3's fixed point). The node rebuilds every listed program and key from these
+/// heights and compares them with the pins.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct TreeConfig {
+    /// The admitted shape this tree aggregates; must be one of `admitted_shapes`.
+    pub shape: DeclaredShape,
+    /// `L`: the bundle proofs one leaf (`rv32n`) covers.
+    pub leaf_size: u8,
+    /// The deepest tree admitted. A tree covers at most `L·2^max_depth`, its own cap: the flat
+    /// `max_covers` does not bound it (the cover cap is the layout's).
+    pub max_depth: u8,
+    /// The leaf program's heights (`rv32n` at `L`; its program digest is today's
+    /// `aggregate_program_digest`).
+    pub leaf: RvmHeights,
+    /// The key digest of `rv32n` at the leaf shape — the `vk_c` level 1 publishes.
+    pub vk_leaf: [u64; 4],
+    /// Level `k`'s step at `steps[k − 1]`, the last entry repeating ([`Self::step_at`]).
+    pub steps: Vec<TreeStepPin>,
+}
+
+/// What an executor rebuilds from a [`TreeConfig`] (step 7b and the startup check compare it):
+/// the leaf key and, per listed level in `steps`' order, `(program digest, key digest)`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TreeDigests {
+    pub vk_leaf: [u64; 4],
+    pub steps: Vec<([u64; 4], [u64; 4])>,
+}
+
+impl TreeConfig {
+    /// The largest depth a genesis may name (`L·2^8` covers is far past any block).
+    pub const MAX_DEPTH: u8 = 8;
+    /// The rVM's production reduce ceiling on one aggregate (circuits docs/06 §3): a leaf is one.
+    pub const MAX_LEAF: u8 = 5;
+
+    /// The index into `steps` for level `level ≥ 1`, the last entry repeating. Level 0 reads as
+    /// level 1. Meaningful only for a non-empty list ([`Self::check`] refuses an empty one).
+    pub fn step_index(&self, level: u32) -> usize {
+        (level.max(1) as usize).min(self.steps.len()).saturating_sub(1)
+    }
+
+    /// Level `level`'s step pins (`level ≥ 1`), the last entry repeating for every deeper level.
+    /// Panics on an empty list, which [`Self::check`] refuses and admission never reads.
+    pub fn step_at(&self, level: u32) -> &TreeStepPin {
+        &self.steps[self.step_index(level)]
+    }
+
+    /// The genesis-time bounds: `1 ≤ leaf_size ≤ MAX_LEAF`, `1 ≤ max_depth ≤ MAX_DEPTH`, a
+    /// non-empty step list no longer than `max_depth`, an admitted `shape`, and no zero digest or
+    /// key (the activation placeholder). What only the rVM can judge — the leaf size against its
+    /// N ceiling, canonical reduce heights, a fixed point past the list — is the node's startup
+    /// check (`agg_executor::check_tree_pins`).
+    pub fn check(&self, cfg: &AggregationConfig) -> Result<(), String> {
+        if !(1..=Self::MAX_LEAF).contains(&self.leaf_size) {
+            return Err(format!("aggregation_tree.leaf_size {} is outside 1..={} (the rVM's reduce ceiling)", self.leaf_size, Self::MAX_LEAF));
+        }
+        if !(1..=Self::MAX_DEPTH).contains(&self.max_depth) {
+            return Err(format!("aggregation_tree.max_depth {} is outside 1..={}", self.max_depth, Self::MAX_DEPTH));
+        }
+        if self.steps.is_empty() {
+            return Err("aggregation_tree.steps is empty: a tree needs at least level 1's step".into());
+        }
+        if self.steps.len() > self.max_depth as usize {
+            return Err(format!(
+                "aggregation_tree.steps lists {} levels, more than max_depth {} can reach",
+                self.steps.len(),
+                self.max_depth
+            ));
+        }
+        // No `max_covers` bound (tree Task 3b, 3a's I3): the cover cap is the layout's. A tree is
+        // bounded by this section, at most MAX_LEAF·2^MAX_DEPTH = 1280 covers; `max_covers` stays
+        // the flat cap, under the rVM's flat N ceiling.
+        if !cfg.admitted_shapes.iter().any(|a| a.shape == self.shape) {
+            return Err("aggregation_tree.shape is not an admitted shape".into());
+        }
+        let mut pins = std::iter::once(&self.vk_leaf).chain(self.steps.iter().flat_map(|s| [&s.program_digest, &s.key]));
+        if pins.any(|d| *d == [0; 4]) {
+            return Err("aggregation_tree has a zero digest (the activation placeholder)".into());
+        }
+        Ok(())
+    }
+}
+
+/// Step 4's count rule, by layout (tree Task 3b, 3a's I3): a flat aggregate covers at most
+/// `max_covers`; a tree exactly `L·2^d` with `1 ≤ d ≤ max_depth` ([`tree_depth`]) — its own
+/// section's cap, whatever `max_covers` says — and needs the section (`TreeNotAdmitted`; one
+/// whose step list is empty admits no tree). Integer work against genesis constants, run before
+/// the duplicate scan so an over-long cover list buys no quadratic work. The shape half of 6t
+/// (the section naming the covered shape) waits for the covered records.
+pub fn check_cover_count(
+    layout: AggregateLayout,
+    covers: usize,
+    cfg: &AggregationConfig,
+    tree: Option<&TreeConfig>,
+) -> Result<(), AggregationError> {
+    if covers == 0 {
+        return Err(AggregationError::EmptyCoverSet);
+    }
+    match layout {
+        AggregateLayout::Flat if covers > cfg.max_covers as usize => {
+            Err(AggregationError::TooManyCovers { got: covers, max: cfg.max_covers })
+        }
+        AggregateLayout::Flat => Ok(()),
+        AggregateLayout::Tree => {
+            let t = tree.filter(|t| !t.steps.is_empty()).ok_or(AggregationError::TreeNotAdmitted)?;
+            tree_depth(covers, t).map(|_| ())
+        }
+    }
+}
+
+/// The layout rule (spec §2): exactly `L·2^d` covers, `1 ≤ d ≤ max_depth`. Returns `d`.
+pub fn tree_depth(covers: usize, tree: &TreeConfig) -> Result<u32, AggregationError> {
+    let l = tree.leaf_size as usize;
+    let layout = AggregationError::TreeLayout { covers, leaf_size: tree.leaf_size };
+    if l == 0 || covers % l != 0 {
+        return Err(layout);
+    }
+    let leaves = covers / l;
+    if leaves < 2 || !leaves.is_power_of_two() {
+        return Err(layout);
+    }
+    let d = leaves.trailing_zeros();
+    if d > tree.max_depth as u32 {
+        return Err(AggregationError::TreeDepth { depth: d, max: tree.max_depth });
+    }
+    Ok(d)
+}
+
+/// Step 7b for a tree (AGG-6 per level): the root program — level `d`'s pinned digest, the last
+/// entry repeating — then every key a depth-`d` recompute uses, in circuits' `keys.at_level(j)`
+/// numbering (the level `j` that *consumes* the key): level 1 uses `vk_leaf`, level `j ≥ 2`
+/// uses level `j − 1`'s step key (`step_at(j − 1).key`), for `j` in `1..=d`. The rebuilt list is
+/// read at the pinned list's index. A rebuilt list with no entry for the root's level has no
+/// program, read as the zero digest (`AggregateProgramMismatch { built: [0; 4] }` — a pin no
+/// genesis can hold); one with no entry for a key's level is `TreeKeyPin { level: j }`.
+fn check_tree_pins(t: &TreeConfig, built: &TreeDigests, d: u32) -> Result<(), AggregationError> {
+    let pinned = t.step_at(d).program_digest;
+    let root = built.steps.get(t.step_index(d)).map_or([0; 4], |(program, _)| *program);
+    if root != pinned {
+        return Err(AggregationError::AggregateProgramMismatch { pinned, built: root });
+    }
+    if built.vk_leaf != t.vk_leaf {
+        return Err(AggregationError::TreeKeyPin { level: 1 });
+    }
+    for j in 2..=d {
+        let level = AggregationError::TreeKeyPin { level: j as u8 };
+        let (_, key) = built.steps.get(t.step_index(j - 1)).ok_or(level.clone())?;
+        if *key != t.step_at(j - 1).key {
+            return Err(level);
+        }
+    }
+    Ok(())
+}
+
 /// One row of the aggregator register (spec §2.1): the Dilithium2 key, the burned bond, the
 /// shielded payout, the action nonce, and the unbonding release height when set. The validator
 /// entry's twin, one role over.
@@ -116,7 +295,7 @@ use crate::crypto::Signature;
 use crate::gas;
 use crate::ledger::{Ledger, TxError};
 use crate::types::actions::{envelope_digest, AggregatorRegistration};
-use crate::types::{Action, Transaction};
+use crate::types::{Action, AggregateLayout, Transaction};
 
 /// Why an aggregation action was refused. Carried inside [`TxError::Aggregation`] so admission
 /// reports the module's own name for it — [`super::staking::StakingError`]'s role, one role over.
@@ -196,6 +375,38 @@ pub enum AggregationError {
     /// never cached: the aggregator re-seals (the proof does not commit to the payout).
     #[error("the aggregate's payout_total is {got}, the ledger pays {expected}: re-seal at the current schedule")]
     PayoutMismatch { expected: u64, got: u64 },
+    /// A `Tree` aggregate on a chain whose genesis has no `aggregation_tree` section for the
+    /// covered shape. A genesis constant, so a permanent verdict.
+    #[error("tree aggregates are not admitted for this shape: the genesis has no aggregation_tree section for it")]
+    TreeNotAdmitted,
+    /// A `Tree` aggregate whose cover count is not `L·2^d` with `d ≥ 1` (spec §2's layout rule).
+    #[error("a tree covers exactly L·2^d bundles: {covers} covers is no tree at leaf size {leaf_size}")]
+    TreeLayout { covers: usize, leaf_size: u8 },
+    /// A `Tree` aggregate deeper than the genesis `max_depth`.
+    #[error("a tree of depth {depth} is deeper than the genesis max_depth {max}")]
+    TreeDepth { depth: u32, max: u8 },
+    /// The root proof's declared tier is not the tier pinned for the root's level (R6).
+    #[error("the tree root declares tier {declared}; its level is pinned at tier {pinned}")]
+    TreeTier { declared: u8, pinned: u8 },
+    /// No key, or not the pinned key, for tree level `level` — numbered by the level that
+    /// *uses* the key, circuits' `keys.at_level(j)`: level 1 uses `vk_leaf`, level `j ≥ 2` uses
+    /// `steps[j − 2].key` (level `j − 1`'s step proofs' key, the last entry repeating). AGG-6's
+    /// rebuilt-key mismatch, or `verify_tree`'s level with no step key — one numbering for both.
+    #[error("tree level {level} has no key or not the pinned one")]
+    TreeKeyPin { level: u8 },
+    /// Covered bundle `index`'s public-value run is not a canonical run (`verify_tree` refuses
+    /// it before the recompute).
+    #[error("covered bundle {index}'s public values are not a canonical run")]
+    CoveredPublicValues { index: usize },
+    /// The tree's recomputed root digest is not the root proof's public words.
+    #[error("the tree's recomputed root digest is not the proof's")]
+    TreeRootDigest,
+    /// Step 7b could not rebuild the `aggregation_tree` section's programs and keys at all (an
+    /// executor without the rVM, a section the rVM cannot serve). The node's failure, never the
+    /// transaction's — so never a permanent verdict, as `TreeKeyPin` is not (final review m3). The
+    /// startup check refuses to start on such a section, so a running node cannot reach it.
+    #[error("this build cannot rebuild the aggregation_tree section: {0}")]
+    TreeRebuild(crate::confidential::ConfidentialError),
     #[error("arithmetic overflow")]
     Overflow,
 }
@@ -322,7 +533,7 @@ pub(super) fn apply(
 
 // ── the `Aggregate` itself: admission (spec §4) and apply (spec §5) ──────────────────────────
 
-use crate::confidential::ConfidentialExecutor;
+use crate::confidential::{ConfidentialError, ConfidentialExecutor};
 use crate::ledger::fees::{FeesConfig, UsdSubsidy};
 use crate::types::{pv, CoveredBundle};
 
@@ -521,6 +732,7 @@ pub(super) fn validate_aggregate(
     signature: &Signature,
     proof: &[u8],
     payout_total: u64,
+    layout: AggregateLayout,
     covered: &[CoveredBundle],
     executor: &dyn ConfidentialExecutor,
 ) -> Result<ValidatedAggregate, TxError> {
@@ -539,9 +751,11 @@ pub(super) fn validate_aggregate(
         return Err(TxError::WrongChain { expected: ledger.chain_id(), actual: tx.chain_id });
     }
     // 2. The aggregator: registered, not unbonding, the nonce the register expects, and the
-    //    signature over the action's signing hash — `signed_by`'s three, plus the bar.
+    //    signature over the action's signing hash — `signed_by`'s three, plus the bar. The
+    //    layout picks the message (tree aggregation R8): a `Tree` signs its own domain.
     let entry = signed_by(ledger, aggregator, nonce, signature, || {
-        ledger.binding_domain().aggregate_signing_hash(
+        ledger.binding_domain().aggregate_signing_hash_at(
+            layout,
             tx.chain_id,
             nonce,
             time,
@@ -561,12 +775,7 @@ pub(super) fn validate_aggregate(
     // 4. The cover set's ledger half: `1 ≤ covers ≤ max_covers`, no duplicates, and the node's
     //    covered records matching the set one for one. (Coverability itself — finalised,
     //    in-window, unsealed — is the node's half, spec §3.2.)
-    if covers.is_empty() {
-        return Err(AggregationError::EmptyCoverSet.into());
-    }
-    if covers.len() > cfg.max_covers as usize {
-        return Err(AggregationError::TooManyCovers { got: covers.len(), max: cfg.max_covers }.into());
-    }
+    check_cover_count(layout, covers.len(), cfg, ledger.aggregation_tree())?;
     for (i, cover) in covers.iter().enumerate() {
         if covers[..i].contains(cover) {
             return Err(AggregationError::DuplicateCover(*cover).into());
@@ -612,6 +821,20 @@ pub(super) fn validate_aggregate(
             return Err(AggregationError::CoveredShapeMismatch { cover: *cover, field, expected, actual }.into());
         }
     }
+    // 6t. The tree layout (tree aggregation spec §2): a `Tree` names the chain's tree section for
+    //     this shape, and the cover count is exactly L·2^d, 1 ≤ d ≤ max_depth. Integer work, before
+    //     step 7's compares and everything after. A section with no step list admits no tree
+    //     (genesis refuses one; this keeps `step_at` total).
+    let tree = match layout {
+        AggregateLayout::Flat => None,
+        AggregateLayout::Tree => {
+            let t = ledger
+                .aggregation_tree()
+                .filter(|t| t.shape == first.shape && !t.steps.is_empty())
+                .ok_or(AggregationError::TreeNotAdmitted)?;
+            Some((t, tree_depth(covers.len(), t)?))
+        }
+    };
     // 7. The chain-side half of the digest step: every covered bundle must be a proof of the
     //    registered guest — `HC0..7` equals its `hc`. The digest compare itself cannot catch a
     //    wrong-guest cover (a prover commits those very words), so the ledger pins it; the
@@ -626,7 +849,19 @@ pub(super) fn validate_aggregate(
     //     before 7b's program build (the interface review's INTERFACE-5): the tier gate used to
     //     live only inside step 8, so a proof at a tier this chain never admits first bought the
     //     program emission below. The executor re-checks it all in step 8.
-    executor.check_aggregate_header(proof).map_err(TxError::InvalidAggregateProof)?;
+    //     A tree's root is gated on its own level's pinned tier, exactly (R6): an honest root is
+    //     a fixed workload at that tier, so any other is refused before 7b's builds (AGG-3,
+    //     tightened); the flat path keeps `admitted_tiers`.
+    match tree {
+        None => executor.check_aggregate_header(proof).map_err(TxError::InvalidAggregateProof)?,
+        Some((t, d)) => {
+            let declared = executor.aggregate_proof_tier(proof).map_err(TxError::InvalidAggregateProof)?;
+            let pinned = t.step_at(d).heights.tier;
+            if declared != pinned {
+                return Err(AggregationError::TreeTier { declared, pinned }.into());
+            }
+        }
+    }
     // 7b. The genesis pin, enforced (audit v3, AGG-6). `admitted_shapes[i].aggregate_program_digest`
     //     is measured at activation and bound into the genesis hash, but nothing ever compared it
     //     with the program this build emits: `verify_aggregate` verifies against whatever
@@ -634,28 +869,50 @@ pub(super) fn validate_aggregate(
     //     — or the AGG-2 program change — would go unnoticed until two nodes disagreed on a block.
     //     Cheap (a DSL emission, no proof) and before the rVM verify, in this function's
     //     cheap-before-expensive order.
-    match executor.aggregate_program_digest(&first.shape) {
-        Ok(built) if built == admitted.aggregate_program_digest => {}
-        Ok(built) => {
-            return Err(AggregationError::AggregateProgramMismatch {
-                pinned: admitted.aggregate_program_digest,
-                built,
+    //     For a tree, per level: the root's program (level d's pin) and every key the depth
+    //     uses, rebuilt by the executor from the pinned heights ([`check_tree_pins`]).
+    if let Some((t, d)) = tree {
+        // Fail closed (review I2): `verify_tree` checks no pin, so an executor that cannot
+        // rebuild the tree's programs and keys refuses here, never reaching step 8 — as
+        // `TreeRebuild`, the node's failure, which the admission cache does not hold (final
+        // review m3; `InvalidAggregateProof` would be cached as a verdict on the bytes).
+        let built = executor.tree_digests(t).map_err(|e| TxError::Aggregation(AggregationError::TreeRebuild(e)))?;
+        check_tree_pins(t, &built, d)?;
+    } else {
+        match executor.aggregate_program_digest(&first.shape) {
+            Ok(built) if built == admitted.aggregate_program_digest => {}
+            Ok(built) => {
+                return Err(AggregationError::AggregateProgramMismatch {
+                    pinned: admitted.aggregate_program_digest,
+                    built,
+                }
+                .into())
             }
-            .into())
+            // An executor that cannot build the program at all (the stub, and any build without the
+            // rVM) says so through the proof step below, where it also says what it cannot do.
+            Err(_) => {}
         }
-        // An executor that cannot build the program at all (the stub, and any build without the
-        // rVM) says so through the proof step below, where it also says what it cannot do.
-        Err(_) => {}
     }
     // 8. The proof: the interface-list recompute and digest compare, then the rVM
     //    `Machine::verify` — the executor's pair, the one expensive step, last. The binding is
     //    this transaction's own `(chain, aggregator, nonce)` (audit v3, AGG-2), recomputed here
     //    and never read from the proof: the proof committed to its prover's triple, so a copy
     //    re-signed by another aggregator, or replayed at another nonce, does not verify.
+    //    A tree's is `verify_tree` at the depth 6t derived, its named refusals reported under
+    //    their ledger names (spec §4 Errors); every other refusal is the proof's.
     let binding = ledger.binding_domain().aggregate_binding(tx.chain_id, aggregator, nonce);
-    let outs = executor
-        .verify_aggregate(&first.shape, covered, proof, &binding)
-        .map_err(TxError::InvalidAggregateProof)?;
+    let verdict = match tree {
+        None => executor.verify_aggregate(&first.shape, covered, proof, &binding),
+        Some((t, d)) => executor.verify_tree(t, covered, proof, &binding, d),
+    };
+    let outs = verdict.map_err(|e| match e {
+        ConfidentialError::TreeRootDigest => TxError::Aggregation(AggregationError::TreeRootDigest),
+        ConfidentialError::TreeKeyPin { level } => TxError::Aggregation(AggregationError::TreeKeyPin { level }),
+        ConfidentialError::CoveredPublicValues { index } => {
+            TxError::Aggregation(AggregationError::CoveredPublicValues { index })
+        }
+        e => TxError::InvalidAggregateProof(e),
+    })?;
     Ok(ValidatedAggregate { covered: covered.to_vec(), payout_cm, outs })
 }
 
@@ -687,7 +944,8 @@ impl Ledger {
     /// register's entry, nonce, signature and unbonding bar (ZKQ-1). `validate_aggregate`
     /// re-runs all of it — this is a pre-screen, like the mempool's.
     pub fn preflight_aggregate(&self, tx: &Transaction) -> Result<(), TxError> {
-        let Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope, signature, payout_total } = &tx.action else {
+        let Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope, signature, payout_total, layout } = &tx.action
+        else {
             return Err(NOT_AGGREGATION);
         };
         let Some(cfg) = self.aggregation() else { return Err(NOT_AGGREGATION) };
@@ -708,19 +966,20 @@ impl Ledger {
         // ~1.2 MB record and saturated the admission workers. Step 4's count and duplicate rules,
         // then step 2's register, nonce, signature and unbonding bar: the same checks, in the
         // same order, that `validate_aggregate` re-runs.
-        if covers.is_empty() {
-            return Err(AggregationError::EmptyCoverSet.into());
-        }
-        if covers.len() > cfg.max_covers as usize {
-            return Err(AggregationError::TooManyCovers { got: covers.len(), max: cfg.max_covers }.into());
-        }
+        // Step 4's count rule by layout, with 6t's count half for a tree (a chain with no tree
+        // section, a count that is not L·2^d within max_depth): integer work against genesis
+        // constants, before the duplicate scan and before the register and the signature, so a
+        // stale nonce never hides the permanent verdict. The shape half — the section naming the
+        // covered shape — waits for the records.
+        check_cover_count(*layout, covers.len(), cfg, self.aggregation_tree())?;
         for (i, cover) in covers.iter().enumerate() {
             if covers[..i].contains(cover) {
                 return Err(AggregationError::DuplicateCover(*cover).into());
             }
         }
         let entry = signed_by(self, aggregator, *nonce, signature, || {
-            self.binding_domain().aggregate_signing_hash(
+            self.binding_domain().aggregate_signing_hash_at(
+                *layout,
                 tx.chain_id,
                 *nonce,
                 *time,
@@ -746,11 +1005,12 @@ impl Ledger {
         covered: &[CoveredBundle],
         executor: &dyn ConfidentialExecutor,
     ) -> Result<ValidatedAggregate, TxError> {
-        let Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope, signature, payout_total } = &tx.action else {
+        let Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope, signature, payout_total, layout } = &tx.action
+        else {
             return Err(NOT_AGGREGATION);
         };
         validate_aggregate(
-            self, tx, covers, aggregator, *nonce, *time, r, envelope, signature, proof, *payout_total, covered, executor,
+            self, tx, covers, aggregator, *nonce, *time, r, envelope, signature, proof, *payout_total, *layout, covered, executor,
         )
     }
 
@@ -1234,6 +1494,7 @@ mod tests {
                 envelope: env(),
                 signature: sig,
                 payout_total: 1_000,
+                layout: crate::types::AggregateLayout::Flat,
             },
         ];
         for a in &actions {
@@ -1314,6 +1575,7 @@ mod tests {
             proof_window_blocks: None,
             program_state: None,
             multisig: None,
+            aggregation_tree: None,
             incremental_nullifier_root: None,
             perps: None,
             hardening_v6: None,
@@ -1755,8 +2017,10 @@ mod admission_tests {
     use crate::ledger::staking::ValidatorEntry;
     use crate::ledger::{Ledger, TxError};
     use crate::notes::{word8_from_bytes, Bundle, Envelope, ShieldedAddress, Word8};
-    use crate::types::actions::{aggregate_binding, aggregator_register_message, aggregate_signing_hash, AggregatorRegistration};
-    use crate::types::{pv, Action, CoveredBundle, DeclaredShape, FriProfile, Transaction};
+    use crate::types::actions::{
+        aggregate_binding, aggregate_signing_hash, aggregate_tree_signing_hash, aggregator_register_message, AggregatorRegistration,
+    };
+    use crate::types::{pv, Action, AggregateLayout, BindingDomain, CoveredBundle, DeclaredShape, FriProfile, Transaction};
     use std::collections::BTreeMap;
 
     const HC: Word8 = [11; 8];
@@ -1871,13 +2135,32 @@ mod admission_tests {
     /// A well-formed aggregate transaction over `covers`; the stub executor accepts any proof
     /// but `b"reject"`.
     fn aggregate_tx(l: &Ledger, kp: &Keypair, nonce: u64, time: u32, covers: Vec<Hash>, proof: Vec<u8>) -> Transaction {
+        aggregate_tx_at(l, kp, nonce, time, covers, proof, AggregateLayout::Flat)
+    }
+
+    /// [`aggregate_tx`] at an explicit layout (tree aggregation R8): `Flat` signs
+    /// `aggregate_signing_hash`, as every aggregate always has, and `Tree` signs
+    /// `aggregate_tree_signing_hash`.
+    fn aggregate_tx_at(
+        l: &Ledger,
+        kp: &Keypair,
+        nonce: u64,
+        time: u32,
+        covers: Vec<Hash>,
+        proof: Vec<u8>,
+        layout: AggregateLayout,
+    ) -> Transaction {
         let aggregator = kp.public_key().address();
         let r = [9; 8];
         // The amount the ledger pays on `l` — what an honest aggregator seals and signs (0 when
         // the covers are not coverable: a test of a refusal earlier than the payment's).
         let payout_total = l.payout_total_for(&covers).unwrap_or(0);
+        let signing_hash = match layout {
+            AggregateLayout::Flat => aggregate_signing_hash,
+            AggregateLayout::Tree => aggregate_tree_signing_hash,
+        };
         let signature = kp.sign(
-            aggregate_signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof), &envelope_digest(&env()), payout_total).as_bytes(),
+            signing_hash(7, nonce, time, &r, &covers, &Hash::digest(&proof), &envelope_digest(&env()), payout_total).as_bytes(),
         );
         Transaction {
             chain_id: 7,
@@ -1892,6 +2175,7 @@ mod admission_tests {
                 envelope: env(),
                 signature,
                 payout_total,
+                layout,
             },
         }
     }
@@ -1924,7 +2208,7 @@ mod admission_tests {
         register(&mut l, &kp);
         // The synthetic covers in the ledger's coverable set (H1's block rule), excess-free.
         let p = proposer(&l);
-        for c in covers(4) {
+        for c in covers(16) {
             l.bucket_excess(c, 0, p, u64::MAX);
         }
         (l, kp)
@@ -2566,7 +2850,7 @@ mod admission_tests {
             Transaction {
                 chain_id: 7,
                 bundle: None,
-                action: Action::Aggregate { covers, proof, aggregator, nonce: 0, time: 100, r, envelope: env(), signature, payout_total },
+                action: Action::Aggregate { covers, proof, aggregator, nonce: 0, time: 100, r, envelope: env(), signature, payout_total, layout: crate::types::AggregateLayout::Flat },
             }
         };
         let covered = covered_records(&shape(), &[1, 2]);
@@ -2577,6 +2861,481 @@ mod admission_tests {
         let lifted = lb.validate_aggregate(&aggregate(&db, &da), &covered, &StubExecutor).map(|_| ());
         assert!(matches!(lifted, Err(TxError::InvalidAggregateProof(_))), "A's proof re-signed for B: {lifted:?}");
     }
+    // ── tree aggregation (circuits spec 2026-10-08 §4–§4.1, Task 3a) ─────────────────────────
+
+    /// One level's heights at the test profile (R7: tier 19), differing only in the reduce
+    /// table: level 1's step reduces at 2^16 and level 2's — the repeated last entry — at 2^17,
+    /// the measured R3 shapes.
+    fn level_heights(reduce_log_height: u8) -> RvmHeights {
+        RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height }
+    }
+
+    /// The test profile's tree section: L = 1, depth up to 3, and a two-entry step list, so a
+    /// depth-3 root runs on the repeated last entry.
+    fn tree_cfg() -> TreeConfig {
+        let d = StubExecutor.tree_digests_for_tests();
+        TreeConfig {
+            shape: shape(),
+            leaf_size: 1,
+            max_depth: 3,
+            leaf: level_heights(15),
+            vk_leaf: d.vk_leaf,
+            steps: vec![
+                TreeStepPin { heights: level_heights(16), program_digest: d.steps[0].0, key: d.steps[0].1 },
+                TreeStepPin { heights: level_heights(17), program_digest: d.steps[1].0, key: d.steps[1].1 },
+            ],
+        }
+    }
+
+    /// `setup`, on a chain whose cover cap admits sixteen and whose genesis carries [`tree_cfg`].
+    fn tree_setup() -> (Ledger, Keypair) {
+        let (mut l, kp) = setup();
+        let mut cfg = l.aggregation().expect("gated").clone();
+        cfg.max_covers = 16;
+        l.set_aggregation(Some(cfg));
+        l.set_aggregation_tree(Some(tree_cfg()));
+        (l, kp)
+    }
+
+    /// A tree aggregate over the first `n` covers, its stub root declaring `tier` and `depth`,
+    /// made under `l`'s own binding for the aggregator at nonce 0.
+    fn tree_tx(l: &Ledger, kp: &Keypair, n: usize, tier: u8, depth: u8) -> Transaction {
+        let binding = l.binding_domain().aggregate_binding(7, &kp.public_key().address(), 0);
+        aggregate_tx_at(l, kp, 0, 100, covers(n), StubExecutor::make_tree_proof(tier, depth, &binding), AggregateLayout::Tree)
+    }
+
+    fn tags(n: usize) -> Vec<u8> {
+        (1..=n as u8).collect()
+    }
+
+    /// Validate `tree_tx(n, tier, depth)` against the honest covered records.
+    fn tree_at(l: &Ledger, kp: &Keypair, n: usize, tier: u8, depth: u8, ex: &dyn ConfidentialExecutor) -> Result<ValidatedAggregate, TxError> {
+        l.validate_aggregate(&tree_tx(l, kp, n, tier, depth), &covered_records(&shape(), &tags(n)), ex)
+    }
+
+    /// The stub, with the tree hooks observable: step 7b's rebuild counted and optionally cut
+    /// short (`steps` entries kept), and `verify_tree`'s verdict optionally replaced.
+    struct TreeProbe {
+        builds: std::sync::atomic::AtomicUsize,
+        verifies: std::sync::atomic::AtomicUsize,
+        keep_steps: Option<usize>,
+        digests_fail: bool,
+        verdict: Option<ConfidentialError>,
+    }
+
+    impl TreeProbe {
+        fn new() -> Self {
+            TreeProbe {
+                builds: std::sync::atomic::AtomicUsize::new(0),
+                verifies: std::sync::atomic::AtomicUsize::new(0),
+                keep_steps: None,
+                digests_fail: false,
+                verdict: None,
+            }
+        }
+        fn builds(&self) -> usize {
+            self.builds.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn verifies(&self) -> usize {
+            self.verifies.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ConfidentialExecutor for TreeProbe {
+        fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
+            StubExecutor.check_program(base_pc, words)
+        }
+        fn verify_call(&self, program: &crate::program::ProgramRecord, proof: &[u8]) -> Result<crate::program::CallOutcome, ConfidentialError> {
+            StubExecutor.verify_call(program, proof)
+        }
+        fn public_digest(&self, words: &[u32]) -> Word8 {
+            StubExecutor.public_digest(words)
+        }
+        fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
+            StubExecutor.node_hash(left, right)
+        }
+        fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+            StubExecutor.hash_domain(domain, msg)
+        }
+        fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
+            StubExecutor.note_commitment(pk, from, amount, asset, time, r)
+        }
+        fn bundle_digest(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+            StubExecutor.bundle_digest(input)
+        }
+        fn bundle_digest_v3(&self, input: &crate::notes::BundleDigestInput) -> Word8 {
+            StubExecutor.bundle_digest_v3(input)
+        }
+        fn bundle_proof_digest(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.bundle_proof_digest(hc_bundle, proof)
+        }
+        fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.auth_proof_digest(proof)
+        }
+        fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.verify_auth(hc_auth, proof, binding)
+        }
+        fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            StubExecutor.bundle_gas_limit(proof)
+        }
+        fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            StubExecutor.auth_gas_limit(proof)
+        }
+        fn verify_bundle(&self, hc: &Word8, proof: &[u8], binding: &[u32; crate::types::TX_BINDING_WORDS]) -> Result<(), ConfidentialError> {
+            StubExecutor.verify_bundle(hc, proof, binding)
+        }
+        fn aggregate_program_digest(&self, shape: &DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
+            StubExecutor.aggregate_program_digest(shape)
+        }
+        fn verify_aggregate(&self, shape: &DeclaredShape, covered: &[CoveredBundle], proof: &[u8], binding: &[u32; 8]) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+            StubExecutor.verify_aggregate(shape, covered, proof, binding)
+        }
+        fn aggregate_proof_tier(&self, proof: &[u8]) -> Result<u8, ConfidentialError> {
+            StubExecutor.aggregate_proof_tier(proof)
+        }
+        fn tree_digests(&self, tree: &TreeConfig) -> Result<TreeDigests, ConfidentialError> {
+            self.builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.digests_fail {
+                return Err(ConfidentialError::AggregationUnsupported);
+            }
+            let mut d = StubExecutor.tree_digests(tree)?;
+            if let Some(n) = self.keep_steps {
+                d.steps.truncate(n);
+            }
+            Ok(d)
+        }
+        fn verify_tree(&self, tree: &TreeConfig, covered: &[CoveredBundle], proof: &[u8], binding: &[u32; 8], depth: u32) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+            self.verifies.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match &self.verdict {
+                Some(e) => Err(e.clone()),
+                None => StubExecutor.verify_tree(tree, covered, proof, binding, depth),
+            }
+        }
+    }
+
+    /// Spec §2's layout rule, each boundary by name and before any executor call: a tree covers
+    /// exactly `L·2^d` bundles, `1 ≤ d ≤ max_depth`, on a chain whose `aggregation_tree` names
+    /// the covered shape. The flat path beside it is unchanged.
+    #[test]
+    fn tree_layout_boundaries_are_named() {
+        let (l, kp) = tree_setup();
+        assert!(tree_cfg().check(l.aggregation().unwrap()).is_ok(), "the fixture is a genesis-valid section");
+        assert!(tree_at(&l, &kp, 2, 19, 1, &StubExecutor).is_ok(), "L·2^1");
+        assert!(tree_at(&l, &kp, 4, 19, 2, &StubExecutor).is_ok(), "L·2^2");
+        assert!(tree_at(&l, &kp, 8, 19, 3, &StubExecutor).is_ok(), "L·2^max_depth, on the repeated last step");
+        let probe = TreeProbe::new();
+        let r = tree_at(&l, &kp, 16, 19, 4, &probe);
+        assert!(matches!(r, Err(TxError::Aggregation(AggregationError::TreeDepth { depth: 4, max: 3 }))), "{r:?}");
+        for n in [1usize, 3, 5, 6, 12] {
+            let r = tree_at(&l, &kp, n, 19, 1, &probe);
+            assert!(
+                matches!(r, Err(TxError::Aggregation(AggregationError::TreeLayout { covers, leaf_size: 1 })) if covers == n),
+                "{n} covers: {r:?}"
+            );
+        }
+        assert_eq!(probe.builds(), 0, "a layout refusal buys no program build");
+        // Flat is today's path, beside a tree section: two covers, a flat proof.
+        assert!(l.validate_aggregate(&aggregate_tx(&l, &kp, 0, 100, covers(2), b"ok".to_vec()), &covered_records(&shape(), &[1, 2]), &StubExecutor).is_ok());
+        // No section, or a section for another shape: the tree is not admitted.
+        let (mut ungated, kp2) = tree_setup();
+        ungated.set_aggregation_tree(None);
+        assert!(matches!(tree_at(&ungated, &kp2, 2, 19, 1, &StubExecutor), Err(TxError::Aggregation(AggregationError::TreeNotAdmitted))));
+        let mut elsewhere = tree_cfg();
+        elsewhere.shape.mem_log_height += 1;
+        ungated.set_aggregation_tree(Some(elsewhere));
+        assert!(matches!(tree_at(&ungated, &kp2, 2, 19, 1, &StubExecutor), Err(TxError::Aggregation(AggregationError::TreeNotAdmitted))));
+    }
+
+    /// `tree_depth` at a leaf of two: whole leaves only, at least two of them, a power of two.
+    #[test]
+    fn tree_depth_counts_whole_leaves_in_powers_of_two() {
+        let mut t = tree_cfg();
+        t.leaf_size = 2;
+        assert_eq!(tree_depth(4, &t), Ok(1));
+        assert_eq!(tree_depth(8, &t), Ok(2));
+        assert_eq!(tree_depth(16, &t), Ok(3));
+        assert_eq!(tree_depth(32, &t), Err(AggregationError::TreeDepth { depth: 4, max: 3 }));
+        for n in [0usize, 1, 2, 3, 5, 6, 12] {
+            assert_eq!(tree_depth(n, &t), Err(AggregationError::TreeLayout { covers: n, leaf_size: 2 }), "{n}");
+        }
+    }
+
+    /// R6, per level: the root's declared tier must be exactly the tier pinned for the root's
+    /// level (`step_at(depth)`, the last entry repeating), and a mismatch is refused before 7b
+    /// builds anything.
+    #[test]
+    fn a_tree_root_at_another_tier_is_refused_before_any_build() {
+        let (mut l, kp) = tree_setup();
+        let probe = TreeProbe::new();
+        let r = tree_at(&l, &kp, 2, 20, 1, &probe);
+        assert!(matches!(r, Err(TxError::Aggregation(AggregationError::TreeTier { declared: 20, pinned: 19 }))), "{r:?}");
+        assert_eq!(probe.builds(), 0, "the tier gate runs before 7b's rebuild");
+        // Level 2 pinned at tier 20: depth 2 and depth 3 (the repeat) take it, depth 1 keeps 19.
+        let mut t = tree_cfg();
+        t.steps[1].heights.tier = 20;
+        l.set_aggregation_tree(Some(t));
+        assert!(tree_at(&l, &kp, 2, 19, 1, &StubExecutor).is_ok());
+        assert!(tree_at(&l, &kp, 4, 20, 2, &StubExecutor).is_ok());
+        assert!(tree_at(&l, &kp, 8, 20, 3, &StubExecutor).is_ok());
+        let r = tree_at(&l, &kp, 4, 19, 2, &StubExecutor);
+        assert!(matches!(r, Err(TxError::Aggregation(AggregationError::TreeTier { declared: 19, pinned: 20 }))), "{r:?}");
+        // A root whose header does not decode is the proof's own refusal.
+        let junk = aggregate_tx_at(&l, &kp, 0, 100, covers(2), b"junk".to_vec(), AggregateLayout::Tree);
+        let r = l.validate_aggregate(&junk, &covered_records(&shape(), &[1, 2]), &StubExecutor);
+        assert!(matches!(r, Err(TxError::InvalidAggregateProof(ConfidentialError::MalformedProof))), "{r:?}");
+    }
+
+    /// Step 7b per level (AGG-6): the root program is level `d`'s pinned digest, and the keys
+    /// compared are exactly the ones a depth-`d` recompute uses — `vk_leaf` (level 0), then each
+    /// level `1..d`'s step key — so a wrong pin refuses the depths that use it and no other.
+    #[test]
+    fn the_tree_pins_are_checked_per_level() {
+        let (mut l, kp) = tree_setup();
+        let d = StubExecutor.tree_digests_for_tests();
+        let with = |l: &mut Ledger, f: &dyn Fn(&mut TreeConfig)| {
+            let mut t = tree_cfg();
+            f(&mut t);
+            l.set_aggregation_tree(Some(t));
+        };
+        let key = |r: Result<ValidatedAggregate, TxError>| match r {
+            Err(TxError::Aggregation(AggregationError::TreeKeyPin { level })) => Some(level),
+            Ok(_) => None,
+            other => panic!("{other:?}"),
+        };
+        // `TreeKeyPin.level` is the level that *uses* the key, circuits' `keys.at_level(j)`
+        // numbering: vk_leaf is level 1's, `steps[k − 1].key` level k + 1's.
+        // vk_leaf: level 1 uses it, so every depth.
+        with(&mut l, &|t| t.vk_leaf = [0xdead; 4]);
+        assert_eq!(key(tree_at(&l, &kp, 2, 19, 1, &StubExecutor)), Some(1));
+        assert_eq!(key(tree_at(&l, &kp, 8, 19, 3, &StubExecutor)), Some(1));
+        // Level 1's step key (`vk_t_leaf`): level 2 uses it, so depth ≥ 2 only.
+        with(&mut l, &|t| t.steps[0].key = [0xdead; 4]);
+        assert_eq!(key(tree_at(&l, &kp, 2, 19, 1, &StubExecutor)), None);
+        assert_eq!(key(tree_at(&l, &kp, 4, 19, 2, &StubExecutor)), Some(2));
+        // Level 2's step key (the last entry): level 3 uses it, so depth 3 only.
+        with(&mut l, &|t| t.steps[1].key = [0xdead; 4]);
+        assert_eq!(key(tree_at(&l, &kp, 4, 19, 2, &StubExecutor)), None);
+        assert_eq!(key(tree_at(&l, &kp, 8, 19, 3, &StubExecutor)), Some(3));
+        // Level 1's program: the root of a depth-1 tree only.
+        with(&mut l, &|t| t.steps[0].program_digest = [0xbeef; 4]);
+        let r = tree_at(&l, &kp, 2, 19, 1, &StubExecutor);
+        assert!(
+            matches!(r, Err(TxError::Aggregation(AggregationError::AggregateProgramMismatch { pinned, built })) if pinned == [0xbeef; 4] && built == d.steps[0].0),
+            "{r:?}"
+        );
+        assert!(tree_at(&l, &kp, 4, 19, 2, &StubExecutor).is_ok());
+        // Level 2's program: depth 2 and, repeating, depth 3.
+        with(&mut l, &|t| t.steps[1].program_digest = [0xbeef; 4]);
+        assert!(tree_at(&l, &kp, 2, 19, 1, &StubExecutor).is_ok());
+        for (n, depth) in [(4usize, 2u8), (8, 3)] {
+            let r = tree_at(&l, &kp, n, 19, depth, &StubExecutor);
+            assert!(matches!(r, Err(TxError::Aggregation(AggregationError::AggregateProgramMismatch { pinned, .. })) if pinned == [0xbeef; 4]), "{r:?}");
+        }
+        // An executor that rebuilt no entry for the root's level: no program, which reads as the
+        // zero digest — a pin no genesis can hold (`check` refuses zero) — so a mismatch.
+        l.set_aggregation_tree(Some(tree_cfg()));
+        let short = TreeProbe { keep_steps: Some(1), ..TreeProbe::new() };
+        assert!(tree_at(&l, &kp, 2, 19, 1, &short).is_ok());
+        let r = tree_at(&l, &kp, 4, 19, 2, &short);
+        assert!(
+            matches!(r, Err(TxError::Aggregation(AggregationError::AggregateProgramMismatch { pinned, built: [0, 0, 0, 0] })) if pinned == d.steps[1].0),
+            "{r:?}"
+        );
+        assert_eq!(short.verifies(), 1, "only the depth-1 tree reached verify_tree");
+    }
+
+    /// 7b fails closed on the tree path (review I2): an executor that cannot rebuild the tree's
+    /// programs and keys refuses the aggregate, and `verify_tree` — which checks no pin — is never
+    /// called. The refusal is `TreeRebuild`, the node's own failure (final review m3), not
+    /// `InvalidAggregateProof`: the admission cache holds the latter permanently, and a build
+    /// that cannot serve the genesis is no verdict on the transaction (`TreeKeyPin`'s rationale).
+    /// (The flat path's fall-through is the stub's and rVM-less builds', whose
+    /// `verify_aggregate` then refuses anyway.)
+    #[test]
+    fn a_tree_whose_pins_cannot_be_rebuilt_is_refused_before_verify_tree() {
+        let (l, kp) = tree_setup();
+        let probe = TreeProbe { digests_fail: true, ..TreeProbe::new() };
+        let r = tree_at(&l, &kp, 2, 19, 1, &probe);
+        assert!(
+            matches!(r, Err(TxError::Aggregation(AggregationError::TreeRebuild(ConfidentialError::AggregationUnsupported)))),
+            "{r:?}"
+        );
+        assert_eq!((probe.builds(), probe.verifies()), (1, 0));
+    }
+
+    /// A tree section with no step list (genesis refuses one; `set_aggregation_tree` does not)
+    /// admits no tree, at admission and at the pre-screen — and never reaches `step_at`'s panic.
+    #[test]
+    fn an_empty_step_list_admits_no_tree() {
+        let (mut l, kp) = tree_setup();
+        let mut t = tree_cfg();
+        t.steps.clear();
+        l.set_aggregation_tree(Some(t));
+        let tx = tree_tx(&l, &kp, 2, 19, 1);
+        assert!(matches!(l.preflight_aggregate(&tx), Err(TxError::Aggregation(AggregationError::TreeNotAdmitted))));
+        assert!(matches!(
+            l.validate_aggregate(&tx, &covered_records(&shape(), &[1, 2]), &StubExecutor),
+            Err(TxError::Aggregation(AggregationError::TreeNotAdmitted))
+        ));
+    }
+
+    /// The recompute's refusals reach the ledger as `TreeRootDigest`: the stub models a root made
+    /// at another depth or under another binding (a re-signed or replayed tree).
+    #[test]
+    fn a_root_the_recompute_refuses_is_tree_root_digest() {
+        let (l, kp) = tree_setup();
+        let binding = l.binding_domain().aggregate_binding(7, &kp.public_key().address(), 0);
+        let lying = aggregate_tx_at(&l, &kp, 0, 100, covers(4), StubExecutor::make_tree_proof(19, 1, &binding), AggregateLayout::Tree);
+        let r = l.validate_aggregate(&lying, &covered_records(&shape(), &tags(4)), &StubExecutor);
+        assert!(matches!(r, Err(TxError::Aggregation(AggregationError::TreeRootDigest))), "{r:?}");
+        let other = aggregate_tx_at(&l, &kp, 0, 100, covers(2), StubExecutor::make_tree_proof(19, 1, &[9; 8]), AggregateLayout::Tree);
+        let r = l.validate_aggregate(&other, &covered_records(&shape(), &[1, 2]), &StubExecutor);
+        assert!(matches!(r, Err(TxError::Aggregation(AggregationError::TreeRootDigest))), "{r:?}");
+        // And the honest root returns each covered bundle's OUT words, in cover order.
+        let ok = tree_at(&l, &kp, 4, 19, 2, &StubExecutor).unwrap();
+        assert_eq!(ok.outs.len(), 4);
+        assert_eq!(ok.outs[3][0], 400);
+    }
+
+    /// `verify_tree`'s other named verdicts map to their ledger names (spec §4 Errors): a covered
+    /// run that is not canonical is `CoveredPublicValues { index }` (refused before the
+    /// recompute, so the short or aliased run never reaches it), and a level with no step key is
+    /// `TreeKeyPin { level }`. Any other refusal stays the proof's own.
+    #[test]
+    fn verify_trees_named_refusals_keep_their_names() {
+        let (l, kp) = tree_setup();
+        let mut covered = covered_records(&shape(), &[1, 2]);
+        covered[1].public_values[pv::OUT0 + 3] = 1 << 32;
+        let r = l.validate_aggregate(&tree_tx(&l, &kp, 2, 19, 1), &covered, &StubExecutor);
+        assert!(matches!(r, Err(TxError::Aggregation(AggregationError::CoveredPublicValues { index: 1 }))), "{r:?}");
+        let probe = TreeProbe { verdict: Some(ConfidentialError::TreeKeyPin { level: 2 }), ..TreeProbe::new() };
+        assert!(matches!(tree_at(&l, &kp, 8, 19, 3, &probe), Err(TxError::Aggregation(AggregationError::TreeKeyPin { level: 2 }))));
+        let probe = TreeProbe { verdict: Some(ConfidentialError::InvalidAggregateProof("quotient identity[0]".into())), ..TreeProbe::new() };
+        assert!(matches!(tree_at(&l, &kp, 2, 19, 1, &probe), Err(TxError::InvalidAggregateProof(ConfidentialError::InvalidAggregateProof(_)))));
+    }
+
+    /// R8: the layout is signed. Flipping it on a signed transaction breaks the signature — at
+    /// admission and at the node's pre-screen — and a `Flat` aggregate's signing hash is today's,
+    /// byte for byte.
+    #[test]
+    fn the_layout_is_signed_and_flat_signs_as_before() {
+        let (l, kp) = tree_setup();
+        let mut tx = tree_tx(&l, &kp, 2, 19, 1);
+        assert!(l.preflight_aggregate(&tx).is_ok());
+        if let Action::Aggregate { layout, .. } = &mut tx.action {
+            *layout = AggregateLayout::Flat;
+        }
+        assert!(matches!(l.preflight_aggregate(&tx), Err(TxError::Aggregation(AggregationError::BadSignature))));
+        assert!(matches!(
+            l.validate_aggregate(&tx, &covered_records(&shape(), &[1, 2]), &StubExecutor),
+            Err(TxError::Aggregation(AggregationError::BadSignature))
+        ));
+        let mut flat = aggregate_tx(&l, &kp, 0, 100, covers(2), b"ok".to_vec());
+        if let Action::Aggregate { layout, .. } = &mut flat.action {
+            *layout = AggregateLayout::Tree;
+        }
+        assert!(matches!(l.preflight_aggregate(&flat), Err(TxError::Aggregation(AggregationError::BadSignature))));
+        let (r, c, p, e) = ([9; 8], covers(2), Hash::digest(b"p"), envelope_digest(&env()));
+        let a = aggregate_signing_hash(7, 0, 100, &r, &c, &p, &e, 5);
+        assert_eq!(a, BindingDomain::ChainId.aggregate_signing_hash(7, 0, 100, &r, &c, &p, &e, 5));
+        assert_ne!(a, BindingDomain::ChainId.aggregate_tree_signing_hash(7, 0, 100, &r, &c, &p, &e, 5));
+        assert_eq!(aggregate_tree_signing_hash(7, 0, 100, &r, &c, &p, &e, 5), BindingDomain::ChainId.aggregate_tree_signing_hash(7, 0, 100, &r, &c, &p, &e, 5));
+        let g = BindingDomain::Genesis(Hash([0xa; 32]));
+        assert_ne!(g.aggregate_signing_hash(7, 0, 100, &r, &c, &p, &e, 5), g.aggregate_tree_signing_hash(7, 0, 100, &r, &c, &p, &e, 5));
+    }
+
+    /// The node's pre-screen refuses a tree the chain cannot admit by its count alone, before a
+    /// single cover is read from the store: no section, or a count that is not `L·2^d`.
+    #[test]
+    fn preflight_refuses_a_tree_by_its_count() {
+        let (mut l, kp) = tree_setup();
+        assert!(matches!(l.preflight_aggregate(&tree_tx(&l, &kp, 3, 19, 1)), Err(TxError::Aggregation(AggregationError::TreeLayout { covers: 3, leaf_size: 1 }))));
+        assert!(matches!(l.preflight_aggregate(&tree_tx(&l, &kp, 16, 19, 4)), Err(TxError::Aggregation(AggregationError::TreeDepth { depth: 4, max: 3 }))));
+        // Integer work against genesis constants, before the register and the signature (review
+        // M3): a stale nonce does not hide the permanent verdict.
+        let binding = l.binding_domain().aggregate_binding(7, &kp.public_key().address(), 5);
+        let stale = aggregate_tx_at(&l, &kp, 5, 100, covers(3), StubExecutor::make_tree_proof(19, 1, &binding), AggregateLayout::Tree);
+        assert!(matches!(l.preflight_aggregate(&stale), Err(TxError::Aggregation(AggregationError::TreeLayout { covers: 3, leaf_size: 1 }))));
+        l.set_aggregation_tree(None);
+        assert!(matches!(l.preflight_aggregate(&tree_tx(&l, &kp, 2, 19, 1)), Err(TxError::Aggregation(AggregationError::TreeNotAdmitted))));
+    }
+
+    /// The cover cap is the layout's (tree Task 3b, 3a's deferred I3): flat keeps `max_covers`
+    /// (today's semantics, under the rVM's flat N ceiling), a tree is bounded by its own section
+    /// (`L·2^max_depth`), not by `max_covers` — at preflight and at validate alike. A tree's count
+    /// is judged before the duplicate scan, so an over-long tree buys no quadratic work.
+    #[test]
+    fn the_cover_cap_is_the_layouts() {
+        let (mut l, kp) = tree_setup();
+        let mut cfg = l.aggregation().unwrap().clone();
+        cfg.max_covers = 3;
+        l.set_aggregation(Some(cfg.clone()));
+        assert!(tree_cfg().check(&cfg).is_ok(), "L·2^3 = 8 over max_covers 3 is a valid section");
+        assert!(l.preflight_aggregate(&tree_tx(&l, &kp, 8, 19, 3)).is_ok(), "eight covers as a tree, at preflight");
+        assert!(tree_at(&l, &kp, 8, 19, 3, &StubExecutor).is_ok(), "and at validate");
+        let too_many = |r: Result<_, TxError>| matches!(r, Err(TxError::Aggregation(AggregationError::TooManyCovers { got: 4, max: 3 })));
+        let flat4 = aggregate_tx(&l, &kp, 0, 100, covers(4), b"ok".to_vec());
+        assert!(too_many(l.preflight_aggregate(&flat4).map(|_| ())), "flat keeps max_covers");
+        assert!(too_many(l.validate_aggregate(&flat4, &covered_records(&shape(), &tags(4)), &StubExecutor).map(|_| ())));
+        let depth = |r: Result<_, TxError>| matches!(r, Err(TxError::Aggregation(AggregationError::TreeDepth { depth: 4, max: 3 })));
+        assert!(depth(l.preflight_aggregate(&tree_tx(&l, &kp, 16, 19, 4)).map(|_| ())), "past its section, by name");
+        assert!(depth(tree_at(&l, &kp, 16, 19, 4, &StubExecutor).map(|_| ())));
+        let mut dup = covers(16);
+        dup[15] = dup[0];
+        let binding = l.binding_domain().aggregate_binding(7, &kp.public_key().address(), 0);
+        let long = aggregate_tx_at(&l, &kp, 0, 100, dup, StubExecutor::make_tree_proof(19, 4, &binding), AggregateLayout::Tree);
+        assert!(depth(l.preflight_aggregate(&long).map(|_| ())), "the count before the duplicate scan");
+        assert!(depth(l.validate_aggregate(&long, &covered_records(&shape(), &tags(16)), &StubExecutor).map(|_| ())));
+    }
+
+    /// `TreeConfig::check`, the genesis-time bounds, one refusal each (R2–R4 as lists).
+    #[test]
+    fn a_tree_section_out_of_bounds_is_refused_by_check() {
+        let (l, _) = tree_setup();
+        let cfg = l.aggregation().unwrap().clone();
+        let bad = |f: &dyn Fn(&mut TreeConfig)| {
+            let mut t = tree_cfg();
+            f(&mut t);
+            t.check(&cfg)
+        };
+        assert!(bad(&|_| {}).is_ok());
+        assert!(bad(&|t| t.steps.clear()).is_err(), "an empty step list");
+        assert!(bad(&|t| { t.max_depth = 1; }).is_err(), "more steps than levels");
+        assert!(bad(&|t| { t.max_depth = 2; }).is_ok(), "as many steps as levels");
+        assert!(bad(&|t| t.leaf_size = 0).is_err());
+        assert!(bad(&|t| t.leaf_size = TreeConfig::MAX_LEAF + 1).is_err());
+        assert!(bad(&|t| t.max_depth = 0).is_err());
+        assert!(bad(&|t| t.max_depth = TreeConfig::MAX_DEPTH + 1).is_err());
+        assert!(bad(&|t| t.max_depth = 5).is_ok(), "L·2^5 = 32 over max_covers 16: a tree is bounded by its section (I3)");
+        assert!(bad(&|t| t.vk_leaf = [0; 4]).is_err());
+        assert!(bad(&|t| t.steps[1].program_digest = [0; 4]).is_err());
+        assert!(bad(&|t| t.steps[0].key = [0; 4]).is_err());
+        assert!(bad(&|t| t.shape.tier += 1).is_err(), "a shape no admitted shape is");
+        // The two constant bounds alone (review M4): under a cover cap that refuses neither.
+        let mut roomy = cfg.clone();
+        roomy.max_covers = 4096;
+        let only = |f: &dyn Fn(&mut TreeConfig)| {
+            let mut t = tree_cfg();
+            f(&mut t);
+            t.check(&roomy)
+        };
+        assert!(only(&|t| { t.leaf_size = TreeConfig::MAX_LEAF; t.max_depth = TreeConfig::MAX_DEPTH; }).is_ok(), "5·2^8 = 1280 fits");
+        let e = only(&|t| t.leaf_size = TreeConfig::MAX_LEAF + 1).unwrap_err();
+        assert!(e.contains("leaf_size"), "{e}");
+        let e = only(&|t| t.max_depth = TreeConfig::MAX_DEPTH + 1).unwrap_err();
+        assert!(e.contains("max_depth"), "{e}");
+    }
+
+    /// `step_at` reads level `k`'s entry, the last one repeating for every deeper level.
+    #[test]
+    fn step_at_repeats_the_last_entry() {
+        let t = tree_cfg();
+        assert_eq!(t.step_at(1).heights.reduce_log_height, 16);
+        assert_eq!(t.step_at(2).heights.reduce_log_height, 17);
+        assert_eq!(t.step_at(3), t.step_at(2));
+        assert_eq!(t.step_at(8), &t.steps[1]);
+    }
+
 }
 
 // ── Task 5: the subsidy, the proving share, and the supply audit ─────────────────────────────
@@ -2718,7 +3477,7 @@ mod payment_tests {
         Transaction {
             chain_id: 7,
             bundle: None,
-            action: Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope: env(), signature, payout_total },
+            action: Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope: env(), signature, payout_total, layout: crate::types::AggregateLayout::Flat },
         }
     }
 

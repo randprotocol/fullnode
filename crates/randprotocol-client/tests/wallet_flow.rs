@@ -113,6 +113,7 @@ fn genesis_full(
         proof_window_blocks: None,
         program_state: None,
         multisig: None,
+        aggregation_tree: None,
         incremental_nullifier_root: None,
         perps: None,
         hardening_v6: None,

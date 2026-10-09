@@ -247,6 +247,58 @@ impl BindingDomain {
             ),
         }
     }
+
+    /// [`actions::aggregate_tree_signing_hash`] (`rand-aggregate-tree-1`, tree aggregation R8);
+    /// genesis-bound under `rand-aggregate-tree-2` — its own tag, as every genesis-bound form here
+    /// has one apart from its chain-id twin's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn aggregate_tree_signing_hash(
+        &self,
+        chain_id: u64,
+        nonce: u64,
+        time: u32,
+        r: &Word8,
+        covers: &[Hash],
+        proof_hash: &Hash,
+        envelope_digest: &Hash,
+        payout_total: u64,
+    ) -> Hash {
+        match self {
+            BindingDomain::ChainId => {
+                actions::aggregate_tree_signing_hash(chain_id, nonce, time, r, covers, proof_hash, envelope_digest, payout_total)
+            }
+            BindingDomain::Genesis(g) => Self::bound(
+                b"rand-aggregate-tree-2",
+                g,
+                &(chain_id, nonce, time, r, covers, proof_hash, envelope_digest, payout_total),
+            ),
+        }
+    }
+
+    /// The signing hash for an aggregate at `layout`: [`Self::aggregate_signing_hash`] for
+    /// `Flat`, [`Self::aggregate_tree_signing_hash`] for `Tree` — the one choice admission makes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn aggregate_signing_hash_at(
+        &self,
+        layout: crate::types::AggregateLayout,
+        chain_id: u64,
+        nonce: u64,
+        time: u32,
+        r: &Word8,
+        covers: &[Hash],
+        proof_hash: &Hash,
+        envelope_digest: &Hash,
+        payout_total: u64,
+    ) -> Hash {
+        match layout {
+            crate::types::AggregateLayout::Flat => {
+                self.aggregate_signing_hash(chain_id, nonce, time, r, covers, proof_hash, envelope_digest, payout_total)
+            }
+            crate::types::AggregateLayout::Tree => {
+                self.aggregate_tree_signing_hash(chain_id, nonce, time, r, covers, proof_hash, envelope_digest, payout_total)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -319,6 +371,12 @@ mod tests {
             assert_eq!(got.to_hex(), *want, "message {i}");
         }
         assert_eq!(words(d.aggregate_binding(13, &a, 1)), "3fa1eee2c5ddeb21ef05dcab09e22f46c99e6a9063229c82573348a22fc415eb");
+        // Tree aggregation (R8): a `Tree` aggregate's message, new under `rand-aggregate-tree-1`.
+        // Pinned so a change to it is a decision; it is no message chain 18 ever signed.
+        assert_eq!(
+            d.aggregate_tree_signing_hash(13, 1, 9, &[3; 8], &[Hash([7; 32])], &Hash([8; 32]), &Hash([9; 32]), 1_000).to_hex(),
+            "5b122d647d231ab739e0e28a8261088f942427fe0995d668458c0b46b828a182"
+        );
     }
 
     /// BIND-1: under `Genesis`, every binding and every message moves with the genesis hash — two
@@ -348,6 +406,7 @@ mod tests {
                 d.aggregator_withdraw_message(13, &a, 1, 9, &[3; 8], &env()).to_hex(),
                 d.aggregate_signing_hash(13, 1, 9, &[3; 8], &[Hash([7; 32])], &Hash([8; 32]), &Hash([9; 32]), 1_000).to_hex(),
                 words(d.aggregate_binding(13, &a, 1)),
+                d.aggregate_tree_signing_hash(13, 1, 9, &[3; 8], &[Hash([7; 32])], &Hash([8; 32]), &Hash([9; 32]), 1_000).to_hex(),
             ]
         };
         let (on_a, on_b, plain) = (all(&ga), all(&gb), all(&v0));
@@ -355,7 +414,8 @@ mod tests {
             assert_ne!(on_a[i], on_b[i], "message {i}: two genesis hashes, one chain id");
             assert_ne!(on_a[i], plain[i], "message {i}: never the chain-id form");
         }
-        // No two kinds collide under one genesis either: thirteen messages, thirteen digests.
+        // No two kinds collide under one genesis either: one digest per message kind (fourteen
+        // since tree aggregation's `rand-aggregate-tree-2`).
         let distinct: std::collections::BTreeSet<&String> = on_a.iter().collect();
         assert_eq!(distinct.len(), on_a.len());
         // The chain id is still inside: the genesis hash is added, nothing is taken out.

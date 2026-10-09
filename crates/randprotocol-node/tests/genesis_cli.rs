@@ -700,3 +700,68 @@ fn the_genesis_command_writes_the_multisig_section_and_prints_the_derived_ids() 
         assert!(!refused.exists(), "{name}");
     }
 }
+
+/// Tree aggregation (review m6): `--aggregation-tree` writes an `aggregation_tree` section, judged
+/// before anything is written by the genesis checks (`TreeConfig::check`: bounds, an admitted
+/// shape) **and** by this build's rVM (`agg_executor::check_tree_pins`: every pin rebuilt from
+/// the heights, the leaf size under the rVM's N ceiling, canonical reduce heights, a fixed point
+/// past the list) — the node's startup check, run at the cut. The section is circuits docs/08
+/// §5's test tree (L = 1, two levels) over the recursion fixtures' shape, its pins circuits'
+/// `pins.json` and docs/08 §5's program digests.
+#[test]
+fn the_genesis_command_writes_an_aggregation_tree_section_it_checks_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let limbs = |hex: &str| -> [u64; 4] { std::array::from_fn(|k| u64::from_str_radix(&hex[16 * k..16 * (k + 1)], 16).unwrap()) };
+    let section = |edit: &dyn Fn(&mut serde_json::Value)| -> std::path::PathBuf {
+        let mut v = serde_json::json!({
+            "shape": { "profile": "Test", "tier": 14, "program_log_height": 12, "input_log_height": 10, "keccak_log_height": 0,
+                       "sha256_log_height": 0, "public_log_height": 7, "mem_log_height": 16 },
+            "leaf_size": 1,
+            "max_depth": 2,
+            "leaf": { "tier": 18, "reg_log_height": 19, "ram_log_height": 19, "poseidon2_log_height": 14, "reduce_log_height": 16 },
+            "vk_leaf": [1769152780461762224u64, 4754121159208375271u64, 16285051620565002471u64, 12356170513791122891u64],
+            "steps": [
+                { "heights": { "tier": 19, "reg_log_height": 20, "ram_log_height": 20, "poseidon2_log_height": 15, "reduce_log_height": 16 },
+                  "program_digest": limbs("2c586636c4c0f94cdf13b410154679d995eefad11e27371e0786e89e206ccd34"),
+                  "key": [7711328338169539612u64, 5984874271003933741u64, 17134834717916042633u64, 2542356665053237370u64] },
+                { "heights": { "tier": 19, "reg_log_height": 20, "ram_log_height": 20, "poseidon2_log_height": 15, "reduce_log_height": 17 },
+                  "program_digest": limbs("04b1677122526e51c0d278375b0c30ebd37f94ba8a2afed3cd3e019ecdc3c226"),
+                  "key": [12189568167191873679u64, 7035563939045772652u64, 12535684755110529647u64, 4848701472125205360u64] }
+            ]
+        });
+        edit(&mut v);
+        let path = dir.path().join(format!("tree-{}.json", rand_suffix(&v)));
+        std::fs::write(&path, v.to_string()).unwrap();
+        path
+    };
+    let shape = format!("test,14,12,10,0,0,{},16,hc_bundle,{}", randprotocol_core::types::BUNDLE_PUBLIC_LOG_HEIGHT, "0000000000000001".repeat(4));
+    let run = |out: &Path, tree: &Path| {
+        genesis(out, &["--aggregation", "100,3,100,210000,256", "--admitted-shape", shape.as_str(), "--aggregation-tree", tree.to_str().unwrap()])
+    };
+
+    let out = dir.path().join("genesis.json");
+    let ok = run(&out, &section(&|_| {}));
+    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    let tree = read(&out).aggregation_tree.expect("the section is in the file");
+    assert_eq!((tree.leaf_size, tree.max_depth, tree.steps.len()), (1, 2, 2));
+    assert_eq!(tree.steps[1].heights.reduce_log_height, 17);
+
+    for (edit, words) in [
+        (&(|v: &mut serde_json::Value| v["leaf_size"] = 6.into()) as &dyn Fn(&mut serde_json::Value), "leaf_size"),
+        (&|v: &mut serde_json::Value| v["steps"][1]["key"][0] = 1.into(), "tree level 3"),
+        (&|v: &mut serde_json::Value| v["steps"][0]["program_digest"][0] = 1.into(), "aggregate program"),
+        (&|v: &mut serde_json::Value| v["max_depth"] = 3.into(), "fixed point"),
+    ] {
+        let refused = dir.path().join("refused.json");
+        let run = run(&refused, &section(edit));
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(!run.status.success(), "{words}: accepted");
+        assert!(stderr.contains(words), "{words}: {stderr}");
+        assert!(!refused.exists(), "{words}: and nothing is written");
+    }
+}
+
+/// A distinct file name per section variant.
+fn rand_suffix(v: &serde_json::Value) -> String {
+    blake3::hash(v.to_string().as_bytes()).to_hex()[..12].to_string()
+}

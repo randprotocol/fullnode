@@ -67,7 +67,11 @@ env:
   CARGO_TERM_COLOR: always
   # The circuits commit this tree's vendored crates were synced from (deploy/sync-zkvm.sh). Bump it
   # in the same commit as a re-vendor, or CI builds this workspace against a tree it did not vendor.
-  CIRCUITS_PIN: 71e1a0411748cbb7ba74b204acaafe37587e613a
+  # 4a244b6 is circuits branch feat/tree-aggregation, not yet on zkp-circuits (synced before it was
+  # pushed, as 5ff7676 was; it is 92b750e plus docs and the tree tests' TreeConfig JSON printer);
+  # the rand-zkvm-cuda revs stay at the pushed 71e1a04, where rand-zkvm-cuda/ and research/ are
+  # identical to this commit's.
+  CIRCUITS_PIN: 4a244b604954b13420af419170ef458156a5bbe4
 
 jobs:
   check-and-test:

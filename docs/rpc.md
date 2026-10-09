@@ -1890,6 +1890,25 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
+### Unreleased — tree aggregation: `Aggregate.layout` (genesis-gated; no chain carries it yet)
+
+**Wire change for aggregates (on every chain, though none has carried one):** `Action::Aggregate`
+gains a last field, `layout` (`Flat` or `Tree`, a trailing 4-byte enum index), so its encoding and
+txid move; a `Tree` aggregate signs under `rand-aggregate-tree-1` (genesis-bound
+`rand-aggregate-tree-2`), a `Flat` one exactly as before. `tx_json`'s `aggregate` gains `layout`
+(`"flat"` or `"tree"`). A `Tree` is admitted only on a chain whose genesis has an
+`aggregation_tree` section (refused `TreeNotAdmitted` otherwise), over exactly `L·2^d` covers.
+`rand_status.aggregation` gains `tree`, present only on a chain whose genesis has the section:
+`shape`, `leaf_size`, `max_depth`, `leaf` heights, `vk_leaf`, and `steps`, each `{ heights,
+program_digest, key }`. Every digest is a **64-character lowercase hex string** (the four
+canonical u64 limbs, 16 hex digits each, circuits docs/08's spelling), never JSON numbers — a limb
+past 2^53 would lose bits in a JavaScript reader. It is what `rand-node aggregate --layout tree`
+rebuilds its tree from (`rpc::TreeStatus::to_config` reads it back exactly). A `Tree` is bounded by `L·2^max_depth`, not by
+`aggregation.max_covers` (the flat cap). The refusal cache (`rand_getTransactionStatus`'s
+`rejected`) now holds `TreeNotAdmitted`, `TreeLayout`, `TreeDepth`, `TreeTier`,
+`CoveredPublicValues` and `TreeRootDigest` as permanent; `TreeKeyPin` and `TreeRebuild` (this
+build cannot rebuild the section) are not cached.
+
 ### Unreleased — dollar-indexed prover pay: `rand_getRandPrice`, `fee_rules.usd_subsidy`, `SetRandPrice` (tag 44) (genesis-gated; no chain carries it yet)
 
 Additive. A genesis `fees.usd_subsidy` section (`docs/fees.md` §1.3; aggregating chains only)

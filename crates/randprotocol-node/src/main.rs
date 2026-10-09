@@ -569,6 +569,14 @@ enum Cmd {
         /// balance — the id the treasury's signers spend from. Omitted entirely when absent.
         #[arg(long, value_name = "MULTISIG.JSON")]
         multisig: Option<PathBuf>,
+        /// Tree aggregation (`docs/aggregation.md` §3.8): the `aggregation_tree` section, as a
+        /// `TreeConfig` JSON file (`shape`, `leaf_size`, `max_depth`, `leaf` heights, `vk_leaf`,
+        /// `steps: [{heights, program_digest, key}]`, digests as four u64 limbs). Needs
+        /// `--aggregation`. Checked before anything is written: the genesis bounds, then this
+        /// build's rebuild of every pin (`agg_executor::check_tree_pins`, the node's startup
+        /// check). Omitted entirely when absent.
+        #[arg(long, value_name = "TREE.JSON")]
+        aggregation_tree: Option<PathBuf>,
         /// The bundle guest the chain pins as `hc_bundle`: `v1` (the hidden-asset guest chains 14
         /// and 15 run) or `v2`, the branch-free guest whose instruction and lookup counts do not
         /// depend on which input slots are real or on the spent leaves' indices (INT-2 / GV-1).
@@ -982,6 +990,11 @@ enum Cmd {
         /// costs the read timeout per call).
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
         watch_max_failures: u32,
+        /// `flat` (one aggregate over up to `max_covers` bundles) or `tree` (tree aggregation,
+        /// `docs/aggregation.md` §3.8: `L·2^d` bundles proved as `rv32n` leaves and 2-to-1 steps,
+        /// on a chain whose genesis has an `aggregation_tree` section).
+        #[arg(long, default_value = "flat", value_parser = parse_layout)]
+        layout: randprotocol_core::types::AggregateLayout,
     },
     /// Benchmarks of the node's own paths; no network, no database.
     Bench {
@@ -2475,6 +2488,7 @@ async fn main() -> Result<()> {
             envelope_bytes,
             vesting,
             multisig,
+            aggregation_tree,
             bundle_guest,
             auth_guest,
             hardening_v6,
@@ -2717,6 +2731,18 @@ async fn main() -> Result<()> {
                     Some(path) => Some(read_multisig_config(path, chain_id)?),
                     None => None,
                 },
+                // Tree aggregation: read from a `TreeConfig` JSON file when `--aggregation-tree` is
+                // given (`Genesis::build` runs `TreeConfig::check`; this build's rVM checks the pins
+                // below); omitted entirely otherwise, so a chain without the flag hashes as before.
+                aggregation_tree: match &aggregation_tree {
+                    Some(path) => Some(
+                        serde_json::from_str::<randprotocol_core::ledger::aggregation::TreeConfig>(
+                            &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
+                        )
+                        .with_context(|| format!("{} is not a valid aggregation_tree section", path.display()))?,
+                    ),
+                    None => None,
+                },
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -2746,6 +2772,14 @@ async fn main() -> Result<()> {
             }
             let executor = node::executor_for_profile(&gen.fri_profile)?;
             let state = gen.build(executor.as_ref())?;
+            // The half of the tree section's check core cannot run (review m6): every pin rebuilt
+            // by this build's rVM, the leaf size under its N ceiling, canonical reduce heights, a
+            // fixed point past the list — the node's own startup check, so a section no node of
+            // this build would start on is never written.
+            if let Some(t) = &gen.aggregation_tree {
+                randprotocol_node::agg_executor::check_tree_pins(executor.as_ref(), t)
+                    .map_err(|e| anyhow::anyhow!("--aggregation-tree: {e}"))?;
+            }
             std::fs::write(&out, gen.to_json())?;
             println!(
                 "wrote {} (genesis hash {}, {} validators, {} notes, {} blocks/epoch, programs up to {} words, proofs up to {} bytes, blocks up to {} bytes, call envelopes up to {} bytes, program public input up to {} words, faucet {}, confidential {}, fri {}, hc_bundle {}, hc_auth {})",
@@ -3429,9 +3463,9 @@ async fn main() -> Result<()> {
                 submit_staking(&staking, chain_id, action, "aggregator withdraw").await?;
             }
         },
-        Cmd::Aggregate { key, rpc, watch, interval_secs, no_wait, watch_max_failures } => {
-            let cfg = DaemonConfig { watch, interval: Duration::from_secs(interval_secs), no_wait, max_failures: watch_max_failures };
-            aggregate_daemon(&key, &rpc, &cfg).await?;
+        Cmd::Aggregate { key, rpc, watch, interval_secs, no_wait, watch_max_failures, layout } => {
+            let cfg = DaemonConfig { watch, interval: Duration::from_secs(interval_secs), no_wait, max_failures: watch_max_failures, tree: None };
+            aggregate_daemon(&key, &rpc, cfg, layout).await?;
         }
     }
     let _ = UNITS_PER_RAND;
@@ -3571,6 +3605,92 @@ async fn aggregator_row(rpc: &impl AggregateNode, me: &randprotocol_core::Addres
     Ok((nonce, payout, bond))
 }
 
+/// `--layout`'s parser: `flat` or `tree`.
+fn parse_layout(s: &str) -> Result<randprotocol_core::types::AggregateLayout, String> {
+    match s {
+        "flat" => Ok(randprotocol_core::types::AggregateLayout::Flat),
+        "tree" => Ok(randprotocol_core::types::AggregateLayout::Tree),
+        other => Err(format!("--layout is flat or tree, not {other:?}")),
+    }
+}
+
+/// The chain's `aggregation_tree` section, as `rand_status.aggregation.tree` serves it — a
+/// genesis constant, so `--layout tree` reads it once, at start. A node whose genesis has none
+/// (or that predates the field) is a named error. Then this build's own rebuild of every pin
+/// (`check_tree_pins` over `ex`, the node's startup check — review m7): a daemon whose build
+/// does not reproduce the chain's pins would prove for hours a root admission refuses, so it
+/// refuses before proving.
+async fn daemon_tree_of(
+    rpc: &impl AggregateNode,
+    ex: &dyn randprotocol_core::confidential::ConfidentialExecutor,
+) -> Result<randprotocol_core::ledger::aggregation::TreeConfig> {
+    let status = rpc.call("rand_status", serde_json::json!([])).await?;
+    let tree = &status["aggregation"]["tree"];
+    if tree.is_null() {
+        anyhow::bail!("--layout tree: the node's rand_status has no aggregation.tree — this chain's genesis has no aggregation_tree section");
+    }
+    let tree = serde_json::from_value::<randprotocol_node::rpc::TreeStatus>(tree.clone())
+        .context("rand_status.aggregation.tree does not parse as an aggregation_tree section")?
+        .to_config()
+        .map_err(|e| anyhow::anyhow!("rand_status.aggregation.tree: {e}"))?;
+    randprotocol_node::agg_executor::check_tree_pins(ex, &tree).map_err(|e| {
+        anyhow::anyhow!("this build does not reproduce the chain's aggregation_tree pins ({e}); rebuild from the chain's pinned commit before proving")
+    })?;
+    Ok(tree)
+}
+
+/// How many covers a `--layout tree` pass takes from `available` unsealed bundles: `L·2^d` for the
+/// largest `1 ≤ d ≤ max_depth` that fits (spec §2's layout rule — a tree covers exactly that many),
+/// `None` under `2L`.
+fn tree_cover_count(available: usize, tree: &randprotocol_core::ledger::aggregation::TreeConfig) -> Option<usize> {
+    (1..=tree.max_depth as u32)
+        .rev()
+        .map(|d| (tree.leaf_size as usize) << d)
+        .find(|n| *n <= available && *n > 0)
+}
+
+/// The tree's root over the raw bundle proofs (`--layout tree`): the section's leaf and per-level
+/// step shapes rebuilt from its pinned heights (`TreeShapes::build`, what admission rebuilds), then
+/// `aggregate_tree` on this one machine — `2^d` `rv32n` leaves of `L` proofs, then `d` levels of
+/// 2-to-1 steps, each proof checked against its pinned shape before the next level is built on it.
+/// Production steps are tier 21 (circuits docs/08 §2: a 256 GB-class host, pending the droplet's
+/// measurement).
+fn prove_tree_aggregate(
+    profile: FriProfile,
+    raw_proofs: &[Vec<u8>],
+    binding: &[u32; 8],
+    tree: &randprotocol_core::ledger::aggregation::TreeConfig,
+) -> Result<Vec<u8>> {
+    use randprotocol_node::agg_executor::rvm_heights;
+    let proofs = raw_proofs
+        .iter()
+        .map(|b| postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(b).map_err(|_| anyhow::anyhow!("a work row's proof does not decode")))
+        .collect::<Result<Vec<_>>>()?;
+    let first = proofs.first().context("nothing to aggregate")?;
+    let shape = randprotocol_rvm::shape::InnerShape::of(
+        profile,
+        first.tier,
+        first.program_log_height,
+        first.input_log_height,
+        first.keccak_log_height,
+        first.sha256_log_height,
+        first.public_log_height,
+        first.mem_log_height,
+    );
+    let key_inner = randprotocol_rvm::shape::InnerKey::of(profile, &shape);
+    let vk = randprotocol_rvm::aggregate::InnerVerifierKey { shape, key: key_inner };
+    let steps: Vec<_> = tree.steps.iter().map(|s| rvm_heights(s.heights)).collect();
+    let shapes = randprotocol_rvm::aggregate::TreeShapes::build(profile, &vk, rvm_heights(tree.leaf), &steps)
+        .map_err(|e| anyhow::anyhow!("rebuilding the aggregation_tree shapes: {e:?}"))?;
+    let m = randprotocol_rvm::machine::Machine::new(profile);
+    let t0 = std::time::Instant::now();
+    let (root, depth) = randprotocol_rvm::aggregate::aggregate_tree(&m, &vk, &shapes, &proofs, binding, tree.leaf_size as usize)
+        .map_err(|e| anyhow::anyhow!("a tree over {} bundles: {e:?}", proofs.len()))?;
+    let bytes = root.to_bytes();
+    tracing::info!("tree of depth {depth} over {} bundles in {:.1?} ({} root bytes)", proofs.len(), t0.elapsed(), bytes.len());
+    Ok(bytes)
+}
+
 /// The one rVM aggregate proof over the raw bundle proofs, bound to `binding` — the daemon's
 /// only expensive step (~26 min at the test profile), a function of its own so the pass around
 /// it can be driven without the rVM.
@@ -3631,7 +3751,23 @@ async fn aggregate_pass(
     chain_id: u64,
     prove: impl FnOnce(FriProfile, &[Vec<u8>], &[u32; 8]) -> Result<Vec<u8>>,
 ) -> Result<Option<randprotocol_core::Transaction>> {
-    let Some(proved) = prove_pass(rpc, kp, chain_id, prove).await? else {
+    let Some(proved) = prove_pass(rpc, kp, chain_id, None, prove).await? else {
+        return Ok(None);
+    };
+    Ok(Some(seal_aggregate(rpc, kp, chain_id, &proved).await?))
+}
+
+/// [`aggregate_pass`] under `--layout tree`: the section `tree` picks the cover count and the
+/// action is a `Tree`, signed under the tree domain.
+#[cfg(test)]
+async fn aggregate_pass_tree(
+    rpc: &impl AggregateNode,
+    kp: &Keypair,
+    chain_id: u64,
+    tree: &randprotocol_core::ledger::aggregation::TreeConfig,
+    prove: impl FnOnce(FriProfile, &[Vec<u8>], &[u32; 8]) -> Result<Vec<u8>>,
+) -> Result<Option<randprotocol_core::Transaction>> {
+    let Some(proved) = prove_pass(rpc, kp, chain_id, Some(tree), prove).await? else {
         return Ok(None);
     };
     Ok(Some(seal_aggregate(rpc, kp, chain_id, &proved).await?))
@@ -3649,14 +3785,21 @@ struct ProvedAggregate {
     fees: randprotocol_core::ledger::FeesConfig,
     format: EnvelopeFormat,
     domain: randprotocol_core::BindingDomain,
+    /// `Tree` under `--layout tree`: the action's layout and its signing domain.
+    layout: randprotocol_core::types::AggregateLayout,
 }
 
 /// [`aggregate_pass`]'s first half (`prove_pass`): the work list, the raw bundles, the reads fixed at genesis
 /// and the prove.
+///
+/// `tree` is the chain's `aggregation_tree` section under `--layout tree` (`None`: flat). A tree
+/// pass asks for up to `L·2^max_depth` unsealed bundles and takes `L·2^d` of them for the largest
+/// `d` they fill ([`tree_cover_count`]), or nothing under `2L`; `prove` then makes the root.
 async fn prove_pass(
     rpc: &impl AggregateNode,
     kp: &Keypair,
     chain_id: u64,
+    tree: Option<&randprotocol_core::ledger::aggregation::TreeConfig>,
     prove: impl FnOnce(FriProfile, &[Vec<u8>], &[u32; 8]) -> Result<Vec<u8>>,
 ) -> Result<Option<ProvedAggregate>> {
     let status = rpc.call("rand_status", serde_json::json!([])).await?;
@@ -3664,13 +3807,25 @@ async fn prove_pass(
         "test" => FriProfile::Test,
         _ => FriProfile::Production,
     };
-    let max_covers = status["aggregation"]["max_covers"].as_u64().unwrap_or(0) as usize;
+    // The cover cap is the layout's: flat takes up to `max_covers`, a tree up to its own
+    // section's `L·2^max_depth` (`max_covers` does not bound a tree).
+    let max_covers = match tree {
+        None => status["aggregation"]["max_covers"].as_u64().unwrap_or(0) as usize,
+        Some(t) => (t.leaf_size as usize) << t.max_depth,
+    };
     let work = rpc.call("rand_getUnsealed", serde_json::json!([0, max_covers.max(1)])).await?;
     let bundles = work["bundles"].as_array().cloned().unwrap_or_default();
     if bundles.is_empty() || max_covers == 0 {
         return Ok(None);
     }
-    let chosen = &bundles[..bundles.len().min(max_covers)];
+    let take = match tree {
+        None => bundles.len().min(max_covers),
+        Some(t) => match tree_cover_count(bundles.len(), t) {
+            Some(n) => n,
+            None => return Ok(None),
+        },
+    };
+    let chosen = &bundles[..take];
     // The raw bundles, back from the node: each one's stored proof is the tape input.
     let mut raw_proofs = Vec::with_capacity(chosen.len());
     let mut covers = Vec::with_capacity(chosen.len());
@@ -3709,7 +3864,8 @@ async fn prove_pass(
     let format = rpc.envelope_format(chain_id).await?;
     let binding = domain.aggregate_binding(chain_id, &kp.address(), nonce);
     let proof_bytes = prove(profile, &raw_proofs, &binding)?;
-    Ok(Some(ProvedAggregate { covers, proof: proof_bytes, nonce, shares, fees, format, domain }))
+    let layout = if tree.is_some() { randprotocol_core::types::AggregateLayout::Tree } else { randprotocol_core::types::AggregateLayout::Flat };
+    Ok(Some(ProvedAggregate { covers, proof: proof_bytes, nonce, shares, fees, format, domain, layout }))
 }
 
 /// [`aggregate_pass`]'s second half, re-run on a re-seal: after the prove, immediately before the
@@ -3721,7 +3877,7 @@ async fn seal_aggregate(
     chain_id: u64,
     proved: &ProvedAggregate,
 ) -> Result<randprotocol_core::Transaction> {
-    let ProvedAggregate { covers, proof: proof_bytes, nonce, shares, fees, format, domain } = proved;
+    let ProvedAggregate { covers, proof: proof_bytes, nonce, shares, fees, format, domain, layout } = proved;
     let (nonce, shares) = (*nonce, *shares);
     let (nonce_now, payout, _) = aggregator_row(rpc, &kp.address()).await?;
     if nonce_now != nonce {
@@ -3779,7 +3935,8 @@ async fn seal_aggregate(
     let (note, envelope) = sealed_withdraw_note(&payout, payout_total, time, *format)?;
     let signature = kp.sign(
         domain
-            .aggregate_signing_hash(
+            .aggregate_signing_hash_at(
+                *layout,
                 chain_id,
                 nonce,
                 time,
@@ -3804,6 +3961,7 @@ async fn seal_aggregate(
             envelope,
             signature,
             payout_total,
+            layout: *layout,
         },
     })
 }
@@ -3888,15 +4046,37 @@ struct DaemonConfig {
     /// `--watch-max-failures`: this many failed passes in a row end the loop with an error. A
     /// pass that seals or finds nothing to cover resets the count. At least 1.
     max_failures: u32,
+    /// `--layout tree`: the chain's `aggregation_tree` section, read once at start (a genesis
+    /// constant); `None` is the flat daemon.
+    tree: Option<randprotocol_core::ledger::aggregation::TreeConfig>,
 }
 
 /// The aggregate daemon: [`aggregate_pass`], submitted, and `--watch` loops it on the interval;
 /// every pass is one proving job.
-async fn aggregate_daemon(key: &std::path::Path, rpc_url: &str, cfg: &DaemonConfig) -> Result<()> {
+async fn aggregate_daemon(
+    key: &std::path::Path,
+    rpc_url: &str,
+    mut cfg: DaemonConfig,
+    layout: randprotocol_core::types::AggregateLayout,
+) -> Result<()> {
     let kp = load_keypair(key)?;
     let rpc = RpcClient::new(rpc_url.to_string());
     let chain_id = rpc.chain_id().await?;
-    aggregate_loop(&rpc, &kp, chain_id, cfg, prove_aggregate).await
+    if layout == randprotocol_core::types::AggregateLayout::Tree {
+        let status = rpc.call("rand_status", serde_json::json!([])).await?;
+        let profile = match status["fri_profile"].as_str().unwrap_or("production") {
+            "test" => FriProfile::Test,
+            _ => FriProfile::Production,
+        };
+        // The pin rebuild is minutes at production (the section's programs and keys), once at
+        // start, before any pass; the proving it guards is hours.
+        let ex = std::sync::Arc::new(randprotocol_node::agg_executor::AggExecutor::new(profile));
+        let tree = daemon_tree_of(&rpc, ex.as_ref()).await?;
+        tracing::info!("aggregate --layout tree: L = {}, max_depth {}, {} listed levels", tree.leaf_size, tree.max_depth, tree.steps.len());
+        cfg.tree = Some(tree.clone());
+        return aggregate_loop(&rpc, &kp, chain_id, &cfg, move |p: FriProfile, raw: &[Vec<u8>], b: &[u32; 8]| prove_tree_aggregate(p, raw, b, &tree)).await;
+    }
+    aggregate_loop(&rpc, &kp, chain_id, &cfg, prove_aggregate).await
 }
 
 /// The daemon's loop over a node, apart from the key file and the RPC client so a test can drive
@@ -3972,7 +4152,7 @@ async fn aggregate_round(
             return Err(StopError::ChainIdMismatch { expected: chain_id, got: now }.into());
         }
     }
-    let Some(proved) = prove_pass(rpc, kp, chain_id, prove).await? else {
+    let Some(proved) = prove_pass(rpc, kp, chain_id, cfg.tree.as_ref(), prove).await? else {
         return Ok(false);
     };
     let covered = proved.covers.len();
@@ -5124,6 +5304,7 @@ mod tests {
             proof_window_blocks: None,
             program_state: None,
             multisig: None,
+            aggregation_tree: None,
             fees: None,
             incremental_nullifier_root: None,
             perps: None,
@@ -5213,6 +5394,11 @@ mod tests {
         /// then commits — the register nonce moving at that commit, not at the send.
         uncommitted_polls: std::cell::Cell<u32>,
         status_polls: std::cell::Cell<u32>,
+        /// How many bundles `rand_getUnsealed` lists (the first is `raw`, the rest stand-in hashes
+        /// whose raw transaction is `raw` too); 1 unless a test sets it.
+        unsealed: std::cell::Cell<usize>,
+        /// `rand_status.aggregation.tree`: absent unless a test sets it.
+        tree: Option<serde_json::Value>,
     }
 
     impl AggregateNode for MovingNode {
@@ -5229,7 +5415,7 @@ mod tests {
                     if (self.fail_status)(i) {
                         anyhow::bail!("rand_status: connection reset by peer (call {i})");
                     }
-                    json!({
+                    let mut v = json!({
                     "fri_profile": "test",
                     "height": self.height.get(),
                     "aggregation": {
@@ -5238,12 +5424,22 @@ mod tests {
                         "halving_blocks": 1,
                         "sealed_blocks": self.sealed_blocks.get(),
                     },
-                    })
+                    });
+                    if let Some(t) = &self.tree {
+                        v["aggregation"]["tree"] = t.clone();
+                    }
+                    v
                 }
-                "rand_getUnsealed" => json!({
-                    "bundles": [{ "hash": self.raw.hash().to_hex(), "height": 1, "excess": self.excess.get().to_string() }],
-                    "next_from": null,
-                }),
+                "rand_getUnsealed" => {
+                    let limit = _params[1].as_u64().unwrap_or(u64::MAX) as usize;
+                    let rows: Vec<serde_json::Value> = (0..self.unsealed.get().min(limit))
+                        .map(|i| {
+                            let h = if i == 0 { self.raw.hash() } else { randprotocol_core::Hash::digest(&[i as u8]) };
+                            json!({ "hash": h.to_hex(), "height": 1, "excess": self.excess.get().to_string() })
+                        })
+                        .collect();
+                    json!({ "bundles": rows, "next_from": null })
+                }
                 "rand_getRawTransaction" => json!(hex::encode(bincode::serialize(&self.raw).unwrap())),
                 "rand_getRandPrice" => self.rand_price.clone(),
                 "rand_getLimits" => {
@@ -5319,6 +5515,122 @@ mod tests {
         }
     }
 
+    /// A tree section as `rand_status.aggregation.tree` carries it (the genesis section
+    /// verbatim): L = `leaf_size`, `max_depth`, two listed levels.
+    fn daemon_tree(leaf_size: u8, max_depth: u8) -> randprotocol_core::ledger::aggregation::TreeConfig {
+        use randprotocol_core::ledger::aggregation::{RvmHeights, TreeConfig, TreeStepPin};
+        let h = |reduce_log_height| RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height };
+        let d = randprotocol_core::confidential::StubExecutor.tree_digests_for_tests();
+        TreeConfig {
+            shape: randprotocol_core::types::DeclaredShape {
+                profile: randprotocol_core::types::FriProfile::Test,
+                tier: 14,
+                program_log_height: 13,
+                input_log_height: 12,
+                keccak_log_height: 0,
+                sha256_log_height: 0,
+                public_log_height: 7,
+                mem_log_height: 18,
+            },
+            leaf_size,
+            max_depth,
+            leaf: RvmHeights { tier: 18, reg_log_height: 19, ram_log_height: 19, poseidon2_log_height: 14, reduce_log_height: 16 },
+            // The stub executor's rebuild (`tree_digests_for_tests`), so the daemon's own pin
+            // check (review m7) passes over the stub.
+            vk_leaf: d.vk_leaf,
+            steps: vec![
+                TreeStepPin { heights: h(16), program_digest: d.steps[0].0, key: d.steps[0].1 },
+                TreeStepPin { heights: h(17), program_digest: d.steps[1].0, key: d.steps[1].1 },
+            ],
+        }
+    }
+
+    /// `--layout tree`'s selection (spec §2's layout rule): the largest whole tree, `L·2^d` for
+    /// the deepest `1 ≤ d ≤ max_depth` the unsealed list fills, and nothing under `2L`.
+    #[test]
+    fn the_tree_cover_count_is_the_largest_whole_tree() {
+        let t = daemon_tree(1, 2);
+        for (have, want) in [(0, None), (1, None), (2, Some(2)), (3, Some(2)), (4, Some(4)), (5, Some(4)), (100, Some(4))] {
+            assert_eq!(tree_cover_count(have, &t), want, "{have} unsealed, L = 1, max_depth 2");
+        }
+        let t = daemon_tree(2, 3);
+        for (have, want) in [(3, None), (4, Some(4)), (7, Some(4)), (8, Some(8)), (15, Some(8)), (16, Some(16)), (99, Some(16))] {
+            assert_eq!(tree_cover_count(have, &t), want, "{have} unsealed, L = 2, max_depth 3");
+        }
+    }
+
+    /// `aggregate --layout tree`'s pass: five unsealed at L = 1, max_depth 2 take four covers (a
+    /// depth-2 tree), the prove is handed the four stored proofs and the section, and the action
+    /// carries `layout: Tree` signed under the tree domain (never the flat one). Fewer than 2L
+    /// unsealed is nothing to do; a node with no tree section is a named error at start.
+    #[tokio::test]
+    async fn a_tree_pass_takes_a_whole_tree_and_signs_under_the_tree_domain() {
+        let kp = Keypair::from_seed([9; 32]).unwrap();
+        let payout = randprotocol_zkvm::address::address_of(&SpendKey([7; 8]).viewing_key());
+        let mut node = moving_node(kp.address(), payout.clone());
+        let t = daemon_tree(1, 2);
+        node.tree = Some(serde_json::to_value(randprotocol_node::rpc::TreeStatus::of(&t)).unwrap());
+        node.unsealed.set(5);
+        let stub = randprotocol_core::confidential::StubExecutor;
+        let read = daemon_tree_of(&node, &stub).await.expect("the node serves the section, and this build reproduces it");
+        assert_eq!(read, t, "rand_status.aggregation.tree reads back as the section");
+        let tx = aggregate_pass_tree(&node, &kp, 7, &t, |profile, raw, binding| {
+            assert_eq!(profile, FriProfile::Test);
+            assert_eq!(raw.len(), 4, "L·2^2 = 4 of the five unsealed");
+            assert_eq!(binding, &randprotocol_core::types::actions::aggregate_binding(7, &kp.address(), 0));
+            Ok(b"the tree root".to_vec())
+        })
+        .await
+        .unwrap()
+        .expect("a whole tree to cover");
+        let randprotocol_core::Action::Aggregate { covers, nonce, time, r, envelope, proof, signature, payout_total, layout, .. } = &tx.action else {
+            panic!("not an aggregate: {tx:?}")
+        };
+        assert_eq!(covers.len(), 4);
+        assert_eq!(*layout, randprotocol_core::types::AggregateLayout::Tree);
+        let hash_at = |layout| {
+            randprotocol_core::BindingDomain::ChainId.aggregate_signing_hash_at(
+                layout,
+                7,
+                *nonce,
+                *time,
+                r,
+                covers,
+                &randprotocol_core::Hash::digest(proof),
+                &randprotocol_core::types::actions::envelope_digest(envelope),
+                *payout_total,
+            )
+        };
+        assert!(kp.public_key().verify(hash_at(randprotocol_core::types::AggregateLayout::Tree).as_bytes(), signature), "signed under the tree domain");
+        assert!(!kp.public_key().verify(hash_at(randprotocol_core::types::AggregateLayout::Flat).as_bytes(), signature), "not the flat one");
+        node.unsealed.set(1);
+        assert!(aggregate_pass_tree(&node, &kp, 7, &t, |_, _, _| panic!("nothing to prove")).await.unwrap().is_none(), "under 2L unsealed");
+        // Review m7: a daemon whose build rebuilds other pins than the chain's refuses before it
+        // proves anything (hours of proving for a root admission would refuse).
+        let mut other = t.clone();
+        other.steps[1].key = [9; 4];
+        node.tree = Some(serde_json::to_value(randprotocol_node::rpc::TreeStatus::of(&other)).unwrap());
+        let e = daemon_tree_of(&node, &stub).await.unwrap_err();
+        assert!(format!("{e:#}").contains("does not reproduce") && format!("{e:#}").contains("tree level 3"), "{e:#}");
+        node.tree = None;
+        let e = daemon_tree_of(&node, &stub).await.unwrap_err();
+        assert!(format!("{e:#}").contains("aggregation_tree"), "{e:#}");
+    }
+
+    /// `rand-node aggregate --layout tree|flat`, flat by default.
+    #[test]
+    fn the_aggregate_command_takes_a_layout() {
+        let layout = |args: &[&str]| match Cli::try_parse_from(["rand-node", "aggregate", "--key", "k"].iter().copied().chain(args.iter().copied())) {
+            Ok(Cli { cmd: Cmd::Aggregate { layout, .. }, .. }) => Ok(layout),
+            Ok(_) => panic!("not the aggregate command"),
+            Err(e) => Err(e.to_string()),
+        };
+        assert_eq!(layout(&[]), Ok(randprotocol_core::types::AggregateLayout::Flat));
+        assert_eq!(layout(&["--layout", "tree"]), Ok(randprotocol_core::types::AggregateLayout::Tree));
+        assert_eq!(layout(&["--layout", "flat"]), Ok(randprotocol_core::types::AggregateLayout::Flat));
+        assert!(layout(&["--layout", "bush"]).is_err());
+    }
+
     fn moving_node(me: randprotocol_core::Address, payout: ShieldedAddress) -> MovingNode {
         let env = || Envelope { kem_ct: vec![1; 8], to_receiver: vec![2; 4], to_sender: vec![3; 4], body: vec![4; 16] };
         let bundle = randprotocol_core::Bundle {
@@ -5356,12 +5668,14 @@ mod tests {
             evict: std::cell::Cell::new(0),
             uncommitted_polls: std::cell::Cell::new(0),
             status_polls: std::cell::Cell::new(0),
+            unsealed: std::cell::Cell::new(1),
+            tree: None,
         }
     }
 
     /// The watch loop under test: zero interval, so no test sleeps.
     fn watch_config(max_failures: u32) -> DaemonConfig {
-        DaemonConfig { watch: true, interval: Duration::ZERO, no_wait: false, max_failures }
+        DaemonConfig { watch: true, interval: Duration::ZERO, no_wait: false, max_failures, tree: None }
     }
 
     fn fake_prove(_: FriProfile, _: &[Vec<u8>], _: &[u32; 8]) -> Result<Vec<u8>> {
@@ -5674,7 +5988,7 @@ mod tests {
         let kp = Keypair::from_seed([9; 32]).unwrap();
         let payee = SpendKey([7; 8]);
         let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
-        let cfg = DaemonConfig { watch: false, interval: Duration::ZERO, no_wait: false, max_failures: 1 };
+        let cfg = DaemonConfig { watch: false, interval: Duration::ZERO, no_wait: false, max_failures: 1, tree: None };
         let proves = std::cell::Cell::new(0u32);
         let prove = |_: FriProfile, _: &[Vec<u8>], _: &[u32; 8]| {
             proves.set(proves.get() + 1);
@@ -5725,7 +6039,7 @@ mod tests {
         let kp = Keypair::from_seed([9; 32]).unwrap();
         let payee = SpendKey([7; 8]);
         let payout = randprotocol_zkvm::address::address_of(&payee.viewing_key());
-        let cfg = DaemonConfig { watch: false, interval: Duration::ZERO, no_wait: false, max_failures: 1 };
+        let cfg = DaemonConfig { watch: false, interval: Duration::ZERO, no_wait: false, max_failures: 1, tree: None };
 
         // Unknown for 5 polls, then committed: one submission, success. The fifth `unknown` is
         // answered as the commit lands (the nonce moves), so the pass sees the spent nonce first.

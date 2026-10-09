@@ -14,10 +14,12 @@ pub mod constraints;
 mod rv32;
 mod rv32n;
 mod rv32r;
+mod rv32t;
 
 pub use rv32::{cycle_report, digest_hex, fold_eval, own_slot_check, reduce_compiled, run_reduce_sequence, verify_rv32, verify_rv32_with, CycleReport, Precompiles};
 pub use rv32n::{aggregate_program_digest, verify_rv32n};
 pub use rv32r::{self_program_digest, verify_rv32r};
+pub use rv32t::{rv32t_int, rv32t_leaf, tree_step_program_digest, verify_rv32t, TREE_ARITY};
 
 use crate::dsl::{Checkpoints, Stats};
 use constraints::Phase5Cost;

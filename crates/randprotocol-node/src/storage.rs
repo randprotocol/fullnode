@@ -4300,6 +4300,7 @@ pub(crate) mod fixtures {
             proof_window_blocks: None,
             program_state: None,
             multisig: None,
+            aggregation_tree: None,
             incremental_nullifier_root: None,
             perps: None,
             hardening_v6: None,
@@ -4460,6 +4461,7 @@ pub(crate) mod fixtures {
             proof_window_blocks: None,
             program_state: None,
             multisig: None,
+            aggregation_tree: None,
             incremental_nullifier_root: None,
             perps: None,
             hardening_v6: None,
@@ -9629,7 +9631,7 @@ mod seal_tests {
         Transaction {
             chain_id: 7,
             bundle: None,
-            action: Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope: env(9), signature, payout_total },
+            action: Action::Aggregate { covers, proof, aggregator, nonce, time, r, envelope: env(9), signature, payout_total, layout: randprotocol_core::types::AggregateLayout::Flat },
         }
     }
 

@@ -677,6 +677,11 @@ pub struct Ledger {
     /// `epoch_blocks` — a genesis parameter, not consensus state. `None` makes the five
     /// aggregation actions inadmissible and keeps the state root byte-for-byte today's.
     aggregation: Option<aggregation::AggregationConfig>,
+    /// The `aggregation_tree` section of genesis (tree aggregation, R4), a genesis parameter like
+    /// `aggregation`: restored from the genesis file by `reload_ledger`, never part of the state
+    /// root. `None` refuses every `Tree` aggregate (`TreeNotAdmitted`); flat aggregation is
+    /// untouched either way.
+    aggregation_tree: Option<aggregation::TreeConfig>,
     /// The `staking` section of genesis (audit v4, STAKE-2), a genesis parameter like
     /// `aggregation`: restored from the genesis file by `reload_ledger`, never from storage.
     /// `None` keeps the faucet unbudgeted, bonds active at the next boundary and the state root
@@ -961,6 +966,7 @@ impl Ledger {
             bridge: None,
             tokens: None,
             aggregation: None,
+            aggregation_tree: None,
             staking: None,
             faucet_epoch: 0,
             faucet_minted_in_epoch: 0,
@@ -1032,6 +1038,7 @@ impl Ledger {
             bridge: None,
             tokens: None,
             aggregation: None,
+            aggregation_tree: None,
             staking: None,
             faucet_epoch: 0,
             faucet_minted_in_epoch: 0,
@@ -1815,6 +1822,17 @@ impl Ledger {
     /// actions are inadmissible and the state root is byte-for-byte today's.
     pub fn aggregation(&self) -> Option<&aggregation::AggregationConfig> {
         self.aggregation.as_ref()
+    }
+
+    /// Install (or clear) the tree aggregation section (genesis `aggregation_tree`). Genesis calls
+    /// this once; a reloading node calls it from the genesis file, as for `aggregation`.
+    pub fn set_aggregation_tree(&mut self, tree: Option<aggregation::TreeConfig>) {
+        self.aggregation_tree = tree;
+    }
+
+    /// The tree aggregation section, or `None` where every `Tree` aggregate is refused.
+    pub fn aggregation_tree(&self) -> Option<&aggregation::TreeConfig> {
+        self.aggregation_tree.as_ref()
     }
 
     /// The largest program a `Deploy` may carry, in words, as genesis set it (default

@@ -287,6 +287,20 @@ pub fn is_permanent(e: &TxError) -> bool {
                 | A::CoverSealed(_)
                 // A slash is refused whatever its bytes and whatever the state (INTERFACE-1).
                 | A::SlashingRetired
+                // Tree aggregation (tree Task 3b): the section, the L·2^d layout rule, the depth
+                // bound and the root's pinned tier are genesis constants; a covered run that is no
+                // bundle's and a recompute that is not the root's words judge committed public
+                // values against the transaction's own binding. `TreeKeyPin` stays out, as
+                // `AggregateProgramMismatch` does: a build that rebuilds another key than the
+                // genesis pins is the node's quarrel with the chain, not the transaction's.
+                // `TreeRebuild` (a build that cannot rebuild the section at all) stays out for
+                // the same reason.
+                | A::TreeNotAdmitted
+                | A::TreeLayout { .. }
+                | A::TreeDepth { .. }
+                | A::TreeTier { .. }
+                | A::CoveredPublicValues { .. }
+                | A::TreeRootDigest
         );
     }
     // Multisig accounts, split the same way. Cacheable are the verdicts on the action's own
@@ -1623,6 +1637,16 @@ mod tests {
             agg(A::SlashingRetired),
             TxError::AggregateTooLarge { size: 9_000_000, max: 2 << 20 },
             TxError::InvalidAggregateProof(ConfidentialError::MalformedProof),
+            // Tree aggregation's state-independent verdicts (tree Task 3b): the section, the
+            // layout rule, the depth bound and the pinned root tier are genesis constants; a
+            // covered run and the recompute are the committed bundles' public values against the
+            // transaction's own binding.
+            agg(A::TreeNotAdmitted),
+            agg(A::TreeLayout { covers: 3, leaf_size: 1 }),
+            agg(A::TreeDepth { depth: 4, max: 3 }),
+            agg(A::TreeTier { declared: 20, pinned: 19 }),
+            agg(A::CoveredPublicValues { index: 1 }),
+            agg(A::TreeRootDigest),
         ] {
             assert!(is_permanent(&e), "{e} is a statement about the bytes or genesis constants");
         }
@@ -1635,6 +1659,12 @@ mod tests {
             agg(A::CoverStoreCorrupt(h(8))),
             // The covered-carrying path's signpost is not a verdict on the transaction at all.
             TxError::AggregateNeedsCovered,
+            // A key this build rebuilds differently from the genesis pin is the build's quarrel
+            // with the chain, not the transaction's; like `AggregateProgramMismatch` it stays out.
+            agg(A::TreeKeyPin { level: 2 }),
+            agg(A::AggregateProgramMismatch { pinned: [1; 4], built: [2; 4] }),
+            // And a build that cannot rebuild the section at all (step 7b, final review m3).
+            agg(A::TreeRebuild(ConfidentialError::AggregationUnsupported)),
         ] {
             assert!(!is_permanent(&e), "{e} depends on state and must not be cached");
         }

@@ -41,6 +41,22 @@ pub enum ConfidentialError {
     /// fault — never a permanent admission verdict either.
     #[error("the registered shape is not one a proof can have: {0}")]
     BadDeclaredShape(String),
+    /// Tree aggregation: the recomputed root digest is not the proof's public values (a level
+    /// under another binding, another key, another order, another depth). A permanent admission
+    /// verdict; the ledger reports it as `AggregationError::TreeRootDigest`.
+    #[error("the tree's recomputed root digest is not the proof's")]
+    TreeRootDigest,
+    /// Tree aggregation: no key, or not the pinned key, for level `level` (`verify_tree`'s empty
+    /// step-key list for a level ≥ 2), numbered as circuits' `keys.at_level(j)`: the level that
+    /// uses the key — 1 for `vk_leaf`, `j ≥ 2` for level `j − 1`'s step key. The ledger reports it
+    /// as `AggregationError::TreeKeyPin`, whose 7b compare uses the same numbering.
+    #[error("tree level {level} has no step key, or not the pinned one")]
+    TreeKeyPin { level: u8 },
+    /// Tree aggregation: covered bundle `index`'s public-value run is not the inner shape's count
+    /// of canonical field words with `u32` OUT words — refused before the recompute. The ledger
+    /// reports it as `AggregationError::CoveredPublicValues`.
+    #[error("covered bundle {index}'s public values are not a canonical run")]
+    CoveredPublicValues { index: usize },
     #[error("confidential computation is disabled on this chain")]
     Disabled,
 }
@@ -296,6 +312,43 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// largest admitted N, since an rVM verifier key is per (tier, reduce height) and the reduce
     /// height is canonical in (program, N); may be a no-op.
     fn warm_aggregation(&self, _shape: &crate::types::DeclaredShape, _max_covers: u32) {}
+
+    /// Tree aggregation, step 7a (R6): the root proof's declared rVM tier, read off its header
+    /// alone — the decode and canonical encoding, nothing built. The ledger compares it with the
+    /// tier pinned for the root's level before anything is built. The default (any executor
+    /// without the rVM) supports no tree.
+    fn aggregate_proof_tier(&self, _proof: &[u8]) -> Result<u8, ConfidentialError> {
+        Err(ConfidentialError::AggregationUnsupported)
+    }
+    /// Tree aggregation, step 7b (AGG-6 per level): the leaf key digest and each listed level's
+    /// `(step program digest, step key digest)`, rebuilt from `tree`'s pinned heights — the list
+    /// in `tree.steps`' order, one entry per pinned entry. The ledger compares them with the pins;
+    /// the node's startup check does too.
+    fn tree_digests(&self, _tree: &crate::ledger::aggregation::TreeConfig) -> Result<crate::ledger::aggregation::TreeDigests, ConfidentialError> {
+        Err(ConfidentialError::AggregationUnsupported)
+    }
+    /// Tree aggregation, step 8 (spec §4 `verify_tree`): the bottom-up recompute of a depth-`depth`
+    /// tree's root digest from the covered public values in cover order, `binding` (AGG-2) and
+    /// the pinned keys, compared with the root proof's public words; then the rVM verify of the
+    /// root against level `depth`'s step program. Returns each covered bundle's `OUT0..7` in
+    /// cover order, as [`Self::verify_aggregate`] does. The ledger has already checked the layout,
+    /// the depth, the root's tier and the root program's digest; this checks none of them.
+    fn verify_tree(
+        &self,
+        _tree: &crate::ledger::aggregation::TreeConfig,
+        _covered: &[crate::types::CoveredBundle],
+        _proof: &[u8],
+        _binding: &[u32; 8],
+        _depth: u32,
+    ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+        Err(ConfidentialError::AggregationUnsupported)
+    }
+    /// Tree aggregation's startup key-build, [`Self::warm_aggregation`]'s twin: rebuild the
+    /// section's leaf and per-level step programs and warm the rVM verifier key a root at each
+    /// listed level verifies under (its pinned tier, its canonical reduce height at N = 2), so
+    /// the first tree aggregate does not pay a key build inside admission. Called once at node
+    /// startup on a chain whose genesis has an `aggregation_tree` section; may be a no-op.
+    fn warm_tree(&self, _tree: &crate::ledger::aggregation::TreeConfig) {}
 }
 
 /// Test executor. A "proof" is `STUB` || tier (1 byte) || 8 outputs (LE u32) || `H_IN`
@@ -316,6 +369,10 @@ const STUB_BUNDLE_LEN: usize = 4 + 32 + 8 + 32 + 8;
 /// The tag of a stub aggregate proof that carries its binding (AGG-2), followed by the eight
 /// binding words (32 bytes, little-endian).
 const STUB_AGGREGATE_TAG: &[u8] = b"rand-stub-aggregate-bound";
+/// The tag of a stub tree root proof: followed by the root's declared tier (1 byte), the depth it
+/// was made at (1 byte) and the eight binding words (32 bytes, little-endian).
+const STUB_TREE_TAG: &[u8] = b"rand-stub-tree";
+const STUB_TREE_LEN: usize = STUB_TREE_TAG.len() + 2 + 32;
 
 /// Where the binding words start inside a stub bundle proof.
 const STUB_BUNDLE_BINDING: usize = 4 + 32 + 8;
@@ -402,6 +459,28 @@ impl StubExecutor {
         let mut v = STUB_AGGREGATE_TAG.to_vec();
         v.extend_from_slice(&word8_to_bytes(binding));
         v
+    }
+
+    /// Build a stub tree root proof declaring rVM `tier`, made at `depth` under `binding`. The
+    /// stub's `verify_tree` refuses it (`TreeRootDigest`, as a recompute would) at any other depth
+    /// or under any other binding.
+    pub fn make_tree_proof(tier: u8, depth: u8, binding: &[u32; 8]) -> Vec<u8> {
+        let mut v = STUB_TREE_TAG.to_vec();
+        v.push(tier);
+        v.push(depth);
+        v.extend_from_slice(&word8_to_bytes(binding));
+        v
+    }
+
+    /// The digests the stub "rebuilds" for any tree section: a leaf key and two levels'
+    /// `(program, key)` pairs, all distinct — the test profile's two-entry step list. A section
+    /// pinning these validates its 7b compares against the stub; a third listed level has no
+    /// rebuilt entry (`TreeKeyPin`).
+    pub fn tree_digests_for_tests(&self) -> crate::ledger::aggregation::TreeDigests {
+        crate::ledger::aggregation::TreeDigests {
+            vk_leaf: [0x7472_0001; 4],
+            steps: vec![([0x7472_0002; 4], [0x7472_0003; 4]), ([0x7472_0004; 4], [0x7472_0005; 4])],
+        }
     }
 
     /// Build a stub bundle proof publishing `digest`, bound to the guest commitment `hc_bundle`
@@ -765,6 +844,46 @@ impl ConfidentialExecutor for StubExecutor {
                 })
             })
             .collect())
+    }
+
+    fn aggregate_proof_tier(&self, proof: &[u8]) -> Result<u8, ConfidentialError> {
+        match proof.strip_prefix(STUB_TREE_TAG) {
+            Some(rest) if proof.len() == STUB_TREE_LEN => Ok(rest[0]),
+            _ => Err(ConfidentialError::MalformedProof),
+        }
+    }
+
+    fn tree_digests(&self, _tree: &crate::ledger::aggregation::TreeConfig) -> Result<crate::ledger::aggregation::TreeDigests, ConfidentialError> {
+        Ok(self.tree_digests_for_tests())
+    }
+
+    fn verify_tree(
+        &self,
+        _tree: &crate::ledger::aggregation::TreeConfig,
+        covered: &[crate::types::CoveredBundle],
+        proof: &[u8],
+        binding: &[u32; 8],
+        depth: u32,
+    ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+        let rest = match proof.strip_prefix(STUB_TREE_TAG) {
+            Some(rest) if proof.len() == STUB_TREE_LEN => rest,
+            _ => return Err(ConfidentialError::MalformedProof),
+        };
+        // The covered runs first, as the real one refuses them before its recompute: an OUT word
+        // past `u32` is no canonical run.
+        let mut outs = Vec::with_capacity(covered.len());
+        for (index, c) in covered.iter().enumerate() {
+            let words: Option<Vec<u32>> =
+                (0..8).map(|k| u32::try_from(c.public_values[crate::types::pv::OUT0 + k]).ok()).collect();
+            let words = words.ok_or(ConfidentialError::CoveredPublicValues { index })?;
+            outs.push(std::array::from_fn(|k| words[k]));
+        }
+        // The recompute, modelled: a root made at another depth or under another binding does
+        // not reproduce.
+        if rest[1] as u32 != depth || rest[2..] != word8_to_bytes(binding) {
+            return Err(ConfidentialError::TreeRootDigest);
+        }
+        Ok(outs)
     }
 }
 

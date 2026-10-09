@@ -536,6 +536,52 @@ async fn fee_rules_under_all_three_flags() {
     assert_eq!(call(addr, "rand_getSupply", json!([])).await["result"]["base_fees_burned"], json!("0"));
 }
 
+/// Tree aggregation's `rand_status.aggregation.tree` (review m8; `rand-node aggregate --layout
+/// tree` reads it): every digest is 64 lowercase hex characters, never a JSON number (a limb past
+/// 2^53 would lose bits in a JavaScript reader), and the section reads back exactly. Absent on a
+/// chain without the section. Served without a node behind it: the node loop publishes the
+/// snapshot, and a node refuses every aggregating genesis today.
+#[tokio::test]
+async fn the_status_tree_section_serves_its_digests_as_hex() {
+    use randprotocol_core::ledger::aggregation::{RvmHeights, TreeConfig, TreeStepPin};
+    let (addr, served) = common::serve_genesis(|_| {}).await;
+    let plain = call(addr, "rand_status", json!([])).await;
+    assert!(plain["result"]["aggregation"].get("tree").is_none(), "absent without a section: {}", short(&plain));
+    let h = RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height: 16 };
+    let tree = TreeConfig {
+        shape: randprotocol_core::types::DeclaredShape {
+            profile: randprotocol_core::types::FriProfile::Test,
+            tier: 14,
+            program_log_height: 12,
+            input_log_height: 10,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: 7,
+            mem_log_height: 16,
+        },
+        leaf_size: 1,
+        max_depth: 2,
+        leaf: h,
+        vk_leaf: [u64::MAX, 1 << 60, 3, 4],
+        steps: vec![TreeStepPin { heights: h, program_digest: [0xFFFF_FFFF_0000_0001, 6, 7, 8], key: [9, 10, 11, 12] }],
+    };
+    served.set_status(|s| s.aggregation.tree = Some(randprotocol_node::rpc::TreeStatus::of(&tree)));
+    let rows = [row("rand_status", json!([]), "rand-node aggregate --layout tree (`daemon_tree_of`)", &[
+        ("aggregation.tree.leaf_size", Int),
+        ("aggregation.tree.max_depth", Int),
+        ("aggregation.tree.leaf.tier", Int),
+        ("aggregation.tree.vk_leaf", Hex),
+        ("aggregation.tree.steps.0.heights.reduce_log_height", Int),
+        ("aggregation.tree.steps.0.program_digest", Hex),
+        ("aggregation.tree.steps.0.key", Hex),
+    ])];
+    check(addr, &rows).await;
+    let v = call(addr, "rand_status", json!([])).await["result"]["aggregation"]["tree"].clone();
+    assert_eq!(v["vk_leaf"], json!("ffffffffffffffff100000000000000000000000000000030000000000000004"));
+    let back: randprotocol_node::rpc::TreeStatus = serde_json::from_value(v).unwrap();
+    assert_eq!(back.to_config().unwrap(), tree, "the section reads back exactly");
+}
+
 /// The proposer/aggregator split (`docs/compute-optimization.md` §6.2–§6.3) on the wire:
 /// `fee_rules.prove_base` is a decimal string like every amount, `proposer_share_bps` a number, and
 /// `rand_estimateFee`'s bundle floor includes `prove_base`. Served without a node behind it, for

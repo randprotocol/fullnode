@@ -3083,6 +3083,7 @@ mod tests {
                             .as_bytes(),
                     ),
                     payout_total,
+                    layout: randprotocol_core::types::AggregateLayout::Flat,
                 },
             }
         };

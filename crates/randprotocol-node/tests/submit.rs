@@ -195,6 +195,7 @@ async fn a_gossiped_aggregate_is_verified_off_the_loop_and_its_refusal_cached() 
                         .as_bytes(),
                 ),
                 payout_total: 0,
+                layout: randprotocol_core::types::AggregateLayout::Flat,
             },
         }
     };

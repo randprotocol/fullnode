@@ -11,11 +11,13 @@
 
 use crate::isa::{Program, F};
 use crate::machine::{Machine, ProveError, Tier, VerifyError};
-use crate::public_values::{interface_words_bound, public_digest};
-use crate::shape::{InnerKey, InnerShape};
+use crate::programs::{verify_rv32t, TREE_ARITY};
+use crate::public_values::{interface_words_bound, public_digest, tree_step_words};
+use crate::shape::{inner_vk_digest, InnerKey, InnerShape, RvmHeights, RvmKey, RvmShape, ShapeError, VerifierShape};
 use crate::witness::{TapeError, WitnessTape};
-use p3_field::PrimeField64;
+use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use randprotocol_zkvm::tables::cpu::pv;
+use std::sync::Arc;
 
 /// The RV32 machine's `Proof` (its 35 public values ride inside it; the empty public segment's
 /// `H_PUB` is a prover-computed constant of the shape, as in M5.1's fixtures).
@@ -65,6 +67,13 @@ pub enum AggregateError {
     /// The executed program's published digest disagrees with the host-computed one — a
     /// tape/program mismatch caught at prove time (R6).
     DigestMismatch,
+    /// A tree covers exactly `leaf_size · 2^d` proofs, `d ≥ 1` (spec §2's layout rule).
+    TreeLayout { covers: usize, leaf_size: usize },
+    /// Tree level `level` (0 = a leaf) cannot be built on the pinned shapes: a proof produced
+    /// there does not declare its pinned shape, or the level lies past a step list whose last
+    /// entry is not a fixed point. The next level's program could not verify it, and the chain
+    /// would refuse the root.
+    TreeShape { level: u32 },
 }
 
 /// Why an aggregate proof did not verify.
@@ -165,4 +174,267 @@ pub fn verify_aggregate(
             })
         })
         .collect())
+}
+
+// ── tree aggregation (spec §2–§4, §4.1 R2–R4 amended) ─────────────────────────────────────────
+
+/// The child key digests a tree's levels publish (spec §4.1 R2, amended by R3): level 1's `vk_c`
+/// is `vk_leaf` (its children are `rv32n` leaves); level `j ≥ 2`'s is `step_keys[j − 2]`, the key
+/// of level `j − 1`'s step proofs, and the list's **last entry repeats** for every deeper level
+/// (the fixed point). The genesis's `vk_leaf` and `step_keys` (spec §4); the test profile's list
+/// is `[vk_t_leaf, vk_int, vk_fix]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeKeys {
+    pub vk_leaf: [F; 4],
+    pub step_keys: Vec<[F; 4]>,
+}
+
+impl TreeKeys {
+    /// The `vk_c` a level-`level` step publishes (1-based): `vk_leaf` at 1, then
+    /// `step_keys[min(level − 2, len − 1)]`. `None` for level 0 and for a level ≥ 2 when no step
+    /// key is pinned.
+    pub fn at_level(&self, level: u32) -> Option<[F; 4]> {
+        match level {
+            0 => None,
+            1 => Some(self.vk_leaf),
+            j => {
+                let last = self.step_keys.len().checked_sub(1)?;
+                Some(self.step_keys[(j as usize - 2).min(last)])
+            }
+        }
+    }
+}
+
+/// A tree's shapes, each carrying its own program: the leaf (`rv32n`'s proofs) and the
+/// per-level step list (spec §4.1 R3): `steps[k − 1]` is the declared shape of level `k`'s proofs,
+/// carrying level `k`'s program, `rv32t` built over level `k − 1`'s shape (the leaf's for `k = 1`).
+/// The last entry repeats for every deeper level, which is sound only when it is a fixed point
+/// ([`TreeShapes::fixed_point`]).
+#[derive(Clone, Debug)]
+pub struct TreeShapes {
+    pub leaf: RvmShape,
+    pub steps: Vec<RvmShape>,
+}
+
+impl TreeShapes {
+    /// From the pinned leaf heights and the per-level step heights (R4): build `rv32n` at the
+    /// leaf, then each level's `rv32t` over the shape below it, at that level's heights.
+    pub fn build(
+        profile: crate::machine::FriProfile,
+        inner: &InnerVerifierKey,
+        leaf: RvmHeights,
+        steps: &[RvmHeights],
+    ) -> Result<Self, ShapeError> {
+        if steps.is_empty() {
+            return Err(ShapeError::EmptyTreeSteps);
+        }
+        let leaf = RvmShape::try_of_heights(profile, &Arc::new(aggregate_program(inner)), leaf)?;
+        let mut out: Vec<RvmShape> = Vec::with_capacity(steps.len());
+        for h in steps {
+            let child = out.last().unwrap_or(&leaf);
+            let program = Arc::new(verify_rv32t(child, crate::dsl::Checkpoints::Off).program);
+            out.push(RvmShape::try_of_heights(profile, &program, *h)?);
+        }
+        Ok(TreeShapes { leaf, steps: out })
+    }
+
+    /// The key list: `vk_leaf` over the leaf shape, then each level's proofs' key in order.
+    pub fn keys(&self) -> TreeKeys {
+        let vk = |s: &RvmShape| inner_vk_digest(s, &RvmKey::of(s.profile, s));
+        TreeKeys { vk_leaf: vk(&self.leaf), step_keys: self.steps.iter().map(vk).collect() }
+    }
+
+    /// The declared shape of level `level`'s proofs (1-based), carrying that level's program;
+    /// the last entry repeats. `None` for level 0 and for an empty list (the fields are public,
+    /// so a list put together by hand may be empty), as [`TreeKeys::at_level`] answers.
+    pub fn step_at(&self, level: u32) -> Option<&RvmShape> {
+        let last = self.steps.len().checked_sub(1)?;
+        let k = (level as usize).checked_sub(1)?;
+        Some(&self.steps[k.min(last)])
+    }
+
+    /// The shape of level `level`'s children (1-based): what that level's tape is built against.
+    /// The leaf at level 1; `None` for level 0 and where [`TreeShapes::step_at`] has none.
+    pub fn child_at(&self, level: u32) -> Option<&RvmShape> {
+        match level {
+            0 => None,
+            1 => Some(&self.leaf),
+            j => self.step_at(j - 1),
+        }
+    }
+
+    /// The root's program at `depth` (level `depth`'s entry, the last repeating): what AGG-6
+    /// checks against `step_digests` and `verify_tree` runs.
+    pub fn root_program(&self, depth: u32) -> Option<&Program> {
+        self.step_at(depth).map(|s| &*s.program)
+    }
+
+    /// Whether the last entry is a fixed point (R3): `rv32t` built over its own shape is its own
+    /// program, so it verifies its own proofs and may serve every deeper level. `false` for an
+    /// empty list.
+    pub fn fixed_point(&self) -> bool {
+        self.steps
+            .last()
+            .is_some_and(|last| crate::programs::tree_step_program_digest(last) == last.program.digest())
+    }
+}
+
+/// Why a tree aggregate did not verify (spec §4's errors that are the verifier's; the chain adds
+/// its own around them). Every variant but `Verify` is answered before `verify_n` builds a key.
+#[derive(Debug)]
+pub enum VerifyTreeError {
+    /// `depth` is 0, or too large for a cover count to exist.
+    TreeDepth { depth: u32 },
+    /// The covered count is not `leaf_size · 2^depth` (or `leaf_size` is 0).
+    TreeLayout { covers: usize, leaf_size: usize },
+    /// No key, or not the pinned key, for level `level` (spec §4 Errors, amended): here, an empty
+    /// step list under a tree of depth ≥ 2; at the chain, also AGG-6's rebuilt-key mismatch.
+    TreeKeyPin { level: u32 },
+    /// `covered[index]` is not the inner shape's count of canonical field words with `u32` OUT
+    /// words: it cannot be a bundle's public values (and a non-canonical word would alias).
+    CoveredPublicValues { index: usize },
+    /// The bottom-up recompute is not the proof's four public values.
+    TreeRootDigest,
+    Verify(VerifyError),
+}
+
+/// The root digest the chain expects (ZKQ-5's rule, spec §4): leaf `i` is the flat bound list over
+/// its `leaf_size` covered public-value runs, and each level `j ≥ 1` is `[keys.at_level(j) ‖ 2 ‖ B
+/// ‖ D_a ‖ D_b]` over adjacent pairs, in cover order, under the one `binding`.
+pub fn tree_root_digest(
+    inner: &InnerVerifierKey,
+    covered: &[Vec<u64>],
+    binding: &[u32; 8],
+    leaf_size: usize,
+    depth: u32,
+    keys: &TreeKeys,
+) -> Result<[F; 4], VerifyTreeError> {
+    let leaves = 1usize.checked_shl(depth).filter(|_| depth >= 1).ok_or(VerifyTreeError::TreeDepth { depth })?;
+    if leaf_size == 0 || leaf_size.checked_mul(leaves) != Some(covered.len()) {
+        return Err(VerifyTreeError::TreeLayout { covers: covered.len(), leaf_size });
+    }
+    let level_keys: Vec<[F; 4]> = (1..=depth)
+        .map(|j| keys.at_level(j).ok_or(VerifyTreeError::TreeKeyPin { level: j }))
+        .collect::<Result<_, _>>()?;
+    let npv = inner.shape.num_public_values()[inner.shape.pv_instance()];
+    for (index, run) in covered.iter().enumerate() {
+        let well_formed = run.len() == npv
+            && run.iter().all(|x| *x < F::ORDER_U64)
+            && run[pv::OUT0..pv::OUT0 + 8].iter().all(|x| *x <= u32::MAX as u64);
+        if !well_formed {
+            return Err(VerifyTreeError::CoveredPublicValues { index });
+        }
+    }
+    let mut level: Vec<[F; 4]> = covered
+        .chunks(leaf_size)
+        .map(|leaf| public_digest(&interface_words_bound(&inner.shape, &inner.key, binding, leaf)))
+        .collect();
+    for vk in level_keys {
+        level = level.chunks(2).map(|p| public_digest(&tree_step_words(&vk, binding, &p[0], &p[1]))).collect();
+    }
+    debug_assert_eq!(level.len(), 1, "L·2^d covers fold to one root");
+    Ok(level[0])
+}
+
+/// Spec §4's `verify_tree`: the layout, the bottom-up recompute against the proof's public
+/// values, then `Machine::verify_n(root_program, proof, 2)`, so the canonical reduce height holds
+/// for the step (R1). Cheap before expensive, in `verify_aggregate`'s order. Returns each covered
+/// bundle's `OUT0..7`, in cover order. Choosing `root_program` (level `depth`'s entry of the
+/// step list, [`TreeShapes::root_program`]) and pinning the keys belong to the caller: in the
+/// chain's case, admission's step 7b.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_tree(
+    m: &Machine,
+    root_program: &Program,
+    proof: &crate::machine::Proof,
+    inner: &InnerVerifierKey,
+    covered: &[Vec<u64>],
+    binding: &[u32; 8],
+    leaf_size: usize,
+    depth: u32,
+    keys: &TreeKeys,
+) -> Result<Vec<[u32; 8]>, VerifyTreeError> {
+    let root = tree_root_digest(inner, covered, binding, leaf_size, depth, keys)?;
+    let want: Vec<u64> = root.iter().map(|f| f.as_canonical_u64()).collect();
+    if proof.public_values != want {
+        return Err(VerifyTreeError::TreeRootDigest);
+    }
+    m.verify_n(root_program, proof, TREE_ARITY).map_err(VerifyTreeError::Verify)?;
+    Ok(covered
+        .iter()
+        .map(|run| std::array::from_fn(|k| run[pv::OUT0 + k] as u32))
+        .collect())
+}
+
+/// One interior step proved over `children` (of shape `child`, in cover order): the tape, the
+/// proof, and the host's own `[vk_c ‖ 2 ‖ B ‖ D_a ‖ D_b]` compared with what the proof publishes,
+/// at prove time (`aggregate`'s R6 discipline).
+pub fn prove_tree_step(
+    m: &Machine,
+    child: &RvmShape,
+    children: [&crate::machine::Proof; 2],
+    binding: &[u32; 8],
+    tier: Option<Tier>,
+) -> Result<crate::machine::Proof, AggregateError> {
+    let program = verify_rv32t(child, crate::dsl::Checkpoints::Off).program;
+    let tape = WitnessTape::build_tree_step(m.profile, child, children, binding).map_err(AggregateError::Tape)?;
+    let (proof, _exec) = m.prove(&program, &tape.words, tier).map_err(AggregateError::Prove)?;
+    let vk = inner_vk_digest(child, &RvmKey::of(m.profile, child));
+    let d = |p: &crate::machine::Proof| -> [F; 4] { std::array::from_fn(|k| F::from_u64(p.public_values[k])) };
+    let want: Vec<u64> = public_digest(&tree_step_words(&vk, binding, &d(children[0]), &d(children[1])))
+        .iter()
+        .map(|f| f.as_canonical_u64())
+        .collect();
+    if proof.public_values != want {
+        return Err(AggregateError::DigestMismatch);
+    }
+    Ok(proof)
+}
+
+/// A whole tree on one machine (the aggregate daemon's `--layout tree`): `L·2^d` bundle proofs
+/// (`d ≥ 1`) → `2^d` leaves → `d` levels of steps, level `j` over `shapes.child_at(j)`. Refused
+/// before any proving: a count that is not `L·2^d`, an empty step list, and a depth past a step
+/// list whose last entry is not a fixed point. Every produced proof is checked against its pinned shape before the next
+/// level is built on it. Returns the root and `d`.
+pub fn aggregate_tree(
+    m: &Machine,
+    inner: &InnerVerifierKey,
+    shapes: &TreeShapes,
+    proofs: &[InnerProof],
+    binding: &[u32; 8],
+    leaf_size: usize,
+) -> Result<(crate::machine::Proof, u32), AggregateError> {
+    let leaves = proofs.len().checked_div(leaf_size).unwrap_or(0);
+    if leaf_size == 0 || !proofs.len().is_multiple_of(leaf_size) || leaves < 2 || !leaves.is_power_of_two() {
+        return Err(AggregateError::TreeLayout { covers: proofs.len(), leaf_size });
+    }
+    let depth = leaves.trailing_zeros();
+    let listed = shapes.steps.len() as u32;
+    if listed == 0 || (depth > listed && !shapes.fixed_point()) {
+        return Err(AggregateError::TreeShape { level: listed + 1 });
+    }
+    let mut level: Vec<crate::machine::Proof> = Vec::with_capacity(leaves);
+    for chunk in proofs.chunks(leaf_size) {
+        let p = aggregate(m, inner, chunk, binding, None)?.proof;
+        if !shapes.leaf.matches(&p) {
+            return Err(AggregateError::TreeShape { level: 0 });
+        }
+        level.push(p);
+    }
+    for j in 1..=depth {
+        let (child, out) = match (shapes.child_at(j), shapes.step_at(j)) {
+            (Some(c), Some(o)) => (c, o),
+            _ => return Err(AggregateError::TreeShape { level: j }),
+        };
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks(2) {
+            let p = prove_tree_step(m, child, [&pair[0], &pair[1]], binding, None)?;
+            if !out.matches(&p) {
+                return Err(AggregateError::TreeShape { level: j });
+            }
+            next.push(p);
+        }
+        level = next;
+    }
+    Ok((level.pop().expect("one root"), depth))
 }

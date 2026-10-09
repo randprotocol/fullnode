@@ -89,6 +89,7 @@ fn genesis(key: &Keypair, incremental_nullifier_root: bool) -> anyhow::Result<Ge
         proof_window_blocks: None,
         program_state: None,
         multisig: None,
+        aggregation_tree: None,
         fees: None,
         incremental_nullifier_root: incremental_nullifier_root.then_some(true),
         perps: None,

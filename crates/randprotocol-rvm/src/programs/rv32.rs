@@ -39,7 +39,7 @@ use super::constraints::{
 use super::VerifierProgram;
 
 /// The cap size, in words: four digests of four elements (`cap_height = 2`).
-const CAP_WORDS: usize = (1 << crate::shape::CAP_HEIGHT) * DIGEST_ELEMS;
+pub(super) const CAP_WORDS: usize = (1 << crate::shape::CAP_HEIGHT) * DIGEST_ELEMS;
 
 /// Reads sixteen witness words into four `Digest`s: one `MerkleCap` of `cap_height = 2`.
 ///
@@ -80,6 +80,22 @@ pub(super) fn emit_proof<S: VerifierShape>(
     b: &mut Builder,
     shape: &S,
     key: &S::Key,
+) -> (Array<Felt>, Vec<Phase5Cost>)
+where
+    S::Air: BaseAir<F> + Air<InteractionSymbolicBuilder<F, EF>>,
+{
+    emit_proof_with(b, shape, |b| constant_cap(b, key.cap()))
+}
+
+/// [`emit_proof`] with the preprocessed cap supplied by `cap_of`, which is called at exactly
+/// the point `emit_proof` builds its constant cap (phase 2, after the preprocessed widths), so
+/// `emit_proof` emits the same instructions in the same order as before the split. The tree
+/// step (`super::rv32t`) passes the hinted cap's four digests: offsets of an absolute
+/// allocation, which emit nothing.
+pub(super) fn emit_proof_with<S: VerifierShape>(
+    b: &mut Builder,
+    shape: &S,
+    cap_of: impl FnOnce(&mut Builder) -> [Digest; 4],
 ) -> (Array<Felt>, Vec<Phase5Cost>)
 where
     S::Air: BaseAir<F> + Air<InteractionSymbolicBuilder<F, EF>>,
@@ -133,7 +149,7 @@ where
     for i in 0..n {
         ch.observe_usize(b, shape.preprocessed_widths()[i]);
     }
-    let pre_cap = constant_cap(b, key.cap());
+    let pre_cap = cap_of(b);
     ch.observe_cap(b, &pre_cap);
 
     // ── phase 3: the lookup challenges, the permutation commitment, the terminals, alpha.
@@ -322,6 +338,27 @@ pub(super) fn vk_digest_in_program<S: VerifierShape>(b: &mut Builder, shape: &S,
     }
     let vk = Digest(b.alloc(DIGEST_ELEMS as u64));
     hash::sponge(b, src, msg.len(), vk);
+    vk
+}
+
+/// The verifier-key digest over a cap the program did not bake: `[RVM_VK_DOMAIN] ‖
+/// shape_words ‖ cap(16)` sponged in-program, with the domain and the shape words as constants
+/// and the cap copied from `cap` (sixteen cells). The host twin is `shape::inner_vk_digest(shape,
+/// &RvmKey { cap })`. The tree step publishes this as `vk_c`, so the key a child pair was
+/// checked against is a value the chain compares (spec §3 step 2; ruling 2).
+pub(super) fn vk_digest_over_cap<S: VerifierShape>(b: &mut Builder, shape: &S, cap: Ptr) -> Digest {
+    let words = shape.shape_words();
+    let n = 1 + words.len() + CAP_WORDS;
+    let src = b.alloc(n as u64);
+    let dom = b.constant(F::from_u64(RVM_VK_DOMAIN));
+    b.store(src, 0, dom);
+    for (k, v) in words.iter().enumerate() {
+        let c = b.constant(*v);
+        b.store(src, 1 + k as i64, c);
+    }
+    b.copy_cells(src, (1 + words.len()) as i64, cap, 0, CAP_WORDS);
+    let vk = Digest(b.alloc(DIGEST_ELEMS as u64));
+    hash::sponge(b, src, n, vk);
     vk
 }
 
