@@ -12,6 +12,14 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+- **Compact-blocks follow-ups** (node-only, no wire or consensus change): the first-header
+  equivocation record is capped at 64 entries (was 1 024; ~6 MB worst case at 26 validators,
+  against ~100 MB); a gossiped transaction refused by the per-forwarder limiter is held,
+  unhashed and unverified, in a one-block overflow cache that a compact proposal's rebuild
+  consults after the pool and the recent cache (and that fills an open park), so it no longer
+  costs a fetch — never pooled or served; and with both park slots full, the lowest-view park
+  is replaced only by a header whose justify certifies that view or a later one, so two
+  adjacent Byzantine leaders cannot evict an honest current-view park.
 - **Dollar-indexed prover pay** (genesis-gated, off by default: no existing chain carries it;
   aggregating chains only): a genesis `fees.usd_subsidy { usd_micros_per_sealed_block,
   max_subsidy_per_block, price_max_age_blocks, initial_price_micros }` (all four required) makes

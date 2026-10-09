@@ -511,6 +511,13 @@ hash only what it never saw. Measured on the `feat/compact-blocks` branch, debug
 source column says where each number comes from: most are printed by the test named beside them,
 two are derived from printed sizes and one is quoted from another page.
 
+Memory the compact path keeps beside the pool (spec §0 and its 2026-10-09 follow-ups): the
+recent cache, `4 × max_block_bytes`; the overflow cache of bodies relayed past a forwarder's
+transaction limit, `max_block_bytes`; and the first-header record, 64 signed headers of ~100 KB
+each at 26 validators — about 6 MB at worst (it was 1 024 entries, ~100 MB). The table below
+was measured before the overflow cache; the unpaced run's 24 fetches were bodies dropped by that
+limit, which a rebuild would now find in the overflow cache (not re-measured).
+
 | quantity | value | source |
 |---|---|---|
 | largest compact frame, four validators | 15 420 bytes carrying 4 transactions, mints paced one per node every 500 ms (before the pacing, a burst of all 32: 15 708 bytes carrying 13, and 15 804 carrying 16) | `tests/cluster.rs` `a_proposal_frame_carries_hashes_not_bodies`, raw gossipsub frames read by an observer swarm |

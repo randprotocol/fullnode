@@ -390,13 +390,16 @@ count cap, no duplicate hash, the hash list against the signed `tx_root`, justif
 parent, the QC, the height and view window, the leader of the view, the header signature — and
 the verdict is reported to gossipsub once. A second, different header from a view's leader for
 that view is reported `Ignore` and neither rebuilt nor parked (one header per view and
-proposer); on a chain that slashes, the two signed headers are pooled and gossiped as one
+proposer, the first kept for at most 64 views); on a chain that slashes, the two signed headers are pooled and gossiped as one
 `SlashEquivocation`, as the replica pools its own evidence. The node then rebuilds the block from its mempool and
 its recent-transactions cache (4 096 entries, `4 × max_block_bytes` bytes; it holds gossiped
 bodies once they pass the bytes-only refusal and every proposal body this node sends or
-handles) and hands HotStuff the same full `Proposal` it receives from an old leader. If bodies
+handles), then from its overflow cache — bodies a forwarder relayed past its transaction limit,
+held unhashed and unverified (4 096 entries, `max_block_bytes` bytes), never pooled or served —
+and hands HotStuff the same full `Proposal` it receives from an old leader. If bodies
 are missing the proposal is parked — two slots by view, the band from the replica's view to one
-past the highest parked view, a park never displaced by its own child — and the missing hashes
+past the highest parked view, a park never displaced by its own child nor by a header whose
+justify certifies a view under it — and the missing hashes
 are fetched in batches of 512 from the leader's bound peer, then the forwarder, then peers at or
 above our height, then any, at most 8 distinct peers (a `Busy` answer not counted). A proposal
 the pre-screen `Ignore`s is dropped, never rebuilt: its signature is checked only after the
