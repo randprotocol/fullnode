@@ -65,6 +65,24 @@ pub fn parse_amount(s: &str) -> Result<u64, AmountError> {
         .ok_or(AmountError::Overflow)
 }
 
+/// How an [`Action::Aggregate`]'s proof covers its bundles (tree aggregation, circuits spec
+/// 2026-10-08 §2). `Flat` is today's single aggregate: one rVM proof over the covered bundles,
+/// every rule unchanged. A `Tree` covers exactly `L·2^d` bundles (`L` the genesis
+/// `aggregation_tree.leaf_size`, `1 ≤ d ≤ max_depth`) and is verified level by level from a
+/// root proof (`docs/aggregation.md` §Trees): leaves of `L` bundle proofs, 2-to-1 interior
+/// steps, the chain recomputing every level's digest.
+///
+/// Wire: the field is `Aggregate`'s last, so variant 13 gains a trailing 4-byte little-endian
+/// enum index (`Flat` 0, `Tree` 1) and every aggregate's encoding and txid move. Safe because
+/// aggregation is refused on every live chain (`node::check_build_runs_genesis`): no committed
+/// transaction carries the variant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggregateLayout {
+    #[default]
+    Flat,
+    Tree,
+}
+
 /// What a transaction does besides moving shielded value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
@@ -223,6 +241,12 @@ pub enum Action {
         /// longer pays (a price vote, the price going stale, a halving, between sealing and
         /// inclusion) is refused rather than paid into a note its envelope cannot open.
         payout_total: u64,
+        /// Flat or tree (tree aggregation, R8): signed — a `Tree` aggregate signs
+        /// `aggregate_tree_signing_hash` (`rand-aggregate-tree-1`), a `Flat` one today's message
+        /// byte for byte — so a relayer cannot re-read one layout's proof as the other's. Last,
+        /// and defaulting to `Flat` where a format allows a missing field.
+        #[serde(default)]
+        layout: AggregateLayout,
     },
     /// RPL (spec §4): create a token. Permissionless — anyone who pays the bundle base plus the
     /// registry's `registration_fee` gets the next dense index — and content-addressed: the
@@ -710,7 +734,7 @@ impl Action {
                 }
             }
             Action::SlashAggregator { a, b } => Action::SlashAggregator { a: a.clone(), b: b.clone() },
-            Action::Aggregate { covers, proof: _, aggregator, nonce, time, r, envelope, signature, payout_total } => {
+            Action::Aggregate { covers, proof: _, aggregator, nonce, time, r, envelope, signature, payout_total, layout } => {
                 Action::Aggregate {
                     covers: covers.clone(),
                     proof: Vec::new(),
@@ -721,6 +745,7 @@ impl Action {
                     envelope: envelope.clone(),
                     signature: signature.clone(),
                     payout_total: *payout_total,
+                    layout: *layout,
                 }
             }
             Action::RegisterToken { name, symbol, decimals, authority, initial, salt, index } => {
@@ -1547,6 +1572,7 @@ mod tests {
                 envelope: env(),
                 signature: Signature::empty(),
                 payout_total: 7,
+                layout: AggregateLayout::Flat,
             },
         };
         let got = |tx: &Transaction| {
@@ -1603,8 +1629,52 @@ mod tests {
     /// chain has ever carried an aggregate. Before: encoding
     /// `c5f06333b3d6f2e744f6edeb66b612723c1bc4fcf7f98fd8249b40226af64d64`, id
     /// `da7be1091cabf0cc0489eb619aab0ad5801970c965ecef6e2912a3168845afb2`.
-    const AGGREGATE_ENCODING_BLAKE3: &str = "63ed7180e0defbb91de02fea939a270d19ba91f3bc3fa5927ed772b0add16c45";
-    const AGGREGATE_ID: &str = "838707beb61a7c84d159e0873b8a74b184ba6054ce3d3b78e594cc3e5a7ac8f2";
+    ///
+    /// Moved again by tree aggregation (Task 3a), deliberately: `Aggregate` gained its last field,
+    /// `layout` (here `Flat`), so its encoding grows by the 4-byte enum index `00000000` and its id
+    /// moves. Still no chain has carried an aggregate. Before: encoding
+    /// `63ed7180e0defbb91de02fea939a270d19ba91f3bc3fa5927ed772b0add16c45` (the new encoding less its
+    /// last four bytes hashes to it, `the_aggregate_layout_is_a_trailing_enum_index`), id
+    /// `838707beb61a7c84d159e0873b8a74b184ba6054ce3d3b78e594cc3e5a7ac8f2`.
+    const AGGREGATE_ENCODING_BLAKE3: &str = "6bae239cc2e4909cadaf17b14afb382ff2c0f81c110cc325b74f36b09ac63bf8";
+    const AGGREGATE_ID: &str = "1061b26a884bfc37f1c231727d972dfe396510d3cd7beae88dcb2a67de1b0d26";
+
+    /// Tree aggregation (Task 3a): `Aggregate.layout` is the action's last field, so the wire
+    /// form of variant 13 is exactly its pre-layout encoding followed by the layout's 4-byte
+    /// little-endian enum index — `Flat` 0, `Tree` 1. The pre-layout encoding of the pinned
+    /// aggregate above hashed to `63ed7180…6c45` (dollar-indexed prover pay's pin, 2026-10-09).
+    #[test]
+    fn the_aggregate_layout_is_a_trailing_enum_index() {
+        let flat = Transaction {
+            chain_id: 13,
+            bundle: None,
+            action: Action::Aggregate {
+                covers: vec![Hash([1; 32]), Hash([2; 32])],
+                proof: vec![0xee; 300],
+                aggregator: Address([3; 32]),
+                nonce: 4,
+                time: 5,
+                r: [6; 8],
+                envelope: env(),
+                signature: Signature::empty(),
+                payout_total: 7,
+                layout: AggregateLayout::Flat,
+            },
+        };
+        let bytes = flat.encode();
+        let (head, tail) = bytes.split_at(bytes.len() - 4);
+        assert_eq!(tail, [0, 0, 0, 0]);
+        assert_eq!(hex::encode(blake3::hash(head).as_bytes()), "63ed7180e0defbb91de02fea939a270d19ba91f3bc3fa5927ed772b0add16c45");
+        let mut tree = flat.clone();
+        let Action::Aggregate { layout, .. } = &mut tree.action else { unreachable!() };
+        *layout = AggregateLayout::Tree;
+        let tree_bytes = tree.encode();
+        assert_eq!(&tree_bytes[..head.len()], head);
+        assert_eq!(&tree_bytes[head.len()..], [1, 0, 0, 0]);
+        assert_eq!(Transaction::decode(&tree_bytes).unwrap(), tree);
+        assert_ne!(tree.hash(), flat.hash());
+        assert_eq!(AggregateLayout::default(), AggregateLayout::Flat);
+    }
 
     #[test]
     fn transactions_roundtrip_and_hash_their_full_encoding() {
@@ -2076,6 +2146,7 @@ mod tests {
                 envelope: env(),
                 signature: sig(),
                 payout_total: 9,
+                layout: AggregateLayout::Tree,
             },
             14 => Action::RegisterToken {
                 name: "Test Coin".into(),

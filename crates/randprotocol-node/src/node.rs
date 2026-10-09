@@ -168,6 +168,11 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // The aggregation gate lives in the genesis file too: without this a restarted chain-9 node
     // would compute state-2 roots and refuse every aggregation action by name.
     ledger.set_aggregation(gs.ledger.aggregation().cloned());
+    // And its tree section (tree aggregation, R4): without it a restarted node would refuse every
+    // `Tree` aggregate its peers admit — a block-validity split at the first tree.
+    ledger.set_aggregation_tree(gs.ledger.aggregation_tree().cloned());
+    // And its tree section (tree aggregation, R4): without it a restarted node would refuse every
+    // `Tree` aggregate its peers admit — a block-validity split at the first tree.
     // And the fee-feedback rules (genesis `fees`, `docs/fees.md` §1.3): `load_ledger` restores the
     // stored copy, but the file is the authority — a node that came back without `burn_base`
     // would pay the base its peers burn and compute a different register: a fork at its first
@@ -5932,6 +5937,49 @@ mod tests {
         );
     }
 
+    /// Tree aggregation (R4): the `aggregation_tree` section lives in the genesis file beside
+    /// `aggregation`, and `load_ledger` comes back without it — a restarted node that kept running
+    /// without it would refuse, as `TreeNotAdmitted`, every tree aggregate its peers admit.
+    #[test]
+    fn a_restart_restores_the_aggregation_tree() {
+        use randprotocol_core::ledger::aggregation::{RvmHeights, TreeConfig, TreeStepPin};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        let shape = randprotocol_core::types::DeclaredShape {
+            profile: randprotocol_core::types::FriProfile::Test,
+            tier: 14,
+            program_log_height: 13,
+            input_log_height: 12,
+            keccak_log_height: 0,
+            sha256_log_height: 0,
+            public_log_height: 2,
+            mem_log_height: 18,
+        };
+        let h = RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height: 16 };
+        let tree = TreeConfig {
+            shape,
+            leaf_size: 1,
+            max_depth: 1,
+            leaf: h,
+            vk_leaf: [1; 4],
+            steps: vec![TreeStepPin { heights: h, program_digest: [2; 4], key: [3; 4] }],
+        };
+        gs.ledger.set_aggregation(Some(randprotocol_core::ledger::aggregation::AggregationConfig {
+            bond: 100 * randprotocol_core::UNITS_PER_RAND,
+            max_covers: 3,
+            subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![],
+        }));
+        gs.ledger.set_aggregation_tree(Some(tree.clone()));
+        storage.init_genesis(&gs).unwrap();
+        let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
+        assert_eq!(reloaded.aggregation_tree(), Some(&tree));
+        assert_eq!(reloaded.state_root(), gs.ledger.state_root(), "a genesis parameter, never in the state root");
+    }
+
     /// The staking gate (audit v4, STAKE-2) survives a restart the same way: it lives in the
     /// genesis file, `load_ledger` comes back without it, and a node that kept running without
     /// it would compute `rand-state-2` roots against peers on `rand-state-5`, refuse nothing the
@@ -7895,6 +7943,7 @@ mod tests {
                 envelope: env(9),
                 signature,
                 payout_total,
+                layout: randprotocol_core::types::AggregateLayout::Flat,
             },
         }
     }

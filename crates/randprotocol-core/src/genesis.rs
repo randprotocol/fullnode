@@ -528,6 +528,16 @@ pub struct Genesis {
     /// when absent, so every chain without one hashes and commits byte-for-byte as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multisig: Option<crate::ledger::multisig::MultisigConfig>,
+    /// Tree aggregation (circuits spec 2026-10-08 §4, R4): the leaf size, the deepest tree, the
+    /// leaf and per-level step heights and the digests the node must rebuild them to. R4:
+    /// top-level so `aggregation`'s hashed bytes do not move; appended last to the commitment
+    /// (after `multisig`), tagged and only when present, so every genesis without it hashes
+    /// byte-for-byte as before. Requires `aggregation` and must pass [`TreeConfig::check`]
+    /// against it.
+    ///
+    /// [`TreeConfig::check`]: crate::ledger::aggregation::TreeConfig::check
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregation_tree: Option<crate::ledger::aggregation::TreeConfig>,
 }
 
 /// The chains whose committed genesis file (`deploy/genesis-chain<N>.json`) carries both
@@ -883,6 +893,14 @@ impl Genesis {
         }
         if let Some(aggregation) = &self.aggregation {
             check_aggregation(aggregation, &self.fri_profile)?;
+        }
+        // Tree aggregation: the section refines `aggregation` (its shape, its cover cap), so it
+        // is refused without one.
+        if let Some(tree) = &self.aggregation_tree {
+            let Some(aggregation) = &self.aggregation else {
+                return Err(GenesisError::BadAggregationConfig("aggregation_tree without aggregation".into()));
+            };
+            tree.check(aggregation).map_err(GenesisError::BadAggregationConfig)?;
         }
         // S2 divides by `epoch_blocks` to get the epoch of a height; a genesis file that says
         // zero would panic every node on the first block rather than at the one place that
@@ -1281,6 +1299,7 @@ impl Genesis {
             ledger.set_tokens(Some(registry));
         }
         ledger.set_aggregation(self.aggregation.clone());
+        ledger.set_aggregation_tree(self.aggregation_tree.clone());
         ledger.set_fees(self.fees.clone().unwrap_or_default());
         // The dollar-indexed subsidy's starting price, when the file gives one: set at height 0
         // with nonce 0, so the first `SetRandPrice` carries nonce 1 either way.
@@ -1748,6 +1767,13 @@ impl Genesis {
                 commit.extend_from_slice(&a.balance.to_be_bytes());
             }
         }
+        // Tree aggregation (R4), after `multisig` — last — tagged, and only when the file has the
+        // section, so every genesis cut before it hashes byte-for-byte as before. The whole
+        // section, bincode (the step list length-prefixed).
+        if let Some(t) = &self.aggregation_tree {
+            commit.extend_from_slice(b"aggregation_tree");
+            commit.extend_from_slice(&bincode::serialize(t).expect("serializes"));
+        }
         let genesis_binding = Hash::digest_domain(b"rand-genesis-2", &commit);
         let header = BlockHeader {
             height: 0,
@@ -2199,6 +2225,7 @@ mod tests {
             incremental_nullifier_root: None,
             perps: None,
             multisig: None,
+            aggregation_tree: None,
         }
     }
 
@@ -2878,6 +2905,75 @@ mod tests {
         g.alloc = opened_alloc();
         g.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None });
         assert_eq!(build(&g).hash().to_hex(), "de93090f45fefa36f131e934849bf188aea7782ed47c07e77f653d32354ebc06");
+    }
+
+    /// Tree aggregation (circuits spec 2026-10-08 §4, R4): `aggregation_tree` is a top-level
+    /// section, checked against `aggregation`, and bound into the genesis hash last and only when
+    /// present — so an aggregating genesis without it hashes exactly as it did (the pinned
+    /// `de93…` fixture above), and adding it moves only its own hash.
+    #[test]
+    fn an_aggregation_tree_section_is_checked_and_moves_only_its_own_hash() {
+        use crate::ledger::aggregation::{RvmHeights, TreeConfig, TreeStepPin};
+        use crate::ledger::fees::FeesConfig;
+        let mut g = aggregating_genesis();
+        g.bridge = Some(bridge_cfg());
+        g.tokens = Some(TokensConfig { registration_fee: MIN_REGISTRATION_FEE, tokens: vec![], mint_cap_per_day: 100_000 * 100_000_000, max_tokens: None, burn_registration_fee: None, bound_note_value: None, incremental_root: None });
+        g.alloc = opened_alloc();
+        g.fees = Some(FeesConfig { burn_base: Some(true), subsidy_net_of_fees: Some(true), burn_floor: None, proposer_share_bps: None, prove_base: None, usd_subsidy: None });
+        assert_eq!(g.aggregation_tree, None);
+        assert!(!g.to_json().contains("aggregation_tree"), "absent is omitted from the file");
+        let before = build(&g);
+        assert_eq!(before.hash().to_hex(), "de93090f45fefa36f131e934849bf188aea7782ed47c07e77f653d32354ebc06");
+        assert_eq!(before.ledger.aggregation_tree(), None);
+
+        g.aggregation.as_mut().unwrap().max_covers = 8;
+        let widened = build(&g).hash();
+        let shape = g.aggregation.as_ref().unwrap().admitted_shapes[0].shape;
+        let h = |reduce_log_height| RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height };
+        let tree = TreeConfig {
+            shape,
+            leaf_size: 1,
+            max_depth: 3,
+            leaf: h(15),
+            vk_leaf: [1; 4],
+            steps: vec![
+                TreeStepPin { heights: h(16), program_digest: [2; 4], key: [3; 4] },
+                TreeStepPin { heights: h(17), program_digest: [4; 4], key: [5; 4] },
+            ],
+        };
+        let mut t = g.clone();
+        t.aggregation_tree = Some(tree.clone());
+        let with = build(&t);
+        assert_ne!(with.hash(), widened, "the section is committed");
+        assert_eq!(with.ledger.aggregation_tree(), Some(&tree), "and installed on the ledger");
+        let back: Genesis = serde_json::from_str(&t.to_json()).unwrap();
+        assert_eq!(back, t);
+        let mut other = t.clone();
+        other.aggregation_tree.as_mut().unwrap().steps[1].key = [6; 4];
+        assert_ne!(build(&other).hash(), with.hash(), "every pin is in the hash");
+
+        let refused = |f: &dyn Fn(&mut TreeConfig)| {
+            let mut bad = t.clone();
+            f(bad.aggregation_tree.as_mut().unwrap());
+            matches!(bad.validate(), Err(GenesisError::BadAggregationConfig(_)))
+        };
+        assert!(refused(&|c| c.leaf_size = 0));
+        assert!(refused(&|c| c.leaf_size = 6));
+        assert!(refused(&|c| c.max_depth = 0));
+        assert!(refused(&|c| c.max_depth = 4), "L·2^4 = 16 > max_covers 8");
+        assert!(refused(&|c| c.vk_leaf = [0; 4]));
+        assert!(refused(&|c| c.steps[0].program_digest = [0; 4]));
+        assert!(refused(&|c| c.steps[1].key = [0; 4]));
+        assert!(refused(&|c| c.shape.mem_log_height += 1), "a shape matching no admitted shape");
+        assert!(refused(&|c| c.steps.clear()), "an empty step list");
+        assert!(refused(&|c| c.max_depth = 1), "more steps than levels");
+        let mut orphan = t.clone();
+        orphan.aggregation = None;
+        orphan.fees = None;
+        assert!(
+            matches!(orphan.validate(), Err(GenesisError::BadAggregationConfig(m)) if m.contains("without aggregation")),
+            "the section without aggregation"
+        );
     }
 
     /// Fee feedback: the fee-first subsidy nets the aggregation subsidy, so a chain without an

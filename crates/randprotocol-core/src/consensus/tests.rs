@@ -161,6 +161,7 @@ fn build_with(n: u8, validators: u8, epoch_blocks: u64, all_signers: bool, bridg
         proof_window_blocks: None,
         program_state: None,
         multisig: None,
+        aggregation_tree: None,
         fees: None,
         incremental_nullifier_root: None,
         perps: None,
@@ -1593,6 +1594,7 @@ fn one_node_parts() -> (ConsensusConfig, crate::genesis::GenesisState, Keypair) 
         proof_window_blocks: None,
         program_state: None,
         multisig: None,
+        aggregation_tree: None,
         fees: None,
         incremental_nullifier_root: None,
         perps: None,
@@ -2220,6 +2222,7 @@ fn aggregation_node_with(
         proof_window_blocks: None,
         program_state: None,
         multisig: None,
+        aggregation_tree: None,
         fees: None,
         incremental_nullifier_root: None,
         perps: None,
@@ -2320,6 +2323,7 @@ fn aggregate_tx(ledger: &crate::ledger::Ledger, key: &Keypair, nonce: u64, time:
             envelope,
             signature,
             payout_total,
+            layout: crate::types::AggregateLayout::Flat,
         },
     }
 }

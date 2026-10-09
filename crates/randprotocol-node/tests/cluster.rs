@@ -219,6 +219,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         proof_window_blocks: None,
         program_state: None,
         multisig: None,
+        aggregation_tree: None,
         fees: None,
         incremental_nullifier_root: None,
         perps: None,
@@ -2174,6 +2175,7 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
                 envelope,
                 signature,
                 payout_total,
+                layout: randprotocol_core::types::AggregateLayout::Flat,
             },
         }
     };

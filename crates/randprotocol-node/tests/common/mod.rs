@@ -98,6 +98,7 @@ fn genesis(key: &Keypair) -> Genesis {
         proof_window_blocks: None,
         program_state: None,
         multisig: None,
+        aggregation_tree: None,
         fees: None,
         incremental_nullifier_root: None,
         perps: None,

@@ -4710,6 +4710,7 @@ pub(crate) mod tests {
                 envelope: fixtures::env(9),
                 signature,
                 payout_total,
+                layout: randprotocol_core::types::AggregateLayout::Flat,
             },
         };
         let record = st.storage.covered_record(&covered_tx.hash(), FriProfile::Test).unwrap().unwrap();
@@ -4953,6 +4954,7 @@ pub(crate) mod tests {
                     envelope,
                     signature: sig,
                     payout_total: 1_000,
+                    layout: randprotocol_core::types::AggregateLayout::Flat,
                 }),
                 "aggregate",
                 json!({
@@ -6493,6 +6495,7 @@ pub(crate) mod tests {
                 envelope: fixtures::env(9),
                 signature,
                 payout_total,
+                layout: randprotocol_core::types::AggregateLayout::Flat,
             },
         };
         let record = st.storage.covered_record(&deploy.hash(), FriProfile::Test).unwrap().unwrap();

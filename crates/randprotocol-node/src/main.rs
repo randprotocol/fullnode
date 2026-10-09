@@ -2717,6 +2717,9 @@ async fn main() -> Result<()> {
                     Some(path) => Some(read_multisig_config(path, chain_id)?),
                     None => None,
                 },
+                // Tree aggregation's section has no flag yet (tree aggregation Task 3a): a genesis
+                // file written here carries none, and hashes as before.
+                aggregation_tree: None,
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -3804,6 +3807,7 @@ async fn seal_aggregate(
             envelope,
             signature,
             payout_total,
+            layout: randprotocol_core::types::AggregateLayout::Flat,
         },
     })
 }
@@ -5124,6 +5128,7 @@ mod tests {
             proof_window_blocks: None,
             program_state: None,
             multisig: None,
+            aggregation_tree: None,
             fees: None,
             incremental_nullifier_root: None,
             perps: None,

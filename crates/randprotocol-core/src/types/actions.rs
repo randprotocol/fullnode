@@ -656,3 +656,23 @@ pub fn aggregate_signing_hash(
         bincode::serialize(&(chain_id, nonce, time, r, covers, proof_hash, envelope_digest, payout_total)).expect("serializes");
     crate::crypto::Hash::digest_domain(b"rand-aggregate-4", &bytes)
 }
+
+/// What an aggregator signs over a `Tree` aggregate (tree aggregation, circuits spec 2026-10-08
+/// R8): [`aggregate_signing_hash`]'s preimage under its own domain, `rand-aggregate-tree-1`. The
+/// layout is thereby signed — a tree aggregate's signature is no flat aggregate's, and back —
+/// while a `Flat` aggregate signs exactly what it always has.
+#[allow(clippy::too_many_arguments)]
+pub fn aggregate_tree_signing_hash(
+    chain_id: u64,
+    nonce: u64,
+    time: u32,
+    r: &Word8,
+    covers: &[crate::crypto::Hash],
+    proof_hash: &crate::crypto::Hash,
+    envelope_digest: &crate::crypto::Hash,
+    payout_total: u64,
+) -> crate::crypto::Hash {
+    let bytes =
+        bincode::serialize(&(chain_id, nonce, time, r, covers, proof_hash, envelope_digest, payout_total)).expect("serializes");
+    crate::crypto::Hash::digest_domain(b"rand-aggregate-tree-1", &bytes)
+}
