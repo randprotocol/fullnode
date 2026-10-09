@@ -622,6 +622,16 @@ impl HotStuff {
         self.set_for_vote(&qc.block_hash)
     }
 
+    /// Whether `qc` verifies in full — every vote's signature and quorum stake — against the set
+    /// [`set_for_qc`](Self::set_for_qc) gives it: the set of its block's epoch when this replica
+    /// holds the block, the current set otherwise (as a `NewView`'s high QC is judged). For the
+    /// node's park rule (compact-blocks spec 2026-10-08 §0), which trusts a header's
+    /// `justify.view` only once its certificate is real; `precheck_compact` checks the
+    /// certificate's shape alone. Uncached: one verification per caller.
+    pub fn justify_verifies(&self, qc: &QuorumCertificate) -> bool {
+        qc.verify(&self.cfg.domain, &self.set_for_qc(qc))
+    }
+
     /// Recompute [`current_set`](Self::current_set) after `high_qc` or the tree moved. A
     /// `high_qc` whose block this replica cannot obtain leaves the previous set in place; the
     /// fallback in [`fallback_high_qc`](Self::fallback_high_qc) is what resolves that.

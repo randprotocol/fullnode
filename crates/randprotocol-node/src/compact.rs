@@ -100,6 +100,105 @@ impl RecentTxs {
     pub fn bytes(&self) -> usize {
         self.bytes
     }
+
+    /// Drop the oldest entry, if any; [`OverflowTxs`] evicts across its two stages with it.
+    fn pop_oldest(&mut self) -> bool {
+        let Some((old, old_len)) = self.order.pop_front() else { return false };
+        self.by_hash.remove(&old);
+        self.bytes = self.bytes.saturating_sub(old_len);
+        true
+    }
+}
+
+/// The overflow cache (spec 2026-10-08 §0, compact follow-ups): gossiped bodies the forwarder's
+/// transaction limiter refused (`node::Peer::tx_bucket`), kept apart from [`RecentTxs`] so a
+/// compact proposal naming one still rebuilds without a fetch. Capped at [`RECENT_TXS_MAX`]
+/// entries and one block's bytes across both stages below, the oldest out first; a flood fills
+/// and churns this cache only, never the recent one.
+///
+/// Nothing here is verified or pooled, nor served directly: its one use is a rebuild or a park
+/// fill, whose block then goes through the full precheck and the replica like any other (and
+/// whose bodies then enter the recent cache with the block, as fetched bodies do).
+///
+/// A body is taken unhashed (`hold`) and hashed only when a rebuild needs it (`settle`): the
+/// limiter's refusal comes before the transaction id is computed (audit v6, GOSSIP-1), and
+/// hashing every frame a forwarder sends past its allowance on arrival would hand that cost
+/// back to it. Settling runs on a compact proposal that passed the pre-screen and missed the
+/// pool and the recent cache, so the hashing is bounded by one block's bytes per such proposal.
+pub struct OverflowTxs {
+    /// Bodies not yet hashed, oldest first, with their serialized sizes. Every one is newer
+    /// than everything in `hashed`.
+    pending: VecDeque<(Transaction, usize)>,
+    pending_bytes: usize,
+    hashed: RecentTxs,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl OverflowTxs {
+    pub fn new(max_entries: usize, max_bytes: usize) -> OverflowTxs {
+        OverflowTxs {
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+            hashed: RecentTxs::new(max_entries, max_bytes),
+            max_entries,
+            max_bytes,
+        }
+    }
+
+    /// Keep a limiter-dropped body without hashing it. A marker-form body ([`is_marker_form`])
+    /// or one larger than the whole byte cap is not taken; past either cap the oldest entries
+    /// go, the settled ones first (they are older).
+    pub fn hold(&mut self, tx: Transaction) {
+        if is_marker_form(&tx) {
+            return;
+        }
+        let len = bincode::serialized_size(&tx).map_or(usize::MAX, |n| n as usize);
+        if len > self.max_bytes {
+            return;
+        }
+        self.pending.push_back((tx, len));
+        self.pending_bytes = self.pending_bytes.saturating_add(len);
+        while self.len() > self.max_entries || self.bytes() > self.max_bytes {
+            if self.hashed.pop_oldest() {
+                continue;
+            }
+            let Some((_, old_len)) = self.pending.pop_front() else { break };
+            self.pending_bytes = self.pending_bytes.saturating_sub(old_len);
+        }
+    }
+
+    /// Hash every held body, so [`OverflowTxs::get`] finds it. A body already settled under the
+    /// same id is a no-op ([`RecentTxs::remember_hashed`]); the total only shrinks.
+    pub fn settle(&mut self) {
+        self.pending_bytes = 0;
+        for (tx, _) in std::mem::take(&mut self.pending) {
+            let h = tx.hash();
+            self.hashed.remember_hashed(h, tx);
+        }
+    }
+
+    /// A settled body by id; one held but not yet settled is not found.
+    pub fn get(&self, h: &Hash) -> Option<&Transaction> {
+        self.hashed.get(h)
+    }
+
+    /// Whether any body is held and not yet settled.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.pending.len() + self.hashed.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.pending_bytes.saturating_add(self.hashed.bytes())
+    }
 }
 
 /// The answer to a transaction fetch (spec 2026-10-08 §3.2, §6): the bodies `lookup` finds for
@@ -485,6 +584,39 @@ pub(crate) mod tests {
         assert_eq!(p.missing(), vec![txs[1].hash()]);
         assert_eq!(p.accept(vec![txs[1].clone()]), 1);
         assert_eq!(p.into_block().unwrap(), block);
+    }
+
+    /// The overflow cache holds bodies unhashed, finds them once settled, refuses marker-form
+    /// and oversize bodies, and evicts oldest first across both stages within its caps.
+    #[test]
+    fn the_overflow_cache_settles_on_demand_and_evicts_oldest_first() {
+        let txs: Vec<Transaction> = (1..=5).map(bundled).collect();
+        let one = bincode::serialized_size(&txs[0]).unwrap() as usize;
+        let mut o = OverflowTxs::new(usize::MAX, 3 * one);
+        o.hold(txs[0].clone());
+        assert!(o.has_pending() && o.get(&txs[0].hash()).is_none(), "held, not yet found");
+        o.settle();
+        assert!(!o.has_pending());
+        assert_eq!(o.get(&txs[0].hash()), Some(&txs[0]));
+        for t in &txs[1..] {
+            o.hold(t.clone());
+        }
+        assert_eq!((o.len(), o.bytes()), (3, 3 * one), "three fit");
+        o.settle();
+        assert!(o.get(&txs[0].hash()).is_none() && o.get(&txs[1].hash()).is_none(), "the oldest, settled first, went");
+        assert!(txs[2..].iter().all(|t| o.get(&t.hash()).is_some()));
+        o.hold(marker_copy(&txs[0]));
+        assert_eq!(o.len(), 3, "a marker-form body is not held");
+        let mut by_count = OverflowTxs::new(2, usize::MAX);
+        for t in &txs[..3] {
+            by_count.hold(t.clone());
+        }
+        by_count.settle();
+        assert_eq!(by_count.len(), 2, "the count cap");
+        assert!(by_count.get(&txs[0].hash()).is_none());
+        let mut small = OverflowTxs::new(usize::MAX, one - 1);
+        small.hold(txs[0].clone());
+        assert!(small.is_empty(), "a body over the byte cap is not held");
     }
 
     /// `n` distinct request ids, from a real request-response behaviour (they cannot be made

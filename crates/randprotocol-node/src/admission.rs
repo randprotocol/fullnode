@@ -814,6 +814,11 @@ impl ProofRefusedCache {
 pub enum GossipOutcome {
     Report(Acceptance),
     Verify,
+    /// The forwarder's transaction allowance is spent (audit v6, GOSSIP-1): reported `Ignore`,
+    /// like any shed message, and decided before the transaction is hashed. Its own outcome so
+    /// the node can tell this refusal from the others — the body goes to the overflow cache
+    /// (`compact::OverflowTxs`, spec 2026-10-08 §0) and nowhere else.
+    Limited,
 }
 
 impl GossipOutcome {
@@ -864,7 +869,7 @@ impl GossipOutcome {
     ) -> GossipOutcome {
         if let Some(b) = bucket {
             if !limiter.allow(b, now) {
-                return GossipOutcome::Report(Acceptance::Ignore);
+                return GossipOutcome::Limited;
             }
         }
         let h = hash();

@@ -346,9 +346,11 @@ async fn a_proposal_frame_carries_hashes_not_bodies() {
     // 500 ms apart: every node bootstraps from n0, so n0 relays the other three nodes' mints to
     // each peer, and all 32 at once would put 24 through n0 to each receiver in well under a
     // second — past the receiver's per-forwarder transaction limit (`admission::PEER_TX_BURST`
-    // 16, refilling at `PEER_TX_PER_SEC` 4). A body over that limit is dropped unremembered and
-    // later fetched by hash: the fetch path, measured by the late-validator test, not the common
-    // case this one measures. Paced, n0 forwards three mints a round to each peer.
+    // 16, refilling at `PEER_TX_PER_SEC` 4). A body over that limit is not verified or pooled;
+    // it is held in the receiver's overflow cache, which a rebuild consults after the pool and
+    // the recent cache (spec 2026-10-08 §0 follow-ups), so this test paces its mints to measure
+    // the common case: bodies that arrived and were verified. Paced, n0 forwards three mints a
+    // round to each peer.
     const PER_NODE: u8 = 8;
     let submit = async {
         let mut hashes = Vec::new();

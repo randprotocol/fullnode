@@ -1046,6 +1046,12 @@ struct Node {
     /// proposal naming one still waiting for its verdict, or already proposed, is rebuilt
     /// without a fetch (spec 2026-10-08 §5.2, §5.4).
     recent_txs: compact::RecentTxs,
+    /// Gossiped bodies the forwarder's transaction limiter refused, kept apart from
+    /// `recent_txs` so a compact proposal naming one rebuilds without a fetch (spec 2026-10-08
+    /// §0, compact follow-ups). Never verified or pooled, and not served directly — a body used
+    /// in a rebuild enters `recent_txs` with the block, as fetched bodies do; a rebuild source
+    /// and a park filler only, after the pool and `recent_txs`.
+    overflow_txs: compact::OverflowTxs,
     /// The compact proposals waiting for bodies a peer is asked for, by view (spec 2026-10-08
     /// §5.3; final review I2): at most [`PARK_SLOTS`], placed by [`park_slot`], and dropped when
     /// the replica schedules a later view's timeout or holds the block.
@@ -1167,7 +1173,28 @@ enum ParkSlot {
 /// own parent, whose block it needs. Every parked proposal passed the pre-screen, so each
 /// slot is held by a view's scheduled leader: a junk park for the next view leaves the other
 /// slot to the honest current view.
-fn park_slot(parked: &BTreeMap<u64, compact::Parked>, replica_view: u64, header: &randprotocol_core::BlockHeader) -> ParkSlot {
+///
+/// And it replaces the lowest only when its justify certifies that park's view or a later one,
+/// and that justify verifies in full (spec 2026-10-08 §0, compact follow-ups). Otherwise two
+/// adjacent Byzantine leaders — one parking junk in the next view, the next building on an
+/// older parent — could evict the honest current-view park. The view is trusted only after
+/// `justify_ok` (quorum stake and vote signatures, [`HotStuff::justify_verifies`]): the
+/// pre-screen checks a certificate's shape alone, so a header carrying an empty QC naming a
+/// later view would pass it. `justify_ok` runs only on the replace path, so it costs at most one
+/// certificate verification per pre-screened (view, leader) that gets that far.
+///
+/// The price, accepted: an honest successor does not always extend past the park. When the
+/// leader of `v + 1` withholds QC(`v`), the honest leader of `v + 2` proposes with a justify
+/// under `v`, and a replica still at `v` holding parks for `v` and `v + 1` does not park it
+/// (before this rule it replaced the `v` park). That `v` park is moot then; the `v + 2` block
+/// still arrives by its parent's fetch or by sync, and the parks are dropped once the replica's
+/// view moves on.
+fn park_slot(
+    parked: &BTreeMap<u64, compact::Parked>,
+    replica_view: u64,
+    header: &randprotocol_core::BlockHeader,
+    justify_ok: impl FnOnce(&randprotocol_core::types::block::QuorumCertificate) -> bool,
+) -> ParkSlot {
     let top = parked.keys().next_back().copied().unwrap_or(replica_view).max(replica_view).saturating_add(1);
     if header.view < replica_view || header.view > top {
         return ParkSlot::No("outside the park band");
@@ -1180,7 +1207,14 @@ fn park_slot(parked: &BTreeMap<u64, compact::Parked>, replica_view: u64, header:
     }
     match parked.first_key_value() {
         Some((_, p)) if p.compact.hash() == header.parent => ParkSlot::No("both slots are taken, the lowest by its parent"),
-        Some((&low, _)) => ParkSlot::Replace(low),
+        Some((&low, _)) if header.justify.view >= low => {
+            if justify_ok(&header.justify) {
+                ParkSlot::Replace(low)
+            } else {
+                ParkSlot::No("the justify does not verify")
+            }
+        }
+        Some(_) => ParkSlot::No("both slots are taken and the new header does not extend past the lowest"),
         None => ParkSlot::Free,
     }
 }
@@ -1201,10 +1235,16 @@ struct FirstCompact {
     evidence_sent: bool,
 }
 
-/// The most (view, proposer) entries [`Node::first_compact`] keeps (final review C1). Entries
-/// below the committed view are pruned on every insert, so in steady state it holds a handful;
-/// the cap bounds a chain that certifies without committing for a long stretch.
-const FIRST_COMPACT_MAX: usize = 1_024;
+/// The most (view, proposer) entries [`Node::first_compact`] keeps (final review C1; spec
+/// 2026-10-08 §0, compact follow-ups). Entries below the committed view are pruned on every
+/// insert, so in steady state it holds a handful; the cap bounds a chain that certifies without
+/// committing for a long stretch. Each entry holds a signed header, whose size is dominated by
+/// its justify QC — ~100 KB at 26 validators — so 64 entries are ~6 MB at worst, against
+/// ~100 MB at the former 1 024. Entries come only from headers whose signature the pre-screen
+/// verified, so from scheduled leaders, and are pruned below the committed view: an entry
+/// inside the eight-view proposal window (`PROPOSAL_VIEW_WINDOW`) is dropped only after ~64
+/// views without a commit.
+const FIRST_COMPACT_MAX: usize = 64;
 
 /// What the node knows about one peer.
 ///
@@ -2434,6 +2474,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         fetch_inflight: HashMap::new(),
         fetch_attempts: HashMap::new(),
         recent_txs: compact::RecentTxs::new(compact::RECENT_TXS_MAX, compact::recent_txs_bytes(max_block_bytes)),
+        overflow_txs: compact::OverflowTxs::new(compact::RECENT_TXS_MAX, max_block_bytes),
         parked: BTreeMap::new(),
         first_compact: BTreeMap::new(),
         fetch_deferred_since: HashMap::new(),
@@ -2755,6 +2796,8 @@ impl Node {
             // than reporting it. Accepting is the safe reading if that ever changes: a message
             // forwarded once too often beats a message this node silently stops relaying.
             GossipOutcome::Verify => admission::Acceptance::Accept,
+            // A forwarder over its allowance is shed like a full queue: never penalised.
+            GossipOutcome::Limited => admission::Acceptance::Ignore,
         };
         self.net.report_validation(id, a.into()).await;
     }
@@ -2776,6 +2819,15 @@ impl Node {
                 Instant::now(),
             )
         };
+        if outcome == GossipOutcome::Limited {
+            // The per-forwarder limiter's refusal (`Peer::tx_bucket`, PEER_TX_BURST at
+            // PEER_TX_PER_SEC; audit v6, GOSSIP-1) — only this one, not a refused-cache hit nor a
+            // full verification queue. Reported as before, once, `Ignore`; the body is then kept
+            // in the overflow cache, unhashed, so a compact proposal naming it rebuilds without a
+            // fetch (spec 2026-10-08 §0, compact follow-ups). Never verified or pooled, not served directly.
+            self.report(id, outcome).await;
+            return self.on_limited_tx(tx).await;
+        }
         if outcome != GossipOutcome::Verify {
             self.report(id, outcome).await;
             return Ok(());
@@ -2808,6 +2860,24 @@ impl Node {
             Some(tx) => self.fill_parks(tx).await,
             None => Ok(()),
         }
+    }
+
+    /// A body the forwarder's limiter refused (spec 2026-10-08 §0, compact follow-ups): it fills
+    /// an open park waiting for it, and is held in the overflow cache for a later rebuild. The
+    /// id is computed only while a park is open — a pre-screened proposal of a view's scheduled
+    /// leader, at most [`PARK_SLOTS`] — so with none open the limiter's refusal still costs no
+    /// hash (audit v6, GOSSIP-1). A park it completes goes through the full precheck and the
+    /// replica, as from any other source.
+    async fn on_limited_tx(&mut self, tx: Transaction) -> Result<()> {
+        let for_park = !self.parked.is_empty() && !compact::is_marker_form(&tx) && {
+            let h = tx.hash();
+            self.parked.values().any(|p| p.wants(&h))
+        };
+        if for_park {
+            self.fill_parks(tx.clone()).await?;
+        }
+        self.overflow_txs.hold(tx);
+        Ok(())
     }
 
     /// Place a gossiped body in every open park that is waiting for it, and hand on a park it
@@ -3582,9 +3652,12 @@ impl Node {
     }
 
     /// The bodies of `hashes` this node holds (spec 2026-10-08 §6 as amended), in the order
-    /// asked: from the pool, then the recent cache — the two sources a rebuild uses. Not from
-    /// committed storage: a block being fetched for cannot carry a committed transaction again,
-    /// and storage may hold its marker form. A marker-form body ([`compact::is_marker_form`]) is
+    /// asked: from the pool, then the recent cache. Not from the overflow cache, the rebuild's
+    /// third source: its bodies are a forwarder's over-allowance relay, never verified, and are
+    /// not served directly — one used in a rebuild enters the recent cache with the block, as a
+    /// fetched body does (spec 2026-10-08 §0, compact follow-ups). Not from committed storage: a
+    /// block being fetched for cannot carry a committed transaction again, and storage may hold
+    /// its marker form. A marker-form body ([`compact::is_marker_form`]) is
     /// never sent, whatever holds it; the asker would refuse it anyway. On the loop, as
     /// `BlockByHash` is: at most TX_FETCH_BATCH map reads (plan amendment 3). Over the batch
     /// size it is `Busy`, never a partial answer — the asker's batches are bounded, so an
@@ -3673,8 +3746,9 @@ impl Node {
     /// then by its own encoded bytes — then prechecked on its header and hash list
     /// ([`HotStuff::precheck_compact`]) and reported once on that verdict, never on the
     /// rebuild's (plan amendment 4): what passes is provably the scheduled leader's proposal,
-    /// so it is forwarded before its bodies are found. Then rebuilt from the pool and the recent
-    /// cache, never from a marker-form body ([`compact::is_marker_form`]); what is missing is
+    /// so it is forwarded before its bodies are found. Then rebuilt from the pool, the recent
+    /// cache and the overflow cache of limiter-dropped bodies, in that order (spec 2026-10-08
+    /// §0), never from a marker-form body ([`compact::is_marker_form`]); what is missing is
     /// fetched by hash (§5.3), with the proposal parked meanwhile. A block the replica already
     /// holds is neither rebuilt nor fetched.
     ///
@@ -3682,7 +3756,8 @@ impl Node {
     /// carry a committed transaction again, and storage may hold its marker form. Where a
     /// proposal missing bodies may park is [`park_slot`]'s rule (final review I2): two slots, a
     /// band from the replica's view to one past the highest parked view, a parked view kept
-    /// against a second proposal for it, and a park never displaced by its own child. The rule
+    /// against a second proposal for it, and a park never displaced by its own child nor by a
+    /// header whose justify certifies a view under it (spec 2026-10-08 §0). The rule
     /// is decided before the rebuild, so a proposal that would not be parked is rebuilt only when
     /// every body is already here.
     ///
@@ -3754,13 +3829,23 @@ impl Node {
             return Ok(());
         }
         let view = c.header.view;
-        let (pool, recent) = (&self.mempool, &self.recent_txs);
+        // Overflow bodies are hashed only now, and only when the pool and the recent cache miss
+        // one: a proposal that passed the pre-screen, so at most one block's bytes per such
+        // proposal (`compact::OverflowTxs`).
         let real = |t: &&Transaction| !compact::is_marker_form(t);
-        let body = |h: &Hash| pool.get(h).filter(real).or_else(|| recent.get(h).filter(real));
+        if self.overflow_txs.has_pending() {
+            let (pool, recent) = (&self.mempool, &self.recent_txs);
+            if c.tx_hashes.iter().any(|h| pool.get(h).filter(real).or_else(|| recent.get(h).filter(real)).is_none()) {
+                self.overflow_txs.settle();
+            }
+        }
+        let (pool, recent, overflow) = (&self.mempool, &self.recent_txs, &self.overflow_txs);
+        // The pool, then the recent cache, then the overflow cache (spec 2026-10-08 §0).
+        let body = |h: &Hash| pool.get(h).filter(real).or_else(|| recent.get(h).filter(real)).or_else(|| overflow.get(h).filter(real));
         let slot = if c.tx_hashes.iter().all(|h| body(h).is_some()) {
             None
         } else {
-            match park_slot(&self.parked, self.hs.view(), &c.header) {
+            match park_slot(&self.parked, self.hs.view(), &c.header, |qc| self.hs.justify_verifies(qc)) {
                 ParkSlot::No(why) => {
                     tracing::debug!("compact proposal view {view}: bodies missing and not parked: {why} (replica view {})", self.hs.view());
                     return Ok(());
@@ -6358,6 +6443,7 @@ mod tests {
             fetch_inflight: HashMap::new(),
             fetch_attempts: HashMap::new(),
             recent_txs: compact::RecentTxs::new(compact::RECENT_TXS_MAX, compact::recent_txs_bytes(max_block_bytes)),
+            overflow_txs: compact::OverflowTxs::new(compact::RECENT_TXS_MAX, max_block_bytes),
             parked: BTreeMap::new(),
             first_compact: BTreeMap::new(),
             fetch_deferred_since: HashMap::new(),
@@ -6759,6 +6845,71 @@ mod tests {
         assert_eq!(asked.len(), 3, "nothing fetched for the proposal that did not park");
     }
 
+    /// Compact follow-ups (spec 2026-10-08 §0): with both slots taken — the replica's own view
+    /// `v` parked honestly and incomplete, `v + 1` parked as junk — a proposal for `v + 2` whose
+    /// justify certifies a view under `v` does not evict the `v` park: two adjacent Byzantine
+    /// leaders cannot clear an honest current-view park by building on an older parent. A
+    /// proposal for `v + 2` carrying a forged justify — naming `v + 1`, with no votes, which the
+    /// pre-screen's shape check passes — does not evict it either: the justify is verified in
+    /// full before a replace. A proposal for `v + 2` whose real justify certifies view `v` (a
+    /// sibling of the parked block, so not its child) replaces it as before.
+    #[tokio::test]
+    async fn a_proposal_certifying_an_older_view_does_not_evict_the_lowest_park() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let v = node.hs.view();
+        assert!(head.view() < v, "the head's view is under the replica's");
+        let txs: Vec<Transaction> = (1..=5).map(|i| next_tx(&ledger, i)).collect();
+        let honest = block_on(&head, &ledger, &key(1), v, vec![txs[0].clone()]);
+        let junk = block_on(&head, &ledger, &key(1), v + 1, vec![txs[1].clone()]);
+        // Built on the head: its justify certifies `head.view() < v`.
+        let evictor = block_on(&head, &ledger, &key(1), v + 2, vec![txs[2].clone()]);
+        // A sibling at `v`, and a `v + 2` on it: its justify certifies `v`, the lowest park's view.
+        let sibling = block_on(&head, &ledger, &key(1), v, vec![txs[3].clone()]);
+        let successor = block_on(&sibling, &ledger, &key(1), v + 2, vec![txs[4].clone()]);
+        // On the junk park, its justify naming `v + 1` with no votes, re-signed by the leader.
+        let forged = {
+            let b = block_on(&junk, &ledger, &key(1), v + 2, vec![txs[2].clone()]);
+            let mut header = b.header.clone();
+            header.justify.votes.clear();
+            Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, b.transactions, &key(1))
+        };
+        claiming_peer(&mut node, 4);
+
+        for b in [&honest, &junk] {
+            node.on_compact_proposal(CompactBlock::of(b), gossip_id()).await.unwrap();
+        }
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v, v + 1]);
+        assert_eq!(
+            park_slot(&node.parked, v, &evictor.header, |qc| node.hs.justify_verifies(qc)),
+            ParkSlot::No("both slots are taken and the new header does not extend past the lowest")
+        );
+        node.on_compact_proposal(CompactBlock::of(&evictor), gossip_id()).await.unwrap();
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v, v + 1], "not parked");
+        assert_eq!(node.parked.get(&v).map(|p| p.compact.hash()), Some(honest.hash()), "the v park survives");
+
+        // The fixture's one key leads every view, so each later `v + 2` header would be the
+        // evictor's equivocation (final review C1); on a chain where they differ each is fresh.
+        node.first_compact.clear();
+        assert_eq!(
+            park_slot(&node.parked, v, &forged.header, |qc| node.hs.justify_verifies(qc)),
+            ParkSlot::No("the justify does not verify")
+        );
+        node.on_compact_proposal(CompactBlock::of(&forged), gossip_id()).await.unwrap();
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v, v + 1], "the forged evictor is not parked");
+        assert_eq!(node.parked.get(&v).map(|p| p.compact.hash()), Some(honest.hash()), "the v park survives it");
+
+        assert_eq!(park_slot(&node.parked, v, &successor.header, |qc| node.hs.justify_verifies(qc)), ParkSlot::Replace(v));
+        node.first_compact.clear();
+        node.on_compact_proposal(CompactBlock::of(&successor), gossip_id()).await.unwrap();
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v + 1, v + 2], "replaces as before");
+        assert_eq!(node.parked.get(&(v + 2)).map(|p| p.compact.hash()), Some(successor.hash()));
+        let asked: Vec<Vec<Hash>> = tx_fetches(&drain(&mut seen).await).into_iter().map(|(_, h)| h).collect();
+        assert_eq!(asked, vec![vec![txs[0].hash()], vec![txs[1].hash()], vec![txs[4].hash()]], "nothing fetched for the evictor");
+    }
+
     /// [`park_slot`]'s band runs from the replica's view to one past the highest parked view.
     #[test]
     fn the_park_band_runs_from_the_replica_view_to_one_past_the_highest_park() {
@@ -6768,15 +6919,15 @@ mod tests {
         let v = hs.view();
         let header = |view: u64| block_on(&head, &ledger, &key(1), view, vec![]).header;
         let mut parked = BTreeMap::new();
-        assert_eq!(park_slot(&parked, v, &header(v - 1)), ParkSlot::No("outside the park band"));
-        assert_eq!(park_slot(&parked, v, &header(v)), ParkSlot::Free);
-        assert_eq!(park_slot(&parked, v, &header(v + 1)), ParkSlot::Free);
-        assert_eq!(park_slot(&parked, v, &header(v + 2)), ParkSlot::No("outside the park band"));
+        assert_eq!(park_slot(&parked, v, &header(v - 1), |_| true), ParkSlot::No("outside the park band"));
+        assert_eq!(park_slot(&parked, v, &header(v), |_| true), ParkSlot::Free);
+        assert_eq!(park_slot(&parked, v, &header(v + 1), |_| true), ParkSlot::Free);
+        assert_eq!(park_slot(&parked, v, &header(v + 2), |_| true), ParkSlot::No("outside the park band"));
         let b = block_on(&head, &ledger, &key(1), v + 1, vec![]);
         parked.insert(v + 1, compact::Parked::new(CompactBlock::of(&b), Vec::new(), PeerId::random(), Instant::now()));
-        assert_eq!(park_slot(&parked, v, &header(v + 1)), ParkSlot::No("its view is parked already"));
-        assert_eq!(park_slot(&parked, v, &header(v + 2)), ParkSlot::Free, "one past the highest park");
-        assert_eq!(park_slot(&parked, v, &header(v + 3)), ParkSlot::No("outside the park band"));
+        assert_eq!(park_slot(&parked, v, &header(v + 1), |_| true), ParkSlot::No("its view is parked already"));
+        assert_eq!(park_slot(&parked, v, &header(v + 2), |_| true), ParkSlot::Free, "one past the highest park");
+        assert_eq!(park_slot(&parked, v, &header(v + 3), |_| true), ParkSlot::No("outside the park band"));
     }
 
     /// A proposal for a view past the park band is neither parked nor fetched for, and does not
@@ -7272,6 +7423,114 @@ mod tests {
         assert_eq!(reports(&drain(&mut seen).await).len(), 1, "the refused one reported now, the queued one on its verdict");
     }
 
+    /// A connected forwarder whose transaction allowance is spent, under a limiter that does not
+    /// refill, so every delivery it forwards in the test is the limiter's refusal.
+    fn over_its_allowance(node: &mut Node) -> PeerId {
+        node.limiter = admission::PeerLimiter::new(admission::PEER_TX_BURST, 0.0);
+        let f = claiming_peer(node, 4);
+        let now = Instant::now();
+        let bucket = &mut node.peers.get_mut(&f).expect("inserted").tx_bucket;
+        while node.limiter.allow(bucket, now) {}
+        f
+    }
+
+    /// Compact follow-ups (spec 2026-10-08 §0): a transaction delivered over its forwarder's
+    /// limit is reported `Ignore` once and neither pooled, cached as recent nor served; a later
+    /// compact proposal naming it rebuilds from the overflow cache with no fetch, and is handled.
+    #[tokio::test]
+    async fn a_limiter_dropped_body_rebuilds_a_later_proposal_without_a_fetch() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let tx = next_tx(&ledger, 1);
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![tx.clone()]);
+        let f = over_its_allowance(&mut node);
+
+        node.on_gossiped_tx(tx.clone(), GossipId { propagation_source: f, ..gossip_id() }).await.unwrap();
+        let sent = drain(&mut seen).await;
+        assert_eq!(reports(&sent), vec![libp2p::gossipsub::MessageAcceptance::Ignore], "reported once, as before");
+        assert!(!node.mempool.contains(&tx.hash()) && node.verify_queue.is_empty(), "not pooled, not queued");
+        assert!(node.recent_txs.get(&tx.hash()).is_none(), "not in the recent cache");
+        assert_eq!(node.overflow_txs.len(), 1, "held in the overflow cache");
+        node.overflow_txs.settle();
+        let SyncResponse::Transactions(served) = node.serve_transactions(&[tx.hash()]) else { panic!("answered") };
+        assert!(served.is_empty(), "never served from overflow");
+
+        node.on_compact_proposal(CompactBlock::of(&block), gossip_id()).await.unwrap();
+        assert!(node.hs.has_block(&block.hash()), "handled as a proposal");
+        assert!(node.parked.is_empty());
+        let sent = drain(&mut seen).await;
+        assert!(voted_for(&sent, &block), "the replica voted for the rebuilt block");
+        assert_eq!(tx_fetches(&sent), vec![], "no SyncRequest::Transactions sent");
+    }
+
+    /// Compact follow-ups: a limiter-dropped body that arrives while its proposal is parked
+    /// fills the park and, the last one missing, completes it — handled and voted for, nothing
+    /// counted as fetched, the delivery still reported `Ignore` once.
+    #[tokio::test]
+    async fn a_limiter_dropped_body_completes_an_open_park() {
+        let (_d, mut node, mut seen, block, txs, _first) = parked_node(1, 3).await;
+        let f = over_its_allowance(&mut node);
+        node.on_gossiped_tx(txs[0].clone(), GossipId { propagation_source: f, ..gossip_id() }).await.unwrap();
+        assert!(node.parked.is_empty(), "the park completed");
+        assert!(node.hs.has_block(&block.hash()), "handled as a proposal");
+        let sent = drain(&mut seen).await;
+        assert!(voted_for(&sent, &block), "and voted for");
+        assert_eq!(reports(&sent), vec![libp2p::gossipsub::MessageAcceptance::Ignore], "reported once");
+        assert_eq!(node.compact_fetched, 0, "nothing was fetched");
+        assert!(!node.mempool.contains(&txs[0].hash()), "not pooled");
+    }
+
+    /// Compact follow-ups: a forwarder flooding past its allowance churns the overflow cache only
+    /// — its bytes stay within the cap, the oldest junk goes first — and the recent cache keeps
+    /// exactly what it held.
+    #[tokio::test]
+    async fn an_overflow_flood_evicts_only_overflow_entries() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let kept = next_tx(&ledger, 1);
+        node.recent_txs.remember(kept.clone());
+        let (recent_len, recent_bytes) = (node.recent_txs.len(), node.recent_txs.bytes());
+        let junk: Vec<Transaction> = (2..=11).map(|i| next_tx(&ledger, i)).collect();
+        let one = bincode::serialized_size(&junk[0]).unwrap() as usize;
+        let cap = 3 * one + one / 2;
+        node.overflow_txs = compact::OverflowTxs::new(compact::RECENT_TXS_MAX, cap);
+        let f = over_its_allowance(&mut node);
+
+        for (i, t) in junk.iter().enumerate() {
+            node.on_gossiped_tx(t.clone(), GossipId { propagation_source: f, ..gossip_id() }).await.unwrap();
+            if i == 4 {
+                node.overflow_txs.settle(); // a rebuild in mid-flood: eviction crosses both stages
+            }
+        }
+        assert!(node.overflow_txs.bytes() <= cap, "within the byte cap");
+        assert_eq!(node.overflow_txs.len(), 3);
+        node.overflow_txs.settle();
+        assert!(junk[..7].iter().all(|t| node.overflow_txs.get(&t.hash()).is_none()), "the oldest went");
+        assert!(junk[7..].iter().all(|t| node.overflow_txs.get(&t.hash()).is_some()), "the newest stayed");
+        assert_eq!((node.recent_txs.len(), node.recent_txs.bytes()), (recent_len, recent_bytes), "the recent cache untouched");
+        assert_eq!(node.recent_txs.get(&kept.hash()), Some(&kept));
+        assert_eq!(reports(&drain(&mut seen).await).len(), junk.len(), "each delivery reported once");
+    }
+
+    /// Compact follow-ups: the marker form of a transaction (review finding I1), dropped by the
+    /// limiter, is not placed in the overflow cache.
+    #[tokio::test]
+    async fn a_limiter_dropped_marker_form_is_not_held() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, _seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let mut marker = next_tx(&ledger, 1);
+        let b = marker.bundle.as_mut().unwrap();
+        b.proof = [randprotocol_core::notes::PRUNED_PROOF_MARKER, Hash::digest(&b.proof).as_bytes().as_slice()].concat();
+        assert!(compact::is_marker_form(&marker));
+        let f = over_its_allowance(&mut node);
+        node.on_gossiped_tx(marker, GossipId { propagation_source: f, ..gossip_id() }).await.unwrap();
+        assert!(node.overflow_txs.is_empty(), "not held");
+    }
+
     /// A compact proposal whose hash list does not match its signed root is rejected by the
     /// pre-screen: one `Reject` report, no park, no fetch (spec 2026-10-08 §5.1).
     #[tokio::test]
@@ -7453,13 +7712,25 @@ mod tests {
         node.note_first_compact((floor - 1, who), &c, Hash::ZERO);
         node.note_first_compact((floor, who), &c, Hash::ZERO);
         assert_eq!(node.first_compact.keys().map(|k| k.0).collect::<Vec<_>>(), vec![floor], "under the committed view: pruned");
+        assert_eq!(FIRST_COMPACT_MAX, 64, "the cap: 64 signed headers, ~6 MB at 26 validators");
         for v in 1..=FIRST_COMPACT_MAX as u64 {
             node.note_first_compact((floor + v, who), &c, Hash::ZERO);
         }
         assert_eq!(node.first_compact.len(), FIRST_COMPACT_MAX);
         assert!(!node.first_compact.contains_key(&(floor, who)), "the oldest view went first");
-        node.note_first_compact((floor + 5, who), &c, Hash::digest(b"later"));
-        assert_eq!(node.first_compact.get(&(floor + 5, who)).map(|f| f.hash), Some(Hash::ZERO), "the first record stands");
+        // Past the cap, each insert evicts the oldest view still held, and the map stays at 64.
+        let past = FIRST_COMPACT_MAX as u64 + 10;
+        for v in FIRST_COMPACT_MAX as u64 + 1..=past {
+            node.note_first_compact((floor + v, who), &c, Hash::ZERO);
+        }
+        assert_eq!(node.first_compact.len(), FIRST_COMPACT_MAX, "exactly the cap");
+        assert_eq!(
+            node.first_compact.keys().map(|k| k.0).collect::<Vec<_>>(),
+            (floor + past - FIRST_COMPACT_MAX as u64 + 1..=floor + past).collect::<Vec<_>>(),
+            "the newest 64 views, the oldest out first"
+        );
+        node.note_first_compact((floor + past, who), &c, Hash::digest(b"later"));
+        assert_eq!(node.first_compact.get(&(floor + past, who)).map(|f| f.hash), Some(Hash::ZERO), "the first record stands");
     }
 
     /// Audit v6, PROC-8: a node more than one block behind defers by-hash fetches to batch sync;
@@ -9557,10 +9828,10 @@ mod tests {
             GossipOutcome::Verify
         );
         // The same *forwarder's* next one is over the rate limit: ignored, not rejected — an honest
-        // peer in a burst must not be penalised.
+        // peer in a burst must not be penalised. Its own outcome, reported as `Ignore`.
         assert_eq!(
             GossipOutcome::for_transaction(&fresh, Some(&mut bucket), &mut refused, &limiter, 0, VerifyLimits::for_cores(1).queue, t),
-            GossipOutcome::Report(Acceptance::Ignore)
+            GossipOutcome::Limited
         );
         // A different forwarder has its own bucket, because it has its own `node::Peer`.
         let mut other = TokenBucket::default();
@@ -9582,7 +9853,7 @@ mod tests {
         );
         assert_eq!(
             GossipOutcome::for_transaction(&tx, Some(&mut bucket), &mut refused, &limiter, 0, VerifyLimits::for_cores(1).queue, t),
-            GossipOutcome::Report(Acceptance::Ignore)
+            GossipOutcome::Limited
         );
     }
 
@@ -9592,7 +9863,7 @@ mod tests {
     /// hashing seam: an empty bucket, no hash; within the allowance, one.
     #[test]
     fn a_gossiped_transaction_is_hashed_only_within_its_forwarders_allowance() {
-        use crate::admission::{Acceptance, GossipOutcome, PeerLimiter, RefusedCache, TokenBucket};
+        use crate::admission::{GossipOutcome, PeerLimiter, RefusedCache, TokenBucket};
         let (mut refused, limiter, t) = (RefusedCache::new(4), PeerLimiter::new(1, 0.0), Instant::now());
         let tx = transfer(3);
         let hashes = std::cell::Cell::new(0u32);
@@ -9604,7 +9875,7 @@ mod tests {
         assert!(limiter.allow(&mut spent, t));
         assert_eq!(
             GossipOutcome::for_transaction_hashed(&tx, counted, Some(&mut spent), &mut refused, &limiter, 0, VerifyLimits::for_cores(1).queue, t),
-            GossipOutcome::Report(Acceptance::Ignore)
+            GossipOutcome::Limited
         );
         assert_eq!(hashes.get(), 0, "a forwarder over its allowance cost no hash");
         let counted = || {
