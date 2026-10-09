@@ -896,3 +896,59 @@ fn pin_raw(block: &str, key: &str) -> i128 {
         .unwrap_or_else(|| panic!("tests/pins.json's `{block}` block has no `{key}`"))
         .1
 }
+
+/// The chain's `aggregation_tree` genesis section (docs/08 §4) as the exact JSON the node's
+/// `TreeConfig` deserializes — what `rand-node genesis --aggregation-tree TREE.JSON` reads
+/// (fullnode `docs/aggregation.md` §3.8): `shape` (the covered bundles' declared shape, read off
+/// `bundle`'s header, under `profile`), `leaf_size` (L), `max_depth`, `leaf`
+/// (the leaf's five declared heights), `vk_leaf`, and `steps` — level `k`'s `{heights,
+/// program_digest, key}` at `steps[k − 1]`, the spec's `step_tiers` / `step_digests` /
+/// `step_keys` as one list. Every digest is four canonical u64 limbs, never hex.
+#[allow(dead_code)]
+pub fn aggregation_tree_json(
+    profile: FriProfile,
+    bundle: &Proof,
+    leaf_size: usize,
+    max_depth: usize,
+    leaf: &randprotocol_rvm::shape::RvmHeights,
+    vk_leaf: [u64; 4],
+    steps: &[(randprotocol_rvm::shape::RvmHeights, [u64; 4], [u64; 4])],
+) -> String {
+    let profile = match profile {
+        FriProfile::Test => "Test",
+        FriProfile::Production => "Production",
+    };
+    let heights = |h: &randprotocol_rvm::shape::RvmHeights| {
+        format!(
+            "{{ \"tier\": {}, \"reg_log_height\": {}, \"ram_log_height\": {}, \"poseidon2_log_height\": {}, \"reduce_log_height\": {} }}",
+            h.tier.0, h.reg_log_height, h.ram_log_height, h.poseidon2_log_height, h.reduce_log_height
+        )
+    };
+    let limbs = |d: &[u64; 4]| format!("[{}, {}, {}, {}]", d[0], d[1], d[2], d[3]);
+    let steps: Vec<String> = steps
+        .iter()
+        .map(|(h, program, key)| {
+            format!(
+                "    {{\n      \"heights\": {},\n      \"program_digest\": {},\n      \"key\": {}\n    }}",
+                heights(h),
+                limbs(program),
+                limbs(key)
+            )
+        })
+        .collect();
+    format!(
+        "{{\n  \"shape\": {{ \"profile\": \"{profile}\", \"tier\": {}, \"program_log_height\": {}, \"input_log_height\": {}, \
+         \"keccak_log_height\": {}, \"sha256_log_height\": {}, \"public_log_height\": {}, \"mem_log_height\": {} }},\n  \
+         \"leaf_size\": {leaf_size},\n  \"max_depth\": {max_depth},\n  \"leaf\": {},\n  \"vk_leaf\": {},\n  \"steps\": [\n{}\n  ]\n}}\n",
+        bundle.tier.0,
+        bundle.program_log_height,
+        bundle.input_log_height,
+        bundle.keccak_log_height,
+        bundle.sha256_log_height,
+        bundle.public_log_height,
+        bundle.mem_log_height,
+        heights(leaf),
+        limbs(&vk_leaf),
+        steps.join(",\n")
+    )
+}

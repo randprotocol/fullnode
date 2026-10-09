@@ -590,10 +590,13 @@ fn production_tree_root() {
     let _ = production_step_list(&s_step, &s_root, &root);
 }
 
-/// The chain's `aggregation_tree` genesis values (docs/08 §4; Task 3a), printed per level from the
-/// cached leaf, step and root: the leaf heights and `vk_leaf`, then for each listed level its
-/// heights, step program digest (`step_digests`), key (`step_keys`) and tier (`step_tiers`), the
-/// last entry repeating.
+/// The chain's `aggregation_tree` genesis values (docs/08 §4; Task 3a), from the cached leaf, step
+/// and root, printed as the exact `TreeConfig` JSON `rand-node genesis --aggregation-tree TREE.JSON`
+/// reads (`common::aggregation_tree_json`; review m2): the bundle shape, L, `max_depth` (the list
+/// length — deeper only by the fixed point and a genesis decision), the leaf heights and
+/// `vk_leaf`, and per listed level its heights (`step_tiers` is `heights.tier`), step program digest
+/// (`step_digests`) and key (`step_keys`), the last entry repeating. Every digest is four canonical
+/// u64 limbs. Save the block between the `== aggregation_tree` markers as TREE.JSON.
 #[test]
 #[ignore = "tree Task 2: prints the production aggregation_tree genesis values from the cached tree (keys at tier 21: the 256 GB droplet)"]
 fn production_tree_genesis_values() {
@@ -609,16 +612,13 @@ fn production_tree_genesis_values() {
     assert_eq!(shapes.fixed_point(), fixed, "the rebuilt list agrees with the emulated verdict");
     assert_eq!(shapes.steps[0], s_step);
     assert_eq!(shapes.steps[1], s_root);
-    let hex = |d: [randprotocol_rvm::isa::F; 4]| d.map(|f| p3_field::PrimeField64::as_canonical_u64(&f));
+    let limbs = |d: [randprotocol_rvm::isa::F; 4]| d.map(|f| p3_field::PrimeField64::as_canonical_u64(&f));
     let keys = shapes.keys();
-    println!("== aggregate_program_digest {:?}", hex(program.digest()));
-    println!("== leaf_size {L}, leaf heights {:?}", leaf_shape.heights());
-    println!("== vk_leaf {:?}", hex(keys.vk_leaf));
+    println!("== aggregate_program_digest {:?} (admitted_shapes[].aggregate_program_digest)", limbs(program.digest()));
     assert_eq!(keys.vk_leaf, inner_vk_digest(&leaf_shape, &RvmKey::of(P, &leaf_shape)));
-    for (k, s) in shapes.steps.iter().enumerate() {
-        println!("== level {}: heights {:?}, step_digests[{k}] {:?}, step_keys[{k}] {:?}, step_tiers[{k}] {}",
-            k + 1, s.heights(), hex(s.program.digest()), hex(keys.step_keys[k]), s.tier);
-    }
+    let steps: Vec<_> = shapes.steps.iter().enumerate().map(|(k, s)| (s.heights(), limbs(s.program.digest()), limbs(keys.step_keys[k]))).collect();
+    let json = common::aggregation_tree_json(P, &bundles(0, 1)[0], L, list.len(), &leaf_shape.heights(), limbs(keys.vk_leaf), &steps);
+    println!("== aggregation_tree (TREE.JSON for `rand-node genesis --aggregation-tree`)\n{json}== end aggregation_tree");
     println!("== list length {}, fixed point {}: {}", list.len(), if fixed { "HOLDS" } else { "FAILS" },
         if fixed { "max_depth unbounded by R3" } else { "valid genesis for max_depth ≤ 3 only" });
     assert!(fixed, "no fixed point within three levels: the values above serve max_depth ≤ 3; record them in docs/08 §4 and halt for a decision");

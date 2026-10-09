@@ -715,6 +715,31 @@ fn the_tree_shapes_rebuild_the_test_tree_programs_and_keys() {
     assert!(matches!(aggregate_tree(&Machine::new(P), &l.inner, &empty, &bundles, B, 1), Err(AggregateError::TreeShape { level: 1 })));
 }
 
+/// The test tree's genesis section as `rand-node genesis --aggregation-tree` reads it (review
+/// m2): the two-level list `[S_T, S_root]` (`max_depth` 2, no fixed point needed) that the node's
+/// `agg_executor` tests build, printed as `TreeConfig` JSON by `common::aggregation_tree_json` and
+/// held to `tests/tree-test-genesis.json` — the file the node deserializes into its own
+/// `TreeConfig` (fullnode `the_printed_tree_section_is_a_tree_config`). A missing file is written
+/// (the measurement run, as `pins.json`); every later run is a diff against it.
+#[test]
+fn the_test_tree_genesis_section_prints_as_the_nodes_tree_config() {
+    let (l, t) = (leaves(), test_tree());
+    let (h_leaf, h_t, h_root) = (RvmHeights::of_proof(&l.proofs[0]), RvmHeights::of_proof(&t.steps[0]), RvmHeights::of_proof(&t.root));
+    let s = TreeShapes::build(P, &l.inner, h_leaf, &[h_t, h_root]).unwrap();
+    let k = s.keys();
+    let limbs = |d: [F; 4]| d.map(|f| f.as_canonical_u64());
+    let steps: Vec<_> = s.steps.iter().enumerate().map(|(i, x)| (x.heights(), limbs(x.program.digest()), limbs(k.step_keys[i]))).collect();
+    let json = common::aggregation_tree_json(P, &l.bundles[0], 1, 2, &h_leaf, limbs(k.vk_leaf), &steps);
+    println!("{json}");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/tree-test-genesis.json");
+    match std::fs::read_to_string(&path) {
+        Ok(pinned) => assert_eq!(json, pinned, "the printed section moved; regenerate {} and re-vendor", path.display()),
+        Err(_) => std::fs::write(&path, &json).expect("the pin file is writable"),
+    }
+    assert_eq!(limbs(k.vk_leaf), limbs(pinned_key("vk_leaf")));
+    assert_eq!(steps[1].2, limbs(pinned_key("vk_int")), "level 2's key is vk_int");
+}
+
 /// `aggregate_tree`'s refusals that come before any proving: a count that is not L·2^d (d ≥ 1),
 /// and a depth past a list whose last entry is not a fixed point (its program would not verify
 /// the level below it).

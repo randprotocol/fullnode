@@ -1,0 +1,19 @@
+{
+  "shape": { "profile": "Test", "tier": 14, "program_log_height": 12, "input_log_height": 10, "keccak_log_height": 0, "sha256_log_height": 0, "public_log_height": 7, "mem_log_height": 16 },
+  "leaf_size": 1,
+  "max_depth": 2,
+  "leaf": { "tier": 18, "reg_log_height": 19, "ram_log_height": 19, "poseidon2_log_height": 14, "reduce_log_height": 16 },
+  "vk_leaf": [1769152780461762224, 4754121159208375271, 16285051620565002471, 12356170513791122891],
+  "steps": [
+    {
+      "heights": { "tier": 19, "reg_log_height": 20, "ram_log_height": 20, "poseidon2_log_height": 15, "reduce_log_height": 16 },
+      "program_digest": [3195416321034615116, 16074389476184848857, 10803848332169393950, 542376570991201588],
+      "key": [7711328338169539612, 5984874271003933741, 17134834717916042633, 2542356665053237370]
+    },
+    {
+      "heights": { "tier": 19, "reg_log_height": 20, "ram_log_height": 20, "poseidon2_log_height": 15, "reduce_log_height": 17 },
+      "program_digest": [338165182634290769, 13894299979537461483, 15240063192947949267, 14789260007899906598],
+      "key": [12189568167191873679, 7035563939045772652, 12535684755110529647, 4848701472125205360]
+    }
+  ]
+}

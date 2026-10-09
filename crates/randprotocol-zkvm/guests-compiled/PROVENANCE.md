@@ -5,11 +5,12 @@ same path under `guests-compiled/` in the public circuits repository
 (<https://github.com/randprotocol/zkp-circuits>). Nothing here is built or edited in this
 repository. The copies are byte-identical to this circuits commit:
 
-circuits: 92b750e085da15e2cb9eb75950cc98bfc20da627
+circuits: 4a244b604954b13420af419170ef458156a5bbe4
 
-(Branch feat/tree-aggregation, not yet on zkp-circuits. The files here are byte-identical
-at 71e1a04, the pushed commit both rand-zkvm-cuda revs name: the tree re-vendor moved only
-recursion/.)
+(Branch feat/tree-aggregation, not yet on zkp-circuits; 92b750e plus the tree final-review
+fixes, which touched recursion/ tests and docs and research/AGENTS.md only. The files here are
+byte-identical at 71e1a04, the pushed commit both rand-zkvm-cuda revs name: the tree re-vendor
+moved only recursion/.)
 
 That is the commit `.github/workflows/ci.yml` checks out as `CIRCUITS_PIN`; `tests/guest_provenance.rs`
 refuses a manifest whose commit differs from it.

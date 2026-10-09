@@ -498,7 +498,9 @@ echo "reminder: --features cuda / mock-cuda / reference-backend fetch rand-zkvm-
 # `recursion/` moved): `programs/rv32t.rs` (the 2-to-1 step over a compile-time child shape),
 # `aggregate::{TreeKeys, TreeShapes, verify_tree, tree_root_digest, prove_tree_step,
 # aggregate_tree, VerifyTreeError}`, `shape::RvmHeights`, `tests/{tree,tree_measure}.rs` and
-# `tests/heap/`; no flat-path digest, key shape or opcode moves). Re-vendoring the rVM alone is this section alone: the research
+# `tests/heap/`; no flat-path digest, key shape or opcode moves), re-synced at `4a244b6` (the final review's fixes: `tests/common`'s
+# `aggregation_tree_json`, the `TreeConfig` JSON the genesis printers emit, and `tests/tree-test-genesis.json`;
+# no `src/` change). Re-vendoring the rVM alone is this section alone: the research
 # section above rewrites `guests-compiled/PROVENANCE.md` and would carry research's older drift. Two vendored files carry hand fixes this
 # section does not reproduce — keep them when re-syncing: `Cargo.toml`'s `license.workspace`
 # line and `tests/backend.rs`'s doc comment (`randprotocol-zkvm`, not the old crate name). What the
@@ -594,4 +596,4 @@ if "license.workspace = true" not in s:
 PY
 sed -i '' 's|crates/shrugg-zkvm/tests/backend.rs|crates/randprotocol-zkvm/tests/backend.rs|' "$RVM_DST/tests/backend.rs"
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 92b750e, tree aggregation) into $RVM_DST"
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 4a244b6, tree aggregation) into $RVM_DST"

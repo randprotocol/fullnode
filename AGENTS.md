@@ -8,8 +8,9 @@ invariants, and known traps.
 
 ### Tree aggregation (2026-10-09; branch `feat/tree-aggregation`, NOT pushed; genesis-gated, on no chain)
 
-Circuits `92b750e` (branch `feat/tree-aggregation`, **not yet on zkp-circuits**; `CIRCUITS_PIN`
-and both PROVENANCE.md files name it, the `rand-zkvm-cuda` revs stay `71e1a04`, identical where
+Circuits `92b750e` (branch `feat/tree-aggregation`, **not yet on zkp-circuits**; re-pinned at
+`4a244b6` by the final review's fixes, tests and docs only, which `CIRCUITS_PIN`
+and both PROVENANCE.md files now name; the `rand-zkvm-cuda` revs stay `71e1a04`, identical where
 it matters) re-vendored by the recursion section of `deploy/sync-zkvm.sh` alone: `rv32t`,
 `aggregate::{TreeShapes, TreeKeys, verify_tree, aggregate_tree, …}` (`recursion/docs/08`). Core
 (3a): `Aggregate.layout`, genesis `aggregation_tree` (`TreeConfig`: shape, `leaf_size`,
