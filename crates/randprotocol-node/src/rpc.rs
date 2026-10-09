@@ -374,12 +374,90 @@ pub struct AggregationStatus {
     pub halving_blocks: u64,
     /// Sealed blocks so far — the schedule index `n` the next aggregate mints at.
     pub sealed_blocks: u64,
-    /// The genesis `aggregation_tree` section, verbatim (absent on a chain without one): the leaf
-    /// size, `max_depth`, the leaf heights and `vk_leaf`, and the per-level step list (heights,
-    /// program digest, key). What `rand-node aggregate --layout tree` rebuilds its tree shapes
-    /// from, and the ops check of a tree chain (docs/deploy.md).
+    /// The genesis `aggregation_tree` section (absent on a chain without one): the leaf size,
+    /// `max_depth`, the leaf heights and `vk_leaf`, and the per-level step list (heights, program
+    /// digest, key), every digest as 64 lowercase hex characters ([`TreeStatus`]). What
+    /// `rand-node aggregate --layout tree` rebuilds its tree shapes from, and the ops check of a
+    /// tree chain (docs/deploy.md).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tree: Option<randprotocol_core::ledger::aggregation::TreeConfig>,
+    pub tree: Option<TreeStatus>,
+}
+
+/// A four-limb rVM digest (`[u64; 4]`, each a canonical Goldilocks element) as 64 lowercase hex
+/// characters, 16 a limb in order — circuits docs/08's spelling, and a string like every other
+/// digest this RPC serves (a JSON number loses a limb past 2^53 in a JavaScript client).
+pub fn limbs_hex(d: &[u64; 4]) -> String {
+    d.iter().map(|l| format!("{l:016x}")).collect()
+}
+
+/// [`limbs_hex`]'s inverse; anything but exactly 64 hex characters is refused.
+pub fn limbs_from_hex(s: &str) -> Result<[u64; 4], String> {
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("a tree digest is 64 hex characters, got {s:?}"));
+    }
+    let mut out = [0u64; 4];
+    for (k, limb) in out.iter_mut().enumerate() {
+        *limb = u64::from_str_radix(&s[16 * k..16 * (k + 1)], 16).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
+/// One level of [`TreeStatus`]: its pinned heights, the step program digest and the key, hex.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TreeStepStatus {
+    pub heights: randprotocol_core::ledger::aggregation::RvmHeights,
+    pub program_digest: String,
+    pub key: String,
+}
+
+/// `rand_status.aggregation.tree`: the genesis `aggregation_tree` section with its digests as
+/// hex strings (review m8). [`TreeStatus::to_config`] reads it back exactly.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TreeStatus {
+    pub shape: randprotocol_core::types::DeclaredShape,
+    pub leaf_size: u8,
+    pub max_depth: u8,
+    pub leaf: randprotocol_core::ledger::aggregation::RvmHeights,
+    pub vk_leaf: String,
+    pub steps: Vec<TreeStepStatus>,
+}
+
+impl TreeStatus {
+    pub fn of(t: &randprotocol_core::ledger::aggregation::TreeConfig) -> TreeStatus {
+        TreeStatus {
+            shape: t.shape,
+            leaf_size: t.leaf_size,
+            max_depth: t.max_depth,
+            leaf: t.leaf,
+            vk_leaf: limbs_hex(&t.vk_leaf),
+            steps: t
+                .steps
+                .iter()
+                .map(|s| TreeStepStatus { heights: s.heights, program_digest: limbs_hex(&s.program_digest), key: limbs_hex(&s.key) })
+                .collect(),
+        }
+    }
+
+    pub fn to_config(&self) -> Result<randprotocol_core::ledger::aggregation::TreeConfig, String> {
+        Ok(randprotocol_core::ledger::aggregation::TreeConfig {
+            shape: self.shape,
+            leaf_size: self.leaf_size,
+            max_depth: self.max_depth,
+            leaf: self.leaf,
+            vk_leaf: limbs_from_hex(&self.vk_leaf)?,
+            steps: self
+                .steps
+                .iter()
+                .map(|s| {
+                    Ok(randprotocol_core::ledger::aggregation::TreeStepPin {
+                        heights: s.heights,
+                        program_digest: limbs_from_hex(&s.program_digest)?,
+                        key: limbs_from_hex(&s.key)?,
+                    })
+                })
+                .collect::<Result<_, String>>()?,
+        })
+    }
 }
 
 #[allow(clippy::large_enum_variant)] // moved once, never stored in bulk: boxing buys nothing
@@ -4246,13 +4324,22 @@ pub(crate) mod tests {
             vk_leaf: [1; 4],
             steps: vec![TreeStepPin { heights: h, program_digest: [2; 4], key: [3; 4] }],
         };
-        a.tree = Some(t.clone());
+        a.tree = Some(TreeStatus::of(&t));
         let v = serde_json::to_value(&a).unwrap();
         assert_eq!(v["tree"]["leaf_size"], 1);
         assert_eq!(v["tree"]["max_depth"], 2);
         assert_eq!(v["tree"]["steps"][0]["heights"]["reduce_log_height"], 16);
-        let back: TreeConfig = serde_json::from_value(v["tree"].clone()).unwrap();
-        assert_eq!(back, t);
+        // Digests are hex strings (review m8), 16 characters a limb, never JSON numbers.
+        assert_eq!(v["tree"]["vk_leaf"], json!("0000000000000001".repeat(4)));
+        assert_eq!(v["tree"]["steps"][0]["program_digest"], json!("0000000000000002".repeat(4)));
+        assert_eq!(v["tree"]["steps"][0]["key"], json!("0000000000000003".repeat(4)));
+        let back: TreeStatus = serde_json::from_value(v["tree"].clone()).unwrap();
+        assert_eq!(back.to_config().unwrap(), t);
+        // A limb past 2^53 survives exactly, and a malformed digest is refused.
+        let big = [u64::MAX, 0xFFFF_FFFF_0000_0000, 1 << 60, 7];
+        assert_eq!(limbs_from_hex(&limbs_hex(&big)).unwrap(), big);
+        assert!(limbs_from_hex("00").is_err());
+        assert!(limbs_from_hex(&"zz".repeat(32)).is_err());
     }
 
     /// The same state over a database a storage fixture already opened and initialised. Shared

@@ -19,7 +19,10 @@ key}` whose last entry repeats), admission 6t/7a/7b/8, the tree signing domain. 
 the whole section; **`agg_executor::check_tree_pins` at startup** compares every pin and refuses
 an unservable section (leaf size past the rVM N ceiling, a non-canonical reduce height, a
 `max_depth` past a list whose last entry is not a fixed point); `rand_status.aggregation.tree`;
-`rand-node aggregate --layout tree`. **The cover cap is the layout's**: flat ≤ `max_covers`, a tree
+`rand-node aggregate --layout tree` (which runs `check_tree_pins` on its own build before
+proving); `rand-node genesis --aggregation-tree` (bounds + `check_tree_pins` before writing);
+`rand_status.aggregation.tree` digests are 64-char hex (`rpc::TreeStatus`, not the genesis file's
+u64 limbs); the root header must match all five pinned heights of its level. **The cover cap is the layout's**: flat ≤ `max_covers`, a tree
 ≤ `L·2^max_depth` (`check_cover_count`; `TreeConfig::check` no longer reads `max_covers`). Tree
 verdicts but `TreeKeyPin` are `is_permanent`. Traps: `TreeKeyPin.level` is circuits' consuming
 level (`vk_leaf` = 1, `steps[k-1].key` = k+1); the test-profile list needs **three** entries for
@@ -28,7 +31,10 @@ at `max_depth` 2; the agg_executor tree tests run on the in-repo set (heights an
 pins are constants there) — do **not** point `RECURSION_FIXTURES` at circuits' cache for the whole
 node suite (its Test-0..2 are other bytes, and the pinned-vectors test fails), only for
 `the_test_tree_heights_are_the_cached_proofs`. Production values: **pending the droplet** (circuits
-docs/08 §3–§4); `agg_executor::tests::production_tree` is the ignored node-side check for it.
+docs/08 §3–§4); `agg_executor::tests::production_tree` is the ignored node-side check for it
+(L = 2, depth 2: `tree/Production-{leaf-0,step-0,root}` and bundles **Production-0..7**). The
+in-repo bundle fixtures' shape is `14/12/10/0/0/7/16` (the fleet's), the shape every test tree
+value is over.
 
 ### Dollar-indexed prover pay (2026-10-09; branch `feat/usd-prover-pay` off main `3119a29a`, NOT pushed; genesis-gated, on no chain)
 

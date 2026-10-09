@@ -569,6 +569,14 @@ enum Cmd {
         /// balance — the id the treasury's signers spend from. Omitted entirely when absent.
         #[arg(long, value_name = "MULTISIG.JSON")]
         multisig: Option<PathBuf>,
+        /// Tree aggregation (`docs/aggregation.md` §3.8): the `aggregation_tree` section, as a
+        /// `TreeConfig` JSON file (`shape`, `leaf_size`, `max_depth`, `leaf` heights, `vk_leaf`,
+        /// `steps: [{heights, program_digest, key}]`, digests as four u64 limbs). Needs
+        /// `--aggregation`. Checked before anything is written: the genesis bounds, then this
+        /// build's rebuild of every pin (`agg_executor::check_tree_pins`, the node's startup
+        /// check). Omitted entirely when absent.
+        #[arg(long, value_name = "TREE.JSON")]
+        aggregation_tree: Option<PathBuf>,
         /// The bundle guest the chain pins as `hc_bundle`: `v1` (the hidden-asset guest chains 14
         /// and 15 run) or `v2`, the branch-free guest whose instruction and lookup counts do not
         /// depend on which input slots are real or on the spent leaves' indices (INT-2 / GV-1).
@@ -2480,6 +2488,7 @@ async fn main() -> Result<()> {
             envelope_bytes,
             vesting,
             multisig,
+            aggregation_tree,
             bundle_guest,
             auth_guest,
             hardening_v6,
@@ -2722,9 +2731,18 @@ async fn main() -> Result<()> {
                     Some(path) => Some(read_multisig_config(path, chain_id)?),
                     None => None,
                 },
-                // Tree aggregation's section has no flag yet (tree aggregation Task 3a): a genesis
-                // file written here carries none, and hashes as before.
-                aggregation_tree: None,
+                // Tree aggregation: read from a `TreeConfig` JSON file when `--aggregation-tree` is
+                // given (`Genesis::build` runs `TreeConfig::check`; this build's rVM checks the pins
+                // below); omitted entirely otherwise, so a chain without the flag hashes as before.
+                aggregation_tree: match &aggregation_tree {
+                    Some(path) => Some(
+                        serde_json::from_str::<randprotocol_core::ledger::aggregation::TreeConfig>(
+                            &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
+                        )
+                        .with_context(|| format!("{} is not a valid aggregation_tree section", path.display()))?,
+                    ),
+                    None => None,
+                },
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -2754,6 +2772,14 @@ async fn main() -> Result<()> {
             }
             let executor = node::executor_for_profile(&gen.fri_profile)?;
             let state = gen.build(executor.as_ref())?;
+            // The half of the tree section's check core cannot run (review m6): every pin rebuilt
+            // by this build's rVM, the leaf size under its N ceiling, canonical reduce heights, a
+            // fixed point past the list — the node's own startup check, so a section no node of
+            // this build would start on is never written.
+            if let Some(t) = &gen.aggregation_tree {
+                randprotocol_node::agg_executor::check_tree_pins(executor.as_ref(), t)
+                    .map_err(|e| anyhow::anyhow!("--aggregation-tree: {e}"))?;
+            }
             std::fs::write(&out, gen.to_json())?;
             println!(
                 "wrote {} (genesis hash {}, {} validators, {} notes, {} blocks/epoch, programs up to {} words, proofs up to {} bytes, blocks up to {} bytes, call envelopes up to {} bytes, program public input up to {} words, faucet {}, confidential {}, fri {}, hc_bundle {}, hc_auth {})",
@@ -3590,14 +3616,27 @@ fn parse_layout(s: &str) -> Result<randprotocol_core::types::AggregateLayout, St
 
 /// The chain's `aggregation_tree` section, as `rand_status.aggregation.tree` serves it — a
 /// genesis constant, so `--layout tree` reads it once, at start. A node whose genesis has none
-/// (or that predates the field) is a named error.
-async fn daemon_tree_of(rpc: &impl AggregateNode) -> Result<randprotocol_core::ledger::aggregation::TreeConfig> {
+/// (or that predates the field) is a named error. Then this build's own rebuild of every pin
+/// (`check_tree_pins` over `ex`, the node's startup check — review m7): a daemon whose build
+/// does not reproduce the chain's pins would prove for hours a root admission refuses, so it
+/// refuses before proving.
+async fn daemon_tree_of(
+    rpc: &impl AggregateNode,
+    ex: &dyn randprotocol_core::confidential::ConfidentialExecutor,
+) -> Result<randprotocol_core::ledger::aggregation::TreeConfig> {
     let status = rpc.call("rand_status", serde_json::json!([])).await?;
     let tree = &status["aggregation"]["tree"];
     if tree.is_null() {
         anyhow::bail!("--layout tree: the node's rand_status has no aggregation.tree — this chain's genesis has no aggregation_tree section");
     }
-    serde_json::from_value(tree.clone()).context("rand_status.aggregation.tree does not parse as an aggregation_tree section")
+    let tree = serde_json::from_value::<randprotocol_node::rpc::TreeStatus>(tree.clone())
+        .context("rand_status.aggregation.tree does not parse as an aggregation_tree section")?
+        .to_config()
+        .map_err(|e| anyhow::anyhow!("rand_status.aggregation.tree: {e}"))?;
+    randprotocol_node::agg_executor::check_tree_pins(ex, &tree).map_err(|e| {
+        anyhow::anyhow!("this build does not reproduce the chain's aggregation_tree pins ({e}); rebuild from the chain's pinned commit before proving")
+    })?;
+    Ok(tree)
 }
 
 /// How many covers a `--layout tree` pass takes from `available` unsealed bundles: `L·2^d` for the
@@ -4024,7 +4063,15 @@ async fn aggregate_daemon(
     let rpc = RpcClient::new(rpc_url.to_string());
     let chain_id = rpc.chain_id().await?;
     if layout == randprotocol_core::types::AggregateLayout::Tree {
-        let tree = daemon_tree_of(&rpc).await?;
+        let status = rpc.call("rand_status", serde_json::json!([])).await?;
+        let profile = match status["fri_profile"].as_str().unwrap_or("production") {
+            "test" => FriProfile::Test,
+            _ => FriProfile::Production,
+        };
+        // The pin rebuild is minutes at production (the section's programs and keys), once at
+        // start, before any pass; the proving it guards is hours.
+        let ex = std::sync::Arc::new(randprotocol_node::agg_executor::AggExecutor::new(profile));
+        let tree = daemon_tree_of(&rpc, ex.as_ref()).await?;
         tracing::info!("aggregate --layout tree: L = {}, max_depth {}, {} listed levels", tree.leaf_size, tree.max_depth, tree.steps.len());
         cfg.tree = Some(tree.clone());
         return aggregate_loop(&rpc, &kp, chain_id, &cfg, move |p: FriProfile, raw: &[Vec<u8>], b: &[u32; 8]| prove_tree_aggregate(p, raw, b, &tree)).await;
@@ -5473,6 +5520,7 @@ mod tests {
     fn daemon_tree(leaf_size: u8, max_depth: u8) -> randprotocol_core::ledger::aggregation::TreeConfig {
         use randprotocol_core::ledger::aggregation::{RvmHeights, TreeConfig, TreeStepPin};
         let h = |reduce_log_height| RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height };
+        let d = randprotocol_core::confidential::StubExecutor.tree_digests_for_tests();
         TreeConfig {
             shape: randprotocol_core::types::DeclaredShape {
                 profile: randprotocol_core::types::FriProfile::Test,
@@ -5487,10 +5535,12 @@ mod tests {
             leaf_size,
             max_depth,
             leaf: RvmHeights { tier: 18, reg_log_height: 19, ram_log_height: 19, poseidon2_log_height: 14, reduce_log_height: 16 },
-            vk_leaf: [1; 4],
+            // The stub executor's rebuild (`tree_digests_for_tests`), so the daemon's own pin
+            // check (review m7) passes over the stub.
+            vk_leaf: d.vk_leaf,
             steps: vec![
-                TreeStepPin { heights: h(16), program_digest: [2; 4], key: [3; 4] },
-                TreeStepPin { heights: h(17), program_digest: [4; 4], key: [5; 4] },
+                TreeStepPin { heights: h(16), program_digest: d.steps[0].0, key: d.steps[0].1 },
+                TreeStepPin { heights: h(17), program_digest: d.steps[1].0, key: d.steps[1].1 },
             ],
         }
     }
@@ -5519,10 +5569,11 @@ mod tests {
         let payout = randprotocol_zkvm::address::address_of(&SpendKey([7; 8]).viewing_key());
         let mut node = moving_node(kp.address(), payout.clone());
         let t = daemon_tree(1, 2);
-        node.tree = Some(serde_json::to_value(&t).unwrap());
+        node.tree = Some(serde_json::to_value(randprotocol_node::rpc::TreeStatus::of(&t)).unwrap());
         node.unsealed.set(5);
-        let read = daemon_tree_of(&node).await.expect("the node serves the section");
-        assert_eq!(read, t, "rand_status.aggregation.tree is the section verbatim");
+        let stub = randprotocol_core::confidential::StubExecutor;
+        let read = daemon_tree_of(&node, &stub).await.expect("the node serves the section, and this build reproduces it");
+        assert_eq!(read, t, "rand_status.aggregation.tree reads back as the section");
         let tx = aggregate_pass_tree(&node, &kp, 7, &t, |profile, raw, binding| {
             assert_eq!(profile, FriProfile::Test);
             assert_eq!(raw.len(), 4, "L·2^2 = 4 of the five unsealed");
@@ -5554,8 +5605,15 @@ mod tests {
         assert!(!kp.public_key().verify(hash_at(randprotocol_core::types::AggregateLayout::Flat).as_bytes(), signature), "not the flat one");
         node.unsealed.set(1);
         assert!(aggregate_pass_tree(&node, &kp, 7, &t, |_, _, _| panic!("nothing to prove")).await.unwrap().is_none(), "under 2L unsealed");
+        // Review m7: a daemon whose build rebuilds other pins than the chain's refuses before it
+        // proves anything (hours of proving for a root admission would refuse).
+        let mut other = t.clone();
+        other.steps[1].key = [9; 4];
+        node.tree = Some(serde_json::to_value(randprotocol_node::rpc::TreeStatus::of(&other)).unwrap());
+        let e = daemon_tree_of(&node, &stub).await.unwrap_err();
+        assert!(format!("{e:#}").contains("does not reproduce") && format!("{e:#}").contains("tree level 3"), "{e:#}");
         node.tree = None;
-        let e = daemon_tree_of(&node).await.unwrap_err();
+        let e = daemon_tree_of(&node, &stub).await.unwrap_err();
         assert!(format!("{e:#}").contains("aggregation_tree"), "{e:#}");
     }
 

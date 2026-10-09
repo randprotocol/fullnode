@@ -185,16 +185,30 @@ impl AggExecutor {
 
     /// The tree root's header (step 7a's executor half): the decode, the canonical encoding, then
     /// the exact tier pinned for the root's level — `aggregate_header`'s discipline with the
-    /// pinned tier in place of `admitted_tiers`, so a root at any other tier builds nothing.
-    fn aggregate_header_tree(&self, proof: &[u8], pinned_tier: u8) -> Result<randprotocol_rvm::machine::Proof, ConfidentialError> {
+    /// pinned tier in place of `admitted_tiers`, so a root at any other tier builds nothing — and
+    /// then the level's other four pinned heights (review m4): an honest root of level `d`
+    /// declares exactly `step_at(d).heights`, so any other declaration is refused off the header,
+    /// before any key work.
+    fn aggregate_header_tree(
+        &self,
+        proof: &[u8],
+        pinned: randprotocol_core::ledger::aggregation::RvmHeights,
+    ) -> Result<randprotocol_rvm::machine::Proof, ConfidentialError> {
         let p: randprotocol_rvm::machine::Proof = postcard::from_bytes(proof).map_err(|_| ConfidentialError::MalformedProof)?;
         if p.to_bytes() != proof {
             return Err(ConfidentialError::MalformedProof);
         }
-        if p.tier.0 != pinned_tier as usize {
+        if p.tier.0 != pinned.tier as usize {
             return Err(ConfidentialError::InvalidAggregateProof(format!(
-                "tree root at tier {}; its level is pinned at tier {pinned_tier}",
-                p.tier.0
+                "tree root at tier {}; its level is pinned at tier {}",
+                p.tier.0, pinned.tier
+            )));
+        }
+        let declared = (p.reg_log_height, p.ram_log_height, p.poseidon2_log_height, p.reduce_log_height);
+        let want = (pinned.reg_log_height, pinned.ram_log_height, pinned.poseidon2_log_height, pinned.reduce_log_height);
+        if declared != want {
+            return Err(ConfidentialError::InvalidAggregateProof(format!(
+                "tree root declares heights reg/ram/poseidon2/reduce {declared:?}; its level is pinned at {want:?}"
             )));
         }
         Ok(p)
@@ -746,7 +760,7 @@ impl ConfidentialExecutor for AggExecutor {
         if tree.steps.is_empty() {
             return Err(ConfidentialError::InvalidAggregateProof("aggregation_tree lists no step".into()));
         }
-        let root = self.aggregate_header_tree(proof, tree.step_at(depth).heights.tier)?;
+        let root = self.aggregate_header_tree(proof, tree.step_at(depth).heights)?;
         let built = self.built_tree(tree)?;
         if depth as usize > tree.steps.len() && built.fixed_point != Some(true) {
             return Err(ConfidentialError::InvalidAggregateProof(format!(
@@ -1470,6 +1484,23 @@ mod tests {
         assert_eq!(ex.tree_builds(), 1, "the section is built once (memoised by its whole content)");
     }
 
+    /// The memo is keyed by the whole section: two sections differing only in one level's
+    /// heights are two builds with different digests (a key narrower than the section — the
+    /// shape, the pins — would hand the second the first's rebuild).
+    #[test]
+    fn sections_differing_in_one_height_do_not_share_a_rebuild() {
+        let ex = AggExecutor::new(FriProfile::Test);
+        let a = test_tree_cfg();
+        let mut b = a.clone();
+        b.steps[1].heights.tier += 1;
+        let (da, db) = (ex.tree_digests(&a).unwrap(), ex.tree_digests(&b).unwrap());
+        assert_eq!(ex.tree_builds(), 2, "two sections, two builds");
+        assert_ne!(da.steps[1].1, db.steps[1].1, "level 2's key follows its own heights");
+        assert_eq!(da.steps[0], db.steps[0], "level 1 is the same in both");
+        assert_eq!(ex.tree_digests(&a).unwrap(), da, "and each is served from its own entry");
+        assert_eq!(ex.tree_builds(), 2);
+    }
+
     /// The startup check (spec §4: "refuses to start on a mismatch"), stricter than admission's
     /// per-depth 7b: the honest section passes, and every pin, flipped alone, is named — keys by
     /// the consuming level (circuits' `at_level`), program digests as `AggregateProgramMismatch`,
@@ -1584,6 +1615,22 @@ mod tests {
         let b = [3u32; 8];
         let before = ex.rvm.cached_keys();
         assert!(matches!(ex.verify_tree(&t, &covered, &root_for(&b, st.tier as usize + 1), &b, 1), Err(ConfidentialError::InvalidAggregateProof(m)) if m.contains("tier")));
+        assert!(matches!(ex.verify_tree(&t, &covered, &root_for(&b, st.tier as usize - 1), &b, 1), Err(ConfidentialError::InvalidAggregateProof(m)) if m.contains("tier")), "the tier is exact, not a floor");
+        // The root's other declared heights are the level's pins too: a root at the right tier
+        // declaring any other height is refused off its header, before any key work.
+        for bump in 0..4 {
+            let mut p: randprotocol_rvm::machine::Proof = postcard::from_bytes(&root_for(&b, st.tier as usize)).unwrap();
+            match bump {
+                0 => p.reg_log_height += 1,
+                1 => p.ram_log_height += 1,
+                2 => p.poseidon2_log_height += 1,
+                _ => p.reduce_log_height += 1,
+            }
+            assert!(
+                matches!(ex.verify_tree(&t, &covered, &p.to_bytes(), &b, 1), Err(ConfidentialError::InvalidAggregateProof(m)) if m.contains("heights")),
+                "height {bump} off its pin"
+            );
+        }
         assert!(matches!(ex.verify_tree(&t, &covered, &root_for(&[4; 8], st.tier as usize), &b, 1), Err(ConfidentialError::TreeRootDigest)));
         assert_eq!(ex.rvm.cached_keys(), before, "neither refusal built a key");
         assert!(matches!(ex.verify_tree(&t, &covered, &root_for(&b, st.tier as usize), &b, 1), Err(ConfidentialError::InvalidAggregateProof(_))));
@@ -1593,7 +1640,9 @@ mod tests {
         assert!(matches!(ex.verify_tree(&t, &bad, &root_for(&b, st.tier as usize), &b, 1), Err(ConfidentialError::CoveredPublicValues { index: 1 })));
         // A depth the section's list cannot reach without a fixed point is refused, not verified.
         let eight: Vec<CoveredBundle> = (0..8).map(|k| covered[k % 2].clone()).collect();
-        assert!(matches!(ex.verify_tree(&t, &eight, &root_for(&b, TEST_ROOT.tier as usize), &b, 3), Err(ConfidentialError::InvalidAggregateProof(m)) if m.contains("fixed point")));
+        let mut deep: randprotocol_rvm::machine::Proof = postcard::from_bytes(&root_for(&b, TEST_ROOT.tier as usize)).unwrap();
+        deep.reduce_log_height = TEST_ROOT.reduce_log_height; // level 3 repeats level 2's pins
+        assert!(matches!(ex.verify_tree(&t, &eight, &deep.to_bytes(), &b, 3), Err(ConfidentialError::InvalidAggregateProof(m)) if m.contains("fixed point")));
         assert_eq!(ex.rvm.cached_keys(), before + 1, "only the one honest-digest verify built a key");
     }
 
@@ -1626,10 +1675,10 @@ mod tests {
 
     /// The production depth-2 tree through the node: its section built from the cached
     /// production leaf, step and root (circuits docs/08 §3–§4, L = 2), the startup pin check, then
-    /// `verify_tree` over Production-0..3 under the doc binding. **Pending the droplet**: the
+    /// `verify_tree` over Production-0..7 (L·2^2 = 8 bundles) under the doc binding. **Pending the droplet**: the
     /// production tree is not proved yet, and its keys are tier-21 builds.
     #[test]
-    #[ignore = "tree aggregation: the production depth-2 tree (circuits docs/08 §3) — needs tree/Production-{leaf-0,step-0,root}.rvmproof and Production-0..3.proof in RECURSION_FIXTURES and the 256 GB droplet"]
+    #[ignore = "tree aggregation: the production depth-2 tree (circuits docs/08 §3) — needs tree/Production-{leaf-0,step-0,root}.rvmproof and Production-0..7.proof in RECURSION_FIXTURES and the 256 GB droplet"]
     fn production_tree() {
         use p3_field::PrimeField64;
         let dir = std::path::PathBuf::from(std::env::var_os("RECURSION_FIXTURES").expect("RECURSION_FIXTURES"));
@@ -1661,14 +1710,16 @@ mod tests {
         let t = TreeConfig { shape, leaf_size: 2, max_depth: 2, leaf: heights_of(&leaf), vk_leaf: u(k.vk_leaf), steps };
         let ex = AggExecutor::new(FriProfile::Production);
         check_tree_pins(&ex, &t).expect("the production section's own pins");
-        let covered: Vec<CoveredBundle> = (0..4)
+        // L·2^depth covered bundles: fixtures 0..8 at L = 2, depth 2 (circuits' `bundles(0, 4 * L)`).
+        let n = (t.leaf_size as usize) << 2;
+        let covered: Vec<CoveredBundle> = (0..n)
             .map(|k| {
                 let p = bundle(k);
                 CoveredBundle { public_values: p.public_values.clone().try_into().unwrap(), shape }
             })
             .collect();
         let outs = ex.verify_tree(&t, &covered, &root.to_bytes(), &DOC_BINDING, 2).expect("the production tree verifies through the node");
-        assert_eq!(outs.len(), 4);
+        assert_eq!(outs.len(), 8, "one OUT row per covered bundle");
         eprintln!("PRODUCTION_TREE vk_leaf {:?} steps {:?}", t.vk_leaf, t.steps);
     }
 }

@@ -286,7 +286,8 @@ preimage under another tag, so flipping it is `BadSignature`.
 **Admission, a tree's steps.** After step 6 (the covered shapes): **6t** the section must exist
 for the covered shape (`TreeNotAdmitted`) and the count must be a tree (`tree_depth`). **7a**
 (AGG-3 on the root's exact tier, R6): the root's declared tier, read off its header alone, must
-equal the tier pinned for level `d` (`TreeTier`) — nothing is built first. **7b** (AGG-6 per
+equal the tier pinned for level `d` (`TreeTier`) — nothing is built first; the executor then
+holds the root's other four declared heights to the level's pins as well, off the header. **7b** (AGG-6 per
 level): the executor rebuilds the leaf and every listed step program and key from the pinned
 heights (`AggExecutor::built_tree`, memoised), and the root's program must be level `d`'s pinned
 digest (`AggregateProgramMismatch`), then `vk_leaf` and each step key a depth-`d` recompute uses
@@ -315,9 +316,13 @@ bytes against genesis constants and is cached by the admission refusal cache
 (`admission::is_permanent`); `TreeKeyPin` stays out, as `AggregateProgramMismatch` does (a
 build/genesis disagreement, not the transaction's fault).
 
+**At the cut.** `rand-node genesis --aggregation-tree <TREE.JSON>` writes the section after the
+genesis bounds and this build's `check_tree_pins` (below) both pass; nothing is written otherwise.
+
 **At startup.** A node whose genesis carries the section rebuilds it and compares **every** pin —
 each listed level's program digest and key, and `vk_leaf`, whatever depth a tree may later take —
-before anything else starts (`agg_executor::check_tree_pins`, beside `check_build_runs_genesis`):
+before it opens its store (`agg_executor::check_tree_pins`, after the disk guard, on a blocking
+thread that startup waits on):
 `aggregation_tree pins: <error>; refusing to start` on a mismatch, `aggregation_tree pins: ok` in
 the log otherwise. It also refuses a section the rVM could never serve: a leaf size past the rVM's
 N ceiling for the shape (production N ≤ 5), a pinned reduce height that is not canonical for its
@@ -326,8 +331,10 @@ last entry is not a fixed point. The warm thread then builds one rVM key per lis
 root's at that level's tier and canonical height (`warm_tree`). Today this path is behind the
 pre-existing refusal of every aggregation genesis (below).
 
-**The RPC and the daemon.** `rand_status.aggregation.tree` is the section verbatim (absent
-without one). `rand-node aggregate --layout tree` reads it, takes `L·2^d` covers for the largest
+**The RPC and the daemon.** `rand_status.aggregation.tree` is the section, its digests as
+64-character hex strings (absent without one). `rand-node aggregate --layout tree` reads it once,
+checks that its own build reproduces every pin (`check_tree_pins`, the node's startup check —
+refused before any proving otherwise), takes `L·2^d` covers for the largest
 `d ≤ max_depth` the unsealed work list fills (nothing if fewer than `2L` are unsealed), proves the
 tree on one machine (`randprotocol_rvm::aggregate::aggregate_tree`: leaves, then each level,
 every proof checked against its pinned shape before the next level is built on it) and signs

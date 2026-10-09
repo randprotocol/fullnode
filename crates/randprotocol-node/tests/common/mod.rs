@@ -238,8 +238,9 @@ async fn serve_genesis_seeded_with(
         viewing: Arc::new(RwLock::new(randprotocol_node::viewing::Registry::default())),
     };
     let ws_conns = state.ws_conns.clone();
+    let status = state.status.clone();
     let (addr, task) = randprotocol_node::rpc::serve("127.0.0.1:0".parse().unwrap(), state).await.expect("rpc binds");
-    (addr, heads, ServedRpc { task, ws_conns, _dir: dir, _node_rx: node_rx })
+    (addr, heads, ServedRpc { task, ws_conns, status, _dir: dir, _node_rx: node_rx })
 }
 
 /// Keeps a [`serve_heads`] server's task, database directory and command receiver alive for the
@@ -247,11 +248,20 @@ async fn serve_genesis_seeded_with(
 pub struct ServedRpc {
     task: tokio::task::JoinHandle<()>,
     ws_conns: Arc<AtomicUsize>,
+    /// The `rand_status` snapshot the server reads — the node loop's to publish on a real node,
+    /// the test's here.
+    status: Arc<RwLock<NodeStatus>>,
     _dir: tempfile::TempDir,
     _node_rx: tokio::sync::mpsc::Receiver<randprotocol_node::rpc::NodeCommand>,
 }
 
 impl ServedRpc {
+    /// Edit the `rand_status` snapshot, as a node loop's publish would.
+    #[allow(dead_code)] // not every test binary that shares `common` sets the status
+    pub fn set_status(&self, edit: impl FnOnce(&mut NodeStatus)) {
+        edit(&mut self.status.write().unwrap());
+    }
+
     /// Live WebSocket connections, the number `NodeStatus::ws_clients` reports on a real node.
     /// Read straight off the counter here, because there is no node loop to publish it.
     pub fn ws_conns(&self) -> usize {

@@ -1898,10 +1898,12 @@ txid move; a `Tree` aggregate signs under `rand-aggregate-tree-1` (genesis-bound
 `rand-aggregate-tree-2`), a `Flat` one exactly as before. `tx_json`'s `aggregate` gains `layout`
 (`"flat"` or `"tree"`). A `Tree` is admitted only on a chain whose genesis has an
 `aggregation_tree` section (refused `TreeNotAdmitted` otherwise), over exactly `L·2^d` covers.
-`rand_status.aggregation` gains `tree`, present only on a chain whose genesis has the section: the
-section verbatim (`shape`, `leaf_size`, `max_depth`, `leaf` heights, `vk_leaf`, and `steps`, each
-`{ heights, program_digest, key }`, digests as four u64 limbs) — what `rand-node aggregate
---layout tree` rebuilds its tree from. A `Tree` is bounded by `L·2^max_depth`, not by
+`rand_status.aggregation` gains `tree`, present only on a chain whose genesis has the section:
+`shape`, `leaf_size`, `max_depth`, `leaf` heights, `vk_leaf`, and `steps`, each `{ heights,
+program_digest, key }`. Every digest is a **64-character lowercase hex string** (the four
+canonical u64 limbs, 16 hex digits each, circuits docs/08's spelling), never JSON numbers — a limb
+past 2^53 would lose bits in a JavaScript reader. It is what `rand-node aggregate --layout tree`
+rebuilds its tree from (`rpc::TreeStatus::to_config` reads it back exactly). A `Tree` is bounded by `L·2^max_depth`, not by
 `aggregation.max_covers` (the flat cap). The refusal cache (`rand_getTransactionStatus`'s
 `rejected`) now holds `TreeNotAdmitted`, `TreeLayout`, `TreeDepth`, `TreeTier`,
 `CoveredPublicValues` and `TreeRootDigest` as permanent; `TreeKeyPin` is not cached.

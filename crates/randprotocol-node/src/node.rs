@@ -2205,15 +2205,6 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     let key = Keypair::from_seed(cfg.seed).context("bad key seed")?;
     let (gs, executor) = load_genesis(&cfg.datadir)?;
     check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles())?;
-    // Tree aggregation (circuits spec §4): every `aggregation_tree` pin — each listed level's
-    // step program and key, and `vk_leaf` — must be what this build rebuilds from the section's
-    // heights, or the node refuses to start (stricter than admission's per-depth 7b). Builds the
-    // section's programs and keys once (minutes at production), before the warm thread reuses them.
-    if let Some(t) = gs.ledger.aggregation_tree() {
-        crate::agg_executor::check_tree_pins(executor.as_ref(), t)
-            .map_err(|e| anyhow::anyhow!("aggregation_tree pins: {e}; refusing to start"))?;
-        tracing::info!("aggregation_tree pins: ok ({} listed levels, L = {}, max_depth {})", t.steps.len(), t.leaf_size, t.max_depth);
-    }
     // Before RocksDB opens its ~1000 table files (issue #41): a node started under the default
     // soft limit of 1024 ran out of descriptors and its RPC refused every connection.
     match crate::rlimit::raise_nofile_limit() {
@@ -2231,6 +2222,21 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             disk_free_bytes / (1 << 20),
             cfg.min_free_disk_bytes / (1 << 20)
         ));
+    }
+    // Tree aggregation (circuits spec §4): every `aggregation_tree` pin — each listed level's
+    // step program and key, and `vk_leaf` — must be what this build rebuilds from the section's
+    // heights, or the node refuses to start (stricter than admission's per-depth 7b). It builds
+    // the section's programs and keys once (minutes at production) and the warm thread reuses
+    // them. After the rlimit and disk guards (a full disk refuses in seconds, not after the
+    // build), and on a blocking thread (review m5): startup still waits for the verdict.
+    if let Some(t) = gs.ledger.aggregation_tree().cloned() {
+        let ex = executor.clone();
+        let (levels, leaf_size, max_depth) = (t.steps.len(), t.leaf_size, t.max_depth);
+        tokio::task::spawn_blocking(move || crate::agg_executor::check_tree_pins(ex.as_ref(), &t).map_err(|e| e.to_string()))
+            .await
+            .map_err(|e| anyhow::anyhow!("aggregation_tree pins: the check panicked ({e}); refusing to start"))?
+            .map_err(|e| anyhow::anyhow!("aggregation_tree pins: {e}; refusing to start"))?;
+        tracing::info!("aggregation_tree pins: ok ({levels} listed levels, L = {leaf_size}, max_depth {max_depth})");
     }
     prune_window_check(cfg.prune_history, gs.ledger.aggregation().map(|a| a.window), cfg.block_interval)
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -2689,7 +2695,7 @@ impl Node {
             s.aggregation.halving_blocks = cfg.halving_blocks;
             s.aggregation.sealed_blocks = ledger.supply().sealed_blocks;
         }
-        s.aggregation.tree = ledger.aggregation_tree().cloned();
+        s.aggregation.tree = ledger.aggregation_tree().map(rpc::TreeStatus::of);
         // Spec 2026-09-28 §7.1, §8: the tip's live gas prices, `null` without a `gas` section —
         // what `rand_status` reports and what `rand_getLimits` reads for a `dynamic` chain's
         // current prices, since `ChainLimits::of`'s snapshot is only ever taken at startup.

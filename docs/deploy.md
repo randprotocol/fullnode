@@ -1374,7 +1374,8 @@ from the same commit.
    (`vk_leaf`, each level's program digest and key) from that build's rebuild, the list long
    enough to end on a fixed point if `max_depth` runs past it. **Pending (droplet; circuits
    docs/08 §4)**: the production tree is not proved yet, so there are no production values to
-   cut. Every node checks every pin at startup and refuses to start on a mismatch (`aggregation_tree
+   cut. The section goes in with `rand-node genesis --aggregation-tree <TREE.JSON>`, which runs
+   the same pin check every node runs at startup and writes nothing on a mismatch. Every node checks every pin at startup and refuses to start on a mismatch (`aggregation_tree
    pins: …; refusing to start`); a healthy node logs **`aggregation_tree pins: ok`** before the
    warm thread, then `aggregation_tree: N root keys warmed`. Aggregators run **`rand-node aggregate
    --watch --layout tree`** on a host of the step class (circuits docs/08 §3: tier-21 production
