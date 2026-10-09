@@ -1201,10 +1201,16 @@ struct FirstCompact {
     evidence_sent: bool,
 }
 
-/// The most (view, proposer) entries [`Node::first_compact`] keeps (final review C1). Entries
-/// below the committed view are pruned on every insert, so in steady state it holds a handful;
-/// the cap bounds a chain that certifies without committing for a long stretch.
-const FIRST_COMPACT_MAX: usize = 1_024;
+/// The most (view, proposer) entries [`Node::first_compact`] keeps (final review C1; spec
+/// 2026-10-08 §0, compact follow-ups). Entries below the committed view are pruned on every
+/// insert, so in steady state it holds a handful; the cap bounds a chain that certifies without
+/// committing for a long stretch. Each entry holds a signed header, whose size is dominated by
+/// its justify QC — ~100 KB at 26 validators — so 64 entries are ~6 MB at worst, against
+/// ~100 MB at the former 1 024. 64 is many times the replica's eight-view proposal window
+/// (`PROPOSAL_VIEW_WINDOW`): the pre-screen `Ignore`s a header past it before its signature is
+/// checked, so it is never recorded, and an equivocation older than the window is not
+/// reachable on compact gossip at all.
+const FIRST_COMPACT_MAX: usize = 64;
 
 /// What the node knows about one peer.
 ///
@@ -7453,13 +7459,25 @@ mod tests {
         node.note_first_compact((floor - 1, who), &c, Hash::ZERO);
         node.note_first_compact((floor, who), &c, Hash::ZERO);
         assert_eq!(node.first_compact.keys().map(|k| k.0).collect::<Vec<_>>(), vec![floor], "under the committed view: pruned");
+        assert_eq!(FIRST_COMPACT_MAX, 64, "the cap: 64 signed headers, ~6 MB at 26 validators");
         for v in 1..=FIRST_COMPACT_MAX as u64 {
             node.note_first_compact((floor + v, who), &c, Hash::ZERO);
         }
         assert_eq!(node.first_compact.len(), FIRST_COMPACT_MAX);
         assert!(!node.first_compact.contains_key(&(floor, who)), "the oldest view went first");
-        node.note_first_compact((floor + 5, who), &c, Hash::digest(b"later"));
-        assert_eq!(node.first_compact.get(&(floor + 5, who)).map(|f| f.hash), Some(Hash::ZERO), "the first record stands");
+        // Past the cap, each insert evicts the oldest view still held, and the map stays at 64.
+        let past = FIRST_COMPACT_MAX as u64 + 10;
+        for v in FIRST_COMPACT_MAX as u64 + 1..=past {
+            node.note_first_compact((floor + v, who), &c, Hash::ZERO);
+        }
+        assert_eq!(node.first_compact.len(), FIRST_COMPACT_MAX, "exactly the cap");
+        assert_eq!(
+            node.first_compact.keys().map(|k| k.0).collect::<Vec<_>>(),
+            (floor + past - FIRST_COMPACT_MAX as u64 + 1..=floor + past).collect::<Vec<_>>(),
+            "the newest 64 views, the oldest out first"
+        );
+        node.note_first_compact((floor + past, who), &c, Hash::digest(b"later"));
+        assert_eq!(node.first_compact.get(&(floor + past, who)).map(|f| f.hash), Some(Hash::ZERO), "the first record stands");
     }
 
     /// Audit v6, PROC-8: a node more than one block behind defers by-hash fetches to batch sync;
