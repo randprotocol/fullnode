@@ -246,11 +246,17 @@ pub fn aggregate_pins() -> AggregatePins {
         measure_aggregate(2, FriProfile::Test),
         measure_aggregate(3, FriProfile::Test),
     ];
-    // Phase 3 Task 0: the hand-written `phase3_attribution` block survives a re-measure.
-    let block = s.find("\"phase3_attribution\"").map(|at| {
-        let close = at + s[at..].find('}').expect("the attribution block closes");
-        s[at..=close].to_string()
-    });
+    // Every hand-written nested block (`phase3_attribution`, `tree_measure`, `tree_test`)
+    // survives a re-measure, in file order.
+    let mut blocks: Vec<String> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = s[from..].find("\": {") {
+        let open = from + rel;
+        let start = s[..open].rfind('"').expect("a block name opens with a quote");
+        let close = open + s[open..].find('}').expect("the block closes");
+        blocks.push(s[start..=close].to_string());
+        from = close + 1;
+    }
     let mut json = format!(
         "{{\n  \"cpu_rows\": {},\n  \"permutations\": {},\n  \"mem_accesses\": {},\n  \
          \"witness_words\": {},\n  \"program_instrs\": {},\n",
@@ -259,15 +265,16 @@ pub fn aggregate_pins() -> AggregatePins {
     );
     for (i, r) in rs.iter().enumerate() {
         let n = i + 1;
-        let comma = if n == 3 && block.is_none() { "" } else { "," };
+        let comma = if n == 3 && blocks.is_empty() { "" } else { "," };
         json += &format!(
             "  \"aggregate_test_n{n}_cpu_rows\": {},\n  \"aggregate_test_n{n}_permutations\": {},\n  \
              \"aggregate_test_n{n}_mem_accesses\": {},\n  \"aggregate_test_n{n}_witness_words\": {}{comma}\n",
             r.cpu_rows, r.permutations, r.mem_accesses, r.witness_words
         );
     }
-    if let Some(b) = &block {
-        json += &format!("  {b}\n");
+    for (i, b) in blocks.iter().enumerate() {
+        let comma = if i + 1 < blocks.len() { "," } else { "" };
+        json += &format!("  {b}{comma}\n");
     }
     json += "}\n";
     std::fs::write(&path, json).expect("the pin file is writable");
@@ -842,4 +849,50 @@ pub fn pow_program(bits: &[u64], off: u64, len: u64, g: randprotocol_rvm::isa::F
     }
     v.push(i(Op::Halt, 0, 0, 0));
     Program { instrs: v, checkpoints: vec![], reduce_layout: vec![] }
+}
+
+/// A nested block of `tests/pins.json` (`tree_measure`, `tree_test`, …) as `(key, value)` pairs
+/// in file order. Panics, naming the block, when the file has none: the first measuring run
+/// is what writes it.
+#[allow(dead_code)]
+pub fn pin_block(name: &str) -> Vec<(String, i128)> {
+    let s = std::fs::read_to_string(pins_path()).expect("tests/pins.json");
+    let at = s.find(&format!("\"{name}\": {{")).unwrap_or_else(|| panic!("tests/pins.json has no `{name}` block yet"));
+    let block = &s[at..at + s[at..].find('}').expect("the block closes")];
+    block
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (k, v) = line.trim().trim_end_matches(',').split_once(": ")?;
+            Some((k.trim_matches('"').to_string(), v.parse::<i128>().expect("a numeric field")))
+        })
+        .collect()
+}
+
+/// One value of a nested pin block.
+#[allow(dead_code)]
+pub fn pin(block: &str, key: &str) -> usize {
+    usize::try_from(pin_i64(block, key)).unwrap_or_else(|_| panic!("tests/pins.json's `{block}.{key}` is negative"))
+}
+
+/// One signed value of a nested pin block: a measured difference such as `tree_test.step_overhead`
+/// (the step's rows less 2C), which the measurement found negative.
+#[allow(dead_code)]
+pub fn pin_i64(block: &str, key: &str) -> i64 {
+    i64::try_from(pin_raw(block, key)).unwrap_or_else(|_| panic!("tests/pins.json's `{block}.{key}` is not an i64"))
+}
+
+/// One unsigned 64-bit value of a nested pin block: a field limb such as a key digest's
+/// (`tree_test.vk_fix_0..3`), which may exceed `i64::MAX`.
+#[allow(dead_code)]
+pub fn pin_u64(block: &str, key: &str) -> u64 {
+    u64::try_from(pin_raw(block, key)).unwrap_or_else(|_| panic!("tests/pins.json's `{block}.{key}` is not a u64"))
+}
+
+fn pin_raw(block: &str, key: &str) -> i128 {
+    pin_block(block)
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .unwrap_or_else(|| panic!("tests/pins.json's `{block}` block has no `{key}`"))
+        .1
 }

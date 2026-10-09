@@ -140,6 +140,9 @@ pub enum ShapeError {
     /// than an assertion because [`InnerShape::try_of`] is the fallible entry a node calls with
     /// numbers it did not choose.
     FriSchedule { rolled_in: usize, heights: usize },
+    /// A tree's per-level step list is empty: a tree has at least one interior level (spec §2,
+    /// `aggregate::TreeShapes::build`).
+    EmptyTreeSteps,
 }
 
 impl InnerShape {
@@ -1014,6 +1017,31 @@ impl RvmShape {
         Ok(shape)
     }
 
+    /// The shape a proof of `program` declares: [`RvmShape::of`] over the proof's own header
+    /// (tier and the four declared heights). How a tree step's child shape is read off a child.
+    pub fn of_proof(
+        profile: FriProfile,
+        program: &std::sync::Arc<crate::isa::Program>,
+        proof: &crate::machine::Proof,
+    ) -> Self {
+        Self::of(
+            profile,
+            program,
+            proof.tier,
+            proof.reg_log_height,
+            proof.ram_log_height,
+            proof.poseidon2_log_height,
+            proof.reduce_log_height,
+        )
+    }
+
+    /// Whether a tree step built for `self` verifies proofs of `other`: everything the program
+    /// reads of a child shape agrees (the vk preimage's shape words, and the tape header words it
+    /// pins). The committed program is not read: its cap is a tape value (R3's fixed-point test).
+    pub fn same_step_words(&self, other: &RvmShape) -> bool {
+        self.shape_words() == other.shape_words() && self.header_words() == other.header_words()
+    }
+
     /// The `AirLayout` `verify_batch`'s precompute loop builds for instance `i` —
     /// [`InnerShape::air_layout`], verbatim.
     pub fn air_layout(&self, i: usize, air: &crate::machine::Chip) -> AirLayout {
@@ -1105,6 +1133,62 @@ impl RvmShape {
             && proof.public_values.len() == self.num_public_values[crate::machine::PUBLIC_VALUES_INDEX]
             && proof.public_values.iter().all(|x| *x < <Val as p3_field::PrimeField64>::ORDER_U64)
             && proof_log_arities_generic(proof) == self.log_arities
+    }
+}
+
+/// The five words an rVM proof declares (tier and the four declared heights): what a chain pins
+/// for a tree's leaf and per-level step shapes (spec §4.1 R4), from which the node rebuilds the
+/// `RvmShape`s, the step programs and their keys (`aggregate::TreeShapes::build`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RvmHeights {
+    pub tier: crate::machine::Tier,
+    pub reg_log_height: u8,
+    pub ram_log_height: u8,
+    pub poseidon2_log_height: u8,
+    pub reduce_log_height: u8,
+}
+
+impl RvmHeights {
+    /// The heights `p` declares.
+    pub fn of_proof(p: &crate::machine::Proof) -> Self {
+        RvmHeights {
+            tier: p.tier,
+            reg_log_height: p.reg_log_height,
+            ram_log_height: p.ram_log_height,
+            poseidon2_log_height: p.poseidon2_log_height,
+            reduce_log_height: p.reduce_log_height,
+        }
+    }
+}
+
+impl RvmShape {
+    /// The five declared words of this shape.
+    pub fn heights(&self) -> RvmHeights {
+        RvmHeights {
+            tier: crate::machine::Tier(self.tier),
+            reg_log_height: self.reg_log_height,
+            ram_log_height: self.ram_log_height,
+            poseidon2_log_height: self.poseidon2_log_height,
+            reduce_log_height: self.reduce_log_height,
+        }
+    }
+
+    /// [`RvmShape::try_of`] over pinned heights: a genesis's numbers, which this node did not
+    /// choose, so it reports rather than panics.
+    pub fn try_of_heights(
+        profile: FriProfile,
+        program: &std::sync::Arc<crate::isa::Program>,
+        h: RvmHeights,
+    ) -> Result<Self, ShapeError> {
+        Self::try_of(
+            profile,
+            program,
+            h.tier,
+            h.reg_log_height,
+            h.ram_log_height,
+            h.poseidon2_log_height,
+            h.reduce_log_height,
+        )
     }
 }
 

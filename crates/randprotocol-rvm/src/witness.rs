@@ -22,6 +22,7 @@
 use crate::isa::{EF, F};
 use crate::reference::{replay, InputRound, ReplayError};
 use crate::shape::{InnerKey, InnerShape, ProofBatch, ShapeKey, VerifierShape, CAP_HEIGHT};
+use crate::shape::{RvmKey, RvmShape};
 use p3_air::BaseAir;
 use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
 use p3_matrix::Dimensions;
@@ -170,6 +171,9 @@ impl Writer {
 /// exactly one of each [`Segment`].
 pub const SEGMENTS_PER_PROOF: usize = 14;
 
+/// The tree step tape's preamble ahead of the regions: the binding (8) and the child cap (16).
+pub const TREE_TAPE_PREAMBLE: usize = 8 + 16;
+
 /// One segment of one proof's region of a tape: which proof (in
 /// [`WitnessTape::build_n`]'s argument order), which segment, where its words start, and how
 /// many there are. The tamper tests index a word to corrupt by one of these.
@@ -275,6 +279,36 @@ impl WitnessTape {
         }
         for proof in proofs {
             write_proof(&mut w, profile, shape, key, proof)?;
+        }
+        Ok(WitnessTape { words: w.words, segments: w.segments })
+    }
+
+    /// The tree step's tape (spec §3): `[B(8) ‖ cap(16) ‖ region(child a) ‖ region(child b)]`.
+    /// `cap` is the child's own preprocessed cap, `RvmKey::of(profile, child)`, so `child` must
+    /// carry the program the children were proved for (the step *program* reads only its shape
+    /// words). Both children are shape-checked before any word is written. The regions are
+    /// `build_for`'s, so `segment_refs` numbers them proof 0 and proof 1.
+    pub fn build_tree_step(
+        profile: FriProfile,
+        child: &RvmShape,
+        children: [&crate::machine::Proof; 2],
+        binding: &[u32; 8],
+    ) -> Result<Self, TapeError> {
+        for p in children {
+            if !child.matches(p) {
+                return Err(ReplayError::Shape.into());
+            }
+        }
+        let key = RvmKey::of(profile, child);
+        let mut w = Writer::new();
+        for word in binding {
+            w.usize(*word as usize);
+        }
+        for v in key.flatten() {
+            w.f(v);
+        }
+        for p in children {
+            write_proof(&mut w, profile, child, &key, p)?;
         }
         Ok(WitnessTape { words: w.words, segments: w.segments })
     }

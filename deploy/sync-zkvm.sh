@@ -491,7 +491,14 @@ echo "reminder: --features cuda / mock-cuda / reference-backend fetch rand-zkvm-
 # (`machine::max_reduce_n`: production N ≤ 5, test N ≤ 26) — the node's `agg_executor` follows
 # all three — and **the rate-¼ rVM profile**, `recursion/docs/07-rvm-rate-quarter.md` —
 # `RvmFri` (log_blowup 2, 92 queries, 24 grinding bits), `tests/security.rs`, a `p3-security`
-# dev-dependency; rVM keys and proofs move, no digest and no tier does). Re-vendoring the rVM alone is this section alone: the research
+# dev-dependency; rVM keys and proofs move, no digest and no tier does), then at `92b750e`
+# (2026-10-09, tree aggregation, `recursion/docs/08-tree-aggregation.md`, branch
+# `feat/tree-aggregation`, synced before it was pushed to zkp-circuits — the way `5ff7676` was —
+# with `CUDA_REV=71e1a0411748cbb7ba74b204acaafe37587e613a` (research and `rand-zkvm-cuda/` are identical between the two; only
+# `recursion/` moved): `programs/rv32t.rs` (the 2-to-1 step over a compile-time child shape),
+# `aggregate::{TreeKeys, TreeShapes, verify_tree, tree_root_digest, prove_tree_step,
+# aggregate_tree, VerifyTreeError}`, `shape::RvmHeights`, `tests/{tree,tree_measure}.rs` and
+# `tests/heap/`; no flat-path digest, key shape or opcode moves). Re-vendoring the rVM alone is this section alone: the research
 # section above rewrites `guests-compiled/PROVENANCE.md` and would carry research's older drift. Two vendored files carry hand fixes this
 # section does not reproduce — keep them when re-syncing: `Cargo.toml`'s `license.workspace`
 # line and `tests/backend.rs`'s doc comment (`randprotocol-zkvm`, not the old crate name). What the
@@ -587,4 +594,4 @@ if "license.workspace = true" not in s:
 PY
 sed -i '' 's|crates/shrugg-zkvm/tests/backend.rs|crates/randprotocol-zkvm/tests/backend.rs|' "$RVM_DST/tests/backend.rs"
 RVM_REV=$(git -C "$RVM_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 71e1a04, rVM phase 3 and the rate-¼ profile) into $RVM_DST"
+echo "synced recursion VM from $RVM_SRC at $RVM_REV (pin 92b750e, tree aggregation) into $RVM_DST"
