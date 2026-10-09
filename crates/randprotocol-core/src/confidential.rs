@@ -47,7 +47,9 @@ pub enum ConfidentialError {
     #[error("the tree's recomputed root digest is not the proof's")]
     TreeRootDigest,
     /// Tree aggregation: no key, or not the pinned key, for level `level` (`verify_tree`'s empty
-    /// step-key list for a level ≥ 2). The ledger reports it as `AggregationError::TreeKeyPin`.
+    /// step-key list for a level ≥ 2), numbered as circuits' `keys.at_level(j)`: the level that
+    /// uses the key — 1 for `vk_leaf`, `j ≥ 2` for level `j − 1`'s step key. The ledger reports it
+    /// as `AggregationError::TreeKeyPin`, whose 7b compare uses the same numbering.
     #[error("tree level {level} has no step key, or not the pinned one")]
     TreeKeyPin { level: u8 },
     /// Tree aggregation: covered bundle `index`'s public-value run is not the inner shape's count

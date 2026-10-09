@@ -2382,10 +2382,15 @@ fn tx_json_with(
             "kind": "slash_aggregator", "aggregator": a.aggregator.to_base58(), "nonce": a.nonce,
             "headers": [a.proof_hash.to_hex(), b.proof_hash.to_hex()]
         }),
-        Action::Aggregate { covers, proof, aggregator, nonce, time, payout_total, .. } => json!({
+        // `layout` (tree aggregation): `"flat"` or `"tree"`, so an explorer tells them apart.
+        Action::Aggregate { covers, proof, aggregator, nonce, time, payout_total, layout, .. } => json!({
             "kind": "aggregate", "covers": covers.len(), "proof_len": proof.len(),
             "aggregator": aggregator.to_base58(), "nonce": nonce, "time": time,
-            "payout_total": payout_total.to_string()
+            "payout_total": payout_total.to_string(),
+            "layout": match layout {
+                randprotocol_core::types::AggregateLayout::Flat => "flat",
+                randprotocol_core::types::AggregateLayout::Tree => "tree",
+            },
         }),
         // RPL (spec §4). A token's whole registration is public by design — that is what makes
         // its supply auditable — as is every mint's amount and recipient; only the later
@@ -4832,6 +4837,7 @@ pub(crate) mod tests {
         assert_eq!(txs[1]["sealed_by"], Value::Null, "the register's bundle is uncovered");
         let b2 = ok(&st, "rand_getBlockByHeight", json!([2])).await;
         assert_eq!(b2["transactions"].as_array().unwrap()[0]["action"]["kind"], "aggregate");
+        assert_eq!(b2["transactions"].as_array().unwrap()[0]["action"]["layout"], "flat", "tree aggregation: the layout is public");
 
         // `rand_getAggregate`: the public fields of the sealing aggregate (spec §8).
         let v = ok(&st, "rand_getAggregate", json!([aggregate.hash().to_hex()])).await;

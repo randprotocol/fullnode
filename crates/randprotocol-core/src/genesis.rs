@@ -523,8 +523,8 @@ pub struct Genesis {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perps: Option<crate::ledger::perps::PerpsConfig>,
     /// Multisig accounts (`docs/superpowers/specs/2026-10-08-multisig-design.md`): the fee to
-    /// create one and the accounts the register starts with. Part of the genesis hash (the
-    /// last tag, after RPL-3's `perps`) and of the state root (`rand-state-multisig-1`) when present; omitted entirely
+    /// create one and the accounts the register starts with. Part of the genesis hash (tagged,
+    /// after RPL-3's `perps`; `aggregation_tree` follows it) and of the state root (`rand-state-multisig-1`) when present; omitted entirely
     /// when absent, so every chain without one hashes and commits byte-for-byte as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multisig: Option<crate::ledger::multisig::MultisigConfig>,
@@ -1750,8 +1750,8 @@ impl Genesis {
             commit.extend_from_slice(b"perps");
             commit.extend_from_slice(&bincode::serialize(p).expect("serializes"));
         }
-        // Multisig accounts, after `perps` — the last tag — tagged and present-only like the
-        // others; accounts in id order, so the file's order is free.
+        // Multisig accounts, after `perps` (and before `aggregation_tree`), tagged and
+        // present-only like the others; accounts in id order, so the file's order is free.
         if let Some(m) = &self.multisig {
             let mut accounts: Vec<_> = m.accounts.iter().map(|a| (a.id(self.chain_id), a)).collect();
             accounts.sort_by_key(|(id, _)| *id);

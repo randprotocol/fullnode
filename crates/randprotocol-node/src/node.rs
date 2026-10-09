@@ -171,8 +171,6 @@ pub fn reload_ledger(storage: &Storage, gs: &GenesisState, executor: &dyn Confid
     // And its tree section (tree aggregation, R4): without it a restarted node would refuse every
     // `Tree` aggregate its peers admit — a block-validity split at the first tree.
     ledger.set_aggregation_tree(gs.ledger.aggregation_tree().cloned());
-    // And its tree section (tree aggregation, R4): without it a restarted node would refuse every
-    // `Tree` aggregate its peers admit — a block-validity split at the first tree.
     // And the fee-feedback rules (genesis `fees`, `docs/fees.md` §1.3): `load_ledger` restores the
     // stored copy, but the file is the authority — a node that came back without `burn_base`
     // would pay the base its peers burn and compute a different register: a fork at its first

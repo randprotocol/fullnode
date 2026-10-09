@@ -117,8 +117,7 @@ impl TreeConfig {
     }
 
     /// The genesis-time bounds: `1 ≤ leaf_size ≤ MAX_LEAF`, `1 ≤ max_depth ≤ MAX_DEPTH`, a
-    /// non-empty step list no longer than `max_depth`, `L·2^max_depth` within `u32` and within
-    /// `max_covers`, an admitted `shape`, and no zero digest or key (the activation placeholder).
+    /// non-empty step list no longer than `max_depth`, `L·2^max_depth` within `max_covers`, an admitted `shape`, and no zero digest or key (the activation placeholder).
     pub fn check(&self, cfg: &AggregationConfig) -> Result<(), String> {
         if !(1..=Self::MAX_LEAF).contains(&self.leaf_size) {
             return Err(format!("aggregation_tree.leaf_size {} is outside 1..={} (the rVM's reduce ceiling)", self.leaf_size, Self::MAX_LEAF));
@@ -136,9 +135,9 @@ impl TreeConfig {
                 self.max_depth
             ));
         }
-        let most = u32::try_from((self.leaf_size as u64) << self.max_depth)
-            .map_err(|_| "aggregation_tree: L·2^max_depth does not fit u32".to_string())?;
-        if most > cfg.max_covers {
+        // At most MAX_LEAF·2^MAX_DEPTH = 1280 after the bounds above: no overflow to guard.
+        let most = (self.leaf_size as u64) << self.max_depth;
+        if most > cfg.max_covers as u64 {
             return Err(format!("a tree covers up to L·2^max_depth = {most}, above max_covers {}", cfg.max_covers));
         }
         if !cfg.admitted_shapes.iter().any(|a| a.shape == self.shape) {
@@ -171,23 +170,26 @@ pub fn tree_depth(covers: usize, tree: &TreeConfig) -> Result<u32, AggregationEr
 }
 
 /// Step 7b for a tree (AGG-6 per level): the root program — level `d`'s pinned digest, the last
-/// entry repeating — then every key a depth-`d` recompute uses, level by level: `vk_leaf`
-/// (level 0), then level `k`'s step key for `k` in `1..d`. The rebuilt list is read at the
-/// pinned list's index; an entry it does not have is no key for that level (`TreeKeyPin`).
+/// entry repeating — then every key a depth-`d` recompute uses, in circuits' `keys.at_level(j)`
+/// numbering (the level `j` that *consumes* the key): level 1 uses `vk_leaf`, level `j ≥ 2`
+/// uses level `j − 1`'s step key (`step_at(j − 1).key`), for `j` in `1..=d`. The rebuilt list is
+/// read at the pinned list's index. A rebuilt list with no entry for the root's level has no
+/// program, read as the zero digest (`AggregateProgramMismatch { built: [0; 4] }` — a pin no
+/// genesis can hold); one with no entry for a key's level is `TreeKeyPin { level: j }`.
 fn check_tree_pins(t: &TreeConfig, built: &TreeDigests, d: u32) -> Result<(), AggregationError> {
-    let rebuilt = |level: u32| built.steps.get(t.step_index(level)).ok_or(AggregationError::TreeKeyPin { level: level as u8 });
-    let (root, _) = rebuilt(d)?;
     let pinned = t.step_at(d).program_digest;
-    if *root != pinned {
-        return Err(AggregationError::AggregateProgramMismatch { pinned, built: *root });
+    let root = built.steps.get(t.step_index(d)).map_or([0; 4], |(program, _)| *program);
+    if root != pinned {
+        return Err(AggregationError::AggregateProgramMismatch { pinned, built: root });
     }
     if built.vk_leaf != t.vk_leaf {
-        return Err(AggregationError::TreeKeyPin { level: 0 });
+        return Err(AggregationError::TreeKeyPin { level: 1 });
     }
-    for level in 1..d {
-        let (_, key) = rebuilt(level)?;
-        if *key != t.step_at(level).key {
-            return Err(AggregationError::TreeKeyPin { level: level as u8 });
+    for j in 2..=d {
+        let level = AggregationError::TreeKeyPin { level: j as u8 };
+        let (_, key) = built.steps.get(t.step_index(j - 1)).ok_or(level.clone())?;
+        if *key != t.step_at(j - 1).key {
+            return Err(level);
         }
     }
     Ok(())
@@ -357,8 +359,10 @@ pub enum AggregationError {
     /// The root proof's declared tier is not the tier pinned for the root's level (R6).
     #[error("the tree root declares tier {declared}; its level is pinned at tier {pinned}")]
     TreeTier { declared: u8, pinned: u8 },
-    /// No key, or not the pinned key, for tree level `level` (0 is the leaf key): AGG-6's
-    /// rebuilt-key mismatch, or `verify_tree`'s level with no step key.
+    /// No key, or not the pinned key, for tree level `level` — numbered by the level that
+    /// *uses* the key, circuits' `keys.at_level(j)`: level 1 uses `vk_leaf`, level `j ≥ 2` uses
+    /// `steps[j − 2].key` (level `j − 1`'s step proofs' key, the last entry repeating). AGG-6's
+    /// rebuilt-key mismatch, or `verify_tree`'s level with no step key — one numbering for both.
     #[error("tree level {level} has no key or not the pinned one")]
     TreeKeyPin { level: u8 },
     /// Covered bundle `index`'s public-value run is not a canonical run (`verify_tree` refuses
@@ -838,10 +842,10 @@ pub(super) fn validate_aggregate(
     //     For a tree, per level: the root's program (level d's pin) and every key the depth
     //     uses, rebuilt by the executor from the pinned heights ([`check_tree_pins`]).
     if let Some((t, d)) = tree {
-        if let Ok(built) = executor.tree_digests(t) {
-            check_tree_pins(t, &built, d)?;
-        }
-        // As for the flat program below: an executor that cannot rebuild says so at step 8.
+        // Fail closed (review I2): `verify_tree` checks no pin, so an executor that cannot
+        // rebuild the tree's programs and keys refuses here, never reaching step 8.
+        let built = executor.tree_digests(t).map_err(TxError::InvalidAggregateProof)?;
+        check_tree_pins(t, &built, d)?;
     } else {
         match executor.aggregate_program_digest(&first.shape) {
             Ok(built) if built == admitted.aggregate_program_digest => {}
@@ -941,6 +945,15 @@ impl Ledger {
                 return Err(AggregationError::DuplicateCover(*cover).into());
             }
         }
+        // Step 6t's count half (tree aggregation): a tree on a chain with no tree section, or
+        // over a count that is not L·2^d within max_depth, needs no covered record to refuse —
+        // integer work against genesis constants, like the count rules above, so before the
+        // register and the signature: a stale nonce never hides the permanent verdict.
+        // The shape half — the section naming the covered shape — waits for the records.
+        if *layout == AggregateLayout::Tree {
+            let t = self.aggregation_tree().filter(|t| !t.steps.is_empty()).ok_or(AggregationError::TreeNotAdmitted)?;
+            tree_depth(covers.len(), t)?;
+        }
         let entry = signed_by(self, aggregator, *nonce, signature, || {
             self.binding_domain().aggregate_signing_hash_at(
                 *layout,
@@ -956,13 +969,6 @@ impl Ledger {
         })?;
         if entry.unbonding.is_some() {
             return Err(AggregationError::Unbonding(*aggregator).into());
-        }
-        // Step 6t's count half (tree aggregation): a tree on a chain with no tree section, or
-        // over a count that is not L·2^d within max_depth, needs no covered record to refuse.
-        // The shape half — the section naming the covered shape — waits for the records.
-        if *layout == AggregateLayout::Tree {
-            let t = self.aggregation_tree().filter(|t| !t.steps.is_empty()).ok_or(AggregationError::TreeNotAdmitted)?;
-            tree_depth(covers.len(), t)?;
         }
         Ok(())
     }
@@ -2888,16 +2894,27 @@ mod admission_tests {
     /// short (`steps` entries kept), and `verify_tree`'s verdict optionally replaced.
     struct TreeProbe {
         builds: std::sync::atomic::AtomicUsize,
+        verifies: std::sync::atomic::AtomicUsize,
         keep_steps: Option<usize>,
+        digests_fail: bool,
         verdict: Option<ConfidentialError>,
     }
 
     impl TreeProbe {
         fn new() -> Self {
-            TreeProbe { builds: std::sync::atomic::AtomicUsize::new(0), keep_steps: None, verdict: None }
+            TreeProbe {
+                builds: std::sync::atomic::AtomicUsize::new(0),
+                verifies: std::sync::atomic::AtomicUsize::new(0),
+                keep_steps: None,
+                digests_fail: false,
+                verdict: None,
+            }
         }
         fn builds(&self) -> usize {
             self.builds.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn verifies(&self) -> usize {
+            self.verifies.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -2955,6 +2972,9 @@ mod admission_tests {
         }
         fn tree_digests(&self, tree: &TreeConfig) -> Result<TreeDigests, ConfidentialError> {
             self.builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.digests_fail {
+                return Err(ConfidentialError::AggregationUnsupported);
+            }
             let mut d = StubExecutor.tree_digests(tree)?;
             if let Some(n) = self.keep_steps {
                 d.steps.truncate(n);
@@ -2962,6 +2982,7 @@ mod admission_tests {
             Ok(d)
         }
         fn verify_tree(&self, tree: &TreeConfig, covered: &[CoveredBundle], proof: &[u8], binding: &[u32; 8], depth: u32) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+            self.verifies.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match &self.verdict {
                 Some(e) => Err(e.clone()),
                 None => StubExecutor.verify_tree(tree, covered, proof, binding, depth),
@@ -3058,18 +3079,20 @@ mod admission_tests {
             Ok(_) => None,
             other => panic!("{other:?}"),
         };
-        // vk_leaf: every depth uses it.
+        // `TreeKeyPin.level` is the level that *uses* the key, circuits' `keys.at_level(j)`
+        // numbering: vk_leaf is level 1's, `steps[k − 1].key` level k + 1's.
+        // vk_leaf: level 1 uses it, so every depth.
         with(&mut l, &|t| t.vk_leaf = [0xdead; 4]);
-        assert_eq!(key(tree_at(&l, &kp, 2, 19, 1, &StubExecutor)), Some(0));
-        assert_eq!(key(tree_at(&l, &kp, 8, 19, 3, &StubExecutor)), Some(0));
-        // Level 1's step key (`vk_t_leaf`): the children of level 2, so depth ≥ 2 only.
+        assert_eq!(key(tree_at(&l, &kp, 2, 19, 1, &StubExecutor)), Some(1));
+        assert_eq!(key(tree_at(&l, &kp, 8, 19, 3, &StubExecutor)), Some(1));
+        // Level 1's step key (`vk_t_leaf`): level 2 uses it, so depth ≥ 2 only.
         with(&mut l, &|t| t.steps[0].key = [0xdead; 4]);
         assert_eq!(key(tree_at(&l, &kp, 2, 19, 1, &StubExecutor)), None);
-        assert_eq!(key(tree_at(&l, &kp, 4, 19, 2, &StubExecutor)), Some(1));
-        // Level 2's step key (the last entry): the children of level 3, so depth 3 only.
+        assert_eq!(key(tree_at(&l, &kp, 4, 19, 2, &StubExecutor)), Some(2));
+        // Level 2's step key (the last entry): level 3 uses it, so depth 3 only.
         with(&mut l, &|t| t.steps[1].key = [0xdead; 4]);
         assert_eq!(key(tree_at(&l, &kp, 4, 19, 2, &StubExecutor)), None);
-        assert_eq!(key(tree_at(&l, &kp, 8, 19, 3, &StubExecutor)), Some(2));
+        assert_eq!(key(tree_at(&l, &kp, 8, 19, 3, &StubExecutor)), Some(3));
         // Level 1's program: the root of a depth-1 tree only.
         with(&mut l, &|t| t.steps[0].program_digest = [0xbeef; 4]);
         let r = tree_at(&l, &kp, 2, 19, 1, &StubExecutor);
@@ -3085,11 +3108,46 @@ mod admission_tests {
             let r = tree_at(&l, &kp, n, 19, depth, &StubExecutor);
             assert!(matches!(r, Err(TxError::Aggregation(AggregationError::AggregateProgramMismatch { pinned, .. })) if pinned == [0xbeef; 4]), "{r:?}");
         }
-        // An executor that rebuilt no entry for a level the depth uses: no key for that level.
+        // An executor that rebuilt no entry for the root's level: no program, which reads as the
+        // zero digest — a pin no genesis can hold (`check` refuses zero) — so a mismatch.
         l.set_aggregation_tree(Some(tree_cfg()));
         let short = TreeProbe { keep_steps: Some(1), ..TreeProbe::new() };
         assert!(tree_at(&l, &kp, 2, 19, 1, &short).is_ok());
-        assert_eq!(key(tree_at(&l, &kp, 4, 19, 2, &short)), Some(2));
+        let r = tree_at(&l, &kp, 4, 19, 2, &short);
+        assert!(
+            matches!(r, Err(TxError::Aggregation(AggregationError::AggregateProgramMismatch { pinned, built: [0, 0, 0, 0] })) if pinned == d.steps[1].0),
+            "{r:?}"
+        );
+        assert_eq!(short.verifies(), 1, "only the depth-1 tree reached verify_tree");
+    }
+
+    /// 7b fails closed on the tree path (review I2): an executor that cannot rebuild the tree's
+    /// programs and keys refuses the aggregate as a proof it cannot check, and `verify_tree` —
+    /// which checks no pin — is never called. (The flat path's fall-through is the stub's and
+    /// rVM-less builds', whose `verify_aggregate` then refuses anyway.)
+    #[test]
+    fn a_tree_whose_pins_cannot_be_rebuilt_is_refused_before_verify_tree() {
+        let (l, kp) = tree_setup();
+        let probe = TreeProbe { digests_fail: true, ..TreeProbe::new() };
+        let r = tree_at(&l, &kp, 2, 19, 1, &probe);
+        assert!(matches!(r, Err(TxError::InvalidAggregateProof(ConfidentialError::AggregationUnsupported))), "{r:?}");
+        assert_eq!((probe.builds(), probe.verifies()), (1, 0));
+    }
+
+    /// A tree section with no step list (genesis refuses one; `set_aggregation_tree` does not)
+    /// admits no tree, at admission and at the pre-screen — and never reaches `step_at`'s panic.
+    #[test]
+    fn an_empty_step_list_admits_no_tree() {
+        let (mut l, kp) = tree_setup();
+        let mut t = tree_cfg();
+        t.steps.clear();
+        l.set_aggregation_tree(Some(t));
+        let tx = tree_tx(&l, &kp, 2, 19, 1);
+        assert!(matches!(l.preflight_aggregate(&tx), Err(TxError::Aggregation(AggregationError::TreeNotAdmitted))));
+        assert!(matches!(
+            l.validate_aggregate(&tx, &covered_records(&shape(), &[1, 2]), &StubExecutor),
+            Err(TxError::Aggregation(AggregationError::TreeNotAdmitted))
+        ));
     }
 
     /// The recompute's refusals reach the ledger as `TreeRootDigest`: the stub models a root made
@@ -3164,6 +3222,11 @@ mod admission_tests {
         let (mut l, kp) = tree_setup();
         assert!(matches!(l.preflight_aggregate(&tree_tx(&l, &kp, 3, 19, 1)), Err(TxError::Aggregation(AggregationError::TreeLayout { covers: 3, leaf_size: 1 }))));
         assert!(matches!(l.preflight_aggregate(&tree_tx(&l, &kp, 16, 19, 4)), Err(TxError::Aggregation(AggregationError::TreeDepth { depth: 4, max: 3 }))));
+        // Integer work against genesis constants, before the register and the signature (review
+        // M3): a stale nonce does not hide the permanent verdict.
+        let binding = l.binding_domain().aggregate_binding(7, &kp.public_key().address(), 5);
+        let stale = aggregate_tx_at(&l, &kp, 5, 100, covers(3), StubExecutor::make_tree_proof(19, 1, &binding), AggregateLayout::Tree);
+        assert!(matches!(l.preflight_aggregate(&stale), Err(TxError::Aggregation(AggregationError::TreeLayout { covers: 3, leaf_size: 1 }))));
         l.set_aggregation_tree(None);
         assert!(matches!(l.preflight_aggregate(&tree_tx(&l, &kp, 2, 19, 1)), Err(TxError::Aggregation(AggregationError::TreeNotAdmitted))));
     }
@@ -3192,6 +3255,19 @@ mod admission_tests {
         assert!(bad(&|t| t.steps[1].program_digest = [0; 4]).is_err());
         assert!(bad(&|t| t.steps[0].key = [0; 4]).is_err());
         assert!(bad(&|t| t.shape.tier += 1).is_err(), "a shape no admitted shape is");
+        // The two constant bounds alone (review M4): under a cover cap that refuses neither.
+        let mut roomy = cfg.clone();
+        roomy.max_covers = 4096;
+        let only = |f: &dyn Fn(&mut TreeConfig)| {
+            let mut t = tree_cfg();
+            f(&mut t);
+            t.check(&roomy)
+        };
+        assert!(only(&|t| { t.leaf_size = TreeConfig::MAX_LEAF; t.max_depth = TreeConfig::MAX_DEPTH; }).is_ok(), "5·2^8 = 1280 fits");
+        let e = only(&|t| t.leaf_size = TreeConfig::MAX_LEAF + 1).unwrap_err();
+        assert!(e.contains("leaf_size"), "{e}");
+        let e = only(&|t| t.max_depth = TreeConfig::MAX_DEPTH + 1).unwrap_err();
+        assert!(e.contains("max_depth"), "{e}");
     }
 
     /// `step_at` reads level `k`'s entry, the last one repeating for every deeper level.

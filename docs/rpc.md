@@ -1890,6 +1890,15 @@ the proof's published digest against the one it computed before it submits anyth
 
 What changed for clients, in one place. Newest first.
 
+### Unreleased — tree aggregation: `Aggregate.layout` (genesis-gated; no chain carries it yet)
+
+**Wire change for aggregates (on every chain, though none has carried one):** `Action::Aggregate`
+gains a last field, `layout` (`Flat` or `Tree`, a trailing 4-byte enum index), so its encoding and
+txid move; a `Tree` aggregate signs under `rand-aggregate-tree-1` (genesis-bound
+`rand-aggregate-tree-2`), a `Flat` one exactly as before. `tx_json`'s `aggregate` gains `layout`
+(`"flat"` or `"tree"`). A `Tree` is admitted only on a chain whose genesis has an
+`aggregation_tree` section (refused `TreeNotAdmitted` otherwise), over exactly `L·2^d` covers.
+
 ### Unreleased — dollar-indexed prover pay: `rand_getRandPrice`, `fee_rules.usd_subsidy`, `SetRandPrice` (tag 44) (genesis-gated; no chain carries it yet)
 
 Additive. A genesis `fees.usd_subsidy` section (`docs/fees.md` §1.3; aggregating chains only)
