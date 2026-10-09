@@ -1172,6 +1172,12 @@ enum ParkSlot {
 /// own parent, whose block it needs. Every parked proposal passed the pre-screen, so each
 /// slot is held by a view's scheduled leader: a junk park for the next view leaves the other
 /// slot to the honest current view.
+///
+/// And it replaces the lowest only when its justify certifies that park's view or a later one
+/// (spec 2026-10-08 §0, compact follow-ups). Otherwise two adjacent Byzantine leaders — one
+/// parking junk in the next view, the next building on an older parent — could evict the honest
+/// current-view park; an honest successor always has `justify.view` at or past the parked view,
+/// since a leader extends the highest certified block it knows.
 fn park_slot(parked: &BTreeMap<u64, compact::Parked>, replica_view: u64, header: &randprotocol_core::BlockHeader) -> ParkSlot {
     let top = parked.keys().next_back().copied().unwrap_or(replica_view).max(replica_view).saturating_add(1);
     if header.view < replica_view || header.view > top {
@@ -1185,7 +1191,8 @@ fn park_slot(parked: &BTreeMap<u64, compact::Parked>, replica_view: u64, header:
     }
     match parked.first_key_value() {
         Some((_, p)) if p.compact.hash() == header.parent => ParkSlot::No("both slots are taken, the lowest by its parent"),
-        Some((&low, _)) => ParkSlot::Replace(low),
+        Some((&low, _)) if header.justify.view >= low => ParkSlot::Replace(low),
+        Some(_) => ParkSlot::No("both slots are taken and the new header does not extend past the lowest"),
         None => ParkSlot::Free,
     }
 }
@@ -3725,7 +3732,8 @@ impl Node {
     /// carry a committed transaction again, and storage may hold its marker form. Where a
     /// proposal missing bodies may park is [`park_slot`]'s rule (final review I2): two slots, a
     /// band from the replica's view to one past the highest parked view, a parked view kept
-    /// against a second proposal for it, and a park never displaced by its own child. The rule
+    /// against a second proposal for it, and a park never displaced by its own child nor by a
+    /// header whose justify certifies a view under it (spec 2026-10-08 §0). The rule
     /// is decided before the rebuild, so a proposal that would not be parked is rebuilt only when
     /// every body is already here.
     ///
@@ -6811,6 +6819,53 @@ mod tests {
         assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v + 1, v + 2], "the lowest is its parent: kept");
         let asked = tx_fetches(&drain(&mut seen).await);
         assert_eq!(asked.len(), 3, "nothing fetched for the proposal that did not park");
+    }
+
+    /// Compact follow-ups (spec 2026-10-08 §0): with both slots taken — the replica's own view
+    /// `v` parked honestly and incomplete, `v + 1` parked as junk — a proposal for `v + 2` whose
+    /// justify certifies a view under `v` does not evict the `v` park: two adjacent Byzantine
+    /// leaders cannot clear an honest current-view park by building on an older parent. A
+    /// proposal for `v + 2` whose justify certifies view `v` (a sibling of the parked block, so
+    /// not its child) replaces it as before.
+    #[tokio::test]
+    async fn a_proposal_certifying_an_older_view_does_not_evict_the_lowest_park() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen) = bare_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let v = node.hs.view();
+        assert!(head.view() < v, "the head's view is under the replica's");
+        let txs: Vec<Transaction> = (1..=5).map(|i| next_tx(&ledger, i)).collect();
+        let honest = block_on(&head, &ledger, &key(1), v, vec![txs[0].clone()]);
+        let junk = block_on(&head, &ledger, &key(1), v + 1, vec![txs[1].clone()]);
+        // Built on the head: its justify certifies `head.view() < v`.
+        let evictor = block_on(&head, &ledger, &key(1), v + 2, vec![txs[2].clone()]);
+        // A sibling at `v`, and a `v + 2` on it: its justify certifies `v`, the lowest park's view.
+        let sibling = block_on(&head, &ledger, &key(1), v, vec![txs[3].clone()]);
+        let successor = block_on(&sibling, &ledger, &key(1), v + 2, vec![txs[4].clone()]);
+        claiming_peer(&mut node, 4);
+
+        for b in [&honest, &junk] {
+            node.on_compact_proposal(CompactBlock::of(b), gossip_id()).await.unwrap();
+        }
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v, v + 1]);
+        assert_eq!(
+            park_slot(&node.parked, v, &evictor.header),
+            ParkSlot::No("both slots are taken and the new header does not extend past the lowest")
+        );
+        node.on_compact_proposal(CompactBlock::of(&evictor), gossip_id()).await.unwrap();
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v, v + 1], "not parked");
+        assert_eq!(node.parked.get(&v).map(|p| p.compact.hash()), Some(honest.hash()), "the v park survives");
+
+        assert_eq!(park_slot(&node.parked, v, &successor.header), ParkSlot::Replace(v));
+        // The fixture's one key leads every view, so the successor would be the evictor's
+        // equivocation (final review C1); on a chain where they differ it would be a fresh header.
+        node.first_compact.clear();
+        node.on_compact_proposal(CompactBlock::of(&successor), gossip_id()).await.unwrap();
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v + 1, v + 2], "replaces as before");
+        assert_eq!(node.parked.get(&(v + 2)).map(|p| p.compact.hash()), Some(successor.hash()));
+        let asked: Vec<Vec<Hash>> = tx_fetches(&drain(&mut seen).await).into_iter().map(|(_, h)| h).collect();
+        assert_eq!(asked, vec![vec![txs[0].hash()], vec![txs[1].hash()], vec![txs[4].hash()]], "nothing fetched for the evictor");
     }
 
     /// [`park_slot`]'s band runs from the replica's view to one past the highest parked view.
