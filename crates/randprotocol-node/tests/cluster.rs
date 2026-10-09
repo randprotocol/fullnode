@@ -2257,6 +2257,168 @@ async fn a_fresh_node_syncs_pruned_history_with_one_rvm_verify_per_sealed_window
     n1.handle.shutdown().await;
 }
 
+/// The capstone's tree twin (tree aggregation, `docs/aggregation.md` §3.8): a gated chain with an
+/// `aggregation_tree` section (test profile, L = 1, `max_depth` 2, the two levels of circuits
+/// docs/08 §5) registers an aggregator, three more bundles commit, and `rand-node aggregate
+/// --layout tree` proves one depth-2 tree over the four and submits it; it commits sealing all
+/// four, and a fresh joiner's sync verifies the window with **one** rVM verification (the root's).
+///
+/// **Ignored with the capstone, for the capstone's reason**: `node::check_build_runs_genesis`
+/// refuses every `aggregation` genesis until the admitted shape is re-measured for the
+/// hidden-asset bundle. The section's heights are docs/08 §5's, measured over the recursion
+/// fixtures' shape; when this is un-ignored they are re-read off a leaf and steps proved at the
+/// fleet's admitted shape (the startup pin check refuses a section the rVM rebuilds otherwise).
+/// It proves four test leaves and three tier-19 steps (≈ 34 GB max RSS each, circuits docs/08 §5):
+/// a ≥ 48 GB host, one proving process at a time, the proving slot held throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "aggregation is refused at startup on the hidden-asset bundle until its admitted shape is re-measured (b053a76); proves a test-profile tree (tier-19 steps, ≈ 34 GB each)"]
+async fn a_tree_aggregate_over_four_bundles_commits_with_one_rvm_verify() {
+    use randprotocol_core::ledger::aggregation::{RvmHeights, TreeConfig, TreeStepPin};
+    init_tracing();
+    let started = Instant::now();
+    let ks = keys(4);
+    let (a, b, aggregator) = (wallet(1), wallet(2), &ks[2]);
+    let shape = randprotocol_core::types::DeclaredShape {
+        profile: randprotocol_core::types::FriProfile::Test,
+        tier: 14,
+        program_log_height: 12,
+        input_log_height: 10,
+        keccak_log_height: 0,
+        sha256_log_height: 0,
+        public_log_height: randprotocol_core::types::BUNDLE_PUBLIC_LOG_HEIGHT,
+        mem_log_height: 16,
+    };
+    let hc = Hash(randprotocol_core::notes::word8_to_bytes(&ZkExecutor::hc_bundle()));
+    let ex = randprotocol_node::agg_executor::AggExecutor::new(FriProfile::Test);
+    let program_digest = ex.aggregate_program_digest(&shape).expect("the shape builds");
+    let cfg = randprotocol_core::ledger::aggregation::AggregationConfig {
+        bond: 100 * UNITS_PER_RAND,
+        max_covers: 3,
+        subsidy_base: 100 * UNITS_PER_RAND,
+        halving_blocks: 210_000,
+        // Long enough that no cover leaves the window during the tree's seven proofs: this twin
+        // tests the tree's admission and sealed sync, not the prune pass (the capstone's).
+        window: 100_000,
+        admitted_shapes: vec![randprotocol_core::ledger::aggregation::AdmittedShape { shape, hc, aggregate_program_digest: program_digest }],
+    };
+    // docs/08 §5's test-profile heights; the pins are this build's rebuild of them (what a
+    // genesis cut measures), so the startup check passes by construction.
+    let h = |tier, reg, p2, reduce| RvmHeights { tier, reg_log_height: reg, ram_log_height: reg, poseidon2_log_height: p2, reduce_log_height: reduce };
+    let mut tree = TreeConfig {
+        shape,
+        leaf_size: 1,
+        max_depth: 2,
+        leaf: h(18, 19, 14, 16),
+        vk_leaf: [1; 4],
+        steps: vec![
+            TreeStepPin { heights: h(19, 20, 15, 16), program_digest: [1; 4], key: [1; 4] },
+            TreeStepPin { heights: h(19, 20, 15, 17), program_digest: [1; 4], key: [1; 4] },
+        ],
+    };
+    let d = ex.tree_digests(&tree).expect("the section rebuilds at the admitted shape");
+    tree.vk_leaf = d.vk_leaf;
+    for (pin, (program, key)) in tree.steps.iter_mut().zip(&d.steps) {
+        pin.program_digest = *program;
+        pin.key = *key;
+    }
+    let mut gen = genesis_funding(&ks[..2], &[&a]);
+    gen.aggregation = Some(cfg.clone());
+    gen.aggregation_tree = Some(tree.clone());
+
+    let n0 = start_node_at(&ks[0], &gen, vec![], true, PROVING).await;
+    let n1 = start_node_at(&ks[1], &gen, vec![bootstrap_addr(&n0)], true, PROVING).await;
+    wait_height(&[&n0, &n1], 2, Duration::from_secs(60)).await;
+    let status = n0.rpc.call("rand_status", json!([])).await.unwrap();
+    assert_eq!(status["aggregation"]["tree"]["max_depth"], 2, "rand_status serves the section: {status}");
+
+    // Four bundles: the registration, then three transfers.
+    let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
+    let registration = randprotocol_core::types::actions::AggregatorRegistration {
+        public_key: aggregator.public_key().clone(),
+        payout: payout.clone(),
+        signature: aggregator.sign(randprotocol_core::types::actions::aggregator_register_message(CHAIN_ID, &payout).as_bytes()),
+    };
+    let mut store = NoteStore::default();
+    let mut covered = Vec::new();
+    {
+        let slot = proving_slot().await;
+        let sent = wallet::submit(
+            &n0.rpc,
+            &a,
+            &mut store,
+            None,
+            Action::RegisterAggregator { registration },
+            gas::BUNDLE_BASE + 7,
+            wallet::Burn::Rand(cfg.bond),
+            FriProfile::Test,
+            &Proving::local(Backend::Cpu),
+            CHAIN_ID,
+            true,
+        )
+        .await
+        .expect("the registration is accepted and commits");
+        covered.push(sent.hash);
+        for _ in 0..3 {
+            let sent = wallet::send(&n0.rpc, &a, &mut store, &b.address, UNITS_PER_RAND, "", gas::BUNDLE_BASE + 7, FriProfile::Test, &Proving::local(Backend::Cpu), CHAIN_ID, true)
+                .await
+                .expect("a transfer commits");
+            covered.push(sent.hash);
+        }
+        drop(slot);
+    }
+    eprintln!("four bundles committed ({:.1?} in)", started.elapsed());
+
+    // The daemon, one pass, `--layout tree`: four unsealed at L = 1, max_depth 2 is one depth-2
+    // tree; it proves, submits and waits for the commit.
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("aggregator.json");
+    randprotocol_node::keyfile::KeyFile::from_keypair(aggregator).write_new(&key).unwrap();
+    let verifications_before = randprotocol_node::agg_executor::AggExecutor::verification_count();
+    let out = {
+        let slot = proving_slot().await;
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_rand-node"))
+            .args(["aggregate", "--key"])
+            .arg(&key)
+            .args(["--rpc", &format!("http://{}", n0.handle.rpc_addr), "--layout", "tree"])
+            .output()
+            .await
+            .expect("the aggregate daemon runs");
+        drop(slot);
+        out
+    };
+    assert!(out.status.success(), "the tree pass: {}", String::from_utf8_lossy(&out.stderr));
+    eprintln!("tree aggregate sealed ({:.1?} in)", started.elapsed());
+    let seals: Vec<_> = covered.iter().map(|h| n0.handle.storage.sealed_by(h).unwrap()).collect();
+    assert!(seals.iter().all(|s| s.is_some() && s == &seals[0]), "one tree seals all four: {seals:?}");
+    let (agg_hash, h_seal) = seals[0].unwrap();
+    let (h, i) = n0.handle.storage.tx_location(&agg_hash).unwrap().unwrap();
+    assert_eq!(h, h_seal);
+    let block = n0.handle.storage.block_by_height(h).unwrap().unwrap();
+    assert!(
+        matches!(&block.transactions[i as usize].action, Action::Aggregate { layout: randprotocol_core::types::AggregateLayout::Tree, covers, .. } if covers.len() == 4),
+        "a Tree aggregate over the four"
+    );
+    assert!(randprotocol_node::agg_executor::AggExecutor::verification_count() > verifications_before, "admission verified the root");
+
+    // A fresh joiner: one rVM verification for the whole window, the root's.
+    let before = randprotocol_node::agg_executor::AggExecutor::verification_count();
+    let n2 = start_node(&ks[3], &gen, vec![bootstrap_addr(&n0)], false).await;
+    let target = n0.height();
+    let t0 = Instant::now();
+    while n2.height() < target {
+        assert!(t0.elapsed() < Duration::from_secs(300), "n2 never reached {target}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(randprotocol_node::agg_executor::AggExecutor::verification_count() - before, 1, "one rVM verification for the tree");
+    for h in 0..=target {
+        assert_eq!(n2.handle.storage.block_by_height(h).unwrap().unwrap().hash(), n0.handle.storage.block_by_height(h).unwrap().unwrap().hash());
+    }
+    eprintln!("tree twin done in {:.1?}", started.elapsed());
+    n2.handle.shutdown().await;
+    n0.handle.shutdown().await;
+    n1.handle.shutdown().await;
+}
+
 /// A peer that answers sync requests with whatever batch it is given, without holding a chain of
 /// its own: the only way to serve blocks a real node would refuse to store (review C1).
 ///

@@ -2960,7 +2960,9 @@ mod tests {
         assert!(refused(&|c| c.leaf_size = 0));
         assert!(refused(&|c| c.leaf_size = 6));
         assert!(refused(&|c| c.max_depth = 0));
-        assert!(refused(&|c| c.max_depth = 4), "L·2^4 = 16 > max_covers 8");
+        // The cover cap is the layout's (tree Task 3b, 3a's I3): a tree is bounded by its own
+        // section, L·2^max_depth, not by the flat `max_covers`.
+        assert!(!refused(&|c| c.max_depth = 4), "L·2^4 = 16 over max_covers 8 is a valid section");
         assert!(refused(&|c| c.vk_leaf = [0; 4]));
         assert!(refused(&|c| c.steps[0].program_digest = [0; 4]));
         assert!(refused(&|c| c.steps[1].key = [0; 4]));

@@ -10,6 +10,7 @@
 //! `ZkExecutor`.
 
 use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor};
+use randprotocol_core::ledger::aggregation::{AggregationError, TreeConfig, TreeDigests};
 use randprotocol_core::notes::{BundleDigestInput, Word8};
 use randprotocol_core::program::{CallOutcome, ProgramRecord};
 use randprotocol_core::types::{CoveredBundle, DeclaredShape};
@@ -59,6 +60,35 @@ fn shape_key(s: &DeclaredShape) -> ShapeKey {
 /// map without limit — past it a shape is built and used, not kept.
 const MAX_BUILT_PROGRAMS: usize = 8;
 
+/// One `aggregation_tree` section's rebuild (tree aggregation, circuits docs/08 §4–§5): the
+/// inner key, the leaf and per-level step shapes (each carrying its program), the key list the
+/// recompute publishes level by level, the digests 7b and the startup check compare with the
+/// genesis pins, and whether the last listed level is a fixed point — what lets a tree deeper
+/// than the list reuse it (R3). A pure function of a genesis constant, so built once.
+struct BuiltTree {
+    inner: InnerVerifierKey,
+    shapes: randprotocol_rvm::aggregate::TreeShapes,
+    keys: randprotocol_rvm::aggregate::TreeKeys,
+    digests: TreeDigests,
+    /// `None` when `max_depth` is within the list (no level repeats the last entry, so whether
+    /// it is a fixed point is never asked); otherwise the rVM's verdict.
+    fixed_point: Option<bool>,
+}
+
+/// How many tree sections the memo keeps — a chain has one; the bound is [`MAX_BUILT_PROGRAMS`]'s.
+const MAX_BUILT_TREES: usize = 4;
+
+/// The rVM's mirror of core's `RvmHeights` (core never names the rVM; the tier is a `Tier`).
+pub fn rvm_heights(h: randprotocol_core::ledger::aggregation::RvmHeights) -> randprotocol_rvm::shape::RvmHeights {
+    randprotocol_rvm::shape::RvmHeights {
+        tier: randprotocol_rvm::machine::Tier(h.tier as usize),
+        reg_log_height: h.reg_log_height,
+        ram_log_height: h.ram_log_height,
+        poseidon2_log_height: h.poseidon2_log_height,
+        reduce_log_height: h.reduce_log_height,
+    }
+}
+
 /// The executor the node runs: `ZkExecutor` inside, one rVM `Machine` beside it (its 64-entry
 /// verifier-key FIFO is what `warm_aggregation` fills and every `verify_aggregate` then reuses),
 /// and the admitted shapes' aggregate programs, built once each.
@@ -68,6 +98,11 @@ pub struct AggExecutor {
     programs: std::sync::Mutex<std::collections::HashMap<ShapeKey, std::sync::Arc<BuiltProgram>>>,
     /// Program builds this executor has run — the memo's instrument for its test.
     program_builds: std::sync::atomic::AtomicUsize,
+    /// The `aggregation_tree` sections' rebuilds, keyed by a digest over the whole section (its
+    /// shape, sizes, heights and pins), so two sections differing anywhere never share one.
+    trees: std::sync::Mutex<std::collections::HashMap<[u8; 32], std::sync::Arc<BuiltTree>>>,
+    /// Tree rebuilds this executor has run (the tree memo's instrument).
+    tree_builds: std::sync::atomic::AtomicUsize,
 }
 
 impl AggExecutor {
@@ -77,7 +112,92 @@ impl AggExecutor {
             rvm: randprotocol_rvm::machine::Machine::new(profile),
             programs: std::sync::Mutex::new(std::collections::HashMap::new()),
             program_builds: std::sync::atomic::AtomicUsize::new(0),
+            trees: std::sync::Mutex::new(std::collections::HashMap::new()),
+            tree_builds: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many tree sections this executor has rebuilt.
+    pub fn tree_builds(&self) -> usize {
+        self.tree_builds.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The section's rebuild, memoised: `TreeShapes::build` over the pinned leaf and per-level
+    /// heights (the leaf program is the memoised flat program of the shape), the key list, and
+    /// the digests. Refused as `BadDeclaredShape`, before any key is compared, when the rVM could
+    /// never serve the section: an empty step list; a leaf size past the rVM's N ceiling for the
+    /// shape (3a's deferred M6 — production N ≤ 5, `machine::max_reduce_n`); a pinned reduce height
+    /// that is not canonical for its program (the leaf at N = L, every step at N = 2, as
+    /// `verify_n` insists, so no honest proof could declare it); or a `max_depth` past the listed
+    /// levels whose last entry is not a fixed point (R3: deeper levels repeat it, and a step that
+    /// does not verify its own proofs makes those depths unprovable). Built outside the lock,
+    /// as `built_program` is. Production: minutes (three programs and their keys).
+    fn built_tree(&self, tree: &TreeConfig) -> Result<std::sync::Arc<BuiltTree>, ConfidentialError> {
+        use p3_field::PrimeField64;
+        let memo_key = *blake3::hash(&bincode::serialize(tree).expect("a TreeConfig serializes")).as_bytes();
+        if let Some(hit) = self.trees.lock().expect("the tree memo").get(&memo_key) {
+            return Ok(hit.clone());
+        }
+        let unservable = |m: String| ConfidentialError::BadDeclaredShape(format!("aggregation_tree: {m}"));
+        let leaf_program = self.built_program(&tree.shape)?;
+        if tree.leaf_size == 0 || tree.leaf_size as u64 > leaf_program.max_n {
+            return Err(unservable(format!(
+                "leaf_size {} is outside 1..={}, the rVM's N ceiling for this shape (the reduce chip's REDUCE_MAX_LOG_HEIGHT)",
+                tree.leaf_size, leaf_program.max_n
+            )));
+        }
+        let inner = leaf_program.vk.clone();
+        let steps: Vec<randprotocol_rvm::shape::RvmHeights> = tree.steps.iter().map(|s| rvm_heights(s.heights)).collect();
+        let shapes = randprotocol_rvm::aggregate::TreeShapes::build(zkvm_profile(tree.shape.profile), &inner, rvm_heights(tree.leaf), &steps)
+            .map_err(|e| unservable(format!("{e:?}")))?;
+        let canonical = |what: String, program: &randprotocol_rvm::isa::Program, n: u64, pinned: u8| {
+            match randprotocol_rvm::machine::canonical_reduce_log_height(program, n) {
+                Some(h) if h == pinned => Ok(()),
+                h => Err(unservable(format!("{what} pins reduce height {pinned}; the canonical one at N = {n} is {h:?}"))),
+            }
+        };
+        canonical("the leaf".into(), &shapes.leaf.program, tree.leaf_size as u64, tree.leaf.reduce_log_height)?;
+        for (k, s) in shapes.steps.iter().enumerate() {
+            canonical(format!("level {}", k + 1), &s.program, randprotocol_rvm::programs::TREE_ARITY, tree.steps[k].heights.reduce_log_height)?;
+        }
+        let fixed_point = (tree.max_depth as usize > tree.steps.len()).then(|| shapes.fixed_point());
+        if fixed_point == Some(false) {
+            return Err(unservable(format!(
+                "max_depth {} is past the {} listed levels and the last is not a fixed point (R3): depths beyond the list are unprovable",
+                tree.max_depth,
+                tree.steps.len()
+            )));
+        }
+        let keys = shapes.keys();
+        let u = |d: [randprotocol_rvm::isa::F; 4]| d.map(|f| f.as_canonical_u64());
+        let digests = TreeDigests {
+            vk_leaf: u(keys.vk_leaf),
+            steps: shapes.steps.iter().zip(&keys.step_keys).map(|(s, k)| (u(s.program.digest()), u(*k))).collect(),
+        };
+        self.tree_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let built = std::sync::Arc::new(BuiltTree { inner, shapes, keys, digests, fixed_point });
+        let mut memo = self.trees.lock().expect("the tree memo");
+        if memo.len() < MAX_BUILT_TREES {
+            memo.entry(memo_key).or_insert_with(|| built.clone());
+        }
+        Ok(built)
+    }
+
+    /// The tree root's header (step 7a's executor half): the decode, the canonical encoding, then
+    /// the exact tier pinned for the root's level — `aggregate_header`'s discipline with the
+    /// pinned tier in place of `admitted_tiers`, so a root at any other tier builds nothing.
+    fn aggregate_header_tree(&self, proof: &[u8], pinned_tier: u8) -> Result<randprotocol_rvm::machine::Proof, ConfidentialError> {
+        let p: randprotocol_rvm::machine::Proof = postcard::from_bytes(proof).map_err(|_| ConfidentialError::MalformedProof)?;
+        if p.to_bytes() != proof {
+            return Err(ConfidentialError::MalformedProof);
+        }
+        if p.tier.0 != pinned_tier as usize {
+            return Err(ConfidentialError::InvalidAggregateProof(format!(
+                "tree root at tier {}; its level is pinned at tier {pinned_tier}",
+                p.tier.0
+            )));
+        }
+        Ok(p)
     }
 
     /// The shape's aggregate program, memoised (INTERFACE-5). Step 7b's digest compare and step
@@ -261,6 +381,54 @@ pub fn check_admitted_covers(shape: &DeclaredShape, max_covers: u32) -> Result<(
         return Err(ConfidentialError::BadDeclaredShape(format!(
             "max_covers {max_covers} is past the rVM's N ceiling {max_n} for this shape (the reduce chip's REDUCE_MAX_LOG_HEIGHT)"
         )));
+    }
+    Ok(())
+}
+
+/// Why a node refuses to start on its `aggregation_tree` section ([`check_tree_pins`]).
+#[derive(Debug)]
+pub enum TreePinError {
+    /// The rVM cannot serve the section at all (`AggExecutor`'s rebuild refused it): no tree
+    /// aggregate could ever be proved or verified on the chain.
+    Unbuildable(ConfidentialError),
+    /// A pin this build does not rebuild: `TreeKeyPin { level }` (circuits' `at_level`
+    /// numbering) or `AggregateProgramMismatch` for a level's step program.
+    Pin(AggregationError),
+}
+
+impl std::fmt::Display for TreePinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TreePinError::Unbuildable(e) => write!(f, "the rVM cannot serve the section: {e}"),
+            TreePinError::Pin(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for TreePinError {}
+
+/// The startup check (circuits spec §4: the node "refuses to start on a mismatch"): rebuild the
+/// section and compare **every** pin — each listed level's step program digest, `vk_leaf`, and
+/// each listed level's key — whatever depth a tree may later take. Stricter than admission's
+/// 7b, which reads only what a depth-`d` recompute uses, so a pin only a deep tree would touch
+/// cannot sit wrong until the first deep aggregate. The node runs it beside
+/// `check_build_runs_genesis`, before the warm thread.
+pub fn check_tree_pins(ex: &dyn ConfidentialExecutor, tree: &TreeConfig) -> Result<(), TreePinError> {
+    let built = ex.tree_digests(tree).map_err(TreePinError::Unbuildable)?;
+    for (k, pin) in tree.steps.iter().enumerate() {
+        let program = built.steps.get(k).map_or([0; 4], |(p, _)| *p);
+        if program != pin.program_digest {
+            return Err(TreePinError::Pin(AggregationError::AggregateProgramMismatch { pinned: pin.program_digest, built: program }));
+        }
+    }
+    if built.vk_leaf != tree.vk_leaf {
+        return Err(TreePinError::Pin(AggregationError::TreeKeyPin { level: 1 }));
+    }
+    for (k, pin) in tree.steps.iter().enumerate() {
+        // `steps[k].key` is the key of level k+1's proofs, which level k+2 consumes.
+        if built.steps.get(k).map(|(_, key)| *key) != Some(pin.key) {
+            return Err(TreePinError::Pin(AggregationError::TreeKeyPin { level: u8::try_from(k + 2).unwrap_or(u8::MAX) }));
+        }
     }
     Ok(())
 }
@@ -540,6 +708,95 @@ impl ConfidentialExecutor for AggExecutor {
                 .map_err(|e| ConfidentialError::InvalidAggregateProof(format!("{e:?}")))?;
         AGGREGATE_VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(out)
+    }
+
+    /// Step 7a for a tree: the root's tier off its header alone — the decode and the canonical
+    /// encoding (`aggregate_header`'s), no tier set and nothing built; the ledger compares it with
+    /// the pinned tier of the root's level.
+    fn aggregate_proof_tier(&self, proof: &[u8]) -> Result<u8, ConfidentialError> {
+        let p: randprotocol_rvm::machine::Proof = postcard::from_bytes(proof).map_err(|_| ConfidentialError::MalformedProof)?;
+        if p.to_bytes() != proof {
+            return Err(ConfidentialError::MalformedProof);
+        }
+        u8::try_from(p.tier.0).map_err(|_| ConfidentialError::InvalidAggregateProof(format!("tree root at tier {}", p.tier.0)))
+    }
+
+    /// Step 7b for a tree: the rebuilt `vk_leaf` and each listed level's `(program, key)`, in the
+    /// list's order (memoised; see `built_tree` for what refuses a section outright).
+    fn tree_digests(&self, tree: &TreeConfig) -> Result<TreeDigests, ConfidentialError> {
+        Ok(self.built_tree(tree)?.digests.clone())
+    }
+
+    /// Step 8 for a tree (circuits `aggregate::verify_tree`): the root's header at its level's
+    /// pinned tier, then the rVM's bottom-up recompute under the rebuilt key list and
+    /// `verify_n(root program, root, 2)`. The ledger has checked the layout, the depth, the tier
+    /// and the pins; this re-reads the tier (the header is this executor's to decode) and refuses
+    /// a depth past the list without a fixed point, which `built_tree` lets through only when
+    /// `max_depth` is within the list. Named verdicts keep their names (`TreeRootDigest`,
+    /// `TreeKeyPin`, `CoveredPublicValues`); every other refusal is `InvalidAggregateProof`.
+    fn verify_tree(
+        &self,
+        tree: &TreeConfig,
+        covered: &[CoveredBundle],
+        proof: &[u8],
+        binding: &[u32; 8],
+        depth: u32,
+    ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+        use randprotocol_rvm::aggregate::VerifyTreeError;
+        if tree.steps.is_empty() {
+            return Err(ConfidentialError::InvalidAggregateProof("aggregation_tree lists no step".into()));
+        }
+        let root = self.aggregate_header_tree(proof, tree.step_at(depth).heights.tier)?;
+        let built = self.built_tree(tree)?;
+        if depth as usize > tree.steps.len() && built.fixed_point != Some(true) {
+            return Err(ConfidentialError::InvalidAggregateProof(format!(
+                "a depth-{depth} tree repeats level {}'s step, which is not a fixed point",
+                tree.steps.len()
+            )));
+        }
+        let program = built
+            .shapes
+            .root_program(depth)
+            .ok_or_else(|| ConfidentialError::InvalidAggregateProof(format!("no step program for depth {depth}")))?;
+        let pvs: Vec<Vec<u64>> = covered.iter().map(|c| c.public_values.to_vec()).collect();
+        let out = randprotocol_rvm::aggregate::verify_tree(
+            &self.rvm,
+            program,
+            &root,
+            &built.inner,
+            &pvs,
+            binding,
+            tree.leaf_size as usize,
+            depth,
+            &built.keys,
+        )
+        .map_err(|e| match e {
+            VerifyTreeError::TreeRootDigest => ConfidentialError::TreeRootDigest,
+            VerifyTreeError::TreeKeyPin { level } => ConfidentialError::TreeKeyPin { level: u8::try_from(level).unwrap_or(u8::MAX) },
+            VerifyTreeError::CoveredPublicValues { index } => ConfidentialError::CoveredPublicValues { index },
+            e => ConfidentialError::InvalidAggregateProof(format!("{e:?}")),
+        })?;
+        AGGREGATE_VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(out)
+    }
+
+    /// The tree's startup key-build: for each listed level, the rVM key a root of that depth
+    /// verifies under — the level's step program, its pinned tier, its canonical reduce height at
+    /// N = 2 (which `built_tree` holds the pin to). A section the rVM refuses is logged, not
+    /// panicked on: the startup pin check is where that refusal belongs.
+    fn warm_tree(&self, tree: &TreeConfig) {
+        let t0 = std::time::Instant::now();
+        let built = match self.built_tree(tree) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("aggregation_tree: cannot rebuild the section ({e}); skipping the warm");
+                return;
+            }
+        };
+        for (s, pin) in built.shapes.steps.iter().zip(&tree.steps) {
+            let _ = self.rvm.verifier_key(&s.program, randprotocol_rvm::machine::Tier(pin.heights.tier as usize), pin.heights.reduce_log_height);
+        }
+        tracing::info!("aggregation_tree: {} root keys warmed ({:.1?})", tree.steps.len(), t0.elapsed());
     }
 
     /// The startup key-build (spec §2.3, `circuits/recursion/docs/02-aggregate.md` "Startup: the
@@ -1111,5 +1368,307 @@ mod tests {
             u32::try_from(cov.public_values[randprotocol_zkvm::tables::cpu::pv::OUT0 + k]).unwrap()
         });
         assert_eq!(outs, vec![want], "the covered bundle's OUT0..7, in cover order");
+    }
+
+
+    // ── tree aggregation (circuits docs/08, spec §4 / §4.1 per-level lists) ─────────────────────
+
+    use randprotocol_core::ledger::aggregation::{AggregationError, RvmHeights, TreeConfig, TreeStepPin};
+
+    /// The cached test tree's declared heights (circuits Task 1b, `$RECURSION_FIXTURES/tree/`,
+    /// docs/08 §5): `Test-leaf-0` (`rv32n` at L = 1), `Test-step-0` (level 1, `rv32t_leaf`) and
+    /// `Test-root` (level 2, `rv32t_int`). Data a genesis cut reads off the proofs, held here so the
+    /// node lib suite runs without the cache; `the_test_tree_heights_are_the_cached_proofs` holds
+    /// them to the cache wherever it is present.
+    const TEST_LEAF: RvmHeights = RvmHeights { tier: 18, reg_log_height: 19, ram_log_height: 19, poseidon2_log_height: 14, reduce_log_height: 16 };
+    const TEST_STEP: RvmHeights = RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height: 16 };
+    const TEST_ROOT: RvmHeights = RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height: 17 };
+
+    /// circuits `recursion/tests/pins.json`'s `tree_test` keys (`vk_leaf`, `vk_t_leaf`, `vk_int`),
+    /// as canonical u64 limbs: what the rVM's own suite computes from the proved shapes.
+    const PIN_VK_LEAF: [u64; 4] = [1769152780461762224, 4754121159208375271, 16285051620565002471, 12356170513791122891];
+    const PIN_VK_T_LEAF: [u64; 4] = [7711328338169539612, 5984874271003933741, 17134834717916042633, 2542356665053237370];
+    const PIN_VK_INT: [u64; 4] = [12189568167191873679, 7035563939045772652, 12535684755110529647, 4848701472125205360];
+    const PIN_VK_FIX: [u64; 4] = [4756771443877942240, 18437901406829798119, 13732813924430148200, 10825047408558662485];
+
+    /// A tree proof from `$RECURSION_FIXTURES/tree/{name}.rvmproof` (the bare postcard rVM proof),
+    /// with `fixture_proof`'s loud failure.
+    fn load_tree(dir: &std::path::Path, name: &str) -> randprotocol_rvm::machine::Proof {
+        let path = dir.join("tree").join(format!("{name}.rvmproof"));
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!("{}: {e} — the tree tests read circuits' cached test tree (recursion `tests/tree.rs`, docs/08 §5); point RECURSION_FIXTURES at a cache holding tree/", path.display())
+        });
+        postcard::from_bytes(&bytes).expect("a tree fixture decodes")
+    }
+
+    fn heights_of(p: &randprotocol_rvm::machine::Proof) -> RvmHeights {
+        RvmHeights {
+            tier: p.tier.0 as u8,
+            reg_log_height: p.reg_log_height,
+            ram_log_height: p.ram_log_height,
+            poseidon2_log_height: p.poseidon2_log_height,
+            reduce_log_height: p.reduce_log_height,
+        }
+    }
+
+    /// The test-profile `aggregation_tree` section, built the way a genesis cut computes it: the
+    /// heights read off the cached test leaf, step and root, the digests from the rVM's own
+    /// `TreeShapes` over them (never this executor's, so a node-side mapping slip is a mismatch).
+    /// L = 1, max_depth 2, two listed levels.
+    fn test_tree_cfg() -> TreeConfig {
+        use p3_field::PrimeField64;
+        let (shape, _) = covered(0);
+        let inner = AggExecutor::inner_key(&shape).unwrap();
+        let s = randprotocol_rvm::aggregate::TreeShapes::build(
+            FriProfile::Test,
+            &inner,
+            rvm_heights(TEST_LEAF),
+            &[rvm_heights(TEST_STEP), rvm_heights(TEST_ROOT)],
+        )
+        .unwrap();
+        let u = |d: [randprotocol_rvm::isa::F; 4]| d.map(|f| f.as_canonical_u64());
+        let k = s.keys();
+        let steps = [TEST_STEP, TEST_ROOT]
+            .iter()
+            .enumerate()
+            .map(|(i, h)| TreeStepPin { heights: *h, program_digest: u(s.steps[i].program.digest()), key: u(k.step_keys[i]) })
+            .collect();
+        TreeConfig { shape, leaf_size: 1, max_depth: 2, leaf: TEST_LEAF, vk_leaf: u(k.vk_leaf), steps }
+    }
+
+    /// The heights above are the cache's (skipped without `RECURSION_FIXTURES`; the in-repo set
+    /// has no tree). The leaves and both level-1 steps each declare one shape.
+    #[test]
+    fn the_test_tree_heights_are_the_cached_proofs() {
+        let Some(dir) = std::env::var_os("RECURSION_FIXTURES").map(std::path::PathBuf::from) else {
+            eprintln!("skipped: RECURSION_FIXTURES is not set (the in-repo set has no tree/)");
+            return;
+        };
+        for k in 0..4 {
+            assert_eq!(heights_of(&load_tree(&dir, &format!("Test-leaf-{k}"))), TEST_LEAF, "leaf {k}");
+        }
+        for k in 0..2 {
+            assert_eq!(heights_of(&load_tree(&dir, &format!("Test-step-{k}"))), TEST_STEP, "step {k}");
+        }
+        assert_eq!(heights_of(&load_tree(&dir, "Test-root")), TEST_ROOT, "root");
+    }
+
+    /// The node's rebuild is circuits': the executor's `tree_digests` over the test section are
+    /// the rVM suite's pinned keys, and one entry per listed level, in order.
+    #[test]
+    fn the_rebuilt_test_tree_keys_are_the_circuits_pins() {
+        let ex = AggExecutor::new(FriProfile::Test);
+        let t = test_tree_cfg();
+        let d = ex.tree_digests(&t).expect("the test section rebuilds");
+        assert_eq!(d.vk_leaf, PIN_VK_LEAF, "vk_leaf");
+        assert_eq!(d.steps.len(), 2, "one entry per listed level");
+        assert_eq!(d.steps[0].1, PIN_VK_T_LEAF, "level 1's step key (vk_t_leaf)");
+        assert_eq!(d.steps[1].1, PIN_VK_INT, "level 2's step key (vk_int)");
+        assert_eq!((d.steps[0].0, d.steps[1].0), (t.steps[0].program_digest, t.steps[1].program_digest));
+        assert_eq!(ex.tree_builds(), 1);
+        ex.tree_digests(&t).unwrap();
+        assert_eq!(ex.tree_builds(), 1, "the section is built once (memoised by its whole content)");
+    }
+
+    /// The startup check (spec §4: "refuses to start on a mismatch"), stricter than admission's
+    /// per-depth 7b: the honest section passes, and every pin, flipped alone, is named — keys by
+    /// the consuming level (circuits' `at_level`), program digests as `AggregateProgramMismatch`,
+    /// whichever level's.
+    #[test]
+    fn the_tree_pins_are_checked_at_startup() {
+        let ex = AggExecutor::new(FriProfile::Test);
+        let good = test_tree_cfg();
+        check_tree_pins(&ex, &good).expect("the cached test tree's own pins");
+        let flip = |f: &dyn Fn(&mut TreeConfig)| {
+            let mut t = good.clone();
+            f(&mut t);
+            check_tree_pins(&ex, &t)
+        };
+        assert!(matches!(flip(&|t| t.vk_leaf = [1; 4]), Err(TreePinError::Pin(AggregationError::TreeKeyPin { level: 1 }))));
+        assert!(matches!(flip(&|t| t.steps[0].key = [1; 4]), Err(TreePinError::Pin(AggregationError::TreeKeyPin { level: 2 }))));
+        assert!(matches!(flip(&|t| t.steps[1].key = [1; 4]), Err(TreePinError::Pin(AggregationError::TreeKeyPin { level: 3 }))));
+        assert!(matches!(
+            flip(&|t| t.steps[0].program_digest = [1; 4]),
+            Err(TreePinError::Pin(AggregationError::AggregateProgramMismatch { pinned: [1, 1, 1, 1], .. }))
+        ));
+        assert!(matches!(
+            flip(&|t| t.steps[1].program_digest = [1; 4]),
+            Err(TreePinError::Pin(AggregationError::AggregateProgramMismatch { pinned: [1, 1, 1, 1], .. }))
+        ));
+        // Admission at depth 1 reads neither level-2 pin; startup reads both.
+        let mut deep_only = good.clone();
+        deep_only.steps[1].key = [1; 4];
+        assert!(check_tree_pins(&ex, &deep_only).is_err(), "a level only a depth-2 tree uses is still checked");
+    }
+
+    /// The deferred 3a M6 and what makes a section unservable: a leaf size past the rVM's N
+    /// ceiling for the shape (no leaf can be proved), a pinned reduce height that is not canonical
+    /// for its program (no honest proof declares it), and a `max_depth` past the listed levels
+    /// whose last entry is not a fixed point (the test list's is not: docs/08 §5). Each refuses
+    /// startup as `Unbuildable`, before any pin is compared.
+    #[test]
+    fn a_tree_section_the_rvm_cannot_serve_refuses_startup() {
+        let ex = AggExecutor::new(FriProfile::Test);
+        let good = test_tree_cfg();
+        let max_n = ex.built_program(&good.shape).unwrap().max_n;
+        let refused = |t: &TreeConfig, want: &str| match check_tree_pins(&ex, t) {
+            Err(TreePinError::Unbuildable(ConfidentialError::BadDeclaredShape(m))) => assert!(m.contains(want), "{m}"),
+            other => panic!("want Unbuildable naming {want:?}, got {other:?}"),
+        };
+        refused(&TreeConfig { leaf_size: max_n as u8 + 1, ..good.clone() }, "N ceiling");
+        let mut t = good.clone();
+        t.leaf.reduce_log_height += 1;
+        refused(&t, "canonical");
+        let mut t = good.clone();
+        t.steps[0].heights.reduce_log_height += 1;
+        refused(&t, "canonical");
+        refused(&TreeConfig { max_depth: 3, ..good.clone() }, "fixed point");
+        refused(&TreeConfig { steps: Vec::new(), ..good.clone() }, "EmptyTreeSteps");
+    }
+
+    /// The test list with its fixed point (docs/08 §5: level 3's program, `rv32t` at the root's
+    /// shape, is its own): three listed levels admit a `max_depth` past the list, the rebuilt
+    /// `vk_fix` is circuits' pin, and the startup check passes where the two-level list is
+    /// refused (`a_tree_section_the_rvm_cannot_serve_refuses_startup`).
+    #[test]
+    fn a_listed_fixed_point_admits_a_deeper_max_depth() {
+        use p3_field::PrimeField64;
+        let ex = AggExecutor::new(FriProfile::Test);
+        let mut t = test_tree_cfg();
+        let inner = AggExecutor::inner_key(&t.shape).unwrap();
+        let s = randprotocol_rvm::aggregate::TreeShapes::build(
+            FriProfile::Test,
+            &inner,
+            rvm_heights(TEST_LEAF),
+            &[rvm_heights(TEST_STEP), rvm_heights(TEST_ROOT), rvm_heights(TEST_ROOT)],
+        )
+        .unwrap();
+        assert!(s.fixed_point(), "the third entry is the fixed point");
+        let u = |d: [randprotocol_rvm::isa::F; 4]| d.map(|f| f.as_canonical_u64());
+        t.steps.push(TreeStepPin { heights: TEST_ROOT, program_digest: u(s.steps[2].program.digest()), key: u(s.keys().step_keys[2]) });
+        assert_eq!(t.steps[2].key, PIN_VK_FIX, "vk_fix, circuits' pin");
+        t.max_depth = 5;
+        check_tree_pins(&ex, &t).expect("a fixed point past the list serves every deeper level");
+    }
+
+    /// Crafted roots (`crafted_proof`'s pattern, at level 1's step heights and its program's
+    /// degree bits): another tier is refused by the header and builds no key; the digest the
+    /// recompute makes under another binding is `TreeRootDigest` and builds no key; the right
+    /// digest over an all-zero batch reaches the rVM verify and is refused there.
+    #[test]
+    fn crafted_tree_roots_are_refused_at_their_step() {
+        use p3_field::PrimeField64;
+        let ex = AggExecutor::new(FriProfile::Test);
+        let t = test_tree_cfg();
+        let covered: Vec<CoveredBundle> = (0..2).map(|k| covered(k).1).collect();
+        let pvs: Vec<Vec<u64>> = covered.iter().map(|c| c.public_values.to_vec()).collect();
+        let inner = AggExecutor::inner_key(&t.shape).unwrap();
+        let s = randprotocol_rvm::aggregate::TreeShapes::build(FriProfile::Test, &inner, rvm_heights(t.leaf), &[rvm_heights(TEST_STEP), rvm_heights(TEST_ROOT)]).unwrap();
+        let st = t.steps[0].heights;
+        let root_for = |binding: &[u32; 8], tier: usize| -> Vec<u8> {
+            let d = randprotocol_rvm::aggregate::tree_root_digest(&inner, &pvs, binding, 1, 1, &s.keys()).unwrap();
+            let digest: Vec<u64> = d.iter().map(|f| f.as_canonical_u64()).collect();
+            let mut bytes = postcard::to_allocvec(&(tier, st.reg_log_height, st.ram_log_height, st.poseidon2_log_height, st.reduce_log_height, digest)).unwrap();
+            bytes.extend_from_slice(&[0u8; 4096]);
+            let mut p: randprotocol_rvm::machine::Proof = postcard::from_bytes(&bytes).unwrap();
+            p.batch.degree_bits = randprotocol_rvm::machine::log_ext_degrees(
+                s.root_program(1).unwrap(),
+                randprotocol_rvm::machine::Tier(tier),
+                st.reg_log_height,
+                st.ram_log_height,
+                st.poseidon2_log_height,
+                st.reduce_log_height,
+            );
+            p.to_bytes()
+        };
+        let b = [3u32; 8];
+        let before = ex.rvm.cached_keys();
+        assert!(matches!(ex.verify_tree(&t, &covered, &root_for(&b, st.tier as usize + 1), &b, 1), Err(ConfidentialError::InvalidAggregateProof(m)) if m.contains("tier")));
+        assert!(matches!(ex.verify_tree(&t, &covered, &root_for(&[4; 8], st.tier as usize), &b, 1), Err(ConfidentialError::TreeRootDigest)));
+        assert_eq!(ex.rvm.cached_keys(), before, "neither refusal built a key");
+        assert!(matches!(ex.verify_tree(&t, &covered, &root_for(&b, st.tier as usize), &b, 1), Err(ConfidentialError::InvalidAggregateProof(_))));
+        // A covered run that is no bundle's (an OUT word past u32) is named before the recompute.
+        let mut bad = covered.clone();
+        bad[1].public_values[randprotocol_core::types::pv::OUT0] = 1 << 40;
+        assert!(matches!(ex.verify_tree(&t, &bad, &root_for(&b, st.tier as usize), &b, 1), Err(ConfidentialError::CoveredPublicValues { index: 1 })));
+        // A depth the section's list cannot reach without a fixed point is refused, not verified.
+        let eight: Vec<CoveredBundle> = (0..8).map(|k| covered[k % 2].clone()).collect();
+        assert!(matches!(ex.verify_tree(&t, &eight, &root_for(&b, TEST_ROOT.tier as usize), &b, 3), Err(ConfidentialError::InvalidAggregateProof(m)) if m.contains("fixed point")));
+        assert_eq!(ex.rvm.cached_keys(), before + 1, "only the one honest-digest verify built a key");
+    }
+
+    /// Step 7a's header read: the tier off a canonical root, nothing built; junk and a padded
+    /// encoding are `MalformedProof`.
+    #[test]
+    fn the_tree_root_tier_is_read_off_a_canonical_header() {
+        let ex = AggExecutor::new(FriProfile::Test);
+        let (shape, cov) = covered(0);
+        let p = crafted_proof(&shape, &[cov], &[3; 8], 19, 16);
+        assert_eq!(ex.aggregate_proof_tier(&p), Ok(19));
+        let mut padded = p.clone();
+        padded.push(0);
+        assert_eq!(ex.aggregate_proof_tier(&padded), Err(ConfidentialError::MalformedProof));
+        assert_eq!(ex.aggregate_proof_tier(b"junk"), Err(ConfidentialError::MalformedProof));
+        assert_eq!(ex.program_builds() + ex.tree_builds(), 0);
+    }
+
+    /// The tree's startup warm: one rVM key per listed level, at the level's pinned tier and its
+    /// canonical reduce height at N = 2 — what a root of that depth verifies under.
+    #[test]
+    fn warm_tree_warms_one_root_key_per_listed_level() {
+        let ex = AggExecutor::new(FriProfile::Test);
+        let t = test_tree_cfg();
+        ex.warm_tree(&t);
+        assert_eq!(ex.rvm.cached_keys(), t.steps.len());
+        ex.warm_tree(&t);
+        assert_eq!(ex.rvm.cached_keys(), t.steps.len(), "a second warm hits the cache");
+    }
+
+    /// The production depth-2 tree through the node: its section built from the cached
+    /// production leaf, step and root (circuits docs/08 §3–§4, L = 2), the startup pin check, then
+    /// `verify_tree` over Production-0..3 under the doc binding. **Pending the droplet**: the
+    /// production tree is not proved yet, and its keys are tier-21 builds.
+    #[test]
+    #[ignore = "tree aggregation: the production depth-2 tree (circuits docs/08 §3) — needs tree/Production-{leaf-0,step-0,root}.rvmproof and Production-0..3.proof in RECURSION_FIXTURES and the 256 GB droplet"]
+    fn production_tree() {
+        use p3_field::PrimeField64;
+        let dir = std::path::PathBuf::from(std::env::var_os("RECURSION_FIXTURES").expect("RECURSION_FIXTURES"));
+        let bundle = |k: usize| -> randprotocol_zkvm::machine::Proof {
+            let bytes = std::fs::read(dir.join(format!("Production-{k}.proof"))).expect("a production bundle fixture");
+            postcard::from_bytes(&bytes[32..]).expect("decodes")
+        };
+        let p0 = bundle(0);
+        let shape = DeclaredShape {
+            profile: CoreProfile::Production,
+            tier: p0.tier.0 as u8,
+            program_log_height: p0.program_log_height,
+            input_log_height: p0.input_log_height,
+            keccak_log_height: p0.keccak_log_height,
+            sha256_log_height: p0.sha256_log_height,
+            public_log_height: p0.public_log_height,
+            mem_log_height: p0.mem_log_height,
+        };
+        let (leaf, step, root) = (load_tree(&dir, "Production-leaf-0"), load_tree(&dir, "Production-step-0"), load_tree(&dir, "Production-root"));
+        let inner = AggExecutor::inner_key(&shape).unwrap();
+        let s = randprotocol_rvm::aggregate::TreeShapes::build(FriProfile::Production, &inner, rvm_heights(heights_of(&leaf)), &[rvm_heights(heights_of(&step)), rvm_heights(heights_of(&root))]).unwrap();
+        let u = |d: [randprotocol_rvm::isa::F; 4]| d.map(|f| f.as_canonical_u64());
+        let k = s.keys();
+        let steps = [heights_of(&step), heights_of(&root)]
+            .iter()
+            .enumerate()
+            .map(|(i, h)| TreeStepPin { heights: *h, program_digest: u(s.steps[i].program.digest()), key: u(k.step_keys[i]) })
+            .collect();
+        let t = TreeConfig { shape, leaf_size: 2, max_depth: 2, leaf: heights_of(&leaf), vk_leaf: u(k.vk_leaf), steps };
+        let ex = AggExecutor::new(FriProfile::Production);
+        check_tree_pins(&ex, &t).expect("the production section's own pins");
+        let covered: Vec<CoveredBundle> = (0..4)
+            .map(|k| {
+                let p = bundle(k);
+                CoveredBundle { public_values: p.public_values.clone().try_into().unwrap(), shape }
+            })
+            .collect();
+        let outs = ex.verify_tree(&t, &covered, &root.to_bytes(), &DOC_BINDING, 2).expect("the production tree verifies through the node");
+        assert_eq!(outs.len(), 4);
+        eprintln!("PRODUCTION_TREE vk_leaf {:?} steps {:?}", t.vk_leaf, t.steps);
     }
 }

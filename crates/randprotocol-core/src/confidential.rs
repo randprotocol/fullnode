@@ -343,6 +343,12 @@ pub trait ConfidentialExecutor: Send + Sync {
     ) -> Result<Vec<[u32; 8]>, ConfidentialError> {
         Err(ConfidentialError::AggregationUnsupported)
     }
+    /// Tree aggregation's startup key-build, [`Self::warm_aggregation`]'s twin: rebuild the
+    /// section's leaf and per-level step programs and warm the rVM verifier key a root at each
+    /// listed level verifies under (its pinned tier, its canonical reduce height at N = 2), so
+    /// the first tree aggregate does not pay a key build inside admission. Called once at node
+    /// startup on a chain whose genesis has an `aggregation_tree` section; may be a no-op.
+    fn warm_tree(&self, _tree: &crate::ledger::aggregation::TreeConfig) {}
 }
 
 /// Test executor. A "proof" is `STUB` || tier (1 byte) || 8 outputs (LE u32) || `H_IN`

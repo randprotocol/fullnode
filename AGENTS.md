@@ -6,6 +6,30 @@ invariants, and known traps.
 
 ## Project memory (state as of 2026-10-09)
 
+### Tree aggregation (2026-10-09; branch `feat/tree-aggregation`, NOT pushed; genesis-gated, on no chain)
+
+Circuits `92b750e` (branch `feat/tree-aggregation`, **not yet on zkp-circuits**; `CIRCUITS_PIN`
+and both PROVENANCE.md files name it, the `rand-zkvm-cuda` revs stay `71e1a04`, identical where
+it matters) re-vendored by the recursion section of `deploy/sync-zkvm.sh` alone: `rv32t`,
+`aggregate::{TreeShapes, TreeKeys, verify_tree, aggregate_tree, …}` (`recursion/docs/08`). Core
+(3a): `Aggregate.layout`, genesis `aggregation_tree` (`TreeConfig`: shape, `leaf_size`,
+`max_depth`, leaf heights, `vk_leaf`, a per-level `steps` list of `{heights, program_digest,
+key}` whose last entry repeats), admission 6t/7a/7b/8, the tree signing domain. Node (3b):
+`AggExecutor::{aggregate_proof_tier, tree_digests, verify_tree, warm_tree}` over a memo keyed by
+the whole section; **`agg_executor::check_tree_pins` at startup** compares every pin and refuses
+an unservable section (leaf size past the rVM N ceiling, a non-canonical reduce height, a
+`max_depth` past a list whose last entry is not a fixed point); `rand_status.aggregation.tree`;
+`rand-node aggregate --layout tree`. **The cover cap is the layout's**: flat ≤ `max_covers`, a tree
+≤ `L·2^max_depth` (`check_cover_count`; `TreeConfig::check` no longer reads `max_covers`). Tree
+verdicts but `TreeKeyPin` are `is_permanent`. Traps: `TreeKeyPin.level` is circuits' consuming
+level (`vk_leaf` = 1, `steps[k-1].key` = k+1); the test-profile list needs **three** entries for
+a fixed point (`rv32t_int`'s reduce table crosses 2^16), so a two-entry test section is valid only
+at `max_depth` 2; the agg_executor tree tests run on the in-repo set (heights and circuits' key
+pins are constants there) — do **not** point `RECURSION_FIXTURES` at circuits' cache for the whole
+node suite (its Test-0..2 are other bytes, and the pinned-vectors test fails), only for
+`the_test_tree_heights_are_the_cached_proofs`. Production values: **pending the droplet** (circuits
+docs/08 §3–§4); `agg_executor::tests::production_tree` is the ignored node-side check for it.
+
 ### Dollar-indexed prover pay (2026-10-09; branch `feat/usd-prover-pay` off main `3119a29a`, NOT pushed; genesis-gated, on no chain)
 
 The fee study's best prover-retention variant ("dollar-indexed, from fees first, then minted") as

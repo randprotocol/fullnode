@@ -2205,6 +2205,15 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     let key = Keypair::from_seed(cfg.seed).context("bad key seed")?;
     let (gs, executor) = load_genesis(&cfg.datadir)?;
     check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles())?;
+    // Tree aggregation (circuits spec §4): every `aggregation_tree` pin — each listed level's
+    // step program and key, and `vk_leaf` — must be what this build rebuilds from the section's
+    // heights, or the node refuses to start (stricter than admission's per-depth 7b). Builds the
+    // section's programs and keys once (minutes at production), before the warm thread reuses them.
+    if let Some(t) = gs.ledger.aggregation_tree() {
+        crate::agg_executor::check_tree_pins(executor.as_ref(), t)
+            .map_err(|e| anyhow::anyhow!("aggregation_tree pins: {e}; refusing to start"))?;
+        tracing::info!("aggregation_tree pins: ok ({} listed levels, L = {}, max_depth {})", t.steps.len(), t.leaf_size, t.max_depth);
+    }
     // Before RocksDB opens its ~1000 table files (issue #41): a node started under the default
     // soft limit of 1024 ran out of descriptors and its RPC refused every connection.
     match crate::rlimit::raise_nofile_limit() {
@@ -2402,6 +2411,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             .aggregation()
             .map(|c| c.admitted_shapes.iter().map(|a| (a.shape, c.max_covers)).collect())
             .unwrap_or_default();
+        let agg_tree = hs.committed_ledger().aggregation_tree().cloned();
         // Under genesis `hardening_v6` a call proves over other shapes (the call binding, INT-4),
         // so its keys are the hardened ones.
         let hardened = hs.committed_ledger().hardening_v6();
@@ -2426,6 +2436,9 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
             tracing::info!("verifier keys warmed");
             for (shape, max_covers) in &agg_shapes {
                 ex.warm_aggregation(shape, *max_covers);
+            }
+            if let Some(t) = &agg_tree {
+                ex.warm_tree(t);
             }
         });
     }
@@ -2676,6 +2689,7 @@ impl Node {
             s.aggregation.halving_blocks = cfg.halving_blocks;
             s.aggregation.sealed_blocks = ledger.supply().sealed_blocks;
         }
+        s.aggregation.tree = ledger.aggregation_tree().cloned();
         // Spec 2026-09-28 §7.1, §8: the tip's live gas prices, `null` without a `gas` section —
         // what `rand_status` reports and what `rand_getLimits` reads for a `dynamic` chain's
         // current prices, since `ChainLimits::of`'s snapshot is only ever taken at startup.

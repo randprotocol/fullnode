@@ -79,7 +79,8 @@ pub struct TreeConfig {
     pub shape: DeclaredShape,
     /// `L`: the bundle proofs one leaf (`rv32n`) covers.
     pub leaf_size: u8,
-    /// The deepest tree admitted; `max_covers ≥ L·2^max_depth`.
+    /// The deepest tree admitted. A tree covers at most `L·2^max_depth`, its own cap: the flat
+    /// `max_covers` does not bound it (the cover cap is the layout's).
     pub max_depth: u8,
     /// The leaf program's heights (`rv32n` at `L`; its program digest is today's
     /// `aggregate_program_digest`).
@@ -117,7 +118,10 @@ impl TreeConfig {
     }
 
     /// The genesis-time bounds: `1 ≤ leaf_size ≤ MAX_LEAF`, `1 ≤ max_depth ≤ MAX_DEPTH`, a
-    /// non-empty step list no longer than `max_depth`, `L·2^max_depth` within `max_covers`, an admitted `shape`, and no zero digest or key (the activation placeholder).
+    /// non-empty step list no longer than `max_depth`, an admitted `shape`, and no zero digest or
+    /// key (the activation placeholder). What only the rVM can judge — the leaf size against its
+    /// N ceiling, canonical reduce heights, a fixed point past the list — is the node's startup
+    /// check (`agg_executor::check_tree_pins`).
     pub fn check(&self, cfg: &AggregationConfig) -> Result<(), String> {
         if !(1..=Self::MAX_LEAF).contains(&self.leaf_size) {
             return Err(format!("aggregation_tree.leaf_size {} is outside 1..={} (the rVM's reduce ceiling)", self.leaf_size, Self::MAX_LEAF));
@@ -135,11 +139,9 @@ impl TreeConfig {
                 self.max_depth
             ));
         }
-        // At most MAX_LEAF·2^MAX_DEPTH = 1280 after the bounds above: no overflow to guard.
-        let most = (self.leaf_size as u64) << self.max_depth;
-        if most > cfg.max_covers as u64 {
-            return Err(format!("a tree covers up to L·2^max_depth = {most}, above max_covers {}", cfg.max_covers));
-        }
+        // No `max_covers` bound (tree Task 3b, 3a's I3): the cover cap is the layout's. A tree is
+        // bounded by this section, at most MAX_LEAF·2^MAX_DEPTH = 1280 covers; `max_covers` stays
+        // the flat cap, under the rVM's flat N ceiling.
         if !cfg.admitted_shapes.iter().any(|a| a.shape == self.shape) {
             return Err("aggregation_tree.shape is not an admitted shape".into());
         }
@@ -148,6 +150,33 @@ impl TreeConfig {
             return Err("aggregation_tree has a zero digest (the activation placeholder)".into());
         }
         Ok(())
+    }
+}
+
+/// Step 4's count rule, by layout (tree Task 3b, 3a's I3): a flat aggregate covers at most
+/// `max_covers`; a tree exactly `L·2^d` with `1 ≤ d ≤ max_depth` ([`tree_depth`]) — its own
+/// section's cap, whatever `max_covers` says — and needs the section (`TreeNotAdmitted`; one
+/// whose step list is empty admits no tree). Integer work against genesis constants, run before
+/// the duplicate scan so an over-long cover list buys no quadratic work. The shape half of 6t
+/// (the section naming the covered shape) waits for the covered records.
+pub fn check_cover_count(
+    layout: AggregateLayout,
+    covers: usize,
+    cfg: &AggregationConfig,
+    tree: Option<&TreeConfig>,
+) -> Result<(), AggregationError> {
+    if covers == 0 {
+        return Err(AggregationError::EmptyCoverSet);
+    }
+    match layout {
+        AggregateLayout::Flat if covers > cfg.max_covers as usize => {
+            Err(AggregationError::TooManyCovers { got: covers, max: cfg.max_covers })
+        }
+        AggregateLayout::Flat => Ok(()),
+        AggregateLayout::Tree => {
+            let t = tree.filter(|t| !t.steps.is_empty()).ok_or(AggregationError::TreeNotAdmitted)?;
+            tree_depth(covers, t).map(|_| ())
+        }
     }
 }
 
@@ -740,12 +769,7 @@ pub(super) fn validate_aggregate(
     // 4. The cover set's ledger half: `1 ≤ covers ≤ max_covers`, no duplicates, and the node's
     //    covered records matching the set one for one. (Coverability itself — finalised,
     //    in-window, unsealed — is the node's half, spec §3.2.)
-    if covers.is_empty() {
-        return Err(AggregationError::EmptyCoverSet.into());
-    }
-    if covers.len() > cfg.max_covers as usize {
-        return Err(AggregationError::TooManyCovers { got: covers.len(), max: cfg.max_covers }.into());
-    }
+    check_cover_count(layout, covers.len(), cfg, ledger.aggregation_tree())?;
     for (i, cover) in covers.iter().enumerate() {
         if covers[..i].contains(cover) {
             return Err(AggregationError::DuplicateCover(*cover).into());
@@ -934,25 +958,16 @@ impl Ledger {
         // ~1.2 MB record and saturated the admission workers. Step 4's count and duplicate rules,
         // then step 2's register, nonce, signature and unbonding bar: the same checks, in the
         // same order, that `validate_aggregate` re-runs.
-        if covers.is_empty() {
-            return Err(AggregationError::EmptyCoverSet.into());
-        }
-        if covers.len() > cfg.max_covers as usize {
-            return Err(AggregationError::TooManyCovers { got: covers.len(), max: cfg.max_covers }.into());
-        }
+        // Step 4's count rule by layout, with 6t's count half for a tree (a chain with no tree
+        // section, a count that is not L·2^d within max_depth): integer work against genesis
+        // constants, before the duplicate scan and before the register and the signature, so a
+        // stale nonce never hides the permanent verdict. The shape half — the section naming the
+        // covered shape — waits for the records.
+        check_cover_count(*layout, covers.len(), cfg, self.aggregation_tree())?;
         for (i, cover) in covers.iter().enumerate() {
             if covers[..i].contains(cover) {
                 return Err(AggregationError::DuplicateCover(*cover).into());
             }
-        }
-        // Step 6t's count half (tree aggregation): a tree on a chain with no tree section, or
-        // over a count that is not L·2^d within max_depth, needs no covered record to refuse —
-        // integer work against genesis constants, like the count rules above, so before the
-        // register and the signature: a stale nonce never hides the permanent verdict.
-        // The shape half — the section naming the covered shape — waits for the records.
-        if *layout == AggregateLayout::Tree {
-            let t = self.aggregation_tree().filter(|t| !t.steps.is_empty()).ok_or(AggregationError::TreeNotAdmitted)?;
-            tree_depth(covers.len(), t)?;
         }
         let entry = signed_by(self, aggregator, *nonce, signature, || {
             self.binding_domain().aggregate_signing_hash_at(
@@ -3231,6 +3246,34 @@ mod admission_tests {
         assert!(matches!(l.preflight_aggregate(&tree_tx(&l, &kp, 2, 19, 1)), Err(TxError::Aggregation(AggregationError::TreeNotAdmitted))));
     }
 
+    /// The cover cap is the layout's (tree Task 3b, 3a's deferred I3): flat keeps `max_covers`
+    /// (today's semantics, under the rVM's flat N ceiling), a tree is bounded by its own section
+    /// (`L·2^max_depth`), not by `max_covers` — at preflight and at validate alike. A tree's count
+    /// is judged before the duplicate scan, so an over-long tree buys no quadratic work.
+    #[test]
+    fn the_cover_cap_is_the_layouts() {
+        let (mut l, kp) = tree_setup();
+        let mut cfg = l.aggregation().unwrap().clone();
+        cfg.max_covers = 3;
+        l.set_aggregation(Some(cfg.clone()));
+        assert!(tree_cfg().check(&cfg).is_ok(), "L·2^3 = 8 over max_covers 3 is a valid section");
+        assert!(l.preflight_aggregate(&tree_tx(&l, &kp, 8, 19, 3)).is_ok(), "eight covers as a tree, at preflight");
+        assert!(tree_at(&l, &kp, 8, 19, 3, &StubExecutor).is_ok(), "and at validate");
+        let too_many = |r: Result<_, TxError>| matches!(r, Err(TxError::Aggregation(AggregationError::TooManyCovers { got: 4, max: 3 })));
+        let flat4 = aggregate_tx(&l, &kp, 0, 100, covers(4), b"ok".to_vec());
+        assert!(too_many(l.preflight_aggregate(&flat4).map(|_| ())), "flat keeps max_covers");
+        assert!(too_many(l.validate_aggregate(&flat4, &covered_records(&shape(), &tags(4)), &StubExecutor).map(|_| ())));
+        let depth = |r: Result<_, TxError>| matches!(r, Err(TxError::Aggregation(AggregationError::TreeDepth { depth: 4, max: 3 })));
+        assert!(depth(l.preflight_aggregate(&tree_tx(&l, &kp, 16, 19, 4)).map(|_| ())), "past its section, by name");
+        assert!(depth(tree_at(&l, &kp, 16, 19, 4, &StubExecutor).map(|_| ())));
+        let mut dup = covers(16);
+        dup[15] = dup[0];
+        let binding = l.binding_domain().aggregate_binding(7, &kp.public_key().address(), 0);
+        let long = aggregate_tx_at(&l, &kp, 0, 100, dup, StubExecutor::make_tree_proof(19, 4, &binding), AggregateLayout::Tree);
+        assert!(depth(l.preflight_aggregate(&long).map(|_| ())), "the count before the duplicate scan");
+        assert!(depth(l.validate_aggregate(&long, &covered_records(&shape(), &tags(16)), &StubExecutor).map(|_| ())));
+    }
+
     /// `TreeConfig::check`, the genesis-time bounds, one refusal each (R2–R4 as lists).
     #[test]
     fn a_tree_section_out_of_bounds_is_refused_by_check() {
@@ -3249,8 +3292,7 @@ mod admission_tests {
         assert!(bad(&|t| t.leaf_size = TreeConfig::MAX_LEAF + 1).is_err());
         assert!(bad(&|t| t.max_depth = 0).is_err());
         assert!(bad(&|t| t.max_depth = TreeConfig::MAX_DEPTH + 1).is_err());
-        assert!(bad(&|t| t.max_depth = 5).is_err(), "L·2^5 = 32 > max_covers 16");
-        assert!(bad(&|t| t.max_depth = 4).is_ok(), "L·2^4 = 16 = max_covers");
+        assert!(bad(&|t| t.max_depth = 5).is_ok(), "L·2^5 = 32 over max_covers 16: a tree is bounded by its section (I3)");
         assert!(bad(&|t| t.vk_leaf = [0; 4]).is_err());
         assert!(bad(&|t| t.steps[1].program_digest = [0; 4]).is_err());
         assert!(bad(&|t| t.steps[0].key = [0; 4]).is_err());

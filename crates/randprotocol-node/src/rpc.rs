@@ -374,6 +374,12 @@ pub struct AggregationStatus {
     pub halving_blocks: u64,
     /// Sealed blocks so far — the schedule index `n` the next aggregate mints at.
     pub sealed_blocks: u64,
+    /// The genesis `aggregation_tree` section, verbatim (absent on a chain without one): the leaf
+    /// size, `max_depth`, the leaf heights and `vk_leaf`, and the per-level step list (heights,
+    /// program digest, key). What `rand-node aggregate --layout tree` rebuilds its tree shapes
+    /// from, and the ops check of a tree chain (docs/deploy.md).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tree: Option<randprotocol_core::ledger::aggregation::TreeConfig>,
 }
 
 #[allow(clippy::large_enum_variant)] // moved once, never stored in bulk: boxing buys nothing
@@ -4213,6 +4219,40 @@ pub(crate) mod tests {
         let storage = Arc::new(crate::storage::Storage::open(dir.path()).unwrap());
         storage.init_genesis(gs).unwrap();
         (dir, state_over(storage, gs))
+    }
+
+    /// `rand_status.aggregation.tree` (tree Task 3b): absent without the section, the section
+    /// verbatim with it — what `rand-node aggregate --layout tree` parses back.
+    #[test]
+    fn the_status_carries_the_tree_section_only_when_set() {
+        use randprotocol_core::ledger::aggregation::{RvmHeights, TreeConfig, TreeStepPin};
+        let mut a = AggregationStatus::default();
+        assert!(serde_json::to_value(&a).unwrap().get("tree").is_none(), "absent without a section");
+        let h = RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height: 16 };
+        let t = TreeConfig {
+            shape: randprotocol_core::types::DeclaredShape {
+                profile: randprotocol_core::types::FriProfile::Test,
+                tier: 14,
+                program_log_height: 13,
+                input_log_height: 12,
+                keccak_log_height: 0,
+                sha256_log_height: 0,
+                public_log_height: 7,
+                mem_log_height: 18,
+            },
+            leaf_size: 1,
+            max_depth: 2,
+            leaf: h,
+            vk_leaf: [1; 4],
+            steps: vec![TreeStepPin { heights: h, program_digest: [2; 4], key: [3; 4] }],
+        };
+        a.tree = Some(t.clone());
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["tree"]["leaf_size"], 1);
+        assert_eq!(v["tree"]["max_depth"], 2);
+        assert_eq!(v["tree"]["steps"][0]["heights"]["reduce_log_height"], 16);
+        let back: TreeConfig = serde_json::from_value(v["tree"].clone()).unwrap();
+        assert_eq!(back, t);
     }
 
     /// The same state over a database a storage fixture already opened and initialised. Shared

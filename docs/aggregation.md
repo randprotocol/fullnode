@@ -252,6 +252,98 @@ registered on the new chain), and the node reports no `binding_domain` for a cha
 is read once, before the first pass. Without `--watch` a failed pass is the command's error,
 exactly as before.
 
+### 3.8 Trees (tree aggregation, circuits `recursion/docs/08-tree-aggregation.md`)
+
+A flat aggregate verifies at most N ≤ 5 bundle proofs at production (§"Before enabling
+aggregation", the reduce chip's N ceiling). A **tree** goes past it at a constant per-step cost:
+`rv32n` leaves of `L` bundle proofs each (today's aggregate program at N = L), then `d` levels of
+`rv32t`, the 2-to-1 interior step, whose child shape is compiled in and whose child key is a
+published tape value. Its root covers exactly `L·2^d` bundles. Built on circuits `92b750e`
+(branch `feat/tree-aggregation`), vendored into `crates/randprotocol-rvm` (2026-10-09). Like every
+aggregation rule it is genesis-gated and on no chain.
+
+**The genesis section.** `aggregation_tree` (top level, beside `aggregation`, which it requires):
+the admitted `shape` it aggregates, `leaf_size` (`L`), `max_depth`, the leaf's rVM heights
+(`leaf`) and `vk_leaf`, and a per-level `steps` list — `steps[k − 1]` is level `k`'s step:
+its rVM heights (`tier`, `reg/ram/poseidon2/reduce_log_height`), its program digest and the key
+digest of its proofs. The **last entry repeats** for every deeper level, which is sound only when
+it is a fixed point (the step built over its own proofs' shape is itself; R3). The genesis hash
+appends `"aggregation_tree" ‖ bincode(section)` after `multisig`, only when the section is set,
+so no existing genesis hash moves. `TreeConfig::check` bounds it: `1 ≤ L ≤ 5`, `1 ≤ max_depth
+≤ 8`, a non-empty list no longer than `max_depth`, an admitted shape, no zero pin.
+
+**The cover cap is the layout's.** A flat aggregate is bounded by `aggregation.max_covers`
+(unchanged, and ≤ the rVM's N ceiling, `rand-node genesis`'s `check_admitted_covers`); a tree by
+its own section, `L·2^max_depth`, whatever `max_covers` says.
+
+**The layout rule.** An `Aggregate` carries `layout: flat | tree` (a trailing 4-byte enum index on
+the wire, `serde(default)` flat). A tree covers exactly `L·2^d` bundles with `1 ≤ d ≤ max_depth`;
+any other count is `TreeLayout` (or `TreeDepth` past `max_depth`), refused at preflight before
+the register is read or the signature checked. A smaller set takes the flat path. The layout is
+signed: `rand-aggregate-tree-1` (chain-id form) / `rand-aggregate-tree-2` (genesis-bound), the flat
+preimage under another tag, so flipping it is `BadSignature`.
+
+**Admission, a tree's steps.** After step 6 (the covered shapes): **6t** the section must exist
+for the covered shape (`TreeNotAdmitted`) and the count must be a tree (`tree_depth`). **7a**
+(AGG-3 on the root's exact tier, R6): the root's declared tier, read off its header alone, must
+equal the tier pinned for level `d` (`TreeTier`) — nothing is built first. **7b** (AGG-6 per
+level): the executor rebuilds the leaf and every listed step program and key from the pinned
+heights (`AggExecutor::built_tree`, memoised), and the root's program must be level `d`'s pinned
+digest (`AggregateProgramMismatch`), then `vk_leaf` and each step key a depth-`d` recompute uses
+must be the pins (`TreeKeyPin { level }`, numbered by the level that *consumes* the key: `vk_leaf`
+is level 1, `steps[k − 1].key` level `k + 1`). **8** `verify_tree`: the bottom-up recompute from
+the covered bundles' public values in cover order — leaf `i`'s digest is the flat bound list
+`[inner_vk ‖ L ‖ B ‖ 35·L]` over its `L` runs, and each level `j` hashes adjacent pairs as
+`[vk_c ‖ 2 ‖ B ‖ D_a ‖ D_b]` with `vk_c` = `vk_leaf` at level 1 and `steps[j − 2].key` above it
+(the last repeating) — compared with the root's four public values (`TreeRootDigest`), then
+`Machine::verify_n(root program, root, 2)`, which holds the root's reduce height to the canonical
+one. A covered run that cannot be a bundle's (an OUT word past `u32`, a non-canonical word) is
+`CoveredPublicValues { index }`, before the recompute.
+
+**ZKQ-5, implemented.** There is no in-program `B_out == B_in`: a step does not check that its
+children were made under its own binding. Admission recomputes every level from the covered
+bundles under the transaction's one binding `B` (§3.5), so a root whose any level was made under
+another binding — another aggregator's, another nonce — digests differently and is
+`TreeRootDigest`. Swapped children, a foreign leaf program, a flat proof presented as a tree and
+a wrong-shape child are refused the same way or in-program (circuits `tests/tree.rs`).
+
+**The errors**, all `AggregationError`: `TreeNotAdmitted`, `TreeLayout { covers, leaf_size }`,
+`TreeDepth { depth, max }`, `TreeTier { declared, pinned }`, `TreeKeyPin { level }`,
+`CoveredPublicValues { index }`, `TreeRootDigest`, plus the flat path's
+`AggregateProgramMismatch` for the root's program. Every one but `TreeKeyPin` is a verdict on the
+bytes against genesis constants and is cached by the admission refusal cache
+(`admission::is_permanent`); `TreeKeyPin` stays out, as `AggregateProgramMismatch` does (a
+build/genesis disagreement, not the transaction's fault).
+
+**At startup.** A node whose genesis carries the section rebuilds it and compares **every** pin —
+each listed level's program digest and key, and `vk_leaf`, whatever depth a tree may later take —
+before anything else starts (`agg_executor::check_tree_pins`, beside `check_build_runs_genesis`):
+`aggregation_tree pins: <error>; refusing to start` on a mismatch, `aggregation_tree pins: ok` in
+the log otherwise. It also refuses a section the rVM could never serve: a leaf size past the rVM's
+N ceiling for the shape (production N ≤ 5), a pinned reduce height that is not canonical for its
+program (the leaf at N = L, every step at N = 2), and a `max_depth` past the listed levels whose
+last entry is not a fixed point. The warm thread then builds one rVM key per listed level, the
+root's at that level's tier and canonical height (`warm_tree`). Today this path is behind the
+pre-existing refusal of every aggregation genesis (below).
+
+**The RPC and the daemon.** `rand_status.aggregation.tree` is the section verbatim (absent
+without one). `rand-node aggregate --layout tree` reads it, takes `L·2^d` covers for the largest
+`d ≤ max_depth` the unsealed work list fills (nothing if fewer than `2L` are unsealed), proves the
+tree on one machine (`randprotocol_rvm::aggregate::aggregate_tree`: leaves, then each level,
+every proof checked against its pinned shape before the next level is built on it) and signs
+under the tree domain. `--layout flat` (the default) is today's daemon.
+
+**The test-profile values** (circuits docs/08 §5; the node's suite rebuilds and checks them,
+`agg_executor::tests`): leaf `rv32n`, L = 1, tier 18, heights 19/19/14/16; level 1 `rv32t_leaf`
+tier 19, 20/20/15/16; level 2 `rv32t_int` tier 19, 20/20/15/**17** (the reduce table crosses 2^16:
+the step is not its own fixed point); the fixed point is reached at level 3 (`rv32t` at the root's
+shape). `vk_leaf` `188d4b14…acfdcb`, `vk_t_leaf` `6b042444…d8507a`, `vk_int` `a92a0baa…3efbb70`,
+`vk_fix` `4203726c…7e6e355`; programs `T_LEAF_TEST` `2c586636…206ccd34`, `T_INT_TEST`
+`04b16771…dc3c226`, `T_FIX_TEST` `08abf188…795ff396`. A test-profile step proves at ≈ 34 GB
+maximum RSS on a 48 GB laptop. **Production values: pending (droplet; circuits docs/08 §4)** — the
+production depth-2 tree (L = 2, tier-21 steps, ≈ 122–197 GB projected at rate ¼, the 256 GB
+droplet) has not been proved, so no production section, digest or host class is recorded here yet.
+
 ## Before enabling aggregation
 
 **Aggregation does not remove the auth proof (audit v6, AGG-7; recorded 2026-09-30).** On a
@@ -304,8 +396,9 @@ both have to clear before a genesis may switch it on.
        fix for the sponge's block-boundary bug, `docs/confidential.md`'s "Constraint set 8"), the
        length in capacity, the final
        permutation) and hostile cover sets (N = 0, a wrong N, duplicates, mixed shapes): no
-       desynchronisation — read, not fuzzed. The `rv32r` self-verifier's binding is not tied to
-       the inner aggregate's (ZKQ-5): decide before trees of aggregates ship;
+       desynchronisation — read, not fuzzed. ZKQ-5, decided 2026-09-28 and implemented for
+       trees in circuits docs/08: no in-program `B_out == B_in`; admission recomputes every level
+       from the covered bundles under the transaction's one binding (§3.8 Trees);
      - the CUDA and reference backends: no verifier path differs under their features;
      - the witness tape and host-side replay: admission read every cover before checking the
        count and signature (ZKQ-1, fixed in this release);
@@ -454,6 +547,8 @@ filled at activation.
 | sealed resync, a fresh joiner | **1 rVM verification per sealed window** (the covering aggregate's; a raw sync re-verifies each bundle); the 7-block sealed batch applied in under a second | capstone's verification counter |
 | the capstone end to end | **1873.2 s** (register 97 s → prove 1568 s → seal → prune → resync) | `tests/cluster.rs` |
 | rVM aggregate proof size, test profile | 325–327 KB measured here (the circuits M5.3 record is 328 121 bytes; production measured 2026-09-30 at **1 563 226 bytes** for N=1 under constraint set 8 — under the 2 MiB default cap, not the ~0.5–0.6 MB first estimated) | `circuits/recursion/docs/02-aggregate.md` |
+| tree, test profile (circuits docs/08 §5, 2026-10-09, 48 GB laptop) | leaf `rv32n` L = 1: 169 640 rows, tier 18; step `rv32t_leaf`: 287 107 rows, tier 19, 280 133–280 772 bytes, **34.35 GB** max RSS, 177 s; root `rv32t_int`: 306 985 rows, tier 19, 283 172 bytes, **33.21 GB**, 182 s | circuits `recursion/tests/tree.rs`, `docs/measurements/2026-10-09-tree-test-fixtures-laptop.log` |
+| tree, production (circuits docs/08 §3) | step `rv32t_leaf` at the production leaf shape **1 294 577 rows, tier 21, emulated**; proved leaf/step/root rows, memory and times **pending (droplet)** | circuits `recursion/tests/tree_measure.rs` |
 | the interface conformance vectors | `inner_vk_digest` `33a94ec6…92a1c8`, the 115-word bound list (AGG-2; the stand-in binding of `circuits/recursion/docs/02-aggregate.md`), digest `9833ac5b…fdc868e` — reproduced byte-for-byte by the fullnode's recompute | the conformance suite (`agg_executor.rs`) |
 
 ### The one capstone walk-through

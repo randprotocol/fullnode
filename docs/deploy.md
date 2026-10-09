@@ -1368,6 +1368,19 @@ from the same commit.
    burn) and run **`rand-node aggregate --watch`** on a proof machine (≥ 256 GB at N=1 after the
    phase-2 row cuts, a projection until the tier-20 proof runs — `docs/node-hardware.md` §4; the GPU
    node for N≥2 — see `docs/aggregation.md`'s machine classes), pointed at any fleet RPC.
+5a. **On a tree chain** (a genesis with an `aggregation_tree` section, `docs/aggregation.md` §3.8;
+   none yet): the section's values are measured like step 1's — the leaf and each listed level's
+   heights read off a leaf, steps and root proved on the production build, the pins
+   (`vk_leaf`, each level's program digest and key) from that build's rebuild, the list long
+   enough to end on a fixed point if `max_depth` runs past it. **Pending (droplet; circuits
+   docs/08 §4)**: the production tree is not proved yet, so there are no production values to
+   cut. Every node checks every pin at startup and refuses to start on a mismatch (`aggregation_tree
+   pins: …; refusing to start`); a healthy node logs **`aggregation_tree pins: ok`** before the
+   warm thread, then `aggregation_tree: N root keys warmed`. Aggregators run **`rand-node aggregate
+   --watch --layout tree`** on a host of the step class (circuits docs/08 §3: tier-21 production
+   steps, ≈ 122–197 GB projected at rate ¼ — the 256 GB droplet class; the measured number is
+   pending the droplet), pointed at any fleet RPC. The ops check is `rand_status.aggregation.tree`
+   (the section verbatim) beside the startup log line.
 6. **Ops checks**: `rand_status`'s `aggregation` section (registered, unsealed, the schedule
    index), `rand_getUnsealed` for the work list, `rand_getSupply` for the four counters
    (`subsidised` against `sealed_blocks` is the schedule audit). Archive nodes run with

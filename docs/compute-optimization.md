@@ -297,6 +297,29 @@ the size of one ordinary GPU-proved shard in comparable systems.
 
 ### 4.2 Tree aggregation, bounded steps
 
+> **Correction (2026-10-08, circuits docs/06–08; written 2026-10-09 with tree aggregation's node
+> side).** §4.1–§4.4 below predate the rVM's phase 3 and the tree's design, and nine points in them
+> are stale. (1) §4.1's "two dedicated chips" are built: `SPONGE`/`COMPRESS` in the poseidon2 chip
+> and the `FOLD`/`POW` row kinds in the reduce chip; one inner proof is 585 686 rows, tier 20
+> (docs/06). (2) §4.1's "N = 16 around 2^24" is unreachable: the reduce chip caps a flat aggregate
+> at N ≤ 5 at production. (3) §4.2's "B = 16 per leaf" is L = 2 (spec ruling 6; `TreeConfig` caps
+> L at 5). (4) "Memory per step is a constant" holds, but the constant is a 256 GB-class leaf and
+> step (tier-21 production steps, ≈ 122–197 GB projected at rate ¼, docs/08 §2–§3; measured
+> numbers pending the droplet), not a GPU host. (5) "The root's interface is unchanged … only N
+> grows" is wrong: the root publishes `[vk_c ‖ 2 ‖ B ‖ D_a ‖ D_b]`, admission recomputes every
+> level from the covered bundles, and the `Aggregate` action carries a `layout`
+> (`docs/aggregation.md` §3.8). (6) "ZKQ-5, still open" was decided 2026-09-28: no in-program
+> `B_out == B_in`, the chain's recompute under the transaction's one binding binds every level.
+> (7) §4.3's "32 inner verifications per leaf" is at most 2 bundle + 2 auth proofs under the
+> reduce ceiling (spec ruling 7, sub-project 3). (8) §4.4's ≤ 64 GB leaf and step targets move to
+> the memory track (spec ruling 1). (9) §4.4's "80 queries, rate ½" is rate ⅛ (`log_blowup 3`) for
+> the inner proofs, and the rVM's own proofs run at rate ¼ with 92 queries and 24 grinding bits
+> (docs/07), not "40 queries": rate ¼ needs ~120 queries at the same proven bound only if the
+> grinding stays at 20 (docs/06 §7 item 2). The old N = 1 "377 GB" is ≈ 110–130 GB projected since
+> phase 3 (≈ 64–75 GB at rate ¼, docs/07). What shipped is the per-level design of circuits
+> `recursion/docs/08-tree-aggregation.md`: `rv32n` leaves of L proofs, `rv32t` 2-to-1 steps, a
+> per-level genesis step list whose last entry repeats as a fixed point.
+
 Replace the single flat aggregate over N proofs with a tree:
 
 ```
