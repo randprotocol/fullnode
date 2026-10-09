@@ -259,7 +259,8 @@ aggregation", the reduce chip's N ceiling). A **tree** goes past it at a constan
 `rv32n` leaves of `L` bundle proofs each (today's aggregate program at N = L), then `d` levels of
 `rv32t`, the 2-to-1 interior step, whose child shape is compiled in and whose child key is a
 published tape value. Its root covers exactly `L·2^d` bundles. Built on circuits `92b750e`
-(branch `feat/tree-aggregation`), vendored into `crates/randprotocol-rvm` (2026-10-09). Like every
+(branch `feat/tree-aggregation`; re-pinned at `4a244b6`, the final review's test and docs fixes,
+no `src/` change), vendored into `crates/randprotocol-rvm` (2026-10-09). Like every
 aggregation rule it is genesis-gated and on no chain.
 
 **The genesis section.** `aggregation_tree` (top level, beside `aggregation`, which it requires):
@@ -286,13 +287,15 @@ preimage under another tag, so flipping it is `BadSignature`.
 **Admission, a tree's steps.** After step 6 (the covered shapes): **6t** the section must exist
 for the covered shape (`TreeNotAdmitted`) and the count must be a tree (`tree_depth`). **7a**
 (AGG-3 on the root's exact tier, R6): the root's declared tier, read off its header alone, must
-equal the tier pinned for level `d` (`TreeTier`) — nothing is built first; the executor then
-holds the root's other four declared heights to the level's pins as well, off the header. **7b** (AGG-6 per
+equal the tier pinned for level `d` (`TreeTier`) — nothing is built first. **7b** (AGG-6 per
 level): the executor rebuilds the leaf and every listed step program and key from the pinned
 heights (`AggExecutor::built_tree`, memoised), and the root's program must be level `d`'s pinned
 digest (`AggregateProgramMismatch`), then `vk_leaf` and each step key a depth-`d` recompute uses
 must be the pins (`TreeKeyPin { level }`, numbered by the level that *consumes* the key: `vk_leaf`
-is level 1, `steps[k − 1].key` level `k + 1`). **8** `verify_tree`: the bottom-up recompute from
+is level 1, `steps[k − 1].key` level `k + 1`). A build that cannot rebuild the section at all is
+`TreeRebuild` (the startup check refuses to start on such a section, so a running node does not
+reach it). **8** `verify_tree`: first the root's other four declared heights against level `d`'s
+pins, off the header (`aggregate_header_tree`, before any key is built), then the bottom-up recompute from
 the covered bundles' public values in cover order — leaf `i`'s digest is the flat bound list
 `[inner_vk ‖ L ‖ B ‖ 35·L]` over its `L` runs, and each level `j` hashes adjacent pairs as
 `[vk_c ‖ 2 ‖ B ‖ D_a ‖ D_b]` with `vk_c` = `vk_leaf` at level 1 and `steps[j − 2].key` above it
@@ -311,13 +314,37 @@ a wrong-shape child are refused the same way or in-program (circuits `tests/tree
 **The errors**, all `AggregationError`: `TreeNotAdmitted`, `TreeLayout { covers, leaf_size }`,
 `TreeDepth { depth, max }`, `TreeTier { declared, pinned }`, `TreeKeyPin { level }`,
 `CoveredPublicValues { index }`, `TreeRootDigest`, plus the flat path's
-`AggregateProgramMismatch` for the root's program. Every one but `TreeKeyPin` is a verdict on the
-bytes against genesis constants and is cached by the admission refusal cache
-(`admission::is_permanent`); `TreeKeyPin` stays out, as `AggregateProgramMismatch` does (a
+`AggregateProgramMismatch` for the root's program, and `TreeRebuild` when this build cannot
+rebuild the section. Every one but `TreeKeyPin` and `TreeRebuild` is a verdict on the bytes
+against genesis constants and is cached by the admission refusal cache
+(`admission::is_permanent`); those two stay out, as `AggregateProgramMismatch` does (a
 build/genesis disagreement, not the transaction's fault).
 
 **At the cut.** `rand-node genesis --aggregation-tree <TREE.JSON>` writes the section after the
 genesis bounds and this build's `check_tree_pins` (below) both pass; nothing is written otherwise.
+`TREE.JSON` is the `TreeConfig` JSON — every digest four canonical u64 limbs, as JSON numbers:
+
+```json
+{
+  "shape": { "profile": "Production", "tier": 14, "program_log_height": …, "input_log_height": …,
+             "keccak_log_height": …, "sha256_log_height": …, "public_log_height": …, "mem_log_height": … },
+  "leaf_size": 2, "max_depth": 2,
+  "leaf": { "tier": …, "reg_log_height": …, "ram_log_height": …, "poseidon2_log_height": …, "reduce_log_height": … },
+  "vk_leaf": [u64, u64, u64, u64],
+  "steps": [ { "heights": { … }, "program_digest": [u64, u64, u64, u64], "key": [u64, u64, u64, u64] }, … ]
+}
+```
+
+circuits `production_tree_genesis_values` prints exactly this between its `== aggregation_tree`
+markers (save that block as `TREE.JSON`); the spec's names map onto it as `step_tiers[k]` =
+`steps[k].heights.tier`, `step_digests[k]` = `steps[k].program_digest`, `step_keys[k]` =
+`steps[k].key`. The test tree's section, in the same form, is circuits
+`recursion/tests/tree-test-genesis.json` (vendored at
+`crates/randprotocol-rvm/tests/tree-test-genesis.json`; `agg_executor`'s
+`the_printed_tree_section_is_a_tree_config` deserializes it). `rand_status.aggregation.tree` is the
+same section for humans, its digests as 64-character hex (the four limbs, 16 hex digits each, in
+order — a limb past 2^53 would lose bits in a JavaScript reader); `rpc::TreeStatus::to_config`
+converts it back, and `--aggregation-tree` takes only the limb form.
 
 **At startup.** A node whose genesis carries the section rebuilds it and compares **every** pin —
 each listed level's program digest and key, and `vk_leaf`, whatever depth a tree may later take —

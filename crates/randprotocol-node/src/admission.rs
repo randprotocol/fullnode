@@ -293,6 +293,8 @@ pub fn is_permanent(e: &TxError) -> bool {
                 // values against the transaction's own binding. `TreeKeyPin` stays out, as
                 // `AggregateProgramMismatch` does: a build that rebuilds another key than the
                 // genesis pins is the node's quarrel with the chain, not the transaction's.
+                // `TreeRebuild` (a build that cannot rebuild the section at all) stays out for
+                // the same reason.
                 | A::TreeNotAdmitted
                 | A::TreeLayout { .. }
                 | A::TreeDepth { .. }
@@ -1661,6 +1663,8 @@ mod tests {
             // with the chain, not the transaction's; like `AggregateProgramMismatch` it stays out.
             agg(A::TreeKeyPin { level: 2 }),
             agg(A::AggregateProgramMismatch { pinned: [1; 4], built: [2; 4] }),
+            // And a build that cannot rebuild the section at all (step 7b, final review m3).
+            agg(A::TreeRebuild(ConfidentialError::AggregationUnsupported)),
         ] {
             assert!(!is_permanent(&e), "{e} depends on state and must not be cached");
         }

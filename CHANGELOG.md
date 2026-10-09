@@ -12,6 +12,24 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+- **Tree aggregation** (genesis-gated, off by default: no existing chain carries the section; every
+  aggregation genesis is still refused at startup): a genesis `aggregation_tree` section
+  (`TreeConfig`: `shape`, `leaf_size`, `max_depth`, `leaf` heights, `vk_leaf`, per-level
+  `steps[{heights, program_digest, key}]`; `docs/aggregation.md` §3.8), appended last to the
+  genesis hash and only when present, so no existing hash moves. An aggregate may cover exactly
+  `L·2^d` bundles as one rVM tree (`rv32n` leaves, `rv32t` 2-to-1 steps), verified by the
+  bottom-up recompute under the transaction's binding and the pinned per-level keys; new
+  refusals `TreeNotAdmitted`, `TreeLayout`, `TreeDepth`, `TreeTier`, `TreeKeyPin`,
+  `CoveredPublicValues`, `TreeRootDigest`, `TreeRebuild`. A node whose genesis carries the
+  section rebuilds every pin at startup and refuses to start on a mismatch. **Aggregate wire
+  change** (every chain; none has carried an aggregate): `Action::Aggregate` gains a last field,
+  `layout` (`Flat` or `Tree`, a trailing 4-byte enum index), so its encoding and txid move; a
+  `Flat` aggregate signs exactly as before, a `Tree` one under `rand-aggregate-tree-1`
+  (genesis-bound `-2`); `tx_json`'s `aggregate` gains `layout`, `rand_status.aggregation` gains
+  `tree`. CLI: `rand-node genesis --aggregation-tree TREE.JSON` (the section as `TreeConfig`
+  JSON, the form circuits' `production_tree_genesis_values` prints; pins checked against this
+  build before anything is written) and `rand-node aggregate --layout flat|tree` (`tree` proves
+  the largest `L·2^d` the unsealed list fills). Vendors circuits `4a244b6` (`feat/tree-aggregation`).
 - **Compact-blocks follow-ups** (node-only, no wire or consensus change): the first-header
   equivocation record is capped at 64 entries (was 1 024; ~6 MB worst case at 26 validators,
   against ~100 MB); a gossiped transaction refused by the per-forwarder limiter is held,

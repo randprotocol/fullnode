@@ -401,6 +401,12 @@ pub enum AggregationError {
     /// The tree's recomputed root digest is not the root proof's public words.
     #[error("the tree's recomputed root digest is not the proof's")]
     TreeRootDigest,
+    /// Step 7b could not rebuild the `aggregation_tree` section's programs and keys at all (an
+    /// executor without the rVM, a section the rVM cannot serve). The node's failure, never the
+    /// transaction's — so never a permanent verdict, as `TreeKeyPin` is not (final review m3). The
+    /// startup check refuses to start on such a section, so a running node cannot reach it.
+    #[error("this build cannot rebuild the aggregation_tree section: {0}")]
+    TreeRebuild(crate::confidential::ConfidentialError),
     #[error("arithmetic overflow")]
     Overflow,
 }
@@ -867,8 +873,10 @@ pub(super) fn validate_aggregate(
     //     uses, rebuilt by the executor from the pinned heights ([`check_tree_pins`]).
     if let Some((t, d)) = tree {
         // Fail closed (review I2): `verify_tree` checks no pin, so an executor that cannot
-        // rebuild the tree's programs and keys refuses here, never reaching step 8.
-        let built = executor.tree_digests(t).map_err(TxError::InvalidAggregateProof)?;
+        // rebuild the tree's programs and keys refuses here, never reaching step 8 — as
+        // `TreeRebuild`, the node's failure, which the admission cache does not hold (final
+        // review m3; `InvalidAggregateProof` would be cached as a verdict on the bytes).
+        let built = executor.tree_digests(t).map_err(|e| TxError::Aggregation(AggregationError::TreeRebuild(e)))?;
         check_tree_pins(t, &built, d)?;
     } else {
         match executor.aggregate_program_digest(&first.shape) {
@@ -3137,15 +3145,21 @@ mod admission_tests {
     }
 
     /// 7b fails closed on the tree path (review I2): an executor that cannot rebuild the tree's
-    /// programs and keys refuses the aggregate as a proof it cannot check, and `verify_tree` —
-    /// which checks no pin — is never called. (The flat path's fall-through is the stub's and
-    /// rVM-less builds', whose `verify_aggregate` then refuses anyway.)
+    /// programs and keys refuses the aggregate, and `verify_tree` — which checks no pin — is never
+    /// called. The refusal is `TreeRebuild`, the node's own failure (final review m3), not
+    /// `InvalidAggregateProof`: the admission cache holds the latter permanently, and a build
+    /// that cannot serve the genesis is no verdict on the transaction (`TreeKeyPin`'s rationale).
+    /// (The flat path's fall-through is the stub's and rVM-less builds', whose
+    /// `verify_aggregate` then refuses anyway.)
     #[test]
     fn a_tree_whose_pins_cannot_be_rebuilt_is_refused_before_verify_tree() {
         let (l, kp) = tree_setup();
         let probe = TreeProbe { digests_fail: true, ..TreeProbe::new() };
         let r = tree_at(&l, &kp, 2, 19, 1, &probe);
-        assert!(matches!(r, Err(TxError::InvalidAggregateProof(ConfidentialError::AggregationUnsupported))), "{r:?}");
+        assert!(
+            matches!(r, Err(TxError::Aggregation(AggregationError::TreeRebuild(ConfidentialError::AggregationUnsupported)))),
+            "{r:?}"
+        );
         assert_eq!((probe.builds(), probe.verifies()), (1, 0));
     }
 

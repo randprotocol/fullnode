@@ -1375,7 +1375,11 @@ from the same commit.
    enough to end on a fixed point if `max_depth` runs past it. **Pending (droplet; circuits
    docs/08 §4)**: the production tree is not proved yet, so there are no production values to
    cut. The section goes in with `rand-node genesis --aggregation-tree <TREE.JSON>`, which runs
-   the same pin check every node runs at startup and writes nothing on a mismatch. Every node checks every pin at startup and refuses to start on a mismatch (`aggregation_tree
+   the same pin check every node runs at startup and writes nothing on a mismatch. `TREE.JSON` is
+   the block circuits `production_tree_genesis_values` prints between its `== aggregation_tree`
+   markers, saved as is: the `TreeConfig` JSON, digests as four u64 limbs (`docs/aggregation.md`
+   §3.8 has the form and the `step_tiers`/`step_digests`/`step_keys` mapping). Do not transcribe
+   `rand_status.aggregation.tree`'s hex into it; that is the same section for humans. Every node checks every pin at startup and refuses to start on a mismatch (`aggregation_tree
    pins: …; refusing to start`); a healthy node logs **`aggregation_tree pins: ok`** before the
    warm thread, then `aggregation_tree: N root keys warmed`. Aggregators run **`rand-node aggregate
    --watch --layout tree`** on a host of the step class (circuits docs/08 §3: tier-21 production

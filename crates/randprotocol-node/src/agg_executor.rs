@@ -1673,6 +1673,233 @@ mod tests {
         assert_eq!(ex.rvm.cached_keys(), t.steps.len(), "a second warm hits the cache");
     }
 
+    /// circuits `tests/common`'s `TEST_BINDING`: the binding the cached test tree was proved under.
+    /// On a chain `B` is `aggregate_binding(chain, aggregator, nonce)`, a hash no test key can
+    /// steer to these words, so [`AsProvedBinding`] stands in for it on the ledger path.
+    const TREE_TEST_BINDING: [u32; 8] =
+        [0xA662_0000, 0xA662_0001, 0xA662_0002, 0xA662_0003, 0xA662_0004, 0xA662_0005, 0xA662_0006, 0xA662_0007];
+
+    /// The four covered bundles of the cached test tree: circuits' leaves are `rv32n` over bundle
+    /// fixtures 0..3, one each (L = 1, `tests/tree.rs`'s `leaves`), read from the same
+    /// `$RECURSION_FIXTURES` as `tree/`.
+    fn test_tree_covered() -> Vec<CoveredBundle> {
+        (0..4).map(|k| covered(k).1).collect()
+    }
+
+    fn outs_of(covered: &[CoveredBundle]) -> Vec<[u32; 8]> {
+        covered
+            .iter()
+            .map(|c| std::array::from_fn(|k| u32::try_from(c.public_values[randprotocol_core::types::pv::OUT0 + k]).unwrap()))
+            .collect()
+    }
+
+    /// The real executor on the ledger path, with one substitution: `verify_tree` receives the
+    /// ledger's binding, checks it is the transaction's own (`expect`), and verifies under the
+    /// binding the cached root was proved under. Everything else is `AggExecutor`'s — the header
+    /// read, the 7b rebuild, the payout note, the recompute and the rVM verify.
+    struct AsProvedBinding<'a> {
+        ex: &'a AggExecutor,
+        expect: [u32; 8],
+    }
+
+    impl ConfidentialExecutor for AsProvedBinding<'_> {
+        fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
+            self.ex.check_program(base_pc, words)
+        }
+        fn verify_call(&self, program: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            self.ex.verify_call(program, proof)
+        }
+        fn public_digest(&self, words: &[u32]) -> Word8 {
+            self.ex.public_digest(words)
+        }
+        fn node_hash(&self, left: &Word8, right: &Word8) -> Word8 {
+            self.ex.node_hash(left, right)
+        }
+        fn hash_domain(&self, domain: u32, msg: &[u32]) -> Word8 {
+            self.ex.hash_domain(domain, msg)
+        }
+        fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
+            self.ex.note_commitment(pk, from, amount, asset, time, r)
+        }
+        fn bundle_digest(&self, input: &BundleDigestInput) -> Word8 {
+            self.ex.bundle_digest(input)
+        }
+        fn bundle_digest_v3(&self, input: &BundleDigestInput) -> Word8 {
+            self.ex.bundle_digest_v3(input)
+        }
+        fn bundle_proof_digest(&self, hc_bundle: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            self.ex.bundle_proof_digest(hc_bundle, proof)
+        }
+        fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            self.ex.auth_proof_digest(proof)
+        }
+        fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
+            self.ex.verify_auth(hc_auth, proof, binding)
+        }
+        fn verify_bundle(&self, hc: &Word8, proof: &[u8], binding: &[u32; randprotocol_core::types::TX_BINDING_WORDS]) -> Result<(), ConfidentialError> {
+            self.ex.verify_bundle(hc, proof, binding)
+        }
+        fn aggregate_program_digest(&self, shape: &DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
+            self.ex.aggregate_program_digest(shape)
+        }
+        fn verify_aggregate(&self, shape: &DeclaredShape, covered: &[CoveredBundle], proof: &[u8], binding: &[u32; 8]) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+            self.ex.verify_aggregate(shape, covered, proof, binding)
+        }
+        fn aggregate_proof_tier(&self, proof: &[u8]) -> Result<u8, ConfidentialError> {
+            self.ex.aggregate_proof_tier(proof)
+        }
+        fn tree_digests(&self, tree: &TreeConfig) -> Result<TreeDigests, ConfidentialError> {
+            self.ex.tree_digests(tree)
+        }
+        fn verify_tree(&self, tree: &TreeConfig, covered: &[CoveredBundle], proof: &[u8], binding: &[u32; 8], depth: u32) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+            assert_eq!(*binding, self.expect, "the ledger hands verify_tree the transaction's own binding");
+            self.ex.verify_tree(tree, covered, proof, &TREE_TEST_BINDING, depth)
+        }
+    }
+
+    /// Final review I1: the cached depth-2 test tree's root (circuits `tests/tree.rs`,
+    /// `$RECURSION_FIXTURES/tree/Test-root.rvmproof`) **accepted** through the node — first
+    /// `AggExecutor::verify_tree` itself over the four covered bundles at depth 2 (the startup pin
+    /// check on the section first), then the ledger's `validate_aggregate` tree path: a genesis
+    /// with `aggregation` and an `aggregation_tree` built from the test-profile pins, a registered
+    /// aggregator, the four covers coverable, and a `Tree` aggregate signed under the tree domain.
+    /// One covered word flipped is refused on both (`TreeRootDigest`), and so is another binding.
+    /// Skipped without `RECURSION_FIXTURES` (the in-repo set has no tree/); run it filtered — the
+    /// variable suite-wide breaks the pinned-vectors test (AGENTS.md):
+    /// `RECURSION_FIXTURES=<circuits>/recursion/target/recursion-fixtures cargo test --release -p randprotocol-node --lib the_cached_test_tree_root_is_admitted`
+    #[test]
+    fn the_cached_test_tree_root_is_admitted_through_the_executor_and_the_ledger() {
+        use randprotocol_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
+        use randprotocol_core::types::{Action, AggregateLayout};
+        use randprotocol_core::{Hash, Transaction, TxError};
+        let Some(dir) = std::env::var_os("RECURSION_FIXTURES").map(std::path::PathBuf::from) else {
+            eprintln!("skipped: RECURSION_FIXTURES is not set (the in-repo set has no tree/)");
+            return;
+        };
+        let t = test_tree_cfg();
+        let covered = test_tree_covered();
+        let root = load_tree(&dir, "Test-root").to_bytes();
+        let ex = AggExecutor::new(FriProfile::Test);
+        check_tree_pins(&ex, &t).expect("the test section's own pins");
+
+        // 1. The executor: accepted, the four OUT rows in cover order.
+        let outs = ex.verify_tree(&t, &covered, &root, &TREE_TEST_BINDING, 2).expect("the cached test tree verifies through AggExecutor");
+        assert_eq!(outs, outs_of(&covered), "one OUT row per covered bundle, in cover order");
+        let mut tampered = covered.clone();
+        tampered[2].public_values[randprotocol_core::types::pv::OUT0] ^= 1;
+        assert!(matches!(ex.verify_tree(&t, &tampered, &root, &TREE_TEST_BINDING, 2), Err(ConfidentialError::TreeRootDigest)), "a flipped covered word");
+        assert!(matches!(ex.verify_tree(&t, &covered, &root, &[7; 8], 2), Err(ConfidentialError::TreeRootDigest)), "another binding");
+
+        // 2. The ledger: a genesis carrying the section, built as `rand-node genesis` builds one.
+        let p0 = fixture_proof(0);
+        let hc_words: [u32; 8] = std::array::from_fn(|k| u32::try_from(p0.public_values[randprotocol_core::types::pv::HC0 + k]).unwrap());
+        let mut g = crate::storage::fixtures::genesis_file_of(7, &[&crate::storage::fixtures::key(1)], vec![], 2);
+        g.aggregation = Some(AggregationConfig {
+            bond: 100 * randprotocol_core::UNITS_PER_RAND,
+            max_covers: 3,
+            subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![AdmittedShape {
+                shape: t.shape,
+                hc: Hash(randprotocol_core::notes::word8_to_bytes(&hc_words)),
+                aggregate_program_digest: ex.aggregate_program_digest(&t.shape).unwrap(),
+            }],
+        });
+        g.aggregation_tree = Some(t.clone());
+        let gs = g.build(&StubExecutor).expect("a genesis with the test aggregation_tree builds");
+        assert_eq!(gs.ledger.aggregation_tree(), Some(&t));
+        let mut l = gs.ledger.clone();
+        l.set_height(1);
+        // The aggregator, registered through the ordinary apply path (a stub-proved bundle burning
+        // exactly the bond, as the node's own aggregate tests do).
+        let kp = crate::storage::fixtures::key(7);
+        let aggregator = kp.public_key().address();
+        let payout = randprotocol_core::notes::ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
+        let registration = randprotocol_core::types::actions::AggregatorRegistration {
+            public_key: kp.public_key().clone(),
+            payout: payout.clone(),
+            signature: kp.sign(l.binding_domain().aggregator_register_message(7, &aggregator, &payout).as_bytes()),
+        };
+        let mut b = randprotocol_core::notes::Bundle {
+            anchor: l.root(),
+            nullifiers: crate::storage::fixtures::pad4([[1; 8], [2; 8]]),
+            commitments: crate::storage::fixtures::pad4([[3; 8], [4; 8]]),
+            fee: randprotocol_core::gas::BUNDLE_BASE,
+            burn_a: 0,
+            burn_r: 100 * randprotocol_core::UNITS_PER_RAND,
+            burn_asset: 0,
+            time: 1,
+            envelopes: std::array::from_fn(|k| crate::storage::fixtures::env(k as u8 + 1)),
+            proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
+        };
+        let d = StubExecutor.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&crate::storage::fixtures::HC, &d, &[0; 8]);
+        let reg = StubExecutor::bound(Transaction::shielded(7, b, Action::RegisterAggregator { registration }));
+        let proposer = *l.validators().keys().next().unwrap();
+        l.apply_tx(&reg, &proposer, &StubExecutor).expect("the aggregator registers");
+        // The four covers, coverable (the bundles the covered records stand for, bucketed).
+        let covers: Vec<Hash> = (0..4u8).map(|k| Hash::digest(&[b'c', k])).collect();
+        l.set_unsealed_fees(covers.iter().map(|c| (*c, (1_000, proposer, u64::MAX))).collect());
+        // The signed `Tree` aggregate carrying the cached root.
+        let (r, env, time) = ([9; 8], crate::storage::fixtures::env(9), l.height() as u32);
+        let payout_total = l.payout_total_for(&covers).expect("the covers are coverable");
+        let tx = Transaction {
+            chain_id: 7,
+            bundle: None,
+            action: Action::Aggregate {
+                covers: covers.clone(),
+                signature: kp.sign(
+                    l.binding_domain()
+                        .aggregate_signing_hash_at(
+                            AggregateLayout::Tree,
+                            7,
+                            0,
+                            time,
+                            &r,
+                            &covers,
+                            &Hash::digest(&root),
+                            &randprotocol_core::types::actions::envelope_digest(&env),
+                            payout_total,
+                        )
+                        .as_bytes(),
+                ),
+                proof: root.clone(),
+                aggregator,
+                nonce: 0,
+                time,
+                r,
+                envelope: env,
+                payout_total,
+                layout: AggregateLayout::Tree,
+            },
+        };
+        let wrapped = AsProvedBinding { ex: &ex, expect: l.binding_domain().aggregate_binding(7, &aggregator, 0) };
+        let v = l.validate_aggregate(&tx, &covered, &wrapped).expect("the ledger admits the cached test tree");
+        assert_eq!(v.outs, outs, "the ledger's OUT rows are the executor's");
+        assert_eq!(v.covered, covered);
+        // The same transaction over a flipped covered word: refused at the recompute.
+        let r = l.validate_aggregate(&tx, &tampered, &wrapped);
+        assert!(matches!(r, Err(TxError::Aggregation(AggregationError::TreeRootDigest))), "{r:?}");
+    }
+
+    /// Final review m2: the section circuits prints for a genesis cut — the test tree's, pinned by
+    /// circuits `the_test_tree_genesis_section_prints_as_the_nodes_tree_config` as
+    /// `tests/tree-test-genesis.json` and vendored beside the rVM — is a `TreeConfig` as
+    /// `rand-node genesis --aggregation-tree` reads it (`serde_json`), and it is exactly the
+    /// section this suite rebuilds from the test heights.
+    #[test]
+    fn the_printed_tree_section_is_a_tree_config() {
+        let printed = include_str!("../../randprotocol-rvm/tests/tree-test-genesis.json");
+        let t: TreeConfig = serde_json::from_str(printed).expect("the printed section deserializes as a TreeConfig");
+        assert_eq!(t, test_tree_cfg(), "the printed section is the rebuilt one, field for field");
+        assert_eq!(t.steps[1].key, PIN_VK_INT);
+        let again: TreeConfig = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(again, t, "and it round-trips");
+    }
+
     /// The production depth-2 tree through the node: its section built from the cached
     /// production leaf, step and root (circuits docs/08 §3–§4, L = 2), the startup pin check, then
     /// `verify_tree` over Production-0..7 (L·2^2 = 8 bundles) under the doc binding. **Pending the droplet**: the

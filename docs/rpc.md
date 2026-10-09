@@ -1906,7 +1906,8 @@ past 2^53 would lose bits in a JavaScript reader. It is what `rand-node aggregat
 rebuilds its tree from (`rpc::TreeStatus::to_config` reads it back exactly). A `Tree` is bounded by `L·2^max_depth`, not by
 `aggregation.max_covers` (the flat cap). The refusal cache (`rand_getTransactionStatus`'s
 `rejected`) now holds `TreeNotAdmitted`, `TreeLayout`, `TreeDepth`, `TreeTier`,
-`CoveredPublicValues` and `TreeRootDigest` as permanent; `TreeKeyPin` is not cached.
+`CoveredPublicValues` and `TreeRootDigest` as permanent; `TreeKeyPin` and `TreeRebuild` (this
+build cannot rebuild the section) are not cached.
 
 ### Unreleased — dollar-indexed prover pay: `rand_getRandPrice`, `fee_rules.usd_subsidy`, `SetRandPrice` (tag 44) (genesis-gated; no chain carries it yet)
 
