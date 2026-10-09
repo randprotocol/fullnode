@@ -1048,8 +1048,9 @@ struct Node {
     recent_txs: compact::RecentTxs,
     /// Gossiped bodies the forwarder's transaction limiter refused, kept apart from
     /// `recent_txs` so a compact proposal naming one rebuilds without a fetch (spec 2026-10-08
-    /// §0, compact follow-ups). Never verified, pooled or served; a rebuild source and a park
-    /// filler only, after the pool and `recent_txs`.
+    /// §0, compact follow-ups). Never verified or pooled, and not served directly — a body used
+    /// in a rebuild enters `recent_txs` with the block, as fetched bodies do; a rebuild source
+    /// and a park filler only, after the pool and `recent_txs`.
     overflow_txs: compact::OverflowTxs,
     /// The compact proposals waiting for bodies a peer is asked for, by view (spec 2026-10-08
     /// §5.3; final review I2): at most [`PARK_SLOTS`], placed by [`park_slot`], and dropped when
@@ -1173,12 +1174,27 @@ enum ParkSlot {
 /// slot is held by a view's scheduled leader: a junk park for the next view leaves the other
 /// slot to the honest current view.
 ///
-/// And it replaces the lowest only when its justify certifies that park's view or a later one
-/// (spec 2026-10-08 §0, compact follow-ups). Otherwise two adjacent Byzantine leaders — one
-/// parking junk in the next view, the next building on an older parent — could evict the honest
-/// current-view park; an honest successor always has `justify.view` at or past the parked view,
-/// since a leader extends the highest certified block it knows.
-fn park_slot(parked: &BTreeMap<u64, compact::Parked>, replica_view: u64, header: &randprotocol_core::BlockHeader) -> ParkSlot {
+/// And it replaces the lowest only when its justify certifies that park's view or a later one,
+/// and that justify verifies in full (spec 2026-10-08 §0, compact follow-ups). Otherwise two
+/// adjacent Byzantine leaders — one parking junk in the next view, the next building on an
+/// older parent — could evict the honest current-view park. The view is trusted only after
+/// `justify_ok` (quorum stake and vote signatures, [`HotStuff::justify_verifies`]): the
+/// pre-screen checks a certificate's shape alone, so a header carrying an empty QC naming a
+/// later view would pass it. `justify_ok` runs only on the replace path, so it costs at most one
+/// certificate verification per pre-screened (view, leader) that gets that far.
+///
+/// The price, accepted: an honest successor does not always extend past the park. When the
+/// leader of `v + 1` withholds QC(`v`), the honest leader of `v + 2` proposes with a justify
+/// under `v`, and a replica still at `v` holding parks for `v` and `v + 1` does not park it
+/// (before this rule it replaced the `v` park). That `v` park is moot then; the `v + 2` block
+/// still arrives by its parent's fetch or by sync, and the parks are dropped once the replica's
+/// view moves on.
+fn park_slot(
+    parked: &BTreeMap<u64, compact::Parked>,
+    replica_view: u64,
+    header: &randprotocol_core::BlockHeader,
+    justify_ok: impl FnOnce(&randprotocol_core::types::block::QuorumCertificate) -> bool,
+) -> ParkSlot {
     let top = parked.keys().next_back().copied().unwrap_or(replica_view).max(replica_view).saturating_add(1);
     if header.view < replica_view || header.view > top {
         return ParkSlot::No("outside the park band");
@@ -1191,7 +1207,13 @@ fn park_slot(parked: &BTreeMap<u64, compact::Parked>, replica_view: u64, header:
     }
     match parked.first_key_value() {
         Some((_, p)) if p.compact.hash() == header.parent => ParkSlot::No("both slots are taken, the lowest by its parent"),
-        Some((&low, _)) if header.justify.view >= low => ParkSlot::Replace(low),
+        Some((&low, _)) if header.justify.view >= low => {
+            if justify_ok(&header.justify) {
+                ParkSlot::Replace(low)
+            } else {
+                ParkSlot::No("the justify does not verify")
+            }
+        }
         Some(_) => ParkSlot::No("both slots are taken and the new header does not extend past the lowest"),
         None => ParkSlot::Free,
     }
@@ -1218,10 +1240,10 @@ struct FirstCompact {
 /// insert, so in steady state it holds a handful; the cap bounds a chain that certifies without
 /// committing for a long stretch. Each entry holds a signed header, whose size is dominated by
 /// its justify QC — ~100 KB at 26 validators — so 64 entries are ~6 MB at worst, against
-/// ~100 MB at the former 1 024. 64 is many times the replica's eight-view proposal window
-/// (`PROPOSAL_VIEW_WINDOW`): the pre-screen `Ignore`s a header past it before its signature is
-/// checked, so it is never recorded, and an equivocation older than the window is not
-/// reachable on compact gossip at all.
+/// ~100 MB at the former 1 024. Entries come only from headers whose signature the pre-screen
+/// verified, so from scheduled leaders, and are pruned below the committed view: an entry
+/// inside the eight-view proposal window (`PROPOSAL_VIEW_WINDOW`) is dropped only after ~64
+/// views without a commit.
 const FIRST_COMPACT_MAX: usize = 64;
 
 /// What the node knows about one peer.
@@ -2802,7 +2824,7 @@ impl Node {
             // PEER_TX_PER_SEC; audit v6, GOSSIP-1) — only this one, not a refused-cache hit nor a
             // full verification queue. Reported as before, once, `Ignore`; the body is then kept
             // in the overflow cache, unhashed, so a compact proposal naming it rebuilds without a
-            // fetch (spec 2026-10-08 §0, compact follow-ups). Never verified, pooled or served.
+            // fetch (spec 2026-10-08 §0, compact follow-ups). Never verified or pooled, not served directly.
             self.report(id, outcome).await;
             return self.on_limited_tx(tx).await;
         }
@@ -3632,8 +3654,10 @@ impl Node {
     /// The bodies of `hashes` this node holds (spec 2026-10-08 §6 as amended), in the order
     /// asked: from the pool, then the recent cache. Not from the overflow cache, the rebuild's
     /// third source: its bodies are a forwarder's over-allowance relay, never verified, and are
-    /// not re-served (spec 2026-10-08 §0, compact follow-ups). Not from committed storage: a block being fetched for cannot carry a committed transaction again,
-    /// and storage may hold its marker form. A marker-form body ([`compact::is_marker_form`]) is
+    /// not served directly — one used in a rebuild enters the recent cache with the block, as a
+    /// fetched body does (spec 2026-10-08 §0, compact follow-ups). Not from committed storage: a
+    /// block being fetched for cannot carry a committed transaction again, and storage may hold
+    /// its marker form. A marker-form body ([`compact::is_marker_form`]) is
     /// never sent, whatever holds it; the asker would refuse it anyway. On the loop, as
     /// `BlockByHash` is: at most TX_FETCH_BATCH map reads (plan amendment 3). Over the batch
     /// size it is `Busy`, never a partial answer — the asker's batches are bounded, so an
@@ -3821,7 +3845,7 @@ impl Node {
         let slot = if c.tx_hashes.iter().all(|h| body(h).is_some()) {
             None
         } else {
-            match park_slot(&self.parked, self.hs.view(), &c.header) {
+            match park_slot(&self.parked, self.hs.view(), &c.header, |qc| self.hs.justify_verifies(qc)) {
                 ParkSlot::No(why) => {
                     tracing::debug!("compact proposal view {view}: bodies missing and not parked: {why} (replica view {})", self.hs.view());
                     return Ok(());
@@ -6825,8 +6849,10 @@ mod tests {
     /// `v` parked honestly and incomplete, `v + 1` parked as junk — a proposal for `v + 2` whose
     /// justify certifies a view under `v` does not evict the `v` park: two adjacent Byzantine
     /// leaders cannot clear an honest current-view park by building on an older parent. A
-    /// proposal for `v + 2` whose justify certifies view `v` (a sibling of the parked block, so
-    /// not its child) replaces it as before.
+    /// proposal for `v + 2` carrying a forged justify — naming `v + 1`, with no votes, which the
+    /// pre-screen's shape check passes — does not evict it either: the justify is verified in
+    /// full before a replace. A proposal for `v + 2` whose real justify certifies view `v` (a
+    /// sibling of the parked block, so not its child) replaces it as before.
     #[tokio::test]
     async fn a_proposal_certifying_an_older_view_does_not_evict_the_lowest_park() {
         let (_d, storage, gs, hs) = replica_past_a_boundary();
@@ -6843,6 +6869,13 @@ mod tests {
         // A sibling at `v`, and a `v + 2` on it: its justify certifies `v`, the lowest park's view.
         let sibling = block_on(&head, &ledger, &key(1), v, vec![txs[3].clone()]);
         let successor = block_on(&sibling, &ledger, &key(1), v + 2, vec![txs[4].clone()]);
+        // On the junk park, its justify naming `v + 1` with no votes, re-signed by the leader.
+        let forged = {
+            let b = block_on(&junk, &ledger, &key(1), v + 2, vec![txs[2].clone()]);
+            let mut header = b.header.clone();
+            header.justify.votes.clear();
+            Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, b.transactions, &key(1))
+        };
         claiming_peer(&mut node, 4);
 
         for b in [&honest, &junk] {
@@ -6850,16 +6883,25 @@ mod tests {
         }
         assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v, v + 1]);
         assert_eq!(
-            park_slot(&node.parked, v, &evictor.header),
+            park_slot(&node.parked, v, &evictor.header, |qc| node.hs.justify_verifies(qc)),
             ParkSlot::No("both slots are taken and the new header does not extend past the lowest")
         );
         node.on_compact_proposal(CompactBlock::of(&evictor), gossip_id()).await.unwrap();
         assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v, v + 1], "not parked");
         assert_eq!(node.parked.get(&v).map(|p| p.compact.hash()), Some(honest.hash()), "the v park survives");
 
-        assert_eq!(park_slot(&node.parked, v, &successor.header), ParkSlot::Replace(v));
-        // The fixture's one key leads every view, so the successor would be the evictor's
-        // equivocation (final review C1); on a chain where they differ it would be a fresh header.
+        // The fixture's one key leads every view, so each later `v + 2` header would be the
+        // evictor's equivocation (final review C1); on a chain where they differ each is fresh.
+        node.first_compact.clear();
+        assert_eq!(
+            park_slot(&node.parked, v, &forged.header, |qc| node.hs.justify_verifies(qc)),
+            ParkSlot::No("the justify does not verify")
+        );
+        node.on_compact_proposal(CompactBlock::of(&forged), gossip_id()).await.unwrap();
+        assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v, v + 1], "the forged evictor is not parked");
+        assert_eq!(node.parked.get(&v).map(|p| p.compact.hash()), Some(honest.hash()), "the v park survives it");
+
+        assert_eq!(park_slot(&node.parked, v, &successor.header, |qc| node.hs.justify_verifies(qc)), ParkSlot::Replace(v));
         node.first_compact.clear();
         node.on_compact_proposal(CompactBlock::of(&successor), gossip_id()).await.unwrap();
         assert_eq!(node.parked.keys().copied().collect::<Vec<_>>(), vec![v + 1, v + 2], "replaces as before");
@@ -6877,15 +6919,15 @@ mod tests {
         let v = hs.view();
         let header = |view: u64| block_on(&head, &ledger, &key(1), view, vec![]).header;
         let mut parked = BTreeMap::new();
-        assert_eq!(park_slot(&parked, v, &header(v - 1)), ParkSlot::No("outside the park band"));
-        assert_eq!(park_slot(&parked, v, &header(v)), ParkSlot::Free);
-        assert_eq!(park_slot(&parked, v, &header(v + 1)), ParkSlot::Free);
-        assert_eq!(park_slot(&parked, v, &header(v + 2)), ParkSlot::No("outside the park band"));
+        assert_eq!(park_slot(&parked, v, &header(v - 1), |_| true), ParkSlot::No("outside the park band"));
+        assert_eq!(park_slot(&parked, v, &header(v), |_| true), ParkSlot::Free);
+        assert_eq!(park_slot(&parked, v, &header(v + 1), |_| true), ParkSlot::Free);
+        assert_eq!(park_slot(&parked, v, &header(v + 2), |_| true), ParkSlot::No("outside the park band"));
         let b = block_on(&head, &ledger, &key(1), v + 1, vec![]);
         parked.insert(v + 1, compact::Parked::new(CompactBlock::of(&b), Vec::new(), PeerId::random(), Instant::now()));
-        assert_eq!(park_slot(&parked, v, &header(v + 1)), ParkSlot::No("its view is parked already"));
-        assert_eq!(park_slot(&parked, v, &header(v + 2)), ParkSlot::Free, "one past the highest park");
-        assert_eq!(park_slot(&parked, v, &header(v + 3)), ParkSlot::No("outside the park band"));
+        assert_eq!(park_slot(&parked, v, &header(v + 1), |_| true), ParkSlot::No("its view is parked already"));
+        assert_eq!(park_slot(&parked, v, &header(v + 2), |_| true), ParkSlot::Free, "one past the highest park");
+        assert_eq!(park_slot(&parked, v, &header(v + 3), |_| true), ParkSlot::No("outside the park band"));
     }
 
     /// A proposal for a view past the park band is neither parked nor fetched for, and does not

@@ -116,8 +116,9 @@ impl RecentTxs {
 /// entries and one block's bytes across both stages below, the oldest out first; a flood fills
 /// and churns this cache only, never the recent one.
 ///
-/// Nothing here is verified, pooled or served: its one use is a rebuild or a park fill, whose
-/// block then goes through the full precheck and the replica like any other.
+/// Nothing here is verified or pooled, nor served directly: its one use is a rebuild or a park
+/// fill, whose block then goes through the full precheck and the replica like any other (and
+/// whose bodies then enter the recent cache with the block, as fetched bodies do).
 ///
 /// A body is taken unhashed (`hold`) and hashed only when a rebuild needs it (`settle`): the
 /// limiter's refusal comes before the transaction id is computed (audit v6, GOSSIP-1), and
