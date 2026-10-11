@@ -338,18 +338,33 @@ A commit of one or more blocks is a single, fsynced `WriteBatch`: the blocks, QC
 one `nullifiers` row per spend, the block-end `anchors` row, the proposer's rewritten
 `ValidatorEntry`, any new programs and receipts, the new `meta/tree` frontier, and the new head.
 
-**Startup verification (`--verify-chain off|quick|full`).** Block 0 must equal the genesis file's
+**Startup verification (`--verify-chain off|quick|replay|full`).** Block 0 must equal the genesis file's
 own derivation, and this build's bundle guest must equal the genesis `hc_bundle` — a mismatch
 refuses to start at all, naming both digests. `quick` then replays every later block's transactions
 against a ledger rebuilt from genesis, checking each block's parent link, height, index entry,
 transaction root, and that re-execution (through the real executor — including every bundle proof
-and every `Call` proof) reproduces the header's state root. `full` additionally checks every
-proposer signature and every QC's votes. On the first inconsistency the node truncates its chain to
+and every `Call` proof) reproduces the header's state root; the proposer signatures are checked on
+the way, by `apply_block_for_sync`. `replay` is `quick` that is never skipped (below). `full`
+adds only every QC's votes. On the first inconsistency the node truncates its chain to
 the last good height — deleting the `notes` rows above the replayed ledger's next index, the
 `nullifiers` and `anchors` rows above that height, and rewriting every validator row and the tree
 frontier from the replayed ledger, while keeping its consensus safety state so it never
 double-votes — and lets sync refetch the rest from peers. `rand-node verify --repair` does the
 same thing offline, without running the node.
+
+**The startup checkpoint.** A walk that succeeds writes one `meta` row, `verified_head`: the head's
+height, hash and state root, and the git sha of the build that verified it. A later start of
+the same build in `quick` mode, on a store whose head is still that block, skips the walk: it
+loads the ledger once and compares the snapshot with the head's state root (OPS-5, which runs on
+every start, checkpoint or not). Only a clean build is trusted: a sha that is not 40 hex
+characters (`-dirty`, `unknown`) neither writes nor honours the row, so such builds always walk.
+`Storage::commit` carries the row forward in the same batch as the head when it matches the
+pre-commit head and this build's sha, so blocks the node commits itself stay covered;
+`truncate_to` clears it. Every other case walks, and `NodeHandle.startup` says why (no
+checkpoint, another build, an untrusted build, a head that moved, a forced mode); an unreadable
+head block also walks and repairs, as before. On an archive's fast path the counters outside the
+state root (base fees burned, unsealed fees, perp input rows) are not re-audited;
+`--verify-chain replay` is how to audit them.
 
 **Why a constraint-set change is a hard fork.** `--verify-chain quick`/`full` re-verify every
 historical `Call`'s proof through whatever zkVM constraints the running binary implements. A STARK
@@ -652,9 +667,10 @@ action.
 A node joining later, or catching up after a partition, does not take any committed receipt on
 faith. Batch sync re-executes every fetched block through the real executor — every `Call`'s proof
 is re-verified, not merely trusted because a quorum signed the block — before the node accepts it
-and advances its head. `--verify-chain quick|full` does the same thing over the whole chain at
-startup (§7): quick mode re-derives every state root (proof verification included, since it goes
-through the real executor); full mode additionally re-checks every proposer signature and QC.
+and advances its head. `--verify-chain quick|replay|full` does the same thing over the whole chain at
+startup (§7): quick and replay re-derive every state root (proof verification and proposer
+signatures included, since it goes through the real executor), unless the startup checkpoint
+skips the walk; full mode additionally re-checks every QC's votes.
 
 ## 10. Failure modes
 

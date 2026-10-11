@@ -762,7 +762,7 @@ enum Cmd {
         block_interval_ms: u64,
         #[arg(long, default_value_t = 3000)]
         view_timeout_ms: u64,
-        /// Startup chain integrity check: off, quick (structure + ledger replay), full (also signatures).
+        /// Startup chain integrity check: off, quick (skipped when this same clean build already verified the store through its head; otherwise structure + ledger replay), replay (quick, never skipped), full (replay plus every QC's votes).
         #[arg(long, default_value = "quick")]
         verify_chain: String,
         /// Keep the raw proofs of sealed bundles (block aggregation, spec §6.2): an archive
@@ -862,6 +862,8 @@ enum Cmd {
     Verify {
         #[arg(long)]
         datadir: PathBuf,
+        /// off, quick, replay or full, as for `run --verify-chain` (`replay` is the same as `quick`
+        /// here: this command always walks).
         #[arg(long, default_value = "full")]
         mode: String,
         /// Truncate the damaged tail (safety state is kept). Without this, only report.
