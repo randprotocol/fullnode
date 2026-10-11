@@ -70,7 +70,7 @@ env:
   # 56b7061 is circuits branch feat/scan-compact: main c83b1c7 (tree aggregation, 4a244b6) plus
   # viewing.rs's ScanKey and EnvelopeHead; recursion/ is 4a244b6's. The rand-zkvm-cuda revs stay
   # at the pushed 71e1a04, where rand-zkvm-cuda/ is identical to this commit's.
-  CIRCUITS_PIN: 56b70611724930a5848ac5c0fd32ca2de8e61e2e
+  CIRCUITS_PIN: 57fb9dcfb93d7bb6b2ce6e6ce73283961fbd7f1c
 
 jobs:
   check-and-test:
@@ -189,7 +189,7 @@ jobs:
           cd fullnode/vendor/circuits
           sha256sum -c SHA256SUMS
           grep -q "^circuits: $CIRCUITS_PIN$" PROVENANCE.md
-          for crate in evm-core sbpf-core; do
+          for crate in evm-core sbpf-core dilithium-core; do
             diff -r --exclude Cargo.lock --exclude target "$crate" "$GITHUB_WORKSPACE/circuits/guests-compiled/$crate"
           done
       # The CUDA backend is a git dependency at its own revision (`crates/randprotocol-zkvm/Cargo.toml`),
@@ -211,9 +211,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: circuits/rand-guest
-      # Builds fib, keccak256, evm and sbpf from source with `rand-guest build` and compares:
-      # evm/sbpf byte for byte, the two legacy flat pins by program (base_pc, words, hc).
-      - name: circuits rebuilds the four guests from source
+      # Builds fib, keccak256, evm, sbpf, dilithium-verify and msauth from source with `rand-guest
+      # build` and compares: the four image containers byte for byte, the two legacy flat pins by
+      # program (base_pc, words, hc). circuits' gate lists all six at the pin (private multisig).
+      - name: circuits rebuilds the six guests from source
         working-directory: circuits/rand-guest
         run: cargo test --release --test build -- --exact build_reproduces_every_committed_image_and_reports_hc
       # Inline rather than circuits' `contracts/build.sh`: that script's `mktemp -t erc20.runtime.hex`

@@ -2594,3 +2594,90 @@ fn a_headless_pow_row_at_the_tables_first_row_is_rejected() {
     let t = traces_from_parts(&p, &exec, Tier(8), &reg, &ram, Some((red, lh)));
     assert!(rejects(|| prove_and_verify(&m, &p, &t)), "a headless pow row at the table's first row VERIFIED, writing 777 to cell 664");
 }
+
+// ── Phase 4 B/B′: SPONGE's source and COMPRESS's sibling as absolute immediates ───────────────
+
+/// Phase 4 B/B′: a program with one SPONGE and one COMPRESS at immediate addresses.
+fn hash_setup() -> (Machine, Program, Traces) {
+    let mut instrs = vec![i(Op::Faddi, 7, 0, 64), i(Op::Faddi, 9, 0, 1)];
+    for k in 0..8 { instrs.push(i(Op::Faddi, 2, 0, 10 + k)); instrs.push(i(Op::Store, 2, 0, 96 + k)); }
+    instrs.push(i(Op::Sponge, 0, 7, 96));       // SPONGE row
+    instrs.push(i(Op::Compress, 9, 7, 100));    // COMPRESS row
+    for k in 0..4 { instrs.push(i(Op::Load, 3, 7, k)); instrs.push(i(Op::Public, 0, 3, 0)); }
+    instrs.push(i(Op::Halt, 0, 0, 0));
+    let p = Program { instrs, checkpoints: vec![], reduce_layout: vec![] };
+    let m = Machine::new(FriProfile::Test);
+    let exec = execute(&p, &[], 10_000).unwrap();
+    let t = build_traces(&p, &exec, Tier(8)).unwrap();
+    (m, p, t)
+}
+
+fn row_of(p: &Program, op: Op) -> usize { p.instrs.iter().position(|x| x.op == op).unwrap() }
+
+#[test]
+fn honest_immediate_address_hash_traces_pass() {
+    let (m, p, t) = hash_setup();
+    prove_and_verify(&m, &p, &t).unwrap();
+}
+
+/// Moving `B0` alone (this test and the next) leaves the SPONGE/COMPRESS chip, the RAM log and
+/// the G2/G4 limbs at the honest address, so the bus mismatch refuses it too — it does not
+/// isolate the immediate-form row constraint. `the_immediate_form_alone_binds_*` below does.
+#[test]
+fn a_sponge_source_moved_off_its_immediate_is_rejected() {
+    let (m, p, mut t) = hash_setup();
+    let w = cpu::col::WIDTH;
+    t.cpu.values[row_of(&p, Op::Sponge) * w + cpu::col::B0] += F::from_u64(4); // another block
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)));
+}
+
+/// Also refused by the bus mismatch (see the SPONGE twin above); not the isolating test.
+#[test]
+fn a_compress_sibling_moved_off_its_immediate_is_rejected() {
+    let (m, p, mut t) = hash_setup();
+    let w = cpu::col::WIDTH;
+    t.cpu.values[row_of(&p, Op::Compress) * w + cpu::col::B0] -= F::from_u64(4);
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)));
+}
+
+#[test]
+fn a_forged_second_pointer_limb_on_an_immediate_row_is_rejected() {
+    let (m, p, mut t) = hash_setup();
+    let w = cpu::col::WIDTH;
+    t.cpu.values[row_of(&p, Op::Sponge) * w + cpu::col::G2LIMB0] += F::ONE;
+    assert!(rejects(|| prove_and_verify(&m, &p, &t)));
+}
+
+/// The binding test for B/B′ (one per opcode): a fully consistent forgery that only the
+/// immediate form `(1 − is_b_reg)(B0 − B)` can refuse. The run is executed and traced for the
+/// honest program (word 4 = `A`), so `B0`, the limbs, the SPONGE/COMPRESS chip and the RAM log all
+/// use `A`. On that row only the fetched word `B` is set to `A − 4`, and the proof is made and
+/// checked against the program variant whose word 4 is `A − 4` — so the PROGRAM fetch balances
+/// against that variant's preprocessed table (its main trace is multiplicities by pc, unchanged),
+/// and `B` appears in no other constraint on these rows. Every bus balances; with the
+/// immediate-form line removed from `cpu.rs` this proof VERIFIES (checked by hand, phase-4 final
+/// review), so its refusal here is that line's alone.
+fn forge_word4_only(op: Op) -> (Machine, Program, Traces) {
+    let (m, p, mut t) = hash_setup();
+    let w = cpu::col::WIDTH;
+    let row = row_of(&p, op);
+    let a = p.instrs[row].b;
+    let moved = a - F::from_u64(4);
+    assert_eq!(t.cpu.values[row * w + cpu::col::B0], a, "B0 is the honest address");
+    t.cpu.values[row * w + cpu::col::B] = moved;
+    let mut p2 = p.clone();
+    p2.instrs[row].b = moved;
+    (m, p2, t)
+}
+
+#[test]
+fn the_immediate_form_alone_binds_the_sponge_source() {
+    let (m, p2, t) = forge_word4_only(Op::Sponge);
+    assert!(rejects(|| prove_and_verify(&m, &p2, &t)), "SPONGE read block 96 under a program whose word 4 says 92");
+}
+
+#[test]
+fn the_immediate_form_alone_binds_the_compress_sibling() {
+    let (m, p2, t) = forge_word4_only(Op::Compress);
+    assert!(rejects(|| prove_and_verify(&m, &p2, &t)), "COMPRESS read sibling 100 under a program whose word 4 says 96");
+}

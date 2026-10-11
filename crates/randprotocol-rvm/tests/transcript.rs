@@ -417,8 +417,7 @@ fn a_restored_merkle_path_verifies_in_the_dsl_exactly_where_p3_verifies_it() {
         let levels = paths[q].siblings.len();
         let bits: Vec<_> =
             (0..levels).map(|k| b.constant(F::from_u64(((*idx as u64) >> k) & 1))).collect();
-        let root = randprotocol_rvm::dsl::Digest(b.alloc(4));
-        hash::merkle_walk(&mut b, leaf, &bits, sib, levels, root);
+        let root = hash::merkle_walk(&mut b, leaf, &bits, sib, levels);
         for k in 0..4 {
             let v = b.load(root.0, k);
             b.public(v);
@@ -443,13 +442,12 @@ fn two_injections_at_one_level_are_refused_at_build_time() {
     let leaf = randprotocol_rvm::dsl::Digest(b.alloc(4));
     let sib = b.alloc(16);
     let rows = b.alloc(9);
-    let out = randprotocol_rvm::dsl::Digest(b.alloc(4));
     let bits: Vec<_> = (0..4).map(|_| b.constant(F::ONE)).collect();
     let inj = [
         hash::Injection { after_level: 1, rows, n_cells: 5 },
         hash::Injection { after_level: 1, rows, n_cells: 4 },
     ];
-    hash::merkle_walk_with_injections(&mut b, leaf, &bits, sib, 4, &inj, out);
+    let _ = hash::merkle_walk_with_injections(&mut b, leaf, &bits, sib, 4, &inj);
 }
 
 #[test]
@@ -512,9 +510,8 @@ fn an_injected_shorter_matrix_group_verifies_in_the_dsl_exactly_where_p3_verifie
         }
         let bits: Vec<_> =
             (0..levels).map(|k| b.constant(F::from_u64(((*idx as u64) >> k) & 1))).collect();
-        let root = randprotocol_rvm::dsl::Digest(b.alloc(4));
         let inj = [hash::Injection { after_level: 1, rows, n_cells: inj_row.len() }];
-        hash::merkle_walk_with_injections(&mut b, leaf, &bits, sib, levels, &inj, root);
+        let root = hash::merkle_walk_with_injections(&mut b, leaf, &bits, sib, levels, &inj);
         for k in 0..4 {
             let v = b.load(root.0, k);
             b.public(v);

@@ -2221,33 +2221,44 @@ fn close_batch_coverage(storage: &Storage, batch: &mut Vec<CommittedBlock>, limi
 ///   and pins bundle guest v3 and `hc_auth`, both of which this build still carries — so only its
 ///   hash refuses it: this binary installed on a chain-17 host would otherwise start, refuse the
 ///   chain's own history at its startup replay, and a `verify --repair` would truncate it.
-pub const CHAINS_THIS_BUILD_CANNOT_RUN: [(u64, &str, &str); 4] = [
+/// - **Chains 18, 19 and 20** (v0.6.5–v0.7.x) commit proofs under constraint set 8. Constraint set
+///   9 (the MODQ chip, private multisig phase 4) moved every verifier key and the proof encoding
+///   (`Proof::modq_log_height`), so this build verifies none of their proofs.
+pub const CHAINS_THIS_BUILD_CANNOT_RUN: [(u64, &str, &str); 7] = [
     (14, "1cff3b7da248d93ab547aef5c05bb7d0d22da510b592dab9cf7374807de7c7ff", CONSTRAINT_SET_6_REASON),
     (15, "cc30e0854fb25b3abcee96bb7bc206dcd6e37862f6dfe80a05b3e474c2d1b6b8", CONSTRAINT_SET_6_REASON),
     (16, "20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005", SPLIT_AUTH_REASON),
     (17, "d1afefc3dd68f73e3799aa0803b692d0e6a5c7c27d228bdeb3d06cdf4027e7ff", CONSTRAINT_SET_7_REASON),
+    (18, "a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76", CONSTRAINT_SET_8_REASON),
+    (19, "a3defc937d561d4beb1df9a08c9cb87a3dc32dadbfc2d1814ab6f627b0a2228a", CONSTRAINT_SET_8_REASON),
+    (20, "6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135", CONSTRAINT_SET_8_REASON),
 ];
 
-/// The constraint set this build proves and verifies under: 8, the gas meter (`pv::GAS`, chain 18).
-pub const BUILD_CONSTRAINT_SET: u8 = 8;
+/// The constraint set this build proves and verifies under: 9, the MODQ chip (private multisig
+/// phase 4; set 8, the gas meter, ran chains 18-20).
+pub const BUILD_CONSTRAINT_SET: u8 = 9;
 
 const CONSTRAINT_SET_6_REASON: &str = "its proofs were made under constraint set 6; this build is constraint \
-     set 8 (v0.6.5 and later) and verifies none of them, so its startup replay would refuse the chain's own \
+     set 9 (v0.8.0 and later) and verifies none of them, so its startup replay would refuse the chain's own \
      history and a `verify --repair` would truncate it — on an archive node, the only full copy. Run the \
      chain's own release (v0.6 or earlier), never this one";
 
-const SPLIT_AUTH_REASON: &str = "its proofs were made under constraint set 7 and this build is constraint set 8, \
+const SPLIT_AUTH_REASON: &str = "its proofs were made under constraint set 7 and this build is constraint set 9, \
      and this build changes the bundle wire and every transaction id (rand-txid-3, split authorisation): a \
      `verify --repair` would truncate the chain's history — on an archive node, the only full copy. Use the \
      v0.6.1/v0.6.2 release for chain 16";
 
 const CONSTRAINT_SET_7_REASON: &str = "its proofs were made under constraint set 7; this build is constraint \
-     set 8 (v0.6.5 and later) and verifies none of them, so its startup replay would refuse the chain's own \
+     set 9 (v0.8.0 and later) and verifies none of them, so its startup replay would refuse the chain's own \
      history and a `verify --repair` would truncate it. Use the v0.6.3 release for chain 17";
+
+const CONSTRAINT_SET_8_REASON: &str = "its proofs were made under constraint set 8; this build is constraint \
+     set 9 (the MODQ chip, v0.8.0 and later) and verifies none of them, so its startup replay would refuse the \
+     chain's own history and a `verify --repair` would truncate it. Use the v0.7.x release for chains 18-20";
 
 /// Refuse a genesis in [`CHAINS_THIS_BUILD_CANNOT_RUN`]: `run` (through
 /// [`check_build_runs_genesis`]) and `verify` both call it before touching the datadir's blocks,
-/// so this binary installed on a chain-14, -15, -16 or -17 host neither starts nor `verify --repair`s
+/// so this binary installed on a host of any of chains 14-20 neither starts nor `verify --repair`s
 /// that chain's history away — on an archive (obs1, rand-archive-2) that history is the only full
 /// copy there is.
 pub fn refuse_chains_this_build_cannot_run(gs: &GenesisState) -> Result<()> {
@@ -4893,6 +4904,23 @@ fn faucet_mint_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Constraint set 9 (the MODQ chip): every verifier key and the proof encoding moved, so this
+    /// build verifies none of chain 18's, 19's or 20's proofs and must refuse their genesis before
+    /// touching a datadir.
+    #[test]
+    fn this_build_refuses_chains_18_to_20() {
+        assert_eq!(BUILD_CONSTRAINT_SET, 9);
+        for (chain, hash) in [
+            (18, "a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76"),
+            (19, "a3defc937d561d4beb1df9a08c9cb87a3dc32dadbfc2d1814ab6f627b0a2228a"),
+            (20, "6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135"),
+        ] {
+            let row = CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(c, _, _)| *c == chain).unwrap_or_else(|| panic!("chain {chain} not listed"));
+            assert_eq!(row.1, hash, "chain {chain}");
+            assert!(row.2.contains("constraint set 8") && row.2.contains("v0.7"), "chain {chain}: {}", row.2);
+        }
+    }
     use crate::storage::fixtures::{alloc_note, bundle_fee, bundle_tx, genesis_of, key, make_block_voted};
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::consensus::{EpochSets, HotStuff};

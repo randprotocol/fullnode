@@ -146,6 +146,9 @@ pub const KECCAK_GAS: u64 = 192;
 /// Its sha256 twin: one row plus 64 rows of 466 columns, ≈ 66 cycle-equivalents, rounded down
 /// to the block size.
 pub const SHA256_GAS: u64 = 64;
+/// What one `MODQ` ecall row costs (constraint set 9; circuits `gas::MODQ_GAS`): 1 024 × (59 + 16)
+/// committed cells at ≈ 460 cells per gas.
+pub const MODQ_GAS: u64 = 168;
 /// Spec §3.3: the default price of one gas, 10⁻⁷ RAND.
 pub const GAS_PRICE_DEFAULT: u64 = 100;
 /// Spec §3.3: the default price of one KiB of call proof and envelope, from byte 0 — a bare
@@ -177,6 +180,14 @@ pub fn gas_max(tier: u8, keccak_log_height: u8, sha256_log_height: u8) -> u64 {
         .saturating_add(absorb_surcharge)
         .saturating_add(blocks(keccak_log_height, 32).saturating_mul(KECCAK_GAS - 1))
         .saturating_add(blocks(sha256_log_height, 64).saturating_mul(SHA256_GAS - 1))
+}
+
+/// `gas_max` with the modq table's declared height: `MODQ_GAS − 1` per 1 024-row block
+/// (constraint set 9; mirrors circuits `gas::gas_max_with_modq`). At `modq_log_height = 0` it is
+/// `gas_max` exactly.
+pub fn gas_max_with_modq(tier: u8, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8) -> u64 {
+    let blocks = if modq_log_height == 0 { 0 } else { (1u64 << modq_log_height.min(40)) / 1024 };
+    gas_max(tier, keccak_log_height, sha256_log_height).saturating_add(blocks.saturating_mul(MODQ_GAS - 1))
 }
 
 /// The one `bundle_gas_limit` a genesis `gas` section may name (final-review I3): the bundle
@@ -957,5 +968,18 @@ mod gas_config_tests {
         assert_eq!(next_price(1_000, 800, 2 * t + 1, t, 5000), 1_500, "just over twice the target at 50 %: +50 %, no more");
         assert_eq!(next_price(u64::MAX, 800, 2 * t, t, 5000), u64::MAX, "saturates");
         assert_eq!(next_price(100, 100, 0, 1 << 18, 1250), 100, "gas: floor holds");
+    }
+
+    /// MODQ re-vendor: `gas_max_with_modq` is `gas_max` plus `MODQ_GAS − 1` per declared 1 024-row
+    /// modq block; at 0 it is `gas_max` exactly, at every tier.
+    #[test]
+    fn gas_max_with_modq_adds_167_per_modq_block() {
+        assert_eq!(MODQ_GAS, 168);
+        for t in MIN_TIER..=MAX_TIER {
+            assert_eq!(gas_max_with_modq(t, 0, 0, 0), gas_max(t, 0, 0));
+            assert_eq!(gas_max_with_modq(t, 14, 0, 0), gas_max(t, 14, 0));
+        }
+        assert_eq!(gas_max_with_modq(18, 14, 0, 16) - gas_max(18, 14, 0), (1u64 << 16) / 1024 * 167);
+        assert_eq!(gas_max_with_modq(18, 14, 0, 10) - gas_max(18, 14, 0), 167);
     }
 }

@@ -205,11 +205,11 @@ impl Op {
     /// `JEQ`/`JNE` are *not* in this set: their operands are `ra, rb, imm` (spec §3), and with
     /// only four words the two compared registers occupy the `rd` and `ra` slots, leaving the
     /// fourth word for the branch target — which is a `pc` below `2^24`, not a register index.
+    ///
+    /// `SPONGE` and `COMPRESS` (phase 4) take their second address as an absolute immediate: the
+    /// source block's / the sibling digest's cell, a program word fixed by the program table.
     pub fn b_is_register(self) -> bool {
-        matches!(
-            self,
-            Op::Fadd | Op::Fsub | Op::Fmul | Op::Eadd | Op::Esub | Op::Emul | Op::Emulf | Op::Sponge | Op::Compress
-        )
+        matches!(self, Op::Fadd | Op::Fsub | Op::Fmul | Op::Eadd | Op::Esub | Op::Emul | Op::Emulf)
     }
 }
 

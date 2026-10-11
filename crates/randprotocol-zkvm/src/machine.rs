@@ -360,6 +360,14 @@ impl Tier {
     pub fn max_sha256_log_height(self) -> u8 {
         ((self.0 + crate::tables::sha256::MIN_LOG_HEIGHT as usize) as u8).min(crate::tables::sha256::MAX_LOG_HEIGHT)
     }
+    /// Private multisig phase 3 (spec §3.4): the modq table's analogue — one call is one cycle
+    /// and one 1 024-row block, so `mlh ≤ t + 10`, folded with the flat
+    /// `tables::modq::MAX_LOG_HEIGHT` the way `max_sha256_log_height` folds its own. The tier
+    /// bound `min(t + 10, 20)` never binds for `TIERS` (`t + 10 >= 20` from tier 10), so a tier-10
+    /// header may declare a 2^20 modq table, the same as the existing flat caps.
+    pub fn max_modq_log_height(self) -> u8 {
+        ((self.0 + crate::tables::modq::MIN_LOG_HEIGHT as usize) as u8).min(crate::tables::modq::MAX_LOG_HEIGHT)
+    }
     /// One padding row is always kept.
     pub fn max_cycles(self) -> usize { self.cpu_height() - 1 }
     /// `2^(t+2)`, i.e. `2^(t-3)` Poseidon2 permutation slots (each block is 32 rows) —
@@ -389,14 +397,14 @@ impl Tier {
 }
 
 #[derive(Clone)]
-pub enum Chip { Program(ProgramAir), Cpu(CpuAir), Memory(MemoryAir), Alu(AluAir), Range(RangeAir), Nibble(NibbleAir), Poseidon2(Poseidon2Air, usize), Input(crate::tables::input::InputAir), Keccak(KeccakAir, usize), Sha256(Sha256Air, usize), Public(crate::tables::public::PublicAir) }
+pub enum Chip { Program(ProgramAir), Cpu(CpuAir), Memory(MemoryAir), Alu(AluAir), Range(RangeAir), Nibble(NibbleAir), Poseidon2(Poseidon2Air, usize), Input(crate::tables::input::InputAir), Keccak(KeccakAir, usize), Sha256(Sha256Air, usize), Modq(crate::tables::modq::ModqAir, usize), Public(crate::tables::public::PublicAir) }
 
 impl Chip {
     /// The table's own width — its `col::WIDTH` — without constraint set 7's blind columns. What a
     /// `Traces` matrix is; `BaseAir::width` (and so the committed trace) is this plus
     /// `tables::blind::col::WIDTH`.
     pub fn table_width(&self) -> usize {
-        match self { Chip::Program(a) => BaseAir::<Val>::width(a), Chip::Cpu(a) => BaseAir::<Val>::width(a), Chip::Memory(a) => BaseAir::<Val>::width(a), Chip::Alu(a) => BaseAir::<Val>::width(a), Chip::Range(a) => BaseAir::<Val>::width(a), Chip::Nibble(a) => BaseAir::<Val>::width(a), Chip::Poseidon2(a, _) => BaseAir::<Val>::width(a), Chip::Input(a) => BaseAir::<Val>::width(a), Chip::Keccak(a, _) => BaseAir::<Val>::width(a), Chip::Sha256(a, _) => BaseAir::<Val>::width(a), Chip::Public(a) => BaseAir::<Val>::width(a) }
+        match self { Chip::Program(a) => BaseAir::<Val>::width(a), Chip::Cpu(a) => BaseAir::<Val>::width(a), Chip::Memory(a) => BaseAir::<Val>::width(a), Chip::Alu(a) => BaseAir::<Val>::width(a), Chip::Range(a) => BaseAir::<Val>::width(a), Chip::Nibble(a) => BaseAir::<Val>::width(a), Chip::Poseidon2(a, _) => BaseAir::<Val>::width(a), Chip::Input(a) => BaseAir::<Val>::width(a), Chip::Keccak(a, _) => BaseAir::<Val>::width(a), Chip::Sha256(a, _) => BaseAir::<Val>::width(a), Chip::Modq(a, _) => BaseAir::<Val>::width(a), Chip::Public(a) => BaseAir::<Val>::width(a) }
     }
 }
 
@@ -406,7 +414,7 @@ impl BaseAir<Val> for Chip {
     /// table's layout moves and the blind is one piece of code for all eleven.
     fn width(&self) -> usize { self.table_width() + crate::tables::blind::col::WIDTH }
     fn preprocessed_width(&self) -> usize {
-        match self { Chip::Program(a) => BaseAir::<Val>::preprocessed_width(a), Chip::Range(a) => BaseAir::<Val>::preprocessed_width(a), Chip::Nibble(a) => BaseAir::<Val>::preprocessed_width(a), Chip::Poseidon2(a, _) => BaseAir::<Val>::preprocessed_width(a), Chip::Keccak(a, _) => BaseAir::<Val>::preprocessed_width(a), Chip::Sha256(a, _) => BaseAir::<Val>::preprocessed_width(a), _ => 0 }
+        match self { Chip::Program(a) => BaseAir::<Val>::preprocessed_width(a), Chip::Range(a) => BaseAir::<Val>::preprocessed_width(a), Chip::Nibble(a) => BaseAir::<Val>::preprocessed_width(a), Chip::Poseidon2(a, _) => BaseAir::<Val>::preprocessed_width(a), Chip::Keccak(a, _) => BaseAir::<Val>::preprocessed_width(a), Chip::Sha256(a, _) => BaseAir::<Val>::preprocessed_width(a), Chip::Modq(a, _) => BaseAir::<Val>::preprocessed_width(a), _ => 0 }
     }
     fn preprocessed_trace(&self) -> Option<RowMajorMatrix<Val>> {
         match self {
@@ -423,6 +431,10 @@ impl BaseAir<Val> for Chip {
             // M4.4: and the sha256 table's row selectors, round constants `K[t]` and the tail
             // one-hots — periodic with period 64, a function of the height alone.
             Chip::Sha256(_, height) => Some(Sha256Air::preprocessed_trace_at(*height)),
+            // Private multisig phase 3: and the modq table's 16 period-1 024 columns (stage,
+            // butterfly pairs, twiddles, pointwise indices). `ModqAir::preprocessed_trace` is
+            // `unreachable!` for the same reason as the three above.
+            Chip::Modq(_, height) => Some(crate::tables::modq::ModqAir::preprocessed_trace_at(*height)),
             _ => None,
         }
     }
@@ -434,7 +446,7 @@ where
     AB: AirBuilder<F = Val> + PermutationAirBuilder + InteractionBuilder,
 {
     fn eval(&self, b: &mut AB) {
-        match self { Chip::Program(a) => a.eval(b), Chip::Cpu(a) => a.eval(b), Chip::Memory(a) => a.eval(b), Chip::Alu(a) => a.eval(b), Chip::Range(a) => a.eval(b), Chip::Nibble(a) => a.eval(b), Chip::Poseidon2(a, _) => a.eval(b), Chip::Input(a) => a.eval(b), Chip::Keccak(a, _) => a.eval(b), Chip::Sha256(a, _) => a.eval(b), Chip::Public(a) => a.eval(b) }
+        match self { Chip::Program(a) => a.eval(b), Chip::Cpu(a) => a.eval(b), Chip::Memory(a) => a.eval(b), Chip::Alu(a) => a.eval(b), Chip::Range(a) => a.eval(b), Chip::Nibble(a) => a.eval(b), Chip::Poseidon2(a, _) => a.eval(b), Chip::Input(a) => a.eval(b), Chip::Keccak(a, _) => a.eval(b), Chip::Sha256(a, _) => a.eval(b), Chip::Modq(a, _) => a.eval(b), Chip::Public(a) => a.eval(b) }
         // Constraint set 7: the blind, on the columns after the table's own.
         crate::tables::blind::eval(b, self.table_width());
     }
@@ -476,9 +488,16 @@ where
 /// `Chip::Input` where it structurally belongs, for the reason every chip since M4.2 has gone
 /// last: `i == 1` (`Cpu`) is the public-values slot `prove_traces`/`verify` hard-code and
 /// `i == 2` (`Memory`) is indexed directly by `tests/cheating.rs`, and inserting in the middle
-/// would move both. Its own index is therefore `8 + (klh != 0) + (slh != 0)` — 8, 9 or 10 — and
-/// the batch carries nine, ten or eleven instances.
+/// would move both. Its own index is therefore `8 + (klh != 0) + (slh != 0) + (mlh != 0)` — 8 to 11 — and
+/// the batch carries nine to twelve instances.
 pub fn chips(tier: Tier, keccak_log_height: u8, sha256_log_height: u8) -> Vec<Chip> {
+    chips_with_modq(tier, keccak_log_height, sha256_log_height, 0)
+}
+
+/// [`chips`] with the modq table's declared height (private multisig phase 3). `0` declares no
+/// modq table and is exactly `chips`; any other value pushes `Chip::Modq` after `Sha256` and
+/// before the mandatory `Public`, so no earlier index moves.
+pub fn chips_with_modq(tier: Tier, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8) -> Vec<Chip> {
     let mut v = vec![
         Chip::Program(ProgramAir),
         Chip::Cpu(CpuAir),
@@ -494,6 +513,9 @@ pub fn chips(tier: Tier, keccak_log_height: u8, sha256_log_height: u8) -> Vec<Ch
     }
     if sha256_log_height != 0 {
         v.push(Chip::Sha256(Sha256Air, 1usize << sha256_log_height));
+    }
+    if modq_log_height != 0 {
+        v.push(Chip::Modq(crate::tables::modq::ModqAir, 1usize << modq_log_height));
     }
     v.push(Chip::Public(crate::tables::public::PublicAir));
     v
@@ -529,6 +551,12 @@ pub struct Traces {
     /// (one 64-row block per compression, floored at one block), with `0` the distinguished
     /// "no sha256 table in this proof" value.
     pub sha256_log_height: u8,
+    /// Private multisig phase 3: `None` for a guest that never calls `MODQ` (and no
+    /// `min_modq_log_height` floor). `Some` iff `modq_log_height != 0`.
+    pub modq: Option<RowMajorMatrix<Val>>,
+    /// The modq table's height, as a base-2 log (`tables::modq::modq_log_height`, one 1 024-row
+    /// block per call), `0` meaning no modq table.
+    pub modq_log_height: u8,
     /// M4.2 (controller ruling 1): the memory table's height, as a base-2 log — proof-declared
     /// like the four above, but with a tier-derived *floor* the others have no analogue
     /// of (`Tier::min_mem_log_height`). See `Proof::mem_log_height`.
@@ -543,13 +571,14 @@ pub struct Traces {
 impl Traces {
     /// The traces in `chips()` order — eight entries, plus one per optional hash table this proof
     /// declares (M4.2, Task 6: a `Vec`, not a fixed-size array, because the batch's instance count
-    /// is now per-proof; M4.4 adds the sha256 table as the second such, so the count is 8, 9 or
-    /// 10). The `i`-th entry pairs with the `i`-th chip, which is what keeps `i == 1`'s
+    /// is now per-proof; M4.4 adds the sha256 table as the second such and private multisig phase 3
+    /// the modq table as the third, so the count is 8 to 11). The `i`-th entry pairs with the `i`-th chip, which is what keeps `i == 1`'s
     /// public-values slot correct in every shape.
     pub fn as_slice(&self) -> Vec<&RowMajorMatrix<Val>> {
         let mut v = vec![&self.program, &self.cpu, &self.memory, &self.alu, &self.range, &self.nibble, &self.poseidon2, &self.input];
         if let Some(keccak) = &self.keccak { v.push(keccak); }
         if let Some(sha256) = &self.sha256 { v.push(sha256); }
+        if let Some(modq) = &self.modq { v.push(modq); }
         // Constraint set 6: last, matching `chips()` — see that function's doc comment for why
         // the mandatory public table is appended after the two optional ones.
         v.push(&self.public);
@@ -585,6 +614,9 @@ pub enum ProveError {
     /// cycle check above (a compression costs a cycle, so `n ≤ 2^t`), and kept for the same reason:
     /// an error rather than a panic for a direct caller who hand-builds an `Execution`.
     TooManyCompressions { compressions: usize, log_height: u8 },
+    /// Private multisig phase 3: the modq table's analogue — the declared `modq_log_height`
+    /// (calls, or the `min_modq_log_height` floor) exceeds `Tier::max_modq_log_height`.
+    TooManyModqCalls { calls: usize, log_height: u8 },
     /// M4.2 (controller ruling 1): the memory table's analogue — this execution makes more
     /// accesses than `MAX_MEM_LOG_HEIGHT` rows can hold. Unlike the three above this is not
     /// quite unreachable: a guest doing nothing but `KECCAK` passes it at tier 18-20 (see
@@ -674,6 +706,10 @@ pub enum VerifyError {
     /// because it is a *relation* between two declared values rather than a range check on one,
     /// and because the test that pins it asserts on the exact variant.
     Sha256HeightExceedsTier,
+    /// Private multisig phase 3: `proof.modq_log_height` is non-zero and outside
+    /// `[tables::modq::MIN_LOG_HEIGHT, Tier::max_modq_log_height]` (the flat cap folded in). `0`
+    /// is exempt and means no modq table.
+    ModqHeight,
     /// M4.2 (controller ruling 1): `proof.mem_log_height` is outside `[tier.min_mem_log_height(),
     /// MAX_MEM_LOG_HEIGHT]`. The lower bound is the load-bearing half — see
     /// `Proof::mem_log_height`.
@@ -721,7 +757,7 @@ pub fn check_public_values(hc: &[u32; 8], proof: &Proof) -> Result<(), VerifyErr
     if !TIERS.contains(&proof.tier.0) { return Err(VerifyError::Tier); }
     // Constraint set 8: the declared gas limit is canonical (checked above) and never past what
     // the header itself allows — a larger value could only be a mispriced header.
-    if proof.public_values[pv::GAS] > crate::gas::gas_max(proof.tier, proof.keccak_log_height, proof.sha256_log_height) {
+    if proof.public_values[pv::GAS] > crate::gas::gas_max_with_modq(proof.tier, proof.keccak_log_height, proof.sha256_log_height, proof.modq_log_height) {
         return Err(VerifyError::GasLimit);
     }
     // Audit ZKA-1: an output slot is a 32-bit word, and every consumer reads it as one — but the
@@ -805,6 +841,23 @@ pub fn check_declared_heights(
     public_log_height: u8,
     mem_log_height: u8,
 ) -> Result<(), VerifyError> {
+    check_declared_heights_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, 0, public_log_height, mem_log_height)
+}
+
+/// [`check_declared_heights`] with the modq table's declared height (private multisig phase 3):
+/// `0` declares no modq table; any other value must lie in
+/// `[max(tables::modq::MIN_LOG_HEIGHT, floor), Tier::max_modq_log_height]`, else `ModqHeight`.
+#[allow(clippy::too_many_arguments)]
+pub fn check_declared_heights_with_modq(
+    tier: Tier,
+    program_log_height: u8,
+    input_log_height: u8,
+    keccak_log_height: u8,
+    sha256_log_height: u8,
+    modq_log_height: u8,
+    public_log_height: u8,
+    mem_log_height: u8,
+) -> Result<(), VerifyError> {
     // `tier` is deserialized from untrusted bytes: an attacker-supplied out-of-range tier
     // (anything not in TIERS) must be rejected first of all, since every check below it — and
     // `log_ext_degrees` after them — calls `Tier::cpu_height`/`alu_height`/`min_mem_log_height`,
@@ -867,6 +920,14 @@ pub fn check_declared_heights(
         if sha256_log_height > tier.max_sha256_log_height() {
             return Err(VerifyError::Sha256HeightExceedsTier);
         }
+    }
+    // Private multisig phase 3: the modq table, on the same terms — `0` declares none (the `MODQ`
+    // bus then has no provider, so a cpu row claiming `SYS_MODQ` is unprovable), any other value
+    // gets one range whose top is `Tier::max_modq_log_height` (the flat cap folded in).
+    if modq_log_height != 0
+        && !(crate::tables::modq::MIN_LOG_HEIGHT.max(floor)..=tier.max_modq_log_height()).contains(&modq_log_height)
+    {
+        return Err(VerifyError::ModqHeight);
     }
     // The public table is mandatory — unlike the two hash chips there is no "0 means absent"
     // value — so this is a plain range check, `tables::input`'s exactly.
@@ -956,6 +1017,23 @@ pub struct ProveOptions {
     /// work, not the header's ceiling, passes the exact `gas` (`gas::gas_of`) rather than relying
     /// on the default.
     pub gas_limit: Option<u64>,
+
+    /// Private multisig phase 3 (spec §5, pre-flight ruling 3 — the shape leak): floors on three
+    /// declared heights, so a prover that pins its tier can also pin every variable height to a
+    /// worst-case value and the header stops leaking how many calls (or accesses) the run made.
+    /// `0` = no floor. Prover-side only: the verifier is unchanged, because idle padding blocks
+    /// and padding memory rows verify already. A floor must still lie inside
+    /// `check_declared_heights_with_modq`' range for its table, or `build_traces_inner` refuses
+    /// (`TooManyModqCalls` / `TooManyPermutations` / `TooManyMemoryAccesses`).
+    ///
+    /// `min_modq_log_height` declares an idle modq table even when the run makes no `MODQ` call
+    /// (`pad_absent_hash_tables` never does). The `msauth` prover sets all three to their
+    /// `M_MAX` values.
+    pub min_modq_log_height: u8,
+    /// The keccak table's floor; non-zero declares an idle keccak table on a keccak-free run.
+    pub min_keccak_log_height: u8,
+    /// The memory table's floor, above the tier's own `t + 2`.
+    pub min_mem_log_height: u8,
 }
 
 /// Constraint set 8: `gas_limit` is the proof's declared `pv::GAS`, and must lie in
@@ -963,21 +1041,59 @@ pub struct ProveOptions {
 /// `GasLimitAboveHeader` otherwise, before the cpu trace is built. A caller with no better value
 /// passes the header's ceiling; [`build_traces_salted_with`] does exactly that.
 pub fn build_traces_salted(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 4], exec: &Execution, tier: Tier, gas_limit: u64) -> Result<Traces, ProveError> {
-    build_traces_inner(program, inputs, public, salt, exec, tier, ProveOptions::default(), Some(gas_limit))
+    build_traces_inner(program, inputs, public, salt, exec, tier, ProveOptions::default(), Some(gas_limit), None)
 }
+
+/// Cheating-suite hook (spec §5, pre-flight ruling 1; `cheating` feature only):
+/// [`build_traces_salted`] with the modq table forged by `tables::modq::forge_block(events,
+/// height, lie)` over the run's own (clk-offset) events. The memory table records the forged
+/// block's own accesses in place of the emulator's — with the builder's consistency asserts off
+/// (`tables::memory::memory_trace_forged`'s terms), so the memory AIR is what judges them — and the
+/// forged `RangeCounts` join the range table. `Lie::NoModqTable` instead declares no modq table at
+/// all, its memory traffic and range counts left out with it. Everything else is
+/// `build_traces_salted`'s. No prover path calls this.
+#[cfg(feature = "cheating")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn build_traces_forged(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 4], exec: &Execution, tier: Tier, gas_limit: u64, lie: crate::tables::modq::Lie) -> Result<Traces, ProveError> {
+    use crate::tables::modq::{forge_block, Lie};
+    let forge = |events: &[crate::tables::modq::ModqEvent], log_height: u8| {
+        if lie == Lie::NoModqTable || log_height == 0 {
+            return ModqOverride { log_height: 0, trace: None, range: RangeCounts::default(), accesses: Vec::new() };
+        }
+        let f = forge_block(events, log_height, lie);
+        let accesses = f.accesses.iter().flat_map(|(clk, acc)| acc.iter().map(move |a| (*clk, *a))).collect();
+        ModqOverride { log_height, trace: Some(f.trace), range: f.range, accesses }
+    };
+    build_traces_inner(program, inputs, public, salt, exec, tier, ProveOptions::default(), Some(gas_limit), Some(&forge))
+}
+
+/// What the cheating suite puts in place of the run's modq table (`build_traces_forged`): the
+/// declared height, the table (`None`: no table), its range counts, and the memory accesses it
+/// sends at absolute clocks, which replace the emulator's modq accesses in the memory table.
+#[cfg_attr(not(feature = "cheating"), allow(dead_code))]
+struct ModqOverride {
+    log_height: u8,
+    trace: Option<RowMajorMatrix<Val>>,
+    range: RangeCounts,
+    accesses: Vec<(u32, crate::emulator::MemAccess)>,
+}
+type ModqForge<'a> = &'a dyn Fn(&[crate::tables::modq::ModqEvent], u8) -> ModqOverride;
 
 /// [`build_traces_salted`] under explicit [`ProveOptions`]: `opts.gas_limit` is the declared
 /// limit, `None` meaning the header's own ceiling (`gas::gas_max`) — what every `Machine::prove*`
 /// entry point declares by default.
 pub fn build_traces_salted_with(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 4], exec: &Execution, tier: Tier, opts: ProveOptions) -> Result<Traces, ProveError> {
     let gas_limit = opts.gas_limit;
-    build_traces_inner(program, inputs, public, salt, exec, tier, opts, gas_limit)
+    build_traces_inner(program, inputs, public, salt, exec, tier, opts, gas_limit, None)
 }
 
 /// The one trace builder. `gas_limit: None` = the header's ceiling, resolved once the declared
-/// keccak/sha256 heights are known.
+/// keccak/sha256/modq heights are known.
 #[allow(clippy::too_many_arguments)]
-fn build_traces_inner(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 4], exec: &Execution, tier: Tier, opts: ProveOptions, gas_limit: Option<u64>) -> Result<Traces, ProveError> {
+/// `forge`: `build_traces_forged`'s override, `None` on every prover path.
+#[allow(clippy::too_many_arguments)]
+fn build_traces_inner(program: &Program, inputs: &[u32], public: &[u32], salt: [u32; 4], exec: &Execution, tier: Tier, opts: ProveOptions, gas_limit: Option<u64>, forge: Option<ModqForge>) -> Result<Traces, ProveError> {
     // M3.4: digest rows count as cycles too — the digest prefix is part of every proof's cpu
     // table, not just `exec.events`. M4.1: so does the input-digest prefix.
     let input_digest_rows = crate::hash::input_digest_row_count(inputs.len());
@@ -1047,7 +1163,12 @@ fn build_traces_inner(program: &Program, inputs: &[u32], public: &[u32], salt: [
     // `klh ≤ t + 5` (`Tier::max_keccak_log_height`) and the flat defensive cap
     // `tables::keccak::MAX_LOG_HEIGHT`. The prover enforces the same `min` the verifier does, so
     // no honest proof is built that the verifier would then refuse to look at.
-    if keccak_log_height > tier.max_keccak_log_height().min(crate::tables::keccak::MAX_LOG_HEIGHT) {
+    // Private multisig phase 3: the prover-side floor (`ProveOptions::min_keccak_log_height`),
+    // which may declare an idle table on a keccak-free run.
+    let keccak_log_height = keccak_log_height.max(opts.min_keccak_log_height);
+    if keccak_log_height > tier.max_keccak_log_height().min(crate::tables::keccak::MAX_LOG_HEIGHT)
+        || (keccak_log_height != 0 && keccak_log_height < crate::tables::keccak::MIN_LOG_HEIGHT.max(crate::tables::MIN_PRIVATE_TABLE_LOG_HEIGHT))
+    {
         return Err(ProveError::TooManyPermutations { perms: keccak_events.len(), log_height: keccak_log_height });
     }
     // M4.2 (Task 6): no permutations, no table. `keccak_log_height == 0` and `keccak == None`
@@ -1077,12 +1198,32 @@ fn build_traces_inner(program: &Program, inputs: &[u32], public: &[u32], salt: [
     // No compressions, no table: `sha256_log_height == 0` and `sha256 == None` are set here
     // together and travel together from this point on.
     let sha256_t = (sha256_log_height != 0).then(|| sha256_trace(&sha256_events, sha256_log_height));
+    // Private multisig phase 3: one `ModqEvent` per `MODQ` row, in execution order, at the cpu
+    // table's own (digest-prefix shifted) clock — what both sides of `bus::MODQ` carry and what the
+    // chip's memory timestamps `4·CLK`/`4·CLK + 1` are built from.
+    let modq_events: Vec<crate::tables::modq::ModqEvent> = exec.events.iter()
+        .filter_map(|e| e.modq.as_ref().map(|m| crate::tables::modq::ModqEvent { clk: clk_offset + e.clk, base: m.base, a1: m.a1, inputs: m.inputs.clone() }))
+        .collect();
+    // No calls and no floor: no table. Otherwise one block per call, raised to the floor
+    // (`ProveOptions::min_modq_log_height`) — a floor alone declares an all-idle table, which
+    // claims nothing on `MODQ` and sends nothing on `MEMORY`. `pad_absent_hash_tables` does not
+    // touch this table.
+    let mut modq_log_height = crate::tables::modq::modq_log_height(modq_events.len());
+    if modq_log_height != 0 || opts.min_modq_log_height != 0 {
+        modq_log_height = modq_log_height.max(opts.min_modq_log_height).max(crate::tables::modq::MIN_LOG_HEIGHT);
+    }
+    if modq_log_height != 0 && modq_log_height > tier.max_modq_log_height() {
+        return Err(ProveError::TooManyModqCalls { calls: modq_events.len(), log_height: modq_log_height });
+    }
+    // The cheating suite's override (`build_traces_forged`): a forged modq block, or none at all.
+    let forged = forge.map(|f| f(&modq_events, modq_log_height));
+    if let Some(f) = &forged { modq_log_height = f.log_height; }
     // Constraint set 8: the declared gas limit sits between what this run spends and what its
     // header could ever need — refused here, before the cpu trace (whose `HALT` row encodes the
     // difference in four byte limbs) is built. `gas_max` < 2^32 at every admissible header
     // (`tests/gas.rs` pins the largest), so the slack always fits the limbs.
     let gas = crate::gas::gas_of(program, inputs, public, &exec.events);
-    let max = crate::gas::gas_max(tier, keccak_log_height, sha256_log_height);
+    let max = crate::gas::gas_max_with_modq(tier, keccak_log_height, sha256_log_height, modq_log_height);
     let gas_limit = gas_limit.unwrap_or(max);
     if gas_limit < gas { return Err(ProveError::GasLimitBelowRun { gas, limit: gas_limit }); }
     if gas_limit > max { return Err(ProveError::GasLimitAboveHeader { limit: gas_limit, max }); }
@@ -1098,14 +1239,23 @@ fn build_traces_inner(program: &Program, inputs: &[u32], public: &[u32], salt: [
     // all recorded here. Expressed as the plan's formula, the table holds
     // `4·cycles + 100·n_keccak + 32·n_sha256` accesses; counted here the way `memory_trace` will
     // actually consume them, which is per event rather than per formula.
-    let mem_accesses: usize = exec.events.iter().map(|e| e.accesses.len() + e.keccak_accesses.len() + e.sha256_accesses.len()).sum();
+    // An override's accesses replace the emulator's modq accesses in the memory table.
+    let mem_accesses: usize = exec.events.iter().map(|e| e.accesses.len() + e.keccak_accesses.len() + e.sha256_accesses.len() + if forged.is_some() { 0 } else { e.modq.as_ref().map_or(0, |m| m.accesses.len()) }).sum::<usize>() + forged.as_ref().map_or(0, |f| f.accesses.len());
+    // Private multisig phase 3: and the prover-side floor `ProveOptions::min_mem_log_height`.
     let mem_log_height = tier
         .min_mem_log_height()
-        .max((mem_accesses + 1).next_power_of_two().trailing_zeros() as u8);
+        .max((mem_accesses + 1).next_power_of_two().trailing_zeros() as u8)
+        .max(opts.min_mem_log_height);
     if mem_log_height > MAX_MEM_LOG_HEIGHT {
         return Err(ProveError::TooManyMemoryAccesses { accesses: mem_accesses, log_height: mem_log_height });
     }
-    let memory = memory_trace(&exec.events, clk_offset, 1usize << mem_log_height, &mut range);
+    let memory = if let Some(f) = &forged {
+        let mut events = exec.events.clone();
+        for m in events.iter_mut().filter_map(|e| e.modq.as_mut()) { m.accesses.clear(); }
+        crate::tables::memory::memory_trace_inner(&events, clk_offset, 1usize << mem_log_height, &mut range, &f.accesses, false)
+    } else {
+        memory_trace(&exec.events, clk_offset, 1usize << mem_log_height, &mut range)
+    };
     let alu = alu_trace(&exec.events, tier.alu_height(), &mut range, &mut nibble);
     let read_counts = crate::tables::input::read_counts(inputs.len(), &exec.events);
     // ZKM-1/ZKH-2 (next constraint set): the input and public tables' word limbs are `RANGE8`
@@ -1115,6 +1265,15 @@ fn build_traces_inner(program: &Program, inputs: &[u32], public: &[u32], salt: [
     // `SYS_READ_PUBLIC` events the same way.
     let public_read_counts = crate::tables::public::read_counts(public.len(), &exec.events);
     let public_t = crate::tables::public::public_trace(public, &public_read_counts, 1usize << public_log_height, &mut range);
+    // Private multisig phase 3: the modq table counts its 29 limbs per real row into `range`, so it
+    // is built before the range table is.
+    let modq_t = match forged {
+        Some(f) => {
+            range.absorb(&f.range);
+            f.trace
+        }
+        None => (modq_log_height != 0).then(|| crate::tables::modq::modq_trace(&modq_events, modq_log_height, &mut range)),
+    };
     let range_t = range_trace(&range);
     let nibble_t = nibble_trace(&nibble);
     let program_t = program_trace(program, &exec.events, 1usize << program_log_height);
@@ -1167,12 +1326,13 @@ fn build_traces_inner(program: &Program, inputs: &[u32], public: &[u32], salt: [
         program: program_t, cpu, memory, alu, range: range_t, nibble: nibble_t, poseidon2: poseidon2_t, input: input_t,
         keccak: keccak_t,
         sha256: sha256_t,
+        modq: modq_t,
         public: public_t,
         // Constraint set 8: the limit checked above, the same one the cpu trace's `HALT` row
         // encodes (the `Machine::prove*` paths pass the header's own ceiling by default;
         // `ProveOptions::gas_limit` overrides it).
         public_values: public_values(program.base_pc, tier.0, &exec.outputs, &hc, &hin, &hpub, gas_limit),
-        program_log_height, input_log_height, keccak_log_height, sha256_log_height, public_log_height, mem_log_height,
+        program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height, mem_log_height,
     })
 }
 
@@ -1213,6 +1373,11 @@ pub struct Proof {
     /// 466 + 10 columns against keccak's 2 612 + 99, and every FRI query opens a leaf of the
     /// batch's full width whether the table holds 64 rows or 65 536.
     pub sha256_log_height: u8,
+    /// Private multisig phase 3: the modq table's height, declared by the prover —
+    /// `tables::modq::modq_log_height` (one 1 024-row block per call), or a prover's floor —
+    /// bounded by `[tables::modq::MIN_LOG_HEIGHT, Tier::max_modq_log_height]`. `0` means the batch
+    /// carries no modq table. Placed after `sha256_log_height`; postcard adds one byte.
+    pub modq_log_height: u8,
     /// Constraint set 6: the public table's height, declared by the prover —
     /// `tables::public::public_log_height`, range-checked against
     /// `[MIN_LOG_HEIGHT, MAX_LOG_HEIGHT]` by `check_declared_heights`. Mandatory: unlike the two
@@ -1331,12 +1496,17 @@ const KEY_CACHE_CAPACITY: usize = 64;
 /// `TIERS.len() * (program::MAX_LOG_HEIGHT − program::MIN_LOG_HEIGHT + 1) *
 /// (input::MAX_LOG_HEIGHT − input::MIN_LOG_HEIGHT + 1) *
 /// (keccak range, `min(t + 5, keccak::MAX_LOG_HEIGHT) − keccak::MIN_LOG_HEIGHT + 2` = 17 at
-/// tier 20, the `+ 2` counting M4.2 Task 6's `klh = 0`, "no keccak table", as its own value)` distinct
-/// keys in the worst case —
+/// tier 20, the `+ 2` counting M4.2 Task 6's `klh = 0`, "no keccak table", as its own value) *
+/// (the sha256 range, counted the same way) *
+/// (modq range, `min(t + 10, modq::MAX_LOG_HEIGHT) − modq::MIN_LOG_HEIGHT + 2` = 12 at any tier
+/// from 10, the `+ 2` counting `mlh = 0`, "no modq table", as its own value) *
+/// (the public range)` distinct keys in the worst case —
 /// comfortably able to exceed `KEY_CACHE_CAPACITY` if a caller proves at many different
 /// program/input sizes, unlike the tier-only cache this replaces, so the eviction here is
 /// a real policy again, not just defense in depth.
-type KeyShape = (usize, u8, u8, u8, u8, u8);
+/// Private multisig phase 3: the 7-tuple `(tier, program, input, keccak, sha256, modq, public)`;
+/// `modq = 0` is the modq-free key every pre-phase-3 call keeps reaching.
+type KeyShape = (usize, u8, u8, u8, u8, u8, u8);
 type KeySlot = Arc<std::sync::OnceLock<Arc<CommonData<Config>>>>;
 
 struct KeyCache {
@@ -1403,7 +1573,7 @@ impl Machine {
     /// not count as a use).
     #[doc(hidden)]
     pub fn has_cached_key(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, public_log_height: u8) -> bool {
-        self.keys.lock().unwrap().is_built(&(tier.0, program_log_height, input_log_height, keccak_log_height, sha256_log_height, public_log_height))
+        self.keys.lock().unwrap().is_built(&(tier.0, program_log_height, input_log_height, keccak_log_height, sha256_log_height, 0, public_log_height))
     }
 
     /// Each instance's extended trace degree bits, in `chips()` order — a pure function of the
@@ -1415,6 +1585,14 @@ impl Machine {
     /// machine rather than from the proof — the whole point of a *shape* is that it is not
     /// proof-supplied — and this is where the machine says what they are.
     pub fn log_ext_degrees(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, public_log_height: u8, mem_log_height: u8) -> Vec<usize> {
+        self.log_ext_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, 0, public_log_height, mem_log_height)
+    }
+
+    /// [`Self::log_ext_degrees`] with the modq table's declared height (private multisig phase
+    /// 3): its entry, when non-zero, sits after sha256's and before public's, matching
+    /// `chips_with_modq`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_ext_degrees_with_modq(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8, public_log_height: u8, mem_log_height: u8) -> Vec<usize> {
         let zk = self.config.is_zk();
         // Order matches `chips()`: program, cpu, memory, alu, range, nibble, poseidon2, input,
         // then — only when this proof declares them — keccak and sha256, and finally the
@@ -1441,6 +1619,9 @@ impl Machine {
         // M4.4: and the sha256 entry, on the same terms — after keccak's, matching `chips()`.
         if sha256_log_height != 0 {
             v.push(sha256_log_height as usize + zk);
+        }
+        if modq_log_height != 0 {
+            v.push(modq_log_height as usize + zk);
         }
         // Constraint set 6: the public table is mandatory and last, so its entry is
         // unconditional and always the final one — see `chips()`.
@@ -1492,7 +1673,15 @@ impl Machine {
     pub fn log_ext_degrees_pub(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, public_log_height: u8, mem_log_height: u8) -> Vec<usize> { self.log_ext_degrees(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, public_log_height, mem_log_height) }
 
     pub fn verifier_key(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, public_log_height: u8) -> Arc<CommonData<Config>> {
-        let key = (tier.0, program_log_height, input_log_height, keccak_log_height, sha256_log_height, public_log_height);
+        self.verifier_key_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, 0, public_log_height)
+    }
+
+    /// [`Self::verifier_key`] with the modq table's declared height (private multisig phase 3) as
+    /// the key's sixth component; `modq_log_height = 0` is the same cache slot `verifier_key`
+    /// uses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verifier_key_with_modq(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8, public_log_height: u8) -> Arc<CommonData<Config>> {
+        let key = (tier.0, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height);
         // The cache lock is held only to find or make the slot; the build runs outside it, and
         // `OnceLock::get_or_init` makes every concurrent caller of this shape wait for the one
         // build (#54's single flight) — a caller of another shape is never held up by it.
@@ -1503,13 +1692,13 @@ impl Machine {
             // of which proof happened to miss the cache first.
             let mem_log_height = tier.min_mem_log_height();
             self.key_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips(tier, keccak_log_height, sha256_log_height), &self.log_ext_degrees(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, public_log_height, mem_log_height)).common)
+            Arc::new(ProverData::from_airs_and_degrees(&key_config(self.profile), &chips_with_modq(tier, keccak_log_height, sha256_log_height, modq_log_height), &self.log_ext_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height, mem_log_height)).common)
         })
         .clone()
     }
 
     /// Number of `(tier, program_log_height, input_log_height, keccak_log_height,
-    /// sha256_log_height, public_log_height)` verifier keys
+    /// sha256_log_height, modq_log_height, public_log_height)` verifier keys
     /// currently cached.
     pub fn cached_keys(&self) -> usize { self.keys.lock().unwrap().built() }
 
@@ -1591,11 +1780,11 @@ impl Machine {
     /// blinds that do not balance (`tests/cheating.rs`) are refused like any other unbalanced bus.
     #[doc(hidden)]
     pub fn prove_traces_with_blinds(&self, _program: &Program, traces: &Traces, tier: Tier, blinds: &[crate::tables::blind::Blind]) -> Proof {
-        let airs = chips(tier, traces.keccak_log_height, traces.sha256_log_height);
+        let airs = chips_with_modq(tier, traces.keccak_log_height, traces.sha256_log_height, traces.modq_log_height);
         // M4.2 (Task 6): `keccak_log_height` picks the chip set and `keccak` supplies the
         // traces, so the two must agree — a mismatch would `zip` short and silently prove a
         // different batch than the degree bits describe.
-        assert_eq!(airs.len(), traces.as_slice().len(), "one trace per chip: the declared keccak/sha256 heights and Traces::keccak/sha256 disagree");
+        assert_eq!(airs.len(), traces.as_slice().len(), "one trace per chip: the declared keccak/sha256/modq heights and Traces::keccak/sha256 disagree");
         assert_eq!(airs.len(), blinds.len(), "one blind per instance");
         let wide: Vec<RowMajorMatrix<Val>> = traces.as_slice().iter().zip(blinds).map(|(m, b)| crate::tables::blind::widen(m, b)).collect();
         let mats: Vec<&RowMajorMatrix<Val>> = wide.iter().collect();
@@ -1620,9 +1809,9 @@ impl Machine {
         // parameters, which `key_config` and `make_config` share via `build_config`); their
         // RNG state can differ freely.
         let key_cfg = key_config(self.profile);
-        let prover_data = ProverData::from_airs_and_degrees(&key_cfg, &airs, &self.log_ext_degrees(tier, traces.program_log_height, traces.input_log_height, traces.keccak_log_height, traces.sha256_log_height, traces.public_log_height, traces.mem_log_height));
+        let prover_data = ProverData::from_airs_and_degrees(&key_cfg, &airs, &self.log_ext_degrees_with_modq(tier, traces.program_log_height, traces.input_log_height, traces.keccak_log_height, traces.sha256_log_height, traces.modq_log_height, traces.public_log_height, traces.mem_log_height));
         let batch = prove_batch(&self.config, &instances, &prover_data);
-        Proof { tier, program_log_height: traces.program_log_height, input_log_height: traces.input_log_height, keccak_log_height: traces.keccak_log_height, sha256_log_height: traces.sha256_log_height, public_log_height: traces.public_log_height, mem_log_height: traces.mem_log_height, public_values: traces.public_values.iter().map(|x| x.as_canonical_u64()).collect(), batch }
+        Proof { tier, program_log_height: traces.program_log_height, input_log_height: traces.input_log_height, keccak_log_height: traces.keccak_log_height, sha256_log_height: traces.sha256_log_height, modq_log_height: traces.modq_log_height, public_log_height: traces.public_log_height, mem_log_height: traces.mem_log_height, public_values: traces.public_values.iter().map(|x| x.as_canonical_u64()).collect(), batch }
     }
 
     /// Prove on `backend`. `Backend::Cpu` is exactly `prove`; the other backends run the same
@@ -1702,11 +1891,11 @@ impl Machine {
             }
         };
         let traces = build_traces_salted_with(program, inputs, public, salt, &exec, tier, ProveOptions::default())?;
-        let airs = chips(tier, traces.keccak_log_height, traces.sha256_log_height);
+        let airs = chips_with_modq(tier, traces.keccak_log_height, traces.sha256_log_height, traces.modq_log_height);
         // M4.2 (Task 6): `keccak_log_height` picks the chip set and `keccak` supplies the
         // traces, so the two must agree — a mismatch would `zip` short and silently prove a
         // different batch than the degree bits describe.
-        assert_eq!(airs.len(), traces.as_slice().len(), "one trace per chip: the declared keccak/sha256 heights and Traces::keccak/sha256 disagree");
+        assert_eq!(airs.len(), traces.as_slice().len(), "one trace per chip: the declared keccak/sha256/modq heights and Traces::keccak/sha256 disagree");
         // Constraint set 7: fresh blinds, appended — `prove_traces`' step, duplicated with it.
         let blinds = crate::tables::blind::fresh(airs.len());
         let wide: Vec<RowMajorMatrix<Val>> = traces.as_slice().iter().zip(&blinds).map(|(m, b)| crate::tables::blind::widen(m, b)).collect();
@@ -1718,14 +1907,14 @@ impl Machine {
         // That is invariant, not a leak: every backend config (`reference_cfg`, `cuda_cfg`) is
         // built on `HidingFriPcs` just as `make_config` is, so `is_zk()` is `true` for all of
         // them and the degree bits agree with what `verify` recomputes.
-        let prover_data = ProverData::from_airs_and_degrees(key_cfg, &airs, &self.log_ext_degrees(tier, traces.program_log_height, traces.input_log_height, traces.keccak_log_height, traces.sha256_log_height, traces.public_log_height, traces.mem_log_height));
+        let prover_data = ProverData::from_airs_and_degrees(key_cfg, &airs, &self.log_ext_degrees_with_modq(tier, traces.program_log_height, traces.input_log_height, traces.keccak_log_height, traces.sha256_log_height, traces.modq_log_height, traces.public_log_height, traces.mem_log_height));
         // The engines panic (rather than return) on a device failure — `CudaHashEngine::ok`
         // and friends — so a backend fault must not take the caller's process down with it.
         let batch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prove_batch(cfg, &instances, &prover_data)))
             .map_err(|p| ProveError::Backend(panic_message(p)))?;
         let bytes = postcard::to_allocvec(&batch).map_err(|e| ProveError::Backend(format!("proof serialise: {e}")))?;
         let batch: BatchProof<Config> = postcard::from_bytes(&bytes).map_err(|e| ProveError::Backend(format!("proof convert: {e}")))?;
-        Ok((Proof { tier, program_log_height: traces.program_log_height, input_log_height: traces.input_log_height, keccak_log_height: traces.keccak_log_height, sha256_log_height: traces.sha256_log_height, public_log_height: traces.public_log_height, mem_log_height: traces.mem_log_height, public_values: traces.public_values.iter().map(|x| x.as_canonical_u64()).collect(), batch }, exec))
+        Ok((Proof { tier, program_log_height: traces.program_log_height, input_log_height: traces.input_log_height, keccak_log_height: traces.keccak_log_height, sha256_log_height: traces.sha256_log_height, modq_log_height: traces.modq_log_height, public_log_height: traces.public_log_height, mem_log_height: traces.mem_log_height, public_values: traces.public_values.iter().map(|x| x.as_canonical_u64()).collect(), batch }, exec))
     }
 
     /// M3.4: takes `hc`, not the program — the verifier no longer holds the program at all
@@ -1747,12 +1936,13 @@ impl Machine {
         // handful of comparisons rather than a multi-second — at an absurd declared height,
         // multi-minute — preprocessed-commitment recomputation. `tests/cheating.rs` observes
         // exactly that as `cached_keys() == 0` after a rejection.
-        check_declared_heights(
+        check_declared_heights_with_modq(
             proof.tier,
             proof.program_log_height,
             proof.input_log_height,
             proof.keccak_log_height,
             proof.sha256_log_height,
+            proof.modq_log_height,
             proof.public_log_height,
             proof.mem_log_height,
         )?;
@@ -1774,11 +1964,11 @@ impl Machine {
         // with one — and the check that every declared height matches. A proof that claims
         // `keccak_log_height = 0` while carrying nine instances (or vice versa) fails here,
         // before `chips` builds anything.
-        if proof.batch.degree_bits != self.log_ext_degrees(proof.tier, proof.program_log_height, proof.input_log_height, proof.keccak_log_height, proof.sha256_log_height, proof.public_log_height, proof.mem_log_height) { return Err(VerifyError::Tier); }
-        let airs = chips(proof.tier, proof.keccak_log_height, proof.sha256_log_height);
+        if proof.batch.degree_bits != self.log_ext_degrees_with_modq(proof.tier, proof.program_log_height, proof.input_log_height, proof.keccak_log_height, proof.sha256_log_height, proof.modq_log_height, proof.public_log_height, proof.mem_log_height) { return Err(VerifyError::Tier); }
+        let airs = chips_with_modq(proof.tier, proof.keccak_log_height, proof.sha256_log_height, proof.modq_log_height);
         let pv_vals: Vec<Val> = proof.public_values.iter().map(|x| Val::from_u64(*x)).collect();
         let pvs: Vec<Vec<Val>> = (0..airs.len()).map(|i| if i == 1 { pv_vals.clone() } else { vec![] }).collect();
-        let common = self.verifier_key(proof.tier, proof.program_log_height, proof.input_log_height, proof.keccak_log_height, proof.sha256_log_height, proof.public_log_height);
+        let common = self.verifier_key_with_modq(proof.tier, proof.program_log_height, proof.input_log_height, proof.keccak_log_height, proof.sha256_log_height, proof.modq_log_height, proof.public_log_height);
         verify_batch(&self.config, &airs, &proof.batch, &pvs, &common).map_err(|e| VerifyError::Batch(format!("{e:?}")))
     }
 
@@ -1816,11 +2006,17 @@ impl Machine {
 /// here should come with a matching update to those assertions and to
 /// `docs/02-tables-and-buses.md`.
 pub fn max_constraint_degrees(tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, public_log_height: u8, mem_log_height: u8) -> Vec<usize> {
+    max_constraint_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, 0, public_log_height, mem_log_height)
+}
+
+/// [`max_constraint_degrees`] with the modq table's declared height (private multisig phase 3).
+#[allow(clippy::too_many_arguments)]
+pub fn max_constraint_degrees_with_modq(tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8, public_log_height: u8, mem_log_height: u8) -> Vec<usize> {
     let machine = Machine::new(FriProfile::Test);
     let key_cfg = key_config(machine.profile);
-    let airs = chips(tier, keccak_log_height, sha256_log_height);
+    let airs = chips_with_modq(tier, keccak_log_height, sha256_log_height, modq_log_height);
     let is_zk = machine.config.is_zk();
-    let ext_degrees = machine.log_ext_degrees(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, public_log_height, mem_log_height);
+    let ext_degrees = machine.log_ext_degrees_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height, mem_log_height);
     let prover_data = ProverData::from_airs_and_degrees(&key_cfg, &airs, &ext_degrees);
     let lookup_gadget = p3_lookup::LogUpGadget::new();
     airs.iter()

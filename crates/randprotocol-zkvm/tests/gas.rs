@@ -273,3 +273,29 @@ mod gas_column_tests {
         let _ = gas_max(Tier(10), 255, 255);
     }
 }
+
+/// Private multisig phase 3: `MODQ_GAS = 168` (spec §6: 1 024 rows × (59 + 16) committed cells at
+/// the ≈ 460 cells per gas `KECCAK_GAS`/`SHA256_GAS` imply), and `gas_max_with_modq` adds 167 per
+/// 1 024-row modq block. `gas_max` is its modq-free case.
+mod modq {
+    use randprotocol_zkvm::gas::{gas_max, gas_max_with_modq, MODQ_GAS};
+    use randprotocol_zkvm::machine::Tier;
+
+    #[test]
+    fn modq_gas_is_the_spec_figure() {
+        assert_eq!(MODQ_GAS, 168);
+        assert_eq!(gas_max_with_modq(Tier(10), 0, 0, 10), gas_max(Tier(10), 0, 0) + 167);
+        assert_eq!(gas_max_with_modq(Tier(14), 12, 13, 16), gas_max(Tier(14), 12, 13) + 64 * 167);
+    }
+
+    #[test]
+    fn every_admissible_modq_ceiling_fits_the_four_gas_limbs() {
+        assert!(gas_max_with_modq(Tier(20), 20, 20, 20) < 1 << 32);
+    }
+
+    #[test]
+    fn gas_max_with_modq_clamps_an_absurd_height() {
+        assert_eq!(gas_max_with_modq(Tier(10), 0, 0, 41), gas_max_with_modq(Tier(10), 0, 0, 40));
+        let _ = gas_max_with_modq(Tier(10), 255, 255, 255);
+    }
+}

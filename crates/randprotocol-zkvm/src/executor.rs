@@ -2126,6 +2126,13 @@ mod tests {
                         crate::gas::gas_max(Tier(t as usize), k, sh),
                         "tier {t}, keccak 2^{k}, sha256 2^{sh}"
                     );
+                    for m in [0u8, 10, 12, 14, 16] {
+                        assert_eq!(
+                            randprotocol_core::gas::gas_max_with_modq(t, k, sh, m),
+                            crate::gas::gas_max_with_modq(Tier(t as usize), k, sh, m),
+                            "tier {t} keccak {k} sha256 {sh} modq {m}"
+                        );
+                    }
                     checked += 1;
                 }
             }

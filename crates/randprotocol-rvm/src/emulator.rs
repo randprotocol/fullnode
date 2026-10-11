@@ -450,8 +450,8 @@ pub fn execute(p: &Program, witness: &[F], max_cycles: usize) -> Result<Executio
             }
             Op::Sponge => {
                 a[0] = regs[ra];
-                let rb = reg_b(&instr, pc)? as usize;
-                b_val[0] = regs[rb];
+                // Phase 4 B′: the source block's address is the absolute immediate `b`.
+                b_val[0] = instr.b;
                 let ptr = a[0].as_canonical_u64();
                 let src = b_val[0].as_canonical_u64();
                 bounded(pc, ptr + 7)?;
@@ -487,9 +487,9 @@ pub fn execute(p: &Program, witness: &[F], max_cycles: usize) -> Result<Executio
                 run.hints_read += 8;
             }
             Op::Compress => {
-                let rb = reg_b(&instr, pc)? as usize;
                 a[0] = regs[ra];
-                b_val[0] = regs[rb];
+                // Phase 4 B: the sibling's address is the absolute immediate `b`.
+                b_val[0] = instr.b;
                 d[0] = regs[rd];
                 let bit = if d[0] == F::ZERO {
                     false

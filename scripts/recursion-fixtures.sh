@@ -26,9 +26,10 @@
 # A test that calls `fixture_proof` with a new k adds it to REQUIRED here, once.
 #
 # The pinned set. A fixture's notes are random, and the pinned-vectors test pins the 118-word
-# interface list and its digest (`3534960f…`) that those notes produce, so it passes on exactly
-# one set of bytes: the cache re-proved 2026-10-03 that the phase-2 re-vendor measured, committed
-# as crates/randprotocol-node/fixtures/recursion (#131). A freshly proved set satisfies every
+# interface list and its digest (`3753f2fd…`) that those notes produce, so it passes on exactly
+# one set of bytes: the cache re-proved 2026-10-11 for the constraint-set-9 re-vendor (circuits
+# `57fb9dc`, the MODQ chip; it was `3534960f…` over the 2026-10-03 phase-2 cache), committed as
+# crates/randprotocol-node/fixtures/recursion (#131). A freshly proved set satisfies every
 # other fixture-backed test and fails that one at "the pinned 118-word interface list" (measured
 # 2026-10-06). So the check compares the three files against PINNED_SHA256 and exits 3 on a
 # difference. Proving is for a re-pin, when the vendored zkVM moves: prove into the in-repo
@@ -57,9 +58,9 @@ set -euo pipefail
 REQUIRED=(Test-0 Test-1 Test-2)
 # sha256 of Test-0, Test-1, Test-2 in the pinned cache, in REQUIRED's order.
 PINNED_SHA256=(
-  162a5199702dc26ea1d60a9053d4b975de91ef76378bec509c9fec9f40bc62d5
-  3cd04ebcd16c91664a774342246fef8c5caeb225a335e5b724d988dfcd101a55
-  187935fd58a016071236ac2c523fda2be1f1d397c1c8e591e1cfec24ad82645f
+  1f837913c3bf006e50ed1f8fd56eabd3f7ed1091b8bcc75ea9fac2a2c981b98c
+  3f19d5515b008c5368df7326c2ab7d9e24add6411cdc221d5c029079e751e43c
+  08fddfc002932ca95af7142edd7689c36bc2bc9bc37209a8854c41e05e50365a
 )
 
 usage() {

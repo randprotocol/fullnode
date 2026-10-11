@@ -817,19 +817,17 @@ fn emit_input_round_root(
         .zip(&groups[1..])
         .map(|(&h, &(buf, n))| hash::Injection { after_level: max_h - h - 1, rows: buf, n_cells: n })
         .collect();
-    let out = Digest(b.alloc(DIGEST_ELEMS as u64));
-    hash::merkle_walk_with_injections(
+    let reached = hash::merkle_walk_with_injections(
         b,
         leaf,
         &index_bits[bits_reduced..bits_reduced + levels],
         path.base,
         levels,
         &injections,
-        out,
     );
     assert_cap_eq(
         b,
-        out,
+        reached,
         &meta.cap,
         &index_bits[bits_reduced + levels..bits_reduced + levels + CAP_HEIGHT],
         &format!("input opening root[{}]", meta.name),
@@ -843,17 +841,29 @@ fn emit_commit_root(b: &mut Builder, log_arity: usize, msg: Ptr, path: Array<Fel
     let leaf = Digest(b.alloc(DIGEST_ELEMS as u64));
     hash::sponge(b, msg, 2 * (1usize << log_arity) + SALT_ELEMS, leaf);
     let levels = path.len / DIGEST_ELEMS;
-    let out = Digest(b.alloc(DIGEST_ELEMS as u64));
-    hash::merkle_walk(b, leaf, &index_bits[..levels], path.base, levels, out);
-    assert_cap_eq(b, out, &cap, &index_bits[levels..levels + CAP_HEIGHT], name);
+    let reached = hash::merkle_walk(b, leaf, &index_bits[..levels], path.base, levels);
+    assert_cap_eq(b, reached, &cap, &index_bits[levels..levels + CAP_HEIGHT], name);
 }
 
 /// The digest a Merkle walk reached, compared against the commitment's entry at the remaining
-/// index: the two bits the walk did not consume (`cap_height = 2`) select the entry
-/// arithmetically, `cap_index = bit₀ + 2·bit₁`. All four lanes are asserted under one name —
-/// either failing means the same thing: this opening is not in the committed tree.
+/// index `cap_index = bit₀ + 2·bit₁`, the two bits the walk did not consume (`cap_height = 2`).
+/// Under `Precompiles::On` (phase 4, D1) the entry is selected by address — `off = 4·bit₀ +
+/// 8·bit₁` into the four caps' contiguous sixteen cells, one register-offset `LOAD` a lane
+/// ([`hash::assert_cap_entry`]). Under `Off` it is selected arithmetically, an indicator dot
+/// product over the four entries, kept as the differential reference. All four lanes are asserted
+/// under one name — either failing means the same thing: this opening is not in the committed tree.
 fn assert_cap_eq(b: &mut Builder, got: Digest, cap: &[Digest; 4], bits: &[Felt], name: &str) {
     debug_assert_eq!(bits.len(), CAP_HEIGHT);
+    if b.precompiles() == Precompiles::On {
+        // D1: the four caps are one contiguous sixteen-cell run (`read_cap` / `constant_cap`); the
+        // select is by address. `Off` keeps the dot product below as the differential reference.
+        for j in 1..4 {
+            assert_eq!(b.addr_of(cap[j].0), b.addr_of(cap[0].0) + (j * DIGEST_ELEMS) as u64,
+                       "the four cap digests must be contiguous for the address select");
+        }
+        hash::assert_cap_entry(b, got, cap[0].0, [bits[0], bits[1]], name);
+        return;
+    }
     let one = b.constant(F::ONE);
     let nb0 = b.sub(one, bits[0]);
     let nb1 = b.sub(one, bits[1]);

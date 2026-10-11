@@ -2,7 +2,7 @@
 //! consistency is a transition constraint; the CPU's accesses reach here through
 //! the MEMORY multiset bus.
 use super::{bus, limbs, range::RangeCounts, F};
-use crate::emulator::CycleEvent;
+use crate::emulator::{CycleEvent, MemAccess};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{Field, PrimeCharacteristicRing};
 use p3_lookup::{Count, InteractionBuilder};
@@ -74,8 +74,28 @@ where
 /// the `MEMORY` bus timestamps (`ts = 4*CLK + slot`) this table sends must use that same
 /// shifted `CLK` or the two sides' `(space, addr, ts, value, is_write)` tuples stop matching.
 pub fn memory_trace(events: &[CycleEvent], clk_offset: u32, height: usize, counts: &mut RangeCounts) -> RowMajorMatrix<F> {
+    memory_trace_inner(events, clk_offset, height, counts, &[], true)
+}
+
+/// Cheating-suite hook (`machine::build_traces_forged`, spec §5; `cheating` feature only): `memory_trace` plus `extra`
+/// accesses at absolute (digest-prefix shifted) clocks, with the builder's own consistency
+/// `assert!`s off — a duplicate `(addr, ts)` gets the wrapped delta limbs and a read that does not
+/// match the last write is recorded as is — so the memory AIR, not this builder, is what refuses
+/// them. Never used by a prover path.
+#[cfg(feature = "cheating")]
+#[doc(hidden)]
+pub fn memory_trace_forged(events: &[CycleEvent], clk_offset: u32, height: usize, counts: &mut RangeCounts, extra: &[(u32, MemAccess)]) -> RowMajorMatrix<F> {
+    memory_trace_inner(events, clk_offset, height, counts, extra, false)
+}
+
+/// `memory_trace` with `extra` accesses (absolute clocks); `checked = false` turns the builder's
+/// consistency asserts off. Only the cheating suite's forged traces pass anything but `(&[], true)`.
+pub(crate) fn memory_trace_inner(events: &[CycleEvent], clk_offset: u32, height: usize, counts: &mut RangeCounts, extra: &[(u32, MemAccess)], checked: bool) -> RowMajorMatrix<F> {
     // (key, ts, space, addr, value, is_write)
     let mut rows: Vec<(u64, u64, u32, u32, u32, bool)> = Vec::new();
+    for (clk, a) in extra {
+        rows.push((((a.space as u64) << KEY_SHIFT) + a.addr as u64, a.ts(*clk) as u64, a.space, a.addr, a.value, a.is_write));
+    }
     for e in events {
         // M4.2: `keccak_accesses` are the `KECCAK` permutation's own reads and writes. They are
         // not `accesses` because the cpu table does not send them — the keccak table does — but
@@ -83,7 +103,7 @@ pub fn memory_trace(events: &[CycleEvent], clk_offset: u32, height: usize, count
         // bus stop balancing and a permuted word could be read back as something else.
         // M4.4: `sha256_accesses` are the same thing for the `SHA256` compression — 24 reads of
         // the buffer at slot 0 and 8 state write-backs at slot 1, sent by the sha256 chip.
-        for a in e.accesses.iter().chain(e.keccak_accesses.iter()).chain(e.sha256_accesses.iter()) {
+        for a in e.accesses.iter().chain(e.keccak_accesses.iter()).chain(e.sha256_accesses.iter()).chain(e.modq.iter().flat_map(|m| m.accesses.iter())) {
             // Audit ZM2 (2026-09-12): the sort key must be computed exactly the way the AIR
             // recomputes it — `SPACE·2^30 + ADDR` (`eval`'s `key_l`/`key_n`), i.e. `+`, not
             // `|`. With `|`, any RAM address `>= 2^30` (reachable through `POSEIDON2`
@@ -115,11 +135,13 @@ pub fn memory_trace(events: &[CycleEvent], clk_offset: u32, height: usize, count
         if let Some(nx) = rows.get(i + 1) {
             let changed = nx.0 != r.0;
             let delta: u64 = if changed { nx.0 - r.0 - 1 } else {
-                assert!(nx.1 > r.1, "two accesses to the same address at the same timestamp");
-                if !nx.5 { assert_eq!(nx.4, r.4, "read does not match last write at key {:#x}", r.0); }
-                nx.1 - r.1 - 1
+                if checked {
+                    assert!(nx.1 > r.1, "two accesses to the same address at the same timestamp");
+                    if !nx.5 { assert_eq!(nx.4, r.4, "read does not match last write at key {:#x}", r.0); }
+                }
+                nx.1.wrapping_sub(r.1).wrapping_sub(1) & if checked { u64::MAX } else { u32::MAX as u64 }
             };
-            if changed && !nx.5 { assert_eq!(nx.4, 0, "first read of a fresh address must be zero"); }
+            if checked && changed && !nx.5 { assert_eq!(nx.4, 0, "first read of a fresh address must be zero"); }
             v[base + col::ADDR_CHANGED] = F::from_bool(changed);
             v[base + col::DIFF_INV] = if changed { F::from_u64(nx.0 - r.0).inverse() } else { F::ZERO };
             assert!(delta < 1 << 32);
@@ -130,6 +152,6 @@ pub fn memory_trace(events: &[CycleEvent], clk_offset: u32, height: usize, count
             }
         }
     }
-    if let Some(first) = rows.first() { if !first.5 { assert_eq!(first.4, 0); } }
+    if let Some(first) = rows.first() { if checked && !first.5 { assert_eq!(first.4, 0); } }
     RowMajorMatrix::new(v, col::WIDTH)
 }

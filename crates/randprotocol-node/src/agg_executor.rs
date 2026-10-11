@@ -333,20 +333,27 @@ fn zkvm_profile(profile: randprotocol_core::types::FriProfile) -> FriProfile {
 /// N-economics at the phase-3 tiers") keeps the sets: production N=1 at 20 (585 960 rows), N=2–3
 /// at 21, N=4–5 at 22 — and stops there, at the reduce chip's N ceiling (production N ≤ 5,
 /// `check_n_ceiling`; tier 22 would hold N ≤ 7 by cpu rows); test N=1 at 18, N=2–3 at 19, N=4–6 at
-/// 20 (by the row model; not measured). The rate-¼ profile (docs/07) moves no tier. The sets below are those rungs — three a
-/// profile, as the spec sized them.
+/// 20 (by the row model; not measured). The rate-¼ profile (docs/07) moves no tier.
+///
+/// rVM phase 4 (Merkle spans, circuits `recursion/docs/09-phase4-spans.md` §5, re-pinned with the
+/// MODQ chip at circuits `57fb9dc`) moved production one tier down again: one inner verification
+/// is 315 391 rows, so N=1 lands at **tier 19**, N=2–3 at 20 (632 175 / 948 071 rows emulated
+/// before the MODQ re-pin) and N=4–5 at 21; the reduce chip's N ≤ 5 ceiling did not move, so tier
+/// 22 admits nothing a valid production aggregate can be and is refused. Production is therefore
+/// {19, 20, 21} (docs/09 §5's recommendation). Test: N=1 and N=2 at 18, N=3 at 19, so {18, 19, 20}
+/// still covers it. The sets below are those rungs — three a profile, as the spec sized them.
 ///
 /// Nothing enforced this before (audit v3, AGG-3). `Machine::verify` accepts any tier on the
 /// ladder and builds the verifier key for whatever the proof declares *before* verifying it — so
 /// a proposer could put an invalid aggregate at an unwarmed tier in a block and every replica
 /// would pay a 30–70 s key build, on the consensus loop at block apply, before refusing it.
 ///
-/// Production is the spec's three, one tier down; test is the one the fixtures and the warm path
+/// Production is the spec's three, two tiers down (phase 2, then phase 4); test is the one the fixtures and the warm path
 /// use, plus its two neighbours for the same N=2/N=3 reason.
 pub fn admitted_tiers(profile: FriProfile) -> &'static [u8] {
     match profile {
         FriProfile::Test => &[18, 19, 20],
-        FriProfile::Production => &[20, 21, 22],
+        FriProfile::Production => &[19, 20, 21],
     }
 }
 
@@ -1250,8 +1257,23 @@ mod tests {
         );
     }
 
+    /// circuits recursion/docs/09 §5's re-vendor checklist: the node's production aggregate program
+    /// digest is the phase-4 + MODQ pin, so a stale admission list fails here instead of verifying
+    /// an old program under the new opcode 25/27 semantics. The production bundle shape is the
+    /// fixture shape at the production profile (the heights are the trace's, not the FRI
+    /// profile's), as circuits' `tests/aggregate.rs` builds it; the pin is that test's
+    /// (`dc350ecf…` pre-phase-4, `e0eede8b…` at phase 4, `8bc2cecb…` with the MODQ chip).
+    #[test]
+    fn the_production_aggregate_program_digest_is_the_phase_4_modq_pin() {
+        let (mut shape, _) = covered(0);
+        shape.profile = CoreProfile::Production;
+        let got = AggExecutor::new(FriProfile::Production).aggregate_program_digest(&shape).expect("the production shape builds");
+        let hex: String = got.iter().map(|w| format!("{w:016x}")).collect();
+        assert_eq!(hex, "8bc2cecbd30b975ec15a5e11354434bd7e1c2814d46dd0acc1d92b3ff944d8c7");
+    }
+
     /// Audit v3, AGG-3: the spec admits three rVM tiers (production {21, 22, 23} at constraint
-    /// set 8, {20, 21, 22} since the phase-2 row cuts) and nothing checked it. `Machine::verify` builds the verifier key for whatever tier the proof declares *before*
+    /// set 8, {20, 21, 22} since the phase-2 row cuts, {19, 20, 21} since rVM phase 4) and nothing checked it. `Machine::verify` builds the verifier key for whatever tier the proof declares *before*
     /// verifying the proof, so a proposer could put an invalid aggregate at an unwarmed tier in a
     /// block and every replica would pay a 30–70 s key build — on the consensus loop, at block
     /// apply — before refusing it.
@@ -1260,7 +1282,7 @@ mod tests {
         for t in admitted_tiers(FriProfile::Production) {
             assert!(check_tier(FriProfile::Production, *t).is_ok(), "tier {t} is admitted");
         }
-        for t in [8u8, 18, 19, 23, 255] {
+        for t in [8u8, 18, 22, 23, 255] {
             match check_tier(FriProfile::Production, t) {
                 Err(ConfidentialError::InvalidAggregateProof(m)) => {
                     assert!(m.contains(&t.to_string()), "the refusal names the tier: {m}")
@@ -1272,7 +1294,9 @@ mod tests {
         assert!(check_tier(FriProfile::Test, 18).is_ok());
         assert!(check_tier(FriProfile::Test, 19).is_ok());
         assert!(check_tier(FriProfile::Production, 18).is_err());
-        assert!(check_tier(FriProfile::Production, 19).is_err());
+        // rVM phase 4: production N=1 is 315 391 rows, tier 19, admitted; tier 22 no longer is.
+        assert!(check_tier(FriProfile::Production, 19).is_ok());
+        assert!(check_tier(FriProfile::Production, 22).is_err());
         assert!(check_tier(FriProfile::Test, 21).is_err());
         assert!(check_tier(FriProfile::Test, 23).is_err());
     }
@@ -1313,6 +1337,11 @@ mod tests {
     /// (`~/rand-agg-512-results/out/fixtures`; the droplet sync had brought only the logs), so the
     /// list and its digest moved once more with the notes (`5e3d7fb2…` → `3534960f…`) — data, not
     /// program: the vk digest is unchanged, as `recursion/docs/04` says of the inner machine.
+    /// Constraint set 9 (the MODQ chip, circuits `57fb9dc`, 2026-10-11) moved the inner shape and
+    /// the proof encoding: the vk digest moved for the first time since constraint set 8
+    /// (`346ee184…` → `1b0c4b00…`, circuits recursion/docs/09 §6), the fixtures were re-proved
+    /// (`scripts/recursion-fixtures.sh`), and the list and its digest moved with both
+    /// (`3534960f…` → `3753f2fd…`).
     #[test]
     fn the_admission_recompute_reproduces_the_pinned_vectors_byte_for_byte() {
         use p3_field::PrimeField64;
@@ -1328,7 +1357,7 @@ mod tests {
         // The inner vk digest, a data-independent constant of the shape.
         assert_eq!(
             hex_words(&randprotocol_rvm::shape::inner_vk_digest(&vk.shape, &vk.key)),
-            "346ee1841980e46a3501f5b04cdf40dd3208e5b1c67360285353cf7a0b735fb9",
+            "1b0c4b0043dd5d00d710f10048bfde989a955034d7fd52f1a85595a61339ddc7",
             "the pinned inner_vk_digest"
         );
         // The 118-word interface list, built the way admission builds it: from the covered
@@ -1339,7 +1368,7 @@ mod tests {
         assert_eq!(hex_words(&list), INTERFACE_LIST_HEX, "the pinned 118-word interface list");
         assert_eq!(
             hex_words(&randprotocol_rvm::public_values::public_digest(&list)),
-            "3534960f6757e6e034518a5a1926f6107c9cda7c9d5d96296b6d4ed5c3984629",
+            "3753f2fd7ba2091910f1a5eb6b722c3b55e71e7661854c058d95ed446cb186b4",
             "the pinned interface digest"
         );
     }
@@ -1352,34 +1381,34 @@ mod tests {
     /// `docs/02-aggregate.md`'s worked example: the 118-word interface list for the 3-proof
     /// test-profile fixture set, each word the canonical `u64` as 16 lowercase hex chars.
     const INTERFACE_LIST_HEX: &str = concat!(
-        "346ee1841980e46a3501f5b04cdf40dd3208e5b1c67360285353cf7a0b735fb9",
+        "1b0c4b0043dd5d00d710f10048bfde989a955034d7fd52f1a85595a61339ddc7",
         "000000000000000300000000a662000000000000a662000100000000a6620002",
         "00000000a662000300000000a662000400000000a662000500000000a6620006",
-        "00000000a66200070000000000000000000000000000000e00000000b6c9c0dc",
-        "000000009750a10a00000000c111097f00000000686c450c00000000a31856a0",
-        "00000000724c667300000000a6cf2e6a00000000c22612ba000000006f35274a",
+        "00000000a66200070000000000000000000000000000000e0000000009798e88",
+        "000000001bc1014400000000c6454ed8000000006b17834200000000f8f1a540",
+        "000000005c25de80000000007983d65e00000000841b3716000000006f35274a",
         "000000000371953700000000a8a42560000000004b291c6600000000b7c2de0e",
-        "00000000d6bf7fcf00000000182b470b00000000fb4abd6c000000001db4f72d",
-        "000000004852186000000000351c3f410000000001a6c33700000000f692eaf4",
-        "00000000fbf5508d00000000ae3d9c4d000000009d7a3bc200000000934a2759",
+        "00000000d6bf7fcf00000000182b470b00000000fb4abd6c00000000d68ddbe1",
+        "0000000012f885a60000000032d1718800000000c3bc890400000000d7286a18",
+        "0000000056171f8a00000000dc91a25d000000008f77eb5a00000000934a2759",
         "00000000d5389ac8000000002e612784000000008639ed090000000085f58a21",
         "000000004448d889000000006bb9c915000000000671dc2c0000000000004fff",
-        "0000000000000000000000000000000e00000000d89b0c4e000000000c79315f",
-        "0000000054d269dd000000002d93469600000000373d607000000000efe6b09b",
-        "00000000c8a1f6da000000008f300cc6000000006f35274a0000000003719537",
+        "0000000000000000000000000000000e000000006c3312a900000000bb1b0223",
+        "00000000d9e09f5b000000001d46c05b00000000d1be87c4000000007b76acd3",
+        "000000005e7267ff00000000c4731095000000006f35274a0000000003719537",
         "00000000a8a42560000000004b291c6600000000b7c2de0e00000000d6bf7fcf",
-        "00000000182b470b00000000fb4abd6c00000000bf4eccca00000000930235f1",
-        "0000000039c139bf000000007ffa79d900000000276ab59900000000b260698b",
-        "000000009bf06006000000008ed2b5ea00000000934a275900000000d5389ac8",
+        "00000000182b470b00000000fb4abd6c000000004b556bca00000000341d2f5f",
+        "0000000079f436080000000091f8e29c000000001ba6f2fd00000000ad68b2ba",
+        "0000000013fa3f2300000000490af7f100000000934a275900000000d5389ac8",
         "000000002e612784000000008639ed090000000085f58a21000000004448d889",
         "000000006bb9c915000000000671dc2c0000000000004fff0000000000000000",
-        "000000000000000e0000000084b7fba400000000917c878a0000000054d35f8f",
-        "00000000e901961100000000e6cb99f80000000088b794b10000000098fcab7f",
-        "00000000d61a1159000000006f35274a000000000371953700000000a8a42560",
+        "000000000000000e00000000d74313f3000000004675ac4000000000f4c1f8eb",
+        "00000000a9cf0890000000005dda21530000000043e32a4d0000000002ecb55a",
+        "000000005e6e3049000000006f35274a000000000371953700000000a8a42560",
         "000000004b291c6600000000b7c2de0e00000000d6bf7fcf00000000182b470b",
-        "00000000fb4abd6c00000000101f1f09000000001820409400000000f239b1a0",
-        "00000000d2e4449100000000db29d5cc000000000a2fab2700000000ae681b7e",
-        "00000000bdb2470100000000934a275900000000d5389ac8000000002e612784",
+        "00000000fb4abd6c00000000a6a7204c00000000dbb032c800000000e550ab3e",
+        "000000004cc1905e000000007a603b2a00000000379776a200000000c7d34ee3",
+        "000000003dc30f7b00000000934a275900000000d5389ac8000000002e612784",
         "000000008639ed090000000085f58a21000000004448d889000000006bb9c915",
         "000000000671dc2c0000000000004fff",
     );
@@ -1482,15 +1511,17 @@ mod tests {
     /// node lib suite runs without the cache; `the_test_tree_heights_are_the_cached_proofs` holds
     /// them to the cache wherever it is present.
     const TEST_LEAF: RvmHeights = RvmHeights { tier: 18, reg_log_height: 19, ram_log_height: 19, poseidon2_log_height: 14, reduce_log_height: 16 };
-    const TEST_STEP: RvmHeights = RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height: 16 };
-    const TEST_ROOT: RvmHeights = RvmHeights { tier: 19, reg_log_height: 20, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height: 17 };
+    // rVM phase 4 (circuits docs/09 §7): both steps are tier 18 and both cross 2^16 reduce rows, so
+    // the root declares S_T's header words and the fixed point is level 2 (was level 3, tier 19).
+    const TEST_STEP: RvmHeights = RvmHeights { tier: 18, reg_log_height: 19, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height: 17 };
+    const TEST_ROOT: RvmHeights = RvmHeights { tier: 18, reg_log_height: 19, ram_log_height: 20, poseidon2_log_height: 15, reduce_log_height: 17 };
 
     /// circuits `recursion/tests/pins.json`'s `tree_test` keys (`vk_leaf`, `vk_t_leaf`, `vk_int`),
     /// as canonical u64 limbs: what the rVM's own suite computes from the proved shapes.
-    const PIN_VK_LEAF: [u64; 4] = [1769152780461762224, 4754121159208375271, 16285051620565002471, 12356170513791122891];
-    const PIN_VK_T_LEAF: [u64; 4] = [7711328338169539612, 5984874271003933741, 17134834717916042633, 2542356665053237370];
-    const PIN_VK_INT: [u64; 4] = [12189568167191873679, 7035563939045772652, 12535684755110529647, 4848701472125205360];
-    const PIN_VK_FIX: [u64; 4] = [4756771443877942240, 18437901406829798119, 13732813924430148200, 10825047408558662485];
+    /// rVM phase 4 dropped `vk_fix` (the fixed point is level 2, `vk_int` itself: docs/09 §7).
+    const PIN_VK_LEAF: [u64; 4] = [8319022251449045440, 6921460171031583545, 12120586048388560564, 2237657693139026209];
+    const PIN_VK_T_LEAF: [u64; 4] = [149934054759036529, 11853972217771236064, 7974370166788545537, 4681341164698736412];
+    const PIN_VK_INT: [u64; 4] = [17974589521606301101, 12194447673073698417, 12600030651550503010, 948039196462741351];
 
     /// A tree proof from `$RECURSION_FIXTURES/tree/{name}.rvmproof` (the bare postcard rVM proof),
     /// with `fixture_proof`'s loud failure.
@@ -1622,7 +1653,8 @@ mod tests {
     /// The deferred 3a M6 and what makes a section unservable: a leaf size past the rVM's N
     /// ceiling for the shape (no leaf can be proved), a pinned reduce height that is not canonical
     /// for its program (no honest proof declares it), and a `max_depth` past the listed levels
-    /// whose last entry is not a fixed point (the test list's is not: docs/08 §5). Each refuses
+    /// whose last entry is not a fixed point (since rVM phase 4 the two-level test list's last
+    /// entry is one, docs/09 §7, so the list cut to level 1 alone stands in). Each refuses
     /// startup as `Unbuildable`, before any pin is compared.
     #[test]
     fn a_tree_section_the_rvm_cannot_serve_refuses_startup() {
@@ -1640,16 +1672,17 @@ mod tests {
         let mut t = good.clone();
         t.steps[0].heights.reduce_log_height += 1;
         refused(&t, "canonical");
-        refused(&TreeConfig { max_depth: 3, ..good.clone() }, "fixed point");
+        refused(&TreeConfig { steps: good.steps[..1].to_vec(), max_depth: 2, ..good.clone() }, "fixed point");
         refused(&TreeConfig { steps: Vec::new(), ..good.clone() }, "EmptyTreeSteps");
     }
 
-    /// The test list with its fixed point (docs/08 §5: level 3's program, `rv32t` at the root's
-    /// shape, is its own): three listed levels admit a `max_depth` past the list, the rebuilt
-    /// `vk_fix` is circuits' pin, and the startup check passes where the two-level list is
-    /// refused (`a_tree_section_the_rvm_cannot_serve_refuses_startup`).
+    /// The test list's fixed point (rVM phase 4, circuits docs/09 §7: it moved from level 3 to
+    /// level 2): `rv32t` at the root's shape is `rv32t_int` itself, so the two listed levels
+    /// admit a `max_depth` past the list, a third entry at the root's heights rebuilds level 2's
+    /// program and `vk_int` exactly, and the startup check passes. (The three-entry list and its
+    /// `vk_fix` pin are gone with the level-3 fixed point.)
     #[test]
-    fn a_listed_fixed_point_admits_a_deeper_max_depth() {
+    fn the_listed_two_levels_are_a_fixed_point_and_admit_a_deeper_max_depth() {
         use p3_field::PrimeField64;
         let ex = AggExecutor::new(FriProfile::Test);
         let mut t = test_tree_cfg();
@@ -1658,13 +1691,20 @@ mod tests {
             FriProfile::Test,
             &inner,
             rvm_heights(TEST_LEAF),
+            &[rvm_heights(TEST_STEP), rvm_heights(TEST_ROOT)],
+        )
+        .unwrap();
+        assert!(s.fixed_point(), "level 2 is the fixed point");
+        let three = randprotocol_rvm::aggregate::TreeShapes::build(
+            FriProfile::Test,
+            &inner,
+            rvm_heights(TEST_LEAF),
             &[rvm_heights(TEST_STEP), rvm_heights(TEST_ROOT), rvm_heights(TEST_ROOT)],
         )
         .unwrap();
-        assert!(s.fixed_point(), "the third entry is the fixed point");
         let u = |d: [randprotocol_rvm::isa::F; 4]| d.map(|f| f.as_canonical_u64());
-        t.steps.push(TreeStepPin { heights: TEST_ROOT, program_digest: u(s.steps[2].program.digest()), key: u(s.keys().step_keys[2]) });
-        assert_eq!(t.steps[2].key, PIN_VK_FIX, "vk_fix, circuits' pin");
+        assert_eq!(u(three.steps[2].program.digest()), u(s.steps[1].program.digest()), "level 3 repeats level 2's program");
+        assert_eq!(u(three.keys().step_keys[2]), PIN_VK_INT, "and its key is vk_int");
         t.max_depth = 5;
         check_tree_pins(&ex, &t).expect("a fixed point past the list serves every deeper level");
     }

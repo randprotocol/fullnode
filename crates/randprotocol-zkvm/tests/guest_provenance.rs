@@ -109,7 +109,7 @@ fn the_manifest_covers_every_vendored_file_and_nothing_else() {
 #[test]
 fn each_circuits_pin_names_the_manifest_digest() {
     let manifest = manifest();
-    for guest in ["fib", "keccak256", "evm", "sbpf"] {
+    for guest in ["fib", "keccak256", "evm", "sbpf", "dilithium-verify", "msauth"] {
         let bin = format!("bin/{guest}.bin");
         let want = &manifest.iter().find(|(_, p)| *p == bin).unwrap_or_else(|| panic!("{bin} not in SHA256SUMS")).0;
         let pin = std::fs::read_to_string(dir().join(format!("{bin}.sha256"))).unwrap();
@@ -322,4 +322,30 @@ fn the_cuda_backend_is_one_git_revision_in_both_manifests() {
     assert!(zkvm.contains("git = \"https://github.com/randprotocol/zkp-circuits\""), "{zkvm}");
     assert!(zkvm.contains("optional = true"), "{zkvm}");
     assert!(!zkvm.contains("path ="), "a path dependency outside the repository again: {zkvm}");
+}
+
+/// Private multisig phase 4: the re-vendor brought the MODQ chip (syscall 8, `MODQ_GAS`), the
+/// `msauth` host model and the compiled `msauth` guest, and the guest is in the manifest.
+#[test]
+fn the_msauth_guest_and_the_modq_chip_are_vendored() {
+    let manifest = manifest();
+    for path in ["bin/msauth.bin", "bin/msauth.bin.sha256", "bin/dilithium-verify.bin", "bin/dilithium-verify.bin.sha256"] {
+        assert!(manifest.iter().any(|(_, p)| p == path), "{path} is not in SHA256SUMS");
+    }
+    assert_eq!(randprotocol_zkvm::isa::SYS_MODQ, 8);
+    assert_eq!(randprotocol_zkvm::gas::MODQ_GAS, 168);
+    assert_eq!(randprotocol_zkvm::msauth::MSAUTH_WORDS, 17 + randprotocol_zkvm::msauth::M_MAX * 967);
+    assert!(!randprotocol_zkvm::guests::compiled::msauth().words.is_empty());
+    // Its tags are node-local and sit beside auth.rs's: AUTH is the same 65.
+    assert_eq!(randprotocol_zkvm::msauth::AUTH, randprotocol_zkvm::auth::AUTH_DOMAIN);
+}
+
+/// No guest program moved: every digest pin above is unchanged by the MODQ re-vendor (only
+/// verifier keys moved), and the msauth guest is none of them.
+#[test]
+fn the_modq_re_vendor_moved_no_guest_program() {
+    let msauth = randprotocol_zkvm::guests::compiled::msauth().digest();
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_auth()), "1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1");
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), "60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce");
+    assert!(!ZkExecutor::known_hc_bundles().contains(&msauth) && msauth != ZkExecutor::hc_auth());
 }

@@ -13,7 +13,7 @@ const HEAP: i32 = 0x1000; // data lives above the code
 /// opposed to every other guest in this module, which is written directly against `asm.rs`'s
 /// mnemonic helpers. Mirrors upstream `research/src/guests.rs`'s `compiled` module exactly,
 /// except the `include_bytes!` path: `guests-compiled/` sits directly under this crate root
-/// (`crates/randprotocol-zkvm/guests-compiled/bin/{fib,keccak256,evm,sbpf}.bin`, vendored by
+/// (`crates/randprotocol-zkvm/guests-compiled/bin/{fib,keccak256,evm,sbpf,dilithium-verify,msauth}.bin`, vendored by
 /// `deploy/sync-zkvm.sh`'s copy step), one level shallower than upstream's
 /// `research/../guests-compiled/`.
 pub mod compiled {
@@ -79,6 +79,25 @@ pub mod compiled {
     pub fn sbpf() -> Program {
         const BIN: &[u8] = include_bytes!("../guests-compiled/bin/sbpf.bin");
         Program::from_flat_image(BIN).expect("sbpf.bin is a committed, known-good build")
+    }
+
+    /// `guests-compiled/dilithium-verify`: Dilithium2 verification (`dilithium-core::verify`) with
+    /// every Keccak-f permutation on the `KECCAK` syscall. Input words `0..328` pk, `328..933` sig,
+    /// `933` message byte length (`<= 64`), `934..` message; output slot 0 is 1 iff valid. An image
+    /// container (the NTT table is `.rodata`). The phase-1 measurement of the private multisig.
+    pub fn dilithium_verify() -> Program {
+        const BIN: &[u8] = include_bytes!("../guests-compiled/bin/dilithium-verify.bin");
+        Program::from_flat_image(BIN).expect("dilithium-verify.bin is a committed, known-good build")
+    }
+
+    /// The private-multisig auth guest (circuits `guests-compiled/msauth`, built by `rand-guest`),
+    /// an image container vendored as `guests-compiled/bin/msauth.bin`. M-of-N Dilithium2 over the
+    /// transaction binding (`crate::msauth`'s layout; private input `msauth_inputs`, public input
+    /// `0..8` the binding); publishes `c = H(AUTH, nk ‖ salt)` or the panic sentinel (output slot 7
+    /// `0xdead_beef`).
+    pub fn msauth() -> Program {
+        const BIN: &[u8] = include_bytes!("../guests-compiled/bin/msauth.bin");
+        Program::from_flat_image(BIN).expect("msauth.bin is a committed, known-good build")
     }
 }
 

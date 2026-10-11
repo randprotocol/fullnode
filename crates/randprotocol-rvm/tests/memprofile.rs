@@ -73,14 +73,16 @@ fn tier8_toy() {
 }
 
 /// Threads (Task 6): a synthetic tier-16 program — 1 250 rounds of 16 hinted words stored and
-/// sponged (5 000 `SPONGE` absorbs; 63 762 rows, tier 16) — proved once and verified; prints the
+/// sponged (5 000 `SPONGE` absorbs; 60 012 rows, tier 16) — proved once and verified; prints the
 /// prove wall time and the peak live heap. Run it three ways (`docs/04-phase2-row-cuts.md`
 /// §"Threads"): without the feature (the baseline), then
 /// `RAYON_NUM_THREADS=1` and `=16 cargo test --release --features parallel --test memprofile
 /// tier16 -- --ignored --nocapture`. 2 000 rounds is 102 012 rows, past tier 16 (no tier 17 rung):
 /// the program is emulated and its tier asserted before anything is proved, so a row drift fails
 /// in seconds instead of starting a tier-18 proof. Measured 2026-10-04 on the 48 GB box: off
-/// 170.6 s, `RAYON_NUM_THREADS=1` 171.1 s, `=16` 36.4 s; peak live 9.09 GB all three.
+/// 170.6 s, `RAYON_NUM_THREADS=1` 171.1 s, `=16` 36.4 s; peak live 9.09 GB all three. Phase 4
+/// (2026-10-09, the Merkle spans) re-recorded it: 63 762 → 60 012 rows, still tier 16 (B′'s
+/// immediate `SPONGE` source and re-homing; `docs/09-phase4-spans.md` §4).
 #[test]
 #[ignore = "the thread benchmark: ~1-3 min; RAYON_NUM_THREADS=1 then 16, --features parallel"]
 fn tier16_synthetic_threads() {
@@ -127,9 +129,11 @@ fn tier16_synthetic_threads() {
 /// table 2^20 → 2^19), and **26.88 GB at the phase's end** (169 366 rows, prove 141.3 s, verify
 /// 6.67 s, 268 168 B; 2026-10-06, `docs/measurements/2026-10-06-tier18-twin-memprofile-phase3.log`)
 /// — fewer cpu rows, but the reduce chip is 81 columns wide (was 30) and carries the fold and pow
-/// runs. The name is kept for the record it produced.
+/// runs. The name is kept for the record it produced. Phase 4 (2026-10-09, the Merkle spans)
+/// re-recorded it: 169 366 → 104 150 rows, still tier 18 (`TIERS` has no 17 rung; not re-profiled).
+/// MODQ chip (2026-10-11, private multisig phase 3): the inner cpu gained SYS_MODQ: 104 150 → 104 229 rows (emulated by `tests/profile.rs`), still tier 18.
 #[test]
-#[ignore = "one exit-twin rVM proof under the heap profiler (tier 18 since phase 2): proved on this 48 GB box at 26.88 GB live, 2026-10-06, at phase 3's end (33.27 GB at the quotient-layout fork, 2026-10-05; 78.7 GB live when killed at tier 19 before it); ~2.5 min on 16 threads with --features parallel"]
+#[ignore = "one exit-twin rVM proof under the heap profiler (tier 18 since phase 2; 104 229 rows since the MODQ chip, 104 150 after phase 4): proved on this 48 GB box at 26.88 GB live, 2026-10-06, at phase 3's end (33.27 GB at the quotient-layout fork, 2026-10-05; 78.7 GB live when killed at tier 19 before it); ~2.5 min on 16 threads with --features parallel"]
 fn tier19_exit_twin() {
     use randprotocol_zkvm::machine::FriProfile;
     use randprotocol_rvm::dsl::Checkpoints;

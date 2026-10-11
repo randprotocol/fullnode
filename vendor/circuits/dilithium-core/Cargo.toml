@@ -1,0 +1,12 @@
+[package]
+name = "dilithium-core"
+version = "0.1.0"
+edition = "2021"
+description = "no_std Dilithium2 verifier core for the Rand zkVM's multisig guest; Keccak is abstracted so the guest can use the KECCAK syscall"
+license = "GPL-3.0-only"
+
+[dependencies]
+
+# Its own workspace root, like guests-compiled/evm-core: research/ depends on it by path, the
+# guest crate will too. Never swept into research's `cargo test`/`cargo build`.
+[workspace]

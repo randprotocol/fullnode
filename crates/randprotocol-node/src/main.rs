@@ -4722,7 +4722,7 @@ mod tests {
                 .expect_err(&format!("this build must refuse chain {chain} at run"))
                 .to_string();
             assert!(refused.contains(why) && refused.contains(&format!("chain {chain}")), "{refused}");
-            assert!(refused.contains("constraint set 8"), "names this build's set: {refused}");
+            assert!(refused.contains("constraint set 9"), "names this build's set: {refused}");
             let at_verify = node::refuse_chains_this_build_cannot_run(&state)
                 .expect_err(&format!("this build must refuse chain {chain} at verify"))
                 .to_string();
@@ -4736,7 +4736,7 @@ mod tests {
     /// blocks), chain 16's 26 validators, its bridge state (set 1, burn sequence 7, the replay
     /// floors at the snapshot's next sequences) and its zUSD, plus the RAND the operator's wallets
     /// held. `deploy/genesis-chain17.json` is committed and its hash is pinned in
-    /// `node::CHAINS_THIS_BUILD_CANNOT_RUN`: this build is constraint set 8 (the gas meter) and
+    /// `node::CHAINS_THIS_BUILD_CANNOT_RUN`: this build is constraint set 9 (the MODQ chip) and
     /// refuses to run chain 17 — it verifies none of its cs7 proofs — but still names its exact
     /// genesis hash there, so the hash assertion below reads it from that one place (chain 16's
     /// test, the same way since v0.6.3).
@@ -4767,17 +4767,17 @@ mod tests {
         assert_eq!(state.ledger.hc_auth(), Some(ZkExecutor::hc_auth()), "the ledger enforces split authorisation");
         assert!(state.ledger.gas().is_none(), "chain 17 has no gas section");
         let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles())
-            .expect_err("a constraint-set-8 build must refuse chain 17")
+            .expect_err("a constraint-set-9 build must refuse chain 17")
             .to_string();
-        assert!(refused.contains("chain 17") && refused.contains("constraint set 7") && refused.contains("constraint set 8"), "{refused}");
+        assert!(refused.contains("chain 17") && refused.contains("constraint set 7") && refused.contains("constraint set 9"), "{refused}");
     }
 
     /// The committed chain-18 genesis (LIVE 2026-09-29 04:56 UTC, cut by `deploy/cut-chain18-genesis.sh`
     /// from chain 17 at height 5 604 on the v0.6.7-rc1 build) builds chain 18: the hash the fleet runs,
     /// the gas section (Phase 1 prices 100/800, the bundle pin, the Phase 2 controller), the memo on,
-    /// and this build accepts it — the counterpart of the chain-17 test above.
+    /// and — since constraint set 9 (the MODQ chip) — this build refuses it, by its listed hash.
     #[test]
-    fn chain_18s_genesis_file_builds_chain_18() {
+    fn chain_18s_genesis_file_is_refused_by_this_build() {
         let chain_18_hash = "a7cb020cc99a33c83fc38cfa0ec1db357f67fbf8b6dab13ab1d9812280b4da76";
         let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain18.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(committed).unwrap()).unwrap();
@@ -4808,17 +4808,22 @@ mod tests {
         assert_eq!(state.hash().to_hex(), chain_18_hash, "chain 18's live genesis");
         assert!(state.ledger.gas().is_some(), "the ledger prices calls and pins the bundle limit");
         assert_eq!(state.ledger.envelope_bytes(), Some(1860));
-        node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 18");
+        let (_, hash, _) = node::CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(c, _, _)| *c == 18).expect("listed");
+        assert_eq!(state.hash().to_hex(), *hash, "the listed hash is the committed file's");
+        let e = node::refuse_chains_this_build_cannot_run(&state).unwrap_err().to_string();
+        assert!(e.contains("constraint set 8"), "{e}");
+        let at_run = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect_err("this build refuses chain 18 at run").to_string();
+        assert_eq!(at_run, e, "run and verify give the same reason");
     }
 
     /// Chain 19, live 2026-10-01 03:43 UTC: a pure re-genesis of chain 18 on v0.6.7 (the
-    /// redeployed bridge endpoints as its emitters). This build must still compute its hash and
-    /// run it: none of the audit-v6 genesis fields (`testnet`, `binding_domain`, `bridge.rotation`,
+    /// redeployed bridge endpoints as its emitters). This build must still compute its hash, and
+    /// refuses it (constraint set 8's proofs; this build is set 9): none of the audit-v6 genesis fields (`testnet`, `binding_domain`, `bridge.rotation`,
     /// `proof_window_blocks`, the staking and vesting additions) is in its file, and it carries a
     /// faucet beside a bridge without the `testnet` marker, so its id is grandfathered
     /// (`FAUCET_BESIDE_BRIDGE_CHAIN_IDS`).
     #[test]
-    fn chain_19s_genesis_file_builds_chain_19() {
+    fn chain_19s_genesis_file_is_refused_by_this_build() {
         let chain_19_hash = "a3defc937d561d4beb1df9a08c9cb87a3dc32dadbfc2d1814ab6f627b0a2228a";
         let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain19.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(committed).unwrap()).unwrap();
@@ -4830,13 +4835,19 @@ mod tests {
         let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
         let state = gen.build(executor.as_ref()).unwrap();
         assert_eq!(state.hash().to_hex(), chain_19_hash, "chain 19's live genesis");
-        node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 19");
+        let (_, hash, _) = node::CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(c, _, _)| *c == 19).expect("listed");
+        assert_eq!(state.hash().to_hex(), *hash, "the listed hash is the committed file's");
+        let e = node::refuse_chains_this_build_cannot_run(&state).unwrap_err().to_string();
+        assert!(e.contains("constraint set 8"), "{e}");
+        let at_run = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect_err("this build refuses chain 19 at run").to_string();
+        assert_eq!(at_run, e, "run and verify give the same reason");
     }
 
     /// Chain 20, live 2026-10-01 06:17 UTC on v0.6.8: chain 19's shape plus every audit-v6 genesis
-    /// field at its recommended value, RPL-2's `program_state` and the zUSD bridge fees.
+    /// field at its recommended value, RPL-2's `program_state` and the zUSD bridge fees. Refused by
+    /// this build (constraint set 9), by its listed hash.
     #[test]
-    fn chain_20s_genesis_file_builds_chain_20() {
+    fn chain_20s_genesis_file_is_refused_by_this_build() {
         let chain_20_hash = "6210cf071a390d7ac61d8cbea5dd9d139d1a493a862b54a45a498f36af2d5135";
         let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/genesis-chain20.json");
         let gen = Genesis::from_json(&std::fs::read_to_string(committed).unwrap()).unwrap();
@@ -4849,10 +4860,15 @@ mod tests {
         let executor = node::executor_for_profile(&gen.fri_profile).unwrap();
         let state = gen.build(executor.as_ref()).unwrap();
         assert_eq!(state.hash().to_hex(), chain_20_hash, "chain 20's live genesis");
-        node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect("this build runs chain 20");
+        let (_, hash, _) = node::CHAINS_THIS_BUILD_CANNOT_RUN.iter().find(|(c, _, _)| *c == 20).expect("listed");
+        assert_eq!(state.hash().to_hex(), *hash, "the listed hash is the committed file's");
+        let e = node::refuse_chains_this_build_cannot_run(&state).unwrap_err().to_string();
+        assert!(e.contains("constraint set 8"), "{e}");
+        let at_run = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).expect_err("this build refuses chain 20 at run").to_string();
+        assert_eq!(at_run, e, "run and verify give the same reason");
     }
 
-    /// This build is constraint set 8 (the gas meter, chain 18): every verifier key moved again, so
+    /// This build is constraint set 9 (the MODQ chip; set 8, the gas meter, ran chains 18-20): every verifier key moved again, so
     /// no proof chain 16 (constraint set 7, v0.6.1) committed verifies here. Chain 16 pins the v2
     /// guest, which this build still carries, so the `hc_bundle` check alone would let this binary
     /// start on chain 16 — and its startup replay (or a `verify --repair`) would then refuse, and
@@ -4865,10 +4881,10 @@ mod tests {
         let state = gen.build(executor.as_ref()).unwrap();
         assert_eq!(state.hash().to_hex(), "20925ae63cfa6e6c96f3ff369486ead8ea04821fec026a55df9e2893f3d53005");
         let refused = node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles())
-            .expect_err("a constraint-set-8 build must refuse chain 16")
+            .expect_err("a constraint-set-9 build must refuse chain 16")
             .to_string();
         assert!(
-            refused.contains("chain 16") && refused.contains("constraint set 7") && refused.contains("constraint set 8"),
+            refused.contains("chain 16") && refused.contains("constraint set 7") && refused.contains("constraint set 9"),
             "{refused}"
         );
         assert!(refused.contains("archive"), "the message names the archive risk: {refused}");

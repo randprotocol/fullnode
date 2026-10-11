@@ -1146,3 +1146,45 @@ fn public_table_rows_are_committed_words_with_their_read_counts() {
     assert_eq!(public::public_log_height(128), 8);
     assert_eq!(public::public_log_height(1000), 10);
 }
+
+/// Private multisig phase 3 (Task 4): the modq chip's degrees, measured on the real instance the
+/// way `alu_max_constraint_degree_is_pinned` measures sha256's. The AIR's own rules are degree 3
+/// (rule 2's `IS_DOT·W·V`, `IS_MSUB·W·V`, `IS_INTT·ZI·U` and rule 4's gated transitions); the
+/// packed `MEMORY`/`MODQ`/`MODQ_WIRE`/`RANGE8` fraction-pins add the fourth, and 4 costs nothing
+/// over 3 (`log_quotient = 2` for both, as sha256). In the ten-chip shape `[…, input, modq,
+/// public]` the modq instance is second to last.
+#[test]
+fn modq_max_constraint_degree_is_pinned() {
+    use randprotocol_zkvm::machine::{max_constraint_degrees_with_modq, Tier};
+    let d = max_constraint_degrees_with_modq(Tier(10), 7, 7, 0, 0, 10, 7, 12);
+    assert_eq!(d.len(), 10, "nine mandatory chips plus modq");
+    let modq = d[d.len() - 2];
+    assert!(modq <= 4, "modq instance degree {modq}: rule degree 3 plus LogUp count degree, log_quotient 2");
+    assert_eq!(modq, 4, "modq table max constraint degree, packed lookups included");
+    // The shared tables do not move when modq joins the batch (only the instance count does).
+    let bare = randprotocol_zkvm::machine::max_constraint_degrees(Tier(10), 7, 7, 0, 0, 7, 12);
+    assert_eq!(bare[..8], d[..8]);
+    assert_eq!(bare[8], d[9], "the public table's degree does not depend on modq");
+    {
+        use p3_air::symbolic::AirLayout;
+        use p3_batch_stark::symbolic::get_max_constraint_degree;
+        use randprotocol_zkvm::machine::{Challenge, Chip, Machine};
+        use randprotocol_zkvm::tables::modq::{self, ModqAir};
+        let height = 1usize << modq::MIN_LOG_HEIGHT;
+        let chip = Chip::Modq(ModqAir, height);
+        let air_only = get_max_constraint_degree::<F, Challenge, Chip, _>(
+            &chip,
+            AirLayout::from_air::<F>(&chip),
+            height,
+            &[],
+            &p3_lookup::LogUpGadget::new(),
+        );
+        assert_eq!(air_only, 3, "modq table max constraint degree, AIR rules alone");
+        let m = Machine::new(FriProfile::Test);
+        let common = m.verifier_key_with_modq(Tier(10), 7, 7, 0, 0, modq::MIN_LOG_HEIGHT, 7);
+        assert_eq!(common.lookups.len(), 10);
+        // Task 3 measured 15 groups on the bare `ModqAir` (no blind); as a `Chip` the LogUp blind's
+        // `BLIND` pair is one more group on a bus of its own, as for sha256 (7 → 8): 16.
+        assert_eq!(common.lookups[8].len(), 16, "modq packed lookup groups, the blind's included");
+    }
+}

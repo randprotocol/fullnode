@@ -719,14 +719,14 @@ fn the_genesis_command_writes_an_aggregation_tree_section_it_checks_first() {
             "leaf_size": 1,
             "max_depth": 2,
             "leaf": { "tier": 18, "reg_log_height": 19, "ram_log_height": 19, "poseidon2_log_height": 14, "reduce_log_height": 16 },
-            "vk_leaf": [1769152780461762224u64, 4754121159208375271u64, 16285051620565002471u64, 12356170513791122891u64],
+            "vk_leaf": [8319022251449045440u64, 6921460171031583545u64, 12120586048388560564u64, 2237657693139026209u64],
             "steps": [
-                { "heights": { "tier": 19, "reg_log_height": 20, "ram_log_height": 20, "poseidon2_log_height": 15, "reduce_log_height": 16 },
-                  "program_digest": limbs("2c586636c4c0f94cdf13b410154679d995eefad11e27371e0786e89e206ccd34"),
-                  "key": [7711328338169539612u64, 5984874271003933741u64, 17134834717916042633u64, 2542356665053237370u64] },
-                { "heights": { "tier": 19, "reg_log_height": 20, "ram_log_height": 20, "poseidon2_log_height": 15, "reduce_log_height": 17 },
-                  "program_digest": limbs("04b1677122526e51c0d278375b0c30ebd37f94ba8a2afed3cd3e019ecdc3c226"),
-                  "key": [12189568167191873679u64, 7035563939045772652u64, 12535684755110529647u64, 4848701472125205360u64] }
+                { "heights": { "tier": 18, "reg_log_height": 19, "ram_log_height": 20, "poseidon2_log_height": 15, "reduce_log_height": 17 },
+                  "program_digest": limbs("d8d558eecb8fbdaaba7eaa93d7d04bae0a47808f31978ecea804f04f7e6e5d93"),
+                  "key": [149934054759036529u64, 11853972217771236064u64, 7974370166788545537u64, 4681341164698736412u64] },
+                { "heights": { "tier": 18, "reg_log_height": 19, "ram_log_height": 20, "poseidon2_log_height": 15, "reduce_log_height": 17 },
+                  "program_digest": limbs("a222637e1eb9333b16b820bbacceaac9ea0e5d4cebfc5379d170796a2ac6dc62"),
+                  "key": [17974589521606301101u64, 12194447673073698417u64, 12600030651550503010u64, 948039196462741351u64] }
             ]
         });
         edit(&mut v);
@@ -750,7 +750,9 @@ fn the_genesis_command_writes_an_aggregation_tree_section_it_checks_first() {
         (&(|v: &mut serde_json::Value| v["leaf_size"] = 6.into()) as &dyn Fn(&mut serde_json::Value), "leaf_size"),
         (&|v: &mut serde_json::Value| v["steps"][1]["key"][0] = 1.into(), "tree level 3"),
         (&|v: &mut serde_json::Value| v["steps"][0]["program_digest"][0] = 1.into(), "aggregate program"),
-        (&|v: &mut serde_json::Value| v["max_depth"] = 3.into(), "fixed point"),
+        // rVM phase 4 (circuits docs/09 §7): level 2 is a fixed point, so a deeper max_depth over
+        // both levels is servable; level 1 alone is not one.
+        (&|v: &mut serde_json::Value| { v["steps"].as_array_mut().unwrap().truncate(1) }, "fixed point"),
     ] {
         let refused = dir.path().join("refused.json");
         let run = run(&refused, &section(edit));
