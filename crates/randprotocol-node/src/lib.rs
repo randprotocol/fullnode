@@ -15,5 +15,6 @@ pub mod node;
 pub mod peer_bindings;
 pub mod rpc;
 pub mod storage;
+pub mod verify_cache;
 pub mod viewing;
 pub mod ws;

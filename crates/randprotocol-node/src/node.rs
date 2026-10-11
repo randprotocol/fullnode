@@ -2376,6 +2376,10 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     }
     let key = Keypair::from_seed(cfg.seed).context("bad key seed")?;
     let (gs, executor) = load_genesis(&cfg.datadir)?;
+    // Every verifier the node runs, on every path, through one digest-keyed cache
+    // (docs/compute-optimization.md §3.3): admission fills it, apply reads it.
+    let bare_executor = executor.clone();
+    let executor: Arc<dyn ConfidentialExecutor> = Arc::new(crate::verify_cache::CachingExecutor::new(executor));
     check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles())?;
     // Before RocksDB opens its ~1000 table files (issue #41): a node started under the default
     // soft limit of 1024 ran out of descriptors and its RPC refused every connection.
@@ -2416,7 +2420,9 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     storage.init_genesis(&gs)?;
     refuse_a_halted_store(&storage)?;
     // The stored ledger a walk loaded goes to `resume_consensus_from` below: one load per startup.
-    let StartupCheck { stored, verify: startup_verify, .. } = startup_check(&storage, &gs, cfg.verify, executor.as_ref())?;
+    // The walk takes the bare executor: a replay would only fill the cache with history no later
+    // lookup hits.
+    let StartupCheck { stored, verify: startup_verify, .. } = startup_check(&storage, &gs, cfg.verify, bare_executor.as_ref())?;
 
     // "Is a validator" is "has a signer", not "is in the genesis set" (spec §8): a validator that
     // bonds in after genesis must already hold its key when its first epoch arrives, and a node

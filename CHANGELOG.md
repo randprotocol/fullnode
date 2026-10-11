@@ -29,6 +29,10 @@ carries a node-only wire change (compact blocks) and the consensus rules a new c
 - **Startup checkpoint** (node-only): a restart of the same clean build skips the startup chain
   walk (`verified_head` META row, bound to the build sha); `--verify-chain replay` forces it. The
   first start of v0.8.0 itself still runs the full check.
+- **Verify cache** (node-only): `rand-node run` remembers the `Ok` verdict of each STARK verifier
+  under a digest of all its inputs (16 384 entries, FIFO), so an aggregate admission has seen is
+  verified once per node, not three times on the leader and twice on a follower. CLI tools are
+  unchanged.
 - **Chain 21 and later, by genesis section:** `fees` (`burn_base`, `burn_floor`,
   `subsidy_net_of_fees`, `proposer_share_bps`, `prove_base`, `usd_subsidy`), `perps` (RPL-3),
   `multisig`, `aggregation_tree`, and the `incremental_nullifier_root` flag (the hot path's
