@@ -1333,6 +1333,8 @@ struct Node {
     /// most [`WAITING_BLOCKS`] in all: released through [`Node::take_proposals`] once the parent
     /// has been delivered, whatever the replica made of it.
     waiting: HashMap<Hash, Vec<Block>>,
+    /// The hashes of the blocks in `waiting`, so [`Node::applying`] is a lookup.
+    waiting_hashes: HashSet<Hash>,
     /// [`NodeConfig::apply_inline`]: deliver every proposal straight to the replica, on the loop.
     apply_inline: bool,
 }
@@ -2757,6 +2759,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         applied_tx,
         in_flight: HashSet::new(),
         waiting: HashMap::new(),
+        waiting_hashes: HashSet::new(),
         apply_inline,
     };
     // A fatal error in the loop ends the node, but most embedders (every cluster test, and any
@@ -3922,7 +3925,7 @@ impl Node {
             if self.route_proposal(block).await? {
                 // Its children's parent is in the tree now, or will never be: either way they
                 // no longer wait.
-                queue.extend(self.waiting.remove(&hash).unwrap_or_default());
+                queue.extend(self.release(&hash));
             }
         }
         Ok(())
@@ -3937,26 +3940,41 @@ impl Node {
         }
         // A block the replica holds goes straight to it, which drops it at once, as before.
         if !self.hs.has_block(&hash) {
-            let parent = block.parent();
-            if self.hs.ledger_after(&parent).is_none() {
-                if self.applying(&parent) && self.waiting_len() < WAITING_BLOCKS {
-                    tracing::debug!("proposal {hash:?} waits for its parent {parent:?}, being applied");
-                    self.waiting.entry(parent).or_default().push(block);
-                    return Ok(false);
-                }
-            } else if self.in_flight.len() < OFFLOOP_APPLIES {
-                match self.hs.covered_sidecar(&block) {
+            // The replica's own pre-execute refusals first, reading only: a block one of them
+            // refuses is delivered on the loop, where it is refused (or orphaned) exactly as
+            // before. So no such block costs a worker's apply, and a block that shares an honest
+            // block's hash without being it — a forged signature, GOSSIP-2's repeated tail —
+            // never takes the honest block's place in flight or waiting.
+            match self.hs.precheck_proposal(&block) {
+                Ok(()) if self.in_flight.len() < OFFLOOP_APPLIES => match self.hs.covered_sidecar(&block) {
                     Ok(sidecar) => {
                         self.spawn_apply(block, sidecar);
                         return Ok(false);
                     }
                     // The replica refuses it the same way, on the loop.
                     Err(e) => tracing::debug!("proposal {hash:?}: no sidecar for an off-loop apply ({e}); delivered"),
+                },
+                Err(ConsensusError::UnknownParent(parent)) if self.applying(&parent) && self.waiting_hashes.len() < WAITING_BLOCKS => {
+                    tracing::debug!("proposal {hash:?} waits for its parent {parent:?}, being applied");
+                    self.waiting_hashes.insert(hash);
+                    self.waiting.entry(parent).or_default().push(block);
+                    return Ok(false);
                 }
+                // Over a cap, or refused: on the loop, as before.
+                _ => {}
             }
         }
         self.deliver(ConsensusMessage::Proposal(block)).await?;
         Ok(true)
+    }
+
+    /// Take the proposals waiting behind `parent` out of `waiting`.
+    fn release(&mut self, parent: &Hash) -> Vec<Block> {
+        let children = self.waiting.remove(parent).unwrap_or_default();
+        for c in &children {
+            self.waiting_hashes.remove(&c.hash());
+        }
+        children
     }
 
     /// Apply `block` on a blocking worker (§4.1): a clone of its parent's post-state, taken
@@ -4004,23 +4022,19 @@ impl Node {
             None => self.hs.on_message(ConsensusMessage::Proposal(block), now_ms()),
         };
         self.after_consensus(true, result).await?;
-        let children = self.waiting.remove(&hash).unwrap_or_default();
+        let children = self.release(&hash);
         self.take_proposals(children).await
     }
 
     /// Whether `h` is a proposal on its way to the replica: applying on a worker, or waiting
     /// for its parent's apply. Counted as held by dedupe and by every by-hash fetch (§4.3).
     fn applying(&self, h: &Hash) -> bool {
-        self.in_flight.contains(h) || self.waiting.values().flatten().any(|b| b.hash() == *h)
+        self.in_flight.contains(h) || self.waiting_hashes.contains(h)
     }
 
     /// The replica holds `h`, or it is on its way there ([`Node::applying`]).
     fn holds_block(&self, h: &Hash) -> bool {
         self.hs.has_block(h) || self.applying(h)
-    }
-
-    fn waiting_len(&self) -> usize {
-        self.waiting.values().map(Vec::len).sum()
     }
 
     fn serve_sync(&mut self, req: SyncRequest) -> SyncResponse {
@@ -4607,13 +4621,23 @@ impl Node {
         response: SyncResponse,
     ) -> Result<()> {
         match response {
-            SyncResponse::Block(Some(b)) => {
-                if let Some((h, _)) = self.fetch_inflight.remove(&request_id) {
-                    self.fetch_attempts.remove(&h);
-                    self.fetch_deferred_since.remove(&h);
+            SyncResponse::Block(Some(b)) => match self.fetch_inflight.get(&request_id).map(|(h, _)| *h) {
+                // An answer to a by-hash fetch is the block asked for or nothing: any other is
+                // dropped, and the next peer asked, as for `Block(None)` (off-loop apply fix
+                // round 1).
+                Some(h) if b.hash() != h => {
+                    tracing::debug!("peer {peer} answered the fetch of {h:?} with another block, {:?}; dropped", b.hash());
+                    self.retry_fetch(request_id).await?;
                 }
-                self.on_consensus(ConsensusMessage::Proposal(b)).await?;
-            }
+                asked => {
+                    if let Some(h) = asked {
+                        self.fetch_inflight.remove(&request_id);
+                        self.fetch_attempts.remove(&h);
+                        self.fetch_deferred_since.remove(&h);
+                    }
+                    self.on_consensus(ConsensusMessage::Proposal(b)).await?;
+                }
+            },
             SyncResponse::Transactions(txs) => self.on_transactions_response(peer, request_id, txs).await?,
             SyncResponse::Block(None) => {
                 tracing::debug!("peer {peer} does not have a requested block; trying another");
@@ -7238,6 +7262,7 @@ mod tests {
             applied_tx,
             in_flight: HashSet::new(),
             waiting: HashMap::new(),
+            waiting_hashes: HashSet::new(),
             apply_inline: false,
         };
         (node, seen_rx, applied_rx)
@@ -11000,7 +11025,7 @@ mod tests {
         let orphan = block_on(&bad, &after_n, &key(1), v + 1, vec![next_tx(&after_n, 2)]);
         node.on_consensus(ConsensusMessage::Proposal(bad.clone())).await.unwrap();
         node.on_consensus(ConsensusMessage::Proposal(orphan.clone())).await.unwrap();
-        assert_eq!(node.waiting_len(), 1);
+        assert_eq!(node.waiting_hashes.len(), 1);
         assert_eq!(complete(&mut node, &mut applied).await, bad.hash());
         assert!(!node.hs.has_block(&bad.hash()), "refused");
         assert!(node.waiting.is_empty() && node.in_flight.is_empty(), "nothing left waiting or in flight");
@@ -11124,5 +11149,152 @@ mod tests {
         assert!(node.in_flight.is_empty() && node.waiting.is_empty());
         tokio::task::yield_now().await;
         assert!(applied.try_recv().is_err(), "nothing was applied off the loop");
+    }
+
+    /// Off-loop apply fix round 1 (I1): a block that shares the honest proposal's hash without
+    /// being it — the GOSSIP-2 repeated tail, or the header under a forged signature — arrives
+    /// first, by a by-hash fetch. The replica's precheck refuses it before any worker sees it, so
+    /// it takes no slot, and the honest copy arriving on gossip after it is applied off the loop,
+    /// inserted and voted for. A fetch answered with some other block is dropped.
+    #[tokio::test]
+    async fn a_variant_under_the_honest_hash_does_not_take_its_place() {
+        for variant in ["repeated tail", "forged signature"] {
+            let (_d, storage, gs, hs) = replica_past_a_boundary();
+            let head = storage.head_block().unwrap();
+            let (mut node, mut seen, mut applied) = bare_node_full(storage, gs, hs, true);
+            let peer = claiming_peer(&mut node, 3);
+            let ledger = node.hs.tip_ledger().clone();
+            let txs: Vec<Transaction> = (1..=3).map(|i| next_tx(&ledger, i)).collect();
+            let honest = block_on(&head, &ledger, &key(1), node.hs.view(), txs.clone());
+            let mut bad = honest.clone();
+            match variant {
+                "repeated tail" => bad.transactions.push(txs[2].clone()),
+                _ => bad.signature = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), honest.header.clone(), txs.clone(), &key(2)).signature,
+            }
+            assert_eq!(bad.hash(), honest.hash(), "{variant}: the honest block's hash");
+            assert!(node.hs.precheck_proposal(&bad).is_err() && node.hs.precheck_proposal(&honest).is_ok());
+
+            // The variant answers a by-hash fetch of the honest hash.
+            assert!(node.fetch_block(honest.hash()).await.is_empty());
+            let id = *node.fetch_inflight.keys().next().expect("a fetch in flight");
+            node.on_sync_response(peer, id, SyncResponse::Block(Some(bad))).await.unwrap();
+            assert!(node.in_flight.is_empty() && node.waiting.is_empty(), "{variant}: no slot taken");
+            assert!(!node.hs.has_block(&honest.hash()));
+            tokio::task::yield_now().await;
+            assert!(applied.try_recv().is_err(), "{variant}: no worker applied it");
+            drain(&mut seen).await;
+
+            node.on_consensus(ConsensusMessage::Proposal(honest.clone())).await.unwrap();
+            assert!(node.in_flight.contains(&honest.hash()), "{variant}: the honest copy goes off the loop");
+            assert_eq!(complete(&mut node, &mut applied).await, honest.hash());
+            assert!(node.hs.has_block(&honest.hash()), "{variant}: the honest block is inserted");
+            assert!(voted_for(&drain(&mut seen).await, &honest), "{variant}: and voted for");
+        }
+
+        // A fetch answered with a different (valid) block: dropped, and the next peer asked.
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen, mut applied) = bare_node_full(storage, gs, hs, true);
+        claiming_peer(&mut node, 3);
+        claiming_peer(&mut node, 3);
+        let ledger = node.hs.tip_ledger().clone();
+        let other = block_on(&head, &ledger, &key(1), node.hs.view(), vec![next_tx(&ledger, 1)]);
+        let wanted = Hash::digest(b"the block asked for");
+        node.fetch_block(wanted).await;
+        let id = *node.fetch_inflight.keys().next().unwrap();
+        let first = sent_by_hash(&mut seen).await[0].0;
+        node.on_sync_response(first, id, SyncResponse::Block(Some(other.clone()))).await.unwrap();
+        assert!(!node.hs.has_block(&other.hash()) && node.in_flight.is_empty(), "not delivered");
+        tokio::task::yield_now().await;
+        assert!(applied.try_recv().is_err());
+        let again = sent_by_hash(&mut seen).await;
+        assert_eq!(again.len(), 1, "asked again");
+        assert_eq!(again[0].1, wanted);
+        assert_ne!(again[0].0, first, "of another peer");
+    }
+
+    /// Off-loop apply fix round 1 (I1): a proposal the replica's precheck refuses — here a
+    /// proposer that does not lead the view, which the gossip precheck only `Ignore`s — is not
+    /// sent to a worker: it is delivered on the loop and refused there.
+    #[tokio::test]
+    async fn a_proposal_the_precheck_refuses_is_not_applied_off_the_loop() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, _seen, mut applied) = offloop_node(storage, gs, hs);
+        let exec = Hooked::new(|| {});
+        node.executor = exec.clone();
+        let ledger = node.hs.tip_ledger().clone();
+        let honest = block_on(&head, &ledger, &key(1), node.hs.view(), vec![next_tx(&ledger, 1)]);
+        let mut header = honest.header.clone();
+        header.proposer = key(2).public_key().clone();
+        let block = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, honest.transactions.clone(), &key(2));
+        assert_eq!(node.hs.precheck_proposal(&block), Err(ConsensusError::WrongLeader(block.view())));
+        node.on_consensus(ConsensusMessage::Proposal(block.clone())).await.unwrap();
+        assert!(node.in_flight.is_empty() && node.waiting.is_empty());
+        assert!(!node.hs.has_block(&block.hash()));
+        tokio::task::yield_now().await;
+        assert!(applied.try_recv().is_err(), "no Applied: nothing went to a worker");
+        assert_eq!(exec.bundles(), 0, "nothing was verified for it");
+    }
+
+    /// Off-loop apply fix round 1 (M4): a parked compact proposal whose bodies arrive while the
+    /// same block, come in full, is being applied: the park is dropped as held, and the block is
+    /// applied once.
+    #[tokio::test]
+    async fn a_park_completing_while_its_block_is_in_flight_is_dropped() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen, mut applied) = bare_node_full(storage, gs, hs, true);
+        let exec = Hooked::new(|| {});
+        node.executor = exec.clone();
+        let peer = claiming_peer(&mut node, 4);
+        let ledger = node.hs.tip_ledger().clone();
+        let txs = vec![next_tx(&ledger, 1)];
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), txs.clone());
+        node.on_compact_proposal(CompactBlock::of(&block), gossip_id()).await.unwrap();
+        assert_eq!(tx_fetches(&drain(&mut seen).await).len(), 1, "parked, its body asked for");
+        let rid = parked_request(&node);
+
+        node.on_consensus(ConsensusMessage::Proposal(block.clone())).await.unwrap();
+        assert!(node.in_flight.contains(&block.hash()));
+        node.on_sync_response(peer, rid, SyncResponse::Transactions(txs)).await.unwrap();
+        assert!(node.parked.is_empty(), "the park went, its block being applied");
+        assert_eq!(node.in_flight.len(), 1);
+
+        assert_eq!(complete(&mut node, &mut applied).await, block.hash());
+        assert!(node.hs.has_block(&block.hash()));
+        assert!(applied.try_recv().is_err(), "one apply");
+        assert_eq!(exec.bundles(), 1);
+        assert!(voted_for(&drain(&mut seen).await, &block));
+    }
+
+    /// Off-loop apply fix round 1 (M4): a compact proposal whose parent is being applied
+    /// rebuilds from the pool and waits behind the parent, then gets its own off-loop apply.
+    #[tokio::test]
+    async fn a_compact_proposal_whose_parent_is_in_flight_waits_behind_it() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen, mut applied) = offloop_node(storage, gs, hs);
+        claiming_peer(&mut node, 4);
+        let ledger = node.hs.tip_ledger().clone();
+        let v = node.hs.view();
+        let n = block_on(&head, &ledger, &key(1), v, vec![next_tx(&ledger, 1)]);
+        let after_n = post_state(&ledger, &n);
+        let tx = next_tx(&after_n, 2);
+        // Its body held already (anchored past the tip, so the recent cache, not the pool).
+        node.recent_txs.remember(tx.clone());
+        let n1 = block_on(&n, &after_n, &key(1), v + 1, vec![tx]);
+
+        node.on_consensus(ConsensusMessage::Proposal(n.clone())).await.unwrap();
+        node.on_compact_proposal(CompactBlock::of(&n1), gossip_id()).await.unwrap();
+        assert!(node.parked.is_empty(), "rebuilt from the pool");
+        assert!(node.waiting_hashes.contains(&n1.hash()), "N+1 waits behind N");
+        assert_eq!(complete(&mut node, &mut applied).await, n.hash());
+        assert!(node.in_flight.contains(&n1.hash()));
+        assert_eq!(complete(&mut node, &mut applied).await, n1.hash());
+        assert!(node.hs.has_block(&n1.hash()));
+        let sent = drain(&mut seen).await;
+        assert!(voted_for(&sent, &n) && voted_for(&sent, &n1));
+        assert!(!sent.iter().any(|s| matches!(s, Seen::Sync(_, SyncRequest::BlockByHash(_)))), "nothing fetched");
     }
 }

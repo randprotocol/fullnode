@@ -3904,3 +3904,84 @@ fn pre_execute_refusals_still_fire_with_a_pre_applied_result() {
     assert_eq!(pre_exec.calls(), before);
     assert!(!pre.has_block(&second.hash()));
 }
+
+/// Off-loop apply fix round 1 (I1): `precheck_proposal` — the node's screen before an off-loop
+/// apply — refuses each pre-execute case with the error `on_proposal` refuses it with, and
+/// executes nothing. Two cases differ by design: an unheld parent is `UnknownParent` without
+/// being orphaned, and GOSSIP-2's repeated tail is refused on its list (the orphan pool's own
+/// refusal) where `on_proposal`, holding the parent, refuses it in the apply.
+#[test]
+fn precheck_proposal_refuses_what_on_proposal_refuses_before_the_apply() {
+    let mut sim = setup(4, 4);
+    let (leader, view) = pending_leader(&sim);
+    let alice = Keypair::from_seed(*sim.keys[0].seed()).unwrap();
+    sim.now += 1;
+    let mints = vec![mint(&alice, 5), mint(&alice, 6), mint(&alice, 7)];
+    let block = proposal_of(&sim.nodes[leader].propose(view, mints, sim.now).unwrap());
+    assert_eq!(block.transactions.len(), 3, "an odd list, for the repeated tail");
+    let follower = (leader + 1) % 4;
+    let wrong = (0..4).find(|&i| i != leader).unwrap();
+    let domain = sim.domain();
+    let signed = |header: crate::types::BlockHeader, k: usize| Block::sign(&domain, header, block.transactions.clone(), &sim.keys[k]);
+    let with = |f: &dyn Fn(&mut crate::types::BlockHeader)| {
+        let mut h = block.header.clone();
+        f(&mut h);
+        h
+    };
+
+    let [(fresh, exec), _] = counted_twins(&sim, follower);
+    assert_eq!(fresh.precheck_proposal(&block), Ok(()));
+    assert_eq!(exec.calls(), 0, "the precheck executes nothing");
+
+    let current = fresh.view();
+    let cases: Vec<(&str, Block)> = vec![
+        ("view out of range", signed(with(&|h| h.view = current + 1_000_001), leader)),
+        ("view too far ahead", signed(with(&|h| h.view = current + PROPOSAL_VIEW_WINDOW + 1), leader)),
+        ("stale", signed(with(&|h| h.height = 0), leader)),
+        ("bad signature", {
+            let mut b = block.clone();
+            b.signature = signed(block.header.clone(), wrong).signature;
+            b
+        }),
+        ("bad height", signed(with(&|h| h.height += 1), leader)),
+        ("wrong leader", signed(with(&|h| h.proposer = sim.keys[wrong].public_key().clone()), wrong)),
+        ("justify names another block", signed(with(&|h| h.justify.block_hash = Hash::digest(b"not the parent")), leader)),
+    ];
+    for (case, bad) in cases {
+        let [(mut hs, exec), _] = counted_twins(&sim, follower);
+        let pre = hs.precheck_proposal(&bad);
+        assert!(pre.is_err(), "{case}: passed the precheck");
+        let plain = hs.on_proposal(bad.clone(), sim.now);
+        assert_eq!(pre, plain.map(|_| ()), "{case}");
+        assert_eq!(exec.calls(), 0, "{case}: refused before any apply");
+    }
+
+    // An equivocation: the leader's second block for the view, after the first is held.
+    let [(mut hs, exec), _] = counted_twins(&sim, follower);
+    hs.on_proposal(block.clone(), sim.now).unwrap();
+    let second = signed(with(&|h| h.timestamp_ms += 1), leader);
+    let calls = exec.calls();
+    let pre = hs.precheck_proposal(&second);
+    assert!(matches!(pre, Err(ConsensusError::Equivocation { .. })), "{pre:?}");
+    assert_eq!(pre, hs.on_proposal(second, sim.now).map(|_| ()));
+    assert_eq!(exec.calls(), calls);
+
+    // An unheld parent: `UnknownParent`, and nothing orphaned by the precheck.
+    let [(mut hs, _), _] = counted_twins(&sim, follower);
+    let orphan = signed(with(&|h| {
+        h.parent = Hash::digest(b"unheld");
+        h.justify.block_hash = h.parent;
+    }), leader);
+    assert_eq!(hs.precheck_proposal(&orphan), Err(ConsensusError::UnknownParent(orphan.parent())));
+    assert!(!hs.holds_orphan(&orphan.hash()), "the precheck keeps nothing");
+
+    // GOSSIP-2's repeated tail: the honest hash, refused on its list here; refused by the apply
+    // in `on_proposal`, and never inserted.
+    let mut repeated = block.clone();
+    repeated.transactions.push(block.transactions[2].clone());
+    assert_eq!(repeated.hash(), block.hash());
+    assert_eq!(hs.precheck_proposal(&repeated), Err(ConsensusError::Execution(crate::ledger::BlockError::RepeatedTransaction)));
+    assert!(matches!(hs.on_proposal(repeated, sim.now), Err(ConsensusError::Execution(_))));
+    assert!(!hs.has_block(&block.hash()));
+    assert_eq!(hs.precheck_proposal(&block), Ok(()), "the honest block still passes");
+}
