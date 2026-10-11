@@ -2954,6 +2954,12 @@ impl Storage {
             return Ok(());
         }
         let head = self.head()?;
+        // The startup checkpoint is carried, never created (spec §3.2.2): only a row this build
+        // wrote for exactly the head this commit extends moves up with it.
+        let carry = match (self.checkpoint_build(), self.verified_head()?) {
+            (Some(build), Some(m)) if m.build_sha == build && m.height == head.height && m.block_hash == head.hash => Some(build),
+            _ => None,
+        };
         let first_height = head.height + 1;
         let mut expected_height = first_height;
         let mut expected_parent = head.hash;
@@ -3317,6 +3323,11 @@ impl Storage {
         self.stage_retired_aggregator_nonces(&mut batch, ledger_after)?;
         let tokens_staged = self.stage_tokens(&mut batch, ledger_after.tokens())?;
         self.put_tokens_ext(&mut batch, ledger_after.tokens())?;
+        if let Some(build_sha) = carry {
+            let last = blocks.last().expect("blocks is non-empty past the early return");
+            let row = VerifiedHead { height: last.block.height(), block_hash: last.block.hash(), state_root: last.block.header.state_root, build_sha };
+            batch.put_cf(self.cf(CF_META), META_VERIFIED_HEAD, bincode::serialize(&row)?);
+        }
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(last_height));
         self.db.write_opt(batch, &sync_opts())?;
         self.tokens_landed(tokens_staged);
@@ -4233,6 +4244,8 @@ impl Storage {
             batch.put_cf(self.cf(CF_META), META_CHAIN_ID, gs.chain_id.to_be_bytes());
             batch.put_cf(self.cf(CF_META), META_HC_BUNDLE, word8_to_bytes(&gs.hc_bundle));
         }
+        // The checkpoint described the old head (spec §3.3); the repair re-verifies and rewrites it.
+        batch.delete_cf(self.cf(CF_META), META_VERIFIED_HEAD);
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(height));
         self.db.write_opt(batch, &sync_opts())?;
         self.tokens_landed(tokens_staged);
@@ -5631,6 +5644,15 @@ pub(crate) mod fixtures {
 
     /// [`chain_fixture`] on a genesis state `tweak` adjusts first (a genesis parameter, say).
     pub(crate) fn chain_fixture_with(n: u64, tweak: impl FnOnce(&mut GenesisState)) -> (tempfile::TempDir, Storage, GenesisState, Vec<CommittedBlock>) {
+        chain_fixture_hooked(n, tweak, |_, _| {})
+    }
+
+    /// [`chain_fixture_with`], calling `on_block(&store, h)` just before block `h` is committed.
+    pub(crate) fn chain_fixture_hooked(
+        n: u64,
+        tweak: impl FnOnce(&mut GenesisState),
+        mut on_block: impl FnMut(&Storage, u64),
+    ) -> (tempfile::TempDir, Storage, GenesisState, Vec<CommittedBlock>) {
         use randprotocol_core::Vote;
         let (dir, st, mut gs) = genesis_with_two_notes();
         tweak(&mut gs);
@@ -5656,6 +5678,7 @@ pub(crate) mod fixtures {
             let block = cb.block.clone();
             let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), block.view(), block.hash(), &k)] };
             let cb = CommittedBlock { qc, ..cb };
+            on_block(&st, h);
             st.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
             out.push(cb);
         }
@@ -9655,8 +9678,72 @@ mod tests {
 
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    #[allow(dead_code)]
     const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn commit_carries_this_builds_marker_to_the_new_head() {
+        let (_d, st, _gs, blocks) = chain_fixture_hooked(4, |_| {}, |st, h| {
+            if h == 2 {
+                st.set_checkpoint_build_for_testing(Some(SHA_A));
+                assert!(st.mark_verified_head().unwrap(), "marker at height 1");
+            }
+        });
+        let head = blocks.last().unwrap().block.clone();
+        assert_eq!(
+            st.verified_head().unwrap(),
+            Some(VerifiedHead { height: 4, block_hash: head.hash(), state_root: head.header.state_root, build_sha: SHA_A.into() })
+        );
+    }
+
+    #[test]
+    fn commit_does_not_create_a_marker() {
+        let (_d, st, _gs, _) = chain_fixture_hooked(3, |_| {}, |st, h| {
+            if h == 1 {
+                st.set_checkpoint_build_for_testing(Some(SHA_A));
+            }
+        });
+        assert_eq!(st.verified_head().unwrap(), None);
+    }
+
+    #[test]
+    fn commit_does_not_carry_another_builds_marker() {
+        let (_d, st, _gs, _) = chain_fixture_hooked(3, |_| {}, |st, h| {
+            if h == 2 {
+                st.set_checkpoint_build_for_testing(Some(SHA_A));
+                st.mark_verified_head().unwrap();
+                st.set_checkpoint_build_for_testing(Some(SHA_B));
+            }
+        });
+        let m = st.verified_head().unwrap().expect("the old row stays");
+        assert_eq!((m.height, m.build_sha.as_str()), (1, SHA_A), "not carried: it is another build's");
+    }
+
+    #[test]
+    fn commit_does_not_carry_a_stale_marker() {
+        let (_d, st, _gs, _) = chain_fixture_hooked(4, |_| {}, |st, h| {
+            if h == 2 {
+                st.set_checkpoint_build_for_testing(Some(SHA_A));
+                st.mark_verified_head().unwrap();
+                // As if another build committed block 2 without carrying it.
+                st.set_checkpoint_build_for_testing(None);
+            }
+            if h == 3 {
+                st.set_checkpoint_build_for_testing(Some(SHA_A));
+            }
+        });
+        let m = st.verified_head().unwrap().expect("the old row stays");
+        assert_eq!(m.height, 1, "head moved past it without this build, so it is never carried again");
+    }
+
+    #[test]
+    fn truncate_to_clears_the_marker() {
+        let (_d, st, gs, _) = chain_fixture(4);
+        st.set_checkpoint_build_for_testing(Some(SHA_A));
+        st.mark_verified_head().unwrap();
+        let c = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        st.truncate_to(&gs, 2, &c.ledger).unwrap();
+        assert_eq!(st.verified_head().unwrap(), None);
+    }
 
     #[test]
     fn only_a_clean_forty_hex_sha_is_a_trusted_build() {
