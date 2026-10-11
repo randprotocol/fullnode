@@ -102,6 +102,7 @@ fn genesis(key: &Keypair) -> Genesis {
         fees: None,
         incremental_nullifier_root: None,
         perps: None,
+        hc_auth_multisig: None,
     }
 }
 

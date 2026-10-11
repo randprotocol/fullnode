@@ -223,6 +223,7 @@ fn genesis_bridge(validators: &[Keypair], funded: &[&Wallet], bridge: Option<Bri
         fees: None,
         incremental_nullifier_root: None,
         perps: None,
+        hc_auth_multisig: None,
     }
 }
 

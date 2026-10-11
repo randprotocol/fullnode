@@ -722,6 +722,12 @@ impl ConfidentialExecutor for AggExecutor {
         ConfidentialExecutor::build_msauth_key(&self.inner)
     }
 
+    /// Forwarded (Task 3): the default would leave the inner executor's msauth path shut and
+    /// refuse every multisig auth proof on a chain that names `hc_auth_multisig`.
+    fn enable_auth_multisig(&self) {
+        ConfidentialExecutor::enable_auth_multisig(&self.inner)
+    }
+
     /// Forwarded, like `max_callable_program_words` (a default would switch the rule off).
     fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
         self.inner.non_canonical_proof(proof)

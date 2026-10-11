@@ -814,6 +814,13 @@ pub struct Ledger {
     /// (`node::check_build_runs_genesis`): core cannot name guests. A genesis parameter like
     /// `hardening_v6`: outside the state root and equality, restored by `reload_ledger`.
     hc_auth: Option<Word8>,
+    /// Genesis `hc_auth_multisig` (private multisig phase 4, spec
+    /// `docs/superpowers/specs/2026-10-11-private-multisig-phase4-design.md` §2): the multisig auth
+    /// guest an auth proof of the multisig shape is verified against, beside `hc_auth`'s
+    /// single-key guest. `None` — every chain cut before it — admits no multisig auth proof.
+    /// A genesis parameter like `hc_auth`: outside the state root and equality, restored by
+    /// `reload_ledger` (a node that forgot it would refuse every multisig spend its peers apply).
+    hc_auth_multisig: Option<Word8>,
     /// Audit v6, STAKE-2: the genesis `testnet` marker, what lets `faucet: true` sit beside a
     /// `bridge` section (`Genesis::validate`). No rule of this ledger reads it — it is here so
     /// the node can serve it (`rand_status`, `rand_getLimits`) from the one place every genesis
@@ -991,6 +998,7 @@ impl Ledger {
             gas_prices: None,
             hardening_v6: false,
             hc_auth: None,
+            hc_auth_multisig: None,
             testnet: false,
             proof_window_blocks: None,
             aggregators: BTreeMap::new(),
@@ -1063,6 +1071,7 @@ impl Ledger {
             gas_prices: None,
             hardening_v6: false,
             hc_auth: None,
+            hc_auth_multisig: None,
             testnet: false,
             proof_window_blocks: None,
             aggregators: BTreeMap::new(),
@@ -1868,6 +1877,17 @@ impl Ledger {
     /// Set by genesis from `hc_auth`, and by `reload_ledger` on every restart.
     pub fn set_hc_auth(&mut self, hc_auth: Option<Word8>) {
         self.hc_auth = hc_auth;
+    }
+
+    /// The pinned multisig auth guest (genesis `hc_auth_multisig`), or `None` on a chain without
+    /// private multisig — see the field.
+    pub fn hc_auth_multisig(&self) -> Option<Word8> {
+        self.hc_auth_multisig
+    }
+
+    /// Set by genesis from `hc_auth_multisig`, and by `reload_ledger` on every restart.
+    pub fn set_hc_auth_multisig(&mut self, hc: Option<Word8>) {
+        self.hc_auth_multisig = hc;
     }
 
     /// The largest proof a transaction may carry, in bytes, as genesis set it (default

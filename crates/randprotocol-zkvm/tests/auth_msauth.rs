@@ -80,6 +80,7 @@ fn the_msauth_shape_is_the_vendored_pinned_one() {
 #[test]
 fn junk_and_a_single_key_proof_take_their_shape_or_none() {
     let ex = ZkExecutor::new(FriProfile::Test);
+    ex.enable_auth_multisig(); // a chain naming hc_auth_multisig: the msauth path is reachable
     assert_eq!(ZkExecutor::auth_shape_of(b"junk"), Err(ConfidentialError::MalformedProof));
     let (single, c, tier) = prove_auth(FriProfile::Test, &SpendKey([7; 8]), &SALT, &BINDING, Backend::Cpu).unwrap();
     assert_eq!(tier as usize, AUTH_TIER);
@@ -107,6 +108,7 @@ fn junk_and_a_single_key_proof_take_their_shape_or_none() {
 fn every_msauth_header_word_off_by_one_is_refused_by_name_before_any_key() {
     use randprotocol_zkvm::machine::{Machine, Proof, Tier};
     let ex = ZkExecutor::new(FriProfile::Test);
+    ex.enable_auth_multisig(); // a chain naming hc_auth_multisig: the msauth path is reachable
     let (single, c, _) = prove_auth(FriProfile::Test, &SpendKey([7; 8]), &SALT, &BINDING, Backend::Cpu).unwrap();
     let gas = decode_canonical(&single).unwrap().public_values[pv::GAS];
     let s = ZkExecutor::msauth_heights();
@@ -165,6 +167,21 @@ fn every_msauth_header_word_off_by_one_is_refused_by_name_before_any_key() {
     assert_eq!(refused, 16);
     assert_eq!(ex.cached_msauth_keys(), 0, "no header built the msauth key");
     assert!(!ex.msauth_key_ready());
+
+    // Task 3 (the Task 2b review's carried note): on a chain WITHOUT `hc_auth_multisig` the msauth
+    // path is unreachable. The all-matching header — which on an enabled executor would go on to
+    // build the ~4 GB tier-18 key — is refused before any decode, by name, and nothing is built.
+    let plain = ZkExecutor::new(FriProfile::Test);
+    assert!(!plain.auth_multisig_enabled(), "off until a genesis names hc_auth_multisig");
+    match plain.verify_auth(&ZkExecutor::hc_auth_multisig(), &matching, &BINDING) {
+        Err(ConfidentialError::InvalidProof(why)) => assert!(why.contains("without hc_auth_multisig"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(plain.cached_msauth_keys(), 0, "no msauth key touched");
+    assert_eq!(plain.msauth_key_builds(), 0);
+    assert_eq!(plain.msauth_machine_key_builds(), 0);
+    // The single-key path is untouched by the gate.
+    assert_eq!(plain.verify_auth(&ZkExecutor::hc_auth(), &single, &BINDING), Ok(c));
 }
 
 /// One real msauth proof at the Test profile, and every header rule checked on it.
@@ -175,6 +192,7 @@ fn every_msauth_header_word_off_by_one_is_refused_by_name_before_any_key() {
 fn a_real_msauth_proof_takes_the_pinned_shape_and_every_other_header_is_refused() {
     let f = fixture(3);
     let ex = ZkExecutor::new(FriProfile::Test);
+    ex.enable_auth_multisig();
     let hc = ZkExecutor::hc_auth_multisig();
     let mut proofs = Vec::new();
     for active in [vec![0usize], vec![0, 2], (0..M_MAX).collect::<Vec<_>>()] {
@@ -210,6 +228,7 @@ fn a_real_msauth_proof_takes_the_pinned_shape_and_every_other_header_is_refused(
     // Every header word (and the tier) moved by one, up and down, is refused by shape before a key is built.
     // `machine::Proof` is not `Clone`: re-decode the honest bytes for every mutation.
     let fresh = ZkExecutor::new(FriProfile::Test);
+    fresh.enable_auth_multisig();
     type Edit = fn(&mut randprotocol_zkvm::machine::Proof, i8);
     let edits: [(&str, Edit); 8] = [
         ("tier", |p, d| p.tier.0 = (p.tier.0 as i64 + 2 * d as i64) as usize),
@@ -266,6 +285,7 @@ fn measure_the_msauth_verifier_key_build_and_verify_at_the_production_profile() 
     let inputs = msauth_inputs(&MSK, &SALT, 2, &[slot(&f, 0), slot(&f, 2)]);
     let (bytes, _, _) = prove_msauth(FriProfile::Production, &inputs, &BINDING).unwrap();
     let ex = ZkExecutor::new(FriProfile::Production);
+    ex.enable_auth_multisig();
     let t0 = std::time::Instant::now();
     ex.warm_auth_multisig();
     let warm = t0.elapsed();

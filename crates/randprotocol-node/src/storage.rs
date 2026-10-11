@@ -4417,6 +4417,7 @@ pub(crate) mod fixtures {
             hardening_v6: None,
             hc_auth: None,
             fees: None,
+            hc_auth_multisig: None,
         }
     }
 
@@ -4578,6 +4579,7 @@ pub(crate) mod fixtures {
             hardening_v6: None,
             hc_auth: None,
             fees: None,
+            hc_auth_multisig: None,
         };
         (gs, secrets)
     }

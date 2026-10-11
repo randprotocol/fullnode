@@ -592,6 +592,12 @@ enum Cmd {
         /// with `v1`/`v2` — the two come as a pair (only v3 publishes the commitment).
         #[arg(long)]
         auth_guest: bool,
+        /// Pin this build's multisig auth guest as `hc_auth_multisig` (private multisig): an auth
+        /// proof may then also be a `t`-of-`M` multisig's, verified against this guest. Requires
+        /// `--auth-guest` (the multisig guest authorises bundle guest v3's spends too); at
+        /// production FRI the chain needs `--max-proof-bytes` of at least 4 MiB.
+        #[arg(long, requires = "auth_guest")]
+        auth_multisig_guest: bool,
         /// Turn on the v0.6 rules as validity rules (`hardening_v6`): the pc window, uncallable
         /// deploys, canonical proof shapes and proof-of-work words, the call binding and the
         /// program-table floor. Absent, a node still refuses those at its pool, as policy.
@@ -2539,6 +2545,7 @@ async fn main() -> Result<()> {
             aggregation_tree,
             bundle_guest,
             auth_guest,
+            auth_multisig_guest,
             hardening_v6,
             gas_price,
             byte_price,
@@ -2791,6 +2798,10 @@ async fn main() -> Result<()> {
                     ),
                     None => None,
                 },
+                // Private multisig's auth guest (`--auth-multisig-guest`, only with `--auth-guest`):
+                // this build's digest, never typed; absent otherwise, so a genesis cut without it
+                // hashes byte-for-byte as before.
+                hc_auth_multisig: auth_multisig_guest.then(|| word8_to_hex(&ZkExecutor::hc_auth_multisig())),
             };
             if binding_domain.is_none() && !randprotocol_client::CHAIN_ID_BINDING_CHAIN_IDS.contains(&chain_id) {
                 eprintln!(
@@ -2830,7 +2841,7 @@ async fn main() -> Result<()> {
             }
             std::fs::write(&out, gen.to_json())?;
             println!(
-                "wrote {} (genesis hash {}, {} validators, {} notes, {} blocks/epoch, programs up to {} words, proofs up to {} bytes, blocks up to {} bytes, call envelopes up to {} bytes, program public input up to {} words, faucet {}, confidential {}, fri {}, hc_bundle {}, hc_auth {})",
+                "wrote {} (genesis hash {}, {} validators, {} notes, {} blocks/epoch, programs up to {} words, proofs up to {} bytes, blocks up to {} bytes, call envelopes up to {} bytes, program public input up to {} words, faucet {}, confidential {}, fri {}, hc_bundle {}, hc_auth {}{})",
                 out.display(),
                 state.hash(),
                 state.validators.len(),
@@ -2846,6 +2857,9 @@ async fn main() -> Result<()> {
                 state.fri_profile,
                 gen.hc_bundle,
                 gen.hc_auth.as_deref().unwrap_or("none"),
+                // Private multisig's pin, only when set: a summary without it reads as before (and
+                // says nothing of "multisig" on a chain that has none).
+                gen.hc_auth_multisig.as_deref().map(|h| format!(", hc_auth_multisig {h}")).unwrap_or_default(),
             );
             println!("{}", gas_summary(state.ledger.gas()));
             if let Some(p) = state.ledger.program_state() {
@@ -5387,6 +5401,7 @@ mod tests {
             fees: None,
             incremental_nullifier_root: None,
             perps: None,
+            hc_auth_multisig: None,
         }
     }
 

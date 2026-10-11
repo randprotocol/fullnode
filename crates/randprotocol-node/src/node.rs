@@ -155,6 +155,13 @@ pub fn load_genesis(datadir: &std::path::Path) -> Result<(GenesisState, Arc<dyn 
     let genesis = Genesis::from_json(&text)?;
     let executor = executor_for_profile(&genesis.fri_profile)?;
     let gs = genesis.build(executor.as_ref())?;
+    // Private multisig (plan Task 3): the executor's msauth path opens only for a genesis naming
+    // `hc_auth_multisig`. On every other chain a multisig-`hc` verify is refused before any
+    // decode, so no auth proof can make this node build the ~4 GB msauth key. Here, on the bare
+    // executor, before any caching wrapper sees it.
+    if gs.ledger.hc_auth_multisig().is_some() {
+        executor.enable_auth_multisig();
+    }
     Ok((gs, executor))
 }
 
@@ -224,6 +231,9 @@ pub fn reload_ledger_from(
     // would recompute the v1 digest and refuse every v3 bundle its peers apply — a fork at the
     // first transaction after its restart.
     ledger.set_hc_auth(gs.ledger.hc_auth());
+    // And private multisig's auth guest (genesis `hc_auth_multisig`): a node that came back
+    // without it would refuse every multisig spend its peers apply — a fork at its first restart.
+    ledger.set_hc_auth_multisig(gs.ledger.hc_auth_multisig());
     // And the gas section (design 2026-09-28 §4.2, §4.3, §7.1): `load_ledger` comes back at
     // `None`, and a node that kept it would run without the prices and the bundle gas limit its
     // peers enforce.
@@ -2381,6 +2391,19 @@ pub fn check_build_runs_genesis(gs: &GenesisState, built_hc_bundles: &[randproto
              authorisation) — without it the ledger recomputes the v1 digest and admits no bundle"
         ),
         _ => {}
+    }
+    // Private multisig (spec §2.3): `hc_auth_multisig` must be this build's multisig auth guest —
+    // another is a guest no wallet built from it can prove, and the executor dispatches the
+    // msauth path on exactly this digest. Core checks the rest (it needs `hc_auth`, it differs
+    // from it); `hc_auth` being this build's auth guest and bundle guest v3 is checked above.
+    if let Some(h) = gs.ledger.hc_auth_multisig() {
+        if h != ZkExecutor::hc_auth_multisig() {
+            anyhow::bail!(
+                "the genesis hc_auth_multisig ({}) is not this build's multisig auth guest ({}); rebuild from the chain's pinned commit",
+                randprotocol_core::notes::word8_to_hex(&h),
+                randprotocol_core::notes::word8_to_hex(&ZkExecutor::hc_auth_multisig())
+            );
+        }
     }
     if gs.ledger.aggregation().is_some() {
         anyhow::bail!(
@@ -6932,6 +6955,35 @@ mod tests {
         assert_eq!(storage.load_ledger(&StubExecutor).unwrap().hc_auth(), None);
         let reloaded = reload_ledger(&storage, &gs, &StubExecutor).unwrap();
         assert_eq!(reloaded.hc_auth(), Some([21; 8]), "restored from the genesis state");
+    }
+
+    /// Private multisig phase 4: `hc_auth_multisig` must be this build's msauth guest.
+    #[test]
+    fn startup_refuses_an_hc_auth_multisig_this_build_does_not_carry() {
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        let known = ZkExecutor::known_hc_bundles();
+        gs.hc_bundle = ZkExecutor::hc_hidden_bundle_v3();
+        gs.ledger.set_hc_auth(Some(ZkExecutor::hc_auth()));
+        gs.ledger.set_hc_auth_multisig(Some(ZkExecutor::hc_auth_multisig()));
+        assert!(check_build_runs_genesis(&gs, &known).is_ok());
+        gs.ledger.set_hc_auth_multisig(Some([0xdead; 8]));
+        let e = check_build_runs_genesis(&gs, &known).unwrap_err().to_string();
+        assert!(e.contains("not this build's multisig auth guest"), "{e}");
+        assert!(e.contains(&randprotocol_core::notes::word8_to_hex(&ZkExecutor::hc_auth_multisig())), "names this build's: {e}");
+    }
+
+    /// `hc_auth_multisig` survives a restart like `hc_auth`: a node that came back without it
+    /// would refuse every multisig spend its peers apply — a fork at its first restart.
+    #[test]
+    fn a_restart_restores_hc_auth_multisig() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut gs = genesis_of(7, &[&key(1)], vec![], 2);
+        gs.ledger.set_hc_auth(Some([21; 8]));
+        gs.ledger.set_hc_auth_multisig(Some([23; 8]));
+        storage.init_genesis(&gs).unwrap();
+        assert_eq!(storage.load_ledger(&StubExecutor).unwrap().hc_auth_multisig(), None);
+        assert_eq!(reload_ledger(&storage, &gs, &StubExecutor).unwrap().hc_auth_multisig(), Some([23; 8]));
     }
 
     /// v0.6.8: core's `kem_ek_is_valid` (genesis `bridge.fees.recipient`) agrees with the KEM the

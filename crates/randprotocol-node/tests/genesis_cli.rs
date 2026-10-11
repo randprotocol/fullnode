@@ -767,3 +767,42 @@ fn the_genesis_command_writes_an_aggregation_tree_section_it_checks_first() {
 fn rand_suffix(v: &serde_json::Value) -> String {
     blake3::hash(v.to_string().as_bytes()).to_hex()[..12].to_string()
 }
+
+/// Private multisig phase 4: `--auth-multisig-guest` pins this build's msauth guest as
+/// `hc_auth_multisig` (from `ZkExecutor::hc_auth_multisig()`, never retyped) and prints it; it
+/// requires `--auth-guest`, and without it the command is refused, with the reason, before any
+/// file is written. (The plan's `run_genesis` is this file's `genesis` runner.)
+#[test]
+fn genesis_auth_multisig_guest_writes_this_builds_msauth_hc_and_needs_auth_guest() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("g.json");
+    let ok = genesis(
+        &out,
+        &["--bundle-guest", "v3", "--auth-guest", "--auth-multisig-guest", "--max-proof-bytes", "4194304", "--max-block-bytes", "20971520"],
+    );
+    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    let gen = read(&out);
+    let want = word8_to_hex(&ZkExecutor::hc_auth_multisig());
+    assert_eq!(gen.hc_auth_multisig.as_deref(), Some(want.as_str()));
+    assert_eq!(want, "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247", "this build's msauth guest");
+    let stdout = String::from_utf8_lossy(&ok.stdout);
+    assert!(stdout.contains(&format!("hc_auth_multisig {want}")), "the operator is told: {stdout}");
+    let executor = randprotocol_node::node::executor_for_profile(&gen.fri_profile).unwrap();
+    let state = gen.build(executor.as_ref()).unwrap();
+    assert_eq!(state.ledger.hc_auth_multisig(), Some(ZkExecutor::hc_auth_multisig()));
+    randprotocol_node::node::check_build_runs_genesis(&state, &ZkExecutor::known_hc_bundles()).unwrap();
+    assert_eq!(printed_hash(&ok, "genesis hash "), state.hash().to_hex());
+
+    let bare_out = dir.path().join("h.json");
+    let bare = genesis(&bare_out, &["--auth-multisig-guest"]);
+    assert!(!bare.status.success(), "requires --auth-guest");
+    let stderr = String::from_utf8_lossy(&bare.stderr);
+    assert!(stderr.contains("--auth-guest"), "the reason names the missing flag: {stderr}");
+    assert!(!bare_out.exists(), "and nothing is written");
+
+    // Without the flag the field is absent: the file is the one `--auth-guest` alone writes.
+    let plain_out = dir.path().join("p.json");
+    let plain = genesis(&plain_out, &["--bundle-guest", "v3", "--auth-guest", "--max-proof-bytes", "4194304", "--max-block-bytes", "20971520"]);
+    assert!(plain.status.success(), "{}", String::from_utf8_lossy(&plain.stderr));
+    assert!(!std::fs::read_to_string(&plain_out).unwrap().contains("hc_auth_multisig"));
+}

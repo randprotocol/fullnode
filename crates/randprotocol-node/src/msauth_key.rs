@@ -157,12 +157,11 @@ pub fn parse_profile(s: &str) -> Result<FriProfile> {
     randprotocol_zkvm::executor::ZkExecutor::profile_from_str(s).ok_or_else(|| anyhow!("--profile must be production or test, not {s}"))
 }
 
-/// Whether the chain names `hc_auth_multisig`, i.e. whether this node must hold the msauth key.
-///
-/// TASK-3: `gs.ledger.hc_auth_multisig().is_some()` once plan Task 3 adds the genesis field. No
-/// genesis carries it before then, so until then no node reads a key file.
-pub fn chain_has_msauth(_gs: &randprotocol_core::genesis::GenesisState) -> bool {
-    false
+/// Whether the chain names `hc_auth_multisig` (plan Task 3: the genesis field, read off the built
+/// ledger), i.e. whether this node must hold the msauth key. A chain without it never reads a key
+/// file, and its executor's msauth path stays shut (`node::load_genesis`).
+pub fn chain_has_msauth(gs: &randprotocol_core::genesis::GenesisState) -> bool {
+    gs.ledger.hc_auth_multisig().is_some()
 }
 
 /// `node::start_with`'s step: [`resolve_path`] and [`load_msauth_key`] into `executor` (the bare
@@ -334,5 +333,151 @@ mod tests {
             }
         }
         assert!(seen > 10, "read the deploy directory");
+    }
+
+    /// A one-validator Test-profile genesis pinning bundle guest v3, this build's auth guest and,
+    /// when `multisig`, this build's msauth guest — what `rand-node genesis --bundle-guest v3
+    /// --auth-guest [--auth-multisig-guest]` writes.
+    fn msauth_genesis(validator: &randprotocol_core::Keypair, multisig: bool) -> randprotocol_core::genesis::Genesis {
+        use randprotocol_core::notes::word8_to_hex;
+        randprotocol_core::genesis::Genesis {
+            chain_id: 4242,
+            timestamp_ms: 0,
+            validators: vec![randprotocol_core::genesis::GenesisValidator {
+                public_key: validator.public_key().clone(),
+                stake: randprotocol_core::ledger::staking::MIN_STAKE as u128,
+                payout: randprotocol_core::notes::ShieldedAddress { pk: [1; 8], kem_ek: vec![2; randprotocol_core::notes::KEM_EK_BYTES] }
+                    .to_string(),
+            }],
+            alloc: vec![],
+            faucet: false,
+            confidential: true,
+            fri_profile: "test".into(),
+            hc_bundle: word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()),
+            bridge: None,
+            tokens: None,
+            aggregation: None,
+            consensus_domain: None,
+            staking: None,
+            epoch_blocks: randprotocol_core::genesis::EPOCH_BLOCKS_DEFAULT,
+            max_program_words: None,
+            max_proof_bytes: None,
+            max_block_bytes: Some(7 << 20),
+            max_call_envelope_bytes: None,
+            max_program_public_words: None,
+            envelope_bytes: None,
+            vesting: None,
+            hardening_v6: None,
+            hc_auth: Some(word8_to_hex(&ZkExecutor::hc_auth())),
+            gas: None,
+            testnet: Some(true),
+            binding_domain: Some(1),
+            proof_window_blocks: None,
+            program_state: None,
+            fees: None,
+            incremental_nullifier_root: None,
+            perps: None,
+            multisig: None,
+            aggregation_tree: None,
+            hc_auth_multisig: multisig.then(|| word8_to_hex(&ZkExecutor::hc_auth_multisig())),
+        }
+    }
+
+    fn node_config(datadir: &Path, key: &randprotocol_core::Keypair, msauth: MsauthKeyOptions) -> crate::node::NodeConfig {
+        crate::node::NodeConfig {
+            viewing_open: false,
+            datadir: datadir.to_path_buf(),
+            seed: *key.seed(),
+            listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            bootstrap: vec![],
+            rpc_addr: "127.0.0.1:0".parse().unwrap(),
+            enable_mdns: false,
+            validator: true,
+            block_interval: std::time::Duration::from_secs(1),
+            base_timeout: std::time::Duration::from_secs(2),
+            max_timeout: std::time::Duration::from_secs(8),
+            verify: crate::storage::VerifyMode::Off,
+            keep_raw_proofs: false,
+            min_free_disk_bytes: 0,
+            verify_workers: None,
+            apply_inline: false,
+            prune_history: None,
+            gas_policy: None,
+            msauth,
+        }
+    }
+
+    /// Task 3 flips the placeholder: the predicate is the genesis' `hc_auth_multisig`, read off
+    /// the built ledger.
+    #[test]
+    fn chain_has_msauth_reads_the_genesis_field() {
+        let key = randprotocol_core::Keypair::from_seed([9; 32]).unwrap();
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let without = msauth_genesis(&key, false).build(&ex).unwrap();
+        assert!(!chain_has_msauth(&without));
+        let with = msauth_genesis(&key, true).build(&ex).unwrap();
+        assert_eq!(with.ledger.hc_auth_multisig(), Some(ZkExecutor::hc_auth_multisig()));
+        assert!(chain_has_msauth(&with));
+    }
+
+    /// `node::load_genesis` opens the executor's msauth path exactly when the file names
+    /// `hc_auth_multisig` (the Task 2b review's carried note): without it a multisig-`hc` verify
+    /// is refused by name before any decode or key; with it the same junk reaches the decoder.
+    #[test]
+    fn load_genesis_opens_the_msauth_path_only_for_a_multisig_genesis() {
+        let key = randprotocol_core::Keypair::from_seed([9; 32]).unwrap();
+        for multisig in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("genesis.json"), msauth_genesis(&key, multisig).to_json()).unwrap();
+            let (gs, ex) = crate::node::load_genesis(dir.path()).unwrap();
+            assert_eq!(chain_has_msauth(&gs), multisig);
+            let got = ex.verify_auth(&ZkExecutor::hc_auth_multisig(), b"junk", &[0; 8]);
+            if multisig {
+                assert_eq!(got, Err(randprotocol_core::confidential::ConfidentialError::MalformedProof));
+            } else {
+                match got {
+                    Err(randprotocol_core::confidential::ConfidentialError::InvalidProof(why)) => {
+                        assert!(why.contains("without hc_auth_multisig"), "{why}")
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The carried `start_with` test with the predicate true: a multisig genesis and the
+    /// committed Test blob at `--msauth-vk` start a node whose status says `Loaded`; the same
+    /// genesis with the file missing refuses to start, naming the path and the pin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_multisig_chain_starts_with_the_blob_and_refuses_without_it() {
+        let key = randprotocol_core::Keypair::from_seed([9; 32]).unwrap();
+        let blob = Path::new(env!("CARGO_MANIFEST_DIR")).join("../randprotocol-zkvm/keys/msauth-vk-test.bin");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("genesis.json"), msauth_genesis(&key, true).to_json()).unwrap();
+        let opts = MsauthKeyOptions { path: Some(blob), build: false };
+        let handle = crate::node::start(node_config(dir.path(), &key, opts)).await.expect("a multisig chain with its blob starts");
+        assert_eq!(handle.status.read().unwrap().msauth_key, MsauthKeySource::Loaded);
+        handle.shutdown().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("genesis.json"), msauth_genesis(&key, true).to_json()).unwrap();
+        let missing = dir.path().join("no-such-msauth-vk-test.bin");
+        let opts = MsauthKeyOptions { path: Some(missing.clone()), build: false };
+        let e = match crate::node::start(node_config(dir.path(), &key, opts)).await {
+            Ok(_) => panic!("a multisig chain without its blob must not start"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(e.contains(&missing.display().to_string()), "{e}");
+        assert!(e.contains(&format!("expected sha256 {}", msauth_vk::pin(FriProfile::Test))), "{e}");
+        assert!(e.contains("refusing to start"), "{e}");
+
+        // And a chain without the field never reads the (missing) path: it starts, `Absent`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("genesis.json"), msauth_genesis(&key, false).to_json()).unwrap();
+        let opts = MsauthKeyOptions { path: Some(missing), build: false };
+        let handle = crate::node::start(node_config(dir.path(), &key, opts)).await.expect("a chain without multisig starts");
+        assert_eq!(handle.status.read().unwrap().msauth_key, MsauthKeySource::Absent);
+        handle.shutdown().await;
     }
 }

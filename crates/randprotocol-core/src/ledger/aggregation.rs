@@ -1581,6 +1581,7 @@ mod tests {
             hardening_v6: None,
             hc_auth: None,
             fees: None,
+            hc_auth_multisig: None,
         }
     }
 

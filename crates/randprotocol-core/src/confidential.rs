@@ -285,6 +285,13 @@ pub trait ConfidentialExecutor: Send + Sync {
     fn install_msauth_vk(&self, _blob: &[u8]) -> Result<(), String> {
         Err("this executor has no msauth verifier key".into())
     }
+    /// Private multisig (plan Task 3): this executor runs a chain whose genesis names
+    /// `hc_auth_multisig`, so `verify_auth` may take the multisig guest's path. Until it is called
+    /// an executor refuses the multisig `hc` without touching its msauth key — the path is
+    /// unreachable on every other chain. `node::load_genesis` calls it once, on the bare executor
+    /// (before any caching wrapper), for exactly such a genesis. The default — an executor with no
+    /// msauth path — does nothing.
+    fn enable_auth_multisig(&self) {}
     /// Build the multisig auth verifier key on this host (Task 2b's `--build-msauth-key`,
     /// development only: ~80 s and ~4 GB at production). Never called by default. May be a no-op.
     /// `Err` when the built key's SHA-256 is not this build's pin (the caller logs it loudly).

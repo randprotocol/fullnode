@@ -744,6 +744,12 @@ pub struct ZkExecutor {
     /// Where the msauth key came from (Task 2b): set once, `Loaded` by
     /// [`ZkExecutor::install_msauth_vk`], `Built` by the build; unset reads as `Absent`.
     msauth_key_source: std::sync::OnceLock<msauth_vk::MsauthKeySource>,
+    /// Whether this executor runs a chain whose genesis names `hc_auth_multisig` (plan Task 3, the
+    /// Task 2b review's carried note): set once by [`ZkExecutor::enable_auth_multisig`] — which
+    /// `node::load_genesis` calls exactly for such a genesis — and never cleared. Off, the msauth
+    /// path of `verify_auth` is unreachable: a multisig-`hc` verify is refused by name before any
+    /// decode, so no crafted auth proof can make a node on another chain build the ~4 GB key.
+    msauth_enabled: std::sync::atomic::AtomicBool,
     /// Held across the whole body of `warm` and `warm_bundle` (CPUV-1): at most one warm-up
     /// builds keys at a time on this node, whoever calls it. `node::warm_new_programs` spawns a
     /// blocking task per deploy-carrying commit and the startup warm runs beside them, so before
@@ -770,6 +776,7 @@ impl ZkExecutor {
             msauth_key: std::sync::OnceLock::new(),
             msauth_key_builds: std::sync::atomic::AtomicUsize::new(0),
             msauth_key_source: std::sync::OnceLock::new(),
+            msauth_enabled: std::sync::atomic::AtomicBool::new(false),
             warm_lock: std::sync::Mutex::new(()),
             warms_in_flight: std::sync::atomic::AtomicUsize::new(0),
             peak_warms: std::sync::atomic::AtomicUsize::new(0),
@@ -1376,6 +1383,18 @@ impl ZkExecutor {
             .verify_public(hc, binding, &p)
             .map_err(|e| ConfidentialError::InvalidProof(format!("{e:?}")))?;
         published_digest(&p.public_values)
+    }
+
+    /// Open the msauth path of `verify_auth` (see the `msauth_enabled` field): this executor runs
+    /// a chain whose genesis names `hc_auth_multisig`. `node::load_genesis` calls it for exactly
+    /// such a genesis; a wallet or a test that verifies multisig auth proofs calls it itself.
+    pub fn enable_auth_multisig(&self) {
+        self.msauth_enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::enable_auth_multisig`] has been called.
+    pub fn auth_multisig_enabled(&self) -> bool {
+        self.msauth_enabled.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The msauth key, built at most once ([`Self::msauth_key_with`] over the tier-18 build).
@@ -2069,6 +2088,10 @@ impl ConfidentialExecutor for ZkExecutor {
     /// own full shape before building a key, so a single-key proof sent with the msauth `hc` dies
     /// in the msauth shape check and the reverse in the single-key one: the ledger's choice of
     /// `hc` by shape and this choice of machine by `hc` cannot disagree into a verify.
+    ///
+    /// Plan Task 3: the msauth path is gated on the genesis field. On an executor that was not
+    /// told its chain names `hc_auth_multisig` ([`ZkExecutor::enable_auth_multisig`]) the msauth
+    /// `hc` is refused here, before any decode and without touching the msauth key.
     fn verify_auth(
         &self,
         hc_auth: &Word8,
@@ -2076,6 +2099,11 @@ impl ConfidentialExecutor for ZkExecutor {
         binding: &[u32; TX_BINDING_WORDS],
     ) -> Result<Word8, ConfidentialError> {
         if *hc_auth == Self::hc_auth_multisig() {
+            if !self.auth_multisig_enabled() {
+                return Err(ConfidentialError::InvalidProof(
+                    "a multisig auth proof on a chain without hc_auth_multisig".into(),
+                ));
+            }
             self.verify_msauth_proof(hc_auth, proof, binding)
         } else {
             self.verify_auth_proof(hc_auth, proof, binding)
@@ -2130,6 +2158,10 @@ impl ConfidentialExecutor for ZkExecutor {
 
     fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
         ZkExecutor::install_msauth_vk(self, blob).map_err(|e| e.to_string())
+    }
+
+    fn enable_auth_multisig(&self) {
+        ZkExecutor::enable_auth_multisig(self)
     }
 
     fn build_msauth_key(&self) -> Result<(), String> {

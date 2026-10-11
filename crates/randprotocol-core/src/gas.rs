@@ -39,6 +39,16 @@ pub const MAX_PROOF_BYTES: usize = 2 << 20;
 pub const MAX_PROOF_BYTES_MIN: usize = 1 << 20;
 /// The largest `max_proof_bytes` a genesis file may set: 32 MiB.
 pub const MAX_PROOF_BYTES_LIMIT: usize = 32 << 20;
+/// The smallest `max_proof_bytes` a Production-FRI genesis naming `hc_auth_multisig` may run
+/// (private multisig phase 4, spec §3.3; `Genesis::validate`'s `ProofCapTooSmallForMsauth`): the
+/// ledger caps every auth proof at `max_proof_bytes`, and a multisig auth proof is estimated at
+/// ≈ 3.6 MB (3.5–3.8 MB; at least 3.4 MB): a v3 bundle proof's 1.49 MB, +4 × 30 KB from tier 14
+/// to 18, +1.91 MB for the keccak table's width, +75 KB for the modq table. The rule keeps it at
+/// most 95 % of the cap (3 984 588 bytes at 4 MiB); a measured proof above that moves this to
+/// `6 << 20`. It is a floor, not the chain's cap: a genesis may set more (chain 21's cut chooses
+/// its own `max_proof_bytes`), and the block rule ([`min_block_bytes`], three proofs) still
+/// applies on top. The Test profile is not judged by it.
+pub const MSAUTH_MIN_PROOF_BYTES: usize = 4 << 20;
 /// Largest bridge attestation accepted in a `BridgeAttest` transaction.
 ///
 /// A real attestation is tiny: 6 envelope bytes, 66 per signature, a
