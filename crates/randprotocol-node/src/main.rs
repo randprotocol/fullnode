@@ -890,6 +890,10 @@ enum Cmd {
         /// Truncate the damaged tail (safety state is kept). Without this, only report.
         #[arg(long)]
         repair: bool,
+        /// The precomputed msauth verifier key file, as for `run` (read only on a chain naming
+        /// `hc_auth_multisig`; a missing or unpinned file refuses the verify — it never builds).
+        #[arg(long, value_name = "PATH")]
+        msauth_vk: Option<PathBuf>,
     },
     /// Database maintenance on a stopped node's data directory.
     Db {
@@ -2905,11 +2909,13 @@ async fn main() -> Result<()> {
             println!("initialised {} at genesis {} (chain id {})", datadir.display(), gs.hash(), gs.chain_id);
             println!("{}", gas_summary(gs.ledger.gas()));
         }
-        Cmd::Verify { datadir, mode, repair } => {
+        Cmd::Verify { datadir, mode, repair, msauth_vk } => {
             let mode: VerifyMode = mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let (gs, executor) = node::load_genesis(&datadir)?;
             refuse_test_fri_profile(&gs.fri_profile, test_profile_allowed)?;
             node::refuse_chains_this_build_cannot_run(&gs)?;
+            // The pinned msauth key, loaded as `run` loads it: a replay must never build it.
+            randprotocol_node::msauth_key::verify_startup(&gs, msauth_vk, executor.as_ref()).map_err(|e| anyhow::anyhow!("{e:#}; refusing to verify"))?;
             let storage = Storage::open(&datadir)?;
             let check = node::verify_store(&storage, &gs, mode, executor.as_ref())?;
             match &check.problem {

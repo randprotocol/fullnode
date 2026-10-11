@@ -1948,6 +1948,15 @@ mod tests {
     }
 
     impl ConfidentialExecutor for AsProvedBinding<'_> {
+        fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+            self.ex.install_msauth_vk(blob)
+        }
+        fn enable_auth_multisig(&self) {
+            self.ex.enable_auth_multisig()
+        }
+        fn build_msauth_key(&self) -> Result<(), String> {
+            self.ex.build_msauth_key()
+        }
         fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
             self.ex.check_program(base_pc, words)
         }

@@ -3639,6 +3639,15 @@ impl Counted {
 }
 
 impl ConfidentialExecutor for Counted {
+    fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+        self.tick().install_msauth_vk(blob)
+    }
+    fn enable_auth_multisig(&self) {
+        self.tick().enable_auth_multisig()
+    }
+    fn build_msauth_key(&self) -> Result<(), String> {
+        self.tick().build_msauth_key()
+    }
     fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, crate::confidential::ConfidentialError> {
         self.tick().check_program(base_pc, words)
     }

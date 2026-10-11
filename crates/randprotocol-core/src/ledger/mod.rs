@@ -4469,6 +4469,15 @@ pub(crate) mod tests {
     }
 
     impl ConfidentialExecutor for CountingExecutor {
+        fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+            StubExecutor.install_msauth_vk(blob)
+        }
+        fn enable_auth_multisig(&self) {
+            StubExecutor.enable_auth_multisig()
+        }
+        fn build_msauth_key(&self) -> Result<(), String> {
+            StubExecutor.build_msauth_key()
+        }
         fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
             StubExecutor.check_program(base_pc, words)
         }
@@ -5294,6 +5303,15 @@ pub(crate) mod tests {
     }
 
     impl ConfidentialExecutor for FlaggingExecutor {
+        fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+            StubExecutor.install_msauth_vk(blob)
+        }
+        fn enable_auth_multisig(&self) {
+            StubExecutor.enable_auth_multisig()
+        }
+        fn build_msauth_key(&self) -> Result<(), String> {
+            StubExecutor.build_msauth_key()
+        }
         fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
             StubExecutor.check_program(base_pc, words)
         }
@@ -5609,6 +5627,15 @@ pub(crate) mod tests {
     }
 
     impl ConfidentialExecutor for PaddedStub {
+        fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+            StubExecutor.install_msauth_vk(blob)
+        }
+        fn enable_auth_multisig(&self) {
+            StubExecutor.enable_auth_multisig()
+        }
+        fn build_msauth_key(&self) -> Result<(), String> {
+            StubExecutor.build_msauth_key()
+        }
         fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
             StubExecutor.check_program(base_pc, words)
         }
@@ -6715,6 +6742,15 @@ pub(crate) mod tests {
         /// publishes another — the verify's answer is compared as well.
         struct LyingDigest;
         impl ConfidentialExecutor for LyingDigest {
+            fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+                StubExecutor.install_msauth_vk(blob)
+            }
+            fn enable_auth_multisig(&self) {
+                StubExecutor.enable_auth_multisig()
+            }
+            fn build_msauth_key(&self) -> Result<(), String> {
+                StubExecutor.build_msauth_key()
+            }
             fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
                 StubExecutor.check_program(base_pc, words)
             }
@@ -7274,6 +7310,15 @@ pub(crate) mod tests {
         // An executor whose proofs carry no limit declares none, and is refused under the section.
         struct NoGas;
         impl ConfidentialExecutor for NoGas {
+            fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+                StubExecutor.install_msauth_vk(blob)
+            }
+            fn enable_auth_multisig(&self) {
+                StubExecutor.enable_auth_multisig()
+            }
+            fn build_msauth_key(&self) -> Result<(), String> {
+                StubExecutor.build_msauth_key()
+            }
             fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
                 StubExecutor.check_program(base_pc, words)
             }
@@ -7944,6 +7989,15 @@ pub(crate) mod tests {
     }
 
     impl ConfidentialExecutor for FlakyDeploy {
+        fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+            StubExecutor.install_msauth_vk(blob)
+        }
+        fn enable_auth_multisig(&self) {
+            StubExecutor.enable_auth_multisig()
+        }
+        fn build_msauth_key(&self) -> Result<(), String> {
+            StubExecutor.build_msauth_key()
+        }
         fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, crate::confidential::ConfidentialError> {
             if words.len() == 7 && self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % 2 == 1 {
                 return Err(crate::confidential::ConfidentialError::Disabled);

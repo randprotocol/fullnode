@@ -2318,6 +2318,15 @@ mod admission_tests {
         /// The stub, with a header gate that refuses and a count of step 7b's calls.
         struct HeaderRefusing(AtomicUsize);
         impl ConfidentialExecutor for HeaderRefusing {
+            fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+                StubExecutor.install_msauth_vk(blob)
+            }
+            fn enable_auth_multisig(&self) {
+                StubExecutor.enable_auth_multisig()
+            }
+            fn build_msauth_key(&self) -> Result<(), String> {
+                StubExecutor.build_msauth_key()
+            }
             fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
                 StubExecutor.check_program(base_pc, words)
             }
@@ -2943,6 +2952,15 @@ mod admission_tests {
     }
 
     impl ConfidentialExecutor for TreeProbe {
+        fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+            StubExecutor.install_msauth_vk(blob)
+        }
+        fn enable_auth_multisig(&self) {
+            StubExecutor.enable_auth_multisig()
+        }
+        fn build_msauth_key(&self) -> Result<(), String> {
+            StubExecutor.build_msauth_key()
+        }
         fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
             StubExecutor.check_program(base_pc, words)
         }

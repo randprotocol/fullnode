@@ -179,6 +179,20 @@ pub fn startup(
     load_msauth_key(&path, profile, true, opts.build, |blob| executor.install_msauth_vk(blob))
 }
 
+/// `rand-node verify`'s step (plan Task 3 review): the same load as [`startup`], never a build.
+/// `verify` replays the chain through `node::load_genesis`, which opens the msauth path on a
+/// multisig chain; without the pinned blob installed first, the first multisig auth proof the
+/// replay meets would build the ~4 GB key lazily. So the blob is loaded here exactly as `run`
+/// loads it — a missing or unpinned file is the same loud error — and `--build-msauth-key` is not
+/// honoured: a verify never builds.
+pub fn verify_startup(
+    gs: &randprotocol_core::genesis::GenesisState,
+    path: Option<PathBuf>,
+    executor: &dyn randprotocol_core::confidential::ConfidentialExecutor,
+) -> Result<MsauthKeySource> {
+    startup(gs, &MsauthKeyOptions { path, build: false }, executor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +457,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `rand-node verify` on a multisig chain loads the pinned blob as `run` does: `Loaded`, and
+    /// no key built (neither the machine's nor the single-flight slot's); a missing blob is the
+    /// same loud error naming the path and the pin, even though `verify` has no build flag.
+    #[test]
+    fn verify_on_a_multisig_chain_loads_the_blob_and_builds_nothing() {
+        let key = randprotocol_core::Keypair::from_seed([9; 32]).unwrap();
+        let blob = Path::new(env!("CARGO_MANIFEST_DIR")).join("../randprotocol-zkvm/keys/msauth-vk-test.bin");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("genesis.json"), msauth_genesis(&key, true).to_json()).unwrap();
+        let (gs, node_ex) = crate::node::load_genesis(dir.path()).unwrap();
+        assert_eq!(verify_startup(&gs, Some(blob.clone()), node_ex.as_ref()).unwrap(), MsauthKeySource::Loaded);
+        // The same load into a bare executor, to count builds.
+        let ex = ZkExecutor::new(FriProfile::Test);
+        ex.enable_auth_multisig();
+        assert_eq!(verify_startup(&gs, Some(blob), &ex).unwrap(), MsauthKeySource::Loaded);
+        assert_eq!(ex.msauth_key_source(), MsauthKeySource::Loaded);
+        assert!(ex.msauth_key_ready());
+        assert_eq!((ex.msauth_machine_key_builds(), ex.msauth_key_builds()), (0, 0));
+        let missing = dir.path().join("no-such-msauth-vk-test.bin");
+        let e = format!("{:#}", verify_startup(&gs, Some(missing.clone()), &ZkExecutor::new(FriProfile::Test)).unwrap_err());
+        assert!(e.contains(&missing.display().to_string()) && e.contains(msauth_vk::pin(FriProfile::Test)), "{e}");
+        // A chain without the field never reads the path.
+        std::fs::write(dir.path().join("genesis.json"), msauth_genesis(&key, false).to_json()).unwrap();
+        let (gs, node_ex) = crate::node::load_genesis(dir.path()).unwrap();
+        assert_eq!(verify_startup(&gs, Some(missing), node_ex.as_ref()).unwrap(), MsauthKeySource::Absent);
     }
 
     /// The carried `start_with` test with the predicate true: a multisig genesis and the

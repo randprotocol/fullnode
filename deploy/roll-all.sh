@@ -67,7 +67,8 @@ IPS=$(grep -oE '/ip4/[0-9.]+' deploy/nodes.env | cut -d/ -f3 | sort -u)
 # NO_MSAUTH_VK=1 says "this chain has no multisig"; a host whose genesis names hc_auth_multisig
 # proves it wrong, and its new node would refuse to start without the blob (plan Task 3). So,
 # before anything is copied, every droplet's genesis is read where the node reads it: the
-# `--datadir` of the installed rand-node unit (the last one, as the cutover scripts read it),
+# `--datadir` of the installed rand-node unit (the last one, either `--datadir P` or
+# `--datadir=P`, as the cutover scripts read it),
 # `<datadir>/genesis.json` (`node::load_genesis`). The check is a grep for the key
 # `"hc_auth_multisig"`: serde writes every present field under its name and omits an absent one,
 # so the key is in the file exactly when the genesis names it — no binary, no RPC, no running
@@ -76,7 +77,7 @@ IPS=$(grep -oE '/ip4/[0-9.]+' deploy/nodes.env | cut -d/ -f3 | sort -u)
 # unproved. Node A's launchd job (retired since 2026-09-27) is not read; pass the blob if it runs.
 if [ -z "$MSAUTH_VK" ]; then
   for ip in $IPS; do
-    ms=$(ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip 'D=$(systemctl cat rand-node 2>/dev/null | grep -o -- "--datadir [^ ]*" | tail -1 | cut -d" " -f2); [ -n "$D" ] && [ -r "$D/genesis.json" ] || { echo "unreadable ${D:-<no --datadir in the rand-node unit>}/genesis.json"; exit 0; }; if grep -q "\"hc_auth_multisig\"" "$D/genesis.json"; then echo "multisig $D/genesis.json"; else echo "plain"; fi' 2>/dev/null)
+    ms=$(ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip 'D=$(systemctl cat rand-node 2>/dev/null | grep -oE -- "--datadir[= ][^ ]*" | tail -1 | sed -E "s/^--datadir[= ]//"); [ -n "$D" ] && [ -r "$D/genesis.json" ] || { echo "unreadable ${D:-<no --datadir in the rand-node unit>}/genesis.json"; exit 0; }; if grep -q "\"hc_auth_multisig\"" "$D/genesis.json"; then echo "multisig $D/genesis.json"; else echo "plain"; fi' 2>/dev/null)
     case "$ms" in
       plain) ;;
       multisig*) echo "NO_MSAUTH_VK=1 but $ip's genesis names hc_auth_multisig (${ms#multisig }): its node refuses to start without msauth-vk-production.bin — pass it (fifth argument or MSAUTH_VK)"; exit 1 ;;

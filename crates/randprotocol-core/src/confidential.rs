@@ -70,7 +70,10 @@ pub enum ConfidentialError {
 }
 
 /// A method added here must also be forwarded in the node's `verify_cache::CachingExecutor`, or
-/// that wrapper inherits the default.
+/// that wrapper inherits the default. The private-multisig methods — `install_msauth_vk`,
+/// `enable_auth_multisig`, `build_msauth_key`, `auth_header`, `warm_auth_multisig` and
+/// `auth_multisig_key_ready` — have no default at all, so a wrapper that does not forward one
+/// does not compile.
 pub trait ConfidentialExecutor: Send + Sync {
     /// Validate program code at deploy time (must be cheap: it runs inside block application)
     /// and return the code commitment recorded on chain.
@@ -280,24 +283,22 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// multisig, plan Task 2b): the executor checks them against its pinned digest, its profile
     /// and the msauth shape, and installs the key without building it. A node calls it at startup
     /// only on a chain naming `hc_auth_multisig`, on the bare executor (it is a startup step, not a
-    /// verification, so the caching wrapper has nothing to add). The default — an executor with
-    /// no msauth machine — refuses.
-    fn install_msauth_vk(&self, _blob: &[u8]) -> Result<(), String> {
-        Err("this executor has no msauth verifier key".into())
-    }
+    /// verification, so the caching wrapper has nothing to add — it forwards). Required: an
+    /// executor with no msauth machine refuses (the stub accepts any blob).
+    fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String>;
     /// Private multisig (plan Task 3): this executor runs a chain whose genesis names
     /// `hc_auth_multisig`, so `verify_auth` may take the multisig guest's path. Until it is called
     /// an executor refuses the multisig `hc` without touching its msauth key — the path is
     /// unreachable on every other chain. `node::load_genesis` calls it once, on the bare executor
-    /// (before any caching wrapper), for exactly such a genesis. The default — an executor with no
-    /// msauth path — does nothing.
-    fn enable_auth_multisig(&self) {}
+    /// (before any caching wrapper), for exactly such a genesis; every wrapper forwards it, so the
+    /// call opens the path through a wrapper too. Required: an executor with no msauth path does
+    /// nothing.
+    fn enable_auth_multisig(&self);
     /// Build the multisig auth verifier key on this host (Task 2b's `--build-msauth-key`,
-    /// development only: ~80 s and ~4 GB at production). Never called by default. May be a no-op.
-    /// `Err` when the built key's SHA-256 is not this build's pin (the caller logs it loudly).
-    fn build_msauth_key(&self) -> Result<(), String> {
-        Ok(())
-    }
+    /// development only: ~80 s and ~4 GB at production). Never called by default. Required; may
+    /// be a no-op. `Err` when the built key's SHA-256 is not this build's pin (the caller logs it
+    /// loudly).
+    fn build_msauth_key(&self) -> Result<(), String>;
     /// The v0.6 canonical-proof rules, for a bundle or a call proof alike: the first header or
     /// transcript field of `proof` that is not the value the honest prover writes, named, or
     /// `None`. A field the verifier does not bind to the statement lets anyone who relays a
@@ -656,6 +657,18 @@ impl StubExecutor {
 }
 
 impl ConfidentialExecutor for StubExecutor {
+    /// The stub has no msauth machine: it refuses every blob, as an executor without one must.
+    fn install_msauth_vk(&self, _blob: &[u8]) -> Result<(), String> {
+        Err("this executor has no msauth verifier key".into())
+    }
+
+    /// The stub's multisig path needs no opening: its `verify_auth` checks the proof's `hc` tag.
+    fn enable_auth_multisig(&self) {}
+
+    fn build_msauth_key(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
         Ok(crate::program::program_id(base_pc, words).0.to_vec())
     }
