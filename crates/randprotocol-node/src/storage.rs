@@ -3506,6 +3506,13 @@ impl Storage {
         Ok(())
     }
 
+    /// Test hook: write a checkpoint row as given, for the startup decisions a stale row drives.
+    #[cfg(test)]
+    pub(crate) fn put_verified_head_for_testing(&self, row: &VerifiedHead) -> Result<()> {
+        self.db.put_cf(self.cf(CF_META), META_VERIFIED_HEAD, bincode::serialize(row)?)?;
+        Ok(())
+    }
+
     /// Test hook: plant the locked block the way v0.5.4 wrote it, so the upgrade path — read
     /// once, folded into the pending set, key retired — can be exercised.
     #[cfg(test)]
