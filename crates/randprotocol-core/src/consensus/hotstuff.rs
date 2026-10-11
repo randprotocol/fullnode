@@ -73,6 +73,8 @@ struct Entry {
 /// `parent` is the block's parent and that parent is still in the tree; otherwise it is dropped
 /// and the block is applied as [`HotStuff::on_proposal`] applies it. Apply is deterministic and a
 /// tree entry's post-state never changes while it is held, so the two are the same result.
+/// An apply that ran across a commit can carry a `SharedSet` delta that the shared base has since
+/// absorbed, until the entry's next absorb: logically equal, costing only memory.
 pub struct PreApplied {
     /// The hash of the block whose `ledger_after` was cloned.
     pub parent: Hash,
@@ -1081,7 +1083,8 @@ impl HotStuff {
         if self.tree.len() >= self.cfg.max_tree_blocks {
             return Err(ConsensusError::TreeFull);
         }
-        // `evict_for_room` never removes the certified chain, so the parent is still there.
+        // `execute_and_insert` looks the parent up again and refuses with `UnknownParent` if it
+        // is gone; that re-lookup, not `evict_for_room`'s choice, is what keeps the apply safe.
         self.execute_and_insert(&block, pre)?;
         self.refresh_current_set();
 

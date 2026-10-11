@@ -3886,7 +3886,9 @@ fn pre_execute_refusals_still_fire_with_a_pre_applied_result() {
         let applied = pre_apply(&pre, &block);
         assert!(applied.result.is_ok() && applied.parent == bad.parent());
         assert_eq!(plain.on_proposal(bad.clone(), sim.now).unwrap_err(), want);
+        let before = pre_exec.calls();
         assert_eq!(pre.on_proposal_with(bad.clone(), sim.now, Some(applied)).unwrap_err(), want);
+        assert_eq!(pre_exec.calls(), before, "refused before the apply step: the executor is not called");
         assert!(!pre.has_block(&bad.hash()));
     }
 

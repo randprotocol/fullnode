@@ -13,14 +13,14 @@ use crate::storage::{Storage, VerifyMode};
 use anyhow::{anyhow, Context, Result};
 use libp2p::{Multiaddr, PeerId};
 use randprotocol_core::confidential::ConfidentialExecutor;
-use randprotocol_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff, NotHeld};
+use randprotocol_core::consensus::{Action, CommittedBlock, ConsensusConfig, ConsensusError, ConsensusMessage, HotStuff, NotHeld, PreApplied};
 use randprotocol_core::Block;
 use randprotocol_core::genesis::{Genesis, GenesisState};
 use randprotocol_core::{Hash, Keypair, Ledger, NoVerified, ShieldedAddress, Transaction, ValidatorSet, Word8, FAUCET_MAX_UNITS};
 use randprotocol_zkvm::executor::ZkExecutor;
 use randprotocol_zkvm::notes::{Note, SpendKey};
 use randprotocol_zkvm::viewing::TxKey;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, Ordering::SeqCst};
@@ -80,6 +80,10 @@ pub struct NodeConfig {
     /// Proof-verification workers (`--verify-workers`); `None` sizes them to the host
     /// ([`VerifyLimits::for_host`], spec 2026-10-05 §6).
     pub verify_workers: Option<usize>,
+    /// Apply incoming proposals on the consensus loop, as before (`--apply-proposals-inline`,
+    /// spec 2026-10-11 off-loop apply §4.5); `false`, the default, applies them on a blocking
+    /// worker ([`OFFLOOP_APPLIES`]).
+    pub apply_inline: bool,
     /// Keep only this much block history (history pruning spec §1); `None` keeps everything.
     pub prune_history: Option<Duration>,
     /// Spec 2026-09-28 §4.1: price calls by their proof header; None = no policy.
@@ -1318,6 +1322,39 @@ struct Node {
     /// The sender every verification task answers on; its receiver is an arm of the loop's
     /// `select!`.
     verdicts_tx: mpsc::Sender<Verdict>,
+    /// The sender every off-loop proposal apply answers on (spec 2026-10-11 off-loop apply
+    /// §4.2); its receiver is an arm of the loop's `select!`, handled by [`Node::on_applied`].
+    applied_tx: mpsc::Sender<Applied>,
+    /// The proposals being applied on a blocking worker right now, at most [`OFFLOOP_APPLIES`]:
+    /// each is delivered to the replica by [`Node::on_applied`] when its [`Applied`] comes back,
+    /// and until then counts as held for dedupe and by-hash fetches (§4.3).
+    in_flight: HashSet<Hash>,
+    /// Proposals whose parent is in flight or itself waiting, by that parent's hash (§4.4), at
+    /// most [`WAITING_BLOCKS`] in all: released through [`Node::take_proposals`] once the parent
+    /// has been delivered, whatever the replica made of it.
+    waiting: HashMap<Hash, Vec<Block>>,
+    /// [`NodeConfig::apply_inline`]: deliver every proposal straight to the replica, on the loop.
+    apply_inline: bool,
+}
+
+/// Incoming proposals applied on blocking workers at once (spec 2026-10-11 off-loop apply §4.1).
+/// One more is delivered on the loop as before, so a burst costs no more than it used to.
+const OFFLOOP_APPLIES: usize = 4;
+
+/// Proposals held back behind an in-flight parent, over every parent (§4.4). Past it a proposal
+/// is delivered on the loop, where the replica orphans it until its parent lands.
+const WAITING_BLOCKS: usize = 8;
+
+/// An off-loop proposal apply's outcome (spec 2026-10-11 off-loop apply §4.1–4.2):
+/// `apply_block_for_sync` on a clone of `parent`'s post-state, with the replica's sidecar,
+/// executor and verified set. `result` is `None` when the apply panicked; the block is then
+/// delivered plainly and applied on the loop, which panics or refuses exactly as it always did.
+struct Applied {
+    block: Block,
+    parent: Hash,
+    result: Option<Result<(Ledger, Vec<randprotocol_core::CallReceipt>), randprotocol_core::BlockError>>,
+    /// How long the apply itself took, on its worker.
+    took: Duration,
 }
 
 const MAX_FETCH_ATTEMPTS: usize = 8;
@@ -2639,6 +2676,8 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     // At most `verify_limits.in_flight` verdicts can be outstanding — a worker only exists because
     // the loop counted it in — so the channel never has to hold more than that.
     let (verdicts_tx, verdicts_rx) = mpsc::channel(verify_limits.in_flight);
+    // Likewise at most `OFFLOOP_APPLIES` proposal applies are outstanding.
+    let (applied_tx, applied_rx) = mpsc::channel(OFFLOOP_APPLIES);
     // RESCAN-LEDGER-1: this pool admits faucet mints from the genesis's minters only.
     let mut mempool = Mempool::new(10_000);
     mempool.set_faucet_minters(admission::faucet_minters(&gs));
@@ -2646,6 +2685,10 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         mempool.set_gas_policy(p);
     }
     let binding_signer = if cfg.validator { Some(Keypair::from_seed(cfg.seed)?) } else { None };
+    let apply_inline = cfg.apply_inline;
+    if apply_inline {
+        tracing::info!("incoming proposals are applied on the consensus loop (--apply-proposals-inline)");
+    }
     let node = Node {
         cfg,
         gs,
@@ -2711,13 +2754,17 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         verify_limits,
         verify_queue: VecDeque::new(),
         verdicts_tx,
+        applied_tx,
+        in_flight: HashSet::new(),
+        waiting: HashMap::new(),
+        apply_inline,
     };
     // A fatal error in the loop ends the node, but most embedders (every cluster test, and any
     // caller that keeps the handle without awaiting it) never look at the `JoinHandle`, so
     // without this the node simply goes quiet and looks like a consensus or networking stall.
     // The `Result` is still returned for whoever does await it.
     let task = tokio::spawn(async move {
-        let outcome = node.run(events, cmd_rx, verdicts_rx, early).await;
+        let outcome = node.run(events, cmd_rx, verdicts_rx, applied_rx, early).await;
         match &outcome {
             Ok(()) => tracing::info!("node loop stopped"),
             Err(e) => tracing::error!("node loop exited: {e:#}"),
@@ -2741,6 +2788,7 @@ impl Node {
         mut events: mpsc::Receiver<NetworkEvent>,
         mut cmds: mpsc::Receiver<NodeCommand>,
         mut verdicts: mpsc::Receiver<Verdict>,
+        mut applied: mpsc::Receiver<Applied>,
         early: Vec<NetworkEvent>,
     ) -> Result<()> {
         let actions = self.hs.start();
@@ -2768,6 +2816,13 @@ impl Node {
                     // This node holds a sender for as long as it lives, so the channel cannot close
                     // under it; stopping beats spinning on a closed receiver if it ever does.
                     None => { tracing::warn!("verify channel closed; shutting down"); return Ok(()); }
+                },
+                // A proposal applied on a blocking worker (spec 2026-10-11 off-loop apply §4.2):
+                // only the replica's insert is left for this loop.
+                a = applied.recv() => match a {
+                    Some(a) => self.on_applied(a).await?,
+                    // As for verdicts: this node holds a sender for as long as it lives.
+                    None => { tracing::warn!("apply channel closed; shutting down"); return Ok(()); }
                 },
                 _ = sleep_until(self.timeout.map(|t| t.1)) => {
                     if let Some((view, _)) = self.timeout.take() {
@@ -3795,9 +3850,28 @@ impl Node {
         Ok(())
     }
 
+    /// A consensus message for the replica. A proposal is applied off the loop
+    /// ([`Node::take_proposals`], spec 2026-10-11 off-loop apply §4.1) unless `apply_inline`;
+    /// everything else, and every proposal under the kill switch, is delivered as it arrives.
     async fn on_consensus(&mut self, m: ConsensusMessage) -> Result<()> {
+        match m {
+            ConsensusMessage::Proposal(block) if !self.apply_inline => self.take_proposals(vec![block]).await,
+            m => self.deliver(m).await,
+        }
+    }
+
+    /// Hand `m` to the replica now, on the loop: the path every message took before the
+    /// off-loop apply, and still the path of every message but an off-loop proposal.
+    async fn deliver(&mut self, m: ConsensusMessage) -> Result<()> {
         let is_proposal = matches!(m, ConsensusMessage::Proposal(_));
         let result = self.hs.on_message(m, now_ms());
+        self.after_consensus(is_proposal, result).await
+    }
+
+    /// What follows the replica's handling of a message, whether it was delivered on the loop
+    /// or completed an off-loop apply ([`Node::on_applied`]): the one place either outcome is
+    /// acted on.
+    async fn after_consensus(&mut self, is_proposal: bool, result: Result<Vec<Action>, ConsensusError>) -> Result<()> {
         // Audit v6, STAKE-1: an equivocation is refused with an error, which carries no actions,
         // so the evidence the replica kept is collected here, on every outcome.
         let evidence = self.hs.take_equivocations();
@@ -3835,6 +3909,118 @@ impl Node {
                 Ok(())
             }
         }
+    }
+
+    /// Route each proposal in `blocks` (spec 2026-10-11 off-loop apply §4.1, §4.4), and every
+    /// proposal that was waiting behind one of them once it has been delivered, until none is
+    /// left. Each one ends up on exactly one path: dropped as a copy of one in flight or waiting,
+    /// queued behind its parent, applied on a worker, or delivered here.
+    async fn take_proposals(&mut self, blocks: Vec<Block>) -> Result<()> {
+        let mut queue = VecDeque::from(blocks);
+        while let Some(block) = queue.pop_front() {
+            let hash = block.hash();
+            if self.route_proposal(block).await? {
+                // Its children's parent is in the tree now, or will never be: either way they
+                // no longer wait.
+                queue.extend(self.waiting.remove(&hash).unwrap_or_default());
+            }
+        }
+        Ok(())
+    }
+
+    /// One proposal's path (§4.1); `true` when it was delivered to the replica here, on the loop.
+    async fn route_proposal(&mut self, block: Block) -> Result<bool> {
+        let hash = block.hash();
+        if self.applying(&hash) {
+            // A copy of a proposal already on its way to the replica: dropped, silently.
+            return Ok(false);
+        }
+        // A block the replica holds goes straight to it, which drops it at once, as before.
+        if !self.hs.has_block(&hash) {
+            let parent = block.parent();
+            if self.hs.ledger_after(&parent).is_none() {
+                if self.applying(&parent) && self.waiting_len() < WAITING_BLOCKS {
+                    tracing::debug!("proposal {hash:?} waits for its parent {parent:?}, being applied");
+                    self.waiting.entry(parent).or_default().push(block);
+                    return Ok(false);
+                }
+            } else if self.in_flight.len() < OFFLOOP_APPLIES {
+                match self.hs.covered_sidecar(&block) {
+                    Ok(sidecar) => {
+                        self.spawn_apply(block, sidecar);
+                        return Ok(false);
+                    }
+                    // The replica refuses it the same way, on the loop.
+                    Err(e) => tracing::debug!("proposal {hash:?}: no sidecar for an off-loop apply ({e}); delivered"),
+                }
+            }
+        }
+        self.deliver(ConsensusMessage::Proposal(block)).await?;
+        Ok(true)
+    }
+
+    /// Apply `block` on a blocking worker (§4.1): a clone of its parent's post-state, taken
+    /// here as the replica's own apply takes it, through this node's executor (the caching one
+    /// the replica holds) and verified set. Its [`Applied`] comes back to [`Node::on_applied`],
+    /// panic or not; only a closed channel — the node shutting down — loses it.
+    fn spawn_apply(&mut self, block: Block, sidecar: BTreeMap<usize, Vec<randprotocol_core::types::CoveredBundle>>) {
+        let parent = block.parent();
+        let ledger = self.hs.ledger_after(&parent).expect("the caller found the parent in the tree").clone();
+        let (executor, verified, out) = (self.executor.clone(), self.verified.clone(), self.applied_tx.clone());
+        self.in_flight.insert(block.hash());
+        tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut ledger = ledger;
+                ledger.apply_block_for_sync(&block, &sidecar, &[], executor.as_ref(), verified.as_ref()).map(|receipts| (ledger, receipts))
+            }))
+            .map_err(|payload| {
+                let what = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "a non-string panic".into());
+                tracing::warn!("the off-loop apply of proposal {:?} panicked: {what}; it is delivered on the loop", block.hash());
+            })
+            .ok();
+            // A send that fails is the node shutting down; the result has nowhere to go.
+            let _ = out.blocking_send(Applied { block, parent, result, took: started.elapsed() });
+        });
+    }
+
+    /// An off-loop apply came back (§4.2): the replica runs every check of `on_proposal` on the
+    /// loop and inserts the result — or, after a panic, applies the block itself — and the
+    /// outcome is handled as any delivered proposal's is. The proposals waiting behind this one
+    /// are then routed, whatever became of it.
+    async fn on_applied(&mut self, a: Applied) -> Result<()> {
+        let Applied { block, parent, result, took } = a;
+        let hash = block.hash();
+        self.in_flight.remove(&hash);
+        let result = match result {
+            Some(result) => {
+                tracing::debug!("proposal {hash:?} applied off the loop in {} ms", took.as_millis());
+                self.hs.on_proposal_with(block, now_ms(), Some(PreApplied { parent, result }))
+            }
+            None => self.hs.on_message(ConsensusMessage::Proposal(block), now_ms()),
+        };
+        self.after_consensus(true, result).await?;
+        let children = self.waiting.remove(&hash).unwrap_or_default();
+        self.take_proposals(children).await
+    }
+
+    /// Whether `h` is a proposal on its way to the replica: applying on a worker, or waiting
+    /// for its parent's apply. Counted as held by dedupe and by every by-hash fetch (§4.3).
+    fn applying(&self, h: &Hash) -> bool {
+        self.in_flight.contains(h) || self.waiting.values().flatten().any(|b| b.hash() == *h)
+    }
+
+    /// The replica holds `h`, or it is on its way there ([`Node::applying`]).
+    fn holds_block(&self, h: &Hash) -> bool {
+        self.hs.has_block(h) || self.applying(h)
+    }
+
+    fn waiting_len(&self) -> usize {
+        self.waiting.values().map(Vec::len).sum()
     }
 
     fn serve_sync(&mut self, req: SyncRequest) -> SyncResponse {
@@ -3893,7 +4079,7 @@ impl Node {
         for stale in expire_stale_fetches(&mut self.fetch_inflight, self.wire.sync_request_timeout, Instant::now()) {
             tracing::debug!("by-hash fetch of {stale:?} got no answer within the wire timeout; abandoned");
         }
-        if self.hs.has_block(&h) || fetch_blocked(&self.fetch_inflight, &h) {
+        if self.holds_block(&h) || fetch_blocked(&self.fetch_inflight, &h) {
             return Vec::new();
         }
         let (best, held) = (self.best_peer_height(), self.hs.pending_tip_height().max(self.hs.committed_height()));
@@ -4027,7 +4213,7 @@ impl Node {
         // I2), as the full path counts every proposal it hands on; only these, since an
         // `Ignore`d header's signature was never verified.
         self.highest_proposal_seen = self.highest_proposal_seen.max(c.header.height);
-        if self.hs.has_block(&hash) {
+        if self.holds_block(&hash) {
             return Ok(());
         }
         let view = c.header.view;
@@ -4157,9 +4343,9 @@ impl Node {
     /// by-hash fetch of a parent, a batch (final review fold-in): there is nothing left to fetch
     /// for it.
     fn drop_held_parks(&mut self) {
-        let hs = &self.hs;
-        self.parked.retain(|view, p| {
-            let held = hs.has_block(&p.compact.hash());
+        let held: Vec<u64> = self.parked.iter().filter(|(_, p)| self.holds_block(&p.compact.hash())).map(|(v, _)| *v).collect();
+        self.parked.retain(|view, _| {
+            let held = held.contains(view);
             if held {
                 tracing::debug!(view, "parked proposal's block is held; the park is dropped");
             }
@@ -4261,7 +4447,7 @@ impl Node {
     /// it (it came another way), in which case the park is only dropped.
     async fn complete_park(&mut self, view: u64) -> Result<()> {
         let Some(block) = self.parked.remove(&view).and_then(compact::Parked::into_block) else { return Ok(()) };
-        if self.hs.has_block(&block.hash()) {
+        if self.holds_block(&block.hash()) {
             tracing::debug!("parked proposal view {view} completed for a block already held; dropped");
             return Ok(());
         }
@@ -4313,7 +4499,7 @@ impl Node {
     /// A by-hash fetch came back empty or failed: try the next peer.
     async fn retry_fetch(&mut self, request_id: libp2p::request_response::OutboundRequestId) -> Result<()> {
         if let Some((h, _)) = self.fetch_inflight.remove(&request_id) {
-            if !self.hs.has_block(&h) {
+            if !self.holds_block(&h) {
                 let acts = self.fetch_block(h).await;
                 self.handle_actions(acts).await?;
             }
@@ -4900,6 +5086,11 @@ mod tests {
     use randprotocol_core::genesis::GenesisState;
     use randprotocol_core::{Block, BlockHeader, QuorumCertificate, Vote};
     use crate::storage::VerifiedHead;
+    use randprotocol_core::confidential::ConfidentialError;
+    use randprotocol_core::ledger::aggregation::{TreeConfig, TreeDigests};
+    use randprotocol_core::notes::BundleDigestInput;
+    use randprotocol_core::program::{CallOutcome, ProgramRecord};
+    use randprotocol_core::types::TX_BINDING_WORDS;
 
     /// A one-validator chain with two-block epochs, committed past its first boundary: blocks 1
     /// (epoch 0) and 2 (the first block of epoch 1, whose set is recorded with it).
@@ -6918,7 +7109,22 @@ mod tests {
         bare_node_with(storage, gs, hs, true)
     }
 
+    /// The harness's nodes deliver proposals inline (`apply_inline`): the tests over gossip,
+    /// compact proposals, parks and fetches read the replica straight after the call. The
+    /// off-loop path has its own harness, [`offloop_node`].
     fn bare_node_with(storage: Storage, gs: GenesisState, hs: HotStuff, answer: bool) -> (Node, mpsc::UnboundedReceiver<Seen>) {
+        let (mut node, seen, _applied) = bare_node_full(storage, gs, hs, answer);
+        node.apply_inline = true;
+        (node, seen)
+    }
+
+    /// [`bare_node`] with the off-loop apply on, as `rand-node run` has it, and the receiver its
+    /// applies answer on: a test plays the loop's arm by hand, `node.on_applied(rx.recv().await)`.
+    fn offloop_node(storage: Storage, gs: GenesisState, hs: HotStuff) -> (Node, mpsc::UnboundedReceiver<Seen>, mpsc::Receiver<Applied>) {
+        bare_node_full(storage, gs, hs, false)
+    }
+
+    fn bare_node_full(storage: Storage, gs: GenesisState, hs: HotStuff, answer: bool) -> (Node, mpsc::UnboundedReceiver<Seen>, mpsc::Receiver<Applied>) {
         let local = PeerId::random();
         let (net, mut cmds) = network::NetworkHandle::detached_for_test(local);
         let (seen_tx, seen_rx) = mpsc::unbounded_channel();
@@ -6955,12 +7161,14 @@ mod tests {
             keep_raw_proofs: false,
             min_free_disk_bytes: 0,
             verify_workers: None,
+            apply_inline: false,
             prune_history: None,
             gas_policy: None,
         };
         let wire = network::WireLimits::for_ledger(&gs.ledger);
         let max_block_bytes = gs.ledger.max_block_bytes();
         let (verdicts_tx, _verdicts_rx) = mpsc::channel(VerifyLimits::for_cores(1).in_flight);
+        let (applied_tx, applied_rx) = mpsc::channel(OFFLOOP_APPLIES);
         let peer_bindings = crate::peer_bindings::PeerBindings::load(gs.hash(), Default::default(), Default::default());
         let node = Node {
             cfg,
@@ -7027,8 +7235,12 @@ mod tests {
             verify_limits: VerifyLimits::for_cores(1),
             verify_queue: VecDeque::new(),
             verdicts_tx,
+            applied_tx,
+            in_flight: HashSet::new(),
+            waiting: HashMap::new(),
+            apply_inline: false,
         };
-        (node, seen_rx)
+        (node, seen_rx, applied_rx)
     }
 
     /// One connected peer claiming `height`.
@@ -10539,5 +10751,378 @@ mod tests {
         assert_eq!(rpc_refusal(Acceptance::Reject, &h, &refused), MempoolError::Invalid(TxError::BadDigest));
         // A full verify queue is a "not now", which is what `Full` already says to a client.
         assert_eq!(rpc_refusal(Acceptance::Ignore, &h, &refused), MempoolError::Full);
+    }
+
+    // ---- Off-loop proposal apply (spec 2026-10-11 off-loop apply §4; §5 tests 5–11) ----
+
+    /// The stub executor, running `hook` before each `verify_bundle` and counting those calls:
+    /// what the off-loop tests hold an apply on (a gate) or break it with (a panic).
+    struct Hooked {
+        hook: Box<dyn Fn() + Send + Sync>,
+        bundles: AtomicUsize,
+    }
+
+    impl Hooked {
+        fn new(hook: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
+            Arc::new(Hooked { hook: Box::new(hook), bundles: AtomicUsize::new(0) })
+        }
+        fn bundles(&self) -> usize {
+            self.bundles.load(SeqCst)
+        }
+    }
+
+    impl ConfidentialExecutor for Hooked {
+        fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
+            StubExecutor.check_program(base_pc, words)
+        }
+        fn max_callable_program_words(&self, n: usize) -> Option<usize> {
+            StubExecutor.max_callable_program_words(n)
+        }
+        fn verify_call(&self, p: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.verify_call(p, proof)
+        }
+        fn decode_call(&self, p: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.decode_call(p, proof)
+        }
+        fn verify_call_hardened(&self, p: &ProgramRecord, proof: &[u8], s: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.verify_call_hardened(p, proof, s)
+        }
+        fn decode_call_hardened(&self, p: &ProgramRecord, proof: &[u8], s: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.decode_call_hardened(p, proof, s)
+        }
+        fn verify_invoke(&self, p: &ProgramRecord, proof: &[u8], s: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.verify_invoke(p, proof, s)
+        }
+        fn decode_invoke(&self, p: &ProgramRecord, proof: &[u8], s: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.decode_invoke(p, proof, s)
+        }
+        fn verify_perp(&self, hc: &Word8, max_tier: u8, s: &[u32], proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.verify_perp(hc, max_tier, s, proof)
+        }
+        fn decode_perp(&self, hc: &Word8, max_tier: u8, s: &[u32], proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            StubExecutor.decode_perp(hc, max_tier, s, proof)
+        }
+        fn public_digest(&self, words: &[u32]) -> Word8 {
+            StubExecutor.public_digest(words)
+        }
+        fn node_hash(&self, l: &Word8, r: &Word8) -> Word8 {
+            StubExecutor.node_hash(l, r)
+        }
+        fn hash_domain(&self, d: u32, m: &[u32]) -> Word8 {
+            StubExecutor.hash_domain(d, m)
+        }
+        fn note_commitment(&self, pk: &Word8, from: &Word8, amount: u64, asset: u32, time: u32, r: &Word8) -> Word8 {
+            StubExecutor.note_commitment(pk, from, amount, asset, time, r)
+        }
+        fn bundle_digest(&self, i: &BundleDigestInput) -> Word8 {
+            StubExecutor.bundle_digest(i)
+        }
+        fn bundle_digest_v3(&self, i: &BundleDigestInput) -> Word8 {
+            StubExecutor.bundle_digest_v3(i)
+        }
+        fn bundle_proof_digest(&self, hc: &Word8, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.bundle_proof_digest(hc, proof)
+        }
+        fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.auth_proof_digest(proof)
+        }
+        fn verify_auth(&self, hc: &Word8, proof: &[u8], b: &[u32; TX_BINDING_WORDS]) -> Result<Word8, ConfidentialError> {
+            StubExecutor.verify_auth(hc, proof, b)
+        }
+        fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            StubExecutor.bundle_gas_limit(proof)
+        }
+        fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            StubExecutor.auth_gas_limit(proof)
+        }
+        fn verify_bundle(&self, hc: &Word8, proof: &[u8], b: &[u32; TX_BINDING_WORDS]) -> Result<(), ConfidentialError> {
+            self.bundles.fetch_add(1, SeqCst);
+            (self.hook)();
+            StubExecutor.verify_bundle(hc, proof, b)
+        }
+        fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
+            StubExecutor.non_canonical_proof(proof)
+        }
+        fn aggregate_program_digest(&self, s: &DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
+            StubExecutor.aggregate_program_digest(s)
+        }
+        fn check_aggregate_header(&self, proof: &[u8]) -> Result<(), ConfidentialError> {
+            StubExecutor.check_aggregate_header(proof)
+        }
+        fn verify_aggregate(&self, s: &DeclaredShape, c: &[CoveredBundle], proof: &[u8], b: &[u32; 8]) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+            StubExecutor.verify_aggregate(s, c, proof, b)
+        }
+        fn aggregate_proof_tier(&self, proof: &[u8]) -> Result<u8, ConfidentialError> {
+            StubExecutor.aggregate_proof_tier(proof)
+        }
+        fn tree_digests(&self, t: &TreeConfig) -> Result<TreeDigests, ConfidentialError> {
+            StubExecutor.tree_digests(t)
+        }
+        fn verify_tree(&self, t: &TreeConfig, c: &[CoveredBundle], proof: &[u8], b: &[u32; 8], depth: u32) -> Result<Vec<[u32; 8]>, ConfidentialError> {
+            StubExecutor.verify_tree(t, c, proof, b, depth)
+        }
+    }
+
+    /// `block`'s post-state over `ledger`, its parent's: what the replica will hold for it, and
+    /// what a child proposal is built on.
+    fn post_state(ledger: &Ledger, block: &Block) -> Ledger {
+        let mut after = ledger.clone();
+        after.apply_block_for_sync(block, &BTreeMap::new(), &[], &StubExecutor, &NoVerified).expect("the block applies");
+        after
+    }
+
+    /// The next [`Applied`] — the loop's arm, played by hand — and the block it carries.
+    async fn complete(node: &mut Node, applied: &mut mpsc::Receiver<Applied>) -> Hash {
+        let a = tokio::time::timeout(Duration::from_secs(10), applied.recv()).await.expect("an apply comes back").expect("the node holds a sender");
+        let hash = a.block.hash();
+        node.on_applied(a).await.unwrap();
+        hash
+    }
+
+    /// Spec §5 test 5: a proposal goes off the loop — not held right after `on_consensus`, no
+    /// vote yet — and once its apply comes back the replica holds exactly the entry the inline
+    /// path inserts and has voted as the inline path votes.
+    #[tokio::test]
+    async fn an_incoming_proposal_is_applied_off_the_loop_and_voted_as_inline() {
+        let (_d1, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut inline, mut inline_seen) = bare_node(storage, gs, hs);
+        let (_d2, storage, gs, hs) = replica_past_a_boundary();
+        assert_eq!(storage.head_block().unwrap().hash(), head.hash(), "the two fixtures are one chain");
+        let (mut node, mut seen, mut applied) = offloop_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![next_tx(&ledger, 1)]);
+        let hash = block.hash();
+
+        inline.on_consensus(ConsensusMessage::Proposal(block.clone())).await.unwrap();
+        assert!(inline.hs.has_block(&hash));
+        assert!(voted_for(&drain(&mut inline_seen).await, &block));
+
+        node.on_consensus(ConsensusMessage::Proposal(block.clone())).await.unwrap();
+        assert!(!node.hs.has_block(&hash), "not applied on the loop");
+        assert!(node.in_flight.contains(&hash));
+        assert!(!voted_for(&drain(&mut seen).await, &block), "no vote before the apply is back");
+
+        assert_eq!(complete(&mut node, &mut applied).await, hash);
+        assert!(node.hs.has_block(&hash) && node.in_flight.is_empty());
+        assert!(voted_for(&drain(&mut seen).await, &block), "voted once the apply was in");
+        assert!(node.hs.ledger_after(&hash).unwrap() == inline.hs.ledger_after(&hash).unwrap(), "the same entry");
+        assert_eq!(node.hs.ledger_after(&hash).unwrap().state_root(), block.header.state_root);
+        assert_eq!(node.hs.safety_state(), inline.hs.safety_state());
+        assert_eq!((node.hs.view(), node.hs.high_qc()), (inline.hs.view(), inline.hs.high_qc()));
+        assert!(applied.try_recv().is_err(), "one apply");
+    }
+
+    /// Spec §5 test 6: the loop is not blocked by an apply. The apply waits on a gate in the
+    /// executor; meanwhile the node takes the block's own vote, forms the QC (this one-validator
+    /// chain's) and does not fetch the block the QC names, which is on its way. Only then is
+    /// the gate opened. A loop that ran the apply itself would wait out the gate's timeout
+    /// first, which the executor records.
+    #[tokio::test]
+    async fn the_loop_handles_a_vote_while_a_proposal_applies() {
+        let (_d, storage, gs, _ledger) = chain_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let t = timed_out.clone();
+        let exec = Hooked::new(move || {
+            if gate.lock().unwrap().recv_timeout(Duration::from_secs(5)).is_err() {
+                t.store(true, SeqCst);
+            }
+        });
+        // The replica holds the same executor, as `rand-node run`'s does: an apply on the loop
+        // would wait at the gate too.
+        let hs = resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), exec.clone()).unwrap();
+        let (mut node, mut seen, mut applied) = offloop_node(storage, gs, hs);
+        node.executor = exec;
+        claiming_peer(&mut node, 3);
+        let ledger = node.hs.tip_ledger().clone();
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![next_tx(&ledger, 1)]);
+        let hash = block.hash();
+
+        node.on_consensus(ConsensusMessage::Proposal(block.clone())).await.unwrap();
+        let vote = Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), block.view(), hash, &key(1));
+        node.on_consensus(ConsensusMessage::Vote(vote)).await.unwrap();
+        assert_eq!(node.hs.high_qc().block_hash, hash, "the vote was handled while the apply waits");
+        assert!(!node.hs.has_block(&hash));
+        assert!(!timed_out.load(SeqCst), "the apply is still at the gate");
+        let acts = node.fetch_block(hash).await;
+        node.handle_actions(acts).await.unwrap();
+        assert_eq!(sent_by_hash(&mut seen).await, vec![], "the block being applied is not fetched");
+
+        open.send(()).unwrap();
+        assert_eq!(complete(&mut node, &mut applied).await, hash);
+        assert!(node.hs.has_block(&hash));
+        assert!(!timed_out.load(SeqCst), "the gate was opened by the test, after the vote");
+    }
+
+    /// Spec §5 test 7: N and N+1 back to back. N+1 waits behind N rather than being orphaned,
+    /// and gets its own off-loop apply on N once N is in; nothing is fetched. A child whose
+    /// parent's apply is refused is still released, and the replica treats it as today.
+    #[tokio::test]
+    async fn a_chain_of_proposals_applies_off_the_loop_in_order_and_none_is_orphaned() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen, mut applied) = offloop_node(storage, gs, hs);
+        claiming_peer(&mut node, 3);
+        let ledger = node.hs.tip_ledger().clone();
+        let v = node.hs.view();
+        let n = block_on(&head, &ledger, &key(1), v, vec![next_tx(&ledger, 1)]);
+        let after_n = post_state(&ledger, &n);
+        let n1 = block_on(&n, &after_n, &key(1), v + 1, vec![next_tx(&after_n, 2)]);
+
+        node.on_consensus(ConsensusMessage::Proposal(n.clone())).await.unwrap();
+        node.on_consensus(ConsensusMessage::Proposal(n1.clone())).await.unwrap();
+        assert_eq!(node.in_flight, HashSet::from([n.hash()]), "N+1 is not applied on a parent not yet held");
+        assert_eq!(node.waiting.get(&n.hash()).map(|w| w.len()), Some(1), "N+1 waits behind N");
+        assert!(node.applying(&n1.hash()));
+
+        assert_eq!(complete(&mut node, &mut applied).await, n.hash());
+        assert!(node.hs.has_block(&n.hash()));
+        assert!(node.waiting.is_empty() && node.in_flight == HashSet::from([n1.hash()]), "N+1 went off the loop on N");
+        assert!(!node.hs.has_block(&n1.hash()));
+        assert_eq!(complete(&mut node, &mut applied).await, n1.hash(), "N+1's own apply");
+        assert!(node.hs.has_block(&n1.hash()) && node.in_flight.is_empty());
+        let sent = drain(&mut seen).await;
+        assert!(voted_for(&sent, &n) && voted_for(&sent, &n1));
+        assert!(!sent.iter().any(|s| matches!(s, Seen::Sync(_, SyncRequest::BlockByHash(_)))), "no parent was fetched");
+
+        // A parent the apply refuses (a state root its transactions do not produce): the child
+        // waiting behind it is still released and delivered, and orphaned by the replica as it
+        // would be today — the refused parent is then fetched, not lost track of.
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, mut seen, mut applied) = offloop_node(storage, gs, hs);
+        claiming_peer(&mut node, 3);
+        let mut header = n.header.clone();
+        header.state_root = Hash::digest(b"not the post-state");
+        let bad = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, n.transactions.clone(), &key(1));
+        let orphan = block_on(&bad, &after_n, &key(1), v + 1, vec![next_tx(&after_n, 2)]);
+        node.on_consensus(ConsensusMessage::Proposal(bad.clone())).await.unwrap();
+        node.on_consensus(ConsensusMessage::Proposal(orphan.clone())).await.unwrap();
+        assert_eq!(node.waiting_len(), 1);
+        assert_eq!(complete(&mut node, &mut applied).await, bad.hash());
+        assert!(!node.hs.has_block(&bad.hash()), "refused");
+        assert!(node.waiting.is_empty() && node.in_flight.is_empty(), "nothing left waiting or in flight");
+        assert!(applied.try_recv().is_err(), "the child was delivered on the loop, not applied");
+        assert_eq!(sent_by_hash(&mut seen).await.into_iter().map(|(_, h)| h).collect::<Vec<_>>(), vec![bad.hash()], "the orphan's parent is fetched");
+    }
+
+    /// Spec §5 test 8: a copy of a proposal in flight — full or compact — starts no second
+    /// apply, and a by-hash fetch of it sends nothing, though a peer is there to ask (a hash
+    /// nobody holds is fetched from it).
+    #[tokio::test]
+    async fn a_copy_of_an_in_flight_proposal_is_neither_applied_again_nor_fetched() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen, mut applied) = offloop_node(storage, gs, hs);
+        let exec = Hooked::new(|| {});
+        node.executor = exec.clone();
+        claiming_peer(&mut node, 3);
+        let ledger = node.hs.tip_ledger().clone();
+        let tx = next_tx(&ledger, 1);
+        node.mempool.insert_verified(tx.clone(), &ledger, &StubExecutor).unwrap();
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![tx]);
+        let hash = block.hash();
+
+        node.on_consensus(ConsensusMessage::Proposal(block.clone())).await.unwrap();
+        node.on_consensus(ConsensusMessage::Proposal(block.clone())).await.unwrap();
+        node.on_compact_proposal(CompactBlock::of(&block), gossip_id()).await.unwrap();
+        assert_eq!(node.in_flight.len(), 1);
+        assert!(node.waiting.is_empty());
+        let acts = node.fetch_block(hash).await;
+        node.handle_actions(acts).await.unwrap();
+        assert_eq!(sent_by_hash(&mut seen).await, vec![], "an in-flight block is not fetched");
+        let other = Hash::digest(b"a block nobody holds");
+        assert!(node.fetch_block(other).await.is_empty());
+        assert_eq!(sent_by_hash(&mut seen).await.len(), 1, "the control: an unheld hash is fetched");
+
+        assert_eq!(complete(&mut node, &mut applied).await, hash);
+        assert!(node.hs.has_block(&hash));
+        assert!(applied.try_recv().is_err(), "one apply for three copies");
+        assert_eq!(exec.bundles(), 1, "the block's bundle was verified once");
+    }
+
+    /// Spec §5 test 9: with [`OFFLOOP_APPLIES`] applies in flight, the next proposal is
+    /// delivered on the loop; the four in flight still complete.
+    #[tokio::test]
+    async fn at_the_cap_the_next_proposal_is_delivered_inline() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, _seen, mut applied) = offloop_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let v = node.hs.view();
+        // Siblings over the head at successive views, by its one leader: five distinct proposals.
+        let blocks: Vec<Block> = (0..=OFFLOOP_APPLIES as u64).map(|i| block_on(&head, &ledger, &key(1), v + i, vec![next_tx(&ledger, i as u32)])).collect();
+        let (fifth, four) = blocks.split_last().unwrap();
+        for b in four {
+            node.on_consensus(ConsensusMessage::Proposal(b.clone())).await.unwrap();
+        }
+        assert_eq!(node.in_flight.len(), OFFLOOP_APPLIES);
+        assert!(four.iter().all(|b| !node.hs.has_block(&b.hash())));
+        node.on_consensus(ConsensusMessage::Proposal(fifth.clone())).await.unwrap();
+        assert!(node.hs.has_block(&fifth.hash()), "over the cap: applied on the loop, at once");
+        assert_eq!(node.in_flight.len(), OFFLOOP_APPLIES);
+        let mut done = HashSet::new();
+        for _ in four {
+            done.insert(complete(&mut node, &mut applied).await);
+        }
+        assert_eq!(done, four.iter().map(Block::hash).collect());
+        assert!(four.iter().all(|b| node.hs.has_block(&b.hash())) && node.in_flight.is_empty());
+    }
+
+    /// Spec §5 test 10: a panic in the off-loop apply delivers the proposal on the loop, where
+    /// the replica applies it itself (the executor panics only once), and the node goes on to
+    /// handle the next proposal off the loop again.
+    #[tokio::test]
+    async fn a_panic_in_the_off_loop_apply_is_delivered_on_the_loop() {
+        let (_d, storage, gs, _ledger) = chain_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let panicked = Arc::new(AtomicBool::new(false));
+        let p = panicked.clone();
+        let exec = Hooked::new(move || {
+            if !p.swap(true, SeqCst) {
+                panic!("a verifier bug, once");
+            }
+        });
+        // The replica holds the same executor, as `rand-node run`'s does.
+        let hs = resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), exec.clone()).unwrap();
+        let (mut node, mut seen, mut applied) = offloop_node(storage, gs, hs);
+        node.executor = exec.clone();
+        let ledger = node.hs.tip_ledger().clone();
+        let v = node.hs.view();
+        let n = block_on(&head, &ledger, &key(1), v, vec![next_tx(&ledger, 1)]);
+
+        node.on_consensus(ConsensusMessage::Proposal(n.clone())).await.unwrap();
+        assert_eq!(complete(&mut node, &mut applied).await, n.hash());
+        assert!(panicked.load(SeqCst), "the off-loop apply panicked");
+        assert_eq!(exec.bundles(), 2, "and the loop applied the block again");
+        assert!(node.hs.has_block(&n.hash()) && node.in_flight.is_empty());
+        assert!(voted_for(&drain(&mut seen).await, &n));
+
+        let after_n = post_state(&ledger, &n);
+        let n1 = block_on(&n, &after_n, &key(1), v + 1, vec![next_tx(&after_n, 2)]);
+        node.on_consensus(ConsensusMessage::Proposal(n1.clone())).await.unwrap();
+        assert!(node.in_flight.contains(&n1.hash()), "the next proposal goes off the loop");
+        assert_eq!(complete(&mut node, &mut applied).await, n1.hash());
+        assert!(node.hs.has_block(&n1.hash()));
+    }
+
+    /// Spec §5 test 11: `--apply-proposals-inline` delivers on the loop, as before: held and
+    /// voted straight after `on_consensus`, nothing in flight, no apply sent off.
+    #[tokio::test]
+    async fn apply_inline_delivers_the_proposal_on_the_loop() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen, mut applied) = offloop_node(storage, gs, hs);
+        node.apply_inline = true;
+        let ledger = node.hs.tip_ledger().clone();
+        let block = block_on(&head, &ledger, &key(1), node.hs.view(), vec![next_tx(&ledger, 1)]);
+        node.on_consensus(ConsensusMessage::Proposal(block.clone())).await.unwrap();
+        assert!(node.hs.has_block(&block.hash()));
+        assert!(voted_for(&drain(&mut seen).await, &block));
+        assert!(node.in_flight.is_empty() && node.waiting.is_empty());
+        tokio::task::yield_now().await;
+        assert!(applied.try_recv().is_err(), "nothing was applied off the loop");
     }
 }
