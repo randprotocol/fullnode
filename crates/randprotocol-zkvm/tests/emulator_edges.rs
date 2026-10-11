@@ -401,7 +401,7 @@ fn an_unsigned_half_load_at_an_odd_offset_is_misaligned() {
 
 #[test]
 fn unknown_syscall_numbers_are_refused_with_their_number() {
-    for num in [8i32, 100, -1] {
+    for num in [9i32, 100, 255, -1] {
         let p = program(|a| {
             a.extend(li(REG_A7, num));
             a.push(ecall());

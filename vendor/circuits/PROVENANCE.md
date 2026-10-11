@@ -12,7 +12,7 @@ lock is the one cargo reads) and `target/`; the manifests are verbatim, their `[
 included, which is why the root `Cargo.toml` lists all three paths under `[workspace] exclude`. The
 copies are byte-identical to this circuits commit:
 
-circuits: 57fb9dcfb93d7bb6b2ce6e6ce73283961fbd7f1c
+circuits: c55cfa19350f9a3724818d113d60ade008dc8adf
 
 (Branch feat/private-multisig, not yet on zkp-circuits: rVM phase 4 (Merkle spans) and the MODQ
 chip (constraint set 9), with the `dilithium-verify` and `msauth` guests and the
