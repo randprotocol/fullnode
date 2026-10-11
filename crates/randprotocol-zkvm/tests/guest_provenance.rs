@@ -367,11 +367,10 @@ fn the_multisig_auth_guest_is_pinned() {
 
 /// The precomputed msauth verifier key (plan Task 2b, spec §3.6) is consensus-critical: a wrong
 /// commitment could let a forged multisig proof verify. Both profiles' blobs are pinned by the
-/// SHA-256 of their file bytes. The Test blob is committed (`keys/msauth-vk-test.bin`) and must
-/// hash to its pin. The Production blob is a release asset, not in the repository: it is checked
-/// when present (`$MSAUTH_VK_PRODUCTION_BLOB`, else `target/msauth-vk-production.bin`, where
-/// `rand-node keygen-msauth-vk --profile production` writes it for the release step), and
-/// `docs/deploy.md` must name its pin either way, so an operator can compare by hand.
+/// SHA-256 of their file bytes. Both are committed (`keys/msauth-vk-{test,production}.bin`) and
+/// must hash to their pins; `$MSAUTH_VK_PRODUCTION_BLOB`, if set, is checked as well (a release
+/// asset about to ship), and `docs/deploy.md` must name the production pin so an operator can
+/// compare by hand.
 #[test]
 fn the_msauth_verifier_key_blobs_are_pinned() {
     use randprotocol_zkvm::executor::msauth_vk::{digest, MSAUTH_VK_SHA256_PRODUCTION, MSAUTH_VK_SHA256_TEST, PIN_PENDING};
@@ -384,11 +383,12 @@ fn the_msauth_verifier_key_blobs_are_pinned() {
     let test = root.join("keys/msauth-vk-test.bin");
     let bytes = std::fs::read(&test).unwrap_or_else(|e| panic!("{}: {e}; run `rand-node keygen-msauth-vk --profile test --out {}`", test.display(), test.display()));
     assert_eq!(digest(&bytes), MSAUTH_VK_SHA256_TEST, "test msauth key blob {} ({} bytes): write the computed digest (left) into MSAUTH_VK_SHA256_TEST", test.display(), bytes.len());
-    let production = std::env::var_os("MSAUTH_VK_PRODUCTION_BLOB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("../../target/msauth-vk-production.bin"));
-    if let Ok(bytes) = std::fs::read(&production) {
-        assert_eq!(digest(&bytes), MSAUTH_VK_SHA256_PRODUCTION, "production msauth key blob {} ({} bytes): write the computed digest (left) into MSAUTH_VK_SHA256_PRODUCTION", production.display(), bytes.len());
+    let committed = root.join("keys/msauth-vk-production.bin");
+    let bytes = std::fs::read(&committed).unwrap_or_else(|e| panic!("{}: {e}; run `rand-node keygen-msauth-vk --profile production --out {}`", committed.display(), committed.display()));
+    assert_eq!(digest(&bytes), MSAUTH_VK_SHA256_PRODUCTION, "production msauth key blob {} ({} bytes): write the computed digest (left) into MSAUTH_VK_SHA256_PRODUCTION", committed.display(), bytes.len());
+    if let Some(extra) = std::env::var_os("MSAUTH_VK_PRODUCTION_BLOB").map(PathBuf::from) {
+        let bytes = std::fs::read(&extra).unwrap_or_else(|e| panic!("{}: {e}", extra.display()));
+        assert_eq!(digest(&bytes), MSAUTH_VK_SHA256_PRODUCTION, "MSAUTH_VK_PRODUCTION_BLOB {} is not the pinned production blob", extra.display());
     }
     let deploy = std::fs::read_to_string(root.join("../../docs/deploy.md")).unwrap();
     assert!(deploy.contains(MSAUTH_VK_SHA256_PRODUCTION), "docs/deploy.md names the production msauth key pin");

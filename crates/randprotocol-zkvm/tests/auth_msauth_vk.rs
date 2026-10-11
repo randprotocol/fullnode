@@ -147,15 +147,17 @@ fn a_flipped_byte_of_the_real_blob_is_refused_on_its_digest() {
     assert_nothing_installed(&ex);
 }
 
-/// The Production blob (a release asset, not committed) loads on a fresh Production executor:
-/// `MSAUTH_VK_PRODUCTION_BLOB=<file> cargo +1.98.1 test --release -p randprotocol-zkvm --test
-/// auth_msauth_vk -- --ignored --nocapture the_production_blob`. A load, not a build.
+/// The Production blob (committed at `keys/msauth-vk-production.bin`, or
+/// `$MSAUTH_VK_PRODUCTION_BLOB`) loads on a fresh Production executor: `cargo +1.98.1 test
+/// --release -p randprotocol-zkvm --test auth_msauth_vk -- --ignored --nocapture
+/// the_production_blob`. A load, not a build; ignored only to keep the Production machine out of
+/// the default run.
 #[test]
-#[ignore = "needs the release asset msauth-vk-production.bin ($MSAUTH_VK_PRODUCTION_BLOB)"]
+#[ignore = "the Production-profile load, measured on request"]
 fn the_production_blob_loads_without_a_build() {
     let path = std::env::var_os("MSAUTH_VK_PRODUCTION_BLOB")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/msauth-vk-production.bin"));
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("keys/msauth-vk-production.bin"));
     load_and_measure(FriProfile::Production, &path);
 }
 

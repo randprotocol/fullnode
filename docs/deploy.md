@@ -335,13 +335,15 @@ A node on a chain whose genesis names `hc_auth_multisig` verifies multisig autho
   `rand-node keygen-msauth-vk --print-pinned production` prints it, `--check FILE` prints a
   file's). At circuits d217252 (constraint set 9) the production blob is 23 754 bytes with
   SHA-256 `68facb06c7f321aaf1d4d541acf6b5c0e9d7f17788ed1c9add6c5a8a8f7acd30`; the keygen is deterministic (any host regenerates it byte for byte, ~25 s and
-  ~4 GB peak on an M-series laptop). The Test-profile blob is committed at
+  ~4 GB peak on an M-series laptop). Both blobs are committed, so a release tree carries
+  them: `crates/randprotocol-zkvm/keys/msauth-vk-production.bin` and, for tests,
   `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (SHA-256 `c82250e7e7f8ca94246dc512091c1dafe402d5c0f6f4503e585d9381319443f5`). The vendored `Machine::install_verifier_key_pinned` checks it on the raw bytes before
   decoding anything: the blob is a trust root (a crafted preprocessed commitment could let a
   forged proof verify), so an unpinned file is never decoded.
 - **The location.** Beside the binary: `/usr/local/bin/msauth-vk-production.bin` on the fleet
   (`msauth-vk-<profile>.bin` next to whatever `rand-node` runs). `--msauth-vk <path>`, else
-  `RAND_MSAUTH_VK`, overrides it.
+  `RAND_MSAUTH_VK`, overrides it. A binary run from a checkout with nothing beside it falls back
+  to the committed `crates/randprotocol-zkvm/keys/msauth-vk-<profile>.bin` (pin-checked the same).
 - **The startup failure.** On a multisig chain a missing or refused file stops the start,
   naming the path, the file's SHA-256 and the expected one. There is no automatic fallback
   build; only `--build-msauth-key` (development, a ≥ 8 GB host, never set by a deploy script)

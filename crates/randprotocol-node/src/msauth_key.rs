@@ -32,7 +32,10 @@ pub struct MsauthKeyOptions {
 
 /// The key file this node reads: `--msauth-vk`, else `RAND_MSAUTH_VK`, else
 /// `msauth-vk-<profile>.bin` beside the running executable — the fleet's
-/// `/usr/local/bin/msauth-vk-production.bin`.
+/// `/usr/local/bin/msauth-vk-production.bin` — and, when that file is absent, the copy a source
+/// tree carries (`crates/randprotocol-zkvm/keys/msauth-vk-<profile>.bin`, found through the
+/// build's own manifest directory: a `cargo run` / `target/release/rand-node` in a checkout). The
+/// pin is checked whichever file is read; when neither exists the error names the fleet path.
 pub fn resolve_path(opts: &MsauthKeyOptions, profile: FriProfile) -> Result<PathBuf> {
     if let Some(p) = &opts.path {
         return Ok(p.clone());
@@ -41,8 +44,21 @@ pub fn resolve_path(opts: &MsauthKeyOptions, profile: FriProfile) -> Result<Path
         return Ok(PathBuf::from(p));
     }
     let exe = std::env::current_exe().context("locating the running binary for the msauth key file")?;
-    Ok(exe.with_file_name(msauth_vk::file_name(profile)))
+    let beside = exe.with_file_name(msauth_vk::file_name(profile));
+    if !beside.exists() {
+        let tree = source_tree_path(profile);
+        if tree.exists() {
+            return Ok(tree);
+        }
+    }
+    Ok(beside)
 }
+
+/// The committed blob in a source tree: `crates/randprotocol-zkvm/keys/msauth-vk-<profile>.bin`.
+pub fn source_tree_path(profile: FriProfile) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../randprotocol-zkvm/keys").join(msauth_vk::file_name(profile))
+}
+
 
 /// The startup obligation (spec §3.6). On a chain without `hc_auth_multisig` there is no key:
 /// `Absent`, and the path is never read. Otherwise the file at `path` is read and handed to
@@ -69,13 +85,13 @@ pub fn load_msauth_key(
             return Ok(MsauthKeySource::Built);
         }
         Err(e) => bail!(
-            "msauth verifier key: {} missing ({e}) (expected sha256 {pin}); install it from the release, or run with --build-msauth-key on a ≥ 8 GB host",
+            "msauth verifier key: {} missing ({e}) (expected sha256 {pin}); install it from the release (a source tree carries it at crates/randprotocol-zkvm/keys/), or run with --build-msauth-key on a ≥ 8 GB host",
             path.display()
         ),
     };
     install(&bytes).map_err(|e| {
         anyhow!(
-            "msauth verifier key: {} has sha256 {} and was refused: {e} (expected sha256 {pin}); install it from the release, or run with --build-msauth-key on a ≥ 8 GB host",
+            "msauth verifier key: {} has sha256 {} and was refused: {e} (expected sha256 {pin}); install it from the release (a source tree carries it at crates/randprotocol-zkvm/keys/), or run with --build-msauth-key on a ≥ 8 GB host",
             path.display(),
             msauth_vk::digest(&bytes)
         )
@@ -224,9 +240,10 @@ mod tests {
         let flag = MsauthKeyOptions { path: Some(PathBuf::from("/x/key.bin")), build: false };
         assert_eq!(resolve_path(&flag, FriProfile::Production).unwrap(), PathBuf::from("/x/key.bin"));
         if std::env::var_os(ENV_PATH).is_none() {
+            // In a checkout with nothing beside the test binary: the committed blob.
             let p = resolve_path(&MsauthKeyOptions::default(), FriProfile::Production).unwrap();
-            assert_eq!(p.file_name().unwrap(), "msauth-vk-production.bin");
-            assert_eq!(p.parent(), std::env::current_exe().unwrap().parent());
+            assert_eq!(p, source_tree_path(FriProfile::Production));
+            assert_eq!(msauth_vk::digest(&std::fs::read(&p).unwrap()), msauth_vk::pin(FriProfile::Production));
         }
     }
 
