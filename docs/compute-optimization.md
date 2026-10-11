@@ -162,11 +162,11 @@ becomes `O(block)`, and committing is applying a chain of deltas. No consensus c
 
 ### 3.3 Verification off the loop, cached by digest
 
-**Shipped**: the worker count (`rand-node run --verify-workers`, default the cores minus two, at least four, with the queue and in-flight limits sized from it), and the digest-keyed cache (`verify_cache::CachingExecutor`, every verifier, keyed by a digest of all its inputs, 16 384 entries). Still open: moving an uncached apply-time verify off the consensus loop.
+**Shipped**: the worker count (`rand-node run --verify-workers`, default the cores minus two, at least four, with the queue and in-flight limits sized from it), and the digest-keyed cache (`verify_cache::CachingExecutor`, every STARK verifier, keyed by a digest of all its inputs, 16 384 entries). Still open: moving an uncached apply-time verify off the consensus loop.
 
 The admission workers already verify proofs on `spawn_blocking` threads and the proposal path
 re-checks against a verified set. Generalise it: every proof the node will ever verify — bundle,
-auth, call, aggregate — goes through one `VerifyCache` keyed by proof digest, filled by a worker
+auth, call, aggregate — goes through one `VerifyCache` keyed by proof digest (the shipped key is a digest of every verifier input, kind tag, program or hc, proof and public inputs, not of the proof alone), filled by a worker
 pool sized to the cores (default `cores − 2`, minimum 4), and the consensus loop only ever
 looks up. A proposal whose aggregates are all cached applies in the time it takes to append
 records. A proposal carrying an uncached aggregate waits on the worker, which is the ≤ 150 ms

@@ -491,8 +491,8 @@ the life of the process: a hit returns what the inner executor would have, and t
 different cache contents reach the same verdict. `VerifiedSet` is kept: a hit there skips the
 verifier call, and a miss falls through to the cache. The effect is per node: an aggregate that
 admission has seen is now verified once, where the leader used to verify it three times (admission,
-trial apply, its own apply) and a follower twice (admission, apply). CLI tools such as `rand-node
-verify` use the bare executor and have no cache. An uncached verify at apply time still runs on the
+trial apply, its own apply) and a follower twice (admission, apply). The startup chain walk and CLI tools such as `rand-node
+verify` use the bare executor and have no cache (a replay walk would only fill it with history no later lookup hits). An uncached verify at apply time still runs on the
 consensus loop (compute-optimization §3.3).
 
 Gossipsub runs with application-level validation (`validate_messages()`), so a transaction is

@@ -121,31 +121,36 @@ impl VerifyCache {
     }
 }
 
-/// The bytes a cache key is the digest of: a one-byte kind tag, then every input the verifier
-/// receives, each length-prefixed (`u64` little-endian), words as little-endian bytes.
-struct KeyBuf(Vec<u8>);
+/// The key hasher: `blake3(KEY_DOMAIN || tag || fields)`, fed field by field so a proof (up to
+/// 8 MiB) is never copied. Every input the verifier receives is length-prefixed (`u64`
+/// little-endian), words as little-endian bytes. The digest equals
+/// `Hash::digest_domain(KEY_DOMAIN, tag || fields)`.
+struct KeyBuf(blake3::Hasher);
 
 impl KeyBuf {
     fn new(tag: u8) -> Self {
-        Self(vec![tag])
+        let mut h = blake3::Hasher::new();
+        h.update(KEY_DOMAIN);
+        h.update(&[tag]);
+        Self(h)
     }
 
     /// Append `n` as a length prefix.
     fn prefix(mut self, n: usize) -> Self {
-        self.0.extend_from_slice(&(n as u64).to_le_bytes());
+        self.0.update(&(n as u64).to_le_bytes());
         self
     }
 
     fn bytes(self, b: &[u8]) -> Self {
         let mut s = self.prefix(b.len());
-        s.0.extend_from_slice(b);
+        s.0.update(b);
         s
     }
 
     fn words(self, w: &[u32]) -> Self {
         let mut s = self.prefix(w.len());
         for x in w {
-            s.0.extend_from_slice(&x.to_le_bytes());
+            s.0.update(&x.to_le_bytes());
         }
         s
     }
@@ -153,7 +158,7 @@ impl KeyBuf {
     fn u64s(self, w: &[u64]) -> Self {
         let mut s = self.prefix(w.len());
         for x in w {
-            s.0.extend_from_slice(&x.to_le_bytes());
+            s.0.update(&x.to_le_bytes());
         }
         s
     }
@@ -172,7 +177,7 @@ impl KeyBuf {
     }
 
     fn finish(self) -> Hash {
-        Hash::digest_domain(KEY_DOMAIN, &self.0)
+        Hash(*self.0.finalize().as_bytes())
     }
 }
 
@@ -869,6 +874,12 @@ mod tests {
             (Kind::Call, "record", |i| i.record.base_pc += 4),
             (Kind::Call, "record public_len", |i| i.record.public_len += 1),
             (Kind::Call, "record code_hash", |i| i.record.code_hash.push(1)),
+            (Kind::Call, "record id", |i| i.record.id = Hash([6; 32])),
+            (Kind::Call, "record public_digest", |i| i.record.public_digest = Some([7; 8])),
+            (Kind::CallHardened, "record id", |i| i.record.id = Hash([6; 32])),
+            (Kind::CallHardened, "record public_digest", |i| i.record.public_digest = Some([7; 8])),
+            (Kind::Invoke, "record id", |i| i.record.id = Hash([6; 32])),
+            (Kind::Invoke, "record public_digest", |i| i.record.public_digest = Some([7; 8])),
             (Kind::Call, "proof", |i| flip_byte(&mut i.call_proof)),
             (Kind::CallHardened, "record", |i| i.record.deployed_at += 1),
             (Kind::CallHardened, "proof", |i| flip_byte(&mut i.hardened_proof)),
@@ -914,6 +925,37 @@ mod tests {
             let _ = run(&ex, kind, &changed);
             assert_eq!(inner.count(kind), 2, "{kind:?}: a changed {what} must reach inner");
         }
+    }
+
+    #[test]
+    fn streamed_key_equals_the_buffered_digest() {
+        let i = Inputs::new();
+        let le = |n: usize| (n as u64).to_le_bytes().to_vec();
+        let words = |w: &[u32]| {
+            let mut v = le(w.len());
+            for x in w {
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+            v
+        };
+        let bytes = |b: &[u8]| {
+            let mut v = le(b.len());
+            v.extend_from_slice(b);
+            v
+        };
+        // The old encoding: one Vec, then Hash::digest_domain.
+        let mut old = vec![TAG_BUNDLE];
+        old.extend(words(&i.hc_bundle));
+        old.extend(bytes(&i.bundle_proof));
+        old.extend(words(&i.binding));
+        let new = KeyBuf::new(TAG_BUNDLE).words(&i.hc_bundle).bytes(&i.bundle_proof).words(&i.binding).finish();
+        assert_eq!(new, Hash::digest_domain(b"rand-verify-cache-1", &old));
+
+        let mut old = vec![TAG_CALL];
+        old.extend(bytes(&bincode::serialize(&i.record).unwrap()));
+        old.extend(bytes(&i.call_proof));
+        let new = KeyBuf::new(TAG_CALL).ser(&i.record).bytes(&i.call_proof).finish();
+        assert_eq!(new, Hash::digest_domain(b"rand-verify-cache-1", &old));
     }
 
     #[test]
