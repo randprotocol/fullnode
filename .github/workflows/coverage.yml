@@ -60,6 +60,16 @@ jobs:
         # cluster suite's proving tests are not distinguishable by name.
         run: |
           cargo llvm-cov --no-report -p randprotocol-node --release --test submit --test ws
+          # Coverage push 2026-10-11: suites the nightly already ran, cheap and proof-free, that the
+          # fast job and the coverage measurement did not name. The prover service and its HTTP
+          # surface run on a stub prove function; the `rand`/`rand-node` binaries are driven as an
+          # operator runs them (loopback RPC fakes, no real node, no GPU); `network` is two or three
+          # libp2p swarms on 127.0.0.1. genesis_cli's aggregation-tree test (one minute alone) stays
+          # with the nightly.
+          cargo llvm-cov --no-report -p randprotocol-prover --release --test http --test service --test pairing --test wire --test retired_flag
+          cargo llvm-cov --no-report -p randprotocol-client --release --test cli_scripts --test cli_rpc
+          cargo llvm-cov --no-report -p randprotocol-node --release --test prover_hosted --test keygen_cli --test prover_flag --test network
+          cargo llvm-cov --no-report -p randprotocol-node --release --test genesis_cli -- --skip aggregation_tree_section
           cargo llvm-cov --no-report -p randprotocol-zkvm --release --test guest_provenance --test verifier_key
           cargo llvm-cov --no-report -p randprotocol-rvm --release --test verifier_key
           cargo llvm-cov --no-report -p randprotocol-node --release --test cluster -- --exact \
