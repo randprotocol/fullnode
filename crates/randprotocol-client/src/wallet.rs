@@ -8688,13 +8688,13 @@ mod tests {
     fn the_hardened_quote_prices_the_proof_cap_only_under_a_policy() {
         let raised = ChainLimits {
             max_program_words: 4096, max_proof_bytes: 20 << 20, max_block_bytes: 24 << 20, max_call_envelope_bytes: 18_432,
-            max_program_public_words: 0, envelope_bytes: None, hardening_v6: true,
+            max_program_public_words: 0, envelope_bytes: None, hardening_v6: true, hc_auth_multisig: None,
             gas_price: None, byte_price: None, gas_circuit: false, bundle_gas_limit: None, adjust_bps: None, proof_window_blocks: None,
             program_state: None, multisig: None,
             prove_base: 0,
             perps: None,
         };
-        let priced = ChainLimits { gas_price: Some(100), byte_price: Some(800), ..raised };
+        let priced = ChainLimits { gas_price: Some(100), byte_price: Some(800), ..raised.clone() };
         assert_eq!(hardened_call_quote_bytes(Some(&raised), 1_000), 1_000, "no policy: the envelope, as before");
         assert_eq!(hardened_call_quote_bytes(None, 0), 0);
         assert_eq!(hardened_call_quote_bytes(Some(&priced), 1_000), (20 << 20) + 1_000, "a policy: the cap in the proof's place");
@@ -8709,11 +8709,11 @@ mod tests {
     #[tokio::test]
     async fn the_wallets_floors_include_the_served_prove_base() {
         let plain = limits(18_432, 2 << 20);
-        let proving = ChainLimits { prove_base: 600_000, ..plain };
+        let proving = ChainLimits { prove_base: 600_000, ..plain.clone() };
         assert_eq!(call_floor(Some(&proving), 12, 0, 0, 0, 0).unwrap(), call_floor(Some(&plain), 12, 0, 0, 0, 0).unwrap() + 600_000);
-        let circuit = ChainLimits { gas_circuit: true, gas_price: Some(100), byte_price: Some(800), ..proving };
+        let circuit = ChainLimits { gas_circuit: true, gas_price: Some(100), byte_price: Some(800), ..proving.clone() };
         assert_eq!(call_floor(Some(&circuit), 12, 0, 0, 3_000, 0).unwrap(), gas::circuit_call_floor(100, 800, 3_000, 0) + 600_000);
-        let policy = ChainLimits { gas_price: Some(100), byte_price: Some(800), ..proving };
+        let policy = ChainLimits { gas_price: Some(100), byte_price: Some(800), ..proving.clone() };
         assert_eq!(
             call_fee_default(Some(&policy), 14, 0, 0, 0, 1_000).unwrap(),
             gas::GasPolicy { gas_price: 100, byte_price: 800 }.call_floor(14, 0, 0, 1_000) + 600_000
@@ -8746,13 +8746,13 @@ mod tests {
         use randprotocol_core::gas::GasPolicy;
         let policy = ChainLimits {
             max_program_words: 4096, max_proof_bytes: 2 << 20, max_block_bytes: 4 << 20, max_call_envelope_bytes: 18_432,
-            max_program_public_words: 0, envelope_bytes: None, hardening_v6: false,
+            max_program_public_words: 0, envelope_bytes: None, hardening_v6: false, hc_auth_multisig: None,
             gas_price: Some(100), byte_price: Some(800), gas_circuit: false, bundle_gas_limit: None, adjust_bps: None, proof_window_blocks: None,
             program_state: None, multisig: None,
             prove_base: 0,
             perps: None,
         };
-        let old = ChainLimits { gas_price: None, byte_price: None, ..policy };
+        let old = ChainLimits { gas_price: None, byte_price: None, ..policy.clone() };
         for tier in [10u8, 12, 14, 20] {
             // Review focus 4: no node, or an old node, prices the ledger's floor, nothing over it.
             assert_eq!(call_fee_default(None, tier, 0, 0, 0, 0).unwrap(), gas::BUNDLE_BASE + gas::call_fee(tier, 0));
@@ -9128,6 +9128,7 @@ mod tests {
             max_program_public_words: 64,
             envelope_bytes: None,
             hardening_v6: false,
+            hc_auth_multisig: None,
             gas_price: None,
             byte_price: None,
             gas_circuit: false,
@@ -9406,6 +9407,7 @@ mod tests {
             max_program_public_words: 0,
             envelope_bytes: None,
             hardening_v6: true,
+            hc_auth_multisig: None,
             gas_price: Some(100),
             byte_price: Some(800),
             gas_circuit: false,
@@ -9481,7 +9483,7 @@ mod tests {
         }
         assert!(call_fee_default(Some(&l), 12, 0, 0, 3_000, 0).unwrap() < call_fee_default(Some(&l), 12, 0, 0, 4_000, 0).unwrap(), "the limit prices it");
         // Without the section, the gas limit is ignored (Phase 0's header rule).
-        let header = ChainLimits { gas_circuit: false, bundle_gas_limit: None, ..l };
+        let header = ChainLimits { gas_circuit: false, bundle_gas_limit: None, ..l.clone() };
         assert_eq!(call_fee_default(Some(&header), 12, 0, 0, 3_000, 1_300_000).unwrap(), call_fee_default(Some(&header), 12, 0, 0, 9, 1_300_000).unwrap());
         // The post-proof guard prices the proof's own declared limit.
         let proof = vec![0u8; 1_300_000];

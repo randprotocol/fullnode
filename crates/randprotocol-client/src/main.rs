@@ -2376,7 +2376,7 @@ async fn main() -> Result<()> {
             // holds — so nothing below spends a minute of proving on a transaction the chain
             // would refuse in a microsecond.
             let limits = rpc.limits().await?;
-            let Some(ps) = limits.and_then(|l| l.program_state) else {
+            let Some(ps) = limits.as_ref().and_then(|l| l.program_state) else {
                 anyhow::bail!("this chain has no program_state section: no invoke is admitted");
             };
             let (prog, public) = wallet::load_call_program(&rpc, &pid).await?;
@@ -3507,6 +3507,7 @@ mod tests {
             max_program_public_words: 64,
             envelope_bytes: None,
             hardening_v6: false,
+            hc_auth_multisig: None,
             gas_price: Some(100),
             byte_price: Some(800),
             gas_circuit: true,

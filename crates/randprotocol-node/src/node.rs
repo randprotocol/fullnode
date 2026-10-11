@@ -3025,6 +3025,7 @@ impl Node {
         s.tree_root = randprotocol_core::notes::word8_to_hex(&ledger.root());
         s.hc_bundle = randprotocol_core::notes::word8_to_hex(&ledger.hc_bundle());
         s.hc_auth = ledger.hc_auth().map(|h| randprotocol_core::notes::word8_to_hex(&h));
+        s.hc_auth_multisig = ledger.hc_auth_multisig().map(|h| randprotocol_core::notes::word8_to_hex(&h));
         s.binding_domain = ledger.binding_domain().version();
         let target = self.peers.values().filter_map(|p| p.status.as_ref()).map(|p| p.height).max().unwrap_or(0);
         s.sync_target = target.max(s.height);
