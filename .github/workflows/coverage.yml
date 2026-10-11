@@ -67,7 +67,7 @@ jobs:
           # libp2p swarms on 127.0.0.1. genesis_cli's aggregation-tree test (one minute alone) stays
           # with the nightly.
           cargo llvm-cov --no-report -p randprotocol-prover --release --test http --test service --test pairing --test wire --test retired_flag
-          cargo llvm-cov --no-report -p randprotocol-client --release --test cli_scripts --test cli_rpc
+          cargo llvm-cov --no-report -p randprotocol-client --release --test cli_scripts --test cli_rpc --test cli_perp --test cli_token_bridge
           cargo llvm-cov --no-report -p randprotocol-node --release --test prover_hosted --test keygen_cli --test prover_flag --test network
           cargo llvm-cov --no-report -p randprotocol-node --release --test genesis_cli -- --skip aggregation_tree_section
           cargo llvm-cov --no-report -p randprotocol-zkvm --release --test guest_provenance --test verifier_key

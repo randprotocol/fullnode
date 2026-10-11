@@ -123,7 +123,7 @@ jobs:
           # libp2p swarms on 127.0.0.1. genesis_cli's aggregation-tree test (one minute alone) stays
           # with the nightly.
           cargo test -p randprotocol-prover --release --test http --test service --test pairing --test wire --test retired_flag
-          cargo test -p randprotocol-client --release --test cli_scripts --test cli_rpc
+          cargo test -p randprotocol-client --release --test cli_scripts --test cli_rpc --test cli_perp --test cli_token_bridge
           cargo test -p randprotocol-node --release --test prover_hosted --test keygen_cli --test prover_flag --test network
           cargo test -p randprotocol-node --release --test genesis_cli -- --skip aggregation_tree_section
           # The downstream repos' RPC contract (randscan, randbridge.org, randprotocol.org,
