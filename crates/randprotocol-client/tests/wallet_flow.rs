@@ -173,6 +173,7 @@ async fn start_with(dir: &tempfile::TempDir, key: &Keypair, genesis: Genesis) ->
         // priced by the pool's `admission::call_floor` over its decoded header, and the wallet
         // pays the policy floor it reads from `rand_getLimits`.
         gas_policy: Some(randprotocol_core::gas::GasPolicy::DEFAULT),
+        msauth: Default::default(),
     })
     .await
     .expect("node starts")

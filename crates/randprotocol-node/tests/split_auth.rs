@@ -115,6 +115,7 @@ async fn a_v3_chain_admits_a_real_auth_proof_and_refuses_a_swapped_one() {
         verify_workers: None,
         prune_history: None,
         gas_policy: None,
+        msauth: Default::default(),
     })
     .await
     .expect("a v3 + hc_auth genesis starts on this build");

@@ -857,6 +857,16 @@ enum Cmd {
         /// Units per KiB (or part) of a call's proof and input envelope, from byte 0.
         #[arg(long, default_value_t = randprotocol_core::gas::BYTE_PRICE_DEFAULT)]
         byte_price: u64,
+        /// The precomputed msauth verifier key file (private multisig, read only on a chain
+        /// naming `hc_auth_multisig`). Default: `$RAND_MSAUTH_VK`, else
+        /// `msauth-vk-<profile>.bin` beside this binary (`/usr/local/bin/msauth-vk-production.bin`
+        /// on the fleet). A missing or unpinned file refuses the start.
+        #[arg(long, value_name = "PATH")]
+        msauth_vk: Option<PathBuf>,
+        /// Development only: when the msauth key file is missing, build the key on this host
+        /// (~80 s, ~4 GB at production) instead of refusing to start. Never set by a deploy script.
+        #[arg(long)]
+        build_msauth_key: bool,
     },
     /// Verify the chain in a data directory without running the node.
     Verify {
@@ -2913,6 +2923,8 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Run {
+            msauth_vk,
+            build_msauth_key,
             datadir,
             key,
             listen,
@@ -3008,6 +3020,7 @@ async fn main() -> Result<()> {
                 verify_workers,
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
+                msauth: randprotocol_node::msauth_key::MsauthKeyOptions { path: msauth_vk, build: build_msauth_key },
             }, rpc_options, node::NetOptions { reserved_peers: reserved_peer, strict_gossip })
             .await?;
             // The prover is served once the node's RPC is up and stops with the node; a prover

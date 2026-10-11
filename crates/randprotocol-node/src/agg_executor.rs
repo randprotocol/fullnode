@@ -713,6 +713,15 @@ impl ConfidentialExecutor for AggExecutor {
         self.inner.warm_auth()
     }
 
+    /// Forwarded (Task 2b): the default would refuse every blob and fail a multisig chain's startup.
+    fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+        ConfidentialExecutor::install_msauth_vk(&self.inner, blob)
+    }
+
+    fn build_msauth_key(&self) {
+        ConfidentialExecutor::build_msauth_key(&self.inner)
+    }
+
     /// Forwarded, like `max_callable_program_words` (a default would switch the rule off).
     fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
         self.inner.non_canonical_proof(proof)

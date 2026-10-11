@@ -276,6 +276,18 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// Precompute the auth guest's verifier key (split authorisation). May be a no-op. A node
     /// calls it only on a chain whose genesis names `hc_auth`; no earlier chain needs the key.
     fn warm_auth(&self) {}
+    /// Install the precomputed multisig auth verifier key from the key file's bytes (private
+    /// multisig, plan Task 2b): the executor checks them against its pinned digest, its profile
+    /// and the msauth shape, and installs the key without building it. A node calls it at startup
+    /// only on a chain naming `hc_auth_multisig`, on the bare executor (it is a startup step, not a
+    /// verification, so the caching wrapper has nothing to add). The default — an executor with
+    /// no msauth machine — refuses.
+    fn install_msauth_vk(&self, _blob: &[u8]) -> Result<(), String> {
+        Err("this executor has no msauth verifier key".into())
+    }
+    /// Build the multisig auth verifier key on this host (Task 2b's `--build-msauth-key`,
+    /// development only: ~80 s and ~4 GB at production). Never called by default. May be a no-op.
+    fn build_msauth_key(&self) {}
     /// The v0.6 canonical-proof rules, for a bundle or a call proof alike: the first header or
     /// transcript field of `proof` that is not the value the honest prover writes, named, or
     /// `None`. A field the verifier does not bind to the statement lets anyone who relays a

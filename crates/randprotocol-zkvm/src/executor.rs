@@ -2123,6 +2123,14 @@ impl ConfidentialExecutor for ZkExecutor {
 
     /// The auth guest's one key ([`AUTH_TIER`], its pinned heights, no hash table) — the only key
     /// `verify_auth_proof` ever asks `auth_machine` for.
+    fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
+        ZkExecutor::install_msauth_vk(self, blob).map_err(|e| e.to_string())
+    }
+
+    fn build_msauth_key(&self) {
+        self.warm_auth_multisig()
+    }
+
     fn warm_auth(&self) {
         self.warming(|| {
             let (plh, ilh, pubh) = Self::auth_heights();

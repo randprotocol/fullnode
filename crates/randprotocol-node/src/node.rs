@@ -84,6 +84,9 @@ pub struct NodeConfig {
     pub prune_history: Option<Duration>,
     /// Spec 2026-09-28 §4.1: price calls by their proof header; None = no policy.
     pub gas_policy: Option<randprotocol_core::gas::GasPolicy>,
+    /// Where the precomputed msauth verifier key is read from, and whether a missing one may be
+    /// built here (plan Task 2b; consulted only on a chain naming `hc_auth_multisig`).
+    pub msauth: crate::msauth_key::MsauthKeyOptions,
 }
 
 /// Handles returned by `Node::start` so tests and the CLI can observe the node.
@@ -2392,6 +2395,12 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
     let bare_executor = executor.clone();
     let executor: Arc<dyn ConfidentialExecutor> = Arc::new(crate::verify_cache::CachingExecutor::new(executor));
     check_build_runs_genesis(&gs, &ZkExecutor::known_hc_bundles())?;
+    // The precomputed msauth verifier key (plan Task 2b, spec §3.6), before any other key: on a
+    // chain naming `hc_auth_multisig` a missing or unpinned blob refuses the start here, loudly;
+    // the build happens only under `--build-msauth-key`, first in the warm thread below.
+    let msauth_source = crate::msauth_key::startup(&gs, &cfg.msauth, bare_executor.as_ref())
+        .map_err(|e| anyhow!("{e:#}; refusing to start"))?;
+    let msauth_builder = bare_executor.clone();
     // Before RocksDB opens its ~1000 table files (issue #41): a node started under the default
     // soft limit of 1024 ran out of descriptors and its RPC refused every connection.
     match crate::rlimit::raise_nofile_limit() {
@@ -2616,6 +2625,13 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         let split_auth = hs.committed_ledger().hc_auth().is_some();
         let ex = executor.clone();
         tokio::task::spawn_blocking(move || {
+            // `--build-msauth-key` with no key file (development only): the build, first. A loaded
+            // key needs nothing here; on the bare executor, since the caching wrapper's default
+            // would do nothing.
+            if msauth_source == crate::msauth_key::MsauthKeySource::Built {
+                msauth_builder.build_msauth_key();
+                tracing::info!("msauth verifier key built");
+            }
             ex.warm_bundle();
             tracing::info!("bundle verifier key warmed");
             if split_auth {
@@ -6985,6 +7001,7 @@ mod tests {
             verify_workers: None,
             prune_history: None,
             gas_policy: None,
+            msauth: Default::default(),
         };
         let wire = network::WireLimits::for_ledger(&gs.ledger);
         let max_block_bytes = gs.ledger.max_block_bytes();

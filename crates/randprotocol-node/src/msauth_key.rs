@@ -11,7 +11,8 @@
 //! what the deploy scripts compare) and prints this build's pin (`--print-pinned`).
 
 use anyhow::{anyhow, bail, Context, Result};
-use randprotocol_zkvm::executor::msauth_vk::{self, MsauthKeySource};
+pub use randprotocol_zkvm::executor::msauth_vk::MsauthKeySource;
+use randprotocol_zkvm::executor::msauth_vk;
 use randprotocol_zkvm::machine::FriProfile;
 use std::path::{Path, PathBuf};
 
@@ -110,4 +111,27 @@ pub fn check_file(path: &Path) -> Result<String> {
 /// The profile named on the command line.
 pub fn parse_profile(s: &str) -> Result<FriProfile> {
     randprotocol_zkvm::executor::ZkExecutor::profile_from_str(s).ok_or_else(|| anyhow!("--profile must be production or test, not {s}"))
+}
+
+/// Whether the chain names `hc_auth_multisig`, i.e. whether this node must hold the msauth key.
+///
+/// TASK-3: `gs.ledger.hc_auth_multisig().is_some()` once plan Task 3 adds the genesis field. No
+/// genesis carries it before then, so until then no node reads a key file.
+pub fn chain_has_msauth(_gs: &randprotocol_core::genesis::GenesisState) -> bool {
+    false
+}
+
+/// `node::start_with`'s step: [`resolve_path`] and [`load_msauth_key`] into `executor` (the bare
+/// one, not the caching wrapper) for the chain's profile. An `Err` is a startup failure.
+pub fn startup(
+    gs: &randprotocol_core::genesis::GenesisState,
+    opts: &MsauthKeyOptions,
+    executor: &dyn randprotocol_core::confidential::ConfidentialExecutor,
+) -> Result<MsauthKeySource> {
+    if !chain_has_msauth(gs) {
+        return Ok(MsauthKeySource::Absent);
+    }
+    let profile = parse_profile(&gs.fri_profile)?;
+    let path = resolve_path(opts, profile)?;
+    load_msauth_key(&path, profile, true, opts.build, |blob| executor.install_msauth_vk(blob))
 }
