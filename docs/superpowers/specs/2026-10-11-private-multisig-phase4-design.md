@@ -375,6 +375,13 @@ hand to the hand-maintained `guests.rs`: `Program::from_flat_image(include_bytes
   uses `chips_with_modq(tier, clamped(k), clamped(s), clamped(modq))`. A fast, non-ignored test: a
   tier-10 Test-profile proof with one modq block (circuits' `tests/common` modq fixture) has
   `non_canonical == None` and `honest_fri_arities == Some(_)`.
+- **No modq-bearing inner proof is aggregated** (circuits Task 9b: `recursion/src` does not know
+  the MODQ chip, so it verifies chip-free inner proofs only). Every aggregate/tree path refuses an
+  inner proof with `modq_log_height != 0` where it decodes the inner header, before the rVM:
+  `verify_aggregate`, `verify_tree`, `verify_tree`'s bottom-up recompute, the aggregator's cover
+  assembly and the `decode_call` mirror. The refusal is `InvalidAggregateProof` (`InvalidProof` on
+  calls), with one test per path on a tier-10, one-modq-block inner proof. Auth proofs (msauth
+  included) are never aggregated, so a multisig spend is unaffected.
 - `AggExecutor::decode_call` (`agg_executor.rs:466-512`) mirrors the call header checks itself; it
   gains the same `modq_log_height != 0` refusal.
 - `const` asserts beside `MAX_HONEST_DEGREE_BITS` gain `tables::modq::MAX_LOG_HEIGHT`.
@@ -460,7 +467,10 @@ there. That commit must be pushed: `CUDA_REV` must be fetchable.
    pre-phase-4 program digest, aggregate or tree digest, or pinned key would therefore keep
    verifying while meaning something else. In the **same commit** that bumps `CIRCUITS_PIN`, the
    re-vendor drops or re-records every one of them:
-   - `inner_vk_digest` `346ee184…` and the pinned-vectors digest `3534960f…`;
+   - `inner_vk_digest` `346ee184…` (→ `1b0c4b00…` at the branch's post-9b HEAD, the vendored SHA,
+     not `bba7875`) and the pinned-vectors digest `3534960f…`; `verify_rv32.digest` → `79ebe02b…`;
+     the production `aggregate_program_digest` `e0eede8b…` → `8bc2cecb…` (production rows
+     315 391, tier 19);
    - `verify_rv32.digest` `cf5a350a…` and `dsl-sample.digest` `8c77648e…`;
    - the sixteen `tree_test.vk_*` words, which are `agg_executor.rs`'s `PIN_VK_{LEAF,T_LEAF,INT,FIX}`;
    - every test `TreeConfig` step key in the node and core tests, and the recursion fixtures.

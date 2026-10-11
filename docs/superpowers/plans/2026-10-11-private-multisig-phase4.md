@@ -361,6 +361,14 @@ git commit -m "zkvm, rvm: re-vendor circuits $CIRCUITS — the MODQ chip (constr
 ```
 
 Each `<after>` in the second `-m` is the value Step 4b recorded; write the actual hex prefixes before committing.
+
+**The recursion pins moved again on the circuits branch (Task 9b).** The vendored SHA is `feat/private-multisig`'s **post-9b HEAD**, not `bba7875`. The values recorded there:
+- `inner_vk_digest` `346ee184…` → `1b0c4b00…`;
+- `verify_rv32.digest` `6a70c377…` → `79ebe02b…` on the circuits branch (this tree's copy is still `cf5a350a…`, so it moves to `79ebe02b…`);
+- the production `aggregate_program_digest` `e0eede8b…` → `8bc2cecb…`;
+- production rows 315 391, at tier 19.
+
+Step 4b's after values must equal these. A mismatch means the wrong SHA was vendored: stop.
 ```
 
 ---
@@ -749,6 +757,14 @@ Expected: compile errors (no `run_msauth`, `prove_msauth`, `MSAUTH_TIER`, `msaut
 
      (Task 4 adds the three methods to the trait. Until then, write them as inherent `pub fn`s with the same signatures; Task 4 moves them into the impl.)
   9. **`non_canonical`'s preprocessed-round count** (`executor.rs:276-284`): replace `crate::machine::chips(proof.tier, …)` in the `preprocessed` count with the same `chips_with_modq(…, clamped modq)` as below. Without it `auth_modq_canonical`'s test fails. Beside `MAX_HONEST_DEGREE_BITS`, add `const _: () = assert!(crate::tables::modq::MAX_LOG_HEIGHT as usize + 1 <= MAX_HONEST_DEGREE_BITS);`. In `crates/randprotocol-node/src/agg_executor.rs`'s `decode_call` mirror, refuse `proof.modq_log_height != 0` with the same `InvalidProof("a call proof declares no modq table")`, and give it a test beside the existing `decode_call` header tests.
+  9a. **No modq-bearing inner proof reaches the recursion verifier** (circuits Task 9b). `recursion/src`, the aggregation verifier program, does not know the MODQ chip, so it can verify only chip-free inner proofs. Refuse any inner proof whose header has `modq_log_height != 0` on every aggregate/tree path, **at the point that path decodes the inner proof's header** (where its `DeclaredShape`/`CoveredBundle` is built from a `Proof`), before anything reaches the rVM:
+      - `AggExecutor::verify_aggregate`;
+      - `AggExecutor::verify_tree`;
+      - `verify_tree`'s bottom-up recompute;
+      - the `decode_call` mirror (item 9);
+      - the aggregator's own cover assembly (`rand-node aggregate`).
+
+      Reuse the existing header-refusal class: `ConfidentialError::InvalidAggregateProof("an inner proof declares a modq table; the aggregation verifier is chip-free")` on the aggregate paths, and `InvalidProof` on `decode_call`. For the tests, move Task 2's one-NTT guest into node-local `executor.rs` as `#[doc(hidden)] pub mod fixtures { pub fn one_modq_ntt_program() -> Program }`, used by `auth_modq_canonical.rs` too. Add one test per path to `agg_executor.rs`'s tests: a tier-10, one-modq-block inner proof (`modq_log_height = 10`) fed to that path is refused with the message above, and `rvm`'s verify is never reached (`program_builds`/`tree_builds` unchanged). **Auth proofs (msauth included) are never aggregated** — an aggregate covers bundle proofs only — so this never affects a multisig spend.
   9b. `honest_fri_arities`: replace `crate::machine::chips(…)` with `crate::machine::chips_with_modq(proof.tier, clamped(keccak), clamped(sha256), clamped_hash_log_height(proof.modq_log_height, crate::tables::modq::MAX_LOG_HEIGHT))`.
   10. `non_canonical`'s memory rules: the plain rule (`mem == t + 2`) applies only when keccak, sha256 **and** modq are all 0. The hash-bearing rule applies when any is non-zero, and uses
       ```rust
