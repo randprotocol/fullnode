@@ -835,7 +835,8 @@ enum Cmd {
         #[arg(long, value_name = "N")]
         verify_workers: Option<usize>,
         /// Apply incoming proposals on the consensus loop, as before v0.8.0, instead of on a
-        /// blocking worker (spec 2026-10-11 off-loop apply §4.5): the kill switch.
+        /// blocking worker (spec 2026-10-11 off-loop apply §4.5): the kill switch. The by-hash
+        /// fetch answer binding is a separate fix and stays on.
         #[arg(long)]
         apply_proposals_inline: bool,
         /// Skip the free-memory gate that refuses a prover the machine cannot hold.

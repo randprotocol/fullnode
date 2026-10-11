@@ -3975,6 +3975,20 @@ fn precheck_proposal_refuses_what_on_proposal_refuses_before_the_apply() {
     assert_eq!(hs.precheck_proposal(&orphan), Err(ConsensusError::UnknownParent(orphan.parent())));
     assert!(!hs.holds_orphan(&orphan.hash()), "the precheck keeps nothing");
 
+    // Final review I1: an unheld parent under a proposer that leads no view is refused by the
+    // orphan checks, as `on_proposal` refuses it — not `UnknownParent`, which the node would
+    // queue behind an in-flight parent.
+    let rogue = signed(with(&|h| {
+        h.parent = Hash::digest(b"unheld");
+        h.justify.block_hash = h.parent;
+        h.proposer = sim.keys[wrong].public_key().clone();
+    }), wrong);
+    let pre = hs.precheck_proposal(&rogue);
+    assert_eq!(pre, Err(ConsensusError::WrongLeader(rogue.view())));
+    assert!(!hs.holds_orphan(&rogue.hash()), "the precheck keeps nothing");
+    assert_eq!(pre, hs.on_proposal(rogue.clone(), sim.now).map(|_| ()));
+    assert!(!hs.holds_orphan(&rogue.hash()), "nor does on_proposal");
+
     // GOSSIP-2's repeated tail: the honest hash, refused on its list here; refused by the apply
     // in `on_proposal`, and never inserted.
     let mut repeated = block.clone();

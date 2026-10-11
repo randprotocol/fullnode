@@ -1335,6 +1335,11 @@ struct Node {
     waiting: HashMap<Hash, Vec<Block>>,
     /// The hashes of the blocks in `waiting`, so [`Node::applying`] is a lookup.
     waiting_hashes: HashSet<Hash>,
+    /// The `(view, proposer)` of each block in `in_flight`, with its hash (final review I2): a
+    /// second, different block for a key already in flight — a leader equivocating — waits
+    /// behind the first rather than taking a worker of its own, and is refused as an
+    /// equivocation once the first is in. Kept in step with `in_flight` on every exit.
+    in_flight_keys: HashMap<(u64, randprotocol_core::Address), Hash>,
     /// [`NodeConfig::apply_inline`]: deliver every proposal straight to the replica, on the loop.
     apply_inline: bool,
 }
@@ -1346,6 +1351,11 @@ const OFFLOOP_APPLIES: usize = 4;
 /// Proposals held back behind an in-flight parent, over every parent (§4.4). Past it a proposal
 /// is delivered on the loop, where the replica orphans it until its parent lands.
 const WAITING_BLOCKS: usize = 8;
+
+/// Of [`WAITING_BLOCKS`], the most one proposer's blocks may hold (final review I1): a key that
+/// passes the replica's orphan checks still cannot take every place an honest child needs.
+/// Past it a proposal is delivered on the loop, as over the overall cap.
+const WAITING_PER_PROPOSER: usize = 2;
 
 /// An off-loop proposal apply's outcome (spec 2026-10-11 off-loop apply §4.1–4.2):
 /// `apply_block_for_sync` on a clone of `parent`'s post-state, with the replica's sidecar,
@@ -2760,6 +2770,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         in_flight: HashSet::new(),
         waiting: HashMap::new(),
         waiting_hashes: HashSet::new(),
+        in_flight_keys: HashMap::new(),
         apply_inline,
     };
     // A fatal error in the loop ends the node, but most embedders (every cluster test, and any
@@ -3946,18 +3957,32 @@ impl Node {
             // block's hash without being it — a forged signature, GOSSIP-2's repeated tail —
             // never takes the honest block's place in flight or waiting.
             match self.hs.precheck_proposal(&block) {
-                Ok(()) if self.in_flight.len() < OFFLOOP_APPLIES => match self.hs.covered_sidecar(&block) {
-                    Ok(sidecar) => {
-                        self.spawn_apply(block, sidecar);
+                Ok(()) => match self.in_flight_keys.get(&(block.view(), block.proposer())).copied() {
+                    // The same leader's other block for this view is being applied (final review
+                    // I2): this one waits behind it — no worker of its own — and, once the first
+                    // is in, its precheck is an `Equivocation`, so it is delivered and refused on
+                    // the loop, its evidence kept. Over a waiting cap it is delivered now.
+                    Some(first) if self.waiting_room(&block) => {
+                        tracing::debug!("proposal {hash:?} waits behind {first:?}, its leader's other block for the view");
+                        self.wait_behind(first, block);
                         return Ok(false);
                     }
-                    // The replica refuses it the same way, on the loop.
-                    Err(e) => tracing::debug!("proposal {hash:?}: no sidecar for an off-loop apply ({e}); delivered"),
+                    Some(_) => {}
+                    None if self.in_flight.len() < OFFLOOP_APPLIES => match self.hs.covered_sidecar(&block) {
+                        Ok(sidecar) => {
+                            self.spawn_apply(block, sidecar);
+                            return Ok(false);
+                        }
+                        // The replica refuses it the same way, on the loop.
+                        Err(e) => tracing::debug!("proposal {hash:?}: no sidecar for an off-loop apply ({e}); delivered"),
+                    },
+                    None => {}
                 },
-                Err(ConsensusError::UnknownParent(parent)) if self.applying(&parent) && self.waiting_hashes.len() < WAITING_BLOCKS => {
+                // Past the replica's orphan checks too (`precheck_proposal` runs them on an unheld
+                // parent), so its proposer leads its view.
+                Err(ConsensusError::UnknownParent(parent)) if self.applying(&parent) && self.waiting_room(&block) => {
                     tracing::debug!("proposal {hash:?} waits for its parent {parent:?}, being applied");
-                    self.waiting_hashes.insert(hash);
-                    self.waiting.entry(parent).or_default().push(block);
+                    self.wait_behind(parent, block);
                     return Ok(false);
                 }
                 // Over a cap, or refused: on the loop, as before.
@@ -3966,6 +3991,20 @@ impl Node {
         }
         self.deliver(ConsensusMessage::Proposal(block)).await?;
         Ok(true)
+    }
+
+    /// Whether `waiting` has a place for `block`: under [`WAITING_BLOCKS`] in all and under
+    /// [`WAITING_PER_PROPOSER`] for its proposer. Without one, the caller delivers it on the loop.
+    fn waiting_room(&self, block: &Block) -> bool {
+        let proposer = block.proposer();
+        self.waiting_hashes.len() < WAITING_BLOCKS && self.waiting.values().flatten().filter(|b| b.proposer() == proposer).count() < WAITING_PER_PROPOSER
+    }
+
+    /// Queue `block` in `waiting` behind `behind` — its parent, or its leader's other block for
+    /// the view — after [`Node::waiting_room`] found it a place.
+    fn wait_behind(&mut self, behind: Hash, block: Block) {
+        self.waiting_hashes.insert(block.hash());
+        self.waiting.entry(behind).or_default().push(block);
     }
 
     /// Take the proposals waiting behind `parent` out of `waiting`.
@@ -3986,6 +4025,7 @@ impl Node {
         let ledger = self.hs.ledger_after(&parent).expect("the caller found the parent in the tree").clone();
         let (executor, verified, out) = (self.executor.clone(), self.verified.clone(), self.applied_tx.clone());
         self.in_flight.insert(block.hash());
+        self.in_flight_keys.insert((block.view(), block.proposer()), block.hash());
         tokio::task::spawn_blocking(move || {
             let started = Instant::now();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4013,7 +4053,12 @@ impl Node {
     async fn on_applied(&mut self, a: Applied) -> Result<()> {
         let Applied { block, parent, result, took } = a;
         let hash = block.hash();
+        // Every exit — an apply that succeeded, was refused or panicked — comes back here.
         self.in_flight.remove(&hash);
+        let key = (block.view(), block.proposer());
+        if self.in_flight_keys.get(&key) == Some(&hash) {
+            self.in_flight_keys.remove(&key);
+        }
         let result = match result {
             Some(result) => {
                 tracing::debug!("proposal {hash:?} applied off the loop in {} ms", took.as_millis());
@@ -7263,6 +7308,7 @@ mod tests {
             in_flight: HashSet::new(),
             waiting: HashMap::new(),
             waiting_hashes: HashSet::new(),
+            in_flight_keys: HashMap::new(),
             apply_inline: false,
         };
         (node, seen_rx, applied_rx)
@@ -11296,5 +11342,190 @@ mod tests {
         let sent = drain(&mut seen).await;
         assert!(voted_for(&sent, &n) && voted_for(&sent, &n1));
         assert!(!sent.iter().any(|s| matches!(s, Seen::Sync(_, SyncRequest::BlockByHash(_)))), "nothing fetched");
+    }
+
+    /// Final review M3(a): an [`Applied`] that comes back after `HotStuff::resume` replaced the
+    /// replica, as [`Node::apply_synced`] does. With the parent still held under the same hash
+    /// the result is inserted as any other; with the parent gone the replica falls back to its
+    /// orphan path (the parent is fetched, and the child is inserted once the parent arrives).
+    /// Neither panics.
+    #[tokio::test]
+    async fn an_apply_landing_after_a_resume_inserts_or_orphans() {
+        let resume = |node: &Node| resume_consensus(&node.storage, &node.gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), Arc::new(StubExecutor)).unwrap();
+
+        // The parent (the committed head) is held by the resumed replica too.
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen, mut applied) = offloop_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let n = block_on(&head, &ledger, &key(1), node.hs.view(), vec![next_tx(&ledger, 1)]);
+        node.on_consensus(ConsensusMessage::Proposal(n.clone())).await.unwrap();
+        assert!(node.in_flight.contains(&n.hash()));
+        node.hs = resume(&node);
+        assert!(node.hs.has_block(&head.hash()), "the parent is held under the same hash");
+        assert_eq!(complete(&mut node, &mut applied).await, n.hash());
+        assert!(node.hs.has_block(&n.hash()), "inserted by the resumed replica");
+        assert_eq!(node.hs.ledger_after(&n.hash()).unwrap().state_root(), n.header.state_root);
+        assert!(node.in_flight.is_empty() && node.in_flight_keys.is_empty());
+        assert!(voted_for(&drain(&mut seen).await, &n));
+
+        // The parent (an uncertified block) is gone from the resumed replica.
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let (mut node, mut seen, mut applied) = offloop_node(storage, gs, hs);
+        claiming_peer(&mut node, 3);
+        let ledger = node.hs.tip_ledger().clone();
+        let v = node.hs.view();
+        let n = block_on(&head, &ledger, &key(1), v, vec![next_tx(&ledger, 1)]);
+        let after_n = post_state(&ledger, &n);
+        let n1 = block_on(&n, &after_n, &key(1), v + 1, vec![next_tx(&after_n, 2)]);
+        node.on_consensus(ConsensusMessage::Proposal(n.clone())).await.unwrap();
+        assert_eq!(complete(&mut node, &mut applied).await, n.hash());
+        node.on_consensus(ConsensusMessage::Proposal(n1.clone())).await.unwrap();
+        assert!(node.in_flight.contains(&n1.hash()));
+        // As a sync past N would leave it: off the synced branch, dropped by `resume`.
+        node.storage.save_pending_blocks(&[]).unwrap();
+        node.hs = resume(&node);
+        assert!(!node.hs.has_block(&n.hash()), "the parent is not held after the resume");
+        drain(&mut seen).await;
+        assert_eq!(complete(&mut node, &mut applied).await, n1.hash());
+        assert!(!node.hs.has_block(&n1.hash()), "not inserted without its parent");
+        assert!(node.in_flight.is_empty() && node.in_flight_keys.is_empty());
+        assert_eq!(sent_by_hash(&mut seen).await.into_iter().map(|(_, h)| h).collect::<Vec<_>>(), vec![n.hash()], "orphaned: its parent is fetched");
+        // The parent arrives again: the orphan is replayed on it.
+        node.on_consensus(ConsensusMessage::Proposal(n.clone())).await.unwrap();
+        assert_eq!(complete(&mut node, &mut applied).await, n.hash());
+        assert!(node.hs.has_block(&n1.hash()), "the orphan was inserted once its parent was");
+    }
+
+    /// Final review I2 / M3(b): a leader's two blocks for one view, back to back. The second is
+    /// not sent to a worker while the first is in flight: it waits behind the first, and once
+    /// the first is in, it is refused on the loop as an `Equivocation`, its evidence pooled.
+    #[tokio::test]
+    async fn an_equivocating_pair_gets_one_off_loop_apply_and_evidence() {
+        use crate::storage::fixtures::slashing_genesis;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let keys = [key(1), key(2), key(3), key(4)];
+        let gs = slashing_genesis(&keys.iter().collect::<Vec<_>>());
+        storage.init_genesis(&gs).unwrap();
+        let hs = resume_consensus(&storage, &gs, Some(key(1)), Duration::from_secs(1), Duration::from_secs(8), Arc::new(StubExecutor)).unwrap();
+        let genesis = gs.block.clone();
+        let view = hs.view();
+        let leader = keys.iter().find(|k| k.address() == gs.validators.leader(view)).unwrap();
+        let (mut node, mut seen, mut applied) = offloop_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let signed = |ts: u64| {
+            let mut after = ledger.clone();
+            after.set_height(1);
+            after.set_timestamp_ms(ts);
+            after.apply_transactions(&[], &leader.address(), &StubExecutor).unwrap();
+            after.record_anchor(1);
+            let header = BlockHeader {
+                height: 1,
+                view,
+                parent: genesis.hash(),
+                proposer: leader.public_key().clone(),
+                timestamp_ms: ts,
+                tx_root: Block::tx_root(&[]),
+                state_root: after.state_root(),
+                justify: QuorumCertificate::genesis(genesis.hash()),
+            };
+            Block::sign(node.hs.domain(), header, Vec::new(), leader)
+        };
+        let (first, second) = (signed(1), signed(2));
+        assert_ne!(first.hash(), second.hash());
+        assert!(node.hs.precheck_proposal(&first).is_ok() && node.hs.precheck_proposal(&second).is_ok());
+
+        node.on_consensus(ConsensusMessage::Proposal(first.clone())).await.unwrap();
+        node.on_consensus(ConsensusMessage::Proposal(second.clone())).await.unwrap();
+        assert_eq!(node.in_flight, HashSet::from([first.hash()]), "one worker apply for the view");
+        assert_eq!(node.waiting.get(&first.hash()).map(|w| w.len()), Some(1), "the second waits behind the first");
+        assert!(!node.hs.has_block(&second.hash()), "and is not applied on the loop either");
+
+        assert_eq!(complete(&mut node, &mut applied).await, first.hash());
+        assert!(node.hs.has_block(&first.hash()), "the first is inserted");
+        assert!(!node.hs.has_block(&second.hash()), "the second is refused");
+        assert!(node.in_flight.is_empty() && node.waiting.is_empty() && node.in_flight_keys.is_empty());
+        tokio::task::yield_now().await;
+        assert!(applied.try_recv().is_err(), "no second apply");
+        let sent = drain(&mut seen).await;
+        assert_eq!(slash_broadcasts(&sent).len(), 1, "the equivocation's evidence is pooled and gossiped");
+    }
+
+    /// Final review M3(c): N in flight, N+1 waiting behind it, N+2 waiting behind N+1. All three
+    /// are applied off the loop in order and inserted; nothing is fetched.
+    #[tokio::test]
+    async fn a_grandchild_waits_behind_a_waiting_child_and_all_three_land() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, mut seen, mut applied) = offloop_node(storage, gs, hs);
+        claiming_peer(&mut node, 3);
+        let ledger = node.hs.tip_ledger().clone();
+        let v = node.hs.view();
+        let n = block_on(&head, &ledger, &key(1), v, vec![next_tx(&ledger, 1)]);
+        let after_n = post_state(&ledger, &n);
+        let n1 = block_on(&n, &after_n, &key(1), v + 1, vec![next_tx(&after_n, 2)]);
+        let after_n1 = post_state(&after_n, &n1);
+        let n2 = block_on(&n1, &after_n1, &key(1), v + 2, vec![next_tx(&after_n1, 3)]);
+
+        for b in [&n, &n1, &n2] {
+            node.on_consensus(ConsensusMessage::Proposal(b.clone())).await.unwrap();
+        }
+        assert_eq!(node.in_flight, HashSet::from([n.hash()]));
+        assert_eq!(node.waiting.get(&n.hash()).map(|w| w.len()), Some(1), "N+1 waits behind N");
+        assert_eq!(node.waiting.get(&n1.hash()).map(|w| w.len()), Some(1), "N+2 waits behind N+1");
+        for b in [&n, &n1, &n2] {
+            assert_eq!(complete(&mut node, &mut applied).await, b.hash());
+            assert!(node.hs.has_block(&b.hash()));
+        }
+        assert!(node.in_flight.is_empty() && node.waiting.is_empty() && node.waiting_hashes.is_empty() && node.in_flight_keys.is_empty());
+        let sent = drain(&mut seen).await;
+        assert!(voted_for(&sent, &n) && voted_for(&sent, &n1) && voted_for(&sent, &n2));
+        assert!(!sent.iter().any(|s| matches!(s, Seen::Sync(_, SyncRequest::BlockByHash(_)))), "nothing fetched");
+    }
+
+    /// Final review I1 / M3(d): a block validly signed by a key that leads no view, naming an
+    /// in-flight parent, is not queued — the replica's orphan checks refuse it, and it is
+    /// delivered on the loop, where it is refused. And one proposer holds at most
+    /// [`WAITING_PER_PROPOSER`] waiting places: its next block is delivered on the loop, where
+    /// the replica orphans it.
+    #[tokio::test]
+    async fn a_non_leader_cannot_fill_waiting_and_one_proposer_holds_two_places() {
+        let (_d, storage, gs, hs) = replica_past_a_boundary();
+        let head = storage.head_block().unwrap();
+        let (mut node, _seen, mut applied) = offloop_node(storage, gs, hs);
+        let ledger = node.hs.tip_ledger().clone();
+        let v = node.hs.view();
+        let n = block_on(&head, &ledger, &key(1), v, vec![next_tx(&ledger, 1)]);
+        let after_n = post_state(&ledger, &n);
+        node.on_consensus(ConsensusMessage::Proposal(n.clone())).await.unwrap();
+        assert!(node.in_flight.contains(&n.hash()));
+
+        // A child of N signed by a key that leads no view, over its own header.
+        let honest = block_on(&n, &after_n, &key(1), v + 1, vec![next_tx(&after_n, 2)]);
+        let mut header = honest.header.clone();
+        header.proposer = key(2).public_key().clone();
+        let rogue = Block::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), header, honest.transactions.clone(), &key(2));
+        node.on_consensus(ConsensusMessage::Proposal(rogue.clone())).await.unwrap();
+        assert!(node.waiting.is_empty() && !node.applying(&rogue.hash()), "the non-leader's block is not queued");
+        assert!(!node.hs.has_block(&rogue.hash()));
+        // Its signature checks (the precheck gets past it) and its leader does not.
+        assert_eq!(node.hs.precheck_proposal(&rogue), Err(ConsensusError::WrongLeader(rogue.view())));
+
+        // Three children of N by its leader, at three views: two wait, the third does not.
+        let kids: Vec<Block> = (1..=3u64).map(|i| block_on(&n, &after_n, &key(1), v + i, vec![next_tx(&after_n, 30 + i as u32)])).collect();
+        for k in &kids {
+            node.on_consensus(ConsensusMessage::Proposal(k.clone())).await.unwrap();
+        }
+        assert_eq!(node.waiting_hashes, HashSet::from([kids[0].hash(), kids[1].hash()]), "two places for one proposer");
+        assert!(!node.applying(&kids[2].hash()), "the third was delivered on the loop");
+
+        assert_eq!(complete(&mut node, &mut applied).await, n.hash());
+        assert!(node.hs.has_block(&kids[2].hash()), "orphaned on the loop, replayed once N was in");
+        for _ in 0..2 {
+            complete(&mut node, &mut applied).await;
+        }
+        assert!(kids.iter().all(|k| node.hs.has_block(&k.hash())));
+        assert!(node.in_flight.is_empty() && node.waiting.is_empty() && node.in_flight_keys.is_empty());
     }
 }

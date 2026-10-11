@@ -1172,7 +1172,8 @@ impl HotStuff {
     /// honest block's hash that is not that block (a forged signature; GOSSIP-2's repeated tail)
     /// never takes its place. Runs `on_proposal`'s pre-execute refusals through the same code,
     /// reading only — the view range and window, a stale height, the signature, the parent
-    /// (`UnknownParent` when it is not held; nothing is orphaned), its view and height, the
+    /// (`UnknownParent` when it is not held and the block passes `check_orphan`, whose refusal
+    /// is returned otherwise; nothing is orphaned), its view and height, the
     /// leader, an equivocation (no evidence kept), the justify's parent and set and view — plus
     /// [`Block::transaction_list_fault`], in place of the apply that would refuse it. Two checks
     /// are left to `on_proposal`: the certificate's signatures (verified there once, through
@@ -1187,6 +1188,12 @@ impl HotStuff {
         }
         let parent_hash = block.parent();
         if !self.tree.contains_key(&parent_hash) {
+            // The orphan checks `on_proposal` runs on such a block (final review I1): a block that
+            // waits for its parent must be one the replica would keep as an orphan — a proposer
+            // that leads its view in the current or next set, a height and view that can link,
+            // the transaction count and byte cap, a justify no larger than a set. Without them a
+            // key that leads no view, signing its own header, could take every waiting place.
+            self.check_orphan(block)?;
             return Err(ConsensusError::UnknownParent(parent_hash));
         }
         self.check_against_parent(block)?;

@@ -498,15 +498,24 @@ parent's ledger) runs on a blocking thread; the result returns on a select arm a
 as a `PreApplied`. What stays on the loop: `precheck_proposal`, run before dispatch (view, stale,
 signature, parent, leader, equivocation, justify and the transaction list); all of `on_proposal`'s
 checks, including the QC check; and the insert. At most 4 blocks apply at once (`OFFLOOP_APPLIES`), and
-up to 8 (`WAITING_BLOCKS`) wait behind a parent that is applying or waiting. Over a cap, or when the
-precheck refuses, the block is delivered inline as before; over the waiting cap it goes to HotStuff's
-orphan path. Still applied on the loop: sync batches, the leader's own block, orphan re-runs,
-`offer_pending` and `restore_pending`. A by-hash fetch answer that is not the requested block is
-dropped and the next peer is asked. `--apply-proposals-inline` restores the old path. Two behaviour
-notes. (1) The view timeout can now fire while a slow apply is running, so a late proposal can miss its
-vote; before, the blocked loop could not fire the timer first. (2) With two same-view blocks applying
-at once, whichever finishes first is inserted and the other becomes the equivocation, so the order of
-evidence can swap; safety is unchanged.
+up to 8 (`WAITING_BLOCKS`), at most 2 per proposer (`WAITING_PER_PROPOSER`), wait behind a parent that
+is applying or waiting. A block with an unheld parent must also pass HotStuff's orphan checks
+(`check_orphan`: its proposer leads its view in the current or next set, its height and view can link,
+the transaction and byte caps, the justify's vote count) before it may wait, so a key that leads no view
+cannot take the places. A leader's second block for a view whose first block is applying waits behind
+the first (`in_flight_keys`, by view and proposer); once the first is in, it is refused on the loop as an
+equivocation and the evidence is kept, so an equivocating leader costs one worker apply per view. Over
+a cap, or when the precheck refuses, the block is delivered inline as before; over the waiting cap it
+goes to HotStuff's orphan path. Still applied on the loop: sync batches, the leader's own block, orphan
+re-runs, `offer_pending` and `restore_pending`. `--apply-proposals-inline` restores the inline apply. A
+by-hash fetch answer that is not the requested block is dropped and the next peer is asked; this
+binding is a fix of its own and stays on whatever the flag says. Two behaviour notes. (1) The view
+timeout can now fire while a slow apply is running. That alone only sends a timeout message and re-arms
+the timer; the vote is lost only if a timeout quorum or a QC moves the view before the apply lands,
+since `try_vote` needs `block.view() == self.view`. Before, the blocked loop could not fire the timer
+first. (2) A same-view pair from one leader is settled in arrival order, as inline: the second waits
+for the first and is the equivocation. Only past a waiting cap is the second applied on the loop while
+the first is still applying, and then the evidence order can swap; safety is unchanged.
 
 Gossipsub runs with application-level validation (`validate_messages()`), so a transaction is
 forwarded to other peers only once it has verified here; consensus and status messages are
