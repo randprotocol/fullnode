@@ -327,6 +327,86 @@ includes an ignored Production measurement
 (the key stays resident for the life of the process), exceeds 1.5 GB above a plain `rand-node`
 baseline, stop and report before any cut carries the field.
 
+**Measured (plan Task 2, commit `14904597`): the stop rule tripped.** The Production build took
+78.6 s, with about 4.0 GB peak and about 4.0 GB resident after it (macOS). The fleet's validators
+are `s-2vcpu-4gb`, and the user has ruled that the roll uses the current machines, so **no
+validator builds this key at startup**. The key is precomputed instead (§3.6).
+
+### 3.6 The precomputed msauth verifier key (plan Task 2b)
+
+**What the key is.** The vendored type is `p3_batch_stark::CommonData<Config>`, which has two fields:
+
+- `preprocessed: Option<GlobalPreprocessed>`: the global preprocessed **commitment** (a Merkle
+  cap), plus per-instance `{matrix_index, width, degree_bits}` and `matrix_to_instance`;
+- `lookups: Vec<Lookups<Val>>`, one per instance.
+
+`CommonData` derives no `Serialize`. Of its contents, only the commitment is expensive: it is the
+root over the low-degree extension of every table's preprocessed columns, which is where the 78 s
+and the 4 GB go. The metadata and the lookups are symbolic functions of the AIRs and the pinned
+heights, cheap to recompute. All of it is deterministic in the msauth program, the pinned shape
+(`msauth_heights()`) and the FRI profile.
+
+**The blob.** `msauth-vk-<profile>.bin` is `postcard` of
+`MsauthVkBlob { version: 1, profile, shape: MsauthShape, hc: Word8, commitment: Commitment<Config>, instances: Vec<Option<(usize, usize, usize)>>, matrix_to_instance: Vec<usize> }`.
+Its size is a few KB at most: a Merkle cap of a few 32-byte digests plus small vectors. Task 2b
+measures it.
+
+**Trust.** A wrong commitment could let a forged multisig proof verify, so the blob is
+consensus-critical, like `hc`. Its blake3 is pinned in `tests/guest_provenance.rs` for both
+profiles, and `warm_auth_multisig` refuses a blob whose digest is not the pinned one, or whose
+`shape`, `hc` or profile is not this build's.
+
+**Building it.** `rand-node keygen-msauth-vk --profile production --out <file>` runs on a big host
+and does the full build once (78.6 s, about 4 GB). It extracts the commitment and metadata from the
+built `CommonData` and writes the blob, printing its blake3.
+
+**Loading it.** `ZkExecutor::install_msauth_vk(blob)` checks the digest, profile, `hc` and shape.
+It then rebuilds the lookups and per-instance metadata from the AIRs: a `sync-zkvm.sh` patch to
+`machine.rs`, anchored like `log_ext_degrees_pub`, adds
+`Machine::verifier_key_with_modq_from_commitment(…7-tuple…, commitment) -> Arc<CommonData<Config>>`.
+That function runs `from_airs_and_degrees`'s lookup/metadata half without the commit, and inserts
+the result into the cache slot for the 7-tuple. The function also checks that the rebuilt metadata
+equals the blob's. The result goes into the same single-flight `msauth_key` `OnceLock` and the
+`Machine` slot, so `verify_public` finds it built.
+
+**Where the blob lives (cut-owner ruling, adopted).** There is **one** fixed location, beside the
+binary: `/usr/local/bin/msauth-vk-production.bin` (`msauth-vk-<profile>.bin` next to the running
+executable). A developer can override it with `--msauth-vk <path>` or the environment variable
+`RAND_MSAUTH_VK`. There is no data-dir location and no embedded copy. The repository's
+`crates/randprotocol-zkvm/keys/msauth-vk-test.bin` exists only for tests.
+
+**Startup fails loudly.** On a chain with `hc_auth_multisig`, `node::warm` loads the blob before
+any other key. If the blob is missing, undecodable, or its blake3 is not the pin in
+`tests/guest_provenance.rs`, the node **refuses to start**. The error names the path and the
+expected digest: "msauth verifier key: /usr/local/bin/msauth-vk-production.bin missing (expected
+blake3 <hex>); install it from the release, or run with --build-msauth-key on a ≥ 8 GB host".
+There is **no automatic fallback build**. A build happens only behind the explicit
+`--build-msauth-key` flag, for development on a laptop, never by default, because the fleet is
+4 GB.
+
+**Status.** `rand_status.msauth_key` is one of:
+
+- `"loaded"`: from the blob;
+- `"built"`: `--build-msauth-key`;
+- `"absent"`: the chain has no `hc_auth_multisig`. A multisig chain never runs without the key.
+
+**Deploy.** Chain 21 is a fresh cut, so the first install is a new
+`deploy/cutover-fleet-chain21.sh`, modelled on `cutover-fleet-chain20.sh` and owned by
+randprotocol-d7. The plan sends d7 the copy-and-check snippet; it does not write that script.
+`deploy/roll-all.sh` gains the same steps for the blob, alongside the `rand-node` and `rand`
+binaries it already handles (copy to `/root/*.new`, sha256 check, install to `/usr/local/bin`):
+
+- copy it to `/root/msauth-vk-production.bin.new`;
+- check its blake3 against the pin;
+- install it to `/usr/local/bin/msauth-vk-production.bin`.
+
+v0.8.0 ships `msauth-vk-production.bin` as a signed release asset, listed in `SHA256SUMS`.
+
+**Linux.** macOS libmalloc kept the 4 GB after the build. The load path never allocates the LDE,
+so resident memory after a load should be small on any OS; glibc behaviour after a fallback build
+may differ. Plan Task 8 and the cut rehearsal must **measure on an `s-2vcpu-4gb` droplet**: RSS
+after load, and RSS after the first tier-18 verify, which has its own allocations.
+
 ## 4. The executor (`crates/randprotocol-zkvm`)
 
 ### 4.1 New items
@@ -734,4 +814,5 @@ startup-checkpoint and verify-cache bullets) verbatim, and makes three changes:
 | 19 | stale parent-spec copy | replaced with circuits' |
 | 20 | prover fleet and `clients/core` at the cut | §7 |
 | 21 | `sign` warns on a validator key | §6.3 |
+| — | (Task 2 measurement) the precomputed msauth key | §3.6, plan Task 2b |
 | — | (user decision) signer checks as the pure, wasm32-clean crate `randprotocol-msig` | §6.5, plan Task 6 |
