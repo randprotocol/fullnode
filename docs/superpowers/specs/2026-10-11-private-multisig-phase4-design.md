@@ -402,7 +402,8 @@ hand to the hand-maintained `guests.rs`: `Program::from_flat_image(include_bytes
   `inner_vk_digest` and `verify_rv32.digest` (vendored rvm `tests/pins.json`), the node's
   `aggregate_program_digest` pins, the recursion fixtures (`crates/randprotocol-node/fixtures/
   recursion/Test-{0,1,2}.proof` no longer decode and are re-proved by `scripts/recursion-fixtures.sh`,
-  so the pinned-vectors digest `3534960f…` moves), and `CIRCUITS_PIN`.
+  so the pinned-vectors digest `3534960f…` moves), and `CIRCUITS_PIN`. Every pre-rVM-phase-4
+  recursion digest and key is purged in the same commit and guarded by a test (§5 item 8).
 
 ## 5. The re-vendor (`deploy/sync-zkvm.sh`)
 
@@ -444,16 +445,34 @@ there. That commit must be pushed: `CUDA_REV` must be fetchable.
    nothing new (`HC`, `IN`, `PUB` unchanged, and `msauth.rs`'s tags are its own constants). The
    script now prints `anchors: verifier_key 6-arg ok; notes::domain HC/IN/PUB ok` so the run log
    shows it.
-7. **The rvm is re-vendored on purpose this time.** The script's tail re-syncs
+7. **The circuits SHA** is the one randprotocol-3a names after rVM phase 4's final review, as
+   merged into `feat/private-multisig` by circuits Task 9; it is not `origin/main`.
+8. **The rvm is re-vendored on purpose this time.** The script's tail re-syncs
    `crates/randprotocol-rvm` from `../circuits/recursion`. The usual trap, a re-vendor that should
    not move the rvm, is reverted with `git checkout -- crates/randprotocol-rvm`. Here it must
    **not** be reverted: the inner cpu width moved, so `verify_rv32.digest`, `tests/pins.json` and
    `inner_vk_digest` move with it, and that is exactly circuits Task 9's re-pin. Re-vendor the rvm
    from the **same** circuits commit (`RVM_SRC=../circuits/recursion` at the Task 9 merge). The
    script's last echo line (`pin 4a244b6`) becomes the new commit.
-8. `CIRCUITS_PIN` in `.github/workflows/ci.yml`, both `PROVENANCE.md` files and the CUDA rev all
+
+   **rVM phase 4's silent semantic change (randprotocol-3a).** Phase 4 changed recursion opcodes 25
+   and 27 (their 4th word is now an absolute address) **without changing the verifier key**. Any
+   pre-phase-4 program digest, aggregate or tree digest, or pinned key would therefore keep
+   verifying while meaning something else. In the **same commit** that bumps `CIRCUITS_PIN`, the
+   re-vendor drops or re-records every one of them:
+   - `inner_vk_digest` `346ee184…` and the pinned-vectors digest `3534960f…`;
+   - `verify_rv32.digest` `cf5a350a…` and `dsl-sample.digest` `8c77648e…`;
+   - the sixteen `tree_test.vk_*` words, which are `agg_executor.rs`'s `PIN_VK_{LEAF,T_LEAF,INT,FIX}`;
+   - every test `TreeConfig` step key in the node and core tests, and the recursion fixtures.
+
+   A guard test, `crates/randprotocol-node/tests/no_pre_phase4_recursion_pins.rs`, asserts that
+   none of the moved literals remains anywhere in the tree. The commit message names each digest
+   that moved and why, and any value that did not move as invariant, with the reason. No committed
+   genesis carries `aggregation_tree` today; if one did, its step pins would be consensus and the
+   cut would have to be redone.
+9. `CIRCUITS_PIN` in `.github/workflows/ci.yml`, both `PROVENANCE.md` files and the CUDA rev all
    name that commit. CI's guest-rebuild gate covers `msauth` (five guests).
-9. Mirror `MODQ_GAS` and `gas_max_with_modq` in `randprotocol-core/src/gas.rs`.
+10. Mirror `MODQ_GAS` and `gas_max_with_modq` in `randprotocol-core/src/gas.rs`.
    `the_cores_gas_max_mirror_matches_the_vendored_one` gains a modq sweep.
 
 Out of scope here, and recorded for the clients repo: `clients/core` vendors the fullnode, and its
@@ -611,7 +630,8 @@ set:
 - **Selftest refuse cases:** absent (gate on), not chain 20's flag set, equal to `hc_auth`, a
   `max_proof_bytes` under 4 MiB, a wrong digest.
 
-Cut checklist addition: the `rand-prover` fleet (prover.randprotocol.org) and `clients/core`'s
+Cut checklist addition: no genesis `aggregation_tree` step pin may predate rVM phase 4 (§5 item 8;
+opcodes 25/27 changed meaning under an unchanged key). Also, the `rand-prover` fleet (prover.randprotocol.org) and `clients/core`'s
 vendored fullnode must be on constraint set 9 at the cut, or every delegated bundle proof and every
 light wallet fails on chain 21's keys.
 

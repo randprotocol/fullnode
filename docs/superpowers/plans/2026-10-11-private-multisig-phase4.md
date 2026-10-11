@@ -23,7 +23,8 @@
   - **Task 8**, which measures `MSAUTH_TIER` and `M_MAX` and writes `msauth::pinned_options()`'s floors and the msauth `hc` into `research/docs/04-guests.md`;
   - **Task 9**, the docs, the merge of rVM phase 4 and the single recursion re-pin, on a commit pushed to a remote, since `CUDA_REV` must be fetchable.
 
-  Record that commit as `$CIRCUITS` in the Task 1 commit message.
+  **The circuits SHA to vendor is the one randprotocol-3a names after rVM phase 4's final review, as merged into `feat/private-multisig` by circuits Task 9. It is not `origin/main`.** Ask 3a for it, and check that `git -C <circuits> merge-base --is-ancestor <3a's SHA> $CIRCUITS` holds. Record that commit as `$CIRCUITS` in the Task 1 commit message.
+- **rVM phase 4 changed recursion opcodes 25 and 27 without changing the verifier key** (randprotocol-3a): their 4th word is now an absolute address. So every pre-phase-4 program digest, aggregate/tree digest and pinned key would **keep verifying while meaning something else**. Task 1 drops or re-records every one of them **in the same commit that bumps `CIRCUITS_PIN`**, and adds a guard test that none survives.
 - **The two values from circuits Task 8, filled in (controller ruling, 2026-10-11): `MSAUTH_TIER = 18`, `M_MAX = 3`.** Task 8's five-fixture gate measured M = 3 at 250 685–252 775 cycles and exactly 1 942 Poseidon2 permutations, inside tier 18 with 9 368 cycles to spare. The pinned heights are program 12, input 12, keccak 14, sha256 0, modq 16, public 7, mem 20. Circuits' `check_pinned_shape_with`/`prove_msauth` hard-error, naming the field, when a witness's natural heights miss a pin. If the vendored commit disagrees with any of these numbers, stop. The msauth program `hc` is the one value still read off the vendored binary (Task 2 Step 3).
 - **Chain-21 gate (before Task 1).** Check whether chain 21 has been cut: `deploy/genesis-chain21.json` is committed, or randprotocol-d7 says so. Task 1 alone already makes this build constraint set 9. If chain 21 has been cut:
   - add chain 21's hash to `CHAINS_THIS_BUILD_CANNOT_RUN` in Task 1, with `CONSTRAINT_SET_8_REASON` and the wording "chains 18–21";
@@ -297,13 +298,69 @@ cargo +1.98.1 tree -p randprotocol-node -e normal -f '{p} {f}' | grep 'randproto
 
 Expected: all pass, and the last command prints `0`. Any test that pinned a verifier-key digest, `inner_vk_digest` or an aggregate program digest is re-pinned to the value its failure prints, and only those. A re-pin elsewhere is a stop-and-report.
 
+- [ ] **Step 4b: Purge every pre-rVM-phase-4 recursion pin (randprotocol-3a's requirement).** Opcodes 25 and 27 changed meaning under an unchanged verifier key, so a stale digest would still verify. The "before" set is everything the fullnode pins today from circuits' `recursion/tests/pins.json` (it equals this tree's `crates/randprotocol-rvm/tests/pins.json`, whose `tree_test` matches the circuits branch's pre-merge file) and the digests derived from it:
+
+| where | literal (before) |
+|---|---|
+| `crates/randprotocol-node/src/agg_executor.rs:1331,1355` (`inner_vk_digest`) | `346ee1841980e46a3501f5b04cdf40dd3208e5b1c67360285353cf7a0b735fb9` |
+| `agg_executor.rs:1342`, `scripts/recursion-fixtures.sh` (pinned-vectors digest) | `3534960f6757e6e034518a5a1926f6107c9cda7c9d5d96296b6d4ed5c3984629` |
+| `crates/randprotocol-rvm/src/programs/verify_rv32.digest` | `cf5a350a62fa00bb6e84fa0de311a726aac7c610d23ce272b8c80795bac51788` |
+| `crates/randprotocol-rvm/tests/dsl-sample.digest` | `8c77648ee88aecb69d4ab5cd562d262298a4cea0cc8d5ad083c29f27a41ab72b` |
+| `agg_executor.rs:1490` `PIN_VK_LEAF`, `pins.json` `tree_test.vk_leaf_*` | `1769152780461762224`, `4754121159208375271`, `16285051620565002471`, `12356170513791122891` |
+| `agg_executor.rs:1491` `PIN_VK_T_LEAF`, `vk_t_leaf_*` | `7711328338169539612`, `5984874271003933741`, `17134834717916042633`, `2542356665053237370` |
+| `agg_executor.rs:1492` `PIN_VK_INT`, `vk_int_*` | `12189568167191873679`, `7035563939045772652`, `12535684755110529647`, `4848701472125205360` |
+| `agg_executor.rs:1493` `PIN_VK_FIX`, `vk_fix_*` | `4756771443877942240`, `18437901406829798119`, `13732813924430148200`, `10825047408558662485` |
+
+  1. Diff circuits `recursion/tests/pins.json` at `$CIRCUITS` against the before file (`git -C <circuits> diff <pre-phase-4 base>..$CIRCUITS -- recursion/tests/pins.json`). Every literal above whose value moved is re-recorded from the after file or from the failing test's print. A literal that did not move is **phase-4-invariant**: name it in the commit message with the reason, and drop it from the guard.
+  2. Re-record the same set wherever else it appears:
+     - every `TreeConfig` step key and step digest in `crates/randprotocol-node/tests/**` (`tests/common/mod.rs`, `cluster.rs`, `genesis_cli.rs`, `rpc_contract.rs`) and in `crates/randprotocol-core` tests (`ledger/aggregation.rs`);
+     - the aggregate/tree fixtures under `crates/randprotocol-node/fixtures/`.
+
+     Prefer **deriving** a step key at test time from `randprotocol_rvm` over a literal wherever the test allows it. No committed `deploy/genesis-chain*.json` carries `aggregation_tree` (checked: none does; chain 21 is not cut). If one does by then, stop: its step pins are consensus, and randprotocol-d7 must re-cut.
+  3. Add the guard, `crates/randprotocol-node/tests/no_pre_phase4_recursion_pins.rs`:
+     ```rust
+     //! rVM phase 4 (circuits $CIRCUITS) changed recursion opcodes 25/27 (4th word = absolute address)
+     //! without changing the verifier key: a pre-phase-4 digest or key would still verify, meaning
+     //! something else. None may remain anywhere in the tree.
+     const STALE: &[&str] = &[ /* every literal of the table that moved, as written in it */ ];
+     #[test]
+     fn no_pre_phase4_recursion_digest_or_key_remains() {
+         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+         let mut hits = Vec::new();
+         for dir in ["crates", "deploy", "scripts", "vendor"] {
+             walk(&root.join(dir), &mut |p, text| {
+                 if p.ends_with("no_pre_phase4_recursion_pins.rs") { return; }
+                 for lit in STALE { if text.contains(lit) { hits.push(format!("{}: {lit}", p.display())); } }
+             });
+         }
+         assert!(hits.is_empty(), "pre-rVM-phase-4 pins remain:
+{}", hits.join("
+"));
+     }
+     fn walk(d: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
+         for e in std::fs::read_dir(d).unwrap().flatten() {
+             let p = e.path();
+             if p.file_name().is_some_and(|n| n == "target" || n == ".git") { continue; }
+             if p.is_dir() { walk(&p, f) } else if let Ok(t) = std::fs::read_to_string(&p) { f(&p, &t) }
+         }
+     }
+     ```
+     Fill `STALE` with exactly the moved literals from item 1, copied from the table above. Before the purge it must fail, listing every hit; after the purge it must pass:
+     ```bash
+     cargo +1.98.1 test --release -p randprotocol-node --test no_pre_phase4_recursion_pins
+     ```
+
 - [ ] **Step 5: Commit.**
 
 ```bash
 git add deploy/sync-zkvm.sh crates/randprotocol-zkvm crates/randprotocol-rvm crates/randprotocol-core/src/gas.rs \
         crates/randprotocol-node/src/node.rs crates/randprotocol-node/src/main.rs crates/randprotocol-node/src/agg_executor.rs crates/randprotocol-node/fixtures \
-        scripts/recursion-fixtures.sh vendor/circuits .github/workflows/ci.yml Cargo.lock
-git commit -m "zkvm, rvm: re-vendor circuits $CIRCUITS — the MODQ chip (constraint set 9: every key and the proof encoding move), the msauth host model and guest, the rvm re-pinned with it; the node refuses chains 18-20"
+        scripts/recursion-fixtures.sh vendor/circuits .github/workflows/ci.yml Cargo.lock crates/randprotocol-node/tests crates/randprotocol-core
+git commit -m "zkvm, rvm: re-vendor circuits $CIRCUITS — the MODQ chip (constraint set 9: every key and the proof encoding move), the msauth host model and guest, the rvm re-pinned with it; the node refuses chains 18-20" \
+  -m "Recursion pins moved, and why: rVM phase 4 (3a's reviewed SHA, merged by circuits Task 9) changed opcodes 25/27 (4th word = absolute address) without changing the verifier key, so every pre-phase-4 digest would still verify while meaning something else. Re-recorded in this same commit: inner_vk_digest 346ee184… → <after>, pinned vectors 3534960f… → <after>, verify_rv32.digest cf5a350a… → <after>, dsl-sample.digest 8c77648e… → <after or 'invariant: <reason>'>, PIN_VK_LEAF/T_LEAF/INT/FIX → <after>; tree step keys in node/core tests re-derived; guard test no_pre_phase4_recursion_pins added."
+```
+
+Each `<after>` in the second `-m` is the value Step 4b recorded; write the actual hex prefixes before committing.
 ```
 
 ---
