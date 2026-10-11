@@ -369,26 +369,38 @@ the result into the cache slot for the 7-tuple. The function also checks that th
 equals the blob's. The result goes into the same single-flight `msauth_key` `OnceLock` and the
 `Machine` slot, so `verify_public` finds it built.
 
-**Where the blob comes from at startup, in order:**
+**Where the blob lives (cut-owner ruling, adopted).** There is **one** fixed location, beside the
+binary: `/usr/local/bin/msauth-vk-production.bin` (`msauth-vk-<profile>.bin` next to the running
+executable). A developer can override it with `--msauth-vk <path>` or the environment variable
+`RAND_MSAUTH_VK`. There is no data-dir location and no embedded copy. The repository's
+`crates/randprotocol-zkvm/keys/msauth-vk-test.bin` exists only for tests.
 
-1. `--msauth-vk <path>`.
-2. `<datadir>/msauth-vk-<profile>.bin`.
-3. `msauth-vk-<profile>.bin` beside the executable.
-4. **Embedded.** If Task 2b measures the blob at ≤ 64 KB, it is committed at
-   `crates/randprotocol-zkvm/keys/msauth-vk-{production,test}.bin` and `include_bytes!`'d, so a
-   binary always carries its own. That is the expected case, and it makes items 1–3 overrides.
-5. **None found.** Fall back to building only if `MemAvailable` (Linux `/proc/meminfo`;
-   `sysctl hw.memsize` minus usage on macOS) exceeds 6 GB, logging loudly at `warn`. Otherwise the
-   key stays absent: multisig spends are deferred (`MempoolError::Warming`), and a block carrying
-   one stalls this node's apply rather than OOM-killing it. `rand_status` says why.
+**Startup fails loudly.** On a chain with `hc_auth_multisig`, `node::warm` loads the blob before
+any other key. If the blob is missing, undecodable, or its blake3 is not the pin in
+`tests/guest_provenance.rs`, the node **refuses to start**. The error names the path and the
+expected digest: "msauth verifier key: /usr/local/bin/msauth-vk-production.bin missing (expected
+blake3 <hex>); install it from the release, or run with --build-msauth-key on a ≥ 8 GB host".
+There is **no automatic fallback build**. A build happens only behind the explicit
+`--build-msauth-key` flag, for development on a laptop, never by default, because the fleet is
+4 GB.
 
-**Status.** `rand_status.msauth_key` is one of `"loaded"` (from a blob or embedded), `"built"`,
-`"absent"` (multisig chain, no blob, not enough memory), or `"not_required"` (no
-`hc_auth_multisig`).
+**Status.** `rand_status.msauth_key` is one of:
 
-**Release.** v0.8.0 ships `msauth-vk-production.bin` as a release asset, listed in `SHA256SUMS`
-and signed. `deploy/roll-all.sh` copies it beside the binary on every host, and the cut checklist
-lists it. Embedding (item 4) makes this belt-and-braces.
+- `"loaded"`: from the blob;
+- `"built"`: `--build-msauth-key`;
+- `"absent"`: the chain has no `hc_auth_multisig`. A multisig chain never runs without the key.
+
+**Deploy.** Chain 21 is a fresh cut, so the first install is a new
+`deploy/cutover-fleet-chain21.sh`, modelled on `cutover-fleet-chain20.sh` and owned by
+randprotocol-d7. The plan sends d7 the copy-and-check snippet; it does not write that script.
+`deploy/roll-all.sh` gains the same steps for the blob, alongside the `rand-node` and `rand`
+binaries it already handles (copy to `/root/*.new`, sha256 check, install to `/usr/local/bin`):
+
+- copy it to `/root/msauth-vk-production.bin.new`;
+- check its blake3 against the pin;
+- install it to `/usr/local/bin/msauth-vk-production.bin`.
+
+v0.8.0 ships `msauth-vk-production.bin` as a signed release asset, listed in `SHA256SUMS`.
 
 **Linux.** macOS libmalloc kept the 4 GB after the build. The load path never allocates the LDE,
 so resident memory after a load should be small on any OS; glibc behaviour after a fallback build

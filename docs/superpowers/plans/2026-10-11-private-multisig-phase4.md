@@ -809,11 +809,12 @@ Why: Task 2 (commit `14904597`) measured the tier-18 msauth key build at **78.6 
 **Files:**
 - Modify: `deploy/sync-zkvm.sh` (a `machine.rs` patch: `verifier_key_with_modq_from_commitment`, anchored on `verifier_key_with_modq`'s signature and asserted like the `log_ext_degrees_pub` patch)
 - Modify: `crates/randprotocol-zkvm/src/executor.rs` (`MsauthVkBlob`, `msauth_vk_blob`, `install_msauth_vk`, `MsauthKeySource`)
-- Create: `crates/randprotocol-zkvm/keys/msauth-vk-production.bin`, `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (only if Step 3 measures ≤ 64 KB; otherwise these stay release assets only)
+- Create: `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (tests only). The production blob is a release asset installed at `/usr/local/bin/msauth-vk-production.bin`, never embedded
 - Create: `crates/randprotocol-zkvm/tests/auth_msauth_vk.rs`
 - Modify: `crates/randprotocol-zkvm/tests/guest_provenance.rs` (both blob digests)
-- Modify: `crates/randprotocol-node/src/main.rs` (`keygen-msauth-vk`; `run --msauth-vk <path>`), `crates/randprotocol-node/src/node.rs` (the warm order, the source), `crates/randprotocol-node/src/rpc.rs` (`rand_status.msauth_key`)
-- Modify: `deploy/roll-all.sh` (copy `msauth-vk-production.bin` beside the binary, verify its sha256), `docs/deploy.md`, `docs/node-hardware.md`
+- Modify: `crates/randprotocol-node/src/main.rs` (`keygen-msauth-vk`; `run --msauth-vk <path>` / env `RAND_MSAUTH_VK`; `run --build-msauth-key`), `crates/randprotocol-node/src/node.rs` (the warm order, the source), `crates/randprotocol-node/src/rpc.rs` (`rand_status.msauth_key`)
+- Modify: `deploy/roll-all.sh` (copy the blob to `/root/msauth-vk-production.bin.new`, check its blake3 against the pin, install it to `/usr/local/bin/`, beside the `rand-node`/`rand` steps at `:51-52`)
+- Not modified (d7's): `deploy/cutover-fleet-chain21.sh`. Step 3 item 7 sends d7 the snippet, `docs/deploy.md`, `docs/node-hardware.md`
 
 **Interfaces:**
 - Consumes: Task 2's `msauth_machine`, `msauth_key` `OnceLock`, `msauth_heights()`, `hc_auth_multisig()`.
@@ -827,7 +828,7 @@ Why: Task 2 (commit `14904597`) measured the tier-18 msauth key build at **78.6 
   pub struct MsauthVkBlob { pub version: u32, pub profile: String, pub shape: MsauthShape, pub hc: Word8,
                             pub commitment: Vec<u8> /* postcard of Commitment<Config> */,
                             pub instances: Vec<Option<(usize, usize, usize)>>, pub matrix_to_instance: Vec<usize> }
-  #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)] pub enum MsauthKeySource { Loaded, Built, Absent, NotRequired }
+  #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)] pub enum MsauthKeySource { Loaded, Built, Absent }   // Absent = the chain has no hc_auth_multisig
   pub fn msauth_vk_blob(profile: FriProfile) -> Vec<u8>;                         // the full build, serialised (big host)
   pub const MSAUTH_VK_BLAKE3_PRODUCTION: &str; pub const MSAUTH_VK_BLAKE3_TEST: &str;
   impl ZkExecutor {
@@ -835,8 +836,8 @@ Why: Task 2 (commit `14904597`) measured the tier-18 msauth key build at **78.6 
       pub fn msauth_key_source(&self) -> MsauthKeySource;
   }
   // node: rand-node keygen-msauth-vk --profile <production|test> --out <file>    (prints `blake3 <hex>  bytes <n>`)
-  //       rand-node run --msauth-vk <path>
-  //       rand_status.msauth_key: "loaded" | "built" | "absent" | "not_required"
+  //       rand-node run [--msauth-vk <path> | env RAND_MSAUTH_VK] [--build-msauth-key]   (default path: <exe dir>/msauth-vk-<profile>.bin = /usr/local/bin/msauth-vk-production.bin)
+  //       rand_status.msauth_key: "loaded" | "built" | "absent"
   ```
 
 - [ ] **Step 1: Write the failing tests** in `crates/randprotocol-zkvm/tests/auth_msauth_vk.rs`:
@@ -906,8 +907,13 @@ fn the_loaded_key_equals_the_built_key_and_the_blob_regenerates_to_the_pin() {
 
 Also:
 - in `guest_provenance.rs`, add `the_msauth_verifier_key_blobs_are_pinned()`. It asserts both constants are 64-hex, and that each committed `keys/msauth-vk-*.bin` hashes to its constant (or, if the blobs are release-only, that `docs/deploy.md` names both digests);
-- in `rpc.rs`'s tests, add `rand_status_reports_the_msauth_key_source`. It sets each `MsauthKeySource` on the status and reads `"loaded"`, `"built"`, `"absent"` and `"not_required"`;
-- in `node.rs`'s tests, add `a_missing_blob_with_little_memory_leaves_the_key_absent_and_never_builds`. It drives the source selection with an injected `available_bytes = 3 GiB` and no blob, then asserts `Absent` and `cached_msauth_keys() == 0`.
+- in `rpc.rs`'s tests, add `rand_status_reports_the_msauth_key_source`. It sets each `MsauthKeySource` on the status and reads `"loaded"`, `"built"` and `"absent"`;
+- in `node.rs`'s tests, add `startup_fails_loudly_on_a_missing_or_wrong_msauth_blob_and_never_builds`. On a genesis with `hc_auth_multisig`, `node::load_msauth_key(&executor, path, build: false)`:
+  - with no file, returns `Err` whose text contains the path and `MSAUTH_VK_BLAKE3_TEST`;
+  - with a one-byte-flipped copy of the test blob, returns `Err` containing "blake3";
+  - with the committed test blob, returns `Ok(Loaded)`.
+
+  `cached_msauth_keys() == 0` after both failures (no build). With `build: true` and no file it returns `Ok(Built)` only in the ignored variant, which builds. On a genesis without `hc_auth_multisig` it returns `Ok(Absent)` and never reads the path.
 
 `install_err_text` is a test helper (`#[doc(hidden)] pub fn`) that renders the `ConfidentialError`. `fixtures::one_msauth_proof` is Task 2's 2-of-3 fixture moved into `executor::fixtures`.
 
@@ -928,19 +934,25 @@ Expected: compile errors (no `install_msauth_vk`, `MsauthVkBlob` or `msauth_vk_b
      - `verifier_key_with_modq_from_commitment` succeeds, and its rebuilt `instances`/`matrix_to_instance` equal the blob's ("metadata").
 
      Then it fills `msauth_key` and sets the source to `Loaded`. `warm_auth_multisig` keeps its build behaviour only for the `Built` fallback.
-  4. Node source selection (`node::warm`, before every other key) tries, in order:
-     - `--msauth-vk <path>`;
-     - `<datadir>/msauth-vk-<profile>.bin`;
-     - `<exe dir>/msauth-vk-<profile>.bin`;
-     - the embedded blob, if `keys/` is committed. Use `include_bytes!` on the profile's blob, under `#[cfg(not(feature = "no-embedded-msauth-vk"))]`.
-
-     The first that installs wins; a blob that is present but refused is logged at `error` with its path, and the next is tried. With none: if `available_bytes()` (Linux `MemAvailable` from `/proc/meminfo`; macOS `sysctl hw.memsize`) exceeds 6 GiB, log at `warn` "building the tier-18 msauth key (~4 GB, ~80 s): no blob found" and build, giving `Built`. Otherwise log at `error` "no msauth key blob and < 6 GiB free: multisig spends are deferred on this node", and the source is `Absent`. The mempool's `Warming` deferral (Task 4) covers `Absent`. Block apply of a multisig spend on an `Absent` node waits on the `OnceLock`, which nothing fills: it stalls this node, visibly, rather than OOM-killing it. This is documented in `docs/deploy.md`, with the remedy "install the blob, restart".
+  4. `node::load_msauth_key(executor, path, build)`, called by `node::warm` before every other key and only on a chain with `hc_auth_multisig`. The path is `--msauth-vk`, else `RAND_MSAUTH_VK`, else `std::env::current_exe()?.with_file_name("msauth-vk-<profile>.bin")` (the fleet's `/usr/local/bin/msauth-vk-production.bin`).
+     - If the file is missing, undecodable, or its blake3 is not the pinned constant, return an error. `run` turns it into a **startup failure**: "msauth verifier key: {path} {missing|has blake3 X} (expected blake3 {pin}); install it from the release, or run with --build-msauth-key on a ≥ 8 GB host".
+     - There is **no automatic fallback build**. Only `--build-msauth-key` (a dev/laptop flag, never set by any deploy script) builds the key, logs at `warn` "building the tier-18 msauth key (~4 GB, ~80 s)", and reports `Built`.
   5. Add `rand-node keygen-msauth-vk --profile <p> --out <file>`, which writes `msauth_vk_blob(p)` (refusing an existing file) and prints `blake3 <hex>  bytes <n>`. Then:
      - run it on a big host for `production` and `test`;
      - write the digests into `MSAUTH_VK_BLAKE3_{PRODUCTION,TEST}`;
-     - measure the size, and if ≤ 64 KB commit both under `crates/randprotocol-zkvm/keys/`.
+     - commit the test blob under `crates/randprotocol-zkvm/keys/`, and record both sizes in `docs/node-hardware.md`.
   6. Add `rand_status.msauth_key` (`MsauthKeySource` as snake_case).
-  7. `deploy/roll-all.sh` takes a fifth argument, `<msauth-vk-production.bin>`. It checks the file's blake3 against `MSAUTH_VK_BLAKE3_PRODUCTION` (read from the binary with `rand-node keygen-msauth-vk --print-pinned production`), then copies it beside the binary on every host. `docs/deploy.md` and the v0.8.0 release assets list `msauth-vk-production.bin` (in `SHA256SUMS`, signed).
+  7. Deploy:
+     - **`deploy/roll-all.sh`** takes a fifth argument, `<msauth-vk-production.bin>`. Beside its `rand-node`/`rand` handling (copy to `/root/*.new`, sha256 check, install to `/usr/local/bin` at `:51-52`), it copies the blob to `/root/msauth-vk-production.bin.new` and checks it with `b3sum` (or `rand-node keygen-msauth-vk --check <file>`) against `MSAUTH_VK_BLAKE3_PRODUCTION` from `rand-node keygen-msauth-vk --print-pinned production`. It then installs to `/usr/local/bin/msauth-vk-production.bin` **before** restarting the node. A mismatch aborts that host's roll.
+     - **`deploy/cutover-fleet-chain21.sh`** is randprotocol-d7's, modelled on `cutover-fleet-chain20.sh`. Do not write it. Message d7 with the snippet:
+       ```bash
+       # msauth verifier key (private multisig, v0.8.0): beside the binary, digest-checked, before first start
+       scp "$MSAUTH_VK" "root@$host:/root/msauth-vk-production.bin.new"
+       want=$("$NODE" keygen-msauth-vk --print-pinned production)
+       ssh "root@$host" "got=\$(/usr/local/bin/rand-node.new keygen-msauth-vk --check /root/msauth-vk-production.bin.new) && [ \"\$got\" = $want ] && install -m 0644 /root/msauth-vk-production.bin.new /usr/local/bin/msauth-vk-production.bin" \
+         || { echo "cutover: $host msauth key blob is not $want" >&2; exit 1; }
+       ```
+     - v0.8.0 ships `msauth-vk-production.bin` as a signed release asset (in `SHA256SUMS`), and `docs/deploy.md` documents the location, the override and the startup failure.
   8. Linux. `docs/node-hardware.md` records the laptop numbers (build 78.6 s / ~4.0 GB; load time and RSS from Step 4). Add a line: "**To measure on an `s-2vcpu-4gb` droplet (Task 8 / cut rehearsal): RSS after load, and after the first tier-18 verify.** glibc may return freed memory where macOS did not."
 
 - [ ] **Step 4: Run to see it pass.**
@@ -2061,7 +2073,7 @@ git commit -m "cli: rand multisig-private new-policy|address|balance|prepare|che
 - Consumes: Tasks 1–7; `node::start` via `start_with`; `genesis_v3`; `proving_slot`; `wallet::payout_note_for`; `multisig_pay_tx` (this file).
 - Produces: `a_private_multisig_receives_spends_rotates_and_refuses_one_signature_end_to_end` (ignored).
 
-- [ ] **Step 0: Precondition.** The e2e node loads the Test-profile blob (Task 2b), never building, and asserts `rand_status.msauth_key == "loaded"`. Task 2's `MSAUTH-TEST:` line is recorded, with its prove time and peak RSS. If the peak was over 40 GB, stop. The test runs the node in-process, three msauth proofs are sequential under the proving slot, and the 1 024-block window must exceed (sign + msauth prove + bundle prove) with margin at 3 s blocks.
+- [ ] **Step 0: Precondition.** The e2e node loads the committed Test-profile blob through `--msauth-vk` (`NodeConfig.msauth_vk = Some(keys/msauth-vk-test.bin)`), never building, and asserts `rand_status.msauth_key == "loaded"`. Task 2's `MSAUTH-TEST:` line is recorded, with its prove time and peak RSS. If the peak was over 40 GB, stop. The test runs the node in-process, three msauth proofs are sequential under the proving slot, and the 1 024-block window must exceed (sign + msauth prove + bundle prove) with margin at 3 s blocks.
 
 - [ ] **Step 1: Write the failing test.** Append to `wallet_flow.rs`:
 
@@ -2249,7 +2261,7 @@ git commit -m "test: private multisig end to end with real proofs — a 2-of-3 a
 
   Wait for the answer. If d7 applies it, hand over Steps 2–3 as a patch and skip to Step 4. (Whether chain 21 is already cut was settled by the Global Constraints gate before Task 1. If it was, this task targets chain 22's script.)
 
-  Add to the cut record's checklist in the same message: the `rand-prover` fleet (prover.randprotocol.org) and `clients/core`'s vendored fullnode must be on constraint set 9 at the cut. Also: `msauth-vk-production.bin` ships with v0.8.0 and `roll-all.sh` copies it (Task 2b). The rehearsal measures RSS after the key load and after the first tier-18 verify on an `s-2vcpu-4gb` droplet.
+  Add to the cut record's checklist in the same message: the `rand-prover` fleet (prover.randprotocol.org) and `clients/core`'s vendored fullnode must be on constraint set 9 at the cut. Also: `msauth-vk-production.bin` ships with v0.8.0 and lives at `/usr/local/bin/msauth-vk-production.bin`. A node on a multisig chain refuses to start without it. `roll-all.sh` copies and checks it, and `cutover-fleet-chain21.sh` (d7's) carries the Task 2b snippet. The rehearsal measures RSS after the key load and after the first tier-18 verify on an `s-2vcpu-4gb` droplet.
 
 - [ ] **Step 2: Write the failing selftest cases.** In the selftest block, after the multisig refuse cases at `deploy/cut-chain21-genesis.sh:1716-1718`, add:
 
