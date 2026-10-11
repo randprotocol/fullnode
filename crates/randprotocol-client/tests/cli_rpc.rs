@@ -225,11 +225,8 @@ fn fee_refuses_flags_that_belong_to_another_kind_before_any_call() {
     }
 }
 
-fn node_reading(extra: fn(&str, &Value) -> Option<Result<Value, (i64, String)>>) -> Fake {
-    fake(Box::new(move |m, p| {
-        if let Some(r) = extra(m, p) {
-            return r;
-        }
+fn node_reading() -> Fake {
+    fake(Box::new(move |m, _| {
         match m {
             "rand_getHead" => Ok(json!({ "height": 7, "hash": "ab" })),
             "rand_status" => Ok(json!({ "fri_profile": "test", "peers": 2 })),
@@ -242,7 +239,7 @@ fn node_reading(extra: fn(&str, &Value) -> Option<Result<Value, (i64, String)>>)
 
 #[test]
 fn head_status_peers_validators_print_the_reply_as_pretty_json() {
-    let node = node_reading(|_, _| None);
+    let node = node_reading();
     let dir = tempfile::tempdir().unwrap();
     let key = dir.path().join("none.json");
     let head = rand(&node.url, &key, &["head"]);
