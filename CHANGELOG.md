@@ -12,6 +12,36 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## Unreleased
 
+## v0.8.0 — TAG_DATE (draft: chain 20 by a flag-day roll; the gated features at chain 21's cut)
+
+Tag `TAG_SHA` (fullnode `main`, vendoring circuits `4a244b6`). A minor bump, not a
+patch: the release carries a node-only wire change (compact blocks) and the consensus rules a
+new chain needs. What reaches each chain:
+
+- **Chain 20, rolled as a flag day:** no consensus rule, genesis or bundle verifier key changes
+  on chain 20 (`inner_vk_digest` `346ee184…` is unchanged and the RV32 wallet machine keeps
+  upstream's quotient layout, so every bundle proof verifies as before). The one wire change is
+  compact blocks: roll observers and archives first, then every validator at once with
+  `deploy/roll-all.sh`; a mixed validator set can stop commits. Chain 20 gets the validator hot
+  path's node-only half (`SharedSet`, propose replay, verify workers, parallel QC verification),
+  the compact-block follow-ups, the aggregate daemon's retry loop and the storage checks. Every
+  gated action below is refused there by name.
+- **Chain 21 and later, by genesis section:** `fees` (`burn_base`, `burn_floor`,
+  `subsidy_net_of_fees`, `proposer_share_bps`, `prove_base`, `usd_subsidy`), `perps` (RPL-3),
+  `multisig`, `aggregation_tree`, and the `incremental_nullifier_root` flag (the hot path's
+  consensus half: block apply 495.0 → 55.5 ms at 2.4 M nullifiers, and 56.1 ms at 80 M,
+  `docs/node-hardware.md` §7).
+  `deploy/cut-chain21-genesis.sh` sets which of these the cut carries.
+- **Aggregate wire change, every chain:** `Action::Aggregate` gains `payout_total` and `layout`,
+  so its encoding, txid and signing domain move. No chain has carried an aggregate.
+- **Rollback:** a database opened by this build has the `perp_inputs` column family; run
+  `rand-node db drop-perp-inputs --datadir <dir>` before going back to v0.7.1 (refused on a perps
+  chain's database).
+
+Assets, when signed: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`, `SHA256SUMS.sig`.
+
+### Features
+
 - **Tree aggregation** (genesis-gated, off by default: no existing chain carries the section; every
   aggregation genesis is still refused at startup): a genesis `aggregation_tree` section
   (`TreeConfig`: `shape`, `leaf_size`, `max_depth`, `leaf` heights, `vk_leaf`, per-level
@@ -223,6 +253,44 @@ new chain, so this ships with the next cut rather than as a node-only roll.
   audited (`docs/perps.md`, "v0 limits").
 - **Vectors**: `tests/vectors/perps-v1.json` gains `digest_4000`, `digest_4001` and
   `digest_8001`, the multi-chunk `perp_digest` with the real Poseidon2.
+
+### The rVM re-vendors (aggregation only; no chain carries the section)
+
+Four circuits pins since v0.7.1. Every one keeps `inner_vk_digest`, so bundle proofs are
+unchanged on every chain; each moves only rVM keys, proofs or the aggregate program, which a chain
+reads only through an `aggregation` section. Any future chain with one needs every node on this
+build.
+
+- **Phase-2 row cuts** (circuits `75b7893`, 4c03dcb1): the production inner proof 2 047 268 →
+  893 606 cpu rows, tier 21 → 20; `admitted_tiers` {21, 22, 23} → **{20, 21, 22}** production,
+  {19, 20, 21} → {18, 19, 20} test; aggregate program digest → `c90b3f0a…74d8`.
+- **Quotient layout** (circuits `5ff7676`, 22827279; `vendor/p3-batch-stark`): the rVM commits
+  each instance's quotient chunks as one matrix. Tier-16 peak 9.09 → 6.41 GB; the tier-18 test
+  twin proves at 33.27 GB peak live (a 64 GB host). Aggregate program digest unchanged.
+- **Phase 3 and the rate-¼ profile** (circuits `71e1a04`, 17d7cefb, 37f217cd): the reduce chip's
+  FOLD / POW rows (585 686 cpu rows, still tier 20) and the rVM's own proofs at log_blowup 2, 92
+  queries, 24 grinding bits (86.38 proven bits against 86.41). Aggregate program digest →
+  `dc350ecf…e38ba0`; the tier-18 twin 26.88 → 15.64 GB. Node side: one warmed key per admitted
+  tier × canonical reduce height, and production `N ≤ 5` refused by name at `verify_aggregate`
+  and at `rand-node genesis`.
+- **Tree aggregation** (circuits `92b750e`, then `4a244b6`): `rv32t`, `verify_tree`, `TreeShapes`,
+  `TreeKeys`; see Features. The production depth-2 tree is not proved yet (it needs a ≥ 256 GB
+  host).
+
+### Tests, CI and tooling
+
+- **`scripts/dev-chain.sh`** (e96f15b3): a throwaway single-validator chain for the downstream
+  repos' integration tests; `rand-node genesis --fees`.
+- **The `rpc_contract` canary** (19dd8528): the RPC reads that randscan, randbridge.org,
+  randprotocol.org and zusd.money depend on, pinned by presence and JSON type, in CI.
+- **Network tests** (1e7c4c9e): 54 tests pinning the wire, the codec limits, the connection guard
+  and the swarm's policy.
+- **Fixture-backed node tests run in CI** (d0d551fb): the skip list keeps only the two rVM proving
+  tests, by full name.
+- **Coverage** (9a259aeb): `cargo-llvm-cov` over check-and-test's suites on every push to `main`,
+  uploaded to Codecov; the badge in `README.md`.
+- **Research tests reach the vendored copy** (abf5cb23, circuits `5f69747`): 155 new tests,
+  sources byte-identical to `5ff7676`.
 
 ## v0.7.1 — 2026-10-07 (chain 20, node-only)
 
