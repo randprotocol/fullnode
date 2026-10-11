@@ -162,7 +162,7 @@ becomes `O(block)`, and committing is applying a chain of deltas. No consensus c
 
 ### 3.3 Verification off the loop, cached by digest
 
-**Partly shipped**: the worker count (`rand-node run --verify-workers`, default the cores minus two, at least four, with the queue and in-flight limits sized from it). The digest-keyed cache for every proof kind is still open.
+**Shipped**: the worker count (`rand-node run --verify-workers`, default the cores minus two, at least four, with the queue and in-flight limits sized from it), and the digest-keyed cache (`verify_cache::CachingExecutor`, every verifier, keyed by a digest of all its inputs, 16 384 entries). Still open: moving an uncached apply-time verify off the consensus loop.
 
 The admission workers already verify proofs on `spawn_blocking` threads and the proposal path
 re-checks against a verified set. Generalise it: every proof the node will ever verify — bundle,
