@@ -14,9 +14,9 @@ stopped at v0.4 until 2026-09-30, when the entries v0.5 to v0.6.7 were written f
 
 ## v0.8.0 — TAG_DATE (draft: chain 20 by a flag-day roll; the gated features at chain 21's cut)
 
-Tag `TAG_SHA` (fullnode `main`, vendoring circuits `4a244b6`). A minor bump, not a
-patch: the release carries a node-only wire change (compact blocks) and the consensus rules a
-new chain needs. What reaches each chain:
+Tag `TAG_SHA` (fullnode `main`, vendoring circuits `56b7061`, `feat/scan-compact`: `4a244b6`'s
+tree aggregation plus the scan heads' `viewing.rs`). A minor bump, not a patch: the release
+carries a node-only wire change (compact blocks) and the consensus rules a new chain needs. What reaches each chain:
 
 - **Chain 20, rolled as a flag day:** no consensus rule, genesis or bundle verifier key changes
   on chain 20 (`inner_vk_digest` `346ee184…` is unchanged and the RV32 wallet machine keeps
@@ -41,6 +41,14 @@ new chain needs. What reaches each chain:
 Assets, when signed: `rand-node`, `rand`, `rand-prover`, `SHA256SUMS`, `SHA256SUMS.sig`.
 
 ### Features
+
+- **Scan heads** (node-only, no chain change): new public RPC `rand_getScanLeaves` — the
+  `rand_getCommitments` page with each envelope cut to its 1 208-byte head (`kem_ct ‖ to_receiver
+  ‖ to_sender`, base64). `rand` trial-opens heads and reads full envelopes only for the leaves its
+  keys open (and heads of any other length), falling back to full pages on an older node; on
+  chain 20's leaves that is 2.26× fewer bytes per leaf (1 718 against 3 876). The wallet also
+  derives its ML-KEM key once per wallet instead of once per leaf (38 → 21 µs per leaf on an M4
+  Max). Vendors circuits `56b7061` (`viewing::ScanKey`, `EnvelopeHead`).
 
 - **The chain-21 cut carries `perps` and `multisig`** (deploy only; no node change):
   `deploy/cut-chain21-genesis.sh` switches on two more genesis sections beside `fees`, each a
