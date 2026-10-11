@@ -156,11 +156,10 @@ because Task 1 alone already makes the build constraint set 9.
 The v0.8.0 draft's "Rollback" paragraph (`CHANGELOG.md`, the `drop-perp-inputs` step back to
 v0.7.1) no longer holds across a constraint set: a database written by a constraint-set-9 build
 holds blocks v0.7.1 cannot verify, so "rollback" to v0.7.1 is only to a chain v0.7.1 runs. The
-plan describes that change; the user edits `CHANGELOG.md`.
+plan's Task 10 rewrites that paragraph (§8).
 
-**This contradicts the v0.8.0 draft in `CHANGELOG.md`**, which rolls v0.8.0 onto chain 20 as a
-flag day "with no bundle verifier key change". A release cannot do both. The plan's Global
-Constraints make this a decision the user takes before the re-vendor merges (§9).
+**Decided (user, option A, 2026-10-11):** v0.8.0 carries private multisig and runs chain 21 onward;
+the draft's chain-20 flag-day roll is withdrawn.
 
 ## 3. Admission: dispatch on the auth proof's shape
 
@@ -627,16 +626,22 @@ laptop):
    `msauth_gas_limit_pin()` for both the 2-signature spends. That is R-gas and R-hide checked on
    the chain's own bytes.
 
-## 8. CHANGELOG (v0.8.0, or v0.9.0) — the release section
+## 8. CHANGELOG (v0.8.0) — the release section
 
-This section is where the plan's Task 10 records the final proposed text, beside the PR
-description.
+The user's decision is option A: v0.8.0 carries this, from chain 21 onward. The plan's Task 10
+edits `CHANGELOG.md` after a one-line in-session confirmation. It keeps lines 30–35 (the
+startup-checkpoint and verify-cache bullets) verbatim, and makes three changes:
 
-The user decides the release scope and edits `CHANGELOG.md`; this text is the proposal. Under
-"Chain 21 and later, by genesis section":
+- **The node bullet.** The chain-20 flag-day bullet is withdrawn and replaced by: "**Chain 21
+  onward; not for chain 20.** Constraint set 9 (the MODQ chip) changes every verifier key and the
+  proof encoding: this build refuses chains 18–20 at startup (`CHAINS_THIS_BUILD_CANNOT_RUN`).
+  Chain 20 stays on v0.7.x until chain 21's cut."
+- **Rollback.** "Going back to v0.7.1 is possible only on a chain v0.7.1 runs (18–20); a chain-21
+  database cannot be rolled back across constraint set 9."
+- **Private multisig.** The following bullet goes under "Chain 21 and later, by genesis section":
 
 > - **Private multisig** (`hc_auth_multisig`): an M-of-N Dilithium2 policy hidden inside a second
->   auth guest (tier 18, the MODQ chip; `M_MAX` *(Task 8)*, `N_MAX` 16). Admission tells the two
+>   auth guest (tier 18, the MODQ chip; `M_MAX` 3, `N_MAX` 16). Admission tells the two
 >   auth guests apart by the proof's pinned shape, with no wire, txid or binding change; the chain
 >   learns only "multisig-authorised". `rand multisig-private new-policy|address|balance|prepare|
 >   sign|prove|submit`; the auth proof is proved locally (about 3.6 MB at Production FRI, so a
@@ -645,9 +650,8 @@ The user decides the release scope and edits `CHANGELOG.md`; this text is the pr
 
 ## 9. Risks and open points
 
-1. **v0.8.0 and chain 20** (§2.5): the decision is the user's. Either v0.8.0 becomes chain-21-only
-   and the chain-20 flag-day roll is withdrawn, or v0.8.0 is tagged before the re-vendor and this
-   ships as v0.9.0 at the cut that carries it.
+1. **v0.8.0 and chain 20** (§2.5): decided by the user, option A. v0.8.0 runs chain 21 onward,
+   and the chain-20 flag-day roll is withdrawn.
 2. **Chain-21 timing** (now a gate before Task 1): if chain 21 is cut before this lands, chain 21
    joins `CHAINS_THIS_BUILD_CANNOT_RUN`, `hc_auth_multisig` moves to chain 22's script, and the
    CHANGELOG wording changes accordingly.

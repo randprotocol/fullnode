@@ -28,18 +28,19 @@
 - **Chain-21 gate (before Task 1).** Check whether chain 21 has been cut: `deploy/genesis-chain21.json` is committed, or randprotocol-d7 says so. Task 1 alone already makes this build constraint set 9. If chain 21 has been cut:
   - add chain 21's hash to `CHAINS_THIS_BUILD_CANNOT_RUN` in Task 1, with `CONSTRAINT_SET_8_REASON` and the wording "chains 18–21";
   - retarget Task 9 at chain 22's cut script;
-  - change the CHANGELOG description in Task 10 from "chain 21 on" to "chain 22 on".
-- **`CHANGELOG.md` is the user's.** The user is deciding v0.8.0 against v0.9.0 scope. This plan never edits that file. Task 10 writes the proposed text into the PR description and into the spec's §8 release section. That text includes the "Rollback to v0.7.1" paragraph (~line 45), which no longer holds across a constraint set.
-- **v0.8.0 decision (blocking).** After Task 1 this build cannot run chains 18–20, because every verifier key and the proof encoding change. Before merging Task 1 to `main`, the user chooses one of two options:
-  - **(a)** v0.8.0 becomes chain-21-only and the chain-20 flag-day roll in `CHANGELOG.md` is withdrawn;
-  - **(b)** v0.8.0 is tagged first from today's `main`, and this work ships as v0.9.0.
-
-  Task 10 describes both forms for the user; it does not edit `CHANGELOG.md`.
+  - change the CHANGELOG text in Task 10 from "chain 21 onward" to "chain 22 onward" (this contingency applies only if chain 21 is cut before this lands).
+- **Release decision (the user's, option A, relayed by randprotocol-61 on 2026-10-11):** v0.8.0 carries private multisig and runs chain 21 onward. There is no chain-20 flag-day roll, and after Task 1 this build refuses chains 18–20. Task 10 edits `CHANGELOG.md` directly, under these rules:
+  - the decision was relayed, not typed in this session, so first announce the edit in-session and get a one-line confirmation from the user;
+  - keep `CHANGELOG.md` lines 30–35 (randprotocol-61's startup-checkpoint and verify-cache bullets) verbatim;
+  - withdraw the chain-20 flag-day text for the node;
+  - state the chain-21 floor and that this build refuses chains 18–20;
+  - fix the "Rollback to v0.7.1" paragraph (~line 45) as drafted in spec §8;
+  - add the private-multisig bullet.
 - **Read-only:**
   - circuits;
   - `deploy/cut-chain21-genesis.sh`, until Task 9 Step 1's message to randprotocol-d7 is answered;
-  - `feat/verify-cache`, which belongs to randprotocol-61: message that owner, and never write its spec file;
-  - `CHANGELOG.md`.
+  - `feat/verify-cache`'s spec file (randprotocol-61's): never write it. Its code is on local `main` as `10fff634` and Task 4 edits `verify_cache.rs`;
+  - `CHANGELOG.md` until Task 10, and then only under the release-decision rules above.
 - **Corrected premises:**
   - `Transaction::binding` blanks both the bundle proof and the auth proof, so signing before proving is sound, and `salt`/`auth_commit` are fixed at `prepare`.
   - `sync-zkvm.sh` never copies research's `Cargo.toml`, so there is no self dev-dependency to strip.
@@ -914,7 +915,7 @@ git commit -m "genesis: hc_auth_multisig — last field, hash-bound last (after 
 - Modify: `crates/randprotocol-core/src/ledger/aggregation.rs` (`HeaderRefusing`, `TreeProbe`)
 - Modify: `crates/randprotocol-zkvm/src/executor.rs` (move Task 2's inherent methods into the trait impl)
 - Modify: `crates/randprotocol-node/src/agg_executor.rs` (`AggExecutor`, `AsProvedBinding`), `crates/randprotocol-node/src/node.rs` (warm)
-- Modify, only if `feat/verify-cache` is on `main` when this task starts: `crates/randprotocol-node/src/verify_cache.rs`
+- Modify: `crates/randprotocol-node/src/verify_cache.rs` (`feat/verify-cache` is merged into local fullnode `main` as `10fff634`, not yet pushed). Base this task on `10fff634`, or on `origin/main` once it carries it: `git merge 10fff634` into this branch before Step 1. Never rebase.
 
 **Interfaces:**
 - Consumes: Task 2 (`AuthShape`, `ZkExecutor::auth_shape_of`, `warm_auth_multisig`), Task 3 (`Ledger::hc_auth_multisig`), `gas::msauth_gas_limit_pin`.
@@ -1078,7 +1079,7 @@ fn a_multisig_auth_proof_is_deferred_not_refused_until_the_key_is_warm() {
 
 The deferral sits in `Mempool::precheck`, after `pool_conflicts` and before `make_room`. It reads `executor.auth_header(&bundle.auth_proof)` only when the ledger has `hc_auth_multisig`. Admission (`admission.rs`) maps `Warming` to "try again later": the transaction is not forwarded and not cached, and the node's `rand_sendTransaction` reply says "the multisig auth key is still warming; retry in a minute".
 
-If `verify_cache.rs` is on `main`, add the three forwards to its test executor `Counting` (`feat/verify-cache`, `verify_cache.rs` ~line 522) and append to its tests:
+Add the three forwards to `verify_cache.rs`'s test executor `Counting` (~line 522) and append to its tests:
 
 ```rust
 #[test]
@@ -1122,9 +1123,9 @@ Expected: compile errors (no trait methods, `make_msauth_proof` or `STUB_MSAUTH_
   3. Ledger. Rewrite `check_auth_fields` to spec §3.2's sequence (one `auth_header` call, no separate digest/gas reads), returning `Ok(Some(shape))` on a `hc_auth` chain and `Ok(None)` otherwise. The shape refusal is `TxError::InvalidAuthProof(ConfidentialError::InvalidProof("a multisig auth proof on a chain without hc_auth_multisig".into()))`. `verify_auth_proof` takes the shape and selects `hc` as in spec §3.2. `check_bundle_proof` threads the shape from the cheap half to the expensive one, and the verified-set path keeps skipping the expensive half.
   4. `ZkExecutor`: `auth_header` forwards to Task 2's `auth_header_of`; `warm_auth_multisig` and `auth_multisig_key_ready` forward to the `OnceLock` methods.
   5. `AggExecutor`, `AsProvedBinding` and the test executors forward all three to `inner` / `StubExecutor`. In `node.rs`'s warm task, read `let multisig = hs.committed_ledger().hc_auth_multisig().is_some();` beside `split_auth`, and call `ex.warm_auth_multisig()` **first**, before `warm_bundle` and `warm_auth`, logging `multisig auth verifier key warmed`. Admission: add `MempoolError::Warming` and `is_retryable` as specified in Step 1, with the check in `Mempool::precheck`. Map `Warming` to the RPC refusal text in `admission.rs`, and never `RefusedCache` it. Block validation needs no change: it reaches `verify_auth`, which waits on the `OnceLock`.
-  6. `verify_cache.rs`. If it is on `main`, add the three forwards to `CachingExecutor`'s "forwarded unchanged" group and to `Counting`. If it is not, write nothing to its files. Message randprotocol-61 (the owner):
+  6. `verify_cache.rs`: add the three forwards to `CachingExecutor`'s "forwarded unchanged" group and to `Counting`. After the commit, tell randprotocol-61 the forwards are in:
 
-     > Private multisig phase 4 adds three required, uncached `ConfidentialExecutor` methods, `auth_header`, `warm_auth_multisig` and `auth_multisig_key_ready`. `CachingExecutor` and your test executor `Counting` must forward all three. Multisig verifies reuse `verify_auth`, kind 2, with `hc` in the key; nothing new is cached.
+     > Private multisig phase 4: `CachingExecutor` and `Counting` now forward the three new required, uncached methods (`auth_header`, `warm_auth_multisig`, `auth_multisig_key_ready`), commit `<sha>`. Multisig verifies reuse `verify_auth`, kind 2, with `hc` in the key; nothing new is cached.
 
 - [ ] **Step 4: Run to see it pass.**
 
@@ -1902,7 +1903,7 @@ git commit -m "cut-chain21: hc_auth_multisig — the --auth-multisig-guest gate 
 ### Task 10: Docs and CHANGELOG
 
 **Files:**
-- Not modified: `CHANGELOG.md` (the user's; this task writes the proposed text into the PR description)
+- Modify: `CHANGELOG.md` (v0.8.0; under the Global Constraints' release-decision rules)
 - Modify: `docs/shielded.md` (§2: a "Private multisig: the second auth guest" subsection after "Split authorisation"; §4 RPC fields), `docs/prover.md` (§8: the second auth guest, local-only), `docs/multisig.md` (a "Private accounts" section: private vs public, MultisigPay into a private address, rotation), `docs/rpc.md` (`hc_auth_multisig` on both methods, plus its changelog line), `docs/node-hardware.md` (Task 2's key-build and verify measurement), `docs/zkvm.md` (constraint set 9: the MODQ chip, proof-size deltas), `docs/deploy.md` (the cut's new field), `docs/superpowers/specs/2026-10-11-private-multisig-phase4-design.md` (§8, the release section: the final proposed CHANGELOG text)
 
 **Interfaces:**
@@ -1940,13 +1941,12 @@ Run: `cargo +1.98.1 test --release -p randprotocol-zkvm --test guest_provenance 
   - **`docs/zkvm.md`:** a "Constraint set 9: the MODQ chip" section. Every key moved; `Proof.modq_log_height`; chip-free proofs +≈1 KB; a modq table only in the msauth guest's proofs; calls refuse it.
   - **`docs/deploy.md`:** the cut's `hc_auth_multisig` and `--auth-multisig-guest`.
 
-- [ ] **Step 3: Describe the CHANGELOG change, without editing `CHANGELOG.md`.** Write it into the spec's §8 release section, and copy it into the PR description under "CHANGELOG (for the user)":
-  - The spec §8 bullet, with `M_MAX` 3 and Task 2's measured proof size.
-  - **If v0.8.0 carries this:**
-    - the "Chain 20, rolled as a flag day" bullet becomes "**Not for chain 20.** Constraint set 9 changes every verifier key and the proof encoding: this build refuses chains 18–20 at startup (`CHAINS_THIS_BUILD_CANNOT_RUN`). Chain 20 stays on v0.7.x until chain 21's cut.";
-    - the header's vendoring sentence names `$CIRCUITS`;
-    - the "**Rollback**" paragraph (~`CHANGELOG.md:45`) becomes "going back to v0.7.1 is possible only on a chain v0.7.1 runs (18–20); a chain-21 database cannot be rolled back across constraint set 9".
-  - **If it ships as v0.9.0:** all of the above goes in a new `## v0.9.0` entry, and v0.8.0 is untouched.
+- [ ] **Step 3: Edit `CHANGELOG.md`'s v0.8.0 entry (option A).** First post in-session: "Task 10 will now edit CHANGELOG.md v0.8.0 per option A (chain 21 onward, chains 18–20 refused, private multisig bullet, rollback paragraph). Confirm?" Wait for the user's one-line confirmation. Then make exactly these edits, matching spec §8:
+  - Keep lines 30–35 (randprotocol-61's startup-checkpoint and verify-cache bullets) **verbatim**.
+  - Withdraw the "**Chain 20, rolled as a flag day**" bullet for the node. In its place: "**Chain 21 onward; not for chain 20.** Constraint set 9 (the MODQ chip) changes every verifier key and the proof encoding: this build refuses chains 18–20 at startup (`CHAINS_THIS_BUILD_CANNOT_RUN`). Chain 20 stays on v0.7.x until chain 21's cut." Change the header's "(draft: chain 20 by a flag-day roll; …)" to "(chain 21 onward)", and its vendoring sentence to name `$CIRCUITS`.
+  - Add the private-multisig bullet of spec §8 to "Chain 21 and later, by genesis section", with `M_MAX` 3 and Task 2's measured proof size.
+  - Replace the "**Rollback**" paragraph (~line 45) with spec §8's rollback text.
+  - Put the same text into the PR description.
 
 - [ ] **Step 4: Run to see it pass.**
 
@@ -1960,6 +1960,6 @@ Expected: all pass.
 - [ ] **Step 5: Commit.**
 
 ```bash
-git add docs crates/randprotocol-zkvm/tests/guest_provenance.rs
-git commit -m "docs: private multisig — the second auth guest (shielded §2, prover §8, multisig private accounts, rpc, zkvm constraint set 9, node-hardware's tier-18 key, deploy); CHANGELOG text proposed in the PR, not applied"
+git add docs CHANGELOG.md crates/randprotocol-zkvm/tests/guest_provenance.rs
+git commit -m "docs: private multisig — the second auth guest (shielded §2, prover §8, multisig private accounts, rpc, zkvm constraint set 9, node-hardware's tier-18 key, deploy); CHANGELOG v0.8.0: chain 21 onward, chains 18-20 refused, private multisig, rollback across constraint set 9"
 ```
