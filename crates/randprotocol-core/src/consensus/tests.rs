@@ -3639,6 +3639,13 @@ impl Counted {
 }
 
 impl ConfidentialExecutor for Counted {
+    fn auth_header(&self, proof: &[u8]) -> Result<(crate::confidential::AuthShape, crate::notes::Word8, Option<u64>), crate::confidential::ConfidentialError> {
+        self.tick().auth_header(proof)
+    }
+    fn warm_auth_multisig(&self) {}
+    fn auth_multisig_key_ready(&self) -> bool {
+        true
+    }
     fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
         self.tick().install_msauth_vk(blob)
     }

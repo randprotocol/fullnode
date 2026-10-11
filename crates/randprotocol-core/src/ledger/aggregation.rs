@@ -2318,6 +2318,13 @@ mod admission_tests {
         /// The stub, with a header gate that refuses and a count of step 7b's calls.
         struct HeaderRefusing(AtomicUsize);
         impl ConfidentialExecutor for HeaderRefusing {
+            fn auth_header(&self, proof: &[u8]) -> Result<(crate::confidential::AuthShape, crate::notes::Word8, Option<u64>), crate::confidential::ConfidentialError> {
+                StubExecutor.auth_header(proof)
+            }
+            fn warm_auth_multisig(&self) {}
+            fn auth_multisig_key_ready(&self) -> bool {
+                true
+            }
             fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
                 StubExecutor.install_msauth_vk(blob)
             }
@@ -2952,6 +2959,13 @@ mod admission_tests {
     }
 
     impl ConfidentialExecutor for TreeProbe {
+        fn auth_header(&self, proof: &[u8]) -> Result<(crate::confidential::AuthShape, crate::notes::Word8, Option<u64>), crate::confidential::ConfidentialError> {
+            StubExecutor.auth_header(proof)
+        }
+        fn warm_auth_multisig(&self) {}
+        fn auth_multisig_key_ready(&self) -> bool {
+            true
+        }
         fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
             StubExecutor.install_msauth_vk(blob)
         }

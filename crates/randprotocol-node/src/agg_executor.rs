@@ -728,6 +728,18 @@ impl ConfidentialExecutor for AggExecutor {
         ConfidentialExecutor::enable_auth_multisig(&self.inner)
     }
 
+    fn auth_header(&self, proof: &[u8]) -> Result<(randprotocol_core::confidential::AuthShape, Word8, Option<u64>), ConfidentialError> {
+        self.inner.auth_header(proof)
+    }
+
+    fn warm_auth_multisig(&self) {
+        ConfidentialExecutor::warm_auth_multisig(&self.inner)
+    }
+
+    fn auth_multisig_key_ready(&self) -> bool {
+        ConfidentialExecutor::auth_multisig_key_ready(&self.inner)
+    }
+
     /// Forwarded, like `max_callable_program_words` (a default would switch the rule off).
     fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
         self.inner.non_canonical_proof(proof)
@@ -977,6 +989,23 @@ mod tests {
     use super::*;
     use randprotocol_core::confidential::StubExecutor;
     use randprotocol_core::types::FriProfile as CoreProfile;
+
+    /// All three phase-4 methods are forwarded, never left at a default: the wrapper answers exactly
+    /// what the bare executor answers.
+    #[test]
+    fn the_phase_4_auth_methods_are_forwarded() {
+        use randprotocol_core::confidential::AuthShape;
+        use randprotocol_zkvm::machine::Backend;
+        let ex = AggExecutor::new(FriProfile::Test);
+        let bare = ZkExecutor::new(FriProfile::Test);
+        assert_eq!(ex.auth_header(b"junk"), ConfidentialExecutor::auth_header(&bare, b"junk"));
+        let (single, c, _) = randprotocol_zkvm::executor::prove_auth(FriProfile::Test, &randprotocol_zkvm::notes::SpendKey([7; 8]), &[6; 8], &[0; 8], Backend::Cpu).unwrap();
+        assert_eq!(ex.auth_header(&single), ConfidentialExecutor::auth_header(&bare, &single));
+        assert_eq!(ex.auth_header(&single).unwrap().0, AuthShape::SingleKey);
+        assert_eq!(ex.auth_header(&single).unwrap().1, c);
+        assert!(!ex.auth_multisig_key_ready(), "nothing warmed yet, as the bare executor says");
+        assert_eq!(ex.auth_multisig_key_ready(), ConfidentialExecutor::auth_multisig_key_ready(&bare));
+    }
 
     /// The covered-bundle record admission would assemble for fixture `k`: its declared shape
     /// read off the proof's stored header, and its `pv::NUM` public values.
@@ -1948,6 +1977,15 @@ mod tests {
     }
 
     impl ConfidentialExecutor for AsProvedBinding<'_> {
+        fn auth_header(&self, proof: &[u8]) -> Result<(randprotocol_core::confidential::AuthShape, randprotocol_core::notes::Word8, Option<u64>), randprotocol_core::confidential::ConfidentialError> {
+            self.ex.auth_header(proof)
+        }
+        fn warm_auth_multisig(&self) {
+            self.ex.warm_auth_multisig()
+        }
+        fn auth_multisig_key_ready(&self) -> bool {
+            self.ex.auth_multisig_key_ready()
+        }
         fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
             self.ex.install_msauth_vk(blob)
         }

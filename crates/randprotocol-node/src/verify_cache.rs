@@ -17,7 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use randprotocol_core::confidential::{ConfidentialError, ConfidentialExecutor};
+use randprotocol_core::confidential::{AuthShape, ConfidentialError, ConfidentialExecutor};
 use randprotocol_core::crypto::Hash;
 use randprotocol_core::ledger::aggregation::{TreeConfig, TreeDigests};
 use randprotocol_core::notes::{BundleDigestInput, Word8};
@@ -423,6 +423,20 @@ impl ConfidentialExecutor for CachingExecutor {
         self.inner.build_msauth_key()
     }
 
+    /// A decode, not a verdict: forwarded, never cached. A multisig proof's verify is
+    /// `verify_auth` under kind 2, keyed by its `hc`, so nothing new is cached for it.
+    fn auth_header(&self, proof: &[u8]) -> Result<(AuthShape, Word8, Option<u64>), ConfidentialError> {
+        self.inner.auth_header(proof)
+    }
+
+    fn warm_auth_multisig(&self) {
+        self.inner.warm_auth_multisig()
+    }
+
+    fn auth_multisig_key_ready(&self) -> bool {
+        self.inner.auth_multisig_key_ready()
+    }
+
     fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
         self.inner.non_canonical_proof(proof)
     }
@@ -515,6 +529,8 @@ mod tests {
         plain: bool,
         /// `enable_auth_multisig` calls.
         multisig_enables: AtomicUsize,
+        /// `warm_auth_multisig` calls.
+        multisig_warms: AtomicUsize,
     }
 
     /// `Counting`'s answer for every `decode_*`: no stub proof decodes to tier 77.
@@ -669,6 +685,24 @@ mod tests {
                 return self.stub.build_msauth_key();
             }
             Err("counting: built".into())
+        }
+        fn auth_header(&self, proof: &[u8]) -> Result<(AuthShape, Word8, Option<u64>), ConfidentialError> {
+            if self.plain {
+                return self.stub.auth_header(proof);
+            }
+            Ok((AuthShape::Multisig, [0x5a; 8], Some(4242)))
+        }
+        fn warm_auth_multisig(&self) {
+            self.multisig_warms.fetch_add(1, Ordering::SeqCst);
+            if self.plain {
+                self.stub.warm_auth_multisig()
+            }
+        }
+        fn auth_multisig_key_ready(&self) -> bool {
+            if self.plain {
+                return self.stub.auth_multisig_key_ready();
+            }
+            false
         }
         fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
             if self.plain {
@@ -1075,6 +1109,10 @@ mod tests {
         assert_eq!(ex.build_msauth_key(), Err("counting: built".into()));
         ex.enable_auth_multisig();
         assert_eq!(inner.multisig_enables.load(Ordering::SeqCst), 1);
+        assert_eq!(ex.auth_header(&i.auth_proof), Ok((AuthShape::Multisig, [0x5a; 8], Some(4242))));
+        ex.warm_auth_multisig();
+        assert_eq!(inner.multisig_warms.load(Ordering::SeqCst), 1);
+        assert!(!ex.auth_multisig_key_ready());
         // Every decode reaches inner, every time.
         for _ in 0..2 {
             assert_eq!(ex.decode_call(&i.record, &i.call_proof), Ok(DECODED));
@@ -1132,6 +1170,29 @@ mod tests {
         assert_eq!(ex.build_msauth_key(), stub.build_msauth_key());
         ex.enable_auth_multisig();
         assert_eq!(inner.multisig_enables.load(Ordering::SeqCst), 1);
+        let msig = StubExecutor::make_msauth_proof(&[23; 8], &[1; 8], &[0; 8]);
+        assert_eq!(ex.auth_header(&msig), stub.auth_header(&msig));
+        ex.warm_auth_multisig();
+        assert_eq!(inner.multisig_warms.load(Ordering::SeqCst), 1);
+        assert_eq!(ex.auth_multisig_key_ready(), stub.auth_multisig_key_ready());
+    }
+
+    /// Spec §3.4: the three phase-4 methods forward, and a multisig verify is an ordinary kind-2
+    /// (`verify_auth`) entry keyed by its `hc` — nothing new is cached. `Counting::plain()`, since
+    /// the test needs the stub's answers (a ready key, a real multisig shape).
+    #[test]
+    fn the_phase_4_methods_forward_and_a_multisig_verify_is_its_own_kind_2_entry() {
+        let inner = Arc::new(Counting::plain());
+        let ex = CachingExecutor::new(inner.clone());
+        let msig = StubExecutor::make_msauth_proof(&[23; 8], &[1; 8], &[0; 8]);
+        assert_eq!(ex.auth_header(&msig).unwrap().0, AuthShape::Multisig);
+        ex.warm_auth_multisig();
+        assert!(ex.auth_multisig_key_ready());
+        assert_eq!(ex.verify_auth(&[23; 8], &msig, &[0; 8]), Ok([1; 8]));
+        assert_eq!(ex.verify_auth(&[23; 8], &msig, &[0; 8]), Ok([1; 8]));
+        assert_eq!(inner.count(Kind::Auth), 1, "cached under (hc, proof, binding)");
+        let _ = ex.verify_auth(&[21; 8], &msig, &[0; 8]);
+        assert_eq!(inner.count(Kind::Auth), 2, "another hc is another entry");
     }
 
     /// Plan Task 3 review: the msauth gate opens THROUGH the caching wrapper. Today

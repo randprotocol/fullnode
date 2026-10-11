@@ -866,6 +866,16 @@ fn assemble_covered(
 /// refuses a cover with no entry), so a block that re-covers a sealed bundle is invalid on
 /// every replica whatever this source answers. `assemble_covered` keeps the three named
 /// verdicts for admission's error reporting.
+/// The covered record the sync path keeps for a raw bundle it has just applied, for later
+/// aggregates in the same batch: [`crate::agg_executor::covered_bundle_of`], the builder the store's
+/// `covered_record` uses — so `HotStuff::covered_sidecar` (through [`StoreCovered`], the off-loop
+/// apply's source) and this path hand the ledger the same record, the modq refusal included.
+/// `None` for bytes that do not decode or a proof it refuses.
+fn sync_raw_cover(proof: &[u8], profile: randprotocol_core::types::FriProfile) -> Option<randprotocol_core::types::CoveredBundle> {
+    let proof = postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(proof).ok()?;
+    crate::agg_executor::covered_bundle_of(&proof, profile).ok()
+}
+
 struct StoreCovered {
     storage: Arc<Storage>,
     profile: randprotocol_core::types::FriProfile,
@@ -2696,6 +2706,9 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         // Split authorisation (genesis `hc_auth`): every bundle on such a chain carries an auth
         // proof too, so its key is warmed beside the bundle's; a chain without it never needs one.
         let split_auth = hs.committed_ledger().hc_auth().is_some();
+        // Private multisig (genesis `hc_auth_multisig`): its key first, since admission defers
+        // every multisig auth proof until it is ready.
+        let multisig = hs.committed_ledger().hc_auth_multisig().is_some();
         let ex = executor.clone();
         tokio::task::spawn_blocking(move || {
             // `--build-msauth-key` with no key file (development only): the build, first. A loaded
@@ -2706,6 +2719,10 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
                     Ok(()) => tracing::info!("msauth verifier key built; its sha256 is this build's pin"),
                     Err(e) => tracing::error!("msauth verifier key built, but {e}"),
                 }
+            }
+            if multisig {
+                ex.warm_auth_multisig();
+                tracing::info!("multisig auth verifier key warmed");
             }
             ex.warm_bundle();
             tracing::info!("bundle verifier key warmed");
@@ -5012,26 +5029,10 @@ impl Node {
                         recent.insert(p.tx_hash, randprotocol_core::types::CoveredBundle { public_values: pv, shape: p.shape });
                     }
                     None => {
-                        if let Some(bd) = &tx.bundle {
-                            if let Ok(proof) = postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(&bd.proof) {
-                                let pv: [u64; randprotocol_core::types::pv::NUM] = proof.public_values.clone().try_into().expect("cs8 proofs carry pv::NUM public values");
-                                recent.insert(
-                                    tx.hash(),
-                                    randprotocol_core::types::CoveredBundle {
-                                        public_values: pv,
-                                        shape: randprotocol_core::types::DeclaredShape {
-                                            profile,
-                                            tier: proof.tier.0 as u8,
-                                            program_log_height: proof.program_log_height,
-                                            input_log_height: proof.input_log_height,
-                                            keccak_log_height: proof.keccak_log_height,
-                                            sha256_log_height: proof.sha256_log_height,
-                                            public_log_height: proof.public_log_height,
-                                            mem_log_height: proof.mem_log_height,
-                                        },
-                                    },
-                                );
-                            }
+                        // A record it refuses (a modq table, a short public-value run) is left
+                        // out: a later cover of it then reads the store, which refuses it too.
+                        if let Some(record) = tx.bundle.as_ref().and_then(|bd| sync_raw_cover(&bd.proof, profile)) {
+                            recent.insert(tx.hash(), record);
                         }
                     }
                 }
@@ -8890,6 +8891,23 @@ mod tests {
         (dir, storage, gs, covered_tx, mint_tx)
     }
 
+    /// The sync path's inline record and the off-loop apply's (`HotStuff::covered_sidecar` through
+    /// `StoreCovered`, i.e. `Storage::covered_record`) are one builder: equal for a raw proof, and
+    /// both refuse a proof declaring a modq table.
+    #[test]
+    fn the_sync_paths_cover_record_is_the_covered_sidecars() {
+        use randprotocol_core::consensus::CoveredSource;
+        let (_d, storage, _gs, covered_tx, _mint) = chain_with_a_real_proof();
+        let profile = randprotocol_core::types::FriProfile::Test;
+        let inline = sync_raw_cover(&covered_tx.bundle.as_ref().unwrap().proof, profile).expect("a raw proof's record");
+        assert_eq!(Some(inline.clone()), storage.covered_record(&covered_tx.hash(), profile).unwrap());
+        let source = StoreCovered { storage: Arc::new(storage), profile };
+        assert_eq!(source.covered(&[covered_tx.hash()]), Some(vec![inline]));
+        let modq = crate::agg_executor::modq_fixture_proof_bytes();
+        assert_eq!(sync_raw_cover(modq, profile), None, "a modq-declaring proof is refused inline");
+        assert!(crate::agg_executor::covered_bundle_of(&postcard::from_bytes(modq).unwrap(), profile).is_err(), "and by the store's builder");
+    }
+
     /// Assembly reads the store (spec §3.2): the covered bundle's `pv::NUM` public values and its
     /// declared shape come back off the stored proof's header, the profile filled from the chain.
     #[test]
@@ -10943,6 +10961,13 @@ mod tests {
     }
 
     impl ConfidentialExecutor for Hooked {
+        fn auth_header(&self, proof: &[u8]) -> Result<(randprotocol_core::confidential::AuthShape, randprotocol_core::notes::Word8, Option<u64>), randprotocol_core::confidential::ConfidentialError> {
+            StubExecutor.auth_header(proof)
+        }
+        fn warm_auth_multisig(&self) {}
+        fn auth_multisig_key_ready(&self) -> bool {
+            true
+        }
         fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
             StubExecutor.install_msauth_vk(blob)
         }

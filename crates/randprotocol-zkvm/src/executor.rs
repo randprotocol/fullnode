@@ -1507,14 +1507,15 @@ impl ZkExecutor {
 
     /// Precompute the multisig auth guest's one verifier key (spec §3.4–3.5), under the warm lock
     /// like every warm-up. A node calls it, first, only on a chain whose genesis names
-    /// `hc_auth_multisig`. Task 4 makes it the `ConfidentialExecutor` method of the same name.
+    /// `hc_auth_multisig`; there the key is already loaded from the pinned blob, so this finds the
+    /// slot filled and builds nothing. The `ConfidentialExecutor` method of the same name.
     pub fn warm_auth_multisig(&self) {
         self.warming(|| {
             let _ = self.msauth_key();
         })
     }
 
-    /// `ConfidentialExecutor::auth_multisig_key_ready` (Task 4): [`Self::msauth_key_ready`].
+    /// `ConfidentialExecutor::auth_multisig_key_ready`: [`Self::msauth_key_ready`].
     pub fn auth_multisig_key_ready(&self) -> bool {
         self.msauth_key_ready()
     }
@@ -2165,8 +2166,21 @@ impl ConfidentialExecutor for ZkExecutor {
     }
 
     fn build_msauth_key(&self) -> Result<(), String> {
-        self.warm_auth_multisig();
+        ZkExecutor::warm_auth_multisig(self);
         self.check_built_msauth_key()
+    }
+
+    /// [`ZkExecutor::auth_header_of`]: header, degree bits and `pv::NUM` checked per shape.
+    fn auth_header(&self, proof: &[u8]) -> Result<(randprotocol_core::confidential::AuthShape, Word8, Option<u64>), ConfidentialError> {
+        self.auth_header_of(proof)
+    }
+
+    fn warm_auth_multisig(&self) {
+        ZkExecutor::warm_auth_multisig(self)
+    }
+
+    fn auth_multisig_key_ready(&self) -> bool {
+        ZkExecutor::auth_multisig_key_ready(self)
     }
 
     /// The auth guest's one key ([`AUTH_TIER`], its pinned heights, no hash table) — the only key

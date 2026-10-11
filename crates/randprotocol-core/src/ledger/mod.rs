@@ -28,7 +28,7 @@ pub mod tokens;
 pub mod vesting;
 
 use crate::bridge::{BridgeError, BridgeState, CheckedAttestation};
-use crate::confidential::{ConfidentialError, ConfidentialExecutor, StubExecutor};
+use crate::confidential::{AuthShape, ConfidentialError, ConfidentialExecutor, StubExecutor};
 use crate::crypto::{merkle_root, Address, Hash};
 use crate::gas;
 use crate::notes::{word8_to_bytes, Bundle, CommitmentTree, Envelope, Word8, MAX_ENVELOPE_BYTES};
@@ -2382,7 +2382,7 @@ impl Ledger {
         executor: &dyn ConfidentialExecutor,
         admitted: bool,
     ) -> Result<(), TxError> {
-        self.check_auth_fields(b, executor)?;
+        let shape = self.check_auth_fields(b, executor)?;
         // A pruned bundle (spec §6.2's marker form) carries no proof to check: the covering
         // aggregate — verified when its own block applied — is what this bundle's validity
         // rests on. Two checks stand in for it (spec §7's acceptance, the ledger's half): the
@@ -2426,7 +2426,7 @@ impl Ledger {
             }
             // The auth proof is not covered by the aggregate: verified here, as admission does.
             if !admitted {
-                self.verify_auth_proof(b, binding, executor)?;
+                self.verify_auth_proof(b, shape, binding, executor)?;
             }
             return Ok(());
         }
@@ -2450,7 +2450,7 @@ impl Ledger {
         // binds the auth proof by digest (`rand-txid-3`), so a hit vouches for it too.
         if !admitted {
             executor.verify_bundle(&self.hc_bundle, &b.proof, binding).map_err(TxError::InvalidBundleProof)?;
-            self.verify_auth_proof(b, binding, executor)?;
+            self.verify_auth_proof(b, shape, binding, executor)?;
         }
         Ok(())
     }
@@ -2465,45 +2465,71 @@ impl Ledger {
     }
 
     /// Split authorisation's cheap half: without genesis `hc_auth`, no auth field at all
-    /// (`AuthUnexpected`); with it, an auth proof whose published `c` — read, not verified — is
-    /// the bundle's `auth_commit` (`AuthMissing`, `InvalidAuthProof`, `AuthMismatch`), and, under
-    /// the `gas` section, whose declared `GAS_LIMIT` is exactly the auth guest's ceiling
-    /// (`AuthGasLimit`, spec 2026-09-28 §4.3). Every path runs this — admission, apply, a
-    /// verified-set hit, a pruned bundle — before either proof's verify, so a wrong limit buys none.
-    fn check_auth_fields(&self, b: &Bundle, executor: &dyn ConfidentialExecutor) -> Result<(), TxError> {
+    /// (`AuthUnexpected`); with it, an auth proof whose one header decode (`auth_header`: shape,
+    /// published `c`, declared gas — read, not verified) names a shape this chain admits, whose
+    /// `c` is the bundle's `auth_commit` (`AuthMissing`, `InvalidAuthProof`, `AuthMismatch`), and,
+    /// under the `gas` section, whose declared `GAS_LIMIT` is exactly that shape's ceiling —
+    /// `auth_gas_limit_pin` single-key, `msauth_gas_limit_pin` multisig (`AuthGasLimit`, spec
+    /// 2026-09-28 §4.3, private multisig phase 4 §3.2). A multisig-shaped proof on a chain whose
+    /// genesis does not name `hc_auth_multisig` is a permanent `InvalidAuthProof`. Every path runs
+    /// this — admission, apply, a verified-set hit, a pruned bundle — before either proof's verify,
+    /// so a wrong limit buys none. Returns the shape on a `hc_auth` chain, for
+    /// [`Self::verify_auth_proof`] to pick its guest by.
+    fn check_auth_fields(&self, b: &Bundle, executor: &dyn ConfidentialExecutor) -> Result<Option<AuthShape>, TxError> {
         match self.hc_auth {
             None if b.auth_commit != [0; 8] || !b.auth_proof.is_empty() => Err(TxError::AuthUnexpected),
-            None => Ok(()),
+            None => Ok(None),
             Some(_) if b.auth_proof.is_empty() => Err(TxError::AuthMissing),
             Some(_) => {
-                let c = executor.auth_proof_digest(&b.auth_proof).map_err(TxError::InvalidAuthProof)?;
+                let (shape, c, got) = executor.auth_header(&b.auth_proof).map_err(TxError::InvalidAuthProof)?;
+                if shape == AuthShape::Multisig && self.hc_auth_multisig.is_none() {
+                    return Err(TxError::InvalidAuthProof(ConfidentialError::InvalidProof(
+                        "a multisig auth proof on a chain without hc_auth_multisig".into(),
+                    )));
+                }
                 if c != b.auth_commit {
                     return Err(TxError::AuthMismatch);
                 }
                 if self.gas.is_some() {
-                    let want = gas::auth_gas_limit_pin();
-                    let got = executor.auth_gas_limit(&b.auth_proof).map_err(TxError::InvalidAuthProof)?;
+                    let want = match shape {
+                        AuthShape::SingleKey => gas::auth_gas_limit_pin(),
+                        AuthShape::Multisig => gas::msauth_gas_limit_pin(),
+                    };
                     if got != Some(want) {
                         return Err(TxError::AuthGasLimit { want, got });
                     }
                 }
-                Ok(())
+                Ok(Some(shape))
             }
         }
     }
 
-    /// Split authorisation's expensive half: the auth proof verifies against the pinned auth
-    /// guest and this transaction's `binding` — the same binding the bundle proof was verified
-    /// against — and the `c` it publishes is the bundle's `auth_commit`. Nothing on a chain
-    /// without `hc_auth` (`check_auth_fields` has refused any auth field there).
+    /// Split authorisation's expensive half: the auth proof verifies against the auth guest its
+    /// shape names — genesis `hc_auth` for a single-key proof, `hc_auth_multisig` for a multisig
+    /// one — and this transaction's `binding`, the same binding the bundle proof was verified
+    /// against, and the `c` it publishes is the bundle's `auth_commit`. `shape` is
+    /// [`Self::check_auth_fields`]' answer; nothing on a chain without `hc_auth` (`None`: that
+    /// check has refused any auth field there).
     fn verify_auth_proof(
         &self,
         b: &Bundle,
+        shape: Option<AuthShape>,
         binding: &[u32; crate::types::TX_BINDING_WORDS],
         executor: &dyn ConfidentialExecutor,
     ) -> Result<(), TxError> {
-        let Some(hc_auth) = self.hc_auth else { return Ok(()) };
-        let c = executor.verify_auth(&hc_auth, &b.auth_proof, binding).map_err(TxError::InvalidAuthProof)?;
+        let hc = match shape {
+            None => return Ok(()),
+            Some(AuthShape::SingleKey) => self.hc_auth,
+            Some(AuthShape::Multisig) => self.hc_auth_multisig,
+        };
+        // `check_auth_fields` returns a shape only for a chain naming its guest; refused, never
+        // waved through, should a caller pass one anyway.
+        let Some(hc) = hc else {
+            return Err(TxError::InvalidAuthProof(ConfidentialError::InvalidProof(
+                "a multisig auth proof on a chain without hc_auth_multisig".into(),
+            )));
+        };
+        let c = executor.verify_auth(&hc, &b.auth_proof, binding).map_err(TxError::InvalidAuthProof)?;
         if c != b.auth_commit {
             return Err(TxError::AuthMismatch);
         }
@@ -4454,9 +4480,14 @@ pub(crate) mod tests {
         bundles: std::sync::atomic::AtomicUsize,
         calls: std::sync::atomic::AtomicUsize,
         auths: std::sync::atomic::AtomicUsize,
+        /// The `hc` of every `verify_auth`, in order.
+        auth_hcs: std::sync::Mutex<Vec<Word8>>,
     }
 
     impl CountingExecutor {
+        fn auth_hcs(&self) -> Vec<Word8> {
+            self.auth_hcs.lock().unwrap().clone()
+        }
         fn bundles(&self) -> usize {
             self.bundles.load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -4469,6 +4500,13 @@ pub(crate) mod tests {
     }
 
     impl ConfidentialExecutor for CountingExecutor {
+        fn auth_header(&self, proof: &[u8]) -> Result<(crate::confidential::AuthShape, crate::notes::Word8, Option<u64>), crate::confidential::ConfidentialError> {
+            StubExecutor.auth_header(proof)
+        }
+        fn warm_auth_multisig(&self) {}
+        fn auth_multisig_key_ready(&self) -> bool {
+            true
+        }
         fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
             StubExecutor.install_msauth_vk(blob)
         }
@@ -4516,6 +4554,7 @@ pub(crate) mod tests {
         }
         fn verify_auth(&self, hc_auth: &Word8, proof: &[u8], binding: &[u32; 8]) -> Result<Word8, ConfidentialError> {
             self.auths.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.auth_hcs.lock().unwrap().push(*hc_auth);
             StubExecutor.verify_auth(hc_auth, proof, binding)
         }
         fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
@@ -5303,6 +5342,13 @@ pub(crate) mod tests {
     }
 
     impl ConfidentialExecutor for FlaggingExecutor {
+        fn auth_header(&self, proof: &[u8]) -> Result<(crate::confidential::AuthShape, crate::notes::Word8, Option<u64>), crate::confidential::ConfidentialError> {
+            StubExecutor.auth_header(proof)
+        }
+        fn warm_auth_multisig(&self) {}
+        fn auth_multisig_key_ready(&self) -> bool {
+            true
+        }
         fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
             StubExecutor.install_msauth_vk(blob)
         }
@@ -5627,6 +5673,13 @@ pub(crate) mod tests {
     }
 
     impl ConfidentialExecutor for PaddedStub {
+        fn auth_header(&self, proof: &[u8]) -> Result<(crate::confidential::AuthShape, crate::notes::Word8, Option<u64>), crate::confidential::ConfidentialError> {
+            StubExecutor.auth_header(proof)
+        }
+        fn warm_auth_multisig(&self) {}
+        fn auth_multisig_key_ready(&self) -> bool {
+            true
+        }
         fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
             StubExecutor.install_msauth_vk(blob)
         }
@@ -6742,6 +6795,13 @@ pub(crate) mod tests {
         /// publishes another — the verify's answer is compared as well.
         struct LyingDigest;
         impl ConfidentialExecutor for LyingDigest {
+            fn auth_header(&self, proof: &[u8]) -> Result<(crate::confidential::AuthShape, crate::notes::Word8, Option<u64>), crate::confidential::ConfidentialError> {
+                StubExecutor.auth_header(proof).map(|(shape, _, gas)| (shape, C, gas))
+            }
+            fn warm_auth_multisig(&self) {}
+            fn auth_multisig_key_ready(&self) -> bool {
+                true
+            }
             fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
                 StubExecutor.install_msauth_vk(blob)
             }
@@ -7310,6 +7370,13 @@ pub(crate) mod tests {
         // An executor whose proofs carry no limit declares none, and is refused under the section.
         struct NoGas;
         impl ConfidentialExecutor for NoGas {
+            fn auth_header(&self, proof: &[u8]) -> Result<(crate::confidential::AuthShape, crate::notes::Word8, Option<u64>), crate::confidential::ConfidentialError> {
+                StubExecutor.auth_header(proof)
+            }
+            fn warm_auth_multisig(&self) {}
+            fn auth_multisig_key_ready(&self) -> bool {
+                true
+            }
             fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
                 StubExecutor.install_msauth_vk(blob)
             }
@@ -7437,6 +7504,101 @@ pub(crate) mod tests {
         replica.apply_block(&block, &StubExecutor).unwrap();
         assert_eq!(replica.gas_prices(), expect.gas_prices());
         assert!(replica.gas_prices().gas_price > 100, "60 479 gas against a 20 000 target raised the price");
+    }
+
+    // ---- Private multisig phase 4: dispatch on the auth proof's shape -----------------------------
+
+    /// The multisig auth guest a test chain pins (genesis `hc_auth_multisig`).
+    const HCM: Word8 = [23; 8];
+
+    fn msig_ledger() -> Ledger {
+        let mut l = v3_ledger();
+        l.set_hc_auth_multisig(Some(HCM));
+        l
+    }
+
+    /// A v3 transaction whose auth proof is a stub multisig proof made by `hc`, publishing `proof_c`.
+    fn msig_tx_with(l: &Ledger, c: Word8, proof_c: Word8, hc: Word8) -> Transaction {
+        let mut b = bundle(l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], gas::BUNDLE_BASE);
+        b.auth_commit = c;
+        b.proof = StubExecutor::make_bundle_proof(&HC, &StubExecutor.bundle_digest_v3(&b.digest_input()), &[0; 8]);
+        b.auth_proof = StubExecutor::make_msauth_proof(&hc, &proof_c, &[0; 8]);
+        StubExecutor::bound(Transaction::shielded(7, b, Action::None))
+    }
+
+    #[test]
+    fn a_multisig_auth_proof_is_verified_against_hc_auth_multisig_and_single_key_still_works() {
+        let (a, _) = keys();
+        let mut l = msig_ledger();
+        let t = msig_tx_with(&l, C, C, HCM);
+        let exec = CountingExecutor::default();
+        assert_eq!(l.validate(&t, &exec), Ok(()));
+        assert_eq!(exec.auth_hcs(), vec![HCM], "verify_auth got hc_auth_multisig");
+        l.apply_tx(&t, &a.address(), &StubExecutor).unwrap();
+        let l = msig_ledger();
+        let exec = CountingExecutor::default();
+        assert_eq!(l.validate(&v3_tx(&l), &exec), Ok(()), "a single-key spend on the same chain");
+        assert_eq!(exec.auth_hcs(), vec![HCA], "verify_auth got hc_auth");
+    }
+
+    #[test]
+    fn a_multisig_shaped_proof_made_by_another_guest_is_refused() {
+        let l = msig_ledger();
+        assert_eq!(l.validate(&msig_tx_with(&l, C, C, HCA), &StubExecutor), Err(TxError::InvalidAuthProof(ConfidentialError::WrongProgram)));
+    }
+
+    #[test]
+    fn a_multisig_auth_proof_on_a_chain_without_hc_auth_multisig_is_refused_before_any_verify() {
+        let l = v3_ledger();
+        let t = msig_tx_with(&l, C, C, HCM);
+        let exec = CountingExecutor::default();
+        match l.validate(&t, &exec) {
+            Err(TxError::InvalidAuthProof(ConfidentialError::InvalidProof(why))) => assert!(why.contains("without hc_auth_multisig"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!((exec.bundles(), exec.auths()), (0, 0));
+    }
+
+    #[test]
+    fn a_multisig_auth_proof_publishing_another_c_is_auth_mismatch() {
+        let l = msig_ledger();
+        let t = msig_tx_with(&l, C, [0xc1; 8], HCM);
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::AuthMismatch));
+        let b = t.bundle.as_ref().unwrap();
+        assert_eq!(l.check_bundle_proof(&t, b, &t.binding(&crate::types::BindingDomain::ChainId), &StubExecutor, true), Err(TxError::AuthMismatch), "on a verified-set hit too");
+    }
+
+    /// R-gas: under the section a multisig proof must declare its header's ceiling, the msauth pin —
+    /// not the single-key pin, and not any run-exact value.
+    #[test]
+    fn under_gas_a_multisig_auth_proof_must_declare_the_msauth_ceiling() {
+        let (a, _) = keys();
+        let mut l = msig_ledger();
+        l.set_gas(Some(gas::GasConfig { gas_price: 100, byte_price: 800, bundle_gas_limit: gas::bundle_gas_limit_pin(), metering: gas::GasMetering::Circuit, dynamic: None }));
+        let pin = gas::msauth_gas_limit_pin();
+        assert_eq!(pin, crate::confidential::STUB_MSAUTH_GAS_LIMIT);
+        let ok = msig_tx_with(&l, C, C, HCM);
+        assert_eq!(l.validate(&ok, &StubExecutor), Ok(()));
+        for other in [pin - 1, pin + 1, gas::auth_gas_limit_pin(), 1] {
+            let mut t = ok.clone();
+            StubExecutor::with_auth_gas(&mut t.bundle.as_mut().unwrap().auth_proof, other);
+            let t = StubExecutor::bound(t);
+            let want = Err(TxError::AuthGasLimit { want: pin, got: Some(other) });
+            let exec = CountingExecutor::default();
+            assert_eq!(l.validate(&t, &exec), want, "{other}");
+            assert_eq!((exec.bundles(), exec.auths()), (0, 0), "refused before either verify");
+            let mut applied = l.clone();
+            assert_eq!(applied.apply_tx_with(&t, &a.address(), &StubExecutor, &Admitted::of(&[&t])).map(|_| ()), want);
+        }
+    }
+
+    #[test]
+    fn an_auth_proof_of_neither_shape_is_invalid() {
+        let l = msig_ledger();
+        let mut t = v3_tx(&l);
+        t.bundle.as_mut().unwrap().auth_proof = b"neither".to_vec();
+        let t = StubExecutor::bound(t);
+        assert_eq!(l.validate(&t, &StubExecutor), Err(TxError::InvalidAuthProof(ConfidentialError::MalformedProof)));
     }
 
     // ---- Issue #135: `fees.burn_floor`, the whole floor burned under `burn_base` --------------
@@ -7989,6 +8151,13 @@ pub(crate) mod tests {
     }
 
     impl ConfidentialExecutor for FlakyDeploy {
+        fn auth_header(&self, proof: &[u8]) -> Result<(crate::confidential::AuthShape, crate::notes::Word8, Option<u64>), crate::confidential::ConfidentialError> {
+            StubExecutor.auth_header(proof)
+        }
+        fn warm_auth_multisig(&self) {}
+        fn auth_multisig_key_ready(&self) -> bool {
+            true
+        }
         fn install_msauth_vk(&self, blob: &[u8]) -> Result<(), String> {
             StubExecutor.install_msauth_vk(blob)
         }

@@ -236,6 +236,22 @@ pub trait ConfidentialExecutor: Send + Sync {
     /// nothing cryptographic — the ledger compares the answer with the bundle's `auth_commit`
     /// before paying for [`Self::verify_auth`].
     fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError>;
+    /// Cheap (private multisig phase 4): decode an auth proof canonically once, name its pinned
+    /// shape — the single-key auth guest's or the multisig one's — and return the `c` it publishes
+    /// and its declared `pv::GAS`, all from the one decode. A header of neither shape is refused
+    /// (`InvalidProof`, or `MalformedProof` for bytes that do not decode). Verifies nothing: the
+    /// ledger picks `hc_auth` or `hc_auth_multisig` by the shape before paying for
+    /// [`Self::verify_auth`]. Every wrapper (`AggExecutor`, `CachingExecutor`) forwards this and
+    /// the two methods below; they verify nothing and are never cached.
+    fn auth_header(&self, proof: &[u8]) -> Result<(AuthShape, Word8, Option<u64>), ConfidentialError>;
+    /// Make the multisig auth guest's one verifier key ready (spec §3.5). On a node the pinned
+    /// key blob is loaded at startup (`msauth_key::startup`), so this finds it in place; a bare
+    /// executor without the blob builds it. A node calls it, first of its warm-ups, only on a
+    /// chain whose genesis names `hc_auth_multisig`.
+    fn warm_auth_multisig(&self);
+    /// Whether that key is ready — loaded or built (spec §3.5): admission defers a multisig auth
+    /// proof, retryably, until it is. Block validation never asks: its verify waits on the key.
+    fn auth_multisig_key_ready(&self) -> bool;
     /// Expensive: the STARK verification of an auth proof against the pinned auth guest
     /// `hc_auth` (genesis) and against `binding` — the [`crate::types::Transaction::binding`] of
     /// the transaction it rides in, as its public input segment — returning the `c` it publishes.
@@ -421,6 +437,25 @@ const STUB_AUTH_GAS: usize = STUB_AUTH_BINDING + 32;
 /// The gas limit a stub auth proof declares unless a test chooses one: `gas_max(10, 0, 0)`,
 /// what every real auth proof declares (tier 10, no hash table).
 pub const STUB_AUTH_GAS_LIMIT: u64 = 1_279;
+/// Stub multisig auth proof (private multisig phase 4): [`STUB_AUTH_MARKER`]'s layout under its
+/// own marker — `msau:` || `c` || blake3("rand-stub-auth", hc bytes)[..8] || binding || gas — so
+/// `verify_auth`'s guest check is the same for both shapes.
+const STUB_MSAUTH_MARKER: &[u8; 5] = b"msau:";
+/// The gas limit a stub multisig auth proof declares unless a test chooses one:
+/// `gas::msauth_gas_limit_pin()`, what every real multisig auth proof declares.
+pub const STUB_MSAUTH_GAS_LIMIT: u64 = 436_159;
+
+/// The shape of a well-formed stub auth proof of either marker, or `None`.
+fn stub_auth_shape(proof: &[u8]) -> Option<AuthShape> {
+    if proof.len() != STUB_AUTH_LEN {
+        return None;
+    }
+    match &proof[..5] {
+        m if m == STUB_AUTH_MARKER => Some(AuthShape::SingleKey),
+        m if m == STUB_MSAUTH_MARKER => Some(AuthShape::Multisig),
+        _ => None,
+    }
+}
 /// Where the gas limit starts inside a stub bundle proof: its last eight bytes.
 const STUB_BUNDLE_GAS: usize = STUB_BUNDLE_BINDING + 32;
 
@@ -541,10 +576,21 @@ impl StubExecutor {
         v
     }
 
-    /// Rewrite the gas limit a stub auth proof declares, as [`Self::with_bundle_gas`] does a
-    /// bundle proof's. Anything that is not a well-formed stub auth proof is left untouched.
+    /// Build a stub multisig auth proof publishing `c`, made by the multisig auth guest `hc` and
+    /// bound to `binding`: [`Self::make_auth_proof`]'s bytes under the `msau:` marker, declaring
+    /// [`STUB_MSAUTH_GAS_LIMIT`].
+    pub fn make_msauth_proof(hc_auth_multisig: &Word8, c: &Word8, binding: &[u32; TX_BINDING_WORDS]) -> Vec<u8> {
+        let mut v = Self::make_auth_proof(hc_auth_multisig, c, binding);
+        v[..5].copy_from_slice(STUB_MSAUTH_MARKER);
+        v[STUB_AUTH_GAS..].copy_from_slice(&STUB_MSAUTH_GAS_LIMIT.to_le_bytes());
+        v
+    }
+
+    /// Rewrite the gas limit a stub auth proof (either shape) declares, as
+    /// [`Self::with_bundle_gas`] does a bundle proof's. Anything that is not a well-formed stub
+    /// auth proof is left untouched.
     pub fn with_auth_gas(proof: &mut [u8], gas_limit: u64) {
-        if proof.len() == STUB_AUTH_LEN && &proof[..5] == STUB_AUTH_MARKER {
+        if stub_auth_shape(proof).is_some() {
             proof[STUB_AUTH_GAS..].copy_from_slice(&gas_limit.to_le_bytes());
         }
     }
@@ -578,7 +624,7 @@ impl StubExecutor {
             if b.proof.len() == STUB_BUNDLE_LEN && &b.proof[..4] == STUB_MARKER {
                 b.proof[STUB_BUNDLE_BINDING..STUB_BUNDLE_GAS].copy_from_slice(&binding);
             }
-            if b.auth_proof.len() == STUB_AUTH_LEN && &b.auth_proof[..5] == STUB_AUTH_MARKER {
+            if stub_auth_shape(&b.auth_proof).is_some() {
                 b.auth_proof[STUB_AUTH_BINDING..STUB_AUTH_GAS].copy_from_slice(&binding);
             }
         }
@@ -804,10 +850,21 @@ impl ConfidentialExecutor for StubExecutor {
     }
 
     fn auth_proof_digest(&self, proof: &[u8]) -> Result<Word8, ConfidentialError> {
-        if proof.len() != STUB_AUTH_LEN || &proof[..5] != STUB_AUTH_MARKER {
-            return Err(ConfidentialError::MalformedProof);
-        }
-        Ok(word8_from_bytes(&proof[5..37]).unwrap())
+        Ok(self.auth_header(proof)?.1)
+    }
+
+    /// `auth:` is the single-key shape, `msau:` the multisig one; anything else is malformed.
+    fn auth_header(&self, proof: &[u8]) -> Result<(AuthShape, Word8, Option<u64>), ConfidentialError> {
+        let shape = stub_auth_shape(proof).ok_or(ConfidentialError::MalformedProof)?;
+        let c = word8_from_bytes(&proof[5..37]).unwrap();
+        let gas = u64::from_le_bytes(proof[STUB_AUTH_GAS..].try_into().expect("8 bytes"));
+        Ok((shape, c, Some(gas)))
+    }
+
+    fn warm_auth_multisig(&self) {}
+
+    fn auth_multisig_key_ready(&self) -> bool {
+        true
     }
 
     fn verify_auth(
@@ -833,8 +890,7 @@ impl ConfidentialExecutor for StubExecutor {
     }
 
     fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
-        self.auth_proof_digest(proof)?;
-        Ok(Some(u64::from_le_bytes(proof[STUB_AUTH_GAS..].try_into().expect("8 bytes"))))
+        Ok(self.auth_header(proof)?.2)
     }
 
     fn verify_bundle(
