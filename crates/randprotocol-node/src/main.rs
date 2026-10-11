@@ -1010,7 +1010,7 @@ enum Cmd {
     },
     /// The precomputed msauth verifier key (private multisig, plan Task 2b). `--profile P --out
     /// FILE` builds the key (a big host: ~80 s, ~4 GB at production) and writes the blob, printing
-    /// `blake3 <hex>  bytes <n>`; `--check FILE` prints a file's blake3; `--print-pinned P` prints
+    /// `sha256 <hex>  bytes <n>`; `--check FILE` prints a file's SHA-256; `--print-pinned P` prints
     /// this build's pin. A validator loads the blob from beside its binary
     /// (`/usr/local/bin/msauth-vk-production.bin`) and never builds it.
     KeygenMsauthVk {
@@ -2493,7 +2493,7 @@ async fn main() -> Result<()> {
                 let t0 = std::time::Instant::now();
                 let (digest, bytes) = msauth_key::keygen(profile, &out)?;
                 eprintln!("wrote {} in {:.1?}", out.display(), t0.elapsed());
-                println!("blake3 {digest}  bytes {bytes}");
+                println!("sha256 {digest}  bytes {bytes}");
             } else {
                 anyhow::bail!("keygen-msauth-vk: give --profile P --out FILE, --check FILE or --print-pinned P");
             }

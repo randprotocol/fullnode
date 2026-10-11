@@ -123,7 +123,7 @@ pub struct MsauthShape {
 /// The tier-18 msauth key costs 78.6 s and ~4 GB to build (Task 2's measurement), and the fleet's
 /// validators are `s-2vcpu-4gb`, so a node **loads** it instead. The key file is exactly the
 /// vendored machine's postcard-serialised `VerifierKeyBlob` (no wrapper of ours), so its pin is
-/// the blake3 of the file bytes. There is one location, beside the binary
+/// the SHA-256 of the file bytes. There is one location, beside the binary
 /// (`/usr/local/bin/msauth-vk-production.bin`; `--msauth-vk` / `RAND_MSAUTH_VK` override it), and
 /// a node on a chain naming `hc_auth_multisig` refuses to start without the pinned blob.
 ///
@@ -146,19 +146,19 @@ pub mod msauth_vk {
     /// No blob hashes to this: the value the pins hold until the real blobs exist (TASK-2B-RESYNC).
     pub const PIN_PENDING: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-    /// blake3 of `msauth-vk-production.bin`, the release asset every validator installs at
+    /// SHA-256 of `msauth-vk-production.bin`, the release asset every validator installs at
     /// `/usr/local/bin/msauth-vk-production.bin`. Consensus-critical (a wrong commitment could let
     /// a forged multisig proof verify): `tests/guest_provenance.rs` and `deploy/roll-all.sh` check
     /// it. TASK-2B-RESYNC: set from the keygen run after the re-sync.
-    pub const MSAUTH_VK_BLAKE3_PRODUCTION: &str = PIN_PENDING;
-    /// blake3 of `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (tests only). TASK-2B-RESYNC.
-    pub const MSAUTH_VK_BLAKE3_TEST: &str = PIN_PENDING;
+    pub const MSAUTH_VK_SHA256_PRODUCTION: &str = PIN_PENDING;
+    /// SHA-256 of `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (tests only). TASK-2B-RESYNC.
+    pub const MSAUTH_VK_SHA256_TEST: &str = PIN_PENDING;
 
     /// This build's pin for `profile`.
     pub fn pin(profile: FriProfile) -> &'static str {
         match profile {
-            FriProfile::Production => MSAUTH_VK_BLAKE3_PRODUCTION,
-            FriProfile::Test => MSAUTH_VK_BLAKE3_TEST,
+            FriProfile::Production => MSAUTH_VK_SHA256_PRODUCTION,
+            FriProfile::Test => MSAUTH_VK_SHA256_TEST,
         }
     }
 
@@ -170,9 +170,11 @@ pub mod msauth_vk {
         }
     }
 
-    /// The blake3 of `bytes`, lowercase hex: what every pin and every deploy check compares.
+    /// The SHA-256 of `bytes`, lowercase hex: what every pin and every deploy check compares, and
+    /// the digest the vendored `Machine::install_verifier_key_pinned` checks on the raw bytes
+    /// (`crate::sha256::sha256`, the same function) before it decodes anything.
     pub fn digest(bytes: &[u8]) -> String {
-        blake3::hash(bytes).to_hex().to_string()
+        crate::sha256::sha256(bytes).iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// Mirror of the vendored `FriProfile` as the contract serialises it (the vendored enum
@@ -249,7 +251,7 @@ pub mod msauth_vk {
     impl std::fmt::Display for MsauthVkError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                MsauthVkError::Digest { got, want } => write!(f, "msauth key blob digest: has blake3 {got}, not the pinned {want}"),
+                MsauthVkError::Digest { got, want } => write!(f, "msauth key blob digest: has sha256 {got}, not the pinned {want}"),
                 MsauthVkError::Decode(e) => write!(f, "msauth key blob does not decode: {e}"),
                 MsauthVkError::Profile { got, want } => write!(f, "msauth key blob profile is {got:?}, this node runs {want:?}"),
                 MsauthVkError::Shape { got, want } => write!(f, "msauth key blob shape {got:?} is not the pinned msauth shape {want:?}"),
@@ -260,7 +262,7 @@ pub mod msauth_vk {
     }
     impl std::error::Error for MsauthVkError {}
 
-    /// The checks that need nothing from the machine, in order: the blake3 of the file bytes
+    /// The checks that need nothing from the machine, in order: the SHA-256 of the file bytes
     /// equals `want_digest`; the bytes decode; the header's profile is `profile`; its shape is
     /// exactly [`ZkExecutor::msauth_heights`]. Returns the decoded blob for the install.
     pub fn check(blob: &[u8], want_digest: &str, profile: FriProfile) -> Result<VerifierKeyBlob, MsauthVkError> {

@@ -54,8 +54,6 @@ chacha20poly1305 = "=0.11.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 postcard = { version = "1", features = ["alloc"] }
-# Task 2b: the precomputed msauth verifier key blob is pinned by the blake3 of its file bytes.
-blake3 = { workspace = true }
 # The GPU backend is circuits' `rand-zkvm-cuda`, taken from the public zkp-circuits repository at
 # a pinned revision — a git dependency, not a path to a sibling checkout (audit v6 PROC-2, issue
 # #109: cargo loads every path dependency's manifest, optional or not, so a sibling path made a

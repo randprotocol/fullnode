@@ -367,7 +367,7 @@ fn the_multisig_auth_guest_is_pinned() {
 
 /// The precomputed msauth verifier key (plan Task 2b, spec §3.6) is consensus-critical: a wrong
 /// commitment could let a forged multisig proof verify. Both profiles' blobs are pinned by the
-/// blake3 of their file bytes. The Test blob is committed (`keys/msauth-vk-test.bin`); the
+/// SHA-256 of their file bytes. The Test blob is committed (`keys/msauth-vk-test.bin`); the
 /// Production blob is a release asset, read here from `$MSAUTH_VK_PRODUCTION_BLOB`, else
 /// `target/msauth-vk-production.bin` (where `rand-node keygen-msauth-vk --profile production`
 /// writes it for the release step).
@@ -377,14 +377,14 @@ fn the_multisig_auth_guest_is_pinned() {
 /// the file, which is the value to write into `executor::msauth_vk`.
 #[test]
 fn the_msauth_verifier_key_blobs_are_pinned() {
-    use randprotocol_zkvm::executor::msauth_vk::{digest, MSAUTH_VK_BLAKE3_PRODUCTION, MSAUTH_VK_BLAKE3_TEST, PIN_PENDING};
+    use randprotocol_zkvm::executor::msauth_vk::{digest, MSAUTH_VK_SHA256_PRODUCTION, MSAUTH_VK_SHA256_TEST, PIN_PENDING};
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let production = std::env::var_os("MSAUTH_VK_PRODUCTION_BLOB")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("../../target/msauth-vk-production.bin"));
     for (profile, pin, path) in [
-        ("test", MSAUTH_VK_BLAKE3_TEST, root.join("keys/msauth-vk-test.bin")),
-        ("production", MSAUTH_VK_BLAKE3_PRODUCTION, production),
+        ("test", MSAUTH_VK_SHA256_TEST, root.join("keys/msauth-vk-test.bin")),
+        ("production", MSAUTH_VK_SHA256_PRODUCTION, production),
     ] {
         let bytes = std::fs::read(&path).unwrap_or_else(|e| {
             panic!(
@@ -393,9 +393,9 @@ fn the_msauth_verifier_key_blobs_are_pinned() {
                 path.display()
             )
         });
-        assert_eq!(pin.len(), 64, "{profile}: a blake3 pin is 64 hex characters");
+        assert_eq!(pin.len(), 64, "{profile}: a SHA-256 pin is 64 hex characters");
         assert!(pin.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{profile}: lowercase hex");
-        assert_eq!(digest(&bytes), pin, "{profile} msauth key blob {} ({} bytes): write the computed digest (left) into MSAUTH_VK_BLAKE3_{}", path.display(), bytes.len(), profile.to_uppercase());
+        assert_eq!(digest(&bytes), pin, "{profile} msauth key blob {} ({} bytes): write the computed digest (left) into MSAUTH_VK_SHA256_{}", path.display(), bytes.len(), profile.to_uppercase());
         assert_ne!(pin, PIN_PENDING, "{profile}: the pin is still the placeholder");
     }
 }

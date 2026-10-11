@@ -69,24 +69,24 @@ pub fn load_msauth_key(
             return Ok(MsauthKeySource::Built);
         }
         Err(e) => bail!(
-            "msauth verifier key: {} missing ({e}) (expected blake3 {pin}); install it from the release, or run with --build-msauth-key on a ≥ 8 GB host",
+            "msauth verifier key: {} missing ({e}) (expected sha256 {pin}); install it from the release, or run with --build-msauth-key on a ≥ 8 GB host",
             path.display()
         ),
     };
     install(&bytes).map_err(|e| {
         anyhow!(
-            "msauth verifier key: {} has blake3 {} and was refused: {e} (expected blake3 {pin}); install it from the release, or run with --build-msauth-key on a ≥ 8 GB host",
+            "msauth verifier key: {} has sha256 {} and was refused: {e} (expected sha256 {pin}); install it from the release, or run with --build-msauth-key on a ≥ 8 GB host",
             path.display(),
             msauth_vk::digest(&bytes)
         )
     })?;
-    tracing::info!("msauth verifier key loaded from {} (blake3 {pin})", path.display());
+    tracing::info!("msauth verifier key loaded from {} (sha256 {pin})", path.display());
     Ok(MsauthKeySource::Loaded)
 }
 
 /// `rand-node keygen-msauth-vk --profile <p> --out <file>`: build the key (a big host: 78.6 s,
 /// ~4 GB at Production), write the blob to a new file (never over an existing one) and return
-/// its blake3 and size.
+/// its sha256 and size.
 pub fn keygen(profile: FriProfile, out: &Path) -> Result<(String, usize)> {
     if out.exists() {
         bail!("{} exists; refusing to overwrite a key file", out.display());
@@ -101,7 +101,7 @@ pub fn keygen(profile: FriProfile, out: &Path) -> Result<(String, usize)> {
     Ok((msauth_vk::digest(&blob), blob.len()))
 }
 
-/// `rand-node keygen-msauth-vk --check <file>`: the file's blake3, as the deploy scripts compare
+/// `rand-node keygen-msauth-vk --check <file>`: the file's sha256, as the deploy scripts compare
 /// it against `--print-pinned`.
 pub fn check_file(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
