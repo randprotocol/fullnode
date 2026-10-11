@@ -1,6 +1,6 @@
 # Multisig accounts: M-of-N controlled public balances
 
-> **Status: implemented on `feat/multisig`, not yet on any chain.** The section is genesis-gated: a
+> **Status: on `main` (fullnode 3119a29a), not yet on any chain.** The section is genesis-gated: a
 > chain without it refuses all four actions (`UnsupportedAction("multisig")`) and runs byte for
 > byte as before, so the build changes no live chain. It reaches one with the genesis cut that
 > carries the treasury. Design: `docs/superpowers/specs/2026-10-08-multisig-design.md`.
@@ -216,6 +216,60 @@ rand-node multisig rotate submit --proposal rotate.json --signature 0:<hex> --si
 A payment reveals "account X paid N of asset A" at that block, exactly as a program invoke does; the
 receiving note is shielded, and from then on the RAND is indistinguishable from any other.
 Creating and depositing burn from a shielded wallet, so they reveal the amount, not the funder.
+
+### So is a multisig account private?
+
+**No — not the account itself.** A multisig account is a *public register*, like the validator and
+vesting registers: its balance, its signer keys, its threshold and every payment out of it are on
+chain for anyone to read. Only the edges are shielded: the wallet that created or funded it (a
+burn from a shielded note) and where a payout goes once it is a note. It is the right shape for a
+foundation treasury, whose balance is meant to be auditable; it is the wrong shape for anyone who
+wants M-of-N control *and* RandProtocol's normal privacy.
+
+The reason is where the threshold check runs. A shielded note is spent by a proof that its owner
+knows one key (`sk`, or on split-authorisation chains the auth proof over `sk`, `docs/shielded.md`
+§2); there is no threshold inside that proof. So the four multisig actions check their Dilithium2
+signatures **natively, in the node, outside any proof** — and whatever the node checks, it must
+see: the keys, the threshold, the indices that signed, the amounts.
+
+Explicit multisig is also the post-quantum norm, not a RandProtocol shortcut. The compact
+constructions classical chains use — MuSig2 and FROST (one Schnorr signature for M of N), BLS
+aggregation — all rest on discrete logs or pairings that a quantum computer breaks, and lattice
+threshold signatures are not yet standardised or deployed. What is left is N public keys and M
+independent Dilithium2 signatures: 1 312 bytes per key and 2 420 per signature on the wire, with
+the signer set visible.
+
+## Planned: private multisig (the threshold inside the proof)
+
+The way to get both is to move the M-of-N check **into a proof**, so the node verifies one proof
+instead of M signatures and learns nothing about the policy. The design is
+`docs/superpowers/specs/2026-10-11-private-multisig-design.md`; in short:
+
+- A **multisig address** is an ordinary `rand1…` address. Its `nk` is derived from a hidden policy
+  (the signers' Dilithium2 keys, the threshold, and a secret the signers share) instead of from one
+  spend key, so its notes sit in the same shielded pool as everyone else's and look the same.
+- Spending one uses the **existing** bundle guest unchanged. What changes is the *auth* proof:
+  a second auth guest, `hc_auth_multisig`, verifies M Dilithium2 signatures over the transaction's
+  binding inside the zkVM and publishes the same `auth_commit` the single-key auth guest does.
+- The chain then sees one fixed-size proof. It does **not** see the account, the signer keys, N,
+  M, the threshold, which signers signed, the amounts or the recipients. It does see that the
+  spend was multisig-authorised (the auth proof's pinned shape differs from the single-key one).
+- Rotation becomes an ordinary M-of-N spend of every note to a new policy's address; the public
+  register's nonce and mempool slot are not needed, because nullifiers already prevent replay.
+- A public account can move its balance into a private one with an ordinary `MultisigPay` to the
+  private address: the payout is a note like any other.
+
+How it is built, in order (each phase gated on the one before):
+
+| phase | where | what | gate |
+|---|---|---|---|
+| 1 | `circuits` | a `no_std` Dilithium2 verifier compiled for the rVM (Keccak through the `KECCAK` syscall), byte-identical to `crystals-dilithium` 2.0.0's `dilithium2` | known-answer tests against the node's crate; **cycles per verification measured** |
+| 2 | `circuits` | the multisig auth guest: policy check, up to `M_MAX` signatures over the binding read from the public segment, `c = H(AUTH, nk ‖ salt)` out | cheating suite; tier measured at `M_MAX` ∈ {2, 3, 5} |
+| 3 | `circuits` (only if phase 2 misses tier 19) | a modular-arithmetic / NTT coprocessor chip for `q = 8 380 417`, so a verification costs rows, not hundreds of thousands of cycles | phase 2's tier re-measured under it |
+| 4 | `fullnode` | genesis `hc_auth_multisig`, admission by the auth proof's declared shape, the prover's multisig witness, `rand multisig-private` (address, prepare, sign, prove, submit), wallet scanning by `nk` | a real-proof end-to-end on a test chain |
+| 5 | cut | the genesis section on a chain; the treasury may then move privately | — |
+
+Until phase 4 lands on a chain, the public account above is the only multisig there is.
 
 ## Reading it
 
