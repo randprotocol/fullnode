@@ -2535,6 +2535,7 @@ pub async fn start_with(cfg: NodeConfig, rpc_options: RpcOptions, net_options: N
         prune_floor: 0,
         prune_history_secs: cfg.prune_history.map(|d| d.as_secs()),
         reserved_peers: peer_bindings.reserved_count(),
+        msauth_key: msauth_source,
         ..Default::default()
     }));
     let (cmd_tx, cmd_rx) = mpsc::channel(256);

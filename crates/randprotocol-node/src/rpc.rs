@@ -314,6 +314,11 @@ pub struct NodeStatus {
     /// computed once, at startup).
     #[serde(default)]
     pub gas_prices: Option<GasPricesStatus>,
+    /// Where this node's multisig auth verifier key came from (plan Task 2b): `"loaded"` from the
+    /// pinned blob, `"built"` here under `--build-msauth-key`, `"absent"` on a chain without
+    /// `hc_auth_multisig`. A multisig chain never runs without the key: a node that could not
+    /// load it refused to start.
+    pub msauth_key: crate::msauth_key::MsauthKeySource,
 }
 
 /// [`NodeStatus::gas_prices`]'s two amounts, decimal strings like every other RAND amount on the
@@ -9658,5 +9663,20 @@ pub(crate) mod tests {
         let v = ok(&st, "rand_status", json!([])).await;
         assert_eq!(v["prune_floor"], 0, "the status struct is filled by the node loop, absent here");
         assert!(v.get("prune_history_secs").is_some());
+    }
+
+    /// Plan Task 2b: `rand_status.msauth_key` names where the multisig auth verifier key came
+    /// from — `"absent"` by default (no `hc_auth_multisig`), `"loaded"` from the pinned blob,
+    /// `"built"` under `--build-msauth-key`.
+    #[tokio::test]
+    async fn rand_status_reports_the_msauth_key_source() {
+        use crate::msauth_key::MsauthKeySource;
+        let (_dir, st, _gs, _blocks) = pruned_state();
+        assert_eq!(ok(&st, "rand_status", json!([])).await["msauth_key"], "absent");
+        for (source, want) in [(MsauthKeySource::Loaded, "loaded"), (MsauthKeySource::Built, "built"), (MsauthKeySource::Absent, "absent")] {
+            st.status.write().unwrap().msauth_key = source;
+            assert_eq!(ok(&st, "rand_status", json!([])).await["msauth_key"], want);
+            assert_eq!(source.as_str(), want);
+        }
     }
 }
