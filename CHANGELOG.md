@@ -311,6 +311,11 @@ build.
   uploaded to Codecov; the badge in `README.md`.
 - **Research tests reach the vendored copy** (abf5cb23, circuits `5f69747`): 155 new tests,
   sources byte-identical to `5ff7676`.
+- **The binaries under test** (2c669a1d): `rand`, `rand-node` and `rand-prover` driven as an
+  operator runs them, against loopback RPC fakes — about 100 tests (wallet reads, perps, tokens,
+  bridge governance, multisig, staking, vesting, the datadir commands, prover keygen/pair/run);
+  the proof-free prover service, HTTP, hosted-prover and network suites now run in check-and-test
+  and the coverage measurement.
 
 ## v0.7.1 — 2026-10-07 (chain 20, node-only)
 
