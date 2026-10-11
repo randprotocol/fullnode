@@ -68,7 +68,7 @@ jobs:
           # with the nightly.
           cargo llvm-cov --no-report -p randprotocol-prover --release --test http --test service --test pairing --test wire --test retired_flag --test cli
           cargo llvm-cov --no-report -p randprotocol-client --release --test cli_scripts --test cli_rpc --test cli_perp --test cli_token_bridge --test rpc_methods
-          cargo llvm-cov --no-report -p randprotocol-node --release --test prover_hosted --test keygen_cli --test prover_flag --test network
+          cargo llvm-cov --no-report -p randprotocol-node --release --test prover_hosted --test keygen_cli --test prover_flag --test network --test cli_multisig --test cli_staking --test cli_vesting --test cli_datadir
           cargo llvm-cov --no-report -p randprotocol-node --release --test genesis_cli -- --skip aggregation_tree_section
           cargo llvm-cov --no-report -p randprotocol-zkvm --release --test guest_provenance --test verifier_key
           cargo llvm-cov --no-report -p randprotocol-rvm --release --test verifier_key
