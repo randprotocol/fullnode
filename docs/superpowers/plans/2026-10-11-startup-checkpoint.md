@@ -914,8 +914,12 @@ if `node` isn't a public module path, re-export them where `NodeHandle` is re-ex
     structural, not a replay."
   - **`deploy/README.md:424-426` and `AGENTS.md:2136`:** add one sentence each. "The first
     start of a new build still runs the full check (plan the pause for it); a restart of the
-    same build skips it (startup checkpoint, v0.7.2+)." If the next release has a different
-    version, use that version.
+    same build skips it (startup checkpoint, v0.8.0+)."
+  - **`CHANGELOG.md`:** add one bullet to the draft v0.8.0 entry (c31ec75e, under what reaches
+    chain 20 by flag day): "Startup checkpoint: a restart of the same clean build skips the
+    startup chain walk (`verified_head` META row, bound to the build sha); `--verify-chain replay`
+    forces it. The first start of v0.8.0 itself still runs the full check." Another session
+    drafted that entry: add the bullet only, and leave the rest of the entry as it is.
 
 - [ ] **Step 6: Run the full suites once.**
 
