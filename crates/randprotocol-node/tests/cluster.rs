@@ -911,6 +911,7 @@ async fn a_build_whose_bundle_guest_differs_from_genesis_refuses_to_start() {
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
         verify_workers: None,
+        apply_inline: false,
         prune_history: None,
         gas_policy: None,
         msauth: Default::default(),

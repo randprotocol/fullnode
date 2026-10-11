@@ -834,6 +834,11 @@ enum Cmd {
         /// Proof-verification workers (default: the cores minus two, at least four — spec 2026-10-05 §6).
         #[arg(long, value_name = "N")]
         verify_workers: Option<usize>,
+        /// Apply incoming proposals on the consensus loop, as before v0.8.0, instead of on a
+        /// blocking worker (spec 2026-10-11 off-loop apply §4.5): the kill switch. The by-hash
+        /// fetch answer binding is a separate fix and stays on.
+        #[arg(long)]
+        apply_proposals_inline: bool,
         /// Skip the free-memory gate that refuses a prover the machine cannot hold.
         #[arg(long)]
         prover_skip_memory_check: bool,
@@ -2952,6 +2957,7 @@ async fn main() -> Result<()> {
             prover_cpu,
             prover_threads,
             verify_workers,
+            apply_proposals_inline,
             prover_skip_memory_check,
             prover_allow_origin,
             prover_fee,
@@ -3018,6 +3024,7 @@ async fn main() -> Result<()> {
                 keep_raw_proofs,
                 min_free_disk_bytes: min_free_disk_mb << 20,
                 verify_workers,
+                apply_inline: apply_proposals_inline,
                 prune_history,
                 gas_policy: randprotocol_core::gas::GasPolicy::from_prices(gas_price, byte_price),
                 msauth: randprotocol_node::msauth_key::MsauthKeyOptions { path: msauth_vk, build: build_msauth_key },

@@ -33,6 +33,15 @@ carries a node-only wire change (compact blocks) and the consensus rules a new c
   under a digest of all its inputs (16 384 entries, FIFO), so an aggregate admission has seen is
   verified once per node, not three times on the leader and twice on a follower. CLI tools are
   unchanged.
+- **Off-loop proposal apply** (node-only): an incoming proposal's apply runs on a blocking thread
+  (at most 4 at once, up to 8 waiting behind a parent, at most 2 of them per proposer, each past
+  HotStuff's orphan checks) while the prechecks, `on_proposal`'s checks and the insert stay on the
+  loop; sync batches, the leader's own block and orphan re-runs still apply on it. A leader's second
+  block for a view waits behind the first and is refused as an equivocation once the first is in.
+  A view timeout firing during a slow apply only sends a timeout message and re-arms; the vote is
+  lost only if a timeout quorum or a QC moves the view before the apply lands.
+  `rand-node run --apply-proposals-inline` restores the inline apply. Independent of the flag, and
+  always on: a by-hash fetch answer that is not the block asked for is dropped and the next peer asked.
 - **Chain 21 and later, by genesis section:** `fees` (`burn_base`, `burn_floor`,
   `subsidy_net_of_fees`, `proposer_share_bps`, `prove_base`, `usd_subsidy`), `perps` (RPL-3),
   `multisig`, `aggregation_tree`, and the `incremental_nullifier_root` flag (the hot path's

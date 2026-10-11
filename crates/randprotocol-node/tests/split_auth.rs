@@ -113,6 +113,7 @@ async fn a_v3_chain_admits_a_real_auth_proof_and_refuses_a_swapped_one() {
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
         verify_workers: None,
+        apply_inline: false,
         prune_history: None,
         gas_policy: None,
         msauth: Default::default(),

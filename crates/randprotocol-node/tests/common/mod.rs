@@ -155,6 +155,7 @@ pub async fn start_one_validator_shaped(edit: impl FnOnce(&mut Genesis)) -> Test
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
         verify_workers: None,
+        apply_inline: false,
         prune_history: None,
         gas_policy: None,
         msauth: Default::default(),
