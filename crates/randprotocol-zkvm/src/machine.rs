@@ -43,7 +43,7 @@ pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
 #[cfg_attr(not(any(feature = "reference-backend", feature = "cuda", feature = "mock-cuda")), allow(dead_code))]
 pub(crate) const PERM_SEED: u64 = crate::poseidon2_constants::PERM_SEED; // "RandZK"
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FriProfile {
     /// 16 queries, 4 PoW bits — for `cargo test`. 3·16+4 = 52 conjectured bits; not a
     /// production target, only fast enough for the suite.
@@ -1510,8 +1510,10 @@ type KeyShape = (usize, u8, u8, u8, u8, u8, u8);
 type KeySlot = Arc<std::sync::OnceLock<Arc<CommonData<Config>>>>;
 
 struct KeyCache {
-    /// Each shape's slot and the tick of its last use.
-    map: HashMap<KeyShape, (KeySlot, u64)>,
+    /// Each shape's slot, the tick of its last use, and whether it is pinned: a key installed by
+    /// `Machine::install_verifier_key` is never evicted (a consumer that installs a key never
+    /// rebuilds it).
+    map: HashMap<KeyShape, (KeySlot, u64, bool)>,
     tick: u64,
     capacity: usize,
 }
@@ -1522,28 +1524,204 @@ impl KeyCache {
     /// The slot for `key`, marked used now — an existing one (built, or being built by another
     /// caller) or a fresh, empty one, making room first by evicting the least recently used
     /// entries. An evicted slot that is still being built is only dropped from the map: its
-    /// builder holds its own handle and returns the key it builds.
+    /// builder holds its own handle and returns the key it builds. Pinned entries are never
+    /// evicted; when only pinned entries remain, the cache grows past `capacity` instead.
     fn slot(&mut self, key: KeyShape) -> KeySlot {
         self.tick += 1;
         let now = self.tick;
-        if let Some((slot, used)) = self.map.get_mut(&key) {
+        if let Some((slot, used, _)) = self.map.get_mut(&key) {
             *used = now;
             return slot.clone();
         }
         while self.map.len() >= self.capacity {
-            let lru = *self.map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k).expect("capacity > 0");
+            let Some(lru) = self.map.iter().filter(|(_, (_, _, pinned))| !*pinned).min_by_key(|(_, (_, used, _))| *used).map(|(k, _)| *k) else { break };
             self.map.remove(&lru);
         }
         let slot = KeySlot::default();
-        self.map.insert(key, (slot.clone(), now));
+        self.map.insert(key, (slot.clone(), now, false));
         slot
+    }
+    /// Marks `key`'s entry (which must exist) as never evictable.
+    fn pin(&mut self, key: &KeyShape) {
+        if let Some(e) = self.map.get_mut(key) { e.2 = true; }
     }
     /// Whether `key`'s slot is present and built (a lookup, not a use).
     fn is_built(&self, key: &KeyShape) -> bool {
-        self.map.get(key).is_some_and(|(slot, _)| slot.get().is_some())
+        self.map.get(key).is_some_and(|(slot, _, _)| slot.get().is_some())
     }
     /// The number of built keys held.
-    fn built(&self) -> usize { self.map.values().filter(|(slot, _)| slot.get().is_some()).count() }
+    fn built(&self) -> usize { self.map.values().filter(|(slot, _, _)| slot.get().is_some()).count() }
+}
+
+/// The constraint set this crate's AIRs implement: 9 is the MODQ chip (`docs/05-roadmap.md`,
+/// "Constraint set 9: the MODQ chip", after constraint set 8's gas meter). It is stamped into every
+/// [`VerifierKeyBlob`] and checked on install, so a key exported by one constraint set is never
+/// installed by a machine of another (whose `CommonData` for the same shape differs —
+/// `tests/verifier_key.rs` pins those digests). Bump it with every chain-cut re-pin there.
+pub const CONSTRAINT_SET: u32 = 9;
+
+/// The [`VerifierKeyBlob`] wire format's version: the header layout and the `CommonData` mirror
+/// (`CommonDataWire`). Format 1 is the first.
+pub const VERIFIER_KEY_BLOB_FORMAT: u32 = 1;
+
+/// One verifier-key shape: the tier and the six declared table heights the key cache is keyed
+/// on — `(tier, program, input, keccak, sha256, modq, public)`. `mem_log_height` is deliberately
+/// absent (every valid memory height yields the same `CommonData`; `Machine::verifier_key`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifierKeyShape {
+    pub tier: Tier,
+    pub program_log_height: u8,
+    pub input_log_height: u8,
+    pub keccak_log_height: u8,
+    pub sha256_log_height: u8,
+    pub modq_log_height: u8,
+    pub public_log_height: u8,
+}
+impl VerifierKeyShape {
+    /// The shape `Machine::verify` looks the key up under for `proof`.
+    pub fn of_proof(proof: &Proof) -> Self {
+        Self {
+            tier: proof.tier,
+            program_log_height: proof.program_log_height,
+            input_log_height: proof.input_log_height,
+            keccak_log_height: proof.keccak_log_height,
+            sha256_log_height: proof.sha256_log_height,
+            modq_log_height: proof.modq_log_height,
+            public_log_height: proof.public_log_height,
+        }
+    }
+    fn key(&self) -> KeyShape {
+        (self.tier.0, self.program_log_height, self.input_log_height, self.keccak_log_height, self.sha256_log_height, self.modq_log_height, self.public_log_height)
+    }
+}
+
+/// A verifier key for ONE shape, exported after a build so another host can install it without
+/// rebuilding it ([`Machine::export_verifier_key_with_modq`], [`Machine::install_verifier_key`]).
+/// Exists for the fullnode's tier-18 `msauth` key: ~80 s and ~4 GB to build, more than a 4 GB
+/// validator can spare, so it is built once and shipped.
+///
+/// A header — `format_version` ([`VERIFIER_KEY_BLOB_FORMAT`]), the FRI `profile`, the `shape` and
+/// the `constraint_set` ([`CONSTRAINT_SET`]) — and `common`, the postcard bytes of the shape's
+/// `CommonData` (the preprocessed commitment, each instance's preprocessed placement and every
+/// instance's packed lookups). The whole blob is postcard ([`Self::to_bytes`]).
+///
+/// **Trust: the blob is a trust root.** `install_verifier_key` checks the header, the structure of
+/// `common` (instance count, preprocessed widths and degree bits, the matrix map) and the packed
+/// lookups — recomputed from this machine's chips, cheaply, with no trace or commitment — so after
+/// those checks the only unchecked part is the preprocessed **commitment**, which cannot be checked
+/// without the build the blob exists to avoid. A crafted commitment is not merely a key that makes
+/// honest proofs fail: it fixes the "preprocessed" columns (range, nibble, round constants, periodic
+/// tables) to whatever its author committed, and a prover who knows those columns can make FORGED
+/// proofs verify. The consumer must therefore pin the SHA-256 of the whole `to_bytes()` out of band
+/// and check it on the raw bytes *before* decoding anything — [`Machine::install_verifier_key_pinned`]
+/// does exactly that (the decoded lookups are recursive symbolic expressions of unbounded depth, so
+/// unpinned bytes should never reach the decoder). `verify`'s own declared-height and degree-bit
+/// checks still run on every proof, so a key is only ever used for the shape in its header.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifierKeyBlob {
+    pub format_version: u32,
+    pub profile: FriProfile,
+    pub shape: VerifierKeyShape,
+    pub constraint_set: u32,
+    /// postcard(`CommonDataWire`) — the shape's `CommonData`.
+    pub common: Vec<u8>,
+}
+impl VerifierKeyBlob {
+    pub fn to_bytes(&self) -> Vec<u8> { postcard::to_allocvec(self).expect("a key blob serialises") }
+    /// Decodes a whole blob; trailing bytes are refused, so one blob has one encoding.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, InstallKeyError> {
+        let (blob, rest) = postcard::take_from_bytes::<Self>(bytes).map_err(|e| InstallKeyError::Decode(e.to_string()))?;
+        if !rest.is_empty() { return Err(InstallKeyError::Decode(format!("{} trailing bytes", rest.len()))); }
+        Ok(blob)
+    }
+}
+
+/// Why [`Machine::install_verifier_key`] refused a blob. Nothing is installed on any error.
+#[derive(Debug, PartialEq)]
+pub enum InstallKeyError {
+    /// `format_version` is not [`VERIFIER_KEY_BLOB_FORMAT`].
+    Format { blob: u32, machine: u32 },
+    /// The blob was exported under another FRI profile than this machine's.
+    Profile { blob: FriProfile, machine: FriProfile },
+    /// `constraint_set` is not [`CONSTRAINT_SET`].
+    ConstraintSet { blob: u32, machine: u32 },
+    /// The header's shape fails `check_declared_heights_with_modq` (at the tier's memory floor).
+    Shape(VerifyError),
+    /// The blob (or its `common` bytes) does not decode, or decodes with trailing bytes.
+    Decode(String),
+    /// `common` decodes but disagrees with this machine's chips for `shape` (instance count,
+    /// a preprocessed width or degree bits, the matrix map).
+    Structure(String),
+    /// The slot for `shape` already holds a *different* key; it is never replaced.
+    SlotFilled,
+    /// `install_verifier_key_pinned`: the raw bytes' SHA-256 is not the expected pin.
+    Pin { got: [u8; 32] },
+}
+
+/// The serialisable mirror of `CommonData<Config>` (Plonky3's own type derives no serde; its
+/// fields are public and each part is serialisable). Field for field, in `CommonData`'s order.
+#[derive(Serialize, Deserialize)]
+struct CommonDataWire {
+    preprocessed: Option<PreprocessedWire>,
+    lookups: Vec<p3_lookup::Lookups<Val>>,
+}
+#[derive(Serialize, Deserialize)]
+struct PreprocessedWire {
+    commitment: p3_batch_stark::config::Commitment<Config>,
+    /// `(matrix_index, width, degree_bits)` per instance, `None` for no preprocessed columns.
+    instances: Vec<Option<(u64, u64, u64)>>,
+    matrix_to_instance: Vec<u64>,
+}
+fn common_to_bytes(c: &CommonData<Config>) -> Vec<u8> {
+    let wire = CommonDataWire {
+        preprocessed: c.preprocessed.as_ref().map(|p| PreprocessedWire {
+            commitment: p.commitment.clone(),
+            instances: p.instances.iter().map(|m| m.as_ref().map(|m| (m.matrix_index as u64, m.width as u64, m.degree_bits as u64))).collect(),
+            matrix_to_instance: p.matrix_to_instance.iter().map(|&i| i as u64).collect(),
+        }),
+        lookups: c.lookups.clone(),
+    };
+    postcard::to_allocvec(&wire).expect("CommonData serialises")
+}
+/// Each instance's packed lookups, exactly as `ProverData::from_airs_and_degrees` derives them
+/// (p3-batch-stark 0.7.0 `common.rs`, the lookups loop with every budget override `0`):
+/// `Lookups::from_air` → `get_log_num_quotient_chunks` → `pack_same_bus` at the free budget.
+/// Symbolic only — no trace, no commitment. `install_verifier_key` checks a blob's against it;
+/// `tests/key_blob.rs` checks it against a real build.
+fn lookups_for_airs_and_degrees(airs: &[Chip], trace_ext_degree_bits: &[usize], is_zk: usize) -> Vec<p3_lookup::Lookups<Val>> {
+    use p3_lookup::{LogUpGadget, Lookups};
+    let gadget = LogUpGadget::new();
+    airs.iter()
+        .zip(trace_ext_degree_bits)
+        .map(|(air, &ext_db)| {
+            let trace_len = 1usize << (ext_db - is_zk);
+            let unpacked = Lookups::<Val>::from_air::<Challenge, Chip>(air);
+            let log_chunks = p3_batch_stark::symbolic::get_log_num_quotient_chunks::<Val, Challenge, Chip, LogUpGadget>(
+                air,
+                p3_air::symbolic::AirLayout::from_air(air),
+                trace_len,
+                &unpacked,
+                is_zk,
+                &gadget,
+            );
+            let free_budget = (1usize << log_chunks) + 1 - is_zk;
+            unpacked.pack_same_bus(&gadget, free_budget)
+        })
+        .collect()
+}
+fn common_from_bytes(bytes: &[u8]) -> Result<CommonData<Config>, InstallKeyError> {
+    let (wire, rest) = postcard::take_from_bytes::<CommonDataWire>(bytes).map_err(|e| InstallKeyError::Decode(format!("common: {e}")))?;
+    if !rest.is_empty() { return Err(InstallKeyError::Decode(format!("common: {} trailing bytes", rest.len()))); }
+    let us = |x: u64| usize::try_from(x).map_err(|_| InstallKeyError::Decode("common: index overflows usize".into()));
+    let preprocessed = match wire.preprocessed {
+        None => None,
+        Some(p) => Some(p3_batch_stark::common::GlobalPreprocessed {
+            commitment: p.commitment,
+            instances: p.instances.into_iter().map(|m| m.map(|(a, b, c)| Ok::<_, InstallKeyError>(p3_batch_stark::common::PreprocessedInstanceMeta { matrix_index: us(a)?, width: us(b)?, degree_bits: us(c)? })).transpose()).collect::<Result<_, _>>()?,
+            matrix_to_instance: p.matrix_to_instance.into_iter().map(us).collect::<Result<_, _>>()?,
+        }),
+    };
+    Ok(CommonData { preprocessed, lookups: wire.lookups })
 }
 
 pub struct Machine { pub config: Config, pub profile: FriProfile, keys: Mutex<KeyCache>, key_builds: std::sync::atomic::AtomicUsize }
@@ -1701,6 +1879,86 @@ impl Machine {
     /// sha256_log_height, modq_log_height, public_log_height)` verifier keys
     /// currently cached.
     pub fn cached_keys(&self) -> usize { self.keys.lock().unwrap().built() }
+
+    /// The verifier key for one shape, as a [`VerifierKeyBlob`] another host can
+    /// [`install`](Self::install_verifier_key) without building it. Builds the key (or takes it
+    /// from the cache) exactly as [`Self::verifier_key_with_modq`] does; the arguments are its.
+    #[allow(clippy::too_many_arguments)]
+    pub fn export_verifier_key_with_modq(&self, tier: Tier, program_log_height: u8, input_log_height: u8, keccak_log_height: u8, sha256_log_height: u8, modq_log_height: u8, public_log_height: u8) -> VerifierKeyBlob {
+        let common = self.verifier_key_with_modq(tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height);
+        VerifierKeyBlob {
+            format_version: VERIFIER_KEY_BLOB_FORMAT,
+            profile: self.profile,
+            shape: VerifierKeyShape { tier, program_log_height, input_log_height, keccak_log_height, sha256_log_height, modq_log_height, public_log_height },
+            constraint_set: CONSTRAINT_SET,
+            common: common_to_bytes(&common),
+        }
+    }
+
+    /// Installs `blob`'s key into the cache slot for `blob.shape` without building it, so
+    /// `verify`/`verify_public` of a proof of that shape use it (and `key_builds` does not move).
+    /// Refuses a blob of another format, profile or constraint set, a shape `verify` would refuse,
+    /// `common` bytes that do not decode or whose structure disagrees with this machine's chips for
+    /// the shape, and — never replacing a key — a slot already holding a different one
+    /// (`SlotFilled`); re-installing the identical key is a no-op. The slot is an ordinary cache
+    /// entry: LRU eviction applies to it, after which the shape is rebuilt on its next use.
+    /// See [`VerifierKeyBlob`] for what the caller must pin.
+    pub fn install_verifier_key(&self, blob: &VerifierKeyBlob) -> Result<(), InstallKeyError> {
+        if blob.format_version != VERIFIER_KEY_BLOB_FORMAT { return Err(InstallKeyError::Format { blob: blob.format_version, machine: VERIFIER_KEY_BLOB_FORMAT }); }
+        if blob.profile != self.profile { return Err(InstallKeyError::Profile { blob: blob.profile, machine: self.profile }); }
+        if blob.constraint_set != CONSTRAINT_SET { return Err(InstallKeyError::ConstraintSet { blob: blob.constraint_set, machine: CONSTRAINT_SET }); }
+        let s = blob.shape;
+        // The shape is untrusted the way a proof header is: range-check it before it sizes
+        // anything (`Tier` in `TIERS` first of all), at the tier's own memory floor.
+        check_declared_heights_with_modq(s.tier, s.program_log_height, s.input_log_height, s.keccak_log_height, s.sha256_log_height, s.modq_log_height, s.public_log_height, s.tier.min_mem_log_height()).map_err(InstallKeyError::Shape)?;
+        let common = common_from_bytes(&blob.common)?;
+        // Structure: what this machine's chips and degree bits say for the shape — cheap, no trace.
+        let chips = chips_with_modq(s.tier, s.keccak_log_height, s.sha256_log_height, s.modq_log_height);
+        let degrees = self.log_ext_degrees_with_modq(s.tier, s.program_log_height, s.input_log_height, s.keccak_log_height, s.sha256_log_height, s.modq_log_height, s.public_log_height, s.tier.min_mem_log_height());
+        let bad = |m: String| Err(InstallKeyError::Structure(m));
+        if common.lookups.len() != chips.len() { return bad(format!("{} lookups for {} instances", common.lookups.len(), chips.len())); }
+        let Some(pre) = common.preprocessed.as_ref() else { return bad("no preprocessed commitment".into()) };
+        if pre.instances.len() != chips.len() { return bad(format!("{} preprocessed entries for {} instances", pre.instances.len(), chips.len())); }
+        let mut next = 0usize;
+        for (i, (chip, meta)) in chips.iter().zip(&pre.instances).enumerate() {
+            let width = <Chip as BaseAir<Val>>::preprocessed_width(chip);
+            match meta {
+                None if width == 0 => {}
+                Some(m) if width != 0 && m.width == width && m.degree_bits == degrees[i] && m.matrix_index == next && pre.matrix_to_instance.get(next) == Some(&i) => next += 1,
+                _ => return bad(format!("instance {i}: preprocessed placement disagrees with the chip")),
+            }
+        }
+        if pre.matrix_to_instance.len() != next { return bad("matrix_to_instance length".into()); }
+        // The packed lookups are derivable without a trace or a commitment: recompute them and
+        // require the blob's to be byte-identical, so the commitment is the only trusted part.
+        let want = lookups_for_airs_and_degrees(&chips, &degrees, self.config.is_zk());
+        for (i, (got, want)) in common.lookups.iter().zip(&want).enumerate() {
+            if postcard::to_allocvec(got).expect("lookups serialise") != postcard::to_allocvec(want).expect("lookups serialise") {
+                return bad(format!("instance {i}: packed lookups disagree with the chip"));
+            }
+        }
+        let key = s.key();
+        let slot = self.keys.lock().unwrap().slot(key);
+        let result = match slot.set(Arc::new(common)) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let held = slot.get().expect("set failed, so the slot is filled");
+                if common_to_bytes(held) == blob.common { Ok(()) } else { Err(InstallKeyError::SlotFilled) }
+            }
+        };
+        if result.is_ok() { self.keys.lock().unwrap().pin(&key); }
+        result
+    }
+
+    /// [`Self::install_verifier_key`] from raw blob bytes, refusing them unless their SHA-256
+    /// (`crate::sha256::sha256` over the whole `VerifierKeyBlob::to_bytes()`) is `expected` —
+    /// checked BEFORE the bytes are decoded, so unpinned input never reaches the decoder. This is
+    /// the entry a consumer should use (`VerifierKeyBlob`'s trust paragraph).
+    pub fn install_verifier_key_pinned(&self, bytes: &[u8], expected: &[u8; 32]) -> Result<(), InstallKeyError> {
+        let got = crate::sha256::sha256(bytes);
+        if &got != expected { return Err(InstallKeyError::Pin { got }); }
+        self.install_verifier_key(&VerifierKeyBlob::from_bytes(bytes)?)
+    }
 
     /// Draws a fresh per-proof salt from OS entropy and delegates to [`Self::prove_salted`] —
     /// see that method's doc comment (controller ruling: H_IN, `pv::IN0..7`, must be salted or
@@ -2033,6 +2291,28 @@ pub fn max_constraint_degrees_with_modq(tier: Tier, program_log_height: u8, inpu
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod key_cache_tests {
+    use super::*;
+
+    /// Installed (pinned) entries survive any amount of churn past capacity; unpinned ones go LRU.
+    #[test]
+    fn a_pinned_entry_is_never_evicted() {
+        let mut c = KeyCache { capacity: 4, ..KeyCache::default() };
+        let k = |i: u8| (10usize, i, 7, 0, 0, 0, 7);
+        c.slot(k(0));
+        c.pin(&k(0));
+        for i in 1..100 { c.slot(k(i)); }
+        assert!(c.map.contains_key(&k(0)), "the pinned entry survived 99 other shapes");
+        assert_eq!(c.map.len(), 4);
+        assert!(c.map.contains_key(&k(99)) && !c.map.contains_key(&k(1)), "unpinned entries still go LRU");
+        // All pinned: the cache grows past capacity rather than evict one.
+        for i in 96..100 { c.pin(&k(i)); }
+        c.slot(k(200));
+        assert_eq!(c.map.len(), 5);
+    }
 }
 
 #[cfg(test)]

@@ -489,7 +489,7 @@ fn the_docs_name_the_chip_where_the_isa_and_tables_are_documented() {
     assert!(tables.contains("`MODQ_WIRE`"), "the bus catalogue");
     let row8 = isa.lines().find(|l| l.starts_with("| 8 | `MODQ base a1`")).unwrap();
     assert!(row8.contains("| 168 |"), "row 8 carries MODQ_GAS");
-    assert!(roadmap.contains("## Constraint set: the MODQ chip"), "05-roadmap.md MODQ section");
+    assert!(roadmap.contains("## Constraint set 9: the MODQ chip"), "05-roadmap.md MODQ section");
     assert_eq!(randprotocol_zkvm::tables::modq::col::WIDTH, 59);
     assert_eq!(randprotocol_zkvm::tables::cpu::col::WIDTH, 283);
 }

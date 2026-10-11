@@ -70,7 +70,7 @@ env:
   # 56b7061 is circuits branch feat/scan-compact: main c83b1c7 (tree aggregation, 4a244b6) plus
   # viewing.rs's ScanKey and EnvelopeHead; recursion/ is 4a244b6's. The rand-zkvm-cuda revs stay
   # at the pushed 71e1a04, where rand-zkvm-cuda/ is identical to this commit's.
-  CIRCUITS_PIN: c55cfa19350f9a3724818d113d60ade008dc8adf
+  CIRCUITS_PIN: d217252afde318b2ff51976351f449a685b5832f
 
 jobs:
   check-and-test:
