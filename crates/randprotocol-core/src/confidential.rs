@@ -7,6 +7,14 @@ use crate::notes::{word8_from_bytes, word8_to_bytes, BundleDigestInput, Word8};
 use crate::program::{CallOutcome, ProgramRecord};
 use crate::types::{Transaction, TX_BINDING_WORDS};
 
+/// Which auth guest an auth proof's pinned header names (private multisig phase 4): the
+/// single-key auth guest (genesis `hc_auth`) or the multisig one (`hc_auth_multisig`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthShape {
+    SingleKey,
+    Multisig,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
 pub enum ConfidentialError {
     #[error("program word {index} does not decode: {reason}")]

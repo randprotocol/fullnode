@@ -174,3 +174,16 @@ fn the_auth_domain_tag_is_node_local() {
     assert_eq!(auth_commit(&nk, &salt), notes::hash(AUTH_DOMAIN, &msg));
     assert_ne!(auth_commit(&nk, &salt), notes::hash(HIDDEN_BUNDLE_DOMAIN, &msg));
 }
+
+/// msauth's tags (66–69) are node-local like AUTH (65) and the hidden bundle's (64), and collide
+/// with no tag this crate has.
+#[test]
+fn the_msauth_domain_tags_are_node_local_and_distinct() {
+    use randprotocol_zkvm::msauth::{MS_LEAF, MS_NODE, MS_POLICY, NK_MS};
+    let ours = [HIDDEN_BUNDLE_DOMAIN, AUTH_DOMAIN, MS_LEAF, MS_NODE, MS_POLICY, NK_MS];
+    assert_eq!(ours[2..], [66, 67, 68, 69]);
+    for (i, a) in ours.iter().enumerate() {
+        assert!(!(1..=0x3f).contains(a) && *a != notes::domain::TEST, "{a}");
+        assert!(ours[i + 1..].iter().all(|b| b != a), "{a} repeats");
+    }
+}

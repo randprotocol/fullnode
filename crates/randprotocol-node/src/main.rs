@@ -3653,6 +3653,20 @@ fn tree_cover_count(available: usize, tree: &randprotocol_core::ledger::aggregat
         .find(|n| *n <= available && *n > 0)
 }
 
+/// The aggregator's cover assembly: each work row's raw bundle proof decoded, and refused if it
+/// declares a modq table (constraint set 9, circuits Task 9b: the recursion verifier is chip-free,
+/// `agg_executor::check_inner_chip_free`) — before any rVM work, flat or tree.
+fn decode_inner_proofs(raw_proofs: &[Vec<u8>]) -> Result<Vec<randprotocol_zkvm::machine::Proof>> {
+    raw_proofs
+        .iter()
+        .map(|b| {
+            let p = postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(b).map_err(|_| anyhow::anyhow!("a work row's proof does not decode"))?;
+            randprotocol_node::agg_executor::check_inner_chip_free(&p).map_err(|e| anyhow::anyhow!("a work row's proof: {e}"))?;
+            Ok(p)
+        })
+        .collect()
+}
+
 /// The tree's root over the raw bundle proofs (`--layout tree`): the section's leaf and per-level
 /// step shapes rebuilt from its pinned heights (`TreeShapes::build`, what admission rebuilds), then
 /// `aggregate_tree` on this one machine — `2^d` `rv32n` leaves of `L` proofs, then `d` levels of
@@ -3666,10 +3680,7 @@ fn prove_tree_aggregate(
     tree: &randprotocol_core::ledger::aggregation::TreeConfig,
 ) -> Result<Vec<u8>> {
     use randprotocol_node::agg_executor::rvm_heights;
-    let proofs = raw_proofs
-        .iter()
-        .map(|b| postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(b).map_err(|_| anyhow::anyhow!("a work row's proof does not decode")))
-        .collect::<Result<Vec<_>>>()?;
+    let proofs = decode_inner_proofs(raw_proofs)?;
     let first = proofs.first().context("nothing to aggregate")?;
     let shape = randprotocol_rvm::shape::InnerShape::of(
         profile,
@@ -3699,10 +3710,7 @@ fn prove_tree_aggregate(
 /// only expensive step (~26 min at the test profile), a function of its own so the pass around
 /// it can be driven without the rVM.
 fn prove_aggregate(profile: FriProfile, raw_proofs: &[Vec<u8>], binding: &[u32; 8]) -> Result<Vec<u8>> {
-    let proofs = raw_proofs
-        .iter()
-        .map(|b| postcard::from_bytes::<randprotocol_zkvm::machine::Proof>(b).map_err(|_| anyhow::anyhow!("a work row's proof does not decode")))
-        .collect::<Result<Vec<_>>>()?;
+    let proofs = decode_inner_proofs(raw_proofs)?;
     // The shape is the first proof's; every proof in the set must share it (the chain's
     // admission checks it again).
     let first = proofs.first().context("nothing to aggregate")?;
@@ -5563,6 +5571,24 @@ mod tests {
                 TreeStepPin { heights: h(17), program_digest: d.steps[1].0, key: d.steps[1].1 },
             ],
         }
+    }
+
+    /// Constraint set 9 / circuits Task 9b: the aggregator's cover assembly refuses a work row
+    /// whose bundle proof declares a modq table, before any rVM work (`prove_aggregate` and
+    /// `prove_tree_aggregate` both decode through `decode_inner_proofs`), and still decodes a
+    /// chip-free one.
+    #[test]
+    fn the_aggregators_cover_assembly_refuses_a_modq_bearing_inner_proof() {
+        use randprotocol_zkvm::machine::{Machine, ProveOptions, Tier};
+        let program = randprotocol_zkvm::executor::fixtures::one_modq_ntt_program();
+        let (modq, _) = Machine::new(FriProfile::Test).prove_with_options(&program, &[], &[], Some(Tier(10)), ProveOptions::default()).unwrap();
+        assert_eq!(modq.modq_log_height, 10);
+        let err = decode_inner_proofs(&[modq.to_bytes()]).err().expect("refused").to_string();
+        assert!(err.contains(randprotocol_node::agg_executor::INNER_MODQ_REFUSAL), "{err}");
+        let err = prove_aggregate(FriProfile::Test, &[modq.to_bytes()], &[0; 8]).unwrap_err().to_string();
+        assert!(err.contains(randprotocol_node::agg_executor::INNER_MODQ_REFUSAL), "flat: {err}");
+        let (plain, _) = Machine::new(FriProfile::Test).prove(&randprotocol_zkvm::guests::fib(10), &[], &[], None).unwrap();
+        assert_eq!(decode_inner_proofs(&[plain.to_bytes()]).unwrap().len(), 1);
     }
 
     /// `--layout tree`'s selection (spec §2's layout rule): the largest whole tree, `L·2^d` for

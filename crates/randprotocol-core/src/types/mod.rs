@@ -55,6 +55,14 @@ pub const BUNDLE_PROOF_TIER: u8 = 14;
 /// executor's tests pin mirror == the real constant.
 pub const AUTH_PROOF_TIER: u8 = 10;
 
+/// The one tier a multisig auth proof may declare — `randprotocol_zkvm::executor::MSAUTH_TIER`
+/// (circuits Task 8: the MODQ ruling's tier 18). Mirrored because core cannot name the zkVM.
+pub const MSAUTH_PROOF_TIER: u8 = 18;
+/// The keccak and modq heights every multisig auth proof declares (`msauth::pinned_options()`'s
+/// floors at `M_MAX`), mirrored for `gas::msauth_gas_limit_pin`; the zkvm tests pin mirror == vendored.
+pub const MSAUTH_KECCAK_LOG_HEIGHT: u8 = 14;
+pub const MSAUTH_MODQ_LOG_HEIGHT: u8 = 16;
+
 /// The one public-table height a bundle proof may declare: the transaction binding's
 /// ([`TX_BINDING_WORDS`] words) `public_log_height`, pinned by `decode_and_check` since the
 /// transaction binding (Task 5b). Mirrored like [`BUNDLE_PROOF_TIER`]; the node's

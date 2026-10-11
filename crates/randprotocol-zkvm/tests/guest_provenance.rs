@@ -349,3 +349,18 @@ fn the_modq_re_vendor_moved_no_guest_program() {
     assert_eq!(word8_to_hex(&ZkExecutor::hc_hidden_bundle_v3()), "60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce");
     assert!(!ZkExecutor::known_hc_bundles().contains(&msauth) && msauth != ZkExecutor::hc_auth());
 }
+
+/// The multisig auth guest (`guests::compiled::msauth()`, private multisig phase 4) is the value a
+/// genesis carries as `hc_auth_multisig`. Its digest is that of circuits Task 8's `msauth.bin`
+/// (c55cfa1; the vendored file's sha256 is the manifest's), pinned so a re-vendor that moves it
+/// fails here, not at a chain's first block.
+const MSAUTH_HC: &str = "9705f8e2f1bc8561848b29cb8efd57c37e3e39788fa58a5f03304d8019668247";
+
+#[test]
+fn the_multisig_auth_guest_is_pinned() {
+    assert_eq!(MSAUTH_HC.len(), 64, "write circuits Task 8's msauth hc into MSAUTH_HC (Task 2 Step 3)");
+    assert_eq!(word8_to_hex(&ZkExecutor::hc_auth_multisig()), MSAUTH_HC);
+    assert_eq!(randprotocol_zkvm::executor::MSAUTH_TIER, 18, "the MODQ ruling: tier 18 only");
+    assert_ne!(ZkExecutor::hc_auth_multisig(), ZkExecutor::hc_auth());
+    assert!(!ZkExecutor::known_hc_bundles().contains(&ZkExecutor::hc_auth_multisig()));
+}

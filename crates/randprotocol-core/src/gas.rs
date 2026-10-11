@@ -205,6 +205,13 @@ pub fn auth_gas_limit_pin() -> u64 {
     gas_max(crate::types::AUTH_PROOF_TIER, 0, 0)
 }
 
+/// The `GAS_LIMIT` every multisig auth proof must declare on a chain with a `gas` section: its
+/// pinned header's ceiling `gas_max_with_modq(18, 14, 0, 16)` = 436 159 (R-gas: a function of
+/// public header words only, the same for every M).
+pub fn msauth_gas_limit_pin() -> u64 {
+    gas_max_with_modq(crate::types::MSAUTH_PROOF_TIER, crate::types::MSAUTH_KECCAK_LOG_HEIGHT, 0, crate::types::MSAUTH_MODQ_LOG_HEIGHT)
+}
+
 /// A node's gas prices (spec §4.1, Phase 0): admission policy, not a ledger rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GasPolicy {

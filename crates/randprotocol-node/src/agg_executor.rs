@@ -291,6 +291,52 @@ impl AggExecutor {
     }
 }
 
+/// The refusal every aggregate/tree path gives an inner proof that declares a modq table
+/// (constraint set 9, circuits Task 9b): the vendored recursion verifier (`recursion/src`, the
+/// aggregate program) does not know the MODQ chip, so it can verify only chip-free inner proofs.
+pub const INNER_MODQ_REFUSAL: &str = "an inner proof declares a modq table; the aggregation verifier is chip-free";
+
+/// Whether a zkVM proof may be an aggregate's or a tree's inner proof: `modq_log_height == 0`
+/// (`NO_MODQ`), else [`INNER_MODQ_REFUSAL`] as `InvalidAggregateProof`, before anything reaches
+/// the rVM. Every place an inner proof's header is decoded runs it — [`covered_bundle_of`] (the
+/// covered records `verify_aggregate` and `verify_tree`, its bottom-up recompute included, are
+/// handed: `Storage::covered_record`, the pruning pass) and the aggregator's own cover assembly
+/// (`rand-node aggregate`'s `decode_inner_proofs`). `DeclaredShape` has no modq field, so a
+/// covered record cannot carry the declaration past this point. Auth proofs (msauth included)
+/// are never aggregated, so a multisig spend never meets it; and a bundle declaring a modq table
+/// is refused at admission by the zkVM's exact pin, so on an honest chain no stored bundle can.
+pub fn check_inner_chip_free(proof: &randprotocol_zkvm::machine::Proof) -> Result<(), ConfidentialError> {
+    if proof.modq_log_height != 0 {
+        return Err(ConfidentialError::InvalidAggregateProof(INNER_MODQ_REFUSAL.into()));
+    }
+    Ok(())
+}
+
+/// The covered-bundle record of an inner proof (spec §6.2): its `pv::NUM` public values and its
+/// declared shape, read off the header — after [`check_inner_chip_free`]. `MalformedProof` for a
+/// public-value vector of another length.
+pub fn covered_bundle_of(
+    proof: &randprotocol_zkvm::machine::Proof,
+    profile: randprotocol_core::types::FriProfile,
+) -> Result<CoveredBundle, ConfidentialError> {
+    check_inner_chip_free(proof)?;
+    let public_values: [u64; randprotocol_core::types::pv::NUM] =
+        proof.public_values.clone().try_into().map_err(|_| ConfidentialError::MalformedProof)?;
+    Ok(CoveredBundle {
+        public_values,
+        shape: DeclaredShape {
+            profile,
+            tier: proof.tier.0 as u8,
+            program_log_height: proof.program_log_height,
+            input_log_height: proof.input_log_height,
+            keccak_log_height: proof.keccak_log_height,
+            sha256_log_height: proof.sha256_log_height,
+            public_log_height: proof.public_log_height,
+            mem_log_height: proof.mem_log_height,
+        },
+    })
+}
+
 /// The rVM's `InnerShape` for a declared shape, through the fallible `try_of`.
 fn inner_shape(shape: &DeclaredShape) -> Result<InnerShape, ConfidentialError> {
     InnerShape::try_of(
@@ -481,6 +527,11 @@ impl ConfidentialExecutor for AggExecutor {
     fn decode_call(&self, record: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
         use randprotocol_zkvm::tables::cpu::pv;
         let proof = randprotocol_zkvm::executor::decode_canonical(proof)?;
+        // Constraint set 9: `check_decoded`'s call refusal, mirrored — a modq table is the
+        // multisig auth guest's alone, and no deployed program issues `SYS_MODQ`.
+        if proof.modq_log_height != 0 {
+            return Err(ConfidentialError::InvalidProof("a call proof declares no modq table".into()));
+        }
         randprotocol_zkvm::machine::check_declared_heights(
             proof.tier,
             proof.program_log_height,
@@ -889,6 +940,23 @@ pub(crate) fn fixture_proof(k: usize) -> randprotocol_zkvm::machine::Proof {
     postcard::from_bytes(&bytes[32..]).expect("a fixture proof decodes")
 }
 
+/// A tier-10 Test-profile zkVM proof carrying one modq block (`modq_log_height = 10`): the
+/// zkVM's `executor::fixtures::one_modq_ntt_program`, proved once per process (~8 s). The
+/// aggregate-path refusal tests feed it where an inner proof's header is decoded.
+#[cfg(test)]
+pub(crate) fn modq_fixture_proof_bytes() -> &'static [u8] {
+    static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    BYTES.get_or_init(|| {
+        use randprotocol_zkvm::machine::{Machine, ProveOptions, Tier};
+        let program = randprotocol_zkvm::executor::fixtures::one_modq_ntt_program();
+        let (proof, _) = Machine::new(FriProfile::Test)
+            .prove_with_options(&program, &[], &[], Some(Tier(10)), ProveOptions::default())
+            .expect("the one-NTT fixture proves at tier 10");
+        assert_eq!(proof.modq_log_height, 10, "one modq block");
+        proof.to_bytes()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1150,6 +1218,41 @@ mod tests {
         assert_eq!(w.bundle_gas_limit(b"junk"), zk.bundle_gas_limit(b"junk"));
         assert_eq!(w.auth_gas_limit(b"junk"), zk.auth_gas_limit(b"junk"));
         assert!(w.auth_gas_limit(b"junk").is_err(), "not the trait default");
+    }
+
+    /// Constraint set 9: the `decode_call` mirror refuses what `check_decoded` refuses for a call,
+    /// by the same message, on an honest tier-10 one-modq-block proof — and builds nothing.
+    #[test]
+    fn decode_call_refuses_a_modq_bearing_call_proof_like_verify_call() {
+        let w = AggExecutor::new(FriProfile::Test);
+        let zk = ZkExecutor::new(FriProfile::Test);
+        let bytes = modq_fixture_proof_bytes();
+        let program = randprotocol_zkvm::executor::fixtures::one_modq_ntt_program();
+        let code_hash = program.digest().iter().flat_map(|w| w.to_le_bytes()).collect();
+        let record = ProgramRecord { id: randprotocol_core::Hash::digest(b"modq"), base_pc: 0, words: program.words.clone(), code_hash, deployed_at: 0, public_digest: None, public_len: 0 };
+        let want = ConfidentialError::InvalidProof("a call proof declares no modq table".into());
+        assert_eq!(w.decode_call(&record, bytes).unwrap_err(), want);
+        assert_eq!(zk.verify_call(&record, bytes).unwrap_err(), want, "the zkVM's own verdict, by the same words");
+        assert_eq!(zk.cached_keys(), 0, "refused before any key");
+        assert_eq!(w.program_builds() + w.tree_builds(), 0);
+    }
+
+    /// Constraint set 9 / circuits Task 9b: an inner proof declaring a modq table never becomes a
+    /// covered record, so it never reaches `verify_aggregate`, `verify_tree` or the tree's
+    /// bottom-up recompute (each takes `CoveredBundle`s, whose `DeclaredShape` has no modq field:
+    /// the refusal is where the header is read). A chip-free fixture still assembles, field for
+    /// field what `storage::raw_proof_facts` always read.
+    #[test]
+    fn an_inner_proof_declaring_a_modq_table_never_becomes_a_covered_record() {
+        let ex = AggExecutor::new(FriProfile::Test);
+        let p = randprotocol_zkvm::executor::decode_canonical(modq_fixture_proof_bytes()).unwrap();
+        let refusal = ConfidentialError::InvalidAggregateProof(INNER_MODQ_REFUSAL.into());
+        assert_eq!(check_inner_chip_free(&p), Err(refusal.clone()));
+        assert_eq!(covered_bundle_of(&p, CoreProfile::Test).unwrap_err(), refusal);
+        let honest = fixture_proof(0);
+        assert_eq!(check_inner_chip_free(&honest), Ok(()));
+        assert_eq!(covered_bundle_of(&honest, CoreProfile::Test), Ok(covered(0).1));
+        assert_eq!(ex.program_builds() + ex.tree_builds(), 0, "nothing reached the rVM");
     }
 
     /// Every remaining forwarder answers exactly what the bare zkVM executor answers on the same
