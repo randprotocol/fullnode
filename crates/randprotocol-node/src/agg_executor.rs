@@ -1145,6 +1145,93 @@ mod tests {
         assert!(w.auth_gas_limit(b"junk").is_err(), "not the trait default");
     }
 
+    /// Every remaining forwarder answers exactly what the bare zkVM executor answers on the same
+    /// inputs — hashes, digests, program checks, the plain (non-hardened) call path, and the
+    /// bundle/auth verifications. A wrapper method left at the trait default would differ here
+    /// (the defaults answer `None`/"unsupported"), and `decode_call`, which re-implements the
+    /// zkVM's pre-verify half, is held to the same answers on junk and on a real (bundle) proof
+    /// whose header is not a call's.
+    #[test]
+    fn the_remaining_forwarders_and_decode_call_agree_with_the_bare_zkvm_executor() {
+        let w = AggExecutor::new(FriProfile::Test);
+        let zk = ZkExecutor::new(FriProfile::Test);
+        // Program admission.
+        assert_eq!(w.check_program(0, &[0x13; 4]), zk.check_program(0, &[0x13; 4]));
+        assert_eq!(w.check_program(2, &[0x13; 4]), zk.check_program(2, &[0x13; 4]));
+        assert!(w.check_program(2, &[0x13; 4]).is_err(), "an unaligned base is refused through the wrapper");
+        // Hashes.
+        assert_eq!(w.public_digest(&[1, 2, 3]), zk.public_digest(&[1, 2, 3]));
+        assert_eq!(w.hash_domain(7, &[1, 2, 3]), zk.hash_domain(7, &[1, 2, 3]));
+        assert_ne!(w.hash_domain(7, &[1, 2, 3]), w.hash_domain(8, &[1, 2, 3]), "the domain separates");
+        let input = randprotocol_core::notes::BundleDigestInput {
+            anchor: [1; 8],
+            nullifiers: [[2; 8], [3; 8], [4; 8], [5; 8]],
+            commitments: [[6; 8], [7; 8], [8; 8], [9; 8]],
+            fee: 11,
+            burn_a: 12,
+            burn_r: 13,
+            burn_asset: 14,
+            time: 15,
+            auth_commit: [16; 8],
+        };
+        assert_eq!(w.bundle_digest(&input), zk.bundle_digest(&input));
+        assert_eq!(w.bundle_digest_v3(&input), zk.bundle_digest_v3(&input));
+        assert_ne!(w.bundle_digest(&input), w.bundle_digest_v3(&input), "v3 binds the auth commitment");
+        // Proof digests and verifications, on bytes that are not proofs.
+        let hc = [3u32; 8];
+        let binding = [0u32; randprotocol_core::types::TX_BINDING_WORDS];
+        for junk in [&b""[..], b"junk", &[0xff; 64]] {
+            assert_eq!(w.bundle_proof_digest(&hc, junk), zk.bundle_proof_digest(&hc, junk));
+            assert_eq!(w.auth_proof_digest(junk), zk.auth_proof_digest(junk));
+            assert_eq!(w.verify_auth(&hc, junk, &binding), zk.verify_auth(&hc, junk, &binding));
+            assert_eq!(w.verify_bundle(&hc, junk, &binding), zk.verify_bundle(&hc, junk, &binding));
+            assert_eq!(w.non_canonical_proof(junk), zk.non_canonical_proof(junk));
+        }
+        assert_eq!(w.verify_bundle(&hc, b"junk", &binding), Err(ConfidentialError::MalformedProof));
+        // The plain call path: `verify_call` is the zkVM's; `decode_call` is a mirror of its
+        // pre-verify half and must refuse what it refuses.
+        let record = ProgramRecord { id: randprotocol_core::Hash::digest(b"p"), base_pc: 0, words: vec![0x13; 4], code_hash: vec![0; 32], deployed_at: 0, public_digest: None, public_len: 0 };
+        for junk in [&b""[..], b"junk"] {
+            assert_eq!(w.verify_call(&record, junk), zk.verify_call(&record, junk));
+            assert_eq!(w.decode_call(&record, junk), Err(ConfidentialError::MalformedProof));
+        }
+        // Non-canonical encodings of a real proof (trailing bytes) are malformed, not decoded.
+        let real = fixture_proof(0).to_bytes();
+        let mut padded = real.clone();
+        padded.push(0);
+        assert_eq!(w.decode_call(&record, &padded), Err(ConfidentialError::MalformedProof));
+        assert_eq!(w.verify_call(&record, &padded), zk.verify_call(&record, &padded));
+        // The fixture is a canonical rVM-shaped proof over an empty public input: `decode_call`
+        // reads its header and public values off exactly as the zkVM's decode does — the tier,
+        // the declared limit, `OUT0..7` and `H_IN` — and does not verify it (admission did that).
+        use randprotocol_zkvm::tables::cpu::pv;
+        let p = fixture_proof(0);
+        let got = w.decode_call(&record, &real).expect("the fixture's header and public values decode");
+        assert_eq!(got.tier, p.tier.0 as u8);
+        assert_eq!(got.gas_limit, p.public_values[pv::GAS]);
+        assert_eq!(got.outputs, std::array::from_fn(|i| p.public_values[pv::OUT0 + i] as u32));
+        assert_eq!(got.h_in, std::array::from_fn(|i| p.public_values[pv::IN0 + i] as u32));
+        assert_eq!((got.keccak_log_height, got.sha256_log_height), (p.keccak_log_height, p.sha256_log_height));
+        // A record that claims a public input the proof's public table does not hold is refused
+        // by name (the public-table height is the record's, `PublicValues`), as is a record whose
+        // deploy-time public digest is not the one the proof publishes.
+        let mut other = record.clone();
+        other.public_len = 100_000;
+        match w.decode_call(&other, &real) {
+            Err(ConfidentialError::InvalidProof(m)) => assert!(m.contains("PublicValues"), "{m}"),
+            r => panic!("a mismatched public table must be refused, got {r:?}"),
+        }
+        let mut wrong_digest = record.clone();
+        wrong_digest.public_digest = Some([0xdead; 8]);
+        match w.decode_call(&wrong_digest, &real) {
+            Err(ConfidentialError::InvalidProof(m)) => assert!(m.contains("PublicValues"), "{m}"),
+            r => panic!("a wrong public digest must be refused, got {r:?}"),
+        }
+        // Warming the hardened call path for a record is a no-op for a junk-free record but must
+        // not panic; the plain warm is skipped (it builds a verifier key).
+        w.warm_hardened(&record);
+    }
+
     /// The registered artifact (spec §2.3): the wrapper's digest is the rVM's own
     /// `aggregate_program_digest` over the same shape, deterministically.
     #[test]
