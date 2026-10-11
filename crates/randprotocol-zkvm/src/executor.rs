@@ -540,7 +540,9 @@ pub struct ZkExecutor {
     /// every validator at once when a proposal carries it). `decode_and_check` pins every
     /// component of a bundle proof's key (tier, all three heights the prover chooses, both hash
     /// tables absent), so this cache only ever holds that one key and nothing a program can
-    /// deploy reaches it. The vendored cache itself (FIFO, no single-flight) is upstream's.
+    /// deploy reaches it. (The history above is the FIFO cache of the time; the vendored cache is
+    /// now LRU and single-flight per shape — each slot an `Arc<OnceLock>`, #54 — and is
+    /// upstream's either way.)
     bundle_machine: Machine,
     /// The auth guest's own `Machine` (split authorisation), for the same reason as
     /// `bundle_machine`: `decode_and_check` pins every component of an auth proof's key
@@ -552,9 +554,11 @@ pub struct ZkExecutor {
     /// before it asks, so its cache only ever holds the one tier-18 key, which neither a deploy,
     /// a bundle nor a single-key auth proof can evict.
     msauth_machine: Machine,
-    /// The tier-18 msauth verifier key, built once (spec §3.5, pre-flight finding 3): roughly a
-    /// minute and 1.5–2 GB at Production, on 2–4 GB validators, so four verify workers and the
-    /// warm thread must never each build one. `get_or_init` is the single flight: the first caller
+    /// The tier-18 msauth verifier key, built once (spec §3.5, pre-flight finding 3): measured at
+    /// Production on the 48 GB laptop at 78.6 s and ~4.0 GB peak (and resident after, on macOS's
+    /// allocator — the key itself is a commitment and lookups), on 2–4 GB validators, so four
+    /// verify workers and the warm thread must never each build one; Task 2b has the node LOAD a
+    /// precomputed key instead of building it. `get_or_init` is the single flight: the first caller
     /// builds, every other waits for it and receives the same `Arc`. Filled by
     /// [`ZkExecutor::warm_auth_multisig`] (which `node::warm` runs first on a chain naming
     /// `hc_auth_multisig`) or by the first msauth verify; [`ZkExecutor::msauth_key_ready`] is the
@@ -567,8 +571,9 @@ pub struct ZkExecutor {
     /// blocking task per deploy-carrying commit and the startup warm runs beside them, so before
     /// this the builds overlapped — six at once peaked at 1.58 GB against 2 GB droplets. A queued
     /// warm-up waits here holding nothing but a blocking-pool thread. It does not serialise the
-    /// admission workers' own key builds on a cache miss (`Machine::verifier_key` has no
-    /// single-flight); those are bounded by the four verify workers instead.
+    /// admission workers' own key builds on a cache miss; those are single-flight per shape in
+    /// the vendored cache (#54: concurrent callers of one shape wait for one build) and bounded
+    /// across shapes by the four verify workers.
     warm_lock: std::sync::Mutex<()>,
     /// How many `warm`/`warm_bundle` bodies are running right now, and the most that ever ran at
     /// once — [`ZkExecutor::peak_concurrent_warms`], the observable CPUV-1's serialisation is
@@ -1104,6 +1109,10 @@ impl ZkExecutor {
     /// Which auth guest's pinned header `proof` declares (spec §3.1), from its canonical decode
     /// alone: the single-key one, the multisig one (all eight words exact), or neither
     /// (`InvalidProof`). Nothing verified and nothing built.
+    ///
+    /// A header read only — no ranges, no degree bits, no public-value layout. **The ledger
+    /// (Task 4) must use `auth_header` ([`Self::auth_header_of`]), which runs the chosen shape's
+    /// full structural checks in the same decode; this is a test and tooling convenience.**
     pub fn auth_shape_of(proof: &[u8]) -> Result<randprotocol_core::confidential::AuthShape, ConfidentialError> {
         use randprotocol_core::confidential::AuthShape;
         let p = decode_canonical(proof)?;
@@ -1254,20 +1263,22 @@ impl ZkExecutor {
 
     /// `ConfidentialExecutor::auth_header` (Task 4; spec §3.2, pre-flight finding 14): one
     /// canonical decode, then the shape's exact checks, then the shape, the published `c` and the
-    /// declared `pv::GAS` together. The tier routes: [`MSAUTH_TIER`] takes the multisig checks
-    /// (whose errors name the field), anything else the single-key ones, so a proof of neither
-    /// shape is `InvalidProof` either way, before any key is built.
+    /// declared `pv::GAS` together. Routing: a header that is exactly the single-key one (tier,
+    /// program, input, public, no hash or modq table) takes the single-key checks; every other
+    /// header takes the multisig checks, whose refusal names the first word that is not the
+    /// pinned one (`"not the multisig auth guest's shape: <field>"`). A proof of neither shape is
+    /// `InvalidProof` either way, before any key is built.
     pub fn auth_header_of(
         &self,
         proof: &[u8],
     ) -> Result<(randprotocol_core::confidential::AuthShape, Word8, Option<u64>), ConfidentialError> {
         use randprotocol_core::confidential::AuthShape;
         let p = decode_canonical(proof)?;
-        let (shape, p) = if p.tier == Tier(MSAUTH_TIER) {
-            (AuthShape::Multisig, self.check_msauth_decoded(p)?)
-        } else {
+        let (shape, p) = if Self::is_single_key_header(&p) {
             let (plh, ilh, pubh) = Self::auth_heights();
             (AuthShape::SingleKey, self.check_decoded(p, plh, ilh, pubh, true, AUTH_TIER)?)
+        } else {
+            (AuthShape::Multisig, self.check_msauth_decoded(p)?)
         };
         Ok((shape, published_digest(&p.public_values)?, Some(p.public_values[pv::GAS])))
     }

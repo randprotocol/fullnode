@@ -587,7 +587,9 @@ fn raw_proof_facts(
         .map_err(|_| StorageError::Corrupt(format!("covered bundle {tx_hash}'s proof does not decode")))?;
     // Constraint set 9: `agg_executor::covered_bundle_of` refuses an inner proof declaring a modq
     // table (the recursion verifier is chip-free) — unreachable on an honest chain, whose bundle
-    // admission pins `modq_log_height = 0`, so a stored one is corruption.
+    // admission pins `modq_log_height = 0`, so a stored one is corruption. It surfaces as
+    // `StorageError::Corrupt` here, which `node::assemble_covered` reports to admission as
+    // `CoverStoreCorrupt` (and `verify_chain`/the pruning pass as a storage error).
     crate::agg_executor::covered_bundle_of(&proof, profile).map_err(|e| match e {
         randprotocol_core::confidential::ConfidentialError::MalformedProof => {
             StorageError::Corrupt(format!("covered bundle {tx_hash}'s public values are not pv::NUM words"))

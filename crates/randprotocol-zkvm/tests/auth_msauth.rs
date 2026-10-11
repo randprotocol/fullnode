@@ -70,6 +70,11 @@ fn the_msauth_shape_is_the_vendored_pinned_one() {
     assert_eq!(s.modq_log_height, randprotocol_core::types::MSAUTH_MODQ_LOG_HEIGHT, "core's mirror");
     // R-gas: the header ceiling, a function of public header words only.
     assert_eq!(randprotocol_core::gas::msauth_gas_limit_pin(), 436_159);
+    assert_eq!(
+        randprotocol_core::gas::msauth_gas_limit_pin(),
+        randprotocol_zkvm::gas::gas_max_with_modq(randprotocol_zkvm::machine::Tier(MSAUTH_TIER), s.keccak_log_height, 0, s.modq_log_height),
+        "core's pin is the vendored machine's ceiling of the pinned header"
+    );
 }
 
 #[test]
@@ -90,6 +95,76 @@ fn junk_and_a_single_key_proof_take_their_shape_or_none() {
     assert_eq!(ex.cached_msauth_keys(), 0, "refused before any msauth key");
     assert!(!ex.msauth_key_ready());
     assert_eq!(ex.verify_auth(&ZkExecutor::hc_auth(), &single, &BINDING), Ok(c));
+}
+
+/// The per-field header comparison without the 4 GB key (spec §3.1, pre-flight finding 7): a
+/// decoded Test-profile proof given the msauth header — all eight words `msauth_heights()`,
+/// `degree_bits` the pinned shape's, its own `pv::NUM` public values — reads as `Multisig`
+/// through the one decode; each word moved by one either way is refused by name by
+/// `auth_header_of` and by `verify_auth` under `hc_auth_multisig`, and no key is ever built.
+/// (`verify_auth` is never called on the all-matching proof: it would build the key.)
+#[test]
+fn every_msauth_header_word_off_by_one_is_refused_by_name_before_any_key() {
+    use randprotocol_zkvm::machine::{Machine, Proof, Tier};
+    let ex = ZkExecutor::new(FriProfile::Test);
+    let (single, c, _) = prove_auth(FriProfile::Test, &SpendKey([7; 8]), &SALT, &BINDING, Backend::Cpu).unwrap();
+    let gas = decode_canonical(&single).unwrap().public_values[pv::GAS];
+    let s = ZkExecutor::msauth_heights();
+    let m = Machine::new(FriProfile::Test);
+    let synth = |edit: &dyn Fn(&mut Proof)| -> Vec<u8> {
+        let mut p = decode_canonical(&single).unwrap();
+        p.tier = Tier(s.tier);
+        p.program_log_height = s.program_log_height;
+        p.input_log_height = s.input_log_height;
+        p.keccak_log_height = s.keccak_log_height;
+        p.sha256_log_height = s.sha256_log_height;
+        p.modq_log_height = s.modq_log_height;
+        p.public_log_height = s.public_log_height;
+        p.mem_log_height = s.mem_log_height;
+        p.batch.degree_bits = m.log_ext_degrees_with_modq(
+            Tier(s.tier),
+            s.program_log_height,
+            s.input_log_height,
+            s.keccak_log_height,
+            s.sha256_log_height,
+            s.modq_log_height,
+            s.public_log_height,
+            s.mem_log_height,
+        );
+        assert_eq!(p.public_values.len(), pv::NUM);
+        edit(&mut p);
+        p.to_bytes()
+    };
+    let matching = synth(&|_| {});
+    assert_eq!(ZkExecutor::auth_shape_of(&matching), Ok(AuthShape::Multisig));
+    assert_eq!(ex.auth_header_of(&matching), Ok((AuthShape::Multisig, c, Some(gas))));
+    assert_eq!(ex.auth_proof_digest(&matching), Ok(c));
+    assert_eq!(ex.auth_gas_limit(&matching), Ok(Some(gas)));
+    type Edit = fn(&mut Proof, i8);
+    let edits: [(&str, Edit); 8] = [
+        ("tier", |p, d| p.tier.0 = (p.tier.0 as i64 + d as i64) as usize),
+        ("program_log_height", |p, d| p.program_log_height = (p.program_log_height as i16 + d as i16) as u8),
+        ("input_log_height", |p, d| p.input_log_height = (p.input_log_height as i16 + d as i16) as u8),
+        ("keccak_log_height", |p, d| p.keccak_log_height = (p.keccak_log_height as i16 + d as i16) as u8),
+        ("sha256_log_height", |p, d| p.sha256_log_height = (p.sha256_log_height as i16 + d as i16) as u8),
+        ("modq_log_height", |p, d| p.modq_log_height = (p.modq_log_height as i16 + d as i16) as u8),
+        ("public_log_height", |p, d| p.public_log_height = (p.public_log_height as i16 + d as i16) as u8),
+        ("mem_log_height", |p, d| p.mem_log_height = (p.mem_log_height as i16 + d as i16) as u8),
+    ];
+    let mut refused = 0;
+    for (field, edit) in edits {
+        for d in [1i8, -1] {
+            let bytes = synth(&|p| edit(p, d));
+            let want = ConfidentialError::InvalidProof(format!("not the multisig auth guest's shape: {field}"));
+            assert!(ZkExecutor::auth_shape_of(&bytes).is_err(), "{field} {d:+}");
+            assert_eq!(ex.auth_header_of(&bytes), Err(want.clone()), "{field} {d:+}");
+            assert_eq!(ex.verify_auth(&ZkExecutor::hc_auth_multisig(), &bytes, &BINDING), Err(want), "{field} {d:+}");
+            refused += 1;
+        }
+    }
+    assert_eq!(refused, 16);
+    assert_eq!(ex.cached_msauth_keys(), 0, "no header built the msauth key");
+    assert!(!ex.msauth_key_ready());
 }
 
 /// One real msauth proof at the Test profile, and every header rule checked on it.
@@ -185,7 +260,7 @@ fn measure_the_msauth_test_profile_prove() {
 /// Run from a terminal outside the agent harness:
 /// `/usr/bin/time -l cargo +1.98.1 test --release -p randprotocol-zkvm --test auth_msauth -- --ignored --nocapture measure_the_msauth_verifier_key_build_and_verify`
 #[test]
-#[ignore = "a Production tier-18 prove, then the key build and one verify: run from a terminal outside the agent harness; record in docs/node-hardware.md"]
+#[ignore = "a Production tier-18 prove (tens of GB) then the ~4 GB key build and one verify: run from a terminal outside the agent harness; record in docs/node-hardware.md"]
 fn measure_the_msauth_verifier_key_build_and_verify_at_the_production_profile() {
     let f = fixture(3);
     let inputs = msauth_inputs(&MSK, &SALT, 2, &[slot(&f, 0), slot(&f, 2)]);
@@ -212,7 +287,7 @@ fn rss_bytes() -> u64 {
 /// inside the agent harness.
 /// `/usr/bin/time -l cargo +1.98.1 test --release -p randprotocol-zkvm --test auth_msauth -- --ignored --nocapture measure_the_msauth_verifier_key_build_alone`
 #[test]
-#[ignore = "the Production tier-18 key build: about a minute and ~2 GB"]
+#[ignore = "the Production tier-18 key build: measured 78.6 s and ~4.0 GB peak/resident on the 48 GB laptop"]
 fn measure_the_msauth_verifier_key_build_alone() {
     let ex = std::sync::Arc::new(ZkExecutor::new(FriProfile::Production));
     let base = rss_bytes();
