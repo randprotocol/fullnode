@@ -338,18 +338,43 @@ A commit of one or more blocks is a single, fsynced `WriteBatch`: the blocks, QC
 one `nullifiers` row per spend, the block-end `anchors` row, the proposer's rewritten
 `ValidatorEntry`, any new programs and receipts, the new `meta/tree` frontier, and the new head.
 
-**Startup verification (`--verify-chain off|quick|full`).** Block 0 must equal the genesis file's
+**Startup verification (`--verify-chain off|quick|replay|full`).** Block 0 must equal the genesis file's
 own derivation, and this build's bundle guest must equal the genesis `hc_bundle` — a mismatch
 refuses to start at all, naming both digests. `quick` then replays every later block's transactions
 against a ledger rebuilt from genesis, checking each block's parent link, height, index entry,
 transaction root, and that re-execution (through the real executor — including every bundle proof
-and every `Call` proof) reproduces the header's state root. `full` additionally checks every
-proposer signature and every QC's votes. On the first inconsistency the node truncates its chain to
+and every `Call` proof) reproduces the header's state root; the proposer signatures are checked on
+the way, by `apply_block_for_sync`. `replay` is `quick` that is never skipped (below). `full`
+adds only every QC's votes. On the first inconsistency the node truncates its chain to
 the last good height — deleting the `notes` rows above the replayed ledger's next index, the
 `nullifiers` and `anchors` rows above that height, and rewriting every validator row and the tree
 frontier from the replayed ledger, while keeping its consensus safety state so it never
 double-votes — and lets sync refetch the rest from peers. `rand-node verify --repair` does the
 same thing offline, without running the node.
+
+**The startup checkpoint.** A walk that succeeds writes one `meta` row, `verified_head`: the head's
+height, hash and state root, and the git sha of the build that verified it. A later start of
+the same build in `quick` mode, on a store whose head is still that block, skips the walk. Only a
+clean build is trusted: a sha that is not 40 hex characters (`-dirty`, `unknown`) neither writes
+nor honours the row, so such builds always walk. `Storage::commit` carries the row forward in the
+same batch as the head when it matches the pre-commit head and this build's sha, so blocks the
+node commits itself stay covered; `truncate_to` clears it, and so does any walk that reports a
+problem (at startup or in `rand-node verify`, before it repairs or bails). Every other case walks,
+and `NodeHandle.startup` says why (no checkpoint, another build, an untrusted build, a head that
+moved, a forced mode, a head block that does not read or check).
+
+The fast path trusts that the rows this build wrote have not changed on disk since. It re-checks
+only two things: the snapshot against the head's state root (OPS-5, on every start), and the tip
+block itself — it must read, its tx root must match its transactions and its proposer signature
+must verify, or the start walks and repairs. Everything else an archive's walk would catch goes
+unchecked on a skipped start: interior block bodies, QCs and `block_index`; tx records and
+receipts; the stored epoch-set rows; the supply and fee counters outside the state root
+(registration and base fees burned, unsealed fees, the faucet's epoch counters on a chain without
+a `staking` section); the perp input rows; and the equality of the stored ledger with the replayed
+one. On a pruned node the structural walk of the retained window is skipped. `--verify-chain
+replay` (or `rand-node verify`) audits all of it. One behaviour change for archives: a snapshot
+that fails OPS-5 on a skipped start is now fatal, where the walk used to truncate and repair it;
+restart with `--verify-chain replay` to rebuild the state from history.
 
 **Why a constraint-set change is a hard fork.** `--verify-chain quick`/`full` re-verify every
 historical `Call`'s proof through whatever zkVM constraints the running binary implements. A STARK
@@ -652,9 +677,10 @@ action.
 A node joining later, or catching up after a partition, does not take any committed receipt on
 faith. Batch sync re-executes every fetched block through the real executor — every `Call`'s proof
 is re-verified, not merely trusted because a quorum signed the block — before the node accepts it
-and advances its head. `--verify-chain quick|full` does the same thing over the whole chain at
-startup (§7): quick mode re-derives every state root (proof verification included, since it goes
-through the real executor); full mode additionally re-checks every proposer signature and QC.
+and advances its head. `--verify-chain quick|replay|full` does the same thing over the whole chain at
+startup (§7): quick and replay re-derive every state root (proof verification and proposer
+signatures included, since it goes through the real executor), unless the startup checkpoint
+skips the walk; full mode additionally re-checks every QC's votes.
 
 ## 10. Failure modes
 

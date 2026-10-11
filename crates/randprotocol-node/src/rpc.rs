@@ -668,7 +668,7 @@ impl RpcState {
 pub const PUBLIC_METHODS: &[&str] = &[
     "rand_chainId", "rand_status", "rand_syncStatus", "rand_getVersion", "rand_getGenesisHash", "rand_getHealth",
     "rand_getLimits", "rand_getHead", "rand_getFinality", "rand_getProposer", "rand_getMempoolInfo", "rand_tokenInfo",
-    "rand_getTreeInfo", "rand_getCommitments", "rand_getNullifiers", "rand_getCompactBlocks", "rand_getAnchor",
+    "rand_getTreeInfo", "rand_getCommitments", "rand_getScanLeaves", "rand_getNullifiers", "rand_getCompactBlocks", "rand_getAnchor",
     "rand_getWitness", "rand_getWitnesses", "rand_estimateFee",
     "rand_checkTransaction", "rand_sendTransaction", "rand_getTransaction", "rand_getTransactionStatus", "rand_getRawTransaction",
     "rand_getReceipt", "rand_getReceipts", "rand_getCallEnvelope",
@@ -1635,6 +1635,14 @@ fn parse_limit(params: &Value, idx: usize) -> Result<usize, RpcError> {
             Ok((n as usize).min(MAX_PAGE))
         }
     }
+}
+
+/// An envelope's scan head as `rand_getScanLeaves` serves it: `kem_ct ‖ to_receiver ‖ to_sender`,
+/// standard base64 with padding. Whatever lengths the parts have — a wallet reads a head of any
+/// other length than 1 208 bytes in full rather than guessing at its split.
+fn scan_head_b64(e: &Envelope) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode([&e.kem_ct[..], &e.to_receiver, &e.to_sender].concat())
 }
 
 fn envelope_json(e: &Envelope) -> Value {
@@ -2794,6 +2802,25 @@ async fn dispatch(st: &RpcState, req: &Request) -> Result<Value, RpcError> {
                     "index": index,
                     "cm": word8_to_hex(&r.cm),
                     "envelope": envelope_json(&r.envelope),
+                    "height": r.height,
+                }))
+                .collect::<Vec<_>>()))
+        }
+        // `rand_getCommitments` less each envelope's body: what a scan needs to tell its own leaves
+        // from everyone else's (`scan` is `kem_ct ‖ to_receiver ‖ to_sender`, base64, 1 208 bytes
+        // for every envelope a wallet seals). A wallet trial-opens the heads and asks
+        // `rand_getCommitments` only for the leaves one of its keys opens — about a third of the
+        // bytes of a full page for the same answer.
+        "rand_getScanLeaves" => {
+            let from: u64 = param(p, 0, "from_index")?;
+            let limit = parse_limit(p, 1)?;
+            let rows = st.storage.notes_from(from, limit).map_err(RpcError::internal)?;
+            Ok(json!(rows
+                .into_iter()
+                .map(|(index, r)| json!({
+                    "index": index,
+                    "cm": word8_to_hex(&r.cm),
+                    "scan": scan_head_b64(&r.envelope),
                     "height": r.height,
                 }))
                 .collect::<Vec<_>>()))
@@ -5107,6 +5134,34 @@ pub(crate) mod tests {
                 assert_eq!(&j["action"][k], v, "{kind}.{k}: {j}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn get_scan_leaves_is_get_commitments_less_the_bodies() {
+        use base64::Engine as _;
+        let (_d, st, _gs) = chain();
+        let full = ok(&st, "rand_getCommitments", json!([0, 100])).await;
+        let heads = ok(&st, "rand_getScanLeaves", json!([0, 100])).await;
+        let (full, heads) = (full.as_array().unwrap(), heads.as_array().unwrap());
+        assert_eq!(heads.len(), full.len(), "one head per leaf");
+        for (f, h) in full.iter().zip(heads) {
+            assert_eq!(h["index"], f["index"]);
+            assert_eq!(h["cm"], f["cm"]);
+            assert_eq!(h["height"], f["height"]);
+            assert!(h.get("envelope").is_none(), "no body on the wire");
+            let want = [&f["envelope"]["kem_ct"], &f["envelope"]["to_receiver"], &f["envelope"]["to_sender"]]
+                .iter()
+                .flat_map(|x| hex::decode(x.as_str().unwrap()).unwrap())
+                .collect::<Vec<u8>>();
+            let got = base64::engine::general_purpose::STANDARD.decode(h["scan"].as_str().unwrap()).unwrap();
+            assert_eq!(got, want, "leaf {}: the head is the envelope's first three parts, in order", f["index"]);
+        }
+        // Paged and capped exactly as `rand_getCommitments` is.
+        assert_eq!(ok(&st, "rand_getScanLeaves", json!([2, 100])).await.as_array().unwrap(), &heads[2..]);
+        assert_eq!(ok(&st, "rand_getScanLeaves", json!([0, 2])).await.as_array().unwrap().len(), 2);
+        assert_eq!(ok(&st, "rand_getScanLeaves", json!([9, 100])).await, json!([]));
+        assert_eq!(ok(&st, "rand_getScanLeaves", json!([0, 10_000])).await.as_array().unwrap().len(), 6);
+        assert!(PUBLIC_METHODS.contains(&"rand_getScanLeaves"), "a read a wallet needs is on the public listener");
     }
 
     #[tokio::test]

@@ -424,6 +424,8 @@ the `receipts_by_program` column family) went out as a same-chain binary update,
 2. **Startup is ~4 minutes, not ~20 s**: the node runs a quick chain verification before the RPC
    opens (239 s at 59 183 blocks). A rolling update must wait for `rand_getHealth` = `ok` on each
    node before the next, which the loop did (a fixed sleep would stop two validators at once).
+   The first start of a new build still runs the full check (plan the pause for it); a restart of
+   the same build skips it (startup checkpoint, v0.8.0+).
 3. `deploy/update-droplet.sh <ip>` over the other fifteen, one at a time, each waited to
    `rand_getHealth` `ok`: 06:33–07:38 UTC, ~4–6 min per droplet, all fifteen `updated to
    16e41293`, chain producing throughout.

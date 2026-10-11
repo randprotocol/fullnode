@@ -594,6 +594,31 @@ async fn validator_restarts_from_disk_and_resumes() {
     );
 }
 
+/// Startup checkpoint (spec §6): a validator restarted on the same binary in `quick` mode skips
+/// the walk when this build is a clean commit — which the CI clean-clone job is — and walks,
+/// saying why, when it is not. Either way it rejoins and commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_same_build_restart_skips_the_startup_walk() {
+    use randprotocol_node::node::{StartupVerify, WalkReason};
+    use randprotocol_node::storage::{this_build_checkpoint, VerifyMode};
+    init_tracing();
+    let ks = keys(2);
+    let gen = genesis(&ks);
+    let a = start_node(&ks[0], &gen, vec![], true).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("genesis.json"), gen.to_json()).unwrap();
+    let b = start_in_verify(dir, &ks[1], vec![bootstrap_addr(&a)], true, FAST, None, VerifyMode::Quick).await;
+    wait_height(&[&a, &b], 4, Duration::from_secs(40)).await;
+    let (dir, _) = stop_and_head(b).await;
+    let b = start_in_verify(dir, &ks[1], vec![bootstrap_addr(&a)], true, FAST, None, VerifyMode::Quick).await;
+    match this_build_checkpoint() {
+        Some(_) => assert!(matches!(b.handle.startup, StartupVerify::Skipped { .. }), "{:?}", b.handle.startup),
+        None => assert_eq!(b.handle.startup, StartupVerify::Walked(WalkReason::UntrustedBuild)),
+    }
+    let target = a.height().max(b.height()) + 4;
+    wait_height(&[&a, &b], target, Duration::from_secs(60)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_cycles_keep_all_nodes_in_sync() {
     init_tracing();

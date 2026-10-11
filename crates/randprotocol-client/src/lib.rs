@@ -335,6 +335,16 @@ pub struct CommitmentRow {
     pub height: u64,
 }
 
+/// One leaf as `rand_getScanLeaves` reports it: [`CommitmentRow`] with only the envelope's head
+/// (`kem_ct ‖ to_receiver ‖ to_sender`, raw bytes) — enough to tell whether a key opens it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanLeaf {
+    pub index: u64,
+    pub cm: Word8,
+    pub head: Vec<u8>,
+    pub height: u64,
+}
+
 /// `rand_getTreeInfo`: how far a wallet still has to scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TreeInfo {
@@ -478,6 +488,9 @@ pub struct RpcClient {
     /// `rand_getTransaction` polling loop instead of paying for a round trip to a method the
     /// node does not have on every subsequent call.
     legacy_status: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set on the first `-32601` `rand_getScanLeaves` reply: this node predates scan heads, so
+    /// [`RpcClient::scan_leaves`] answers `None` from then on without asking again.
+    legacy_scan: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// [`RpcClient::envelope_format`]'s cache: one `rand_getLimits` read for the life of this
     /// client and everything cloned from it (the `Arc` is shared, like `legacy_status` above),
     /// not one per bundle a wallet builds.
@@ -603,6 +616,7 @@ impl RpcClient {
             // this one; this is the read timeout.
             http: reqwest::Client::builder().timeout(READ_TIMEOUT).build().expect("client"),
             legacy_status: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            legacy_scan: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             envelope_format: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             rate_limit_wait: Duration::from_secs(1),
             read_timeout: READ_TIMEOUT,
@@ -1156,6 +1170,38 @@ impl RpcClient {
                 })
             })
             .collect()
+    }
+
+    /// A page of leaves from `from` with only their envelopes' heads (`rand_getScanLeaves`), or
+    /// `None` from a node too old to serve them — remembered, so such a node is asked once per
+    /// client. Any other error is the caller's, never a reason to fall back.
+    pub async fn scan_leaves(&self, from: u64, limit: usize) -> Result<Option<Vec<ScanLeaf>>> {
+        use base64::Engine as _;
+        use std::sync::atomic::Ordering;
+        if self.legacy_scan.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let v = match self.call("rand_getScanLeaves", json!([from, limit])).await {
+            Ok(v) => v,
+            Err(e) if is_method_not_found(&e) => {
+                self.legacy_scan.store(true, Ordering::Relaxed);
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let rows = v.as_array().context("getScanLeaves did not return a list")?;
+        rows.iter()
+            .map(|r| {
+                let scan = r.get("scan").and_then(|x| x.as_str()).context("scan missing")?;
+                Ok(ScanLeaf {
+                    index: r["index"].as_u64().context("index")?,
+                    cm: word8_at(r, "cm")?,
+                    head: base64::engine::general_purpose::STANDARD.decode(scan).context("scan is not base64")?,
+                    height: r["height"].as_u64().context("height")?,
+                })
+            })
+            .collect::<Result<_>>()
+            .map(Some)
     }
 
     /// Every nullifier published from block `from_height` onwards, as `(height, nullifier)`.

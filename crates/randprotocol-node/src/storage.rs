@@ -374,6 +374,10 @@ const META_PRUNE_FLOOR: &str = "prune_floor";
 /// in consensus reads it, a lost or corrupt row costs only the wait for the next announcement,
 /// so it is written without an fsync and read back leniently.
 const META_PEER_BINDINGS: &str = "peer_bindings";
+/// The startup checkpoint (startup-checkpoint spec §3): the head this build last verified the
+/// store through, and the build. Local state, outside consensus; `commit` carries it forward,
+/// `truncate_to` clears it.
+const META_VERIFIED_HEAD: &str = "verified_head";
 
 /// One persisted peer binding (audit v6, NET-1): the peer id in its base58 text form, and the
 /// signer's `issued_ms` of the binding it came from, so a restart still ignores anything older.
@@ -421,6 +425,29 @@ pub struct NoteRow {
     pub height: u64,
 }
 
+/// The startup checkpoint row (startup-checkpoint spec §3): `build_sha` verified this store's
+/// history through `height` — a replay on an archive, the structural walk on a pruned store —
+/// or committed every block above its own verification itself.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VerifiedHead {
+    pub height: u64,
+    pub block_hash: Hash,
+    /// The head header's `state_root`, copied, not recomputed.
+    pub state_root: Hash,
+    pub build_sha: String,
+}
+
+/// A build may write or honour the checkpoint only under a clean commit sha: `-dirty` and
+/// `unknown` do not change when the code does (spec §3.1).
+pub fn trusted_build(sha: &str) -> Option<&str> {
+    (sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).then_some(sha)
+}
+
+/// This binary's checkpoint identity, if it has one.
+pub fn this_build_checkpoint() -> Option<&'static str> {
+    trusted_build(env!("RAND_GIT_SHA"))
+}
+
 pub struct Storage {
     db: DB,
     /// The commitment tree as last built, with the leaf count it was built from (audit v3, RPC-1).
@@ -438,6 +465,11 @@ pub struct Storage {
     /// How many times the tree has actually been rebuilt, for the tests that assert the cache is
     /// doing its job.
     tree_builds: std::sync::atomic::AtomicUsize,
+    /// The build the checkpoint is written and honoured under (spec §3.1): this binary's sha
+    /// when it is a clean commit, else `None`. `None` in unit tests unless a test sets one.
+    checkpoint_build: std::sync::Mutex<Option<String>>,
+    /// How many times `load_ledger` ran, for the tests that pin one load per startup.
+    ledger_loads: std::sync::atomic::AtomicUsize,
     /// The floor `prune_history` last warned about hitting a torn store at, `u64::MAX` until
     /// the first such warning. A torn floor does not move, and every pass below `keep_from`
     /// re-tries it, so without this the warning would fire once per pass forever instead of
@@ -924,6 +956,8 @@ impl Storage {
             db,
             tree_cache: std::sync::Mutex::new(None),
             tree_builds: std::sync::atomic::AtomicUsize::new(0),
+            checkpoint_build: std::sync::Mutex::new(if cfg!(test) { None } else { this_build_checkpoint().map(String::from) }),
+            ledger_loads: std::sync::atomic::AtomicUsize::new(0),
             torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX),
             seal_rows_examined: std::sync::atomic::AtomicU64::new(0),
             token_rows: std::sync::Mutex::new(None),
@@ -2025,6 +2059,56 @@ impl Storage {
         self.tree_builds.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    pub fn checkpoint_build(&self) -> Option<String> {
+        self.checkpoint_build.lock().unwrap().clone()
+    }
+
+    #[doc(hidden)]
+    pub fn set_checkpoint_build_for_testing(&self, sha: Option<&str>) {
+        *self.checkpoint_build.lock().unwrap() = sha.and_then(trusted_build).map(String::from);
+    }
+
+    #[doc(hidden)]
+    pub fn ledger_loads(&self) -> usize {
+        self.ledger_loads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The checkpoint row, or `None` when there is none or it does not decode (an older layout,
+    /// a torn write): either way the next startup walks and rewrites it (spec §5).
+    pub fn verified_head(&self) -> Result<Option<VerifiedHead>> {
+        let Some(bytes) = self.get_meta_raw(META_VERIFIED_HEAD)? else { return Ok(None) };
+        match bincode::deserialize::<VerifiedHead>(&bytes) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                tracing::warn!("startup checkpoint row does not decode ({e}); treating it as absent");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Record that this build verified the store through its current head (spec §3.2.1).
+    /// Nothing is written without a trusted build; returns whether the row was written.
+    ///
+    /// Startup only, before consensus and sync start: it reads the head and then writes, so a
+    /// commit between the two would mark a head this build never verified.
+    pub fn mark_verified_head(&self) -> Result<bool> {
+        let Some(build_sha) = self.checkpoint_build() else { return Ok(false) };
+        let head = self.head_block()?;
+        let row = VerifiedHead { height: head.height(), block_hash: head.hash(), state_root: head.header.state_root, build_sha };
+        let mut batch = WriteBatch::default();
+        batch.put_cf(self.cf(CF_META), META_VERIFIED_HEAD, bincode::serialize(&row)?);
+        self.db.write_opt(batch, &sync_opts())?;
+        Ok(true)
+    }
+
+    /// Delete the checkpoint row, synced (final review #2): any walk that reports a problem
+    /// calls this before it returns or bails, so the next start walks again rather than
+    /// skipping past damage a failed check found.
+    pub fn clear_verified_head(&self) -> Result<()> {
+        self.db.delete_cf_opt(self.cf(CF_META), META_VERIFIED_HEAD, &sync_opts())?;
+        Ok(())
+    }
+
     /// How many seal rows [`Storage::prune_sealed`] has visited since this store was opened.
     pub fn seal_rows_examined(&self) -> u64 {
         self.seal_rows_examined.load(std::sync::atomic::Ordering::Relaxed)
@@ -2774,6 +2858,7 @@ impl Storage {
     /// returns carries their defaults. It is not a ledger to run a chain on:
     /// [`crate::node::reload_ledger`] is the one way to get a runnable one, and it sets them.
     pub fn load_ledger(&self, executor: &dyn ConfidentialExecutor) -> Result<Ledger> {
+        self.ledger_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let chain_id = self.chain_id()?;
         let hc_bundle = self.hc_bundle()?;
         let tree = self.tree()?;
@@ -2880,6 +2965,12 @@ impl Storage {
             return Ok(());
         }
         let head = self.head()?;
+        // The startup checkpoint is carried, never created (spec §3.2.2): only a row this build
+        // wrote for exactly the head this commit extends moves up with it.
+        let carry = match (self.checkpoint_build(), self.verified_head()?) {
+            (Some(build), Some(m)) if m.build_sha == build && m.height == head.height && m.block_hash == head.hash => Some(build),
+            _ => None,
+        };
         let first_height = head.height + 1;
         let mut expected_height = first_height;
         let mut expected_parent = head.hash;
@@ -3243,6 +3334,11 @@ impl Storage {
         self.stage_retired_aggregator_nonces(&mut batch, ledger_after)?;
         let tokens_staged = self.stage_tokens(&mut batch, ledger_after.tokens())?;
         self.put_tokens_ext(&mut batch, ledger_after.tokens())?;
+        if let Some(build_sha) = carry {
+            let last = blocks.last().expect("blocks is non-empty past the early return");
+            let row = VerifiedHead { height: last.block.height(), block_hash: last.block.hash(), state_root: last.block.header.state_root, build_sha };
+            batch.put_cf(self.cf(CF_META), META_VERIFIED_HEAD, bincode::serialize(&row)?);
+        }
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(last_height));
         self.db.write_opt(batch, &sync_opts())?;
         self.tokens_landed(tokens_staged);
@@ -3421,6 +3517,13 @@ impl Storage {
         Ok(())
     }
 
+    /// Test hook: write a checkpoint row as given, for the startup decisions a stale row drives.
+    #[cfg(test)]
+    pub(crate) fn put_verified_head_for_testing(&self, row: &VerifiedHead) -> Result<()> {
+        self.db.put_cf(self.cf(CF_META), META_VERIFIED_HEAD, bincode::serialize(row)?)?;
+        Ok(())
+    }
+
     /// Test hook: plant the locked block the way v0.5.4 wrote it, so the upgrade path — read
     /// once, folded into the pending set, key retired — can be exercised.
     #[cfg(test)]
@@ -3439,6 +3542,9 @@ pub enum VerifyMode {
     /// tx roots) plus a full ledger replay against every header's state root.
     /// Bundle proofs are re-verified; QC votes are not.
     Quick,
+    /// `Quick`, with the startup checkpoint ignored (startup-checkpoint spec §4.1). Inside
+    /// `verify_chain` it is `Quick`.
+    Replay,
     /// `Quick` plus every QC's votes.
     Full,
 }
@@ -3449,8 +3555,9 @@ impl std::str::FromStr for VerifyMode {
         match s {
             "off" => Ok(VerifyMode::Off),
             "quick" => Ok(VerifyMode::Quick),
+            "replay" => Ok(VerifyMode::Replay),
             "full" => Ok(VerifyMode::Full),
-            other => Err(format!("unknown verify mode {other} (off|quick|full)")),
+            other => Err(format!("unknown verify mode {other} (off|quick|replay|full)")),
         }
     }
 }
@@ -3476,6 +3583,10 @@ pub struct ChainCheck {
     /// (a proof above the new head may have pruned them). Empty without the section and on a
     /// pruned store, which replays nothing.
     pub perp_inputs: Vec<(u64, Vec<u32>)>,
+    /// The stored ledger this check loaded (with the genesis setters it applies), when it
+    /// loaded and nothing was wrong. `node::startup_check` hands it to
+    /// `resume_consensus_from`, so a startup loads the ledger once (spec §4.5).
+    pub stored: Option<Ledger>,
 }
 
 impl ChainCheck {
@@ -3510,6 +3621,7 @@ impl Storage {
             genesis_ok: true,
             floor: 0,
             perp_inputs: Vec::new(),
+            stored: None,
         };
         let floor = self.prune_floor()?;
         check.floor = floor;
@@ -3770,6 +3882,7 @@ impl Storage {
         // The full equality walks every commitment and nullifier (O(state), final review F2), so
         // it is evaluated once here and the arms below read `same`.
         let same = matches!(&loaded, Ok(stored) if *stored == ledger);
+        let stored_copy = if same { loaded.as_ref().ok().cloned() } else { None };
         match loaded {
             // The live gas prices (Phase 2): inside the equality, hashed under `gas.dynamic`,
             // named first so the repair knows the key.
@@ -3898,6 +4011,7 @@ impl Storage {
         }
         check.ledger = ledger;
         check.perp_inputs = perp_inputs;
+        check.stored = if check.problem.is_none() { stored_copy } else { None };
         Ok(check)
     }
 
@@ -3978,7 +4092,9 @@ impl Storage {
             }
         }
         check.last_good = head;
-        check.ledger = self.load_ledger(executor)?;
+        let stored = self.load_ledger(executor)?;
+        check.ledger = stored.clone();
+        check.stored = Some(stored);
         Ok(check)
     }
 
@@ -4155,6 +4271,8 @@ impl Storage {
             batch.put_cf(self.cf(CF_META), META_CHAIN_ID, gs.chain_id.to_be_bytes());
             batch.put_cf(self.cf(CF_META), META_HC_BUNDLE, word8_to_bytes(&gs.hc_bundle));
         }
+        // The checkpoint described the old head (spec §3.3); the repair re-verifies and rewrites it.
+        batch.delete_cf(self.cf(CF_META), META_VERIFIED_HEAD);
         batch.put_cf(self.cf(CF_META), META_HEAD_HEIGHT, height_key(height));
         self.db.write_opt(batch, &sync_opts())?;
         self.tokens_landed(tokens_staged);
@@ -5553,6 +5671,15 @@ pub(crate) mod fixtures {
 
     /// [`chain_fixture`] on a genesis state `tweak` adjusts first (a genesis parameter, say).
     pub(crate) fn chain_fixture_with(n: u64, tweak: impl FnOnce(&mut GenesisState)) -> (tempfile::TempDir, Storage, GenesisState, Vec<CommittedBlock>) {
+        chain_fixture_hooked(n, tweak, |_, _| {})
+    }
+
+    /// [`chain_fixture_with`], calling `on_block(&store, h)` just before block `h` is committed.
+    pub(crate) fn chain_fixture_hooked(
+        n: u64,
+        tweak: impl FnOnce(&mut GenesisState),
+        mut on_block: impl FnMut(&Storage, u64),
+    ) -> (tempfile::TempDir, Storage, GenesisState, Vec<CommittedBlock>) {
         use randprotocol_core::Vote;
         let (dir, st, mut gs) = genesis_with_two_notes();
         tweak(&mut gs);
@@ -5578,6 +5705,7 @@ pub(crate) mod fixtures {
             let block = cb.block.clone();
             let qc = QuorumCertificate { view: block.view(), block_hash: block.hash(), votes: vec![Vote::sign(&randprotocol_core::consensus::SigningDomain::v0(Hash::ZERO), block.view(), block.hash(), &k)] };
             let cb = CommittedBlock { qc, ..cb };
+            on_block(&st, h);
             st.commit(std::slice::from_ref(&cb), &ledger, &[], &StubExecutor).unwrap();
             out.push(cb);
         }
@@ -5885,15 +6013,19 @@ mod tests {
         let (_dir, st, gs, _blocks) = timed_chain(12);
         assert_eq!(st.prune_history(u64::MAX, 10, PRUNE_PASS_MAX).unwrap(), 9);
         for mode in [VerifyMode::Quick, VerifyMode::Full] {
+            let loads = st.ledger_loads();
             let check = st.verify_chain(&gs, mode, &StubExecutor).unwrap();
+            assert_eq!(st.ledger_loads(), loads + 1, "{mode:?}: one load");
             assert_eq!(check.problem, None, "{mode:?}");
             assert_eq!(check.floor, 10);
             assert_eq!(check.last_good, 12);
+            assert_eq!(check.stored.as_ref().map(|l| l.state_root()), Some(check.ledger.state_root()), "{mode:?}");
             assert_eq!(check.ledger, st.load_ledger(&StubExecutor).unwrap());
         }
         // Off still needs genesis and the snapshot, nothing else.
         let check = st.verify_chain(&gs, VerifyMode::Off, &StubExecutor).unwrap();
         assert_eq!(check.problem, None);
+        assert!(check.stored.is_none());
     }
 
     #[test]
@@ -8356,7 +8488,7 @@ mod tests {
         {
             // `init_genesis` touches no family the old build lacks, so it runs over the raw
             // fifteen-family handle exactly as the old build's own did.
-            let old = Storage { db: open_as_pre_v03(dir.path(), true).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX), seal_rows_examined: Default::default(), token_rows: Default::default(), token_rows_written: Default::default() };
+            let old = Storage { db: open_as_pre_v03(dir.path(), true).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), checkpoint_build: Default::default(), ledger_loads: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX), seal_rows_examined: Default::default(), token_rows: Default::default(), token_rows_written: Default::default() };
             old.init_genesis(&gs).unwrap();
             let r = a_receipt(pid);
             old.db.put_cf(old.cf(CF_RECEIPTS), r.tx.as_bytes(), bincode::serialize(&r).unwrap()).unwrap();
@@ -8393,7 +8525,7 @@ mod tests {
                 .iter()
                 .filter(|c| **c != CF_PROGRAM_PUBLIC && **c != CF_PERP_INPUTS)
                 .map(|n| ColumnFamilyDescriptor::new(*n, Options::default()));
-            let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX), seal_rows_examined: Default::default(), token_rows: Default::default(), token_rows_written: Default::default() };
+            let st = Storage { db: DB::open_cf_descriptors(&opts, dir.path().join("db"), cfs).unwrap(), tree_cache: Default::default(), tree_builds: Default::default(), checkpoint_build: Default::default(), ledger_loads: Default::default(), torn_floor_warned: std::sync::atomic::AtomicU64::new(u64::MAX), seal_rows_examined: Default::default(), token_rows: Default::default(), token_rows_written: Default::default() };
             st.backfill_receipts_index().unwrap();
             st.init_genesis(&gs).unwrap();
             let r = a_receipt(pid);
@@ -9575,6 +9707,128 @@ mod tests {
         assert!(s.register().is_err());
     }
 
+
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn commit_carries_this_builds_marker_to_the_new_head() {
+        let (_d, st, _gs, blocks) = chain_fixture_hooked(4, |_| {}, |st, h| {
+            if h == 2 {
+                st.set_checkpoint_build_for_testing(Some(SHA_A));
+                assert!(st.mark_verified_head().unwrap(), "marker at height 1");
+            }
+        });
+        let head = blocks.last().unwrap().block.clone();
+        assert_eq!(
+            st.verified_head().unwrap(),
+            Some(VerifiedHead { height: 4, block_hash: head.hash(), state_root: head.header.state_root, build_sha: SHA_A.into() })
+        );
+    }
+
+    #[test]
+    fn commit_does_not_create_a_marker() {
+        let (_d, st, _gs, _) = chain_fixture_hooked(3, |_| {}, |st, h| {
+            if h == 1 {
+                st.set_checkpoint_build_for_testing(Some(SHA_A));
+            }
+        });
+        assert_eq!(st.verified_head().unwrap(), None);
+    }
+
+    #[test]
+    fn commit_does_not_carry_another_builds_marker() {
+        let (_d, st, _gs, _) = chain_fixture_hooked(3, |_| {}, |st, h| {
+            if h == 2 {
+                st.set_checkpoint_build_for_testing(Some(SHA_A));
+                st.mark_verified_head().unwrap();
+                st.set_checkpoint_build_for_testing(Some(SHA_B));
+            }
+        });
+        let m = st.verified_head().unwrap().expect("the old row stays");
+        assert_eq!((m.height, m.build_sha.as_str()), (1, SHA_A), "not carried: it is another build's");
+    }
+
+    #[test]
+    fn commit_does_not_carry_a_stale_marker() {
+        let (_d, st, _gs, _) = chain_fixture_hooked(4, |_| {}, |st, h| {
+            if h == 2 {
+                st.set_checkpoint_build_for_testing(Some(SHA_A));
+                st.mark_verified_head().unwrap();
+                // As if another build committed block 2 without carrying it.
+                st.set_checkpoint_build_for_testing(None);
+            }
+            if h == 3 {
+                st.set_checkpoint_build_for_testing(Some(SHA_A));
+            }
+        });
+        let m = st.verified_head().unwrap().expect("the old row stays");
+        assert_eq!(m.height, 1, "head moved past it without this build, so it is never carried again");
+    }
+
+    #[test]
+    fn truncate_to_clears_the_marker() {
+        let (_d, st, gs, _) = chain_fixture(4);
+        st.set_checkpoint_build_for_testing(Some(SHA_A));
+        st.mark_verified_head().unwrap();
+        let c = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        st.truncate_to(&gs, 2, &c.ledger).unwrap();
+        assert_eq!(st.verified_head().unwrap(), None);
+    }
+
+    #[test]
+    fn only_a_clean_forty_hex_sha_is_a_trusted_build() {
+        assert_eq!(trusted_build(SHA_A), Some(SHA_A));
+        assert_eq!(trusted_build(&format!("{SHA_A}-dirty")), None);
+        assert_eq!(trusted_build("unknown"), None);
+        assert_eq!(trusted_build(&SHA_A[..39]), None);
+        assert_eq!(trusted_build(&SHA_A.to_uppercase()), None);
+        assert_eq!(trusted_build("gggggggggggggggggggggggggggggggggggggggg"), None);
+    }
+
+    #[test]
+    fn a_test_store_has_no_trusted_build_until_one_is_set() {
+        let (_d, st, _gs, _) = chain_fixture(2);
+        assert_eq!(st.checkpoint_build(), None);
+        assert!(!st.mark_verified_head().unwrap(), "no trusted build, no marker");
+        assert_eq!(st.verified_head().unwrap(), None);
+        st.set_checkpoint_build_for_testing(Some("unknown"));
+        assert_eq!(st.checkpoint_build(), None, "an untrusted sha stays untrusted");
+    }
+
+    #[test]
+    fn mark_verified_head_records_the_head_and_the_build() {
+        let (_d, st, _gs, blocks) = chain_fixture(3);
+        st.set_checkpoint_build_for_testing(Some(SHA_A));
+        assert!(st.mark_verified_head().unwrap());
+        let head = blocks.last().unwrap().block.clone();
+        assert_eq!(
+            st.verified_head().unwrap(),
+            Some(VerifiedHead { height: 3, block_hash: head.hash(), state_root: head.header.state_root, build_sha: SHA_A.into() })
+        );
+    }
+
+    #[test]
+    fn an_undecodable_marker_reads_as_none() {
+        let (_d, st, _gs, _) = chain_fixture(1);
+        st.db.put_cf(st.cf(CF_META), META_VERIFIED_HEAD, b"\x01\x02").unwrap();
+        assert_eq!(st.verified_head().unwrap(), None);
+    }
+
+    #[test]
+    fn replay_parses_and_unknown_modes_name_all_four() {
+        assert_eq!("replay".parse::<VerifyMode>().unwrap(), VerifyMode::Replay);
+        let err = "fast".parse::<VerifyMode>().unwrap_err();
+        assert_eq!(err, "unknown verify mode fast (off|quick|replay|full)");
+    }
+
+    #[test]
+    fn ledger_loads_counts_each_load() {
+        let (_d, st, _gs, _) = chain_fixture(1);
+        let before = st.ledger_loads();
+        st.load_ledger(&StubExecutor).unwrap();
+        assert_eq!(st.ledger_loads(), before + 1);
+    }
 }
 
 // ── sealing and pruning (block aggregation, spec §6) ─────────────────────────────────────────
@@ -10232,6 +10486,33 @@ mod seal_tests {
         assert_eq!(replayed.ledger.state_root(), l2.state_root(), "the same root");
         assert_eq!(replayed.ledger.supply(), l2.supply(), "the same counters");
         assert_eq!(replayed.ledger.unsealed_fees(), l2.unsealed_fees(), "the same bucket");
+        assert_eq!(
+            replayed.stored.as_ref().map(|l| l.state_root()),
+            Some(replayed.ledger.state_root()),
+            "the stored ledger is handed over"
+        );
+    }
+
+    #[test]
+    fn verify_chain_hands_over_the_stored_ledger_it_loaded() {
+        let (_d, st, gs, _) = chain_fixture(5);
+        for mode in [VerifyMode::Quick, VerifyMode::Replay, VerifyMode::Full] {
+            let loads = st.ledger_loads();
+            let c = st.verify_chain(&gs, mode, &StubExecutor).unwrap();
+            assert!(c.is_ok(), "{:?}", c.problem);
+            assert_eq!(st.ledger_loads(), loads + 1, "{mode:?}: one load");
+            let stored = c.stored.expect("the stored ledger is handed over");
+            assert_eq!(stored.state_root(), st.load_ledger(&StubExecutor).unwrap().state_root());
+        }
+    }
+
+    #[test]
+    fn verify_chain_hands_over_nothing_when_it_found_a_problem() {
+        let (_d, st, gs, _) = chain_fixture(6);
+        st.overwrite_block_bytes_for_testing(4, b"garbage").unwrap();
+        let c = st.verify_chain(&gs, VerifyMode::Quick, &StubExecutor).unwrap();
+        assert!(!c.is_ok());
+        assert!(c.stored.is_none());
     }
 
     /// A committed block 1 carrying `n` stub-proved bundles, each with its own nullifiers and

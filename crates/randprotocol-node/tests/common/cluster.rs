@@ -115,6 +115,19 @@ pub async fn start_in_pruned(
     block_interval: Duration,
     prune_history: Option<Duration>,
 ) -> TestNode {
+    start_in_verify(dir, key, bootstrap, validator, block_interval, prune_history, randprotocol_node::storage::VerifyMode::Full).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn start_in_verify(
+    dir: tempfile::TempDir,
+    key: &Keypair,
+    bootstrap: Vec<libp2p::Multiaddr>,
+    validator: bool,
+    block_interval: Duration,
+    prune_history: Option<Duration>,
+    verify: randprotocol_node::storage::VerifyMode,
+) -> TestNode {
     let handle = node::start(NodeConfig {
         viewing_open: false,
         datadir: dir.path().to_path_buf(),
@@ -127,7 +140,7 @@ pub async fn start_in_pruned(
         block_interval,
         base_timeout: Duration::from_millis(1500).max(block_interval * 10),
         max_timeout: Duration::from_secs(6).max(block_interval * 40),
-        verify: randprotocol_node::storage::VerifyMode::Full,
+        verify,
         keep_raw_proofs: false,
         min_free_disk_bytes: 0,
         verify_workers: None,

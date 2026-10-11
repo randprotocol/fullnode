@@ -396,7 +396,7 @@ one the cut announced; a mismatch on one node is almost always an old binary.
 | `--no-mdns` | off | disable LAN discovery (recommended on servers) |
 | `--block-interval-ms <MS>` | `1000` | minimum spacing between proposals |
 | `--view-timeout-ms <MS>` | `3000` | base view timeout; doubles per consecutive timeout up to 8x |
-| `--verify-chain <MODE>` | `quick` | startup integrity check: `off`, `quick` (structure + ledger replay), `full` (also proposer signatures and every QC's votes) |
+| `--verify-chain <MODE>` | `quick` | startup integrity check: `off`; `quick` (skipped when this same clean build already verified the store through its head — the startup checkpoint, `docs/architecture.md`; otherwise structure plus a ledger replay, which re-checks proposer signatures and bundle proofs); `replay` (`quick`, never skipped); `full` (`replay` plus every QC's votes) |
 | `--min-free-disk-mb <MB>` | `1024` | refuse to start with less free on the data directory's filesystem; `rand_getHealth` says `disk_low` under four times it (audit v4 OPS-3). `0` disables the guard |
 | `--prover <ADDR>` | off | host the delegated prover (`prover_*` JSON-RPC) on this address: a listener of its own, never the RPC — an address equal to `--rpc`, or a wildcard on `--rpc`'s port, is refused. Refuses to start without `<prover-home>/prover.key.json` (made by `rand-prover keygen`); every prover check runs, and the address is bound, before the node key is read or the database opened |
 | `--prover-home <DIR>` | `<datadir>/prover` | the prover's `prover.key.json` and `pairings.json` |
@@ -444,7 +444,7 @@ rand-node bench apply --blocks 10000 --report-every 500 --incremental-nullifier-
 | argument | default | meaning |
 |---|---|---|
 | `--datadir <DATADIR>` | required | data directory (node must not be running) |
-| `--mode <MODE>` | `full` | `quick` or `full`, as for `--verify-chain` |
+| `--mode <MODE>` | `full` | `quick`, `replay` or `full`, as for `--verify-chain` (no checkpoint here: `rand-node verify` always walks) |
 | `--repair` | off | truncate the damaged tail and rewrite the note, nullifier, anchor and validator families from the replayed ledger; safety state is kept |
 
 Exit code 0 if the chain is consistent, 2 if a problem was found and `--repair` was not given.

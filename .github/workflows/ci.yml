@@ -67,11 +67,10 @@ env:
   CARGO_TERM_COLOR: always
   # The circuits commit this tree's vendored crates were synced from (deploy/sync-zkvm.sh). Bump it
   # in the same commit as a re-vendor, or CI builds this workspace against a tree it did not vendor.
-  # 4a244b6 is circuits branch feat/tree-aggregation, not yet on zkp-circuits (synced before it was
-  # pushed, as 5ff7676 was; it is 92b750e plus docs and the tree tests' TreeConfig JSON printer);
-  # the rand-zkvm-cuda revs stay at the pushed 71e1a04, where rand-zkvm-cuda/ and research/ are
-  # identical to this commit's.
-  CIRCUITS_PIN: 4a244b604954b13420af419170ef458156a5bbe4
+  # 56b7061 is circuits branch feat/scan-compact: main c83b1c7 (tree aggregation, 4a244b6) plus
+  # viewing.rs's ScanKey and EnvelopeHead; recursion/ is 4a244b6's. The rand-zkvm-cuda revs stay
+  # at the pushed 71e1a04, where rand-zkvm-cuda/ is identical to this commit's.
+  CIRCUITS_PIN: 56b70611724930a5848ac5c0fd32ca2de8e61e2e
 
 jobs:
   check-and-test:
@@ -116,6 +115,16 @@ jobs:
         # into the fast job. A new cheap test has to be added here on purpose — that is the trade.
         run: |
           cargo test -p randprotocol-node --release --test submit --test ws
+          # Coverage push 2026-10-11: suites the nightly already ran, cheap and proof-free, that the
+          # fast job and the coverage measurement did not name. The prover service and its HTTP
+          # surface run on a stub prove function; the `rand`/`rand-node` binaries are driven as an
+          # operator runs them (loopback RPC fakes, no real node, no GPU); `network` is two or three
+          # libp2p swarms on 127.0.0.1. genesis_cli's aggregation-tree test (one minute alone) stays
+          # with the nightly.
+          cargo test -p randprotocol-prover --release --test http --test service --test pairing --test wire --test retired_flag --test cli
+          cargo test -p randprotocol-client --release --test cli_scripts --test cli_rpc --test cli_perp --test cli_token_bridge --test rpc_methods
+          cargo test -p randprotocol-node --release --test prover_hosted --test keygen_cli --test prover_flag --test network --test cli_multisig --test cli_staking --test cli_vesting --test cli_datadir --test cli_bridge_gov
+          cargo test -p randprotocol-node --release --test genesis_cli -- --skip aggregation_tree_section
           # The downstream repos' RPC contract (randscan, randbridge.org, randprotocol.org,
           # zusd.money): every field they read, by presence and JSON type. One validator, one
           # faucet mint, no proof.

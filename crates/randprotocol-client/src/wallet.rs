@@ -21,7 +21,7 @@
 
 use crate::prover::RemoteProver;
 use crate::tree::LocalTree;
-use crate::{AssetRow, ChainLimits, CommitmentRow, RpcClient};
+use crate::{AssetRow, ChainLimits, CommitmentRow, RpcClient, ScanLeaf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -41,7 +41,7 @@ use randprotocol_zkvm::executor::{prove_auth, prove_bundle_for, ZkExecutor};
 use randprotocol_zkvm::hidden::{self, HiddenDigestInput, HiddenDigestInputV3, HiddenOutput, A_SLOTS, SLOTS};
 use randprotocol_zkvm::machine::{Backend, FriProfile};
 use randprotocol_zkvm::notes::{Note, SpendKey, ViewingKey};
-use randprotocol_zkvm::viewing::TxKey;
+use randprotocol_zkvm::viewing::{EnvelopeHead, ScanKey, TxKey};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -75,12 +75,15 @@ pub struct Wallet {
     pub sk: SpendKey,
     pub vk: ViewingKey,
     pub address: ShieldedAddress,
+    /// The keys a scan opens envelopes with, derived from `vk` once: re-deriving the ML-KEM
+    /// keypair for every leaf was nearly half of what a scan spent per leaf.
+    pub scan_key: ScanKey,
 }
 
 impl Wallet {
     pub fn from_spend_key(sk: SpendKey) -> Wallet {
         let vk = sk.viewing_key();
-        Wallet { sk, vk, address: address_of(&vk) }
+        Wallet { sk, vk, address: address_of(&vk), scan_key: vk.scan_key() }
     }
 
     pub fn generate() -> Wallet {
@@ -660,8 +663,8 @@ pub fn output_keys(w: &Wallet, tx: &Transaction) -> Vec<OutputKey> {
         let env = envelope_from_core(e);
         // Opening under the KEM is not ownership (see [`Found`]): only a note naming this
         // wallet's `pk` is received.
-        let received = env.open_as_receiver(cm, &w.vk).filter(|(_, n)| n.pk == w.vk.pk());
-        let sent = env.open_as_sender(cm, &w.vk);
+        let received = env.open_as_receiver_with(cm, &w.scan_key).filter(|(_, n)| n.pk == w.vk.pk());
+        let sent = env.open_as_sender_with(cm, &w.scan_key);
         let (role, (key, note)) = match (received, sent) {
             (Some(r), Some(_)) => (KeyRole::Change, r),
             (Some(r), None) => (KeyRole::Received, r),
@@ -737,7 +740,7 @@ fn is_dummy(note: &Note) -> bool {
 pub fn classify(w: &Wallet, cm: Word8, envelope: &Envelope) -> Found {
     let env = envelope_from_core(envelope);
     let mut why = NOT_OURS;
-    if let Some((key, note)) = env.open_as_receiver(cm, &w.vk) {
+    if let Some((key, note)) = env.open_as_receiver_with(cm, &w.scan_key) {
         if note.pk == w.vk.pk() {
             return if is_dummy(&note) { Found::Skipped(DUMMY) } else { Found::Received(note, env.memo(cm, &key)) };
         }
@@ -745,7 +748,7 @@ pub fn classify(w: &Wallet, cm: Word8, envelope: &Envelope) -> Found {
     }
     // Still worth the sender path: an envelope this wallet sealed for someone else is opened
     // through `ovk`, not through the KEM, so the two openings are independent.
-    if let Some((key, note)) = env.open_as_sender(cm, &w.vk) {
+    if let Some((key, note)) = env.open_as_sender_with(cm, &w.scan_key) {
         return if is_dummy(&note) { Found::Skipped(DUMMY) } else { Found::Sent(note, env.memo(cm, &key)) };
     }
     Found::Skipped(why)
@@ -1206,6 +1209,65 @@ enum ScanPass {
     RebuildTree,
 }
 
+/// Whether [`classify`] could find anything in a leaf whose envelope has this head: a head of
+/// exactly [`EnvelopeHead`]'s size that one of `w`'s keys opens, or a head of any other non-zero
+/// length, which is read in full rather than guessed at. An empty head opens for nobody.
+fn may_be_ours(w: &Wallet, leaf: &ScanLeaf) -> bool {
+    if leaf.head.is_empty() {
+        return false;
+    }
+    match EnvelopeHead::from_bytes(&leaf.head) {
+        Some(head) => head.receiver_key(leaf.cm, &w.scan_key).is_some() || head.sender_key(leaf.cm, &w.scan_key).is_some(),
+        None => true,
+    }
+}
+
+/// Leaves further apart than this are fetched in separate `rand_getCommitments` reads; closer
+/// ones in one, the few envelopes between them read for nothing.
+const FETCH_GAP: u64 = 8;
+
+/// One page of leaves from `from`, as [`offer_row`] takes them. Against a node that serves scan
+/// heads, the page is read as heads and only the leaves [`may_be_ours`] — and the ones `rebuilt`
+/// does not already account for — are read again in full; every other row carries an empty
+/// envelope, which [`classify`] skips exactly as it would have skipped the real one. Against an
+/// older node, the page is read in full.
+async fn leaf_page(rpc: &RpcClient, w: &Wallet, from: u64, rebuilt: &BTreeMap<Word8, Note>) -> Result<Vec<CommitmentRow>> {
+    let Some(leaves) = rpc.scan_leaves(from, PAGE).await? else {
+        return rpc.commitments(from, PAGE).await;
+    };
+    let wanted: Vec<u64> = leaves.iter().filter(|l| !rebuilt.contains_key(&l.cm) && may_be_ours(w, l)).map(|l| l.index).collect();
+    let mut full: BTreeMap<u64, CommitmentRow> = BTreeMap::new();
+    let mut i = 0;
+    while i < wanted.len() {
+        let start = wanted[i];
+        let mut end = start;
+        while i + 1 < wanted.len() && wanted[i + 1] - end <= FETCH_GAP {
+            i += 1;
+            end = wanted[i];
+        }
+        i += 1;
+        let span = (end - start + 1) as usize;
+        for row in rpc.commitments(start, span).await? {
+            full.insert(row.index, row);
+        }
+    }
+    leaves
+        .into_iter()
+        .map(|l| match full.remove(&l.index) {
+            // The node's two answers for one leaf must agree, or its envelope is not this leaf's.
+            Some(row) if row.cm == l.cm && row.height == l.height => Ok(row),
+            Some(_) => Err(anyhow!("getCommitments and getScanLeaves disagree about leaf {}", l.index)),
+            None if wanted.binary_search(&l.index).is_ok() => Err(anyhow!("getCommitments did not serve leaf {}", l.index)),
+            None => Ok(CommitmentRow {
+                index: l.index,
+                cm: l.cm,
+                envelope: Envelope { kem_ct: Vec::new(), to_receiver: Vec::new(), to_sender: Vec::new(), body: Vec::new() },
+                height: l.height,
+            }),
+        })
+        .collect()
+}
+
 /// One scan pass: page every commitment this wallet has not seen yet, growing the wallet's own
 /// commitment tree with every leaf read, then mark as spent every note whose nullifier the chain
 /// has published. Advances the store and saves nothing — the caller owns the file.
@@ -1220,7 +1282,7 @@ async fn scan_pass(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result
     let mut tip: Option<u64> = None;
 
     loop {
-        let rows = rpc.commitments(store.scanned_index, PAGE).await?;
+        let rows = leaf_page(rpc, w, store.scanned_index, &rebuilt).await?;
         if rows.is_empty() {
             break;
         }
@@ -1249,7 +1311,7 @@ async fn scan_pass(rpc: &RpcClient, w: &Wallet, store: &mut NoteStore) -> Result
     // deposit is in the store from then on.
     let mut from = 0;
     while !rebuilt.is_empty() {
-        let rows = rpc.commitments(from, PAGE).await?;
+        let rows = leaf_page(rpc, w, from, &rebuilt).await?;
         if rows.is_empty() {
             // Every leaf there is has been offered and some rebuilt note still has no leaf: the
             // node rendered a public-note transaction whose commitment its own tree does not hold.
@@ -5150,6 +5212,115 @@ mod tests {
         randprotocol_zkvm::address::seal_note(&from.vk, &to.address, note, &TxKey::random()).unwrap()
     }
 
+    /// A chain with every kind of leaf a scan meets: notes received, a note sent, a change note
+    /// (sealed to and owned by this wallet), a zero-value dummy sealed to it, a note sealed to it
+    /// but owned by another key, strangers' traffic, garbage and empty envelopes, a head of the
+    /// wrong length, and the three public-note deposits/mints whose envelopes are garbage.
+    fn every_kind_of_leaf(me: &Wallet) -> ChainState {
+        let stranger = Wallet::from_spend_key(SpendKey([12; 8]));
+        let mut c = ChainState::new();
+        let (txs, notes) = public_notes_for(me);
+        for (tx, note) in txs.into_iter().zip(&notes) {
+            c.commit(vec![tx], vec![(note.commitment(), garbage())]);
+        }
+        c.fund(me, 40, 0);
+        let leaf = |from: &Wallet, to: &Wallet, owner: &Wallet, amount: u64, t: u32| {
+            let n = Note::new(owner.vk.pk(), from.vk.pk(), amount, 0, t);
+            (n.commitment(), sealed(from, to, &n))
+        };
+        let block = vec![
+            leaf(me, &stranger, &stranger, 3, 1),  // sent
+            leaf(me, me, me, 36, 1),               // change
+            leaf(me, me, me, 0, 1),                // a dummy sealed to me
+            leaf(&stranger, me, &stranger, 9, 1),  // sealed to me, owned by another key
+        ];
+        c.commit(Vec::new(), block);
+        for t in 0..20 {
+            let l = leaf(&stranger, &stranger, &stranger, 5 + t as u64, t);
+            c.commit(Vec::new(), vec![l]);
+        }
+        let odd_note = Note::new(me.vk.pk(), stranger.vk.pk(), 11, 0, 4);
+        let mut odd = sealed(&stranger, me, &odd_note);
+        odd.to_sender.push(0); // a head one byte long: read in full, never guessed at
+        c.commit(Vec::new(), vec![(odd_note.commitment(), odd)]);
+        c.commit(Vec::new(), vec![(Note::new(stranger.vk.pk(), stranger.vk.pk(), 1, 0, 9).commitment(), Envelope { kem_ct: vec![], to_receiver: vec![], to_sender: vec![], body: vec![] })]);
+        c.fund(me, 7, 0);
+        c
+    }
+
+    /// The scan-head path (`rand_getScanLeaves`, bodies fetched only for the leaves a key opens)
+    /// ends with exactly the store the full path (`rand_getCommitments` for every leaf) ends with,
+    /// and reads far fewer full envelopes doing it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_over_heads_finds_exactly_what_a_full_scan_finds() {
+        let me = Wallet::from_spend_key(SpendKey([13; 8]));
+        let mut c = every_kind_of_leaf(&me);
+        c.headers_carry_public_notes = true;
+        let leaves = c.leaves.len();
+        let chain = Arc::new(Mutex::new(c));
+        let mut stores = Vec::new();
+        let mut served = Vec::new();
+        for heads in [false, true] {
+            {
+                let mut c = chain.lock().unwrap();
+                (c.scan_leaves, c.full_rows_served, c.scan_leaf_asks) = (heads, 0, 0);
+            }
+            // A client of its own each time: the fallback is remembered per client.
+            let rpc = serve(&chain).await;
+            let mut store = NoteStore::default();
+            scan(&rpc, &me, &mut store).await.unwrap();
+            assert_eq!(store.scanned_index, leaves as u64);
+            let c = chain.lock().unwrap();
+            served.push((c.full_rows_served, c.scan_leaf_asks, leaves));
+            stores.push(serde_json::to_value(&store).unwrap());
+        }
+        assert_eq!(stores[0], stores[1], "the same notes, sent rows, cursor and tree either way");
+        let notes = stores[1]["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 3 + 2 + 1 + 1, "three public notes, two fundings, the change, the odd-head note");
+        assert_eq!(stores[1]["sent"].as_array().unwrap().len(), 1);
+        let (legacy_rows, _, leaves) = served[0];
+        let (head_rows, head_asks, _) = served[1];
+        assert!(legacy_rows >= leaves, "the full path reads every envelope");
+        // Read in full: the two fundings, sent, change, dummy, owned-by-another, the odd head —
+        // never a stranger's leaf, a garbage envelope, nor a public note (found from its
+        // transaction, not its envelope). The one extra row is the empty envelope at leaf 29,
+        // inside `FETCH_GAP` of the odd head (28) and the second funding (30), so read in the
+        // same request rather than a request of its own.
+        assert_eq!(head_rows, 7 + 1, "only the leaves a key opens, the head it cannot split, and one gap row");
+        assert!(head_asks >= 1);
+    }
+
+    /// Against a node without `rand_getScanLeaves`, the scan falls back to full pages and asks
+    /// for the method once per client, not once per page.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_without_scan_heads_is_asked_once_then_paged_in_full() {
+        let me = Wallet::from_spend_key(SpendKey([14; 8]));
+        let mut c = every_kind_of_leaf(&me);
+        c.headers_carry_public_notes = true;
+        let chain = Arc::new(Mutex::new(c));
+        let rpc = serve(&chain).await;
+        let mut store = NoteStore::default();
+        scan(&rpc, &me, &mut store).await.unwrap();
+        chain.lock().unwrap().fund(&me, 2, 0);
+        scan(&rpc, &me, &mut store).await.unwrap();
+        assert_eq!(chain.lock().unwrap().scan_leaf_asks, 1, "one -32601, remembered by the client");
+        assert_eq!(store.notes.len(), 3 + 2 + 1 + 1 + 1);
+    }
+
+    /// A refusal that is not "no such method" is an error of the scan, not a reason to fall back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_scan_head_page_fails_the_scan() {
+        let me = Wallet::from_spend_key(SpendKey([15; 8]));
+        let mut c = every_kind_of_leaf(&me);
+        c.scan_leaves = true;
+        c.fail = Some("rand_getScanLeaves");
+        let chain = Arc::new(Mutex::new(c));
+        let rpc = serve(&chain).await;
+        let err = scan(&rpc, &me, &mut NoteStore::default()).await.unwrap_err();
+        assert!(err.to_string().contains("injected"), "{err}");
+        assert_eq!(chain.lock().unwrap().full_rows_served, 0, "no silent fallback to full pages");
+    }
+
     #[test]
     fn scan_only_records_notes_this_wallet_actually_owns() {
         let me = Wallet::from_spend_key(SpendKey([11; 8]));
@@ -5411,6 +5582,13 @@ mod tests {
         stall_header_page: Option<u64>,
         /// The span of every `rand_getBlocks` range this node was asked for, in order.
         header_pages: Vec<u64>,
+        /// Whether this fake serves `rand_getScanLeaves`, as a node since the scan-head change
+        /// does; off by default, an older node that answers `-32601`.
+        scan_leaves: bool,
+        /// How many `rand_getScanLeaves` calls this node has answered, refused ones included.
+        scan_leaf_asks: usize,
+        /// How many rows (full envelopes) `rand_getCommitments` has served in all.
+        full_rows_served: usize,
         /// `rand_getLimits`' `envelope_bytes` (task 7): `None` — this fake's default — is a chain
         /// that predates the field, same as a genuinely absent one; `Some(MEMO_ENVELOPE_BYTES)`
         /// is the memo format.
@@ -5494,6 +5672,9 @@ mod tests {
                 stall_header_page: None,
                 header_pages: Vec::new(),
                 envelope_bytes: None,
+                scan_leaves: false,
+                scan_leaf_asks: 0,
+                full_rows_served: 0,
                 hc_bundle: ZkExecutor::hc_bundle(),
                 hc_auth: None,
                 binding_domain: 1,
@@ -5569,6 +5750,15 @@ mod tests {
                     return Reply::Stall;
                 }
             }
+            if method == "rand_getScanLeaves" {
+                self.scan_leaf_asks += 1;
+                if !self.scan_leaves {
+                    return Reply::Err(-32601, "unknown method");
+                }
+            }
+            if method == "rand_getCommitments" {
+                self.full_rows_served += self.leaves.len().saturating_sub(n(0) as usize).min(n(1) as usize);
+            }
             Reply::Ok(match method {
                 "rand_getHead" => json!({ "height": head }),
                 "rand_getGenesisHash" => json!(self.genesis.to_hex()),
@@ -5614,6 +5804,18 @@ mod tests {
                     .skip(n(0) as usize)
                     .take(n(1) as usize)
                     .map(|(i, (cm, e, h))| json!({ "index": i, "cm": word8_to_hex(cm), "envelope": envelope_json(e), "height": h }))
+                    .collect::<Vec<_>>()),
+                "rand_getScanLeaves" => json!(self
+                    .leaves
+                    .iter()
+                    .enumerate()
+                    .skip(n(0) as usize)
+                    .take(n(1) as usize)
+                    .map(|(i, (cm, e, h))| {
+                        use base64::Engine as _;
+                        let head = [&e.kem_ct[..], &e.to_receiver, &e.to_sender].concat();
+                        json!({ "index": i, "cm": word8_to_hex(cm), "scan": base64::engine::general_purpose::STANDARD.encode(head), "height": h })
+                    })
                     .collect::<Vec<_>>()),
                 "rand_getNullifiers" => json!(self
                     .nullifiers
