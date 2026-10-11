@@ -8,7 +8,9 @@
 #
 #   The msauth verifier key (private multisig, v0.8.0+, plan Task 2b) is the fifth argument or
 #   MSAUTH_VK. A node on a chain naming `hc_auth_multisig` refuses to start without it, so the roll
-#   is refused without one unless NO_MSAUTH_VK=1 says the chain has no multisig. Each host checks
+#   is refused without one unless NO_MSAUTH_VK=1 says the chain has no multisig — itself refused
+#   when any droplet's genesis (`<datadir>/genesis.json` of its rand-node unit) names
+#   hc_auth_multisig or cannot be read, before anything is copied. Each host checks
 #   the copy with the binary being installed: `rand-node.new keygen-msauth-vk --check` must equal
 #   its own `--print-pinned production` (the SHA-256 pin compiled into that build); a mismatch
 #   skips that host's install, binaries included. Installed to
@@ -42,10 +44,6 @@ if [ -n "$MSAUTH_VK" ]; then
 elif [ "${NO_MSAUTH_VK:-}" != 1 ]; then
   echo "no msauth-vk-production.bin (fifth argument or MSAUTH_VK): a v0.8.0+ node on a chain naming hc_auth_multisig refuses to start without it; pass it, or NO_MSAUTH_VK=1 for a chain without multisig"; exit 1
 fi
-# TASK-3: once the genesis carries `hc_auth_multisig` (plan Task 3 wires `chain_has_msauth`),
-# refuse NO_MSAUTH_VK=1 when a host's genesis names it — read it on the host (e.g. a
-# `rand-node` genesis query against /root/genesis.json) before the install loop, and exit with
-# "NO_MSAUTH_VK=1 but <host>'s genesis names hc_auth_multisig". Until then no chain names it.
 . deploy/lib/verify-release.sh
 if [ -n "${RELEASE_SUMS:-}" ] || [ -n "${RELEASE_SIG:-}" ]; then
   { [ -n "${RELEASE_SUMS:-}" ] && [ -n "${RELEASE_SIG:-}" ]; } || { echo "RELEASE_SUMS and RELEASE_SIG go together: the release's SHA256SUMS and its SHA256SUMS.sig"; exit 1; }
@@ -66,6 +64,27 @@ fi
 [ "$(shasum -a 256 "$NODE_BIN" | cut -d' ' -f1)" = "$WANT" ] || { echo "local $NODE_BIN does not match $WANT"; exit 1; }
 [ "$(shasum -a 256 "$WALLET_BIN" | cut -d' ' -f1)" = "$WANT_WALLET" ] || { echo "local $WALLET_BIN does not match $WANT_WALLET"; exit 1; }
 IPS=$(grep -oE '/ip4/[0-9.]+' deploy/nodes.env | cut -d/ -f3 | sort -u)
+# NO_MSAUTH_VK=1 says "this chain has no multisig"; a host whose genesis names hc_auth_multisig
+# proves it wrong, and its new node would refuse to start without the blob (plan Task 3). So,
+# before anything is copied, every droplet's genesis is read where the node reads it: the
+# `--datadir` of the installed rand-node unit (the last one, as the cutover scripts read it),
+# `<datadir>/genesis.json` (`node::load_genesis`). The check is a grep for the key
+# `"hc_auth_multisig"`: serde writes every present field under its name and omits an absent one,
+# so the key is in the file exactly when the genesis names it — no binary, no RPC, no running
+# node needed (the cheapest reliable read; `rand_status` would need the node up and Task 5's
+# field). A host whose genesis cannot be read refuses the roll too: "no multisig" is then
+# unproved. Node A's launchd job (retired since 2026-09-27) is not read; pass the blob if it runs.
+if [ -z "$MSAUTH_VK" ]; then
+  for ip in $IPS; do
+    ms=$(ssh -o ConnectTimeout=15 -o BatchMode=yes root@$ip 'D=$(systemctl cat rand-node 2>/dev/null | grep -o -- "--datadir [^ ]*" | tail -1 | cut -d" " -f2); [ -n "$D" ] && [ -r "$D/genesis.json" ] || { echo "unreadable ${D:-<no --datadir in the rand-node unit>}/genesis.json"; exit 0; }; if grep -q "\"hc_auth_multisig\"" "$D/genesis.json"; then echo "multisig $D/genesis.json"; else echo "plain"; fi' 2>/dev/null)
+    case "$ms" in
+      plain) ;;
+      multisig*) echo "NO_MSAUTH_VK=1 but $ip's genesis names hc_auth_multisig (${ms#multisig }): its node refuses to start without msauth-vk-production.bin — pass it (fifth argument or MSAUTH_VK)"; exit 1 ;;
+      *) echo "NO_MSAUTH_VK=1 but $ip's genesis could not be read (${ms:-ssh failed}): cannot confirm the chain has no hc_auth_multisig — pass msauth-vk-production.bin, or fix the host first"; exit 1 ;;
+    esac
+  done
+  [ -f ~/Library/LaunchAgents/org.randprotocol.node-a.plist ] && echo "   note: node A's launchd job is installed and its genesis is not checked under NO_MSAUTH_VK=1"
+fi
 echo "== install (no restart) $(date -u +%H:%M:%S)"
 # The msauth key blob's check and install, run on the host before the binaries' install (empty
 # when the roll carries no blob): the copy is intact (sha256) and is the blob the build being
