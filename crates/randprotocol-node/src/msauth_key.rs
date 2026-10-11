@@ -135,3 +135,103 @@ pub fn startup(
     let path = resolve_path(opts, profile)?;
     load_msauth_key(&path, profile, true, opts.build, |blob| executor.install_msauth_vk(blob))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use randprotocol_zkvm::executor::ZkExecutor;
+
+    fn never(_: &[u8]) -> Result<(), String> {
+        panic!("the key file must not be read or installed here")
+    }
+
+    /// A missing file on a multisig chain fails the start, naming the path and the expected
+    /// SHA-256, and builds nothing.
+    #[test]
+    fn a_missing_key_file_fails_naming_the_path_and_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("msauth-vk-test.bin");
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let e = load_msauth_key(&path, FriProfile::Test, true, false, never).unwrap_err().to_string();
+        assert!(e.contains(&path.display().to_string()), "{e}");
+        assert!(e.contains(&format!("expected sha256 {}", msauth_vk::pin(FriProfile::Test))), "{e}");
+        assert!(e.contains("--build-msauth-key"), "{e}");
+        assert_eq!(ex.msauth_key_builds(), 0);
+        assert!(!ex.msauth_key_ready());
+    }
+
+    /// A present file whose SHA-256 is not the pin is refused with the path, its digest and the
+    /// expected one — through the real executor, which builds nothing.
+    #[test]
+    fn a_wrong_digest_fails_naming_the_path_got_and_expected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("msauth-vk-test.bin");
+        std::fs::write(&path, b"not the msauth key").unwrap();
+        let got = msauth_vk::digest(b"not the msauth key");
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let e = load_msauth_key(&path, FriProfile::Test, true, false, |b| ex.install_msauth_vk(b).map_err(|e| e.to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(&path.display().to_string()), "{e}");
+        assert!(e.contains(&format!("has sha256 {got}")), "{e}");
+        assert!(e.contains(&format!("expected sha256 {}", msauth_vk::pin(FriProfile::Test))), "{e}");
+        assert_eq!(ex.msauth_key_builds(), 0);
+        assert_eq!(ex.msauth_machine_key_builds(), 0);
+        assert!(!ex.msauth_key_ready());
+    }
+
+    /// `--build-msauth-key` is the only build path: a missing file is `Built` only with it set,
+    /// and a present-but-refused file is an error even with it (a wrong blob is never papered
+    /// over by a build).
+    #[test]
+    fn only_the_build_flag_turns_a_missing_file_into_a_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.bin");
+        assert!(load_msauth_key(&missing, FriProfile::Test, true, false, never).is_err());
+        assert_eq!(load_msauth_key(&missing, FriProfile::Test, true, true, never).unwrap(), MsauthKeySource::Built);
+        let wrong = dir.path().join("wrong.bin");
+        std::fs::write(&wrong, b"x").unwrap();
+        assert!(load_msauth_key(&wrong, FriProfile::Test, true, true, |_| Err("refused".into())).is_err());
+    }
+
+    /// A chain without `hc_auth_multisig` needs no key: `Absent`, and the path is never read.
+    #[test]
+    fn a_chain_without_multisig_never_reads_the_path() {
+        let path = Path::new("/nonexistent/msauth-vk-production.bin");
+        assert_eq!(load_msauth_key(path, FriProfile::Production, false, false, never).unwrap(), MsauthKeySource::Absent);
+        assert_eq!(load_msauth_key(path, FriProfile::Production, false, true, never).unwrap(), MsauthKeySource::Absent);
+    }
+
+    /// The path order: `--msauth-vk`, then `RAND_MSAUTH_VK`, then the file beside the binary.
+    #[test]
+    fn the_flag_wins_and_the_default_is_beside_the_binary() {
+        let flag = MsauthKeyOptions { path: Some(PathBuf::from("/x/key.bin")), build: false };
+        assert_eq!(resolve_path(&flag, FriProfile::Production).unwrap(), PathBuf::from("/x/key.bin"));
+        if std::env::var_os(ENV_PATH).is_none() {
+            let p = resolve_path(&MsauthKeyOptions::default(), FriProfile::Production).unwrap();
+            assert_eq!(p.file_name().unwrap(), "msauth-vk-production.bin");
+            assert_eq!(p.parent(), std::env::current_exe().unwrap().parent());
+        }
+    }
+
+    /// No deploy script ever builds the key on a validator: `--build-msauth-key` is development
+    /// only, and the roll ships the blob.
+    #[test]
+    fn no_deploy_script_passes_the_build_flag() {
+        let deploy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy");
+        let mut stack = vec![deploy];
+        let mut seen = 0;
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if let Ok(s) = std::fs::read_to_string(&p) {
+                    seen += 1;
+                    assert!(!s.contains("--build-msauth-key"), "{} passes --build-msauth-key", p.display());
+                }
+            }
+        }
+        assert!(seen > 10, "read the deploy directory");
+    }
+}
