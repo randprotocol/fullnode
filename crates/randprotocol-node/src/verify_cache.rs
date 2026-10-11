@@ -491,6 +491,9 @@ mod tests {
         fail_bundle: bool,
         /// `verify_auth` answers this without asking the stub (a fixed `Ok`).
         auth_ok: Option<Word8>,
+        /// Answer the defaulted methods as the stub does, for a test that runs a real ledger
+        /// (which would refuse `Counting`'s distinctive values); the verifiers still count.
+        plain: bool,
     }
 
     /// `Counting`'s answer for every `decode_*`: no stub proof decodes to tier 77.
@@ -503,6 +506,9 @@ mod tests {
         }
         fn bump(&self, k: Kind) {
             self.verifies[k as usize].fetch_add(1, Ordering::SeqCst);
+        }
+        fn plain() -> Self {
+            Self { plain: true, ..Self::default() }
         }
         fn decoded(&self) -> Result<CallOutcome, ConfidentialError> {
             self.decodes.fetch_add(1, Ordering::SeqCst);
@@ -517,35 +523,50 @@ mod tests {
         fn check_program(&self, base_pc: u32, words: &[u32]) -> Result<Vec<u8>, ConfidentialError> {
             self.stub.check_program(base_pc, words)
         }
-        fn max_callable_program_words(&self, _: usize) -> Option<usize> {
+        fn max_callable_program_words(&self, n: usize) -> Option<usize> {
+            if self.plain {
+                return self.stub.max_callable_program_words(n);
+            }
             Some(31_337)
         }
         fn verify_call(&self, p: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
             self.bump(Kind::Call);
             self.stub.verify_call(p, proof)
         }
-        fn decode_call(&self, _: &ProgramRecord, _: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+        fn decode_call(&self, p: &ProgramRecord, proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            if self.plain {
+                return self.stub.decode_call(p, proof);
+            }
             self.decoded()
         }
         fn verify_call_hardened(&self, p: &ProgramRecord, proof: &[u8], s: &[u32]) -> Result<CallOutcome, ConfidentialError> {
             self.bump(Kind::CallHardened);
             self.stub.verify_call_hardened(p, proof, s)
         }
-        fn decode_call_hardened(&self, _: &ProgramRecord, _: &[u8], _: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+        fn decode_call_hardened(&self, p: &ProgramRecord, proof: &[u8], s: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+            if self.plain {
+                return self.stub.decode_call_hardened(p, proof, s);
+            }
             self.decoded()
         }
         fn verify_invoke(&self, p: &ProgramRecord, proof: &[u8], s: &[u32]) -> Result<CallOutcome, ConfidentialError> {
             self.bump(Kind::Invoke);
             self.stub.verify_invoke(p, proof, s)
         }
-        fn decode_invoke(&self, _: &ProgramRecord, _: &[u8], _: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+        fn decode_invoke(&self, p: &ProgramRecord, proof: &[u8], s: &[u32]) -> Result<CallOutcome, ConfidentialError> {
+            if self.plain {
+                return self.stub.decode_invoke(p, proof, s);
+            }
             self.decoded()
         }
         fn verify_perp(&self, hc: &Word8, max_tier: u8, s: &[u32], proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
             self.bump(Kind::Perp);
             self.stub.verify_perp(hc, max_tier, s, proof)
         }
-        fn decode_perp(&self, _: &Word8, _: u8, _: &[u32], _: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+        fn decode_perp(&self, hc: &Word8, max_tier: u8, s: &[u32], proof: &[u8]) -> Result<CallOutcome, ConfidentialError> {
+            if self.plain {
+                return self.stub.decode_perp(hc, max_tier, s, proof);
+            }
             self.decoded()
         }
         fn warm(&self, _: &ProgramRecord) {
@@ -585,10 +606,16 @@ mod tests {
             }
             self.stub.verify_auth(hc, proof, b)
         }
-        fn bundle_gas_limit(&self, _: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+        fn bundle_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            if self.plain {
+                return self.stub.bundle_gas_limit(proof);
+            }
             Ok(Some(1_111))
         }
-        fn auth_gas_limit(&self, _: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+        fn auth_gas_limit(&self, proof: &[u8]) -> Result<Option<u64>, ConfidentialError> {
+            if self.plain {
+                return self.stub.auth_gas_limit(proof);
+            }
             Ok(Some(2_222))
         }
         fn verify_bundle(&self, hc: &Word8, proof: &[u8], b: &[u32; TX_BINDING_WORDS]) -> Result<(), ConfidentialError> {
@@ -604,13 +631,19 @@ mod tests {
         fn warm_auth(&self) {
             self.warmed("warm_auth")
         }
-        fn non_canonical_proof(&self, _: &[u8]) -> Option<String> {
+        fn non_canonical_proof(&self, proof: &[u8]) -> Option<String> {
+            if self.plain {
+                return self.stub.non_canonical_proof(proof);
+            }
             Some("counting".into())
         }
         fn aggregate_program_digest(&self, s: &DeclaredShape) -> Result<[u64; 4], ConfidentialError> {
             self.stub.aggregate_program_digest(s)
         }
-        fn check_aggregate_header(&self, _: &[u8]) -> Result<(), ConfidentialError> {
+        fn check_aggregate_header(&self, proof: &[u8]) -> Result<(), ConfidentialError> {
+            if self.plain {
+                return self.stub.check_aggregate_header(proof);
+            }
             Err(ConfidentialError::Disabled)
         }
         fn verify_aggregate(
@@ -626,10 +659,16 @@ mod tests {
         fn warm_aggregation(&self, _: &DeclaredShape, _: u32) {
             self.warmed("warm_aggregation")
         }
-        fn aggregate_proof_tier(&self, _: &[u8]) -> Result<u8, ConfidentialError> {
+        fn aggregate_proof_tier(&self, proof: &[u8]) -> Result<u8, ConfidentialError> {
+            if self.plain {
+                return self.stub.aggregate_proof_tier(proof);
+            }
             Ok(99)
         }
-        fn tree_digests(&self, _: &TreeConfig) -> Result<TreeDigests, ConfidentialError> {
+        fn tree_digests(&self, t: &TreeConfig) -> Result<TreeDigests, ConfidentialError> {
+            if self.plain {
+                return self.stub.tree_digests(t);
+            }
             Ok(TreeDigests { vk_leaf: [9; 4], steps: vec![] })
         }
         fn verify_tree(
@@ -999,5 +1038,157 @@ mod tests {
         // None of this touched a verifier or the cache.
         assert!(KINDS.iter().all(|k| inner.count(*k) == 0));
         assert_eq!(ex.cache().hits() + ex.cache().misses(), 0);
+    }
+
+    // ---------------------------------- the reuse contract, through a real ledger (spec §4)
+
+    use crate::storage::fixtures::{bundle_fee, bundle_tx, env, genesis_of, key, pad4, stub_pruned_facts, HC};
+    use randprotocol_core::ledger::aggregation::{AdmittedShape, AggregationConfig};
+    use randprotocol_core::types::actions::{aggregate_signing_hash, aggregator_register_message, AggregatorRegistration};
+    use randprotocol_core::types::{Action, AggregateLayout};
+    use randprotocol_core::{Keypair, Ledger, ShieldedAddress, Transaction};
+
+    /// A one-validator stub-executor ledger at height 1 and a valid stub bundle over it.
+    fn bundle_ledger() -> (Ledger, Transaction) {
+        let mut l = genesis_of(7, &[&key(1)], vec![], 2).ledger;
+        l.set_height(1);
+        let tx = bundle_tx(&l, [[1; 8], [2; 8]], [[3; 8], [4; 8]], bundle_fee());
+        (l, tx)
+    }
+
+    /// Admission (`validate`) then apply (`apply_tx`, which passes `NoVerified` and so verifies
+    /// the proof again) through one cache: the bundle verifier runs once. The control, the same
+    /// two calls on the bare executor, shows apply does verify: there it runs twice.
+    #[test]
+    fn a_ledger_apply_after_validate_reuses_the_bundle_verdict() {
+        let (l, tx) = bundle_ledger();
+        let proposer = key(1).address();
+
+        let bare = Counting::plain();
+        l.validate(&tx, &bare).unwrap();
+        l.clone().apply_tx(&tx, &proposer, &bare).unwrap();
+        assert_eq!(bare.count(Kind::Bundle), 2, "without the cache, apply verifies the bundle again");
+
+        let inner = Arc::new(Counting::plain());
+        let cx = CachingExecutor::new(inner.clone());
+        l.validate(&tx, &cx).unwrap();
+        assert_eq!(inner.count(Kind::Bundle), 1, "admission verified the bundle");
+        l.clone().apply_tx(&tx, &proposer, &cx).unwrap();
+        assert_eq!(inner.count(Kind::Bundle), 1, "apply reused admission's verdict");
+        assert_eq!((cx.cache().hits(), cx.cache().misses()), (1, 1));
+    }
+
+    /// A ledger under an aggregation section that admits the stub bundle's shape, with `kp`
+    /// registered as an aggregator and one applied bundle in the coverable set: the ledger, that
+    /// bundle's hash and its covered record.
+    fn aggregate_ledger(kp: &Keypair) -> (Ledger, Hash, CoveredBundle) {
+        let (mut l, covered_tx) = bundle_ledger();
+        let facts = stub_pruned_facts(&covered_tx);
+        let ux = StubExecutor;
+        l.set_aggregation(Some(AggregationConfig {
+            bond: 100 * randprotocol_core::UNITS_PER_RAND,
+            max_covers: 3,
+            subsidy_base: 100 * randprotocol_core::UNITS_PER_RAND,
+            halving_blocks: 210_000,
+            window: 256,
+            admitted_shapes: vec![AdmittedShape {
+                shape: facts.shape,
+                hc: Hash(randprotocol_core::notes::word8_to_bytes(&HC)),
+                aggregate_program_digest: ux.aggregate_program_digest(&facts.shape).unwrap(),
+            }],
+        }));
+        let proposer = key(1).address();
+        l.apply_tx(&covered_tx, &proposer, &ux).unwrap();
+        // The registration bundle burns exactly the bond.
+        let mut b = randprotocol_core::notes::Bundle {
+            anchor: l.anchors().back().expect("a ledger always has an anchor").1,
+            nullifiers: pad4([[11; 8], [12; 8]]),
+            commitments: pad4([[13; 8], [14; 8]]),
+            fee: randprotocol_core::gas::BUNDLE_BASE,
+            burn_a: 0,
+            burn_r: 100 * randprotocol_core::UNITS_PER_RAND,
+            burn_asset: 0,
+            time: l.height() as u32,
+            envelopes: [env(1), env(2), env(1), env(2)],
+            proof: vec![],
+            auth_commit: [0; 8],
+            auth_proof: Vec::new(),
+        };
+        let d = ux.bundle_digest(&b.digest_input());
+        b.proof = StubExecutor::make_bundle_proof(&HC, &d, &[0; 8]);
+        let payout = ShieldedAddress { pk: [7; 8], kem_ek: vec![8; randprotocol_core::notes::KEM_EK_BYTES] };
+        let registration = AggregatorRegistration {
+            public_key: kp.public_key().clone(),
+            payout: payout.clone(),
+            signature: kp.sign(aggregator_register_message(l.chain_id(), &payout).as_bytes()),
+        };
+        let register = StubExecutor::bound(Transaction::shielded(l.chain_id(), b, Action::RegisterAggregator { registration }));
+        l.apply_tx(&register, &proposer, &ux).unwrap();
+        assert!(l.unsealed_fees().contains_key(&covered_tx.hash()), "the covered bundle is coverable");
+        (l, covered_tx.hash(), facts)
+    }
+
+    /// An aggregate by `kp` at nonce 0 over `covers`, with a stub proof bound to its own
+    /// `(chain, aggregator, nonce)`, signed for the payout `l` pays now.
+    fn aggregate_tx(l: &Ledger, kp: &Keypair, covers: Vec<Hash>) -> Transaction {
+        let (chain_id, nonce, time, r) = (l.chain_id(), 0, 1, [9; 8]);
+        let aggregator = kp.public_key().address();
+        let proof = StubExecutor::make_aggregate_proof(&l.binding_domain().aggregate_binding(chain_id, &aggregator, nonce));
+        let payout_total = l.payout_total_for(&covers).unwrap();
+        let envelope = env(9);
+        let signature = kp.sign(
+            aggregate_signing_hash(
+                chain_id,
+                nonce,
+                time,
+                &r,
+                &covers,
+                &Hash::digest(&proof),
+                &randprotocol_core::types::actions::envelope_digest(&envelope),
+                payout_total,
+            )
+            .as_bytes(),
+        );
+        Transaction {
+            chain_id,
+            bundle: None,
+            action: Action::Aggregate {
+                covers,
+                proof,
+                aggregator,
+                nonce,
+                time,
+                r,
+                envelope,
+                signature,
+                payout_total,
+                layout: AggregateLayout::Flat,
+            },
+        }
+    }
+
+    /// An aggregate validated (admission) then applied (`apply_aggregate`, which validates
+    /// again) through one cache: `verify_aggregate` reaches inner once. The control on the bare
+    /// executor reaches it twice.
+    #[test]
+    fn an_aggregate_validated_then_applied_verifies_once() {
+        let kp = key(7);
+        let (l, cover, facts) = aggregate_ledger(&kp);
+        let tx = aggregate_tx(&l, &kp, vec![cover]);
+        let covered = [facts];
+
+        let bare = Counting::plain();
+        l.validate_aggregate(&tx, &covered, &bare).unwrap();
+        l.clone().apply_aggregate(&tx, &covered, &bare).unwrap();
+        assert_eq!(bare.count(Kind::Aggregate), 2, "without the cache, apply verifies the aggregate again");
+
+        let inner = Arc::new(Counting::plain());
+        let cx = CachingExecutor::new(inner.clone());
+        l.validate_aggregate(&tx, &covered, &cx).unwrap();
+        assert_eq!(inner.count(Kind::Aggregate), 1, "admission verified the aggregate");
+        let mut applied = l.clone();
+        applied.apply_aggregate(&tx, &covered, &cx).unwrap();
+        assert_eq!(inner.count(Kind::Aggregate), 1, "apply reused admission's verdict");
+        assert_eq!(applied.aggregators()[&kp.public_key().address()].nonce, 1, "and the aggregate applied");
     }
 }
