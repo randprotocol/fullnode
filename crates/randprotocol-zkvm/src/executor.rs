@@ -140,10 +140,11 @@ pub mod msauth_vk {
     /// SHA-256 of `msauth-vk-production.bin`, the release asset every validator installs at
     /// `/usr/local/bin/msauth-vk-production.bin`. Consensus-critical (a wrong commitment could let
     /// a forged multisig proof verify): `tests/guest_provenance.rs` and `deploy/roll-all.sh` check
-    /// it.
-    pub const MSAUTH_VK_SHA256_PRODUCTION: &str = PIN_PENDING;
-    /// SHA-256 of `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (tests only).
-    pub const MSAUTH_VK_SHA256_TEST: &str = PIN_PENDING;
+    /// it. 23 754 bytes, from `rand-node keygen-msauth-vk --profile production` at circuits
+    /// d217252 (constraint set 9); deterministic, so any host regenerates it byte for byte.
+    pub const MSAUTH_VK_SHA256_PRODUCTION: &str = "68facb06c7f321aaf1d4d541acf6b5c0e9d7f17788ed1c9add6c5a8a8f7acd30";
+    /// SHA-256 of `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (tests only; 23 754 bytes).
+    pub const MSAUTH_VK_SHA256_TEST: &str = "c82250e7e7f8ca94246dc512091c1dafe402d5c0f6f4503e585d9381319443f5";
 
     /// This build's pin for `profile`.
     pub fn pin(profile: FriProfile) -> &'static str {

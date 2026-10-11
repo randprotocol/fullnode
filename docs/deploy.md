@@ -333,7 +333,10 @@ A node on a chain whose genesis names `hc_auth_multisig` verifies multisig autho
   `sha256 <hex>  bytes <n>`). It ships as a release asset listed in the signed `SHA256SUMS`.
 - **The pin.** Its SHA-256 is compiled into the build (`MSAUTH_VK_SHA256_PRODUCTION`;
   `rand-node keygen-msauth-vk --print-pinned production` prints it, `--check FILE` prints a
-  file's). The vendored `Machine::install_verifier_key_pinned` checks it on the raw bytes before
+  file's). At circuits d217252 (constraint set 9) the production blob is 23 754 bytes with
+  SHA-256 `68facb06c7f321aaf1d4d541acf6b5c0e9d7f17788ed1c9add6c5a8a8f7acd30`; the keygen is deterministic (any host regenerates it byte for byte, ~25 s and
+  ~4 GB peak on an M-series laptop). The Test-profile blob is committed at
+  `crates/randprotocol-zkvm/keys/msauth-vk-test.bin` (SHA-256 `c82250e7e7f8ca94246dc512091c1dafe402d5c0f6f4503e585d9381319443f5`). The vendored `Machine::install_verifier_key_pinned` checks it on the raw bytes before
   decoding anything: the blob is a trust root (a crafted preprocessed commitment could let a
   forged proof verify), so an unpinned file is never decoded.
 - **The location.** Beside the binary: `/usr/local/bin/msauth-vk-production.bin` on the fleet

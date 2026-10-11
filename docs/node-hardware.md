@@ -546,3 +546,22 @@ validator joins only after gossipsub's 2.5 s history window has passed, so it ne
 bodies. Its arrival makes the quorum; the first proposal that names the mints parks on it, the
 eight bodies are fetched by hash (`SyncRequest::Transactions`), and it votes and commits the
 same chain (`assert_chains_equal`). Fetch latency was not timed.
+
+## 9. The msauth verifier key: built once, loaded everywhere (2026-10-12)
+
+A chain naming `hc_auth_multisig` needs the tier-18 msauth verifier key on every validator.
+Building it is too big for an `s-2vcpu-4gb` droplet, so validators load a pinned blob instead
+(`docs/deploy.md`, "The msauth verifier key"). Measured on the M-series laptop, circuits d217252:
+
+| | wall | memory | file |
+|---|---|---|---|
+| build (Task 2, `verifier_key_with_modq`) | 78.6 s | ~4.0 GB peak and resident after | — |
+| `keygen-msauth-vk --profile production` | 25.0 s (91 s CPU) | 4.00 GB peak RSS | 23 754 bytes |
+| load (`install_verifier_key_pinned`, Production) | 6.6 ms | +8 MiB resident (2 → 10 MiB) | — |
+| load (Test) | 14.6 ms | +7 MiB resident (3 → 10 MiB) | 23 754 bytes |
+
+The load checks the SHA-256 pin, decodes the `CommonData` and recomputes the packed lookups; it
+does no LDE and no Merkle commit, which is the build's 4 GB.
+
+**To measure on an `s-2vcpu-4gb` droplet (Task 8 / cut rehearsal): RSS after load, and after the
+first tier-18 verify.** glibc may return freed memory where macOS did not.

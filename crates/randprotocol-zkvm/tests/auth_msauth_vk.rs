@@ -99,3 +99,62 @@ fn both_pins_are_lowercase_sha256_hex() {
         assert!(msauth_vk::pin_bytes(msauth_vk::pin(p)).is_some());
     }
 }
+
+/// This process's resident set, in MiB (`ps`, which macOS and Linux both have).
+fn rss_mib() -> f64 {
+    let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap() / 1024.0
+}
+
+/// Load `path` into a fresh executor of `profile` and report it (`MSAUTH-VK:` lines).
+fn load_and_measure(profile: FriProfile, path: &std::path::Path) -> ZkExecutor {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let ex = ZkExecutor::new(profile);
+    let before = rss_mib();
+    let t0 = std::time::Instant::now();
+    ex.install_msauth_vk(&bytes).unwrap();
+    let wall = t0.elapsed();
+    let after = rss_mib();
+    eprintln!(
+        "MSAUTH-VK: profile={profile:?} file={} bytes={} sha256={} load={wall:.2?} rss_before={before:.0} MiB rss_after={after:.0} MiB",
+        path.display(),
+        bytes.len(),
+        msauth_vk::digest(&bytes)
+    );
+    assert_eq!(ex.msauth_key_source(), MsauthKeySource::Loaded);
+    assert!(ex.msauth_key_ready());
+    assert_eq!(ex.msauth_machine_key_builds(), 0, "a load builds nothing");
+    ex
+}
+
+/// The committed Test blob is this build's pin and loads on a fresh executor, building nothing.
+/// `cargo +1.98.1 test --release -p randprotocol-zkvm --test auth_msauth_vk -- --nocapture the_committed`
+#[test]
+fn the_committed_test_blob_is_pinned_and_loads_without_a_build() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("keys/msauth-vk-test.bin");
+    assert_eq!(msauth_vk::digest(&std::fs::read(&path).unwrap()), msauth_vk::MSAUTH_VK_SHA256_TEST);
+    load_and_measure(FriProfile::Test, &path);
+}
+
+/// A one-byte flip of the real Test blob is refused on its digest, before anything decodes.
+#[test]
+fn a_flipped_byte_of_the_real_blob_is_refused_on_its_digest() {
+    let mut bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/keys/msauth-vk-test.bin")).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    let ex = ZkExecutor::new(FriProfile::Test);
+    assert!(matches!(ex.install_msauth_vk(&bytes).unwrap_err(), MsauthVkError::Digest { .. }));
+    assert_nothing_installed(&ex);
+}
+
+/// The Production blob (a release asset, not committed) loads on a fresh Production executor:
+/// `MSAUTH_VK_PRODUCTION_BLOB=<file> cargo +1.98.1 test --release -p randprotocol-zkvm --test
+/// auth_msauth_vk -- --ignored --nocapture the_production_blob`. A load, not a build.
+#[test]
+#[ignore = "needs the release asset msauth-vk-production.bin ($MSAUTH_VK_PRODUCTION_BLOB)"]
+fn the_production_blob_loads_without_a_build() {
+    let path = std::env::var_os("MSAUTH_VK_PRODUCTION_BLOB")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/msauth-vk-production.bin"));
+    load_and_measure(FriProfile::Production, &path);
+}
