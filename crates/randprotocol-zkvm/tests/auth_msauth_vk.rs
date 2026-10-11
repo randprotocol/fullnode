@@ -158,3 +158,17 @@ fn the_production_blob_loads_without_a_build() {
         .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/msauth-vk-production.bin"));
     load_and_measure(FriProfile::Production, &path);
 }
+
+/// End to end on the executor: after the load, `warm_auth_multisig` (what `node::warm` runs on a
+/// multisig chain) finds the key ready and builds nothing — neither the executor's single flight
+/// nor the machine's cache.
+#[test]
+fn after_a_load_warm_auth_multisig_is_ready_and_builds_nothing() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("keys/msauth-vk-test.bin");
+    let ex = load_and_measure(FriProfile::Test, &path);
+    ex.warm_auth_multisig();
+    assert!(ex.auth_multisig_key_ready());
+    assert_eq!(ex.msauth_machine_key_builds(), 0, "Machine::key_builds() == 0");
+    assert_eq!(ex.msauth_key_builds(), 0);
+    assert_eq!(ex.msauth_key_source(), MsauthKeySource::Loaded);
+}

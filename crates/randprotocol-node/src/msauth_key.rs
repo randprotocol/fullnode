@@ -202,6 +202,22 @@ mod tests {
         assert_eq!(load_msauth_key(path, FriProfile::Production, false, true, never).unwrap(), MsauthKeySource::Absent);
     }
 
+    /// The node's load path pointed at the committed Test blob (`--msauth-vk`): `Loaded`, then the
+    /// warm thread's `warm_auth_multisig` finds the key ready and nothing is ever built.
+    #[test]
+    fn the_test_blob_loads_through_the_node_path_and_warm_builds_nothing() {
+        let blob = Path::new(env!("CARGO_MANIFEST_DIR")).join("../randprotocol-zkvm/keys/msauth-vk-test.bin");
+        let opts = MsauthKeyOptions { path: Some(blob), build: false };
+        let ex = ZkExecutor::new(FriProfile::Test);
+        let path = resolve_path(&opts, FriProfile::Test).unwrap();
+        let source = load_msauth_key(&path, FriProfile::Test, true, opts.build, |b| ex.install_msauth_vk(b).map_err(|e| e.to_string())).unwrap();
+        assert_eq!(source, MsauthKeySource::Loaded);
+        ex.warm_auth_multisig();
+        assert!(ex.auth_multisig_key_ready());
+        assert_eq!(ex.msauth_machine_key_builds(), 0);
+        assert_eq!(ex.msauth_key_builds(), 0);
+    }
+
     /// The path order: `--msauth-vk`, then `RAND_MSAUTH_VK`, then the file beside the binary.
     #[test]
     fn the_flag_wins_and_the_default_is_beside_the_binary() {
