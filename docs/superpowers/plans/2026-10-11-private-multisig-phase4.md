@@ -39,7 +39,7 @@
 - **Read-only:**
   - circuits;
   - `deploy/cut-chain21-genesis.sh`, until Task 9 Step 1's message to randprotocol-d7 is answered;
-  - `feat/verify-cache`'s spec file (randprotocol-61's): never write it. Its code is on local `main` as `10fff634` and Task 4 edits `verify_cache.rs`;
+  - `feat/verify-cache`'s spec file (randprotocol-61's): never write it. Its code is pushed: fullnode `origin/main` = `10fff634`, which this phase bases on directly. Task 4 edits `verify_cache.rs`;
   - `CHANGELOG.md` until Task 10, and then only under the release-decision rules above.
 - **Corrected premises:**
   - `Transaction::binding` blanks both the bundle proof and the auth proof, so signing before proving is sound, and `salt`/`auth_commit` are fixed at `prepare`.
@@ -915,7 +915,7 @@ git commit -m "genesis: hc_auth_multisig — last field, hash-bound last (after 
 - Modify: `crates/randprotocol-core/src/ledger/aggregation.rs` (`HeaderRefusing`, `TreeProbe`)
 - Modify: `crates/randprotocol-zkvm/src/executor.rs` (move Task 2's inherent methods into the trait impl)
 - Modify: `crates/randprotocol-node/src/agg_executor.rs` (`AggExecutor`, `AsProvedBinding`), `crates/randprotocol-node/src/node.rs` (warm)
-- Modify: `crates/randprotocol-node/src/verify_cache.rs` (`feat/verify-cache` is merged into local fullnode `main` as `10fff634`, not yet pushed). Base this task on `10fff634`, or on `origin/main` once it carries it: `git merge 10fff634` into this branch before Step 1. Never rebase.
+- Modify: `crates/randprotocol-node/src/verify_cache.rs` (on `origin/main` = `10fff634`, which this phase's branch is based on).
 
 **Interfaces:**
 - Consumes: Task 2 (`AuthShape`, `ZkExecutor::auth_shape_of`, `warm_auth_multisig`), Task 3 (`Ledger::hc_auth_multisig`), `gas::msauth_gas_limit_pin`.
@@ -1079,7 +1079,7 @@ fn a_multisig_auth_proof_is_deferred_not_refused_until_the_key_is_warm() {
 
 The deferral sits in `Mempool::precheck`, after `pool_conflicts` and before `make_room`. It reads `executor.auth_header(&bundle.auth_proof)` only when the ledger has `hc_auth_multisig`. Admission (`admission.rs`) maps `Warming` to "try again later": the transaction is not forwarded and not cached, and the node's `rand_sendTransaction` reply says "the multisig auth key is still warming; retry in a minute".
 
-Add the three forwards to `verify_cache.rs`'s test executor `Counting` (~line 522) and append to its tests:
+In `verify_cache.rs`, give the test executor `Counting` (~line 522), **and its `plain` branch**, overrides of `auth_header`, `warm_auth_multisig` and `auth_multisig_key_ready` whose return values are **distinguishable** from the inner executor's defaults: `auth_header` returns `Ok((AuthShape::Multisig, [0x5a; 8], Some(4242)))`, `warm_auth_multisig` increments a `multisig_warms` counter, and `auth_multisig_key_ready` returns `false`. Then extend the existing `non_cached_methods_forward` test to assert that `CachingExecutor` returns exactly those values and that the counter moved. That makes it cover the three methods (`auth_header` is the first draft's `auth_proof_shape`). Then append:
 
 ```rust
 #[test]
@@ -1105,6 +1105,7 @@ fn the_phase_4_methods_forward_and_a_multisig_verify_is_its_own_kind_2_entry() {
 ```bash
 cargo +1.98.1 test --release -p randprotocol-core --lib multisig_auth_proof auth_proof_of_neither 2>&1 | tail -5
 cargo +1.98.1 test --release -p randprotocol-node --lib the_phase_4_auth_methods_are_forwarded 2>&1 | tail -5
+cargo +1.98.1 test --release -p randprotocol-node --lib non_cached_methods_forward 2>&1 | tail -5
 cargo +1.98.1 test --release -p randprotocol-node --lib a_multisig_auth_proof_is_deferred 2>&1 | tail -5
 ```
 
@@ -1123,7 +1124,7 @@ Expected: compile errors (no trait methods, `make_msauth_proof` or `STUB_MSAUTH_
   3. Ledger. Rewrite `check_auth_fields` to spec §3.2's sequence (one `auth_header` call, no separate digest/gas reads), returning `Ok(Some(shape))` on a `hc_auth` chain and `Ok(None)` otherwise. The shape refusal is `TxError::InvalidAuthProof(ConfidentialError::InvalidProof("a multisig auth proof on a chain without hc_auth_multisig".into()))`. `verify_auth_proof` takes the shape and selects `hc` as in spec §3.2. `check_bundle_proof` threads the shape from the cheap half to the expensive one, and the verified-set path keeps skipping the expensive half.
   4. `ZkExecutor`: `auth_header` forwards to Task 2's `auth_header_of`; `warm_auth_multisig` and `auth_multisig_key_ready` forward to the `OnceLock` methods.
   5. `AggExecutor`, `AsProvedBinding` and the test executors forward all three to `inner` / `StubExecutor`. In `node.rs`'s warm task, read `let multisig = hs.committed_ledger().hc_auth_multisig().is_some();` beside `split_auth`, and call `ex.warm_auth_multisig()` **first**, before `warm_bundle` and `warm_auth`, logging `multisig auth verifier key warmed`. Admission: add `MempoolError::Warming` and `is_retryable` as specified in Step 1, with the check in `Mempool::precheck`. Map `Warming` to the RPC refusal text in `admission.rs`, and never `RefusedCache` it. Block validation needs no change: it reaches `verify_auth`, which waits on the `OnceLock`.
-  6. `verify_cache.rs`: add the three forwards to `CachingExecutor`'s "forwarded unchanged" group and to `Counting`. After the commit, tell randprotocol-61 the forwards are in:
+  6. `verify_cache.rs`: add the three methods to `impl ConfidentialExecutor for CachingExecutor`, each forwarding to `inner`, in its "forwarded unchanged" group. Add the distinguishable overrides to `Counting` and its `plain` branch, so `non_cached_methods_forward` (extended in Step 1) fails on a missing or defaulted forward. After the commit, tell randprotocol-61 the forwards are in:
 
      > Private multisig phase 4: `CachingExecutor` and `Counting` now forward the three new required, uncached methods (`auth_header`, `warm_auth_multisig`, `auth_multisig_key_ready`), commit `<sha>`. Multisig verifies reuse `verify_auth`, kind 2, with `hc` in the key; nothing new is cached.
 
