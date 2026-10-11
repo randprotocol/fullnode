@@ -228,10 +228,19 @@ RELAYER_DONE_DIR=${RELAYER_DONE_DIR:-}             # optional: a copy of the rel
 EXPECT_HC_BUNDLE=${EXPECT_HC_BUNDLE:-60af094acfe65d85fdb18fb3d06cf9085dcf28c96e59e87f1ee527226e6e3fce}   # bundle guest v3, chain 20's
 EXPECT_HC_AUTH=${EXPECT_HC_AUTH:-1e4e347f44cf86750b30a9a4bdf9ec9256efe353d4ff8017451eca7d195639c1}     # the auth guest, chain 20's
 
-# ── chain 20's limits (asserted equal to its genesis unless LIMITS_CHANGED=1) ───────────────────
+# ── the limits: chain 20's, asserted equal to its genesis unless LIMITS_CHANGED=1 — except the two
+# chain 21 decides for private multisig (hc_auth_multisig), asserted at those values unless
+# LIMITS_CHANGED=1: a multisig auth proof plus its bundle is estimated near 4.8 MB at production
+# FRI, and the node refuses a cap below 4 MiB beside hc_auth_multisig (gas::MSAUTH_MIN_PROOF_BYTES).
+#   - max_proof_bytes 6 MiB (6291456; chain 20's was 4 MiB). PENDING the measured production msauth
+#     proof size (private-multisig phase 4, Task 3: prove still to run from the user's terminal); a
+#     measurement re-decides it, here and in docs/deploy.md together.
+#   - max_block_bytes 19 MiB (19922944; chain 20's was 20 MiB): exactly 3 · 6 MiB + 1 MiB, the
+#     three-proof Call rule (a `Call` carries bundle, auth and call proofs). GAS_DYNAMIC's byte target
+#     follows as max_block_bytes / 2 (9961472; chain 20's 10485760) — the one gas field that moves.
 MAX_PROGRAM_WORDS=${MAX_PROGRAM_WORDS:-65535}
-MAX_PROOF_BYTES=${MAX_PROOF_BYTES:-4194304}
-MAX_BLOCK_BYTES=${MAX_BLOCK_BYTES:-20971520}
+MAX_PROOF_BYTES=${MAX_PROOF_BYTES:-6291456}
+MAX_BLOCK_BYTES=${MAX_BLOCK_BYTES:-19922944}
 MAX_CALL_ENVELOPE_BYTES=${MAX_CALL_ENVELOPE_BYTES:-65536}
 MAX_PROGRAM_PUBLIC_WORDS=${MAX_PROGRAM_PUBLIC_WORDS:-32768}
 EPOCH_BLOCKS=${EPOCH_BLOCKS:-1000}
@@ -810,7 +819,7 @@ PY
 # ══ the cut, step 2: splice bridge, tokens, staking; assert every carried sum and every new field ═
 py_splice() {
   python3 - <<'PY'
-import json, os, re, sys, time
+import copy, json, os, re, sys, time
 E = os.environ
 exec(E["UNITS_PY"])
 out = E["OUT"]
@@ -1160,7 +1169,10 @@ need(int(dyn["min_gas_price"]) == int(E["GAS_PRICE"]) and int(dyn["min_byte_pric
 need(str(dyn.get("max_gas_price")) == E["MAX_GAS_PRICE"] == "10000", f"gas.dynamic.max_gas_price is {dyn.get('max_gas_price')!r}, not \"10000\" — --max-gas-price did not take")
 need(str(dyn.get("max_byte_price")) == E["MAX_BYTE_PRICE"] == "80000", f"gas.dynamic.max_byte_price is {dyn.get('max_byte_price')!r}, not \"80000\" — --max-byte-price did not take")
 need(dyn.get("byte_load") == E["GAS_BYTE_LOAD"] == "paying", f"gas.dynamic.byte_load is {dyn.get('byte_load')!r}, not \"paying\" — --gas-byte-load paying did not take")
-want_gas_section = g20["gas"]
+# chain 20's section but for the byte target, which follows chain 21's max_block_bytes (half of it,
+# asserted above): 9961472 at the decided 19 MiB, chain 20's 10485760 at its 20 MiB.
+want_gas_section = copy.deepcopy(g20["gas"])
+want_gas_section["dynamic"]["target_block_bytes"] = g["max_block_bytes"] // 2
 need(gas == want_gas_section or E.get("GAS_CHANGED"), f"the gas section {gas} is not chain 20's {want_gas_section} (GAS_CHANGED=1 if intended)")
 # the staking section
 st = g["staking"]
@@ -1194,17 +1206,26 @@ need(sum(n["amount"] for n in g["alloc"] if n["opening"].get("asset", 0) == 0) =
 staked_total = sum(v["stake"] for v in g["validators"])
 issued_total = alloc_total + staked_total + treasury_units
 need(issued_total < 2**64, f"Σ RAND notes {alloc_total} + Σ stakes {staked_total} + treasury {treasury_units} = {issued_total} overflows a u64")
+# chain 21's decided limits (private multisig; see MAX_PROOF_BYTES): 6 MiB proofs — PENDING the
+# measured production msauth proof size — and 19 MiB blocks, 3 · 6 MiB + 1 MiB.
+LIMITS_DECIDED = {"max_proof_bytes": 6291456, "max_block_bytes": 19922944}
 for k, want in (("max_program_words", "MAX_PROGRAM_WORDS"), ("max_proof_bytes", "MAX_PROOF_BYTES"),
                 ("max_block_bytes", "MAX_BLOCK_BYTES"), ("max_call_envelope_bytes", "MAX_CALL_ENVELOPE_BYTES"),
                 ("max_program_public_words", "MAX_PROGRAM_PUBLIC_WORDS")):
     need(g[k] == int(E[want]), f"{k} is {g[k]}")
-    need(g[k] == g20[k] or E.get("LIMITS_CHANGED"), f"{k} {g[k]} differs from chain 20's {g20[k]} (LIMITS_CHANGED=1 if intended)")
+    if k in LIMITS_DECIDED:
+        need(g[k] == LIMITS_DECIDED[k] or E.get("LIMITS_CHANGED"),
+             f"{k} {g[k]} is not chain 21's decided {LIMITS_DECIDED[k]} (chain 20's was {g20[k]}; LIMITS_CHANGED=1 if intended)")
+    else:
+        need(g[k] == g20[k] or E.get("LIMITS_CHANGED"), f"{k} {g[k]} differs from chain 20's {g20[k]} (LIMITS_CHANGED=1 if intended)")
 need(g["max_block_bytes"] >= 3 * g["max_proof_bytes"] + 1048576,
      f"max_block_bytes {g['max_block_bytes']} < 3*max_proof_bytes + 1 MiB: a v3 Call carries three proofs")
 # Outside the chain id, the clock, the carried notes, the bridge's burn sequence / floors, the zUSD
-# backings' `locked`, the faucet lists and the three new sections, every byte is chain 20's (gas and
-# staking are compared on their own lines, with their own override).
-excused = {"chain_id", "timestamp_ms", "alloc", "bridge", "tokens", "staking", "gas", "fees", "perps", "multisig"}
+# backings' `locked`, the faucet lists, the three new sections and chain 21's two decided limits
+# (asserted at their values above), every byte is chain 20's (gas and staking are compared on their
+# own lines, with their own override).
+excused = {"chain_id", "timestamp_ms", "alloc", "bridge", "tokens", "staking", "gas", "fees", "perps", "multisig",
+           "max_proof_bytes", "max_block_bytes"}
 if E.get("LIMITS_CHANGED"):
     excused |= {"max_program_words", "max_proof_bytes", "max_block_bytes", "max_call_envelope_bytes", "max_program_public_words"}
 moved = sorted(k for k in set(g) | set(g20) if k not in excused and g.get(k) != g20.get(k))
@@ -1397,6 +1418,8 @@ want("bundle_gas_limit", L.get("bundle_gas_limit"), 20479)
 want("adjust_bps", L.get("adjust_bps"), 1250)
 want("envelope_bytes", L.get("envelope_bytes"), 1860)
 want("hardening_v6", L.get("hardening_v6"), True)
+want("max_proof_bytes", L.get("max_proof_bytes"), gen["max_proof_bytes"])
+want("max_block_bytes", L.get("max_block_bytes"), gen["max_block_bytes"])
 want("hc_auth", L.get("hc_auth"), gen["hc_auth"])
 ps = L.get("program_state") or {}
 want("program_state.cell_fee", ps.get("cell_fee"), str(gen["program_state"]["cell_fee"]))
@@ -1538,6 +1561,7 @@ base = {k: g20[k] for k in ("chain_id", "timestamp_ms", "validators", "faucet", 
                            "max_program_public_words", "envelope_bytes", "hardening_v6", "hc_auth")}
 tb, tg, bps = (int(x) for x in E["GAS_DYNAMIC"].split(","))
 base.update(chain_id=21, timestamp_ms=int(time.time() * 1000), alloc=rand_notes, hc_bundle=E["EXPECT_HC_BUNDLE"], hc_auth=E["EXPECT_HC_AUTH"],
+            max_proof_bytes=int(E["MAX_PROOF_BYTES"]), max_block_bytes=int(E["MAX_BLOCK_BYTES"]),
             tokens={"registration_fee": g20["tokens"]["registration_fee"], "mint_cap_per_day": g20["tokens"]["mint_cap_per_day"], "tokens": []},
             gas={"gas_price": E["GAS_PRICE"], "byte_price": E["BYTE_PRICE"], "bundle_gas_limit": int(E["BUNDLE_GAS_LIMIT"]), "metering": "circuit",
                  "dynamic": {"target_block_bytes": tb, "target_block_gas": tg, "adjust_bps": bps,
@@ -1616,7 +1640,9 @@ a = m["accounts"][0]
 assert a["threshold"] == 2 and len(a["signers"]) == 3 and a["balance"] == str(500000000 * 10**9) and len(a["salt"]) == 64
 assert g["testnet"] is True and g["binding_domain"] == 1 and g["proof_window_blocks"] == 1024
 assert g["program_state"] == {"cell_fee": 10000000} == g20["program_state"]
-assert g["gas"] == g20["gas"] and g["gas"]["dynamic"]["byte_load"] == "paying"
+assert (g["max_proof_bytes"], g["max_block_bytes"]) == (6291456, 19922944) == (6 << 20, 3 * (6 << 20) + (1 << 20))
+assert {**g["gas"], "dynamic": {**g["gas"]["dynamic"], "target_block_bytes": 10485760}} == g20["gas"] and g["gas"]["dynamic"]["target_block_bytes"] == 9961472
+assert g["gas"]["dynamic"]["byte_load"] == "paying"
 assert g["bridge"]["rotation"] == g20["bridge"]["rotation"] == {"delay_secs": 86400, "needs_possession": True}
 assert g["bridge"]["fees"] == g20["bridge"]["fees"] and g["bridge"]["fees"]["mint_bps"] == g["bridge"]["fees"]["burn_bps"] == 10
 assert list(g["bridge"]) == list(g20["bridge"])
@@ -1795,6 +1821,19 @@ open(sys.argv[3], "w").write(str(2**64 - 1))' "$B" "$ST/tmp/multisig.json" "$ST/
   refuse "gas prices that are not chain 20's" "$B" 'd["gas"]["gas_price"] = "200"; d["gas"]["dynamic"]["min_gas_price"] = "200"' "is not chain 20's {" GAS_PRICE=200
   refuse "a bundle_gas_limit off the pin"    "$B" 'd["gas"]["bundle_gas_limit"] = 16383' "not gas_max(14, 0, 0)"
   refuse "a byte target not half the block"  "$B" 'd["gas"]["dynamic"]["target_block_bytes"] = 4194304' "gas.dynamic targets are"
+  # chain 21's decided limits (6 MiB proofs, 19 MiB blocks): chain 20's own are refused without LIMITS_CHANGED=1
+  refuse "chain 20's 4 MiB proof cap, no LIMITS_CHANGED" "$B" 'd["max_proof_bytes"] = 4194304' "max_proof_bytes 4194304 is not chain 21's decided 6291456" MAX_PROOF_BYTES=4194304
+  refuse "chain 20's 20 MiB block, no LIMITS_CHANGED" "$B" 'd["max_block_bytes"] = 20971520; d["gas"]["dynamic"]["target_block_bytes"] = 10485760' \
+    "max_block_bytes 20971520 is not chain 21's decided 19922944" MAX_BLOCK_BYTES=20971520 GAS_DYNAMIC=10485760,262144,1250
+  refuse "a block under 3 proofs + 1 MiB"    "$B" 'd["max_block_bytes"] = 18874368; d["gas"]["dynamic"]["target_block_bytes"] = 9437184' \
+    "a v3 Call carries three proofs" MAX_BLOCK_BYTES=18874368 GAS_DYNAMIC=9437184,262144,1250 LIMITS_CHANGED=1
+  cp "$B" "$B.orig"
+  python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["max_proof_bytes"] = 4194304; d["max_block_bytes"] = 20971520; d["gas"]["dynamic"]["target_block_bytes"] = 10485760; json.dump(d, open(p,"w"))' "$B"
+  fresh
+  if LIMITS_CHANGED=1 MAX_PROOF_BYTES=4194304 MAX_BLOCK_BYTES=20971520 GAS_DYNAMIC=10485760,262144,1250 bash -c 'py_validators >/dev/null && py_splice' >"$ST/log" 2>&1; then
+    ok "chain 20's limits (4 MiB / 20 MiB, byte target 10485760) are accepted with LIMITS_CHANGED=1"
+  else bad "chain 20's limits with LIMITS_CHANGED=1: $(tail -1 "$ST/log")"; fi
+  mv "$B.orig" "$B"
   refuse "a validator payout that is not chain 20's" "$B" 'd["validators"][0]["payout"] = d["validators"][1]["payout"]' "not chain 20's shape: ['validators']"
   refuse "no envelope_bytes"                 "$B" 'del d["envelope_bytes"]' "envelope_bytes is None, not 1860"
   refuse "a legacy (1 348-B) RAND alloc"     "$B" 'd["alloc"][0]["envelope"]["body"] = d["alloc"][0]["envelope"]["body"][:-1024]' "sealed in the legacy format"
@@ -1856,7 +1895,7 @@ json.dump({"rand_getGenesisHash": "ab" * 32,
            "rand_getLimits": {"proof_window_blocks": 1024, "binding_domain": 1, "testnet": True, "admission_by_vote": True, "slashing": None,
                               "max_gas_price": d["max_gas_price"], "max_byte_price": d["max_byte_price"], "byte_load": "paying",
                               "gas_metering": "circuit", "bundle_gas_limit": 20479, "adjust_bps": 1250, "envelope_bytes": 1860,
-                              "hardening_v6": True, "hc_auth": g["hc_auth"],
+                              "hardening_v6": True, "hc_auth": g["hc_auth"], "max_proof_bytes": g["max_proof_bytes"], "max_block_bytes": g["max_block_bytes"],
                               "program_state": {"cell_fee": str(g["program_state"]["cell_fee"]), "max_reads": 8, "max_writes": 8, "max_payouts": 4},
                               "fee_rules": {"burn_base": True, "subsidy_net_of_fees": False, "burn_floor": True,
                                             "proposer_share_bps": None, "prove_base": None, "usd_subsidy": None},
@@ -1885,7 +1924,7 @@ PY
   else bad "BASE_FEES_BURNED_ANY=1: $(tail -2 "$ST/log")"; fi
   mv "$ST/answers.keep" "$ST/answers.json"
   for m in 'L["proof_window_blocks"] = 256' 'L["binding_domain"] = 0' 'L["testnet"] = False' 'L["admission_by_vote"] = False' \
-           'L["byte_load"] = None' 'L["max_gas_price"] = None' 'L["program_state"] = None' 'B["rotation_rules"] = None' 'B["min_inbound_sequence"]["2"] = 0' 'B["fees"] = None' 'B["fees"]["burn_bps"] = 20' \
+           'L["byte_load"] = None' 'L["max_gas_price"] = None' 'L["max_proof_bytes"] = 4194304' 'L["max_block_bytes"] = 20971520' 'L["program_state"] = None' 'B["rotation_rules"] = None' 'B["min_inbound_sequence"]["2"] = 0' 'B["fees"] = None' 'B["fees"]["burn_bps"] = 20' \
            'L["fee_rules"] = None' 'L["fee_rules"]["burn_floor"] = False' 'L["fee_rules"]["burn_base"] = False' 'L["fee_rules"]["subsidy_net_of_fees"] = True' \
            'L["fee_rules"]["burn_base"] = 1' 'L["fee_rules"]["burn_floor"] = 1' 'L["fee_rules"]["prove_base"] = "1000"' 'del L["fee_rules"]["usd_subsidy"]' 'L["proof_window_blocks"] = 1024.0' \
            'S["base_fees_burned"] = "1000000"' 'S["base_fees_burned"] = 0' 'del S["base_fees_burned"]' 'S["invariant_holds"] = False' 'S["invariant_holds"] = 1' \
